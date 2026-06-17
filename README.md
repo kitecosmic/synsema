@@ -372,9 +372,67 @@ syntecnia/
 ├── human/             # Human interaction
 │   └── interaction.py # Terminal, auto, queue, callback handlers
 ├── llm/               # LLM integration
-│   └── provider.py    # Anthropic, OpenAI, Ollama, Mock
+│   ├── provider.py    # Anthropic, OpenAI, MiniMax, Ollama, Mock
+│   ├── context.py     # Context builder for enriched prompts
+│   └── validator.py   # Response validation + retry with feedback
 └── cli.py             # Command-line interface
 ```
+
+## AI Skill (for Claude Code, Codex, etc.)
+
+Syntecnia includes a structured skill so AI coding assistants can learn the language. The skill is organized as an indexed folder — the AI reads only the sections it needs.
+
+### Install the skill (Claude Code)
+
+```bash
+# From the repo
+cd Syntecnia && bash install-skill.sh
+
+# Or remote
+curl -s https://raw.githubusercontent.com/kitecosmic/Syntecnia/main/install-skill.sh | bash
+```
+
+Then add to your `CLAUDE.md`:
+```
+For Syntecnia development, read ~/.claude/skills/syntecnia/INDEX.md
+```
+
+### Skill index
+
+The skill lives in `.syntecnia-skill/` and is organized by topic:
+
+| File | When to read |
+|------|-------------|
+| [INDEX.md](.syntecnia-skill/INDEX.md) | **Always read first** — points to everything else |
+| [syntax.md](.syntecnia-skill/syntax.md) | Writing or reading `.syn` code — keywords, operators, statement patterns |
+| [builtins.md](.syntecnia-skill/builtins.md) | Need to know what functions exist — all built-in tasks with signatures |
+| [types.md](.syntecnia-skill/types.md) | Working with data — type system, property access, truthiness |
+| [capabilities.md](.syntecnia-skill/capabilities.md) | Adding security — require, sandbox, intent, per-task scoping |
+| [agents.md](.syntecnia-skill/agents.md) | Multi-agent work — blackboard, swarm, signals, resource locks |
+| [llm.md](.syntecnia-skill/llm.md) | Using AI reasoning — reason, decide, analyze, generate, providers |
+| [human.md](.syntecnia-skill/human.md) | Human interaction — approve, confirm, ask, escalation |
+| [observability.md](.syntecnia-skill/observability.md) | Debugging — trace, log, measure, error diagnostics, recovery |
+| [memory.md](.syntecnia-skill/memory.md) | Agent persistence — progress tracking, memory, owner rules |
+| [patterns.md](.syntecnia-skill/patterns.md) | Common idioms — safe division, pipe chains, intentional ops |
+| [structure.md](.syntecnia-skill/structure.md) | Understanding the codebase — file map with entry points |
+
+### For other AI tools (Codex, Cursor, Windsurf, etc.)
+
+Point the tool at `.syntecnia-skill/INDEX.md` in the repo root. Each tool has its own way to add context:
+
+- **Codex**: reference the skill folder in your system instructions
+- **Cursor**: add `.syntecnia-skill/` to your project rules or docs
+- **Windsurf**: include INDEX.md in your cascade context
+- **Any tool**: paste the contents of INDEX.md as system prompt, the AI will know which sub-file to request
+
+### LLM response validation
+
+When Syntecnia connects to an LLM, responses are validated automatically:
+
+- `decide` responses **must** be exactly one of the given options
+- Invalid responses trigger a retry (up to 3 attempts)
+- Each retry includes feedback: *"Your response was invalid because X"*
+- The LLM receives full program context: intent, variables, rules, memory, progress
 
 ## Roadmap
 
