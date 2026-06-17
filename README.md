@@ -6,19 +6,27 @@ Syntecnia is not a framework or a library — it's a language where observabilit
 
 ## Install
 
+Zero dependencies — only needs Python 3.10+.
+
 ```bash
 git clone https://github.com/kitecosmic/Syntecnia.git
 cd Syntecnia
-pip install -e .
 ```
 
-Or without pip:
+Then choose one:
 
 ```bash
-git clone https://github.com/kitecosmic/Syntecnia.git
-cd Syntecnia
+# Option 1: pip (creates the 'syntecnia' command)
+pip install -e .
+
+# Option 2: uv (faster, modern)
+uv pip install -e .
+
+# Option 3: no install needed (run directly)
 python3 -m syntecnia version
 ```
+
+All three work. Option 3 doesn't require any package manager — if you have Python, you can run Syntecnia.
 
 ## Quick start
 
