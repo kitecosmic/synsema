@@ -84,7 +84,8 @@ class AgentSwarm:
         self.agent_definitions: Dict[str, Dict] = {}
         self._threads: Dict[str, threading.Thread] = {}
         self._lock = threading.RLock()
-        self._signals: Dict[str, List[Signal]] = {}  # signal_name → list
+        self._signals: Dict[str, List[Signal]] = {}  # signal_name → pending queue
+        self._signal_history: List[Signal] = []       # consumed signals (for dashboard)
         self._signal_events: Dict[str, threading.Event] = {}
         self._interpreters: Dict[str, Interpreter] = {}
 
@@ -149,31 +150,45 @@ class AgentSwarm:
         Wait for and CONSUME one signal. Returns it and removes from queue.
 
         If a signal is already queued, returns immediately (consumes it).
-        If no signal, blocks until one arrives or timeout.
+        If no signal, polls with short sleeps. Each cycle checks:
+        - Did the signal arrive?
+        - Are all agents dead/done? If so, no one can emit → return None.
         """
-        with self._lock:
-            # Check if signal already queued — consume it
-            if signal_name in self._signals and self._signals[signal_name]:
-                sig = self._signals[signal_name].pop(0)
-                # Reset event if queue is now empty
-                if not self._signals[signal_name] and signal_name in self._signal_events:
-                    self._signal_events[signal_name].clear()
-                return sig
-            # No signal yet — prepare to wait
-            if signal_name not in self._signal_events:
-                self._signal_events[signal_name] = threading.Event()
-            self._signal_events[signal_name].clear()
-            event = self._signal_events[signal_name]
+        poll_interval = 0.1  # 100ms
+        deadline = time.time() + (timeout or 30)
 
-        # Block outside the lock
-        signaled = event.wait(timeout=timeout)
-        if signaled:
+        while time.time() < deadline:
             with self._lock:
+                # Check if signal queued
                 if signal_name in self._signals and self._signals[signal_name]:
                     sig = self._signals[signal_name].pop(0)
-                    if not self._signals[signal_name]:
+                    self._signal_history.append(sig)
+                    if not self._signals[signal_name] and signal_name in self._signal_events:
                         self._signal_events[signal_name].clear()
                     return sig
+
+                # Check if any agent is still alive and could emit
+                alive = any(
+                    a.state in (AgentState.STARTING, AgentState.WORKING, AgentState.WAITING)
+                    for a in self.agents.values()
+                )
+                if not alive and self.agents:
+                    # All agents are done/error/stopped — no one will emit
+                    return None
+
+            # Prepare event for this signal
+            with self._lock:
+                if signal_name not in self._signal_events:
+                    self._signal_events[signal_name] = threading.Event()
+                self._signal_events[signal_name].clear()
+                event = self._signal_events[signal_name]
+
+            # Wait for a short interval
+            remaining = min(poll_interval, deadline - time.time())
+            if remaining <= 0:
+                break
+            event.wait(timeout=remaining)
+
         return None
 
     def wait_all(self, timeout: float = 60):
@@ -219,12 +234,25 @@ class AgentSwarm:
                     "written_by": entry.written_by,
                 }
 
+            # Show both pending and consumed signals
             signals_view = {}
+            # Pending (not yet consumed)
             for sig_name, sigs in self._signals.items():
-                signals_view[sig_name] = [{
-                    "sender": s.sender,
-                    "data": str(s.data) if s.data else None,
-                } for s in sigs[-5:]]  # last 5
+                if sigs:
+                    signals_view[sig_name] = [{
+                        "sender": s.sender,
+                        "data": str(s.data) if s.data else None,
+                        "status": "pending",
+                    } for s in sigs[-5:]]
+            # History (consumed)
+            for sig in self._signal_history[-20:]:
+                if sig.name not in signals_view:
+                    signals_view[sig.name] = []
+                signals_view[sig.name].append({
+                    "sender": sig.sender,
+                    "data": str(sig.data) if sig.data else None,
+                    "status": "consumed",
+                })
 
             # Detect conflicts: multiple agents writing to same blackboard keys
             conflicts = self._detect_conflicts()
