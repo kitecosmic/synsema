@@ -256,9 +256,9 @@ class SpawnStatement(Node):
 
 @dataclass
 class ShareStatement(Node):
-    """share results as "search_results" """
+    """share results as "search_results" or share results as key_expr"""
     value: Node = None
-    key: str = ""
+    key: Node = None  # expression, evaluated at runtime to get key string
 
 @dataclass
 class ObserveStatement(Node):

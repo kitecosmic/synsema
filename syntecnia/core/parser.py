@@ -384,13 +384,13 @@ class Parser:
         return ast.SpawnStatement(location=loc, agent_name=name_tok.value, arguments=args)
 
     def _parse_share(self) -> ast.ShareStatement:
-        """share value as "key" """
+        """share value as key_expression"""
         loc = self._location()
         self._advance()
         value = self._parse_expression()
         self._expect(TokenType.AS)
-        key_tok = self._expect(TokenType.TEXT, "Expected string key after 'as' in share")
-        return ast.ShareStatement(location=loc, value=value, key=key_tok.value)
+        key_expr = self._parse_expression()
+        return ast.ShareStatement(location=loc, value=value, key=key_expr)
 
     def _parse_observe(self) -> ast.ObserveStatement:
         """observe "key" as variable"""

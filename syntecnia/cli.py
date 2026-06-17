@@ -150,6 +150,11 @@ def main():
 
             if "--audit" in args:
                 print("\n" + engine.get_audit_report())
+
+            if "--dashboard" in args:
+                # Wait for agents to finish before showing dashboard
+                engine.swarm.wait_all(timeout=10)
+                print("\n" + engine.swarm.format_dashboard())
             return
 
     print(f"Unknown command: {command}")

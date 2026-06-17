@@ -139,72 +139,83 @@ class SyntecniaEngine:
 
     def _wire_swarm(self):
         """Connect the interpreter to the real swarm for agent operations."""
+        import threading as _threading
+        from ..agents.swarm import AgentInfo, AgentState
+
         interp = self.interpreter
         swarm = self.swarm
 
         def swarm_spawn(agent_name, body, parent_env, spawn_args):
             """Spawn an agent in a real thread."""
-            import threading
-            from ..core.interpreter import Interpreter, Environment, GiveSignal
-
             instance_id = f"{agent_name}_{len(swarm.agents)}"
 
             def run_agent():
-                # Each agent gets its own interpreter for thread safety
+                from ..core.interpreter import Interpreter, Environment
+
                 agent_interp = Interpreter()
                 agent_interp.output_callback = interp.output_callback
                 agent_interp.llm_callback = interp.llm_callback
                 agent_interp.human_callback = interp.human_callback
 
-                # Wire the agent interpreter to the same swarm
+                # Wire agent's swarm operations
                 agent_interp._swarm_share = lambda k, v: swarm.blackboard.write(k, v, agent=instance_id)
                 agent_interp._swarm_observe = lambda k: swarm.blackboard.read(k, agent=instance_id)
                 agent_interp._swarm_signal = lambda name, data: swarm.signal(name, instance_id, data)
-                agent_interp._swarm_wait_for = lambda name, timeout=30: _wait_signal(name, timeout)
+
+                def agent_wait_for(name, timeout=30):
+                    """Wait for signal, setting WAITING state while blocked."""
+                    if instance_id in swarm.agents:
+                        swarm.agents[instance_id].state = AgentState.WAITING
+                    sig = swarm.wait_for_signal(name, timeout=timeout)
+                    if instance_id in swarm.agents:
+                        swarm.agents[instance_id].state = AgentState.WORKING
+                    if sig and sig.data:
+                        return sig.data
+                    return None
+
+                agent_interp._swarm_wait_for = agent_wait_for
 
                 agent_env = Environment(parent=parent_env, name=f"agent:{instance_id}")
                 for key, val in spawn_args.items():
                     agent_env.set(key, val)
 
                 try:
-                    if instance_id in swarm.agents:
-                        swarm.agents[instance_id].state = __import__(
-                            'syntecnia.agents.swarm', fromlist=['AgentState']
-                        ).AgentState.WORKING
+                    swarm.agents[instance_id].state = AgentState.WORKING
                     agent_interp._exec_block(body, agent_env)
-                    if instance_id in swarm.agents:
-                        swarm.agents[instance_id].state = __import__(
-                            'syntecnia.agents.swarm', fromlist=['AgentState']
-                        ).AgentState.DONE
+                    swarm.agents[instance_id].state = AgentState.DONE
                 except Exception as e:
-                    if instance_id in swarm.agents:
-                        swarm.agents[instance_id].state = __import__(
-                            'syntecnia.agents.swarm', fromlist=['AgentState']
-                        ).AgentState.ERROR
-                        swarm.agents[instance_id].error = str(e)
+                    swarm.agents[instance_id].state = AgentState.ERROR
+                    swarm.agents[instance_id].error = str(e)
+                    # Wake up any agents waiting for signals from this agent.
+                    # Without this, a waiter hangs for 30s on a dead agent.
+                    swarm.signal(f"__agent_error:{instance_id}", instance_id)
+                finally:
+                    import time as _time
+                    swarm.agents[instance_id].finished_at = _time.time()
 
-            from ..agents.swarm import AgentInfo, AgentState
-            import time
-            swarm.agents[instance_id] = AgentInfo(
-                name=instance_id, state=AgentState.STARTING, started_at=time.time(),
+            import time as _time
+            info = AgentInfo(
+                name=instance_id, state=AgentState.STARTING,
+                started_at=_time.time(),
             )
-            thread = threading.Thread(target=run_agent, name=instance_id, daemon=True)
+            swarm.agents[instance_id] = info
+            thread = _threading.Thread(target=run_agent, name=instance_id, daemon=True)
             swarm._threads[instance_id] = thread
             thread.start()
             return instance_id
 
-        def _wait_signal(name, timeout=30):
+        def main_wait_for(name, timeout=30):
             sig = swarm.wait_for_signal(name, timeout=timeout)
             if sig and sig.data:
                 return sig.data
             return None
 
-        # Wire callbacks
+        # Wire interpreter callbacks to swarm
         interp._swarm_spawn = swarm_spawn
         interp._swarm_share = lambda k, v: swarm.blackboard.write(k, v, agent="main")
         interp._swarm_observe = lambda k: swarm.blackboard.read(k, agent="main")
         interp._swarm_signal = lambda name, data: swarm.signal(name, "main", data)
-        interp._swarm_wait_for = lambda name, timeout=30: _wait_signal(name, timeout)
+        interp._swarm_wait_for = main_wait_for
 
     def configure_llm_provider(self, provider_name: str, **kwargs):
         """

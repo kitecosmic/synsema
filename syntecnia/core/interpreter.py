@@ -661,14 +661,15 @@ class Interpreter:
     def _exec_ShareStatement(self, node: ast.ShareStatement, env: Environment) -> SynValue:
         """Publish a value to the shared blackboard."""
         value = self._exec(node.value, env)
+        key = str(self._exec(node.key, env))
 
         # Use swarm blackboard if available (thread-safe)
         if hasattr(self, '_swarm_share') and self._swarm_share:
-            self._swarm_share(node.key, value)
+            self._swarm_share(key, value)
         else:
-            self.blackboard[node.key] = value
+            self.blackboard[key] = value
 
-        self.logs.append({"type": "share", "key": node.key})
+        self.logs.append({"type": "share", "key": key})
         return value
 
     def _exec_ObserveStatement(self, node: ast.ObserveStatement, env: Environment) -> SynValue:

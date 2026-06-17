@@ -103,67 +103,17 @@ class AgentSwarm:
             "tasks": task_registry or {},
         }
 
-    def spawn(self, agent_name: str, args: Dict[str, SynValue] = None,
-              instance_name: str = None) -> str:
+    def register_agent(self, instance_id: str, info: AgentInfo,
+                       thread: threading.Thread):
         """
-        Spawn an agent instance.
-
-        Returns the instance ID.
+        Register a spawned agent. The actual spawn logic lives in
+        engine._wire_swarm.swarm_spawn, which creates the interpreter,
+        wires blackboard/signals, and starts the thread. This method
+        just registers the result for dashboard/tracking.
         """
-        definition = self.agent_definitions.get(agent_name)
-        if not definition:
-            raise ValueError(f"No agent definition found for '{agent_name}'")
-
-        instance_id = instance_name or f"{agent_name}_{len(self.agents)}"
-
-        info = AgentInfo(
-            name=instance_id,
-            state=AgentState.STARTING,
-            started_at=time.time(),
-        )
-
         with self._lock:
             self.agents[instance_id] = info
-
-        # Create agent's interpreter with its own environment
-        interpreter = Interpreter()
-        interpreter.blackboard = self.blackboard._data  # share blackboard data
-
-        # Wire blackboard operations
-        original_share = interpreter.blackboard
-        interpreter.blackboard = {}
-
-        def agent_share(key, value):
-            self.blackboard.write(key, value, agent=instance_id)
-
-        def agent_observe(key):
-            return self.blackboard.read(key, agent=instance_id)
-
-        self._interpreters[instance_id] = interpreter
-
-        # Set initial arguments
-        if args:
-            for k, v in args.items():
-                interpreter.global_env.set(k, v)
-
-        # Run in thread
-        def run_agent():
-            try:
-                info.state = AgentState.WORKING
-                for node in definition["body"]:
-                    interpreter._exec(node, interpreter.global_env)
-                info.state = AgentState.DONE
-            except Exception as e:
-                info.state = AgentState.ERROR
-                info.error = str(e)
-            finally:
-                info.finished_at = time.time()
-
-        thread = threading.Thread(target=run_agent, name=instance_id, daemon=True)
-        self._threads[instance_id] = thread
-        thread.start()
-
-        return instance_id
+            self._threads[instance_id] = thread
 
     def stop(self, instance_id: str):
         """Request an agent to stop."""
@@ -172,7 +122,12 @@ class AgentSwarm:
                 self.agents[instance_id].state = AgentState.STOPPED
 
     def signal(self, signal_name: str, sender: str, data: SynValue = None):
-        """Send a signal that any agent can receive."""
+        """
+        Send a signal that waiting agents can consume.
+
+        Signals are queued, not latched. Each wait_for consumes one signal.
+        Multiple signals with the same name queue up.
+        """
         sig = Signal(
             name=signal_name,
             sender=sender,
@@ -185,24 +140,40 @@ class AgentSwarm:
             self._signals[signal_name].append(sig)
 
             # Wake up anyone waiting for this signal
-            if signal_name in self._signal_events:
-                self._signal_events[signal_name].set()
-
-    def wait_for_signal(self, signal_name: str, timeout: float = None) -> Optional[Signal]:
-        """Wait for a signal. Returns the most recent one."""
-        with self._lock:
-            # Check if signal already exists
-            if signal_name in self._signals and self._signals[signal_name]:
-                return self._signals[signal_name][-1]
             if signal_name not in self._signal_events:
                 self._signal_events[signal_name] = threading.Event()
+            self._signal_events[signal_name].set()
+
+    def wait_for_signal(self, signal_name: str, timeout: float = None) -> Optional[Signal]:
+        """
+        Wait for and CONSUME one signal. Returns it and removes from queue.
+
+        If a signal is already queued, returns immediately (consumes it).
+        If no signal, blocks until one arrives or timeout.
+        """
+        with self._lock:
+            # Check if signal already queued — consume it
+            if signal_name in self._signals and self._signals[signal_name]:
+                sig = self._signals[signal_name].pop(0)
+                # Reset event if queue is now empty
+                if not self._signals[signal_name] and signal_name in self._signal_events:
+                    self._signal_events[signal_name].clear()
+                return sig
+            # No signal yet — prepare to wait
+            if signal_name not in self._signal_events:
+                self._signal_events[signal_name] = threading.Event()
+            self._signal_events[signal_name].clear()
             event = self._signal_events[signal_name]
 
+        # Block outside the lock
         signaled = event.wait(timeout=timeout)
         if signaled:
             with self._lock:
                 if signal_name in self._signals and self._signals[signal_name]:
-                    return self._signals[signal_name][-1]
+                    sig = self._signals[signal_name].pop(0)
+                    if not self._signals[signal_name]:
+                        self._signal_events[signal_name].clear()
+                    return sig
         return None
 
     def wait_all(self, timeout: float = 60):
