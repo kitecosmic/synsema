@@ -1,0 +1,16 @@
+-- Error Demo: shows rich error diagnostics
+intent: "Calculate order totals and discounts"
+
+type Order
+    customer: text
+    quantity: number
+    price: number
+
+task calculate_unit_price(order)
+    let total be price of order
+    let units be quantity of order
+    give total / units
+
+let bad_order be Order("Alice", 0, 100)
+let result be calculate_unit_price(bad_order)
+print(text(result))

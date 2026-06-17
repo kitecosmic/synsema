@@ -1,0 +1,31 @@
+-- Syntecnia: LLM Integration Demo
+-- Shows reasoning, decisions, analysis, and generation
+
+intent: "Handle customer support ticket using AI reasoning"
+
+-- Simulated ticket data
+let ticket be {
+    "customer": "Bob",
+    "issue": "My order arrived damaged",
+    "order_id": "ORD-4521",
+    "amount": 89.99
+}
+
+show ticket as "Incoming Ticket"
+
+-- LLM-powered analysis
+let analysis be analyze ticket for "sentiment and urgency"
+print("Analysis: " + analysis)
+
+-- LLM-powered decision
+let action be decide between ["refund", "replace", "escalate"] given ticket
+print("Decided action: " + action)
+
+-- LLM-powered generation
+let response be generate "customer response email" given ticket with tone = "empathetic"
+print("Generated response: " + response)
+
+-- Human confirmation before sending
+confirm "Send this response to " + customer of ticket + "?"
+
+print("Ticket resolved!")

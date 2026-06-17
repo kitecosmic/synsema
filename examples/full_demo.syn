@@ -1,0 +1,138 @@
+-- Syntecnia: Full Feature Demo
+-- Demonstrates all 5 layers of the language
+
+-- ============================================
+-- LAYER 1: Core Language
+-- ============================================
+
+-- Variables and types
+let name be "Syntecnia"
+let version be 0.1
+let features be ["capabilities", "agents", "llm", "human", "observability"]
+
+-- Custom type
+type Product
+    name: text
+    price: number
+    stock: number
+
+let laptop be Product("MacBook Pro", 2499.99, 15)
+let phone be Product("iPhone", 999.99, 42)
+let products be [laptop, phone]
+
+-- Tasks (functions)
+task format_price(amount)
+    when amount >= 1000
+        give "$" + text(amount)
+    otherwise
+        give "$" + text(amount)
+
+task find_expensive(products, threshold)
+    let result be []
+    each p in products
+        when price of p > threshold
+            set result to append(result, p)
+    give result
+
+-- Pipe operator
+task discount(product)
+    let new_price be price of product * 0.9
+    give Product(name of product, new_price, stock of product)
+
+-- Pattern matching
+task categorize(price)
+    match true
+        is price > 2000
+            give "premium"
+        is price > 500
+            give "mid-range"
+        is true
+            give "budget"
+
+-- ============================================
+-- LAYER 2: Capabilities & Security
+-- ============================================
+
+-- Declare what this program needs
+require stdout
+require time
+
+-- ============================================
+-- LAYER 3: Observability
+-- ============================================
+
+trace "product_processing"
+    let expensive be find_expensive(products, 1500)
+    each p in expensive
+        log "Expensive product: " + name of p + " at " + format_price(price of p)
+
+    checkpoint "after_filter"
+
+-- ============================================
+-- LAYER 4: Agent Coordination
+-- ============================================
+
+-- Share data on blackboard
+share products as "product_catalog"
+
+-- Later, another agent could observe this:
+observe "product_catalog" as catalog
+print("Catalog has " + text(length(catalog)) + " products")
+
+-- ============================================
+-- LAYER 5: Human Interaction & LLM
+-- ============================================
+
+-- Approval gate
+let total_value be 0
+each p in products
+    set total_value to total_value + (price of p * stock of p)
+
+print("Total inventory value: " + format_price(total_value))
+
+when total_value > 50000
+    approve "High inventory value: " + format_price(total_value)
+
+-- LLM-powered analysis (uses mock when no provider configured)
+let category be categorize(price of laptop)
+print("Laptop category: " + category)
+
+-- Intent declaration
+intent: "Process product catalog and generate report"
+
+-- Show results
+show features as "Language Features"
+
+-- ============================================
+-- DEMO: Closures, recursion, higher-order
+-- ============================================
+
+task make_counter(start)
+    let count be start
+    task increment()
+        set count to count + 1
+        give count
+    give increment
+
+let counter be make_counter(0)
+print("Counter: " + text(counter()))
+print("Counter: " + text(counter()))
+print("Counter: " + text(counter()))
+
+-- Recursive fibonacci
+task fib(n)
+    when n <= 1
+        give n
+    otherwise
+        give fib(n - 1) + fib(n - 2)
+
+print("fib(10) = " + text(fib(10)))
+
+-- Map-like operation with pipe
+task square(x)
+    give x * 2
+
+let result be 7 |> square |> square |> square
+print("7 |> square |> square |> square = " + text(result))
+
+print("\nSyntecnia v" + text(version) + " — All systems operational.")

@@ -1,0 +1,39 @@
+-- Syntecnia: Hello World
+-- This is the simplest Syntecnia program
+
+let greeting be "Hello from Syntecnia!"
+show greeting
+
+-- Variables and arithmetic
+let x be 10
+let y be 20
+let sum be x + y
+print("Sum: " + text(sum))
+
+-- A simple task (function)
+task greet(name)
+    give "Hello, " + name + "!"
+
+let message be greet("World")
+print(message)
+
+-- Conditional flow
+let score be 85
+when score >= 90
+    print("Excellent!")
+otherwise when score >= 70
+    print("Good job!")
+otherwise
+    print("Keep trying!")
+
+-- Iteration
+let fruits be ["apple", "banana", "cherry"]
+each fruit in fruits
+    print("I like " + fruit)
+
+-- Lists and operations
+let numbers be [1, 2, 3, 4, 5]
+let total be 0
+each n in numbers
+    set total to total + n
+print("Total: " + text(total))

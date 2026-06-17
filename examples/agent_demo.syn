@@ -1,0 +1,75 @@
+-- Syntecnia: Agent & Capability Demo
+-- Shows agent definitions, capabilities, human interaction, and observability
+
+intent: "Demonstrate agent-based order processing"
+
+-- Define a data type
+type Order
+    customer: text
+    product: text
+    amount: number
+
+-- Create an order
+let order be Order("Alice", "Laptop", 1299.99)
+print("Order: " + customer of order + " wants " + product of order)
+
+-- Capability declaration
+require net("api.payment.com")
+require file("/var/log/orders/*")
+
+-- Task with tracing
+task process_payment(order)
+    trace "payment_processing"
+        let amount be amount of order
+        log "Processing payment of " + text(amount)
+
+        -- Human approval for large amounts
+        when amount > 1000
+            approve "Large payment: $" + text(amount) + " for " + customer of order
+
+        checkpoint "after_payment"
+        give "Payment processed: $" + text(amount)
+
+let result be process_payment(order)
+print(result)
+
+-- Invariant checking
+let balance be 5000
+invariant: balance > 0
+
+-- Pattern matching
+let status be "pending"
+match status
+    is "pending"
+        print("Order is pending")
+    is "shipped"
+        print("Order shipped!")
+    is "delivered"
+        print("Order delivered!")
+
+-- Pipe operator
+task double(n)
+    give n * 2
+
+task add_one(n)
+    give n + 1
+
+let result2 be 5 |> double |> add_one
+print("5 |> double |> add_one = " + text(result2))
+
+-- Shared state (blackboard)
+share order as "current_order"
+observe "current_order" as retrieved
+print("Retrieved from blackboard: " + customer of retrieved)
+
+-- Map operations
+let config be {"host": "localhost", "port": 8080, "debug": true}
+print("Host: " + host of config)
+print("Keys: " + text(keys(config)))
+
+-- Sandbox block
+sandbox
+    let untrusted be "user input here"
+    print("Sandboxed: " + untrusted)
+
+print("Done!")

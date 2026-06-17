@@ -1,0 +1,27 @@
+-- Syntecnia Flat Syntax Demo
+-- This reads like a document, not like code
+
+task calculate_discount(price):
+    When price > 100, give price * 0.9.
+    Otherwise, give price.
+end
+
+task is_expensive(item):
+    Give price of item > 50.
+end
+
+let products be [{"name": "Laptop", "price": 1200}, {"name": "Mouse", "price": 25}, {"name": "Monitor", "price": 400}]
+
+-- Intentional operations instead of loops
+let expensive be where(products, is_expensive)
+let names be collect(expensive, "name")
+For each name in names, print("Expensive: " + name).
+
+-- Reduce to total
+let prices be collect(products, "price")
+task add(a, b):
+    Give a + b.
+end
+
+let total be reduce(prices, add, 0)
+print("Total: " + text(total)).
