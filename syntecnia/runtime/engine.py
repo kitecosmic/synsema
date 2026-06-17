@@ -31,6 +31,7 @@ from ..capabilities.intent import IntentEnforcer, ActionCategory
 from ..llm.provider import LLMProvider, LLMRequest, create_provider
 from .error_reporter import ErrorReporter, ErrorDiagnostic
 from .recovery import RecoveryProtocol
+from ..llm.context import LLMContext, build_contextual_prompt
 from ..agents.progress import ProgressManager
 from ..agents.memory import AgentMemory
 from ..agents.builtins import register_agent_builtins
@@ -100,6 +101,9 @@ class SyntecniaEngine:
         # Capability scoping for tasks
         self._cap_stack: List[CapabilitySet] = []
         self.interpreter._capability_scope_callback = self._capability_scope
+
+        # LLM context builder
+        self.llm_context = LLMContext()
 
         # Error reporter and recovery
         self.error_reporter = ErrorReporter()
@@ -218,9 +222,66 @@ class SyntecniaEngine:
         self._output_buffer.append(text)
 
     def _on_llm(self, operation: str, data: dict) -> str:
+        # Gather current context for the LLM
+        self._update_llm_context()
+
         if self.llm_provider:
+            # If using a provider instance with contextual prompts
+            if hasattr(self, '_llm_provider_instance') and self._llm_provider_instance:
+                from ..llm.provider import LLMRequest
+                prompt = build_contextual_prompt(operation, data, self.llm_context)
+                request = LLMRequest(operation=operation, data={"_raw_prompt": prompt})
+                # Override the provider's prompt building
+                request.data = data
+                request.data["_contextual_prompt"] = prompt
+                response = self._llm_provider_instance.call(request)
+                return response.content
             return self.llm_provider(operation, data)
         return f"[LLM:{operation} not configured]"
+
+    def _update_llm_context(self):
+        """Gather all available context for the next LLM call."""
+        # Intent
+        if self.intent_enforcer.intent:
+            self.llm_context.set_intent(self.intent_enforcer.intent.description)
+
+        # Variables (filter to user-defined only)
+        env_dump = self.interpreter.global_env.dump()
+        user_vars = {}
+        for k, v in env_dump.items():
+            s = str(v)
+            if not s.startswith("SynValue(task:") and "builtin:" not in s:
+                user_vars[k] = s
+        self.llm_context.set_variables(user_vars)
+
+        # Active trace
+        if self.error_reporter.active_traces:
+            self.llm_context.set_trace(self.error_reporter.active_traces[-1])
+
+        # Rules
+        active_rules = self.agent_memory.get_rules()
+        self.llm_context.set_rules([r.to_dict() for r in active_rules])
+
+        # Recent memory (last 5 entries)
+        recent = self.agent_memory.recall(limit=5)
+        self.llm_context.set_memory([{
+            "category": e.category.value,
+            "content": e.content,
+        } for e in recent])
+
+        # Progress
+        for task_name, progress in self.progress_manager.tasks.items():
+            current = progress.current_step()
+            if current:
+                self.llm_context.set_progress(
+                    current.name,
+                    progress.status_summary,
+                )
+                break
+
+        # Capabilities
+        caps = [str(c) for c in self.capabilities.granted]
+        self.llm_context.set_capabilities(caps)
 
     def _on_human(self, action: str, message: str) -> Any:
         if self.human_handler:

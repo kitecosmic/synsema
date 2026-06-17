@@ -58,6 +58,10 @@ class LLMProvider(ABC):
 
     def _build_prompt(self, request: LLMRequest) -> str:
         """Build a prompt from the request data."""
+        # Use contextual prompt if the engine built one
+        if "_contextual_prompt" in request.data:
+            return request.data["_contextual_prompt"]
+
         op = request.operation
         data = request.data
 
