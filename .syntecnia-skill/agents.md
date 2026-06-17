@@ -1,6 +1,7 @@
 # Syntecnia Multi-Agent System
 
 ## Agent definition
+Defining an agent registers it. The body does NOT run until spawned.
 ```
 agent Researcher
     require net("*.wikipedia.org")
@@ -10,9 +11,11 @@ agent Researcher
         signal "search_done" with data
 ```
 
-## Spawning
+## Spawning (runs in a real thread)
 ```
 spawn Researcher with query = "AI safety"
+-- The agent body now runs in a separate thread
+-- Multiple spawns create independent agent instances
 ```
 
 ## Blackboard (shared state)
@@ -22,11 +25,12 @@ observe "key" as variable      -- read
 -- Blackboard is thread-safe, versioned, watchable
 ```
 
-## Signals
+## Signals (real blocking)
 ```
-signal "done" with result_data
-wait_for "done" as result
+signal "done" with result_data    -- wakes up any agent waiting for "done"
+wait_for "done" as result         -- blocks the current thread until signal arrives
 ```
+`wait_for` truly blocks (up to 30s timeout). `signal` wakes all waiters via threading.Event.
 
 ## Resource locking (preventive)
 Agents declare what they're working on BEFORE touching it:

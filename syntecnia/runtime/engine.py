@@ -31,6 +31,7 @@ from ..capabilities.intent import IntentEnforcer, ActionCategory
 from ..llm.provider import LLMProvider, LLMRequest, create_provider
 from .error_reporter import ErrorReporter, ErrorDiagnostic
 from .recovery import RecoveryProtocol
+from ..agents.swarm import AgentSwarm
 from ..llm.context import LLMContext, build_contextual_prompt
 from ..llm.validator import ResponseValidator
 from ..agents.progress import ProgressManager
@@ -113,6 +114,10 @@ class SyntecniaEngine:
             output_callback=self._on_output,
         )
 
+        # Agent swarm (real threading)
+        self.swarm = AgentSwarm()
+        self._wire_swarm()
+
         # Agent systems: progress, memory, rules
         self.progress_manager = ProgressManager()
         self.agent_memory = AgentMemory()
@@ -131,6 +136,75 @@ class SyntecniaEngine:
         self.interpreter.output_callback = self._on_output
         self.interpreter.llm_callback = self._on_llm
         self.interpreter.human_callback = self._on_human
+
+    def _wire_swarm(self):
+        """Connect the interpreter to the real swarm for agent operations."""
+        interp = self.interpreter
+        swarm = self.swarm
+
+        def swarm_spawn(agent_name, body, parent_env, spawn_args):
+            """Spawn an agent in a real thread."""
+            import threading
+            from ..core.interpreter import Interpreter, Environment, GiveSignal
+
+            instance_id = f"{agent_name}_{len(swarm.agents)}"
+
+            def run_agent():
+                # Each agent gets its own interpreter for thread safety
+                agent_interp = Interpreter()
+                agent_interp.output_callback = interp.output_callback
+                agent_interp.llm_callback = interp.llm_callback
+                agent_interp.human_callback = interp.human_callback
+
+                # Wire the agent interpreter to the same swarm
+                agent_interp._swarm_share = lambda k, v: swarm.blackboard.write(k, v, agent=instance_id)
+                agent_interp._swarm_observe = lambda k: swarm.blackboard.read(k, agent=instance_id)
+                agent_interp._swarm_signal = lambda name, data: swarm.signal(name, instance_id, data)
+                agent_interp._swarm_wait_for = lambda name, timeout=30: _wait_signal(name, timeout)
+
+                agent_env = Environment(parent=parent_env, name=f"agent:{instance_id}")
+                for key, val in spawn_args.items():
+                    agent_env.set(key, val)
+
+                try:
+                    if instance_id in swarm.agents:
+                        swarm.agents[instance_id].state = __import__(
+                            'syntecnia.agents.swarm', fromlist=['AgentState']
+                        ).AgentState.WORKING
+                    agent_interp._exec_block(body, agent_env)
+                    if instance_id in swarm.agents:
+                        swarm.agents[instance_id].state = __import__(
+                            'syntecnia.agents.swarm', fromlist=['AgentState']
+                        ).AgentState.DONE
+                except Exception as e:
+                    if instance_id in swarm.agents:
+                        swarm.agents[instance_id].state = __import__(
+                            'syntecnia.agents.swarm', fromlist=['AgentState']
+                        ).AgentState.ERROR
+                        swarm.agents[instance_id].error = str(e)
+
+            from ..agents.swarm import AgentInfo, AgentState
+            import time
+            swarm.agents[instance_id] = AgentInfo(
+                name=instance_id, state=AgentState.STARTING, started_at=time.time(),
+            )
+            thread = threading.Thread(target=run_agent, name=instance_id, daemon=True)
+            swarm._threads[instance_id] = thread
+            thread.start()
+            return instance_id
+
+        def _wait_signal(name, timeout=30):
+            sig = swarm.wait_for_signal(name, timeout=timeout)
+            if sig and sig.data:
+                return sig.data
+            return None
+
+        # Wire callbacks
+        interp._swarm_spawn = swarm_spawn
+        interp._swarm_share = lambda k, v: swarm.blackboard.write(k, v, agent="main")
+        interp._swarm_observe = lambda k: swarm.blackboard.read(k, agent="main")
+        interp._swarm_signal = lambda name, data: swarm.signal(name, "main", data)
+        interp._swarm_wait_for = lambda name, timeout=30: _wait_signal(name, timeout)
 
     def configure_llm_provider(self, provider_name: str, **kwargs):
         """

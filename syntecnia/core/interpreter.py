@@ -601,38 +601,118 @@ class Interpreter:
         env.set(node.name, SynValue(raw=builtin, type=SynTask()))
         return syn_nothing()
 
-    # -- Agent system (basic implementation) --
+    # -- Agent system --
+    # Connected to the real swarm (agents/swarm.py) via callbacks.
+    # The engine wires these up. If no swarm is connected, falls back
+    # to in-process execution.
 
     def _exec_AgentDefinition(self, node: ast.AgentDefinition, env: Environment) -> SynValue:
-        agent_env = Environment(parent=env, name=f"agent:{node.name}")
-        self._exec_block(node.body, agent_env)
-        agent_data = syn_map({"name": syn_text(node.name), "state": syn_text("idle")})
+        """
+        Register an agent definition. Does NOT execute the body.
+        The body runs when the agent is spawned.
+        """
+        # Store the agent definition (name → AST body + parent env)
+        if not hasattr(self, '_agent_definitions'):
+            self._agent_definitions = {}
+        self._agent_definitions[node.name] = {
+            "body": node.body,
+            "parent_env": env,
+        }
+        self.logs.append({"type": "agent_define", "name": node.name})
+        # Set the agent name in env so it can be referenced
+        agent_data = syn_map({"name": syn_text(node.name), "state": syn_text("defined")})
         env.set(node.name, agent_data)
         return agent_data
 
     def _exec_SpawnStatement(self, node: ast.SpawnStatement, env: Environment) -> SynValue:
-        self.logs.append({"type": "spawn", "agent": node.agent_name, "args": str(node.arguments)})
+        """
+        Spawn an agent — runs its body in a real thread via the swarm.
+        If no swarm is connected, runs in-process (blocking).
+        """
+        if not hasattr(self, '_agent_definitions'):
+            self._agent_definitions = {}
+
+        definition = self._agent_definitions.get(node.agent_name)
+        if not definition:
+            raise RuntimeError(f"No agent defined with name '{node.agent_name}'", node.location)
+
+        body = definition["body"]
+        parent_env = definition["parent_env"]
+
+        # Evaluate spawn arguments
+        spawn_args = {}
+        for key, val_node in node.arguments.items():
+            spawn_args[key] = self._exec(val_node, env)
+
+        self.logs.append({"type": "spawn", "agent": node.agent_name, "args": list(spawn_args.keys())})
+
+        # Use swarm callback if available (real threading)
+        if hasattr(self, '_swarm_spawn') and self._swarm_spawn:
+            instance_id = self._swarm_spawn(node.agent_name, body, parent_env, spawn_args)
+            return syn_text(instance_id)
+
+        # Fallback: run in-process (blocking, for simple cases)
+        agent_env = Environment(parent=parent_env, name=f"agent:{node.agent_name}")
+        for key, val in spawn_args.items():
+            agent_env.set(key, val)
+        self._exec_block(body, agent_env)
         return syn_text(f"agent:{node.agent_name}")
 
     def _exec_ShareStatement(self, node: ast.ShareStatement, env: Environment) -> SynValue:
+        """Publish a value to the shared blackboard."""
         value = self._exec(node.value, env)
-        self.blackboard[node.key] = value
+
+        # Use swarm blackboard if available (thread-safe)
+        if hasattr(self, '_swarm_share') and self._swarm_share:
+            self._swarm_share(node.key, value)
+        else:
+            self.blackboard[node.key] = value
+
         self.logs.append({"type": "share", "key": node.key})
         return value
 
     def _exec_ObserveStatement(self, node: ast.ObserveStatement, env: Environment) -> SynValue:
-        if node.key not in self.blackboard:
+        """Read a value from the shared blackboard."""
+        value = None
+
+        # Use swarm blackboard if available (thread-safe)
+        if hasattr(self, '_swarm_observe') and self._swarm_observe:
+            value = self._swarm_observe(node.key)
+        else:
+            value = self.blackboard.get(node.key)
+
+        if value is None:
             env.set(node.variable, syn_nothing())
             return syn_nothing()
-        value = self.blackboard[node.key]
+
         env.set(node.variable, value)
         return value
 
     def _exec_SignalStatement(self, node: ast.SignalStatement, env: Environment) -> SynValue:
+        """Send a signal to other agents."""
+        data = None
+        if node.data:
+            data = self._exec(node.data, env)
+
+        # Use swarm signals if available (real threading.Event)
+        if hasattr(self, '_swarm_signal') and self._swarm_signal:
+            self._swarm_signal(node.name, data)
         self.logs.append({"type": "signal", "name": node.name})
         return syn_nothing()
 
     def _exec_WaitForStatement(self, node: ast.WaitForStatement, env: Environment) -> SynValue:
+        """Block until a signal is received."""
+        # Use swarm wait if available (real blocking)
+        if hasattr(self, '_swarm_wait_for') and self._swarm_wait_for:
+            result = self._swarm_wait_for(node.signal_name, timeout=30)
+            if result and node.variable:
+                env.set(node.variable, result)
+                return result
+            elif node.variable:
+                env.set(node.variable, syn_nothing())
+            return syn_nothing()
+
+        # Fallback: no swarm, just log
         self.logs.append({"type": "wait_for", "signal": node.signal_name})
         if node.variable:
             env.set(node.variable, syn_nothing())
