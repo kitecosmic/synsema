@@ -32,6 +32,7 @@ from ..llm.provider import LLMProvider, LLMRequest, create_provider
 from .error_reporter import ErrorReporter, ErrorDiagnostic
 from .recovery import RecoveryProtocol
 from ..llm.context import LLMContext, build_contextual_prompt
+from ..llm.validator import ResponseValidator
 from ..agents.progress import ProgressManager
 from ..agents.memory import AgentMemory
 from ..agents.builtins import register_agent_builtins
@@ -226,17 +227,35 @@ class SyntecniaEngine:
         self._update_llm_context()
 
         if self.llm_provider:
-            # If using a provider instance with contextual prompts
-            if hasattr(self, '_llm_provider_instance') and self._llm_provider_instance:
-                from ..llm.provider import LLMRequest
-                prompt = build_contextual_prompt(operation, data, self.llm_context)
-                request = LLMRequest(operation=operation, data={"_raw_prompt": prompt})
-                # Override the provider's prompt building
-                request.data = data
-                request.data["_contextual_prompt"] = prompt
-                response = self._llm_provider_instance.call(request)
-                return response.content
-            return self.llm_provider(operation, data)
+            def raw_call(op, call_data):
+                """Raw LLM call that builds contextual prompt."""
+                # Include retry feedback in prompt if present
+                retry_feedback = call_data.pop("_retry_feedback", None)
+
+                if hasattr(self, '_llm_provider_instance') and self._llm_provider_instance:
+                    from ..llm.provider import LLMRequest
+                    prompt = build_contextual_prompt(op, call_data, self.llm_context)
+                    if retry_feedback:
+                        prompt += f"\n\nIMPORTANT: {retry_feedback}"
+                    call_data["_contextual_prompt"] = prompt
+                    request = LLMRequest(operation=op, data=call_data)
+                    response = self._llm_provider_instance.call(request)
+                    return response.content
+                return self.llm_provider(op, call_data)
+
+            # Use validator for validated calls
+            validator = ResponseValidator(raw_call, max_retries=3)
+            result = validator.call_validated(operation, data)
+
+            if result.valid:
+                return result.value
+
+            # Validation failed after retries — log and return raw
+            self._output_buffer.append(
+                f"[WARN] LLM response validation failed after {result.attempts} attempts: {result.error}"
+            )
+            return result.raw_response
+
         return f"[LLM:{operation} not configured]"
 
     def _update_llm_context(self):
