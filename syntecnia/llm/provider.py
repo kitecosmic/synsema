@@ -278,14 +278,15 @@ class MiniMaxProvider(LLMProvider):
     Messages API, so we reuse that structure: messages array with role/content,
     model field, max_tokens, etc.
 
-    Endpoint: https://api.minimaxi.chat/v1/messages
+    Endpoint: https://api.minimax.io/anthropic/v1/messages
     Auth: x-api-key header (same as Anthropic)
+    Doc: https://platform.minimax.io/docs/api-reference/text-anthropic-api
     """
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "MiniMax-M1"):
+    def __init__(self, api_key: Optional[str] = None, model: str = "MiniMax-M3"):
         self.api_key = api_key or os.environ.get("MINIMAX_API_KEY", "")
         self.model = model
-        self.api_url = "https://api.minimaxi.chat/v1/messages"
+        self.api_url = "https://api.minimax.io/anthropic/v1/messages"
 
     def name(self) -> str:
         return f"minimax:{self.model}"
@@ -313,6 +314,7 @@ class MiniMaxProvider(LLMProvider):
         req = urllib.request.Request(self.api_url)
         req.add_header("Content-Type", "application/json")
         req.add_header("x-api-key", self.api_key)
+        req.add_header("anthropic-version", "2023-06-01")
         req.data = payload.encode("utf-8")
 
         start = time.perf_counter()
