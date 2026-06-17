@@ -266,6 +266,77 @@ class OllamaProvider(LLMProvider):
             )
 
 
+class MiniMaxProvider(LLMProvider):
+    """
+    MiniMax M3 provider — uses the Anthropic-compatible Messages API.
+
+    MiniMax exposes an endpoint that accepts the same format as Anthropic's
+    Messages API, so we reuse that structure: messages array with role/content,
+    model field, max_tokens, etc.
+
+    Endpoint: https://api.minimaxi.chat/v1/messages
+    Auth: x-api-key header (same as Anthropic)
+    """
+
+    def __init__(self, api_key: Optional[str] = None, model: str = "MiniMax-M1"):
+        self.api_key = api_key or os.environ.get("MINIMAX_API_KEY", "")
+        self.model = model
+        self.api_url = "https://api.minimaxi.chat/v1/messages"
+
+    def name(self) -> str:
+        return f"minimax:{self.model}"
+
+    def call(self, request: LLMRequest) -> LLMResponse:
+        import urllib.request
+        import time
+
+        if not self.api_key:
+            return LLMResponse(
+                content="[MiniMax API key not configured. Set MINIMAX_API_KEY]",
+                model=self.model,
+            )
+
+        prompt = self._build_prompt(request)
+        model = request.model or self.model
+
+        # Anthropic Messages API format
+        payload = json.dumps({
+            "model": model,
+            "max_tokens": request.max_tokens,
+            "messages": [{"role": "user", "content": prompt}],
+        })
+
+        req = urllib.request.Request(self.api_url)
+        req.add_header("Content-Type", "application/json")
+        req.add_header("x-api-key", self.api_key)
+        req.data = payload.encode("utf-8")
+
+        start = time.perf_counter()
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+                duration = (time.perf_counter() - start) * 1000
+
+                # Anthropic response format: content[0].text
+                content = ""
+                if "content" in body and body["content"]:
+                    content = body["content"][0].get("text", "")
+
+                tokens = body.get("usage", {}).get("output_tokens", 0)
+                return LLMResponse(
+                    content=content,
+                    model=model,
+                    tokens_used=tokens,
+                    duration_ms=duration,
+                    raw_response=body,
+                )
+        except Exception as e:
+            return LLMResponse(
+                content=f"[MiniMax API error: {e}]",
+                model=model,
+            )
+
+
 class MockProvider(LLMProvider):
     """Mock provider for testing — returns predictable responses."""
 
@@ -292,6 +363,8 @@ def create_provider(provider_name: str, **kwargs) -> LLMProvider:
         "claude": AnthropicProvider,
         "openai": OpenAIProvider,
         "gpt": OpenAIProvider,
+        "minimax": MiniMaxProvider,
+        "minimax-m1": MiniMaxProvider,
         "ollama": OllamaProvider,
         "local": OllamaProvider,
         "mock": MockProvider,
