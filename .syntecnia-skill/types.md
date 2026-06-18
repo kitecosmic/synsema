@@ -1,7 +1,7 @@
 # Syntecnia Types
 
 ## Primitive types
-- `number` — int or float: `42`, `3.14`, `1_000_000`
+- `number` — int or float: `42`, `3.14`, `1_000_000`. Division always returns float. `text(42)` shows no decimal; `text(3.14)` shows decimal.
 - `text` — string: `"hello"`, `'world'`, supports `\n`, `\t`, `\\`
 - `bool` — `true` or `false`
 - `nothing` — null equivalent

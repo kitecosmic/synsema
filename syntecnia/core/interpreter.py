@@ -715,13 +715,14 @@ class Interpreter:
 
     def _exec_ObserveStatement(self, node: ast.ObserveStatement, env: Environment) -> SynValue:
         """Read a value from the shared blackboard."""
+        key = str(self._exec(node.key, env))
         value = None
 
         # Use swarm blackboard if available (thread-safe)
         if hasattr(self, '_swarm_observe') and self._swarm_observe:
-            value = self._swarm_observe(node.key)
+            value = self._swarm_observe(key)
         else:
-            value = self.blackboard.get(node.key)
+            value = self.blackboard.get(key)
 
         if value is None:
             env.set(node.variable, syn_nothing())

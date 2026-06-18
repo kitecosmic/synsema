@@ -262,8 +262,8 @@ class ShareStatement(Node):
 
 @dataclass
 class ObserveStatement(Node):
-    """observe "search_results" as data"""
-    key: str = ""
+    """observe "search_results" as data — or observe key_expr as data"""
+    key: Node = None  # expression, evaluated at runtime
     variable: str = ""
 
 @dataclass

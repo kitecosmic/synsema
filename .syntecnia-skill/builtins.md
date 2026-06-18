@@ -3,8 +3,8 @@
 ## Core
 - `print(values...)` — output text
 - `length(collection)` → number
-- `text(value)` → string conversion
-- `number(value)` → numeric conversion
+- `text(value)` → string conversion (integers show no decimal: `text(42)` → `"42"`)
+- `number(value)` → numeric conversion (always float: `number("42")` → `42.0`)
 - `append(list, item)` → new list with item added
 - `keys(map)` → list of keys
 - `values(map)` → list of values
@@ -14,6 +14,15 @@
 - `range(end)` or `range(start, end)` or `range(start, end, step)` → list
 - `type_of(value)` → text ("number", "text", "bool", "list", "map", "task", "nothing")
 - `slice(collection, start, end?)` → sub-collection
+
+## Strings
+- `fmt(template, map)` → interpolated text: `fmt("Hi {name}", {"name": "Alice"})` → `"Hi Alice"`
+- `upper(text)` → uppercase
+- `lower(text)` → lowercase
+- `trim(text)` → strip whitespace
+- `starts_with(text, prefix)` → bool
+- `ends_with(text, suffix)` → bool
+- `replace_text(text, old, new)` → text with replacements
 
 ## Intentional operations (replace loops)
 - `apply(function, list)` → list with function applied to each

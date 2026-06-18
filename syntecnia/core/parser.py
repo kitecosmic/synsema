@@ -420,13 +420,13 @@ class Parser:
         return ast.ShareStatement(location=loc, value=value, key=key_expr)
 
     def _parse_observe(self) -> ast.ObserveStatement:
-        """observe "key" as variable"""
+        """observe key_expression as variable"""
         loc = self._location()
         self._advance()
-        key_tok = self._expect(TokenType.TEXT)
+        key_expr = self._parse_expression()
         self._expect(TokenType.AS)
         var_tok = self._expect(TokenType.IDENTIFIER)
-        return ast.ObserveStatement(location=loc, key=key_tok.value, variable=var_tok.value)
+        return ast.ObserveStatement(location=loc, key=key_expr, variable=var_tok.value)
 
     def _parse_signal(self) -> ast.SignalStatement:
         """signal "done" """

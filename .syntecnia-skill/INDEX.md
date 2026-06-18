@@ -23,7 +23,11 @@ Read ONLY the sections you need. Do not load everything.
 ## Deployment
 - [deploy.md](deploy.md) — Daemon mode, Docker, VPS, Kubernetes, systemd
 
+## Troubleshooting
+- [pitfalls.md](pitfalls.md) — **Read first if something fails.** Common errors, surprises, and anti-patterns with solutions.
+
 ## When to read what
+- Something broke → pitfalls.md
 - Writing a new .syn program → syntax.md, builtins.md
 - HTTP / SQL / cron → stdlib.md
 - Deploying to server → deploy.md

@@ -1,5 +1,11 @@
 # Syntecnia Agent Memory & Rules
 
+## Persistence
+
+Memory, progress, and rules **automatically persist between executions**. Stored in SQLite at `~/.syntecnia/state/<program_name>.db`. Auto-loaded on startup, auto-saved after execution.
+
+This means: `remember()` in run 1 → `recall()` in run 2 finds it. If a daemon crashes and restarts, it retains all its knowledge.
+
 ## Progress tracking
 ```
 create_progress("sync", ["fetch", "validate", "update", "notify"])
@@ -8,7 +14,7 @@ complete_step("sync", "fetch", "got 100 items")
 start_step("sync", "validate")
 fail_step("sync", "validate", "3 items invalid")
 
--- After crash, find where to resume:
+-- After crash/restart, find where to resume:
 let next be resume_point("sync")    -- returns "validate" (retry failed)
 
 -- Display:
@@ -19,6 +25,8 @@ show progress_display("sync")
 --   [  ] update
 --   [  ] notify
 ```
+
+Progress persists to disk. A restarted daemon resumes where it left off.
 
 ## Persistent memory
 ```
@@ -36,7 +44,11 @@ let search be recall(nothing, nothing, "Monday")
 forget_memory(entry_id)
 ```
 
-Categories: `preference`, `rule`, `learning`, `decision`, `context`
+**Categories are a fixed set (English only):**
+`preference`, `rule`, `learning`, `decision`, `context`
+
+Using any other string (e.g. `"preferencia"`) raises an error:
+`Invalid memory category: 'preferencia'. Valid categories: preference, rule, learning, decision, context`
 
 ## Owner rules
 ```
@@ -44,7 +56,6 @@ Categories: `preference`, `rule`, `learning`, `decision`, `context`
 add_rule("max_discount", "must", "discount <= 0.20", "pricing")
 add_rule("formal_tone", "prefer", "Use formal tone in emails", "communication")
 add_rule("no_delete", "must", "Never delete customer data", "data")
-add_rule("minimize_api", "avoid", "Avoid unnecessary API calls", "performance")
 
 -- Check before acting
 let violations be check_rules("pricing", {"discount": 0.25})
@@ -61,13 +72,9 @@ Rule levels:
 - `avoid` — preference against doing something
 - `prefer` — preference for doing something
 
+Rules with numeric conditions (e.g. `"discount <= 0.20"`) are auto-extracted and evaluated against the context map.
+
 ## Summary
 ```
 print(memory_summary())
--- Output:
---   Agent Memory: 5 entries, 3 rules
---   Entries: 2 preference, 2 learning, 1 context
---   Rules:
---     [must  ] max_discount: discount <= 0.20
---     [prefer] formal_tone: Use formal tone in emails
 ```
