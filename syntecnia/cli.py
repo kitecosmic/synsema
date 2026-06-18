@@ -203,6 +203,21 @@ def main():
                 engine.swarm.wait_all(timeout=10)
                 print("\n" + engine.swarm.format_dashboard())
 
+            if engine.servers:
+                # An HTTP server (serve on PORT) is running — keep alive.
+                print(
+                    f"\n{len(engine.servers)} HTTP server(s) running. "
+                    f"Press Ctrl+C to stop."
+                )
+                try:
+                    engine.wait_servers()
+                except KeyboardInterrupt:
+                    pass
+                engine.cron_scheduler.cancel_all()
+                engine.db_manager.close_all()
+                print("\nStopped.")
+                return
+
             if "--serve" in args:
                 # Keep process alive for cron jobs and agents
                 jobs = engine.cron_scheduler.list_jobs()

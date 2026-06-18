@@ -176,6 +176,10 @@ class Parser:
             return self._parse_type_definition()
         elif tt == TokenType.TRY:
             return self._parse_try_recover()
+        elif tt == TokenType.SERVE:
+            return self._parse_serve()
+        elif tt == TokenType.EXPECT:
+            return self._parse_expect()
         else:
             # Expression statement (e.g., function call)
             return self._parse_expression()
@@ -454,7 +458,12 @@ class Parser:
         """require net("api.example.com")"""
         loc = self._location()
         self._advance()
-        cap_tok = self._expect(TokenType.IDENTIFIER)
+        # Capability names are identifiers, but `serve` is also a keyword;
+        # accept it (and its value "serve") here.
+        if self._check(TokenType.SERVE):
+            cap_tok = self._advance()
+        else:
+            cap_tok = self._expect(TokenType.IDENTIFIER)
         scope = None
         if self._match(TokenType.LPAREN):
             scope = self._parse_expression()
@@ -541,6 +550,107 @@ class Parser:
         self._advance()
         name_tok = self._expect(TokenType.TEXT)
         return ast.CheckpointStatement(location=loc, name=name_tok.value)
+
+    # -- HTTP server --
+
+    def _parse_serve(self) -> ast.ServeBlock:
+        """
+        serve on PORT
+            auth with <task>          (optional)
+            route "GET /path" [requires auth]
+                body...
+        """
+        loc = self._location()
+        self._advance()  # consume 'serve'
+        self._expect(TokenType.ON, "Expected 'on' after 'serve' (serve on PORT)")
+        port = self._parse_expression()
+
+        auth_handler = None
+        routes = []
+
+        self._skip_newlines()
+        self._expect(TokenType.INDENT, "Expected an indented block after 'serve on PORT'")
+        self._skip_newlines()
+
+        while not self._at_end() and not self._check(TokenType.DEDENT):
+            if self._check(TokenType.AUTH):
+                self._advance()  # consume 'auth'
+                self._expect(TokenType.WITH, "Expected 'with' after 'auth' (auth with <task>)")
+                auth_handler = self._parse_expression()
+            elif self._check(TokenType.ROUTE):
+                routes.append(self._parse_route())
+            else:
+                tok = self._current()
+                raise ParseError(
+                    f"Inside 'serve', expected 'auth with ...' or 'route ...', "
+                    f"got {tok.type.name}",
+                    tok.location,
+                )
+            self._skip_newlines()
+
+        if self._check(TokenType.DEDENT):
+            self._advance()
+
+        return ast.ServeBlock(
+            location=loc, port=port, auth_handler=auth_handler, routes=routes,
+        )
+
+    def _parse_route(self) -> ast.RouteDefinition:
+        """route "METHOD /path/:param" [requires auth]\n    body"""
+        loc = self._location()
+        self._advance()  # consume 'route'
+        spec_tok = self._expect(TokenType.TEXT, "Expected a route spec string, e.g. \"GET /path\"")
+        method, path, param_names = self._split_route_spec(spec_tok.value, spec_tok.location)
+
+        requires_auth = False
+        if self._match(TokenType.REQUIRES):
+            self._expect(TokenType.AUTH, "Expected 'auth' after 'requires' (requires auth)")
+            requires_auth = True
+
+        body = self._parse_block()
+        return ast.RouteDefinition(
+            location=loc, method=method, path=path,
+            param_names=param_names, requires_auth=requires_auth, body=body,
+        )
+
+    def _split_route_spec(self, spec: str, loc) -> tuple:
+        """Parse 'GET /products/:id' → ('GET', '/products/:id', ['id'])."""
+        parts = spec.strip().split(None, 1)
+        if len(parts) != 2:
+            raise ParseError(
+                f"Route spec must be \"METHOD /path\", got {spec!r}", loc,
+            )
+        method = parts[0].upper()
+        path = parts[1].strip()
+        if not path.startswith("/"):
+            raise ParseError(f"Route path must start with '/', got {path!r}", loc)
+        param_names = [
+            seg[1:] for seg in path.split("/")
+            if seg.startswith(":") and len(seg) > 1
+        ]
+        return method, path, param_names
+
+    def _parse_expect(self) -> ast.ExpectStatement:
+        """expect body {field: type, ...}"""
+        loc = self._location()
+        self._advance()  # consume 'expect'
+        target_tok = self._expect(TokenType.IDENTIFIER, "Expected 'body' after 'expect'")
+        self._expect(TokenType.LBRACE, "Expected '{' to declare the expected shape")
+        shape = []
+        if not self._check(TokenType.RBRACE):
+            shape.append(self._parse_expect_field())
+            while self._match(TokenType.COMMA):
+                if self._check(TokenType.RBRACE):
+                    break
+                shape.append(self._parse_expect_field())
+        self._expect(TokenType.RBRACE, "Expected '}' to close the expected shape")
+        return ast.ExpectStatement(location=loc, target=target_tok.value, shape=shape)
+
+    def _parse_expect_field(self) -> tuple:
+        field_tok = self._expect(TokenType.IDENTIFIER, "Expected a field name in expect shape")
+        self._expect(TokenType.COLON, "Expected ':' after field name in expect shape")
+        type_tok = self._expect(TokenType.IDENTIFIER, "Expected a type name (text, number, bool, list, map)")
+        return (field_tok.value, type_tok.value)
 
     # =========================================================
     # Expressions (Pratt parser)

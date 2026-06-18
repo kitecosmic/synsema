@@ -4,7 +4,9 @@
 Nothing works without declaring capabilities.
 
 ## Capability types
-`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `db`
+`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `db`, `serve`
+
+`serve(PORT)` allows binding an HTTP server to that port — see [serve.md](serve.md).
 
 ## Declaring capabilities
 ```

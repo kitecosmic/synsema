@@ -410,3 +410,40 @@ class TryRecover(Node):
     try_body: List[Node] = field(default_factory=list)
     error_variable: str = "error"  # variable name for the error
     recover_body: List[Node] = field(default_factory=list)
+
+
+# -- HTTP Server --
+
+@dataclass
+class RouteDefinition(Node):
+    """
+    route "GET /products/:id" requires auth
+        let p be find_product(params.id)
+        give p
+    """
+    method: str = "GET"
+    path: str = "/"                      # pattern, may contain :params
+    param_names: List[str] = field(default_factory=list)  # named path params
+    requires_auth: bool = False
+    body: List[Node] = field(default_factory=list)
+
+@dataclass
+class ServeBlock(Node):
+    """
+    serve on 8080
+        auth with check_token
+        route "GET /products"
+            give all_products()
+    """
+    port: Node = None                    # expression evaluating to the port number
+    auth_handler: Optional[Node] = None  # expression resolving to the auth task
+    routes: List[RouteDefinition] = field(default_factory=list)
+
+@dataclass
+class ExpectStatement(Node):
+    """
+    expect body {name: text, age: number}
+    Validates the request's parsed JSON body against the declared shape.
+    """
+    target: str = "body"                 # what to validate (currently: body)
+    shape: List[tuple] = field(default_factory=list)  # [(field_name, type_name)]

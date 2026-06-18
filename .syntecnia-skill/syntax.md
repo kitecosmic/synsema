@@ -8,6 +8,7 @@ Security: `require`, `sandbox`, `invariant`, `intent`
 Human: `approve`, `confirm`, `ask`, `show`
 LLM: `reason`, `decide`, `analyze`, `generate`
 Error handling: `try`, `recover`
+HTTP server: `serve`, `on`, `route`, `auth`, `requires`, `expect`
 Observability: `trace`, `log`, `measure`, `checkpoint`
 Logic: `and`, `or`, `not`
 Literals: `true`, `false`, `nothing`

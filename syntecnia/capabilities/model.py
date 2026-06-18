@@ -48,6 +48,7 @@ class CapabilityType(Enum):
     STDIN = auto()       # Read from stdin
     LLM = auto()         # LLM API access
     DB = auto()           # Database access
+    SERVE = auto()        # Bind/listen on a TCP port (HTTP server)
 
 
 # Map from string names to types
@@ -64,6 +65,7 @@ CAPABILITY_NAMES = {
     "stdin": CapabilityType.STDIN,
     "llm": CapabilityType.LLM,
     "db": CapabilityType.DB,
+    "serve": CapabilityType.SERVE,
 }
 
 

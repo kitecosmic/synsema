@@ -141,6 +141,48 @@ let sorted be sort_by(products, get_price)
 let groups be group_by(orders, get_status)
 ```
 
+### HTTP server
+
+A native, zero-dependency HTTP server (built on `http.server`). The runtime
+enforces a consistent response contract, pagination, auth and input validation.
+
+```
+require serve(8080)
+
+task check_token(token)
+    when token == "admin-key"
+        give {"role": "admin"}
+    give nothing
+
+serve on 8080
+    auth with check_token
+
+    route "GET /products"
+        give sql("SELECT id, name, price FROM products")     -- list → paginated envelope
+
+    route "GET /products/:id"
+        let rows be sql("SELECT * FROM products WHERE id = ?", [params.id])
+        when length(rows) == 0
+            give not_found("product not found")              -- 404
+        give rows[0]                                          -- map → object as-is
+
+    route "POST /products" requires auth
+        expect body {name: text, price: number}              -- 400 if invalid
+        let b be json of request
+        sql_exec("INSERT INTO products (name, price) VALUES (?, ?)", [name of b, price of b])
+        give created(b)                                       -- 201
+```
+
+- **Capability:** `require serve(PORT)` — scoped to the port. Without it, `serve on PORT` fails with a clear error.
+- **Request:** `request.json`, `request.body`, `request.headers`, `request.user`, plus `query` and `params` maps.
+- **Response contract:** `give <map>` → the object as-is; `give <list>` → `{"items", "count", "total", "cursor"}`. Helpers: `ok(x)`, `created(x)` (201), `not_found(x)` (404), `fail(code, msg)`.
+- **Pagination:** always applied to collections — default `limit` 100, `?limit=` / `?cursor=`, `total` always present.
+- **Auth:** `requires auth` extracts the `Authorization: Bearer` token, calls the `auth with` task; `nothing` → 401, otherwise the value lands in `request.user`.
+- **Validation:** `expect body {field: type}` (`text`, `number`, `bool`, `list`, `map`) → 400 naming the bad field.
+- **Isolation:** each request runs in its own interpreter/scope, like an agent; only the blackboard and DB are shared. Uncaught errors become 500 — never a server crash.
+
+See [.syntecnia-skill/serve.md](.syntecnia-skill/serve.md) for full details.
+
 ## Security
 
 ### Capabilities
@@ -450,7 +492,7 @@ When Syntecnia connects to an LLM, responses are validated automatically:
 - [ ] Port runtime to Rust (tokio async, real parallelism)
 - [ ] Async I/O operations
 - [ ] Database capability and query builder
-- [ ] Web server capability (serve HTTP)
+- [x] Web server capability (`serve on PORT`)
 - [ ] Package manager for verified capabilities
 - [ ] Language server protocol (LSP) for IDE support
 - [ ] Visual dashboard for agent swarm monitoring

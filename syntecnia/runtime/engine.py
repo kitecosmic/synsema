@@ -20,7 +20,7 @@ from ..core.lexer import Lexer, LexerError
 from ..core.parser import Parser, ParseError
 from ..core.interpreter import Interpreter, RuntimeError as SynRuntimeError
 from ..core import ast_nodes as ast
-from ..core.types import SynValue, syn_nothing
+from ..core.types import SynValue, syn_nothing, syn_text, syn_map
 from ..capabilities.model import (
     CapabilitySet, Capability, CapabilityType, CapabilityViolation,
     parse_capability,
@@ -40,6 +40,9 @@ from ..agents.builtins import register_agent_builtins
 from ..stdlib.http import register_http_builtins
 from ..stdlib.database import DatabaseManager, register_database_builtins
 from ..stdlib.cron import CronScheduler, register_cron_builtins
+from ..stdlib.server import (
+    register_serve_builtins, RouteSpec, ServeRuntime, python_to_syn,
+)
 from .persistence import StatePersistence
 
 
@@ -136,6 +139,10 @@ class SyntecniaEngine:
         # State persistence (survives restarts)
         self.persistence: Optional[StatePersistence] = None
 
+        # HTTP servers started by `serve on PORT`
+        self.servers: List[ServeRuntime] = []
+        self.interpreter._serve_callback = self._run_serve
+
         # Register secure builtins (fetch, read_file, etc.)
         register_secure_builtins(self.interpreter.global_env, self.secure_ops)
 
@@ -151,10 +158,170 @@ class SyntecniaEngine:
         register_database_builtins(self.interpreter.global_env, self.db_manager)
         register_cron_builtins(self.interpreter.global_env, self.cron_scheduler, self.interpreter)
 
+        # Register HTTP server response helpers (ok, created, not_found, fail)
+        register_serve_builtins(self.interpreter.global_env)
+
         # Wire up callbacks
         self.interpreter.output_callback = self._on_output
         self.interpreter.llm_callback = self._on_llm
         self.interpreter.human_callback = self._on_human
+
+    # =========================================================
+    # HTTP server (serve on PORT)
+    # =========================================================
+
+    def _make_request_interpreter(self) -> Interpreter:
+        """
+        Build a fresh, isolated interpreter for a single HTTP request.
+
+        Each request gets its own interpreter/scope (its own logs, trace and
+        variable bindings) — exactly like a spawned agent. The only shared
+        state is the blackboard (via the swarm) and the database (the sql()
+        builtins close over the shared DatabaseManager). Tasks and builtins
+        defined by the program are reachable because handlers execute with the
+        program's global environment as their parent scope.
+        """
+        ri = Interpreter()
+        ri.output_callback = self._on_output
+        ri.llm_callback = self._on_llm
+        ri.human_callback = self._on_human
+        ri.intent_enforcer = self.intent_enforcer
+        ri._intent_frozen = True
+
+        swarm = self.swarm
+        ri._swarm_share = lambda k, v: swarm.blackboard.write(k, v, agent="request")
+        ri._swarm_observe = lambda k: swarm.blackboard.read(k, agent="request")
+        ri._swarm_signal = lambda name, data: swarm.signal(name, "request", data)
+
+        def request_wait_for(name, timeout=30):
+            sig = swarm.wait_for_signal(name, timeout=timeout)
+            if sig and sig.data:
+                return sig.data
+            return None
+
+        ri._swarm_wait_for = request_wait_for
+        return ri
+
+    def _run_serve(self, node, env, port: SynValue) -> SynValue:
+        """
+        Start an HTTP server for a `serve on PORT` block.
+
+        Enforces the SERVE capability (scoped to the port), then builds the
+        route table with per-request isolated handlers and starts a threaded
+        server in the background. Returns immediately; the CLI keeps the
+        process alive while servers are running.
+        """
+        from ..core.interpreter import Environment, GiveSignal
+        from ..core.types import SynNumber
+
+        # Resolve the port to an integer.
+        try:
+            port_num = int(float(port.raw))
+        except (TypeError, ValueError):
+            raise SynRuntimeError(f"serve port must be a number, got {port}", node.location)
+        port_str = str(port_num)
+
+        # Capability check — scoped to the exact port.
+        cap = Capability(CapabilityType.SERVE, port_str)
+        if not self.capabilities.check(cap, source=f"serve on {port_str}"):
+            raise CapabilityViolation(
+                f"serve on {port_str} is not permitted: missing capability "
+                f"serve({port_str}). Add `require serve({port_str})` at the top "
+                f"of your program.",
+                requested=cap, source=f"serve on {port_str}",
+            )
+
+        serve_env = env
+
+        # Resolve the auth task once (if declared).
+        auth_value = None
+        if node.auth_handler is not None:
+            auth_value = self.interpreter._exec(node.auth_handler, serve_env)
+
+        def _str_map(d: dict) -> SynValue:
+            return syn_map({k: syn_text(str(v)) for k, v in d.items()})
+
+        def _build_request(ctx: dict) -> SynValue:
+            return syn_map({
+                "method": syn_text(ctx["method"]),
+                "path": syn_text(ctx["path"]),
+                "body": syn_text(ctx["body"]),
+                "json": python_to_syn(ctx["json"]),
+                "headers": _str_map(ctx["headers"]),
+                "query": _str_map(ctx["query"]),
+                "params": _str_map(ctx["params"]),
+                "user": ctx["user"] if ctx["user"] is not None else syn_nothing(),
+            })
+
+        def _make_handler(route_node):
+            def handler(ctx: dict) -> SynValue:
+                ri = self._make_request_interpreter()
+                req_env = Environment(
+                    parent=serve_env,
+                    name=f"request:{route_node.method} {route_node.path}",
+                )
+                req_env.set("request", _build_request(ctx))
+                req_env.set("query", _str_map(ctx["query"]))
+                req_env.set("params", _str_map(ctx["params"]))
+                try:
+                    ri._exec_block(route_node.body, req_env)
+                    return syn_nothing()
+                except GiveSignal as g:
+                    return g.value
+            return handler
+
+        def _auth_runner(token: str):
+            if auth_value is None:
+                return None
+            ri = self._make_request_interpreter()
+            try:
+                return ri._call_value(auth_value, [syn_text(token)], node.location)
+            except GiveSignal as g:
+                return g.value
+            except Exception:
+                # Any error inside the auth task is treated as "not authorized".
+                return None
+
+        routes = [
+            RouteSpec(
+                method=r.method, path=r.path, param_names=r.param_names,
+                requires_auth=r.requires_auth, handler=_make_handler(r),
+            )
+            for r in node.routes
+        ]
+
+        runtime = ServeRuntime(port_num, routes, auth_handler=_auth_runner)
+        try:
+            runtime.start(background=True)
+        except OSError as e:
+            raise SynRuntimeError(
+                f"could not start server on port {port_str}: {e}", node.location,
+            )
+
+        self.servers.append(runtime)
+        self._on_output(
+            f"Serving HTTP on port {port_str} ({len(routes)} route(s))"
+        )
+        return syn_text(f"serving:{port_str}")
+
+    def shutdown_servers(self):
+        """Stop all running HTTP servers."""
+        for server in self.servers:
+            try:
+                server.stop()
+            except Exception:
+                pass
+        self.servers = []
+
+    def wait_servers(self):
+        """Block until interrupted while servers are running (for the CLI)."""
+        try:
+            while self.servers:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.shutdown_servers()
 
     def _wire_swarm(self):
         """Connect the interpreter to the real swarm for agent operations."""

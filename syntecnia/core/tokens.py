@@ -92,6 +92,14 @@ class TokenType(Enum):
     TRY = auto()             # try block
     RECOVER = auto()         # catch/recover block
 
+    # -- HTTP server keywords --
+    SERVE = auto()           # serve on PORT — start an HTTP server
+    ON = auto()              # serve on PORT
+    ROUTE = auto()           # route "GET /path" — define a route
+    AUTH = auto()            # auth with <task> / requires auth
+    REQUIRES = auto()        # route ... requires auth
+    EXPECT = auto()          # expect body {field: type} — input validation
+
     # -- Observability keywords --
     TRACE = auto()           # tracing block
     LOG = auto()             # log emission
@@ -208,6 +216,14 @@ KEYWORDS = {
     # Error handling
     "try": TokenType.TRY,
     "recover": TokenType.RECOVER,
+
+    # HTTP server
+    "serve": TokenType.SERVE,
+    "on": TokenType.ON,
+    "route": TokenType.ROUTE,
+    "auth": TokenType.AUTH,
+    "requires": TokenType.REQUIRES,
+    "expect": TokenType.EXPECT,
 
     # Literals
     "true": TokenType.BOOL_TRUE,

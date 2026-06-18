@@ -35,6 +35,12 @@ syntecnia/
 │   ├── memory.py              # AgentMemory + OwnerRule
 │   └── builtins.py            # remember, recall, check_rules, etc.
 │
+├── stdlib/                    # Zero-dependency standard library
+│   ├── http.py                # HTTP client (urllib): http, http_get, http_post...
+│   ├── server.py              # HTTP server: serve on PORT, routes, response contract
+│   ├── database.py            # SQLite: sql, sql_exec, db_open (thread-safe)
+│   └── cron.py                # Cron scheduler
+│
 ├── human/                     # Human interaction
 │   └── interaction.py         # Terminal, Auto, Queue, Callback handlers
 │

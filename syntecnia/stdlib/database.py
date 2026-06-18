@@ -22,38 +22,45 @@ Connection management:
 """
 
 import sqlite3
+import threading
 from typing import Dict, List, Optional, Any
 
 
 class DatabaseManager:
     """
     Manages SQLite connections for Syntecnia programs.
-    Thread-safe per connection. Each agent should get its own manager.
+
+    Connections are opened with check_same_thread=False and every access is
+    serialized through a lock, so a single program (including a multithreaded
+    `serve on PORT` HTTP server) can safely share one connection across
+    request threads.
     """
 
     def __init__(self):
         self.connections: Dict[str, sqlite3.Connection] = {}
         self.default_db: Optional[str] = None
+        self._lock = threading.RLock()
 
     def open(self, path: str, mode: str = "readwrite") -> str:
         """Open a database connection. Returns the path as identifier."""
-        if path in self.connections:
+        with self._lock:
+            if path in self.connections:
+                return path
+
+            if mode == "readonly":
+                uri = f"file:{path}?mode=ro"
+                conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+            elif mode == "memory":
+                conn = sqlite3.connect(":memory:", check_same_thread=False)
+                path = ":memory:"
+            else:
+                conn = sqlite3.connect(path, check_same_thread=False)
+
+            conn.row_factory = sqlite3.Row
+            self.connections[path] = conn
+            if self.default_db is None:
+                self.default_db = path
             return path
-
-        if mode == "readonly":
-            uri = f"file:{path}?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
-        elif mode == "memory":
-            conn = sqlite3.connect(":memory:")
-            path = ":memory:"
-        else:
-            conn = sqlite3.connect(path)
-
-        conn.row_factory = sqlite3.Row
-        self.connections[path] = conn
-        if self.default_db is None:
-            self.default_db = path
-        return path
 
     def close(self, path: str = None):
         """Close a database connection."""
@@ -79,34 +86,37 @@ class DatabaseManager:
     def query(self, sql: str, params: list = None,
               db: str = None) -> List[Dict[str, Any]]:
         """Execute a SELECT query, return list of row dicts."""
-        conn = self._get_conn(db)
-        cursor = conn.execute(sql, params or [])
-        columns = [desc[0] for desc in cursor.description] if cursor.description else []
-        rows = []
-        for row in cursor.fetchall():
-            rows.append({col: row[i] for i, col in enumerate(columns)})
-        return rows
+        with self._lock:
+            conn = self._get_conn(db)
+            cursor = conn.execute(sql, params or [])
+            columns = [desc[0] for desc in cursor.description] if cursor.description else []
+            rows = []
+            for row in cursor.fetchall():
+                rows.append({col: row[i] for i, col in enumerate(columns)})
+            return rows
 
     def execute(self, sql: str, params: list = None,
                 db: str = None) -> Dict[str, Any]:
         """Execute an INSERT/UPDATE/DELETE/CREATE, return result info."""
-        conn = self._get_conn(db)
-        cursor = conn.execute(sql, params or [])
-        conn.commit()
-        return {
-            "rows_affected": cursor.rowcount,
-            "last_id": cursor.lastrowid,
-        }
+        with self._lock:
+            conn = self._get_conn(db)
+            cursor = conn.execute(sql, params or [])
+            conn.commit()
+            return {
+                "rows_affected": cursor.rowcount,
+                "last_id": cursor.lastrowid,
+            }
 
     def execute_many(self, sql: str, params_list: List[list],
                      db: str = None) -> Dict[str, Any]:
         """Execute a statement with multiple parameter sets (batch)."""
-        conn = self._get_conn(db)
-        cursor = conn.executemany(sql, params_list)
-        conn.commit()
-        return {
-            "rows_affected": cursor.rowcount,
-        }
+        with self._lock:
+            conn = self._get_conn(db)
+            cursor = conn.executemany(sql, params_list)
+            conn.commit()
+            return {
+                "rows_affected": cursor.rowcount,
+            }
 
     def tables(self, db: str = None) -> List[str]:
         """List all tables in the database."""
