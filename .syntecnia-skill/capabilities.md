@@ -31,11 +31,11 @@ How the intent works internally:
 - The intent **freezes** after the first non-intent statement — prompt injection cannot expand it.
 - Without an `intent:` declaration = fully permissive (only capabilities apply).
 
-**Recognized verbs (English):** read, fetch, get, download, process, analyze, calculate, write, save, store, update, create, delete, send, post, upload, notify, email, run, execute, deploy, build, spawn, delegate, manage, generate, report
+**Recognized verbs (English only):** read, fetch, get, download, process, analyze, calculate, write, save, store, update, create, delete, send, post, upload, notify, email, run, execute, deploy, build, spawn, delegate, manage, generate, report
 
-**Recognized verbs (Spanish):** leer, obtener, descargar, procesar, analizar, calcular, escribir, guardar, almacenar, actualizar, modificar, crear, eliminar, borrar, enviar, notificar, ejecutar, correr, construir, generar, reportar, gestionar, manejar, subir, delegar, coordinar
+**Write the intent in English** to activate category enforcement. The intent, like all keywords in the language, is English.
 
-**If no verbs match** (e.g. intent in an unsupported language), the enforcer **degrades to permissive** in categories — it won't silently block everything. Domains and paths in the intent text are still enforced.
+**If no verbs match** (e.g. intent in another language), the enforcer **degrades to permissive** in categories — it won't block anything by category. Domains and paths in the intent text are still enforced. This means a non-English intent is safe (not blocking) but provides no category restriction.
 
 ## Per-task sandboxing
 

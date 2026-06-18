@@ -9,7 +9,7 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 | `Unterminated string` | Literal newline inside `"..."` | Use `\n` escape. Strings are single-line only. |
 | `Capability not granted: file_write(...)` | Missing `require` or scope too narrow | Add `require file("/path/*")` at top of program |
 | `Capability not granted: net(...)` | Missing `require` for the domain | Add `require net("domain.com")` |
-| `Intent violation: ... action not within declared intent` | Intent text has no recognized action verbs | Use clear verbs: read/write/fetch/send (EN) or leer/escribir/enviar (ES). Or remove the `intent:` line. |
+| `Intent violation: ... action not within declared intent` | Intent text has no recognized English action verbs | Write intent in English with clear verbs (read/write/fetch/send). Non-English intents degrade to permissive (no category restriction). |
 | `Invalid memory category: 'preferencia'` | Categories are English-only | Use exactly: `preference`, `rule`, `learning`, `decision`, `context` |
 | `No agent defined with name 'X'` | `spawn X` before `agent X` definition | Define the agent before spawning it |
 | `Division by zero` | Divisor is 0 | Guard with `when divisor != 0` or use `try/recover` |
@@ -25,7 +25,7 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 |---|---|---|
 | String on multiple lines | `Unterminated string` error | Use `\n` or concatenate: `"line1\n" + "line2"` |
 | `remember("preferencia", ...)` works | Error: invalid category | Categories are English: `preference`, `rule`, `learning`, `decision`, `context` |
-| `intent: "Procesar datos"` allows file ops | Blocks everything | "Procesar" is recognized (Spanish). But if your verb isn't in the list, add it in English too, or omit `intent:`. |
+| `intent: "Procesar datos"` — does it restrict? | No, it's permissive | Intent verbs are English only. Non-English text degrades to permissive (won't block, but won't restrict by category either). Write intent in English for enforcement. |
 | `wait_for` wakes all waiters on one `signal` | Only ONE waiter gets it | Signals are a queue (consumed on read). For fan-out, emit N signals or use blackboard. |
 | `wait_for` hangs forever on dead agent | Returns `nothing` quickly | The runtime detects no alive agents and returns. But only if ALL agents are dead. |
 | Agent shares state with main program | Each agent has its own interpreter | Use `share`/`observe` via blackboard to communicate. |
