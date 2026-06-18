@@ -24,6 +24,8 @@ Auth, validation and uncaught errors never crash the server — they become
 """
 
 import json
+import os
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -41,7 +43,38 @@ from ..capabilities.model import CapabilityViolation
 
 DEFAULT_LIMIT = 100
 MAX_LIMIT = 1000
-MAX_BODY = 1_048_576  # 1 MB — reject larger request bodies with 413
+# Default cap on the request body buffered in memory. NOT a hard ceiling on
+# what can be served: `max_body` in a serve block overrides it, and larger
+# bodies spill to disk (see _RequestHandler). The cap protects memory.
+MAX_BODY = 1_048_576  # 1 MB
+# Above this many bytes a body is streamed to a temp file instead of memory.
+MEM_SPILL = 1_048_576  # 1 MB
+
+
+def parse_body_size(value: Any) -> Optional[int]:
+    """
+    Resolve a max-body setting to a byte count, or None for unlimited.
+
+    Accepts a number (raw bytes) or a string with an optional unit:
+    "512kb", "10mb", "1gb" (case-insensitive, 1024-based), or
+    "unlimited"/"none" to disable the cap.
+    """
+    if value is None:
+        return MAX_BODY
+    if isinstance(value, bool):
+        return MAX_BODY
+    if isinstance(value, (int, float)):
+        n = int(value)
+        return n if n > 0 else None
+    s = str(value).strip().lower()
+    if s in ("unlimited", "none", "off", "0"):
+        return None
+    import re
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb)?$", s)
+    if not m:
+        return MAX_BODY
+    units = {None: 1, "b": 1, "kb": 1024, "mb": 1024 ** 2, "gb": 1024 ** 3}
+    return int(float(m.group(1)) * units[m.group(2)])
 
 # Metadata flag marking a value produced by ok()/created()/not_found()/fail().
 _ENVELOPE = "__serve_envelope__"
@@ -269,11 +302,12 @@ class ServeRuntime:
 
     def __init__(self, port: int, routes: List[RouteSpec],
                  auth_handler: Optional[Callable[[str], Optional[SynValue]]] = None,
-                 host: str = "0.0.0.0"):
+                 host: str = "0.0.0.0", max_body: Optional[int] = MAX_BODY):
         self.port = int(port)
         self.host = host
         self.routes = routes
         self.auth_handler = auth_handler
+        self.max_body = max_body  # bytes, or None for unlimited
         self.httpd: Optional[ThreadingHTTPServer] = None
         self.thread: Optional[threading.Thread] = None
 
@@ -336,8 +370,13 @@ class ServeRuntime:
         return ""
 
     def dispatch(self, method: str, path: str, query: Dict[str, str],
-                 headers: Dict[str, str], body_str: str) -> Tuple[int, Any, Dict[str, str]]:
-        """Return (status, json_body, extra_headers)."""
+                 headers: Dict[str, str], body_str: Optional[str],
+                 body_file: Optional[str] = None) -> Tuple[int, Any, Dict[str, str]]:
+        """Return (status, json_body, extra_headers).
+
+        body_str is the in-memory body text (or None when the body was spilled
+        to disk, in which case body_file is the temp path).
+        """
         route, params = self._match(method, path)
         if route is None:
             allowed = self.methods_for_path(path)
@@ -368,7 +407,8 @@ class ServeRuntime:
             "query": query,
             "params": params,
             "headers": headers,
-            "body": body_str,
+            "body": body_str or "",
+            "body_file": body_file,
             "json": json_obj,
             "user": None,
         }
@@ -414,6 +454,14 @@ class ServeRuntime:
             self.httpd = None
 
 
+def _safe_unlink(path: Optional[str]):
+    if path and os.path.exists(path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 class _RequestHandler(BaseHTTPRequestHandler):
     """Adapts http.server requests onto ServeRuntime.dispatch."""
 
@@ -425,32 +473,119 @@ class _RequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
+        if self.close_connection:
+            self.send_header("Connection", "close")
         for k, v in (extra_headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
         if write_body:
             self.wfile.write(payload)
 
+    # -- body reading (counts real bytes, supports chunked, spills to disk) --
+
+    def _iter_body(self):
+        """Yield raw body byte-chunks, decoding Transfer-Encoding: chunked."""
+        te = (self.headers.get("Transfer-Encoding", "") or "").lower()
+        if "chunked" in te:
+            while True:
+                size_line = self.rfile.readline(65537).strip()
+                if b";" in size_line:  # drop chunk extensions
+                    size_line = size_line.split(b";", 1)[0].strip()
+                if size_line == b"":
+                    continue
+                try:
+                    chunk_size = int(size_line, 16)
+                except ValueError:
+                    break
+                if chunk_size == 0:
+                    self.rfile.readline()  # trailing CRLF after the last chunk
+                    break
+                yield self.rfile.read(chunk_size)
+                self.rfile.readline()  # CRLF after each chunk
+        else:
+            remaining = int(self.headers.get("Content-Length", 0) or 0)
+            while remaining > 0:
+                block = self.rfile.read(min(65536, remaining))
+                if not block:
+                    break
+                remaining -= len(block)
+                yield block
+
+    def _read_body(self, max_body: Optional[int]):
+        """
+        Read the request body, counting real bytes (never trusting
+        Content-Length). Returns one of:
+            ("mem", bytes)        small body kept in memory
+            ("file", path)        large body spilled to a temp file
+            ("too_large", None)   exceeded max_body — caller closes connection
+        """
+        spill_at = MEM_SPILL if max_body is None else min(max_body, MEM_SPILL)
+        total = 0
+        buf = bytearray()
+        tmp = None
+        tmp_path = None
+        try:
+            for chunk in self._iter_body():
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if max_body is not None and total > max_body:
+                    if tmp is not None:
+                        tmp.close()
+                        _safe_unlink(tmp_path)
+                    return ("too_large", None)
+                if tmp is None:
+                    buf.extend(chunk)
+                    if len(buf) > spill_at:
+                        fd, tmp_path = tempfile.mkstemp(prefix="syn_body_")
+                        tmp = os.fdopen(fd, "wb")
+                        tmp.write(buf)
+                        buf = bytearray()
+                else:
+                    tmp.write(chunk)
+        except Exception:
+            if tmp is not None:
+                tmp.close()
+                _safe_unlink(tmp_path)
+            raise
+        if tmp is not None:
+            tmp.close()
+            return ("file", tmp_path)
+        return ("mem", bytes(buf))
+
     def _dispatch(self, method: str, write_body: bool = True):
         runtime: ServeRuntime = self.server.runtime  # type: ignore[attr-defined]
+        body_file = None
         try:
             parsed = urlparse(self.path)
             path = parsed.path
             query = {k: v[-1] for k, v in parse_qs(parsed.query).items()}
+            headers = {k: v for k, v in self.headers.items()}
 
-            length = int(self.headers.get("Content-Length", 0) or 0)
-            if length > MAX_BODY:
-                # Reject oversized payloads without reading the body.
+            kind, payload = self._read_body(runtime.max_body)
+            if kind == "too_large":
+                # Don't leave an unread body on a live keep-alive connection:
+                # respond and close (Go's MaxBytesReader pattern).
+                self.close_connection = True
                 self._write(
                     413, {"error": "payload too large", "status": 413},
                     write_body=write_body,
                 )
                 return
-            body = self.rfile.read(min(length, MAX_BODY)).decode("utf-8") if length else ""
-            headers = {k: v for k, v in self.headers.items()}
-            status, body_obj, extra = runtime.dispatch(method, path, query, headers, body)
+            if kind == "file":
+                body_str = None
+                body_file = payload
+            else:
+                body_str = payload.decode("utf-8", errors="replace") if payload else ""
+
+            status, body_obj, extra = runtime.dispatch(
+                method, path, query, headers, body_str, body_file,
+            )
         except Exception as e:  # plumbing failure → 500, still no crash
             status, body_obj, extra = 500, {"error": f"{type(e).__name__}: {e}", "status": 500}, {}
+        finally:
+            if body_file:
+                _safe_unlink(body_file)
 
         self._write(status, body_obj, extra, write_body=write_body)
 

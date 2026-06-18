@@ -38,27 +38,30 @@ serve on 8080
 
 ### Soft keywords
 
-`serve`, `on`, `route`, `auth`, `requires` and `expect` are **soft keywords**:
-they are special *only* at the start of their construction (`serve on N`,
-`route "..."`, `requires auth`, `expect body {...}`). Everywhere else they are
-ordinary names — `let route be "/x"` and `task auth(x)` are valid. The parser
-decides with fixed lookahead, never heuristics.
+`serve`, `on`, `route`, `auth`, `requires`, `expect` and `max_body` are **soft
+keywords**: they are special *only* at the start of their construction (`serve on
+N`, `route "..."`, `requires auth`, `expect body {...}`, `max_body "10mb"`).
+Everywhere else they are ordinary names — `let route be "/x"` and `task auth(x)`
+are valid. The parser decides with fixed lookahead, never heuristics.
 
 ## The request
 
 Inside a handler you have:
 
 ```
-request          -- map with .method .path .body .json .headers .user
+request          -- map with .method .path .body .json .headers .user .body_file
 json of request  -- parsed JSON body (a map), or nothing
-body of request  -- raw body text
+body of request  -- raw body text (in-memory bodies; "" when spilled to disk)
 headers of request
 user of request  -- set after auth (see below)
+body_file of request  -- temp file path when a large body spilled to disk, else nothing
+read_body()      -- read the full body text (from memory or the temp file)
 query            -- query string as a map: /x?page=2 → query.page == "2"
 params           -- path params as a map: /products/:id → params.id
 ```
 
-All `query` and `params` values are text.
+All `query` and `params` values are text. Use `read_body()` to get the whole
+body regardless of where it lives (memory or disk) — see "Request body limits".
 
 ## Response contract (enforced by the runtime, on the BODY you `give`)
 
@@ -169,6 +172,36 @@ route "POST /users"
 `expect body {field: type, ...}` validates the request's JSON body. A missing
 field or a type mismatch → **400** with the offending `field` named. Types:
 `text`, `number`, `bool`, `list`, `map`.
+
+## Request body limits
+
+The request body is bounded so a single oversized request can't exhaust memory.
+
+```
+serve on 8080
+    max_body "10mb"        -- optional; default 1mb
+    route "POST /upload"
+        give {"bytes": length(read_body())}
+```
+
+- **Default:** 1 MB when `max_body` is not declared.
+- **`max_body`** accepts a size string — `"512kb"`, `"10mb"`, `"1gb"`
+  (case-insensitive, 1024-based) — or a raw byte count, or `"unlimited"` /
+  `"none"` to disable the cap (only for trusted, internal use). The `"10mb"`
+  form is recommended for readability.
+- **Real bytes are counted**, never the declared `Content-Length`, so a lying
+  length or a `Transfer-Encoding: chunked` body cannot evade the limit.
+- **Over the limit → 413** `{"error":"payload too large","status":413}` and the
+  connection is closed cleanly (`Connection: close`) — it never leaves an unread
+  body to corrupt the next request on a keep-alive connection.
+- **Memory vs disk:** small bodies stay in memory (`body of request`,
+  `json of request`). Bodies larger than ~1 MB stream to a temp file;
+  `body_file of request` is its path and `read_body()` reads it. The temp file
+  is removed when the request finishes (even if the handler errors).
+- **Chunked** request bodies (no `Content-Length`) are supported and counted.
+
+This is why raising the limit is safe: the cap is on the in-memory buffer, not
+on what can be served — large uploads stream to disk rather than being buffered.
 
 ## Isolation
 

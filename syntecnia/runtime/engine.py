@@ -212,7 +212,8 @@ class SyntecniaEngine:
         process alive while servers are running.
         """
         from ..core.interpreter import Environment, GiveSignal
-        from ..core.types import SynNumber
+        from ..core.types import SynNumber, BuiltinTask, SynTask
+        from ..stdlib.server import parse_body_size
 
         # Resolve the port to an integer.
         try:
@@ -238,20 +239,43 @@ class SyntecniaEngine:
         if node.auth_handler is not None:
             auth_value = self.interpreter._exec(node.auth_handler, serve_env)
 
+        # Resolve the max-body limit once (bytes, or None for unlimited).
+        if node.max_body is not None:
+            max_body_val = self.interpreter._exec(node.max_body, serve_env)
+            raw = max_body_val.raw if isinstance(max_body_val.type, SynNumber) else str(max_body_val)
+            max_body = parse_body_size(raw)
+        else:
+            max_body = parse_body_size(None)
+
         def _str_map(d: dict) -> SynValue:
             return syn_map({k: syn_text(str(v)) for k, v in d.items()})
 
         def _build_request(ctx: dict) -> SynValue:
+            body_file = ctx.get("body_file")
             return syn_map({
                 "method": syn_text(ctx["method"]),
                 "path": syn_text(ctx["path"]),
                 "body": syn_text(ctx["body"]),
+                "body_file": syn_text(body_file) if body_file else syn_nothing(),
                 "json": python_to_syn(ctx["json"]),
                 "headers": _str_map(ctx["headers"]),
                 "query": _str_map(ctx["query"]),
                 "params": _str_map(ctx["params"]),
                 "user": ctx["user"] if ctx["user"] is not None else syn_nothing(),
             })
+
+        def _make_read_body(ctx: dict) -> SynValue:
+            """Per-request builtin: read the full body (memory or temp file)."""
+            def _read_body(args):
+                bf = ctx.get("body_file")
+                if bf:
+                    try:
+                        with open(bf, "r", encoding="utf-8", errors="replace") as f:
+                            return syn_text(f.read())
+                    except OSError:
+                        return syn_text("")
+                return syn_text(ctx.get("body") or "")
+            return SynValue(raw=BuiltinTask("read_body", _read_body, 0), type=SynTask())
 
         def _make_handler(route_node):
             def handler(ctx: dict) -> SynValue:
@@ -263,6 +287,7 @@ class SyntecniaEngine:
                 req_env.set("request", _build_request(ctx))
                 req_env.set("query", _str_map(ctx["query"]))
                 req_env.set("params", _str_map(ctx["params"]))
+                req_env.set("read_body", _make_read_body(ctx))
                 try:
                     ri._exec_block(route_node.body, req_env)
                     return syn_nothing()
@@ -290,7 +315,7 @@ class SyntecniaEngine:
             for r in node.routes
         ]
 
-        runtime = ServeRuntime(port_num, routes, auth_handler=_auth_runner)
+        runtime = ServeRuntime(port_num, routes, auth_handler=_auth_runner, max_body=max_body)
         try:
             runtime.start(background=True)
         except OSError as e:

@@ -179,9 +179,10 @@ serve on 8080
 - **Pagination:** always applied to collections — default `limit` 100, `?limit=` / `?cursor=`, `total` always present. For large tables use `give paged("SELECT ...", [params])` — SQL `LIMIT`/`OFFSET` pushdown with an exact `COUNT(*)` total, nothing fully materialized.
 - **Auth:** `requires auth` extracts the `Authorization: Bearer` token, calls the `auth with` task; `nothing` → 401, otherwise the value lands in `request.user`.
 - **Validation:** `expect body {field: type}` (`text`, `number`, `bool`, `list`, `map`) → 400 naming the bad field.
-- **HTTP semantics:** `405` (with `Allow`) for a known path on the wrong method, `OPTIONS`/`HEAD` handled, malformed JSON → 400, bodies over 1 MB → 413.
+- **HTTP semantics:** `405` (with `Allow`) for a known path on the wrong method, `OPTIONS`/`HEAD` handled, malformed JSON → 400.
+- **Body limits:** default 1 MB, configurable per server with `max_body "10mb"` (or `"unlimited"`). Real bytes are counted (a lying `Content-Length` or chunked body can't evade it); over the limit → 413 with a clean connection close; large bodies stream to disk (`read_body()` / `request.body_file`), chunked supported.
 - **Isolation:** each request runs in its own interpreter/scope, like an agent; only the blackboard and DB are shared. Uncaught errors become 500 — never a server crash.
-- **Soft keywords:** `serve`, `on`, `route`, `auth`, `requires`, `expect` are only special inside their construction — elsewhere they are ordinary names (`let route be "/x"` works).
+- **Soft keywords:** `serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body` are only special inside their construction — elsewhere they are ordinary names (`let route be "/x"` works).
 
 See [.syntecnia-skill/serve.md](.syntecnia-skill/serve.md) for full details.
 

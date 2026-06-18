@@ -437,6 +437,7 @@ class ServeBlock(Node):
     """
     port: Node = None                    # expression evaluating to the port number
     auth_handler: Optional[Node] = None  # expression resolving to the auth task
+    max_body: Optional[Node] = None      # expression: max request body ("10mb"/bytes/"unlimited")
     routes: List[RouteDefinition] = field(default_factory=list)
 
 @dataclass

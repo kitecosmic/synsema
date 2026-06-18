@@ -16,11 +16,12 @@ Logic: `and`, `or`, `not`
 Literals: `true`, `false`, `nothing`
 
 ## Soft keywords (NOT reserved)
-`serve`, `on`, `route`, `auth`, `requires`, `expect` — special **only** at the
-start of their HTTP-server construction (`serve on N`, `route "..."`, `requires
-auth`, `expect body {...}`). Everywhere else they are ordinary identifiers, so
-`let route be "/x"` and `task auth(x)` are valid. The parser uses fixed
-lookahead, never heuristics. See [serve.md](serve.md).
+`serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body` — special
+**only** at the start of their HTTP-server construction (`serve on N`,
+`route "..."`, `requires auth`, `expect body {...}`, `max_body "10mb"`).
+Everywhere else they are ordinary identifiers, so `let route be "/x"` and
+`task auth(x)` are valid. The parser uses fixed lookahead, never heuristics.
+See [serve.md](serve.md).
 
 ## Operators
 Arithmetic: `+`, `-`, `*`, `/`, `%`, `**`

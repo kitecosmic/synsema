@@ -103,6 +103,7 @@ class TokenType(Enum):
     AUTH = auto()            # auth with <task> / requires auth
     REQUIRES = auto()        # route ... requires auth
     EXPECT = auto()          # expect body {field: type} — input validation
+    MAX_BODY = auto()        # max_body "10mb" — request body size limit
 
     # -- Observability keywords --
     TRACE = auto()           # tracing block

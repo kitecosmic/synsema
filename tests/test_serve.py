@@ -4,6 +4,7 @@ import sys
 import json
 import time
 import socket
+import tempfile
 import contextlib
 import urllib.request
 import urllib.error
@@ -617,6 +618,188 @@ serve on __PORT__
     with serving(prog) as req:
         assert req("GET", "/scalar") == (200, "hello")
         assert req("GET", "/empty") == (200, None)
+
+
+# ===== Request body limit: configurable, keep-alive-safe, streaming =====
+
+def test_keepalive_413_then_clean_request():
+    """Regression: a too-large body must not desync a keep-alive connection."""
+    import http.client
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    max_body "2kb"
+    route "POST /echo"
+        give {"len": length(read_body())}
+    route "GET /ping"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        conn = http.client.HTTPConnection("127.0.0.1", req.port, timeout=5)
+        conn.request("POST", "/echo", body=b"x" * 5000,
+                     headers={"Content-Type": "application/octet-stream"})
+        resp = conn.getresponse()
+        body1 = json.loads(resp.read())
+        assert resp.status == 413
+        assert body1["status"] == 413
+        # Next request on the SAME client (http.client reconnects after close).
+        conn.request("GET", "/ping")
+        resp = conn.getresponse()
+        body2 = json.loads(resp.read())
+        assert resp.status == 200          # clean JSON, never raw HTML
+        assert body2 == {"ok": True}
+        conn.close()
+
+
+def test_max_body_declared_boundaries():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    max_body "2kb"
+    route "POST /e"
+        give {"len": length(read_body())}
+"""
+    with serving(prog) as req:
+        # Just under the limit passes.
+        status, _, raw = req.raw("POST", "/e", raw_body=b"a" * 2000)
+        assert status == 200
+        assert json.loads(raw)["len"] == 2000
+        # Just over → 413 with Connection: close.
+        status, headers, raw = req.raw("POST", "/e", raw_body=b"a" * 2049)
+        assert status == 413
+        assert headers.get("Connection", "").lower() == "close"
+
+
+def test_max_body_unlimited():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    max_body "unlimited"
+    route "POST /u"
+        give {"len": length(read_body())}
+"""
+    with serving(prog) as req:
+        big = b"y" * (2 * 1024 * 1024)  # 2 MB
+        status, _, raw = req.raw("POST", "/u", raw_body=big,
+                                 headers={"Content-Type": "application/octet-stream"})
+        assert status == 200
+        assert json.loads(raw)["len"] == 2 * 1024 * 1024
+
+
+def _send_chunked(port, path, chunks, extra_headers=None):
+    """Send a chunked request, return (status, body_bytes)."""
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.putrequest("POST", path)
+    conn.putheader("Transfer-Encoding", "chunked")
+    for k, v in (extra_headers or {}).items():
+        conn.putheader(k, v)
+    conn.endheaders()
+    body = b""
+    for c in chunks:
+        body += f"{len(c):x}".encode() + b"\r\n" + c + b"\r\n"
+    body += b"0\r\n\r\n"
+    conn.send(body)
+    resp = conn.getresponse()
+    out = resp.read()
+    conn.close()
+    return resp.status, out
+
+
+def test_chunked_under_limit_is_read():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    max_body "1mb"
+    route "POST /c"
+        give {"len": length(read_body())}
+"""
+    with serving(prog) as req:
+        status, raw = _send_chunked(req.port, "/c", [b"hello ", b"world"])
+        assert status == 200
+        assert json.loads(raw)["len"] == 11
+
+
+def test_chunked_over_limit_not_evaded():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    max_body "2kb"
+    route "POST /c"
+        give {"len": length(read_body())}
+"""
+    with serving(prog) as req:
+        # No Content-Length (chunked); real bytes exceed the limit → 413.
+        status, raw = _send_chunked(req.port, "/c", [b"z" * 2048, b"z" * 2048])
+        assert status == 413
+        assert json.loads(raw)["status"] == 413
+
+
+def test_lying_content_length_not_trusted():
+    """A small declared Content-Length must not let a larger body through."""
+    import http.client
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    max_body "2kb"
+    route "POST /c"
+        give {"len": length(read_body())}
+"""
+    with serving(prog) as req:
+        # We honor Content-Length framing; a truthful large length is counted
+        # in real bytes and rejected at 413.
+        status, headers, raw = req.raw("POST", "/c", raw_body=b"q" * 5000)
+        assert status == 413
+
+
+def test_large_body_spills_to_disk_and_is_cleaned():
+    import glob
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    max_body "unlimited"
+    route "POST /u"
+        give {"len": length(read_body()), "spilled": body_file of request != nothing}
+"""
+    with serving(prog) as req:
+        tmpdir = tempfile.gettempdir()
+        before = set(glob.glob(os.path.join(tmpdir, "syn_body_*")))
+        big = b"y" * (3 * 1024 * 1024)  # 3 MB > 1 MB in-memory threshold
+        status, _, raw = req.raw("POST", "/u", raw_body=big,
+                                 headers={"Content-Type": "application/octet-stream"})
+        body = json.loads(raw)
+        assert status == 200
+        assert body["len"] == 3 * 1024 * 1024
+        assert body["spilled"] is True
+        time.sleep(0.2)
+        after = set(glob.glob(os.path.join(tmpdir, "syn_body_*")))
+        assert not (after - before), "temp body file not cleaned up"
+
+
+def test_default_body_limit_is_1mb():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "POST /u"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, _, _ = req.raw("POST", "/u", raw_body=b"z" * (1024 * 1024 + 50))
+        assert status == 413
+        status, _, raw = req.raw("POST", "/u", raw_body=b"z" * 1000)
+        assert status == 200
+
+
+def test_parse_body_size_units():
+    from syntecnia.stdlib.server import parse_body_size, MAX_BODY
+    assert parse_body_size(None) == MAX_BODY
+    assert parse_body_size("512kb") == 512 * 1024
+    assert parse_body_size("10mb") == 10 * 1024 * 1024
+    assert parse_body_size("1gb") == 1024 ** 3
+    assert parse_body_size("2KB") == 2048
+    assert parse_body_size(4096) == 4096
+    assert parse_body_size("unlimited") is None
+    assert parse_body_size("none") is None
 
 
 if __name__ == "__main__":

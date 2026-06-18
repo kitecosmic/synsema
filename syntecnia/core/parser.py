@@ -604,6 +604,7 @@ class Parser:
         port = self._parse_expression()
 
         auth_handler = None
+        max_body = None
         routes = []
 
         self._skip_newlines()
@@ -615,6 +616,9 @@ class Parser:
                 self._advance()  # consume soft keyword 'auth'
                 self._expect(TokenType.WITH, "Expected 'with' after 'auth' (auth with <task>)")
                 auth_handler = self._parse_expression()
+            elif self._check_word("max_body"):
+                self._advance()  # consume soft keyword 'max_body'
+                max_body = self._parse_expression()
             elif self._check_word("route"):
                 routes.append(self._parse_route())
             else:
@@ -640,7 +644,8 @@ class Parser:
                     )
 
         return ast.ServeBlock(
-            location=loc, port=port, auth_handler=auth_handler, routes=routes,
+            location=loc, port=port, auth_handler=auth_handler,
+            max_body=max_body, routes=routes,
         )
 
     def _parse_route(self) -> ast.RouteDefinition:
