@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  agent:
+    build: .
+    command: ["run", "agent.syn", "--serve"]
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+      - ./programs:/programs
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - MINIMAX_API_KEY=${MINIMAX_API_KEY:-}

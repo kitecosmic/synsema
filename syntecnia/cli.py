@@ -2,12 +2,19 @@
 Syntecnia CLI — Command-line interface.
 
 Usage:
-    syntecnia run program.syn       Run a .syn file
-    syntecnia repl                  Start interactive mode
-    syntecnia check program.syn     Parse and check without running
-    syntecnia tokens program.syn    Show token stream (debug)
-    syntecnia ast program.syn       Show AST (debug)
-    syntecnia version               Show version
+    syntecnia run program.syn           Run a .syn file
+    syntecnia run program.syn --serve   Run and keep alive (for crons/agents)
+    syntecnia repl                      Start interactive mode
+    syntecnia check program.syn         Parse and check without running
+    syntecnia tokens program.syn        Show token stream (debug)
+    syntecnia ast program.syn           Show AST (debug)
+    syntecnia testgen program.syn       Auto-generate and run tests
+    syntecnia daemon start program.syn  Run as background service
+    syntecnia daemon stop program.syn   Stop a background service
+    syntecnia daemon status             Show all running services
+    syntecnia daemon logs program.syn   View service logs
+    syntecnia daemon restart program.syn  Restart a service
+    syntecnia version                   Show version
 """
 
 import sys
@@ -27,6 +34,46 @@ def main():
     if command == "version":
         from . import __version__
         print(f"Syntecnia v{__version__}")
+        return
+
+    if command == "daemon":
+        from .runtime.daemon import (
+            daemon_start, daemon_stop, daemon_status,
+            daemon_logs, daemon_restart, format_status_table,
+        )
+        if len(args) < 2:
+            print("Usage: syntecnia daemon <start|stop|status|logs|restart> [program.syn]")
+            sys.exit(1)
+
+        action = args[1]
+
+        if action == "status":
+            statuses = daemon_status()
+            print(format_status_table(statuses))
+            return
+
+        if len(args) < 3 and action != "status":
+            print(f"Usage: syntecnia daemon {action} <program.syn>")
+            sys.exit(1)
+
+        target = args[2] if len(args) > 2 else ""
+        extra = args[3:]
+
+        if action == "start":
+            result = daemon_start(target, extra)
+            print(result["message"])
+        elif action == "stop":
+            result = daemon_stop(target)
+            print(result["message"])
+        elif action == "restart":
+            result = daemon_restart(target, extra)
+            print(result["message"])
+        elif action == "logs":
+            lines = int(args[3]) if len(args) > 3 and args[3].isdigit() else 50
+            print(daemon_logs(target, lines))
+        else:
+            print(f"Unknown daemon action: {action}")
+            sys.exit(1)
         return
 
     if command == "repl":

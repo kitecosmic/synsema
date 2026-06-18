@@ -20,9 +20,13 @@ Read ONLY the sections you need. Do not load everything.
 ## Project structure
 - [structure.md](structure.md) — File map of the codebase
 
+## Deployment
+- [deploy.md](deploy.md) — Daemon mode, Docker, VPS, Kubernetes, systemd
+
 ## When to read what
 - Writing a new .syn program → syntax.md, builtins.md
 - HTTP / SQL / cron → stdlib.md
+- Deploying to server → deploy.md
 - Adding security → capabilities.md
 - Multi-agent system → agents.md
 - Using AI reasoning → llm.md
