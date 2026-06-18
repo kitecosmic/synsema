@@ -22,9 +22,10 @@ task check_token(token)
 serve on 8080
     auth with check_token
 
-    -- Collection → {"items":[...], "count", "total", "cursor"}; supports ?limit & ?cursor
+    -- Collection → {"items":[...], "count", "total", "cursor"}; supports ?limit & ?cursor.
+    -- paged() pushes LIMIT/OFFSET into SQL and reports an exact total.
     route "GET /products"
-        give sql("SELECT id, name, price FROM products")
+        give paged("SELECT id, name, price FROM products ORDER BY id")
 
     -- Single item → the object as-is, or 404
     route "GET /products/:id"

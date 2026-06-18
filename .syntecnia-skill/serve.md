@@ -36,6 +36,14 @@ serve on 8080
 - `route "METHOD /path"` defines a handler. The body is ordinary Syntecnia.
 - Named path params use `:name` → `route "GET /products/:id"`.
 
+### Soft keywords
+
+`serve`, `on`, `route`, `auth`, `requires` and `expect` are **soft keywords**:
+they are special *only* at the start of their construction (`serve on N`,
+`route "..."`, `requires auth`, `expect body {...}`). Everywhere else they are
+ordinary names — `let route be "/x"` and `task auth(x)` are valid. The parser
+decides with fixed lookahead, never heuristics.
+
 ## The request
 
 Inside a handler you have:
@@ -54,27 +62,40 @@ All `query` and `params` values are text.
 
 ## Response contract (enforced by the runtime, on the BODY you `give`)
 
-| You `give`        | Response body                                                        |
-|-------------------|----------------------------------------------------------------------|
-| a **map**         | the object as-is                                                     |
-| a **list**        | `{"items": [...], "count": <page>, "total": <real>, "cursor": <next or null>}` |
+| You `give`            | Response body                                                        |
+|-----------------------|----------------------------------------------------------------------|
+| a **map**             | the object as-is                                                     |
+| a **list**            | `{"items": [...], "count": <page>, "total": <real>, "cursor": <next or null>}` |
+| a **scalar** (text/number/bool) | the value as JSON, as-is                                    |
+| nothing / no `give`   | `null`                                                              |
 
 Helpers set the HTTP status:
 
 ```
 ok(x)             -- 200, body shaped per the table above
 created(x)        -- 201
-not_found(x)      -- 404 → {"error": x, "status": 404}
+not_found(text)   -- 404 → {"error": text, "status": 404}
+not_found(map)    -- 404 → the map as-is (custom 404 body)
 fail(code, msg)   -- {"error": msg, "status": code}
+fail(msg)         -- {"error": msg, "status": 400}
+fail(code)        -- {"error": "error", "status": code}
 ```
 
 Errors never crash the server:
 
 ```
 expect failure         → 400  {"error": "...", "status": 400, "field": "..."}
+malformed JSON body    → 400  {"error": "malformed JSON body", "status": 400}
 uncaught error / 1/0   → 500  {"error": "...", "status": 500}
+unauthorized           → 401
+method not allowed     → 405  (with an `Allow` header listing valid methods)
 unknown route          → 404
+body larger than 1 MB  → 413  {"error": "payload too large", "status": 413}
 ```
+
+`OPTIONS` returns `204` with an `Allow` header; `HEAD` behaves like `GET` with no
+body. A malformed body is only an error when `Content-Type` says JSON; otherwise
+`json of request` is `nothing` and `body of request` keeps the raw text.
 
 ## Pagination
 
@@ -89,6 +110,28 @@ Collections are **never** returned unbounded.
 GET /products?limit=2          → {"items":[...2...], "count":2, "total":57, "cursor":2}
 GET /products?limit=2&cursor=2 → {"items":[...2...], "count":2, "total":57, "cursor":4}
 ```
+
+**Rule:** with `give <list>`, the handler must return the **whole** collection —
+the runtime is the sole owner of `LIMIT`/`OFFSET`/`total`. Never put `LIMIT` in
+your own query when you `give <list>`, or `total` would be wrong. Note that
+`give <list>` also loads the full collection into memory.
+
+### `paged()` — for large tables (SQL pushdown, exact total)
+
+For big result sets, `give paged("SELECT ...", [params])` fetches **only the
+requested page** (the runtime appends `LIMIT`/`OFFSET`) and computes `total` with
+a `COUNT(*)`, so nothing is fully materialized:
+
+```
+route "GET /products"
+    give paged("SELECT id, name, price FROM products ORDER BY id")
+```
+
+- Same envelope and `?limit`/`?cursor` semantics as `give <list>`, but `total` is
+  exact and only one page is read from the DB.
+- Always pass values as `params` (parameterized) — never string-concatenate.
+- Do **not** add your own `LIMIT`/`;` to the query.
+- Outside a route handler, `paged()` degrades to the full result set.
 
 ## Auth (incoming)
 
@@ -111,6 +154,9 @@ task check_token(token)
         give {"name": "alice"}
     give nothing
 ```
+
+A route that uses `requires auth` must have an `auth with <task>` on the `serve`
+block — otherwise it's a parse error (`syntecnia check` catches it).
 
 ## Input validation
 

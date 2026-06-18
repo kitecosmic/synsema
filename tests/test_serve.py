@@ -1,4 +1,5 @@
 """Tests for the native HTTP server (serve on PORT)."""
+import os
 import sys
 import json
 import time
@@ -8,7 +9,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
-sys.path.insert(0, "/root/Syntecnia")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from syntecnia.runtime.engine import SyntecniaEngine
 
@@ -35,9 +36,36 @@ def _request(port, method, path, body=None, headers=None):
         return e.code, json.loads(e.read().decode("utf-8"))
 
 
+def _raw_request(port, method, path, body=None, headers=None, raw_body=None):
+    """Low-level request returning (status, headers_dict, body_bytes)."""
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    data = raw_body if raw_body is not None else (
+        json.dumps(body).encode("utf-8") if body is not None else None
+    )
+    conn.request(method, path, body=data, headers=headers or {})
+    resp = conn.getresponse()
+    raw = resp.read()
+    hdrs = {k: v for k, v in resp.getheaders()}
+    conn.close()
+    return resp.status, hdrs, raw
+
+
+class _Client:
+    """Callable like req(method, path, ...); also exposes .raw() and .port."""
+    def __init__(self, port):
+        self.port = port
+
+    def __call__(self, method, path, body=None, headers=None):
+        return _request(self.port, method, path, body, headers)
+
+    def raw(self, method, path, body=None, headers=None, raw_body=None):
+        return _raw_request(self.port, method, path, body, headers, raw_body)
+
+
 @contextlib.contextmanager
 def serving(program: str):
-    """Start an engine, run a serve program on a free port, yield a request fn."""
+    """Start an engine, run a serve program on a free port, yield a request client."""
     port = _free_port()
     engine = SyntecniaEngine()
     source = program.replace("__PORT__", str(port))
@@ -45,9 +73,7 @@ def serving(program: str):
     assert result.success, f"program failed to start: {result.errors}"
     time.sleep(0.25)
     try:
-        yield lambda method, path, body=None, headers=None: _request(
-            port, method, path, body, headers
-        )
+        yield _Client(port)
     finally:
         engine.shutdown_servers()
         engine.db_manager.close_all()
@@ -367,6 +393,230 @@ serve on __PORT__
         status, body = req("GET", "/echo?q=search+term")
         assert status == 200
         assert body == {"q": "search term"}
+
+
+# ===== paged() — SQL pushdown with exact total =====
+
+PAGED_PROG = """
+require serve(__PORT__)
+require db(":memory:")
+
+db_open(":memory:", "memory")
+sql_exec("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)")
+each i in range(250)
+    sql_exec("INSERT INTO items (name) VALUES (?)", ["item"])
+
+serve on __PORT__
+    route "GET /items"
+        give paged("SELECT id, name FROM items ORDER BY id")
+    route "GET /items/:name"
+        give paged("SELECT id, name FROM items WHERE name = ?", [params.name])
+"""
+
+
+def test_paged_exact_total_first_page():
+    with serving(PAGED_PROG) as req:
+        status, body = req("GET", "/items")
+        assert status == 200
+        assert body["count"] == 100          # default limit
+        assert body["total"] == 250          # exact total via COUNT(*)
+        assert body["cursor"] == 100
+
+
+def test_paged_last_page_and_window():
+    with serving(PAGED_PROG) as req:
+        status, body = req("GET", "/items?limit=100&cursor=200")
+        assert body["count"] == 50
+        assert body["total"] == 250
+        assert body["cursor"] is None
+
+
+def test_paged_injection_blocked():
+    with serving(PAGED_PROG) as req:
+        payload = urllib.parse.quote("item' OR '1'='1")
+        status, body = req("GET", f"/items/{payload}")
+        assert status == 200
+        assert body["total"] == 0
+        assert body["items"] == []
+
+
+# ===== fail() never drops the message =====
+
+def test_fail_variants():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /a"
+        give fail(422, "bad input")
+    route "GET /b"
+        give fail("not allowed")
+    route "GET /c"
+        give fail(503)
+"""
+    with serving(prog) as req:
+        assert req("GET", "/a") == (422, {"error": "bad input", "status": 422})
+        assert req("GET", "/b") == (400, {"error": "not allowed", "status": 400})
+        assert req("GET", "/c") == (503, {"error": "error", "status": 503})
+
+
+# ===== requires auth without auth with → clear parse-time error =====
+
+def test_requires_auth_without_auth_with_errors():
+    engine = SyntecniaEngine()
+    result = engine.run_source(
+        'require serve(8131)\n'
+        'serve on 8131\n'
+        '    route "GET /x" requires auth\n'
+        '        give {"ok": true}',
+        filename="noauth.syn",
+    )
+    assert not result.success
+    assert len(engine.servers) == 0
+    assert any("auth with" in e for e in result.errors)
+    engine.shutdown_servers()
+
+
+# ===== not_found(map) vs not_found(text) =====
+
+def test_not_found_text_and_map():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /t"
+        give not_found("gone")
+    route "GET /m"
+        give not_found({"reason": "deleted", "id": 7})
+"""
+    with serving(prog) as req:
+        s, b = req("GET", "/t")
+        assert s == 404 and b == {"error": "gone", "status": 404}
+        s, b = req("GET", "/m")
+        assert s == 404 and b == {"reason": "deleted", "id": 7}
+
+
+# ===== 405 method not allowed =====
+
+def test_method_not_allowed_405():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /only"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("POST", "/only", body={"x": 1})
+        assert status == 405
+        assert "GET" in headers.get("Allow", "")
+        body = json.loads(raw)
+        assert body["status"] == 405
+
+
+# ===== OPTIONS and HEAD =====
+
+def test_options_returns_allow():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /res"
+        give {"ok": true}
+    route "POST /res"
+        give created({"ok": true})
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("OPTIONS", "/res")
+        assert status == 204
+        allow = headers.get("Allow", "")
+        assert "GET" in allow and "POST" in allow
+        assert raw == b""
+
+        # OPTIONS on unknown path → 404 JSON
+        status, headers, raw = req.raw("OPTIONS", "/nope")
+        assert status == 404
+
+
+def test_head_has_no_body():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /res"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("HEAD", "/res")
+        assert status == 200
+        assert raw == b""  # headers only, no body
+
+
+# ===== malformed JSON =====
+
+def test_malformed_json_body_400():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "POST /u"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw(
+            "POST", "/u",
+            raw_body=b"{not valid json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert status == 400
+        assert json.loads(raw)["error"] == "malformed JSON body"
+
+
+def test_non_json_body_preserved():
+    # Non-JSON content type with non-JSON body is not an error; body stays raw.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "POST /u"
+        give {"len": length(body of request)}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw(
+            "POST", "/u",
+            raw_body=b"hello world",
+            headers={"Content-Type": "text/plain"},
+        )
+        assert status == 200
+        assert json.loads(raw)["len"] == 11
+
+
+# ===== body size limit (413) =====
+
+def test_body_too_large_413():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "POST /u"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        big = b"x" * (1_048_576 + 10)  # > 1 MB
+        status, headers, raw = req.raw(
+            "POST", "/u", raw_body=big,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert status == 413
+        assert json.loads(raw)["status"] == 413
+
+
+# ===== scalar / nothing responses =====
+
+def test_scalar_and_nothing_bodies():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /scalar"
+        give "hello"
+    route "GET /empty"
+        let x be 1
+"""
+    with serving(prog) as req:
+        assert req("GET", "/scalar") == (200, "hello")
+        assert req("GET", "/empty") == (200, None)
 
 
 if __name__ == "__main__":

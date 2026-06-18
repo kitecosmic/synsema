@@ -24,7 +24,7 @@ for expressions. Syntecnia's grammar is designed to be flat and readable:
 """
 
 from typing import List, Optional, Dict
-from .tokens import Token, TokenType, SourceLocation
+from .tokens import Token, TokenType, SourceLocation, KEYWORDS
 from .lexer import Lexer
 from . import ast_nodes as ast
 
@@ -83,6 +83,46 @@ class Parser:
     def _check(self, *types: TokenType) -> bool:
         return self._current().type in types
 
+    def _check_word(self, word: str) -> bool:
+        """True if the current token is an identifier with this exact text.
+
+        Used for *soft keywords* (serve, on, route, auth, requires, expect):
+        words that are special only inside their construction and ordinary
+        identifiers everywhere else.
+        """
+        tok = self._current()
+        return tok.type == TokenType.IDENTIFIER and tok.value == word
+
+    def _peek_word(self, offset: int, word: str) -> bool:
+        """True if the token at `offset` is an identifier with this exact text."""
+        tok = self._peek(offset)
+        return tok.type == TokenType.IDENTIFIER and tok.value == word
+
+    def _expect_word(self, word: str, message: str = "") -> Token:
+        """Consume a soft keyword by its text, with a clear error otherwise."""
+        if self._check_word(word):
+            return self._advance()
+        msg = message or f"Expected '{word}'"
+        raise ParseError(msg, self._current().location)
+
+    def _expect_name(self, what: str = "name") -> Token:
+        """
+        Expect an identifier to be used as a name (variable, task, param, ...).
+
+        If the token is a reserved (hard) keyword, raise a clear error saying
+        so instead of a confusing 'expected name' message.
+        """
+        tok = self._current()
+        if tok.type == TokenType.IDENTIFIER:
+            return self._advance()
+        if tok.raw in KEYWORDS:
+            raise ParseError(
+                f"'{tok.raw}' is a reserved word in Syntecnia; choose another "
+                f"name for the {what}",
+                tok.location,
+            )
+        raise ParseError(f"Expected {what}, got {tok.type.name}", tok.location)
+
     def _skip_newlines(self):
         while self._current().type == TokenType.NEWLINE:
             self._advance()
@@ -117,6 +157,13 @@ class Parser:
         self._skip_newlines()
         if self._at_end():
             return None
+
+        # Soft keywords: recognized only at the start of their construction,
+        # via fixed lookahead. Everywhere else they are plain identifiers.
+        if self._check_word("serve") and self._peek_word(1, "on"):
+            return self._parse_serve()
+        if self._check_word("expect") and self._peek_word(1, "body"):
+            return self._parse_expect()
 
         tt = self._current().type
 
@@ -176,10 +223,6 @@ class Parser:
             return self._parse_type_definition()
         elif tt == TokenType.TRY:
             return self._parse_try_recover()
-        elif tt == TokenType.SERVE:
-            return self._parse_serve()
-        elif tt == TokenType.EXPECT:
-            return self._parse_expect()
         else:
             # Expression statement (e.g., function call)
             return self._parse_expression()
@@ -208,7 +251,7 @@ class Parser:
         """let name be expression"""
         loc = self._location()
         self._advance()  # consume 'let'
-        name_tok = self._expect(TokenType.IDENTIFIER, "Expected variable name after 'let'")
+        name_tok = self._expect_name("variable after 'let'")
         self._expect(TokenType.BE, "Expected 'be' after variable name in let binding")
         value = self._parse_expression()
         return ast.LetBinding(location=loc, name=name_tok.value, value=value)
@@ -256,7 +299,7 @@ class Parser:
         """each item in collection\n    body"""
         loc = self._location()
         self._advance()  # consume 'each'
-        var_tok = self._expect(TokenType.IDENTIFIER, "Expected variable after 'each'")
+        var_tok = self._expect_name("loop variable after 'each'")
         self._expect(TokenType.IN, "Expected 'in' after variable in each loop")
         collection = self._parse_expression()
         body = self._parse_block()
@@ -305,14 +348,14 @@ class Parser:
         """task name(params)\n    body"""
         loc = self._location()
         self._advance()  # consume 'task'
-        name_tok = self._expect(TokenType.IDENTIFIER, "Expected task name")
+        name_tok = self._expect_name("task name")
         params = []
 
         if self._match(TokenType.LPAREN):
             if not self._check(TokenType.RPAREN):
-                params.append(self._expect(TokenType.IDENTIFIER).value)
+                params.append(self._expect_name("parameter name").value)
                 while self._match(TokenType.COMMA):
-                    params.append(self._expect(TokenType.IDENTIFIER).value)
+                    params.append(self._expect_name("parameter name").value)
             self._expect(TokenType.RPAREN)
 
         body = self._parse_block()
@@ -343,14 +386,14 @@ class Parser:
         """type Name\n    field: type"""
         loc = self._location()
         self._advance()  # consume 'type'
-        name_tok = self._expect(TokenType.IDENTIFIER)
+        name_tok = self._expect_name("type name")
         self._skip_newlines()
         self._expect(TokenType.INDENT)
         fields = []
 
         self._skip_newlines()
         while not self._check(TokenType.DEDENT, TokenType.EOF):
-            field_name = self._expect(TokenType.IDENTIFIER).value
+            field_name = self._expect_name("field name").value
             self._expect(TokenType.COLON)
             type_name = self._expect(TokenType.IDENTIFIER).value
             fields.append((field_name, type_name))
@@ -458,12 +501,7 @@ class Parser:
         """require net("api.example.com")"""
         loc = self._location()
         self._advance()
-        # Capability names are identifiers, but `serve` is also a keyword;
-        # accept it (and its value "serve") here.
-        if self._check(TokenType.SERVE):
-            cap_tok = self._advance()
-        else:
-            cap_tok = self._expect(TokenType.IDENTIFIER)
+        cap_tok = self._expect(TokenType.IDENTIFIER)
         scope = None
         if self._match(TokenType.LPAREN):
             scope = self._parse_expression()
@@ -561,8 +599,8 @@ class Parser:
                 body...
         """
         loc = self._location()
-        self._advance()  # consume 'serve'
-        self._expect(TokenType.ON, "Expected 'on' after 'serve' (serve on PORT)")
+        self._advance()  # consume soft keyword 'serve'
+        self._expect_word("on", "Expected 'on' after 'serve' (serve on PORT)")
         port = self._parse_expression()
 
         auth_handler = None
@@ -573,11 +611,11 @@ class Parser:
         self._skip_newlines()
 
         while not self._at_end() and not self._check(TokenType.DEDENT):
-            if self._check(TokenType.AUTH):
-                self._advance()  # consume 'auth'
+            if self._check_word("auth"):
+                self._advance()  # consume soft keyword 'auth'
                 self._expect(TokenType.WITH, "Expected 'with' after 'auth' (auth with <task>)")
                 auth_handler = self._parse_expression()
-            elif self._check(TokenType.ROUTE):
+            elif self._check_word("route"):
                 routes.append(self._parse_route())
             else:
                 tok = self._current()
@@ -591,6 +629,16 @@ class Parser:
         if self._check(TokenType.DEDENT):
             self._advance()
 
+        # A route that 'requires auth' needs an 'auth with <task>' on the block.
+        if auth_handler is None:
+            for r in routes:
+                if r.requires_auth:
+                    raise ParseError(
+                        f"route \"{r.method} {r.path}\" uses 'requires auth' but the "
+                        f"'serve' block declares no 'auth with <task>'",
+                        r.location,
+                    )
+
         return ast.ServeBlock(
             location=loc, port=port, auth_handler=auth_handler, routes=routes,
         )
@@ -598,13 +646,14 @@ class Parser:
     def _parse_route(self) -> ast.RouteDefinition:
         """route "METHOD /path/:param" [requires auth]\n    body"""
         loc = self._location()
-        self._advance()  # consume 'route'
+        self._advance()  # consume soft keyword 'route'
         spec_tok = self._expect(TokenType.TEXT, "Expected a route spec string, e.g. \"GET /path\"")
         method, path, param_names = self._split_route_spec(spec_tok.value, spec_tok.location)
 
         requires_auth = False
-        if self._match(TokenType.REQUIRES):
-            self._expect(TokenType.AUTH, "Expected 'auth' after 'requires' (requires auth)")
+        if self._check_word("requires"):
+            self._advance()  # consume soft keyword 'requires'
+            self._expect_word("auth", "Expected 'auth' after 'requires' (requires auth)")
             requires_auth = True
 
         body = self._parse_block()
@@ -633,8 +682,8 @@ class Parser:
     def _parse_expect(self) -> ast.ExpectStatement:
         """expect body {field: type, ...}"""
         loc = self._location()
-        self._advance()  # consume 'expect'
-        target_tok = self._expect(TokenType.IDENTIFIER, "Expected 'body' after 'expect'")
+        self._advance()  # consume soft keyword 'expect'
+        target_tok = self._expect_word("body", "Expected 'body' after 'expect'")
         self._expect(TokenType.LBRACE, "Expected '{' to declare the expected shape")
         shape = []
         if not self._check(TokenType.RBRACE):

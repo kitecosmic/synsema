@@ -193,6 +193,50 @@ def register_database_builtins(env, db_manager: DatabaseManager):
             "last_id": syn_number(result["last_id"] or 0),
         })
 
+    def _paged(args):
+        """
+        paged(query, params?) → a lazy, server-paginated result.
+
+        Returns a marker value that `serve` recognizes: instead of loading the
+        whole collection, it fetches only the requested page (LIMIT/OFFSET) and
+        computes `total` with a COUNT(*) over the query. Use it with `give` in a
+        route handler for large tables. Do NOT put LIMIT in `query` yourself.
+
+        Outside a route handler it degrades to the full result set.
+        Always use parameterized `params` — never string-concatenate values.
+        """
+        query = str(args[0].raw)
+        params = []
+        if len(args) > 1 and isinstance(args[1].type, SynList):
+            params = [_syn_to_python(p) for p in args[1].raw]
+
+        def _rows_to_syn(rows):
+            return [syn_map({k: _python_to_syn(v) for k, v in row.items()}) for row in rows]
+
+        def fetch(limit, offset):
+            # limit is None → degraded full materialization (no serve context).
+            if limit is None:
+                rows = db_manager.query(query, list(params))
+                return _rows_to_syn(rows), len(rows)
+            count_rows = db_manager.query(
+                f"SELECT COUNT(*) AS _c FROM ({query}) AS _sub", list(params)
+            )
+            total = 0
+            if count_rows:
+                total = list(count_rows[0].values())[0]
+            rows = db_manager.query(
+                f"{query} LIMIT ? OFFSET ?", list(params) + [int(limit), int(offset)]
+            )
+            return _rows_to_syn(rows), total
+
+        # Marker consumed by stdlib.server (kept as a plain string to avoid a
+        # circular import): server._PAGED == "__serve_paged__".
+        return SynValue(
+            raw={"fetch": fetch, "query": query, "params": params},
+            type=SynMap(),
+            metadata={"__serve_paged__": True},
+        )
+
     def _sql_tables(args):
         """sql_tables() → list of table names"""
         tables = db_manager.tables()
@@ -214,6 +258,7 @@ def register_database_builtins(env, db_manager: DatabaseManager):
         "db_open": BuiltinTask("db_open", _db_open),
         "db_close": BuiltinTask("db_close", _db_close),
         "sql": BuiltinTask("sql", _sql),
+        "paged": BuiltinTask("paged", _paged),
         "sql_exec": BuiltinTask("sql_exec", _sql_exec),
         "sql_tables": BuiltinTask("sql_tables", _sql_tables, 0),
         "sql_batch": BuiltinTask("sql_batch", _sql_batch, 2),

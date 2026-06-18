@@ -1,6 +1,9 @@
 # Syntecnia Syntax
 
-## Keywords
+## Reserved (hard) keywords
+These cannot be used as names; using one (e.g. `let task be 1`) gives a clear
+"reserved word" error.
+
 Flow: `when`, `otherwise`, `each`, `in`, `while`, `match`, `is`, `then`, `stop`
 Definitions: `task`, `give`, `let`, `be`, `set`, `to`, `type`, `as`, `of`, `with`
 Agent: `agent`, `spawn`, `share`, `observe`, `signal`, `wait_for`
@@ -8,10 +11,16 @@ Security: `require`, `sandbox`, `invariant`, `intent`
 Human: `approve`, `confirm`, `ask`, `show`
 LLM: `reason`, `decide`, `analyze`, `generate`
 Error handling: `try`, `recover`
-HTTP server: `serve`, `on`, `route`, `auth`, `requires`, `expect`
 Observability: `trace`, `log`, `measure`, `checkpoint`
 Logic: `and`, `or`, `not`
 Literals: `true`, `false`, `nothing`
+
+## Soft keywords (NOT reserved)
+`serve`, `on`, `route`, `auth`, `requires`, `expect` — special **only** at the
+start of their HTTP-server construction (`serve on N`, `route "..."`, `requires
+auth`, `expect body {...}`). Everywhere else they are ordinary identifiers, so
+`let route be "/x"` and `task auth(x)` are valid. The parser uses fixed
+lookahead, never heuristics. See [serve.md](serve.md).
 
 ## Operators
 Arithmetic: `+`, `-`, `*`, `/`, `%`, `**`

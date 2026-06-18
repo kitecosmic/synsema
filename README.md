@@ -175,11 +175,13 @@ serve on 8080
 
 - **Capability:** `require serve(PORT)` — scoped to the port. Without it, `serve on PORT` fails with a clear error.
 - **Request:** `request.json`, `request.body`, `request.headers`, `request.user`, plus `query` and `params` maps.
-- **Response contract:** `give <map>` → the object as-is; `give <list>` → `{"items", "count", "total", "cursor"}`. Helpers: `ok(x)`, `created(x)` (201), `not_found(x)` (404), `fail(code, msg)`.
-- **Pagination:** always applied to collections — default `limit` 100, `?limit=` / `?cursor=`, `total` always present.
+- **Response contract:** `give <map>` → the object as-is; `give <list>` → `{"items", "count", "total", "cursor"}`; scalar → as-is; nothing → `null`. Helpers: `ok(x)`, `created(x)` (201), `not_found(x)` (404), `fail(code, msg)`.
+- **Pagination:** always applied to collections — default `limit` 100, `?limit=` / `?cursor=`, `total` always present. For large tables use `give paged("SELECT ...", [params])` — SQL `LIMIT`/`OFFSET` pushdown with an exact `COUNT(*)` total, nothing fully materialized.
 - **Auth:** `requires auth` extracts the `Authorization: Bearer` token, calls the `auth with` task; `nothing` → 401, otherwise the value lands in `request.user`.
 - **Validation:** `expect body {field: type}` (`text`, `number`, `bool`, `list`, `map`) → 400 naming the bad field.
+- **HTTP semantics:** `405` (with `Allow`) for a known path on the wrong method, `OPTIONS`/`HEAD` handled, malformed JSON → 400, bodies over 1 MB → 413.
 - **Isolation:** each request runs in its own interpreter/scope, like an agent; only the blackboard and DB are shared. Uncaught errors become 500 — never a server crash.
+- **Soft keywords:** `serve`, `on`, `route`, `auth`, `requires`, `expect` are only special inside their construction — elsewhere they are ordinary names (`let route be "/x"` works).
 
 See [.syntecnia-skill/serve.md](.syntecnia-skill/serve.md) for full details.
 

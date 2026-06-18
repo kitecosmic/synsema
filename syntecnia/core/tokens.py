@@ -92,7 +92,11 @@ class TokenType(Enum):
     TRY = auto()             # try block
     RECOVER = auto()         # catch/recover block
 
-    # -- HTTP server keywords --
+    # -- HTTP server SOFT keywords --
+    # These are NOT in KEYWORDS: the lexer emits them as IDENTIFIER and the
+    # parser recognizes them only at the start of their construction (serve on
+    # N, route "...", requires auth, expect body {...}) via fixed lookahead.
+    # The enum members are kept as documentation of the reserved-by-context set.
     SERVE = auto()           # serve on PORT — start an HTTP server
     ON = auto()              # serve on PORT
     ROUTE = auto()           # route "GET /path" — define a route
@@ -217,13 +221,12 @@ KEYWORDS = {
     "try": TokenType.TRY,
     "recover": TokenType.RECOVER,
 
-    # HTTP server
-    "serve": TokenType.SERVE,
-    "on": TokenType.ON,
-    "route": TokenType.ROUTE,
-    "auth": TokenType.AUTH,
-    "requires": TokenType.REQUIRES,
-    "expect": TokenType.EXPECT,
+    # NOTE: the HTTP-server words (serve, on, route, auth, requires, expect)
+    # are intentionally NOT reserved. They are *soft keywords*: the parser
+    # recognizes them only at the start of their construction (serve on N,
+    # route "...", requires auth, expect body {...}) via fixed lookahead.
+    # Everywhere else they are ordinary identifiers, so `let route be "/x"`
+    # and `task auth(x)` are valid.
 
     # Literals
     "true": TokenType.BOOL_TRUE,
