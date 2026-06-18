@@ -37,6 +37,9 @@ from ..llm.validator import ResponseValidator
 from ..agents.progress import ProgressManager
 from ..agents.memory import AgentMemory
 from ..agents.builtins import register_agent_builtins
+from ..stdlib.http import register_http_builtins
+from ..stdlib.database import DatabaseManager, register_database_builtins
+from ..stdlib.cron import CronScheduler, register_cron_builtins
 
 
 class ExecutionResult:
@@ -125,6 +128,10 @@ class SyntecniaEngine:
         self.progress_manager = ProgressManager()
         self.agent_memory = AgentMemory()
 
+        # Database and cron managers
+        self.db_manager = DatabaseManager()
+        self.cron_scheduler = CronScheduler()
+
         # Register secure builtins (fetch, read_file, etc.)
         register_secure_builtins(self.interpreter.global_env, self.secure_ops)
 
@@ -134,6 +141,11 @@ class SyntecniaEngine:
             self.progress_manager,
             self.agent_memory,
         )
+
+        # Register stdlib builtins (http, database, cron)
+        register_http_builtins(self.interpreter.global_env)
+        register_database_builtins(self.interpreter.global_env, self.db_manager)
+        register_cron_builtins(self.interpreter.global_env, self.cron_scheduler, self.interpreter)
 
         # Wire up callbacks
         self.interpreter.output_callback = self._on_output

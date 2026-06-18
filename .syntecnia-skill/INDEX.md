@@ -8,6 +8,7 @@ Read ONLY the sections you need. Do not load everything.
 - [types.md](types.md) — Type system, property access, values
 
 ## By topic
+- [stdlib.md](stdlib.md) — HTTP requests, SQL database, cron scheduler (zero dependencies)
 - [capabilities.md](capabilities.md) — Security model, require, sandbox, intent
 - [agents.md](agents.md) — Multi-agent coordination, blackboard, swarm, signals
 - [llm.md](llm.md) — LLM operations: reason, decide, analyze, generate
@@ -21,6 +22,7 @@ Read ONLY the sections you need. Do not load everything.
 
 ## When to read what
 - Writing a new .syn program → syntax.md, builtins.md
+- HTTP / SQL / cron → stdlib.md
 - Adding security → capabilities.md
 - Multi-agent system → agents.md
 - Using AI reasoning → llm.md
