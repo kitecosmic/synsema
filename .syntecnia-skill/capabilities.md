@@ -18,24 +18,24 @@ require time
 
 `require` in the program body grants the capability for real. This is NOT just a declaration — it enables the operation.
 
-## Intent enforcement
+## Intent (descriptive)
 
 ```
-intent: "Read data from api.shop.com and generate reports"
+intent: "Process customer orders and generate reports"
 ```
 
-How the intent works internally:
-- The enforcer parses the intent text looking for **action verbs** (keywords).
-- Each verb maps to allowed action categories (FILE_READ, NET_WRITE, etc.).
-- Actions outside those categories are **blocked** in strict mode.
-- The intent **freezes** after the first non-intent statement — prompt injection cannot expand it.
-- Without an `intent:` declaration = fully permissive (only capabilities apply).
+The `intent:` is a **human-readable description** of what the program is for. It is used for:
+- Auditing (shown in `--audit`)
+- LLM context (every reasoning call sees the program's purpose)
+- Documentation
 
-**Recognized verbs (English only):** read, fetch, get, download, process, analyze, calculate, write, save, store, update, create, delete, send, post, upload, notify, email, run, execute, deploy, build, spawn, delegate, manage, generate, report
+**The intent does NOT authorize or block actions.** Security is enforced *only* by capabilities (`require`). This is deliberate: the language has exactly ONE explicit authorization model, so behavior is predictable. You can write the intent in any language — it is never parsed for security.
 
-**Write the intent in English** to activate category enforcement. The intent, like all keywords in the language, is English.
+To restrict what the program can do, use `require` with precise scopes. Anything not declared fails with a clear, actionable `Capability not granted` error — there is no guessing and no silent permissive fallback.
 
-**If no verbs match** (e.g. intent in another language), the enforcer **degrades to permissive** in categories — it won't block anything by category. Domains and paths in the intent text are still enforced. This means a non-English intent is safe (not blocking) but provides no category restriction.
+- The intent **freezes** after execution starts: a prompt injection cannot redeclare a broader intent (redeclaring a frozen intent is an error).
+
+> Earlier versions tried to infer allowed action categories by scanning the intent prose for verb keywords, with a permissive fallback when nothing matched. That was unpredictable and language-dependent, so it was removed. Use `require` to declare permissions.
 
 ## Per-task sandboxing
 

