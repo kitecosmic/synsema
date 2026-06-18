@@ -86,12 +86,16 @@ def register_agent_builtins(env, progress_mgr: ProgressManager,
 
     def _remember(args: List[SynValue]) -> SynValue:
         """remember(category, content, tags?)"""
+        from ..core.interpreter import RuntimeError as SynRuntimeError
         category = str(args[0].raw)
         content = str(args[1].raw)
         tags = []
         if len(args) > 2 and isinstance(args[2].type, SynList):
             tags = [str(t) for t in args[2].raw]
-        entry = memory.remember(category, content, tags=tags)
+        try:
+            entry = memory.remember(category, content, tags=tags)
+        except ValueError as e:
+            raise SynRuntimeError(str(e))
         return syn_text(entry.id)
 
     def _recall(args: List[SynValue]) -> SynValue:

@@ -208,8 +208,8 @@ ERROR_PATTERNS = [
         "category": "capability",
         "recoverable": False,
         "suggestions": [
-            "Add 'require {capability}' at the top of the program",
-            "Run with --grant {capability}:{scope} flag",
+            "Add the matching 'require' at the top of the program",
+            "Run with the --grant flag, e.g. --grant file:/path/*",
             "Check if this operation matches the declared intent",
         ],
     },
