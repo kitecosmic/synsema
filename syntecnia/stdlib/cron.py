@@ -160,12 +160,24 @@ class CronScheduler:
         return "\n".join(lines)
 
 
-def register_cron_builtins(env, scheduler: CronScheduler, interpreter=None):
+def register_cron_builtins(env, scheduler: CronScheduler, interpreter=None,
+                           live_output: bool = True):
     """Register cron builtins in a Syntecnia environment."""
+    import sys as _sys
     from ..core.types import (
         SynValue, BuiltinTask, SynTask, SynTaskValue,
         syn_number, syn_text, syn_bool, syn_nothing, syn_list, syn_map,
     )
+
+    # For cron tasks, output goes directly to stdout (not buffered)
+    _original_output = interpreter.output_callback if interpreter else None
+
+    def _cron_output(text):
+        """Route cron task output to stdout in real time."""
+        if _original_output:
+            _original_output(text)
+        # Also print to real stdout for serve/daemon mode
+        print(text, flush=True)
 
     def _cron_every(args):
         """cron_every(seconds, task_or_name)"""
@@ -177,7 +189,12 @@ def register_cron_builtins(env, scheduler: CronScheduler, interpreter=None):
             name = task_val.raw.name
             def run():
                 if interpreter:
-                    interpreter._call_value(task_val, [], None)
+                    saved_cb = interpreter.output_callback
+                    interpreter.output_callback = _cron_output
+                    try:
+                        interpreter._call_value(task_val, [], None)
+                    finally:
+                        interpreter.output_callback = saved_cb
         elif isinstance(task_val.raw, BuiltinTask):
             name = task_val.raw.name
             def run():

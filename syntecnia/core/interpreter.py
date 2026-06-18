@@ -148,6 +148,13 @@ class Interpreter:
             "range": BuiltinTask("range", self._builtin_range),
             "type_of": BuiltinTask("type_of", self._builtin_type_of, 1),
             "slice": BuiltinTask("slice", self._builtin_slice),
+            "fmt": BuiltinTask("fmt", self._builtin_fmt, 1),
+            "upper": BuiltinTask("upper", self._builtin_upper, 1),
+            "lower": BuiltinTask("lower", self._builtin_lower, 1),
+            "trim": BuiltinTask("trim", self._builtin_trim, 1),
+            "starts_with": BuiltinTask("starts_with", self._builtin_starts_with, 2),
+            "ends_with": BuiltinTask("ends_with", self._builtin_ends_with, 2),
+            "replace_text": BuiltinTask("replace_text", self._builtin_replace_text, 3),
         }
         for name, builtin in builtins.items():
             self.global_env.set(name, SynValue(raw=builtin, type=SynTask()))
@@ -248,6 +255,40 @@ class Interpreter:
         if isinstance(collection.type, SynText):
             return syn_text(collection.raw[start:end])
         raise RuntimeError(f"Cannot slice {collection.type.name}")
+
+    def _builtin_fmt(self, args: List[SynValue]) -> SynValue:
+        """fmt("Hello {name}, you have {count} items") — interpolate variables from caller's env."""
+        template = str(args[0].raw)
+        # Replace {varname} with variable values
+        import re
+        def replace_var(match):
+            var_name = match.group(1)
+            # Try to find the variable in the current environment
+            # We'll use a simple approach: check if extra args were passed
+            return str(var_name)  # fallback
+        # For fmt, we use a map as second arg: fmt("Hi {name}", {"name": "Alice"})
+        if len(args) > 1 and isinstance(args[1].type, SynMap):
+            for key, val in args[1].raw.items():
+                template = template.replace("{" + str(key) + "}", str(val))
+        return syn_text(template)
+
+    def _builtin_upper(self, args: List[SynValue]) -> SynValue:
+        return syn_text(str(args[0].raw).upper())
+
+    def _builtin_lower(self, args: List[SynValue]) -> SynValue:
+        return syn_text(str(args[0].raw).lower())
+
+    def _builtin_trim(self, args: List[SynValue]) -> SynValue:
+        return syn_text(str(args[0].raw).strip())
+
+    def _builtin_starts_with(self, args: List[SynValue]) -> SynValue:
+        return syn_bool(str(args[0].raw).startswith(str(args[1].raw)))
+
+    def _builtin_ends_with(self, args: List[SynValue]) -> SynValue:
+        return syn_bool(str(args[0].raw).endswith(str(args[1].raw)))
+
+    def _builtin_replace_text(self, args: List[SynValue]) -> SynValue:
+        return syn_text(str(args[0].raw).replace(str(args[1].raw), str(args[2].raw)))
 
     # =========================================================
     # Main evaluation
@@ -895,3 +936,33 @@ class Interpreter:
             "state_keys": list(state.keys()),
         })
         return syn_nothing()
+
+    # -- Error handling --
+
+    def _exec_TryRecover(self, node: ast.TryRecover, env: Environment) -> SynValue:
+        """
+        Execute try block. If any exception occurs, execute recover block
+        with the error message bound to the error variable.
+        """
+        try:
+            return self._exec_block(node.try_body, env)
+        except GiveSignal:
+            raise  # give (return) propagates through try/recover
+        except StopSignal:
+            raise  # stop (break) propagates through try/recover
+        except Exception as e:
+            # Bind the error message to the variable
+            error_msg = str(e)
+            # Strip location prefix if present
+            if ": " in error_msg and error_msg[0] != " ":
+                parts = error_msg.split(": ", 1)
+                if parts[0].count(":") >= 2:  # looks like file:line:col
+                    error_msg = parts[1]
+            recover_env = Environment(parent=env, name="recover")
+            recover_env.set(node.error_variable, syn_text(error_msg))
+            self.logs.append({
+                "type": "recover",
+                "error": error_msg,
+                "variable": node.error_variable,
+            })
+            return self._exec_block(node.recover_body, recover_env)

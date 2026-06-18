@@ -40,6 +40,7 @@ from ..agents.builtins import register_agent_builtins
 from ..stdlib.http import register_http_builtins
 from ..stdlib.database import DatabaseManager, register_database_builtins
 from ..stdlib.cron import CronScheduler, register_cron_builtins
+from .persistence import StatePersistence
 
 
 class ExecutionResult:
@@ -131,6 +132,9 @@ class SyntecniaEngine:
         # Database and cron managers
         self.db_manager = DatabaseManager()
         self.cron_scheduler = CronScheduler()
+
+        # State persistence (survives restarts)
+        self.persistence: Optional[StatePersistence] = None
 
         # Register secure builtins (fetch, read_file, etc.)
         register_secure_builtins(self.interpreter.global_env, self.secure_ops)
@@ -416,6 +420,13 @@ class SyntecniaEngine:
         self._output_buffer = []
         start = time.perf_counter()
 
+        # Auto-enable persistence for named files
+        if filename != "<stdin>" and not self.persistence:
+            from pathlib import Path
+            prog_name = Path(filename).stem
+            self.persistence = StatePersistence(program_name=prog_name)
+            self.persistence.load_into(self.agent_memory, self.progress_manager)
+
         # Load source for error context
         self.error_reporter.load_source(filename, source)
 
@@ -484,6 +495,11 @@ class SyntecniaEngine:
 
         result.duration_ms = (time.perf_counter() - start) * 1000
         result.output = self._output_buffer.copy()
+
+        # Auto-save state after execution
+        if self.persistence:
+            self.persistence.save_from(self.agent_memory, self.progress_manager)
+
         return result
 
     def run_file(self, filepath: str) -> ExecutionResult:

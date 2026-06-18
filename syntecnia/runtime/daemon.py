@@ -63,12 +63,25 @@ def _read_pid(name: str) -> Optional[int]:
 
 
 def _is_running(pid: int) -> bool:
-    """Check if a process is running."""
-    try:
-        os.kill(pid, 0)
-        return True
-    except (OSError, ProcessLookupError):
-        return False
+    """Check if a process is running. Works on Linux, Mac, and Windows."""
+    if os.name == "nt":
+        # Windows: use tasklist
+        try:
+            output = subprocess.check_output(
+                ["tasklist", "/FI", f"PID eq {pid}"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            return str(pid) in output
+        except (subprocess.SubprocessError, FileNotFoundError):
+            return False
+    else:
+        # Unix: signal 0 checks existence
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
 
 
 def daemon_start(program_path: str, extra_args: List[str] = None,
@@ -162,17 +175,23 @@ def daemon_stop(name_or_path: str) -> Dict:
         (_daemon_state_dir(name) / "pid").unlink(missing_ok=True)
         return {"status": "not_running", "message": f"Daemon '{name}' is not running (stale PID {pid})"}
 
-    # Send SIGTERM (graceful) then SIGKILL if needed
+    # Send SIGTERM (graceful) then force kill if needed
     try:
-        os.kill(pid, signal.SIGTERM)
-        # Wait up to 5 seconds for graceful shutdown
-        for _ in range(50):
-            if not _is_running(pid):
-                break
-            time.sleep(0.1)
+        if os.name == "nt":
+            # Windows: taskkill
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                           capture_output=True)
         else:
-            # Force kill
-            os.kill(pid, signal.SIGKILL)
+            os.kill(pid, signal.SIGTERM)
+            # Wait up to 5 seconds for graceful shutdown
+            for _ in range(50):
+                if not _is_running(pid):
+                    break
+                time.sleep(0.1)
+            else:
+                # Force kill (Unix only)
+                if hasattr(signal, "SIGKILL"):
+                    os.kill(pid, signal.SIGKILL)
     except (OSError, ProcessLookupError):
         pass
 

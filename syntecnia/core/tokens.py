@@ -88,6 +88,10 @@ class TokenType(Enum):
     ANALYZE = auto()         # LLM analysis
     GENERATE = auto()        # LLM content generation
 
+    # -- Error handling keywords --
+    TRY = auto()             # try block
+    RECOVER = auto()         # catch/recover block
+
     # -- Observability keywords --
     TRACE = auto()           # tracing block
     LOG = auto()             # log emission
@@ -200,6 +204,10 @@ KEYWORDS = {
     "log": TokenType.LOG,
     "measure": TokenType.MEASURE,
     "checkpoint": TokenType.CHECKPOINT,
+
+    # Error handling
+    "try": TokenType.TRY,
+    "recover": TokenType.RECOVER,
 
     # Literals
     "true": TokenType.BOOL_TRUE,

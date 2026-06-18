@@ -395,3 +395,18 @@ class MeasureBlock(Node):
 class CheckpointStatement(Node):
     """checkpoint "before_payment" """
     name: str = ""
+
+
+# -- Error handling --
+
+@dataclass
+class TryRecover(Node):
+    """
+    try
+        risky_operation()
+    recover error
+        handle_error(error)
+    """
+    try_body: List[Node] = field(default_factory=list)
+    error_variable: str = "error"  # variable name for the error
+    recover_body: List[Node] = field(default_factory=list)

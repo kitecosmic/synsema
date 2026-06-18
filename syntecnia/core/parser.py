@@ -174,6 +174,8 @@ class Parser:
             return self._parse_checkpoint()
         elif tt == TokenType.TYPE:
             return self._parse_type_definition()
+        elif tt == TokenType.TRY:
+            return self._parse_try_recover()
         else:
             # Expression statement (e.g., function call)
             return self._parse_expression()
@@ -354,6 +356,31 @@ class Parser:
             self._advance()
 
         return ast.TypeDefinition(location=loc, name=name_tok.value, fields=fields)
+
+    # -- try/recover --
+
+    def _parse_try_recover(self) -> ast.TryRecover:
+        """try\n    body\nrecover error_var\n    recover_body"""
+        loc = self._location()
+        self._advance()  # consume 'try'
+        try_body = self._parse_block()
+
+        self._skip_newlines()
+        self._expect(TokenType.RECOVER, "Expected 'recover' after try block")
+
+        # Optional error variable name
+        error_var = "error"
+        if self._check(TokenType.IDENTIFIER):
+            error_var = self._advance().value
+
+        recover_body = self._parse_block()
+
+        return ast.TryRecover(
+            location=loc,
+            try_body=try_body,
+            error_variable=error_var,
+            recover_body=recover_body,
+        )
 
     # -- agent --
 
