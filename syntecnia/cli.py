@@ -155,6 +155,22 @@ def main():
                 # Wait for agents to finish before showing dashboard
                 engine.swarm.wait_all(timeout=10)
                 print("\n" + engine.swarm.format_dashboard())
+
+            if "--serve" in args:
+                # Keep process alive for cron jobs and agents
+                jobs = engine.cron_scheduler.list_jobs()
+                if jobs:
+                    print(f"\nServing {len(jobs)} cron job(s). Press Ctrl+C to stop.")
+                else:
+                    print("\nServe mode. Press Ctrl+C to stop.")
+                try:
+                    import time
+                    while True:
+                        time.sleep(1)
+                except KeyboardInterrupt:
+                    engine.cron_scheduler.cancel_all()
+                    engine.db_manager.close_all()
+                    print("\nStopped.")
             return
 
     print(f"Unknown command: {command}")

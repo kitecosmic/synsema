@@ -84,9 +84,13 @@ def http_request(method: str, url: str,
             response_headers = dict(resp.headers)
             status = resp.status
 
-            # Auto-parse JSON
+            # Auto-parse JSON (headers can be any casing)
             json_data = None
-            content_type = response_headers.get("content-type", "")
+            content_type = ""
+            for k, v in response_headers.items():
+                if k.lower() == "content-type":
+                    content_type = v
+                    break
             if "json" in content_type.lower():
                 try:
                     json_data = _json.loads(response_body)

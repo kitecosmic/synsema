@@ -42,6 +42,28 @@
 - `random()` → float 0-1
 - `random_int(min, max)` → integer
 
+## HTTP
+- `http(method, url, headers?, query?, body?, timeout?)` → response map {status, ok, body, json, headers, error}
+- `http_get(url, headers?, query?)` → response map
+- `http_post(url, body, headers?)` → response map
+- `http_put(url, body, headers?)` → response map
+- `http_delete(url, headers?)` → response map
+
+## Database (SQL)
+- `db_open(path, mode?)` — mode: "readwrite" (default), "readonly", "memory"
+- `db_close(path?)` — close connection
+- `sql(query, params?)` → list of row maps (SELECT)
+- `sql_exec(statement, params?)` → {rows_affected, last_id} (INSERT/UPDATE/DELETE/CREATE)
+- `sql_batch(statement, params_list)` → {rows_affected} (batch operations)
+- `sql_tables()` → list of table names
+
+## Cron (Scheduled Tasks)
+- `cron_every(seconds, task)` → job name (repeating background job)
+- `cron_after(seconds, task)` → job name (one-shot delayed execution)
+- `cron_cancel(name)` → bool
+- `cron_list()` → list of job info maps
+- `cron_status()` → formatted text
+
 ## Agent operations
 - `create_progress(task_name, [step_names])` → task_name
 - `start_step(task_name, step_name)` → bool

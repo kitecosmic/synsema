@@ -85,6 +85,16 @@ let jobs be cron_list()            -- list all jobs
 print(cron_status())               -- formatted status
 ```
 
+## Serve mode (keep crons alive)
+
+By default, when the program ends, cron jobs stop (daemon threads).
+Use `--serve` to keep the process alive:
+
+```bash
+syntecnia run server.syn --serve
+# Serving 3 cron job(s). Press Ctrl+C to stop.
+```
+
 ## Capabilities
 
 HTTP requires `net` capability. Database requires `db` capability.
@@ -93,3 +103,10 @@ HTTP requires `net` capability. Database requires `db` capability.
 require net("api.store.com")
 require db("./store.db")
 ```
+
+## Platform
+
+- HTTP: works on Linux, Windows, Mac (Python stdlib urllib)
+- SQL: works on Linux, Windows, Mac (Python stdlib sqlite3)
+- Cron: works on Linux, Windows, Mac (Python stdlib threading.Timer)
+- All zero external dependencies
