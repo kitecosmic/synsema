@@ -158,9 +158,9 @@ ERROR_PATTERNS = [
         "category": "data",
         "recoverable": True,
         "suggestions": [
-            "Add a guard: when {divisor} != 0",
-            "Add invariant: {divisor} > 0 before the division",
-            "Provide a default value: when {divisor} == 0, give 0",
+            "Add a guard: when divisor != 0 before dividing",
+            "Add invariant: divisor > 0 before the division",
+            "Provide a default: when divisor == 0, give 0 otherwise give x / divisor",
         ],
     },
     {

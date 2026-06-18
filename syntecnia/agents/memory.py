@@ -194,9 +194,17 @@ class AgentMemory:
                  data: Dict = None, tags: List[str] = None,
                  source: str = "agent") -> MemoryEntry:
         """Store something in memory."""
+        valid_categories = [c.value for c in MemoryCategory]
+        try:
+            cat = MemoryCategory(category)
+        except ValueError:
+            raise ValueError(
+                f"Invalid memory category: '{category}'. "
+                f"Valid categories: {', '.join(valid_categories)}"
+            )
         entry = MemoryEntry(
             id=self._next_id(),
-            category=MemoryCategory(category),
+            category=cat,
             content=content,
             data=data or {},
             tags=tags or [],

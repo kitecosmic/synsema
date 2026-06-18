@@ -104,6 +104,9 @@ class SyntecniaEngine:
         self._cap_stack: List[CapabilitySet] = []
         self.interpreter._capability_scope_callback = self._capability_scope
 
+        # Wire require statements to the real CapabilitySet
+        self.interpreter._grant_capability = lambda name, scope: self.grant_capability(name, scope)
+
         # LLM context builder
         self.llm_context = LLMContext()
 

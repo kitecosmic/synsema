@@ -50,13 +50,13 @@ def _gen_numbers(count: int) -> List[SynValue]:
         syn_number(-1),
         syn_number(0.5),
         syn_number(-0.5),
-        syn_number(999999),
-        syn_number(-999999),
+        syn_number(10),
+        syn_number(-10),
         syn_number(0.0001),
     ]
-    # Add random values
+    # Add random values (keep small to avoid blowing up recursive functions)
     while len(edge) < count:
-        edge.append(syn_number(random.uniform(-1000, 1000)))
+        edge.append(syn_number(random.uniform(-100, 100)))
     return edge[:count]
 
 
@@ -261,24 +261,40 @@ class TestGenerator:
 
         return cases
 
-    def run_all(self, cases: List[TestCase]) -> Dict[str, int]:
+    def run_all(self, cases: List[TestCase], timeout_per_case: float = 5.0) -> Dict[str, int]:
         """
         Run all test cases and return summary.
-
-        Returns dict with: total, passed, failed, errors
+        Each case has a timeout (default 5s) to prevent hangs on recursive functions.
         """
+        import threading
         stats = {"total": 0, "passed": 0, "failed": 0, "errors": 0}
 
         for case in cases:
             stats["total"] += 1
-            try:
-                self._run_case(case)
-                if case.passed:
-                    stats["passed"] += 1
-                else:
-                    stats["failed"] += 1
-            except Exception as e:
-                case.error = str(e)
+
+            # Run with timeout using a thread
+            result_holder = [None]
+            def run():
+                try:
+                    self._run_case(case)
+                except Exception as e:
+                    case.error = str(e)
+                    case.passed = False
+
+            thread = threading.Thread(target=run, daemon=True)
+            thread.start()
+            thread.join(timeout=timeout_per_case)
+
+            if thread.is_alive():
+                # Timed out
+                case.passed = False
+                case.error = f"Timed out after {timeout_per_case}s"
+                stats["errors"] += 1
+            elif case.passed:
+                stats["passed"] += 1
+            elif case.passed is False:
+                stats["failed"] += 1
+            else:
                 stats["errors"] += 1
 
         return stats

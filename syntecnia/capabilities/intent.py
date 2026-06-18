@@ -166,6 +166,35 @@ INTENT_KEYWORDS = {
     "handle": {ActionCategory.DATA_READ, ActionCategory.DATA_WRITE, ActionCategory.COMPUTE},
     "generate": {ActionCategory.LLM_REASON, ActionCategory.DATA_WRITE},
     "report": {ActionCategory.DATA_READ, ActionCategory.COMPUTE, ActionCategory.COMMUNICATE},
+
+    # Spanish keywords
+    "leer": {ActionCategory.DATA_READ, ActionCategory.FILE_READ, ActionCategory.NET_READ},
+    "obtener": {ActionCategory.NET_READ, ActionCategory.DATA_READ},
+    "descargar": {ActionCategory.NET_READ, ActionCategory.FILE_WRITE},
+    "procesar": {ActionCategory.DATA_READ, ActionCategory.DATA_WRITE, ActionCategory.COMPUTE},
+    "analizar": {ActionCategory.DATA_READ, ActionCategory.COMPUTE, ActionCategory.LLM_REASON},
+    "calcular": {ActionCategory.COMPUTE},
+    "transformar": {ActionCategory.DATA_READ, ActionCategory.DATA_WRITE, ActionCategory.COMPUTE},
+    "escribir": {ActionCategory.DATA_WRITE, ActionCategory.FILE_WRITE},
+    "guardar": {ActionCategory.DATA_WRITE, ActionCategory.FILE_WRITE},
+    "almacenar": {ActionCategory.DATA_WRITE, ActionCategory.FILE_WRITE},
+    "actualizar": {ActionCategory.DATA_READ, ActionCategory.DATA_WRITE},
+    "modificar": {ActionCategory.DATA_READ, ActionCategory.DATA_WRITE},
+    "crear": {ActionCategory.DATA_WRITE, ActionCategory.FILE_WRITE},
+    "eliminar": {ActionCategory.DATA_WRITE},
+    "borrar": {ActionCategory.DATA_WRITE},
+    "enviar": {ActionCategory.NET_WRITE, ActionCategory.COMMUNICATE},
+    "notificar": {ActionCategory.COMMUNICATE},
+    "ejecutar": {ActionCategory.EXEC},
+    "correr": {ActionCategory.EXEC},
+    "construir": {ActionCategory.EXEC, ActionCategory.FILE_WRITE},
+    "generar": {ActionCategory.LLM_REASON, ActionCategory.DATA_WRITE},
+    "reportar": {ActionCategory.DATA_READ, ActionCategory.COMPUTE, ActionCategory.COMMUNICATE},
+    "gestionar": {ActionCategory.DATA_READ, ActionCategory.DATA_WRITE, ActionCategory.COMPUTE},
+    "manejar": {ActionCategory.DATA_READ, ActionCategory.DATA_WRITE, ActionCategory.COMPUTE},
+    "subir": {ActionCategory.NET_WRITE},
+    "delegar": {ActionCategory.AGENT_SPAWN, ActionCategory.AGENT_SIGNAL},
+    "coordinar": {ActionCategory.AGENT_SPAWN, ActionCategory.AGENT_SIGNAL},
 }
 
 # Domain extraction pattern
@@ -208,6 +237,13 @@ def parse_intent(description: str) -> IntentScope:
 
     # Always allow computation and human interaction
     scope.categories.update(ALWAYS_ALLOWED)
+
+    # If no keywords matched (e.g. intent in unsupported language),
+    # grant all categories rather than blocking everything silently.
+    # The intent still constrains domains and paths if specified.
+    user_categories = scope.categories - ALWAYS_ALLOWED
+    if not user_categories:
+        scope.categories.update(ActionCategory)
 
     return scope
 

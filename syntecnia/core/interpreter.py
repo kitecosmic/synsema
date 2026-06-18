@@ -722,8 +722,16 @@ class Interpreter:
     # -- Capabilities --
 
     def _exec_RequireStatement(self, node: ast.RequireStatement, env: Environment) -> SynValue:
+        scope_val = None
+        if node.scope:
+            scope_val = str(self._exec(node.scope, env))
+
+        # Grant on the real CapabilitySet via callback (wired by engine)
+        if hasattr(self, '_grant_capability') and self._grant_capability:
+            self._grant_capability(node.capability, scope_val)
+
         self.capabilities.add(node.capability)
-        self.logs.append({"type": "require", "capability": node.capability})
+        self.logs.append({"type": "require", "capability": node.capability, "scope": scope_val})
         return syn_nothing()
 
     def _exec_SandboxBlock(self, node: ast.SandboxBlock, env: Environment) -> SynValue:
@@ -787,7 +795,13 @@ class Interpreter:
         prompt = self._exec(node.prompt, env)
         if self.human_callback:
             result = self.human_callback("ask", str(prompt))
-            return syn_text(str(result))
+            if result:
+                return syn_text(str(result))
+        # Non-interactive fallback: return first option if available
+        if node.options:
+            options = self._exec(node.options, env)
+            if isinstance(options.type, SynList) and options.raw:
+                return options.raw[0]
         return syn_text("")
 
     # -- LLM / Reasoning --
