@@ -48,6 +48,7 @@ class Parser:
         self.tokens = tokens
         self.filename = filename
         self.pos = 0
+        self._stream_depth = 0  # >0 while parsing inside a `stream` block
 
     def _current(self) -> Token:
         if self.pos < len(self.tokens):
@@ -160,6 +161,12 @@ class Parser:
 
         # Soft keywords: recognized only at the start of their construction,
         # via fixed lookahead. Everywhere else they are plain identifiers.
+        if self._stream_depth > 0 and self._check_word("send"):
+            return self._parse_send()
+        if (self._check_word("stream")
+                and self._peek(1).type == TokenType.NEWLINE
+                and self._peek(2).type == TokenType.INDENT):
+            return self._parse_stream()
         if self._check_word("serve") and self._peek_word(1, "on"):
             return self._parse_serve()
         if self._check_word("expect") and self._peek_word(1, "body"):
@@ -605,6 +612,7 @@ class Parser:
 
         auth_handler = None
         max_body = None
+        max_streams = None
         routes = []
 
         self._skip_newlines()
@@ -619,6 +627,9 @@ class Parser:
             elif self._check_word("max_body"):
                 self._advance()  # consume soft keyword 'max_body'
                 max_body = self._parse_expression()
+            elif self._check_word("max_streams"):
+                self._advance()  # consume soft keyword 'max_streams'
+                max_streams = self._parse_expression()
             elif self._check_word("route"):
                 routes.append(self._parse_route())
             else:
@@ -645,7 +656,7 @@ class Parser:
 
         return ast.ServeBlock(
             location=loc, port=port, auth_handler=auth_handler,
-            max_body=max_body, routes=routes,
+            max_body=max_body, max_streams=max_streams, routes=routes,
         )
 
     def _parse_route(self) -> ast.RouteDefinition:
@@ -662,10 +673,34 @@ class Parser:
             requires_auth = True
 
         body = self._parse_block()
+        streaming = any(isinstance(s, ast.StreamBlock) for s in body)
         return ast.RouteDefinition(
             location=loc, method=method, path=path,
-            param_names=param_names, requires_auth=requires_auth, body=body,
+            param_names=param_names, requires_auth=requires_auth,
+            streaming=streaming, body=body,
         )
+
+    def _parse_stream(self) -> ast.StreamBlock:
+        """stream\n    send ...  — an SSE response block."""
+        loc = self._location()
+        self._advance()  # consume soft keyword 'stream'
+        self._stream_depth += 1
+        try:
+            body = self._parse_block()
+        finally:
+            self._stream_depth -= 1
+        return ast.StreamBlock(location=loc, body=body)
+
+    def _parse_send(self) -> ast.SendStatement:
+        """send <value> [as "event"]"""
+        loc = self._location()
+        self._advance()  # consume soft keyword 'send'
+        value = self._parse_expression()
+        event_name = None
+        if self._match(TokenType.AS):
+            ev_tok = self._expect(TokenType.TEXT, "Expected an event name string after 'as'")
+            event_name = ev_tok.value
+        return ast.SendStatement(location=loc, value=value, event_name=event_name)
 
     def _split_route_spec(self, spec: str, loc) -> tuple:
         """Parse 'GET /products/:id' → ('GET', '/products/:id', ['id'])."""

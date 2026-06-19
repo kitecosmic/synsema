@@ -38,11 +38,13 @@ serve on 8080
 
 ### Soft keywords
 
-`serve`, `on`, `route`, `auth`, `requires`, `expect` and `max_body` are **soft
-keywords**: they are special *only* at the start of their construction (`serve on
-N`, `route "..."`, `requires auth`, `expect body {...}`, `max_body "10mb"`).
-Everywhere else they are ordinary names — `let route be "/x"` and `task auth(x)`
-are valid. The parser decides with fixed lookahead, never heuristics.
+`serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body`, `max_streams`,
+`stream` and `send` are **soft keywords**: they are special *only* at the start
+of their construction (`serve on N`, `route "..."`, `requires auth`,
+`expect body {...}`, `max_body "10mb"`, `max_streams N`, a `stream` block, and
+`send` inside one). Everywhere else they are ordinary names — `let route be "/x"`
+and `task auth(x)` are valid. The parser decides with fixed lookahead, never
+heuristics.
 
 ## The request
 
@@ -135,6 +137,54 @@ route "GET /products"
 - Always pass values as `params` (parameterized) — never string-concatenate.
 - Do **not** add your own `LIMIT`/`;` to the query.
 - Outside a route handler, `paged()` degrades to the full result set.
+
+## Streaming responses (SSE)
+
+A route can emit many messages over time on one connection — LLM tokens, a data
+feed, MCP events — using **Server-Sent Events**. Open a `stream` block and emit
+with `send`:
+
+```
+serve on 8080
+    max_streams 200                  -- optional; default 100
+
+    route "GET /events"
+        stream
+            each tick in range(10)
+                send {"count": tick}         -- → data: {"count":0}\n\n
+
+    route "GET /llm"
+        stream
+            let answer be generate "reply" given prompt
+            each token in answer
+                send token as "token"        -- → event: token\n data: "..."\n\n
+```
+
+- `send <value>` emits `data: <json(value)>` (the value as-is — no pagination
+  envelope; that is only for `give`). `send <value> as "name"` adds `event: name`.
+- The stream ends when the `stream` block ends; the server then closes the
+  connection. **`stream` and `give` are mutually exclusive** in a route: a route
+  with a `stream` block responds in SSE mode, otherwise it follows the `give`
+  contract.
+- Response headers: `Content-Type: text/event-stream`, `Cache-Control: no-cache`,
+  `X-Accel-Buffering: no` (disables proxy buffering), and no `Content-Length`.
+  Each event is **flushed immediately**, so clients receive messages as they are
+  produced.
+- **Client disconnect:** if the client goes away mid-stream, the next `send`
+  unwinds the handler cleanly (the `each`/loop stops), frees the thread, and
+  never crashes the server.
+- **Errors mid-stream:** the status was already sent, so the runtime emits a
+  final `event: error` event and closes — never a crash.
+- **Isolation:** each stream runs in its own interpreter/scope, like any request.
+- **Concurrency cap:** in the current one-thread-per-connection model each open
+  stream holds a thread, so `max_streams N` (default 100) bounds concurrent
+  streams. Over the cap a new stream gets `503 {"error":"too many concurrent
+  streams","status":503}` with a `Retry-After` header.
+- **Pacing / heartbeat:** `sleep(seconds)` (requires `require time`) paces a
+  stream; send a periodic event to keep proxies from timing out.
+
+`stream`, `send` and `max_streams` are soft keywords — only special in this
+construction; `let send be 1` is still valid.
 
 ## Auth (incoming)
 

@@ -141,6 +141,9 @@ class Interpreter:
         self.intent_enforcer = None  # set by engine
         self._intent_frozen = False
 
+        # SSE streaming sink (set by the server for streaming routes)
+        self._stream_emit = None
+
         self._register_builtins()
         self._register_intentional_ops()
 
@@ -997,6 +1000,22 @@ class Interpreter:
         port = self._exec(node.port, env)
         self.logs.append({"type": "serve", "port": str(port)})
         return self._serve_callback(node, env, port)
+
+    def _exec_StreamBlock(self, node: ast.StreamBlock, env: Environment) -> SynValue:
+        """Run a stream block. Events are emitted by `send` via the sink."""
+        return self._exec_block(node.body, env)
+
+    def _exec_SendStatement(self, node: ast.SendStatement, env: Environment) -> SynValue:
+        """Emit one SSE event through the streaming sink wired by the server."""
+        value = self._exec(node.value, env)
+        emit = getattr(self, "_stream_emit", None)
+        if emit is None:
+            raise RuntimeError(
+                "send can only be used inside a stream route handler",
+                node.location,
+            )
+        emit(value, node.event_name)
+        return syn_nothing()
 
     def _exec_ExpectStatement(self, node: ast.ExpectStatement, env: Environment) -> SynValue:
         """

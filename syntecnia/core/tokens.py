@@ -104,6 +104,9 @@ class TokenType(Enum):
     REQUIRES = auto()        # route ... requires auth
     EXPECT = auto()          # expect body {field: type} — input validation
     MAX_BODY = auto()        # max_body "10mb" — request body size limit
+    STREAM = auto()          # stream block — Server-Sent Events response
+    SEND = auto()            # send <value> [as "event"] — emit an SSE event
+    MAX_STREAMS = auto()     # max_streams N — concurrent stream cap
 
     # -- Observability keywords --
     TRACE = auto()           # tracing block

@@ -790,6 +790,244 @@ serve on __PORT__
         assert status == 200
 
 
+# ===== SSE streaming =====
+
+def _parse_sse_block(block: str) -> dict:
+    name = None
+    data_lines = []
+    for line in block.split("\n"):
+        if line.startswith("event:"):
+            name = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[len("data:"):].strip())
+    data = "\n".join(data_lines)
+    try:
+        data = json.loads(data)
+    except (ValueError, TypeError):
+        pass
+    return {"event": name, "data": data}
+
+
+def _read_sse(port, path, count, headers=None, timeout=5):
+    """Open an SSE stream, return (response, events, connection). Caller closes."""
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    conn.request("GET", path, headers=headers or {})
+    resp = conn.getresponse()
+    events = []
+    buf = b""
+    while len(events) < count:
+        chunk = resp.read(1)
+        if not chunk:
+            break
+        buf += chunk
+        while b"\n\n" in buf:
+            block, buf = buf.split(b"\n\n", 1)
+            if block.strip():
+                events.append(_parse_sse_block(block.decode()))
+    return resp, events, conn
+
+
+def test_sse_basic_events_in_order():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /events"
+        stream
+            each tick in range(3)
+                send {"count": tick}
+"""
+    with serving(prog) as req:
+        resp, events, conn = _read_sse(req.port, "/events", 3)
+        conn.close()
+        assert [e["data"] for e in events] == [
+            {"count": 0}, {"count": 1}, {"count": 2},
+        ]
+        assert all(e["event"] is None for e in events)
+
+
+def test_sse_named_event():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /n"
+        stream
+            send "hi" as "greeting"
+"""
+    with serving(prog) as req:
+        resp, events, conn = _read_sse(req.port, "/n", 1)
+        conn.close()
+        assert events[0]["event"] == "greeting"
+        assert events[0]["data"] == "hi"
+
+
+def test_sse_headers():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /e"
+        stream
+            send {"x": 1}
+"""
+    with serving(prog) as req:
+        resp, events, conn = _read_sse(req.port, "/e", 1)
+        assert resp.status == 200
+        assert resp.getheader("Content-Type") == "text/event-stream"
+        assert resp.getheader("Cache-Control") == "no-cache"
+        assert resp.getheader("Content-Length") is None
+        conn.close()
+
+
+def test_sse_flush_is_progressive():
+    prog = """
+require serve(__PORT__)
+require time
+serve on __PORT__
+    route "GET /slow"
+        stream
+            each tick in range(5)
+                send {"n": tick}
+                sleep(0.2)
+"""
+    with serving(prog) as req:
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", req.port, timeout=5)
+        t0 = time.time()
+        conn.request("GET", "/slow")
+        resp = conn.getresponse()
+        buf = b""
+        while b"\n\n" not in buf:
+            buf += resp.read(1)
+        first_dt = time.time() - t0
+        conn.close()
+        # First event must arrive well before the ~1s handler finishes.
+        assert first_dt < 0.8, f"events not flushed progressively ({first_dt:.2f}s)"
+
+
+def test_sse_client_disconnect_does_not_crash_server():
+    prog = """
+require serve(__PORT__)
+require time
+serve on __PORT__
+    route "GET /slow"
+        stream
+            each tick in range(100)
+                send {"n": tick}
+                sleep(0.05)
+    route "GET /ping"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        resp, events, conn = _read_sse(req.port, "/slow", 1)
+        conn.close()  # disconnect mid-stream
+        time.sleep(0.3)
+        # Server keeps serving other routes.
+        status, body = req("GET", "/ping")
+        assert status == 200 and body == {"ok": True}
+
+
+def test_sse_max_streams_cap():
+    prog = """
+require serve(__PORT__)
+require time
+serve on __PORT__
+    max_streams 1
+    route "GET /slow"
+        stream
+            each tick in range(100)
+                send {"n": tick}
+                sleep(0.05)
+"""
+    with serving(prog) as req:
+        # Hold the single slot.
+        resp1, ev1, conn1 = _read_sse(req.port, "/slow", 1)
+        assert resp1.status == 200
+        # Second stream is over the cap → 503 (plain JSON, not SSE).
+        status, headers, raw = req.raw("GET", "/slow")
+        assert status == 503
+        body = json.loads(raw)
+        assert body["status"] == 503
+        assert headers.get("Retry-After") is not None
+
+        # Free the slot by disconnecting; the handler notices on its next write.
+        # TCP can delay surfacing the broken pipe, so poll until capacity returns.
+        conn1.close()
+        freed = False
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            resp2, ev2, conn2 = _read_sse(req.port, "/slow", 1)
+            if resp2.status == 200:
+                assert ev2[0]["data"] == {"n": 0}
+                conn2.close()
+                freed = True
+                break
+            conn2.close()
+            time.sleep(0.2)
+        assert freed, "stream slot was not released after client disconnect"
+
+
+def test_sse_streams_are_isolated():
+    prog = """
+require serve(__PORT__)
+require time
+serve on __PORT__
+    route "GET /iso"
+        stream
+            let who be query.id
+            each tick in range(3)
+                send {"id": who, "tick": tick}
+                sleep(0.05)
+"""
+    with serving(prog) as req:
+        import http.client
+        ca = http.client.HTTPConnection("127.0.0.1", req.port, timeout=5)
+        cb = http.client.HTTPConnection("127.0.0.1", req.port, timeout=5)
+        ca.request("GET", "/iso?id=AAA")
+        cb.request("GET", "/iso?id=BBB")
+        ra = ca.getresponse()
+        rb = cb.getresponse()
+
+        def first_event(resp):
+            buf = b""
+            while b"\n\n" not in buf:
+                buf += resp.read(1)
+            return _parse_sse_block(buf.split(b"\n\n", 1)[0].decode())
+
+        ea = first_event(ra)
+        eb = first_event(rb)
+        ca.close()
+        cb.close()
+        assert ea["data"]["id"] == "AAA"
+        assert eb["data"]["id"] == "BBB"
+
+
+def test_sse_coexists_with_give_route():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /stream"
+        stream
+            send {"x": 1}
+    route "GET /plain"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        # Plain route works normally.
+        assert req("GET", "/plain") == (200, {"ok": True})
+        # Stream route streams.
+        resp, events, conn = _read_sse(req.port, "/stream", 1)
+        conn.close()
+        assert events[0]["data"] == {"x": 1}
+
+
+def test_send_without_stream_sink_is_clear_error():
+    # A stream block executed outside an SSE route has no sink → clear error.
+    engine = SyntecniaEngine()
+    result = engine.run_source('stream\n    send {"x": 1}')
+    assert not result.success
+    assert any("send can only be used inside a stream" in e for e in result.errors)
+
+
 def test_parse_body_size_units():
     from syntecnia.stdlib.server import parse_body_size, MAX_BODY
     assert parse_body_size(None) == MAX_BODY

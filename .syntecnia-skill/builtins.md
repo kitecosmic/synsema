@@ -47,7 +47,8 @@
 - `file_exists(path)` → bool
 - `run(command, args_list?, timeout?)` → map with exit_code, stdout, stderr
 - `get_env(name)` → text or nothing
-- `now()` → unix timestamp (number)
+- `now()` → unix timestamp (number) — requires `time`
+- `sleep(seconds)` → pause execution (e.g. to pace an SSE stream) — requires `time`
 - `random()` → float 0-1
 - `random_int(min, max)` → integer
 
@@ -65,6 +66,7 @@
 - `sql_exec(statement, params?)` → {rows_affected, last_id} (INSERT/UPDATE/DELETE/CREATE)
 - `sql_batch(statement, params_list)` → {rows_affected} (batch operations)
 - `sql_tables()` → list of table names
+- `paged(query, params?)` → lazy paginated result for `give` in an SSE/serve route (SQL LIMIT/OFFSET pushdown, exact COUNT total)
 
 ## Cron (Scheduled Tasks)
 - `cron_every(seconds, task)` → job name (repeating background job)

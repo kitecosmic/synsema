@@ -331,6 +331,15 @@ def test_soft_keyword_auth_as_task_name():
 def test_soft_keyword_as_property_key():
     assert_output('let m be {"auth": 1, "route": 2}\nprint(m.auth)\nprint(m.route)', ['1', '2'])
 
+def test_soft_keyword_send_as_variable():
+    assert_output('let send be 1\nprint(send)', ['1'])
+
+def test_soft_keyword_stream_as_variable():
+    assert_output('let stream be 2\nprint(stream)', ['2'])
+
+def test_soft_keyword_max_streams_as_variable():
+    assert_output('let max_streams be 3\nprint(max_streams)', ['3'])
+
 
 # -- Reserved (hard) keywords give a clear error --
 

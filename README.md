@@ -182,7 +182,8 @@ serve on 8080
 - **HTTP semantics:** `405` (with `Allow`) for a known path on the wrong method, `OPTIONS`/`HEAD` handled, malformed JSON → 400.
 - **Body limits:** default 1 MB, configurable per server with `max_body "10mb"` (or `"unlimited"`). Real bytes are counted (a lying `Content-Length` or chunked body can't evade it); over the limit → 413 with a clean connection close; large bodies stream to disk (`read_body()` / `request.body_file`), chunked supported.
 - **Isolation:** each request runs in its own interpreter/scope, like an agent; only the blackboard and DB are shared. Uncaught errors become 500 — never a server crash.
-- **Soft keywords:** `serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body` are only special inside their construction — elsewhere they are ordinary names (`let route be "/x"` works).
+- **Streaming (SSE):** a route can `stream` and `send` events over time (LLM tokens, feeds, MCP) — `Content-Type: text/event-stream`, flushed per event, client-disconnect-safe, with a `max_streams` concurrency cap (`503` over the limit). `stream` and `give` are mutually exclusive per route.
+- **Soft keywords:** `serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body`, `max_streams`, `stream`, `send` are only special inside their construction — elsewhere they are ordinary names (`let route be "/x"` works).
 
 See [.syntecnia-skill/serve.md](.syntecnia-skill/serve.md) for full details.
 
@@ -496,6 +497,7 @@ When Syntecnia connects to an LLM, responses are validated automatically:
 - [ ] Async I/O operations
 - [ ] Database capability and query builder
 - [x] Web server capability (`serve on PORT`)
+- [x] Streaming responses (Server-Sent Events: `stream` / `send`)
 - [ ] Package manager for verified capabilities
 - [ ] Language server protocol (LSP) for IDE support
 - [ ] Visual dashboard for agent swarm monitoring

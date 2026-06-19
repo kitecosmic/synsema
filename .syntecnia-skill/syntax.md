@@ -16,9 +16,10 @@ Logic: `and`, `or`, `not`
 Literals: `true`, `false`, `nothing`
 
 ## Soft keywords (NOT reserved)
-`serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body` — special
-**only** at the start of their HTTP-server construction (`serve on N`,
-`route "..."`, `requires auth`, `expect body {...}`, `max_body "10mb"`).
+`serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body`, `max_streams`,
+`stream`, `send` — special **only** at the start of their HTTP-server
+construction (`serve on N`, `route "..."`, `requires auth`, `expect body {...}`,
+`max_body "10mb"`, `max_streams N`, a `stream` block, `send` inside one).
 Everywhere else they are ordinary identifiers, so `let route be "/x"` and
 `task auth(x)` are valid. The parser uses fixed lookahead, never heuristics.
 See [serve.md](serve.md).

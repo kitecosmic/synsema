@@ -1,0 +1,34 @@
+-- Server-Sent Events demo — stream messages over time on one connection.
+-- Run:   syntecnia run examples/sse_demo.syn      (Ctrl+C to stop)
+-- Watch:  curl -N http://127.0.0.1:8080/count
+--         curl -N http://127.0.0.1:8080/tokens
+
+intent: "Stream events over HTTP with Server-Sent Events"
+
+require serve(8080)
+require time
+
+-- A mock token stream (stands in for an LLM response)
+task mock_answer()
+    give ["Hello", " from", " Syntecnia", " streaming!"]
+
+serve on 8080
+    max_streams 50
+
+    -- A simple counter: one event every 0.3s
+    route "GET /count"
+        stream
+            each n in range(10)
+                send {"count": n}
+                sleep(0.3)
+
+    -- Named events, like LLM tokens arriving one by one
+    route "GET /tokens"
+        stream
+            each token in mock_answer()
+                send token as "token"
+                sleep(0.2)
+
+    -- A normal (non-streaming) route coexists fine
+    route "GET /health"
+        give {"ok": true}

@@ -247,6 +247,18 @@ class SyntecniaEngine:
         else:
             max_body = parse_body_size(None)
 
+        # Resolve the concurrent-stream cap once.
+        from ..stdlib.server import DEFAULT_MAX_STREAMS
+        max_streams = DEFAULT_MAX_STREAMS
+        if node.max_streams is not None:
+            ms_val = self.interpreter._exec(node.max_streams, serve_env)
+            try:
+                max_streams = int(ms_val.raw) if isinstance(ms_val.type, SynNumber) else int(str(ms_val))
+            except (TypeError, ValueError):
+                max_streams = DEFAULT_MAX_STREAMS
+            if max_streams <= 0:
+                max_streams = DEFAULT_MAX_STREAMS
+
         def _str_map(d: dict) -> SynValue:
             return syn_map({k: syn_text(str(v)) for k, v in d.items()})
 
@@ -277,23 +289,39 @@ class SyntecniaEngine:
                 return syn_text(ctx.get("body") or "")
             return SynValue(raw=BuiltinTask("read_body", _read_body, 0), type=SynTask())
 
+        def _make_request_env(ri, route_node, ctx):
+            req_env = Environment(
+                parent=serve_env,
+                name=f"request:{route_node.method} {route_node.path}",
+            )
+            req_env.set("request", _build_request(ctx))
+            req_env.set("query", _str_map(ctx["query"]))
+            req_env.set("params", _str_map(ctx["params"]))
+            req_env.set("read_body", _make_read_body(ctx))
+            return req_env
+
         def _make_handler(route_node):
             def handler(ctx: dict) -> SynValue:
                 ri = self._make_request_interpreter()
-                req_env = Environment(
-                    parent=serve_env,
-                    name=f"request:{route_node.method} {route_node.path}",
-                )
-                req_env.set("request", _build_request(ctx))
-                req_env.set("query", _str_map(ctx["query"]))
-                req_env.set("params", _str_map(ctx["params"]))
-                req_env.set("read_body", _make_read_body(ctx))
+                req_env = _make_request_env(ri, route_node, ctx)
                 try:
                     ri._exec_block(route_node.body, req_env)
                     return syn_nothing()
                 except GiveSignal as g:
                     return g.value
             return handler
+
+        def _make_stream_handler(route_node):
+            def stream_handler(ctx: dict, emit):
+                # Each stream runs in its own isolated interpreter/scope.
+                ri = self._make_request_interpreter()
+                ri._stream_emit = emit  # wire `send` to this connection's sink
+                req_env = _make_request_env(ri, route_node, ctx)
+                try:
+                    ri._exec_block(route_node.body, req_env)
+                except GiveSignal:
+                    pass  # a give inside a stream route just ends the stream
+            return stream_handler
 
         def _auth_runner(token: str):
             if auth_value is None:
@@ -310,12 +338,18 @@ class SyntecniaEngine:
         routes = [
             RouteSpec(
                 method=r.method, path=r.path, param_names=r.param_names,
-                requires_auth=r.requires_auth, handler=_make_handler(r),
+                requires_auth=r.requires_auth,
+                handler=_make_handler(r),
+                streaming=r.streaming,
+                stream_handler=_make_stream_handler(r) if r.streaming else None,
             )
             for r in node.routes
         ]
 
-        runtime = ServeRuntime(port_num, routes, auth_handler=_auth_runner, max_body=max_body)
+        runtime = ServeRuntime(
+            port_num, routes, auth_handler=_auth_runner,
+            max_body=max_body, max_streams=max_streams,
+        )
         try:
             runtime.start(background=True)
         except OSError as e:

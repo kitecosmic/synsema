@@ -49,6 +49,17 @@ MAX_LIMIT = 1000
 MAX_BODY = 1_048_576  # 1 MB
 # Above this many bytes a body is streamed to a temp file instead of memory.
 MEM_SPILL = 1_048_576  # 1 MB
+# Default cap on concurrent SSE streams (each holds a thread in this model).
+DEFAULT_MAX_STREAMS = 100
+
+
+class ClientGone(BaseException):
+    """
+    Raised inside an SSE handler when writing to a disconnected client fails.
+
+    Inherits BaseException so it unwinds the handler cleanly without being
+    swallowed by user-level `try/recover` (which catches Exception).
+    """
 
 
 def parse_body_size(value: Any) -> Optional[int]:
@@ -289,6 +300,9 @@ class RouteSpec:
     param_names: List[str] = field(default_factory=list)
     requires_auth: bool = False
     handler: Callable[[Dict[str, Any]], SynValue] = None
+    streaming: bool = False
+    # For streaming routes: stream_handler(ctx, emit) pushes SSE events.
+    stream_handler: Callable[[Dict[str, Any], Callable], None] = None
 
 
 class ServeRuntime:
@@ -302,14 +316,32 @@ class ServeRuntime:
 
     def __init__(self, port: int, routes: List[RouteSpec],
                  auth_handler: Optional[Callable[[str], Optional[SynValue]]] = None,
-                 host: str = "0.0.0.0", max_body: Optional[int] = MAX_BODY):
+                 host: str = "0.0.0.0", max_body: Optional[int] = MAX_BODY,
+                 max_streams: int = DEFAULT_MAX_STREAMS):
         self.port = int(port)
         self.host = host
         self.routes = routes
         self.auth_handler = auth_handler
         self.max_body = max_body  # bytes, or None for unlimited
+        self.max_streams = int(max_streams)
         self.httpd: Optional[ThreadingHTTPServer] = None
         self.thread: Optional[threading.Thread] = None
+        self._stream_lock = threading.Lock()
+        self._active_streams = 0
+
+    # -- concurrent stream accounting --
+
+    def try_acquire_stream(self) -> bool:
+        with self._stream_lock:
+            if self._active_streams >= self.max_streams:
+                return False
+            self._active_streams += 1
+            return True
+
+    def release_stream(self):
+        with self._stream_lock:
+            if self._active_streams > 0:
+                self._active_streams -= 1
 
     # -- matching --
 
@@ -371,8 +403,13 @@ class ServeRuntime:
 
     def dispatch(self, method: str, path: str, query: Dict[str, str],
                  headers: Dict[str, str], body_str: Optional[str],
-                 body_file: Optional[str] = None) -> Tuple[int, Any, Dict[str, str]]:
-        """Return (status, json_body, extra_headers).
+                 body_file: Optional[str] = None
+                 ) -> Tuple[int, Any, Dict[str, str], Optional[Tuple]]:
+        """Return (status, json_body, extra_headers, stream).
+
+        `stream` is None for a normal one-shot response; for an SSE route that
+        is ready to stream it is (route, ctx) and a stream slot has been
+        acquired (the caller must call release_stream when done).
 
         body_str is the in-memory body text (or None when the body was spilled
         to disk, in which case body_file is the temp path).
@@ -386,8 +423,9 @@ class ServeRuntime:
                     405,
                     {"error": "method not allowed", "status": 405},
                     {"Allow": ", ".join(allowed)},
+                    None,
                 )
-            return 404, {"error": f"no route for {method} {path}", "status": 404}, {}
+            return 404, {"error": f"no route for {method} {path}", "status": 404}, {}, None
 
         json_obj = None
         if body_str:
@@ -398,7 +436,7 @@ class ServeRuntime:
                 # Only an error if the client claimed JSON; otherwise keep the
                 # raw body available and json = nothing.
                 if "json" in ctype:
-                    return 400, {"error": "malformed JSON body", "status": 400}, {}
+                    return 400, {"error": "malformed JSON body", "status": 400}, {}, None
                 json_obj = None
 
         ctx: Dict[str, Any] = {
@@ -417,22 +455,33 @@ class ServeRuntime:
             token = self._bearer_token(headers)
             user = self.auth_handler(token) if self.auth_handler else None
             if user is None or isinstance(getattr(user, "type", None), SynNothing):
-                return 401, {"error": "unauthorized", "status": 401}, {}
+                return 401, {"error": "unauthorized", "status": 401}, {}, None
             ctx["user"] = user
+
+        # SSE routes: acquire a stream slot and hand off to the streaming path.
+        if route.streaming:
+            if not self.try_acquire_stream():
+                return (
+                    503,
+                    {"error": "too many concurrent streams", "status": 503},
+                    {"Retry-After": "5"},
+                    None,
+                )
+            return 200, None, {}, (route, ctx)
 
         try:
             give_value = route.handler(ctx)
         except ExpectViolation as e:
-            return 400, {"error": str(e), "status": 400, "field": e.field}, {}
+            return 400, {"error": str(e), "status": 400, "field": e.field}, {}, None
         except GiveSignal as g:  # defensive: a give that escaped the handler
             give_value = g.value
         except CapabilityViolation as e:
-            return 500, {"error": str(e), "status": 500}, {}
+            return 500, {"error": str(e), "status": 500}, {}, None
         except Exception as e:  # never crash the server
-            return 500, {"error": f"{type(e).__name__}: {e}", "status": 500}, {}
+            return 500, {"error": f"{type(e).__name__}: {e}", "status": 500}, {}, None
 
         status, body = build_response(give_value, query)
-        return status, body, {}
+        return status, body, {}, None
 
     # -- lifecycle --
 
@@ -578,16 +627,63 @@ class _RequestHandler(BaseHTTPRequestHandler):
             else:
                 body_str = payload.decode("utf-8", errors="replace") if payload else ""
 
-            status, body_obj, extra = runtime.dispatch(
+            status, body_obj, extra, stream = runtime.dispatch(
                 method, path, query, headers, body_str, body_file,
             )
         except Exception as e:  # plumbing failure → 500, still no crash
-            status, body_obj, extra = 500, {"error": f"{type(e).__name__}: {e}", "status": 500}, {}
+            status, body_obj, extra, stream = 500, {"error": f"{type(e).__name__}: {e}", "status": 500}, {}, None
         finally:
             if body_file:
                 _safe_unlink(body_file)
 
+        if stream is not None:
+            route, ctx = stream
+            self._stream_response(runtime, route, ctx, write_body)
+            return
+
         self._write(status, body_obj, extra, write_body=write_body)
+
+    def _stream_response(self, runtime: "ServeRuntime", route, ctx, write_body: bool):
+        """Run an SSE route: send event-stream headers, then push events."""
+        self.close_connection = True  # MVP: one stream per connection, then close
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")  # disable proxy buffering
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            if not write_body:
+                return  # HEAD probe: headers only
+
+            def emit(value, event_name=None):
+                payload = ""
+                if event_name:
+                    payload += f"event: {event_name}\n"
+                payload += "data: " + json.dumps(syn_to_json(value)) + "\n\n"
+                try:
+                    self.wfile.write(payload.encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionError, OSError):
+                    raise ClientGone()
+
+            try:
+                route.stream_handler(ctx, emit)
+            except ClientGone:
+                pass  # client disconnected — unwind quietly
+            except Exception as e:
+                # Headers already sent; can't change status. Best-effort error event.
+                try:
+                    err = "event: error\ndata: " + json.dumps(
+                        {"error": f"{type(e).__name__}: {e}"}
+                    ) + "\n\n"
+                    self.wfile.write(err.encode("utf-8"))
+                    self.wfile.flush()
+                except Exception:
+                    pass
+        finally:
+            runtime.release_stream()
 
     def _handle(self):
         self._dispatch(self.command)
