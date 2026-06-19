@@ -259,6 +259,32 @@ class SyntecniaEngine:
             if max_streams <= 0:
                 max_streams = DEFAULT_MAX_STREAMS
 
+        # Resolve rate limits. Each clause → ("unlimited", None) | (capacity, secs) | None.
+        _WINDOW_SECONDS = {"second": 1.0, "minute": 60.0, "hour": 3600.0}
+
+        def _resolve_rate(clause):
+            if clause is None:
+                return None
+            if clause.unlimited:
+                return ("unlimited", None)
+            cap = int(self.interpreter._exec(clause.count, serve_env).raw)
+            secs = _WINDOW_SECONDS.get(clause.window, 60.0)
+            return (cap, secs)
+
+        block_rate = _resolve_rate(node.rate_limit)
+        block_limit = block_rate if (block_rate and block_rate[0] != "unlimited") else None
+
+        def _route_rate(r):
+            """Return (effective_limit_or_None, zone_or_None) for a route."""
+            rc = _resolve_rate(r.rate_limit)
+            if rc is None:                      # not declared → inherit block default
+                if block_limit:
+                    return block_limit, "__default__"
+                return None, None
+            if rc[0] == "unlimited":            # explicitly disabled on this route
+                return None, None
+            return rc, f"route:{r.method} {r.path}"
+
         def _str_map(d: dict) -> SynValue:
             return syn_map({k: syn_text(str(v)) for k, v in d.items()})
 
@@ -273,6 +299,7 @@ class SyntecniaEngine:
                 "headers": _str_map(ctx["headers"]),
                 "query": _str_map(ctx["query"]),
                 "params": _str_map(ctx["params"]),
+                "ip": syn_text(ctx.get("client_ip") or ""),
                 "user": ctx["user"] if ctx["user"] is not None else syn_nothing(),
             })
 
@@ -335,16 +362,17 @@ class SyntecniaEngine:
                 # Any error inside the auth task is treated as "not authorized".
                 return None
 
-        routes = [
-            RouteSpec(
+        routes = []
+        for r in node.routes:
+            eff_rate, zone = _route_rate(r)
+            routes.append(RouteSpec(
                 method=r.method, path=r.path, param_names=r.param_names,
                 requires_auth=r.requires_auth,
                 handler=_make_handler(r),
                 streaming=r.streaming,
                 stream_handler=_make_stream_handler(r) if r.streaming else None,
-            )
-            for r in node.routes
-        ]
+                rate_limit=eff_rate, rate_zone=zone,
+            ))
 
         runtime = ServeRuntime(
             port_num, routes, auth_handler=_auth_runner,

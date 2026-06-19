@@ -303,6 +303,9 @@ class RouteSpec:
     streaming: bool = False
     # For streaming routes: stream_handler(ctx, emit) pushes SSE events.
     stream_handler: Callable[[Dict[str, Any], Callable], None] = None
+    # Effective rate limit (capacity, window_seconds) or None for unlimited.
+    rate_limit: Optional[Tuple[int, float]] = None
+    rate_zone: Optional[str] = None     # bucket namespace (shared vs per-route)
 
 
 class _QuietThreadingHTTPServer(ThreadingHTTPServer):
@@ -348,6 +351,7 @@ class ServeRuntime:
         self.thread: Optional[threading.Thread] = None
         self._stream_lock = threading.Lock()
         self._active_streams = 0
+        self.rate_limiter = RateLimiter()
 
     # -- concurrent stream accounting --
 
@@ -423,7 +427,7 @@ class ServeRuntime:
 
     def dispatch(self, method: str, path: str, query: Dict[str, str],
                  headers: Dict[str, str], body_str: Optional[str],
-                 body_file: Optional[str] = None
+                 body_file: Optional[str] = None, client_ip: str = ""
                  ) -> Tuple[int, Any, Dict[str, str], Optional[Tuple]]:
         """Return (status, json_body, extra_headers, stream).
 
@@ -447,6 +451,26 @@ class ServeRuntime:
                 )
             return 404, {"error": f"no route for {method} {path}", "status": 404}, {}, None
 
+        # Rate limit AFTER matching the route, BEFORE auth/handler — so a
+        # brute-force on an authenticated route (e.g. /login) is throttled even
+        # with invalid credentials. Keyed by the real peer IP, never X-Forwarded-For.
+        rate_headers: Dict[str, str] = {}
+        if route.rate_limit is not None:
+            capacity, window = route.rate_limit
+            key = f"{route.rate_zone}|{client_ip}"
+            ok, remaining, retry_after, reset = self.rate_limiter.check(key, capacity, window)
+            rate_headers = {
+                "RateLimit-Limit": str(capacity),
+                "RateLimit-Remaining": str(remaining),
+                "RateLimit-Reset": str(int(reset) + 1),
+            }
+            if not ok:
+                retry = str(int(retry_after) + 1)
+                headers_429 = dict(rate_headers)
+                headers_429["Retry-After"] = retry
+                headers_429["RateLimit-Remaining"] = "0"
+                return 429, {"error": "rate limit exceeded", "status": 429}, headers_429, None
+
         json_obj = None
         if body_str:
             ctype = self._content_type(headers)
@@ -468,6 +492,7 @@ class ServeRuntime:
             "body": body_str or "",
             "body_file": body_file,
             "json": json_obj,
+            "client_ip": client_ip,
             "user": None,
         }
 
@@ -475,7 +500,7 @@ class ServeRuntime:
             token = self._bearer_token(headers)
             user = self.auth_handler(token) if self.auth_handler else None
             if user is None or isinstance(getattr(user, "type", None), SynNothing):
-                return 401, {"error": "unauthorized", "status": 401}, {}, None
+                return 401, {"error": "unauthorized", "status": 401}, rate_headers, None
             ctx["user"] = user
 
         # SSE routes: acquire a stream slot and hand off to the streaming path.
@@ -492,16 +517,16 @@ class ServeRuntime:
         try:
             give_value = route.handler(ctx)
         except ExpectViolation as e:
-            return 400, {"error": str(e), "status": 400, "field": e.field}, {}, None
+            return 400, {"error": str(e), "status": 400, "field": e.field}, rate_headers, None
         except GiveSignal as g:  # defensive: a give that escaped the handler
             give_value = g.value
         except CapabilityViolation as e:
-            return 500, {"error": str(e), "status": 500}, {}, None
+            return 500, {"error": str(e), "status": 500}, rate_headers, None
         except Exception as e:  # never crash the server
-            return 500, {"error": f"{type(e).__name__}: {e}", "status": 500}, {}, None
+            return 500, {"error": f"{type(e).__name__}: {e}", "status": 500}, rate_headers, None
 
         status, body = build_response(give_value, query)
-        return status, body, {}, None
+        return status, body, rate_headers, None
 
     # -- lifecycle --
 
@@ -521,6 +546,68 @@ class ServeRuntime:
             self.httpd.shutdown()
             self.httpd.server_close()
             self.httpd = None
+
+
+class RateLimiter:
+    """
+    Token-bucket rate limiter, keyed by a caller-supplied string (zone|ip).
+
+    Each key has a bucket of `capacity` tokens that refills at capacity/window
+    tokens per second (pro-rated by elapsed time). A request consumes one token;
+    if none are available it is rejected. This allows bursts up to `capacity`
+    and a sustained rate of `capacity` per `window`.
+
+    Stale buckets (unseen for > 2× their window) are purged lazily so a flood of
+    unique keys can't grow the table without bound.
+    """
+
+    def __init__(self, cleanup_interval: float = 30.0):
+        self._lock = threading.Lock()
+        self._buckets: Dict[str, Tuple[float, float, float]] = {}  # key → (tokens, last, window)
+        self._cleanup_interval = cleanup_interval
+        self._last_cleanup = 0.0
+
+    def check(self, key: str, capacity: int, window_seconds: float):
+        """Return (allowed, remaining, retry_after, reset_seconds)."""
+        import time as _time
+        now = _time.monotonic()
+        rate = capacity / window_seconds
+        with self._lock:
+            self._maybe_cleanup(now)
+            tokens, last, _w = self._buckets.get(key, (float(capacity), now, window_seconds))
+            tokens = min(float(capacity), tokens + (now - last) * rate)
+            if tokens >= 1.0:
+                tokens -= 1.0
+                allowed = True
+                retry_after = 0.0
+            else:
+                allowed = False
+                retry_after = (1.0 - tokens) / rate
+            self._buckets[key] = (tokens, now, window_seconds)
+            remaining = int(tokens)
+            reset = (capacity - tokens) / rate  # seconds until the bucket is full
+            return allowed, remaining, retry_after, reset
+
+    def _maybe_cleanup(self, now: float):
+        if now - self._last_cleanup < self._cleanup_interval:
+            return
+        self._last_cleanup = now
+        self._purge_locked(now)
+
+    def _purge_locked(self, now: float):
+        stale = [k for k, (t, last, w) in self._buckets.items() if now - last > 2 * w]
+        for k in stale:
+            del self._buckets[k]
+
+    def purge(self):
+        """Force a cleanup pass now (used by tests / maintenance)."""
+        import time as _time
+        with self._lock:
+            self._purge_locked(_time.monotonic())
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._buckets)
 
 
 def _safe_unlink(path: Optional[str]):
@@ -647,8 +734,9 @@ class _RequestHandler(BaseHTTPRequestHandler):
             else:
                 body_str = payload.decode("utf-8", errors="replace") if payload else ""
 
+            client_ip = self.client_address[0] if self.client_address else ""
             status, body_obj, extra, stream = runtime.dispatch(
-                method, path, query, headers, body_str, body_file,
+                method, path, query, headers, body_str, body_file, client_ip,
             )
         except Exception as e:  # plumbing failure → 500, still no crash
             status, body_obj, extra, stream = 500, {"error": f"{type(e).__name__}: {e}", "status": 500}, {}, None

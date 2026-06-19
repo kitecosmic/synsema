@@ -39,12 +39,12 @@ serve on 8080
 ### Soft keywords
 
 `serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body`, `max_streams`,
-`stream` and `send` are **soft keywords**: they are special *only* at the start
-of their construction (`serve on N`, `route "..."`, `requires auth`,
-`expect body {...}`, `max_body "10mb"`, `max_streams N`, a `stream` block, and
-`send` inside one). Everywhere else they are ordinary names — `let route be "/x"`
-and `task auth(x)` are valid. The parser decides with fixed lookahead, never
-heuristics.
+`stream`, `send`, `rate_limit` and `per` are **soft keywords**: they are special
+*only* at the start of their construction (`serve on N`, `route "..."`,
+`requires auth`, `expect body {...}`, `max_body "10mb"`, `max_streams N`, a
+`stream` block, `send` inside one, `rate_limit N per window`). Everywhere else
+they are ordinary names — `let route be "/x"` and `task auth(x)` are valid. The
+parser decides with fixed lookahead, never heuristics.
 
 ## The request
 
@@ -56,6 +56,7 @@ json of request  -- parsed JSON body (a map), or nothing
 body of request  -- raw body text (in-memory bodies; "" when spilled to disk)
 headers of request
 user of request  -- set after auth (see below)
+ip of request    -- the client's real peer IP (used for rate limiting)
 body_file of request  -- temp file path when a large body spilled to disk, else nothing
 read_body()      -- read the full body text (from memory or the temp file)
 query            -- query string as a map: /x?page=2 → query.page == "2"
@@ -185,6 +186,49 @@ serve on 8080
 
 `stream`, `send` and `max_streams` are soft keywords — only special in this
 construction; `let send be 1` is still valid.
+
+## Rate limiting
+
+Protect against brute-force, scraping and spam. Declare a limit on the serve
+block (default for all routes) and/or override it per route:
+
+```
+serve on 8080
+    rate_limit 100 per minute        -- default for every route, per client IP
+    auth with check_token
+
+    route "POST /login"
+        rate_limit 5 per minute      -- stricter override
+        ...
+
+    route "GET /public"              -- inherits the 100/min default
+        ...
+
+    route "GET /webhook"
+        rate_limit none              -- disable the inherited default
+        ...
+```
+
+- `rate_limit <N> per <window>` — window is `second`, `minute` or `hour`.
+- **Opt-in:** with no `rate_limit` there is no limit. `rate_limit none` (or
+  `unlimited`) disables an inherited default on one route.
+- **Algorithm:** token bucket — up to `N` per window sustained, with bursts up
+  to `N`. Tokens refill continuously.
+- **Keyed by the real peer IP.** `X-Forwarded-For` is **not** trusted (a client
+  could forge it to evade the limit or flood the table). Per-user keying and
+  trusted-proxy `X-Forwarded-For` are future work.
+- **Order:** the limit is checked after route matching but **before** auth and
+  the handler — so it also throttles the auth task (e.g. 5 login attempts/min
+  even with invalid tokens).
+- **Over the limit → 429** `{"error":"rate limit exceeded","status":429}` with a
+  `Retry-After` header; responses also carry `RateLimit-Limit`,
+  `RateLimit-Remaining` and `RateLimit-Reset`. The handler does not run.
+- **Memory:** routes sharing the default share one bucket per IP; an overridden
+  route gets its own. Stale buckets are purged automatically, so a flood of
+  unique IPs can't grow the table without bound.
+- The client IP is also available to handlers as `ip of request`.
+
+`rate_limit` and `per` are soft keywords — `let per be 1` is still valid.
 
 ## Auth (incoming)
 

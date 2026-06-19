@@ -1001,6 +1001,13 @@ class Interpreter:
         self.logs.append({"type": "serve", "port": str(port)})
         return self._serve_callback(node, env, port)
 
+    def _exec_RateLimitClause(self, node: ast.RateLimitClause, env: Environment) -> SynValue:
+        """A rate_limit declaration is consumed by the serve runtime, not executed.
+
+        It only reaches here if used outside a serve block / route (a no-op).
+        """
+        return syn_nothing()
+
     def _exec_StreamBlock(self, node: ast.StreamBlock, env: Environment) -> SynValue:
         """Run a stream block. Events are emitted by `send` via the sink."""
         return self._exec_block(node.body, env)

@@ -167,6 +167,10 @@ class Parser:
                 and self._peek(1).type == TokenType.NEWLINE
                 and self._peek(2).type == TokenType.INDENT):
             return self._parse_stream()
+        if self._check_word("rate_limit") and (
+                self._peek(1).type == TokenType.NUMBER
+                or self._peek_word(1, "none") or self._peek_word(1, "unlimited")):
+            return self._parse_rate_limit()
         if self._check_word("serve") and self._peek_word(1, "on"):
             return self._parse_serve()
         if self._check_word("expect") and self._peek_word(1, "body"):
@@ -613,6 +617,7 @@ class Parser:
         auth_handler = None
         max_body = None
         max_streams = None
+        rate_limit = None
         routes = []
 
         self._skip_newlines()
@@ -630,6 +635,8 @@ class Parser:
             elif self._check_word("max_streams"):
                 self._advance()  # consume soft keyword 'max_streams'
                 max_streams = self._parse_expression()
+            elif self._check_word("rate_limit"):
+                rate_limit = self._parse_rate_limit()
             elif self._check_word("route"):
                 routes.append(self._parse_route())
             else:
@@ -656,7 +663,8 @@ class Parser:
 
         return ast.ServeBlock(
             location=loc, port=port, auth_handler=auth_handler,
-            max_body=max_body, max_streams=max_streams, routes=routes,
+            max_body=max_body, max_streams=max_streams,
+            rate_limit=rate_limit, routes=routes,
         )
 
     def _parse_route(self) -> ast.RouteDefinition:
@@ -673,12 +681,39 @@ class Parser:
             requires_auth = True
 
         body = self._parse_block()
+        # A `rate_limit` declared inside the route body is a route-level override.
+        rate_limit = None
+        clean_body = []
+        for s in body:
+            if isinstance(s, ast.RateLimitClause):
+                rate_limit = s
+            else:
+                clean_body.append(s)
+        body = clean_body
         streaming = any(isinstance(s, ast.StreamBlock) for s in body)
         return ast.RouteDefinition(
             location=loc, method=method, path=path,
             param_names=param_names, requires_auth=requires_auth,
-            streaming=streaming, body=body,
+            streaming=streaming, rate_limit=rate_limit, body=body,
         )
+
+    def _parse_rate_limit(self) -> ast.RateLimitClause:
+        """rate_limit N per <second|minute|hour>  |  rate_limit none|unlimited"""
+        loc = self._location()
+        self._advance()  # consume soft keyword 'rate_limit'
+        if self._check_word("none") or self._check_word("unlimited"):
+            self._advance()
+            return ast.RateLimitClause(location=loc, unlimited=True)
+        count = self._parse_expression()
+        self._expect_word("per", "Expected 'per' in rate_limit (e.g. rate_limit 100 per minute)")
+        window_tok = self._expect(TokenType.IDENTIFIER, "Expected a window: second, minute, or hour")
+        window = window_tok.value
+        if window not in ("second", "minute", "hour"):
+            raise ParseError(
+                f"rate_limit window must be second, minute, or hour, got {window!r}",
+                window_tok.location,
+            )
+        return ast.RateLimitClause(location=loc, count=count, window=window)
 
     def _parse_stream(self) -> ast.StreamBlock:
         """stream\n    send ...  — an SSE response block."""

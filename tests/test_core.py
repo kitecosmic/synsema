@@ -340,6 +340,12 @@ def test_soft_keyword_stream_as_variable():
 def test_soft_keyword_max_streams_as_variable():
     assert_output('let max_streams be 3\nprint(max_streams)', ['3'])
 
+def test_soft_keyword_rate_limit_as_variable():
+    assert_output('let rate_limit be 1\nprint(rate_limit)', ['1'])
+
+def test_soft_keyword_per_as_variable():
+    assert_output('let per be 2\nprint(per)', ['2'])
+
 
 # -- Reserved (hard) keywords give a clear error --
 

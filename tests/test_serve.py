@@ -80,6 +80,29 @@ def serving(program: str):
         engine.db_manager.close_all()
 
 
+@contextlib.contextmanager
+def serving_runtime(program: str):
+    """Like serving() but yields the ServeRuntime, for dispatch-level tests."""
+    port = _free_port()
+    engine = SyntecniaEngine()
+    result = engine.run_source(program.replace("__PORT__", str(port)), filename="t.syn")
+    assert result.success, f"program failed to start: {result.errors}"
+    time.sleep(0.1)
+    try:
+        yield engine.servers[0]
+    finally:
+        engine.shutdown_servers()
+        engine.db_manager.close_all()
+
+
+def _disp(rt, method, path, ip="1.2.3.4", headers=None):
+    """Call ServeRuntime.dispatch; return (status, extra_headers)."""
+    status, body, extra, stream = rt.dispatch(
+        method, path, {}, headers or {}, "", None, ip,
+    )
+    return status, extra
+
+
 # ===== Basic route =====
 
 def test_basic_route():
@@ -1026,6 +1049,164 @@ def test_send_without_stream_sink_is_clear_error():
     result = engine.run_source('stream\n    send {"x": 1}')
     assert not result.success
     assert any("send can only be used inside a stream" in e for e in result.errors)
+
+
+# ===== Rate limiting =====
+
+def test_rate_limit_basic():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "POST /e"
+        rate_limit 3 per second
+        give {"ok": true}
+"""
+    with serving_runtime(prog) as rt:
+        codes = [_disp(rt, "POST", "/e")[0] for _ in range(4)]
+        assert codes == [200, 200, 200, 429]
+        status, extra = _disp(rt, "POST", "/e")
+        assert status == 429
+        assert extra.get("Retry-After") is not None
+        assert extra.get("RateLimit-Limit") == "3"
+        assert extra.get("RateLimit-Remaining") == "0"
+
+
+def test_rate_limit_recovery_after_window():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "POST /e"
+        rate_limit 2 per second
+        give {"ok": true}
+"""
+    with serving_runtime(prog) as rt:
+        assert [_disp(rt, "POST", "/e")[0] for _ in range(3)] == [200, 200, 429]
+        time.sleep(1.1)  # refill
+        assert _disp(rt, "POST", "/e")[0] == 200
+
+
+def test_rate_limit_override_and_inherit():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    rate_limit 100 per minute
+    route "POST /strict"
+        rate_limit 2 per second
+        give {"ok": true}
+    route "GET /loose"
+        give {"ok": true}
+"""
+    with serving_runtime(prog) as rt:
+        # Override: stricter limit applies.
+        assert [_disp(rt, "POST", "/strict")[0] for _ in range(3)] == [200, 200, 429]
+        # Inherited 100/min on a separate zone — unaffected by /strict.
+        assert all(_disp(rt, "GET", "/loose")[0] == 200 for _ in range(10))
+
+
+def test_rate_limit_keyed_by_ip():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "POST /e"
+        rate_limit 2 per second
+        give {"ok": true}
+"""
+    with serving_runtime(prog) as rt:
+        # IP A exhausts its bucket.
+        assert [_disp(rt, "POST", "/e", ip="1.1.1.1")[0] for _ in range(3)] == [200, 200, 429]
+        # IP B has its own bucket.
+        assert _disp(rt, "POST", "/e", ip="2.2.2.2")[0] == 200
+
+
+def test_rate_limit_applies_before_auth():
+    prog = """
+require serve(__PORT__)
+
+task check_token(token)
+    give nothing
+
+serve on __PORT__
+    auth with check_token
+    route "POST /login" requires auth
+        rate_limit 3 per second
+        give {"ok": true}
+"""
+    with serving_runtime(prog) as rt:
+        # Invalid token → 401, but each attempt still consumes a token.
+        codes = [_disp(rt, "POST", "/login", ip="7.7.7.7")[0] for _ in range(3)]
+        assert codes == [401, 401, 401]
+        # 4th is throttled before auth even runs → brute force is capped.
+        assert _disp(rt, "POST", "/login", ip="7.7.7.7")[0] == 429
+
+
+def test_rate_limit_xff_not_trusted():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "POST /e"
+        rate_limit 2 per second
+        give {"ok": true}
+"""
+    with serving_runtime(prog) as rt:
+        # Same real peer IP, different (spoofed) X-Forwarded-For each time.
+        codes = []
+        for i in range(3):
+            codes.append(_disp(rt, "POST", "/e", ip="9.9.9.9",
+                               headers={"X-Forwarded-For": f"{i}.0.0.1"})[0])
+        assert codes == [200, 200, 429]  # XFF did not create new buckets
+
+
+def test_rate_limit_opt_in_and_none():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    rate_limit 1 per second
+    route "GET /capped"
+        give {"ok": true}
+    route "GET /free"
+        rate_limit none
+        give {"ok": true}
+"""
+    with serving_runtime(prog) as rt:
+        # Inherits the 1/sec default.
+        assert [_disp(rt, "GET", "/capped")[0] for _ in range(2)] == [200, 429]
+        # `rate_limit none` disables the inherited default.
+        assert all(_disp(rt, "GET", "/free")[0] == 200 for _ in range(20))
+
+
+def test_rate_limit_no_limit_when_undeclared():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /e"
+        give {"ok": true}
+"""
+    with serving_runtime(prog) as rt:
+        assert all(_disp(rt, "GET", "/e")[0] == 200 for _ in range(50))
+
+
+def test_rate_limit_http_429():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /e"
+        rate_limit 2 per second
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        codes = [req("GET", "/e")[0] for _ in range(3)]
+        assert codes == [200, 200, 429]
+
+
+def test_rate_limiter_cleanup_purges_stale():
+    from syntecnia.stdlib.server import RateLimiter
+    rl = RateLimiter(cleanup_interval=999)  # disable auto-cleanup; test purge() directly
+    for i in range(50):
+        rl.check(f"k{i}", 5, 1.0)  # window 1s
+    assert rl.size() == 50
+    time.sleep(2.1)  # > 2× window → entries become stale
+    rl.purge()
+    assert rl.size() == 0
 
 
 def test_handle_error_silences_client_disconnects():

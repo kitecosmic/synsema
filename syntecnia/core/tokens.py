@@ -107,6 +107,8 @@ class TokenType(Enum):
     STREAM = auto()          # stream block — Server-Sent Events response
     SEND = auto()            # send <value> [as "event"] — emit an SSE event
     MAX_STREAMS = auto()     # max_streams N — concurrent stream cap
+    RATE_LIMIT = auto()      # rate_limit N per <window> — request rate limit
+    PER = auto()             # rate_limit N per minute
 
     # -- Observability keywords --
     TRACE = auto()           # tracing block
