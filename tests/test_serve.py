@@ -3,6 +3,7 @@ import os
 import sys
 import json
 import time
+import shutil
 import socket
 import tempfile
 import contextlib
@@ -1247,6 +1248,878 @@ def test_parse_body_size_units():
     assert parse_body_size(4096) == 4096
     assert parse_body_size("unlimited") is None
     assert parse_body_size("none") is None
+
+
+# ===== HTML / arbitrary content-types (html, respond) =====
+
+def test_html_helper_returns_raw_html():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /page"
+        give html("<h1>Hi</h1>")
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/page")
+        assert status == 200
+        assert headers.get("Content-Type") == "text/html; charset=utf-8"
+        assert raw == b"<h1>Hi</h1>"          # exact body, no JSON quoting
+
+
+def test_respond_arbitrary_content_type_and_status():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /csv"
+        give respond("a,b,c", "text/csv")
+    route "GET /xml"
+        give respond("<x/>", "application/xml", 201)
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/csv")
+        assert status == 200
+        assert headers.get("Content-Type") == "text/csv"
+        assert raw == b"a,b,c"
+        status, headers, raw = req.raw("GET", "/xml")
+        assert status == 201
+        assert headers.get("Content-Type") == "application/xml"
+        assert raw == b"<x/>"
+
+
+def test_give_string_is_json_not_html():
+    # give "<h1>Hi</h1>" is JSON (a quoted string), NOT a raw HTML page.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /s"
+        give "<h1>Hi</h1>"
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/s")
+        assert status == 200
+        assert headers.get("Content-Type") == "application/json"
+        assert raw == b'"<h1>Hi</h1>"'
+        assert json.loads(raw) == "<h1>Hi</h1>"
+
+
+def test_give_map_still_json_with_raw_helpers_present():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /j"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/j")
+        assert headers.get("Content-Type") == "application/json"
+        assert json.loads(raw) == {"ok": True}
+
+
+# ===== Static file serving (static "./dir") =====
+
+@contextlib.contextmanager
+def _static_site(files: dict, outside: dict = None):
+    """Temp dir with a public/ subdir of `files`; `outside` files sit beside it.
+
+    Yields (public_path_with_forward_slashes, base_dir).
+    """
+    base = tempfile.mkdtemp(prefix="syn_static_test_")
+    pub = os.path.join(base, "public")
+    os.makedirs(pub)
+    for name, content in files.items():
+        path = os.path.join(pub, *name.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+    for name, content in (outside or {}).items():
+        with open(os.path.join(base, name), "w", encoding="utf-8") as f:
+            f.write(content)
+    try:
+        yield pub.replace("\\", "/"), base
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def _static_prog(pub: str, extra_routes: str = "") -> str:
+    return f"""
+require serve(__PORT__)
+serve on __PORT__
+    static "{pub}"
+    route "GET /api/ping"
+        give {{"ok": true}}
+{extra_routes}"""
+
+
+def test_static_serves_index_at_root():
+    with _static_site({"index.html": "<h1>Landing</h1>"}) as (pub, _base):
+        with serving(_static_prog(pub)) as req:
+            status, headers, raw = req.raw("GET", "/")
+            assert status == 200
+            assert raw == b"<h1>Landing</h1>"
+            assert headers.get("Content-Type", "").startswith("text/html")
+
+
+def test_static_content_type_by_extension():
+    with _static_site({"style.css": "body{color:red}"}) as (pub, _base):
+        with serving(_static_prog(pub)) as req:
+            status, headers, raw = req.raw("GET", "/style.css")
+            assert status == 200
+            assert raw == b"body{color:red}"
+            assert headers.get("Content-Type", "").startswith("text/css")
+
+
+def test_static_missing_file_404():
+    with _static_site({"index.html": "x"}) as (pub, _base):
+        with serving(_static_prog(pub)) as req:
+            status, body = req("GET", "/nope.png")
+            assert status == 404
+            assert body["status"] == 404
+
+
+def test_static_declared_route_wins_over_file():
+    with _static_site({"data.json": '{"from": "file"}'}) as (pub, _base):
+        prog = _static_prog(pub, '    route "GET /data.json"\n        give {"declared": true}\n')
+        with serving(prog) as req:
+            status, body = req("GET", "/data.json")
+            assert status == 200
+            assert body == {"declared": True}
+
+
+def test_static_path_traversal_blocked():
+    secret = "TOPSECRET-DO-NOT-LEAK"
+    with _static_site({"index.html": "<h1>ok</h1>"}, outside={"secret.txt": secret}) as (pub, _base):
+        with serving(_static_prog(pub)) as req:
+            for path in ("/../secret.txt", "/..%2f..%2fsecret.txt",
+                         "/..%2Fsecret.txt", "/%2e%2e/secret.txt"):
+                status, headers, raw = req.raw("GET", path)
+                assert secret.encode() not in raw, f"traversal leaked via {path}"
+                assert status == 404, f"{path} should be 404, got {status}"
+
+
+def test_static_post_not_served():
+    with _static_site({"index.html": "<h1>x</h1>"}) as (pub, _base):
+        with serving(_static_prog(pub)) as req:
+            status, headers, raw = req.raw("POST", "/index.html", body={"a": 1})
+            assert status == 404  # static is GET/HEAD only; no declared POST
+
+
+def test_static_head_has_no_body():
+    with _static_site({"index.html": "<h1>x</h1>"}) as (pub, _base):
+        with serving(_static_prog(pub)) as req:
+            status, headers, raw = req.raw("HEAD", "/")
+            assert status == 200
+            assert raw == b""
+            assert headers.get("Content-Type", "").startswith("text/html")
+
+
+# ===== CORS (cors "*" / cors "https://app.com") =====
+
+def test_cors_adds_allow_origin_wildcard():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    cors "*"
+    route "GET /x"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/x")
+        assert status == 200
+        assert headers.get("Access-Control-Allow-Origin") == "*"
+
+
+def test_cors_specific_origin_reflected():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    cors "https://app.example.com"
+    route "GET /x"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/x")
+        assert headers.get("Access-Control-Allow-Origin") == "https://app.example.com"
+
+
+def test_cors_preflight_options():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    cors "*"
+    route "GET /res"
+        give {"ok": true}
+    route "POST /res"
+        give created({"ok": true})
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("OPTIONS", "/res")
+        assert status == 204
+        assert headers.get("Access-Control-Allow-Origin") == "*"
+        methods = headers.get("Access-Control-Allow-Methods", "")
+        assert "GET" in methods and "POST" in methods
+        assert "Content-Type" in headers.get("Access-Control-Allow-Headers", "")
+        assert "Authorization" in headers.get("Access-Control-Allow-Headers", "")
+        assert headers.get("Access-Control-Max-Age") is not None
+
+
+def test_no_cors_no_headers():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /x"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/x")
+        assert headers.get("Access-Control-Allow-Origin") is None
+
+
+# ===== MODULE A: Next-parity routing =====
+
+# -- A1: catch-all routes + specificity precedence --
+
+def test_catch_all_captures_rest_of_path():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /files/*path"
+        give {"path": params.path}
+"""
+    with serving(prog) as req:
+        assert req("GET", "/files/a/b/c") == (200, {"path": "a/b/c"})
+        assert req("GET", "/files/single") == (200, {"path": "single"})
+
+
+def test_catch_all_url_decodes_segments():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /files/*path"
+        give {"path": params.path}
+"""
+    with serving(prog) as req:
+        status, body = req("GET", "/files/a%20b/c")
+        assert body == {"path": "a b/c"}
+
+
+def test_catch_all_requires_at_least_one_segment():
+    # Bare /files has nothing for *path to capture → no match → 404.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /files/*path"
+        give {"path": params.path}
+"""
+    with serving(prog) as req:
+        status, body = req("GET", "/files")
+        assert status == 404
+
+
+def test_exact_route_wins_over_catch_all():
+    # Precedence is by specificity, NOT declaration order: the catch-all is
+    # declared first but the exact route still wins.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /files/*path"
+        give {"catch": params.path}
+    route "GET /files/special"
+        give {"exact": true}
+"""
+    with serving(prog) as req:
+        assert req("GET", "/files/special") == (200, {"exact": True})
+        assert req("GET", "/files/other") == (200, {"catch": "other"})
+
+
+def test_param_route_wins_over_catch_all():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /files/*path"
+        give {"catch": params.path}
+    route "GET /files/:id"
+        give {"id": params.id}
+"""
+    with serving(prog) as req:
+        # Single segment → :id (more specific) wins over the catch-all.
+        assert req("GET", "/files/42") == (200, {"id": "42"})
+        # Deeper path → only the catch-all matches.
+        assert req("GET", "/files/42/extra") == (200, {"catch": "42/extra"})
+
+
+def test_catch_all_must_be_last_segment_parse_error():
+    engine = SyntecniaEngine()
+    result = engine.run_source(
+        'require serve(8150)\n'
+        'serve on 8150\n'
+        '    route "GET /files/*rest/more"\n'
+        '        give {"ok": true}',
+        filename="badcatch.syn",
+    )
+    assert not result.success
+    assert any("LAST segment" in e for e in result.errors)
+    engine.shutdown_servers()
+
+
+# -- A2: index in static subfolders --
+
+@contextlib.contextmanager
+def _dirs(spec: dict):
+    """spec: {"rel/path": content}. Yields the base dir (forward slashes)."""
+    base = tempfile.mkdtemp(prefix="syn_modA_test_")
+    for rel, content in spec.items():
+        path = os.path.join(base, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+    try:
+        yield base.replace("\\", "/")
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_static_subfolder_index():
+    files = {"public/index.html": "<h1>root</h1>",
+             "public/docs/index.html": "<h1>docs</h1>"}
+    with _dirs(files) as base:
+        prog = f"""
+require serve(__PORT__)
+serve on __PORT__
+    static "{base}/public"
+    route "GET /api/ping"
+        give {{"ok": true}}
+"""
+        with serving(prog) as req:
+            # Both /docs/ and /docs resolve to the subfolder index.
+            for path in ("/docs/", "/docs"):
+                status, headers, raw = req.raw("GET", path)
+                assert status == 200, path
+                assert raw == b"<h1>docs</h1>"
+            # Root still serves the top index.
+            status, headers, raw = req.raw("GET", "/")
+            assert raw == b"<h1>root</h1>"
+
+
+def test_static_js_content_type_is_pinned():
+    # Predictable content-type regardless of the host mimetypes registry.
+    with _dirs({"public/app.js": "console.log(1)"}) as base:
+        prog = f"""
+require serve(__PORT__)
+serve on __PORT__
+    static "{base}/public"
+    route "GET /api/ping"
+        give {{"ok": true}}
+"""
+        with serving(prog) as req:
+            status, headers, raw = req.raw("GET", "/app.js")
+            assert status == 200
+            assert headers.get("Content-Type") == "text/javascript; charset=utf-8"
+
+
+# -- A3: multiple static mounts --
+
+def test_multiple_static_mounts():
+    files = {"public/index.html": "<h1>root</h1>",
+             "assets/app.css": "body{}"}
+    with _dirs(files) as base:
+        prog = f"""
+require serve(__PORT__)
+serve on __PORT__
+    static "{base}/public"
+    static "/assets" from "{base}/assets"
+    route "GET /api/ping"
+        give {{"ok": true}}
+"""
+        with serving(prog) as req:
+            status, headers, raw = req.raw("GET", "/")
+            assert raw == b"<h1>root</h1>"
+            status, headers, raw = req.raw("GET", "/assets/app.css")
+            assert status == 200
+            assert raw == b"body{}"
+            assert headers.get("Content-Type", "").startswith("text/css")
+
+
+def test_static_mount_traversal_blocked_per_mount():
+    secret = "MOUNT-LEAK"
+    files = {"assets/app.css": "body{}", "secret.txt": secret}
+    with _dirs(files) as base:
+        prog = f"""
+require serve(__PORT__)
+serve on __PORT__
+    static "/assets" from "{base}/assets"
+    route "GET /api/ping"
+        give {{"ok": true}}
+"""
+        with serving(prog) as req:
+            for path in ("/assets/../secret.txt", "/assets/..%2f..%2fsecret.txt"):
+                status, headers, raw = req.raw("GET", path)
+                assert secret.encode() not in raw, path
+                assert status == 404, path
+
+
+def test_two_static_at_same_root_is_error():
+    files = {"a/x.html": "a", "b/y.html": "b"}
+    with _dirs(files) as base:
+        port = _free_port()
+        engine = SyntecniaEngine()
+        result = engine.run_source(
+            f'require serve({port})\n'
+            f'serve on {port}\n'
+            f'    static "{base}/a"\n'
+            f'    static "{base}/b"\n'
+            f'    route "GET /x"\n'
+            f'        give {{"ok": true}}',
+            filename="duproot.syn",
+        )
+        assert not result.success
+        assert len(engine.servers) == 0
+        assert any("same prefix" in e for e in result.errors)
+        engine.shutdown_servers()
+
+
+# ===== MODULE B1b/B2: semantic content tree + negotiation =====
+
+CONTENT_PROG = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /blog/:slug"
+        let p be {"title": "Hi <there>", "body": "hello & welcome", "tag": "news"}
+        give content(page(
+            [
+                heading(1, title of p),
+                prose(body of p),
+                list(["one", "two"]),
+                link("Back", "/blog"),
+                code("print(1)", "python"),
+                raw("<hr class='x'>")
+            ],
+            {"title": title of p, "description": "An <intro>"}
+        ))
+"""
+
+
+def test_content_default_is_html_with_head():
+    with serving(CONTENT_PROG) as req:
+        status, headers, raw = req.raw("GET", "/blog/hello")
+        assert status == 200
+        assert headers.get("Content-Type") == "text/html; charset=utf-8"
+        body = raw.decode()
+        assert body.startswith("<!DOCTYPE html>")
+        # <head> built from page metadata
+        assert "<title>Hi &lt;there&gt;</title>" in body
+        assert '<meta name="description" content="An &lt;intro&gt;">' in body
+        # JSON-LD structured data from the metadata
+        assert 'application/ld+json' in body
+        # semantic vocabulary rendered
+        assert "<h1>Hi &lt;there&gt;</h1>" in body
+        assert "<ul><li>one</li><li>two</li></ul>" in body
+        assert '<a href="/blog">Back</a>' in body
+        assert 'language-python' in body
+
+
+def test_content_auto_escapes_but_raw_passes_through():
+    with serving(CONTENT_PROG) as req:
+        status, headers, raw = req.raw("GET", "/blog/hello")
+        body = raw.decode()
+        # text content is auto-escaped (no live <there> tag) — XSS-safe by default
+        assert "<there>" not in body
+        assert "&lt;there&gt;" in body
+        assert "hello &amp; welcome" in body
+        # raw() opts out of escaping
+        assert "<hr class='x'>" in body
+
+
+def test_content_markdown_via_accept():
+    with serving(CONTENT_PROG) as req:
+        status, headers, raw = req.raw(
+            "GET", "/blog/hello", headers={"Accept": "text/markdown"})
+        assert status == 200
+        assert headers.get("Content-Type") == "text/markdown; charset=utf-8"
+        body = raw.decode()
+        assert "# Hi <there>" in body          # markdown is not HTML-escaped
+        assert "- one\n- two" in body
+        assert "[Back](/blog)" in body
+        assert "```python\nprint(1)\n```" in body
+
+
+def test_content_markdown_via_suffix():
+    with serving(CONTENT_PROG) as req:
+        status, headers, raw = req.raw("GET", "/blog/hello.md")
+        assert status == 200
+        assert headers.get("Content-Type") == "text/markdown; charset=utf-8"
+        assert "# Hi <there>" in raw.decode()
+
+
+def test_content_json_via_suffix():
+    with serving(CONTENT_PROG) as req:
+        status, headers, raw = req.raw("GET", "/blog/hello.json")
+        assert status == 200
+        assert headers.get("Content-Type") == "application/json; charset=utf-8"
+        tree = json.loads(raw)
+        assert tree["type"] == "page"
+        assert tree["meta"]["title"] == "Hi <there>"
+        kinds = [n["type"] for n in tree["nodes"]]
+        assert kinds == ["heading", "prose", "list", "link", "code", "raw"]
+        assert tree["nodes"][0] == {"type": "heading", "level": 1, "text": "Hi <there>"}
+
+
+def test_content_json_via_accept():
+    with serving(CONTENT_PROG) as req:
+        status, headers, raw = req.raw(
+            "GET", "/blog/hello", headers={"Accept": "application/json"})
+        assert status == 200
+        assert headers.get("Content-Type") == "application/json; charset=utf-8"
+        assert json.loads(raw)["type"] == "page"
+
+
+def test_content_star_accept_defaults_to_html():
+    with serving(CONTENT_PROG) as req:
+        status, headers, raw = req.raw("GET", "/blog/hello", headers={"Accept": "*/*"})
+        assert headers.get("Content-Type") == "text/html; charset=utf-8"
+
+
+def test_real_static_file_wins_over_suffix():
+    # A real x.json file is served as-is; the suffix is NOT a format request here.
+    with _dirs({"public/data.json": '{"real": "file"}'}) as base:
+        prog = f"""
+require serve(__PORT__)
+serve on __PORT__
+    static "{base}/public"
+    route "GET /:slug"
+        give content(page([heading(1, params.slug)], {{"title": params.slug}}))
+"""
+        with serving(prog) as req:
+            status, headers, raw = req.raw("GET", "/data.json")
+            assert status == 200
+            assert json.loads(raw) == {"real": "file"}
+
+
+def test_declared_literal_route_wins_over_negotiation():
+    # A route authored literally as /report.json is served as-is, not negotiated.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /report.json"
+        give {"literal": true}
+    route "GET /:slug"
+        give content(page([heading(1, params.slug)], {"title": params.slug}))
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/report.json")
+        assert headers.get("Content-Type") == "application/json"
+        assert json.loads(raw) == {"literal": True}
+
+
+def test_non_content_give_is_unaffected_by_accept():
+    # Without content(), Accept does nothing: a map is still JSON.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /x"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/x", headers={"Accept": "text/markdown"})
+        assert headers.get("Content-Type") == "application/json"
+        assert json.loads(raw) == {"ok": True}
+
+
+def test_bare_node_without_content_degrades_to_json():
+    # give heading(...) without content() serializes to the node's JSON form.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /n"
+        give heading(2, "Title")
+"""
+    with serving(prog) as req:
+        status, body = req("GET", "/n")
+        assert status == 200
+        assert body == {"type": "heading", "level": 2, "text": "Title"}
+
+
+# ===== MODULE B3: agent discoverability (/llms.txt, /robots.txt) =====
+
+def test_llms_txt_zero_config():
+    # No config: /llms.txt exists and lists the intent + the route table.
+    prog = """
+intent: "A tiny demo service"
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /blog/:slug"
+        give {"x": 1}
+    route "POST /api/signup"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/llms.txt")
+        assert status == 200
+        assert headers.get("Content-Type", "").startswith("text/plain")
+        body = raw.decode()
+        assert "A tiny demo service" in body          # intent
+        assert "GET /blog/:slug" in body              # route table
+        assert "POST /api/signup" in body
+
+
+def test_robots_txt_present_and_allows():
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /x"
+        give {"ok": true}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/robots.txt")
+        assert status == 200
+        body = raw.decode()
+        assert "User-agent: *" in body
+        assert "Allow: /" in body
+
+
+def test_describe_enriches_llms_txt():
+    prog = """
+intent: "Internal purpose text"
+require serve(__PORT__)
+serve on __PORT__
+    describe
+        about: "Public Blog API"
+        api: ["GET /blog/:slug -- an article", "POST /api/signup -- join"]
+    route "GET /blog/:slug"
+        give {"x": 1}
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/llms.txt")
+        assert status == 200
+        body = raw.decode()
+        assert "# Public Blog API" in body            # about → title
+        assert "Internal purpose text" in body        # intent → summary
+        assert "## API" in body
+        assert "GET /blog/:slug -- an article" in body
+
+
+def test_private_disables_llms_txt_and_disallows_robots():
+    # private → no /llms.txt (no info leak) and robots tells crawlers to stay out.
+    prog = """
+intent: "Internal dashboard — do not publish"
+require serve(__PORT__)
+serve on __PORT__
+    private
+    route "GET /admin"
+        give {"secret": true}
+"""
+    with serving(prog) as req:
+        status, body = req("GET", "/llms.txt")
+        assert status == 404
+        status, headers, raw = req.raw("GET", "/robots.txt")
+        assert status == 200
+        assert "Disallow: /" in raw.decode()
+
+
+def test_declared_route_overrides_llms_txt():
+    # A user route at /llms.txt wins over the auto-generated one.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /llms.txt"
+        give respond("custom", "text/plain")
+"""
+    with serving(prog) as req:
+        status, headers, raw = req.raw("GET", "/llms.txt")
+        assert status == 200
+        assert raw == b"custom"
+
+
+# ===== MODULE B1a: SSR templates (render()) =====
+
+@contextlib.contextmanager
+def _in_dir(files: dict):
+    """chdir into a temp dir holding `files`; yield (base, free_port). Restores cwd."""
+    base = tempfile.mkdtemp(prefix="syn_tmpl_test_")
+    for name, content in files.items():
+        path = os.path.join(base, *name.split("/"))
+        os.makedirs(os.path.dirname(path) or base, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+    old_cwd = os.getcwd()
+    os.chdir(base)
+    try:
+        yield base, _free_port()
+    finally:
+        os.chdir(old_cwd)
+        shutil.rmtree(base, ignore_errors=True)
+
+
+@contextlib.contextmanager
+def _serving_in_dir(files: dict, program: str, secure: bool = False):
+    """chdir into a temp dir holding `files`, run the serve program, yield a client."""
+    with _in_dir(files) as (base, port):
+        engine = SyntecniaEngine(secure=secure)
+        if secure:
+            from syntecnia.capabilities.model import Capability, CapabilityType
+            engine.capabilities.grant(Capability(CapabilityType.SERVE, str(port)))
+        try:
+            result = engine.run_source(program.replace("__PORT__", str(port)), filename="t.syn")
+            assert result.success, f"program failed to start: {result.errors}"
+            time.sleep(0.25)
+            yield _Client(port)
+        finally:
+            engine.shutdown_servers()
+            engine.db_manager.close_all()
+
+
+TEMPLATE = (
+    "<h1>{ title }</h1>\n"
+    "<ul>{ each item in items }<li>{ item }</li>{ end }</ul>\n"
+    "{ when featured }<aside>star</aside>{ otherwise }<aside>none</aside>{ end }\n"
+    "<div>{ raw trusted }</div>\n"
+)
+
+TEMPLATE_PROG = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /"
+        give render("home.html", {"title": "Hi <script>", "items": ["a", "b<x>"], "featured": true, "trusted": "<b>ok</b>"})
+    route "GET /plain"
+        give render("home.html", {"title": "T", "items": [], "featured": false, "trusted": ""})
+"""
+
+
+def test_template_renders_html_and_escapes():
+    with _serving_in_dir({"home.html": TEMPLATE}, TEMPLATE_PROG) as req:
+        status, headers, raw = req.raw("GET", "/")
+        assert status == 200
+        assert headers.get("Content-Type") == "text/html; charset=utf-8"
+        body = raw.decode()
+        # interpolation is auto-escaped (XSS-safe)
+        assert "<h1>Hi &lt;script&gt;</h1>" in body
+        assert "<script>" not in body
+        # each loop, with escaped items
+        assert "<li>a</li><li>b&lt;x&gt;</li>" in body
+        # when (truthy) branch
+        assert "<aside>star</aside>" in body
+        # raw() opts out of escaping
+        assert "<div><b>ok</b></div>" in body
+
+
+def test_template_when_false_and_empty_each():
+    with _serving_in_dir({"home.html": TEMPLATE}, TEMPLATE_PROG) as req:
+        status, headers, raw = req.raw("GET", "/plain")
+        body = raw.decode()
+        assert "<aside>none</aside>" in body     # otherwise branch
+        assert "<ul></ul>" in body               # empty collection
+
+
+# -- Fix 1: a single-name hole is a direct data lookup (reserved-word-proof) --
+
+def test_template_reserved_word_keys_resolve_from_data():
+    # `type` and `show` are reserved words; as a bare hole they must still
+    # resolve from the data (no parse error). A real expression still parses.
+    tpl = "<p>{ type }</p><p>{ show }</p><p>{ upper(name) }</p>"
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /"
+        give render("t.html", {"type": "book", "show": "yes", "name": "hi"})
+"""
+    with _serving_in_dir({"t.html": tpl}, prog) as req:
+        status, headers, raw = req.raw("GET", "/")
+        assert status == 200
+        body = raw.decode()
+        assert "<p>book</p>" in body
+        assert "<p>yes</p>" in body
+        assert "<p>HI</p>" in body              # expression still works
+
+
+def test_template_missing_field_clear_runtime_error():
+    # A bare name not present in the data → clear runtime error naming the field.
+    prog = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /"
+        give render("t.html", {"present": 1})
+"""
+    with _serving_in_dir({"t.html": "<p>{ ghost }</p>"}, prog) as req:
+        status, body = req("GET", "/")
+        assert status == 500
+        assert "field 'ghost'" in body["error"]
+        assert "template data" in body["error"]
+
+
+# -- Fix 2a: literal render() templates are validated at startup (fail-fast) --
+
+def test_template_missing_literal_fails_at_startup():
+    prog_t = (
+        'require serve({port})\n'
+        'serve on {port}\n'
+        '    route "GET /"\n'
+        '        give render("nope.html", {{}})'
+    )
+    with _in_dir({"home.html": "ok"}) as (base, port):
+        engine = SyntecniaEngine()
+        result = engine.run_source(prog_t.format(port=port), filename="t.syn")
+        assert not result.success
+        assert len(engine.servers) == 0
+        assert any("template not found" in e and "nope.html" in e for e in result.errors)
+        engine.shutdown_servers()
+
+
+def test_template_syntax_error_fails_at_startup():
+    bad = "<ul>{ each x in xs }<li>{ x }</li>"   # missing { end }
+    prog_t = (
+        'require serve({port})\n'
+        'serve on {port}\n'
+        '    route "GET /"\n'
+        '        give render("bad.html", {{"xs": []}})'
+    )
+    with _in_dir({"bad.html": bad}) as (base, port):
+        engine = SyntecniaEngine()
+        result = engine.run_source(prog_t.format(port=port), filename="t.syn")
+        assert not result.success
+        assert any("end" in e.lower() for e in result.errors)
+        engine.shutdown_servers()
+
+
+def test_template_literal_traversal_fails_at_startup():
+    prog_t = (
+        'require serve({port})\n'
+        'serve on {port}\n'
+        '    route "GET /"\n'
+        '        give render("../outside.html", {{}})'
+    )
+    with _in_dir({"home.html": "ok"}) as (base, port):
+        engine = SyntecniaEngine()
+        result = engine.run_source(prog_t.format(port=port), filename="t.syn")
+        assert not result.success
+        assert any("escapes the working directory" in e for e in result.errors)
+        engine.shutdown_servers()
+
+
+# -- Fix 2b: 500 detail in dev, generic in secure mode (always logged) --
+
+ERR_PROG = """
+require serve(__PORT__)
+serve on __PORT__
+    route "GET /boom"
+        let x be 1 / 0
+        give {"never": true}
+"""
+
+
+def test_500_includes_detail_in_dev_mode():
+    with _serving_in_dir({}, ERR_PROG) as req:
+        status, body = req("GET", "/boom")
+        assert status == 500
+        # dev (default): the detail is returned so a human/agent can self-correct
+        assert body["error"] != "internal server error"
+        assert body["status"] == 500
+
+
+def test_500_is_generic_in_secure_mode():
+    with _serving_in_dir({}, ERR_PROG, secure=True) as req:
+        status, body = req("GET", "/boom")
+        assert status == 500
+        # secure (production): no internals leak to the client
+        assert body == {"error": "internal server error", "status": 500}
 
 
 if __name__ == "__main__":

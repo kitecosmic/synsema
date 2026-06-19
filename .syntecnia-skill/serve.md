@@ -35,16 +35,35 @@ serve on 8080
   and returns immediately. The CLI keeps the process alive while servers run.
 - `route "METHOD /path"` defines a handler. The body is ordinary Syntecnia.
 - Named path params use `:name` → `route "GET /products/:id"`.
+- A trailing **catch-all** `*name` captures the rest of the path (variable depth)
+  → `route "GET /files/*path"` matches `/files/a/b/c` with `params.path == "a/b/c"`.
+  It must be the last segment and needs at least one segment to capture.
+
+### Route precedence (by specificity, not order)
+
+When several routes could match the same path, the **most specific** wins —
+regardless of declaration order, so a `:param` or catch-all can never accidentally
+swallow a more specific route:
+
+```
+exact segment  >  :param  >  *catchall
+```
+
+`route "GET /files/special"` beats `route "GET /files/:id"` beats
+`route "GET /files/*path"` for `/files/special`, even if the catch-all is declared
+first.
 
 ### Soft keywords
 
 `serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body`, `max_streams`,
-`stream`, `send`, `rate_limit` and `per` are **soft keywords**: they are special
-*only* at the start of their construction (`serve on N`, `route "..."`,
-`requires auth`, `expect body {...}`, `max_body "10mb"`, `max_streams N`, a
-`stream` block, `send` inside one, `rate_limit N per window`). Everywhere else
-they are ordinary names — `let route be "/x"` and `task auth(x)` are valid. The
-parser decides with fixed lookahead, never heuristics.
+`stream`, `send`, `rate_limit`, `per`, `static`, `from`, `cors`, `describe` and
+`private` are **soft keywords**: they are special *only* at the start of their
+construction (`serve on N`, `route "..."`, `requires auth`, `expect body {...}`,
+`max_body "10mb"`, `max_streams N`, a `stream` block, `send` inside one,
+`rate_limit N per window`, `static "./dir"`, `static "/p" from "./dir"`,
+`cors "*"`, a `describe` block, `private`). Everywhere else they are ordinary
+names — `let route be "/x"`, `let static be 1`, `let private be 1` and
+`task auth(x)` are valid. The parser decides with fixed lookahead, never heuristics.
 
 ## The request
 
@@ -102,6 +121,253 @@ body larger than 1 MB  → 413  {"error": "payload too large", "status": 413}
 `OPTIONS` returns `204` with an `Allow` header; `HEAD` behaves like `GET` with no
 body. A malformed body is only an error when `Content-Type` says JSON; otherwise
 `json of request` is `nothing` and `body of request` keeps the raw text.
+
+### Error responses (dev vs `--secure`)
+
+An uncaught error in a handler becomes a `500`. Its full detail is **always
+logged** to the server console (observability). What the **client** sees depends
+on the mode:
+
+- **Dev (default):** the body includes the detail —
+  `{"error": "<type>: <message>", "status": 500}` — so a human or agent can
+  self-correct. (`expect`/`400` and other client errors always keep their detail.)
+- **Production (`--secure`):** the body is generic —
+  `{"error": "internal server error", "status": 500}` — no internals leak.
+
+This applies to **all** uncaught 500s, not just templates.
+
+## Serving web pages (HTML, static files, CORS)
+
+`serve` is not only a JSON API — it can serve a real web app: HTML responses,
+static assets (CSS/JS/images), and the CORS headers a browser needs.
+
+### HTML and other content-types — `html()`, `respond()`
+
+`give <value>` always produces JSON (`give "<h1>Hi</h1>"` returns the JSON string
+`"<h1>Hi</h1>"`, **not** a page). To return non-JSON, use these helpers:
+
+```
+route "GET /"
+    give html("<h1>Hello</h1>")           -- 200, text/html; charset=utf-8, raw body
+
+route "GET /report.csv"
+    give respond("a,b,c\n1,2,3", "text/csv")   -- any content-type
+
+route "GET /legacy"
+    give respond("<x/>", "application/xml", 404)   -- content-type + status
+```
+
+- `html(content)` → status `200`, `Content-Type: text/html; charset=utf-8`, body
+  written **verbatim** (no `json.dumps`, no quotes).
+- `respond(content, content_type, status?)` → arbitrary content-type, optional
+  status (default `200`).
+- `give <map>` / `give <list>` are unchanged — still JSON. For text plain use
+  `respond(x, "text/plain")` (the `text(...)` builtin is value conversion, not a
+  response helper).
+
+### Static files — `static "./dir"` (and mounts)
+
+Declare a directory and any GET/HEAD that doesn't match a declared route is served
+from it. You can mount several dirs, each at its own URL prefix:
+
+```
+serve on 8090
+    static "./public"                 -- root mount: "/" → ./public/index.html
+    static "/assets" from "./assets"  -- mount ./assets under the "/assets" prefix
+    route "POST /api/signup"          -- declared routes ALWAYS win over static
+        ...
+```
+
+- A `GET`/`HEAD` with no matching route falls through to the static handler:
+  the file is served with a content-type from its extension (`.html`, `.css`,
+  `.js`, `.png`, `.svg`, `.json`, … — these common web types are **pinned** so the
+  result doesn't depend on the host's mime registry); a missing file → `404` JSON.
+- **Directory index.** `/` serves `index.html`; a subfolder serves its
+  `index.html` too — `/docs/` (and `/docs`) → `<dir>/docs/index.html`.
+- **Multiple mounts.** `static "./dir"` mounts at the root; `static "/p" from
+  "./dir"` mounts under `/p`. Longer prefixes are matched first, so `/assets/...`
+  is served from the `/assets` mount before the root mount is tried. Declaring two
+  mounts at the **same** prefix is an **error** (no silent shadowing).
+- **Declared routes always win.** If a path is declared (for any method) it is
+  never shadowed by a file — a different method on it gets `405`, not a file.
+- **Only `GET`/`HEAD`.** A `POST` to a static path is not served (→ `404`/`405`).
+- **The declaration is the permission.** `static "./public"` grants reading from
+  that directory; you do **not** also need a `file()` capability for it. Relative
+  paths are resolved against the program's working directory.
+- **Path traversal is blocked, per mount.** `../`, encoded `..%2f`, absolute paths
+  and symlinks escaping the directory are rejected — the resolved real path must
+  stay inside that mount's root.
+
+> **Same-origin tip:** if the landing page is served by `static` from the same
+> server as the API, the browser's `fetch` is **same-origin** and needs no CORS.
+
+### CORS — `cors "*"` / `cors "https://app.com"`
+
+For APIs called from a browser on a **different** origin, declare CORS:
+
+```
+serve on 8090
+    cors "*"                     -- or cors "https://app.example.com"
+    route "GET /api/data"
+        give [...]
+```
+
+- With `cors` declared, every response carries `Access-Control-Allow-Origin:
+  <origin>`. A preflight `OPTIONS` additionally returns
+  `Access-Control-Allow-Methods` (the path's methods),
+  `Access-Control-Allow-Headers: Content-Type, Authorization` and
+  `Access-Control-Max-Age`.
+- Without `cors`, no CORS headers are sent (unchanged behavior).
+- **Credentials caveat:** the CORS spec forbids `*` for requests with
+  credentials (`Authorization`/cookies). If you send credentials cross-origin, set
+  a **specific** origin (`cors "https://app.example.com"`), not `*`.
+
+## Web for agents — SSR, negotiation & discoverability
+
+Two ways to render server-side, for two jobs:
+
+- **`render("page.html", data)`** — templates, for **design pages** (landing,
+  marketing) where you control the exact HTML.
+- **`content(tree)`** — a semantic tree, for **content** humans *and* agents
+  consume (blog/docs), negotiated to HTML / Markdown / JSON.
+
+### Templates — `render()` (pixel-control SSR)
+
+`render("page.html", data)` returns a `text/html` response from a template file.
+The data map's keys become variables inside the template:
+
+```
+route "GET /"
+    give render("home.html", {"title": "Welcome", "items": ["a", "b"], "featured": true})
+```
+
+```html
+<!-- home.html — { ... } holes are Syntecnia expressions, AUTO-ESCAPED -->
+<h1>{ title }</h1>
+<ul>{ each item in items }<li>{ item }</li>{ end }</ul>
+{ when featured }<aside>★</aside>{ otherwise }<aside>—</aside>{ end }
+{ raw trusted_html }              <!-- raw opts out of escaping -->
+```
+
+- **A hole `{ x }` shows the value of `x`.** `x` can be a **data field** (any
+  name — even a reserved word like `type`, `show`, `state`) or an **expression**
+  like `{ format_time(created) }` or `{ a + b }`. A single bare name is looked up
+  directly in the data, so simple field names always work; if the field isn't in
+  the data you get a clear `field 'x' is not in the template data` error.
+- **Auto-escape (XSS-safe by default):** every `{ expr }` value is HTML-escaped
+  (`<script>` → `&lt;script&gt;`) — you never have to remember. `{ raw expr }`
+  opts out for trusted HTML.
+- **Flow control reuses Syntecnia:** `{ each VAR in EXPR }…{ end }` and
+  `{ when EXPR }…{ otherwise }…{ end }` — the same `each`/`when` you already know,
+  not a new dialect.
+- **Paths are cwd-relative** and may not escape the working directory (traversal
+  blocked).
+- **Errors are caught early.** A template referenced as `render("literal.html")`
+  is validated **at startup** (file exists + parses), so a typo/missing file
+  fails when the program runs — not on the first request. A runtime error (e.g. a
+  missing field) is a `500`: in dev the detail (with `file:line`) is returned so
+  you or an agent can fix it; with `--secure` the body is generic and the detail
+  only goes to the server log (see "Error responses" below).
+- **`{`/`}` are delimiters.** Keep CSS/JS (which use braces) in external files
+  served via `static`; for a literal brace use a string hole like `{ "{" }`.
+
+### Semantic content — `content()` (negotiated)
+
+For content that **both humans and agents** consume (blog posts, docs, a KB), you
+describe the content **once** as a tree of semantic nodes and `give content(tree)`.
+The runtime then negotiates the representation per request — HTML for browsers,
+Markdown for agents, JSON for tools — from the **same route**.
+
+```
+task post_view(p)
+    give page(
+        [
+            heading(1, title of p),
+            prose("Published " + format_time(created of p)),
+            prose(body of p),
+            link("Back", "/blog")
+        ],
+        {"title": title of p, "description": excerpt of p}   -- <head> + SEO
+    )
+
+route "GET /blog/:slug"
+    give content(post_view(load_post(params.slug)))          -- opt-in: negotiated
+```
+
+### Vocabulary (content nodes)
+
+| Builtin | Renders to |
+|---|---|
+| `page(nodes, meta?)` | the document; `meta` (a map) feeds `<title>`/`<meta>` + JSON-LD |
+| `heading(level, text)` | `<h1>`–`<h6>` / `#` |
+| `prose(text)` | `<p>` / paragraph |
+| `list(items)` / `ordered_list(items)` | `<ul>`/`<ol>` / `- ` / `1. ` |
+| `link(text, href)` | `<a>` / `[text](href)` |
+| `image(src, alt)` | `<img>` / `![alt](src)` |
+| `section(nodes)` | `<section>` / grouped blocks |
+| `code(text, lang?)` | `<pre><code>` / fenced ```` ``` ```` |
+| `raw(html)` | the HTML **verbatim** (escape hatch) |
+
+- **Opt-in:** only `give content(tree)` is negotiated. A route that gives
+  `html()`/`respond()` stays HTML, a `{map}`/`list` stays JSON — no magic.
+- **Auto-escape (XSS-safe by default):** all text in the HTML rendering is escaped
+  (`<script>` → `&lt;script&gt;`), including the JSON-LD. Use `raw(html)` to opt
+  out for trusted HTML. You never have to remember to escape.
+- **SEO automatic:** `page` metadata (`title`, `description`) becomes `<title>`,
+  `<meta name="description">` and a JSON-LD `WebPage` block.
+- A content node used **without** `content()` (e.g. `give heading(...)`) degrades
+  to its JSON form.
+
+### Content negotiation (`Accept` + suffix)
+
+The same `content()` route serves three formats. Two triggers, no `?query`:
+
+```
+GET /blog/hola                              # browser → HTML (default)
+GET /blog/hola   Accept: text/markdown      # agent   → Markdown
+GET /blog/hola.md                           # explicit → Markdown
+GET /blog/hola.json                         # explicit → JSON (the node tree)
+```
+
+- **Default is HTML** — including `Accept: */*` or no/unclear `Accept`.
+  `Accept: text/markdown` → Markdown; `Accept: application/json` → JSON.
+- **Suffix** `.md`/`.json`/`.html` is an explicit selector. It is stripped before
+  matching, so it works with `:param` routes (`/blog/hola.json` → slug `hola`).
+- **No conflict with static files / literal routes.** A real file (`data.json`) or
+  a route authored literally (`route "GET /report.json"`) is served **as-is** and
+  wins over negotiation — the suffix only re-interprets a path a `:param` captured.
+  A `*catch-all` keeps the dotted value too (it's not negotiated).
+- Negotiation applies **only** to `content()` values; everything else is unchanged.
+
+### Discoverability — `/llms.txt`, `/robots.txt`, `describe`, `private`
+
+Every server is **discoverable by agents from day 1, zero config**:
+
+- **`/llms.txt`** (the "robots.txt of the agent era") is auto-generated from the
+  program `intent:`, the route table (method + path), and the `describe` block.
+- **`/robots.txt`** is auto-served (allows crawlers and points them at the site).
+
+Enrich or opt out with two clauses on the serve block:
+
+```
+serve on 8080
+    describe                       -- enriches /llms.txt (optional)
+        about: "Blog and waitlist for Syntecnia"
+        api: ["GET /blog/:slug — an article", "POST /api/signup — join"]
+    -- private                     -- opt-out: internal server, publish nothing
+    route "GET /blog/:slug"
+        give content(post_view(load_post(params.slug)))
+```
+
+- **`describe`** (soft keyword): `about:` becomes the `/llms.txt` title and
+  `api:` a curated endpoint list. The `intent:` becomes the summary.
+- **`private`** (soft keyword): disables `/llms.txt` (returns `404`) and makes
+  `/robots.txt` `Disallow: /` — for internal servers/dashboards, so they don't
+  leak their shape (secure by default).
+- A declared route or a static file at `/llms.txt` or `/robots.txt` **overrides**
+  the auto-generated one.
+- Combined with the `content()` page metadata → JSON-LD, this closes the SEO +
+  agent-discovery loop.
 
 ## Pagination
 
@@ -266,6 +532,21 @@ route "POST /users"
 `expect body {field: type, ...}` validates the request's JSON body. A missing
 field or a type mismatch → **400** with the offending `field` named. Types:
 `text`, `number`, `bool`, `list`, `map`.
+
+For finer checks than a type (email, phone, slug…), use `matches(value, pattern)`
+— it is a **full match** (the whole value must match), so an unanchored pattern is
+already safe for validation; no `^...$` needed:
+
+```
+route "POST /signup"
+    expect body {email: text}
+    let email be email of (json of request)
+    when not matches(email, "[^@ ]+@[^@ ]+\.[^@ ]+")
+        give fail(422, "that doesn't look like an email")
+    ...
+```
+
+(For "does the pattern appear somewhere" use `find_all`/`capture` — see builtins.md.)
 
 ## Request body limits
 

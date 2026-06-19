@@ -457,6 +457,27 @@ class RateLimitClause(Node):
     unlimited: bool = False              # `rate_limit none` / `unlimited`
 
 @dataclass
+class StaticMount(Node):
+    """
+    A static-file mount inside a serve block:
+        static "./public"               -- prefix is None → mounted at "/"
+        static "/assets" from "./assets" -- mounted under the "/assets" prefix
+    """
+    directory: Node = None               # expression: directory to serve from
+    prefix: Optional[Node] = None        # expression: URL prefix, or None for "/"
+
+@dataclass
+class DescribeClause(Node):
+    """
+    Enriches the auto-generated /llms.txt:
+        describe
+            about: "Blog and waitlist"
+            api: ["GET /blog/:slug — article", "POST /api/signup — join"]
+    """
+    about: Optional[Node] = None         # expression → text (site summary)
+    api: Optional[Node] = None           # expression → list of endpoint descriptions
+
+@dataclass
 class ServeBlock(Node):
     """
     serve on 8080
@@ -469,6 +490,10 @@ class ServeBlock(Node):
     max_body: Optional[Node] = None      # expression: max request body ("10mb"/bytes/"unlimited")
     max_streams: Optional[Node] = None   # expression: max concurrent SSE streams
     rate_limit: Optional['RateLimitClause'] = None  # default rate limit for all routes
+    static_mounts: List['StaticMount'] = field(default_factory=list)  # static file mounts
+    cors: Optional[Node] = None          # expression: CORS origin ("*" or "https://app.com")
+    describe: Optional['DescribeClause'] = None  # enriches /llms.txt
+    private: bool = False                # opt-out of agent discoverability (/llms.txt)
     routes: List[RouteDefinition] = field(default_factory=list)
 
 @dataclass

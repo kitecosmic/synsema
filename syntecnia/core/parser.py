@@ -618,6 +618,10 @@ class Parser:
         max_body = None
         max_streams = None
         rate_limit = None
+        static_mounts = []
+        cors = None
+        describe = None
+        private = False
         routes = []
 
         self._skip_newlines()
@@ -637,12 +641,32 @@ class Parser:
                 max_streams = self._parse_expression()
             elif self._check_word("rate_limit"):
                 rate_limit = self._parse_rate_limit()
+            elif self._check_word("static"):
+                self._advance()  # consume soft keyword 'static'
+                first = self._parse_expression()
+                if self._check_word("from"):
+                    self._advance()  # consume soft keyword 'from'
+                    directory = self._parse_expression()
+                    static_mounts.append(ast.StaticMount(
+                        location=loc, prefix=first, directory=directory))
+                else:
+                    static_mounts.append(ast.StaticMount(
+                        location=loc, prefix=None, directory=first))
+            elif self._check_word("cors"):
+                self._advance()  # consume soft keyword 'cors'
+                cors = self._parse_expression()
+            elif self._check_word("describe"):
+                describe = self._parse_describe()
+            elif self._check_word("private"):
+                self._advance()  # consume soft keyword 'private'
+                private = True
             elif self._check_word("route"):
                 routes.append(self._parse_route())
             else:
                 tok = self._current()
                 raise ParseError(
-                    f"Inside 'serve', expected 'auth with ...' or 'route ...', "
+                    f"Inside 'serve', expected 'auth with ...', 'route ...', "
+                    f"'static ...', 'cors ...', 'describe' or 'private', "
                     f"got {tok.type.name}",
                     tok.location,
                 )
@@ -664,8 +688,42 @@ class Parser:
         return ast.ServeBlock(
             location=loc, port=port, auth_handler=auth_handler,
             max_body=max_body, max_streams=max_streams,
-            rate_limit=rate_limit, routes=routes,
+            rate_limit=rate_limit, static_mounts=static_mounts, cors=cors,
+            describe=describe, private=private, routes=routes,
         )
+
+    def _parse_describe(self) -> ast.DescribeClause:
+        """
+        describe
+            about: "..."
+            api: ["...", "..."]
+        """
+        loc = self._location()
+        self._advance()  # consume soft keyword 'describe'
+        about = None
+        api = None
+        self._skip_newlines()
+        self._expect(TokenType.INDENT, "Expected an indented block after 'describe'")
+        self._skip_newlines()
+        while not self._at_end() and not self._check(TokenType.DEDENT):
+            if self._check_word("about"):
+                self._advance()
+                self._expect(TokenType.COLON, "Expected ':' after 'about'")
+                about = self._parse_expression()
+            elif self._check_word("api"):
+                self._advance()
+                self._expect(TokenType.COLON, "Expected ':' after 'api'")
+                api = self._parse_expression()
+            else:
+                tok = self._current()
+                raise ParseError(
+                    f"Inside 'describe', expected 'about:' or 'api:', got {tok.type.name}",
+                    tok.location,
+                )
+            self._skip_newlines()
+        if self._check(TokenType.DEDENT):
+            self._advance()
+        return ast.DescribeClause(location=loc, about=about, api=api)
 
     def _parse_route(self) -> ast.RouteDefinition:
         """route "METHOD /path/:param" [requires auth]\n    body"""
@@ -738,7 +796,12 @@ class Parser:
         return ast.SendStatement(location=loc, value=value, event_name=event_name)
 
     def _split_route_spec(self, spec: str, loc) -> tuple:
-        """Parse 'GET /products/:id' → ('GET', '/products/:id', ['id'])."""
+        """
+        Parse 'GET /products/:id' → ('GET', '/products/:id', ['id']).
+
+        Supports a single trailing catch-all segment: 'GET /files/*path' captures
+        the rest of the path (variable depth) as `params.path`.
+        """
         parts = spec.strip().split(None, 1)
         if len(parts) != 2:
             raise ParseError(
@@ -748,10 +811,20 @@ class Parser:
         path = parts[1].strip()
         if not path.startswith("/"):
             raise ParseError(f"Route path must start with '/', got {path!r}", loc)
-        param_names = [
-            seg[1:] for seg in path.split("/")
-            if seg.startswith(":") and len(seg) > 1
-        ]
+        segs = [s for s in path.split("/") if s != ""]
+        param_names = []
+        for i, seg in enumerate(segs):
+            if seg.startswith(":") and len(seg) > 1:
+                param_names.append(seg[1:])
+            elif seg.startswith("*"):
+                if len(seg) == 1:
+                    raise ParseError(
+                        f"Catch-all segment must be named, e.g. '*path', got {seg!r}", loc)
+                if i != len(segs) - 1:
+                    raise ParseError(
+                        f"Catch-all '*{seg[1:]}' must be the LAST segment of the path, "
+                        f"got {path!r}", loc)
+                param_names.append(seg[1:])
         return method, path, param_names
 
     def _parse_expect(self) -> ast.ExpectStatement:

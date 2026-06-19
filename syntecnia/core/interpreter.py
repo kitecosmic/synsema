@@ -170,6 +170,13 @@ class Interpreter:
             "starts_with": BuiltinTask("starts_with", self._builtin_starts_with, 2),
             "ends_with": BuiltinTask("ends_with", self._builtin_ends_with, 2),
             "replace_text": BuiltinTask("replace_text", self._builtin_replace_text, 3),
+            # Regex (pure computation — no capability required)
+            "matches": BuiltinTask("matches", self._builtin_matches, 2),
+            "find_all": BuiltinTask("find_all", self._builtin_find_all, 2),
+            "capture": BuiltinTask("capture", self._builtin_capture, 2),
+            "replace_re": BuiltinTask("replace_re", self._builtin_replace_re, 3),
+            # SSR templates — render("page.html", data) → text/html (auto-escaped)
+            "render": BuiltinTask("render", self._builtin_render, -1),
         }
         for name, builtin in builtins.items():
             self.global_env.set(name, SynValue(raw=builtin, type=SynTask()))
@@ -304,6 +311,71 @@ class Interpreter:
 
     def _builtin_replace_text(self, args: List[SynValue]) -> SynValue:
         return syn_text(str(args[0].raw).replace(str(args[1].raw), str(args[2].raw)))
+
+    # -- Regex (re) — pure, no capability. Patterns are caller-supplied; a
+    #    pathological pattern can be slow (ReDoS), so never feed untrusted input
+    #    as a pattern without care (see builtins.md / pitfalls.md).
+
+    @staticmethod
+    def _compile_re(pattern: str):
+        import re
+        try:
+            return re.compile(pattern)
+        except re.error as e:
+            raise RuntimeError(f"invalid regex pattern {pattern!r}: {e}")
+
+    def _builtin_matches(self, args: List[SynValue]) -> SynValue:
+        """
+        matches(text, pattern) → bool — true only if the WHOLE text matches the
+        pattern. Built for input validation, so an unanchored pattern is already
+        safe (no need to remember ^...$). For "does the pattern appear somewhere",
+        use find_all / capture.
+        """
+        rx = self._compile_re(str(args[1].raw))
+        return syn_bool(rx.fullmatch(str(args[0].raw)) is not None)
+
+    def _builtin_find_all(self, args: List[SynValue]) -> SynValue:
+        """find_all(text, pattern) → list of every (whole) match, in order."""
+        rx = self._compile_re(str(args[1].raw))
+        return syn_list([syn_text(m.group(0)) for m in rx.finditer(str(args[0].raw))])
+
+    def _builtin_capture(self, args: List[SynValue]) -> SynValue:
+        """
+        capture(text, pattern) → first match, or nothing.
+
+        With capture groups, returns the groups as a list (an unmatched optional
+        group is `nothing`); without groups, returns the whole match as text.
+        """
+        rx = self._compile_re(str(args[1].raw))
+        m = rx.search(str(args[0].raw))
+        if m is None:
+            return syn_nothing()
+        if m.groups():
+            return syn_list([
+                syn_text(g) if g is not None else syn_nothing() for g in m.groups()
+            ])
+        return syn_text(m.group(0))
+
+    def _builtin_replace_re(self, args: List[SynValue]) -> SynValue:
+        """replace_re(text, pattern, replacement) → text (\\1 backrefs supported)."""
+        rx = self._compile_re(str(args[1].raw))
+        return syn_text(rx.sub(str(args[2].raw), str(args[0].raw)))
+
+    def _builtin_render(self, args: List[SynValue]) -> SynValue:
+        """
+        render("page.html", data?) → an HTML response from a template.
+
+        The template's { ... } holes are Syntecnia expressions; values are
+        auto-escaped (raw(...) opts out). Reuses each/when for flow control.
+        """
+        # Lazy imports: server/templates import the interpreter, so importing
+        # them at module load would be circular.
+        from ..stdlib.templates import render_template
+        from ..stdlib.server import _make_raw
+        path = str(args[0].raw) if args else ""
+        data = args[1] if len(args) > 1 else None
+        html_str = render_template(self, path, data)
+        return _make_raw(html_str, "text/html; charset=utf-8", 200)
 
     # =========================================================
     # Main evaluation

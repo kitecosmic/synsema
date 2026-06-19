@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{ title }</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <main>
+    <h1>{ title }</h1>
+    <!-- the tagline holds an angle-bracket word; it renders escaped, not as a tag -->
+    <p>{ tagline }</p>
+
+    { when highlighted }<aside>★ Featured</aside>{ otherwise }<aside>—</aside>{ end }
+
+    <ul>
+      { each feature in features }<li>{ feature }</li>{ end }
+    </ul>
+
+    <!-- raw() opts this HTML out of escaping -->
+    <footer>{ raw note }</footer>
+  </main>
+</body>
+</html>

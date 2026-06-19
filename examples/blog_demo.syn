@@ -1,0 +1,62 @@
+-- Agent-first blog — one route, three representations.
+-- Run with:  syntecnia run examples/blog_demo.syn
+--
+-- The SAME /blog/:slug route serves:
+--   a browser            -> HTML (semantic, with <head> + JSON-LD for SEO)
+--   an agent             -> Markdown   (Accept: text/markdown  OR  /blog/:slug.md)
+--   a tool               -> JSON tree  (/blog/:slug.json)
+-- because the handler describes the content once with content(page(...)).
+--
+-- Try it:
+--   curl localhost:8095/blog/hello
+--   curl -H "Accept: text/markdown" localhost:8095/blog/hello
+--   curl localhost:8095/blog/hello.md
+--   curl localhost:8095/blog/hello.json
+
+intent: "Serve a small blog that humans read as HTML and agents read as Markdown"
+
+require serve(8095)
+require db(":memory:")
+require time
+
+db_open(":memory:", "memory")
+sql_exec("CREATE TABLE posts (slug TEXT PRIMARY KEY, title TEXT, excerpt TEXT, body TEXT, created NUMBER)")
+sql_exec("INSERT INTO posts (slug, title, excerpt, body, created) VALUES (?, ?, ?, ?, ?)",
+    ["hello", "Hello, agents", "Why a blog should speak Markdown too",
+     "Browsers get HTML; agents get clean Markdown from the very same URL.", 1750000000])
+
+task load_post(slug)
+    let rows be sql("SELECT slug, title, excerpt, body, created FROM posts WHERE slug = ?", [slug])
+    when length(rows) == 0
+        give nothing
+    give rows[0]
+
+-- Describe the post ONCE as a semantic tree; the runtime negotiates the format.
+task post_view(p)
+    give page(
+        [
+            heading(1, title of p),
+            prose("Published " + format_time(created of p, "%Y-%m-%d")),
+            prose(body of p),
+            link("← All posts", "/blog")
+        ],
+        {"title": title of p, "description": excerpt of p}   -- <head> + SEO
+    )
+
+serve on 8095
+    -- Agent discoverability: /llms.txt and /robots.txt are auto-served.
+    -- `describe` enriches /llms.txt (try: curl localhost:8095/llms.txt).
+    describe
+        about: "A tiny blog that humans read as HTML and agents read as Markdown"
+        api: ["GET /blog/:slug — a post (HTML / Markdown / JSON)", "GET /blog — list posts"]
+
+    -- A content() route: HTML by default, Markdown via Accept/.md, JSON via .json
+    route "GET /blog/:slug"
+        let p be load_post(params.slug)
+        when p == nothing
+            give not_found("no such post")
+        give content(post_view(p))
+
+    -- A plain index (JSON) — not negotiated, just an API listing.
+    route "GET /blog"
+        give sql("SELECT slug, title FROM posts ORDER BY created")

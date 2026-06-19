@@ -166,11 +166,15 @@ class SecureOperations:
 
     # -- System --
 
+    def require_time(self, source: str = "") -> None:
+        """Gate on the time capability (no clock read), for time-derived ops."""
+        cap = Capability(CapabilityType.TIME)
+        self.capabilities.require(cap, source)
+
     def get_time(self, source: str = "") -> float:
         """Get current time, requires time capability."""
         import time
-        cap = Capability(CapabilityType.TIME)
-        self.capabilities.require(cap, source)
+        self.require_time(source)
         return time.time()
 
     def get_random(self, source: str = "") -> float:

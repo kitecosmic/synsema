@@ -374,9 +374,59 @@ class SyntecniaEngine:
                 rate_limit=eff_rate, rate_zone=zone,
             ))
 
+        # Resolve the static mounts and CORS origin once (if declared). Each
+        # mount is (url_prefix, directory); prefix None means the root "/".
+        static_mounts = []
+        seen_prefixes = set()
+        for mount in node.static_mounts:
+            directory = str(self.interpreter._exec(mount.directory, serve_env).raw)
+            if mount.prefix is None:
+                prefix = "/"
+            else:
+                prefix = str(self.interpreter._exec(mount.prefix, serve_env).raw)
+            key = "/" + prefix.strip("/")  # normalize for the duplicate check
+            if key in seen_prefixes:
+                raise SynRuntimeError(
+                    f"two static mounts at the same prefix {prefix!r}; mount each "
+                    f"at a distinct prefix (e.g. static \"/assets\" from \"./assets\")",
+                    node.location,
+                )
+            seen_prefixes.add(key)
+            static_mounts.append((prefix, directory))
+
+        cors_origin = None
+        if node.cors is not None:
+            cors_origin = str(self.interpreter._exec(node.cors, serve_env).raw)
+
+        # Agent discoverability (/llms.txt): the program intent + describe block.
+        from ..core.types import SynList as _SynList, SynText
+        describe_about = None
+        describe_api = None
+        if node.describe is not None:
+            if node.describe.about is not None:
+                describe_about = str(self.interpreter._exec(node.describe.about, serve_env).raw)
+            if node.describe.api is not None:
+                api_val = self.interpreter._exec(node.describe.api, serve_env)
+                if isinstance(api_val.type, _SynList):
+                    describe_api = [str(x.raw) if isinstance(x.type, SynText) else str(x)
+                                    for x in api_val.raw]
+        intent_text = None
+        if self.intent_enforcer and self.intent_enforcer.intent:
+            intent_text = self.intent_enforcer.intent.description
+
+        # Fail-fast: validate templates referenced by render("literal") at
+        # startup, so a missing file or a template syntax error surfaces when the
+        # program runs — not on the first request. (Dynamic paths / runtime data
+        # errors still surface per request.)
+        self._validate_route_templates(node)
+
         runtime = ServeRuntime(
             port_num, routes, auth_handler=_auth_runner,
             max_body=max_body, max_streams=max_streams,
+            static_mounts=static_mounts, cors_origin=cors_origin,
+            intent=intent_text, describe_about=describe_about,
+            describe_api=describe_api, private=bool(node.private),
+            secure=self.secure,
         )
         try:
             runtime.start(background=True)
@@ -390,6 +440,38 @@ class SyntecniaEngine:
             f"Serving HTTP on port {port_str} ({len(routes)} route(s))"
         )
         return syn_text(f"serving:{port_str}")
+
+    def _validate_route_templates(self, node):
+        """Parse every render("literal") template in the serve block's routes.
+
+        Raises SynRuntimeError (→ program fails to start) on a missing file or a
+        template syntax error, so typos are caught like a compiler would.
+        """
+        import dataclasses
+        from ..core import ast_nodes as astn
+        from ..stdlib.templates import validate_template, TemplateError
+
+        def _iter(n):
+            if isinstance(n, astn.Node):
+                yield n
+                for fld in dataclasses.fields(n):
+                    yield from _iter(getattr(n, fld.name))
+            elif isinstance(n, (list, tuple)):
+                for item in n:
+                    yield from _iter(item)
+
+        for route in node.routes:
+            for n in _iter(route.body):
+                if (isinstance(n, astn.TaskCall)
+                        and isinstance(n.name, astn.Identifier)
+                        and n.name.name == "render"
+                        and n.arguments
+                        and isinstance(n.arguments[0], astn.TextLiteral)):
+                    try:
+                        validate_template(n.arguments[0].value)
+                    except TemplateError as e:
+                        raise SynRuntimeError(
+                            f'render("{n.arguments[0].value}"): {e}', node.location)
 
     def shutdown_servers(self):
         """Stop all running HTTP servers."""

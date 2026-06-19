@@ -305,6 +305,51 @@ def test_builtin_type_of():
     assert_output('print(type_of([1]))', ['list'])
 
 
+# -- Regex builtins (pure, no capability) --
+
+def test_regex_matches():
+    # Full-match semantics: the WHOLE text must match the pattern.
+    assert_output('print(text(matches("12345", "[0-9]+")))', ['true'])
+    assert_output('print(text(matches("hello 5 world", "[0-9]+")))', ['false'])
+    # An UNANCHORED email pattern is already safe — no ^...$ needed.
+    assert_output(r'print(text(matches("a@b.com", "[^@ ]+@[^@ ]+\.[^@ ]+")))', ['true'])
+    assert_output(r'print(text(matches("junk a@b.com junk", "[^@ ]+@[^@ ]+\.[^@ ]+")))',
+                  ['false'])
+    # Explicit anchors are now redundant but must not break anything.
+    assert_output(r'print(text(matches("a@b.com", "^[^@]+@[^@]+\.[^@]+$")))', ['true'])
+    assert_output(r'print(text(matches("not-an-email", "^[^@]+@[^@]+\.[^@]+$")))', ['false'])
+
+
+def test_regex_find_all():
+    assert_output('print(find_all("a1b2", "[0-9]"))', ['[1, 2]'])
+    assert_output('print(text(length(find_all("a1b2c3", "[0-9]"))))', ['3'])
+    # whole match is returned even with groups
+    assert_output('print(find_all("ab12cd34", "[a-z]+[0-9]+"))', ['[ab12, cd34]'])
+
+
+def test_regex_capture():
+    # No groups → whole match as text.
+    assert_output('print(capture("hello world", "w[a-z]+"))', ['world'])
+    # With groups → list of group values.
+    assert_output('print(capture("2026-06-19", "([0-9]+)-([0-9]+)-([0-9]+)"))',
+                  ['[2026, 06, 19]'])
+    # No match → nothing.
+    assert_output('print(text(capture("zzz", "q+")))', ['nothing'])
+
+
+def test_regex_replace_re():
+    assert_output('print(replace_re("foo123bar", "[0-9]+", "#"))', ['foo#bar'])
+    # backreferences work
+    assert_output(r'print(replace_re("John Smith", "(\w+) (\w+)", "\2 \1"))',
+                  ['Smith John'])
+
+
+def test_regex_invalid_pattern_errors():
+    result, _ = run('print(matches("x", "[unterminated"))')
+    assert not result.success
+    assert any("invalid regex" in e.lower() for e in result.errors)
+
+
 # -- Soft keywords (HTTP server words are NOT reserved) --
 
 def test_soft_keyword_route_as_variable():
@@ -345,6 +390,21 @@ def test_soft_keyword_rate_limit_as_variable():
 
 def test_soft_keyword_per_as_variable():
     assert_output('let per be 2\nprint(per)', ['2'])
+
+def test_soft_keyword_static_as_variable():
+    assert_output('let static be 1\nprint(static)', ['1'])
+
+def test_soft_keyword_cors_as_variable():
+    assert_output('let cors be 2\nprint(cors)', ['2'])
+
+def test_soft_keyword_from_as_variable():
+    assert_output('let from be 3\nprint(from)', ['3'])
+
+def test_soft_keyword_describe_as_variable():
+    assert_output('let describe be 4\nprint(describe)', ['4'])
+
+def test_soft_keyword_private_as_variable():
+    assert_output('let private be 5\nprint(private)', ['5'])
 
 
 # -- Reserved (hard) keywords give a clear error --

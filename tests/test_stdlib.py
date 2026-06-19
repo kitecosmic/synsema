@@ -214,6 +214,75 @@ cron_cancel("ticker")
     engine.cron_scheduler.cancel_all()
 
 
+# ===== Time formatting (format_time / parse_time / date_parts) =====
+
+def test_format_time_default_iso():
+    engine = SyntecniaEngine()
+    result = engine.run_source('require time\nprint(format_time(0))')
+    assert result.success, f"Errors: {result.errors}"
+    assert result.output[0] == "1970-01-01T00:00:00Z"
+
+
+def test_format_time_with_pattern():
+    engine = SyntecniaEngine()
+    result = engine.run_source(
+        'require time\nprint(format_time(1781836890, "%Y-%m-%d %H:%M"))'
+    )
+    assert result.success, f"Errors: {result.errors}"
+    assert result.output[0] == "2026-06-19 02:41"
+
+
+def test_parse_time_roundtrip():
+    engine = SyntecniaEngine()
+    result = engine.run_source("""
+require time
+let t be 1781836890
+let back be parse_time(format_time(t))
+print(text(back == t))
+""")
+    assert result.success, f"Errors: {result.errors}"
+    assert result.output[0] == "true"
+
+
+def test_parse_time_iso_zero():
+    engine = SyntecniaEngine()
+    result = engine.run_source(
+        'require time\nprint(text(parse_time("1970-01-01T00:00:00Z") == 0))'
+    )
+    assert result.success, f"Errors: {result.errors}"
+    assert result.output[0] == "true"
+
+
+def test_date_parts():
+    engine = SyntecniaEngine()
+    result = engine.run_source("""
+require time
+let p be date_parts(0)
+print(text(year of p))
+print(text(month of p))
+print(text(day of p))
+""")
+    assert result.success, f"Errors: {result.errors}"
+    assert result.output == ["1970", "1", "1"]
+
+
+def test_time_builtins_require_time_capability():
+    """In secure mode, format_time/parse_time/date_parts need the time capability."""
+    from syntecnia.capabilities.model import Capability, CapabilityType
+    for call in ('format_time(0)', 'parse_time("1970-01-01T00:00:00Z")', 'date_parts(0)'):
+        engine = SyntecniaEngine(secure=True)
+        engine.capabilities.grant(Capability(CapabilityType.STDOUT))
+        result = engine.run_source(f'print({call})')
+        assert not result.success, f"{call} should require time"
+        assert any("time" in e.lower() and "capab" in e.lower() for e in result.errors)
+        # With the capability granted it works.
+        engine2 = SyntecniaEngine(secure=True)
+        engine2.capabilities.grant(Capability(CapabilityType.STDOUT))
+        engine2.capabilities.grant(Capability(CapabilityType.TIME))
+        result2 = engine2.run_source(f'print({call})')
+        assert result2.success, f"{call} with time cap: {result2.errors}"
+
+
 if __name__ == "__main__":
     test_functions = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = 0

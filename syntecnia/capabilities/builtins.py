@@ -21,6 +21,13 @@ from ..core.types import (
     syn_number, syn_text, syn_bool, syn_nothing, syn_list, syn_map,
     SynText, SynList, SynMap,
 )
+
+
+def _opt_pattern(args: List[SynValue]):
+    """Return the strftime/strptime pattern from a 2nd arg, or None if absent."""
+    if len(args) > 1 and isinstance(args[1].type, SynText):
+        return str(args[1].raw)
+    return None
 from .enforcer import SecureOperations
 
 
@@ -112,6 +119,56 @@ def register_secure_builtins(env, secure_ops: SecureOperations):
         _time.sleep(min(seconds, 3600))  # cap a single sleep at 1 hour
         return syn_nothing()
 
+    def _format_time(args: List[SynValue]) -> SynValue:
+        """
+        format_time(timestamp, pattern?) → text. Requires the time capability.
+
+        Default is ISO-8601 in UTC ("2026-06-19T02:41:30Z"). With a strftime
+        pattern the timestamp is formatted in UTC (format_time(t, "%Y-%m-%d")).
+        """
+        import datetime
+        secure_ops.require_time(source="format_time()")
+        ts = float(args[0].raw)
+        dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+        pattern = _opt_pattern(args)
+        if pattern is not None:
+            return syn_text(dt.strftime(pattern))
+        return syn_text(dt.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+    def _parse_time(args: List[SynValue]) -> SynValue:
+        """
+        parse_time(text, pattern?) → timestamp. Requires the time capability.
+
+        Inverse of format_time. Without a pattern, parses ISO-8601 (a trailing
+        'Z' is accepted); naive/pattern times are interpreted as UTC.
+        """
+        import datetime
+        secure_ops.require_time(source="parse_time()")
+        s = str(args[0].raw)
+        pattern = _opt_pattern(args)
+        if pattern is not None:
+            dt = datetime.datetime.strptime(s, pattern)
+        else:
+            dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return syn_number(dt.timestamp())
+
+    def _date_parts(args: List[SynValue]) -> SynValue:
+        """date_parts(timestamp) → {year, month, day, hour, minute, second} (UTC)."""
+        import datetime
+        secure_ops.require_time(source="date_parts()")
+        ts = float(args[0].raw)
+        dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+        return syn_map({
+            "year": syn_number(dt.year),
+            "month": syn_number(dt.month),
+            "day": syn_number(dt.day),
+            "hour": syn_number(dt.hour),
+            "minute": syn_number(dt.minute),
+            "second": syn_number(dt.second),
+        })
+
     def _random(args: List[SynValue]) -> SynValue:
         """random() → float between 0 and 1"""
         return syn_number(secure_ops.get_random(source="random()"))
@@ -136,6 +193,9 @@ def register_secure_builtins(env, secure_ops: SecureOperations):
         "get_env": BuiltinTask("get_env", _get_env, 1),
         "now": BuiltinTask("now", _now, 0),
         "sleep": BuiltinTask("sleep", _sleep, 1),
+        "format_time": BuiltinTask("format_time", _format_time, -1),
+        "parse_time": BuiltinTask("parse_time", _parse_time, -1),
+        "date_parts": BuiltinTask("date_parts", _date_parts, 1),
         "random": BuiltinTask("random", _random, 0),
         "random_int": BuiltinTask("random_int", _random_int, 2),
     }

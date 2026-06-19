@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Join the waitlist</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main>
+    <h1>Join the waitlist</h1>
+    <p>Served by Syntecnia <code>serve</code> — this page and the API share one origin.</p>
+    <form id="signup">
+      <input type="email" name="email" placeholder="you@example.com" required>
+      <button type="submit">Join</button>
+    </form>
+    <p id="msg"></p>
+  </main>
+
+  <script>
+    const form = document.getElementById("signup");
+    const msg = document.getElementById("msg");
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      msg.textContent = "…";
+      const email = form.email.value;
+      // Same-origin fetch — no CORS needed because the page is served by `static`.
+      const res = await fetch("/api/signup", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      const data = await res.json();
+      msg.textContent = res.ok
+        ? `You're in: ${data.email}`
+        : `Error: ${data.error}`;
+    });
+  </script>
+</body>
+</html>

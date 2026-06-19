@@ -9,7 +9,7 @@ Read ONLY the sections you need. Do not load everything.
 
 ## By topic
 - [stdlib.md](stdlib.md) — HTTP requests, SQL database, cron scheduler (zero dependencies)
-- [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination/paged(), streaming (SSE), rate limiting, body limits
+- [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination/paged(), streaming (SSE), rate limiting, body limits, HTML/SSR pages (`render`, `html`), static files, CORS, content negotiation (HTML/Markdown/JSON for agents), agent discoverability (`llms.txt`)
 - [capabilities.md](capabilities.md) — Security model, require, sandbox, intent
 - [agents.md](agents.md) — Multi-agent coordination, blackboard, swarm, signals
 - [llm.md](llm.md) — LLM operations: reason, decide, analyze, generate
@@ -34,6 +34,10 @@ Read ONLY the sections you need. Do not load everything.
 - Building an HTTP API / web server → serve.md
 - Streaming / Server-Sent Events → serve.md
 - Rate limiting / anti-abuse → serve.md
+- Serving HTML pages / server-side rendering (templates) → serve.md
+- Agent-readable content / content negotiation (HTML · Markdown · JSON) → serve.md
+- Static files (CSS/JS/images) → serve.md
+- Agent discoverability (llms.txt / robots.txt) → serve.md
 - Deploying to server → deploy.md
 - Adding security → capabilities.md
 - Multi-agent system → agents.md

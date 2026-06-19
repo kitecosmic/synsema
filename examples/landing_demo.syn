@@ -1,0 +1,25 @@
+-- Template SSR demo — a server-rendered landing page with render().
+-- Run with:  syntecnia run examples/landing_demo.syn   (then open http://localhost:8096)
+--
+-- render("home.html", data) fills the template's { ... } holes with Syntecnia
+-- expressions. Every value is AUTO-ESCAPED (XSS-safe); { raw } opts out.
+-- Flow control reuses each/when. CSS lives in a static file (braces!).
+
+intent: "Serve a server-rendered landing page"
+
+require serve(8096)
+
+task features()
+    give ["Zero dependencies", "Auto-escaped by default", "each / when in templates"]
+
+serve on 8096
+    static "/assets" from "./examples/public"   -- style.css (braces stay out of templates)
+
+    route "GET /"
+        give render("examples/templates/home.html", {
+            "title": "Syntecnia",
+            "tagline": "Server-rendered, <safe> by default",
+            "features": features(),
+            "highlighted": true,
+            "note": "<em>Templates auto-escape; this italic came through raw()</em>"
+        })

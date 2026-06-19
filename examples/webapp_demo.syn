@@ -1,0 +1,49 @@
+-- Web app demo — a real waitlist: static landing page + JSON API, one origin.
+-- Run with:  syntecnia run examples/webapp_demo.syn   (then open http://localhost:8090)
+--
+-- Shows the "serve web" features together:
+--   static "./examples/public"   → serves index.html / style.css (same-origin)
+--   html(...)                    → an HTML response (not JSON)
+--   matches(...)                 → regex email validation
+--   format_time(...)             → human-readable timestamps
+-- Because the page is served from the same origin as /api, the browser fetch
+-- needs no CORS. (Uncomment `cors "*"` below to call this API from another origin.)
+
+intent: "Serve a waitlist landing page and collect signups"
+
+require serve(8090)
+require db(":memory:")
+require time
+
+db_open(":memory:", "memory")
+sql_exec("CREATE TABLE signups (id INTEGER PRIMARY KEY, email TEXT, joined NUMBER)")
+
+-- Shape one DB row into the public view, with a readable join date.
+task present_signup(row)
+    give {
+        "email": email of row,
+        "joined_at": format_time(joined of row)
+    }
+
+serve on 8090
+    static "./examples/public"        -- "/" → public/index.html, plus style.css
+    -- cors "*"                        -- only needed for a different-origin caller
+
+    -- A small server-rendered HTML page (not JSON).
+    route "GET /about"
+        give html("<h1>Waitlist</h1><p>Join from the home page.</p>")
+
+    -- Collect a signup. Validates the email with a regex before storing it.
+    route "POST /api/signup"
+        expect body {email: text}
+        let email be email of (json of request)
+        -- matches is full-match, so an unanchored pattern is already safe.
+        when not matches(email, "[^@ ]+@[^@ ]+\.[^@ ]+")
+            give fail(422, "that doesn't look like an email")
+        sql_exec("INSERT INTO signups (email, joined) VALUES (?, ?)", [email, now()])
+        give created({"joined": true, "email": email})
+
+    -- List signups with a human-readable join date (UTC).
+    route "GET /api/signups"
+        let rows be sql("SELECT id, email, joined FROM signups ORDER BY id")
+        give apply(present_signup, rows)
