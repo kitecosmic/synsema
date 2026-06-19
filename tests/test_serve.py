@@ -1028,6 +1028,34 @@ def test_send_without_stream_sink_is_clear_error():
     assert any("send can only be used inside a stream" in e for e in result.errors)
 
 
+def test_handle_error_silences_client_disconnects():
+    """Connection resets are swallowed; genuine errors still print."""
+    import io
+    from syntecnia.stdlib.server import _QuietThreadingHTTPServer, _RequestHandler
+
+    srv = _QuietThreadingHTTPServer(("127.0.0.1", 0), _RequestHandler)
+    try:
+        # A connection error → quiet (nothing on stderr).
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            try:
+                raise ConnectionResetError("client gone")
+            except ConnectionResetError:
+                srv.handle_error(None, ("127.0.0.1", 1234))
+        assert buf.getvalue() == ""
+
+        # A real error → surfaced (traceback printed).
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            try:
+                raise ValueError("real bug")
+            except ValueError:
+                srv.handle_error(None, ("127.0.0.1", 1234))
+        assert "ValueError" in buf.getvalue()
+    finally:
+        srv.server_close()
+
+
 def test_parse_body_size_units():
     from syntecnia.stdlib.server import parse_body_size, MAX_BODY
     assert parse_body_size(None) == MAX_BODY

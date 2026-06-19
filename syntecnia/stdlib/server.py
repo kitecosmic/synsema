@@ -305,6 +305,26 @@ class RouteSpec:
     stream_handler: Callable[[Dict[str, Any], Callable], None] = None
 
 
+class _QuietThreadingHTTPServer(ThreadingHTTPServer):
+    """
+    ThreadingHTTPServer that stays quiet about client disconnects.
+
+    A client resetting the connection (RST / broken pipe) is routine — and with
+    SSE it happens on every EventSource/`curl -N` that closes — so socketserver's
+    default traceback is just noise that would bury real errors. We swallow only
+    the connection-error family; genuine bugs still print.
+    """
+
+    def handle_error(self, request, client_address):
+        import sys
+        import traceback
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionError, BrokenPipeError,
+                            ConnectionResetError, ConnectionAbortedError)):
+            return
+        traceback.print_exc()
+
+
 class ServeRuntime:
     """
     Owns the HTTP server for one `serve on PORT` block.
@@ -486,7 +506,7 @@ class ServeRuntime:
     # -- lifecycle --
 
     def start(self, background: bool = True):
-        self.httpd = ThreadingHTTPServer((self.host, self.port), _RequestHandler)
+        self.httpd = _QuietThreadingHTTPServer((self.host, self.port), _RequestHandler)
         self.httpd.runtime = self  # type: ignore[attr-defined]
         if background:
             self.thread = threading.Thread(
