@@ -51,6 +51,10 @@ let products be sql("SELECT * FROM products WHERE price > ?", [100])
 each p in products
     print(name of p + ": $" + text(price of p))
 
+-- Paginated query for HTTP routes (see serve.md): SQL LIMIT/OFFSET pushdown
+-- with an exact COUNT(*) total. Use only with `give` in a route handler.
+give paged("SELECT * FROM products ORDER BY id")
+
 -- Batch insert
 sql_batch("INSERT INTO logs VALUES (?)", [["event1"], ["event2"], ["event3"]])
 

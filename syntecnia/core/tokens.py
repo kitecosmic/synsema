@@ -92,6 +92,24 @@ class TokenType(Enum):
     TRY = auto()             # try block
     RECOVER = auto()         # catch/recover block
 
+    # -- HTTP server SOFT keywords --
+    # These are NOT in KEYWORDS: the lexer emits them as IDENTIFIER and the
+    # parser recognizes them only at the start of their construction (serve on
+    # N, route "...", requires auth, expect body {...}) via fixed lookahead.
+    # The enum members are kept as documentation of the reserved-by-context set.
+    SERVE = auto()           # serve on PORT — start an HTTP server
+    ON = auto()              # serve on PORT
+    ROUTE = auto()           # route "GET /path" — define a route
+    AUTH = auto()            # auth with <task> / requires auth
+    REQUIRES = auto()        # route ... requires auth
+    EXPECT = auto()          # expect body {field: type} — input validation
+    MAX_BODY = auto()        # max_body "10mb" — request body size limit
+    STREAM = auto()          # stream block — Server-Sent Events response
+    SEND = auto()            # send <value> [as "event"] — emit an SSE event
+    MAX_STREAMS = auto()     # max_streams N — concurrent stream cap
+    RATE_LIMIT = auto()      # rate_limit N per <window> — request rate limit
+    PER = auto()             # rate_limit N per minute
+
     # -- Observability keywords --
     TRACE = auto()           # tracing block
     LOG = auto()             # log emission
@@ -208,6 +226,13 @@ KEYWORDS = {
     # Error handling
     "try": TokenType.TRY,
     "recover": TokenType.RECOVER,
+
+    # NOTE: the HTTP-server words (serve, on, route, auth, requires, expect)
+    # are intentionally NOT reserved. They are *soft keywords*: the parser
+    # recognizes them only at the start of their construction (serve on N,
+    # route "...", requires auth, expect body {...}) via fixed lookahead.
+    # Everywhere else they are ordinary identifiers, so `let route be "/x"`
+    # and `task auth(x)` are valid.
 
     # Literals
     "true": TokenType.BOOL_TRUE,

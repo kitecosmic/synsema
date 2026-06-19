@@ -24,7 +24,7 @@ for expressions. Syntecnia's grammar is designed to be flat and readable:
 """
 
 from typing import List, Optional, Dict
-from .tokens import Token, TokenType, SourceLocation
+from .tokens import Token, TokenType, SourceLocation, KEYWORDS
 from .lexer import Lexer
 from . import ast_nodes as ast
 
@@ -48,6 +48,7 @@ class Parser:
         self.tokens = tokens
         self.filename = filename
         self.pos = 0
+        self._stream_depth = 0  # >0 while parsing inside a `stream` block
 
     def _current(self) -> Token:
         if self.pos < len(self.tokens):
@@ -83,6 +84,46 @@ class Parser:
     def _check(self, *types: TokenType) -> bool:
         return self._current().type in types
 
+    def _check_word(self, word: str) -> bool:
+        """True if the current token is an identifier with this exact text.
+
+        Used for *soft keywords* (serve, on, route, auth, requires, expect):
+        words that are special only inside their construction and ordinary
+        identifiers everywhere else.
+        """
+        tok = self._current()
+        return tok.type == TokenType.IDENTIFIER and tok.value == word
+
+    def _peek_word(self, offset: int, word: str) -> bool:
+        """True if the token at `offset` is an identifier with this exact text."""
+        tok = self._peek(offset)
+        return tok.type == TokenType.IDENTIFIER and tok.value == word
+
+    def _expect_word(self, word: str, message: str = "") -> Token:
+        """Consume a soft keyword by its text, with a clear error otherwise."""
+        if self._check_word(word):
+            return self._advance()
+        msg = message or f"Expected '{word}'"
+        raise ParseError(msg, self._current().location)
+
+    def _expect_name(self, what: str = "name") -> Token:
+        """
+        Expect an identifier to be used as a name (variable, task, param, ...).
+
+        If the token is a reserved (hard) keyword, raise a clear error saying
+        so instead of a confusing 'expected name' message.
+        """
+        tok = self._current()
+        if tok.type == TokenType.IDENTIFIER:
+            return self._advance()
+        if tok.raw in KEYWORDS:
+            raise ParseError(
+                f"'{tok.raw}' is a reserved word in Syntecnia; choose another "
+                f"name for the {what}",
+                tok.location,
+            )
+        raise ParseError(f"Expected {what}, got {tok.type.name}", tok.location)
+
     def _skip_newlines(self):
         while self._current().type == TokenType.NEWLINE:
             self._advance()
@@ -117,6 +158,23 @@ class Parser:
         self._skip_newlines()
         if self._at_end():
             return None
+
+        # Soft keywords: recognized only at the start of their construction,
+        # via fixed lookahead. Everywhere else they are plain identifiers.
+        if self._stream_depth > 0 and self._check_word("send"):
+            return self._parse_send()
+        if (self._check_word("stream")
+                and self._peek(1).type == TokenType.NEWLINE
+                and self._peek(2).type == TokenType.INDENT):
+            return self._parse_stream()
+        if self._check_word("rate_limit") and (
+                self._peek(1).type == TokenType.NUMBER
+                or self._peek_word(1, "none") or self._peek_word(1, "unlimited")):
+            return self._parse_rate_limit()
+        if self._check_word("serve") and self._peek_word(1, "on"):
+            return self._parse_serve()
+        if self._check_word("expect") and self._peek_word(1, "body"):
+            return self._parse_expect()
 
         tt = self._current().type
 
@@ -204,7 +262,7 @@ class Parser:
         """let name be expression"""
         loc = self._location()
         self._advance()  # consume 'let'
-        name_tok = self._expect(TokenType.IDENTIFIER, "Expected variable name after 'let'")
+        name_tok = self._expect_name("variable after 'let'")
         self._expect(TokenType.BE, "Expected 'be' after variable name in let binding")
         value = self._parse_expression()
         return ast.LetBinding(location=loc, name=name_tok.value, value=value)
@@ -252,7 +310,7 @@ class Parser:
         """each item in collection\n    body"""
         loc = self._location()
         self._advance()  # consume 'each'
-        var_tok = self._expect(TokenType.IDENTIFIER, "Expected variable after 'each'")
+        var_tok = self._expect_name("loop variable after 'each'")
         self._expect(TokenType.IN, "Expected 'in' after variable in each loop")
         collection = self._parse_expression()
         body = self._parse_block()
@@ -301,14 +359,14 @@ class Parser:
         """task name(params)\n    body"""
         loc = self._location()
         self._advance()  # consume 'task'
-        name_tok = self._expect(TokenType.IDENTIFIER, "Expected task name")
+        name_tok = self._expect_name("task name")
         params = []
 
         if self._match(TokenType.LPAREN):
             if not self._check(TokenType.RPAREN):
-                params.append(self._expect(TokenType.IDENTIFIER).value)
+                params.append(self._expect_name("parameter name").value)
                 while self._match(TokenType.COMMA):
-                    params.append(self._expect(TokenType.IDENTIFIER).value)
+                    params.append(self._expect_name("parameter name").value)
             self._expect(TokenType.RPAREN)
 
         body = self._parse_block()
@@ -339,14 +397,14 @@ class Parser:
         """type Name\n    field: type"""
         loc = self._location()
         self._advance()  # consume 'type'
-        name_tok = self._expect(TokenType.IDENTIFIER)
+        name_tok = self._expect_name("type name")
         self._skip_newlines()
         self._expect(TokenType.INDENT)
         fields = []
 
         self._skip_newlines()
         while not self._check(TokenType.DEDENT, TokenType.EOF):
-            field_name = self._expect(TokenType.IDENTIFIER).value
+            field_name = self._expect_name("field name").value
             self._expect(TokenType.COLON)
             type_name = self._expect(TokenType.IDENTIFIER).value
             fields.append((field_name, type_name))
@@ -541,6 +599,182 @@ class Parser:
         self._advance()
         name_tok = self._expect(TokenType.TEXT)
         return ast.CheckpointStatement(location=loc, name=name_tok.value)
+
+    # -- HTTP server --
+
+    def _parse_serve(self) -> ast.ServeBlock:
+        """
+        serve on PORT
+            auth with <task>          (optional)
+            route "GET /path" [requires auth]
+                body...
+        """
+        loc = self._location()
+        self._advance()  # consume soft keyword 'serve'
+        self._expect_word("on", "Expected 'on' after 'serve' (serve on PORT)")
+        port = self._parse_expression()
+
+        auth_handler = None
+        max_body = None
+        max_streams = None
+        rate_limit = None
+        routes = []
+
+        self._skip_newlines()
+        self._expect(TokenType.INDENT, "Expected an indented block after 'serve on PORT'")
+        self._skip_newlines()
+
+        while not self._at_end() and not self._check(TokenType.DEDENT):
+            if self._check_word("auth"):
+                self._advance()  # consume soft keyword 'auth'
+                self._expect(TokenType.WITH, "Expected 'with' after 'auth' (auth with <task>)")
+                auth_handler = self._parse_expression()
+            elif self._check_word("max_body"):
+                self._advance()  # consume soft keyword 'max_body'
+                max_body = self._parse_expression()
+            elif self._check_word("max_streams"):
+                self._advance()  # consume soft keyword 'max_streams'
+                max_streams = self._parse_expression()
+            elif self._check_word("rate_limit"):
+                rate_limit = self._parse_rate_limit()
+            elif self._check_word("route"):
+                routes.append(self._parse_route())
+            else:
+                tok = self._current()
+                raise ParseError(
+                    f"Inside 'serve', expected 'auth with ...' or 'route ...', "
+                    f"got {tok.type.name}",
+                    tok.location,
+                )
+            self._skip_newlines()
+
+        if self._check(TokenType.DEDENT):
+            self._advance()
+
+        # A route that 'requires auth' needs an 'auth with <task>' on the block.
+        if auth_handler is None:
+            for r in routes:
+                if r.requires_auth:
+                    raise ParseError(
+                        f"route \"{r.method} {r.path}\" uses 'requires auth' but the "
+                        f"'serve' block declares no 'auth with <task>'",
+                        r.location,
+                    )
+
+        return ast.ServeBlock(
+            location=loc, port=port, auth_handler=auth_handler,
+            max_body=max_body, max_streams=max_streams,
+            rate_limit=rate_limit, routes=routes,
+        )
+
+    def _parse_route(self) -> ast.RouteDefinition:
+        """route "METHOD /path/:param" [requires auth]\n    body"""
+        loc = self._location()
+        self._advance()  # consume soft keyword 'route'
+        spec_tok = self._expect(TokenType.TEXT, "Expected a route spec string, e.g. \"GET /path\"")
+        method, path, param_names = self._split_route_spec(spec_tok.value, spec_tok.location)
+
+        requires_auth = False
+        if self._check_word("requires"):
+            self._advance()  # consume soft keyword 'requires'
+            self._expect_word("auth", "Expected 'auth' after 'requires' (requires auth)")
+            requires_auth = True
+
+        body = self._parse_block()
+        # A `rate_limit` declared inside the route body is a route-level override.
+        rate_limit = None
+        clean_body = []
+        for s in body:
+            if isinstance(s, ast.RateLimitClause):
+                rate_limit = s
+            else:
+                clean_body.append(s)
+        body = clean_body
+        streaming = any(isinstance(s, ast.StreamBlock) for s in body)
+        return ast.RouteDefinition(
+            location=loc, method=method, path=path,
+            param_names=param_names, requires_auth=requires_auth,
+            streaming=streaming, rate_limit=rate_limit, body=body,
+        )
+
+    def _parse_rate_limit(self) -> ast.RateLimitClause:
+        """rate_limit N per <second|minute|hour>  |  rate_limit none|unlimited"""
+        loc = self._location()
+        self._advance()  # consume soft keyword 'rate_limit'
+        if self._check_word("none") or self._check_word("unlimited"):
+            self._advance()
+            return ast.RateLimitClause(location=loc, unlimited=True)
+        count = self._parse_expression()
+        self._expect_word("per", "Expected 'per' in rate_limit (e.g. rate_limit 100 per minute)")
+        window_tok = self._expect(TokenType.IDENTIFIER, "Expected a window: second, minute, or hour")
+        window = window_tok.value
+        if window not in ("second", "minute", "hour"):
+            raise ParseError(
+                f"rate_limit window must be second, minute, or hour, got {window!r}",
+                window_tok.location,
+            )
+        return ast.RateLimitClause(location=loc, count=count, window=window)
+
+    def _parse_stream(self) -> ast.StreamBlock:
+        """stream\n    send ...  — an SSE response block."""
+        loc = self._location()
+        self._advance()  # consume soft keyword 'stream'
+        self._stream_depth += 1
+        try:
+            body = self._parse_block()
+        finally:
+            self._stream_depth -= 1
+        return ast.StreamBlock(location=loc, body=body)
+
+    def _parse_send(self) -> ast.SendStatement:
+        """send <value> [as "event"]"""
+        loc = self._location()
+        self._advance()  # consume soft keyword 'send'
+        value = self._parse_expression()
+        event_name = None
+        if self._match(TokenType.AS):
+            ev_tok = self._expect(TokenType.TEXT, "Expected an event name string after 'as'")
+            event_name = ev_tok.value
+        return ast.SendStatement(location=loc, value=value, event_name=event_name)
+
+    def _split_route_spec(self, spec: str, loc) -> tuple:
+        """Parse 'GET /products/:id' → ('GET', '/products/:id', ['id'])."""
+        parts = spec.strip().split(None, 1)
+        if len(parts) != 2:
+            raise ParseError(
+                f"Route spec must be \"METHOD /path\", got {spec!r}", loc,
+            )
+        method = parts[0].upper()
+        path = parts[1].strip()
+        if not path.startswith("/"):
+            raise ParseError(f"Route path must start with '/', got {path!r}", loc)
+        param_names = [
+            seg[1:] for seg in path.split("/")
+            if seg.startswith(":") and len(seg) > 1
+        ]
+        return method, path, param_names
+
+    def _parse_expect(self) -> ast.ExpectStatement:
+        """expect body {field: type, ...}"""
+        loc = self._location()
+        self._advance()  # consume soft keyword 'expect'
+        target_tok = self._expect_word("body", "Expected 'body' after 'expect'")
+        self._expect(TokenType.LBRACE, "Expected '{' to declare the expected shape")
+        shape = []
+        if not self._check(TokenType.RBRACE):
+            shape.append(self._parse_expect_field())
+            while self._match(TokenType.COMMA):
+                if self._check(TokenType.RBRACE):
+                    break
+                shape.append(self._parse_expect_field())
+        self._expect(TokenType.RBRACE, "Expected '}' to close the expected shape")
+        return ast.ExpectStatement(location=loc, target=target_tok.value, shape=shape)
+
+    def _parse_expect_field(self) -> tuple:
+        field_tok = self._expect(TokenType.IDENTIFIER, "Expected a field name in expect shape")
+        self._expect(TokenType.COLON, "Expected ':' after field name in expect shape")
+        type_tok = self._expect(TokenType.IDENTIFIER, "Expected a type name (text, number, bool, list, map)")
+        return (field_tok.value, type_tok.value)
 
     # =========================================================
     # Expressions (Pratt parser)

@@ -20,7 +20,7 @@ from ..core.lexer import Lexer, LexerError
 from ..core.parser import Parser, ParseError
 from ..core.interpreter import Interpreter, RuntimeError as SynRuntimeError
 from ..core import ast_nodes as ast
-from ..core.types import SynValue, syn_nothing
+from ..core.types import SynValue, syn_nothing, syn_text, syn_map
 from ..capabilities.model import (
     CapabilitySet, Capability, CapabilityType, CapabilityViolation,
     parse_capability,
@@ -40,6 +40,9 @@ from ..agents.builtins import register_agent_builtins
 from ..stdlib.http import register_http_builtins
 from ..stdlib.database import DatabaseManager, register_database_builtins
 from ..stdlib.cron import CronScheduler, register_cron_builtins
+from ..stdlib.server import (
+    register_serve_builtins, RouteSpec, ServeRuntime, python_to_syn,
+)
 from .persistence import StatePersistence
 
 
@@ -136,6 +139,10 @@ class SyntecniaEngine:
         # State persistence (survives restarts)
         self.persistence: Optional[StatePersistence] = None
 
+        # HTTP servers started by `serve on PORT`
+        self.servers: List[ServeRuntime] = []
+        self.interpreter._serve_callback = self._run_serve
+
         # Register secure builtins (fetch, read_file, etc.)
         register_secure_builtins(self.interpreter.global_env, self.secure_ops)
 
@@ -151,10 +158,257 @@ class SyntecniaEngine:
         register_database_builtins(self.interpreter.global_env, self.db_manager)
         register_cron_builtins(self.interpreter.global_env, self.cron_scheduler, self.interpreter)
 
+        # Register HTTP server response helpers (ok, created, not_found, fail)
+        register_serve_builtins(self.interpreter.global_env)
+
         # Wire up callbacks
         self.interpreter.output_callback = self._on_output
         self.interpreter.llm_callback = self._on_llm
         self.interpreter.human_callback = self._on_human
+
+    # =========================================================
+    # HTTP server (serve on PORT)
+    # =========================================================
+
+    def _make_request_interpreter(self) -> Interpreter:
+        """
+        Build a fresh, isolated interpreter for a single HTTP request.
+
+        Each request gets its own interpreter/scope (its own logs, trace and
+        variable bindings) — exactly like a spawned agent. The only shared
+        state is the blackboard (via the swarm) and the database (the sql()
+        builtins close over the shared DatabaseManager). Tasks and builtins
+        defined by the program are reachable because handlers execute with the
+        program's global environment as their parent scope.
+        """
+        ri = Interpreter()
+        ri.output_callback = self._on_output
+        ri.llm_callback = self._on_llm
+        ri.human_callback = self._on_human
+        ri.intent_enforcer = self.intent_enforcer
+        ri._intent_frozen = True
+
+        swarm = self.swarm
+        ri._swarm_share = lambda k, v: swarm.blackboard.write(k, v, agent="request")
+        ri._swarm_observe = lambda k: swarm.blackboard.read(k, agent="request")
+        ri._swarm_signal = lambda name, data: swarm.signal(name, "request", data)
+
+        def request_wait_for(name, timeout=30):
+            sig = swarm.wait_for_signal(name, timeout=timeout)
+            if sig and sig.data:
+                return sig.data
+            return None
+
+        ri._swarm_wait_for = request_wait_for
+        return ri
+
+    def _run_serve(self, node, env, port: SynValue) -> SynValue:
+        """
+        Start an HTTP server for a `serve on PORT` block.
+
+        Enforces the SERVE capability (scoped to the port), then builds the
+        route table with per-request isolated handlers and starts a threaded
+        server in the background. Returns immediately; the CLI keeps the
+        process alive while servers are running.
+        """
+        from ..core.interpreter import Environment, GiveSignal
+        from ..core.types import SynNumber, BuiltinTask, SynTask
+        from ..stdlib.server import parse_body_size
+
+        # Resolve the port to an integer.
+        try:
+            port_num = int(float(port.raw))
+        except (TypeError, ValueError):
+            raise SynRuntimeError(f"serve port must be a number, got {port}", node.location)
+        port_str = str(port_num)
+
+        # Capability check — scoped to the exact port.
+        cap = Capability(CapabilityType.SERVE, port_str)
+        if not self.capabilities.check(cap, source=f"serve on {port_str}"):
+            raise CapabilityViolation(
+                f"serve on {port_str} is not permitted: missing capability "
+                f"serve({port_str}). Add `require serve({port_str})` at the top "
+                f"of your program.",
+                requested=cap, source=f"serve on {port_str}",
+            )
+
+        serve_env = env
+
+        # Resolve the auth task once (if declared).
+        auth_value = None
+        if node.auth_handler is not None:
+            auth_value = self.interpreter._exec(node.auth_handler, serve_env)
+
+        # Resolve the max-body limit once (bytes, or None for unlimited).
+        if node.max_body is not None:
+            max_body_val = self.interpreter._exec(node.max_body, serve_env)
+            raw = max_body_val.raw if isinstance(max_body_val.type, SynNumber) else str(max_body_val)
+            max_body = parse_body_size(raw)
+        else:
+            max_body = parse_body_size(None)
+
+        # Resolve the concurrent-stream cap once.
+        from ..stdlib.server import DEFAULT_MAX_STREAMS
+        max_streams = DEFAULT_MAX_STREAMS
+        if node.max_streams is not None:
+            ms_val = self.interpreter._exec(node.max_streams, serve_env)
+            try:
+                max_streams = int(ms_val.raw) if isinstance(ms_val.type, SynNumber) else int(str(ms_val))
+            except (TypeError, ValueError):
+                max_streams = DEFAULT_MAX_STREAMS
+            if max_streams <= 0:
+                max_streams = DEFAULT_MAX_STREAMS
+
+        # Resolve rate limits. Each clause → ("unlimited", None) | (capacity, secs) | None.
+        _WINDOW_SECONDS = {"second": 1.0, "minute": 60.0, "hour": 3600.0}
+
+        def _resolve_rate(clause):
+            if clause is None:
+                return None
+            if clause.unlimited:
+                return ("unlimited", None)
+            cap = int(self.interpreter._exec(clause.count, serve_env).raw)
+            secs = _WINDOW_SECONDS.get(clause.window, 60.0)
+            return (cap, secs)
+
+        block_rate = _resolve_rate(node.rate_limit)
+        block_limit = block_rate if (block_rate and block_rate[0] != "unlimited") else None
+
+        def _route_rate(r):
+            """Return (effective_limit_or_None, zone_or_None) for a route."""
+            rc = _resolve_rate(r.rate_limit)
+            if rc is None:                      # not declared → inherit block default
+                if block_limit:
+                    return block_limit, "__default__"
+                return None, None
+            if rc[0] == "unlimited":            # explicitly disabled on this route
+                return None, None
+            return rc, f"route:{r.method} {r.path}"
+
+        def _str_map(d: dict) -> SynValue:
+            return syn_map({k: syn_text(str(v)) for k, v in d.items()})
+
+        def _build_request(ctx: dict) -> SynValue:
+            body_file = ctx.get("body_file")
+            return syn_map({
+                "method": syn_text(ctx["method"]),
+                "path": syn_text(ctx["path"]),
+                "body": syn_text(ctx["body"]),
+                "body_file": syn_text(body_file) if body_file else syn_nothing(),
+                "json": python_to_syn(ctx["json"]),
+                "headers": _str_map(ctx["headers"]),
+                "query": _str_map(ctx["query"]),
+                "params": _str_map(ctx["params"]),
+                "ip": syn_text(ctx.get("client_ip") or ""),
+                "user": ctx["user"] if ctx["user"] is not None else syn_nothing(),
+            })
+
+        def _make_read_body(ctx: dict) -> SynValue:
+            """Per-request builtin: read the full body (memory or temp file)."""
+            def _read_body(args):
+                bf = ctx.get("body_file")
+                if bf:
+                    try:
+                        with open(bf, "r", encoding="utf-8", errors="replace") as f:
+                            return syn_text(f.read())
+                    except OSError:
+                        return syn_text("")
+                return syn_text(ctx.get("body") or "")
+            return SynValue(raw=BuiltinTask("read_body", _read_body, 0), type=SynTask())
+
+        def _make_request_env(ri, route_node, ctx):
+            req_env = Environment(
+                parent=serve_env,
+                name=f"request:{route_node.method} {route_node.path}",
+            )
+            req_env.set("request", _build_request(ctx))
+            req_env.set("query", _str_map(ctx["query"]))
+            req_env.set("params", _str_map(ctx["params"]))
+            req_env.set("read_body", _make_read_body(ctx))
+            return req_env
+
+        def _make_handler(route_node):
+            def handler(ctx: dict) -> SynValue:
+                ri = self._make_request_interpreter()
+                req_env = _make_request_env(ri, route_node, ctx)
+                try:
+                    ri._exec_block(route_node.body, req_env)
+                    return syn_nothing()
+                except GiveSignal as g:
+                    return g.value
+            return handler
+
+        def _make_stream_handler(route_node):
+            def stream_handler(ctx: dict, emit):
+                # Each stream runs in its own isolated interpreter/scope.
+                ri = self._make_request_interpreter()
+                ri._stream_emit = emit  # wire `send` to this connection's sink
+                req_env = _make_request_env(ri, route_node, ctx)
+                try:
+                    ri._exec_block(route_node.body, req_env)
+                except GiveSignal:
+                    pass  # a give inside a stream route just ends the stream
+            return stream_handler
+
+        def _auth_runner(token: str):
+            if auth_value is None:
+                return None
+            ri = self._make_request_interpreter()
+            try:
+                return ri._call_value(auth_value, [syn_text(token)], node.location)
+            except GiveSignal as g:
+                return g.value
+            except Exception:
+                # Any error inside the auth task is treated as "not authorized".
+                return None
+
+        routes = []
+        for r in node.routes:
+            eff_rate, zone = _route_rate(r)
+            routes.append(RouteSpec(
+                method=r.method, path=r.path, param_names=r.param_names,
+                requires_auth=r.requires_auth,
+                handler=_make_handler(r),
+                streaming=r.streaming,
+                stream_handler=_make_stream_handler(r) if r.streaming else None,
+                rate_limit=eff_rate, rate_zone=zone,
+            ))
+
+        runtime = ServeRuntime(
+            port_num, routes, auth_handler=_auth_runner,
+            max_body=max_body, max_streams=max_streams,
+        )
+        try:
+            runtime.start(background=True)
+        except OSError as e:
+            raise SynRuntimeError(
+                f"could not start server on port {port_str}: {e}", node.location,
+            )
+
+        self.servers.append(runtime)
+        self._on_output(
+            f"Serving HTTP on port {port_str} ({len(routes)} route(s))"
+        )
+        return syn_text(f"serving:{port_str}")
+
+    def shutdown_servers(self):
+        """Stop all running HTTP servers."""
+        for server in self.servers:
+            try:
+                server.stop()
+            except Exception:
+                pass
+        self.servers = []
+
+    def wait_servers(self):
+        """Block until interrupted while servers are running (for the CLI)."""
+        try:
+            while self.servers:
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.shutdown_servers()
 
     def _wire_swarm(self):
         """Connect the interpreter to the real swarm for agent operations."""

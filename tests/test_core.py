@@ -305,6 +305,61 @@ def test_builtin_type_of():
     assert_output('print(type_of([1]))', ['list'])
 
 
+# -- Soft keywords (HTTP server words are NOT reserved) --
+
+def test_soft_keyword_route_as_variable():
+    assert_output('let route be "/x"\nprint(route)', ['/x'])
+
+def test_soft_keyword_auth_as_variable():
+    assert_output('let auth be "tok"\nprint(auth)', ['tok'])
+
+def test_soft_keyword_on_as_variable():
+    assert_output('let on be true\nprint(on)', ['true'])
+
+def test_soft_keyword_expect_as_variable():
+    assert_output('let expect be 5\nprint(expect)', ['5'])
+
+def test_soft_keyword_serve_as_variable():
+    assert_output('let serve be 9\nprint(serve)', ['9'])
+
+def test_soft_keyword_requires_as_variable():
+    assert_output('let requires be "yes"\nprint(requires)', ['yes'])
+
+def test_soft_keyword_auth_as_task_name():
+    assert_output('task auth(x)\n    give x\nprint(auth(7))', ['7'])
+
+def test_soft_keyword_as_property_key():
+    assert_output('let m be {"auth": 1, "route": 2}\nprint(m.auth)\nprint(m.route)', ['1', '2'])
+
+def test_soft_keyword_send_as_variable():
+    assert_output('let send be 1\nprint(send)', ['1'])
+
+def test_soft_keyword_stream_as_variable():
+    assert_output('let stream be 2\nprint(stream)', ['2'])
+
+def test_soft_keyword_max_streams_as_variable():
+    assert_output('let max_streams be 3\nprint(max_streams)', ['3'])
+
+def test_soft_keyword_rate_limit_as_variable():
+    assert_output('let rate_limit be 1\nprint(rate_limit)', ['1'])
+
+def test_soft_keyword_per_as_variable():
+    assert_output('let per be 2\nprint(per)', ['2'])
+
+
+# -- Reserved (hard) keywords give a clear error --
+
+def test_reserved_word_as_variable_clear_error():
+    result, _ = run('let task be 1')
+    assert not result.success
+    assert any("reserved word" in e for e in result.errors)
+
+def test_reserved_word_as_task_name_clear_error():
+    result, _ = run('task while(x)\n    give x')
+    assert not result.success
+    assert any("reserved word" in e for e in result.errors)
+
+
 # -- Run all tests --
 
 if __name__ == "__main__":

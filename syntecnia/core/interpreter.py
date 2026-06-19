@@ -47,6 +47,18 @@ class ApprovalRequired(Exception):
         super().__init__(f"Approval required: {message}")
 
 
+class ExpectViolation(Exception):
+    """
+    Raised when an `expect body {...}` validation fails inside an HTTP handler.
+    The serve runtime catches this and returns a 400 response with `field`
+    naming the offending field. It is NOT a server crash.
+    """
+    def __init__(self, message: str, field: str = "", expected: str = ""):
+        self.field = field
+        self.expected = expected
+        super().__init__(message)
+
+
 class Environment:
     """
     Variable scope with parent chain.
@@ -128,6 +140,9 @@ class Interpreter:
         # Intent enforcement
         self.intent_enforcer = None  # set by engine
         self._intent_frozen = False
+
+        # SSE streaming sink (set by the server for streaming routes)
+        self._stream_emit = None
 
         self._register_builtins()
         self._register_intentional_ops()
@@ -967,3 +982,92 @@ class Interpreter:
                 "variable": node.error_variable,
             })
             return self._exec_block(node.recover_body, recover_env)
+
+    # -- HTTP server --
+
+    def _exec_ServeBlock(self, node: ast.ServeBlock, env: Environment) -> SynValue:
+        """
+        Start an HTTP server. The actual server is implemented by the engine
+        (it owns the capability set, blackboard and per-request interpreters),
+        wired in via `self._serve_callback`. Without the full engine, serving
+        is unavailable.
+        """
+        if not getattr(self, "_serve_callback", None):
+            raise RuntimeError(
+                "serve is only available through the Syntecnia engine runtime",
+                node.location,
+            )
+        port = self._exec(node.port, env)
+        self.logs.append({"type": "serve", "port": str(port)})
+        return self._serve_callback(node, env, port)
+
+    def _exec_RateLimitClause(self, node: ast.RateLimitClause, env: Environment) -> SynValue:
+        """A rate_limit declaration is consumed by the serve runtime, not executed.
+
+        It only reaches here if used outside a serve block / route (a no-op).
+        """
+        return syn_nothing()
+
+    def _exec_StreamBlock(self, node: ast.StreamBlock, env: Environment) -> SynValue:
+        """Run a stream block. Events are emitted by `send` via the sink."""
+        return self._exec_block(node.body, env)
+
+    def _exec_SendStatement(self, node: ast.SendStatement, env: Environment) -> SynValue:
+        """Emit one SSE event through the streaming sink wired by the server."""
+        value = self._exec(node.value, env)
+        emit = getattr(self, "_stream_emit", None)
+        if emit is None:
+            raise RuntimeError(
+                "send can only be used inside a stream route handler",
+                node.location,
+            )
+        emit(value, node.event_name)
+        return syn_nothing()
+
+    def _exec_ExpectStatement(self, node: ast.ExpectStatement, env: Environment) -> SynValue:
+        """
+        Validate request.<target> (the parsed JSON body) against a declared
+        shape. Raises ExpectViolation (→ 400) on the first mismatch.
+        """
+        type_map = {
+            "text": SynText,
+            "number": SynNumber,
+            "bool": SynBool,
+            "list": SynList,
+            "map": SynMap,
+        }
+        try:
+            request = env.get("request")
+        except RuntimeError:
+            raise ExpectViolation(
+                "expect can only be used inside an HTTP route handler"
+            )
+        # The validated data is the request's parsed JSON body.
+        data = None
+        if isinstance(request.type, SynMap):
+            data = request.raw.get("json")
+        if data is None or not isinstance(data.type, SynMap):
+            raise ExpectViolation(
+                "request body is not a JSON object", expected="map"
+            )
+        for field_name, type_name in node.shape:
+            expected_type = type_map.get(type_name)
+            if expected_type is None:
+                raise ExpectViolation(
+                    f"unknown type '{type_name}' for field '{field_name}' "
+                    f"(use: text, number, bool, list, map)",
+                    field=field_name, expected=type_name,
+                )
+            if field_name not in data.raw:
+                raise ExpectViolation(
+                    f"missing required field '{field_name}' (expected {type_name})",
+                    field=field_name, expected=type_name,
+                )
+            actual = data.raw[field_name]
+            if not isinstance(actual.type, expected_type):
+                raise ExpectViolation(
+                    f"field '{field_name}' must be {type_name}, "
+                    f"got {actual.type.name}",
+                    field=field_name, expected=type_name,
+                )
+        return syn_nothing()

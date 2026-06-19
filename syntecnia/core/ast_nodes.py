@@ -410,3 +410,72 @@ class TryRecover(Node):
     try_body: List[Node] = field(default_factory=list)
     error_variable: str = "error"  # variable name for the error
     recover_body: List[Node] = field(default_factory=list)
+
+
+# -- HTTP Server --
+
+@dataclass
+class RouteDefinition(Node):
+    """
+    route "GET /products/:id" requires auth
+        let p be find_product(params.id)
+        give p
+    """
+    method: str = "GET"
+    path: str = "/"                      # pattern, may contain :params
+    param_names: List[str] = field(default_factory=list)  # named path params
+    requires_auth: bool = False
+    streaming: bool = False              # True when the body streams (SSE) instead of give
+    rate_limit: Optional['RateLimitClause'] = None  # per-route override
+    body: List[Node] = field(default_factory=list)
+
+@dataclass
+class StreamBlock(Node):
+    """
+    stream
+        each tick in range(10)
+            send {"count": tick}
+    A route body that emits Server-Sent Events over time instead of one give.
+    """
+    body: List[Node] = field(default_factory=list)
+
+@dataclass
+class SendStatement(Node):
+    """send <value> [as "event"] — emit one SSE event inside a stream block."""
+    value: Node = None
+    event_name: Optional[str] = None
+
+@dataclass
+class RateLimitClause(Node):
+    """
+    rate_limit 100 per minute   — a request rate limit (token bucket).
+    rate_limit none             — disable an inherited default (unlimited=True).
+    Declared on a serve block (default) or a route (override).
+    """
+    count: Optional[Node] = None         # expression → tokens per window
+    window: str = "minute"               # second | minute | hour
+    unlimited: bool = False              # `rate_limit none` / `unlimited`
+
+@dataclass
+class ServeBlock(Node):
+    """
+    serve on 8080
+        auth with check_token
+        route "GET /products"
+            give all_products()
+    """
+    port: Node = None                    # expression evaluating to the port number
+    auth_handler: Optional[Node] = None  # expression resolving to the auth task
+    max_body: Optional[Node] = None      # expression: max request body ("10mb"/bytes/"unlimited")
+    max_streams: Optional[Node] = None   # expression: max concurrent SSE streams
+    rate_limit: Optional['RateLimitClause'] = None  # default rate limit for all routes
+    routes: List[RouteDefinition] = field(default_factory=list)
+
+@dataclass
+class ExpectStatement(Node):
+    """
+    expect body {name: text, age: number}
+    Validates the request's parsed JSON body against the declared shape.
+    """
+    target: str = "body"                 # what to validate (currently: body)
+    shape: List[tuple] = field(default_factory=list)  # [(field_name, type_name)]

@@ -47,7 +47,8 @@
 - `file_exists(path)` → bool
 - `run(command, args_list?, timeout?)` → map with exit_code, stdout, stderr
 - `get_env(name)` → text or nothing
-- `now()` → unix timestamp (number)
+- `now()` → unix timestamp (number) — requires `time`
+- `sleep(seconds)` → pause execution (e.g. to pace an SSE stream) — requires `time`
 - `random()` → float 0-1
 - `random_int(min, max)` → integer
 
@@ -65,6 +66,15 @@
 - `sql_exec(statement, params?)` → {rows_affected, last_id} (INSERT/UPDATE/DELETE/CREATE)
 - `sql_batch(statement, params_list)` → {rows_affected} (batch operations)
 - `sql_tables()` → list of table names
+- `paged(query, params?)` → paginated result for `give` in a (non-streaming) serve route (SQL LIMIT/OFFSET pushdown, exact COUNT total)
+
+## HTTP server (serve) — see serve.md
+Response helpers (set the HTTP status; body follows the response contract):
+- `ok(x)` → 200
+- `created(x)` → 201
+- `not_found(x)` → 404 — `not_found(text)` → `{"error": text, "status": 404}`; `not_found(map)` → the map as-is
+- `fail(code, msg)` → `{"error": msg, "status": code}`; also `fail(msg)` → 400, and `fail(code)`
+- `read_body()` → full request body text (from memory or the temp file) — inside a route handler
 
 ## Cron (Scheduled Tasks)
 - `cron_every(seconds, task)` → job name (repeating background job)

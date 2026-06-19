@@ -1,0 +1,42 @@
+-- HTTP server demo — a tiny products API, zero dependencies.
+-- Run with:  syntecnia run examples/serve_demo.syn   (Ctrl+C to stop)
+
+intent: "Serve a small products API over HTTP"
+
+require serve(8080)
+require db(":memory:")
+
+-- Seed an in-memory database
+db_open(":memory:", "memory")
+sql_exec("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price NUMBER)")
+sql_exec("INSERT INTO products (name, price) VALUES (?, ?)", ["Laptop", 1200])
+sql_exec("INSERT INTO products (name, price) VALUES (?, ?)", ["Mouse", 25])
+sql_exec("INSERT INTO products (name, price) VALUES (?, ?)", ["Keyboard", 75])
+
+-- Auth task: returns a user for a valid bearer token, nothing otherwise
+task check_token(token)
+    when token == "admin-key"
+        give {"role": "admin"}
+    give nothing
+
+serve on 8080
+    auth with check_token
+
+    -- Collection → {"items":[...], "count", "total", "cursor"}; supports ?limit & ?cursor.
+    -- paged() pushes LIMIT/OFFSET into SQL and reports an exact total.
+    route "GET /products"
+        give paged("SELECT id, name, price FROM products ORDER BY id")
+
+    -- Single item → the object as-is, or 404
+    route "GET /products/:id"
+        let rows be sql("SELECT id, name, price FROM products WHERE id = ?", [params.id])
+        when length(rows) == 0
+            give not_found("product not found")
+        give rows[0]
+
+    -- Protected + validated create → 201
+    route "POST /products" requires auth
+        expect body {name: text, price: number}
+        let b be json of request
+        sql_exec("INSERT INTO products (name, price) VALUES (?, ?)", [name of b, price of b])
+        give created({"created": true, "by": role of (user of request)})

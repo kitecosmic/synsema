@@ -141,6 +141,53 @@ let sorted be sort_by(products, get_price)
 let groups be group_by(orders, get_status)
 ```
 
+### HTTP server
+
+A native, zero-dependency HTTP server (built on `http.server`). The runtime
+enforces a consistent response contract, pagination, auth and input validation.
+
+```
+require serve(8080)
+
+task check_token(token)
+    when token == "admin-key"
+        give {"role": "admin"}
+    give nothing
+
+serve on 8080
+    auth with check_token
+
+    route "GET /products"
+        give sql("SELECT id, name, price FROM products")     -- list → paginated envelope
+
+    route "GET /products/:id"
+        let rows be sql("SELECT * FROM products WHERE id = ?", [params.id])
+        when length(rows) == 0
+            give not_found("product not found")              -- 404
+        give rows[0]                                          -- map → object as-is
+
+    route "POST /products" requires auth
+        expect body {name: text, price: number}              -- 400 if invalid
+        let b be json of request
+        sql_exec("INSERT INTO products (name, price) VALUES (?, ?)", [name of b, price of b])
+        give created(b)                                       -- 201
+```
+
+- **Capability:** `require serve(PORT)` — scoped to the port. Without it, `serve on PORT` fails with a clear error.
+- **Request:** `request.json`, `request.body`, `request.headers`, `request.user`, plus `query` and `params` maps.
+- **Response contract:** `give <map>` → the object as-is; `give <list>` → `{"items", "count", "total", "cursor"}`; scalar → as-is; nothing → `null`. Helpers: `ok(x)`, `created(x)` (201), `not_found(x)` (404), `fail(code, msg)`.
+- **Pagination:** always applied to collections — default `limit` 100, `?limit=` / `?cursor=`, `total` always present. For large tables use `give paged("SELECT ...", [params])` — SQL `LIMIT`/`OFFSET` pushdown with an exact `COUNT(*)` total, nothing fully materialized.
+- **Auth:** `requires auth` extracts the `Authorization: Bearer` token, calls the `auth with` task; `nothing` → 401, otherwise the value lands in `request.user`.
+- **Validation:** `expect body {field: type}` (`text`, `number`, `bool`, `list`, `map`) → 400 naming the bad field.
+- **HTTP semantics:** `405` (with `Allow`) for a known path on the wrong method, `OPTIONS`/`HEAD` handled, malformed JSON → 400.
+- **Body limits:** default 1 MB, configurable per server with `max_body "10mb"` (or `"unlimited"`). Real bytes are counted (a lying `Content-Length` or chunked body can't evade it); over the limit → 413 with a clean connection close; large bodies stream to disk (`read_body()` / `request.body_file`), chunked supported.
+- **Isolation:** each request runs in its own interpreter/scope, like an agent; only the blackboard and DB are shared. Uncaught errors become 500 — never a server crash.
+- **Streaming (SSE):** a route can `stream` and `send` events over time (LLM tokens, feeds, MCP) — `Content-Type: text/event-stream`, flushed per event, client-disconnect-safe, with a `max_streams` concurrency cap (`503` over the limit). `stream` and `give` are mutually exclusive per route.
+- **Rate limiting:** `rate_limit N per second|minute|hour` on the server (default) or per route (override; `none` to disable). Token bucket keyed by the real peer IP (not `X-Forwarded-For`), checked before auth, `429` + `Retry-After` + `RateLimit-*` over the limit, stale buckets purged.
+- **Soft keywords:** `serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body`, `max_streams`, `stream`, `send` are only special inside their construction — elsewhere they are ordinary names (`let route be "/x"` works).
+
+See [.syntecnia-skill/serve.md](.syntecnia-skill/serve.md) for full details.
+
 ## Security
 
 ### Capabilities
@@ -450,7 +497,9 @@ When Syntecnia connects to an LLM, responses are validated automatically:
 - [ ] Port runtime to Rust (tokio async, real parallelism)
 - [ ] Async I/O operations
 - [ ] Database capability and query builder
-- [ ] Web server capability (serve HTTP)
+- [x] Web server capability (`serve on PORT`)
+- [x] Streaming responses (Server-Sent Events: `stream` / `send`)
+- [x] Rate limiting (`rate_limit N per <window>`, token bucket, per-IP)
 - [ ] Package manager for verified capabilities
 - [ ] Language server protocol (LSP) for IDE support
 - [ ] Visual dashboard for agent swarm monitoring

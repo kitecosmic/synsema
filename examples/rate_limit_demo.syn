@@ -1,0 +1,38 @@
+-- Rate limiting demo — protect a login endpoint from brute-force.
+-- Run:   syntecnia run examples/rate_limit_demo.syn      (Ctrl+C to stop)
+-- Try:   for i in $(seq 1 7); do curl -s -o /dev/null -w "%{http_code}\n" \
+--            -X POST http://127.0.0.1:8080/login \
+--            -H "Content-Type: application/json" -d '{"user":"a","pass":"x"}'; done
+--        → first 5 are 200/401, then 429 (Too Many Requests)
+
+intent: "Login API protected by per-IP rate limiting"
+
+require serve(8080)
+
+task check_token(token)
+    when token == "letmein"
+        give {"user": "admin"}
+    give nothing
+
+serve on 8080
+    rate_limit 100 per minute          -- generous default for the whole API
+    auth with check_token
+
+    -- Brute-force protection: only 5 login attempts per minute per IP,
+    -- enforced BEFORE auth so invalid passwords still count.
+    route "POST /login"
+        rate_limit 5 per minute
+        expect body {user: text, pass: text}
+        let b be json of request
+        when pass of b == "letmein"
+            give {"token": "letmein", "from": ip of request}
+        give fail(401, "invalid credentials")
+
+    -- Inherits the 100/min default.
+    route "GET /public"
+        give {"ok": true}
+
+    -- Health checks shouldn't be limited.
+    route "GET /health"
+        rate_limit none
+        give {"ok": true}

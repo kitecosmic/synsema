@@ -101,6 +101,17 @@ def register_secure_builtins(env, secure_ops: SecureOperations):
         """now() → unix timestamp"""
         return syn_number(secure_ops.get_time(source="now()"))
 
+    def _sleep(args: List[SynValue]) -> SynValue:
+        """sleep(seconds) → pause execution. Requires the time capability."""
+        import time as _time
+        # Gate on the time capability (same as now()).
+        secure_ops.get_time(source="sleep()")
+        seconds = float(args[0].raw) if args else 0.0
+        if seconds < 0:
+            seconds = 0.0
+        _time.sleep(min(seconds, 3600))  # cap a single sleep at 1 hour
+        return syn_nothing()
+
     def _random(args: List[SynValue]) -> SynValue:
         """random() → float between 0 and 1"""
         return syn_number(secure_ops.get_random(source="random()"))
@@ -124,6 +135,7 @@ def register_secure_builtins(env, secure_ops: SecureOperations):
         "run": BuiltinTask("run", _run_command),
         "get_env": BuiltinTask("get_env", _get_env, 1),
         "now": BuiltinTask("now", _now, 0),
+        "sleep": BuiltinTask("sleep", _sleep, 1),
         "random": BuiltinTask("random", _random, 0),
         "random_int": BuiltinTask("random_int", _random_int, 2),
     }

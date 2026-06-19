@@ -4,7 +4,9 @@
 Nothing works without declaring capabilities.
 
 ## Capability types
-`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `db`
+`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `db`, `serve`
+
+`serve(PORT)` allows binding an HTTP server to that port — see [serve.md](serve.md).
 
 ## Declaring capabilities
 ```
@@ -14,6 +16,8 @@ require file("/data/*")
 require exec("ffmpeg")
 require env("API_KEY")
 require time
+require serve(8080)                 -- bind an HTTP server to this port
+require db("./store.db")            -- open this SQLite database
 ```
 
 `require` in the program body grants the capability for real. This is NOT just a declaration — it enables the operation.
