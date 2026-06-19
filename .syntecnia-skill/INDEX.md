@@ -9,7 +9,7 @@ Read ONLY the sections you need. Do not load everything.
 
 ## By topic
 - [stdlib.md](stdlib.md) — HTTP requests, SQL database, cron scheduler (zero dependencies)
-- [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination
+- [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination/paged(), streaming (SSE), rate limiting, body limits
 - [capabilities.md](capabilities.md) — Security model, require, sandbox, intent
 - [agents.md](agents.md) — Multi-agent coordination, blackboard, swarm, signals
 - [llm.md](llm.md) — LLM operations: reason, decide, analyze, generate
@@ -32,6 +32,8 @@ Read ONLY the sections you need. Do not load everything.
 - Writing a new .syn program → syntax.md, builtins.md
 - HTTP / SQL / cron → stdlib.md
 - Building an HTTP API / web server → serve.md
+- Streaming / Server-Sent Events → serve.md
+- Rate limiting / anti-abuse → serve.md
 - Deploying to server → deploy.md
 - Adding security → capabilities.md
 - Multi-agent system → agents.md

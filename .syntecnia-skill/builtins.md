@@ -66,7 +66,15 @@
 - `sql_exec(statement, params?)` → {rows_affected, last_id} (INSERT/UPDATE/DELETE/CREATE)
 - `sql_batch(statement, params_list)` → {rows_affected} (batch operations)
 - `sql_tables()` → list of table names
-- `paged(query, params?)` → lazy paginated result for `give` in an SSE/serve route (SQL LIMIT/OFFSET pushdown, exact COUNT total)
+- `paged(query, params?)` → paginated result for `give` in a (non-streaming) serve route (SQL LIMIT/OFFSET pushdown, exact COUNT total)
+
+## HTTP server (serve) — see serve.md
+Response helpers (set the HTTP status; body follows the response contract):
+- `ok(x)` → 200
+- `created(x)` → 201
+- `not_found(x)` → 404 — `not_found(text)` → `{"error": text, "status": 404}`; `not_found(map)` → the map as-is
+- `fail(code, msg)` → `{"error": msg, "status": code}`; also `fail(msg)` → 400, and `fail(code)`
+- `read_body()` → full request body text (from memory or the temp file) — inside a route handler
 
 ## Cron (Scheduled Tasks)
 - `cron_every(seconds, task)` → job name (repeating background job)
