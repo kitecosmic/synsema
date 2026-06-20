@@ -1,0 +1,13 @@
+[package]
+name = "syntecnia-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Syntecnia core: lexer, parser, AST, value model, interpreter"
+
+[dependencies]
+num-bigint.workspace = true
+num-traits.workspace = true
+num-integer.workspace = true
+indexmap.workspace = true
+regex.workspace = true

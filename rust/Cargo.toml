@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/syntecnia-core",
+    "crates/syntecnia-capabilities",
+    "crates/syntecnia-stdlib",
+    "crates/syntecnia-agents",
+    "crates/syntecnia-llm",
+    "crates/syntecnia-runtime",
+    "crates/syntecnia-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Syntecnia — a programming language designed for AI agents (Rust port)"
+repository = "https://github.com/kitecosmic/Syntecnia"
+
+# Dependencias compartidas se pinean acá y se referencian con `workspace = true`
+# desde cada crate. Se agregan por capa, no antes de necesitarlas.
+[workspace.dependencies]
+# Modelo numérico: enteros de precisión arbitraria como Python (fast-path i64 +
+# promoción a BigInt por overflow). num-traits/num-integer dan conversores y ops.
+num-bigint = "0.4"
+num-traits = "0.2"
+num-integer = "0.1"
+# Map ordenado (Python dict preserva orden de inserción) y regex (puro Rust, sin C).
+indexmap = "2"
+regex = "1"
+# JSON para el subcomando de conformidad del CLI y la persistencia de progress/memory.
+# `preserve_order`: los objetos JSON entrantes preservan el orden de inserción (como
+# el dict de Python), para paridad byte-a-byte en las respuestas del server.
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# Fecha/hora para los builtins de time (UTC). Sin feature `clock` → sin riesgo de C;
+# now() usa std::time. HTTP usa std::net (sin TLS por ahora); cron usa std::thread.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# SQLite estático (binario único, sin DLL). Compila C → requiere gcc (WinLibs en Windows).
+rusqlite = { version = "0.32", features = ["bundled"] }
+syntecnia-core = { path = "crates/syntecnia-core" }
+syntecnia-capabilities = { path = "crates/syntecnia-capabilities" }
+syntecnia-stdlib = { path = "crates/syntecnia-stdlib" }
+syntecnia-agents = { path = "crates/syntecnia-agents" }
+syntecnia-llm = { path = "crates/syntecnia-llm" }
+syntecnia-runtime = { path = "crates/syntecnia-runtime" }
+
+[profile.release]
+opt-level = 3
+lto = true

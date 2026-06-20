@@ -624,3 +624,64 @@ Run it:
 ```bash
 syntecnia run store.syn      # stays alive while the server runs; Ctrl+C to stop
 ```
+
+---
+
+## Production web stack (Rust implementation)
+
+The Rust server (tokio/hyper/rustls) adds, natively, what you'd normally put Caddy/nginx
+in front for. These are Rust-only; the Python reference omits them. HTTP/1.1 responses
+stay byte-identical to the Python oracle — TLS/vhost/proxy/HTTP-2 are additive.
+
+### TLS / HTTPS
+
+```
+require serve(443)
+serve on 443
+    domain "example.com"
+    tls cert "./cert.pem" key "./key.pem"   -- manual cert
+    redirect https                           -- also listen on :80 and 301 → https
+    route "GET /" ...
+```
+
+- `tls cert <expr> key <expr>` — manual certificate.
+- `tls auto "email"` — **automatic HTTPS** via ACME (Let's Encrypt): issues the cert,
+  serves the HTTP-01 challenge on :80, stores it in `~/.syntecnia/certs/`, and a
+  background thread renews it (< 30 days). `domain` (or `host`) is required with `tls auto`.
+- TLS 1.2+ enforced, **HSTS** automatic, **SNI** (per-host cert with vhosts).
+- **HTTP/2** is negotiated automatically via ALPN over TLS; HTTP/1.1 is kept.
+
+### Virtual hosts (multi-domain)
+
+```
+serve on 443
+    host "api.example.com"
+        auth with check_token
+        route "GET /users" ...
+    host "app.example.com"
+        static "./app"
+    host "*.tenant.example.com"           -- wildcard subdomains
+        route "GET /" ...
+    route "GET /"                          -- default host (no Host match)
+        give {"host": "default"}
+```
+
+Dispatched by the `Host` header: exact → wildcard → default. Each host has its own
+routes/static/auth/cert, fully isolated (a route in one host 404s in another).
+
+### Reverse proxy
+
+```
+route "GET /api/*path"
+    proxy to "http://127.0.0.1:9000"      -- forwards the request to the upstream
+```
+
+The target is the base; the incoming path is appended (like nginx `proxy_pass`). Needs a
+`require net "<host>"` capability for the upstream. Forwards status + content-type + body.
+
+### Production static files
+
+The `static` mounts get production behavior automatically:
+- **ETag** + `304 Not Modified` on `If-None-Match`.
+- **Range** / `206 Partial Content` (+ `416` on invalid range) for media.
+- **gzip** when the client sends `Accept-Encoding: gzip` (compressible types).

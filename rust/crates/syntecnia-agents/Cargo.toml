@@ -1,0 +1,14 @@
+[package]
+name = "syntecnia-agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Syntecnia agents: blackboard, resource_lock, swarm, memory, progress, builtins"
+
+[dependencies]
+syntecnia-core.workspace = true
+syntecnia-capabilities.workspace = true
+indexmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true

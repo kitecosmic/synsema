@@ -1,0 +1,21 @@
+[package]
+name = "syntecnia-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Syntecnia CLI — binario syntecnia-cli (subcomando de conformidad)"
+
+# Binario `syntecnia-cli` (el contrato del gate del agente de testing). En la
+# distribución (Parte C) el producto final se renombra a `syntecnia`.
+[[bin]]
+name = "syntecnia-cli"
+path = "src/main.rs"
+
+[dependencies]
+syntecnia-core.workspace = true
+syntecnia-capabilities.workspace = true
+syntecnia-stdlib.workspace = true
+syntecnia-agents.workspace = true
+syntecnia-llm.workspace = true
+syntecnia-runtime.workspace = true
+serde_json.workspace = true

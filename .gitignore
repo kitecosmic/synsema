@@ -6,3 +6,18 @@ build/
 .eggs/
 *.json
 !examples/*.json
+
+# Rust
+target/
+**/*.rs.bk
+
+# Privado — NO va al repo público (herramientas de testing internas + docs de proceso).
+# Quedan en disco local, sin versionar.
+conformance/
+docs/
+PLAN-MIGRACION-RUST.md
+SPEC-CONCURRENCIA.md
+HANDOFF-RUST.md
+
+# Estado/persistencia y daemons de runtime (fuera del repo, defensivo)
+.syntecnia/

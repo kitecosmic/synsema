@@ -4,29 +4,35 @@ A programming language designed for AI agents.
 
 Syntecnia is not a framework or a library — it's a language where observability, security, multi-agent coordination, human interaction, and LLM integration are built-in primitives, not afterthoughts.
 
+## Two implementations
+
+Syntecnia has two interpreters that pass the **same** test corpus, byte-for-byte:
+
+- **Python** (`syntecnia/`) — the reference implementation. Frozen; acts as the conformance oracle.
+- **Rust** (`rust/`) — the production implementation. A single static binary, no runtime, no GIL, true multi-core. Adds what Python couldn't: real concurrency (`parallel_map`) and a native web stack (TLS, auto-HTTPS/ACME, virtual hosts, reverse proxy, HTTP/2).
+
+Parity is enforced by a differential test harness: the same `.syn` programs run against both interpreters and must produce identical results.
+
 ## Install
 
-Zero dependencies — only needs Python 3.10+.
+### Rust (production — single binary, zero runtime)
 
 ```bash
 git clone https://github.com/kitecosmic/Syntecnia.git
 cd Syntecnia
+cargo build --release --manifest-path rust/Cargo.toml
+# binary at rust/target/release/syntecnia-cli
 ```
 
-Then choose one:
+The result is one self-contained executable — no Python, no npm, nothing to install on the target.
+
+### Python (reference — needs only Python 3.10+)
 
 ```bash
-# Option 1: pip (creates the 'syntecnia' command)
-pip install -e .
-
-# Option 2: uv (faster, modern)
-uv pip install -e .
-
-# Option 3: no install needed (run directly)
+pip install -e .          # creates the 'syntecnia' command
+# or run directly, no install:
 python3 -m syntecnia version
 ```
-
-All three work. Option 3 doesn't require any package manager — if you have Python, you can run Syntecnia.
 
 ## Quick start
 
@@ -50,8 +56,12 @@ syntecnia run hello.syn
 
 ## Usage
 
+With the Rust binary the command is `syntecnia-cli` (e.g. `syntecnia-cli run program.syn`,
+`syntecnia-cli serve app.syn`); the Python `syntecnia` command takes the same subcommands.
+
 ```bash
 syntecnia run program.syn              # Run a program
+syntecnia serve app.syn                # Run a program that starts an HTTP server (blocks)
 syntecnia run program.syn -v           # Run with verbose output
 syntecnia run program.syn --secure     # Run in secure mode (all capabilities must be granted)
 syntecnia run program.syn --provider anthropic  # Use Claude as LLM engine
@@ -141,6 +151,27 @@ let sorted be sort_by(products, get_price)
 let groups be group_by(orders, get_status)
 ```
 
+### Concurrency (Rust)
+
+Real, multi-core parallelism — no GIL. `parallel_map` runs a task over a list
+concurrently, results in input order, with a bounded number of simultaneous workers:
+
+```
+let results be parallel_map(fetch_user, ids, 50)   -- 50 at a time, order preserved
+```
+
+`chunk` splits a list into batches — the "10k as 10×1000, then merge" pattern:
+
+```
+let batches be chunk(items, 1000)
+let partial be parallel_map(process_batch, batches, 10)   -- 10 batches in parallel
+let merged be flatten(partial)
+```
+
+`parallel_map(task, list)` returns the same result (and order) as `apply(task, list)` —
+it only adds concurrency. Fail-fast: the first error cancels the rest and propagates
+(wrap the task in `try/recover` to collect partial results instead).
+
 ### HTTP server
 
 A native, zero-dependency HTTP server (built on `http.server`). The runtime
@@ -187,6 +218,31 @@ serve on 8080
 - **Soft keywords:** `serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body`, `max_streams`, `stream`, `send` are only special inside their construction — elsewhere they are ordinary names (`let route be "/x"` works).
 
 See [.syntecnia-skill/serve.md](.syntecnia-skill/serve.md) for full details.
+
+### Production web stack (Rust) — no Caddy/nginx needed
+
+The Rust server runs on `tokio`/`hyper`/`rustls` and adds, natively, what you'd normally
+put a reverse proxy in front for:
+
+```
+require serve(443)
+serve on 443
+    domain "example.com"
+    tls auto "admin@example.com"      -- auto-HTTPS: Let's Encrypt (ACME) + auto-renewal
+    redirect https                     -- also listen on :80 and 301 → https
+    route "GET /" ...
+```
+
+- **TLS:** `tls cert "./c.pem" key "./k.pem"` (manual) or `tls auto "email"` (automatic
+  HTTPS via ACME — issuance + background renewal). TLS 1.2+ enforced, HSTS automatic, SNI.
+- **HTTP/2:** negotiated via ALPN over TLS (HTTP/1.1 kept).
+- **Virtual hosts:** `host "a.com"` / `host "*.tenant.com"` blocks, each with its own
+  routes/static/auth/cert; dispatched by the `Host` header.
+- **Reverse proxy:** `proxy to "http://upstream"` inside a route forwards the request.
+- **Production static files:** ETag + `304`, `Range`/`206`, gzip — on the `static` mounts.
+
+These are Rust-only (the Python reference omits them). The HTTP/1.1 responses stay
+byte-identical to the Python oracle; TLS/vhost/proxy/HTTP-2 are additive.
 
 ## Security
 
@@ -382,17 +438,19 @@ Automatically generates edge-case tests from your types and task signatures:
 
 ## Tests
 
+**Python reference** — 329 tests across 10 files (the conformance oracle):
+
 ```bash
-python3 tests/test_core.py          # 32 tests
-python3 tests/test_capabilities.py  # 14 tests
-python3 tests/test_agents.py        # 17 tests
-python3 tests/test_intent.py        # 15 tests
-python3 tests/test_advanced.py      # 40 tests
-python3 tests/test_recovery.py      # 24 tests
-python3 tests/test_agent_systems.py # 25 tests
+PYTHONPATH=. python3 tests/test_core.py     # and test_capabilities / test_agents /
+                                            # test_intent / test_advanced / test_recovery /
+                                            # test_agent_systems / test_stdlib / test_serve / test_concurrency
 ```
 
-167 tests total, 0 failures.
+**Rust** — unit and integration tests across the workspace:
+
+```bash
+cargo test --manifest-path rust/Cargo.toml --workspace
+```
 
 ## Architecture
 
@@ -435,6 +493,24 @@ syntecnia/
 │   └── validator.py   # Response validation + retry with feedback
 └── cli.py             # Command-line interface
 ```
+
+### Rust implementation
+
+```
+rust/                  # Cargo workspace — the production interpreter (single binary)
+├── crates/
+│   ├── syntecnia-core/        # lexer, parser, AST, types, interpreter, templates
+│   ├── syntecnia-capabilities/# capability model + intent enforcement
+│   ├── syntecnia-stdlib/      # http, database (rusqlite), cron, server (tokio/hyper/rustls), acme, mimetypes
+│   ├── syntecnia-agents/      # blackboard, swarm, memory, progress, resource_lock
+│   ├── syntecnia-runtime/     # engine, serve, parallel (concurrency), recovery, persistence, daemon
+│   ├── syntecnia-llm/         # provider, context, validator, human
+│   └── syntecnia-cli/         # CLI: run, serve, conform, check, repl, ast, tokens, daemon
+└── ...
+```
+
+The Rust interpreter is **synchronous** (parity with Python); concurrency (`parallel_map`)
+and the web server are async layers (`tokio`) around it. `spawn` agents use OS threads.
 
 ## AI Skill (for Claude Code, Codex, etc.)
 
@@ -494,15 +570,17 @@ When Syntecnia connects to an LLM, responses are validated automatically:
 
 ## Roadmap
 
-- [ ] Port runtime to Rust (tokio async, real parallelism)
-- [ ] Async I/O operations
-- [ ] Database capability and query builder
+- [x] Port runtime to Rust (single static binary, no GIL, real multi-core)
+- [x] Real concurrency (`parallel_map` / `chunk`, bounded fan-out)
 - [x] Web server capability (`serve on PORT`)
 - [x] Streaming responses (Server-Sent Events: `stream` / `send`)
 - [x] Rate limiting (`rate_limit N per <window>`, token bucket, per-IP)
+- [x] Native web stack: TLS, auto-HTTPS (ACME), virtual hosts, reverse proxy, HTTP/2 (Rust)
+- [x] Database (SQLite via `sql` / `db_open`)
+- [ ] Async interpreter for C100k+ I/O fan-out (deferred)
+- [ ] Distribution: cross-platform binaries, installer, mobile/IoT
 - [ ] Package manager for verified capabilities
 - [ ] Language server protocol (LSP) for IDE support
-- [ ] Visual dashboard for agent swarm monitoring
 
 ## License
 
