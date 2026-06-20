@@ -584,4 +584,8 @@ When Syntecnia connects to an LLM, responses are validated automatically:
 
 ## License
 
-MIT
+[Apache License 2.0](LICENSE). The code is free to use, modify, and distribute,
+with an explicit patent grant.
+
+**Trademark:** "Syntecnia" is a project trademark. The license covers the code, not the
+name — forks and derivative works must use a different name (see [NOTICE](NOTICE)).

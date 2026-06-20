@@ -11,13 +11,9 @@ build/
 target/
 **/*.rs.bk
 
-# Privado — NO va al repo público (herramientas de testing internas + docs de proceso).
-# Quedan en disco local, sin versionar.
+# Privado — herramienta de testing interna (oráculo Python + harness differential).
+# Se usa localmente; no va al repo público. (Los docs de proceso viven fuera del repo.)
 conformance/
-docs/
-PLAN-MIGRACION-RUST.md
-SPEC-CONCURRENCIA.md
-HANDOFF-RUST.md
 
 # Estado/persistencia y daemons de runtime (fuera del repo, defensivo)
 .syntecnia/
