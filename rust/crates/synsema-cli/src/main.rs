@@ -15,9 +15,9 @@ use std::process::ExitCode;
 // El conform usa el motor (runtime): intérprete + modelo de seguridad cableado.
 use synsema_runtime::daemon;
 use synsema_runtime::engine::{repl, run_source, run_swarm_dump};
-use synsema_runtime::serve::run_serve_program;
+use synsema_runtime::serve::{run_serve_program_with_overrides, ServeOverrides};
 
-const USAGE: &str = "uso: synsema-cli <conform [--swarm] [--flat] | serve [--secure] | run | check | tokens | ast | repl | daemon | version> [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema-cli <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run | check | tokens | ast | repl | daemon | version> [--env-file <path> | --no-env-file] <archivo.syn>";
 
 /// Serializa un mapa (clave→string) como objeto JSON ordenado.
 fn json_obj(pairs: Vec<(String, String)>) -> String {
@@ -145,21 +145,77 @@ fn cmd_conform(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// serve [--secure] <archivo.syn>: levanta el server y bloquea hasta kill.
-/// Imprime la línea de readiness ("Serving HTTP on port PORT (N route(s))") a STDOUT.
+/// serve [--secure] [deploy flags] <archivo.syn>: levanta el server y bloquea hasta kill.
+/// Flags de despliegue (Pieza A) que sobreescriben el bloque `serve` (flag > archivo >
+/// default): `--port N`, `--domain d1,d2`, `--tls-auto <email>`, `--tls-cert <p>
+/// --tls-key <p>`, `--bind <addr>`. Imprime la línea de readiness a STDOUT.
 fn cmd_serve(args: &[String]) -> ExitCode {
     let args = take_env_file_flags(args);
-    let args = args.as_slice();
-    let (secure, path) = match args.get(2).map(String::as_str) {
-        Some("--secure") => match args.get(3) {
-            Some(p) => (true, p.clone()),
-            None => {
-                eprintln!("{}", USAGE);
+    let mut secure = false;
+    let mut path: Option<String> = None;
+    let mut ov = ServeOverrides::default();
+    let mut i = 2;
+    while i < args.len() {
+        // Toma el valor del flag siguiente, o error claro (fail-loud).
+        macro_rules! next_val {
+            ($flag:expr) => {{
+                i += 1;
+                match args.get(i) {
+                    Some(v) => v.clone(),
+                    None => {
+                        eprintln!("synsema serve: {} requires a value", $flag);
+                        return ExitCode::from(2);
+                    }
+                }
+            }};
+        }
+        match args[i].as_str() {
+            "--secure" => secure = true,
+            "--port" => {
+                let v = next_val!("--port");
+                match v.parse::<u16>() {
+                    Ok(p) if p >= 1 => ov.port = Some(p),
+                    _ => {
+                        eprintln!(
+                            "synsema serve: --port must be a valid port (1-65535), got '{}'",
+                            v
+                        );
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--domain" => {
+                let v = next_val!("--domain");
+                let ds: Vec<String> =
+                    v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                if ds.is_empty() {
+                    eprintln!("synsema serve: --domain requires at least one domain");
+                    return ExitCode::from(2);
+                }
+                ov.domains = Some(ds);
+            }
+            "--tls-auto" => ov.tls_auto_email = Some(next_val!("--tls-auto")),
+            "--tls-cert" => ov.tls_cert = Some(next_val!("--tls-cert")),
+            "--tls-key" => ov.tls_key = Some(next_val!("--tls-key")),
+            "--bind" => ov.bind = Some(next_val!("--bind")),
+            p if !p.starts_with("--") => path = Some(p.to_string()),
+            other => {
+                eprintln!("synsema serve: unknown flag '{}'", other);
                 return ExitCode::from(2);
             }
-        },
-        Some(p) if args.len() == 3 => (false, p.to_string()),
-        _ => {
+        }
+        i += 1;
+    }
+
+    // Validación fail-loud de combinaciones inválidas (mutua exclusión, par cert/key).
+    if let Err(e) = ov.validate() {
+        eprintln!("synsema serve: {}", e);
+        return ExitCode::from(2);
+    }
+
+    let path = match path {
+        Some(p) => p,
+        None => {
             eprintln!("{}", USAGE);
             return ExitCode::from(2);
         }
@@ -174,7 +230,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     };
 
     // Bloquea mientras el server corra; sólo retorna si no se levantó o falló.
-    let result = run_serve_program(&source, &path, secure);
+    let result = run_serve_program_with_overrides(&source, &path, secure, ov);
     if !result.success {
         for e in &result.errors {
             eprintln!("{}", e);

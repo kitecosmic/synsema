@@ -725,6 +725,38 @@ serve on 443
   `host of (headers of request)` (header keys are lower-case; there is no `host of request`
   shortcut).
 
+### Deployment flags (CLI overrides)
+
+The `serve` block stays declarative — there is **no `when`/conditional TLS**. Deployment
+config is injected at launch with CLI flags so the **same `.syn` is dev-clean in the repo**
+and prod-ready via flags (systemd/Docker). The flags **override the `serve` block**:
+
+```bash
+synsema serve <file>
+    [--port N]                      # overrides `serve on N` AND grants serve(N)
+    [--domain d1[,d2,...]]          # overrides the file's `domain`
+    [--tls-auto <email> | --tls-cert <p> --tls-key <p>]
+    [--bind <addr>]                 # default 0.0.0.0
+```
+
+**Precedence: CLI flag > file clause > default.**
+
+| Knob | Default | File clause | CLI flag (wins) |
+|---|---|---|---|
+| port | — | `serve on N` | `--port N` (also grants `serve(N)`) |
+| TLS on/off | off (plain HTTP) | `tls auto` / `tls cert` | `--tls-auto <email>` / `--tls-cert …` |
+| domains | — | `domain …` | `--domain d1,d2` |
+| bind addr | `0.0.0.0` | — | `--bind <addr>` |
+
+- **The presence of `--tls-auto` is the dev↔prod toggle**: without it (and without `tls` in
+  the file) you get plain HTTP for local dev; with it you get ACME HTTPS in prod — same file.
+- Fail-loud: `--tls-auto` with no domain (flag or file) → error; `--tls-auto` + `--tls-cert`
+  → error; invalid port → error.
+- The flags configure one deployment: with **multiple `serve` blocks** they are rejected
+  with a clear error.
+
+See [deploy.md](deploy.md) for the canonical dev-clean `.syn` + prod systemd unit.
+
 ### Virtual hosts (multi-domain)
 
 ```

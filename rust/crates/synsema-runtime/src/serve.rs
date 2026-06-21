@@ -38,6 +38,56 @@ type SharedDb = Arc<Mutex<DatabaseManager>>;
 use crate::engine::{wire_common, wire_swarm_hooks, INTERP_STACK_SIZE};
 
 // =========================================================
+// Overrides de despliegue por CLI (Pieza A)
+// =========================================================
+
+/// Config de despliegue inyectada por flags de `synsema serve` (capa de lanzamiento).
+/// NO toca la gramática del `serve` (sigue declarativo). Precedencia: **flag > cláusula
+/// del archivo > default**. Todos los campos son `Send` (cruzan al hilo del motor).
+#[derive(Clone, Default)]
+pub struct ServeOverrides {
+    /// `--port N`: sobreescribe `serve on N` y **concede** la capability `serve(N)`.
+    pub port: Option<u16>,
+    /// `--domain d1,d2,…`: dominios del cert SAN de ACME (pisa `domain` del archivo).
+    pub domains: Option<Vec<String>>,
+    /// `--tls-auto <email>`: prende auto-HTTPS (ACME). Su presencia es el toggle dev↔prod.
+    pub tls_auto_email: Option<String>,
+    /// `--tls-cert <path>`: TLS manual (excluyente con `--tls-auto`).
+    pub tls_cert: Option<String>,
+    /// `--tls-key <path>`: par de `--tls-cert`.
+    pub tls_key: Option<String>,
+    /// `--bind <addr>`: dirección de bind (default `0.0.0.0`).
+    pub bind: Option<String>,
+}
+
+impl ServeOverrides {
+    /// True si no se pasó ningún flag de despliegue.
+    pub fn is_empty(&self) -> bool {
+        self.port.is_none()
+            && self.domains.is_none()
+            && self.tls_auto_email.is_none()
+            && self.tls_cert.is_none()
+            && self.tls_key.is_none()
+            && self.bind.is_none()
+    }
+
+    /// Validación fail-loud de combinaciones inválidas (independiente del archivo).
+    /// La ausencia de dominio para `--tls-auto` se valida en el hook (puede venir del
+    /// archivo). El rango de puerto ya queda validado al parsear (`u16`, > 0).
+    pub fn validate(&self) -> Result<(), String> {
+        if self.tls_auto_email.is_some() && (self.tls_cert.is_some() || self.tls_key.is_some()) {
+            return Err(
+                "--tls-auto and --tls-cert/--tls-key are mutually exclusive (choose one)".to_string(),
+            );
+        }
+        if self.tls_cert.is_some() != self.tls_key.is_some() {
+            return Err("--tls-cert and --tls-key must be provided together".to_string());
+        }
+        Ok(())
+    }
+}
+
+// =========================================================
 // Snapshot de globales (Send) → reconstrucción por request
 // =========================================================
 
@@ -460,6 +510,7 @@ fn make_serve_hook(
     shared_db: SharedDb,
     servers: Servers,
     secure: bool,
+    overrides: ServeOverrides,
 ) -> ServeHook {
     Rc::new(move |interp, node, env| {
         let (
@@ -520,15 +571,25 @@ fn make_serve_hook(
             ),
             _ => return Err(Control::Error(RuntimeError::new("internal: serve_hook on non-serve node"))),
         };
-        // -- puerto + capability --
-        let port_val = interp.eval(port_n, env)?;
-        let port_num = match val_to_f64(&port_val) {
-            Some(f) => f as i64,
+        // -- puerto + capability (precedencia: --port > `serve on N`) --
+        let port_num = match overrides.port {
+            // El operador que pasa `--port` es la autoridad: se concede `serve(N)`, así
+            // que el `require serve(...)` del archivo no necesita coincidir.
+            Some(p) => {
+                caps.borrow_mut().grant(Capability::new(CapabilityType::Serve, Some(p.to_string())));
+                p as i64
+            }
             None => {
-                return Err(Control::Error(RuntimeError::new(format!(
-                    "serve port must be a number, got {}",
-                    port_val
-                ))))
+                let port_val = interp.eval(port_n, env)?;
+                match val_to_f64(&port_val) {
+                    Some(f) => f as i64,
+                    None => {
+                        return Err(Control::Error(RuntimeError::new(format!(
+                            "serve port must be a number, got {}",
+                            port_val
+                        ))))
+                    }
+                }
             }
         };
         let port_str = port_num.to_string();
@@ -539,6 +600,8 @@ fn make_serve_hook(
                 port_str
             ))));
         }
+        // Dirección de bind (precedencia: --bind > default 0.0.0.0).
+        let bind_addr: String = overrides.bind.clone().unwrap_or_else(|| "0.0.0.0".to_string());
 
         // -- max_body / max_streams --
         let max_body = match max_body_n {
@@ -682,24 +745,49 @@ fn make_serve_hook(
             }
         }
 
-        // -- TLS manual (A2 batch 1): `tls cert <expr> key <expr>` → HTTPS (rustls/ring) --
-        // Certs por-host (vhost): SNI elige el cert según el server name del handshake.
-        let host_certs: Vec<(String, String, String)> = built_vhosts
-            .iter()
-            .filter_map(|v| match (&v.tls_cert, &v.tls_key) {
-                (Some(c), Some(k)) => Some((v.pattern.clone(), c.clone(), k.clone())),
-                _ => None,
-            })
-            .collect();
-        let tls_config = match (tls_cert_n, tls_key_n) {
+        // -- TLS resolution (precedencia: flag CLI > cláusula del archivo > default) --
+        // Si la CLI fuerza un modo TLS (--tls-auto o --tls-cert), ESE flag es la autoridad
+        // y define TLS por completo: se ignoran las cláusulas `tls` del archivo, incluidos
+        // los certs por-host (SNI). Así es predecible para CUALQUIER programa (no sólo el
+        // caso de un único cert por defecto): "si overrideás TLS por CLI, la CLI manda".
+        let cli_forces_auto = overrides.tls_auto_email.is_some();
+        let cli_overrides_tls = cli_forces_auto || overrides.tls_cert.is_some();
+
+        // Certs por-host (vhost) para SNI — sólo cuando la CLI no sobreescribe TLS.
+        let host_certs: Vec<(String, String, String)> = if cli_overrides_tls {
+            Vec::new()
+        } else {
+            built_vhosts
+                .iter()
+                .filter_map(|v| match (&v.tls_cert, &v.tls_key) {
+                    (Some(c), Some(k)) => Some((v.pattern.clone(), c.clone(), k.clone())),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // Modo TLS efectivo:
+        //   --tls-cert/--tls-key → TLS manual (pisa el archivo).
+        //   --tls-auto           → ACME (pisa el archivo) y desactiva el `tls cert` del archivo.
+        //   sin flags TLS        → lo que declare el archivo.
+        let (manual_cert, manual_key): (Option<String>, Option<String>) =
+            match (&overrides.tls_cert, &overrides.tls_key) {
+                (Some(c), Some(k)) => (Some(c.clone()), Some(k.clone())),
+                _ if cli_forces_auto => (None, None),
+                _ => match (tls_cert_n, tls_key_n) {
+                    (Some(c), Some(k)) => {
+                        (Some(interp.eval(c, env)?.to_string()), Some(interp.eval(k, env)?.to_string()))
+                    }
+                    _ => (None, None),
+                },
+            };
+        let tls_config = match (&manual_cert, &manual_key) {
             (Some(c), Some(k)) => {
-                let cert_path = interp.eval(c, env)?.to_string();
-                let key_path = interp.eval(k, env)?.to_string();
                 let cfg = if host_certs.is_empty() {
-                    server::build_tls_config(&cert_path, &key_path)
+                    server::build_tls_config(c, k)
                 } else {
                     // Default + per-host vía resolver SNI.
-                    server::build_tls_config_sni(&cert_path, &key_path, host_certs)
+                    server::build_tls_config_sni(c, k, host_certs)
                 };
                 match cfg {
                     Ok(cfg) => Some(cfg),
@@ -716,31 +804,42 @@ fn make_serve_hook(
             }
         };
 
-        // -- auto-HTTPS / ACME (A2 batch 2): `tls auto [<email>]` + `domain <expr>` --
-        // `domain` acepta un string (un dominio) o una lista (cert SAN multi-dominio,
-        // p.ej. `domain ["synsema.com", "www.synsema.com"]`). El primero es el primario.
-        let acme_domains: Vec<String> = match domain_n {
-            Some(d) => match interp.eval(d, env)? {
-                SynValue::List(l) => l.borrow().iter().map(|x| x.to_string()).collect(),
-                other => vec![other.to_string()],
+        // -- auto-HTTPS / ACME: `tls auto [<email>]` + `domain <expr>`, o los flags
+        // `--tls-auto <email>` + `--domain`. `domain` acepta un string (un dominio) o
+        // lista (cert SAN multi-dominio); el primero es el primario.
+        let acme_domains: Vec<String> = match &overrides.domains {
+            Some(ds) => ds.clone(),
+            None => match domain_n {
+                Some(d) => match interp.eval(d, env)? {
+                    SynValue::List(l) => l.borrow().iter().map(|x| x.to_string()).collect(),
+                    other => vec![other.to_string()],
+                },
+                None => Vec::new(),
             },
-            None => Vec::new(),
         };
-        let acme_email = match tls_auto_email_n {
-            Some(e) => Some(interp.eval(e, env)?.to_string()),
-            None => None,
+        let tls_auto_eff = if overrides.tls_cert.is_some() {
+            false // un cert manual por flag desactiva el auto
+        } else {
+            cli_forces_auto || tls_auto
         };
-        if tls_auto && acme_domains.is_empty() {
+        let acme_email = match &overrides.tls_auto_email {
+            Some(e) => Some(e.clone()),
+            None => match tls_auto_email_n {
+                Some(e) => Some(interp.eval(e, env)?.to_string()),
+                None => None,
+            },
+        };
+        if tls_auto_eff && acme_domains.is_empty() {
             return Err(Control::Error(RuntimeError::new(
-                "tls auto (auto-HTTPS) requires a domain — add `domain \"example.com\"` to the serve block".to_string(),
+                "tls auto (auto-HTTPS) requires a domain — pass `--domain example.com` or add `domain \"example.com\"` to the serve block".to_string(),
             )));
         }
-        let use_tls = tls_config.is_some() || tls_auto;
+        let use_tls = tls_config.is_some() || tls_auto_eff;
 
         let n_routes = routes.len();
         let mut runtime = ServeRuntime::new(
             port_num as u16,
-            "0.0.0.0".to_string(),
+            bind_addr.clone(),
             routes,
             auth_handler,
             max_body,
@@ -760,12 +859,12 @@ fn make_serve_hook(
         }
 
         // Bind síncrono: si el puerto ya acepta, la readiness está garantizada.
-        let listener = match TcpListener::bind(("0.0.0.0", port_num as u16)) {
+        let listener = match TcpListener::bind((bind_addr.as_str(), port_num as u16)) {
             Ok(l) => l,
             Err(e) => {
                 return Err(Control::Error(RuntimeError::new(format!(
-                    "could not start server on port {}: {}",
-                    port_str, e
+                    "could not start server on {}:{}: {}",
+                    bind_addr, port_str, e
                 ))))
             }
         };
@@ -775,14 +874,14 @@ fn make_serve_hook(
 
         // auto-HTTPS: levanta el listener de challenge (HTTP-01 + 301), obtiene/carga
         // el cert (bloquea hasta tenerlo) y sirve HTTPS con hot-swap en renovación.
-        if tls_auto {
+        if tls_auto_eff {
             let http_port: u16 = std::env::var("SYNSEMA_ACME_HTTP_PORT")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(80);
             let store: server::ChallengeStore =
                 Arc::new(Mutex::new(std::collections::HashMap::new()));
-            let chal = match TcpListener::bind(("0.0.0.0", http_port)) {
+            let chal = match TcpListener::bind((bind_addr.as_str(), http_port)) {
                 Ok(l) => l,
                 Err(e) => {
                     return Err(Control::Error(RuntimeError::new(format!(
@@ -823,7 +922,7 @@ fn make_serve_hook(
 
         // `redirect https`: además escucha :80 y responde 301 → https://host[:port].
         if redirect_https && tls_config.is_some() {
-            match TcpListener::bind(("0.0.0.0", 80u16)) {
+            match TcpListener::bind((bind_addr.as_str(), 80u16)) {
                 Ok(rl) => {
                     let https_port = port_num as u16;
                     let h = std::thread::Builder::new()
@@ -863,7 +962,7 @@ fn make_serve_hook(
     })
 }
 
-fn serve_inner(source: &str, filename: &str, secure: bool) -> RunResult {
+fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverrides) -> RunResult {
     let program = match parse_source(source, filename) {
         Ok(p) => p,
         Err(CompileError::Lex(e)) => {
@@ -873,6 +972,31 @@ fn serve_inner(source: &str, filename: &str, secure: bool) -> RunResult {
             return RunResult { success: false, output: Vec::new(), errors: vec![format!("Parse error: {}", e)] }
         }
     };
+
+    // Validación de los flags de despliegue (fail-loud) y política de múltiples serve.
+    if !overrides.is_empty() {
+        if let Err(e) = overrides.validate() {
+            return RunResult { success: false, output: Vec::new(), errors: vec![format!("Runtime error: {}", e)] };
+        }
+        // Los flags configuran UN despliegue: con varios bloques `serve` no hay forma
+        // coherente de aplicar --port/--tls-* (cada uno bindea su propio puerto), así
+        // que se rechaza con un error claro (el caso común es un solo `serve`).
+        let n_serve = program
+            .statements
+            .iter()
+            .filter(|s| matches!(s.kind, NodeKind::ServeBlock { .. }))
+            .count();
+        if n_serve != 1 {
+            return RunResult {
+                success: false,
+                output: Vec::new(),
+                errors: vec![format!(
+                    "Runtime error: CLI serve flags (--port/--domain/--tls-*/--bind) require exactly one `serve` block, but found {}",
+                    n_serve
+                )],
+            };
+        }
+    }
 
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("program")));
@@ -890,6 +1014,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool) -> RunResult {
         shared_db.clone(),
         servers.clone(),
         secure,
+        overrides,
     ));
 
     let r = interp.execute(&program);
@@ -927,11 +1052,23 @@ fn serve_inner(source: &str, filename: &str, secure: bool) -> RunResult {
 /// línea de readiness y bloquea hasta que maten el proceso. Default no-secure
 /// (como `synsema run`); `secure=true` para el path seguro (body 500 genérico).
 pub fn run_serve_program(source: &str, filename: &str, secure: bool) -> RunResult {
+    run_serve_program_with_overrides(source, filename, secure, ServeOverrides::default())
+}
+
+/// Como `run_serve_program` pero con los flags de despliegue de la CLI (Pieza A):
+/// `--port`/`--domain`/`--tls-auto`/`--tls-cert`/`--tls-key`/`--bind`. Sobreescriben
+/// las cláusulas del bloque `serve` (precedencia flag > archivo > default).
+pub fn run_serve_program_with_overrides(
+    source: &str,
+    filename: &str,
+    secure: bool,
+    overrides: ServeOverrides,
+) -> RunResult {
     let src = source.to_string();
     let fname = filename.to_string();
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || serve_inner(&src, &fname, secure))
+        .spawn(move || serve_inner(&src, &fname, secure, overrides))
         .expect("no se pudo crear el hilo del motor serve")
         .join()
         .unwrap_or_else(|_| RunResult {

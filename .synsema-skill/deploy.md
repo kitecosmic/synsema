@@ -41,6 +41,51 @@ see [secrets.md](secrets.md). Resolution: **process environment → `.env` file 
   `~/.synsema/audit/reveal.log` — under systemd, set `SYNSEMA_AUDIT_DIR` or a writable
   `HOME`/`StateDirectory`, or `reveal()` will fail (by design: no audit, no reveal).
 
+## Serve deployment flags (dev-clean `.syn` + prod flags)
+
+The `serve` block stays **declarative and dev-clean** in the repo; deployment knobs
+(port, TLS, domains, bind address) are injected at launch with CLI flags. The same
+`.syn` runs locally with no setup (plain HTTP, high port) and in prod (443 + TLS +
+domain) **without editing the file**.
+
+```bash
+synsema serve <file> [--secure]
+    [--port N]                       # override `serve on N` AND grant serve(N)
+    [--domain d1[,d2,...]]           # ACME SAN domains (overrides `domain` in the file)
+    [--tls-auto <email> | --tls-cert <path> --tls-key <path>]
+    [--bind <addr>]                  # bind address (default 0.0.0.0)
+```
+
+| Flag | Effect |
+|---|---|
+| `--port N` | Overrides `serve on N` **and grants the `serve(N)` capability** (the operator passing the flag is the authority, so the file's `require serve(...)` need not match). |
+| `--domain d1,d2` | Sets/overrides the ACME SAN domains (comma-separated). |
+| `--tls-auto <email>` | Turns on auto-HTTPS (ACME) with that account email. **Its presence is the dev↔prod toggle.** Brings up the `:80` challenge/redirect listener. Requires a domain (`--domain` or `domain` in the file). |
+| `--tls-cert <p> --tls-key <p>` | Manual TLS. **Mutually exclusive** with `--tls-auto`. |
+| `--bind <addr>` | Bind address (default `0.0.0.0`). |
+
+**Precedence: CLI flag > file clause > default.**
+- No `--tls-auto` and no `tls` in the file → **plain HTTP** (dev).
+- `--tls-auto` (even if the file has no `tls`) → **TLS** (prod). This is the switch.
+- `--port` overrides `serve on N` and satisfies `serve(N)`.
+- Fail-loud: `--tls-auto` with no domain → error; `--tls-auto` together with `--tls-cert` → error; invalid port → error.
+- The flags configure **one** deployment: with **multiple `serve` blocks** in the file they are rejected with a clear error (the common case is a single `serve`).
+
+Canonical pattern — `site.syn` stays dev-clean in the repo:
+
+```
+require serve(8080)
+serve on 8080
+    static "/" from "./public"
+    route "GET /" ...
+```
+- Dev:  `synsema serve site.syn`  → `:8080`, plain HTTP, runs with nothing else.
+- Prod: `synsema serve site.syn --port 443 --domain example.com,www.example.com --tls-auto admin@example.com`
+
+> Use `env()`/`secret()` for runtime **values** (DB URL, API keys) and these flags for
+> the **deployment structure** of `serve`. The `serve` block has no `when`/conditionals
+> by design — the flags keep it declarative.
+
 ## Daemon details
 
 - Detaches from terminal (real process fork on Unix, subprocess on Windows)
@@ -96,7 +141,10 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/synsema serve /opt/agents/my_agent.syn
+# The .syn stays dev-clean (`serve on 8080`, no tls/domain). Prod deployment config
+# lives here as flags — the same file runs locally with just `synsema serve site.syn`.
+ExecStart=/usr/local/bin/synsema serve /opt/agents/site.syn \
+    --port 443 --domain example.com,www.example.com --tls-auto admin@example.com
 Restart=always
 RestartSec=5
 User=synsema
