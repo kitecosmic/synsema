@@ -1901,6 +1901,12 @@ fn make_redirect_val(location: String, status: i64) -> SynValue {
     SynValue::Server(Rc::new(ServerValue::Redirect { location, status }))
 }
 
+fn redirect_err(msg: &str) -> synsema_core::interpreter::Control {
+    synsema_core::interpreter::Control::Error(synsema_core::interpreter::RuntimeError::new(
+        msg.to_string(),
+    ))
+}
+
 fn n_nodes(v: Option<&SynValue>) -> SynValue {
     match v {
         Some(SynValue::List(l)) => syn_list(l.borrow().clone()),
@@ -2000,21 +2006,27 @@ pub fn register_serve_builtins(interp: &Interpreter) {
         -1,
         Rc::new(|_i, a, _l| {
             let url = text_arg(a.first());
+            // URL vacía → `Location:` vacío, inútil. Falla fuerte.
+            if url.is_empty() {
+                return Err(redirect_err("redirect(url): la URL no puede estar vacía"));
+            }
             // Seguridad: un Location con CR/LF permitiría header injection / response
             // splitting. Se rechaza explícito (falla fuerte, no se sanea en silencio).
             if url.contains('\r') || url.contains('\n') {
-                return Err(synsema_core::interpreter::Control::Error(
-                    synsema_core::interpreter::RuntimeError::new(
-                        "redirect(url): la URL no puede contener CR ni LF".to_string(),
-                    ),
-                ));
+                return Err(redirect_err("redirect(url): la URL no puede contener CR ni LF"));
             }
-            // status opcional (default 301 permanente); fuera del rango 3xx → 301.
+            // status opcional (default 301 permanente); fuera de 3xx → error explícito
+            // (no se clampea en silencio, para no enmascarar un bug del programa).
             let status = match a.get(1) {
                 Some(n @ SynValue::Number(_)) => num_i64(n),
                 _ => 301,
             };
-            let status = if (300..=399).contains(&status) { status } else { 301 };
+            if !(300..=399).contains(&status) {
+                return Err(redirect_err(&format!(
+                    "redirect(url, status): status debe ser 3xx, recibido {}",
+                    status
+                )));
+            }
             Ok(make_redirect_val(url, status))
         }),
     );
@@ -2393,11 +2405,19 @@ async fn handle_request(
         None => req.uri().path().to_string(),
     };
     let (path, query) = parse_path_query(&target);
-    let headers: Vec<(String, String)> = req
+    let mut headers: Vec<(String, String)> = req
         .headers()
         .iter()
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
+    // HTTP/2: el Host viaja en el pseudo-header `:authority` (vía `req.uri().authority()`),
+    // no en `headers()`. Sin esto, la selección de vhost y `host of (headers of request)`
+    // caen al host default para todo cliente h2 (los navegadores negocian h2 sobre TLS).
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+        if let Some(auth) = req.uri().authority() {
+            headers.push(("host".to_string(), auth.host().to_string()));
+        }
+    }
 
     if method == "OPTIONS" {
         return Ok(build_options_response(&rt, &path));

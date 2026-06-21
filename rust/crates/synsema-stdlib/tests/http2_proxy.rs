@@ -185,3 +185,99 @@ fn http2_alpn_handshake_and_get() {
     assert!(alpn_is_h2, "ALPN no negoció h2");
     assert_eq!(status, 200, "GET sobre HTTP/2 debió dar 200");
 }
+
+// ===================== vhost por :authority sobre HTTP/2 =====================
+
+/// Regresión: en HTTP/2 el Host viaja en el pseudo-header `:authority`, no en
+/// `headers()`. La selección de vhost debe sintetizar el host desde la authority,
+/// o todo cliente h2 (los navegadores) cae al host por defecto.
+#[test]
+fn vhost_selected_by_authority_over_http2() {
+    use std::rc::Rc;
+    use synsema_core::types::{ServerValue, SynValue};
+
+    // Host por defecto: solo "GET /" → "/foo" no matchea (sería 404 sin elegir el vhost).
+    let apex = RouteSpec {
+        method: "GET".to_string(),
+        path: "/".to_string(),
+        param_names: vec![],
+        requires_auth: false,
+        streaming: false,
+        rate_limit: None,
+        rate_zone: None,
+        handler: dummy_handler(),
+        stream_handler: None,
+        proxy_target: None,
+    };
+    // vhost www.example.com: catch-all que redirige 301.
+    let redir: Handler = Arc::new(|_ctx| {
+        let v = SynValue::Server(Rc::new(ServerValue::Redirect {
+            location: "https://example.com/moved".to_string(),
+            status: 301,
+        }));
+        GiveOutcome::Give(Some(v))
+    });
+    let vhost_route = RouteSpec {
+        method: "GET".to_string(),
+        path: "/*path".to_string(),
+        param_names: vec!["path".to_string()],
+        requires_auth: false,
+        streaming: false,
+        rate_limit: None,
+        rate_zone: None,
+        handler: redir,
+        stream_handler: None,
+        proxy_target: None,
+    };
+    let mut rtm = ServeRuntime::new(
+        0,
+        "0.0.0.0".to_string(),
+        vec![apex],
+        None,
+        None,
+        64,
+        Vec::new(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        false,
+        false,
+    );
+    rtm.add_vhost("www.example.com".to_string(), vec![vhost_route], Vec::new(), None);
+    let rt = Arc::new(rtm);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || serve_forever(rt, listener));
+    thread::sleep(Duration::from_millis(300));
+
+    // Cliente h2c (HTTP/2 en claro, prior-knowledge): request con :authority
+    // www.example.com y SIN header `host` → ejercita la síntesis del host.
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let (status, location) = runtime.block_on(async move {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let io = hyper_util::rt::TokioIo::new(tcp);
+        let (mut sender, conn) =
+            hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+                .await
+                .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = hyper::Request::builder()
+            .uri("http://www.example.com/foo")
+            .body(http_body_util::Empty::<Bytes>::new())
+            .unwrap();
+        let resp = sender.send_request(req).await.unwrap();
+        let loc = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        (resp.status().as_u16(), loc)
+    });
+
+    assert_eq!(status, 301, "vhost por :authority sobre h2 debió dar 301 (sin el fix: 404 del host default)");
+    assert_eq!(location, "https://example.com/moved", "Location del redirect del vhost");
+}
