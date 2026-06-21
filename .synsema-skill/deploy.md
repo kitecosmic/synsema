@@ -82,6 +82,11 @@ ExecStart=/usr/local/bin/synsema serve /opt/agents/my_agent.syn
 Restart=always
 RestartSec=5
 User=synsema
+# tls auto stores certs under ~/.synsema/certs, but systemd usually starts the
+# service with an empty HOME. StateDirectory= creates /var/lib/synsema (owned by
+# User=) where Synsema falls back to. Alternatively set Environment=HOME=/home/synsema
+# or Environment=SYNSEMA_CERT_DIR=/some/abs/path.
+StateDirectory=synsema
 
 [Install]
 WantedBy=multi-user.target

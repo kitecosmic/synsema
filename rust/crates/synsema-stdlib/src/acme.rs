@@ -10,7 +10,7 @@
 //! - `SYNSEMA_ACME_CA` — PEM de una CA a confiar (para PKI de prueba como Pebble).
 //! - `SYNSEMA_CERT_DIR` — dónde guardar cert+key (default `~/.synsema/certs`).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,15 +31,60 @@ fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// Directorio de almacenamiento de certs (`SYNSEMA_CERT_DIR` o `~/.synsema/certs`).
+/// Directorio de almacenamiento de certs. Orden: `SYNSEMA_CERT_DIR` → home del
+/// usuario (`~/.synsema/certs`) → un default **absoluto** de sistema.
+///
+/// NUNCA devuelve una ruta relativa: bajo systemd `HOME`/`USERPROFILE` suelen estar
+/// vacíos, y un path relativo guardaría los certs dentro del cwd (p.ej. el repo que
+/// el server está sirviendo → fuga). Si ni el default de sistema es escribible,
+/// `save_cert` falla con un error claro (mejor que escribir en silencio al lugar
+/// equivocado). Para servir bajo systemd: setear `HOME`, `SYNSEMA_CERT_DIR`, o
+/// `StateDirectory=synsema` (que mapea a `/var/lib/synsema`).
 pub fn certs_dir() -> PathBuf {
     if let Ok(d) = std::env::var("SYNSEMA_CERT_DIR") {
-        return PathBuf::from(d);
+        if !d.is_empty() {
+            return PathBuf::from(d);
+        }
     }
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default();
-    Path::new(&home).join(".synsema").join("certs")
+    if let Some(home) = home_dir() {
+        return home.join(".synsema").join("certs");
+    }
+    system_certs_dir()
+}
+
+/// Home del usuario como ruta **absoluta**, o `None` si no es resoluble.
+fn home_dir() -> Option<PathBuf> {
+    for var in ["USERPROFILE", "HOME"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                let p = PathBuf::from(v);
+                if p.is_absolute() {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Default de sistema **absoluto** cuando no hay home (p.ej. systemd sin `HOME`).
+#[cfg(windows)]
+fn system_certs_dir() -> PathBuf {
+    for var in ["ProgramData", "LOCALAPPDATA"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.is_empty() {
+                return PathBuf::from(v).join("synsema").join("certs");
+            }
+        }
+    }
+    std::env::temp_dir().join("synsema").join("certs")
+}
+
+/// FHS: estado variable de un servicio. systemd `StateDirectory=synsema` lo crea con
+/// permisos correctos. Absoluto → nunca cae a un path relativo del cwd.
+#[cfg(not(windows))]
+fn system_certs_dir() -> PathBuf {
+    PathBuf::from("/var/lib/synsema/certs")
 }
 
 fn sanitize(domain: &str) -> String {
@@ -271,6 +316,13 @@ pub fn spawn_renewal_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_certs_dir_is_absolute() {
+        // El fallback de sistema (cuando no hay HOME, p.ej. systemd) DEBE ser absoluto:
+        // un path relativo guardaría los certs en el cwd del programa servido.
+        assert!(system_certs_dir().is_absolute());
+    }
 
     #[test]
     fn sanitize_domain_for_filename() {
