@@ -46,14 +46,14 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          cp "rust/target/${{ matrix.target }}/release/syntecnia-cli" "${{ matrix.asset }}"
+          cp "rust/target/${{ matrix.target }}/release/syntecnia" "${{ matrix.asset }}"
           shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Copy-Item "rust/target/${{ matrix.target }}/release/syntecnia-cli.exe" "${{ matrix.asset }}"
+          Copy-Item "rust/target/${{ matrix.target }}/release/syntecnia.exe" "${{ matrix.asset }}"
           (Get-FileHash "${{ matrix.asset }}" -Algorithm SHA256).Hash | Out-File -Encoding ascii "${{ matrix.asset }}.sha256"
 
       - name: Upload to Release

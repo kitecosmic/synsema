@@ -3,12 +3,12 @@ name = "syntecnia-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Syntecnia CLI — binario syntecnia-cli (subcomando de conformidad)"
+description = "Syntecnia CLI — the `syntecnia` command"
 
-# Binario `syntecnia-cli` (el contrato del gate del agente de testing). En la
-# distribución (Parte C) el producto final se renombra a `syntecnia`.
+# The product command is `syntecnia` (single, unified name). The crate is still
+# `syntecnia-cli` (built with `-p syntecnia-cli`), but it produces a `syntecnia` binary.
 [[bin]]
-name = "syntecnia-cli"
+name = "syntecnia"
 path = "src/main.rs"
 
 [dependencies]

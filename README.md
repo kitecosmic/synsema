@@ -39,7 +39,7 @@ a property of the language, not a discipline you have to remember.
 git clone https://github.com/kitecosmic/Syntecnia.git
 cd Syntecnia
 cargo build --release --manifest-path rust/Cargo.toml
-# binary at rust/target/release/syntecnia-cli
+# binary at rust/target/release/syntecnia
 ```
 
 The result is one self-contained executable — no Python, no npm, nothing to install on the target.
@@ -74,8 +74,8 @@ syntecnia run hello.syn
 
 ## Usage
 
-With the Rust binary the command is `syntecnia-cli` (e.g. `syntecnia-cli run program.syn`,
-`syntecnia-cli serve app.syn`); the Python `syntecnia` command takes the same subcommands.
+The command is `syntecnia` for both implementations (e.g. `syntecnia run program.syn`,
+`syntecnia serve app.syn`).
 
 ```bash
 syntecnia run program.syn              # Run a program
@@ -523,7 +523,7 @@ rust/                  # Cargo workspace — the production interpreter (single 
 │   ├── syntecnia-agents/      # blackboard, swarm, memory, progress, resource_lock
 │   ├── syntecnia-runtime/     # engine, serve, parallel (concurrency), recovery, persistence, daemon
 │   ├── syntecnia-llm/         # provider, context, validator, human
-│   └── syntecnia-cli/         # CLI: run, serve, conform, check, repl, ast, tokens, daemon
+│   └── syntecnia-cli/         # crate that builds the `syntecnia` binary: run, serve, conform, check, repl, ast, tokens, daemon
 └── ...
 ```
 

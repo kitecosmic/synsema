@@ -436,12 +436,17 @@ def _render_html(tree: SynValue) -> str:
     meta = d.get("meta", {}) if d.get("kind") == "page" else {}
     title = meta.get("title")
     description = meta.get("description")
+    # Optional stylesheet for the HTML representation only (head-only; the
+    # Markdown/JSON representations of the same content() are unaffected).
+    stylesheet = meta.get("stylesheet")
     head = ['<meta charset="utf-8">',
             '<meta name="viewport" content="width=device-width, initial-scale=1">']
     if title:
         head.append(f"<title>{_esc(title)}</title>")
     if description:
         head.append(f'<meta name="description" content="{_esc(description)}">')
+    if stylesheet:
+        head.append(f'<link rel="stylesheet" href="{_esc(stylesheet)}">')
     # Structured data (JSON-LD) from the page metadata → SEO for crawlers/agents.
     if title or description:
         ld = {"@context": "https://schema.org", "@type": "WebPage"}

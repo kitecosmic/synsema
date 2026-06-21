@@ -1728,6 +1728,9 @@ fn render_html(tree: &SynValue) -> String {
     let meta = if is_page { node_field(tree, "meta") } else { None };
     let title = meta.as_ref().and_then(|m| meta_get(m, "title"));
     let description = meta.as_ref().and_then(|m| meta_get(m, "description"));
+    // Optional stylesheet for the HTML representation only (head-only; the
+    // Markdown/JSON representations of the same content() are unaffected).
+    let stylesheet = meta.as_ref().and_then(|m| meta_get(m, "stylesheet"));
     let mut head = vec![
         "<meta charset=\"utf-8\">".to_string(),
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">".to_string(),
@@ -1737,6 +1740,9 @@ fn render_html(tree: &SynValue) -> String {
     }
     if let Some(d) = &description {
         head.push(format!("<meta name=\"description\" content=\"{}\">", esc(d)));
+    }
+    if let Some(s) = &stylesheet {
+        head.push(format!("<link rel=\"stylesheet\" href=\"{}\">", esc(s)));
     }
     if title.is_some() || description.is_some() {
         let mut ld: Vec<(&str, Json)> = vec![
