@@ -90,18 +90,23 @@ fn save_cert(domain: &str, cert_pem: &str, key_pem: &str) -> Result<(PathBuf, Pa
 /// Obtiene un cert vía ACME HTTP-01 y lo guarda en disco. Devuelve (cert_path, key_path).
 /// El listener de challenge HTTP **debe** estar corriendo y compartir `store`.
 pub fn obtain_and_save(
-    domain: &str,
+    domains: &[String],
     email: Option<&str>,
     store: ChallengeStore,
 ) -> Result<(PathBuf, PathBuf), String> {
-    let (cert_pem, key_pem) = provision_certificate(domain, email, store)?;
-    save_cert(domain, &cert_pem, &key_pem)
+    let primary = domains
+        .first()
+        .ok_or_else(|| "ACME requires at least one domain".to_string())?;
+    let (cert_pem, key_pem) = provision_certificate(domains, email, store)?;
+    // El cert (que cubre todos los `domains` como SAN) se guarda bajo el dominio
+    // primario (el primero); los SAN viven dentro del PEM.
+    save_cert(primary, &cert_pem, &key_pem)
 }
 
 /// Flujo ACME completo (cuenta → orden → HTTP-01 → finalize → cert). Devuelve los
 /// PEM (cert chain, private key). Arranca un runtime tokio acotado internamente.
 pub fn provision_certificate(
-    domain: &str,
+    domains: &[String],
     email: Option<&str>,
     store: ChallengeStore,
 ) -> Result<(String, String), String> {
@@ -117,15 +122,15 @@ pub fn provision_certificate(
         .build()
         .map_err(|e| format!("could not start ACME runtime: {}", e))?;
 
-    let domain = domain.to_string();
+    let domains: Vec<String> = domains.to_vec();
     let email = email.map(|s| s.to_string());
     rt.block_on(async move {
-        acme_flow(&domain, email.as_deref(), &directory_url, ca_root.as_deref(), store).await
+        acme_flow(&domains, email.as_deref(), &directory_url, ca_root.as_deref(), store).await
     })
 }
 
 async fn acme_flow(
-    domain: &str,
+    domains: &[String],
     email: Option<&str>,
     directory_url: &str,
     ca_root: Option<&str>,
@@ -154,11 +159,15 @@ async fn acme_flow(
         .map_err(|e| format!("ACME account creation failed: {}", e))?;
 
     // Un identifier IP (p.ej. "127.0.0.1") va como Identifier::Ip; lo demás como DNS.
-    let identifier = match domain.parse::<std::net::IpAddr>() {
-        Ok(ip) => Identifier::Ip(ip),
-        Err(_) => Identifier::Dns(domain.to_string()),
-    };
-    let identifiers = [identifier];
+    // Con varios dominios se pide un único certificado SAN (p.ej. apex + www): la
+    // orden lleva todos los identifiers y cada uno resuelve su propio HTTP-01 abajo.
+    let identifiers: Vec<Identifier> = domains
+        .iter()
+        .map(|d| match d.parse::<std::net::IpAddr>() {
+            Ok(ip) => Identifier::Ip(ip),
+            Err(_) => Identifier::Dns(d.to_string()),
+        })
+        .collect();
     let mut order = account
         .new_order(&NewOrder::new(&identifiers))
         .await
@@ -208,15 +217,18 @@ async fn acme_flow(
 /// Carga el cert en disco si está fresco; si no, lo obtiene vía ACME. Construye y
 /// devuelve la config TLS. El listener de challenge debe compartir `store`.
 pub fn load_or_obtain_config(
-    domain: &str,
+    domains: &[String],
     email: Option<&str>,
     store: ChallengeStore,
 ) -> Result<Arc<rustls::ServerConfig>, String> {
-    let (cert_path, key_path) = if has_fresh_cert(domain) {
-        let (c, k, _) = cert_paths(domain);
+    let primary = domains
+        .first()
+        .ok_or_else(|| "ACME requires at least one domain".to_string())?;
+    let (cert_path, key_path) = if has_fresh_cert(primary) {
+        let (c, k, _) = cert_paths(primary);
         (c, k)
     } else {
-        obtain_and_save(domain, email, store)?
+        obtain_and_save(domains, email, store)?
     };
     server::build_tls_config(&cert_path.to_string_lossy(), &key_path.to_string_lossy())
 }
@@ -224,19 +236,22 @@ pub fn load_or_obtain_config(
 /// Lanza un hilo de renovación: cada 12h chequea la frescura del cert y, si entra
 /// en la ventana de renovación (<30 días), re-emite y hot-swappea `cell`.
 pub fn spawn_renewal_thread(
-    domain: String,
+    domains: Vec<String>,
     email: Option<String>,
     store: ChallengeStore,
     cell: SharedServerConfig,
 ) {
+    // La frescura/almacenamiento se llavea por el dominio primario; al renovar se
+    // re-emite el cert SAN completo (`&domains`).
+    let primary = domains.first().cloned().unwrap_or_default();
     std::thread::Builder::new()
-        .name(format!("acme-renew:{}", domain))
+        .name(format!("acme-renew:{}", primary))
         .spawn(move || loop {
             std::thread::sleep(Duration::from_secs(12 * 60 * 60));
-            if has_fresh_cert(&domain) {
+            if has_fresh_cert(&primary) {
                 continue;
             }
-            match obtain_and_save(&domain, email.as_deref(), store.clone()) {
+            match obtain_and_save(&domains, email.as_deref(), store.clone()) {
                 Ok((cert, key)) => {
                     if let Ok(cfg) =
                         server::build_tls_config(&cert.to_string_lossy(), &key.to_string_lossy())
@@ -244,10 +259,10 @@ pub fn spawn_renewal_thread(
                         if let Ok(mut w) = cell.write() {
                             *w = cfg;
                         }
-                        println!("ACME: renewed certificate for {}", domain);
+                        println!("ACME: renewed certificate for {}", primary);
                     }
                 }
-                Err(e) => eprintln!("ACME: renewal failed for {}: {}", domain, e),
+                Err(e) => eprintln!("ACME: renewal failed for {}: {}", primary, e),
             }
         })
         .ok();

@@ -691,15 +691,20 @@ fn make_serve_hook(
         };
 
         // -- auto-HTTPS / ACME (A2 batch 2): `tls auto [<email>]` + `domain <expr>` --
-        let acme_domain = match domain_n {
-            Some(d) => Some(interp.eval(d, env)?.to_string()),
-            None => None,
+        // `domain` acepta un string (un dominio) o una lista (cert SAN multi-dominio,
+        // p.ej. `domain ["synsema.com", "www.synsema.com"]`). El primero es el primario.
+        let acme_domains: Vec<String> = match domain_n {
+            Some(d) => match interp.eval(d, env)? {
+                SynValue::List(l) => l.borrow().iter().map(|x| x.to_string()).collect(),
+                other => vec![other.to_string()],
+            },
+            None => Vec::new(),
         };
         let acme_email = match tls_auto_email_n {
             Some(e) => Some(interp.eval(e, env)?.to_string()),
             None => None,
         };
-        if tls_auto && acme_domain.is_none() {
+        if tls_auto && acme_domains.is_empty() {
             return Err(Control::Error(RuntimeError::new(
                 "tls auto (auto-HTTPS) requires a domain — add `domain \"example.com\"` to the serve block".to_string(),
             )));
@@ -745,7 +750,6 @@ fn make_serve_hook(
         // auto-HTTPS: levanta el listener de challenge (HTTP-01 + 301), obtiene/carga
         // el cert (bloquea hasta tenerlo) y sirve HTTPS con hot-swap en renovación.
         if tls_auto {
-            let domain = acme_domain.expect("domain validado arriba");
             let http_port: u16 = std::env::var("SYNSEMA_ACME_HTTP_PORT")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -770,17 +774,18 @@ fn make_serve_hook(
                     .expect("hilo de challenge ACME");
                 servers.lock().unwrap().push(h);
             }
-            // Obtiene (o reusa) el cert. Bloqueante: no se puede servir HTTPS sin él.
-            let cfg = match acme::load_or_obtain_config(&domain, acme_email.as_deref(), store.clone())
+            // Obtiene (o reusa) el cert SAN (cubre todos los `acme_domains`).
+            // Bloqueante: no se puede servir HTTPS sin él.
+            let cfg = match acme::load_or_obtain_config(&acme_domains, acme_email.as_deref(), store.clone())
             {
                 Ok(c) => c,
                 Err(e) => {
                     return Err(Control::Error(RuntimeError::new(format!("ACME error: {}", e))))
                 }
             };
-            println!("ACME: certificate ready for {}", domain);
+            println!("ACME: certificate ready for {}", acme_domains.join(", "));
             let cell: server::SharedServerConfig = Arc::new(std::sync::RwLock::new(cfg));
-            acme::spawn_renewal_thread(domain, acme_email, store, cell.clone());
+            acme::spawn_renewal_thread(acme_domains, acme_email, store, cell.clone());
             let rt2 = rt.clone();
             let h = std::thread::Builder::new()
                 .name(format!("serve:{}", port_str))

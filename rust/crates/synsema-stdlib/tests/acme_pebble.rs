@@ -143,9 +143,12 @@ fn acme_http01_end_to_end_against_pebble() {
     std::env::set_var("SYNSEMA_CERT_DIR", &certdir);
 
     // (7) Emite el cert end-to-end (cuenta → orden → HTTP-01 → finalize → cert).
-    let (cert_path, key_path) =
-        synsema_stdlib::acme::obtain_and_save("127.0.0.1", Some("admin@example.com"), store.clone())
-            .expect("emisión ACME contra Pebble falló");
+    let (cert_path, key_path) = synsema_stdlib::acme::obtain_and_save(
+        &["127.0.0.1".to_string()],
+        Some("admin@example.com"),
+        store.clone(),
+    )
+    .expect("emisión ACME contra Pebble falló");
     assert!(cert_path.is_file() && key_path.is_file(), "no se guardaron cert/key");
 
     // (8) Construye el TLS config con el cert emitido y sirve HTTPS.
