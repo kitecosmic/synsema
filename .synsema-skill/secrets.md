@@ -142,12 +142,15 @@ secret without ever exposing it.
 ## Dev vs prod — the same code
 
 ```
--- dev:  .env provides the values → `synsema serve app.syn`.
--- prod: systemd Environment= (or Docker -e) overrides .env. No repo edits.
-require env("PORT")
-let port be env("PORT", 8080)
-require serve(port)
-serve on port
+-- The .syn stays dev-clean: `synsema serve app.syn` → :8080, plain HTTP locally.
+-- App values resolve from .env in dev and from the environment in prod (no repo edits).
+require serve(8080)
+serve on 8080
     route "GET /health"
         give {"ok": true}
 ```
+
+> For the serve **port and TLS** (the deployment *structure*), prefer the CLI flags
+> (`--port` / `--domain` / `--tls-auto`) — see [deploy.md](deploy.md). Use
+> `env()`/`secret()` for application **values** (DB URL, API keys, webhook secrets),
+> not for the serve port.
