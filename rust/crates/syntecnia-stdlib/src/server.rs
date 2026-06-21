@@ -1767,15 +1767,19 @@ fn render_html(tree: &SynValue) -> String {
     // site passes the SAME nav/footer partials it uses elsewhere via `body of render(...)`.
     let header = meta.as_ref().and_then(|m| meta_get(m, "header")).unwrap_or_default();
     let footer = meta.as_ref().and_then(|m| meta_get(m, "footer")).unwrap_or_default();
+    // The content container class is overridable (default "prose") so the page author —
+    // not the language — controls styling. The Markdown/JSON representations ignore it.
+    let css_class = meta.as_ref().and_then(|m| meta_get(m, "class")).unwrap_or_else(|| "prose".to_string());
     let body = if is_page {
         list_field(tree, "nodes").iter().filter(|n| is_node(n)).map(render_node_html).collect::<String>()
     } else {
         render_node_html(tree)
     };
     format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n{}\n</head>\n<body>\n{}<main class=\"prose\">\n{}</main>\n{}</body>\n</html>\n",
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n{}\n</head>\n<body>\n{}<main class=\"{}\">\n{}</main>\n{}</body>\n</html>\n",
         head.join("\n"),
         header,
+        css_class,
         body,
         footer
     )

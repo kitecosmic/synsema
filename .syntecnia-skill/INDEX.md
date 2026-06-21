@@ -13,6 +13,7 @@ Read ONLY the sections you need. Do not load everything.
 ## By topic
 - [stdlib.md](stdlib.md) — HTTP requests, SQL database, cron scheduler (zero dependencies)
 - [concurrency.md](concurrency.md) — Real multi-core parallelism (Rust): `parallel_map`, `chunk`, fan-out/merge, fail-fast
+- [frontend.md](frontend.md) — Building UIs/sites: render() templates (full freedom) + layouts/partials/includes + static assets + client JS; content() for agent-negotiable pages. No imposed framework.
 - [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination/paged(), streaming (SSE), rate limiting, body limits, HTML/SSR pages (`render`, `html`), static files, CORS, content negotiation (HTML/Markdown/JSON for agents), agent discoverability (`llms.txt`), **and the Rust production stack: TLS / auto-HTTPS (ACME) / virtual hosts / reverse proxy / HTTP-2 / production static (ETag·Range·gzip)**
 - [capabilities.md](capabilities.md) — Security model, require, sandbox, intent
 - [agents.md](agents.md) — Multi-agent coordination, blackboard, swarm, signals
@@ -37,6 +38,7 @@ Read ONLY the sections you need. Do not load everything.
 - Writing a new .syn program → syntax.md, builtins.md
 - HTTP / SQL / cron → stdlib.md
 - Parallelism / fan-out / process many things at once → concurrency.md
+- Building a UI / website / frontend (templates, layouts, CSS, JS) → frontend.md
 - HTTPS / TLS / auto-HTTPS / certificates → serve.md (production web stack)
 - Multi-domain / virtual hosts / reverse proxy → serve.md (production web stack)
 - Building an HTTP API / web server → serve.md

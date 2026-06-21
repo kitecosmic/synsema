@@ -464,6 +464,9 @@ def _render_html(tree: SynValue) -> str:
     # site passes the SAME nav/footer partials it uses elsewhere via `body of render(...)`.
     header = meta.get("header", "")
     footer = meta.get("footer", "")
+    # The content container class is overridable (default "prose") so the page author —
+    # not the language — controls styling. The Markdown/JSON representations ignore it.
+    css_class = meta.get("class", "prose")
     if d.get("kind") == "page":
         body = "".join(_render_node_html(n) for n in d.get("nodes", []) if _is_node(n))
     else:
@@ -473,7 +476,7 @@ def _render_html(tree: SynValue) -> str:
         + "\n".join(head)
         + "\n</head>\n<body>\n"
         + header
-        + "<main class=\"prose\">\n"
+        + f'<main class="{css_class}">\n'
         + body
         + "</main>\n"
         + footer
