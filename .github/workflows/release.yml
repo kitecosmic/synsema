@@ -39,6 +39,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # ring (the rustls crypto backend) assembles with NASM on windows-msvc;
+      # the runners don't ship it. Linux/macOS use the system assembler (no-op here).
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
       - name: Build
         run: cargo build --release --locked --manifest-path rust/Cargo.toml -p syntecnia-cli --target ${{ matrix.target }}
 
