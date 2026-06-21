@@ -698,16 +698,26 @@ serve on 443
 - The `:80 → :443` redirect **preserves the `Host`** — there is no automatic
   `www.example.com → example.com` canonicalization. To make `www` work over HTTPS, include
   it in the `domain` list (above) so it gets a valid cert. To *canonicalize* `www` to the
-  apex, add a catch-all route that uses `redirect()` (the Host is read from the request
-  headers — keys are lower-case — there is no `host of request` shortcut):
+  apex, give `www` its own **vhost** (`host "www.example.com"`) whose only route redirects —
+  do **not** add a catch-all route on the default host, because declared routes win over
+  `static` mounts and a `GET /*path` would shadow all your assets:
 
   ```
-  route "GET /*path"
-      let h be host of (headers of request)
-      when starts_with(h, "www.")
-          give redirect("https://example.com/" + params.path)
-      give ...your normal response...
+  serve on 443
+      tls auto "admin@example.com"
+      domain ["example.com", "www.example.com"]
+      host "www.example.com"
+          route "GET /*path"
+              give redirect("https://example.com/" + params.path)
+      -- default host (apex) = your real site; statics keep working
+      static "/assets" from "./static"
+      route "GET /" ...
   ```
+
+  vhost selection is by the request's `Host` (or, over HTTP/2, the `:authority` pseudo-
+  header — both handled). If you need the host inside a handler, read it from
+  `host of (headers of request)` (header keys are lower-case; there is no `host of request`
+  shortcut).
 
 ### Virtual hosts (multi-domain)
 
