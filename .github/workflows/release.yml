@@ -1,0 +1,67 @@
+name: release
+
+# Cross-compile the Syntecnia binary for Linux/macOS/Windows and publish to a
+# GitHub Release. Triggered by pushing a version tag (e.g. `git tag v0.1.0 && git push --tags`),
+# or manually via the Actions tab. The asset names match install.sh / install.ps1.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: syntecnia-linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: syntecnia-macos-aarch64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset: syntecnia-macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: syntecnia-windows-x86_64.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --manifest-path rust/Cargo.toml -p syntecnia-cli --target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cp "rust/target/${{ matrix.target }}/release/syntecnia-cli" "${{ matrix.asset }}"
+          shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item "rust/target/${{ matrix.target }}/release/syntecnia-cli.exe" "${{ matrix.asset }}"
+          (Get-FileHash "${{ matrix.asset }}" -Algorithm SHA256).Hash | Out-File -Encoding ascii "${{ matrix.asset }}.sha256"
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
+
+  # NOTE: aarch64-linux is deferred (needs a C cross-toolchain for rusqlite's bundled
+  # SQLite). Add it later via `cross` or a gcc-aarch64 setup if there's demand.
