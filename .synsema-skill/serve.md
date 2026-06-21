@@ -176,12 +176,19 @@ route "GET /report.csv"
 
 route "GET /legacy"
     give respond("<x/>", "application/xml", 404)   -- content-type + status
+
+route "GET /old-path"
+    give redirect("https://example.com/new-path")   -- 301 + Location, no body
 ```
 
 - `html(content)` → status `200`, `Content-Type: text/html; charset=utf-8`, body
   written **verbatim** (no `json.dumps`, no quotes).
 - `respond(content, content_type, status?)` → arbitrary content-type, optional
   status (default `200`).
+- `redirect(url, status?)` → a `3xx` response with a `Location: <url>` header and no
+  body. Default status `301` (permanent); pass `302` for a temporary redirect. The URL
+  is rejected (500) if it contains CR/LF — this prevents header injection. Use it for
+  canonical redirects (see `www → apex` under TLS below) or moved resources.
 - `give <map>` / `give <list>` are unchanged — still JSON. For text plain use
   `respond(x, "text/plain")` (the `text(...)` builtin is value conversion, not a
   response helper).
@@ -689,9 +696,18 @@ serve on 443
   301-redirects everything else to HTTPS — so `redirect https` is implicit; adding it is a
   silent no-op. `redirect https` only does work alongside a **manual** `tls cert`.
 - The `:80 → :443` redirect **preserves the `Host`** — there is no automatic
-  `www.example.com → example.com` canonicalization. To make `www` work over HTTPS you must
-  include it in the `domain` list (above) so it gets a valid cert; to *canonicalize* to the
-  apex, add a route that 301s when `host of request` starts with `www.`.
+  `www.example.com → example.com` canonicalization. To make `www` work over HTTPS, include
+  it in the `domain` list (above) so it gets a valid cert. To *canonicalize* `www` to the
+  apex, add a catch-all route that uses `redirect()` (the Host is read from the request
+  headers — keys are lower-case — there is no `host of request` shortcut):
+
+  ```
+  route "GET /*path"
+      let h be host of (headers of request)
+      when starts_with(h, "www.")
+          give redirect("https://example.com/" + params.path)
+      give ...your normal response...
+  ```
 
 ### Virtual hosts (multi-domain)
 

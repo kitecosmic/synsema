@@ -505,6 +505,10 @@ pub fn syn_to_json(v: &SynValue) -> Json {
                 Ok((rows, _)) => Json::Array(rows.iter().map(syn_to_json).collect()),
                 Err(_) => Json::Null,
             },
+            ServerValue::Redirect { location, status } => obj(vec![
+                ("redirect", Json::Str(location.clone())),
+                ("status", Json::Int(*status)),
+            ]),
         },
     }
 }
@@ -628,6 +632,12 @@ pub fn build_response(
             ServerValue::Envelope { status, value } => {
                 return Ok((*status as u16, ResponseBody::Json(shape(Some(value), query)?)));
             }
+            ServerValue::Redirect { location, status } => {
+                return Ok((
+                    *status as u16,
+                    ResponseBody::Redirect { location: location.clone(), status: *status as u16 },
+                ));
+            }
             _ => {}
         }
     }
@@ -696,6 +706,9 @@ pub struct RouteSpec {
 pub enum ResponseBody {
     Json(Json),
     Raw(RawResponse),
+    /// `redirect()` — 3xx + header `Location` (sin body). El `Location` lo inyecta
+    /// el dispatch en los headers extra; acá viaja solo el destino + status.
+    Redirect { location: String, status: u16 },
 }
 
 // =========================================================
@@ -1884,6 +1897,10 @@ fn make_envelope(status: i64, value: SynValue) -> SynValue {
     SynValue::Server(Rc::new(ServerValue::Envelope { status, value }))
 }
 
+fn make_redirect_val(location: String, status: i64) -> SynValue {
+    SynValue::Server(Rc::new(ServerValue::Redirect { location, status }))
+}
+
 fn n_nodes(v: Option<&SynValue>) -> SynValue {
     match v {
         Some(SynValue::List(l)) => syn_list(l.borrow().clone()),
@@ -1976,6 +1993,30 @@ pub fn register_serve_builtins(interp: &Interpreter) {
         "html",
         1,
         Rc::new(|_i, a, _l| Ok(make_raw_val(text_arg(a.first()), "text/html; charset=utf-8", 200))),
+    );
+    // redirect(url, status?) — respuesta 3xx con header Location. status default 301.
+    interp.register_builtin(
+        "redirect",
+        -1,
+        Rc::new(|_i, a, _l| {
+            let url = text_arg(a.first());
+            // Seguridad: un Location con CR/LF permitiría header injection / response
+            // splitting. Se rechaza explícito (falla fuerte, no se sanea en silencio).
+            if url.contains('\r') || url.contains('\n') {
+                return Err(synsema_core::interpreter::Control::Error(
+                    synsema_core::interpreter::RuntimeError::new(
+                        "redirect(url): la URL no puede contener CR ni LF".to_string(),
+                    ),
+                ));
+            }
+            // status opcional (default 301 permanente); fuera del rango 3xx → 301.
+            let status = match a.get(1) {
+                Some(n @ SynValue::Number(_)) => num_i64(n),
+                _ => 301,
+            };
+            let status = if (300..=399).contains(&status) { status } else { 301 };
+            Ok(make_redirect_val(url, status))
+        }),
     );
     interp.register_builtin(
         "respond",
@@ -2237,6 +2278,8 @@ fn response_body_bytes(body: ResponseBody) -> (String, Bytes) {
     match body {
         ResponseBody::Json(j) => ("application/json".to_string(), Bytes::from(dumps(&j))),
         ResponseBody::Raw(r) => (r.content_type, Bytes::from(r.body)),
+        // El destino va como header `Location` (inyectado en el dispatch); sin body.
+        ResponseBody::Redirect { .. } => ("text/plain; charset=utf-8".to_string(), Bytes::new()),
     }
 }
 
@@ -2396,6 +2439,11 @@ async fn handle_request(
         let bf = body_file.as_ref().map(|p| p.to_string_lossy().into_owned());
         match rt2.dispatch(&eff_method, &path, query, headers, &body_str, bf.as_deref(), &client_ip) {
             Dispatched::Response { status, body, headers: extra } => {
+                let mut extra = extra;
+                // redirect(): el destino se emite como header `Location`.
+                if let ResponseBody::Redirect { location, .. } = &body {
+                    extra.push(("Location".to_string(), location.clone()));
+                }
                 let (ct, bytes) = response_body_bytes(body);
                 let _ = head_tx.send(HeadInfo {
                     status,

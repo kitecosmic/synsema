@@ -57,6 +57,8 @@ pub enum ServerValue {
     Node(MapRef),
     /// `content()` — árbol negociable (HTML/MD/JSON). Envuelve un nodo. (_CONTENT)
     Content(Box<SynValue>),
+    /// `redirect()` — respuesta 3xx con header `Location` y sin body. (_REDIRECT)
+    Redirect { location: String, status: i64 },
     /// `paged()` — paginación lazy vía SQL. (_PAGED)
     Paged(Rc<PagedFetch>),
 }
@@ -77,6 +79,11 @@ impl ServerValue {
                 _ => None,
             },
             ServerValue::Node(m) => m.borrow().get(key).cloned(),
+            ServerValue::Redirect { location, status } => match key {
+                "location" => Some(syn_text(location.as_str())),
+                "status" => Some(syn_int(*status)),
+                _ => None,
+            },
             ServerValue::Content(_) | ServerValue::Paged(_) => None,
         }
     }
@@ -162,6 +169,10 @@ impl SynValue {
                 }
                 (ServerValue::Content(a), ServerValue::Content(b)) => a.syn_equals(b),
                 (ServerValue::Paged(a), ServerValue::Paged(b)) => Rc::ptr_eq(a, b),
+                (
+                    ServerValue::Redirect { location: l1, status: s1 },
+                    ServerValue::Redirect { location: l2, status: s2 },
+                ) => l1 == l2 && s1 == s2,
                 _ => false,
             },
             _ => false,
@@ -207,6 +218,9 @@ impl fmt::Display for SynValue {
                 }
                 ServerValue::Content(inner) => write!(f, "{}", inner),
                 ServerValue::Paged(_) => write!(f, "{{paged}}"),
+                ServerValue::Redirect { location, status } => {
+                    write!(f, "{{redirect: {}, status: {}}}", location, status)
+                }
             },
         }
     }
@@ -297,6 +311,10 @@ pub fn to_send(v: &SynValue) -> SendValue {
             }
             ServerValue::Content(inner) => to_send(inner),
             ServerValue::Paged(_) => SendValue::Text("{paged}".to_string()),
+            ServerValue::Redirect { location, status } => SendValue::Map(vec![
+                ("redirect".to_string(), SendValue::Text(location.clone())),
+                ("status".to_string(), SendValue::Number(Number::Int(*status))),
+            ]),
         },
     }
 }
