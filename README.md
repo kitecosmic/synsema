@@ -2,54 +2,41 @@
 
 A programming language designed for AI agents.
 
-Syntecnia is not a framework or a library — it's a language where observability, security, multi-agent coordination, human interaction, and LLM integration are built-in primitives, not afterthoughts.
-
-## Two implementations
-
-Syntecnia has two interpreters that pass the **same** test corpus, byte-for-byte:
-
-- **Python** (`syntecnia/`) — the reference implementation. Frozen; acts as the conformance oracle.
-- **Rust** (`rust/`) — the production implementation. A single static binary, no runtime, no GIL, true multi-core. Adds what Python couldn't: real concurrency (`parallel_map`) and a native web stack (TLS, auto-HTTPS/ACME, virtual hosts, reverse proxy, HTTP/2).
-
-Parity is enforced by a differential test harness: the same `.syn` programs run against both interpreters and must produce identical results.
+Syntecnia is not a framework or a library — it's a language where observability, security, multi-agent coordination, human interaction, and LLM integration are built-in primitives, not afterthoughts. It compiles to a single native binary: no runtime, no GIL, true multi-core.
 
 ## Fast *and* secure
 
-The Rust implementation is in the Go/Node performance tier — and adds deny-by-default
-security none of them have. HTTP throughput, same API, 100 concurrent connections:
+Syntecnia is in the Go/Node performance tier — and adds deny-by-default security none of
+them have. HTTP throughput, same API, 100 concurrent connections:
 
-| Framework | req/s | avg latency | p99 |
+| Stack | req/s | avg latency | p99 |
 |---|---|---|---|
-| Node/TS | 2,746 | 11.5 ms | 41 ms |
-| **Syntecnia (Rust)** | **2,610** | **14.4 ms** | **50 ms** |
+| **Syntecnia** | **2,610** | **14.4 ms** | **50 ms** |
+| Node | 2,746 | 11.5 ms | 41 ms |
 | Go (net/http) | 2,522 | 16.5 ms | 58 ms |
 | FastAPI (uvicorn) | 1,744 | 51.3 ms | 79 ms |
 
-Node, Syntecnia (Rust), and Go are effectively tied (run-to-run noise); Syntecnia is
-~1.5× FastAPI under load. Unlike all of them, Syntecnia enforces **capability security at
-the language level** — no network, file, or DB access without an explicit `require`, route
-auth and input validation are declarative, and there's an automatic audit log. Security is
-a property of the language, not a discipline you have to remember.
+Syntecnia, Node, and Go are effectively tied (run-to-run noise); Syntecnia is ~1.5× FastAPI
+under load. Unlike all of them, Syntecnia enforces **capability security at the language
+level** — no network, file, or DB access without an explicit `require`, route auth and input
+validation are declarative, and there's an automatic audit log. Security is a property of
+the language, not a discipline you have to remember.
 
 ## Install
 
-### Rust (production — single binary, zero runtime)
+A single self-contained binary — no Python, no npm, nothing to install on the target.
+
+```bash
+# one-liner (Linux/macOS) — once a release is published
+curl -fsSL https://syntecnia.org/install.sh | sh
+```
+
+### Build from source
 
 ```bash
 git clone https://github.com/kitecosmic/Syntecnia.git
 cd Syntecnia
-cargo build --release --manifest-path rust/Cargo.toml
-# binary at rust/target/release/syntecnia
-```
-
-The result is one self-contained executable — no Python, no npm, nothing to install on the target.
-
-### Python (reference — needs only Python 3.10+)
-
-```bash
-pip install -e .          # creates the 'syntecnia' command
-# or run directly, no install:
-python3 -m syntecnia version
+cargo build --release --manifest-path rust/Cargo.toml   # → rust/target/release/syntecnia
 ```
 
 ## Quick start
@@ -169,7 +156,7 @@ let sorted be sort_by(products, get_price)
 let groups be group_by(orders, get_status)
 ```
 
-### Concurrency (Rust)
+### Concurrency
 
 Real, multi-core parallelism — no GIL. `parallel_map` runs a task over a list
 concurrently, results in input order, with a bounded number of simultaneous workers:
@@ -237,10 +224,9 @@ serve on 8080
 
 See [.syntecnia-skill/serve.md](.syntecnia-skill/serve.md) for full details.
 
-### Production web stack (Rust) — no Caddy/nginx needed
+### Production web stack — no Caddy/nginx needed
 
-The Rust server runs on `tokio`/`hyper`/`rustls` and adds, natively, what you'd normally
-put a reverse proxy in front for:
+The async-native server adds, natively, what you'd normally put a reverse proxy in front for:
 
 ```
 require serve(443)
@@ -259,8 +245,7 @@ serve on 443
 - **Reverse proxy:** `proxy to "http://upstream"` inside a route forwards the request.
 - **Production static files:** ETag + `304`, `Range`/`206`, gzip — on the `static` mounts.
 
-These are Rust-only (the Python reference omits them). The HTTP/1.1 responses stay
-byte-identical to the Python oracle; TLS/vhost/proxy/HTTP-2 are additive.
+No external proxy, no extra processes — it's all in the one binary.
 
 ## Security
 
@@ -456,19 +441,14 @@ Automatically generates edge-case tests from your types and task signatures:
 
 ## Tests
 
-**Python reference** — 329 tests across 10 files (the conformance oracle):
-
-```bash
-PYTHONPATH=. python3 tests/test_core.py     # and test_capabilities / test_agents /
-                                            # test_intent / test_advanced / test_recovery /
-                                            # test_agent_systems / test_stdlib / test_serve / test_concurrency
-```
-
-**Rust** — unit and integration tests across the workspace:
+A 329-test conformance corpus plus unit and integration tests:
 
 ```bash
 cargo test --manifest-path rust/Cargo.toml --workspace
 ```
+
+A second reference interpreter (`syntecnia/`, Python) runs the same corpus and acts as the
+conformance oracle: `PYTHONPATH=. python3 tests/test_core.py` (and the other 9 test files).
 
 ## Architecture
 
@@ -512,23 +492,23 @@ syntecnia/
 └── cli.py             # Command-line interface
 ```
 
-### Rust implementation
+### Production interpreter (`rust/`)
+
+The shipped binary is a Cargo workspace mirroring the packages above:
 
 ```
-rust/                  # Cargo workspace — the production interpreter (single binary)
-├── crates/
-│   ├── syntecnia-core/        # lexer, parser, AST, types, interpreter, templates
-│   ├── syntecnia-capabilities/# capability model + intent enforcement
-│   ├── syntecnia-stdlib/      # http, database (rusqlite), cron, server (tokio/hyper/rustls), acme, mimetypes
-│   ├── syntecnia-agents/      # blackboard, swarm, memory, progress, resource_lock
-│   ├── syntecnia-runtime/     # engine, serve, parallel (concurrency), recovery, persistence, daemon
-│   ├── syntecnia-llm/         # provider, context, validator, human
-│   └── syntecnia-cli/         # crate that builds the `syntecnia` binary: run, serve, conform, check, repl, ast, tokens, daemon
-└── ...
+rust/crates/
+├── syntecnia-core/         # lexer, parser, AST, types, interpreter, templates
+├── syntecnia-capabilities/ # capability model + intent enforcement
+├── syntecnia-stdlib/       # http, database, cron, server, acme, mimetypes
+├── syntecnia-agents/       # blackboard, swarm, memory, progress, resource_lock
+├── syntecnia-runtime/      # engine, serve, parallel (concurrency), recovery, persistence, daemon
+├── syntecnia-llm/          # provider, context, validator, human
+└── syntecnia-cli/          # builds the `syntecnia` binary: run, serve, check, repl, ast, tokens, daemon
 ```
 
-The Rust interpreter is **synchronous** (parity with Python); concurrency (`parallel_map`)
-and the web server are async layers (`tokio`) around it. `spawn` agents use OS threads.
+The interpreter is **synchronous**; concurrency (`parallel_map`) and the web server are
+async layers around it. `spawn` agents use OS threads.
 
 ## AI Skill (for Claude Code, Codex, etc.)
 
@@ -588,12 +568,12 @@ When Syntecnia connects to an LLM, responses are validated automatically:
 
 ## Roadmap
 
-- [x] Port runtime to Rust (single static binary, no GIL, real multi-core)
+- [x] Native compiled runtime (single static binary, no GIL, real multi-core)
 - [x] Real concurrency (`parallel_map` / `chunk`, bounded fan-out)
 - [x] Web server capability (`serve on PORT`)
 - [x] Streaming responses (Server-Sent Events: `stream` / `send`)
 - [x] Rate limiting (`rate_limit N per <window>`, token bucket, per-IP)
-- [x] Native web stack: TLS, auto-HTTPS (ACME), virtual hosts, reverse proxy, HTTP/2 (Rust)
+- [x] Native web stack: TLS, auto-HTTPS (ACME), virtual hosts, reverse proxy, HTTP/2
 - [x] Database (SQLite via `sql` / `db_open`)
 - [ ] Async interpreter for C100k+ I/O fan-out (deferred)
 - [ ] Distribution: cross-platform binaries, installer, mobile/IoT
