@@ -1768,7 +1768,7 @@ fn render_html(tree: &SynValue) -> String {
         render_node_html(tree)
     };
     format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n{}\n</head>\n<body>\n{}</body>\n</html>\n",
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n{}\n</head>\n<body>\n<main class=\"prose\">\n{}</main>\n</body>\n</html>\n",
         head.join("\n"),
         body
     )

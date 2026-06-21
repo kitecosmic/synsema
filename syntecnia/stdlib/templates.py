@@ -150,6 +150,15 @@ def _parse_each(content: str, filename: str, line: int):
         raise TemplateError(f"{filename}:{line}: invalid 'each' directive: {e}")
 
 
+def _parse_str_literal(rest: str, filename: str, line: int, kw: str) -> str:
+    """A directive that takes a quoted path: { include "p" } / { layout "p" }."""
+    s = rest.strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        return s[1:-1]
+    raise TemplateError(
+        f"{filename}:{line}: '{{ {kw} ... }}' needs a quoted path, got: {rest!r}")
+
+
 def _value_node(expr_src: str, escape: bool, filename: str, line: int):
     """
     Build a value node for a hole. A single bare name → a direct data lookup
@@ -200,6 +209,14 @@ def _build_tree(segs, filename: str):
             stack.pop()
         elif head == "raw":
             target.append(_value_node(rest, False, filename, line))
+        elif head == "include":
+            target.append({"t": "include", "path": _parse_str_literal(rest, filename, line, "include"),
+                           "line": line})
+        elif head == "layout":
+            target.append({"t": "layout", "path": _parse_str_literal(rest, filename, line, "layout"),
+                           "line": line})
+        elif head == "slot":
+            target.append({"t": "slot", "line": line})
         else:
             target.append(_value_node(content, True, filename, line))
 
@@ -226,7 +243,7 @@ def _emit(value: SynValue, escape: bool, out):
     out.append(_html.escape(s, quote=True) if escape else s)
 
 
-def _render_nodes(nodes, interp, env, out, filename):
+def _render_nodes(nodes, interp, env, out, filename, slot_html="", depth=0):
     # The interpreter defines its OWN RuntimeError (shadowing the builtin), which
     # is what env.get raises for an unknown variable — catch that exact type.
     from ..core.interpreter import Environment, RuntimeError as InterpRuntimeError
@@ -251,11 +268,25 @@ def _render_nodes(nodes, interp, env, out, filename):
             for item in items:
                 child = Environment(parent=env, name="template:each")
                 child.set(node["var"], item)
-                _render_nodes(node["body"], interp, child, out, filename)
+                _render_nodes(node["body"], interp, child, out, filename, slot_html, depth)
         elif t == "when":
             cond = interp._exec(node["cond"], env)
             branch = node["then"] if cond.is_truthy() else node["else"]
-            _render_nodes(branch, interp, env, out, filename)
+            _render_nodes(branch, interp, env, out, filename, slot_html, depth)
+        elif t == "slot":
+            out.append(slot_html)  # raw: the child page's already-rendered HTML
+        elif t == "include":
+            if depth > 50:
+                raise TemplateError(f"{filename}: template include nesting too deep")
+            target = resolve_template_path(node["path"])
+            inc_name = os.path.basename(target)
+            with open(target, "r", encoding="utf-8") as f:
+                inc_src = f.read()
+            inc_tree = _build_tree(_segments(inc_src, inc_name), inc_name)
+            # A partial renders with the CURRENT env (sees data + loop vars), and
+            # never carries a layout of its own.
+            inc_body = [n for n in inc_tree if n["t"] != "layout"]
+            _render_nodes(inc_body, interp, env, out, inc_name, slot_html, depth + 1)
 
 
 def validate_template(path: str) -> None:
@@ -271,18 +302,39 @@ def validate_template(path: str) -> None:
     _build_tree(_segments(src, filename), filename)
 
 
-def render_template(interp, path: str, data) -> str:
-    """Render template `path` with `data` (a SynMap) bound as variables → HTML."""
+def _render_file(interp, path: str, data, slot_html: str = "", depth: int = 0) -> str:
+    """Render one template file. If it declares { layout "L" }, render its body and
+    then render L with that body injected at { slot } (recursively — a layout may
+    have its own layout)."""
     from ..core.interpreter import Environment
+    if depth > 50:
+        raise TemplateError(f"template layout nesting too deep ({path})")
     target = resolve_template_path(path)
     filename = os.path.basename(target)
     with open(target, "r", encoding="utf-8") as f:
         src = f.read()
     tree = _build_tree(_segments(src, filename), filename)
+    layout_path = None
+    body = []
+    for node in tree:
+        if node["t"] == "layout":
+            if layout_path is None:
+                layout_path = node["path"]
+        else:
+            body.append(node)
     env = Environment(parent=interp.global_env, name=f"template:{filename}")
     if data is not None and isinstance(data.type, SynMap):
         for k, v in data.raw.items():
             env.set(str(k), v)
     out = []
-    _render_nodes(tree, interp, env, out, filename)
-    return "".join(out)
+    _render_nodes(body, interp, env, out, filename, slot_html, depth)
+    rendered = "".join(out)
+    if layout_path is not None:
+        return _render_file(interp, layout_path, data, slot_html=rendered, depth=depth + 1)
+    return rendered
+
+
+def render_template(interp, path: str, data) -> str:
+    """Render template `path` with `data` (a SynMap) bound as variables → HTML.
+    Supports { include "partial" } and { layout "base" } / { slot } composition."""
+    return _render_file(interp, path, data)

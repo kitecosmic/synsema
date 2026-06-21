@@ -88,6 +88,9 @@ enum TNode {
     Expr { node: Node, escape: bool },
     Each { var: String, coll: Node, body: Vec<TNode> },
     When { cond: Node, then: Vec<TNode>, els: Vec<TNode> },
+    Slot,
+    Include { path: String },
+    Layout { path: String },
 }
 
 /// Divide el source en segmentos texto/hole (quote-aware: `}` dentro de `"…"` no cierra).
@@ -162,6 +165,14 @@ fn split_head(content: &str) -> (String, String) {
     }
 }
 
+fn parse_str_literal(rest: &str, filename: &str, line: usize, kw: &str) -> Result<String, Control> {
+    let s = rest.trim();
+    match s.strip_prefix('"').and_then(|x| x.strip_suffix('"')) {
+        Some(p) if !s.is_empty() && s.len() >= 2 => Ok(p.to_string()),
+        _ => Err(terr(filename, line, &format!("'{{ {} ... }}' needs a quoted path, got: {}", kw, rest))),
+    }
+}
+
 fn value_node(src: &str, escape: bool, filename: &str, line: usize) -> Result<TNode, Control> {
     let s = src.trim();
     if is_bare_name(s) {
@@ -221,6 +232,13 @@ fn parse_block(
                         out.push(TNode::When { cond, then, els });
                     }
                     "raw" => out.push(value_node(&rest, false, filename, line)?),
+                    "include" => out.push(TNode::Include {
+                        path: parse_str_literal(&rest, filename, line, "include")?,
+                    }),
+                    "layout" => out.push(TNode::Layout {
+                        path: parse_str_literal(&rest, filename, line, "layout")?,
+                    }),
+                    "slot" => out.push(TNode::Slot),
                     "end" => return Err(terr(filename, line, "'{ end }' without a matching block")),
                     "otherwise" => return Err(terr(filename, line, "'otherwise' outside a 'when' block")),
                     _ => out.push(value_node(content, true, filename, line)?),
@@ -246,6 +264,8 @@ fn render_nodes(
     env: &Rc<RefCell<Environment>>,
     out: &mut String,
     filename: &str,
+    slot_html: &str,
+    depth: usize,
 ) -> Result<(), Control> {
     for node in nodes {
         match node {
@@ -272,25 +292,59 @@ fn render_nodes(
                 for item in items {
                     let child = Environment::child(env, "template:each");
                     env_set(&child, var, item);
-                    render_nodes(body, interp, &child, out, filename)?;
+                    render_nodes(body, interp, &child, out, filename, slot_html, depth)?;
                 }
             }
             TNode::When { cond, then, els } => {
                 let c = interp.eval(cond, env)?;
                 let branch = if c.is_truthy() { then } else { els };
-                render_nodes(branch, interp, env, out, filename)?;
+                render_nodes(branch, interp, env, out, filename, slot_html, depth)?;
+            }
+            // The child page's already-rendered HTML, injected raw in a layout.
+            TNode::Slot => out.push_str(slot_html),
+            // A layout declaration emits nothing inline (handled in render_file).
+            TNode::Layout { .. } => {}
+            // A partial: rendered with the CURRENT env (sees data + loop vars).
+            TNode::Include { path } => {
+                if depth > 50 {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "{}: template include nesting too deep", filename
+                    ))));
+                }
+                let target = resolve_template_path(path)
+                    .map_err(|m| Control::Error(RuntimeError::new(m)))?;
+                let inc_src = std::fs::read_to_string(&target).map_err(|_| {
+                    Control::Error(RuntimeError::new(format!("template not found: {}", path)))
+                })?;
+                let inc_name = target
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                let segs = segments(&inc_src, &inc_name)?;
+                let mut pos = 0;
+                let (inc_tree, _) = parse_block(&segs, &mut pos, &inc_name, &[])?;
+                render_nodes(&inc_tree, interp, env, out, &inc_name, slot_html, depth + 1)?;
             }
         }
     }
     Ok(())
 }
 
-/// Renderiza el template `path` con `data` (un SynMap) bindeado como variables → HTML.
-pub fn render_template(
+/// Renderiza un archivo de template. Si declara `{ layout "L" }`, renderiza su cuerpo y
+/// luego renderiza L inyectando ese cuerpo en `{ slot }` (recursivo: un layout puede
+/// tener su propio layout). Soporta `{ include "partial" }`.
+fn render_file(
     interp: &mut Interpreter,
     path: &str,
     data: Option<&SynValue>,
+    slot_html: &str,
+    depth: usize,
 ) -> Result<String, Control> {
+    if depth > 50 {
+        return Err(Control::Error(RuntimeError::new(format!(
+            "template layout nesting too deep ({})", path
+        ))));
+    }
     let target = resolve_template_path(path).map_err(|m| Control::Error(RuntimeError::new(m)))?;
     let src = std::fs::read_to_string(&target)
         .map_err(|_| Control::Error(RuntimeError::new(format!("template not found: {}", path))))?;
@@ -301,6 +355,10 @@ pub fn render_template(
     let segs = segments(&src, &filename)?;
     let mut pos = 0;
     let (tree, _) = parse_block(&segs, &mut pos, &filename, &[])?;
+    let layout_path = tree.iter().find_map(|n| match n {
+        TNode::Layout { path } => Some(path.clone()),
+        _ => None,
+    });
     let env = Environment::child(&interp.global_env, &format!("template:{}", filename));
     if let Some(SynValue::Map(m)) = data {
         for (k, v) in m.borrow().iter() {
@@ -308,6 +366,19 @@ pub fn render_template(
         }
     }
     let mut out = String::new();
-    render_nodes(&tree, interp, &env, &mut out, &filename)?;
+    render_nodes(&tree, interp, &env, &mut out, &filename, slot_html, depth)?;
+    if let Some(lp) = layout_path {
+        return render_file(interp, &lp, data, &out, depth + 1);
+    }
     Ok(out)
+}
+
+/// Renderiza el template `path` con `data` (un SynMap) bindeado como variables → HTML.
+/// Soporta composición: `{ include "partial" }` y `{ layout "base" }` / `{ slot }`.
+pub fn render_template(
+    interp: &mut Interpreter,
+    path: &str,
+    data: Option<&SynValue>,
+) -> Result<String, Control> {
+    render_file(interp, path, data, "", 0)
 }

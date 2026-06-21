@@ -466,9 +466,9 @@ def _render_html(tree: SynValue) -> str:
     return (
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
         + "\n".join(head)
-        + "\n</head>\n<body>\n"
+        + "\n</head>\n<body>\n<main class=\"prose\">\n"
         + body
-        + "</body>\n</html>\n"
+        + "</main>\n</body>\n</html>\n"
     )
 
 

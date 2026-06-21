@@ -685,3 +685,39 @@ The `static` mounts get production behavior automatically:
 - **ETag** + `304 Not Modified` on `If-None-Match`.
 - **Range** / `206 Partial Content` (+ `416` on invalid range) for media.
 - **gzip** when the client sends `Accept-Encoding: gzip` (compressible types).
+
+---
+
+## Template composition (layouts, includes)
+
+`render()` templates compose, so you don't duplicate the page chrome (head, nav, footer):
+
+- **`{ include "partials/nav.html" }`** — inline another template at this point. It renders
+  with the current data (and any surrounding `each` loop variables). Use for reusable
+  components: nav, footer, cards.
+- **`{ layout "layouts/base.html" }`** — declared at the top of a page. The page's output is
+  rendered, then injected into the layout where the layout has **`{ slot }`**. Layouts can
+  themselves declare a layout (nested). The slot content is inserted raw (already rendered).
+
+A base layout:
+```html
+<!DOCTYPE html><html><head><title>{ title }</title>
+<link rel="stylesheet" href="/assets/style.css"></head>
+<body>
+  { include "partials/nav.html" }
+  { slot }
+  { include "partials/footer.html" }
+</body></html>
+```
+A page that uses it:
+```html
+{ layout "layouts/base.html" }
+<main class="wrap"><h1>{ title }</h1> ... </main>
+```
+
+Recommended project structure: `layouts/`, `partials/`, `pages/`, `static/` (CSS/JS),
+`content/` (markdown/content sources). Paths are cwd-relative and traversal-safe.
+
+**content() and CSS:** a `content()` page's HTML is wrapped in `<main class="prose">` and
+can declare a stylesheet via page meta (`{"stylesheet": "/assets/style.css"}`) — head-only,
+so the Markdown/JSON representations for agents stay clean.
