@@ -1,6 +1,6 @@
 name: release
 
-# Cross-compile the Syntecnia binary for Linux/macOS/Windows and publish to a
+# Cross-compile the Synsema binary for Linux/macOS/Windows and publish to a
 # GitHub Release. Triggered by pushing a version tag (e.g. `git tag v0.1.0 && git push --tags`),
 # or manually via the Actions tab. The asset names match install.sh / install.ps1.
 
@@ -22,18 +22,18 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            asset: syntecnia-linux-x86_64
+            asset: synsema-linux-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
-            asset: syntecnia-macos-aarch64
+            asset: synsema-macos-aarch64
           # Built on the ARM runner (cross to x86_64) — macos-13 Intel runners are
           # scarce/queued on the free tier; Apple's toolchain cross-compiles fine.
           - os: macos-latest
             target: x86_64-apple-darwin
-            asset: syntecnia-macos-x86_64
+            asset: synsema-macos-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            asset: syntecnia-windows-x86_64.exe
+            asset: synsema-windows-x86_64.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -48,20 +48,20 @@ jobs:
         uses: ilammy/setup-nasm@v1
 
       - name: Build
-        run: cargo build --release --locked --manifest-path rust/Cargo.toml -p syntecnia-cli --target ${{ matrix.target }}
+        run: cargo build --release --locked --manifest-path rust/Cargo.toml -p synsema-cli --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          cp "rust/target/${{ matrix.target }}/release/syntecnia" "${{ matrix.asset }}"
+          cp "rust/target/${{ matrix.target }}/release/synsema" "${{ matrix.asset }}"
           shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Copy-Item "rust/target/${{ matrix.target }}/release/syntecnia.exe" "${{ matrix.asset }}"
+          Copy-Item "rust/target/${{ matrix.target }}/release/synsema.exe" "${{ matrix.asset }}"
           (Get-FileHash "${{ matrix.asset }}" -Algorithm SHA256).Hash | Out-File -Encoding ascii "${{ matrix.asset }}.sha256"
 
       - name: Upload to Release

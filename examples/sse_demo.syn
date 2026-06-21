@@ -1,5 +1,5 @@
 -- Server-Sent Events demo — stream messages over time on one connection.
--- Run:   syntecnia run examples/sse_demo.syn      (Ctrl+C to stop)
+-- Run:   synsema run examples/sse_demo.syn      (Ctrl+C to stop)
 -- Watch:  curl -N http://127.0.0.1:8080/count
 --         curl -N http://127.0.0.1:8080/tokens
 
@@ -10,7 +10,7 @@ require time
 
 -- A mock token stream (stands in for an LLM response)
 task mock_answer()
-    give ["Hello", " from", " Syntecnia", " streaming!"]
+    give ["Hello", " from", " Synsema", " streaming!"]
 
 serve on 8080
     max_streams 50

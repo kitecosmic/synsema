@@ -1,12 +1,12 @@
-"""Tests for Syntecnia capability system."""
+"""Tests for Synsema capability system."""
 import sys
-sys.path.insert(0, "/root/Syntecnia")
+sys.path.insert(0, "/root/Synsema")
 
-from syntecnia.capabilities.model import (
+from synsema.capabilities.model import (
     Capability, CapabilityType, CapabilitySet, CapabilityViolation,
     parse_capability,
 )
-from syntecnia.runtime.engine import SyntecniaEngine
+from synsema.runtime.engine import SynsemaEngine
 
 
 def test_capability_creation():
@@ -98,7 +98,7 @@ def test_capability_audit_trail():
 
 def test_capability_violation_in_engine():
     """Test that secure builtins fail without capabilities."""
-    engine = SyntecniaEngine(secure=True)
+    engine = SynsemaEngine(secure=True)
     # In secure mode, even stdout needs a capability
     # But the engine auto-grants stdout in non-secure mode
     engine.capabilities.grant(Capability(CapabilityType.STDOUT))
@@ -111,21 +111,21 @@ def test_capability_violation_in_engine():
 
 def test_capability_grant_enables_operation():
     """Test that granting capability allows the operation."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     engine.grant_capability("file", "/tmp/*")
     # This should work now
-    result = engine.run_source('write_file("/tmp/syntecnia_test.txt", "hello")')
+    result = engine.run_source('write_file("/tmp/synsema_test.txt", "hello")')
     assert result.success
 
     # Read it back
-    result2 = engine.run_source('let c be read_file("/tmp/syntecnia_test.txt")\nprint(c)')
+    result2 = engine.run_source('let c be read_file("/tmp/synsema_test.txt")\nprint(c)')
     assert result2.success
     assert result2.output == ["hello"]
 
     # Cleanup
     import os
     try:
-        os.remove("/tmp/syntecnia_test.txt")
+        os.remove("/tmp/synsema_test.txt")
     except:
         pass
 

@@ -1,13 +1,13 @@
-"""Tests for Syntecnia stdlib: HTTP, Database, Cron."""
+"""Tests for Synsema stdlib: HTTP, Database, Cron."""
 import sys
 import time
 import os
-sys.path.insert(0, "/root/Syntecnia")
+sys.path.insert(0, "/root/Synsema")
 
-from syntecnia.runtime.engine import SyntecniaEngine
-from syntecnia.stdlib.http import http_request
-from syntecnia.stdlib.database import DatabaseManager
-from syntecnia.stdlib.cron import CronScheduler
+from synsema.runtime.engine import SynsemaEngine
+from synsema.stdlib.http import http_request
+from synsema.stdlib.database import DatabaseManager
+from synsema.stdlib.cron import CronScheduler
 
 
 # ===== HTTP (unit tests on the raw function) =====
@@ -21,7 +21,7 @@ def test_http_request_invalid_url():
 
 def test_http_builtins_in_engine():
     """http_get/http_post are available as builtins."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 let response be http_get("http://localhost:99999")
 print(text(ok of response))
@@ -33,7 +33,7 @@ print(text(status of response))
 
 def test_http_full_syntax():
     """The http() builtin accepts method, url, headers, query, body."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 let r be http("GET", "http://localhost:99999", {"Accept": "application/json"}, {"page": "1"})
 print(text(ok of r))
@@ -78,8 +78,8 @@ def test_db_batch():
 
 
 def test_db_builtins_in_engine():
-    """SQL builtins work from Syntecnia code."""
-    engine = SyntecniaEngine()
+    """SQL builtins work from Synsema code."""
+    engine = SynsemaEngine()
     result = engine.run_source("""
 db_open(":memory:", "memory")
 sql_exec("CREATE TABLE products (name TEXT, price REAL)")
@@ -100,9 +100,9 @@ db_close()
 
 def test_db_file_persistence():
     """Database persists to file."""
-    db_path = "/tmp/syntecnia_test.db"
+    db_path = "/tmp/synsema_test.db"
     try:
-        engine = SyntecniaEngine()
+        engine = SynsemaEngine()
         result = engine.run_source(f"""
 db_open("{db_path}")
 sql_exec("CREATE TABLE IF NOT EXISTS test (val TEXT)")
@@ -112,7 +112,7 @@ db_close()
         assert result.success
 
         # Read back in new engine
-        engine2 = SyntecniaEngine()
+        engine2 = SynsemaEngine()
         result2 = engine2.run_source(f"""
 db_open("{db_path}")
 let rows be sql("SELECT * FROM test")
@@ -128,7 +128,7 @@ db_close()
 
 def test_db_parameterized_query():
     """Parameters prevent SQL injection."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 db_open(":memory:", "memory")
 sql_exec("CREATE TABLE users (name TEXT)")
@@ -196,8 +196,8 @@ def test_cron_list():
 
 
 def test_cron_builtins_in_engine():
-    """Cron builtins work from Syntecnia code."""
-    engine = SyntecniaEngine()
+    """Cron builtins work from Synsema code."""
+    engine = SynsemaEngine()
     result = engine.run_source("""
 task ticker()
     log "tick"
@@ -217,14 +217,14 @@ cron_cancel("ticker")
 # ===== Time formatting (format_time / parse_time / date_parts) =====
 
 def test_format_time_default_iso():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source('require time\nprint(format_time(0))')
     assert result.success, f"Errors: {result.errors}"
     assert result.output[0] == "1970-01-01T00:00:00Z"
 
 
 def test_format_time_with_pattern():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source(
         'require time\nprint(format_time(1781836890, "%Y-%m-%d %H:%M"))'
     )
@@ -233,7 +233,7 @@ def test_format_time_with_pattern():
 
 
 def test_parse_time_roundtrip():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 require time
 let t be 1781836890
@@ -245,7 +245,7 @@ print(text(back == t))
 
 
 def test_parse_time_iso_zero():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source(
         'require time\nprint(text(parse_time("1970-01-01T00:00:00Z") == 0))'
     )
@@ -254,7 +254,7 @@ def test_parse_time_iso_zero():
 
 
 def test_date_parts():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 require time
 let p be date_parts(0)
@@ -268,15 +268,15 @@ print(text(day of p))
 
 def test_time_builtins_require_time_capability():
     """In secure mode, format_time/parse_time/date_parts need the time capability."""
-    from syntecnia.capabilities.model import Capability, CapabilityType
+    from synsema.capabilities.model import Capability, CapabilityType
     for call in ('format_time(0)', 'parse_time("1970-01-01T00:00:00Z")', 'date_parts(0)'):
-        engine = SyntecniaEngine(secure=True)
+        engine = SynsemaEngine(secure=True)
         engine.capabilities.grant(Capability(CapabilityType.STDOUT))
         result = engine.run_source(f'print({call})')
         assert not result.success, f"{call} should require time"
         assert any("time" in e.lower() and "capab" in e.lower() for e in result.errors)
         # With the capability granted it works.
-        engine2 = SyntecniaEngine(secure=True)
+        engine2 = SynsemaEngine(secure=True)
         engine2.capabilities.grant(Capability(CapabilityType.STDOUT))
         engine2.capabilities.grant(Capability(CapabilityType.TIME))
         result2 = engine2.run_source(f'print({call})')

@@ -1,4 +1,4 @@
--- Syntecnia: LLM Integration Demo
+-- Synsema: LLM Integration Demo
 -- Shows reasoning, decisions, analysis, and generation
 
 intent: "Handle customer support ticket using AI reasoning"

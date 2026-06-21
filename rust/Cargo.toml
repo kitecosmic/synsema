@@ -1,21 +1,21 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/syntecnia-core",
-    "crates/syntecnia-capabilities",
-    "crates/syntecnia-stdlib",
-    "crates/syntecnia-agents",
-    "crates/syntecnia-llm",
-    "crates/syntecnia-runtime",
-    "crates/syntecnia-cli",
+    "crates/synsema-core",
+    "crates/synsema-capabilities",
+    "crates/synsema-stdlib",
+    "crates/synsema-agents",
+    "crates/synsema-llm",
+    "crates/synsema-runtime",
+    "crates/synsema-cli",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Syntecnia — a programming language designed for AI agents (Rust port)"
-repository = "https://github.com/kitecosmic/Syntecnia"
+description = "Synsema — a programming language designed for AI agents (Rust port)"
+repository = "https://github.com/kitecosmic/synsema"
 
 # Dependencias compartidas se pinean acá y se referencian con `workspace = true`
 # desde cada crate. Se agregan por capa, no antes de necesitarlas.
@@ -38,12 +38,12 @@ serde_json = { version = "1", features = ["preserve_order"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 # SQLite estático (binario único, sin DLL). Compila C → requiere gcc (WinLibs en Windows).
 rusqlite = { version = "0.32", features = ["bundled"] }
-syntecnia-core = { path = "crates/syntecnia-core" }
-syntecnia-capabilities = { path = "crates/syntecnia-capabilities" }
-syntecnia-stdlib = { path = "crates/syntecnia-stdlib" }
-syntecnia-agents = { path = "crates/syntecnia-agents" }
-syntecnia-llm = { path = "crates/syntecnia-llm" }
-syntecnia-runtime = { path = "crates/syntecnia-runtime" }
+synsema-core = { path = "crates/synsema-core" }
+synsema-capabilities = { path = "crates/synsema-capabilities" }
+synsema-stdlib = { path = "crates/synsema-stdlib" }
+synsema-agents = { path = "crates/synsema-agents" }
+synsema-llm = { path = "crates/synsema-llm" }
+synsema-runtime = { path = "crates/synsema-runtime" }
 
 [profile.release]
 opt-level = 3

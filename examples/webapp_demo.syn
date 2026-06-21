@@ -1,5 +1,5 @@
 -- Web app demo — a real waitlist: static landing page + JSON API, one origin.
--- Run with:  syntecnia run examples/webapp_demo.syn   (then open http://localhost:8090)
+-- Run with:  synsema run examples/webapp_demo.syn   (then open http://localhost:8090)
 --
 -- Shows the "serve web" features together:
 --   static "./examples/public"   → serves index.html / style.css (same-origin)

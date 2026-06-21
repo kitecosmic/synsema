@@ -1,6 +1,6 @@
-# Syntecnia — VS Code extension
+# Synsema — VS Code extension
 
-Syntax highlighting for the Syntecnia language (`.syn`, `.fsyn`).
+Syntax highlighting for the Synsema language (`.syn`, `.fsyn`).
 
 Works in **VS Code, Cursor, Windsurf, VSCodium** and any VS Code–family editor (one
 extension, all of them) — no editor fork needed.
@@ -19,12 +19,12 @@ extension, all of them) — no editor fork needed.
 ```bash
 cd editors/vscode
 npm install -g @vscode/vsce      # one time
-vsce package                     # produces syntecnia-0.1.0.vsix
-code --install-extension syntecnia-0.1.0.vsix   # or: cursor / windsurf --install-extension
+vsce package                     # produces synsema-0.1.0.vsix
+code --install-extension synsema-0.1.0.vsix   # or: cursor / windsurf --install-extension
 ```
 
 Or, for quick local use, copy this folder to your editor's extensions dir
-(`~/.vscode/extensions/syntecnia` and reload).
+(`~/.vscode/extensions/synsema` and reload).
 
 ### Marketplaces (planned)
 
@@ -33,7 +33,7 @@ Or, for quick local use, copy this folder to your editor's extensions dir
 
 ## The grammar powers the website too
 
-`syntaxes/syntecnia.tmLanguage.json` is a TextMate grammar. The same file is consumed by
+`syntaxes/synsema.tmLanguage.json` is a TextMate grammar. The same file is consumed by
 **Shiki** (and Prism/highlight.js with a small adapter), so the docs/blog code blocks on
 the site use the exact same highlighting as the editor — one grammar, both surfaces.
 

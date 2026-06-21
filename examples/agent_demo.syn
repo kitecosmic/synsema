@@ -1,4 +1,4 @@
--- Syntecnia: Agent & Capability Demo
+-- Synsema: Agent & Capability Demo
 -- Shows agent definitions, capabilities, human interaction, and observability
 
 intent: "Demonstrate agent-based order processing"

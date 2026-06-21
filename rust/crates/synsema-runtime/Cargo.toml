@@ -1,0 +1,20 @@
+[package]
+name = "synsema-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Synsema runtime: engine, daemon, persistence, recovery, speculative, error_reporter"
+
+[dependencies]
+synsema-core.workspace = true
+synsema-capabilities.workspace = true
+synsema-stdlib.workspace = true
+synsema-agents.workspace = true
+synsema-llm.workspace = true
+indexmap.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+# StatePersistence cross-run: SQLite (mismo esquema/ruta que el oráculo persistence.py).
+rusqlite.workspace = true
+# A1 Fase 2: ejecutor M:N de parallel_map sobre tokio (runtime + spawn_blocking + semáforo).
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "sync"] }

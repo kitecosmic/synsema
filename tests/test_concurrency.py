@@ -1,15 +1,15 @@
 """Tests for REAL agent concurrency — threads, blackboard, signals."""
 import sys
 import time
-sys.path.insert(0, "/root/Syntecnia")
+sys.path.insert(0, "/root/Synsema")
 
-from syntecnia.runtime.engine import SyntecniaEngine
-from syntecnia.agents.swarm import AgentState
+from synsema.runtime.engine import SynsemaEngine
+from synsema.agents.swarm import AgentState
 
 
 def test_agent_define_does_not_execute():
     """Agent body should NOT run on definition — only on spawn."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 agent Worker
     print("I am running!")
@@ -23,7 +23,7 @@ print("After definition")
 
 def test_spawn_runs_agent_body():
     """Spawn should actually execute the agent body."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 agent Greeter
     share "hello from agent" as "greeting"
@@ -41,7 +41,7 @@ spawn Greeter
 
 def test_spawn_with_arguments():
     """Spawn passes arguments to the agent."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 agent Calculator
     let result be x * 2
@@ -58,7 +58,7 @@ spawn Calculator with x = 21
 
 def test_two_agents_communicate_via_blackboard():
     """Two agents running concurrently, sharing data via blackboard."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 agent Producer
     share "data_from_producer" as "shared_data"
@@ -90,7 +90,7 @@ spawn Consumer
 
 def test_signal_wakes_waiting_agent():
     """signal/wait_for actually blocks and wakes up."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 agent Sender
     share "preparing" as "status"
@@ -115,7 +115,7 @@ spawn Sender
 
 def test_main_shares_agent_observes():
     """Main program shares data, spawned agent observes it."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 share "hello from main" as "main_data"
 
@@ -135,7 +135,7 @@ spawn Reader
 
 def test_spawn_undefined_agent_fails():
     """Spawning an agent that doesn't exist should error."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 spawn NonExistent
 """)
@@ -145,7 +145,7 @@ spawn NonExistent
 
 def test_swarm_dashboard_shows_agents():
     """The swarm dashboard should reflect spawned agents."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 agent Worker
     share "done" as "status"
@@ -163,7 +163,7 @@ spawn Worker
 
 def test_multiple_spawns_of_same_agent():
     """Spawn the same agent type multiple times — each runs independently."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 agent Adder
     let result be n + 100
@@ -189,7 +189,7 @@ spawn Adder with n = 3
 
 def test_agent_error_captured_in_swarm():
     """Agent errors should be captured, not crash the program."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 agent Crasher
     let x be 1 / 0

@@ -1,5 +1,5 @@
 [project]
-name = "syntecnia"
+name = "synsema"
 version = "0.1.0"
 description = "A programming language designed for AI agents"
 requires-python = ">=3.10"
@@ -7,7 +7,7 @@ license = "MIT"
 dependencies = []  # zero dependencies — stdlib only
 
 [project.scripts]
-syntecnia = "syntecnia.cli:main"
+synsema = "synsema.cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]

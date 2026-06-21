@@ -1,17 +1,17 @@
-"""Tests for Syntecnia core: lexer, parser, interpreter."""
+"""Tests for Synsema core: lexer, parser, interpreter."""
 
 import sys
-sys.path.insert(0, "/root/Syntecnia")
+sys.path.insert(0, "/root/Synsema")
 
-from syntecnia.core.lexer import Lexer
-from syntecnia.core.parser import Parser, parse
-from syntecnia.core.interpreter import Interpreter
-from syntecnia.runtime.engine import SyntecniaEngine
+from synsema.core.lexer import Lexer
+from synsema.core.parser import Parser, parse
+from synsema.core.interpreter import Interpreter
+from synsema.runtime.engine import SynsemaEngine
 
 
 def run(source: str) -> tuple:
     """Helper: run source, return (result, output_lines)."""
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source(source)
     return result, result.output
 

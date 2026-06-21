@@ -16,4 +16,4 @@ target/
 conformance/
 
 # Estado/persistencia y daemons de runtime (fuera del repo, defensivo)
-.syntecnia/
+.synsema/

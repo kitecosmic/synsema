@@ -13,7 +13,7 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from syntecnia.runtime.engine import SyntecniaEngine
+from synsema.runtime.engine import SynsemaEngine
 
 
 def _free_port() -> int:
@@ -69,7 +69,7 @@ class _Client:
 def serving(program: str):
     """Start an engine, run a serve program on a free port, yield a request client."""
     port = _free_port()
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     source = program.replace("__PORT__", str(port))
     result = engine.run_source(source, filename="test_serve.syn")
     assert result.success, f"program failed to start: {result.errors}"
@@ -85,7 +85,7 @@ def serving(program: str):
 def serving_runtime(program: str):
     """Like serving() but yields the ServeRuntime, for dispatch-level tests."""
     port = _free_port()
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source(program.replace("__PORT__", str(port)), filename="t.syn")
     assert result.success, f"program failed to start: {result.errors}"
     time.sleep(0.1)
@@ -203,7 +203,7 @@ serve on __PORT__
 # ===== Port capability =====
 
 def test_serve_requires_capability():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source(
         'serve on 8123\n    route "GET /x"\n        give {"ok": true}',
         filename="nocap.syn",
@@ -215,7 +215,7 @@ def test_serve_requires_capability():
 
 
 def test_serve_capability_wrong_port():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source(
         'require serve(8124)\nserve on 8125\n    route "GET /x"\n        give {"ok": true}',
         filename="wrongport.syn",
@@ -487,7 +487,7 @@ serve on __PORT__
 # ===== requires auth without auth with → clear parse-time error =====
 
 def test_requires_auth_without_auth_with_errors():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source(
         'require serve(8131)\n'
         'serve on 8131\n'
@@ -1046,7 +1046,7 @@ serve on __PORT__
 
 def test_send_without_stream_sink_is_clear_error():
     # A stream block executed outside an SSE route has no sink → clear error.
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source('stream\n    send {"x": 1}')
     assert not result.success
     assert any("send can only be used inside a stream" in e for e in result.errors)
@@ -1200,7 +1200,7 @@ serve on __PORT__
 
 
 def test_rate_limiter_cleanup_purges_stale():
-    from syntecnia.stdlib.server import RateLimiter
+    from synsema.stdlib.server import RateLimiter
     rl = RateLimiter(cleanup_interval=999)  # disable auto-cleanup; test purge() directly
     for i in range(50):
         rl.check(f"k{i}", 5, 1.0)  # window 1s
@@ -1213,7 +1213,7 @@ def test_rate_limiter_cleanup_purges_stale():
 def test_handle_error_silences_client_disconnects():
     """Connection resets are swallowed; genuine errors still print."""
     import io
-    from syntecnia.stdlib.server import _QuietThreadingHTTPServer, _RequestHandler
+    from synsema.stdlib.server import _QuietThreadingHTTPServer, _RequestHandler
 
     srv = _QuietThreadingHTTPServer(("127.0.0.1", 0), _RequestHandler)
     try:
@@ -1239,7 +1239,7 @@ def test_handle_error_silences_client_disconnects():
 
 
 def test_parse_body_size_units():
-    from syntecnia.stdlib.server import parse_body_size, MAX_BODY
+    from synsema.stdlib.server import parse_body_size, MAX_BODY
     assert parse_body_size(None) == MAX_BODY
     assert parse_body_size("512kb") == 512 * 1024
     assert parse_body_size("10mb") == 10 * 1024 * 1024
@@ -1548,7 +1548,7 @@ serve on __PORT__
 
 
 def test_catch_all_must_be_last_segment_parse_error():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source(
         'require serve(8150)\n'
         'serve on 8150\n'
@@ -1661,7 +1661,7 @@ def test_two_static_at_same_root_is_error():
     files = {"a/x.html": "a", "b/y.html": "b"}
     with _dirs(files) as base:
         port = _free_port()
-        engine = SyntecniaEngine()
+        engine = SynsemaEngine()
         result = engine.run_source(
             f'require serve({port})\n'
             f'serve on {port}\n'
@@ -1953,9 +1953,9 @@ def _in_dir(files: dict):
 def _serving_in_dir(files: dict, program: str, secure: bool = False):
     """chdir into a temp dir holding `files`, run the serve program, yield a client."""
     with _in_dir(files) as (base, port):
-        engine = SyntecniaEngine(secure=secure)
+        engine = SynsemaEngine(secure=secure)
         if secure:
-            from syntecnia.capabilities.model import Capability, CapabilityType
+            from synsema.capabilities.model import Capability, CapabilityType
             engine.capabilities.grant(Capability(CapabilityType.SERVE, str(port)))
         try:
             result = engine.run_source(program.replace("__PORT__", str(port)), filename="t.syn")
@@ -2055,7 +2055,7 @@ def test_template_missing_literal_fails_at_startup():
         '        give render("nope.html", {{}})'
     )
     with _in_dir({"home.html": "ok"}) as (base, port):
-        engine = SyntecniaEngine()
+        engine = SynsemaEngine()
         result = engine.run_source(prog_t.format(port=port), filename="t.syn")
         assert not result.success
         assert len(engine.servers) == 0
@@ -2072,7 +2072,7 @@ def test_template_syntax_error_fails_at_startup():
         '        give render("bad.html", {{"xs": []}})'
     )
     with _in_dir({"bad.html": bad}) as (base, port):
-        engine = SyntecniaEngine()
+        engine = SynsemaEngine()
         result = engine.run_source(prog_t.format(port=port), filename="t.syn")
         assert not result.success
         assert any("end" in e.lower() for e in result.errors)
@@ -2087,7 +2087,7 @@ def test_template_literal_traversal_fails_at_startup():
         '        give render("../outside.html", {{}})'
     )
     with _in_dir({"home.html": "ok"}) as (base, port):
-        engine = SyntecniaEngine()
+        engine = SynsemaEngine()
         result = engine.run_source(prog_t.format(port=port), filename="t.syn")
         assert not result.success
         assert any("escapes the working directory" in e for e in result.errors)

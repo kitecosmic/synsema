@@ -1,5 +1,5 @@
 -- HTTP server demo — a tiny products API, zero dependencies.
--- Run with:  syntecnia run examples/serve_demo.syn   (Ctrl+C to stop)
+-- Run with:  synsema run examples/serve_demo.syn   (Ctrl+C to stop)
 
 intent: "Serve a small products API over HTTP"
 

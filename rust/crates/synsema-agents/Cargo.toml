@@ -1,0 +1,14 @@
+[package]
+name = "synsema-agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Synsema agents: blackboard, resource_lock, swarm, memory, progress, builtins"
+
+[dependencies]
+synsema-core.workspace = true
+synsema-capabilities.workspace = true
+indexmap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true

@@ -1,4 +1,4 @@
--- Syntecnia Flat Syntax Demo
+-- Synsema Flat Syntax Demo
 -- This reads like a document, not like code
 
 task calculate_discount(price):

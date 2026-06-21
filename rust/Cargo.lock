@@ -1058,52 +1058,41 @@ dependencies = [
 ]
 
 [[package]]
-name = "synstructure"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "syntecnia-agents"
+name = "synsema-agents"
 version = "0.1.0"
 dependencies = [
  "indexmap",
  "regex",
  "serde",
  "serde_json",
- "syntecnia-capabilities",
- "syntecnia-core",
+ "synsema-capabilities",
+ "synsema-core",
 ]
 
 [[package]]
-name = "syntecnia-capabilities"
+name = "synsema-capabilities"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "indexmap",
- "syntecnia-core",
+ "synsema-core",
 ]
 
 [[package]]
-name = "syntecnia-cli"
+name = "synsema-cli"
 version = "0.1.0"
 dependencies = [
  "serde_json",
- "syntecnia-agents",
- "syntecnia-capabilities",
- "syntecnia-core",
- "syntecnia-llm",
- "syntecnia-runtime",
- "syntecnia-stdlib",
+ "synsema-agents",
+ "synsema-capabilities",
+ "synsema-core",
+ "synsema-llm",
+ "synsema-runtime",
+ "synsema-stdlib",
 ]
 
 [[package]]
-name = "syntecnia-core"
+name = "synsema-core"
 version = "0.1.0"
 dependencies = [
  "indexmap",
@@ -1114,33 +1103,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "syntecnia-llm"
+name = "synsema-llm"
 version = "0.1.0"
 dependencies = [
  "indexmap",
  "regex",
- "syntecnia-capabilities",
- "syntecnia-core",
+ "synsema-capabilities",
+ "synsema-core",
 ]
 
 [[package]]
-name = "syntecnia-runtime"
+name = "synsema-runtime"
 version = "0.1.0"
 dependencies = [
  "indexmap",
  "regex",
  "rusqlite",
  "serde_json",
- "syntecnia-agents",
- "syntecnia-capabilities",
- "syntecnia-core",
- "syntecnia-llm",
- "syntecnia-stdlib",
+ "synsema-agents",
+ "synsema-capabilities",
+ "synsema-core",
+ "synsema-llm",
+ "synsema-stdlib",
  "tokio",
 ]
 
 [[package]]
-name = "syntecnia-stdlib"
+name = "synsema-stdlib"
 version = "0.1.0"
 dependencies = [
  "bytes",
@@ -1155,11 +1144,22 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde_json",
- "syntecnia-capabilities",
- "syntecnia-core",
+ "synsema-capabilities",
+ "synsema-core",
  "tokio",
  "tokio-rustls",
  "winreg",
+]
+
+[[package]]
+name = "synstructure"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 -- Agent-first blog — one route, three representations.
--- Run with:  syntecnia run examples/blog_demo.syn
+-- Run with:  synsema run examples/blog_demo.syn
 --
 -- The SAME /blog/:slug route serves:
 --   a browser            -> HTML (semantic, with <head> + JSON-LD for SEO)

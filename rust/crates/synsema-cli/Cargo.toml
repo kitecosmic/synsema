@@ -1,0 +1,21 @@
+[package]
+name = "synsema-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Synsema CLI — the `synsema` command"
+
+# The product command is `synsema` (single, unified name). The crate is still
+# `synsema-cli` (built with `-p synsema-cli`), but it produces a `synsema` binary.
+[[bin]]
+name = "synsema"
+path = "src/main.rs"
+
+[dependencies]
+synsema-core.workspace = true
+synsema-capabilities.workspace = true
+synsema-stdlib.workspace = true
+synsema-agents.workspace = true
+synsema-llm.workspace = true
+synsema-runtime.workspace = true
+serde_json.workspace = true

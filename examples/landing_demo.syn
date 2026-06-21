@@ -1,7 +1,7 @@
 -- Template SSR demo — a server-rendered landing page with render().
--- Run with:  syntecnia run examples/landing_demo.syn   (then open http://localhost:8096)
+-- Run with:  synsema run examples/landing_demo.syn   (then open http://localhost:8096)
 --
--- render("home.html", data) fills the template's { ... } holes with Syntecnia
+-- render("home.html", data) fills the template's { ... } holes with Synsema
 -- expressions. Every value is AUTO-ESCAPED (XSS-safe); { raw } opts out.
 -- Flow control reuses each/when. CSS lives in a static file (braces!).
 
@@ -17,7 +17,7 @@ serve on 8096
 
     route "GET /"
         give render("examples/templates/home.html", {
-            "title": "Syntecnia",
+            "title": "Synsema",
             "tagline": "Server-rendered, <safe> by default",
             "features": features(),
             "highlighted": true,

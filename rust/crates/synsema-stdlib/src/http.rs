@@ -1,0 +1,312 @@
+//! HTTP nativo. Port de `synsema/stdlib/http.py`.
+//!
+//! Cliente mínimo sobre `std::net` (sin dependencias). Capa 6: el gate sólo prueba
+//! el camino de fallo de conexión (host inválido / puerto inválido → ok=false,
+//! status=0, error). Para `http://` reales hace el intercambio HTTP/1.1 básico
+//! (Connection: close). `https://` (TLS) queda para una capa posterior.
+//!
+//! Nota: `http`/`http_get`/`http_post`/… NO chequean capability (a diferencia de
+//! `fetch`, que sí). Es el contrato del oráculo.
+
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::rc::Rc;
+use std::time::Duration;
+
+use indexmap::IndexMap;
+
+use synsema_core::interpreter::Interpreter;
+use synsema_core::types::{syn_bool, syn_int, syn_map, syn_text, SynValue};
+
+/// Respuesta estructurada (espeja el dict del oráculo).
+pub struct HttpResult {
+    pub status: i64,
+    pub ok: bool,
+    pub body: String,
+    pub headers: Vec<(String, String)>,
+    pub error: Option<String>,
+}
+
+fn err_result(error: String) -> HttpResult {
+    HttpResult {
+        status: 0,
+        ok: false,
+        body: String::new(),
+        headers: Vec::new(),
+        error: Some(error),
+    }
+}
+
+/// Petición HTTP. Devuelve la respuesta o un resultado de error (nunca panica).
+pub fn http_request(
+    method: &str,
+    url: &str,
+    headers: Option<&[(String, String)]>,
+    query: Option<&[(String, String)]>,
+    body: Option<&str>,
+    timeout_secs: u64,
+) -> HttpResult {
+    // URL con query.
+    let full_url = match query {
+        Some(q) if !q.is_empty() => {
+            let sep = if url.contains('?') { "&" } else { "?" };
+            format!("{}{}{}", url, sep, urlencode(q))
+        }
+        _ => url.to_string(),
+    };
+    match do_request(method, &full_url, headers, body, timeout_secs) {
+        Ok(r) => r,
+        Err(e) => err_result(e),
+    }
+}
+
+fn parse_url(url: &str) -> Result<(String, String, u16, String), String> {
+    let idx = url.find("://").ok_or_else(|| "invalid URL (no scheme)".to_string())?;
+    let scheme = url[..idx].to_lowercase();
+    let rest = &url[idx + 3..];
+    let path_start = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..path_start];
+    let path = if path_start < rest.len() { &rest[path_start..] } else { "/" };
+    let (host, port) = match authority.rfind(':') {
+        Some(i) => {
+            let h = authority[..i].to_string();
+            let p: u16 = authority[i + 1..]
+                .parse()
+                .map_err(|_| format!("invalid port in URL: {}", authority))?;
+            (h, p)
+        }
+        None => (
+            authority.to_string(),
+            if scheme == "https" { 443 } else { 80 },
+        ),
+    };
+    Ok((scheme, host, port, path.to_string()))
+}
+
+fn do_request(
+    method: &str,
+    url: &str,
+    headers: Option<&[(String, String)]>,
+    body: Option<&str>,
+    timeout_secs: u64,
+) -> Result<HttpResult, String> {
+    let (scheme, host, port, path) = parse_url(url)?;
+    if scheme != "http" {
+        return Err(format!(
+            "unsupported scheme '{}': TLS/https not available yet (capa posterior)",
+            scheme
+        ));
+    }
+
+    let addr = format!("{}:{}", host, port);
+    let sa = addr
+        .to_socket_addrs()
+        .map_err(|e| e.to_string())?
+        .next()
+        .ok_or_else(|| format!("could not resolve host: {}", host))?;
+    let timeout = Duration::from_secs(timeout_secs);
+    let mut stream = TcpStream::connect_timeout(&sa, timeout).map_err(|e| e.to_string())?;
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    let mut req = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+        method.to_uppercase(),
+        path,
+        host
+    );
+    if let Some(hs) = headers {
+        for (k, v) in hs {
+            req.push_str(&format!("{}: {}\r\n", k, v));
+        }
+    }
+    if let Some(b) = body {
+        req.push_str(&format!("Content-Length: {}\r\n", b.len()));
+    }
+    req.push_str("\r\n");
+    if let Some(b) = body {
+        req.push_str(b);
+    }
+
+    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    parse_response(&buf)
+}
+
+fn parse_response(buf: &[u8]) -> Result<HttpResult, String> {
+    let text = String::from_utf8_lossy(buf);
+    let split = text.find("\r\n\r\n").ok_or_else(|| "malformed HTTP response".to_string())?;
+    let head = &text[..split];
+    let body = &text[split + 4..];
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().unwrap_or("");
+    let status: i64 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut headers = Vec::new();
+    for line in lines {
+        if let Some(ci) = line.find(':') {
+            headers.push((line[..ci].trim().to_string(), line[ci + 1..].trim().to_string()));
+        }
+    }
+    Ok(HttpResult {
+        status,
+        ok: (200..300).contains(&status),
+        body: body.to_string(),
+        headers,
+        error: None,
+    })
+}
+
+fn urlencode(q: &[(String, String)]) -> String {
+    q.iter()
+        .map(|(k, v)| format!("{}={}", pct(k), pct(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn pct(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+// -- Builtins (no gateados por capability) --
+
+fn raw_str(v: &SynValue) -> String {
+    match v {
+        SynValue::Text(s) => s.to_string(),
+        SynValue::Number(n) => n.to_string(),
+        SynValue::Bool(b) => if *b { "True" } else { "False" }.to_string(),
+        SynValue::Nothing => "None".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Map SynValue → pares (clave, str(valor)).
+fn map_pairs(v: Option<&SynValue>) -> Option<Vec<(String, String)>> {
+    match v {
+        Some(SynValue::Map(m)) => Some(
+            m.borrow()
+                .iter()
+                .map(|(k, val)| (k.clone(), val.to_string()))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+fn response_to_syn(r: HttpResult) -> SynValue {
+    let mut m = IndexMap::new();
+    m.insert("status".to_string(), syn_int(r.status));
+    m.insert("ok".to_string(), syn_bool(r.ok));
+    m.insert("body".to_string(), syn_text(r.body));
+    if !r.headers.is_empty() {
+        let mut hm = IndexMap::new();
+        for (k, v) in r.headers {
+            hm.insert(k, syn_text(v));
+        }
+        m.insert("headers".to_string(), syn_map(hm));
+    }
+    if let Some(e) = r.error {
+        m.insert("error".to_string(), syn_text(e));
+    }
+    syn_map(m)
+}
+
+pub fn register_http_builtins(interp: &Interpreter) {
+    // http(method, url, headers?, query?, body?, timeout?)
+    interp.register_builtin(
+        "http",
+        -1,
+        Rc::new(move |_i, args, _loc| {
+            let method = raw_str(args.first().unwrap_or(&SynValue::Nothing));
+            let url = raw_str(args.get(1).unwrap_or(&SynValue::Nothing));
+            let headers = map_pairs(args.get(2));
+            let query = map_pairs(args.get(3));
+            let body = args.get(4).map(raw_str);
+            let r = http_request(
+                &method,
+                &url,
+                headers.as_deref(),
+                query.as_deref(),
+                body.as_deref(),
+                30,
+            );
+            Ok(response_to_syn(r))
+        }),
+    );
+
+    // http_get(url, headers?, query?)
+    interp.register_builtin(
+        "http_get",
+        -1,
+        Rc::new(move |_i, args, _loc| {
+            let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
+            let headers = map_pairs(args.get(1));
+            let query = map_pairs(args.get(2));
+            let r = http_request("GET", &url, headers.as_deref(), query.as_deref(), None, 30);
+            Ok(response_to_syn(r))
+        }),
+    );
+
+    // http_post(url, body, headers?)
+    interp.register_builtin(
+        "http_post",
+        -1,
+        Rc::new(move |_i, args, _loc| {
+            let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
+            let body = args.get(1).map(raw_str);
+            let headers = map_pairs(args.get(2));
+            let r = http_request("POST", &url, headers.as_deref(), None, body.as_deref(), 30);
+            Ok(response_to_syn(r))
+        }),
+    );
+
+    // http_put(url, body, headers?)
+    interp.register_builtin(
+        "http_put",
+        -1,
+        Rc::new(move |_i, args, _loc| {
+            let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
+            let body = args.get(1).map(raw_str);
+            let headers = map_pairs(args.get(2));
+            let r = http_request("PUT", &url, headers.as_deref(), None, body.as_deref(), 30);
+            Ok(response_to_syn(r))
+        }),
+    );
+
+    // http_delete(url, headers?)
+    interp.register_builtin(
+        "http_delete",
+        -1,
+        Rc::new(move |_i, args, _loc| {
+            let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
+            let headers = map_pairs(args.get(1));
+            let r = http_request("DELETE", &url, headers.as_deref(), None, None, 30);
+            Ok(response_to_syn(r))
+        }),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_request_invalid_url() {
+        let r = http_request("GET", "http://this-does-not-exist-12345.invalid", None, None, None, 5);
+        assert!(!r.ok);
+        assert_eq!(r.status, 0);
+        assert!(r.error.is_some());
+    }
+}

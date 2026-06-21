@@ -1,0 +1,12 @@
+[package]
+name = "synsema-llm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Synsema llm + human: provider, context, validator, interaction"
+
+[dependencies]
+synsema-core.workspace = true
+synsema-capabilities.workspace = true
+indexmap.workspace = true
+regex.workspace = true

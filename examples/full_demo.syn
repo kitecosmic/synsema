@@ -1,4 +1,4 @@
--- Syntecnia: Full Feature Demo
+-- Synsema: Full Feature Demo
 -- Demonstrates all 5 layers of the language
 
 -- ============================================
@@ -6,7 +6,7 @@
 -- ============================================
 
 -- Variables and types
-let name be "Syntecnia"
+let name be "Synsema"
 let version be 0.1
 let features be ["capabilities", "agents", "llm", "human", "observability"]
 
@@ -135,4 +135,4 @@ task square(x)
 let result be 7 |> square |> square |> square
 print("7 |> square |> square |> square = " + text(result))
 
-print("\nSyntecnia v" + text(version) + " — All systems operational.")
+print("\nSynsema v" + text(version) + " — All systems operational.")

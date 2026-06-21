@@ -1,7 +1,7 @@
--- Syntecnia: Hello World
--- This is the simplest Syntecnia program
+-- Synsema: Hello World
+-- This is the simplest Synsema program
 
-let greeting be "Hello from Syntecnia!"
+let greeting be "Hello from Synsema!"
 show greeting
 
 -- Variables and arithmetic

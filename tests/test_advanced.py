@@ -1,19 +1,19 @@
-"""Tests for advanced Syntecnia features: AST API, testgen, intentional ops,
+"""Tests for advanced Synsema features: AST API, testgen, intentional ops,
 speculative execution, resource locking, addressable memory, flat syntax."""
 
 import sys
-sys.path.insert(0, "/root/Syntecnia")
+sys.path.insert(0, "/root/Synsema")
 
-from syntecnia.runtime.engine import SyntecniaEngine
-from syntecnia.core.parser import parse
-from syntecnia.core import ast_api
-from syntecnia.core.testgen import TestGenerator
-from syntecnia.core.addressable import AddressableCode
-from syntecnia.core.flat_syntax import translate_flat
-from syntecnia.runtime.speculative import SpeculativeEngine, EnvironmentSnapshot
-from syntecnia.core.interpreter import Interpreter, Environment
-from syntecnia.core.types import syn_number, syn_text
-from syntecnia.agents.resource_lock import ResourceLockManager, LockMode, LockStatus
+from synsema.runtime.engine import SynsemaEngine
+from synsema.core.parser import parse
+from synsema.core import ast_api
+from synsema.core.testgen import TestGenerator
+from synsema.core.addressable import AddressableCode
+from synsema.core.flat_syntax import translate_flat
+from synsema.runtime.speculative import SpeculativeEngine, EnvironmentSnapshot
+from synsema.core.interpreter import Interpreter, Environment
+from synsema.core.types import syn_number, syn_text
+from synsema.agents.resource_lock import ResourceLockManager, LockMode, LockStatus
 
 
 # ===== AST API =====
@@ -140,7 +140,7 @@ task add(a, b)
 # ===== Intentional Operations =====
 
 def test_intentional_apply():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 task double(x)
     give x * 2
@@ -154,7 +154,7 @@ each n in doubled
 
 
 def test_intentional_where():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 task is_big(x)
     give x > 3
@@ -167,7 +167,7 @@ print(text(length(big)))
 
 
 def test_intentional_reduce():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 task add(acc, x)
     give acc + x
@@ -179,7 +179,7 @@ print(text(total))
 
 
 def test_intentional_collect():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 let users be [{"name": "Alice"}, {"name": "Bob"}]
 let names be collect(users, "name")
@@ -191,7 +191,7 @@ each n in names
 
 
 def test_intentional_transform():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 task double(x)
     give x * 2
@@ -207,7 +207,7 @@ each n in result
 
 
 def test_intentional_sort_by():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 task neg(x)
     give 0 - x
@@ -221,7 +221,7 @@ each n in sorted
 
 
 def test_intentional_every_some():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 task positive(x)
     give x > 0
@@ -235,7 +235,7 @@ print(text(some([-1, -2, -3], positive)))
 
 
 def test_intentional_flatten():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 let nested be [[1, 2], [3, 4], [5]]
 let flat be flatten(nested)
@@ -453,7 +453,7 @@ let nums be [1, 2, 3]
 For each n in nums, print(text(double(n))).
 """
     std = translate_flat(flat)
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source(std)
     assert result.success
     assert result.output == ["2", "4", "6"]

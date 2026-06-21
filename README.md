@@ -1,23 +1,23 @@
-# Syntecnia
+# Synsema
 
 A programming language designed for AI agents.
 
-Syntecnia is not a framework or a library — it's a language where observability, security, multi-agent coordination, human interaction, and LLM integration are built-in primitives, not afterthoughts. It compiles to a single native binary: no runtime, no GIL, true multi-core.
+Synsema is not a framework or a library — it's a language where observability, security, multi-agent coordination, human interaction, and LLM integration are built-in primitives, not afterthoughts. It compiles to a single native binary: no runtime, no GIL, true multi-core.
 
 ## Fast *and* secure
 
-Syntecnia is in the Go/Node performance tier — and adds deny-by-default security none of
+Synsema is in the Go/Node performance tier — and adds deny-by-default security none of
 them have. HTTP throughput, same API, 100 concurrent connections:
 
 | Stack | req/s | avg latency | p99 |
 |---|---|---|---|
-| **Syntecnia** | **2,610** | **14.4 ms** | **50 ms** |
+| **Synsema** | **2,610** | **14.4 ms** | **50 ms** |
 | Node | 2,746 | 11.5 ms | 41 ms |
 | Go (net/http) | 2,522 | 16.5 ms | 58 ms |
 | FastAPI (uvicorn) | 1,744 | 51.3 ms | 79 ms |
 
-Syntecnia, Node, and Go are effectively tied (run-to-run noise); Syntecnia is ~1.5× FastAPI
-under load. Unlike all of them, Syntecnia enforces **capability security at the language
+Synsema, Node, and Go are effectively tied (run-to-run noise); Synsema is ~1.5× FastAPI
+under load. Unlike all of them, Synsema enforces **capability security at the language
 level** — no network, file, or DB access without an explicit `require`, route auth and input
 validation are declarative, and there's an automatic audit log. Security is a property of
 the language, not a discipline you have to remember.
@@ -28,15 +28,15 @@ A single self-contained binary — no Python, no npm, nothing to install on the 
 
 ```bash
 # one-liner (Linux/macOS) — once a release is published
-curl -fsSL https://syntecnia.org/install.sh | sh
+curl -fsSL https://synsema.org/install.sh | sh
 ```
 
 ### Build from source
 
 ```bash
-git clone https://github.com/kitecosmic/Syntecnia.git
-cd Syntecnia
-cargo build --release --manifest-path rust/Cargo.toml   # → rust/target/release/syntecnia
+git clone https://github.com/kitecosmic/synsema.git
+cd synsema
+cargo build --release --manifest-path rust/Cargo.toml   # → rust/target/release/synsema
 ```
 
 ## Quick start
@@ -56,28 +56,28 @@ print(greet("Alice"))
 Run it:
 
 ```bash
-syntecnia run hello.syn
+synsema run hello.syn
 ```
 
 ## Usage
 
-The command is `syntecnia` for both implementations (e.g. `syntecnia run program.syn`,
-`syntecnia serve app.syn`).
+The command is `synsema` for both implementations (e.g. `synsema run program.syn`,
+`synsema serve app.syn`).
 
 ```bash
-syntecnia run program.syn              # Run a program
-syntecnia serve app.syn                # Run a program that starts an HTTP server (blocks)
-syntecnia run program.syn -v           # Run with verbose output
-syntecnia run program.syn --secure     # Run in secure mode (all capabilities must be granted)
-syntecnia run program.syn --provider anthropic  # Use Claude as LLM engine
-syntecnia run program.syn --grant net:api.example.com  # Grant a capability
-syntecnia run program.syn --audit      # Show capability audit trail
-syntecnia run program.fsyn             # Run flat (document-style) syntax
-syntecnia repl                         # Interactive mode
-syntecnia check program.syn            # Parse and validate without running
-syntecnia tokens program.syn           # Show token stream
-syntecnia ast program.syn              # Show abstract syntax tree
-syntecnia testgen program.syn          # Auto-generate and run tests
+synsema run program.syn              # Run a program
+synsema serve app.syn                # Run a program that starts an HTTP server (blocks)
+synsema run program.syn -v           # Run with verbose output
+synsema run program.syn --secure     # Run in secure mode (all capabilities must be granted)
+synsema run program.syn --provider anthropic  # Use Claude as LLM engine
+synsema run program.syn --grant net:api.example.com  # Grant a capability
+synsema run program.syn --audit      # Show capability audit trail
+synsema run program.fsyn             # Run flat (document-style) syntax
+synsema repl                         # Interactive mode
+synsema check program.syn            # Parse and validate without running
+synsema tokens program.syn           # Show token stream
+synsema ast program.syn              # Show abstract syntax tree
+synsema testgen program.syn          # Auto-generate and run tests
 ```
 
 ## Language overview
@@ -222,7 +222,7 @@ serve on 8080
 - **Rate limiting:** `rate_limit N per second|minute|hour` on the server (default) or per route (override; `none` to disable). Token bucket keyed by the real peer IP (not `X-Forwarded-For`), checked before auth, `429` + `Retry-After` + `RateLimit-*` over the limit, stale buckets purged.
 - **Soft keywords:** `serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body`, `max_streams`, `stream`, `send` are only special inside their construction — elsewhere they are ordinary names (`let route be "/x"` works).
 
-See [.syntecnia-skill/serve.md](.syntecnia-skill/serve.md) for full details.
+See [.synsema-skill/serve.md](.synsema-skill/serve.md) for full details.
 
 ### Production web stack — no Caddy/nginx needed
 
@@ -306,9 +306,9 @@ let response be generate "email" given ticket with tone = "empathetic"
 Configure the provider:
 
 ```bash
-syntecnia run program.syn --provider anthropic   # Claude
-syntecnia run program.syn --provider openai       # GPT
-syntecnia run program.syn --provider ollama       # Local model
+synsema run program.syn --provider anthropic   # Claude
+synsema run program.syn --provider openai       # GPT
+synsema run program.syn --provider ollama       # Local model
 ```
 
 ## Human interaction
@@ -430,7 +430,7 @@ end
 ## Auto-generated tests
 
 ```bash
-syntecnia testgen program.syn
+synsema testgen program.syn
 ```
 
 Automatically generates edge-case tests from your types and task signatures:
@@ -447,13 +447,13 @@ A 329-test conformance corpus plus unit and integration tests:
 cargo test --manifest-path rust/Cargo.toml --workspace
 ```
 
-A second reference interpreter (`syntecnia/`, Python) runs the same corpus and acts as the
+A second reference interpreter (`synsema/`, Python) runs the same corpus and acts as the
 conformance oracle: `PYTHONPATH=. python3 tests/test_core.py` (and the other 9 test files).
 
 ## Architecture
 
 ```
-syntecnia/
+synsema/
 ├── core/              # Language foundation
 │   ├── tokens.py      # Token definitions (60+ types)
 │   ├── lexer.py       # Tokenizer with significant whitespace
@@ -498,13 +498,13 @@ The shipped binary is a Cargo workspace mirroring the packages above:
 
 ```
 rust/crates/
-├── syntecnia-core/         # lexer, parser, AST, types, interpreter, templates
-├── syntecnia-capabilities/ # capability model + intent enforcement
-├── syntecnia-stdlib/       # http, database, cron, server, acme, mimetypes
-├── syntecnia-agents/       # blackboard, swarm, memory, progress, resource_lock
-├── syntecnia-runtime/      # engine, serve, parallel (concurrency), recovery, persistence, daemon
-├── syntecnia-llm/          # provider, context, validator, human
-└── syntecnia-cli/          # builds the `syntecnia` binary: run, serve, check, repl, ast, tokens, daemon
+├── synsema-core/         # lexer, parser, AST, types, interpreter, templates
+├── synsema-capabilities/ # capability model + intent enforcement
+├── synsema-stdlib/       # http, database, cron, server, acme, mimetypes
+├── synsema-agents/       # blackboard, swarm, memory, progress, resource_lock
+├── synsema-runtime/      # engine, serve, parallel (concurrency), recovery, persistence, daemon
+├── synsema-llm/          # provider, context, validator, human
+└── synsema-cli/          # builds the `synsema` binary: run, serve, check, repl, ast, tokens, daemon
 ```
 
 The interpreter is **synchronous**; concurrency (`parallel_map`) and the web server are
@@ -512,54 +512,54 @@ async layers around it. `spawn` agents use OS threads.
 
 ## AI Skill (for Claude Code, Codex, etc.)
 
-Syntecnia includes a structured skill so AI coding assistants can learn the language. The skill is organized as an indexed folder — the AI reads only the sections it needs.
+Synsema includes a structured skill so AI coding assistants can learn the language. The skill is organized as an indexed folder — the AI reads only the sections it needs.
 
 ### Install the skill (Claude Code)
 
 ```bash
 # From the repo
-cd Syntecnia && bash install-skill.sh
+cd synsema && bash install-skill.sh
 
 # Or remote
-curl -s https://raw.githubusercontent.com/kitecosmic/Syntecnia/main/install-skill.sh | bash
+curl -s https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash
 ```
 
 Then add to your `CLAUDE.md`:
 ```
-For Syntecnia development, read ~/.claude/skills/syntecnia/INDEX.md
+For Synsema development, read ~/.claude/skills/synsema/INDEX.md
 ```
 
 ### Skill index
 
-The skill lives in `.syntecnia-skill/` and is organized by topic:
+The skill lives in `.synsema-skill/` and is organized by topic:
 
 | File | When to read |
 |------|-------------|
-| [INDEX.md](.syntecnia-skill/INDEX.md) | **Always read first** — points to everything else |
-| [syntax.md](.syntecnia-skill/syntax.md) | Writing or reading `.syn` code — keywords, operators, statement patterns |
-| [builtins.md](.syntecnia-skill/builtins.md) | Need to know what functions exist — all built-in tasks with signatures |
-| [types.md](.syntecnia-skill/types.md) | Working with data — type system, property access, truthiness |
-| [capabilities.md](.syntecnia-skill/capabilities.md) | Adding security — require, sandbox, intent, per-task scoping |
-| [agents.md](.syntecnia-skill/agents.md) | Multi-agent work — blackboard, swarm, signals, resource locks |
-| [llm.md](.syntecnia-skill/llm.md) | Using AI reasoning — reason, decide, analyze, generate, providers |
-| [human.md](.syntecnia-skill/human.md) | Human interaction — approve, confirm, ask, escalation |
-| [observability.md](.syntecnia-skill/observability.md) | Debugging — trace, log, measure, error diagnostics, recovery |
-| [memory.md](.syntecnia-skill/memory.md) | Agent persistence — progress tracking, memory, owner rules |
-| [patterns.md](.syntecnia-skill/patterns.md) | Common idioms — safe division, pipe chains, intentional ops |
-| [structure.md](.syntecnia-skill/structure.md) | Understanding the codebase — file map with entry points |
+| [INDEX.md](.synsema-skill/INDEX.md) | **Always read first** — points to everything else |
+| [syntax.md](.synsema-skill/syntax.md) | Writing or reading `.syn` code — keywords, operators, statement patterns |
+| [builtins.md](.synsema-skill/builtins.md) | Need to know what functions exist — all built-in tasks with signatures |
+| [types.md](.synsema-skill/types.md) | Working with data — type system, property access, truthiness |
+| [capabilities.md](.synsema-skill/capabilities.md) | Adding security — require, sandbox, intent, per-task scoping |
+| [agents.md](.synsema-skill/agents.md) | Multi-agent work — blackboard, swarm, signals, resource locks |
+| [llm.md](.synsema-skill/llm.md) | Using AI reasoning — reason, decide, analyze, generate, providers |
+| [human.md](.synsema-skill/human.md) | Human interaction — approve, confirm, ask, escalation |
+| [observability.md](.synsema-skill/observability.md) | Debugging — trace, log, measure, error diagnostics, recovery |
+| [memory.md](.synsema-skill/memory.md) | Agent persistence — progress tracking, memory, owner rules |
+| [patterns.md](.synsema-skill/patterns.md) | Common idioms — safe division, pipe chains, intentional ops |
+| [structure.md](.synsema-skill/structure.md) | Understanding the codebase — file map with entry points |
 
 ### For other AI tools (Codex, Cursor, Windsurf, etc.)
 
-Point the tool at `.syntecnia-skill/INDEX.md` in the repo root. Each tool has its own way to add context:
+Point the tool at `.synsema-skill/INDEX.md` in the repo root. Each tool has its own way to add context:
 
 - **Codex**: reference the skill folder in your system instructions
-- **Cursor**: add `.syntecnia-skill/` to your project rules or docs
+- **Cursor**: add `.synsema-skill/` to your project rules or docs
 - **Windsurf**: include INDEX.md in your cascade context
 - **Any tool**: paste the contents of INDEX.md as system prompt, the AI will know which sub-file to request
 
 ### LLM response validation
 
-When Syntecnia connects to an LLM, responses are validated automatically:
+When Synsema connects to an LLM, responses are validated automatically:
 
 - `decide` responses **must** be exactly one of the given options
 - Invalid responses trigger a retry (up to 3 attempts)
@@ -585,5 +585,5 @@ When Syntecnia connects to an LLM, responses are validated automatically:
 [Apache License 2.0](LICENSE). The code is free to use, modify, and distribute,
 with an explicit patent grant.
 
-**Trademark:** "Syntecnia" is a project trademark. The license covers the code, not the
+**Trademark:** "Synsema" is a project trademark. The license covers the code, not the
 name — forks and derivative works must use a different name (see [NOTICE](NOTICE)).

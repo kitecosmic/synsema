@@ -1,5 +1,5 @@
 -- Rate limiting demo — protect a login endpoint from brute-force.
--- Run:   syntecnia run examples/rate_limit_demo.syn      (Ctrl+C to stop)
+-- Run:   synsema run examples/rate_limit_demo.syn      (Ctrl+C to stop)
 -- Try:   for i in $(seq 1 7); do curl -s -o /dev/null -w "%{http_code}\n" \
 --            -X POST http://127.0.0.1:8080/login \
 --            -H "Content-Type: application/json" -d '{"user":"a","pass":"x"}'; done

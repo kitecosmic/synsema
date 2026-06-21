@@ -1,16 +1,16 @@
-"""Tests for Syntecnia agent swarm and blackboard."""
+"""Tests for Synsema agent swarm and blackboard."""
 import sys
 import time
-sys.path.insert(0, "/root/Syntecnia")
+sys.path.insert(0, "/root/Synsema")
 
-from syntecnia.agents.blackboard import Blackboard
-from syntecnia.agents.swarm import AgentSwarm, AgentState
-from syntecnia.core.types import syn_text, syn_number, syn_list, syn_nothing
-from syntecnia.human.interaction import (
+from synsema.agents.blackboard import Blackboard
+from synsema.agents.swarm import AgentSwarm, AgentState
+from synsema.core.types import syn_text, syn_number, syn_list, syn_nothing
+from synsema.human.interaction import (
     InteractionManager, AutoHandler, QueueHandler,
     InteractionType, InteractionStatus,
 )
-from syntecnia.llm.provider import MockProvider, create_provider
+from synsema.llm.provider import MockProvider, create_provider
 
 
 # -- Blackboard tests --
@@ -117,7 +117,7 @@ def test_queue_handler_respond():
     result_holder = [None]
 
     def make_request():
-        from syntecnia.human.interaction import InteractionRequest, InteractionType
+        from synsema.human.interaction import InteractionRequest, InteractionType
         req = InteractionRequest(id="req_1", type=InteractionType.APPROVE, message="Test?")
         result_holder[0] = handler.handle(req)
 
@@ -142,15 +142,15 @@ def test_mock_provider():
         "reason": "This is a mock reasoning result",
         "decide": "option_a",
     })
-    from syntecnia.llm.provider import LLMRequest
+    from synsema.llm.provider import LLMRequest
     resp = provider.call(LLMRequest(operation="reason", data={"subject": "test"}))
     assert resp.content == "This is a mock reasoning result"
     assert len(provider.call_log) == 1
 
 
 def test_mock_provider_in_engine():
-    from syntecnia.runtime.engine import SyntecniaEngine
-    engine = SyntecniaEngine()
+    from synsema.runtime.engine import SynsemaEngine
+    engine = SynsemaEngine()
     engine.configure_llm_provider("mock", responses={
         "analyze": "Positive sentiment",
         "decide": "refund",
@@ -176,8 +176,8 @@ def test_create_provider_factory():
 # -- Integration: human + engine --
 
 def test_human_interaction_in_engine():
-    from syntecnia.runtime.engine import SyntecniaEngine
-    engine = SyntecniaEngine()
+    from synsema.runtime.engine import SynsemaEngine
+    engine = SynsemaEngine()
 
     mgr = InteractionManager(AutoHandler(default_approve=True))
     engine.configure_human(mgr.get_callback())
@@ -192,8 +192,8 @@ print("deployed!")
 
 
 def test_human_denial_in_engine():
-    from syntecnia.runtime.engine import SyntecniaEngine
-    engine = SyntecniaEngine()
+    from synsema.runtime.engine import SynsemaEngine
+    engine = SynsemaEngine()
 
     mgr = InteractionManager(AutoHandler(default_approve=False))
     engine.configure_human(mgr.get_callback())

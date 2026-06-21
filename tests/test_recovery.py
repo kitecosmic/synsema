@@ -1,18 +1,18 @@
 """Tests for error reporter, recovery protocol, and escalation."""
 import sys
 import time
-sys.path.insert(0, "/root/Syntecnia")
+sys.path.insert(0, "/root/Synsema")
 
-from syntecnia.runtime.error_reporter import (
+from synsema.runtime.error_reporter import (
     ErrorReporter, ErrorDiagnostic, classify_error, CallFrame,
 )
-from syntecnia.runtime.recovery import (
+from synsema.runtime.recovery import (
     RecoveryProtocol, RecoveryResult, EscalationOption, HumanDecision,
 )
-from syntecnia.runtime.engine import SyntecniaEngine
-from syntecnia.core.interpreter import Environment
-from syntecnia.core.types import syn_number, syn_text
-from syntecnia.human.interaction import InteractionManager, AutoHandler
+from synsema.runtime.engine import SynsemaEngine
+from synsema.core.interpreter import Environment
+from synsema.core.types import syn_number, syn_text
+from synsema.human.interaction import InteractionManager, AutoHandler
 
 
 # ===== Error Reporter =====
@@ -71,7 +71,7 @@ def test_error_reporter_build_diagnostic():
         pass
     err = FakeError("Division by zero")
 
-    from syntecnia.core.tokens import SourceLocation
+    from synsema.core.tokens import SourceLocation
     err.location = SourceLocation(file="test.syn", line=2, column=15, offset=20)
 
     env = Environment(name="test")
@@ -91,7 +91,7 @@ def test_error_reporter_human_format():
     reporter.load_source("test.syn", "line1\nline2\nline3\nline4\nline5")
     reporter.set_intent("Process orders")
 
-    from syntecnia.core.tokens import SourceLocation
+    from synsema.core.tokens import SourceLocation
     err = Exception("Division by zero")
     err.location = SourceLocation(file="test.syn", line=3, column=5, offset=0)
 
@@ -158,7 +158,7 @@ def test_recovery_partial():
     protocol.output_callback = lambda t: output.append(t)
 
     def partial_fn():
-        from syntecnia.core.types import syn_list
+        from synsema.core.types import syn_list
         return syn_list([syn_text("partial_result")])
 
     err = Exception("Full data unavailable")
@@ -264,7 +264,7 @@ def test_recovery_decision_persistence(tmp_path=None):
 # ===== Integration: Rich diagnostics in engine =====
 
 def test_engine_rich_diagnostic_on_error():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 let x be 0
 let y be 10 / x
@@ -278,7 +278,7 @@ let y be 10 / x
 
 
 def test_engine_rich_diagnostic_undefined_var():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("print(unknown_var)")
     assert not result.success
     assert len(result.diagnostics) > 0
@@ -287,7 +287,7 @@ def test_engine_rich_diagnostic_undefined_var():
 
 
 def test_engine_rich_diagnostic_with_intent():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 intent: "Calculate payroll"
 let salary be 5000
@@ -301,7 +301,7 @@ let rate be salary / hours
 
 
 def test_engine_diagnostic_shows_variables():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("""
 let name be "Alice"
 let balance be 100
@@ -316,7 +316,7 @@ let bad be 10 / 0
 
 
 def test_engine_diagnostic_format_agent():
-    engine = SyntecniaEngine()
+    engine = SynsemaEngine()
     result = engine.run_source("let x be 1 / 0")
     assert not result.success
     diag = result.diagnostics[0]
