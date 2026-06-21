@@ -7,4 +7,5 @@ pub mod cron;
 pub mod database;
 pub mod http;
 pub mod mimetypes;
+pub mod secrets;
 pub mod server;

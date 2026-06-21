@@ -24,6 +24,10 @@ pub enum CapabilityType {
     Llm,
     Db,
     Serve,
+    /// Leer una variable como `secret` (valor opaco tainted). Scope = nombre/prefijo.
+    Secret,
+    /// Habilita `reveal()` (extraer plaintext de un secret). Coarse, sin scope.
+    Reveal,
 }
 
 impl CapabilityType {
@@ -45,6 +49,8 @@ impl CapabilityType {
             Llm => "llm",
             Db => "db",
             Serve => "serve",
+            Secret => "secret",
+            Reveal => "reveal",
         }
     }
 }
@@ -66,6 +72,8 @@ pub fn capability_type_from_name(name: &str) -> Option<CapabilityType> {
         "llm" => Llm,
         "db" => Db,
         "serve" => Serve,
+        "secret" => Secret,
+        "reveal" => Reveal,
         _ => return None,
     })
 }
@@ -292,7 +300,7 @@ pub fn parse_capability(name: &str, scope: Option<&str>) -> Result<Capability, S
     match capability_type_from_name(name) {
         Some(ty) => Ok(Capability::new(ty, scope.map(|s| s.to_string()))),
         None => Err(format!(
-            "Unknown capability type: '{}'. Known: [net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve]",
+            "Unknown capability type: '{}'. Known: [net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal]",
             name
         )),
     }

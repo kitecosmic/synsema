@@ -978,6 +978,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
         // Concatenación de texto (un operando texto coerciona el otro vía str()).
         if op == "+" {
+            // Propagación de taint (#10): si algún operando es `secret`, el resultado
+            // es `secret` (sigue redactado). Esta es UNA comprobación de discriminante
+            // que en código sin secretos es siempre falsa → rama no-tomada, coste
+            // efectivo cero (§8: no es un taint pervasivo, es un check local en `+`).
+            if left.is_secret() || right.is_secret() {
+                return Ok(secret_concat(&left, &right));
+            }
             if let SynValue::Text(l) = &left {
                 return Ok(syn_text(format!("{}{}", l, right)));
             }
@@ -1627,6 +1634,24 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 
 fn nth(args: &[SynValue], i: usize) -> Result<&SynValue, Control> {
     args.get(i).ok_or_else(|| err("missing argument"))
+}
+
+/// Concatenación que **propaga el taint** (#10): el resultado es un `secret` cuyo
+/// plaintext es la concatenación de los plaintexts (un operando no-secret aporta su
+/// Display, igual que la concatenación normal). El nombre se hereda del primer
+/// operando secret (sólo cosmético para la redacción `secret(NAME)`).
+fn secret_concat(left: &SynValue, right: &SynValue) -> SynValue {
+    // (texto a concatenar, nombre si el operando es secret).
+    fn part(v: &SynValue) -> (String, Option<String>) {
+        match v {
+            SynValue::Secret(s) => (s.expose().to_string(), Some(s.name().to_string())),
+            other => (other.to_string(), None),
+        }
+    }
+    let (lp, ln) = part(left);
+    let (rp, rn) = part(right);
+    let name = ln.or(rn).unwrap_or_else(|| "derived".to_string());
+    syn_secret(name, format!("{}{}", lp, rp))
 }
 
 /// `str(value.raw)` estilo Python (texto crudo, no el Display de SynValue).

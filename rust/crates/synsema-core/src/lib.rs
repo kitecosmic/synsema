@@ -11,6 +11,7 @@ pub mod interpreter;
 pub mod lexer;
 pub mod number;
 pub mod parser;
+pub mod secret;
 pub mod templates;
 pub mod testgen;
 pub mod tokens;

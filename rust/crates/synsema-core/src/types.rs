@@ -21,6 +21,7 @@ use indexmap::IndexMap;
 use crate::ast::Node;
 use crate::interpreter::{BuiltinTask, Environment};
 use crate::number::Number;
+use crate::secret::{constant_time_eq, SecretInner};
 use crate::tokens::SourceLocation;
 
 pub type ListRef = Rc<RefCell<Vec<SynValue>>>;
@@ -41,6 +42,11 @@ pub enum SynValue {
     /// comporta como un map (type "map", property access, etc.); el tag sólo lo
     /// lee la lógica de `serve` (contrato de respuesta + negociación).
     Server(Rc<ServerValue>),
+    /// Valor sensible y opaco (feature `secret`). Variante **aislada** (§8): no es
+    /// un bit de taint en los otros valores — es un tag más del enum. Se redacta en
+    /// toda salida (Display/JSON/blackboard/logs); el plaintext sólo se materializa
+    /// en los puntos bordeados del runtime (reveal/socket/DB). Ver `secret.rs`.
+    Secret(Rc<SecretInner>),
 }
 
 /// Closure de paginación lazy de `paged()`: `fetch(limit, offset) → (filas, total)`.
@@ -113,7 +119,14 @@ impl SynValue {
             SynValue::Task(_) | SynValue::Builtin(_) => "task",
             // type=SynMap() en el oráculo para todos los valores del servidor.
             SynValue::Server(_) => "map",
+            SynValue::Secret(_) => "secret",
         }
+    }
+
+    /// ¿Es un valor `secret` (tainted/opaco)? Comprobación de discriminante O(1).
+    #[inline]
+    pub fn is_secret(&self) -> bool {
+        matches!(self, SynValue::Secret(_))
     }
 
     /// Veracidad: nothing/false/0/""/[]/{} → false; el resto → true.
@@ -127,12 +140,23 @@ impl SynValue {
             SynValue::Map(m) => !m.borrow().is_empty(),
             SynValue::Task(_) | SynValue::Builtin(_) => true,
             SynValue::Server(_) => true,
+            // Un secret con plaintext no vacío es truthy (chequeo de longitud, no
+            // expone el valor).
+            SynValue::Secret(s) => !s.expose_bytes().is_empty(),
         }
     }
 
     /// Igualdad por valor (operador `==`/`!=`, `match`, `contains`).
     pub fn syn_equals(&self, other: &SynValue) -> bool {
         match (self, other) {
+            // Secret: igualdad en **tiempo constante** (no filtra por timing, §5).
+            // Comparar dos plaintexts internamente no los expone a user-space.
+            (SynValue::Secret(a), SynValue::Secret(b)) => {
+                constant_time_eq(a.expose_bytes(), b.expose_bytes())
+            }
+            (SynValue::Secret(a), SynValue::Text(b)) | (SynValue::Text(b), SynValue::Secret(a)) => {
+                constant_time_eq(a.expose_bytes(), b.as_bytes())
+            }
             (SynValue::Number(a), SynValue::Number(b)) => a.num_eq(b),
             (SynValue::Bool(a), SynValue::Bool(b)) => a == b,
             // Python: True == 1 (bool es subclase de int).
@@ -222,6 +246,10 @@ impl fmt::Display for SynValue {
                     write!(f, "{{redirect: {}, status: {}}}", location, status)
                 }
             },
+            // Redacción de fondo: `secret(NAME)`, nunca el plaintext. Esto sella por
+            // sí solo print/log/error/coerción-a-texto/contexto-LLM (todo pasa por
+            // Display) — el plaintext no puede filtrarse por un `format!` accidental.
+            SynValue::Secret(s) => write!(f, "{}", s),
         }
     }
 }
@@ -257,6 +285,10 @@ pub fn syn_list(items: Vec<SynValue>) -> SynValue {
 }
 pub fn syn_map(m: IndexMap<String, SynValue>) -> SynValue {
     SynValue::Map(Rc::new(RefCell::new(m)))
+}
+/// Construye un `secret` opaco a partir de su nombre de origen y su plaintext.
+pub fn syn_secret(name: impl Into<String>, plaintext: impl Into<String>) -> SynValue {
+    SynValue::Secret(Rc::new(SecretInner::new(name, plaintext)))
 }
 
 // =========================================================
@@ -316,6 +348,10 @@ pub fn to_send(v: &SynValue) -> SendValue {
                 ("status".to_string(), SendValue::Number(Number::Int(*status))),
             ]),
         },
+        // Blackboard entre agentes (#6): el secret se **redacta** al compartir. Un
+        // agente comprometido no puede `share` el plaintext — del otro lado se observa
+        // un texto redactado, no un secret reconstruible.
+        SynValue::Secret(s) => SendValue::Text(s.to_string()),
     }
 }
 

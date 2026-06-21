@@ -23,6 +23,24 @@ synsema daemon stop program.syn         # graceful stop
 synsema daemon restart program.syn      # restart
 ```
 
+## Configuration & secrets (`.env` / environment)
+
+Read config with `env("NAME", default?)` and secrets with `secret("NAME", default?)` —
+see [secrets.md](secrets.md). Resolution: **process environment → `.env` file → default**.
+
+- **Dev:** drop a `.env` in the working directory (`synsema serve app.syn` auto-loads it).
+  Keep `.env` in `.gitignore`; commit a `.env.example` with the keys (no values).
+- **Prod:** set real values via the environment — they **override** `.env` without editing
+  the repo:
+  - systemd: `Environment=DATABASE_URL=...` (or `EnvironmentFile=/etc/app.env`)
+  - Docker: `-e DATABASE_URL=...` (as in the examples below)
+  - Kubernetes: `env:` / `secretKeyRef:` (as in the example below)
+- Override the `.env` location with `--env-file <path>` (or `SYNSEMA_ENV_FILE=<path>`);
+  disable it with `--no-env-file`.
+- `reveal()` (if you use it) appends to an audit log at `$SYNSEMA_AUDIT_DIR` or
+  `~/.synsema/audit/reveal.log` — under systemd, set `SYNSEMA_AUDIT_DIR` or a writable
+  `HOME`/`StateDirectory`, or `reveal()` will fail (by design: no audit, no reveal).
+
 ## Daemon details
 
 - Detaches from terminal (real process fork on Unix, subprocess on Windows)
