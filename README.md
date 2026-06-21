@@ -28,7 +28,7 @@ A single self-contained binary — no Python, no npm, nothing to install on the 
 
 ```bash
 # one-liner (Linux/macOS) — once a release is published
-curl -fsSL https://synsema.org/install.sh | sh
+curl -fsSL https://synsema.com/install.sh | sh
 ```
 
 ### Build from source

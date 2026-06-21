@@ -88,7 +88,7 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 | Agent shares state with main program | Each agent has its own interpreter | Use `share`/`observe` via blackboard to communicate. |
 | `number("1200")` gives integer | Gives `1200.0` (float) | `text()` on integers shows no decimal. Use `text(number(...))` for display. |
 | `/tmp/file.txt` works on Windows | Maps to `C:\tmp\file.txt` | Use absolute paths. For agent data, use `~/.synsema/` paths. |
-| Cron output appears after program ends | Output is buffered | Fixed in recent versions. Update to latest. Use `--serve` for live output. |
+| Cron output appears after program ends | Output is buffered | Fixed in recent versions. Update to latest. Use `synsema serve` to keep the process alive for live output. |
 
 ## Anti-patterns
 

@@ -1,13 +1,17 @@
 # Synsema Deployment
 
+Synsema ships as a **single static binary** (the Rust build) — no Python, no Node, no
+runtime on the target. Install it with `cargo install --path rust/crates/synsema-cli` or
+grab a prebuilt binary from the GitHub Releases page.
+
 ## Running modes
 
 ```bash
-# Foreground (exits when program finishes)
+# Run once (exits when the program finishes)
 synsema run program.syn
 
-# Foreground, stays alive for crons and agents
-synsema run program.syn --serve
+# Serve: stay alive for HTTP (serve on), crons and agents
+synsema serve program.syn
 
 # Background daemon (detaches from terminal, survives logout)
 synsema daemon start program.syn
@@ -41,7 +45,7 @@ docker run synsema run examples/hello.syn
 docker run -d --restart unless-stopped \
     -e ANTHROPIC_API_KEY=sk-... \
     -v $(pwd)/data:/data \
-    synsema run my_agent.syn --serve
+    synsema serve my_agent.syn
 
 # Docker Compose (edit docker-compose.yml)
 docker compose up -d
@@ -50,9 +54,11 @@ docker compose up -d
 ## VPS deployment (Linux)
 
 ```bash
-# 1. Clone and install
+# 1. Clone and build the single static binary (Rust)
 git clone https://github.com/kitecosmic/synsema.git
-cd synsema && pip install -e .
+cd synsema
+cargo install --path rust/crates/synsema-cli    # installs the `synsema` binary
+# (or download a prebuilt binary from the GitHub Releases page)
 
 # 2. Start as daemon
 synsema daemon start /path/to/agent.syn
@@ -72,7 +78,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/synsema run /opt/agents/my_agent.syn --serve
+ExecStart=/usr/local/bin/synsema serve /opt/agents/my_agent.syn
 Restart=always
 RestartSec=5
 User=synsema
@@ -105,7 +111,7 @@ spec:
       containers:
       - name: agent
         image: synsema:latest
-        command: ["synsema", "run", "/app/agent.syn", "--serve"]
+        command: ["synsema", "serve", "/app/agent.syn"]
         env:
         - name: ANTHROPIC_API_KEY
           valueFrom:
@@ -116,8 +122,8 @@ spec:
 
 ## Platform support
 
-| Platform | run | --serve | daemon | Docker |
-|----------|-----|---------|--------|--------|
-| Linux    | yes | yes     | yes    | yes    |
-| macOS    | yes | yes     | yes    | yes    |
-| Windows  | yes | yes     | yes    | yes    |
+| Platform | run | serve | daemon | Docker |
+|----------|-----|-------|--------|--------|
+| Linux    | yes | yes   | yes    | yes    |
+| macOS    | yes | yes   | yes    | yes    |
+| Windows  | yes | yes   | yes    | yes    |

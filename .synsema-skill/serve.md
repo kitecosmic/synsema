@@ -1,8 +1,15 @@
 # Synsema HTTP Server — `serve`
 
-A native HTTP server with **zero dependencies** (built on Python's `http.server`).
-Define routes in Synsema, the runtime enforces a consistent response contract,
-pagination, auth and input validation for you.
+A native HTTP server with **zero dependencies**. Define routes in Synsema and the
+runtime enforces a consistent response contract, pagination, auth and input
+validation for you. The production build serves over Rust (`std::net` + tokio/
+hyper/rustls); the Python reference uses `http.server` and stays byte-identical
+for HTTP/1.1.
+
+> Start a server with **`synsema serve program.syn`**, not `synsema run`. `run`
+> executes a program once and a `serve on` block errors with *"serve is only
+> available through the Synsema engine runtime"*. `serve` wires up that runtime
+> (HTTP, crons, agents) and keeps the process alive.
 
 ## Capability
 
@@ -15,6 +22,20 @@ require serve(8080)
 Without it, `serve on 8080` fails with a clear error:
 `serve on 8080 is not permitted: missing capability serve(8080). Add `require serve(8080)``.
 The scope is the port — `require serve(8080)` does **not** allow `serve on 9090`.
+
+### Choosing a port
+
+- **Public HTTPS → `443`** (with `tls auto`). This is the standard HTTPS port; clients
+  reach `https://your-domain` with no `:port` suffix.
+- **Public HTTP → `80`** — used only to serve the ACME challenge and **301-redirect to
+  HTTPS**. Don't serve real traffic in clear text on `:80`.
+- On Linux, ports **< 1024** (80/443) need privileges: run via a service manager, or grant
+  the binary `setcap 'cap_net_bind_service=+ep'`.
+- **Do not expose a public server on a common dev port** (`8080`, `3000`, `5000`, `8000`).
+  Scanners sweep those first. They're fine for local/dev; for anything internet-facing use
+  `443`. If you genuinely need a non-standard port (an internal service behind a firewall),
+  it works — just open that exact port in the firewall and `require serve(<that port>)`;
+  clients must include `:port` in the URL.
 
 ## Basic shape
 
@@ -622,7 +643,7 @@ serve on 8080
 Run it:
 
 ```bash
-synsema run store.syn      # stays alive while the server runs; Ctrl+C to stop
+synsema serve store.syn    # serves and stays alive while the server runs; Ctrl+C to stop
 ```
 
 ---
@@ -647,9 +668,30 @@ serve on 443
 - `tls cert <expr> key <expr>` — manual certificate.
 - `tls auto "email"` — **automatic HTTPS** via ACME (Let's Encrypt): issues the cert,
   serves the HTTP-01 challenge on :80, stores it in `~/.synsema/certs/`, and a
-  background thread renews it (< 30 days). `domain` (or `host`) is required with `tls auto`.
+  background thread renews it (< 30 days). `domain` is **required** with `tls auto`.
+- `domain` accepts **one domain or a list** — pass a list for a single **SAN certificate**
+  covering several names (e.g. apex + `www`):
+
+  ```
+  serve on 443
+      tls auto "admin@example.com"
+      domain ["example.com", "www.example.com"]   -- one SAN cert for both
+      route "GET /" ...
+  ```
+
+  Every name in the list must resolve (DNS A/AAAA) to this server and be reachable on
+  `:80`, or the whole order fails. The cert is stored under the first (primary) domain.
 - TLS 1.2+ enforced, **HSTS** automatic, **SNI** (per-host cert with vhosts).
 - **HTTP/2** is negotiated automatically via ALPN over TLS; HTTP/1.1 is kept.
+
+**`redirect https` and `www`:**
+- With **`tls auto`**, the `:80` listener already serves the ACME challenge **and**
+  301-redirects everything else to HTTPS — so `redirect https` is implicit; adding it is a
+  silent no-op. `redirect https` only does work alongside a **manual** `tls cert`.
+- The `:80 → :443` redirect **preserves the `Host`** — there is no automatic
+  `www.example.com → example.com` canonicalization. To make `www` work over HTTPS you must
+  include it in the `domain` list (above) so it gets a valid cert; to *canonicalize* to the
+  apex, add a route that 301s when `host of request` starts with `www.`.
 
 ### Virtual hosts (multi-domain)
 

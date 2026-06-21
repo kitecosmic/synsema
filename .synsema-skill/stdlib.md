@@ -92,10 +92,10 @@ print(cron_status())               -- formatted status
 ## Serve mode (keep crons alive)
 
 By default, when the program ends, cron jobs stop (daemon threads).
-Use `--serve` to keep the process alive:
+Use `synsema serve` to keep the process alive:
 
 ```bash
-synsema run server.syn --serve
+synsema serve server.syn
 # Serving 3 cron job(s). Press Ctrl+C to stop.
 ```
 
