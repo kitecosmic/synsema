@@ -4,9 +4,11 @@
 Nothing works without declaring capabilities.
 
 ## Capability types
-`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `db`, `serve`
+`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `db`, `serve`, `secret`, `reveal`
 
 `serve(PORT)` allows binding an HTTP server to that port — see [serve.md](serve.md).
+
+`env("NAME")`, `secret("NAME")` and `reveal` gate config and secrets — see [secrets.md](secrets.md). `env` and `secret` are scoped by **name** (or a `NAME_*` prefix); `reveal` is coarse (no scope) and every `reveal()` is written to a persistent audit log.
 
 ## Declaring capabilities
 ```
@@ -15,6 +17,9 @@ require net("*.example.com")        -- wildcard
 require file("/data/*")
 require exec("ffmpeg")
 require env("API_KEY")
+require secret("STRIPE_API_KEY")    -- read as an opaque, redacted secret
+require secret("APP_*")             -- name prefix: APP_DB, APP_KEY, … (only a trailing *)
+require reveal                      -- enable reveal() (loud + audited; use sparingly)
 require time
 require serve(8080)                 -- bind an HTTP server to this port
 require db("./store.db")            -- open this SQLite database
@@ -81,3 +86,4 @@ Shows every capability check: what was requested, granted or denied, and why.
 - Per-task `require` creates an isolated scope
 - Wildcard: `net("*.example.com")` covers all subdomains
 - Path glob: `file("/data/*")` covers all files in /data/
+- Name prefix: `secret("APP_*")` / `env("APP_*")` covers `APP_DB`, `APP_KEY`, … (only a trailing `*`)

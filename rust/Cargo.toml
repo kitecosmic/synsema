@@ -38,6 +38,15 @@ serde_json = { version = "1", features = ["preserve_order"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 # SQLite estático (binario único, sin DLL). Compila C → requiere gcc (WinLibs en Windows).
 rusqlite = { version = "0.32", features = ["bundled"] }
+# Secretos (feature `secret`): todo puro-Rust (RustCrypto), sin deps C → preserva el
+# binario único estático.
+#   zeroize  : borra el plaintext de memoria al drop (best-effort, §5 del spec).
+#   subtle   : comparación constant-time (igualdad de secrets + verify_hmac, §5/§4).
+#   hmac+sha2: HMAC-SHA256/512 para verify_hmac/hmac_sha256 (§4; SHA-1 excluido a propósito).
+zeroize = "1"
+subtle = "2"
+hmac = "0.12"
+sha2 = "0.10"
 synsema-core = { path = "crates/synsema-core" }
 synsema-capabilities = { path = "crates/synsema-capabilities" }
 synsema-stdlib = { path = "crates/synsema-stdlib" }

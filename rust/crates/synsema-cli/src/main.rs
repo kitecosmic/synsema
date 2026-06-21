@@ -17,12 +17,41 @@ use synsema_runtime::daemon;
 use synsema_runtime::engine::{repl, run_source, run_swarm_dump};
 use synsema_runtime::serve::run_serve_program;
 
-const USAGE: &str = "uso: synsema-cli <conform [--swarm] [--flat] | serve [--secure] | run | check | tokens | ast | repl | daemon | version> <archivo.syn>";
+const USAGE: &str = "uso: synsema-cli <conform [--swarm] [--flat] | serve [--secure] | run | check | tokens | ast | repl | daemon | version> [--env-file <path> | --no-env-file] <archivo.syn>";
 
 /// Serializa un mapa (clave→string) como objeto JSON ordenado.
 fn json_obj(pairs: Vec<(String, String)>) -> String {
     let map: std::collections::BTreeMap<String, String> = pairs.into_iter().collect();
     serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Procesa `--env-file <path>` / `--env-file=<path>` / `--no-env-file`: setea la
+/// env-var `SYNSEMA_ENV_FILE` (la fuente de verdad que lee el runtime) y devuelve los
+/// args sin esos flags, para que el resto del parseo no los confunda con el archivo.
+/// `--no-env-file` ≡ `SYNSEMA_ENV_FILE=` vacío (desactiva la auto-carga del `.env`).
+fn take_env_file_flags(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--no-env-file" {
+            std::env::set_var("SYNSEMA_ENV_FILE", "");
+        } else if a == "--env-file" {
+            match args.get(i + 1) {
+                Some(p) => {
+                    std::env::set_var("SYNSEMA_ENV_FILE", p);
+                    i += 1; // consume el valor
+                }
+                None => eprintln!("synsema: --env-file requires a path"),
+            }
+        } else if let Some(p) = a.strip_prefix("--env-file=") {
+            std::env::set_var("SYNSEMA_ENV_FILE", p);
+        } else {
+            out.push(args[i].clone());
+        }
+        i += 1;
+    }
+    out
 }
 
 fn main() -> ExitCode {
@@ -56,7 +85,9 @@ fn main() -> ExitCode {
 }
 
 fn cmd_conform(args: &[String]) -> ExitCode {
-    // conform [--swarm] [--flat] <archivo.syn>
+    // conform [--swarm] [--flat] [--env-file <p>|--no-env-file] <archivo.syn>
+    let args = take_env_file_flags(args);
+    let args = args.as_slice();
     let mut swarm = false;
     let mut flat = false;
     let mut path: Option<String> = None;
@@ -117,6 +148,8 @@ fn cmd_conform(args: &[String]) -> ExitCode {
 /// serve [--secure] <archivo.syn>: levanta el server y bloquea hasta kill.
 /// Imprime la línea de readiness ("Serving HTTP on port PORT (N route(s))") a STDOUT.
 fn cmd_serve(args: &[String]) -> ExitCode {
+    let args = take_env_file_flags(args);
+    let args = args.as_slice();
     let (secure, path) = match args.get(2).map(String::as_str) {
         Some("--secure") => match args.get(3) {
             Some(p) => (true, p.clone()),
@@ -153,6 +186,8 @@ fn cmd_serve(args: &[String]) -> ExitCode {
 
 /// run <archivo.syn> [--flat]: ejecuta el programa, imprime la salida, exit≠0 si falla.
 fn cmd_run(args: &[String]) -> ExitCode {
+    let args = take_env_file_flags(args);
+    let args = args.as_slice();
     let mut flat = false;
     let mut path: Option<String> = None;
     for a in &args[2..] {

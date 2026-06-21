@@ -33,6 +33,7 @@ use synsema_core::types::{from_send, to_send, SendValue, SynValue};
 use synsema_stdlib::cron::{register_cron_builtins, CronScheduler};
 use synsema_stdlib::database::{register_database_builtins, DatabaseManager};
 use synsema_stdlib::http::register_http_builtins;
+use synsema_stdlib::secrets::{register_secret_builtins, EnvStore};
 
 pub(crate) const INTERP_STACK_SIZE: usize = 512 * 1024 * 1024;
 
@@ -62,6 +63,10 @@ pub(crate) fn wire_common_with_state(
         caps.borrow_mut().grant(Capability::new(CapabilityType::Time, None));
     }
     register_secure_builtins(interp, caps.clone());
+    // Secretos/env: carga el `.env` (antes de evaluar require/serve) y registra
+    // env/secret/reveal/bearer/crypto. Deny-by-default: env()/secret()/reveal() exigen
+    // su capability incluso en modo no-secure (NO se auto-conceden como stdout/time).
+    register_secret_builtins(interp, caps.clone(), Rc::new(EnvStore::load_default()));
     register_http_builtins(interp);
     // cron/db/progress/memory: sus builtins clonan el Rc internamente → viven mientras
     // viva el intérprete.

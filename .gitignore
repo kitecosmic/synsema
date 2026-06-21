@@ -17,3 +17,8 @@ conformance/
 
 # Estado/persistencia y daemons de runtime (fuera del repo, defensivo)
 .synsema/
+
+# Secretos: el .env real NUNCA va al repo (commitear .env.example con las claves
+# sin valores como plantilla). Ver .synsema-skill/secrets.md.
+.env
+!.env.example

@@ -200,6 +200,10 @@ fn syn_to_value(v: &SynValue) -> Value {
             Err(_) => Value::Text(b.to_string()),
         },
         SynValue::Nothing => Value::Null,
+        // Secret (#8): se permite persistirlo — el plaintext se **revela en el borde
+        // de la DB** (SQL parametrizado). No hay query-log que redactar (este crate no
+        // loguea queries ni params); si se agregara uno en el futuro, DEBE redactar.
+        SynValue::Secret(s) => Value::Text(s.expose().to_string()),
         // Bool/Text/List/Map → str(val) (Display de SynValue).
         other => Value::Text(other.to_string()),
     }

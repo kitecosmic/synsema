@@ -31,6 +31,16 @@
 - `replace_re(text, pattern, replacement)` → text (`\1`/`\2` backreferences supported)
 - ⚠️ A pathological pattern can be slow (ReDoS) — don't feed untrusted input as a *pattern* without care.
 
+## Config & secrets (see [secrets.md](secrets.md))
+Resolution for `env`/`secret`: process environ → `.env` → default → else error. Both are deny-by-default and scoped by name (`require env("X")` / `require secret("X")`, or a `X_*` prefix).
+- `env(name, default?)` → plain text config
+- `secret(name, default?)` → an opaque, **redacted** `secret` (LLM-proof; never prints/logs/serializes its value)
+- `reveal(secret)` → plaintext — requires `require reveal`, writes a persistent audit entry, fails if it can't audit. Use sparingly.
+- `bearer(secret)` → a tainted `Bearer <secret>` header value (materialized only at the socket)
+- `hmac_sha256(data, secret)` → hex MAC (not secret)
+- `verify_hmac(data, signature, secret, algo?)` → bool, constant-time. `algo` = `"sha256"` (default) or `"sha512"`; decodes hex/base64 signatures (Stripe/GitHub/Shopify). SHA-1 is rejected.
+- `constant_time_eq(a, b)` → bool, constant-time; accepts a `secret` on either side
+
 ## Intentional operations (replace loops)
 - `apply(function, list)` → list with function applied to each
 - `where(list, predicate)` → filtered list

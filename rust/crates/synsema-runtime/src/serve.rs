@@ -102,12 +102,24 @@ pub(crate) fn rebuild_globals(interp: &Interpreter, snapshot: &[(String, GlobalV
 fn build_request_interp(
     swarm: Arc<Swarm>,
     snapshot: &[(String, GlobalVal)],
+    caps_snap: &[Capability],
     shared_db: SharedDb,
     secure: bool,
 ) -> Interpreter {
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("request")));
     wire_common(&mut interp, &caps, secure);
+    // Re-concede las capabilities declaradas con `require` en el preámbulo. El
+    // intérprete por-request es fresco (modelo snapshot-globales) y `caps` es `Rc`
+    // (no cruza hilos), así que el programa las declara una vez y acá se re-aplican
+    // desde el snapshot `Send`. Sin esto, los builtins gateados (secret/env/reveal/
+    // fetch/…) no verían ningún grant dentro de una ruta.
+    {
+        let mut c = caps.borrow_mut();
+        for cap in caps_snap {
+            c.grant(cap.clone());
+        }
+    }
     wire_swarm_hooks(&mut interp, swarm, "request");
     register_database_builtins(&interp, shared_db);
     rebuild_globals(&interp, snapshot);
@@ -166,11 +178,12 @@ fn build_request_syn(ctx: &Ctx) -> SynValue {
 fn setup_request_interp(
     swarm: &Arc<Swarm>,
     snapshot: &Arc<Vec<(String, GlobalVal)>>,
+    caps_snap: &Arc<Vec<Capability>>,
     shared_db: &SharedDb,
     ctx: &Ctx,
     secure: bool,
 ) -> Interpreter {
-    let interp = build_request_interp(swarm.clone(), snapshot, shared_db.clone(), secure);
+    let interp = build_request_interp(swarm.clone(), snapshot, caps_snap, shared_db.clone(), secure);
     interp.set_global("request", build_request_syn(ctx));
     interp.set_global("query", str_map(&ctx.query));
     interp.set_global("params", str_map(&ctx.params));
@@ -192,12 +205,13 @@ fn setup_request_interp(
 fn run_route(
     swarm: &Arc<Swarm>,
     snapshot: &Arc<Vec<(String, GlobalVal)>>,
+    caps_snap: &Arc<Vec<Capability>>,
     shared_db: &SharedDb,
     body: &[Node],
     ctx: &Ctx,
     secure: bool,
 ) -> GiveOutcome {
-    let mut interp = setup_request_interp(swarm, snapshot, shared_db, ctx, secure);
+    let mut interp = setup_request_interp(swarm, snapshot, caps_snap, shared_db, ctx, secure);
     match interp.run_block(body) {
         Ok(_) => GiveOutcome::Give(None),
         Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
@@ -217,13 +231,14 @@ const CLIENT_GONE: &str = "__client_gone__";
 fn run_stream(
     swarm: &Arc<Swarm>,
     snapshot: &Arc<Vec<(String, GlobalVal)>>,
+    caps_snap: &Arc<Vec<Capability>>,
     shared_db: &SharedDb,
     body: &[Node],
     ctx: &Ctx,
     secure: bool,
     emit: Emitter,
 ) -> StreamEnd {
-    let mut interp = setup_request_interp(swarm, snapshot, shared_db, ctx, secure);
+    let mut interp = setup_request_interp(swarm, snapshot, caps_snap, shared_db, ctx, secure);
     let cell = Rc::new(RefCell::new(emit));
     let ec = cell.clone();
     interp.set_stream_emit(Rc::new(move |val: SynValue, event: Option<&str>| {
@@ -314,6 +329,7 @@ fn build_host_table(
     auth_handler_n: Option<&Node>,
     block_limit: Option<(i64, f64)>,
     snapshot: &Arc<Vec<(String, GlobalVal)>>,
+    caps_snap: &Arc<Vec<Capability>>,
     swarm: &Arc<Swarm>,
     shared_db: &SharedDb,
     secure: bool,
@@ -345,9 +361,10 @@ fn build_host_table(
         let auth_node = an.clone();
         let swarm_a = swarm.clone();
         let snap_a = snapshot.clone();
+        let caps_a = caps_snap.clone();
         let db_a = shared_db.clone();
         let h: AuthHandler = Arc::new(move |token: &str| -> Option<SynValue> {
-            let mut interp = build_request_interp(swarm_a.clone(), &snap_a, db_a.clone(), secure);
+            let mut interp = build_request_interp(swarm_a.clone(), &snap_a, &caps_a, db_a.clone(), secure);
             let genv = interp.global_env.clone();
             let task = match interp.eval(&auth_node, &genv) {
                 Ok(t) => t,
@@ -400,18 +417,20 @@ fn build_host_table(
             let body_c = body.clone();
             let swarm_c = swarm.clone();
             let snap_c = snapshot.clone();
+            let caps_c = caps_snap.clone();
             let db_c = shared_db.clone();
             let handler: Handler = Arc::new(move |ctx: &Ctx| {
-                run_route(&swarm_c, &snap_c, &db_c, &body_c, ctx, secure)
+                run_route(&swarm_c, &snap_c, &caps_c, &db_c, &body_c, ctx, secure)
             });
 
             let stream_handler: Option<StreamHandler> = if *streaming {
                 let body_s = body.clone();
                 let swarm_s = swarm.clone();
                 let snap_s = snapshot.clone();
+                let caps_s = caps_snap.clone();
                 let db_s = shared_db.clone();
                 Some(Arc::new(move |ctx: &Ctx, emit: Emitter| {
-                    run_stream(&swarm_s, &snap_s, &db_s, &body_s, ctx, secure, emit)
+                    run_stream(&swarm_s, &snap_s, &caps_s, &db_s, &body_s, ctx, secure, emit)
                 }))
             } else {
                 None
@@ -588,6 +607,11 @@ fn make_serve_hook(
         // Snapshot de globales (una vez, ya corrió el top-level): cada request lo
         // reconstruye en su intérprete fresco. Intent enriquece /llms.txt.
         let snapshot = snapshot_globals(interp);
+        // Snapshot `Send` de las capabilities concedidas por el preámbulo `require`
+        // (ya corrió, porque `serve on` viene después). Cada request las re-aplica en
+        // su intérprete fresco (los grants no cruzan hilos vía `Rc`).
+        let caps_snap: Arc<Vec<Capability>> =
+            Arc::new(caps.borrow().granted.iter().cloned().collect());
         let intent = interp.intent().map(|s| s.to_string());
 
         // -- host default (rutas/estáticos/auth a nivel de `serve`) --
@@ -599,6 +623,7 @@ fn make_serve_hook(
             auth_handler_n,
             block_limit,
             &snapshot,
+            &caps_snap,
             &swarm,
             &shared_db,
             secure,
@@ -633,6 +658,7 @@ fn make_serve_hook(
                     auth_handler.as_deref(),
                     block_limit,
                     &snapshot,
+                    &caps_snap,
                     &swarm,
                     &shared_db,
                     secure,

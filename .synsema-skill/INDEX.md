@@ -16,6 +16,7 @@ Read ONLY the sections you need. Do not load everything.
 - [frontend.md](frontend.md) — Building UIs/sites: render() templates (full freedom) + layouts/partials/includes + static assets + client JS; content() for agent-negotiable pages. No imposed framework.
 - [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination/paged(), streaming (SSE), rate limiting, body limits, HTML/SSR pages (`render`, `html`), static files, CORS, content negotiation (HTML/Markdown/JSON for agents), agent discoverability (`llms.txt`), **and the Rust production stack: TLS / auto-HTTPS (ACME) / virtual hosts / reverse proxy / HTTP-2 / production static (ETag·Range·gzip)**
 - [capabilities.md](capabilities.md) — Security model, require, sandbox, intent
+- [secrets.md](secrets.md) — Config by environment (`env`), LLM-proof secrets (`secret`, redacted everywhere), `.env`, `reveal()` + audit, HMAC/bearer/constant-time helpers
 - [agents.md](agents.md) — Multi-agent coordination, blackboard, swarm, signals
 - [llm.md](llm.md) — LLM operations: reason, decide, analyze, generate
 - [human.md](human.md) — Human interaction: approve, confirm, ask, show
@@ -50,6 +51,7 @@ Read ONLY the sections you need. Do not load everything.
 - Agent discoverability (llms.txt / robots.txt) → serve.md
 - Deploying to server → deploy.md
 - Adding security → capabilities.md
+- Config by environment / `.env` / secrets / API keys / webhook signatures → secrets.md
 - Multi-agent system → agents.md
 - Using AI reasoning → llm.md
 - Debugging errors → observability.md

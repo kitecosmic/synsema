@@ -11,6 +11,13 @@ synsema-capabilities.workspace = true
 indexmap.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
+# Feature `secret`: builtins env/secret/reveal/bearer + crypto (hmac_sha256/verify_hmac/
+# constant_time_eq). Todo puro-Rust (RustCrypto), sin C → binario único estático.
+# chrono ya está en el workspace (sin feature `clock`); se usa para el timestamp del audit.
+hmac.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+chrono.workspace = true
 # A2 stack web: gzip (miniz_oxide puro-Rust, sin C) + TLS (rustls con backend ring).
 flate2 = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

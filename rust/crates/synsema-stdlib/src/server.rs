@@ -487,6 +487,17 @@ pub fn syn_to_json(v: &SynValue) -> Json {
             Json::Object(m.borrow().iter().map(|(k, v)| (k.clone(), syn_to_json(v))).collect())
         }
         SynValue::Task(_) | SynValue::Builtin(_) => Json::Str(v.to_string()),
+        // Secret en el body de una respuesta / evento SSE (#3/#7): se redacta a
+        // "[redacted]" y se emite un warning al log del server (seguro pero visible;
+        // no se tumba la API por un descuido). Este brazo SÓLO corre si hay un secret
+        // en la respuesta → el request promedio (sin secretos) no paga nada (§8).
+        SynValue::Secret(s) => {
+            eprintln!(
+                "[serve] warning: secret({}) was redacted in a serialized response/SSE body",
+                s.name()
+            );
+            Json::Str("[redacted]".to_string())
+        }
         SynValue::Server(s) => match &**s {
             // _RAW/_ENVELOPE serializados como data (fuera del contrato) → su dict.
             ServerValue::Raw { body, content_type, status } => obj(vec![

@@ -192,13 +192,33 @@ fn raw_str(v: &SynValue) -> String {
     }
 }
 
-/// Map SynValue → pares (clave, str(valor)).
+/// Map SynValue → pares (clave, str(valor)). Para query params: un `secret` se
+/// **redacta** vía Display (fail-closed; los query params terminan en la URL, que se
+/// loguea). Para credenciales usar headers + `bearer()`.
 fn map_pairs(v: Option<&SynValue>) -> Option<Vec<(String, String)>> {
     match v {
         Some(SynValue::Map(m)) => Some(
             m.borrow()
                 .iter()
                 .map(|(k, val)| (k.clone(), val.to_string()))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Igual que `map_pairs` pero para **headers**: un `secret` (o el resultado de
+/// `bearer()`) se materializa a su plaintext SÓLO acá, en el borde del socket — el
+/// String vive en el runtime y se escribe al header; nunca vuelve a user-space (§4).
+fn header_pairs(v: Option<&SynValue>) -> Option<Vec<(String, String)>> {
+    match v {
+        Some(SynValue::Map(m)) => Some(
+            m.borrow()
+                .iter()
+                .map(|(k, val)| match val {
+                    SynValue::Secret(s) => (k.clone(), s.expose().to_string()),
+                    other => (k.clone(), other.to_string()),
+                })
                 .collect(),
         ),
         _ => None,
@@ -231,7 +251,7 @@ pub fn register_http_builtins(interp: &Interpreter) {
         Rc::new(move |_i, args, _loc| {
             let method = raw_str(args.first().unwrap_or(&SynValue::Nothing));
             let url = raw_str(args.get(1).unwrap_or(&SynValue::Nothing));
-            let headers = map_pairs(args.get(2));
+            let headers = header_pairs(args.get(2));
             let query = map_pairs(args.get(3));
             let body = args.get(4).map(raw_str);
             let r = http_request(
@@ -252,7 +272,7 @@ pub fn register_http_builtins(interp: &Interpreter) {
         -1,
         Rc::new(move |_i, args, _loc| {
             let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
-            let headers = map_pairs(args.get(1));
+            let headers = header_pairs(args.get(1));
             let query = map_pairs(args.get(2));
             let r = http_request("GET", &url, headers.as_deref(), query.as_deref(), None, 30);
             Ok(response_to_syn(r))
@@ -266,7 +286,7 @@ pub fn register_http_builtins(interp: &Interpreter) {
         Rc::new(move |_i, args, _loc| {
             let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
             let body = args.get(1).map(raw_str);
-            let headers = map_pairs(args.get(2));
+            let headers = header_pairs(args.get(2));
             let r = http_request("POST", &url, headers.as_deref(), None, body.as_deref(), 30);
             Ok(response_to_syn(r))
         }),
@@ -279,7 +299,7 @@ pub fn register_http_builtins(interp: &Interpreter) {
         Rc::new(move |_i, args, _loc| {
             let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
             let body = args.get(1).map(raw_str);
-            let headers = map_pairs(args.get(2));
+            let headers = header_pairs(args.get(2));
             let r = http_request("PUT", &url, headers.as_deref(), None, body.as_deref(), 30);
             Ok(response_to_syn(r))
         }),
@@ -291,7 +311,7 @@ pub fn register_http_builtins(interp: &Interpreter) {
         -1,
         Rc::new(move |_i, args, _loc| {
             let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
-            let headers = map_pairs(args.get(1));
+            let headers = header_pairs(args.get(1));
             let r = http_request("DELETE", &url, headers.as_deref(), None, None, 30);
             Ok(response_to_syn(r))
         }),
@@ -308,5 +328,27 @@ mod tests {
         assert!(!r.ok);
         assert_eq!(r.status, 0);
         assert!(r.error.is_some());
+    }
+
+    #[test]
+    fn header_pairs_reveal_at_socket_but_map_pairs_redacts() {
+        use indexmap::IndexMap;
+        use synsema_core::types::{syn_secret, syn_text, SynValue};
+        let mut m = IndexMap::new();
+        m.insert("Authorization".to_string(), syn_secret("STRIPE_KEY", "Bearer sk_live_LEAKCANARY"));
+        m.insert("X-Trace".to_string(), syn_text("plain"));
+        let map = SynValue::Map(std::rc::Rc::new(std::cell::RefCell::new(m)));
+
+        // headers: el secret se MATERIALIZA (borde del socket) → plaintext real.
+        let hp = header_pairs(Some(&map)).unwrap();
+        let auth = hp.iter().find(|(k, _)| k == "Authorization").unwrap();
+        assert_eq!(auth.1, "Bearer sk_live_LEAKCANARY");
+        assert!(hp.iter().any(|(k, v)| k == "X-Trace" && v == "plain"));
+
+        // query params (map_pairs): el secret se REDACTA (fail-closed; va a la URL).
+        let qp = map_pairs(Some(&map)).unwrap();
+        let auth = qp.iter().find(|(k, _)| k == "Authorization").unwrap();
+        assert_eq!(auth.1, "secret(STRIPE_KEY)");
+        assert!(!auth.1.contains("LEAKCANARY"));
     }
 }
