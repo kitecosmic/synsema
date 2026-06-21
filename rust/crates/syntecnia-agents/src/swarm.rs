@@ -158,12 +158,14 @@ impl Swarm {
         self.cvar.notify_all();
     }
 
-    /// Espera y CONSUME una señal. Devuelve None por timeout o si ningún agente
-    /// está STARTING/WORKING (nadie podrá emitir → evita deadlock/hang).
+    /// Espera y CONSUME una señal. Devuelve None por timeout, o antes si NINGÚN
+    /// agente sigue activo (STARTING/WORKING/WAITING) y por tanto nadie podrá emitir.
     ///
-    /// Nota de paridad: el oráculo cuenta WAITING como "vivo" (puede colgar 30s con
-    /// un emisor muerto); acá excluimos WAITING → más determinista (rompe deadlocks).
-    /// El gate no llega a ese caso (los emisores siempre emiten).
+    /// Nota de paridad: contamos WAITING como "activo" igual que el oráculo. Excluirlo
+    /// (optimización previa) causaba una carrera: si el receptor llega a wait_for ANTES
+    /// de que el hilo principal haya hecho `spawn` del emisor, el único agente es él
+    /// mismo (WAITING) → "no hay productor" → bail con None y la señal nunca se espera.
+    /// El `timeout` acota los deadlocks reales (waiter sin emisor posible).
     pub fn wait_for_signal(&self, name: &str, timeout: Duration) -> Option<Signal> {
         let deadline = Instant::now() + timeout;
         let mut g = self.state.lock().unwrap();
@@ -174,10 +176,12 @@ impl Swarm {
                     return Some(sig);
                 }
             }
-            let producer_alive = g
-                .agents
-                .values()
-                .any(|a| matches!(a.state, AgentState::Starting | AgentState::Working));
+            let producer_alive = g.agents.values().any(|a| {
+                matches!(
+                    a.state,
+                    AgentState::Starting | AgentState::Working | AgentState::Waiting
+                )
+            });
             if !producer_alive && !g.agents.is_empty() {
                 return None;
             }
