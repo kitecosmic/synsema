@@ -459,6 +459,11 @@ def _render_html(tree: SynValue) -> str:
         ld_json = (json.dumps(ld).replace("<", "\\u003c")
                    .replace(">", "\\u003e").replace("&", "\\u0026"))
         head.append('<script type="application/ld+json">' + ld_json + "</script>")
+    # Optional site chrome (raw HTML) for the HTML representation only: a header
+    # (nav) before the content and a footer after. Markdown/JSON stay clean. The
+    # site passes the SAME nav/footer partials it uses elsewhere via `body of render(...)`.
+    header = meta.get("header", "")
+    footer = meta.get("footer", "")
     if d.get("kind") == "page":
         body = "".join(_render_node_html(n) for n in d.get("nodes", []) if _is_node(n))
     else:
@@ -466,9 +471,13 @@ def _render_html(tree: SynValue) -> str:
     return (
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
         + "\n".join(head)
-        + "\n</head>\n<body>\n<main class=\"prose\">\n"
+        + "\n</head>\n<body>\n"
+        + header
+        + "<main class=\"prose\">\n"
         + body
-        + "</main>\n</body>\n</html>\n"
+        + "</main>\n"
+        + footer
+        + "</body>\n</html>\n"
     )
 
 

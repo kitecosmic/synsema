@@ -1762,15 +1762,22 @@ fn render_html(tree: &SynValue) -> String {
             .replace('&', "\\u0026");
         head.push(format!("<script type=\"application/ld+json\">{}</script>", ld_json));
     }
+    // Optional site chrome (raw HTML) for the HTML representation only: a header
+    // (nav) before the content and a footer after. Markdown/JSON stay clean. The
+    // site passes the SAME nav/footer partials it uses elsewhere via `body of render(...)`.
+    let header = meta.as_ref().and_then(|m| meta_get(m, "header")).unwrap_or_default();
+    let footer = meta.as_ref().and_then(|m| meta_get(m, "footer")).unwrap_or_default();
     let body = if is_page {
         list_field(tree, "nodes").iter().filter(|n| is_node(n)).map(render_node_html).collect::<String>()
     } else {
         render_node_html(tree)
     };
     format!(
-        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n{}\n</head>\n<body>\n<main class=\"prose\">\n{}</main>\n</body>\n</html>\n",
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n{}\n</head>\n<body>\n{}<main class=\"prose\">\n{}</main>\n{}</body>\n</html>\n",
         head.join("\n"),
-        body
+        header,
+        body,
+        footer
     )
 }
 
