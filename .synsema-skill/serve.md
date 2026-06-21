@@ -707,12 +707,18 @@ serve on 443
       tls auto "admin@example.com"
       domain ["example.com", "www.example.com"]
       host "www.example.com"
+          route "GET /"
+              give redirect("https://example.com/")
           route "GET /*path"
               give redirect("https://example.com/" + params.path)
       -- default host (apex) = your real site; statics keep working
       static "/assets" from "./static"
       route "GET /" ...
   ```
+
+  Note: the catch-all `*path` **does not match the bare root `/`** (it needs at least one
+  segment to capture), so the `www` vhost needs an explicit `route "GET /"` or
+  `https://www.example.com/` — the most common case — would 404.
 
   vhost selection is by the request's `Host` (or, over HTTP/2, the `:authority` pseudo-
   header — both handled). If you need the host inside a handler, read it from

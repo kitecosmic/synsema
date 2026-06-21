@@ -21,6 +21,8 @@ fn start(port: u16) {
         r#"require serve({p})
 serve on {p}
     host "www.example.com"
+        route "GET /"
+            give redirect("https://example.com/")
         route "GET /*path"
             give redirect("https://example.com/" + params.path)
     route "GET /perm"
@@ -102,4 +104,14 @@ fn redirect_builtin_and_vhost_e2e() {
     // El mismo path en el host por defecto (apex) NO matchea el catch-all del vhost → 404.
     let r = request(port, "GET", "/docs", "127.0.0.1");
     assert!(r.starts_with("http/1.1 404"), "apex /docs debería ser 404: {}", r);
+
+    // El bare root `/` del vhost también redirige: el catch-all `*path` NO matchea `/`,
+    // así que el vhost necesita su `route "GET /"` explícita (caso más común).
+    let r = request(port, "GET", "/", "www.example.com");
+    assert!(r.starts_with("http/1.1 301"), "vhost root status: {}", r);
+    assert!(r.contains("location: https://example.com/"), "vhost root location: {}", r);
+
+    // Y el root del host por defecto sigue dando 200 (el vhost no lo shadowea).
+    let r = request(port, "GET", "/", "127.0.0.1");
+    assert!(r.starts_with("http/1.1 200"), "apex root status: {}", r);
 }
