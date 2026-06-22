@@ -9,3 +9,4 @@ description = "Synsema capabilities: model, intent, enforcer, builtins"
 synsema-core.workspace = true
 chrono.workspace = true
 indexmap.workspace = true
+rand.workspace = true
