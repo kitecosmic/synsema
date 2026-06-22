@@ -348,6 +348,52 @@ impl Interpreter {
         self.exec_block(stmts, &g)
     }
 
+    /// Corre el cuerpo de una ruta del serve en un scope HIJO del entorno global,
+    /// con las bindings de request (`request`/`query`/`params`/`read_body`) locales
+    /// a ese scope. Esto habilita reusar el mismo intérprete (builtins + globales +
+    /// tasks, caro de construir) entre requests: lo que define el handler queda en el
+    /// hijo y se descarta al terminar → NO se filtra al siguiente request. Los
+    /// globales (inmutables por convención) se comparten vía el padre. El reset del
+    /// estado transitorio entre requests lo hace `reset_for_request`.
+    pub fn run_request_block(
+        &mut self,
+        stmts: &[Node],
+        bindings: Vec<(String, SynValue)>,
+    ) -> Result<SynValue, Control> {
+        let env = Environment::child(&self.global_env, "request");
+        {
+            let mut e = env.borrow_mut();
+            for (k, v) in bindings {
+                e.bindings.insert(k, v);
+            }
+        }
+        let result = self.exec_block(stmts, &env);
+        // Rompe cualquier ciclo Rc creado en el scope del request: si el handler hace
+        // `define task` dentro del body, la task cierra sobre `env` (`closure_env`) y el
+        // env la contiene en `bindings` → `env ⇄ task`, que Rc no libera (igual razón que
+        // el `Drop` del intérprete para el global, fix de OOM #7). Como el intérprete se
+        // REUSA entre requests, este `env` no se dropea vía ese `Drop`; vaciarlo acá corta
+        // el ciclo → el env del request (bindings + lo que definió el handler) se libera.
+        // El give-value (en `result`) es un valor owned, no referencia al env.
+        env.borrow_mut().bindings.clear();
+        result
+    }
+
+    /// Limpia el estado transitorio entre requests del serve (cuando un worker reusa
+    /// el mismo intérprete). Deja `global_env` (builtins + globales + tasks) intacto
+    /// pero resetea lo per-request: salida acumulada, blackboard local, definiciones
+    /// de agente, sink de stream y profundidad de recursión. Las capabilities se
+    /// resetean afuera (las posee el motor, vía el `Rc<RefCell<CapabilitySet>>` que
+    /// capturan los builtins). Sin esto, el estado de un request se filtraría al
+    /// siguiente.
+    pub fn reset_for_request(&mut self) {
+        self.output.clear();
+        self.blackboard.clear();
+        self.agent_definitions.clear();
+        self.stream_emit = None;
+        self.recursion_depth = 0;
+    }
+
     /// Evalúa un nodo en un entorno dado (templates + motor de serve).
     pub fn eval(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
         self.exec(node, env)
@@ -1979,6 +2025,41 @@ mod drop_tests {
         assert!(
             weak.upgrade().is_none(),
             "FUGA: global_env sigue vivo tras drop — el ciclo Rc no se rompió"
+        );
+    }
+
+    /// `run_request_block` corre el handler en un scope HIJO efímero y, como el
+    /// intérprete se REUSA entre requests (perf/interp-reuse), no se dropea por request.
+    /// Si el handler hace `define task` dentro del body, la task cierra sobre ese scope
+    /// → ciclo `scope ⇄ task`. `run_request_block` vacía las bindings del hijo al final
+    /// para cortarlo: tras correr, el scope del request NO debe seguir vivo (igual
+    /// invariante que el Drop del global, fix de OOM #7, pero para el scope del request).
+    #[test]
+    fn request_scope_does_not_leak_handler_defined_task() {
+        let interp = Interpreter::new(); // se reusa: NO se dropea entre "requests"
+        let weak;
+        {
+            // Replica lo que hace run_request_block: child env + una task que cierra
+            // sobre él (lo que produciría un `define task` dentro del handler).
+            let env = Environment::child(&interp.global_env, "request");
+            let task = SynValue::Task(Rc::new(SynTaskValue {
+                name: "t".to_string(),
+                parameters: vec![],
+                body: vec![],
+                closure_env: env.clone(), // task → child (mitad del ciclo)
+                origin: None,
+                required_capabilities: vec![],
+            }));
+            env.borrow_mut().bindings.insert("t".to_string(), task); // child → task (otra mitad)
+            weak = Rc::downgrade(&env);
+            assert!(weak.upgrade().is_some(), "scope del request vivo mientras corre");
+            // El cierre que hace run_request_block tras exec_block:
+            env.borrow_mut().bindings.clear();
+        }
+        assert!(
+            weak.upgrade().is_none(),
+            "FUGA: el scope del request sigue vivo — el ciclo Rc no se rompió (el reuse del \
+             intérprete lo filtraría por request)"
         );
     }
 }
