@@ -19,6 +19,7 @@ use indexmap::IndexMap;
 use regex::Regex;
 
 use crate::ast::{Node, NodeKind, Program};
+use crate::number::Number;
 use crate::parser::{parse_source, CompileError};
 use crate::tokens::SourceLocation;
 use crate::types::*;
@@ -358,6 +359,12 @@ impl Interpreter {
         self.register("length", 1, Rc::new(|i, a, l| i.b_length(a, l)));
         self.register("text", 1, Rc::new(|i, a, l| i.b_to_text(a, l)));
         self.register("number", 1, Rc::new(|i, a, l| i.b_to_number(a, l)));
+        // Redondeo a entero (PUROS — sin capability, como text/number). ties-to-even en
+        // round() para igualar el `round` de Python.
+        self.register("floor", 1, Rc::new(|i, a, l| i.b_round_op(a, l, "floor", f64::floor)));
+        self.register("ceil", 1, Rc::new(|i, a, l| i.b_round_op(a, l, "ceil", f64::ceil)));
+        self.register("round", 1, Rc::new(|i, a, l| i.b_round_op(a, l, "round", f64::round_ties_even)));
+        self.register("trunc", 1, Rc::new(|i, a, l| i.b_round_op(a, l, "trunc", f64::trunc)));
         self.register("append", 2, Rc::new(|i, a, l| i.b_append(a, l)));
         self.register("keys", 1, Rc::new(|i, a, l| i.b_keys(a, l)));
         self.register("values", 1, Rc::new(|i, a, l| i.b_values(a, l)));
@@ -1249,6 +1256,23 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 
     fn b_to_text(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
         Ok(syn_text(nth(args, 0)?.to_string()))
+    }
+
+    /// floor/ceil/round/trunc → entero. Los enteros (Int/Big) ya lo son y pasan tal cual;
+    /// los floats aplican `op` y vuelven a Int (o Big si desbordan i64). No-número → error.
+    fn b_round_op(
+        &mut self,
+        args: &[SynValue],
+        _loc: &SourceLocation,
+        name: &str,
+        op: fn(f64) -> f64,
+    ) -> Result<SynValue, Control> {
+        let v = nth(args, 0)?;
+        match v {
+            SynValue::Number(Number::Float(x)) => Ok(SynValue::Number(Number::integer_from_f64(op(*x)))),
+            SynValue::Number(n) => Ok(SynValue::Number(n.clone())), // Int/Big ya son enteros
+            _ => Err(err(format!("{} expects a number, got {}", name, v.type_name()))),
+        }
     }
 
     fn b_to_number(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
