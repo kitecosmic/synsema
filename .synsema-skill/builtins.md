@@ -5,6 +5,10 @@
 - `length(collection)` → number
 - `text(value)` → string conversion (integers show no decimal: `text(42)` → `"42"`)
 - `number(value)` → numeric conversion (always float: `number("42")` → `42.0`)
+- `floor(x)` → **integer** rounded toward −∞ (`floor(3.7)` → `3`, `floor(-3.7)` → `-4`)
+- `ceil(x)` → **integer** rounded toward +∞ (`ceil(3.2)` → `4`, `ceil(-3.2)` → `-3`)
+- `trunc(x)` → **integer** rounded toward zero (`trunc(3.7)` → `3`, `trunc(-3.7)` → `-3`)
+- `round(x)` → nearest **integer**; ties round to the **even** value (banker's rounding, like Python's `round`): `round(2.5)` → `2`, `round(3.5)` → `4`. A non-number errors. These four are **pure** (no capability), and an already-integer argument is returned unchanged.
 - `append(list, item)` → new list with item added
 - `keys(map)` → list of keys
 - `values(map)` → list of values

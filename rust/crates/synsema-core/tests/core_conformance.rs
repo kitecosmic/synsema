@@ -427,3 +427,38 @@ fn error_category_vectors() {
         &["Lexer error: <archivo>:1:10: Unexpected character: '@'"],
     );
 }
+
+// -- floor / ceil / round / trunc (builtins PUROS de redondeo, sin capability) --
+
+#[test]
+fn math_rounding_builtins() {
+    // floor: hacia abajo (-inf)
+    assert_output("print(text(floor(3.7)))", &["3"]);
+    assert_output("print(text(floor(-3.7)))", &["-4"]);
+    assert_output("print(text(floor(3.0)))", &["3"]);
+    // ceil: hacia arriba (+inf)
+    assert_output("print(text(ceil(3.2)))", &["4"]);
+    assert_output("print(text(ceil(-3.2)))", &["-3"]);
+    assert_output("print(text(ceil(0.1)))", &["1"]);
+    // trunc: hacia cero
+    assert_output("print(text(trunc(3.7)))", &["3"]);
+    assert_output("print(text(trunc(-3.7)))", &["-3"]);
+    assert_output("print(text(trunc(-0.9)))", &["0"]);
+    // round: al más cercano, EMPATES al par (round-half-to-even, como el `round` de Python)
+    assert_output("print(text(round(0.5)))", &["0"]);
+    assert_output("print(text(round(1.5)))", &["2"]);
+    assert_output("print(text(round(2.5)))", &["2"]);
+    assert_output("print(text(round(3.5)))", &["4"]);
+    assert_output("print(text(round(-2.5)))", &["-2"]);
+    assert_output("print(text(round(2.4)))", &["2"]);
+    assert_output("print(text(round(2.6)))", &["3"]);
+    // devuelven ENTERO (text sin decimal)
+    assert_output("print(text(floor(9.99)))", &["9"]);
+    // un entero pasa tal cual (Int/Big)
+    assert_output("print(text(floor(42)))", &["42"]);
+    assert_output("print(text(round(-7)))", &["-7"]);
+    assert_output("print(text(ceil(1000000000000)))", &["1000000000000"]);
+    // no-número → error claro
+    assert_error_contains("print(floor(\"x\"))", "expects a number");
+    assert_error_contains("print(round(true))", "expects a number");
+}

@@ -14,7 +14,7 @@ use std::fmt;
 
 use num_bigint::{BigInt, Sign};
 use num_integer::Integer;
-use num_traits::{ToPrimitive, Zero};
+use num_traits::{FromPrimitive, ToPrimitive, Zero};
 
 #[derive(Clone, Debug)]
 pub enum Number {
@@ -43,6 +43,24 @@ impl Number {
         match b.to_i64() {
             Some(n) => Number::Int(n),
             None => Number::Big(b),
+        }
+    }
+
+    /// Un f64 **entero** (ya sin parte fraccionaria, p.ej. de floor/ceil/round/trunc) a
+    /// `Number` entero: `Int` si entra en i64, si no `Big` (preserva el valor exacto del
+    /// float). NaN/inf → `Int(0)` (no deberían llegar con input finito).
+    pub fn integer_from_f64(v: f64) -> Number {
+        if !v.is_finite() {
+            return Number::Int(0);
+        }
+        // < 2^63 entra holgado en i64 (y el cast `as i64` satura en el borde, sin UB).
+        if v.abs() < 9.223_372_036_854_776e18 {
+            Number::Int(v as i64)
+        } else {
+            match BigInt::from_f64(v) {
+                Some(b) => Number::from_bigint(b),
+                None => Number::Int(0),
+            }
         }
     }
 
