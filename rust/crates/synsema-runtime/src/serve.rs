@@ -9,6 +9,7 @@
 //! compartido es el blackboard y la base de datos".
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::net::TcpListener;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -19,7 +20,9 @@ use indexmap::IndexMap;
 use synsema_agents::swarm::Swarm;
 use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
 use synsema_core::ast::{Node, NodeKind};
-use synsema_core::interpreter::{Control, Interpreter, RunResult, RuntimeError, ServeHook};
+use synsema_core::interpreter::{
+    BuiltinTask, Control, Interpreter, RunResult, RuntimeError, ServeHook,
+};
 use synsema_core::number::Number;
 use synsema_core::parser::{parse_source, CompileError};
 use synsema_core::types::{
@@ -146,24 +149,26 @@ pub(crate) fn rebuild_globals(interp: &Interpreter, snapshot: &[(String, GlobalV
     }
 }
 
-/// Intérprete fresco por request: wiring común + hooks del swarm + db compartida
-/// + globales. La db compartida (Arc<Mutex>) sobrescribe la db fresca de wire_common
-/// para que los handlers vean las tablas/datos abiertos en el top-level.
-fn build_request_interp(
+/// Intérprete base de un serve: wiring común + hooks del swarm + db compartida +
+/// globales (tasks+valores). La db compartida (Arc<Mutex>) sobrescribe la db fresca
+/// de wire_common para que los handlers vean las tablas/datos abiertos en el top-level.
+///
+/// Construir esto es CARO (registrar ~100 builtins + recargar `.env` + clonar el AST
+/// de cada task) y era el ~46% del CPU por request (medido en la VPS: profile-first).
+/// Ahora se construye UNA vez por worker y se reusa entre requests (ver
+/// `with_serve_interp`), no por request. Devuelve el `CapabilitySet` para poder
+/// resetearlo entre requests (los grants del preámbulo, vía el `Rc` que capturan los
+/// builtins gateados: secret/env/reveal/fetch/…).
+fn build_base_interp(
     swarm: Arc<Swarm>,
     snapshot: &[(String, GlobalVal)],
     caps_snap: &[Capability],
     shared_db: SharedDb,
     secure: bool,
-) -> Interpreter {
+) -> (Interpreter, Rc<RefCell<CapabilitySet>>) {
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("request")));
     wire_common(&mut interp, &caps, secure);
-    // Re-concede las capabilities declaradas con `require` en el preámbulo. El
-    // intérprete por-request es fresco (modelo snapshot-globales) y `caps` es `Rc`
-    // (no cruza hilos), así que el programa las declara una vez y acá se re-aplican
-    // desde el snapshot `Send`. Sin esto, los builtins gateados (secret/env/reveal/
-    // fetch/…) no verían ningún grant dentro de una ruta.
     {
         let mut c = caps.borrow_mut();
         for cap in caps_snap {
@@ -173,7 +178,63 @@ fn build_request_interp(
     wire_swarm_hooks(&mut interp, swarm, "request");
     register_database_builtins(&interp, shared_db);
     rebuild_globals(&interp, snapshot);
-    interp
+    (interp, caps)
+}
+
+/// Intérprete base + sus capabilities, cacheado por-worker y reusado entre requests.
+struct BaseInterp {
+    interp: Interpreter,
+    caps: Rc<RefCell<CapabilitySet>>,
+}
+
+thread_local! {
+    /// Cache por-thread (cada worker del pool del intérprete) de un `BaseInterp` por
+    /// serve, keyed por el puntero del `snapshot` (estable y único mientras viva el
+    /// serve; los handlers lo mantienen vivo vía `Arc`). Reusar el intérprete entre
+    /// requests es lo que elimina el hotspot. El intérprete es `!Send` (Rc/RefCell) →
+    /// no puede compartirse entre hilos; por eso el cache es thread-local (uno por
+    /// worker). Acotado: `#workers × #serves` (no por request) → no reintroduce el OOM.
+    static SERVE_INTERPS: RefCell<HashMap<usize, BaseInterp>> = RefCell::new(HashMap::new());
+}
+
+/// Corre `f` sobre el intérprete base de este serve (construyéndolo la primera vez en
+/// este worker, reusándolo después). Tras `f`, restaura el estado por-request del
+/// intérprete y las capabilities al snapshot del preámbulo → el próximo request
+/// arranca aislado (un `require`/print/share dentro de un handler no se filtra).
+fn with_serve_interp<R>(
+    swarm: &Arc<Swarm>,
+    snapshot: &Arc<Vec<(String, GlobalVal)>>,
+    caps_snap: &Arc<Vec<Capability>>,
+    shared_db: &SharedDb,
+    secure: bool,
+    f: impl FnOnce(&mut Interpreter) -> R,
+) -> R {
+    let key = Arc::as_ptr(snapshot) as *const () as usize;
+    // Sacá el base del cache (o construilo la primera vez). Sacarlo (en vez de tomar
+    // prestado) evita sostener el borrow del thread-local mientras corre `f`.
+    let mut base = SERVE_INTERPS.with(|c| c.borrow_mut().remove(&key)).unwrap_or_else(|| {
+        let (interp, caps) =
+            build_base_interp(swarm.clone(), snapshot, caps_snap, shared_db.clone(), secure);
+        BaseInterp { interp, caps }
+    });
+
+    let out = f(&mut base.interp);
+
+    // Limpieza por-request: estado transitorio del intérprete + capabilities al
+    // snapshot del preámbulo (aislamiento entre requests reusando el mismo intérprete).
+    base.interp.reset_for_request();
+    {
+        let mut c = base.caps.borrow_mut();
+        *c = CapabilitySet::new("request");
+        for cap in caps_snap.iter() {
+            c.grant(cap.clone());
+        }
+    }
+    // Devolvelo al cache para el próximo request de este worker. (Si `f` paniquea, el
+    // base se dropea acá sin re-insertarse → se evita reusar un intérprete corrupto; su
+    // `Drop` corta el ciclo Rc del global_env. El pool atrapa el panic.)
+    SERVE_INTERPS.with(|c| c.borrow_mut().insert(key, base));
+    out
 }
 
 // =========================================================
@@ -224,31 +285,26 @@ fn build_request_syn(ctx: &Ctx) -> SynValue {
     syn_map(m)
 }
 
-/// Intérprete por request con `request`/`query`/`params`/`read_body` bindeados.
-fn setup_request_interp(
-    swarm: &Arc<Swarm>,
-    snapshot: &Arc<Vec<(String, GlobalVal)>>,
-    caps_snap: &Arc<Vec<Capability>>,
-    shared_db: &SharedDb,
-    ctx: &Ctx,
-    secure: bool,
-) -> Interpreter {
-    let interp = build_request_interp(swarm.clone(), snapshot, caps_snap, shared_db.clone(), secure);
-    interp.set_global("request", build_request_syn(ctx));
-    interp.set_global("query", str_map(&ctx.query));
-    interp.set_global("params", str_map(&ctx.params));
-    // read_body() per-request: cuerpo en memoria o desde el temp file spilled.
+/// Las bindings que ve un handler, LOCALES al scope hijo del request (no globales →
+/// no se filtran al siguiente request al reusar el intérprete): `request`, `query`,
+/// `params` y el builtin `read_body` (lee el cuerpo, en memoria o del temp file spilled).
+fn request_bindings(ctx: &Ctx) -> Vec<(String, SynValue)> {
     let body_text = ctx.body.clone();
     let body_file = ctx.body_file.clone();
-    interp.register_builtin(
-        "read_body",
-        0,
-        Rc::new(move |_i, _a, _l| match &body_file {
+    let read_body = SynValue::Builtin(Rc::new(BuiltinTask {
+        name: "read_body".to_string(),
+        param_count: 0,
+        func: Rc::new(move |_i, _a, _l| match &body_file {
             Some(bf) => Ok(syn_text(std::fs::read_to_string(bf).unwrap_or_default())),
             None => Ok(syn_text(body_text.as_str())),
         }),
-    );
-    interp
+    }));
+    vec![
+        ("request".to_string(), build_request_syn(ctx)),
+        ("query".to_string(), str_map(&ctx.query)),
+        ("params".to_string(), str_map(&ctx.params)),
+        ("read_body".to_string(), read_body),
+    ]
 }
 
 /// Corre el cuerpo de una ruta normal; captura el `give`-value.
@@ -261,19 +317,20 @@ fn run_route(
     ctx: &Ctx,
     secure: bool,
 ) -> GiveOutcome {
-    let mut interp = setup_request_interp(swarm, snapshot, caps_snap, shared_db, ctx, secure);
-    match interp.run_block(body) {
-        Ok(_) => GiveOutcome::Give(None),
-        Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
-        // Falla de validación (`expect`) → 400 + `field`; cualquier otro error → 500.
-        Err(Control::Error(e)) if e.is_validation => {
-            GiveOutcome::Validation { message: e.message.clone(), field: e.field.clone() }
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, secure, |interp| {
+        match interp.run_request_block(body, request_bindings(ctx)) {
+            Ok(_) => GiveOutcome::Give(None),
+            Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
+            // Falla de validación (`expect`) → 400 + `field`; cualquier otro error → 500.
+            Err(Control::Error(e)) if e.is_validation => {
+                GiveOutcome::Validation { message: e.message.clone(), field: e.field.clone() }
+            }
+            Err(Control::Error(e)) => GiveOutcome::Error(e.to_string()),
+            Err(Control::Stop(_)) => {
+                GiveOutcome::Error("'give'/'stop' used outside of a task or loop".to_string())
+            }
         }
-        Err(Control::Error(e)) => GiveOutcome::Error(e.to_string()),
-        Err(Control::Stop(_)) => {
-            GiveOutcome::Error("'give'/'stop' used outside of a task or loop".to_string())
-        }
-    }
+    })
 }
 
 /// Marcador (en el mensaje del error) de desconexión del cliente SSE.
@@ -292,26 +349,27 @@ fn run_stream(
     secure: bool,
     emit: Emitter,
 ) -> StreamEnd {
-    let mut interp = setup_request_interp(swarm, snapshot, caps_snap, shared_db, ctx, secure);
-    let cell = Rc::new(RefCell::new(emit));
-    let ec = cell.clone();
-    interp.set_stream_emit(Rc::new(move |val: SynValue, event: Option<&str>| {
-        match (*ec.borrow_mut())(&val, event) {
-            Ok(()) => Ok(()),
-            Err(StreamGone) => Err(Control::Error(RuntimeError::new(CLIENT_GONE))),
-        }
-    }));
-    match interp.run_block(body) {
-        Ok(_) | Err(Control::Give(_)) | Err(Control::Stop(_)) => StreamEnd::Done,
-        Err(Control::Error(e)) => {
-            let m = e.to_string();
-            if m == CLIENT_GONE {
-                StreamEnd::ClientGone
-            } else {
-                StreamEnd::Error(m)
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, secure, move |interp| {
+        let cell = Rc::new(RefCell::new(emit));
+        let ec = cell.clone();
+        interp.set_stream_emit(Rc::new(move |val: SynValue, event: Option<&str>| {
+            match (*ec.borrow_mut())(&val, event) {
+                Ok(()) => Ok(()),
+                Err(StreamGone) => Err(Control::Error(RuntimeError::new(CLIENT_GONE))),
+            }
+        }));
+        match interp.run_request_block(body, request_bindings(ctx)) {
+            Ok(_) | Err(Control::Give(_)) | Err(Control::Stop(_)) => StreamEnd::Done,
+            Err(Control::Error(e)) => {
+                let m = e.to_string();
+                if m == CLIENT_GONE {
+                    StreamEnd::ClientGone
+                } else {
+                    StreamEnd::Error(m)
+                }
             }
         }
-    }
+    })
 }
 
 // =========================================================
@@ -418,16 +476,17 @@ fn build_host_table(
         let caps_a = caps_snap.clone();
         let db_a = shared_db.clone();
         let h: AuthHandler = Arc::new(move |token: &str| -> Option<SynValue> {
-            let mut interp = build_request_interp(swarm_a.clone(), &snap_a, &caps_a, db_a.clone(), secure);
-            let genv = interp.global_env.clone();
-            let task = match interp.eval(&auth_node, &genv) {
-                Ok(t) => t,
-                Err(_) => return None,
-            };
-            match interp.call_task(task, vec![syn_text(token)]) {
-                Ok(user) => Some(user),
-                Err(_) => None,
-            }
+            with_serve_interp(&swarm_a, &snap_a, &caps_a, &db_a, secure, |interp| {
+                let genv = interp.global_env.clone();
+                let task = match interp.eval(&auth_node, &genv) {
+                    Ok(t) => t,
+                    Err(_) => return None,
+                };
+                match interp.call_task(task, vec![syn_text(token)]) {
+                    Ok(user) => Some(user),
+                    Err(_) => None,
+                }
+            })
         });
         h
     });
