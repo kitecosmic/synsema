@@ -32,14 +32,24 @@ use crate::types::*;
 pub struct RuntimeError {
     pub message: String,
     pub location: Option<SourceLocation>,
+    /// Error de VALIDACIÓN de cliente (p.ej. una falla de `expect body`): el serve lo
+    /// mapea a HTTP 400 (no 500), con `field` = el campo ofensor (o None). Para errores
+    /// normales del runtime `is_validation` es false.
+    pub is_validation: bool,
+    pub field: Option<String>,
 }
 
 impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), location: None }
+        Self { message: message.into(), location: None, is_validation: false, field: None }
     }
     pub fn at(message: impl Into<String>, location: SourceLocation) -> Self {
-        Self { message: message.into(), location: Some(location) }
+        Self { message: message.into(), location: Some(location), is_validation: false, field: None }
+    }
+    /// Error de validación de cliente (input que no cumple `expect`): se mapea a HTTP 400
+    /// con el nombre del campo ofensor, en vez de a un 500 genérico.
+    pub fn validation(message: impl Into<String>, field: Option<String>) -> Self {
+        Self { message: message.into(), location: None, is_validation: true, field }
     }
 }
 
@@ -62,6 +72,10 @@ pub enum Control {
 
 fn err(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::new(msg))
+}
+/// Error de validación de cliente (falla de `expect`): el serve lo mapea a 400 + `field`.
+fn err_validation(msg: impl Into<String>, field: Option<String>) -> Control {
+    Control::Error(RuntimeError::validation(msg, field))
 }
 fn err_at(msg: impl Into<String>, loc: &SourceLocation) -> Control {
     Control::Error(RuntimeError::at(msg, loc.clone()))
@@ -1158,11 +1172,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             _ => None,
         };
         let data_map = match &data {
+            // Input del cliente que no es un objeto JSON → error de validación (400).
             Some(SynValue::Map(m)) => m.clone(),
-            _ => return Err(err("request body is not a JSON object")),
+            _ => return Err(err_validation("request body is not a JSON object", None)),
         };
         for (field_name, type_name) in shape {
             if !matches!(type_name.as_str(), "text" | "number" | "bool" | "list" | "map") {
+                // Tipo inexistente en el `.syn`: bug del autor, no del cliente → 500.
                 return Err(err(format!(
                     "unknown type '{}' for field '{}' (use: text, number, bool, list, map)",
                     type_name, field_name
@@ -1171,19 +1187,23 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             let actual = match data_map.borrow().get(field_name) {
                 Some(v) => v.clone(),
                 None => {
-                    return Err(err(format!(
-                        "missing required field '{}' (expected {})",
-                        field_name, type_name
-                    )))
+                    // Falla de validación del cliente → 400 con el campo ofensor.
+                    return Err(err_validation(
+                        format!("missing required field '{}' (expected {})", field_name, type_name),
+                        Some(field_name.clone()),
+                    ))
                 }
             };
             if actual.type_name() != type_name.as_str() {
-                return Err(err(format!(
-                    "field '{}' must be {}, got {}",
-                    field_name,
-                    type_name,
-                    actual.type_name()
-                )));
+                return Err(err_validation(
+                    format!(
+                        "field '{}' must be {}, got {}",
+                        field_name,
+                        type_name,
+                        actual.type_name()
+                    ),
+                    Some(field_name.clone()),
+                ));
             }
         }
         Ok(SynValue::Nothing)

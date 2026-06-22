@@ -265,6 +265,10 @@ fn run_route(
     match interp.run_block(body) {
         Ok(_) => GiveOutcome::Give(None),
         Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
+        // Falla de validación (`expect`) → 400 + `field`; cualquier otro error → 500.
+        Err(Control::Error(e)) if e.is_validation => {
+            GiveOutcome::Validation { message: e.message.clone(), field: e.field.clone() }
+        }
         Err(Control::Error(e)) => GiveOutcome::Error(e.to_string()),
         Err(Control::Stop(_)) => {
             GiveOutcome::Error("'give'/'stop' used outside of a task or loop".to_string())
