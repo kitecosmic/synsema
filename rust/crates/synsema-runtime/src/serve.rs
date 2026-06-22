@@ -1033,10 +1033,10 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     if handles.is_empty() {
         // Sin server: resultado normal (un programa serve sin bloque serve válido).
         return match r {
-            Ok(_) => RunResult { success: true, output: interp.output, errors: Vec::new() },
+            Ok(_) => RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() },
             Err(_) => RunResult {
                 success: false,
-                output: interp.output,
+                output: std::mem::take(&mut interp.output),
                 errors: vec!["Runtime error: 'give'/'stop' used outside of a task or loop".to_string()],
             },
         };
@@ -1045,7 +1045,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     for h in handles {
         let _ = h.join(); // bloquea para siempre (el accept loop nunca termina)
     }
-    RunResult { success: true, output: interp.output, errors: Vec::new() }
+    RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() }
 }
 
 /// Corre un programa que contiene `serve on PORT`. Bindea (síncrono), imprime la
