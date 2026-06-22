@@ -28,6 +28,9 @@ num-integer = "0.1"
 # Map ordenado (Python dict preserva orden de inserción) y regex (puro Rust, sin C).
 indexmap = "2"
 regex = "1"
+# RNG no-cripto para los builtins random()/random_int() (paridad con el `random` de
+# Python). getrandom ya entra transitivamente; rand da la API de distribución/rango.
+rand = "0.8"
 # JSON para el subcomando de conformidad del CLI y la persistencia de progress/memory.
 # `preserve_order`: los objetos JSON entrantes preservan el orden de inserción (como
 # el dict de Python), para paridad byte-a-byte en las respuestas del server.

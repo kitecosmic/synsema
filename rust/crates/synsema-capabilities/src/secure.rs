@@ -273,4 +273,45 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             }),
         );
     }
+
+    // -- Builtins de random (requieren la capability `random`) --
+    // Paridad con el oráculo: random() = float [0,1), random_int(lo,hi) = entero INCLUSIVO
+    // [lo,hi]. RNG no-cripto como el `random` de Python (Mersenne Twister); los valores no
+    // son byte-idénticos al oráculo (RNG distinto) — el contrato es rango+tipo+capability.
+
+    // random() → float en [0,1).
+    {
+        let caps = caps.clone();
+        interp.register_builtin(
+            "random",
+            0,
+            Rc::new(move |_i, _args, _loc| {
+                require(&caps, Capability::new(CapabilityType::Random, None), "random()")?;
+                Ok(syn_float(rand::random::<f64>()))
+            }),
+        );
+    }
+
+    // random_int(min, max) → entero inclusivo [min, max].
+    {
+        let caps = caps.clone();
+        interp.register_builtin(
+            "random_int",
+            2,
+            Rc::new(move |_i, args, _loc| {
+                require(&caps, Capability::new(CapabilityType::Random, None), "random_int()")?;
+                // int(arg) trunca hacia cero, como `int(args[i].raw)` del oráculo.
+                let lo = arg_f64(arg(args, 0)?)?.trunc() as i64;
+                let hi = arg_f64(arg(args, 1)?)?.trunc() as i64;
+                if lo > hi {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "random_int: min ({}) is greater than max ({})",
+                        lo, hi
+                    ))));
+                }
+                use rand::Rng;
+                Ok(syn_int(rand::thread_rng().gen_range(lo..=hi)))
+            }),
+        );
+    }
 }
