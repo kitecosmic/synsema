@@ -1130,6 +1130,17 @@ impl ServeRuntime {
 
     // -- dispatch --
 
+    /// ¿La ruta que matchearía esta request está declarada como `stream`? Resuelve sólo
+    /// vhost + match de ruta (mismo criterio que el primer match de `dispatch`), sin correr
+    /// auth ni el handler. Sirve para elegir el hilo: streams → hilo dedicado; sized → pool.
+    pub fn route_is_streaming(&self, method: &str, path: &str, headers: &[(String, String)]) -> bool {
+        let host = self.select_host(&header_value(headers, "host"));
+        match host.match_route(method, path) {
+            Some((i, _)) => host.routes[i].streaming,
+            None => false,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &self,
@@ -2172,9 +2183,86 @@ pub type SharedServerConfig = std::sync::Arc<std::sync::RwLock<Arc<rustls::Serve
 /// Cuerpo de respuesta unificado (Full para sized, canal para SSE).
 type RespBody = BoxBody<Bytes, std::convert::Infallible>;
 
-/// Stack grande para los hilos del runtime (worker + blocking): el intérprete tiene
-/// guard de recursión, pero le damos holgura como el viejo thread-per-conn.
+/// Stack grande para los hilos que corren el intérprete: el tree-walker tiene guard de
+/// recursión, pero le damos holgura como el viejo thread-per-conn (fib, tasks recursivas
+/// profundas). Vive SOLO en el pool del intérprete y en los hilos de stream — NO en los
+/// workers async de I/O de tokio (esos usan stack default).
 const SERVE_STACK_SIZE: usize = 64 * 1024 * 1024;
+
+/// Pool dedicado y ACOTADO para correr el intérprete sync por request.
+///
+/// Reemplaza el `spawn_blocking` por-request, que crecía contra el blocking pool de tokio
+/// (hasta 512 hilos) heredando el stack de 64 MB → bajo keep-alive, N requests en vuelo =
+/// N × 64 MB → OOM. Acá el tope es fijo: `#workers × 64 MB`, sin importar la concurrencia.
+/// El exceso de requests **espera en la cola** (no se rechaza). El intérprete sigue sync.
+///
+/// Streams (SSE) NO usan este pool: corren en un hilo dedicado (acotado por `max_streams`)
+/// para no agotar los workers — si no, unos pocos streams taparían el pool entero.
+type InterpJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct InterpreterPool {
+    tx: std::sync::mpsc::Sender<InterpJob>,
+}
+
+impl InterpreterPool {
+    fn new(workers: usize) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<InterpJob>();
+        let rx = Arc::new(Mutex::new(rx));
+        for i in 0..workers {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("synsema-interp-{}", i))
+                .stack_size(SERVE_STACK_SIZE)
+                .spawn(move || loop {
+                    // El lock se sostiene solo durante el `recv` (handoff instantáneo);
+                    // el job corre fuera del lock → los workers ejecutan en paralelo.
+                    let job = {
+                        let guard = match rx.lock() {
+                            Ok(g) => g,
+                            Err(_) => return,
+                        };
+                        guard.recv()
+                    };
+                    match job {
+                        // Un panic del handler NO debe matar al worker: se traga acá; los
+                        // canales del job se dropean y el lado async responde 500. Seguimos.
+                        Ok(job) => {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                        }
+                        Err(_) => return, // canal cerrado: el proceso termina
+                    }
+                });
+        }
+        InterpreterPool { tx }
+    }
+
+    fn submit(&self, job: InterpJob) {
+        let _ = self.tx.send(job);
+    }
+}
+
+static INTERP_POOL: std::sync::OnceLock<InterpreterPool> = std::sync::OnceLock::new();
+
+/// El pool del intérprete, inicializado una vez. Tamaño: `SYNSEMA_SERVE_WORKERS` si está
+/// seteado (>=1), si no `#cores` (mín. 2). El env es el escape hatch para deploys con
+/// handlers I/O-bound (más workers = más concurrencia de I/O, a costa de más RAM); el
+/// default acota la memoria. La concurrencia real de I/O sin tope la dará el intérprete
+/// async (diferido), no subir esto sin límite.
+fn interp_pool() -> &'static InterpreterPool {
+    INTERP_POOL.get_or_init(|| {
+        let workers = std::env::var("SYNSEMA_SERVE_WORKERS")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(2)
+                    .max(2)
+            });
+        InterpreterPool::new(workers)
+    })
+}
 
 #[derive(Clone)]
 enum TlsMode {
@@ -2200,9 +2288,16 @@ pub fn serve_forever_tls_auto(rt: Arc<ServeRuntime>, listener: TcpListener, conf
 
 fn run_async(rt: Arc<ServeRuntime>, listener: TcpListener, tls: TlsMode) {
     let _ = listener.set_nonblocking(true);
+    // Arranca el pool del intérprete (stack grande, acotado) ANTES de aceptar conexiones.
+    let _ = interp_pool();
+    // NO seteamos `thread_stack_size` acá: los workers async de I/O usan stack default
+    // (~MBs), no 64 MB. El stack grande vive solo en el pool del intérprete. Además cap
+    // explícito del blocking pool (ya casi no se usa: el intérprete migró a su pool) y
+    // keep-alive corto de hilos ociosos, como pidió el reporte de la arena.
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(SERVE_STACK_SIZE)
+        .max_blocking_threads(4)
+        .thread_keep_alive(std::time::Duration::from_secs(10))
         .build()
     {
         Ok(r) => r,
@@ -2460,13 +2555,22 @@ async fn handle_request(
         (String::from_utf8_lossy(&body_bytes).into_owned(), None)
     };
 
-    // dispatch + (si stream) correr el handler dentro de spawn_blocking; head por
-    // oneshot, body por mpsc (1 frame para sized, N frames para SSE).
+    // ¿La ruta que matchearía es un `stream`? Resolución barata (vhost + match de ruta,
+    // sin auth ni handler) para decidir el hilo: los streams (long-lived, Ctx !Send) corren
+    // en un hilo dedicado; los sized (caso común) van al pool acotado.
+    let streaming_route = rt.route_is_streaming(&eff_method, &path, &headers);
+
+    // dispatch + (si stream) correr el handler; head por oneshot, body por mpsc (1 frame
+    // para sized, N frames para SSE).
     let (head_tx, head_rx) = tokio::sync::oneshot::channel::<HeadInfo>();
     let (body_tx, body_rx) = tokio::sync::mpsc::channel::<Bytes>(16);
     let rt2 = rt.clone();
     let cors_b = cors.clone();
-    tokio::task::spawn_blocking(move || {
+
+    // Un SOLO closure: corre el intérprete sync (dispatch + handler). El `Ctx` es !Send
+    // pero queda LOCAL al job (nunca se captura) → el closure captura sólo inputs Send, así
+    // sirve igual para el pool (sized) que para un hilo dedicado (stream).
+    let job = move || {
         let bf = body_file.as_ref().map(|p| p.to_string_lossy().into_owned());
         match rt2.dispatch(&eff_method, &path, query, headers, &body_str, bf.as_deref(), &client_ip) {
             Dispatched::Response { status, body, headers: extra } => {
@@ -2517,7 +2621,27 @@ async fn handle_request(
         if let Some(p) = &body_file {
             let _ = std::fs::remove_file(p);
         }
-    });
+    };
+
+    if streaming_route {
+        // Stream: hilo dedicado de stack grande (dispatch + handler juntos; el Ctx no cruza
+        // hilos). Acotado por `max_streams` (el slot se adquiere/libera dentro del job).
+        // NO ocupa un worker del pool → unas pocas conexiones SSE no lo agotan.
+        if std::thread::Builder::new()
+            .name("synsema-stream".to_string())
+            .stack_size(SERVE_STACK_SIZE)
+            .spawn(job)
+            .is_err()
+        {
+            // Falló crear el hilo (sistema sin recursos): el job se dropeó → head_rx da Err
+            // → el lado async responde 500. dispatch no corrió: no hay slot que liberar.
+        }
+    } else {
+        // Sized (caso común): pool dedicado y ACOTADO (no el blocking pool de tokio). La
+        // memoria es `#workers × 64 MB` pase lo que pase con la concurrencia → adiós OOM:
+        // ya no hay N hilos × 64 MB por N requests en vuelo bajo keep-alive.
+        interp_pool().submit(Box::new(job));
+    }
 
     let head = match head_rx.await {
         Ok(h) => h,

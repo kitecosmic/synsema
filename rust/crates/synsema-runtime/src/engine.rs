@@ -96,17 +96,17 @@ pub(crate) fn wire_common_with_state(
     }));
 }
 
-fn finish(interp: Interpreter, result: Result<SynValue, Control>) -> RunResult {
+fn finish(mut interp: Interpreter, result: Result<SynValue, Control>) -> RunResult {
     match result {
-        Ok(_) => RunResult { success: true, output: interp.output, errors: Vec::new() },
+        Ok(_) => RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() },
         Err(Control::Error(e)) => RunResult {
             success: false,
-            output: interp.output,
+            output: std::mem::take(&mut interp.output),
             errors: vec![format!("Runtime error: {}", e)],
         },
         Err(Control::Give(_)) | Err(Control::Stop(_)) => RunResult {
             success: false,
-            output: interp.output,
+            output: std::mem::take(&mut interp.output),
             errors: vec!["Runtime error: 'give'/'stop' used outside of a task or loop".to_string()],
         },
     }
@@ -257,7 +257,7 @@ fn run_diag_inner(source: &str, filename: &str) -> DiagRun {
     wire_common(&mut interp, &caps, false);
     match interp.execute(&program) {
         Ok(_) => DiagRun {
-            result: RunResult { success: true, output: interp.output, errors: Vec::new() },
+            result: RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() },
             diagnostics: Vec::new(),
         },
         Err(Control::Error(e)) => {
@@ -282,7 +282,7 @@ fn run_diag_inner(source: &str, filename: &str) -> DiagRun {
         Err(_) => DiagRun {
             result: RunResult {
                 success: false,
-                output: interp.output,
+                output: std::mem::take(&mut interp.output),
                 errors: vec!["Runtime error: 'give'/'stop' used outside of a task or loop".to_string()],
             },
             diagnostics: Vec::new(),

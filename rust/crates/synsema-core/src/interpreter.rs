@@ -219,6 +219,24 @@ impl Default for Interpreter {
     }
 }
 
+impl Drop for Interpreter {
+    fn drop(&mut self) {
+        // Rompe el ciclo de Rc del entorno global: cada task del global cierra sobre
+        // `global_env` (su `closure_env`) y el entorno las contiene en `bindings` →
+        // `global_env ⇄ tasks` es un ciclo que `Rc` NUNCA libera (Python tiene GC de
+        // ciclos; este port no). En el modelo snapshot-por-request del serve cada request
+        // arma un `global_env` fresco con este ciclo, así que al terminar NO se libera:
+        // leak de ~decenas de KB/request (la RSS trepa bajo carga y en Linux no baja →
+        // segundo OOM). Vaciar las bindings acá corta el ciclo y libera el entorno entero
+        // (tasks + AST clonado + valores) cuando el intérprete se dropea.
+        // `try_borrow_mut`: en drop no debería haber borrows vivos, pero si los hubiera no
+        // paniqueamos (sólo nos saltamos la limpieza de ese intérprete).
+        if let Ok(mut env) = self.global_env.try_borrow_mut() {
+            env.bindings.clear();
+        }
+    }
+}
+
 impl Interpreter {
     pub fn new() -> Self {
         let interp = Interpreter {
@@ -1849,18 +1867,18 @@ fn run_inner(source: &str, filename: &str) -> RunResult {
             match interp.execute(&program) {
                 Ok(_) => RunResult {
                     success: true,
-                    output: interp.output,
+                    output: std::mem::take(&mut interp.output),
                     errors: Vec::new(),
                 },
                 Err(Control::Error(e)) => RunResult {
                     success: false,
-                    output: interp.output,
+                    output: std::mem::take(&mut interp.output),
                     errors: vec![format!("Runtime error: {}", e)],
                 },
                 // `give`/`stop` que escapan al top: error limpio (no "Internal error:").
                 Err(Control::Give(_)) | Err(Control::Stop(_)) => RunResult {
                     success: false,
-                    output: interp.output,
+                    output: std::mem::take(&mut interp.output),
                     errors: vec![
                         "Runtime error: 'give'/'stop' used outside of a task or loop".to_string(),
                     ],
@@ -1885,4 +1903,38 @@ pub fn run_source(source: &str, filename: &str) -> RunResult {
             output: Vec::new(),
             errors: vec!["el intérprete abortó (probable desborde de stack nativo)".to_string()],
         })
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+    use crate::types::SynTaskValue;
+    use std::rc::Rc;
+
+    /// El intérprete por-request arma un `global_env` fresco con tasks que cierran sobre él
+    /// (`closure_env = global_env`) → ciclo Rc `global_env ⇄ task`. Sin romperlo, el entorno
+    /// global se filtra en CADA request (segundo OOM del serve, pinned en Linux). El `Drop`
+    /// del intérprete debe cortar el ciclo: tras droppearlo, el `global_env` ya no debe vivir.
+    #[test]
+    fn drop_breaks_global_env_task_cycle() {
+        let weak;
+        {
+            let interp = Interpreter::new();
+            let task = SynValue::Task(Rc::new(SynTaskValue {
+                name: "f".to_string(),
+                parameters: vec![],
+                body: vec![],
+                closure_env: interp.global_env.clone(), // task → global_env (la mitad del ciclo)
+                origin: None,
+                required_capabilities: vec![],
+            }));
+            interp.set_global("f", task); // global_env → task (la otra mitad)
+            weak = Rc::downgrade(&interp.global_env);
+            assert!(weak.upgrade().is_some(), "global_env vivo mientras el interp vive");
+        } // el interp se dropea acá → Drop vacía bindings → corta el ciclo
+        assert!(
+            weak.upgrade().is_none(),
+            "FUGA: global_env sigue vivo tras drop — el ciclo Rc no se rompió"
+        );
+    }
 }
