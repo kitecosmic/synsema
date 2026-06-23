@@ -9,7 +9,9 @@ use std::fmt;
 
 use crate::ast::{Node, NodeKind, Program};
 use crate::lexer::{Lexer, LexerError};
-use crate::tokens::{keyword_lookup, Number, SourceLocation, Token, TokenType, TokenValue};
+use crate::tokens::{
+    keyword_lookup, Number, SourceLocation, TemplateSegment, Token, TokenType, TokenValue,
+};
 
 /// Error de parseo. `Display` = "file:line:col: mensaje".
 #[derive(Debug, Clone, PartialEq)]
@@ -111,6 +113,9 @@ fn token_value_repr(v: &TokenValue) -> String {
         TokenValue::Number(Number::Float(x)) => py_float_repr(*x),
         TokenValue::Str(s) => py_repr_str(s),
         TokenValue::Int(n) => n.to_string(),
+        // Un TEMPLATE siempre tiene su propio arm en parse_primary, así que nunca
+        // llega al catch-all "Unexpected token": esto es inalcanzable en la práctica.
+        TokenValue::Template(_) => "<template>".to_string(),
         TokenValue::None => "None".to_string(),
     }
 }
@@ -1648,6 +1653,71 @@ impl Parser {
         ))
     }
 
+    /// Desugara un template (backtick) a una cadena `+` asociada a izquierda (§5).
+    /// literal → TextLiteral; interp → su expresión parseada. El primer operando
+    /// se fuerza a TextLiteral (usa "") para que todo el template evalúe a texto
+    /// vía el `+` que coacciona. Template puro-literal → un solo TextLiteral;
+    /// vacío → "". AST e intérprete intactos (solo TextLiteral + BinaryOp).
+    fn desugar_template(
+        &self,
+        segments: Vec<TemplateSegment>,
+        loc: &SourceLocation,
+    ) -> Result<Node, ParseError> {
+        let mut node: Option<Node> = None;
+        for seg in segments {
+            let part = match seg {
+                TemplateSegment::Literal(text) => {
+                    Node::new(loc.clone(), NodeKind::TextLiteral { value: text })
+                }
+                TemplateSegment::Interp(src, _interp_loc) => {
+                    self.parse_interp_expression(&src, loc)?
+                }
+            };
+            node = Some(match node {
+                None if matches!(part.kind, NodeKind::TextLiteral { .. }) => part,
+                None => Node::new(
+                    loc.clone(),
+                    NodeKind::BinaryOp {
+                        left: Box::new(Node::new(
+                            loc.clone(),
+                            NodeKind::TextLiteral { value: String::new() },
+                        )),
+                        operator: "+".to_string(),
+                        right: Box::new(part),
+                    },
+                ),
+                Some(acc) => Node::new(
+                    loc.clone(),
+                    NodeKind::BinaryOp {
+                        left: Box::new(acc),
+                        operator: "+".to_string(),
+                        right: Box::new(part),
+                    },
+                ),
+            });
+        }
+        Ok(node.unwrap_or_else(|| {
+            Node::new(loc.clone(), NodeKind::TextLiteral { value: String::new() })
+        }))
+    }
+
+    /// Parsea el source de un hole `{ … }` como una sola expresión. Espeja el
+    /// oráculo: trimea (convención de los holes SSR) y reusa
+    /// `parse_expression_source` (lex + UNA expresión, sin chequeo de tokens
+    /// sobrantes). Un error de lexer se convierte a ParseError para que ambas
+    /// implementaciones reporten la misma categoría en el gate de paridad.
+    fn parse_interp_expression(
+        &self,
+        src: &str,
+        loc: &SourceLocation,
+    ) -> Result<Node, ParseError> {
+        match parse_expression_source(src.trim(), &loc.file) {
+            Ok(node) => Ok(node),
+            Err(CompileError::Parse(e)) => Err(e),
+            Err(CompileError::Lex(e)) => Err(ParseError::new(e.message, e.location)),
+        }
+    }
+
     fn parse_primary(&mut self) -> Result<Node, ParseError> {
         let loc = self.location();
         let tok = self.current().clone();
@@ -1660,6 +1730,14 @@ impl Parser {
             TokenType::Text => {
                 self.advance();
                 Ok(Node::new(loc, NodeKind::TextLiteral { value: tok.as_str().to_string() }))
+            }
+            TokenType::Template => {
+                self.advance();
+                let segments = match tok.value {
+                    TokenValue::Template(segs) => segs,
+                    _ => Vec::new(),
+                };
+                self.desugar_template(segments, &loc)
             }
             TokenType::BoolTrue => {
                 self.advance();
@@ -2103,5 +2181,59 @@ mod tests {
     #[test]
     fn lambda_missing_body_fails() {
         assert!(parse_source("let f be () =>", "<test>").is_err());
+    }
+
+    // -- Backtick templates: desugar a cadena `+` --
+
+    #[test]
+    fn template_desugars_to_plus_chain() {
+        // `a{b}c` -> (("a" + b) + "c")
+        let val = lambda_value("let s be `a{b}c`");
+        let NodeKind::BinaryOp { left, operator, right } = &val.kind else {
+            panic!("esperaba BinaryOp, got {:?}", val.kind);
+        };
+        assert_eq!(operator, "+");
+        assert!(matches!(&right.kind, NodeKind::TextLiteral { value } if value == "c"));
+        let NodeKind::BinaryOp { left: l2, operator: op2, right: r2 } = &left.kind else {
+            panic!("esperaba BinaryOp interno");
+        };
+        assert_eq!(op2, "+");
+        assert!(matches!(&l2.kind, NodeKind::TextLiteral { value } if value == "a"));
+        assert!(matches!(&r2.kind, NodeKind::Identifier { name } if name == "b"));
+    }
+
+    #[test]
+    fn template_pure_literal_is_text_node() {
+        let val = lambda_value("let s be `plain`");
+        assert!(matches!(&val.kind, NodeKind::TextLiteral { value } if value == "plain"));
+    }
+
+    #[test]
+    fn template_leading_interp_anchors_empty_text() {
+        // `{x}` -> ("" + x): primer operando forzado a TextLiteral
+        let val = lambda_value("let s be `{x}`");
+        let NodeKind::BinaryOp { left, operator, right } = &val.kind else {
+            panic!("esperaba BinaryOp");
+        };
+        assert_eq!(operator, "+");
+        assert!(matches!(&left.kind, NodeKind::TextLiteral { value } if value.is_empty()));
+        assert!(matches!(&right.kind, NodeKind::Identifier { name } if name == "x"));
+    }
+
+    #[test]
+    fn empty_template_is_empty_text() {
+        let val = lambda_value("let s be ``");
+        assert!(matches!(&val.kind, NodeKind::TextLiteral { value } if value.is_empty()));
+    }
+
+    #[test]
+    fn plain_string_newline_still_errors_regression() {
+        let err = parse_source("let s be \"a\nb\"", "<test>").unwrap_err();
+        assert!(err.to_string().contains("Unterminated string"), "got: {}", err);
+    }
+
+    #[test]
+    fn malformed_interp_expression_fails() {
+        assert!(parse_source("let s be `{1 +}`", "<test>").is_err());
     }
 }

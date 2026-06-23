@@ -18,6 +18,7 @@ class LexerError(Exception):
     """Error during tokenization with full location info."""
 
     def __init__(self, message: str, location: SourceLocation):
+        self.message = message
         self.location = location
         super().__init__(f"{location}: {message}")
 
@@ -150,6 +151,92 @@ class Lexer:
 
         raise LexerError("Unterminated string (reached end of file)", loc)
 
+    def _read_template(self) -> None:
+        """Read a backtick template literal: interpolation + multi-line.
+
+        Splits the backtick body into ordered segments and emits ONE
+        TEMPLATE token carrying them. Segments are:
+          ("lit", text)            — literal text (escapes decoded, newlines kept)
+          ("expr", src, loc)       — raw source of a {…} interpolation hole
+
+        Plain "..."/'...' are untouched: only backticks interpolate and allow
+        real newlines. Same escape set as strings plus ``\\``` `` → backtick and
+        ``\\{`` → literal `{`. Per §6 the {…} splitter balances nested braces and
+        skips nested string literals so a `}` inside "…"/'…'/`…` does NOT close
+        the interpolation. The desugaring to `+` happens later, in the parser.
+        """
+        loc = self._location()
+        raw_start = self.pos
+        self._advance()  # consume opening backtick
+        segments = []
+        chars = []
+        escape_map = {
+            'n': '\n', 't': '\t', 'r': '\r',
+            '\\': '\\', '"': '"', "'": "'",
+            '`': '`', '{': '{',
+        }
+
+        while not self._at_end():
+            ch = self._peek()
+            if ch == '\\':
+                self._advance()
+                escape = self._advance() if not self._at_end() else ''
+                chars.append(escape_map.get(escape, f'\\{escape}'))
+            elif ch == '`':
+                self._advance()  # consume closing backtick
+                if chars:
+                    segments.append(("lit", ''.join(chars)))
+                raw = self.source[raw_start:self.pos]
+                self._emit(TokenType.TEMPLATE, segments, loc, raw)
+                return
+            elif ch == '{':
+                interp_loc = self._location()
+                self._advance()  # consume '{'
+                if chars:
+                    segments.append(("lit", ''.join(chars)))
+                    chars = []
+                # Capture the balanced interpolation source (§6): count brace
+                # depth, but skip over nested string literals so their braces /
+                # quotes don't count toward the balance.
+                expr_chars = []
+                depth = 1
+                while not self._at_end():
+                    c = self._peek()
+                    if c in ('"', "'", '`'):
+                        delim = self._advance()
+                        expr_chars.append(delim)
+                        while not self._at_end():
+                            cc = self._peek()
+                            if cc == '\\':
+                                expr_chars.append(self._advance())
+                                if not self._at_end():
+                                    expr_chars.append(self._advance())
+                            elif cc == delim:
+                                expr_chars.append(self._advance())
+                                break
+                            else:
+                                expr_chars.append(self._advance())
+                        continue
+                    if c == '{':
+                        depth += 1
+                        expr_chars.append(self._advance())
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0:
+                            self._advance()  # consume matching '}'
+                            break
+                        expr_chars.append(self._advance())
+                    else:
+                        expr_chars.append(self._advance())
+                else:
+                    # loop ended without break → EOF before the matching '}'
+                    raise LexerError("Unterminated template (reached end of file)", loc)
+                segments.append(("expr", ''.join(expr_chars), interp_loc))
+            else:
+                chars.append(self._advance())
+
+        raise LexerError("Unterminated template (reached end of file)", loc)
+
     def _read_number(self) -> Token:
         """Read a numeric literal (integer or float)."""
         loc = self._location()
@@ -262,6 +349,11 @@ class Lexer:
             # Strings
             if ch in ('"', "'"):
                 self._read_string(ch)
+                continue
+
+            # Backtick template strings (interpolation + multi-line)
+            if ch == '`':
+                self._read_template()
                 continue
 
             # Numbers

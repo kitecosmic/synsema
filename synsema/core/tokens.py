@@ -28,6 +28,7 @@ class TokenType(Enum):
     # -- Literals --
     NUMBER = auto()          # 42, 3.14
     TEXT = auto()             # "hello", 'world'
+    TEMPLATE = auto()        # `hola {name}` — backtick: interpolación + multilínea
     BOOL_TRUE = auto()       # true
     BOOL_FALSE = auto()      # false
     NOTHING = auto()         # nothing (null equivalent)

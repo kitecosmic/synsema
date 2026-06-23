@@ -25,7 +25,7 @@ for expressions. Synsema's grammar is designed to be flat and readable:
 
 from typing import List, Optional, Dict
 from .tokens import Token, TokenType, SourceLocation, KEYWORDS
-from .lexer import Lexer
+from .lexer import Lexer, LexerError
 from . import ast_nodes as ast
 
 
@@ -1018,6 +1018,53 @@ class Parser:
         body = self._parse_expression()
         return ast.LambdaExpression(location=loc, parameters=params, body=body)
 
+    def _desugar_template(self, segments, loc) -> ast.Node:
+        """Desugar a backtick template into a left-assoc `+` chain (§5).
+
+        literal segment → TextLiteral; interpolation segment → its parsed
+        expression. The first operand is forced to be a TextLiteral (use "")
+        so the whole template always evaluates to text via the Text-coercing
+        `+`. A pure-literal template → a single TextLiteral; empty → "".
+        The AST and interpreter are untouched (TextLiteral + BinaryOp only).
+        """
+        node = None
+        for seg in segments:
+            if seg[0] == "lit":
+                part = ast.TextLiteral(location=loc, value=seg[1])
+            else:  # ("expr", src, interp_loc)
+                _, src, interp_loc = seg
+                part = self._parse_interp_expression(src, interp_loc)
+            if node is None:
+                if isinstance(part, ast.TextLiteral):
+                    node = part
+                else:
+                    node = ast.BinaryOp(
+                        location=loc,
+                        left=ast.TextLiteral(location=loc, value=""),
+                        operator="+", right=part,
+                    )
+            else:
+                node = ast.BinaryOp(location=loc, left=node, operator="+", right=part)
+        if node is None:
+            node = ast.TextLiteral(location=loc, value="")
+        return node
+
+    def _parse_interp_expression(self, src: str, loc) -> ast.Node:
+        """Parse one `{…}` interpolation hole's source as a single expression.
+
+        Mirrors Rust `parse_expression_source`: lex + parse ONE expression with
+        no leftover-token check. The hole source is trimmed first (same as the
+        SSR template `{ expr }` convention) so surrounding whitespace doesn't
+        get lexed as indentation. A lexer error is converted to a ParseError so
+        both implementations report it in the same category (parity gate).
+        """
+        try:
+            sub_tokens = Lexer(src.strip(), self.filename).tokenize_filtered()
+        except LexerError as e:
+            raise ParseError(e.message, e.location)
+        sub_parser = Parser(sub_tokens, self.filename)
+        return sub_parser._parse_expression()
+
     def _parse_primary(self) -> ast.Node:
         """Parse primary expressions (literals, identifiers, grouped, etc.)."""
         loc = self._location()
@@ -1030,6 +1077,10 @@ class Parser:
         if tok.type == TokenType.TEXT:
             self._advance()
             return ast.TextLiteral(location=loc, value=tok.value)
+
+        if tok.type == TokenType.TEMPLATE:
+            self._advance()
+            return self._desugar_template(tok.value, loc)
 
         if tok.type == TokenType.BOOL_TRUE:
             self._advance()

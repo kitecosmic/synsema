@@ -16,6 +16,8 @@ pub enum TokenType {
     // -- Literales --
     Number,
     Text,
+    /// `hola {name}` — backtick: interpolación + multilínea.
+    Template,
     BoolTrue,
     BoolFalse,
     Nothing,
@@ -150,6 +152,7 @@ impl TokenType {
         match self {
             Number => "NUMBER",
             Text => "TEXT",
+            Template => "TEMPLATE",
             BoolTrue => "BOOL_TRUE",
             BoolFalse => "BOOL_FALSE",
             Nothing => "NOTHING",
@@ -345,6 +348,17 @@ impl fmt::Display for SourceLocation {
     }
 }
 
+/// Un segmento de un literal de template (backtick). El lexer parte el cuerpo
+/// del backtick en estos segmentos ordenados; el parser los desugara a una
+/// cadena `+` (literal → TextLiteral; interp → expresión parseada).
+#[derive(Clone, Debug, PartialEq)]
+pub enum TemplateSegment {
+    /// Texto literal (escapes ya decodificados, newlines conservados).
+    Literal(String),
+    /// Fuente cruda de un hole `{ … }`, con la ubicación de su `{`.
+    Interp(String, SourceLocation),
+}
+
 /// Valor adjunto a un token. En Python `Token.value` es `Any`; acá lo modelamos
 /// como enum según el tipo de token que lo produjo.
 #[derive(Clone, Debug, PartialEq)]
@@ -356,6 +370,8 @@ pub enum TokenValue {
     Str(String),
     /// Nivel de indentación para INDENT/DEDENT.
     Int(i64),
+    /// Segmentos de un literal de template (TEMPLATE).
+    Template(Vec<TemplateSegment>),
     /// Sin valor (NEWLINE, EOF).
     None,
 }
@@ -406,6 +422,7 @@ impl Token {
             TokenValue::Number(Number::Float(x)) => x.to_string(),
             TokenValue::Str(s) => format!("{:?}", s),
             TokenValue::Int(n) => n.to_string(),
+            TokenValue::Template(_) => "<template>".to_string(),
             TokenValue::None => "None".to_string(),
         }
     }

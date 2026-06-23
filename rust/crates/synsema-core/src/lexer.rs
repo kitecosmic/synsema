@@ -12,7 +12,9 @@
 
 use std::fmt;
 
-use crate::tokens::{keyword_lookup, Number, SourceLocation, Token, TokenType, TokenValue};
+use crate::tokens::{
+    keyword_lookup, Number, SourceLocation, TemplateSegment, Token, TokenType, TokenValue,
+};
 
 /// Error durante la tokenización, con ubicación. `Display` = "file:line:col: mensaje"
 /// (igual que `str(LexerError)` en Python).
@@ -234,6 +236,114 @@ impl Lexer {
         Err(LexerError::new("Unterminated string (reached end of file)", loc))
     }
 
+    /// Lee un literal de template con backtick: interpolación + multilínea.
+    ///
+    /// Parte el cuerpo del backtick en segmentos ordenados y emite UN token
+    /// TEMPLATE. Espeja `_read_template` del oráculo Python: mismos escapes (los
+    /// de string + ``\``` `` → backtick literal y ``\{`` → `{` literal), newlines
+    /// reales permitidos, y el split de los holes `{ … }` balancea llaves y se
+    /// salta strings anidados (§6) para que un `}` dentro de "…"/'…'/`…` NO cierre
+    /// la interpolación. El desugar a la cadena `+` ocurre después, en el parser.
+    fn read_template(&mut self) -> Result<(), LexerError> {
+        let loc = self.location();
+        let raw_start = self.pos;
+        self.advance(); // backtick de apertura
+        let mut segments: Vec<TemplateSegment> = Vec::new();
+        let mut chars = String::new();
+
+        while !self.at_end() {
+            let ch = self.peek(0).unwrap();
+            if ch == '\\' {
+                self.advance();
+                let escape = if !self.at_end() { Some(self.advance()) } else { None };
+                match escape {
+                    Some('n') => chars.push('\n'),
+                    Some('t') => chars.push('\t'),
+                    Some('r') => chars.push('\r'),
+                    Some('\\') => chars.push('\\'),
+                    Some('"') => chars.push('"'),
+                    Some('\'') => chars.push('\''),
+                    Some('`') => chars.push('`'),
+                    Some('{') => chars.push('{'),
+                    // Escape no mapeado: backslash + char (igual que read_string).
+                    Some(other) => {
+                        chars.push('\\');
+                        chars.push(other);
+                    }
+                    // Backslash al final del fuente.
+                    None => chars.push('\\'),
+                }
+            } else if ch == '`' {
+                self.advance(); // backtick de cierre
+                if !chars.is_empty() {
+                    segments.push(TemplateSegment::Literal(std::mem::take(&mut chars)));
+                }
+                let raw = self.slice(raw_start, self.pos);
+                self.emit(TokenType::Template, TokenValue::Template(segments), loc, raw);
+                return Ok(());
+            } else if ch == '{' {
+                let interp_loc = self.location();
+                self.advance(); // '{'
+                if !chars.is_empty() {
+                    segments.push(TemplateSegment::Literal(std::mem::take(&mut chars)));
+                }
+                // Capturar el source balanceado del hole (§6): cuenta profundidad
+                // de llaves, pero copia los strings anidados verbatim para que sus
+                // llaves/comillas no cuenten en el balance.
+                let mut expr_src = String::new();
+                let mut depth: i32 = 1;
+                let mut closed = false;
+                while !self.at_end() {
+                    let c = self.peek(0).unwrap();
+                    if c == '"' || c == '\'' || c == '`' {
+                        let delim = self.advance();
+                        expr_src.push(delim);
+                        while !self.at_end() {
+                            let cc = self.peek(0).unwrap();
+                            if cc == '\\' {
+                                expr_src.push(self.advance());
+                                if !self.at_end() {
+                                    expr_src.push(self.advance());
+                                }
+                            } else if cc == delim {
+                                expr_src.push(self.advance());
+                                break;
+                            } else {
+                                expr_src.push(self.advance());
+                            }
+                        }
+                        continue;
+                    }
+                    if c == '{' {
+                        depth += 1;
+                        expr_src.push(self.advance());
+                    } else if c == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            self.advance(); // '}' de cierre
+                            closed = true;
+                            break;
+                        }
+                        expr_src.push(self.advance());
+                    } else {
+                        expr_src.push(self.advance());
+                    }
+                }
+                if !closed {
+                    return Err(LexerError::new(
+                        "Unterminated template (reached end of file)",
+                        loc,
+                    ));
+                }
+                segments.push(TemplateSegment::Interp(expr_src, interp_loc));
+            } else {
+                chars.push(self.advance());
+            }
+        }
+
+        Err(LexerError::new("Unterminated template (reached end of file)", loc))
+    }
+
     /// Lee un literal numérico (entero o float).
     fn read_number(&mut self) -> Result<(), LexerError> {
         let loc = self.location();
@@ -370,6 +480,12 @@ impl Lexer {
             // Strings
             if ch == '"' || ch == '\'' {
                 self.read_string(ch)?;
+                continue;
+            }
+
+            // Strings de template con backtick (interpolación + multilínea)
+            if ch == '`' {
+                self.read_template()?;
                 continue;
             }
 
@@ -591,5 +707,91 @@ mod tests {
     fn unexpected_character() {
         let err = Lexer::new("@", "<test>").tokenize().unwrap_err();
         assert_eq!(err.message, "Unexpected character: '@'");
+    }
+
+    // -- Backtick templates --
+
+    fn first_template(src: &str) -> Vec<TemplateSegment> {
+        let toks = Lexer::new(src, "<test>").tokenize_filtered().unwrap();
+        let t = toks
+            .iter()
+            .find(|t| t.ty == TokenType::Template)
+            .expect("no hay token TEMPLATE");
+        match &t.value {
+            TokenValue::Template(segs) => segs.clone(),
+            _ => panic!("TEMPLATE sin segmentos"),
+        }
+    }
+
+    #[test]
+    fn template_lexes_segments() {
+        let segs = first_template("`a{b}c`");
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[0], TemplateSegment::Literal("a".into()));
+        match &segs[1] {
+            TemplateSegment::Interp(src, _) => assert_eq!(src, "b"),
+            _ => panic!("esperaba Interp"),
+        }
+        assert_eq!(segs[2], TemplateSegment::Literal("c".into()));
+    }
+
+    #[test]
+    fn template_pure_literal() {
+        assert_eq!(first_template("`plain`"), vec![TemplateSegment::Literal("plain".into())]);
+    }
+
+    #[test]
+    fn template_multiline() {
+        assert_eq!(first_template("`a\nb`"), vec![TemplateSegment::Literal("a\nb".into())]);
+    }
+
+    #[test]
+    fn template_escapes_brace_and_backtick() {
+        // \{ -> '{', \` -> backtick, \n -> newline (mismo set que los strings + \` \{)
+        let segs = first_template(r"`x\{y\`z\n`");
+        assert_eq!(segs, vec![TemplateSegment::Literal("x{y`z\n".into())]);
+    }
+
+    #[test]
+    fn template_nested_string_in_interp() {
+        // el `}` dentro de "}" NO cierra la interpolación (§6)
+        let segs = first_template("`x{f(\"}\")}`");
+        assert_eq!(segs.len(), 2);
+        assert_eq!(segs[0], TemplateSegment::Literal("x".into()));
+        match &segs[1] {
+            TemplateSegment::Interp(src, _) => assert_eq!(src, "f(\"}\")"),
+            _ => panic!("esperaba Interp"),
+        }
+    }
+
+    #[test]
+    fn template_nested_braces_in_interp() {
+        // un map literal dentro de la interpolación: llaves balanceadas (§6)
+        let segs = first_template("`{ {\"a\": 1} }`");
+        assert_eq!(segs.len(), 1);
+        match &segs[0] {
+            TemplateSegment::Interp(src, _) => assert_eq!(src, " {\"a\": 1} "),
+            _ => panic!("esperaba Interp"),
+        }
+    }
+
+    #[test]
+    fn template_unterminated_eof() {
+        let err = Lexer::new("`abc", "<test>").tokenize().unwrap_err();
+        assert!(err.message.contains("Unterminated template (reached end of file)"));
+    }
+
+    #[test]
+    fn template_unterminated_interp_eof() {
+        let err = Lexer::new("`a{b", "<test>").tokenize().unwrap_err();
+        assert!(err.message.contains("Unterminated template (reached end of file)"));
+    }
+
+    #[test]
+    fn plain_string_still_text_regression() {
+        // regresión: "..." sigue siendo TEXT literal, sin interpolar
+        let toks = Lexer::new(r#""{literal}""#, "<test>").tokenize_filtered().unwrap();
+        assert_eq!(toks[0].ty, TokenType::Text);
+        assert_eq!(toks[0].value, TokenValue::Str("{literal}".into()));
     }
 }
