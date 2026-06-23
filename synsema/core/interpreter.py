@@ -9,6 +9,7 @@ The interpreter walks the AST and executes each node. Key features:
 - Full state inspection at any point
 """
 
+import os
 from typing import Any, Dict, List, Optional, Callable
 from . import ast_nodes as ast
 from .types import (
@@ -131,6 +132,14 @@ class Interpreter:
         self.capabilities: set = set()
         self.blackboard: Dict[str, SynValue] = {}
         self.logs: List[Dict] = []
+
+        # Local modules (use/export): cache by resolved path, an in-progress set
+        # for circular-import detection, and a stack of exported-name lists (one
+        # frame per module being loaded; the base frame is the entrypoint's and is
+        # never harvested, so a top-level `export` in the entrypoint is ignored).
+        self.module_cache: Dict[str, SynValue] = {}
+        self.loading_modules: set = set()
+        self.exports_collector: List[List[str]] = [[]]
 
         # Callbacks (pluggable)
         self.human_callback: Optional[Callable] = None
@@ -722,6 +731,72 @@ class Interpreter:
         if node.value:
             value = self._exec(node.value, env)
         raise GiveSignal(value)
+
+    # -- Local modules (use / export) --
+
+    def _exec_UseImport(self, node: ast.UseImport, env: Environment) -> SynValue:
+        module_map = self._load_module(node.path, node.location.file)
+        env.set(node.alias, module_map)
+        return module_map
+
+    def _exec_ExportDeclaration(self, node: ast.ExportDeclaration, env: Environment) -> SynValue:
+        value = self._exec(node.declaration, env)
+        # Record this name as part of the current module's public surface. The
+        # base frame (entrypoint) is never harvested, so this is a no-op there.
+        self.exports_collector[-1].append(node.declaration.name)
+        return value
+
+    def _load_module(self, raw_path: str, importer_file: str) -> SynValue:
+        """Resolve → read → parse → run in a child env → harvest exports into a map.
+
+        A module is imported as a plain map of its exported names (no new runtime
+        type). Cached by resolved path; circular imports error. Path resolution is
+        relative to the importing file's directory, traversal-safe, and must end
+        in .syn. A `serve` block or a top-level `require` in a module is an error.
+        """
+        from .parser import parse
+        from ..stdlib.templates import resolve_module_path
+
+        base_dir = os.path.dirname(importer_file)
+        resolved = resolve_module_path(raw_path, base_dir)
+
+        if resolved in self.loading_modules:
+            raise RuntimeError(f"circular import: module '{raw_path}' is already being loaded")
+        if resolved in self.module_cache:
+            return self.module_cache[resolved]
+
+        self.loading_modules.add(resolved)
+        try:
+            with open(resolved, "r", encoding="utf-8") as fh:
+                source = fh.read()
+            program = parse(source, resolved)
+
+            # Pre-scan before any side effect: a module may not start a server
+            # or widen global capabilities (per-task `require` inside is fine).
+            for stmt in program.statements:
+                if isinstance(stmt, ast.ServeBlock):
+                    raise RuntimeError(
+                        f"module '{raw_path}' must not contain a 'serve' block"
+                    )
+                if isinstance(stmt, ast.RequireStatement):
+                    raise RuntimeError(
+                        f"module '{raw_path}' must not have a top-level 'require'"
+                    )
+
+            module_env = Environment(parent=self.global_env, name=f"module:{resolved}")
+            self.exports_collector.append([])
+            try:
+                self._exec_block(program.statements, module_env)
+                names = self.exports_collector[-1]
+            finally:
+                self.exports_collector.pop()
+
+            exports = {name: module_env.get(name) for name in names}
+            result = syn_map(exports)
+            self.module_cache[resolved] = result
+            return result
+        finally:
+            self.loading_modules.discard(resolved)
 
     # -- Type definition (stores as a constructor in env) --
 

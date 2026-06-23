@@ -148,6 +148,19 @@ pub enum NodeKind {
         value: Option<Box<Node>>,
     },
 
+    // -- Módulos locales (import / export) --
+    /// `use "./orders.syn" as orders` — importa un módulo local como un map de
+    /// sus exports (sin tipo de runtime nuevo: property-access + call ya operan).
+    UseImport {
+        path: String,
+        alias: String,
+    },
+    /// `export task f(...)` / `export type T` / `export let x be ...` — corre la
+    /// definición y marca su nombre como parte de la superficie pública del módulo.
+    ExportDeclaration {
+        declaration: Box<Node>,
+    },
+
     // -- Definición de tipo --
     TypeDefinition {
         name: String,

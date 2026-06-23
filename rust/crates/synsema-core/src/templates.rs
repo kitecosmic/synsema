@@ -77,6 +77,63 @@ fn resolve_template_path(path: &str) -> Result<PathBuf, String> {
     Ok(target)
 }
 
+/// Normaliza un path LÉXICAMENTE (colapsa `.` y `..`), sin tocar el filesystem.
+/// A diferencia de `canonicalize`, funciona sobre paths inexistentes y NO agrega
+/// el prefijo verbatim `\\?\` de Windows — clave para que el string resuelto sea
+/// byte-idéntico al del oráculo Python (`os.path.normpath`).
+fn lexical_normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Resuelve el path de un módulo local relativo al directorio del archivo que lo
+/// importa. Mismo criterio de seguridad que `resolve_template_path` (sólo relativo
+/// + `..` no puede escapar), anclado al dir del importador y exigiendo sufijo
+/// `.syn`. Usa normalización LÉXICA en vez de `canonicalize` para que el string
+/// resuelto coincida con el del puerto Python (en Windows `canonicalize` emite un
+/// prefijo `\\?\` que `realpath` no; rompería la paridad de cualquier path que
+/// aparezca en un error/ubicación). Los errores citan el path RAW (nunca el
+/// resuelto), para no filtrar formas de path divergentes.
+pub(crate) fn resolve_module_path(raw_path: &str, base_dir: &Path) -> Result<String, String> {
+    // Una ruta drive-absoluta O con `/`/`\` inicial (root-relativa) se rechaza. El
+    // chequeo del slash inicial mantiene la decisión idéntica entre plataformas/impls
+    // (os.path.isabs y Path::is_absolute difieren en "/x" en Windows).
+    if Path::new(raw_path).is_absolute()
+        || raw_path.starts_with('/')
+        || raw_path.starts_with('\\')
+    {
+        return Err(format!(
+            "module path must be relative to the importing file: '{}'",
+            raw_path
+        ));
+    }
+    if !raw_path.ends_with(".syn") {
+        return Err(format!("module path must end in '.syn': '{}'", raw_path));
+    }
+    let base = lexical_normalize(base_dir);
+    let target = lexical_normalize(&base.join(raw_path));
+    if target != base && !target.starts_with(&base) {
+        return Err(format!(
+            "module path escapes the importing directory: '{}'",
+            raw_path
+        ));
+    }
+    if !target.is_file() {
+        return Err(format!("module not found: {}", raw_path));
+    }
+    Ok(target.to_string_lossy().to_string())
+}
+
 enum Seg {
     Text(String),
     Hole(String, usize),

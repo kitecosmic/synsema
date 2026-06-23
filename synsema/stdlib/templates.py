@@ -55,6 +55,38 @@ def resolve_template_path(path: str) -> str:
     return target
 
 
+def resolve_module_path(raw_path: str, base_dir: str) -> str:
+    """Resolve a local-module path relative to the importing file's directory.
+
+    Same path-safety stance as resolve_template_path (relative-only + `..` cannot
+    escape), but anchored at the importer dir and requiring a `.syn` suffix. Uses
+    LEXICAL normalization (os.path.normpath) rather than realpath/canonicalize so
+    the resolved string is byte-identical to the Rust port — on Windows
+    canonicalize emits a `\\\\?\\` verbatim prefix that realpath does not, which
+    would break Python↔Rust parity of any path that reaches an error/location.
+    `..` is still collapsed lexically, so traversal is blocked all the same.
+    Errors quote the RAW path (never the resolved one) to stay parity-safe.
+    Raises the interpreter's RuntimeError (→ engine reports "Runtime error: ...").
+    """
+    # The interpreter's RuntimeError (not the builtin) so the engine categorizes
+    # these as runtime errors, matching the Rust loader's category.
+    from ..core.interpreter import RuntimeError as SynRuntimeError
+    # A drive-absolute path OR a leading-slash (root-relative) path is rejected.
+    # The leading-slash check keeps the decision identical across platforms/impls
+    # (os.path.isabs and Rust's Path::is_absolute disagree on "/x" on Windows).
+    if os.path.isabs(raw_path) or raw_path[:1] in ("/", "\\"):
+        raise SynRuntimeError(f"module path must be relative to the importing file: '{raw_path}'")
+    if not raw_path.endswith(".syn"):
+        raise SynRuntimeError(f"module path must end in '.syn': '{raw_path}'")
+    base = os.path.normpath(base_dir)
+    target = os.path.normpath(os.path.join(base, raw_path))
+    if target != base and not target.startswith(base + os.sep):
+        raise SynRuntimeError(f"module path escapes the importing directory: '{raw_path}'")
+    if not os.path.isfile(target):
+        raise SynRuntimeError(f"module not found: {raw_path}")
+    return target
+
+
 # =========================================================
 # Splitting source into text / hole segments (quote-aware)
 # =========================================================

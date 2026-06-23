@@ -11,8 +11,9 @@
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::path::Path;
 use std::rc::Rc;
 
 use indexmap::IndexMap;
@@ -21,6 +22,7 @@ use regex::Regex;
 use crate::ast::{Node, NodeKind, Program};
 use crate::number::Number;
 use crate::parser::{parse_source, CompileError};
+use crate::templates::resolve_module_path;
 use crate::tokens::SourceLocation;
 use crate::types::*;
 
@@ -226,6 +228,13 @@ pub struct Interpreter {
     /// Sink de `send` dentro de un handler de stream SSE (lo cablea el motor por
     /// request de streaming). (value, event_name) → (). Sin él, `send` es error.
     stream_emit: Option<Rc<dyn Fn(SynValue, Option<&str>) -> Result<(), Control>>>,
+    /// Módulos locales (use/export): caché por path resuelto, set de módulos en
+    /// carga (detección de import circular) y una pila de listas de nombres
+    /// exportados (un frame por módulo en carga; el frame base es el del
+    /// entrypoint y nunca se cosecha → un `export` top-level del entrypoint se ignora).
+    module_cache: HashMap<String, SynValue>,
+    loading_modules: HashSet<String>,
+    exports_collector: Vec<Vec<String>>,
 }
 
 impl Default for Interpreter {
@@ -268,6 +277,9 @@ impl Interpreter {
             llm_callback: None,
             serve_hook: None,
             stream_emit: None,
+            module_cache: HashMap::new(),
+            loading_modules: HashSet::new(),
+            exports_collector: vec![Vec::new()],
         };
         interp.register_builtins();
         interp
@@ -397,6 +409,74 @@ impl Interpreter {
     /// Evalúa un nodo en un entorno dado (templates + motor de serve).
     pub fn eval(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
         self.exec(node, env)
+    }
+
+    /// Carga un módulo local: resuelve → lee → parsea → corre el body en un env
+    /// HIJO del global → cosecha los exports en un map → lo devuelve. Cacheado por
+    /// path resuelto; un import circular es error. No agrega tipo de runtime nuevo:
+    /// el módulo es un `SynValue::Map`.
+    fn load_module(&mut self, raw_path: &str, importer_file: &str) -> Result<SynValue, Control> {
+        let base_dir = Path::new(importer_file).parent().unwrap_or_else(|| Path::new("."));
+        let resolved = resolve_module_path(raw_path, base_dir).map_err(err)?;
+
+        if self.loading_modules.contains(&resolved) {
+            return Err(err(format!(
+                "circular import: module '{}' is already being loaded",
+                raw_path
+            )));
+        }
+        if let Some(cached) = self.module_cache.get(&resolved) {
+            return Ok(cached.clone());
+        }
+
+        self.loading_modules.insert(resolved.clone());
+        let res = self.load_module_inner(raw_path, &resolved);
+        self.loading_modules.remove(&resolved);
+        let module_map = res?;
+        self.module_cache.insert(resolved, module_map.clone());
+        Ok(module_map)
+    }
+
+    fn load_module_inner(&mut self, raw_path: &str, resolved: &str) -> Result<SynValue, Control> {
+        let source = std::fs::read_to_string(resolved)
+            .map_err(|_| err(format!("module not found: {}", raw_path)))?;
+        // Un error de compilación del módulo se reporta como runtime (la operación
+        // de import falló), igual que en el oráculo Python.
+        let program = parse_source(&source, resolved).map_err(|e| err(e.to_string()))?;
+
+        // Pre-escaneo antes de cualquier efecto: un módulo no puede arrancar un
+        // servidor ni ensanchar capabilities globales (el `require` POR TASK sí va).
+        for stmt in &program.statements {
+            match &stmt.kind {
+                NodeKind::ServeBlock { .. } => {
+                    return Err(err(format!(
+                        "module '{}' must not contain a 'serve' block",
+                        raw_path
+                    )))
+                }
+                NodeKind::RequireStatement { .. } => {
+                    return Err(err(format!(
+                        "module '{}' must not have a top-level 'require'",
+                        raw_path
+                    )))
+                }
+                _ => {}
+            }
+        }
+
+        let module_env = Environment::child(&self.global_env, &format!("module:{}", resolved));
+        self.exports_collector.push(Vec::new());
+        let exec_res = self.exec_block(&program.statements, &module_env);
+        let names = self.exports_collector.pop().unwrap_or_default();
+        exec_res?;
+
+        let mut exports = IndexMap::new();
+        for name in names {
+            if let Some(v) = env_get(&module_env, &name) {
+                exports.insert(name, v);
+            }
+        }
+        Ok(syn_map(exports))
     }
 
     fn register_builtins(&self) {
@@ -737,6 +817,28 @@ impl Interpreter {
                     None => SynValue::Nothing,
                 };
                 Err(Control::Give(v))
+            }
+
+            // -- Módulos locales (use / export) --
+            NodeKind::UseImport { path, alias } => {
+                let module_map = self.load_module(path, &loc.file)?;
+                env_set(env, alias, module_map.clone());
+                Ok(module_map)
+            }
+            NodeKind::ExportDeclaration { declaration } => {
+                let value = self.exec(declaration, env)?;
+                let name = match &declaration.kind {
+                    NodeKind::TaskDefinition { name, .. }
+                    | NodeKind::TypeDefinition { name, .. }
+                    | NodeKind::LetBinding { name, .. } => name.clone(),
+                    _ => return Err(err_at("export must wrap a task, type, or let", loc)),
+                };
+                // Registra el nombre en la superficie pública del módulo actual. El
+                // frame base (entrypoint) nunca se cosecha → allí es un no-op.
+                if let Some(frame) = self.exports_collector.last_mut() {
+                    frame.push(name);
+                }
+                Ok(value)
             }
 
             // -- Tipos --
@@ -2153,5 +2255,114 @@ mod lambda_tests {
     fn call_non_function_fails() {
         let r = run_source("let x be 5\nprint(x(1))", "<test>");
         assert!(!r.success, "llamar a un no-función debería fallar");
+    }
+}
+
+#[cfg(test)]
+mod module_tests {
+    use super::run_source;
+    use std::fs;
+
+    /// Crea un dir temporal con fixtures `.syn` y devuelve el path del entrypoint
+    /// (cuyo dir es contra el que resuelven los `use "./x.syn"`). El entrypoint no
+    /// se escribe a disco: run_source parsea el `source` directamente.
+    fn setup(tag: &str, fixtures: &[(&str, &str)]) -> String {
+        let dir = std::env::temp_dir().join(format!("synsema_modtest_{}", tag));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for (name, content) in fixtures {
+            fs::write(dir.join(name), content).unwrap();
+        }
+        dir.join("__entry__.syn").to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn basic_import_and_call() {
+        let entry = setup("basic", &[(
+            "orders.syn",
+            "task _mk(name, amount)\n    give {\"name\": name, \"amount\": amount}\n\
+             export task create(name, amount)\n    give _mk(name, amount)\n\
+             export task total(o)\n    give amount of o\n",
+        )]);
+        let r = run_source(
+            "use \"./orders.syn\" as orders\nlet o be orders.create(\"Ana\", 500)\n\
+             print(text(orders.total(o)))",
+            &entry,
+        );
+        assert!(r.success, "{:?}", r.errors);
+        assert_eq!(r.output, vec!["500"]);
+    }
+
+    #[test]
+    fn module_private_isolation() {
+        let entry = setup("private", &[(
+            "orders.syn",
+            "task _mk(x)\n    give x\nexport task create(x)\n    give _mk(x)\n",
+        )]);
+        let r = run_source("use \"./orders.syn\" as orders\nprint(orders._mk(1))", &entry);
+        assert!(!r.success, "acceder a un nombre privado del módulo debería fallar");
+    }
+
+    #[test]
+    fn circular_import_errors() {
+        let entry = setup("circular", &[
+            ("a.syn", "use \"./b.syn\" as b\nexport task fa()\n    give 1\n"),
+            ("b.syn", "use \"./a.syn\" as a\nexport task fb()\n    give 2\n"),
+        ]);
+        let r = run_source("use \"./a.syn\" as a\nprint(1)", &entry);
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.contains("circular import")), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn serve_in_module_errors() {
+        let entry = setup("serve", &[(
+            "srv.syn",
+            "export task f()\n    give 1\nserve on 8080\n    route \"GET /x\"\n        give 1\n",
+        )]);
+        let r = run_source("use \"./srv.syn\" as s\nprint(1)", &entry);
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.contains("serve")), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn toplevel_require_in_module_errors() {
+        let entry = setup("require", &[(
+            "req.syn",
+            "require net(\"x.com\")\nexport task f()\n    give 1\n",
+        )]);
+        let r = run_source("use \"./req.syn\" as r\nprint(1)", &entry);
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.contains("require")), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn caching_runs_module_once() {
+        let entry = setup("cache", &[(
+            "noisy.syn",
+            "print(\"loaded\")\nexport let answer be 42\n",
+        )]);
+        let r = run_source(
+            "use \"./noisy.syn\" as m\nuse \"./noisy.syn\" as m2\nprint(text(m.answer))",
+            &entry,
+        );
+        assert!(r.success, "{:?}", r.errors);
+        assert_eq!(r.output, vec!["loaded", "42"]);
+    }
+
+    #[test]
+    fn traversal_path_errors() {
+        let entry = setup("traversal", &[]);
+        let r = run_source("use \"../secret.syn\" as x\nprint(1)", &entry);
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.contains("escapes")), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn non_syn_path_errors() {
+        let entry = setup("nonsyn", &[]);
+        let r = run_source("use \"./x.txt\" as x\nprint(1)", &entry);
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.contains(".syn")), "{:?}", r.errors);
     }
 }

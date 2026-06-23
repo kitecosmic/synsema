@@ -230,6 +230,20 @@ class GiveStatement(Node):
     value: Optional[Node] = None
 
 
+# -- Local modules (import / export) --
+
+@dataclass
+class UseImport(Node):
+    """use "./orders.syn" as orders — import a local module as a map of exports."""
+    path: str = ""
+    alias: str = ""
+
+@dataclass
+class ExportDeclaration(Node):
+    """export task f(...) / export type T / export let x be ... — public surface."""
+    declaration: Node = None
+
+
 # -- Type Definition --
 
 @dataclass

@@ -175,6 +175,12 @@ class Parser:
             return self._parse_serve()
         if self._check_word("expect") and self._peek_word(1, "body"):
             return self._parse_expect()
+        # Local modules: `use "..." as name` and `export <task|type|let> ...`.
+        if self._check_word("use") and self._peek(1).type == TokenType.TEXT:
+            return self._parse_use()
+        if self._check_word("export") and self._peek(1).type in (
+                TokenType.TASK, TokenType.TYPE, TokenType.LET):
+            return self._parse_export()
 
         tt = self._current().type
 
@@ -352,6 +358,35 @@ class Parser:
             self._advance()
 
         return ast.MatchStatement(location=loc, value=value, arms=arms)
+
+    # -- local modules (use / export) --
+
+    def _parse_use(self) -> ast.UseImport:
+        """use "<relative.syn>" as name — import a local module."""
+        loc = self._location()
+        self._advance()  # consume soft keyword 'use'
+        path_tok = self._expect(TokenType.TEXT, "Expected a module path string after 'use'")
+        self._expect(TokenType.AS, "Expected 'as' after the module path")
+        alias_tok = self._expect_name("module alias after 'as'")
+        return ast.UseImport(location=loc, path=path_tok.value, alias=alias_tok.value)
+
+    def _parse_export(self) -> ast.ExportDeclaration:
+        """export <task|type|let> ... — run the definition and mark it public."""
+        loc = self._location()
+        self._advance()  # consume soft keyword 'export'
+        tt = self._current().type
+        if tt == TokenType.TASK:
+            decl = self._parse_task_definition()
+        elif tt == TokenType.TYPE:
+            decl = self._parse_type_definition()
+        elif tt == TokenType.LET:
+            decl = self._parse_let()
+        else:
+            raise ParseError(
+                "export must be followed by task, type, or let",
+                self._location(),
+            )
+        return ast.ExportDeclaration(location=loc, declaration=decl)
 
     # -- task --
 

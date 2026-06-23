@@ -306,6 +306,15 @@ impl Parser {
         if self.check_word("proxy") && self.peek(1).ty == TokenType::To {
             return Ok(Some(self.parse_proxy()?));
         }
+        // Módulos locales: `use "..." as name` y `export <task|type|let> ...`.
+        if self.check_word("use") && self.peek(1).ty == TokenType::Text {
+            return Ok(Some(self.parse_use()?));
+        }
+        if self.check_word("export")
+            && matches!(self.peek(1).ty, TokenType::Task | TokenType::Type | TokenType::Let)
+        {
+            return Ok(Some(self.parse_export()?));
+        }
 
         let tt = self.current().ty;
         let node = match tt {
@@ -499,6 +508,40 @@ impl Parser {
                 arms,
             },
         ))
+    }
+
+    // -- módulos locales (use / export) --
+
+    fn parse_use(&mut self) -> Result<Node, ParseError> {
+        let loc = self.location();
+        self.advance(); // soft keyword 'use'
+        let path_tok = self.expect(TokenType::Text, "Expected a module path string after 'use'")?;
+        self.expect(TokenType::As, "Expected 'as' after the module path")?;
+        let alias_tok = self.expect_name("module alias after 'as'")?;
+        Ok(Node::new(
+            loc,
+            NodeKind::UseImport {
+                path: path_tok.as_str().to_string(),
+                alias: alias_tok.as_str().to_string(),
+            },
+        ))
+    }
+
+    fn parse_export(&mut self) -> Result<Node, ParseError> {
+        let loc = self.location();
+        self.advance(); // soft keyword 'export'
+        let decl = match self.current().ty {
+            TokenType::Task => self.parse_task_definition()?,
+            TokenType::Type => self.parse_type_definition()?,
+            TokenType::Let => self.parse_let()?,
+            _ => {
+                return Err(ParseError::new(
+                    "export must be followed by task, type, or let",
+                    self.location(),
+                ))
+            }
+        };
+        Ok(Node::new(loc, NodeKind::ExportDeclaration { declaration: Box::new(decl) }))
     }
 
     // -- task --
@@ -2235,5 +2278,52 @@ mod tests {
     #[test]
     fn malformed_interp_expression_fails() {
         assert!(parse_source("let s be `{1 +}`", "<test>").is_err());
+    }
+
+    // -- Local modules (use / export) --
+
+    #[test]
+    fn use_import_parses() {
+        let prog = parse_ok("use \"./orders.syn\" as orders");
+        match &prog.statements[0].kind {
+            NodeKind::UseImport { path, alias } => {
+                assert_eq!(path, "./orders.syn");
+                assert_eq!(alias, "orders");
+            }
+            other => panic!("esperaba UseImport, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn export_task_parses() {
+        let prog = parse_ok("export task f()\n    give 1");
+        match &prog.statements[0].kind {
+            NodeKind::ExportDeclaration { declaration } => {
+                assert!(matches!(declaration.kind, NodeKind::TaskDefinition { .. }));
+            }
+            other => panic!("esperaba ExportDeclaration, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn export_let_and_type_parse() {
+        let p1 = parse_ok("export let x be 5");
+        let NodeKind::ExportDeclaration { declaration } = &p1.statements[0].kind else {
+            panic!("esperaba ExportDeclaration");
+        };
+        assert!(matches!(declaration.kind, NodeKind::LetBinding { .. }));
+        let p2 = parse_ok("export type T\n    a: number");
+        let NodeKind::ExportDeclaration { declaration } = &p2.statements[0].kind else {
+            panic!("esperaba ExportDeclaration");
+        };
+        assert!(matches!(declaration.kind, NodeKind::TypeDefinition { .. }));
+    }
+
+    #[test]
+    fn use_and_export_are_soft_keywords() {
+        // `let use be 1` / `let export be 2` siguen siendo bindings normales.
+        let p = parse_ok("let use be 1\nlet export be 2");
+        assert!(matches!(p.statements[0].kind, NodeKind::LetBinding { .. }));
+        assert!(matches!(p.statements[1].kind, NodeKind::LetBinding { .. }));
     }
 }
