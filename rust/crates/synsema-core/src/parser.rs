@@ -315,6 +315,10 @@ impl Parser {
         {
             return Ok(Some(self.parse_export()?));
         }
+        // Enums (sum types): `enum Name` liderando un statement, seguido de un NAME.
+        if self.check_word("enum") && self.peek(1).ty == TokenType::Identifier {
+            return Ok(Some(self.parse_enum()?));
+        }
 
         let tt = self.current().ty;
         let node = match tt {
@@ -625,6 +629,46 @@ impl Parser {
             NodeKind::TypeDefinition {
                 name: name_tok.as_str().to_string(),
                 fields,
+            },
+        ))
+    }
+
+    // -- enum (sum type) --
+
+    fn parse_enum(&mut self) -> Result<Node, ParseError> {
+        let loc = self.location();
+        self.advance(); // soft keyword 'enum'
+        let name_tok = self.expect_name("enum name")?;
+        self.skip_newlines();
+        self.expect(TokenType::Indent, "")?;
+        let mut variants: Vec<(String, Vec<String>)> = Vec::new();
+
+        self.skip_newlines();
+        while !self.check_any(&[TokenType::Dedent, TokenType::Eof]) {
+            let variant_name = self.expect_name("variant name")?.as_str().to_string();
+            let mut fields = Vec::new();
+            if self.match_tok(TokenType::LParen).is_some() {
+                if !self.check(TokenType::RParen) {
+                    fields.push(self.expect_name("payload field name")?.as_str().to_string());
+                    while self.match_tok(TokenType::Comma).is_some() {
+                        fields.push(self.expect_name("payload field name")?.as_str().to_string());
+                    }
+                }
+                self.expect(TokenType::RParen, "")?;
+            }
+            variants.push((variant_name, fields));
+            self.skip_newlines();
+        }
+
+        if self.check(TokenType::Dedent) {
+            self.advance();
+        }
+
+        Ok(Node::new(
+            loc,
+            NodeKind::EnumDefinition {
+                name: name_tok.as_str().to_string(),
+                variants,
             },
         ))
     }
@@ -2325,5 +2369,32 @@ mod tests {
         let p = parse_ok("let use be 1\nlet export be 2");
         assert!(matches!(p.statements[0].kind, NodeKind::LetBinding { .. }));
         assert!(matches!(p.statements[1].kind, NodeKind::LetBinding { .. }));
+    }
+
+    // -- Enums (sum types) --
+
+    #[test]
+    fn enum_parses_variants() {
+        let p = parse_ok("enum Order\n    pending\n    paid(amount)\n    shipped(date, carrier)\n");
+        match &p.statements[0].kind {
+            NodeKind::EnumDefinition { name, variants } => {
+                assert_eq!(name, "Order");
+                assert_eq!(variants.len(), 3);
+                assert_eq!(variants[0], ("pending".to_string(), vec![]));
+                assert_eq!(variants[1], ("paid".to_string(), vec!["amount".to_string()]));
+                assert_eq!(
+                    variants[2],
+                    ("shipped".to_string(), vec!["date".to_string(), "carrier".to_string()])
+                );
+            }
+            other => panic!("esperaba EnumDefinition, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn enum_is_soft_keyword() {
+        // `let enum be 1` sigue siendo un binding normal.
+        let p = parse_ok("let enum be 1");
+        assert!(matches!(p.statements[0].kind, NodeKind::LetBinding { .. }));
     }
 }

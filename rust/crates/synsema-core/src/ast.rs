@@ -166,6 +166,13 @@ pub enum NodeKind {
         name: String,
         fields: Vec<(String, String)>, // (nombre, tipo)
     },
+    /// `enum Order { pending, paid(amount), shipped(date, carrier) }` — tipo suma.
+    /// Cada variante es (nombre, [campos de payload]); sin tipos en los campos.
+    /// El valor es un map etiquetado y el tipo un map namespace (sin tipo nuevo).
+    EnumDefinition {
+        name: String,
+        variants: Vec<(String, Vec<String>)>, // (nombre_variante, [campo, ...])
+    },
 
     // -- Sistema de agentes --
     AgentDefinition {

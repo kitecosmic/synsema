@@ -181,6 +181,9 @@ class Parser:
         if self._check_word("export") and self._peek(1).type in (
                 TokenType.TASK, TokenType.TYPE, TokenType.LET):
             return self._parse_export()
+        # Enums (sum types): `enum Name` leading a statement, followed by a NAME.
+        if self._check_word("enum") and self._peek(1).type == TokenType.IDENTIFIER:
+            return self._parse_enum()
 
         tt = self._current().type
 
@@ -449,6 +452,35 @@ class Parser:
             self._advance()
 
         return ast.TypeDefinition(location=loc, name=name_tok.value, fields=fields)
+
+    # -- enum (sum type) --
+
+    def _parse_enum(self) -> ast.EnumDefinition:
+        """enum Name\n    nullary\n    payloaded(field, ...)"""
+        loc = self._location()
+        self._advance()  # consume soft keyword 'enum'
+        name_tok = self._expect_name("enum name")
+        self._skip_newlines()
+        self._expect(TokenType.INDENT)
+        variants = []
+
+        self._skip_newlines()
+        while not self._check(TokenType.DEDENT, TokenType.EOF):
+            variant_name = self._expect_name("variant name").value
+            fields = []
+            if self._match(TokenType.LPAREN):
+                if not self._check(TokenType.RPAREN):
+                    fields.append(self._expect_name("payload field name").value)
+                    while self._match(TokenType.COMMA):
+                        fields.append(self._expect_name("payload field name").value)
+                self._expect(TokenType.RPAREN)
+            variants.append((variant_name, fields))
+            self._skip_newlines()
+
+        if self._check(TokenType.DEDENT):
+            self._advance()
+
+        return ast.EnumDefinition(location=loc, name=name_tok.value, variants=variants)
 
     # -- try/recover --
 

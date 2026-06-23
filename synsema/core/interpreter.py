@@ -630,9 +630,29 @@ class Interpreter:
             raise RuntimeError("Loop exceeded maximum iterations (1,000,000)", node.location)
         return result
 
+    def _variant_pattern_id(self, pattern: ast.Node, env: Environment):
+        """If `pattern` is an `Enum.variant` access whose object evaluates to an
+        enum namespace map (has "__enum"), return the qualified variant id
+        ("Enum.variant"); otherwise None (→ the caller uses value-equality)."""
+        if not isinstance(pattern, ast.PropertyAccess):
+            return None
+        obj = self._exec(pattern.object, env)
+        if isinstance(obj.type, SynMap) and "__enum" in obj.raw:
+            return f"{obj.raw['__enum'].raw}.{pattern.property_name}"
+        return None
+
     def _exec_MatchStatement(self, node: ast.MatchStatement, env: Environment) -> SynValue:
         value = self._exec(node.value, env)
         for arm in node.arms:
+            # Variant pattern `Enum.variant`: match by discriminant, payload ignored.
+            variant_id = self._variant_pattern_id(arm.pattern, env)
+            if variant_id is not None:
+                if (isinstance(value.type, SynMap)
+                        and "__variant" in value.raw
+                        and value.raw["__variant"].raw == variant_id):
+                    return self._exec_block(arm.body, env)
+                continue
+            # Any other pattern: the unchanged value-equality path.
             pattern = self._exec(arm.pattern, env)
             if value.raw == pattern.raw:
                 return self._exec_block(arm.body, env)
@@ -817,6 +837,39 @@ class Interpreter:
         builtin = BuiltinTask(node.name, lambda args: constructor(args), len(field_names))
         env.set(node.name, SynValue(raw=builtin, type=SynTask()))
         return syn_nothing()
+
+    def _exec_EnumDefinition(self, node: ast.EnumDefinition, env: Environment) -> SynValue:
+        # An enum value is a tagged map ({"__variant": "Enum.variant", <fields>});
+        # an enum type is a namespace map ({"__enum": "Enum", <variant>: value|ctor}).
+        # No new runtime type — construction reuses property-access + call.
+        namespace = {"__enum": syn_text(node.name, node.location)}
+        for variant_name, field_names in node.variants:
+            qualified = f"{node.name}.{variant_name}"
+            if field_names:
+                # Payloaded variant → a constructor builtin of EXACT arity.
+                def make_ctor(qualified, field_names):
+                    def constructor(args: List[SynValue]) -> SynValue:
+                        if len(args) != len(field_names):
+                            raise RuntimeError(
+                                f"variant {qualified} expects {len(field_names)} "
+                                f"fields, got {len(args)}",
+                                node.location,
+                            )
+                        pairs = {"__variant": syn_text(qualified, node.location)}
+                        for fname, val in zip(field_names, args):
+                            pairs[fname] = val
+                        return syn_map(pairs, node.location)
+                    return constructor
+                builtin = BuiltinTask(qualified, make_ctor(qualified, field_names), len(field_names))
+                namespace[variant_name] = SynValue(raw=builtin, type=SynTask())
+            else:
+                # Nullary variant → a constant tagged map value.
+                namespace[variant_name] = syn_map(
+                    {"__variant": syn_text(qualified, node.location)}, node.location
+                )
+        value = syn_map(namespace, node.location)
+        env.set(node.name, value)
+        return value
 
     # -- Agent system --
     # Connected to the real swarm (agents/swarm.py) via callbacks.

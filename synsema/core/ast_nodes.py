@@ -257,6 +257,20 @@ class TypeDefinition(Node):
     fields: List[tuple] = field(default_factory=list)  # (name, type_str)
 
 
+@dataclass
+class EnumDefinition(Node):
+    """
+    enum Order
+        pending
+        paid(amount)
+        shipped(date, carrier)
+
+    A sum type. Each variant is nullary or carries named payload fields.
+    """
+    name: str = ""
+    variants: List[tuple] = field(default_factory=list)  # (variant_name, [field, ...])
+
+
 # -- Agent System --
 
 @dataclass

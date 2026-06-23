@@ -530,6 +530,25 @@ impl Interpreter {
         self.register("zip_with", 3, Rc::new(|i, a, l| i.b_zip_with(a, l)));
     }
 
+    /// Si `pattern` es un acceso `Enum.variant` cuyo objeto evalúa a un map
+    /// namespace de enum (tiene "__enum"), devuelve el id calificado
+    /// ("Enum.variant"); si no, None (→ el caller usa igualdad de valor).
+    fn variant_pattern_id(
+        &mut self,
+        pattern: &Node,
+        env: &Rc<RefCell<Environment>>,
+    ) -> Result<Option<String>, Control> {
+        if let NodeKind::PropertyAccess { property_name, object } = &pattern.kind {
+            let obj = self.exec(object, env)?;
+            if let SynValue::Map(m) = &obj {
+                if let Some(SynValue::Text(enum_name)) = m.borrow().get("__enum") {
+                    return Ok(Some(format!("{}.{}", enum_name, property_name)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     // =========================================================
     // Ejecución
     // =========================================================
@@ -742,6 +761,23 @@ impl Interpreter {
                 let v = self.exec(value, env)?;
                 for arm in arms {
                     if let NodeKind::MatchArm { pattern, body } = &arm.kind {
+                        // Patrón de variante `Enum.variant`: match por discriminante
+                        // ("__variant"), payload ignorado.
+                        if let Some(variant_id) = self.variant_pattern_id(pattern, env)? {
+                            let is_match = if let SynValue::Map(m) = &v {
+                                matches!(
+                                    m.borrow().get("__variant"),
+                                    Some(SynValue::Text(t)) if t.as_ref() == variant_id.as_str()
+                                )
+                            } else {
+                                false
+                            };
+                            if is_match {
+                                return self.exec_block(body, env);
+                            }
+                            continue;
+                        }
+                        // Cualquier otro patrón: la igualdad de valor de SIEMPRE.
                         let p = self.exec(pattern, env)?;
                         if v.syn_equals(&p) {
                             return self.exec_block(body, env);
@@ -875,6 +911,59 @@ impl Interpreter {
                     })),
                 );
                 Ok(SynValue::Nothing)
+            }
+
+            NodeKind::EnumDefinition { name, variants } => {
+                // Valor de variante = map etiquetado {"__variant": "Enum.var", <campos>};
+                // tipo enum = map namespace {"__enum": "Enum", <var>: valor|ctor}. Sin
+                // tipo de runtime nuevo: construcción = property-access + call.
+                let mut namespace = IndexMap::new();
+                namespace.insert("__enum".to_string(), syn_text(name.as_str()));
+                for (variant_name, fields) in variants {
+                    let qualified = format!("{}.{}", name, variant_name);
+                    if fields.is_empty() {
+                        // Variante nullary → un map etiquetado constante.
+                        let mut m = IndexMap::new();
+                        m.insert("__variant".to_string(), syn_text(qualified.as_str()));
+                        namespace.insert(variant_name.clone(), syn_map(m));
+                    } else {
+                        // Variante con payload → constructor builtin de aridad EXACTA.
+                        let field_names = fields.clone();
+                        let count = field_names.len() as i32;
+                        let q = qualified.clone();
+                        let def_loc = loc.clone();
+                        let func: BuiltinFn = Rc::new(move |_i, args, _l| {
+                            if args.len() != field_names.len() {
+                                return Err(err_at(
+                                    format!(
+                                        "variant {} expects {} fields, got {}",
+                                        q,
+                                        field_names.len(),
+                                        args.len()
+                                    ),
+                                    &def_loc,
+                                ));
+                            }
+                            let mut m = IndexMap::new();
+                            m.insert("__variant".to_string(), syn_text(q.as_str()));
+                            for (n, val) in field_names.iter().zip(args.iter()) {
+                                m.insert(n.clone(), val.clone());
+                            }
+                            Ok(syn_map(m))
+                        });
+                        namespace.insert(
+                            variant_name.clone(),
+                            SynValue::Builtin(Rc::new(BuiltinTask {
+                                name: qualified.clone(),
+                                func,
+                                param_count: count,
+                            })),
+                        );
+                    }
+                }
+                let value = syn_map(namespace);
+                env_set(env, name, value.clone());
+                Ok(value)
             }
 
             // -- Agentes (fallback in-process; sin swarm en capa 4) --
@@ -2364,5 +2453,87 @@ mod module_tests {
         let r = run_source("use \"./x.txt\" as x\nprint(1)", &entry);
         assert!(!r.success);
         assert!(r.errors.iter().any(|e| e.contains(".syn")), "{:?}", r.errors);
+    }
+}
+
+#[cfg(test)]
+mod enum_tests {
+    use super::run_source;
+
+    const ENUM: &str = "enum Order\n    pending\n    paid(amount)\n    shipped(date, carrier)\n";
+
+    fn out(src: &str) -> Vec<String> {
+        let r = run_source(src, "<test>");
+        assert!(r.success, "el programa falló: {:?}", r.errors);
+        r.output
+    }
+
+    #[test]
+    fn construct_and_payload_access() {
+        let src = format!(
+            "{}let o be Order.shipped(\"2026-06-23\", \"DHL\")\nprint(carrier of o)\nprint(date of o)",
+            ENUM
+        );
+        assert_eq!(out(&src), vec!["DHL", "2026-06-23"]);
+    }
+
+    #[test]
+    fn nullary_value_is_map() {
+        assert_eq!(out(&format!("{}let s be Order.pending\nprint(type_of(s))", ENUM)), vec!["map"]);
+    }
+
+    #[test]
+    fn match_payloaded_variant() {
+        let src = format!(
+            "{}let o be Order.shipped(\"d\", \"DHL\")\nmatch o\n    is Order.pending\n        print(\"p\")\n    is Order.shipped\n        print(\"enviado por \" + carrier of o)\n",
+            ENUM
+        );
+        assert_eq!(out(&src), vec!["enviado por DHL"]);
+    }
+
+    #[test]
+    fn match_nullary_variant() {
+        let src = format!(
+            "{}let o be Order.pending\nmatch o\n    is Order.paid\n        print(\"paid\")\n    is Order.pending\n        print(\"pend\")\n",
+            ENUM
+        );
+        assert_eq!(out(&src), vec!["pend"]);
+    }
+
+    #[test]
+    fn match_no_arm_returns_nothing() {
+        let src = format!(
+            "{}let o be Order.paid(50)\nmatch o\n    is Order.pending\n        print(\"p\")\n",
+            ENUM
+        );
+        assert_eq!(out(&src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn equality_nullary_and_different() {
+        assert_eq!(out(&format!("{}print(text(Order.pending == Order.pending))", ENUM)), vec!["true"]);
+        assert_eq!(
+            out(&format!("{}print(text(Order.pending == Order.paid(1)))", ENUM)),
+            vec!["false"]
+        );
+    }
+
+    #[test]
+    fn wrong_arity_errors() {
+        let r = run_source(&format!("{}let o be Order.shipped(\"d\")", ENUM), "<test>");
+        assert!(!r.success);
+        assert!(r.errors.iter().any(|e| e.contains("expects 2 fields, got 1")), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn nullary_not_callable() {
+        let r = run_source(&format!("{}let o be Order.pending()", ENUM), "<test>");
+        assert!(!r.success);
+    }
+
+    #[test]
+    fn non_enum_match_regression() {
+        let src = "let x be 9\nmatch x\n    is 5\n        print(\"five\")\n    is 9\n        print(\"nine\")\n";
+        assert_eq!(out(src), vec!["nine"]);
     }
 }
