@@ -15,6 +15,7 @@ The node hierarchy:
     │   ├── BinaryOp, UnaryOp
     │   ├── PropertyAccess (name of person)
     │   ├── TaskCall (function invocation)
+    │   ├── LambdaExpression ((params) => expr)
     │   ├── PipeExpression (x |> transform)
     │   ├── ReasonExpression (LLM reasoning)
     │   ├── DecideExpression (LLM decision)
@@ -211,6 +212,17 @@ class TaskCall(Node):
     """greet("world") or process(data)"""
     name: Node = None  # can be Identifier or PropertyAccess
     arguments: List[Node] = field(default_factory=list)
+
+@dataclass
+class LambdaExpression(Node):
+    """
+    Anonymous single-expression function: (params) => expr
+
+    Evaluates to a function value (type "task"), capturing the
+    enclosing scope as its closure. The body is exactly one expression.
+    """
+    parameters: List[str] = field(default_factory=list)
+    body: Node = None
 
 @dataclass
 class GiveStatement(Node):

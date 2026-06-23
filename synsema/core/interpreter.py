@@ -663,6 +663,20 @@ class Interpreter:
         env.set(node.name, value)
         return value
 
+    def _exec_LambdaExpression(self, node: ast.LambdaExpression, env: Environment) -> SynValue:
+        # A lambda is an anonymous task whose body is one implicit `give <expr>`,
+        # closing over the current environment. The existing call path
+        # (child env → bind params → exec body → catch GiveSignal) is reused as-is.
+        task_val = SynTaskValue(
+            name="<lambda>",
+            parameters=node.parameters,
+            body=[ast.GiveStatement(location=node.location, value=node.body)],
+            closure_env=env,
+            origin=node.location,
+            required_capabilities=[],
+        )
+        return syn_task(task_val, node.location)
+
     def _exec_TaskCall(self, node: ast.TaskCall, env: Environment) -> SynValue:
         func = self._exec(node.name, env)
         args = [self._exec(a, env) for a in node.arguments]

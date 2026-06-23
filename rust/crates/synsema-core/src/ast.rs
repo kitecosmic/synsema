@@ -138,6 +138,12 @@ pub enum NodeKind {
         name: Box<Node>, // Identifier o PropertyAccess
         arguments: Vec<Node>,
     },
+    /// Función anónima de una sola expresión: `(params) => expr`.
+    /// Evalúa a un valor función (tipo "task") que captura el entorno actual.
+    LambdaExpression {
+        parameters: Vec<String>,
+        body: Box<Node>,
+    },
     GiveStatement {
         value: Option<Box<Node>>,
     },

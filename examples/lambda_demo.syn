@@ -1,0 +1,39 @@
+-- Mini-app: catálogo de una tienda procesado con lambdas inline.
+-- Antes de las lambdas, cada (x) => ... habría exigido un `task` con nombre aparte
+-- (justo la fricción que sufrimos armando el sitemap de synsema-web).
+
+let catalog be [
+    {"name": "Laptop",  "price": 1200, "stock": 3, "cat": "tech"},
+    {"name": "Mouse",   "price": 25,   "stock": 0, "cat": "tech"},
+    {"name": "Desk",    "price": 300,  "stock": 5, "cat": "home"},
+    {"name": "Chair",   "price": 150,  "stock": 8, "cat": "home"},
+    {"name": "Monitor", "price": 400,  "stock": 2, "cat": "tech"}
+]
+
+-- 1. En stock  (where + lambda predicado)
+let available be where(catalog, (p) => stock of p > 0)
+print("En stock: " + text(length(available)) + " de " + text(length(catalog)))
+
+-- 2. Precios con 10% off  (apply + lambda que arma un map nuevo)
+let discounted be apply((p) => {"name": name of p, "price": price of p * 0.9}, available)
+print("Laptop con descuento: $" + text(price of (discounted[0])))
+
+-- 3. Valor del inventario  (reduce + lambda de 2 args)
+let inventory be reduce(catalog, (acc, p) => acc + (price of p * stock of p), 0)
+print("Valor inventario: $" + text(inventory))
+
+-- 4. El más barato  (sort_by + lambda key, luego index)
+let by_price be sort_by(catalog, (p) => price of p)
+print("Mas barato: " + name of (by_price[0]))
+
+-- 5. Agrupar por categoría  (group_by + lambda key)
+let groups be group_by(catalog, (p) => cat of p)
+print("Categorias: " + text(length(keys(groups))))
+
+-- 6. ¿Hay algo premium?  (some + lambda)
+print("Algo > $1000? " + text(some(catalog, (p) => price of p > 1000)))
+
+-- 7. Currying real: una fábrica de descuentos
+let discount be (pct) => (amount) => amount - (amount * pct / 100)
+let half_off be discount(50)
+print("Mitad de $400 = $" + text(half_off(400)))

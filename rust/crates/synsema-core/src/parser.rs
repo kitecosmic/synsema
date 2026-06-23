@@ -1596,6 +1596,58 @@ impl Parser {
         Ok(node)
     }
 
+    /// En un '(', indica si su ')' de cierre va seguido inmediatamente de '=>'.
+    /// Lookahead acotado que no consume nada: sólo cuenta profundidad de
+    /// paréntesis, así la desambiguación funciona sin importar qué haya dentro.
+    /// Un '(' cuyo cierre va seguido de '=>' abre una lista de parámetros de
+    /// lambda; cualquier otra cosa (p.ej. `(1 + 2) * 3`) es una agrupación.
+    fn is_lambda_ahead(&self) -> bool {
+        let mut depth: i32 = 0;
+        let mut i = self.pos;
+        let n = self.tokens.len();
+        while i < n {
+            match self.tokens[i].ty {
+                TokenType::LParen => depth += 1,
+                TokenType::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let nxt = i + 1;
+                        return nxt < n && self.tokens[nxt].ty == TokenType::FatArrow;
+                    }
+                }
+                TokenType::Eof => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// `(params) => expr` — función anónima de una sola expresión.
+    /// Params: cero o más identificadores (paréntesis siempre), igual que la
+    /// lista de params de un task. El cuerpo es una única expresión completa.
+    fn parse_lambda(&mut self) -> Result<Node, ParseError> {
+        let loc = self.location();
+        self.expect(TokenType::LParen, "")?;
+        let mut params = Vec::new();
+        if !self.check(TokenType::RParen) {
+            params.push(self.expect_name("lambda parameter")?.as_str().to_string());
+            while self.match_tok(TokenType::Comma).is_some() {
+                params.push(self.expect_name("lambda parameter")?.as_str().to_string());
+            }
+        }
+        self.expect(TokenType::RParen, "")?;
+        self.expect(TokenType::FatArrow, "")?;
+        let body = self.parse_expression()?;
+        Ok(Node::new(
+            loc,
+            NodeKind::LambdaExpression {
+                parameters: params,
+                body: Box::new(body),
+            },
+        ))
+    }
+
     fn parse_primary(&mut self) -> Result<Node, ParseError> {
         let loc = self.location();
         let tok = self.current().clone();
@@ -1662,10 +1714,15 @@ impl Parser {
                 Ok(Node::new(loc, NodeKind::MapLiteral { pairs }))
             }
             TokenType::LParen => {
-                self.advance();
-                let expr = self.parse_expression()?;
-                self.expect(TokenType::RParen, "")?;
-                Ok(expr)
+                // Lambda `(params) => expr` o expresión agrupada `(expr)`.
+                if self.is_lambda_ahead() {
+                    self.parse_lambda()
+                } else {
+                    self.advance();
+                    let expr = self.parse_expression()?;
+                    self.expect(TokenType::RParen, "")?;
+                    Ok(expr)
+                }
             }
             TokenType::Reason => self.parse_reason_expr(),
             TokenType::Decide => self.parse_decide_expr(),
@@ -1946,5 +2003,105 @@ mod tests {
             "got: {}",
             err
         );
+    }
+
+    // -- Lambdas: (params) => expr --
+
+    fn lambda_value(src: &str) -> Node {
+        let prog = parse_ok(src);
+        match &prog.statements[0].kind {
+            NodeKind::LetBinding { value, .. } => (**value).clone(),
+            other => panic!("esperaba LetBinding, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lambda_single_param_parses() {
+        let lam = lambda_value("let f be (x) => x + 1");
+        match &lam.kind {
+            NodeKind::LambdaExpression { parameters, body } => {
+                assert_eq!(parameters, &["x"]);
+                assert!(matches!(body.kind, NodeKind::BinaryOp { .. }));
+            }
+            other => panic!("esperaba LambdaExpression, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lambda_zero_params_parses() {
+        let lam = lambda_value("let f be () => 42");
+        match &lam.kind {
+            NodeKind::LambdaExpression { parameters, .. } => assert!(parameters.is_empty()),
+            other => panic!("esperaba LambdaExpression, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lambda_multi_params_parses() {
+        let lam = lambda_value("let f be (a, b, c) => a");
+        match &lam.kind {
+            NodeKind::LambdaExpression { parameters, .. } => {
+                assert_eq!(parameters, &["a", "b", "c"]);
+            }
+            other => panic!("esperaba LambdaExpression, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn lambda_nested_curried_parses() {
+        // (m) => (n) => m * n : el cuerpo es a su vez una lambda.
+        let lam = lambda_value("let curry be (m) => (n) => m * n");
+        let NodeKind::LambdaExpression { parameters, body } = &lam.kind else {
+            panic!("esperaba LambdaExpression externa");
+        };
+        assert_eq!(parameters, &["m"]);
+        assert!(
+            matches!(body.kind, NodeKind::LambdaExpression { .. }),
+            "el cuerpo de la lambda externa debería ser otra lambda"
+        );
+    }
+
+    #[test]
+    fn grouped_expr_not_lambda_regression() {
+        // (1 + 2) * 3 debe seguir siendo una expresión agrupada (BinaryOp *).
+        let val = lambda_value("let x be (1 + 2) * 3");
+        match &val.kind {
+            NodeKind::BinaryOp { operator, .. } => assert_eq!(operator, "*"),
+            other => panic!("esperaba BinaryOp *, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn nested_parens_call_not_lambda_regression() {
+        // f((x)) no involucra ninguna lambda: el argumento es x agrupado.
+        let prog = parse_ok("let y be identity((x))");
+        let NodeKind::LetBinding { value, .. } = &prog.statements[0].kind else {
+            panic!("esperaba LetBinding");
+        };
+        let NodeKind::TaskCall { arguments, .. } = &value.kind else {
+            panic!("esperaba TaskCall");
+        };
+        assert_eq!(arguments[0].as_identifier(), Some("x"));
+    }
+
+    #[test]
+    fn list_and_map_literals_unaffected() {
+        // Los literales de lista/map siguen parseando (no hay '(' que confunda).
+        let l = lambda_value("let xs be [1, 2, 3]");
+        assert!(matches!(l.kind, NodeKind::ListLiteral { .. }));
+        let m = lambda_value("let mp be {\"a\": 1}");
+        assert!(matches!(m.kind, NodeKind::MapLiteral { .. }));
+    }
+
+    #[test]
+    fn lambda_non_identifier_param_fails() {
+        // (1 + 2) => x : los params deben ser identificadores.
+        let err = parse_source("let f be (1 + 2) => x", "<test>").unwrap_err();
+        assert!(err.to_string().contains("lambda parameter"), "got: {}", err);
+    }
+
+    #[test]
+    fn lambda_missing_body_fails() {
+        assert!(parse_source("let f be () =>", "<test>").is_err());
     }
 }

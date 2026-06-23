@@ -713,6 +713,24 @@ impl Interpreter {
                 }
                 self.call_value(func, args, loc)
             }
+            NodeKind::LambdaExpression { parameters, body } => {
+                // Una lambda es un task anónimo cuyo cuerpo es un `give <expr>`
+                // implícito, que cierra sobre el entorno actual. Se reusa el
+                // camino de llamada existente (entorno hijo → bind params →
+                // exec body → catch Give). No se hace env_set: es anónima.
+                let task = Rc::new(SynTaskValue {
+                    name: "<lambda>".to_string(),
+                    parameters: parameters.clone(),
+                    body: vec![Node::new(
+                        loc.clone(),
+                        NodeKind::GiveStatement { value: Some(body.clone()) },
+                    )],
+                    closure_env: env.clone(),
+                    origin: Some(loc.clone()),
+                    required_capabilities: Vec::new(),
+                });
+                Ok(SynValue::Task(task))
+            }
             NodeKind::GiveStatement { value } => {
                 let v = match value {
                     Some(n) => self.exec(n, env)?,
@@ -2061,5 +2079,79 @@ mod drop_tests {
             "FUGA: el scope del request sigue vivo — el ciclo Rc no se rompió (el reuse del \
              intérprete lo filtraría por request)"
         );
+    }
+}
+
+#[cfg(test)]
+mod lambda_tests {
+    use super::run_source;
+
+    fn out(src: &str) -> Vec<String> {
+        let r = run_source(src, "<test>");
+        assert!(r.success, "el programa falló: {:?}", r.errors);
+        r.output
+    }
+
+    #[test]
+    fn lambda_is_task_type() {
+        assert_eq!(out("print(type_of((x) => x))"), vec!["task"]);
+    }
+
+    #[test]
+    fn lambda_evaluates_and_calls() {
+        assert_eq!(out("let double be (x) => x * 2\nprint(text(double(21)))"), vec!["42"]);
+    }
+
+    #[test]
+    fn lambda_closes_over_outer_let() {
+        let src = "let y be 10\nlet f be (x) => x + y\nprint(text(f(5)))";
+        assert_eq!(out(src), vec!["15"]);
+    }
+
+    #[test]
+    fn lambda_zero_arg_called() {
+        assert_eq!(out("let f be () => 7\nprint(text(f()))"), vec!["7"]);
+    }
+
+    #[test]
+    fn lambda_curried() {
+        let src = "let curry be (m) => (n) => m * n\nlet t3 be curry(3)\nprint(text(t3(4)))";
+        assert_eq!(out(src), vec!["12"]);
+    }
+
+    #[test]
+    fn lambda_missing_arg_binds_nothing() {
+        assert_eq!(out("let f be (a, b) => b\nprint(text(f(5)))"), vec!["nothing"]);
+    }
+
+    #[test]
+    fn lambda_extra_args_ignored() {
+        assert_eq!(out("let f be (x) => x\nprint(text(f(1, 2, 3)))"), vec!["1"]);
+    }
+
+    #[test]
+    fn apply_with_lambda() {
+        assert_eq!(out("print(apply((x) => x * 2, [1, 2, 3]))"), vec!["[2, 4, 6]"]);
+    }
+
+    #[test]
+    fn reduce_with_lambda() {
+        assert_eq!(out("print(text(reduce([1, 2, 3], (a, b) => a + b, 0)))"), vec!["6"]);
+    }
+
+    #[test]
+    fn where_with_lambda_predicate() {
+        assert_eq!(out("print(where([1, 2, 3, 4], (x) => x > 2))"), vec!["[3, 4]"]);
+    }
+
+    #[test]
+    fn sort_by_with_lambda_key() {
+        assert_eq!(out("print(sort_by([3, 1, 2], (x) => x))"), vec!["[1, 2, 3]"]);
+    }
+
+    #[test]
+    fn call_non_function_fails() {
+        let r = run_source("let x be 5\nprint(x(1))", "<test>");
+        assert!(!r.success, "llamar a un no-función debería fallar");
     }
 }

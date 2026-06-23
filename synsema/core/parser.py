@@ -975,6 +975,49 @@ class Parser:
 
         return node
 
+    def _is_lambda_ahead(self) -> bool:
+        """At a '(', report whether its matching ')' is immediately followed by '=>'.
+
+        Bounded lookahead that consumes nothing — only paren depth is tracked,
+        so the disambiguation works regardless of what sits inside the parens.
+        A '(' whose match is followed by '=>' begins a lambda param list;
+        anything else (e.g. (1 + 2) * 3) is an ordinary grouped expression.
+        """
+        depth = 0
+        i = self.pos
+        n = len(self.tokens)
+        while i < n:
+            t = self.tokens[i].type
+            if t == TokenType.LPAREN:
+                depth += 1
+            elif t == TokenType.RPAREN:
+                depth -= 1
+                if depth == 0:
+                    nxt = i + 1
+                    return nxt < n and self.tokens[nxt].type == TokenType.FAT_ARROW
+            elif t == TokenType.EOF:
+                break
+            i += 1
+        return False
+
+    def _parse_lambda(self) -> ast.LambdaExpression:
+        """(params) => expr — anonymous single-expression function.
+
+        Params are zero or more identifiers (parens always required), mirroring
+        a task's param list. The body is a single full-precedence expression.
+        """
+        loc = self._location()
+        self._expect(TokenType.LPAREN)
+        params = []
+        if not self._check(TokenType.RPAREN):
+            params.append(self._expect_name("lambda parameter").value)
+            while self._match(TokenType.COMMA):
+                params.append(self._expect_name("lambda parameter").value)
+        self._expect(TokenType.RPAREN)
+        self._expect(TokenType.FAT_ARROW)
+        body = self._parse_expression()
+        return ast.LambdaExpression(location=loc, parameters=params, body=body)
+
     def _parse_primary(self) -> ast.Node:
         """Parse primary expressions (literals, identifiers, grouped, etc.)."""
         loc = self._location()
@@ -1036,8 +1079,10 @@ class Parser:
             self._expect(TokenType.RBRACE)
             return ast.MapLiteral(location=loc, pairs=pairs)
 
-        # Grouped expression: (expr)
+        # Lambda — (params) => expr — or grouped expression — (expr)
         if tok.type == TokenType.LPAREN:
+            if self._is_lambda_ahead():
+                return self._parse_lambda()
             self._advance()
             expr = self._parse_expression()
             self._expect(TokenType.RPAREN)
