@@ -870,8 +870,9 @@ impl Interpreter {
                 let name = match &declaration.kind {
                     NodeKind::TaskDefinition { name, .. }
                     | NodeKind::TypeDefinition { name, .. }
-                    | NodeKind::LetBinding { name, .. } => name.clone(),
-                    _ => return Err(err_at("export must wrap a task, type, or let", loc)),
+                    | NodeKind::LetBinding { name, .. }
+                    | NodeKind::EnumDefinition { name, .. } => name.clone(),
+                    _ => return Err(err_at("export must wrap a task, type, let, or enum", loc)),
                 };
                 // Registra el nombre en la superficie pública del módulo actual. El
                 // frame base (entrypoint) nunca se cosecha → allí es un no-op.
@@ -2457,6 +2458,32 @@ mod module_tests {
         let r = run_source("use \"./x.txt\" as x\nprint(1)", &entry);
         assert!(!r.success);
         assert!(r.errors.iter().any(|e| e.contains(".syn")), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn export_enum_construct_and_match_cross_module() {
+        let entry = setup(
+            "exportenum",
+            &[(
+                "ordstatus.syn",
+                "export enum OrderStatus\n    pending\n    paid(method)\n    shipped(carrier, tracking)\nenum Hidden\n    secret\n",
+            )],
+        );
+        // construir + leer payload por `of` desde el importador
+        let r = run_source(
+            "use \"./ordstatus.syn\" as orders\nlet s be orders.OrderStatus.shipped(\"DHL\", \"ABC\")\nprint(carrier of s)",
+            &entry,
+        );
+        assert!(r.success, "{:?}", r.errors);
+        assert_eq!(r.output, vec!["DHL"]);
+        // match por variante cross-módulo + otherwise
+        let m = "use \"./ordstatus.syn\" as orders\nlet s be orders.OrderStatus.shipped(\"DHL\", \"ABC\")\nmatch s\n    is orders.OrderStatus.pending\n        print(\"p\")\n    is orders.OrderStatus.shipped\n        print(\"enviado por \" + carrier of s)\n    otherwise\n        print(\"otro\")\n";
+        let r2 = run_source(m, &entry);
+        assert!(r2.success, "{:?}", r2.errors);
+        assert_eq!(r2.output, vec!["enviado por DHL"]);
+        // un enum NO exportado no es visible
+        let r3 = run_source("use \"./ordstatus.syn\" as orders\nprint(orders.Hidden)", &entry);
+        assert!(!r3.success, "Hidden no debería ser visible");
     }
 }
 

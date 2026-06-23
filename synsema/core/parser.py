@@ -175,11 +175,13 @@ class Parser:
             return self._parse_serve()
         if self._check_word("expect") and self._peek_word(1, "body"):
             return self._parse_expect()
-        # Local modules: `use "..." as name` and `export <task|type|let> ...`.
+        # Local modules: `use "..." as name` and `export <task|type|let|enum> ...`.
         if self._check_word("use") and self._peek(1).type == TokenType.TEXT:
             return self._parse_use()
-        if self._check_word("export") and self._peek(1).type in (
-                TokenType.TASK, TokenType.TYPE, TokenType.LET):
+        # `enum` is a soft keyword (Identifier with value "enum"), not a token type.
+        if self._check_word("export") and (
+                self._peek(1).type in (TokenType.TASK, TokenType.TYPE, TokenType.LET)
+                or self._peek_word(1, "enum")):
             return self._parse_export()
         # Enums (sum types): `enum Name` leading a statement, followed by a NAME.
         if self._check_word("enum") and self._peek(1).type == TokenType.IDENTIFIER:
@@ -381,7 +383,7 @@ class Parser:
         return ast.UseImport(location=loc, path=path_tok.value, alias=alias_tok.value)
 
     def _parse_export(self) -> ast.ExportDeclaration:
-        """export <task|type|let> ... — run the definition and mark it public."""
+        """export <task|type|let|enum> ... — run the definition and mark it public."""
         loc = self._location()
         self._advance()  # consume soft keyword 'export'
         tt = self._current().type
@@ -391,9 +393,11 @@ class Parser:
             decl = self._parse_type_definition()
         elif tt == TokenType.LET:
             decl = self._parse_let()
+        elif self._check_word("enum"):  # soft keyword, not a token type
+            decl = self._parse_enum()
         else:
             raise ParseError(
-                "export must be followed by task, type, or let",
+                "export must be followed by task, type, let, or enum",
                 self._location(),
             )
         return ast.ExportDeclaration(location=loc, declaration=decl)

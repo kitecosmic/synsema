@@ -85,6 +85,17 @@ FIXTURES = {
         'print("loaded")\n'
         "export let answer be 42\n"
     ),
+    # a module that exports an enum (sum type) + a task; Hidden is NOT exported
+    "ordstatus.syn": (
+        "export enum OrderStatus\n"
+        "    pending\n"
+        "    paid(method)\n"
+        "    shipped(carrier, tracking)\n"
+        "enum Hidden\n"
+        "    secret\n"
+        "export task new_order(x)\n"
+        "    give x\n"
+    ),
 }
 
 for _name, _content in FIXTURES.items():
@@ -263,8 +274,75 @@ def test_module_not_found_errors():
 
 
 # =========================================================
+# export enum — modules can expose a sum type
+# =========================================================
+
+def test_export_enum_construct_and_payload():
+    src = (
+        'use "./ordstatus.syn" as orders\n'
+        'let s be orders.OrderStatus.shipped("DHL", "ABC123")\n'
+        "print(carrier of s)\n"
+        "print(tracking of s)\n"
+    )
+    assert_output(src, ["DHL", "ABC123"])
+
+
+def test_export_enum_nullary_value():
+    src = 'use "./ordstatus.syn" as orders\nprint(type_of(orders.OrderStatus.pending))'
+    assert_output(src, ["map"])
+
+
+def test_export_enum_cross_module_match():
+    src = (
+        'use "./ordstatus.syn" as orders\n'
+        'let s be orders.OrderStatus.shipped("DHL", "ABC123")\n'
+        "match s\n"
+        "    is orders.OrderStatus.pending\n"
+        '        print("pendiente")\n'
+        "    is orders.OrderStatus.shipped\n"
+        '        print("enviado por " + carrier of s)\n'
+        "    otherwise\n"
+        '        print("otro")\n'
+    )
+    assert_output(src, ["enviado por DHL"])
+
+
+def test_export_enum_otherwise_for_unhandled_variant():
+    src = (
+        'use "./ordstatus.syn" as orders\n'
+        'let s be orders.OrderStatus.paid("card")\n'
+        "match s\n"
+        "    is orders.OrderStatus.shipped\n"
+        '        print("enviado")\n'
+        "    otherwise\n"
+        '        print("otro")\n'
+    )
+    assert_output(src, ["otro"])
+
+
+def test_export_enum_equality_cross_module():
+    src = (
+        'use "./ordstatus.syn" as orders\n'
+        'print(text(orders.OrderStatus.shipped("DHL", "X") == orders.OrderStatus.shipped("DHL", "X")))\n'
+    )
+    assert_output(src, ["true"])
+
+
+def test_non_exported_enum_not_visible():
+    assert_fails('use "./ordstatus.syn" as orders\nprint(orders.Hidden)')
+
+
+def test_export_task_alongside_enum_still_works():
+    assert_output('use "./ordstatus.syn" as orders\nprint(text(orders.new_order(42)))', ["42"])
+
+
+# =========================================================
 # Soft-keyword regression
 # =========================================================
 
 def test_use_and_export_still_identifiers():
     assert_output("let use be 1\nlet export be 2\nprint(text(use + export))", ["3"])
+
+
+def test_enum_still_identifier():
+    assert_output("let enum be 1\nprint(text(enum))", ["1"])

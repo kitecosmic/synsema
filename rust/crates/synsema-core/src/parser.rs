@@ -310,8 +310,10 @@ impl Parser {
         if self.check_word("use") && self.peek(1).ty == TokenType::Text {
             return Ok(Some(self.parse_use()?));
         }
+        // `enum` es soft keyword (Identifier con value "enum"), no un token type.
         if self.check_word("export")
-            && matches!(self.peek(1).ty, TokenType::Task | TokenType::Type | TokenType::Let)
+            && (matches!(self.peek(1).ty, TokenType::Task | TokenType::Type | TokenType::Let)
+                || self.peek_word(1, "enum"))
         {
             return Ok(Some(self.parse_export()?));
         }
@@ -546,9 +548,11 @@ impl Parser {
             TokenType::Task => self.parse_task_definition()?,
             TokenType::Type => self.parse_type_definition()?,
             TokenType::Let => self.parse_let()?,
+            // `enum` es soft keyword (Identifier con value "enum"), no un token type.
+            _ if self.check_word("enum") => self.parse_enum()?,
             _ => {
                 return Err(ParseError::new(
-                    "export must be followed by task, type, or let",
+                    "export must be followed by task, type, let, or enum",
                     self.location(),
                 ))
             }
@@ -2369,6 +2373,17 @@ mod tests {
             panic!("esperaba ExportDeclaration");
         };
         assert!(matches!(declaration.kind, NodeKind::TypeDefinition { .. }));
+    }
+
+    #[test]
+    fn export_enum_parses() {
+        let prog = parse_ok("export enum Order\n    pending\n    paid(amount)\n");
+        match &prog.statements[0].kind {
+            NodeKind::ExportDeclaration { declaration } => {
+                assert!(matches!(declaration.kind, NodeKind::EnumDefinition { .. }));
+            }
+            other => panic!("esperaba ExportDeclaration envolviendo EnumDefinition, got {:?}", other),
+        }
     }
 
     #[test]
