@@ -357,10 +357,17 @@ class Parser:
             arms.append(ast.MatchArm(location=arm_loc, pattern=pattern, body=arm_body))
             self._skip_newlines()
 
+        # Optional `otherwise` default arm (last, after all `is` arms) — mirrors
+        # how `when` does its otherwise.
+        otherwise = None
+        if self._match(TokenType.OTHERWISE):
+            otherwise = self._parse_block()
+            self._skip_newlines()
+
         if self._check(TokenType.DEDENT):
             self._advance()
 
-        return ast.MatchStatement(location=loc, value=value, arms=arms)
+        return ast.MatchStatement(location=loc, value=value, arms=arms, otherwise=otherwise)
 
     # -- local modules (use / export) --
 

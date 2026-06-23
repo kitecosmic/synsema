@@ -15,6 +15,7 @@ from . import ast_nodes as ast
 from .types import (
     SynValue, SynTaskValue, BuiltinTask,
     syn_number, syn_text, syn_bool, syn_nothing, syn_list, syn_map, syn_task,
+    syn_equals,
     SynNumber, SynText, SynBool, SynList, SynMap, SynNothing, SynTask,
 )
 from .tokens import SourceLocation
@@ -245,7 +246,7 @@ class Interpreter:
         collection, item = args[0], args[1]
         if isinstance(collection.type, SynList):
             for elem in collection.raw:
-                if elem.raw == item.raw:
+                if syn_equals(elem, item):
                     return syn_bool(True)
             return syn_bool(False)
         if isinstance(collection.type, SynText):
@@ -517,9 +518,9 @@ class Interpreter:
 
         # Comparison
         if op == "==":
-            return syn_bool(left.raw == right.raw, node.location)
+            return syn_bool(syn_equals(left, right), node.location)
         if op == "!=":
-            return syn_bool(left.raw != right.raw, node.location)
+            return syn_bool(not syn_equals(left, right), node.location)
         if op in ("<", ">", "<=", ">="):
             if isinstance(left.type, SynNumber) and isinstance(right.type, SynNumber):
                 if op == "<": return syn_bool(left.raw < right.raw, node.location)
@@ -652,10 +653,13 @@ class Interpreter:
                         and value.raw["__variant"].raw == variant_id):
                     return self._exec_block(arm.body, env)
                 continue
-            # Any other pattern: the unchanged value-equality path.
+            # Any other pattern: structural value-equality.
             pattern = self._exec(arm.pattern, env)
-            if value.raw == pattern.raw:
+            if syn_equals(value, pattern):
                 return self._exec_block(arm.body, env)
+        # No `is` arm matched: run the `otherwise` default block if present.
+        if node.otherwise is not None:
+            return self._exec_block(node.otherwise, env)
         return syn_nothing()
 
     def _exec_StopStatement(self, node: ast.StopStatement, env: Environment) -> SynValue:

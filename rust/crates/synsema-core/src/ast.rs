@@ -117,6 +117,8 @@ pub enum NodeKind {
     MatchStatement {
         value: Box<Node>,
         arms: Vec<Node>, // cada uno es un MatchArm
+        /// Bloque `otherwise` por defecto (corre si ningún arm `is` matcheó).
+        otherwise: Option<Vec<Node>>,
     },
     MatchArm {
         pattern: Box<Node>,

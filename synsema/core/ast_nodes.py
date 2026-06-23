@@ -178,9 +178,10 @@ class WhileStatement(Node):
 
 @dataclass
 class MatchStatement(Node):
-    """match value\n    is pattern then action"""
+    """match value\n    is pattern then action\n    otherwise default"""
     value: Node = None
     arms: List['MatchArm'] = field(default_factory=list)
+    otherwise: Optional[List[Node]] = None  # default block, run if no arm matched
 
 @dataclass
 class MatchArm(Node):

@@ -757,7 +757,7 @@ impl Interpreter {
                 }
                 Ok(result)
             }
-            NodeKind::MatchStatement { value, arms } => {
+            NodeKind::MatchStatement { value, arms, otherwise } => {
                 let v = self.exec(value, env)?;
                 for arm in arms {
                     if let NodeKind::MatchArm { pattern, body } = &arm.kind {
@@ -783,6 +783,10 @@ impl Interpreter {
                             return self.exec_block(body, env);
                         }
                     }
+                }
+                // Ningún arm `is` matcheó: corré el bloque `otherwise` si existe.
+                if let Some(body) = otherwise {
+                    return self.exec_block(body, env);
                 }
                 Ok(SynValue::Nothing)
             }
@@ -2535,5 +2539,71 @@ mod enum_tests {
     fn non_enum_match_regression() {
         let src = "let x be 9\nmatch x\n    is 5\n        print(\"five\")\n    is 9\n        print(\"nine\")\n";
         assert_eq!(out(src), vec!["nine"]);
+    }
+}
+
+#[cfg(test)]
+mod match_fixes_tests {
+    use super::run_source;
+
+    fn out(src: &str) -> Vec<String> {
+        let r = run_source(src, "<test>");
+        assert!(r.success, "el programa falló: {:?}", r.errors);
+        r.output
+    }
+
+    const ENUM: &str = "enum Order\n    pending\n    paid(amount)\n    shipped(date, carrier)\n";
+
+    // -- Parte A: otherwise --
+
+    #[test]
+    fn otherwise_runs_when_no_arm_matches() {
+        let src = "let x be 9\nmatch x\n    is 5\n        print(\"five\")\n    otherwise\n        print(\"other\")\n";
+        assert_eq!(out(src), vec!["other"]);
+    }
+
+    #[test]
+    fn otherwise_not_run_when_arm_matches() {
+        let src = "let x be 5\nmatch x\n    is 5\n        print(\"five\")\n    otherwise\n        print(\"other\")\n";
+        assert_eq!(out(src), vec!["five"]);
+    }
+
+    #[test]
+    fn no_otherwise_no_match_is_nothing() {
+        let src = "let x be 9\nmatch x\n    is 5\n        print(\"five\")\n";
+        assert_eq!(out(src), Vec::<String>::new());
+    }
+
+    #[test]
+    fn enum_match_otherwise_for_unhandled_variant() {
+        let src = format!(
+            "{}let o be Order.paid(50)\nmatch o\n    is Order.pending\n        print(\"p\")\n    is Order.shipped\n        print(\"s\")\n    otherwise\n        print(\"otro\")\n",
+            ENUM
+        );
+        assert_eq!(out(&src), vec!["otro"]);
+    }
+
+    #[test]
+    fn enum_match_otherwise_not_run_for_handled_variant() {
+        let src = format!(
+            "{}let o be Order.shipped(\"d\", \"DHL\")\nmatch o\n    is Order.shipped\n        print(\"enviado por \" + carrier of o)\n    otherwise\n        print(\"otro\")\n",
+            ENUM
+        );
+        assert_eq!(out(&src), vec!["enviado por DHL"]);
+    }
+
+    // -- Parte B: la igualdad estructural de Rust ya es correcta (regresión) --
+
+    #[test]
+    fn structural_map_equality() {
+        assert_eq!(out("print(text({\"x\": 1} == {\"x\": 1}))"), vec!["true"]);
+        assert_eq!(out("print(text([1, 2] == [1, 2]))"), vec!["true"]);
+        assert_eq!(out("print(text({\"x\": 1} == {\"x\": 2}))"), vec!["false"]);
+    }
+
+    #[test]
+    fn payloaded_enum_equality() {
+        let src = format!("{}print(text(Order.shipped(\"a\",\"b\") == Order.shipped(\"a\",\"b\")))", ENUM);
+        assert_eq!(out(&src), vec!["true"]);
     }
 }

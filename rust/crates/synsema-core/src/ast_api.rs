@@ -53,9 +53,12 @@ fn children(n: &Node) -> Vec<&Node> {
             v.extend(body.iter());
             v
         }
-        MatchStatement { value, arms } => {
+        MatchStatement { value, arms, otherwise } => {
             let mut v = vec![value.as_ref()];
             v.extend(arms.iter());
+            if let Some(o) = otherwise {
+                v.extend(o.iter());
+            }
             v
         }
         MatchArm { pattern, body } => {
@@ -487,9 +490,12 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
             v.extend(body.iter_mut());
             v
         }
-        MatchStatement { value, arms } => {
+        MatchStatement { value, arms, otherwise } => {
             let mut v = vec![value.as_mut()];
             v.extend(arms.iter_mut());
+            if let Some(o) = otherwise {
+                v.extend(o.iter_mut());
+            }
             v
         }
         MatchArm { pattern, body } => {

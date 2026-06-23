@@ -118,6 +118,41 @@ def syn_map(pairs: dict, origin: SourceLocation = None) -> SynValue:
     return SynValue(raw=pairs, type=SynMap(), origin=origin)
 
 
+def syn_equals(a: SynValue, b: SynValue) -> bool:
+    """Structural value equality — the language-level `==`/`!=`, `match`, and
+    `contains` comparison.
+
+    Mirrors the Rust reference `SynValue::syn_equals` (types.rs:149-204):
+    recurses on `.raw`, ignoring `origin`/`metadata`, so two separately-built
+    equal composites compare equal — unlike the dataclass `SynValue.__eq__`,
+    which is origin-sensitive and is intentionally NOT used here.
+
+    Note on parity: Python's value model has no distinct Secret/Server type
+    (server values are a `SynMap` with metadata; there is no secret type in the
+    oracle), so the Rust Secret/Server arms have no Python counterpart — server
+    values fall through the Map path, as they always have.
+    """
+    ta, tb = a.type, b.type
+    # Number/Number, Bool/Bool, and Number/Bool (Python's `True == 1`, bool is an
+    # int subclass) — all faithfully captured by raw `==` on the scalar payloads.
+    if isinstance(ta, (SynNumber, SynBool)) and isinstance(tb, (SynNumber, SynBool)):
+        return a.raw == b.raw
+    if isinstance(ta, SynText) and isinstance(tb, SynText):
+        return a.raw == b.raw
+    if isinstance(ta, SynNothing) and isinstance(tb, SynNothing):
+        return True
+    if isinstance(ta, SynList) and isinstance(tb, SynList):
+        return len(a.raw) == len(b.raw) and all(
+            syn_equals(x, y) for x, y in zip(a.raw, b.raw)
+        )
+    if isinstance(ta, SynMap) and isinstance(tb, SynMap):
+        if len(a.raw) != len(b.raw):
+            return False
+        return all(k in b.raw and syn_equals(v, b.raw[k]) for k, v in a.raw.items())
+    # everything else (incl. mismatched types, tasks) → false (mirrors Rust `_`)
+    return False
+
+
 @dataclass
 class SynTaskValue:
     """A callable task stored as a value."""

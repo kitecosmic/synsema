@@ -501,6 +501,13 @@ impl Parser {
             self.skip_newlines();
         }
 
+        // `otherwise` opcional (último, tras los arms `is`) — igual que en `when`.
+        let mut otherwise = None;
+        if self.match_tok(TokenType::Otherwise).is_some() {
+            otherwise = Some(self.parse_block()?);
+            self.skip_newlines();
+        }
+
         if self.check(TokenType::Dedent) {
             self.advance();
         }
@@ -510,6 +517,7 @@ impl Parser {
             NodeKind::MatchStatement {
                 value: Box::new(value),
                 arms,
+                otherwise,
             },
         ))
     }
@@ -2396,5 +2404,29 @@ mod tests {
         // `let enum be 1` sigue siendo un binding normal.
         let p = parse_ok("let enum be 1");
         assert!(matches!(p.statements[0].kind, NodeKind::LetBinding { .. }));
+    }
+
+    // -- match … otherwise --
+
+    #[test]
+    fn match_with_otherwise_parses() {
+        let p = parse_ok("match x\n    is 5\n        print(\"a\")\n    otherwise\n        print(\"b\")\n");
+        match &p.statements[0].kind {
+            NodeKind::MatchStatement { arms, otherwise, .. } => {
+                assert_eq!(arms.len(), 1);
+                let body = otherwise.as_ref().expect("otherwise debería existir");
+                assert_eq!(body.len(), 1);
+            }
+            other => panic!("esperaba MatchStatement, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn match_without_otherwise_parses_none() {
+        let p = parse_ok("match x\n    is 5\n        print(\"a\")\n");
+        match &p.statements[0].kind {
+            NodeKind::MatchStatement { otherwise, .. } => assert!(otherwise.is_none()),
+            other => panic!("esperaba MatchStatement, got {:?}", other),
+        }
     }
 }
