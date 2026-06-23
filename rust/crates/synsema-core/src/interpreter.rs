@@ -2634,3 +2634,128 @@ mod match_fixes_tests {
         assert_eq!(out(&src), vec!["true"]);
     }
 }
+
+#[cfg(test)]
+mod semantic_invariants {
+    //! Red de seguridad que reemplaza al oráculo diferencial de Python para la
+    //! semántica más riesgosa: igualdad ESTRUCTURAL (donde estuvo el bug real),
+    //! orden, coerción, `contains` y la igualdad del `match`. Corre programas
+    //! `.syn` reales por run_source. Rust es ahora la fuente de verdad.
+    use super::run_source;
+
+    fn line(src: &str) -> String {
+        let r = run_source(src, "<inv>");
+        assert!(r.success, "programa falló: {:?} | src={}", r.errors, src);
+        assert_eq!(r.output.len(), 1, "esperaba 1 línea, got {:?}", r.output);
+        r.output.into_iter().next().unwrap()
+    }
+    fn b(expr: &str) -> String {
+        line(&format!("print(text({}))", expr))
+    }
+    fn t(expr: &str) {
+        assert_eq!(b(expr), "true", "esperaba true: {}", expr);
+    }
+    fn f(expr: &str) {
+        assert_eq!(b(expr), "false", "esperaba false: {}", expr);
+    }
+
+    // -- Igualdad estructural de maps (el bug que encontramos: separately-built) --
+    #[test]
+    fn eq_maps_structural() {
+        t(r#"{"x": 1} == {"x": 1}"#);
+        t(r#"{"a": 1, "b": 2} == {"a": 1, "b": 2}"#);
+        f(r#"{"x": 1} == {"x": 2}"#);
+        f(r#"{"x": 1} == {"y": 1}"#);
+        f(r#"{"x": 1} == {"x": 1, "y": 2}"#); // distinto tamaño
+        t(r#"{} == {}"#);
+    }
+
+    #[test]
+    fn eq_nested_composites() {
+        t(r#"{"a": [1, 2], "b": {"c": 3}} == {"a": [1, 2], "b": {"c": 3}}"#);
+        f(r#"{"a": [1, 2]} == {"a": [1, 3]}"#);
+    }
+
+    #[test]
+    fn eq_lists_structural_and_ordered() {
+        t("[1, 2, 3] == [1, 2, 3]");
+        f("[1, 2, 3] == [1, 2]");
+        f("[1, 2] == [2, 1]"); // el orden importa
+        t("[] == []");
+    }
+
+    #[test]
+    fn eq_reflexive_and_separately_built() {
+        assert_eq!(line("let m be {\"x\": 1}\nprint(text(m == m))"), "true");
+        assert_eq!(
+            line("let a be [1, {\"k\": 2}]\nlet z be [1, {\"k\": 2}]\nprint(text(a == z))"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn neq_is_negation_of_eq() {
+        f(r#"{"x": 1} != {"x": 1}"#);
+        t(r#"{"x": 1} != {"x": 2}"#);
+        f("5 != 5");
+    }
+
+    // -- Escalares + coerción (bool/number = Python `True == 1`) --
+    #[test]
+    fn eq_scalars_and_coercion() {
+        t("5 == 5");
+        t("\"a\" == \"a\"");
+        t("nothing == nothing");
+        t("true == true");
+        t("true == 1");
+        t("false == 0");
+        f("5 == \"5\""); // tipos distintos
+        f("true == 2");
+        f("\"a\" == \"b\"");
+    }
+
+    // -- Orden --
+    #[test]
+    fn ordering_numbers() {
+        t("1 < 2");
+        f("2 < 1");
+        t("2 <= 2");
+        t("3 > 2");
+        t("2 >= 2");
+        f("2 > 2");
+    }
+
+    #[test]
+    fn ordering_consistent_with_eq() {
+        t("(1 < 2) == (2 > 1)");
+        // `not` liga más flojo que `==` en Synsema (not a == b == not (a == b)),
+        // por eso se testea aislado en vez de combinarlo con `==`.
+        t("not (2 > 2)");
+        f("not (2 <= 2)");
+    }
+
+    // -- contains usa igualdad estructural --
+    #[test]
+    fn contains_structural() {
+        t(r#"contains([{"x": 1}, {"y": 2}], {"x": 1})"#);
+        f(r#"contains([{"x": 1}], {"x": 2})"#);
+        t("contains([1, 2, 3], 2)");
+        f("contains([1, 2, 3], 9)");
+    }
+
+    // -- match (no-variante) usa igualdad estructural --
+    #[test]
+    fn match_uses_structural_equality() {
+        let src = "let m be {\"k\": 1}\nmatch m\n    is {\"k\": 1}\n        print(\"si\")\n    otherwise\n        print(\"no\")\n";
+        assert_eq!(line(src), "si");
+    }
+
+    // -- Igualdad de variantes de enum con payload (separately-built) --
+    #[test]
+    fn enum_payload_eq_separately_built() {
+        let src = "enum O\n    s(a, b)\nprint(text(O.s(1, 2) == O.s(1, 2)))";
+        assert_eq!(line(src), "true");
+        let src2 = "enum O\n    s(a, b)\nprint(text(O.s(1, 2) == O.s(1, 9)))";
+        assert_eq!(line(src2), "false");
+    }
+}
