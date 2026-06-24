@@ -98,7 +98,8 @@ headers of request
 user of request  -- set after auth (see below)
 ip of request    -- the client's real peer IP (used for rate limiting)
 body_file of request  -- temp file path when a large body spilled to disk, else nothing
-read_body()      -- read the full body text (from memory or the temp file)
+read_body()      -- read the full body TEXT (lossy for non-UTF-8)
+read_body_bytes() -- read the full body as `bytes` (byte-exact, for binary uploads)
 query            -- query string as a map: /x?page=2 → query.page == "2"
 params           -- path params as a map: /products/:id → params.id
 ```
@@ -185,6 +186,10 @@ route "GET /old-path"
   written **verbatim** (no `json.dumps`, no quotes).
 - `respond(content, content_type, status?)` → arbitrary content-type, optional
   status (default `200`).
+- `binary(bytes, content_type?, status?)` → a **binary** response (default
+  `application/octet-stream`, `200`); the body is written byte-exact, not compressed. Also
+  `give bytes(...)` directly → an octet-stream. Use for images/files/downloads. See
+  [builtins.md](builtins.md) (bytes).
 - `redirect(url, status?)` → a `3xx` response with a `Location: <url>` header and no
   body. Default status `301` (permanent); pass `302` for a temporary redirect. The URL
   is rejected (500) if it contains CR/LF — this prevents header injection. Use it for

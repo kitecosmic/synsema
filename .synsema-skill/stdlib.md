@@ -1,6 +1,9 @@
 # Synsema Standard Library — HTTP, Database, Cron
 
-Zero external dependencies. All built on Python stdlib.
+Synsema is a **Rust** language (the `synsema/` Python tree is frozen; Rust is the source of truth).
+Single static binary. The HTTP server runs on an async `hyper`/`tokio` stack; bundled SQLite via
+`rusqlite`. For numeric/scientific builtins (bytes, complex, special math, arrays + linear algebra)
+see [builtins.md](builtins.md).
 
 ## HTTP
 
@@ -110,7 +113,7 @@ require db("./store.db")
 
 ## Platform
 
-- HTTP: works on Linux, Windows, Mac (Python stdlib urllib)
-- SQL: works on Linux, Windows, Mac (Python stdlib sqlite3)
-- Cron: works on Linux, Windows, Mac (Python stdlib threading.Timer)
-- All zero external dependencies
+- HTTP, SQL, Cron: work on Linux, Windows, Mac.
+- Single static binary (the one C dependency is bundled SQLite in `rusqlite`, which needs a C
+  compiler at build time on Windows). Numeric deps (`libm`, `num-complex`, `ndarray`, `faer`) are
+  pure-Rust.

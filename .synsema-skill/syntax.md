@@ -27,10 +27,16 @@ identifiers, so `let route be "/x"`, `let static be 1`, `let from be 3`,
 `let private be 1` and `task auth(x)` are valid. The parser uses fixed lookahead,
 never heuristics. See [serve.md](serve.md).
 
+`test` is also a soft keyword: `test "name"` at the start of a statement begins a test block
+(see [testing.md](testing.md)); anywhere else `test` is an ordinary identifier
+(`let test be 5`, `task f(test)` are valid).
+
 ## Operators
-Arithmetic: `+`, `-`, `*`, `/`, `%`, `**`
+Arithmetic: `+`, `-`, `*`, `/`, `%`, `**` (on `array`, these are **elementwise** with broadcasting — matrix product is `matmul`)
 Comparison: `==`, `!=`, `<`, `>`, `<=`, `>=`
+Assignment of a default / named arg: `=` (in `task f(x, y = 1)` and `f(x, y = 2)`). Distinct from `==` (equality). `=` is NOT a general assignment statement — use `let`/`set`.
 Pipe: `|>` — chains: `data |> clean |> validate`
+Lambda: `(params) => expr`
 Comments: `-- comment`
 
 ## Strings
@@ -68,12 +74,29 @@ while condition
     body
 
 match value
-    is pattern
+    is "literal"                     -- value match (==)
+    is Status.paid(amount)           -- enum variant + positional binding
+    is Status.shipped(d, c) when c == "DHL"   -- guard: arm matches only if cond holds
+    is [first, ...rest]              -- list pattern: head + tail (also [a,b], [], [...init, last])
+    is {name, age} when age >= 18    -- map pattern: binds keys (subset; extra keys ignored)
+    is {status: 200, body}           -- map field with sub-pattern + binder
+    is _                             -- wildcard: matches anything, binds nothing
         body
+    otherwise                        -- default if no `is` matched
+        body
+-- NOTE: top-level `is x` (a bare identifier) still COMPARES against the value of x
+-- (it does NOT bind). Binders appear only inside list/map/variant patterns and `_`.
 
-task name(param1, param2)
+task name(param1, param2 = 10)        -- default value with `=` (evaluated at call time)
     body
     give return_value
+
+name("a")                             -- param2 defaults to 10
+name("a", 20)                         -- positional
+name("a", param2 = 20)                -- named arg (any order; like `spawn ... with k = v`)
+
+test "description"                    -- test block (run only by `synsema test`, skipped by run)
+    assert_eq(name("a"), expected)    -- see testing.md
 
 type Name
     field1: type_name

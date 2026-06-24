@@ -12,12 +12,13 @@
 - `append(list, item)` → new list with item added
 - `keys(map)` → list of keys
 - `values(map)` → list of values
-- `contains(collection, item)` → bool
+- `contains(collection, item)` → bool (lists/text/maps; also `bytes`: subsequence, or a single byte 0–255)
 - `split(text, separator)` → list
 - `join(list, separator)` → text
 - `range(end)` or `range(start, end)` or `range(start, end, step)` → list
-- `type_of(value)` → text ("number", "text", "bool", "list", "map", "task", "nothing")
-- `slice(collection, start, end?)` → sub-collection
+- `type_of(value)` → text ("number", "decimal", "complex", "text", "bytes", "bool", "list", "map", "array", "task", "nothing")
+- `slice(collection, start, end?)` → sub-collection (lists/text/`bytes`; Python-style negatives)
+- `length(x)` also works on `bytes` (byte count) and `array` (total elements). Indexing `x[i]` works on lists, maps, `bytes` (→ int 0–255) and `array` (→ row or scalar).
 
 ## Strings
 - `fmt(template, map)` → interpolated text: `fmt("Hi {name}", {"name": "Alice"})` → `"Hi Alice"`
@@ -34,6 +35,39 @@
 - `capture(text, pattern)` → first match (partial search): with groups, a list of group values; without groups, the whole match as text; no match → `nothing`
 - `replace_re(text, pattern, replacement)` → text (`\1`/`\2` backreferences supported)
 - ⚠️ A pathological pattern can be slow (ReDoS) — don't feed untrusted input as a *pattern* without care.
+
+## Bytes / binary (pure — no capability)
+- `bytes(text)` → utf8 bytes; `bytes(text, "hex")` / `bytes(text, "base64")` → decode; `bytes([72,73])` → from ints 0–255; `bytes(bytes)` → identity. `bytes(secret)` → **error** (plaintext never materializes).
+- `decode(b)` / `decode(b, "utf8")` → text (UTF-8 **strict**, errors on invalid); `decode(b, "utf8_lossy")` → with `U+FFFD`; `decode(b, "hex")` / `decode(b, "base64")` → text. (so `bytes(...)` ↔ `decode(...)` are inverses)
+- `is_bytes(x)` → bool. `b[i]` → int 0–255; `bytes + bytes` → concatenation; `length`/`slice`/`contains` work on bytes.
+- `sha256(x)` / `sha512(x)` → **bytes** (raw digest). x: text → hashes utf8; bytes → raw. Hex via `decode(sha256(x), "hex")`. `sha256(secret)` → error.
+- Note: `text(b)` / `print(b)` show a hex repr like `bytes(48656c6c6f)`, **not** a decode. `bytes != text` always.
+
+## Math (pure — no capability)
+Constants (bare values): `pi`, `tau`, `e`, `inf`, `nan`.
+- magnitude/selection (type-preserving): `abs`, `sign`, `min`, `max`, `clamp`. `abs(complex)` → modulus.
+- roots/powers: `sqrt`, `cbrt`, `hypot`, `pow`. exp/log: `exp`, `ln`, `log10`, `log2`, `log_base`. (no bare `log` — it's a soft keyword; use `ln`/`log10`/`log2`.)
+- trig (radians): `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `radians`, `degrees`.
+- hyperbolic: `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`.
+- number theory (integers): `gcd`, `lcm`, `factorial`.
+- introspection: `is_nan`, `is_infinite`, `is_finite`, `round_to`.
+- aggregates over a list: `sum`, `product`, `mean` (also work on `array`, see below).
+- **Special functions:** `gamma`, `lgamma`, `erf`, `erfc`, `beta` (real-only; via `libm`).
+- **Polymorphic:** `sqrt`/`exp`/`ln`/`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/hyperbolics accept a real **or** a `complex`. Real arg → real result (unchanged: `sqrt(-1)` → NaN). Complex arg → complex (cmath): `sqrt(complex(-1,0))` → `complex(0,1)`, `exp(complex(0, pi))` ≈ `-1`.
+
+### Complex numbers
+- `complex(re, im)` → complex; `real(z)` / `imag(z)` → float; `conj(z)`, `arg(z)` (phase), `is_complex(x)`. Fluid arithmetic with real promotion (`3 + complex(0,2)`); `complex(0,1)**2` == `-1+0i` (exact). `complex(a,0) == a`; **not ordered** (`<`/`>` → error).
+
+## Numeric arrays + linear algebra (pure — no capability)
+n-dimensional f64 arrays (NumPy-equivalent core).
+- **Construct:** `array(nested_list)`, `zeros(shape)`, `ones(shape)`, `full(shape, v)`, `arange(start, stop, step?)`, `linspace(start, stop, n)`, `identity(n)` / `eye(n)`. `shape` is an int or a list like `[2,3]`.
+- **Inspect/convert:** `shape(a)`, `ndim(a)`, `size(a)`, `is_array(a)`, `to_list(a)`, `reshape(a, shape)`, `transpose(a)`, `flatten(a)`, `at(a, [i,j])` (element), `a[i]` (row or scalar).
+- **Vectorized:** `+ - * /` are **elementwise** with broadcasting (`array([1,2,3]) + array([10,20,30])`, `a * 2`). ⚠️ `*` is **elementwise (Hadamard), NOT matrix product** — use `matmul`.
+- **Reductions** (whole array or along an `axis`): `sum`, `mean`, `min`, `max`, `product`, `std`, `var` — e.g. `sum(a, 0)`.
+- **Linear algebra** (2D, via `faer`): `matmul(a, b)` / `dot(a, b)`, `solve(A, b)`, `det(A)`, `inv(A)`, `norm(a, kind?)`, `trace(A)`, `eig(A)` → `{values, vectors}` (eigenvalues are `complex`), `svd(A)` → `{u, s, vt}`. A singular matrix in `inv`/`solve` → clear error (never silent NaN).
+
+## Assertions / tests (see [testing.md](testing.md))
+- `assert(cond, msg?)`, `assert_eq(actual, expected, msg?)`, `assert_ne(a, b, msg?)`, `assert_error(fn)`. Work anywhere as defensive checks; `test "..."` blocks + `synsema test` are the harness.
 
 ## Config & secrets (see [secrets.md](secrets.md))
 Resolution for `env`/`secret`: process environ → `.env` → default → else error. Both are deny-by-default and scoped by name (`require env("X")` / `require secret("X")`, or a `X_*` prefix).
@@ -62,8 +96,9 @@ Resolution for `env`/`secret`: process environ → `.env` → default → else e
 
 ## I/O (require capabilities)
 - `fetch(url, method?, headers?, body?)` → map with status, headers, body
-- `read_file(path)` → text
-- `write_file(path, content)` → bool
+- `read_file(path)` → text — requires `file.read` (lossy for non-UTF-8; use the bytes variant for binary)
+- `read_file_bytes(path)` → `bytes` — requires `file.read` (byte-exact)
+- `write_file(path, content)` → bool — requires `file.write`. If `content` is `bytes`, writes raw bytes; else text.
 - `list_dir(path)` → list of filenames
 - `file_exists(path)` → bool
 - `run(command, args_list?, timeout?)` → map with exit_code, stdout, stderr
@@ -101,7 +136,9 @@ Response helpers (set the HTTP status; body follows the response contract):
 - `html(content)` → 200, `text/html; charset=utf-8`, raw body (no JSON encoding)
 - `respond(content, content_type, status?)` → raw body with an arbitrary content-type and optional status
 - `render(template_path, data?)` → `text/html` from a template file. A hole `{ x }` is a **data field** (a single name — even a reserved word like `type`) or an **expression** (`{ format_time(created) }`). Values are auto-escaped (XSS-safe); `{ raw expr }` opts out; `{ each x in xs }…{ end }` and `{ when c }…{ otherwise }…{ end }` reuse Synsema flow. cwd-relative + traversal-blocked; `render("literal")` templates are validated at startup; errors carry `file:line`. See serve.md.
-- `read_body()` → full request body text (from memory or the temp file) — inside a route handler
+- `read_body()` → full request body **text** (lossy for non-UTF-8) — inside a route handler
+- `read_body_bytes()` → full request body as `bytes` (byte-exact, for binary uploads) — inside a route handler
+- `binary(bytes, content_type?, status?)` → a binary response (default `application/octet-stream`, 200). Also `give bytes(...)` directly → octet-stream.
 
 ### Semantic content (negotiated HTML / Markdown / JSON — see serve.md)
 - `content(tree)` → a negotiable response: HTML (default), Markdown (`Accept: text/markdown` or `.md`), or JSON (`.json`). Opt-in; only `content()` is negotiated.

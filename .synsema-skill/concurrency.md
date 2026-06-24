@@ -1,8 +1,8 @@
-# Concurrency (Rust implementation)
+# Concurrency
 
-Real multi-core parallelism, no GIL. Two builtins: `parallel_map` and `chunk`.
-(Available in the Rust interpreter. The Python reference has `apply`, the sequential
-equivalent.)
+Real multi-core parallelism, no GIL. Two builtins: `parallel_map` and `chunk`
+(`parallel_map` runs on a `tokio` M:N executor with backpressure). The sequential
+equivalent is `apply`.
 
 ## parallel_map(task, list, limit?)
 
@@ -59,5 +59,12 @@ let merged be flatten(partial)                            -- join the results
   compute, datalake processing). Hundreds to thousands of concurrent tasks (thread pool).
 - **`spawn` / swarm** (see agents.md) — run *different* agents concurrently that
   coordinate via blackboard/signals. Heterogeneous concurrency.
-- **Deferred:** >10k simultaneous I/O operations in a single fan-out would need an async
-  interpreter. The current thread-pool model covers the realistic range.
+
+## The HTTP server is already async (high concurrency, no `async` keyword)
+
+The `serve` stack runs on an async `hyper`/`tokio` runtime (one task per connection), with
+your route handlers running **synchronously** on a blocking pool. So the server handles many
+thousands of concurrent connections cheaply, while the language stays simple (sync handlers).
+This is why Synsema has **no `async`/`await` in the language** — concurrency is solved in the
+runtime. Measured on a Linux VPS, web throughput **beats Go** (with the security + agent-native
+edge Go lacks). For concurrent I/O *inside* a handler, use `parallel_map` (it's tokio-backed).
