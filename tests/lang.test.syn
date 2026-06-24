@@ -1,0 +1,89 @@
+-- Dogfood del lenguaje: testea Batch 1 (bytes), Batch 2 (match/params) y Batch 3 (test)
+-- todo en el propio Synsema. Correr con:  synsema test tests/lang.test.syn
+
+-- ===== setup top-level (visible en todos los tests) =====
+
+task connect(host, port = 5432, timeout = 30)
+    give host + ":" + text(port) + ":" + text(timeout)
+
+task sum(xs)
+    match xs
+        is []
+            give 0
+        is [h, ...t]
+            give h + sum(t)
+
+task classify(resp)
+    match resp
+        is {status: 200, items: [first, ...rest]} when length(rest) > 0
+            give "ok-many:" + text(first)
+        is {status: 200}
+            give "ok-empty"
+        is {status}
+            give "status:" + text(status)
+        otherwise
+            give "unknown"
+
+-- ===== Batch 1: bytes =====
+
+test "bytes hex round-trip"
+    let b be bytes("48656c6c6f", "hex")
+    assert_eq(decode(b), "Hello")
+    assert_eq(decode(b, "hex"), "48656c6c6f")
+
+test "bytes base64 round-trip"
+    let b be bytes("Hello")
+    assert_eq(decode(b, "base64"), "SGVsbG8=")
+    assert_eq(decode(bytes("SGVsbG8=", "base64")), "Hello")
+
+test "bytes equality and length"
+    assert_eq(bytes("Hi"), bytes("4869", "hex"))
+    assert_ne(bytes("Hi"), bytes("Ho"))
+    assert_eq(length(bytes("héllo")), 6)
+
+test "sha256 vector (NIST abc)"
+    let h be sha256(bytes("abc"))
+    assert_eq(length(h), 32)
+    assert_eq(decode(h, "hex"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+
+test "decode strict utf8 errors on invalid"
+    assert_error(() => decode(bytes("ff", "hex")))
+
+-- ===== Batch 2: match (list/map patterns + guards) =====
+
+test "recursive sum with list patterns"
+    assert_eq(sum([1, 2, 3, 4, 5]), 15)
+    assert_eq(sum([]), 0)
+
+test "list patterns: head/tail and middle"
+    match [10, 20, 30, 40]
+        is [a, ...mid, z]
+            assert_eq(a, 10)
+            assert_eq(z, 40)
+            assert_eq(length(mid), 2)
+        otherwise
+            assert(false, "should have matched")
+
+test "map pattern with guard"
+    assert_eq(classify({"status": 200, "items": [1, 2, 3]}), "ok-many:1")
+    assert_eq(classify({"status": 200, "items": []}), "ok-empty")
+    assert_eq(classify({"status": 404}), "status:404")
+
+test "wildcard and literal element"
+    match [200, "body"]
+        is [200, b]
+            assert_eq(b, "body")
+        otherwise
+            assert(false, "literal element should match")
+
+-- ===== Batch 2: params (defaults / named) =====
+
+test "connect defaults"
+    assert_eq(connect("db"), "db:5432:30")
+
+test "connect positional override"
+    assert_eq(connect("db", 6000), "db:6000:30")
+
+test "connect named args (any order)"
+    assert_eq(connect("db", timeout = 60), "db:5432:60")
+    assert_eq(connect("db", timeout = 60, port = 7000), "db:7000:60")

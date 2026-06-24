@@ -357,6 +357,12 @@ impl Parser {
         if self.check_word("enum") && self.peek(1).ty == TokenType::Identifier {
             return Ok(Some(self.parse_enum()?));
         }
+        // Test framework (Batch 3): `test "<nombre>"` lidera un bloque de test. SOFT
+        // keyword: sólo se interpreta como tal si va seguido de un Text; en cualquier
+        // otro lugar `test` es un identificador ordinario (G1).
+        if self.check_word("test") && self.peek(1).ty == TokenType::Text {
+            return Ok(Some(self.parse_test_block()?));
+        }
 
         // DSL de features (agentes/human/observabilidad) — SOFT keywords: son su
         // construcción del DSL sólo si lideran el statement y no las sigue un token
@@ -1120,6 +1126,22 @@ impl Parser {
         Ok(Node::new(
             loc,
             NodeKind::TraceBlock {
+                name: name_tok.as_str().to_string(),
+                body,
+            },
+        ))
+    }
+
+    /// `test "<nombre>"` + bloque indentado (Batch 3). El dispatcher ya verificó que tras
+    /// `test` viene un Text, así que acá `test` es la palabra del DSL, no un identificador.
+    fn parse_test_block(&mut self) -> Result<Node, ParseError> {
+        let loc = self.location();
+        self.advance(); // soft keyword 'test'
+        let name_tok = self.expect(TokenType::Text, "Expected a test name string after 'test'")?;
+        let body = self.parse_block()?;
+        Ok(Node::new(
+            loc,
+            NodeKind::TestBlock {
                 name: name_tok.as_str().to_string(),
                 body,
             },

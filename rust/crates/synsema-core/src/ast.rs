@@ -315,6 +315,14 @@ pub enum NodeKind {
         name: String,
     },
 
+    // -- Test framework (Batch 3) --
+    /// `test "<nombre>"` … — bloque de test. No-op en `synsema run` (G2); sólo corre
+    /// bajo `synsema test` (ver `Interpreter::run_test_blocks`).
+    TestBlock {
+        name: String,
+        body: Vec<Node>,
+    },
+
     // -- Manejo de errores --
     TryRecover {
         try_body: Vec<Node>,

@@ -14,10 +14,10 @@ use std::process::ExitCode;
 
 // El conform usa el motor (runtime): intérprete + modelo de seguridad cableado.
 use synsema_runtime::daemon;
-use synsema_runtime::engine::{repl, run_source, run_swarm_dump};
+use synsema_runtime::engine::{repl, run_source, run_swarm_dump, run_tests, TestReport};
 use synsema_runtime::serve::{run_serve_program_with_overrides, ServeOverrides};
 
-const USAGE: &str = "uso: synsema-cli <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run | check | tokens | ast | repl | daemon | version> [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema-cli <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run | test [-v] <archivo|dir> | check | tokens | ast | repl | daemon | version> [--env-file <path> | --no-env-file] <archivo.syn>";
 
 /// Serializa un mapa (clave→string) como objeto JSON ordenado.
 fn json_obj(pairs: Vec<(String, String)>) -> String {
@@ -61,6 +61,7 @@ fn main() -> ExitCode {
         Some("conform") => cmd_conform(&args),
         Some("serve") => cmd_serve(&args),
         Some("run") => cmd_run(&args),
+        Some("test") => cmd_test(&args),
         Some("check") => cmd_check(&args),
         Some("tokens") => cmd_tokens(&args),
         Some("ast") => cmd_ast(&args),
@@ -74,7 +75,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(other) => {
-            eprintln!("subcomando desconocido: '{}'. Disponibles: conform, serve, run, check, tokens, ast, repl, daemon, version", other);
+            eprintln!("subcomando desconocido: '{}'. Disponibles: conform, serve, run, test, check, tokens, ast, repl, daemon, version", other);
             ExitCode::from(2)
         }
         None => {
@@ -281,6 +282,116 @@ fn cmd_run(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
+}
+
+/// test [-v] [--flat] <archivo.syn | dir>: corre los bloques `test` y reporta ✓/✗.
+/// Exit 0 si todos pasan; 1 si alguno falla; 2 por error de uso/archivo ilegible.
+fn cmd_test(args: &[String]) -> ExitCode {
+    let args = take_env_file_flags(args);
+    let args = args.as_slice();
+    let mut flat = false;
+    let mut verbose = false;
+    let mut path: Option<String> = None;
+    for a in &args[2..] {
+        match a.as_str() {
+            "--flat" => flat = true,
+            "-v" | "--verbose" => verbose = true,
+            p if !p.starts_with('-') => path = Some(p.to_string()),
+            _ => {}
+        }
+    }
+    let path = match path {
+        Some(p) => p,
+        None => {
+            eprintln!("uso: synsema-cli test [-v] [--flat] <archivo.syn | dir>");
+            return ExitCode::from(2);
+        }
+    };
+    let files = match collect_syn_files(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("no se pudo acceder a '{}': {}", path, e);
+            return ExitCode::from(2);
+        }
+    };
+    if files.is_empty() {
+        eprintln!("no se encontraron archivos .syn en '{}'", path);
+        return ExitCode::from(2);
+    }
+    let multi = files.len() > 1;
+    let mut total_passed = 0usize;
+    let mut total_failed = 0usize;
+    for file in &files {
+        let mut source = match std::fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("no se pudo leer '{}': {}", file, e);
+                total_failed += 1;
+                continue;
+            }
+        };
+        if flat || file.ends_with(".fsyn") {
+            source = synsema_core::flat_syntax::translate_flat(&source);
+        }
+        if multi {
+            println!("{}:", file);
+        }
+        let report = run_tests(&source, file);
+        print_test_report(&report, verbose);
+        total_passed += report.passed;
+        total_failed += report.failed;
+    }
+    let total = total_passed + total_failed;
+    println!("{} passed, {} failed ({} total)", total_passed, total_failed, total);
+    if total_failed > 0 {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+/// Imprime el reporte de un archivo: ✓/✗ por test (+ stdout de los tests sólo con `-v`).
+fn print_test_report(report: &TestReport, verbose: bool) {
+    if verbose {
+        for line in &report.output {
+            println!("  | {}", line);
+        }
+    }
+    for o in &report.outcomes {
+        if o.passed {
+            println!("  \u{2713} {}", o.name); // ✓
+        } else {
+            let msg = o.message.as_deref().unwrap_or("failed");
+            println!("  \u{2717} {}: {}", o.name, msg); // ✗
+        }
+    }
+}
+
+/// Recolecta archivos `.syn`: un archivo solo, o todos los `*.syn` de un dir (recursivo).
+fn collect_syn_files(path: &str) -> std::io::Result<Vec<String>> {
+    let p = std::path::Path::new(path);
+    if p.is_file() {
+        return Ok(vec![path.to_string()]);
+    }
+    if p.is_dir() {
+        let mut out = Vec::new();
+        collect_syn_dir(p, &mut out)?;
+        out.sort();
+        return Ok(out);
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no es un archivo ni un directorio"))
+}
+
+fn collect_syn_dir(dir: &std::path::Path, out: &mut Vec<String>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_syn_dir(&path, out)?;
+        } else if path.extension().and_then(|e| e.to_str()) == Some("syn") {
+            out.push(path.to_string_lossy().into_owned());
+        }
+    }
+    Ok(())
 }
 
 /// check <archivo.syn>: parsea sin ejecutar; reporta cantidad de statements o el error.

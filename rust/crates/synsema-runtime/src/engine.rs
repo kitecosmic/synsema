@@ -27,7 +27,7 @@ use synsema_capabilities::model::{
 };
 use synsema_capabilities::secure::register_secure_builtins;
 use synsema_core::ast::Node;
-use synsema_core::interpreter::{Control, Interpreter, RunResult, SwarmHooks};
+use synsema_core::interpreter::{Control, Interpreter, RunResult, SwarmHooks, TestOutcome};
 use synsema_core::parser::{parse_source, CompileError};
 use synsema_core::types::{from_send, to_send, SendValue, SynValue};
 use synsema_stdlib::cron::{register_cron_builtins, CronScheduler};
@@ -186,6 +186,60 @@ fn spawn_run(source: &str, filename: &str, secure: bool) -> RunResult {
 /// Modo no-secure (default real): auto-concede STDOUT y TIME. Lo que usa `conform`.
 pub fn run_source(source: &str, filename: &str) -> RunResult {
     spawn_run(source, filename, false)
+}
+
+// =========================================================
+// Test framework (Batch 3): `synsema test`
+// =========================================================
+
+/// Reporte agregado de correr los bloques `test` de un archivo. `output` lleva los `print`
+/// de los tests (para mostrarse sólo con `-v`).
+pub struct TestReport {
+    pub outcomes: Vec<TestOutcome>,
+    pub passed: usize,
+    pub failed: usize,
+    pub output: Vec<String>,
+}
+
+fn report_with_failure(name: &str, message: String) -> TestReport {
+    TestReport {
+        outcomes: vec![TestOutcome { name: name.to_string(), passed: false, message: Some(message), assertion: false }],
+        passed: 0,
+        failed: 1,
+        output: Vec::new(),
+    }
+}
+
+fn run_tests_inner(source: &str, filename: &str) -> TestReport {
+    let program = match parse_source(source, filename) {
+        Ok(p) => p,
+        Err(CompileError::Lex(e)) => return report_with_failure("<parse>", format!("Lexer error: {}", e)),
+        Err(CompileError::Parse(e)) => return report_with_failure("<parse>", format!("Parse error: {}", e)),
+    };
+    let mut interp = Interpreter::new();
+    let caps = Rc::new(RefCell::new(CapabilitySet::new("program")));
+    let progress = Rc::new(RefCell::new(ProgressManager::new()));
+    let memory = Rc::new(RefCell::new(AgentMemory::new()));
+    // Wiring no-secure (igual que `run`): los `require` del archivo conceden capabilities (G4).
+    wire_common_with_state(&mut interp, &caps, false, progress, memory);
+    let outcomes = interp.run_test_blocks(&program);
+    let passed = outcomes.iter().filter(|o| o.passed).count();
+    let failed = outcomes.len() - passed;
+    TestReport { outcomes, passed, failed, output: std::mem::take(&mut interp.output) }
+}
+
+/// Corre los bloques `test` de un archivo en un hilo con stack grande (como `spawn_run`).
+pub fn run_tests(source: &str, filename: &str) -> TestReport {
+    let src = source.to_string();
+    let fname = filename.to_string();
+    std::thread::Builder::new()
+        .stack_size(INTERP_STACK_SIZE)
+        .spawn(move || run_tests_inner(&src, &fname))
+        .expect("no se pudo crear el hilo del motor")
+        .join()
+        .unwrap_or_else(|_| {
+            report_with_failure("<runner>", "el motor abortó (probable desborde de stack nativo)".to_string())
+        })
 }
 
 /// REPL interactivo (espeja `engine.repl()` del oráculo). Mantiene UN intérprete

@@ -40,19 +40,27 @@ pub struct RuntimeError {
     /// normales del runtime `is_validation` es false.
     pub is_validation: bool,
     pub field: Option<String>,
+    /// Falla de una aserción (`assert*`, Batch 3): sólo se usa para el ÍCONO del reporte
+    /// de `synsema test` (distingue una aserción de otro error de runtime). NO cambia el
+    /// `Display` ni el manejo del error; una aserción falla igual que cualquier error.
+    pub is_assertion: bool,
 }
 
 impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), location: None, is_validation: false, field: None }
+        Self { message: message.into(), location: None, is_validation: false, field: None, is_assertion: false }
     }
     pub fn at(message: impl Into<String>, location: SourceLocation) -> Self {
-        Self { message: message.into(), location: Some(location), is_validation: false, field: None }
+        Self { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false }
     }
     /// Error de validación de cliente (input que no cumple `expect`): se mapea a HTTP 400
     /// con el nombre del campo ofensor, en vez de a un 500 genérico.
     pub fn validation(message: impl Into<String>, field: Option<String>) -> Self {
-        Self { message: message.into(), location: None, is_validation: true, field }
+        Self { message: message.into(), location: None, is_validation: true, field, is_assertion: false }
+    }
+    /// Falla de aserción (`assert*`): marca `is_assertion` para el reporte de tests.
+    pub fn assertion(message: impl Into<String>) -> Self {
+        Self { message: message.into(), location: None, is_validation: false, field: None, is_assertion: true }
     }
 }
 
@@ -82,6 +90,20 @@ fn err_validation(msg: impl Into<String>, field: Option<String>) -> Control {
 }
 fn err_at(msg: impl Into<String>, loc: &SourceLocation) -> Control {
     Control::Error(RuntimeError::at(msg, loc.clone()))
+}
+/// Falla de aserción (`assert*`, Batch 3): error de runtime marcado `is_assertion`.
+fn err_assertion(msg: impl Into<String>) -> Control {
+    Control::Error(RuntimeError::assertion(msg))
+}
+/// Mensaje legible de un `Control` (para el reporte de tests): el error tal cual, o el
+/// mensaje estándar de `give`/`stop` fuera de task/loop.
+fn control_message(c: &Control) -> String {
+    match c {
+        Control::Error(e) => e.to_string(),
+        Control::Give(_) | Control::Stop(_) => {
+            "'give'/'stop' used outside of a task or loop".to_string()
+        }
+    }
 }
 
 // =========================================================
@@ -494,6 +516,12 @@ impl Interpreter {
         self.register("bytes", -1, Rc::new(|i, a, l| i.b_bytes(a, l)));
         self.register("decode", -1, Rc::new(|i, a, l| i.b_decode(a, l)));
         self.register("is_bytes", 1, Rc::new(|i, a, l| i.b_is_bytes(a, l)));
+        // Aserciones (test framework, Batch 3). PUROS; al fallar producen un error
+        // marcado `is_assertion`. Funcionan en cualquier parte (checks defensivos, G3).
+        self.register("assert", -1, Rc::new(|i, a, l| i.b_assert(a, l)));
+        self.register("assert_eq", -1, Rc::new(|i, a, l| i.b_assert_eq(a, l)));
+        self.register("assert_ne", -1, Rc::new(|i, a, l| i.b_assert_ne(a, l)));
+        self.register("assert_error", 1, Rc::new(|i, a, l| i.b_assert_error(a, l)));
         // Redondeo a entero (PUROS — sin capability, como text/number). ties-to-even en
         // round() para igualar el `round` de Python.
         self.register("floor", 1, Rc::new(|i, a, l| i.b_round_op(a, l, "floor", f64::floor)));
@@ -857,6 +885,77 @@ impl Interpreter {
             last = self.exec(stmt, &g)?;
         }
         Ok(last)
+    }
+
+    /// Runner del test framework (Batch 3). Corre el SETUP top-level (todo lo que no es
+    /// `TestBlock`, respetando el preámbulo intent/require como `execute`) en el global, y
+    /// luego cada `TestBlock` en un Environment HIJO aislado (G5). Captura el resultado de
+    /// cada test SIN abortar a los demás. Si el setup falla, devuelve un único outcome de
+    /// error de setup. Las defs top-level quedan visibles dentro de cada test.
+    pub fn run_test_blocks(&mut self, program: &Program) -> Vec<TestOutcome> {
+        let g = self.global_env.clone();
+        // Preámbulo: intent/require al inicio, luego congelar intent (igual que execute).
+        let mut split = 0;
+        for stmt in &program.statements {
+            if matches!(
+                stmt.kind,
+                NodeKind::IntentDeclaration { .. } | NodeKind::RequireStatement { .. }
+            ) {
+                split += 1;
+            } else {
+                break;
+            }
+        }
+        // Setup: preámbulo + todas las sentencias no-`TestBlock`. Un fallo → outcome único.
+        let setup: Result<(), Control> = (|| {
+            for stmt in &program.statements[..split] {
+                self.exec(stmt, &g)?;
+            }
+            if self.intent.is_some() {
+                self.intent_frozen = true;
+            }
+            for stmt in &program.statements[split..] {
+                if matches!(stmt.kind, NodeKind::TestBlock { .. }) {
+                    continue;
+                }
+                self.exec(stmt, &g)?;
+            }
+            Ok(())
+        })();
+        if let Err(c) = setup {
+            return vec![TestOutcome {
+                name: "<setup>".to_string(),
+                passed: false,
+                message: Some(control_message(&c)),
+                assertion: matches!(&c, Control::Error(e) if e.is_assertion),
+            }];
+        }
+        // Cada test en orden, aislado, con captura (no-abort, G5).
+        let mut outcomes = Vec::new();
+        for stmt in &program.statements {
+            if let NodeKind::TestBlock { name, body } = &stmt.kind {
+                let test_env = Environment::child(&g, &format!("test:{}", name));
+                let outcome = match self.exec_block(body, &test_env) {
+                    Ok(_) => {
+                        TestOutcome { name: name.clone(), passed: true, message: None, assertion: false }
+                    }
+                    Err(Control::Error(e)) => TestOutcome {
+                        name: name.clone(),
+                        passed: false,
+                        message: Some(e.to_string()),
+                        assertion: e.is_assertion,
+                    },
+                    Err(c @ (Control::Give(_) | Control::Stop(_))) => TestOutcome {
+                        name: name.clone(),
+                        passed: false,
+                        message: Some(control_message(&c)),
+                        assertion: false,
+                    },
+                };
+                outcomes.push(outcome);
+            }
+        }
+        outcomes
     }
 
     fn exec_block(
@@ -1500,6 +1599,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             NodeKind::MeasureBlock { body, .. } => self.exec_block(body, env),
             NodeKind::CheckpointStatement { .. } => Ok(SynValue::Nothing),
+            // G2: los bloques `test` NO corren en `synsema run` — no-op. Sólo
+            // `Interpreter::run_test_blocks` (vía `synsema test`) ejecuta su cuerpo.
+            NodeKind::TestBlock { .. } => Ok(SynValue::Nothing),
 
             // -- Errores --
             NodeKind::TryRecover { try_body, error_variable, recover_body } => {
@@ -2097,6 +2199,71 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// `is_bytes(x)` → true sólo si `x` es bytes.
     fn b_is_bytes(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
         Ok(syn_bool(matches!(nth(args, 0)?, SynValue::Bytes(_))))
+    }
+
+    // -- Aserciones (Batch 3) --
+
+    /// `assert(cond, msg?)` → `nothing` si `cond` es truthy; si no, error de aserción con
+    /// `msg` (o `"assertion failed"`).
+    fn b_assert(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        if nth(args, 0)?.is_truthy() {
+            return Ok(SynValue::Nothing);
+        }
+        let msg = match args.get(1) {
+            Some(m) => m.to_string(),
+            None => "assertion failed".to_string(),
+        };
+        Err(err_assertion(msg))
+    }
+
+    /// `assert_eq(actual, expected, msg?)` → error si `!actual.syn_equals(expected)`. El
+    /// mensaje usa `Display` para ambos valores (bytes muestran su repr hex).
+    fn b_assert_eq(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        let actual = nth(args, 0)?;
+        let expected = nth(args, 1)?;
+        if actual.syn_equals(expected) {
+            return Ok(SynValue::Nothing);
+        }
+        let prefix = match args.get(2) {
+            Some(m) => format!("{}: ", m),
+            None => String::new(),
+        };
+        Err(err_assertion(format!("{}expected {}, got {}", prefix, expected, actual)))
+    }
+
+    /// `assert_ne(a, b, msg?)` → error si `a.syn_equals(b)` (se esperaba que difirieran).
+    fn b_assert_ne(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        let a = nth(args, 0)?;
+        let b = nth(args, 1)?;
+        if !a.syn_equals(b) {
+            return Ok(SynValue::Nothing);
+        }
+        let prefix = match args.get(2) {
+            Some(m) => format!("{}: ", m),
+            None => String::new(),
+        };
+        Err(err_assertion(format!("{}expected values to differ, both {}", prefix, a)))
+    }
+
+    /// `assert_error(fn)` → llama `fn` (0 args) vía `call_value`; **pasa** si lanza
+    /// `Control::Error`; **falla** si retorna normal. `Give`/`Stop` se propagan tal cual
+    /// (un `give` NO es un error → una lambda que da `give` hace FALLAR la aserción).
+    fn b_assert_error(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        let func = nth(args, 0)?.clone();
+        if !matches!(func, SynValue::Task(_) | SynValue::Builtin(_)) {
+            return Err(err_at(
+                format!("assert_error expects a task or lambda, got {}", func.type_name()),
+                loc,
+            ));
+        }
+        match self.call_value(func, Vec::new(), loc) {
+            // Lanzó un error → la aserción pasa.
+            Err(Control::Error(_)) => Ok(SynValue::Nothing),
+            // Retornó normal (incl. un `give`, que `call_value` materializa como Ok) → falla.
+            Ok(_) => Err(err_assertion("expected an error, but none was raised")),
+            // `give`/`stop` fuera de un task se propagan como hoy (no son "el error esperado").
+            Err(other) => Err(other),
+        }
     }
 
     fn b_append(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -2718,6 +2885,16 @@ pub struct RunResult {
     pub success: bool,
     pub output: Vec<String>,
     pub errors: Vec<String>,
+}
+
+/// Resultado de un bloque `test` (Batch 3). `assertion` distingue una falla de aserción
+/// de otro error de runtime (sólo para el ícono del reporte).
+#[derive(Debug, Clone)]
+pub struct TestOutcome {
+    pub name: String,
+    pub passed: bool,
+    pub message: Option<String>,
+    pub assertion: bool,
 }
 
 /// Stack del hilo de ejecución del intérprete. Grande porque el intérprete es

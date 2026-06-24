@@ -148,6 +148,7 @@ fn children(n: &Node) -> Vec<&Node> {
             v
         }
         TraceBlock { body, .. } => body.iter().collect(),
+        TestBlock { body, .. } => body.iter().collect(),
         LogStatement { message, .. } => vec![message],
         MeasureBlock { body, .. } => body.iter().collect(),
         TryRecover { try_body, recover_body, .. } => {
@@ -607,6 +608,7 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
             v
         }
         TraceBlock { body, .. } => body.iter_mut().collect(),
+        TestBlock { body, .. } => body.iter_mut().collect(),
         LogStatement { message, .. } => vec![message.as_mut()],
         MeasureBlock { body, .. } => body.iter_mut().collect(),
         TryRecover { try_body, recover_body, .. } => {
