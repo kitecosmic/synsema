@@ -17,12 +17,13 @@
 use std::cmp::Ordering;
 
 use num_bigint::{BigInt, Sign};
+use num_complex::Complex64;
 use num_integer::Integer;
 use num_traits::ToPrimitive;
 
 use crate::interpreter::{Control, RuntimeError};
 use crate::number::{Number, MIX_DECIMAL_FLOAT};
-use crate::types::{syn_bool, syn_float, syn_int, syn_number, SynValue};
+use crate::types::{syn_bool, syn_complex, syn_float, syn_int, syn_number, SynValue};
 
 // -- helpers --
 
@@ -81,11 +82,71 @@ fn binary_float(
 }
 
 // =========================================================
+// Polimorfismo real/complex (Batch 4)
+// =========================================================
+
+/// Función unaria POLIMÓRFICA: arg real → `Float(real(x))` (idéntico a hoy, G1); arg
+/// complejo → `Complex(cplx(z))`. Cualquier otro tipo → error de tipo claro.
+fn unary_poly(
+    args: &[SynValue],
+    name: &str,
+    real: impl Fn(f64) -> f64,
+    cplx: impl Fn(Complex64) -> Complex64,
+) -> Result<SynValue, Control> {
+    arity(args, 1, name)?;
+    match arg(args, 0)? {
+        SynValue::Number(n) => Ok(syn_float(real(n.to_f64()))),
+        SynValue::Complex(z) => Ok(SynValue::Complex(cplx(*z))),
+        other => Err(err(format!("{} expects a number, got {}", name, other.type_name()))),
+    }
+}
+
+/// Potencia compleja `a ** exp` con **exponente entero exacto** (Python-like): si `exp`
+/// es un entero que entra en `i32` → `a.powi` (cuadrados repetidos, sin el drift de
+/// `powc`: `complex(0,1)**2 == -1+0i` exacto); si no → `a.powc(b)`. `b` es `exp` ya
+/// coercionado a `Complex64`.
+pub fn complex_pow(a: Complex64, exp: &SynValue, b: Complex64) -> Complex64 {
+    if let SynValue::Number(n) = exp {
+        if n.is_integer() {
+            if let Some(i) = n.to_i64_trunc().and_then(|v| i32::try_from(v).ok()) {
+                return a.powi(i);
+            }
+        }
+    }
+    a.powc(b)
+}
+
+/// Coerciona el i-ésimo argumento a `Complex64` (real → parte imaginaria 0).
+fn complex_arg(args: &[SynValue], i: usize, name: &str) -> Result<Complex64, Control> {
+    match arg(args, i)? {
+        SynValue::Number(n) => Ok(Complex64::new(n.to_f64(), 0.0)),
+        SynValue::Complex(z) => Ok(*z),
+        other => Err(err(format!("{} expects a number, got {}", name, other.type_name()))),
+    }
+}
+
+/// Lee un argumento REAL para una función real-only (gamma/erf/…). Un complejo da un
+/// error específico ("X is not defined for complex numbers"); otro tipo, error de tipo.
+fn real_only(args: &[SynValue], i: usize, name: &str) -> Result<f64, Control> {
+    match arg(args, i)? {
+        SynValue::Number(n) => Ok(n.to_f64()),
+        SynValue::Complex(_) => {
+            Err(err(format!("{} is not defined for complex numbers", name)))
+        }
+        other => Err(err(format!("{} expects a number, got {}", name, other.type_name()))),
+    }
+}
+
+// =========================================================
 // Signo / magnitud / selección (preservan tipo)
 // =========================================================
 
 pub fn abs(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 1, "abs")?;
+    // Complex (Batch 4): módulo (Float). El resto preserva tipo (G1).
+    if let SynValue::Complex(z) = arg(args, 0)? {
+        return Ok(syn_float(z.norm()));
+    }
     let n = num(args, 0, "abs")?;
     Ok(syn_number(match n {
         Number::Float(x) => Number::Float(x.abs()),
@@ -181,8 +242,10 @@ pub fn clamp(args: &[SynValue]) -> Result<SynValue, Control> {
 // Raíces / potencias
 // =========================================================
 
+/// `sqrt` POLIMÓRFICA: real → `f64::sqrt` (G1: `sqrt(-1)`→NaN); complejo → raíz
+/// principal (`sqrt(complex(-1,0))`→`complex(0,1)`).
 pub fn sqrt(args: &[SynValue]) -> Result<SynValue, Control> {
-    unary_float(args, "sqrt", f64::sqrt)
+    unary_poly(args, "sqrt", f64::sqrt, |z| z.sqrt())
 }
 pub fn cbrt(args: &[SynValue]) -> Result<SynValue, Control> {
     unary_float(args, "cbrt", f64::cbrt)
@@ -191,10 +254,17 @@ pub fn hypot(args: &[SynValue]) -> Result<SynValue, Control> {
     binary_float(args, "hypot", f64::hypot)
 }
 
-/// `pow(base, exp)` espeja el operador `**`: entero^entero≥0 → entero; Decimal base
-/// + exp entero → Decimal; mezclar Decimal y Float → error; si no → float.
+/// `pow(base, exp)` espeja el operador `**`: si alguno es complejo → `a.powc(b)`
+/// (complex); si no, entero^entero≥0 → entero; Decimal base + exp entero → Decimal;
+/// mezclar Decimal y Float → error; si no → float (idéntico a hoy para reales, G1).
 pub fn pow(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "pow")?;
+    if matches!(arg(args, 0)?, SynValue::Complex(_)) || matches!(arg(args, 1)?, SynValue::Complex(_))
+    {
+        let a = complex_arg(args, 0, "pow")?;
+        let b = complex_arg(args, 1, "pow")?;
+        return Ok(SynValue::Complex(complex_pow(a, arg(args, 1)?, b)));
+    }
     let base = num(args, 0, "pow")?;
     let exp = num(args, 1, "pow")?;
     base.checked_pow(exp).map(syn_number).map_err(err)
@@ -205,10 +275,10 @@ pub fn pow(args: &[SynValue]) -> Result<SynValue, Control> {
 // =========================================================
 
 pub fn exp(args: &[SynValue]) -> Result<SynValue, Control> {
-    unary_float(args, "exp", f64::exp)
+    unary_poly(args, "exp", f64::exp, |z| z.exp())
 }
 pub fn ln(args: &[SynValue]) -> Result<SynValue, Control> {
-    unary_float(args, "ln", f64::ln)
+    unary_poly(args, "ln", f64::ln, |z| z.ln())
 }
 pub fn log10(args: &[SynValue]) -> Result<SynValue, Control> {
     unary_float(args, "log10", f64::log10)
@@ -225,22 +295,22 @@ pub fn log_base(args: &[SynValue]) -> Result<SynValue, Control> {
 // =========================================================
 
 pub fn sin(args: &[SynValue]) -> Result<SynValue, Control> {
-    unary_float(args, "sin", f64::sin)
+    unary_poly(args, "sin", f64::sin, |z| z.sin())
 }
 pub fn cos(args: &[SynValue]) -> Result<SynValue, Control> {
-    unary_float(args, "cos", f64::cos)
+    unary_poly(args, "cos", f64::cos, |z| z.cos())
 }
 pub fn tan(args: &[SynValue]) -> Result<SynValue, Control> {
-    unary_float(args, "tan", f64::tan)
+    unary_poly(args, "tan", f64::tan, |z| z.tan())
 }
 pub fn asin(args: &[SynValue]) -> Result<SynValue, Control> {
-    unary_float(args, "asin", f64::asin)
+    unary_poly(args, "asin", f64::asin, |z| z.asin())
 }
 pub fn acos(args: &[SynValue]) -> Result<SynValue, Control> {
-    unary_float(args, "acos", f64::acos)
+    unary_poly(args, "acos", f64::acos, |z| z.acos())
 }
 pub fn atan(args: &[SynValue]) -> Result<SynValue, Control> {
-    unary_float(args, "atan", f64::atan)
+    unary_poly(args, "atan", f64::atan, |z| z.atan())
 }
 pub fn atan2(args: &[SynValue]) -> Result<SynValue, Control> {
     binary_float(args, "atan2", f64::atan2)
@@ -394,4 +464,125 @@ pub fn mean(args: &[SynValue]) -> Result<SynValue, Control> {
         acc = acc.checked_add(n).map_err(err)?;
     }
     Ok(syn_float(acc.to_f64() / nums.len() as f64))
+}
+
+// =========================================================
+// Hiperbólicas (Batch 4) — polimórficas (real vía std f64, complejo vía num-complex)
+// =========================================================
+
+pub fn sinh(args: &[SynValue]) -> Result<SynValue, Control> {
+    unary_poly(args, "sinh", f64::sinh, |z| z.sinh())
+}
+pub fn cosh(args: &[SynValue]) -> Result<SynValue, Control> {
+    unary_poly(args, "cosh", f64::cosh, |z| z.cosh())
+}
+pub fn tanh(args: &[SynValue]) -> Result<SynValue, Control> {
+    unary_poly(args, "tanh", f64::tanh, |z| z.tanh())
+}
+pub fn asinh(args: &[SynValue]) -> Result<SynValue, Control> {
+    unary_poly(args, "asinh", f64::asinh, |z| z.asinh())
+}
+pub fn acosh(args: &[SynValue]) -> Result<SynValue, Control> {
+    unary_poly(args, "acosh", f64::acosh, |z| z.acosh())
+}
+pub fn atanh(args: &[SynValue]) -> Result<SynValue, Control> {
+    unary_poly(args, "atanh", f64::atanh, |z| z.atanh())
+}
+
+// =========================================================
+// Funciones especiales (Batch 4) — REAL-ONLY, vía libm (puro-Rust)
+// =========================================================
+
+/// `gamma(x)` = Γ(x) (= `(x-1)!` para enteros). `gamma(5)`=24, `gamma(0.5)`=√π.
+pub fn gamma(args: &[SynValue]) -> Result<SynValue, Control> {
+    arity(args, 1, "gamma")?;
+    Ok(syn_float(libm::tgamma(real_only(args, 0, "gamma")?)))
+}
+/// `lgamma(x)` = ln|Γ(x)| (estable para argumentos grandes).
+pub fn lgamma(args: &[SynValue]) -> Result<SynValue, Control> {
+    arity(args, 1, "lgamma")?;
+    Ok(syn_float(libm::lgamma(real_only(args, 0, "lgamma")?)))
+}
+/// `erf(x)` = función error.
+pub fn erf(args: &[SynValue]) -> Result<SynValue, Control> {
+    arity(args, 1, "erf")?;
+    Ok(syn_float(libm::erf(real_only(args, 0, "erf")?)))
+}
+/// `erfc(x)` = error complementaria (`1 - erf(x)`, estable en la cola).
+pub fn erfc(args: &[SynValue]) -> Result<SynValue, Control> {
+    arity(args, 1, "erfc")?;
+    Ok(syn_float(libm::erfc(real_only(args, 0, "erfc")?)))
+}
+/// `beta(a, b)` = B(a,b) = Γ(a)Γ(b)/Γ(a+b). Forma numéricamente estable vía lgamma con
+/// signo (`lgamma_r`): `signo · exp(lgΓ(a)+lgΓ(b)−lgΓ(a+b))`. Para `a,b>0` es positivo.
+pub fn beta(args: &[SynValue]) -> Result<SynValue, Control> {
+    arity(args, 2, "beta")?;
+    let a = real_only(args, 0, "beta")?;
+    let b = real_only(args, 1, "beta")?;
+    let (la, sa) = libm::lgamma_r(a);
+    let (lb, sb) = libm::lgamma_r(b);
+    let (lab, sab) = libm::lgamma_r(a + b);
+    // signo(Γ(a))·signo(Γ(b))/signo(Γ(a+b)); como sab=±1, dividir = multiplicar.
+    let sign = (sa * sb * sab) as f64;
+    Ok(syn_float(sign * (la + lb - lab).exp()))
+}
+
+// =========================================================
+// Constructores / accesores complex (Batch 4)
+// =========================================================
+
+/// `complex(re, im)` → número complejo (re/im numéricos reales).
+pub fn complex(args: &[SynValue]) -> Result<SynValue, Control> {
+    arity(args, 2, "complex")?;
+    let re = num(args, 0, "complex")?.to_f64();
+    let im = num(args, 1, "complex")?.to_f64();
+    Ok(syn_complex(re, im))
+}
+
+/// `real(z)` → parte real (`Float`). Acepta un real (`real(5)`→5.0) por ergonomía.
+pub fn real(args: &[SynValue]) -> Result<SynValue, Control> {
+    arity(args, 1, "real")?;
+    match arg(args, 0)? {
+        SynValue::Complex(z) => Ok(syn_float(z.re)),
+        SynValue::Number(n) => Ok(syn_float(n.to_f64())),
+        other => Err(err(format!("real expects a number or complex, got {}", other.type_name()))),
+    }
+}
+
+/// `imag(z)` → parte imaginaria (`Float`). Un real tiene parte imaginaria 0 (`imag(5)`→0.0).
+pub fn imag(args: &[SynValue]) -> Result<SynValue, Control> {
+    arity(args, 1, "imag")?;
+    match arg(args, 0)? {
+        SynValue::Complex(z) => Ok(syn_float(z.im)),
+        SynValue::Number(_) => Ok(syn_float(0.0)),
+        other => Err(err(format!("imag expects a number or complex, got {}", other.type_name()))),
+    }
+}
+
+/// `conj(z)` → conjugado. El conjugado de un real es él mismo (devuelve el real).
+pub fn conj(args: &[SynValue]) -> Result<SynValue, Control> {
+    arity(args, 1, "conj")?;
+    match arg(args, 0)? {
+        SynValue::Complex(z) => Ok(SynValue::Complex(z.conj())),
+        SynValue::Number(n) => Ok(syn_number(n.clone())),
+        other => Err(err(format!("conj expects a number or complex, got {}", other.type_name()))),
+    }
+}
+
+/// `arg(z)` → fase/argumento en radianes (`Float`). `arg` del real positivo = 0, del
+/// negativo = π. (Builtin `arg`; el nombre Rust es `arg_phase` por la colisión con el
+/// helper interno `arg`.)
+pub fn arg_phase(args: &[SynValue]) -> Result<SynValue, Control> {
+    arity(args, 1, "arg")?;
+    match arg(args, 0)? {
+        SynValue::Complex(z) => Ok(syn_float(z.arg())),
+        SynValue::Number(n) => Ok(syn_float(Complex64::new(n.to_f64(), 0.0).arg())),
+        other => Err(err(format!("arg expects a number or complex, got {}", other.type_name()))),
+    }
+}
+
+/// `is_complex(x)` → `true` sólo si `x` es complex (espeja `is_decimal`/`is_bytes`).
+pub fn is_complex(args: &[SynValue]) -> Result<SynValue, Control> {
+    arity(args, 1, "is_complex")?;
+    Ok(syn_bool(matches!(arg(args, 0)?, SynValue::Complex(_))))
 }

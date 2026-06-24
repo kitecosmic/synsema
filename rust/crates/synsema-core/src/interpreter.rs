@@ -17,6 +17,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use indexmap::IndexMap;
+use num_complex::Complex64;
 use regex::Regex;
 
 use crate::ast::{Node, NodeKind, Param, Program};
@@ -610,6 +611,29 @@ impl Interpreter {
         self.register("product", 1, Rc::new(|_i, a, _l| crate::math::product(a)));
         self.register("mean", 1, Rc::new(|_i, a, _l| crate::math::mean(a)));
 
+        // -- Completitud matemática (Batch 4) --
+        // Complejos: constructor + accesores (PUROS). Las transcendentales (sqrt/exp/…/pow)
+        // ya registradas arriba se vuelven polimórficas internamente (real O complejo, G1).
+        self.register("complex", 2, Rc::new(|_i, a, _l| crate::math::complex(a)));
+        self.register("real", 1, Rc::new(|_i, a, _l| crate::math::real(a)));
+        self.register("imag", 1, Rc::new(|_i, a, _l| crate::math::imag(a)));
+        self.register("conj", 1, Rc::new(|_i, a, _l| crate::math::conj(a)));
+        self.register("arg", 1, Rc::new(|_i, a, _l| crate::math::arg_phase(a)));
+        self.register("is_complex", 1, Rc::new(|_i, a, _l| crate::math::is_complex(a)));
+        // Hiperbólicas (polimórficas: real vía std f64, complejo vía num-complex).
+        self.register("sinh", 1, Rc::new(|_i, a, _l| crate::math::sinh(a)));
+        self.register("cosh", 1, Rc::new(|_i, a, _l| crate::math::cosh(a)));
+        self.register("tanh", 1, Rc::new(|_i, a, _l| crate::math::tanh(a)));
+        self.register("asinh", 1, Rc::new(|_i, a, _l| crate::math::asinh(a)));
+        self.register("acosh", 1, Rc::new(|_i, a, _l| crate::math::acosh(a)));
+        self.register("atanh", 1, Rc::new(|_i, a, _l| crate::math::atanh(a)));
+        // Funciones especiales (real-only, vía libm).
+        self.register("gamma", 1, Rc::new(|_i, a, _l| crate::math::gamma(a)));
+        self.register("lgamma", 1, Rc::new(|_i, a, _l| crate::math::lgamma(a)));
+        self.register("erf", 1, Rc::new(|_i, a, _l| crate::math::erf(a)));
+        self.register("erfc", 1, Rc::new(|_i, a, _l| crate::math::erfc(a)));
+        self.register("beta", 2, Rc::new(|_i, a, _l| crate::math::beta(a)));
+
         // Constantes matemáticas — VALORES globales (se usan sin llamar): pi/tau/e/inf/nan.
         {
             let mut g = self.global_env.borrow_mut();
@@ -1067,6 +1091,7 @@ impl Interpreter {
                 match operator.as_str() {
                     "-" => match &v {
                         SynValue::Number(n) => Ok(syn_number(n.neg())),
+                        SynValue::Complex(z) => Ok(SynValue::Complex(-z)),
                         _ => Err(err_at(format!("Cannot negate {}", v.type_name()), loc)),
                     },
                     "not" => Ok(syn_bool(!v.is_truthy())),
@@ -1713,6 +1738,31 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 return Ok(syn_list(v));
             }
         }
+        // Aritmética complex (Batch 4): si alguno es Complex y ambos coercionan a
+        // Complex64 (Number→real, promoción). Va DESPUÉS de los concats de Text/List/Bytes
+        // (un `Complex + Text` sigue siendo concat de texto vía Display) y ANTES del camino
+        // de Number (G2: el tower no se perturba). Sólo +,-,*,/,**; otros ops caen al error.
+        if matches!(op, "+" | "-" | "*" | "/" | "**")
+            && (matches!(left, SynValue::Complex(_)) || matches!(right, SynValue::Complex(_)))
+        {
+            if let (Some(a), Some(b)) = (as_complex(&left), as_complex(&right)) {
+                let z = match op {
+                    "+" => a + b,
+                    "-" => a - b,
+                    "*" => a * b,
+                    "/" => {
+                        if b.re == 0.0 && b.im == 0.0 {
+                            return Err(err_at("Division by zero", loc));
+                        }
+                        a / b
+                    }
+                    // Exponente entero → potencia EXACTA (powi), como Python; si no, powc.
+                    "**" => crate::math::complex_pow(a, &right, b),
+                    _ => unreachable!(),
+                };
+                return Ok(SynValue::Complex(z));
+            }
+        }
         // Aritmética — por el camino FALIBLE: mezclar Decimal con Float es un error
         // claro. Int/Big mezclan libremente con ambos.
         if let (SynValue::Number(a), SynValue::Number(b)) = (&left, &right) {
@@ -1759,6 +1809,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
         // Orden
         if matches!(op, "<" | ">" | "<=" | ">=") {
+            // Los complejos NO son ordenables (G3): error claro, como Python.
+            if matches!(left, SynValue::Complex(_)) || matches!(right, SynValue::Complex(_)) {
+                return Err(err_at("complex numbers are not ordered", loc));
+            }
             if let (SynValue::Number(a), SynValue::Number(b)) = (&left, &right) {
                 if Number::mixes_decimal_float(a, b) {
                     return Err(err_at(MIX_DECIMAL_FLOAT, loc));
@@ -2688,6 +2742,17 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 
 fn nth(args: &[SynValue], i: usize) -> Result<&SynValue, Control> {
     args.get(i).ok_or_else(|| err("missing argument"))
+}
+
+/// Coerciona un valor a `Complex64` para la aritmética complex (Batch 4): `Complex(z)→z`;
+/// `Number(n)→z(n,0)` (promoción real→complex; promover Decimal/Big a f64 es lossy a
+/// propósito — complex es float-based); cualquier otro tipo → `None`.
+fn as_complex(v: &SynValue) -> Option<Complex64> {
+    match v {
+        SynValue::Complex(z) => Some(*z),
+        SynValue::Number(n) => Some(Complex64::new(n.to_f64(), 0.0)),
+        _ => None,
+    }
 }
 
 /// Lee el arg opcional de encoding (2º) de `bytes`/`decode`: `None` si no se pasó,

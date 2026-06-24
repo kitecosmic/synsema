@@ -505,6 +505,11 @@ pub fn syn_to_json(v: &SynValue) -> Json {
         // `bytes` dentro de un body JSON → string base64 (JSON no tiene tipo binario;
         // base64 es la convención estándar e interoperable). NO-lossy.
         SynValue::Bytes(b) => Json::Str(b64_encode(b)),
+        // `complex` en un body JSON → objeto `{re, im}` (JSON no tiene tipo complejo;
+        // self-describing y recuperable).
+        SynValue::Complex(z) => {
+            obj(vec![("re", Json::Float(z.re)), ("im", Json::Float(z.im))])
+        }
         SynValue::Server(s) => match &**s {
             // _RAW/_ENVELOPE serializados como data (fuera del contrato) → su dict.
             ServerValue::Raw { body, content_type, status } => obj(vec![

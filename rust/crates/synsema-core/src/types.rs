@@ -17,10 +17,11 @@ use std::fmt;
 use std::rc::Rc;
 
 use indexmap::IndexMap;
+use num_complex::Complex64;
 
 use crate::ast::{Node, Param};
 use crate::interpreter::{BuiltinTask, Environment};
-use crate::number::Number;
+use crate::number::{py_float_str, Number};
 use crate::secret::{constant_time_eq, SecretInner};
 use crate::tokens::SourceLocation;
 
@@ -51,6 +52,11 @@ pub enum SynValue {
     /// pero sin garantía de UTF-8. Constructor-only (`bytes(...)`); no hay literal.
     /// Toda operación devuelve bytes nuevos (sin mutación in-place → sin aliasing).
     Bytes(Rc<[u8]>),
+    /// Número complejo (feature math, Batch 4). Variante **aislada** (como `bytes`): NO
+    /// vive en el tower `Number` (Int/Big/Float/Decimal queda intacto, G1/G2). La
+    /// aritmética se resuelve en `exec_binary` (promoción real→complex). Constructor-only
+    /// `complex(re, im)` (sin literal `2i`). Basado en float (`Complex64`).
+    Complex(Complex64),
 }
 
 /// Closure de paginación lazy de `paged()`: `fetch(limit, offset) → (filas, total)`.
@@ -135,6 +141,7 @@ impl SynValue {
             SynValue::Server(_) => "map",
             SynValue::Secret(_) => "secret",
             SynValue::Bytes(_) => "bytes",
+            SynValue::Complex(_) => "complex",
         }
     }
 
@@ -160,6 +167,8 @@ impl SynValue {
             SynValue::Secret(s) => !s.expose_bytes().is_empty(),
             // Bytes vacío = false (como text/list vacíos).
             SynValue::Bytes(b) => !b.is_empty(),
+            // complex(0,0) = false; cualquier parte no-cero = true.
+            SynValue::Complex(z) => z.re != 0.0 || z.im != 0.0,
         }
     }
 
@@ -223,6 +232,11 @@ impl SynValue {
             // `bytes` sólo es igual a `bytes` (byte-a-byte). Nunca igual a text ni a
             // ningún otro tipo (cae al `_ => false`): no hay igualdad cross-type (G3).
             (SynValue::Bytes(a), SynValue::Bytes(b)) => a == b,
+            // Complex (Batch 4, G4): igualdad por valor; y Pythónico `complex(a,0) == a`
+            // (un complejo con parte imaginaria 0 iguala al real correspondiente).
+            (SynValue::Complex(a), SynValue::Complex(b)) => a == b,
+            (SynValue::Complex(z), SynValue::Number(n))
+            | (SynValue::Number(n), SynValue::Complex(z)) => z.im == 0.0 && z.re == n.to_f64(),
             _ => false,
         }
     }
@@ -285,8 +299,25 @@ impl fmt::Display for SynValue {
             // Repr seguro y NO-lossy: `bytes(<hexlower>)`. Nunca decodifica a texto
             // (eso reintroduciría el lossy: G4). Sella print/text()/concat-con-texto.
             SynValue::Bytes(b) => write!(f, "{}", bytes_display(b)),
+            // `re±imi` (estilo Python cmath): enteros sin `.0` (3+2i), fracción con
+            // decimales (1.5-2i). El signo lo da la parte imaginaria.
+            SynValue::Complex(z) => write!(f, "{}", complex_display(z.re, z.im)),
         }
     }
+}
+
+/// Float al estilo del lenguaje pero recortando un `.0` final (como el repr de Python
+/// dentro de complejos: `3.0`→`"3"`, `1.5`→`"1.5"`, `nan`/`inf` intactos).
+fn trim_float(x: f64) -> String {
+    let s = py_float_str(x);
+    s.strip_suffix(".0").map(|t| t.to_string()).unwrap_or(s)
+}
+
+/// Repr de un complejo: `<re><±><|im|>i` (p.ej. `3+2i`, `3-2i`, `0+1i`). El signo es el
+/// de la parte imaginaria.
+pub fn complex_display(re: f64, im: f64) -> String {
+    let sign = if im < 0.0 { '-' } else { '+' };
+    format!("{}{}{}i", trim_float(re), sign, trim_float(im.abs()))
 }
 
 /// Repr textual seguro de unos bytes para `Display`: `bytes(<hexlower>)`. Para más de
@@ -340,6 +371,10 @@ pub fn syn_secret(name: impl Into<String>, plaintext: impl Into<String>) -> SynV
 pub fn syn_bytes(b: impl Into<Rc<[u8]>>) -> SynValue {
     SynValue::Bytes(b.into())
 }
+/// Construye un `complex` a partir de sus partes real e imaginaria.
+pub fn syn_complex(re: f64, im: f64) -> SynValue {
+    SynValue::Complex(Complex64::new(re, im))
+}
 
 // =========================================================
 // SendValue — representación owned, `Send`+`Sync`, para cruzar hilos
@@ -363,6 +398,8 @@ pub enum SendValue {
     Map(Vec<(String, SendValue)>),
     /// Snapshot binario (feature `bytes`): cruza el blackboard como copia owned (G7).
     Bytes(Vec<u8>),
+    /// Snapshot de un complejo (re, im): cruza el blackboard como copia owned (G7).
+    Complex(f64, f64),
 }
 
 /// Snapshot de un `SynValue` a `SendValue` (deep copy). Task/Builtin no cruzan: se
@@ -411,6 +448,8 @@ pub fn to_send(v: &SynValue) -> SendValue {
         SynValue::Secret(s) => SendValue::Text(s.to_string()),
         // Snapshot binario (copia owned, sin aliasing): G7.
         SynValue::Bytes(b) => SendValue::Bytes(b.to_vec()),
+        // Snapshot del complejo (re, im): copia owned (G7).
+        SynValue::Complex(z) => SendValue::Complex(z.re, z.im),
     }
 }
 
@@ -430,6 +469,7 @@ pub fn from_send(v: &SendValue) -> SynValue {
             syn_map(m)
         }
         SendValue::Bytes(v) => syn_bytes(v.clone()),
+        SendValue::Complex(re, im) => syn_complex(*re, *im),
     }
 }
 
@@ -451,6 +491,8 @@ impl fmt::Display for SendValue {
             }
             // Espeja el repr hex de `SynValue::Bytes` (mismo `bytes(<hex>)`).
             SendValue::Bytes(b) => write!(f, "{}", bytes_display(b)),
+            // Mismo formato `re±imi` que `SynValue::Complex`.
+            SendValue::Complex(re, im) => write!(f, "{}", complex_display(*re, *im)),
         }
     }
 }

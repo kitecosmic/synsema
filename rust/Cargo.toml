@@ -53,6 +53,12 @@ zeroize = "1"
 subtle = "2"
 hmac = "0.12"
 sha2 = "0.10"
+# Completitud matemática (Batch 4): ambas PURO-Rust, sin C → preservan el binario único
+# estático.
+#   libm        : funciones especiales (gamma/lgamma/erf/erfc); port Rust de musl libm (rust-lang).
+#   num-complex : tipo complejo + cmath (mismo ecosistema num-* que num-bigint/num-traits/num-integer).
+libm = "0.2"
+num-complex = "0.4"
 synsema-core = { path = "crates/synsema-core" }
 synsema-capabilities = { path = "crates/synsema-capabilities" }
 synsema-stdlib = { path = "crates/synsema-stdlib" }

@@ -16,3 +16,7 @@ rust_decimal.workspace = true
 # Tipo `secret`: zeroize del plaintext al drop + igualdad constant-time (§5 del spec).
 zeroize.workspace = true
 subtle.workspace = true
+# Completitud matemática (Batch 4): funciones especiales (libm) y tipo complejo + cmath
+# (num-complex). Ambas puro-Rust, sin C → binario único estático.
+libm.workspace = true
+num-complex.workspace = true
