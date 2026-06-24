@@ -285,13 +285,8 @@ pub fn keyword_lookup(word: &str) -> Option<TokenType> {
         "as" => As,
         "of" => Of,
         "type" => Type,
-        // Agentes
-        "agent" => Agent,
-        "spawn" => Spawn,
-        "share" => Share,
-        "observe" => Observe,
-        "state" => State,
-        "signal" => Signal,
+        // Agentes — SOFT (agent/spawn/share/observe/state/signal lexean como
+        // Identifier; el parser los reconoce por contexto). wait_for sigue reservada.
         "wait_for" => WaitFor,
         // Capacidades
         "require" => Require,
@@ -299,11 +294,8 @@ pub fn keyword_lookup(word: &str) -> Option<TokenType> {
         "deny" => Deny,
         "sandbox" => Sandbox,
         "verify" => Verify,
-        // Humano
-        "approve" => Approve,
-        "show" => Show,
-        "ask" => Ask,
-        "confirm" => Confirm,
+        // Humano — SOFT (approve/show/ask/confirm lexean como Identifier; el
+        // parser los reconoce por contexto).
         // Razonamiento
         "reason" => Reason,
         "intent" => Intent,
@@ -311,11 +303,8 @@ pub fn keyword_lookup(word: &str) -> Option<TokenType> {
         "decide" => Decide,
         "analyze" => Analyze,
         "generate" => Generate,
-        // Observabilidad
-        "trace" => Trace,
-        "log" => Log,
-        "measure" => Measure,
-        "checkpoint" => Checkpoint,
+        // Observabilidad — SOFT (trace/log/measure/checkpoint lexean como
+        // Identifier; el parser los reconoce por contexto).
         // Manejo de errores
         "try" => Try,
         "recover" => Recover,

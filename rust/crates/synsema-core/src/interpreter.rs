@@ -2955,3 +2955,126 @@ mod semantic_invariants {
         assert_eq!(line(src2), "false");
     }
 }
+
+#[cfg(test)]
+mod soft_dsl_keyword_tests {
+    use super::run_source;
+
+    fn out(src: &str) -> Vec<String> {
+        let r = run_source(src, "<test>");
+        assert!(r.success, "el programa falló: {:?}", r.errors);
+        r.output
+    }
+
+    fn ok(src: &str) {
+        let r = run_source(src, "<test>");
+        assert!(r.success, "el DSL debería parsear+correr: {:?}", r.errors);
+    }
+
+    // ---- Las 14 palabras ahora usables como NOMBRES ----
+
+    #[test]
+    fn show_as_task_name_and_call() {
+        // `task show(x)` (posición de nombre) + `show(5)` (seguido de `(` → llamada)
+        assert_eq!(out("task show(x)\n    give x * 2\nprint(text(show(5)))"), vec!["10"]);
+    }
+
+    #[test]
+    fn state_as_variable() {
+        assert_eq!(out("let state be 1\nprint(text(state))"), vec!["1"]);
+    }
+
+    #[test]
+    fn measure_as_variable() {
+        assert_eq!(out("let measure be 2\nprint(text(measure))"), vec!["2"]);
+    }
+
+    #[test]
+    fn log_as_task_name_and_call() {
+        assert_eq!(out("task log(m)\n    give m\nprint(log(\"x\"))"), vec!["x"]);
+    }
+
+    #[test]
+    fn soft_word_as_lambda_property() {
+        // `(s) => state of s` — `state` es campo/propiedad
+        assert_eq!(
+            out("let m be {\"state\": 7}\nlet f be (s) => state of s\nprint(text(f(m)))"),
+            vec!["7"]
+        );
+    }
+
+    #[test]
+    fn soft_word_as_map_key_and_property() {
+        // map key "log" + `log of m` (seguido de `of` → propiedad)
+        assert_eq!(out("let m be {\"log\": 1}\nprint(text(log of m))"), vec!["1"]);
+    }
+
+    #[test]
+    fn statement_soft_words_as_bare_value_names() {
+        // Las 10 palabras DSL de statement son identificadores ordinarios en
+        // expresión (no son expression-primaries), así que se leen como valor.
+        let src = "let agent be 1\nlet share be 2\nlet observe be 3\nlet signal be 4\n\
+                   let spawn be 5\nlet state be 6\nlet trace be 7\nlet log be 8\n\
+                   let measure be 9\nlet checkpoint be 10\n\
+                   print(text(agent + share + observe + signal + spawn + state + trace + log + measure + checkpoint))";
+        assert_eq!(out(src), vec!["55"]);
+    }
+
+    #[test]
+    fn expression_soft_words_as_task_names_and_calls() {
+        // ask/show/approve/confirm: usables como nombre de task + llamada `(`.
+        assert_eq!(out("task ask(q)\n    give q\nprint(ask(\"hi\"))"), vec!["hi"]);
+        assert_eq!(out("task approve(m)\n    give m\nprint(approve(\"ok\"))"), vec!["ok"]);
+        assert_eq!(out("task confirm(m)\n    give m\nprint(confirm(\"y\"))"), vec!["y"]);
+    }
+
+    // ---- El DSL sigue parseando + corriendo (regresión) ----
+
+    #[test]
+    fn dsl_log_still_works() {
+        ok("log \"msg\"");
+    }
+
+    #[test]
+    fn dsl_show_as_label_still_works() {
+        ok("show 42 as \"answer\"");
+    }
+
+    #[test]
+    fn dsl_share_and_observe_still_work() {
+        assert_eq!(out("share 5 as \"k\"\nobserve \"k\" as v\nprint(text(v))"), vec!["5"]);
+    }
+
+    #[test]
+    fn dsl_signal_still_works() {
+        ok("signal \"s\"");
+    }
+
+    #[test]
+    fn dsl_agent_and_spawn_still_work() {
+        ok("agent Researcher\n    task search(q)\n        give q\nspawn Researcher");
+    }
+
+    #[test]
+    fn dsl_approve_confirm_ask_still_work() {
+        ok("approve \"deploy?\"");
+        ok("confirm \"sure?\"");
+        ok("ask \"name?\" with [\"a\", \"b\"]");
+    }
+
+    #[test]
+    fn dsl_trace_measure_checkpoint_still_work() {
+        assert_eq!(out("trace \"t\"\n    print(\"x\")"), vec!["x"]);
+        assert_eq!(out("measure \"m\"\n    print(\"y\")"), vec!["y"]);
+        ok("checkpoint \"c\"");
+    }
+
+    // ---- Seguridad/core siguen reservadas (regresión) ----
+
+    #[test]
+    fn security_keywords_stay_reserved() {
+        // `require`/`sandbox` son keywords reservadas: no son nombres válidos.
+        assert!(!run_source("let require be 1", "<test>").success);
+        assert!(!run_source("let sandbox be 1", "<test>").success);
+    }
+}

@@ -204,6 +204,41 @@ impl Parser {
         tok.ty == TokenType::Identifier && tok.as_str() == word
     }
 
+    /// True si el token en `offset` hace que una palabra soft del DSL se use como
+    /// NOMBRE (identificador) en vez de como construcción: `(` `.` `[`, un operador
+    /// binario, o `of` (acceso a propiedad). §3 de soft-dsl-keywords-spec.
+    fn followed_by_name_use(&self, offset: usize) -> bool {
+        matches!(
+            self.peek(offset).ty,
+            TokenType::LParen
+                | TokenType::Dot
+                | TokenType::LBracket
+                | TokenType::Plus
+                | TokenType::Minus
+                | TokenType::Star
+                | TokenType::Slash
+                | TokenType::Percent
+                | TokenType::Power
+                | TokenType::Equal
+                | TokenType::NotEqual
+                | TokenType::Less
+                | TokenType::Greater
+                | TokenType::LessEqual
+                | TokenType::GreaterEqual
+                | TokenType::And
+                | TokenType::Or
+                | TokenType::Pipe
+                | TokenType::Of
+        )
+    }
+
+    /// True si la palabra soft del DSL `word` lidera aquí su construcción del DSL:
+    /// es esa palabra Y no la sigue un token de uso-como-nombre. Si no, es un
+    /// identificador ordinario (cae al camino de expresión). §3.
+    fn soft_dsl(&self, word: &str) -> bool {
+        self.check_word(word) && !self.followed_by_name_use(1)
+    }
+
     fn expect_word(&mut self, word: &str, message: &str) -> Result<Token, ParseError> {
         if self.check_word(word) {
             return Ok(self.advance());
@@ -322,6 +357,46 @@ impl Parser {
             return Ok(Some(self.parse_enum()?));
         }
 
+        // DSL de features (agentes/human/observabilidad) — SOFT keywords: son su
+        // construcción del DSL sólo si lideran el statement y no las sigue un token
+        // de uso-como-nombre (`(`/`.`/`[`/operador/`of`); si no, caen a expresión. §3.
+        if self.soft_dsl("agent") {
+            return Ok(Some(self.parse_agent()?));
+        }
+        if self.soft_dsl("spawn") {
+            return Ok(Some(self.parse_spawn()?));
+        }
+        if self.soft_dsl("share") {
+            return Ok(Some(self.parse_share()?));
+        }
+        if self.soft_dsl("observe") {
+            return Ok(Some(self.parse_observe()?));
+        }
+        if self.soft_dsl("signal") {
+            return Ok(Some(self.parse_signal()?));
+        }
+        if self.soft_dsl("approve") {
+            return Ok(Some(self.parse_approve()?));
+        }
+        if self.soft_dsl("show") {
+            return Ok(Some(self.parse_show()?));
+        }
+        if self.soft_dsl("confirm") {
+            return Ok(Some(self.parse_confirm()?));
+        }
+        if self.soft_dsl("trace") {
+            return Ok(Some(self.parse_trace()?));
+        }
+        if self.soft_dsl("log") {
+            return Ok(Some(self.parse_log()?));
+        }
+        if self.soft_dsl("measure") {
+            return Ok(Some(self.parse_measure()?));
+        }
+        if self.soft_dsl("checkpoint") {
+            return Ok(Some(self.parse_checkpoint()?));
+        }
+
         let tt = self.current().ty;
         let node = match tt {
             TokenType::Let => self.parse_let()?,
@@ -333,23 +408,11 @@ impl Parser {
             TokenType::Task => self.parse_task_definition()?,
             TokenType::Give => self.parse_give()?,
             TokenType::Stop => self.parse_stop()?,
-            TokenType::Agent => self.parse_agent()?,
-            TokenType::Spawn => self.parse_spawn()?,
-            TokenType::Share => self.parse_share()?,
-            TokenType::Observe => self.parse_observe()?,
-            TokenType::Signal => self.parse_signal()?,
             TokenType::WaitFor => self.parse_wait_for()?,
             TokenType::Require => self.parse_require()?,
             TokenType::Sandbox => self.parse_sandbox()?,
             TokenType::Invariant => self.parse_invariant()?,
             TokenType::Intent => self.parse_intent()?,
-            TokenType::Approve => self.parse_approve()?,
-            TokenType::Show => self.parse_show()?,
-            TokenType::Confirm => self.parse_confirm()?,
-            TokenType::Trace => self.parse_trace()?,
-            TokenType::Log => self.parse_log()?,
-            TokenType::Measure => self.parse_measure()?,
-            TokenType::Checkpoint => self.parse_checkpoint()?,
             TokenType::Type => self.parse_type_definition()?,
             TokenType::Try => self.parse_try_recover()?,
             _ => self.parse_expression()?, // sentencia-expresión
@@ -1821,6 +1884,22 @@ impl Parser {
         let loc = self.location();
         let tok = self.current().clone();
 
+        // Soft DSL keywords en posición de primary (ask/show/approve/confirm):
+        // son la construcción del DSL sólo si no las sigue `(`/`.`/`[`/operador/`of`;
+        // si no, caen al arm Identifier de abajo (uso como nombre). §3.
+        if self.soft_dsl("ask") {
+            return self.parse_ask_expr();
+        }
+        if self.soft_dsl("approve") {
+            return self.parse_approve();
+        }
+        if self.soft_dsl("confirm") {
+            return self.parse_confirm();
+        }
+        if self.soft_dsl("show") {
+            return self.parse_show();
+        }
+
         match tok.ty {
             TokenType::Number => {
                 self.advance();
@@ -1905,10 +1984,6 @@ impl Parser {
             TokenType::Decide => self.parse_decide_expr(),
             TokenType::Analyze => self.parse_analyze_expr(),
             TokenType::Generate => self.parse_generate_expr(),
-            TokenType::Ask => self.parse_ask_expr(),
-            TokenType::Approve => self.parse_approve(),
-            TokenType::Confirm => self.parse_confirm(),
-            TokenType::Show => self.parse_show(),
             _ => Err(ParseError::new(
                 format!(
                     "Unexpected token: {} ({})",
