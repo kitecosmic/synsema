@@ -21,7 +21,7 @@ use num_integer::Integer;
 use num_traits::ToPrimitive;
 
 use crate::interpreter::{Control, RuntimeError};
-use crate::number::Number;
+use crate::number::{Number, MIX_DECIMAL_FLOAT};
 use crate::types::{syn_bool, syn_float, syn_int, syn_number, SynValue};
 
 // -- helpers --
@@ -131,6 +131,10 @@ fn select_numbers(args: &[SynValue], name: &str) -> Result<Vec<Number>, Control>
             }
         }
     }
+    // Coherente con el orden del lenguaje: no mezclar Decimal y Float.
+    if nums.iter().any(|n| n.is_decimal()) && nums.iter().any(|n| matches!(n, Number::Float(_))) {
+        return Err(err(MIX_DECIMAL_FLOAT.to_string()));
+    }
     Ok(nums)
 }
 
@@ -161,6 +165,9 @@ pub fn clamp(args: &[SynValue]) -> Result<SynValue, Control> {
     let x = num(args, 0, "clamp")?;
     let lo = num(args, 1, "clamp")?;
     let hi = num(args, 2, "clamp")?;
+    if Number::mixes_decimal_float(x, lo) || Number::mixes_decimal_float(x, hi) {
+        return Err(err(MIX_DECIMAL_FLOAT.to_string()));
+    }
     if x.partial_cmp_num(lo) == Some(Ordering::Less) {
         Ok(syn_number(lo.clone()))
     } else if x.partial_cmp_num(hi) == Some(Ordering::Greater) {
@@ -184,12 +191,13 @@ pub fn hypot(args: &[SynValue]) -> Result<SynValue, Control> {
     binary_float(args, "hypot", f64::hypot)
 }
 
-/// `pow(base, exp)` espeja el operador `**`: entero^entero≥0 → entero, si no float.
+/// `pow(base, exp)` espeja el operador `**`: entero^entero≥0 → entero; Decimal base
+/// + exp entero → Decimal; mezclar Decimal y Float → error; si no → float.
 pub fn pow(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "pow")?;
     let base = num(args, 0, "pow")?;
     let exp = num(args, 1, "pow")?;
-    Ok(syn_number(base.pow(exp)))
+    base.checked_pow(exp).map(syn_number).map_err(err)
 }
 
 // =========================================================
@@ -360,7 +368,9 @@ pub fn sum(args: &[SynValue]) -> Result<SynValue, Control> {
     let nums = list_numbers(args, "sum")?;
     let mut acc = Number::Int(0);
     for n in &nums {
-        acc = acc.add(n); // preserva Int/Big; promueve a Float si hay alguno
+        // preserva Int/Big/Decimal; promueve a Float si hay floats; mezclar
+        // Decimal y Float → error (camino falible).
+        acc = acc.checked_add(n).map_err(err)?;
     }
     Ok(syn_number(acc))
 }
@@ -369,7 +379,7 @@ pub fn product(args: &[SynValue]) -> Result<SynValue, Control> {
     let nums = list_numbers(args, "product")?;
     let mut acc = Number::Int(1);
     for n in &nums {
-        acc = acc.mul(n);
+        acc = acc.checked_mul(n).map_err(err)?;
     }
     Ok(syn_number(acc))
 }
@@ -381,7 +391,7 @@ pub fn mean(args: &[SynValue]) -> Result<SynValue, Control> {
     }
     let mut acc = Number::Int(0);
     for n in &nums {
-        acc = acc.add(n);
+        acc = acc.checked_add(n).map_err(err)?;
     }
     Ok(syn_float(acc.to_f64() / nums.len() as f64))
 }

@@ -31,11 +31,8 @@ fn err(msg: &str) -> Control {
 }
 
 fn num_i64(n: &Number) -> i64 {
-    match n {
-        Number::Int(i) => *i,
-        Number::Float(f) => *f as i64,
-        Number::Big(b) => b.to_string().parse().unwrap_or(0),
-    }
+    // Trunca a i64 (Int/Big/Float/Decimal). Para tamaños de chunk/worker.
+    n.to_i64_trunc().unwrap_or(0)
 }
 
 /// Convierte un `Control` de error en `RuntimeError` (preservando la ubicación del

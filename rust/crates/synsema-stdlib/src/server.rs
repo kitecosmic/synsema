@@ -481,6 +481,9 @@ pub fn syn_to_json(v: &SynValue) -> Json {
         SynValue::Number(Number::Int(i)) => Json::Int(*i),
         SynValue::Number(Number::Float(f)) => Json::Float(*f),
         SynValue::Number(Number::Big(b)) => Json::BigInt(b.to_string()),
+        // Decimal: número JSON exacto (string verbatim, preserva escala: 1.50d → 1.50).
+        // Evita el drift de convertir a float; reusa el camino "número crudo".
+        SynValue::Number(Number::Decimal(d)) => Json::BigInt(d.to_string()),
         SynValue::Text(s) => Json::Str(s.to_string()),
         SynValue::List(l) => Json::Array(l.borrow().iter().map(syn_to_json).collect()),
         SynValue::Map(m) => {

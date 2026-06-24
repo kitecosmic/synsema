@@ -368,9 +368,23 @@ impl Lexer {
             }
         }
 
+        // Sufijo `d` → literal Decimal exacto (1.50d, 100d), pero SÓLO si no lo sigue
+        // un char de continuación de identificador: `1.50d`→Decimal, `1.50 d`→número
+        // + ident, `1.50dx`→número + ident `dx`.
+        let is_decimal = self.peek(0) == Some('d')
+            && !matches!(self.peek(1), Some(c) if c.is_alphanumeric() || c == '_');
+        if is_decimal {
+            self.advance(); // consume el sufijo 'd'
+        }
+
         let raw = self.slice(start, self.pos);
-        let clean: String = raw.chars().filter(|c| *c != '_').collect();
-        let value = if has_dot {
+        // dígitos sin separadores `_` ni el sufijo `d`.
+        let clean: String = raw.chars().filter(|c| *c != '_' && *c != 'd').collect();
+        let value = if is_decimal {
+            Number::Decimal(rust_decimal::Decimal::from_str_exact(&clean).map_err(|_| {
+                LexerError::new(format!("Invalid decimal literal: {}", raw), loc.clone())
+            })?)
+        } else if has_dot {
             Number::Float(clean.parse::<f64>().map_err(|_| {
                 LexerError::new(format!("Invalid float literal: {}", raw), loc.clone())
             })?)

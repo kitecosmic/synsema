@@ -20,7 +20,7 @@ use indexmap::IndexMap;
 use regex::Regex;
 
 use crate::ast::{Node, NodeKind, Program};
-use crate::number::Number;
+use crate::number::{Number, MIX_DECIMAL_FLOAT};
 use crate::parser::{parse_source, CompileError};
 use crate::templates::resolve_module_path;
 use crate::tokens::SourceLocation;
@@ -485,6 +485,10 @@ impl Interpreter {
         self.register("length", 1, Rc::new(|i, a, l| i.b_length(a, l)));
         self.register("text", 1, Rc::new(|i, a, l| i.b_to_text(a, l)));
         self.register("number", 1, Rc::new(|i, a, l| i.b_to_number(a, l)));
+        // Tipo Decimal (dinero exacto): constructor + conversión a float + introspección.
+        self.register("decimal", 1, Rc::new(|i, a, l| i.b_decimal(a, l)));
+        self.register("float", 1, Rc::new(|i, a, l| i.b_float(a, l)));
+        self.register("is_decimal", 1, Rc::new(|i, a, l| i.b_is_decimal(a, l)));
         // Redondeo a entero (PUROS — sin capability, como text/number). ties-to-even en
         // round() para igualar el `round` de Python.
         self.register("floor", 1, Rc::new(|i, a, l| i.b_round_op(a, l, "floor", f64::floor)));
@@ -1420,43 +1424,56 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 return Ok(syn_list(v));
             }
         }
-        // Aritmética
+        // Aritmética — por el camino FALIBLE: mezclar Decimal con Float es un error
+        // claro. Int/Big mezclan libremente con ambos.
         if let (SynValue::Number(a), SynValue::Number(b)) = (&left, &right) {
             match op {
-                "+" => return Ok(syn_number(a.add(b))),
-                "-" => return Ok(syn_number(a.sub(b))),
-                "*" => return Ok(syn_number(a.mul(b))),
+                "+" => return a.checked_add(b).map(syn_number).map_err(|e| err_at(e, loc)),
+                "-" => return a.checked_sub(b).map(syn_number).map_err(|e| err_at(e, loc)),
+                "*" => return a.checked_mul(b).map(syn_number).map_err(|e| err_at(e, loc)),
                 "/" => {
+                    if Number::mixes_decimal_float(a, b) {
+                        return Err(err_at(MIX_DECIMAL_FLOAT, loc));
+                    }
                     if b.is_zero() {
                         return Err(err_at("Division by zero", loc));
                     }
                     return Ok(syn_number(a.div(b)));
                 }
                 "%" => {
-                    return match a.modulo(b) {
-                        Some(n) => Ok(syn_number(n)),
-                        None => Err(err_at("Modulo by zero", loc)),
+                    return match a.checked_modulo(b) {
+                        Err(e) => Err(err_at(e, loc)),
+                        Ok(Some(n)) => Ok(syn_number(n)),
+                        Ok(None) => Err(err_at("Modulo by zero", loc)),
                     }
                 }
                 "**" => {
                     if a.is_zero() && b.is_negative() {
                         return Err(err_at("Zero cannot be raised to a negative power", loc));
                     }
-                    return Ok(syn_number(a.pow(b)));
+                    return a.checked_pow(b).map(syn_number).map_err(|e| err_at(e, loc));
                 }
                 _ => {}
             }
         }
-        // Comparación de igualdad
-        if op == "==" {
-            return Ok(syn_bool(left.syn_equals(&right)));
-        }
-        if op == "!=" {
-            return Ok(syn_bool(!left.syn_equals(&right)));
+        // Comparación de igualdad. El OPERADOR `==`/`!=` erroría al mezclar Decimal y
+        // Float (a diferencia de match/contains, que los consideran simplemente
+        // distintos para mantener total esa comparación).
+        if matches!(op, "==" | "!=") {
+            if let (SynValue::Number(a), SynValue::Number(b)) = (&left, &right) {
+                if Number::mixes_decimal_float(a, b) {
+                    return Err(err_at(MIX_DECIMAL_FLOAT, loc));
+                }
+            }
+            let eq = left.syn_equals(&right);
+            return Ok(syn_bool(if op == "==" { eq } else { !eq }));
         }
         // Orden
         if matches!(op, "<" | ">" | "<=" | ">=") {
             if let (SynValue::Number(a), SynValue::Number(b)) = (&left, &right) {
+                if Number::mixes_decimal_float(a, b) {
+                    return Err(err_at(MIX_DECIMAL_FLOAT, loc));
+                }
                 return Ok(syn_bool(ord_op(a.partial_cmp_num(b), op)));
             }
             if let (SynValue::Text(a), SynValue::Text(b)) = (&left, &right) {
@@ -1677,6 +1694,54 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             _ => return Err(err(format!("Cannot convert {} to number", v))),
         };
         Ok(syn_float(f))
+    }
+
+    /// `decimal(x)` → Decimal exacto. `decimal("1234.56")`/`decimal(int)` exactos;
+    /// `decimal(float)` → ERROR (usar string para evitar la imprecisión del float).
+    fn b_decimal(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        let v = nth(args, 0)?;
+        let d = match v {
+            SynValue::Number(Number::Decimal(d)) => *d,
+            SynValue::Number(Number::Float(_)) => {
+                return Err(err(
+                    "decimal(float) is not exact; use a string, e.g. decimal(\"1.50\"), \
+                     to avoid float imprecision",
+                ))
+            }
+            SynValue::Number(n) => n
+                .to_decimal()
+                .ok_or_else(|| err("number too large for an exact decimal"))?,
+            SynValue::Text(s) => rust_decimal::Decimal::from_str_exact(s.trim())
+                .map_err(|_| err(format!("Cannot parse {} as a decimal", v)))?,
+            _ => return Err(err(format!("Cannot convert {} to a decimal", v.type_name()))),
+        };
+        Ok(syn_number(Number::Decimal(d)))
+    }
+
+    /// `float(x)` → Float (lossy a propósito): convierte Decimal→Float, o parsea texto.
+    fn b_float(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        let v = nth(args, 0)?;
+        let f = match v {
+            SynValue::Number(n) => n.to_f64(),
+            SynValue::Bool(b) => {
+                if *b {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            SynValue::Text(s) => s
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| err(format!("Cannot convert {} to float", v)))?,
+            _ => return Err(err(format!("Cannot convert {} to float", v.type_name()))),
+        };
+        Ok(syn_float(f))
+    }
+
+    /// `is_decimal(x)` → true sólo si `x` es un Decimal.
+    fn b_is_decimal(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        Ok(syn_bool(matches!(nth(args, 0)?, SynValue::Number(Number::Decimal(_)))))
     }
 
     fn b_append(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -3266,5 +3331,132 @@ mod math_library_tests {
     fn log_soft_keyword_not_shadowed() {
         // No se registró un builtin `log`: `log "msg"` sigue siendo el DSL.
         assert!(run_source("log \"msg\"", "<test>").success);
+    }
+}
+
+#[cfg(test)]
+mod decimal_tests {
+    use super::run_source;
+
+    fn line(src: &str) -> String {
+        let r = run_source(src, "<test>");
+        assert!(r.success, "el programa falló: {:?}", r.errors);
+        assert_eq!(r.output.len(), 1, "se esperaba una línea: {:?}", r.output);
+        r.output[0].clone()
+    }
+
+    fn fails_with(src: &str, needle: &str) {
+        let r = run_source(src, "<test>");
+        assert!(!r.success, "se esperaba error para: {}", src);
+        assert!(
+            r.errors.iter().any(|e| e.contains(needle)),
+            "error esperado contiene {:?}, got {:?}",
+            needle,
+            r.errors
+        );
+    }
+
+    // ---- literal + exactitud ----
+    #[test]
+    fn literal_and_exactness() {
+        assert_eq!(line("print(text(0.1d + 0.2d == 0.3d))"), "true");
+        assert_eq!(line("print(text(19.99d * 3))"), "59.97");
+        assert_eq!(line("print(text(1.50d + 1.50d))"), "3.00"); // escala preservada
+        assert_eq!(line("print(text(2d ** 3))"), "8"); // ** con exp entero → Decimal
+        assert_eq!(line("print(text(2d ** 10))"), "1024");
+    }
+
+    // ---- constructor ----
+    #[test]
+    fn constructor() {
+        assert_eq!(line("print(text(decimal(\"1234.56\")))"), "1234.56");
+        assert_eq!(line("print(text(decimal(100)))"), "100");
+        assert_eq!(line("print(text(decimal(\"0.10\")))"), "0.10"); // escala del string
+        fails_with("print(decimal(1.5))", "decimal(float) is not exact");
+    }
+
+    // ---- error de mezcla Decimal⊕Float ----
+    #[test]
+    fn mixing_errors() {
+        fails_with("print(1.50d + 1.5)", "cannot mix decimal and float");
+        fails_with("print(1.5 - 1.50d)", "cannot mix decimal and float");
+        fails_with("print(1.50d * 2.0)", "cannot mix decimal and float");
+        fails_with("print(1.50d / 2.0)", "cannot mix decimal and float");
+        fails_with("print(text(1.50d < 1.5))", "cannot mix decimal and float");
+        fails_with("print(text(1.50d == 1.5))", "cannot mix decimal and float");
+        fails_with("print(text(1.50d != 1.5))", "cannot mix decimal and float");
+        // Int/Big mezclan libremente:
+        assert_eq!(line("print(text(5 + 1.50d))"), "6.50");
+        assert_eq!(line("print(text(5 == 5d))"), "true");
+        assert_eq!(line("print(text(1.50d < 2))"), "true");
+    }
+
+    // ---- división / precisión ----
+    #[test]
+    fn division_precision() {
+        assert_eq!(line("print(text(1d / 4d))"), "0.25"); // exacto
+        // precisión por defecto de rust_decimal: 28 dígitos significativos, bancario.
+        assert_eq!(line("print(text(1d / 3d))"), "0.3333333333333333333333333333");
+    }
+
+    // ---- display / escala ----
+    #[test]
+    fn display_scale() {
+        assert_eq!(line("print(text(1.50d))"), "1.50");
+        assert_eq!(line("print(text(100d))"), "100");
+        assert_eq!(line("print(text(0.1d))"), "0.1");
+    }
+
+    // ---- conversión float() ----
+    #[test]
+    fn conversion_float() {
+        assert_eq!(line("print(text(float(1.50d)))"), "1.5"); // Float (lossy)
+        assert_eq!(line("print(text(is_decimal(float(1.50d))))"), "false");
+        assert_eq!(line("print(text(float(100d)))"), "100.0");
+    }
+
+    // ---- math que preserva Decimal ----
+    #[test]
+    fn math_preserves_decimal() {
+        assert_eq!(line("print(text(abs(0 - 1.50d)))"), "1.50");
+        assert_eq!(line("print(text(min(1.5d, 2.5d, 0.5d)))"), "0.5");
+        assert_eq!(line("print(text(max([1.5d, 2.5d, 0.5d])))"), "2.5");
+        assert_eq!(line("print(text(sum([1.10d, 2.20d])))"), "3.30");
+        assert_eq!(line("print(text(product([1.5d, 2d])))"), "3.0");
+        assert_eq!(line("print(text(clamp(12.5d, 0d, 10d)))"), "10");
+        // trascendentes/raíces coercionan a f64 → Float (irracional, ok):
+        assert_eq!(line("print(text(round_to(sqrt(2d), 4)))"), "1.4142");
+        // math sobre Decimal⊕Float también erroría:
+        fails_with("print(min(1.5d, 2.0))", "cannot mix decimal and float");
+    }
+
+    // ---- type_of / is_decimal ----
+    #[test]
+    fn type_introspection() {
+        assert_eq!(line("print(text(type_of(1.5d)))"), "number");
+        assert_eq!(line("print(text(is_decimal(1.5d)))"), "true");
+        assert_eq!(line("print(text(is_decimal(1.5)))"), "false");
+        assert_eq!(line("print(text(is_decimal(5)))"), "false");
+        assert_eq!(line("print(text(is_decimal(\"x\")))"), "false");
+    }
+
+    // ---- regresión: int/float/bigint intactos; en match/contains Decimal≠Float SIN error ----
+    #[test]
+    fn regression_other_numbers_unchanged() {
+        assert_eq!(line("print(text(2 + 3))"), "5"); // int
+        assert_eq!(line("print(text(0.1 + 0.2))"), "0.30000000000000004"); // float drift intacto
+        assert_eq!(line("print(text(2 ** 100))"), "1267650600228229401496703205376"); // bigint
+        assert_eq!(line("print(text(1.5 < 2.5))"), "true");
+    }
+
+    #[test]
+    fn match_and_contains_decimal_vs_float_unequal_no_error() {
+        // match: un Decimal contra un patrón Float NO matchea (y NO erroría).
+        let m = "let d be 1.5d\nmatch d\n    is 1.5\n        print(\"float\")\n    is 1.5d\n        print(\"decimal\")\n    otherwise\n        print(\"otro\")\n";
+        assert_eq!(line(m), "decimal");
+        // contains: Decimal vs Float → false (sin error); Decimal vs Decimal → true.
+        assert_eq!(line("print(text(contains([1.5d], 1.5)))"), "false");
+        assert_eq!(line("print(text(contains([1.5d], 1.5d)))"), "true");
+        assert_eq!(line("print(text(contains([1.5], 1.5d)))"), "false");
     }
 }

@@ -11,6 +11,8 @@ num-traits.workspace = true
 num-integer.workspace = true
 indexmap.workspace = true
 regex.workspace = true
+# Tipo Decimal exacto (dinero/finanzas): rust_decimal, puro Rust, 96-bit.
+rust_decimal.workspace = true
 # Tipo `secret`: zeroize del plaintext al drop + igualdad constant-time (§5 del spec).
 zeroize.workspace = true
 subtle.workspace = true

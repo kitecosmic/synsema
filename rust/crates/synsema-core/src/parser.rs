@@ -111,6 +111,7 @@ fn token_value_repr(v: &TokenValue) -> String {
         TokenValue::Number(Number::Int(n)) => n.to_string(),
         TokenValue::Number(Number::Big(b)) => b.to_string(),
         TokenValue::Number(Number::Float(x)) => py_float_repr(*x),
+        TokenValue::Number(Number::Decimal(d)) => d.to_string(),
         TokenValue::Str(s) => py_repr_str(s),
         TokenValue::Int(n) => n.to_string(),
         // Un TEMPLATE siempre tiene su propio arm en parse_primary, así que nunca

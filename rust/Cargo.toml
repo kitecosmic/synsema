@@ -28,6 +28,9 @@ num-integer = "0.1"
 # Map ordenado (Python dict preserva orden de inserción) y regex (puro Rust, sin C).
 indexmap = "2"
 regex = "1"
+# Decimal exacto base-10 para dinero/finanzas (tipo Decimal). Puro Rust (96-bit,
+# 28-29 dígitos significativos), sin deps C → preserva el binario único estático.
+rust_decimal = "1"
 # RNG no-cripto para los builtins random()/random_int() (paridad con el `random` de
 # Python). getrandom ya entra transitivamente; rand da la API de distribución/rango.
 rand = "0.8"

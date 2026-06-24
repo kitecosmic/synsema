@@ -14,7 +14,12 @@ use std::fmt;
 
 use num_bigint::{BigInt, Sign};
 use num_integer::Integer;
-use num_traits::{FromPrimitive, ToPrimitive, Zero};
+use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
+use rust_decimal::Decimal;
+
+/// Mensaje único para el error de mezclar Decimal con Float (camino falible).
+pub const MIX_DECIMAL_FLOAT: &str =
+    "cannot mix decimal and float; convert with float(x) or decimal(...)";
 
 #[derive(Clone, Debug)]
 pub enum Number {
@@ -24,6 +29,8 @@ pub enum Number {
     Big(BigInt),
     /// Punto flotante.
     Float(f64),
+    /// Decimal exacto base-10 (dinero/finanzas): 96-bit, preserva escala.
+    Decimal(Decimal),
 }
 
 impl Number {
@@ -72,17 +79,23 @@ impl Number {
         }
     }
 
-    /// True si es entero (`Int` o `Big`), no `Float`.
+    /// True si es entero (`Int` o `Big`), no `Float`/`Decimal`.
     pub fn is_integer(&self) -> bool {
         matches!(self, Number::Int(_) | Number::Big(_))
     }
 
-    /// True si el valor es cero (entero o float).
+    /// True si es un `Decimal` (tipo dinero exacto).
+    pub fn is_decimal(&self) -> bool {
+        matches!(self, Number::Decimal(_))
+    }
+
+    /// True si el valor es cero (entero, float o decimal).
     pub fn is_zero(&self) -> bool {
         match self {
             Number::Int(n) => *n == 0,
             Number::Big(b) => b.is_zero(),
             Number::Float(x) => *x == 0.0,
+            Number::Decimal(d) => d.is_zero(),
         }
     }
 
@@ -92,6 +105,7 @@ impl Number {
             Number::Int(n) => *n < 0,
             Number::Big(b) => b.sign() == Sign::Minus,
             Number::Float(x) => *x < 0.0,
+            Number::Decimal(d) => d.is_sign_negative() && !d.is_zero(),
         }
     }
 
@@ -100,24 +114,46 @@ impl Number {
             Number::Int(n) => *n as f64,
             Number::Big(b) => b.to_f64().unwrap_or(f64::INFINITY),
             Number::Float(x) => *x,
+            Number::Decimal(d) => d.to_f64().unwrap_or(f64::NAN),
         }
     }
 
-    /// Vista como BigInt si es entero; `None` si es float.
+    /// Vista como BigInt si es entero (incl. un `Decimal` con parte fraccionaria
+    /// cero); `None` si es float o un decimal no entero.
     pub fn as_bigint(&self) -> Option<BigInt> {
         match self {
             Number::Int(n) => Some(BigInt::from(*n)),
             Number::Big(b) => Some(b.clone()),
             Number::Float(_) => None,
+            Number::Decimal(d) => {
+                if d.fract().is_zero() {
+                    // Un Decimal entero siempre entra en i128 (máx ~7.9e28).
+                    d.to_i128().map(BigInt::from)
+                } else {
+                    None
+                }
+            }
         }
     }
 
-    /// Entero a usize si es no-negativo y entra (para índices/longitudes).
+    /// Vista como `Decimal` exacto si es representable (Int/Big/Decimal); `None`
+    /// para Float (lossy a propósito) o Big fuera del rango de Decimal.
+    pub fn to_decimal(&self) -> Option<Decimal> {
+        match self {
+            Number::Int(n) => Some(Decimal::from(*n)),
+            Number::Big(b) => Decimal::from_str_exact(&b.to_string()).ok(),
+            Number::Decimal(d) => Some(*d),
+            Number::Float(_) => None,
+        }
+    }
+
+    /// Entero a i64 truncando (para índices/longitudes).
     pub fn to_i64_trunc(&self) -> Option<i64> {
         match self {
             Number::Int(n) => Some(*n),
             Number::Big(b) => b.to_i64(),
             Number::Float(x) => Some(x.trunc() as i64),
+            Number::Decimal(d) => d.to_i64(),
         }
     }
 
@@ -125,7 +161,42 @@ impl Number {
         matches!(a, Number::Float(_)) || matches!(b, Number::Float(_))
     }
 
+    fn any_decimal(a: &Number, b: &Number) -> bool {
+        a.is_decimal() || b.is_decimal()
+    }
+
+    /// True si un operando es Decimal y el otro Float (mezcla prohibida).
+    pub fn mixes_decimal_float(a: &Number, b: &Number) -> bool {
+        (a.is_decimal() && matches!(b, Number::Float(_)))
+            || (matches!(a, Number::Float(_)) && b.is_decimal())
+    }
+
+    /// Operación binaria entre números donde al menos uno es Decimal. Decimal⊕
+    /// Decimal/Int/Big → Decimal exacto. La mezcla con Float NO debería llegar acá
+    /// (el intérprete usa los `checked_*` y erroría antes); por totalidad cae a
+    /// Float. Un overflow de Decimal o un Big fuera de rango también cae a Float.
+    fn decimal_binop(
+        a: &Number,
+        b: &Number,
+        dec: impl Fn(Decimal, Decimal) -> Option<Decimal>,
+        flt: impl Fn(f64, f64) -> f64,
+    ) -> Number {
+        if Number::any_float(a, b) {
+            return Number::Float(flt(a.to_f64(), b.to_f64()));
+        }
+        match (a.to_decimal(), b.to_decimal()) {
+            (Some(x), Some(y)) => match dec(x, y) {
+                Some(r) => Number::Decimal(r),
+                None => Number::Float(flt(a.to_f64(), b.to_f64())),
+            },
+            _ => Number::Float(flt(a.to_f64(), b.to_f64())),
+        }
+    }
+
     pub fn add(&self, other: &Number) -> Number {
+        if Number::any_decimal(self, other) {
+            return Number::decimal_binop(self, other, |x, y| x.checked_add(y), |x, y| x + y);
+        }
         match (self, other) {
             _ if Number::any_float(self, other) => Number::Float(self.to_f64() + other.to_f64()),
             (Number::Int(a), Number::Int(b)) => match a.checked_add(*b) {
@@ -137,6 +208,9 @@ impl Number {
     }
 
     pub fn sub(&self, other: &Number) -> Number {
+        if Number::any_decimal(self, other) {
+            return Number::decimal_binop(self, other, |x, y| x.checked_sub(y), |x, y| x - y);
+        }
         match (self, other) {
             _ if Number::any_float(self, other) => Number::Float(self.to_f64() - other.to_f64()),
             (Number::Int(a), Number::Int(b)) => match a.checked_sub(*b) {
@@ -148,6 +222,9 @@ impl Number {
     }
 
     pub fn mul(&self, other: &Number) -> Number {
+        if Number::any_decimal(self, other) {
+            return Number::decimal_binop(self, other, |x, y| x.checked_mul(y), |x, y| x * y);
+        }
         match (self, other) {
             _ if Number::any_float(self, other) => Number::Float(self.to_f64() * other.to_f64()),
             (Number::Int(a), Number::Int(b)) => match a.checked_mul(*b) {
@@ -158,14 +235,37 @@ impl Number {
         }
     }
 
-    /// División: en Synsema (como Python `/`) SIEMPRE devuelve float.
-    /// El divisor-cero lo chequea el intérprete antes de llamar.
+    /// División: con Decimal (sin Float) → Decimal exacto/redondeado (precisión por
+    /// defecto de rust_decimal: ~28 dígitos significativos, redondeo bancario). Si no,
+    /// en Synsema (como Python `/`) SIEMPRE devuelve float. El divisor-cero lo chequea
+    /// el intérprete antes de llamar.
     pub fn div(&self, other: &Number) -> Number {
+        if Number::any_decimal(self, other) && !Number::any_float(self, other) {
+            if let (Some(x), Some(y)) = (self.to_decimal(), other.to_decimal()) {
+                if let Some(r) = x.checked_div(y) {
+                    return Number::Decimal(r);
+                }
+            }
+        }
         Number::Float(self.to_f64() / other.to_f64())
     }
 
     /// Módulo floored (signo del divisor, como Python). `None` si divisor es cero.
     pub fn modulo(&self, other: &Number) -> Option<Number> {
+        if Number::any_decimal(self, other) && !Number::any_float(self, other) {
+            let (x, y) = (self.to_decimal()?, other.to_decimal()?);
+            if y.is_zero() {
+                return None;
+            }
+            let r = x.checked_rem(y)?;
+            // Truncado → floored: ajustar al signo del divisor (como Python).
+            let r = if !r.is_zero() && (r.is_sign_negative() != y.is_sign_negative()) {
+                r.checked_add(y).unwrap_or(r)
+            } else {
+                r
+            };
+            return Some(Number::Decimal(r));
+        }
         if Number::any_float(self, other) {
             let (a, b) = (self.to_f64(), other.to_f64());
             if b == 0.0 {
@@ -218,11 +318,75 @@ impl Number {
             },
             Number::Big(b) => Number::from_bigint(-b),
             Number::Float(x) => Number::Float(-x),
+            Number::Decimal(d) => Number::Decimal(-*d),
+        }
+    }
+
+    // -- Camino falible: la mezcla Decimal⊕Float es un ERROR del lenguaje --
+    // El intérprete (y math.rs) rutean la aritmética por estos `checked_*` para
+    // que `1.50d + 1.5` falle claro. Int/Big mezclan libremente con ambos.
+
+    pub fn checked_add(&self, other: &Number) -> Result<Number, String> {
+        Self::guard_mix(self, other)?;
+        Ok(self.add(other))
+    }
+    pub fn checked_sub(&self, other: &Number) -> Result<Number, String> {
+        Self::guard_mix(self, other)?;
+        Ok(self.sub(other))
+    }
+    pub fn checked_mul(&self, other: &Number) -> Result<Number, String> {
+        Self::guard_mix(self, other)?;
+        Ok(self.mul(other))
+    }
+    pub fn checked_div(&self, other: &Number) -> Result<Number, String> {
+        Self::guard_mix(self, other)?;
+        Ok(self.div(other))
+    }
+    pub fn checked_modulo(&self, other: &Number) -> Result<Option<Number>, String> {
+        Self::guard_mix(self, other)?;
+        Ok(self.modulo(other))
+    }
+
+    /// `**` falible: mezcla con Float → error; con base/exp Decimal el exponente
+    /// debe ser ENTERO (exactitud), si no → error (recomendación del spec §6).
+    pub fn checked_pow(&self, other: &Number) -> Result<Number, String> {
+        Self::guard_mix(self, other)?;
+        if Number::any_decimal(self, other) {
+            let exp = other.as_bigint().ok_or_else(|| {
+                "decimal ** non-integer exponent is not supported (it would lose \
+                 exactness); use float(x) for an approximate power"
+                    .to_string()
+            })?;
+            let base = self
+                .to_decimal()
+                .ok_or_else(|| "number too large for an exact decimal power".to_string())?;
+            return decimal_powi(base, &exp);
+        }
+        Ok(self.pow(other))
+    }
+
+    fn guard_mix(a: &Number, b: &Number) -> Result<(), String> {
+        if Number::mixes_decimal_float(a, b) {
+            Err(MIX_DECIMAL_FLOAT.to_string())
+        } else {
+            Ok(())
         }
     }
 
     /// Orden numérico (para `< > <= >=`). `None` sólo con NaN.
     pub fn partial_cmp_num(&self, other: &Number) -> Option<Ordering> {
+        // Decimal⊕Float: incomparable acá (el operador de orden erroría antes vía el
+        // chequeo de mezcla; en sort cae a Equal con unwrap_or). Decimal con Int/Big/
+        // Decimal: comparación de valor exacta.
+        if Number::mixes_decimal_float(self, other) {
+            return None;
+        }
+        if Number::any_decimal(self, other) {
+            return match (self.to_decimal(), other.to_decimal()) {
+                (Some(a), Some(b)) => a.partial_cmp(&b),
+                _ => None,
+            };
+        }
         match (self, other) {
             (Number::Float(a), Number::Float(b)) => a.partial_cmp(b),
             (Number::Float(a), _) => a.partial_cmp(&other.to_f64()),
@@ -233,12 +397,48 @@ impl Number {
 
     /// Igualdad numérica con semántica Python (`5 == 5.0` es true).
     pub fn num_eq(&self, other: &Number) -> bool {
+        // Decimal⊕Float: simplemente distintos (sin error — mantiene total el `==`
+        // de match/contains). Decimal con Int/Big/Decimal: igualdad de valor exacta
+        // (`5 == 5d` → true; `1.50d == 1.5d` → true).
+        if Number::mixes_decimal_float(self, other) {
+            return false;
+        }
+        if Number::any_decimal(self, other) {
+            return matches!(
+                (self.to_decimal(), other.to_decimal()),
+                (Some(a), Some(b)) if a == b
+            );
+        }
         match (self, other) {
             (Number::Float(a), Number::Float(b)) => a == b,
             (Number::Float(a), _) => *a == other.to_f64(),
             (_, Number::Float(b)) => self.to_f64() == *b,
             _ => self.as_bigint() == other.as_bigint(),
         }
+    }
+}
+
+/// `base^exp` exacto con `exp` ENTERO (BigInt). Exp negativo → división con la
+/// precisión por defecto de rust_decimal. Overflow / exp gigante → error.
+fn decimal_powi(base: Decimal, exp: &BigInt) -> Result<Number, String> {
+    let neg = exp.sign() == Sign::Minus;
+    let e = exp
+        .abs()
+        .to_u32()
+        .ok_or_else(|| "decimal exponent too large".to_string())?;
+    let mut acc = Decimal::ONE;
+    for _ in 0..e {
+        acc = acc
+            .checked_mul(base)
+            .ok_or_else(|| "decimal power overflow".to_string())?;
+    }
+    if neg {
+        Decimal::ONE
+            .checked_div(acc)
+            .map(Number::Decimal)
+            .ok_or_else(|| "decimal power division failed".to_string())
+    } else {
+        Ok(Number::Decimal(acc))
     }
 }
 
@@ -294,12 +494,15 @@ pub fn py_float_str(x: f64) -> String {
 }
 
 /// Igualdad estructural robusta a la representación (Int vs Big por valor; float
-/// sólo iguala a float; entero ≠ float). La igualdad `==` de Synsema usa `num_eq`.
+/// sólo iguala a float; decimal sólo iguala a decimal por VALOR — escala-insensible).
+/// La igualdad `==` del lenguaje Synsema usa `num_eq` (que sí mezcla Int con Decimal).
 impl PartialEq for Number {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Number::Float(a), Number::Float(b)) => a == b,
             (Number::Float(_), _) | (_, Number::Float(_)) => false,
+            (Number::Decimal(a), Number::Decimal(b)) => a == b,
+            (Number::Decimal(_), _) | (_, Number::Decimal(_)) => false,
             _ => self.as_bigint() == other.as_bigint(),
         }
     }
@@ -311,6 +514,8 @@ impl fmt::Display for Number {
             Number::Int(n) => write!(f, "{}", n),
             Number::Big(b) => write!(f, "{}", b),
             Number::Float(x) => write!(f, "{}", py_float_str(*x)),
+            // rust_decimal preserva la escala: 1.50d → "1.50", 100d → "100".
+            Number::Decimal(d) => write!(f, "{}", d),
         }
     }
 }

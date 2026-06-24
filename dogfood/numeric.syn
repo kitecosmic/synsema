@@ -29,3 +29,14 @@ print(`ln(0) is infinite: {text(is_infinite(ln(0)))}`)
 
 -- trig en radianes
 print(`sin(pi/2) = {text(round_to(sin(pi / 2), 6))}, degrees(pi) = {text(round_to(degrees(pi), 6))}`)
+
+-- dinero EXACTO con el tipo Decimal (sufijo `d`): sin drift de float
+print(`0.1d + 0.2d == 0.3d: {text(0.1d + 0.2d == 0.3d)}`)
+let precio be 19.99d
+print(`precio x 3 = {text(precio * 3)}`)
+let carrito be [1.10d, 2.25d, 9.99d]
+let subtotal be sum(carrito)
+let iva be subtotal * decimal("0.21")
+print(`subtotal = {text(subtotal)}, IVA(21%) = {text(round_to(float(iva), 2))}, total = {text(subtotal + iva)}`)
+print(`5 + 1.50d = {text(5 + 1.50d)} (Int mezcla con Decimal)`)
+print(`a float explícito: {text(float(precio))}`)
