@@ -4,7 +4,7 @@
 //! semánticamente (en vez de search-and-replace de texto): find_tasks, find_usages,
 //! rename_task, add_parameter, extract_task, summarize, make_call/make_text, etc.
 
-use crate::ast::{Node, NodeKind, Program};
+use crate::ast::{Arg, Node, NodeKind, Param, Program};
 use crate::tokens::SourceLocation;
 
 fn gen_loc() -> SourceLocation {
@@ -61,16 +61,32 @@ fn children(n: &Node) -> Vec<&Node> {
             }
             v
         }
-        MatchArm { pattern, body } => {
+        MatchArm { pattern, guard, body } => {
             let mut v = vec![pattern.as_ref()];
+            if let Some(g) = guard {
+                v.push(g.as_ref());
+            }
             v.extend(body.iter());
             v
         }
+        // Patrones (Batch 2): descienden a sus sub-patrones; wildcard es hoja.
+        WildcardPattern => Vec::new(),
+        ListPattern { prefix, suffix, .. } => {
+            let mut v: Vec<&Node> = prefix.iter().collect();
+            v.extend(suffix.iter());
+            v
+        }
+        MapPattern { fields } => fields.iter().filter_map(|(_, p)| p.as_ref()).collect(),
         StopStatement { value } => value.iter().map(|b| b.as_ref()).collect(),
-        TaskDefinition { body, .. } => body.iter().collect(),
+        // Los defaults de params son sub-expresiones (Batch 2): se recorren.
+        TaskDefinition { parameters, body, .. } => {
+            let mut v: Vec<&Node> = parameters.iter().filter_map(|p| p.default.as_ref()).collect();
+            v.extend(body.iter());
+            v
+        }
         TaskCall { name, arguments } => {
             let mut v = vec![name.as_ref()];
-            v.extend(arguments.iter());
+            v.extend(arguments.iter().map(|a| &a.value));
             v
         }
         GiveStatement { value } => value.iter().map(|b| b.as_ref()).collect(),
@@ -338,8 +354,8 @@ pub fn rename_task(program: &mut Program, old_name: &str, new_name: &str) -> usi
 /// Agrega un parámetro a una definición de task (si no está ya).
 pub fn add_parameter(task: &mut Node, param_name: &str) {
     if let NodeKind::TaskDefinition { parameters, .. } = &mut task.kind {
-        if !parameters.iter().any(|p| p == param_name) {
-            parameters.push(param_name.to_string());
+        if !parameters.iter().any(|p| p.name == param_name) {
+            parameters.push(Param { name: param_name.to_string(), default: None });
         }
     }
 }
@@ -358,7 +374,10 @@ pub fn extract_task(
         location: gen_loc(),
         kind: NodeKind::TaskDefinition {
             name: task_name.to_string(),
-            parameters: params.to_vec(),
+            parameters: params
+                .iter()
+                .map(|n| Param { name: n.clone(), default: None })
+                .collect(),
             body: extracted,
             return_type: None,
             capabilities: Vec::new(),
@@ -388,7 +407,10 @@ pub fn make_identifier(name: &str) -> Node {
 pub fn make_call(task_name: &str, args: Vec<Node>) -> Node {
     Node {
         location: gen_loc(),
-        kind: NodeKind::TaskCall { name: Box::new(make_identifier(task_name)), arguments: args },
+        kind: NodeKind::TaskCall {
+            name: Box::new(make_identifier(task_name)),
+            arguments: args.into_iter().map(|value| Arg { name: None, value }).collect(),
+        },
     }
 }
 
@@ -428,7 +450,7 @@ pub fn summarize(program: &Program) -> Summary {
         match &stmt.kind {
             NodeKind::TaskDefinition { name, parameters, .. } => s.tasks.push(TaskInfo {
                 name: name.clone(),
-                params: parameters.clone(),
+                params: parameters.iter().map(|p| p.name.clone()).collect(),
                 line: stmt.location.line,
             }),
             NodeKind::TypeDefinition { name, fields } => s.types.push(TypeInfo {
@@ -498,16 +520,32 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
             }
             v
         }
-        MatchArm { pattern, body } => {
+        MatchArm { pattern, guard, body } => {
             let mut v = vec![pattern.as_mut()];
+            if let Some(g) = guard {
+                v.push(g.as_mut());
+            }
             v.extend(body.iter_mut());
             v
         }
+        // Patrones (Batch 2): descienden a sus sub-patrones; wildcard es hoja.
+        WildcardPattern => Vec::new(),
+        ListPattern { prefix, suffix, .. } => {
+            let mut v: Vec<&mut Node> = prefix.iter_mut().collect();
+            v.extend(suffix.iter_mut());
+            v
+        }
+        MapPattern { fields } => fields.iter_mut().filter_map(|(_, p)| p.as_mut()).collect(),
         StopStatement { value } => value.iter_mut().map(|b| b.as_mut()).collect(),
-        TaskDefinition { body, .. } => body.iter_mut().collect(),
+        TaskDefinition { parameters, body, .. } => {
+            let mut v: Vec<&mut Node> =
+                parameters.iter_mut().filter_map(|p| p.default.as_mut()).collect();
+            v.extend(body.iter_mut());
+            v
+        }
         TaskCall { name, arguments } => {
             let mut v = vec![name.as_mut()];
-            v.extend(arguments.iter_mut());
+            v.extend(arguments.iter_mut().map(|a| &mut a.value));
             v
         }
         GiveStatement { value } => value.iter_mut().map(|b| b.as_mut()).collect(),
@@ -684,7 +722,8 @@ mod tests {
         let p = prog(SAMPLE);
         let task = find_task_by_name(&p, "add").unwrap();
         if let NodeKind::TaskDefinition { parameters, .. } = &task.kind {
-            assert_eq!(parameters, &vec!["a".to_string(), "b".to_string()]);
+            let names: Vec<String> = parameters.iter().map(|p| p.name.clone()).collect();
+            assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
         } else {
             panic!("not a task");
         }
@@ -730,7 +769,7 @@ mod tests {
             .unwrap();
         add_parameter(task, "c");
         if let NodeKind::TaskDefinition { parameters, .. } = &task.kind {
-            assert!(parameters.contains(&"c".to_string()));
+            assert!(parameters.iter().any(|p| p.name == "c"));
         }
     }
 

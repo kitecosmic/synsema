@@ -132,6 +132,8 @@ pub enum TokenType {
     RBrace,
     Comma,
     Dot,
+    /// `...` (exactamente tres puntos) — spread en patrones de lista (Batch 2).
+    Spread,
     Colon,
     Newline,
     Indent,
@@ -245,6 +247,7 @@ impl TokenType {
             RBrace => "RBRACE",
             Comma => "COMMA",
             Dot => "DOT",
+            Spread => "SPREAD",
             Colon => "COLON",
             Newline => "NEWLINE",
             Indent => "INDENT",

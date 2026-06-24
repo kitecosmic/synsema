@@ -19,7 +19,7 @@ use std::rc::Rc;
 use indexmap::IndexMap;
 use regex::Regex;
 
-use crate::ast::{Node, NodeKind, Program};
+use crate::ast::{Node, NodeKind, Param, Program};
 use crate::number::{Number, MIX_DECIMAL_FLOAT};
 use crate::parser::{parse_source, CompileError};
 use crate::templates::resolve_module_path;
@@ -489,6 +489,11 @@ impl Interpreter {
         self.register("decimal", 1, Rc::new(|i, a, l| i.b_decimal(a, l)));
         self.register("float", 1, Rc::new(|i, a, l| i.b_float(a, l)));
         self.register("is_decimal", 1, Rc::new(|i, a, l| i.b_is_decimal(a, l)));
+        // Tipo bytes (binario): constructor/conversión + introspección. PUROS (sin
+        // capability, como text/number/decimal). El hex/base64 es hand-rolled (bytesutil).
+        self.register("bytes", -1, Rc::new(|i, a, l| i.b_bytes(a, l)));
+        self.register("decode", -1, Rc::new(|i, a, l| i.b_decode(a, l)));
+        self.register("is_bytes", 1, Rc::new(|i, a, l| i.b_is_bytes(a, l)));
         // Redondeo a entero (PUROS — sin capability, como text/number). ties-to-even en
         // round() para igualar el `round` de Python.
         self.register("floor", 1, Rc::new(|i, a, l| i.b_round_op(a, l, "floor", f64::floor)));
@@ -606,42 +611,219 @@ impl Interpreter {
         Ok(None)
     }
 
-    /// Reconoce un patrón de variante de enum en un arm de `match`:
-    /// - `PropertyAccess` sobre un map con "__enum" → `Some((id, None))` — sin binding.
-    /// - `TaskCall` cuyo `name` es ese `PropertyAccess` Y **todos** los args son
-    ///   identificadores → `Some((id, Some([nombres])))` — binding posicional del payload.
-    /// - cualquier otra cosa → `None` (cae a la igualdad de valor: cubre formas como
-    ///   `is Order.paid(100)` (value-match), literales, identificadores, maps, etc.).
-    fn variant_pattern(
+    /// Matcher de patrones a nivel TOP de un arm `match` (G2). Aplica el matcher
+    /// recursivo SÓLO para patrones estructurales (wildcard/list/map) o variantes de
+    /// enum; para un identificador suelto u otra expresión a nivel top usa la
+    /// **comparación por valor** de siempre (evaluar + `syn_equals`). Así `is x` (top)
+    /// sigue comparando con la variable `x`, NUNCA liga.
+    fn match_pattern_top(
         &mut self,
         pattern: &Node,
+        value: &SynValue,
         env: &Rc<RefCell<Environment>>,
-    ) -> Result<Option<(String, Option<Vec<String>>)>, Control> {
+    ) -> Result<Option<Vec<(String, SynValue)>>, Control> {
         match &pattern.kind {
-            NodeKind::PropertyAccess { property_name, object } => {
-                Ok(self
-                    .enum_variant_id(property_name, object, env)?
-                    .map(|id| (id, None)))
+            // Estructurales y variantes de enum → matcher recursivo.
+            NodeKind::WildcardPattern
+            | NodeKind::ListPattern { .. }
+            | NodeKind::MapPattern { .. }
+            | NodeKind::PropertyAccess { .. }
+            | NodeKind::TaskCall { .. } => self.match_pattern(pattern, value, env),
+            // Identificador suelto / literal / cualquier otra expresión → valor (G2).
+            _ => {
+                let p = self.exec(pattern, env)?;
+                Ok(if value.syn_equals(&p) { Some(Vec::new()) } else { None })
             }
+        }
+    }
+
+    /// Matcher recursivo de patrones (Batch 2). Devuelve `Some(bindings)` si matchea
+    /// (acumulando `(nombre, valor)` de los binders), `None` si no. Acá un `Identifier`
+    /// SÍ liga: sólo se llega vía sub-patrón de un patrón estructural / variante (a nivel
+    /// top G2 lo desvía `match_pattern_top`). El `_` ya se canonizó a `WildcardPattern`.
+    fn match_pattern(
+        &mut self,
+        pattern: &Node,
+        value: &SynValue,
+        env: &Rc<RefCell<Environment>>,
+    ) -> Result<Option<Vec<(String, SynValue)>>, Control> {
+        match &pattern.kind {
+            NodeKind::WildcardPattern => Ok(Some(Vec::new())),
+            NodeKind::Identifier { name } => Ok(Some(vec![(name.clone(), value.clone())])),
+            NodeKind::ListPattern { prefix, rest, suffix } => {
+                self.match_list_pattern(prefix, rest, suffix, value, env)
+            }
+            NodeKind::MapPattern { fields } => self.match_map_pattern(fields, value, env),
+            // Variante de enum sin payload: `is Enum.variant`.
+            NodeKind::PropertyAccess { property_name, object } => {
+                if let Some(id) = self.enum_variant_id(property_name, object, env)? {
+                    return self.match_variant(value, &id, None, env);
+                }
+                let p = self.exec(pattern, env)?;
+                Ok(if value.syn_equals(&p) { Some(Vec::new()) } else { None })
+            }
+            // Variante de enum con payload: `is Enum.variant(p1, …)` — sub-patrones.
             NodeKind::TaskCall { name, arguments } => {
                 if let NodeKind::PropertyAccess { property_name, object } = &name.kind {
-                    // Binding sólo si TODOS los args son identificadores; si no, es
-                    // un patrón de valor (p.ej. `is Order.paid(100)`) → None.
-                    let mut binders = Vec::with_capacity(arguments.len());
-                    for a in arguments {
-                        match &a.kind {
-                            NodeKind::Identifier { name } => binders.push(name.clone()),
-                            _ => return Ok(None),
+                    // Sólo es patrón de variante si todos los args son posicionales.
+                    if arguments.iter().all(|a| a.name.is_none()) {
+                        if let Some(id) = self.enum_variant_id(property_name, object, env)? {
+                            let subs: Vec<&Node> = arguments.iter().map(|a| &a.value).collect();
+                            return self.match_variant(value, &id, Some(&subs), env);
                         }
                     }
-                    if let Some(id) = self.enum_variant_id(property_name, object, env)? {
-                        return Ok(Some((id, Some(binders))));
+                }
+                // No es variante → patrón de valor (evaluar + comparar).
+                let p = self.exec(pattern, env)?;
+                Ok(if value.syn_equals(&p) { Some(Vec::new()) } else { None })
+            }
+            // Literal / cualquier otra expresión → patrón de valor.
+            _ => {
+                let p = self.exec(pattern, env)?;
+                Ok(if value.syn_equals(&p) { Some(Vec::new()) } else { None })
+            }
+        }
+    }
+
+    /// Matchea un valor contra una variante de enum (`__variant == id`) y, si hay
+    /// sub-patrones, los liga recursivamente al payload posicional (orden declarado).
+    fn match_variant(
+        &mut self,
+        value: &SynValue,
+        variant_id: &str,
+        subs: Option<&[&Node]>,
+        env: &Rc<RefCell<Environment>>,
+    ) -> Result<Option<Vec<(String, SynValue)>>, Control> {
+        let is_match = match value {
+            SynValue::Map(m) => matches!(
+                m.borrow().get("__variant"),
+                Some(SynValue::Text(t)) if t.as_ref() == variant_id
+            ),
+            _ => false,
+        };
+        if !is_match {
+            return Ok(None);
+        }
+        match subs {
+            // `is Enum.variant` sin paréntesis: matchea la variante, sin ligar.
+            None => Ok(Some(Vec::new())),
+            Some(subpats) => {
+                // Payload = valores del map salvo "__variant", en orden de inserción.
+                let payload: Vec<SynValue> = match value {
+                    SynValue::Map(m) => m
+                        .borrow()
+                        .iter()
+                        .filter(|(k, _)| k.as_str() != "__variant")
+                        .map(|(_, v)| v.clone())
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                if subpats.len() != payload.len() {
+                    return Err(err(format!(
+                        "variant {} binds {} fields, got {}",
+                        variant_id,
+                        payload.len(),
+                        subpats.len()
+                    )));
+                }
+                let mut binds = Vec::new();
+                for (sp, pv) in subpats.iter().zip(payload.iter()) {
+                    match self.match_pattern(sp, pv, env)? {
+                        Some(b) => binds.extend(b),
+                        None => return Ok(None),
                     }
                 }
-                Ok(None)
+                Ok(Some(binds))
             }
-            _ => Ok(None),
         }
+    }
+
+    /// Matchea un `ListPattern` contra un valor (sólo `SynValue::List`). Sin spread:
+    /// longitud exacta. Con spread: `len >= prefix+suffix`; liga prefix desde el frente,
+    /// suffix desde atrás, y (si el spread tiene nombre) el medio como sub-lista.
+    fn match_list_pattern(
+        &mut self,
+        prefix: &[Node],
+        rest: &Option<Option<String>>,
+        suffix: &[Node],
+        value: &SynValue,
+        env: &Rc<RefCell<Environment>>,
+    ) -> Result<Option<Vec<(String, SynValue)>>, Control> {
+        // Clonamos los items (Rc-clones baratos) para no sostener el borrow del RefCell
+        // mientras recursamos (match_pattern toma &mut self).
+        let items: Vec<SynValue> = match value {
+            SynValue::List(l) => l.borrow().clone(),
+            _ => return Ok(None),
+        };
+        let n = items.len();
+        let mut binds = Vec::new();
+        match rest {
+            None => {
+                if n != prefix.len() {
+                    return Ok(None);
+                }
+                for (p, v) in prefix.iter().zip(items.iter()) {
+                    match self.match_pattern(p, v, env)? {
+                        Some(b) => binds.extend(b),
+                        None => return Ok(None),
+                    }
+                }
+            }
+            Some(rest_name) => {
+                if n < prefix.len() + suffix.len() {
+                    return Ok(None);
+                }
+                for (p, v) in prefix.iter().zip(items[..prefix.len()].iter()) {
+                    match self.match_pattern(p, v, env)? {
+                        Some(b) => binds.extend(b),
+                        None => return Ok(None),
+                    }
+                }
+                let suffix_start = n - suffix.len();
+                for (p, v) in suffix.iter().zip(items[suffix_start..].iter()) {
+                    match self.match_pattern(p, v, env)? {
+                        Some(b) => binds.extend(b),
+                        None => return Ok(None),
+                    }
+                }
+                if let Some(name) = rest_name {
+                    let mid: Vec<SynValue> = items[prefix.len()..suffix_start].to_vec();
+                    binds.push((name.clone(), syn_list(mid)));
+                }
+            }
+        }
+        Ok(Some(binds))
+    }
+
+    /// Matchea un `MapPattern` contra un valor (sólo `SynValue::Map`). **Subset**: cada
+    /// clave del patrón debe existir; claves extra del map se ignoran. `None` → bindea la
+    /// clave a una var del mismo nombre; `Some(subpat)` → recursa. Server NO se matchea
+    /// (sus campos no son un map plano); documentado.
+    fn match_map_pattern(
+        &mut self,
+        fields: &[(String, Option<Node>)],
+        value: &SynValue,
+        env: &Rc<RefCell<Environment>>,
+    ) -> Result<Option<Vec<(String, SynValue)>>, Control> {
+        let map = match value {
+            SynValue::Map(m) => m.borrow().clone(),
+            _ => return Ok(None),
+        };
+        let mut binds = Vec::new();
+        for (k, subpat) in fields {
+            let fv = match map.get(k) {
+                Some(v) => v.clone(),
+                None => return Ok(None),
+            };
+            match subpat {
+                None => binds.push((k.clone(), fv)),
+                Some(p) => match self.match_pattern(p, &fv, env)? {
+                    Some(b) => binds.extend(b),
+                    None => return Ok(None),
+                },
+            }
+        }
+        Ok(Some(binds))
     }
 
     // =========================================================
@@ -759,6 +941,18 @@ impl Interpreter {
                             None => Err(err_at(format!("Map has no key '{}'", key), loc)),
                         }
                     }
+                    // `b[i]` → entero (valor del byte 0..=255). Sin índices negativos
+                    // (out-of-bounds igual que la rama List; misma forma de mensaje).
+                    SynValue::Bytes(b) => {
+                        let i = num_to_i64(&idx)?;
+                        if i < 0 || i >= b.len() as i64 {
+                            return Err(err_at(
+                                format!("Index {} out of bounds (bytes length {})", i, b.len()),
+                                loc,
+                            ));
+                        }
+                        Ok(syn_int(b[i as usize] as i64))
+                    }
                     _ => Err(err_at(format!("Cannot index into {}", obj.type_name()), loc)),
                 }
             }
@@ -855,61 +1049,25 @@ impl Interpreter {
             NodeKind::MatchStatement { value, arms, otherwise } => {
                 let v = self.exec(value, env)?;
                 for arm in arms {
-                    if let NodeKind::MatchArm { pattern, body } = &arm.kind {
-                        // Patrón de variante `Enum.variant` (con o sin binding del payload).
-                        if let Some((variant_id, binders)) = self.variant_pattern(pattern, env)? {
-                            // ¿el escrutinio es un map cuyo "__variant" == variant_id?
-                            let is_match = if let SynValue::Map(m) = &v {
-                                matches!(
-                                    m.borrow().get("__variant"),
-                                    Some(SynValue::Text(t)) if t.as_ref() == variant_id.as_str()
-                                )
-                            } else {
-                                false
-                            };
-                            if !is_match {
-                                continue;
-                            }
-                            match binders {
-                                // `is Enum.variant` (sin paréntesis): sin binding.
-                                None => return self.exec_block(body, env),
-                                // `is Enum.variant(b1, …)`: ligá el payload posicionalmente
-                                // (valores del map salvo "__variant", en orden declarado) en
-                                // un Environment HIJO scopeado al arm; aridad exacta.
-                                Some(names) => {
-                                    let payload: Vec<SynValue> = match &v {
-                                        SynValue::Map(m) => m
-                                            .borrow()
-                                            .iter()
-                                            .filter(|(k, _)| k.as_str() != "__variant")
-                                            .map(|(_, val)| val.clone())
-                                            .collect(),
-                                        _ => Vec::new(),
-                                    };
-                                    if names.len() != payload.len() {
-                                        return Err(err_at(
-                                            format!(
-                                                "variant {} binds {} fields, got {}",
-                                                variant_id,
-                                                payload.len(),
-                                                names.len()
-                                            ),
-                                            loc,
-                                        ));
-                                    }
-                                    let arm_env = Environment::child(env, "match-arm");
-                                    for (name, val) in names.iter().zip(payload.into_iter()) {
-                                        env_set(&arm_env, name, val);
-                                    }
-                                    return self.exec_block(body, &arm_env);
-                                }
+                    if let NodeKind::MatchArm { pattern, guard, body } = &arm.kind {
+                        // El patrón liga (en patrones estructurales/variantes) o compara
+                        // por valor (a nivel top, G2). `None` → no matchea, próximo arm.
+                        let binds = match self.match_pattern_top(pattern, &v, env)? {
+                            Some(b) => b,
+                            None => continue,
+                        };
+                        // Los binders viven en un Environment HIJO scopeado al arm; el
+                        // guard se evalúa con ellos en scope.
+                        let arm_env = Environment::child(env, "match-arm");
+                        for (name, val) in binds {
+                            env_set(&arm_env, &name, val);
+                        }
+                        if let Some(g) = guard {
+                            if !self.exec(g, &arm_env)?.is_truthy() {
+                                continue; // guard falso → próximo arm
                             }
                         }
-                        // Cualquier otro patrón: la igualdad de valor de SIEMPRE.
-                        let p = self.exec(pattern, env)?;
-                        if v.syn_equals(&p) {
-                            return self.exec_block(body, env);
-                        }
+                        return self.exec_block(body, &arm_env);
                     }
                 }
                 // Ningún arm `is` matcheó: corré el bloque `otherwise` si existe.
@@ -955,20 +1113,29 @@ impl Interpreter {
             }
             NodeKind::TaskCall { name, arguments } => {
                 let func = self.exec(name, env)?;
+                // Evaluá cada arg preservando su `name` (named vs posicional).
                 let mut args = Vec::with_capacity(arguments.len());
                 for arg in arguments {
-                    args.push(self.exec(arg, env)?);
+                    let val = self.exec(&arg.value, env)?;
+                    args.push((arg.name.clone(), val));
                 }
-                self.call_value(func, args, loc)
+                self.call_value_named(func, args, loc)
             }
             NodeKind::LambdaExpression { parameters, body } => {
                 // Una lambda es un task anónimo cuyo cuerpo es un `give <expr>`
                 // implícito, que cierra sobre el entorno actual. Se reusa el
                 // camino de llamada existente (entorno hijo → bind params →
                 // exec body → catch Give). No se hace env_set: es anónima.
+                // Las lambdas no tienen sintaxis de default (bounded): cada nombre de
+                // param se mapea a `Param { default: None }`. SÍ aceptan llamadas con args
+                // nombrados (tienen nombres de param).
+                let lambda_params: Vec<Param> = parameters
+                    .iter()
+                    .map(|n| Param { name: n.clone(), default: None })
+                    .collect();
                 let task = Rc::new(SynTaskValue {
                     name: "<lambda>".to_string(),
-                    parameters: parameters.clone(),
+                    parameters: lambda_params,
                     body: vec![Node::new(
                         loc.clone(),
                         NodeKind::GiveStatement { value: Some(body.clone()) },
@@ -1371,6 +1538,17 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 
             // -- Sin executor en el oráculo (no alcanzables en programas válidos) --
             NodeKind::MatchArm { .. } => Err(err_at("No executor for node type: MatchArm", loc)),
+            // Nodos de patrón: sólo válidos en posición de patrón (los consume
+            // `match_pattern`), nunca se evalúan como expresión.
+            NodeKind::WildcardPattern => {
+                Err(err_at("No executor for node type: WildcardPattern", loc))
+            }
+            NodeKind::ListPattern { .. } => {
+                Err(err_at("No executor for node type: ListPattern", loc))
+            }
+            NodeKind::MapPattern { .. } => {
+                Err(err_at("No executor for node type: MapPattern", loc))
+            }
             NodeKind::RouteDefinition { .. } => {
                 Err(err_at("No executor for node type: RouteDefinition", loc))
             }
@@ -1417,6 +1595,15 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             if let SynValue::Text(r) = &right {
                 return Ok(syn_text(format!("{}{}", left, r)));
+            }
+            // `bytes + bytes` → bytes nuevos (concat). Va DESPUÉS del check de secret y
+            // de las ramas de Text (`bytes + text`/`text + bytes` coercionan vía Display,
+            // produciendo texto con el repr `bytes(...)`) y ANTES del fallback aritmético.
+            if let (SynValue::Bytes(l), SynValue::Bytes(r)) = (&left, &right) {
+                let mut v = Vec::with_capacity(l.len() + r.len());
+                v.extend_from_slice(l);
+                v.extend_from_slice(r);
+                return Ok(syn_bytes(v));
             }
             if let (SynValue::List(l), SynValue::List(r)) = (&left, &right) {
                 let mut v = l.borrow().clone();
@@ -1541,10 +1728,25 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
     }
 
+    /// Llamada con args sólo posicionales (camino de siempre: pipes, apply/where,
+    /// callbacks internos, etc.). Envuelve cada uno como `(None, v)` y delega en
+    /// `call_value_named`.
     fn call_value(
         &mut self,
         func: SynValue,
         args: Vec<SynValue>,
+        loc: &SourceLocation,
+    ) -> Result<SynValue, Control> {
+        let named = args.into_iter().map(|v| (None, v)).collect();
+        self.call_value_named(func, named, loc)
+    }
+
+    /// Llamada con args posicionales y/o nombrados (Batch 2). Lleva el tracking de
+    /// recursión; el binding lo hace `call_value_named_inner`.
+    fn call_value_named(
+        &mut self,
+        func: SynValue,
+        args: Vec<(Option<String>, SynValue)>,
         loc: &SourceLocation,
     ) -> Result<SynValue, Control> {
         self.recursion_depth += 1;
@@ -1552,27 +1754,88 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             self.recursion_depth -= 1;
             return Err(err("maximum recursion depth exceeded"));
         }
-        let result = self.call_value_inner(func, args, loc);
+        let result = self.call_value_named_inner(func, args, loc);
         self.recursion_depth -= 1;
         result
     }
 
-    fn call_value_inner(
+    fn call_value_named_inner(
         &mut self,
         func: SynValue,
-        args: Vec<SynValue>,
+        args: Vec<(Option<String>, SynValue)>,
         loc: &SourceLocation,
     ) -> Result<SynValue, Control> {
         match func {
             SynValue::Builtin(bt) => {
+                // Los builtins no declaran nombres de param: un arg nombrado es error
+                // claro (sintaxis nueva, G3). El camino posicional queda intacto.
+                let mut pos = Vec::with_capacity(args.len());
+                for (name, v) in args {
+                    if let Some(n) = name {
+                        return Err(err_at(
+                            format!("builtin '{}' does not accept named arguments", n),
+                            loc,
+                        ));
+                    }
+                    pos.push(v);
+                }
                 let f = bt.func.clone();
-                f(self, &args, loc)
+                f(self, &pos, loc)
             }
             SynValue::Task(task) => {
                 let call_env = Environment::child(&task.closure_env, &format!("call:{}", task.name));
+                let nparams = task.parameters.len();
+                // Repartición: cada slot de param recibe a lo sumo un valor.
+                let mut slots: Vec<Option<SynValue>> = vec![None; nparams];
+                let mut seen_named = false;
+                let mut pos_idx = 0usize;
+                for (name, value) in args {
+                    match name {
+                        None => {
+                            // Posicional tras nombrado → error (sintaxis nueva, G3).
+                            if seen_named {
+                                return Err(err_at(
+                                    "positional argument after named argument",
+                                    loc,
+                                ));
+                            }
+                            // Aridad permisiva (G3): un posicional extra se descarta,
+                            // igual que antes (no es error).
+                            if pos_idx < nparams {
+                                slots[pos_idx] = Some(value);
+                            }
+                            pos_idx += 1;
+                        }
+                        Some(n) => {
+                            seen_named = true;
+                            match task.parameters.iter().position(|p| p.name == n) {
+                                Some(idx) => {
+                                    if slots[idx].is_some() {
+                                        return Err(err_at(
+                                            format!("duplicate argument '{}'", n),
+                                            loc,
+                                        ));
+                                    }
+                                    slots[idx] = Some(value);
+                                }
+                                None => {
+                                    return Err(err_at(format!("unknown parameter '{}'", n), loc))
+                                }
+                            }
+                        }
+                    }
+                }
+                // Llená cada param: valor recibido, o default (eval en call time en el
+                // closure_env, G5), o `nothing` (aridad permisiva, G3).
                 for (i, param) in task.parameters.iter().enumerate() {
-                    let v = args.get(i).cloned().unwrap_or(SynValue::Nothing);
-                    env_set(&call_env, param, v);
+                    let v = match slots[i].take() {
+                        Some(v) => v,
+                        None => match &param.default {
+                            Some(default_node) => self.exec(default_node, &task.closure_env)?,
+                            None => SynValue::Nothing,
+                        },
+                    };
+                    env_set(&call_env, &param.name, v);
                 }
                 match self.exec_block(&task.body, &call_env) {
                     Ok(v) => Ok(v),
@@ -1651,6 +1914,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             SynValue::Text(s) => Ok(syn_int(s.chars().count() as i64)),
             SynValue::List(l) => Ok(syn_int(l.borrow().len() as i64)),
             SynValue::Map(m) => Ok(syn_int(m.borrow().len() as i64)),
+            SynValue::Bytes(b) => Ok(syn_int(b.len() as i64)),
             _ => Err(err(format!("Cannot get length of {}", v.type_name()))),
         }
     }
@@ -1744,6 +2008,97 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         Ok(syn_bool(matches!(nth(args, 0)?, SynValue::Number(Number::Decimal(_)))))
     }
 
+    /// `bytes(value, encoding?)` → bytes. PURO (sin capability). Conversión hacia
+    /// binario; el `encoding` (2º arg) sólo aplica a un primer arg de texto.
+    /// - `bytes(text)` / `bytes(text, "utf8")` → UTF-8 del texto.
+    /// - `bytes(text, "hex")` → decodifica hex (error si longitud impar o char no-hex).
+    /// - `bytes(text, "base64")` → decodifica base64 RFC-4648 con padding (error si inválido).
+    /// - `bytes(list)` → de una lista de enteros (error si algún elemento no es int 0..=255).
+    /// - `bytes(bytes)` → identidad (clona el `Rc`).
+    /// - `bytes(secret)` → ERROR (G6: el plaintext no se extrae a bytes).
+    fn b_bytes(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        if args.is_empty() || args.len() > 2 {
+            return Err(err("bytes() takes 1 or 2 arguments"));
+        }
+        match nth(args, 0)? {
+            // Identidad: clona el Rc (inmutable, sin copia de datos).
+            SynValue::Bytes(b) => Ok(SynValue::Bytes(b.clone())),
+            // G6: nunca materializar el plaintext de un secret en bytes user-space.
+            SynValue::Secret(_) => Err(err("Cannot convert secret to bytes")),
+            SynValue::Text(s) => {
+                let enc = bytes_encoding_arg(args)?;
+                match enc.as_deref().unwrap_or("utf8") {
+                    "utf8" => Ok(syn_bytes(s.as_bytes().to_vec())),
+                    "hex" => crate::bytesutil::hex_decode(s).map(syn_bytes).map_err(err),
+                    "base64" => crate::bytesutil::b64_decode(s).map(syn_bytes).map_err(err),
+                    other => Err(err(format!(
+                        "unsupported encoding {:?} for bytes(); use one of: utf8, hex, base64",
+                        other
+                    ))),
+                }
+            }
+            SynValue::List(l) => {
+                let items = l.borrow();
+                let mut out = Vec::with_capacity(items.len());
+                for (i, e) in items.iter().enumerate() {
+                    match e {
+                        SynValue::Number(Number::Int(n)) if (0..=255).contains(n) => {
+                            out.push(*n as u8)
+                        }
+                        _ => {
+                            return Err(err(format!(
+                                "bytes(list): element {} is not an integer in 0..=255",
+                                i
+                            )))
+                        }
+                    }
+                }
+                Ok(syn_bytes(out))
+            }
+            other => Err(err(format!("Cannot convert {} to bytes", other.type_name()))),
+        }
+    }
+
+    /// `decode(value, encoding?)` → texto. Inverso simétrico de `bytes`. El primer arg
+    /// DEBE ser bytes. UTF-8 por defecto es **estricto** (error en inválidos, G4); la
+    /// variante lossy (`U+FFFD`) es opt-in explícito con `"utf8_lossy"`.
+    /// - `decode(bytes)` / `decode(bytes, "utf8")` → texto (UTF-8 estricto).
+    /// - `decode(bytes, "utf8_lossy")` → texto con `U+FFFD` en inválidos.
+    /// - `decode(bytes, "hex")` → texto hex en minúsculas.
+    /// - `decode(bytes, "base64")` → texto base64 con padding.
+    /// - `decode(secret)` → ERROR (G6; cae al error de tipo: un secret no es bytes).
+    fn b_decode(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        if args.is_empty() || args.len() > 2 {
+            return Err(err("decode() takes 1 or 2 arguments"));
+        }
+        let b = match nth(args, 0)? {
+            SynValue::Bytes(b) => b,
+            other => return Err(err(format!("decode expects bytes, got {}", other.type_name()))),
+        };
+        match bytes_encoding_arg(args)?.as_deref().unwrap_or("utf8") {
+            "utf8" => match std::str::from_utf8(b) {
+                Ok(s) => Ok(syn_text(s)),
+                Err(e) => Err(err(format!(
+                    "decode: invalid UTF-8 at byte offset {} (use \"utf8_lossy\" to replace \
+                     invalid bytes)",
+                    e.valid_up_to()
+                ))),
+            },
+            "utf8_lossy" => Ok(syn_text(String::from_utf8_lossy(b).into_owned())),
+            "hex" => Ok(syn_text(crate::bytesutil::hex_encode(b))),
+            "base64" => Ok(syn_text(crate::bytesutil::b64_encode(b))),
+            other => Err(err(format!(
+                "unsupported encoding {:?} for decode(); use one of: utf8, utf8_lossy, hex, base64",
+                other
+            ))),
+        }
+    }
+
+    /// `is_bytes(x)` → true sólo si `x` es bytes.
+    fn b_is_bytes(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        Ok(syn_bool(matches!(nth(args, 0)?, SynValue::Bytes(_))))
+    }
+
     fn b_append(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
         let lst = nth(args, 0)?;
         let item = nth(args, 1)?.clone();
@@ -1791,6 +2146,23 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             SynValue::Text(s) => Ok(syn_bool(s.contains(&raw_str(item)))),
             SynValue::Map(m) => Ok(syn_bool(m.borrow().contains_key(&raw_str(item)))),
+            SynValue::Bytes(b) => match item {
+                // Subsecuencia contigua de bytes; el vacío siempre está contenido.
+                SynValue::Bytes(needle) => {
+                    let found = needle.is_empty()
+                        || (needle.len() <= b.len()
+                            && b.windows(needle.len()).any(|w| w == &needle[..]));
+                    Ok(syn_bool(found))
+                }
+                // Un byte suelto (entero 0..=255) presente en la secuencia.
+                SynValue::Number(Number::Int(n)) if (0..=255).contains(n) => {
+                    Ok(syn_bool(b.contains(&(*n as u8))))
+                }
+                other => Err(err(format!(
+                    "contains(bytes, ...): expected bytes or an integer 0..=255, got {}",
+                    other.type_name()
+                ))),
+            },
             _ => Err(err(format!("Cannot check containment in {}", collection.type_name()))),
         }
     }
@@ -1872,6 +2244,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 let chars: Vec<char> = t.chars().collect();
                 let (s, e) = py_slice_range(chars.len(), start, end);
                 Ok(syn_text(chars[s..e].iter().collect::<String>()))
+            }
+            SynValue::Bytes(b) => {
+                let (s, e) = py_slice_range(b.len(), start, end);
+                Ok(syn_bytes(b[s..e].to_vec()))
             }
             _ => Err(err(format!("Cannot slice {}", coll.type_name()))),
         }
@@ -2145,6 +2521,16 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 
 fn nth(args: &[SynValue], i: usize) -> Result<&SynValue, Control> {
     args.get(i).ok_or_else(|| err("missing argument"))
+}
+
+/// Lee el arg opcional de encoding (2º) de `bytes`/`decode`: `None` si no se pasó,
+/// `Some(enc)` si es texto, error si está presente pero no es texto.
+fn bytes_encoding_arg(args: &[SynValue]) -> Result<Option<String>, Control> {
+    match args.get(1) {
+        None => Ok(None),
+        Some(SynValue::Text(s)) => Ok(Some(s.to_string())),
+        Some(other) => Err(err(format!("encoding must be text, got {}", other.type_name()))),
+    }
 }
 
 /// Concatenación que **propaga el taint** (#10): el resultado es un `secret` cuyo

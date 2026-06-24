@@ -612,8 +612,19 @@ impl Lexer {
                 self.advance();
                 self.emit(TokenType::Comma, TokenValue::Str(",".into()), loc, ",".into());
             } else if ch == '.' {
-                self.advance();
-                self.emit(TokenType::Dot, TokenValue::Str(".".into()), loc, ".".into());
+                // `...` (EXACTAMENTE tres puntos) → Spread; cualquier otra cosa → Dot.
+                // No se introduce `..`: dos puntos siguen siendo Dot+Dot, y `a.b.c`
+                // (property chain) sigue lexeando como Dot/Dot (G6). Para `....` se emite
+                // Spread + Dot (3 puntos + 1).
+                if self.peek(1) == Some('.') && self.peek(2) == Some('.') {
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                    self.emit(TokenType::Spread, TokenValue::Str("...".into()), loc, "...".into());
+                } else {
+                    self.advance();
+                    self.emit(TokenType::Dot, TokenValue::Str(".".into()), loc, ".".into());
+                }
             } else if ch == ':' {
                 self.advance();
                 self.emit(TokenType::Colon, TokenValue::Str(":".into()), loc, ":".into());

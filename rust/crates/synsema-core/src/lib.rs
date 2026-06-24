@@ -6,6 +6,7 @@
 pub mod addressable;
 pub mod ast;
 pub mod ast_api;
+pub mod bytesutil;
 pub mod flat_syntax;
 pub mod interpreter;
 pub mod lexer;

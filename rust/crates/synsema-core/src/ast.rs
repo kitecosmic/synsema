@@ -36,6 +36,22 @@ impl Node {
     }
 }
 
+/// Parámetro de un `task`: nombre + default opcional (Batch 2). El default es un
+/// `Node` (AST) que se evalúa en CALL TIME, en el `closure_env` del task (G5).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Param {
+    pub name: String,
+    pub default: Option<Node>,
+}
+
+/// Argumento de una llamada a `task` (Batch 2): valor + nombre opcional. `name = None`
+/// → posicional; `name = Some(n)` → nombrado (`f(timeout = 5)`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Arg {
+    pub name: Option<String>,
+    pub value: Node,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum NodeKind {
     // -- Literales --
@@ -122,7 +138,26 @@ pub enum NodeKind {
     },
     MatchArm {
         pattern: Box<Node>,
+        /// Guard opcional `when <cond>`; se evalúa con los binders del patrón en scope.
+        guard: Option<Box<Node>>,
         body: Vec<Node>,
+    },
+    // -- Patrones (sólo válidos en posición de patrón, dentro de un `match`) --
+    /// `_` — wildcard: matchea cualquier valor, no liga.
+    WildcardPattern,
+    /// `[a, b]` / `[h, ...rest]` / `[...init, last]` / `[a, ...mid, z]` / `[]`.
+    ListPattern {
+        /// Sub-patrones antes del spread (o todos, si no hay spread).
+        prefix: Vec<Node>,
+        /// `Some(Some(name))` = `...name`; `Some(None)` = `...` anónimo; `None` = sin spread.
+        rest: Option<Option<String>>,
+        /// Sub-patrones después del spread.
+        suffix: Vec<Node>,
+    },
+    /// `{name, age}` (subset, bindea las claves) / `{status: 200, body}` (clave con subpatrón).
+    MapPattern {
+        /// (clave, subpatrón?). `None` = bindea la clave a una var del mismo nombre.
+        fields: Vec<(String, Option<Node>)>,
     },
     StopStatement {
         value: Option<Box<Node>>,
@@ -131,14 +166,14 @@ pub enum NodeKind {
     // -- Definición de task (función) --
     TaskDefinition {
         name: String,
-        parameters: Vec<String>,
+        parameters: Vec<Param>,
         body: Vec<Node>,
         return_type: Option<String>,
         capabilities: Vec<String>,
     },
     TaskCall {
         name: Box<Node>, // Identifier o PropertyAccess
-        arguments: Vec<Node>,
+        arguments: Vec<Arg>,
     },
     /// Función anónima de una sola expresión: `(params) => expr`.
     /// Evalúa a un valor función (tipo "task") que captura el entorno actual.

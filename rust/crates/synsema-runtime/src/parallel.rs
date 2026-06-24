@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use synsema_capabilities::model::{Capability, CapabilitySet};
-use synsema_core::ast::Node;
+use synsema_core::ast::{Node, Param};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::number::Number;
 use synsema_core::types::{from_send, syn_list, to_send, SendValue, SynTaskValue, SynValue};
@@ -49,7 +49,7 @@ fn control_to_error(c: Control) -> RuntimeError {
 enum TaskSnapshot {
     User {
         name: String,
-        parameters: Vec<String>,
+        parameters: Vec<Param>,
         body: Vec<Node>,
         required_capabilities: Vec<(String, Option<String>)>,
     },

@@ -153,8 +153,10 @@ impl TestGenerator {
     fn task_tests(&self, program: &Program) -> Vec<TestCase> {
         let mut cases = Vec::new();
         for task in find_tasks(program) {
-            let (name, params) = match &task.kind {
-                NodeKind::TaskDefinition { name, parameters, .. } => (name.clone(), parameters.clone()),
+            let (name, params): (String, Vec<String>) = match &task.kind {
+                NodeKind::TaskDefinition { name, parameters, .. } => {
+                    (name.clone(), parameters.iter().map(|p| p.name.clone()).collect())
+                }
                 _ => continue,
             };
             if params.is_empty() {

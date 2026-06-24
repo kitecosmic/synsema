@@ -34,6 +34,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 
+use synsema_core::bytesutil::b64_encode;
 use synsema_core::interpreter::Interpreter;
 use synsema_core::number::{py_float_str, Number};
 use synsema_core::types::{
@@ -501,10 +502,19 @@ pub fn syn_to_json(v: &SynValue) -> Json {
             );
             Json::Str("[redacted]".to_string())
         }
+        // `bytes` dentro de un body JSON → string base64 (JSON no tiene tipo binario;
+        // base64 es la convención estándar e interoperable). NO-lossy.
+        SynValue::Bytes(b) => Json::Str(b64_encode(b)),
         SynValue::Server(s) => match &**s {
             // _RAW/_ENVELOPE serializados como data (fuera del contrato) → su dict.
             ServerValue::Raw { body, content_type, status } => obj(vec![
                 ("body", Json::Str(body.clone())),
+                ("content_type", Json::Str(content_type.clone())),
+                ("status", Json::Int(*status)),
+            ]),
+            // _RAWBYTES serializado como data → body en base64 (decisión §8.3.3).
+            ServerValue::RawBytes { body, content_type, status } => obj(vec![
+                ("bytes", Json::Str(b64_encode(body))),
                 ("content_type", Json::Str(content_type.clone())),
                 ("status", Json::Int(*status)),
             ]),
@@ -643,6 +653,17 @@ pub fn build_response(
                     }),
                 ));
             }
+            // binary(): body crudo verbatim al socket, sin negociación (ya es final).
+            ServerValue::RawBytes { body, content_type, status } => {
+                return Ok((
+                    *status as u16,
+                    ResponseBody::Raw(RawResponse {
+                        body: body.clone(),
+                        content_type: content_type.clone(),
+                        status: *status as u16,
+                    }),
+                ));
+            }
             ServerValue::Envelope { status, value } => {
                 return Ok((*status as u16, ResponseBody::Json(shape(Some(value), query)?)));
             }
@@ -654,6 +675,18 @@ pub fn build_response(
             }
             _ => {}
         }
+    }
+    // `give bytes(...)` directo (sin binary()): octet-stream 200 (ergonomía). Para fijar
+    // otro content-type se usa binary(). NO pasa por la forma JSON (sería base64).
+    if let Some(SynValue::Bytes(b)) = give {
+        return Ok((
+            200,
+            ResponseBody::Raw(RawResponse {
+                body: b.to_vec(),
+                content_type: "application/octet-stream".to_string(),
+                status: 200,
+            }),
+        ));
     }
     Ok((200, ResponseBody::Json(shape(give, query)?)))
 }
@@ -670,6 +703,10 @@ pub struct Ctx {
     pub params: IndexMap<String, String>,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// Body crudo (bytes exactos) para los casos en memoria — habilita `read_body_bytes`
+    /// byte-exacto sin pasar por la decodificación lossy de `body`. Vacío cuando el body
+    /// spilleó a disco (entonces `body_file` es la fuente cruda; ver §8.1).
+    pub body_raw: Vec<u8>,
     pub body_file: Option<String>,
     pub json: Option<serde_json::Value>,
     pub client_ip: String,
@@ -1152,6 +1189,7 @@ impl ServeRuntime {
         query: IndexMap<String, String>,
         headers: Vec<(String, String)>,
         body_str: &str,
+        body_raw: &[u8],
         body_file: Option<&str>,
         client_ip: &str,
     ) -> Dispatched {
@@ -1292,6 +1330,7 @@ impl ServeRuntime {
             params,
             headers: headers.clone(),
             body: body_str.to_string(),
+            body_raw: body_raw.to_vec(),
             body_file: body_file.map(|s| s.to_string()),
             json: json_obj,
             client_ip: client_ip.to_string(),
@@ -1918,6 +1957,10 @@ fn make_raw_val(body: String, ct: &str, status: i64) -> SynValue {
     SynValue::Server(Rc::new(ServerValue::Raw { body, content_type: ct.to_string(), status }))
 }
 
+fn make_rawbytes_val(body: Vec<u8>, ct: &str, status: i64) -> SynValue {
+    SynValue::Server(Rc::new(ServerValue::RawBytes { body, content_type: ct.to_string(), status }))
+}
+
 fn make_envelope(status: i64, value: SynValue) -> SynValue {
     SynValue::Server(Rc::new(ServerValue::Envelope { status, value }))
 }
@@ -1927,6 +1970,13 @@ fn make_redirect_val(location: String, status: i64) -> SynValue {
 }
 
 fn redirect_err(msg: &str) -> synsema_core::interpreter::Control {
+    synsema_core::interpreter::Control::Error(synsema_core::interpreter::RuntimeError::new(
+        msg.to_string(),
+    ))
+}
+
+/// Error genérico de un builtin de servidor (sin ubicación).
+fn serve_err(msg: &str) -> synsema_core::interpreter::Control {
     synsema_core::interpreter::Control::Error(synsema_core::interpreter::RuntimeError::new(
         msg.to_string(),
     ))
@@ -2070,6 +2120,36 @@ pub fn register_serve_builtins(interp: &Interpreter) {
                 _ => 200,
             };
             Ok(make_raw_val(content, &ct, status))
+        }),
+    );
+    // binary(bytes, content_type?, status?) — respuesta binaria cruda. content_type
+    // default "application/octet-stream", status default 200. El body se escribe verbatim
+    // al socket sin negociación. El primer arg DEBE ser bytes (error claro si no).
+    interp.register_builtin(
+        "binary",
+        -1,
+        Rc::new(|_i, a, _l| {
+            let body = match a.first() {
+                Some(SynValue::Bytes(b)) => b.to_vec(),
+                Some(other) => {
+                    return Err(serve_err(&format!(
+                        "binary() expects bytes as the first argument, got {}",
+                        other.type_name()
+                    )))
+                }
+                None => return Err(serve_err("binary() requires a bytes argument")),
+            };
+            let ct = if a.len() > 1 {
+                let c = text_arg(a.get(1));
+                if c.is_empty() { "application/octet-stream".to_string() } else { c }
+            } else {
+                "application/octet-stream".to_string()
+            };
+            let status = match a.get(2) {
+                Some(n @ SynValue::Number(_)) => num_i64(n),
+                _ => 200,
+            };
+            Ok(make_rawbytes_val(body, &ct, status))
         }),
     );
     // Vocabulario de contenido semántico.
@@ -2549,14 +2629,17 @@ async fn handle_request(
         }
     };
     // Spill a disco igual que el oráculo: bodies > MEM_SPILL no van en memoria (el
-    // `body` string queda vacío; el handler lo lee del file vía body_file).
-    let (body_str, body_file): (String, Option<PathBuf>) = if body_bytes.len() > MEM_SPILL {
-        let p = spill_path();
-        let _ = std::fs::write(&p, &body_bytes);
-        (String::new(), Some(p))
-    } else {
-        (String::from_utf8_lossy(&body_bytes).into_owned(), None)
-    };
+    // `body` string queda vacío; el handler lo lee del file vía body_file). El `body_raw`
+    // conserva los bytes exactos en memoria (para `read_body_bytes` byte-exacto sin la
+    // decodificación lossy de `body`); vacío cuando spilleó (el file es la fuente cruda).
+    let (body_str, body_raw, body_file): (String, Vec<u8>, Option<PathBuf>) =
+        if body_bytes.len() > MEM_SPILL {
+            let p = spill_path();
+            let _ = std::fs::write(&p, &body_bytes);
+            (String::new(), Vec::new(), Some(p))
+        } else {
+            (String::from_utf8_lossy(&body_bytes).into_owned(), body_bytes.to_vec(), None)
+        };
 
     // ¿La ruta que matchearía es un `stream`? Resolución barata (vhost + match de ruta,
     // sin auth ni handler) para decidir el hilo: los streams (long-lived, Ctx !Send) corren
@@ -2575,7 +2658,16 @@ async fn handle_request(
     // sirve igual para el pool (sized) que para un hilo dedicado (stream).
     let job = move || {
         let bf = body_file.as_ref().map(|p| p.to_string_lossy().into_owned());
-        match rt2.dispatch(&eff_method, &path, query, headers, &body_str, bf.as_deref(), &client_ip) {
+        match rt2.dispatch(
+            &eff_method,
+            &path,
+            query,
+            headers,
+            &body_str,
+            &body_raw,
+            bf.as_deref(),
+            &client_ip,
+        ) {
             Dispatched::Response { status, body, headers: extra } => {
                 let mut extra = extra;
                 // redirect(): el destino se emite como header `Location`.

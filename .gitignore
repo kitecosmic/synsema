@@ -15,6 +15,9 @@ target/
 # Se usa localmente; no va al repo público. (Los docs de proceso viven fuera del repo.)
 conformance/
 
+# Specs de implementación / docs de proceso: viven localmente, NO van al repo público.
+specs/
+
 # Estado/persistencia y daemons de runtime (fuera del repo, defensivo)
 .synsema/
 

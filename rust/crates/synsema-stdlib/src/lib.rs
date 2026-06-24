@@ -5,6 +5,7 @@
 pub mod acme;
 pub mod cron;
 pub mod database;
+pub mod hashing;
 pub mod http;
 pub mod mimetypes;
 pub mod secrets;

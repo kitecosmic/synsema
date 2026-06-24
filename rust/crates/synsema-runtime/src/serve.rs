@@ -19,14 +19,15 @@ use indexmap::IndexMap;
 
 use synsema_agents::swarm::Swarm;
 use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
-use synsema_core::ast::{Node, NodeKind};
+use synsema_core::ast::{Node, NodeKind, Param};
 use synsema_core::interpreter::{
     BuiltinTask, Control, Interpreter, RunResult, RuntimeError, ServeHook,
 };
 use synsema_core::number::Number;
 use synsema_core::parser::{parse_source, CompileError};
 use synsema_core::types::{
-    from_send, syn_map, syn_nothing, syn_text, to_send, SendValue, SynTaskValue, SynValue,
+    from_send, syn_bytes, syn_map, syn_nothing, syn_text, to_send, SendValue, SynTaskValue,
+    SynValue,
 };
 use synsema_stdlib::acme;
 use synsema_stdlib::database::{register_database_builtins, DatabaseManager};
@@ -98,7 +99,7 @@ pub(crate) enum GlobalVal {
     Value(SendValue),
     Task {
         name: String,
-        parameters: Vec<String>,
+        parameters: Vec<Param>,
         body: Vec<Node>,
         required_capabilities: Vec<(String, Option<String>)>,
     },
@@ -299,11 +300,26 @@ fn request_bindings(ctx: &Ctx) -> Vec<(String, SynValue)> {
             None => Ok(syn_text(body_text.as_str())),
         }),
     }));
+    // read_body_bytes() → bytes crudos (NO lossy). Prefiere el temp file spilled
+    // (`std::fs::read`, no `read_to_string`); para bodies en memoria usa `body_raw` (los
+    // bytes exactos), no `body` (que pasó por from_utf8_lossy aguas arriba). Cierra el
+    // punto lossy de read_body para binario; exactitud byte-a-byte (A4).
+    let body_raw = ctx.body_raw.clone();
+    let body_file_b = ctx.body_file.clone();
+    let read_body_bytes = SynValue::Builtin(Rc::new(BuiltinTask {
+        name: "read_body_bytes".to_string(),
+        param_count: 0,
+        func: Rc::new(move |_i, _a, _l| match &body_file_b {
+            Some(bf) => Ok(syn_bytes(std::fs::read(bf).unwrap_or_default())),
+            None => Ok(syn_bytes(body_raw.clone())),
+        }),
+    }));
     vec![
         ("request".to_string(), build_request_syn(ctx)),
         ("query".to_string(), str_map(&ctx.query)),
         ("params".to_string(), str_map(&ctx.params)),
         ("read_body".to_string(), read_body),
+        ("read_body_bytes".to_string(), read_body_bytes),
     ]
 }
 

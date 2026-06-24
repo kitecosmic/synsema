@@ -68,6 +68,8 @@ pub(crate) fn wire_common_with_state(
     // su capability incluso en modo no-secure (NO se auto-conceden como stdout/time).
     register_secret_builtins(interp, caps.clone(), Rc::new(EnvStore::load_default()));
     register_http_builtins(interp);
+    // Hashing SHA (puro, sin capability): sha256/sha512 → bytes.
+    synsema_stdlib::hashing::register_hash_builtins(interp);
     // cron/db/progress/memory: sus builtins clonan el Rc internamente → viven mientras
     // viva el intérprete.
     register_cron_builtins(interp, Rc::new(CronScheduler::new()));

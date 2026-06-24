@@ -16,7 +16,7 @@ use chrono::{DateTime, Datelike, NaiveDateTime, Timelike, Utc};
 use indexmap::IndexMap;
 
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
-use synsema_core::types::{syn_bool, syn_float, syn_int, syn_map, syn_text, SynValue};
+use synsema_core::types::{syn_bool, syn_bytes, syn_float, syn_int, syn_map, syn_text, SynValue};
 
 use crate::model::{Capability, CapabilityType, CapabilitySet};
 
@@ -133,7 +133,34 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         );
     }
 
-    // write_file(path, content) → true. Requiere file_write("<path>").
+    // read_file_bytes(path) → bytes (crudo, NO lossy). Requiere file_read("<path>"),
+    // mismo gating que read_file. Cierra el punto lossy de read_file para binario.
+    {
+        let caps = caps.clone();
+        interp.register_builtin(
+            "read_file_bytes",
+            1,
+            Rc::new(move |_i, args, _loc| {
+                let path = raw_str(arg(args, 0)?);
+                require(
+                    &caps,
+                    Capability::new(CapabilityType::FileRead, Some(path.clone())),
+                    "read_file_bytes()",
+                )?;
+                match std::fs::read(&path) {
+                    Ok(b) => Ok(syn_bytes(b)),
+                    Err(_) => Err(Control::Error(RuntimeError::new(format!(
+                        "File not found: {}",
+                        path
+                    )))),
+                }
+            }),
+        );
+    }
+
+    // write_file(path, content) → true. Requiere file_write("<path>"). Despacha por
+    // tipo: si `content` es bytes, escribe los bytes crudos (binario, NO lossy); si no,
+    // texto (raw_str) — backward-compatible con el comportamiento previo.
     {
         let caps = caps.clone();
         interp.register_builtin(
@@ -141,7 +168,6 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             2,
             Rc::new(move |_i, args, _loc| {
                 let path = raw_str(arg(args, 0)?);
-                let content = raw_str(arg(args, 1)?);
                 require(
                     &caps,
                     Capability::new(CapabilityType::FileWrite, Some(path.clone())),
@@ -150,7 +176,11 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 if let Some(parent) = Path::new(&path).parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                match std::fs::write(&path, content) {
+                let result = match arg(args, 1)? {
+                    SynValue::Bytes(b) => std::fs::write(&path, &b[..]),
+                    other => std::fs::write(&path, raw_str(other)),
+                };
+                match result {
                     Ok(_) => Ok(syn_bool(true)),
                     Err(e) => Err(Control::Error(RuntimeError::new(format!(
                         "Cannot write file {}: {}",

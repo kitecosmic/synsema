@@ -18,7 +18,7 @@ use std::rc::Rc;
 
 use indexmap::IndexMap;
 
-use crate::ast::Node;
+use crate::ast::{Node, Param};
 use crate::interpreter::{BuiltinTask, Environment};
 use crate::number::Number;
 use crate::secret::{constant_time_eq, SecretInner};
@@ -47,6 +47,10 @@ pub enum SynValue {
     /// toda salida (Display/JSON/blackboard/logs); el plaintext sólo se materializa
     /// en los puntos bordeados del runtime (reveal/socket/DB). Ver `secret.rs`.
     Secret(Rc<SecretInner>),
+    /// Datos binarios inmutables (feature `bytes`, Batch 1). Espeja `Text(Rc<str>)`
+    /// pero sin garantía de UTF-8. Constructor-only (`bytes(...)`); no hay literal.
+    /// Toda operación devuelve bytes nuevos (sin mutación in-place → sin aliasing).
+    Bytes(Rc<[u8]>),
 }
 
 /// Closure de paginación lazy de `paged()`: `fetch(limit, offset) → (filas, total)`.
@@ -57,6 +61,9 @@ pub type PagedFetch = dyn Fn(Option<i64>, i64) -> Result<(Vec<SynValue>, i64), S
 pub enum ServerValue {
     /// `html()`/`respond()`/`render()` — body escrito verbatim. (_RAW)
     Raw { body: String, content_type: String, status: i64 },
+    /// `binary()` / `give bytes(...)` — body binario crudo escrito verbatim al socket
+    /// (sin negociación de contenido). Espeja `Raw` pero con body `Vec<u8>`. (Batch 1)
+    RawBytes { body: Vec<u8>, content_type: String, status: i64 },
     /// `ok()`/`created()`/`not_found()`/`fail()` — status + valor interno. (_ENVELOPE)
     Envelope { status: i64, value: SynValue },
     /// Nodo de contenido (`heading`/`prose`/`list`/…): map `{kind, …}`. (_NODE)
@@ -75,6 +82,12 @@ impl ServerValue {
         match self {
             ServerValue::Raw { body, content_type, status } => match key {
                 "body" => Some(syn_text(body.as_str())),
+                "content_type" => Some(syn_text(content_type.as_str())),
+                "status" => Some(syn_int(*status)),
+                _ => None,
+            },
+            ServerValue::RawBytes { body, content_type, status } => match key {
+                "body" => Some(syn_bytes(body.clone())),
                 "content_type" => Some(syn_text(content_type.as_str())),
                 "status" => Some(syn_int(*status)),
                 _ => None,
@@ -98,7 +111,8 @@ impl ServerValue {
 /// Un task definido por el usuario, con su entorno de cierre (closure).
 pub struct SynTaskValue {
     pub name: String,
-    pub parameters: Vec<String>,
+    /// Parámetros (nombre + default opcional). El default se evalúa en call time (G5).
+    pub parameters: Vec<Param>,
     pub body: Vec<Node>,
     pub closure_env: Rc<RefCell<Environment>>,
     pub origin: Option<SourceLocation>,
@@ -120,6 +134,7 @@ impl SynValue {
             // type=SynMap() en el oráculo para todos los valores del servidor.
             SynValue::Server(_) => "map",
             SynValue::Secret(_) => "secret",
+            SynValue::Bytes(_) => "bytes",
         }
     }
 
@@ -143,6 +158,8 @@ impl SynValue {
             // Un secret con plaintext no vacío es truthy (chequeo de longitud, no
             // expone el valor).
             SynValue::Secret(s) => !s.expose_bytes().is_empty(),
+            // Bytes vacío = false (como text/list vacíos).
+            SynValue::Bytes(b) => !b.is_empty(),
         }
     }
 
@@ -183,6 +200,10 @@ impl SynValue {
                     ServerValue::Raw { body: b2, content_type: c2, status: s2 },
                 ) => b1 == b2 && c1 == c2 && s1 == s2,
                 (
+                    ServerValue::RawBytes { body: b1, content_type: c1, status: s1 },
+                    ServerValue::RawBytes { body: b2, content_type: c2, status: s2 },
+                ) => b1 == b2 && c1 == c2 && s1 == s2,
+                (
                     ServerValue::Envelope { status: s1, value: v1 },
                     ServerValue::Envelope { status: s2, value: v2 },
                 ) => s1 == s2 && v1.syn_equals(v2),
@@ -199,6 +220,9 @@ impl SynValue {
                 ) => l1 == l2 && s1 == s2,
                 _ => false,
             },
+            // `bytes` sólo es igual a `bytes` (byte-a-byte). Nunca igual a text ni a
+            // ningún otro tipo (cae al `_ => false`): no hay igualdad cross-type (G3).
+            (SynValue::Bytes(a), SynValue::Bytes(b)) => a == b,
             _ => false,
         }
     }
@@ -223,7 +247,10 @@ impl fmt::Display for SynValue {
                     .collect();
                 write!(f, "{{{}}}", parts.join(", "))
             }
-            SynValue::Task(t) => write!(f, "task {}({})", t.name, t.parameters.join(", ")),
+            SynValue::Task(t) => {
+                let names: Vec<&str> = t.parameters.iter().map(|p| p.name.as_str()).collect();
+                write!(f, "task {}({})", t.name, names.join(", "))
+            }
             SynValue::Builtin(b) => write!(f, "builtin:{}", b.name),
             // str() de un valor del servidor: repr map-like de su dict subyacente.
             SynValue::Server(s) => match &**s {
@@ -231,6 +258,11 @@ impl fmt::Display for SynValue {
                     f,
                     "{{body: {}, content_type: {}, status: {}}}",
                     body, content_type, status
+                ),
+                ServerValue::RawBytes { body, content_type, status } => write!(
+                    f,
+                    "{{body: {}, content_type: {}, status: {}}}",
+                    bytes_display(body), content_type, status
                 ),
                 ServerValue::Envelope { status, value } => {
                     write!(f, "{{status: {}, value: {}}}", status, value)
@@ -250,7 +282,21 @@ impl fmt::Display for SynValue {
             // sí solo print/log/error/coerción-a-texto/contexto-LLM (todo pasa por
             // Display) — el plaintext no puede filtrarse por un `format!` accidental.
             SynValue::Secret(s) => write!(f, "{}", s),
+            // Repr seguro y NO-lossy: `bytes(<hexlower>)`. Nunca decodifica a texto
+            // (eso reintroduciría el lossy: G4). Sella print/text()/concat-con-texto.
+            SynValue::Bytes(b) => write!(f, "{}", bytes_display(b)),
         }
+    }
+}
+
+/// Repr textual seguro de unos bytes para `Display`: `bytes(<hexlower>)`. Para más de
+/// 32 bytes, muestra los primeros 32 en hex + `…` + ` (<n> bytes)`. **Nunca** decodifica
+/// a texto (no-lossy, G4) — así `print`/`text()`/concat muestran el hex, no datos crudos.
+pub fn bytes_display(b: &[u8]) -> String {
+    if b.len() > 32 {
+        format!("bytes({}… ({} bytes))", crate::bytesutil::hex_encode(&b[..32]), b.len())
+    } else {
+        format!("bytes({})", crate::bytesutil::hex_encode(b))
     }
 }
 
@@ -290,6 +336,10 @@ pub fn syn_map(m: IndexMap<String, SynValue>) -> SynValue {
 pub fn syn_secret(name: impl Into<String>, plaintext: impl Into<String>) -> SynValue {
     SynValue::Secret(Rc::new(SecretInner::new(name, plaintext)))
 }
+/// Construye un valor `bytes` (inmutable). Acepta `Vec<u8>` → `Rc<[u8]>` vía `Into`.
+pub fn syn_bytes(b: impl Into<Rc<[u8]>>) -> SynValue {
+    SynValue::Bytes(b.into())
+}
 
 // =========================================================
 // SendValue — representación owned, `Send`+`Sync`, para cruzar hilos
@@ -311,6 +361,8 @@ pub enum SendValue {
     Nothing,
     List(Vec<SendValue>),
     Map(Vec<(String, SendValue)>),
+    /// Snapshot binario (feature `bytes`): cruza el blackboard como copia owned (G7).
+    Bytes(Vec<u8>),
 }
 
 /// Snapshot de un `SynValue` a `SendValue` (deep copy). Task/Builtin no cruzan: se
@@ -334,6 +386,11 @@ pub fn to_send(v: &SynValue) -> SendValue {
                 ("content_type".to_string(), SendValue::Text(content_type.clone())),
                 ("status".to_string(), SendValue::Number(Number::Int(*status))),
             ]),
+            ServerValue::RawBytes { body, content_type, status } => SendValue::Map(vec![
+                ("body".to_string(), SendValue::Bytes(body.clone())),
+                ("content_type".to_string(), SendValue::Text(content_type.clone())),
+                ("status".to_string(), SendValue::Number(Number::Int(*status))),
+            ]),
             ServerValue::Envelope { status, value } => SendValue::Map(vec![
                 ("status".to_string(), SendValue::Number(Number::Int(*status))),
                 ("value".to_string(), to_send(value)),
@@ -352,6 +409,8 @@ pub fn to_send(v: &SynValue) -> SendValue {
         // agente comprometido no puede `share` el plaintext — del otro lado se observa
         // un texto redactado, no un secret reconstruible.
         SynValue::Secret(s) => SendValue::Text(s.to_string()),
+        // Snapshot binario (copia owned, sin aliasing): G7.
+        SynValue::Bytes(b) => SendValue::Bytes(b.to_vec()),
     }
 }
 
@@ -370,6 +429,7 @@ pub fn from_send(v: &SendValue) -> SynValue {
             }
             syn_map(m)
         }
+        SendValue::Bytes(v) => syn_bytes(v.clone()),
     }
 }
 
@@ -389,6 +449,8 @@ impl fmt::Display for SendValue {
                     pairs.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
                 write!(f, "{{{}}}", parts.join(", "))
             }
+            // Espeja el repr hex de `SynValue::Bytes` (mismo `bytes(<hex>)`).
+            SendValue::Bytes(b) => write!(f, "{}", bytes_display(b)),
         }
     }
 }

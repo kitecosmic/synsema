@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use crate::ast::{Node, NodeKind, Program};
+use crate::ast::{Arg, Node, NodeKind, Param, Program};
 use crate::lexer::{Lexer, LexerError};
 use crate::tokens::{
     keyword_lookup, Number, SourceLocation, TemplateSegment, Token, TokenType, TokenValue,
@@ -555,12 +555,19 @@ impl Parser {
         while self.check(TokenType::Is) {
             let arm_loc = self.location();
             self.advance(); // 'is'
-            let pattern = self.parse_expression()?;
+            let pattern = self.parse_pattern()?;
+            // Guard opcional `when <cond>`: se evalúa con los binders del patrón en scope.
+            let guard = if self.match_tok(TokenType::When).is_some() {
+                Some(Box::new(self.parse_expression()?))
+            } else {
+                None
+            };
             let arm_body = self.parse_block()?;
             arms.push(Node::new(
                 arm_loc,
                 NodeKind::MatchArm {
                     pattern: Box::new(pattern),
+                    guard,
                     body: arm_body,
                 },
             ));
@@ -586,6 +593,108 @@ impl Parser {
                 otherwise,
             },
         ))
+    }
+
+    /// Parsea un patrón de `match` (Batch 2). Las formas estructurales (wildcard `_`,
+    /// list `[...]`, map `{...}`) producen nodos de patrón dedicados; cualquier otra
+    /// cosa cae a `parse_expression()` (variante de enum, literal, bare-identifier como
+    /// valor, etc. — comportamiento previo intacto). Recursivo: los sub-patrones dentro
+    /// de list/map se parsean con `parse_pattern()`.
+    fn parse_pattern(&mut self) -> Result<Node, ParseError> {
+        let loc = self.location();
+        // `_` SOLO (no `_.foo` ni `_(...)`) → wildcard. Cualquier otro uso de `_` cae a
+        // expresión (identificador ordinario).
+        if self.check_word("_")
+            && !matches!(self.peek(1).ty, TokenType::LParen | TokenType::Dot | TokenType::LBracket)
+        {
+            self.advance();
+            return Ok(Node::new(loc, NodeKind::WildcardPattern));
+        }
+        if self.check(TokenType::LBracket) {
+            return self.parse_list_pattern();
+        }
+        // `{...}` es un MAP PATTERN sólo si sus claves son identificadores bare (o `{}`
+        // que matchea cualquier map). `{"k": 1}` (clave string/expr) es un map LITERAL →
+        // patrón de valor por igualdad estructural (comportamiento previo intacto, G1).
+        // Desambiguación por el primer token tras `{`.
+        if self.check(TokenType::LBrace)
+            && matches!(self.peek(1).ty, TokenType::RBrace | TokenType::Identifier)
+        {
+            return self.parse_map_pattern();
+        }
+        self.parse_expression()
+    }
+
+    /// `[a, b]` / `[h, ...rest]` / `[...init, last]` / `[a, ...mid, z]` / `[]`. Un solo
+    /// spread (cero o uno); dos `...` → error de parseo.
+    fn parse_list_pattern(&mut self) -> Result<Node, ParseError> {
+        let loc = self.location();
+        self.expect(TokenType::LBracket, "")?;
+        let mut prefix = Vec::new();
+        let mut suffix = Vec::new();
+        let mut rest: Option<Option<String>> = None;
+        if !self.check(TokenType::RBracket) {
+            loop {
+                if self.check(TokenType::Spread) {
+                    if rest.is_some() {
+                        return Err(ParseError::new(
+                            "a list pattern may have at most one '...' spread",
+                            self.location(),
+                        ));
+                    }
+                    self.advance(); // '...'
+                    // Binder opcional inmediatamente después del spread: `...rest`.
+                    if self.check(TokenType::Identifier) {
+                        let name = self.advance().as_str().to_string();
+                        rest = Some(Some(name));
+                    } else {
+                        rest = Some(None); // `...` anónimo
+                    }
+                } else {
+                    let pat = self.parse_pattern()?;
+                    if rest.is_some() {
+                        suffix.push(pat);
+                    } else {
+                        prefix.push(pat);
+                    }
+                }
+                if self.match_tok(TokenType::Comma).is_none() {
+                    break;
+                }
+                if self.check(TokenType::RBracket) {
+                    break; // coma final permitida
+                }
+            }
+        }
+        self.expect(TokenType::RBracket, "")?;
+        Ok(Node::new(loc, NodeKind::ListPattern { prefix, rest, suffix }))
+    }
+
+    /// `{name, age}` (subset, bindea claves) / `{status: 200, body}` (clave : subpatrón)
+    /// / `{}` (matchea cualquier map). Anidados vía `parse_pattern()` recursivo.
+    fn parse_map_pattern(&mut self) -> Result<Node, ParseError> {
+        let loc = self.location();
+        self.expect(TokenType::LBrace, "")?;
+        let mut fields: Vec<(String, Option<Node>)> = Vec::new();
+        if !self.check(TokenType::RBrace) {
+            loop {
+                let key = self.expect_name("map pattern field name")?.as_str().to_string();
+                let subpat = if self.match_tok(TokenType::Colon).is_some() {
+                    Some(self.parse_pattern()?)
+                } else {
+                    None
+                };
+                fields.push((key, subpat));
+                if self.match_tok(TokenType::Comma).is_none() {
+                    break;
+                }
+                if self.check(TokenType::RBrace) {
+                    break; // coma final permitida
+                }
+            }
+        }
+        self.expect(TokenType::RBrace, "")?;
+        Ok(Node::new(loc, NodeKind::MapPattern { fields }))
     }
 
     // -- módulos locales (use / export) --
@@ -634,9 +743,9 @@ impl Parser {
 
         if self.match_tok(TokenType::LParen).is_some() {
             if !self.check(TokenType::RParen) {
-                params.push(self.expect_name("parameter name")?.as_str().to_string());
+                params.push(self.parse_param()?);
                 while self.match_tok(TokenType::Comma).is_some() {
-                    params.push(self.expect_name("parameter name")?.as_str().to_string());
+                    params.push(self.parse_param()?);
                 }
             }
             self.expect(TokenType::RParen, "")?;
@@ -653,6 +762,18 @@ impl Parser {
                 capabilities: Vec::new(),
             },
         ))
+    }
+
+    /// Un parámetro de `task`: nombre y, tras `=`, un default opcional (Batch 2). El
+    /// default se evalúa en call time (G5). `=` es `Assign` (distinto de `==`/`Equal`).
+    fn parse_param(&mut self) -> Result<Param, ParseError> {
+        let name = self.expect_name("parameter name")?.as_str().to_string();
+        let default = if self.match_tok(TokenType::Assign).is_some() {
+            Some(self.parse_expression()?)
+        } else {
+            None
+        };
+        Ok(Param { name, default })
     }
 
     fn parse_give(&mut self) -> Result<Node, ParseError> {
@@ -1703,9 +1824,9 @@ impl Parser {
                 self.advance();
                 let mut args = Vec::new();
                 if !self.check(TokenType::RParen) {
-                    args.push(self.parse_expression()?);
+                    args.push(self.parse_arg()?);
                     while self.match_tok(TokenType::Comma).is_some() {
-                        args.push(self.parse_expression()?);
+                        args.push(self.parse_arg()?);
                     }
                 }
                 self.expect(TokenType::RParen, "")?;
@@ -1762,6 +1883,20 @@ impl Parser {
         }
 
         Ok(node)
+    }
+
+    /// Un argumento de llamada: posicional (`expr`) o nombrado (`name = expr`, Batch 2).
+    /// El nombrado se distingue por el token `Assign` (`=`) tras un identificador; `name ==
+    /// expr` usa `Equal` y es un arg posicional booleano (no se confunden).
+    fn parse_arg(&mut self) -> Result<Arg, ParseError> {
+        if self.check(TokenType::Identifier) && self.peek(1).ty == TokenType::Assign {
+            let name = self.advance().as_str().to_string();
+            self.advance(); // '='
+            let value = self.parse_expression()?;
+            return Ok(Arg { name: Some(name), value });
+        }
+        let value = self.parse_expression()?;
+        Ok(Arg { name: None, value })
     }
 
     /// En un '(', indica si su ')' de cierre va seguido inmediatamente de '=>'.
@@ -2215,7 +2350,7 @@ mod tests {
         let prog = parse_ok("print(name of person)");
         // print( PropertyAccess(name, person) )
         if let NodeKind::TaskCall { arguments, .. } = &prog.statements[0].kind {
-            match &arguments[0].kind {
+            match &arguments[0].value.kind {
                 NodeKind::PropertyAccess { property_name, .. } => {
                     assert_eq!(property_name, "name");
                 }
@@ -2334,7 +2469,7 @@ mod tests {
         let NodeKind::TaskCall { arguments, .. } = &value.kind else {
             panic!("esperaba TaskCall");
         };
-        assert_eq!(arguments[0].as_identifier(), Some("x"));
+        assert_eq!(arguments[0].value.as_identifier(), Some("x"));
     }
 
     #[test]

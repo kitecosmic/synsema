@@ -74,8 +74,9 @@ impl AddressableCode {
                         result.found = true;
                         result.location = Some(format!("{}:{}", filename, task.location.line));
                         result.source_lines = extract_lines(&lines, task.location.line, 30);
-                        result.summary = format!("task {}({})", name, parameters.join(", "));
-                        result.params = parameters.clone();
+                        let names: Vec<String> = parameters.iter().map(|p| p.name.clone()).collect();
+                        result.summary = format!("task {}({})", name, names.join(", "));
+                        result.params = names;
                         result.deps = get_task_dependencies(program, name);
                     }
                 }
@@ -84,7 +85,8 @@ impl AddressableCode {
                 if let Some(task) = find_task_by_name(program, identifier) {
                     if let NodeKind::TaskDefinition { name, parameters, .. } = &task.kind {
                         result.found = true;
-                        result.summary = format!("task {}({})", name, parameters.join(", "));
+                        let names: Vec<String> = parameters.iter().map(|p| p.name.clone()).collect();
+                        result.summary = format!("task {}({})", name, names.join(", "));
                     }
                 }
             }
