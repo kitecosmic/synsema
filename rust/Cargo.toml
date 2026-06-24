@@ -59,6 +59,15 @@ sha2 = "0.10"
 #   num-complex : tipo complejo + cmath (mismo ecosistema num-* que num-bigint/num-traits/num-integer).
 libm = "0.2"
 num-complex = "0.4"
+# Arrays numéricos n-dimensionales + álgebra lineal (Batch 5). AMBAS PURO-Rust, SIN C
+# (sin BLAS/LAPACK/openblas/mkl ni ningún `*-sys`) → preservan el binario único estático.
+#   ndarray : tipo array n-dimensional + vectorización/broadcasting/reducciones.
+#   faer    : álgebra lineal densa puro-Rust (solve/det/inv/eig/svd), con SIMD (pulp/gemm).
+# `default-features = false`: se desactiva `rayon` (multihilo) porque arrastra `spindle →
+# atomic-wait → windows-sys` (un crate `*-sys`); la regla "cero `*-sys`" manda sobre el
+# multihilo. Queda el SIMD (pulp) → sigue rápido y 100% puro-Rust sin `*-sys`.
+ndarray = "0.16"
+faer = { version = "0.24", default-features = false, features = ["std", "linalg"] }
 synsema-core = { path = "crates/synsema-core" }
 synsema-capabilities = { path = "crates/synsema-capabilities" }
 synsema-stdlib = { path = "crates/synsema-stdlib" }

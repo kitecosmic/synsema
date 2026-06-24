@@ -200,6 +200,10 @@ fn select_numbers(args: &[SynValue], name: &str) -> Result<Vec<Number>, Control>
 }
 
 pub fn min(args: &[SynValue]) -> Result<SynValue, Control> {
+    // Array (Batch 5): reducción total o por eje (las listas/variádicos siguen igual, G1).
+    if matches!(args.first(), Some(SynValue::Array(_))) {
+        return crate::arrays::reduce(args, "min");
+    }
     let nums = select_numbers(args, "min")?;
     let mut best = nums[0].clone();
     for n in &nums[1..] {
@@ -211,6 +215,9 @@ pub fn min(args: &[SynValue]) -> Result<SynValue, Control> {
 }
 
 pub fn max(args: &[SynValue]) -> Result<SynValue, Control> {
+    if matches!(args.first(), Some(SynValue::Array(_))) {
+        return crate::arrays::reduce(args, "max");
+    }
     let nums = select_numbers(args, "max")?;
     let mut best = nums[0].clone();
     for n in &nums[1..] {
@@ -435,6 +442,9 @@ fn list_numbers(args: &[SynValue], name: &str) -> Result<Vec<Number>, Control> {
 }
 
 pub fn sum(args: &[SynValue]) -> Result<SynValue, Control> {
+    if matches!(args.first(), Some(SynValue::Array(_))) {
+        return crate::arrays::reduce(args, "sum");
+    }
     let nums = list_numbers(args, "sum")?;
     let mut acc = Number::Int(0);
     for n in &nums {
@@ -446,6 +456,9 @@ pub fn sum(args: &[SynValue]) -> Result<SynValue, Control> {
 }
 
 pub fn product(args: &[SynValue]) -> Result<SynValue, Control> {
+    if matches!(args.first(), Some(SynValue::Array(_))) {
+        return crate::arrays::reduce(args, "product");
+    }
     let nums = list_numbers(args, "product")?;
     let mut acc = Number::Int(1);
     for n in &nums {
@@ -455,6 +468,9 @@ pub fn product(args: &[SynValue]) -> Result<SynValue, Control> {
 }
 
 pub fn mean(args: &[SynValue]) -> Result<SynValue, Control> {
+    if matches!(args.first(), Some(SynValue::Array(_))) {
+        return crate::arrays::reduce(args, "mean");
+    }
     let nums = list_numbers(args, "mean")?;
     if nums.is_empty() {
         return Err(err("mean of an empty list"));

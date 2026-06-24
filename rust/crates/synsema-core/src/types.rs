@@ -17,6 +17,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use indexmap::IndexMap;
+use ndarray::ArrayD;
 use num_complex::Complex64;
 
 use crate::ast::{Node, Param};
@@ -57,6 +58,12 @@ pub enum SynValue {
     /// aritmética se resuelve en `exec_binary` (promoción real→complex). Constructor-only
     /// `complex(re, im)` (sin literal `2i`). Basado en float (`Complex64`).
     Complex(Complex64),
+    /// Array numérico n-dimensional (feature math, Batch 5). Variante **aislada** (como
+    /// `bytes`/`complex`): NO vive en el tower `Number`. dtype `f64`, inmutable (las ops
+    /// devuelven arrays nuevos). La aritmética vectorizada (elementwise + broadcasting) se
+    /// resuelve en `exec_binary`; el álgebra lineal (faer) opera sobre el caso 2D.
+    /// `*` es ELEMENTWISE (Hadamard); el producto matricial es `matmul`/`dot`.
+    Array(Rc<ArrayD<f64>>),
 }
 
 /// Closure de paginación lazy de `paged()`: `fetch(limit, offset) → (filas, total)`.
@@ -142,6 +149,7 @@ impl SynValue {
             SynValue::Secret(_) => "secret",
             SynValue::Bytes(_) => "bytes",
             SynValue::Complex(_) => "complex",
+            SynValue::Array(_) => "array",
         }
     }
 
@@ -169,6 +177,8 @@ impl SynValue {
             SynValue::Bytes(b) => !b.is_empty(),
             // complex(0,0) = false; cualquier parte no-cero = true.
             SynValue::Complex(z) => z.re != 0.0 || z.im != 0.0,
+            // Array no-vacío = true (espeja list).
+            SynValue::Array(a) => !a.is_empty(),
         }
     }
 
@@ -237,6 +247,8 @@ impl SynValue {
             (SynValue::Complex(a), SynValue::Complex(b)) => a == b,
             (SynValue::Complex(z), SynValue::Number(n))
             | (SynValue::Number(n), SynValue::Complex(z)) => z.im == 0.0 && z.re == n.to_f64(),
+            // Array (Batch 5): misma shape Y mismos datos. Nunca igual a otro tipo.
+            (SynValue::Array(a), SynValue::Array(b)) => a == b,
             _ => false,
         }
     }
@@ -302,8 +314,29 @@ impl fmt::Display for SynValue {
             // `re±imi` (estilo Python cmath): enteros sin `.0` (3+2i), fracción con
             // decimales (1.5-2i). El signo lo da la parte imaginaria.
             SynValue::Complex(z) => write!(f, "{}", complex_display(z.re, z.im)),
+            // Repr anidado estilo NumPy; ACOTADO a un resumen si size > 100.
+            SynValue::Array(a) => write!(f, "{}", array_display(a)),
         }
     }
+}
+
+/// Repr anidado de un array estilo NumPy (`[1, 2, 3]` / `[[1, 2], [3, 4]]`). Reusa el
+/// recorte de `.0` de los floats (enteros sin decimal). **Acotado**: si hay más de 100
+/// elementos, muestra un resumen `array(shape=[..], N elements)` (no vuelca millones).
+pub fn array_display(a: &ArrayD<f64>) -> String {
+    if a.len() > 100 {
+        let shape: Vec<String> = a.shape().iter().map(|d| d.to_string()).collect();
+        return format!("array(shape=[{}], {} elements)", shape.join(", "), a.len());
+    }
+    fn rec(a: &ndarray::ArrayViewD<f64>) -> String {
+        if a.ndim() == 0 {
+            trim_float(*a.first().unwrap())
+        } else {
+            let parts: Vec<String> = a.outer_iter().map(|s| rec(&s)).collect();
+            format!("[{}]", parts.join(", "))
+        }
+    }
+    rec(&a.view())
 }
 
 /// Float al estilo del lenguaje pero recortando un `.0` final (como el repr de Python
@@ -375,6 +408,10 @@ pub fn syn_bytes(b: impl Into<Rc<[u8]>>) -> SynValue {
 pub fn syn_complex(re: f64, im: f64) -> SynValue {
     SynValue::Complex(Complex64::new(re, im))
 }
+/// Construye un `array` (envuelve el `ArrayD<f64>` en `Rc`, inmutable compartido).
+pub fn syn_array(a: ArrayD<f64>) -> SynValue {
+    SynValue::Array(Rc::new(a))
+}
 
 // =========================================================
 // SendValue — representación owned, `Send`+`Sync`, para cruzar hilos
@@ -400,6 +437,8 @@ pub enum SendValue {
     Bytes(Vec<u8>),
     /// Snapshot de un complejo (re, im): cruza el blackboard como copia owned (G7).
     Complex(f64, f64),
+    /// Snapshot de un array (shape, datos row-major): cruza el blackboard como copia (G7).
+    Array(Vec<usize>, Vec<f64>),
 }
 
 /// Snapshot de un `SynValue` a `SendValue` (deep copy). Task/Builtin no cruzan: se
@@ -450,6 +489,8 @@ pub fn to_send(v: &SynValue) -> SendValue {
         SynValue::Bytes(b) => SendValue::Bytes(b.to_vec()),
         // Snapshot del complejo (re, im): copia owned (G7).
         SynValue::Complex(z) => SendValue::Complex(z.re, z.im),
+        // Snapshot del array (shape + datos row-major): copia owned (G7).
+        SynValue::Array(a) => SendValue::Array(a.shape().to_vec(), a.iter().copied().collect()),
     }
 }
 
@@ -470,6 +511,14 @@ pub fn from_send(v: &SendValue) -> SynValue {
         }
         SendValue::Bytes(v) => syn_bytes(v.clone()),
         SendValue::Complex(re, im) => syn_complex(*re, *im),
+        // Reconstruye el array desde shape + datos. Si la shape no cuadra con los datos
+        // (no debería: el snapshot es consistente), cae a un array 1D con los datos.
+        SendValue::Array(shape, data) => {
+            match ArrayD::from_shape_vec(ndarray::IxDyn(shape), data.clone()) {
+                Ok(a) => syn_array(a),
+                Err(_) => syn_array(ArrayD::from_shape_vec(ndarray::IxDyn(&[data.len()]), data.clone()).unwrap()),
+            }
+        }
     }
 }
 
@@ -493,6 +542,13 @@ impl fmt::Display for SendValue {
             SendValue::Bytes(b) => write!(f, "{}", bytes_display(b)),
             // Mismo formato `re±imi` que `SynValue::Complex`.
             SendValue::Complex(re, im) => write!(f, "{}", complex_display(*re, *im)),
+            // Reconstruye el array y reusa el repr NumPy-like.
+            SendValue::Array(shape, data) => {
+                match ArrayD::from_shape_vec(ndarray::IxDyn(shape), data.clone()) {
+                    Ok(a) => write!(f, "{}", array_display(&a)),
+                    Err(_) => write!(f, "array(shape=[{}])", shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ")),
+                }
+            }
         }
     }
 }

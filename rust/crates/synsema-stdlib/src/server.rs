@@ -474,6 +474,15 @@ pub fn dumps(j: &Json) -> String {
     out
 }
 
+/// `array` (Batch 5) → lista JSON anidada (row-major); el caso 0-D es un número.
+fn array_view_to_json(a: &ndarray::ArrayViewD<f64>) -> Json {
+    if a.ndim() == 0 {
+        Json::Float(*a.first().unwrap())
+    } else {
+        Json::Array(a.outer_iter().map(|s| array_view_to_json(&s)).collect())
+    }
+}
+
 /// SynValue → árbol JSON (como `syn_to_json` del oráculo).
 pub fn syn_to_json(v: &SynValue) -> Json {
     match v {
@@ -510,6 +519,8 @@ pub fn syn_to_json(v: &SynValue) -> Json {
         SynValue::Complex(z) => {
             obj(vec![("re", Json::Float(z.re)), ("im", Json::Float(z.im))])
         }
+        // `array` en un body JSON → lista anidada (NumPy-like). Batch 5.
+        SynValue::Array(a) => array_view_to_json(&a.view()),
         SynValue::Server(s) => match &**s {
             // _RAW/_ENVELOPE serializados como data (fuera del contrato) → su dict.
             ServerValue::Raw { body, content_type, status } => obj(vec![

@@ -4,6 +4,7 @@
 //! Orden de port: lexer -> tokens -> parser -> ast -> types -> interpreter.
 
 pub mod addressable;
+pub mod arrays;
 pub mod ast;
 pub mod ast_api;
 pub mod bytesutil;

@@ -11,6 +11,8 @@ synsema-capabilities.workspace = true
 indexmap.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
+# Arrays (Batch 5): serializar `SynValue::Array` a JSON anidado en las respuestas serve.
+ndarray.workspace = true
 # Feature `secret`: builtins env/secret/reveal/bearer + crypto (hmac_sha256/verify_hmac/
 # constant_time_eq). Todo puro-Rust (RustCrypto), sin C → binario único estático.
 # chrono ya está en el workspace (sin feature `clock`); se usa para el timestamp del audit.

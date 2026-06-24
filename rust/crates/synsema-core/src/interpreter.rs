@@ -607,9 +607,9 @@ impl Interpreter {
         self.register("is_finite", 1, Rc::new(|_i, a, _l| crate::math::is_finite(a)));
         self.register("round_to", 2, Rc::new(|_i, a, _l| crate::math::round_to(a)));
         // agregados sobre una lista
-        self.register("sum", 1, Rc::new(|_i, a, _l| crate::math::sum(a)));
-        self.register("product", 1, Rc::new(|_i, a, _l| crate::math::product(a)));
-        self.register("mean", 1, Rc::new(|_i, a, _l| crate::math::mean(a)));
+        self.register("sum", -1, Rc::new(|_i, a, _l| crate::math::sum(a)));
+        self.register("product", -1, Rc::new(|_i, a, _l| crate::math::product(a)));
+        self.register("mean", -1, Rc::new(|_i, a, _l| crate::math::mean(a)));
 
         // -- Completitud matemática (Batch 4) --
         // Complejos: constructor + accesores (PUROS). Las transcendentales (sqrt/exp/…/pow)
@@ -633,6 +633,41 @@ impl Interpreter {
         self.register("erf", 1, Rc::new(|_i, a, _l| crate::math::erf(a)));
         self.register("erfc", 1, Rc::new(|_i, a, _l| crate::math::erfc(a)));
         self.register("beta", 2, Rc::new(|_i, a, _l| crate::math::beta(a)));
+
+        // -- Arrays numéricos n-dimensionales + álgebra lineal (Batch 5). PUROS. --
+        // Construcción.
+        self.register("array", 1, Rc::new(|_i, a, _l| crate::arrays::array(a)));
+        self.register("zeros", 1, Rc::new(|_i, a, _l| crate::arrays::zeros(a)));
+        self.register("ones", 1, Rc::new(|_i, a, _l| crate::arrays::ones(a)));
+        self.register("full", 2, Rc::new(|_i, a, _l| crate::arrays::full(a)));
+        self.register("arange", -1, Rc::new(|_i, a, _l| crate::arrays::arange(a)));
+        self.register("linspace", 3, Rc::new(|_i, a, _l| crate::arrays::linspace(a)));
+        self.register("identity", 1, Rc::new(|_i, a, _l| crate::arrays::identity(a)));
+        self.register("eye", 1, Rc::new(|_i, a, _l| crate::arrays::eye(a)));
+        // Introspección / conversión / forma.
+        self.register("shape", 1, Rc::new(|_i, a, _l| crate::arrays::shape(a)));
+        self.register("ndim", 1, Rc::new(|_i, a, _l| crate::arrays::ndim(a)));
+        self.register("size", 1, Rc::new(|_i, a, _l| crate::arrays::size(a)));
+        self.register("is_array", 1, Rc::new(|_i, a, _l| crate::arrays::is_array(a)));
+        self.register("to_list", 1, Rc::new(|_i, a, _l| crate::arrays::to_list(a)));
+        self.register("reshape", 2, Rc::new(|_i, a, _l| crate::arrays::reshape(a)));
+        self.register("transpose", 1, Rc::new(|_i, a, _l| crate::arrays::transpose(a)));
+        // `flatten` NO se re-registra: el `flatten` de listas (arriba) ahora es polimórfico
+        // y delega los arrays a `crate::arrays::flatten` (G1: no pisa el de listas).
+        self.register("at", 2, Rc::new(|_i, a, _l| crate::arrays::at(a)));
+        // Reducciones nuevas (std/var). sum/mean/min/max/product se extienden en math.rs.
+        self.register("std", -1, Rc::new(|_i, a, _l| crate::arrays::std(a)));
+        self.register("var", -1, Rc::new(|_i, a, _l| crate::arrays::var(a)));
+        // Álgebra lineal (faer, sobre 2D).
+        self.register("matmul", 2, Rc::new(|_i, a, _l| crate::arrays::matmul(a)));
+        self.register("dot", 2, Rc::new(|_i, a, _l| crate::arrays::dot(a)));
+        self.register("solve", 2, Rc::new(|_i, a, _l| crate::arrays::solve(a)));
+        self.register("det", 1, Rc::new(|_i, a, _l| crate::arrays::det(a)));
+        self.register("inv", 1, Rc::new(|_i, a, _l| crate::arrays::inv(a)));
+        self.register("norm", -1, Rc::new(|_i, a, _l| crate::arrays::norm(a)));
+        self.register("trace", 1, Rc::new(|_i, a, _l| crate::arrays::trace(a)));
+        self.register("eig", 1, Rc::new(|_i, a, _l| crate::arrays::eig(a)));
+        self.register("svd", 1, Rc::new(|_i, a, _l| crate::arrays::svd(a)));
 
         // Constantes matemáticas — VALORES globales (se usan sin llamar): pi/tau/e/inf/nan.
         {
@@ -1076,6 +1111,8 @@ impl Interpreter {
                         }
                         Ok(syn_int(b[i as usize] as i64))
                     }
+                    // `a[i]` → fila (nD) o escalar (1D). Negativo/fuera de rango → error.
+                    SynValue::Array(a) => crate::arrays::index_row(a, num_to_i64(&idx)?),
                     _ => Err(err_at(format!("Cannot index into {}", obj.type_name()), loc)),
                 }
             }
@@ -1092,6 +1129,7 @@ impl Interpreter {
                     "-" => match &v {
                         SynValue::Number(n) => Ok(syn_number(n.neg())),
                         SynValue::Complex(z) => Ok(SynValue::Complex(-z)),
+                        SynValue::Array(a) => Ok(crate::arrays::negate(a)),
                         _ => Err(err_at(format!("Cannot negate {}", v.type_name()), loc)),
                     },
                     "not" => Ok(syn_bool(!v.is_truthy())),
@@ -1763,6 +1801,16 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 return Ok(SynValue::Complex(z));
             }
         }
+        // Aritmética vectorizada de arrays (Batch 5): elementwise + broadcasting, y
+        // array⊕scalar. `*` es ELEMENTWISE (Hadamard), NO producto matricial (eso es
+        // matmul/dot). Va DESPUÉS de los concats de Text/List/Bytes y de la rama Complex,
+        // y ANTES del camino Number (G2: el tower no se perturba). `array_binop` devuelve
+        // None si ningún operando es array → sigue al camino normal.
+        if matches!(op, "+" | "-" | "*" | "/") {
+            if let Some(res) = crate::arrays::array_binop(&left, &right, op) {
+                return res;
+            }
+        }
         // Aritmética — por el camino FALIBLE: mezclar Decimal con Float es un error
         // claro. Int/Big mezclan libremente con ambos.
         if let (SynValue::Number(a), SynValue::Number(b)) = (&left, &right) {
@@ -1812,6 +1860,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             // Los complejos NO son ordenables (G3): error claro, como Python.
             if matches!(left, SynValue::Complex(_)) || matches!(right, SynValue::Complex(_)) {
                 return Err(err_at("complex numbers are not ordered", loc));
+            }
+            // Comparación elementwise de arrays = futuro (§12). Por ahora, error claro (G3).
+            if matches!(left, SynValue::Array(_)) || matches!(right, SynValue::Array(_)) {
+                return Err(err_at(
+                    "arrays do not support ordering comparisons (use elementwise functions)",
+                    loc,
+                ));
             }
             if let (SynValue::Number(a), SynValue::Number(b)) = (&left, &right) {
                 if Number::mixes_decimal_float(a, b) {
@@ -2713,6 +2768,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_flatten(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        // Array (Batch 5): aplana a un array 1D (row-major). Listas: comportamiento previo
+        // (aplana UN nivel de anidamiento). Polimórfico → no rompe el `flatten` de listas (G1).
+        if matches!(nth(args, 0)?, SynValue::Array(_)) {
+            return crate::arrays::flatten(args);
+        }
         let items = self.list_arg(nth(args, 0)?, "flatten")?;
         let mut out = Vec::new();
         for item in items {

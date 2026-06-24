@@ -20,3 +20,6 @@ subtle.workspace = true
 # (num-complex). Ambas puro-Rust, sin C → binario único estático.
 libm.workspace = true
 num-complex.workspace = true
+# Arrays n-dimensionales + álgebra lineal (Batch 5): ndarray + faer, puro-Rust sin C.
+ndarray.workspace = true
+faer.workspace = true
