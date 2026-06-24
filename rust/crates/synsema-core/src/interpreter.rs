@@ -528,6 +528,60 @@ impl Interpreter {
         self.register("count_where", 2, Rc::new(|i, a, l| i.b_count_where(a, l)));
         self.register("flatten", 1, Rc::new(|i, a, l| i.b_flatten(a, l)));
         self.register("zip_with", 3, Rc::new(|i, a, l| i.b_zip_with(a, l)));
+
+        // -- Librería matemática (math.rs) — funciones puras sobre Number.
+        // NOTA: NO se registra un builtin `log` (choca con el soft keyword de
+        // observabilidad); se usan ln/log10/log2.
+        // signo / magnitud / selección (preservan tipo)
+        self.register("abs", 1, Rc::new(|_i, a, _l| crate::math::abs(a)));
+        self.register("sign", 1, Rc::new(|_i, a, _l| crate::math::sign(a)));
+        self.register("min", -1, Rc::new(|_i, a, _l| crate::math::min(a)));
+        self.register("max", -1, Rc::new(|_i, a, _l| crate::math::max(a)));
+        self.register("clamp", 3, Rc::new(|_i, a, _l| crate::math::clamp(a)));
+        // raíces / potencias
+        self.register("sqrt", 1, Rc::new(|_i, a, _l| crate::math::sqrt(a)));
+        self.register("cbrt", 1, Rc::new(|_i, a, _l| crate::math::cbrt(a)));
+        self.register("hypot", 2, Rc::new(|_i, a, _l| crate::math::hypot(a)));
+        self.register("pow", 2, Rc::new(|_i, a, _l| crate::math::pow(a)));
+        // exp / log
+        self.register("exp", 1, Rc::new(|_i, a, _l| crate::math::exp(a)));
+        self.register("ln", 1, Rc::new(|_i, a, _l| crate::math::ln(a)));
+        self.register("log10", 1, Rc::new(|_i, a, _l| crate::math::log10(a)));
+        self.register("log2", 1, Rc::new(|_i, a, _l| crate::math::log2(a)));
+        self.register("log_base", 2, Rc::new(|_i, a, _l| crate::math::log_base(a)));
+        // trigonometría (radianes)
+        self.register("sin", 1, Rc::new(|_i, a, _l| crate::math::sin(a)));
+        self.register("cos", 1, Rc::new(|_i, a, _l| crate::math::cos(a)));
+        self.register("tan", 1, Rc::new(|_i, a, _l| crate::math::tan(a)));
+        self.register("asin", 1, Rc::new(|_i, a, _l| crate::math::asin(a)));
+        self.register("acos", 1, Rc::new(|_i, a, _l| crate::math::acos(a)));
+        self.register("atan", 1, Rc::new(|_i, a, _l| crate::math::atan(a)));
+        self.register("atan2", 2, Rc::new(|_i, a, _l| crate::math::atan2(a)));
+        self.register("radians", 1, Rc::new(|_i, a, _l| crate::math::radians(a)));
+        self.register("degrees", 1, Rc::new(|_i, a, _l| crate::math::degrees(a)));
+        // teoría de números (enteros)
+        self.register("gcd", 2, Rc::new(|_i, a, _l| crate::math::gcd(a)));
+        self.register("lcm", 2, Rc::new(|_i, a, _l| crate::math::lcm(a)));
+        self.register("factorial", 1, Rc::new(|_i, a, _l| crate::math::factorial(a)));
+        // introspección
+        self.register("is_nan", 1, Rc::new(|_i, a, _l| crate::math::is_nan(a)));
+        self.register("is_infinite", 1, Rc::new(|_i, a, _l| crate::math::is_infinite(a)));
+        self.register("is_finite", 1, Rc::new(|_i, a, _l| crate::math::is_finite(a)));
+        self.register("round_to", 2, Rc::new(|_i, a, _l| crate::math::round_to(a)));
+        // agregados sobre una lista
+        self.register("sum", 1, Rc::new(|_i, a, _l| crate::math::sum(a)));
+        self.register("product", 1, Rc::new(|_i, a, _l| crate::math::product(a)));
+        self.register("mean", 1, Rc::new(|_i, a, _l| crate::math::mean(a)));
+
+        // Constantes matemáticas — VALORES globales (se usan sin llamar): pi/tau/e/inf/nan.
+        {
+            let mut g = self.global_env.borrow_mut();
+            g.bindings.insert("pi".to_string(), syn_float(std::f64::consts::PI));
+            g.bindings.insert("tau".to_string(), syn_float(std::f64::consts::TAU));
+            g.bindings.insert("e".to_string(), syn_float(std::f64::consts::E));
+            g.bindings.insert("inf".to_string(), syn_float(f64::INFINITY));
+            g.bindings.insert("nan".to_string(), syn_float(f64::NAN));
+        }
     }
 
     /// Si `Enum.variant` (un `property_name` accedido sobre un objeto que evalúa a
@@ -3076,5 +3130,141 @@ mod soft_dsl_keyword_tests {
         // `require`/`sandbox` son keywords reservadas: no son nombres válidos.
         assert!(!run_source("let require be 1", "<test>").success);
         assert!(!run_source("let sandbox be 1", "<test>").success);
+    }
+}
+
+#[cfg(test)]
+mod math_library_tests {
+    use super::run_source;
+
+    fn line(src: &str) -> String {
+        let r = run_source(src, "<test>");
+        assert!(r.success, "el programa falló: {:?}", r.errors);
+        assert_eq!(r.output.len(), 1, "se esperaba una línea de salida: {:?}", r.output);
+        r.output[0].clone()
+    }
+
+    fn fails(src: &str) {
+        assert!(!run_source(src, "<test>").success, "se esperaba un error para: {}", src);
+    }
+
+    // ---- constantes ----
+    #[test]
+    fn constants() {
+        assert_eq!(line("print(text(pi))"), "3.141592653589793");
+        assert_eq!(line("let r be 2\nprint(text(pi * r * r))"), "12.566370614359172");
+        assert_eq!(line("print(text(round_to(e, 5)))"), "2.71828");
+        assert_eq!(line("print(text(round_to(tau, 5)))"), "6.28319");
+        assert_eq!(line("print(text(nan))"), "nan");
+        assert_eq!(line("print(text(inf))"), "inf");
+        assert_eq!(line("print(text(0 - inf))"), "-inf");
+    }
+
+    // ---- raíces / potencias ----
+    #[test]
+    fn roots_and_powers() {
+        assert_eq!(line("print(text(sqrt(16)))"), "4.0");
+        assert_eq!(line("print(text(round_to(sqrt(2), 4)))"), "1.4142");
+        assert_eq!(line("print(text(is_nan(sqrt(-1))))"), "true");
+        assert_eq!(line("print(text(cbrt(27)))"), "3.0");
+        assert_eq!(line("print(text(pow(2, 10)))"), "1024"); // int, espeja **
+        assert_eq!(line("print(text(hypot(3, 4)))"), "5.0");
+    }
+
+    // ---- exp / log ----
+    #[test]
+    fn exp_and_log() {
+        assert_eq!(line("print(text(exp(0)))"), "1.0");
+        assert_eq!(line("print(text(round_to(ln(e), 6)))"), "1.0");
+        assert_eq!(line("print(text(round_to(log10(1000), 6)))"), "3.0");
+        assert_eq!(line("print(text(log2(8)))"), "3.0");
+        assert_eq!(line("print(text(is_infinite(ln(0))))"), "true");
+        assert_eq!(line("print(text(ln(0)))"), "-inf");
+        assert_eq!(line("print(text(is_nan(ln(-1))))"), "true");
+        assert_eq!(line("print(text(round_to(log_base(8, 2), 6)))"), "3.0");
+    }
+
+    // ---- trig (radianes) ----
+    #[test]
+    fn trig() {
+        assert_eq!(line("print(text(sin(0)))"), "0.0");
+        assert_eq!(line("print(text(cos(0)))"), "1.0");
+        assert_eq!(line("print(text(round_to(sin(pi / 2), 6)))"), "1.0");
+        assert_eq!(line("print(text(round_to(atan2(1, 1), 6)))"), "0.785398");
+        assert_eq!(line("print(text(round_to(degrees(pi), 6)))"), "180.0");
+        assert_eq!(line("print(text(round_to(radians(180), 6)))"), "3.141593");
+    }
+
+    // ---- signo / magnitud / selección (preservan tipo) ----
+    #[test]
+    fn sign_abs_min_max_clamp() {
+        assert_eq!(line("print(text(abs(-5)))"), "5"); // int
+        assert_eq!(line("print(text(abs(-5.0)))"), "5.0"); // float (tipo preservado)
+        assert_eq!(line("print(text(sign(-3)))"), "-1");
+        assert_eq!(line("print(text(sign(0)))"), "0");
+        assert_eq!(line("print(text(sign(7)))"), "1");
+        assert_eq!(line("print(text(min(3, 5, 1)))"), "1");
+        assert_eq!(line("print(text(max([3, 5, 1])))"), "5");
+        assert_eq!(line("print(text(min(5)))"), "5");
+        assert_eq!(line("print(text(clamp(12, 0, 10)))"), "10");
+        assert_eq!(line("print(text(clamp(-3, 0, 10)))"), "0");
+        assert_eq!(line("print(text(clamp(5, 0, 10)))"), "5");
+    }
+
+    // ---- teoría de números ----
+    #[test]
+    fn number_theory() {
+        assert_eq!(line("print(text(gcd(12, 18)))"), "6");
+        assert_eq!(line("print(text(lcm(4, 6)))"), "12");
+        assert_eq!(line("print(text(factorial(25)))"), "15511210043330985984000000");
+        assert_eq!(line("print(text(factorial(0)))"), "1");
+    }
+
+    // ---- introspección ----
+    #[test]
+    fn introspection() {
+        assert_eq!(line("print(text(is_finite(1.0)))"), "true");
+        assert_eq!(line("print(text(is_nan(nan)))"), "true");
+        assert_eq!(line("print(text(is_infinite(inf)))"), "true");
+        assert_eq!(line("print(text(is_finite(inf)))"), "false");
+        assert_eq!(line("print(text(is_finite(42)))"), "true"); // los enteros son finitos
+        assert_eq!(line("print(text(round_to(3.14159, 2)))"), "3.14");
+    }
+
+    // ---- agregados ----
+    #[test]
+    fn aggregates() {
+        assert_eq!(line("print(text(sum([1, 2, 3])))"), "6");
+        assert_eq!(line("print(text(product([1, 2, 3, 4])))"), "24");
+        assert_eq!(line("print(text(mean([2, 4, 6])))"), "4.0");
+        assert_eq!(line("print(text(sum([])))"), "0"); // vacío → 0
+        assert_eq!(line("print(text(product([])))"), "1"); // vacío → 1
+    }
+
+    // ---- errores ----
+    #[test]
+    fn errors() {
+        fails("print(sqrt(\"x\"))"); // tipo
+        fails("print(min())"); // vacío
+        fails("print(min([]))"); // lista vacía
+        fails("print(mean([]))"); // mean vacío → error
+        fails("print(sqrt(1, 2))"); // aridad
+        fails("print(gcd(1.5, 2))"); // gcd sobre float
+        fails("print(factorial(0 - 3))"); // factorial negativo
+    }
+
+    // ---- regresión: redondeo intacto + sin colisión con el soft keyword `log` ----
+    #[test]
+    fn rounding_builtins_unchanged() {
+        assert_eq!(line("print(text(floor(3.7)))"), "3");
+        assert_eq!(line("print(text(ceil(3.2)))"), "4");
+        assert_eq!(line("print(text(round(2.5)))"), "2"); // ties-to-even
+        assert_eq!(line("print(text(trunc(-3.7)))"), "-3");
+    }
+
+    #[test]
+    fn log_soft_keyword_not_shadowed() {
+        // No se registró un builtin `log`: `log "msg"` sigue siendo el DSL.
+        assert!(run_source("log \"msg\"", "<test>").success);
     }
 }

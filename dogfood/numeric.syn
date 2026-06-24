@@ -1,0 +1,31 @@
+-- dogfood de la librería matemática (feat/math-library)
+-- constantes
+let r be 3
+print(`área del círculo: {round_to(pi * r * r, 4)}`)
+
+-- raíces / potencias / magnitud
+print(`sqrt(144) = {text(sqrt(144))}`)
+print(`abs(-7) = {text(abs(-7))}`)
+print(`pow(2, 16) = {text(pow(2, 16))}`)
+print(`hypot(3, 4) = {text(hypot(3, 4))}`)
+
+-- selección sobre datos
+let muestras be [12, -4, 7, 23, 0]
+print(`min = {text(min(muestras))}, max = {text(max(muestras))}`)
+print(`min(3, 5, 1) = {text(min(3, 5, 1))}`)
+print(`clamp(120, 0, 100) = {text(clamp(120, 0, 100))}`)
+
+-- agregados
+let valores be [2, 4, 6, 8]
+print(`sum = {text(sum(valores))}, mean = {text(mean(valores))}, product = {text(product(valores))}`)
+
+-- teoría de números
+print(`gcd(24, 36) = {text(gcd(24, 36))}, lcm(4, 6) = {text(lcm(4, 6))}`)
+print(`factorial(20) = {text(factorial(20))}`)
+
+-- dominio: NaN/Inf chequeables
+print(`sqrt(-1) is nan: {text(is_nan(sqrt(-1)))}`)
+print(`ln(0) is infinite: {text(is_infinite(ln(0)))}`)
+
+-- trig en radianes
+print(`sin(pi/2) = {text(round_to(sin(pi / 2), 6))}, degrees(pi) = {text(round_to(degrees(pi), 6))}`)

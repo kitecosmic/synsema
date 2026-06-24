@@ -9,6 +9,7 @@ pub mod ast_api;
 pub mod flat_syntax;
 pub mod interpreter;
 pub mod lexer;
+pub mod math;
 pub mod number;
 pub mod parser;
 pub mod secret;
