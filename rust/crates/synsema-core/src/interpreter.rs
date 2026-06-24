@@ -530,23 +530,60 @@ impl Interpreter {
         self.register("zip_with", 3, Rc::new(|i, a, l| i.b_zip_with(a, l)));
     }
 
-    /// Si `pattern` es un acceso `Enum.variant` cuyo objeto evalúa a un map
-    /// namespace de enum (tiene "__enum"), devuelve el id calificado
-    /// ("Enum.variant"); si no, None (→ el caller usa igualdad de valor).
-    fn variant_pattern_id(
+    /// Si `Enum.variant` (un `property_name` accedido sobre un objeto que evalúa a
+    /// un map namespace de enum con "__enum"), devuelve el id calificado
+    /// ("Enum.variant"); si no, None.
+    fn enum_variant_id(
         &mut self,
-        pattern: &Node,
+        property_name: &str,
+        object: &Node,
         env: &Rc<RefCell<Environment>>,
     ) -> Result<Option<String>, Control> {
-        if let NodeKind::PropertyAccess { property_name, object } = &pattern.kind {
-            let obj = self.exec(object, env)?;
-            if let SynValue::Map(m) = &obj {
-                if let Some(SynValue::Text(enum_name)) = m.borrow().get("__enum") {
-                    return Ok(Some(format!("{}.{}", enum_name, property_name)));
-                }
+        let obj = self.exec(object, env)?;
+        if let SynValue::Map(m) = &obj {
+            if let Some(SynValue::Text(enum_name)) = m.borrow().get("__enum") {
+                return Ok(Some(format!("{}.{}", enum_name, property_name)));
             }
         }
         Ok(None)
+    }
+
+    /// Reconoce un patrón de variante de enum en un arm de `match`:
+    /// - `PropertyAccess` sobre un map con "__enum" → `Some((id, None))` — sin binding.
+    /// - `TaskCall` cuyo `name` es ese `PropertyAccess` Y **todos** los args son
+    ///   identificadores → `Some((id, Some([nombres])))` — binding posicional del payload.
+    /// - cualquier otra cosa → `None` (cae a la igualdad de valor: cubre formas como
+    ///   `is Order.paid(100)` (value-match), literales, identificadores, maps, etc.).
+    fn variant_pattern(
+        &mut self,
+        pattern: &Node,
+        env: &Rc<RefCell<Environment>>,
+    ) -> Result<Option<(String, Option<Vec<String>>)>, Control> {
+        match &pattern.kind {
+            NodeKind::PropertyAccess { property_name, object } => {
+                Ok(self
+                    .enum_variant_id(property_name, object, env)?
+                    .map(|id| (id, None)))
+            }
+            NodeKind::TaskCall { name, arguments } => {
+                if let NodeKind::PropertyAccess { property_name, object } = &name.kind {
+                    // Binding sólo si TODOS los args son identificadores; si no, es
+                    // un patrón de valor (p.ej. `is Order.paid(100)`) → None.
+                    let mut binders = Vec::with_capacity(arguments.len());
+                    for a in arguments {
+                        match &a.kind {
+                            NodeKind::Identifier { name } => binders.push(name.clone()),
+                            _ => return Ok(None),
+                        }
+                    }
+                    if let Some(id) = self.enum_variant_id(property_name, object, env)? {
+                        return Ok(Some((id, Some(binders))));
+                    }
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
     }
 
     // =========================================================
@@ -761,9 +798,9 @@ impl Interpreter {
                 let v = self.exec(value, env)?;
                 for arm in arms {
                     if let NodeKind::MatchArm { pattern, body } = &arm.kind {
-                        // Patrón de variante `Enum.variant`: match por discriminante
-                        // ("__variant"), payload ignorado.
-                        if let Some(variant_id) = self.variant_pattern_id(pattern, env)? {
+                        // Patrón de variante `Enum.variant` (con o sin binding del payload).
+                        if let Some((variant_id, binders)) = self.variant_pattern(pattern, env)? {
+                            // ¿el escrutinio es un map cuyo "__variant" == variant_id?
                             let is_match = if let SynValue::Map(m) = &v {
                                 matches!(
                                     m.borrow().get("__variant"),
@@ -772,10 +809,43 @@ impl Interpreter {
                             } else {
                                 false
                             };
-                            if is_match {
-                                return self.exec_block(body, env);
+                            if !is_match {
+                                continue;
                             }
-                            continue;
+                            match binders {
+                                // `is Enum.variant` (sin paréntesis): sin binding.
+                                None => return self.exec_block(body, env),
+                                // `is Enum.variant(b1, …)`: ligá el payload posicionalmente
+                                // (valores del map salvo "__variant", en orden declarado) en
+                                // un Environment HIJO scopeado al arm; aridad exacta.
+                                Some(names) => {
+                                    let payload: Vec<SynValue> = match &v {
+                                        SynValue::Map(m) => m
+                                            .borrow()
+                                            .iter()
+                                            .filter(|(k, _)| k.as_str() != "__variant")
+                                            .map(|(_, val)| val.clone())
+                                            .collect(),
+                                        _ => Vec::new(),
+                                    };
+                                    if names.len() != payload.len() {
+                                        return Err(err_at(
+                                            format!(
+                                                "variant {} binds {} fields, got {}",
+                                                variant_id,
+                                                payload.len(),
+                                                names.len()
+                                            ),
+                                            loc,
+                                        ));
+                                    }
+                                    let arm_env = Environment::child(env, "match-arm");
+                                    for (name, val) in names.iter().zip(payload.into_iter()) {
+                                        env_set(&arm_env, name, val);
+                                    }
+                                    return self.exec_block(body, &arm_env);
+                                }
+                            }
                         }
                         // Cualquier otro patrón: la igualdad de valor de SIEMPRE.
                         let p = self.exec(pattern, env)?;
@@ -2632,6 +2702,132 @@ mod match_fixes_tests {
     fn payloaded_enum_equality() {
         let src = format!("{}print(text(Order.shipped(\"a\",\"b\") == Order.shipped(\"a\",\"b\")))", ENUM);
         assert_eq!(out(&src), vec!["true"]);
+    }
+}
+
+#[cfg(test)]
+mod match_binding_tests {
+    use super::run_source;
+
+    const ENUM: &str = "enum Order\n    pending\n    paid(amount)\n    shipped(date, carrier)\n";
+
+    fn out(src: &str) -> Vec<String> {
+        let r = run_source(src, "<test>");
+        assert!(r.success, "el programa falló: {:?}", r.errors);
+        r.output
+    }
+
+    // `is Order.shipped(d, c)` liga el payload POSICIONALMENTE (orden declarado).
+    #[test]
+    fn binds_payload_positionally() {
+        let src = format!(
+            "{}let o be Order.shipped(\"2026-06-23\", \"DHL\")\nmatch o\n    is Order.shipped(d, c)\n        print(d)\n        print(c)\n",
+            ENUM
+        );
+        // date=d, carrier=c (orden declarado: shipped(date, carrier))
+        assert_eq!(out(&src), vec!["2026-06-23", "DHL"]);
+    }
+
+    #[test]
+    fn binds_single_field_variant() {
+        let src = format!(
+            "{}let o be Order.paid(99)\nmatch o\n    is Order.paid(amt)\n        print(text(amt))\n",
+            ENUM
+        );
+        assert_eq!(out(&src), vec!["99"]);
+    }
+
+    // El arm de binding se SALTEA si la variante no matchea (sin fuga de binders).
+    #[test]
+    fn binding_arm_skipped_on_non_matching_variant() {
+        let src = format!(
+            "{}let o be Order.pending\nmatch o\n    is Order.shipped(d, c)\n        print(c)\n    is Order.pending\n        print(\"pend\")\n",
+            ENUM
+        );
+        assert_eq!(out(&src), vec!["pend"]);
+    }
+
+    // `otherwise` corre si ningún `is` (incluido uno con binding) matchea.
+    #[test]
+    fn otherwise_runs_when_binding_arm_does_not_match() {
+        let src = format!(
+            "{}let o be Order.pending\nmatch o\n    is Order.shipped(d, c)\n        print(c)\n    otherwise\n        print(\"otro\")\n",
+            ENUM
+        );
+        assert_eq!(out(&src), vec!["otro"]);
+    }
+
+    // Aridad: `is Order.shipped(d)` contra un shipped (2 campos) → error claro.
+    #[test]
+    fn arity_mismatch_errors() {
+        let src = format!(
+            "{}let o be Order.shipped(\"d\", \"c\")\nmatch o\n    is Order.shipped(d)\n        print(d)\n",
+            ENUM
+        );
+        let r = run_source(&src, "<test>");
+        assert!(!r.success, "binder-count incorrecto debería fallar");
+        assert!(
+            r.errors.iter().any(|e| e.contains("binds 2 fields, got 1")),
+            "error de aridad esperado, got {:?}",
+            r.errors
+        );
+    }
+
+    // Los binders están scopeados al arm: no son visibles tras el match.
+    #[test]
+    fn binders_are_arm_scoped() {
+        let src = format!(
+            "{}let o be Order.shipped(\"d\", \"DHL\")\nmatch o\n    is Order.shipped(d, c)\n        print(c)\nprint(c)\n",
+            ENUM
+        );
+        let r = run_source(&src, "<test>");
+        assert!(!r.success, "el binder `c` no debería ser visible tras el match");
+        assert!(
+            r.errors.iter().any(|e| e.contains("Undefined") || e.contains("c")),
+            "se esperaba un error de variable indefinida, got {:?}",
+            r.errors
+        );
+    }
+
+    #[test]
+    fn binder_shadows_outer() {
+        let src = format!(
+            "{}let c be \"outer\"\nlet o be Order.shipped(\"d\", \"DHL\")\nmatch o\n    is Order.shipped(d, c)\n        print(c)\n",
+            ENUM
+        );
+        assert_eq!(out(&src), vec!["DHL"]);
+    }
+
+    // -- Regresión: las formas existentes siguen igual --
+
+    #[test]
+    fn no_parens_variant_still_matches() {
+        let src = format!(
+            "{}let o be Order.pending\nmatch o\n    is Order.pending\n        print(\"pend\")\n",
+            ENUM
+        );
+        assert_eq!(out(&src), vec!["pend"]);
+    }
+
+    #[test]
+    fn literal_payload_is_value_match() {
+        // `is Order.paid(100)` (literal, no identificador) → patrón de valor.
+        let hit = format!(
+            "{}let o be Order.paid(100)\nmatch o\n    is Order.paid(100)\n        print(\"cien\")\n    otherwise\n        print(\"otro\")\n",
+            ENUM
+        );
+        assert_eq!(out(&hit), vec!["cien"]);
+        let miss = format!(
+            "{}let o be Order.paid(50)\nmatch o\n    is Order.paid(100)\n        print(\"cien\")\n    otherwise\n        print(\"otro\")\n",
+            ENUM
+        );
+        assert_eq!(out(&miss), vec!["otro"]);
+    }
+
+    #[test]
+    fn non_enum_match_unchanged() {
+        let src = "let x be 9\nmatch x\n    is 5\n        print(\"five\")\n    is 9\n        print(\"nine\")\n";
+        assert_eq!(out(src), vec!["nine"]);
     }
 }
 
