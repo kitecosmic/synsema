@@ -23,6 +23,10 @@ specs/
 # Arena de benchmark: comparativas locales (vs Go/Node/etc.), NO va al repo público.
 synsema-arena/
 
+# Árbol Python original (MVP / oráculo de paridad), CONGELADO — producción es Rust
+# (rust/). Se conserva localmente pero ya no va al repo público. Ver synsema/FROZEN.md.
+synsema/
+
 # Estado/persistencia y daemons de runtime (fuera del repo, defensivo)
 .synsema/
 
