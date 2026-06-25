@@ -30,6 +30,11 @@ synsema-arena/
 # (rust/). Se conserva localmente pero ya no va al repo público. Ver synsema/FROZEN.md.
 synsema/
 
+# Suite pytest del oráculo Python (legado): importa synsema/ y ya no se usa
+# (el conformance es `cargo test`). Se conserva local, fuera del repo público.
+# Los tests del lenguaje en .syn (tests/*.test.syn) SÍ se versionan.
+tests/*.py
+
 # Estado/persistencia y daemons de runtime (fuera del repo, defensivo)
 .synsema/
 
