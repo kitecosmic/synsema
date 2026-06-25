@@ -8,7 +8,7 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
-use synsema_runtime::engine::{run_source, run_swarm_dump};
+use synsema_runtime::engine::{run_source, run_source_secure, run_swarm_dump};
 use synsema_runtime::serve::run_serve_program;
 
 // =========================================================
@@ -65,6 +65,59 @@ fn sandbox_require_cannot_escape() {
     assert!(!r.success, "require no debería poder escapar del sandbox");
     assert!(
         r.errors.iter().any(|e| e.contains("Capability not granted")),
+        "errs: {:?}",
+        r.errors
+    );
+}
+
+// =========================================================
+// Gate de capability `llm` para las ops LLM (reason/decide/analyze/generate)
+// =========================================================
+
+#[test]
+fn llm_op_denied_in_secure_without_require() {
+    // En secure, una op LLM sin `require llm` debe DENEGARSE (igual que cualquier
+    // otra capability). Cubre el path de placeholder (sin provider real).
+    let r = run_source_secure("let e be generate \"x\" given \"y\"\n", "<t>");
+    assert!(!r.success, "secure sin `require llm` debería denegar la op LLM");
+    assert!(
+        r.errors.iter().any(|e| e.contains("Capability not granted: llm")),
+        "errs: {:?}",
+        r.errors
+    );
+}
+
+#[test]
+fn llm_op_allowed_in_secure_with_require() {
+    // En secure, declarar `require llm` concede la capability → la op LLM corre.
+    let r = run_source_secure(
+        "require llm\nlet e be generate \"x\" given \"y\"\nprint(\"ok\")\n",
+        "<t>",
+    );
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["ok".to_string()]);
+}
+
+#[test]
+fn llm_op_autogranted_in_run() {
+    // Retrocompat: en no-secure (`run`/`conform`) `llm` se auto-concede como
+    // stdout/time → los programas existentes sin `require llm` siguen andando.
+    let r = run_source("let e be generate \"x\" given \"y\"\nprint(\"ok\")\n", "<t>");
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["ok".to_string()]);
+}
+
+#[test]
+fn llm_op_denied_inside_sandbox() {
+    // El gate se COMPONE con el aislamiento del sandbox: aunque `llm` esté concedida
+    // afuera (auto-grant), dentro del sandbox el CapabilitySet se vacía → denegada.
+    let r = run_source(
+        "let e be generate \"outside\"\nsandbox\n    let f be generate \"inside\"\n",
+        "<t>",
+    );
+    assert!(!r.success, "el sandbox debería denegar la op LLM");
+    assert!(
+        r.errors.iter().any(|e| e.contains("Capability not granted: llm")),
         "errs: {:?}",
         r.errors
     );

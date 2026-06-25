@@ -259,6 +259,11 @@ pub struct Interpreter {
     /// Callback LLM (reason/decide/analyze/generate): operación → contenido.
     /// Sin él: placeholders descriptivos.
     llm_callback: Option<Rc<dyn Fn(&str) -> String>>,
+    /// Gate de capability para las ops LLM: lo cablea el motor para exigir
+    /// `require llm` antes de CUALQUIER op LLM (provider real o placeholder).
+    /// `Err(msg)` → la op falla con `Capability not granted: llm`. Sin él: sin gate
+    /// (core no depende de capabilities; el motor provee la lógica).
+    llm_cap_hook: Option<Rc<dyn Fn() -> Result<(), String>>>,
     /// Hook de `serve on PORT` (lo cablea el motor en el camino de serve).
     serve_hook: Option<ServeHook>,
     /// Sink de `send` dentro de un handler de stream SSE (lo cablea el motor por
@@ -318,6 +323,7 @@ impl Interpreter {
             swarm_hooks: None,
             human_callback: None,
             llm_callback: None,
+            llm_cap_hook: None,
             serve_hook: None,
             stream_emit: None,
             log_hook: None,
@@ -378,6 +384,20 @@ impl Interpreter {
     /// Cablea el callback LLM (reason/decide/analyze/generate).
     pub fn set_llm_callback(&mut self, cb: Rc<dyn Fn(&str) -> String>) {
         self.llm_callback = Some(cb);
+    }
+
+    /// Cablea el gate de capability para las ops LLM (exige `require llm`).
+    pub fn set_llm_cap_hook(&mut self, hook: Rc<dyn Fn() -> Result<(), String>>) {
+        self.llm_cap_hook = Some(hook);
+    }
+
+    /// Chequea la capability `llm` (si hay gate). Se llama al inicio de cada op LLM,
+    /// con o sin provider real. Sin gate cableado: no-op (no rompe `Interpreter::new`).
+    fn check_llm_cap(&self) -> Result<(), Control> {
+        if let Some(hook) = &self.llm_cap_hook {
+            hook().map_err(|m| Control::Error(RuntimeError::new(m)))?;
+        }
+        Ok(())
     }
 
     /// Cablea el hook de `serve on PORT` (lo usa el motor en el camino de serve).
@@ -1687,6 +1707,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 
             // -- LLM (sin callback → placeholders) --
             NodeKind::ReasonExpression { subject, context, .. } => {
+                self.check_llm_cap()?;
                 let subj = match subject {
                     Some(s) => self.exec(s, env)?,
                     None => SynValue::Nothing,
@@ -1700,6 +1721,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
             }
             NodeKind::DecideExpression { options, given, .. } => {
+                self.check_llm_cap()?;
                 if let Some(o) = options {
                     self.exec(o, env)?;
                 }
@@ -1712,6 +1734,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
             }
             NodeKind::AnalyzeExpression { data, objective } => {
+                self.check_llm_cap()?;
                 self.exec(data, env)?;
                 match self.llm_callback.clone() {
                     Some(cb) => Ok(syn_text(cb("analyze"))),
@@ -1719,6 +1742,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
             }
             NodeKind::GenerateExpression { target, given, parameters } => {
+                self.check_llm_cap()?;
                 if let Some(g) = given {
                     self.exec(g, env)?;
                 }

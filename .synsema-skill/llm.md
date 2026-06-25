@@ -8,6 +8,19 @@ let email be generate "response email" given complaint with tone = "empathetic"
 let insight be reason about problem with context = background_data
 ```
 
+## Capability
+
+All four operations are gated by the `llm` capability — they are side-effecting (a real provider
+hits the network and costs money), so they follow the same deny-by-default rule as `net`/`file`/`db`:
+
+```
+require llm
+let email be generate "response email" given complaint
+```
+
+Auto-granted in plain `run`/`conform` (like `stdout`/`time`), enforced in `serve`/secure mode, and
+stripped inside a `sandbox`. See [capabilities.md](capabilities.md#the-llm-capability).
+
 ## Providers
 ```bash
 synsema run program.syn --provider anthropic   # Claude

@@ -39,7 +39,8 @@ use synsema_stdlib::secrets::{register_secret_builtins, EnvStore};
 pub(crate) const INTERP_STACK_SIZE: usize = 512 * 1024 * 1024;
 
 /// Wiring común de un intérprete: capabilities + builtins seguros/stdlib + grant hook.
-/// En modo no-secure se auto-conceden STDOUT y TIME (engine.py:99-101).
+/// En modo no-secure se auto-conceden STDOUT, TIME y LLM; en secure/serve hay que
+/// declararlas (`require llm` para las ops LLM). También instala el gate de las ops LLM.
 pub(crate) fn wire_common(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, secure: bool) {
     wire_common_with_state(
         interp,
@@ -62,6 +63,10 @@ pub(crate) fn wire_common_with_state(
     if !secure {
         caps.borrow_mut().grant(Capability::new(CapabilityType::Stdout, None));
         caps.borrow_mut().grant(Capability::new(CapabilityType::Time, None));
+        // Las ops LLM (reason/decide/analyze/generate) exigen la capability `llm`
+        // (gateadas más abajo). En no-secure se auto-concede como stdout/time, por
+        // ergonomía + retrocompat; en secure/serve hay que declarar `require llm`.
+        caps.borrow_mut().grant(Capability::new(CapabilityType::Llm, None));
     }
     register_secure_builtins(interp, caps.clone());
     // Secretos/env: carga el `.env` (antes de evaluar require/serve) y registra
@@ -96,6 +101,16 @@ pub(crate) fn wire_common_with_state(
         if let Some(ty) = capability_type_from_name(name) {
             c.borrow_mut().grant(Capability::new(ty, scope.map(|s| s.to_string())));
         }
+    }));
+    // Gate de las ops LLM: cada reason/decide/analyze/generate exige la capability
+    // `llm` (auto-concedida en no-secure arriba; en secure/serve la concede `require
+    // llm`). Cierra sobre el mismo CapabilitySet → el audit_log registra cada chequeo.
+    let caps_llm = caps.clone();
+    interp.set_llm_cap_hook(Rc::new(move || {
+        caps_llm
+            .borrow_mut()
+            .require(&Capability::new(CapabilityType::Llm, None), "llm operation")
+            .map_err(|v| v.message)
     }));
     // Aislamiento de `sandbox`: al entrar guarda y VACÍA el CapabilitySet (deniega todo);
     // al salir, restaura. Stack para sandboxes anidados. Cubre TODOS los builtins gateados

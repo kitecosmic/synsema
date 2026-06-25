@@ -21,11 +21,29 @@ require secret("STRIPE_API_KEY")    -- read as an opaque, redacted secret
 require secret("APP_*")             -- name prefix: APP_DB, APP_KEY, … (only a trailing *)
 require reveal                      -- enable reveal() (loud + audited; use sparingly)
 require time
+require llm                         -- enable LLM ops (reason/decide/analyze/generate)
 require serve(8080)                 -- bind an HTTP server to this port
 require db("./store.db")            -- open this SQLite database
 ```
 
 `require` in the program body grants the capability for real. This is NOT just a declaration — it enables the operation.
+
+## The `llm` capability
+
+The LLM operations — `reason`, `decide`, `analyze`, `generate` — are gated like every other
+side-effecting operation. They require the `llm` capability:
+
+```
+require llm
+let summary be generate "a summary" given report
+```
+
+- In **secure mode** (`serve`, the secure runtime) an LLM op without `require llm` fails with
+  `Capability not granted: llm`. So you can audit a program's LLM use by reading its `require` lines.
+- In plain **`run`/`conform`** (the non-secure dev mode) `llm` is **auto-granted** for convenience —
+  exactly like `stdout` and `time` — so quick scripts don't need to declare it.
+- Inside a `sandbox` the capability is stripped like any other: an LLM op inside a `sandbox` is
+  **denied** even if it was granted outside.
 
 ## Intent (descriptive)
 
