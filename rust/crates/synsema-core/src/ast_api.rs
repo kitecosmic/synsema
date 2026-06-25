@@ -98,8 +98,17 @@ fn children(n: &Node) -> Vec<&Node> {
         SpawnStatement { arguments, .. } => arguments.iter().map(|(_, node)| node).collect(),
         ShareStatement { value, key } => vec![value, key],
         ObserveStatement { key, .. } => vec![key],
-        SignalStatement { data, .. } => data.iter().map(|b| b.as_ref()).collect(),
-        WaitForStatement { timeout, .. } => timeout.iter().map(|b| b.as_ref()).collect(),
+        // El nombre del canal es una expresión (Batch 6) → se recorre (además del data/timeout).
+        SignalStatement { name, data } => {
+            let mut v: Vec<&Node> = vec![name.as_ref()];
+            v.extend(data.iter().map(|b| b.as_ref()));
+            v
+        }
+        WaitForStatement { signal_name, timeout, .. } => {
+            let mut v: Vec<&Node> = vec![signal_name.as_ref()];
+            v.extend(timeout.iter().map(|b| b.as_ref()));
+            v
+        }
         RequireStatement { scope, .. } => scope.iter().map(|b| b.as_ref()).collect(),
         SandboxBlock { body, .. } => body.iter().collect(),
         InvariantDeclaration { condition, .. } => vec![condition],
@@ -558,8 +567,16 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
         SpawnStatement { arguments, .. } => arguments.iter_mut().map(|(_, node)| node).collect(),
         ShareStatement { value, key } => vec![value.as_mut(), key.as_mut()],
         ObserveStatement { key, .. } => vec![key.as_mut()],
-        SignalStatement { data, .. } => data.iter_mut().map(|b| b.as_mut()).collect(),
-        WaitForStatement { timeout, .. } => timeout.iter_mut().map(|b| b.as_mut()).collect(),
+        SignalStatement { name, data } => {
+            let mut v: Vec<&mut Node> = vec![name.as_mut()];
+            v.extend(data.iter_mut().map(|b| b.as_mut()));
+            v
+        }
+        WaitForStatement { signal_name, timeout, .. } => {
+            let mut v: Vec<&mut Node> = vec![signal_name.as_mut()];
+            v.extend(timeout.iter_mut().map(|b| b.as_mut()));
+            v
+        }
         RequireStatement { scope, .. } => scope.iter_mut().map(|b| b.as_mut()).collect(),
         SandboxBlock { body, .. } => body.iter_mut().collect(),
         InvariantDeclaration { condition, .. } => vec![condition.as_mut()],

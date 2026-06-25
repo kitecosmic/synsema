@@ -980,35 +980,28 @@ impl Parser {
     fn parse_signal(&mut self) -> Result<Node, ParseError> {
         let loc = self.location();
         self.advance();
-        let name_tok = self.expect(TokenType::Text, "")?;
+        // El nombre del canal es una EXPRESIÓN (Batch 6): `parse_expression` se detiene en
+        // el keyword `with` (TokenType::With), así que la cláusula opcional sigue OK.
+        let name = Box::new(self.parse_expression()?);
         let mut data = None;
         if self.match_tok(TokenType::With).is_some() {
             data = Some(Box::new(self.parse_expression()?));
         }
-        Ok(Node::new(
-            loc,
-            NodeKind::SignalStatement {
-                name: name_tok.as_str().to_string(),
-                data,
-            },
-        ))
+        Ok(Node::new(loc, NodeKind::SignalStatement { name, data }))
     }
 
     fn parse_wait_for(&mut self) -> Result<Node, ParseError> {
         let loc = self.location();
         self.advance();
-        let name_tok = self.expect(TokenType::Text, "")?;
+        // Nombre como EXPRESIÓN (Batch 6); `parse_expression` se detiene en `as`.
+        let signal_name = Box::new(self.parse_expression()?);
         let mut variable = None;
         if self.match_tok(TokenType::As).is_some() {
             variable = Some(self.expect(TokenType::Identifier, "")?.as_str().to_string());
         }
         Ok(Node::new(
             loc,
-            NodeKind::WaitForStatement {
-                signal_name: name_tok.as_str().to_string(),
-                variable,
-                timeout: None,
-            },
+            NodeKind::WaitForStatement { signal_name, variable, timeout: None },
         ))
     }
 

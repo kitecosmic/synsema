@@ -231,11 +231,14 @@ pub enum NodeKind {
         variable: String,
     },
     SignalStatement {
-        name: String,
+        /// Nombre del canal — EXPRESIÓN (Batch 6): un literal `"x"` o algo dinámico como
+        /// `"cancel:" + text(id)`. Se evalúa a texto en runtime.
+        name: Box<Node>,
         data: Option<Box<Node>>,
     },
     WaitForStatement {
-        signal_name: String,
+        /// Nombre del canal — EXPRESIÓN (Batch 6), igual que `SignalStatement.name`.
+        signal_name: Box<Node>,
         variable: Option<String>,
         timeout: Option<Box<Node>>,
     },

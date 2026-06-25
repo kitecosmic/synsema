@@ -1,0 +1,29 @@
+-- Dogfood del Batch 6 (Fix 3: raise) vía el test framework del Batch 3.
+-- Los Fix 1 (spawn-en-route) y Fix 2 (canales por job_id) viven en los tests E2E del
+-- runtime (necesitan server/swarm reales). Correr: synsema test tests/batch6.test.syn
+
+task reraise()
+    try
+        let x be (1 / 0)
+    recover err
+        raise(err)
+
+test "raise(msg) errors with the message"
+    assert_error(() => raise("boom"))
+
+test "raise() without an argument errors"
+    assert_error(() => raise())
+
+test "raise re-propagates a captured error (recover + raise)"
+    assert_error(() => reraise())
+
+test "try/recover WITHOUT raise swallows the error"
+    let outcome be "not run"
+    try
+        let x be (1 / 0)
+    recover err
+        set outcome to "caught"
+    assert_eq(outcome, "caught")
+
+test "raise coerces non-text messages"
+    assert_error(() => raise(42))

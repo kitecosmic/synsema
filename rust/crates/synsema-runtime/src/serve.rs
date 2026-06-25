@@ -103,6 +103,13 @@ pub(crate) enum GlobalVal {
         body: Vec<Node>,
         required_capabilities: Vec<(String, Option<String>)>,
     },
+    /// Definición de agente (Batch 6): las defs de agentes viven en
+    /// `Interpreter.agent_definitions` (fuera de `global_env.bindings`), así que se
+    /// snapshotean/restauran aparte para que un `spawn` desde una route las encuentre. El
+    /// nombre va en la clave de la tupla; el `body` (Vec<Node>) es `Send` y clonable.
+    Agent {
+        body: Vec<Node>,
+    },
 }
 
 /// Snapshot de las bindings globales (tras correr el top-level). Los builtins se
@@ -125,13 +132,18 @@ pub(crate) fn snapshot_globals(interp: &Interpreter) -> Arc<Vec<(String, GlobalV
             other => out.push((k.clone(), GlobalVal::Value(to_send(other)))),
         }
     }
+    // Agentes (Batch 6): viven en `agent_definitions`, no en `bindings` → se snapshotean
+    // aparte (sólo el body; el closure_env se re-apunta al global del nuevo intérprete).
+    for (name, (body, _env)) in interp.agent_definitions.iter() {
+        out.push((name.clone(), GlobalVal::Agent { body: body.clone() }));
+    }
     Arc::new(out)
 }
 
 /// Reconstruye los globales en un intérprete fresco. Las tasks se recrean con su
 /// closure apuntando al global del nuevo intérprete (los top-level cierran sobre el
 /// global → recursión mutua y acceso a otros globales siguen funcionando).
-pub(crate) fn rebuild_globals(interp: &Interpreter, snapshot: &[(String, GlobalVal)]) {
+pub(crate) fn rebuild_globals(interp: &mut Interpreter, snapshot: &[(String, GlobalVal)]) {
     for (k, gv) in snapshot {
         let v = match gv {
             GlobalVal::Value(sv) => from_send(sv),
@@ -144,6 +156,14 @@ pub(crate) fn rebuild_globals(interp: &Interpreter, snapshot: &[(String, GlobalV
                     origin: None,
                     required_capabilities: required_capabilities.clone(),
                 }))
+            }
+            // Agentes (Batch 6): van al mapa separado `agent_definitions` (NO a bindings),
+            // con el closure apuntando al global del intérprete nuevo (como las tasks). Sin
+            // esto, un `spawn Worker` desde una route daría "No agent defined".
+            GlobalVal::Agent { body } => {
+                let genv = interp.global_env.clone();
+                interp.agent_definitions.insert(k.clone(), (body.clone(), genv));
+                continue;
             }
         };
         interp.set_global(k, v);
@@ -178,7 +198,7 @@ fn build_base_interp(
     }
     wire_swarm_hooks(&mut interp, swarm, "request");
     register_database_builtins(&interp, shared_db);
-    rebuild_globals(&interp, snapshot);
+    rebuild_globals(&mut interp, snapshot);
     (interp, caps)
 }
 

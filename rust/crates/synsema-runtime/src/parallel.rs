@@ -75,7 +75,7 @@ fn build_worker_interp(
         }
     }
     wire_common(&mut interp, &caps, secure);
-    rebuild_globals(&interp, globals);
+    rebuild_globals(&mut interp, globals);
     interp.freeze_intent(); // corre bajo el intent congelado
     interp
 }

@@ -2,7 +2,7 @@
 //!
 //! Subcomando de conformidad (gate de paridad contra el oráculo Python):
 //!
-//!     synsema-cli conform <archivo.syn>
+//!     synsema conform <archivo.syn>
 //!
 //! Ejecuta el programa y emite a STDOUT una sola línea JSON:
 //!     {"ok": <bool>, "out": [<líneas de print>], "err": [<errores>]}
@@ -17,7 +17,7 @@ use synsema_runtime::daemon;
 use synsema_runtime::engine::{repl, run_source, run_swarm_dump, run_tests, TestReport};
 use synsema_runtime::serve::{run_serve_program_with_overrides, ServeOverrides};
 
-const USAGE: &str = "uso: synsema-cli <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run | test [-v] <archivo|dir> | check | tokens | ast | repl | daemon | version> [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run | test [-v] <archivo|dir> | check | tokens | ast | repl | daemon | version> [--env-file <path> | --no-env-file] <archivo.syn>";
 
 /// Serializa un mapa (clave→string) como objeto JSON ordenado.
 fn json_obj(pairs: Vec<(String, String)>) -> String {
@@ -257,7 +257,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let path = match path {
         Some(p) => p,
         None => {
-            eprintln!("uso: synsema-cli run [--flat] <archivo.syn>");
+            eprintln!("uso: synsema run [--flat] <archivo.syn>");
             return ExitCode::from(2);
         }
     };
@@ -303,7 +303,7 @@ fn cmd_test(args: &[String]) -> ExitCode {
     let path = match path {
         Some(p) => p,
         None => {
-            eprintln!("uso: synsema-cli test [-v] [--flat] <archivo.syn | dir>");
+            eprintln!("uso: synsema test [-v] [--flat] <archivo.syn | dir>");
             return ExitCode::from(2);
         }
     };
@@ -399,7 +399,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
     let path = match args.get(2) {
         Some(p) => p.clone(),
         None => {
-            eprintln!("uso: synsema-cli check <archivo.syn>");
+            eprintln!("uso: synsema check <archivo.syn>");
             return ExitCode::from(2);
         }
     };
@@ -432,7 +432,7 @@ fn cmd_tokens(args: &[String]) -> ExitCode {
     let path = match args.get(2) {
         Some(p) => p.clone(),
         None => {
-            eprintln!("uso: synsema-cli tokens <archivo.syn>");
+            eprintln!("uso: synsema tokens <archivo.syn>");
             return ExitCode::from(2);
         }
     };
@@ -462,7 +462,7 @@ fn cmd_ast(args: &[String]) -> ExitCode {
     let path = match args.get(2) {
         Some(p) => p.clone(),
         None => {
-            eprintln!("uso: synsema-cli ast <archivo.syn>");
+            eprintln!("uso: synsema ast <archivo.syn>");
             return ExitCode::from(2);
         }
     };
@@ -497,7 +497,7 @@ fn cmd_daemon(args: &[String]) -> ExitCode {
     let action = match args.get(2).map(String::as_str) {
         Some(a) => a,
         None => {
-            eprintln!("uso: synsema-cli daemon <start|stop|status|logs|restart> [program.syn]");
+            eprintln!("uso: synsema daemon <start|stop|status|logs|restart> [program.syn]");
             return ExitCode::from(2);
         }
     };
@@ -511,7 +511,7 @@ fn cmd_daemon(args: &[String]) -> ExitCode {
     let target = match args.get(3) {
         Some(t) => t.clone(),
         None => {
-            eprintln!("uso: synsema-cli daemon {} <program.syn>", action);
+            eprintln!("uso: synsema daemon {} <program.syn>", action);
             return ExitCode::from(2);
         }
     };

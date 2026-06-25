@@ -523,6 +523,9 @@ impl Interpreter {
         self.register("assert_eq", -1, Rc::new(|i, a, l| i.b_assert_eq(a, l)));
         self.register("assert_ne", -1, Rc::new(|i, a, l| i.b_assert_ne(a, l)));
         self.register("assert_error", 1, Rc::new(|i, a, l| i.b_assert_error(a, l)));
+        // raise(msg) — re-propaga un error (siempre devuelve Control::Error). Habilita
+        // re-lanzar un error capturado en `recover` (`raise(err)`). PURO (Batch 6).
+        self.register("raise", -1, Rc::new(|i, a, l| i.b_raise(a, l)));
         // Redondeo a entero (PUROS — sin capability, como text/number). ties-to-even en
         // round() para igualar el `round` de Python.
         self.register("floor", 1, Rc::new(|i, a, l| i.b_round_op(a, l, "floor", f64::floor)));
@@ -1497,18 +1500,21 @@ impl Interpreter {
                 }
             }
             NodeKind::SignalStatement { name, data } => {
+                // El nombre del canal es una expresión (Batch 6): evaluar a texto.
+                let n = raw_str(&self.exec(name, env)?);
                 let d = match data {
                     Some(d) => Some(self.exec(d, env)?),
                     None => None,
                 };
                 if let Some(h) = self.swarm_hooks.as_ref().map(|s| s.signal.clone()) {
-                    h(name, d);
+                    h(&n, d);
                 }
                 Ok(SynValue::Nothing)
             }
             NodeKind::WaitForStatement { signal_name, variable, .. } => {
+                let n = raw_str(&self.exec(signal_name, env)?);
                 let result = match self.swarm_hooks.as_ref().map(|s| s.wait_for.clone()) {
-                    Some(h) => h(signal_name),
+                    Some(h) => h(&n),
                     None => None,
                 };
                 match result {
@@ -2372,6 +2378,17 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             Ok(_) => Err(err_assertion("expected an error, but none was raised")),
             // `give`/`stop` fuera de un task se propagan como hoy (no son "el error esperado").
             Err(other) => Err(other),
+        }
+    }
+
+    /// `raise(message)` → SIEMPRE devuelve `Control::Error` con `message` coercionado a
+    /// texto. Re-propaga un error capturado en `recover` (un agente con try/recover+raise
+    /// termina en ERROR, no DONE). Sin argumentos → error claro. `give`/`stop` no se ven
+    /// afectados (raise es siempre un error, no un control de flujo).
+    fn b_raise(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        match args.first() {
+            Some(v) => Err(err(raw_str(v))),
+            None => Err(err("raise expects a message")),
         }
     }
 
