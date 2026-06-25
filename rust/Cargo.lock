@@ -2003,6 +2003,7 @@ dependencies = [
  "rcgen 0.13.2",
  "rusqlite",
  "rustls",
+ "rustls-native-certs",
  "rustls-pemfile",
  "serde_json",
  "sha2",

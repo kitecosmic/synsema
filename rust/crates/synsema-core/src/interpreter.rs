@@ -224,7 +224,10 @@ pub struct SwarmHooks {
     /// `wait_for(canal, timeout_secs)` — `None` = default (30 s). Batch 7.
     pub wait_for: Rc<dyn Fn(&str, Option<f64>) -> Option<SynValue>>,
     #[allow(clippy::type_complexity)]
-    pub spawn: Rc<dyn Fn(&str, Vec<Node>, Vec<(String, SynValue)>) -> Result<String, Control>>,
+    /// `spawn(name, body, args, globals)` — `globals` es un snapshot de los bindings
+    /// globales del intérprete llamador (tareas, valores, módulos) para que el agente
+    /// hijo los tenga disponibles sin necesitar HTTP ni wrappers.
+    pub spawn: Rc<dyn Fn(&str, Vec<Node>, Vec<(String, SynValue)>, Vec<(String, SynValue)>) -> Result<String, Control>>,
 }
 
 pub struct Interpreter {
@@ -252,6 +255,10 @@ pub struct Interpreter {
     /// Sink de `send` dentro de un handler de stream SSE (lo cablea el motor por
     /// request de streaming). (value, event_name) → (). Sin él, `send` es error.
     stream_emit: Option<Rc<dyn Fn(SynValue, Option<&str>) -> Result<(), Control>>>,
+    /// Hook de log: si está seteado, cada `log` llama el hook en tiempo real (además
+    /// de pushear a `output`). Thread-safe (`Arc+Sync`) para que los hilos de agentes
+    /// puedan escribir a stdout del proceso principal sin bufferizado.
+    pub log_hook: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
     /// Módulos locales (use/export): caché por path resuelto, set de módulos en
     /// carga (detección de import circular) y una pila de listas de nombres
     /// exportados (un frame por módulo en carga; el frame base es el del
@@ -301,6 +308,7 @@ impl Interpreter {
             llm_callback: None,
             serve_hook: None,
             stream_emit: None,
+            log_hook: None,
             module_cache: HashMap::new(),
             loading_modules: HashSet::new(),
             exports_collector: vec![Vec::new()],
@@ -1456,7 +1464,17 @@ impl Interpreter {
                 match self.swarm_hooks.as_ref().map(|s| s.spawn.clone()) {
                     // Con swarm: el agente corre en su propio hilo (motor).
                     Some(spawn) => {
-                        let id = spawn(agent_name, def.0, spawn_args)?;
+                        // Snapshot de globales del intérprete llamador: tareas, valores
+                        // y módulos (excluye builtins). Viajan al intérprete del agente
+                        // para que pueda llamar tasks del top-level sin HTTP.
+                        let global_vals: Vec<(String, SynValue)> = {
+                            let env = self.global_env.borrow();
+                            env.bindings.iter()
+                                .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect()
+                        };
+                        let id = spawn(agent_name, def.0, spawn_args, global_vals)?;
                         Ok(syn_text(id))
                     }
                     // Sin swarm: ejecución in-process (bloqueante), fallback.
@@ -1678,11 +1696,18 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             NodeKind::TraceBlock { body, .. } => self.exec_block(body, env),
             NodeKind::LogStatement { message, .. } => {
                 let m = self.exec(message, env)?;
-                self.output.push(format!("[LOG] {}", m));
+                let line = format!("[LOG] {}", m);
+                if let Some(hook) = &self.log_hook {
+                    hook(&line);
+                }
+                self.output.push(line);
                 Ok(SynValue::Nothing)
             }
             NodeKind::MeasureBlock { body, .. } => self.exec_block(body, env),
-            NodeKind::CheckpointStatement { .. } => Ok(SynValue::Nothing),
+            NodeKind::CheckpointStatement { name } => {
+                self.exec(name, env)?; // evalúa la expresión (resuelve variables), descarta el valor
+                Ok(SynValue::Nothing)
+            }
             // G2: los bloques `test` NO corren en `synsema run` — no-op. Sólo
             // `Interpreter::run_test_blocks` (vía `synsema test`) ejecuta su cuerpo.
             NodeKind::TestBlock { .. } => Ok(SynValue::Nothing),
@@ -2136,6 +2161,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 
     fn b_print(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
         let s = args.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
+        if let Some(hook) = &self.log_hook {
+            hook(&s);
+        }
         self.output.push(s);
         Ok(SynValue::Nothing)
     }

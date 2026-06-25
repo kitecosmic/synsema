@@ -30,6 +30,7 @@ use synsema_core::ast::Node;
 use synsema_core::interpreter::{Control, Interpreter, RunResult, SwarmHooks, TestOutcome};
 use synsema_core::parser::{parse_source, CompileError};
 use synsema_core::types::{from_send, to_send, SendValue, SynValue};
+use crate::serve::{val_to_global, rebuild_globals, GlobalVal};
 use synsema_stdlib::cron::{register_cron_builtins, CronScheduler};
 use synsema_stdlib::database::{register_database_builtins, DatabaseManager};
 use synsema_stdlib::http::register_http_builtins;
@@ -157,7 +158,7 @@ fn run_inner(source: &str, filename: &str, secure: bool) -> RunResult {
 
 /// Abre la persistencia de estado para `filename` (None si es `<stdin>`). El nombre
 /// de programa es el `stem` del archivo, idéntico al oráculo.
-fn state_persistence_for(filename: &str) -> Option<crate::persistence::StatePersistence> {
+pub(crate) fn state_persistence_for(filename: &str) -> Option<crate::persistence::StatePersistence> {
     if filename == "<stdin>" {
         return None;
     }
@@ -465,13 +466,17 @@ pub(crate) fn wire_swarm_hooks(interp: &mut Interpreter, swarm: Arc<Swarm>, agen
         })
     };
     let spawn: Rc<
-        dyn Fn(&str, Vec<Node>, Vec<(String, SynValue)>) -> Result<String, Control>,
+        dyn Fn(&str, Vec<Node>, Vec<(String, SynValue)>, Vec<(String, SynValue)>) -> Result<String, Control>,
     > = {
         let sw = swarm.clone();
-        Rc::new(move |agent, body, args| {
+        Rc::new(move |agent, body, args, globals| {
             let send_args: Vec<(String, SendValue)> =
                 args.iter().map(|(k, v)| (k.clone(), to_send(v))).collect();
-            Ok(spawn_agent(sw.clone(), agent.to_string(), body, send_args))
+            // Convertir el snapshot de globales del llamador a GlobalVal (preserva tasks).
+            let global_snap: Arc<Vec<(String, GlobalVal)>> = Arc::new(
+                globals.iter().map(|(k, v)| (k.clone(), val_to_global(v))).collect(),
+            );
+            Ok(spawn_agent(sw.clone(), agent.to_string(), body, send_args, global_snap))
         })
     };
 
@@ -479,11 +484,17 @@ pub(crate) fn wire_swarm_hooks(interp: &mut Interpreter, swarm: Arc<Swarm>, agen
 }
 
 /// Crea un intérprete con el wiring común + los hooks del swarm.
+/// El `log_hook` manda los `log` del agente a stdout del proceso principal en tiempo
+/// real — así los agentes no son silenciosos durante el desarrollo.
 fn setup_swarm_interpreter(swarm: Arc<Swarm>, agent_name: &str) -> Interpreter {
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("agent")));
     wire_common(&mut interp, &caps, false);
     wire_swarm_hooks(&mut interp, swarm, agent_name);
+    let name = agent_name.to_string();
+    interp.log_hook = Some(Arc::new(move |line: &str| {
+        println!("[{}] {}", name, line);
+    }));
     interp
 }
 
@@ -495,6 +506,7 @@ fn spawn_agent(
     agent_name: String,
     body: Vec<Node>,
     send_args: Vec<(String, SendValue)>,
+    globals: Arc<Vec<(String, GlobalVal)>>,
 ) -> String {
     let instance_id = swarm.register_new_agent(&agent_name);
     let sw = swarm.clone();
@@ -504,6 +516,10 @@ fn spawn_agent(
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
             let mut interp = setup_swarm_interpreter(sw.clone(), &id);
+            // Restaurar tareas y valores del top-level para que el agente
+            // los pueda llamar directamente sin necesitar HTTP.
+            rebuild_globals(&mut interp, &globals);
+            // Los spawn_args sobreescriben cualquier global con el mismo nombre.
             for (k, v) in &send_args {
                 interp.set_global(k, from_send(v));
             }

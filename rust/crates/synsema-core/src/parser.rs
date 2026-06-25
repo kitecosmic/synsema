@@ -486,11 +486,36 @@ impl Parser {
         let loc = self.location();
         self.advance(); // 'when'
         let condition = self.parse_expression()?;
-        let body = self.parse_block()?;
 
+        // Forma inline: when <cond> then <expr> [otherwise [when ...] <expr>]
+        // Usable en cualquier posición de expresión (map literal, apply, let, etc.).
+        if self.match_tok(TokenType::Then).is_some() {
+            let then_expr = self.parse_expression()?;
+            let mut otherwise = None;
+            let mut otherwise_when = None;
+            if self.match_tok(TokenType::Otherwise).is_some() {
+                self.skip_newlines();
+                if self.check(TokenType::When) {
+                    otherwise_when = Some(Box::new(self.parse_when()?));
+                } else {
+                    otherwise = Some(vec![self.parse_expression()?]);
+                }
+            }
+            return Ok(Node::new(
+                loc,
+                NodeKind::WhenStatement {
+                    condition: Box::new(condition),
+                    body: vec![then_expr],
+                    otherwise,
+                    otherwise_when,
+                },
+            ));
+        }
+
+        // Forma de bloque (existente): when <cond>\n    body
+        let body = self.parse_block()?;
         let mut otherwise = None;
         let mut otherwise_when = None;
-
         self.skip_newlines();
         if self.match_tok(TokenType::Otherwise).is_some() {
             self.skip_newlines();
@@ -500,7 +525,6 @@ impl Parser {
                 otherwise = Some(self.parse_block()?);
             }
         }
-
         Ok(Node::new(
             loc,
             NodeKind::WhenStatement {
@@ -1034,8 +1058,14 @@ impl Parser {
 
     fn parse_sandbox(&mut self) -> Result<Node, ParseError> {
         let loc = self.location();
-        self.advance();
-        let body = self.parse_block()?;
+        self.advance(); // consume 'sandbox'
+        // Forma de bloque:  sandbox\n    body...
+        // Forma inline:     sandbox <expr>  (como expresión o en la misma línea)
+        let body = if self.check(TokenType::Newline) && self.peek(1).ty == TokenType::Indent {
+            self.parse_block()?
+        } else {
+            vec![self.parse_expression()?]
+        };
         Ok(Node::new(
             loc,
             NodeKind::SandboxBlock {
@@ -1178,11 +1208,11 @@ impl Parser {
     fn parse_checkpoint(&mut self) -> Result<Node, ParseError> {
         let loc = self.location();
         self.advance();
-        let name_tok = self.expect(TokenType::Text, "")?;
+        let name = self.parse_expression()?;
         Ok(Node::new(
             loc,
             NodeKind::CheckpointStatement {
-                name: name_tok.as_str().to_string(),
+                name: Box::new(name),
             },
         ))
     }
@@ -2142,6 +2172,8 @@ impl Parser {
             TokenType::Decide => self.parse_decide_expr(),
             TokenType::Analyze => self.parse_analyze_expr(),
             TokenType::Generate => self.parse_generate_expr(),
+            TokenType::Sandbox => self.parse_sandbox(),
+            TokenType::When => self.parse_when(),
             _ => Err(ParseError::new(
                 format!(
                     "Unexpected token: {} ({})",

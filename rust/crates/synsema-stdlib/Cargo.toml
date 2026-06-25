@@ -24,6 +24,9 @@ chrono.workspace = true
 flate2 = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
+# Cliente HTTPS (http_get/http_post con https://): root CAs del SO vía rustls-native-certs.
+# Ya está en Cargo.lock (transitivo de instant-acme); se hace directo para usarlo en http.rs.
+rustls-native-certs = "0.8"
 # A2 batch 2 — ACME/auto-HTTPS. instant-acme (cliente ACME) con backend ring (sin C/cmake),
 # cliente HTTP propio (hyper-rustls) y `rcgen` interno para keygen/CSR en finalize().
 # tokio = runtime async acotado SÓLO para obtener/renovar el cert; el server sigue std::net.

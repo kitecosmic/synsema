@@ -13,21 +13,32 @@ use std::collections::HashMap;
 use std::net::TcpListener;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+
+/// Callback de persistencia que se llama tras cada mutación de memoria desde
+/// un route handler. Encapsula el `StatePersistence` protegido por mutex.
+type OnWriteFn = Arc<dyn Fn(&AgentMemory) + Send + Sync>;
+
+/// Memoria compartida entre todos los handlers de un serve: el `AgentMemory`
+/// vive en un `Arc<Mutex>` para ser accesible desde múltiples hilos del pool.
+type SharedMemoryStore = Arc<Mutex<AgentMemory>>;
 use std::thread::JoinHandle;
 
 use indexmap::IndexMap;
 
+use synsema_agents::builtins::register_serve_memory_builtins;
+use synsema_agents::memory::{AgentMemory, OwnerRule};
+use synsema_agents::progress::ProgressManager;
 use synsema_agents::swarm::Swarm;
 use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
 use synsema_core::ast::{Node, NodeKind, Param};
 use synsema_core::interpreter::{
-    BuiltinTask, Control, Interpreter, RunResult, RuntimeError, ServeHook,
+    BuiltinTask, Control, Environment, Interpreter, RunResult, RuntimeError, ServeHook,
 };
 use synsema_core::number::Number;
 use synsema_core::parser::{parse_source, CompileError};
 use synsema_core::types::{
-    from_send, syn_bytes, syn_map, syn_nothing, syn_text, to_send, SendValue, SynTaskValue,
-    SynValue,
+    from_send, syn_bool, syn_bytes, syn_map, syn_nothing, syn_text, to_send, SendValue,
+    SynTaskValue, SynValue,
 };
 use synsema_stdlib::acme;
 use synsema_stdlib::database::{register_database_builtins, DatabaseManager};
@@ -39,7 +50,12 @@ use synsema_stdlib::server::{
 /// Manager de base de datos compartido entre el top-level y los hilos de conexión.
 type SharedDb = Arc<Mutex<DatabaseManager>>;
 
-use crate::engine::{wire_common, wire_swarm_hooks, INTERP_STACK_SIZE};
+/// Estado mutable compartido entre todos los route handlers de un serve.
+/// Respaldo de `state_set`/`state_get`/`state_incr` — alternativa explícita
+/// a mutar globales (que no se propagan entre requests por diseño).
+type SharedState = Arc<Mutex<HashMap<String, SendValue>>>;
+
+use crate::engine::{wire_common, wire_common_with_state, wire_swarm_hooks, INTERP_STACK_SIZE};
 
 // =========================================================
 // Overrides de despliegue por CLI (Pieza A)
@@ -110,27 +126,83 @@ pub(crate) enum GlobalVal {
     Agent {
         body: Vec<Node>,
     },
+    /// Un módulo importado (`use "…" as name`) — map cuyas entradas pueden ser Tasks
+    /// u otros GlobalVal. Se snapshotea recursivamente para que las tasks del módulo
+    /// sobrevivan al cruce de hilos (parallel_map) y al snapshot de serve, en lugar de
+    /// degradarse a texto a través de to_send/from_send.
+    Module(Vec<(String, GlobalVal)>),
+}
+
+/// Convierte un `SynValue` a `GlobalVal` de forma recursiva. Los Maps que contienen
+/// Tasks (patrón módulo importado) se convierten en `GlobalVal::Module` para que las
+/// tasks sobrevivan el cruce de hilos y el snapshot de serve sin degradarse a texto.
+pub(crate) fn val_to_global(v: &SynValue) -> GlobalVal {
+    match v {
+        SynValue::Task(t) => GlobalVal::Task {
+            name: t.name.clone(),
+            parameters: t.parameters.clone(),
+            body: t.body.clone(),
+            required_capabilities: t.required_capabilities.clone(),
+        },
+        SynValue::Builtin(_) => GlobalVal::Value(to_send(v)),
+        SynValue::Map(m) => {
+            let entries: Vec<(String, GlobalVal)> = m
+                .borrow()
+                .iter()
+                .map(|(k, v)| (k.clone(), val_to_global(v)))
+                .collect();
+            // Si alguna entrada es Task o Module anidado, usar Module para conservarlas.
+            // Maps puramente de valores primitivos siguen viajando como SendValue (barato).
+            if entries.iter().any(|(_, gv)| !matches!(gv, GlobalVal::Value(_))) {
+                GlobalVal::Module(entries)
+            } else {
+                GlobalVal::Value(to_send(&SynValue::Map(m.clone())))
+            }
+        }
+        other => GlobalVal::Value(to_send(other)),
+    }
+}
+
+/// Reconstruye un `SynValue` desde un `GlobalVal`, apuntando las tasks al `global_env`
+/// del intérprete nuevo para que puedan llamar a otros globales (recursión mutua, etc.).
+fn rebuild_global_val(gv: &GlobalVal, global_env: &Rc<RefCell<Environment>>) -> SynValue {
+    match gv {
+        GlobalVal::Value(sv) => from_send(sv),
+        GlobalVal::Task { name, parameters, body, required_capabilities } => {
+            SynValue::Task(Rc::new(SynTaskValue {
+                name: name.clone(),
+                parameters: parameters.clone(),
+                body: body.clone(),
+                closure_env: global_env.clone(),
+                origin: None,
+                required_capabilities: required_capabilities.clone(),
+            }))
+        }
+        GlobalVal::Module(entries) => {
+            let mut m = IndexMap::new();
+            for (k, gv) in entries {
+                m.insert(k.clone(), rebuild_global_val(gv, global_env));
+            }
+            SynValue::Map(Rc::new(RefCell::new(m)))
+        }
+        GlobalVal::Agent { .. } => {
+            // Los agentes van a `agent_definitions`, nunca a bindings — no debería llegar aquí.
+            SynValue::Nothing
+        }
+    }
 }
 
 /// Snapshot de las bindings globales (tras correr el top-level). Los builtins se
-/// re-registran por intérprete (no se copian); las tasks se copian con su AST.
+/// re-registran por intérprete (no se copian); las tasks se copian con su AST;
+/// los módulos importados (maps con tasks) se snapshotean recursivamente.
 pub(crate) fn snapshot_globals(interp: &Interpreter) -> Arc<Vec<(String, GlobalVal)>> {
     let env = interp.global_env.borrow();
     let mut out: Vec<(String, GlobalVal)> = Vec::new();
     for (k, v) in env.bindings.iter() {
-        match v {
-            SynValue::Builtin(_) => {} // re-registrados por wire_common
-            SynValue::Task(t) => out.push((
-                k.clone(),
-                GlobalVal::Task {
-                    name: t.name.clone(),
-                    parameters: t.parameters.clone(),
-                    body: t.body.clone(),
-                    required_capabilities: t.required_capabilities.clone(),
-                },
-            )),
-            other => out.push((k.clone(), GlobalVal::Value(to_send(other)))),
+        if matches!(v, SynValue::Builtin(_)) {
+            continue; // re-registrados por wire_common
         }
+        out.push((k.clone(), val_to_global(v)));
     }
     // Agentes (Batch 6): viven en `agent_definitions`, no en `bindings` → se snapshotean
     // aparte (sólo el body; el closure_env se re-apunta al global del nuevo intérprete).
@@ -140,33 +212,24 @@ pub(crate) fn snapshot_globals(interp: &Interpreter) -> Arc<Vec<(String, GlobalV
     Arc::new(out)
 }
 
-/// Reconstruye los globales en un intérprete fresco. Las tasks se recrean con su
-/// closure apuntando al global del nuevo intérprete (los top-level cierran sobre el
-/// global → recursión mutua y acceso a otros globales siguen funcionando).
+/// Reconstruye los globales en un intérprete fresco. Las tasks (top-level y dentro de
+/// módulos) se recrean con su closure apuntando al global del nuevo intérprete para que
+/// la recursión mutua y el acceso a otros globales sigan funcionando.
 pub(crate) fn rebuild_globals(interp: &mut Interpreter, snapshot: &[(String, GlobalVal)]) {
     for (k, gv) in snapshot {
-        let v = match gv {
-            GlobalVal::Value(sv) => from_send(sv),
-            GlobalVal::Task { name, parameters, body, required_capabilities } => {
-                SynValue::Task(Rc::new(SynTaskValue {
-                    name: name.clone(),
-                    parameters: parameters.clone(),
-                    body: body.clone(),
-                    closure_env: interp.global_env.clone(),
-                    origin: None,
-                    required_capabilities: required_capabilities.clone(),
-                }))
-            }
+        match gv {
             // Agentes (Batch 6): van al mapa separado `agent_definitions` (NO a bindings),
             // con el closure apuntando al global del intérprete nuevo (como las tasks). Sin
             // esto, un `spawn Worker` desde una route daría "No agent defined".
             GlobalVal::Agent { body } => {
                 let genv = interp.global_env.clone();
                 interp.agent_definitions.insert(k.clone(), (body.clone(), genv));
-                continue;
             }
-        };
-        interp.set_global(k, v);
+            other => {
+                let v = rebuild_global_val(other, &interp.global_env.clone());
+                interp.set_global(k, v);
+            }
+        }
     }
 }
 
@@ -174,6 +237,82 @@ pub(crate) fn rebuild_globals(interp: &mut Interpreter, snapshot: &[(String, Glo
 /// globales (tasks+valores). La db compartida (Arc<Mutex>) sobrescribe la db fresca
 /// de wire_common para que los handlers vean las tablas/datos abiertos en el top-level.
 ///
+/// Registra los builtins de estado compartido (`state_set`/`state_get`/`state_incr`)
+/// para un serve. El `SharedState` es un `HashMap<String, SendValue>` bajo `Arc<Mutex>`
+/// — compartido entre todos los route handlers y entre requests, con la misma vida que
+/// el servidor. No persiste a disco (para persistencia usar SQL o `remember`).
+fn register_serve_state_builtins(interp: &Interpreter, state: SharedState) {
+    {
+        let s = state.clone();
+        interp.register_builtin("state_set", 2, Rc::new(move |_i, args, _l| {
+            let key = match args.first() {
+                Some(v) => v.to_string(),
+                None => return Err(Control::Error(RuntimeError::new("state_set: missing key"))),
+            };
+            let val = args.get(1).cloned().unwrap_or(SynValue::Nothing);
+            s.lock().unwrap().insert(key, to_send(&val));
+            Ok(val)
+        }));
+    }
+    {
+        let s = state.clone();
+        interp.register_builtin("state_get", -1, Rc::new(move |_i, args, _l| {
+            let key = match args.first() {
+                Some(v) => v.to_string(),
+                None => return Err(Control::Error(RuntimeError::new("state_get: missing key"))),
+            };
+            let guard = s.lock().unwrap();
+            match guard.get(&key) {
+                Some(sv) => Ok(from_send(sv)),
+                None => Ok(args.get(1).cloned().unwrap_or(SynValue::Nothing)),
+            }
+        }));
+    }
+    {
+        let s = state.clone();
+        interp.register_builtin("state_incr", -1, Rc::new(move |_i, args, _l| {
+            let key = match args.first() {
+                Some(v) => v.to_string(),
+                None => return Err(Control::Error(RuntimeError::new("state_incr: missing key"))),
+            };
+            let delta = match args.get(1) {
+                Some(SynValue::Number(n)) => n.to_f64(),
+                _ => 1.0,
+            };
+            let mut guard = s.lock().unwrap();
+            let current = match guard.get(&key) {
+                Some(SendValue::Number(n)) => n.to_f64(),
+                _ => 0.0,
+            };
+            let new_val = current + delta;
+            guard.insert(key, to_send(&SynValue::Number(synsema_core::number::Number::Float(new_val))));
+            Ok(SynValue::Number(synsema_core::number::Number::Float(new_val)))
+        }));
+    }
+    {
+        let s = state.clone();
+        interp.register_builtin("state_delete", 1, Rc::new(move |_i, args, _l| {
+            let key = match args.first() {
+                Some(v) => v.to_string(),
+                None => return Err(Control::Error(RuntimeError::new("state_delete: missing key"))),
+            };
+            s.lock().unwrap().remove(&key);
+            Ok(syn_bool(true))
+        }));
+    }
+    {
+        let s = state.clone();
+        interp.register_builtin("state_all", 0, Rc::new(move |_i, _args, _l| {
+            let guard = s.lock().unwrap();
+            let mut map = IndexMap::new();
+            for (k, sv) in guard.iter() {
+                map.insert(k.clone(), from_send(sv));
+            }
+            Ok(SynValue::Map(Rc::new(RefCell::new(map))))
+        }));
+    }
+}
+
 /// Construir esto es CARO (registrar ~100 builtins + recargar `.env` + clonar el AST
 /// de cada task) y era el ~46% del CPU por request (medido en la VPS: profile-first).
 /// Ahora se construye UNA vez por worker y se reusa entre requests (ver
@@ -185,11 +324,32 @@ fn build_base_interp(
     snapshot: &[(String, GlobalVal)],
     caps_snap: &[Capability],
     shared_db: SharedDb,
+    rules_snap: &Arc<Vec<OwnerRule>>,
+    shared_memory: &SharedMemoryStore,
+    on_write: &OnWriteFn,
+    shared_state: &SharedState,
     secure: bool,
 ) -> (Interpreter, Rc<RefCell<CapabilitySet>>) {
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("request")));
-    wire_common(&mut interp, &caps, secure);
+    // Pre-populamos el AgentMemory con las reglas del top-level para que
+    // add_rule/check_rules/get_rules funcionen desde los route handlers.
+    let mut mem = AgentMemory::new();
+    for rule in rules_snap.iter() {
+        mem.rules.insert(rule.name.clone(), rule.clone());
+    }
+    wire_common_with_state(
+        &mut interp,
+        &caps,
+        secure,
+        Rc::new(RefCell::new(ProgressManager::new())),
+        Rc::new(RefCell::new(mem)),
+    );
+    // Sobrescribir los builtins de memoria (remember/recall/forget_memory/memory_summary)
+    // con versiones que usan el AgentMemory compartido entre hilos.
+    register_serve_memory_builtins(&interp, shared_memory.clone(), on_write.clone());
+    // Registrar los builtins de estado compartido (state_set/state_get/state_incr/…).
+    register_serve_state_builtins(&interp, shared_state.clone());
     {
         let mut c = caps.borrow_mut();
         for cap in caps_snap {
@@ -227,6 +387,10 @@ fn with_serve_interp<R>(
     snapshot: &Arc<Vec<(String, GlobalVal)>>,
     caps_snap: &Arc<Vec<Capability>>,
     shared_db: &SharedDb,
+    rules_snap: &Arc<Vec<OwnerRule>>,
+    shared_memory: &SharedMemoryStore,
+    on_write: &OnWriteFn,
+    shared_state: &SharedState,
     secure: bool,
     f: impl FnOnce(&mut Interpreter) -> R,
 ) -> R {
@@ -234,8 +398,17 @@ fn with_serve_interp<R>(
     // Sacá el base del cache (o construilo la primera vez). Sacarlo (en vez de tomar
     // prestado) evita sostener el borrow del thread-local mientras corre `f`.
     let mut base = SERVE_INTERPS.with(|c| c.borrow_mut().remove(&key)).unwrap_or_else(|| {
-        let (interp, caps) =
-            build_base_interp(swarm.clone(), snapshot, caps_snap, shared_db.clone(), secure);
+        let (interp, caps) = build_base_interp(
+            swarm.clone(),
+            snapshot,
+            caps_snap,
+            shared_db.clone(),
+            rules_snap,
+            shared_memory,
+            on_write,
+            shared_state,
+            secure,
+        );
         BaseInterp { interp, caps }
     });
 
@@ -349,11 +522,15 @@ fn run_route(
     snapshot: &Arc<Vec<(String, GlobalVal)>>,
     caps_snap: &Arc<Vec<Capability>>,
     shared_db: &SharedDb,
+    rules_snap: &Arc<Vec<OwnerRule>>,
+    shared_memory: &SharedMemoryStore,
+    on_write: &OnWriteFn,
+    shared_state: &SharedState,
     body: &[Node],
     ctx: &Ctx,
     secure: bool,
 ) -> GiveOutcome {
-    with_serve_interp(swarm, snapshot, caps_snap, shared_db, secure, |interp| {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_state, secure, |interp| {
         match interp.run_request_block(body, request_bindings(ctx)) {
             Ok(_) => GiveOutcome::Give(None),
             Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
@@ -380,12 +557,16 @@ fn run_stream(
     snapshot: &Arc<Vec<(String, GlobalVal)>>,
     caps_snap: &Arc<Vec<Capability>>,
     shared_db: &SharedDb,
+    rules_snap: &Arc<Vec<OwnerRule>>,
+    shared_memory: &SharedMemoryStore,
+    on_write: &OnWriteFn,
+    shared_state: &SharedState,
     body: &[Node],
     ctx: &Ctx,
     secure: bool,
     emit: Emitter,
 ) -> StreamEnd {
-    with_serve_interp(swarm, snapshot, caps_snap, shared_db, secure, move |interp| {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_state, secure, move |interp| {
         let cell = Rc::new(RefCell::new(emit));
         let ec = cell.clone();
         interp.set_stream_emit(Rc::new(move |val: SynValue, event: Option<&str>| {
@@ -478,6 +659,10 @@ fn build_host_table(
     block_limit: Option<(i64, f64)>,
     snapshot: &Arc<Vec<(String, GlobalVal)>>,
     caps_snap: &Arc<Vec<Capability>>,
+    rules_snap: &Arc<Vec<OwnerRule>>,
+    shared_memory: &SharedMemoryStore,
+    on_write: &OnWriteFn,
+    shared_state: &SharedState,
     swarm: &Arc<Swarm>,
     shared_db: &SharedDb,
     secure: bool,
@@ -510,9 +695,13 @@ fn build_host_table(
         let swarm_a = swarm.clone();
         let snap_a = snapshot.clone();
         let caps_a = caps_snap.clone();
+        let rules_a = rules_snap.clone();
+        let mem_a = shared_memory.clone();
+        let ow_a = on_write.clone();
+        let st_a = shared_state.clone();
         let db_a = shared_db.clone();
         let h: AuthHandler = Arc::new(move |token: &str| -> Option<SynValue> {
-            with_serve_interp(&swarm_a, &snap_a, &caps_a, &db_a, secure, |interp| {
+            with_serve_interp(&swarm_a, &snap_a, &caps_a, &db_a, &rules_a, &mem_a, &ow_a, &st_a, secure, |interp| {
                 let genv = interp.global_env.clone();
                 let task = match interp.eval(&auth_node, &genv) {
                     Ok(t) => t,
@@ -567,9 +756,13 @@ fn build_host_table(
             let swarm_c = swarm.clone();
             let snap_c = snapshot.clone();
             let caps_c = caps_snap.clone();
+            let rules_c = rules_snap.clone();
+            let mem_c = shared_memory.clone();
+            let ow_c = on_write.clone();
+            let st_c = shared_state.clone();
             let db_c = shared_db.clone();
             let handler: Handler = Arc::new(move |ctx: &Ctx| {
-                run_route(&swarm_c, &snap_c, &caps_c, &db_c, &body_c, ctx, secure)
+                run_route(&swarm_c, &snap_c, &caps_c, &db_c, &rules_c, &mem_c, &ow_c, &st_c, &body_c, ctx, secure)
             });
 
             let stream_handler: Option<StreamHandler> = if *streaming {
@@ -577,9 +770,15 @@ fn build_host_table(
                 let swarm_s = swarm.clone();
                 let snap_s = snapshot.clone();
                 let caps_s = caps_snap.clone();
+                let rules_s = rules_snap.clone();
+                let mem_s = shared_memory.clone();
+                let ow_s = on_write.clone();
+                let st_s = shared_state.clone();
                 let db_s = shared_db.clone();
                 Some(Arc::new(move |ctx: &Ctx, emit: Emitter| {
-                    run_stream(&swarm_s, &snap_s, &caps_s, &db_s, &body_s, ctx, secure, emit)
+                    run_stream(
+                        &swarm_s, &snap_s, &caps_s, &db_s, &rules_s, &mem_s, &ow_s, &st_s, &body_s, ctx, secure, emit,
+                    )
                 }))
             } else {
                 None
@@ -610,6 +809,10 @@ fn make_serve_hook(
     servers: Servers,
     secure: bool,
     overrides: ServeOverrides,
+    top_level_memory: Rc<RefCell<AgentMemory>>,
+    shared_memory: SharedMemoryStore,
+    on_write: OnWriteFn,
+    shared_state: SharedState,
 ) -> ServeHook {
     Rc::new(move |interp, node, env| {
         let (
@@ -774,6 +977,13 @@ fn make_serve_hook(
         // su intérprete fresco (los grants no cruzan hilos vía `Rc`).
         let caps_snap: Arc<Vec<Capability>> =
             Arc::new(caps.borrow().granted.iter().cloned().collect());
+        // Snapshot de las reglas declaradas en el top-level con `add_rule`. Se clona
+        // una vez aquí (el top-level ya corrió completo) y se pre-popula en el
+        // AgentMemory de cada intérprete de request, para que check_rules/get_rules
+        // encuentren las reglas sin que el programador tenga que re-declararlas.
+        let rules_snap: Arc<Vec<OwnerRule>> = Arc::new(
+            top_level_memory.borrow().rules.values().cloned().collect(),
+        );
         let intent = interp.intent().map(|s| s.to_string());
 
         // -- host default (rutas/estáticos/auth a nivel de `serve`) --
@@ -786,6 +996,10 @@ fn make_serve_hook(
             block_limit,
             &snapshot,
             &caps_snap,
+            &rules_snap,
+            &shared_memory,
+            &on_write,
+            &shared_state,
             &swarm,
             &shared_db,
             secure,
@@ -821,6 +1035,10 @@ fn make_serve_hook(
                     block_limit,
                     &snapshot,
                     &caps_snap,
+                    &rules_snap,
+                    &shared_memory,
+                    &on_write,
+                    &shared_state,
                     &swarm,
                     &shared_db,
                     secure,
@@ -1099,13 +1317,63 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
 
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("program")));
-    wire_common(&mut interp, &caps, secure);
+
+    // ── Memoria compartida entre el top-level y todos los route handlers ──────
+    // `shared_memory` es la fuente de verdad para remember/recall. Se inicializa
+    // desde el SQLite del programa (mismo .db que usa `synsema run`) para que la
+    // memoria persista entre reinicios y sea coherente entre ambos modos.
+    let shared_memory: SharedMemoryStore = Arc::new(Mutex::new(AgentMemory::new()));
+    {
+        let persistence = crate::engine::state_persistence_for(filename);
+        if let Some(ref p) = persistence {
+            let mut pm = ProgressManager::new();
+            p.load_into(&mut shared_memory.lock().unwrap(), &mut pm);
+        }
+    }
+    // Callback de persistencia: cada vez que remember/forget_memory muten la
+    // memoria, se guarda al SQLite inmediatamente para sobrevivir reinicios.
+    let persist_for_serve = {
+        let persistence = crate::engine::state_persistence_for(filename);
+        let shared_persistence: Option<Arc<Mutex<crate::persistence::StatePersistence>>> =
+            persistence.map(|p| Arc::new(Mutex::new(p)));
+        let sp = shared_persistence;
+        let on_write: OnWriteFn = Arc::new(move |mem: &AgentMemory| {
+            if let Some(ref p) = sp {
+                if let Ok(guard) = p.lock() {
+                    guard.save_from(mem, &ProgressManager::new());
+                }
+            }
+        });
+        on_write
+    };
+
+    // `top_level_memory` sigue siendo el AgentMemory per-intérprete del top-level.
+    // Gestiona add_rule/check_rules (gap-15). Para remember/recall usamos shared_memory.
+    let top_level_memory = Rc::new(RefCell::new(AgentMemory::new()));
+    wire_common_with_state(
+        &mut interp,
+        &caps,
+        secure,
+        Rc::new(RefCell::new(ProgressManager::new())),
+        top_level_memory.clone(),
+    );
+    // Sobrescribir los builtins de memoria en el top-level con los compartidos,
+    // para que `remember` en el top-level también persista a disco.
+    register_serve_memory_builtins(&interp, shared_memory.clone(), persist_for_serve.clone());
+
     let swarm = Arc::new(Swarm::new());
     wire_swarm_hooks(&mut interp, swarm.clone(), "main");
     // db compartida: el top-level abre/crea tablas; los handlers (en sus hilos) la
     // comparten vía Arc<Mutex>. Sobrescribe la db fresca que dejó wire_common.
     let shared_db: SharedDb = Arc::new(Mutex::new(DatabaseManager::new()));
     register_database_builtins(&interp, shared_db.clone());
+    // Estado mutable compartido entre todos los route handlers: respaldo de
+    // state_set/state_get/state_incr. Vive mientras el servidor esté activo.
+    let shared_state: SharedState = Arc::new(Mutex::new(HashMap::new()));
+    // Registrar los builtins de estado también en el top-level (para que puedan
+    // inicializar valores antes del `serve on PORT`).
+    register_serve_state_builtins(&interp, shared_state.clone());
+
     let servers: Servers = Arc::new(Mutex::new(Vec::new()));
     interp.set_serve_hook(make_serve_hook(
         caps.clone(),
@@ -1114,6 +1382,10 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         servers.clone(),
         secure,
         overrides,
+        top_level_memory,
+        shared_memory,
+        persist_for_serve,
+        shared_state,
     ));
 
     let r = interp.execute(&program);

@@ -4,6 +4,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use indexmap::IndexMap;
 use serde_json::Map as JsonMap;
@@ -200,6 +201,81 @@ pub fn register_agent_builtins(
         let m = memory.clone();
         interp.register_builtin("memory_summary", 0, Rc::new(move |_i, _args, _l| {
             Ok(syn_text(m.borrow().format_summary()))
+        }));
+    }
+}
+
+/// Sobrescribe los builtins de memoria (`remember`, `recall`, `forget_memory`,
+/// `memory_summary`) para que usen un `AgentMemory` compartido entre hilos
+/// (`Arc<Mutex>`). Usado por `synsema serve` para que todos los route handlers
+/// compartan y persistan la misma memoria, tanto entre requests como entre
+/// reinicios del proceso.
+///
+/// Debe llamarse DESPUÉS de `register_agent_builtins` (o `wire_common_with_state`)
+/// para que las versiones compartidas sobrescriban las per-intérprete.
+///
+/// Las reglas (`add_rule`/`check_rules`/`get_rules`) NO se tocan: siguen usando
+/// el `AgentMemory` per-intérprete que ya recibe las reglas del top-level via el
+/// snapshot de serve (gap-15 fix).
+///
+/// `on_write` se llama con la memoria después de cada mutación para persistir a disco.
+pub fn register_serve_memory_builtins(
+    interp: &Interpreter,
+    shared: Arc<Mutex<AgentMemory>>,
+    on_write: Arc<dyn Fn(&AgentMemory) + Send + Sync>,
+) {
+    {
+        let s = shared.clone();
+        let ow = on_write.clone();
+        interp.register_builtin("remember", -1, Rc::new(move |_i, args, _l| {
+            let category = raw_str(nth(args, 0)?);
+            let content  = raw_str(nth(args, 1)?);
+            let tags     = str_list(args.get(2));
+            let mut mem  = s.lock().unwrap();
+            let id = mem.remember(&category, &content, JsonMap::new(), tags, "agent").map_err(err)?;
+            ow(&mem);
+            Ok(syn_text(id))
+        }));
+    }
+    {
+        let s = shared.clone();
+        interp.register_builtin("recall", -1, Rc::new(move |_i, args, _l| {
+            let category = args.get(0).map(raw_str).filter(|s| s != "nothing");
+            let tags = if matches!(args.get(1), Some(SynValue::List(_))) {
+                Some(str_list(args.get(1)))
+            } else {
+                None
+            };
+            let search = args.get(2).map(raw_str);
+            let mem = s.lock().unwrap();
+            let entries = mem.recall(category.as_deref(), tags.as_deref(), search.as_deref());
+            let result: Vec<SynValue> = entries.iter().map(|e| {
+                let mut map = IndexMap::new();
+                map.insert("id".to_string(),       syn_text(e.id.as_str()));
+                map.insert("category".to_string(), syn_text(e.category.value()));
+                map.insert("content".to_string(),  syn_text(e.content.as_str()));
+                map.insert("source".to_string(),   syn_text(e.source.as_str()));
+                map.insert("tags".to_string(),
+                    syn_list(e.tags.iter().map(|t| syn_text(t.as_str())).collect()));
+                syn_map(map)
+            }).collect();
+            Ok(syn_list(result))
+        }));
+    }
+    {
+        let s = shared.clone();
+        let ow = on_write.clone();
+        interp.register_builtin("forget_memory", 1, Rc::new(move |_i, args, _l| {
+            let mut mem = s.lock().unwrap();
+            mem.forget(&raw_str(nth(args, 0)?));
+            ow(&mem);
+            Ok(syn_bool(true))
+        }));
+    }
+    {
+        let s = shared.clone();
+        interp.register_builtin("memory_summary", 0, Rc::new(move |_i, _args, _l| {
+            Ok(syn_text(s.lock().unwrap().format_summary()))
         }));
     }
 }

@@ -315,7 +315,7 @@ pub enum NodeKind {
         body: Vec<Node>,
     },
     CheckpointStatement {
-        name: String,
+        name: Box<Node>,
     },
 
     // -- Test framework (Batch 3) --

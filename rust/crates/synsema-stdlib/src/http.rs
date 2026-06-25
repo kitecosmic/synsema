@@ -1,9 +1,8 @@
 //! HTTP nativo. Port de `synsema/stdlib/http.py`.
 //!
-//! Cliente mínimo sobre `std::net` (sin dependencias). Capa 6: el gate sólo prueba
-//! el camino de fallo de conexión (host inválido / puerto inválido → ok=false,
-//! status=0, error). Para `http://` reales hace el intercambio HTTP/1.1 básico
-//! (Connection: close). `https://` (TLS) queda para una capa posterior.
+//! Cliente mínimo: `http://` usa `std::net::TcpStream` directo; `https://` envuelve
+//! el mismo stream con `rustls` (ring + root CAs del SO). La lógica de HTTP/1.1 es
+//! idéntica en ambos caminos — solo el stream subyacente cambia.
 //!
 //! Nota: `http`/`http_get`/`http_post`/… NO chequean capability (a diferencia de
 //! `fetch`, que sí). Es el contrato del oráculo.
@@ -11,7 +10,9 @@
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
+
 
 use indexmap::IndexMap;
 
@@ -83,32 +84,21 @@ fn parse_url(url: &str) -> Result<(String, String, u16, String), String> {
     Ok((scheme, host, port, path.to_string()))
 }
 
-fn do_request(
-    method: &str,
-    url: &str,
-    headers: Option<&[(String, String)]>,
-    body: Option<&str>,
-    timeout_secs: u64,
-) -> Result<HttpResult, String> {
-    let (scheme, host, port, path) = parse_url(url)?;
-    if scheme != "http" {
-        return Err(format!(
-            "unsupported scheme '{}': TLS/https not available yet (capa posterior)",
-            scheme
-        ));
+/// Carga los root CAs del SO una vez y los devuelve como `RootCertStore`.
+fn root_cert_store() -> Result<rustls::RootCertStore, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    // Los errores de carga parcial no son fatales — usamos los que sí cargaron.
+    for cert in native.certs {
+        let _ = roots.add(cert); // ignora certs mal formados individualmente
     }
+    if roots.is_empty() {
+        return Err("no root CAs found in system store".to_string());
+    }
+    Ok(roots)
+}
 
-    let addr = format!("{}:{}", host, port);
-    let sa = addr
-        .to_socket_addrs()
-        .map_err(|e| e.to_string())?
-        .next()
-        .ok_or_else(|| format!("could not resolve host: {}", host))?;
-    let timeout = Duration::from_secs(timeout_secs);
-    let mut stream = TcpStream::connect_timeout(&sa, timeout).map_err(|e| e.to_string())?;
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
-
+fn build_http_request(method: &str, path: &str, host: &str, headers: Option<&[(String, String)]>, body: Option<&str>) -> Vec<u8> {
     let mut req = format!(
         "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
         method.to_uppercase(),
@@ -127,10 +117,56 @@ fn do_request(
     if let Some(b) = body {
         req.push_str(b);
     }
+    req.into_bytes()
+}
 
-    stream.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
+fn do_request(
+    method: &str,
+    url: &str,
+    headers: Option<&[(String, String)]>,
+    body: Option<&str>,
+    timeout_secs: u64,
+) -> Result<HttpResult, String> {
+    let (scheme, host, port, path) = parse_url(url)?;
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("unsupported scheme '{}': only http and https are supported", scheme));
+    }
+
+    let addr = format!("{}:{}", host, port);
+    let sa = addr
+        .to_socket_addrs()
+        .map_err(|e| e.to_string())?
+        .next()
+        .ok_or_else(|| format!("could not resolve host: {}", host))?;
+    let timeout = Duration::from_secs(timeout_secs);
+    let tcp = TcpStream::connect_timeout(&sa, timeout).map_err(|e| e.to_string())?;
+    let _ = tcp.set_read_timeout(Some(timeout));
+    let _ = tcp.set_write_timeout(Some(timeout));
+
+    let req_bytes = build_http_request(method, &path, &host, headers, body);
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+
+    if scheme == "https" {
+        let roots = root_cert_store()?;
+        let config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let server_name: rustls::pki_types::ServerName<'static> = host
+            .as_str()
+            .try_into()
+            .map(|n: rustls::pki_types::ServerName| n.to_owned())
+            .map_err(|_| format!("invalid server name: {}", host))?;
+        let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
+            .map_err(|e| e.to_string())?;
+        let mut stream = rustls::StreamOwned::new(conn, tcp);
+        stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
+        stream.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    } else {
+        let mut stream = tcp;
+        stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
+        stream.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    }
+
     parse_response(&buf)
 }
 

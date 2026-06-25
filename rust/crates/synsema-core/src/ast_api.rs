@@ -230,8 +230,9 @@ fn children(n: &Node) -> Vec<&Node> {
             }
             v
         }
+        CheckpointStatement { name } => vec![name.as_ref()],
         // Hojas (sin sub-Nodes): literales, Identifier, TypeDefinition, IntentDeclaration,
-        // StateTransition, CheckpointStatement, ExpectStatement, NothingLiteral, etc.
+        // StateTransition, ExpectStatement, NothingLiteral, etc.
         _ => Vec::new(),
     }
 }
