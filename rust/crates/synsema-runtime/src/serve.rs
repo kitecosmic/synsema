@@ -55,7 +55,7 @@ type SharedDb = Arc<Mutex<DatabaseManager>>;
 /// a mutar globales (que no se propagan entre requests por diseño).
 type SharedState = Arc<Mutex<HashMap<String, SendValue>>>;
 
-use crate::engine::{wire_common, wire_common_with_state, wire_swarm_hooks, INTERP_STACK_SIZE};
+use crate::engine::{wire_common_with_state, wire_swarm_hooks, INTERP_STACK_SIZE};
 
 // =========================================================
 // Overrides de despliegue por CLI (Pieza A)

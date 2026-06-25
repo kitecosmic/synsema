@@ -2,10 +2,10 @@
 
 > **What's real today:** `log` and the error diagnostics (below) are fully functional. `trace`,
 > `measure` and `checkpoint` are **decorative markers** — they run their body but the
-> timing/snapshot instrumentation is a stub in the current runtime. Their **name must be a string
-> literal** (`trace "x"`, `checkpoint "x"` — not an expression). For real **logging** use `log`
-> (which DOES take an expression); for **crash-resume / step tracking** use the progress builtins
-> (NOT `checkpoint`).
+> timing/snapshot instrumentation is a stub in the current runtime. `trace`/`measure` take a
+> **literal** name; `checkpoint` takes an **expression** (`checkpoint "step_" + text(i)`) but is
+> still decorative — it does NOT persist anything. For real **logging** use `log` (also an
+> expression); for **crash-resume / step tracking** use the progress builtins (NOT `checkpoint`).
 
 ## Logging (real)
 ```
@@ -22,8 +22,9 @@ measure "db_query"
 
 checkpoint "before_payment"
 ```
-The name is a literal label (a dynamic name like `checkpoint step` is a parse error). These do
-NOT persist state — `checkpoint` does not snapshot variables for resume.
+`trace`/`measure` names are literal labels; `checkpoint` accepts an expression
+(`checkpoint step`). But ALL of these are decorative — they do NOT persist state; `checkpoint`
+does not snapshot variables for resume.
 
 ## Crash-resume / step tracking (the real mechanism — see builtins.md / memory.md)
 For "ingest done, died in validation, resume there", use the **progress** builtins, not

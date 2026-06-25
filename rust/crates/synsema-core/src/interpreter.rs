@@ -202,6 +202,10 @@ const MAX_RECURSION: usize = 3000;
 /// el `CapabilitySet` real (que vive fuera de core, para evitar el ciclo de deps).
 /// Espeja el callback `_grant_capability` del intérprete Python.
 pub type GrantHook = Rc<dyn Fn(&str, Option<&str>)>;
+/// Hook de aislamiento de `sandbox` (lo cablea el motor, que tiene el CapabilitySet):
+/// `true` al entrar (deniega TODAS las capabilities), `false` al salir (restaura).
+/// Maneja sandboxes anidados (stack en el closure).
+pub type SandboxHook = Rc<dyn Fn(bool)>;
 
 /// Hook que el host (motor) cablea para ejecutar un bloque `serve on PORT { … }`:
 /// construye el `ServeRuntime`, bindea el puerto y lanza el servidor. Vive fuera de
@@ -238,6 +242,11 @@ pub struct Interpreter {
     recursion_depth: usize,
     /// Concede capabilities declaradas con `require` (lo cablea el motor).
     grant_hook: Option<GrantHook>,
+    /// Aislamiento de `sandbox`: profundidad de anidamiento (>0 = dentro de un sandbox)
+    /// y un hook que vacía/restaura el CapabilitySet durante el cuerpo. Un `require`
+    /// dentro de un sandbox es no-op (no se puede re-grantear para escapar).
+    sandbox_depth: u32,
+    sandbox_hook: Option<SandboxHook>,
     /// Intent declarado (descriptivo). El texto no gatea nada.
     intent: Option<String>,
     /// True una vez congelado el intent (tras el preámbulo) — anti prompt-injection.
@@ -258,6 +267,7 @@ pub struct Interpreter {
     /// Hook de log: si está seteado, cada `log` llama el hook en tiempo real (además
     /// de pushear a `output`). Thread-safe (`Arc+Sync`) para que los hilos de agentes
     /// puedan escribir a stdout del proceso principal sin bufferizado.
+    #[allow(clippy::type_complexity)]
     pub log_hook: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
     /// Módulos locales (use/export): caché por path resuelto, set de módulos en
     /// carga (detección de import circular) y una pila de listas de nombres
@@ -301,6 +311,8 @@ impl Interpreter {
             agent_definitions: HashMap::new(),
             recursion_depth: 0,
             grant_hook: None,
+            sandbox_depth: 0,
+            sandbox_hook: None,
             intent: None,
             intent_frozen: false,
             swarm_hooks: None,
@@ -336,6 +348,16 @@ impl Interpreter {
     /// Cablea el hook de concesión de capabilities (lo llama `require`).
     pub fn set_grant_hook(&mut self, hook: GrantHook) {
         self.grant_hook = Some(hook);
+    }
+
+    /// Cablea el hook de aislamiento de `sandbox` (lo instala el motor con el caps).
+    pub fn set_sandbox_hook(&mut self, hook: SandboxHook) {
+        self.sandbox_hook = Some(hook);
+    }
+
+    /// ¿Estamos dentro de un bloque `sandbox`? (capabilities denegadas).
+    pub fn in_sandbox(&self) -> bool {
+        self.sandbox_depth > 0
     }
 
     /// Congela el intent: re-declararlo después es error (anti prompt-injection).
@@ -1573,14 +1595,31 @@ impl Interpreter {
                     Some(s) => Some(self.exec(s, env)?.to_string()),
                     None => None,
                 };
-                if let Some(hook) = self.grant_hook.clone() {
-                    hook(capability, scope_val.as_deref());
+                // Dentro de un `sandbox` NO se conceden capabilities: un `require` ahí
+                // es no-op (si no, se podría re-grantear para escapar del aislamiento).
+                if !self.in_sandbox() {
+                    if let Some(hook) = self.grant_hook.clone() {
+                        hook(capability, scope_val.as_deref());
+                    }
                 }
                 Ok(SynValue::Nothing)
             }
             NodeKind::SandboxBlock { body, .. } => {
+                // Aislamiento real: durante el cuerpo, todas las capabilities quedan
+                // DENEGADAS (el hook vacía el CapabilitySet; `require` es no-op). Se
+                // restaura al salir, también en el camino de error. El `print` no está
+                // gateado, así que el sandbox puede computar y devolver un valor.
                 let sandbox_env = Environment::child(env, "sandbox");
-                self.exec_block(body, &sandbox_env)
+                self.sandbox_depth += 1;
+                if let Some(hook) = self.sandbox_hook.clone() {
+                    hook(true);
+                }
+                let result = self.exec_block(body, &sandbox_env);
+                if let Some(hook) = self.sandbox_hook.clone() {
+                    hook(false);
+                }
+                self.sandbox_depth -= 1;
+                result
             }
             NodeKind::InvariantDeclaration { condition, description } => {
                 let result = self.exec(condition, env)?;

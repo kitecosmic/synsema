@@ -10,7 +10,7 @@
 //! Todo corre en hilos con stack grande (intérprete tree-walking + recursión).
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -95,6 +95,26 @@ pub(crate) fn wire_common_with_state(
     interp.set_grant_hook(Rc::new(move |name, scope| {
         if let Some(ty) = capability_type_from_name(name) {
             c.borrow_mut().grant(Capability::new(ty, scope.map(|s| s.to_string())));
+        }
+    }));
+    // Aislamiento de `sandbox`: al entrar guarda y VACÍA el CapabilitySet (deniega todo);
+    // al salir, restaura. Stack para sandboxes anidados. Cubre TODOS los builtins gateados
+    // de una sola vez (leen el mismo CapabilitySet vía el `caps` Rc compartido).
+    #[allow(clippy::type_complexity)]
+    let saved: Rc<RefCell<Vec<(HashSet<Capability>, HashSet<Capability>, Option<Rc<RefCell<CapabilitySet>>>)>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    let caps_sb = caps.clone();
+    interp.set_sandbox_hook(Rc::new(move |entering| {
+        let mut cs = caps_sb.borrow_mut();
+        if entering {
+            let g = std::mem::take(&mut cs.granted);
+            let d = std::mem::take(&mut cs.denied);
+            let p = cs.parent.take();
+            saved.borrow_mut().push((g, d, p));
+        } else if let Some((g, d, p)) = saved.borrow_mut().pop() {
+            cs.granted = g;
+            cs.denied = d;
+            cs.parent = p;
         }
     }));
 }
