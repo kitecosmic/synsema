@@ -43,6 +43,10 @@ const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
 /// Base de MiniMax: su API **Anthropic-compatible** (mismo formato `/v1/messages` +
 /// `x-api-key`), por eso reusa el `AnthropicProvider`. Override por `SYNSEMA_LLM_BASE_URL`.
 const MINIMAX_DEFAULT_BASE: &str = "https://api.minimax.io/anthropic";
+/// Base de DeepSeek: su API es **OpenAI-compatible** (Bearer, `{base}/chat/completions`,
+/// `usage.prompt/completion_tokens`), por eso reusa el `OpenAIProvider`. Override por
+/// `SYNSEMA_LLM_BASE_URL`.
+const DEEPSEEK_DEFAULT_BASE: &str = "https://api.deepseek.com";
 
 /// Default de Anthropic: **Sonnet** (más barato) por seguridad de costo. Opus es
 /// opt-in vía `SYNSEMA_LLM_MODEL=claude-opus-4-8` — así nadie quema plata sin querer.
@@ -52,6 +56,9 @@ pub const OPENAI_DEFAULT_MODEL: &str = "gpt-4o";
 /// Default de MiniMax (configurable por `SYNSEMA_LLM_MODEL`): la serie M para razonamiento
 /// agéntico + tool use + long-context.
 pub const MINIMAX_DEFAULT_MODEL: &str = "MiniMax-M3";
+/// Default de DeepSeek (configurable por `SYNSEMA_LLM_MODEL`): el modelo de chat general
+/// (soporta tool-calls); los modelos nuevos se setean por env.
+pub const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-chat";
 
 // =========================================================
 // Helpers puros compartidos
@@ -451,6 +458,14 @@ pub fn build_provider(
             max_tokens,
             base_url: base_url.unwrap_or_else(|| MINIMAX_DEFAULT_BASE.to_string()),
         })),
+        // DeepSeek expone una API OpenAI-compatible → reusa el OpenAIProvider (Bearer,
+        // chat/completions), sólo cambia la base + el modelo + la key (`DEEPSEEK_API_KEY`).
+        "deepseek" => Some(Arc::new(OpenAIProvider {
+            api_key,
+            model,
+            max_tokens,
+            base_url: base_url.unwrap_or_else(|| DEEPSEEK_DEFAULT_BASE.to_string()),
+        })),
         _ => None,
     }
 }
@@ -472,6 +487,8 @@ pub fn provider_from_env() -> Option<Arc<dyn LLMProvider>> {
                 "openai".to_string()
             } else if std::env::var("MINIMAX_API_KEY").is_ok() {
                 "minimax".to_string()
+            } else if std::env::var("DEEPSEEK_API_KEY").is_ok() {
+                "deepseek".to_string()
             } else {
                 return None;
             }
@@ -481,6 +498,7 @@ pub fn provider_from_env() -> Option<Arc<dyn LLMProvider>> {
         "anthropic" | "claude" => ("ANTHROPIC_API_KEY", ANTHROPIC_DEFAULT_MODEL),
         "openai" | "gpt" => ("OPENAI_API_KEY", OPENAI_DEFAULT_MODEL),
         "minimax" => ("MINIMAX_API_KEY", MINIMAX_DEFAULT_MODEL),
+        "deepseek" => ("DEEPSEEK_API_KEY", DEEPSEEK_DEFAULT_MODEL),
         _ => return None,
     };
     let api_key = std::env::var(key_var).ok()?;
@@ -751,6 +769,22 @@ mod tests {
         assert_eq!(
             anthropic_endpoint(MINIMAX_DEFAULT_BASE),
             "https://api.minimax.io/anthropic/v1/messages"
+        );
+    }
+
+    #[test]
+    fn build_provider_deepseek_some() {
+        // DeepSeek reusa el OpenAIProvider (API OpenAI-compatible).
+        let p = build_provider("deepseek", "k".to_string(), "deepseek-chat".to_string(), 4096, None)
+            .unwrap();
+        assert!(p.name().contains("openai"), "name: {}", p.name());
+    }
+
+    #[test]
+    fn deepseek_openai_compatible_endpoint() {
+        assert_eq!(
+            openai_endpoint(DEEPSEEK_DEFAULT_BASE),
+            "https://api.deepseek.com/chat/completions"
         );
     }
 

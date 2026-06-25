@@ -26,6 +26,7 @@ stripped inside a `sandbox`. See [capabilities.md](capabilities.md#the-llm-capab
 synsema run program.syn --provider anthropic   # Claude
 synsema run program.syn --provider openai       # GPT
 synsema run program.syn --provider minimax      # MiniMax M3 (Anthropic-compatible API)
+synsema run program.syn --provider deepseek     # DeepSeek (OpenAI-compatible API)
 synsema run program.syn --provider ollama       # Local model
 ```
 
@@ -34,6 +35,7 @@ Set API keys via environment:
 export ANTHROPIC_API_KEY=sk-...
 export OPENAI_API_KEY=sk-...
 export MINIMAX_API_KEY=...
+export DEEPSEEK_API_KEY=sk-...
 ```
 
 ## Context-aware prompts
@@ -59,9 +61,9 @@ runnable without any provider.
 
 | Env var | Purpose | Default |
 |---|---|---|
-| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `MINIMAX_API_KEY` | API key; presence also auto-selects the provider | — (offline if absent) |
-| `SYNSEMA_LLM_PROVIDER` | Force provider: `anthropic`, `openai`, or `minimax` | auto (from whichever key is set) |
-| `SYNSEMA_LLM_MODEL` | Model id (override wins over the default) | `claude-sonnet-4-6` / `gpt-4o` / `MiniMax-M3` |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `MINIMAX_API_KEY` / `DEEPSEEK_API_KEY` | API key; presence also auto-selects the provider | — (offline if absent) |
+| `SYNSEMA_LLM_PROVIDER` | Force provider: `anthropic`, `openai`, `minimax`, or `deepseek` | auto (from whichever key is set) |
+| `SYNSEMA_LLM_MODEL` | Model id (override wins over the default) | `claude-sonnet-4-6` / `gpt-4o` / `MiniMax-M3` / `deepseek-chat` |
 | `SYNSEMA_LLM_MAX_TOKENS` | Output token cap | `4096` |
 | `SYNSEMA_LLM_BASE_URL` | Endpoint base — point a provider at any compatible endpoint (e.g. a local server) | official endpoint |
 
@@ -69,6 +71,10 @@ Cost note: the default is **Sonnet** (cheaper); opt into Opus with `SYNSEMA_LLM_
 
 **MiniMax (M3).** First-class via its **Anthropic-compatible** API (reuses the Anthropic provider
 internally): `SYNSEMA_LLM_PROVIDER=minimax` + `MINIMAX_API_KEY=...` (default model `MiniMax-M3`).
+
+**DeepSeek.** First-class via its **OpenAI-compatible** API (reuses the OpenAI provider internally):
+`SYNSEMA_LLM_PROVIDER=deepseek` + `DEEPSEEK_API_KEY=...` (default model `deepseek-chat`; set another
+with `SYNSEMA_LLM_MODEL`). Use `deepseek-chat` for tool-calling.
 
 **Local / on-prem models (100% private).** Any OpenAI-compatible server works — Ollama, LM Studio,
 vLLM, llama.cpp. Nothing leaves your machine:
