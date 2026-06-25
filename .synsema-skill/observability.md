@@ -1,28 +1,39 @@
 # Synsema Observability
 
-## Tracing
+> **What's real today:** `log` and the error diagnostics (below) are fully functional. `trace`,
+> `measure` and `checkpoint` are **decorative markers** — they run their body but the
+> timing/snapshot instrumentation is a stub in the current runtime. Their **name must be a string
+> literal** (`trace "x"`, `checkpoint "x"` — not an expression). For real **logging** use `log`
+> (which DOES take an expression); for **crash-resume / step tracking** use the progress builtins
+> (NOT `checkpoint`).
+
+## Logging (real)
+```
+log "Processing order " + order_id        -- `log` takes a full expression
+```
+
+## Tracing / Measurement / Checkpoints (decorative markers — literal name)
 ```
 trace "payment_processing"
     process_payment(order)
--- Records: name, duration, result
-```
 
-## Logging
-```
-log "Processing order " + order_id
-```
-
-## Measurement
-```
 measure "db_query"
     run_query(sql)
--- Records: name, duration in ms
-```
 
-## Checkpoints
-```
 checkpoint "before_payment"
--- Snapshots all variable state at this point
+```
+The name is a literal label (a dynamic name like `checkpoint step` is a parse error). These do
+NOT persist state — `checkpoint` does not snapshot variables for resume.
+
+## Crash-resume / step tracking (the real mechanism — see builtins.md / memory.md)
+For "ingest done, died in validation, resume there", use the **progress** builtins, not
+`checkpoint`:
+```
+create_progress("import", ["ingest", "validate", "load"])
+start_step("import", "ingest")
+complete_step("import", "ingest", result)
+-- after a restart:
+let where be resume_point("import")        -- the step to resume from
 ```
 
 ## Error diagnostics

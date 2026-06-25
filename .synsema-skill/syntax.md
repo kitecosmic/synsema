@@ -39,11 +39,28 @@ Pipe: `|>` — chains: `data |> clean |> validate`
 Lambda: `(params) => expr`
 Comments: `-- comment`
 
-## Strings
-- Single line only. A literal newline inside `"..."` gives `Unterminated string`.
-- Use escape sequences: `\n` (newline), `\t` (tab), `\\` (backslash), `\"` (quote).
-- Concatenation: `"hello" + " " + "world"`
-- Interpolation: `fmt("Hello {name}", {"name": value})`
+## Strings — two kinds
+
+**Quoted `"..."` / `'...'`** — single-line, escape sequences:
+- A **literal** newline inside `"..."` is an error (`Unterminated string`). For a newline, use the escape `\n`.
+- Escapes: `\n` (newline), `\t` (tab), `\\` (backslash), `\"` / `\'` (quote). `"a\nb"` is 3 chars (the `\n` is ONE real newline), and `split("a\nb", "\n")` returns 2 items.
+- Concatenation: `"hello" + " " + "world"`. Safe for JSON (single-line, literal).
+
+**Backtick `` `...` ``** — multiline + interpolation + escapes:
+- **Real newlines work** — press Enter inside the backticks (great for SQL / HTML / multi-line text).
+- **Escapes also work** (`\n`, `\t`, `\\`) — `` `a\nb` `` is the same 3 chars as `"a\nb"`.
+- **Interpolation:** `` `Hello {name}, you have {count} items` `` — `{expr}` evaluates a full expression. Escape a literal brace/backtick with `\{` / `` \` ``.
+- ⚠️ Common confusion: backticks are NOT "raw" — they DO process `\n`/`\t`. The difference from `"..."` is that backticks also allow **literal** newlines and `{expr}` interpolation.
+
+**Multi-line text (e.g. SQL):** use a backtick string with real newlines:
+```
+let q be `
+    SELECT id, name FROM users
+    WHERE active = 1
+    ORDER BY name
+`
+```
+(`fmt("Hello {name}", {"name": value})` is the older map-based interpolation; backtick `{expr}` is usually nicer.)
 
 ## Numbers
 - Integer or float: `42`, `3.14`, `1_000_000`

@@ -47,11 +47,15 @@ Agents declare what they're working on BEFORE touching it:
 - `shared` — multiple readers, no writers
 - `advisory` — logged but not enforced
 
-## Dashboard
+## Swarm state dump
+The swarm runtime tracks agent states (IDLE/STARTING/WORKING/WAITING/DONE/ERROR), blackboard
+contents, signals (pending + consumed), and detected conflicts. To inspect them after a run, use
+the swarm dump (JSON: `{ok, out, err, blackboard, agents}`):
 ```bash
-synsema run program.syn --dashboard
+synsema conform --swarm program.syn
 ```
-Shows: agent states (IDLE/STARTING/WORKING/WAITING/DONE/ERROR), blackboard contents, signals (pending + consumed), and detected conflicts.
+(Note: a live `run --dashboard` flag is **not currently wired** — `synsema run` ignores it. Use
+`conform --swarm` for the state dump.)
 
 ## Coordination patterns
 
