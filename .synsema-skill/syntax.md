@@ -84,6 +84,11 @@ otherwise when condition
 otherwise
     body
 
+-- Inline conditional EXPRESSION (usable in let/map/apply/call args):
+let label be when score >= 50 then "pass" otherwise "fail"
+let kind be when n > 0 then "pos" otherwise when n < 0 then "neg" otherwise "zero"
+-- `when <cond> then <expr> [otherwise [when ...] <expr>]` returns the taken branch's value.
+
 each item in collection
     body
 

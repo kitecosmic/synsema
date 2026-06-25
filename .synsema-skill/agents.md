@@ -17,7 +17,12 @@ spawn Researcher with query = "AI safety"
 - Each `spawn` creates a new thread with its own interpreter.
 - Multiple spawns of the same agent create independent instances.
 - The parent program continues immediately (non-blocking).
-- Top-level tasks are accessible, but **state is NOT shared** between agents except via the blackboard.
+- **Top-level tasks and values are snapshotted into the agent** (a COPY) — so the agent can call
+  your top-level tasks directly, no HTTP needed. But it's a copy: mutating a value inside the
+  agent does NOT affect the parent or other agents. Share state via the blackboard. (Secrets are
+  redacted when they cross into an agent.)
+- **Agent `log`/`print` appears in the main process stdout**, prefixed `[AgentName]` — agents are
+  not silent during development.
 
 ## Blackboard (shared state)
 ```

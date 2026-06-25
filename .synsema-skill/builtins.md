@@ -125,6 +125,7 @@ Resolution for `env`/`secret`: process environ → `.env` → default → else e
 - `random_int(min, max)` → integer
 
 ## HTTP
+Both `http://` and **`https://` (TLS)** are supported (rustls + OS root CAs, real cert validation). `http*` are NOT capability-gated (`fetch` is — see capabilities.md).
 - `http(method, url, headers?, query?, body?, timeout?)` → response map {status, ok, body, json, headers, error}
 - `http_get(url, headers?, query?)` → response map
 - `http_post(url, body, headers?)` → response map
@@ -152,6 +153,7 @@ Response helpers (set the HTTP status; body follows the response contract):
 - `read_body()` → full request body **text** (lossy for non-UTF-8) — inside a route handler
 - `read_body_bytes()` → full request body as `bytes` (byte-exact, for binary uploads) — inside a route handler
 - `binary(bytes, content_type?, status?)` → a binary response (default `application/octet-stream`, 200). Also `give bytes(...)` directly → octet-stream.
+- **Shared state across requests** (serve): `state_set(key, value)`, `state_get(key, default?)`, `state_incr(key, delta?)`, `state_delete(key)` — an in-memory store shared across all handlers/requests (a `set` on a global does NOT persist across requests). See serve.md.
 
 ### Semantic content (negotiated HTML / Markdown / JSON — see serve.md)
 - `content(tree)` → a negotiable response: HTML (default), Markdown (`Accept: text/markdown` or `.md`), or JSON (`.json`). Opt-in; only `content()` is negotiated.

@@ -23,6 +23,10 @@ let r be http_put(url, {"name": "Bob"})
 let r be http_delete(url, {"Authorization": "Bearer sk-123"})
 ```
 
+**HTTPS works**: `http://` and `https://` are both supported (TLS via `rustls` with the OS
+root CAs — real certificate validation, pure-Rust). So `http_get("https://api.example.com")`
+is fine for real-world APIs. (`http*` are NOT capability-gated; `fetch` is — see capabilities.md.)
+
 Response is always a map:
 ```
 status of r      -- 200

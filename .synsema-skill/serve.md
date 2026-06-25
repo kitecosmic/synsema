@@ -107,6 +107,23 @@ params           -- path params as a map: /products/:id → params.id
 All `query` and `params` values are text. Use `read_body()` to get the whole
 body regardless of where it lives (memory or disk) — see "Request body limits".
 
+## Shared mutable state across requests (`state_*`)
+
+⚠️ A `set globalVar to ...` inside a route handler does NOT persist to the next request —
+each request runs on a per-request snapshot of the globals (this keeps requests isolated and
+fast). For state shared **across requests/handlers**, use the `state_*` builtins (an in-memory
+store with the life of the server):
+```
+route "POST /visit"
+    state_incr("visits")            -- shared counter across all requests
+    give "ok"
+route "GET /count"
+    give state_get("visits", 0)     -- default 0 if unset
+```
+- `state_set(key, value)` / `state_get(key, default?)` / `state_incr(key, delta?)` / `state_delete(key)`.
+- In-memory (gone on restart). For durable state use SQL ([stdlib.md](stdlib.md)) or the agent
+  memory (`remember`/`recall`, which now persists from serve too).
+
 ## Response contract (enforced by the runtime, on the BODY you `give`)
 
 | You `give`            | Response body                                                        |

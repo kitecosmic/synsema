@@ -64,9 +64,16 @@ task fetch_orders()
 ## Sandbox blocks
 ```
 sandbox
-    -- code here has NO capabilities (fully isolated)
+    -- code here has NO capabilities (fully isolated): net/file/time/random/db/secret
+    -- are all DENIED inside, even if the program granted them. `require` inside is a
+    -- no-op (can't re-grant to escape). `print` works (not gated); restored on exit.
     let result be compute(untrusted_data)
+
+-- Sandbox can also be an EXPRESSION (returns the value of its body):
+let enriched be sandbox transform(untrusted_data)   -- isolated AND returns a value
 ```
+Use it to run untrusted/enriching logic that must NOT touch the network, disk, or any
+capability — only pure computation in, value out.
 
 ## Invariants
 ```
