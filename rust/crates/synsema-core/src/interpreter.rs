@@ -221,7 +221,8 @@ pub struct SwarmHooks {
     pub share: Rc<dyn Fn(&str, &SynValue)>,
     pub observe: Rc<dyn Fn(&str) -> Option<SynValue>>,
     pub signal: Rc<dyn Fn(&str, Option<SynValue>)>,
-    pub wait_for: Rc<dyn Fn(&str) -> Option<SynValue>>,
+    /// `wait_for(canal, timeout_secs)` — `None` = default (30 s). Batch 7.
+    pub wait_for: Rc<dyn Fn(&str, Option<f64>) -> Option<SynValue>>,
     #[allow(clippy::type_complexity)]
     pub spawn: Rc<dyn Fn(&str, Vec<Node>, Vec<(String, SynValue)>) -> Result<String, Control>>,
 }
@@ -1511,10 +1512,24 @@ impl Interpreter {
                 }
                 Ok(SynValue::Nothing)
             }
-            NodeKind::WaitForStatement { signal_name, variable, .. } => {
+            NodeKind::WaitForStatement { signal_name, variable, timeout } => {
                 let n = raw_str(&self.exec(signal_name, env)?);
+                // Timeout opcional (Batch 7): segundos como número (no-número → error claro);
+                // clamp a [0, 3600] como `sleep`. `None` = default (30 s) en el hook.
+                let secs: Option<f64> = match timeout {
+                    Some(t) => match self.exec(t, env)? {
+                        SynValue::Number(num) => Some(num.to_f64().clamp(0.0, 3600.0)),
+                        _ => {
+                            return Err(err_at(
+                                "wait_for timeout must be a number of seconds",
+                                loc,
+                            ))
+                        }
+                    },
+                    None => None,
+                };
                 let result = match self.swarm_hooks.as_ref().map(|s| s.wait_for.clone()) {
-                    Some(h) => h(&n),
+                    Some(h) => h(&n, secs),
                     None => None,
                 };
                 match result {

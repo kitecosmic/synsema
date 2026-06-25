@@ -993,15 +993,22 @@ impl Parser {
     fn parse_wait_for(&mut self) -> Result<Node, ParseError> {
         let loc = self.location();
         self.advance();
-        // Nombre como EXPRESIÓN (Batch 6); `parse_expression` se detiene en `as`.
+        // Nombre como EXPRESIÓN (Batch 6); `parse_expression` se detiene en `as`/`timeout`.
         let signal_name = Box::new(self.parse_expression()?);
+        // `timeout <expr>` opcional (Batch 7): SOFT keyword, sólo especial acá, justo entre
+        // el nombre y el `as`. La expresión del timeout se detiene en `as` (TokenType::As).
+        let mut timeout = None;
+        if self.check_word("timeout") {
+            self.advance();
+            timeout = Some(Box::new(self.parse_expression()?));
+        }
         let mut variable = None;
         if self.match_tok(TokenType::As).is_some() {
             variable = Some(self.expect(TokenType::Identifier, "")?.as_str().to_string());
         }
         Ok(Node::new(
             loc,
-            NodeKind::WaitForStatement { signal_name, variable, timeout: None },
+            NodeKind::WaitForStatement { signal_name, variable, timeout },
         ))
     }
 

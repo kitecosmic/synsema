@@ -450,13 +450,16 @@ pub(crate) fn wire_swarm_hooks(interp: &mut Interpreter, swarm: Arc<Swarm>, agen
         let n = name.clone();
         Rc::new(move |sig_name, data| sw.signal(sig_name, &n, data.map(|v| to_send(&v))))
     };
-    let wait_for: Rc<dyn Fn(&str) -> Option<SynValue>> = {
+    let wait_for: Rc<dyn Fn(&str, Option<f64>) -> Option<SynValue>> = {
         let sw = swarm.clone();
         let n = name.clone();
-        Rc::new(move |sig_name| {
+        Rc::new(move |sig_name, timeout| {
+            // Timeout configurable (Batch 7): segundos del `wait_for ... timeout <expr>`, o
+            // 30 s por defecto (G1). Clamp [0, 3600] como `sleep`.
+            let secs = timeout.unwrap_or(30.0).clamp(0.0, 3600.0);
             // Estado WAITING mientras bloquea (no-op si `n` no es agente registrado, p.ej. "main").
             sw.set_state(&n, AgentState::Waiting);
-            let sig = sw.wait_for_signal(sig_name, Duration::from_secs(30));
+            let sig = sw.wait_for_signal(sig_name, Duration::from_secs_f64(secs));
             sw.set_state(&n, AgentState::Working);
             sig.and_then(|s| s.data).map(|d| from_send(&d))
         })
