@@ -231,6 +231,10 @@ pub enum StepResult {
 pub type LlmStepCallback =
     Rc<dyn Fn(&str, &[StepCatalogEntry], &str) -> StepResult>;
 
+/// Callback de texto (reason/decide/analyze/generate): `(op, prompt) -> contenido`. El
+/// motor lo cablea con el provider real; sin él, las ops LLM caen a placeholders.
+pub type LlmTextCallback = Rc<dyn Fn(&str, &str) -> String>;
+
 /// Hook de aislamiento por-TOOL (least-privilege). Lo cablea el motor con el
 /// `CapabilitySet`. `(true, declared)` al entrar: restringe las caps a las DECLARADAS
 /// por la tool que el agente ya tenía (∩ agente, SIN heredar el resto del padre) → el
@@ -295,9 +299,11 @@ pub struct Interpreter {
     /// Callback humano (approve/confirm/ask). (action, message) → SynValue
     /// (bool para approve/confirm, texto para ask). Sin él: auto-aprueba.
     human_callback: Option<Rc<dyn Fn(&str, &str) -> SynValue>>,
-    /// Callback LLM (reason/decide/analyze/generate): operación → contenido.
-    /// Sin él: placeholders descriptivos.
-    llm_callback: Option<Rc<dyn Fn(&str) -> String>>,
+    /// Callback LLM (reason/decide/analyze/generate): (operación, prompt) → contenido.
+    /// El `prompt` lleva el texto ya renderizado de la op (subject/data/objective/…)
+    /// para que el provider real tenga qué mandar; un mock puede ignorarlo y keyear por
+    /// la operación. Sin él: placeholders descriptivos.
+    llm_callback: Option<LlmTextCallback>,
     /// Callback LLM tool-aware de PASO (`llm_step`, FASE 1): el motor lo cablea con el
     /// provider guionable/real. Sin él: `llm_step` devuelve un placeholder seguro.
     llm_step_callback: Option<LlmStepCallback>,
@@ -437,8 +443,9 @@ impl Interpreter {
         self.human_callback = Some(cb);
     }
 
-    /// Cablea el callback LLM (reason/decide/analyze/generate).
-    pub fn set_llm_callback(&mut self, cb: Rc<dyn Fn(&str) -> String>) {
+    /// Cablea el callback LLM (reason/decide/analyze/generate). La firma es
+    /// `(op, prompt) -> contenido`: el motor le pasa el prompt renderizado de la op.
+    pub fn set_llm_callback(&mut self, cb: LlmTextCallback) {
         self.llm_callback = Some(cb);
     }
 
@@ -1787,45 +1794,76 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     Some(s) => self.exec(s, env)?,
                     None => SynValue::Nothing,
                 };
-                for (_, v) in context {
-                    self.exec(v, env)?;
+                // Evaluá el contexto (`with k=v`/`given …`) y armalo para el prompt — el
+                // LLM necesita ver ese contexto, no sólo el subject.
+                let mut ctx_parts = Vec::new();
+                for (name, v) in context {
+                    ctx_parts.push(format!("{}={}", name, self.exec(v, env)?));
                 }
                 match self.llm_callback.clone() {
-                    Some(cb) => Ok(syn_text(cb("reason"))),
+                    Some(cb) => {
+                        let prompt = if ctx_parts.is_empty() {
+                            subj.to_string()
+                        } else {
+                            format!("Reason about: {} (context: {})", subj, ctx_parts.join(", "))
+                        };
+                        Ok(syn_text(cb("reason", &prompt)))
+                    }
                     None => Ok(syn_text(format!("[reasoning about: {}]", subj))),
                 }
             }
             NodeKind::DecideExpression { options, given, .. } => {
                 self.check_llm_cap()?;
-                if let Some(o) = options {
-                    self.exec(o, env)?;
-                }
-                if let Some(g) = given {
-                    self.exec(g, env)?;
-                }
+                let opts = match options {
+                    Some(o) => self.exec(o, env)?,
+                    None => SynValue::Nothing,
+                };
+                let giv = match given {
+                    Some(g) => self.exec(g, env)?,
+                    None => SynValue::Nothing,
+                };
                 match self.llm_callback.clone() {
-                    Some(cb) => Ok(syn_text(cb("decide"))),
+                    Some(cb) => {
+                        let prompt = format!("Decide between {} given {}", opts, giv);
+                        Ok(syn_text(cb("decide", &prompt)))
+                    }
                     None => Ok(syn_text("[decision pending]")),
                 }
             }
             NodeKind::AnalyzeExpression { data, objective } => {
                 self.check_llm_cap()?;
-                self.exec(data, env)?;
+                let d = self.exec(data, env)?;
                 match self.llm_callback.clone() {
-                    Some(cb) => Ok(syn_text(cb("analyze"))),
+                    Some(cb) => {
+                        let prompt = format!("Analyze for {}: {}", objective, d);
+                        Ok(syn_text(cb("analyze", &prompt)))
+                    }
                     None => Ok(syn_text(format!("[analysis of: {}]", objective))),
                 }
             }
             NodeKind::GenerateExpression { target, given, parameters } => {
                 self.check_llm_cap()?;
-                if let Some(g) = given {
-                    self.exec(g, env)?;
-                }
-                for (_, v) in parameters {
-                    self.exec(v, env)?;
+                // Evaluá given/parameters y armalos para el prompt (el LLM los necesita,
+                // no sólo el target).
+                let giv = match given {
+                    Some(g) => Some(self.exec(g, env)?),
+                    None => None,
+                };
+                let mut param_parts = Vec::new();
+                for (name, v) in parameters {
+                    param_parts.push(format!("{}={}", name, self.exec(v, env)?));
                 }
                 match self.llm_callback.clone() {
-                    Some(cb) => Ok(syn_text(cb("generate"))),
+                    Some(cb) => {
+                        let mut prompt = format!("Generate {}", target);
+                        if let Some(g) = &giv {
+                            prompt.push_str(&format!(" given {}", g));
+                        }
+                        if !param_parts.is_empty() {
+                            prompt.push_str(&format!(" with {}", param_parts.join(", ")));
+                        }
+                        Ok(syn_text(cb("generate", &prompt)))
+                    }
                     None => Ok(syn_text(format!("[generated: {}]", target))),
                 }
             }

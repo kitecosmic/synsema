@@ -158,7 +158,7 @@ pub fn create_provider(name: &str) -> Option<Box<dyn LLMProvider>> {
     };
     match name.to_lowercase().as_str() {
         "mock" => Some(Box::new(MockProvider::new(HashMap::new()))),
-        "anthropic" | "claude" => net("anthropic", "claude-sonnet-4-20250514"),
+        "anthropic" | "claude" => net("anthropic", "claude-sonnet-4-6"),
         "openai" | "gpt" => net("openai", "gpt-4o"),
         "minimax" | "minimax-m1" => net("minimax", "MiniMax-M3"),
         "ollama" | "local" => net("ollama", "llama3"),

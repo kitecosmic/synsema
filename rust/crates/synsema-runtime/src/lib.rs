@@ -8,6 +8,7 @@
 pub mod daemon;
 pub mod engine;
 pub mod error_reporter;
+pub mod llm_providers;
 pub mod parallel;
 pub mod persistence;
 pub mod recovery;

@@ -52,9 +52,34 @@ Every LLM call automatically receives:
 - After 3 failures, logs a warning and returns raw response
 
 ## Provider setup
-The LLM provider is selected/configured by the runtime (via the environment). Offline, the engine
-uses a built-in mock provider, so `reason`/`decide`/`analyze`/`generate` return descriptive
-placeholders and programs stay runnable without an API key.
+The real LLM provider is selected and configured by the **runtime via environment variables** — the
+`.syn` program never names a host or key, so it can't redirect the call (no exfiltration) and isn't
+coupled to a vendor. Offline (no key) the engine returns descriptive placeholders, so programs stay
+runnable without any provider.
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | API key; presence also auto-selects the provider | — (offline if absent) |
+| `SYNSEMA_LLM_PROVIDER` | Force provider: `anthropic` or `openai` | auto (from whichever key is set) |
+| `SYNSEMA_LLM_MODEL` | Model id (override wins over the default) | `claude-sonnet-4-6` (Anthropic) / `gpt-4o` (OpenAI) |
+| `SYNSEMA_LLM_MAX_TOKENS` | Output token cap | `4096` |
+| `SYNSEMA_LLM_BASE_URL` | Endpoint base — point the OpenAI-style provider at any OpenAI-compatible server | official endpoint |
+
+Cost note: the default is **Sonnet** (cheaper); opt into Opus with `SYNSEMA_LLM_MODEL=claude-opus-4-8`.
+
+**Local / on-prem models (100% private).** Any OpenAI-compatible server works — Ollama, LM Studio,
+vLLM, llama.cpp. Nothing leaves your machine:
+
+```
+SYNSEMA_LLM_PROVIDER=openai
+SYNSEMA_LLM_BASE_URL=http://localhost:11434/v1   # Ollama
+SYNSEMA_LLM_MODEL=llama3.1
+OPENAI_API_KEY=ollama                            # any non-empty value; local servers ignore it
+```
+
+Security: the only capability needed to reach the LLM is `require llm` — the network egress to the
+configured host is part of that, **not** a separate `net` grant (the runtime fixes the host; the
+program can't change it). Use `net` only for egress the program itself directs.
 
 ## Safe tool-calling (`llm_step` + `call_tool`)
 

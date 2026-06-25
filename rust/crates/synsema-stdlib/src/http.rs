@@ -172,9 +172,9 @@ fn do_request(
 
 fn parse_response(buf: &[u8]) -> Result<HttpResult, String> {
     let text = String::from_utf8_lossy(buf);
+    // El head es ASCII → el offset de char en `text` == offset de byte en `buf`.
     let split = text.find("\r\n\r\n").ok_or_else(|| "malformed HTTP response".to_string())?;
     let head = &text[..split];
-    let body = &text[split + 4..];
     let mut lines = head.split("\r\n");
     let status_line = lines.next().unwrap_or("");
     let status: i64 = status_line
@@ -188,13 +188,53 @@ fn parse_response(buf: &[u8]) -> Result<HttpResult, String> {
             headers.push((line[..ci].trim().to_string(), line[ci + 1..].trim().to_string()));
         }
     }
+    // De-chunk si la respuesta es `Transfer-Encoding: chunked` (HTTP/1.1 sin
+    // Content-Length — p.ej. la API de Anthropic). El body crudo trae los prefijos de
+    // tamaño hex por chunk; sin des-chunkear NO es JSON válido.
+    let chunked = headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
+    });
+    let body_bytes = &buf[split + 4..];
+    let body = if chunked {
+        dechunk_body(body_bytes)
+    } else {
+        String::from_utf8_lossy(body_bytes).to_string()
+    };
     Ok(HttpResult {
         status,
         ok: (200..300).contains(&status),
-        body: body.to_string(),
+        body,
         headers,
         error: None,
     })
+}
+
+/// Des-chunkea un body `Transfer-Encoding: chunked`: cada chunk es `<hex>\r\n<datos>\r\n`
+/// y termina con un chunk de tamaño 0. Concatena los datos (ignora trailers).
+fn dechunk_body(mut data: &[u8]) -> String {
+    let mut out: Vec<u8> = Vec::with_capacity(data.len());
+    while let Some(line_end) = data.windows(2).position(|w| w == b"\r\n") {
+        let size_line = String::from_utf8_lossy(&data[..line_end]);
+        // El tamaño puede traer extensiones tras `;` — quedate sólo con el hex.
+        let hex = size_line.split(';').next().unwrap_or("").trim();
+        let size = match usize::from_str_radix(hex, 16) {
+            Ok(s) => s,
+            Err(_) => break,
+        };
+        if size == 0 {
+            break;
+        }
+        let start = line_end + 2;
+        let end = start + size;
+        if end > data.len() {
+            out.extend_from_slice(&data[start..]);
+            break;
+        }
+        out.extend_from_slice(&data[start..end]);
+        // Saltá los datos + el `\r\n` que cierra el chunk.
+        data = if end + 2 <= data.len() { &data[end + 2..] } else { &[] };
+    }
+    String::from_utf8_lossy(&out).to_string()
 }
 
 fn urlencode(q: &[(String, String)]) -> String {
@@ -364,6 +404,24 @@ mod tests {
         assert!(!r.ok);
         assert_eq!(r.status, 0);
         assert!(r.error.is_some());
+    }
+
+    #[test]
+    fn parse_response_dechunks_chunked_body() {
+        // Respuesta HTTP/1.1 `Transfer-Encoding: chunked` (como Anthropic sobre 1.1):
+        // dos chunks de 5 bytes → el body crudo trae los prefijos de tamaño; debe
+        // des-chunkearse a JSON limpio y concatenado.
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\n{\"a\":\r\n5\r\n\"bc\"}\r\n0\r\n\r\n";
+        let r = parse_response(raw).unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body, "{\"a\":\"bc\"}");
+    }
+
+    #[test]
+    fn parse_response_nonchunked_unchanged() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n{\"a\":1}";
+        let r = parse_response(raw).unwrap();
+        assert_eq!(r.body, "{\"a\":1}");
     }
 
     #[test]

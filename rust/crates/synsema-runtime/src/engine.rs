@@ -176,6 +176,51 @@ pub(crate) fn wire_common_with_state(
     }));
 }
 
+/// Cablea el provider LLM REAL (HTTP) si hay uno configurado por env
+/// (`SYNSEMA_LLM_PROVIDER` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`). Cablea AMBOS
+/// callbacks: el de texto (reason/decide/analyze/generate) y el de paso tool-aware
+/// (`llm_step`). Si no hay provider (offline): NO cablea nada → las ops LLM caen a los
+/// placeholders descriptivos del core (`run` no se rompe). NO concede capabilities: el
+/// gate `require llm` sigue idéntico (lo cableó `wire_common`).
+fn wire_real_llm_provider(interp: &mut Interpreter) {
+    let provider = match crate::llm_providers::provider_from_env() {
+        Some(p) => p,
+        None => return,
+    };
+    // Callback de texto: arma `LLMRequest::new(op)` + `data["prompt"]` → `call().content`.
+    let p_text = provider.clone();
+    interp.set_llm_callback(Rc::new(move |op: &str, prompt: &str| {
+        let mut req = LLMRequest::new(op);
+        req.data.insert("prompt".to_string(), prompt.to_string());
+        p_text.call(&req).content
+    }));
+    // Callback de paso tool-aware: arma `LLMRequest::new("step").with_tools(catalog)` +
+    // `data["prompt"]`/`data["context"]` → `call_step` → mapea `LlmStep`→`StepResult`.
+    interp.set_llm_step_callback(Rc::new(
+        move |prompt: &str, catalog: &[StepCatalogEntry], context: &str| {
+            let mut req = LLMRequest::new("step").with_tools(
+                catalog
+                    .iter()
+                    .map(|e| ToolSpec {
+                        name: e.name.clone(),
+                        description: e.description.clone(),
+                        params: e.params.clone(),
+                    })
+                    .collect(),
+            );
+            req.data.insert("prompt".to_string(), prompt.to_string());
+            req.data.insert("context".to_string(), context.to_string());
+            let r = provider.call_step(&req);
+            match r.step {
+                LlmStep::Final(t) => StepResult::Final { text: t, tokens: r.tokens_used },
+                LlmStep::ToolCall { name, args } => {
+                    StepResult::Tool { name, args, tokens: r.tokens_used }
+                }
+            }
+        },
+    ));
+}
+
 fn finish(mut interp: Interpreter, result: Result<SynValue, Control>) -> RunResult {
     match result {
         Ok(_) => RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() },
@@ -214,6 +259,9 @@ fn run_inner(source: &str, filename: &str, secure: bool) -> RunResult {
             let progress = Rc::new(RefCell::new(ProgressManager::new()));
             let memory = Rc::new(RefCell::new(AgentMemory::new()));
             wire_common_with_state(&mut interp, &caps, secure, progress.clone(), memory.clone());
+            // Conectividad LLM real: si hay provider por env, cablea texto + paso
+            // tool-aware; offline (sin key) deja los placeholders del core.
+            wire_real_llm_provider(&mut interp);
 
             // StatePersistence cross-run (espeja engine.run_source del oráculo): para
             // archivos nombrados (no "<stdin>") carga el estado previo antes de ejecutar
@@ -487,6 +535,34 @@ pub fn run_with_human(source: &str, filename: &str, default_approve: bool) -> Ru
         .unwrap_or_else(|_| RunResult { success: false, output: Vec::new(), errors: vec!["el motor abortó".to_string()] })
 }
 
+/// Host-config de test: corre con un callback de texto que GRABA `(op, prompt)` de cada
+/// op LLM (reason/decide/analyze/generate) y responde `"ok"`. Devuelve los pares grabados
+/// junto al resultado — para aseverar que el prompt threadea su contexto (`with`/`given`)
+/// sin pegarle a la red.
+pub fn run_capturing_llm(source: &str, filename: &str) -> (RunResult, Vec<(String, String)>) {
+    let captured: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cap_outer = captured.clone();
+    let src = source.to_string();
+    let fname = filename.to_string();
+    let result = std::thread::Builder::new()
+        .stack_size(INTERP_STACK_SIZE)
+        .spawn(move || {
+            run_configured(&src, &fname, move |interp| {
+                let cap = captured.clone();
+                interp.set_llm_callback(Rc::new(move |op: &str, prompt: &str| {
+                    cap.lock().unwrap().push((op.to_string(), prompt.to_string()));
+                    "ok".to_string()
+                }));
+            })
+        })
+        .expect("hilo del motor")
+        .join()
+        .unwrap_or_else(|_| RunResult { success: false, output: Vec::new(), errors: vec!["el motor abortó".to_string()] });
+    let pairs = cap_outer.lock().unwrap().clone();
+    (result, pairs)
+}
+
 /// Corre con un proveedor LLM mock (host-config) con respuestas predecibles.
 pub fn run_with_llm(source: &str, filename: &str, responses: HashMap<String, String>) -> RunResult {
     let src = source.to_string();
@@ -496,7 +572,10 @@ pub fn run_with_llm(source: &str, filename: &str, responses: HashMap<String, Str
         .spawn(move || {
             run_configured(&src, &fname, move |interp| {
                 let provider = Arc::new(MockProvider::new(responses));
-                interp.set_llm_callback(Rc::new(move |op: &str| provider.call(&LLMRequest::new(op)).content));
+                // El mock keyea por `op` e ignora el prompt (retrocompat de los tests).
+                interp.set_llm_callback(Rc::new(move |op: &str, _prompt: &str| {
+                    provider.call(&LLMRequest::new(op)).content
+                }));
             })
         })
         .expect("hilo del motor")
