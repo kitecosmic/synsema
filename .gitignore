@@ -6,6 +6,8 @@ build/
 .eggs/
 *.json
 !examples/*.json
+# La extensión de editor son archivos .json legítimos (no caen bajo la regla de arriba).
+!editors/**/*.json
 
 # Rust
 target/

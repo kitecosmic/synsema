@@ -1,0 +1,42 @@
+{
+  "name": "synsema",
+  "displayName": "Synsema",
+  "description": "Syntax highlighting for the Synsema language (.syn / .fsyn)",
+  "version": "0.1.0",
+  "publisher": "synsema",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kitecosmic/synsema.git",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "synsema",
+    "syn",
+    "ai agents",
+    "language"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "synsema",
+        "aliases": ["Synsema", "synsema"],
+        "extensions": [".syn", ".fsyn"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "synsema",
+        "scopeName": "source.synsema",
+        "path": "./syntaxes/synsema.tmLanguage.json"
+      }
+    ]
+  }
+}

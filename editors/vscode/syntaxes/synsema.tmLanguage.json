@@ -1,0 +1,132 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Synsema",
+  "scopeName": "source.synsema",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#definitions" },
+    { "include": "#constants" },
+    { "include": "#keywords" },
+    { "include": "#builtins" },
+    { "include": "#calls" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-dash.synsema",
+          "match": "--.*$"
+        }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.synsema",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        { "name": "constant.character.escape.synsema", "match": "\\\\." },
+        {
+          "name": "meta.template.expression.synsema",
+          "begin": "\\{",
+          "end": "\\}",
+          "patterns": [
+            { "include": "#numbers" },
+            { "include": "#keywords" },
+            { "include": "#builtins" }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.synsema",
+          "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*([eE][+-]?[0-9]+)?\\b"
+        },
+        {
+          "name": "constant.numeric.integer.synsema",
+          "match": "\\b[0-9][0-9_]*\\b"
+        }
+      ]
+    },
+    "definitions": {
+      "patterns": [
+        {
+          "match": "\\b(task)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.function.synsema" },
+            "2": { "name": "entity.name.function.synsema" }
+          }
+        },
+        {
+          "match": "\\b(type)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.synsema" },
+            "2": { "name": "entity.name.type.synsema" }
+          }
+        },
+        {
+          "match": "\\b(agent)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": { "name": "storage.type.class.synsema" },
+            "2": { "name": "entity.name.type.class.synsema" }
+          }
+        }
+      ]
+    },
+    "constants": {
+      "name": "constant.language.synsema",
+      "match": "\\b(true|false|nothing)\\b"
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.synsema",
+          "match": "\\b(when|otherwise|each|while|repeat|match|is|try|recover|give|stop|then|and_then|return)\\b"
+        },
+        {
+          "name": "storage.type.synsema",
+          "match": "\\b(let|be|set|to|task|type|agent|state)\\b"
+        },
+        {
+          "name": "keyword.operator.word.synsema",
+          "match": "\\b(and|or|not|in|of|as|with)\\b"
+        },
+        {
+          "name": "keyword.control.security.synsema",
+          "match": "\\b(require|allow|deny|sandbox|intent|invariant|verify)\\b"
+        },
+        {
+          "name": "keyword.control.agent.synsema",
+          "match": "\\b(spawn|share|observe|signal|wait_for)\\b"
+        },
+        {
+          "name": "keyword.control.llm.synsema",
+          "match": "\\b(analyze|decide|reason|generate)\\b"
+        },
+        {
+          "name": "keyword.control.human.synsema",
+          "match": "\\b(approve|confirm|ask|show)\\b"
+        },
+        {
+          "name": "keyword.control.observe.synsema",
+          "match": "\\b(trace|log|measure|checkpoint)\\b"
+        },
+        {
+          "name": "keyword.control.serve.synsema",
+          "match": "\\b(serve|on|route|auth|requires|expect|max_body|max_streams|stream|send|static|cors|describe|private|from|domain|tls|redirect|proxy|host|paged|per|rate_limit|unlimited|none)\\b"
+        }
+      ]
+    },
+    "builtins": {
+      "name": "support.function.builtin.synsema",
+      "match": "\\b(print|text|length|append|range|contains|split|join|type_of|matches|find_all|capture|replace_re|fetch|read_file|write_file|http|http_get|http_post|sql|sql_exec|sql_tables|db_open|db_close|format_time|parse_time|date_parts|now|sleep|apply|where|reduce|collect|transform|sort_by|group_by|every|some|flatten|parallel_map|chunk|remember|recall|forget_memory|add_rule|check_rules|get_rules|memory_summary|create_progress|start_step|complete_step|fail_step|resume_point|progress_display|progress_percent|ok|created|not_found|fail|html|respond|render|page|heading|prose|list|ordered_list|link|image|section|code|raw|content)\\b(?=\\s*\\()"
+    },
+    "calls": {
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+      "name": "entity.name.function.call.synsema"
+    }
+  }
+}

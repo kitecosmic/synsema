@@ -1,0 +1,26 @@
+{
+  "comments": {
+    "lineComment": "--"
+  },
+  "brackets": [
+    ["{", "}"],
+    ["[", "]"],
+    ["(", ")"]
+  ],
+  "autoClosingPairs": [
+    { "open": "{", "close": "}" },
+    { "open": "[", "close": "]" },
+    { "open": "(", "close": ")" },
+    { "open": "\"", "close": "\"", "notIn": ["string"] }
+  ],
+  "surroundingPairs": [
+    ["{", "}"],
+    ["[", "]"],
+    ["(", ")"],
+    ["\"", "\""]
+  ],
+  "indentationRules": {
+    "increaseIndentPattern": "(:\\s*$)|\\b(task|type|agent|when|otherwise|each|while|repeat|match|is|try|recover|serve|route|stream|sandbox|trace|measure|describe|host)\\b.*$",
+    "decreaseIndentPattern": "^\\s*(otherwise|recover|end)\\b"
+  }
+}
