@@ -31,8 +31,5 @@ When automatic recovery fails:
 4. Decision is recorded for future precedent
 
 ## Decision persistence
-Past decisions are saved and consultable:
-```python
-protocol.find_precedent("RuntimeError", "inventory")
-# Returns: last time this error happened, human chose "skip"
-```
+Past decisions are recorded for precedent: the runtime can consult a prior human choice for the
+same error/context and apply it automatically instead of asking again.

@@ -2,9 +2,8 @@
 
 A native HTTP server with **zero dependencies**. Define routes in Synsema and the
 runtime enforces a consistent response contract, pagination, auth and input
-validation for you. The production build serves over Rust (`std::net` + tokio/
-hyper/rustls); the Python reference uses `http.server` and stays byte-identical
-for HTTP/1.1.
+validation for you. It runs on an async Rust stack (`tokio`/`hyper`/`rustls`) as a
+single static binary.
 
 > Start a server with **`synsema serve program.syn`**, not `synsema run`. `run`
 > executes a program once and a `serve on` block errors with *"serve is only
@@ -677,11 +676,10 @@ synsema serve store.syn    # serves and stays alive while the server runs; Ctrl+
 
 ---
 
-## Production web stack (Rust implementation)
+## Production web stack
 
-The Rust server (tokio/hyper/rustls) adds, natively, what you'd normally put Caddy/nginx
-in front for. These are Rust-only; the Python reference omits them. HTTP/1.1 responses
-stay byte-identical to the Python oracle — TLS/vhost/proxy/HTTP-2 are additive.
+The server (async `tokio`/`hyper`/`rustls`) adds, natively, what you'd normally put Caddy/nginx
+in front for: TLS, auto-HTTPS (ACME), virtual hosts, reverse proxy, HTTP/2.
 
 ### TLS / HTTPS
 

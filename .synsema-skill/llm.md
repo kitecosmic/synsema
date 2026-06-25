@@ -38,9 +38,7 @@ Every LLM call automatically receives:
 - Each retry includes feedback: "Your response was invalid because X"
 - After 3 failures, logs a warning and returns raw response
 
-## Programmatic setup
-```python
-from synsema.runtime.engine import SynsemaEngine
-engine = SynsemaEngine()
-engine.configure_llm_provider("anthropic", api_key="sk-...")
-```
+## Provider setup
+The LLM provider is selected/configured by the runtime (via the environment). Offline, the engine
+uses a built-in mock provider, so `reason`/`decide`/`analyze`/`generate` return descriptive
+placeholders and programs stay runnable without an API key.

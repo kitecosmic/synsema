@@ -55,9 +55,5 @@ When an error occurs, Synsema provides:
 4. Speculative alternatives (fork, try, pick best)
 5. Human escalation
 
-## Speculative execution
-```python
-# Fork: try multiple approaches, pick the best
-spec.fork(env, [approach_a, approach_b, approach_c])
-spec.choose_and_apply(env, results, best_index)
-```
+Auto-recovery (including speculative fork/try/pick-best) is an internal runtime strategy — there
+is no user-facing API to drive it; you get it via `try`/`recover` and the recovery protocol.

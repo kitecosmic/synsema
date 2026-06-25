@@ -1,62 +1,74 @@
 # Synsema Codebase Structure
 
+Synsema is a **Rust** language: a single static binary, one Cargo workspace. (The old
+`synsema/` Python tree is **frozen** and not the source of truth — ignore it; everything
+lives under `rust/`.)
+
 ```
-synsema/
-├── core/                      # START HERE for language internals
-│   ├── tokens.py              # 60+ token types, keyword map
-│   ├── lexer.py               # Source → tokens (significant whitespace)
-│   ├── ast_nodes.py           # 40+ AST node types = the grammar
-│   ├── parser.py              # Tokens → AST (recursive descent + Pratt)
-│   ├── interpreter.py         # AST → execution (tree-walking evaluator)
-│   ├── types.py               # SynValue, type constructors, BuiltinTask
-│   ├── ast_api.py             # Structural manipulation (find, rename, extract)
-│   ├── testgen.py             # Auto test generation from types
-│   ├── intentional_ops.py     # apply, where, reduce, sort_by, etc.
-│   ├── addressable.py         # Token-efficient code addressing
-│   └── flat_syntax.py         # .fsyn → .syn translator
-│
-├── capabilities/              # Security layer
-│   ├── model.py               # Capability, CapabilitySet, CapabilityViolation
-│   ├── enforcer.py            # SecureOperations (gates every I/O)
-│   ├── builtins.py            # fetch, read_file, write_file, run, etc.
-│   └── intent.py              # IntentEnforcer, parse_intent, freeze
-│
-├── runtime/                   # Execution engine
-│   ├── engine.py              # SynsemaEngine — the main entry point
-│   ├── speculative.py         # Fork/rollback/commit
-│   ├── error_reporter.py      # Rich diagnostics + suggestions
-│   └── recovery.py            # Retry/fallback/escalation protocol
-│
-├── agents/                    # Multi-agent system
-│   ├── blackboard.py          # Thread-safe shared state
-│   ├── swarm.py               # AgentSwarm manager
-│   ├── resource_lock.py       # Preventive locking
-│   ├── progress.py            # Task step tracking
-│   ├── memory.py              # AgentMemory + OwnerRule
-│   └── builtins.py            # remember, recall, check_rules, etc.
-│
-├── stdlib/                    # Zero-dependency standard library
-│   ├── http.py                # HTTP client (urllib): http, http_get, http_post...
-│   ├── server.py              # HTTP server: serve on PORT, routes, response contract
-│   ├── database.py            # SQLite: sql, sql_exec, db_open (thread-safe)
-│   └── cron.py                # Cron scheduler
-│
-├── human/                     # Human interaction
-│   └── interaction.py         # Terminal, Auto, Queue, Callback handlers
-│
-├── llm/                       # LLM integration
-│   ├── provider.py            # Anthropic, OpenAI, MiniMax, Ollama, Mock
-│   ├── context.py             # Context builder for enriched prompts
-│   └── validator.py           # Response validation + retry
-│
-├── cli.py                     # CLI entry point
-├── __main__.py                # python -m synsema
-└── __init__.py                # Version
+rust/
+├── Cargo.toml                       # workspace + pinned deps (all pure-Rust except bundled SQLite)
+└── crates/
+    ├── synsema-core/                # START HERE for language internals
+    │   └── src/
+    │       ├── tokens.rs            # token types + keyword map
+    │       ├── lexer.rs             # source → tokens (significant whitespace)
+    │       ├── ast.rs               # NodeKind = the grammar
+    │       ├── parser.rs            # tokens → AST (recursive descent + Pratt)
+    │       ├── interpreter.rs       # AST → execution (tree-walking) + builtins
+    │       ├── types.rs             # SynValue (incl. bytes/complex/array), constructors
+    │       ├── number.rs            # Int/Big/Float/Decimal tower (battle-tested; don't touch lightly)
+    │       ├── math.rs              # math lib (trig/exp/gamma/erf/…) — pure fns over Number
+    │       ├── arrays.rs            # numeric arrays + linear algebra (ndarray + faer)
+    │       ├── bytesutil.rs         # hex/base64 (hand-rolled, zero-dep)
+    │       ├── ast_api.rs           # structural manipulation (children, find, rename)
+    │       ├── addressable.rs       # token-efficient code addressing
+    │       ├── templates.rs         # SSR template engine (render)
+    │       ├── secret.rs            # opaque `secret` value (zeroize + constant-time eq)
+    │       └── flat_syntax.rs       # .fsyn → .syn translator
+    │
+    ├── synsema-capabilities/        # security layer (deny-by-default)
+    │   └── src/{model.rs, secure.rs, intent.rs}   # CapabilitySet; gated builtins; intent freeze
+    │
+    ├── synsema-runtime/             # execution engine (wires everything)
+    │   └── src/
+    │       ├── engine.rs            # run_source / Engine / swarm wiring (capability + sandbox hooks)
+    │       ├── serve.rs             # `serve on PORT`: per-request snapshot, state_*, routes
+    │       ├── parallel.rs          # parallel_map / chunk (tokio M:N executor)
+    │       ├── daemon.rs            # background process management
+    │       ├── persistence.rs       # cross-run state (memory/progress)
+    │       ├── recovery.rs          # retry/fallback/escalation
+    │       └── error_reporter.rs    # rich diagnostics + suggestions
+    │
+    ├── synsema-stdlib/              # standard library
+    │   └── src/
+    │       ├── http.rs              # HTTP client (std::net + rustls for https)
+    │       ├── server.rs            # async HTTP server (hyper/tokio): response contract, TLS, vhost, proxy
+    │       ├── database.rs          # SQLite (rusqlite, bundled)
+    │       ├── cron.rs              # cron scheduler
+    │       ├── secrets.rs           # env/secret/reveal/bearer + HMAC/sha hashing
+    │       ├── acme.rs              # auto-HTTPS (ACME, instant-acme)
+    │       └── mimetypes.rs         # static-file content types
+    │
+    ├── synsema-agents/              # multi-agent system
+    │   └── src/{blackboard.rs, swarm.rs, resource_lock.rs, progress.rs, memory.rs, builtins.rs}
+    │
+    ├── synsema-llm/                 # LLM + human interaction
+    │   └── src/{provider.rs, context.rs, validator.rs, human.rs}
+    │
+    └── synsema-cli/                 # the `synsema` binary
+        └── src/main.rs             # subcommands: run / check / test / serve / conform / repl / daemon
 ```
 
 ## Key entry points
-- **Run a program**: `SynsemaEngine.run_source()` in `runtime/engine.py`
-- **Parse code**: `parse()` in `core/parser.py`
-- **Add a builtin**: register in `core/interpreter.py._register_builtins()`
-- **Add a capability**: define in `capabilities/model.py`
-- **Add an LLM provider**: subclass `LLMProvider` in `llm/provider.py`
+- **Run a program**: `run_source()` in `synsema-runtime/src/engine.rs`.
+- **Parse code**: `parse_source()` in `synsema-core/src/parser.rs`.
+- **Add a pure builtin**: register in `synsema-core/src/interpreter.rs::register_builtins`.
+- **Add a capability-gated builtin**: `synsema-capabilities/src/secure.rs` (wired in `engine.rs`).
+- **Add a serve builtin**: `synsema-stdlib/src/server.rs` (or `serve.rs` for the per-request wiring).
+- **Add a capability type**: `synsema-capabilities/src/model.rs`.
+- **Add an LLM provider**: `LLMProvider` in `synsema-llm/src/provider.rs`.
+
+## Tests
+Per-crate Rust tests under `crates/*/tests/` and `#[cfg(test)]` modules. Run with
+`cargo test --workspace`. The semantic-invariant net lives in `synsema-core` (equality/order/
+coercion property tests). `.syn`-level self-tests use the native test framework (`synsema test`).
