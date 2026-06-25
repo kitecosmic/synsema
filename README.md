@@ -6,21 +6,21 @@ Synsema is not a framework or a library — it's a language where observability,
 
 ## Fast *and* secure
 
-Synsema is in the Go/Node performance tier — and adds deny-by-default security none of
-them have. HTTP throughput, same API, 100 concurrent connections:
+Synsema (Rust) **matches or beats Go** — and adds deny-by-default security none of the
+mainstream stacks have. HTTP throughput, same workload, 50 concurrent connections:
 
-| Stack | req/s | avg latency | p99 |
+| Endpoint | Synsema | Go (net/http) | |
 |---|---|---|---|
-| **Synsema** | **2,610** | **14.4 ms** | **50 ms** |
-| Node | 2,746 | 11.5 ms | 41 ms |
-| Go (net/http) | 2,522 | 16.5 ms | 58 ms |
-| FastAPI (uvicorn) | 1,744 | 51.3 ms | 79 ms |
+| `/plaintext` | **47.2k req/s** | 42.8k | beats Go |
+| `/health` | 38.7k req/s | 39.4k | ties (98%) |
+| `/json` | **41.8k req/s** | 40.7k | beats Go |
 
-Synsema, Node, and Go are effectively tied (run-to-run noise); Synsema is ~1.5× FastAPI
-under load. Unlike all of them, Synsema enforces **capability security at the language
-level** — no network, file, or DB access without an explicit `require`, route auth and input
-validation are declarative, and there's an automatic audit log. Security is a property of
-the language, not a discipline you have to remember.
+Synsema wins on plaintext and JSON and ties on health (run-to-run noise) — squarely in
+Go's tier and well above interpreted stacks like FastAPI. Unlike all of them, Synsema
+enforces **capability security at the language level** — no network, file, or DB access
+without an explicit `require`, route auth and input validation are declarative, and there's
+an automatic audit log. Security is a property of the language, not a discipline you have to
+remember.
 
 ## Install
 
