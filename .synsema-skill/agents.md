@@ -35,11 +35,24 @@ signal "result" with data        -- emit with data
 wait_for "done" as result        -- blocks until signal arrives, CONSUMES it
 ```
 
+**The channel name is an EXPRESSION** (not only a literal) — so you can have an independent
+channel **per job/worker** (push, not poll):
+```
+-- cancel a specific job by id (e.g. from a DELETE route)
+signal "cancel:" + text(job_id)
+
+-- the worker for that job waits on its OWN channel
+wait_for "cancel:" + text(job_id) as reason
+```
+With literal names all jobs share one namespace; with dynamic names each `job_id` is its own
+channel. (Per-job cancellation/coordination used to require polling blackboard keys — now it's a
+real push channel.)
+
 **Important semantics:**
 - Signals are a **queue**, not a latch. Each `wait_for` consumes one signal (pop).
 - A single `signal` does NOT wake N consumers reliably. For fan-out, emit N signals or use the blackboard.
 - `wait_for` returns `nothing` if **no agents are alive** that could emit the signal (prevents 30s hangs on dead agents).
-- Pattern for N workers: each worker writes to its own blackboard key; coordinator reads all keys.
+- Pattern for N workers: a dynamic channel per worker (`"work:" + text(id)`), or each worker writes to its own blackboard key and the coordinator reads all keys.
 
 ## Resource locking (preventive)
 Agents declare what they're working on BEFORE touching it:

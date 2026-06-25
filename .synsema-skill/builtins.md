@@ -19,6 +19,19 @@
 - `type_of(value)` → text ("number", "decimal", "complex", "text", "bytes", "bool", "list", "map", "array", "task", "nothing")
 - `slice(collection, start, end?)` → sub-collection (lists/text/`bytes`; Python-style negatives)
 - `length(x)` also works on `bytes` (byte count) and `array` (total elements). Indexing `x[i]` works on lists, maps, `bytes` (→ int 0–255) and `array` (→ row or scalar).
+- `raise(message)` → **always raises a runtime error** with `message` (coerced to text). Use it to fail deliberately, or to **re-propagate** a caught error inside `recover` (see below). `raise()` with no arg errors. (`fail(...)` is for HTTP responses, NOT for raising runtime errors.)
+
+## Error handling — `try` / `recover` / `raise`
+```
+try
+    risky()
+recover err
+    log "failed: " + err          -- err is the error message (text)
+    raise(err)                    -- RE-PROPAGATE so the caller/agent sees a real failure
+```
+Without `raise`, `recover` **swallows** the error (the task/agent ends normally — DONE). With
+`raise(err)`, the error propagates again (an agent ends in **ERROR**, not DONE). `give`/`stop` are
+not errors and pass through `try/recover` untouched.
 
 ## Strings
 - `fmt(template, map)` → interpolated text: `fmt("Hi {name}", {"name": "Alice"})` → `"Hi Alice"`

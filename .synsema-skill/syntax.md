@@ -127,6 +127,8 @@ recover err
     use_fallback()
 -- Catches all runtime errors. err contains the error message.
 -- give and stop propagate through try/recover (not caught).
+-- To RE-PROPAGATE a caught error (so the caller/agent sees a real failure), use raise(err)
+-- inside recover. Without it, recover swallows the error. See builtins.md (Error handling).
 
 intent: "description"               -- must be at top, freezes after
 invariant: condition                 -- checked at runtime
