@@ -40,12 +40,18 @@ const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
 /// Base-URL oficial de OpenAI (override por `SYNSEMA_LLM_BASE_URL` → modelos LOCALES
 /// OpenAI-compatibles, ej. `http://localhost:11434/v1` para Ollama).
 const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
+/// Base de MiniMax: su API **Anthropic-compatible** (mismo formato `/v1/messages` +
+/// `x-api-key`), por eso reusa el `AnthropicProvider`. Override por `SYNSEMA_LLM_BASE_URL`.
+const MINIMAX_DEFAULT_BASE: &str = "https://api.minimax.io/anthropic";
 
 /// Default de Anthropic: **Sonnet** (más barato) por seguridad de costo. Opus es
 /// opt-in vía `SYNSEMA_LLM_MODEL=claude-opus-4-8` — así nadie quema plata sin querer.
 pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 /// Default de OpenAI (configurable por `SYNSEMA_LLM_MODEL`; para local poné el tuyo).
 pub const OPENAI_DEFAULT_MODEL: &str = "gpt-4o";
+/// Default de MiniMax (configurable por `SYNSEMA_LLM_MODEL`): la serie M para razonamiento
+/// agéntico + tool use + long-context.
+pub const MINIMAX_DEFAULT_MODEL: &str = "MiniMax-M3";
 
 // =========================================================
 // Helpers puros compartidos
@@ -436,6 +442,15 @@ pub fn build_provider(
             max_tokens,
             base_url: base_url.unwrap_or_else(|| OPENAI_DEFAULT_BASE.to_string()),
         })),
+        // MiniMax expone una API Anthropic-compatible → reusa el AnthropicProvider
+        // (mismo `/v1/messages`, `x-api-key`, content blocks y `usage`), sólo cambia
+        // la base + el modelo + la key (`MINIMAX_API_KEY`).
+        "minimax" => Some(Arc::new(AnthropicProvider {
+            api_key,
+            model,
+            max_tokens,
+            base_url: base_url.unwrap_or_else(|| MINIMAX_DEFAULT_BASE.to_string()),
+        })),
         _ => None,
     }
 }
@@ -455,6 +470,8 @@ pub fn provider_from_env() -> Option<Arc<dyn LLMProvider>> {
                 "anthropic".to_string()
             } else if std::env::var("OPENAI_API_KEY").is_ok() {
                 "openai".to_string()
+            } else if std::env::var("MINIMAX_API_KEY").is_ok() {
+                "minimax".to_string()
             } else {
                 return None;
             }
@@ -463,6 +480,7 @@ pub fn provider_from_env() -> Option<Arc<dyn LLMProvider>> {
     let (key_var, default_model) = match provider.as_str() {
         "anthropic" | "claude" => ("ANTHROPIC_API_KEY", ANTHROPIC_DEFAULT_MODEL),
         "openai" | "gpt" => ("OPENAI_API_KEY", OPENAI_DEFAULT_MODEL),
+        "minimax" => ("MINIMAX_API_KEY", MINIMAX_DEFAULT_MODEL),
         _ => return None,
     };
     let api_key = std::env::var(key_var).ok()?;
@@ -717,6 +735,23 @@ mod tests {
     fn build_provider_openai_some() {
         let p = build_provider("openai", "k".to_string(), "m".to_string(), 4096, None).unwrap();
         assert!(p.name().contains("openai"), "name: {}", p.name());
+    }
+
+    #[test]
+    fn build_provider_minimax_some() {
+        // MiniMax reusa el AnthropicProvider (API Anthropic-compatible); el modelo
+        // queda en el name → identificable.
+        let p =
+            build_provider("minimax", "k".to_string(), "MiniMax-M3".to_string(), 4096, None).unwrap();
+        assert!(p.name().contains("MiniMax-M3"), "name: {}", p.name());
+    }
+
+    #[test]
+    fn minimax_anthropic_compatible_endpoint() {
+        assert_eq!(
+            anthropic_endpoint(MINIMAX_DEFAULT_BASE),
+            "https://api.minimax.io/anthropic/v1/messages"
+        );
     }
 
     #[test]

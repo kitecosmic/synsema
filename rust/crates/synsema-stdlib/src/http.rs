@@ -160,14 +160,26 @@ fn do_request(
             .map_err(|e| e.to_string())?;
         let mut stream = rustls::StreamOwned::new(conn, tcp);
         stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
-        stream.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+        read_to_end_tolerant(&mut stream, &mut buf)?;
     } else {
         let mut stream = tcp;
         stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
-        stream.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+        read_to_end_tolerant(&mut stream, &mut buf)?;
     }
 
     parse_response(&buf)
+}
+
+/// Lee hasta EOF tolerando el cierre sin `close_notify`. rustls es estricto: si el peer
+/// cierra el TLS sin el alert `close_notify` (común en muchos servidores/LBs, p.ej.
+/// MiniMax) devuelve `UnexpectedEof` — pero con `Connection: close` los bytes recibidos
+/// ya son la respuesta completa. Sólo es error real si NO se recibió nada.
+fn read_to_end_tolerant<R: Read>(stream: &mut R, buf: &mut Vec<u8>) -> Result<(), String> {
+    match stream.read_to_end(buf) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof && !buf.is_empty() => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn parse_response(buf: &[u8]) -> Result<HttpResult, String> {
