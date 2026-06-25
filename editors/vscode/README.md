@@ -14,13 +14,26 @@ extension, all of them) — no editor fork needed.
 
 ## Install
 
-### From source (until published)
+### From a release — no clone needed (recommended)
+
+Download the packaged `.vsix` from GitHub Releases and install it directly — you don't
+need to check out the repo:
+
+```bash
+curl -L -o synsema.vsix https://github.com/kitecosmic/synsema/releases/latest/download/synsema-vscode.vsix
+code --install-extension synsema.vsix      # or: cursor / windsurf --install-extension
+```
+
+(Or download the `.vsix` from the [Releases page](https://github.com/kitecosmic/synsema/releases)
+and use **Extensions → … → Install from VSIX…** in the editor UI.)
+
+### From source (build it yourself)
 
 ```bash
 cd editors/vscode
 npm install -g @vscode/vsce      # one time
-vsce package                     # produces synsema-0.1.0.vsix
-code --install-extension synsema-0.1.0.vsix   # or: cursor / windsurf --install-extension
+vsce package                     # produces synsema-<version>.vsix
+code --install-extension synsema-*.vsix   # or: cursor / windsurf --install-extension
 ```
 
 Or, for quick local use, copy this folder to your editor's extensions dir

@@ -13,6 +13,9 @@ build/
 target/
 **/*.rs.bk
 
+# Paquetes de la extensión de editor (build artifact de vsce)
+*.vsix
+
 # Privado — herramienta de testing interna (oráculo Python + harness differential).
 # Se usa localmente; no va al repo público. (Los docs de proceso viven fuera del repo.)
 conformance/

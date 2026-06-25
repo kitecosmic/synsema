@@ -1,4 +1,5 @@
 {
+  "$schema": "https://json.schemastore.org/language-configuration.json",
   "comments": {
     "lineComment": "--"
   },
