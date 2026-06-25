@@ -18,6 +18,9 @@ conformance/
 # Specs de implementación / docs de proceso: viven localmente, NO van al repo público.
 specs/
 
+# Arena de benchmark: comparativas locales (vs Go/Node/etc.), NO va al repo público.
+synsema-arena/
+
 # Estado/persistencia y daemons de runtime (fuera del repo, defensivo)
 .synsema/
 
