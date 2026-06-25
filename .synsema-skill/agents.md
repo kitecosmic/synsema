@@ -32,8 +32,13 @@ The blackboard is thread-safe, versioned, and watchable.
 ```
 signal "done"                    -- emit a signal
 signal "result" with data        -- emit with data
-wait_for "done" as result        -- blocks until signal arrives, CONSUMES it
+wait_for "done" as result        -- blocks until signal arrives, CONSUMES it (default 30s)
+wait_for "done" timeout 2 as r   -- block at most 2 seconds, then `nothing`
+wait_for "done" timeout 0.5      -- sub-second; `timeout 0` = immediate check
 ```
+Syntax: `wait_for <channel> [timeout <seconds>] [as <var>]`. The `timeout` (a number of seconds,
+int/float, clamped to 0–3600) bounds how long the wait blocks — IMPORTANT in a route handler so a
+request doesn't hang the default 30s when the emitter never signals. A non-number timeout errors.
 
 **The channel name is an EXPRESSION** (not only a literal) — so you can have an independent
 channel **per job/worker** (push, not poll):
@@ -51,7 +56,7 @@ real push channel.)
 **Important semantics:**
 - Signals are a **queue**, not a latch. Each `wait_for` consumes one signal (pop).
 - A single `signal` does NOT wake N consumers reliably. For fan-out, emit N signals or use the blackboard.
-- `wait_for` returns `nothing` if **no agents are alive** that could emit the signal (prevents 30s hangs on dead agents).
+- `wait_for` returns `nothing` if **no agents are alive** that could emit, or when the `timeout` elapses. Default is 30s — set `timeout <secs>` to bound it (e.g. in HTTP route handlers, to avoid hanging requests / exhausting threads).
 - Pattern for N workers: a dynamic channel per worker (`"work:" + text(id)`), or each worker writes to its own blackboard key and the coordinator reads all keys.
 
 ## Resource locking (preventive)

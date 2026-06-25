@@ -99,6 +99,7 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 | `assert_error(() => give 5)` passes | A `give` is not an error → it **fails** | `assert_error` passes only if the function raises a runtime error |
 | `try/recover` lets the error bubble up | `recover` **swallows** it — the task/agent ends normally (DONE) | To re-propagate, call `raise(err)` inside `recover` (agent ends ERROR). `fail()` is HTTP-only, not for this. |
 | `signal "x:" + text(id)` must be a literal | The channel name is an **expression** — dynamic names work | Use `signal`/`wait_for` with a computed name for per-job channels (see agents.md) |
+| A route's `wait_for` hangs the request 30s when no signal comes | That's the **default** timeout | Set it: `wait_for "x" timeout 2 as r` (seconds, 0–3600). Bounds the wait so requests don't pile up. |
 
 ## Behavioral surprises
 
