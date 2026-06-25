@@ -441,14 +441,17 @@ Automatically generates edge-case tests from your types and task signatures:
 
 ## Tests
 
-A 329-test conformance corpus plus unit and integration tests:
+A conformance corpus plus unit and integration tests, all in Rust:
 
 ```bash
 cargo test --manifest-path rust/Cargo.toml --workspace
 ```
 
-A second reference interpreter (`synsema/`, Python) runs the same corpus and acts as the
-conformance oracle: `PYTHONPATH=. python3 tests/test_core.py` (and the other 9 test files).
+Language-level `.syn` tests (using `assert` / `test "..."`) run with the binary:
+
+```bash
+synsema test tests/        # runs tests/*.test.syn
+```
 
 ## Architecture
 
@@ -509,6 +512,18 @@ rust/crates/
 
 The interpreter is **synchronous**; concurrency (`parallel_map`) and the web server are
 async layers around it. `spawn` agents use OS threads.
+
+## Editor support (syntax highlighting)
+
+A VS Code–family extension highlights `.syn` / `.fsyn` (works in VS Code, Cursor, Windsurf,
+VSCodium). Install it **without cloning the repo**:
+
+```bash
+curl -L -o synsema.vsix https://github.com/kitecosmic/synsema/releases/latest/download/synsema-vscode.vsix
+code --install-extension synsema.vsix      # or: cursor / windsurf --install-extension
+```
+
+Source and details: [`editors/vscode/`](editors/vscode/README.md).
 
 ## AI Skill (for Claude Code, Codex, etc.)
 
