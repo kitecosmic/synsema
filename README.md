@@ -524,10 +524,9 @@ cd synsema && bash install-skill.sh
 curl -s https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash
 ```
 
-Then add to your `CLAUDE.md`:
-```
-For Synsema development, read ~/.claude/skills/synsema/INDEX.md
-```
+That's it — Claude Code auto-detects the skill via its `SKILL.md` frontmatter. No
+`CLAUDE.md` edit needed: just open a `.syn`/`.fsyn` file or type `/synsema`, and the
+relevant reference sections load on demand.
 
 ### Skill index
 
