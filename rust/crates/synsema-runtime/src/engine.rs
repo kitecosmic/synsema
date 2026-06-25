@@ -18,6 +18,11 @@ use std::time::Duration;
 use synsema_llm::human::{AutoHandler, InteractionManager};
 use synsema_llm::provider::{LLMProvider, LLMRequest, MockProvider};
 
+// Re-export de los tipos del provider tool-aware (FASE 1): los usa este módulo y, a
+// la vez, los expone para que los tests de integración guionen pasos sin depender
+// directo de `synsema-llm`.
+pub use synsema_llm::provider::{LlmStep, LlmStepResponse, ToolSpec};
+
 use synsema_agents::builtins::register_agent_builtins;
 use synsema_agents::memory::AgentMemory;
 use synsema_agents::progress::ProgressManager;
@@ -27,7 +32,9 @@ use synsema_capabilities::model::{
 };
 use synsema_capabilities::secure::register_secure_builtins;
 use synsema_core::ast::Node;
-use synsema_core::interpreter::{Control, Interpreter, RunResult, SwarmHooks, TestOutcome};
+use synsema_core::interpreter::{
+    Control, Interpreter, RunResult, StepCatalogEntry, StepResult, SwarmHooks, TestOutcome,
+};
 use synsema_core::parser::{parse_source, CompileError};
 use synsema_core::types::{from_send, to_send, SendValue, SynValue};
 use crate::serve::{val_to_global, rebuild_globals, GlobalVal};
@@ -127,6 +134,41 @@ pub(crate) fn wire_common_with_state(
             let p = cs.parent.take();
             saved.borrow_mut().push((g, d, p));
         } else if let Some((g, d, p)) = saved.borrow_mut().pop() {
+            cs.granted = g;
+            cs.denied = d;
+            cs.parent = p;
+        }
+    }));
+    // Aislamiento por-tool (least-privilege): cuando el loop despacha una tool con
+    // `call_tool`, restringe el CapabilitySet a las caps DECLARADAS por la tool que el
+    // agente YA tenía (∩ agente, SIN heredar el padre). Reusa el patrón save/restore del
+    // sandbox-hook (stack para tools anidadas). Hace ENFORCED el `require` por-tool: una
+    // tool no puede usar una capability que no declaró, aunque el agente la tenga.
+    #[allow(clippy::type_complexity)]
+    let saved_tool: Rc<RefCell<Vec<(HashSet<Capability>, HashSet<Capability>, Option<Rc<RefCell<CapabilitySet>>>)>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    let caps_tool = caps.clone();
+    interp.set_tool_scope_hook(Rc::new(move |entering, declared: &[(String, Option<String>)]| {
+        let mut cs = caps_tool.borrow_mut();
+        if entering {
+            // Las declaradas que el set ACTUAL (efectivo, incl. padre) ya satisface → la
+            // tool no puede exceder al agente. `check` audita y camina la cadena de padres.
+            let mut allowed: HashSet<Capability> = HashSet::new();
+            for (name, scope) in declared {
+                if let Some(ty) = capability_type_from_name(name) {
+                    let cap = Capability::new(ty, scope.clone());
+                    if cs.check(&cap, "tool-scope") {
+                        allowed.insert(cap);
+                    }
+                }
+            }
+            // Guardar y REEMPLAZAR por sólo las permitidas, SIN padre → la tool no hereda
+            // caps no declaradas (aunque el agente las tenga).
+            let g = std::mem::replace(&mut cs.granted, allowed);
+            let d = std::mem::take(&mut cs.denied);
+            let p = cs.parent.take();
+            saved_tool.borrow_mut().push((g, d, p));
+        } else if let Some((g, d, p)) = saved_tool.borrow_mut().pop() {
             cs.granted = g;
             cs.denied = d;
             cs.parent = p;
@@ -455,6 +497,49 @@ pub fn run_with_llm(source: &str, filename: &str, responses: HashMap<String, Str
             run_configured(&src, &fname, move |interp| {
                 let provider = Arc::new(MockProvider::new(responses));
                 interp.set_llm_callback(Rc::new(move |op: &str| provider.call(&LLMRequest::new(op)).content));
+            })
+        })
+        .expect("hilo del motor")
+        .join()
+        .unwrap_or_else(|_| RunResult { success: false, output: Vec::new(), errors: vec!["el motor abortó".to_string()] })
+}
+
+/// Corre con un proveedor LLM tool-aware GUIONADO (host-config, FASE 1): cablea
+/// `llm_step` a un `MockProvider::scripted` determinista (sin red). Espejo de
+/// `run_with_llm`. Para los tests del loop seguro en-lenguaje. Camino no-secure: la
+/// capability `llm` se auto-concede (igual que `run`); en secure/serve hay que
+/// declarar `require llm`.
+pub fn run_with_llm_steps(source: &str, filename: &str, steps: Vec<LlmStepResponse>) -> RunResult {
+    let src = source.to_string();
+    let fname = filename.to_string();
+    std::thread::Builder::new()
+        .stack_size(INTERP_STACK_SIZE)
+        .spawn(move || {
+            run_configured(&src, &fname, move |interp| {
+                let provider = Arc::new(MockProvider::scripted(steps));
+                interp.set_llm_step_callback(Rc::new(
+                    move |prompt: &str, catalog: &[StepCatalogEntry], context: &str| {
+                        let mut req = LLMRequest::new("step").with_tools(
+                            catalog
+                                .iter()
+                                .map(|e| ToolSpec {
+                                    name: e.name.clone(),
+                                    description: e.description.clone(),
+                                    params: e.params.clone(),
+                                })
+                                .collect(),
+                        );
+                        req.data.insert("prompt".to_string(), prompt.to_string());
+                        req.data.insert("context".to_string(), context.to_string());
+                        let r = provider.call_step(&req);
+                        match r.step {
+                            LlmStep::Final(t) => StepResult::Final { text: t, tokens: r.tokens_used },
+                            LlmStep::ToolCall { name, args } => {
+                                StepResult::Tool { name, args, tokens: r.tokens_used }
+                            }
+                        }
+                    },
+                ));
             })
         })
         .expect("hilo del motor")

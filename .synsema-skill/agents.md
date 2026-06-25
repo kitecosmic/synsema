@@ -1,5 +1,10 @@
 # Synsema Multi-Agent System
 
+> **LLM tool-calling agents** (a model that picks tools in a loop) are built from the `llm_step` +
+> `call_tool` primitives plus an in-language allow-list — see the safe loop in
+> [llm.md](llm.md#safe-tool-calling-llm_step--call_tool). The `agent`/`spawn` system below is the
+> *concurrency* layer (real threads + blackboard); the two compose.
+
 ## Agent definition
 Defining an agent **registers** it. The body does NOT run until spawned.
 ```

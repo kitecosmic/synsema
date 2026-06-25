@@ -207,6 +207,37 @@ pub type GrantHook = Rc<dyn Fn(&str, Option<&str>)>;
 /// Maneja sandboxes anidados (stack en el closure).
 pub type SandboxHook = Rc<dyn Fn(bool)>;
 
+// --- FASE 1 tool-calling: el callback de paso del LLM (tipos PLANOS) ---
+// Core NO depende de `synsema-llm` (la dep va al revés vía runtime). Igual que
+// `llm_callback`, el motor cablea este callback con el provider real; core sólo
+// conoce estos tipos planos (sin `ToolSpec`/`LlmStep` de llm).
+
+/// Entrada del catálogo que el builtin `llm_step` pasa al callback.
+#[derive(Clone, Debug)]
+pub struct StepCatalogEntry {
+    pub name: String,
+    pub description: String,
+    pub params: Vec<String>,
+}
+
+/// Resultado que el callback de paso devuelve al builtin `llm_step`.
+pub enum StepResult {
+    Final { text: String, tokens: u64 },
+    Tool { name: String, args: Vec<(String, String)>, tokens: u64 },
+}
+
+/// Callback de paso del LLM: `(prompt, catalog, context) -> StepResult`. Lo cablea el
+/// motor con el provider tool-aware; sin él, `llm_step` devuelve un placeholder.
+pub type LlmStepCallback =
+    Rc<dyn Fn(&str, &[StepCatalogEntry], &str) -> StepResult>;
+
+/// Hook de aislamiento por-TOOL (least-privilege). Lo cablea el motor con el
+/// `CapabilitySet`. `(true, declared)` al entrar: restringe las caps a las DECLARADAS
+/// por la tool que el agente ya tenía (∩ agente, SIN heredar el resto del padre) → el
+/// `require` por-tool queda ENFORCED, no metadata. `(false, &[])` al salir (restaura,
+/// con stack para tools anidadas). Sin él: las tools corren con las caps ambientes.
+pub type ToolScopeHook = Rc<dyn Fn(bool, &[(String, Option<String>)])>;
+
 /// Hook que el host (motor) cablea para ejecutar un bloque `serve on PORT { … }`:
 /// construye el `ServeRuntime`, bindea el puerto y lanza el servidor. Vive fuera de
 /// core (en el motor + stdlib) para evitar el ciclo de deps. Recibe el `&mut`
@@ -247,6 +278,14 @@ pub struct Interpreter {
     /// dentro de un sandbox es no-op (no se puede re-grantear para escapar).
     sandbox_depth: u32,
     sandbox_hook: Option<SandboxHook>,
+    /// Hook de aislamiento por-tool (least-privilege en `call_tool`). Lo instala el
+    /// motor con el CapabilitySet. Sin él: las tools corren con las caps ambientes.
+    tool_scope_hook: Option<ToolScopeHook>,
+    /// Profundidad de `call_tool` (>0 = ejecutando el cuerpo de una tool con
+    /// least-privilege). Un `require` ANIDADO en ese cuerpo (bajo when/if/while, que NO
+    /// se extrae a `required_capabilities`) es no-op acá → no puede auto-concederse una
+    /// cap para escapar del scope. Espejo de `sandbox_depth`.
+    tool_scope_depth: u32,
     /// Intent declarado (descriptivo). El texto no gatea nada.
     intent: Option<String>,
     /// True una vez congelado el intent (tras el preámbulo) — anti prompt-injection.
@@ -259,6 +298,9 @@ pub struct Interpreter {
     /// Callback LLM (reason/decide/analyze/generate): operación → contenido.
     /// Sin él: placeholders descriptivos.
     llm_callback: Option<Rc<dyn Fn(&str) -> String>>,
+    /// Callback LLM tool-aware de PASO (`llm_step`, FASE 1): el motor lo cablea con el
+    /// provider guionable/real. Sin él: `llm_step` devuelve un placeholder seguro.
+    llm_step_callback: Option<LlmStepCallback>,
     /// Gate de capability para las ops LLM: lo cablea el motor para exigir
     /// `require llm` antes de CUALQUIER op LLM (provider real o placeholder).
     /// `Err(msg)` → la op falla con `Capability not granted: llm`. Sin él: sin gate
@@ -318,11 +360,14 @@ impl Interpreter {
             grant_hook: None,
             sandbox_depth: 0,
             sandbox_hook: None,
+            tool_scope_hook: None,
+            tool_scope_depth: 0,
             intent: None,
             intent_frozen: false,
             swarm_hooks: None,
             human_callback: None,
             llm_callback: None,
+            llm_step_callback: None,
             llm_cap_hook: None,
             serve_hook: None,
             stream_emit: None,
@@ -361,9 +406,20 @@ impl Interpreter {
         self.sandbox_hook = Some(hook);
     }
 
+    /// Cablea el hook de aislamiento por-tool (least-privilege en `call_tool`).
+    pub fn set_tool_scope_hook(&mut self, hook: ToolScopeHook) {
+        self.tool_scope_hook = Some(hook);
+    }
+
     /// ¿Estamos dentro de un bloque `sandbox`? (capabilities denegadas).
     pub fn in_sandbox(&self) -> bool {
         self.sandbox_depth > 0
+    }
+
+    /// ¿Estamos ejecutando el cuerpo de una tool bajo `call_tool` (least-privilege)? Un
+    /// `require` anidado ahí es no-op (no puede auto-concederse caps para escapar).
+    pub fn in_tool_scope(&self) -> bool {
+        self.tool_scope_depth > 0
     }
 
     /// Congela el intent: re-declararlo después es error (anti prompt-injection).
@@ -384,6 +440,11 @@ impl Interpreter {
     /// Cablea el callback LLM (reason/decide/analyze/generate).
     pub fn set_llm_callback(&mut self, cb: Rc<dyn Fn(&str) -> String>) {
         self.llm_callback = Some(cb);
+    }
+
+    /// Cablea el callback LLM tool-aware de paso (`llm_step`, FASE 1).
+    pub fn set_llm_step_callback(&mut self, cb: LlmStepCallback) {
+        self.llm_step_callback = Some(cb);
     }
 
     /// Cablea el gate de capability para las ops LLM (exige `require llm`).
@@ -608,6 +669,17 @@ impl Interpreter {
         self.register("render", -1, Rc::new(|i, a, l| i.b_render(a, l)));
         // Operaciones intencionales
         self.register("apply", 2, Rc::new(|i, a, l| i.b_apply(a, l)));
+        // call(task, args_map) — despacha una task con args NOMBRADOS desde un map
+        // (FASE 1 tool-calling). Reusa el binding por nombre de `call_value_named`.
+        // `apply` (map sobre lista) queda intacto.
+        self.register("call", 2, Rc::new(|i, a, l| i.b_call(a, l)));
+        // call_tool(task, args_map) — despacha una task COMO TOOL: igual que `call`
+        // pero con least-privilege (caps restringidas a las DECLARADAS por la tool ∩
+        // las del agente). El dispatch del loop de agente usa ESTE, no `call`.
+        self.register("call_tool", 2, Rc::new(|i, a, l| i.b_call_tool(a, l)));
+        // llm_step(prompt, catalog, context) — un PASO del LLM tool-aware (FASE 1):
+        // devuelve un map {kind, …}. Gateado por la capability `llm` (reusa el hook).
+        self.register("llm_step", 3, Rc::new(|i, a, l| i.b_llm_step(a, l)));
         self.register("where", 2, Rc::new(|i, a, l| i.b_where(a, l)));
         self.register("collect", 2, Rc::new(|i, a, l| i.b_collect(a, l)));
         self.register("transform", -1, Rc::new(|i, a, l| i.b_transform(a, l)));
@@ -1615,9 +1687,12 @@ impl Interpreter {
                     Some(s) => Some(self.exec(s, env)?.to_string()),
                     None => None,
                 };
-                // Dentro de un `sandbox` NO se conceden capabilities: un `require` ahí
-                // es no-op (si no, se podría re-grantear para escapar del aislamiento).
-                if !self.in_sandbox() {
+                // Dentro de un `sandbox` o del cuerpo de una tool (`call_tool`) NO se
+                // conceden capabilities: un `require` ahí es no-op. Si no, se podría
+                // re-grantear para escapar del aislamiento / del least-privilege por-tool
+                // (un `require` anidado bajo when/if no se extrae a required_capabilities,
+                // así que llega acá en runtime).
+                if !self.in_sandbox() && !self.in_tool_scope() {
                     if let Some(hook) = self.grant_hook.clone() {
                         hook(capability, scope_val.as_deref());
                     }
@@ -2761,6 +2836,91 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         Ok(syn_list(out))
     }
 
+    /// `call(task, args_map)` — despacha `task` con args nombrados tomados del map
+    /// (clave→param). `call(task, nothing)` → sin args. Delega en `call_value_named`
+    /// (binding + defaults + give-unwrap ya existentes). NO toca `apply`.
+    fn b_call(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        let func = nth(args, 0)?.clone();
+        let named: Vec<(Option<String>, SynValue)> = match nth(args, 1)? {
+            SynValue::Map(m) => {
+                m.borrow().iter().map(|(k, v)| (Some(k.clone()), v.clone())).collect()
+            }
+            SynValue::Nothing => Vec::new(),
+            other => {
+                return Err(err_at(
+                    format!("call expects a map of named args, got {}", other.type_name()),
+                    loc,
+                ))
+            }
+        };
+        self.call_value_named(func, named, loc)
+    }
+
+    /// `call_tool(task, args_map)` — despacha `task` COMO TOOL: igual que `call`, pero
+    /// corre su cuerpo con LEAST-PRIVILEGE. El `CapabilitySet` queda restringido a las
+    /// caps que la tool DECLARÓ (su `require` por-tool) ∩ las que el agente ya tenía,
+    /// SIN heredar el resto → el `require` por-tool pasa a estar ENFORCED por el
+    /// lenguaje (no es metadata). Restaura SIEMPRE (también si la tool falla). Sin
+    /// `tool_scope_hook` cableado → corre con las caps ambientes (no-op).
+    fn b_call_tool(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        let func = nth(args, 0)?.clone();
+        let named: Vec<(Option<String>, SynValue)> = match nth(args, 1)? {
+            SynValue::Map(m) => {
+                m.borrow().iter().map(|(k, v)| (Some(k.clone()), v.clone())).collect()
+            }
+            SynValue::Nothing => Vec::new(),
+            other => {
+                return Err(err_at(
+                    format!("call_tool expects a map of named args, got {}", other.type_name()),
+                    loc,
+                ))
+            }
+        };
+        // Las caps que la tool declaró (vacío si no es una task o no declara ninguna).
+        let declared: Vec<(String, Option<String>)> = match &func {
+            SynValue::Task(t) => t.required_capabilities.clone(),
+            _ => Vec::new(),
+        };
+        // Entrar al scope restringido y SIEMPRE restaurar (incluido el camino de error,
+        // por eso no se usa `?` sobre el resultado del cuerpo).
+        if let Some(hook) = self.tool_scope_hook.clone() {
+            hook(true, &declared);
+        }
+        // Marca el scope para que un `require` ANIDADO en el cuerpo (no extraído a
+        // required_capabilities) sea no-op y no pueda auto-concederse caps (espejo del
+        // sandbox). Decremento garantizado (también si el cuerpo falla).
+        self.tool_scope_depth += 1;
+        let result = self.call_value_named(func, named, loc);
+        self.tool_scope_depth -= 1;
+        if let Some(hook) = self.tool_scope_hook.clone() {
+            hook(false, &[]);
+        }
+        result
+    }
+
+    /// `llm_step(prompt, catalog, context)` — un paso del LLM tool-aware (FASE 1).
+    /// GATEADO por la capability `llm` (reusa `check_llm_cap`). Parsea el catálogo
+    /// (lista de maps `{name, describe/description, params}`), llama el callback de
+    /// paso (o un placeholder si no hay provider cableado) y devuelve un map
+    /// `{kind:"final", text, tokens}` | `{kind:"tool", name, args:{…}, tokens}`.
+    fn b_llm_step(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        self.check_llm_cap()?; // GATE por `llm` (mismo hook que reason/decide/…)
+        let prompt = raw_str(nth(args, 0)?);
+        let catalog = parse_catalog(args.get(1));
+        let context = match args.get(2) {
+            Some(SynValue::Text(s)) => s.to_string(),
+            Some(SynValue::Nothing) | None => String::new(),
+            Some(v) => v.to_string(),
+        };
+        let result = match &self.llm_step_callback {
+            Some(cb) => cb(&prompt, &catalog, &context),
+            // Sin provider cableado (camino `run` normal): placeholder seguro. El
+            // programa decide qué hacer; no inventa tool-calls.
+            None => StepResult::Final { text: "[no llm provider]".to_string(), tokens: 0 },
+        };
+        Ok(step_result_to_synvalue(result))
+    }
+
     fn b_where(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         let items = self.list_arg(nth(args, 0)?, "where")?;
         let pred = nth(args, 1)?.clone();
@@ -2925,6 +3085,69 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 
 fn nth(args: &[SynValue], i: usize) -> Result<&SynValue, Control> {
     args.get(i).ok_or_else(|| err("missing argument"))
+}
+
+/// Parsea el catálogo de tools que el programa pasa a `llm_step`: una lista de maps
+/// `{name, describe|description, params}`. Items mal formados (sin `name` texto) se
+/// saltan (robustez ante data del programa; no se inventa una tool sin nombre).
+fn parse_catalog(arg: Option<&SynValue>) -> Vec<StepCatalogEntry> {
+    let list = match arg {
+        Some(SynValue::List(l)) => l,
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for item in list.borrow().iter() {
+        let m = match item {
+            SynValue::Map(m) => m,
+            _ => continue,
+        };
+        let m = m.borrow();
+        let name = match m.get("name") {
+            Some(SynValue::Text(s)) => s.to_string(),
+            _ => continue, // sin `name` texto → item inválido, se salta
+        };
+        let description = match m.get("describe").or_else(|| m.get("description")) {
+            Some(SynValue::Text(s)) => s.to_string(),
+            _ => String::new(),
+        };
+        let params = match m.get("params") {
+            Some(SynValue::List(pl)) => pl
+                .borrow()
+                .iter()
+                .filter_map(|p| match p {
+                    SynValue::Text(s) => Some(s.to_string()),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        out.push(StepCatalogEntry { name, description, params });
+    }
+    out
+}
+
+/// Convierte el `StepResult` del callback al map `{kind, …}` que consume el programa:
+/// `{kind:"final", text, tokens}` | `{kind:"tool", name, args:{…}, tokens}`.
+fn step_result_to_synvalue(result: StepResult) -> SynValue {
+    let mut map = IndexMap::new();
+    match result {
+        StepResult::Final { text, tokens } => {
+            map.insert("kind".to_string(), syn_text("final"));
+            map.insert("text".to_string(), syn_text(text));
+            map.insert("tokens".to_string(), syn_int(tokens as i64));
+        }
+        StepResult::Tool { name, args, tokens } => {
+            let mut amap = IndexMap::new();
+            for (k, v) in args {
+                amap.insert(k, syn_text(v));
+            }
+            map.insert("kind".to_string(), syn_text("tool"));
+            map.insert("name".to_string(), syn_text(name));
+            map.insert("args".to_string(), syn_map(amap));
+            map.insert("tokens".to_string(), syn_int(tokens as i64));
+        }
+    }
+    syn_map(map)
 }
 
 /// Coerciona un valor a `Complex64` para la aritmética complex (Batch 4): `Complex(z)→z`;

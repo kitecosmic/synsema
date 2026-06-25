@@ -30,8 +30,8 @@ require db("./store.db")            -- open this SQLite database
 
 ## The `llm` capability
 
-The LLM operations — `reason`, `decide`, `analyze`, `generate` — are gated like every other
-side-effecting operation. They require the `llm` capability:
+The LLM operations — `reason`, `decide`, `analyze`, `generate` — and the tool-calling primitive
+`llm_step` are gated like every other side-effecting operation. They require the `llm` capability:
 
 ```
 require llm
@@ -44,6 +44,11 @@ let summary be generate "a summary" given report
   exactly like `stdout` and `time` — so quick scripts don't need to declare it.
 - Inside a `sandbox` the capability is stripped like any other: an LLM op inside a `sandbox` is
   **denied** even if it was granted outside.
+
+For agent tool-calling, `llm` only gates the *decision* (`llm_step`); dispatch each chosen tool with
+`call_tool`, which runs it under **only its declared capabilities** (∩ the program's) — see
+[Per-tool least-privilege](#per-tool-least-privilege-call_tool) below and the safe loop in
+[llm.md](llm.md).
 
 ## Intent (descriptive)
 
@@ -64,20 +69,30 @@ To restrict what the program can do, use `require` with precise scopes. Anything
 
 > Earlier versions tried to infer allowed action categories by scanning the intent prose for verb keywords, with a permissive fallback when nothing matched. That was unpredictable and language-dependent, so it was removed. Use `require` to declare permissions.
 
-## Per-task sandboxing
+## Per-tool least-privilege (`call_tool`)
 
-Tasks with `require` run in an **isolated capability sandbox**:
+A plain task call runs with the program's **ambient** capabilities — a task's own `require` lines are
+declarations, not an automatic sandbox. To run a task under **least-privilege** (e.g. dispatching a
+model-chosen tool), use `call_tool`:
 
 ```
 task fetch_orders()
-    require net("api.shop.com")
+    require net("api.shop.com")          -- the tool's declared capability
     give fetch("https://api.shop.com/orders")
+
+let result be call_tool(fetch_orders, nothing)
 ```
 
-- The task can ONLY access `api.shop.com`, even if the program has broader `net` capabilities.
-- The sandbox is created when the task is called and destroyed when it returns.
-- Capabilities granted inside a task do NOT leak to the global scope.
-- The task still has `stdout` and `time` by default.
+- Under `call_tool` the task runs with ONLY the capabilities it declared (its top-level `require`)
+  **intersected** with the program's: it cannot use a capability it did not declare, even if the
+  program granted it, and it cannot exceed the program.
+- The restricted scope is created when `call_tool` dispatches and restored when it returns (also on
+  error); nested calls keep the restriction.
+- A `require` **nested** inside the tool body (under `when`/`if`/…) is a **no-op** — a tool cannot
+  self-grant a capability to escape its scope.
+- `print` and pure computation always work; declare `time`/`random`/etc. to use them.
+
+Plain `call`/normal invocation does NOT isolate — use `call_tool` for untrusted, model-chosen tools.
 
 ## Sandbox blocks
 ```
@@ -108,7 +123,7 @@ Shows every capability check: what was requested, granted or denied, and why.
 ## Capability scoping rules
 - `deny` overrides `grant`
 - Sandbox does NOT inherit parent capabilities
-- Per-task `require` creates an isolated scope
+- `call_tool` runs a task with ONLY its declared capabilities (∩ the program's); a plain call uses the program's ambient capabilities
 - Wildcard: `net("*.example.com")` covers all subdomains
 - Path glob: `file("/data/*")` covers all files in /data/
 - Name prefix: `secret("APP_*")` / `env("APP_*")` covers `APP_DB`, `APP_KEY`, … (only a trailing `*`)
