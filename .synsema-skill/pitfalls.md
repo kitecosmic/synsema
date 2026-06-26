@@ -109,7 +109,8 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 | `remember("preferencia", ...)` works | Error: invalid category | Categories are English: `preference`, `rule`, `learning`, `decision`, `context` |
 | `intent: "..."` restricts what the program can do | No — the intent is descriptive only | Security is enforced by capabilities (`require`), in any language. The intent text never blocks. |
 | `wait_for` wakes all waiters on one `signal` | Only ONE waiter gets it | Signals are a queue (consumed on read). For fan-out, emit N signals or use blackboard. |
-| `wait_for` hangs forever on dead agent | Returns `nothing` quickly | The runtime detects no alive agents and returns. But only if ALL agents are dead. |
+| `wait_for` hangs forever on dead agent | Returns `nothing` quickly | The runtime detects this and returns — but ONLY when agents WERE spawned and all of them died. |
+| `wait_for "x"` returns instantly when no agent was ever spawned | It blocks until the `timeout` (default 30s) | The fast return is for "all spawned agents died", not "zero agents". With no producer ever spawned, the runtime can't know none is coming → it waits. **Always pass a bounded `timeout`** when an emitter might be absent: `wait_for "x" timeout 2 as r`. |
 | Agent shares state with main program | Each agent has its own interpreter | Use `share`/`observe` via blackboard to communicate. |
 | `number("1200")` gives integer | Gives `1200.0` (float) | `text()` on integers shows no decimal. Use `text(number(...))` for display. |
 | `/tmp/file.txt` works on Windows | Maps to `C:\tmp\file.txt` | Use absolute paths. For agent data, use `~/.synsema/` paths. |
