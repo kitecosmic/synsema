@@ -663,10 +663,16 @@ impl Interpreter {
         self.register("fmt", 1, Rc::new(|i, a, l| i.b_fmt(a, l)));
         self.register("upper", 1, Rc::new(|i, a, l| i.b_upper(a, l)));
         self.register("lower", 1, Rc::new(|i, a, l| i.b_lower(a, l)));
+        // fold: minúsculas + sin diacríticos (matching tolerante a acentos).
+        self.register("fold", 1, Rc::new(|i, a, l| i.b_fold(a, l)));
         self.register("trim", 1, Rc::new(|i, a, l| i.b_trim(a, l)));
         self.register("starts_with", 2, Rc::new(|i, a, l| i.b_starts_with(a, l)));
         self.register("ends_with", 2, Rc::new(|i, a, l| i.b_ends_with(a, l)));
         self.register("replace_text", 3, Rc::new(|i, a, l| i.b_replace_text(a, l)));
+        // Entrada de stdin (CLI): lee una línea; `nothing` en EOF. Funciona con pipe.
+        self.register("read_line", -1, Rc::new(|i, a, l| i.b_read_line(a, l)));
+        // Estado del provider LLM: true si el motor cableó uno real (vs placeholder offline).
+        self.register("llm_available", 0, Rc::new(|i, _a, _l| Ok(syn_bool(i.llm_callback.is_some()))));
         // Regex (computación pura, sin capability)
         self.register("matches", 2, Rc::new(|i, a, l| i.b_matches(a, l)));
         self.register("find_all", 2, Rc::new(|i, a, l| i.b_find_all(a, l)));
@@ -2782,6 +2788,58 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
     fn b_lower(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
         Ok(syn_text(raw_str(nth(args, 0)?).to_lowercase()))
+    }
+    /// `fold(text)`: minúsculas + sin diacríticos, para matching tolerante a acentos.
+    /// Pliega los acentos latinos comunes (Latin-1 Supplement + Latin Extended-A) a su
+    /// base ASCII; cualquier otro carácter pasa igual. Puro, sin capability.
+    fn b_fold(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        let lowered = raw_str(nth(args, 0)?).to_lowercase();
+        let mut out = String::with_capacity(lowered.len());
+        for c in lowered.chars() {
+            match c {
+                'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => out.push('a'),
+                'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => out.push('e'),
+                'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => out.push('i'),
+                'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ø' | 'ō' | 'ŏ' | 'ő' => out.push('o'),
+                'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => out.push('u'),
+                'ñ' | 'ń' | 'ņ' | 'ň' => out.push('n'),
+                'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => out.push('c'),
+                'ý' | 'ÿ' => out.push('y'),
+                'ś' | 'ŝ' | 'ş' | 'š' => out.push('s'),
+                'ź' | 'ż' | 'ž' => out.push('z'),
+                'ĝ' | 'ğ' | 'ġ' | 'ģ' => out.push('g'),
+                'ð' => out.push('d'),
+                'þ' => out.push_str("th"),
+                'ß' => out.push_str("ss"),
+                'æ' => out.push_str("ae"),
+                'œ' => out.push_str("oe"),
+                other => out.push(other),
+            }
+        }
+        Ok(syn_text(out))
+    }
+    /// `read_line(prompt?)`: lee una línea de stdin (CLI). Si hay prompt, lo imprime sin
+    /// newline antes de leer. Devuelve el texto sin el `\n`/`\r\n` final; `nothing` en EOF.
+    /// Lee stdin crudo → funciona con TTY y con entrada redirigida/pipe (a diferencia de
+    /// `ask`, que es un backend de decisión humana).
+    fn b_read_line(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        use std::io::Write;
+        if let Some(p) = args.first() {
+            if !matches!(p, SynValue::Nothing) {
+                print!("{}", raw_str(p));
+                let _ = std::io::stdout().flush();
+            }
+        }
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) => Ok(SynValue::Nothing), // EOF
+            Ok(_) => {
+                let s = line.strip_suffix('\n').unwrap_or(&line);
+                let s = s.strip_suffix('\r').unwrap_or(s);
+                Ok(syn_text(s))
+            }
+            Err(_) => Ok(SynValue::Nothing),
+        }
     }
     fn b_trim(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
         Ok(syn_text(raw_str(nth(args, 0)?).trim().to_string()))

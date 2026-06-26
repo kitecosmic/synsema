@@ -22,9 +22,9 @@ Auto-granted in plain `run`/`conform` (like `stdout`/`time`), enforced in `serve
 stripped inside a `sandbox`. See [capabilities.md](capabilities.md#the-llm-capability).
 
 ## Providers
-The provider is chosen by the **runtime config** (there is no `--provider` CLI flag): set
-`SYNSEMA_LLM_PROVIDER` (in the environment or `.env`), or let it auto-select from whichever API key is
-present.
+Choose the provider with `synsema run --provider <name>`, by setting `SYNSEMA_LLM_PROVIDER` (in the
+environment or `.env`), or let it auto-select from whichever API key is present. Precedence: the
+`--provider` flag wins over the env var, which wins over `.env`.
 ```bash
 SYNSEMA_LLM_PROVIDER=anthropic   # Claude (also auto-selected by ANTHROPIC_API_KEY)
 SYNSEMA_LLM_PROVIDER=openai      # GPT (or OPENAI_API_KEY)
@@ -84,6 +84,15 @@ the engine returns descriptive placeholders, so programs stay runnable without a
 | `SYNSEMA_LLM_BASE_URL` | Endpoint base — point a provider at any compatible endpoint (e.g. a local server) | official endpoint |
 
 Cost note: the default is **Sonnet** (cheaper); opt into Opus with `SYNSEMA_LLM_MODEL=claude-opus-4-8`.
+
+**Detect offline vs real provider:** `llm_available()` → bool (`true` when a real provider is wired,
+`false` offline). Branch on it instead of string-matching placeholders:
+```
+when llm_available()
+    let summary be reason "Summarize: " + text
+otherwise
+    let summary be "(LLM offline)"
+```
 
 **MiniMax (M3).** First-class via its **Anthropic-compatible** API (reuses the Anthropic provider
 internally): `SYNSEMA_LLM_PROVIDER=minimax` + `MINIMAX_API_KEY=...` (default model `MiniMax-M3`).
@@ -169,6 +178,11 @@ declared (∩ the agent's), so it cannot exceed its mandate even if the agent is
 loop is always bounded by `max_steps` and the token budget. (Plain `call` runs with the agent's
 ambient capabilities — use `call_tool` to dispatch untrusted, model-chosen tools.)
 
-In the normal `run` path no real provider is wired, so `llm_step` returns the safe placeholder
-`{kind: "final", text: "[no llm provider]", tokens: 0}`. Tests drive it deterministically with a
-scripted mock (engine host-config `run_with_llm_steps`).
+Offline (no provider configured) `llm_step` returns the safe placeholder
+`{kind: "final", text: "[no llm provider]", tokens: 0}` — check `llm_available()` to branch. With a
+provider wired (via `.env`/env/`--provider`, see Providers) it calls the real model. Tests drive it
+deterministically with a scripted mock (engine host-config `run_with_llm_steps`).
+
+**Force a final answer (no tools).** For "tool-greedy" models that keep calling tools, pass an **empty
+catalog** to make the step return a `final`: `llm_step(prompt, [], ctx)`. Useful as the last turn of a
+loop ("you've gathered enough — now answer") or to bound a runaway tool loop.

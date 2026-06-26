@@ -122,10 +122,19 @@ pub fn register_agent_builtins(
     {
         let m = memory.clone();
         interp.register_builtin("recall", -1, Rc::new(move |_i, args, _l| {
-            let category = args.get(0).map(raw_str).filter(|s| s != "nothing");
+            // `nothing` (o ausente) en category/search = sin filtro. Chequear el valor
+            // directo: raw_str(nothing) es "None", no "nothing" → un filtro por string
+            // no lo capturaba (bug preexistente en category, ahora corregido).
+            let opt_arg = |a: Option<&SynValue>| match a {
+                None | Some(SynValue::Nothing) => None,
+                Some(v) => Some(raw_str(v)),
+            };
+            let category = opt_arg(args.get(0));
             let tags = if matches!(args.get(1), Some(SynValue::List(_))) { Some(str_list(args.get(1))) } else { None };
-            let search = args.get(2).map(raw_str);
-            let entries = m.borrow().recall(category.as_deref(), tags.as_deref(), search.as_deref());
+            let search = opt_arg(args.get(2));
+            // 4º arg opcional `mode`: "all" (AND) o "any"/ausente (OR, default). (MF-005)
+            let match_all = args.get(3).map(raw_str).map(|m| m.to_lowercase() == "all").unwrap_or(false);
+            let entries = m.borrow().recall_mode(category.as_deref(), tags.as_deref(), search.as_deref(), match_all);
             let result: Vec<SynValue> = entries.iter().map(|e| {
                 let mut map = IndexMap::new();
                 map.insert("id".to_string(), syn_text(e.id.as_str()));

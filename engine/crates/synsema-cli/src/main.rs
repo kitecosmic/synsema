@@ -21,7 +21,7 @@ use synsema_runtime::serve::{run_serve_program_with_overrides, ServeOverrides};
 
 mod update;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] | test [-v] <archivo|dir> | check | tokens | ast | repl | daemon | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] | test [-v] <archivo|dir> | check | tokens | ast | repl | daemon | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
 
 /// Serializa un mapa (clave→string) como objeto JSON ordenado.
 fn json_obj(pairs: Vec<(String, String)>) -> String {
@@ -288,6 +288,21 @@ fn cmd_run(args: &[String]) -> ExitCode {
                 }
                 i += 1; // consume el valor
             }
+            // `--provider <name>`: elige el proveedor LLM por flag (gana sobre env/.env,
+            // setea SYNSEMA_LLM_PROVIDER antes de cablear el LLM). Forma `=` también.
+            "--provider" => match args.get(i + 1) {
+                Some(name) if !name.starts_with("--") => {
+                    std::env::set_var("SYNSEMA_LLM_PROVIDER", name);
+                    i += 1;
+                }
+                _ => {
+                    eprintln!("synsema run: --provider requires a value (anthropic|openai|minimax|deepseek)");
+                    return ExitCode::from(2);
+                }
+            },
+            p if p.starts_with("--provider=") => {
+                std::env::set_var("SYNSEMA_LLM_PROVIDER", p.trim_start_matches("--provider="));
+            }
             p if !p.starts_with("--") => path = Some(p.to_string()),
             _ => {}
         }
@@ -296,7 +311,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let path = match path {
         Some(p) => p,
         None => {
-            eprintln!("uso: synsema run [--flat] [--explain] [--format human|json] <archivo.syn>");
+            eprintln!("uso: synsema run [--flat] [--explain] [--format human|json] [--provider <name>] <archivo.syn>");
             return ExitCode::from(2);
         }
     };

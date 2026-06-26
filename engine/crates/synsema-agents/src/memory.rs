@@ -232,11 +232,25 @@ impl AgentMemory {
         Ok(id)
     }
 
+    /// Recall con semántica OR de tags (compatibilidad). Espeja el oráculo.
     pub fn recall(
         &self,
         category: Option<&str>,
         tags: Option<&[String]>,
         search: Option<&str>,
+    ) -> Vec<MemoryEntry> {
+        self.recall_mode(category, tags, search, false)
+    }
+
+    /// Como `recall` pero con modo de tags configurable: `match_all=false` → OR (cualquier
+    /// tag, default); `match_all=true` → AND (la entrada debe tener TODOS los tags). El
+    /// modo afecta solo a los tags; `category`/`search` estrechan igual. (MF-005)
+    pub fn recall_mode(
+        &self,
+        category: Option<&str>,
+        tags: Option<&[String]>,
+        search: Option<&str>,
+        match_all: bool,
     ) -> Vec<MemoryEntry> {
         let mut results: Vec<MemoryEntry> = self
             .entries
@@ -244,6 +258,7 @@ impl AgentMemory {
             .filter(|e| e.active)
             .filter(|e| category.is_none_or(|c| e.category.value() == c))
             .filter(|e| match tags {
+                Some(ts) if match_all => ts.iter().all(|t| e.tags.contains(t)),
                 Some(ts) => ts.iter().any(|t| e.tags.contains(t)),
                 None => true,
             })
@@ -461,6 +476,21 @@ mod tests {
         let r = m.recall(None, Some(&tags(&["communication"])), None);
         assert_eq!(r.len(), 1);
         assert!(r[0].content.contains("Formal"));
+    }
+
+    #[test]
+    fn memory_recall_mode_any_vs_all() {
+        // MF-005: OR (any, default) vs AND (all) sobre los tags.
+        let mut m = AgentMemory::new();
+        m.remember("context", "A", JsonMap::new(), tags(&["s1", "turn"]), "agent").unwrap();
+        m.remember("context", "B", JsonMap::new(), tags(&["s1", "obj"]), "agent").unwrap();
+        // OR: ["s1","obj"] matchea ambas (las dos tienen s1).
+        assert_eq!(m.recall(Some("context"), Some(&tags(&["s1", "obj"])), None).len(), 2);
+        assert_eq!(m.recall_mode(Some("context"), Some(&tags(&["s1", "obj"])), None, false).len(), 2);
+        // AND: solo B tiene s1 Y obj.
+        let only_b = m.recall_mode(Some("context"), Some(&tags(&["s1", "obj"])), None, true);
+        assert_eq!(only_b.len(), 1);
+        assert_eq!(only_b[0].content, "B");
     }
 
     #[test]

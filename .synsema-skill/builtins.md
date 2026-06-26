@@ -20,6 +20,8 @@
 - `slice(collection, start, end?)` → sub-collection (lists/text/`bytes`; Python-style negatives)
 - `length(x)` also works on `bytes` (byte count) and `array` (total elements). Indexing `x[i]` works on lists, maps, `bytes` (→ int 0–255) and `array` (→ row or scalar).
 - `raise(message)` → **always raises a runtime error** with `message` (coerced to text). Use it to fail deliberately, or to **re-propagate** a caught error inside `recover` (see below). `raise()` with no arg errors. (`fail(...)` is for HTTP responses, NOT for raising runtime errors.)
+- `read_line(prompt?)` → text — read one line from stdin (CLI). Optional `prompt` is printed first (no newline). Returns the line without the trailing newline; `nothing` on EOF. Works with a TTY **and** piped/redirected input (`printf 'x\n' | synsema run f.syn`) — unlike free-text `ask`. See [human.md](human.md).
+- `llm_available()` → bool — `true` when a real LLM provider is wired, `false` offline. Branch on it instead of string-matching placeholders. See [llm.md](llm.md).
 
 ## Error handling — `try` / `recover` / `raise`
 ```
@@ -37,6 +39,7 @@ not errors and pass through `try/recover` untouched.
 - `fmt(template, map)` → interpolated text: `fmt("Hi {name}", {"name": "Alice"})` → `"Hi Alice"`
 - `upper(text)` → uppercase
 - `lower(text)` → lowercase
+- `fold(text)` → lowercase **and** strips accents/diacritics — for accent-insensitive matching: `fold("Continúa")` → `"continua"`, `contains(fold("Está aquí"), "esta")` → true
 - `trim(text)` → strip whitespace
 - `starts_with(text, prefix)` → bool
 - `ends_with(text, suffix)` → bool
@@ -180,7 +183,7 @@ Response helpers (set the HTTP status; body follows the response contract):
 - `progress_display(task_name)` → formatted text
 - `progress_percent(task_name)` → number 0-100
 - `remember(category, content, tags?)` → entry_id
-- `recall(category?, tags?, search?)` → list of entries (multiple `tags` = OR / any, not AND — use a composite tag to narrow; see memory.md)
+- `recall(category?, tags?, search?, mode?)` → list of entries. `mode` (text) controls multi-tag matching: `"any"` (default, OR) or `"all"` (AND — entry must have every tag). `category`/`search` always narrow; pass `nothing` to skip a positional arg. See memory.md.
 - `forget_memory(entry_id)` → bool
 - `add_rule(name, level, description, category?)` → bool
 - `check_rules(category?, context_map?)` → list of violations

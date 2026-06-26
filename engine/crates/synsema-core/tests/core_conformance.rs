@@ -462,3 +462,21 @@ fn math_rounding_builtins() {
     assert_error_contains("print(floor(\"x\"))", "expects a number");
     assert_error_contains("print(round(true))", "expects a number");
 }
+
+// -- fold (MF-006): minúsculas + sin diacríticos --
+
+#[test]
+fn fold_strips_accents_and_lowercases() {
+    assert_output("print(fold(\"Continúa\"))", &["continua"]);
+    assert_output("print(fold(\"ÁÉÍÓÚñ\"))", &["aeioun"]);
+    assert_output("print(text(contains(fold(\"Está aquí\"), \"esta\")))", &["true"]);
+    // sin acentos = lower normal; otros caracteres pasan igual
+    assert_output("print(fold(\"Hello World 123\"))", &["hello world 123"]);
+}
+
+// -- llm_available (MF-002): false sin provider cableado (runner mínimo de core) --
+
+#[test]
+fn llm_available_false_offline() {
+    assert_output("print(text(llm_available()))", &["false"]);
+}

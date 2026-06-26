@@ -26,12 +26,17 @@ otherwise
 ## No TTY (pipes / CI / redirection)
 In `synsema run` **without an interactive TTY** (output piped, run in CI, or stdin redirected),
 free-text `ask "question"` returns `""` (empty string) and `ask "question" with [opts]` takes the
-**first** option. Don't rely on free-text `ask` for input in those contexts. For programmatic /
-testable input, read from `env()` or a file instead:
+**first** option. Don't rely on free-text `ask` for input in those contexts.
+
+For raw stdin that works with pipes/redirection, use **`read_line(prompt?)`** (returns the line, or
+`nothing` on EOF) — see [builtins.md](builtins.md):
 ```
-let name be env("NAME", "")        -- works in CI, pipes, and tests
+let name be read_line("Your name: ")   -- works with `printf 'Ana\n' | synsema run f.syn`
 ```
-(Reading from stdin in `run` is a future feature.)
+For config-style input, `env()` / a file also work and are easy to test:
+```
+let name be env("NAME", "")            -- works in CI, pipes, and tests
+```
 
 ## Escalation protocol
 When automatic recovery fails:
