@@ -1,7 +1,7 @@
 # Synsema Deployment
 
 Synsema ships as a **single static binary** (the Rust build) — no Python, no Node, no
-runtime on the target. Install it with `cargo install --path rust/crates/synsema-cli` or
+runtime on the target. Install it with `cargo install --path engine/crates/synsema-cli` or
 grab a prebuilt binary from the GitHub Releases page.
 
 ## Running modes
@@ -120,7 +120,7 @@ docker compose up -d
 # 1. Clone and build the single static binary (Rust)
 git clone https://github.com/kitecosmic/synsema.git
 cd synsema
-cargo install --path rust/crates/synsema-cli    # installs the `synsema` binary
+cargo install --path engine/crates/synsema-cli    # installs the `synsema` binary
 # (or download a prebuilt binary from the GitHub Releases page)
 
 # 2. Start as daemon

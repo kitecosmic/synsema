@@ -36,7 +36,7 @@ curl -fsSL https://synsema.com/install.sh | sh
 ```bash
 git clone https://github.com/kitecosmic/synsema.git
 cd synsema
-cargo build --release --manifest-path rust/Cargo.toml   # → rust/target/release/synsema
+cargo build --release --manifest-path engine/Cargo.toml   # → engine/target/release/synsema
 ```
 
 ## Quick start
@@ -444,7 +444,7 @@ Automatically generates edge-case tests from your types and task signatures:
 A conformance corpus plus unit and integration tests, all in Rust:
 
 ```bash
-cargo test --manifest-path rust/Cargo.toml --workspace
+cargo test --manifest-path engine/Cargo.toml --workspace
 ```
 
 Language-level `.syn` tests (using `assert` / `test "..."`) run with the binary:
@@ -495,12 +495,12 @@ synsema/
 └── cli.py             # Command-line interface
 ```
 
-### Production interpreter (`rust/`)
+### Production interpreter (`engine/`)
 
 The shipped binary is a Cargo workspace mirroring the packages above:
 
 ```
-rust/crates/
+engine/crates/
 ├── synsema-core/         # lexer, parser, AST, types, interpreter, templates
 ├── synsema-capabilities/ # capability model + intent enforcement
 ├── synsema-stdlib/       # http, database, cron, server, acme, mimetypes

@@ -53,20 +53,20 @@ jobs:
       - name: Build
         env:
           SYNSEMA_VERSION: ${{ github.ref_name }}
-        run: cargo build --release --locked --manifest-path rust/Cargo.toml -p synsema-cli --target ${{ matrix.target }}
+        run: cargo build --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          cp "rust/target/${{ matrix.target }}/release/synsema" "${{ matrix.asset }}"
+          cp "engine/target/${{ matrix.target }}/release/synsema" "${{ matrix.asset }}"
           shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Copy-Item "rust/target/${{ matrix.target }}/release/synsema.exe" "${{ matrix.asset }}"
+          Copy-Item "engine/target/${{ matrix.target }}/release/synsema.exe" "${{ matrix.asset }}"
           (Get-FileHash "${{ matrix.asset }}" -Algorithm SHA256).Hash | Out-File -Encoding ascii "${{ matrix.asset }}.sha256"
 
       - name: Upload to Release

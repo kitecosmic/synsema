@@ -2,10 +2,10 @@
 
 Synsema is a **Rust** language: a single static binary, one Cargo workspace. (The old
 `synsema/` Python tree is **frozen** and not the source of truth — ignore it; everything
-lives under `rust/`.)
+lives under `engine/`.)
 
 ```
-rust/
+engine/
 ├── Cargo.toml                       # workspace + pinned deps (all pure-Rust except bundled SQLite)
 └── crates/
     ├── synsema-core/                # START HERE for language internals
