@@ -14,12 +14,14 @@ use std::process::ExitCode;
 
 // El conform usa el motor (runtime): intérprete + modelo de seguridad cableado.
 use synsema_runtime::daemon;
-use synsema_runtime::engine::{repl, run_source, run_swarm_dump, run_tests, TestReport};
+use synsema_runtime::engine::{
+    repl, run_source, run_swarm_dump, run_tests, run_with_diagnostics, TestReport,
+};
 use synsema_runtime::serve::{run_serve_program_with_overrides, ServeOverrides};
 
 mod update;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run | test [-v] <archivo|dir> | check | tokens | ast | repl | daemon | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] | test [-v] <archivo|dir> | check | tokens | ast | repl | daemon | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
 
 /// Serializa un mapa (clave→string) como objeto JSON ordenado.
 fn json_obj(pairs: Vec<(String, String)>) -> String {
@@ -246,23 +248,55 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// run <archivo.syn> [--flat]: ejecuta el programa, imprime la salida, exit≠0 si falla.
+/// run <archivo.syn> [--flat] [--explain] [--format human|json]: ejecuta el programa,
+/// imprime la salida, exit≠0 si falla.
+///
+/// `--explain` activa el diagnóstico rico (ubicación, contexto de fuente, variables
+/// visibles, sugerencias, clasificación) en caso de error. Sin la flag, el
+/// comportamiento es el de siempre: la línea corta `Runtime error: ...` (apta para
+/// scripting/CI). Con `--explain` el formato por defecto es humano (`format_human`); con
+/// `--format json` se emite JSON estructurado (`format_agent`) para herramientas/agentes.
 fn cmd_run(args: &[String]) -> ExitCode {
     let args = take_env_file_flags(args);
-    let args = args.as_slice();
     let mut flat = false;
+    let mut explain = false;
+    let mut fmt_json = false; // --format json (sólo aplica con --explain)
     let mut path: Option<String> = None;
-    for a in &args[2..] {
-        match a.as_str() {
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
             "--flat" => flat = true,
+            "--explain" => explain = true,
+            "--format=json" => fmt_json = true,
+            "--format=human" => fmt_json = false,
+            // `--format <valor>` con lookahead, igual que `--env-file`.
+            "--format" => {
+                match args.get(i + 1).map(String::as_str) {
+                    Some("json") => fmt_json = true,
+                    Some("human") => fmt_json = false,
+                    Some(other) => {
+                        eprintln!(
+                            "synsema run: --format must be 'human' or 'json', got '{}'",
+                            other
+                        );
+                        return ExitCode::from(2);
+                    }
+                    None => {
+                        eprintln!("synsema run: --format requires a value (human|json)");
+                        return ExitCode::from(2);
+                    }
+                }
+                i += 1; // consume el valor
+            }
             p if !p.starts_with("--") => path = Some(p.to_string()),
             _ => {}
         }
+        i += 1;
     }
     let path = match path {
         Some(p) => p,
         None => {
-            eprintln!("uso: synsema run [--flat] <archivo.syn>");
+            eprintln!("uso: synsema run [--flat] [--explain] [--format human|json] <archivo.syn>");
             return ExitCode::from(2);
         }
     };
@@ -276,6 +310,36 @@ fn cmd_run(args: &[String]) -> ExitCode {
     if flat || path.ends_with(".fsyn") {
         source = synsema_core::flat_syntax::translate_flat(&source);
     }
+
+    // Camino opt-in: diagnóstico rico. Reusa la API pública del runtime; el default
+    // (línea corta) queda intacto más abajo para no romper scripting/CI.
+    if explain {
+        let run = run_with_diagnostics(&source, &path);
+        for line in &run.result.output {
+            println!("{}", line);
+        }
+        if !run.result.success {
+            if let Some(diag) = run.diagnostics.first() {
+                if fmt_json {
+                    eprintln!(
+                        "{}",
+                        serde_json::to_string_pretty(&diag.format_agent()).unwrap_or_default()
+                    );
+                } else {
+                    eprintln!("{}", diag.format_human());
+                }
+            } else {
+                // Fallback (p.ej. `give`/`stop` top-level no producen diagnóstico):
+                // la línea corta. Nunca quedarse sin output.
+                for e in &run.result.errors {
+                    eprintln!("{}", e);
+                }
+            }
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+
     let result = run_source(&source, &path);
     for line in &result.output {
         println!("{}", line);

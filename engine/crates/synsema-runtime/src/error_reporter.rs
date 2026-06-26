@@ -9,6 +9,12 @@ use regex::RegexBuilder;
 
 use synsema_core::tokens::SourceLocation;
 
+/// Constantes del prelude que el entorno global expone como números (sin prefijo
+/// `builtin:`). Se omiten del diagnóstico de "variables visibles" porque no son del
+/// usuario y solo añaden ruido. (Caso conocido: si el usuario llama `pi` a su variable,
+/// quedaría omitida; resolverlo bien requiere distinguir el scope de usuario del prelude.)
+const PRELUDE_CONSTANTS: &[&str] = &["pi", "tau", "e", "inf", "nan"];
+
 /// Clasificación de un mensaje de error.
 #[derive(Clone, Debug)]
 pub struct Classification {
@@ -150,6 +156,9 @@ pub struct ErrorDiagnostic {
     pub line: usize,
     pub column: usize,
     pub source_context: Vec<String>,
+    /// Línea 1-indexed de `source_context[0]` (0 si no hay contexto). Permite numerar
+    /// la ventana de forma robusta aunque esté truncada por el inicio/fin del archivo.
+    pub source_start_line: usize,
     pub error_line_content: String,
     pub call_stack: Vec<CallFrame>,
     pub visible_variables: IndexMap<String, String>,
@@ -178,8 +187,8 @@ impl ErrorDiagnostic {
         if !self.source_context.is_empty() {
             lines.push("\n  Source:".to_string());
             for (i, src_line) in self.source_context.iter().enumerate() {
-                let line_num = self.line as i64 - (self.source_context.len() / 2) as i64 + i as i64;
-                let marker = if line_num == self.line as i64 { " >> " } else { "    " };
+                let line_num = self.source_start_line + i;
+                let marker = if line_num == self.line { " >> " } else { "    " };
                 lines.push(format!("  {}{:>4} | {}", marker, line_num, src_line));
             }
         }
@@ -227,6 +236,8 @@ impl ErrorDiagnostic {
             "file": self.file,
             "line": self.line,
             "column": self.column,
+            "source_context": self.source_context,
+            "source_start_line": self.source_start_line,
             "error_category": self.error_category,
             "recoverable": self.recoverable,
             "retry_makes_sense": self.retry_makes_sense,
@@ -292,6 +303,7 @@ impl ErrorReporter {
                 let start = loc.line.saturating_sub(4);
                 let end = (loc.line + 3).min(lines.len());
                 diag.source_context = lines[start..end].to_vec();
+                diag.source_start_line = start + 1; // start es 0-indexed → 1-indexed
                 if loc.line > 0 && loc.line <= lines.len() {
                     diag.error_line_content = lines[loc.line - 1].clone();
                 }
@@ -299,7 +311,15 @@ impl ErrorReporter {
         }
         diag.call_stack = self.call_stack.clone();
         if let Some(vars) = env_vars {
+            // Single source of truth: filtramos aquí para que tanto format_human como
+            // format_agent reciban solo variables de usuario (sin builtins ni prelude).
             for (name, value) in vars {
+                let is_builtin =
+                    value.starts_with("builtin:") || value.starts_with("SynValue(task:");
+                let is_const = PRELUDE_CONSTANTS.contains(&name.as_str());
+                if is_builtin || is_const {
+                    continue;
+                }
                 diag.visible_variables.insert(name.clone(), value.clone());
             }
         }
@@ -401,5 +421,58 @@ mod tests {
         assert_eq!(data["error_type"], "Exception");
         assert_eq!(data["error_category"], "io");
         assert_eq!(data["retry_makes_sense"], true);
+    }
+
+    #[test]
+    fn de012_marks_correct_line_when_window_truncated() {
+        // Regresión DE-012: error cerca del final → ventana truncada por el inicio.
+        // El marcador `>>` debe caer en la línea exacta (no una arriba).
+        let mut r = ErrorReporter::new();
+        r.load_source("p.syn", "-- c\nintent: \"x\"\n\nlet m be {\"a\": 1}\nprint(m[\"k\"])");
+        // El print está en la línea 5.
+        let loc = SourceLocation { file: "p.syn".into(), line: 5, column: 8, offset: 0 };
+        let diag = r.build_diagnostic("RuntimeError", "Map has no key 'k'", Some(&loc), None);
+        assert_eq!(diag.source_start_line, 2); // start = 5-4 = 1 (0-idx) → 2 (1-idx)
+        let text = diag.format_human();
+        let print_line = text.lines().find(|l| l.contains("print(m")).unwrap();
+        assert!(print_line.contains(">>"), "el marcador debe estar en el print: {:?}", print_line);
+        assert!(print_line.contains("5 |"), "la línea del print debe numerarse 5: {:?}", print_line);
+        let let_line = text.lines().find(|l| l.contains("let m be")).unwrap();
+        assert!(!let_line.contains(">>"), "el marcador no debe estar en el let: {:?}", let_line);
+        assert!(let_line.contains("4 |"), "la línea del let debe numerarse 4: {:?}", let_line);
+    }
+
+    #[test]
+    fn de012_marks_correct_line_in_long_file() {
+        // Regresión DE-012: archivo largo (ventana NO truncada) sigue marcando bien.
+        let mut r = ErrorReporter::new();
+        let src: String = (1..=20).map(|n| format!("line{}\n", n)).collect::<String>();
+        r.load_source("long.syn", &src);
+        let loc = SourceLocation { file: "long.syn".into(), line: 10, column: 1, offset: 0 };
+        let diag = r.build_diagnostic("RuntimeError", "boom", Some(&loc), None);
+        assert_eq!(diag.source_start_line, 7); // 10-4 = 6 (0-idx) → 7 (1-idx)
+        let text = diag.format_human();
+        let marked = text.lines().find(|l| l.contains(">>")).unwrap();
+        assert!(marked.contains("10 |") && marked.contains("line10"), "marcador mal ubicado: {:?}", marked);
+    }
+
+    #[test]
+    fn de013_filters_builtins_and_prelude_constants() {
+        // Regresión DE-013: solo variables de usuario en el diagnóstico.
+        let r = ErrorReporter::new();
+        let vars = vec![
+            ("m".to_string(), "{a: 1}".to_string()),
+            ("pi".to_string(), "3.141592653589793".to_string()),
+            ("tau".to_string(), "6.283185307179586".to_string()),
+            ("print".to_string(), "builtin:print".to_string()),
+            ("helper".to_string(), "SynValue(task:helper)".to_string()),
+        ];
+        let diag = r.build_diagnostic("RuntimeError", "Map has no key 'k'", None, Some(&vars));
+        assert_eq!(diag.visible_variables.len(), 1, "solo la variable de usuario debe quedar");
+        assert!(diag.visible_variables.contains_key("m"));
+        assert!(!diag.visible_variables.contains_key("pi"));
+        assert!(!diag.visible_variables.contains_key("tau"));
+        assert!(!diag.visible_variables.contains_key("print"));
+        assert!(!diag.visible_variables.contains_key("helper"));
     }
 }

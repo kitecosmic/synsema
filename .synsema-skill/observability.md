@@ -38,7 +38,7 @@ let where be resume_point("import")        -- the step to resume from
 ```
 
 ## Error diagnostics
-When an error occurs, Synsema provides:
+When an error occurs, Synsema can provide a rich report:
 - **Location**: file, line, column
 - **Source context**: code lines around the error, with error line marked
 - **Call stack**: readable trace of function calls
@@ -47,6 +47,16 @@ When an error occurs, Synsema provides:
 - **Classification**: data, io, logic, capability, type
 - **Recoverable**: yes/no
 - **Suggestions**: specific fix suggestions for the error type
+
+### How to see it
+The rich report is **opt-in** via `--explain` (so plain `run` stays script/CI friendly):
+```
+synsema run --explain program.syn               # human-readable report on stderr
+synsema run --explain --format json program.syn # structured JSON (for tools/agents)
+```
+Without `--explain`, `synsema run` prints only the short line
+(`Runtime error: <file>:<line>:<col>: <msg>`) — the stable, parseable form for scripting.
+The process exit code is unchanged either way (1 on failure, 0 on success).
 
 ## Auto-recovery
 1. Retry with backoff (IO/transient errors)
