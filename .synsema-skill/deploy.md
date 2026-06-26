@@ -86,6 +86,20 @@ serve on 8080
 > the **deployment structure** of `serve`. The `serve` block has no `when`/conditionals
 > by design — the flags keep it declarative.
 
+## `synsema daemon` vs systemd — pick ONE
+
+These are **two different supervisors**; don't run the same service under both.
+
+- **`synsema daemon`** = Synsema's **built-in** background manager. Quick to start
+  (`synsema daemon start app.syn`), no OS config. But it does **not** start on boot and does **not**
+  restart on crash. Good for: dev, a box without systemd, quick background runs.
+- **systemd** = the OS supervisor (the systemd unit above). Starts on boot (`enable`), restarts on
+  crash (`Restart=always`), journald logs, `StateDirectory`/env. **Use this for production** (real
+  service, HTTPS, auto-restart). To update it: replace the binary + `systemctl restart` (see above).
+
+Rule of thumb: **production web service with TLS → systemd**; `synsema daemon` is the no-OS-setup
+shortcut.
+
 ## Daemon details
 
 - Detaches from terminal (real process fork on Unix, subprocess on Windows)
@@ -161,6 +175,24 @@ EOF
 systemctl enable synsema-agent
 systemctl start synsema-agent
 ```
+
+## Updating a deployed server (it does NOT auto-update)
+
+A running server does **not** update itself. To roll out a new version:
+
+```bash
+synsema update                    # swaps the binary on disk (downloads the release, verifies sha256)
+systemctl restart synsema-agent   # REQUIRED — the live process keeps the OLD binary until restart
+```
+
+- `synsema update` replaces the binary **file**, but the running process keeps the old binary in
+  memory. The **`systemctl restart` is what applies the new version**.
+- **Restart is safe — TLS certs persist.** `tls auto` stores certs (order: `SYNSEMA_CERT_DIR` →
+  `~/.synsema/certs` → an absolute system default) and auto-renews them in the background (30 days
+  before the 90-day expiry). A restart **reloads** the stored cert — it does **not** re-issue, so you
+  won't hit Let's Encrypt rate limits.
+- If `synsema update` targets a binary at a different path than the unit's `ExecStart`, update that
+  path (or point both at the same binary), then restart.
 
 ## Kubernetes
 

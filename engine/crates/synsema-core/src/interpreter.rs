@@ -4597,11 +4597,22 @@ mod decimal_tests {
     // ---- type_of / is_decimal ----
     #[test]
     fn type_introspection() {
-        assert_eq!(line("print(text(type_of(1.5d)))"), "number");
+        // DE-021: type_of de un decimal reporta "decimal" (antes colapsaba a "number").
+        assert_eq!(line("print(text(type_of(1.5d)))"), "decimal");
+        assert_eq!(line("print(text(type_of(decimal(\"1.50\"))))"), "decimal");
+        // int/float intactos.
+        assert_eq!(line("print(text(type_of(42)))"), "number");
+        assert_eq!(line("print(text(type_of(3.14)))"), "number");
+        assert_eq!(line("print(text(type_of(complex(1,2))))"), "complex");
         assert_eq!(line("print(text(is_decimal(1.5d)))"), "true");
         assert_eq!(line("print(text(is_decimal(1.5)))"), "false");
         assert_eq!(line("print(text(is_decimal(5)))"), "false");
         assert_eq!(line("print(text(is_decimal(\"x\")))"), "false");
+        // dispatch por type_of (el caso de uso que estaba roto para decimal).
+        let p = "let x be 1.5d\nwhen type_of(x) == \"decimal\"\n    print(\"ok\")\notherwise\n    print(\"no\")";
+        assert_eq!(line(p), "ok");
+        // aritmética decimal exacta intacta.
+        assert_eq!(line("print(text(0.1d + 0.2d == 0.3d))"), "true");
     }
 
     // ---- regresión: int/float/bigint intactos; en match/contains Decimal≠Float SIN error ----

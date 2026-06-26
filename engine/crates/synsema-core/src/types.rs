@@ -137,7 +137,10 @@ impl SynValue {
     /// Nombre del tipo (para `type_of` y mensajes de error). Espeja `type.name`.
     pub fn type_name(&self) -> &'static str {
         match self {
-            SynValue::Number(_) => "number",
+            // `decimal` es un tipo de primera clase (vive dentro de Number, junto a
+            // Int/Float/Big). Abrir el sub-enum para que reporte su propio nombre, como
+            // complex/bytes/array (DE-021).
+            SynValue::Number(n) => if n.is_decimal() { "decimal" } else { "number" },
             SynValue::Text(_) => "text",
             SynValue::Bool(_) => "bool",
             SynValue::Nothing => "nothing",
