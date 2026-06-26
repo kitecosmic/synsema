@@ -21,6 +21,7 @@ why-synsema.md
 syntax.md
 builtins.md
 types.md
+modules.md
 testing.md
 stdlib.md
 concurrency.md

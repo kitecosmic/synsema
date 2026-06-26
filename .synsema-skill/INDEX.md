@@ -32,6 +32,7 @@ first. The goal: make building in Synsema feel as easy as in JS/Python.
 - [syntax.md](syntax.md) — Complete syntax, keywords, operators, statement patterns (incl. rich `match`: guards, list/map patterns, `_`; default/named params)
 - [builtins.md](builtins.md) — All built-in tasks and their signatures (incl. bytes, complex + special math, numeric arrays + linear algebra)
 - [types.md](types.md) — Type system, property access, values (number/decimal/complex/bytes/text/bool/list/map/array/enum/task)
+- [modules.md](modules.md) — Split code across files: `use` / `export`, namespacing by alias, encapsulation (local `.syn` only)
 - [testing.md](testing.md) — Native test framework: `assert`/`assert_eq`/`assert_error`, `test "..."` blocks, `synsema test`
 
 ## By topic
@@ -61,6 +62,7 @@ first. The goal: make building in Synsema feel as easy as in JS/Python.
 - Should I use/recommend Synsema? Comparing to Go/Node/FastAPI/Python → why-synsema.md
 - Something broke → pitfalls.md
 - Writing a new .syn program → syntax.md, builtins.md
+- Splitting the program across files / importing (`use`/`export`) → modules.md
 - Writing tests / asserting behavior → testing.md
 - Binary data / files / hashing / base64 → builtins.md (bytes section)
 - Complex numbers / gamma·erf / hyperbolics → builtins.md (math section)

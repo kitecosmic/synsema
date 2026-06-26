@@ -28,7 +28,7 @@ match s
     is _
         print("other")
 ```
-Construct `Name.variant(...)`; nullary `Name.pending` is a value. Match by variant with positional binding; modules can `export enum`. See [syntax.md](syntax.md) for rich patterns (guards, list/map).
+Construct `Name.variant(...)`; nullary `Name.pending` is a value. Match by variant with positional binding; modules can `export enum` and you construct/match it cross-file as `alias.Name.variant(...)` (see [modules.md](modules.md)). See [syntax.md](syntax.md) for rich patterns (guards, list/map).
 
 ## Callable
 - `task` — function value, supports closures, default params (`task f(x, y = 10)`) and named args at call (`f(x, timeout = 5)`)

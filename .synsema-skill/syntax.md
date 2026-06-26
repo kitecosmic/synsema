@@ -142,6 +142,26 @@ sandbox
     untrusted_body
 ```
 
+## Modules (`use` / `export`)
+Split code across files. `export` makes a `task`/`type`/`let`/`enum` public; anything else is private.
+`use` imports a local `.syn` module under an alias (the module is a `map` of its exports).
+```
+-- lib.syn
+export task greet(name)
+    give "hi " + name
+export let VERSION be "1.0"
+task helper()                 -- no `export` → private
+    give 1
+```
+```
+-- main.syn
+use "./lib.syn" as lib
+print(lib.greet("Ana"))       -- cross-file call needs the alias prefix
+print(lib.VERSION)
+```
+Paths are relative to the importing file (`.syn` only, no URLs/FFI, traversal blocked); imports are
+cached, transitive, and cycle-checked. Full guide: [modules.md](modules.md).
+
 ## Property access
 ```
 name of person         -- natural
