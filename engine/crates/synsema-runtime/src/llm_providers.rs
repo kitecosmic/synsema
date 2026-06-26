@@ -26,6 +26,7 @@ use synsema_llm::provider::{
     LLMProvider, LLMRequest, LLMResponse, LlmStep, LlmStepResponse, ToolSpec,
 };
 use synsema_stdlib::http::http_request;
+use synsema_stdlib::secrets::EnvStore;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Default de tokens de salida por request. La API de Anthropic OBLIGA a mandar el
@@ -470,24 +471,42 @@ pub fn build_provider(
     }
 }
 
-/// Selecciona el provider a partir del environ del proceso. Todos los knobs son del
-/// usuario (conectividad libre; el runtime no impone límites):
-/// - `SYNSEMA_LLM_PROVIDER` si está; si no, `ANTHROPIC_API_KEY`→anthropic,
-///   `OPENAI_API_KEY`→openai; si ninguno, `None` (offline → placeholders).
-/// - key del env correspondiente (`None` si falta).
+/// Resuelve un knob de configuración del provider con la MISMA precedencia que
+/// `env()`/`secret()` (§2.1): **environ del proceso > `.env` (EnvStore protegido)**.
+/// Vacío/espacios cuenta como ausente en ambas fuentes. Devuelve `None` si no está en
+/// ninguna → el caller aplica el default. Así la clave puede vivir SOLO en el `.env`
+/// (gitignoreado) sin exportarse al environ del proceso ni a los hijos (DE-007).
+fn resolve_knob(name: &str, store: &EnvStore) -> Option<String> {
+    match std::env::var(name) {
+        Ok(v) if !v.trim().is_empty() => Some(v),
+        _ => store.get(name).filter(|v| !v.trim().is_empty()),
+    }
+}
+
+/// Selecciona el provider resolviendo cada knob con precedencia `environ > .env (store) >
+/// default` (vía [`resolve_knob`]). Todos los knobs son del usuario (conectividad libre;
+/// el runtime no impone límites):
+/// - `SYNSEMA_LLM_PROVIDER` si está; si no, auto-selección por presencia de
+///   `ANTHROPIC_API_KEY`→anthropic, `OPENAI_API_KEY`→openai, `MINIMAX_API_KEY`→minimax,
+///   `DEEPSEEK_API_KEY`→deepseek (en ese orden); si ninguno, `None` (offline → placeholders).
+/// - key del provider correspondiente (`None` si falta → offline).
 /// - `SYNSEMA_LLM_MODEL` (override gana sobre el default), `SYNSEMA_LLM_MAX_TOKENS`
 ///   (default 4096), `SYNSEMA_LLM_BASE_URL` (override → modelos locales OpenAI-compat).
-pub fn provider_from_env() -> Option<Arc<dyn LLMProvider>> {
-    let provider = match std::env::var("SYNSEMA_LLM_PROVIDER") {
-        Ok(p) if !p.trim().is_empty() => p.trim().to_lowercase(),
-        _ => {
-            if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+///
+/// La clave resuelta sólo se usa para armar el header HTTP en el socket: NO se inyecta al
+/// environ ni queda accesible al programa `.syn` (que sigue necesitando `require env/secret`
+/// para tocar el `.env`, y aun así lo vería redactado).
+pub fn provider_from_config(store: &EnvStore) -> Option<Arc<dyn LLMProvider>> {
+    let provider = match resolve_knob("SYNSEMA_LLM_PROVIDER", store) {
+        Some(p) => p.trim().to_lowercase(),
+        None => {
+            if resolve_knob("ANTHROPIC_API_KEY", store).is_some() {
                 "anthropic".to_string()
-            } else if std::env::var("OPENAI_API_KEY").is_ok() {
+            } else if resolve_knob("OPENAI_API_KEY", store).is_some() {
                 "openai".to_string()
-            } else if std::env::var("MINIMAX_API_KEY").is_ok() {
+            } else if resolve_knob("MINIMAX_API_KEY", store).is_some() {
                 "minimax".to_string()
-            } else if std::env::var("DEEPSEEK_API_KEY").is_ok() {
+            } else if resolve_knob("DEEPSEEK_API_KEY", store).is_some() {
                 "deepseek".to_string()
             } else {
                 return None;
@@ -501,21 +520,23 @@ pub fn provider_from_env() -> Option<Arc<dyn LLMProvider>> {
         "deepseek" => ("DEEPSEEK_API_KEY", DEEPSEEK_DEFAULT_MODEL),
         _ => return None,
     };
-    let api_key = std::env::var(key_var).ok()?;
-    // El override de modelo GANA sobre el default.
-    let model = std::env::var("SYNSEMA_LLM_MODEL")
-        .ok()
-        .filter(|m| !m.trim().is_empty())
+    let api_key = resolve_knob(key_var, store)?;
+    // El override de modelo GANA sobre el default (resolve_knob ya descarta vacíos).
+    let model = resolve_knob("SYNSEMA_LLM_MODEL", store)
         .unwrap_or_else(|| default_model.to_string());
-    let max_tokens = std::env::var("SYNSEMA_LLM_MAX_TOKENS")
-        .ok()
+    let max_tokens = resolve_knob("SYNSEMA_LLM_MAX_TOKENS", store)
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_MAX_TOKENS);
-    let base_url = std::env::var("SYNSEMA_LLM_BASE_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    let base_url = resolve_knob("SYNSEMA_LLM_BASE_URL", store);
     build_provider(&provider, api_key, model, max_tokens, base_url)
+}
+
+/// Compat: selecciona el provider SÓLO desde el environ del proceso (sin `.env`).
+/// Equivale a `provider_from_config(&EnvStore::empty())`. El camino real de `run`/`conform`
+/// usa `provider_from_config` con el `.env` cargado (DE-007).
+pub fn provider_from_env() -> Option<Arc<dyn LLMProvider>> {
+    provider_from_config(&EnvStore::empty())
 }
 
 #[cfg(test)]
@@ -791,6 +812,53 @@ mod tests {
     #[test]
     fn build_provider_unknown_none() {
         assert!(build_provider("nope", "k".to_string(), "m".to_string(), 4096, None).is_none());
+    }
+
+    // -- DE-007: resolución desde el `.env` protegido (precedencia environ > store) --
+    // Un solo test (manipula env-vars globales del proceso, serializado para no carrear
+    // con otros tests del mismo binario).
+    #[test]
+    fn provider_from_config_dotenv_and_precedence() {
+        let keys = [
+            "SYNSEMA_LLM_PROVIDER",
+            "SYNSEMA_LLM_MODEL",
+            "SYNSEMA_LLM_BASE_URL",
+            "SYNSEMA_LLM_MAX_TOKENS",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "MINIMAX_API_KEY",
+            "DEEPSEEK_API_KEY",
+        ];
+        let clear = || {
+            for k in keys {
+                std::env::remove_var(k);
+            }
+        };
+        let store = EnvStore::parse("DEEPSEEK_API_KEY=sk-store\nSYNSEMA_LLM_PROVIDER=deepseek\n");
+
+        // (1) La clave SOLO en el `.env` (store) basta — sin exportar nada al environ.
+        //     DeepSeek reusa el OpenAIProvider con su modelo default.
+        clear();
+        let p = provider_from_config(&store).expect("deepseek desde el .env");
+        assert!(p.name().contains(DEEPSEEK_DEFAULT_MODEL), "name: {}", p.name());
+
+        // (2) El environ GANA sobre el `.env`: aunque el store diga deepseek, un provider
+        //     explícito en el environ (openai) se impone.
+        clear();
+        std::env::set_var("SYNSEMA_LLM_PROVIDER", "openai");
+        std::env::set_var("OPENAI_API_KEY", "sk-environ");
+        let p2 = provider_from_config(&store).expect("openai desde el environ");
+        assert!(p2.name().contains(OPENAI_DEFAULT_MODEL), "el environ debe ganar: {}", p2.name());
+
+        // (3) Sin nada (ni environ ni store) → offline.
+        clear();
+        assert!(provider_from_config(&EnvStore::empty()).is_none());
+
+        // (4) `provider_from_env()` (compat) ignora el `.env`: misma ausencia → offline.
+        clear();
+        assert!(provider_from_env().is_none());
+
+        clear();
     }
 
     // -- Live (red real). Corre a mano:

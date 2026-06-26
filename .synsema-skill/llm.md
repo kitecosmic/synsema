@@ -30,13 +30,19 @@ synsema run program.syn --provider deepseek     # DeepSeek (OpenAI-compatible AP
 synsema run program.syn --provider ollama       # Local model
 ```
 
-Set API keys via environment:
+Set API keys via the protected `.env` (recommended — the key never enters the process environment,
+so no child process or program can read it), or via the environment for prod (systemd/Docker):
 ```bash
+# .env (gitignored) — preferred for local dev; no `export`/`source` needed:
+DEEPSEEK_API_KEY=sk-...
+SYNSEMA_LLM_PROVIDER=deepseek
+
+# or export to the process environment (wins over .env if both are set):
 export ANTHROPIC_API_KEY=sk-...
-export OPENAI_API_KEY=sk-...
-export MINIMAX_API_KEY=...
-export DEEPSEEK_API_KEY=sk-...
 ```
+Resolution precedence is the same as `env()`/`secret()`: **process environ > `.env` > default**.
+A key in `.env` reaches the runtime without leaking to the shell/children, and the `.syn` program
+still can't read it (the provider is used by the runtime, not the program).
 
 ## Context-aware prompts
 Every LLM call automatically receives:
@@ -54,12 +60,13 @@ Every LLM call automatically receives:
 - After 3 failures, logs a warning and returns raw response
 
 ## Provider setup
-The real LLM provider is selected and configured by the **runtime via environment variables** — the
-`.syn` program never names a host or key, so it can't redirect the call (no exfiltration) and isn't
-coupled to a vendor. Offline (no key) the engine returns descriptive placeholders, so programs stay
-runnable without any provider.
+The real LLM provider is selected and configured by the **runtime** from these knobs, each resolved
+**process environ > `.env` (protected store) > default** — the `.syn` program never names a host or
+key, so it can't redirect the call (no exfiltration) and isn't coupled to a vendor. Put them in a
+gitignored `.env` (key stays off the process environment) or export them for prod. Offline (no key)
+the engine returns descriptive placeholders, so programs stay runnable without any provider.
 
-| Env var | Purpose | Default |
+| Knob (env var or `.env` entry) | Purpose | Default |
 |---|---|---|
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `MINIMAX_API_KEY` / `DEEPSEEK_API_KEY` | API key; presence also auto-selects the provider | — (offline if absent) |
 | `SYNSEMA_LLM_PROVIDER` | Force provider: `anthropic`, `openai`, `minimax`, or `deepseek` | auto (from whichever key is set) |

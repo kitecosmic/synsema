@@ -176,14 +176,18 @@ pub(crate) fn wire_common_with_state(
     }));
 }
 
-/// Cablea el provider LLM REAL (HTTP) si hay uno configurado por env
-/// (`SYNSEMA_LLM_PROVIDER` / `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`). Cablea AMBOS
+/// Cablea el provider LLM REAL (HTTP) si hay uno configurado. Resuelve los knobs con
+/// precedencia `environ del proceso > .env (EnvStore protegido) > default` (DE-007): así la
+/// clave puede vivir SOLO en el `.env` (gitignoreado) sin exportarla. Cablea AMBOS
 /// callbacks: el de texto (reason/decide/analyze/generate) y el de paso tool-aware
 /// (`llm_step`). Si no hay provider (offline): NO cablea nada → las ops LLM caen a los
 /// placeholders descriptivos del core (`run` no se rompe). NO concede capabilities: el
 /// gate `require llm` sigue idéntico (lo cableó `wire_common`).
 fn wire_real_llm_provider(interp: &mut Interpreter) {
-    let provider = match crate::llm_providers::provider_from_env() {
+    // `load_default` lee `SYNSEMA_ENV_FILE`/`.env` (idempotente; honra `--env-file` y
+    // `--no-env-file`). El environ del proceso sigue ganando sobre el `.env`.
+    let store = EnvStore::load_default();
+    let provider = match crate::llm_providers::provider_from_config(&store) {
         Some(p) => p,
         None => return,
     };

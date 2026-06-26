@@ -56,6 +56,12 @@ LITERAL='no $interpolation here'
 > `.env` is the *source*; `env()` vs `secret()` is *how you read* it. The same key can
 > be read plain (`env`) or tainted (`secret`).
 
+**The LLM provider config resolves from `.env` too** (same `environ > .env > default` order). Put
+`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `MINIMAX_API_KEY` / `DEEPSEEK_API_KEY` (and optional
+`SYNSEMA_LLM_PROVIDER`/`SYNSEMA_LLM_MODEL`/…) in `.env` and the runtime reaches the provider **without
+exporting the key** — it never enters the process environment, and the `.syn` program still can't read
+it (it would need `require env/secret`, and even then sees it redacted). See [llm.md](llm.md#provider-setup).
+
 ## The `secret` type — LLM-proof by design
 
 A `secret` is an opaque value: you can pass it to the operations that consume it, but
