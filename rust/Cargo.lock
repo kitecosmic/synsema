@@ -1934,6 +1934,7 @@ name = "synsema-cli"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sha2",
  "synsema-agents",
  "synsema-capabilities",
  "synsema-core",

@@ -47,7 +47,12 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@v1
 
+      # SYNSEMA_VERSION = el tag que disparó el release (p. ej. v0.3.2). El binario lo
+      # hornea como su versión (ver crates/synsema-cli/build.rs) → `synsema version`
+      # reporta el release, no el commit de main.
       - name: Build
+        env:
+          SYNSEMA_VERSION: ${{ github.ref_name }}
         run: cargo build --release --locked --manifest-path rust/Cargo.toml -p synsema-cli --target ${{ matrix.target }}
 
       - name: Package (unix)

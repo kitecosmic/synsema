@@ -19,3 +19,5 @@ synsema-agents.workspace = true
 synsema-llm.workspace = true
 synsema-runtime.workspace = true
 serde_json.workspace = true
+# `synsema update`: verifica el sha256 del release descargado (RustCrypto, puro Rust).
+sha2.workspace = true

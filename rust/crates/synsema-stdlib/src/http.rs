@@ -120,13 +120,16 @@ fn build_http_request(method: &str, path: &str, host: &str, headers: Option<&[(S
     req.into_bytes()
 }
 
-fn do_request(
+/// Conecta (TCP, o TLS para `https`), envía el request y lee la respuesta cruda
+/// (head + body) hasta EOF. Base compartida por `do_request` (→ `String`) y
+/// `http_request_bytes` (→ bytes crudos, para descargar binarios sin corromperlos).
+fn fetch_raw(
     method: &str,
     url: &str,
     headers: Option<&[(String, String)]>,
     body: Option<&str>,
     timeout_secs: u64,
-) -> Result<HttpResult, String> {
+) -> Result<Vec<u8>, String> {
     let (scheme, host, port, path) = parse_url(url)?;
     if scheme != "http" && scheme != "https" {
         return Err(format!("unsupported scheme '{}': only http and https are supported", scheme));
@@ -166,8 +169,59 @@ fn do_request(
         stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
         read_to_end_tolerant(&mut stream, &mut buf)?;
     }
+    Ok(buf)
+}
 
+fn do_request(
+    method: &str,
+    url: &str,
+    headers: Option<&[(String, String)]>,
+    body: Option<&str>,
+    timeout_secs: u64,
+) -> Result<HttpResult, String> {
+    let buf = fetch_raw(method, url, headers, body, timeout_secs)?;
     parse_response(&buf)
+}
+
+/// Como `http_request` pero devuelve el body como **bytes crudos** (sin pasar por
+/// `String`, que corrompería un binario). Para descargar release assets. Devuelve
+/// `(status, body_bytes, headers)`. No sigue redirects — el caller los maneja.
+pub fn http_request_bytes(
+    method: &str,
+    url: &str,
+    headers: Option<&[(String, String)]>,
+    timeout_secs: u64,
+) -> Result<(i64, Vec<u8>, Vec<(String, String)>), String> {
+    let buf = fetch_raw(method, url, headers, None, timeout_secs)?;
+    parse_response_bytes(&buf)
+}
+
+/// Igual que `parse_response` pero devuelve el body como bytes crudos (para binarios).
+fn parse_response_bytes(buf: &[u8]) -> Result<(i64, Vec<u8>, Vec<(String, String)>), String> {
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| "malformed HTTP response".to_string())?;
+    let head = String::from_utf8_lossy(&buf[..split]);
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next().unwrap_or("");
+    let status: i64 = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut headers = Vec::new();
+    for line in lines {
+        if let Some(ci) = line.find(':') {
+            headers.push((line[..ci].trim().to_string(), line[ci + 1..].trim().to_string()));
+        }
+    }
+    let chunked = headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
+    });
+    let body_bytes = &buf[split + 4..];
+    let body = if chunked { dechunk_bytes(body_bytes) } else { body_bytes.to_vec() };
+    Ok((status, body, headers))
 }
 
 /// Lee hasta EOF tolerando el cierre sin `close_notify`. rustls es estricto: si el peer
@@ -221,9 +275,15 @@ fn parse_response(buf: &[u8]) -> Result<HttpResult, String> {
     })
 }
 
-/// Des-chunkea un body `Transfer-Encoding: chunked`: cada chunk es `<hex>\r\n<datos>\r\n`
-/// y termina con un chunk de tamaño 0. Concatena los datos (ignora trailers).
-fn dechunk_body(mut data: &[u8]) -> String {
+/// Des-chunkea un body `Transfer-Encoding: chunked` a `String` (texto).
+fn dechunk_body(data: &[u8]) -> String {
+    String::from_utf8_lossy(&dechunk_bytes(data)).to_string()
+}
+
+/// Des-chunkea un body `Transfer-Encoding: chunked` a bytes: cada chunk es
+/// `<hex>\r\n<datos>\r\n` y termina con un chunk de tamaño 0. Concatena los datos
+/// (ignora trailers). Opera en bytes para servir tanto a texto como a binarios.
+fn dechunk_bytes(mut data: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::with_capacity(data.len());
     while let Some(line_end) = data.windows(2).position(|w| w == b"\r\n") {
         let size_line = String::from_utf8_lossy(&data[..line_end]);
@@ -246,7 +306,7 @@ fn dechunk_body(mut data: &[u8]) -> String {
         // Saltá los datos + el `\r\n` que cierra el chunk.
         data = if end + 2 <= data.len() { &data[end + 2..] } else { &[] };
     }
-    String::from_utf8_lossy(&out).to_string()
+    out
 }
 
 fn urlencode(q: &[(String, String)]) -> String {

@@ -17,7 +17,9 @@ use synsema_runtime::daemon;
 use synsema_runtime::engine::{repl, run_source, run_swarm_dump, run_tests, TestReport};
 use synsema_runtime::serve::{run_serve_program_with_overrides, ServeOverrides};
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run | test [-v] <archivo|dir> | check | tokens | ast | repl | daemon | version> [--env-file <path> | --no-env-file] <archivo.syn>";
+mod update;
+
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run | test [-v] <archivo|dir> | check | tokens | ast | repl | daemon | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
 
 /// Serializa un mapa (clave→string) como objeto JSON ordenado.
 fn json_obj(pairs: Vec<(String, String)>) -> String {
@@ -66,16 +68,19 @@ fn main() -> ExitCode {
         Some("tokens") => cmd_tokens(&args),
         Some("ast") => cmd_ast(&args),
         Some("repl") => {
+            update::notify_if_outdated();
             repl();
             ExitCode::SUCCESS
         }
         Some("daemon") => cmd_daemon(&args),
+        Some("update") => update::cmd_update(),
         Some("version") | Some("--version") | Some("-V") => {
-            println!("Synsema v{}", env!("CARGO_PKG_VERSION"));
+            println!("Synsema {}", update::current_version());
+            update::notify_if_outdated();
             ExitCode::SUCCESS
         }
         Some(other) => {
-            eprintln!("subcomando desconocido: '{}'. Disponibles: conform, serve, run, test, check, tokens, ast, repl, daemon, version", other);
+            eprintln!("subcomando desconocido: '{}'. Disponibles: conform, serve, run, test, check, tokens, ast, repl, daemon, version, update", other);
             ExitCode::from(2)
         }
         None => {
