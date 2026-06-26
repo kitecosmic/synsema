@@ -6,7 +6,7 @@ Synsema is not a framework or a library — it's a language where observability,
 
 ## Fast *and* secure
 
-Synsema (Rust) **matches or beats Go** — and adds deny-by-default security none of the
+Synsema **matches or beats Go** — and adds deny-by-default security none of the
 mainstream stacks have. HTTP throughput, same workload, 50 concurrent connections:
 
 | Endpoint | Synsema | Go (net/http) | |
@@ -61,7 +61,7 @@ synsema run hello.syn
 
 ## Usage
 
-The command is `synsema` for both implementations (e.g. `synsema run program.syn`,
+The command is `synsema` (e.g. `synsema run program.syn`,
 `synsema serve app.syn`).
 
 ```bash
@@ -441,7 +441,7 @@ Automatically generates edge-case tests from your types and task signatures:
 
 ## Tests
 
-A conformance corpus plus unit and integration tests, all in Rust:
+A conformance corpus plus unit and integration tests:
 
 ```bash
 cargo test --manifest-path engine/Cargo.toml --workspace
@@ -455,59 +455,18 @@ synsema test tests/        # runs tests/*.test.syn
 
 ## Architecture
 
-```
-synsema/
-├── core/              # Language foundation
-│   ├── tokens.py      # Token definitions (60+ types)
-│   ├── lexer.py       # Tokenizer with significant whitespace
-│   ├── ast_nodes.py   # AST node definitions (40+ types)
-│   ├── parser.py      # Recursive descent + Pratt parser
-│   ├── interpreter.py # Tree-walking evaluator
-│   ├── types.py       # Type system with origin tracking
-│   ├── ast_api.py     # Structural AST manipulation
-│   ├── testgen.py     # Automatic test generation
-│   ├── intentional_ops.py  # apply/where/transform/reduce
-│   ├── addressable.py # Token-efficient code access
-│   └── flat_syntax.py # Document-style syntax translator
-├── capabilities/      # Security layer
-│   ├── model.py       # Capability types and sets
-│   ├── enforcer.py    # Runtime enforcement
-│   ├── builtins.py    # Secure I/O operations
-│   └── intent.py      # Intent parsing and enforcement
-├── runtime/           # Execution engine
-│   ├── engine.py      # Top-level orchestrator
-│   ├── speculative.py # Fork/rollback/commit execution
-│   ├── error_reporter.py  # Rich error diagnostics
-│   └── recovery.py    # Auto-recovery and escalation
-├── agents/            # Multi-agent system
-│   ├── blackboard.py  # Thread-safe shared state
-│   ├── swarm.py       # Agent lifecycle and coordination
-│   ├── resource_lock.py   # Preventive conflict detection
-│   ├── progress.py    # Task progress tracking
-│   ├── memory.py      # Persistent memory and rules
-│   └── builtins.py    # Agent operation builtins
-├── human/             # Human interaction
-│   └── interaction.py # Terminal, auto, queue, callback handlers
-├── llm/               # LLM integration
-│   ├── provider.py    # Anthropic, OpenAI, MiniMax, Ollama, Mock
-│   ├── context.py     # Context builder for enriched prompts
-│   └── validator.py   # Response validation + retry with feedback
-└── cli.py             # Command-line interface
-```
-
-### Production interpreter (`engine/`)
-
-The shipped binary is a Cargo workspace mirroring the packages above:
+A single native binary — no external runtime. The engine is organized into focused
+modules under `engine/crates/`:
 
 ```
 engine/crates/
 ├── synsema-core/         # lexer, parser, AST, types, interpreter, templates
 ├── synsema-capabilities/ # capability model + intent enforcement
-├── synsema-stdlib/       # http, database, cron, server, acme, mimetypes
-├── synsema-agents/       # blackboard, swarm, memory, progress, resource_lock
-├── synsema-runtime/      # engine, serve, parallel (concurrency), recovery, persistence, daemon
-├── synsema-llm/          # provider, context, validator, human
-└── synsema-cli/          # builds the `synsema` binary: run, serve, check, repl, ast, tokens, daemon
+├── synsema-stdlib/       # http, database, cron, server, ACME, mimetypes
+├── synsema-agents/       # blackboard, swarm, memory, progress, resource locking
+├── synsema-runtime/      # execution engine, serve, parallelism, recovery, persistence, daemon
+├── synsema-llm/          # LLM provider, context, validator, human interaction
+└── synsema-cli/          # the `synsema` command: run, serve, check, repl, ast, tokens, daemon
 ```
 
 The interpreter is **synchronous**; concurrency (`parallel_map`) and the web server are
