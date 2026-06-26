@@ -341,6 +341,20 @@ pub fn run_source(source: &str, filename: &str) -> RunResult {
 /// Tras terminar el main, joinea todos los hilos de agentes (`wait_all`) y refleja sus
 /// errores. Política de exit (DE-011): el resultado es `success=false` si el main falla
 /// **o** si algún agente terminó en ERROR — sin perder la salida ya producida por el main.
+/// Recolecta los agentes que terminaron en ERROR como líneas legibles
+/// `Agent error [<id>]: <msg>` (para reflejarlos en el exit code + stderr de `run`).
+fn collect_agent_errors(swarm: &Swarm) -> Vec<String> {
+    swarm
+        .agent_states()
+        .into_iter()
+        .filter(|(_, st)| *st == AgentState::Error)
+        .map(|(id, _)| {
+            let msg = swarm.agent_error(&id).unwrap_or_else(|| "agent error".to_string());
+            format!("Agent error [{}]: {}", id, msg)
+        })
+        .collect()
+}
+
 pub fn run_program(source: &str, filename: &str) -> RunResult {
     let swarm = Arc::new(Swarm::new());
     let sw = swarm.clone();
@@ -360,17 +374,8 @@ pub fn run_program(source: &str, filename: &str) -> RunResult {
     // Joinea los agentes lanzados por el main; ya no hay nadie más que pueda spawnear.
     swarm.wait_all();
 
-    // Refleja los agentes en ERROR en el resultado (exit ≠0 + línea de error legible),
-    // sin tocar la salida del main.
-    let agent_errors: Vec<String> = swarm
-        .agent_states()
-        .into_iter()
-        .filter(|(_, st)| *st == AgentState::Error)
-        .map(|(id, _)| {
-            let msg = swarm.agent_error(&id).unwrap_or_else(|| "agent error".to_string());
-            format!("Agent error [{}]: {}", id, msg)
-        })
-        .collect();
+    // Refleja los agentes en ERROR (exit ≠0 + línea de error), sin tocar la salida del main.
+    let agent_errors = collect_agent_errors(&swarm);
     if !agent_errors.is_empty() {
         result.success = false;
         result.errors.extend(agent_errors);
@@ -479,7 +484,10 @@ pub struct DiagRun {
     pub diagnostics: Vec<crate::error_reporter::ErrorDiagnostic>,
 }
 
-fn run_diag_inner(source: &str, filename: &str) -> DiagRun {
+/// Como `run_program` pero capturando el diagnóstico rico del error del MAIN. Si `swarm`
+/// es `Some`, los `spawn` corren en hilos aislados (DE-014): un error de agente NO se
+/// propaga al main; lo refleja el caller tras `wait_all` (en `run_with_diagnostics`).
+fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>) -> DiagRun {
     use crate::error_reporter::ErrorReporter;
     let program = match parse_source(source, filename) {
         Ok(p) => p,
@@ -501,6 +509,11 @@ fn run_diag_inner(source: &str, filename: &str) -> DiagRun {
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("program")));
     wire_common(&mut interp, &caps, false);
+    // Swarm real (DE-014): mismos hooks que `run` → los agentes corren aislados y un
+    // `raise` de agente no aborta el main ni trunca su diagnóstico.
+    if let Some(sw) = swarm {
+        wire_swarm_hooks(&mut interp, sw, "main");
+    }
     match interp.execute(&program) {
         Ok(_) => DiagRun {
             result: RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() },
@@ -536,19 +549,32 @@ fn run_diag_inner(source: &str, filename: &str) -> DiagRun {
     }
 }
 
-/// Corre un programa y devuelve diagnósticos ricos en caso de error (capa 9).
+/// Corre un programa y devuelve diagnósticos ricos en caso de error (capa 9). Cablea el
+/// swarm real (DE-014): los errores de agente quedan aislados (no abortan el main) y se
+/// reflejan tras `wait_all` como líneas `Agent error [<id>]` + `success=false`, igual que
+/// `run_program`. El diagnóstico rico sigue siendo el del error del MAIN.
 pub fn run_with_diagnostics(source: &str, filename: &str) -> DiagRun {
+    let swarm = Arc::new(Swarm::new());
+    let sw = swarm.clone();
     let src = source.to_string();
     let fname = filename.to_string();
-    std::thread::Builder::new()
+    let mut run = std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_diag_inner(&src, &fname))
+        .spawn(move || run_diag_inner(&src, &fname, Some(sw)))
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|_| DiagRun {
             result: RunResult { success: false, output: Vec::new(), errors: vec!["el motor abortó".to_string()] },
             diagnostics: Vec::new(),
-        })
+        });
+
+    swarm.wait_all();
+    let agent_errors = collect_agent_errors(&swarm);
+    if !agent_errors.is_empty() {
+        run.result.success = false;
+        run.result.errors.extend(agent_errors);
+    }
+    run
 }
 
 /// Modo secure: sin auto-grants. Para el modo seguro/serve y las integraciones.

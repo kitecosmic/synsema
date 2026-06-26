@@ -4,7 +4,7 @@
 use synsema_agents::swarm::AgentState;
 use synsema_core::number::Number;
 use synsema_core::types::SendValue;
-use synsema_runtime::engine::{run_program, Engine};
+use synsema_runtime::engine::{run_program, run_with_diagnostics, Engine};
 
 fn text(s: &str) -> SendValue {
     SendValue::Text(s.to_string())
@@ -172,4 +172,36 @@ fn run_program_without_agents_is_unaffected() {
     let r = run_program("print(\"hello\")\nprint(1 + 1)", "<t>");
     assert!(r.success, "{:?}", r.errors);
     assert_eq!(r.output, vec!["hello", "2"]);
+}
+
+// -- DE-014: `run --explain` (run_with_diagnostics) también aísla agentes --
+
+#[test]
+fn run_with_diagnostics_isolates_agent_error_and_keeps_main_output() {
+    // Antes (DE-014): el camino de diagnóstico era single-thread y un raise de agente
+    // abortaba el main (solo se veía "A"). Ahora cablea el swarm como `run`.
+    let src = "agent Crasher\n    raise(\"boom del agente\")\n\nprint(\"A\")\nspawn Crasher\nprint(\"B\")\nprint(\"C\")";
+    let run = run_with_diagnostics(src, "<t>");
+    assert_eq!(run.result.output, vec!["A", "B", "C"]);
+    assert!(!run.result.success);
+    // El main NO falló → no hay diagnóstico rico ...
+    assert!(run.diagnostics.is_empty(), "el main no falló: no debería haber diagnóstico");
+    // ... pero el error del agente se refleja (aislado).
+    assert!(
+        run.result.errors.iter().any(|e| e.contains("boom del agente")),
+        "errors={:?}",
+        run.result.errors
+    );
+}
+
+#[test]
+fn run_with_diagnostics_main_error_still_has_rich_diagnostic() {
+    // Sin regresión de DE-003/012/013: un error del MAIN sigue dando diagnóstico rico,
+    // con variables solo de usuario.
+    let run = run_with_diagnostics("let m be {\"a\": 1}\nprint(m[\"k\"])", "p.syn");
+    assert!(!run.result.success);
+    let diag = run.diagnostics.first().expect("debería haber diagnóstico del main");
+    assert!(diag.message.contains("no key"), "msg={}", diag.message);
+    assert!(diag.visible_variables.contains_key("m"));
+    assert!(!diag.visible_variables.contains_key("print"), "no debería listar builtins");
 }

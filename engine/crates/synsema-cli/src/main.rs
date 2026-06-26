@@ -320,6 +320,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         }
         if !run.result.success {
             if let Some(diag) = run.diagnostics.first() {
+                // Error del MAIN → diagnóstico rico (humano o JSON).
                 if fmt_json {
                     eprintln!(
                         "{}",
@@ -328,9 +329,16 @@ fn cmd_run(args: &[String]) -> ExitCode {
                 } else {
                     eprintln!("{}", diag.format_human());
                 }
+                // Además, los errores de agente aislados (DE-014): el main pudo fallar y,
+                // aparte, algún agente terminar en ERROR. Su línea corta se imprime junto
+                // al diagnóstico (la "Runtime error:" del main ya la cubre el diagnóstico).
+                for e in run.result.errors.iter().filter(|e| e.starts_with("Agent error [")) {
+                    eprintln!("{}", e);
+                }
             } else {
-                // Fallback (p.ej. `give`/`stop` top-level no producen diagnóstico):
-                // la línea corta. Nunca quedarse sin output.
+                // Sin diagnóstico del main: o bien sólo fallaron agentes (DE-014:
+                // `Agent error [<id>]`), o un `give`/`stop` top-level (línea corta). En
+                // ambos casos imprimir los errores. Nunca quedarse sin output.
                 for e in &run.result.errors {
                     eprintln!("{}", e);
                 }
