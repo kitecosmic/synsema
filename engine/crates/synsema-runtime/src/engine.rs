@@ -253,7 +253,13 @@ fn finish(mut interp: Interpreter, result: Result<SynValue, Control>) -> RunResu
 /// Nota: el main NO recibe `log_hook` (a diferencia de `setup_swarm_interpreter`), para
 /// que su salida vaya solo a `output` y el CLI la imprima una sola vez. Los agentes sí
 /// transmiten su `log`/`print` en tiempo real (prefijo `[id]`).
-fn run_inner(source: &str, filename: &str, secure: bool, swarm: Option<Arc<Swarm>>) -> RunResult {
+fn run_inner(
+    source: &str,
+    filename: &str,
+    secure: bool,
+    swarm: Option<Arc<Swarm>>,
+    live_output: bool,
+) -> RunResult {
     match parse_source(source, filename) {
         Err(CompileError::Lex(e)) => RunResult {
             success: false,
@@ -267,6 +273,9 @@ fn run_inner(source: &str, filename: &str, secure: bool, swarm: Option<Arc<Swarm
         },
         Ok(program) => {
             let mut interp = Interpreter::new();
+            // Salida en vivo sólo en `run` interactivo; en conform/test la salida se colecta
+            // (flush/read_line no drenan a stdout). Ver DE-019.
+            interp.live_output = live_output;
             let caps = Rc::new(RefCell::new(CapabilitySet::new("program")));
             let progress = Rc::new(RefCell::new(ProgressManager::new()));
             let memory = Rc::new(RefCell::new(AgentMemory::new()));
@@ -317,7 +326,7 @@ fn spawn_run(source: &str, filename: &str, secure: bool) -> RunResult {
     let fname = filename.to_string();
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_inner(&src, &fname, secure, None))
+        .spawn(move || run_inner(&src, &fname, secure, None, false))
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|_| RunResult {
@@ -362,7 +371,7 @@ pub fn run_program(source: &str, filename: &str) -> RunResult {
     let fname = filename.to_string();
     let mut result = std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_inner(&src, &fname, false, Some(sw)))
+        .spawn(move || run_inner(&src, &fname, false, Some(sw), true))
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|_| RunResult {
@@ -507,6 +516,8 @@ fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>) -> Di
         }
     };
     let mut interp = Interpreter::new();
+    // Camino de `run --explain` (interactivo): salida en vivo (DE-019).
+    interp.live_output = true;
     let caps = Rc::new(RefCell::new(CapabilitySet::new("program")));
     wire_common(&mut interp, &caps, false);
     // Swarm real (DE-014): mismos hooks que `run` → los agentes corren aislados y un

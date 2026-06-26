@@ -272,6 +272,11 @@ pub struct SwarmHooks {
 pub struct Interpreter {
     pub global_env: Rc<RefCell<Environment>>,
     pub output: Vec<String>,
+    /// Salida en vivo (DE-018/019): sólo `true` en el camino de `synsema run` interactivo.
+    /// Gatea el drenado de `flush()`/`read_line` a stdout. En `conform`/`test`/`serve`
+    /// queda `false` → la salida se COLECTA en `output` (JSON `out`/respuesta), nunca a
+    /// stdout crudo (no rompe el contrato del oráculo).
+    pub live_output: bool,
     pub blackboard: HashMap<String, SynValue>,
     pub agent_definitions: HashMap<String, (Vec<Node>, Rc<RefCell<Environment>>)>,
     recursion_depth: usize,
@@ -381,6 +386,7 @@ impl Interpreter {
             module_cache: HashMap::new(),
             loading_modules: HashSet::new(),
             exports_collector: vec![Vec::new()],
+            live_output: false,
         };
         interp.register_builtins();
         interp
@@ -671,6 +677,8 @@ impl Interpreter {
         self.register("replace_text", 3, Rc::new(|i, a, l| i.b_replace_text(a, l)));
         // Entrada de stdin (CLI): lee una línea; `nothing` en EOF. Funciona con pipe.
         self.register("read_line", -1, Rc::new(|i, a, l| i.b_read_line(a, l)));
+        // Vuelca la salida pendiente a stdout en vivo (REPLs/loops largos). Ver b_flush.
+        self.register("flush", 0, Rc::new(|i, _a, _l| i.b_flush()));
         // Estado del provider LLM: true si el motor cableó uno real (vs placeholder offline).
         self.register("llm_available", 0, Rc::new(|i, _a, _l| Ok(syn_bool(i.llm_callback.is_some()))));
         // Regex (computación pura, sin capability)
@@ -2818,12 +2826,38 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
         Ok(syn_text(out))
     }
+    /// Vuelca a stdout (en vivo) lo acumulado en `self.output` y limpia el buffer. Lo que
+    /// se drena se quita de `output` → `cmd_run` no lo re-imprime al final, y `conform`
+    /// sólo ve lo que el programa NO drenó (los tests de conform no llaman flush/read_line).
+    fn drain_output(&mut self) {
+        use std::io::Write;
+        for line in self.output.drain(..) {
+            println!("{}", line);
+        }
+        let _ = std::io::stdout().flush();
+    }
+    /// `flush()`: salida en vivo (REPLs/loops largos). Vuelca `output` pendiente a stdout.
+    /// Sólo actúa en `run` interactivo (`live_output`); bajo `conform`/`test`/`serve` es
+    /// no-op → la salida queda en `output` y entra al JSON/respuesta (DE-019).
+    fn b_flush(&mut self) -> Result<SynValue, Control> {
+        if self.live_output {
+            self.drain_output();
+        }
+        Ok(SynValue::Nothing)
+    }
     /// `read_line(prompt?)`: lee una línea de stdin (CLI). Si hay prompt, lo imprime sin
     /// newline antes de leer. Devuelve el texto sin el `\n`/`\r\n` final; `nothing` en EOF.
     /// Lee stdin crudo → funciona con TTY y con entrada redirigida/pipe (a diferencia de
     /// `ask`, que es un backend de decisión humana).
     fn b_read_line(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
         use std::io::Write;
+        // Drena la salida pendiente (respuesta del turno previo) ANTES del prompt, para
+        // que un REPL sea interactivo de verdad (DE-018) sin requerir flush() explícito.
+        // Sólo en `run` interactivo; bajo conform/test/serve no se drena (DE-019). La
+        // LECTURA de stdin se hace igual en cualquier modo.
+        if self.live_output {
+            self.drain_output();
+        }
         if let Some(p) = args.first() {
             if !matches!(p, SynValue::Nothing) {
                 print!("{}", raw_str(p));

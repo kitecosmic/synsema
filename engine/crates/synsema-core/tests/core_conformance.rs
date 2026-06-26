@@ -480,3 +480,13 @@ fn fold_strips_accents_and_lowercases() {
 fn llm_available_false_offline() {
     assert_output("print(text(llm_available()))", &["false"]);
 }
+
+// -- flush (DE-018/019): no-op bajo el runner que colecta (live_output=false) --
+
+#[test]
+fn flush_noop_when_not_live() {
+    // DE-019: el runner mínimo de core COLECTA la salida (como conform/test), con
+    // live_output=false → flush() NO drena a stdout; "X" e "Y" quedan en `output`.
+    // (El drenado en vivo del camino `run` se verifica end-to-end contra el binario.)
+    assert_output("print(\"X\")\nflush()\nprint(\"Y\")", &["X", "Y"]);
+}
