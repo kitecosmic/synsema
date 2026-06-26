@@ -241,7 +241,15 @@ fn finish(mut interp: Interpreter, result: Result<SynValue, Control>) -> RunResu
 // Camino sin swarm (conform capas 1-6)
 // =========================================================
 
-fn run_inner(source: &str, filename: &str, secure: bool) -> RunResult {
+/// Corre el main. Si `swarm` es `Some`, cablea sus hooks en el intérprete principal
+/// (agente "main") → cada `spawn` corre en su propio hilo aislado (camino de
+/// `synsema run`, DE-011). Con `None`, comportamiento de un solo hilo (lo que usa
+/// `conform` y los tests de `run_source`): `spawn` cae al fallback in-process.
+///
+/// Nota: el main NO recibe `log_hook` (a diferencia de `setup_swarm_interpreter`), para
+/// que su salida vaya solo a `output` y el CLI la imprima una sola vez. Los agentes sí
+/// transmiten su `log`/`print` en tiempo real (prefijo `[id]`).
+fn run_inner(source: &str, filename: &str, secure: bool, swarm: Option<Arc<Swarm>>) -> RunResult {
     match parse_source(source, filename) {
         Err(CompileError::Lex(e)) => RunResult {
             success: false,
@@ -262,6 +270,12 @@ fn run_inner(source: &str, filename: &str, secure: bool) -> RunResult {
             // Conectividad LLM real: si hay provider por env, cablea texto + paso
             // tool-aware; offline (sin key) deja los placeholders del core.
             wire_real_llm_provider(&mut interp);
+
+            // Swarm real (DE-011): los hooks de spawn/share/observe/signal/wait_for del
+            // main van al swarm compartido → los agentes corren en hilos aislados.
+            if let Some(sw) = swarm {
+                wire_swarm_hooks(&mut interp, sw, "main");
+            }
 
             // StatePersistence cross-run (espeja engine.run_source del oráculo): para
             // archivos nombrados (no "<stdin>") carga el estado previo antes de ejecutar
@@ -299,7 +313,7 @@ fn spawn_run(source: &str, filename: &str, secure: bool) -> RunResult {
     let fname = filename.to_string();
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_inner(&src, &fname, secure))
+        .spawn(move || run_inner(&src, &fname, secure, None))
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|_| RunResult {
@@ -310,8 +324,54 @@ fn spawn_run(source: &str, filename: &str, secure: bool) -> RunResult {
 }
 
 /// Modo no-secure (default real): auto-concede STDOUT y TIME. Lo que usa `conform`.
+/// Camino de un solo hilo: `spawn` corre el agente in-process (sin swarm).
 pub fn run_source(source: &str, filename: &str) -> RunResult {
     spawn_run(source, filename, false)
+}
+
+/// Camino de `synsema run` (DE-011): cablea el swarm real → cada `spawn` corre en su
+/// propio hilo con su intérprete (aislado), igual que `conform --swarm`/`serve`, pero con
+/// la salida normal de `run` (no JSON). Un `raise` sin recover dentro de un agente queda
+/// CONTENIDO (estado ERROR), no tumba el main ni trunca su salida.
+///
+/// Tras terminar el main, joinea todos los hilos de agentes (`wait_all`) y refleja sus
+/// errores. Política de exit (DE-011): el resultado es `success=false` si el main falla
+/// **o** si algún agente terminó en ERROR — sin perder la salida ya producida por el main.
+pub fn run_program(source: &str, filename: &str) -> RunResult {
+    let swarm = Arc::new(Swarm::new());
+    let sw = swarm.clone();
+    let src = source.to_string();
+    let fname = filename.to_string();
+    let mut result = std::thread::Builder::new()
+        .stack_size(INTERP_STACK_SIZE)
+        .spawn(move || run_inner(&src, &fname, false, Some(sw)))
+        .expect("no se pudo crear el hilo del motor")
+        .join()
+        .unwrap_or_else(|_| RunResult {
+            success: false,
+            output: Vec::new(),
+            errors: vec!["el motor abortó (probable desborde de stack nativo)".to_string()],
+        });
+
+    // Joinea los agentes lanzados por el main; ya no hay nadie más que pueda spawnear.
+    swarm.wait_all();
+
+    // Refleja los agentes en ERROR en el resultado (exit ≠0 + línea de error legible),
+    // sin tocar la salida del main.
+    let agent_errors: Vec<String> = swarm
+        .agent_states()
+        .into_iter()
+        .filter(|(_, st)| *st == AgentState::Error)
+        .map(|(id, _)| {
+            let msg = swarm.agent_error(&id).unwrap_or_else(|| "agent error".to_string());
+            format!("Agent error [{}]: {}", id, msg)
+        })
+        .collect();
+    if !agent_errors.is_empty() {
+        result.success = false;
+        result.errors.extend(agent_errors);
+    }
+    result
 }
 
 // =========================================================

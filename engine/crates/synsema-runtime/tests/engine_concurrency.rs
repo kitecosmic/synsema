@@ -4,7 +4,7 @@
 use synsema_agents::swarm::AgentState;
 use synsema_core::number::Number;
 use synsema_core::types::SendValue;
-use synsema_runtime::engine::Engine;
+use synsema_runtime::engine::{run_program, Engine};
 
 fn text(s: &str) -> SendValue {
     SendValue::Text(s.to_string())
@@ -123,4 +123,53 @@ fn agent_error_captured_in_swarm() {
     let crasher = states.iter().find(|(id, _)| id.contains("Crasher"));
     assert!(crasher.is_some(), "no se encontró Crasher en {:?}", states);
     assert_eq!(crasher.unwrap().1, AgentState::Error);
+}
+
+// -- DE-011: aislamiento de agentes en `synsema run` (vía run_program) --
+
+#[test]
+fn run_program_isolates_agent_error_and_keeps_main_output() {
+    // probe_19: un `raise` sin recover dentro de un agente NO debe tumbar el main ni
+    // truncar su salida. Antes (camino sin swarm) se imprimía solo "A".
+    let src = "agent Crasher\n    raise(\"boom del agente\")\n\nprint(\"A\")\nspawn Crasher\nprint(\"B\")\nprint(\"C\")";
+    let r = run_program(src, "<t>");
+    // (1) La salida del main se preserva completa.
+    assert_eq!(r.output, vec!["A", "B", "C"]);
+    // (4) Política de exit: ≠0 porque un agente terminó en ERROR ...
+    assert!(!r.success, "se esperaba fallo por agente en ERROR");
+    // (3) ... y el error del agente se reporta (no se traga en silencio).
+    assert!(
+        r.errors.iter().any(|e| e.contains("boom del agente")),
+        "el error del agente no se reportó: {:?}",
+        r.errors
+    );
+}
+
+#[test]
+fn run_program_delayed_agent_crash_does_not_abort_main() {
+    // probe_20: crash TARDÍO. El agente espera y luego falla; el main debe completar
+    // su salida igualmente (no es una carrera: la salida del main no se descarta).
+    let src = "agent Slow\n    sleep(0.2)\n    raise(\"late boom\")\n\nprint(\"A\")\nspawn Slow\nprint(\"B\")\nprint(\"C\")";
+    let r = run_program(src, "<t>");
+    assert_eq!(r.output, vec!["A", "B", "C"]);
+    assert!(!r.success);
+    assert!(r.errors.iter().any(|e| e.contains("late boom")), "errors={:?}", r.errors);
+}
+
+#[test]
+fn run_program_happy_path_blackboard_and_signal() {
+    // probe_13 (criterio 5): caso feliz intacto — spawn + share + signal coordinan bien
+    // entre main y agente (idéntico a conform --swarm).
+    let src = "agent Producer\n    share \"payload\" as \"out\"\n    signal \"done\"\n\nspawn Producer\nwait_for \"done\"\nobserve \"out\" as got\nprint(got)";
+    let r = run_program(src, "<t>");
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["payload"]);
+}
+
+#[test]
+fn run_program_without_agents_is_unaffected() {
+    // Programa sin agentes: comportamiento normal, sin regresión.
+    let r = run_program("print(\"hello\")\nprint(1 + 1)", "<t>");
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["hello", "2"]);
 }

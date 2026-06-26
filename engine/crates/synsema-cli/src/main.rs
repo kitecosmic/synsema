@@ -15,7 +15,7 @@ use std::process::ExitCode;
 // El conform usa el motor (runtime): intérprete + modelo de seguridad cableado.
 use synsema_runtime::daemon;
 use synsema_runtime::engine::{
-    repl, run_source, run_swarm_dump, run_tests, run_with_diagnostics, TestReport,
+    repl, run_program, run_source, run_swarm_dump, run_tests, run_with_diagnostics, TestReport,
 };
 use synsema_runtime::serve::{run_serve_program_with_overrides, ServeOverrides};
 
@@ -340,7 +340,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let result = run_source(&source, &path);
+    // Camino normal: swarm real (DE-011). Los `spawn` corren en hilos aislados; un agente
+    // que falla NO tumba el main ni trunca su salida. Sale ≠0 si el main falla o si algún
+    // agente terminó en ERROR.
+    let result = run_program(&source, &path);
     for line in &result.output {
         println!("{}", line);
     }

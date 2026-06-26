@@ -29,6 +29,16 @@ spawn Researcher with query = "AI safety"
 - **Agent `log`/`print` appears in the main process stdout**, prefixed `[AgentName]` — agents are
   not silent during development.
 
+**Agent lifecycle & isolation (`run`, `conform --swarm`, `serve` all use real threads).** An agent
+runs in its own isolated interpreter: a failing agent (e.g. a `raise` with no `recover`) is
+**contained** — it transitions to state `ERROR` and does **not** abort the main program or truncate
+its output. When the main program finishes, `synsema run` **joins** the spawned agents (waits for
+them) before exiting, so the process does not return while agents are still working. **Exit code:**
+`synsema run` exits non-zero if the main program fails **or** if any agent ended in `ERROR` (each
+such failure is reported on stderr as `Agent error [<id>]: <message>`); a clean run with all agents
+`DONE` exits 0. (For the post-run state dump — blackboard + per-agent states as JSON — use
+`conform --swarm`.)
+
 ## Blackboard (shared state)
 ```
 share value as "key"                     -- publish (key can be expression)
