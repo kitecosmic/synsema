@@ -44,6 +44,12 @@ let search be recall(nothing, nothing, "Monday")
 forget_memory(entry_id)
 ```
 
+**`recall` with multiple tags is OR, not AND.** `recall("learning", ["api", "perf"])` returns entries
+tagged with **at least one** of the tags (any), not only those with all of them. To narrow by a
+specific combination, use a single **composite tag** in both `remember` and `recall`
+(e.g. `"objective:" + session`) instead of multiple tags. (`category` and `search` still narrow as
+expected; the OR only applies among the tags.)
+
 **Categories are a fixed set (English only):**
 `preference`, `rule`, `learning`, `decision`, `context`
 

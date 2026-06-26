@@ -180,7 +180,7 @@ Response helpers (set the HTTP status; body follows the response contract):
 - `progress_display(task_name)` → formatted text
 - `progress_percent(task_name)` → number 0-100
 - `remember(category, content, tags?)` → entry_id
-- `recall(category?, tags?, search?)` → list of entries
+- `recall(category?, tags?, search?)` → list of entries (multiple `tags` = OR / any, not AND — use a composite tag to narrow; see memory.md)
 - `forget_memory(entry_id)` → bool
 - `add_rule(name, level, description, category?)` → bool
 - `check_rules(category?, context_map?)` → list of violations

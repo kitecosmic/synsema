@@ -22,12 +22,15 @@ Auto-granted in plain `run`/`conform` (like `stdout`/`time`), enforced in `serve
 stripped inside a `sandbox`. See [capabilities.md](capabilities.md#the-llm-capability).
 
 ## Providers
+The provider is chosen by the **runtime config** (there is no `--provider` CLI flag): set
+`SYNSEMA_LLM_PROVIDER` (in the environment or `.env`), or let it auto-select from whichever API key is
+present.
 ```bash
-synsema run program.syn --provider anthropic   # Claude
-synsema run program.syn --provider openai       # GPT
-synsema run program.syn --provider minimax      # MiniMax M3 (Anthropic-compatible API)
-synsema run program.syn --provider deepseek     # DeepSeek (OpenAI-compatible API)
-synsema run program.syn --provider ollama       # Local model
+SYNSEMA_LLM_PROVIDER=anthropic   # Claude (also auto-selected by ANTHROPIC_API_KEY)
+SYNSEMA_LLM_PROVIDER=openai      # GPT (or OPENAI_API_KEY)
+SYNSEMA_LLM_PROVIDER=minimax     # MiniMax M3 — Anthropic-compatible API (or MINIMAX_API_KEY)
+SYNSEMA_LLM_PROVIDER=deepseek    # DeepSeek — OpenAI-compatible API (or DEEPSEEK_API_KEY)
+# Local model: SYNSEMA_LLM_PROVIDER=openai + SYNSEMA_LLM_BASE_URL=http://localhost:11434/v1 (Ollama)
 ```
 
 Set API keys via the protected `.env` (recommended — the key never enters the process environment,
@@ -58,6 +61,12 @@ Every LLM call automatically receives:
 - If the LLM gives an invalid response, Synsema retries (up to 3 times)
 - Each retry includes feedback: "Your response was invalid because X"
 - After 3 failures, logs a warning and returns raw response
+
+> **The "exactly one option" guarantee only holds with a real provider.** Offline (no provider
+> configured), `decide` returns the placeholder `"[decision pending]"`, which is **not** one of your
+> options. Code that branches on a `decide` result must handle this — either guard for
+> `"[decision pending]"` / a value outside the option set, or detect offline mode first. (Same idea
+> for the other ops: offline they return descriptive placeholders, not real answers.)
 
 ## Provider setup
 The real LLM provider is selected and configured by the **runtime** from these knobs, each resolved

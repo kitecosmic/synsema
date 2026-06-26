@@ -276,17 +276,23 @@ fn register_serve_state_builtins(interp: &Interpreter, state: SharedState) {
                 None => return Err(Control::Error(RuntimeError::new("state_incr: missing key"))),
             };
             let delta = match args.get(1) {
-                Some(SynValue::Number(n)) => n.to_f64(),
-                _ => 1.0,
+                Some(SynValue::Number(n)) => n.clone(),
+                _ => Number::Int(1), // default entero
             };
             let mut guard = s.lock().unwrap();
             let current = match guard.get(&key) {
-                Some(SendValue::Number(n)) => n.to_f64(),
-                _ => 0.0,
+                Some(SendValue::Number(n)) => n.clone(),
+                _ => Number::Int(0),
             };
-            let new_val = current + delta;
-            guard.insert(key, to_send(&SynValue::Number(synsema_core::number::Number::Float(new_val))));
-            Ok(SynValue::Number(synsema_core::number::Number::Float(new_val)))
+            // Aritmética entera cuando AMBOS son Int (contadores → JSON `1`, no `1.0`);
+            // Float si alguno es Float/Big (DE-009). `SendValue::Number` preserva la
+            // variante Int/Float en el round-trip al state compartido.
+            let new_val = match (&current, &delta) {
+                (Number::Int(a), Number::Int(b)) => Number::Int(a + b),
+                _ => Number::Float(current.to_f64() + delta.to_f64()),
+            };
+            guard.insert(key, to_send(&SynValue::Number(new_val.clone())));
+            Ok(SynValue::Number(new_val))
         }));
     }
     {

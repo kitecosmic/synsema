@@ -230,4 +230,7 @@ fn state_shared_across_requests() {
     // El contador (compartido entre requests) debe ser 3 — un global normal volvería a 0.
     let body = resp.rsplit("\r\n\r\n").next().unwrap_or("");
     assert!(body.contains('3'), "state_* debería compartir el contador entre requests; body: {:?}", body);
+    // DE-009: un contador entero sale como JSON `3`, NO `3.0` (state_incr hace aritmética
+    // entera cuando current y delta son Int).
+    assert!(!body.contains("3.0"), "state_incr de enteros debe dar Int, no Float; body: {:?}", body);
 }
