@@ -80,13 +80,13 @@ pub(crate) fn wire_common_with_state(
     // env/secret/reveal/bearer/crypto. Deny-by-default: env()/secret()/reveal() exigen
     // su capability incluso en modo no-secure (NO se auto-conceden como stdout/time).
     register_secret_builtins(interp, caps.clone(), Rc::new(EnvStore::load_default()));
-    register_http_builtins(interp);
+    register_http_builtins(interp, caps.clone());
     // Hashing SHA (puro, sin capability): sha256/sha512 → bytes.
     synsema_stdlib::hashing::register_hash_builtins(interp);
     // cron/db/progress/memory: sus builtins clonan el Rc internamente → viven mientras
     // viva el intérprete.
     register_cron_builtins(interp, Rc::new(CronScheduler::new()));
-    register_database_builtins(interp, Rc::new(RefCell::new(DatabaseManager::new())));
+    register_database_builtins(interp, Rc::new(RefCell::new(DatabaseManager::new())), caps.clone());
     register_agent_builtins(interp, progress, memory);
     // Helpers de respuesta + vocabulario de contenido (ok/created/.../content). El
     // oráculo los registra en el intérprete principal siempre.

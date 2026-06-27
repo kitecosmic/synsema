@@ -5,8 +5,8 @@
 //! `Runtime error: Capability not granted: <cap>` (sin ubicación — la
 //! CapabilityViolation no la lleva; el prefijo de categoría lo agrega el motor).
 //!
-//! Capa 5: read_file/write_file hacen la op real de filesystem; fetch sólo chequea
-//! la capability (el HTTP real es capa 6).
+//! Capa 5: read_file/write_file/run hacen la op real (filesystem/proceso). El HTTP
+//! (fetch/http_*) vive en synsema-stdlib/http.rs, gateado por `net`.
 
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -811,27 +811,8 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         );
     }
 
-    // fetch(url) — sólo chequeo de capability (HTTP real es capa 6).
-    // Requiere net("<hostname>") (hostname del URL, no el URL completo).
-    {
-        let caps = caps.clone();
-        interp.register_builtin(
-            "fetch",
-            -1,
-            Rc::new(move |_i, args, _loc| {
-                let url = raw_str(arg(args, 0)?);
-                let host = match url_hostname(&url) {
-                    Some(h) if !h.is_empty() => h,
-                    _ => url.clone(),
-                };
-                require(&caps, Capability::new(CapabilityType::Net, Some(host)), "fetch()")?;
-                // Capability concedida: el HTTP real llega en capa 6.
-                Err(Control::Error(RuntimeError::new(
-                    "fetch: the HTTP runtime is not available yet (capa 6)",
-                )))
-            }),
-        );
-    }
+    // (fetch vive ahora en synsema-stdlib/http.rs: cliente HTTP real, gateado por net —
+    // junto con http/http_get/http_post/http_put/http_delete. El stub "capa 6" se removió.)
 
     // -- Builtins de time (todos requieren la capability `time`; UTC) --
 

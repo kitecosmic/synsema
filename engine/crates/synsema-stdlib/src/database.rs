@@ -15,10 +15,11 @@ use indexmap::IndexMap;
 use rusqlite::types::Value;
 use rusqlite::{params_from_iter, Connection, OpenFlags};
 
+use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::number::Number;
 use synsema_core::types::{
-    syn_bool, syn_float, syn_int, syn_list, syn_map, syn_text, ServerValue, SynValue,
+    syn_bool, syn_bytes, syn_float, syn_int, syn_list, syn_map, syn_text, ServerValue, SynValue,
 };
 
 /// Handle al `DatabaseManager` abstrayendo el modo de acceso: `Rc<RefCell>` para
@@ -163,6 +164,12 @@ impl DatabaseManager {
         Ok(total)
     }
 
+    /// Path de la conexión default (para el scope de la capability `db` en las ops de
+    /// datos). `None` si no hay ninguna conexión abierta.
+    pub fn default_path(&self) -> Option<String> {
+        self.default_db.clone()
+    }
+
     pub fn tables(&self) -> Result<Vec<String>, String> {
         let rows = self.query(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
@@ -186,7 +193,8 @@ fn value_to_syn(v: &Value) -> SynValue {
         Value::Integer(i) => syn_int(*i),
         Value::Real(f) => syn_float(*f),
         Value::Text(s) => syn_text(s.as_str()),
-        Value::Blob(b) => syn_text(String::from_utf8_lossy(b).into_owned()),
+        // BLOB → bytes byte-exacto (NO lossy): un blob no-UTF8 ya no se corrompe (MF-010).
+        Value::Blob(b) => syn_bytes(b.clone()),
     }
 }
 
@@ -204,6 +212,8 @@ fn syn_to_value(v: &SynValue) -> Value {
         // de la DB** (SQL parametrizado). No hay query-log que redactar (este crate no
         // loguea queries ni params); si se agregara uno en el futuro, DEBE redactar.
         SynValue::Secret(s) => Value::Text(s.expose().to_string()),
+        // bytes → BLOB byte-exacto (round-trip con value_to_syn; MF-010).
+        SynValue::Bytes(b) => Value::Blob(b[..].to_vec()),
         // Bool/Text/List/Map → str(val) (Display de SynValue).
         other => Value::Text(other.to_string()),
     }
@@ -239,17 +249,35 @@ fn row_to_syn(row: &Row) -> SynValue {
     syn_map(m)
 }
 
-/// Registra los builtins de base de datos sobre un `DbHandle` (compartido).
-pub fn register_database_builtins<H: DbHandle>(interp: &Interpreter, db: H) {
+/// Chequea la capability `db(scope)`; convierte la violación en `Control::Error` SIN
+/// ubicación (como secure.rs). `covers()` normaliza el scope, así que pasar el path crudo.
+fn require_db(caps: &Rc<RefCell<CapabilitySet>>, scope: &str, source: &str) -> Result<(), Control> {
+    caps.borrow_mut()
+        .require(&Capability::new(CapabilityType::Db, Some(scope.to_string())), source)
+        .map_err(|v| Control::Error(RuntimeError::new(v.message)))
+}
+
+/// Registra los builtins de base de datos sobre un `DbHandle` (compartido). Gateados por
+/// la capability `db` (deny-by-default): `db_open` chequea el scope de la base que abre;
+/// las ops de datos (sql/sql_exec/…) chequean el scope de la conexión default que usan.
+/// `db_close` queda sin gatear (cerrar es benigno).
+pub fn register_database_builtins<H: DbHandle>(
+    interp: &Interpreter,
+    db: H,
+    caps: Rc<RefCell<CapabilitySet>>,
+) {
     // db_open(path, mode?)
     {
         let db = db.clone();
+        let caps = caps.clone();
         interp.register_builtin(
             "db_open",
             -1,
             Rc::new(move |_i, args, _loc| {
                 let path = raw_str(args.first().ok_or_else(|| err("missing argument"))?);
                 let mode = args.get(1).map(raw_str).unwrap_or_else(|| "readwrite".to_string());
+                let scope = if mode == "memory" { ":memory:".to_string() } else { path.clone() };
+                require_db(&caps, &scope, "db_open()")?;
                 db.write(|m| m.open(&path, &mode)).map_err(err)?;
                 Ok(syn_bool(true))
             }),
@@ -273,12 +301,16 @@ pub fn register_database_builtins<H: DbHandle>(interp: &Interpreter, db: H) {
     // sql(query, params?) → lista de mapas-fila
     {
         let db = db.clone();
+        let caps = caps.clone();
         interp.register_builtin(
             "sql",
             -1,
             Rc::new(move |_i, args, _loc| {
                 let query = raw_str(args.first().ok_or_else(|| err("missing argument"))?);
                 let params = params_arg(args.get(1));
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "sql()")?;
+                }
                 let rows = db.read(|m| m.query(&query, &params)).map_err(err)?;
                 Ok(syn_list(rows.iter().map(row_to_syn).collect()))
             }),
@@ -288,12 +320,16 @@ pub fn register_database_builtins<H: DbHandle>(interp: &Interpreter, db: H) {
     // sql_exec(statement, params?) → {rows_affected, last_id}
     {
         let db = db.clone();
+        let caps = caps.clone();
         interp.register_builtin(
             "sql_exec",
             -1,
             Rc::new(move |_i, args, _loc| {
                 let stmt = raw_str(args.first().ok_or_else(|| err("missing argument"))?);
                 let params = params_arg(args.get(1));
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "sql_exec()")?;
+                }
                 let (affected, last_id) = db.read(|m| m.execute(&stmt, &params)).map_err(err)?;
                 let mut m = IndexMap::new();
                 m.insert("rows_affected".to_string(), syn_int(affected));
@@ -306,10 +342,14 @@ pub fn register_database_builtins<H: DbHandle>(interp: &Interpreter, db: H) {
     // sql_tables() → lista de nombres
     {
         let db = db.clone();
+        let caps = caps.clone();
         interp.register_builtin(
             "sql_tables",
             0,
             Rc::new(move |_i, _args, _loc| {
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "sql_tables()")?;
+                }
                 let tables = db.read(|m| m.tables()).map_err(err)?;
                 Ok(syn_list(tables.iter().map(|t| syn_text(t.as_str())).collect()))
             }),
@@ -319,11 +359,15 @@ pub fn register_database_builtins<H: DbHandle>(interp: &Interpreter, db: H) {
     // sql_batch(statement, params_list) → {rows_affected}
     {
         let db = db.clone();
+        let caps = caps.clone();
         interp.register_builtin(
             "sql_batch",
             2,
             Rc::new(move |_i, args, _loc| {
                 let stmt = raw_str(args.first().ok_or_else(|| err("missing argument"))?);
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "sql_batch()")?;
+                }
                 let params_list: Vec<Vec<Value>> = match args.get(1) {
                     Some(SynValue::List(l)) => l
                         .borrow()
@@ -343,12 +387,16 @@ pub fn register_database_builtins<H: DbHandle>(interp: &Interpreter, db: H) {
     // paged(query, params?) → marcador de paginación lazy para `serve` (_PAGED).
     {
         let db = db.clone();
+        let caps = caps.clone();
         interp.register_builtin(
             "paged",
             -1,
             Rc::new(move |_i, args, _loc| {
                 let query = raw_str(args.first().ok_or_else(|| err("missing argument"))?);
                 let params = params_arg(args.get(1));
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "paged()")?;
+                }
                 let dbf = db.clone();
                 let fetch = move |limit: Option<i64>, offset: i64| -> Result<(Vec<SynValue>, i64), String> {
                     dbf.read(|m| match limit {
@@ -423,6 +471,17 @@ mod tests {
         assert!(tables.contains(&"users".to_string()));
         assert!(tables.contains(&"orders".to_string()));
         db.close(None);
+    }
+
+    #[test]
+    fn blob_bytes_value_roundtrip() {
+        // MF-010: bytes ↔ BLOB byte-exacto en ambas direcciones (incl. no-UTF8).
+        let raw = vec![255u8, 254, 0, 72, 73];
+        assert_eq!(syn_to_value(&syn_bytes(raw.clone())), Value::Blob(raw.clone()));
+        match value_to_syn(&Value::Blob(raw.clone())) {
+            SynValue::Bytes(b) => assert_eq!(&b[..], &raw[..]),
+            other => panic!("esperaba bytes, got {:?}", other),
+        }
     }
 
     #[test]

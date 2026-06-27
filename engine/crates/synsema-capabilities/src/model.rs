@@ -103,13 +103,17 @@ impl Capability {
                 return false;
             }
         }
-        // Para capacidades de archivo, normalizar léxicamente AMBOS scopes antes de
-        // comparar: así `file.read("./data/*")` se chequea contra la ruta real y el
-        // bypass `./data/../../etc/passwd` deja de colar. Centralizado acá (un solo
-        // punto) para que ningún call-site pueda saltearlo por olvido.
-        let is_file = matches!(
+        // Para capacidades cuyo scope es una RUTA (file/file.read/file.write y db),
+        // normalizar léxicamente AMBOS scopes antes de comparar: así `file.read("./data/*")`
+        // o `db("./store.db")` se chequean contra la ruta real y el bypass
+        // `./data/../../etc/passwd` deja de colar. Centralizado acá (un solo punto) para
+        // que ningún call-site pueda saltearlo por olvido.
+        let is_path = matches!(
             self.ty,
-            CapabilityType::File | CapabilityType::FileRead | CapabilityType::FileWrite
+            CapabilityType::File
+                | CapabilityType::FileRead
+                | CapabilityType::FileWrite
+                | CapabilityType::Db
         );
         match &self.scope {
             // Sin scope = grant wildcard (poder máximo: cubre cualquier ruta). Intacto.
@@ -118,7 +122,7 @@ impl Capability {
                 // self tiene scope, other None → no cubre (paridad con Python).
                 None => false,
                 Some(other_scope) => {
-                    if is_file {
+                    if is_path {
                         let grant = normalize_path(self_scope);
                         let req = normalize_path(other_scope);
                         grant == req || fnmatch(&req, &grant)

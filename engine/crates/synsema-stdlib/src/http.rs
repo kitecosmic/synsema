@@ -4,9 +4,11 @@
 //! el mismo stream con `rustls` (ring + root CAs del SO). La lógica de HTTP/1.1 es
 //! idéntica en ambos caminos — solo el stream subyacente cambia.
 //!
-//! Nota: `http`/`http_get`/`http_post`/… NO chequean capability (a diferencia de
-//! `fetch`, que sí). Es el contrato del oráculo.
+//! Nota: TODO el HTTP (`http`/`http_get`/`http_post`/`http_put`/`http_delete`/`fetch`)
+//! es deny-by-default — gateado por `net(host)` (egress real, como file/db). El host es
+//! el hostname del URL (minúsculas, sin puerto), no el URL completo.
 
+use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::rc::Rc;
@@ -16,8 +18,24 @@ use std::time::Duration;
 
 use indexmap::IndexMap;
 
-use synsema_core::interpreter::Interpreter;
+use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
+use synsema_capabilities::secure::url_hostname;
+use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::types::{syn_bool, syn_int, syn_map, syn_text, SynValue};
+
+/// Chequea la capability `net(host)` del URL; convierte la violación en `Control::Error`
+/// SIN ubicación (como secure.rs/database.rs). Scope = hostname (minúsculas, sin puerto);
+/// si no se puede extraer, se usa el URL crudo (fail-closed). `net` NO es tipo-ruta →
+/// `covers()` usa el glob de host (`net("*.example.com")` cubre `api.example.com`).
+fn require_net(caps: &Rc<RefCell<CapabilitySet>>, url: &str, source: &str) -> Result<(), Control> {
+    let host = match url_hostname(url) {
+        Some(h) if !h.is_empty() => h,
+        _ => url.to_string(),
+    };
+    caps.borrow_mut()
+        .require(&Capability::new(CapabilityType::Net, Some(host)), source)
+        .map_err(|v| Control::Error(RuntimeError::new(v.message)))
+}
 
 /// Respuesta estructurada (espeja el dict del oráculo).
 pub struct HttpResult {
@@ -391,79 +409,118 @@ fn response_to_syn(r: HttpResult) -> SynValue {
     syn_map(m)
 }
 
-pub fn register_http_builtins(interp: &Interpreter) {
+pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
     // http(method, url, headers?, query?, body?, timeout?)
-    interp.register_builtin(
-        "http",
-        -1,
-        Rc::new(move |_i, args, _loc| {
-            let method = raw_str(args.first().unwrap_or(&SynValue::Nothing));
-            let url = raw_str(args.get(1).unwrap_or(&SynValue::Nothing));
-            let headers = header_pairs(args.get(2));
-            let query = map_pairs(args.get(3));
-            let body = args.get(4).map(raw_str);
-            let r = http_request(
-                &method,
-                &url,
-                headers.as_deref(),
-                query.as_deref(),
-                body.as_deref(),
-                30,
-            );
-            Ok(response_to_syn(r))
-        }),
-    );
+    {
+        let caps = caps.clone();
+        interp.register_builtin(
+            "http",
+            -1,
+            Rc::new(move |_i, args, _loc| {
+                let method = raw_str(args.first().unwrap_or(&SynValue::Nothing));
+                let url = raw_str(args.get(1).unwrap_or(&SynValue::Nothing));
+                require_net(&caps, &url, "http()")?;
+                let headers = header_pairs(args.get(2));
+                let query = map_pairs(args.get(3));
+                let body = args.get(4).map(raw_str);
+                let r = http_request(
+                    &method,
+                    &url,
+                    headers.as_deref(),
+                    query.as_deref(),
+                    body.as_deref(),
+                    30,
+                );
+                Ok(response_to_syn(r))
+            }),
+        );
+    }
 
     // http_get(url, headers?, query?)
-    interp.register_builtin(
-        "http_get",
-        -1,
-        Rc::new(move |_i, args, _loc| {
-            let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
-            let headers = header_pairs(args.get(1));
-            let query = map_pairs(args.get(2));
-            let r = http_request("GET", &url, headers.as_deref(), query.as_deref(), None, 30);
-            Ok(response_to_syn(r))
-        }),
-    );
+    {
+        let caps = caps.clone();
+        interp.register_builtin(
+            "http_get",
+            -1,
+            Rc::new(move |_i, args, _loc| {
+                let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
+                require_net(&caps, &url, "http_get()")?;
+                let headers = header_pairs(args.get(1));
+                let query = map_pairs(args.get(2));
+                let r = http_request("GET", &url, headers.as_deref(), query.as_deref(), None, 30);
+                Ok(response_to_syn(r))
+            }),
+        );
+    }
 
     // http_post(url, body, headers?)
-    interp.register_builtin(
-        "http_post",
-        -1,
-        Rc::new(move |_i, args, _loc| {
-            let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
-            let body = args.get(1).map(raw_str);
-            let headers = header_pairs(args.get(2));
-            let r = http_request("POST", &url, headers.as_deref(), None, body.as_deref(), 30);
-            Ok(response_to_syn(r))
-        }),
-    );
+    {
+        let caps = caps.clone();
+        interp.register_builtin(
+            "http_post",
+            -1,
+            Rc::new(move |_i, args, _loc| {
+                let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
+                require_net(&caps, &url, "http_post()")?;
+                let body = args.get(1).map(raw_str);
+                let headers = header_pairs(args.get(2));
+                let r = http_request("POST", &url, headers.as_deref(), None, body.as_deref(), 30);
+                Ok(response_to_syn(r))
+            }),
+        );
+    }
 
     // http_put(url, body, headers?)
-    interp.register_builtin(
-        "http_put",
-        -1,
-        Rc::new(move |_i, args, _loc| {
-            let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
-            let body = args.get(1).map(raw_str);
-            let headers = header_pairs(args.get(2));
-            let r = http_request("PUT", &url, headers.as_deref(), None, body.as_deref(), 30);
-            Ok(response_to_syn(r))
-        }),
-    );
+    {
+        let caps = caps.clone();
+        interp.register_builtin(
+            "http_put",
+            -1,
+            Rc::new(move |_i, args, _loc| {
+                let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
+                require_net(&caps, &url, "http_put()")?;
+                let body = args.get(1).map(raw_str);
+                let headers = header_pairs(args.get(2));
+                let r = http_request("PUT", &url, headers.as_deref(), None, body.as_deref(), 30);
+                Ok(response_to_syn(r))
+            }),
+        );
+    }
 
     // http_delete(url, headers?)
-    interp.register_builtin(
-        "http_delete",
-        -1,
-        Rc::new(move |_i, args, _loc| {
-            let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
-            let headers = header_pairs(args.get(1));
-            let r = http_request("DELETE", &url, headers.as_deref(), None, None, 30);
-            Ok(response_to_syn(r))
-        }),
-    );
+    {
+        let caps = caps.clone();
+        interp.register_builtin(
+            "http_delete",
+            -1,
+            Rc::new(move |_i, args, _loc| {
+                let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
+                require_net(&caps, &url, "http_delete()")?;
+                let headers = header_pairs(args.get(1));
+                let r = http_request("DELETE", &url, headers.as_deref(), None, None, 30);
+                Ok(response_to_syn(r))
+            }),
+        );
+    }
+
+    // fetch(url, method?, headers?, body?) — cliente HTTP real, gateado por net.
+    // Default GET; mismo retorno que http_* (response_to_syn).
+    {
+        let caps = caps.clone();
+        interp.register_builtin(
+            "fetch",
+            -1,
+            Rc::new(move |_i, args, _loc| {
+                let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
+                require_net(&caps, &url, "fetch()")?;
+                let method = args.get(1).map(raw_str).unwrap_or_else(|| "GET".to_string());
+                let headers = header_pairs(args.get(2));
+                let body = args.get(3).map(raw_str);
+                let r = http_request(&method, &url, headers.as_deref(), None, body.as_deref(), 30);
+                Ok(response_to_syn(r))
+            }),
+        );
+    }
 }
 
 #[cfg(test)]

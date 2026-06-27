@@ -25,7 +25,8 @@ let r be http_delete(url, {"Authorization": "Bearer sk-123"})
 
 **HTTPS works**: `http://` and `https://` are both supported (TLS via `rustls` with the OS
 root CAs — real certificate validation, pure-Rust). So `http_get("https://api.example.com")`
-is fine for real-world APIs. (`http*` are NOT capability-gated; `fetch` is — see capabilities.md.)
+is fine for real-world APIs. **All HTTP (`http*` and `fetch`) is gated by `net(host)`** (deny-by-default,
+even in `run`): `require net("host")` — see capabilities.md. `require net` / `net("*")` = any host.
 
 Response is always a map:
 ```
@@ -39,9 +40,13 @@ error of r       -- error message if failed
 
 ## Database (SQL)
 
-SQLite built-in. Parameterized queries (safe from injection).
+SQLite built-in (`rusqlite`). Parameterized queries (safe from injection). **Deny-by-default: every DB
+op needs `require db(path)`** (see capabilities). `bytes` columns round-trip to/from SQLite `BLOB`
+byte-exactly (binary-safe).
 
 ```
+require db("./store.db")           -- declare the DB you use (db("*") / require db = any)
+
 -- Open
 db_open("./store.db")              -- file (persistent)
 db_open(":memory:", "memory")      -- in-memory (fast, temporary)
@@ -68,9 +73,32 @@ sql_batch("INSERT INTO logs VALUES (?)", [["event1"], ["event2"], ["event3"]])
 -- List tables
 let tables be sql_tables()
 
+-- Binary: bytes <-> BLOB (byte-exact)
+sql_exec("CREATE TABLE files (data BLOB)")
+sql_exec("INSERT INTO files VALUES (?)", [read_file_bytes("./logo.png")])
+let raw be (sql("SELECT data FROM files"))[0]["data"]   -- type_of -> "bytes"
+
 -- Close
 db_close()
 ```
+
+### Vector search with SQLite (no extension)
+No `sqlite-vec`/ANN (rusqlite is bundled without `load_extension`). For small/medium corpora, store
+embeddings as TEXT and rank by cosine **in Synsema** (`array`/`dot`/`norm`):
+```
+require db("./vec.db")
+task to_vec(s)
+    give array(apply((x) => number(x), split(s, ",")))
+task cosine(a, b)
+    give dot(a, b) / (norm(a) * norm(b))
+
+let q be array(query_embedding)                  -- from an embeddings API (http_post) or a model (run)
+let rows be sql("SELECT title, emb FROM docs")   -- pre-filter by metadata in SQL if you want
+let scored be apply((r) => {"title": r["title"], "score": cosine(to_vec(r["emb"]), q)}, rows)
+let top be sort_by(scored, (x) => 0 - x["score"])  -- best first
+```
+For real ANN at scale: delegate to a server that does vectors (pgvector via a Postgres HTTP API, or
+ClickHouse over HTTP) and query it with `fetch` — the index runs server-side, no in-process extension.
 
 ## Cron (Scheduled Tasks)
 

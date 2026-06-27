@@ -132,7 +132,7 @@ Resolution for `env`/`secret`: process environ → `.env` → default → else e
 - `random_int(min, max)` → integer
 
 ## HTTP
-Both `http://` and **`https://` (TLS)** are supported (rustls + OS root CAs, real cert validation). `http*` are NOT capability-gated (`fetch` is — see capabilities.md).
+Both `http://` and **`https://` (TLS)** are supported (rustls + OS root CAs, real cert validation). **All HTTP (`http*` and `fetch`) is gated by `net(host)`** — `require net("host")` (deny-by-default, even in `run`; `require net` / `net("*")` = any). See capabilities.md.
 - `http(method, url, headers?, query?, body?, timeout?)` → response map {status, ok, body, json, headers, error}
 - `http_get(url, headers?, query?)` → response map
 - `http_post(url, body, headers?)` → response map
