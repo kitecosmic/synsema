@@ -103,14 +103,28 @@ impl Capability {
                 return false;
             }
         }
+        // Para capacidades de archivo, normalizar léxicamente AMBOS scopes antes de
+        // comparar: así `file.read("./data/*")` se chequea contra la ruta real y el
+        // bypass `./data/../../etc/passwd` deja de colar. Centralizado acá (un solo
+        // punto) para que ningún call-site pueda saltearlo por olvido.
+        let is_file = matches!(
+            self.ty,
+            CapabilityType::File | CapabilityType::FileRead | CapabilityType::FileWrite
+        );
         match &self.scope {
-            // Sin scope = grant wildcard.
+            // Sin scope = grant wildcard (poder máximo: cubre cualquier ruta). Intacto.
             None => true,
             Some(self_scope) => match &other.scope {
                 // self tiene scope, other None → no cubre (paridad con Python).
                 None => false,
                 Some(other_scope) => {
-                    self_scope == other_scope || fnmatch(other_scope, self_scope)
+                    if is_file {
+                        let grant = normalize_path(self_scope);
+                        let req = normalize_path(other_scope);
+                        grant == req || fnmatch(&req, &grant)
+                    } else {
+                        self_scope == other_scope || fnmatch(other_scope, self_scope)
+                    }
                 }
             },
         }
@@ -129,8 +143,9 @@ impl fmt::Display for Capability {
 
 /// `fnmatch` estilo Unix (case-sensitive, como el oráculo en Linux). Soporta `*`
 /// (cero o más) y `?` (uno). Los corchetes `[...]` se tratan literales (no aparecen
-/// en scopes de capability; el contrato sólo exige `*`).
-fn fnmatch(name: &str, pattern: &str) -> bool {
+/// en scopes de capability; el contrato sólo exige `*`). `pub` para reusar en el filtro
+/// `glob` de `grep` (secure.rs).
+pub fn fnmatch(name: &str, pattern: &str) -> bool {
     let n: Vec<char> = name.chars().collect();
     let p: Vec<char> = pattern.chars().collect();
     glob(&n, &p)
@@ -142,6 +157,49 @@ fn glob(name: &[char], pat: &[char]) -> bool {
         Some((&'*', rest)) => (0..=name.len()).any(|k| glob(&name[k..], rest)),
         Some((&'?', rest)) => !name.is_empty() && glob(&name[1..], rest),
         Some((&c, rest)) => !name.is_empty() && name[0] == c && glob(&name[1..], rest),
+    }
+}
+
+/// Normaliza una ruta de forma LÉXICA (sin tocar el filesystem): unifica separadores
+/// a `/`, colapsa `.` y `..`, quita un `./` inicial. NO resuelve symlinks ni vuelve la
+/// ruta absoluta (preserva relativa/absoluta y el prefijo de unidad Windows). Así el
+/// scope-glob de `file.read("./data/*")` se chequea contra la ruta REAL a la que apunta
+/// el argumento, cerrando el bypass `./data/../../etc` sin cambiar la semántica del scope.
+pub fn normalize_path(p: &str) -> String {
+    let p = p.replace('\\', "/");
+    let (prefix, rest): (String, &str) = match p.as_bytes() {
+        // Unidad Windows: "C:/..."
+        [c, b':', b'/', ..] if c.is_ascii_alphabetic() => (p[..3].to_string(), &p[3..]),
+        // Absoluta unix: "/..."
+        _ if p.starts_with('/') => ("/".to_string(), &p[1..]),
+        _ => (String::new(), p.as_str()),
+    };
+    let rooted = !prefix.is_empty();
+    let mut out: Vec<&str> = Vec::new();
+    for seg in rest.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                match out.last() {
+                    Some(&s) if s != ".." => {
+                        out.pop();
+                    }
+                    // ".." sin segmento normal arriba: en ruta rooteada se descarta
+                    // (no se sube de la raíz); en relativa se conserva (escapa del prefijo).
+                    _ if !rooted => out.push(".."),
+                    _ => {}
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    let joined = out.join("/");
+    if rooted {
+        format!("{}{}", prefix, joined)
+    } else if joined.is_empty() {
+        ".".to_string()
+    } else {
+        joined
     }
 }
 
@@ -349,6 +407,44 @@ mod tests {
         let write = cap(CapabilityType::FileWrite, Some("/data/output.csv"));
         assert!(c.covers(&read));
         assert!(c.covers(&write));
+    }
+
+    #[test]
+    fn normalize_path_is_identity_on_normal_paths() {
+        // Idempotencia / back-compat: rutas ya normales quedan igual.
+        assert_eq!(normalize_path("/tmp/x.txt"), "/tmp/x.txt");
+        assert_eq!(normalize_path("/data/*"), "/data/*");
+        assert_eq!(normalize_path("data/report.csv"), "data/report.csv");
+        assert_eq!(normalize_path("C:/data/x.txt"), "C:/data/x.txt");
+    }
+
+    #[test]
+    fn normalize_path_collapses_dots_and_separators() {
+        assert_eq!(normalize_path("./data/x"), "data/x");
+        assert_eq!(normalize_path("data/./x"), "data/x");
+        assert_eq!(normalize_path("data\\sub\\x"), "data/sub/x"); // separadores Windows
+        assert_eq!(normalize_path("./data/../../etc/passwd"), "../etc/passwd");
+        // ".." no sube de una raíz absoluta.
+        assert_eq!(normalize_path("/data/../../etc"), "/etc");
+        assert_eq!(normalize_path("C:/data/../x"), "C:/x");
+        // ruta relativa vacía → "."
+        assert_eq!(normalize_path("./"), ".");
+    }
+
+    #[test]
+    fn covers_closes_traversal_bypass() {
+        // El caso estrella del fix #5: scope acotado ya NO se escapa con `..`.
+        let grant = cap(CapabilityType::FileRead, Some("./data/*"));
+        let ok = cap(CapabilityType::FileRead, Some("./data/report.csv"));
+        let escape = cap(CapabilityType::FileRead, Some("./data/../../etc/passwd"));
+        assert!(grant.covers(&ok), "ruta dentro del scope debe cubrirse");
+        assert!(!grant.covers(&escape), "el bypass `..` debe quedar fuera del scope");
+
+        // Poder total preservado: wildcard cubre cualquier ruta, con o sin `..`.
+        let star = cap(CapabilityType::FileRead, Some("*"));
+        assert!(star.covers(&escape));
+        let total = cap(CapabilityType::File, None);
+        assert!(total.covers(&escape));
     }
 
     #[test]

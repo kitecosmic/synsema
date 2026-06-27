@@ -1042,18 +1042,23 @@ impl Parser {
         let loc = self.location();
         self.advance();
         let cap_tok = self.expect(TokenType::Identifier, "")?;
+        let mut capability = cap_tok.as_str().to_string();
+        // Capacidad punteada opcional: `file.read` / `file.write` (un solo nivel). El
+        // lexer tokeniza `file.read` como Identifier Dot Identifier, así que reconstruimos
+        // el nombre punteado acá. La validación del nombre vive en `capability_type_from_name`
+        // (un nombre punteado desconocido parsea y el grant_hook lo ignora, igual que un
+        // nombre simple desconocido).
+        if self.match_tok(TokenType::Dot).is_some() {
+            let sub = self.expect(TokenType::Identifier, "Expected a capability sub-name after '.'")?;
+            capability.push('.');
+            capability.push_str(sub.as_str());
+        }
         let mut scope = None;
         if self.match_tok(TokenType::LParen).is_some() {
             scope = Some(Box::new(self.parse_expression()?));
             self.expect(TokenType::RParen, "")?;
         }
-        Ok(Node::new(
-            loc,
-            NodeKind::RequireStatement {
-                capability: cap_tok.as_str().to_string(),
-                scope,
-            },
-        ))
+        Ok(Node::new(loc, NodeKind::RequireStatement { capability, scope }))
     }
 
     fn parse_sandbox(&mut self) -> Result<Node, ParseError> {
@@ -2442,6 +2447,45 @@ mod tests {
         let err = parse_source(src, "<test>").unwrap_err();
         assert!(
             err.to_string().contains("uses 'requires auth' but the 'serve' block declares no"),
+            "got: {}",
+            err
+        );
+    }
+
+    // -- require: capacidad punteada `file.read` / `file.write` (DE-023 / MF-009) --
+
+    fn require_stmt(src: &str) -> (String, bool) {
+        let prog = parse_ok(src);
+        match &prog.statements[0].kind {
+            NodeKind::RequireStatement { capability, scope } => (capability.clone(), scope.is_some()),
+            other => panic!("esperaba RequireStatement, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn require_dotted_file_read_and_write() {
+        assert_eq!(require_stmt("require file.read(\"./x\")"), ("file.read".to_string(), true));
+        assert_eq!(require_stmt("require file.write(\"./y\")"), ("file.write".to_string(), true));
+    }
+
+    #[test]
+    fn require_dotted_without_scope() {
+        assert_eq!(require_stmt("require file.read"), ("file.read".to_string(), false));
+    }
+
+    #[test]
+    fn require_simple_names_backcompat() {
+        // Sin punto: exactamente el mismo camino que hoy.
+        assert_eq!(require_stmt("require file(\"./x\")"), ("file".to_string(), true));
+        assert_eq!(require_stmt("require net(\"h\")"), ("net".to_string(), true));
+        assert_eq!(require_stmt("require time"), ("time".to_string(), false));
+    }
+
+    #[test]
+    fn require_dot_without_subname_errors() {
+        let err = parse_source("require file.\n", "<test>").unwrap_err();
+        assert!(
+            err.to_string().contains("Expected a capability sub-name after '.'"),
             "got: {}",
             err
         );

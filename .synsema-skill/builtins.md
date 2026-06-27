@@ -113,13 +113,16 @@ Resolution for `env`/`secret`: process environ → `.env` → default → else e
 
 ## I/O (require capabilities)
 - `fetch(url, method?, headers?, body?)` → map with status, headers, body
-- `read_file(path)` → text — requires `file.read` (lossy for non-UTF-8; use the bytes variant for binary)
-- `read_file_bytes(path)` → `bytes` — requires `file.read` (byte-exact)
-- `write_file(path, content)` → bool — requires `file.write`. If `content` is `bytes`, writes raw bytes; else text.
-- `list_dir(path)` → list of filenames
-- `file_exists(path)` → bool
-- `run(command, args_list?, timeout?)` → map with exit_code, stdout, stderr
-- `get_env(name)` → text or nothing
+- `read_file(path, offset?, limit?)` → text — requires `file.read`. No extra args = whole file (lossy for non-UTF-8; use the bytes variant for binary). With `offset` (1-based line) and optional `limit` (max lines), reads a **line range**, preserving EOLs: `read_file(f, 1, 100)` = lines 1–100; `read_file(f, 500)` = from line 500 to EOF. Fewer lines than `limit` ⇒ end of file. `offset < 1` or `limit < 0` → error.
+- `read_file_bytes(path)` → `bytes` — requires `file.read` (byte-exact; no range)
+- `write_file(path, content)` → bool — requires `file.write`. **Atomic** (temp + rename); creates parent dirs. If `content` is `bytes`, writes raw bytes; else text.
+- `list_dir(path)` → list of maps `{name, is_dir, size}`, **sorted by `name`**, non-recursive, includes hidden entries (`size` = bytes, `0` for dirs) — requires `file.read`. Errors if `path` is not a directory.
+- `file_info(path)` → `{exists, is_dir, size, modified}` (`modified` = unix seconds, or `nothing`); a missing path returns `{exists:false, is_dir:false, size:0, modified:nothing}` (no error) — requires `file.read`
+- `file_exists(path)` → bool (sugar for `file_info(path).exists`) — requires `file.read`
+- `grep(target, pattern, opts?)` → `{matches: [{file, line, col, text}], truncated}` — requires `file.read`. Searches **per line** (streams, never loads the whole file). `target` = file or directory (recursive). **Literal by default**; `opts`: `{regex, ignore_case, glob, max_results}` (`glob` filters filenames; `truncated:true` when `max_results` is hit). `line`/`col` are 1-based.
+- `edit_file(path, old, new, replace_all?)` → `{replaced: N}` — requires `file.write`. Exact-string replace; `old` must be **unique** (errors: `pattern not found` / `ambiguous, N occurrences`). `replace_all:true` replaces all. Atomic (temp+rename).
+- `append_file(path, content)` → bool — requires `file.write`. Appends to the end (creates the file + parent dirs). `content` bytes = raw, else text. Real append (not a full rewrite).
+- `run(cmd, args_list?, timeout?, opts?)` → `{exit_code, stdout, stderr, stdout_truncated, stderr_truncated}` — requires `exec("<cmd>")`. Runs a process **without a shell** (args as a list → no quoting injection). `timeout` default 120s → on expiry kills the process and **raises** (`timed out after Ns`); catch with `try`/`recover`. `opts`: `{cwd, env (inherits environ + overrides), stdin (text/bytes), max_output (default 10MB)}`. **Non-zero `exit_code` is data, not an error**; can't-launch and timeout raise. `exec` is deny-by-default (not auto-granted, even in `run`). Scope = the command string as passed.
 - `now()` → unix timestamp (number) — requires `time`
 - `sleep(seconds)` → pause execution (e.g. to pace an SSE stream) — requires `time`
 - `format_time(timestamp, pattern?)` → text — requires `time`. Default ISO-8601 UTC (`format_time(0)` → `"1970-01-01T00:00:00Z"`); with a strftime pattern: `format_time(t, "%Y-%m-%d %H:%M")`

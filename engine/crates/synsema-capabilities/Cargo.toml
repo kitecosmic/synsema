@@ -10,3 +10,5 @@ synsema-core.workspace = true
 chrono.workspace = true
 indexmap.workspace = true
 rand.workspace = true
+# grep(): matcher RE2 (tiempo lineal, sin ReDoS). Ya dep del workspace (la usa synsema-core).
+regex.workspace = true

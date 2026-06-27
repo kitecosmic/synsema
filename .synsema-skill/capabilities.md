@@ -14,7 +14,9 @@ Nothing works without declaring capabilities.
 ```
 require net("api.example.com")
 require net("*.example.com")        -- wildcard
-require file("/data/*")
+require file("/data/*")             -- read AND write under /data/
+require file.read("./logs/*")       -- read-only (least-privilege)
+require file.write("./out/*")       -- write-only
 require exec("ffmpeg")
 require env("API_KEY")
 require secret("STRIPE_API_KEY")    -- read as an opaque, redacted secret
@@ -125,5 +127,5 @@ Shows every capability check: what was requested, granted or denied, and why.
 - Sandbox does NOT inherit parent capabilities
 - `call_tool` runs a task with ONLY its declared capabilities (∩ the program's); a plain call uses the program's ambient capabilities
 - Wildcard: `net("*.example.com")` covers all subdomains
-- Path glob: `file("/data/*")` covers all files in /data/
+- Path glob: `file("/data/*")` covers all files in /data/. `file` grants **read+write**; use `file.read(scope)` / `file.write(scope)` for least-privilege. Path scope is **faithful**: a `..` escape (`file("./data/*")` + `read_file("./data/../../etc/passwd")`) normalizes outside the scope and is denied. `require file` / `file("*")` cover the whole disk.
 - Name prefix: `secret("APP_*")` / `env("APP_*")` covers `APP_DB`, `APP_KEY`, … (only a trailing `*`)
