@@ -30,7 +30,7 @@ indexmap = "2"
 regex = "1"
 # Decimal exacto base-10 para dinero/finanzas (tipo Decimal). Puro Rust (96-bit,
 # 28-29 dígitos significativos), sin deps C → preserva el binario único estático.
-rust_decimal = "1"
+rust_decimal = { version = "1", features = ["db-postgres"] }
 # RNG no-cripto para los builtins random()/random_int() (paridad con el `random` de
 # Python). getrandom ya entra transitivamente; rand da la API de distribución/rango.
 rand = "0.8"
@@ -68,6 +68,18 @@ num-complex = "0.4"
 # multihilo. Queda el SIMD (pulp) → sigue rápido y 100% puro-Rust sin `*-sys`.
 ndarray = "0.16"
 faer = { version = "0.24", default-features = false, features = ["std", "linalg"] }
+# Postgres nativo (M1). Driver SYNC `postgres` (envuelve tokio-postgres con su propio
+# runtime tokio interno → el intérprete sigue sync). Puro-Rust + TLS rustls (mismo backend
+# ring que el resto de stdlib) → binario único intacto, sin `*-sys`.
+postgres = { version = "0.19", features = [
+    "with-chrono-0_4",       # timestamp/date ↔ chrono (ya es dep)
+    "with-uuid-0_8",         # uuid ↔ uuid crate (feature disponible en este postgres)
+    "with-serde_json-1",     # json/jsonb ↔ serde_json::Value (ya es dep)
+] }
+# NUMERIC ↔ Decimal: lo provee rust_decimal con su feature `db-postgres` (NO existe una
+# feature `with-rust_decimal-1` en `postgres`).
+tokio-postgres-rustls = "0.12"
+uuid = "0.8"
 synsema-core = { path = "crates/synsema-core" }
 synsema-capabilities = { path = "crates/synsema-capabilities" }
 synsema-stdlib = { path = "crates/synsema-stdlib" }

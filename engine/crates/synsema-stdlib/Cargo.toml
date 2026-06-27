@@ -11,6 +11,11 @@ synsema-capabilities.workspace = true
 indexmap.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
+# M1 — Postgres nativo bajo la API universal db_open/sql. Puro-Rust + TLS rustls.
+postgres.workspace = true
+tokio-postgres-rustls.workspace = true
+uuid.workspace = true
+rust_decimal.workspace = true
 # Arrays (Batch 5): serializar `SynValue::Array` a JSON anidado en las respuestas serve.
 ndarray.workspace = true
 # Feature `secret`: builtins env/secret/reveal/bearer + crypto (hmac_sha256/verify_hmac/

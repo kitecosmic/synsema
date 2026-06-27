@@ -103,11 +103,12 @@ impl Capability {
                 return false;
             }
         }
-        // Para capacidades cuyo scope es una RUTA (file/file.read/file.write y db),
-        // normalizar léxicamente AMBOS scopes antes de comparar: así `file.read("./data/*")`
-        // o `db("./store.db")` se chequean contra la ruta real y el bypass
-        // `./data/../../etc/passwd` deja de colar. Centralizado acá (un solo punto) para
-        // que ningún call-site pueda saltearlo por olvido.
+        // Para capacidades cuyo scope es una RUTA o URL (file/file.read/file.write y db),
+        // canonizar AMBOS scopes antes de comparar. file: ruta léxica (cierra el bypass
+        // `..`). db: si el scope es una URL (`postgres://…`) → `canon_url` (scheme/host/db,
+        // sin credenciales/puerto); si es ruta (SQLite) → `normalize_path`. Así
+        // `db("postgres://localhost/appdb")` cubre el connstring completo, y una grant de
+        // ruta nunca cubre una URL (canónicos distintos). Centralizado acá (un solo punto).
         let is_path = matches!(
             self.ty,
             CapabilityType::File
@@ -115,16 +116,24 @@ impl Capability {
                 | CapabilityType::FileWrite
                 | CapabilityType::Db
         );
+        let is_db = self.ty == CapabilityType::Db;
+        let canon = |s: &str| -> String {
+            if is_db && s.contains("://") {
+                canon_url(s)
+            } else {
+                normalize_path(s)
+            }
+        };
         match &self.scope {
-            // Sin scope = grant wildcard (poder máximo: cubre cualquier ruta). Intacto.
+            // Sin scope = grant wildcard (poder máximo: cubre cualquier ruta/URL). Intacto.
             None => true,
             Some(self_scope) => match &other.scope {
                 // self tiene scope, other None → no cubre (paridad con Python).
                 None => false,
                 Some(other_scope) => {
                     if is_path {
-                        let grant = normalize_path(self_scope);
-                        let req = normalize_path(other_scope);
+                        let grant = canon(self_scope);
+                        let req = canon(other_scope);
                         grant == req || fnmatch(&req, &grant)
                     } else {
                         self_scope == other_scope || fnmatch(other_scope, self_scope)
@@ -142,6 +151,43 @@ impl fmt::Display for Capability {
             Some(s) if !s.is_empty() => write!(f, "{}(\"{}\")", self.ty.name_lower(), s),
             _ => write!(f, "{}", self.ty.name_lower()),
         }
+    }
+}
+
+/// Canoniza una URL de conexión (Postgres/MySQL/…) a `scheme://host/dbname`:
+/// minúsculas, **sin credenciales** (userinfo), **sin puerto**, **sin query/fragment**.
+/// Es el scope canónico de la capability `db` para motores remotos (el `://` lo distingue
+/// de una ruta de archivo SQLite). Preserva un `*` como nombre/host para los globs
+/// (`db("postgres://localhost/*")`). Idempotente.
+pub fn canon_url(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((s, r)) => (s.to_lowercase(), r),
+        None => return url.to_lowercase(),
+    };
+    // sin query/fragment
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    // authority / path
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, p),
+        None => (rest, ""),
+    };
+    // sin userinfo (user:pw@)
+    let host_port = match authority.rsplit_once('@') {
+        Some((_, hp)) => hp,
+        None => authority,
+    };
+    // sin puerto (último `:`; no se contemplan IPv6 con corchetes — caso raro)
+    let host = match host_port.rsplit_once(':') {
+        Some((h, _)) => h,
+        None => host_port,
+    }
+    .to_lowercase();
+    // dbname = primer segmento del path
+    let db = path.split('/').next().unwrap_or("").to_lowercase();
+    if db.is_empty() {
+        format!("{}://{}", scheme, host)
+    } else {
+        format!("{}://{}/{}", scheme, host, db)
     }
 }
 
@@ -449,6 +495,50 @@ mod tests {
         assert!(star.covers(&escape));
         let total = cap(CapabilityType::File, None);
         assert!(total.covers(&escape));
+    }
+
+    #[test]
+    fn canon_url_strips_credentials_port_query_case() {
+        assert_eq!(
+            canon_url("postgres://user:pw@Localhost:5432/AppDB?sslmode=require"),
+            "postgres://localhost/appdb"
+        );
+        assert_eq!(canon_url("postgresql://h/db"), "postgresql://h/db");
+        assert_eq!(canon_url("postgres://localhost/*"), "postgres://localhost/*");
+        assert_eq!(canon_url("postgres://*"), "postgres://*");
+        // idempotente
+        assert_eq!(canon_url("postgres://localhost/appdb"), "postgres://localhost/appdb");
+    }
+
+    #[test]
+    fn covers_db_url_branch() {
+        // grant URL (sin credenciales) cubre el connstring completo del db_open.
+        let grant = cap(CapabilityType::Db, Some("postgres://localhost/appdb"));
+        let req = cap(CapabilityType::Db, Some("postgres://user:pw@localhost:5432/appdb"));
+        assert!(grant.covers(&req), "grant URL debe cubrir el connstring completo");
+
+        // no cubre otra base.
+        let other = cap(CapabilityType::Db, Some("postgres://localhost/otra"));
+        assert!(!grant.covers(&other));
+
+        // globs de host/base.
+        let any_db = cap(CapabilityType::Db, Some("postgres://localhost/*"));
+        assert!(any_db.covers(&req));
+        let any_pg = cap(CapabilityType::Db, Some("postgres://*"));
+        assert!(any_pg.covers(&req));
+
+        // db("*") y `require db` (None) cubren URL y ruta.
+        let star = cap(CapabilityType::Db, Some("*"));
+        assert!(star.covers(&req));
+        assert!(star.covers(&cap(CapabilityType::Db, Some("./store.db"))));
+        let total = cap(CapabilityType::Db, None);
+        assert!(total.covers(&req));
+
+        // una grant de RUTA no cubre una URL y viceversa.
+        let path_grant = cap(CapabilityType::Db, Some("./data/*"));
+        assert!(!path_grant.covers(&req));
+        let url_grant = cap(CapabilityType::Db, Some("postgres://localhost/*"));
+        assert!(!url_grant.covers(&cap(CapabilityType::Db, Some("./data/x.db"))));
     }
 
     #[test]
