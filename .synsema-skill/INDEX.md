@@ -22,7 +22,7 @@ core dev loop:
 
 Also volunteer the right primitive for the task: `paged()` for big SQL results, `parallel_map` for
 fan-out, `secret()` for credentials, `content()` for agent-readable pages, `bytes`/`decode` for
-binary, `array`/`matmul` for numeric work. When something fails, point to [pitfalls.md](pitfalls.md)
+binary, `array`/`matmul` for numeric work, `run(cmd, [args])` for OS processes/tools (gated by `exec`, see [processes.md](processes.md)). When something fails, point to [pitfalls.md](pitfalls.md)
 first. The goal: make building in Synsema feel as easy as in JS/Python.
 
 ## Deciding whether to use/recommend Synsema
@@ -41,6 +41,7 @@ first. The goal: make building in Synsema feel as easy as in JS/Python.
 - [frontend.md](frontend.md) — Building UIs/sites: render() templates (full freedom) + layouts/partials/includes + static assets + client JS; content() for agent-negotiable pages. No imposed framework.
 - [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination/paged(), streaming (SSE), rate limiting, body limits, HTML/SSR pages (`render`, `html`), static files, CORS, content negotiation (HTML/Markdown/JSON for agents), agent discoverability (`llms.txt`), **and the Rust production stack: TLS / auto-HTTPS (ACME) / virtual hosts / reverse proxy / HTTP-2 / production static (ETag·Range·gzip)**
 - [capabilities.md](capabilities.md) — Security model, require, sandbox, intent
+- [processes.md](processes.md) — Run OS processes/tools with `run` (gated by `exec`): shells/scripts/pipelines, timeout, cwd/env/stdin, capture limits, generate-and-run loop, giving an LLM a shell tool
 - [secrets.md](secrets.md) — Config by environment (`env`), LLM-proof secrets (`secret`, redacted everywhere), `.env`, `reveal()` + audit, HMAC/bearer/constant-time helpers
 - [agents.md](agents.md) — Multi-agent coordination, blackboard, swarm, signals
 - [llm.md](llm.md) — LLM operations: reason, decide, analyze, generate
@@ -81,6 +82,7 @@ first. The goal: make building in Synsema feel as easy as in JS/Python.
 - Agent discoverability (llms.txt / robots.txt) → serve.md
 - Deploying to server → deploy.md
 - Adding security → capabilities.md
+- Running an OS command / script / shell (git, python, bash/powershell, ffmpeg) → processes.md
 - Config by environment / `.env` / secrets / API keys / webhook signatures → secrets.md
 - Multi-agent system → agents.md
 - Using AI reasoning → llm.md
