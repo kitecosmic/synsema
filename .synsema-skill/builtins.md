@@ -60,6 +60,11 @@ not errors and pass through `try/recover` untouched.
 - `sha256(x)` / `sha512(x)` → **bytes** (raw digest). x: text → hashes utf8; bytes → raw. Hex via `decode(sha256(x), "hex")`. `sha256(secret)` → error.
 - Note: `text(b)` / `print(b)` show a hex repr like `bytes(48656c6c6f)`, **not** a decode. `bytes != text` always.
 
+## JSON (pure — no capability)
+- `json_encode(value)` → text: serialize any value to a JSON string. Maps/lists nest; **secret → `"[redacted]"`** (safe), `bytes` → base64 string, `decimal` (`1.50d`) → exact JSON number, `nothing` → `null`.
+- `json_decode(text)` → value: parse a JSON string to a Synsema value (object→map, array→list, number→number, etc.). Errors clearly on invalid JSON.
+- Round-trippable: `json_decode(json_encode(x))` reconstructs `x` (the idiomatic way to store structured data in a Redis/text value: `redis_set(k, json_encode({...}))`).
+
 ## Math (pure — no capability)
 Constants (bare values): `pi`, `tau`, `e`, `inf`, `nan`.
 - magnitude/selection (type-preserving): `abs`, `sign`, `min`, `max`, `clamp`. `abs(complex)` → modulus.
@@ -139,11 +144,14 @@ Both `http://` and **`https://` (TLS)** are supported (rustls + OS root CAs, rea
 - `http_put(url, body, headers?)` → response map
 - `http_delete(url, headers?)` → response map
 
-## Database (SQL)
-Universal API over SQLite (file path), Postgres (`postgres://`) and MySQL (`mysql://`), routed by the
-`db_open` target. Scope of `require db(...)` for remote URLs is the canonical `scheme://host/db`.
-- `db_open(path, mode?)` — path/URL. mode (SQLite only): "readwrite" (default), "readonly", "memory"
+## Database
+Opened with `db_open`, routed by target. SQL family (SQLite/Postgres/MySQL) + document family (MongoDB) +
+key-value family (Redis). Scope of `require db(...)` for remote URLs is the canonical `scheme://host/db`.
+Wrong family on a connection errors clearly.
+- `db_open(path, mode?)` — file path / `postgres://` / `mysql://` / `mongodb://` / `redis://`. mode (SQLite only): "readwrite" (default), "readonly", "memory"
 - `db_close(path?)` — close connection
+
+### SQL (SQLite / Postgres / MySQL)
 - `sql(query, params?)` → list of row maps (SELECT)
 - `sql_exec(statement, params?)` → {rows_affected, last_id} (INSERT/UPDATE/DELETE/CREATE).
   `last_id`: SQLite rowid; MySQL `last_insert_id()`; Postgres `0` (use `RETURNING`).
@@ -151,6 +159,37 @@ Universal API over SQLite (file path), Postgres (`postgres://`) and MySQL (`mysq
 - `sql_tables()` → list of table names
 - Placeholders: `?` everywhere (Postgres rewrites to `$n` internally; MySQL uses `?` natively)
 - `paged(query, params?)` → paginated result for `give` in a (non-streaming) serve route (SQL LIMIT/OFFSET pushdown, exact COUNT total)
+
+### MongoDB (`mongodb://`) — documents/filters are maps ↔ BSON
+- `mongo_find(coll, filter?, opts?)` → list of docs. opts: `{limit, skip, sort: {f: 1/-1}, fields: {f: 1}}`
+- `mongo_find_one(coll, filter?)` → doc map, or `nothing`
+- `mongo_insert(coll, doc)` → the `_id` (text hex if ObjectId)
+- `mongo_insert_many(coll, docs_list)` → list of `_id`
+- `mongo_update(coll, filter, update)` → {matched, modified}. `update` uses operators (`{"$set": …}`)
+- `mongo_delete(coll, filter)` → {deleted}
+- `mongo_count(coll, filter?)` → number
+- `mongo_aggregate(coll, pipeline_list)` → list of docs
+- `mongo_collections()` → list of collection names
+
+### Redis (`redis://` / `rediss://`) — key-value/cache/structures + TTL + distributed lock
+Values are byte-strings: returns `text` if UTF-8 else `bytes`; integers → `number`. **Arg types accepted:
+text/bytes/number (else error → use `json_encode`).** db-index gotcha: `redis://host:6379` → scope
+`redis://host` (no `/0`); `redis://host:6379/0` → scope `redis://host/0` (different).
+- `redis_get(key)` → text/bytes or `nothing`; `redis_set(key, val, ttl_secs?)` → `nothing`
+- `redis_del(key...)` → number; `redis_exists(key...)` → number
+- `redis_mget(keys_list)` → list (each text/bytes/`nothing`); `redis_mset(map)` → `nothing`
+- `redis_keys(pattern)` → list of text (KEYS is O(N)); `redis_type(key)` → text ("string"/"hash"/…)
+- `redis_incr(key)` / `redis_decr(key)` → number; `redis_incrby(key, n)` → number (atomic)
+- `redis_expire(key, secs)` → bool; `redis_ttl(key)` → number (`-1` no TTL, `-2` absent); `redis_persist(key)` → bool
+- `redis_hget(key, field)` → text/bytes or `nothing`; `redis_hset(key, map)` → number (new fields)
+- `redis_hgetall(key)` → map; `redis_hdel(key, field...)` → number; `redis_hincrby(key, field, n)` → number
+- `redis_lpush(key, val...)` / `redis_rpush(key, val...)` → number (new length)
+- `redis_lpop(key)` / `redis_rpop(key)` → text/bytes or `nothing`; `redis_lrange(key, start, stop)` → list; `redis_llen(key)` → number
+- `redis_sadd(key, member...)` / `redis_srem(key, member...)` → number; `redis_smembers(key)` → list; `redis_sismember(key, member)` → bool
+- `redis_lock(key, ttl_ms?)` → token (text) or `nothing` if held (SET NX PX, default ttl 30000ms)
+- `redis_unlock(key, token)` → bool (frees only if the token matches, atomic Lua)
+- Structured data: `redis_set(k, json_encode(...))` / `json_decode(redis_get(k))`
+- `_id` reads as text hex; a 24-hex string under `_id` in a filter is coerced to an ObjectId
 
 ## HTTP server (serve) — see serve.md
 Response helpers (set the HTTP status; body follows the response contract):

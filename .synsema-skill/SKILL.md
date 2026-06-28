@@ -43,7 +43,7 @@ Also volunteer the right primitive: `paged()` for big SQL results, `parallel_map
 - [testing.md](testing.md) — Native test framework: `assert`/`assert_eq`/`assert_error`, `test "..."`
 
 **By topic**
-- [stdlib.md](stdlib.md) — HTTP requests, SQL database (SQLite / Postgres / MySQL), cron scheduler
+- [stdlib.md](stdlib.md) — HTTP requests, databases (SQL: SQLite / Postgres / MySQL · document: MongoDB · key-value: Redis), cron scheduler
 - [concurrency.md](concurrency.md) — Real multi-core parallelism: `parallel_map`, `chunk`, fan-out/merge
 - [frontend.md](frontend.md) — UIs/sites: `render()` templates, layouts/partials, static assets, `content()`
 - [serve.md](serve.md) — Native HTTP server: routes, auth, validation, pagination, SSE, rate limiting, SSR, static files, CORS, content negotiation, TLS/auto-HTTPS, reverse proxy, HTTP/2

@@ -89,6 +89,35 @@ uuid = "0.8"
 # `default-features = false` apaga el `native-tls`/OpenSSL del default. TLS opt-in (§conexión).
 # Verificado con `cargo tree -p synsema-stdlib`: no entra ni aws-lc-sys ni openssl ni libz-sys.
 mysql = { version = "28", default-features = false, features = ["minimal-rust", "rustls-tls-ring"] }
+# MongoDB (M3, primer backend NO-SQL). El crate `mongodb` es async-only → feature `sync`
+# (wrapper con runtime tokio interno, como el `postgres` sync → el intérprete sigue sync).
+# TRES features necesarias (verificadas en el Cargo.toml del crate, no asumidas):
+#   - `sync`        : el wrapper síncrono (`mongodb::sync::{Client,Database,Collection}`).
+#   - `rustls-tls`  : = `rustls/ring` + `tokio-rustls/ring` (provider RING; aws-lc va en la
+#                     feature SEPARADA `rustls-tls-aws-lc`, que NO activamos → cero `*-sys`).
+#   - `bson-3`      : `default-features = false` apaga el bson del default (que entra vía
+#                     `compat-3-0-0`→`bson-2`); el crate tiene un `compile_error!` si no hay
+#                     bson-2 NI bson-3. Activamos bson-3 (v3.1, puro-Rust) → `mongodb::bson`.
+#   - `compat-3-3-0`: flag VACÍO de forward-compat que el crate EXIGE con un `compile_error!`
+#                     (al venir el default desactivado, hay que activarlo a mano).
+# Se apaga del default: openssl-tls y dns-resolver (SRV/`mongodb+srv://` necesitaría
+# re-activar dns-resolver; el dev usa `mongodb://host:port` plano). Verificado con
+# `cargo tree -p synsema-stdlib`: sin aws-lc-sys/openssl/ningún `*-sys` nuevo.
+mongodb = { version = "3", default-features = false, features = ["sync", "rustls-tls", "bson-3", "compat-3-3-0"] }
+# Redis (M4, 4º backend remoto, 3er paradigma: KV/cache/estructuras, NO SQL ni documentos).
+# API SÍNCRONA NATIVA: la `redis::Connection` bloqueante es la base del crate; lo async vive
+# detrás de features `*-comp` que NO activamos → el intérprete sigue sync (sin block_on).
+# `default-features = false` apaga el default (acl/streams/geospatial/script/keep-alive + nada de
+# native-tls) — sólo necesitamos la conexión sync base (Cmd/Value/ToRedisArgs/FromRedisValue, que
+# NO están gateadas por feature) + TLS rustls para `rediss://`. El lock usa EVAL crudo (no el
+# `redis::Script` del feature `script`).
+# TLS — la trampa recurrente de M2/M3 (aws-lc-sys) NO aplica acá: el crate declara
+# `rustls = { version = "0.23", default-features = false }` (sin provider) y `tls-rustls` sólo
+# agrega `rustls/std` + rustls-native-certs. El provider RING entra por UNIFICACIÓN de features
+# con el `rustls = { features = ["ring"] }` de este mismo stdlib (nadie activa `aws_lc_rs`). El dev
+# es `redis://` plaintext; el path `rediss://` queda disponible con ring. Verificado con
+# `cargo tree -p synsema-stdlib`: cero `*-sys` nuevo (siguen sólo libsqlite3-sys y windows-sys).
+redis = { version = "0.32", default-features = false, features = ["tls-rustls"] }
 synsema-core = { path = "crates/synsema-core" }
 synsema-capabilities = { path = "crates/synsema-capabilities" }
 synsema-stdlib = { path = "crates/synsema-stdlib" }

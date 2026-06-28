@@ -18,6 +18,15 @@ uuid.workspace = true
 rust_decimal.workspace = true
 # M2 — MySQL nativo bajo la misma API. Driver sync puro-Rust + TLS rustls (opt-in).
 mysql.workspace = true
+# M3 — MongoDB (backend no-SQL, API propia mongo_*). Driver sync (wrapper async) + rustls ring.
+mongodb.workspace = true
+# M4 — Redis (backend KV/cache/estructuras, API propia redis_*). Conexión SÍNCRONA nativa del
+# crate + TLS rustls (provider ring por unificación de features, sin `*-sys`). Ver el comentario
+# en el Cargo.toml del workspace.
+redis.workspace = true
+# Token aleatorio del lock distribuido (redis_lock): se reusa el `rand` que el engine YA usa
+# (random()/random_int() en synsema-capabilities) — no se introduce un crate nuevo. Puro-Rust.
+rand.workspace = true
 # Arrays (Batch 5): serializar `SynValue::Array` a JSON anidado en las respuestas serve.
 ndarray.workspace = true
 # Feature `secret`: builtins env/secret/reveal/bearer + crypto (hmac_sha256/verify_hmac/

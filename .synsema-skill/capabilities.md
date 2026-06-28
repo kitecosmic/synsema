@@ -28,6 +28,8 @@ require serve(8080)                 -- bind an HTTP server to this port
 require db("./store.db")            -- open a SQLite database (scope = file path)
 require db("postgres://localhost/appdb")  -- Postgres (scope = canonical URL)
 require db("mysql://localhost/appdb")     -- MySQL (scope = canonical URL)
+require db("mongodb://localhost/appdb")   -- MongoDB (scope = canonical URL)
+require db("redis://localhost")           -- Redis (scope = canonical URL; redis://host:6379 → redis://host)
 require db("*")                     -- any database (file or remote); bare `require db` = same
 ```
 
@@ -132,7 +134,11 @@ Shows every capability check: what was requested, granted or denied, and why.
 - Wildcard: `net("*.example.com")` covers all subdomains
 - Path glob: `file("/data/*")` covers all files in /data/. `file` grants **read+write**; use `file.read(scope)` / `file.write(scope)` for least-privilege. Path scope is **faithful**: a `..` escape (`file("./data/*")` + `read_file("./data/../../etc/passwd")`) normalizes outside the scope and is denied. `require file` / `file("*")` cover the whole disk.
 - Name prefix: `secret("APP_*")` / `env("APP_*")` covers `APP_DB`, `APP_KEY`, … (only a trailing `*`)
-- `db` scope: a **file path** for SQLite; a **canonical URL** for remote engines (Postgres/MySQL) —
+- `db` scope: a **file path** for SQLite; a **canonical URL** for remote engines (Postgres/MySQL/MongoDB/Redis) —
   `scheme://host/db` with **no credentials, port, or query** (so `mysql://user:pw@localhost:3306/appdb?ssl-mode=REQUIRED`
-  is gated by `db("mysql://localhost/appdb")`). A path scope never covers a URL and vice-versa (distinct
-  canonical forms). Host/db globbing works: `db("postgres://localhost/*")` covers any DB on that host.
+  is gated by `db("mysql://localhost/appdb")`, and `mongodb://u:p@host:27017/appdb?authSource=admin` by
+  `db("mongodb://host/appdb")`). A path scope never covers a URL and vice-versa (distinct canonical forms).
+  **Redis db-index gotcha:** `redis://host:6379` canonicalizes to `redis://host` (no `/0`), but
+  `redis://host:6379/0` to `redis://host/0` — different scopes; match the grant to the `db_open` form.
+  Host/db globbing works: `db("postgres://localhost/*")` covers any DB on that host. The gate is the same
+  for SQL and Mongo (`mongo_*` ops check `db` exactly like `sql`).

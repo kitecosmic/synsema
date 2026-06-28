@@ -10,10 +10,20 @@
 //!     `db_open("mysql://user:pw@host:3306/db")`. Placeholders `?` **nativos** (NO se
 //!     reescriben). `last_insert_id()` real → el `last_id` de `sql_exec` funciona. BLOB vs
 //!     TEXT se distinguen por el charset binario de la columna (MF-010, round-trip de bytes).
+//!   - **MongoDB** (M3; primer backend NO-SQL; driver `mongodb` con su feature `sync`, TLS
+//!     rustls) — `db_open("mongodb://user:pw@host:27017/db")`. NO usa `sql`/`sql_exec` (da
+//!     error claro); tiene API propia `mongo_*` (find/insert/update/…) con documentos/filtros
+//!     como **maps de Synsema ↔ BSON**. El `_id` (ObjectId) ↔ text hex.
+//!   - **Redis** (M4; 3er paradigma: ni SQL ni documentos → **clave-valor + estructuras + TTL**;
+//!     driver `redis` SÍNCRONO nativo, TLS rustls ring) — `db_open("redis://host:6379[/N]")`. NO
+//!     usa `sql`/`sql_exec` NI `mongo_*` (error simétrico); tiene API propia `redis_*`
+//!     (get/set/del/incr/hashes/listas/sets/TTL + **lock distribuido** `redis_lock`/`redis_unlock`).
+//!     Los valores son byte-strings: `text` si es UTF-8, si no `bytes`; los enteros → `number`.
+//!     Los estructurados van vía `json_encode`/`json_decode` (sin auto-JSON mágico).
 //!
 //! Gateado por la capability `db(scope)` (deny-by-default): SQLite scope = ruta, Postgres/
-//! MySQL scope = `canon_url` (scheme://host/db, sin credenciales). Acceso serializado (un op
-//! por vez: `Rc<RefCell>` en run, `Arc<Mutex>` en serve) → una conexión por `db_open`.
+//! MySQL/Mongo scope = `canon_url` (scheme://host/db, sin credenciales). Acceso serializado (un
+//! op por vez: `Rc<RefCell>` en run, `Arc<Mutex>` en serve) → una conexión por `db_open`.
 
 use std::cell::RefCell;
 use std::error::Error as StdError;
@@ -21,8 +31,12 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use std::str::FromStr;
+
 use bytes::BytesMut;
 use indexmap::IndexMap;
+use mongodb::bson::spec::BinarySubtype;
+use mongodb::bson::{oid::ObjectId, Binary, Bson, Decimal128, Document};
 use mysql::consts::ColumnType;
 use mysql::prelude::Queryable;
 use postgres::types::{to_sql_checked, Format, FromSql, IsNull, ToSql, Type};
@@ -39,7 +53,7 @@ use synsema_core::types::{
     SynValue,
 };
 
-use crate::server::json_to_syn;
+use crate::server::{dumps, json_to_syn, syn_to_json};
 
 /// Handle al `DatabaseManager` abstrayendo el modo de acceso: `Rc<RefCell>` para
 /// runs single-thread (conform), `Arc<Mutex>` para `serve` (db compartida entre
@@ -84,6 +98,11 @@ enum Backend {
     Sqlite(Connection),
     Postgres(Client),
     Mysql(mysql::Conn),
+    /// MongoDB (no-SQL). Ya scoped al db del connstring; la API propia es `mongo_*`.
+    Mongo(mongodb::sync::Database),
+    /// Redis (M4, KV/cache/estructuras). Conexión sync ya scoped al db-index del connstring;
+    /// la API propia es `redis_*` (no SQL ni `mongo_*`).
+    Redis(redis::Connection),
 }
 
 pub struct DatabaseManager {
@@ -106,11 +125,33 @@ impl DatabaseManager {
     }
 
     /// Abre una conexión. Rutea por scheme: `postgres://`/`postgresql://` → Postgres;
-    /// `mysql://` → MySQL; cualquier otra cosa → SQLite (camino actual, sin cambios).
-    /// Devuelve la key usada como identificador (canon_url para PG/MySQL; ruta/`:memory:`
-    /// para SQLite).
+    /// `mysql://` → MySQL; `mongodb://`/`mongodb+srv://` → MongoDB; cualquier otra cosa →
+    /// SQLite (camino actual, sin cambios). Devuelve la key usada como identificador
+    /// (canon_url para los remotos; ruta/`:memory:` para SQLite).
     pub fn open(&mut self, target: &str, mode: &str) -> Result<String, String> {
-        if is_pg_url(target) {
+        if is_mongo_url(target) {
+            let key = canon_url(target);
+            if self.connections.contains_key(&key) {
+                return Ok(key);
+            }
+            let db = mongo_connect(target)?;
+            self.connections.insert(key.clone(), Backend::Mongo(db));
+            if self.default_db.is_none() {
+                self.default_db = Some(key.clone());
+            }
+            Ok(key)
+        } else if is_redis_url(target) {
+            let key = canon_url(target);
+            if self.connections.contains_key(&key) {
+                return Ok(key);
+            }
+            let conn = redis_connect(target)?;
+            self.connections.insert(key.clone(), Backend::Redis(conn));
+            if self.default_db.is_none() {
+                self.default_db = Some(key.clone());
+            }
+            Ok(key)
+        } else if is_pg_url(target) {
             let key = canon_url(target);
             if self.connections.contains_key(&key) {
                 return Ok(key);
@@ -181,6 +222,8 @@ impl DatabaseManager {
             Backend::Sqlite(c) => sqlite_query(c, sql, params),
             Backend::Postgres(c) => pg_query(c, sql, params),
             Backend::Mysql(c) => mysql_query(c, sql, params),
+            Backend::Mongo(_) => Err(mongo_not_sql()),
+            Backend::Redis(_) => Err(redis_not_sql()),
         }
     }
 
@@ -217,6 +260,8 @@ impl DatabaseManager {
                 }
                 Ok((c.affected_rows() as i64, c.last_insert_id() as i64))
             }
+            Backend::Mongo(_) => Err(mongo_not_sql()),
+            Backend::Redis(_) => Err(redis_not_sql()),
         }
     }
 
@@ -256,6 +301,8 @@ impl DatabaseManager {
                 }
                 Ok(total)
             }
+            Backend::Mongo(_) => Err(mongo_not_sql()),
+            Backend::Redis(_) => Err(redis_not_sql()),
         }
     }
 
@@ -283,6 +330,10 @@ impl DatabaseManager {
                  WHERE table_schema = DATABASE() ORDER BY table_name",
                 "name",
             ),
+            // Mongo no es SQL: `sql_tables()` no aplica → `mongo_collections()`.
+            Backend::Mongo(_) => return Err(mongo_not_sql()),
+            // Redis no es SQL: `sql_tables()` no aplica → `redis_keys(pattern)`.
+            Backend::Redis(_) => return Err(redis_not_sql()),
         };
         let rows = self.query(sql, &[])?;
         Ok(rows
@@ -292,6 +343,140 @@ impl DatabaseManager {
                 _ => None,
             })
             .collect())
+    }
+
+    /// Devuelve la `Collection<Document>` de la conexión Mongo default, o un error simétrico
+    /// si la conexión default es SQL (sin sorpresas silenciosas).
+    fn mongo_coll(&mut self, name: &str) -> Result<mongodb::sync::Collection<Document>, String> {
+        match self.conn_mut(None)? {
+            Backend::Mongo(db) => Ok(db.collection::<Document>(name)),
+            Backend::Sqlite(_) | Backend::Postgres(_) | Backend::Mysql(_) => Err(mongo_wrong_backend()),
+            Backend::Redis(_) => Err(redis_not_mongo()),
+        }
+    }
+
+    // -- API Mongo (M3). Documentos/filtros = maps de Synsema ↔ BSON. --
+
+    /// `mongo_find`: documentos que matchean `filter`, con `opts` (limit/skip/sort/fields).
+    pub fn mongo_find(
+        &mut self,
+        coll: &str,
+        filter: Document,
+        opts: MongoFindOpts,
+    ) -> Result<Vec<SynValue>, String> {
+        let c = self.mongo_coll(coll)?;
+        let mut action = c.find(filter);
+        if let Some(l) = opts.limit {
+            action = action.limit(l);
+        }
+        if let Some(s) = opts.skip {
+            action = action.skip(s);
+        }
+        if let Some(sort) = opts.sort {
+            action = action.sort(sort);
+        }
+        if let Some(proj) = opts.projection {
+            action = action.projection(proj);
+        }
+        let cursor = action.run().map_err(mongo_err)?;
+        let mut out = Vec::new();
+        for doc in cursor {
+            out.push(bson_to_syn(&Bson::Document(doc.map_err(mongo_err)?)));
+        }
+        Ok(out)
+    }
+
+    /// `mongo_find_one`: primer documento que matchea, o `nothing`.
+    pub fn mongo_find_one(&mut self, coll: &str, filter: Document) -> Result<SynValue, String> {
+        let c = self.mongo_coll(coll)?;
+        match c.find_one(filter).run().map_err(mongo_err)? {
+            Some(doc) => Ok(bson_to_syn(&Bson::Document(doc))),
+            None => Ok(SynValue::Nothing),
+        }
+    }
+
+    /// `mongo_insert`: inserta un documento, devuelve el `_id` (text hex si es ObjectId).
+    pub fn mongo_insert(&mut self, coll: &str, doc: Document) -> Result<SynValue, String> {
+        let c = self.mongo_coll(coll)?;
+        let res = c.insert_one(doc).run().map_err(mongo_err)?;
+        Ok(bson_to_syn(&res.inserted_id))
+    }
+
+    /// `mongo_insert_many`: inserta varios, devuelve la lista de `_id` en orden de inserción.
+    pub fn mongo_insert_many(&mut self, coll: &str, docs: Vec<Document>) -> Result<Vec<SynValue>, String> {
+        let n = docs.len();
+        let c = self.mongo_coll(coll)?;
+        let res = c.insert_many(docs).run().map_err(mongo_err)?;
+        // `inserted_ids` es un map índice→id; se reordena 0..n.
+        Ok((0..n)
+            .map(|i| res.inserted_ids.get(&i).map(bson_to_syn).unwrap_or(SynValue::Nothing))
+            .collect())
+    }
+
+    /// `mongo_update` (update_many): `update` debe traer operadores (`$set`/`$inc`/…).
+    /// Devuelve `(matched, modified)`.
+    pub fn mongo_update(&mut self, coll: &str, filter: Document, update: Document) -> Result<(i64, i64), String> {
+        let c = self.mongo_coll(coll)?;
+        let res = c.update_many(filter, update).run().map_err(mongo_err)?;
+        Ok((res.matched_count as i64, res.modified_count as i64))
+    }
+
+    /// `mongo_delete` (delete_many): devuelve cuántos borró.
+    pub fn mongo_delete(&mut self, coll: &str, filter: Document) -> Result<i64, String> {
+        let c = self.mongo_coll(coll)?;
+        let res = c.delete_many(filter).run().map_err(mongo_err)?;
+        Ok(res.deleted_count as i64)
+    }
+
+    /// `mongo_count`: documentos que matchean `filter`.
+    pub fn mongo_count(&mut self, coll: &str, filter: Document) -> Result<i64, String> {
+        let c = self.mongo_coll(coll)?;
+        Ok(c.count_documents(filter).run().map_err(mongo_err)? as i64)
+    }
+
+    /// `mongo_aggregate`: pipeline de agregación (lista de stages-documento) → lista de maps.
+    pub fn mongo_aggregate(&mut self, coll: &str, pipeline: Vec<Document>) -> Result<Vec<SynValue>, String> {
+        let c = self.mongo_coll(coll)?;
+        let cursor = c.aggregate(pipeline).run().map_err(mongo_err)?;
+        let mut out = Vec::new();
+        for doc in cursor {
+            out.push(bson_to_syn(&Bson::Document(doc.map_err(mongo_err)?)));
+        }
+        Ok(out)
+    }
+
+    /// `mongo_collections`: nombres de las colecciones del db.
+    pub fn mongo_collections(&mut self) -> Result<Vec<String>, String> {
+        match self.conn_mut(None)? {
+            Backend::Mongo(db) => db.list_collection_names().run().map_err(mongo_err),
+            Backend::Sqlite(_) | Backend::Postgres(_) | Backend::Mysql(_) => Err(mongo_wrong_backend()),
+            Backend::Redis(_) => Err(redis_not_mongo()),
+        }
+    }
+
+    // -- API Redis (M4). Acceso a la conexión sync + un runner genérico de comandos. --
+
+    /// Devuelve la `redis::Connection` default, o un error simétrico si la conexión default es
+    /// SQL/Mongo (sin sorpresas silenciosas, espeja `mongo_coll`).
+    fn redis_conn(&mut self) -> Result<&mut redis::Connection, String> {
+        match self.conn_mut(None)? {
+            Backend::Redis(c) => Ok(c),
+            Backend::Sqlite(_) | Backend::Postgres(_) | Backend::Mysql(_) => Err(redis_wrong_backend_sql()),
+            Backend::Mongo(_) => Err(redis_wrong_backend_mongo()),
+        }
+    }
+
+    /// Runner genérico de un comando Redis. `parts[0]` es el comando (p.ej. `b"SET"`) y el
+    /// resto los argumentos, **cada uno como un único bulk-string binario-seguro** (redis-rs
+    /// trata `&[u8]` como un solo argumento vía `write_args_from_slice`/`is_single_vec_arg`,
+    /// NO uno por byte). La respuesta cruda (`redis::Value`) la mapea el llamador.
+    pub fn redis_command(&mut self, parts: &[Vec<u8>]) -> Result<redis::Value, String> {
+        let conn = self.redis_conn()?;
+        let mut cmd = redis::Cmd::new();
+        for p in parts {
+            cmd.arg(p.as_slice());
+        }
+        cmd.query::<redis::Value>(conn).map_err(redis_err)
     }
 }
 
@@ -938,6 +1123,324 @@ fn mysql_cell_to_syn(v: mysql::Value, col: &mysql::Column) -> SynValue {
     }
 }
 
+// -- MongoDB: conexión, errores, conversión SynValue <-> BSON (M3) --
+
+fn is_mongo_url(target: &str) -> bool {
+    target.starts_with("mongodb://") || target.starts_with("mongodb+srv://")
+}
+
+/// Mapea un error del crate `mongodb` a un mensaje útil (su `Display` ya trae detalle del
+/// server/driver; lección M1 #2: no devolver algo opaco). Wrapper nombrado para documentarlo.
+fn mongo_err(e: mongodb::error::Error) -> String {
+    e.to_string()
+}
+
+/// Error simétrico cuando se usan los builtins SQL (`sql`/`sql_exec`/`sql_tables`/…) sobre una
+/// conexión MongoDB.
+fn mongo_not_sql() -> String {
+    "this is a MongoDB connection — use the mongo_* builtins (mongo_find/mongo_insert/…), not sql()/sql_exec()"
+        .to_string()
+}
+
+/// Error simétrico cuando se usan los builtins `mongo_*` sobre una conexión SQL.
+fn mongo_wrong_backend() -> String {
+    "this is a SQL connection — use sql()/sql_exec(), not the mongo_* builtins".to_string()
+}
+
+/// Conecta a MongoDB y devuelve el `Database` ya scoped al db del connstring. Timeouts por
+/// defecto (10s) de conexión Y de selección de servidor — sólo si el connstring no los trae
+/// (respeta `?serverSelectionTimeoutMS=…`/`?connectTimeoutMS=…`). Lección M1: no colgarse con
+/// un host caído; en Mongo el cuelgue clásico es el *server selection*, no el TCP connect.
+///
+/// El driver conecta **lazy** (`with_options` no toca la red) → hacemos un `ping` eager para
+/// VALIDAR conectividad/auth en `db_open` (igual que PG/MySQL conectan en su `db_open`); así un
+/// host caído o credenciales malas fallan acá, no recién en el primer `mongo_*`.
+/// TLS lo controla el connstring (`?tls=true`); rustls (backend ring). El dev es plaintext.
+fn mongo_connect(url: &str) -> Result<mongodb::sync::Database, String> {
+    let mut opts = mongodb::options::ClientOptions::parse(url).run().map_err(mongo_err)?;
+    if opts.connect_timeout.is_none() {
+        opts.connect_timeout = Some(Duration::from_secs(10));
+    }
+    if opts.server_selection_timeout.is_none() {
+        opts.server_selection_timeout = Some(Duration::from_secs(10));
+    }
+    let db_name = opts
+        .default_database
+        .clone()
+        .ok_or_else(|| "mongodb url must include a database (mongodb://host/DBNAME)".to_string())?;
+    let client = mongodb::sync::Client::with_options(opts).map_err(mongo_err)?;
+    let db = client.database(&db_name);
+    db.run_command(mongodb::bson::doc! { "ping": 1 })
+        .run()
+        .map_err(mongo_err)?;
+    Ok(db)
+}
+
+/// Opciones de `mongo_find` (mapeadas desde un map `{limit, skip, sort, fields}`).
+#[derive(Default)]
+pub struct MongoFindOpts {
+    pub limit: Option<i64>,
+    pub skip: Option<u64>,
+    pub sort: Option<Document>,
+    pub projection: Option<Document>,
+}
+
+/// `SynValue` → BSON (recursivo). Int32 si entra, si no Int64; decimal/big → Decimal128 (texto
+/// si no parsea); bytes → Binary (subtype Generic); list/map recursivos. El secret se revela
+/// en el borde de la DB (igual que SQL). Para la clave `_id` ver `syn_map_to_doc`/`coerce_id`.
+fn syn_to_bson(v: &SynValue) -> Bson {
+    match v {
+        SynValue::Nothing => Bson::Null,
+        SynValue::Bool(b) => Bson::Boolean(*b),
+        SynValue::Number(Number::Int(i)) => {
+            if *i >= i32::MIN as i64 && *i <= i32::MAX as i64 {
+                Bson::Int32(*i as i32)
+            } else {
+                Bson::Int64(*i)
+            }
+        }
+        SynValue::Number(Number::Float(f)) => Bson::Double(*f),
+        SynValue::Number(n) => match Decimal128::from_str(&n.to_string()) {
+            Ok(d) => Bson::Decimal128(d),
+            Err(_) => Bson::String(n.to_string()),
+        },
+        SynValue::Text(s) => Bson::String(s.to_string()),
+        SynValue::Secret(s) => Bson::String(s.expose().to_string()),
+        SynValue::Bytes(b) => Bson::Binary(Binary {
+            subtype: BinarySubtype::Generic,
+            bytes: b[..].to_vec(),
+        }),
+        SynValue::List(l) => Bson::Array(l.borrow().iter().map(syn_to_bson).collect()),
+        SynValue::Map(m) => Bson::Document(syn_map_to_doc(&m.borrow())),
+        other => Bson::String(other.to_string()),
+    }
+}
+
+/// Map de Synsema → BSON `Document`. Para la clave `_id` aplica `coerce_id` (string hex-24 →
+/// ObjectId) así `mongo_find("c", {"_id": id_text})` matchea el documento real.
+fn syn_map_to_doc(m: &IndexMap<String, SynValue>) -> Document {
+    let mut doc = Document::new();
+    for (k, v) in m {
+        let bson = if k == "_id" { coerce_id(v) } else { syn_to_bson(v) };
+        doc.insert(k.clone(), bson);
+    }
+    doc
+}
+
+/// Convierte el valor de un filtro sobre `_id` a BSON, ascendiendo un string hex-24 a
+/// ObjectId. Recurre en listas (`{"$in": [hex, …]}`) y operadores (`{"$gt": hex}`) para que
+/// los hex anidados bajo `_id` también se conviertan. Un string que NO es un ObjectId válido
+/// queda como String (ambigüedad rara, aceptada por el spec).
+fn coerce_id(v: &SynValue) -> Bson {
+    match v {
+        SynValue::Text(s) => match ObjectId::parse_str(s.as_ref()) {
+            Ok(oid) => Bson::ObjectId(oid),
+            Err(_) => Bson::String(s.to_string()),
+        },
+        SynValue::List(l) => Bson::Array(l.borrow().iter().map(coerce_id).collect()),
+        SynValue::Map(m) => {
+            let mut doc = Document::new();
+            for (k, val) in m.borrow().iter() {
+                doc.insert(k.clone(), coerce_id(val));
+            }
+            Bson::Document(doc)
+        }
+        other => syn_to_bson(other),
+    }
+}
+
+/// BSON → `SynValue` (recursivo). ObjectId → text hex (24); Decimal128 → decimal (texto si no
+/// parsea); Binary → bytes; DateTime → ISO-8601; tipos raros (Regex/Symbol/…) → texto.
+fn bson_to_syn(b: &Bson) -> SynValue {
+    match b {
+        Bson::Null | Bson::Undefined => SynValue::Nothing,
+        Bson::Boolean(x) => syn_bool(*x),
+        Bson::Int32(i) => syn_int(*i as i64),
+        Bson::Int64(i) => syn_int(*i),
+        Bson::Double(f) => syn_float(*f),
+        Bson::Decimal128(d) => match rust_decimal::Decimal::from_str_exact(&d.to_string()) {
+            Ok(dec) => syn_number(Number::Decimal(dec)),
+            Err(_) => syn_text(d.to_string()),
+        },
+        Bson::String(s) => syn_text(s.as_str()),
+        Bson::Binary(bin) => syn_bytes(bin.bytes.clone()),
+        Bson::Array(a) => syn_list(a.iter().map(bson_to_syn).collect()),
+        Bson::Document(d) => {
+            let mut m = IndexMap::new();
+            for (k, v) in d.iter() {
+                m.insert(k.clone(), bson_to_syn(v));
+            }
+            syn_map(m)
+        }
+        Bson::ObjectId(oid) => syn_text(oid.to_hex()),
+        Bson::DateTime(dt) => syn_text(dt.try_to_rfc3339_string().unwrap_or_else(|_| format!("{:?}", dt))),
+        // Tipos BSON sin equivalente directo (Timestamp/Regex/Symbol/JS/MinKey/MaxKey/…) → texto.
+        other => syn_text(format!("{:?}", other)),
+    }
+}
+
+// -- Redis: conexión, errores, conversión SynValue <-> redis::Value (M4) --
+
+fn is_redis_url(target: &str) -> bool {
+    target.starts_with("redis://") || target.starts_with("rediss://")
+}
+
+/// Mapea un error del crate `redis` a un mensaje útil (su `Display` ya trae el detalle: kind +
+/// el detalle del server; lección M1 #2: no devolver algo opaco). Wrapper nombrado para documentarlo.
+fn redis_err(e: redis::RedisError) -> String {
+    e.to_string()
+}
+
+/// Error simétrico cuando se usan los builtins SQL (`sql`/`sql_exec`/`sql_tables`/…) sobre una
+/// conexión Redis.
+fn redis_not_sql() -> String {
+    "this is a Redis connection — use the redis_* builtins (redis_get/redis_set/redis_lock/…), not sql()/sql_exec()"
+        .to_string()
+}
+
+/// Error simétrico cuando se usan los builtins `mongo_*` sobre una conexión Redis.
+fn redis_not_mongo() -> String {
+    "this is a Redis connection — use the redis_* builtins (redis_get/redis_set/redis_lock/…), not the mongo_* builtins"
+        .to_string()
+}
+
+/// Error simétrico cuando se usan los builtins `redis_*` sobre una conexión SQL.
+fn redis_wrong_backend_sql() -> String {
+    "this is a SQL connection — use sql()/sql_exec(), not the redis_* builtins".to_string()
+}
+
+/// Error simétrico cuando se usan los builtins `redis_*` sobre una conexión MongoDB.
+fn redis_wrong_backend_mongo() -> String {
+    "this is a MongoDB connection — use the mongo_* builtins (mongo_find/…), not the redis_* builtins"
+        .to_string()
+}
+
+/// Conecta a Redis (sync). `connect-timeout` explícito (lección M1 #1: no colgarse con un host
+/// caído) + read/write timeouts (no colgar una op contra un peer mudo). Validación **eager** con
+/// `PING` (igual que el ping de Mongo / el connect de PG/MySQL): auth/redis-down fallan ACÁ, no en
+/// la 1ª op. El db-index (`redis://host:6379/2` → SELECT 2) lo maneja el crate al abrir; sin `/N`
+/// = db 0. TLS: `rediss://…` activa rustls (provider ring por unificación de features). El dev es
+/// `redis://` plaintext.
+fn redis_connect(url: &str) -> Result<redis::Connection, String> {
+    let client = redis::Client::open(url).map_err(redis_err)?;
+    let mut conn = client
+        .get_connection_with_timeout(Duration::from_secs(10))
+        .map_err(redis_err)?;
+    let _ = conn.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = conn.set_write_timeout(Some(Duration::from_secs(10)));
+    redis::cmd("PING").query::<String>(&mut conn).map_err(redis_err)?;
+    Ok(conn)
+}
+
+/// `SynValue` → argumento Redis (bytes que se mandan). Redis es *byte-string*: mapeo **explícito**,
+/// binario-seguro, sin auto-JSON mágico (§5.1 del spec). text → bytes UTF-8; bytes → crudos;
+/// number → su repr decimal (así `INCR` lo entiende); secret → se **revela** en el borde de la DB
+/// (como SQL/Mongo). Bool/Map/List/Nothing (y el resto) → **error claro** orientando a `json_encode`.
+fn syn_to_redis_arg(v: &SynValue) -> Result<Vec<u8>, String> {
+    match v {
+        SynValue::Text(s) => Ok(s.as_bytes().to_vec()),
+        SynValue::Bytes(b) => Ok(b[..].to_vec()),
+        SynValue::Number(n) => Ok(n.to_string().into_bytes()),
+        SynValue::Secret(s) => Ok(s.expose().to_string().into_bytes()),
+        other => Err(format!(
+            "redis values must be text, bytes or number (got {}); use json_encode(...) for structured data",
+            other.type_name()
+        )),
+    }
+}
+
+/// Reply Redis (`redis::Value`) → `SynValue` (recursivo, §5.2). `Nil` → `nothing` (clave/campo
+/// ausente, pop vacío); `Int` → number; `BulkString` UTF-8 → `text`, si no `bytes` (heurística
+/// binario-segura, como BLOB/TEXT en MySQL); `SimpleString`/`Okay` → text; `Array`/`Set` → `list`;
+/// `Map` (RESP3) → `map`; tipos raros (Double/Boolean/BigNumber/Verbatim/Push/…) → el más cercano.
+fn redis_value_to_syn(v: &redis::Value) -> SynValue {
+    use redis::Value as RV;
+    match v {
+        RV::Nil => SynValue::Nothing,
+        RV::Int(i) => syn_int(*i),
+        RV::BulkString(bytes) => text_or_bytes(bytes.clone()),
+        RV::SimpleString(s) => syn_text(s.as_str()),
+        RV::Okay => syn_text("OK"),
+        RV::Array(items) | RV::Set(items) => syn_list(items.iter().map(redis_value_to_syn).collect()),
+        RV::Map(pairs) => {
+            let mut m = IndexMap::new();
+            for (k, val) in pairs {
+                m.insert(redis_key_string(k), redis_value_to_syn(val));
+            }
+            syn_map(m)
+        }
+        RV::Double(f) => syn_float(*f),
+        RV::Boolean(b) => syn_bool(*b),
+        RV::BigNumber(n) => syn_number(Number::parse_int_literal(&n.to_string())),
+        RV::VerbatimString { text, .. } => syn_text(text.as_str()),
+        // Attribute/Push/ServerError y cualquier variante futura: best-effort a texto.
+        other => syn_text(format!("{:?}", other)),
+    }
+}
+
+/// Clave de un `Map`/par Redis → `String` (para mapear hashes). Las claves de hash son siempre
+/// texto; un bulk no-UTF8 (raro) cae a lossy (sólo para la clave, no para el valor).
+fn redis_key_string(v: &redis::Value) -> String {
+    match v {
+        redis::Value::BulkString(b) => String::from_utf8_lossy(b).into_owned(),
+        redis::Value::SimpleString(s) => s.clone(),
+        redis::Value::Int(i) => i.to_string(),
+        other => format!("{:?}", other),
+    }
+}
+
+/// Reply de `HGETALL` → `IndexMap` (field→valor). En RESP3 viene como `Map`; en RESP2 (default)
+/// como `Array` plano de pares → se agrupa de a dos. Clave ausente → array vacío → map vacío.
+fn redis_value_to_map(v: redis::Value) -> IndexMap<String, SynValue> {
+    use redis::Value as RV;
+    let mut m = IndexMap::new();
+    match v {
+        RV::Map(pairs) => {
+            for (k, val) in pairs {
+                m.insert(redis_key_string(&k), redis_value_to_syn(&val));
+            }
+        }
+        RV::Array(items) | RV::Set(items) => {
+            let mut it = items.into_iter();
+            while let (Some(k), Some(val)) = (it.next(), it.next()) {
+                m.insert(redis_key_string(&k), redis_value_to_syn(&val));
+            }
+        }
+        _ => {}
+    }
+    m
+}
+
+/// Shaper directo: `redis::Value` → `SynValue` (la mayoría de los builtins).
+fn redis_shape_value(v: redis::Value) -> SynValue {
+    redis_value_to_syn(&v)
+}
+
+/// Shaper a bool (EXPIRE/PERSIST/SISMEMBER/EVAL del unlock): Redis responde `Int` 0/1.
+fn redis_shape_bool(v: redis::Value) -> SynValue {
+    match v {
+        redis::Value::Int(i) => syn_bool(i != 0),
+        redis::Value::Boolean(b) => syn_bool(b),
+        redis::Value::Nil => syn_bool(false),
+        _ => syn_bool(true),
+    }
+}
+
+/// Token único por adquisición del lock distribuido (`redis_lock`): 16 bytes aleatorios → hex
+/// (32 chars). Reusa el `rand` que el engine YA usa (random()/random_int()); no introduce un
+/// crate nuevo. No es para cripto, sólo para que el token sea irrepetible/no-adivinable entre
+/// agentes (el chequeo de propiedad del unlock es atómico vía Lua).
+fn redis_gen_token() -> String {
+    use rand::RngCore;
+    let mut buf = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut buf);
+    let mut s = String::with_capacity(32);
+    for b in buf {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
 // -- Builtins --
 
 fn err(msg: impl Into<String>) -> Control {
@@ -963,9 +1466,10 @@ fn params_arg(v: Option<&SynValue>) -> Vec<SynValue> {
 }
 
 /// Scope canónico de `db` para un `db_open(target, mode)` (matchea la key que guarda
-/// `open()` y la que devuelve `default_path()`): PG/MySQL → canon_url; SQLite → ruta/`:memory:`.
+/// `open()` y la que devuelve `default_path()`): PG/MySQL/Mongo → canon_url; SQLite →
+/// ruta/`:memory:`.
 fn db_scope_for(target: &str, mode: &str) -> String {
-    if is_pg_url(target) || is_mysql_url(target) {
+    if is_pg_url(target) || is_mysql_url(target) || is_mongo_url(target) || is_redis_url(target) {
         canon_url(target)
     } else if mode == "memory" {
         ":memory:".to_string()
@@ -980,6 +1484,112 @@ fn require_db(caps: &Rc<RefCell<CapabilitySet>>, scope: &str, source: &str) -> R
     caps.borrow_mut()
         .require(&Capability::new(CapabilityType::Db, Some(scope.to_string())), source)
         .map_err(|v| Control::Error(RuntimeError::new(v.message)))
+}
+
+// -- Helpers de args para los builtins `mongo_*` (map de Synsema ↔ BSON Document) --
+
+/// Arg de filtro opcional (map) → BSON `Document`. None / no-map → Document vacío (match all).
+fn filter_arg(v: Option<&SynValue>) -> Document {
+    match v {
+        Some(SynValue::Map(m)) => syn_map_to_doc(&m.borrow()),
+        _ => Document::new(),
+    }
+}
+
+/// Arg map REQUERIDO (doc de insert / update) → `Document`; error claro si no es map.
+fn required_doc_arg(v: Option<&SynValue>, ctx: &str) -> Result<Document, Control> {
+    match v {
+        Some(SynValue::Map(m)) => Ok(syn_map_to_doc(&m.borrow())),
+        Some(other) => Err(err(format!("{}: expected a map, got {}", ctx, other.type_name()))),
+        None => Err(err(format!("{}: missing the document argument", ctx))),
+    }
+}
+
+/// Lista de maps → `Vec<Document>` (insert_many / pipeline de aggregate); error si algún
+/// elemento no es map.
+fn docs_list_arg(v: Option<&SynValue>, ctx: &str) -> Result<Vec<Document>, Control> {
+    match v {
+        Some(SynValue::List(l)) => {
+            let mut out = Vec::new();
+            for item in l.borrow().iter() {
+                match item {
+                    SynValue::Map(m) => out.push(syn_map_to_doc(&m.borrow())),
+                    other => {
+                        return Err(err(format!(
+                            "{}: each element must be a map, got {}",
+                            ctx,
+                            other.type_name()
+                        )))
+                    }
+                }
+            }
+            Ok(out)
+        }
+        _ => Err(err(format!("{}: expected a list of maps", ctx))),
+    }
+}
+
+/// Opts de `mongo_find` desde un map `{limit, skip, sort, fields}` (claves desconocidas se
+/// ignoran). `skip` negativo se descarta.
+fn parse_find_opts(v: Option<&SynValue>) -> MongoFindOpts {
+    let mut o = MongoFindOpts::default();
+    if let Some(SynValue::Map(m)) = v {
+        let m = m.borrow();
+        if let Some(SynValue::Number(n)) = m.get("limit") {
+            o.limit = Some(n.to_f64() as i64);
+        }
+        if let Some(SynValue::Number(n)) = m.get("skip") {
+            let s = n.to_f64() as i64;
+            if s >= 0 {
+                o.skip = Some(s as u64);
+            }
+        }
+        if let Some(SynValue::Map(s)) = m.get("sort") {
+            o.sort = Some(syn_map_to_doc(&s.borrow()));
+        }
+        if let Some(SynValue::Map(f)) = m.get("fields") {
+            o.projection = Some(syn_map_to_doc(&f.borrow()));
+        }
+    }
+    o
+}
+
+/// Registra un builtin `redis_*` "directo": todos los args de Synsema se convierten a argumentos
+/// Redis (vía `syn_to_redis_arg`), se antepone(n) el/los token(s) de comando (`tokens`), se corre
+/// el comando contra la conexión default (gateado por `db`), y la respuesta se moldea con `shape`.
+/// `min_args`/`max_args` validan la aridad (Synsema no la enforce: `param_count` es informativo).
+#[allow(clippy::too_many_arguments)]
+fn register_redis_simple<H: DbHandle>(
+    interp: &Interpreter,
+    db: &H,
+    caps: &Rc<RefCell<CapabilitySet>>,
+    name: &'static str,
+    tokens: &'static [&'static str],
+    param_count: i32,
+    min_args: usize,
+    max_args: Option<usize>,
+    shape: fn(redis::Value) -> SynValue,
+) {
+    let db = db.clone();
+    let caps = caps.clone();
+    interp.register_builtin(
+        name,
+        param_count,
+        Rc::new(move |_i, args, _loc| {
+            if args.len() < min_args || max_args.is_some_and(|mx| args.len() > mx) {
+                return Err(err(format!("{}: wrong number of arguments", name)));
+            }
+            let mut parts: Vec<Vec<u8>> = tokens.iter().map(|t| t.as_bytes().to_vec()).collect();
+            for a in args.iter() {
+                parts.push(syn_to_redis_arg(a).map_err(err)?);
+            }
+            if let Some(p) = db.read(|m| m.default_path()) {
+                require_db(&caps, &p, name)?;
+            }
+            let v = db.write(|m| m.redis_command(&parts)).map_err(err)?;
+            Ok(shape(v))
+        }),
+    );
 }
 
 /// Registra los builtins de base de datos sobre un `DbHandle` (compartido). Gateados por
@@ -1021,6 +1631,32 @@ pub fn register_database_builtins<H: DbHandle>(
             }),
         );
     }
+
+    // json_encode(value) → text: serializa CUALQUIER valor a un string JSON. Compañero de la
+    // API de DB para datos estructurados (p.ej. redis_set(k, json_encode({...}))), pero es un
+    // builtin general (transform puro, SIN capability — como text/bytes/decode). Mismo mapeo que
+    // los bodies de serve: secrets → "[redacted]" (seguro), bytes → base64, decimal exacto.
+    interp.register_builtin(
+        "json_encode",
+        1,
+        Rc::new(|_i, args, _loc| {
+            let v = args.first().ok_or_else(|| err("json_encode: missing argument"))?;
+            Ok(syn_text(dumps(&syn_to_json(v))))
+        }),
+    );
+
+    // json_decode(text) → value: parsea un string JSON a un valor de Synsema (map/list/number/
+    // text/bool/nothing). Error claro si el JSON es inválido. Sin capability.
+    interp.register_builtin(
+        "json_decode",
+        1,
+        Rc::new(|_i, args, _loc| {
+            let s = raw_str(args.first().ok_or_else(|| err("json_decode: missing argument"))?);
+            let j: serde_json::Value = serde_json::from_str(&s)
+                .map_err(|e| err(format!("json_decode: invalid JSON: {}", e)))?;
+            Ok(json_to_syn(&j))
+        }),
+    );
 
     // sql(query, params?) → lista de mapas-fila
     {
@@ -1147,6 +1783,441 @@ pub fn register_database_builtins<H: DbHandle>(
                     })
                 };
                 Ok(SynValue::Server(Rc::new(ServerValue::Paged(Rc::new(fetch)))))
+            }),
+        );
+    }
+
+    // -- MongoDB (M3): API propia `mongo_*` (no-SQL). Gateadas por `db` como los SQL. --
+
+    // mongo_find(coll, filter?, opts?) → lista de documentos (maps)
+    {
+        let db = db.clone();
+        let caps = caps.clone();
+        interp.register_builtin(
+            "mongo_find",
+            -1,
+            Rc::new(move |_i, args, _loc| {
+                let coll = raw_str(args.first().ok_or_else(|| err("mongo_find: missing collection"))?);
+                let filter = filter_arg(args.get(1));
+                let opts = parse_find_opts(args.get(2));
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "mongo_find()")?;
+                }
+                let docs = db.write(|m| m.mongo_find(&coll, filter, opts)).map_err(err)?;
+                Ok(syn_list(docs))
+            }),
+        );
+    }
+
+    // mongo_find_one(coll, filter?) → documento (map) o nothing
+    {
+        let db = db.clone();
+        let caps = caps.clone();
+        interp.register_builtin(
+            "mongo_find_one",
+            -1,
+            Rc::new(move |_i, args, _loc| {
+                let coll = raw_str(args.first().ok_or_else(|| err("mongo_find_one: missing collection"))?);
+                let filter = filter_arg(args.get(1));
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "mongo_find_one()")?;
+                }
+                db.write(|m| m.mongo_find_one(&coll, filter)).map_err(err)
+            }),
+        );
+    }
+
+    // mongo_insert(coll, doc) → _id insertado (text hex si es ObjectId)
+    {
+        let db = db.clone();
+        let caps = caps.clone();
+        interp.register_builtin(
+            "mongo_insert",
+            2,
+            Rc::new(move |_i, args, _loc| {
+                let coll = raw_str(args.first().ok_or_else(|| err("mongo_insert: missing collection"))?);
+                let doc = required_doc_arg(args.get(1), "mongo_insert")?;
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "mongo_insert()")?;
+                }
+                db.write(|m| m.mongo_insert(&coll, doc)).map_err(err)
+            }),
+        );
+    }
+
+    // mongo_insert_many(coll, docs_list) → lista de _id (en orden)
+    {
+        let db = db.clone();
+        let caps = caps.clone();
+        interp.register_builtin(
+            "mongo_insert_many",
+            2,
+            Rc::new(move |_i, args, _loc| {
+                let coll = raw_str(args.first().ok_or_else(|| err("mongo_insert_many: missing collection"))?);
+                let docs = docs_list_arg(args.get(1), "mongo_insert_many")?;
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "mongo_insert_many()")?;
+                }
+                let ids = db.write(|m| m.mongo_insert_many(&coll, docs)).map_err(err)?;
+                Ok(syn_list(ids))
+            }),
+        );
+    }
+
+    // mongo_update(coll, filter, update) → {matched, modified}. `update` con operadores ($set/…).
+    {
+        let db = db.clone();
+        let caps = caps.clone();
+        interp.register_builtin(
+            "mongo_update",
+            3,
+            Rc::new(move |_i, args, _loc| {
+                let coll = raw_str(args.first().ok_or_else(|| err("mongo_update: missing collection"))?);
+                let filter = filter_arg(args.get(1));
+                let update = required_doc_arg(args.get(2), "mongo_update")?;
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "mongo_update()")?;
+                }
+                let (matched, modified) =
+                    db.write(|m| m.mongo_update(&coll, filter, update)).map_err(err)?;
+                let mut map = IndexMap::new();
+                map.insert("matched".to_string(), syn_int(matched));
+                map.insert("modified".to_string(), syn_int(modified));
+                Ok(syn_map(map))
+            }),
+        );
+    }
+
+    // mongo_delete(coll, filter) → {deleted}
+    {
+        let db = db.clone();
+        let caps = caps.clone();
+        interp.register_builtin(
+            "mongo_delete",
+            2,
+            Rc::new(move |_i, args, _loc| {
+                let coll = raw_str(args.first().ok_or_else(|| err("mongo_delete: missing collection"))?);
+                let filter = filter_arg(args.get(1));
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "mongo_delete()")?;
+                }
+                let deleted = db.write(|m| m.mongo_delete(&coll, filter)).map_err(err)?;
+                let mut map = IndexMap::new();
+                map.insert("deleted".to_string(), syn_int(deleted));
+                Ok(syn_map(map))
+            }),
+        );
+    }
+
+    // mongo_count(coll, filter?) → number
+    {
+        let db = db.clone();
+        let caps = caps.clone();
+        interp.register_builtin(
+            "mongo_count",
+            -1,
+            Rc::new(move |_i, args, _loc| {
+                let coll = raw_str(args.first().ok_or_else(|| err("mongo_count: missing collection"))?);
+                let filter = filter_arg(args.get(1));
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "mongo_count()")?;
+                }
+                let n = db.write(|m| m.mongo_count(&coll, filter)).map_err(err)?;
+                Ok(syn_int(n))
+            }),
+        );
+    }
+
+    // mongo_aggregate(coll, pipeline_list) → lista de documentos (maps)
+    {
+        let db = db.clone();
+        let caps = caps.clone();
+        interp.register_builtin(
+            "mongo_aggregate",
+            2,
+            Rc::new(move |_i, args, _loc| {
+                let coll = raw_str(args.first().ok_or_else(|| err("mongo_aggregate: missing collection"))?);
+                let pipeline = docs_list_arg(args.get(1), "mongo_aggregate")?;
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "mongo_aggregate()")?;
+                }
+                let docs = db.write(|m| m.mongo_aggregate(&coll, pipeline)).map_err(err)?;
+                Ok(syn_list(docs))
+            }),
+        );
+    }
+
+    // mongo_collections() → lista de nombres de colecciones
+    {
+        let db = db.clone();
+        let caps = caps.clone();
+        interp.register_builtin(
+            "mongo_collections",
+            0,
+            Rc::new(move |_i, _args, _loc| {
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "mongo_collections()")?;
+                }
+                let names = db.write(|m| m.mongo_collections()).map_err(err)?;
+                Ok(syn_list(names.iter().map(|n| syn_text(n.as_str())).collect()))
+            }),
+        );
+    }
+
+    // -- Redis (M4): API propia `redis_*` (KV/cache/estructuras + lock). Gateadas por `db`. --
+    //
+    // Tres familias de DB: SQL (SQLite/PG/MySQL: sql/sql_exec) vs documentos (Mongo: mongo_*)
+    // vs **KV/estructuras (Redis: redis_*)**. Los valores son `text`/`bytes`/`number`
+    // (binario-seguros); los estructurados van por `json_encode`/`json_decode`.
+
+    // KV + cache (los "directos": cada arg → arg Redis; respuesta moldeada por el shaper).
+    register_redis_simple(interp, &db, &caps, "redis_get", &["GET"], 1, 1, Some(1), redis_shape_value);
+    register_redis_simple(interp, &db, &caps, "redis_del", &["DEL"], -1, 1, None, redis_shape_value);
+    register_redis_simple(interp, &db, &caps, "redis_exists", &["EXISTS"], -1, 1, None, redis_shape_value);
+    // `KEYS` es O(N) (escanea TODO el keyspace): para prod preferir un patrón acotado; un
+    // `redis_scan` no-bloqueante puede venir en un follow-up.
+    register_redis_simple(interp, &db, &caps, "redis_keys", &["KEYS"], 1, 1, Some(1), redis_shape_value);
+    register_redis_simple(interp, &db, &caps, "redis_type", &["TYPE"], 1, 1, Some(1), redis_shape_value);
+
+    // Contadores atómicos.
+    register_redis_simple(interp, &db, &caps, "redis_incr", &["INCR"], 1, 1, Some(1), redis_shape_value);
+    register_redis_simple(interp, &db, &caps, "redis_decr", &["DECR"], 1, 1, Some(1), redis_shape_value);
+    register_redis_simple(interp, &db, &caps, "redis_incrby", &["INCRBY"], 2, 2, Some(2), redis_shape_value);
+
+    // TTL.
+    register_redis_simple(interp, &db, &caps, "redis_expire", &["EXPIRE"], 2, 2, Some(2), redis_shape_bool);
+    register_redis_simple(interp, &db, &caps, "redis_ttl", &["TTL"], 1, 1, Some(1), redis_shape_value);
+    register_redis_simple(interp, &db, &caps, "redis_persist", &["PERSIST"], 1, 1, Some(1), redis_shape_bool);
+
+    // Hashes.
+    register_redis_simple(interp, &db, &caps, "redis_hget", &["HGET"], 2, 2, Some(2), redis_shape_value);
+    register_redis_simple(interp, &db, &caps, "redis_hdel", &["HDEL"], -1, 2, None, redis_shape_value);
+    register_redis_simple(interp, &db, &caps, "redis_hincrby", &["HINCRBY"], 3, 3, Some(3), redis_shape_value);
+
+    // Listas (colas/pilas).
+    register_redis_simple(interp, &db, &caps, "redis_lpush", &["LPUSH"], -1, 2, None, redis_shape_value);
+    register_redis_simple(interp, &db, &caps, "redis_rpush", &["RPUSH"], -1, 2, None, redis_shape_value);
+    register_redis_simple(interp, &db, &caps, "redis_lpop", &["LPOP"], 1, 1, Some(1), redis_shape_value);
+    register_redis_simple(interp, &db, &caps, "redis_rpop", &["RPOP"], 1, 1, Some(1), redis_shape_value);
+    register_redis_simple(interp, &db, &caps, "redis_lrange", &["LRANGE"], 3, 3, Some(3), redis_shape_value);
+    register_redis_simple(interp, &db, &caps, "redis_llen", &["LLEN"], 1, 1, Some(1), redis_shape_value);
+
+    // Sets.
+    register_redis_simple(interp, &db, &caps, "redis_sadd", &["SADD"], -1, 2, None, redis_shape_value);
+    register_redis_simple(interp, &db, &caps, "redis_srem", &["SREM"], -1, 2, None, redis_shape_value);
+    register_redis_simple(interp, &db, &caps, "redis_smembers", &["SMEMBERS"], 1, 1, Some(1), redis_shape_value);
+    register_redis_simple(interp, &db, &caps, "redis_sismember", &["SISMEMBER"], 2, 2, Some(2), redis_shape_bool);
+
+    // redis_set(key, val, ttl_secs?) → nothing (ok). Con ttl: `SET key val EX ttl`.
+    {
+        let db = db.clone();
+        let caps = caps.clone();
+        interp.register_builtin(
+            "redis_set",
+            -1,
+            Rc::new(move |_i, args, _loc| {
+                let key = syn_to_redis_arg(args.first().ok_or_else(|| err("redis_set: missing key"))?).map_err(err)?;
+                let val = syn_to_redis_arg(args.get(1).ok_or_else(|| err("redis_set: missing value"))?).map_err(err)?;
+                let mut parts = vec![b"SET".to_vec(), key, val];
+                match args.get(2) {
+                    None | Some(SynValue::Nothing) => {}
+                    Some(SynValue::Number(n)) => {
+                        parts.push(b"EX".to_vec());
+                        parts.push(n.to_i64_trunc().unwrap_or(0).to_string().into_bytes());
+                    }
+                    Some(other) => {
+                        return Err(err(format!(
+                            "redis_set: ttl_secs must be a number, got {}",
+                            other.type_name()
+                        )))
+                    }
+                }
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "redis_set")?;
+                }
+                db.write(|m| m.redis_command(&parts)).map_err(err)?;
+                Ok(SynValue::Nothing)
+            }),
+        );
+    }
+
+    // redis_mget(keys_list) → list (cada uno text/bytes/nothing). El arg es UNA lista de claves.
+    {
+        let db = db.clone();
+        let caps = caps.clone();
+        interp.register_builtin(
+            "redis_mget",
+            1,
+            Rc::new(move |_i, args, _loc| {
+                let items: Vec<SynValue> = match args.first() {
+                    Some(SynValue::List(l)) => l.borrow().iter().cloned().collect(),
+                    _ => return Err(err("redis_mget: expected a list of keys")),
+                };
+                if items.is_empty() {
+                    return Ok(syn_list(vec![]));
+                }
+                let mut parts = vec![b"MGET".to_vec()];
+                for k in &items {
+                    parts.push(syn_to_redis_arg(k).map_err(err)?);
+                }
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "redis_mget")?;
+                }
+                let v = db.write(|m| m.redis_command(&parts)).map_err(err)?;
+                Ok(redis_value_to_syn(&v))
+            }),
+        );
+    }
+
+    // redis_mset(map) → nothing (ok). El arg es UN map clave→valor.
+    {
+        let db = db.clone();
+        let caps = caps.clone();
+        interp.register_builtin(
+            "redis_mset",
+            1,
+            Rc::new(move |_i, args, _loc| {
+                let map_ref = match args.first() {
+                    Some(SynValue::Map(m)) => m,
+                    _ => return Err(err("redis_mset: expected a map of key→value")),
+                };
+                let mut parts = vec![b"MSET".to_vec()];
+                for (k, val) in map_ref.borrow().iter() {
+                    parts.push(k.as_bytes().to_vec());
+                    parts.push(syn_to_redis_arg(val).map_err(err)?);
+                }
+                if parts.len() == 1 {
+                    return Ok(SynValue::Nothing); // map vacío: nada que setear
+                }
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "redis_mset")?;
+                }
+                db.write(|m| m.redis_command(&parts)).map_err(err)?;
+                Ok(SynValue::Nothing)
+            }),
+        );
+    }
+
+    // redis_hset(key, map) → number (campos nuevos). El 2º arg es UN map field→valor.
+    {
+        let db = db.clone();
+        let caps = caps.clone();
+        interp.register_builtin(
+            "redis_hset",
+            2,
+            Rc::new(move |_i, args, _loc| {
+                let key = syn_to_redis_arg(args.first().ok_or_else(|| err("redis_hset: missing key"))?).map_err(err)?;
+                let map_ref = match args.get(1) {
+                    Some(SynValue::Map(m)) => m,
+                    _ => return Err(err("redis_hset: expected a map of field→value")),
+                };
+                let mut parts = vec![b"HSET".to_vec(), key];
+                for (f, val) in map_ref.borrow().iter() {
+                    parts.push(f.as_bytes().to_vec());
+                    parts.push(syn_to_redis_arg(val).map_err(err)?);
+                }
+                if parts.len() == 2 {
+                    return Err(err("redis_hset: the map has no fields"));
+                }
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "redis_hset")?;
+                }
+                let v = db.write(|m| m.redis_command(&parts)).map_err(err)?;
+                Ok(redis_value_to_syn(&v))
+            }),
+        );
+    }
+
+    // redis_hgetall(key) → map (field→valor). Siempre devuelve map (agrupa el array RESP2).
+    {
+        let db = db.clone();
+        let caps = caps.clone();
+        interp.register_builtin(
+            "redis_hgetall",
+            1,
+            Rc::new(move |_i, args, _loc| {
+                let key = syn_to_redis_arg(args.first().ok_or_else(|| err("redis_hgetall: missing key"))?).map_err(err)?;
+                let parts = vec![b"HGETALL".to_vec(), key];
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "redis_hgetall")?;
+                }
+                let v = db.write(|m| m.redis_command(&parts)).map_err(err)?;
+                Ok(syn_map(redis_value_to_map(v)))
+            }),
+        );
+    }
+
+    // redis_lock(key, ttl_ms?) → text (token) o nothing si está tomado. `SET key <token> NX PX ttl`
+    // (default 30000 ms). El token es único por adquisición (16 bytes aleatorios → hex).
+    {
+        let db = db.clone();
+        let caps = caps.clone();
+        interp.register_builtin(
+            "redis_lock",
+            -1,
+            Rc::new(move |_i, args, _loc| {
+                let key = syn_to_redis_arg(args.first().ok_or_else(|| err("redis_lock: missing key"))?).map_err(err)?;
+                let ttl_ms: i64 = match args.get(1) {
+                    None | Some(SynValue::Nothing) => 30000,
+                    Some(SynValue::Number(n)) => n.to_i64_trunc().unwrap_or(30000),
+                    Some(other) => {
+                        return Err(err(format!(
+                            "redis_lock: ttl_ms must be a number, got {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+                if ttl_ms <= 0 {
+                    return Err(err("redis_lock: ttl_ms must be positive"));
+                }
+                let token = redis_gen_token();
+                let parts = vec![
+                    b"SET".to_vec(),
+                    key,
+                    token.clone().into_bytes(),
+                    b"NX".to_vec(),
+                    b"PX".to_vec(),
+                    ttl_ms.to_string().into_bytes(),
+                ];
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "redis_lock")?;
+                }
+                let v = db.write(|m| m.redis_command(&parts)).map_err(err)?;
+                match v {
+                    // NX falló (la clave ya existe) → no adquirimos el lock.
+                    redis::Value::Nil => Ok(SynValue::Nothing),
+                    // OK → es nuestro: devolvemos el token para el unlock token-checked.
+                    _ => Ok(syn_text(token)),
+                }
+            }),
+        );
+    }
+
+    // redis_unlock(key, token) → bool. Libera SOLO si el token coincide (Lua atómico): evita
+    // liberar el lock de otro agente (p.ej. si el nuestro ya expiró por TTL y lo tomó otro).
+    {
+        let db = db.clone();
+        let caps = caps.clone();
+        interp.register_builtin(
+            "redis_unlock",
+            2,
+            Rc::new(move |_i, args, _loc| {
+                let key = syn_to_redis_arg(args.first().ok_or_else(|| err("redis_unlock: missing key"))?).map_err(err)?;
+                let token = syn_to_redis_arg(args.get(1).ok_or_else(|| err("redis_unlock: missing token"))?).map_err(err)?;
+                const LUA: &str =
+                    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+                let parts = vec![
+                    b"EVAL".to_vec(),
+                    LUA.as_bytes().to_vec(),
+                    b"1".to_vec(),
+                    key,
+                    token,
+                ];
+                if let Some(p) = db.read(|m| m.default_path()) {
+                    require_db(&caps, &p, "redis_unlock")?;
+                }
+                let v = db.write(|m| m.redis_command(&parts)).map_err(err)?;
+                Ok(redis_shape_bool(v))
             }),
         );
     }
@@ -1428,5 +2499,263 @@ mod tests {
             split_tls_hint("mysql://h/db?require_ssl=true&prefer_socket=false"),
             ("mysql://h/db?prefer_socket=false".to_string(), true)
         );
+    }
+
+    // -- MongoDB (M3): conversión SynValue ↔ BSON + _id, sin servidor --
+
+    fn imap(pairs: Vec<(&str, SynValue)>) -> IndexMap<String, SynValue> {
+        let mut m = IndexMap::new();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v);
+        }
+        m
+    }
+
+    const OID_HEX: &str = "507f1f77bcf86cd799439011";
+
+    #[test]
+    fn syn_to_bson_primitives() {
+        assert!(matches!(syn_to_bson(&SynValue::Nothing), Bson::Null));
+        assert!(matches!(syn_to_bson(&syn_bool(true)), Bson::Boolean(true)));
+        // Int32 si entra; si no, Int64.
+        assert!(matches!(syn_to_bson(&syn_int(42)), Bson::Int32(42)));
+        assert!(matches!(syn_to_bson(&syn_int(5_000_000_000)), Bson::Int64(5_000_000_000)));
+        assert!(matches!(syn_to_bson(&syn_float(3.5)), Bson::Double(_)));
+        assert!(matches!(syn_to_bson(&syn_text("hi")), Bson::String(_)));
+        // decimal → Decimal128 (texto exacto).
+        let d = rust_decimal::Decimal::from_str_exact("9.99").unwrap();
+        match syn_to_bson(&syn_number(Number::Decimal(d))) {
+            Bson::Decimal128(dec) => assert_eq!(dec.to_string(), "9.99"),
+            o => panic!("esperaba Decimal128, got {:?}", o),
+        }
+        // bytes → Binary (subtype Generic), byte-exacto.
+        let raw = vec![0xFFu8, 0x00, 0x48];
+        match syn_to_bson(&syn_bytes(raw.clone())) {
+            Bson::Binary(b) => {
+                assert_eq!(b.subtype, BinarySubtype::Generic);
+                assert_eq!(b.bytes, raw);
+            }
+            o => panic!("esperaba Binary, got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn bson_to_syn_primitives() {
+        assert!(matches!(bson_to_syn(&Bson::Null), SynValue::Nothing));
+        assert!(matches!(bson_to_syn(&Bson::Undefined), SynValue::Nothing));
+        assert!(matches!(bson_to_syn(&Bson::Int32(7)), SynValue::Number(Number::Int(7))));
+        assert!(matches!(bson_to_syn(&Bson::Int64(7)), SynValue::Number(Number::Int(7))));
+        // ObjectId → text hex (24).
+        let oid = ObjectId::parse_str(OID_HEX).unwrap();
+        match bson_to_syn(&Bson::ObjectId(oid)) {
+            SynValue::Text(s) => assert_eq!(&*s, OID_HEX),
+            o => panic!("esperaba text hex, got {:?}", o),
+        }
+        // Decimal128 → decimal.
+        let dec = Decimal128::from_str("9.99").unwrap();
+        match bson_to_syn(&Bson::Decimal128(dec)) {
+            SynValue::Number(n) => {
+                assert!(n.is_decimal());
+                assert_eq!(n.to_string(), "9.99");
+            }
+            o => panic!("esperaba decimal, got {:?}", o),
+        }
+        // Binary → bytes (byte-exacto, incl. no-UTF8).
+        let raw = vec![0xFFu8, 0x00, 0x48];
+        match bson_to_syn(&Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: raw.clone() })) {
+            SynValue::Bytes(b) => assert_eq!(&b[..], &raw[..]),
+            o => panic!("esperaba bytes, got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn bson_roundtrip_nested() {
+        // map anidado con list, bytes, decimal, NULL → BSON → SynValue conserva estructura.
+        let original = syn_map(imap(vec![
+            ("name", syn_text("Ana")),
+            ("age", syn_int(30)),
+            ("tags", syn_list(vec![syn_text("a"), syn_text("b")])),
+            ("meta", syn_map(imap(vec![("active", syn_bool(true)), ("note", SynValue::Nothing)]))),
+            ("blob", syn_bytes(vec![1u8, 2, 255])),
+        ]));
+        let back = bson_to_syn(&syn_to_bson(&original));
+        match back {
+            SynValue::Map(m) => {
+                let m = m.borrow();
+                assert!(matches!(m.get("name"), Some(SynValue::Text(s)) if &**s == "Ana"));
+                assert!(matches!(m.get("age"), Some(SynValue::Number(Number::Int(30)))));
+                match m.get("tags") {
+                    Some(SynValue::List(l)) => assert_eq!(l.borrow().len(), 2),
+                    o => panic!("esperaba list, got {:?}", o),
+                }
+                match m.get("meta") {
+                    Some(SynValue::Map(mm)) => {
+                        assert!(matches!(mm.borrow().get("active"), Some(SynValue::Bool(true))));
+                        assert!(matches!(mm.borrow().get("note"), Some(SynValue::Nothing)));
+                    }
+                    o => panic!("esperaba map anidado, got {:?}", o),
+                }
+                match m.get("blob") {
+                    Some(SynValue::Bytes(b)) => assert_eq!(&b[..], &[1u8, 2, 255]),
+                    o => panic!("esperaba bytes, got {:?}", o),
+                }
+            }
+            o => panic!("esperaba map, got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn coerce_id_hex_to_objectid() {
+        // Bajo `_id`, un string hex-24 asciende a ObjectId; otra clave lo deja como String.
+        let doc = syn_map_to_doc(&imap(vec![
+            ("_id", syn_text(OID_HEX)),
+            ("ref", syn_text(OID_HEX)),
+            ("name", syn_text("Ana")),
+        ]));
+        match doc.get("_id") {
+            Some(Bson::ObjectId(oid)) => assert_eq!(oid.to_hex(), OID_HEX),
+            o => panic!("esperaba ObjectId en _id, got {:?}", o),
+        }
+        assert!(matches!(doc.get("ref"), Some(Bson::String(s)) if s == OID_HEX));
+        // Un string que NO es un ObjectId válido bajo _id queda como String.
+        let doc2 = syn_map_to_doc(&imap(vec![("_id", syn_text("not-an-oid"))]));
+        assert!(matches!(doc2.get("_id"), Some(Bson::String(_))));
+    }
+
+    #[test]
+    fn coerce_id_inside_in_operator() {
+        // `{"_id": {"$in": ["hex1", "hex2"]}}` → cada hex anidado se vuelve ObjectId.
+        let filter = syn_map_to_doc(&imap(vec![(
+            "_id",
+            syn_map(imap(vec![("$in", syn_list(vec![syn_text(OID_HEX), syn_text(OID_HEX)]))])),
+        )]));
+        match filter.get("_id") {
+            Some(Bson::Document(inner)) => match inner.get("$in") {
+                Some(Bson::Array(arr)) => {
+                    assert_eq!(arr.len(), 2);
+                    assert!(matches!(arr[0], Bson::ObjectId(_)));
+                    assert!(matches!(arr[1], Bson::ObjectId(_)));
+                }
+                o => panic!("esperaba array en $in, got {:?}", o),
+            },
+            o => panic!("esperaba document en _id, got {:?}", o),
+        }
+    }
+
+    // -- Redis (M4): mapeo de valores + scope, sin servidor --
+
+    #[test]
+    fn syn_to_redis_arg_mapping() {
+        // text/bytes/number (incl. decimal) → bytes que se mandan.
+        assert_eq!(syn_to_redis_arg(&syn_text("hola")).unwrap(), b"hola".to_vec());
+        let raw = vec![0xFFu8, 0x00, 0x48];
+        assert_eq!(syn_to_redis_arg(&syn_bytes(raw.clone())).unwrap(), raw);
+        assert_eq!(syn_to_redis_arg(&syn_int(42)).unwrap(), b"42".to_vec());
+        let d = rust_decimal::Decimal::from_str_exact("9.99").unwrap();
+        assert_eq!(syn_to_redis_arg(&syn_number(Number::Decimal(d))).unwrap(), b"9.99".to_vec());
+        // bool/map/list/nothing → error claro (orienta a json_encode).
+        assert!(syn_to_redis_arg(&syn_bool(true)).is_err());
+        assert!(syn_to_redis_arg(&SynValue::Nothing).is_err());
+        assert!(syn_to_redis_arg(&syn_list(vec![syn_int(1)])).is_err());
+        assert!(syn_to_redis_arg(&syn_map(imap(vec![("a", syn_int(1))]))).is_err());
+        let e = syn_to_redis_arg(&syn_bool(true)).unwrap_err();
+        assert!(e.contains("json_encode"), "el error debe orientar a json_encode: {}", e);
+    }
+
+    #[test]
+    fn redis_value_to_syn_mapping() {
+        use redis::Value as RV;
+        assert!(matches!(redis_value_to_syn(&RV::Nil), SynValue::Nothing));
+        assert!(matches!(redis_value_to_syn(&RV::Int(7)), SynValue::Number(Number::Int(7))));
+        // BulkString UTF-8 → text.
+        match redis_value_to_syn(&RV::BulkString(b"hola".to_vec())) {
+            SynValue::Text(s) => assert_eq!(&*s, "hola"),
+            o => panic!("esperaba text, got {:?}", o),
+        }
+        // BulkString no-UTF8 → bytes byte-exacto (heurística binario-segura).
+        let raw = vec![0xFFu8, 0x00, 0x48];
+        match redis_value_to_syn(&RV::BulkString(raw.clone())) {
+            SynValue::Bytes(b) => assert_eq!(&b[..], &raw[..]),
+            o => panic!("esperaba bytes, got {:?}", o),
+        }
+        // SimpleString / Okay → text.
+        match redis_value_to_syn(&RV::SimpleString("string".to_string())) {
+            SynValue::Text(s) => assert_eq!(&*s, "string"),
+            o => panic!("esperaba text, got {:?}", o),
+        }
+        match redis_value_to_syn(&RV::Okay) {
+            SynValue::Text(s) => assert_eq!(&*s, "OK"),
+            o => panic!("esperaba text OK, got {:?}", o),
+        }
+        // Array → list (recursivo).
+        match redis_value_to_syn(&RV::Array(vec![RV::Int(1), RV::BulkString(b"x".to_vec())])) {
+            SynValue::List(l) => assert_eq!(l.borrow().len(), 2),
+            o => panic!("esperaba list, got {:?}", o),
+        }
+        // Map (RESP3) → map (recursivo).
+        match redis_value_to_syn(&RV::Map(vec![(
+            RV::BulkString(b"f".to_vec()),
+            RV::BulkString(b"v".to_vec()),
+        )])) {
+            SynValue::Map(m) => {
+                assert!(matches!(m.borrow().get("f"), Some(SynValue::Text(s)) if &**s == "v"));
+            }
+            o => panic!("esperaba map, got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn redis_value_to_map_resp2_and_resp3() {
+        use redis::Value as RV;
+        // RESP2 (default): array plano de pares → map (se agrupa de a dos).
+        let flat = RV::Array(vec![
+            RV::BulkString(b"a".to_vec()),
+            RV::BulkString(b"1".to_vec()),
+            RV::BulkString(b"b".to_vec()),
+            RV::BulkString(b"2".to_vec()),
+        ]);
+        let m = redis_value_to_map(flat);
+        assert_eq!(m.len(), 2);
+        assert!(matches!(m.get("a"), Some(SynValue::Text(s)) if &**s == "1"));
+        assert!(matches!(m.get("b"), Some(SynValue::Text(s)) if &**s == "2"));
+        // RESP3: Map directo.
+        let m3 = redis_value_to_map(RV::Map(vec![(RV::BulkString(b"k".to_vec()), RV::Int(9))]));
+        assert!(matches!(m3.get("k"), Some(SynValue::Number(Number::Int(9)))));
+        // clave ausente → array vacío → map vacío.
+        assert!(redis_value_to_map(RV::Array(vec![])).is_empty());
+    }
+
+    #[test]
+    fn redis_shape_bool_mapping() {
+        assert!(matches!(redis_shape_bool(redis::Value::Int(1)), SynValue::Bool(true)));
+        assert!(matches!(redis_shape_bool(redis::Value::Int(0)), SynValue::Bool(false)));
+        assert!(matches!(redis_shape_bool(redis::Value::Nil), SynValue::Bool(false)));
+    }
+
+    #[test]
+    fn is_redis_url_detects() {
+        assert!(is_redis_url("redis://localhost:6379"));
+        assert!(is_redis_url("rediss://h/0"));
+        assert!(!is_redis_url("postgres://h/db"));
+        assert!(!is_redis_url("mongodb://h/db"));
+        assert!(!is_redis_url("./store.db"));
+    }
+
+    #[test]
+    fn canon_url_redis_scope() {
+        // credenciales/puerto fuera; db-index preservado.
+        assert_eq!(canon_url("redis://u:p@Host:6379/2"), "redis://host/2");
+        // gotcha del db-index: sin /N el scope NO trae db; /0 sí → son scopes distintos.
+        assert_eq!(canon_url("redis://localhost:6379"), "redis://localhost");
+        assert_eq!(canon_url("redis://localhost:6379/0"), "redis://localhost/0");
+    }
+
+    #[test]
+    fn redis_gen_token_is_unique_hex() {
+        let a = redis_gen_token();
+        let b = redis_gen_token();
+        assert_eq!(a.len(), 32, "16 bytes → 32 chars hex");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "cada adquisición debe dar un token distinto");
     }
 }

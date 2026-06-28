@@ -19,10 +19,11 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 | `Expected indented block` | Missing indentation after when/each/task/etc | Indent body with 4 spaces |
 | `'while' is a reserved word in Synsema` | Using a hard keyword as a name | Pick another name. (HTTP words like `route`/`auth` ARE allowed as names — they're soft keywords.) |
 
-## Database (SQL: SQLite / Postgres / MySQL)
+## Database — SQL (SQLite / Postgres / MySQL)
 
 One universal API (`db_open`/`sql`/`sql_exec`/…) routed by the `db_open` target: a file path → SQLite,
-`postgres://…` → Postgres, `mysql://…` → MySQL. Use `?` placeholders everywhere.
+`postgres://…` → Postgres, `mysql://…` → MySQL. (MongoDB is a separate document API, Redis a separate
+key-value API — see below.) Use `?` placeholders everywhere.
 
 | What you expect | What actually happens | Why / workaround |
 |---|---|---|
@@ -34,6 +35,36 @@ One universal API (`db_open`/`sql`/`sql_exec`/…) routed by the `db_open` targe
 | A `BLOB`/`BYTEA` column round-trips as text | It returns `bytes` (`type_of` "bytes"); `decode()` for text | Binary is byte-exact — use `bytes(...)` to insert, `decode(...)` to read text |
 | `DECIMAL`/`NUMERIC` comes back as a float | It's a `decimal` (`type_of` "decimal"), exact | Keep it as `decimal` for money; don't coerce through float |
 | `?` in a Postgres query must be `$1` | The runtime rewrites `?`→`$n` for you (MySQL uses `?` natively) | Just write `?` everywhere; for pgvector pass a list as `?::vector` |
+
+## Database — MongoDB (document store, `mongo_*`)
+
+`db_open("mongodb://…")` then `mongo_find`/`mongo_insert`/… — **not** `sql()`. Filters and docs are
+Synsema maps ↔ BSON.
+
+| What you expect | What actually happens | Why / workaround |
+|---|---|---|
+| `sql("SELECT …")` works on a Mongo connection | Errors: "this is a MongoDB connection — use mongo_*" | Use `mongo_find`/`mongo_aggregate`/etc. (and `mongo_*` on a SQL connection errors symmetrically) |
+| `mongo_update(c, filt, {"age": 31})` sets age | Mongo rejects a plain doc as the update | Use an operator: `{"$set": {"age": 31}}` (also `$inc`, `$push`, …) |
+| `mongo_find(c, {"_id": "<hex>"})` finds nothing | Without coercion a string ≠ ObjectId | The runtime coerces a 24-hex string under `_id` (incl. in `$in`) to an ObjectId — pass the hex you got back from `mongo_insert` |
+| `"price": 9.99` stores an exact decimal | `9.99` is a **float** → BSON Double → reads back `number` | Use a decimal literal `9.99d` (or `decimal("9.99")`) → BSON Decimal128 → reads back `decimal` |
+| `require db("mongodb://u:p@host:27017/appdb?authSource=admin")` is the scope | Credentials/port/query stripped: scope is `mongodb://host/appdb` | Grant the canonical URL `db("mongodb://host/appdb")` |
+| `db_open("mongodb://…")` is lazy and always succeeds | It pings on open — a dead host / bad auth fails there (within 10s) | Expected: connectivity is validated at `db_open`, like the SQL backends |
+| `mongo_insert` returns the doc | It returns the new `_id` (text hex for ObjectId) | Read it back with `mongo_find_one(c, {"_id": id})` |
+
+## Database — Redis (key-value/cache/structures, `redis_*`)
+
+`db_open("redis://…")` then `redis_get`/`redis_set`/`redis_hset`/… — **not** `sql()` or `mongo_*`. Values are
+byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_decode`.
+
+| What you expect | What actually happens | Why / workaround |
+|---|---|---|
+| `sql("SELECT …")` works on a Redis connection | Errors: "this is a Redis connection — use the redis_* builtins" | Use `redis_*` (and `redis_*` on a SQL/Mongo connection errors symmetrically) |
+| `require db("redis://localhost")` covers `db_open("redis://localhost:6379/0")` | **No** — `:6379` (no path) → scope `redis://localhost`, but `/0` → scope `redis://localhost/0` (different) | Match the `require db(...)` form to `db_open(...)` exactly: no `/N` ⇒ no db in the scope; `/0` ⇒ `/0` in the scope |
+| `redis_set(k, {"a": 1})` stores the map | Errors: redis values must be text/bytes/number | Serialize: `redis_set(k, json_encode({"a": 1}))`, read with `json_decode(redis_get(k))` |
+| `redis_get` of UTF-8 data returns `bytes` | Returns `text` if the bytes are valid UTF-8, else `bytes` | Binary-safe heuristic; raw/non-UTF8 values round-trip as `bytes` byte-exactly |
+| `redis_unlock(k)` frees the lock | It needs the **token** from `redis_lock` and only frees if it still matches | Keep the token: `let t be redis_lock(k, ttl)`; `if t != nothing` … `redis_unlock(k, t)`. A 2nd `redis_lock` on a held key returns `nothing` |
+| `redis_lock` blocks until the lock is free | Non-blocking: returns `nothing` immediately if held | Check the return; the TTL auto-releases if the holder dies (single-node Redlock, not multi-node) |
+| `redis_keys("*")` is fine in prod | `KEYS` is O(N) — scans the whole keyspace | Use a bounded pattern (`user:*`); a non-blocking `redis_scan` may come later |
 
 ## HTTP server (serve)
 
