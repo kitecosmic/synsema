@@ -6,10 +6,14 @@
 //!   - **Postgres** (M1; driver sync `postgres` = tokio-postgres con runtime interno, TLS
 //!     rustls) — `db_open("postgres://user:pw@host/db")`. Placeholders `?` (se reescriben
 //!     a `$n`). pgvector se usa en la query (`<->`/`<=>`), server-side.
+//!   - **MySQL** (M2; driver sync puro-Rust `mysql`, TLS rustls opt-in) —
+//!     `db_open("mysql://user:pw@host:3306/db")`. Placeholders `?` **nativos** (NO se
+//!     reescriben). `last_insert_id()` real → el `last_id` de `sql_exec` funciona. BLOB vs
+//!     TEXT se distinguen por el charset binario de la columna (MF-010, round-trip de bytes).
 //!
-//! Gateado por la capability `db(scope)` (deny-by-default): SQLite scope = ruta, Postgres
-//! scope = `canon_url` (scheme://host/db, sin credenciales). Acceso serializado (un op por
-//! vez: `Rc<RefCell>` en run, `Arc<Mutex>` en serve) → una conexión por `db_open`.
+//! Gateado por la capability `db(scope)` (deny-by-default): SQLite scope = ruta, Postgres/
+//! MySQL scope = `canon_url` (scheme://host/db, sin credenciales). Acceso serializado (un op
+//! por vez: `Rc<RefCell>` en run, `Arc<Mutex>` en serve) → una conexión por `db_open`.
 
 use std::cell::RefCell;
 use std::error::Error as StdError;
@@ -19,6 +23,8 @@ use std::time::Duration;
 
 use bytes::BytesMut;
 use indexmap::IndexMap;
+use mysql::consts::ColumnType;
+use mysql::prelude::Queryable;
 use postgres::types::{to_sql_checked, Format, FromSql, IsNull, ToSql, Type};
 use postgres::{Client, NoTls};
 use rusqlite::types::Value;
@@ -77,6 +83,7 @@ pub type Row = IndexMap<String, SynValue>;
 enum Backend {
     Sqlite(Connection),
     Postgres(Client),
+    Mysql(mysql::Conn),
 }
 
 pub struct DatabaseManager {
@@ -99,8 +106,9 @@ impl DatabaseManager {
     }
 
     /// Abre una conexión. Rutea por scheme: `postgres://`/`postgresql://` → Postgres;
-    /// cualquier otra cosa → SQLite (camino actual, sin cambios). Devuelve la key usada
-    /// como identificador (canon_url para PG; ruta/`:memory:` para SQLite).
+    /// `mysql://` → MySQL; cualquier otra cosa → SQLite (camino actual, sin cambios).
+    /// Devuelve la key usada como identificador (canon_url para PG/MySQL; ruta/`:memory:`
+    /// para SQLite).
     pub fn open(&mut self, target: &str, mode: &str) -> Result<String, String> {
         if is_pg_url(target) {
             let key = canon_url(target);
@@ -109,6 +117,17 @@ impl DatabaseManager {
             }
             let client = pg_connect(target)?;
             self.connections.insert(key.clone(), Backend::Postgres(client));
+            if self.default_db.is_none() {
+                self.default_db = Some(key.clone());
+            }
+            Ok(key)
+        } else if is_mysql_url(target) {
+            let key = canon_url(target);
+            if self.connections.contains_key(&key) {
+                return Ok(key);
+            }
+            let conn = mysql_connect(target)?;
+            self.connections.insert(key.clone(), Backend::Mysql(conn));
             if self.default_db.is_none() {
                 self.default_db = Some(key.clone());
             }
@@ -161,11 +180,13 @@ impl DatabaseManager {
         match self.conn_mut(None)? {
             Backend::Sqlite(c) => sqlite_query(c, sql, params),
             Backend::Postgres(c) => pg_query(c, sql, params),
+            Backend::Mysql(c) => mysql_query(c, sql, params),
         }
     }
 
     /// Ejecuta INSERT/UPDATE/DELETE/CREATE. Devuelve (rows_affected, last_id).
     /// Postgres no tiene `last_insert_rowid` → `last_id = 0` (usar `INSERT … RETURNING id`).
+    /// MySQL sí: `last_id = last_insert_id()` (a diferencia de PG).
     pub fn execute(&mut self, sql: &str, params: &[SynValue]) -> Result<(i64, i64), String> {
         match self.conn_mut(None)? {
             Backend::Sqlite(c) => {
@@ -181,6 +202,20 @@ impl DatabaseManager {
                 let refs: Vec<&(dyn ToSql + Sync)> = pg.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
                 let n = c.execute(rewritten.as_str(), &refs).map_err(pg_err)?;
                 Ok((n as i64, 0))
+            }
+            // `?` nativo (sin reescritura). `last_insert_id()` real (0 si no aplica).
+            // Sin params → protocolo de TEXTO (`query_drop`): el de prepared statements
+            // rechaza el control de transacciones y otros comandos (ERROR 1295: "not
+            // supported in the prepared statement protocol"). Con params → prepared (binario)
+            // para el bind. `execute` no lee valores tipados (solo counts) → el protocolo no
+            // afecta el mapeo de tipos (a diferencia de `query`, que SIEMPRE va por binario).
+            Backend::Mysql(c) => {
+                if params.is_empty() {
+                    c.query_drop(sql).map_err(mysql_err)?;
+                } else {
+                    c.exec_drop(sql, mysql_params(params)).map_err(mysql_err)?;
+                }
+                Ok((c.affected_rows() as i64, c.last_insert_id() as i64))
             }
         }
     }
@@ -211,6 +246,16 @@ impl DatabaseManager {
                 }
                 Ok(total)
             }
+            // Prepara una vez (`?` nativo) y reusa el statement por cada set de params.
+            Backend::Mysql(c) => {
+                let stmt = c.prep(sql).map_err(mysql_err)?;
+                let mut total: i64 = 0;
+                for params in params_list {
+                    c.exec_drop(&stmt, mysql_params(params)).map_err(mysql_err)?;
+                    total += c.affected_rows() as i64;
+                }
+                Ok(total)
+            }
         }
     }
 
@@ -230,6 +275,13 @@ impl DatabaseManager {
                 "SELECT tablename FROM pg_catalog.pg_tables \
                  WHERE schemaname NOT IN ('pg_catalog','information_schema') ORDER BY tablename",
                 "tablename",
+            ),
+            // `SHOW TABLES` da una columna de nombre dinámico (`Tables_in_<db>`); se usa
+            // information_schema con alias fijo `name` para leerla igual que los otros.
+            Backend::Mysql(_) => (
+                "SELECT table_name AS name FROM information_schema.tables \
+                 WHERE table_schema = DATABASE() ORDER BY table_name",
+                "name",
             ),
         };
         let rows = self.query(sql, &[])?;
@@ -667,6 +719,225 @@ fn pg_cell_to_syn(row: &postgres::Row, i: usize, ty: &Type) -> SynValue {
     cell_opt::<String>(row, i).map(syn_text).unwrap_or(nothing)
 }
 
+// -- MySQL: conexión, TLS opt-in, bind, lectura (M2) --
+
+fn is_mysql_url(target: &str) -> bool {
+    target.starts_with("mysql://")
+}
+
+/// Mapea un error del crate `mysql` a un mensaje útil. Su `Display` ya incluye el detalle
+/// del server para `MySqlError` (código + SQLSTATE + mensaje), así que `to_string()` es
+/// informativo (lección M1 #2: no devolver algo opaco). Wrapper nombrado para documentarlo.
+fn mysql_err(e: mysql::Error) -> String {
+    e.to_string()
+}
+
+/// TLS es **opt-in** en MySQL (el contenedor dev es plaintext) y el parser de URL del crate
+/// `mysql` RECHAZA claves de query desconocidas (`UnknownParameter`) → no se puede pedir TLS
+/// con `?ssl-mode=…` directo. Por eso interceptamos NOSOTROS el hint, lo quitamos del url y
+/// devolvemos `(url_limpio, wants_tls)`. Hints: `ssl-mode`/`sslmode` ≠ `DISABLED` → on;
+/// `ssl`/`require_ssl` ∈ {true,1,required,yes} → on. Ausente/`DISABLED` → plaintext.
+fn split_tls_hint(url: &str) -> (String, bool) {
+    let (base, query) = match url.split_once('?') {
+        Some((b, q)) => (b, q),
+        None => return (url.to_string(), false),
+    };
+    let mut wants_tls = false;
+    let mut kept: Vec<&str> = Vec::new();
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match k.to_ascii_lowercase().as_str() {
+            "ssl-mode" | "sslmode" => {
+                let m = v.to_ascii_uppercase();
+                wants_tls = !(m.is_empty() || m == "DISABLED" || m == "DISABLE");
+            }
+            "ssl" | "require_ssl" => {
+                wants_tls = matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "true" | "1" | "required" | "yes"
+                );
+            }
+            _ => kept.push(pair),
+        }
+    }
+    let cleaned = if kept.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}?{}", base, kept.join("&"))
+    };
+    (cleaned, wants_tls)
+}
+
+/// Conecta a MySQL. Aplica `connect_timeout` por defecto (10s) desde el día 1 (lección M1
+/// #1: un `db_open` a un host caído NO debe colgarse). TLS opt-in (rustls, backend ring vía
+/// webpki-roots): si el url lo pide, verifica el cert del server contra los root CAs
+/// embebidos. El contenedor dev es plaintext → por defecto sin SSL.
+fn mysql_connect(url: &str) -> Result<mysql::Conn, String> {
+    let (clean_url, wants_tls) = split_tls_hint(url);
+    let opts = mysql::Opts::from_url(&clean_url).map_err(|e| e.to_string())?;
+    let mut builder = mysql::OptsBuilder::from_opts(opts)
+        .tcp_connect_timeout(Some(Duration::from_secs(10)));
+    if wants_tls {
+        builder = builder.ssl_opts(Some(mysql::SslOpts::default()));
+    }
+    mysql::Conn::new(builder).map_err(mysql_err)
+}
+
+/// Params posicionales (`?` nativo). Vacío → `Params::Empty` (evita el chequeo de aridad
+/// del driver cuando la query no tiene placeholders).
+fn mysql_params(params: &[SynValue]) -> mysql::Params {
+    if params.is_empty() {
+        mysql::Params::Empty
+    } else {
+        mysql::Params::Positional(params.iter().map(syn_to_mysql).collect())
+    }
+}
+
+/// `SynValue` → `mysql::Value` (bind). MySQL no tiene bool real → TINYINT (Int 0/1).
+/// decimal/big → texto (el server castea a DECIMAL/NUMERIC exacto). bytes → bytes crudos
+/// (BLOB/BINARY, round-trip MF-010). El secret se revela en el borde de la DB (SQL
+/// parametrizado), igual que en SQLite/PG.
+fn syn_to_mysql(v: &SynValue) -> mysql::Value {
+    use mysql::Value as MyV;
+    match v {
+        SynValue::Nothing => MyV::NULL,
+        SynValue::Bool(b) => MyV::Int(if *b { 1 } else { 0 }),
+        SynValue::Number(Number::Int(i)) => MyV::Int(*i),
+        SynValue::Number(Number::Float(f)) => MyV::Double(*f),
+        SynValue::Number(n) => MyV::Bytes(n.to_string().into_bytes()),
+        SynValue::Bytes(b) => MyV::Bytes(b[..].to_vec()),
+        SynValue::Text(s) => MyV::Bytes(s.as_bytes().to_vec()),
+        SynValue::Secret(s) => MyV::Bytes(s.expose().to_string().into_bytes()),
+        other => MyV::Bytes(other.to_string().into_bytes()),
+    }
+}
+
+fn mysql_query(conn: &mut mysql::Conn, sql: &str, params: &[SynValue]) -> Result<Vec<Row>, String> {
+    let mut result = conn.exec_iter(sql, mysql_params(params)).map_err(mysql_err)?;
+    let mut out = Vec::new();
+    while let Some(row_res) = result.next() {
+        let row = row_res.map_err(mysql_err)?;
+        let cols = row.columns(); // Arc<[Column]> (mismo orden que los valores)
+        let values = row.unwrap(); // Vec<Value>, consume la fila
+        let mut m = IndexMap::new();
+        for (i, val) in values.into_iter().enumerate() {
+            let col = &cols[i];
+            m.insert(col.name_str().to_string(), mysql_cell_to_syn(val, col));
+        }
+        out.push(m);
+    }
+    Ok(out)
+}
+
+/// True si la columna lleva datos binarios reales (BLOB/BINARY/VARBINARY) → la pseudo-
+/// collation `binary`, cuyo id de charset es **63**. MySQL usa el MISMO `column_type` para
+/// TEXT y BLOB; este es el discriminador para mandar binario→`bytes` y texto→`text`
+/// (round-trip MF-010).
+///
+/// OJO (lección de la verificación viva): NO usar `ColumnFlags::BINARY_FLAG`. Ese flag marca
+/// *collation binaria* (`_bin`), no *datos binarios*: una columna TEXT con collation
+/// `utf8mb3_bin`/`utf8mb4_bin` (p.ej. `information_schema.tables.TABLE_NAME`) trae el flag
+/// pero sigue siendo texto. El único indicador fiable de BLOB/BINARY es el charset id 63.
+fn col_is_binary(col: &mysql::Column) -> bool {
+    col.character_set() == 63
+}
+
+/// `Vec<u8>` válido utf8 → `text`; si no → `bytes` (no corrompe; sin utf8-lossy).
+fn text_or_bytes(b: Vec<u8>) -> SynValue {
+    match String::from_utf8(b) {
+        Ok(s) => syn_text(s),
+        Err(e) => syn_bytes(e.into_bytes()),
+    }
+}
+
+/// Lee una celda MySQL → `SynValue` mirando el `Value` y el tipo/charset de la columna
+/// (§5.2 del spec). Enteros/floats/fechas vienen tipados; DECIMAL/JSON/TEXT/BLOB vienen como
+/// `Bytes` y se interpretan por `column_type` (+ flag binario para BLOB vs TEXT).
+fn mysql_cell_to_syn(v: mysql::Value, col: &mysql::Column) -> SynValue {
+    match v {
+        mysql::Value::NULL => SynValue::Nothing,
+        mysql::Value::Int(i) => syn_int(i),
+        // BIGINT UNSIGNED puede pasarse de i64 → se preserva exacto como entero (Int/Big),
+        // no como decimal (mantiene `type_of` entero).
+        mysql::Value::UInt(u) => {
+            if u <= i64::MAX as u64 {
+                syn_int(u as i64)
+            } else {
+                syn_number(Number::parse_int_literal(&u.to_string()))
+            }
+        }
+        mysql::Value::Float(f) => syn_float(f as f64),
+        mysql::Value::Double(f) => syn_float(f),
+        // DATE → fecha sola; DATETIME/TIMESTAMP → fecha y hora (ISO). Texto (como PG).
+        mysql::Value::Date(y, mo, d, h, mi, s, us) => {
+            let txt = if col.column_type() == ColumnType::MYSQL_TYPE_DATE {
+                format!("{:04}-{:02}-{:02}", y, mo, d)
+            } else if us > 0 {
+                format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:06}", y, mo, d, h, mi, s, us)
+            } else {
+                format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, mi, s)
+            };
+            syn_text(txt)
+        }
+        // TIME admite > 24h (días) y signo (intervalos). Texto `[-]HH:MM:SS[.ffffff]`.
+        mysql::Value::Time(neg, days, h, mi, s, us) => {
+            let total_h = days * 24 + h as u32;
+            let sign = if neg { "-" } else { "" };
+            let txt = if us > 0 {
+                format!("{}{:02}:{:02}:{:02}.{:06}", sign, total_h, mi, s, us)
+            } else {
+                format!("{}{:02}:{:02}:{:02}", sign, total_h, mi, s)
+            };
+            syn_text(txt)
+        }
+        mysql::Value::Bytes(b) => {
+            let nothing = SynValue::Nothing;
+            match col.column_type() {
+                // DECIMAL/NUMERIC: texto "9.99" → Decimal exacto (DE-009/21: type_of "decimal").
+                ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => {
+                    let s = String::from_utf8_lossy(&b);
+                    match rust_decimal::Decimal::from_str_exact(s.trim()) {
+                        Ok(d) => syn_number(Number::Decimal(d)),
+                        Err(_) => syn_text(s.into_owned()),
+                    }
+                }
+                // JSON → map/list (parsear con serde_json; reusa json_to_syn de M1).
+                ColumnType::MYSQL_TYPE_JSON => serde_json::from_slice::<serde_json::Value>(&b)
+                    .map(|j| json_to_syn(&j))
+                    .unwrap_or(nothing),
+                // VARCHAR/CHAR/TEXT/BLOB/ENUM/SET comparten column_type: el charset binario
+                // (63) decide bytes (BLOB/BINARY) vs text (TEXT/VARCHAR/ENUM).
+                ColumnType::MYSQL_TYPE_VARCHAR
+                | ColumnType::MYSQL_TYPE_VAR_STRING
+                | ColumnType::MYSQL_TYPE_STRING
+                | ColumnType::MYSQL_TYPE_BLOB
+                | ColumnType::MYSQL_TYPE_TINY_BLOB
+                | ColumnType::MYSQL_TYPE_MEDIUM_BLOB
+                | ColumnType::MYSQL_TYPE_LONG_BLOB
+                | ColumnType::MYSQL_TYPE_ENUM
+                | ColumnType::MYSQL_TYPE_SET => {
+                    if col_is_binary(col) {
+                        syn_bytes(b)
+                    } else {
+                        text_or_bytes(b)
+                    }
+                }
+                // Otros (BIT, GEOMETRY, fecha-como-texto…): binario→bytes, texto→utf8.
+                _ => {
+                    if col_is_binary(col) {
+                        syn_bytes(b)
+                    } else {
+                        text_or_bytes(b)
+                    }
+                }
+            }
+        }
+    }
+}
+
 // -- Builtins --
 
 fn err(msg: impl Into<String>) -> Control {
@@ -692,9 +963,9 @@ fn params_arg(v: Option<&SynValue>) -> Vec<SynValue> {
 }
 
 /// Scope canónico de `db` para un `db_open(target, mode)` (matchea la key que guarda
-/// `open()` y la que devuelve `default_path()`): PG → canon_url; SQLite → ruta/`:memory:`.
+/// `open()` y la que devuelve `default_path()`): PG/MySQL → canon_url; SQLite → ruta/`:memory:`.
 fn db_scope_for(target: &str, mode: &str) -> String {
-    if is_pg_url(target) {
+    if is_pg_url(target) || is_mysql_url(target) {
         canon_url(target)
     } else if mode == "memory" {
         ":memory:".to_string()
@@ -993,5 +1264,169 @@ mod tests {
         }
         let pv = PgVector::from_sql(&Type::FLOAT4, &raw).unwrap();
         assert_eq!(pv.0, vec![1.0f32, 2.0, 3.0]);
+    }
+
+    // -- MySQL (M2): mapeo de tipos sin servidor (Column sintética) --
+
+    fn mycol(ct: ColumnType) -> mysql::Column {
+        mysql::Column::new(ct)
+    }
+
+    #[test]
+    fn syn_to_mysql_bind_mapping() {
+        use mysql::Value as MyV;
+        assert_eq!(syn_to_mysql(&SynValue::Nothing), MyV::NULL);
+        // MySQL no tiene bool real → TINYINT 0/1.
+        assert_eq!(syn_to_mysql(&syn_bool(true)), MyV::Int(1));
+        assert_eq!(syn_to_mysql(&syn_bool(false)), MyV::Int(0));
+        assert_eq!(syn_to_mysql(&syn_int(42)), MyV::Int(42));
+        assert_eq!(syn_to_mysql(&syn_float(3.5)), MyV::Double(3.5));
+        // decimal → texto exacto (el server castea a DECIMAL/NUMERIC).
+        let d = rust_decimal::Decimal::from_str_exact("9.99").unwrap();
+        assert_eq!(
+            syn_to_mysql(&syn_number(Number::Decimal(d))),
+            MyV::Bytes(b"9.99".to_vec())
+        );
+        // bytes crudos (no-UTF8) byte-exacto (MF-010).
+        let raw = vec![255u8, 0, 72, 73];
+        assert_eq!(syn_to_mysql(&syn_bytes(raw.clone())), MyV::Bytes(raw));
+        assert_eq!(syn_to_mysql(&syn_text("hola")), MyV::Bytes(b"hola".to_vec()));
+    }
+
+    #[test]
+    fn mysql_read_int_float_null() {
+        match mysql_cell_to_syn(mysql::Value::Int(42), &mycol(ColumnType::MYSQL_TYPE_LONGLONG)) {
+            SynValue::Number(Number::Int(42)) => {}
+            o => panic!("esperaba int 42, got {:?}", o),
+        }
+        match mysql_cell_to_syn(mysql::Value::Double(3.5), &mycol(ColumnType::MYSQL_TYPE_DOUBLE)) {
+            SynValue::Number(n) => assert_eq!(n.to_f64(), 3.5),
+            o => panic!("esperaba float, got {:?}", o),
+        }
+        assert!(matches!(
+            mysql_cell_to_syn(mysql::Value::NULL, &mycol(ColumnType::MYSQL_TYPE_NULL)),
+            SynValue::Nothing
+        ));
+    }
+
+    #[test]
+    fn mysql_read_uint_big_preserves_integer() {
+        // BIGINT UNSIGNED > i64::MAX → entero exacto (Big), NO decimal (type_of entero).
+        let big = u64::MAX;
+        match mysql_cell_to_syn(mysql::Value::UInt(big), &mycol(ColumnType::MYSQL_TYPE_LONGLONG)) {
+            SynValue::Number(n) => {
+                assert!(n.is_integer());
+                assert_eq!(n.to_string(), big.to_string());
+            }
+            o => panic!("esperaba entero, got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn mysql_read_decimal_text_to_decimal() {
+        // NEWDECIMAL llega como Bytes-texto "9.99" → Decimal exacto (DE-021: type_of "decimal").
+        match mysql_cell_to_syn(
+            mysql::Value::Bytes(b"9.99".to_vec()),
+            &mycol(ColumnType::MYSQL_TYPE_NEWDECIMAL),
+        ) {
+            SynValue::Number(n) => {
+                assert!(n.is_decimal());
+                assert_eq!(n.to_string(), "9.99");
+            }
+            o => panic!("esperaba decimal, got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn mysql_read_blob_vs_text_by_charset() {
+        // BLOB/BINARY (charset binary 63) → bytes crudos, aun no-UTF8 (round-trip MF-010).
+        let raw = vec![0xFFu8, 0x00, 0x48];
+        let blob = mysql::Column::new(ColumnType::MYSQL_TYPE_BLOB).with_character_set(63);
+        match mysql_cell_to_syn(mysql::Value::Bytes(raw.clone()), &blob) {
+            SynValue::Bytes(b) => assert_eq!(&b[..], &raw[..]),
+            o => panic!("esperaba bytes, got {:?}", o),
+        }
+        // TEXT (mismo column_type BLOB pero charset no-binario) → text.
+        let text = mysql::Column::new(ColumnType::MYSQL_TYPE_BLOB).with_character_set(33);
+        match mysql_cell_to_syn(mysql::Value::Bytes(b"hola".to_vec()), &text) {
+            SynValue::Text(s) => assert_eq!(&*s, "hola"),
+            o => panic!("esperaba text, got {:?}", o),
+        }
+        // REGRESIÓN (verificación viva): una columna TEXT con collation `_bin` (p.ej.
+        // utf8mb3_bin = charset id 83, como `information_schema.tables.TABLE_NAME`) trae el
+        // flag BINARY pero NO es binaria → debe leerse como text, no bytes.
+        let utf8_bin = mysql::Column::new(ColumnType::MYSQL_TYPE_VAR_STRING)
+            .with_character_set(83)
+            .with_flags(mysql::consts::ColumnFlags::BINARY_FLAG);
+        match mysql_cell_to_syn(mysql::Value::Bytes(b"syn_table".to_vec()), &utf8_bin) {
+            SynValue::Text(s) => assert_eq!(&*s, "syn_table"),
+            o => panic!("esperaba text (utf8_bin no es binario), got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn mysql_read_json_to_map() {
+        match mysql_cell_to_syn(
+            mysql::Value::Bytes(br#"{"k":1}"#.to_vec()),
+            &mycol(ColumnType::MYSQL_TYPE_JSON),
+        ) {
+            SynValue::Map(m) => assert_eq!(m.borrow().len(), 1),
+            o => panic!("esperaba map, got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn mysql_read_datetime_and_date_iso() {
+        match mysql_cell_to_syn(
+            mysql::Value::Date(2024, 1, 15, 9, 30, 0, 0),
+            &mycol(ColumnType::MYSQL_TYPE_DATETIME),
+        ) {
+            SynValue::Text(s) => assert_eq!(&*s, "2024-01-15 09:30:00"),
+            o => panic!("esperaba text, got {:?}", o),
+        }
+        match mysql_cell_to_syn(
+            mysql::Value::Date(2024, 1, 15, 0, 0, 0, 0),
+            &mycol(ColumnType::MYSQL_TYPE_DATE),
+        ) {
+            SynValue::Text(s) => assert_eq!(&*s, "2024-01-15"),
+            o => panic!("esperaba text, got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn text_or_bytes_strict_utf8() {
+        match text_or_bytes(b"hola".to_vec()) {
+            SynValue::Text(s) => assert_eq!(&*s, "hola"),
+            o => panic!("esperaba text, got {:?}", o),
+        }
+        // utf8 inválido → bytes (no corrompe con lossy).
+        match text_or_bytes(vec![255, 254, 0]) {
+            SynValue::Bytes(b) => assert_eq!(&b[..], &[255, 254, 0]),
+            o => panic!("esperaba bytes, got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn split_tls_hint_opt_in_and_cleaning() {
+        // Sin query → sin TLS, url intacto.
+        assert_eq!(
+            split_tls_hint("mysql://u:p@h:3306/db"),
+            ("mysql://u:p@h:3306/db".to_string(), false)
+        );
+        // ssl-mode=REQUIRED → TLS on, param consumido (el driver lo rechazaría).
+        assert_eq!(
+            split_tls_hint("mysql://h/db?ssl-mode=REQUIRED"),
+            ("mysql://h/db".to_string(), true)
+        );
+        // ssl-mode=DISABLED → TLS off.
+        assert_eq!(
+            split_tls_hint("mysql://h/db?ssl-mode=DISABLED"),
+            ("mysql://h/db".to_string(), false)
+        );
+        // require_ssl=true mezclado con un param que el driver SÍ entiende → se preserva ese.
+        assert_eq!(
+            split_tls_hint("mysql://h/db?require_ssl=true&prefer_socket=false"),
+            ("mysql://h/db?prefer_socket=false".to_string(), true)
+        );
     }
 }

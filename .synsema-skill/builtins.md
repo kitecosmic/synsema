@@ -140,12 +140,16 @@ Both `http://` and **`https://` (TLS)** are supported (rustls + OS root CAs, rea
 - `http_delete(url, headers?)` → response map
 
 ## Database (SQL)
-- `db_open(path, mode?)` — mode: "readwrite" (default), "readonly", "memory"
+Universal API over SQLite (file path), Postgres (`postgres://`) and MySQL (`mysql://`), routed by the
+`db_open` target. Scope of `require db(...)` for remote URLs is the canonical `scheme://host/db`.
+- `db_open(path, mode?)` — path/URL. mode (SQLite only): "readwrite" (default), "readonly", "memory"
 - `db_close(path?)` — close connection
 - `sql(query, params?)` → list of row maps (SELECT)
-- `sql_exec(statement, params?)` → {rows_affected, last_id} (INSERT/UPDATE/DELETE/CREATE)
+- `sql_exec(statement, params?)` → {rows_affected, last_id} (INSERT/UPDATE/DELETE/CREATE).
+  `last_id`: SQLite rowid; MySQL `last_insert_id()`; Postgres `0` (use `RETURNING`).
 - `sql_batch(statement, params_list)` → {rows_affected} (batch operations)
 - `sql_tables()` → list of table names
+- Placeholders: `?` everywhere (Postgres rewrites to `$n` internally; MySQL uses `?` natively)
 - `paged(query, params?)` → paginated result for `give` in a (non-streaming) serve route (SQL LIMIT/OFFSET pushdown, exact COUNT total)
 
 ## HTTP server (serve) — see serve.md

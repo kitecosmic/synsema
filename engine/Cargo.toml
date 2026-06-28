@@ -80,6 +80,15 @@ postgres = { version = "0.19", features = [
 # feature `with-rust_decimal-1` en `postgres`).
 tokio-postgres-rustls = "0.12"
 uuid = "0.8"
+# MySQL nativo SYNC (M2). Driver puro-Rust `mysql` (rust-mysql-simple). DOS trampas de
+# features (lección M1: verificar el nombre que RESUELVE, no el del spec):
+#   1) `minimal` = `flate2/zlib` → libz-sys (C). Se usa `minimal-rust` = `flate2/rust_backend`
+#      (miniz_oxide puro-Rust, ya en el árbol por flate2).
+#   2) `rustls-tls` = `rustls/aws_lc_rs` → aws-lc-sys (C/cmake). Se usa `rustls-tls-ring` =
+#      `rustls/ring`, el MISMO backend ring que el resto del stdlib → cero `*-sys` nuevo.
+# `default-features = false` apaga el `native-tls`/OpenSSL del default. TLS opt-in (§conexión).
+# Verificado con `cargo tree -p synsema-stdlib`: no entra ni aws-lc-sys ni openssl ni libz-sys.
+mysql = { version = "28", default-features = false, features = ["minimal-rust", "rustls-tls-ring"] }
 synsema-core = { path = "crates/synsema-core" }
 synsema-capabilities = { path = "crates/synsema-capabilities" }
 synsema-stdlib = { path = "crates/synsema-stdlib" }

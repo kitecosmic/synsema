@@ -16,6 +16,8 @@ postgres.workspace = true
 tokio-postgres-rustls.workspace = true
 uuid.workspace = true
 rust_decimal.workspace = true
+# M2 — MySQL nativo bajo la misma API. Driver sync puro-Rust + TLS rustls (opt-in).
+mysql.workspace = true
 # Arrays (Batch 5): serializar `SynValue::Array` a JSON anidado en las respuestas serve.
 ndarray.workspace = true
 # Feature `secret`: builtins env/secret/reveal/bearer + crypto (hmac_sha256/verify_hmac/

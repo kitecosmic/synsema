@@ -19,6 +19,22 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 | `Expected indented block` | Missing indentation after when/each/task/etc | Indent body with 4 spaces |
 | `'while' is a reserved word in Synsema` | Using a hard keyword as a name | Pick another name. (HTTP words like `route`/`auth` ARE allowed as names — they're soft keywords.) |
 
+## Database (SQL: SQLite / Postgres / MySQL)
+
+One universal API (`db_open`/`sql`/`sql_exec`/…) routed by the `db_open` target: a file path → SQLite,
+`postgres://…` → Postgres, `mysql://…` → MySQL. Use `?` placeholders everywhere.
+
+| What you expect | What actually happens | Why / workaround |
+|---|---|---|
+| `require db("postgres://user:pw@host:5432/appdb")` is the scope | Credentials/port/query are stripped: scope is `postgres://host/appdb` | Grant the **canonical URL** `db("postgres://host/appdb")` (same for `mysql://`). A path scope never covers a URL |
+| `sql_exec(INSERT)` returns the new id on Postgres | Postgres `last_id` is always `0` | Use `INSERT … RETURNING id` and read it from `sql(...)`. (MySQL `last_id` = `last_insert_id()`, real; SQLite = rowid) |
+| Postgres connects without TLS by default | TLS is **on** by default | Add `?sslmode=disable` for plaintext (e.g. local dev) |
+| MySQL connects with TLS by default | MySQL TLS is **opt-in** (plaintext default) | Add `?ssl-mode=REQUIRED` to enable rustls TLS |
+| `db_open("postgres://deadhost/db")` hangs | A 10s connect-timeout applies, then errors | Expected: a dead host fails fast, never hangs the agent |
+| A `BLOB`/`BYTEA` column round-trips as text | It returns `bytes` (`type_of` "bytes"); `decode()` for text | Binary is byte-exact — use `bytes(...)` to insert, `decode(...)` to read text |
+| `DECIMAL`/`NUMERIC` comes back as a float | It's a `decimal` (`type_of` "decimal"), exact | Keep it as `decimal` for money; don't coerce through float |
+| `?` in a Postgres query must be `$1` | The runtime rewrites `?`→`$n` for you (MySQL uses `?` natively) | Just write `?` everywhere; for pgvector pass a list as `?::vector` |
+
 ## HTTP server (serve)
 
 ### Errors

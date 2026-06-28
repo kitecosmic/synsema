@@ -40,9 +40,12 @@ error of r       -- error message if failed
 
 ## Database (SQL)
 
-SQLite built-in (`rusqlite`). Parameterized queries (safe from injection). **Deny-by-default: every DB
-op needs `require db(path)`** (see capabilities). `bytes` columns round-trip to/from SQLite `BLOB`
-byte-exactly (binary-safe).
+One **universal API** (`db_open`/`sql`/`sql_exec`/`sql_batch`/`sql_tables`/`paged`) over three backends,
+routed by the `db_open` target: a **file path** → SQLite (built-in, `rusqlite`); `postgres://…` →
+Postgres; `mysql://…` → MySQL. All drivers are pure-Rust (single static binary, no OpenSSL/`*-sys`).
+Parameterized queries everywhere (safe from injection). **Deny-by-default: every DB op needs
+`require db(scope)`** (see capabilities). `bytes` columns round-trip to/from `BLOB`/`BYTEA` byte-exactly
+(binary-safe).
 
 ```
 require db("./store.db")           -- declare the DB you use (db("*") / require db = any)
@@ -81,6 +84,40 @@ let raw be (sql("SELECT data FROM files"))[0]["data"]   -- type_of -> "bytes"
 -- Close
 db_close()
 ```
+
+### Remote SQL: Postgres & MySQL
+Same builtins, different `db_open` URL. The capability **scope is the canonical URL** —
+`scheme://host/db` with **no credentials/port/query** (e.g. `mysql://user:pw@localhost:3306/appdb` →
+`mysql://localhost/appdb`). `db("*")` / bare `require db` cover any DB. Connections apply a 10s
+connect-timeout (a dead host fails fast, never hangs).
+
+```
+-- Postgres: `?` placeholders are rewritten to $1,$2…; no last_id (use RETURNING).
+require db("postgres://localhost/appdb")
+db_open("postgres://user:pw@host:5432/appdb")        -- TLS on by default; add ?sslmode=disable to turn off
+sql_exec("INSERT INTO users (name) VALUES (?) RETURNING id", ["Ada"])
+-- pgvector runs server-side: pass a list as ?::vector, order by <-> / <=>
+let near be sql("SELECT id FROM docs ORDER BY emb <-> ?::vector LIMIT ?", [q_embedding, 5])
+
+-- MySQL: `?` placeholders are NATIVE (not rewritten); last_id = last_insert_id() works.
+require db("mysql://localhost/appdb")
+db_open("mysql://user:pw@host:3306/appdb")           -- plaintext by default; TLS opt-in: ?ssl-mode=REQUIRED
+let r be sql_exec("INSERT INTO users (name) VALUES (?)", ["Ada"])
+print(text(r["last_id"]))                            -- the AUTO_INCREMENT id (real)
+```
+
+**Backends at a glance:**
+
+| | SQLite (file) | Postgres (`postgres://`) | MySQL (`mysql://`) |
+|---|---|---|---|
+| Placeholders | `?` | `?` → `$n` (rewritten) | `?` (native) |
+| `last_id` | rowid | `0` (use `RETURNING`) | `last_insert_id()` (real) |
+| TLS | n/a | default on (`?sslmode=disable` off) | opt-in (`?ssl-mode=REQUIRED`) |
+| Vector | in-Synsema (below) | pgvector (server-side) | — |
+
+**Type mapping** (both remote backends): int→number, float→number, **DECIMAL/NUMERIC→`decimal`**
+(`type_of` "decimal"), text→text, **BLOB/BYTEA→`bytes`** (byte-exact; MySQL distinguishes BLOB vs TEXT by
+the column's binary charset), **JSON/JSONB→`map`/`list`**, date/time→ISO text, NULL→`nothing`.
 
 ### Vector search with SQLite (no extension)
 No `sqlite-vec`/ANN (rusqlite is bundled without `load_extension`). For small/medium corpora, store
@@ -147,5 +184,5 @@ require db("./store.db")
 
 - HTTP, SQL, Cron: work on Linux, Windows, Mac.
 - Single static binary (the one C dependency is bundled SQLite in `rusqlite`, which needs a C
-  compiler at build time on Windows). Numeric deps (`libm`, `num-complex`, `ndarray`, `faer`) are
-  pure-Rust.
+  compiler at build time on Windows). Numeric deps (`libm`, `num-complex`, `ndarray`, `faer`) and the
+  remote SQL drivers (`postgres`, `mysql`, both TLS via rustls/ring) are pure-Rust — no OpenSSL/`*-sys`.

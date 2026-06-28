@@ -36,7 +36,7 @@ first. The goal: make building in Synsema feel as easy as in JS/Python.
 - [testing.md](testing.md) — Native test framework: `assert`/`assert_eq`/`assert_error`, `test "..."` blocks, `synsema test`
 
 ## By topic
-- [stdlib.md](stdlib.md) — HTTP requests, SQL database, cron scheduler (zero dependencies)
+- [stdlib.md](stdlib.md) — HTTP requests, SQL database (SQLite / Postgres / MySQL), cron scheduler (zero dependencies)
 - [concurrency.md](concurrency.md) — Real multi-core parallelism (Rust): `parallel_map`, `chunk`, fan-out/merge, fail-fast
 - [frontend.md](frontend.md) — Building UIs/sites: render() templates (full freedom) + layouts/partials/includes + static assets + client JS; content() for agent-negotiable pages. No imposed framework.
 - [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination/paged(), streaming (SSE), rate limiting, body limits, HTML/SSR pages (`render`, `html`), static files, CORS, content negotiation (HTML/Markdown/JSON for agents), agent discoverability (`llms.txt`), **and the Rust production stack: TLS / auto-HTTPS (ACME) / virtual hosts / reverse proxy / HTTP-2 / production static (ETag·Range·gzip)**
