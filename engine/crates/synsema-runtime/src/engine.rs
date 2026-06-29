@@ -183,7 +183,11 @@ pub(crate) fn wire_common_with_state(
 /// (`llm_step`). Si no hay provider (offline): NO cablea nada → las ops LLM caen a los
 /// placeholders descriptivos del core (`run` no se rompe). NO concede capabilities: el
 /// gate `require llm` sigue idéntico (lo cableó `wire_common`).
-fn wire_real_llm_provider(interp: &mut Interpreter) {
+///
+/// `pub(crate)` para que `serve` también cablee el provider en sus intérpretes (DE-029):
+/// sin esto, `llm_available()` era false bajo serve y reason/decide/generate/llm_step caían
+/// a placeholders pese a `require llm` + `.env` con la clave.
+pub(crate) fn wire_real_llm_provider(interp: &mut Interpreter) {
     // `load_default` lee `SYNSEMA_ENV_FILE`/`.env` (idempotente; honra `--env-file` y
     // `--no-env-file`). El environ del proceso sigue ganando sobre el `.env`.
     let store = EnvStore::load_default();
@@ -308,17 +312,61 @@ fn run_inner(
     }
 }
 
-/// Abre la persistencia de estado para `filename` (None si es `<stdin>`). El nombre
-/// de programa es el `stem` del archivo, idéntico al oráculo.
+/// Abre la persistencia de estado para `filename` (None si es `<stdin>`). DE-031: la ruta
+/// es **project-local** por default — `<dir-del-programa>/.synsema/state/<name>.db` — para
+/// que el estado viva junto al proyecto, sea portable/gitignorable y NO colisione entre
+/// proyectos distintos con el mismo nombre de archivo. Overrides (de mayor a menor
+/// prioridad):
+///   1. `SYNSEMA_STATE_DIR` — dir de estado explícito (absoluto o relativo al cwd).
+///      Escape hatch; restaura el viejo global con `SYNSEMA_STATE_DIR=~/.synsema/state`.
+///   2. project-local (default): el dir del archivo de programa.
+///
+/// Nombre de la DB: `SYNSEMA_STATE_NAME` si está (para que varios archivos de entrada del
+/// mismo proyecto compartan UNA memoria), si no el `stem` del archivo. Si el dir elegido
+/// no es escribible, cae al global `~/.synsema/state` con un warning (no rompe).
 pub(crate) fn state_persistence_for(filename: &str) -> Option<crate::persistence::StatePersistence> {
     if filename == "<stdin>" {
         return None;
     }
-    let stem = std::path::Path::new(filename)
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "default".to_string());
-    crate::persistence::StatePersistence::open(&stem).ok()
+    // Nombre de la DB.
+    let name = std::env::var("SYNSEMA_STATE_NAME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            std::path::Path::new(filename)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "default".to_string())
+        });
+    // Dir de estado: override explícito, o project-local (`<dir>/.synsema/state`).
+    let dir = match std::env::var("SYNSEMA_STATE_DIR").ok().filter(|s| !s.is_empty()) {
+        Some(d) => std::path::PathBuf::from(d),
+        None => {
+            let base = std::path::Path::new(filename)
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            base.join(".synsema").join("state")
+        }
+    };
+    // Crear el dir; si falla (read-only/permisos), fallback al global con warning.
+    let dir = match std::fs::create_dir_all(&dir) {
+        Ok(()) => dir,
+        Err(e) => {
+            let fallback = crate::persistence::home_state_dir();
+            eprintln!(
+                "warning: no se pudo crear el dir de estado '{}' ({}); usando '{}'",
+                dir.display(),
+                e,
+                fallback.display()
+            );
+            let _ = std::fs::create_dir_all(&fallback);
+            fallback
+        }
+    };
+    let path = dir.join(format!("{}.db", name));
+    crate::persistence::StatePersistence::open_path(&path).ok()
 }
 
 fn spawn_run(source: &str, filename: &str, secure: bool) -> RunResult {

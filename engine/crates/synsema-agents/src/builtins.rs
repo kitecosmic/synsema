@@ -288,3 +288,95 @@ pub fn register_serve_memory_builtins(
         }));
     }
 }
+
+/// Sobrescribe los builtins de progreso (`create_progress`/`start_step`/`complete_step`/
+/// `fail_step`/`resume_point`/`progress_display`/`progress_percent`) para que usen un
+/// `ProgressManager` compartido entre hilos (`Arc<Mutex>`). Gemelo exacto de
+/// `register_serve_memory_builtins`: bajo `synsema serve` todos los route handlers
+/// comparten y persisten el MISMO progreso, tanto entre requests como entre reinicios
+/// (DE-028). Sin esto, cada intérprete de request tenía su propio `ProgressManager`
+/// fresco (reseteado por `reset_for_request`) → un plan creado en un request no existía
+/// en el siguiente, y el ciclo PLAN→ADVANCE crasheaba.
+///
+/// Debe llamarse DESPUÉS de `register_agent_builtins` (o `wire_common_with_state`) para
+/// que las versiones compartidas sobrescriban las per-intérprete.
+///
+/// `on_write` se llama con el progreso después de cada mutación para persistir a disco.
+pub fn register_serve_progress_builtins(
+    interp: &Interpreter,
+    shared: Arc<Mutex<ProgressManager>>,
+    on_write: Arc<dyn Fn(&ProgressManager) + Send + Sync>,
+) {
+    {
+        let s = shared.clone();
+        let ow = on_write.clone();
+        interp.register_builtin("create_progress", -1, Rc::new(move |_i, args, _l| {
+            let name = raw_str(nth(args, 0)?);
+            let steps = str_list(args.get(1));
+            let mut pm = s.lock().unwrap();
+            pm.create(&name, &steps);
+            ow(&pm);
+            Ok(syn_text(name))
+        }));
+    }
+    {
+        let s = shared.clone();
+        let ow = on_write.clone();
+        interp.register_builtin("start_step", 2, Rc::new(move |_i, args, _l| {
+            let mut pm = s.lock().unwrap();
+            pm.start_step(&raw_str(nth(args, 0)?), &raw_str(nth(args, 1)?)).map_err(err)?;
+            ow(&pm);
+            Ok(syn_bool(true))
+        }));
+    }
+    {
+        let s = shared.clone();
+        let ow = on_write.clone();
+        interp.register_builtin("complete_step", -1, Rc::new(move |_i, args, _l| {
+            let result = args.get(2).map(raw_str);
+            let mut pm = s.lock().unwrap();
+            pm.complete_step(&raw_str(nth(args, 0)?), &raw_str(nth(args, 1)?), result).map_err(err)?;
+            ow(&pm);
+            Ok(syn_bool(true))
+        }));
+    }
+    {
+        let s = shared.clone();
+        let ow = on_write.clone();
+        interp.register_builtin("fail_step", -1, Rc::new(move |_i, args, _l| {
+            let error = args.get(2).map(raw_str);
+            let mut pm = s.lock().unwrap();
+            pm.fail_step(&raw_str(nth(args, 0)?), &raw_str(nth(args, 1)?), error).map_err(err)?;
+            ow(&pm);
+            Ok(syn_bool(true))
+        }));
+    }
+    {
+        let s = shared.clone();
+        interp.register_builtin("resume_point", 1, Rc::new(move |_i, args, _l| {
+            match s.lock().unwrap().get_resume_point(&raw_str(nth(args, 0)?)) {
+                Some(name) => Ok(syn_text(name)),
+                None => Ok(SynValue::Nothing),
+            }
+        }));
+    }
+    {
+        let s = shared.clone();
+        interp.register_builtin("progress_display", 1, Rc::new(move |_i, args, _l| {
+            let name = raw_str(nth(args, 0)?);
+            let pm = s.lock().unwrap();
+            match pm.tasks.get(&name) {
+                Some(tp) => Ok(syn_text(tp.format_display())),
+                None => Ok(syn_text(format!("No progress for '{}'", name))),
+            }
+        }));
+    }
+    {
+        let s = shared.clone();
+        interp.register_builtin("progress_percent", 1, Rc::new(move |_i, args, _l| {
+            let name = raw_str(nth(args, 0)?);
+            let pm = s.lock().unwrap();
+            Ok(syn_float(pm.tasks.get(&name).map(|tp| tp.progress_percent()).unwrap_or(0.0)))
+        }));
+    }
+}

@@ -13,6 +13,10 @@ build/
 target/
 **/*.rs.bk
 
+# Estado persistente project-local (memoria/planes de remember/progress). DE-031: vive
+# junto al proyecto en `<dir>/.synsema/state/*.db` — NO se versiona.
+.synsema/
+
 # Paquetes de la extensión de editor (build artifact de vsce)
 *.vsix
 

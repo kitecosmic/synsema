@@ -1,0 +1,24 @@
+-- Módulo de prueba para DE-032: un `let MAP` AUTO-REFERENCIAL — sus valores son tasks
+-- del propio módulo que llaman a hermanas (patrón TOOL_ALLOW de tool-calling). Bajo `run`
+-- siempre funcionó; este fixture verifica serve/parallel_map (que snapshotean/reconstruyen
+-- el módulo y antes dejaban ese map con un module_env vacío).
+
+-- 'helper' es una hermana NO exportada.
+task helper(x)
+    give "h:" + x
+
+-- 'viaa' (NO exportada) referenciada por el MAP, llama a la hermana 'helper'.
+task viaa(x)
+    give helper(x)
+
+-- MAP referencia una task del PROPIO módulo (que a su vez llama a 'helper').
+let MAP be {"t": viaa}
+
+-- 'dispatch' (EXPORTADA) referencia el sibling `MAP` y despacha — el camino que fallaba:
+-- bajo serve, MAP["t"] cerraba sobre un module_env vacío → 'helper' no resolvía.
+export task dispatch(arg)
+    let f be MAP.t
+    give f(arg)
+
+-- Export del propio MAP, para el acceso directo (mod.TOOLS.t(...)).
+export let TOOLS be MAP

@@ -2,9 +2,11 @@
 //! `synsema/runtime/persistence.py`.
 //!
 //! La memoria del agente (entries + rules) y el progreso de tareas se persisten en
-//! SQLite. Al re-ejecutar el mismo programa (mismo nombre), se cargan automáticamente.
-//! Ruta: `~/.synsema/state/<program_name>.db` (idéntico al oráculo; mismo esquema,
-//! así los archivos son intercambiables Python↔Rust).
+//! SQLite. Al re-ejecutar el mismo programa, se cargan automáticamente. La RUTA la
+//! resuelve `engine::state_persistence_for` (DE-031): por default es **project-local**
+//! (`<dir-del-programa>/.synsema/state/<name>.db`), con overrides `SYNSEMA_STATE_DIR` y
+//! `SYNSEMA_STATE_NAME`, y fallback al dir global `~/.synsema/state`. El esquema sigue
+//! siendo el del oráculo (archivos intercambiables Python↔Rust).
 
 use std::path::PathBuf;
 
@@ -14,11 +16,17 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use synsema_agents::memory::{AgentMemory, MemoryCategory, MemoryEntry, OwnerRule, RuleLevel};
 use synsema_agents::progress::{ProgressManager, StepStatus, TaskProgress, TaskStep};
 
-fn default_state_path(program_name: &str) -> PathBuf {
+/// Dir de estado GLOBAL del lenguaje (`~/.synsema/state`). Comportamiento histórico,
+/// hoy usado como fallback (DE-031) y vía `SYNSEMA_STATE_DIR=~/.synsema/state`.
+pub(crate) fn home_state_dir() -> PathBuf {
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_default();
-    let dir = PathBuf::from(home).join(".synsema").join("state");
+    PathBuf::from(home).join(".synsema").join("state")
+}
+
+fn default_state_path(program_name: &str) -> PathBuf {
+    let dir = home_state_dir();
     let _ = std::fs::create_dir_all(&dir);
     dir.join(format!("{}.db", program_name))
 }
@@ -80,6 +88,20 @@ impl StatePersistence {
         self.load_memory(memory);
         self.load_rules(memory);
         self.load_progress(progress);
+    }
+
+    /// Persiste SOLO memoria + reglas (no toca la tabla de progress). Para el `on_write`
+    /// de memoria bajo `serve`: cada `remember`/`forget` no debe pisar el progress
+    /// persistido (cada store tiene su propio callback que escribe su propia tabla).
+    pub fn save_memory_only(&self, memory: &AgentMemory) {
+        self.save_memory(memory);
+        self.save_rules(memory);
+    }
+
+    /// Persiste SOLO el progress (no toca memoria/reglas). Gemelo de `save_memory_only`
+    /// para el `on_write` de progress bajo `serve` (DE-028).
+    pub fn save_progress_only(&self, progress: &ProgressManager) {
+        self.save_progress(progress);
     }
 
     fn save_memory(&self, memory: &AgentMemory) {

@@ -24,7 +24,9 @@ use synsema_core::number::Number;
 use synsema_core::types::{from_send, syn_list, to_send, SendValue, SynTaskValue, SynValue};
 
 use crate::engine::{wire_common, INTERP_STACK_SIZE};
-use crate::serve::{rebuild_globals, snapshot_globals, GlobalVal};
+use crate::serve::{
+    rebuild_globals, rebuild_module_env, snapshot_globals, snapshot_module_env, GlobalVal,
+};
 
 fn err(msg: &str) -> Control {
     Control::Error(RuntimeError::new(msg.to_string()))
@@ -52,6 +54,10 @@ enum TaskSnapshot {
         parameters: Vec<Param>,
         body: Vec<Node>,
         required_capabilities: Vec<(String, Option<String>)>,
+        /// Si la task aplicada venía de un módulo (su `closure_env` era el `module_env`),
+        /// el snapshot COMPLETO de ese env (todas las hermanas) para reconstruirlo en el
+        /// worker; si no, `None` y la task cierra sobre el global (DE-030).
+        module: Option<Vec<(String, GlobalVal)>>,
     },
     Builtin(String),
 }
@@ -82,12 +88,20 @@ fn build_worker_interp(
 
 fn reconstruct_task(interp: &Interpreter, snap: &TaskSnapshot) -> SynValue {
     match snap {
-        TaskSnapshot::User { name, parameters, body, required_capabilities } => {
+        TaskSnapshot::User { name, parameters, body, required_capabilities, module } => {
+            // DE-030: si la task vino de un módulo, cerrarla sobre un `module_env`
+            // reconstruido (con todas las hermanas) en vez del global del worker —
+            // así una task de módulo aplicada que llame a una hermana resuelve, igual
+            // que las tasks de los globales (DE-027). Sin módulo: comportamiento actual.
+            let closure_env = match module {
+                Some(env) => rebuild_module_env(env, &interp.global_env),
+                None => interp.global_env.clone(),
+            };
             SynValue::Task(Rc::new(SynTaskValue {
                 name: name.clone(),
                 parameters: parameters.clone(),
                 body: body.clone(),
-                closure_env: interp.global_env.clone(),
+                closure_env,
                 origin: None,
                 required_capabilities: required_capabilities.clone(),
             }))
@@ -237,12 +251,23 @@ pub fn register_parallel_builtins(interp: &Interpreter, caps: &Rc<RefCell<Capabi
                 _ => 64,
             };
             let task_snap = match task {
-                SynValue::Task(t) => TaskSnapshot::User {
-                    name: t.name.clone(),
-                    parameters: t.parameters.clone(),
-                    body: t.body.clone(),
-                    required_capabilities: t.required_capabilities.clone(),
-                },
+                SynValue::Task(t) => {
+                    // DE-030: si el mapper es una task de módulo (cierra sobre un env
+                    // "module:…"), snapshotear su `module_env` completo para reconstruir
+                    // las hermanas en el worker; si no, `None` (cierra sobre el global).
+                    let module = if t.closure_env.borrow().name.starts_with("module:") {
+                        Some(snapshot_module_env(&t.closure_env))
+                    } else {
+                        None
+                    };
+                    TaskSnapshot::User {
+                        name: t.name.clone(),
+                        parameters: t.parameters.clone(),
+                        body: t.body.clone(),
+                        required_capabilities: t.required_capabilities.clone(),
+                        module,
+                    }
+                }
                 SynValue::Builtin(b) => TaskSnapshot::Builtin(b.name.clone()),
                 _ => unreachable!(),
             };

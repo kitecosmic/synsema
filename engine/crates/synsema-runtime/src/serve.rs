@@ -18,14 +18,24 @@ use std::sync::{Arc, Mutex};
 /// un route handler. Encapsula el `StatePersistence` protegido por mutex.
 type OnWriteFn = Arc<dyn Fn(&AgentMemory) + Send + Sync>;
 
+/// Callback de persistencia análogo para el progress (DE-028): se llama tras cada
+/// mutación de progress desde un handler. Escribe SOLO la tabla de progress (no pisa
+/// memoria), de ahí que sea un callback separado del de memoria.
+type OnWriteProgressFn = Arc<dyn Fn(&ProgressManager) + Send + Sync>;
+
 /// Memoria compartida entre todos los handlers de un serve: el `AgentMemory`
 /// vive en un `Arc<Mutex>` para ser accesible desde múltiples hilos del pool.
 type SharedMemoryStore = Arc<Mutex<AgentMemory>>;
+
+/// Progress compartido entre todos los handlers de un serve (DE-028): gemelo de
+/// `SharedMemoryStore`. Sin esto, los planes (`create_progress`/`resume_point`/…) no
+/// sobrevivían entre requests y el ciclo PLAN→ADVANCE crasheaba.
+type SharedProgressStore = Arc<Mutex<ProgressManager>>;
 use std::thread::JoinHandle;
 
 use indexmap::IndexMap;
 
-use synsema_agents::builtins::register_serve_memory_builtins;
+use synsema_agents::builtins::{register_serve_memory_builtins, register_serve_progress_builtins};
 use synsema_agents::memory::{AgentMemory, OwnerRule};
 use synsema_agents::progress::ProgressManager;
 use synsema_agents::swarm::Swarm;
@@ -126,17 +136,46 @@ pub(crate) enum GlobalVal {
     Agent {
         body: Vec<Node>,
     },
-    /// Un módulo importado (`use "…" as name`) — map cuyas entradas pueden ser Tasks
-    /// u otros GlobalVal. Se snapshotea recursivamente para que las tasks del módulo
-    /// sobrevivan al cruce de hilos (parallel_map) y al snapshot de serve, en lugar de
-    /// degradarse a texto a través de to_send/from_send.
-    Module(Vec<(String, GlobalVal)>),
+    /// Un módulo importado real (`use "…" as name`). El alias (Map) que el usuario ve
+    /// vía `m.foo` expone solo los exports, pero el snapshot lleva el **`module_env`
+    /// COMPLETO** — TODAS sus bindings (tasks exportadas, NO exportadas y `let`s) — para
+    /// que una task del módulo pueda llamar a una hermana por su nombre simple bajo serve
+    /// y parallel_map, igual que bajo `run` (DE-027). En rebuild se crea un `module_env`
+    /// compartido (hijo del global del request) y todas las tasks del módulo cierran
+    /// sobre ÉL; el alias reusa esas mismas tasks. Reproduce `load_module_inner` de core.
+    Module {
+        /// Entradas del alias (lo que el usuario ve): los exports del módulo.
+        alias: Vec<(String, GlobalVal)>,
+        /// TODAS las bindings del `module_env` (exportadas + internas + lets).
+        env: Vec<(String, GlobalVal)>,
+    },
+    /// Un map de DATOS cuyas entradas incluyen tasks/closures (p.ej. un callback en un
+    /// map de config) pero que NO es un módulo importado. Se conserva como variante aparte
+    /// (en vez de degradar las tasks a texto vía to_send/from_send) y, en rebuild, sus
+    /// tasks cierran sobre el global del request como cualquier task top-level — sin el
+    /// `module_env` compartido del caso módulo.
+    MapWithTasks(Vec<(String, GlobalVal)>),
+    /// Un map AUTO-REFERENCIAL de un módulo: un `let MAP be {"t": tarea}` cuyas tasks
+    /// cierran sobre el MISMO `module_env` que se está snapshoteando (patrón `TOOL_ALLOW`
+    /// de tool-calling — DE-032). No re-snapshotea el env (ya lo lleva el módulo
+    /// contenedor); solo guarda las entradas del map. En rebuild, sus tasks cierran sobre
+    /// el `module_env` que se está construyendo (donde viven las hermanas), no sobre uno
+    /// vacío ni el global. Distinto del ciclo cross-módulo (A↔B), que sí degrada.
+    ModuleSelfRef(Vec<(String, GlobalVal)>),
 }
 
-/// Convierte un `SynValue` a `GlobalVal` de forma recursiva. Los Maps que contienen
-/// Tasks (patrón módulo importado) se convierten en `GlobalVal::Module` para que las
-/// tasks sobrevivan el cruce de hilos y el snapshot de serve sin degradarse a texto.
+/// Convierte un `SynValue` a `GlobalVal` de forma recursiva. Un Map que es el alias de
+/// un módulo importado se snapshotea como `GlobalVal::Module` llevándose el `module_env`
+/// COMPLETO (todas las hermanas, exportadas o no — DE-027); un Map de datos con tasks se
+/// preserva como `MapWithTasks`; un Map puramente de valores viaja barato como SendValue.
 pub(crate) fn val_to_global(v: &SynValue) -> GlobalVal {
+    val_to_global_inner(v, &mut Vec::new())
+}
+
+/// Núcleo recursivo de `val_to_global`. `visited` lleva los `module_env` que se están
+/// snapshoteando (por identidad de `Rc`) para cortar ciclos de imports (A→B→A) y no
+/// recursar infinito.
+fn val_to_global_inner(v: &SynValue, visited: &mut Vec<usize>) -> GlobalVal {
     match v {
         SynValue::Task(t) => GlobalVal::Task {
             name: t.name.clone(),
@@ -149,23 +188,110 @@ pub(crate) fn val_to_global(v: &SynValue) -> GlobalVal {
             let entries: Vec<(String, GlobalVal)> = m
                 .borrow()
                 .iter()
-                .map(|(k, v)| (k.clone(), val_to_global(v)))
+                .map(|(k, v)| (k.clone(), val_to_global_inner(v, visited)))
                 .collect();
-            // Si alguna entrada es Task o Module anidado, usar Module para conservarlas.
-            // Maps puramente de valores primitivos siguen viajando como SendValue (barato).
-            if entries.iter().any(|(_, gv)| !matches!(gv, GlobalVal::Value(_))) {
-                GlobalVal::Module(entries)
-            } else {
-                GlobalVal::Value(to_send(&SynValue::Map(m.clone())))
+            // Map puramente de valores primitivos → viaja barato como SendValue.
+            if entries.iter().all(|(_, gv)| matches!(gv, GlobalVal::Value(_))) {
+                return GlobalVal::Value(to_send(&SynValue::Map(m.clone())));
+            }
+            // Contiene ≥1 task/módulo. ¿Es el alias de un módulo importado de verdad?
+            // Heurística (edge case #4 de la spec): si alguna task del map cierra sobre un
+            // env llamado "module:…", ése es el `module_env` real → snapshot del env
+            // COMPLETO (todas las hermanas). Si no, es un map de datos con callbacks.
+            match module_env_of(&m.borrow()) {
+                Some(module_env) => {
+                    let key = Rc::as_ptr(&module_env) as usize;
+                    if visited.contains(&key) {
+                        // El map cierra sobre un module_env que ya se está snapshoteando.
+                        if visited.last() == Some(&key) {
+                            // Auto-referencia (DE-032): es el módulo EN CURSO (el que
+                            // estamos snapshoteando ahora). No re-snapshotear el env (ya lo
+                            // lleva el contenedor); guardar solo las entradas. En rebuild
+                            // cerrarán sobre el module_env que se está construyendo →
+                            // resuelven sus hermanas. Patrón TOOL_ALLOW de tool-calling.
+                            return GlobalVal::ModuleSelfRef(entries);
+                        }
+                        // Ciclo cross-módulo real (A→B→A, envs distintos): el env cicleado
+                        // lo empujó un snapshot ANCESTRO, no el actual. Limitación conocida
+                        // y rara: degrada (el alias conserva sus entradas, el env va vacío).
+                        return GlobalVal::Module { alias: entries, env: Vec::new() };
+                    }
+                    visited.push(key);
+                    let env: Vec<(String, GlobalVal)> = module_env
+                        .borrow()
+                        .bindings
+                        .iter()
+                        .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
+                        .map(|(k, v)| (k.clone(), val_to_global_inner(v, visited)))
+                        .collect();
+                    visited.pop();
+                    GlobalVal::Module { alias: entries, env }
+                }
+                None => GlobalVal::MapWithTasks(entries),
             }
         }
         other => GlobalVal::Value(to_send(other)),
     }
 }
 
-/// Reconstruye un `SynValue` desde un `GlobalVal`, apuntando las tasks al `global_env`
-/// del intérprete nuevo para que puedan llamar a otros globales (recursión mutua, etc.).
-fn rebuild_global_val(gv: &GlobalVal, global_env: &Rc<RefCell<Environment>>) -> SynValue {
+/// Devuelve el `module_env` de un map que es alias de módulo: el `closure_env` de
+/// cualquiera de sus tasks cuyo env se llame `module:…`. `None` si el map no es un alias
+/// de módulo (sus tasks cierran sobre el global u otro scope → map de datos con callbacks).
+pub(crate) fn module_env_of(map: &IndexMap<String, SynValue>) -> Option<Rc<RefCell<Environment>>> {
+    for v in map.values() {
+        if let SynValue::Task(t) = v {
+            if t.closure_env.borrow().name.starts_with("module:") {
+                return Some(t.closure_env.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Snapshotea TODAS las bindings de un `module_env` (saltando builtins) a `GlobalVal`,
+/// para que viajen `Send` a otro hilo/intérprete. Cortes de ciclo por identidad de `Rc`
+/// (módulos circulares A→B→A). Reusa el mismo camino que la rama Module de
+/// `val_to_global` — usado por `parallel_map` para capturar el módulo de la task aplicada
+/// (DE-030), no solo el de los globales.
+pub(crate) fn snapshot_module_env(module_env: &Rc<RefCell<Environment>>) -> Vec<(String, GlobalVal)> {
+    let mut visited = vec![Rc::as_ptr(module_env) as usize];
+    module_env
+        .borrow()
+        .bindings
+        .iter()
+        .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
+        .map(|(k, v)| (k.clone(), val_to_global_inner(v, &mut visited)))
+        .collect()
+}
+
+/// Reconstruye un `module_env` compartido (hijo de `base`) desde el snapshot de sus
+/// bindings, con cada task cerrando sobre ESE env → las hermanas (exportadas o no) se
+/// resuelven por nombre simple. Reproduce la estructura de `load_module_inner` de core.
+/// Compartido por la rama Module de `rebuild_global_val` (globales, DE-027) y por
+/// `reconstruct_task` de `parallel_map` (task aplicada, DE-030).
+pub(crate) fn rebuild_module_env(
+    env: &[(String, GlobalVal)],
+    base: &Rc<RefCell<Environment>>,
+) -> Rc<RefCell<Environment>> {
+    let module_env = Environment::child(base, "module:rebuilt");
+    for (k, gv) in env {
+        let v = rebuild_global_val(gv, &module_env, base);
+        module_env.borrow_mut().bindings.insert(k.clone(), v);
+    }
+    module_env
+}
+
+/// Reconstruye un `SynValue` desde un `GlobalVal`. `closure_target` es el env que
+/// capturan las tasks (para top-level es el global; para una task de módulo es el
+/// `module_env` compartido). `base` es el padre para nuevos `module_env` (siempre el
+/// global del request, igual que `load_module_inner`, que cuelga todo module_env del
+/// global). Las tasks cierran sobre `closure_target` para que la recursión mutua entre
+/// globales y la llamada a hermanas dentro de un módulo (DE-027) sigan funcionando.
+fn rebuild_global_val(
+    gv: &GlobalVal,
+    closure_target: &Rc<RefCell<Environment>>,
+    base: &Rc<RefCell<Environment>>,
+) -> SynValue {
     match gv {
         GlobalVal::Value(sv) => from_send(sv),
         GlobalVal::Task { name, parameters, body, required_capabilities } => {
@@ -173,15 +299,41 @@ fn rebuild_global_val(gv: &GlobalVal, global_env: &Rc<RefCell<Environment>>) -> 
                 name: name.clone(),
                 parameters: parameters.clone(),
                 body: body.clone(),
-                closure_env: global_env.clone(),
+                closure_env: closure_target.clone(),
                 origin: None,
                 required_capabilities: required_capabilities.clone(),
             }))
         }
-        GlobalVal::Module(entries) => {
+        GlobalVal::Module { alias, env } => {
+            // Un `module_env` compartido (hijo del global del request) reproduce la
+            // estructura de `load_module_inner`: TODAS las tasks del módulo cierran sobre
+            // él, así que una hermana (exportada o no) se resuelve por su nombre simple.
+            let module_env = rebuild_module_env(env, base);
+            // El alias expone solo los exports; sus tasks cierran sobre el MISMO
+            // module_env que las internas (misma cadena de resolución que en `run`).
+            let mut m = IndexMap::new();
+            for (k, gv) in alias {
+                m.insert(k.clone(), rebuild_global_val(gv, &module_env, base));
+            }
+            SynValue::Map(Rc::new(RefCell::new(m)))
+        }
+        GlobalVal::MapWithTasks(entries) => {
+            // Map de datos con callbacks: las tasks cierran sobre el global (como cualquier
+            // task top-level), NO sobre un module_env compartido.
             let mut m = IndexMap::new();
             for (k, gv) in entries {
-                m.insert(k.clone(), rebuild_global_val(gv, global_env));
+                m.insert(k.clone(), rebuild_global_val(gv, base, base));
+            }
+            SynValue::Map(Rc::new(RefCell::new(m)))
+        }
+        GlobalVal::ModuleSelfRef(entries) => {
+            // Map auto-referencial del módulo (DE-032): sus tasks cierran sobre
+            // `closure_target` (= el module_env que se está construyendo), donde viven las
+            // hermanas. `rebuild_module_env` pasa ese module_env como `closure_target`, así
+            // que `MAP["t"]` resuelve `helper`/`ws_path`/etc. igual que bajo `run`.
+            let mut m = IndexMap::new();
+            for (k, gv) in entries {
+                m.insert(k.clone(), rebuild_global_val(gv, closure_target, base));
             }
             SynValue::Map(Rc::new(RefCell::new(m)))
         }
@@ -226,7 +378,10 @@ pub(crate) fn rebuild_globals(interp: &mut Interpreter, snapshot: &[(String, Glo
                 interp.agent_definitions.insert(k.clone(), (body.clone(), genv));
             }
             other => {
-                let v = rebuild_global_val(other, &interp.global_env.clone());
+                // Top-level: las tasks cierran sobre el global (closure_target) y los
+                // nuevos module_env también cuelgan del global (base).
+                let genv = interp.global_env.clone();
+                let v = rebuild_global_val(other, &genv, &genv);
                 interp.set_global(k, v);
             }
         }
@@ -333,6 +488,8 @@ fn build_base_interp(
     rules_snap: &Arc<Vec<OwnerRule>>,
     shared_memory: &SharedMemoryStore,
     on_write: &OnWriteFn,
+    shared_progress: &SharedProgressStore,
+    on_write_progress: &OnWriteProgressFn,
     shared_state: &SharedState,
     secure: bool,
 ) -> (Interpreter, Rc<RefCell<CapabilitySet>>) {
@@ -351,9 +508,16 @@ fn build_base_interp(
         Rc::new(RefCell::new(ProgressManager::new())),
         Rc::new(RefCell::new(mem)),
     );
+    // DE-029: cablear el provider LLM real (texto + paso tool-aware) también bajo serve,
+    // para que reason/decide/generate/llm_step de los handlers no caigan a placeholders.
+    // Por-worker (no por-request): el provider se resuelve una vez al construir la base.
+    crate::engine::wire_real_llm_provider(&mut interp);
     // Sobrescribir los builtins de memoria (remember/recall/forget_memory/memory_summary)
     // con versiones que usan el AgentMemory compartido entre hilos.
     register_serve_memory_builtins(&interp, shared_memory.clone(), on_write.clone());
+    // DE-028: ídem para el progress (create_progress/start_step/…/resume_point) → el
+    // ProgressManager compartido entre hilos/requests, no el fresco per-intérprete.
+    register_serve_progress_builtins(&interp, shared_progress.clone(), on_write_progress.clone());
     // Registrar los builtins de estado compartido (state_set/state_get/state_incr/…).
     register_serve_state_builtins(&interp, shared_state.clone());
     {
@@ -396,6 +560,8 @@ fn with_serve_interp<R>(
     rules_snap: &Arc<Vec<OwnerRule>>,
     shared_memory: &SharedMemoryStore,
     on_write: &OnWriteFn,
+    shared_progress: &SharedProgressStore,
+    on_write_progress: &OnWriteProgressFn,
     shared_state: &SharedState,
     secure: bool,
     f: impl FnOnce(&mut Interpreter) -> R,
@@ -412,6 +578,8 @@ fn with_serve_interp<R>(
             rules_snap,
             shared_memory,
             on_write,
+            shared_progress,
+            on_write_progress,
             shared_state,
             secure,
         );
@@ -531,12 +699,14 @@ fn run_route(
     rules_snap: &Arc<Vec<OwnerRule>>,
     shared_memory: &SharedMemoryStore,
     on_write: &OnWriteFn,
+    shared_progress: &SharedProgressStore,
+    on_write_progress: &OnWriteProgressFn,
     shared_state: &SharedState,
     body: &[Node],
     ctx: &Ctx,
     secure: bool,
 ) -> GiveOutcome {
-    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_state, secure, |interp| {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, secure, |interp| {
         match interp.run_request_block(body, request_bindings(ctx)) {
             Ok(_) => GiveOutcome::Give(None),
             Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
@@ -566,13 +736,15 @@ fn run_stream(
     rules_snap: &Arc<Vec<OwnerRule>>,
     shared_memory: &SharedMemoryStore,
     on_write: &OnWriteFn,
+    shared_progress: &SharedProgressStore,
+    on_write_progress: &OnWriteProgressFn,
     shared_state: &SharedState,
     body: &[Node],
     ctx: &Ctx,
     secure: bool,
     emit: Emitter,
 ) -> StreamEnd {
-    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_state, secure, move |interp| {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, secure, move |interp| {
         let cell = Rc::new(RefCell::new(emit));
         let ec = cell.clone();
         interp.set_stream_emit(Rc::new(move |val: SynValue, event: Option<&str>| {
@@ -668,6 +840,8 @@ fn build_host_table(
     rules_snap: &Arc<Vec<OwnerRule>>,
     shared_memory: &SharedMemoryStore,
     on_write: &OnWriteFn,
+    shared_progress: &SharedProgressStore,
+    on_write_progress: &OnWriteProgressFn,
     shared_state: &SharedState,
     swarm: &Arc<Swarm>,
     shared_db: &SharedDb,
@@ -704,10 +878,12 @@ fn build_host_table(
         let rules_a = rules_snap.clone();
         let mem_a = shared_memory.clone();
         let ow_a = on_write.clone();
+        let prog_a = shared_progress.clone();
+        let owp_a = on_write_progress.clone();
         let st_a = shared_state.clone();
         let db_a = shared_db.clone();
         let h: AuthHandler = Arc::new(move |token: &str| -> Option<SynValue> {
-            with_serve_interp(&swarm_a, &snap_a, &caps_a, &db_a, &rules_a, &mem_a, &ow_a, &st_a, secure, |interp| {
+            with_serve_interp(&swarm_a, &snap_a, &caps_a, &db_a, &rules_a, &mem_a, &ow_a, &prog_a, &owp_a, &st_a, secure, |interp| {
                 let genv = interp.global_env.clone();
                 let task = match interp.eval(&auth_node, &genv) {
                     Ok(t) => t,
@@ -765,10 +941,12 @@ fn build_host_table(
             let rules_c = rules_snap.clone();
             let mem_c = shared_memory.clone();
             let ow_c = on_write.clone();
+            let prog_c = shared_progress.clone();
+            let owp_c = on_write_progress.clone();
             let st_c = shared_state.clone();
             let db_c = shared_db.clone();
             let handler: Handler = Arc::new(move |ctx: &Ctx| {
-                run_route(&swarm_c, &snap_c, &caps_c, &db_c, &rules_c, &mem_c, &ow_c, &st_c, &body_c, ctx, secure)
+                run_route(&swarm_c, &snap_c, &caps_c, &db_c, &rules_c, &mem_c, &ow_c, &prog_c, &owp_c, &st_c, &body_c, ctx, secure)
             });
 
             let stream_handler: Option<StreamHandler> = if *streaming {
@@ -779,11 +957,13 @@ fn build_host_table(
                 let rules_s = rules_snap.clone();
                 let mem_s = shared_memory.clone();
                 let ow_s = on_write.clone();
+                let prog_s = shared_progress.clone();
+                let owp_s = on_write_progress.clone();
                 let st_s = shared_state.clone();
                 let db_s = shared_db.clone();
                 Some(Arc::new(move |ctx: &Ctx, emit: Emitter| {
                     run_stream(
-                        &swarm_s, &snap_s, &caps_s, &db_s, &rules_s, &mem_s, &ow_s, &st_s, &body_s, ctx, secure, emit,
+                        &swarm_s, &snap_s, &caps_s, &db_s, &rules_s, &mem_s, &ow_s, &prog_s, &owp_s, &st_s, &body_s, ctx, secure, emit,
                     )
                 }))
             } else {
@@ -818,6 +998,8 @@ fn make_serve_hook(
     top_level_memory: Rc<RefCell<AgentMemory>>,
     shared_memory: SharedMemoryStore,
     on_write: OnWriteFn,
+    shared_progress: SharedProgressStore,
+    on_write_progress: OnWriteProgressFn,
     shared_state: SharedState,
 ) -> ServeHook {
     Rc::new(move |interp, node, env| {
@@ -1005,6 +1187,8 @@ fn make_serve_hook(
             &rules_snap,
             &shared_memory,
             &on_write,
+            &shared_progress,
+            &on_write_progress,
             &shared_state,
             &swarm,
             &shared_db,
@@ -1044,6 +1228,8 @@ fn make_serve_hook(
                     &rules_snap,
                     &shared_memory,
                     &on_write,
+                    &shared_progress,
+                    &on_write_progress,
                     &shared_state,
                     &swarm,
                     &shared_db,
@@ -1324,33 +1510,50 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("program")));
 
-    // ── Memoria compartida entre el top-level y todos los route handlers ──────
-    // `shared_memory` es la fuente de verdad para remember/recall. Se inicializa
-    // desde el SQLite del programa (mismo .db que usa `synsema run`) para que la
-    // memoria persista entre reinicios y sea coherente entre ambos modos.
+    // ── Memoria + progress compartidos entre el top-level y todos los handlers ──
+    // `shared_memory`/`shared_progress` son la fuente de verdad para remember/recall y
+    // create_progress/resume_point. Se inicializan desde el SQLite del programa (mismo
+    // .db que usa `synsema run`) para que sobrevivan reinicios y sean coherentes entre
+    // ambos modos. (Antes el progress del boot se cargaba en un `pm` descartado → DE-028.)
     let shared_memory: SharedMemoryStore = Arc::new(Mutex::new(AgentMemory::new()));
+    let shared_progress: SharedProgressStore = Arc::new(Mutex::new(ProgressManager::new()));
     {
         let persistence = crate::engine::state_persistence_for(filename);
         if let Some(ref p) = persistence {
-            let mut pm = ProgressManager::new();
-            p.load_into(&mut shared_memory.lock().unwrap(), &mut pm);
+            p.load_into(
+                &mut shared_memory.lock().unwrap(),
+                &mut shared_progress.lock().unwrap(),
+            );
         }
     }
-    // Callback de persistencia: cada vez que remember/forget_memory muten la
-    // memoria, se guarda al SQLite inmediatamente para sobrevivir reinicios.
-    let persist_for_serve = {
-        let persistence = crate::engine::state_persistence_for(filename);
-        let shared_persistence: Option<Arc<Mutex<crate::persistence::StatePersistence>>> =
-            persistence.map(|p| Arc::new(Mutex::new(p)));
-        let sp = shared_persistence;
-        let on_write: OnWriteFn = Arc::new(move |mem: &AgentMemory| {
+    // Callbacks de persistencia: cada mutación se guarda al SQLite inmediatamente para
+    // sobrevivir reinicios. Memoria y progress escriben tablas DISTINTAS y tienen
+    // callbacks separados (`save_memory_only`/`save_progress_only`) para no pisarse —
+    // antes el on_write de memoria hacía `save_from(mem, &ProgressManager::new())`, que
+    // borraba el progress persistido en cada `remember` (DE-028). Comparten UNA
+    // `StatePersistence` (mismo .db), y ningún callback toma el lock del OTRO store, así
+    // que no hay inversión de orden de locks.
+    let shared_persistence: Option<Arc<Mutex<crate::persistence::StatePersistence>>> =
+        crate::engine::state_persistence_for(filename).map(|p| Arc::new(Mutex::new(p)));
+    let persist_memory: OnWriteFn = {
+        let sp = shared_persistence.clone();
+        Arc::new(move |mem: &AgentMemory| {
             if let Some(ref p) = sp {
                 if let Ok(guard) = p.lock() {
-                    guard.save_from(mem, &ProgressManager::new());
+                    guard.save_memory_only(mem);
                 }
             }
-        });
-        on_write
+        })
+    };
+    let persist_progress: OnWriteProgressFn = {
+        let sp = shared_persistence.clone();
+        Arc::new(move |prog: &ProgressManager| {
+            if let Some(ref p) = sp {
+                if let Ok(guard) = p.lock() {
+                    guard.save_progress_only(prog);
+                }
+            }
+        })
     };
 
     // `top_level_memory` sigue siendo el AgentMemory per-intérprete del top-level.
@@ -1363,9 +1566,14 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         Rc::new(RefCell::new(ProgressManager::new())),
         top_level_memory.clone(),
     );
-    // Sobrescribir los builtins de memoria en el top-level con los compartidos,
-    // para que `remember` en el top-level también persista a disco.
-    register_serve_memory_builtins(&interp, shared_memory.clone(), persist_for_serve.clone());
+    // DE-029: el provider LLM real también en el intérprete del preámbulo, para que el
+    // código top-level (antes del `serve on PORT`) pueda usar reason/decide/generate.
+    crate::engine::wire_real_llm_provider(&mut interp);
+    // Sobrescribir los builtins de memoria/progress en el top-level con los compartidos,
+    // para que `remember`/`create_progress` en el top-level también persistan a disco y
+    // sean coherentes con lo que ven los handlers.
+    register_serve_memory_builtins(&interp, shared_memory.clone(), persist_memory.clone());
+    register_serve_progress_builtins(&interp, shared_progress.clone(), persist_progress.clone());
 
     let swarm = Arc::new(Swarm::new());
     wire_swarm_hooks(&mut interp, swarm.clone(), "main");
@@ -1390,7 +1598,9 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         overrides,
         top_level_memory,
         shared_memory,
-        persist_for_serve,
+        persist_memory,
+        shared_progress,
+        persist_progress,
         shared_state,
     ));
 
