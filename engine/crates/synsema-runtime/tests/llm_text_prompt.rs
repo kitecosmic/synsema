@@ -23,6 +23,29 @@ fn reason_threads_with_context_into_prompt() {
 }
 
 #[test]
+fn reason_without_about_keyword_threads_subject() {
+    // DE-036: `reason "<literal>"` (sin `about`) debe entregar el literal al modelo,
+    // igual que `reason about`. Antes el subject quedaba None → el prompt era "nothing".
+    let src = "require llm\nlet r be reason \"the weather\"\n";
+    let (res, caps) = run_capturing_llm(src, "<test>");
+    assert!(res.success, "{:?}", res.errors);
+    let p = prompt_for(&caps, "reason");
+    assert!(p.contains("the weather"), "el subject debe estar en el prompt: {}", p);
+    assert!(!p.contains("nothing"), "el prompt no debe ser \"nothing\": {}", p);
+}
+
+#[test]
+fn decide_without_between_keyword_threads_options() {
+    // DE-036: `decide "<opts>"` (sin `between`) debe entregar las opciones al modelo.
+    let src = "require llm\nlet d be decide \"a, b\" given \"speed matters\"\n";
+    let (res, caps) = run_capturing_llm(src, "<test>");
+    assert!(res.success, "{:?}", res.errors);
+    let dp = prompt_for(&caps, "decide");
+    assert!(dp.contains("a, b"), "las opciones deben estar en el prompt: {}", dp);
+    assert!(dp.contains("speed matters"), "decide `given` ausente: {}", dp);
+}
+
+#[test]
 fn generate_threads_given_and_params_into_prompt() {
     let src = "require llm\nlet g be generate \"a report\" given \"sales data\" with tone = \"formal\"\n";
     let (res, caps) = run_capturing_llm(src, "<test>");

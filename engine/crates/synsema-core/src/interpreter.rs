@@ -1778,7 +1778,14 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     Some(l) => format!("[{}] ", l),
                     None => String::new(),
                 };
-                self.output.push(format!("{}{}", label_str, v));
+                let line = format!("{}{}", label_str, v);
+                // DE-034: espejo de `log`/`print` — si hay log_hook (p.ej. bajo serve),
+                // emitir en vivo además de bufferizar a `output`. Bajo `run` el hook es
+                // None, así que el comportamiento no cambia.
+                if let Some(hook) = &self.log_hook {
+                    hook(&line);
+                }
+                self.output.push(line);
                 Ok(v)
             }
             NodeKind::AskExpression { prompt, options } => {

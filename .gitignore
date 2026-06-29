@@ -24,6 +24,9 @@ target/
 # Se usa localmente; no va al repo público. (Los docs de proceso viven fuera del repo.)
 conformance/
 
+# Probes de verificación local (los corre el agente de testing). NO van al repo público.
+probes/
+
 # Specs de implementación / docs de proceso: viven localmente, NO van al repo público.
 specs/
 

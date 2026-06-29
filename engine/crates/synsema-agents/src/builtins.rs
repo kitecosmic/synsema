@@ -41,6 +41,18 @@ fn str_list(v: Option<&SynValue>) -> Vec<String> {
     }
 }
 
+/// Arg numérico opcional → `usize` (negativos/no-finitos/no-números → None). DE-035:
+/// usado por el `limit` opcional de `recall`.
+fn opt_usize(v: Option<&SynValue>) -> Option<usize> {
+    match v {
+        Some(SynValue::Number(n)) => {
+            let f = n.to_f64();
+            if f.is_finite() && f >= 0.0 { Some(f as usize) } else { None }
+        }
+        _ => None,
+    }
+}
+
 pub fn register_agent_builtins(
     interp: &Interpreter,
     progress: Rc<RefCell<ProgressManager>>,
@@ -134,7 +146,10 @@ pub fn register_agent_builtins(
             let search = opt_arg(args.get(2));
             // 4º arg opcional `mode`: "all" (AND) o "any"/ausente (OR, default). (MF-005)
             let match_all = args.get(3).map(raw_str).map(|m| m.to_lowercase() == "all").unwrap_or(false);
-            let entries = m.borrow().recall_mode(category.as_deref(), tags.as_deref(), search.as_deref(), match_all);
+            // 5º arg opcional `limit` (número): máximo de entradas. Sin él, el default de
+            // recall_mode (200). DE-035.
+            let limit = opt_usize(args.get(4));
+            let entries = m.borrow().recall_mode(category.as_deref(), tags.as_deref(), search.as_deref(), match_all, limit);
             let result: Vec<SynValue> = entries.iter().map(|e| {
                 let mut map = IndexMap::new();
                 map.insert("id".to_string(), syn_text(e.id.as_str()));
@@ -255,9 +270,13 @@ pub fn register_serve_memory_builtins(
             } else {
                 None
             };
-            let search = args.get(2).map(raw_str);
+            let search = args.get(2).map(raw_str).filter(|s| s != "nothing");
+            // DE-035: exponer también bajo serve el 4º arg `mode` ("all"=AND, "any"/ausente=OR)
+            // y el 5º arg `limit` (número), a la par del camino de run.
+            let match_all = args.get(3).map(raw_str).map(|m| m.to_lowercase() == "all").unwrap_or(false);
+            let limit = opt_usize(args.get(4));
             let mem = s.lock().unwrap();
-            let entries = mem.recall(category.as_deref(), tags.as_deref(), search.as_deref());
+            let entries = mem.recall_mode(category.as_deref(), tags.as_deref(), search.as_deref(), match_all, limit);
             let result: Vec<SynValue> = entries.iter().map(|e| {
                 let mut map = IndexMap::new();
                 map.insert("id".to_string(),       syn_text(e.id.as_str()));

@@ -19,6 +19,12 @@ fn now_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Máximo de entradas que devuelve `recall`/`recall_mode` cuando no se pasa un límite
+/// explícito. DE-035: antes era un `truncate(20)` fijo y silencioso (footgun para
+/// historiales/contadores largos: `length(recall(...))` se topaba en 20). Ahora el
+/// límite es configurable por-llamada y el default se subió a 200.
+const DEFAULT_RECALL_LIMIT: usize = 200;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleLevel {
@@ -239,7 +245,7 @@ impl AgentMemory {
         tags: Option<&[String]>,
         search: Option<&str>,
     ) -> Vec<MemoryEntry> {
-        self.recall_mode(category, tags, search, false)
+        self.recall_mode(category, tags, search, false, None)
     }
 
     /// Como `recall` pero con modo de tags configurable: `match_all=false` → OR (cualquier
@@ -251,6 +257,7 @@ impl AgentMemory {
         tags: Option<&[String]>,
         search: Option<&str>,
         match_all: bool,
+        limit: Option<usize>,
     ) -> Vec<MemoryEntry> {
         let mut results: Vec<MemoryEntry> = self
             .entries
@@ -272,8 +279,10 @@ impl AgentMemory {
             })
             .cloned()
             .collect();
+        // Más-reciente-primero por `updated_at`: `[0]` es la entrada más recientemente
+        // escrita/actualizada, `[len-1]` la más vieja. (DE-035: documentado en el skill.)
         results.sort_by(|a, b| b.updated_at.partial_cmp(&a.updated_at).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(20);
+        results.truncate(limit.unwrap_or(DEFAULT_RECALL_LIMIT));
         results
     }
 
@@ -486,11 +495,43 @@ mod tests {
         m.remember("context", "B", JsonMap::new(), tags(&["s1", "obj"]), "agent").unwrap();
         // OR: ["s1","obj"] matchea ambas (las dos tienen s1).
         assert_eq!(m.recall(Some("context"), Some(&tags(&["s1", "obj"])), None).len(), 2);
-        assert_eq!(m.recall_mode(Some("context"), Some(&tags(&["s1", "obj"])), None, false).len(), 2);
+        assert_eq!(m.recall_mode(Some("context"), Some(&tags(&["s1", "obj"])), None, false, None).len(), 2);
         // AND: solo B tiene s1 Y obj.
-        let only_b = m.recall_mode(Some("context"), Some(&tags(&["s1", "obj"])), None, true);
+        let only_b = m.recall_mode(Some("context"), Some(&tags(&["s1", "obj"])), None, true, None);
         assert_eq!(only_b.len(), 1);
         assert_eq!(only_b[0].content, "B");
+    }
+
+    #[test]
+    fn memory_recall_newest_first() {
+        // DE-035: recall ordena más-reciente-primero por `updated_at`: [0] = la más nueva.
+        let mut m = AgentMemory::new();
+        let id_old = m.remember("context", "T1-viejo", JsonMap::new(), tags(&["o"]), "agent").unwrap();
+        let id_mid = m.remember("context", "T2", JsonMap::new(), tags(&["o"]), "agent").unwrap();
+        let id_new = m.remember("context", "T3-nuevo", JsonMap::new(), tags(&["o"]), "agent").unwrap();
+        // Fijar updated_at explícito → orden determinista (sin depender del reloj).
+        m.entries.get_mut(&id_old).unwrap().updated_at = 100.0;
+        m.entries.get_mut(&id_mid).unwrap().updated_at = 200.0;
+        m.entries.get_mut(&id_new).unwrap().updated_at = 300.0;
+        let r = m.recall(Some("context"), Some(&tags(&["o"])), None);
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0].content, "T3-nuevo"); // más reciente primero
+        assert_eq!(r[r.len() - 1].content, "T1-viejo"); // más vieja al final
+    }
+
+    #[test]
+    fn memory_recall_limit_configurable() {
+        // DE-035: el límite es configurable; el default (200) ya no trunca a 20.
+        let mut m = AgentMemory::new();
+        for i in 0..25 {
+            m.remember("context", &format!("entry-{i}"), JsonMap::new(), tags(&["lim"]), "agent").unwrap();
+        }
+        // Sin límite explícito: las 25 entran bajo el default; antes se truncaba a 20.
+        assert_eq!(m.recall_mode(Some("context"), Some(&tags(&["lim"])), None, false, None).len(), 25);
+        // Límite explícito menor que el total.
+        assert_eq!(m.recall_mode(Some("context"), Some(&tags(&["lim"])), None, false, Some(10)).len(), 10);
+        // Límite explícito mayor que el total → devuelve todas.
+        assert_eq!(m.recall_mode(Some("context"), Some(&tags(&["lim"])), None, false, Some(100)).len(), 25);
     }
 
     #[test]

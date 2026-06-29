@@ -151,15 +151,17 @@ task run_agent(question, max_steps, budget_tokens)
     let spent be 0
     let step_n be 0
     let ctx be ""
-    while step_n < max_steps
+    -- Budget guard goes in the WHILE CONDITION (at the top), NOT after llm_step: a step the model already
+    -- produced (and paid tokens for — e.g. a big file as a write_file arg) ALWAYS dispatches; the budget
+    -- stops the NEXT step, it does NOT discard the current one. (`step["tokens"]` is prompt+completion, so
+    -- size budget_tokens for what you generate — a file-writing step can cost thousands; see MAX_TOKENS.)
+    while (step_n < max_steps) and (spent <= budget_tokens)
         set step_n to step_n + 1
         let step be llm_step(question, catalog, ctx)
         set spent to spent + step["tokens"]
-        when spent > budget_tokens
-            give "budget exhausted"
         when step["kind"] == "final"
             give step["text"]
-        when contains(tools, step["name"])               -- only allow-listed names dispatch
+        otherwise when contains(tools, step["name"])      -- only allow-listed names dispatch
             try
                 let result be call_tool(tools[step["name"]], step["args"])   -- least-privilege
                 set ctx to ctx + " [" + step["name"] + " => " + text(result) + "]"

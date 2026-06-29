@@ -52,6 +52,17 @@ entries tagged with **at least one** of the tags (OR / any). To require **all** 
 both. (`category` and `search` always narrow; the mode applies only to the tags. Pass `nothing` for an
 earlier positional arg you want to skip.)
 
+**`recall` order — newest-first.** Results are sorted **most-recent-first** by last-write time
+(`updated_at`): `recall(...)[0]` is the entry written/updated most recently, and the **last** element is
+the oldest. (Re-`remember`/`update` on an entry bumps it to the front.) Don't take `xs[length - 1]` to get
+"the latest" — that's the **oldest**; use `xs[0]`.
+
+**`recall` limit — default 200, configurable (5th arg).** `recall` returns at most **200** entries by
+default. Pass a 5th arg to change it: `recall("context", nothing, nothing, "any", 1000)` returns up to
+1000. Mind this when counting: `length(recall(cat))` is capped at the limit, so for long histories pass an
+explicit limit (or use `state_incr` for a counter). The same 4th/5th args (`mode`, `limit`) work under
+`serve`. (Earlier engine versions silently truncated to 20.)
+
 **Categories are a fixed set (English only):**
 `preference`, `rule`, `learning`, `decision`, `context`
 

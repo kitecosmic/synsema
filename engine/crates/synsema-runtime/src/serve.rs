@@ -474,6 +474,27 @@ fn register_serve_state_builtins(interp: &Interpreter, state: SharedState) {
     }
 }
 
+/// Sink global de las líneas de log de los handlers de `serve` (DE-034). Por defecto
+/// (`None`) cada línea va a stdout con prefijo `[serve]`. Un embedder —o un test— puede
+/// instalar el suyo con [`set_serve_log_sink`] (p.ej. para enrutar a un logger o
+/// capturarlas). Se resuelve UNA vez por worker al construir el intérprete base, así que
+/// instalalo ANTES de arrancar el server.
+static SERVE_LOG_SINK: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>> = Mutex::new(None);
+
+/// Instala el sink global de logs de `serve`. Pasá `None` para volver al default (stdout).
+pub fn set_serve_log_sink(sink: Option<Arc<dyn Fn(&str) + Send + Sync>>) {
+    *SERVE_LOG_SINK.lock().unwrap() = sink;
+}
+
+/// Resuelve el sink de log de serve: el instalado o, por defecto, stdout `[serve] …`.
+fn serve_log_sink() -> Arc<dyn Fn(&str) + Send + Sync> {
+    SERVE_LOG_SINK
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| Arc::new(|line: &str| println!("[serve] {line}")))
+}
+
 /// Construir esto es CARO (registrar ~100 builtins + recargar `.env` + clonar el AST
 /// de cada task) y era el ~46% del CPU por request (medido en la VPS: profile-first).
 /// Ahora se construye UNA vez por worker y se reusa entre requests (ver
@@ -494,6 +515,12 @@ fn build_base_interp(
     secure: bool,
 ) -> (Interpreter, Rc<RefCell<CapabilitySet>>) {
     let mut interp = Interpreter::new();
+    // DE-034: bajo `serve`, los `log`/`print`/`show` de DENTRO de un handler se
+    // descartaban (el buffer `output` se limpia por request sin volcarse). Cableamos el
+    // `log_hook` — espejo de los agentes del swarm (`setup_swarm_interpreter`) — para que
+    // cada línea salga en tiempo real (a stdout por defecto; útil para SSE/handlers
+    // largos). El `run` NO se toca: este wiring es exclusivo de la ruta serve.
+    interp.log_hook = Some(serve_log_sink());
     let caps = Rc::new(RefCell::new(CapabilitySet::new("request")));
     // Pre-populamos el AgentMemory con las reglas del top-level para que
     // add_rule/check_rules/get_rules funcionen desde los route handlers.

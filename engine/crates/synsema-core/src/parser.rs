@@ -2196,8 +2196,20 @@ impl Parser {
         let loc = self.location();
         self.advance(); // 'reason'
         let mut subject = None;
+        // DE-036: capturar el subject venga o no la palabra `about`. `reason "X"` debe
+        // entregar "X" al modelo igual que `reason about "X"` (la forma documentada
+        // `reason "<str>" + var` dependía de esto y entregaba un prompt vacío). El
+        // subject se omite sólo cuando lo que sigue no puede iniciar una expresión:
+        // `with` (contexto), fin de línea/bloque o EOF.
         if self.current_value_eq("about") {
             self.advance();
+        }
+        if !self.check(TokenType::With)
+            && !self.check(TokenType::Newline)
+            && !self.check(TokenType::Indent)
+            && !self.check(TokenType::Dedent)
+            && !self.at_end()
+        {
             subject = Some(Box::new(self.parse_expression()?));
         }
         let mut context: Vec<(String, Node)> = Vec::new();
@@ -2218,8 +2230,19 @@ impl Parser {
         let loc = self.location();
         self.advance(); // 'decide'
         let mut options = None;
+        // DE-036: capturar las opciones venga o no la palabra `between`, espejo de
+        // `reason`. `decide [a, b]` debe entregar la lista al modelo. Se omite si sigue
+        // `with`/`given`, fin de línea/bloque o EOF (sin nada que parsear).
         if self.current_value_eq("between") {
             self.advance();
+        }
+        if !self.check(TokenType::With)
+            && !self.current_value_eq("given")
+            && !self.check(TokenType::Newline)
+            && !self.check(TokenType::Indent)
+            && !self.check(TokenType::Dedent)
+            && !self.at_end()
+        {
             options = Some(Box::new(self.parse_expression()?));
         }
         let mut given = None;
