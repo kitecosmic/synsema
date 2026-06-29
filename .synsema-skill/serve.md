@@ -121,7 +121,11 @@ route "GET /count"
 ```
 - `state_set(key, value)` / `state_get(key, default?)` / `state_incr(key, delta?)` / `state_delete(key)`.
 - In-memory (gone on restart). For durable state use SQL ([stdlib.md](stdlib.md)) or the agent
-  memory (`remember`/`recall`, which now persists from serve too).
+  memory (`remember`/`recall`) **and progress** (`create_progress`/`resume_point`/…) — **both persist
+  across serve requests** (shared store, same as a fresh `run`), so a plan created in one request
+  advances in the next. State lives in `<program-dir>/.synsema/state/` ([memory.md](memory.md)). LLM ops
+  (`reason`/`decide`/`generate`/`llm_step`) also work under serve with the `.env` provider — a modular
+  orchestrator with memory, plans and an LLM runs directly from `serve`.
 
 ## Response contract (enforced by the runtime, on the BODY you `give`)
 

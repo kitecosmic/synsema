@@ -2,9 +2,11 @@
 
 ## Persistence
 
-Memory, progress, and rules **automatically persist between executions**. Stored in SQLite at `~/.synsema/state/<program_name>.db`. Auto-loaded on startup, auto-saved after execution.
+Memory, progress, and rules **automatically persist between executions** in SQLite. Auto-loaded on startup, auto-saved after execution.
 
-This means: `remember()` in run 1 → `recall()` in run 2 finds it. If a daemon crashes and restarts, it retains all its knowledge.
+**Location (project-local by default):** `<program-dir>/.synsema/state/<name>.db` — next to the `.syn`, inside the project (portable, gitignore `.synsema/`). `<name>` = the file stem (`alfred.syn` → `alfred.db`), or the `SYNSEMA_STATE_NAME` env override (so several entry files in one project — CLI/REPL/web — can **share** one memory). `SYNSEMA_STATE_DIR` overrides the directory. Falls back to the old global `~/.synsema/state/` (with a warning) if the local dir isn't writable; set `SYNSEMA_STATE_DIR=~/.synsema/state` to restore the old behavior. (Tip: `SYNSEMA_STATE_DIR=$(mktemp -d)` to keep test runs from writing `.synsema/` into the tree.)
+
+This means: `remember()` in run 1 → `recall()` in run 2 finds it. If a daemon crashes and restarts, it retains all its knowledge. **Both memory AND progress persist across `serve` requests** (so a plan started in one request advances in the next).
 
 ## Progress tracking
 ```

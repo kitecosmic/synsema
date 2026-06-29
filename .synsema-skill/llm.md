@@ -178,6 +178,19 @@ declared (∩ the agent's), so it cannot exceed its mandate even if the agent is
 loop is always bounded by `max_steps` and the token budget. (Plain `call` runs with the agent's
 ambient capabilities — use `call_tool` to dispatch untrusted, model-chosen tools.)
 
+**Tools that do real work (files/processes/net) — wire both sides.** Each tool **declares** its
+`require` at the top of its body (literal scope); the **program grants** the superset. Under `serve`
+the per-task `require` is only the *declaration* `call_tool` intersects — the real grant goes in the
+**entry's** top-level `require`s (a file/exec tool under serve fails with `Capability not granted`
+otherwise). Dir scope = `file("dir")` + `file("dir/*")`; any command = `require exec`. See
+[capabilities.md](capabilities.md#per-tool-least-privilege-call_tool).
+```
+task tool_write(name, content)
+    require file.write("workspace/*")    -- the tool's declaration
+    write_file("workspace/" + name, content)
+-- entry: require serve(N) + require file("workspace") + require file("workspace/*") + require exec
+```
+
 Offline (no provider configured) `llm_step` returns the safe placeholder
 `{kind: "final", text: "[no llm provider]", tokens: 0}` — check `llm_available()` to branch. With a
 provider wired (via `.env`/env/`--provider`, see Providers) it calls the real model. Tests drive it

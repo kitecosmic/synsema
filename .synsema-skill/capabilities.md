@@ -96,8 +96,23 @@ let result be call_tool(fetch_orders, nothing)
 - The restricted scope is created when `call_tool` dispatches and restored when it returns (also on
   error); nested calls keep the restriction.
 - A `require` **nested** inside the tool body (under `when`/`if`/…) is a **no-op** — a tool cannot
-  self-grant a capability to escape its scope.
+  self-grant a capability to escape its scope. (The top-of-body `require` IS the declaration.)
 - `print` and pure computation always work; declare `time`/`random`/etc. to use them.
+
+**Two sides — the program must also GRANT.** `call_tool` runs the tool with `declared ∩ program`. So a
+tool that declares `require file.write("out/*")` still fails with `Capability not granted` if the
+**program** didn't grant `file`. Wire both: the tool **declares** (top of body, literal scope) and the
+**entry grants** the superset.
+
+> **Under `serve` (secure mode) this bites:** a per-task `require` does **not** grant ambient capability
+> — it's only the **declaration** `call_tool` intersects. The real grant goes at the **top-level of the
+> `serve` file**. (In `run` the per-task `require` suffices, but declare-in-tool + grant-in-entry works
+> in both.) Symptom: a file/exec tool under serve returns `Capability not granted` — you're missing the
+> `require` in the **entry**.
+
+**Directory-tree scope:** to read/write files under a dir, grant **both** `file("dir")` (the dir node,
+for `list_dir`) **and** `file("dir/*")` (the files inside). Scopes are **literal** — `require exec(cmd)`
+with a variable does not parse; use `require exec` for any command, `exec("git")` for one.
 
 Plain `call`/normal invocation does NOT isolate — use `call_tool` for untrusted, model-chosen tools.
 
