@@ -17,7 +17,8 @@ let key  be secret("STRIPE_API_KEY")          -- opaque, redacted everywhere
 | Builtin | Returns | Capability |
 |---|---|---|
 | `env(name, default?)` | plain text | `require env("NAME")` |
-| `secret(name, default?)` | an opaque `secret` | `require secret("NAME")` |
+| `secret(name, default?)` | an opaque `secret` (from config) | `require secret("NAME")` |
+| `as_secret(value, label?)` | seal a **runtime** value as a `secret` | none (pure) — see [below](#sealing-a-runtime-value-as_secret) |
 
 Both are **deny-by-default and scoped by name**, just like `net`/`file`. Reading a
 variable you didn't declare fails with a clear, fix-suggesting error:
@@ -127,20 +128,60 @@ let r be fetch("https://api.stripe.com/v1/charges", "POST",
 - `==` on a `secret` is already constant-time; prefer `constant_time_eq`/`verify_hmac`
   for credential checks.
 
+## Sealing a runtime value: `as_secret()`
+
+`secret("NAME")` reads from config. For a sensitive value that **arrives at runtime**
+and isn't in `.env` — a user's API key in a request header, a token from another
+task/HTTP call — use **`as_secret(value, label?)`** to seal it at the point of entry.
+From there it carries the same taint and redaction as any `secret`:
+
+```
+-- Multi-tenant / SaaS: the end user brings their own key in a header.
+route "POST /proxy"
+    let user_key be as_secret(header_of(request, "x-provider-key"), "user_key")
+    let r be fetch("https://api.provider.com/v1/...", "POST",
+                   {"Authorization": bearer(user_key)}, body)   -- materializes only at the socket
+    give {"ok": true}
+```
+
+- **No `require` needed.** `as_secret` is a *pure* transformation that only *strengthens*
+  security (it seals), so — unlike `secret()`/`reveal()` — it isn't capability-gated. It
+  follows `bearer()`, not `secret()`.
+- Accepts **text or bytes** (what a secret actually *is*). Other types (number/map/list)
+  → a clear error: seal the sensitive **field**, not the whole structure.
+- **Idempotent:** `as_secret(x)` where `x` is already a `secret` returns it unchanged
+  (no re-nesting, same label).
+- `label` is a **non-sensitive** tag shown in redaction (`secret(<label>)`, default
+  `sealed`) and is what `reveal` scopes on — **give it a specific label if you plan to
+  reveal it** (see below).
+- Provenance-agnostic: it doesn't matter whose key it is (yours, a tenant's, a tenant's
+  customer's) — you seal what you receive at your edge.
+
 ## The one escape hatch: `reveal()`
 
-`reveal(s)` returns the plaintext. It is deliberately **loud**:
+`reveal(s)` returns the plaintext (a `secret` of bytes reveals as `bytes`). It is
+deliberately **loud** and **scoped**:
 
-- requires `require reveal` (coarse, no scope);
+- requires `require reveal("NAME")` **scoped to the secret's name/label** — it can only
+  reveal secrets whose name (`secret("STRIPE_KEY")` → `STRIPE_KEY`) or label
+  (`as_secret(v, "user_key")` → `user_key`) is in the granted scope (exact or glob, like
+  `secret`/`net`). Revealing anything outside the scope **fails** — even if you point a
+  variable at a different secret, the check uses *that* secret's name;
 - writes a **persistent, append-only audit entry** (`$SYNSEMA_AUDIT_DIR` or
-  `~/.synsema/audit/reveal.log`): timestamp, variable name, `file:line`, program name
-  — **never the value**;
-- if the audit log can't be written, `reveal()` **fails** (no audit, no reveal).
+  `~/.synsema/audit/reveal.log`) for **every attempt — granted or denied**: timestamp,
+  result, the secret's name/label, `file:line`, program name — **never the value**;
+- if the audit log can't be written, a granted `reveal()` **fails** (no audit, no reveal);
+- bare `require reveal` (no scope) still works for backward compat — it permits revealing
+  **any** secret — but is **discouraged** and prints a warning. Prefer the scoped form.
 
 ```
-require reveal
-let plain be reveal(secret("LEGACY_TOKEN"))   -- audited; avoid unless truly needed
+require reveal("LEGACY_TOKEN")
+let plain be reveal(secret("LEGACY_TOKEN"))   -- audited; only LEGACY_TOKEN is revealable here
 ```
+
+The only way to reveal a given secret is to declare its `require reveal("NAME")` in the
+**source** — auditable by reading the `require` lines, and a prompt injection can't add
+one (injection is data, not code; capabilities freeze at startup).
 
 Prefer `bearer`/`hmac_sha256`/`verify_hmac`/`constant_time_eq` — they consume the
 secret without ever exposing it.

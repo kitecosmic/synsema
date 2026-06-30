@@ -8,7 +8,7 @@ Nothing works without declaring capabilities.
 
 `serve(PORT)` allows binding an HTTP server to that port — see [serve.md](serve.md).
 
-`env("NAME")`, `secret("NAME")` and `reveal` gate config and secrets — see [secrets.md](secrets.md). `env` and `secret` are scoped by **name** (or a `NAME_*` prefix); `reveal` is coarse (no scope) and every `reveal()` is written to a persistent audit log.
+`env("NAME")`, `secret("NAME")` and `reveal("NAME")` gate config and secrets — see [secrets.md](secrets.md). All three are scoped by **name/label** (or a `NAME_*` prefix): `reveal("NAME")` can only reveal the secret whose name (`secret("NAME")`) or label (`as_secret(v,"label")`) matches, and every `reveal()` is written to a persistent audit log (**granted or denied**). Bare `require reveal` (coarse, any secret) still works for compat but **warns**. Separately, `as_secret(value, label?)` seals a **runtime** value as a `secret` and is **pure — no `require`** (see [secrets.md](secrets.md)).
 
 ## Declaring capabilities
 ```
@@ -21,7 +21,7 @@ require exec("ffmpeg")
 require env("API_KEY")
 require secret("STRIPE_API_KEY")    -- read as an opaque, redacted secret
 require secret("APP_*")             -- name prefix: APP_DB, APP_KEY, … (only a trailing *)
-require reveal                      -- enable reveal() (loud + audited; use sparingly)
+require reveal("STRIPE_API_KEY")    -- enable reveal() for THAT secret only (loud + audited; scoped by name/label)
 require time
 require llm                         -- enable LLM ops (reason/decide/analyze/generate)
 require serve(8080)                 -- bind an HTTP server to this port
@@ -148,7 +148,7 @@ Shows every capability check: what was requested, granted or denied, and why.
 - `call_tool` runs a task with ONLY its declared capabilities (∩ the program's); a plain call uses the program's ambient capabilities
 - Wildcard: `net("*.example.com")` covers all subdomains
 - Path glob: `file("/data/*")` covers all files in /data/. `file` grants **read+write**; use `file.read(scope)` / `file.write(scope)` for least-privilege. Path scope is **faithful**: a `..` escape (`file("./data/*")` + `read_file("./data/../../etc/passwd")`) normalizes outside the scope and is denied. `require file` / `file("*")` cover the whole disk.
-- Name prefix: `secret("APP_*")` / `env("APP_*")` covers `APP_DB`, `APP_KEY`, … (only a trailing `*`)
+- Name prefix: `secret("APP_*")` / `env("APP_*")` / `reveal("APP_*")` covers `APP_DB`, `APP_KEY`, … (only a trailing `*`)
 - `db` scope: a **file path** for SQLite; a **canonical URL** for remote engines (Postgres/MySQL/MongoDB/Redis) —
   `scheme://host/db` with **no credentials, port, or query** (so `mysql://user:pw@localhost:3306/appdb?ssl-mode=REQUIRED`
   is gated by `db("mysql://localhost/appdb")`, and `mongodb://u:p@host:27017/appdb?authSource=admin` by

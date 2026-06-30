@@ -403,6 +403,10 @@ pub fn syn_map(m: IndexMap<String, SynValue>) -> SynValue {
 pub fn syn_secret(name: impl Into<String>, plaintext: impl Into<String>) -> SynValue {
     SynValue::Secret(Rc::new(SecretInner::new(name, plaintext)))
 }
+/// Construye un `secret` opaco de BYTES (blob binario sellado con `as_secret`).
+pub fn syn_secret_bytes(name: impl Into<String>, bytes: Vec<u8>) -> SynValue {
+    SynValue::Secret(Rc::new(SecretInner::new_bytes(name, bytes)))
+}
 /// Construye un valor `bytes` (inmutable). Acepta `Vec<u8>` → `Rc<[u8]>` vía `Into`.
 pub fn syn_bytes(b: impl Into<Rc<[u8]>>) -> SynValue {
     SynValue::Bytes(b.into())

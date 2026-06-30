@@ -28,7 +28,7 @@ use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::secret::constant_time_eq;
 use synsema_core::tokens::SourceLocation;
-use synsema_core::types::{syn_bool, syn_secret, syn_text, SynValue};
+use synsema_core::types::{syn_bool, syn_bytes, syn_secret, syn_secret_bytes, syn_text, SynValue};
 
 // =========================================================
 // EnvStore — el `.env` parseado (la fuente; environ se lee en vivo)
@@ -201,11 +201,15 @@ fn cap_denied(kind: &str, name: &str) -> Control {
     )))
 }
 
-fn reveal_denied() -> Control {
-    Control::Error(RuntimeError::new(
-        "reveal() not permitted: missing capability — add `require reveal` \
-         (reveal is loud and writes a persistent audit entry)",
-    ))
+/// Denegación de `reveal` SCOPED por nombre/label (§6.5): el mensaje nombra el secret
+/// concreto y sugiere el `require reveal("NAME")` exacto. Mantiene el substring
+/// `reveal() not permitted` (contrato de error histórico) y aporta `Capability not
+/// granted: reveal("NAME")` para el scope.
+fn reveal_denied(name: &str) -> Control {
+    Control::Error(RuntimeError::new(format!(
+        "reveal() not permitted: Capability not granted: reveal(\"{name}\") — \
+         add `require reveal(\"{name}\")` (reveal is loud and writes a persistent audit entry)"
+    )))
 }
 
 fn undefined_var(kind: &str, name: &str) -> Control {
@@ -388,9 +392,12 @@ fn iso_now() -> String {
 }
 
 /// Escribe una entrada de audit (append-only). **Nunca** el valor revelado: sólo
-/// timestamp, nombre de la var, `file:line` y nombre del programa. Devuelve Err si
-/// no se puede escribir → `reveal()` falla (sin auditoría no hay revelación).
-fn write_audit_entry(name: &str, loc: &SourceLocation) -> Result<(), String> {
+/// timestamp, resultado (concedido/denegado), nombre de la var, `file:line` y nombre
+/// del programa. Se audita TODO intento de `reveal` — concedido O denegado (§6.5c) —
+/// para que una redirección de variable hacia un secret fuera de scope quede registrada.
+/// Devuelve Err si no se puede escribir → en el camino CONCEDIDO `reveal()` falla (sin
+/// auditoría no hay revelación, §7).
+fn write_audit_entry(name: &str, loc: &SourceLocation, granted: bool) -> Result<(), String> {
     let dir = audit_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join("reveal.log");
@@ -403,9 +410,11 @@ fn write_audit_entry(name: &str, loc: &SourceLocation) -> Result<(), String> {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| loc.file.clone());
+    let result = if granted { "granted" } else { "denied" };
     let line = format!(
-        "{} reveal name={} at={}:{} program={}\n",
+        "{} reveal result={} name={} at={}:{} program={}\n",
         iso_now(),
+        result,
         name,
         loc.file,
         loc.line,
@@ -466,38 +475,82 @@ pub fn register_secret_builtins(
         );
     }
 
-    // reveal(s) → plaintext. Requiere reveal + audit persistente (fail-loud).
+    // reveal(s) → plaintext. SCOPED por nombre/label (§6.5): exige `reveal("<name>")`
+    // donde <name> es el name/label del secret pasado — NO un `reveal` grueso. Audita
+    // TODO intento (concedido o denegado); en el camino concedido, sin auditoría no hay
+    // revelación (fail-loud). Un secret de bytes se revela como `bytes`; uno de texto
+    // como `text`.
     {
         let caps = caps.clone();
         interp.register_builtin(
             "reveal",
             1,
             Rc::new(move |_i, args, loc| {
-                if !check_cap(&caps, Capability::new(CapabilityType::Reveal, None)) {
-                    return Err(reveal_denied());
-                }
-                match arg(args, 0)? {
-                    SynValue::Secret(inner) => {
-                        // Sin auditoría no hay revelación: si el audit no es escribible,
-                        // reveal() falla (§7).
-                        write_audit_entry(inner.name(), loc).map_err(|e| {
-                            Control::Error(RuntimeError::new(format!(
-                                "reveal(\"{}\") failed: cannot write the audit log ({}). \
-                                 Refusing to reveal without an audit trail.",
-                                inner.name(),
-                                e
-                            )))
-                        })?;
-                        Ok(syn_text(inner.expose()))
+                let inner = match arg(args, 0)? {
+                    SynValue::Secret(inner) => inner,
+                    other => {
+                        return Err(Control::Error(RuntimeError::new(format!(
+                            "reveal() expects a secret, got {}",
+                            other.type_name()
+                        ))))
                     }
-                    other => Err(Control::Error(RuntimeError::new(format!(
-                        "reveal() expects a secret, got {}",
-                        other.type_name()
-                    )))),
+                };
+                let name = inner.name().to_string();
+                // El chequeo evalúa el name del secret QUE SE PASA: redirigir la variable
+                // a otro secret pasa a revelar ESE (con su propio name) y vuelve a chequear.
+                let granted =
+                    check_cap(&caps, Capability::new(CapabilityType::Reveal, Some(name.clone())));
+                if !granted {
+                    // Auditar el intento DENEGADO (best-effort: ya se rechaza igual).
+                    let _ = write_audit_entry(&name, loc, false);
+                    return Err(reveal_denied(&name));
+                }
+                // Concedido: sin auditoría no hay revelación (§7).
+                write_audit_entry(&name, loc, true).map_err(|e| {
+                    Control::Error(RuntimeError::new(format!(
+                        "reveal(\"{}\") failed: cannot write the audit log ({}). \
+                         Refusing to reveal without an audit trail.",
+                        name, e
+                    )))
+                })?;
+                if inner.is_bytes() {
+                    Ok(syn_bytes(inner.expose_bytes().to_vec()))
+                } else {
+                    Ok(syn_text(inner.expose().into_owned()))
                 }
             }),
         );
     }
+
+    // as_secret(value, label?) → sella un valor de runtime YA en mano como `secret`
+    // (taint en el punto de entrada). PURO y sin `require`: no hace I/O y sólo FORTALECE
+    // (no hay acceso nuevo que gatear). Idempotente sobre un secret. Acepta text/bytes;
+    // otros tipos → error claro (sellá el campo sensible, no la estructura). Label NO
+    // sensible para la redacción `secret(<label>)`; default `sealed`.
+    interp.register_builtin(
+        "as_secret",
+        -1,
+        Rc::new(move |_i, args, _loc| {
+            let v = arg(args, 0)?;
+            // Idempotente: un secret se devuelve tal cual (no re-anida, no cambia label).
+            if matches!(v, SynValue::Secret(_)) {
+                return Ok(v.clone());
+            }
+            let label = match args.get(1) {
+                None | Some(SynValue::Nothing) => "sealed".to_string(),
+                Some(l) => raw_str(l),
+            };
+            match v {
+                SynValue::Text(s) => Ok(syn_secret(label, s.to_string())),
+                SynValue::Bytes(b) => Ok(syn_secret_bytes(label, b.to_vec())),
+                other => Err(Control::Error(RuntimeError::new(format!(
+                    "as_secret() expects text or bytes, got {} — seal the sensitive field, \
+                     not the whole structure",
+                    other.type_name()
+                )))),
+            }
+        }),
+    );
 
     // bearer(s) → secret "Bearer <s>". Produce SIEMPRE un secret (tainted), aunque el
     // input sea texto plano: el header Authorization queda redactado en toda salida.
@@ -622,13 +675,18 @@ mod tests {
         // escribir: write_audit_entry no recibe el plaintext — garantía estructural.)
         let dir = std::env::temp_dir().join(format!("syn_audit_{}", unique()));
         std::env::set_var("SYNSEMA_AUDIT_DIR", &dir);
-        write_audit_entry("STRIPE_KEY", &loc).expect("audit should write");
+        write_audit_entry("STRIPE_KEY", &loc, true).expect("audit should write");
         let log = std::fs::read_to_string(dir.join("reveal.log")).unwrap();
         assert!(log.contains("name=STRIPE_KEY"), "log: {}", log);
+        assert!(log.contains("result=granted"), "log: {}", log);
         assert!(log.contains("app.syn:7"), "log: {}", log);
         assert!(log.contains("program=app"), "log: {}", log);
+        // Un intento DENEGADO también se audita (con result=denied).
+        write_audit_entry("ADMIN_KEY", &loc, false).unwrap();
+        let logd = std::fs::read_to_string(dir.join("reveal.log")).unwrap();
+        assert!(logd.contains("result=denied name=ADMIN_KEY"), "log: {}", logd);
         // Append-only: una segunda entrada se agrega (no sobreescribe).
-        write_audit_entry("STRIPE_KEY", &loc).unwrap();
+        write_audit_entry("STRIPE_KEY", &loc, true).unwrap();
         let log2 = std::fs::read_to_string(dir.join("reveal.log")).unwrap();
         assert_eq!(log2.matches("name=STRIPE_KEY").count(), 2);
         let _ = std::fs::remove_dir_all(&dir);
@@ -637,7 +695,7 @@ mod tests {
         let file_path = std::env::temp_dir().join(format!("syn_audit_file_{}", unique()));
         std::fs::write(&file_path, "x").unwrap();
         std::env::set_var("SYNSEMA_AUDIT_DIR", file_path.join("sub"));
-        assert!(write_audit_entry("X", &loc).is_err());
+        assert!(write_audit_entry("X", &loc, true).is_err());
         let _ = std::fs::remove_file(&file_path);
         std::env::remove_var("SYNSEMA_AUDIT_DIR");
     }

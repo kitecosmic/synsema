@@ -106,6 +106,15 @@ pub(crate) fn wire_common_with_state(
     let c = caps.clone();
     interp.set_grant_hook(Rc::new(move |name, scope| {
         if let Some(ty) = capability_type_from_name(name) {
+            // `require reveal` pelado concede reveal para CUALQUIER secret (grueso). Es
+            // compat, pero desaconsejado: preferir `require reveal("NAME")` scopeado al
+            // secret concreto (§6.5b). Warning a stderr, no bloquea.
+            if ty == CapabilityType::Reveal && scope.is_none() {
+                eprintln!(
+                    "synsema: warning: bare `require reveal` permits revealing ANY secret; \
+                     scope it with `require reveal(\"NAME\")` (the name/label of the secret)"
+                );
+            }
             c.borrow_mut().grant(Capability::new(ty, scope.map(|s| s.to_string())));
         }
     }));

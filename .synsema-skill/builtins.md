@@ -95,7 +95,8 @@ n-dimensional f64 arrays (NumPy-equivalent core).
 Resolution for `env`/`secret`: process environ → `.env` → default → else error. Both are deny-by-default and scoped by name (`require env("X")` / `require secret("X")`, or a `X_*` prefix).
 - `env(name, default?)` → plain text config
 - `secret(name, default?)` → an opaque, **redacted** `secret` (LLM-proof; never prints/logs/serializes its value)
-- `reveal(secret)` → plaintext — requires `require reveal`, writes a persistent audit entry, fails if it can't audit. Use sparingly.
+- `as_secret(value, label?)` → seal a **runtime** value (text/bytes) as an opaque `secret`. **No `require`** (pure; only strengthens). Idempotent. For a key that arrives at runtime (e.g. a user's request header), not from config.
+- `reveal(secret)` → plaintext (a bytes-secret reveals as `bytes`) — requires `require reveal("NAME")` **scoped to the secret's name/label**; audits every attempt (granted/denied); fails if it can't audit; bare `require reveal` = any (compat, warns). Use sparingly.
 - `bearer(secret)` → a tainted `Bearer <secret>` header value (materialized only at the socket)
 - `hmac_sha256(data, secret)` → hex MAC (not secret)
 - `verify_hmac(data, signature, secret, algo?)` → bool, constant-time. `algo` = `"sha256"` (default) or `"sha512"`; decodes hex/base64 signatures (Stripe/GitHub/Shopify). SHA-1 is rejected.

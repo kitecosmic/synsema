@@ -136,6 +136,139 @@ print(reveal(s))
 }
 
 // =========================================================
+// as_secret() — sella un valor de runtime como secret (taint en el borde de entrada)
+// =========================================================
+
+#[test]
+fn as_secret_seals_and_propagates_taint() {
+    let src = r#"let s be as_secret("__CANARY__")
+print(s)
+print(text(s))
+print(type_of(s))
+let pre be "tok-" + s
+print(type_of(pre))
+print(pre)
+"#;
+    let r = run_source(&prog(src, 0), "t.syn");
+    assert!(r.success, "errs: {:?}", r.errors);
+    let out = r.output.join("\n");
+    no_canary(&out, "as_secret stdout");
+    // Redacción con label default `sealed` (s, text(s), pre).
+    assert_eq!(
+        r.output.iter().filter(|l| l.as_str() == "secret(sealed)").count(),
+        3,
+        "out: {:?}",
+        r.output
+    );
+    // type_of(secret) == "secret"; el taint propaga en "+" (pre sigue secret).
+    assert_eq!(r.output.iter().filter(|l| l.as_str() == "secret").count(), 2, "out: {:?}", r.output);
+}
+
+#[test]
+fn as_secret_label_idempotent_and_type_errors() {
+    // Label custom en la redacción.
+    let r = run_source("print(as_secret(\"x\", \"user_key\"))\n", "t.syn");
+    assert!(r.success, "{:?}", r.errors);
+    assert!(r.output.contains(&"secret(user_key)".to_string()), "out: {:?}", r.output);
+
+    // Idempotente: sellar dos veces no re-anida ni cambia el label.
+    let r2 = run_source("print(as_secret(as_secret(\"x\", \"user_key\")))\n", "t.syn");
+    assert!(r2.success, "{:?}", r2.errors);
+    assert!(r2.output.contains(&"secret(user_key)".to_string()), "out: {:?}", r2.output);
+
+    // Tipos no text/bytes → error claro (Opción A: sellá el campo, no la estructura).
+    let bad = run_source("print(as_secret(123))\n", "t.syn");
+    assert!(!bad.success, "as_secret(number) debió fallar");
+    assert!(bad.errors.join(" ").contains("expects text or bytes"), "err: {:?}", bad.errors);
+}
+
+#[test]
+fn as_secret_needs_no_capability() {
+    // as_secret es puro y FORTALECE → NO exige `require` (a diferencia de secret()).
+    let r = run_source("let k be as_secret(\"__CANARY__\")\nprint(k)\n".replace("__CANARY__", CANARY).as_str(), "t.syn");
+    assert!(r.success, "as_secret no debe exigir require: {:?}", r.errors);
+    no_canary(&r.output.join("\n"), "as_secret stdout");
+}
+
+// =========================================================
+// reveal() SCOPED por nombre/label (§6.5) — cubre secret() y as_secret()
+// =========================================================
+
+#[test]
+fn reveal_scoped_only_grants_matching_name() {
+    let _g = env_lock();
+    let dir = std::env::temp_dir().join(format!("syn_rev_scope_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::env::set_var("SYNSEMA_AUDIT_DIR", &dir);
+    std::env::set_var("SYNSEMA_ENV_FILE", "");
+
+    // (a) reveal("user_key") SÍ revela un sellado con ese label.
+    let ok = run_source(
+        &prog("require reveal(\"user_key\")\nlet s be as_secret(\"__CANARY__\", \"user_key\")\nprint(reveal(s))\n", 0),
+        "app.syn",
+    );
+    assert!(ok.success, "errs: {:?}", ok.errors);
+    assert!(ok.output.contains(&CANARY.to_string()), "reveal scoped debe devolver plaintext: {:?}", ok.output);
+
+    // (b) el mismo scope NO revela otro label → denegado.
+    let denied = run_source(
+        "require reveal(\"user_key\")\nlet s be as_secret(\"v\", \"other\")\nprint(reveal(s))\n",
+        "app.syn",
+    );
+    assert!(!denied.success, "reveal de otro label debió fallar");
+    assert!(
+        denied.errors.join(" ").contains("Capability not granted: reveal(\"other\")"),
+        "err: {:?}",
+        denied.errors
+    );
+
+    // (c) variable swap: con scope {user_key}, revelar OTRO secret (ADMIN_KEY) falla
+    //     aunque cambies a qué secret apunta la variable (el chequeo usa el name del
+    //     secret pasado). ← el caso que pidió el autor.
+    let swap = run_source(
+        "require secret(\"ADMIN_KEY\")\nrequire reveal(\"user_key\")\nlet a be secret(\"ADMIN_KEY\", \"v\")\nprint(reveal(a))\n",
+        "app.syn",
+    );
+    assert!(!swap.success, "reveal fuera de scope debió fallar");
+    assert!(swap.errors.join(" ").contains("reveal(\"ADMIN_KEY\")"), "err: {:?}", swap.errors);
+
+    // El audit registró los intentos DENEGADOS (result=denied), SIN el valor.
+    let log = std::fs::read_to_string(dir.join("reveal.log")).expect("audit log");
+    assert!(log.contains("result=denied name=other"), "audit denied other: {}", log);
+    assert!(log.contains("result=denied name=ADMIN_KEY"), "audit denied admin: {}", log);
+    assert!(log.contains("result=granted name=user_key"), "audit granted: {}", log);
+    assert!(!log.contains(CANARY), "audit filtró el valor: {}", log);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    std::env::remove_var("SYNSEMA_AUDIT_DIR");
+    std::env::remove_var("SYNSEMA_ENV_FILE");
+}
+
+#[test]
+fn as_secret_bytes_reveal_returns_bytes() {
+    let _g = env_lock();
+    let dir = std::env::temp_dir().join(format!("syn_rev_bytes_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::env::set_var("SYNSEMA_AUDIT_DIR", &dir);
+    std::env::set_var("SYNSEMA_ENV_FILE", "");
+
+    // sha256(...) → bytes; sellarlo da un secret; revelarlo devuelve `bytes` (no text).
+    let src = r#"require reveal("blob")
+let b be as_secret(sha256("data"), "blob")
+print(type_of(b))
+print(type_of(reveal(b)))
+"#;
+    let r = run_source(src, "app.syn");
+    assert!(r.success, "errs: {:?}", r.errors);
+    assert!(r.output.contains(&"secret".to_string()), "sellado debe ser secret: {:?}", r.output);
+    assert!(r.output.contains(&"bytes".to_string()), "reveal de bytes debe devolver bytes: {:?}", r.output);
+
+    let _ = std::fs::remove_dir_all(&dir);
+    std::env::remove_var("SYNSEMA_AUDIT_DIR");
+    std::env::remove_var("SYNSEMA_ENV_FILE");
+}
+
+// =========================================================
 // #6 blackboard entre agentes (swarm) — redactado al compartir
 // =========================================================
 
