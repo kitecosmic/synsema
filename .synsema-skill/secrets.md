@@ -113,6 +113,18 @@ let r be fetch("https://api.stripe.com/v1/charges", "POST",
                {"Authorization": bearer(secret("STRIPE_API_KEY"))}, body)
 ```
 
+```
+-- secret() is NOT Bearer-only: it goes in ANY header. For x-api-key or your own
+-- header, pass the raw secret — it's materialized at the socket (redacted in logs).
+-- bearer(s) is just sugar for the `Authorization: Bearer <token>` format.
+require secret("PROVIDER_KEY")
+require net("api.provider.com")
+let a be http_get("https://api.provider.com/v1/items",
+                  {"x-api-key": secret("PROVIDER_KEY")})          -- custom header
+let b be http_get("https://api.provider.com/v1/items",
+                  {"x-my-own-header": secret("PROVIDER_KEY")})    -- any name works
+```
+
 | Builtin | Returns |
 |---|---|
 | `bearer(s)` | a tainted `Bearer <secret>` auth header value |
@@ -120,9 +132,13 @@ let r be fetch("https://api.stripe.com/v1/charges", "POST",
 | `verify_hmac(data, sig, s, algo?)` | bool, **constant-time** (HMAC-SHA256/512; SHA-1 rejected) |
 | `constant_time_eq(a, b)` | bool, constant-time (accepts a `secret` on either side) |
 
-- A `secret` in an outgoing **header** value (or the result of `bearer()`) is
-  materialized to its real value **only at the socket** — never in your program's
-  value space. In query params and bodies a `secret` is redacted (fail-closed).
+- **Any** outgoing **header** whose value is a `secret` (a raw `secret(...)` /
+  `as_secret(...)`, or the result of `bearer()`) is materialized to its real value
+  **only at the socket** — never in your program's value space. Credentials are **not
+  Bearer-only**: `{"x-api-key": secret("KEY")}` or any custom header works; `bearer(s)`
+  is just sugar for the `Authorization: Bearer <token>` format. In **query params and
+  bodies a `secret` is redacted** (fail-closed) — a credential only survives over the
+  wire inside a header.
 - `verify_hmac` decodes the incoming signature as hex or base64 (covers Stripe,
   GitHub `sha256=…`, Shopify) and compares in constant time.
 - `==` on a `secret` is already constant-time; prefer `constant_time_eq`/`verify_hmac`

@@ -8,20 +8,28 @@ see [builtins.md](builtins.md).
 ## HTTP
 
 ```
--- Full control
+-- Full control. Don't hardcode credentials: pass a `secret` (materialized at the
+-- socket, redacted in logs). bearer() builds the Authorization: Bearer <token> value.
 let r be http("POST", "https://api.store.com/orders",
-    {"Authorization": "Bearer sk-123", "Content-Type": "application/json"},
+    {"Authorization": bearer(secret("STORE_API_KEY")), "Content-Type": "application/json"},
     {"page": "1"},
     {"product": "laptop", "quantity": 1}
 )
 
 -- Shorthands
 let r be http_get("https://api.store.com/products")
-let r be http_get(url, {"Authorization": "Bearer sk-123"}, {"page": "1"})
-let r be http_post(url, {"name": "Alice"}, {"Authorization": "Bearer sk-123"})
+let r be http_get(url, {"Authorization": bearer(secret("STORE_API_KEY"))}, {"page": "1"})
+let r be http_post(url, {"name": "Alice"}, {"Authorization": bearer(secret("STORE_API_KEY"))})
 let r be http_put(url, {"name": "Bob"})
-let r be http_delete(url, {"Authorization": "Bearer sk-123"})
+let r be http_delete(url, {"x-api-key": secret("STORE_API_KEY")})  -- any header, not just Bearer
 ```
+
+> **Credentials go in headers:** pass a `secret` directly as a header value —
+> `{"x-api-key": secret("KEY")}` or any custom header; it's materialized only at the
+> socket and redacted in logs/errors. `bearer(s)` is sugar for `Authorization: Bearer
+> <token>`. For a key that arrives at runtime (not from `.env`), seal it with
+> `as_secret(...)`. In query params and the body a `secret` is **redacted** (fail-closed).
+> See **[secrets.md](secrets.md)**.
 
 **HTTPS works**: `http://` and `https://` are both supported (TLS via `rustls` with the OS
 root CAs — real certificate validation, pure-Rust). So `http_get("https://api.example.com")`
