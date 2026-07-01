@@ -130,6 +130,32 @@ let enriched be sandbox transform(untrusted_data)   -- isolated AND returns a va
 Use it to run untrusted/enriching logic that must NOT touch the network, disk, or any
 capability — only pure computation in, value out.
 
+## Host capability ceiling (`--sandbox` / `--cap-set`) — v0.4.3+
+
+`require`/`sandbox`/`call_tool` all assume you **trust** the code. When you don't — running an
+LLM-generated `.syn`, a user's plugin, a public playground — the **host** imposes a ceiling the code
+can't exceed, no matter what it declares:
+
+```
+synsema run  --sandbox program.syn                 # ceiling = [stdout, time] only
+synsema run  --cap-set "stdout,db=:memory:" program.syn
+synsema test --cap-set "stdout,time,random,secret,file=scratch_*" program.syn
+```
+
+- **`--sandbox`** ≡ `--cap-set "stdout,time"` — compute + `print`, nothing else.
+- **`--cap-set "<list>"`** — comma-separated `name` or `name=scope`. Semantics: `caps_effective ⊆
+  require ∩ ceiling`. A `require net("*")` under `--cap-set "net=api.mock"` grants **nothing** (the
+  ceiling doesn't cover the wildcard) — the code never rises above the ceiling.
+- Applies to `run` and `test`. `--sandbox` and `--cap-set` are mutually exclusive; an unknown name errors.
+- It only ever **removes**, never widens. Auto-grants (`stdout`/`time`/`llm`) are filtered too (so
+  `--sandbox` won't spend your LLM key). It propagates to **agents** and **`parallel_map` workers** — a
+  spawned agent can't exceed the ceiling either.
+- **Scope `file`/`db`:** a bare `--cap-set "…,file"` lets the code read any absolute path; use a prefix
+  like `file=scratch_*` (or `db=:memory:`) so it can only touch what you intend.
+
+This is what makes "run code you don't trust" safe at the language level. For a public deploy, compose
+it with an OS sandbox/container (defense in depth).
+
 ## Invariants
 ```
 invariant: balance > 0              -- checked at runtime, error if false

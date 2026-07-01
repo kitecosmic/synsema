@@ -71,7 +71,7 @@ synsema serve <file> [--secure]
 - Fail-loud: `--tls-auto` with no domain → error; `--tls-auto` together with `--tls-cert` → error; invalid port → error.
 - The flags configure **one** deployment: with **multiple `serve` blocks** in the file they are rejected with a clear error (the common case is a single `serve`).
 
-Canonical pattern — `site.syn` stays dev-clean in the repo:
+Canonical pattern — one servable file, dev-clean in the repo. The **filename is arbitrary**: name it after what the program *is* (`api.syn`, `agent.syn`, `worker.syn`, `app.syn`, …). There is no magic name and nothing is tied to `site` — `synsema serve <anyname>.syn` works:
 
 ```
 require serve(8080)
@@ -79,8 +79,8 @@ serve on 8080
     static "/" from "./public"
     route "GET /" ...
 ```
-- Dev:  `synsema serve site.syn`  → `:8080`, plain HTTP, runs with nothing else.
-- Prod: `synsema serve site.syn --port 443 --domain example.com,www.example.com --tls-auto admin@example.com`
+- Dev:  `synsema serve app.syn`  → `:8080`, plain HTTP, runs with nothing else.
+- Prod: `synsema serve app.syn --port 443 --domain example.com,www.example.com --tls-auto admin@example.com`
 
 > Use `env()`/`secret()` for runtime **values** (DB URL, API keys) and these flags for
 > the **deployment structure** of `serve`. The `serve` block has no `when`/conditionals
@@ -156,8 +156,8 @@ After=network.target
 [Service]
 Type=simple
 # The .syn stays dev-clean (`serve on 8080`, no tls/domain). Prod deployment config
-# lives here as flags — the same file runs locally with just `synsema serve site.syn`.
-ExecStart=/usr/local/bin/synsema serve /opt/agents/site.syn \
+# lives here as flags — the same file runs locally with just `synsema serve app.syn`.
+ExecStart=/usr/local/bin/synsema serve /opt/agents/app.syn \
     --port 443 --domain example.com,www.example.com --tls-auto admin@example.com
 Restart=always
 RestartSec=5
