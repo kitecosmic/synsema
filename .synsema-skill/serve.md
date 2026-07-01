@@ -813,7 +813,15 @@ route "GET /api/*path"
 ```
 
 The target is the base; the incoming path is appended (like nginx `proxy_pass`). Needs a
-`require net "<host>"` capability for the upstream. Forwards status + content-type + body.
+`require net "<host>"` capability for the upstream. Forwards status + content-type + body
+**and the upstream's end-to-end response headers** (`Location`, `Set-Cookie`, `Cache-Control`,
+`ETag`, …), so redirects, cookies and caching work through it; hop-by-hop headers
+(`Connection`, `Transfer-Encoding`, …) are dropped, and invalid upstream headers are skipped
+(never panic the request).
+
+**Proxying a whole site?** `route "GET /*path"` does **not** match the root `/` (the wildcard
+needs ≥1 segment) — declare `route "GET /"` as well, and one route per method you forward
+(GET, POST, …). Full multi-site edge recipe in [deploy.md](deploy.md) ("Multiple sites on one host").
 
 ### Production static files
 

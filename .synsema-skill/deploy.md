@@ -176,6 +176,52 @@ systemctl enable synsema-agent
 systemctl start synsema-agent
 ```
 
+## Multiple sites on one host (Synsema is its own edge proxy)
+
+Two processes can't both bind `:443`, and you **don't need nginx/Caddy**. One Synsema process is the
+**edge**: it terminates TLS for every domain (one SAN cert) and routes by `Host` to each backend, which
+runs plain-HTTP on a private port.
+
+```
+-- edge.syn — TLS + Host routing for every site on the box
+require serve(443)
+require net("127.0.0.1")            -- deny-by-default: the edge only talks to localhost
+
+serve on 443
+    host "example.com"
+        route "GET /"                              -- root: /*path does NOT match "/"
+            proxy to "http://127.0.0.1:8080"
+        route "GET /*path"
+            proxy to "http://127.0.0.1:8080"
+        route "POST /*path"
+            proxy to "http://127.0.0.1:8080"
+    host "docs.example.com"
+        route "GET /"
+            proxy to "http://127.0.0.1:8791"
+        route "GET /*path"
+            proxy to "http://127.0.0.1:8791"
+        route "POST /*path"
+            proxy to "http://127.0.0.1:8791"
+```
+
+Run the edge with a SAN cert for all domains; each backend runs plain-HTTP, localhost-only, with its own
+repo/version/systemd unit:
+
+```bash
+synsema serve edge.syn --port 443 --domain example.com,docs.example.com --tls-auto admin@example.com
+synsema serve app.syn  --port 8080 --bind 127.0.0.1     # backend 1
+synsema serve docs.syn --port 8791 --bind 127.0.0.1     # backend 2
+```
+
+- **Root gotcha:** `route "GET /*path"` needs ≥1 segment — it does **not** match `/`. Add `route "GET /"`
+  too (per method) so the home page reaches the backend.
+- **Per method:** `route` binds method+path — declare each method you forward (GET, POST, …).
+- `proxy to` forwards status + content-type + body **and** the upstream's end-to-end headers (`Location`,
+  `Set-Cookie`, `Cache-Control`, `ETag`, …), so redirects/cookies/caching work through the edge; hop-by-hop
+  are dropped and invalid headers skipped.
+- **Independent deploys:** restart one backend without touching the others; each can even run a different
+  Synsema version behind the same edge.
+
 ## Updating a deployed server (it does NOT auto-update)
 
 A running server does **not** update itself. To roll out a new version:
