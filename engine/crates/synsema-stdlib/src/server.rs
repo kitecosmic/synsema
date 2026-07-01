@@ -1373,14 +1373,19 @@ impl ServeRuntime {
         }
 
         // Reverse proxy (Lote 2): forwardea la request al upstream y devuelve su
-        // respuesta (status + content-type + body verbatim).
+        // respuesta (status + content-type + headers end-to-end + body).
         if let Some(target) = &host.routes[idx].proxy_target {
             return match proxy_forward(target, &ctx) {
-                Ok((status, content_type, body)) => Dispatched::Response {
-                    status,
-                    body: ResponseBody::Raw(RawResponse { body, content_type, status }),
-                    headers: rate_headers,
-                },
+                Ok((status, content_type, mut up_headers, body)) => {
+                    // rate-limit (si hubo) + los end-to-end del upstream.
+                    let mut headers = rate_headers;
+                    headers.append(&mut up_headers);
+                    Dispatched::Response {
+                        status,
+                        body: ResponseBody::Raw(RawResponse { body, content_type, status }),
+                        headers,
+                    }
+                }
                 Err(e) => Dispatched::Response {
                     status: 502,
                     body: self.server_error(&format!("proxy error: {}", e)),
@@ -1446,9 +1451,12 @@ impl ServeRuntime {
 // -- reverse proxy (Lote 2) --
 
 /// Forward sync de la request al upstream `http://host[:port][/base]`. Devuelve
-/// (status, content_type, body). Cliente HTTP/1.1 mínimo (Connection: close); corre
-/// dentro de spawn_blocking, así que bloquear está bien.
-fn proxy_forward(target: &str, ctx: &Ctx) -> Result<(u16, String, Vec<u8>), String> {
+/// (status, content_type, headers end-to-end, body). Cliente HTTP/1.1 mínimo
+/// (Connection: close); corre dentro de spawn_blocking, así que bloquear está bien.
+fn proxy_forward(
+    target: &str,
+    ctx: &Ctx,
+) -> Result<(u16, String, Vec<(String, String)>, Vec<u8>), String> {
     use std::io::Read;
     let rest = target
         .strip_prefix("http://")
@@ -1497,7 +1505,7 @@ fn proxy_forward(target: &str, ctx: &Ctx) -> Result<(u16, String, Vec<u8>), Stri
     parse_proxy_response(&raw)
 }
 
-fn parse_proxy_response(raw: &[u8]) -> Result<(u16, String, Vec<u8>), String> {
+fn parse_proxy_response(raw: &[u8]) -> Result<(u16, String, Vec<(String, String)>, Vec<u8>), String> {
     let pos = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -1513,20 +1521,33 @@ fn parse_proxy_response(raw: &[u8]) -> Result<(u16, String, Vec<u8>), String> {
         .ok_or_else(|| "bad upstream status line".to_string())?;
     let mut content_type = "application/octet-stream".to_string();
     let mut chunked = false;
+    // Headers end-to-end del upstream a reenviar al cliente. Se excluyen: content-type
+    // (se devuelve aparte y hyper lo emite desde head.content_type), los hop-by-hop
+    // (RFC 7230 §6.1) y content-length (hyper lo recalcula, y tras dechunk cambia).
+    let mut headers: Vec<(String, String)> = Vec::new();
     for l in lines {
         if let Some((k, v)) = l.split_once(':') {
             let lk = k.trim().to_lowercase();
             let vv = v.trim();
-            if lk == "content-type" {
-                content_type = vv.to_string();
-            } else if lk == "transfer-encoding" && vv.to_lowercase().contains("chunked") {
-                chunked = true;
+            match lk.as_str() {
+                "content-type" => content_type = vv.to_string(),
+                "transfer-encoding" => {
+                    if vv.to_lowercase().contains("chunked") {
+                        chunked = true;
+                    }
+                }
+                "content-length" | "connection" | "keep-alive" | "proxy-authenticate"
+                | "proxy-authorization" | "te" | "trailer" | "upgrade" => {}
+                // Todo lo demás end-to-end (Location, Set-Cookie [cada ocurrencia],
+                // Cache-Control, ETag, Last-Modified, Vary, WWW-Authenticate,
+                // Content-Encoding, X-*, …). Se preserva el casing original de la clave.
+                _ => headers.push((k.trim().to_string(), vv.to_string())),
             }
         }
     }
     let body_raw = &raw[body_start..];
     let body = if chunked { dechunk(body_raw) } else { body_raw.to_vec() };
-    Ok((status, content_type, body))
+    Ok((status, content_type, headers, body))
 }
 
 /// De-chunk de un body `Transfer-Encoding: chunked`.
@@ -2778,8 +2799,17 @@ async fn handle_request(
     if head.hsts {
         builder = builder.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
     }
+    // Validar cada header extra y saltear los inválidos: al reenviar headers
+    // arbitrarios del upstream (reverse proxy), un valor malformado (p. ej. con un
+    // byte de control) envenenaría el builder y haría panic en `.body(...).unwrap()`.
+    // Un reverse proxy no debe caerse por datos del upstream → se descarta (como nginx).
     for (k, v) in &head.extra {
-        builder = builder.header(k, v);
+        if let (Ok(name), Ok(val)) = (
+            hyper::http::header::HeaderName::try_from(k.as_str()),
+            hyper::http::header::HeaderValue::try_from(v.as_str()),
+        ) {
+            builder = builder.header(name, val);
+        }
     }
 
     let mut body_rx = body_rx;
