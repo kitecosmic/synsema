@@ -272,6 +272,7 @@ fn run_inner(
     secure: bool,
     swarm: Option<Arc<Swarm>>,
     live_output: bool,
+    ceiling: Option<Vec<Capability>>,
 ) -> RunResult {
     match parse_source(source, filename) {
         Err(CompileError::Lex(e)) => RunResult {
@@ -290,6 +291,13 @@ fn run_inner(
             // (flush/read_line no drenan a stdout). Ver DE-019.
             interp.live_output = live_output;
             let caps = Rc::new(RefCell::new(CapabilitySet::new("program")));
+            // Techo del host (--sandbox/--cap-set): setear ANTES de wire_common para que los
+            // auto-grants (stdout/time/llm) también se filtren. Se propaga a los agentes
+            // swarm como `Arc` (Send) más abajo.
+            if let Some(cl) = &ceiling {
+                caps.borrow_mut().ceiling = Some(Rc::new(cl.clone()));
+            }
+            let ceiling_arc: Option<Arc<Vec<Capability>>> = ceiling.map(Arc::new);
             let progress = Rc::new(RefCell::new(ProgressManager::new()));
             let memory = Rc::new(RefCell::new(AgentMemory::new()));
             wire_common_with_state(&mut interp, &caps, secure, progress.clone(), memory.clone());
@@ -298,9 +306,10 @@ fn run_inner(
             wire_real_llm_provider(&mut interp);
 
             // Swarm real (DE-011): los hooks de spawn/share/observe/signal/wait_for del
-            // main van al swarm compartido → los agentes corren en hilos aislados.
+            // main van al swarm compartido → los agentes corren en hilos aislados. El techo
+            // del host se propaga a cada agente spawneado (nunca lo exceden).
             if let Some(sw) = swarm {
-                wire_swarm_hooks(&mut interp, sw, "main");
+                wire_swarm_hooks(&mut interp, sw, "main", ceiling_arc.clone());
             }
 
             // StatePersistence cross-run (espeja engine.run_source del oráculo): para
@@ -383,7 +392,7 @@ fn spawn_run(source: &str, filename: &str, secure: bool) -> RunResult {
     let fname = filename.to_string();
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_inner(&src, &fname, secure, None, false))
+        .spawn(move || run_inner(&src, &fname, secure, None, false, None))
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|_| RunResult {
@@ -422,13 +431,20 @@ fn collect_agent_errors(swarm: &Swarm) -> Vec<String> {
 }
 
 pub fn run_program(source: &str, filename: &str) -> RunResult {
+    run_program_ceiled(source, filename, None)
+}
+
+/// Como `run_program` pero con un **techo de capabilities del host** opcional
+/// (`--sandbox`/`--cap-set`): el programa y todos los agentes que spawnee jamás exceden
+/// `ceiling`. `None` = sin techo (idéntico a `run_program`).
+pub fn run_program_ceiled(source: &str, filename: &str, ceiling: Option<Vec<Capability>>) -> RunResult {
     let swarm = Arc::new(Swarm::new());
     let sw = swarm.clone();
     let src = source.to_string();
     let fname = filename.to_string();
     let mut result = std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_inner(&src, &fname, false, Some(sw), true))
+        .spawn(move || run_inner(&src, &fname, false, Some(sw), true, ceiling))
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|_| RunResult {
@@ -471,7 +487,7 @@ fn report_with_failure(name: &str, message: String) -> TestReport {
     }
 }
 
-fn run_tests_inner(source: &str, filename: &str) -> TestReport {
+fn run_tests_inner(source: &str, filename: &str, ceiling: Option<Vec<Capability>>) -> TestReport {
     let program = match parse_source(source, filename) {
         Ok(p) => p,
         Err(CompileError::Lex(e)) => return report_with_failure("<parse>", format!("Lexer error: {}", e)),
@@ -479,6 +495,10 @@ fn run_tests_inner(source: &str, filename: &str) -> TestReport {
     };
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("program")));
+    // Techo del host (--sandbox/--cap-set): antes de wire_common para filtrar los auto-grants.
+    if let Some(cl) = &ceiling {
+        caps.borrow_mut().ceiling = Some(Rc::new(cl.clone()));
+    }
     let progress = Rc::new(RefCell::new(ProgressManager::new()));
     let memory = Rc::new(RefCell::new(AgentMemory::new()));
     // Wiring no-secure (igual que `run`): los `require` del archivo conceden capabilities (G4).
@@ -491,11 +511,16 @@ fn run_tests_inner(source: &str, filename: &str) -> TestReport {
 
 /// Corre los bloques `test` de un archivo en un hilo con stack grande (como `spawn_run`).
 pub fn run_tests(source: &str, filename: &str) -> TestReport {
+    run_tests_ceiled(source, filename, None)
+}
+
+/// Como `run_tests` pero con un techo de capabilities del host (`--sandbox`/`--cap-set`).
+pub fn run_tests_ceiled(source: &str, filename: &str, ceiling: Option<Vec<Capability>>) -> TestReport {
     let src = source.to_string();
     let fname = filename.to_string();
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_tests_inner(&src, &fname))
+        .spawn(move || run_tests_inner(&src, &fname, ceiling))
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|_| {
@@ -553,7 +578,7 @@ pub struct DiagRun {
 /// Como `run_program` pero capturando el diagnóstico rico del error del MAIN. Si `swarm`
 /// es `Some`, los `spawn` corren en hilos aislados (DE-014): un error de agente NO se
 /// propaga al main; lo refleja el caller tras `wait_all` (en `run_with_diagnostics`).
-fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>) -> DiagRun {
+fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>, ceiling: Option<Vec<Capability>>) -> DiagRun {
     use crate::error_reporter::ErrorReporter;
     let program = match parse_source(source, filename) {
         Ok(p) => p,
@@ -576,11 +601,16 @@ fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>) -> Di
     // Camino de `run --explain` (interactivo): salida en vivo (DE-019).
     interp.live_output = true;
     let caps = Rc::new(RefCell::new(CapabilitySet::new("program")));
+    // Techo del host: antes de wire_common (filtra auto-grants); a los agentes como Arc.
+    if let Some(cl) = &ceiling {
+        caps.borrow_mut().ceiling = Some(Rc::new(cl.clone()));
+    }
+    let ceiling_arc: Option<Arc<Vec<Capability>>> = ceiling.map(Arc::new);
     wire_common(&mut interp, &caps, false);
     // Swarm real (DE-014): mismos hooks que `run` → los agentes corren aislados y un
     // `raise` de agente no aborta el main ni trunca su diagnóstico.
     if let Some(sw) = swarm {
-        wire_swarm_hooks(&mut interp, sw, "main");
+        wire_swarm_hooks(&mut interp, sw, "main", ceiling_arc.clone());
     }
     match interp.execute(&program) {
         Ok(_) => DiagRun {
@@ -622,13 +652,19 @@ fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>) -> Di
 /// reflejan tras `wait_all` como líneas `Agent error [<id>]` + `success=false`, igual que
 /// `run_program`. El diagnóstico rico sigue siendo el del error del MAIN.
 pub fn run_with_diagnostics(source: &str, filename: &str) -> DiagRun {
+    run_with_diagnostics_ceiled(source, filename, None)
+}
+
+/// Como `run_with_diagnostics` pero con un techo de capabilities del host
+/// (`--sandbox`/`--cap-set`): el main y sus agentes jamás exceden `ceiling`.
+pub fn run_with_diagnostics_ceiled(source: &str, filename: &str, ceiling: Option<Vec<Capability>>) -> DiagRun {
     let swarm = Arc::new(Swarm::new());
     let sw = swarm.clone();
     let src = source.to_string();
     let fname = filename.to_string();
     let mut run = std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_diag_inner(&src, &fname, Some(sw)))
+        .spawn(move || run_diag_inner(&src, &fname, Some(sw), ceiling))
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|_| DiagRun {
@@ -790,7 +826,12 @@ pub fn run_with_llm_steps(source: &str, filename: &str, steps: Vec<LlmStepRespon
 
 /// Cablea los hooks del swarm en un intérprete (capturando el `Arc<Swarm>` y el
 /// nombre del agente para las escrituras al blackboard).
-pub(crate) fn wire_swarm_hooks(interp: &mut Interpreter, swarm: Arc<Swarm>, agent_name: &str) {
+pub(crate) fn wire_swarm_hooks(
+    interp: &mut Interpreter,
+    swarm: Arc<Swarm>,
+    agent_name: &str,
+    ceiling: Option<Arc<Vec<Capability>>>,
+) {
     let name = agent_name.to_string();
 
     let share: Rc<dyn Fn(&str, &SynValue)> = {
@@ -826,6 +867,7 @@ pub(crate) fn wire_swarm_hooks(interp: &mut Interpreter, swarm: Arc<Swarm>, agen
         dyn Fn(&str, Vec<Node>, Vec<(String, SynValue)>, Vec<(String, SynValue)>) -> Result<String, Control>,
     > = {
         let sw = swarm.clone();
+        let ceiling = ceiling.clone();
         Rc::new(move |agent, body, args, globals| {
             let send_args: Vec<(String, SendValue)> =
                 args.iter().map(|(k, v)| (k.clone(), to_send(v))).collect();
@@ -833,7 +875,9 @@ pub(crate) fn wire_swarm_hooks(interp: &mut Interpreter, swarm: Arc<Swarm>, agen
             let global_snap: Arc<Vec<(String, GlobalVal)>> = Arc::new(
                 globals.iter().map(|(k, v)| (k.clone(), val_to_global(v))).collect(),
             );
-            Ok(spawn_agent(sw.clone(), agent.to_string(), body, send_args, global_snap))
+            // El techo del host se propaga al agente (Arc → Send cruza el hilo): un agente
+            // spawneado jamás excede el techo, aunque su cuerpo declare `require exec(...)`.
+            Ok(spawn_agent(sw.clone(), agent.to_string(), body, send_args, global_snap, ceiling.clone()))
         })
     };
 
@@ -843,11 +887,17 @@ pub(crate) fn wire_swarm_hooks(interp: &mut Interpreter, swarm: Arc<Swarm>, agen
 /// Crea un intérprete con el wiring común + los hooks del swarm.
 /// El `log_hook` manda los `log` del agente a stdout del proceso principal en tiempo
 /// real — así los agentes no son silenciosos durante el desarrollo.
-fn setup_swarm_interpreter(swarm: Arc<Swarm>, agent_name: &str) -> Interpreter {
+fn setup_swarm_interpreter(swarm: Arc<Swarm>, agent_name: &str, ceiling: Option<Arc<Vec<Capability>>>) -> Interpreter {
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("agent")));
+    // Techo del host: antes de wire_common (filtra los auto-grants stdout/time/llm del
+    // agente). El `Arc` compartido se reconvierte a `Rc` local del hilo del agente.
+    if let Some(cl) = &ceiling {
+        caps.borrow_mut().ceiling = Some(Rc::new((**cl).clone()));
+    }
     wire_common(&mut interp, &caps, false);
-    wire_swarm_hooks(&mut interp, swarm, agent_name);
+    // Propaga el techo a los sub-agentes que este agente pudiera spawnear.
+    wire_swarm_hooks(&mut interp, swarm, agent_name, ceiling);
     let name = agent_name.to_string();
     interp.log_hook = Some(Arc::new(move |line: &str| {
         println!("[{}] {}", name, line);
@@ -864,6 +914,7 @@ fn spawn_agent(
     body: Vec<Node>,
     send_args: Vec<(String, SendValue)>,
     globals: Arc<Vec<(String, GlobalVal)>>,
+    ceiling: Option<Arc<Vec<Capability>>>,
 ) -> String {
     let instance_id = swarm.register_new_agent(&agent_name);
     let sw = swarm.clone();
@@ -872,7 +923,7 @@ fn spawn_agent(
         .name(id.clone())
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
-            let mut interp = setup_swarm_interpreter(sw.clone(), &id);
+            let mut interp = setup_swarm_interpreter(sw.clone(), &id, ceiling);
             // Restaurar tareas y valores del top-level para que el agente
             // los pueda llamar directamente sin necesitar HTTP.
             rebuild_globals(&mut interp, &globals);
@@ -912,7 +963,7 @@ fn run_swarm_inner(source: &str, filename: &str, swarm: Arc<Swarm>) -> RunResult
             errors: vec![format!("Parse error: {}", e)],
         },
         Ok(program) => {
-            let mut interp = setup_swarm_interpreter(swarm, "main");
+            let mut interp = setup_swarm_interpreter(swarm, "main", None);
             let r = interp.execute(&program);
             finish(interp, r)
         }

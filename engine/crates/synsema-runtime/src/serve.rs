@@ -553,7 +553,9 @@ fn build_base_interp(
             c.grant(cap.clone());
         }
     }
-    wire_swarm_hooks(&mut interp, swarm, "request");
+    // El techo del host (--sandbox/--cap-set) aún no se extiende a `serve` (extensión
+    // posterior); los intérpretes de request corren sin techo (comportamiento actual).
+    wire_swarm_hooks(&mut interp, swarm, "request", None);
     register_database_builtins(&interp, shared_db, caps.clone());
     rebuild_globals(&mut interp, snapshot);
     (interp, caps)
@@ -1603,7 +1605,8 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     register_serve_progress_builtins(&interp, shared_progress.clone(), persist_progress.clone());
 
     let swarm = Arc::new(Swarm::new());
-    wire_swarm_hooks(&mut interp, swarm.clone(), "main");
+    // Techo del host (--sandbox/--cap-set) aún no se extiende a `serve` (extensión posterior).
+    wire_swarm_hooks(&mut interp, swarm.clone(), "main", None);
     // db compartida: el top-level abre/crea tablas; los handlers (en sus hilos) la
     // comparten vía Arc<Mutex>. Sobrescribe la db fresca que dejó wire_common.
     let shared_db: SharedDb = Arc::new(Mutex::new(DatabaseManager::new()));

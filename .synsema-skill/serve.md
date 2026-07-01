@@ -178,6 +178,12 @@ on the mode:
 
 This applies to **all** uncaught 500s, not just templates.
 
+### Request logging (the terminal is quiet by default)
+
+`serve` does **not** write an access log — add a `log` in your handlers to see requests live:
+`log "GET " + (path of request)` shows as `[serve] [LOG] GET /…` in the server terminal. Both
+`log` and `print` reach it with a `[serve]` prefix. See [observability.md](observability.md#logging-under-serve-and-where-it-shows-up).
+
 ## Serving web pages (HTML, static files, CORS)
 
 `serve` is not only a JSON API — it can serve a real web app: HTML responses,

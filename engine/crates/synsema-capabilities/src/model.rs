@@ -270,6 +270,12 @@ pub struct CapabilitySet {
     pub denied: HashSet<Capability>,
     pub audit_log: Vec<CapabilityAuditEntry>,
     pub parent: Option<Rc<RefCell<CapabilitySet>>>,
+    /// Techo de capabilities impuesto por el HOST (`--sandbox`/`--cap-set`): un grant sólo
+    /// se concede si ALGUNA de estas capabilities lo cubre (fail-closed). `None` = sin techo
+    /// (comportamiento por defecto, byte-idéntico a antes). El techo sólo RESTA, nunca
+    /// amplía: `caps_efectivas ⊆ require ∩ techo`. Se propaga (`Rc::clone`, barato) a todo
+    /// set derivado (hijo/sandbox/worker/agente) para que su `grant()`/`check()` lo honren.
+    pub ceiling: Option<Rc<Vec<Capability>>>,
 }
 
 impl CapabilitySet {
@@ -280,10 +286,32 @@ impl CapabilitySet {
             denied: HashSet::new(),
             audit_log: Vec::new(),
             parent: None,
+            ceiling: None,
+        }
+    }
+
+    /// ¿La capability cae DENTRO del techo del host? Reusa el mismo `covers()` que gate los
+    /// `require` (misma canonización de rutas/URLs, mismo cierre de bypass `..`/glob), así no
+    /// hay una segunda lógica de scopes que pueda divergir. Sin techo (`None`) → siempre true.
+    fn within_ceiling(&self, cap: &Capability) -> bool {
+        match &self.ceiling {
+            None => true,
+            Some(c) => c.iter().any(|allowed| allowed.covers(cap)),
         }
     }
 
     pub fn grant(&mut self, capability: Capability) {
+        // Fail-closed: si el host puso un techo y no cubre esta capability, NO se inserta
+        // (el techo nunca amplía). Se audita el rechazo. Sin techo → inserta como siempre.
+        if !self.within_ceiling(&capability) {
+            self.audit_log.push(CapabilityAuditEntry {
+                capability,
+                granted: false,
+                source: "ceiling".to_string(),
+                reason: "above host ceiling (--sandbox/--cap-set)".to_string(),
+            });
+            return;
+        }
         self.granted.insert(capability);
     }
 
@@ -303,6 +331,21 @@ impl CapabilitySet {
                 granted: false,
                 source: source.to_string(),
                 reason: format!("Explicitly denied by {}", d),
+            });
+            return false;
+        }
+
+        // 1.5) Techo del host (defense-in-depth, autoritativo): un USO por encima del techo
+        // se deniega SIEMPRE, aunque un grant (propio o heredado del padre) lo cubriera.
+        // `grant()` ya evita insertar por encima del techo; esto cierra cualquier fuga de un
+        // set derivado que hubiera colado un grant. Sólo corre si hay techo (`is_some`) → el
+        // hot-path por defecto (`ceiling = None`) no paga nada.
+        if self.ceiling.is_some() && !self.within_ceiling(requested) {
+            self.audit_log.push(CapabilityAuditEntry {
+                capability: requested.clone(),
+                granted: false,
+                source: source.to_string(),
+                reason: "Above host ceiling (--sandbox/--cap-set)".to_string(),
             });
             return false;
         }
@@ -349,7 +392,8 @@ impl CapabilitySet {
         Ok(())
     }
 
-    /// Crea un hijo que SÍ hereda del padre (cadena de scopes).
+    /// Crea un hijo que SÍ hereda del padre (cadena de scopes). El techo del host se
+    /// PROPAGA al hijo (`Rc::clone`): un contexto derivado jamás excede el techo.
     pub fn create_child(parent: &Rc<RefCell<CapabilitySet>>, name: &str) -> CapabilitySet {
         CapabilitySet {
             name: name.to_string(),
@@ -357,13 +401,16 @@ impl CapabilitySet {
             denied: HashSet::new(),
             audit_log: Vec::new(),
             parent: Some(parent.clone()),
+            ceiling: parent.borrow().ceiling.clone(),
         }
     }
 
     /// Crea un sandbox restringido que NO hereda: sólo los grants explícitos.
-    /// (Ignora `self`, igual que el oráculo.)
+    /// (Ignora `self`, igual que el oráculo.) El techo del host SÍ se propaga (`Rc::clone`):
+    /// el sandbox nunca puede conceder por encima del techo, aunque el grant sea explícito.
     pub fn create_sandbox(&self, name: &str, allowed: &[Capability]) -> CapabilitySet {
         let mut sandbox = CapabilitySet::new(&format!("sandbox:{}", name));
+        sandbox.ceiling = self.ceiling.clone();
         for cap in allowed {
             sandbox.grant(cap.clone());
         }
@@ -599,5 +646,97 @@ mod tests {
         assert_eq!(cs.audit_log.len(), 2);
         assert!(cs.audit_log[0].granted);
         assert!(!cs.audit_log[1].granted);
+    }
+
+    // ---- Techo del host (--sandbox / --cap-set) ----
+
+    fn ceil(caps: Vec<Capability>) -> Option<Rc<Vec<Capability>>> {
+        Some(Rc::new(caps))
+    }
+
+    #[test]
+    fn ceiling_none_is_identity() {
+        // Regresión cero: sin techo, grant/check son idénticos a antes.
+        let mut cs = CapabilitySet::new("test");
+        assert!(cs.ceiling.is_none());
+        cs.grant(cap(CapabilityType::Exec, None));
+        assert!(cs.check(&cap(CapabilityType::Exec, Some("ls")), ""));
+    }
+
+    #[test]
+    fn ceiling_blocks_grant_above_it() {
+        // --sandbox ≡ techo [stdout, time]: un grant de exec NO se concede (ni se inserta).
+        let mut cs = CapabilitySet::new("program");
+        cs.ceiling = ceil(vec![
+            cap(CapabilityType::Stdout, None),
+            cap(CapabilityType::Time, None),
+        ]);
+        cs.grant(cap(CapabilityType::Exec, None)); // require exec("...")
+        assert!(!cs.check(&cap(CapabilityType::Exec, Some("ls")), ""), "exec fuera del techo");
+        assert!(cs.granted.is_empty(), "no se inserta por encima del techo");
+        // stdout/time SÍ (están en el techo).
+        cs.grant(cap(CapabilityType::Stdout, None));
+        cs.grant(cap(CapabilityType::Time, None));
+        assert!(cs.check(&cap(CapabilityType::Stdout, None), ""));
+        assert!(cs.check(&cap(CapabilityType::Time, None), ""));
+    }
+
+    #[test]
+    fn ceiling_check_is_authoritative_even_if_granted_leaks() {
+        // Red de seguridad: aunque un set derivado cuele un grant DIRECTO por encima del
+        // techo (evitando grant()), el USO se deniega en check().
+        let mut cs = CapabilitySet::new("leaky");
+        cs.ceiling = ceil(vec![cap(CapabilityType::Stdout, None)]);
+        cs.granted.insert(cap(CapabilityType::Exec, None)); // fuga: insert directo
+        assert!(!cs.check(&cap(CapabilityType::Exec, Some("rm")), ""), "check autoritativo");
+    }
+
+    #[test]
+    fn ceiling_blocks_scope_escalation() {
+        // --cap-set "net=api.mock.test" + require net("*") → net("*") NO se concede (el
+        // techo no lo cubre); ningún fetch supera el techo.
+        let mut cs = CapabilitySet::new("program");
+        cs.ceiling = ceil(vec![cap(CapabilityType::Net, Some("api.mock.test"))]);
+        cs.grant(cap(CapabilityType::Net, Some("*"))); // wildcard: no lo cubre el techo
+        assert!(!cs.check(&cap(CapabilityType::Net, Some("evil.com")), ""));
+        assert!(!cs.check(&cap(CapabilityType::Net, Some("api.mock.test")), ""), "ni el propio host, no se concedió nada");
+        // En cambio, un require ACOTADO al techo sí funciona.
+        cs.grant(cap(CapabilityType::Net, Some("api.mock.test")));
+        assert!(cs.check(&cap(CapabilityType::Net, Some("api.mock.test")), ""));
+    }
+
+    #[test]
+    fn ceiling_db_scoped_blocks_other_paths() {
+        // --cap-set "db=:memory:": db(:memory:) OK; cualquier otra ruta/URL denegada.
+        let mut cs = CapabilitySet::new("program");
+        cs.ceiling = ceil(vec![cap(CapabilityType::Db, Some(":memory:"))]);
+        cs.grant(cap(CapabilityType::Db, Some(":memory:")));
+        assert!(cs.check(&cap(CapabilityType::Db, Some(":memory:")), ""));
+        // require db("./real.db") por encima del techo → no se concede.
+        cs.grant(cap(CapabilityType::Db, Some("./real.db")));
+        assert!(!cs.check(&cap(CapabilityType::Db, Some("./real.db")), ""));
+        // require db (wildcard, sin scope) tampoco escala.
+        cs.grant(cap(CapabilityType::Db, None));
+        assert!(!cs.check(&cap(CapabilityType::Db, Some("./real.db")), ""));
+    }
+
+    #[test]
+    fn ceiling_propagates_to_child() {
+        let parent = Rc::new(RefCell::new(CapabilitySet::new("parent")));
+        parent.borrow_mut().ceiling = ceil(vec![cap(CapabilityType::Stdout, None)]);
+        let mut child = CapabilitySet::create_child(&parent, "child");
+        assert!(child.ceiling.is_some());
+        child.grant(cap(CapabilityType::Exec, None));
+        assert!(!child.check(&cap(CapabilityType::Exec, Some("ls")), ""), "el hijo hereda el techo");
+    }
+
+    #[test]
+    fn ceiling_propagates_to_sandbox() {
+        let mut parent = CapabilitySet::new("parent");
+        parent.ceiling = ceil(vec![cap(CapabilityType::Stdout, None)]);
+        // Grant explícito de exec al sandbox: aun así el techo lo bloquea.
+        let mut sandbox = parent.create_sandbox("restricted", &[cap(CapabilityType::Exec, None)]);
+        assert!(sandbox.ceiling.is_some());
+        assert!(!sandbox.check(&cap(CapabilityType::Exec, Some("ls")), ""), "el sandbox nunca excede el techo");
     }
 }

@@ -68,9 +68,16 @@ fn build_worker_interp(
     granted: &[Capability],
     denied: &[Capability],
     secure: bool,
+    ceiling: &Option<Arc<Vec<Capability>>>,
 ) -> Interpreter {
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("parallel")));
+    // Techo del host (--sandbox/--cap-set): setear ANTES de grants/wire_common. Así el
+    // task del worker no puede reconceder por encima del techo (un `require exec(...)` en
+    // su cuerpo llega al grant_hook y se filtra). El `Arc` compartido → `Rc` local del worker.
+    if let Some(cl) = ceiling {
+        caps.borrow_mut().ceiling = Some(Rc::new((**cl).clone()));
+    }
     {
         let mut c = caps.borrow_mut();
         for cap in granted {
@@ -126,6 +133,7 @@ fn run_parallel(
     items: Vec<SendValue>,
     limit: usize,
     secure: bool,
+    ceiling: Option<Arc<Vec<Capability>>>,
 ) -> Result<Vec<SendValue>, RuntimeError> {
     let n = items.len();
     if n == 0 {
@@ -161,6 +169,7 @@ fn run_parallel(
             let globals = globals.clone();
             let granted = granted.clone();
             let denied = denied.clone();
+            let ceiling = ceiling.clone();
             let task_snap = task_snap.clone();
             let items = items.clone();
             let aborted = aborted.clone();
@@ -170,7 +179,7 @@ fn run_parallel(
                 if aborted.load(Ordering::Relaxed) {
                     return None;
                 }
-                let mut interp = build_worker_interp(&globals, &granted, &denied, secure);
+                let mut interp = build_worker_interp(&globals, &granted, &denied, secure, &ceiling);
                 let task_value = reconstruct_task(&interp, &task_snap);
                 let item = from_send(&items[i]);
                 match interp.call_task(task_value, vec![item]) {
@@ -274,6 +283,10 @@ pub fn register_parallel_builtins(interp: &Interpreter, caps: &Rc<RefCell<Capabi
             let globals = snapshot_globals(i);
             let granted: Vec<Capability> = caps.borrow().granted.iter().cloned().collect();
             let denied: Vec<Capability> = caps.borrow().denied.iter().cloned().collect();
+            // Techo del host: se snapshotea del set del padre y se propaga a cada worker
+            // (Arc → cruza a los hilos de tokio). Sin techo → None (comportamiento actual).
+            let ceiling: Option<Arc<Vec<Capability>>> =
+                caps.borrow().ceiling.as_ref().map(|rc| Arc::new((**rc).clone()));
             let items: Vec<SendValue> = list.iter().map(to_send).collect();
             match run_parallel(
                 globals,
@@ -283,6 +296,7 @@ pub fn register_parallel_builtins(interp: &Interpreter, caps: &Rc<RefCell<Capabi
                 items,
                 limit,
                 secure,
+                ceiling,
             ) {
                 Ok(results) => Ok(syn_list(results.iter().map(from_send).collect())),
                 Err(re) => Err(Control::Error(re)),

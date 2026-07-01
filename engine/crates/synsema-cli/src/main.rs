@@ -13,15 +13,63 @@
 use std::process::ExitCode;
 
 // El conform usa el motor (runtime): intérprete + modelo de seguridad cableado.
+use synsema_capabilities::model::{capability_type_from_name, Capability, CapabilityType};
 use synsema_runtime::daemon;
 use synsema_runtime::engine::{
-    repl, run_program, run_source, run_swarm_dump, run_tests, run_with_diagnostics, TestReport,
+    repl, run_program_ceiled, run_source, run_swarm_dump, run_tests_ceiled,
+    run_with_diagnostics_ceiled, TestReport,
 };
 use synsema_runtime::serve::{run_serve_program_with_overrides, ServeOverrides};
 
 mod update;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] | test [-v] <archivo|dir> | check | tokens | ast | repl | daemon | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] | test [-v] [--sandbox | --cap-set <list>] <archivo|dir> | check | tokens | ast | repl | daemon | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
+
+/// Construye el techo de capabilities del host desde `--sandbox`/`--cap-set` (defense-in-depth:
+/// el operador impone un límite que el código ejecutado no puede exceder, sin importar qué
+/// `require`). `--sandbox` ≡ techo `[stdout, time]` (sólo cómputo + `print`). `--cap-set` parsea
+/// items separados por coma: `name` (wildcard, sin scope) o `name=scope`. Son mutuamente
+/// excluyentes. Devuelve `Ok(None)` cuando no hay ninguno (comportamiento por defecto, sin techo).
+fn build_ceiling(sandbox: bool, cap_set: Option<&str>) -> Result<Option<Vec<Capability>>, String> {
+    match (sandbox, cap_set) {
+        (true, Some(_)) => {
+            Err("--sandbox and --cap-set are mutually exclusive; choose one".to_string())
+        }
+        // Techo mínimo: cómputo + stdout (print) + time (now/sleep). Nada de net/exec/file/llm/…
+        (true, None) => Ok(Some(vec![
+            Capability::new(CapabilityType::Stdout, None),
+            Capability::new(CapabilityType::Time, None),
+        ])),
+        (false, Some(list)) => {
+            let mut caps = Vec::new();
+            for item in list.split(',') {
+                let item = item.trim();
+                if item.is_empty() {
+                    continue;
+                }
+                // `name=scope` (net=api.mock.test, db=:memory:, file.read=./data/*) o `name`.
+                let (name, scope) = match item.split_once('=') {
+                    Some((n, s)) => (n.trim(), Some(s.trim().to_string())),
+                    None => (item, None),
+                };
+                match capability_type_from_name(name) {
+                    Some(ty) => caps.push(Capability::new(ty, scope)),
+                    None => {
+                        return Err(format!(
+                            "--cap-set: unknown capability '{}'. Known: net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal",
+                            name
+                        ))
+                    }
+                }
+            }
+            if caps.is_empty() {
+                return Err("--cap-set requires at least one capability".to_string());
+            }
+            Ok(Some(caps))
+        }
+        (false, None) => Ok(None),
+    }
+}
 
 /// Serializa un mapa (clave→string) como objeto JSON ordenado.
 fn json_obj(pairs: Vec<(String, String)>) -> String {
@@ -261,12 +309,29 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let mut flat = false;
     let mut explain = false;
     let mut fmt_json = false; // --format json (sólo aplica con --explain)
+    let mut sandbox = false; // --sandbox: techo [stdout, time]
+    let mut cap_set: Option<String> = None; // --cap-set "<list>": techo explícito
     let mut path: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--flat" => flat = true,
             "--explain" => explain = true,
+            "--sandbox" => sandbox = true,
+            // `--cap-set <list>` con lookahead, y forma `--cap-set=<list>`.
+            "--cap-set" => match args.get(i + 1) {
+                Some(v) => {
+                    cap_set = Some(v.clone());
+                    i += 1;
+                }
+                None => {
+                    eprintln!("synsema run: --cap-set requires a value (e.g. \"stdout,net=api.example.com\")");
+                    return ExitCode::from(2);
+                }
+            },
+            p if p.starts_with("--cap-set=") => {
+                cap_set = Some(p.trim_start_matches("--cap-set=").to_string());
+            }
             "--format=json" => fmt_json = true,
             "--format=human" => fmt_json = false,
             // `--format <valor>` con lookahead, igual que `--env-file`.
@@ -326,10 +391,19 @@ fn cmd_run(args: &[String]) -> ExitCode {
         source = synsema_core::flat_syntax::translate_flat(&source);
     }
 
+    // Techo de capabilities del host (--sandbox/--cap-set): opt-in, defense-in-depth.
+    let ceiling = match build_ceiling(sandbox, cap_set.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("synsema run: {}", e);
+            return ExitCode::from(2);
+        }
+    };
+
     // Camino opt-in: diagnóstico rico. Reusa la API pública del runtime; el default
     // (línea corta) queda intacto más abajo para no romper scripting/CI.
     if explain {
-        let run = run_with_diagnostics(&source, &path);
+        let run = run_with_diagnostics_ceiled(&source, &path, ceiling);
         for line in &run.result.output {
             println!("{}", line);
         }
@@ -365,8 +439,8 @@ fn cmd_run(args: &[String]) -> ExitCode {
 
     // Camino normal: swarm real (DE-011). Los `spawn` corren en hilos aislados; un agente
     // que falla NO tumba el main ni trunca su salida. Sale ≠0 si el main falla o si algún
-    // agente terminó en ERROR.
-    let result = run_program(&source, &path);
+    // agente terminó en ERROR. El techo del host (si hay) se propaga a los agentes.
+    let result = run_program_ceiled(&source, &path, ceiling);
     for line in &result.output {
         println!("{}", line);
     }
@@ -386,19 +460,45 @@ fn cmd_test(args: &[String]) -> ExitCode {
     let args = args.as_slice();
     let mut flat = false;
     let mut verbose = false;
+    let mut sandbox = false; // --sandbox: techo [stdout, time]
+    let mut cap_set: Option<String> = None; // --cap-set "<list>": techo explícito
     let mut path: Option<String> = None;
-    for a in &args[2..] {
-        match a.as_str() {
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
             "--flat" => flat = true,
             "-v" | "--verbose" => verbose = true,
+            "--sandbox" => sandbox = true,
+            "--cap-set" => match args.get(i + 1) {
+                Some(v) => {
+                    cap_set = Some(v.clone());
+                    i += 1;
+                }
+                None => {
+                    eprintln!("synsema test: --cap-set requires a value (e.g. \"stdout,net=api.example.com\")");
+                    return ExitCode::from(2);
+                }
+            },
+            p if p.starts_with("--cap-set=") => {
+                cap_set = Some(p.trim_start_matches("--cap-set=").to_string());
+            }
             p if !p.starts_with('-') => path = Some(p.to_string()),
             _ => {}
         }
+        i += 1;
     }
     let path = match path {
         Some(p) => p,
         None => {
-            eprintln!("uso: synsema test [-v] [--flat] <archivo.syn | dir>");
+            eprintln!("uso: synsema test [-v] [--flat] [--sandbox | --cap-set <list>] <archivo.syn | dir>");
+            return ExitCode::from(2);
+        }
+    };
+    // Techo de capabilities del host (--sandbox/--cap-set): opt-in, defense-in-depth.
+    let ceiling = match build_ceiling(sandbox, cap_set.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("synsema test: {}", e);
             return ExitCode::from(2);
         }
     };
@@ -431,7 +531,7 @@ fn cmd_test(args: &[String]) -> ExitCode {
         if multi {
             println!("{}:", file);
         }
-        let report = run_tests(&source, file);
+        let report = run_tests_ceiled(&source, file, ceiling.clone());
         print_test_report(&report, verbose);
         total_passed += report.passed;
         total_failed += report.failed;

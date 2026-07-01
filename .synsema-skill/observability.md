@@ -12,6 +12,26 @@
 log "Processing order " + order_id        -- `log` takes a full expression
 ```
 
+## Logging under `serve` (and where it shows up)
+
+Under `serve`, `log` and `print` go to the **server's terminal**, prefixed:
+- `log "msg"` → `[serve] [LOG] msg`
+- `print(x)`  → `[serve] x`
+
+There is **no automatic access log** — `serve` does **not** log requests for you, so the terminal
+is quiet by default (this surprises people and makes dev hard). **Add a `log` in your handlers** to
+see traffic while developing:
+
+```
+serve on 8080
+    route "GET /items/:id"
+        log "GET /items/" + params.id      -- shows as: [serve] [LOG] GET /items/42
+        give get_item(params.id)
+```
+
+(A spawned agent's `log`/`print` also appear, prefixed `[AgentName]`.) Under plain `run`, `print`
+**buffers** until the program ends — use `flush()` for live output (see builtins).
+
 ## Tracing / Measurement / Checkpoints (decorative markers — literal name)
 ```
 trace "payment_processing"
