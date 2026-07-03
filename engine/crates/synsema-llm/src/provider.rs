@@ -68,6 +68,21 @@ pub trait LLMProvider: Send + Sync {
     fn call_step(&self, request: &LLMRequest) -> LlmStepResponse {
         LlmStepResponse { step: LlmStep::Final(self.call(request).content), tokens_used: 0 }
     }
+    /// Genera invocando `on_chunk` con cada fragmento de texto a medida que se produce
+    /// (F2, primitiva `llm_stream`). `on_chunk` devuelve `false` para cortar la
+    /// generación (p.ej. cliente SSE desconectado); el provider corta y devuelve lo
+    /// generado hasta ahí. Default: sin streaming real — delega en `call()` y emite el
+    /// contenido completo UNA vez (mock y providers de red siguen funcionando sin
+    /// cambios; el streaming HTTP de los providers de red es fase aparte).
+    fn call_stream(
+        &self,
+        request: &LLMRequest,
+        on_chunk: &mut dyn FnMut(&str) -> bool,
+    ) -> LLMResponse {
+        let resp = self.call(request);
+        on_chunk(&resp.content);
+        resp
+    }
 }
 
 /// Proveedor mock: respuestas predecibles + log de llamadas. Para tool-calling, una
@@ -252,6 +267,23 @@ mod tests {
             _ => panic!("esperaba Final del default"),
         }
         assert_eq!(r.tokens_used, 0);
+    }
+
+    // F2 §4.1: el default de `call_stream` emite exactamente UN chunk == content y
+    // devuelve la misma LLMResponse que `call` — mock y providers de red heredan esto.
+    #[test]
+    fn default_call_stream_emits_once() {
+        let mut responses = HashMap::new();
+        responses.insert("stream".to_string(), "hola entera".to_string());
+        let p = MockProvider::new(responses);
+        let mut chunks: Vec<String> = Vec::new();
+        let resp = p.call_stream(&LLMRequest::new("stream"), &mut |c| {
+            chunks.push(c.to_string());
+            true
+        });
+        assert_eq!(chunks, vec!["hola entera".to_string()]);
+        assert_eq!(resp.content, "hola entera");
+        assert_eq!(resp.content, p.call(&LLMRequest::new("stream")).content);
     }
 
     // push_step encola incrementalmente.

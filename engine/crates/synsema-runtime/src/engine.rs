@@ -211,6 +211,18 @@ pub(crate) fn wire_real_llm_provider(interp: &mut Interpreter) {
         req.data.insert("prompt".to_string(), prompt.to_string());
         p_text.call(&req).content
     }));
+    // Callback de streaming (`llm_stream`, F2): mismo armado de request que llm_step
+    // (prompt + context) → `call_stream` pasa el sink al provider. El local streamea
+    // token a token; mock y providers de red heredan el default del trait (UN chunk).
+    let p_stream = provider.clone();
+    interp.set_llm_stream_callback(Rc::new(
+        move |prompt: &str, context: &str, sink: &mut dyn FnMut(&str) -> bool| {
+            let mut req = LLMRequest::new("stream");
+            req.data.insert("prompt".to_string(), prompt.to_string());
+            req.data.insert("context".to_string(), context.to_string());
+            p_stream.call_stream(&req, sink).content
+        },
+    ));
     // Callback de paso tool-aware: arma `LLMRequest::new("step").with_tools(catalog)` +
     // `data["prompt"]`/`data["context"]` → `call_step` → mapea `LlmStep`→`StepResult`.
     interp.set_llm_step_callback(Rc::new(
@@ -811,6 +823,37 @@ pub fn run_with_llm_steps(source: &str, filename: &str, steps: Vec<LlmStepRespon
                                 StepResult::Tool { name, args, tokens: r.tokens_used }
                             }
                         }
+                    },
+                ));
+            })
+        })
+        .expect("hilo del motor")
+        .join()
+        .unwrap_or_else(|_| RunResult { success: false, output: Vec::new(), errors: vec!["el motor abortó".to_string()] })
+}
+
+/// Corre con un callback de STREAMING guionado (host-config, F2): `llm_stream` recibe
+/// la secuencia fija de `chunks` en orden y devuelve su concatenación. Respeta el
+/// contrato del sink: si `on_chunk` (la task del usuario) falla, el sink devuelve
+/// `false` y la "generación" corta ahí — igual que el provider real. Espejo de
+/// `run_with_llm_steps`, para los tests deterministas sin modelo.
+pub fn run_with_llm_stream(source: &str, filename: &str, chunks: Vec<String>) -> RunResult {
+    let src = source.to_string();
+    let fname = filename.to_string();
+    std::thread::Builder::new()
+        .stack_size(INTERP_STACK_SIZE)
+        .spawn(move || {
+            run_configured(&src, &fname, move |interp| {
+                interp.set_llm_stream_callback(Rc::new(
+                    move |_prompt: &str, _context: &str, sink: &mut dyn FnMut(&str) -> bool| {
+                        let mut full = String::new();
+                        for ch in &chunks {
+                            if !sink(ch) {
+                                break;
+                            }
+                            full.push_str(ch);
+                        }
+                        full
                     },
                 ));
             })

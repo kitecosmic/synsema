@@ -235,6 +235,13 @@ pub type LlmStepCallback =
 /// motor lo cablea con el provider real; sin él, las ops LLM caen a placeholders.
 pub type LlmTextCallback = Rc<dyn Fn(&str, &str) -> String>;
 
+/// Callback de streaming (`llm_stream`, F2): `(prompt, context, sink) -> texto completo`.
+/// El motor lo cablea con `provider.call_stream`; el `sink` recibe cada fragmento a
+/// medida que se genera y devuelve `false` para CORTAR la generación (p.ej. el `send`
+/// de un cliente SSE desconectado falló). Sin él, `llm_stream` devuelve un placeholder.
+#[allow(clippy::type_complexity)]
+pub type LlmStreamCallback = Rc<dyn Fn(&str, &str, &mut dyn FnMut(&str) -> bool) -> String>;
+
 /// Hook de aislamiento por-TOOL (least-privilege). Lo cablea el motor con el
 /// `CapabilitySet`. `(true, declared)` al entrar: restringe las caps a las DECLARADAS
 /// por la tool que el agente ya tenía (∩ agente, SIN heredar el resto del padre) → el
@@ -312,6 +319,10 @@ pub struct Interpreter {
     /// Callback LLM tool-aware de PASO (`llm_step`, FASE 1): el motor lo cablea con el
     /// provider guionable/real. Sin él: `llm_step` devuelve un placeholder seguro.
     llm_step_callback: Option<LlmStepCallback>,
+    /// Callback LLM de STREAMING (`llm_stream`, F2): el motor lo cablea con
+    /// `provider.call_stream`. Sin él: `llm_stream` devuelve el placeholder
+    /// `"[no llm provider]"` sin invocar `on_chunk`.
+    llm_stream_callback: Option<LlmStreamCallback>,
     /// Gate de capability para las ops LLM: lo cablea el motor para exigir
     /// `require llm` antes de CUALQUIER op LLM (provider real o placeholder).
     /// `Err(msg)` → la op falla con `Capability not granted: llm`. Sin él: sin gate
@@ -379,6 +390,7 @@ impl Interpreter {
             human_callback: None,
             llm_callback: None,
             llm_step_callback: None,
+            llm_stream_callback: None,
             llm_cap_hook: None,
             serve_hook: None,
             stream_emit: None,
@@ -458,6 +470,11 @@ impl Interpreter {
     /// Cablea el callback LLM tool-aware de paso (`llm_step`, FASE 1).
     pub fn set_llm_step_callback(&mut self, cb: LlmStepCallback) {
         self.llm_step_callback = Some(cb);
+    }
+
+    /// Cablea el callback LLM de streaming (`llm_stream`, F2).
+    pub fn set_llm_stream_callback(&mut self, cb: LlmStreamCallback) {
+        self.llm_stream_callback = Some(cb);
     }
 
     /// Cablea el gate de capability para las ops LLM (exige `require llm`).
@@ -701,6 +718,9 @@ impl Interpreter {
         // llm_step(prompt, catalog, context) — un PASO del LLM tool-aware (FASE 1):
         // devuelve un map {kind, …}. Gateado por la capability `llm` (reusa el hook).
         self.register("llm_step", 3, Rc::new(|i, a, l| i.b_llm_step(a, l)));
+        // llm_stream(prompt, context, on_chunk) — genera invocando la task/lambda
+        // `on_chunk` con cada fragmento (F2); devuelve el texto completo. Mismo gate `llm`.
+        self.register("llm_stream", 3, Rc::new(|i, a, l| i.b_llm_stream(a, l)));
         self.register("where", 2, Rc::new(|i, a, l| i.b_where(a, l)));
         self.register("collect", 2, Rc::new(|i, a, l| i.b_collect(a, l)));
         self.register("transform", -1, Rc::new(|i, a, l| i.b_transform(a, l)));
@@ -3056,6 +3076,46 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             None => StepResult::Final { text: "[no llm provider]".to_string(), tokens: 0 },
         };
         Ok(step_result_to_synvalue(result))
+    }
+
+    /// `llm_stream(prompt, context, on_chunk)` — genera con el provider configurado
+    /// invocando la task/lambda `on_chunk` con cada fragmento de texto a medida que se
+    /// produce, y devuelve el texto completo (F2). GATEADO por la capability `llm`
+    /// (mismo hook que reason/llm_step). Si `on_chunk` falla (p.ej. el `send` de un
+    /// cliente SSE desconectado → CLIENT_GONE), la generación se CORTA (el sink devuelve
+    /// `false` al provider) y el error PROPAGA — el stream se desenrolla exactamente
+    /// como cualquier `send` fallido de serve. Sin provider cableado: placeholder
+    /// `"[no llm provider]"` SIN invocar `on_chunk` (los placeholders no son respuestas).
+    fn b_llm_stream(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        self.check_llm_cap()?; // GATE por `llm` (mismo hook que reason/decide/…)
+        let prompt = raw_str(nth(args, 0)?);
+        let context = match args.get(1) {
+            Some(SynValue::Text(s)) => s.to_string(),
+            Some(SynValue::Nothing) | None => String::new(),
+            Some(v) => v.to_string(),
+        };
+        let on_chunk = nth(args, 2)?.clone();
+        let cb = match &self.llm_stream_callback {
+            Some(cb) => cb.clone(),
+            None => return Ok(syn_text("[no llm provider]")),
+        };
+        // El sink invoca la task/lambda del usuario por chunk. Un error ahí no puede
+        // atravesar el provider (la firma del sink es `-> bool`), así que se guarda acá
+        // y el sink devuelve `false` → el provider corta; al volver, el error propaga.
+        let mut chunk_err: Option<Control> = None;
+        let full = cb(&prompt, &context, &mut |chunk: &str| {
+            match self.call_value(on_chunk.clone(), vec![syn_text(chunk)], loc) {
+                Ok(_) => true,
+                Err(e) => {
+                    chunk_err = Some(e);
+                    false
+                }
+            }
+        });
+        if let Some(e) = chunk_err {
+            return Err(e);
+        }
+        Ok(syn_text(full))
     }
 
     fn b_where(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {

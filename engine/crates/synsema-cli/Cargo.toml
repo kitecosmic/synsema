@@ -11,6 +11,11 @@ description = "Synsema CLI — the `synsema` command"
 name = "synsema"
 path = "src/main.rs"
 
+[features]
+# Forward de la feature del runtime (spec LLM-LOCAL F1): binario con inferencia GGUF
+# embebida → `cargo install --path crates/synsema-cli --features llm-local`.
+llm-local = ["synsema-runtime/llm-local"]
+
 [dependencies]
 synsema-core.workspace = true
 synsema-capabilities.workspace = true

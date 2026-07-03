@@ -118,6 +118,26 @@ mongodb = { version = "3", default-features = false, features = ["sync", "rustls
 # es `redis://` plaintext; el path `rediss://` queda disponible con ring. Verificado con
 # `cargo tree -p synsema-stdlib`: cero `*-sys` nuevo (siguen sólo libsqlite3-sys y windows-sys).
 redis = { version = "0.32", default-features = false, features = ["tls-rustls"] }
+# LLM local embebido (spec LLM-LOCAL F1): inferencia GGUF cuantizada en CPU con candle.
+# SOLO entran con la feature `llm-local` de synsema-runtime (deps opcionales) — el build
+# default NO las compila (cargo tree idéntico a antes; verificado en la aceptación F1).
+# `default-features = false`: fuera cuda/metal/accelerate/mkl (los backends van por
+# feature en candle); el backend CPU (gemm/pulp/rayon) es puro Rust.
+# candle-core y candle-transformers PINNEADAS a la misma versión (comparten tipos).
+candle-core = { version = "0.11", default-features = false }
+candle-transformers = { version = "0.11", default-features = false }
+# Tokenizer HF para reconstruir el vocabulario DESDE la metadata del GGUF (sin sidecar
+# tokenizer.json). NUESTRO tokenizers (0.23) es puro Rust: `fancy-regex` en vez del
+# default `onig`, sin `esaxx_fast` (C++, solo sirve para TRAINING). PERO candle-core 0.11
+# arrastra su PROPIO tokenizers 0.22 con features=["onig"] hardcodeado upstream
+# (no-opcional; 0.11 es la última versión) → `onig_sys` (oniguruma, C) entra al build
+# feature-ON inevitablemente, y el binario ON compila DOS copias de tokenizers. Segunda
+# excepción C del workspace tras libsqlite3-sys, SOLO en el binario opt-in; el build
+# default queda puro-Rust (cero candle/tokenizers, verificado con cargo tree).
+# NO deduplicar bajando nuestra dep a 0.22: la unión de features activaría `onig` también
+# en NUESTRA copia (tokenizers usa el motor C cuando la feature está presente) — dos
+# copias con la nuestra limpia es el mejor arreglo disponible.
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 synsema-core = { path = "crates/synsema-core" }
 synsema-capabilities = { path = "crates/synsema-capabilities" }
 synsema-stdlib = { path = "crates/synsema-stdlib" }

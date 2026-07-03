@@ -1,6 +1,7 @@
-//! Providers LLM reales (HTTP). Conectividad de las ops `reason`/`decide`/`analyze`/
-//! `generate` y del primitivo `llm_step` con un modelo real (Anthropic primero,
-//! OpenAI/compatible segundo).
+//! Providers LLM reales. Conectividad de las ops `reason`/`decide`/`analyze`/
+//! `generate` y del primitivo `llm_step` con un modelo real: Anthropic, OpenAI/compatible,
+//! MiniMax, DeepSeek (HTTP) y — con `--features llm-local` — el provider `local`
+//! (GGUF cuantizado embebido, CPU, sin red ni API key; ver `llm_local.rs`).
 //!
 //! Diseño:
 //! - El trait/contrato (`LLMProvider` + tipos + `MockProvider`) vive en `synsema-llm`,
@@ -467,6 +468,26 @@ pub fn build_provider(
             max_tokens,
             base_url: base_url.unwrap_or_else(|| DEEPSEEK_DEFAULT_BASE.to_string()),
         })),
+        // Provider `local`: GGUF embebido (candle, CPU). SIN api_key ni base_url —
+        // `model` es el PATH al `.gguf`. Los knobs finos (ctx/threads/temperature/
+        // max_concurrent) los resuelve `provider_from_config`; este camino (factory puro)
+        // usa los defaults. Sin la feature: aviso por stderr y offline — JAMÁS degradar
+        // en silencio a otro provider.
+        #[cfg(feature = "llm-local")]
+        "local" | "gguf" => Some(Arc::new(crate::llm_local::LocalGgufProvider::new(
+            model,
+            max_tokens,
+            crate::llm_local::LocalKnobs::default(),
+        ))),
+        #[cfg(not(feature = "llm-local"))]
+        "local" | "gguf" => {
+            eprintln!(
+                "[synsema] SYNSEMA_LLM_PROVIDER=local requiere un binario compilado con \
+                 --features llm-local (o usá SYNSEMA_LLM_PROVIDER=openai + SYNSEMA_LLM_BASE_URL \
+                 contra un server local)"
+            );
+            None
+        }
         _ => None,
     }
 }
@@ -483,12 +504,41 @@ fn resolve_knob(name: &str, store: &EnvStore) -> Option<String> {
     }
 }
 
+/// Knobs del provider `local` (ignorados por los providers de red), resueltos con la
+/// MISMA precedencia `environ > .env > default` que el resto (`resolve_knob`):
+/// `SYNSEMA_LLM_CTX` (default 4096, capado al ctx del GGUF), `SYNSEMA_LLM_THREADS`
+/// (default: el del pool de rayon), `SYNSEMA_LLM_TEMPERATURE` (default 0 = greedy),
+/// `SYNSEMA_LLM_MAX_CONCURRENT` (default 1 = serializa bajo serve).
+#[cfg(feature = "llm-local")]
+fn local_knobs_from_config(store: &EnvStore) -> crate::llm_local::LocalKnobs {
+    let defaults = crate::llm_local::LocalKnobs::default();
+    crate::llm_local::LocalKnobs {
+        ctx: resolve_knob("SYNSEMA_LLM_CTX", store)
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(defaults.ctx),
+        threads: resolve_knob("SYNSEMA_LLM_THREADS", store)
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0),
+        temperature: resolve_knob("SYNSEMA_LLM_TEMPERATURE", store)
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|&t| t >= 0.0)
+            .unwrap_or(defaults.temperature),
+        max_concurrent: resolve_knob("SYNSEMA_LLM_MAX_CONCURRENT", store)
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(defaults.max_concurrent),
+    }
+}
+
 /// Selecciona el provider resolviendo cada knob con precedencia `environ > .env (store) >
 /// default` (vía [`resolve_knob`]). Todos los knobs son del usuario (conectividad libre;
 /// el runtime no impone límites):
 /// - `SYNSEMA_LLM_PROVIDER` si está; si no, auto-selección por presencia de
 ///   `ANTHROPIC_API_KEY`→anthropic, `OPENAI_API_KEY`→openai, `MINIMAX_API_KEY`→minimax,
 ///   `DEEPSEEK_API_KEY`→deepseek (en ese orden); si ninguno, `None` (offline → placeholders).
+///   El provider `local` (GGUF embebido) es SIEMPRE explícito — jamás auto-seleccionado —
+///   y no lleva API key; su `SYNSEMA_LLM_MODEL` es el path al `.gguf` (obligatorio).
 /// - key del provider correspondiente (`None` si falta → offline).
 /// - `SYNSEMA_LLM_MODEL` (override gana sobre el default), `SYNSEMA_LLM_MAX_TOKENS`
 ///   (default 4096), `SYNSEMA_LLM_BASE_URL` (override → modelos locales OpenAI-compat).
@@ -513,6 +563,43 @@ pub fn provider_from_config(store: &EnvStore) -> Option<Arc<dyn LLMProvider>> {
             }
         }
     };
+    // Provider `local`: SIEMPRE explícito (jamás auto-seleccionado), sin API key (el
+    // path del GGUF es config del runtime por env, como el endpoint de los de red —
+    // mismo precedente: tampoco exige cap `net`/`file`). `SYNSEMA_LLM_MODEL` acá es el
+    // PATH al `.gguf` y es obligatorio.
+    if provider == "local" || provider == "gguf" {
+        let model = match resolve_knob("SYNSEMA_LLM_MODEL", store) {
+            Some(m) => m,
+            None => {
+                eprintln!(
+                    "[synsema] SYNSEMA_LLM_PROVIDER=local necesita SYNSEMA_LLM_MODEL=<ruta al .gguf>"
+                );
+                return None;
+            }
+        };
+        #[cfg(feature = "llm-local")]
+        {
+            let max_tokens = resolve_knob("SYNSEMA_LLM_MAX_TOKENS", store)
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(DEFAULT_MAX_TOKENS);
+            return Some(Arc::new(crate::llm_local::LocalGgufProvider::new(
+                model,
+                max_tokens,
+                local_knobs_from_config(store),
+            )));
+        }
+        #[cfg(not(feature = "llm-local"))]
+        {
+            let _ = model;
+            eprintln!(
+                "[synsema] SYNSEMA_LLM_PROVIDER=local requiere un binario compilado con \
+                 --features llm-local (o usá SYNSEMA_LLM_PROVIDER=openai + SYNSEMA_LLM_BASE_URL \
+                 contra un server local)"
+            );
+            return None;
+        }
+    }
     let (key_var, default_model) = match provider.as_str() {
         "anthropic" | "claude" => ("ANTHROPIC_API_KEY", ANTHROPIC_DEFAULT_MODEL),
         "openai" | "gpt" => ("OPENAI_API_KEY", OPENAI_DEFAULT_MODEL),
@@ -814,11 +901,16 @@ mod tests {
         assert!(build_provider("nope", "k".to_string(), "m".to_string(), 4096, None).is_none());
     }
 
+    // Lock de los tests que manipulan env-vars globales del proceso (cargo test corre en
+    // threads): todo test que toque `std::env::set_var`/`remove_var` de knobs LLM debe
+    // tomar este guard primero.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // -- DE-007: resolución desde el `.env` protegido (precedencia environ > store) --
-    // Un solo test (manipula env-vars globales del proceso, serializado para no carrear
-    // con otros tests del mismo binario).
+    // Serializado vía ENV_LOCK para no carrear con los tests del provider local.
     #[test]
     fn provider_from_config_dotenv_and_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let keys = [
             "SYNSEMA_LLM_PROVIDER",
             "SYNSEMA_LLM_MODEL",
@@ -859,6 +951,114 @@ mod tests {
         assert!(provider_from_env().is_none());
 
         clear();
+    }
+
+    // -- Provider `local` (spec LLM-LOCAL F1) --
+
+    /// Limpia los knobs LLM del environ (los tests locales asumen environ limpio, como
+    /// el test DE-007). Llamar SOLO con ENV_LOCK tomado.
+    fn clear_llm_env() {
+        for k in [
+            "SYNSEMA_LLM_PROVIDER",
+            "SYNSEMA_LLM_MODEL",
+            "SYNSEMA_LLM_BASE_URL",
+            "SYNSEMA_LLM_MAX_TOKENS",
+            "SYNSEMA_LLM_CTX",
+            "SYNSEMA_LLM_THREADS",
+            "SYNSEMA_LLM_TEMPERATURE",
+            "SYNSEMA_LLM_MAX_CONCURRENT",
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "MINIMAX_API_KEY",
+            "DEEPSEEK_API_KEY",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    // Sin `SYNSEMA_LLM_MODEL`, provider=local → None (falta el path del GGUF), en AMBOS
+    // modos de feature — nunca un provider roto.
+    #[test]
+    fn provider_local_without_model_is_none() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_llm_env();
+        let store = EnvStore::parse("SYNSEMA_LLM_PROVIDER=local\n");
+        assert!(provider_from_config(&store).is_none());
+        clear_llm_env();
+    }
+
+    // Feature ON: provider=local + model (SOLO desde el `.env`, sin API key) → Some, y
+    // el name identifica el archivo. Alias `gguf` equivalente. NUNCA auto-seleccionado
+    // sin `SYNSEMA_LLM_PROVIDER` explícito.
+    #[cfg(feature = "llm-local")]
+    #[test]
+    fn provider_local_from_store_without_key() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_llm_env();
+        let store =
+            EnvStore::parse("SYNSEMA_LLM_PROVIDER=local\nSYNSEMA_LLM_MODEL=modelo.gguf\n");
+        let p = provider_from_config(&store).expect("local desde el .env, sin key");
+        assert_eq!(p.name(), "local:modelo.gguf");
+
+        let store2 = EnvStore::parse("SYNSEMA_LLM_PROVIDER=gguf\nSYNSEMA_LLM_MODEL=m.gguf\n");
+        assert!(provider_from_config(&store2).is_some(), "alias gguf");
+
+        // Sin provider explícito NO hay auto-selección hacia local (aunque haya modelo).
+        let store3 = EnvStore::parse("SYNSEMA_LLM_MODEL=m.gguf\n");
+        assert!(provider_from_config(&store3).is_none());
+        clear_llm_env();
+    }
+
+    // Feature ON: precedencia environ > `.env` > default para los knobs nuevos (calca
+    // el test DE-007).
+    #[cfg(feature = "llm-local")]
+    #[test]
+    fn local_knobs_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_llm_env();
+        let store = EnvStore::parse(
+            "SYNSEMA_LLM_CTX=2048\nSYNSEMA_LLM_TEMPERATURE=0.7\nSYNSEMA_LLM_MAX_CONCURRENT=2\n",
+        );
+
+        // (1) Sólo el `.env`: gana el store.
+        let k = local_knobs_from_config(&store);
+        assert_eq!(k.ctx, 2048);
+        assert_eq!(k.temperature, 0.7);
+        assert_eq!(k.max_concurrent, 2);
+        assert_eq!(k.threads, None);
+
+        // (2) El environ GANA sobre el `.env`.
+        std::env::set_var("SYNSEMA_LLM_CTX", "8192");
+        std::env::set_var("SYNSEMA_LLM_THREADS", "4");
+        let k2 = local_knobs_from_config(&store);
+        assert_eq!(k2.ctx, 8192);
+        assert_eq!(k2.threads, Some(4));
+
+        // (3) Sin nada → defaults (4096 / greedy / 1 instancia).
+        clear_llm_env();
+        let k3 = local_knobs_from_config(&EnvStore::empty());
+        assert_eq!(k3, crate::llm_local::LocalKnobs::default());
+
+        // (4) Valores inválidos caen al default, no rompen.
+        let bad = EnvStore::parse("SYNSEMA_LLM_CTX=cero\nSYNSEMA_LLM_MAX_CONCURRENT=0\n");
+        let k4 = local_knobs_from_config(&bad);
+        assert_eq!(k4.ctx, 4096);
+        assert_eq!(k4.max_concurrent, 1);
+        clear_llm_env();
+    }
+
+    // Feature OFF: provider=local configurado → None (aviso por stderr) y JAMÁS otro
+    // provider en silencio — aunque haya una key de red disponible en el store.
+    #[cfg(not(feature = "llm-local"))]
+    #[test]
+    fn provider_local_without_feature_is_none() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_llm_env();
+        let store = EnvStore::parse(
+            "SYNSEMA_LLM_PROVIDER=local\nSYNSEMA_LLM_MODEL=m.gguf\nOPENAI_API_KEY=sk-x\n",
+        );
+        assert!(provider_from_config(&store).is_none());
+        clear_llm_env();
     }
 
     // -- Live (red real). Corre a mano:
