@@ -1,0 +1,5 @@
+-- Brazo B del diamante DE-033: importa D y ESCRIBE a través de él.
+use "./diamond_d.syn" as d
+
+export task bwrite(x)
+    give d.write_d(x)

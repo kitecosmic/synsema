@@ -9,7 +9,7 @@
 //! compartido es el blackboard y la base de datos".
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -136,18 +136,28 @@ pub(crate) enum GlobalVal {
     Agent {
         body: Vec<Node>,
     },
-    /// Un módulo importado real (`use "…" as name`). El alias (Map) que el usuario ve
-    /// vía `m.foo` expone solo los exports, pero el snapshot lleva el **`module_env`
-    /// COMPLETO** — TODAS sus bindings (tasks exportadas, NO exportadas y `let`s) — para
-    /// que una task del módulo pueda llamar a una hermana por su nombre simple bajo serve
-    /// y parallel_map, igual que bajo `run` (DE-027). En rebuild se crea un `module_env`
-    /// compartido (hijo del global del request) y todas las tasks del módulo cierran
-    /// sobre ÉL; el alias reusa esas mismas tasks. Reproduce `load_module_inner` de core.
+    /// Un map que cierra sobre un `module_env` (el alias de un `use "…" as name`, o un
+    /// map interno estilo `TOOL_ALLOW` — DE-032). El módulo se identifica por su **ID
+    /// estable** (`id` = el `name` del `module_env` original, `"module:<resolved>"`), y
+    /// su env viaja **UNA sola vez** por árbol de snapshot: el primer encuentro lo lleva
+    /// inline (`env: Some(…)`); los demás encuentros — el segundo brazo de un diamante
+    /// B→D←C (DE-033), un map auto-referencial, o cualquier ciclo hipotético — llevan
+    /// solo el `id` (`env: None`). En rebuild, un `ModuleRegistry` (`id → env`, vivo
+    /// durante ESE rebuild) garantiza que toda referencia al mismo módulo resuelva al
+    /// MISMO `module_env` compartido — igual que `module_cache` bajo `run` (DE-027/030).
     Module {
-        /// Entradas del alias (lo que el usuario ve): los exports del módulo.
-        alias: Vec<(String, GlobalVal)>,
-        /// TODAS las bindings del `module_env` (exportadas + internas + lets).
-        env: Vec<(String, GlobalVal)>,
+        /// ID estable: el `name` del `module_env` original (`"module:<resolved>"`).
+        id: String,
+        /// Entradas del map (alias de módulo o map interno). `is_export = true` ⇔ en el
+        /// snapshot la entry `(k, v)` era EL MISMO objeto (`Rc::ptr_eq`) que el binding
+        /// `k` del `module_env` → en rebuild se cosecha del env reconstruido (identidad
+        /// compartida alias↔env, como los exports de `load_module_inner`). `false` → se
+        /// materializa desde el `GlobalVal` (primitivas inmutables, claves renombradas).
+        alias: Vec<(String, GlobalVal, bool /* is_export */)>,
+        /// `Some(bindings)` SOLO en el primer encuentro del módulo en el árbol de
+        /// snapshot (TODAS las bindings: exportadas + internas + `let`s); `None` en los
+        /// siguientes (referencia por `id` al registro del rebuild).
+        env: Option<Vec<(String, GlobalVal)>>,
     },
     /// Un map de DATOS cuyas entradas incluyen tasks/closures (p.ej. un callback en un
     /// map de config) pero que NO es un módulo importado. Se conserva como variante aparte
@@ -155,27 +165,64 @@ pub(crate) enum GlobalVal {
     /// tasks cierran sobre el global del request como cualquier task top-level — sin el
     /// `module_env` compartido del caso módulo.
     MapWithTasks(Vec<(String, GlobalVal)>),
-    /// Un map AUTO-REFERENCIAL de un módulo: un `let MAP be {"t": tarea}` cuyas tasks
-    /// cierran sobre el MISMO `module_env` que se está snapshoteando (patrón `TOOL_ALLOW`
-    /// de tool-calling — DE-032). No re-snapshotea el env (ya lo lleva el módulo
-    /// contenedor); solo guarda las entradas del map. En rebuild, sus tasks cierran sobre
-    /// el `module_env` que se está construyendo (donde viven las hermanas), no sobre uno
-    /// vacío ni el global. Distinto del ciclo cross-módulo (A↔B), que sí degrada.
-    ModuleSelfRef(Vec<(String, GlobalVal)>),
 }
 
-/// Convierte un `SynValue` a `GlobalVal` de forma recursiva. Un Map que es el alias de
-/// un módulo importado se snapshotea como `GlobalVal::Module` llevándose el `module_env`
-/// COMPLETO (todas las hermanas, exportadas o no — DE-027); un Map de datos con tasks se
-/// preserva como `MapWithTasks`; un Map puramente de valores viaja barato como SendValue.
+/// Estado del ÁRBOL COMPLETO de un snapshot. Se comparte entre TODOS los bindings de
+/// `snapshot_globals` para que el diamante entre bindings top-level (b y c importan d)
+/// también dedupee: d viaja UNA vez, las demás apariciones son referencias por id.
+#[derive(Default)]
+struct SnapState {
+    /// `module_env`s EN CURSO de snapshot (stack, por identidad de `Rc`): corta la
+    /// recursión de un map interno auto-referencial (TOOL_ALLOW — DE-032) y de
+    /// cualquier ciclo hipotético.
+    in_progress: Vec<usize>,
+    /// `module_env`s YA snapshoteados en este árbol: una segunda aparición (el otro
+    /// brazo del diamante B→D←C — DE-033) viaja como referencia por id, no como copia.
+    done: HashSet<usize>,
+}
+
+/// Convierte un `SynValue` a `GlobalVal` de forma recursiva, con un árbol de snapshot
+/// propio (para snapshots de UN valor suelto, p.ej. los globales que viajan a un agente
+/// spawneado). Un Map que cierra sobre un `module_env` se snapshotea como
+/// `GlobalVal::Module` (env inline la primera vez, referencia por id después); un Map
+/// de datos con tasks se preserva como `MapWithTasks`; un Map puramente de valores viaja
+/// barato como SendValue.
 pub(crate) fn val_to_global(v: &SynValue) -> GlobalVal {
-    val_to_global_inner(v, &mut Vec::new())
+    val_to_global_inner(v, &mut SnapState::default())
 }
 
-/// Núcleo recursivo de `val_to_global`. `visited` lleva los `module_env` que se están
-/// snapshoteando (por identidad de `Rc`) para cortar ciclos de imports (A→B→A) y no
-/// recursar infinito.
-fn val_to_global_inner(v: &SynValue, visited: &mut Vec<usize>) -> GlobalVal {
+/// ¿La entry `(k, v)` del map alias es EL MISMO objeto que el binding `k` del
+/// `module_env`? Solo valores por-referencia (Task/Map/List vía `Rc::ptr_eq`);
+/// primitivas → `false` (inmutables: la copia es indistinguible del original).
+fn is_export_of(module_env: &Rc<RefCell<Environment>>, k: &str, v: &SynValue) -> bool {
+    let env = module_env.borrow();
+    match (env.bindings.get(k), v) {
+        (Some(SynValue::Task(a)), SynValue::Task(b)) => Rc::ptr_eq(a, b),
+        (Some(SynValue::Map(a)), SynValue::Map(b)) => Rc::ptr_eq(a, b),
+        (Some(SynValue::List(a)), SynValue::List(b)) => Rc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+/// Snapshotea las entradas de un map que cierra sobre `module_env`, marcando con
+/// `is_export` las que son el mismo objeto que el binding homónimo del env (en rebuild
+/// se cosechan del env reconstruido → identidad compartida alias↔env).
+fn snapshot_alias_entries(
+    m: &Rc<RefCell<IndexMap<String, SynValue>>>,
+    module_env: &Rc<RefCell<Environment>>,
+    state: &mut SnapState,
+) -> Vec<(String, GlobalVal, bool)> {
+    m.borrow()
+        .iter()
+        .map(|(k, v)| {
+            let is_export = is_export_of(module_env, k, v);
+            (k.clone(), val_to_global_inner(v, state), is_export)
+        })
+        .collect()
+}
+
+/// Núcleo recursivo de `val_to_global`/`snapshot_globals`/`snapshot_module_env`.
+fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
     match v {
         SynValue::Task(t) => GlobalVal::Task {
             name: t.name.clone(),
@@ -185,50 +232,44 @@ fn val_to_global_inner(v: &SynValue, visited: &mut Vec<usize>) -> GlobalVal {
         },
         SynValue::Builtin(_) => GlobalVal::Value(to_send(v)),
         SynValue::Map(m) => {
+            // ¿El map cierra sobre un `module_env`? (alias de `use`, o map interno cuyas
+            // tasks cierran sobre el módulo — heurística por el nombre "module:…").
+            if let Some(module_env) = module_env_of(&m.borrow()) {
+                let key = Rc::as_ptr(&module_env) as usize;
+                let id = module_env.borrow().name.clone();
+                if state.in_progress.contains(&key) || state.done.contains(&key) {
+                    // El env ya viaja (o viajó) en este árbol: referencia por id. Un solo
+                    // camino cubre el map auto-referencial (DE-032), el diamante B→D←C
+                    // (DE-033) y cualquier ciclo hipotético. En rebuild resuelve al MISMO
+                    // env vía el registro.
+                    let alias = snapshot_alias_entries(m, &module_env, state);
+                    return GlobalVal::Module { id, alias, env: None };
+                }
+                // Primer encuentro: el env viaja inline (TODAS las bindings, DE-027).
+                state.in_progress.push(key);
+                let env: Vec<(String, GlobalVal)> = module_env
+                    .borrow()
+                    .bindings
+                    .iter()
+                    .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
+                    .map(|(k, v)| (k.clone(), val_to_global_inner(v, state)))
+                    .collect();
+                state.in_progress.pop();
+                state.done.insert(key);
+                let alias = snapshot_alias_entries(m, &module_env, state);
+                return GlobalVal::Module { id, alias, env: Some(env) };
+            }
             let entries: Vec<(String, GlobalVal)> = m
                 .borrow()
                 .iter()
-                .map(|(k, v)| (k.clone(), val_to_global_inner(v, visited)))
+                .map(|(k, v)| (k.clone(), val_to_global_inner(v, state)))
                 .collect();
             // Map puramente de valores primitivos → viaja barato como SendValue.
             if entries.iter().all(|(_, gv)| matches!(gv, GlobalVal::Value(_))) {
                 return GlobalVal::Value(to_send(&SynValue::Map(m.clone())));
             }
-            // Contiene ≥1 task/módulo. ¿Es el alias de un módulo importado de verdad?
-            // Heurística (edge case #4 de la spec): si alguna task del map cierra sobre un
-            // env llamado "module:…", ése es el `module_env` real → snapshot del env
-            // COMPLETO (todas las hermanas). Si no, es un map de datos con callbacks.
-            match module_env_of(&m.borrow()) {
-                Some(module_env) => {
-                    let key = Rc::as_ptr(&module_env) as usize;
-                    if visited.contains(&key) {
-                        // El map cierra sobre un module_env que ya se está snapshoteando.
-                        if visited.last() == Some(&key) {
-                            // Auto-referencia (DE-032): es el módulo EN CURSO (el que
-                            // estamos snapshoteando ahora). No re-snapshotear el env (ya lo
-                            // lleva el contenedor); guardar solo las entradas. En rebuild
-                            // cerrarán sobre el module_env que se está construyendo →
-                            // resuelven sus hermanas. Patrón TOOL_ALLOW de tool-calling.
-                            return GlobalVal::ModuleSelfRef(entries);
-                        }
-                        // Ciclo cross-módulo real (A→B→A, envs distintos): el env cicleado
-                        // lo empujó un snapshot ANCESTRO, no el actual. Limitación conocida
-                        // y rara: degrada (el alias conserva sus entradas, el env va vacío).
-                        return GlobalVal::Module { alias: entries, env: Vec::new() };
-                    }
-                    visited.push(key);
-                    let env: Vec<(String, GlobalVal)> = module_env
-                        .borrow()
-                        .bindings
-                        .iter()
-                        .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
-                        .map(|(k, v)| (k.clone(), val_to_global_inner(v, visited)))
-                        .collect();
-                    visited.pop();
-                    GlobalVal::Module { alias: entries, env }
-                }
-                None => GlobalVal::MapWithTasks(entries),
-            }
+            // Map de datos con callbacks (tasks que NO cierran sobre un módulo).
+            GlobalVal::MapWithTasks(entries)
         }
         other => GlobalVal::Value(to_send(other)),
     }
@@ -249,33 +290,58 @@ pub(crate) fn module_env_of(map: &IndexMap<String, SynValue>) -> Option<Rc<RefCe
 }
 
 /// Snapshotea TODAS las bindings de un `module_env` (saltando builtins) a `GlobalVal`,
-/// para que viajen `Send` a otro hilo/intérprete. Cortes de ciclo por identidad de `Rc`
-/// (módulos circulares A→B→A). Reusa el mismo camino que la rama Module de
-/// `val_to_global` — usado por `parallel_map` para capturar el módulo de la task aplicada
-/// (DE-030), no solo el de los globales.
+/// para que viajen `Send` a otro hilo/intérprete, con el env raíz marcado en curso (una
+/// referencia interna a él — map auto-referencial — viaja por id, no re-snapshotea).
+/// Reusa el mismo camino que la rama Module de `val_to_global_inner` — usado por
+/// `parallel_map` para capturar el módulo de la task aplicada (DE-030).
 pub(crate) fn snapshot_module_env(module_env: &Rc<RefCell<Environment>>) -> Vec<(String, GlobalVal)> {
-    let mut visited = vec![Rc::as_ptr(module_env) as usize];
+    let mut state = SnapState {
+        in_progress: vec![Rc::as_ptr(module_env) as usize],
+        done: HashSet::new(),
+    };
     module_env
         .borrow()
         .bindings
         .iter()
         .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
-        .map(|(k, v)| (k.clone(), val_to_global_inner(v, &mut visited)))
+        .map(|(k, v)| (k.clone(), val_to_global_inner(v, &mut state)))
         .collect()
 }
 
-/// Reconstruye un `module_env` compartido (hijo de `base`) desde el snapshot de sus
-/// bindings, con cada task cerrando sobre ESE env → las hermanas (exportadas o no) se
+/// Registro `id → module_env` de UN rebuild (per-request/per-worker): toda referencia
+/// al mismo módulo (diamante, alias, task aplicada) resuelve al MISMO env, igual que
+/// `module_cache` bajo `run`. Vive lo que dura ese rebuild — NUNCA se comparte entre
+/// requests o workers (el aislamiento CSP no cambia; el estado entre requests es
+/// `state_set`/SQL/`remember`).
+pub(crate) type ModuleRegistry = HashMap<String, Rc<RefCell<Environment>>>;
+
+/// Reconstruye (o reusa del registro) el `module_env` compartido de un módulo, hijo de
+/// `base`, con cada task cerrando sobre ESE env → las hermanas (exportadas o no) se
 /// resuelven por nombre simple. Reproduce la estructura de `load_module_inner` de core.
 /// Compartido por la rama Module de `rebuild_global_val` (globales, DE-027) y por
 /// `reconstruct_task` de `parallel_map` (task aplicada, DE-030).
 pub(crate) fn rebuild_module_env(
+    id: &str,
     env: &[(String, GlobalVal)],
     base: &Rc<RefCell<Environment>>,
+    registry: &mut ModuleRegistry,
 ) -> Rc<RefCell<Environment>> {
-    let module_env = Environment::child(base, "module:rebuilt");
+    // Identidad primero: si ESTE rebuild ya reconstruyó el módulo (p.ej. llegó por otro
+    // brazo del diamante, o la task aplicada es de un módulo también global), reusar ese
+    // env — un solo D compartido, como `module_cache` bajo `run`.
+    if let Some(e) = registry.get(id) {
+        return e.clone();
+    }
+    // El env reconstruido conserva el nombre ORIGINAL ("module:<resolved>"), no un
+    // placeholder: `module_env_of` y el check de `parallel_map` dependen del prefijo
+    // "module:", y el dedup de un re-snapshot anidado (parallel_map dentro de un route
+    // handler bajo serve) depende del nombre COMPLETO.
+    let module_env = Environment::child(base, id);
+    // Registrar ANTES de poblar: un map interno auto-referencial (TOOL_ALLOW — DE-032)
+    // que aparezca durante la población resuelve a ESTE env en construcción.
+    registry.insert(id.to_string(), module_env.clone());
     for (k, gv) in env {
-        let v = rebuild_global_val(gv, &module_env, base);
+        let v = rebuild_global_val(gv, &module_env, base, registry);
         module_env.borrow_mut().bindings.insert(k.clone(), v);
     }
     module_env
@@ -287,10 +353,12 @@ pub(crate) fn rebuild_module_env(
 /// global del request, igual que `load_module_inner`, que cuelga todo module_env del
 /// global). Las tasks cierran sobre `closure_target` para que la recursión mutua entre
 /// globales y la llamada a hermanas dentro de un módulo (DE-027) sigan funcionando.
+/// `registry` dedupea los `module_env` de este rebuild por id (DE-033).
 fn rebuild_global_val(
     gv: &GlobalVal,
     closure_target: &Rc<RefCell<Environment>>,
     base: &Rc<RefCell<Environment>>,
+    registry: &mut ModuleRegistry,
 ) -> SynValue {
     match gv {
         GlobalVal::Value(sv) => from_send(sv),
@@ -304,16 +372,47 @@ fn rebuild_global_val(
                 required_capabilities: required_capabilities.clone(),
             }))
         }
-        GlobalVal::Module { alias, env } => {
-            // Un `module_env` compartido (hijo del global del request) reproduce la
-            // estructura de `load_module_inner`: TODAS las tasks del módulo cierran sobre
-            // él, así que una hermana (exportada o no) se resuelve por su nombre simple.
-            let module_env = rebuild_module_env(env, base);
-            // El alias expone solo los exports; sus tasks cierran sobre el MISMO
-            // module_env que las internas (misma cadena de resolución que en `run`).
+        GlobalVal::Module { id, alias, env } => {
+            // Resolver el `module_env` compartido: el primer encuentro (env inline) lo
+            // construye y registra; una referencia (env: None) lo toma del registro.
+            let module_env = match env {
+                Some(entries) => rebuild_module_env(id, entries, base, registry),
+                None => match registry.get(id) {
+                    Some(e) => e.clone(),
+                    None => {
+                        // Fallback defensivo (jamás panic): inalcanzable por construcción
+                        // para imports (`use`) — el primer encuentro siempre viaja con el
+                        // env inline y el rebuild recorre en el mismo orden. Solo llegaría
+                        // acá una mutación exótica post-load (inyectar en un map de módulo
+                        // tasks de OTRO módulo no alcanzado por el snapshot). Se registra
+                        // el env vacío para que al menos todas las referencias compartan.
+                        let e = Environment::child(base, id);
+                        registry.insert(id.clone(), e.clone());
+                        e
+                    }
+                },
+            };
+            // Materializar el map: las entries que eran EL MISMO objeto que el binding
+            // homónimo del env (`is_export`) se COSECHAN del env reconstruido — misma
+            // identidad alias↔env que los exports de `load_module_inner` bajo `run`
+            // (mutar `d.STATE` y leer vía una task del módulo ven el mismo objeto). Las
+            // demás se materializan cerrando sobre el module_env (donde viven las
+            // hermanas), igual que antes.
             let mut m = IndexMap::new();
-            for (k, gv) in alias {
-                m.insert(k.clone(), rebuild_global_val(gv, &module_env, base));
+            for (k, gv, is_export) in alias {
+                let harvested = if *is_export {
+                    module_env.borrow().bindings.get(k.as_str()).cloned()
+                } else {
+                    None
+                };
+                let v = match harvested {
+                    Some(v) => v,
+                    // `is_export` sin binding aún: referencia dentro de un env en plena
+                    // población (orden arbitrario del HashMap de bindings) → materializar
+                    // desde el GlobalVal como fallback.
+                    None => rebuild_global_val(gv, &module_env, base, registry),
+                };
+                m.insert(k.clone(), v);
             }
             SynValue::Map(Rc::new(RefCell::new(m)))
         }
@@ -322,18 +421,7 @@ fn rebuild_global_val(
             // task top-level), NO sobre un module_env compartido.
             let mut m = IndexMap::new();
             for (k, gv) in entries {
-                m.insert(k.clone(), rebuild_global_val(gv, base, base));
-            }
-            SynValue::Map(Rc::new(RefCell::new(m)))
-        }
-        GlobalVal::ModuleSelfRef(entries) => {
-            // Map auto-referencial del módulo (DE-032): sus tasks cierran sobre
-            // `closure_target` (= el module_env que se está construyendo), donde viven las
-            // hermanas. `rebuild_module_env` pasa ese module_env como `closure_target`, así
-            // que `MAP["t"]` resuelve `helper`/`ws_path`/etc. igual que bajo `run`.
-            let mut m = IndexMap::new();
-            for (k, gv) in entries {
-                m.insert(k.clone(), rebuild_global_val(gv, closure_target, base));
+                m.insert(k.clone(), rebuild_global_val(gv, base, base, registry));
             }
             SynValue::Map(Rc::new(RefCell::new(m)))
         }
@@ -350,11 +438,16 @@ fn rebuild_global_val(
 pub(crate) fn snapshot_globals(interp: &Interpreter) -> Arc<Vec<(String, GlobalVal)>> {
     let env = interp.global_env.borrow();
     let mut out: Vec<(String, GlobalVal)> = Vec::new();
+    // UN SnapState para TODOS los bindings: el diamante entre bindings top-level (b y c
+    // importan d) dedupea — el env de d viaja UNA vez y la otra aparición es referencia
+    // por id. El orden del Vec se conserva → en rebuild el primer encuentro (que lleva
+    // el env inline) siempre se procesa antes que sus referencias.
+    let mut state = SnapState::default();
     for (k, v) in env.bindings.iter() {
         if matches!(v, SynValue::Builtin(_)) {
             continue; // re-registrados por wire_common
         }
-        out.push((k.clone(), val_to_global(v)));
+        out.push((k.clone(), val_to_global_inner(v, &mut state)));
     }
     // Agentes (Batch 6): viven en `agent_definitions`, no en `bindings` → se snapshotean
     // aparte (sólo el body; el closure_env se re-apunta al global del nuevo intérprete).
@@ -366,8 +459,15 @@ pub(crate) fn snapshot_globals(interp: &Interpreter) -> Arc<Vec<(String, GlobalV
 
 /// Reconstruye los globales en un intérprete fresco. Las tasks (top-level y dentro de
 /// módulos) se recrean con su closure apuntando al global del nuevo intérprete para que
-/// la recursión mutua y el acceso a otros globales sigan funcionando.
-pub(crate) fn rebuild_globals(interp: &mut Interpreter, snapshot: &[(String, GlobalVal)]) {
+/// la recursión mutua y el acceso a otros globales sigan funcionando. Devuelve el
+/// `ModuleRegistry` de este rebuild — `parallel_map` lo necesita para que la task
+/// aplicada de un módulo TAMBIÉN global reuse el mismo `module_env` (DE-033); los demás
+/// call sites pueden ignorarlo.
+pub(crate) fn rebuild_globals(
+    interp: &mut Interpreter,
+    snapshot: &[(String, GlobalVal)],
+) -> ModuleRegistry {
+    let mut registry = ModuleRegistry::new();
     for (k, gv) in snapshot {
         match gv {
             // Agentes (Batch 6): van al mapa separado `agent_definitions` (NO a bindings),
@@ -381,11 +481,12 @@ pub(crate) fn rebuild_globals(interp: &mut Interpreter, snapshot: &[(String, Glo
                 // Top-level: las tasks cierran sobre el global (closure_target) y los
                 // nuevos module_env también cuelgan del global (base).
                 let genv = interp.global_env.clone();
-                let v = rebuild_global_val(other, &genv, &genv);
+                let v = rebuild_global_val(other, &genv, &genv, &mut registry);
                 interp.set_global(k, v);
             }
         }
     }
+    registry
 }
 
 /// Intérprete base de un serve: wiring común + hooks del swarm + db compartida +

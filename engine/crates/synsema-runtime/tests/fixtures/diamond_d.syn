@@ -1,0 +1,14 @@
+-- Módulo D del diamante DE-033 (B→D←C): estado mutable compartido. Bajo `run`,
+-- `module_cache` garantiza UN solo module_env de D aunque B y C lo importen por
+-- separado; bajo serve/parallel_map el snapshot/rebuild debe preservar esa identidad
+-- (antes: N copias de D que divergían en silencio).
+export let STATE be {"v": "init"}
+
+-- Escribe en el estado compartido (cierra sobre el module_env de D).
+export task write_d(x)
+    set STATE["v"] to x
+    give "w"
+
+-- Lee el estado compartido.
+export task read_d()
+    give STATE["v"]

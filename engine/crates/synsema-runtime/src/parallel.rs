@@ -26,6 +26,7 @@ use synsema_core::types::{from_send, syn_list, to_send, SendValue, SynTaskValue,
 use crate::engine::{wire_common, INTERP_STACK_SIZE};
 use crate::serve::{
     rebuild_globals, rebuild_module_env, snapshot_globals, snapshot_module_env, GlobalVal,
+    ModuleRegistry,
 };
 
 fn err(msg: &str) -> Control {
@@ -55,21 +56,26 @@ enum TaskSnapshot {
         body: Vec<Node>,
         required_capabilities: Vec<(String, Option<String>)>,
         /// Si la task aplicada venía de un módulo (su `closure_env` era el `module_env`),
-        /// el snapshot COMPLETO de ese env (todas las hermanas) para reconstruirlo en el
-        /// worker; si no, `None` y la task cierra sobre el global (DE-030).
-        module: Option<Vec<(String, GlobalVal)>>,
+        /// el ID estable de ese módulo (`"module:<resolved>"`) + el snapshot COMPLETO de
+        /// su env (todas las hermanas) para reconstruirlo en el worker; si no, `None` y
+        /// la task cierra sobre el global (DE-030). El ID permite que, si el módulo
+        /// TAMBIÉN es alcanzable desde los globales, la task cierre sobre EL MISMO
+        /// `module_env` que ellos (identidad task-aplicada ↔ módulo global, DE-033).
+        module: Option<(String, Vec<(String, GlobalVal)>)>,
     },
     Builtin(String),
 }
 
 /// Intérprete worker fresco: builtins + caps heredadas + globales reconstruidos.
+/// Devuelve también el `ModuleRegistry` del rebuild, para que `reconstruct_task`
+/// resuelva el módulo de la task aplicada al MISMO env que los globales (DE-033).
 fn build_worker_interp(
     globals: &[(String, GlobalVal)],
     granted: &[Capability],
     denied: &[Capability],
     secure: bool,
     ceiling: &Option<Arc<Vec<Capability>>>,
-) -> Interpreter {
+) -> (Interpreter, ModuleRegistry) {
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("parallel")));
     // Techo del host (--sandbox/--cap-set): setear ANTES de grants/wire_common. Así el
@@ -88,20 +94,27 @@ fn build_worker_interp(
         }
     }
     wire_common(&mut interp, &caps, secure);
-    rebuild_globals(&mut interp, globals);
+    let registry = rebuild_globals(&mut interp, globals);
     interp.freeze_intent(); // corre bajo el intent congelado
-    interp
+    (interp, registry)
 }
 
-fn reconstruct_task(interp: &Interpreter, snap: &TaskSnapshot) -> SynValue {
+fn reconstruct_task(
+    interp: &Interpreter,
+    snap: &TaskSnapshot,
+    registry: &mut ModuleRegistry,
+) -> SynValue {
     match snap {
         TaskSnapshot::User { name, parameters, body, required_capabilities, module } => {
-            // DE-030: si la task vino de un módulo, cerrarla sobre un `module_env`
-            // reconstruido (con todas las hermanas) en vez del global del worker —
-            // así una task de módulo aplicada que llame a una hermana resuelve, igual
-            // que las tasks de los globales (DE-027). Sin módulo: comportamiento actual.
+            // DE-030: si la task vino de un módulo, cerrarla sobre el `module_env` de
+            // ese módulo (con todas las hermanas) en vez del global del worker — así
+            // una task de módulo aplicada que llame a una hermana resuelve, igual que
+            // las tasks de los globales (DE-027). Registry-first (DE-033): si el módulo
+            // TAMBIÉN es alcanzable desde los globales del worker, `rebuild_module_env`
+            // devuelve ESE env (la misma instancia — estado compartido); solo reconstruye
+            // uno nuevo si no (p.ej. el binding global fue pisado con `set`).
             let closure_env = match module {
-                Some(env) => rebuild_module_env(env, &interp.global_env),
+                Some((id, env)) => rebuild_module_env(id, env, &interp.global_env, registry),
                 None => interp.global_env.clone(),
             };
             SynValue::Task(Rc::new(SynTaskValue {
@@ -179,8 +192,9 @@ fn run_parallel(
                 if aborted.load(Ordering::Relaxed) {
                     return None;
                 }
-                let mut interp = build_worker_interp(&globals, &granted, &denied, secure, &ceiling);
-                let task_value = reconstruct_task(&interp, &task_snap);
+                let (mut interp, mut registry) =
+                    build_worker_interp(&globals, &granted, &denied, secure, &ceiling);
+                let task_value = reconstruct_task(&interp, &task_snap, &mut registry);
                 let item = from_send(&items[i]);
                 match interp.call_task(task_value, vec![item]) {
                     Ok(v) => Some(to_send(&v)),
@@ -264,10 +278,16 @@ pub fn register_parallel_builtins(interp: &Interpreter, caps: &Rc<RefCell<Capabi
                     // DE-030: si el mapper es una task de módulo (cierra sobre un env
                     // "module:…"), snapshotear su `module_env` completo para reconstruir
                     // las hermanas en el worker; si no, `None` (cierra sobre el global).
-                    let module = if t.closure_env.borrow().name.starts_with("module:") {
-                        Some(snapshot_module_env(&t.closure_env))
-                    } else {
-                        None
+                    // El nombre del env ES el ID estable del módulo (DE-033) — también
+                    // dentro de un route handler bajo serve, porque el rebuild preserva
+                    // los nombres originales ("module:<resolved>", nunca un placeholder).
+                    let module = {
+                        let env_name = t.closure_env.borrow().name.clone();
+                        if env_name.starts_with("module:") {
+                            Some((env_name, snapshot_module_env(&t.closure_env)))
+                        } else {
+                            None
+                        }
                     };
                     TaskSnapshot::User {
                         name: t.name.clone(),
