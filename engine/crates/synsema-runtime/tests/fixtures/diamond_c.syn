@@ -1,0 +1,5 @@
+-- Brazo C del diamante DE-033: importa D y LEE a través de él.
+use "./diamond_d.syn" as d
+
+export task cread()
+    give d.read_d()
