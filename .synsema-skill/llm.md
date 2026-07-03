@@ -133,6 +133,7 @@ SYNSEMA_LLM_MODEL=C:\models\qwen2.5-0.5b-instruct-q4_k_m.gguf   # path to the .g
 | `SYNSEMA_LLM_THREADS` | CPU threads for inference | engine default (all cores) |
 | `SYNSEMA_LLM_TEMPERATURE` | `0` = greedy/deterministic; `>0` = sampling (fixed seed) | `0` |
 | `SYNSEMA_LLM_MAX_CONCURRENT` | Max model instances; `1` serializes concurrent calls under `serve` | `1` |
+| `SYNSEMA_LLM_STREAM_BUFFER` | Chunks in flight between generation and `llm_stream` emission | `32` |
 
 `SYNSEMA_LLM_MAX_TOKENS` applies as usual. Supported architectures: **llama, qwen2, qwen3**
 (quantized GGUF); anything else fails with a clear `[local error: …]`. Tool-calling (`llm_step`)
@@ -173,9 +174,12 @@ Measured with the 0.5B local model: first token reaches the client in **~1.4s** 
 full answer takes ~9.4s — that latency gap is the feature. If `on_chunk` fails (e.g. the `send` of
 a disconnected SSE client), generation STOPS and the error propagates like any failed `send`
 (recoverable with `try`/`recover`). Offline (no provider): returns `"[no llm provider]"` without
-invoking `on_chunk`. Note: with the local provider the emission runs while holding the model
-instance — with `SYNSEMA_LLM_MAX_CONCURRENT=1` (default) a slow SSE client serializes other LLM
-calls for the duration of the stream.
+invoking `on_chunk`. With the local provider, generation and emission are decoupled by a bounded
+buffer (`SYNSEMA_LLM_STREAM_BUFFER`, default 32 chunks): the model instance is released as soon as
+generation FINISHES, even if the client is still draining — a slow SSE client only stalls the
+generator while the buffer is full (measured: a concurrent LLM call went from waiting the slow
+client's whole stream to waiting only the remaining generation). A dead client still stops
+generation early.
 
 ## Safe tool-calling (`llm_step` + `call_tool`)
 

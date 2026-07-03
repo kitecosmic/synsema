@@ -68,11 +68,16 @@ pub struct LocalKnobs {
     pub temperature: f64,
     /// `SYNSEMA_LLM_MAX_CONCURRENT`: instancias máximas del modelo (default 1 = serializa).
     pub max_concurrent: usize,
+    /// `SYNSEMA_LLM_STREAM_BUFFER` (F3-A): chunks en vuelo entre la generación y la
+    /// emisión de `call_stream`. El préstamo del pool se libera al terminar la
+    /// GENERACIÓN aunque el cliente siga drenando; un consumidor lento bloquea al
+    /// productor recién cuando el buffer se llena.
+    pub stream_buffer: usize,
 }
 
 impl Default for LocalKnobs {
     fn default() -> Self {
-        Self { ctx: 4096, threads: None, temperature: 0.0, max_concurrent: 1 }
+        Self { ctx: 4096, threads: None, temperature: 0.0, max_concurrent: 1, stream_buffer: 32 }
     }
 }
 
@@ -203,17 +208,21 @@ fn read_content(path: &str) -> Result<(gguf_file::Content, File), String> {
     Ok((content, file))
 }
 
-/// Crea UNA instancia del modelo (pesos + KV cache propio). Se llama en la carga inicial
-/// y cuando el pool crece (max_concurrent > 1).
-fn build_model_instance(path: &str, arch: &str) -> Result<GgufModel, String> {
-    let (content, mut file) = read_content(path)?;
+/// Construye la instancia desde un `Content` + reader YA leídos (F3-C: la carga inicial
+/// reusa la única pasada de `read_content` — los offsets de tensores en `Content` son
+/// absolutos, así que el reader posicionado tras el header sirve tal cual).
+fn build_model_from(
+    content: gguf_file::Content,
+    file: &mut File,
+    arch: &str,
+) -> Result<GgufModel, String> {
     let device = Device::Cpu;
     match arch {
-        "llama" => quantized_llama::ModelWeights::from_gguf(content, &mut file, &device)
+        "llama" => quantized_llama::ModelWeights::from_gguf(content, file, &device)
             .map(GgufModel::Llama),
-        "qwen2" => quantized_qwen2::ModelWeights::from_gguf(content, &mut file, &device)
+        "qwen2" => quantized_qwen2::ModelWeights::from_gguf(content, file, &device)
             .map(GgufModel::Qwen2),
-        "qwen3" => quantized_qwen3::ModelWeights::from_gguf(content, &mut file, &device)
+        "qwen3" => quantized_qwen3::ModelWeights::from_gguf(content, file, &device)
             .map(GgufModel::Qwen3),
         other => {
             return Err(format!(
@@ -225,9 +234,19 @@ fn build_model_instance(path: &str, arch: &str) -> Result<GgufModel, String> {
     .map_err(|e| format!("no se pudieron cargar los pesos: {}", e))
 }
 
+/// Crea UNA instancia del modelo (pesos + KV cache propio) leyendo el GGUF. Sólo la usa
+/// el pool cuando CRECE (`max_concurrent > 1`, opt-in raro) — la carga inicial va por
+/// `build_model_from` con el `Content` ya leído (F3-C: una sola lectura por carga).
+fn build_model_instance(path: &str, arch: &str) -> Result<GgufModel, String> {
+    let (content, mut file) = read_content(path)?;
+    build_model_from(content, &mut file, arch)
+}
+
 /// Carga completa: metadata + tokenizer + template + primera instancia del modelo.
+/// UNA sola lectura del GGUF (F3-C): el `Content`/reader de la pasada de metadata se
+/// reusa para construir los pesos al final.
 fn load_gguf(path: &str, max_concurrent: usize) -> Result<LoadedGguf, String> {
-    let (content, _file) = read_content(path)?;
+    let (content, mut file) = read_content(path)?;
     let md = &content.metadata;
 
     let arch = md
@@ -275,7 +294,7 @@ fn load_gguf(path: &str, max_concurrent: usize) -> Result<LoadedGguf, String> {
         .and_then(|v| v.to_bool().ok())
         .unwrap_or(spm);
 
-    let first = build_model_instance(path, &arch)?;
+    let first = build_model_from(content, &mut file, &arch)?;
     Ok(LoadedGguf {
         path: path.to_string(),
         arch,
@@ -792,6 +811,42 @@ pub fn parse_local_step(output: &str, tools: &[ToolSpec]) -> LlmStep {
 }
 
 // =========================================================
+// Puente generación→emisión con buffer acotado (F3-A)
+// =========================================================
+
+/// Corre `producer` en un hilo scoped y puentea sus chunks hacia `on_chunk` (invocado
+/// en el hilo LLAMADOR) por un canal ACOTADO de `buffer` chunks. Semántica:
+/// - El productor termina y suelta sus recursos (el préstamo del pool) aunque el
+///   consumidor siga drenando el buffer — esa es la ganancia con `MAX_CONCURRENT=1`.
+/// - Consumidor lento → el productor se bloquea recién con el buffer LLENO
+///   (backpressure acotada, no cola infinita).
+/// - `on_chunk` → `false` (o error del sink) → se dropea el receiver → el próximo
+///   `send` del productor falla → su sink devuelve `false` → early-stop de F2 intacto,
+///   ahora vía canal.
+/// - `thread::scope` garantiza el join: ningún hilo sobrevive a la llamada.
+/// - Orden y byte-exactitud: el canal es FIFO y no parte ni funde chunks.
+fn pump_chunks<T: Send>(
+    buffer: usize,
+    producer: impl FnOnce(&mut dyn FnMut(&str) -> bool) -> T + Send,
+    on_chunk: &mut dyn FnMut(&str) -> bool,
+) -> Result<T, String> {
+    std::thread::scope(|s| {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(buffer.max(1));
+        // `tx` se mueve ENTERO al hilo productor (no queda copia acá): cuando el
+        // productor termina, el canal se cierra y el drenaje de abajo corta solo.
+        let gen = s.spawn(move || {
+            producer(&mut |chunk: &str| tx.send(chunk.to_string()).is_ok())
+        });
+        for chunk in rx {
+            if !on_chunk(&chunk) {
+                break; // dropea `rx` → el productor ve el canal cerrado y corta
+            }
+        }
+        gen.join().map_err(|_| "el hilo de generación abortó".to_string())
+    })
+}
+
+// =========================================================
 // El provider
 // =========================================================
 
@@ -864,6 +919,10 @@ impl LLMProvider for LocalGgufProvider {
 
     /// Streaming real (F2): el único provider que emite token a token. Los errores van
     /// como RETORNO `"[local error: …]"` (patrón de la casa), nunca por chunks.
+    ///
+    /// F3-A: la generación corre en un hilo scoped y los chunks pasan por un canal
+    /// acotado (`SYNSEMA_LLM_STREAM_BUFFER`, default 32) — ver `pump_chunks`. El camino
+    /// sin sink (`call`/`call_step`) no cambia ni un byte.
     fn call_stream(
         &self,
         request: &LLMRequest,
@@ -872,9 +931,14 @@ impl LLMProvider for LocalGgufProvider {
         let prompt = request.data.get("prompt").cloned().unwrap_or_default();
         let context = request.data.get("context").cloned().unwrap_or_default();
         let user = local_user_content(&prompt, &context);
-        let content = match self.generate_text(&user, Some(on_chunk)) {
-            Ok((text, _)) => text,
-            Err(e) => format!("[local error: {}]", e),
+        let result = pump_chunks(
+            self.knobs.stream_buffer,
+            |sink| self.generate_text(&user, Some(sink)),
+            on_chunk,
+        );
+        let content = match result {
+            Ok(Ok((text, _))) => text,
+            Ok(Err(e)) | Err(e) => format!("[local error: {}]", e),
         };
         LLMResponse { content, model: self.file_name.clone() }
     }
@@ -1037,6 +1101,91 @@ mod tests {
         assert_eq!(ChatTemplate::Plain.apply("hi"), "hi\n");
     }
 
+    // -- F3-A: pump_chunks (deterministas, sin modelo) --
+
+    // Orden FIFO intacto y byte-exactitud: lo que el productor emite es lo que el
+    // consumidor ve, chunk a chunk, y el retorno del productor llega entero.
+    #[test]
+    fn pump_chunks_order_and_exactness() {
+        let chunks_in = ["Ho", "la", " mundo"];
+        let mut got: Vec<String> = Vec::new();
+        let r = pump_chunks(
+            4,
+            |sink| {
+                let mut full = String::new();
+                for c in chunks_in {
+                    if !sink(c) {
+                        break;
+                    }
+                    full.push_str(c);
+                }
+                full
+            },
+            &mut |c| {
+                got.push(c.to_string());
+                true
+            },
+        );
+        assert_eq!(r.unwrap(), "Hola mundo");
+        assert_eq!(got, vec!["Ho".to_string(), "la".to_string(), " mundo".to_string()]);
+    }
+
+    // Early-stop vía receiver dropeado: `on_chunk` → false al PRIMER chunk → el
+    // productor ve el canal cerrado en su próximo send y corta (no produce los 5).
+    #[test]
+    fn pump_chunks_early_stop_via_receiver_drop() {
+        let mut n = 0;
+        let r = pump_chunks(
+            1,
+            |sink| {
+                let mut sent = 0;
+                for c in ["a", "b", "c", "d", "e"] {
+                    if !sink(c) {
+                        break;
+                    }
+                    sent += 1;
+                }
+                sent
+            },
+            &mut |_| {
+                n += 1;
+                false
+            },
+        );
+        assert_eq!(n, 1, "el consumidor debía ver exactamente un chunk");
+        // Con buffer 1 el productor puede colar a lo sumo un chunk extra antes de ver
+        // el canal cerrado — pero jamás los cinco.
+        assert!(r.unwrap() <= 2, "el productor debía cortar temprano");
+    }
+
+    // La ganancia F3-A: el productor TERMINA (y soltaría el préstamo del pool) mientras
+    // el consumidor lento sigue drenando el buffer.
+    #[test]
+    fn pump_chunks_producer_finishes_before_slow_drain() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let done = AtomicBool::new(false);
+        let mut last_saw_done = false;
+        pump_chunks(
+            32,
+            |sink| {
+                for c in ["a", "b", "c", "d"] {
+                    sink(c);
+                }
+                done.store(true, Ordering::SeqCst);
+            },
+            &mut |_| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                last_saw_done = done.load(Ordering::SeqCst);
+                true
+            },
+        )
+        .unwrap();
+        assert!(
+            last_saw_done,
+            "el productor debía terminar antes de que el consumidor lento drenara todo"
+        );
+    }
+
     // -- Tests en vivo (gated por SYNSEMA_TEST_GGUF; skip limpio si falta — patrón
     //    dev-db). El GGUF JAMÁS va al repo: bajalo a mano y exportá el path. --
 
@@ -1120,6 +1269,48 @@ mod tests {
             b.content.to_lowercase().contains("banana"),
             "la llamada post-corte no respondió a su prompt (¿KV contaminado?): {}",
             b.content
+        );
+    }
+
+    // F3-A §5.2 (live): con MAX_CONCURRENT=1, una SEGUNDA llamada NO espera a que el
+    // consumidor lento del primer stream termine de drenar — el préstamo del pool se
+    // libera al terminar la GENERACIÓN (pre-F3A la segunda esperaba el drenaje entero).
+    #[test]
+    fn live_stream_slow_drain_releases_pool() {
+        let Some(path) = test_gguf_path() else { return };
+        let p = Arc::new(LocalGgufProvider::new(path, 16, LocalKnobs::default()));
+        // Warmup: paga la carga para que los tiempos de abajo midan sólo generación.
+        let mut warm = LLMRequest::new("reason");
+        warm.data.insert("prompt".to_string(), "hi".to_string());
+        let _ = p.call(&warm);
+
+        let p1 = p.clone();
+        let h = std::thread::spawn(move || {
+            let mut req = LLMRequest::new("stream");
+            req.data
+                .insert("prompt".to_string(), "Count from one to ten in words.".to_string());
+            let t0 = std::time::Instant::now();
+            let _ = p1.call_stream(&req, &mut |_| {
+                std::thread::sleep(std::time::Duration::from_millis(300)); // cliente lento
+                true
+            });
+            t0.elapsed()
+        });
+        // Dar tiempo a que el stream 1 esté en curso, luego competir por la instancia.
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        let mut req2 = LLMRequest::new("reason");
+        req2.data
+            .insert("prompt".to_string(), "Reply with exactly one word: pong".to_string());
+        let t0 = std::time::Instant::now();
+        let r2 = p.call(&req2);
+        let fast = t0.elapsed();
+        let slow_total = h.join().expect("hilo del stream lento");
+        assert!(!r2.content.starts_with("[local error"), "error: {}", r2.content);
+        assert!(
+            fast.as_secs_f64() < slow_total.as_secs_f64() * 0.8,
+            "la 2ª llamada no debía esperar el drenaje completo (fast {:?} vs slow {:?})",
+            fast,
+            slow_total
         );
     }
 
