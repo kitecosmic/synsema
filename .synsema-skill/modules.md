@@ -67,7 +67,11 @@ Enums export too: `export enum Status`, then construct and `match` across files
 - **Transitive imports:** a module can `use` another. If `main` uses `core` and `core` uses `data`, the
   whole chain loads.
 - **Loaded once (cached):** importing the same module twice (even from different files) runs its
-  top-level a single time and shares the same exports.
+  top-level a single time and shares the same exports. This holds under `serve` and `parallel_map`
+  too: within a request/worker, all importers share the same module instance — a shared
+  `state`/`config` module keeps one identity (write via one importer, read via another), same as
+  `run`. Across requests/workers nothing is shared (CSP isolation): use `state_*`, SQL or
+  `remember` for that.
 - **Cycles are detected:** a circular import gives a clear error (`circular import: …`), not a hang.
 - **A module must not contain a `serve` block or a top-level `require`** — those belong to the entry
   file. (A per-task `require` *inside* a task is fine.)
