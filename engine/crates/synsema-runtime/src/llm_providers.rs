@@ -528,6 +528,10 @@ fn local_knobs_from_config(store: &EnvStore) -> crate::llm_local::LocalKnobs {
             .and_then(|s| s.trim().parse::<usize>().ok())
             .filter(|&n| n > 0)
             .unwrap_or(defaults.max_concurrent),
+        stream_buffer: resolve_knob("SYNSEMA_LLM_STREAM_BUFFER", store)
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(defaults.stream_buffer),
     }
 }
 
@@ -967,6 +971,7 @@ mod tests {
             "SYNSEMA_LLM_THREADS",
             "SYNSEMA_LLM_TEMPERATURE",
             "SYNSEMA_LLM_MAX_CONCURRENT",
+            "SYNSEMA_LLM_STREAM_BUFFER",
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "MINIMAX_API_KEY",
@@ -1017,7 +1022,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_llm_env();
         let store = EnvStore::parse(
-            "SYNSEMA_LLM_CTX=2048\nSYNSEMA_LLM_TEMPERATURE=0.7\nSYNSEMA_LLM_MAX_CONCURRENT=2\n",
+            "SYNSEMA_LLM_CTX=2048\nSYNSEMA_LLM_TEMPERATURE=0.7\nSYNSEMA_LLM_MAX_CONCURRENT=2\nSYNSEMA_LLM_STREAM_BUFFER=8\n",
         );
 
         // (1) Sólo el `.env`: gana el store.
@@ -1025,6 +1030,7 @@ mod tests {
         assert_eq!(k.ctx, 2048);
         assert_eq!(k.temperature, 0.7);
         assert_eq!(k.max_concurrent, 2);
+        assert_eq!(k.stream_buffer, 8);
         assert_eq!(k.threads, None);
 
         // (2) El environ GANA sobre el `.env`.
