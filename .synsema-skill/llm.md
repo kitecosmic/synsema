@@ -115,6 +115,68 @@ Security: the only capability needed to reach the LLM is `require llm` — the n
 configured host is part of that, **not** a separate `net` grant (the runtime fixes the host; the
 program can't change it). Use `net` only for egress the program itself directs.
 
+**Embedded local provider (`local`) — GGUF in-process, zero network.** With a binary compiled with
+`--features llm-local` (`cargo install --path crates/synsema-cli --features llm-local`), the runtime
+can run a quantized GGUF **inside the process** (candle, CPU): no server, no API key, no socket at
+all — the only provider that works under a total `deny net`. Always explicit (never auto-selected):
+
+```
+# .env — no API key of any kind:
+SYNSEMA_LLM_PROVIDER=local
+SYNSEMA_LLM_MODEL=C:\models\qwen2.5-0.5b-instruct-q4_k_m.gguf   # path to the .gguf (required)
+```
+
+| Knob | Purpose | Default |
+|---|---|---|
+| `SYNSEMA_LLM_MODEL` | **Path to the `.gguf` file** (required; no default) | — |
+| `SYNSEMA_LLM_CTX` | Context window (capped to the GGUF's own limit) | `4096` |
+| `SYNSEMA_LLM_THREADS` | CPU threads for inference | engine default (all cores) |
+| `SYNSEMA_LLM_TEMPERATURE` | `0` = greedy/deterministic; `>0` = sampling (fixed seed) | `0` |
+| `SYNSEMA_LLM_MAX_CONCURRENT` | Max model instances; `1` serializes concurrent calls under `serve` | `1` |
+
+`SYNSEMA_LLM_MAX_TOKENS` applies as usual. Supported architectures: **llama, qwen2, qwen3**
+(quantized GGUF); anything else fails with a clear `[local error: …]`. Tool-calling (`llm_step`)
+works via prompting — the model returns a `{"tool": …, "args": …}` JSON that the runtime parses.
+
+Honest limits (measured, see `specs/informe-f0-llm-local.md`): built for **short prompts** — CPU
+prefill is ~12 tok/s, so a 1000-token prompt takes ~90s on a 0.5B; generation is ~11 tok/s (0.5B)
+/ ~5 tok/s (3B, 4 threads). Model load (7s for 0.5B, ~35s for 3B) is paid **once per process** —
+under `serve` the first request loads, the rest reuse (measured: 8.2s → 1.3s). RAM: ~1GB (0.5B) /
+~2.4GB (3B). On a binary **without** the feature, `SYNSEMA_LLM_PROVIDER=local` prints a clear
+stderr notice and stays offline (placeholders) — it never silently falls back to another provider.
+
+## Streaming (`llm_stream`)
+
+`llm_stream(prompt, context, on_chunk)` generates with the configured provider (local OR network),
+invoking the task `on_chunk` with each text fragment as it is produced, and returns the full text.
+Gated by `llm` like every LLM op. With the embedded `local` provider it streams token by token —
+with a network provider it emits ONE chunk (the whole response), same program, zero changes.
+
+Under a `serve` SSE route it composes with `send` — **define the emitting task INSIDE the `stream`
+block** (`send` is a statement that only parses inside a `stream` block, so a lambda like
+`(tok) => send(tok)` or a top-level task won't parse):
+
+```
+require llm
+require serve(8080)
+
+serve on 8080
+    route "GET /chat"
+        stream
+            task emit(tok)
+                send tok
+            let full be llm_stream("Count from one to twenty in words.", "", emit)
+            send full as "full"
+```
+
+Measured with the 0.5B local model: first token reaches the client in **~1.4s** (warm) while the
+full answer takes ~9.4s — that latency gap is the feature. If `on_chunk` fails (e.g. the `send` of
+a disconnected SSE client), generation STOPS and the error propagates like any failed `send`
+(recoverable with `try`/`recover`). Offline (no provider): returns `"[no llm provider]"` without
+invoking `on_chunk`. Note: with the local provider the emission runs while holding the model
+instance — with `SYNSEMA_LLM_MAX_CONCURRENT=1` (default) a slow SSE client serializes other LLM
+calls for the duration of the stream.
+
 ## Safe tool-calling (`llm_step` + `call_tool`)
 
 The four operations above return TEXT. To let the model pick a *tool* (a structured `{tool, args}`

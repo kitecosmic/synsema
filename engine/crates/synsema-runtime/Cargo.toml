@@ -18,3 +18,15 @@ serde_json.workspace = true
 rusqlite.workspace = true
 # A1 Fase 2: ejecutor M:N de parallel_map sobre tokio (runtime + spawn_blocking + semáforo).
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "sync"] }
+# LLM local (feature `llm-local`): candle + tokenizers, opcionales — el build default
+# no los compila ni los descarga al árbol de deps. Ver src/llm_local.rs.
+candle-core = { workspace = true, optional = true }
+candle-transformers = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+
+[features]
+# Provider LLM `local` (spec LLM-LOCAL F1): inferencia GGUF cuantizada embebida (candle,
+# CPU). Opt-in explícito: `cargo build --features llm-local` (o vía synsema-cli). Sin la
+# feature, `SYNSEMA_LLM_PROVIDER=local` avisa por stderr y queda offline (placeholders) —
+# jamás elige otro provider en silencio.
+llm-local = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers"]
