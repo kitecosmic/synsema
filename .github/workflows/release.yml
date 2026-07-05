@@ -50,10 +50,16 @@ jobs:
       # SYNSEMA_VERSION = el tag que disparó el release (p. ej. v0.3.2). El binario lo
       # hornea como su versión (ver crates/synsema-cli/build.rs) → `synsema version`
       # reporta el release, no el commit de main.
+      #
+      # `--features llm-local` (desde v0.4.5): los binarios oficiales traen el provider
+      # LLM local embebido (GGUF con candle, CPU). Sin RUSTFLAGS de target-cpu: el binario
+      # queda portable (los kernels AVX2 cuantizados de candle son compile-time y NO se
+      # activan) — el prefill local es ~3× más lento que un build propio con
+      # `-C target-cpu=native`; la doc (página 52) enseña ese build para quien lo quiera.
       - name: Build
         env:
           SYNSEMA_VERSION: ${{ github.ref_name }}
-        run: cargo build --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --target ${{ matrix.target }}
+        run: cargo build --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'
