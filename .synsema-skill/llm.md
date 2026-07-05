@@ -135,9 +135,30 @@ SYNSEMA_LLM_MODEL=C:\models\qwen2.5-0.5b-instruct-q4_k_m.gguf   # path to the .g
 | `SYNSEMA_LLM_MAX_CONCURRENT` | Max model instances; `1` serializes concurrent calls under `serve` | `1` |
 | `SYNSEMA_LLM_STREAM_BUFFER` | Chunks in flight between generation and `llm_stream` emission | `32` |
 
-`SYNSEMA_LLM_MAX_TOKENS` applies as usual. Supported architectures: **llama, qwen2, qwen3**
-(quantized GGUF); anything else fails with a clear `[local error: …]`. Tool-calling (`llm_step`)
-works via prompting — the model returns a `{"tool": …, "args": …}` JSON that the runtime parses.
+`SYNSEMA_LLM_MAX_TOKENS` applies as usual. Supported architectures: **llama, qwen2, qwen3** —
+the `general.architecture` string in the GGUF header, not the brand name; anything else fails with
+a clear `[local error: …]`. Popular families convert to GGUF declaring one of those three, so real
+coverage is wider. Verified live (probe = load + question + coherent answer + clean stop):
+
+| Model (GGUF probed) | declares | Verified |
+|---|---|---|
+| Qwen2.5 Instruct 0.5B/3B | `qwen2` | ✅ |
+| Qwen3 0.6B | `qwen3` | ✅ thinking model — emits raw `<think>…</think>`; budget max_tokens for it |
+| Qwen3 4B **Instruct**-2507 | `qwen3` | ✅ (2.5 GB GGUF, ran in 8 GB RAM); the 4B **Thinking**-2507 runs but thinks for thousands of tokens — impractical on CPU, prefer Instruct |
+| Mistral 7B Instruct v0.3 | `llama` | ✅ its `[INST]` template is auto-detected |
+| Llama 3.2 1B Instruct | `llama` | ✅ llama3 template auto-detected |
+| SmolLM2 135M Instruct | `llama` | ✅ chatml |
+| DeepSeek-R1-Distill-Qwen 1.5B | `qwen2` | ✅ runs in plain mode; strip the `<think>` tags in your code |
+| TinyLlama 1.1B Chat | `llama` | ⚠️ loads and runs, but its zephyr template isn't recognized → plain fallback, behaves like a BASE model |
+
+A supported arch loads and runs; **chat usability also needs a recognized chat template** (chatml /
+llama3 / `[INST]`; otherwise plain fallback). gemma/phi/glm GGUFs are rejected on purpose (candle
+exposes no public KV-cache reset for them yet — request isolation first). Tip: ollama downloads are
+plain GGUF blobs and far faster than HF (~19 vs ~0.3 MB/s measured) — `ollama pull llama3.2:1b`,
+then point `SYNSEMA_LLM_MODEL` at the blob under `~/.ollama/models/blobs/sha256-…` (the digest is
+in the manifest under `~/.ollama/models/manifests/…`; ollama need not be running). Tool-calling
+(`llm_step`) works via prompting — the model returns a `{"tool": …, "args": …}` JSON that the
+runtime parses.
 
 Honest limits (measured, see `specs/informe-f0-llm-local.md`): built for **short prompts** — CPU
 prefill is ~12 tok/s, so a 1000-token prompt takes ~90s on a 0.5B; generation is ~11 tok/s (0.5B)
@@ -145,6 +166,21 @@ prefill is ~12 tok/s, so a 1000-token prompt takes ~90s on a 0.5B; generation is
 under `serve` the first request loads, the rest reuse (measured: 8.2s → 1.3s). RAM: ~1GB (0.5B) /
 ~2.4GB (3B). On a binary **without** the feature, `SYNSEMA_LLM_PROVIDER=local` prints a clear
 stderr notice and stays offline (placeholders) — it never silently falls back to another provider.
+
+**Build for speed — one flag triples prefill (measured, informe F3).** candle selects its AVX2
+quantized kernels at **compile time** (`#[cfg(target_feature = "avx2")]`) and Rust's default x86-64
+target does NOT enable AVX2 — a plain build runs the scalar path. Compile your own llm-local binary
+with:
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo install --path crates/synsema-cli --features llm-local --force
+```
+
+Measured gain: prefill **~3.1×** on the 0.5B (~11 → ~35 tok/s; a 512-token prompt drops from 48s to
+15.3s), 1.5× on the 3B, generation +21% (0.5B; the 3B barely moves — generation is memory-bound).
+The limits in the paragraph above are WITHOUT the flag. `native` ties the binary to that machine's
+CPU — right for your own VPS/dev box; for a binary you distribute, use
+`-C target-cpu=x86-64-v3` (AVX2+FMA, covers x86 CPUs from ~2015; fails cleanly on older ones).
 
 ## Streaming (`llm_stream`)
 
