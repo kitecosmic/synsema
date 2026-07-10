@@ -17,16 +17,29 @@ otherwise
     cancel()
 ```
 
-## Backends
-- **Terminal** — stdin/stdout, interactive
-- **Auto** — auto-approves everything (for CI/testing)
-- **Queue** — async, agent blocks while human responds later (web UI)
-- **Callback** — programmatic, for embedding
+## Timeouts: `within` (optional, on approve/confirm/ask)
+`approve "Delete prod?" within 2h` — max wait for the human answer (suffixes `s|m|h|d`).
+Precedence: `within` > `SYNSEMA_HUMAN_TIMEOUT` (seconds, env/`.env`) > 300s. On expiry the gate
+returns `false` (ask → its fallback) + a one-time stderr notice. Never hangs forever.
+
+## Where the answer comes from (guaranteed: NEVER silently auto-approved)
+- **`run` with a TTY** — prompts in the terminal (`[approve] … (y/n):`, accepts y/yes/si/sí/n/no)
+  and waits with no timeout; EOF denies.
+- **`run` without TTY (pipes/CI/agent-driven)** — DENIES instantly, fail-closed, with a one-time
+  notice that explicitly tells AI agents a HUMAN must approve. An agent cannot fake approval.
+- **`serve`** — the gate is QUEUED and the request blocks until a human answers or the deadline
+  denies. The server console prints one line per pending approval with a **one-time token**
+  (64 hex) and the ready-to-use command. Reserved routes: `GET /approvals` (lists
+  `{id, message, type, expires_at}` — never tokens) and `POST /approvals/{id}` with
+  `{"token", "decision": true|false}` (or `{"token", "value"}` for ask) → 200/400/403/404.
+  Wrong token = 403 and the gate keeps waiting; the token is single-use and expires with the
+  deadline. A blocked gate holds its request thread — use `within` of minutes under serve.
+- **`test`/`conform`** — deterministic auto-pass (suites never block on a prompt).
 
 ## No TTY (pipes / CI / redirection)
-In `synsema run` **without an interactive TTY** (output piped, run in CI, or stdin redirected),
-free-text `ask "question"` returns `""` (empty string) and `ask "question" with [opts]` takes the
-**first** option. Don't rely on free-text `ask` for input in those contexts.
+In `synsema run` **without an interactive TTY**, free-text `ask "question"` returns `""` (empty
+string) and `ask "question" with [opts]` takes the **first** option — with a one-time notice
+that no human actually answered. Don't rely on free-text `ask` for input in those contexts.
 
 For raw stdin that works with pipes/redirection, use **`read_line(prompt?)`** (returns the line, or
 `nothing` on EOF) — see [builtins.md](builtins.md):
