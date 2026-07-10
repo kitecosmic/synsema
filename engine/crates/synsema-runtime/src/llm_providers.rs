@@ -1381,6 +1381,29 @@ const KEY_VARS: [(&str, &str); 4] = [
     ("DEEPSEEK_API_KEY", "deepseek"),
 ];
 
+/// Lista CANÓNICA de todas las env-vars que el runtime LLM reconoce (knobs + keys).
+/// La consumen `synsema init` (test de sincronía del template — Spec DX-2) y sirve de
+/// referencia única. ⚠️ Al agregar un knob nuevo: sumalo ACÁ — si el template de `init`
+/// no se actualiza a la par, el test `env_example_in_sync_with_engine_knobs` del CLI
+/// rompe el build a propósito (anti-rot del template).
+pub const LLM_ENV_VARS: &[&str] = &[
+    "SYNSEMA_LLM_PROVIDER",
+    "SYNSEMA_LLM_MODEL",
+    "SYNSEMA_LLM_MAX_TOKENS",
+    "SYNSEMA_LLM_TIMEOUT",
+    "SYNSEMA_LLM_HTTP_STREAM",
+    "SYNSEMA_LLM_BASE_URL",
+    "SYNSEMA_LLM_CTX",
+    "SYNSEMA_LLM_THREADS",
+    "SYNSEMA_LLM_TEMPERATURE",
+    "SYNSEMA_LLM_MAX_CONCURRENT",
+    "SYNSEMA_LLM_STREAM_BUFFER",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "MINIMAX_API_KEY",
+    "DEEPSEEK_API_KEY",
+];
+
 /// Redacta el userinfo de una URL (`https://user:pass@host/...` → `https://***@host/...`)
 /// para que un `base_url` con credenciales embebidas no las imprima.
 fn redact_url_userinfo(url: &str) -> String {
