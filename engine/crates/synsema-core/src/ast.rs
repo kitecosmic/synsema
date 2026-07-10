@@ -267,6 +267,10 @@ pub enum NodeKind {
     ApproveStatement {
         message: Box<Node>,
         context: Option<Box<Node>>,
+        /// `within <n><s|m|h|d>` opcional: espera máxima (en segundos) por la
+        /// respuesta humana antes de denegar fail-closed. `None` = sin `within`
+        /// (decide el knob/default del host).
+        timeout: Option<f64>,
     },
     ShowStatement {
         value: Box<Node>,
@@ -274,10 +278,14 @@ pub enum NodeKind {
     },
     ConfirmStatement {
         message: Box<Node>,
+        /// `within` opcional (ver `ApproveStatement::timeout`).
+        timeout: Option<f64>,
     },
     AskExpression {
         prompt: Box<Node>,
         options: Option<Box<Node>>,
+        /// `within` opcional (ver `ApproveStatement::timeout`).
+        timeout: Option<f64>,
     },
 
     // -- LLM / Razonamiento --

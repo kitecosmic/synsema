@@ -1109,15 +1109,57 @@ impl Parser {
 
     // -- human interaction --
 
+    /// `within <n><s|m|h|d>` opcional al final de approve/confirm/ask: espera máxima
+    /// (segundos) por la respuesta humana. `within 1d` llega como UN token (el lexer
+    /// consume el sufijo `d` como literal Decimal) → días; para s/m/h el sufijo es el
+    /// identificador siguiente. Sin `within` → `None`.
+    fn parse_within_timeout(&mut self) -> Result<Option<f64>, ParseError> {
+        if !self.check_word("within") {
+            return Ok(None);
+        }
+        self.advance(); // soft keyword 'within'
+        let num_tok = self.expect(
+            TokenType::Number,
+            "Expected a duration after 'within' (e.g. within 90s, 2m, 1h, 1d)",
+        )?;
+        let n = num_tok.as_number();
+        if matches!(n, Number::Decimal(_)) {
+            // sufijo `d` ya consumido por el lexer (literal Decimal) → días
+            return Ok(Some(n.to_f64() * 86400.0));
+        }
+        let suf_tok = self.expect(
+            TokenType::Identifier,
+            "Expected a duration suffix after 'within': s, m, h or d (e.g. within 90s)",
+        )?;
+        let mult = match suf_tok.as_str() {
+            "s" => 1.0,
+            "m" => 60.0,
+            "h" => 3600.0,
+            "d" => 86400.0,
+            other => {
+                return Err(ParseError::new(
+                    format!(
+                        "Invalid duration suffix '{}' after 'within' — use s, m, h or d (e.g. within 90s)",
+                        other
+                    ),
+                    suf_tok.location.clone(),
+                ))
+            }
+        };
+        Ok(Some(n.to_f64() * mult))
+    }
+
     fn parse_approve(&mut self) -> Result<Node, ParseError> {
         let loc = self.location();
         self.advance();
         let message = self.parse_expression()?;
+        let timeout = self.parse_within_timeout()?;
         Ok(Node::new(
             loc,
             NodeKind::ApproveStatement {
                 message: Box::new(message),
                 context: None,
+                timeout,
             },
         ))
     }
@@ -1143,10 +1185,12 @@ impl Parser {
         let loc = self.location();
         self.advance();
         let message = self.parse_expression()?;
+        let timeout = self.parse_within_timeout()?;
         Ok(Node::new(
             loc,
             NodeKind::ConfirmStatement {
                 message: Box::new(message),
+                timeout,
             },
         ))
     }
@@ -2313,11 +2357,13 @@ impl Parser {
         if self.match_tok(TokenType::With).is_some() {
             options = Some(Box::new(self.parse_expression()?));
         }
+        let timeout = self.parse_within_timeout()?;
         Ok(Node::new(
             loc,
             NodeKind::AskExpression {
                 prompt: Box::new(prompt),
                 options,
+                timeout,
             },
         ))
     }
@@ -2775,5 +2821,74 @@ mod tests {
             NodeKind::MatchStatement { otherwise, .. } => assert!(otherwise.is_none()),
             other => panic!("esperaba MatchStatement, got {:?}", other),
         }
+    }
+
+    // -- `within <n><s|m|h|d>` en approve/confirm/ask (A1.v2) --
+
+    fn approve_timeout(src: &str) -> Option<f64> {
+        let p = parse_ok(src);
+        match &p.statements[0].kind {
+            NodeKind::ApproveStatement { timeout, .. } => *timeout,
+            other => panic!("esperaba ApproveStatement, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn within_suffixes_to_seconds() {
+        assert_eq!(approve_timeout("approve \"x\" within 90s"), Some(90.0));
+        assert_eq!(approve_timeout("approve \"x\" within 2m"), Some(120.0));
+        assert_eq!(approve_timeout("approve \"x\" within 1h"), Some(3600.0));
+        // `1d` llega como UN token (el lexer consume el sufijo `d` como Decimal) → días.
+        assert_eq!(approve_timeout("approve \"x\" within 1d"), Some(86400.0));
+        // decimal con sufijo separado
+        assert_eq!(approve_timeout("approve \"x\" within 1.5h"), Some(5400.0));
+    }
+
+    #[test]
+    fn within_absent_is_none() {
+        assert_eq!(approve_timeout("approve \"x\""), None);
+    }
+
+    #[test]
+    fn within_on_confirm_and_ask() {
+        let p = parse_ok("confirm \"y\" within 30s");
+        match &p.statements[0].kind {
+            NodeKind::ConfirmStatement { timeout, .. } => assert_eq!(*timeout, Some(30.0)),
+            other => panic!("esperaba ConfirmStatement, got {:?}", other),
+        }
+        let p = parse_ok("let r be ask \"z\" with [\"a\", \"b\"] within 2m\nprint(r)");
+        let NodeKind::LetBinding { value, .. } = &p.statements[0].kind else {
+            panic!("esperaba LetBinding")
+        };
+        match &value.kind {
+            NodeKind::AskExpression { timeout, options, .. } => {
+                assert_eq!(*timeout, Some(120.0));
+                assert!(options.is_some(), "el `with [opciones]` no debe perderse");
+            }
+            other => panic!("esperaba AskExpression, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn within_invalid_suffix_is_clear_error() {
+        let err = parse_source("approve \"x\" within 90x", "<test>").unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid duration suffix"),
+            "el error debe nombrar el sufijo inválido: {}",
+            err
+        );
+        let err = parse_source("approve \"x\" within", "<test>").unwrap_err();
+        assert!(
+            err.to_string().contains("duration after 'within'"),
+            "el error debe pedir una duración: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn within_is_soft_keyword() {
+        // `within` fuera de un gate sigue siendo un identificador normal.
+        let p = parse_ok("let within be 5\nprint(within)");
+        assert!(matches!(p.statements[0].kind, NodeKind::LetBinding { .. }));
     }
 }

@@ -65,6 +65,59 @@ type SharedDb = Arc<Mutex<DatabaseManager>>;
 /// a mutar globales (que no se propagan entre requests por diseño).
 type SharedState = Arc<Mutex<HashMap<String, SendValue>>>;
 
+/// Cola de aprobaciones humanas de UN serve (A1.v2): compartida entre todos los
+/// workers/handlers del server, más la espera default del knob del host.
+struct ApprovalsShared {
+    queue: Arc<synsema_llm::human::QueueHandler>,
+    /// `SYNSEMA_HUMAN_TIMEOUT` resuelto (environ > `.env`); `None` → la cola aplica
+    /// su default de 300 s. El `within` de cada gate le gana a esto.
+    default_timeout: Option<f64>,
+}
+type ServeApprovals = Arc<ApprovalsShared>;
+
+/// Adapter cola → contrato de stdlib: sirve las rutas reservadas `/approvals` del
+/// server (stdlib no conoce `QueueHandler`; sólo este trait).
+struct QueueGateway(Arc<synsema_llm::human::QueueHandler>);
+
+impl server::ApprovalsGateway for QueueGateway {
+    fn list(&self) -> Vec<server::ApprovalSummary> {
+        self.0
+            .pending_summaries()
+            .into_iter()
+            .map(|s| server::ApprovalSummary {
+                id: s.id,
+                message: s.message,
+                ty: s.ty,
+                expires_at: s.expires_at,
+            })
+            .collect()
+    }
+    fn respond(
+        &self,
+        id: &str,
+        token: &str,
+        decision: Option<bool>,
+        value: Option<&str>,
+    ) -> server::ApprovalOutcome {
+        use synsema_llm::human::RespondOutcome as R;
+        match self.0.respond_with_token(id, token, decision, value) {
+            R::Accepted => server::ApprovalOutcome::Accepted,
+            R::NotFound => server::ApprovalOutcome::NotFound,
+            R::BadToken => server::ApprovalOutcome::BadToken,
+        }
+    }
+}
+
+/// Espera default del host para los gates humanos (D1): knob `SYNSEMA_HUMAN_TIMEOUT`
+/// en segundos, con la MISMA precedencia que los knobs LLM (environ > `.env` — reusa
+/// `resolve_knob`, única implementación). Inválido/ausente/no-positivo → `None` (la
+/// cola aplica su default de 300 s).
+fn resolve_human_timeout(store: &synsema_stdlib::secrets::EnvStore) -> Option<f64> {
+    crate::llm_providers::resolve_knob("SYNSEMA_HUMAN_TIMEOUT", store)
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|t| *t > 0.0)
+}
+
 use crate::engine::{wire_common_with_state, wire_swarm_hooks, INTERP_STACK_SIZE};
 
 // =========================================================
@@ -613,6 +666,7 @@ fn build_base_interp(
     shared_progress: &SharedProgressStore,
     on_write_progress: &OnWriteProgressFn,
     shared_state: &SharedState,
+    approvals: &ServeApprovals,
     secure: bool,
 ) -> (Interpreter, Rc<RefCell<CapabilitySet>>) {
     let mut interp = Interpreter::new();
@@ -640,14 +694,15 @@ fn build_base_interp(
     // para que reason/decide/generate/llm_step de los handlers no caigan a placeholders.
     // Por-worker (no por-request): el provider se resuelve una vez al construir la base.
     crate::engine::wire_real_llm_provider(&mut interp);
-    // Gates humanos (DX-3 etapa 1, A1.v1): bajo serve NO hay canal humano — un
-    // `approve`/`confirm` en un handler se DENIEGA fail-closed con aviso único (antes se
-    // auto-aprobaba en silencio: un gate de aprobación humana que se auto-pasa en
-    // producción). v2 (cola con timeout + respuesta out-of-band) llega por spec aparte.
+    // Gates humanos (DX-3 etapa 1, A1.v2): bajo serve, `approve`/`confirm`/`ask` van a
+    // la COLA compartida del server — el hilo del request BLOQUEA hasta la respuesta
+    // humana (POST /approvals/{id} con el token de la consola) o el deadline (`within`
+    // del gate > SYNSEMA_HUMAN_TIMEOUT > 300 s); al vencer DENIEGA fail-closed con
+    // aviso único. OJO: un `within` largo retiene el hilo del request toda la espera —
+    // v2 es para minutos, no días (la persistencia para esperas largas es v3).
     {
-        let mgr = synsema_llm::human::InteractionManager::new(std::sync::Arc::new(
-            synsema_llm::human::DenyHandler::new("serve"),
-        ));
+        let mgr = synsema_llm::human::InteractionManager::new(approvals.queue.clone())
+            .with_default_timeout(approvals.default_timeout);
         interp.set_human_callback(mgr.get_callback());
     }
     // Sobrescribir los builtins de memoria (remember/recall/forget_memory/memory_summary)
@@ -703,6 +758,7 @@ fn with_serve_interp<R>(
     shared_progress: &SharedProgressStore,
     on_write_progress: &OnWriteProgressFn,
     shared_state: &SharedState,
+    approvals: &ServeApprovals,
     secure: bool,
     f: impl FnOnce(&mut Interpreter) -> R,
 ) -> R {
@@ -721,6 +777,7 @@ fn with_serve_interp<R>(
             shared_progress,
             on_write_progress,
             shared_state,
+            approvals,
             secure,
         );
         BaseInterp { interp, caps }
@@ -842,11 +899,12 @@ fn run_route(
     shared_progress: &SharedProgressStore,
     on_write_progress: &OnWriteProgressFn,
     shared_state: &SharedState,
+    approvals: &ServeApprovals,
     body: &[Node],
     ctx: &Ctx,
     secure: bool,
 ) -> GiveOutcome {
-    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, secure, |interp| {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, secure, |interp| {
         match interp.run_request_block(body, request_bindings(ctx)) {
             Ok(_) => GiveOutcome::Give(None),
             Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
@@ -879,12 +937,13 @@ fn run_stream(
     shared_progress: &SharedProgressStore,
     on_write_progress: &OnWriteProgressFn,
     shared_state: &SharedState,
+    approvals: &ServeApprovals,
     body: &[Node],
     ctx: &Ctx,
     secure: bool,
     emit: Emitter,
 ) -> StreamEnd {
-    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, secure, move |interp| {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, secure, move |interp| {
         let cell = Rc::new(RefCell::new(emit));
         let ec = cell.clone();
         interp.set_stream_emit(Rc::new(move |val: SynValue, event: Option<&str>| {
@@ -983,6 +1042,7 @@ fn build_host_table(
     shared_progress: &SharedProgressStore,
     on_write_progress: &OnWriteProgressFn,
     shared_state: &SharedState,
+    approvals: &ServeApprovals,
     swarm: &Arc<Swarm>,
     shared_db: &SharedDb,
     secure: bool,
@@ -1021,9 +1081,10 @@ fn build_host_table(
         let prog_a = shared_progress.clone();
         let owp_a = on_write_progress.clone();
         let st_a = shared_state.clone();
+        let ap_a = approvals.clone();
         let db_a = shared_db.clone();
         let h: AuthHandler = Arc::new(move |token: &str| -> Option<SynValue> {
-            with_serve_interp(&swarm_a, &snap_a, &caps_a, &db_a, &rules_a, &mem_a, &ow_a, &prog_a, &owp_a, &st_a, secure, |interp| {
+            with_serve_interp(&swarm_a, &snap_a, &caps_a, &db_a, &rules_a, &mem_a, &ow_a, &prog_a, &owp_a, &st_a, &ap_a, secure, |interp| {
                 let genv = interp.global_env.clone();
                 let task = match interp.eval(&auth_node, &genv) {
                     Ok(t) => t,
@@ -1084,9 +1145,10 @@ fn build_host_table(
             let prog_c = shared_progress.clone();
             let owp_c = on_write_progress.clone();
             let st_c = shared_state.clone();
+            let ap_c = approvals.clone();
             let db_c = shared_db.clone();
             let handler: Handler = Arc::new(move |ctx: &Ctx| {
-                run_route(&swarm_c, &snap_c, &caps_c, &db_c, &rules_c, &mem_c, &ow_c, &prog_c, &owp_c, &st_c, &body_c, ctx, secure)
+                run_route(&swarm_c, &snap_c, &caps_c, &db_c, &rules_c, &mem_c, &ow_c, &prog_c, &owp_c, &st_c, &ap_c, &body_c, ctx, secure)
             });
 
             let stream_handler: Option<StreamHandler> = if *streaming {
@@ -1100,10 +1162,11 @@ fn build_host_table(
                 let prog_s = shared_progress.clone();
                 let owp_s = on_write_progress.clone();
                 let st_s = shared_state.clone();
+                let ap_s = approvals.clone();
                 let db_s = shared_db.clone();
                 Some(Arc::new(move |ctx: &Ctx, emit: Emitter| {
                     run_stream(
-                        &swarm_s, &snap_s, &caps_s, &db_s, &rules_s, &mem_s, &ow_s, &prog_s, &owp_s, &st_s, &body_s, ctx, secure, emit,
+                        &swarm_s, &snap_s, &caps_s, &db_s, &rules_s, &mem_s, &ow_s, &prog_s, &owp_s, &st_s, &ap_s, &body_s, ctx, secure, emit,
                     )
                 }))
             } else {
@@ -1314,6 +1377,19 @@ fn make_serve_hook(
         );
         let intent = interp.intent().map(|s| s.to_string());
 
+        // Cola de aprobaciones humanas de ESTE serve (A1.v2): una por server,
+        // compartida entre todos los workers/handlers. El OTT de cada pendiente sale
+        // por la consola del server (mismo sink que los logs de serve — D3); el
+        // default de espera viene del knob `SYNSEMA_HUMAN_TIMEOUT` (`within` por gate
+        // le gana; sin nada, 300 s).
+        let approvals: ServeApprovals = {
+            let store = synsema_stdlib::secrets::EnvStore::load_default();
+            Arc::new(ApprovalsShared {
+                queue: Arc::new(synsema_llm::human::QueueHandler::with_notice(serve_log_sink())),
+                default_timeout: resolve_human_timeout(&store),
+            })
+        };
+
         // -- host default (rutas/estáticos/auth a nivel de `serve`) --
         let (routes, static_mounts, auth_handler) = build_host_table(
             interp,
@@ -1330,6 +1406,7 @@ fn make_serve_hook(
             &shared_progress,
             &on_write_progress,
             &shared_state,
+            &approvals,
             &swarm,
             &shared_db,
             secure,
@@ -1371,6 +1448,7 @@ fn make_serve_hook(
                     &shared_progress,
                     &on_write_progress,
                     &shared_state,
+                    &approvals,
                     &swarm,
                     &shared_db,
                     secure,
@@ -1502,6 +1580,9 @@ fn make_serve_hook(
             secure,
         );
         runtime.tls_enabled = use_tls;
+        // Rutas reservadas /approvals (A1.v2): el server responde la cola de gates
+        // humanos vía el gateway (GET lista sin tokens; POST con OTT responde).
+        runtime.approvals = Some(Arc::new(QueueGateway(approvals.queue.clone())));
         // Registrar los vhosts (Lote 1): el dispatch elige por header `Host`.
         for vh in built_vhosts {
             runtime.add_vhost(vh.pattern, vh.routes, vh.static_mounts, vh.auth_handler);
@@ -1804,4 +1885,29 @@ pub fn run_serve_program_with_overrides(
             output: Vec::new(),
             errors: vec!["el motor abortó (probable desborde de stack nativo)".to_string()],
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use synsema_stdlib::secrets::EnvStore;
+
+    // D1: precedencia del default del host para gates humanos — environ > `.env` >
+    // ausente (`None` → la cola aplica 300 s). Un valor no-numérico o no-positivo NO
+    // produce un default roto: cae a `None`. (El `within` por-gate se resuelve en el
+    // callback y le gana a todo esto — testeado en human.rs.)
+    #[test]
+    fn human_timeout_knob_precedence() {
+        std::env::remove_var("SYNSEMA_HUMAN_TIMEOUT");
+        let store = EnvStore::parse("SYNSEMA_HUMAN_TIMEOUT=45\n");
+        assert_eq!(resolve_human_timeout(&store), Some(45.0), "el `.env` alcanza solo");
+        std::env::set_var("SYNSEMA_HUMAN_TIMEOUT", "90");
+        assert_eq!(resolve_human_timeout(&store), Some(90.0), "el environ gana sobre el .env");
+        std::env::set_var("SYNSEMA_HUMAN_TIMEOUT", "no-numerico");
+        assert_eq!(resolve_human_timeout(&store), None, "valor inválido → default (300)");
+        std::env::set_var("SYNSEMA_HUMAN_TIMEOUT", "-5");
+        assert_eq!(resolve_human_timeout(&store), None, "no-positivo → default (300)");
+        std::env::remove_var("SYNSEMA_HUMAN_TIMEOUT");
+        assert_eq!(resolve_human_timeout(&EnvStore::empty()), None);
+    }
 }

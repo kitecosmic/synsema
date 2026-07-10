@@ -999,12 +999,54 @@ impl HostRouter {
     }
 }
 
+/// Resumen de una aprobación pendiente para `GET /approvals` — NUNCA incluye el token
+/// (el token se distribuye por la consola del server al encolar).
+#[derive(Clone, Debug)]
+pub struct ApprovalSummary {
+    pub id: String,
+    pub message: String,
+    /// "approve" | "confirm" | "ask" | "review"
+    pub ty: String,
+    /// Vencimiento en epoch-segundos.
+    pub expires_at: i64,
+}
+
+/// Resultado de un intento de respuesta vía `POST /approvals/{id}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    /// Token correcto: la pendiente se consumió (un solo uso) y el gate despertó.
+    Accepted,
+    /// id inexistente, ya consumido o vencido → 404.
+    NotFound,
+    /// Token incorrecto → 403 (la pendiente sigue viva).
+    BadToken,
+}
+
+/// Backend de las rutas reservadas `/approvals` (cola de gates humanos bajo serve).
+/// La cola real vive fuera de stdlib (en el runtime); acá sólo el contrato — el
+/// runtime la cablea en `ServeRuntime.approvals` al armar el server.
+pub trait ApprovalsGateway: Send + Sync {
+    /// Pendientes actuales, sin tokens.
+    fn list(&self) -> Vec<ApprovalSummary>;
+    /// Respuesta humana: `decision` para approve/confirm/review, `value` para ask.
+    fn respond(
+        &self,
+        id: &str,
+        token: &str,
+        decision: Option<bool>,
+        value: Option<&str>,
+    ) -> ApprovalOutcome;
+}
+
 pub struct ServeRuntime {
     pub port: u16,
     pub host: String,
     pub secure: bool,
     /// A2: TLS activo → se emite HSTS y los `redirect https` apuntan a https://.
     pub tls_enabled: bool,
+    /// Cola de aprobaciones humanas (A1.v2) — `None` si el runtime no la cableó
+    /// (las rutas `/approvals` no existen y todo sigue como antes).
+    pub approvals: Option<Arc<dyn ApprovalsGateway>>,
     /// Host por defecto (rutas/estáticos/auth a nivel de `serve`).
     default_host: HostRouter,
     /// Hosts virtuales (Lote 1): seleccionados por el header `Host`.
@@ -1048,6 +1090,7 @@ impl ServeRuntime {
             host,
             secure,
             tls_enabled: false,
+            approvals: None,
             default_host: HostRouter::new(None, routes, static_mounts, auth_handler),
             vhosts: Vec::new(),
             max_body,
@@ -1197,6 +1240,87 @@ impl ServeRuntime {
         }
     }
 
+    /// ¿La request es de las rutas reservadas `/approvals`? (Sólo si el runtime cableó
+    /// la cola.) Lo usa también el lado de conexión para atenderlas en un hilo DEDICADO
+    /// (no el pool del intérprete): un gate bloqueado espera su respuesta ocupando un
+    /// worker — la respuesta no puede quedar en cola detrás de él.
+    pub fn is_approvals_route(&self, method: &str, path: &str) -> bool {
+        self.approvals.is_some()
+            && ((method == "GET" && path == "/approvals")
+                || (method == "POST"
+                    && path.strip_prefix("/approvals/").is_some_and(|id| {
+                        !id.is_empty() && !id.contains('/')
+                    })))
+    }
+
+    /// Atiende las rutas reservadas `/approvals` (A1.v2). D4: `GET /approvals` lista
+    /// las pendientes SIN tokens; `POST /approvals/{id}` con `{"token", "decision"}`
+    /// (o `{"token", "value"}` para ask) responde el gate → 200/400/403/404.
+    fn approvals_response(&self, method: &str, path: &str, body_str: &str) -> Dispatched {
+        let gw = self.approvals.as_ref().expect("is_approvals_route lo garantiza");
+        let resp = |status, body| Dispatched::Response { status, body, headers: vec![] };
+        let err = |status: u16, msg: &str| {
+            resp(
+                status,
+                ResponseBody::Json(obj(vec![
+                    ("error", Json::Str(msg.to_string())),
+                    ("status", Json::Int(status as i64)),
+                ])),
+            )
+        };
+        if method == "GET" {
+            let items: Vec<Json> = gw
+                .list()
+                .into_iter()
+                .map(|s| {
+                    obj(vec![
+                        ("id", Json::Str(s.id)),
+                        ("message", Json::Str(s.message)),
+                        ("type", Json::Str(s.ty)),
+                        ("expires_at", Json::Int(s.expires_at)),
+                    ])
+                })
+                .collect();
+            return resp(200, ResponseBody::Json(obj(vec![("pending", Json::Array(items))])));
+        }
+        let id = path.strip_prefix("/approvals/").unwrap_or_default();
+        let parsed: serde_json::Value = match serde_json::from_str(body_str) {
+            Ok(v) => v,
+            Err(_) => {
+                return err(
+                    400,
+                    "malformed body — expected JSON {\"token\": \"...\", \"decision\": true|false} \
+                     or {\"token\": \"...\", \"value\": \"text\"}",
+                )
+            }
+        };
+        let token = match parsed.get("token").and_then(|t| t.as_str()) {
+            Some(t) if !t.is_empty() => t.to_string(),
+            _ => return err(400, "missing \"token\" — the one-time token was printed on the server console when the approval was queued"),
+        };
+        let decision = parsed.get("decision").and_then(|d| d.as_bool());
+        let value = parsed.get("value").and_then(|v| v.as_str());
+        if decision.is_none() && value.is_none() {
+            return err(
+                400,
+                "missing \"decision\" (true|false, for approve/confirm) or \"value\" (text, for ask)",
+            );
+        }
+        match gw.respond(id, &token, decision, value) {
+            ApprovalOutcome::Accepted => {
+                resp(200, ResponseBody::Json(obj(vec![("ok", Json::Bool(true))])))
+            }
+            ApprovalOutcome::NotFound => err(
+                404,
+                "no pending approval with that id — it may have expired, or a HUMAN already answered it",
+            ),
+            ApprovalOutcome::BadToken => err(
+                403,
+                "invalid token for this approval — the gate is still waiting for a HUMAN with the correct token",
+            ),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
         &self,
@@ -1210,6 +1334,12 @@ impl ServeRuntime {
         client_ip: &str,
     ) -> Dispatched {
         let resp = |status, body| Dispatched::Response { status, body, headers: vec![] };
+
+        // Rutas reservadas `/approvals` (A1.v2): interceptadas ANTES de las rutas de
+        // usuario (como `/llms.txt`); sólo existen si el runtime cableó la cola.
+        if self.is_approvals_route(method, path) {
+            return self.approvals_response(method, path, body_str);
+        }
 
         // vhost (Lote 1): elegir la tabla del host según el header `Host`. Sin vhosts
         // declarados, `host` es siempre el default → comportamiento idéntico al previo.
@@ -2681,7 +2811,12 @@ async fn handle_request(
     // ¿La ruta que matchearía es un `stream`? Resolución barata (vhost + match de ruta,
     // sin auth ni handler) para decidir el hilo: los streams (long-lived, Ctx !Send) corren
     // en un hilo dedicado; los sized (caso común) van al pool acotado.
-    let streaming_route = rt.route_is_streaming(&eff_method, &path, &headers);
+    // Las rutas `/approvals` (A1.v2) también van a hilo dedicado: un gate humano
+    // bloqueado OCUPA un worker del pool esperando su respuesta — si la respuesta
+    // (POST /approvals/{id}) tuviera que esperar un worker libre, con el pool lleno de
+    // gates nadie podría aprobar nada hasta los timeouts.
+    let streaming_route = rt.route_is_streaming(&eff_method, &path, &headers)
+        || rt.is_approvals_route(&eff_method, &path);
 
     // dispatch + (si stream) correr el handler; head por oneshot, body por mpsc (1 frame
     // para sized, N frames para SSE).

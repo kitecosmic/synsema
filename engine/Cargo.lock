@@ -3549,6 +3549,7 @@ name = "synsema-llm"
 version = "0.1.0"
 dependencies = [
  "indexmap",
+ "rand 0.8.6",
  "regex",
  "synsema-capabilities",
  "synsema-core",

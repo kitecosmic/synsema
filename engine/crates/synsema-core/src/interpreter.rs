@@ -342,9 +342,10 @@ pub struct Interpreter {
     intent_frozen: bool,
     /// Conexión al swarm real (lo cablea el motor para agentes en hilos).
     swarm_hooks: Option<SwarmHooks>,
-    /// Callback humano (approve/confirm/ask). (action, message) → SynValue
-    /// (bool para approve/confirm, texto para ask). Sin él: auto-aprueba.
-    human_callback: Option<Rc<dyn Fn(&str, &str) -> SynValue>>,
+    /// Callback humano (approve/confirm/ask). (action, message, timeout_secs) →
+    /// SynValue (bool para approve/confirm, texto para ask). `timeout_secs` es el
+    /// `within` del gate (None = sin `within`; decide el host). Sin él: auto-aprueba.
+    human_callback: Option<Rc<dyn Fn(&str, &str, Option<f64>) -> SynValue>>,
     /// Callback LLM (reason/decide/analyze/generate): (operación, prompt) → contenido.
     /// El `prompt` lleva el texto ya renderizado de la op (subject/data/objective/…)
     /// para que el provider real tenga qué mandar; un mock puede ignorarlo y keyear por
@@ -495,8 +496,9 @@ impl Interpreter {
         self.swarm_hooks = Some(hooks);
     }
 
-    /// Cablea el callback humano (approve/confirm/ask).
-    pub fn set_human_callback(&mut self, cb: Rc<dyn Fn(&str, &str) -> SynValue>) {
+    /// Cablea el callback humano (approve/confirm/ask). El tercer parámetro es el
+    /// `within` del gate en segundos (None = sin `within`).
+    pub fn set_human_callback(&mut self, cb: Rc<dyn Fn(&str, &str, Option<f64>) -> SynValue>) {
         self.human_callback = Some(cb);
     }
 
@@ -1824,17 +1826,17 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
 
             // -- Interacción humana (no-interactiva → auto) --
-            NodeKind::ApproveStatement { message, .. } => {
+            NodeKind::ApproveStatement { message, timeout, .. } => {
                 let m = self.exec(message, env)?;
                 match self.human_callback.clone() {
-                    Some(cb) => Ok(cb("approve", &m.to_string())),
+                    Some(cb) => Ok(cb("approve", &m.to_string(), *timeout)),
                     None => Ok(syn_bool(true)),
                 }
             }
-            NodeKind::ConfirmStatement { message } => {
+            NodeKind::ConfirmStatement { message, timeout } => {
                 let m = self.exec(message, env)?;
                 match self.human_callback.clone() {
-                    Some(cb) => Ok(cb("confirm", &m.to_string())),
+                    Some(cb) => Ok(cb("confirm", &m.to_string(), *timeout)),
                     None => Ok(syn_bool(true)),
                 }
             }
@@ -1854,10 +1856,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 self.output.push(line);
                 Ok(v)
             }
-            NodeKind::AskExpression { prompt, options } => {
+            NodeKind::AskExpression { prompt, options, timeout } => {
                 let p = self.exec(prompt, env)?;
                 if let Some(cb) = self.human_callback.clone() {
-                    let r = cb("ask", &p.to_string());
+                    let r = cb("ask", &p.to_string(), *timeout);
                     if r.is_truthy() {
                         return Ok(syn_text(r.to_string()));
                     }
