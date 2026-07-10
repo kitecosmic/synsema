@@ -21,9 +21,10 @@ use synsema_runtime::engine::{
 };
 use synsema_runtime::serve::{run_serve_program_with_overrides, ServeOverrides};
 
+mod init_templates;
 mod update;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] | test [-v] [--sandbox | --cap-set <list>] <archivo|dir> | check | tokens | ast | repl | daemon | llm status [--json] | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] | test [-v] [--sandbox | --cap-set <list>] <archivo|dir> | check | tokens | ast | repl | daemon | init [dir] | llm status [--json] | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
 
 /// Construye el techo de capabilities del host desde `--sandbox`/`--cap-set` (defense-in-depth:
 /// el operador impone un límite que el código ejecutado no puede exceder, sin importar qué
@@ -123,6 +124,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("daemon") => cmd_daemon(&args),
+        Some("init") => cmd_init(&args),
         Some("llm") => cmd_llm(&args),
         Some("update") => update::cmd_update(),
         Some("version") | Some("--version") | Some("-V") => {
@@ -131,7 +133,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(other) => {
-            eprintln!("subcomando desconocido: '{}'. Disponibles: conform, serve, run, test, check, tokens, ast, repl, daemon, llm, version, update", other);
+            eprintln!("subcomando desconocido: '{}'. Disponibles: init, conform, serve, run, test, check, tokens, ast, repl, daemon, llm, version, update", other);
             ExitCode::from(2)
         }
         None => {
@@ -139,6 +141,52 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// `synsema init [directorio]` — scaffold de proyecto (Spec DX-2): genera `hello.syn`
+/// (tour del lenguaje con test), `.env.example` (providers como pares provider+key,
+/// knobs comentados) y `.gitignore`. JAMÁS pisa un archivo existente (los saltea con
+/// aviso). Los templates están test-verificados contra el engine (init_templates.rs).
+fn cmd_init(args: &[String]) -> ExitCode {
+    let dir = args
+        .get(2)
+        .filter(|a| !a.starts_with("--"))
+        .map(String::as_str)
+        .unwrap_or(".");
+    let base = std::path::Path::new(dir);
+    if let Err(e) = std::fs::create_dir_all(base) {
+        eprintln!("init: no se pudo crear '{}': {}", dir, e);
+        return ExitCode::from(1);
+    }
+    let mut created = 0usize;
+    for (name, content) in init_templates::INIT_FILES {
+        let path = base.join(name);
+        if path.exists() {
+            println!("init: {} ya existe — no se toca", path.display());
+            continue;
+        }
+        match std::fs::write(&path, content) {
+            Ok(()) => {
+                println!("init: {} creado", path.display());
+                created += 1;
+            }
+            Err(e) => {
+                eprintln!("init: no se pudo escribir {}: {}", path.display(), e);
+                return ExitCode::from(1);
+            }
+        }
+    }
+    if created == 0 {
+        println!("init: nada que hacer (los 3 archivos ya existían).");
+    } else {
+        let prefix = if dir == "." { String::new() } else { format!("{}/", dir.trim_end_matches(['/', '\\'])) };
+        println!();
+        println!("Listo. Próximos pasos:");
+        println!("  synsema run {}hello.syn      # correlo (funciona sin LLM)", prefix);
+        println!("  synsema test {}hello.syn     # corré su test", prefix);
+        println!("  synsema llm status           # conectá un provider (copiá .env.example a .env)");
+    }
+    ExitCode::SUCCESS
 }
 
 /// `synsema llm status [--json]` — imprime la configuración LLM RESUELTA (la que
