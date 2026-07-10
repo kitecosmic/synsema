@@ -292,6 +292,22 @@ fn generate_token() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// Una pendiente RECIÉN encolada, para los hooks de notificación (A1.v3): acá SÍ viaja
+/// el token — los hooks (consola, webhook del runtime) son la vía de distribución del
+/// OTT hacia el humano.
+#[derive(Clone, Debug)]
+pub struct EnqueuedApproval {
+    pub id: String,
+    /// "approve" | "confirm" | "ask" | "review"
+    pub ty: String,
+    pub message: String,
+    pub token: String,
+    /// Vencimiento en epoch-segundos.
+    pub expires_at: i64,
+    /// Espera efectiva de esta pendiente, en segundos.
+    pub timeout_secs: f64,
+}
+
 /// Resumen de una pendiente para listarla por HTTP — SIN el token (el token sólo se
 /// distribuye por la consola del server al encolar).
 #[derive(Clone, Debug)]
@@ -335,9 +351,13 @@ struct QueueInner {
 pub struct QueueHandler {
     inner: Mutex<QueueInner>,
     cvar: Condvar,
-    /// Aviso de encolado con el token (D3, v2 sin webhook): el runtime lo cablea a la
-    /// consola del server — poseer la consola = poder aprobar (frontera de confianza).
+    /// Aviso de encolado con el token (v2): el runtime lo cablea a la consola del
+    /// server — poseer la consola = poder aprobar (frontera de confianza base).
     notice: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    /// Hook de encolado ESTRUCTURADO (A1.v3): recibe la pendiente completa (con token)
+    /// además del aviso de consola. El runtime lo cablea al webhook saliente; debe ser
+    /// fire-and-forget (jamás bloquear ni romper el gate).
+    on_enqueue: Option<Arc<dyn Fn(&EnqueuedApproval) + Send + Sync>>,
 }
 
 impl Default for QueueHandler {
@@ -352,6 +372,7 @@ impl QueueHandler {
             inner: Mutex::new(QueueInner { pending: HashMap::new(), responses: HashMap::new() }),
             cvar: Condvar::new(),
             notice: None,
+            on_enqueue: None,
         }
     }
 
@@ -359,6 +380,12 @@ impl QueueHandler {
     /// id, el mensaje, el vencimiento y el token (la vía de distribución del OTT en v2).
     pub fn with_notice(sink: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
         Self { notice: Some(sink), ..Self::new() }
+    }
+
+    /// Builder: hook estructurado de encolado (A1.v3, además del aviso de consola).
+    pub fn with_enqueue_hook(mut self, hook: Arc<dyn Fn(&EnqueuedApproval) + Send + Sync>) -> Self {
+        self.on_enqueue = Some(hook);
+        self
     }
 
     /// Respuesta programática SIN token (código Rust embebido / tests). La vía HTTP es
@@ -464,14 +491,27 @@ impl HumanHandler for QueueHandler {
                 PendingEntry { request: request.clone(), token: token.clone(), expires_at_epoch },
             );
         }
-        // D3 (v2, sin webhook): el OTT se distribuye por la consola del server. Redacción
-        // a prueba de agentes LLM: responde UN HUMANO, por la ruta reservada.
+        // El OTT se distribuye por la consola del server (v2 — sale SIEMPRE, con o sin
+        // webhook). Redacción a prueba de agentes LLM: responde UN HUMANO, por la ruta
+        // reservada.
         if let Some(sink) = &self.notice {
             sink(&format!(
                 "[synsema] approval pending {} — \"{}\" (expires in {}s). A HUMAN can \
                  respond with: POST /approvals/{} {{\"decision\": true|false, \"token\": \"{}\"}}",
                 request.id, request.message, timeout, request.id, token
             ));
+        }
+        // Hook estructurado (A1.v3): el runtime dispara acá el webhook saliente en su
+        // propio hilo (fire-and-forget) — fuera del lock, igual que el aviso de consola.
+        if let Some(hook) = &self.on_enqueue {
+            hook(&EnqueuedApproval {
+                id: request.id.clone(),
+                ty: ty_str(request.ty).to_string(),
+                message: request.message.clone(),
+                token: token.clone(),
+                expires_at: expires_at_epoch,
+                timeout_secs: timeout,
+            });
         }
         let mut g = self.inner.lock().unwrap();
         loop {

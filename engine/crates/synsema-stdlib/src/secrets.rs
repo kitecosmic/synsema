@@ -256,6 +256,12 @@ fn parse_algo(s: &str) -> Result<Algo, Control> {
     }
 }
 
+/// HMAC-SHA256 en hex minúscula (pura). Mismo primitivo que el builtin `hmac_sha256`;
+/// la usa el runtime para firmar el webhook de aprobaciones (`X-Synsema-Signature`).
+pub fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
+    to_hex(&hmac_compute(Algo::Sha256, key, data))
+}
+
 fn hmac_compute(algo: Algo, key: &[u8], data: &[u8]) -> Vec<u8> {
     match algo {
         Algo::Sha256 => {
