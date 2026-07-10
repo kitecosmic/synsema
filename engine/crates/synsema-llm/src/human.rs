@@ -113,6 +113,138 @@ impl HumanHandler for AutoHandler {
     }
 }
 
+/// `true` SOLO la primera vez sobre `flag` (aviso único por proceso; testeable con un
+/// flag local — mismo patrón que el aviso LLM-offline de DX-1).
+fn first_time(flag: &std::sync::atomic::AtomicBool) -> bool {
+    !flag.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+static DENY_NOTICED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ASK_FALLBACK_NOTICED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Handler de TERMINAL (`run` interactivo con TTY): el humano decide DE VERDAD.
+/// Pregunta por stderr (no contamina el stdout del programa) y lee stdin; espera SIN
+/// timeout — el dev está presente y Ctrl+C corta. EOF del TTY = fail-closed (deniega).
+pub struct ConsoleHandler;
+
+impl HumanHandler for ConsoleHandler {
+    fn handle(&self, request: &InteractionRequest) -> InteractionResponse {
+        use std::io::Write;
+        let denied = |r: &InteractionRequest| InteractionResponse {
+            request_id: r.id.clone(),
+            status: InteractionStatus::Denied,
+            value: None,
+        };
+        match request.ty {
+            InteractionType::Approve | InteractionType::Confirm | InteractionType::Review => {
+                let verb = match request.ty {
+                    InteractionType::Approve => "approve",
+                    InteractionType::Confirm => "confirm",
+                    _ => "review",
+                };
+                loop {
+                    eprint!("[{}] {} (s/n): ", verb, request.message);
+                    let _ = std::io::stderr().flush();
+                    let mut line = String::new();
+                    if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
+                        eprintln!();
+                        return denied(request); // EOF en el TTY → fail-closed
+                    }
+                    match line.trim().to_lowercase().as_str() {
+                        "s" | "si" | "sí" | "y" | "yes" => {
+                            return InteractionResponse {
+                                request_id: request.id.clone(),
+                                status: InteractionStatus::Approved,
+                                value: None,
+                            }
+                        }
+                        "n" | "no" => return denied(request),
+                        _ => eprintln!("respondé 's' o 'n'"),
+                    }
+                }
+            }
+            InteractionType::Ask => {
+                eprint!("[ask] {}: ", request.message);
+                let _ = std::io::stderr().flush();
+                let mut line = String::new();
+                let value = match std::io::stdin().read_line(&mut line) {
+                    Ok(n) if n > 0 => Some(line.trim().to_string()),
+                    _ => None, // EOF → texto vacío → el core aplica su fallback documentado
+                };
+                InteractionResponse {
+                    request_id: request.id.clone(),
+                    status: InteractionStatus::Answered,
+                    value,
+                }
+            }
+            InteractionType::Show => InteractionResponse {
+                request_id: request.id.clone(),
+                status: InteractionStatus::Answered,
+                value: None,
+            },
+        }
+    }
+}
+
+/// Handler FAIL-CLOSED (`run` sin TTY / `serve`): un gate humano que NADIE puede
+/// atender se DENIEGA — nunca auto-aprobar en silencio (DX-3 etapa 1, hallazgo A1).
+/// La cadena no se rompe (el programa sigue por la rama `false`), pero JAMÁS en
+/// silencio: aviso único por proceso, por stderr (principio degradar-con-aviso).
+pub struct DenyHandler {
+    /// Contexto para el aviso (p.ej. "run sin TTY", "serve").
+    context: String,
+}
+
+impl DenyHandler {
+    pub fn new(context: &str) -> Self {
+        Self { context: context.to_string() }
+    }
+}
+
+impl HumanHandler for DenyHandler {
+    fn handle(&self, request: &InteractionRequest) -> InteractionResponse {
+        match request.ty {
+            InteractionType::Approve | InteractionType::Confirm | InteractionType::Review => {
+                if first_time(&DENY_NOTICED) {
+                    eprintln!(
+                        "[synsema] aviso: approve/confirm sin canal humano ({}) → DENEGADO \
+                         (fail-closed; antes se auto-aprobaba en silencio). El programa sigue \
+                         por la rama false.",
+                        self.context
+                    );
+                }
+                InteractionResponse {
+                    request_id: request.id.clone(),
+                    status: InteractionStatus::Denied,
+                    value: None,
+                }
+            }
+            InteractionType::Ask => {
+                if first_time(&ASK_FALLBACK_NOTICED) {
+                    eprintln!(
+                        "[synsema] aviso: ask sin canal humano ({}) → fallback automático \
+                         (primera opción o texto vacío) — nadie respondió de verdad.",
+                        self.context
+                    );
+                }
+                // value=None → texto vacío → el core aplica su fallback documentado
+                // (primera opción si hay lista, "" si no).
+                InteractionResponse {
+                    request_id: request.id.clone(),
+                    status: InteractionStatus::Answered,
+                    value: None,
+                }
+            }
+            InteractionType::Show => InteractionResponse {
+                request_id: request.id.clone(),
+                status: InteractionStatus::Answered,
+                value: None,
+            },
+        }
+    }
+}
+
 struct QueueInner {
     pending: HashMap<String, InteractionRequest>,
     responses: HashMap<String, InteractionResponse>,
@@ -280,6 +412,28 @@ mod tests {
         cb("ask", "Third");
         assert_eq!(mgr.history_len(), 3);
         assert_eq!(handler.log_len(), 3);
+    }
+
+    // DX-3 A1.v1: el DenyHandler DENIEGA approve/confirm/review y deja que ask caiga
+    // al fallback del core (texto vacío). La cadena nunca se rompe; el aviso es único
+    // (la static es de proceso — acá se testea la mecánica con un flag local).
+    #[test]
+    fn deny_handler_fail_closed() {
+        let mgr = InteractionManager::new(Arc::new(DenyHandler::new("test")));
+        let cb = mgr.get_callback();
+        assert!(matches!(cb("approve", "¿borro todo?"), SynValue::Bool(false)));
+        assert!(matches!(cb("confirm", "¿seguro?"), SynValue::Bool(false)));
+        match cb("ask", "¿nombre?") {
+            SynValue::Text(s) => assert_eq!(s.as_ref(), ""),
+            other => panic!("esperaba texto vacío, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn first_time_is_true_exactly_once() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(first_time(&flag));
+        assert!(!first_time(&flag));
     }
 
     #[test]
