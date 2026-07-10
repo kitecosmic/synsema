@@ -235,6 +235,12 @@ pub type LlmStepCallback =
 /// motor lo cablea con el provider real; sin él, las ops LLM caen a placeholders.
 pub type LlmTextCallback = Rc<dyn Fn(&str, &str) -> String>;
 
+/// Callback dedicado de `decide` (DE-039): `(prompt, opciones) -> contenido`. Espejo
+/// del de texto, pero con las opciones ESTRUCTURADAS para que el motor pueda forzar la
+/// elección por tool/enum + normalizar + reintentar. Sin él, `decide` cae al callback
+/// de texto genérico (retrocompat: mocks y wirings viejos intactos).
+pub type LlmDecideCallback = Rc<dyn Fn(&str, &[String]) -> String>;
+
 /// Callback de streaming (`llm_stream`, F2): `(prompt, context, sink) -> texto completo`.
 /// El motor lo cablea con `provider.call_stream`; el `sink` recibe cada fragmento a
 /// medida que se genera y devuelve `false` para CORTAR la generación (p.ej. el `send`
@@ -341,6 +347,10 @@ pub struct Interpreter {
     /// para que el provider real tenga qué mandar; un mock puede ignorarlo y keyear por
     /// la operación. Sin él: placeholders descriptivos.
     llm_callback: Option<LlmTextCallback>,
+    /// Callback dedicado de `decide` (DE-039): recibe las opciones estructuradas para
+    /// el contrato tool/enum + normalización + reintento. Sin él: `decide` usa el
+    /// callback de texto genérico (retrocompat).
+    llm_decide_callback: Option<LlmDecideCallback>,
     /// Callback LLM tool-aware de PASO (`llm_step`, FASE 1): el motor lo cablea con el
     /// provider guionable/real. Sin él: `llm_step` devuelve un placeholder seguro.
     llm_step_callback: Option<LlmStepCallback>,
@@ -414,6 +424,7 @@ impl Interpreter {
             swarm_hooks: None,
             human_callback: None,
             llm_callback: None,
+            llm_decide_callback: None,
             llm_step_callback: None,
             llm_stream_callback: None,
             llm_cap_hook: None,
@@ -490,6 +501,13 @@ impl Interpreter {
     /// `(op, prompt) -> contenido`: el motor le pasa el prompt renderizado de la op.
     pub fn set_llm_callback(&mut self, cb: LlmTextCallback) {
         self.llm_callback = Some(cb);
+    }
+
+    /// Cablea el callback dedicado de `decide` (DE-039). La firma es
+    /// `(prompt, opciones) -> contenido`: el prompt renderizado + las opciones
+    /// estructuradas del `between [...]`.
+    pub fn set_llm_decide_callback(&mut self, cb: LlmDecideCallback) {
+        self.llm_decide_callback = Some(cb);
     }
 
     /// Cablea el callback LLM tool-aware de paso (`llm_step`, FASE 1).
@@ -1891,11 +1909,19 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     Some(g) => self.exec(g, env)?,
                     None => SynValue::Nothing,
                 };
+                let prompt = format!("Decide between {} given {}", opts, giv);
+                // Camino dedicado (DE-039): las opciones viajan ESTRUCTURADAS al motor,
+                // que fuerza la elección por tool/enum + normaliza + reintenta. Sólo si
+                // el motor lo cableó; si no, el callback de texto genérico de siempre.
+                if let Some(cb) = self.llm_decide_callback.clone() {
+                    let opt_list: Vec<String> = match &opts {
+                        SynValue::List(l) => l.borrow().iter().map(|v| v.to_string()).collect(),
+                        _ => Vec::new(),
+                    };
+                    return Ok(syn_text(cb(&prompt, &opt_list)));
+                }
                 match self.llm_callback.clone() {
-                    Some(cb) => {
-                        let prompt = format!("Decide between {} given {}", opts, giv);
-                        Ok(syn_text(cb("decide", &prompt)))
-                    }
+                    Some(cb) => Ok(syn_text(cb("decide", &prompt))),
                     None => {
                         note_llm_offline();
                         Ok(syn_text("[decision pending]"))
