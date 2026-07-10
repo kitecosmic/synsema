@@ -640,6 +640,16 @@ fn build_base_interp(
     // para que reason/decide/generate/llm_step de los handlers no caigan a placeholders.
     // Por-worker (no por-request): el provider se resuelve una vez al construir la base.
     crate::engine::wire_real_llm_provider(&mut interp);
+    // Gates humanos (DX-3 etapa 1, A1.v1): bajo serve NO hay canal humano — un
+    // `approve`/`confirm` en un handler se DENIEGA fail-closed con aviso único (antes se
+    // auto-aprobaba en silencio: un gate de aprobación humana que se auto-pasa en
+    // producción). v2 (cola con timeout + respuesta out-of-band) llega por spec aparte.
+    {
+        let mgr = synsema_llm::human::InteractionManager::new(std::sync::Arc::new(
+            synsema_llm::human::DenyHandler::new("serve"),
+        ));
+        interp.set_human_callback(mgr.get_callback());
+    }
     // Sobrescribir los builtins de memoria (remember/recall/forget_memory/memory_summary)
     // con versiones que usan el AgentMemory compartido entre hilos.
     register_serve_memory_builtins(&interp, shared_memory.clone(), on_write.clone());

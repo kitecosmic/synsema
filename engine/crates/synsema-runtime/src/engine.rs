@@ -316,6 +316,23 @@ fn run_inner(
             // Conectividad LLM real: si hay provider por env, cablea texto + paso
             // tool-aware; offline (sin key) deja los placeholders del core.
             wire_real_llm_provider(&mut interp);
+            // Gates humanos (DX-3 etapa 1, A1.v1): en `run` interactivo (TTY) el humano
+            // decide DE VERDAD (ConsoleHandler espera en la terminal); sin TTY (pipe/CI)
+            // se DENIEGA fail-closed con aviso — nunca auto-aprobar en silencio. En
+            // conform/test (`live_output=false`) NO se cablea: quedan los fallbacks
+            // deterministas del core (los tests no bloquean en un prompt). `serve`
+            // cablea su propio DenyHandler en build_base_interp.
+            if live_output {
+                use std::io::IsTerminal;
+                let handler: Arc<dyn synsema_llm::human::HumanHandler> =
+                    if std::io::stdin().is_terminal() {
+                        Arc::new(synsema_llm::human::ConsoleHandler)
+                    } else {
+                        Arc::new(synsema_llm::human::DenyHandler::new("run sin TTY"))
+                    };
+                let mgr = synsema_llm::human::InteractionManager::new(handler);
+                interp.set_human_callback(mgr.get_callback());
+            }
 
             // Swarm real (DE-011): los hooks de spawn/share/observe/signal/wait_for del
             // main van al swarm compartido → los agentes corren en hilos aislados. El techo
