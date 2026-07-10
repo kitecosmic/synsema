@@ -276,6 +276,31 @@ pub struct SwarmHooks {
     pub spawn: Rc<dyn Fn(&str, Vec<Node>, Vec<(String, SynValue)>, Vec<(String, SynValue)>) -> Result<String, Control>>,
 }
 
+/// Aviso ÚNICO por proceso cuando una op LLM cae a placeholder por estar OFFLINE.
+/// Filosofía (spec DX-1): la degradación NUNCA rompe la cadena del agente — el
+/// placeholder se devuelve igual y el programa sigue — pero JAMÁS es silenciosa: la
+/// falla se descubre en desarrollo, con el diagnóstico a un comando de distancia.
+/// Por stderr (no contamina el stdout del programa) y una sola vez (no spamea un
+/// loop de agente con muchos pasos).
+static LLM_OFFLINE_NOTICED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `true` SOLO la primera vez sobre `flag` (separado de la static para poder testearlo
+/// con un flag local, sin depender del orden de los tests del proceso).
+fn first_time(flag: &std::sync::atomic::AtomicBool) -> bool {
+    !flag.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn note_llm_offline() {
+    if first_time(&LLM_OFFLINE_NOTICED) {
+        eprintln!(
+            "[synsema] aviso: LLM OFFLINE — reason/decide/analyze/generate/llm_step/llm_stream \
+             devuelven placeholders, no respuestas reales (el programa sigue). \
+             Diagnóstico: synsema llm status"
+        );
+    }
+}
+
 pub struct Interpreter {
     pub global_env: Rc<RefCell<Environment>>,
     pub output: Vec<String>,
@@ -1850,7 +1875,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         };
                         Ok(syn_text(cb("reason", &prompt)))
                     }
-                    None => Ok(syn_text(format!("[reasoning about: {}]", subj))),
+                    None => {
+                        note_llm_offline();
+                        Ok(syn_text(format!("[reasoning about: {}]", subj)))
+                    }
                 }
             }
             NodeKind::DecideExpression { options, given, .. } => {
@@ -1868,7 +1896,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         let prompt = format!("Decide between {} given {}", opts, giv);
                         Ok(syn_text(cb("decide", &prompt)))
                     }
-                    None => Ok(syn_text("[decision pending]")),
+                    None => {
+                        note_llm_offline();
+                        Ok(syn_text("[decision pending]"))
+                    }
                 }
             }
             NodeKind::AnalyzeExpression { data, objective } => {
@@ -1879,7 +1910,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         let prompt = format!("Analyze for {}: {}", objective, d);
                         Ok(syn_text(cb("analyze", &prompt)))
                     }
-                    None => Ok(syn_text(format!("[analysis of: {}]", objective))),
+                    None => {
+                        note_llm_offline();
+                        Ok(syn_text(format!("[analysis of: {}]", objective)))
+                    }
                 }
             }
             NodeKind::GenerateExpression { target, given, parameters } => {
@@ -1905,7 +1939,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         }
                         Ok(syn_text(cb("generate", &prompt)))
                     }
-                    None => Ok(syn_text(format!("[generated: {}]", target))),
+                    None => {
+                        note_llm_offline();
+                        Ok(syn_text(format!("[generated: {}]", target)))
+                    }
                 }
             }
 
@@ -3073,7 +3110,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             Some(cb) => cb(&prompt, &catalog, &context),
             // Sin provider cableado (camino `run` normal): placeholder seguro. El
             // programa decide qué hacer; no inventa tool-calls.
-            None => StepResult::Final { text: "[no llm provider]".to_string(), tokens: 0 },
+            None => {
+                note_llm_offline();
+                StepResult::Final { text: "[no llm provider]".to_string(), tokens: 0 }
+            }
         };
         Ok(step_result_to_synvalue(result))
     }
@@ -3097,7 +3137,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let on_chunk = nth(args, 2)?.clone();
         let cb = match &self.llm_stream_callback {
             Some(cb) => cb.clone(),
-            None => return Ok(syn_text("[no llm provider]")),
+            None => {
+                note_llm_offline();
+                return Ok(syn_text("[no llm provider]"));
+            }
         };
         // El sink invoca la task/lambda del usuario por chunk. Un error ahí no puede
         // atravesar el provider (la firma del sink es `-> bool`), así que se guarda acá
@@ -3627,6 +3670,23 @@ pub fn run_source(source: &str, filename: &str) -> RunResult {
             output: Vec::new(),
             errors: vec!["el intérprete abortó (probable desborde de stack nativo)".to_string()],
         })
+}
+
+#[cfg(test)]
+mod llm_offline_notice_tests {
+    use super::first_time;
+    use std::sync::atomic::AtomicBool;
+
+    // El aviso de LLM-offline es único: `first_time` devuelve true SOLO la primera vez.
+    // (Se testea sobre un flag LOCAL — la static del proceso puede ya estar consumida
+    // por otros tests que ejercitan placeholders; el aviso mismo es solo un eprintln.)
+    #[test]
+    fn first_time_is_true_exactly_once() {
+        let flag = AtomicBool::new(false);
+        assert!(first_time(&flag), "la primera vez debe ser true");
+        assert!(!first_time(&flag), "la segunda vez debe ser false");
+        assert!(!first_time(&flag), "y todas las siguientes también");
+    }
 }
 
 #[cfg(test)]
