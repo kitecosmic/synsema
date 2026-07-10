@@ -34,6 +34,12 @@ returns `false` (ask → its fallback) + a one-time stderr notice. Never hangs f
   `{"token", "decision": true|false}` (or `{"token", "value"}` for ask) → 200/400/403/404.
   Wrong token = 403 and the gate keeps waiting; the token is single-use and expires with the
   deadline. A blocked gate holds its request thread — use `within` of minutes under serve.
+  **Webhooks (any channel)**: with `SYNSEMA_HUMAN_WEBHOOK=<url>` each queued gate also fires a
+  POST (signed HMAC-SHA256 in `X-Synsema-Signature` when `SYNSEMA_HUMAN_WEBHOOK_SECRET` is set)
+  whose payload includes the token and — with `SYNSEMA_HUMAN_PUBLIC_URL` — ready-to-forward
+  `respond_link_yes`/`no` (`GET /approvals/{id}/{token}?d=yes|no`, single-use, returns HTML).
+  Fire-and-forget (one attempt, 10s): a dead channel never blocks the gate. A Synsema channel
+  is a route doing `json_decode(body of request)` and forwarding the links.
 - **`test`/`conform`** — deterministic auto-pass (suites never block on a prompt).
 
 ## No TTY (pipes / CI / redirection)
