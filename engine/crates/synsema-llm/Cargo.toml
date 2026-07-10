@@ -10,3 +10,5 @@ synsema-core.workspace = true
 synsema-capabilities.workspace = true
 indexmap.workspace = true
 regex.workspace = true
+# OTT de la cola de aprobaciones (A1.v2): OsRng (getrandom) para el token de un solo uso.
+rand.workspace = true

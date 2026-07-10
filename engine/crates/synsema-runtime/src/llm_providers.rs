@@ -1399,7 +1399,9 @@ pub fn build_provider(
 /// Vacío/espacios cuenta como ausente en ambas fuentes. Devuelve `None` si no está en
 /// ninguna → el caller aplica el default. Así la clave puede vivir SOLO en el `.env`
 /// (gitignoreado) sin exportarse al environ del proceso ni a los hijos (DE-007).
-fn resolve_knob(name: &str, store: &EnvStore) -> Option<String> {
+/// `pub(crate)`: también resuelve knobs no-LLM del runtime (p.ej.
+/// `SYNSEMA_HUMAN_TIMEOUT` en serve) — única implementación de la precedencia.
+pub(crate) fn resolve_knob(name: &str, store: &EnvStore) -> Option<String> {
     resolve_knob_src(name, store).map(|(v, _)| v)
 }
 
@@ -1683,6 +1685,11 @@ pub const LLM_ENV_VARS: &[&str] = &[
     "MINIMAX_API_KEY",
     "DEEPSEEK_API_KEY",
 ];
+
+/// Knobs de interacción HUMANA que el runtime reconoce (espejo de [`LLM_ENV_VARS`]).
+/// ⚠️ Sumar un knob acá sin actualizar el template de `init` rompe el build a
+/// propósito (test `env_example_in_sync_with_engine_knobs` del CLI — anti-rot).
+pub const HUMAN_ENV_VARS: &[&str] = &["SYNSEMA_HUMAN_TIMEOUT"];
 
 /// Redacta el userinfo de una URL (`https://user:pass@host/...` → `https://***@host/...`)
 /// para que un `base_url` con credenciales embebidas no las imprima.

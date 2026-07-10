@@ -119,6 +119,10 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # Endpoint alternativo OpenAI-compatible — modelos locales por server:
 # Ollama http://localhost:11434/v1 · LM Studio · vLLM · llama.cpp:
 # SYNSEMA_LLM_BASE_URL=
+
+# Espera máxima (segundos) de approve/confirm/ask bajo serve antes de DENEGAR
+# fail-closed (por-gate: `approve "..." within 2h` le gana a esta variable):
+# SYNSEMA_HUMAN_TIMEOUT=300
 "#;
 
 pub const GITIGNORE: &str = r#"# Secretos / config local — nunca subir
@@ -138,7 +142,7 @@ pub const INIT_FILES: [(&str, &str); 3] = [
 #[cfg(test)]
 mod tests {
     use super::*;
-    use synsema_runtime::llm_providers::LLM_ENV_VARS;
+    use synsema_runtime::llm_providers::{HUMAN_ENV_VARS, LLM_ENV_VARS};
 
     // Anti-rot 1: el hello.syn del template PARSEA con el parser real del engine.
     #[test]
@@ -149,13 +153,14 @@ mod tests {
         }
     }
 
-    /// Extrae los nombres de env-vars LLM mencionados en un texto (`SYNSEMA_*`/`*_API_KEY`).
+    /// Extrae los nombres de env-vars del runtime mencionados en un texto
+    /// (`SYNSEMA_*` — no sólo LLM — y `*_API_KEY`).
     fn mentioned_vars(text: &str) -> Vec<String> {
         let mut out = Vec::new();
         for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
-            let is_llm_var = (token.starts_with("SYNSEMA_LLM_") && token.len() > "SYNSEMA_LLM_".len())
+            let is_knob_var = (token.starts_with("SYNSEMA_") && token.len() > "SYNSEMA_".len())
                 || (token.ends_with("_API_KEY") && token.len() > "_API_KEY".len());
-            if is_llm_var && !out.contains(&token.to_string()) {
+            if is_knob_var && !out.contains(&token.to_string()) {
                 out.push(token.to_string());
             }
         }
@@ -163,35 +168,44 @@ mod tests {
     }
 
     // Anti-rot 2: sincronía template ↔ engine. (a) Toda var mencionada en .env.example
-    // existe en la lista canónica del runtime. (b) Toda var de la lista está en el
-    // template O en el allowlist de knobs solo-local (documentados en docs 52, no en el
-    // template para no abrumar). Agregar un knob nuevo al runtime sin tocar el template
-    // (o este allowlist, a conciencia) ROMPE este test — el template no puede
-    // desincronizarse en silencio.
+    // existe en las listas canónicas del runtime (LLM ∪ humanas). (b) Toda var de las
+    // listas está en el template O en el allowlist de vars que NO van al template por
+    // diseño (knobs solo-local documentados en docs 52; vars circulares/nicho).
+    // Agregar un knob `SYNSEMA_*` nuevo al runtime sin tocar el template (o este
+    // allowlist, a conciencia) ROMPE este test — el template no puede desincronizarse
+    // en silencio.
     #[test]
     fn env_example_in_sync_with_engine_knobs() {
-        const LOCAL_ONLY_OK_TO_OMIT: [&str; 5] = [
+        const OK_TO_OMIT_FROM_TEMPLATE: [&str; 7] = [
+            // knobs solo-local (documentados en docs 52; no van al template para no abrumar)
             "SYNSEMA_LLM_CTX",
             "SYNSEMA_LLM_THREADS",
             "SYNSEMA_LLM_TEMPERATURE",
             "SYNSEMA_LLM_MAX_CONCURRENT",
             "SYNSEMA_LLM_STREAM_BUFFER",
+            // la setean los flags del CLI (--env-file) — ponerla en un `.env` sería circular
+            "SYNSEMA_ENV_FILE",
+            // nicho: relocaliza el estado (.synsema/state) — no es config de proyecto típica
+            "SYNSEMA_STATE_DIR",
         ];
+        let canonical: Vec<&str> =
+            LLM_ENV_VARS.iter().chain(HUMAN_ENV_VARS.iter()).copied().collect();
         let mentioned = mentioned_vars(ENV_EXAMPLE);
         for var in &mentioned {
             assert!(
-                LLM_ENV_VARS.contains(&var.as_str()),
+                canonical.contains(&var.as_str()),
                 "el template menciona '{}' que el runtime NO conoce (¿typo o knob eliminado?)",
                 var
             );
         }
-        for var in LLM_ENV_VARS {
+        for var in &canonical {
             let covered =
-                mentioned.iter().any(|m| m == var) || LOCAL_ONLY_OK_TO_OMIT.contains(var);
+                mentioned.iter().any(|m| m == var) || OK_TO_OMIT_FROM_TEMPLATE.contains(var);
             assert!(
                 covered,
                 "el knob '{}' del runtime NO está en el .env.example de `init` ni en el \
-                 allowlist local-only — actualizá el template (o el allowlist, a conciencia)",
+                 allowlist OK_TO_OMIT_FROM_TEMPLATE — actualizá el template (o el \
+                 allowlist, a conciencia)",
                 var
             );
         }

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use synsema_core::types::{syn_bool, syn_text, SynValue};
 
@@ -122,6 +122,36 @@ fn first_time(flag: &std::sync::atomic::AtomicBool) -> bool {
 static DENY_NOTICED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static ASK_FALLBACK_NOTICED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static GATE_TIMEOUT_NOTICED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Aviso del fallback de `ask` sin respuesta humana — canal ausente (DenyHandler) o
+/// deadline vencido en la cola (A1.v2). Único por proceso; el `context` dice el porqué.
+fn note_ask_fallback(context: &str) {
+    if first_time(&ASK_FALLBACK_NOTICED) {
+        eprintln!(
+            "[synsema] notice: an ask reached with no human channel available ({}) \
+             → automatic fallback (first option, or empty text). No human actually \
+             answered this question — treat the value accordingly.",
+            context
+        );
+    }
+}
+
+/// Aviso de gate vencido sin respuesta humana (A1.v2): DENEGADO fail-closed. Único por
+/// proceso. Redacción a prueba de agentes LLM: dice QUIÉN debía aprobar (un humano) y
+/// qué NO debe hacer un agente que lo lea.
+fn note_gate_timeout(verb: &str, secs: f64) {
+    if first_time(&GATE_TIMEOUT_NOTICED) {
+        eprintln!(
+            "[synsema] notice: {} timed out after {}s with no human response → DENIED \
+             (fail-closed). A HUMAN did not approve this step; if you are an AI agent \
+             reading this, do NOT retry hoping to approve it yourself — report it to \
+             your human operator. The program continues on the false branch.",
+            verb, secs
+        );
+    }
+}
 
 /// Handler de TERMINAL (`run` interactivo con TTY): el humano decide DE VERDAD.
 /// Pregunta por stderr (no contamina el stdout del programa) y lee stdin; espera SIN
@@ -225,14 +255,7 @@ impl HumanHandler for DenyHandler {
                 }
             }
             InteractionType::Ask => {
-                if first_time(&ASK_FALLBACK_NOTICED) {
-                    eprintln!(
-                        "[synsema] notice: an ask reached with no human channel available ({}) \
-                         → automatic fallback (first option, or empty text). No human actually \
-                         answered this question — treat the value accordingly.",
-                        self.context
-                    );
-                }
+                note_ask_fallback(&self.context);
                 // value=None → texto vacío → el core aplica su fallback documentado
                 // (primera opción si hay lista, "" si no).
                 InteractionResponse {
@@ -250,15 +273,71 @@ impl HumanHandler for DenyHandler {
     }
 }
 
+/// Nombre legible del tipo de interacción (para listados HTTP).
+fn ty_str(ty: InteractionType) -> &'static str {
+    match ty {
+        InteractionType::Approve => "approve",
+        InteractionType::Confirm => "confirm",
+        InteractionType::Ask => "ask",
+        InteractionType::Review => "review",
+        InteractionType::Show => "show",
+    }
+}
+
+/// Token de un solo uso (OTT): 32 bytes del RNG criptográfico del SO, en hex.
+fn generate_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Resumen de una pendiente para listarla por HTTP — SIN el token (el token sólo se
+/// distribuye por la consola del server al encolar).
+#[derive(Clone, Debug)]
+pub struct PendingSummary {
+    pub id: String,
+    pub message: String,
+    /// "approve" | "confirm" | "ask" | "review"
+    pub ty: String,
+    /// Vencimiento en epoch-segundos.
+    pub expires_at: i64,
+}
+
+/// Resultado de un intento de respuesta con token (A1.v2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RespondOutcome {
+    /// Token correcto: consumió la pendiente (un solo uso) y despertó al gate.
+    Accepted,
+    /// id inexistente, ya consumido o vencido.
+    NotFound,
+    /// Token incorrecto — la pendiente SIGUE viva (el gate sigue esperando).
+    BadToken,
+}
+
+struct PendingEntry {
+    request: InteractionRequest,
+    /// OTT de esta pendiente: responder la consume; expira con el deadline.
+    token: String,
+    expires_at_epoch: i64,
+}
+
 struct QueueInner {
-    pending: HashMap<String, InteractionRequest>,
+    pending: HashMap<String, PendingEntry>,
     responses: HashMap<String, InteractionResponse>,
 }
 
-/// Backend async: encola y bloquea hasta que `respond` entrega la respuesta.
+/// Backend async: encola y bloquea hasta que un humano responde fuera de banda o vence
+/// el deadline (`within` del gate > default del host > 300 s) → `Timeout` (el callback
+/// lo mapea a DENEGADO fail-closed). OJO (v2): el hilo que ejecuta el gate queda
+/// BLOQUEADO toda la espera — un `within` largo retiene un worker del server; la
+/// persistencia para esperas largas llega en v3.
 pub struct QueueHandler {
     inner: Mutex<QueueInner>,
     cvar: Condvar,
+    /// Aviso de encolado con el token (D3, v2 sin webhook): el runtime lo cablea a la
+    /// consola del server — poseer la consola = poder aprobar (frontera de confianza).
+    notice: Option<Arc<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl Default for QueueHandler {
@@ -272,9 +351,18 @@ impl QueueHandler {
         Self {
             inner: Mutex::new(QueueInner { pending: HashMap::new(), responses: HashMap::new() }),
             cvar: Condvar::new(),
+            notice: None,
         }
     }
 
+    /// Con aviso de encolado: cada pendiente nueva imprime UNA línea por `sink` con el
+    /// id, el mensaje, el vencimiento y el token (la vía de distribución del OTT en v2).
+    pub fn with_notice(sink: Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        Self { notice: Some(sink), ..Self::new() }
+    }
+
+    /// Respuesta programática SIN token (código Rust embebido / tests). La vía HTTP es
+    /// `respond_with_token`.
     pub fn respond(&self, request_id: &str, value: &str, approved: bool) {
         {
             let mut g = self.inner.lock().unwrap();
@@ -294,8 +382,69 @@ impl QueueHandler {
         self.cvar.notify_all();
     }
 
+    /// Respuesta HUMANA vía HTTP (A1.v2): verifica el OTT y consume la pendiente (un
+    /// solo uso). `decision` para approve/confirm/review; `value` para ask. Token
+    /// incorrecto NO consume nada (el gate sigue esperando).
+    pub fn respond_with_token(
+        &self,
+        request_id: &str,
+        token: &str,
+        decision: Option<bool>,
+        value: Option<&str>,
+    ) -> RespondOutcome {
+        {
+            let mut g = self.inner.lock().unwrap();
+            let entry = match g.pending.get(request_id) {
+                Some(e) => e,
+                None => return RespondOutcome::NotFound,
+            };
+            let now_epoch = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if entry.expires_at_epoch <= now_epoch {
+                return RespondOutcome::NotFound; // vencida (el gate despierta solo)
+            }
+            if entry.token != token {
+                return RespondOutcome::BadToken;
+            }
+            g.pending.remove(request_id); // un solo uso: responder consume la pendiente
+            let status = match decision {
+                Some(true) => InteractionStatus::Approved,
+                Some(false) => InteractionStatus::Denied,
+                None => InteractionStatus::Answered, // ask: llega `value`
+            };
+            g.responses.insert(
+                request_id.to_string(),
+                InteractionResponse {
+                    request_id: request_id.to_string(),
+                    status,
+                    value: value.map(|v| v.to_string()),
+                },
+            );
+        }
+        self.cvar.notify_all();
+        RespondOutcome::Accepted
+    }
+
     pub fn get_pending(&self) -> Vec<InteractionRequest> {
-        self.inner.lock().unwrap().pending.values().cloned().collect()
+        self.inner.lock().unwrap().pending.values().map(|e| e.request.clone()).collect()
+    }
+
+    /// Pendientes para `GET /approvals` — sin tokens, con vencimiento en epoch-segundos.
+    pub fn pending_summaries(&self) -> Vec<PendingSummary> {
+        self.inner
+            .lock()
+            .unwrap()
+            .pending
+            .values()
+            .map(|e| PendingSummary {
+                id: e.request.id.clone(),
+                message: e.request.message.clone(),
+                ty: ty_str(e.request.ty).to_string(),
+                expires_at: e.expires_at_epoch,
+            })
+            .collect()
     }
 }
 
@@ -303,8 +452,28 @@ impl HumanHandler for QueueHandler {
     fn handle(&self, request: &InteractionRequest) -> InteractionResponse {
         let timeout = request.timeout_seconds.unwrap_or(300.0);
         let deadline = Instant::now() + Duration::from_secs_f64(timeout);
+        let token = generate_token();
+        let expires_at_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64() + timeout)
+            .unwrap_or(timeout) as i64;
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.pending.insert(
+                request.id.clone(),
+                PendingEntry { request: request.clone(), token: token.clone(), expires_at_epoch },
+            );
+        }
+        // D3 (v2, sin webhook): el OTT se distribuye por la consola del server. Redacción
+        // a prueba de agentes LLM: responde UN HUMANO, por la ruta reservada.
+        if let Some(sink) = &self.notice {
+            sink(&format!(
+                "[synsema] approval pending {} — \"{}\" (expires in {}s). A HUMAN can \
+                 respond with: POST /approvals/{} {{\"decision\": true|false, \"token\": \"{}\"}}",
+                request.id, request.message, timeout, request.id, token
+            ));
+        }
         let mut g = self.inner.lock().unwrap();
-        g.pending.insert(request.id.clone(), request.clone());
         loop {
             if let Some(resp) = g.responses.remove(&request.id) {
                 g.pending.remove(&request.id);
@@ -325,39 +494,51 @@ impl HumanHandler for QueueHandler {
     }
 }
 
+/// Contador GLOBAL de ids de interacción. Bajo serve hay un `InteractionManager` por
+/// worker compartiendo UNA cola — un contador por-manager colisionaría ids entre
+/// workers; el global garantiza unicidad por proceso.
+static NEXT_INTERACTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Maneja toda la interacción humana de un programa. `get_callback` da la función
 /// que usa el intérprete.
 pub struct InteractionManager {
     handler: Arc<dyn HumanHandler>,
     history: Arc<Mutex<Vec<(InteractionRequest, InteractionResponse)>>>,
-    counter: Arc<Mutex<u64>>,
+    /// Espera default (segundos) para gates SIN `within` — el knob del host
+    /// (`SYNSEMA_HUMAN_TIMEOUT` bajo serve). `None` = lo decide el handler (300 s en
+    /// la cola). Precedencia: `within` del lenguaje > esto > 300.
+    default_timeout: Option<f64>,
 }
 
 impl InteractionManager {
     pub fn new(handler: Arc<dyn HumanHandler>) -> Self {
-        Self {
-            handler,
-            history: Arc::new(Mutex::new(Vec::new())),
-            counter: Arc::new(Mutex::new(0)),
-        }
+        Self { handler, history: Arc::new(Mutex::new(Vec::new())), default_timeout: None }
+    }
+
+    /// Builder: fija la espera default del host (ver `default_timeout`).
+    pub fn with_default_timeout(mut self, secs: Option<f64>) -> Self {
+        self.default_timeout = secs;
+        self
     }
 
     pub fn history_len(&self) -> usize {
         self.history.lock().unwrap().len()
     }
 
-    /// Callback (action, message) → SynValue. bool para approve/confirm/review;
-    /// texto para ask.
-    pub fn get_callback(&self) -> Rc<dyn Fn(&str, &str) -> SynValue> {
+    /// Callback (action, message, timeout_secs) → SynValue. bool para approve/confirm/
+    /// review; texto para ask. `timeout_secs` es el `within` del gate; sin él aplica el
+    /// default del host. Un `Timeout` del handler se mapea FAIL-CLOSED: `false` para
+    /// approve/confirm/review (+ aviso único) y texto vacío para ask (fallback
+    /// documentado del core + su aviso).
+    pub fn get_callback(&self) -> Rc<dyn Fn(&str, &str, Option<f64>) -> SynValue> {
         let handler = self.handler.clone();
         let history = self.history.clone();
-        let counter = self.counter.clone();
-        Rc::new(move |action: &str, message: &str| -> SynValue {
-            let id = {
-                let mut c = counter.lock().unwrap();
-                *c += 1;
-                format!("interact_{}", *c)
-            };
+        let default_timeout = self.default_timeout;
+        Rc::new(move |action: &str, message: &str, timeout: Option<f64>| -> SynValue {
+            let id = format!(
+                "interact_{}",
+                NEXT_INTERACTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+            );
             let ty = match action {
                 "approve" => InteractionType::Approve,
                 "confirm" => InteractionType::Confirm,
@@ -365,14 +546,24 @@ impl InteractionManager {
                 "review" => InteractionType::Review,
                 _ => InteractionType::Show,
             };
-            let req = InteractionRequest::new(&id, ty, message);
+            let mut req = InteractionRequest::new(&id, ty, message);
+            req.timeout_seconds = timeout.or(default_timeout);
             let resp = handler.handle(&req);
-            history.lock().unwrap().push((req, resp.clone()));
+            history.lock().unwrap().push((req.clone(), resp.clone()));
             match ty {
                 InteractionType::Approve | InteractionType::Confirm | InteractionType::Review => {
+                    if resp.status == InteractionStatus::Timeout {
+                        note_gate_timeout(action, req.timeout_seconds.unwrap_or(300.0));
+                    }
                     syn_bool(resp.status == InteractionStatus::Approved)
                 }
-                _ => syn_text(resp.value.unwrap_or_default()),
+                _ => {
+                    if resp.status == InteractionStatus::Timeout {
+                        note_ask_fallback("the approval queue timed out");
+                        return syn_text("");
+                    }
+                    syn_text(resp.value.unwrap_or_default())
+                }
             }
         })
     }
@@ -387,21 +578,21 @@ mod tests {
     fn auto_handler_approve() {
         let mgr = InteractionManager::new(Arc::new(AutoHandler::new(true, "")));
         let cb = mgr.get_callback();
-        assert!(matches!(cb("approve", "Do this?"), SynValue::Bool(true)));
+        assert!(matches!(cb("approve", "Do this?", None), SynValue::Bool(true)));
     }
 
     #[test]
     fn auto_handler_deny() {
         let mgr = InteractionManager::new(Arc::new(AutoHandler::new(false, "")));
         let cb = mgr.get_callback();
-        assert!(matches!(cb("approve", "Do this?"), SynValue::Bool(false)));
+        assert!(matches!(cb("approve", "Do this?", None), SynValue::Bool(false)));
     }
 
     #[test]
     fn auto_handler_ask() {
         let mgr = InteractionManager::new(Arc::new(AutoHandler::new(true, "test_answer")));
         let cb = mgr.get_callback();
-        match cb("ask", "What?") {
+        match cb("ask", "What?", None) {
             SynValue::Text(s) => assert_eq!(s.as_ref(), "test_answer"),
             other => panic!("esperaba texto, got {:?}", other),
         }
@@ -412,9 +603,9 @@ mod tests {
         let handler = Arc::new(AutoHandler::new(true, ""));
         let mgr = InteractionManager::new(handler.clone());
         let cb = mgr.get_callback();
-        cb("approve", "First");
-        cb("confirm", "Second");
-        cb("ask", "Third");
+        cb("approve", "First", None);
+        cb("confirm", "Second", None);
+        cb("ask", "Third", None);
         assert_eq!(mgr.history_len(), 3);
         assert_eq!(handler.log_len(), 3);
     }
@@ -426,9 +617,9 @@ mod tests {
     fn deny_handler_fail_closed() {
         let mgr = InteractionManager::new(Arc::new(DenyHandler::new("test")));
         let cb = mgr.get_callback();
-        assert!(matches!(cb("approve", "¿borro todo?"), SynValue::Bool(false)));
-        assert!(matches!(cb("confirm", "¿seguro?"), SynValue::Bool(false)));
-        match cb("ask", "¿nombre?") {
+        assert!(matches!(cb("approve", "¿borro todo?", None), SynValue::Bool(false)));
+        assert!(matches!(cb("confirm", "¿seguro?", None), SynValue::Bool(false)));
+        match cb("ask", "¿nombre?", None) {
             SynValue::Text(s) => assert_eq!(s.as_ref(), ""),
             other => panic!("esperaba texto vacío, got {:?}", other),
         }
@@ -441,24 +632,143 @@ mod tests {
         assert!(!first_time(&flag));
     }
 
+    /// Lanza un `handle` en un hilo y espera (poll corto) a que la pendiente exista.
+    /// Devuelve el join handle y el token de la pendiente.
+    fn spawn_pending(
+        handler: &Arc<QueueHandler>,
+        id: &str,
+        ty: InteractionType,
+        timeout: Option<f64>,
+    ) -> (thread::JoinHandle<InteractionResponse>, String) {
+        let h = handler.clone();
+        let id_c = id.to_string();
+        let t = thread::spawn(move || {
+            let mut req = InteractionRequest::new(&id_c, ty, "Test?");
+            req.timeout_seconds = timeout;
+            h.handle(&req)
+        });
+        let start = Instant::now();
+        while handler.get_pending().is_empty() && start.elapsed() < Duration::from_secs(2) {
+            std::thread::yield_now();
+        }
+        let token = {
+            let g = handler.inner.lock().unwrap();
+            g.pending.get(id).expect("pendiente encolada").token.clone()
+        };
+        (t, token)
+    }
+
     #[test]
     fn queue_handler_respond() {
         let handler = Arc::new(QueueHandler::new());
-        let h = handler.clone();
-        let t = thread::spawn(move || {
-            let req = InteractionRequest::new("req_1", InteractionType::Approve, "Test?");
-            h.handle(&req)
-        });
-        // Esperar a que el request esté pendiente (sin sleep fijo: poll corto).
-        let mut pending = handler.get_pending();
-        let start = Instant::now();
-        while pending.is_empty() && start.elapsed() < Duration::from_secs(2) {
-            std::thread::yield_now();
-            pending = handler.get_pending();
-        }
-        assert_eq!(pending.len(), 1);
+        let (t, _token) = spawn_pending(&handler, "req_1", InteractionType::Approve, None);
+        assert_eq!(handler.get_pending().len(), 1);
         handler.respond("req_1", "", true);
         let resp = t.join().unwrap();
         assert_eq!(resp.status, InteractionStatus::Approved);
+    }
+
+    // A1.v2: token correcto → Approved y la pendiente se consume (un solo uso).
+    #[test]
+    fn queue_respond_with_token_approves_and_consumes() {
+        let handler = Arc::new(QueueHandler::new());
+        let (t, token) = spawn_pending(&handler, "req_t1", InteractionType::Approve, None);
+        assert_eq!(
+            handler.respond_with_token("req_t1", &token, Some(true), None),
+            RespondOutcome::Accepted
+        );
+        let resp = t.join().unwrap();
+        assert_eq!(resp.status, InteractionStatus::Approved);
+        // Un solo uso: el mismo id ya no existe.
+        assert_eq!(
+            handler.respond_with_token("req_t1", &token, Some(true), None),
+            RespondOutcome::NotFound
+        );
+    }
+
+    // A1.v2: token inválido NO consume la pendiente — el gate sigue esperando y una
+    // respuesta posterior con el token correcto llega igual.
+    #[test]
+    fn queue_bad_token_keeps_pending_alive() {
+        let handler = Arc::new(QueueHandler::new());
+        let (t, token) = spawn_pending(&handler, "req_t2", InteractionType::Confirm, None);
+        assert_eq!(
+            handler.respond_with_token("req_t2", "token-falso", Some(true), None),
+            RespondOutcome::BadToken
+        );
+        assert_eq!(handler.get_pending().len(), 1, "la pendiente debe seguir viva");
+        assert_eq!(
+            handler.respond_with_token("req_t2", &token, Some(false), None),
+            RespondOutcome::Accepted
+        );
+        let resp = t.join().unwrap();
+        assert_eq!(resp.status, InteractionStatus::Denied);
+    }
+
+    // A1.v2: ask responde con `value` → Answered con ese texto.
+    #[test]
+    fn queue_ask_answered_with_value() {
+        let handler = Arc::new(QueueHandler::new());
+        let (t, token) = spawn_pending(&handler, "req_t3", InteractionType::Ask, None);
+        assert_eq!(
+            handler.respond_with_token("req_t3", &token, None, Some("azul")),
+            RespondOutcome::Accepted
+        );
+        let resp = t.join().unwrap();
+        assert_eq!(resp.status, InteractionStatus::Answered);
+        assert_eq!(resp.value.as_deref(), Some("azul"));
+    }
+
+    // A1.v2: sin respuesta → al deadline `Timeout` y la pendiente desaparece.
+    #[test]
+    fn queue_timeout_expires_pending() {
+        let handler = Arc::new(QueueHandler::new());
+        let (t, _token) = spawn_pending(&handler, "req_t4", InteractionType::Approve, Some(0.05));
+        let resp = t.join().unwrap();
+        assert_eq!(resp.status, InteractionStatus::Timeout);
+        assert!(handler.get_pending().is_empty(), "la pendiente vencida no debe listarse");
+    }
+
+    // A1.v2: los summaries no exponen el token y llevan tipo + vencimiento.
+    #[test]
+    fn queue_summaries_have_no_token() {
+        let handler = Arc::new(QueueHandler::new());
+        let (t, token) = spawn_pending(&handler, "req_t5", InteractionType::Approve, Some(60.0));
+        let sums = handler.pending_summaries();
+        assert_eq!(sums.len(), 1);
+        assert_eq!(sums[0].id, "req_t5");
+        assert_eq!(sums[0].ty, "approve");
+        assert!(sums[0].expires_at > 0);
+        // El resumen es lo que sale por GET /approvals: no contiene el token.
+        assert!(!format!("{:?}", sums[0]).contains(&token));
+        handler.respond_with_token("req_t5", &token, Some(true), None);
+        let _ = t.join().unwrap();
+    }
+
+    // A1.v2 (D1): el mapeo de Timeout en el callback es fail-closed: false para
+    // approve, texto vacío para ask (fallback documentado del core).
+    #[test]
+    fn callback_maps_timeout_to_false_and_empty() {
+        let mgr = InteractionManager::new(Arc::new(QueueHandler::new()));
+        let cb = mgr.get_callback();
+        assert!(matches!(cb("approve", "¿seguro?", Some(0.05)), SynValue::Bool(false)));
+        match cb("ask", "¿nombre?", Some(0.05)) {
+            SynValue::Text(s) => assert_eq!(s.as_ref(), ""),
+            other => panic!("esperaba texto vacío, got {:?}", other),
+        }
+    }
+
+    // Precedencia del timeout (D1): `within` del gate > default del host (knob). El
+    // request que llega al handler lleva el timeout ya resuelto.
+    #[test]
+    fn callback_timeout_precedence_within_over_default() {
+        let handler = Arc::new(AutoHandler::new(true, ""));
+        let mgr = InteractionManager::new(handler.clone()).with_default_timeout(Some(7.0));
+        let cb = mgr.get_callback();
+        cb("approve", "con within", Some(2.0));
+        cb("approve", "sin within", None);
+        let log = handler.log.lock().unwrap();
+        assert_eq!(log[0].timeout_seconds, Some(2.0), "`within` le gana al default");
+        assert_eq!(log[1].timeout_seconds, Some(7.0), "sin `within` aplica el knob");
     }
 }

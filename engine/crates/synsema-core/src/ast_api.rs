@@ -112,7 +112,7 @@ fn children(n: &Node) -> Vec<&Node> {
         RequireStatement { scope, .. } => scope.iter().map(|b| b.as_ref()).collect(),
         SandboxBlock { body, .. } => body.iter().collect(),
         InvariantDeclaration { condition, .. } => vec![condition],
-        ApproveStatement { message, context } => {
+        ApproveStatement { message, context, .. } => {
             let mut v = vec![message.as_ref()];
             if let Some(c) = context {
                 v.push(c);
@@ -120,8 +120,8 @@ fn children(n: &Node) -> Vec<&Node> {
             v
         }
         ShowStatement { value, .. } => vec![value],
-        ConfirmStatement { message } => vec![message],
-        AskExpression { prompt, options } => {
+        ConfirmStatement { message, .. } => vec![message],
+        AskExpression { prompt, options, .. } => {
             let mut v = vec![prompt.as_ref()];
             if let Some(o) = options {
                 v.push(o);
@@ -581,7 +581,7 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
         RequireStatement { scope, .. } => scope.iter_mut().map(|b| b.as_mut()).collect(),
         SandboxBlock { body, .. } => body.iter_mut().collect(),
         InvariantDeclaration { condition, .. } => vec![condition.as_mut()],
-        ApproveStatement { message, context } => {
+        ApproveStatement { message, context, .. } => {
             let mut v = vec![message.as_mut()];
             if let Some(c) = context {
                 v.push(c.as_mut());
@@ -589,8 +589,8 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
             v
         }
         ShowStatement { value, .. } => vec![value.as_mut()],
-        ConfirmStatement { message } => vec![message.as_mut()],
-        AskExpression { prompt, options } => {
+        ConfirmStatement { message, .. } => vec![message.as_mut()],
+        AskExpression { prompt, options, .. } => {
             let mut v = vec![prompt.as_mut()];
             if let Some(o) = options {
                 v.push(o.as_mut());

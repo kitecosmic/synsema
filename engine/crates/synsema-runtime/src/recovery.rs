@@ -72,7 +72,9 @@ pub struct RecoveryOptions {
 #[allow(clippy::type_complexity)]
 pub struct RecoveryProtocol {
     pub error_reporter: ErrorReporter,
-    pub human_callback: Option<Box<dyn FnMut(&str, &str) -> String>>,
+    /// (action, message, timeout_secs) → respuesta. Espejo de la firma del callback
+    /// humano del intérprete; la escalación no fija timeout (`None` = decide el host).
+    pub human_callback: Option<Box<dyn FnMut(&str, &str, Option<f64>) -> String>>,
     pub output_callback: Option<Box<dyn FnMut(&str)>>,
     pub decision_log: Vec<HumanDecision>,
     pub max_retry_attempts: usize,
@@ -296,7 +298,7 @@ impl RecoveryProtocol {
         let keys: Vec<String> = options.iter().map(|o| o.key.clone()).collect();
         let prompt = format!("Choose option ({})", keys.join(", "));
         let cb = self.human_callback.as_mut().unwrap();
-        let response = cb("ask", &prompt);
+        let response = cb("ask", &prompt, None);
         let mut chosen = response.trim().to_uppercase();
         let labels: std::collections::HashMap<String, String> =
             options.iter().map(|o| (o.key.clone(), o.label.clone())).collect();
@@ -510,7 +512,7 @@ mod tests {
         let mut p = RecoveryProtocol::new();
         p.max_retry_attempts = 1;
         p.retry_backoff_ms = vec![0];
-        p.human_callback = Some(Box::new(|_action, _msg| "A".to_string()));
+        p.human_callback = Some(Box::new(|_action, _msg, _timeout| "A".to_string()));
         let opts = RecoveryOptions {
             retry_fn: Some(Box::new(|| Err("still broken".to_string()))),
             speculate_fns: vec![Box::new(|| Err("still broken".to_string()))],
