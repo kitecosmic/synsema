@@ -16,11 +16,20 @@ pub struct LLMRequest {
     /// el programa como dato (ver el loop seguro en-lenguaje). Vacío para las ops de
     /// texto (reason/decide/analyze/generate) → retrocompat total.
     pub tools: Vec<ToolSpec>,
+    /// Opciones ESTRUCTURADAS de `decide between [...]` (DE-039). Con opciones, los
+    /// providers de red fuerzan la elección por tool/enum; vacío para el resto de las
+    /// ops (y para providers que no lo miran) → retrocompat total.
+    pub options: Vec<String>,
 }
 
 impl LLMRequest {
     pub fn new(operation: &str) -> Self {
-        Self { operation: operation.to_string(), data: HashMap::new(), tools: Vec::new() }
+        Self {
+            operation: operation.to_string(),
+            data: HashMap::new(),
+            tools: Vec::new(),
+            options: Vec::new(),
+        }
     }
     /// Builder: adjunta el catálogo de tools a la request.
     pub fn with_tools(mut self, t: Vec<ToolSpec>) -> Self {

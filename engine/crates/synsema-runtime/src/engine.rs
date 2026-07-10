@@ -211,6 +211,13 @@ pub(crate) fn wire_real_llm_provider(interp: &mut Interpreter) {
         req.data.insert("prompt".to_string(), prompt.to_string());
         p_text.call(&req).content
     }));
+    // Callback dedicado de `decide` (DE-039): las opciones viajan estructuradas y el
+    // contrato completo (tool/enum forzado → normalización → 1 reintento → fallback
+    // con aviso) vive en `decide_with_contract`.
+    let p_decide = provider.clone();
+    interp.set_llm_decide_callback(Rc::new(move |prompt: &str, options: &[String]| {
+        crate::llm_providers::decide_with_contract(p_decide.as_ref(), prompt, options)
+    }));
     // Callback de streaming (`llm_stream`, F2): mismo armado de request que llm_step
     // (prompt + context) → `call_stream` pasa el sink al provider. El local streamea
     // token a token; mock y providers de red heredan el default del trait (UN chunk).
@@ -776,6 +783,38 @@ pub fn run_capturing_llm(source: &str, filename: &str) -> (RunResult, Vec<(Strin
                 interp.set_llm_callback(Rc::new(move |op: &str, prompt: &str| {
                     cap.lock().unwrap().push((op.to_string(), prompt.to_string()));
                     "ok".to_string()
+                }));
+            })
+        })
+        .expect("hilo del motor")
+        .join()
+        .unwrap_or_else(|_| RunResult { success: false, output: Vec::new(), errors: vec!["el motor abortó".to_string()] });
+    let pairs = cap_outer.lock().unwrap().clone();
+    (result, pairs)
+}
+
+/// Host-config de test (DE-039): corre con el callback DEDICADO de `decide` que graba
+/// `(prompt, opciones)` y responde `respuesta`. Para aseverar que las opciones del
+/// `between [...]` llegan ESTRUCTURADAS (no sólo embebidas en el prompt) sin red.
+pub fn run_capturing_decide(
+    source: &str,
+    filename: &str,
+    respuesta: &str,
+) -> (RunResult, Vec<(String, Vec<String>)>) {
+    let captured: Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cap_outer = captured.clone();
+    let src = source.to_string();
+    let fname = filename.to_string();
+    let resp = respuesta.to_string();
+    let result = std::thread::Builder::new()
+        .stack_size(INTERP_STACK_SIZE)
+        .spawn(move || {
+            run_configured(&src, &fname, move |interp| {
+                let cap = captured.clone();
+                interp.set_llm_decide_callback(Rc::new(move |prompt: &str, options: &[String]| {
+                    cap.lock().unwrap().push((prompt.to_string(), options.to_vec()));
+                    resp.clone()
                 }));
             })
         })

@@ -258,6 +258,39 @@ pub fn build_anthropic_body(
     body.to_string()
 }
 
+/// Arma el body de `decide` con opciones (DE-039): tool `elegir` cuyo schema restringe
+/// la respuesta al set (`enum` = opciones) + `tool_choice` FORZADO — el modelo no puede
+/// responder texto libre. Variante de `build_anthropic_body` (que queda intacta para
+/// el resto de las ops).
+pub fn build_anthropic_decide_body(
+    model: &str,
+    max_tokens: u64,
+    user_prompt: &str,
+    context: &str,
+    options: &[String],
+    stream: bool,
+) -> String {
+    let mut body = json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [ { "role": "user", "content": user_content(user_prompt, context) } ],
+        "tools": [{
+            "name": "elegir",
+            "description": "Elegí exactamente una opción.",
+            "input_schema": {
+                "type": "object",
+                "properties": { "opcion": { "type": "string", "enum": options } },
+                "required": ["opcion"],
+            }
+        }],
+        "tool_choice": { "type": "tool", "name": "elegir" },
+    });
+    if stream {
+        body["stream"] = Value::Bool(true);
+    }
+    body.to_string()
+}
+
 /// tokens = `usage.input_tokens + usage.output_tokens`.
 fn anthropic_tokens(v: &Value) -> u64 {
     let usage = v.get("usage");
@@ -541,6 +574,41 @@ impl LLMProvider for AnthropicProvider {
     fn call(&self, request: &LLMRequest) -> LLMResponse {
         let prompt = request.data.get("prompt").cloned().unwrap_or_default();
         let context = request.data.get("context").cloned().unwrap_or_default();
+        // `decide` con opciones (DE-039): body con tool `elegir` + tool_choice forzado.
+        // La respuesta llega como ToolCall (el rearmado SSE de tools ya existe) y el
+        // content es `args["opcion"]`. Si el modelo igual respondió texto, se devuelve
+        // crudo — la normalización/reintento viven en `decide_with_contract`.
+        if request.operation == "decide" && !request.options.is_empty() {
+            let result = if self.stream_transport {
+                let body = build_anthropic_decide_body(
+                    &self.model,
+                    self.max_tokens,
+                    &prompt,
+                    &context,
+                    &request.options,
+                    true,
+                );
+                self.post_sse(&body, &mut |_| true).and_then(|r| match r {
+                    SsePost::Stream(st) => st.finish_step(),
+                    SsePost::Plain(j) => parse_anthropic_step(&j),
+                })
+            } else {
+                let body = build_anthropic_decide_body(
+                    &self.model,
+                    self.max_tokens,
+                    &prompt,
+                    &context,
+                    &request.options,
+                    false,
+                );
+                self.post(body).and_then(|j| parse_anthropic_step(&j))
+            };
+            let content = match result {
+                Ok((step, _)) => decide_step_to_text(step),
+                Err(e) => format!("[anthropic error: {}]", e),
+            };
+            return LLMResponse { content, model: self.model.clone() };
+        }
         let result = if self.stream_transport {
             let body = build_anthropic_body(&self.model, self.max_tokens, &prompt, &context, &[], true);
             self.post_sse(&body, &mut |_| true).and_then(|r| match r {
@@ -673,6 +741,42 @@ pub fn build_openai_body(
             })
             .collect();
         body["tools"] = Value::Array(arr);
+    }
+    body.to_string()
+}
+
+/// Arma el body de `decide` con opciones (DE-039), dialecto function-calling: function
+/// `elegir` con `enum` = opciones + `tool_choice` FORZADO. Variante de
+/// `build_openai_body` (que queda intacta para el resto de las ops).
+pub fn build_openai_decide_body(
+    model: &str,
+    max_tokens: u64,
+    user_prompt: &str,
+    context: &str,
+    options: &[String],
+    stream: bool,
+) -> String {
+    let mut body = json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [ { "role": "user", "content": user_content(user_prompt, context) } ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "elegir",
+                "description": "Elegí exactamente una opción.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "opcion": { "type": "string", "enum": options } },
+                    "required": ["opcion"],
+                }
+            }
+        }],
+        "tool_choice": { "type": "function", "function": { "name": "elegir" } },
+    });
+    if stream {
+        body["stream"] = Value::Bool(true);
+        body["stream_options"] = json!({ "include_usage": true });
     }
     body.to_string()
 }
@@ -950,6 +1054,39 @@ impl LLMProvider for OpenAIProvider {
     fn call(&self, request: &LLMRequest) -> LLMResponse {
         let prompt = request.data.get("prompt").cloned().unwrap_or_default();
         let context = request.data.get("context").cloned().unwrap_or_default();
+        // `decide` con opciones (DE-039): function `elegir` + tool_choice forzado.
+        // Espejo del camino de AnthropicProvider (ver el comentario ahí).
+        if request.operation == "decide" && !request.options.is_empty() {
+            let result = if self.stream_transport {
+                let body = build_openai_decide_body(
+                    &self.model,
+                    self.max_tokens,
+                    &prompt,
+                    &context,
+                    &request.options,
+                    true,
+                );
+                self.post_sse_with_retry(&body, &mut |_| true).and_then(|r| match r {
+                    SsePost::Stream(st) => st.finish_step(),
+                    SsePost::Plain(j) => parse_openai_step(&j),
+                })
+            } else {
+                let body = build_openai_decide_body(
+                    &self.model,
+                    self.max_tokens,
+                    &prompt,
+                    &context,
+                    &request.options,
+                    false,
+                );
+                self.post(body).and_then(|j| parse_openai_step(&j))
+            };
+            let content = match result {
+                Ok((step, _)) => decide_step_to_text(step),
+                Err(e) => format!("[openai error: {}]", e),
+            };
+            return LLMResponse { content, model: self.model.clone() };
+        }
         let result = if self.stream_transport {
             let body = build_openai_body(&self.model, self.max_tokens, &prompt, &context, &[], true);
             self.post_sse_with_retry(&body, &mut |_| true).and_then(|r| match r {
@@ -1033,6 +1170,148 @@ impl LLMProvider for OpenAIProvider {
         };
         LLMResponse { content, model: self.model.clone() }
     }
+}
+
+// =========================================================
+// Contrato de `decide` (DE-039)
+// =========================================================
+
+/// Content de un paso de `decide` forzado por tool: la ToolCall `elegir` → su arg
+/// `opcion`; un `Final` (modelo que igual respondió texto, o compatible que ignoró el
+/// `tool_choice`) → el texto tal cual. La normalización/reintento viven en
+/// `decide_with_contract`, que recibe esto como "crudo".
+fn decide_step_to_text(step: LlmStep) -> String {
+    match step {
+        LlmStep::ToolCall { args, .. } => args
+            .into_iter()
+            .find(|(k, _)| k == "opcion")
+            .map(|(_, v)| v)
+            .unwrap_or_default(),
+        LlmStep::Final(t) => t,
+    }
+}
+
+/// Forma canónica para comparar una respuesta contra las opciones: trim, sacar
+/// puntuación/comillas ENVOLVENTES (no internas) y case-fold.
+fn normalize_decide_token(s: &str) -> String {
+    s.trim()
+        .trim_matches(|c: char| c.is_ascii_punctuation() || c == '¿' || c == '¡' || c == '«' || c == '»' || c == '“' || c == '”' || c == '‘' || c == '’')
+        .trim()
+        .to_lowercase()
+}
+
+/// Normalización tolerante de la respuesta de `decide` (pura, DE-039 peldaño 2):
+/// - tras normalizar, la respuesta ES una opción → esa (`"ROJO."` → `ROJO`);
+/// - la respuesta CONTIENE exactamente UNA opción normalizada → esa
+///   (`"La respuesta es AZUL"` → `AZUL`);
+/// - cero o varias → `None` (ambigua: que decida el reintento/fallback).
+///
+/// Devuelve siempre la opción ORIGINAL (casing/formato intactos), nunca la forma
+/// normalizada — el contrato es "una de las opciones", byte a byte.
+pub fn normalize_decide(raw: &str, options: &[String]) -> Option<String> {
+    let raw_norm = normalize_decide_token(raw);
+    if raw_norm.is_empty() {
+        return None;
+    }
+    // Match exacto primero (gana aunque otra opción esté CONTENIDA en esta,
+    // p.ej. opciones "azul" y "azul oscuro" con respuesta "azul oscuro").
+    for opt in options {
+        if normalize_decide_token(opt) == raw_norm {
+            return Some(opt.clone());
+        }
+    }
+    // Contención: exactamente UNA opción normalizada dentro de la respuesta, como
+    // PALABRA(S) COMPLETA(S) — substring a secas inventa decisiones ("si" dentro de
+    // "nece*si*to"); ver el test adversario `normalize_decide_containment_is_word_boundary`.
+    let contained: Vec<&String> = options
+        .iter()
+        .filter(|opt| {
+            let o = normalize_decide_token(opt);
+            !o.is_empty() && contains_whole(&raw_norm, &o)
+        })
+        .collect();
+    match contained.as_slice() {
+        [only] => Some((*only).clone()),
+        _ => None,
+    }
+}
+
+/// ¿`needle` aparece en `haystack` con LÍMITE DE PALABRA a ambos lados (el char
+/// adyacente, si existe, no es alfanumérico)? Los índices de `find` son byte-offsets de
+/// substrings válidos → los slices caen siempre en límites de char (UTF-8 seguro).
+fn contains_whole(haystack: &str, needle: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = haystack[start..].find(needle) {
+        let abs = start + pos;
+        let end = abs + needle.len();
+        let before_ok =
+            haystack[..abs].chars().next_back().map_or(true, |c| !c.is_alphanumeric());
+        let after_ok = haystack[end..].chars().next().map_or(true, |c| !c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        start = end;
+    }
+    false
+}
+
+/// Aviso ÚNICO por proceso cuando `decide` entrega crudo pese al reintento (peldaño 4).
+/// Mismo patrón `first_time` que los avisos de LLM-offline (DX-1) y de human-gates.
+static DECIDE_FALLBACK_NOTICED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `true` SOLO la primera vez sobre `flag` (testeable con un flag local).
+fn first_time(flag: &std::sync::atomic::AtomicBool) -> bool {
+    !flag.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn note_decide_fallback() {
+    if first_time(&DECIDE_FALLBACK_NOTICED) {
+        eprintln!(
+            "[synsema] aviso: decide devolvió un valor fuera de las opciones pese al \
+             reintento — se entrega crudo"
+        );
+    }
+}
+
+/// La escalera completa de `decide` con opciones (DE-039): tool/enum forzado (lo hace
+/// el provider al ver `options` en la request) → normalización tolerante → UN reintento
+/// con feedback → fallback crudo CON aviso único. Agnóstica del transporte: cualquier
+/// `LLMProvider` sirve (los que no miran `options` — local GGUF, mock — responden texto
+/// y entran directo por la normalización).
+pub fn decide_with_contract(
+    provider: &dyn LLMProvider,
+    prompt: &str,
+    options: &[String],
+) -> String {
+    let mut req = LLMRequest::new("decide");
+    req.data.insert("prompt".to_string(), prompt.to_string());
+    req.options = options.to_vec();
+    let raw = provider.call(&req).content;
+    if options.is_empty() {
+        return raw; // sin `between [...]`: no hay contrato que hacer cumplir
+    }
+    if let Some(choice) = normalize_decide(&raw, options) {
+        return choice;
+    }
+    // UN reintento con feedback (peldaño 3) — costo solo cuando hace falta.
+    let mut retry = LLMRequest::new("decide");
+    retry.data.insert(
+        "prompt".to_string(),
+        format!(
+            "{}\nTu respuesta '{}' no es válida. Respondé ÚNICAMENTE con una de: {}",
+            prompt,
+            raw,
+            options.join(", ")
+        ),
+    );
+    retry.options = options.to_vec();
+    let raw2 = provider.call(&retry).content;
+    if let Some(choice) = normalize_decide(&raw2, options) {
+        return choice;
+    }
+    note_decide_fallback();
+    raw2
 }
 
 // =========================================================
@@ -2641,6 +2920,281 @@ mod tests {
         handle.join().unwrap();
         assert!(chunks.len() > 1, "esperaba >1 chunk, llegaron {:?}", chunks);
         assert_eq!(resp2.content, "Hola");
+    }
+
+    // -- DE-039: contrato de `decide` (normalización + tool forzado + escalera) --
+
+    use synsema_llm::provider::MockProvider;
+
+    #[test]
+    fn normalize_decide_table() {
+        let opts = vec!["ROJO".to_string(), "AZUL".to_string()];
+        // exacto y variantes de formato (trim, case, puntuación/comillas envolventes)
+        assert_eq!(normalize_decide("ROJO", &opts), Some("ROJO".to_string()));
+        assert_eq!(normalize_decide("  rojo.  ", &opts), Some("ROJO".to_string()));
+        assert_eq!(normalize_decide("\"AZUL\"", &opts), Some("AZUL".to_string()));
+        assert_eq!(normalize_decide("'azul!'", &opts), Some("AZUL".to_string()));
+        // contención única
+        assert_eq!(normalize_decide("La respuesta es AZUL", &opts), Some("AZUL".to_string()));
+        // ambigua (contiene ambas) o ninguna o vacía → None
+        assert_eq!(normalize_decide("rojo o azul", &opts), None);
+        assert_eq!(normalize_decide("verde", &opts), None);
+        assert_eq!(normalize_decide("", &opts), None);
+        // los underscores son puntuación envolvente: `__yes__` y `yes` normalizan igual
+        let yn = vec!["__yes__".to_string(), "__no__".to_string()];
+        assert_eq!(normalize_decide("__yes__", &yn), Some("__yes__".to_string()));
+        assert_eq!(normalize_decide("yes", &yn), Some("__yes__".to_string()));
+        // el match exacto gana sobre la contención (opciones que se contienen entre sí)
+        let sub = vec!["azul".to_string(), "azul oscuro".to_string()];
+        assert_eq!(normalize_decide("azul oscuro", &sub), Some("azul oscuro".to_string()));
+    }
+
+    // ADVERSARIO (auditoría Orden 1): la contención debe ser por PALABRA COMPLETA, no
+    // substring — con opciones cortas tipo si/no, "nece*si*to" NO es una elección.
+    // Devolver "si" acá sería inventar una decisión que el modelo no tomó (peor que el
+    // bug DE-039 original, porque encima viene "validada" por el contrato).
+    #[test]
+    fn normalize_decide_containment_is_word_boundary() {
+        let yn = vec!["si".to_string(), "no".to_string()];
+        // "si" está DENTRO de "necesito" → NO cuenta como contención.
+        assert_eq!(normalize_decide("necesito más información", &yn), None);
+        // "no" dentro de "noviembre" tampoco.
+        assert_eq!(normalize_decide("noviembre", &yn), None);
+        // Como palabra completa SÍ cuenta.
+        assert_eq!(normalize_decide("creo que si", &yn), Some("si".to_string()));
+        assert_eq!(normalize_decide("por ahora no, gracias", &yn), Some("no".to_string()));
+        // Palabra completa en el borde del texto.
+        assert_eq!(normalize_decide("si claro", &yn), Some("si".to_string()));
+        // Multi-palabra con límites correctos.
+        let sub = vec!["azul oscuro".to_string(), "rojo".to_string()];
+        assert_eq!(
+            normalize_decide("prefiero el azul oscuro para el fondo", &sub),
+            Some("azul oscuro".to_string())
+        );
+        assert_eq!(normalize_decide("azuloscuro", &sub), None);
+    }
+
+    #[test]
+    fn build_anthropic_decide_body_forces_tool() {
+        let opts = vec!["ROJO".to_string(), "AZUL".to_string()];
+        let body = build_anthropic_decide_body("m", 64, "elegí", "", &opts, false);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["tool_choice"], json!({ "type": "tool", "name": "elegir" }));
+        assert_eq!(v["tools"][0]["name"], "elegir");
+        assert_eq!(
+            v["tools"][0]["input_schema"]["properties"]["opcion"]["enum"],
+            json!(["ROJO", "AZUL"])
+        );
+        assert_eq!(v["tools"][0]["input_schema"]["required"], json!(["opcion"]));
+        assert!(v.get("stream").is_none());
+        let vs: Value =
+            serde_json::from_str(&build_anthropic_decide_body("m", 64, "elegí", "", &opts, true))
+                .unwrap();
+        assert_eq!(vs["stream"], json!(true));
+    }
+
+    #[test]
+    fn build_openai_decide_body_forces_function() {
+        let opts = vec!["ROJO".to_string(), "AZUL".to_string()];
+        let body = build_openai_decide_body("m", 64, "elegí", "", &opts, false);
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            v["tool_choice"],
+            json!({ "type": "function", "function": { "name": "elegir" } })
+        );
+        assert_eq!(v["tools"][0]["type"], "function");
+        assert_eq!(v["tools"][0]["function"]["name"], "elegir");
+        assert_eq!(
+            v["tools"][0]["function"]["parameters"]["properties"]["opcion"]["enum"],
+            json!(["ROJO", "AZUL"])
+        );
+        // con stream: el flag + stream_options (usage), como el body de texto
+        let vs: Value =
+            serde_json::from_str(&build_openai_decide_body("m", 64, "elegí", "", &opts, true))
+                .unwrap();
+        assert_eq!(vs["stream"], json!(true));
+        assert_eq!(vs["stream_options"], json!({ "include_usage": true }));
+    }
+
+    /// Request de `decide` con opciones estructuradas (como la arma el wiring).
+    fn decide_request(prompt: &str, options: &[&str]) -> LLMRequest {
+        let mut req = LLMRequest::new("decide");
+        req.data.insert("prompt".to_string(), prompt.to_string());
+        req.options = options.iter().map(|s| s.to_string()).collect();
+        req
+    }
+
+    const ANTHROPIC_SSE_ELEGIR: &str = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"name\":\"elegir\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"opcion\\\": \\\"ROJO\\\"}\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\"}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+
+    // El parser SSE rearma la ToolCall `elegir` y `call()` devuelve el valor ∈ set.
+    #[test]
+    fn anthropic_decide_sse_toolcall_returns_option() {
+        let (url, handle) = spawn_fake_server(vec![sse_response(ANTHROPIC_SSE_ELEGIR)]);
+        let p = fake_anthropic(url, 5);
+        let r = p.call(&decide_request("elegí", &["ROJO", "AZUL"]));
+        handle.join().unwrap();
+        assert_eq!(r.content, "ROJO");
+    }
+
+    const OPENAI_SSE_ELEGIR: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"elegir\",\"arguments\":\"{\\\"opcion\\\": \\\"AZUL\\\"}\"}}]}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":4}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    #[test]
+    fn openai_decide_sse_toolcall_returns_option() {
+        let (url, handle) = spawn_fake_server(vec![sse_response(OPENAI_SSE_ELEGIR)]);
+        let p = OpenAIProvider {
+            api_key: "k".to_string(),
+            model: "m".to_string(),
+            max_tokens: 64,
+            base_url: url,
+            timeout_secs: 5,
+            stream_transport: true,
+        };
+        let r = p.call(&decide_request("elegí", &["ROJO", "AZUL"]));
+        handle.join().unwrap();
+        assert_eq!(r.content, "AZUL");
+    }
+
+    /// Server fake que además CAPTURA cada request completo (head + body por
+    /// Content-Length) — para aseverar el feedback del reintento de decide.
+    fn spawn_capture_server(
+        responses: Vec<Vec<u8>>,
+    ) -> (String, thread::JoinHandle<()>, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cap = captured.clone();
+        let handle = thread::spawn(move || {
+            for resp in responses {
+                let Ok((mut sock, _)) = listener.accept() else { return };
+                let mut acc: Vec<u8> = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    if let Some(pos) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&acc[..pos]).to_lowercase();
+                        let clen: usize = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .and_then(|v| v.trim().parse().ok())
+                            .unwrap_or(0);
+                        if acc.len() >= pos + 4 + clen {
+                            break;
+                        }
+                    }
+                    match sock.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => acc.extend_from_slice(&buf[..n]),
+                        Err(_) => break,
+                    }
+                }
+                cap.lock().unwrap().push(String::from_utf8_lossy(&acc).to_string());
+                let _ = sock.write_all(&resp);
+            }
+        });
+        (format!("http://127.0.0.1:{}", port), handle, captured)
+    }
+
+    /// Transcript SSE Anthropic de texto plano con el `text` dado (para simular un
+    /// modelo que respondió fuera del set pese al tool forzado).
+    fn sse_anthropic_text(text: &str) -> Vec<u8> {
+        sse_response(&format!(
+            concat!(
+                "event: message_start\n",
+                "data: {{\"type\":\"message_start\",\"message\":{{\"usage\":{{\"input_tokens\":1,\"output_tokens\":0}}}}}}\n\n",
+                "event: content_block_delta\n",
+                "data: {{\"type\":\"content_block_delta\",\"delta\":{{\"type\":\"text_delta\",\"text\":\"{}\"}}}}\n\n",
+                "event: message_stop\n",
+                "data: {{\"type\":\"message_stop\"}}\n\n",
+            ),
+            text
+        ))
+    }
+
+    // Caso común: la ToolCall ya viene en el set → CERO reintentos.
+    #[test]
+    fn decide_contract_toolcall_needs_no_retry() {
+        let (url, handle, reqs) = spawn_capture_server(vec![sse_response(ANTHROPIC_SSE_ELEGIR)]);
+        let p = fake_anthropic(url, 5);
+        let opts = vec!["ROJO".to_string(), "AZUL".to_string()];
+        let out = decide_with_contract(&p, "elegí", &opts);
+        handle.join().unwrap();
+        assert_eq!(out, "ROJO");
+        assert_eq!(reqs.lock().unwrap().len(), 1, "cero reintentos en el caso común");
+    }
+
+    // Fuera de set → UN reintento con el feedback en el body → la opción normalizada.
+    #[test]
+    fn decide_contract_retry_with_feedback_then_ok() {
+        let (url, handle, reqs) = spawn_capture_server(vec![
+            sse_anthropic_text("verde"),
+            sse_anthropic_text("AZUL."),
+        ]);
+        let p = fake_anthropic(url, 5);
+        let opts = vec!["ROJO".to_string(), "AZUL".to_string()];
+        let out = decide_with_contract(&p, "elegí un color", &opts);
+        handle.join().unwrap();
+        assert_eq!(out, "AZUL");
+        let reqs = reqs.lock().unwrap();
+        assert_eq!(reqs.len(), 2, "exactamente UN reintento");
+        // ambos requests fuerzan la tool `elegir`
+        assert!(reqs[0].contains("tool_choice"), "1er request sin tool forzada: {}", reqs[0]);
+        assert!(reqs[1].contains("tool_choice"), "reintento sin tool forzada: {}", reqs[1]);
+        // el reintento lleva el feedback con la respuesta inválida citada
+        assert!(reqs[1].contains("no es válida"), "reintento sin feedback: {}", reqs[1]);
+        assert!(reqs[1].contains("verde"), "el feedback debe citar la respuesta inválida");
+        assert!(reqs[1].contains("ROJO, AZUL"), "el feedback debe listar las opciones");
+    }
+
+    // Reintento también fuera de set → fallback: el crudo (degradar-con-aviso, nunca romper).
+    #[test]
+    fn decide_contract_fallback_returns_raw_after_retry() {
+        let (url, handle, reqs) = spawn_capture_server(vec![
+            sse_anthropic_text("verde"),
+            sse_anthropic_text("verde"),
+        ]);
+        let p = fake_anthropic(url, 5);
+        let opts = vec!["ROJO".to_string(), "AZUL".to_string()];
+        let out = decide_with_contract(&p, "elegí un color", &opts);
+        handle.join().unwrap();
+        assert_eq!(out, "verde", "el fallback entrega el crudo, no rompe");
+        assert_eq!(reqs.lock().unwrap().len(), 2, "un solo reintento, no un loop");
+    }
+
+    // Provider sin camino de tools (mock ≈ local GGUF): entra directo por la
+    // normalización — peldaño 2 de la escalera.
+    #[test]
+    fn decide_contract_mock_normalizes_without_tools() {
+        let mut responses = std::collections::HashMap::new();
+        responses.insert("decide".to_string(), "La respuesta es AZUL".to_string());
+        let p = MockProvider::new(responses);
+        let out =
+            decide_with_contract(&p, "elegí", &["ROJO".to_string(), "AZUL".to_string()]);
+        assert_eq!(out, "AZUL");
+    }
+
+    // Sin opciones (decide sin `between [...]`): passthrough del crudo, sin contrato.
+    #[test]
+    fn decide_contract_without_options_returns_raw() {
+        let mut responses = std::collections::HashMap::new();
+        responses.insert("decide".to_string(), "lo que sea".to_string());
+        let p = MockProvider::new(responses);
+        assert_eq!(decide_with_contract(&p, "x", &[]), "lo que sea");
     }
 
     // -- Live (red real). Corre a mano:
