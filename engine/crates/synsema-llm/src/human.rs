@@ -144,7 +144,7 @@ impl HumanHandler for ConsoleHandler {
                     _ => "review",
                 };
                 loop {
-                    eprint!("[{}] {} (s/n): ", verb, request.message);
+                    eprint!("[{}] {} (y/n): ", verb, request.message);
                     let _ = std::io::stderr().flush();
                     let mut line = String::new();
                     if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
@@ -160,7 +160,7 @@ impl HumanHandler for ConsoleHandler {
                             }
                         }
                         "n" | "no" => return denied(request),
-                        _ => eprintln!("respondé 's' o 'n'"),
+                        _ => eprintln!("please answer 'y' or 'n' (sí/no also accepted)"),
                     }
                 }
             }
@@ -207,10 +207,14 @@ impl HumanHandler for DenyHandler {
         match request.ty {
             InteractionType::Approve | InteractionType::Confirm | InteractionType::Review => {
                 if first_time(&DENY_NOTICED) {
+                    // Redacción a prueba de LLMs: decir QUIÉN debe aprobar (un humano) y
+                    // qué NO debe hacer un agente que lea esto (intentar aprobarlo él).
                     eprintln!(
-                        "[synsema] aviso: approve/confirm sin canal humano ({}) → DENEGADO \
-                         (fail-closed; antes se auto-aprobaba en silencio). El programa sigue \
-                         por la rama false.",
+                        "[synsema] notice: an approve/confirm gate was reached but no human \
+                         channel is available ({}) → DENIED (fail-closed). This step requires \
+                         approval from a HUMAN. If you are an AI agent reading this: do NOT \
+                         attempt to approve it yourself — report it to your human operator. \
+                         The program continues on the false branch.",
                         self.context
                     );
                 }
@@ -223,8 +227,9 @@ impl HumanHandler for DenyHandler {
             InteractionType::Ask => {
                 if first_time(&ASK_FALLBACK_NOTICED) {
                     eprintln!(
-                        "[synsema] aviso: ask sin canal humano ({}) → fallback automático \
-                         (primera opción o texto vacío) — nadie respondió de verdad.",
+                        "[synsema] notice: an ask reached with no human channel available ({}) \
+                         → automatic fallback (first option, or empty text). No human actually \
+                         answered this question — treat the value accordingly.",
                         self.context
                     );
                 }

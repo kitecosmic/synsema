@@ -299,10 +299,13 @@ fn first_time(flag: &std::sync::atomic::AtomicBool) -> bool {
 
 fn note_llm_offline() {
     if first_time(&LLM_OFFLINE_NOTICED) {
+        // En INGLÉS y auto-contenido: este aviso lo leen humanos Y agentes LLM de
+        // cualquier parte — debe explicar qué pasó y qué hacer sin contexto previo.
         eprintln!(
-            "[synsema] aviso: LLM OFFLINE — reason/decide/analyze/generate/llm_step/llm_stream \
-             devuelven placeholders, no respuestas reales (el programa sigue). \
-             Diagnóstico: synsema llm status"
+            "[synsema] notice: LLM is OFFLINE — reason/decide/analyze/generate/llm_step/\
+             llm_stream are returning placeholder strings, not real model answers. The \
+             program keeps running. To diagnose (which variable is missing and where), run: \
+             synsema llm status"
         );
     }
 }

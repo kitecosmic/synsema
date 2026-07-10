@@ -1268,8 +1268,9 @@ fn first_time(flag: &std::sync::atomic::AtomicBool) -> bool {
 fn note_decide_fallback() {
     if first_time(&DECIDE_FALLBACK_NOTICED) {
         eprintln!(
-            "[synsema] aviso: decide devolvió un valor fuera de las opciones pese al \
-             reintento — se entrega crudo"
+            "[synsema] notice: decide returned a value outside the given options even after \
+             one retry — returning the raw model response. Code branching on this decide \
+             should handle a value that is not one of the options."
         );
     }
 }
