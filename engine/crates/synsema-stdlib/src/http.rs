@@ -138,16 +138,18 @@ fn build_http_request(method: &str, path: &str, host: &str, headers: Option<&[(S
     req.into_bytes()
 }
 
-/// Conecta (TCP, o TLS para `https`), envía el request y lee la respuesta cruda
-/// (head + body) hasta EOF. Base compartida por `do_request` (→ `String`) y
-/// `http_request_bytes` (→ bytes crudos, para descargar binarios sin corromperlos).
-fn fetch_raw(
+/// Conecta (TCP, o TLS para `https`) y envía el request; devuelve el stream listo
+/// para leer la respuesta (un `Box<dyn Read>` unifica los dos brazos — la lógica de
+/// HTTP/1.1 es idéntica, solo el transporte cambia). Base compartida por `fetch_raw`
+/// (lee hasta EOF) y `http_request_stream` (lee incrementalmente). El read/write
+/// timeout del socket aplica POR operación, no a la duración total.
+fn connect_and_send(
     method: &str,
     url: &str,
     headers: Option<&[(String, String)]>,
     body: Option<&str>,
     timeout_secs: u64,
-) -> Result<Vec<u8>, String> {
+) -> Result<Box<dyn Read>, String> {
     let (scheme, host, port, path) = parse_url(url)?;
     if scheme != "http" && scheme != "https" {
         return Err(format!("unsupported scheme '{}': only http and https are supported", scheme));
@@ -165,7 +167,6 @@ fn fetch_raw(
     let _ = tcp.set_write_timeout(Some(timeout));
 
     let req_bytes = build_http_request(method, &path, &host, headers, body);
-    let mut buf = Vec::new();
 
     if scheme == "https" {
         let roots = root_cert_store()?;
@@ -181,13 +182,98 @@ fn fetch_raw(
             .map_err(|e| e.to_string())?;
         let mut stream = rustls::StreamOwned::new(conn, tcp);
         stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
-        read_to_end_tolerant(&mut stream, &mut buf)?;
+        Ok(Box::new(stream))
     } else {
         let mut stream = tcp;
         stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
-        read_to_end_tolerant(&mut stream, &mut buf)?;
+        Ok(Box::new(stream))
     }
+}
+
+/// Conecta (TCP, o TLS para `https`), envía el request y lee la respuesta cruda
+/// (head + body) hasta EOF. Base compartida por `do_request` (→ `String`) y
+/// `http_request_bytes` (→ bytes crudos, para descargar binarios sin corromperlos).
+fn fetch_raw(
+    method: &str,
+    url: &str,
+    headers: Option<&[(String, String)]>,
+    body: Option<&str>,
+    timeout_secs: u64,
+) -> Result<Vec<u8>, String> {
+    let mut stream = connect_and_send(method, url, headers, body, timeout_secs)?;
+    let mut buf = Vec::new();
+    read_to_end_tolerant(&mut stream, &mut buf)?;
     Ok(buf)
+}
+
+/// Como `http_request` pero entrega el BODY incrementalmente: parsea el head, y va
+/// invocando `on_data` con cada tramo de body YA des-chunkeado a medida que llega.
+/// `on_data` devuelve `false` para abortar la lectura (el caller corta). Devuelve
+/// `(status, headers)` al terminar (EOF o abort). El read-timeout del socket aplica
+/// POR `read()` → mide **silencio** entre bytes, no duración total: una respuesta
+/// larga que gotea fluye; un host mudo sigue fallando al timeout.
+///
+/// Tolerancia EOF: mismo criterio que `read_to_end_tolerant` — un `UnexpectedEof`
+/// durante el body (head ya recibido) NO es error (peers que cierran TLS sin
+/// `close_notify`, p.ej. MiniMax).
+pub fn http_request_stream(
+    method: &str,
+    url: &str,
+    headers: Option<&[(String, String)]>,
+    body: Option<&str>,
+    timeout_secs: u64,
+    on_data: &mut dyn FnMut(&[u8]) -> bool,
+) -> Result<(i64, Vec<(String, String)>), String> {
+    let mut stream = connect_and_send(method, url, headers, body, timeout_secs)?;
+    let mut read_buf = [0u8; 8192];
+
+    // Fase 1: acumular hasta el fin del head (`\r\n\r\n`) y parsearlo. Un EOF antes
+    // de completar el head sí es error (respuesta malformada, como en parse_response).
+    let mut acc: Vec<u8> = Vec::new();
+    let (status, resp_headers, leftover) = loop {
+        match stream.read(&mut read_buf) {
+            Ok(0) => return Err("malformed HTTP response".to_string()),
+            Ok(n) => {
+                acc.extend_from_slice(&read_buf[..n]);
+                if let Some(split) = acc.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&acc[..split]).to_string();
+                    let (status, headers) = parse_head(&head);
+                    break (status, headers, acc.split_off(split + 4));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err("malformed HTTP response".to_string())
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+
+    // Fase 2: body incremental, des-chunkeado al vuelo si corresponde.
+    let chunked = resp_headers.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
+    });
+    let mut decoder = ChunkDecoder::new();
+    let mut push = |raw: &[u8], on_data: &mut dyn FnMut(&[u8]) -> bool| -> bool {
+        let bytes = if chunked { decoder.feed(raw) } else { raw.to_vec() };
+        bytes.is_empty() || on_data(&bytes)
+    };
+    if !push(&leftover, on_data) {
+        return Ok((status, resp_headers));
+    }
+    loop {
+        match stream.read(&mut read_buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if !push(&read_buf[..n], on_data) {
+                    break;
+                }
+            }
+            // Head + bytes ya recibidos → cierre sin close_notify tolerado.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok((status, resp_headers))
 }
 
 fn do_request(
@@ -214,13 +300,10 @@ pub fn http_request_bytes(
     parse_response_bytes(&buf)
 }
 
-/// Igual que `parse_response` pero devuelve el body como bytes crudos (para binarios).
-fn parse_response_bytes(buf: &[u8]) -> Result<(i64, Vec<u8>, Vec<(String, String)>), String> {
-    let split = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| "malformed HTTP response".to_string())?;
-    let head = String::from_utf8_lossy(&buf[..split]);
+/// Parsea el head crudo de una respuesta HTTP/1.1 (status-line + headers, SIN el
+/// `\r\n\r\n` final) → `(status, headers)`. Compartido por `parse_response`,
+/// `parse_response_bytes` y `http_request_stream`.
+fn parse_head(head: &str) -> (i64, Vec<(String, String)>) {
     let mut lines = head.split("\r\n");
     let status_line = lines.next().unwrap_or("");
     let status: i64 = status_line
@@ -234,6 +317,16 @@ fn parse_response_bytes(buf: &[u8]) -> Result<(i64, Vec<u8>, Vec<(String, String
             headers.push((line[..ci].trim().to_string(), line[ci + 1..].trim().to_string()));
         }
     }
+    (status, headers)
+}
+
+/// Igual que `parse_response` pero devuelve el body como bytes crudos (para binarios).
+fn parse_response_bytes(buf: &[u8]) -> Result<(i64, Vec<u8>, Vec<(String, String)>), String> {
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| "malformed HTTP response".to_string())?;
+    let (status, headers) = parse_head(&String::from_utf8_lossy(&buf[..split]));
     let chunked = headers.iter().any(|(k, v)| {
         k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
     });
@@ -258,20 +351,7 @@ fn parse_response(buf: &[u8]) -> Result<HttpResult, String> {
     let text = String::from_utf8_lossy(buf);
     // El head es ASCII → el offset de char en `text` == offset de byte en `buf`.
     let split = text.find("\r\n\r\n").ok_or_else(|| "malformed HTTP response".to_string())?;
-    let head = &text[..split];
-    let mut lines = head.split("\r\n");
-    let status_line = lines.next().unwrap_or("");
-    let status: i64 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let mut headers = Vec::new();
-    for line in lines {
-        if let Some(ci) = line.find(':') {
-            headers.push((line[..ci].trim().to_string(), line[ci + 1..].trim().to_string()));
-        }
-    }
+    let (status, headers) = parse_head(&text[..split]);
     // De-chunk si la respuesta es `Transfer-Encoding: chunked` (HTTP/1.1 sin
     // Content-Length — p.ej. la API de Anthropic). El body crudo trae los prefijos de
     // tamaño hex por chunk; sin des-chunkear NO es JSON válido.
@@ -301,30 +381,96 @@ fn dechunk_body(data: &[u8]) -> String {
 /// Des-chunkea un body `Transfer-Encoding: chunked` a bytes: cada chunk es
 /// `<hex>\r\n<datos>\r\n` y termina con un chunk de tamaño 0. Concatena los datos
 /// (ignora trailers). Opera en bytes para servir tanto a texto como a binarios.
-fn dechunk_bytes(mut data: &[u8]) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::with_capacity(data.len());
-    while let Some(line_end) = data.windows(2).position(|w| w == b"\r\n") {
-        let size_line = String::from_utf8_lossy(&data[..line_end]);
-        // El tamaño puede traer extensiones tras `;` — quedate sólo con el hex.
-        let hex = size_line.split(';').next().unwrap_or("").trim();
-        let size = match usize::from_str_radix(hex, 16) {
-            Ok(s) => s,
-            Err(_) => break,
-        };
-        if size == 0 {
-            break;
-        }
-        let start = line_end + 2;
-        let end = start + size;
-        if end > data.len() {
-            out.extend_from_slice(&data[start..]);
-            break;
-        }
-        out.extend_from_slice(&data[start..end]);
-        // Saltá los datos + el `\r\n` que cierra el chunk.
-        data = if end + 2 <= data.len() { &data[end + 2..] } else { &[] };
+/// Una pasada = `ChunkDecoder::feed` con el buffer completo (misma salida de siempre).
+fn dechunk_bytes(data: &[u8]) -> Vec<u8> {
+    ChunkDecoder::new().feed(data)
+}
+
+/// Estado del de-chunker incremental (para `http_request_stream`, donde los chunks
+/// llegan partidos en cualquier punto entre `read()`s). Tolerancia idéntica al
+/// de-chunk histórico: tamaño hex inválido → corta y devuelve lo acumulado (no es
+/// error); datos truncados → entrega los bytes parciales que hayan llegado.
+struct ChunkDecoder {
+    /// Bytes crudos aún no decodificados (fragmento de línea de tamaño o de trailer).
+    buf: Vec<u8>,
+    state: ChunkState,
+}
+
+enum ChunkState {
+    /// Esperando la línea `<hex>\r\n` con el tamaño del próximo chunk.
+    Size,
+    /// Leyendo los datos del chunk actual (faltan `remaining` bytes).
+    Data { remaining: usize },
+    /// Saltando el `\r\n` que cierra el chunk (faltan `remaining` bytes).
+    Skip { remaining: usize },
+    /// Chunk de tamaño 0 (o tamaño inválido): fin — el resto se ignora (trailers).
+    Done,
+}
+
+impl ChunkDecoder {
+    fn new() -> Self {
+        Self { buf: Vec::new(), state: ChunkState::Size }
     }
-    out
+
+    /// Alimenta bytes crudos; devuelve los datos de chunk decodificados hasta ahora
+    /// (los datos se emiten a medida que llegan — no se espera el chunk completo).
+    fn feed(&mut self, input: &[u8]) -> Vec<u8> {
+        if matches!(self.state, ChunkState::Done) {
+            return Vec::new();
+        }
+        self.buf.extend_from_slice(input);
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            match self.state {
+                ChunkState::Size => {
+                    let Some(line_end) = self.buf.windows(2).position(|w| w == b"\r\n") else {
+                        break;
+                    };
+                    // El tamaño puede traer extensiones tras `;` — quedate sólo con el hex.
+                    let size_line = String::from_utf8_lossy(&self.buf[..line_end]).to_string();
+                    let hex = size_line.split(';').next().unwrap_or("").trim().to_string();
+                    self.buf.drain(..line_end + 2);
+                    match usize::from_str_radix(&hex, 16) {
+                        Ok(0) | Err(_) => {
+                            self.state = ChunkState::Done;
+                            break;
+                        }
+                        Ok(size) => self.state = ChunkState::Data { remaining: size },
+                    }
+                }
+                ChunkState::Data { remaining } => {
+                    if self.buf.is_empty() {
+                        break;
+                    }
+                    let take = remaining.min(self.buf.len());
+                    out.extend_from_slice(&self.buf[..take]);
+                    self.buf.drain(..take);
+                    if take == remaining {
+                        // Saltá el `\r\n` que cierra el chunk.
+                        self.state = ChunkState::Skip { remaining: 2 };
+                    } else {
+                        self.state = ChunkState::Data { remaining: remaining - take };
+                        break;
+                    }
+                }
+                ChunkState::Skip { remaining } => {
+                    if self.buf.is_empty() {
+                        break;
+                    }
+                    let take = remaining.min(self.buf.len());
+                    self.buf.drain(..take);
+                    if take == remaining {
+                        self.state = ChunkState::Size;
+                    } else {
+                        self.state = ChunkState::Skip { remaining: remaining - take };
+                        break;
+                    }
+                }
+                ChunkState::Done => break,
+            }
+        }
+        out
+    }
 }
 
 fn urlencode(q: &[(String, String)]) -> String {
@@ -391,6 +537,23 @@ fn header_pairs(v: Option<&SynValue>) -> Option<Vec<(String, String)>> {
     }
 }
 
+/// Timeout opcional de las builtins HTTP (MF-012): número positivo → segundos (piso 1);
+/// ausente/`Nothing`/inválido (0, negativo, texto) → 30, el default histórico. Tolerante
+/// como los knobs: un valor inválido cae al default, no es error.
+fn timeout_arg(v: Option<&SynValue>) -> u64 {
+    match v {
+        Some(SynValue::Number(n)) => {
+            let secs = n.to_f64();
+            if secs > 0.0 && secs.is_finite() {
+                (secs as u64).max(1)
+            } else {
+                30
+            }
+        }
+        _ => 30,
+    }
+}
+
 fn response_to_syn(r: HttpResult) -> SynValue {
     let mut m = IndexMap::new();
     m.insert("status".to_string(), syn_int(r.status));
@@ -429,14 +592,14 @@ pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilityS
                     headers.as_deref(),
                     query.as_deref(),
                     body.as_deref(),
-                    30,
+                    timeout_arg(args.get(5)),
                 );
                 Ok(response_to_syn(r))
             }),
         );
     }
 
-    // http_get(url, headers?, query?)
+    // http_get(url, headers?, query?, timeout?)
     {
         let caps = caps.clone();
         interp.register_builtin(
@@ -447,13 +610,20 @@ pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilityS
                 require_net(&caps, &url, "http_get()")?;
                 let headers = header_pairs(args.get(1));
                 let query = map_pairs(args.get(2));
-                let r = http_request("GET", &url, headers.as_deref(), query.as_deref(), None, 30);
+                let r = http_request(
+                    "GET",
+                    &url,
+                    headers.as_deref(),
+                    query.as_deref(),
+                    None,
+                    timeout_arg(args.get(3)),
+                );
                 Ok(response_to_syn(r))
             }),
         );
     }
 
-    // http_post(url, body, headers?)
+    // http_post(url, body, headers?, timeout?)
     {
         let caps = caps.clone();
         interp.register_builtin(
@@ -464,13 +634,20 @@ pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilityS
                 require_net(&caps, &url, "http_post()")?;
                 let body = args.get(1).map(raw_str);
                 let headers = header_pairs(args.get(2));
-                let r = http_request("POST", &url, headers.as_deref(), None, body.as_deref(), 30);
+                let r = http_request(
+                    "POST",
+                    &url,
+                    headers.as_deref(),
+                    None,
+                    body.as_deref(),
+                    timeout_arg(args.get(3)),
+                );
                 Ok(response_to_syn(r))
             }),
         );
     }
 
-    // http_put(url, body, headers?)
+    // http_put(url, body, headers?, timeout?)
     {
         let caps = caps.clone();
         interp.register_builtin(
@@ -481,13 +658,20 @@ pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilityS
                 require_net(&caps, &url, "http_put()")?;
                 let body = args.get(1).map(raw_str);
                 let headers = header_pairs(args.get(2));
-                let r = http_request("PUT", &url, headers.as_deref(), None, body.as_deref(), 30);
+                let r = http_request(
+                    "PUT",
+                    &url,
+                    headers.as_deref(),
+                    None,
+                    body.as_deref(),
+                    timeout_arg(args.get(3)),
+                );
                 Ok(response_to_syn(r))
             }),
         );
     }
 
-    // http_delete(url, headers?)
+    // http_delete(url, headers?, timeout?)
     {
         let caps = caps.clone();
         interp.register_builtin(
@@ -497,13 +681,20 @@ pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilityS
                 let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
                 require_net(&caps, &url, "http_delete()")?;
                 let headers = header_pairs(args.get(1));
-                let r = http_request("DELETE", &url, headers.as_deref(), None, None, 30);
+                let r = http_request(
+                    "DELETE",
+                    &url,
+                    headers.as_deref(),
+                    None,
+                    None,
+                    timeout_arg(args.get(2)),
+                );
                 Ok(response_to_syn(r))
             }),
         );
     }
 
-    // fetch(url, method?, headers?, body?) — cliente HTTP real, gateado por net.
+    // fetch(url, method?, headers?, body?, timeout?) — cliente HTTP real, gateado por net.
     // Default GET; mismo retorno que http_* (response_to_syn).
     {
         let caps = caps.clone();
@@ -516,7 +707,14 @@ pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilityS
                 let method = args.get(1).map(raw_str).unwrap_or_else(|| "GET".to_string());
                 let headers = header_pairs(args.get(2));
                 let body = args.get(3).map(raw_str);
-                let r = http_request(&method, &url, headers.as_deref(), None, body.as_deref(), 30);
+                let r = http_request(
+                    &method,
+                    &url,
+                    headers.as_deref(),
+                    None,
+                    body.as_deref(),
+                    timeout_arg(args.get(4)),
+                );
                 Ok(response_to_syn(r))
             }),
         );
@@ -551,6 +749,192 @@ mod tests {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n{\"a\":1}";
         let r = parse_response(raw).unwrap();
         assert_eq!(r.body, "{\"a\":1}");
+    }
+
+    // -- MF-012: timeout_arg --
+
+    #[test]
+    fn timeout_arg_valid_and_defaults() {
+        use synsema_core::types::{syn_float, syn_nothing};
+        // Válidos: enteros y floats positivos (piso 1 segundo).
+        assert_eq!(timeout_arg(Some(&syn_int(120))), 120);
+        assert_eq!(timeout_arg(Some(&syn_int(1))), 1);
+        assert_eq!(timeout_arg(Some(&syn_float(0.5))), 1, "positivo chico → piso 1");
+        // Inválidos/ausentes → 30 (default histórico, tolerante).
+        assert_eq!(timeout_arg(Some(&syn_int(0))), 30);
+        assert_eq!(timeout_arg(Some(&syn_int(-5))), 30);
+        assert_eq!(timeout_arg(Some(&syn_text("abc"))), 30);
+        assert_eq!(timeout_arg(Some(&syn_nothing())), 30);
+        assert_eq!(timeout_arg(None), 30);
+    }
+
+    // -- ChunkDecoder: una pasada == dechunk_bytes histórico; incremental == misma salida --
+
+    const CHUNKED_BODY: &[u8] = b"5\r\n{\"a\":\r\n5\r\n\"bc\"}\r\n0\r\n\r\n";
+
+    #[test]
+    fn chunk_decoder_one_pass_matches_dechunk() {
+        assert_eq!(dechunk_bytes(CHUNKED_BODY), b"{\"a\":\"bc\"}");
+        // Extensión tras `;` en la línea de tamaño.
+        assert_eq!(dechunk_bytes(b"5;ext=1\r\nhola!\r\n0\r\n\r\n"), b"hola!");
+        // Hex inválido → corta y devuelve lo acumulado (no error).
+        assert_eq!(dechunk_bytes(b"5\r\nhola!\r\nZZ\r\nresto"), b"hola!");
+        // Chunk final truncado → conserva los bytes parciales.
+        assert_eq!(dechunk_bytes(b"a\r\nsolo4"), b"solo4");
+    }
+
+    #[test]
+    fn chunk_decoder_incremental_any_split_same_output() {
+        for step in [1usize, 3, 7, CHUNKED_BODY.len()] {
+            let mut dec = ChunkDecoder::new();
+            let mut out = Vec::new();
+            for piece in CHUNKED_BODY.chunks(step) {
+                out.extend_from_slice(&dec.feed(piece));
+            }
+            assert_eq!(out, b"{\"a\":\"bc\"}", "split de {} bytes", step);
+        }
+    }
+
+    // -- http_request_stream contra un TcpListener local --
+
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::{Duration as TestDuration, Instant};
+
+    /// Server fake de un solo accept: ejecuta `serve` sobre el socket aceptado.
+    fn one_shot_server(
+        serve: impl FnOnce(std::net::TcpStream) + Send + 'static,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            if let Ok((sock, _)) = listener.accept() {
+                serve(sock);
+            }
+        });
+        (format!("http://127.0.0.1:{}/", port), handle)
+    }
+
+    /// Lee y descarta el request entrante (hasta el fin del head; el GET no trae body).
+    fn drain_request(sock: &mut std::net::TcpStream) {
+        let mut buf = [0u8; 4096];
+        let mut acc: Vec<u8> = Vec::new();
+        loop {
+            match sock.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    acc.extend_from_slice(&buf[..n]);
+                    if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    #[test]
+    fn http_request_stream_chunked_in_batches() {
+        let (url, handle) = one_shot_server(|mut sock| {
+            drain_request(&mut sock);
+            sock.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .unwrap();
+            sock.write_all(b"5\r\n{\"a\":\r\n").unwrap();
+            thread::sleep(TestDuration::from_millis(100));
+            sock.write_all(b"5\r\n\"bc\"}\r\n").unwrap();
+            thread::sleep(TestDuration::from_millis(100));
+            sock.write_all(b"0\r\n\r\n").unwrap();
+        });
+        let mut batches: Vec<Vec<u8>> = Vec::new();
+        let (status, headers) =
+            http_request_stream("GET", &url, None, None, 5, &mut |bytes| {
+                batches.push(bytes.to_vec());
+                true
+            })
+            .unwrap();
+        handle.join().unwrap();
+        assert_eq!(status, 200);
+        assert!(headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding")));
+        assert!(batches.len() >= 2, "esperaba ≥2 tandas, llegaron {}", batches.len());
+        let total: Vec<u8> = batches.concat();
+        assert_eq!(total, b"{\"a\":\"bc\"}");
+    }
+
+    #[test]
+    fn http_request_stream_abort_on_false() {
+        let (url, _handle) = one_shot_server(|mut sock| {
+            drain_request(&mut sock);
+            sock.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .unwrap();
+            sock.write_all(b"5\r\nhola!\r\n").unwrap();
+            // El resto no debería leerse: el cliente aborta en la primera tanda.
+            thread::sleep(TestDuration::from_millis(200));
+            let _ = sock.write_all(b"5\r\nchau!\r\n0\r\n\r\n");
+        });
+        let mut seen: Vec<u8> = Vec::new();
+        let (status, _) = http_request_stream("GET", &url, None, None, 5, &mut |bytes| {
+            seen.extend_from_slice(bytes);
+            false
+        })
+        .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(seen, b"hola!", "debe cortar tras la primera tanda");
+    }
+
+    // El caso clave del bug MF-011: el read-timeout mide SILENCIO, no duración total.
+    #[test]
+    fn http_request_stream_timeout_is_silence_not_total_duration() {
+        // (1) Silencio real: el server no manda NADA por 3s con timeout de 1s → falla.
+        let (url, _h) = one_shot_server(|mut sock| {
+            drain_request(&mut sock);
+            thread::sleep(TestDuration::from_secs(3));
+            let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        });
+        let start = Instant::now();
+        let r = http_request_stream("GET", &url, None, None, 1, &mut |_| true);
+        assert!(r.is_err(), "silencio de 3s con timeout 1s debe fallar");
+        assert!(
+            start.elapsed() < TestDuration::from_secs(3),
+            "debe fallar por timeout, no esperar al server"
+        );
+
+        // (2) Goteo: un byte por segundo durante 3s con timeout de 2s → completa OK
+        //     (cada byte renueva el read-timeout; con el camino no-stream fallaría si
+        //     la duración total excediera el timeout).
+        let (url2, h2) = one_shot_server(|mut sock| {
+            drain_request(&mut sock);
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n").unwrap();
+            for b in [b"a", b"b", b"c"] {
+                thread::sleep(TestDuration::from_secs(1));
+                sock.write_all(b).unwrap();
+            }
+        });
+        let mut body: Vec<u8> = Vec::new();
+        let (status, _) = http_request_stream("GET", &url2, None, None, 2, &mut |bytes| {
+            body.extend_from_slice(bytes);
+            true
+        })
+        .expect("el goteo lento debe completar: el timeout mide silencio");
+        h2.join().unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, b"abc");
+    }
+
+    // MF-012 (integración): un server que acepta y NO responde corta al timeout pedido.
+    #[test]
+    fn http_request_short_timeout_cuts_fast() {
+        let (url, _h) = one_shot_server(|mut sock| {
+            drain_request(&mut sock);
+            thread::sleep(TestDuration::from_secs(5));
+        });
+        let start = Instant::now();
+        let r = http_request("GET", &url, None, None, None, 1);
+        assert!(!r.ok);
+        assert!(r.error.is_some());
+        assert!(
+            start.elapsed() < TestDuration::from_secs(4),
+            "timeout de 1s no debe esperar los 30s del default"
+        );
     }
 
     #[test]

@@ -24,6 +24,13 @@ let r be http_put(url, {"name": "Bob"})
 let r be http_delete(url, {"x-api-key": secret("STORE_API_KEY")})  -- any header, not just Bearer
 ```
 
+**Timeout (optional, trailing arg on every HTTP builtin):** seconds as a positive number; absent
+or invalid → **30** (the historical default). Signatures: `http(method, url, headers?, query?,
+body?, timeout?)`, `http_get(url, headers?, query?, timeout?)`, `http_post(url, body, headers?,
+timeout?)`, `http_put(url, body, headers?, timeout?)`, `http_delete(url, headers?, timeout?)`,
+`fetch(url, method?, headers?, body?, timeout?)`. Use it for slow APIs (>30s) or to fail fast:
+`http("GET", url, nothing, nothing, nothing, 120)`.
+
 > **Credentials go in headers:** pass a `secret` directly as a header value —
 > `{"x-api-key": secret("KEY")}` or any custom header; it's materialized only at the
 > socket and redacted in logs/errors. `bearer(s)` is sugar for `Authorization: Bearer
