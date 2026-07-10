@@ -118,6 +118,105 @@ fn resolve_human_timeout(store: &synsema_stdlib::secrets::EnvStore) -> Option<f6
         .filter(|t| *t > 0.0)
 }
 
+// =========================================================
+// Webhook saliente de aprobaciones (A1.v3)
+// =========================================================
+
+/// Config del webhook saliente de aprobaciones, resuelta de los knobs al armar el
+/// serve. El engine NO conoce canales (SMS/Telegram/…): dispara ESTE protocolo y el
+/// canal (userland, p.ej. otro `.syn` bajo serve) se lo hace llegar al humano.
+struct ApprovalWebhook {
+    /// `SYNSEMA_HUMAN_WEBHOOK`: URL destino del POST.
+    url: String,
+    /// `SYNSEMA_HUMAN_WEBHOOK_SECRET`: clave HMAC del header `X-Synsema-Signature`.
+    /// Ausente → se envía SIN firmar (dev local; producción DEBE setearla).
+    secret: Option<String>,
+    /// `SYNSEMA_HUMAN_PUBLIC_URL`: base pública del server — habilita `respond_url` y
+    /// los `respond_link_*` absolutos del payload.
+    public_url: Option<String>,
+}
+
+/// Valor del header `X-Synsema-Signature`: `sha256=<hmac-sha256 hex del body>` (pura).
+fn webhook_signature(secret: &str, body: &str) -> String {
+    format!(
+        "sha256={}",
+        synsema_stdlib::secrets::hmac_sha256_hex(secret.as_bytes(), body.as_bytes())
+    )
+}
+
+/// Body JSON del webhook (pura, D2). Con `public_url` incluye `respond_url` y los
+/// `respond_link_yes`/`respond_link_no` listos para reenviar por SMS/chat; sin ella,
+/// sólo `respond_path` (el receptor sabe dónde vive el server que configuró).
+fn approval_webhook_payload(
+    e: &synsema_llm::human::EnqueuedApproval,
+    public_url: Option<&str>,
+) -> String {
+    let mut body = serde_json::json!({
+        "id": e.id,
+        "type": e.ty,
+        "message": e.message,
+        "expires_at": e.expires_at,
+        "token": e.token,
+        "respond_path": format!("/approvals/{}", e.id),
+    });
+    if let Some(base) = public_url {
+        let base = base.trim_end_matches('/');
+        body["respond_url"] = serde_json::json!(format!("{}/approvals/{}", base, e.id));
+        body["respond_link_yes"] =
+            serde_json::json!(format!("{}/approvals/{}/{}?d=yes", base, e.id, e.token));
+        body["respond_link_no"] =
+            serde_json::json!(format!("{}/approvals/{}/{}?d=no", base, e.id, e.token));
+    }
+    body.to_string()
+}
+
+/// Aviso ÚNICO por proceso si el webhook no se pudo entregar. El gate NO se rompe:
+/// quedan la consola y `GET /approvals` como fallback (por eso un intento y listo).
+static WEBHOOK_FAILED_NOTICED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn note_webhook_failed(err: &str) {
+    if !WEBHOOK_FAILED_NOTICED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "[synsema] notice: the approval webhook could not be delivered ({}). The \
+             approval is still pending — a HUMAN can find it on the server console or \
+             GET /approvals.",
+            err
+        );
+    }
+}
+
+/// Dispara el webhook en un hilo aparte: UN intento, timeout 10 s, sin reintentos —
+/// fire-and-forget, jamás bloquea ni rompe el gate (D3).
+fn fire_approval_webhook(cfg: Arc<ApprovalWebhook>, e: synsema_llm::human::EnqueuedApproval) {
+    let spawned = std::thread::Builder::new()
+        .name("synsema-approval-webhook".to_string())
+        .spawn(move || {
+            let body = approval_webhook_payload(&e, cfg.public_url.as_deref());
+            let mut headers =
+                vec![("content-type".to_string(), "application/json".to_string())];
+            if let Some(s) = &cfg.secret {
+                headers.push(("X-Synsema-Signature".to_string(), webhook_signature(s, &body)));
+            }
+            let r = synsema_stdlib::http::http_request(
+                "POST",
+                &cfg.url,
+                Some(&headers),
+                None,
+                Some(&body),
+                10,
+            );
+            if let Some(err) = r.error {
+                note_webhook_failed(&err);
+            } else if !r.ok {
+                note_webhook_failed(&format!("HTTP {}", r.status));
+            }
+        });
+    if spawned.is_err() {
+        note_webhook_failed("could not spawn the webhook thread");
+    }
+}
+
 use crate::engine::{wire_common_with_state, wire_swarm_hooks, INTERP_STACK_SIZE};
 
 // =========================================================
@@ -1379,13 +1478,32 @@ fn make_serve_hook(
 
         // Cola de aprobaciones humanas de ESTE serve (A1.v2): una por server,
         // compartida entre todos los workers/handlers. El OTT de cada pendiente sale
-        // por la consola del server (mismo sink que los logs de serve — D3); el
-        // default de espera viene del knob `SYNSEMA_HUMAN_TIMEOUT` (`within` por gate
-        // le gana; sin nada, 300 s).
+        // por la consola del server (mismo sink que los logs de serve); el default de
+        // espera viene del knob `SYNSEMA_HUMAN_TIMEOUT` (`within` por gate le gana;
+        // sin nada, 300 s). Con `SYNSEMA_HUMAN_WEBHOOK` (A1.v3), cada encolado dispara
+        // además el webhook saliente firmado — el canal concreto es userland.
         let approvals: ServeApprovals = {
             let store = synsema_stdlib::secrets::EnvStore::load_default();
+            let mut queue = synsema_llm::human::QueueHandler::with_notice(serve_log_sink());
+            if let Some(url) = crate::llm_providers::resolve_knob("SYNSEMA_HUMAN_WEBHOOK", &store)
+            {
+                let cfg = Arc::new(ApprovalWebhook {
+                    url,
+                    secret: crate::llm_providers::resolve_knob(
+                        "SYNSEMA_HUMAN_WEBHOOK_SECRET",
+                        &store,
+                    ),
+                    public_url: crate::llm_providers::resolve_knob(
+                        "SYNSEMA_HUMAN_PUBLIC_URL",
+                        &store,
+                    ),
+                });
+                queue = queue.with_enqueue_hook(Arc::new(move |e| {
+                    fire_approval_webhook(cfg.clone(), e.clone())
+                }));
+            }
             Arc::new(ApprovalsShared {
-                queue: Arc::new(synsema_llm::human::QueueHandler::with_notice(serve_log_sink())),
+                queue: Arc::new(queue),
                 default_timeout: resolve_human_timeout(&store),
             })
         };
@@ -1891,6 +2009,60 @@ pub fn run_serve_program_with_overrides(
 mod tests {
     use super::*;
     use synsema_stdlib::secrets::EnvStore;
+
+    fn enqueued(id: &str, token: &str) -> synsema_llm::human::EnqueuedApproval {
+        synsema_llm::human::EnqueuedApproval {
+            id: id.to_string(),
+            ty: "approve".to_string(),
+            message: "Delete the production table?".to_string(),
+            token: token.to_string(),
+            expires_at: 1786500000,
+            timeout_secs: 300.0,
+        }
+    }
+
+    // A1.v3: la firma del webhook es HMAC-SHA256 hex con prefijo `sha256=` — vector
+    // conocido (RFC 2202-style, key="key").
+    #[test]
+    fn webhook_signature_known_vector() {
+        assert_eq!(
+            webhook_signature("key", "The quick brown fox jumps over the lazy dog"),
+            "sha256=f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+    }
+
+    // A1.v3 (D2): payload SIN public_url → sólo respond_path; CON public_url → además
+    // respond_url y los links yes/no absolutos con el token.
+    #[test]
+    fn webhook_payload_with_and_without_public_url() {
+        let e = enqueued("interact_7", "abc123");
+        let bare: serde_json::Value =
+            serde_json::from_str(&approval_webhook_payload(&e, None)).unwrap();
+        assert_eq!(bare["id"], "interact_7");
+        assert_eq!(bare["type"], "approve");
+        assert_eq!(bare["message"], "Delete the production table?");
+        assert_eq!(bare["expires_at"], 1786500000);
+        assert_eq!(bare["token"], "abc123");
+        assert_eq!(bare["respond_path"], "/approvals/interact_7");
+        assert!(bare.get("respond_url").is_none(), "sin public_url no hay URL absoluta");
+        assert!(bare.get("respond_link_yes").is_none());
+
+        // El trailing slash de la base no debe duplicar la barra.
+        let full: serde_json::Value = serde_json::from_str(&approval_webhook_payload(
+            &e,
+            Some("https://mi-app.com/"),
+        ))
+        .unwrap();
+        assert_eq!(full["respond_url"], "https://mi-app.com/approvals/interact_7");
+        assert_eq!(
+            full["respond_link_yes"],
+            "https://mi-app.com/approvals/interact_7/abc123?d=yes"
+        );
+        assert_eq!(
+            full["respond_link_no"],
+            "https://mi-app.com/approvals/interact_7/abc123?d=no"
+        );
+    }
 
     // D1: precedencia del default del host para gates humanos — environ > `.env` >
     // ausente (`None` → la cola aplica 300 s). Un valor no-numérico o no-positivo NO

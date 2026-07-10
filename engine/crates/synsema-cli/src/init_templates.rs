@@ -123,6 +123,18 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # Espera máxima (segundos) de approve/confirm/ask bajo serve antes de DENEGAR
 # fail-closed (por-gate: `approve "..." within 2h` le gana a esta variable):
 # SYNSEMA_HUMAN_TIMEOUT=300
+
+# Webhook saliente de aprobaciones: cada gate encolado dispara un POST JSON con el
+# token a esta URL (tu canal — otro serve Synsema, SMS, chat — es quien avisa al humano):
+# SYNSEMA_HUMAN_WEBHOOK=
+
+# Clave HMAC del webhook — firma el body en X-Synsema-Signature (sha256=<hex>).
+# Sin ella el POST va SIN firmar: solo para dev local, en producción SIEMPRE:
+# SYNSEMA_HUMAN_WEBHOOK_SECRET=
+
+# Base pública de ESTE server — habilita los links listos para reenviar
+# (respond_link_yes/no: el humano decide abriendo una URL desde SMS/chat):
+# SYNSEMA_HUMAN_PUBLIC_URL=
 "#;
 
 pub const GITIGNORE: &str = r#"# Secretos / config local — nunca subir

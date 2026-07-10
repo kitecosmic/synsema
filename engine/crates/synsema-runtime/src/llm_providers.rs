@@ -1689,7 +1689,12 @@ pub const LLM_ENV_VARS: &[&str] = &[
 /// Knobs de interacción HUMANA que el runtime reconoce (espejo de [`LLM_ENV_VARS`]).
 /// ⚠️ Sumar un knob acá sin actualizar el template de `init` rompe el build a
 /// propósito (test `env_example_in_sync_with_engine_knobs` del CLI — anti-rot).
-pub const HUMAN_ENV_VARS: &[&str] = &["SYNSEMA_HUMAN_TIMEOUT"];
+pub const HUMAN_ENV_VARS: &[&str] = &[
+    "SYNSEMA_HUMAN_TIMEOUT",
+    "SYNSEMA_HUMAN_WEBHOOK",
+    "SYNSEMA_HUMAN_WEBHOOK_SECRET",
+    "SYNSEMA_HUMAN_PUBLIC_URL",
+];
 
 /// Redacta el userinfo de una URL (`https://user:pass@host/...` → `https://***@host/...`)
 /// para que un `base_url` con credenciales embebidas no las imprima.

@@ -1244,19 +1244,52 @@ impl ServeRuntime {
     /// la cola.) Lo usa también el lado de conexión para atenderlas en un hilo DEDICADO
     /// (no el pool del intérprete): un gate bloqueado espera su respuesta ocupando un
     /// worker — la respuesta no puede quedar en cola detrás de él.
+    /// Formas: `GET /approvals` (lista), `POST /approvals/{id}` (respuesta con token en
+    /// el body), `GET /approvals/{id}/{token}` (link de decisión sí/no, A1.v3).
     pub fn is_approvals_route(&self, method: &str, path: &str) -> bool {
-        self.approvals.is_some()
-            && ((method == "GET" && path == "/approvals")
-                || (method == "POST"
-                    && path.strip_prefix("/approvals/").is_some_and(|id| {
-                        !id.is_empty() && !id.contains('/')
-                    })))
+        if self.approvals.is_none() {
+            return false;
+        }
+        if method == "GET" && path == "/approvals" {
+            return true;
+        }
+        let Some(rest) = path.strip_prefix("/approvals/") else { return false };
+        let segs: Vec<&str> = rest.split('/').collect();
+        match (method, segs.as_slice()) {
+            ("POST", [id]) => !id.is_empty(),
+            ("GET", [id, token]) => !id.is_empty() && !token.is_empty(),
+            _ => false,
+        }
     }
 
-    /// Atiende las rutas reservadas `/approvals` (A1.v2). D4: `GET /approvals` lista
-    /// las pendientes SIN tokens; `POST /approvals/{id}` con `{"token", "decision"}`
-    /// (o `{"token", "value"}` para ask) responde el gate → 200/400/403/404.
-    fn approvals_response(&self, method: &str, path: &str, body_str: &str) -> Dispatched {
+    /// Página HTML mínima autocontenida de un link de aprobación (A1.v3) — para el
+    /// humano que abrió la URL desde SMS/chat. NUNCA incluye el token.
+    fn approval_link_page(status: u16, title: &str, detail: &str) -> Dispatched {
+        let html = format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>Synsema approval</title>\
+             </head><body style=\"font-family: system-ui, sans-serif; max-width: 40rem; \
+             margin: 4rem auto; padding: 0 1rem;\"><h1>{}</h1><p>{}</p></body></html>",
+            title, detail
+        );
+        Dispatched::Response {
+            status,
+            body: ResponseBody::Raw(RawResponse::text(html, "text/html; charset=utf-8", status)),
+            headers: vec![],
+        }
+    }
+
+    /// Atiende las rutas reservadas `/approvals`. D4: `GET /approvals` lista las
+    /// pendientes SIN tokens; `POST /approvals/{id}` con `{"token", "decision"}` (o
+    /// `{"token", "value"}` para ask) responde el gate → 200/400/403/404; el link
+    /// `GET /approvals/{id}/{token}?d=yes|no` (A1.v3) responde SOLO decisión sí/no
+    /// (mismo camino: token de un solo uso) y devuelve HTML para el humano.
+    fn approvals_response(
+        &self,
+        method: &str,
+        path: &str,
+        query: &IndexMap<String, String>,
+        body_str: &str,
+    ) -> Dispatched {
         let gw = self.approvals.as_ref().expect("is_approvals_route lo garantiza");
         let resp = |status, body| Dispatched::Response { status, body, headers: vec![] };
         let err = |status: u16, msg: &str| {
@@ -1268,7 +1301,7 @@ impl ServeRuntime {
                 ])),
             )
         };
-        if method == "GET" {
+        if method == "GET" && path == "/approvals" {
             let items: Vec<Json> = gw
                 .list()
                 .into_iter()
@@ -1282,6 +1315,52 @@ impl ServeRuntime {
                 })
                 .collect();
             return resp(200, ResponseBody::Json(obj(vec![("pending", Json::Array(items))])));
+        }
+        if method == "GET" {
+            // Link de decisión (A1.v3): /approvals/{id}/{token}?d=yes|no. Respuestas
+            // en HTML (el humano viene de un SMS/chat); sí/no solamente — `ask` con
+            // `value` sigue siendo POST-only.
+            let rest = path.strip_prefix("/approvals/").unwrap_or_default();
+            let (id, token) = rest.split_once('/').unwrap_or((rest, ""));
+            let approve = match query.get("d").map(String::as_str) {
+                Some("yes") => true,
+                Some("no") => false,
+                _ => {
+                    return Self::approval_link_page(
+                        400,
+                        "Missing decision",
+                        "This approval link needs a decision parameter: append ?d=yes to \
+                         approve or ?d=no to deny.",
+                    )
+                }
+            };
+            return match gw.respond(id, token, Some(approve), None) {
+                ApprovalOutcome::Accepted => {
+                    let (title, verb) =
+                        if approve { ("Approved", "approved") } else { ("Denied", "denied") };
+                    Self::approval_link_page(
+                        200,
+                        title,
+                        &format!(
+                            "The pending step was {}. This decision was recorded from a \
+                             HUMAN following an approval link. You can close this tab.",
+                            verb
+                        ),
+                    )
+                }
+                ApprovalOutcome::NotFound => Self::approval_link_page(
+                    404,
+                    "Not found",
+                    "This approval link is no longer valid — the request may have expired, \
+                     or a HUMAN already answered it.",
+                ),
+                ApprovalOutcome::BadToken => Self::approval_link_page(
+                    403,
+                    "Invalid link",
+                    "The token in this link is not valid for this approval. The gate is \
+                     still waiting for a HUMAN with the correct link.",
+                ),
+            };
         }
         let id = path.strip_prefix("/approvals/").unwrap_or_default();
         let parsed: serde_json::Value = match serde_json::from_str(body_str) {
@@ -1335,10 +1414,10 @@ impl ServeRuntime {
     ) -> Dispatched {
         let resp = |status, body| Dispatched::Response { status, body, headers: vec![] };
 
-        // Rutas reservadas `/approvals` (A1.v2): interceptadas ANTES de las rutas de
-        // usuario (como `/llms.txt`); sólo existen si el runtime cableó la cola.
+        // Rutas reservadas `/approvals` (A1.v2/v3): interceptadas ANTES de las rutas
+        // de usuario (como `/llms.txt`); sólo existen si el runtime cableó la cola.
         if self.is_approvals_route(method, path) {
-            return self.approvals_response(method, path, body_str);
+            return self.approvals_response(method, path, &query, body_str);
         }
 
         // vhost (Lote 1): elegir la tabla del host según el header `Host`. Sin vhosts
@@ -3258,6 +3337,53 @@ mod tests {
         assert!(param_last_segment("/blog/:slug"));
         assert!(!param_last_segment("/blog/post"));
         assert!(!param_last_segment("/files/*path"));
+    }
+
+    // A1.v2/v3: formas de las rutas reservadas de aprobaciones. Sin gateway cableado
+    // no existen; con él: GET lista, POST {id}, GET {id}/{token} (link) — y NUNCA
+    // 3+ segmentos.
+    #[test]
+    fn approvals_route_shapes() {
+        struct NoQueue;
+        impl ApprovalsGateway for NoQueue {
+            fn list(&self) -> Vec<ApprovalSummary> {
+                Vec::new()
+            }
+            fn respond(
+                &self,
+                _id: &str,
+                _token: &str,
+                _decision: Option<bool>,
+                _value: Option<&str>,
+            ) -> ApprovalOutcome {
+                ApprovalOutcome::NotFound
+            }
+        }
+        let mut rt = ServeRuntime::new(
+            0,
+            "127.0.0.1".to_string(),
+            Vec::new(),
+            None,
+            None,
+            8,
+            Vec::new(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            false,
+        );
+        assert!(!rt.is_approvals_route("GET", "/approvals"), "sin gateway no hay rutas");
+        rt.approvals = Some(Arc::new(NoQueue));
+        assert!(rt.is_approvals_route("GET", "/approvals"));
+        assert!(rt.is_approvals_route("POST", "/approvals/interact_1"));
+        assert!(rt.is_approvals_route("GET", "/approvals/interact_1/abc123"));
+        assert!(!rt.is_approvals_route("GET", "/approvals/interact_1"), "GET de 1 segmento no es link");
+        assert!(!rt.is_approvals_route("POST", "/approvals/interact_1/abc123"), "el link es GET-only");
+        assert!(!rt.is_approvals_route("GET", "/approvals/x/y/z"), "3+ segmentos no matchean");
+        assert!(!rt.is_approvals_route("GET", "/approvals/x/"), "token vacío no matchea");
+        assert!(!rt.is_approvals_route("POST", "/approvals/"), "id vacío no matchea");
     }
 
     #[test]
