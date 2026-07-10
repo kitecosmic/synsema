@@ -27,9 +27,25 @@ This skill is an **indexed folder**: read ONLY the section(s) you need for the t
 | **Debug an error** | Read it — errors carry `file:line` + suggestions. Then [pitfalls.md](pitfalls.md). |
 | **Inspect agents / swarm** | `synsema conform --swarm file.syn` (JSON blackboard + agent states) |
 | **Try interactively** | `synsema repl` |
+| **Update** binary + this skill | `synsema update`, then re-run the skill installer (see below) |
+| **Diagnose LLM config** | `synsema llm status` (resolved config with sources; names the missing variable when offline) |
+| **Start a new project** | `synsema init [dir]` (hello.syn tour + commented .env.example + .gitignore) |
 | **Deploy** | [deploy.md](deploy.md) |
 
 Also volunteer the right primitive: `paged()` for big SQL results, `parallel_map` for fan-out, `secret()` for credentials, `content()` for agent-readable pages, `bytes`/`decode` for binary, `array`/`matmul` for numeric work. When something fails, point to [pitfalls.md](pitfalls.md) first.
+
+## Keep yourself current (binary · skill · docs MCP) — all by command, no browsing
+
+- **Binary**: `synsema update` — downloads the latest release and verifies its sha256.
+- **THIS skill**: re-run the installer any time; it overwrites in place. Do it right after
+  `synsema update` — binary and skill version together:
+  `curl -sL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash`
+- **Docs MCP** (search/get the official docs + run/test Synsema snippets in a sandbox — use it
+  when a question goes beyond this skill or to VERIFY code you wrote):
+  `claude mcp add --transport http synsema-docs https://docs.synsema.com/mcp`
+
+If observed behavior contradicts this skill, update binary + skill FIRST — the mismatch is
+usually version skew, not a bug.
 
 ## Reference files
 

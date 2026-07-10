@@ -188,6 +188,13 @@ pub fn cmd_update() -> ExitCode {
     match replace_running_exe(&bytes) {
         Ok(()) => {
             println!("✓ Actualizado a {}. Volvé a ejecutar synsema.", tag);
+            // El binario y el skill de agentes versionan JUNTOS: recordar el refresh acá
+            // evita el skew silencioso (un agente con skill viejo "sabe" cosas que ya no
+            // son verdad). En inglés: lo leen agentes de cualquier parte.
+            println!(
+                "Using the AI skill (Claude Code etc.)? Refresh it to match this version:\n  \
+                 curl -sL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash"
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {
