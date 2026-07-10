@@ -13,11 +13,12 @@ pub const HELLO_SYN: &str = r#"-- Mi primer programa Synsema.
 --   Correlo:   synsema run hello.syn
 --   Testealo:  synsema test hello.syn
 --
--- ¿Desarrollás con un agente (Claude Code o similar)? Potencialo desde el minuto 0:
---   · Skill: copiá la carpeta `.synsema-skill/` del repo de Synsema a
---     `~/.claude/skills/synsema` — el agente escribe Synsema idiomático solo.
---   · MCP de docs: claude mcp add --transport http synsema-docs https://docs.synsema.com/mcp
---     (busca doc con search/get y VERIFICA sus snippets con run/test en sandbox).
+-- ¿Desarrollás con un agente (Claude Code o similar)? Potencialo desde el minuto 0
+-- con DOS comandos (los pega el dev o el propio agente — sin clonar nada):
+--   curl -sL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash
+--     (instala el skill: el agente escribe Synsema idiomático solo)
+--   claude mcp add --transport http synsema-docs https://docs.synsema.com/mcp
+--     (MCP de docs: busca doc con search/get y VERIFICA sus snippets con run/test en sandbox)
 -- Docs para humanos: https://docs.synsema.com
 
 intent: "Mi primer programa Synsema"
@@ -71,9 +72,10 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # ¿Qué quedó configurado de verdad? →  synsema llm status
 # (muestra cada valor RESUELTO con su fuente, y si está offline, qué variable falta)
 #
-# Agentes (Claude Code y similares) — desarrollo potenciado desde el minuto 0:
-#   skill:  copiá `.synsema-skill/` del repo de Synsema a ~/.claude/skills/synsema
-#   MCP:    claude mcp add --transport http synsema-docs https://docs.synsema.com/mcp
+# Agentes (Claude Code y similares) — desarrollo potenciado desde el minuto 0,
+# DOS comandos y listo (en Windows, desde Git Bash el primero):
+#   curl -sL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash
+#   claude mcp add --transport http synsema-docs https://docs.synsema.com/mcp
 
 # ══ Provider LLM: elegí UN par (provider + SU key) y descomentá LAS DOS líneas ══
 # La key va SIEMPRE bajo la variable de SU provider (con provider=minimax, la key va
