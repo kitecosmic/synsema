@@ -335,7 +335,7 @@ fn run_inner(
                     if std::io::stdin().is_terminal() {
                         Arc::new(synsema_llm::human::ConsoleHandler)
                     } else {
-                        Arc::new(synsema_llm::human::DenyHandler::new("run sin TTY"))
+                        Arc::new(synsema_llm::human::DenyHandler::new("non-interactive run, no TTY"))
                     };
                 let mgr = synsema_llm::human::InteractionManager::new(handler);
                 interp.set_human_callback(mgr.get_callback());
