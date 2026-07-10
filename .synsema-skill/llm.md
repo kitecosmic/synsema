@@ -82,6 +82,8 @@ the engine returns descriptive placeholders, so programs stay runnable without a
 | `SYNSEMA_LLM_MODEL` | Model id (override wins over the default) | `claude-sonnet-4-6` / `gpt-4o` / `MiniMax-M3` / `deepseek-chat` |
 | `SYNSEMA_LLM_MAX_TOKENS` | Output token cap | `4096` |
 | `SYNSEMA_LLM_BASE_URL` | Endpoint base — point a provider at any compatible endpoint (e.g. a local server) | official endpoint |
+| `SYNSEMA_LLM_TIMEOUT` | HTTP timeout (seconds) for the network providers. With the default streaming transport it measures **silence between bytes** (each SSE chunk renews it), so long generations flow and a dead host still fails fast; on the non-stream path it caps the whole call. Invalid/≤0 → default | `60` |
+| `SYNSEMA_LLM_HTTP_STREAM` | Internal SSE transport for network providers (the language ops still return complete text). `0`/`false` → classic non-stream path (escape hatch for odd proxies) | `1` (on) |
 
 Cost note: the default is **Sonnet** (cheaper); opt into Opus with `SYNSEMA_LLM_MODEL=claude-opus-4-8`.
 
@@ -186,8 +188,10 @@ CPU — right for your own VPS/dev box; for a binary you distribute, use
 
 `llm_stream(prompt, context, on_chunk)` generates with the configured provider (local OR network),
 invoking the task `on_chunk` with each text fragment as it is produced, and returns the full text.
-Gated by `llm` like every LLM op. With the embedded `local` provider it streams token by token —
-with a network provider it emits ONE chunk (the whole response), same program, zero changes.
+Gated by `llm` like every LLM op. With the embedded `local` provider it streams token by token;
+with a network provider it streams the API's SSE text-deltas as they arrive (real chunks —
+verified live: 7 chunks for a short answer). With `SYNSEMA_LLM_HTTP_STREAM=0` (non-stream
+transport) it falls back to ONE chunk (the whole response) — same program, zero changes.
 
 Under a `serve` SSE route it composes with `send` — **define the emitting task INSIDE the `stream`
 block** (`send` is a statement that only parses inside a `stream` block, so a lambda like
