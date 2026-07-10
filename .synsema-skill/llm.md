@@ -57,10 +57,17 @@ Every LLM call automatically receives:
 - Available capabilities
 
 ## Response validation
-- `decide` responses MUST be exactly one of the given options
-- If the LLM gives an invalid response, Synsema retries (up to 3 times)
-- Each retry includes feedback: "Your response was invalid because X"
-- After 3 failures, logs a warning and returns raw response
+- `decide between [...]` responses MUST be exactly one of the given options — enforced in layers
+  (verified live with Anthropic/DeepSeek/MiniMax, DE-039):
+  1. Network providers **force the choice at the API level**: an internal tool whose schema
+     restricts the answer to the options (`enum`) + mandatory `tool_choice` — zero retries in
+     the common case. Providers without tools (local GGUF, mocks) skip to step 2.
+  2. **Normalization** (free): trim, case-fold, surrounding punctuation, whole-WORD containment
+     (`"The answer is BLUE"` → `BLUE`; `"necesito"` does NOT contain `"si"`); ambiguous → step 3.
+  3. **ONE retry with feedback** quoting the invalid answer and listing the options.
+  4. Only then: one-time stderr notice + the raw response (degrade with notice, never break).
+- The returned value is always one of YOUR options byte-for-byte (original casing), never a
+  normalized form.
 
 > **The "exactly one option" guarantee only holds with a real provider.** Offline (no provider
 > configured), `decide` returns the placeholder `"[decision pending]"`, which is **not** one of your
