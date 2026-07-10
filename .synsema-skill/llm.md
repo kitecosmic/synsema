@@ -88,7 +88,12 @@ the engine returns descriptive placeholders, so programs stay runnable without a
 Cost note: the default is **Sonnet** (cheaper); opt into Opus with `SYNSEMA_LLM_MODEL=claude-opus-4-8`.
 
 **Detect offline vs real provider:** `llm_available()` → bool (`true` when a real provider is wired,
-`false` offline). Branch on it instead of string-matching placeholders:
+`false` offline). Branch on it instead of string-matching placeholders. From the terminal, run
+**`synsema llm status`** (`--json` for scripting): prints the RESOLVED config with each value's
+source (environ / `.env` / default), key **presence** (never values), which `.env` was loaded,
+a warning if several `synsema` binaries shadow each other in PATH, and — when offline — the exact
+missing variable (including the "your key is under the wrong variable name" hint). Exit 0 = live,
+1 = offline. Use it FIRST when LLM ops return placeholders unexpectedly.
 ```
 when llm_available()
     let summary be reason "Summarize: " + text

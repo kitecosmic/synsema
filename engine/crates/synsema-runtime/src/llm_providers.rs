@@ -1120,9 +1120,19 @@ pub fn build_provider(
 /// ninguna → el caller aplica el default. Así la clave puede vivir SOLO en el `.env`
 /// (gitignoreado) sin exportarse al environ del proceso ni a los hijos (DE-007).
 fn resolve_knob(name: &str, store: &EnvStore) -> Option<String> {
+    resolve_knob_src(name, store).map(|(v, _)| v)
+}
+
+/// Como [`resolve_knob`] pero además dice DE DÓNDE salió el valor (para el reporte de
+/// `synsema llm status`). Única implementación de la precedencia — `resolve_knob`
+/// delega acá, así el reporte no puede divergir de la resolución real.
+fn resolve_knob_src(name: &str, store: &EnvStore) -> Option<(String, KnobSource)> {
     match std::env::var(name) {
-        Ok(v) if !v.trim().is_empty() => Some(v),
-        _ => store.get(name).filter(|v| !v.trim().is_empty()),
+        Ok(v) if !v.trim().is_empty() => Some((v, KnobSource::Environ)),
+        _ => store
+            .get(name)
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| (v, KnobSource::DotEnv)),
     }
 }
 
@@ -1279,6 +1289,264 @@ pub fn provider_from_config(store: &EnvStore) -> Option<Arc<dyn LLMProvider>> {
 /// usa `provider_from_config` con el `.env` cargado (DE-007).
 pub fn provider_from_env() -> Option<Arc<dyn LLMProvider>> {
     provider_from_config(&EnvStore::empty())
+}
+
+// =========================================================
+// Reporte de configuración (`synsema llm status`) — datos puros
+// =========================================================
+
+/// De dónde salió un valor resuelto. La 4ª "fuente" (flag `--provider`) llega como
+/// `Environ` porque el CLI setea la env-var antes de resolver — es fiel a lo que pasa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KnobSource {
+    Environ,
+    DotEnv,
+    Default,
+}
+
+impl KnobSource {
+    pub fn label(&self) -> &'static str {
+        match self {
+            KnobSource::Environ => "environ",
+            KnobSource::DotEnv => ".env",
+            KnobSource::Default => "default",
+        }
+    }
+}
+
+/// Un knob NO-secreto resuelto: valor efectivo + fuente. REGLA DE SEGURIDAD: este tipo
+/// jamás transporta material de keys — las keys se reportan SOLO como presencia.
+#[derive(Debug, Clone)]
+pub struct KnobReport {
+    pub value: String,
+    pub source: KnobSource,
+}
+
+/// Cómo se eligió el provider.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProviderSelection {
+    /// `SYNSEMA_LLM_PROVIDER` presente (la fuente dice si environ/.env).
+    Forced(KnobSource),
+    /// Auto-seleccionado por presencia de una API key.
+    Auto,
+    /// Nada configurado.
+    None,
+}
+
+/// Por qué el runtime va a quedar OFFLINE (las ops devuelven placeholders).
+#[derive(Debug, Clone, PartialEq)]
+pub enum OfflineReason {
+    /// Provider (forzado o auto) sin SU key. `expected_var` = la variable que falta;
+    /// `misplaced` = OTRAS `*_API_KEY` que SÍ están (heurística de clave-equivocada).
+    KeyMissing { expected_var: String, misplaced: Vec<String> },
+    /// Ni `SYNSEMA_LLM_PROVIDER` ni ninguna API key.
+    NoProviderNoKeys,
+    /// `provider=local` sin `SYNSEMA_LLM_MODEL` (path al `.gguf`, obligatorio).
+    LocalModelMissing,
+    /// `provider=local` en un binario compilado sin la feature `llm-local`.
+    LocalFeatureMissing,
+    /// Nombre de provider no soportado.
+    UnknownProvider { name: String },
+}
+
+/// Reporte PURO de la config LLM que [`provider_from_config`] va a resolver — para
+/// `synsema llm status`. Espeja la MISMA lógica (mismos `resolve_knob_src`, mismo orden
+/// de auto-selección); si esto miente, el test `report_matches_provider_from_config`
+/// debe fallar. SEGURIDAD: no contiene NINGÚN valor de key (ni prefijo ni longitud) —
+/// solo presencia y en qué fuente está; `base_url` sale con el userinfo redactado.
+#[derive(Debug)]
+pub struct LlmConfigReport {
+    pub provider: String,
+    pub selection: ProviderSelection,
+    /// Variable de key que el provider elegido espera (None para `local`).
+    pub key_var: Option<String>,
+    /// Presencia de esa key (None = FALTA). Nunca el valor.
+    pub key_present: Option<KnobSource>,
+    pub model: KnobReport,
+    pub max_tokens: KnobReport,
+    pub timeout_secs: KnobReport,
+    /// `"streaming"` o `"no-stream"`.
+    pub transport: KnobReport,
+    pub base_url: KnobReport,
+    /// ¿El binario tiene compilada la feature `llm-local`?
+    pub local_feature: bool,
+    /// None = VIVO; Some = OFFLINE con el porqué.
+    pub offline: Option<OfflineReason>,
+}
+
+const KEY_VARS: [(&str, &str); 4] = [
+    ("ANTHROPIC_API_KEY", "anthropic"),
+    ("OPENAI_API_KEY", "openai"),
+    ("MINIMAX_API_KEY", "minimax"),
+    ("DEEPSEEK_API_KEY", "deepseek"),
+];
+
+/// Redacta el userinfo de una URL (`https://user:pass@host/...` → `https://***@host/...`)
+/// para que un `base_url` con credenciales embebidas no las imprima.
+fn redact_url_userinfo(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let rest = &url[scheme_end + 3..];
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        if let Some(at) = rest[..authority_end].rfind('@') {
+            return format!("{}***@{}", &url[..scheme_end + 3], &rest[at + 1..]);
+        }
+    }
+    url.to_string()
+}
+
+/// Arma el reporte. Puro sobre `store` + environ del proceso; NO toca la red.
+pub fn llm_config_report(store: &EnvStore) -> LlmConfigReport {
+    let forced = resolve_knob_src("SYNSEMA_LLM_PROVIDER", store);
+    let (provider, selection) = match &forced {
+        Some((p, src)) => (p.trim().to_lowercase(), ProviderSelection::Forced(*src)),
+        None => match KEY_VARS.iter().find(|(var, _)| resolve_knob(var, store).is_some()) {
+            Some((_, prov)) => (prov.to_string(), ProviderSelection::Auto),
+            None => (String::new(), ProviderSelection::None),
+        },
+    };
+
+    // Knobs comunes (mismos defaults y parseo que provider_from_config).
+    let model_default = match provider.as_str() {
+        "anthropic" | "claude" => ANTHROPIC_DEFAULT_MODEL,
+        "openai" | "gpt" => OPENAI_DEFAULT_MODEL,
+        "minimax" => MINIMAX_DEFAULT_MODEL,
+        "deepseek" => DEEPSEEK_DEFAULT_MODEL,
+        _ => "",
+    };
+    let knob = |name: &str, default: String, valid: &dyn Fn(&str) -> bool| -> KnobReport {
+        match resolve_knob_src(name, store) {
+            Some((v, src)) if valid(v.trim()) => KnobReport { value: v.trim().to_string(), source: src },
+            _ => KnobReport { value: default, source: KnobSource::Default },
+        }
+    };
+    let model = knob("SYNSEMA_LLM_MODEL", model_default.to_string(), &|_| true);
+    let max_tokens = knob("SYNSEMA_LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS.to_string(), &|v| {
+        v.parse::<u64>().map(|n| n > 0).unwrap_or(false)
+    });
+    let timeout_secs = knob("SYNSEMA_LLM_TIMEOUT", DEFAULT_TIMEOUT_SECS.to_string(), &|v| {
+        v.parse::<u64>().map(|n| n > 0).unwrap_or(false)
+    });
+    let transport = match resolve_knob_src("SYNSEMA_LLM_HTTP_STREAM", store) {
+        Some((v, src)) => {
+            let t = v.trim().to_lowercase();
+            let on = t != "0" && t != "false";
+            KnobReport { value: if on { "streaming" } else { "no-stream" }.to_string(), source: src }
+        }
+        None => KnobReport { value: "streaming".to_string(), source: KnobSource::Default },
+    };
+    let base_default = match provider.as_str() {
+        "anthropic" | "claude" => ANTHROPIC_DEFAULT_BASE,
+        "openai" | "gpt" => OPENAI_DEFAULT_BASE,
+        "minimax" => MINIMAX_DEFAULT_BASE,
+        "deepseek" => DEEPSEEK_DEFAULT_BASE,
+        _ => "",
+    };
+    let base_url = match resolve_knob_src("SYNSEMA_LLM_BASE_URL", store) {
+        Some((v, src)) => KnobReport { value: redact_url_userinfo(v.trim()), source: src },
+        None => KnobReport { value: base_default.to_string(), source: KnobSource::Default },
+    };
+
+    let local_feature = cfg!(feature = "llm-local");
+    let misplaced = || -> Vec<String> {
+        KEY_VARS
+            .iter()
+            .filter(|(var, _)| resolve_knob(var, store).is_some())
+            .map(|(var, _)| var.to_string())
+            .collect()
+    };
+
+    // Diagnóstico — mismo árbol de decisión que provider_from_config.
+    let (key_var, key_present, offline) = match provider.as_str() {
+        "" => (None, None, Some(OfflineReason::NoProviderNoKeys)),
+        "local" | "gguf" => {
+            let has_model = resolve_knob_src("SYNSEMA_LLM_MODEL", store).is_some();
+            let offline = if !has_model {
+                Some(OfflineReason::LocalModelMissing)
+            } else if !local_feature {
+                Some(OfflineReason::LocalFeatureMissing)
+            } else {
+                None
+            };
+            (None, None, offline)
+        }
+        p => {
+            let expected = match p {
+                "anthropic" | "claude" => Some("ANTHROPIC_API_KEY"),
+                "openai" | "gpt" => Some("OPENAI_API_KEY"),
+                "minimax" => Some("MINIMAX_API_KEY"),
+                "deepseek" => Some("DEEPSEEK_API_KEY"),
+                _ => None,
+            };
+            match expected {
+                None => (None, None, Some(OfflineReason::UnknownProvider { name: p.to_string() })),
+                Some(var) => {
+                    let present = resolve_knob_src(var, store).map(|(_, src)| src);
+                    let offline = if present.is_none() {
+                        Some(OfflineReason::KeyMissing {
+                            expected_var: var.to_string(),
+                            misplaced: misplaced(),
+                        })
+                    } else {
+                        None
+                    };
+                    (Some(var.to_string()), present, offline)
+                }
+            }
+        }
+    };
+
+    LlmConfigReport {
+        provider,
+        selection,
+        key_var,
+        key_present,
+        model,
+        max_tokens,
+        timeout_secs,
+        transport,
+        base_url,
+        local_feature,
+        offline,
+    }
+}
+
+impl LlmConfigReport {
+    /// JSON estable para `--json` (a mano con serde_json: sin claves de secreto posibles
+    /// por construcción — el tipo no las contiene).
+    pub fn to_json(&self) -> String {
+        let sel = match &self.selection {
+            ProviderSelection::Forced(src) => json!({"mode": "forced", "source": src.label()}),
+            ProviderSelection::Auto => json!({"mode": "auto"}),
+            ProviderSelection::None => json!({"mode": "none"}),
+        };
+        let knob = |k: &KnobReport| json!({"value": k.value, "source": k.source.label()});
+        let offline = self.offline.as_ref().map(|r| match r {
+            OfflineReason::KeyMissing { expected_var, misplaced } => {
+                json!({"reason": "key_missing", "expected_var": expected_var, "other_keys_present": misplaced})
+            }
+            OfflineReason::NoProviderNoKeys => json!({"reason": "no_provider_no_keys"}),
+            OfflineReason::LocalModelMissing => json!({"reason": "local_model_missing"}),
+            OfflineReason::LocalFeatureMissing => json!({"reason": "local_feature_missing"}),
+            OfflineReason::UnknownProvider { name } => {
+                json!({"reason": "unknown_provider", "name": name})
+            }
+        });
+        json!({
+            "alive": self.offline.is_none(),
+            "provider": self.provider,
+            "selection": sel,
+            "key_var": self.key_var,
+            "key_present": self.key_present.map(|s| s.label()),
+            "model": knob(&self.model),
+            "max_tokens": knob(&self.max_tokens),
+            "timeout_secs": knob(&self.timeout_secs),
+            "transport": knob(&self.transport),
+            "base_url": knob(&self.base_url),
+            "local_feature": self.local_feature,
+            "offline": offline,
+        })
+        .to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1813,6 +2081,101 @@ mod tests {
         assert!(!resolve_stream_transport(&EnvStore::parse("SYNSEMA_LLM_HTTP_STREAM=FALSE\n")));
         assert!(resolve_stream_transport(&EnvStore::parse("SYNSEMA_LLM_HTTP_STREAM=1\n")));
         assert!(resolve_stream_transport(&EnvStore::parse("SYNSEMA_LLM_HTTP_STREAM=si\n")));
+        clear_llm_env();
+    }
+
+    // -- llm status: reporte de configuración --
+
+    #[test]
+    fn report_alive_with_forced_provider_and_key() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_llm_env();
+        let store = EnvStore::parse(
+            "SYNSEMA_LLM_PROVIDER=minimax\nMINIMAX_API_KEY=sk-cp-xyz\nSYNSEMA_LLM_MODEL=MiniMax-M3\n",
+        );
+        let r = llm_config_report(&store);
+        assert!(r.offline.is_none(), "debe estar VIVO: {:?}", r.offline);
+        assert_eq!(r.provider, "minimax");
+        assert_eq!(r.selection, ProviderSelection::Forced(KnobSource::DotEnv));
+        assert_eq!(r.key_var.as_deref(), Some("MINIMAX_API_KEY"));
+        assert_eq!(r.key_present, Some(KnobSource::DotEnv));
+        assert_eq!(r.model.value, "MiniMax-M3");
+        assert_eq!(r.timeout_secs.value, "60");
+        assert_eq!(r.timeout_secs.source, KnobSource::Default);
+        clear_llm_env();
+    }
+
+    // El incidente real: provider=minimax con la clave bajo DEEPSEEK_API_KEY.
+    #[test]
+    fn report_offline_key_missing_with_misplaced_hint() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_llm_env();
+        let store =
+            EnvStore::parse("SYNSEMA_LLM_PROVIDER=minimax\nDEEPSEEK_API_KEY=sk-equivocada\n");
+        let r = llm_config_report(&store);
+        match r.offline {
+            Some(OfflineReason::KeyMissing { ref expected_var, ref misplaced }) => {
+                assert_eq!(expected_var, "MINIMAX_API_KEY");
+                assert_eq!(misplaced, &["DEEPSEEK_API_KEY".to_string()]);
+            }
+            other => panic!("esperaba KeyMissing con hint, got {:?}", other),
+        }
+        clear_llm_env();
+    }
+
+    #[test]
+    fn report_offline_and_auto_variants() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_llm_env();
+        // Nada configurado.
+        let r = llm_config_report(&EnvStore::empty());
+        assert_eq!(r.offline, Some(OfflineReason::NoProviderNoKeys));
+        // Auto-selección por key (sin PROVIDER).
+        let r = llm_config_report(&EnvStore::parse("ANTHROPIC_API_KEY=sk-a\n"));
+        assert!(r.offline.is_none());
+        assert_eq!(r.provider, "anthropic");
+        assert_eq!(r.selection, ProviderSelection::Auto);
+        // Provider desconocido.
+        let r = llm_config_report(&EnvStore::parse("SYNSEMA_LLM_PROVIDER=nope\n"));
+        assert_eq!(r.offline, Some(OfflineReason::UnknownProvider { name: "nope".to_string() }));
+        // local sin MODEL.
+        let r = llm_config_report(&EnvStore::parse("SYNSEMA_LLM_PROVIDER=local\n"));
+        assert_eq!(r.offline, Some(OfflineReason::LocalModelMissing));
+        clear_llm_env();
+    }
+
+    // SEGURIDAD: el reporte (y su JSON) JAMÁS contiene material de la key — ni el valor,
+    // ni un prefijo. Coherencia: alive == provider_from_config().is_some().
+    #[test]
+    fn report_never_leaks_key_material_and_matches_resolution() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_llm_env();
+        let secret = "sk-SUPERSECRETO-NO-IMPRIMIR-9f3a";
+        for env in [
+            format!("SYNSEMA_LLM_PROVIDER=minimax\nMINIMAX_API_KEY={}\n", secret),
+            format!("SYNSEMA_LLM_PROVIDER=minimax\nDEEPSEEK_API_KEY={}\n", secret),
+            format!("DEEPSEEK_API_KEY={}\n", secret),
+            "SYNSEMA_LLM_PROVIDER=deepseek\n".to_string(),
+        ] {
+            let store = EnvStore::parse(&env);
+            let r = llm_config_report(&store);
+            let dump = format!("{:?} {}", r, r.to_json());
+            assert!(!dump.contains(secret), "el reporte filtró la key: {}", dump);
+            assert!(!dump.contains("SUPERSECRETO"), "el reporte filtró parte de la key");
+            assert_eq!(
+                r.offline.is_none(),
+                provider_from_config(&store).is_some(),
+                "el reporte miente vs la resolución real para: {}",
+                env
+            );
+        }
+        // base_url con credenciales embebidas → userinfo redactado.
+        let store = EnvStore::parse(
+            "SYNSEMA_LLM_PROVIDER=openai\nOPENAI_API_KEY=k\nSYNSEMA_LLM_BASE_URL=http://user:clave@interno:8080/v1\n",
+        );
+        let r = llm_config_report(&store);
+        assert_eq!(r.base_url.value, "http://***@interno:8080/v1");
+        assert!(!r.to_json().contains("clave"));
         clear_llm_env();
     }
 
