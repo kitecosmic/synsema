@@ -23,7 +23,7 @@ use synsema_runtime::serve::{run_serve_program_with_overrides, ServeOverrides};
 
 mod update;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] | test [-v] [--sandbox | --cap-set <list>] <archivo|dir> | check | tokens | ast | repl | daemon | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] | test [-v] [--sandbox | --cap-set <list>] <archivo|dir> | check | tokens | ast | repl | daemon | llm status [--json] | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
 
 /// Construye el techo de capabilities del host desde `--sandbox`/`--cap-set` (defense-in-depth:
 /// el operador impone un límite que el código ejecutado no puede exceder, sin importar qué
@@ -123,6 +123,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("daemon") => cmd_daemon(&args),
+        Some("llm") => cmd_llm(&args),
         Some("update") => update::cmd_update(),
         Some("version") | Some("--version") | Some("-V") => {
             println!("Synsema {}", update::current_version());
@@ -130,12 +131,167 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(other) => {
-            eprintln!("subcomando desconocido: '{}'. Disponibles: conform, serve, run, test, check, tokens, ast, repl, daemon, version, update", other);
+            eprintln!("subcomando desconocido: '{}'. Disponibles: conform, serve, run, test, check, tokens, ast, repl, daemon, llm, version, update", other);
             ExitCode::from(2)
         }
         None => {
             eprintln!("{}", USAGE);
             ExitCode::from(2)
+        }
+    }
+}
+
+/// `synsema llm status [--json]` — imprime la configuración LLM RESUELTA (la que
+/// `run`/`serve` van a usar de verdad), con la fuente de cada valor y el diagnóstico
+/// cuando está offline. SEGURIDAD: jamás imprime valores de keys (solo presencia) —
+/// el reporte viene de `llm_config_report`, cuyo tipo no puede transportar secretos.
+/// No hace red. Exit: 0 = vivo, 1 = offline, 2 = uso.
+fn cmd_llm(args: &[String]) -> ExitCode {
+    let args = take_env_file_flags(args);
+    match args.get(2).map(String::as_str) {
+        Some("status") => cmd_llm_status(args.iter().any(|a| a == "--json")),
+        _ => {
+            eprintln!("uso: synsema llm status [--json] [--env-file <path> | --no-env-file]");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Path efectivo del `.env` — espeja `EnvStore::load_default` (SYNSEMA_ENV_FILE >
+/// `./.env` si existe > ninguno).
+fn effective_env_file() -> Option<String> {
+    match std::env::var("SYNSEMA_ENV_FILE") {
+        Ok(p) if p.is_empty() => None,
+        Ok(p) => Some(p),
+        Err(_) => std::path::Path::new(".env")
+            .exists()
+            .then(|| std::fs::canonicalize(".env")
+                .map(|p| strip_verbatim(&p))
+                .unwrap_or_else(|_| ".env".to_string())),
+    }
+}
+
+/// Windows: `fs::canonicalize` devuelve paths verbatim (`\\?\C:\…`) — sacá el prefijo
+/// para imprimir. En otras plataformas es identidad.
+fn strip_verbatim(p: &std::path::Path) -> String {
+    let s = p.display().to_string();
+    s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+}
+
+/// Todos los `synsema(.exe)` distintos que hay en el PATH, en orden (el primero gana).
+/// Solo paths de archivos — nada del entorno. Para avisar el shadowing de binarios
+/// (release instalada vs build de cargo) que causa "probé contra el binario viejo".
+fn synsema_binaries_in_path() -> Vec<std::path::PathBuf> {
+    let mut seen = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for name in ["synsema.exe", "synsema"] {
+                let cand = dir.join(name);
+                if cand.is_file() {
+                    let canon = std::fs::canonicalize(&cand).unwrap_or(cand);
+                    if !seen.contains(&canon) {
+                        seen.push(canon);
+                    }
+                }
+            }
+        }
+    }
+    seen
+}
+
+fn cmd_llm_status(json: bool) -> ExitCode {
+    use synsema_runtime::llm_providers::{
+        llm_config_report, OfflineReason, ProviderSelection,
+    };
+    use synsema_stdlib::secrets::EnvStore;
+
+    let store = EnvStore::load_default();
+    let report = llm_config_report(&store);
+
+    if json {
+        println!("{}", report.to_json());
+        return if report.offline.is_none() { ExitCode::SUCCESS } else { ExitCode::from(1) };
+    }
+
+    // Cabecera: binario + versión + .env efectivo (diagnóstico de "¿QUÉ estoy corriendo?").
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    println!("Synsema {} — {}", update::current_version(), exe);
+    match effective_env_file() {
+        Some(p) => println!(".env: {}", p),
+        None => println!(".env: (ninguno — solo environ del proceso y defaults)"),
+    }
+    let bins = synsema_binaries_in_path();
+    if bins.len() > 1 {
+        println!("⚠️  hay {} binarios `synsema` en el PATH (gana el primero):", bins.len());
+        for b in &bins {
+            println!("     {}", strip_verbatim(b));
+        }
+    }
+    println!();
+
+    let sel = match &report.selection {
+        ProviderSelection::Forced(src) => format!("(SYNSEMA_LLM_PROVIDER, {})", src.label()),
+        ProviderSelection::Auto => "(auto, por presencia de la key)".to_string(),
+        ProviderSelection::None => String::new(),
+    };
+    if !report.provider.is_empty() {
+        println!("Provider    {:<28} {}", report.provider, sel);
+    }
+    if let Some(var) = &report.key_var {
+        match report.key_present {
+            Some(src) => println!("Key         {:<28} ✓ presente ({})", var, src.label()),
+            None => println!("Key         {:<28} ✗ FALTA", var),
+        }
+    }
+    if !report.provider.is_empty() && report.provider != "local" && report.provider != "gguf" {
+        println!("Model       {:<28} (SYNSEMA_LLM_MODEL, {})", report.model.value, report.model.source.label());
+        println!("Max tokens  {:<28} ({})", report.max_tokens.value, report.max_tokens.source.label());
+        let timeout_note = if report.transport.value == "streaming" {
+            " — mide silencio entre bytes"
+        } else {
+            " — limita la llamada completa"
+        };
+        println!("Timeout     {:<28} ({}){}", format!("{}s", report.timeout_secs.value), report.timeout_secs.source.label(), timeout_note);
+        println!("Transporte  {:<28} ({})", report.transport.value, report.transport.source.label());
+        println!("Base URL    {:<28} ({})", report.base_url.value, report.base_url.source.label());
+    }
+    println!();
+
+    match &report.offline {
+        None => {
+            println!("Estado: ✅ VIVO — reason/decide/analyze/generate/llm_step van a un modelo real.");
+            ExitCode::SUCCESS
+        }
+        Some(reason) => {
+            match reason {
+                OfflineReason::KeyMissing { expected_var, misplaced } => {
+                    println!("Estado: ✗ OFFLINE — falta {} (las ops devuelven placeholders).", expected_var);
+                    if !misplaced.is_empty() {
+                        println!("        Hay una clave bajo {} — ¿la guardaste bajo la variable equivocada?", misplaced.join(", "));
+                    }
+                    println!("        Fix: poné la clave en {} (en el .env o el environ).", expected_var);
+                }
+                OfflineReason::NoProviderNoKeys => {
+                    println!("Estado: ✗ OFFLINE — sin provider ni API keys (las ops devuelven placeholders).");
+                    println!("        Fix: seteá UNA de ANTHROPIC_API_KEY / OPENAI_API_KEY / MINIMAX_API_KEY /");
+                    println!("        DEEPSEEK_API_KEY (el provider se auto-selecciona), o forzalo con");
+                    println!("        SYNSEMA_LLM_PROVIDER. El .env del directorio actual se auto-carga.");
+                }
+                OfflineReason::LocalModelMissing => {
+                    println!("Estado: ✗ OFFLINE — provider `local` necesita SYNSEMA_LLM_MODEL=<ruta al .gguf>.");
+                }
+                OfflineReason::LocalFeatureMissing => {
+                    println!("Estado: ✗ OFFLINE — este binario NO tiene la feature llm-local compilada.");
+                    println!("        Fix: cargo install --path crates/synsema-cli --features llm-local --force");
+                }
+                OfflineReason::UnknownProvider { name } => {
+                    println!("Estado: ✗ OFFLINE — provider desconocido '{}'.", name);
+                    println!("        Válidos: anthropic, openai, minimax, deepseek, local.");
+                }
+            }
+            ExitCode::from(1)
         }
     }
 }
