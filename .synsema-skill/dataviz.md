@@ -1,4 +1,4 @@
-# Data & Charts (CSV · statistics · native SVG charts)
+# Data & Charts (CSV · statistics · native SVG charts · PNG/PDF export)
 
 The business-report pipeline is native: **data → aggregate → chart → deliver**, with no
 external libraries. All builtins on this page are **pure** (no capability): they work in
@@ -102,6 +102,33 @@ serve on 8080
             chart("bar", filas, {"x": "mes", "y": "total", "title": "Ventas por mes"})
         ], {"title": "Reporte"}))
 ```
+
+## PNG / PDF export — `svg_to_png` / `svg_to_pdf`
+
+**General SVG converters** (any SVG text — from `chart_svg`, handwritten, fetched), pure,
+deterministic across platforms (one embedded sans font — DejaVu Sans — so text rasterizes
+identically on Windows/Linux/macOS/Docker `FROM scratch`). Both return **`bytes`**:
+
+```
+let svg be chart_svg("bar", filas, {"x": "mes", "y": "total"})
+write_file("reporte.png", svg_to_png(svg, {"scale": 2}))      -- needs file.write
+route "GET /chart.pdf"
+    give binary(svg_to_pdf(svg), "application/pdf")
+```
+
+- `svg_to_png(svg, opts?)` → PNG bytes (RGBA, transparent unless `background`). Opts:
+  `width`/`height` (px; one alone keeps aspect), `scale` (e.g. `2` for retina — conflicts
+  with width/height, explicit error), `background` (hex), `max_pixels` (anti-DoS ceiling,
+  default 16.7M ≈ 4096×4096, **overridable** — the error names the option).
+- `svg_to_pdf(svg, opts?)` → single-page **vector** PDF (crisp at any zoom, printable).
+  Opts: `width`/`height` in points (one alone scales proportionally; both must match the
+  SVG's aspect ratio or you get a clear error).
+- Safety: embedded `<script>` is ignored (nothing executes); external `<image href>`
+  (http:// or local paths) is **never fetched** — no network, no disk (only `data:` URLs
+  resolve). A `secret` as the svg argument → type error.
+- Honest limits: resvg renders the *static* state (scripts/SMIL animations ignored);
+  unknown `font-family` falls back to the embedded font; glyphs it lacks (full CJK, color
+  emoji) show as tofu.
 
 ## Gotchas
 

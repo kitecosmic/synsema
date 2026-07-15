@@ -23,3 +23,16 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('engine/Cargo.lock') }}
       - name: Test
         run: cargo test --locked --manifest-path engine/Cargo.toml --workspace
+
+  # Supply-chain: cargo audit contra la base RustSec en cada push/PR.
+  # Falla ante una vulnerabilidad conocida en Cargo.lock (los warnings
+  # "unmaintained" no cortan el build; se revisan al actualizar deps).
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit
+        run: cargo audit --file engine/Cargo.lock

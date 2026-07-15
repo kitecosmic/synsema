@@ -2504,6 +2504,9 @@ pub fn register_serve_builtins(interp: &Interpreter) {
     // PUROS y sin capability (G9): al registrarse acá quedan en TODOS los modos
     // (run/test/conform/serve) y funcionan dentro de `sandbox`.
     crate::charts::register_chart_builtins(interp);
+    // Export PNG/PDF (Batch 9): svg_to_png / svg_to_pdf. Mismo patrón: puros,
+    // sin capability, disponibles en todos los modos y dentro de `sandbox`.
+    crate::raster::register_raster_builtins(interp);
     interp.register_builtin(
         "content",
         1,

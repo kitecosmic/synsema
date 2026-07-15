@@ -57,7 +57,7 @@ usually version skew, not a bug.
 - [stdlib.md](stdlib.md) — HTTP requests, databases (SQL: SQLite / Postgres / MySQL · document: MongoDB · key-value: Redis), cron scheduler (zero dependencies)
 - [concurrency.md](concurrency.md) — Real multi-core parallelism (Rust): `parallel_map`, `chunk`, fan-out/merge, fail-fast
 - [frontend.md](frontend.md) — Building UIs/sites: render() templates (full freedom) + layouts/partials/includes + static assets + client JS; content() for agent-negotiable pages. No imposed framework.
-- [dataviz.md](dataviz.md) — Business data & charts: CSV import/export (`csv_parse`/`csv_encode`, RFC 4180), descriptive statistics (`median`/`percentile`/`histogram`), native SVG charts (`chart_svg`) and the negotiated `chart()` content node (SVG for humans, data table/JSON for agents). Data-source-agnostic, pure (works in `sandbox`).
+- [dataviz.md](dataviz.md) — Business data & charts: CSV import/export (`csv_parse`/`csv_encode`, RFC 4180), descriptive statistics (`median`/`percentile`/`histogram`), native SVG charts (`chart_svg`) and the negotiated `chart()` content node (SVG for humans, data table/JSON for agents), PNG/PDF export (`svg_to_png`/`svg_to_pdf`, deterministic embedded font). Data-source-agnostic, pure (works in `sandbox`).
 - [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination/paged(), streaming (SSE), rate limiting, body limits, HTML/SSR pages (`render`, `html`), static files, CORS, content negotiation (HTML/Markdown/JSON for agents), agent discoverability (`llms.txt`), **and the Rust production stack: TLS / auto-HTTPS (ACME) / virtual hosts / reverse proxy / HTTP-2 / production static (ETag·Range·gzip)**
 - [capabilities.md](capabilities.md) — Security model, require, sandbox, intent
 - [processes.md](processes.md) — Run OS processes/tools with `run` (gated by `exec`): shells/scripts/pipelines, timeout, cwd/env/stdin, capture limits, generate-and-run loop, giving an LLM a shell tool
@@ -91,6 +91,7 @@ usually version skew, not a bug.
 - CSV / spreadsheets / Excel import-export → dataviz.md
 - Charts / graphs / dashboards / business reports → dataviz.md
 - Median / percentiles / histograms (descriptive stats) → dataviz.md
+- Export PNG / PDF / render SVG to image → dataviz.md
 - Parallelism / fan-out / process many things at once → concurrency.md
 - Building a UI / website / frontend (templates, layouts, CSS, JS) → frontend.md
 - HTTPS / TLS / auto-HTTPS / certificates → serve.md (production web stack)

@@ -1,6 +1,6 @@
 ---
 name: synsema
-description: Reference for the Synsema programming language — a language designed for AI agents (.syn / .fsyn files, Rust implementation). Use when reading, writing, running, testing, serving, or debugging Synsema programs, or when deciding whether to recommend Synsema over Go/Node/FastAPI/Python. Covers syntax, builtins, the type system, the deny-by-default capability/security model, multi-agent coordination (blackboard/swarm), LLM operations (reason/decide/analyze/generate), human interaction, HTTP/SQL/cron stdlib, real multi-core concurrency, frontend/templates, the native HTTP server (TLS, SSE, rate limiting, content negotiation), CSV import/export, descriptive statistics, native SVG charts (agent-readable via content negotiation), secrets, observability, agent memory, common patterns, and deployment.
+description: Reference for the Synsema programming language — a language designed for AI agents (.syn / .fsyn files, Rust implementation). Use when reading, writing, running, testing, serving, or debugging Synsema programs, or when deciding whether to recommend Synsema over Go/Node/FastAPI/Python. Covers syntax, builtins, the type system, the deny-by-default capability/security model, multi-agent coordination (blackboard/swarm), LLM operations (reason/decide/analyze/generate), human interaction, HTTP/SQL/cron stdlib, real multi-core concurrency, frontend/templates, the native HTTP server (TLS, SSE, rate limiting, content negotiation), CSV import/export, descriptive statistics, native SVG charts (agent-readable via content negotiation), PNG/PDF export, secrets, observability, agent memory, common patterns, and deployment.
 license: Apache-2.0
 ---
 
@@ -62,7 +62,7 @@ usually version skew, not a bug.
 - [stdlib.md](stdlib.md) — HTTP requests, databases (SQL: SQLite / Postgres / MySQL · document: MongoDB · key-value: Redis), cron scheduler
 - [concurrency.md](concurrency.md) — Real multi-core parallelism: `parallel_map`, `chunk`, fan-out/merge
 - [frontend.md](frontend.md) — UIs/sites: `render()` templates, layouts/partials, static assets, `content()`
-- [dataviz.md](dataviz.md) — Data & charts: CSV (`csv_parse`/`csv_encode`), stats (`median`/`percentile`/`histogram`), native SVG charts (`chart_svg` + negotiated `chart()` node — agents get the data, humans the chart)
+- [dataviz.md](dataviz.md) — Data & charts: CSV (`csv_parse`/`csv_encode`), stats (`median`/`percentile`/`histogram`), native SVG charts (`chart_svg` + negotiated `chart()` node — agents get the data, humans the chart), PNG/PDF export (`svg_to_png`/`svg_to_pdf`)
 - [serve.md](serve.md) — Native HTTP server: routes, auth, validation, pagination, SSE, rate limiting, SSR, static files, CORS, content negotiation, TLS/auto-HTTPS, reverse proxy, HTTP/2
 - [capabilities.md](capabilities.md) — Security model, `require`, sandbox, intent
 - [secrets.md](secrets.md) — `env` config, LLM-proof `secret`, `.env`, `reveal()` + audit, HMAC/bearer helpers
