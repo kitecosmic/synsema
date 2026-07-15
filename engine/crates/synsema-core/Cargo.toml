@@ -23,3 +23,5 @@ num-complex.workspace = true
 # Arrays n-dimensionales + álgebra lineal (Batch 5): ndarray + faer, puro-Rust sin C.
 ndarray.workspace = true
 faer.workspace = true
+# CSV RFC 4180 (Batch 8): csv_parse/csv_encode. Puro-Rust, sin C (ver workspace).
+csv.workspace = true

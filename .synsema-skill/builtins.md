@@ -65,6 +65,10 @@ not errors and pass through `try/recover` untouched.
 - `json_decode(text)` → value: parse a JSON string to a Synsema value (object→map, array→list, number→number, etc.). Errors clearly on invalid JSON.
 - Round-trippable: `json_decode(json_encode(x))` reconstructs `x` (the idiomatic way to store structured data in a Redis/text value: `redis_set(k, json_encode({...}))`).
 
+## CSV (pure — no capability; see [dataviz.md](dataviz.md))
+- `csv_parse(text, opts?)` → list of maps (first row = headers; the same shape `sql()` returns). RFC 4180 (quoted fields, `""` escapes, CRLF/LF, BOM). Opts: `{headers: false}` → list of lists, `{delimiter: ";"}`, `{numbers: true}` (default is **lossless text**: `"00123"` stays text). Errors carry the line (unclosed quote, uneven fields, duplicate headers, unknown option).
+- `csv_encode(value, opts?)` → text. List of maps (headers = first map's keys) or list of lists. Opts: `{headers: [..]}` (order/subset), `{delimiter}`, `{eol}` (`"\r\n"` default). Minimal quoting; integers without decimals; `nothing` → empty; `bytes` → base64; **secret → `[redacted]`**; nested list/map → error suggesting `json_encode`.
+
 ## Math (pure — no capability)
 Constants (bare values): `pi`, `tau`, `e`, `inf`, `nan`.
 - magnitude/selection (type-preserving): `abs`, `sign`, `min`, `max`, `clamp`. `abs(complex)` → modulus.
@@ -74,6 +78,7 @@ Constants (bare values): `pi`, `tau`, `e`, `inf`, `nan`.
 - number theory (integers): `gcd`, `lcm`, `factorial`.
 - introspection: `is_nan`, `is_infinite`, `is_finite`, `round_to`.
 - aggregates over a list: `sum`, `product`, `mean` (also work on `array`, see below).
+- **descriptive statistics** (list of numbers or `array`; see [dataviz.md](dataviz.md)): `median(x)`, `percentile(x, p)` (p ∈ [0,100], linear interpolation — NumPy default), `histogram(x, bins?)` → `{counts, edges}` (`bins` = int, default 10, or explicit ascending edges; last bin closed). Empty data or NaN → clear error.
 - **Special functions:** `gamma`, `lgamma`, `erf`, `erfc`, `beta` (real-only; via `libm`).
 - **Polymorphic:** `sqrt`/`exp`/`ln`/`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/hyperbolics accept a real **or** a `complex`. Real arg → real result (unchanged: `sqrt(-1)` → NaN). Complex arg → complex (cmath): `sqrt(complex(-1,0))` → `complex(0,1)`, `exp(complex(0, pi))` ≈ `-1`.
 
@@ -214,6 +219,10 @@ Response helpers (set the HTTP status; body follows the response contract):
 - `link(text, href)`, `image(src, alt)`
 - `section(nodes)`, `code(text, lang?)`
 - `raw(html)` → raw HTML escape hatch (NOT auto-escaped); everything else in HTML output IS auto-escaped (XSS-safe)
+- `chart(kind, data, opts?)` → a **negotiated chart node**: HTML = inline SVG, Markdown = a data table (agents get the NUMBERS), JSON = structured series. Same args as `chart_svg`. See [dataviz.md](dataviz.md).
+
+### Charts (pure — no capability; see [dataviz.md](dataviz.md))
+- `chart_svg(kind, data, opts?)` → **plain SVG text** (embed with `{ raw ... }`, serve with `respond(svg, "image/svg+xml")`, save with `write_file`). `kind`: `"bar"`/`"line"`/`"pie"`/`"scatter"`. Data: list of maps + `{x, y}` opts (rows from any source), map label→value, list of numbers, `[x,y]` pairs, or 1-D `array`. Opts: `title`, `x`/`y` (multi-series: `y` as list), `x_label`/`y_label`, `width`/`height`, `colors` (replaces the palette), `legend`, `background`. Deterministic; XSS-safe; colorblind-safe 8-color palette in fixed order — **>8 series/slices without custom `colors` → error** (colors are never cycled); NaN/inf in plotted values → error.
 
 ## Cron (Scheduled Tasks)
 - `cron_every(seconds, task)` → job name (repeating background job)

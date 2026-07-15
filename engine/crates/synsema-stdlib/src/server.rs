@@ -1869,7 +1869,7 @@ fn bearer_token(headers: &[(String, String)]) -> String {
 // Árbol de contenido semántico (vocabulario content()) + renderers
 // =========================================================
 
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -1979,6 +1979,25 @@ fn node_to_json(node: &SynValue) -> Json {
                 ),
             ),
         ]),
+        // chart() (Batch 8): series estructuradas — el agente obtiene los DATOS.
+        "chart" => {
+            let mut pairs: Vec<(String, Json)> = vec![
+                ("type".to_string(), Json::Str("chart".into())),
+                ("kind".to_string(), Json::Str(node_str(node, "chart_kind"))),
+            ];
+            for key in ["title", "x_label", "y_label"] {
+                if let Some(val) = node_field(node, key) {
+                    if !matches!(val, SynValue::Nothing) {
+                        pairs.push((key.to_string(), syn_to_json(&val)));
+                    }
+                }
+            }
+            let series = node_field(node, "series")
+                .map(|s| syn_to_json(&s))
+                .unwrap_or(Json::Array(Vec::new()));
+            pairs.push(("series".to_string(), series));
+            Json::Object(pairs)
+        }
         _ => {
             let mut pairs: Vec<(String, Json)> = vec![("type".to_string(), Json::Str(kind))];
             for key in ["level", "text", "href", "src", "alt", "lang", "html"] {
@@ -2041,6 +2060,9 @@ fn render_node_html(node: &SynValue) -> String {
             format!("<pre><code{}>{}</code></pre>\n", cls, esc(&node_str(node, "text")))
         }
         "raw" => node_str(node, "html"), // escape hatch: NO escapado
+        // chart() (Batch 8): el SVG inline pre-renderizado por el MISMO renderer de
+        // chart_svg (mismos bytes); todo texto de datos ya viene escapado (G4).
+        "chart" => format!("{}\n", node_str(node, "svg").trim_end()),
         "page" => list_field(node, "nodes").iter().filter(|n| is_node(n)).map(render_node_html).collect(),
         _ => String::new(),
     }
@@ -2147,6 +2169,8 @@ fn render_node_md(node: &SynValue) -> String {
             .join("\n\n"),
         "code" => format!("```{}\n{}\n```", node_str(node, "lang"), node_str(node, "text")),
         "raw" => node_str(node, "html"),
+        // chart() (Batch 8): tabla Markdown de los datos normalizados (no píxeles).
+        "chart" => crate::charts::render_chart_md(node),
         "page" => list_field(node, "nodes")
             .iter()
             .filter(|n| is_node(n))
@@ -2248,7 +2272,7 @@ fn n_meta(v: Option<&SynValue>) -> SynValue {
     }
 }
 
-fn make_node(kind: &str, fields: Vec<(&str, SynValue)>) -> SynValue {
+pub(crate) fn make_node(kind: &str, fields: Vec<(&str, SynValue)>) -> SynValue {
     let mut m: IndexMap<String, SynValue> = IndexMap::new();
     m.insert("kind".to_string(), syn_text(kind));
     for (k, v) in fields {
@@ -2476,6 +2500,10 @@ pub fn register_serve_builtins(interp: &Interpreter) {
         1,
         Rc::new(|_i, a, _l| Ok(make_node("raw", vec![("html", syn_text(text_arg(a.first())))]))),
     );
+    // Charts nativos (Batch 8): chart_svg (texto SVG) + chart (nodo negociable).
+    // PUROS y sin capability (G9): al registrarse acá quedan en TODOS los modos
+    // (run/test/conform/serve) y funcionan dentro de `sandbox`.
+    crate::charts::register_chart_builtins(interp);
     interp.register_builtin(
         "content",
         1,

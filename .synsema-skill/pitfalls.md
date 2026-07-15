@@ -148,6 +148,17 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `signal "x:" + text(id)` must be a literal | The channel name is an **expression** — dynamic names work | Use `signal`/`wait_for` with a computed name for per-job channels (see agents.md) |
 | A route's `wait_for` hangs the request 30s when no signal comes | That's the **default** timeout | Set it: `wait_for "x" timeout 2 as r` (seconds, 0–3600). Bounds the wait so requests don't pile up. |
 
+## Data & charts (CSV / stats / chart_svg — see [dataviz.md](dataviz.md))
+
+| What you expect | What actually happens | Why / workaround |
+|---|---|---|
+| `csv_parse` converts `"42"` to a number | Everything stays **text** by default (lossless: `"00123"` is preserved) | Pass `{"numbers": true}` to convert numeric-looking fields |
+| A 9th series/pie-slice picks a 9th color | **Error** — colors are never cycled (colorblind-safety: the fixed order is the mechanism) | Group the tail into an "Other" bucket, or pass your own `{"colors": [...]}` |
+| `{"x": "mes"}` works with a map or number list | Error: `x`/`y` only apply to a **list of maps** (rows) | Other shapes carry their own x (labels/index/pairs) — drop the opts |
+| A NaN/infinite value plots as a gap | **Error** (a silent gap or a broken SVG would lie to the reader) | Filter first with `where(...)` + `is_finite(...)` |
+| `histogram` counts every value with explicit edges | Values **outside the edges are discarded** (NumPy semantics) | Widen the edges, or use integer `bins` (auto range [min, max]) |
+| `chart(...)` returns SVG text | It returns a **content node** (negotiated HTML/MD/JSON) | For raw SVG text use `chart_svg(...)`; `chart()` lives inside `content(page([...]))` |
+
 ## Behavioral surprises
 
 | What you expect | What actually happens | Why / workaround |
