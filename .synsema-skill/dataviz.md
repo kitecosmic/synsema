@@ -1,0 +1,116 @@
+# Data & Charts (CSV · statistics · native SVG charts)
+
+The business-report pipeline is native: **data → aggregate → chart → deliver**, with no
+external libraries. All builtins on this page are **pure** (no capability): they work in
+`run`/`test`/`conform`/`serve` and **inside `sandbox`** (bring data in with capabilities
+outside, transform inside).
+
+Everything is **data-source-agnostic**: charts and CSV consume plain values (lists, maps,
+arrays) — the same rows whether they came from `sql()` (SQLite/Postgres/MySQL),
+`mongo_find`, `csv_parse`, `http_get` or a literal.
+
+## CSV — `csv_parse` / `csv_encode`
+
+Text ↔ values, mirroring `json_encode`/`json_decode`. RFC 4180: quoted fields with embedded
+delimiters/quotes/newlines, `""` escapes, CRLF and LF, UTF-8 BOM tolerated. File I/O goes
+through `read_file`/`write_file` (their own capabilities).
+
+```
+let rows be csv_parse(read_file("ventas.csv"), {"numbers": true})
+-- rows is a LIST OF MAPS — the same shape sql() returns → group_by/chart directly
+write_file("out.csv", csv_encode(rows))
+```
+
+- `csv_parse(text, opts?)` → list of maps (first row = headers). Opts:
+  - `"headers": false` → list of lists (all rows are data)
+  - `"delimiter": ";"` (or `"\t"`) — single ASCII char
+  - `"numbers": true` → numeric-looking fields become numbers. **Default is lossless
+    text** (`"00123"` stays `"00123"`; `"inf"`/`"nan"` are never converted)
+- `csv_encode(value, opts?)` → text. Value = list of maps (headers from the first map's
+  keys, in order) or list of lists. Opts: `"headers": [..]` (column order/subset),
+  `"delimiter"`, `"eol"` (`"\r\n"` default — Excel-friendly; or `"\n"`).
+- Guarantees: minimal quoting; integers without decimals (`42`, not `42.0`); `nothing` →
+  empty field; `bytes` → base64; **`secret` → `[redacted]`** (never the plaintext); nested
+  list/map → clear error suggesting `json_encode` for that field.
+- Errors always carry the line/row: unclosed quote, uneven field count, duplicate
+  headers, unknown option (typo guard). All catchable with `try`/`recover`.
+
+## Descriptive statistics — `median` / `percentile` / `histogram`
+
+Work on a list of numbers OR a numeric `array` (same result). Empty data or NaN → clear
+error (never a silent garbage median).
+
+- `median(x)` → number (even N → mean of the two middle values)
+- `percentile(x, p)` → number; `p` ∈ [0,100], **linear interpolation** (NumPy default;
+  `percentile(x, 50) == median(x)`)
+- `histogram(x, bins?)` → `{"counts": [...], "edges": [...]}`. `bins` = integer (default
+  10) or explicit ascending edge list. NumPy semantics: `length(edges) == length(counts)+1`,
+  half-open bins `[a,b)` except the last `[a,b]`; with explicit edges, out-of-range values
+  are discarded.
+
+## Charts — `chart_svg` and the `chart()` content node
+
+`chart_svg(kind, data, opts?)` → **plain SVG text** you can embed with `{ raw svg }` in a
+`render()` template, serve with `respond(svg, "image/svg+xml")`, save with `write_file`,
+or edit as text. Deterministic: same input → byte-identical SVG (cacheable).
+
+`kind` ∈ `"bar" | "line" | "pie" | "scatter"`.
+
+**Accepted data shapes** (pick whichever your pipeline already has):
+
+| Shape | Example | Kinds |
+|---|---|---|
+| list of maps (rows) + `{"x": ..., "y": ...}` | `sql(...)` / `csv_parse(...)` output | all |
+| map label → value | `{"ene": 10, "feb": 25}` (natural after `group_by`+`reduce`) | bar, line, pie |
+| list of numbers | `[3, 1, 4]` (x = index) | bar, line |
+| list of `[x, y]` pairs | `[[1, 2], [3, 4]]` | line, scatter |
+| 1-D `array` | `linspace(0, 1, 50)` results | bar, line |
+
+Multi-series from rows: `{"y": ["ventas", "costos"]}` (one series per field).
+
+**Opts:** `title`, `x`/`y` (rows only — elsewhere they error instead of being silently
+ignored), `x_label`, `y_label`, `width` (640), `height` (360), `colors` (list of hex that
+REPLACES the default palette), `legend` (auto: shown for ≥2 series or pie),
+`background` (hex; default transparent).
+
+**Design defaults you get for free:** a colorblind-safe 8-color palette in fixed order,
+recessive grid, single y-axis, bar charts always include zero, ≥8px scatter markers, all
+data text escaped (XSS-safe).
+
+**The >8 series rule is deliberate:** more series/pie-slices than colors is an ERROR
+(colors are never cycled — that's the colorblind-safety mechanism). Group the long tail
+into an "Other" bucket or pass your own `colors`.
+
+### `chart()` — the negotiated content node (charts agents can read)
+
+Inside `content()`, `chart(kind, data, opts?)` renders per client — same URL:
+
+- **HTML** → the inline SVG (same bytes as `chart_svg`)
+- **Markdown** (`.md` / `Accept: text/markdown`) → the chart's title + a **Markdown table
+  of the data** — an agent gets the numbers, not pixels
+- **JSON** (`.json`) → `{"type": "chart", "kind", "title", "series": [{"name",
+  "points": [[x, y], ...]}]}`
+
+```
+require db("app.db")
+serve on 8080
+    route "GET /r/:name"
+        let filas be sql("SELECT mes, total FROM ventas ORDER BY mes")
+        give content(page([
+            heading(1, "Ventas 2026"),
+            prose("Mediana mensual: " + text(median(collect(filas, "total")))),
+            chart("bar", filas, {"x": "mes", "y": "total", "title": "Ventas por mes"})
+        ], {"title": "Reporte"}))
+```
+
+## Gotchas
+
+- `x`/`y` opts only apply when data is a list of maps; any other shape + `x`/`y` → error
+  (by design, so a typo never silently ignores your intent).
+- NaN/infinite values anywhere in plotted data → clear error; filter with
+  `where(...)` + `is_finite(...)` first.
+- Pie takes ONE series of non-negative values; a map of label→value is the natural input.
+- CSV parse is lossless text by default — pass `{"numbers": true}` when you want numbers
+  (round-trips: `csv_parse(csv_encode(x), {"numbers": true}) == x`).
+- Charts are server-side SVG — for client-side interactivity (tooltips/zoom) serve a JS
+  chart library from `static/` and feed it JSON; both approaches compose.

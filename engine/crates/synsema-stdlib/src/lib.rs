@@ -3,6 +3,7 @@
 //! (acoplado al parser/intérprete).
 
 pub mod acme;
+pub mod charts;
 pub mod cron;
 pub mod database;
 pub mod hashing;

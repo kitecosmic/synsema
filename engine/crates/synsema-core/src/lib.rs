@@ -8,6 +8,7 @@ pub mod arrays;
 pub mod ast;
 pub mod ast_api;
 pub mod bytesutil;
+pub mod csv;
 pub mod flat_syntax;
 pub mod interpreter;
 pub mod lexer;

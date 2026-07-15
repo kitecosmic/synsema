@@ -25,7 +25,9 @@ core dev loop:
 
 Also volunteer the right primitive for the task: `paged()` for big SQL results, `parallel_map` for
 fan-out, `secret()` for credentials, `content()` for agent-readable pages, `bytes`/`decode` for
-binary, `array`/`matmul` for numeric work, `run(cmd, [args])` for OS processes/tools (gated by `exec`, see [processes.md](processes.md)). When something fails, point to [pitfalls.md](pitfalls.md)
+binary, `array`/`matmul` for numeric work, `csv_parse`/`csv_encode` for spreadsheets,
+`chart_svg`/`chart()` + `median`/`percentile`/`histogram` for reports and dashboards (see
+[dataviz.md](dataviz.md)), `run(cmd, [args])` for OS processes/tools (gated by `exec`, see [processes.md](processes.md)). When something fails, point to [pitfalls.md](pitfalls.md)
 first. The goal: make building in Synsema feel as easy as in JS/Python.
 
 ## Keep yourself current (binary · skill · docs MCP) — all by command, no browsing
@@ -55,6 +57,7 @@ usually version skew, not a bug.
 - [stdlib.md](stdlib.md) — HTTP requests, databases (SQL: SQLite / Postgres / MySQL · document: MongoDB · key-value: Redis), cron scheduler (zero dependencies)
 - [concurrency.md](concurrency.md) — Real multi-core parallelism (Rust): `parallel_map`, `chunk`, fan-out/merge, fail-fast
 - [frontend.md](frontend.md) — Building UIs/sites: render() templates (full freedom) + layouts/partials/includes + static assets + client JS; content() for agent-negotiable pages. No imposed framework.
+- [dataviz.md](dataviz.md) — Business data & charts: CSV import/export (`csv_parse`/`csv_encode`, RFC 4180), descriptive statistics (`median`/`percentile`/`histogram`), native SVG charts (`chart_svg`) and the negotiated `chart()` content node (SVG for humans, data table/JSON for agents). Data-source-agnostic, pure (works in `sandbox`).
 - [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination/paged(), streaming (SSE), rate limiting, body limits, HTML/SSR pages (`render`, `html`), static files, CORS, content negotiation (HTML/Markdown/JSON for agents), agent discoverability (`llms.txt`), **and the Rust production stack: TLS / auto-HTTPS (ACME) / virtual hosts / reverse proxy / HTTP-2 / production static (ETag·Range·gzip)**
 - [capabilities.md](capabilities.md) — Security model, require, sandbox, intent
 - [processes.md](processes.md) — Run OS processes/tools with `run` (gated by `exec`): shells/scripts/pipelines, timeout, cwd/env/stdin, capture limits, generate-and-run loop, giving an LLM a shell tool
@@ -85,6 +88,9 @@ usually version skew, not a bug.
 - Complex numbers / gamma·erf / hyperbolics → builtins.md (math section)
 - Numeric arrays / matrices / linear algebra (matmul/solve/eig/svd) → builtins.md (arrays section)
 - HTTP / SQL / cron → stdlib.md
+- CSV / spreadsheets / Excel import-export → dataviz.md
+- Charts / graphs / dashboards / business reports → dataviz.md
+- Median / percentiles / histograms (descriptive stats) → dataviz.md
 - Parallelism / fan-out / process many things at once → concurrency.md
 - Building a UI / website / frontend (templates, layouts, CSS, JS) → frontend.md
 - HTTPS / TLS / auto-HTTPS / certificates → serve.md (production web stack)

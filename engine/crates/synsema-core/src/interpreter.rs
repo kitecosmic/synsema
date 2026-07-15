@@ -825,6 +825,16 @@ impl Interpreter {
         self.register("sum", -1, Rc::new(|_i, a, _l| crate::math::sum(a)));
         self.register("product", -1, Rc::new(|_i, a, _l| crate::math::product(a)));
         self.register("mean", -1, Rc::new(|_i, a, _l| crate::math::mean(a)));
+        // Estadística descriptiva (Batch 8) — PUROS, sobre lista de números o array.
+        // percentile con interpolación lineal (NumPy default); histogram → {counts, edges}.
+        self.register("median", 1, Rc::new(|_i, a, _l| crate::math::median(a)));
+        self.register("percentile", 2, Rc::new(|_i, a, _l| crate::math::percentile(a)));
+        self.register("histogram", -1, Rc::new(|_i, a, _l| crate::math::histogram(a)));
+
+        // -- CSV (Batch 8) — transformación PURA texto↔valores (csv.rs), espejo de
+        // json_encode/json_decode. El I/O de archivos va por read_file/write_file.
+        self.register("csv_parse", -1, Rc::new(|_i, a, _l| crate::csv::csv_parse(a)));
+        self.register("csv_encode", -1, Rc::new(|_i, a, _l| crate::csv::csv_encode(a)));
 
         // -- Completitud matemática (Batch 4) --
         // Complejos: constructor + accesores (PUROS). Las transcendentales (sqrt/exp/…/pow)

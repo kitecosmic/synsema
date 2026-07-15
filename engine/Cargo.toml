@@ -138,6 +138,10 @@ candle-transformers = { version = "0.11", default-features = false }
 # en NUESTRA copia (tokenizers usa el motor C cuando la feature está presente) — dos
 # copias con la nuestra limpia es el mejor arreglo disponible.
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+# CSV RFC 4180 (Batch 8): parser/writer de BurntSushi, PURO-Rust sin C (deps: csv-core/
+# itoa/ryu/serde, cero `*-sys`) → preserva el binario único estático. Sólo la mecánica
+# de quoting/records; la conversión texto↔SynValue vive en synsema-core/src/csv.rs.
+csv = "1"
 synsema-core = { path = "crates/synsema-core" }
 synsema-capabilities = { path = "crates/synsema-capabilities" }
 synsema-stdlib = { path = "crates/synsema-stdlib" }

@@ -26,7 +26,9 @@ testing.md
 stdlib.md
 concurrency.md
 frontend.md
+dataviz.md
 serve.md
+processes.md
 capabilities.md
 secrets.md
 agents.md

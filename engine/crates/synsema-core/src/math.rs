@@ -22,7 +22,7 @@ use num_integer::Integer;
 use num_traits::ToPrimitive;
 
 use crate::interpreter::{Control, RuntimeError};
-use crate::number::{Number, MIX_DECIMAL_FLOAT};
+use crate::number::{py_float_str, Number, MIX_DECIMAL_FLOAT};
 use crate::types::{syn_bool, syn_complex, syn_float, syn_int, syn_number, SynValue};
 
 // -- helpers --
@@ -480,6 +480,203 @@ pub fn mean(args: &[SynValue]) -> Result<SynValue, Control> {
         acc = acc.checked_add(n).map_err(err)?;
     }
     Ok(syn_float(acc.to_f64() / nums.len() as f64))
+}
+
+// =========================================================
+// Estadística descriptiva (Batch 8) — median / percentile / histogram
+// =========================================================
+
+/// Datos numéricos del 1er argumento: lista de números O `array` (aplanado — la
+/// reducción por `axis` es futuro, como se hizo con std/var). Vacío → error claro;
+/// NaN → error claro (una mediana con NaN es garbage silencioso, G5).
+fn data_f64(args: &[SynValue], name: &str) -> Result<Vec<f64>, Control> {
+    let vals: Vec<f64> = match arg(args, 0)? {
+        SynValue::List(l) => {
+            let items = l.borrow();
+            let mut out = Vec::with_capacity(items.len());
+            for (i, it) in items.iter().enumerate() {
+                match it {
+                    SynValue::Number(n) => out.push(n.to_f64()),
+                    other => {
+                        return Err(err(format!(
+                            "{} expects a list of numbers, got {} at index {}",
+                            name,
+                            other.type_name(),
+                            i
+                        )))
+                    }
+                }
+            }
+            out
+        }
+        SynValue::Array(a) => a.iter().copied().collect(),
+        other => {
+            return Err(err(format!(
+                "{} expects a list of numbers or an array, got {}",
+                name,
+                other.type_name()
+            )))
+        }
+    };
+    if vals.is_empty() {
+        return Err(err(format!("{} of an empty collection", name)));
+    }
+    if vals.iter().any(|v| v.is_nan()) {
+        return Err(err(format!(
+            "{}: the data contains NaN; filter or replace NaN values first",
+            name
+        )));
+    }
+    Ok(vals)
+}
+
+/// Percentil `p` ∈ [0,100] con **interpolación lineal** sobre datos YA ordenados
+/// (semántica default de NumPy: `percentile(x, 50) == median(x)`).
+fn percentile_of_sorted(sorted: &[f64], p: f64) -> f64 {
+    let n = sorted.len();
+    if n == 1 {
+        return sorted[0];
+    }
+    let rank = p / 100.0 * (n - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    let frac = rank - lo as f64;
+    sorted[lo] + (sorted[hi] - sorted[lo]) * frac
+}
+
+pub fn median(args: &[SynValue]) -> Result<SynValue, Control> {
+    arity(args, 1, "median")?;
+    let mut vals = data_f64(args, "median")?;
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    Ok(syn_float(percentile_of_sorted(&vals, 50.0)))
+}
+
+pub fn percentile(args: &[SynValue]) -> Result<SynValue, Control> {
+    arity(args, 2, "percentile")?;
+    let p = num(args, 1, "percentile")?.to_f64();
+    if !(0.0..=100.0).contains(&p) {
+        return Err(err(format!(
+            "percentile expects p between 0 and 100, got {}",
+            py_float_str(p)
+        )));
+    }
+    let mut vals = data_f64(args, "percentile")?;
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    Ok(syn_float(percentile_of_sorted(&vals, p)))
+}
+
+/// Bordes del histograma: `bins` entero (default 10, rango [min,max] equiespaciado —
+/// si min == max se expande a [min-0.5, max+0.5], como NumPy) o lista de bordes
+/// explícitos (crecientes).
+fn histogram_edges(args: &[SynValue], vals: &[f64]) -> Result<Vec<f64>, Control> {
+    match args.get(1) {
+        None => equispaced_edges(vals, 10),
+        Some(SynValue::Number(n)) => {
+            if !n.is_integer() {
+                return Err(err("histogram: bins must be an integer or a list of edges, got a fractional number"));
+            }
+            let k = n.to_i64_trunc().unwrap_or(0);
+            if k < 1 {
+                return Err(err(format!("histogram: bins must be at least 1, got {}", k)));
+            }
+            equispaced_edges(vals, k as usize)
+        }
+        Some(SynValue::List(l)) => {
+            let items = l.borrow();
+            if items.len() < 2 {
+                return Err(err(format!(
+                    "histogram: an edge list needs at least 2 edges, got {}",
+                    items.len()
+                )));
+            }
+            let mut edges = Vec::with_capacity(items.len());
+            for (i, it) in items.iter().enumerate() {
+                match it {
+                    SynValue::Number(n) => edges.push(n.to_f64()),
+                    other => {
+                        return Err(err(format!(
+                            "histogram: edges must be numbers, got {} at index {}",
+                            other.type_name(),
+                            i
+                        )))
+                    }
+                }
+            }
+            for w in edges.windows(2) {
+                // partial_cmp: un borde NaN tampoco es "creciente" → error (fail-closed).
+                if w[0].partial_cmp(&w[1]) != Some(Ordering::Less) {
+                    return Err(err(format!(
+                        "histogram: edges must be strictly increasing, but {} is not greater than {}",
+                        py_float_str(w[1]),
+                        py_float_str(w[0])
+                    )));
+                }
+            }
+            Ok(edges)
+        }
+        Some(other) => Err(err(format!(
+            "histogram: bins must be an integer or a list of edges, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+fn equispaced_edges(vals: &[f64], bins: usize) -> Result<Vec<f64>, Control> {
+    let mut lo = vals.iter().copied().fold(f64::INFINITY, f64::min);
+    let mut hi = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !lo.is_finite() || !hi.is_finite() {
+        return Err(err("histogram: the data contains infinite values; filter them first"));
+    }
+    if lo == hi {
+        lo -= 0.5;
+        hi += 0.5;
+    }
+    let width = (hi - lo) / bins as f64;
+    let mut edges: Vec<f64> = (0..bins).map(|i| lo + width * i as f64).collect();
+    edges.push(hi); // el último borde exacto (sin drift acumulado del paso)
+    Ok(edges)
+}
+
+/// `histogram(x, bins?)` → `{"counts": [...], "edges": [...]}`. Semántica NumPy:
+/// `length(edges) == length(counts) + 1`, bins semiabiertos `[a, b)` salvo el
+/// último, cerrado `[a, b]`. Valores fuera de los bordes explícitos se descartan.
+pub fn histogram(args: &[SynValue]) -> Result<SynValue, Control> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(err(format!(
+            "histogram expects (data, bins?) — 1 or 2 argument(s), got {}",
+            args.len()
+        )));
+    }
+    let vals = data_f64(args, "histogram")?;
+    let edges = histogram_edges(args, &vals)?;
+    let nbins = edges.len() - 1;
+    let mut counts = vec![0i64; nbins];
+    let (first, last) = (edges[0], edges[nbins]);
+    for &v in &vals {
+        if v < first || v > last {
+            continue; // fuera de los bordes explícitos → se descarta (NumPy)
+        }
+        // partition_point = índice del primer borde > v ⇒ bin [edge[i-1], edge[i]).
+        let idx = edges.partition_point(|e| *e <= v);
+        let bin = if idx == 0 {
+            0
+        } else if idx > nbins {
+            nbins - 1 // v == último borde → bin cerrado [a, b]
+        } else {
+            idx - 1
+        };
+        counts[bin] += 1;
+    }
+    let mut out = indexmap::IndexMap::new();
+    out.insert(
+        "counts".to_string(),
+        crate::types::syn_list(counts.into_iter().map(syn_int).collect()),
+    );
+    out.insert(
+        "edges".to_string(),
+        crate::types::syn_list(edges.into_iter().map(syn_float).collect()),
+    );
+    Ok(crate::types::syn_map(out))
 }
 
 // =========================================================
