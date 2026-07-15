@@ -7,3 +7,17 @@ This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 The Apache 2.0 license grants rights to the code; it does not grant permission
 to use the project's name or marks. Forks and derivative works must use a
 different name.
+
+--------------------------------------------------------------------------
+Bundled font: DejaVu Sans
+--------------------------------------------------------------------------
+The Synsema binary embeds the DejaVu Sans typeface
+(engine/crates/synsema-stdlib/assets/DejaVuSans.ttf) so that SVG text
+rasterization (svg_to_png / svg_to_pdf) is deterministic across platforms.
+
+DejaVu fonts are (c) Bitstream, Inc. (Bitstream Vera Fonts Copyright);
+DejaVu changes are in the public domain; glyphs imported from the Arev
+fonts are (c) Tavmjong Bah. The full license text — whose copyright,
+trademark and permission notices must accompany all copies of the font —
+is included verbatim at:
+engine/crates/synsema-stdlib/assets/DejaVuSans-LICENSE.txt

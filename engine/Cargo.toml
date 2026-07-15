@@ -142,6 +142,20 @@ tokenizers = { version = "0.23", default-features = false, features = ["fancy-re
 # itoa/ryu/serde, cero `*-sys`) → preserva el binario único estático. Sólo la mecánica
 # de quoting/records; la conversión texto↔SynValue vive en synsema-core/src/csv.rs.
 csv = "1"
+# Export PNG/PDF (Batch 9): rasterización SVG (stack resvg, RazrFalcon/linebender) +
+# SVG→PDF vectorial (svg2pdf, ecosistema typst). TODO PURO-Rust, SIN C (cero `*-sys`).
+# `default-features = false` en resvg/usvg: fuera `system-fonts` (I/O de fuentes del SO,
+# rompería el determinismo multiplataforma G5 y metería I/O en un builtin puro) y fuera
+# `raster-images` (decodificado de <image> embebidas — features mínimas, doctrina M2/M3:
+# verificar lo que RESUELVE, no lo que promete). El texto SVG rasteriza con UNA fuente
+# embebida (DejaVu Sans vía include_bytes!, ver raster.rs; licencia en NOTICE).
+# Las versiones de resvg/usvg y svg2pdf deben compartir EL MISMO usvg (svg2pdf recibe el
+# usvg::Tree por tipo) — verificado con `cargo tree -p synsema-stdlib`.
+resvg = { version = "0.45", default-features = false, features = ["text"] }
+usvg = { version = "0.45", default-features = false, features = ["text"] }
+tiny-skia = "0.11"
+fontdb = { version = "0.23", default-features = false }
+svg2pdf = { version = "0.13", default-features = false, features = ["text"] }
 synsema-core = { path = "crates/synsema-core" }
 synsema-capabilities = { path = "crates/synsema-capabilities" }
 synsema-stdlib = { path = "crates/synsema-stdlib" }

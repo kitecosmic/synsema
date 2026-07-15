@@ -9,5 +9,6 @@ pub mod database;
 pub mod hashing;
 pub mod http;
 pub mod mimetypes;
+pub mod raster;
 pub mod secrets;
 pub mod server;

@@ -29,6 +29,12 @@ redis.workspace = true
 rand.workspace = true
 # Arrays (Batch 5): serializar `SynValue::Array` a JSON anidado en las respuestas serve.
 ndarray.workspace = true
+# Export PNG/PDF (Batch 9): svg_to_png/svg_to_pdf en raster.rs. Puro-Rust, sin C (ver workspace).
+resvg.workspace = true
+usvg.workspace = true
+tiny-skia.workspace = true
+fontdb.workspace = true
+svg2pdf.workspace = true
 # Feature `secret`: builtins env/secret/reveal/bearer + crypto (hmac_sha256/verify_hmac/
 # constant_time_eq). Todo puro-Rust (RustCrypto), sin C → binario único estático.
 # chrono ya está en el workspace (sin feature `clock`); se usa para el timestamp del audit.

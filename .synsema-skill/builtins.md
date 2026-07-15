@@ -224,6 +224,10 @@ Response helpers (set the HTTP status; body follows the response contract):
 ### Charts (pure — no capability; see [dataviz.md](dataviz.md))
 - `chart_svg(kind, data, opts?)` → **plain SVG text** (embed with `{ raw ... }`, serve with `respond(svg, "image/svg+xml")`, save with `write_file`). `kind`: `"bar"`/`"line"`/`"pie"`/`"scatter"`. Data: list of maps + `{x, y}` opts (rows from any source), map label→value, list of numbers, `[x,y]` pairs, or 1-D `array`. Opts: `title`, `x`/`y` (multi-series: `y` as list), `x_label`/`y_label`, `width`/`height`, `colors` (replaces the palette), `legend`, `background`. Deterministic; XSS-safe; colorblind-safe 8-color palette in fixed order — **>8 series/slices without custom `colors` → error** (colors are never cycled); NaN/inf in plotted values → error.
 
+### PNG / PDF export (pure — no capability; see [dataviz.md](dataviz.md))
+- `svg_to_png(svg, opts?)` → PNG **bytes** from ANY SVG text (deterministic: embedded font, no system fonts). Opts: `width`/`height` (one keeps aspect), `scale`, `background` (hex), `max_pixels` (overridable anti-DoS ceiling, default ~16.7M). External `<image href>` never fetched (no net/disk); `<script>` ignored; `secret` → error.
+- `svg_to_pdf(svg, opts?)` → single-page **vector** PDF bytes. Opts: `width`/`height` in points (both must match the SVG aspect ratio). Compose: `write_file(path, b)`, `give binary(b, "image/png"|"application/pdf")`.
+
 ## Cron (Scheduled Tasks)
 - `cron_every(seconds, task)` → job name (repeating background job)
 - `cron_after(seconds, task)` → job name (one-shot delayed execution)
