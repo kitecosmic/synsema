@@ -40,7 +40,8 @@ rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # Fecha/hora para los builtins de time (UTC). Sin feature `clock` → sin riesgo de C;
-# now() usa std::time. HTTP usa std::net (sin TLS por ahora); cron usa std::thread.
+# now() usa std::time. HTTP cliente: std::net + rustls para https (ver stdlib/src/http.rs);
+# cron usa std::thread.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 # SQLite estático (binario único, sin DLL). Compila C → requiere gcc (WinLibs en Windows).
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" width="640" height="360" role="img" font-family="system-ui, sans-serif">
+<title>Distribución</title>
+<text x="320" y="22" text-anchor="middle" font-size="14" font-weight="600" fill="#52514e">Distribución</text>
+<path d="M 254 191 L 254 42 A 149 149 0 1 1 189.35 325.24 Z" fill="#2a78d6"/>
+<path d="M 254 191 L 189.35 325.24 A 149 149 0 0 1 137.51 98.1 Z" fill="#008300"/>
+<path d="M 254 191 L 137.51 98.1 A 149 149 0 0 1 254 42 Z" fill="#e87ba4"/>
+<rect x="500" y="44" width="10" height="10" rx="2" fill="#2a78d6"/>
+<text x="515" y="53" font-size="11" fill="#52514e">a</text>
+<rect x="500" y="62" width="10" height="10" rx="2" fill="#008300"/>
+<text x="515" y="71" font-size="11" fill="#52514e">b</text>
+<rect x="500" y="80" width="10" height="10" rx="2" fill="#e87ba4"/>
+<text x="515" y="89" font-size="11" fill="#52514e">c</text>
+</svg>

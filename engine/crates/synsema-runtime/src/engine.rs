@@ -85,7 +85,17 @@ pub(crate) fn wire_common_with_state(
     synsema_stdlib::hashing::register_hash_builtins(interp);
     // cron/db/progress/memory: sus builtins clonan el Rc internamente → viven mientras
     // viva el intérprete.
-    register_cron_builtins(interp, Rc::new(CronScheduler::new()));
+    // Cron con ejecución REAL también bajo run/test/conform: el ejecutor toma un
+    // snapshot `Send` del programa en la registración y corre el task en el hilo del
+    // job con su propio intérprete (cacheado por hilo — misma maquinaria que serve).
+    // El scheduler arranca cada job al registrarlo; al dropear el intérprete se
+    // cancelan todos (fin del programa = fin de los jobs, sin hilos zombies).
+    let cron_sched = Arc::new(CronScheduler::new());
+    register_cron_builtins(
+        interp,
+        synsema_stdlib::cron::SchedRef::Strong(cron_sched.clone()),
+        crate::serve::run_mode_cron_executor(caps.clone(), secure, &cron_sched),
+    );
     register_database_builtins(interp, Rc::new(RefCell::new(DatabaseManager::new())), caps.clone());
     register_agent_builtins(interp, progress, memory);
     // Helpers de respuesta + vocabulario de contenido (ok/created/.../content). El

@@ -260,7 +260,8 @@ ClickHouse over HTTP) and query it with `fetch` — the index runs server-side, 
 
 ## Cron (Scheduled Tasks)
 
-Background scheduler. Non-blocking. Each task runs in its own thread.
+Background scheduler. Non-blocking. Each job runs its task for real on its own thread
+(parked between ticks — zero CPU); the counters in `cron_list()` reflect real executions.
 
 ```
 -- Repeat every N seconds
@@ -270,7 +271,7 @@ task sync_inventory()
 
 cron_every(300, sync_inventory)    -- every 5 minutes
 
--- One-shot after delay
+-- One-shot after delay (0 = right away)
 task send_reminder()
     log "Sending reminder"
 
@@ -282,10 +283,25 @@ let jobs be cron_list()            -- list all jobs
 print(cron_status())               -- formatted status
 ```
 
+Semantics (know these before reaching for cron):
+- The task must take **0 parameters** and be defined at the top level (the job runs it
+  by name). Required parameters → clear error **at registration**; wrap it instead.
+- **Intervals, not wall-clock cron**: fixed delay between the END of one run and the
+  start of the next. No `"0 9 * * MON"` expressions. A job never overlaps itself.
+- `cron_every` requires interval > 0; `cron_after` accepts delay ≥ 0.
+- Same name re-registered → **replaces** the old job (counters restart at 0).
+- Errors: `errors`+1, one log line (`[serve] [cron] job 'x' failed: …`), the job stays
+  scheduled and the process stays up. `run_count` counts COMPLETED runs only.
+- `cron_list()` entries: `{name, interval, repeating, active, run_count, errors}`.
+- In-memory, no persistence/catch-up: a restart re-registers with run_count = 0.
+- Under `serve`, jobs share the process state with routes (db, `state_*`, memory,
+  blackboard) and run with the program's capabilities; top-level jobs start once the
+  server is serving, and registering from a route works and is globally visible.
+
 ## Serve mode (keep crons alive)
 
-By default, when the program ends, cron jobs stop (daemon threads).
-Use `synsema serve` to keep the process alive:
+Under `run`, jobs execute while the program lives and stop when it ends. Use
+`synsema serve` to keep the process alive — even with no routes:
 
 ```bash
 synsema serve server.syn

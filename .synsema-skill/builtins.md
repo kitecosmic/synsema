@@ -229,10 +229,10 @@ Response helpers (set the HTTP status; body follows the response contract):
 - `svg_to_pdf(svg, opts?)` → single-page **vector** PDF bytes. Opts: `width`/`height` in points (both must match the SVG aspect ratio). Compose: `write_file(path, b)`, `give binary(b, "image/png"|"application/pdf")`.
 
 ## Cron (Scheduled Tasks)
-- `cron_every(seconds, task)` → job name (repeating background job)
-- `cron_after(seconds, task)` → job name (one-shot delayed execution)
+- `cron_every(seconds, task)` → job name (repeating; executes the task for real; interval must be > 0; task must take 0 params and exist at top level — validated at registration)
+- `cron_after(seconds, task)` → job name (one-shot; delay ≥ 0; same validation)
 - `cron_cancel(name)` → bool
-- `cron_list()` → list of job info maps
+- `cron_list()` → list of `{name, interval, repeating, active, run_count, errors}` — run_count = completed runs, errors = failed ticks (real counts, never phantom)
 - `cron_status()` → formatted text
 
 ## Agent operations

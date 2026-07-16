@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" width="640" height="360" role="img" font-family="system-ui, sans-serif">
+<title>Actividad</title>
+<text x="320" y="22" text-anchor="middle" font-size="14" font-weight="600" fill="#52514e">Actividad</text>
+<rect x="52" y="38" width="220" height="145" fill="#f1f6fd"/>
+<rect x="272" y="38" width="220" height="145" fill="#2a78d6"/>
+<rect x="52" y="183" width="220" height="145" fill="#123c6b"/>
+<text x="44" y="114" text-anchor="end" font-size="11" fill="#52514e">lun</text>
+<text x="44" y="259" text-anchor="end" font-size="11" fill="#52514e">mar</text>
+<text x="162" y="344" text-anchor="middle" font-size="11" fill="#52514e">9</text>
+<text x="382" y="344" text-anchor="middle" font-size="11" fill="#52514e">10</text>
+<rect x="500" y="159" width="12" height="5" fill="#e9f1fb"/>
+<rect x="500" y="154" width="12" height="5" fill="#d8e6f8"/>
+<rect x="500" y="149" width="12" height="5" fill="#c8dcf5"/>
+<rect x="500" y="144" width="12" height="5" fill="#b7d1f2"/>
+<rect x="500" y="139" width="12" height="5" fill="#a6c7ee"/>
+<rect x="500" y="134" width="12" height="5" fill="#96bceb"/>
+<rect x="500" y="129" width="12" height="5" fill="#85b2e8"/>
+<rect x="500" y="124" width="12" height="5" fill="#75a7e5"/>
+<rect x="500" y="119" width="12" height="5" fill="#649de1"/>
+<rect x="500" y="114" width="12" height="5" fill="#5392de"/>
+<rect x="500" y="109" width="12" height="5" fill="#4388db"/>
+<rect x="500" y="104" width="12" height="5" fill="#327dd8"/>
+<rect x="500" y="99" width="12" height="5" fill="#2976d2"/>
+<rect x="500" y="94" width="12" height="5" fill="#2771c9"/>
+<rect x="500" y="89" width="12" height="5" fill="#256cc0"/>
+<rect x="500" y="84" width="12" height="5" fill="#2367b7"/>
+<rect x="500" y="79" width="12" height="5" fill="#2162ae"/>
+<rect x="500" y="74" width="12" height="5" fill="#1f5da5"/>
+<rect x="500" y="69" width="12" height="5" fill="#1d589c"/>
+<rect x="500" y="64" width="12" height="5" fill="#1b5393"/>
+<rect x="500" y="59" width="12" height="5" fill="#194e8a"/>
+<rect x="500" y="54" width="12" height="5" fill="#174881"/>
+<rect x="500" y="49" width="12" height="5" fill="#154478"/>
+<rect x="500" y="44" width="12" height="5" fill="#133f6f"/>
+<text x="517" y="52" font-size="10" fill="#898781">9</text>
+<text x="517" y="164" font-size="10" fill="#898781">1</text>
+</svg>
