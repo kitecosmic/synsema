@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" width="640" height="360" role="img" font-family="system-ui, sans-serif">
+<title>Puente</title>
+<text x="320" y="22" text-anchor="middle" font-size="14" font-weight="600" fill="#52514e">Puente</text>
+<line x1="52" y1="328" x2="624" y2="328" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="331.5" text-anchor="end" font-size="11" fill="#898781">0</text>
+<line x1="52" y1="270" x2="624" y2="270" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="273.5" text-anchor="end" font-size="11" fill="#898781">20</text>
+<line x1="52" y1="212" x2="624" y2="212" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="215.5" text-anchor="end" font-size="11" fill="#898781">40</text>
+<line x1="52" y1="154" x2="624" y2="154" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="157.5" text-anchor="end" font-size="11" fill="#898781">60</text>
+<line x1="52" y1="96" x2="624" y2="96" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="99.5" text-anchor="end" font-size="11" fill="#898781">80</text>
+<line x1="52" y1="38" x2="624" y2="38" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="41.5" text-anchor="end" font-size="11" fill="#898781">100</text>
+<rect x="77.17" y="38" width="92.66" height="290" fill="#2a78d6"/>
+<rect x="220.17" y="38" width="92.66" height="116" fill="#eb6834"/>
+<rect x="363.17" y="154" width="92.66" height="72.5" fill="#eb6834"/>
+<rect x="506.17" y="226.5" width="92.66" height="101.5" fill="#52514e"/>
+<line x1="169.83" y1="38" x2="220.17" y2="38" stroke="#c3c2b7" stroke-width="1"/>
+<line x1="312.83" y1="154" x2="363.17" y2="154" stroke="#c3c2b7" stroke-width="1"/>
+<line x1="455.83" y1="226.5" x2="506.17" y2="226.5" stroke="#c3c2b7" stroke-width="1"/>
+<line x1="52" y1="328" x2="624" y2="328" stroke="#c3c2b7" stroke-width="1"/>
+<text x="123.5" y="344" text-anchor="middle" font-size="11" fill="#52514e">ventas</text>
+<text x="266.5" y="344" text-anchor="middle" font-size="11" fill="#52514e">costos</text>
+<text x="409.5" y="344" text-anchor="middle" font-size="11" fill="#52514e">gastos</text>
+<text x="552.5" y="344" text-anchor="middle" font-size="11" fill="#52514e">Total</text>
+</svg>

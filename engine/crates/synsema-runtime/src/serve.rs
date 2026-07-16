@@ -12,7 +12,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Callback de persistencia que se llama tras cada mutación de memoria desde
 /// un route handler. Encapsula el `StatePersistence` protegido por mutex.
@@ -51,6 +51,10 @@ use synsema_core::types::{
     SynTaskValue, SynValue,
 };
 use synsema_stdlib::acme;
+use synsema_stdlib::cron::{
+    register_cron_builtins, CronScheduler, ExecutorFactory as CronExecutorFactory, SchedRef,
+    Task as CronTask,
+};
 use synsema_stdlib::database::{register_database_builtins, DatabaseManager};
 use synsema_stdlib::server::{
     self, json_to_syn, serve_forever, AuthHandler, Ctx, Emitter, GiveOutcome, Handler, RouteSpec,
@@ -116,6 +120,320 @@ fn resolve_human_timeout(store: &synsema_stdlib::secrets::EnvStore) -> Option<f6
     crate::llm_providers::resolve_knob("SYNSEMA_HUMAN_TIMEOUT", store)
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|t| *t > 0.0)
+}
+
+/// Cola de aprobaciones "de fábrica" (aviso por el sink de logs, timeout del knob).
+/// La usan el camino serve (una por bloque) y los entornos de cron de run/serve-solo-jobs.
+fn default_approvals() -> ServeApprovals {
+    let store = synsema_stdlib::secrets::EnvStore::load_default();
+    Arc::new(ApprovalsShared {
+        queue: Arc::new(synsema_llm::human::QueueHandler::with_notice(serve_log_sink())),
+        default_timeout: resolve_human_timeout(&store),
+    })
+}
+
+// =========================================================
+// Cron real (ejecución de tasks Synsema desde el hilo del job)
+// =========================================================
+//
+// El problema de fondo: un task vive en un `Interpreter` (`Rc`, !Send) y no puede
+// cruzar al hilo del timer. La solución es la MISMA que serve usa para los requests:
+// el hilo de cada job construye (una vez, cacheado en su thread-local — espejo de
+// `SERVE_INTERPS`) su intérprete desde el snapshot `Send` del programa y ejecuta el
+// task POR NOMBRE en cada tick, con la limpieza por-ejecución y las caps del
+// preámbulo de `with_serve_interp`. Rendimiento: el hilo espera PARKED (cero CPU),
+// el intérprete se construye UNA vez por hilo de job (no por tick), y el lock del
+// scheduler jamás se sostiene durante un tick.
+
+/// Todo lo que el hilo de un job necesita para ejecutar su task como un request:
+/// snapshot del programa + estado compartido del proceso. Puros `Arc` (Send+Sync).
+#[derive(Clone)]
+pub(crate) struct CronExecEnv {
+    swarm: Arc<Swarm>,
+    snapshot: Arc<Vec<(String, GlobalVal)>>,
+    caps_snap: Arc<Vec<Capability>>,
+    shared_db: SharedDb,
+    rules_snap: Arc<Vec<OwnerRule>>,
+    shared_memory: SharedMemoryStore,
+    on_write: OnWriteFn,
+    shared_progress: SharedProgressStore,
+    on_write_progress: OnWriteProgressFn,
+    shared_state: SharedState,
+    approvals: ServeApprovals,
+    secure: bool,
+}
+
+/// Slot del entorno de ejecución: bajo serve se llena UNA vez (con el bind listo);
+/// bajo run se refresca en cada registración (snapshot del momento). Los hilos de
+/// job lo leen por tick (lectura de RwLock + clones de Arc — barato).
+pub(crate) type CronEnvSlot = Arc<RwLock<Option<CronExecEnv>>>;
+
+/// Wiring de cron de UN proceso: scheduler compartido (decisión: todos los workers
+/// ven los mismos jobs) + slot del entorno. La copia STRONG vive en el dueño del
+/// ciclo de vida (serve_inner / el intérprete principal de run); todo lo que quede
+/// dentro del scheduler o de los intérpretes de tick usa [`CronTickCtx`] (weak).
+#[derive(Clone)]
+pub(crate) struct CronWiring {
+    pub(crate) sched: Arc<CronScheduler>,
+    pub(crate) slot: CronEnvSlot,
+}
+
+impl CronWiring {
+    pub(crate) fn new_deferred() -> Self {
+        Self { sched: Arc::new(CronScheduler::deferred()), slot: Arc::new(RwLock::new(None)) }
+    }
+
+    fn tick_ctx(&self) -> CronTickCtx {
+        CronTickCtx { sched: Arc::downgrade(&self.sched), slot: self.slot.clone() }
+    }
+}
+
+/// Lo que captura el closure de un tick: `Weak` al scheduler — un task que retiene
+/// fuerte a su PROPIO scheduler sería un ciclo Arc (scheduler → job → task →
+/// scheduler): el Drop (y su `cancel_all`) jamás correría y los hilos de los jobs
+/// quedarían zombies al terminar un `run`.
+#[derive(Clone)]
+pub(crate) struct CronTickCtx {
+    sched: std::sync::Weak<CronScheduler>,
+    slot: CronEnvSlot,
+}
+
+/// Publica el entorno (si aún no hay uno — el primer `serve on` gana) y arranca los
+/// jobs pendientes. Orden obligatorio: primero el env, después `start()` — ningún
+/// tick corre sin entorno.
+fn arm_cron(cron: &CronWiring, env: CronExecEnv) {
+    {
+        let mut w = cron.slot.write().unwrap();
+        if w.is_none() {
+            *w = Some(env);
+        }
+    }
+    cron.sched.start();
+}
+
+/// Parámetros OBLIGATORIOS de un task (los que tienen default son opcionales).
+fn required_params(params: &[Param]) -> usize {
+    params.iter().filter(|p| p.default.is_none()).count()
+}
+
+/// Resuelve el argumento task de `cron_every`/`cron_after` contra el intérprete que
+/// registra. Errores EN LA REGISTRACIÓN (no en el tick — G5): debe ser un task (o su
+/// nombre), existir en el top-level (el tick lo ejecuta POR NOMBRE contra el snapshot
+/// del programa) y no exigir parámetros.
+fn resolve_cron_task(interp: &Interpreter, v: &SynValue, builtin: &str) -> Result<String, String> {
+    let name = match v {
+        SynValue::Task(t) => t.name.clone(),
+        SynValue::Builtin(b) => b.name.clone(),
+        SynValue::Text(s) => s.to_string(),
+        other => {
+            return Err(format!(
+                "{}: the task argument must be a task or a task name, got {}",
+                builtin,
+                other.type_name()
+            ))
+        }
+    };
+    let global = interp.global_env.borrow().bindings.get(&name).cloned();
+    match global {
+        Some(SynValue::Task(t)) => {
+            let required = required_params(&t.parameters);
+            if required > 0 {
+                return Err(format!(
+                    "{}: cron task '{}' takes {} parameter(s); cron tasks take none — wrap it in a zero-argument task",
+                    builtin, name, required
+                ));
+            }
+            Ok(name)
+        }
+        Some(SynValue::Builtin(b)) => {
+            if b.param_count > 0 {
+                return Err(format!(
+                    "{}: cron task '{}' takes {} parameter(s); cron tasks take none — wrap it in a zero-argument task",
+                    builtin, name, b.param_count
+                ));
+            }
+            Ok(name)
+        }
+        Some(other) => Err(format!(
+            "{}: '{}' is not a task (it is a {}); cron runs a zero-argument task by name",
+            builtin,
+            name,
+            other.type_name()
+        )),
+        // Un task local (definido dentro de otra task/handler) no sobrevive al tick:
+        // el job lo ejecuta por nombre contra el snapshot del programa.
+        None => Err(format!(
+            "{}: task '{}' is not defined at the top level; cron runs the task by name, so define it before scheduling it",
+            builtin, name
+        )),
+    }
+}
+
+/// Un tick: intérprete por hilo de job (cacheado en `SERVE_INTERPS` — misma
+/// maquinaria y limpieza que un request) + ejecución del task por nombre con 0
+/// argumentos. `Err(())` = terminó en error (ya logueado; el scheduler sólo cuenta).
+/// El intérprete del tick lleva los builtins de cron cableados al MISMO scheduler —
+/// un task puede registrar/cancelar otros jobs (visibles globalmente, sin deadlock:
+/// el lock de jobs no se sostiene durante la ejecución).
+fn run_cron_tick(
+    name: &str,
+    ctx: &CronTickCtx,
+    log: &Arc<dyn Fn(&str) + Send + Sync>,
+) -> Result<(), ()> {
+    // El scheduler se está dropeando (fin del programa) → la cancelación de este
+    // hilo es inminente; no hay nada que ejecutar ni nadie que observe el conteo.
+    let Some(sched) = ctx.sched.upgrade() else {
+        return Err(());
+    };
+    let cron = CronWiring { sched, slot: ctx.slot.clone() };
+    // Clonar el env FUERA del guard: un task largo no retiene el RwLock.
+    let env = match cron.slot.read() {
+        Ok(g) => g.clone(),
+        Err(_) => None,
+    };
+    let Some(env) = env else {
+        // No debería pasar (los hilos arrancan después de publicar el env). Si pasa,
+        // es un tick perdido VISIBLE — jamás un run_count fantasma (G3).
+        log(&format!("[cron] job '{}' ticked before the runtime was ready; tick skipped", name));
+        return Err(());
+    };
+    // Un panic dentro del tick NO puede matar el hilo del job en silencio (el job
+    // quedaría listado activo con los contadores congelados): se atrapa, se loguea y
+    // cuenta como error; el intérprete posiblemente corrupto ya quedó descartado
+    // (with_serve_interp no reinserta el base si `f` paniquea).
+    let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_cron_tick_inner(name, &env, &cron)
+    }));
+    match guarded {
+        Ok(outcome) => match outcome {
+            // Un `give`/`stop` al tope del task es un fin normal del tick.
+            Ok(_) | Err(Control::Give(_)) | Err(Control::Stop(_)) => Ok(()),
+            Err(Control::Error(e)) => {
+                // Una línea por tick fallido; el intervalo del job acota la tasa. El
+                // mensaje de runtime jamás trae plaintext de secrets (redacción del core).
+                log(&format!("[cron] job '{}' failed: {}", name, e.message));
+                Err(())
+            }
+        },
+        Err(_) => {
+            log(&format!(
+                "[cron] job '{}' panicked; the tick was aborted and the job stays scheduled",
+                name
+            ));
+            Err(())
+        }
+    }
+}
+
+/// El cuerpo del tick propiamente dicho (separado para poder envolverlo en
+/// `catch_unwind` sin anidar el logging).
+fn run_cron_tick_inner(
+    name: &str,
+    env: &CronExecEnv,
+    cron: &CronWiring,
+) -> Result<SynValue, Control> {
+    with_serve_interp(
+        &env.swarm,
+        &env.snapshot,
+        &env.caps_snap,
+        &env.shared_db,
+        &env.rules_snap,
+        &env.shared_memory,
+        &env.on_write,
+        &env.shared_progress,
+        &env.on_write_progress,
+        &env.shared_state,
+        &env.approvals,
+        cron,
+        env.secure,
+        |interp| {
+            let task = interp.global_env.borrow().bindings.get(name).cloned();
+            match task {
+                Some(t @ (SynValue::Task(_) | SynValue::Builtin(_))) => {
+                    interp.call_task(t, Vec::new())
+                }
+                Some(other) => Err(Control::Error(RuntimeError::new(format!(
+                    "cron job '{}' no longer resolves to a task (it is a {})",
+                    name,
+                    other.type_name()
+                )))),
+                None => Err(Control::Error(RuntimeError::new(format!(
+                    "cron job '{}' is not defined in the program snapshot",
+                    name
+                )))),
+            }
+        },
+    )
+}
+
+/// Factory del ejecutor sobre un wiring COMPARTIDO (el mismo para el top-level de
+/// serve, los workers y los intérpretes de tick): valida en la registración y arma
+/// el closure del tick. Captura sólo el contexto weak — jamás retiene fuerte al
+/// scheduler dentro de un intérprete de tick.
+pub(crate) fn shared_cron_executor(ctx: CronTickCtx, log: Arc<dyn Fn(&str) + Send + Sync>) -> CronExecutorFactory {
+    Rc::new(move |interp, v, builtin| {
+        let name = resolve_cron_task(interp, v, builtin)?;
+        let ctx = ctx.clone();
+        let log = log.clone();
+        let n = name.clone();
+        let task: CronTask = Box::new(move || run_cron_tick(&n, &ctx, &log));
+        Ok((name, task))
+    })
+}
+
+/// Factory del ejecutor bajo run/test/conform: mismo esquema que serve (snapshot
+/// `Send` → intérprete propio en el hilo del job), con el snapshot tomado en la
+/// REGISTRACIÓN y estado compartido fresco del modo (los jobs de un mismo programa
+/// comparten stores entre sí; el estado del intérprete principal no cruza — la
+/// frontera documentada son archivos/db/blackboard).
+pub(crate) fn run_mode_cron_executor(
+    caps: Rc<RefCell<CapabilitySet>>,
+    secure: bool,
+    sched: &Arc<CronScheduler>,
+) -> CronExecutorFactory {
+    // Compartidos entre TODOS los jobs registrados por este intérprete. El contexto
+    // lleva (weak) el MISMO scheduler que registró el intérprete principal: un task
+    // de cron que registra otro cron es visible en cron_list() y ejecuta.
+    let ctx = CronTickCtx { sched: Arc::downgrade(sched), slot: Arc::new(RwLock::new(None)) };
+    let swarm: Arc<Swarm> = Arc::new(Swarm::new());
+    let shared_db: SharedDb = Arc::new(Mutex::new(DatabaseManager::new()));
+    let shared_memory: SharedMemoryStore = Arc::new(Mutex::new(AgentMemory::new()));
+    let shared_progress: SharedProgressStore = Arc::new(Mutex::new(ProgressManager::new()));
+    let shared_state: SharedState = Arc::new(Mutex::new(HashMap::new()));
+    let log: Arc<dyn Fn(&str) + Send + Sync> =
+        Arc::new(|line: &str| eprintln!("[synsema] {line}"));
+    // Sin leer `.env` acá: este factory se construye por CADA intérprete (wire_common)
+    // y la I/O sería un costo fijo por worker. La cola aplica su default (300 s).
+    let approvals: ServeApprovals = Arc::new(ApprovalsShared {
+        queue: Arc::new(synsema_llm::human::QueueHandler::with_notice(log.clone())),
+        default_timeout: None,
+    });
+    Rc::new(move |interp, v, builtin| {
+        let name = resolve_cron_task(interp, v, builtin)?;
+        // Refrescar el snapshot en cada registración: los jobs ven el mundo del
+        // momento en que el ÚLTIMO fue registrado (los stores compartidos son los
+        // mismos Arc — el cache por-hilo se renueva solo al cambiar el snapshot).
+        let env = CronExecEnv {
+            swarm: swarm.clone(),
+            snapshot: snapshot_globals(interp),
+            caps_snap: Arc::new(caps.borrow().granted.iter().cloned().collect()),
+            shared_db: shared_db.clone(),
+            rules_snap: Arc::new(Vec::new()),
+            shared_memory: shared_memory.clone(),
+            on_write: Arc::new(|_| {}),
+            shared_progress: shared_progress.clone(),
+            on_write_progress: Arc::new(|_| {}),
+            shared_state: shared_state.clone(),
+            approvals: approvals.clone(),
+            secure,
+        };
+        *ctx.slot.write().unwrap() = Some(env);
+        let ctx = ctx.clone();
+        let log = log.clone();
+        let n = name.clone();
+        let task: CronTask = Box::new(move || run_cron_tick(&n, &ctx, &log));
+        Ok((name, task))
+    })
 }
 
 // =========================================================
@@ -754,6 +1072,7 @@ fn serve_log_sink() -> Arc<dyn Fn(&str) + Send + Sync> {
 /// `with_serve_interp`), no por request. Devuelve el `CapabilitySet` para poder
 /// resetearlo entre requests (los grants del preámbulo, vía el `Rc` que capturan los
 /// builtins gateados: secret/env/reveal/fetch/…).
+#[allow(clippy::too_many_arguments)]
 fn build_base_interp(
     swarm: Arc<Swarm>,
     snapshot: &[(String, GlobalVal)],
@@ -766,6 +1085,7 @@ fn build_base_interp(
     on_write_progress: &OnWriteProgressFn,
     shared_state: &SharedState,
     approvals: &ServeApprovals,
+    cron: &CronWiring,
     secure: bool,
 ) -> (Interpreter, Rc<RefCell<CapabilitySet>>) {
     let mut interp = Interpreter::new();
@@ -812,6 +1132,16 @@ fn build_base_interp(
     register_serve_progress_builtins(&interp, shared_progress.clone(), on_write_progress.clone());
     // Registrar los builtins de estado compartido (state_set/state_get/state_incr/…).
     register_serve_state_builtins(&interp, shared_state.clone());
+    // Cron del PROCESO (ejecución real): sobrescribe el scheduler fresco de
+    // wire_common con el compartido del serve — un `cron_every` desde una ruta es
+    // visible (y ejecuta) globalmente, no en una isla por-worker. WEAK: este
+    // intérprete puede vivir en el thread-local de un hilo de tick; una referencia
+    // fuerte acá sería el ciclo scheduler → job → interp → scheduler.
+    register_cron_builtins(
+        &interp,
+        SchedRef::Weak(Arc::downgrade(&cron.sched)),
+        shared_cron_executor(cron.tick_ctx(), serve_log_sink()),
+    );
     {
         let mut c = caps.borrow_mut();
         for cap in caps_snap {
@@ -830,6 +1160,10 @@ fn build_base_interp(
 struct BaseInterp {
     interp: Interpreter,
     caps: Rc<RefCell<CapabilitySet>>,
+    /// Pinnea el snapshot mientras la entrada viva en el cache: la clave del cache es
+    /// la DIRECCIÓN del Arc — si el snapshot se liberara, otro Arc podría alocarse en
+    /// la misma dirección y colisionar con este intérprete (construido de otro mundo).
+    _snapshot: Arc<Vec<(String, GlobalVal)>>,
 }
 
 thread_local! {
@@ -846,6 +1180,7 @@ thread_local! {
 /// este worker, reusándolo después). Tras `f`, restaura el estado por-request del
 /// intérprete y las capabilities al snapshot del preámbulo → el próximo request
 /// arranca aislado (un `require`/print/share dentro de un handler no se filtra).
+#[allow(clippy::too_many_arguments)]
 fn with_serve_interp<R>(
     swarm: &Arc<Swarm>,
     snapshot: &Arc<Vec<(String, GlobalVal)>>,
@@ -858,6 +1193,7 @@ fn with_serve_interp<R>(
     on_write_progress: &OnWriteProgressFn,
     shared_state: &SharedState,
     approvals: &ServeApprovals,
+    cron: &CronWiring,
     secure: bool,
     f: impl FnOnce(&mut Interpreter) -> R,
 ) -> R {
@@ -877,9 +1213,10 @@ fn with_serve_interp<R>(
             on_write_progress,
             shared_state,
             approvals,
+            cron,
             secure,
         );
-        BaseInterp { interp, caps }
+        BaseInterp { interp, caps, _snapshot: snapshot.clone() }
     });
 
     let out = f(&mut base.interp);
@@ -987,6 +1324,7 @@ fn request_bindings(ctx: &Ctx) -> Vec<(String, SynValue)> {
 }
 
 /// Corre el cuerpo de una ruta normal; captura el `give`-value.
+#[allow(clippy::too_many_arguments)]
 fn run_route(
     swarm: &Arc<Swarm>,
     snapshot: &Arc<Vec<(String, GlobalVal)>>,
@@ -999,11 +1337,12 @@ fn run_route(
     on_write_progress: &OnWriteProgressFn,
     shared_state: &SharedState,
     approvals: &ServeApprovals,
+    cron: &CronWiring,
     body: &[Node],
     ctx: &Ctx,
     secure: bool,
 ) -> GiveOutcome {
-    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, secure, |interp| {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, |interp| {
         match interp.run_request_block(body, request_bindings(ctx)) {
             Ok(_) => GiveOutcome::Give(None),
             Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
@@ -1025,6 +1364,7 @@ const CLIENT_GONE: &str = "__client_gone__";
 /// Corre el cuerpo de una ruta de streaming SSE: `send` emite vía el `Emitter`. Un
 /// `give` (o el fin del cuerpo) termina el stream limpio; un fallo de escritura
 /// (cliente desconectado) lo desenrolla.
+#[allow(clippy::too_many_arguments)]
 fn run_stream(
     swarm: &Arc<Swarm>,
     snapshot: &Arc<Vec<(String, GlobalVal)>>,
@@ -1037,12 +1377,13 @@ fn run_stream(
     on_write_progress: &OnWriteProgressFn,
     shared_state: &SharedState,
     approvals: &ServeApprovals,
+    cron: &CronWiring,
     body: &[Node],
     ctx: &Ctx,
     secure: bool,
     emit: Emitter,
 ) -> StreamEnd {
-    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, secure, move |interp| {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, move |interp| {
         let cell = Rc::new(RefCell::new(emit));
         let ec = cell.clone();
         interp.set_stream_emit(Rc::new(move |val: SynValue, event: Option<&str>| {
@@ -1142,6 +1483,7 @@ fn build_host_table(
     on_write_progress: &OnWriteProgressFn,
     shared_state: &SharedState,
     approvals: &ServeApprovals,
+    cron: &CronWiring,
     swarm: &Arc<Swarm>,
     shared_db: &SharedDb,
     secure: bool,
@@ -1181,9 +1523,10 @@ fn build_host_table(
         let owp_a = on_write_progress.clone();
         let st_a = shared_state.clone();
         let ap_a = approvals.clone();
+        let cron_a = cron.clone();
         let db_a = shared_db.clone();
         let h: AuthHandler = Arc::new(move |token: &str| -> Option<SynValue> {
-            with_serve_interp(&swarm_a, &snap_a, &caps_a, &db_a, &rules_a, &mem_a, &ow_a, &prog_a, &owp_a, &st_a, &ap_a, secure, |interp| {
+            with_serve_interp(&swarm_a, &snap_a, &caps_a, &db_a, &rules_a, &mem_a, &ow_a, &prog_a, &owp_a, &st_a, &ap_a, &cron_a, secure, |interp| {
                 let genv = interp.global_env.clone();
                 let task = match interp.eval(&auth_node, &genv) {
                     Ok(t) => t,
@@ -1245,9 +1588,10 @@ fn build_host_table(
             let owp_c = on_write_progress.clone();
             let st_c = shared_state.clone();
             let ap_c = approvals.clone();
+            let cron_c = cron.clone();
             let db_c = shared_db.clone();
             let handler: Handler = Arc::new(move |ctx: &Ctx| {
-                run_route(&swarm_c, &snap_c, &caps_c, &db_c, &rules_c, &mem_c, &ow_c, &prog_c, &owp_c, &st_c, &ap_c, &body_c, ctx, secure)
+                run_route(&swarm_c, &snap_c, &caps_c, &db_c, &rules_c, &mem_c, &ow_c, &prog_c, &owp_c, &st_c, &ap_c, &cron_c, &body_c, ctx, secure)
             });
 
             let stream_handler: Option<StreamHandler> = if *streaming {
@@ -1262,10 +1606,11 @@ fn build_host_table(
                 let owp_s = on_write_progress.clone();
                 let st_s = shared_state.clone();
                 let ap_s = approvals.clone();
+                let cron_s = cron.clone();
                 let db_s = shared_db.clone();
                 Some(Arc::new(move |ctx: &Ctx, emit: Emitter| {
                     run_stream(
-                        &swarm_s, &snap_s, &caps_s, &db_s, &rules_s, &mem_s, &ow_s, &prog_s, &owp_s, &st_s, &ap_s, &body_s, ctx, secure, emit,
+                        &swarm_s, &snap_s, &caps_s, &db_s, &rules_s, &mem_s, &ow_s, &prog_s, &owp_s, &st_s, &ap_s, &cron_s, &body_s, ctx, secure, emit,
                     )
                 }))
             } else {
@@ -1290,6 +1635,7 @@ fn build_host_table(
 }
 
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn make_serve_hook(
     caps: Rc<RefCell<CapabilitySet>>,
     swarm: Arc<Swarm>,
@@ -1303,6 +1649,7 @@ fn make_serve_hook(
     shared_progress: SharedProgressStore,
     on_write_progress: OnWriteProgressFn,
     shared_state: SharedState,
+    cron: CronWiring,
 ) -> ServeHook {
     Rc::new(move |interp, node, env| {
         let (
@@ -1525,6 +1872,7 @@ fn make_serve_hook(
             &on_write_progress,
             &shared_state,
             &approvals,
+            &cron,
             &swarm,
             &shared_db,
             secure,
@@ -1567,6 +1915,7 @@ fn make_serve_hook(
                     &on_write_progress,
                     &shared_state,
                     &approvals,
+                    &cron,
                     &swarm,
                     &shared_db,
                     secure,
@@ -1719,6 +2068,26 @@ fn make_serve_hook(
         let scheme = if use_tls { "HTTPS" } else { "HTTP" };
         println!("Serving {} on port {} ({} route(s))", scheme, port_str, n_routes);
         let rt = Arc::new(runtime);
+
+        // Cron real: con el bind YA listo, publicar el entorno de ejecución (snapshot
+        // + estado compartido del proceso — el mismo que ve un worker) y arrancar los
+        // jobs del top-level que quedaron diferidos. Ningún tick corre contra un
+        // server a medio levantar; los jobs registrados desde rutas arrancan solos.
+        let cron_env = CronExecEnv {
+            swarm: swarm.clone(),
+            snapshot: snapshot.clone(),
+            caps_snap: caps_snap.clone(),
+            shared_db: shared_db.clone(),
+            rules_snap: rules_snap.clone(),
+            shared_memory: shared_memory.clone(),
+            on_write: on_write.clone(),
+            shared_progress: shared_progress.clone(),
+            on_write_progress: on_write_progress.clone(),
+            shared_state: shared_state.clone(),
+            approvals: approvals.clone(),
+            secure,
+        };
+        arm_cron(&cron, cron_env);
 
         // auto-HTTPS: levanta el listener de challenge (HTTP-01 + 301), obtiene/carga
         // el cert (bloquea hasta tenerlo) y sirve HTTPS con hot-swap en renovación.
@@ -1927,6 +2296,16 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     // Registrar los builtins de estado también en el top-level (para que puedan
     // inicializar valores antes del `serve on PORT`).
     register_serve_state_builtins(&interp, shared_state.clone());
+    // Cron del PROCESO (ejecución real): UN scheduler compartido por todos los
+    // intérpretes (top-level + workers) — decisión "un solo scheduler". Nace
+    // DIFERIDO: los jobs del top-level arrancan recién con el bind listo (o al
+    // final del top-level si el programa no tiene `serve on` — camino solo-jobs).
+    let cron = CronWiring::new_deferred();
+    register_cron_builtins(
+        &interp,
+        SchedRef::Strong(cron.sched.clone()),
+        shared_cron_executor(cron.tick_ctx(), serve_log_sink()),
+    );
 
     let servers: Servers = Arc::new(Mutex::new(Vec::new()));
     interp.set_serve_hook(make_serve_hook(
@@ -1936,12 +2315,13 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         servers.clone(),
         secure,
         overrides,
-        top_level_memory,
-        shared_memory,
-        persist_memory,
-        shared_progress,
-        persist_progress,
-        shared_state,
+        top_level_memory.clone(),
+        shared_memory.clone(),
+        persist_memory.clone(),
+        shared_progress.clone(),
+        persist_progress.clone(),
+        shared_state.clone(),
+        cron.clone(),
     ));
 
     let r = interp.execute(&program);
@@ -1958,7 +2338,36 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
 
     let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *servers.lock().unwrap());
     if handles.is_empty() {
-        // Sin server: resultado normal (un programa serve sin bloque serve válido).
+        // Sin rutas pero CON jobs de cron → proceso vivo con los jobs ejecutando
+        // (la promesa documentada de `synsema serve` para programas solo-cron).
+        let n_jobs = cron.sched.job_count();
+        if n_jobs > 0 && r.is_ok() {
+            let rules_snap: Arc<Vec<OwnerRule>> =
+                Arc::new(top_level_memory.borrow().rules.values().cloned().collect());
+            let env = CronExecEnv {
+                swarm,
+                snapshot: snapshot_globals(&interp),
+                caps_snap: Arc::new(caps.borrow().granted.iter().cloned().collect()),
+                shared_db,
+                rules_snap,
+                shared_memory,
+                on_write: persist_memory,
+                shared_progress,
+                on_write_progress: persist_progress,
+                shared_state,
+                approvals: default_approvals(),
+                secure,
+            };
+            arm_cron(&cron, env);
+            println!("Serving {} cron job(s). Press Ctrl+C to stop.", n_jobs);
+            // Bloquea para siempre (como el join de los servers): los hilos de los
+            // jobs trabajan; este hilo espera PARKED (cero CPU) hasta que maten el
+            // proceso (Ctrl+C). Los wakeups espurios de park() sólo re-parkean.
+            loop {
+                std::thread::park();
+            }
+        }
+        // Sin server ni jobs: resultado normal (un programa serve sin bloque serve válido).
         return match r {
             Ok(_) => RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() },
             Err(_) => RunResult {

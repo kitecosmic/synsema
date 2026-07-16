@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" width="640" height="360" role="img" font-family="system-ui, sans-serif">
+<line x1="52" y1="328" x2="624" y2="328" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="331.5" text-anchor="end" font-size="11" fill="#898781">0</text>
+<line x1="52" y1="222.67" x2="624" y2="222.67" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="226.17" text-anchor="end" font-size="11" fill="#898781">1</text>
+<line x1="52" y1="117.33" x2="624" y2="117.33" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="120.83" text-anchor="end" font-size="11" fill="#898781">2</text>
+<line x1="52" y1="12" x2="624" y2="12" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="15.5" text-anchor="end" font-size="11" fill="#898781">3</text>
+<text x="52" y="344" text-anchor="middle" font-size="11" fill="#898781">1</text>
+<text x="195" y="344" text-anchor="middle" font-size="11" fill="#898781">3</text>
+<text x="338" y="344" text-anchor="middle" font-size="11" fill="#898781">5</text>
+<text x="481" y="344" text-anchor="middle" font-size="11" fill="#898781">7</text>
+<text x="624" y="344" text-anchor="middle" font-size="11" fill="#898781">9</text>
+<rect x="52" y="12" width="143" height="316" fill="#2a78d6"/>
+<rect x="195" y="12" width="143" height="316" fill="#2a78d6"/>
+<rect x="338" y="328" width="143" height="0" fill="#2a78d6"/>
+<rect x="481" y="222.67" width="143" height="105.33" fill="#2a78d6"/>
+<line x1="52" y1="328" x2="624" y2="328" stroke="#c3c2b7" stroke-width="1"/>
+</svg>

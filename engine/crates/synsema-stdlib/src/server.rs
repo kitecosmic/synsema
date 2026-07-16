@@ -1979,7 +1979,9 @@ fn node_to_json(node: &SynValue) -> Json {
                 ),
             ),
         ]),
-        // chart() (Batch 8): series estructuradas — el agente obtiene los DATOS.
+        // chart() (Batch 8/10): datos estructurados por kind — el agente obtiene
+        // los DATOS (§3.7). Los campos por kind salen de charts::chart_data_fields
+        // (match exhaustivo sobre Kind: un kind nuevo sin salida JSON no compila).
         "chart" => {
             let mut pairs: Vec<(String, Json)> = vec![
                 ("type".to_string(), Json::Str("chart".into())),
@@ -1992,10 +1994,9 @@ fn node_to_json(node: &SynValue) -> Json {
                     }
                 }
             }
-            let series = node_field(node, "series")
-                .map(|s| syn_to_json(&s))
-                .unwrap_or(Json::Array(Vec::new()));
-            pairs.push(("series".to_string(), series));
+            for (key, val) in crate::charts::chart_data_fields(node) {
+                pairs.push((key.to_string(), syn_to_json(&val)));
+            }
             Json::Object(pairs)
         }
         _ => {

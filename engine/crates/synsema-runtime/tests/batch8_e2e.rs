@@ -127,10 +127,10 @@ recover err
 print(contains(msg, "data is empty"))
 let msg2 be ""
 try
-    chart_svg("area", [1])
+    chart_svg("treemap", [1])
 recover err
     set msg2 to err
-print(contains(msg2, "bar, line, pie, scatter"))
+print(contains(msg2, "valid kinds"))
 print("sigue vivo")"#,
     );
     assert_eq!(o, vec!["true", "true", "sigue vivo"]);

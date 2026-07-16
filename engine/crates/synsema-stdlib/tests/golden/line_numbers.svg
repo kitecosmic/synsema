@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" width="640" height="360" role="img" font-family="system-ui, sans-serif">
+<line x1="52" y1="328" x2="624" y2="328" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="331.5" text-anchor="end" font-size="11" fill="#898781">1</text>
+<line x1="52" y1="249" x2="624" y2="249" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="252.5" text-anchor="end" font-size="11" fill="#898781">1.5</text>
+<line x1="52" y1="170" x2="624" y2="170" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="173.5" text-anchor="end" font-size="11" fill="#898781">2</text>
+<line x1="52" y1="91" x2="624" y2="91" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="94.5" text-anchor="end" font-size="11" fill="#898781">2.5</text>
+<line x1="52" y1="12" x2="624" y2="12" stroke="#e1e0d9" stroke-width="1"/>
+<text x="44" y="15.5" text-anchor="end" font-size="11" fill="#898781">3</text>
+<text x="52" y="344" text-anchor="middle" font-size="11" fill="#898781">0</text>
+<text x="195" y="344" text-anchor="middle" font-size="11" fill="#898781">0.5</text>
+<text x="338" y="344" text-anchor="middle" font-size="11" fill="#898781">1</text>
+<text x="481" y="344" text-anchor="middle" font-size="11" fill="#898781">1.5</text>
+<text x="624" y="344" text-anchor="middle" font-size="11" fill="#898781">2</text>
+<line x1="52" y1="328" x2="624" y2="328" stroke="#c3c2b7" stroke-width="1"/>
+<polyline points="52,328 338,170 624,12" fill="none" stroke="#2a78d6" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>
