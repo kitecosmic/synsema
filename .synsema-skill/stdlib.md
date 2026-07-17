@@ -313,13 +313,65 @@ synsema serve server.syn
 # Serving 3 cron job(s). Press Ctrl+C to stop.
 ```
 
+## Blockchain (sign & verify — ETH/Avalanche/Solana/Algorand)
+
+Operate on-chain from an agent with the private key sealed as a `secret` that NEVER
+materializes. The differentiator is signing/custody, not reading the chain.
+
+```
+require sign("HOT_KEY")   -- signing is deny-by-default + audited (NOT ambient)
+let k be as_secret("<hex>", "HOT_KEY")   -- or secret("HOT_KEY") from .env
+
+-- ETH: build EIP-1559 payload (0x02 || rlp([...])), keccak, sign, recover
+let fields be [chainId, nonce, maxPrio, maxFee, gas, to, value, data, []]
+let digest be keccak256(bytes([2]) + rlp_encode(fields))
+let sig be secp256k1_sign(digest, k)             -- bytes(65) r‖s‖v; RFC6979, low-s
+let pub be secp256k1_recover(digest, sig)        -- ecrecover
+print(eth_address(k))                            -- EIP-55 checksummed address
+-- signed raw tx, ready to broadcast: r/s go in as INTEGERS (bytes_to_int), not blobs
+let raw be bytes([2]) + rlp_encode(fields + [sig[64], bytes_to_int(slice(sig, 0, 32)), bytes_to_int(slice(sig, 32, 64))])
+
+-- Solana/Algorand: ed25519 signs the RAW message
+let sig2 be ed25519_sign("transfer 10", k)
+print(decode(ed25519_pubkey(k), "base58"))       -- Solana address
+```
+
+Builtins:
+- Hashes (pure): `keccak256(x)`/`sha512_256(x)` → bytes(32). ⚠️ keccak256 is PRE-NIST
+  Keccak (Ethereum), NOT SHA3-256 — `keccak256("")` = `c5d24601…`, not `a7ffc6f8…`.
+- Encoding (pure): `bytes(t, "base58"|"base32")` / `decode(b, …)`; `bech32_encode(hrp, data, variant?)` / `bech32_decode(text)` → `{hrp, data, variant}`.
+- secp256k1: `secp256k1_sign(digest32, secret)` [**require sign**], `secp256k1_verify(digest, sig, pubkey)`, `secp256k1_recover(digest, sig65)`, `secp256k1_pubkey(secret, compressed?)`.
+- ed25519: `ed25519_sign(message, secret)` [**require sign**], `ed25519_verify(msg, sig, pubkey)`, `ed25519_pubkey(secret)`.
+- EVM (pure): `eth_address(pubkey_or_secret)` → EIP-55 text; `rlp_encode(value)` / `rlp_decode(bytes)`.
+
+**Instinct vs. reality (money code — get these right):**
+- keccak256 ≠ SHA3-256 (different padding). Use `keccak256`, not any SHA3.
+- ed25519 signs the RAW message (hashes internally, RFC 8032) — do NOT pre-hash.
+  secp256k1 takes a 32-byte digest; ed25519 takes the message.
+- In the signed tx, r/s are RLP **integers** (minimal, leading zeros stripped), NOT
+  32-byte blobs — pasting `slice(sig, 0, 32)` raw makes ~1 in 128 txs invalid. Use
+  `bytes_to_int(slice(sig, 0, 32))`; `int_to_bytes(n, 32)` restores the fixed width.
+- Strict by default: `rlp_decode` rejects non-canonical encodings (like Ethereum's
+  decoders); `ed25519_verify` is verify-strict (rejects small-order keys — what the
+  chains reject). If either says no, the input is malformed, not the builtin.
+- Signing needs `require sign("KEY_NAME")` (scoped to the secret's name) + writes an
+  audit entry; deny-by-default; DENIED inside `sandbox`. Everything else is pure.
+- The key is a `secret`, never a plain string. A text secret = hex (with/without 0x);
+  a bytes secret = raw. Errors describe size/shape, never the key value.
+- A top-level `secret` is REDACTED when it crosses into a cron job / spawned agent
+  (safe, unusable there) — resolve the key INSIDE the task body.
+- All pure-Rust (k256/ed25519-dalek/sha3/bech32), zero `*-sys`. Chains: ETH + Avalanche-C
+  end-to-end; Avalanche X/P, Solana, Algorand signable (tx serialization = future).
+
 ## Capabilities
 
-HTTP requires `net` capability. Database requires `db` capability.
+HTTP requires `net` capability. Database requires `db` capability. Signing requires
+`sign(KEY_NAME)` capability.
 
 ```
 require net("api.store.com")
 require db("./store.db")
+require sign("HOT_KEY")
 ```
 
 ## Platform

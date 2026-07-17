@@ -724,6 +724,8 @@ impl Interpreter {
         self.register("bytes", -1, Rc::new(|i, a, l| i.b_bytes(a, l)));
         self.register("decode", -1, Rc::new(|i, a, l| i.b_decode(a, l)));
         self.register("is_bytes", 1, Rc::new(|i, a, l| i.b_is_bytes(a, l)));
+        self.register("bytes_to_int", 1, Rc::new(|i, a, l| i.b_bytes_to_int(a, l)));
+        self.register("int_to_bytes", -1, Rc::new(|i, a, l| i.b_int_to_bytes(a, l)));
         // Aserciones (test framework, Batch 3). PUROS; al fallar producen un error
         // marcado `is_assertion`. Funcionan en cualquier parte (checks defensivos, G3).
         self.register("assert", -1, Rc::new(|i, a, l| i.b_assert(a, l)));
@@ -2585,6 +2587,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// - `bytes(text)` / `bytes(text, "utf8")` → UTF-8 del texto.
     /// - `bytes(text, "hex")` → decodifica hex (error si longitud impar o char no-hex).
     /// - `bytes(text, "base64")` → decodifica base64 RFC-4648 con padding (error si inválido).
+    /// - `bytes(text, "base58")` → decodifica base58 (Bitcoin/Solana; error si char inválido).
+    /// - `bytes(text, "base32")` → decodifica base32 RFC-4648 (Algorand; error si inválido).
     /// - `bytes(list)` → de una lista de enteros (error si algún elemento no es int 0..=255).
     /// - `bytes(bytes)` → identidad (clona el `Rc`).
     /// - `bytes(secret)` → ERROR (G6: el plaintext no se extrae a bytes).
@@ -2603,8 +2607,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     "utf8" => Ok(syn_bytes(s.as_bytes().to_vec())),
                     "hex" => crate::bytesutil::hex_decode(s).map(syn_bytes).map_err(err),
                     "base64" => crate::bytesutil::b64_decode(s).map(syn_bytes).map_err(err),
+                    // Batch 11 (blockchain): base58 de Bitcoin/Solana; base32 RFC 4648
+                    // (mayúsculas sin padding — convención Algorand).
+                    "base58" => crate::bytesutil::base58_decode(s).map(syn_bytes).map_err(err),
+                    "base32" => crate::bytesutil::base32_decode(s).map(syn_bytes).map_err(err),
                     other => Err(err(format!(
-                        "unsupported encoding {:?} for bytes(); use one of: utf8, hex, base64",
+                        "unsupported encoding {:?} for bytes(); use one of: utf8, hex, base64, base58, base32",
                         other
                     ))),
                 }
@@ -2638,6 +2646,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// - `decode(bytes, "utf8_lossy")` → texto con `U+FFFD` en inválidos.
     /// - `decode(bytes, "hex")` → texto hex en minúsculas.
     /// - `decode(bytes, "base64")` → texto base64 con padding.
+    /// - `decode(bytes, "base58")` → texto base58 (Bitcoin/Solana).
+    /// - `decode(bytes, "base32")` → texto base32 RFC-4648 mayúsculas sin padding (Algorand).
     /// - `decode(secret)` → ERROR (G6; cae al error de tipo: un secret no es bytes).
     fn b_decode(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
         if args.is_empty() || args.len() > 2 {
@@ -2659,8 +2669,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             "utf8_lossy" => Ok(syn_text(String::from_utf8_lossy(b).into_owned())),
             "hex" => Ok(syn_text(crate::bytesutil::hex_encode(b))),
             "base64" => Ok(syn_text(crate::bytesutil::b64_encode(b))),
+            // Batch 11 (blockchain): base58 (Solana/Bitcoin) y base32 RFC 4648
+            // mayúsculas sin padding (Algorand).
+            "base58" => Ok(syn_text(crate::bytesutil::base58_encode(b))),
+            "base32" => Ok(syn_text(crate::bytesutil::base32_encode(b))),
             other => Err(err(format!(
-                "unsupported encoding {:?} for decode(); use one of: utf8, utf8_lossy, hex, base64",
+                "unsupported encoding {:?} for decode(); use one of: utf8, utf8_lossy, hex, base64, base58, base32",
                 other
             ))),
         }
@@ -2669,6 +2683,63 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// `is_bytes(x)` → true sólo si `x` es bytes.
     fn b_is_bytes(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
         Ok(syn_bool(matches!(nth(args, 0)?, SynValue::Bytes(_))))
+    }
+
+    /// `bytes_to_int(b)` → entero NO-negativo desde bytes big-endian, **exacto**
+    /// (bytes vacíos → 0; cae a entero grande si no entra en i64 — un r/s de firma
+    /// de 32 bytes es un entero de 256 bits, jamás pasa por float). Inverso:
+    /// `int_to_bytes`. `bytes_to_int(secret)` → ERROR (G6).
+    fn b_bytes_to_int(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        match nth(args, 0)? {
+            SynValue::Bytes(b) => Ok(syn_number(Number::from_be_bytes(b))),
+            SynValue::Secret(_) => Err(err("bytes_to_int: cannot convert a secret")),
+            other => Err(err(format!("bytes_to_int expects bytes, got {}", other.type_name()))),
+        }
+    }
+
+    /// `int_to_bytes(n, size?)` → bytes big-endian de un entero no-negativo.
+    /// Sin `size`: MÍNIMOS (sin ceros a la izquierda; `0` → bytes vacíos — la forma
+    /// que piden RLP y los enteros de protocolo). Con `size`: exactamente ese ancho,
+    /// con padding de ceros a la izquierda (error si el valor no entra — nunca trunca
+    /// en silencio). Float/Decimal/negativo → error (la conversión es exacta o no es).
+    fn b_int_to_bytes(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        if args.is_empty() || args.len() > 2 {
+            return Err(err("int_to_bytes() takes 1 or 2 arguments: int_to_bytes(n, size?)"));
+        }
+        let n = match nth(args, 0)? {
+            SynValue::Number(n) => n,
+            other => {
+                return Err(err(format!(
+                    "int_to_bytes expects a non-negative integer, got {}",
+                    other.type_name()
+                )))
+            }
+        };
+        let min = n.to_be_bytes_min().ok_or_else(|| {
+            err("int_to_bytes: the value must be a non-negative integer (no floats/decimals/negatives)")
+        })?;
+        match args.get(1) {
+            None | Some(SynValue::Nothing) => Ok(syn_bytes(min)),
+            Some(SynValue::Number(sz)) if sz.is_integer() => {
+                let size = sz.to_i64_trunc().filter(|s| *s >= 0).ok_or_else(|| {
+                    err("int_to_bytes: size must be a non-negative integer")
+                })? as usize;
+                if min.len() > size {
+                    return Err(err(format!(
+                        "int_to_bytes: the value needs {} bytes and does not fit in size {}",
+                        min.len(),
+                        size
+                    )));
+                }
+                let mut out = vec![0u8; size - min.len()];
+                out.extend_from_slice(&min);
+                Ok(syn_bytes(out))
+            }
+            Some(other) => Err(err(format!(
+                "int_to_bytes: size must be a non-negative integer, got {}",
+                other.type_name()
+            ))),
+        }
     }
 
     // -- Aserciones (Batch 3) --

@@ -28,6 +28,11 @@ pub enum CapabilityType {
     Secret,
     /// Habilita `reveal()` (extraer plaintext de un secret). Coarse, sin scope.
     Reveal,
+    /// Habilita FIRMAR con una clave privada (secp256k1/ed25519). La operación más
+    /// peligrosa del lenguaje (autoriza movimiento de valor): deny-by-default, con
+    /// scope al NAME del secret de la clave (como `Reveal` scoped) y audit fail-loud.
+    /// Nunca es ambiente. Batch 11 (blockchain).
+    Sign,
 }
 
 impl CapabilityType {
@@ -51,6 +56,7 @@ impl CapabilityType {
             Serve => "serve",
             Secret => "secret",
             Reveal => "reveal",
+            Sign => "sign",
         }
     }
 }
@@ -74,6 +80,7 @@ pub fn capability_type_from_name(name: &str) -> Option<CapabilityType> {
         "serve" => Serve,
         "secret" => Secret,
         "reveal" => Reveal,
+        "sign" => Sign,
         _ => return None,
     })
 }
@@ -455,7 +462,7 @@ pub fn parse_capability(name: &str, scope: Option<&str>) -> Result<Capability, S
     match capability_type_from_name(name) {
         Some(ty) => Ok(Capability::new(ty, scope.map(|s| s.to_string()))),
         None => Err(format!(
-            "Unknown capability type: '{}'. Known: [net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal]",
+            "Unknown capability type: '{}'. Known: [net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal, sign]",
             name
         )),
     }

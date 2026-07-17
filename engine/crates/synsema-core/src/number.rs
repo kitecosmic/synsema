@@ -71,6 +71,30 @@ impl Number {
         }
     }
 
+    /// Entero NO-negativo desde bytes big-endian (vacío → 0). Exacto: cae a `Big`
+    /// cuando no entra en i64 — un r/s de firma secp256k1 es un entero de 256 bits.
+    pub fn from_be_bytes(b: &[u8]) -> Number {
+        Number::from_bigint(BigInt::from_bytes_be(Sign::Plus, b))
+    }
+
+    /// Bytes big-endian MÍNIMOS (sin ceros a la izquierda; 0 → vacío — la forma que
+    /// piden RLP y los enteros de protocolo) de un entero no-negativo. `None` si el
+    /// número es negativo o no es entero (`Float`/`Decimal`).
+    pub fn to_be_bytes_min(&self) -> Option<Vec<u8>> {
+        match self {
+            Number::Int(i) if *i >= 0 => {
+                let b = (*i as u64).to_be_bytes();
+                let first = b.iter().position(|&x| x != 0).unwrap_or(b.len());
+                Some(b[first..].to_vec())
+            }
+            Number::Big(b) if b.sign() != Sign::Minus => {
+                let (_, mag) = b.to_bytes_be();
+                Some(if mag == [0] { Vec::new() } else { mag })
+            }
+            _ => None,
+        }
+    }
+
     /// Demueve `Big` a `Int` si entra en i64.
     pub fn normalized(self) -> Number {
         match self {

@@ -404,9 +404,36 @@ fn iso_now() -> String {
 /// Devuelve Err si no se puede escribir → en el camino CONCEDIDO `reveal()` falla (sin
 /// auditoría no hay revelación, §7).
 fn write_audit_entry(name: &str, loc: &SourceLocation, granted: bool) -> Result<(), String> {
+    write_audit_op("reveal", "reveal.log", name, loc, granted)
+}
+
+/// Entrada de audit de una FIRMA (Batch 11), append-only, fail-loud. Espeja el audit
+/// de `reveal`: NUNCA el material (ni la clave ni la firma) — sólo timestamp,
+/// resultado, name del secret, `file:line`, programa y la **curva** usada. Vive en
+/// `sign.log` (separado de `reveal.log`). `pub` para que `blockchain.rs` lo llame.
+/// Devuelve Err si no se puede escribir → en el camino concedido la firma FALLA
+/// (sin auditoría no hay firma, decisión #2/G3).
+pub fn write_sign_audit(
+    name: &str,
+    curve: &str,
+    loc: &SourceLocation,
+    granted: bool,
+) -> Result<(), String> {
+    write_audit_op(&format!("sign curve={}", curve), "sign.log", name, loc, granted)
+}
+
+/// Cuerpo compartido del audit append-only (reveal/sign). `op` es el prefijo de la
+/// línea (`"reveal"` o `"sign curve=…"`); `file` el nombre del log.
+fn write_audit_op(
+    op: &str,
+    file: &str,
+    name: &str,
+    loc: &SourceLocation,
+    granted: bool,
+) -> Result<(), String> {
     let dir = audit_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join("reveal.log");
+    let path = dir.join(file);
     let mut f = OpenOptions::new()
         .create(true)
         .append(true)
@@ -418,8 +445,9 @@ fn write_audit_entry(name: &str, loc: &SourceLocation, granted: bool) -> Result<
         .unwrap_or_else(|| loc.file.clone());
     let result = if granted { "granted" } else { "denied" };
     let line = format!(
-        "{} reveal result={} name={} at={}:{} program={}\n",
+        "{} {} result={} name={} at={}:{} program={}\n",
         iso_now(),
+        op,
         result,
         name,
         loc.file,

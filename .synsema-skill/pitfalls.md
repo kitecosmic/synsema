@@ -168,6 +168,19 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | Any font in the SVG renders as requested | One embedded sans (DejaVu); unknown families fall back to it; missing glyphs (full CJK, color emoji) → tofu | Deterministic by design; custom/system fonts may come later |
 | Huge `width`/`scale` just works | Above ~16.7M output pixels → error naming `max_pixels` | Deliberate anti-DoS ceiling; raise it explicitly: `{"max_pixels": n}` |
 
+## Blockchain (sign/verify — see stdlib.md § Blockchain)
+
+| What you expect | What actually happens | Why / workaround |
+|---|---|---|
+| `keccak256` == SHA3-256 | Different padding: `keccak256("")` = `c5d24601…`, SHA3-256 = `a7ffc6f8…` | Ethereum uses PRE-NIST Keccak; `keccak256` gives you the Ethereum one |
+| Pre-hash the message before `ed25519_sign` | Wrong signature (double hash) | ed25519 signs the **raw message** (RFC 8032); only secp256k1 takes a 32-byte digest |
+| Pass the key as a hex string | Error — the key must be a `secret` | `require secret("K")` + `secret("K")`, or `as_secret(hex, "K")`; text secret = hex, bytes secret = raw |
+| Signing works like hashing (pure) | Deny-by-default: needs `require sign("KEY_NAME")` + writes an audit entry; denied inside `sandbox` | Signing moves value — scope it to the key secret's name |
+| Paste `slice(sig, 0, 32)` as r into the tx list | ~1 in 128 txs invalid (r/s must be RLP **integers**, minimal) | `bytes_to_int(slice(sig, 0, 32))`; `int_to_bytes(n, 32)` restores fixed width |
+| `rlp_decode` accepts anything `rlp_encode`-shaped | Non-canonical encodings **error** (like Ethereum's decoders) | Two different byte strings never decode to the same structure silently |
+| `ed25519_verify` accepts any RFC 8032 signature | **Strict**: small-order keys/points rejected (what Solana/Algorand reject) | A lenient verifier would accept forgeries the chain refuses |
+| Sign inside a `cron` job with a top-level secret | The secret crosses **redacted** (safe but unusable) | Resolve the key INSIDE the task body: `let k be secret("HOT_KEY")` |
+
 ## Behavioral surprises
 
 | What you expect | What actually happens | Why / workaround |

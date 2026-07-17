@@ -39,7 +39,7 @@ fn parse_notice(line: &str) -> (String, String) {
     let id = after.split_whitespace().next().expect("id en el aviso").to_string();
     let tok_marker = "\"token\": \"";
     let tpos = line.rfind(tok_marker).expect("token en el aviso") + tok_marker.len();
-    let token = line[tpos..].trim_end_matches(|c| c == '"' || c == '}').to_string();
+    let token = line[tpos..].trim_end_matches(['"', '}']).to_string();
     (id, token)
 }
 

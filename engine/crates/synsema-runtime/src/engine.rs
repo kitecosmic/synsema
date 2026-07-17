@@ -81,8 +81,11 @@ pub(crate) fn wire_common_with_state(
     // su capability incluso en modo no-secure (NO se auto-conceden como stdout/time).
     register_secret_builtins(interp, caps.clone(), Rc::new(EnvStore::load_default()));
     register_http_builtins(interp, caps.clone());
-    // Hashing SHA (puro, sin capability): sha256/sha512 → bytes.
+    // Hashing SHA + Keccak (puro, sin capability): sha256/sha512/keccak256/sha512_256 → bytes.
     synsema_stdlib::hashing::register_hash_builtins(interp);
+    // Blockchain (Batch 11): encoding/verify/derive PUROS + firma GATEADA por `sign(NAME)`
+    // + audit (cierra sobre el mismo CapabilitySet → sandbox lo vacía, deny-by-default).
+    synsema_stdlib::blockchain::register_blockchain_builtins(interp, caps.clone());
     // cron/db/progress/memory: sus builtins clonan el Rc internamente → viven mientras
     // viva el intérprete.
     // Cron con ejecución REAL también bajo run/test/conform: el ejecutor toma un
@@ -123,6 +126,15 @@ pub(crate) fn wire_common_with_state(
                 eprintln!(
                     "synsema: warning: bare `require reveal` permits revealing ANY secret; \
                      scope it with `require reveal(\"NAME\")` (the name/label of the secret)"
+                );
+            }
+            // Ídem para `sign`: firmar autoriza mover valor — un `require sign` sin
+            // scope habilita firmar con CUALQUIER clave. Se aconseja acotarlo al name
+            // del secret de la clave (Batch 11).
+            if ty == CapabilityType::Sign && scope.is_none() {
+                eprintln!(
+                    "synsema: warning: bare `require sign` permits signing with ANY key; \
+                     scope it with `require sign(\"KEY_NAME\")` (the name of the key's secret)"
                 );
             }
             c.borrow_mut().grant(Capability::new(ty, scope.map(|s| s.to_string())));
