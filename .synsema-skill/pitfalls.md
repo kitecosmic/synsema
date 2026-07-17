@@ -180,6 +180,13 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `rlp_decode` accepts anything `rlp_encode`-shaped | Non-canonical encodings **error** (like Ethereum's decoders) | Two different byte strings never decode to the same structure silently |
 | `ed25519_verify` accepts any RFC 8032 signature | **Strict**: small-order keys/points rejected (what Solana/Algorand reject) | A lenient verifier would accept forgeries the chain refuses |
 | Sign inside a `cron` job with a top-level secret | The secret crosses **redacted** (safe but unusable) | Resolve the key INSIDE the task body: `let k be secret("HOT_KEY")` |
+| `abi_encode("transfer(address to, uint256 amount)", …)` | Error — the ABI signature is **canonical** | No spaces, no parameter names: `"transfer(address,uint256)"` (the error shows the canonical form; `uint`→`uint256` normalizes) |
+| Pass a token amount as a float (`1e24`) | Error — uint256 needs **exact integers** | Write the integer literal (`1000000000000000000000000` promotes to big int exactly); floats lose precision on money |
+| `algorand_tx_encode` keeps `amt: 0` / empty `note` | Zero/empty/false fields are **OMITTED** (canonical msgpack, keys sorted) | That's what the network requires — emitting them changes the TXID or gets the tx rejected |
+| Solana keeps accounts in the order you list them | Reordered by runtime rules (payer first; writable signers → ro signers → writable non-signers → ro non-signers; buckets sorted by pubkey bytes) | Matches the official SDK byte-for-byte; instruction indices point at the reordered table |
+| Sign a v0 Solana message without its 0x80 prefix | Invalid signature on-chain — the signature **covers the version prefix** | `solana_message({..., "version": 0})` already includes the prefix; sign its output as-is |
+| Pass `lookup_tables` to `solana_message` | Clear error: "not supported yet" | v0 without tables works today; tables (and PDAs/SPL) are the next stage |
+| A deeply nested type / typed-data / txn is fine | Nesting over **64 levels** errors ("nested too deeply") | A DoS guard (like RLP's) — no real ABI/EIP-712/Algorand payload nests that deep; hostile input can't crash the process |
 
 ## Behavioral surprises
 

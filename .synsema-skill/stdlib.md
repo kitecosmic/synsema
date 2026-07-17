@@ -331,9 +331,25 @@ print(eth_address(k))                            -- EIP-55 checksummed address
 -- signed raw tx, ready to broadcast: r/s go in as INTEGERS (bytes_to_int), not blobs
 let raw be bytes([2]) + rlp_encode(fields + [sig[64], bytes_to_int(slice(sig, 0, 32)), bytes_to_int(slice(sig, 32, 64))])
 
--- Solana/Algorand: ed25519 signs the RAW message
-let sig2 be ed25519_sign("transfer 10", k)
-print(decode(ed25519_pubkey(k), "base58"))       -- Solana address
+-- dApp world: contract calldata + typed-data, all PURE (one gate: sign)
+let data be abi_encode("transfer(address,uint256)", [dest, 1000000000000000000000000])
+let d191 be eip191_digest(siwe_message)          -- SIWE login digest
+let d712 be eip712_digest(domain, types, "Permit", permit_map)  -- readable maps in
+-- both digests sign with secp256k1_sign (G13: no new signing doors)
+
+-- Solana TRANSACTABLE: message → ed25519_sign → wire tx
+let msg be solana_message({"fee_payer": payer, "recent_blockhash": bh,
+    "instructions": [{"program": "11111111111111111111111111111111",
+        "accounts": [{"pubkey": payer, "signer": true, "writable": true},
+                     {"pubkey": dest_pk, "writable": true}],
+        "data": int_to_bytes_le(2, 4) + int_to_bytes_le(lamports, 8)}]})
+let tx be solana_tx(msg, ed25519_sign(msg, k))   -- decode(tx, "base64") → sendTransaction
+
+-- Algorand TRANSACTABLE: canonical msgpack → ed25519_sign → SignedTxn
+let txn be {"type": "pay", "snd": algo_address(k), "rcv": rcv, "amt": 123456,
+    "fee": 1000, "fv": fv, "lv": lv, "gh": gh_bytes}
+let listo be algorand_tx_encode(txn)             -- "TX" || msgpack (zero fields OMITTED)
+let stx be algorand_tx(txn, ed25519_sign(listo, k))  -- POST /v2/transactions (x-binary)
 ```
 
 Builtins:
@@ -342,7 +358,9 @@ Builtins:
 - Encoding (pure): `bytes(t, "base58"|"base32")` / `decode(b, …)`; `bech32_encode(hrp, data, variant?)` / `bech32_decode(text)` → `{hrp, data, variant}`.
 - secp256k1: `secp256k1_sign(digest32, secret)` [**require sign**], `secp256k1_verify(digest, sig, pubkey)`, `secp256k1_recover(digest, sig65)`, `secp256k1_pubkey(secret, compressed?)`.
 - ed25519: `ed25519_sign(message, secret)` [**require sign**], `ed25519_verify(msg, sig, pubkey)`, `ed25519_pubkey(secret)`.
-- EVM (pure): `eth_address(pubkey_or_secret)` → EIP-55 text; `rlp_encode(value)` / `rlp_decode(bytes)`.
+- EVM (pure): `eth_address(pubkey_or_secret)` → EIP-55 text; `rlp_encode(value)` / `rlp_decode(bytes)`; `abi_encode(sig, values)` / `abi_decode(types, data)` / `abi_selector(sig)`; `eip191_digest(message)`; `eip712_digest(domain, types, primary, message)`.
+- Solana (pure): `solana_message(params)` (legacy + `"version": 0`; `lookup_tables` → error, stage 3) / `solana_tx(msg, sigs)`; `int_to_bytes_le(n, size)` for instruction data.
+- Algorand (pure): `algorand_tx_encode(txn)` / `algorand_tx(txn, sig)` / `algo_address(pubkey_or_secret)`; TXID = `decode(sha512_256(algorand_tx_encode(txn)), "base32")`.
 
 **Instinct vs. reality (money code — get these right):**
 - keccak256 ≠ SHA3-256 (different padding). Use `keccak256`, not any SHA3.
@@ -360,8 +378,21 @@ Builtins:
   a bytes secret = raw. Errors describe size/shape, never the key value.
 - A top-level `secret` is REDACTED when it crosses into a cron job / spawned agent
   (safe, unusable there) — resolve the key INSIDE the task body.
+- ABI signatures are CANONICAL: no spaces, no parameter names — `"transfer(address,uint256)"`.
+  A malformed signature = a different selector = a silent call to a nonexistent function;
+  `abi_encode`/`abi_selector` reject it (and normalize `uint`→`uint256`).
+- uint256 amounts need EXACT integers — big int literals just work; floats are rejected
+  (`1e24` as a float is not exact money).
+- Algorand msgpack is CANONICAL: keys sorted bytewise and zero/empty/false fields OMITTED
+  (`amt: 0` disappears — that's what the network requires; otherwise the TXID differs).
+- Solana does NOT keep your account order: fee payer first, then writable signers,
+  ro signers, writable non-signers, ro non-signers (buckets sorted by pubkey bytes,
+  matching the official SDK). The compiled indices point at the reordered table.
+- v0 Solana messages carry the 0x80 version prefix and the signature COVERS it —
+  `solana_message({..., "version": 0})` already includes it; just `ed25519_sign` the bytes.
 - All pure-Rust (k256/ed25519-dalek/sha3/bech32), zero `*-sys`. Chains: ETH + Avalanche-C
-  end-to-end; Avalanche X/P, Solana, Algorand signable (tx serialization = future).
+  + Solana + Algorand END-TO-END (build + sign + wire bytes, SDK-exact); Avalanche X/P
+  signable. Not yet (stage 3): HD wallets/mnemonics, Solana LUTs + PDAs/SPL, keystore JSON.
 
 ## Capabilities
 
