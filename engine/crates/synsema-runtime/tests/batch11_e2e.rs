@@ -31,7 +31,25 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Base de audit AISLADA de este binario de test (un temp por proceso). Los tests
+/// firman de verdad y el audit es fail-loud + append-only; sin este aislamiento
+/// cada `cargo test` ensuciaría el `~/.synsema/audit/sign.log` REAL del dev. NO se
+/// suprime el audit (eso sería una vía de firma sin registro — se pierde seguridad):
+/// sólo se redirige a un temp descartable.
+fn test_audit_base() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("syn_test_audit_{}", std::process::id()))
+}
+static AUDIT_ISOLATE: std::sync::Once = std::sync::Once::new();
+fn isolate_audit_dir() {
+    AUDIT_ISOLATE.call_once(|| {
+        let dir = test_audit_base();
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("SYNSEMA_AUDIT_DIR", &dir);
+    });
+}
+
 fn out(source: &str) -> Vec<String> {
+    isolate_audit_dir();
     let r = run_source(source, "<test>");
     assert!(r.success, "esperaba éxito, falló: {:?}\nfuente:\n{}", r.errors, source);
     r.output
@@ -104,6 +122,7 @@ print("vivo")"#
 
 #[test]
 fn signing_with_capability_works_and_audits() {
+    isolate_audit_dir();
     let _g = env_lock();
     let dir = std::env::temp_dir().join(format!("syn_sign_audit_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -124,7 +143,8 @@ print(length(sig2))"#
         "wallet.syn",
     );
     let log = std::fs::read_to_string(dir.join("sign.log")).ok();
-    std::env::remove_var("SYNSEMA_AUDIT_DIR");
+    // Restaurar la base aislada (NO remove_var: eso caería al ~/.synsema real).
+    std::env::set_var("SYNSEMA_AUDIT_DIR", test_audit_base());
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(r.success, "firmar con la capability debe funcionar: {:?}", r.errors);
@@ -139,6 +159,7 @@ print(length(sig2))"#
 
 #[test]
 fn denied_signing_is_also_audited() {
+    isolate_audit_dir();
     let _g = env_lock();
     let dir = std::env::temp_dir().join(format!("syn_sign_deny_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -156,7 +177,8 @@ recover err
         "attacker.syn",
     );
     let log = std::fs::read_to_string(dir.join("sign.log")).ok();
-    std::env::remove_var("SYNSEMA_AUDIT_DIR");
+    // Restaurar la base aislada (NO remove_var: eso caería al ~/.synsema real).
+    std::env::set_var("SYNSEMA_AUDIT_DIR", test_audit_base());
     let _ = std::fs::remove_dir_all(&dir);
 
     let log = log.expect("un intento denegado igual se audita");
@@ -252,6 +274,7 @@ print(contains(m2, "32 bytes"))"#
 
 #[test]
 fn dogfood_eth_end_to_end_via_synsema_test() {
+    isolate_audit_dir();
     let src = format!(
         r#"require sign("HOT_KEY")
 
@@ -381,6 +404,7 @@ fn request(port: u16, target: &str) -> String {
 
 #[test]
 fn serve_signing_handler_error_keeps_server_alive() {
+    isolate_audit_dir();
     let port = free_port();
     let prog = format!(
         r#"require serve({port})

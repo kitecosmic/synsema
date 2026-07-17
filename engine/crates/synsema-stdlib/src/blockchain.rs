@@ -39,7 +39,7 @@ use std::cell::RefCell;
 
 use crate::secrets::write_sign_audit;
 
-fn err(msg: impl Into<String>) -> Control {
+pub(crate) fn err(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::new(msg))
 }
 
@@ -47,14 +47,14 @@ fn err(msg: impl Into<String>) -> Control {
 // Lectura de argumentos (sin unwrap sobre input — G10)
 // =========================================================
 
-fn arg<'a>(args: &'a [SynValue], i: usize, fname: &str) -> Result<&'a SynValue, Control> {
+pub(crate) fn arg<'a>(args: &'a [SynValue], i: usize, fname: &str) -> Result<&'a SynValue, Control> {
     args.get(i)
         .ok_or_else(|| err(format!("{}: missing argument {}", fname, i + 1)))
 }
 
 /// Bytes de un argumento: sólo `bytes` (no text — la ambigüedad hex/ascii es peligrosa
 /// en cripto). Un `secret` → error de forma (usá el argumento de clave, no acá).
-fn arg_bytes<'a>(v: &'a SynValue, fname: &str, what: &str) -> Result<&'a [u8], Control> {
+pub(crate) fn arg_bytes<'a>(v: &'a SynValue, fname: &str, what: &str) -> Result<&'a [u8], Control> {
     match v {
         SynValue::Bytes(b) => Ok(&b[..]),
         SynValue::Secret(_) => Err(err(format!(
@@ -67,7 +67,7 @@ fn arg_bytes<'a>(v: &'a SynValue, fname: &str, what: &str) -> Result<&'a [u8], C
 
 /// Bytes de largo EXACTO (para digests/firmas/pubkeys de tamaño fijo). El error nombra
 /// el tamaño esperado y el recibido (la longitud NO es material sensible — G4).
-fn arg_bytes_len<'a>(
+pub(crate) fn arg_bytes_len<'a>(
     v: &'a SynValue,
     fname: &str,
     what: &str,
@@ -91,7 +91,7 @@ fn arg_bytes_len<'a>(
 /// gate + audit). Los bytes vienen de `expose_bytes` (Rust-only): un secret de **texto**
 /// = hex (con o sin `0x`); un secret de **bytes** = crudos. El caller DEBE zeroizarlos.
 /// Errores sin fuga (G4): jamás incluyen el valor, sólo la forma esperada.
-fn key_material(v: &SynValue, fname: &str) -> Result<(String, Vec<u8>), Control> {
+pub(crate) fn key_material(v: &SynValue, fname: &str) -> Result<(String, Vec<u8>), Control> {
     match v {
         SynValue::Secret(inner) => {
             let name = inner.name().to_string();
@@ -255,7 +255,7 @@ fn secp256k1_pubkey(args: &[SynValue]) -> Result<SynValue, Control> {
 /// Seed de 32 bytes desde el material de clave. Acepta la forma Solana de 64 bytes
 /// `[seed(32) || pubkey(32)]`, validando que la pubkey coincida con la derivada del
 /// seed (mismatch → error claro, sin exponer material). `key` se zeroiza acá.
-fn ed25519_seed(mut key: Vec<u8>, fname: &str) -> Result<SigningKey, Control> {
+pub(crate) fn ed25519_seed(mut key: Vec<u8>, fname: &str) -> Result<SigningKey, Control> {
     let result = (|| {
         let seed: [u8; 32] = match key.len() {
             32 => key[..32].try_into().expect("32 bytes"),
@@ -460,7 +460,7 @@ fn uncompressed_pubkey(v: &SynValue, fname: &str) -> Result<Vec<u8>, Control> {
 }
 
 /// Checksum EIP-55: hex mixed-case de los 20 bytes de dirección (con `0x`).
-fn eip55(addr20: &[u8]) -> String {
+pub(crate) fn eip55(addr20: &[u8]) -> String {
     let hexs = synsema_core::bytesutil::hex_encode(addr20); // 40 chars lowercase
     let hash = Keccak256::digest(hexs.as_bytes());
     let hash_hex = synsema_core::bytesutil::hex_encode(&hash); // 64 chars
@@ -754,4 +754,9 @@ pub fn register_blockchain_builtins(interp: &Interpreter, caps: Rc<RefCell<Capab
     interp.register_builtin("eth_address", 1, Rc::new(|_i, a, _l| eth_address(a)));
     interp.register_builtin("rlp_encode", 1, Rc::new(|_i, a, _l| rlp_encode(a)));
     interp.register_builtin("rlp_decode", 1, Rc::new(|_i, a, _l| rlp_decode(a)));
+
+    // -- Batch 12 (todo PURO — G13: ninguna puerta de firma nueva) --
+    crate::blockchain_abi::register(interp); // ABI + EIP-191 + EIP-712
+    crate::blockchain_solana::register(interp); // message/tx de Solana
+    crate::blockchain_algorand::register(interp); // msgpack canónico de Algorand
 }

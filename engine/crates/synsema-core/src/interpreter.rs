@@ -726,6 +726,7 @@ impl Interpreter {
         self.register("is_bytes", 1, Rc::new(|i, a, l| i.b_is_bytes(a, l)));
         self.register("bytes_to_int", 1, Rc::new(|i, a, l| i.b_bytes_to_int(a, l)));
         self.register("int_to_bytes", -1, Rc::new(|i, a, l| i.b_int_to_bytes(a, l)));
+        self.register("int_to_bytes_le", 2, Rc::new(|i, a, l| i.b_int_to_bytes_le(a, l)));
         // Aserciones (test framework, Batch 3). PUROS; al fallar producen un error
         // marcado `is_assertion`. Funcionan en cualquier parte (checks defensivos, G3).
         self.register("assert", -1, Rc::new(|i, a, l| i.b_assert(a, l)));
@@ -2740,6 +2741,48 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 other.type_name()
             ))),
         }
+    }
+
+    /// `int_to_bytes_le(n, size)` → bytes **little-endian** de ancho fijo de un
+    /// entero no-negativo (error si no entra — nunca trunca en silencio). El `size`
+    /// es OBLIGATORIO: LE es formato de structs binarios de ancho fijo (los datos
+    /// del System Program de Solana son u32/u64 LE), no de enteros mínimos.
+    fn b_int_to_bytes_le(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        let n = match nth(args, 0)? {
+            SynValue::Number(n) => n,
+            other => {
+                return Err(err(format!(
+                    "int_to_bytes_le expects a non-negative integer, got {}",
+                    other.type_name()
+                )))
+            }
+        };
+        let min = n.to_be_bytes_min().ok_or_else(|| {
+            err("int_to_bytes_le: the value must be a non-negative integer (no floats/decimals/negatives)")
+        })?;
+        let size = match nth(args, 1)? {
+            SynValue::Number(sz) if sz.is_integer() => sz
+                .to_i64_trunc()
+                .filter(|s| *s >= 0)
+                .ok_or_else(|| err("int_to_bytes_le: size must be a non-negative integer"))?
+                as usize,
+            other => {
+                return Err(err(format!(
+                    "int_to_bytes_le: size must be a non-negative integer, got {}",
+                    other.type_name()
+                )))
+            }
+        };
+        if min.len() > size {
+            return Err(err(format!(
+                "int_to_bytes_le: the value needs {} bytes and does not fit in size {}",
+                min.len(),
+                size
+            )));
+        }
+        let mut out: Vec<u8> = min.into_iter().rev().collect();
+        out.resize(size, 0);
+        Ok(syn_bytes(out))
     }
 
     // -- Aserciones (Batch 3) --
