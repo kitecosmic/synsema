@@ -297,6 +297,8 @@ Semantics (know these before reaching for cron):
 - Under `serve`, jobs share the process state with routes (db, `state_*`, memory,
   blackboard) and run with the program's capabilities; top-level jobs start once the
   server is serving, and registering from a route works and is globally visible.
+- Under `run`, jobs share state with EACH OTHER; to exchange data with the rest of
+  the program use external effects (a file, an on-disk db, or `share`/`observe`).
 
 ## Serve mode (keep crons alive)
 

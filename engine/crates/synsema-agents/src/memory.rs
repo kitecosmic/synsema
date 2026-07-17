@@ -445,6 +445,10 @@ fn evaluate_condition(condition: &str, context: &HashMap<String, f64>) -> bool {
         None => return false,
     };
     // La condición describe lo que DEBE ser verdadero. Violación = condición falsa.
+    // allow: la negación es INTENCIONAL y fail-closed — con `actual` NaN, `!(a <= b)`
+    // reporta violación (una condición inevaluable cuenta como violada), mientras que
+    // el "arreglo" `a > b` la dejaría pasar en silencio.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     match op {
         "<=" => !(actual <= threshold),
         ">=" => !(actual >= threshold),

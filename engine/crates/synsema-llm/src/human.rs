@@ -348,16 +348,21 @@ struct QueueInner {
 /// lo mapea a DENEGADO fail-closed). OJO (v2): el hilo que ejecuta el gate queda
 /// BLOQUEADO toda la espera — un `within` largo retiene un worker del server; la
 /// persistencia para esperas largas llega en v3.
+/// Sink del aviso de encolado (una línea de texto hacia la consola del server).
+pub type NoticeSink = Arc<dyn Fn(&str) + Send + Sync>;
+/// Hook estructurado de encolado (A1.v3): recibe la pendiente completa.
+pub type EnqueueHook = Arc<dyn Fn(&EnqueuedApproval) + Send + Sync>;
+
 pub struct QueueHandler {
     inner: Mutex<QueueInner>,
     cvar: Condvar,
     /// Aviso de encolado con el token (v2): el runtime lo cablea a la consola del
     /// server — poseer la consola = poder aprobar (frontera de confianza base).
-    notice: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    notice: Option<NoticeSink>,
     /// Hook de encolado ESTRUCTURADO (A1.v3): recibe la pendiente completa (con token)
     /// además del aviso de consola. El runtime lo cablea al webhook saliente; debe ser
     /// fire-and-forget (jamás bloquear ni romper el gate).
-    on_enqueue: Option<Arc<dyn Fn(&EnqueuedApproval) + Send + Sync>>,
+    on_enqueue: Option<EnqueueHook>,
 }
 
 impl Default for QueueHandler {
@@ -570,7 +575,7 @@ impl InteractionManager {
     /// default del host. Un `Timeout` del handler se mapea FAIL-CLOSED: `false` para
     /// approve/confirm/review (+ aviso único) y texto vacío para ask (fallback
     /// documentado del core + su aviso).
-    pub fn get_callback(&self) -> Rc<dyn Fn(&str, &str, Option<f64>) -> SynValue> {
+    pub fn get_callback(&self) -> synsema_core::interpreter::HumanCallback {
         let handler = self.handler.clone();
         let history = self.history.clone();
         let default_timeout = self.default_timeout;

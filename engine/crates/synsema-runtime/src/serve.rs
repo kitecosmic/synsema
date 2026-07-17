@@ -64,6 +64,9 @@ use synsema_stdlib::server::{
 /// Manager de base de datos compartido entre el top-level y los hilos de conexión.
 type SharedDb = Arc<Mutex<DatabaseManager>>;
 
+/// Tabla de un host (default o vhost): rutas + static mounts (prefijo, dir) + auth.
+type HostTable = (Vec<RouteSpec>, Vec<(String, String)>, Option<AuthHandler>);
+
 /// Estado mutable compartido entre todos los route handlers de un serve.
 /// Respaldo de `state_set`/`state_get`/`state_incr` — alternativa explícita
 /// a mutar globales (que no se propagan entre requests por diseño).
@@ -1050,15 +1053,18 @@ fn register_serve_state_builtins(interp: &Interpreter, state: SharedState) {
 /// instalar el suyo con [`set_serve_log_sink`] (p.ej. para enrutar a un logger o
 /// capturarlas). Se resuelve UNA vez por worker al construir el intérprete base, así que
 /// instalalo ANTES de arrancar el server.
-static SERVE_LOG_SINK: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>> = Mutex::new(None);
+static SERVE_LOG_SINK: Mutex<Option<ServeLogSink>> = Mutex::new(None);
+
+/// Sink de una línea de log de serve (thread-safe: lo comparten workers y jobs).
+pub type ServeLogSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// Instala el sink global de logs de `serve`. Pasá `None` para volver al default (stdout).
-pub fn set_serve_log_sink(sink: Option<Arc<dyn Fn(&str) + Send + Sync>>) {
+pub fn set_serve_log_sink(sink: Option<ServeLogSink>) {
     *SERVE_LOG_SINK.lock().unwrap() = sink;
 }
 
 /// Resuelve el sink de log de serve: el instalado o, por defecto, stdout `[serve] …`.
-fn serve_log_sink() -> Arc<dyn Fn(&str) + Send + Sync> {
+fn serve_log_sink() -> ServeLogSink {
     SERVE_LOG_SINK
         .lock()
         .unwrap()
@@ -1487,7 +1493,7 @@ fn build_host_table(
     swarm: &Arc<Swarm>,
     shared_db: &SharedDb,
     secure: bool,
-) -> Result<(Vec<RouteSpec>, Vec<(String, String)>, Option<AuthHandler>), Control> {
+) -> Result<HostTable, Control> {
     // -- static mounts (dedup por prefijo) --
     let mut static_mounts: Vec<(String, String)> = Vec::new();
     let mut seen_prefixes: Vec<String> = Vec::new();
@@ -1532,10 +1538,7 @@ fn build_host_table(
                     Ok(t) => t,
                     Err(_) => return None,
                 };
-                match interp.call_task(task, vec![syn_text(token)]) {
-                    Ok(user) => Some(user),
-                    Err(_) => None,
-                }
+                interp.call_task(task, vec![syn_text(token)]).ok()
             })
         });
         h

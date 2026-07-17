@@ -97,13 +97,13 @@ fn lexical_normalize(p: &Path) -> PathBuf {
 }
 
 /// Resuelve el path de un módulo local relativo al directorio del archivo que lo
-/// importa. Mismo criterio de seguridad que `resolve_template_path` (sólo relativo
-/// + `..` no puede escapar), anclado al dir del importador y exigiendo sufijo
-/// `.syn`. Usa normalización LÉXICA en vez de `canonicalize` para que el string
-/// resuelto coincida con el del puerto Python (en Windows `canonicalize` emite un
-/// prefijo `\\?\` que `realpath` no; rompería la paridad de cualquier path que
-/// aparezca en un error/ubicación). Los errores citan el path RAW (nunca el
-/// resuelto), para no filtrar formas de path divergentes.
+/// importa. Mismo criterio de seguridad que `resolve_template_path` (sólo
+/// relativo + `..` no puede escapar), anclado al dir del importador y exigiendo
+/// sufijo `.syn`. Usa normalización LÉXICA en vez de `canonicalize` para que el
+/// string resuelto coincida con el del puerto Python (en Windows `canonicalize`
+/// emite un prefijo `\\?\` que `realpath` no; rompería la paridad de cualquier
+/// path que aparezca en un error/ubicación). Los errores citan el path RAW
+/// (nunca el resuelto), para no filtrar formas de path divergentes.
 pub(crate) fn resolve_module_path(raw_path: &str, base_dir: &Path) -> Result<String, String> {
     // Una ruta drive-absoluta O con `/`/`\` inicial (root-relativa) se rechaza. El
     // chequeo del slash inicial mantiene la decisión idéntica entre plataformas/impls

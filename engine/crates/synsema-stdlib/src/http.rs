@@ -287,6 +287,9 @@ fn do_request(
     parse_response(&buf)
 }
 
+/// Respuesta HTTP con body binario: `(status, body_bytes, headers)`.
+pub type BytesResponse = (i64, Vec<u8>, Vec<(String, String)>);
+
 /// Como `http_request` pero devuelve el body como **bytes crudos** (sin pasar por
 /// `String`, que corrompería un binario). Para descargar release assets. Devuelve
 /// `(status, body_bytes, headers)`. No sigue redirects — el caller los maneja.
@@ -295,7 +298,7 @@ pub fn http_request_bytes(
     url: &str,
     headers: Option<&[(String, String)]>,
     timeout_secs: u64,
-) -> Result<(i64, Vec<u8>, Vec<(String, String)>), String> {
+) -> Result<BytesResponse, String> {
     let buf = fetch_raw(method, url, headers, None, timeout_secs)?;
     parse_response_bytes(&buf)
 }
@@ -321,7 +324,7 @@ fn parse_head(head: &str) -> (i64, Vec<(String, String)>) {
 }
 
 /// Igual que `parse_response` pero devuelve el body como bytes crudos (para binarios).
-fn parse_response_bytes(buf: &[u8]) -> Result<(i64, Vec<u8>, Vec<(String, String)>), String> {
+fn parse_response_bytes(buf: &[u8]) -> Result<BytesResponse, String> {
     let split = buf
         .windows(4)
         .position(|w| w == b"\r\n\r\n")

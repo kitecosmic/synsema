@@ -127,14 +127,17 @@ fn validator_for(operation: &str) -> fn(&str, &HashMap<String, String>) -> Valid
     }
 }
 
+/// Llamada al LLM que el validador reintenta: (operación, data) → respuesta cruda.
+pub type LlmCallFn = Box<dyn FnMut(&str, &HashMap<String, String>) -> String>;
+
 /// Valida respuestas del LLM y reintenta con feedback ante fallo.
 pub struct ResponseValidator {
-    llm_call: Box<dyn FnMut(&str, &HashMap<String, String>) -> String>,
+    llm_call: LlmCallFn,
     pub max_retries: usize,
 }
 
 impl ResponseValidator {
-    pub fn new(llm_call: Box<dyn FnMut(&str, &HashMap<String, String>) -> String>, max_retries: usize) -> Self {
+    pub fn new(llm_call: LlmCallFn, max_retries: usize) -> Self {
         ResponseValidator { llm_call, max_retries }
     }
 

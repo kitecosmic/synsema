@@ -212,7 +212,7 @@ impl SynValue {
                 let (a, b) = (a.borrow(), b.borrow());
                 a.len() == b.len()
                     && a.iter()
-                        .all(|(k, v)| b.get(k).map_or(false, |w| v.syn_equals(w)))
+                        .all(|(k, v)| b.get(k).is_some_and(|w| v.syn_equals(w)))
             }
             // Igualdad de valores del servidor (estructural). Un Server NUNCA es
             // igual a un map plano (en el oráculo difieren en metadata).
@@ -232,7 +232,7 @@ impl SynValue {
                 (ServerValue::Node(m1), ServerValue::Node(m2)) => {
                     let (m1, m2) = (m1.borrow(), m2.borrow());
                     m1.len() == m2.len()
-                        && m1.iter().all(|(k, v)| m2.get(k).map_or(false, |w| v.syn_equals(w)))
+                        && m1.iter().all(|(k, v)| m2.get(k).is_some_and(|w| v.syn_equals(w)))
                 }
                 (ServerValue::Content(a), ServerValue::Content(b)) => a.syn_equals(b),
                 (ServerValue::Paged(a), ServerValue::Paged(b)) => Rc::ptr_eq(a, b),

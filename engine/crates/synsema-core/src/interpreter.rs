@@ -263,6 +263,24 @@ pub type ToolScopeHook = Rc<dyn Fn(bool, &[(String, Option<String>)])>;
 pub type ServeHook =
     Rc<dyn Fn(&mut Interpreter, &Node, &Rc<RefCell<Environment>>) -> Result<SynValue, Control>>;
 
+/// Callback humano de los gates (approve/confirm/ask): (acción, mensaje,
+/// within_secs) → respuesta (bool para approve/confirm, texto para ask).
+pub type HumanCallback = Rc<dyn Fn(&str, &str, Option<f64>) -> SynValue>;
+/// Sink de `send` en un handler SSE: (valor, event_name) → Ok, o corta el stream.
+pub type StreamEmitFn = Rc<dyn Fn(SynValue, Option<&str>) -> Result<(), Control>>;
+
+/// Hook de escritura al blackboard (`share`): (clave, valor).
+pub type ShareHook = Rc<dyn Fn(&str, &SynValue)>;
+/// Hook de lectura del blackboard (`observe`): (clave) → valor.
+pub type ObserveHook = Rc<dyn Fn(&str) -> Option<SynValue>>;
+/// Hook de señal (`signal`): (canal, payload opcional).
+pub type SignalHook = Rc<dyn Fn(&str, Option<SynValue>)>;
+/// Hook de espera de señal (`wait_for`): (canal, timeout_secs) → payload.
+pub type WaitForHook = Rc<dyn Fn(&str, Option<f64>) -> Option<SynValue>>;
+/// Hook de `spawn`: (agente, body, args, snapshot de globals) → instance_id.
+pub type SpawnHook =
+    Rc<dyn Fn(&str, Vec<Node>, Vec<(String, SynValue)>, Vec<(String, SynValue)>) -> Result<String, Control>>;
+
 /// Hooks que el host (motor) cablea para conectar `share`/`observe`/`signal`/
 /// `wait_for`/`spawn` al swarm real (blackboard + señales + hilos). Espejan los
 /// callbacks `_swarm_*` del intérprete Python. Si no están, share/observe usan el
@@ -270,16 +288,15 @@ pub type ServeHook =
 /// comportamiento in-process.
 #[derive(Clone)]
 pub struct SwarmHooks {
-    pub share: Rc<dyn Fn(&str, &SynValue)>,
-    pub observe: Rc<dyn Fn(&str) -> Option<SynValue>>,
-    pub signal: Rc<dyn Fn(&str, Option<SynValue>)>,
+    pub share: ShareHook,
+    pub observe: ObserveHook,
+    pub signal: SignalHook,
     /// `wait_for(canal, timeout_secs)` — `None` = default (30 s). Batch 7.
-    pub wait_for: Rc<dyn Fn(&str, Option<f64>) -> Option<SynValue>>,
-    #[allow(clippy::type_complexity)]
+    pub wait_for: WaitForHook,
     /// `spawn(name, body, args, globals)` — `globals` es un snapshot de los bindings
     /// globales del intérprete llamador (tareas, valores, módulos) para que el agente
     /// hijo los tenga disponibles sin necesitar HTTP ni wrappers.
-    pub spawn: Rc<dyn Fn(&str, Vec<Node>, Vec<(String, SynValue)>, Vec<(String, SynValue)>) -> Result<String, Control>>,
+    pub spawn: SpawnHook,
 }
 
 /// Aviso ÚNICO por proceso cuando una op LLM cae a placeholder por estar OFFLINE.
@@ -345,7 +362,7 @@ pub struct Interpreter {
     /// Callback humano (approve/confirm/ask). (action, message, timeout_secs) →
     /// SynValue (bool para approve/confirm, texto para ask). `timeout_secs` es el
     /// `within` del gate (None = sin `within`; decide el host). Sin él: auto-aprueba.
-    human_callback: Option<Rc<dyn Fn(&str, &str, Option<f64>) -> SynValue>>,
+    human_callback: Option<HumanCallback>,
     /// Callback LLM (reason/decide/analyze/generate): (operación, prompt) → contenido.
     /// El `prompt` lleva el texto ya renderizado de la op (subject/data/objective/…)
     /// para que el provider real tenga qué mandar; un mock puede ignorarlo y keyear por
@@ -371,7 +388,7 @@ pub struct Interpreter {
     serve_hook: Option<ServeHook>,
     /// Sink de `send` dentro de un handler de stream SSE (lo cablea el motor por
     /// request de streaming). (value, event_name) → (). Sin él, `send` es error.
-    stream_emit: Option<Rc<dyn Fn(SynValue, Option<&str>) -> Result<(), Control>>>,
+    stream_emit: Option<StreamEmitFn>,
     /// Hook de log: si está seteado, cada `log` llama el hook en tiempo real (además
     /// de pushear a `output`). Thread-safe (`Arc+Sync`) para que los hilos de agentes
     /// puedan escribir a stdout del proceso principal sin bufferizado.
@@ -498,7 +515,7 @@ impl Interpreter {
 
     /// Cablea el callback humano (approve/confirm/ask). El tercer parámetro es el
     /// `within` del gate en segundos (None = sin `within`).
-    pub fn set_human_callback(&mut self, cb: Rc<dyn Fn(&str, &str, Option<f64>) -> SynValue>) {
+    pub fn set_human_callback(&mut self, cb: HumanCallback) {
         self.human_callback = Some(cb);
     }
 
@@ -545,7 +562,7 @@ impl Interpreter {
     }
 
     /// Cablea el sink de `send` (por request de streaming SSE).
-    pub fn set_stream_emit(&mut self, emit: Rc<dyn Fn(SynValue, Option<&str>) -> Result<(), Control>>) {
+    pub fn set_stream_emit(&mut self, emit: StreamEmitFn) {
         self.stream_emit = Some(emit);
     }
 
@@ -3353,7 +3370,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let b = self.list_arg(nth(args, 1)?, "zip_with")?;
         let combiner = nth(args, 2)?.clone();
         let mut out = Vec::new();
-        for (x, y) in a.into_iter().zip(b.into_iter()) {
+        for (x, y) in a.into_iter().zip(b) {
             out.push(self.call_value(combiner.clone(), vec![x, y], loc)?);
         }
         Ok(syn_list(out))

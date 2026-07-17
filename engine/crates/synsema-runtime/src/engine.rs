@@ -811,8 +811,8 @@ pub fn run_capturing_decide(
     filename: &str,
     respuesta: &str,
 ) -> (RunResult, Vec<(String, Vec<String>)>) {
-    let captured: Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+    type Captured = Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>;
+    let captured: Captured = Arc::new(std::sync::Mutex::new(Vec::new()));
     let cap_outer = captured.clone();
     let src = source.to_string();
     let fname = filename.to_string();
@@ -943,22 +943,22 @@ pub(crate) fn wire_swarm_hooks(
 ) {
     let name = agent_name.to_string();
 
-    let share: Rc<dyn Fn(&str, &SynValue)> = {
+    let share: synsema_core::interpreter::ShareHook = {
         let sw = swarm.clone();
         let n = name.clone();
         Rc::new(move |k, v| sw.blackboard.write(k, to_send(v), &n))
     };
-    let observe: Rc<dyn Fn(&str) -> Option<SynValue>> = {
+    let observe: synsema_core::interpreter::ObserveHook = {
         let sw = swarm.clone();
         let n = name.clone();
         Rc::new(move |k| sw.blackboard.read(k, &n).map(|sv| from_send(&sv)))
     };
-    let signal: Rc<dyn Fn(&str, Option<SynValue>)> = {
+    let signal: synsema_core::interpreter::SignalHook = {
         let sw = swarm.clone();
         let n = name.clone();
         Rc::new(move |sig_name, data| sw.signal(sig_name, &n, data.map(|v| to_send(&v))))
     };
-    let wait_for: Rc<dyn Fn(&str, Option<f64>) -> Option<SynValue>> = {
+    let wait_for: synsema_core::interpreter::WaitForHook = {
         let sw = swarm.clone();
         let n = name.clone();
         Rc::new(move |sig_name, timeout| {
@@ -972,9 +972,7 @@ pub(crate) fn wire_swarm_hooks(
             sig.and_then(|s| s.data).map(|d| from_send(&d))
         })
     };
-    let spawn: Rc<
-        dyn Fn(&str, Vec<Node>, Vec<(String, SynValue)>, Vec<(String, SynValue)>) -> Result<String, Control>,
-    > = {
+    let spawn: synsema_core::interpreter::SpawnHook = {
         let sw = swarm.clone();
         let ceiling = ceiling.clone();
         Rc::new(move |agent, body, args, globals| {

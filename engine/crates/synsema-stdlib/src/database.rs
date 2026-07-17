@@ -796,10 +796,7 @@ fn pg_row_to_syn(row: &postgres::Row) -> Row {
 
 /// Lee `Option<T>`: NULL o tipo no convertible → `None`.
 fn cell_opt<'a, T: FromSql<'a>>(row: &'a postgres::Row, i: usize) -> Option<T> {
-    match row.try_get::<usize, Option<T>>(i) {
-        Ok(opt) => opt,
-        Err(_) => None,
-    }
+    row.try_get::<usize, Option<T>>(i).unwrap_or_default()
 }
 
 fn pg_cell_to_syn(row: &postgres::Row, i: usize, ty: &Type) -> SynValue {
@@ -1001,9 +998,9 @@ fn syn_to_mysql(v: &SynValue) -> mysql::Value {
 }
 
 fn mysql_query(conn: &mut mysql::Conn, sql: &str, params: &[SynValue]) -> Result<Vec<Row>, String> {
-    let mut result = conn.exec_iter(sql, mysql_params(params)).map_err(mysql_err)?;
+    let result = conn.exec_iter(sql, mysql_params(params)).map_err(mysql_err)?;
     let mut out = Vec::new();
-    while let Some(row_res) = result.next() {
+    for row_res in result {
         let row = row_res.map_err(mysql_err)?;
         let cols = row.columns(); // Arc<[Column]> (mismo orden que los valores)
         let values = row.unwrap(); // Vec<Value>, consume la fila
