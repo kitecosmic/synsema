@@ -284,6 +284,9 @@ print(cron_status())               -- formatted status
 ```
 
 Semantics (know these before reaching for cron):
+- Signatures: `cron_every(seconds, task)` / `cron_after(seconds, task)` → both **return
+  the job name (text)**, which is what `cron_cancel(name)` takes. The `task` argument is
+  a task reference (`sync_inventory`) or its name as text (`"sync_inventory"`).
 - The task must take **0 parameters** and be defined at the top level (the job runs it
   by name). Required parameters → clear error **at registration**; wrap it instead.
 - **Intervals, not wall-clock cron**: fixed delay between the END of one run and the

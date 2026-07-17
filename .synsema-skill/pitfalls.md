@@ -158,6 +158,11 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | A NaN/infinite value plots as a gap | **Error** (a silent gap or a broken SVG would lie to the reader) | Filter first with `where(...)` + `is_finite(...)` |
 | `histogram` counts every value with explicit edges | Values **outside the edges are discarded** (NumPy semantics) | Widen the edges, or use integer `bins` (auto range [min, max]) |
 | `chart(...)` returns SVG text | It returns a **content node** (negotiated HTML/MD/JSON) | For raw SVG text use `chart_svg(...)`; `chart()` lives inside `content(page([...]))` |
+| A `"stacked_bar"` kind exists | No — stacking is an **opt**: `"bar"`/`"area"` + `{"stack": true}` | Stacked area with mixed signs at one x errors (ambiguous) → use stacked bar |
+| Waterfall takes running totals | It takes **deltas**; the running total is computed for you | The MD/JSON outputs include both `delta` and `running` |
+| `{"center": n}` works with the default heatmap scale | Error — `center` requires explicit `{"scale": "diverging"}` | `"auto"` already centers on 0 when values cross it; `center` is for other pivots |
+| `{"bins": 4.0}` (float) works like `4` | Error — bins must be an **integer** or an ascending **edge list** | Mirrors `histogram()`; convert first with `round(x)`/`floor(x)` (there is no `int()`) |
+| Boxplot draws a group of 1 value | Error — **≥2 values per group** (a 1-point box is garbage) | Aggregate differently or drop the group |
 | `svg_to_png` renders animations / scripts | The PNG is the **static** state (resvg ignores scripts/SMIL) | By design — nothing in an SVG ever executes |
 | A `<image href="http://...">` loads in the PNG | Never fetched — **no network, no disk** from a pure builtin | Embed the image as a `data:` URL if you need it rasterized |
 | Any font in the SVG renders as requested | One embedded sans (DejaVu); unknown families fall back to it; missing glyphs (full CJK, color emoji) → tofu | Deterministic by design; custom/system fonts may come later |
