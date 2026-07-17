@@ -188,10 +188,8 @@ fn children(n: &Node) -> Vec<&Node> {
             ..
         } => {
             let mut v = vec![port.as_ref()];
-            for opt in [auth_handler, max_body, max_streams, rate_limit, cors, describe, tls_cert, tls_key, tls_auto_email, domain] {
-                if let Some(b) = opt {
-                    v.push(b);
-                }
+            for b in [auth_handler, max_body, max_streams, rate_limit, cors, describe, tls_cert, tls_key, tls_auto_email, domain].into_iter().flatten() {
+                v.push(b);
             }
             v.extend(static_mounts.iter());
             v.extend(routes.iter());
@@ -200,10 +198,8 @@ fn children(n: &Node) -> Vec<&Node> {
         }
         HostBlock { pattern, auth_handler, static_mounts, routes, tls_cert, tls_key } => {
             let mut v = vec![pattern.as_ref()];
-            for opt in [auth_handler, tls_cert, tls_key] {
-                if let Some(b) = opt {
-                    v.push(b);
-                }
+            for b in [auth_handler, tls_cert, tls_key].into_iter().flatten() {
+                v.push(b);
             }
             v.extend(static_mounts.iter());
             v.extend(routes.iter());
@@ -657,10 +653,8 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
             ..
         } => {
             let mut v = vec![port.as_mut()];
-            for opt in [auth_handler, max_body, max_streams, rate_limit, cors, describe, tls_cert, tls_key, tls_auto_email, domain] {
-                if let Some(b) = opt {
-                    v.push(b.as_mut());
-                }
+            for b in [auth_handler, max_body, max_streams, rate_limit, cors, describe, tls_cert, tls_key, tls_auto_email, domain].into_iter().flatten() {
+                v.push(b.as_mut());
             }
             v.extend(static_mounts.iter_mut());
             v.extend(routes.iter_mut());
@@ -669,10 +663,8 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
         }
         HostBlock { pattern, auth_handler, static_mounts, routes, tls_cert, tls_key } => {
             let mut v = vec![pattern.as_mut()];
-            for opt in [auth_handler, tls_cert, tls_key] {
-                if let Some(b) = opt {
-                    v.push(b.as_mut());
-                }
+            for b in [auth_handler, tls_cert, tls_key].into_iter().flatten() {
+                v.push(b.as_mut());
             }
             v.extend(static_mounts.iter_mut());
             v.extend(routes.iter_mut());

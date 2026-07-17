@@ -12,6 +12,7 @@
 //!   1. `reveal()` — con capability `require reveal` y audit persistente.
 //!   2. el borde del socket HTTP (materializar un header `Authorization`).
 //!   3. el borde de la DB (persistir vía SQL parametrizado).
+//!
 //! En el core, ese acceso es `SecretInner::expose()` — pensado para el runtime, no
 //! para el lenguaje.
 

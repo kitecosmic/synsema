@@ -11,7 +11,7 @@
 //! Este archivo cubre, por subsistemas (cada uno gateado con su differential):
 //!   1. routing/match  — `specificity`, `path_match`, `match_route`, `methods_for_path`
 //!   2. contrato de respuesta — pendiente (envelopes/paginación)
-//!   ... (static, negotiation, rate-limit, SSE, discovery, CORS, max_body)
+//!      … y siguen: static, negotiation, rate-limit, SSE, discovery, CORS, max_body
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -264,7 +264,7 @@ pub fn specificity(pattern: &str) -> Vec<i32> {
 /// True si el último segmento del patrón es un `:param` (puede tragarse un sufijo
 /// de formato). Un literal o `*catchall` mantiene el valor con punto.
 pub fn param_last_segment(pattern: &str) -> bool {
-    segments(pattern).last().map_or(false, |s| s.starts_with(':'))
+    segments(pattern).last().is_some_and(|s| s.starts_with(':'))
 }
 
 /// Devuelve los params capturados si `path` matchea `pattern`, o None.
@@ -541,7 +541,7 @@ pub fn syn_to_json(v: &SynValue) -> Json {
             ServerValue::Node(_) => node_to_json(v),
             ServerValue::Content(inner) => node_to_json(inner),
             // paged() fuera del contrato → materializa todo (sin LIMIT).
-            ServerValue::Paged(fetch) => match (&**fetch)(None, 0) {
+            ServerValue::Paged(fetch) => match (**fetch)(None, 0) {
                 Ok((rows, _)) => Json::Array(rows.iter().map(syn_to_json).collect()),
                 Err(_) => Json::Null,
             },
@@ -863,7 +863,7 @@ impl HostRouter {
         auth_handler: Option<AuthHandler>,
     ) -> Self {
         // Orden por especificidad (más específica primero): el primer match gana.
-        routes.sort_by(|a, b| specificity(&a.path).cmp(&specificity(&b.path)));
+        routes.sort_by_key(|a| specificity(&a.path));
         // Mounts: prefijo normalizado + realpath del directorio, prefijo más largo primero.
         let mut mounts: Vec<(String, PathBuf)> = static_mounts
             .into_iter()
@@ -872,7 +872,7 @@ impl HostRouter {
                 (norm_prefix(&p), real)
             })
             .collect();
-        mounts.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        mounts.sort_by_key(|m| std::cmp::Reverse(m.0.len()));
         HostRouter { pattern, routes, static_mounts: mounts, auth_handler }
     }
 
@@ -1180,7 +1180,7 @@ impl ServeRuntime {
         }
         let mut endpoints: Vec<(String, String)> =
             self.default_host.routes.iter().map(|r| (r.method.clone(), r.path.clone())).collect();
-        endpoints.sort_by(|a, b| (a.1.clone(), a.0.clone()).cmp(&(b.1.clone(), b.0.clone())));
+        endpoints.sort_by_key(|a| (a.1.clone(), a.0.clone()));
         endpoints.dedup();
         if !endpoints.is_empty() {
             lines.push(String::new());
@@ -1659,13 +1659,13 @@ impl ServeRuntime {
 
 // -- reverse proxy (Lote 2) --
 
+/// Respuesta del upstream de un proxy: (status, content_type, headers, body).
+type ProxyResponse = (u16, String, Vec<(String, String)>, Vec<u8>);
+
 /// Forward sync de la request al upstream `http://host[:port][/base]`. Devuelve
 /// (status, content_type, headers end-to-end, body). Cliente HTTP/1.1 mínimo
 /// (Connection: close); corre dentro de spawn_blocking, así que bloquear está bien.
-fn proxy_forward(
-    target: &str,
-    ctx: &Ctx,
-) -> Result<(u16, String, Vec<(String, String)>, Vec<u8>), String> {
+fn proxy_forward(target: &str, ctx: &Ctx) -> Result<ProxyResponse, String> {
     use std::io::Read;
     let rest = target
         .strip_prefix("http://")
@@ -1714,7 +1714,7 @@ fn proxy_forward(
     parse_proxy_response(&raw)
 }
 
-fn parse_proxy_response(raw: &[u8]) -> Result<(u16, String, Vec<(String, String)>, Vec<u8>), String> {
+fn parse_proxy_response(raw: &[u8]) -> Result<ProxyResponse, String> {
     let pos = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -3287,9 +3287,10 @@ fn redirect_one(stream: TcpStream, https_port: u16) -> io::Result<()> {
     stream.flush()
 }
 
-fn read_request_head<R: BufRead>(
-    reader: &mut R,
-) -> Option<(String, String, String, Vec<(String, String)>)> {
+/// Head parseado de una request: (método, target, versión, headers).
+type RequestHead = (String, String, String, Vec<(String, String)>);
+
+fn read_request_head<R: BufRead>(reader: &mut R) -> Option<RequestHead> {
     let mut line = String::new();
     if reader.read_line(&mut line).ok()? == 0 {
         return None; // EOF / conexión cerrada

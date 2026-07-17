@@ -54,7 +54,7 @@ fn require(caps: &Rc<RefCell<CapabilitySet>>, cap: Capability, source: &str) -> 
 pub fn url_hostname(url: &str) -> Option<String> {
     let after = url.find("://").map(|i| &url[i + 3..])?;
     let end = after
-        .find(|c| c == '/' || c == '?' || c == '#')
+        .find(['/', '?', '#'])
         .unwrap_or(after.len());
     let netloc = &after[..end];
     let host_port = match netloc.rfind('@') {
@@ -96,9 +96,8 @@ fn atomic_write(path: &str, data: &[u8]) -> std::io::Result<()> {
     let tmp = format!("{}.synsema.tmp", path);
     std::fs::write(&tmp, data)
         .and_then(|_| std::fs::rename(&tmp, path))
-        .map_err(|e| {
+        .inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
-            e
         })
 }
 
@@ -721,7 +720,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     _ => None,
                 };
                 let max_output = match opt("max_output") {
-                    Some(SynValue::Number(n)) => (n.to_f64() as usize).max(0),
+                    Some(SynValue::Number(n)) => n.to_f64() as usize,
                     _ => 10 * 1024 * 1024,
                 };
 

@@ -298,7 +298,7 @@ fn hexval(c: u8) -> Option<u8> {
 fn from_hex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
     let bytes = s.as_bytes();
-    if bytes.is_empty() || bytes.len() % 2 != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);

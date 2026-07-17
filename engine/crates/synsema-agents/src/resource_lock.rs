@@ -161,7 +161,7 @@ impl ResourceLockManager {
 
     pub fn is_locked(&self, resource: &str) -> bool {
         let inner = self.inner.lock().unwrap();
-        inner.locks.get(resource).map_or(false, |v| v.iter().any(|l| l.active))
+        inner.locks.get(resource).is_some_and(|v| v.iter().any(|l| l.active))
     }
 
     pub fn who_holds(&self, resource: &str) -> Vec<String> {

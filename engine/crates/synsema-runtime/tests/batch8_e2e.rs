@@ -117,6 +117,9 @@ sandbox
 // =========================================================
 
 #[test]
+// NOTA de mantenimiento: el assert del kind inválido fija la lista LITERAL completa
+// de kinds. Al agregar un kind, este assert DEBE actualizarse — es intencional que
+// duela: obliga a mirar el mensaje de error que ve el usuario.
 fn chart_errors_recoverable() {
     let o = out(
         r#"let msg be ""
@@ -130,7 +133,7 @@ try
     chart_svg("treemap", [1])
 recover err
     set msg2 to err
-print(contains(msg2, "valid kinds"))
+print(contains(msg2, "valid kinds are: area, bar, boxplot, donut, heatmap, histogram, line, pie, scatter, waterfall"))
 print("sigue vivo")"#,
     );
     assert_eq!(o, vec!["true", "true", "sigue vivo"]);

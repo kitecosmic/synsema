@@ -1703,13 +1703,13 @@ impl Parser {
                     return Err(ParseError::new(
                         format!(
                             "Catch-all '*{}' must be the LAST segment of the path, got {}",
-                            &seg[1..],
+                            seg.strip_prefix('*').unwrap_or(seg),
                             py_repr_str(&path)
                         ),
                         loc.clone(),
                     ));
                 }
-                param_names.push(seg[1..].to_string());
+                param_names.push(seg.strip_prefix('*').unwrap_or(seg).to_string());
             }
         }
         Ok((method, path, param_names))

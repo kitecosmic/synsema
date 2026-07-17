@@ -29,7 +29,7 @@ fn raw_str(v: &SynValue) -> String {
     }
 }
 
-fn nth<'a>(args: &'a [SynValue], i: usize) -> Result<&'a SynValue, Control> {
+fn nth(args: &[SynValue], i: usize) -> Result<&SynValue, Control> {
     args.get(i).ok_or_else(|| err("missing argument"))
 }
 
@@ -141,7 +141,7 @@ pub fn register_agent_builtins(
                 None | Some(SynValue::Nothing) => None,
                 Some(v) => Some(raw_str(v)),
             };
-            let category = opt_arg(args.get(0));
+            let category = opt_arg(args.first());
             let tags = if matches!(args.get(1), Some(SynValue::List(_))) { Some(str_list(args.get(1))) } else { None };
             let search = opt_arg(args.get(2));
             // 4º arg opcional `mode`: "all" (AND) o "any"/ausente (OR, default). (MF-005)
@@ -264,7 +264,7 @@ pub fn register_serve_memory_builtins(
     {
         let s = shared.clone();
         interp.register_builtin("recall", -1, Rc::new(move |_i, args, _l| {
-            let category = args.get(0).map(raw_str).filter(|s| s != "nothing");
+            let category = args.first().map(raw_str).filter(|s| s != "nothing");
             let tags = if matches!(args.get(1), Some(SynValue::List(_))) {
                 Some(str_list(args.get(1)))
             } else {

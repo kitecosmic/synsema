@@ -201,7 +201,7 @@ fn run_parallel(
                     Err(c) => {
                         let re = control_to_error(c);
                         let mut e = error.lock().unwrap();
-                        if e.as_ref().map_or(true, |(idx, _)| i < *idx) {
+                        if e.as_ref().is_none_or(|(idx, _)| i < *idx) {
                             *e = Some((i, re));
                         }
                         aborted.store(true, Ordering::Relaxed);

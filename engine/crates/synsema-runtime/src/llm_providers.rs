@@ -140,6 +140,12 @@ pub struct SseAccumulator {
     cur_data: Vec<String>,
 }
 
+impl Default for SseAccumulator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SseAccumulator {
     pub fn new() -> Self {
         Self { buf: String::new(), cur_event: None, cur_data: Vec::new() }
@@ -1245,8 +1251,8 @@ fn contains_whole(haystack: &str, needle: &str) -> bool {
         let abs = start + pos;
         let end = abs + needle.len();
         let before_ok =
-            haystack[..abs].chars().next_back().map_or(true, |c| !c.is_alphanumeric());
-        let after_ok = haystack[end..].chars().next().map_or(true, |c| !c.is_alphanumeric());
+            haystack[..abs].chars().next_back().is_none_or(|c| !c.is_alphanumeric());
+        let after_ok = haystack[end..].chars().next().is_none_or(|c| !c.is_alphanumeric());
         if before_ok && after_ok {
             return true;
         }
