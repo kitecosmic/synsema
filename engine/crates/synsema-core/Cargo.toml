@@ -25,3 +25,7 @@ ndarray.workspace = true
 faer.workspace = true
 # CSV RFC 4180 (Batch 8): csv_parse/csv_encode. Puro-Rust, sin C (ver workspace).
 csv.workspace = true
+# base58 (Batch 11): formato de bytes()/decode() (Solana/Bitcoin). Crate canónico
+# puro-Rust — código de direcciones de dinero: no se hand-rollea. base32 sí es
+# hand-rolled en bytesutil (RFC 4648, trivial).
+bs58.workspace = true

@@ -693,6 +693,8 @@ mod tests {
     }
 
     #[test]
+    // El literal "3.14" es el INPUT del lexer bajo prueba, no una aproximación de π.
+    #[allow(clippy::approx_constant)]
     fn float_and_underscore() {
         let toks = Lexer::new("3.14\n1_000", "<test>").tokenize_filtered().unwrap();
         assert_eq!(toks[0].value, TokenValue::Number(Number::Float(3.14)));

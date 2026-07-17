@@ -54,10 +54,19 @@ not errors and pass through `try/recover` untouched.
 - ⚠️ A pathological pattern can be slow (ReDoS) — don't feed untrusted input as a *pattern* without care.
 
 ## Bytes / binary (pure — no capability)
-- `bytes(text)` → utf8 bytes; `bytes(text, "hex")` / `bytes(text, "base64")` → decode; `bytes([72,73])` → from ints 0–255; `bytes(bytes)` → identity. `bytes(secret)` → **error** (plaintext never materializes).
-- `decode(b)` / `decode(b, "utf8")` → text (UTF-8 **strict**, errors on invalid); `decode(b, "utf8_lossy")` → with `U+FFFD`; `decode(b, "hex")` / `decode(b, "base64")` → text. (so `bytes(...)` ↔ `decode(...)` are inverses)
+- `bytes(text)` → utf8 bytes; `bytes(text, "hex"|"base64"|"base58"|"base32")` → decode; `bytes([72,73])` → from ints 0–255; `bytes(bytes)` → identity. `bytes(secret)` → **error** (plaintext never materializes). base58 = Bitcoin/Solana; base32 = RFC 4648 (Algorand). `bytes + bytes` = concat.
+- `decode(b)` / `decode(b, "utf8")` → text (UTF-8 **strict**, errors on invalid); `decode(b, "utf8_lossy")` → with `U+FFFD`; `decode(b, "hex"|"base64"|"base58"|"base32")` → text. (so `bytes(...)` ↔ `decode(...)` are inverses)
 - `is_bytes(x)` → bool. `b[i]` → int 0–255; `bytes + bytes` → concatenation; `length`/`slice`/`contains` work on bytes.
 - `sha256(x)` / `sha512(x)` → **bytes** (raw digest). x: text → hashes utf8; bytes → raw. Hex via `decode(sha256(x), "hex")`. `sha256(secret)` → error.
+- `keccak256(x)` / `sha512_256(x)` → **bytes(32)**. ⚠️ `keccak256` is PRE-NIST Keccak (Ethereum), NOT SHA3-256 (`keccak256("")`=`c5d24601…`). Same rules as `sha256` (secret → error).
+- `bytes_to_int(b)` → non-negative integer from big-endian bytes, **exact** (empty → 0; 256-bit values never touch float). `int_to_bytes(n, size?)` → big-endian bytes: minimal without `size` (no leading zeros; 0 → empty), zero-padded to exactly `size` with it (error if it doesn't fit). Inverses. Use them to put a signature's r/s into RLP as integers.
+
+Blockchain — sign/verify/derive (all pure-Rust; see stdlib.md for the security model):
+- `secp256k1_sign(digest32, secret)` → bytes(65) `r‖s‖v` — **requires `sign("NAME")`** + audit; RFC 6979 deterministic, low-s. digest must be exactly 32 bytes (keccak256 it first).
+- `secp256k1_verify(digest, sig, pubkey)` → bool; `secp256k1_recover(digest, sig65)` → bytes(65) pubkey (ecrecover); `secp256k1_pubkey(secret, compressed?)` → bytes(33|65). Pure.
+- `ed25519_sign(message, secret)` → bytes(64) — **requires `sign("NAME")`** + audit. ⚠️ signs the RAW message (do NOT pre-hash). `ed25519_verify(msg, sig, pubkey)` → bool (**strict**: rejects small-order keys/points, matching what Solana/Algorand accept); `ed25519_pubkey(secret)` → bytes(32). Pure.
+- `eth_address(pubkey_or_secret)` → EIP-55 text; `rlp_encode(value)` → bytes (bytes/non-neg int/list; text→error); `rlp_decode(bytes)` → value (**canonical-strict**: non-minimal encodings error, like Ethereum's decoders). `bech32_encode(hrp, data, variant?)` / `bech32_decode(text)`→`{hrp,data,variant}`. Pure.
+- The key is always a `secret` (text→hex, bytes→raw); never a plain string. Errors describe size/shape, never the key. Signing DENIED inside `sandbox`.
 - Note: `text(b)` / `print(b)` show a hex repr like `bytes(48656c6c6f)`, **not** a decode. `bytes != text` always.
 
 ## JSON (pure — no capability)

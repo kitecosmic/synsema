@@ -1,5 +1,5 @@
-//! Conformidad de las primitivas de I/O (spec IO-P1): navegación + lectura por rango
-//! + fix de seguridad del scope de ruta (`covers()` normaliza, cierra el bypass `..`).
+//! Conformidad de las primitivas de I/O (spec IO-P1): navegación, lectura por rango
+//! y fix de seguridad del scope de ruta (`covers()` normaliza, cierra el bypass `..`).
 //! También IO-P2: `grep` (búsqueda streaming), `edit_file` (edición quirúrgica),
 //! `append_file` (agregar al final). Y IO-P3: `run` (ejecutar procesos del SO, cap `exec`).
 //! Los tests de ejecución real de `run` están cfg-gateados por SO (acá corren los de

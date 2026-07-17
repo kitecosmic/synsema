@@ -157,6 +157,22 @@ usvg = { version = "0.45", default-features = false, features = ["text"] }
 tiny-skia = "0.11"
 fontdb = { version = "0.23", default-features = false }
 svg2pdf = { version = "0.13", default-features = false, features = ["text"] }
+# Criptografía de blockchain (Batch 11): firmar/verificar/derivar para operar
+# on-chain (ETH/Avalanche/Solana/Algorand) con la clave sellada como `secret`.
+# TODO PURO-Rust (RustCrypto/dalek/rust-bitcoin), CERO `*-sys`/C — doctrina del
+# binario único estático (verificado con `cargo tree`). SOLO criptografía
+# defensiva: firma gateada (`require sign`) + audit; verificación/derivación puras.
+#   k256          : secp256k1 + ECDSA (RustCrypto). `ecdsa` trae firma RFC 6979
+#                   (nonce determinista), low-s y recovery id (ecrecover).
+#   ed25519-dalek : Ed25519 RFC 8032 (Solana/Algorand). Determinista por diseño.
+#   sha3          : Keccak-256 PRE-NIST (el de Ethereum; ≠ SHA3-256 estándar).
+#   bs58          : base58 de Bitcoin/Solana (lo usa core en bytes()/decode()).
+#   bech32        : bech32/bech32m BIP-173/350 (Avalanche X/P; direcciones segwit).
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize", "fast"] }
+sha3 = { version = "0.10", default-features = false, features = ["std"] }
+bs58 = "0.5"
+bech32 = "0.11"
 synsema-core = { path = "crates/synsema-core" }
 synsema-capabilities = { path = "crates/synsema-capabilities" }
 synsema-stdlib = { path = "crates/synsema-stdlib" }

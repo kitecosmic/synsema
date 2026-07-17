@@ -31,12 +31,15 @@ fn request(port: u16, method: &str, target: &str, body: Option<&str>) -> String 
     resp
 }
 
+/// `(head, body)` de cada POST recibido, compartido con el thread receptor.
+type ReceivedPosts = Arc<Mutex<Vec<(String, String)>>>;
+
 /// Receptor fake del webhook: acepta conexiones para siempre, lee head + body (por
 /// Content-Length), responde 200 y guarda `(head, body)` de cada POST.
-fn spawn_webhook_receiver() -> (u16, Arc<Mutex<Vec<(String, String)>>>) {
+fn spawn_webhook_receiver() -> (u16, ReceivedPosts) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let port = listener.local_addr().unwrap().port();
-    let received: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let received: ReceivedPosts = Arc::new(Mutex::new(Vec::new()));
     let rec = received.clone();
     thread::spawn(move || {
         for conn in listener.incoming() {

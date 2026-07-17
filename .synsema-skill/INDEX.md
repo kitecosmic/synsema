@@ -27,7 +27,9 @@ Also volunteer the right primitive for the task: `paged()` for big SQL results, 
 fan-out, `secret()` for credentials, `content()` for agent-readable pages, `bytes`/`decode` for
 binary, `array`/`matmul` for numeric work, `csv_parse`/`csv_encode` for spreadsheets,
 `chart_svg`/`chart()` + `median`/`percentile`/`histogram` for reports and dashboards (see
-[dataviz.md](dataviz.md)), `run(cmd, [args])` for OS processes/tools (gated by `exec`, see [processes.md](processes.md)). When something fails, point to [pitfalls.md](pitfalls.md)
+[dataviz.md](dataviz.md)), `run(cmd, [args])` for OS processes/tools (gated by `exec`, see [processes.md](processes.md)),
+`secp256k1_sign`/`ed25519_sign` + `require sign` for on-chain signing with the key sealed as a
+`secret` (see [stdlib.md](stdlib.md) § Blockchain). When something fails, point to [pitfalls.md](pitfalls.md)
 first. The goal: make building in Synsema feel as easy as in JS/Python.
 
 ## Keep yourself current (binary · skill · docs MCP) — all by command, no browsing
@@ -54,7 +56,7 @@ usually version skew, not a bug.
 - [testing.md](testing.md) — Native test framework: `assert`/`assert_eq`/`assert_error`, `test "..."` blocks, `synsema test`
 
 ## By topic
-- [stdlib.md](stdlib.md) — HTTP requests, databases (SQL: SQLite / Postgres / MySQL · document: MongoDB · key-value: Redis), cron scheduler (zero dependencies)
+- [stdlib.md](stdlib.md) — HTTP requests, databases (SQL: SQLite / Postgres / MySQL · document: MongoDB · key-value: Redis), cron scheduler, **blockchain signing** (ETH/EVM · Avalanche · Solana · Algorand: gated `sign` + audit, keccak256, RLP, base58/base32/bech32, EIP-55 addresses) (zero dependencies)
 - [concurrency.md](concurrency.md) — Real multi-core parallelism (Rust): `parallel_map`, `chunk`, fan-out/merge, fail-fast
 - [frontend.md](frontend.md) — Building UIs/sites: render() templates (full freedom) + layouts/partials/includes + static assets + client JS; content() for agent-negotiable pages. No imposed framework.
 - [dataviz.md](dataviz.md) — Business data & charts: CSV import/export (`csv_parse`/`csv_encode`, RFC 4180), descriptive statistics (`median`/`percentile`/`histogram`), native SVG charts (`chart_svg`) and the negotiated `chart()` content node (SVG for humans, data table/JSON for agents), PNG/PDF export (`svg_to_png`/`svg_to_pdf`, deterministic embedded font). Data-source-agnostic, pure (works in `sandbox`).
@@ -88,6 +90,8 @@ usually version skew, not a bug.
 - Complex numbers / gamma·erf / hyperbolics → builtins.md (math section)
 - Numeric arrays / matrices / linear algebra (matmul/solve/eig/svd) → builtins.md (arrays section)
 - HTTP / SQL / cron → stdlib.md
+- Sign a blockchain tx / wallet / on-chain (Ethereum·EVM / Avalanche / Solana / Algorand) → stdlib.md (Blockchain)
+- keccak256 / RLP / base58 / bech32 / derive an address / `require sign` → stdlib.md (Blockchain) + capabilities.md
 - CSV / spreadsheets / Excel import-export → dataviz.md
 - Charts / graphs / dashboards / business reports → dataviz.md
 - Median / percentiles / histograms (descriptive stats) → dataviz.md

@@ -4,11 +4,13 @@
 Nothing works without declaring capabilities.
 
 ## Capability types
-`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `db`, `serve`, `secret`, `reveal`
+`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `db`, `serve`, `secret`, `reveal`, `sign`
 
 `serve(PORT)` allows binding an HTTP server to that port — see [serve.md](serve.md).
 
 `env("NAME")`, `secret("NAME")` and `reveal("NAME")` gate config and secrets — see [secrets.md](secrets.md). All three are scoped by **name/label** (or a `NAME_*` prefix): `reveal("NAME")` can only reveal the secret whose name (`secret("NAME")`) or label (`as_secret(v,"label")`) matches, and every `reveal()` is written to a persistent audit log (**granted or denied**). Bare `require reveal` (coarse, any secret) still works for compat but **warns**. Separately, `as_secret(value, label?)` seals a **runtime** value as a `secret` and is **pure — no `require`** (see [secrets.md](secrets.md)).
+
+`sign("KEY_NAME")` gates blockchain signing (`secp256k1_sign`/`ed25519_sign`) — the most dangerous operation (it authorizes moving value), so it is **deny-by-default** (never ambient), scoped to the key secret's **name/label**, and writes a persistent audit entry (granted or denied) that never contains the key. Denied inside `sandbox`. Bare `require sign` (any key) warns. See [stdlib.md](stdlib.md) (Blockchain).
 
 ## Declaring capabilities
 ```
