@@ -848,6 +848,13 @@ const RECEIPT_QTY_KEYS: &[&str] = &[
     "type",
     "blobGasUsed",
     "blobGasPrice",
+    // L2s OP-stack (Base/Optimism): el fee de DATA en L1 viaja en el receipt como
+    // hex-quantities propios — decodificados a int exacto, el costo total es
+    // gasUsed×effectiveGasPrice + l1Fee (visible, no escondido en un string hex).
+    // (`l1FeeScalar` es un string decimal "0.684", NO hex — pasa tal cual.)
+    "l1Fee",
+    "l1GasPrice",
+    "l1GasUsed",
 ];
 const RECEIPT_ADDR_KEYS: &[&str] = &["from", "to", "contractAddress"];
 const RECEIPT_HASH_KEYS: &[&str] = &["blockHash", "transactionHash"];
@@ -2127,6 +2134,29 @@ mod tests {
     }
 
     #[test]
+    fn tx_eip1559_is_chain_agnostic_l2_chain_ids() {
+        // El builder y todo el read-side son agnósticos de cadena: cualquier EVM
+        // (L1 o L2) es el mismo wire. Base/Optimism/Arbitrum/Polygon construyen
+        // igual que mainnet — el chain_id se LEE del nodo (eth_chain_id), jamás
+        // se asume. (El vector de Avalanche 43114 ya lo prueba end-to-end; esto
+        // documenta la intención para los L2 grandes.)
+        for chain_id in [8453i64, 10, 42161, 137] {
+            let params = map(vec![
+                ("chain_id", syn_int(chain_id)),
+                ("nonce", syn_int(0)),
+                ("to", syn_text("0x6Fac4D18c912343BF86fa7049364Dd4E424Ab9C0")),
+                ("value", syn_int(1)),
+                ("gas", syn_int(21000)),
+                ("max_fee", syn_int(2)),
+                ("max_priority", syn_int(1)),
+            ]);
+            let tx = ok(tx_eip1559(&[params]));
+            assert!(matches!(get(&tx, "digest"), SynValue::Bytes(b) if b.len() == 32));
+            assert_eq!(get(&tx, "chain_id").to_string(), chain_id.to_string());
+        }
+    }
+
+    #[test]
     fn tx_eip1559_tip_over_cap_rejected() {
         let params = map(vec![
             ("chain_id", syn_int(1)),
@@ -2189,6 +2219,19 @@ mod tests {
             _ => panic!("logs"),
         };
         assert!(matches!(get(&log0, "data"), SynValue::Bytes(b) if b.len() == 2));
+
+        // Receipt de un L2 OP-stack (Base/Optimism): los campos L1 decodifican a
+        // int exacto; l1FeeScalar (string decimal, no hex) pasa tal cual.
+        let l2: serde_json::Value = serde_json::from_str(
+            r#"{"status":"0x1","gasUsed":"0x5208","effectiveGasPrice":"0xf4240",
+                "l1Fee":"0x2e8b3aa1196","l1GasUsed":"0x640","l1GasPrice":"0x3b9aca00",
+                "l1FeeScalar":"0.684"}"#,
+        )
+        .unwrap();
+        let r = ok(decode_receipt(&l2, "t"));
+        assert_eq!(get(&r, "l1Fee").to_string(), "3198469935510");
+        assert_eq!(get(&r, "l1GasUsed").to_string(), "1600");
+        assert_eq!(get(&r, "l1FeeScalar").to_string(), "0.684");
 
         // Hostil: status con ceros a la izquierda → error, no un int inventado.
         let bad: serde_json::Value =
