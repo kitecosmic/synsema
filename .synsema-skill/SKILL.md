@@ -59,7 +59,7 @@ usually version skew, not a bug.
 - [testing.md](testing.md) — Native test framework: `assert`/`assert_eq`/`assert_error`, `test "..."`
 
 **By topic**
-- [stdlib.md](stdlib.md) — HTTP requests, WebSocket client (live feeds, gated by `net`), databases (SQL: SQLite / Postgres / MySQL · document: MongoDB · key-value: Redis), cron scheduler, blockchain (ETH/EVM · Avalanche · Solana · Algorand: gated `sign` + audit, HD wallets/keystore gated by `wallet` — BIP-39/BIP-32/SLIP-0010/Algorand-25, ABI calldata, EIP-191/712, Solana message/tx + PDAs/SPL, Algorand canonical msgpack, keccak256, RLP, base58/base32/bech32, EIP-55)
+- [stdlib.md](stdlib.md) — HTTP requests, WebSocket client (live feeds, gated by `net`), databases (SQL: SQLite / Postgres / MySQL · document: MongoDB · key-value: Redis), cron scheduler, blockchain (ETH/EVM · Avalanche · Solana · Algorand: the full read → build → sign → send → confirm loop — RPC read-side gated by `net` (nonce/fees/balances/`eth_call`/receipts, Solana blockhash/confirm, algod params/wait), `tx_eip1559` builder, gated `sign` + audit, HD wallets/keystore gated by `wallet` — BIP-39/BIP-32/SLIP-0010/Algorand-25, ABI calldata, EIP-191/712, Solana message/tx + PDAs/SPL, Algorand canonical msgpack, keccak256, RLP, base58/base32/bech32, EIP-55)
 - [concurrency.md](concurrency.md) — Real multi-core parallelism: `parallel_map`, `chunk`, fan-out/merge
 - [frontend.md](frontend.md) — UIs/sites: `render()` templates, layouts/partials, static assets, `content()`
 - [dataviz.md](dataviz.md) — Data & charts: CSV (`csv_parse`/`csv_encode`), stats (`median`/`percentile`/`histogram`), native SVG charts (`chart_svg` + negotiated `chart()` node — agents get the data, humans the chart), PNG/PDF export (`svg_to_png`/`svg_to_pdf`)

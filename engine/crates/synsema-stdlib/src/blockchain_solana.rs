@@ -31,7 +31,8 @@ use crate::blockchain::{arg, arg_bytes, err};
 // =========================================================
 
 /// Pubkey de 32 bytes desde bytes(32) o text base58.
-fn pubkey32(v: &SynValue, what: &str, fname: &str) -> Result<[u8; 32], Control> {
+/// `pub(crate)`: blockchain_rpc.rs acepta pubkeys con la MISMA regla.
+pub(crate) fn pubkey32(v: &SynValue, what: &str, fname: &str) -> Result<[u8; 32], Control> {
     let raw: Vec<u8> = match v {
         SynValue::Bytes(b) => b[..].to_vec(),
         SynValue::Text(s) => base58_decode(s)
@@ -506,24 +507,39 @@ fn solana_pda(args: &[SynValue]) -> Result<SynValue, Control> {
     Ok(syn_map(m))
 }
 
+/// El ATA es el PDA de [owner, token_program, mint] bajo el ATA program (la
+/// regla de get_associated_token_address del SDK spl-token). `pub(crate)`:
+/// blockchain_rpc.rs (spl_balance) deriva el ATA con la MISMA regla.
+pub(crate) fn ata_address(
+    owner: &[u8; 32],
+    mint: &[u8; 32],
+    token_program: &[u8; 32],
+    fname: &str,
+) -> Result<[u8; 32], Control> {
+    let ata_program: [u8; 32] =
+        base58_decode(ATA_PROGRAM).expect("constante válida").try_into().expect("32 bytes");
+    let seeds = vec![owner.to_vec(), token_program.to_vec(), mint.to_vec()];
+    find_program_address(&seeds, &ata_program)
+        .map(|(address, _bump)| address)
+        .ok_or_else(|| {
+            err(format!("{}: no off-curve address exists (astronomically unlikely)", fname))
+        })
+}
+
+/// El Token Program clásico como bytes (default de spl_ata/spl_balance).
+pub(crate) fn token_program_default() -> [u8; 32] {
+    base58_decode(TOKEN_PROGRAM).expect("constante válida").try_into().expect("32 bytes")
+}
+
 fn spl_ata(args: &[SynValue]) -> Result<SynValue, Control> {
     const F: &str = "spl_ata";
     let owner = pubkey32(arg(args, 0, F)?, "the owner", F)?;
     let mint = pubkey32(arg(args, 1, F)?, "the mint", F)?;
     let token_program = match args.get(2) {
-        None | Some(SynValue::Nothing) => {
-            base58_decode(TOKEN_PROGRAM).expect("constante válida").try_into().expect("32 bytes")
-        }
+        None | Some(SynValue::Nothing) => token_program_default(),
         Some(v) => pubkey32(v, "the token program", F)?,
     };
-    let ata_program: [u8; 32] =
-        base58_decode(ATA_PROGRAM).expect("constante válida").try_into().expect("32 bytes");
-    // El ATA es el PDA de [owner, token_program, mint] bajo el ATA program (la
-    // regla de get_associated_token_address del SDK spl-token).
-    let seeds = vec![owner.to_vec(), token_program.to_vec(), mint.to_vec()];
-    let (address, _bump) = find_program_address(&seeds, &ata_program).ok_or_else(|| {
-        err(format!("{}: no off-curve address exists (astronomically unlikely)", F))
-    })?;
+    let address = ata_address(&owner, &mint, &token_program, F)?;
     Ok(syn_bytes(address.to_vec()))
 }
 

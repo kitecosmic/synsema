@@ -196,6 +196,15 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | A keystore with huge scrypt `n` grinds the CPU | Rejected fast ("out of the accepted range") before any KDF work | Anti-DoS cap on n·r and pbkdf2 c; Geth defaults (n=262144) pass |
 | `ws_recv` blocks until a message arrives | Returns **`nothing`** after the timeout (default 30s) — never blocks forever | `let m be ws_recv(conn, 5)`; ping/pong handled transparently; a huge frame errors (16 MiB default cap), never buffers unbounded |
 | `ws_connect` needs a new capability | It reuses **`net(host)`** (same scope as `http_*`); denied in `sandbox`; `wss://` validates the cert | No new door — WebSocket is transport, gated exactly like HTTP |
+| The RPC read-side (`eth_*`/`solana_*`/`algorand_*` net calls) needs a new capability | Same **`net(host)`** as `http_*`; broadcasting is `net`-gated too (the signature already happened; `sign` stays the only value door) | A monitor agent with `net` reads everything and spends nothing |
+| `tx_eip1559` fills sensible gas/fee defaults | **No silent defaults** — a missing `max_fee`/`gas`/`value` errors naming the reader helper (`eth_fee_history`/`eth_estimate_gas`) | Anti blind-signing extended to fees; the result map echoes every number for a `confirm` before signing |
+| Reassemble the signed tx by hand (`bytes([2]) + rlp_encode(...)`) | Still works, but `tx_eip1559_raw(tx, sig)` does v/r/s (y-parity, minimal ints) for you | Pass the 65-byte sig from `secp256k1_sign` as-is — 27/28 v values are rejected with a clear error |
+| A weird RPC response gets patched up | **Strict decode**: non-canonical hex-quantity (`0x01`), wrong shape, mismatched id, >16 MiB body → catchable error | A node is untrusted input (G23) — bad data never silently becomes a number |
+| `eth_wait_receipt` ≠ success; `receipt` ≠ profit | It confirms **inclusion**: check `receipt["status"]` (0 = reverted) and Solana `status["err"]` | A tx can land AND fail; the waiters return the data, you check it |
+| `eth_wait_receipt`/`solana_confirm`/`algorand_wait` hang until confirmed | Bounded polls: **`nothing`** at the timeout (default 60s), like `ws_recv` | An unconfirmed tx never hangs the agent; `algorand_wait` errors on a pool rejection (definitive) |
+| Algorand's suggested `fee` is the flat fee | It's **per byte** (often 0); the flat minimum is `min_fee` (1000 µAlgo) | `algorand_params` returns BOTH so neither mistake compiles into a rejected/overpaid tx |
+| `spl_balance` on a missing token account returns 0 | Catchable **error** (the ATA doesn't exist) | A wrong owner/mint would silently read 0 forever; on success the map includes the derived `ata` so you can verify it |
+| A network blip (5xx / dropped connection) mid-wait kills the waiter | After a first successful poll, **transient** failures retry until the deadline (one stderr notice, no agent action needed) | Deadline mid-failure → the ERROR surfaces (not `nothing`) — "unconfirmed" ≠ "node stopped answering"; a wrong URL still fails fast on the FIRST poll |
 
 ## Behavioral surprises
 

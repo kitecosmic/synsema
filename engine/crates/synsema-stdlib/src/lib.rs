@@ -7,6 +7,7 @@ pub mod blockchain;
 pub mod blockchain_abi;
 pub mod blockchain_algorand;
 pub mod blockchain_hd;
+pub mod blockchain_rpc;
 pub mod blockchain_solana;
 pub mod charts;
 pub mod cron;

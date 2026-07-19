@@ -405,7 +405,8 @@ fn int_value(v: &SynValue, path: &str, fname: &str) -> Result<BigInt, Control> {
 
 /// 20 bytes de dirección desde text `0x…` (EIP-55 validado si viene mixed-case;
 /// todo-minúsculas o todo-mayúsculas se acepta sin checksum) o bytes(20).
-fn addr20(v: &SynValue, path: &str, fname: &str) -> Result<[u8; 20], Control> {
+/// `pub(crate)`: blockchain_rpc.rs valida direcciones con la MISMA regla.
+pub(crate) fn addr20(v: &SynValue, path: &str, fname: &str) -> Result<[u8; 20], Control> {
     match v {
         SynValue::Bytes(b) => {
             if b.len() != 20 {

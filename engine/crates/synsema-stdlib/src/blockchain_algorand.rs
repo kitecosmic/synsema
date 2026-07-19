@@ -46,7 +46,8 @@ fn address_from_pubkey(pk: &[u8; 32]) -> String {
 }
 
 /// Decodifica y VALIDA una dirección text (58 chars base32 con checksum) → pubkey.
-fn address_to_pubkey(s: &str, what: &str, fname: &str) -> Result<[u8; 32], Control> {
+/// `pub(crate)`: blockchain_rpc.rs (algorand_account) valida con la MISMA regla.
+pub(crate) fn address_to_pubkey(s: &str, what: &str, fname: &str) -> Result<[u8; 32], Control> {
     if s.len() != 58 {
         return Err(err(format!(
             "{}: {} must be a 58-character Algorand address, got {} characters",
