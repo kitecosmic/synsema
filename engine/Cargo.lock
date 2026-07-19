@@ -2408,6 +2408,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda"
 dependencies = [
  "libc",
+ "log",
  "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.61.2",
 ]
@@ -4214,6 +4215,7 @@ dependencies = [
  "indexmap",
  "instant-acme",
  "k256",
+ "mio",
  "mongodb",
  "mysql",
  "ndarray",

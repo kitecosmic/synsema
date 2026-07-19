@@ -63,6 +63,11 @@ aes.workspace = true
 ctr.workspace = true
 curve25519-dalek.workspace = true
 tungstenite.workspace = true
+# Batch 15 (WebSocket de primera clase): poller de readiness cross-platform
+# (epoll/kqueue/IOCP) para el multiplexado no-bloqueante de ws_select. YA está en el
+# árbol (v1.2.1, transitivo de tokio/hyper) — hacerlo directo NO agrega crate ni C-ABI
+# nuevo (mio son bindings de syscalls del SO ya presentes, no una lib C que compile). G8.
+mio = { version = "1", features = ["os-poll", "net"] }
 # A2 stack web: gzip (miniz_oxide puro-Rust, sin C) + TLS (rustls con backend ring).
 flate2 = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
