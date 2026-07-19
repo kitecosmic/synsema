@@ -542,6 +542,13 @@ bad data; errors name the host only, never the full URL — API keys live in the
   `eth_wait_receipt(url, hash, confirmations?, timeout?)` → receipt after N confs or `nothing`.
   Receipt decoding is typed: quantities→int, addresses→EIP-55 text, hashes→`"0x…"` text,
   log `data`→bytes.
+- **EVM L2s work out of the box** (Base, Optimism, Arbitrum, Polygon — same JSON-RPC wire):
+  point the `url` at the L2's RPC and READ the chain id with `eth_chain_id(url)` (never
+  hardcode it). One honest caveat: on OP-stack chains (Base/Optimism) `eth_estimate_gas`
+  covers only the L2 execution — the total cost adds an L1 DATA fee that arrives in the
+  receipt as `l1Fee`/`l1GasUsed`/`l1GasPrice` (decoded to exact ints): total paid =
+  `gasUsed × effectiveGasPrice + l1Fee`. Arbitrum folds its L1 component into `gasUsed`
+  instead (no extra field).
 - EIP-1559 builders (PURE): `tx_eip1559(params)` with `{chain_id, nonce, to, value, gas,
   max_fee, max_priority, data?, access_list?}` — EVERY value-moving field explicit (no
   silent defaults; a missing field errors naming the reader helper) → `{digest, fields,
