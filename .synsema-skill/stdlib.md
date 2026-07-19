@@ -415,7 +415,7 @@ synsema serve server.syn
 # Serving 3 cron job(s). Press Ctrl+C to stop.
 ```
 
-## Blockchain (read → build → sign → send → confirm — ETH/Avalanche/Solana/Algorand)
+## Blockchain (read → build → sign → send → confirm — ETH/Avalanche/Solana/Algorand/Bitcoin)
 
 Operate on-chain from an agent with the private key sealed as a `secret` that NEVER
 materializes. The full autonomous loop: READ what you need (nonce/fees/blockhash/params),
@@ -497,6 +497,37 @@ let ata be spl_ata(owner_pubkey, mint)           -- associated token account (a 
 let data be spl_transfer_checked_data(amount, decimals)  -- SPL TransferChecked ix data (tag 12)
 ```
 
+**Bitcoin — the UTXO matrix (spend FROM P2WPKH/P2TR key-path, send TO any standard type):**
+Bitcoin is NOT an account chain — the fee is IMPLICIT (inputs − outputs), so forgetting the
+change output DONATES the remainder to miners. `btc_tx` makes that structurally impossible
+(G28: `sum(inputs) == sum(outputs) + fee`, fee declared, or an error naming the exact diff).
+You sign ONCE PER INPUT (BIP-143 for P2WPKH, BIP-341 Schnorr for P2TR — `btc_tx` picks the
+right sighash). `schnorr_sign` uses the SAME `sign` gate — no new capability.
+```
+require net("blockstream.info")
+require sign("HOT")
+let url be "https://blockstream.info/api"
+let k be secret("HOT")
+let addr be btc_address(k)                       -- P2WPKH (BIP-84) default; "p2tr"/"p2pkh" too
+-- READ → BUILD → SIGN → SEND → CONFIRM
+let utxos be btc_utxos(url, addr)                -- [{txid, vout, amount, confirmations}]
+let tx be btc_tx({"inputs": [{"txid": utxos[0]["txid"], "vout": utxos[0]["vout"],
+        "amount": utxos[0]["amount"], "address": addr, "pubkey": secp256k1_pubkey(k)}],
+    "outputs": [{"address": dest, "amount": 20000},
+                {"address": addr, "amount": utxos[0]["amount"] - 20000 - 500}],  -- CHANGE (explicit!)
+    "fee": 500})                                 -- tx echoes fee/vsize/total_in for a confirm
+let sig be secp256k1_sign(tx["digests"][0], k)   -- one sig per input, same order
+let raw be btc_tx_raw(tx, [sig])                 -- witness assembled (DER+SIGHASH_ALL, low-s)
+let txid be btc_send(url, raw)                   -- re-checks the node's txid vs the bytes
+let info be btc_wait(url, txid, 1, 600)          -- bounded poll; nothing on timeout
+-- Taproot key-path: the BIP-341 tweak is applied INSIDE schnorr_sign (never by hand)
+let sigt be schnorr_sign(tx_taproot["digests"][0], kt, "taproot")
+-- PSBT cold custody: agent PREPARES, human signs on hardware wallet, agent finalizes
+let psbt be psbt_encode(tx)                       -- base64, importable in Sparrow/Ledger/…
+let audit be psbt_decode(signed_psbt)             -- {inputs, outputs, amounts, fee, complete}
+let raw2 be psbt_finalize(signed_psbt)            -- → btc_send (the key never touched the agent)
+```
+
 **Read-side / RPC builtins (all `net(host)`-gated; a node is UNTRUSTED input — every
 decode is strict, malformed/oversized/hostile responses → catchable error, never silent
 bad data; errors name the host only, never the full URL — API keys live in the path):**
@@ -543,6 +574,8 @@ Builtins:
 - EVM (pure): `eth_address(pubkey_or_secret)` → EIP-55 text; `rlp_encode(value)` / `rlp_decode(bytes)`; `abi_encode(sig, values)` / `abi_decode(types, data)` / `abi_selector(sig)`; `eip191_digest(message)`; `eip712_digest(domain, types, primary, message)`.
 - Solana (pure): `solana_message(params)` (legacy + `"version": 0`; `lookup_tables` → error) / `solana_tx(msg, sigs)`; `int_to_bytes_le(n, size)` for instruction data; `solana_pda(seeds, program)` → `{address, bump}`; `spl_ata(owner, mint, token_program?)`; `spl_transfer_data(amount)` / `spl_transfer_checked_data(amount, decimals)`.
 - Algorand (pure): `algorand_tx_encode(txn)` / `algorand_tx(txn, sig)` / `algo_address(pubkey_or_secret)`; TXID = `decode(sha512_256(algorand_tx_encode(txn)), "base32")`.
+- Bitcoin (pure): `hash160(x)` → bytes(20); `btc_address(pubkey_or_secret, kind?, network?)` (`"p2wpkh"` default | `"p2tr"` | `"p2pkh"`; networks mainnet/testnet/signet/regtest); `btc_address_decode(text)` → `{kind, network, program, encoding}` (BIP-350 strict); `btc_script(address)` → scriptPubKey bytes; `btc_txid(raw)` → hex (byte-reversed); `schnorr_sign(digest32, secret, "taproot"?)` [**require sign**] / `schnorr_verify(digest32, sig64, xonly32)` / `schnorr_pubkey(secret)`; `btc_tx(params)` → `{digests, fee, vsize, + echo}` (G28) / `btc_tx_raw(tx, signatures)`; `psbt_encode(tx)` / `psbt_decode(text, network?)` / `psbt_finalize(text)`.
+- Bitcoin read-side [**require net**]: `btc_utxos(url, addr)`, `btc_balance(url, addr)`, `btc_fee_estimates(url)`, `btc_send(url, raw)`, `btc_wait(url, txid, confs?, timeout?)`, `btc_rpc(url, method, params?, auth?)` (`auth.pass` may be a secret). `wif_import(text, label?)` [**require wallet**] → secret (no reverse export). HD: `hd_derive(seed, "m/84'/0'/0'/0/0")` BIP-84 / `"m/86'/0'/0'/0/0"` BIP-86 → `btc_address`.
 - HD custody [**require wallet**]: `mnemonic_generate(words?, label?)`, `mnemonic_to_seed(mnemonic, passphrase?)`, `mnemonic_from_entropy(entropy, label?)` / `mnemonic_to_entropy(mnemonic)`, `hd_derive(seed, path, curve?, label?)` (`"secp256k1"` default | `"ed25519"` SLIP-0010), `algorand_mnemonic(secret32)` / `algorand_mnemonic_to_key(mnemonic, label?)`, `keystore_import(json, passphrase, label?)` / `keystore_export(secret, passphrase, opts?)` (`opts` = `{"kdf": "scrypt"|"pbkdf2", "n", "r", "p", "c"}`; defaults = Geth scrypt n=262144). ALL return a `secret`; `label?` names it (default: a derived name like `W.seed` / `W/path` — what `wallet`/`sign`/`reveal` scopes match).
 
 **Instinct vs. reality (money code — get these right):**
@@ -604,12 +637,26 @@ Builtins:
   `secret(NAME)`/`[redacted]`, never the value. Back a phrase up on purpose with
   `reveal()` (gated by `reveal("NAME")` + audited). A bad checksum/passphrase → error
   that never echoes the material.
-- All pure-Rust (k256/ed25519-dalek/sha3/bech32/bip39/scrypt/aes), zero `*-sys`. Chains:
-  ETH + Avalanche-C + Solana + Algorand END-TO-END (read → build → sign → send → confirm,
-  SDK-exact), with HD custody + keystore V3 import/export + Solana PDAs/SPL; Avalanche
-  X/P signable. Not yet: Avalanche X/P serialization helpers, Bitcoin, typed
-  `eth_subscribe` over WS (composable in userland with `ws_connect` + `eth_rpc`-style
-  JSON, see the WebSocket section).
+- Bitcoin (G28): the fee is IMPLICIT (inputs − outputs) — forgetting the change output
+  donates the remainder to miners. `btc_tx` requires the fee declared and checks
+  `sum(inputs) == sum(outputs) + fee`, or errors with the exact sat difference. Change is
+  ONE MORE explicit output; coin selection is yours (out of scope). Amounts are exact SATS
+  (a float/decimal errors; 1 BTC = 100_000_000 sats).
+- Bitcoin signs ONCE PER INPUT (not per tx): `btc_tx` returns `digests` (one per input),
+  each over its own sighash (BIP-143 P2WPKH / BIP-341 P2TR — `btc_tx` picks). Pass one
+  signature per input to `btc_tx_raw`, same order. Only SIGHASH_ALL/DEFAULT.
+- A taproot address is the TWEAKED key, not the internal one: `btc_address(k, "p2tr")`
+  and `schnorr_sign(digest, k, "taproot")` apply the BIP-341 key-path tweak internally.
+  `schnorr_sign` uses the SAME `sign` gate as secp256k1/ed25519 — no new capability.
+- Bitcoin bech32 vs bech32m (BIP-350): witness v0 (P2WPKH/P2WSH) = bech32, v1 (taproot) =
+  bech32m; the wrong variant is REJECTED (lax decode = burned funds). A cross-network
+  address in a tx errors naming both networks. `btc_txid` is byte-reversed (explorer form).
+- All pure-Rust (k256 incl. schnorr / ed25519-dalek / sha3 / ripemd / bech32 / bip39 /
+  scrypt / aes), zero `*-sys`. Chains: ETH + Avalanche-C + Solana + Algorand + **Bitcoin**
+  END-TO-END (read → build → sign → send → confirm, vector-exact), with HD custody +
+  keystore V3 + Solana PDAs/SPL + Bitcoin PSBT cold custody; Avalanche X/P signable. Not
+  yet: Avalanche X/P serialization helpers, typed `eth_subscribe` over WS (composable in
+  userland with `ws_connect` + `eth_rpc`-style JSON, see the WebSocket section).
 
 ## Capabilities
 

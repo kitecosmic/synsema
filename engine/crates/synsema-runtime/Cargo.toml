@@ -35,3 +35,6 @@ llm-local = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers"]
 # E2E del Batch 13: un mini-servidor WS LOCAL para el dogfood del cliente WebSocket
 # (sin red externa). El mismo tungstenite que usa el stdlib, en modo `accept`.
 tungstenite = { workspace = true }
+# E2E del Batch 16 (Bitcoin): el mock Esplora recomputa el txid (dSHA256 sin
+# witness) de los bytes posteados para validar honestamente btc_send.
+sha2 = { workspace = true }

@@ -168,7 +168,9 @@ svg2pdf = { version = "0.13", default-features = false, features = ["text"] }
 #   sha3          : Keccak-256 PRE-NIST (el de Ethereum; ≠ SHA3-256 estándar).
 #   bs58          : base58 de Bitcoin/Solana (lo usa core en bytes()/decode()).
 #   bech32        : bech32/bech32m BIP-173/350 (Avalanche X/P; direcciones segwit).
-k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+# `schnorr` (Batch 16): firma BIP-340 de taproot — el MISMO crate ya presente, cero
+# dep nueva para firmar Bitcoin (el módulo schnorr viene dentro de k256).
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "std", "schnorr"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize", "fast"] }
 sha3 = { version = "0.10", default-features = false, features = ["std"] }
 bs58 = "0.5"
@@ -191,6 +193,10 @@ bech32 = "0.11"
 #                      rustls con provider aws-lc-sys) — el TLS de `wss://` lo pone ws.rs con
 #                      el MISMO rustls/ring + rustls-native-certs que http.rs.
 bip39 = { version = "2", default-features = false, features = ["std", "unicode-normalization", "zeroize"] }
+# Batch 16 (Bitcoin): ripemd160 — la ÚNICA pieza de hash160 (= ripemd160(sha256(x)),
+# el hash de direcciones de Bitcoin) que faltaba en el árbol. RustCrypto puro-Rust,
+# misma familia que hmac/sha2/pbkdf2 ya presentes; CERO `*-sys`/C (G8).
+ripemd = { version = "0.1", default-features = false }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 scrypt = { version = "0.11", default-features = false }
 aes = "0.8"

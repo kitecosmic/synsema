@@ -133,8 +133,9 @@ fn sign_denied(name: &str) -> Control {
 
 /// Chequea `sign("NAME")` (scope al name del secret — anti-swap: redirigir la variable
 /// a otro secret re-evalúa contra SU name) y escribe el audit. Fail-loud: si no se puede
-/// auditar en el camino concedido, NO se firma.
-fn gate_and_audit(
+/// auditar en el camino concedido, NO se firma. `pub(crate)`: blockchain_btc.rs
+/// (schnorr_sign) usa la MISMA puerta (G30 — cero capability nueva).
+pub(crate) fn gate_and_audit(
     caps: &Rc<RefCell<CapabilitySet>>,
     name: &str,
     curve: &str,
@@ -770,5 +771,11 @@ pub fn register_blockchain_builtins(interp: &Interpreter, caps: Rc<RefCell<Capab
     // -- Batch 14 (read-side): JSON-RPC EVM/Solana + REST algod, TODO gateado por
     //    `net(host)` (G22 — cero capability nueva; `sign` sigue siendo la única
     //    puerta de valor) + los builders EIP-1559 puros.
-    crate::blockchain_rpc::register(interp, caps);
+    crate::blockchain_rpc::register(interp, caps.clone());
+
+    // -- Batch 16 (Bitcoin): direcciones/txid/builder UTXO/PSBT puros;
+    //    `schnorr_sign` con la MISMA puerta `sign`, `wif_import` con `wallet`,
+    //    read-side Esplora/Core con `net(host)` (G30 — cero puerta nueva).
+    crate::blockchain_btc::register(interp, caps.clone());
+    crate::blockchain_btc_rpc::register(interp, caps);
 }

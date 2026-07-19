@@ -64,8 +64,9 @@ fn wallet_denied(name: &str) -> Control {
 
 /// Chequea `wallet("NAME")` (scope al name del secret de origen, o al label del
 /// secret nuevo al generar) y escribe el audit en `wallet.log`. Fail-loud: si no
-/// se puede auditar en el camino concedido, NO se crea custodia.
-fn gate_wallet(
+/// se puede auditar en el camino concedido, NO se crea custodia. `pub(crate)`:
+/// blockchain_btc.rs (wif_import) es custodia con la MISMA puerta (G30).
+pub(crate) fn gate_wallet(
     caps: &Rc<RefCell<CapabilitySet>>,
     name: &str,
     op: &str,
@@ -109,7 +110,7 @@ fn text_secret_material(v: &SynValue, fname: &str, what: &str) -> Result<(String
     }
 }
 
-fn opt_label(v: Option<&SynValue>, fname: &str, default: &str) -> Result<String, Control> {
+pub(crate) fn opt_label(v: Option<&SynValue>, fname: &str, default: &str) -> Result<String, Control> {
     match v {
         None | Some(SynValue::Nothing) => Ok(default.to_string()),
         Some(SynValue::Text(s)) => Ok(s.to_string()),

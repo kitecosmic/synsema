@@ -54,10 +54,11 @@ use crate::http::{header_pairs, http_request, http_request_body_bytes, HttpResul
 use crate::server::{dumps, json_to_syn, Json};
 
 /// Timeout HTTP de cada request RPC individual (mismo default que `http_*`).
-const RPC_HTTP_TIMEOUT_SECS: u64 = 30;
+/// `pub(crate)`: blockchain_btc_rpc.rs comparte transporte y doctrina (G22–G23).
+pub(crate) const RPC_HTTP_TIMEOUT_SECS: u64 = 30;
 /// Techo anti-DoS del body de una respuesta RPC (G23: "array gigante" → error
 /// atrapable, no un parse de gigabytes de un nodo hostil).
-const MAX_RPC_RESPONSE: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_RPC_RESPONSE: usize = 16 * 1024 * 1024;
 /// Un hex-quantity EVM es un uint de a lo sumo 256 bits (64 nibbles). Más largo =
 /// basura u hostilidad, jamás un valor real.
 const MAX_HEXQ_NIBBLES: usize = 64;
@@ -78,7 +79,7 @@ const MAX_DEPTH: usize = 64;
 
 /// La MISMA capability `net(host)` que http_*/fetch/ws_connect (G22): scope =
 /// hostname minúsculas sin puerto; sin host extraíble → URL crudo (fail-closed).
-fn require_net(caps: &Rc<RefCell<CapabilitySet>>, url: &str, source: &str) -> Result<(), Control> {
+pub(crate) fn require_net(caps: &Rc<RefCell<CapabilitySet>>, url: &str, source: &str) -> Result<(), Control> {
     let host = match url_hostname(url) {
         Some(h) if !h.is_empty() => h,
         _ => url.to_string(),
@@ -90,18 +91,18 @@ fn require_net(caps: &Rc<RefCell<CapabilitySet>>, url: &str, source: &str) -> Re
 
 /// Host para mensajes de error — JAMÁS el URL completo (la API key del RPC suele
 /// viajar en el path; un error que la ecoa la filtra a logs/respuestas).
-fn host_of(url: &str) -> String {
+pub(crate) fn host_of(url: &str) -> String {
     url_hostname(url).unwrap_or_else(|| "<invalid url>".to_string())
 }
 
-fn url_arg(v: &SynValue, fname: &str) -> Result<String, Control> {
+pub(crate) fn url_arg(v: &SynValue, fname: &str) -> Result<String, Control> {
     match v {
         SynValue::Text(s) => Ok(s.to_string()),
         other => Err(err(format!("{}: the URL must be text, got {}", fname, other.type_name()))),
     }
 }
 
-fn text_arg(v: &SynValue, what: &str, fname: &str) -> Result<String, Control> {
+pub(crate) fn text_arg(v: &SynValue, what: &str, fname: &str) -> Result<String, Control> {
     match v {
         SynValue::Text(s) => Ok(s.to_string()),
         other => Err(err(format!(
@@ -115,7 +116,7 @@ fn text_arg(v: &SynValue, what: &str, fname: &str) -> Result<String, Control> {
 
 /// Primeros ~200 chars de un body/mensaje de error del nodo, sin controles (el
 /// contenido es input no confiable que va a parar a un mensaje de error).
-fn snippet(s: &str) -> String {
+pub(crate) fn snippet(s: &str) -> String {
     let clean: String = s.chars().filter(|c| !c.is_control()).take(200).collect();
     if s.len() > clean.len() {
         format!("{}…", clean)
@@ -130,13 +131,13 @@ fn snippet(s: &str) -> String {
 /// reintentarle a un mentiroso no es resiliencia). Los one-shots colapsan ambas
 /// al mismo error atrapable; SOLO los waiters (`*_wait`/`*_confirm`) reintentan
 /// las transitorias hasta su deadline.
-enum PollError {
+pub(crate) enum PollError {
     Transient(Control),
     Definitive(Control),
 }
 
 impl PollError {
-    fn into_control(self) -> Control {
+    pub(crate) fn into_control(self) -> Control {
         match self {
             PollError::Transient(c) | PollError::Definitive(c) => c,
         }
@@ -146,7 +147,7 @@ impl PollError {
 /// HttpResult → JSON parseado con los chequeos G23, clasificado: error de
 /// transporte y HTTP 5xx → `Transient`; body sobre el techo, 4xx y JSON
 /// inválido → `Definitive`.
-fn http_result_to_json_classified(
+pub(crate) fn http_result_to_json_classified(
     r: HttpResult,
     url: &str,
     fname: &str,
@@ -192,7 +193,7 @@ fn http_result_to_json_classified(
 }
 
 /// Versión sin clasificar (one-shots): cualquier falla → error atrapable.
-fn http_result_to_json(
+pub(crate) fn http_result_to_json(
     r: HttpResult,
     url: &str,
     fname: &str,
@@ -204,13 +205,15 @@ fn http_result_to_json(
 /// con `id` == el enviado; `error` del nodo → `Definitive` con code+message
 /// (una respuesta del nodo, por hostil que sea, no es un blip de red); sin
 /// `result` → `Definitive`. Devuelve el `result` crudo (`Null` es un result
-/// legítimo, p.ej. un receipt que todavía no existe).
-fn jsonrpc_call_classified(
+/// legítimo, p.ej. un receipt que todavía no existe). `extra_headers`: los que
+/// exige el nodo (p.ej. el Basic auth de Bitcoin Core en `btc_rpc`).
+pub(crate) fn jsonrpc_call_headers_classified(
     url: &str,
     method: &str,
     params: Json,
     fname: &str,
     timeout_secs: u64,
+    extra_headers: &[(String, String)],
 ) -> Result<serde_json::Value, PollError> {
     let body = dumps(&Json::Object(vec![
         ("jsonrpc".to_string(), Json::Str("2.0".to_string())),
@@ -218,7 +221,8 @@ fn jsonrpc_call_classified(
         ("method".to_string(), Json::Str(method.to_string())),
         ("params".to_string(), params),
     ]));
-    let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+    let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+    headers.extend_from_slice(extra_headers);
     let r = http_request("POST", url, Some(&headers), None, Some(&body), timeout_secs);
     let v = http_result_to_json_classified(r, url, fname)?;
     let obj = v.as_object().ok_or_else(|| {
@@ -258,6 +262,17 @@ fn jsonrpc_call_classified(
     })
 }
 
+/// La forma sin headers extra (todo el read-side EVM/Solana).
+fn jsonrpc_call_classified(
+    url: &str,
+    method: &str,
+    params: Json,
+    fname: &str,
+    timeout_secs: u64,
+) -> Result<serde_json::Value, PollError> {
+    jsonrpc_call_headers_classified(url, method, params, fname, timeout_secs, &[])
+}
+
 /// Versión sin clasificar (one-shots): cualquier falla → error atrapable.
 fn jsonrpc_call(
     url: &str,
@@ -275,7 +290,7 @@ fn jsonrpc_call(
 // =========================================================
 
 /// Timeout de espera en segundos (estricto, como ws.rs): default 60 s, cap 24 h.
-fn wait_timeout_arg(v: Option<&SynValue>, fname: &str) -> Result<Duration, Control> {
+pub(crate) fn wait_timeout_arg(v: Option<&SynValue>, fname: &str) -> Result<Duration, Control> {
     let secs = match v {
         None | Some(SynValue::Nothing) => DEFAULT_WAIT_SECS,
         Some(SynValue::Number(n)) => {
@@ -301,7 +316,7 @@ fn wait_timeout_arg(v: Option<&SynValue>, fname: &str) -> Result<Duration, Contr
 
 /// Duerme un paso de polling ACOTADO por el deadline. `false` si ya venció (el
 /// caller devuelve `nothing` — mismo contrato que `ws_recv`).
-fn sleep_step(deadline: Instant, step: Duration) -> bool {
+pub(crate) fn sleep_step(deadline: Instant, step: Duration) -> bool {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return false;
@@ -312,7 +327,7 @@ fn sleep_step(deadline: Instant, step: Duration) -> bool {
 
 /// Timeout HTTP de un poll individual: lo que reste del deadline, con piso 1 s y
 /// techo el default — un nodo mudo no puede estirar la espera total.
-fn poll_http_timeout(deadline: Instant) -> u64 {
+pub(crate) fn poll_http_timeout(deadline: Instant) -> u64 {
     deadline
         .saturating_duration_since(Instant::now())
         .as_secs()
@@ -339,7 +354,7 @@ fn warn_transient_once(warned: &mut bool, c: &Control, fname: &str) {
 /// exitoso previo → aviso (una vez) y `Ok` (el loop reintenta); transitoria en
 /// el PRIMER poll (URL equivocada / nodo muerto: fail-fast, no 60 s de mentira)
 /// o definitiva → propaga.
-fn handle_poll_err(
+pub(crate) fn handle_poll_err(
     e: PollError,
     polled_ok: bool,
     warned: &mut bool,
@@ -359,7 +374,7 @@ fn handle_poll_err(
 /// El deadline venció DURANTE una racha de fallas transitorias: sube el último
 /// error (no `nothing`) — "no confirmó" y "el nodo dejó de responder" son
 /// verdades distintas y el agente debe poder distinguirlas.
-fn deadline_result(last_transient: Option<Control>) -> Result<SynValue, Control> {
+pub(crate) fn deadline_result(last_transient: Option<Control>) -> Result<SynValue, Control> {
     match last_transient {
         Some(Control::Error(e)) => Err(err(format!(
             "{} (the wait deadline expired during this failure)",
@@ -458,7 +473,7 @@ fn bytes_to_hexdata(b: &[u8]) -> String {
 // Navegación estricta de la respuesta (serde_json → error atrapable)
 // =========================================================
 
-fn as_obj<'a>(
+pub(crate) fn as_obj<'a>(
     v: &'a serde_json::Value,
     what: &str,
     fname: &str,
@@ -467,7 +482,7 @@ fn as_obj<'a>(
         .ok_or_else(|| err(format!("{}: {} is not a JSON object", fname, what)))
 }
 
-fn get_str<'a>(
+pub(crate) fn get_str<'a>(
     m: &'a serde_json::Map<String, serde_json::Value>,
     key: &str,
     what: &str,
@@ -490,7 +505,7 @@ fn get_u64(
 }
 
 /// u64 exacto → Number (`Int` si entra en i64, si no `Big` — jamás float lossy).
-fn u64_number(u: u64) -> SynValue {
+pub(crate) fn u64_number(u: u64) -> SynValue {
     match i64::try_from(u) {
         Ok(i) => syn_int(i),
         Err(_) => syn_number(Number::Big(BigInt::from(u))),
@@ -547,8 +562,9 @@ fn syn_to_eth_json(v: &SynValue, path: &str, fname: &str, depth: usize) -> Resul
 
 /// Params Solana/JSON planos: los números viajan como números JSON (no hexq).
 /// `bytes` crudos → error dirigido (¿base58 o base64? el caller decide con
-/// `decode(x, "base58"/"base64")` — no se adivina la codificación).
-fn syn_to_plain_json(v: &SynValue, path: &str, fname: &str, depth: usize) -> Result<Json, Control> {
+/// `decode(x, "base58"/"base64")` — no se adivina la codificación). También el
+/// wire de `btc_rpc` (Bitcoin Core habla JSON plano).
+pub(crate) fn syn_to_plain_json(v: &SynValue, path: &str, fname: &str, depth: usize) -> Result<Json, Control> {
     if depth > MAX_DEPTH {
         return Err(err(format!("{}: {} is nested too deeply", fname, path)));
     }
@@ -599,7 +615,7 @@ fn syn_to_plain_json(v: &SynValue, path: &str, fname: &str, depth: usize) -> Res
 }
 
 /// Lista de params (arg opcional) → `Json::Array` con el conversor dado.
-fn params_arg(
+pub(crate) fn params_arg(
     v: Option<&SynValue>,
     fname: &str,
     convert: impl Fn(&SynValue, &str, &str, usize) -> Result<Json, Control>,
