@@ -103,7 +103,8 @@ fn parse_url(url: &str) -> Result<(String, String, u16, String), String> {
 }
 
 /// Carga los root CAs del SO una vez y los devuelve como `RootCertStore`.
-fn root_cert_store() -> Result<rustls::RootCertStore, String> {
+/// `pub(crate)`: ws.rs (cliente WebSocket) usa el MISMO trust store para `wss://`.
+pub(crate) fn root_cert_store() -> Result<rustls::RootCertStore, String> {
     let mut roots = rustls::RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
     // Los errores de carga parcial no son fatales — usamos los que sí cargaron.

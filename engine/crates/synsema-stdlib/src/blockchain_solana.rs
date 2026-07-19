@@ -16,9 +16,13 @@
 
 use std::rc::Rc;
 
+use curve25519_dalek::edwards::CompressedEdwardsY;
+use sha2::{Digest, Sha256};
+
 use synsema_core::bytesutil::base58_decode;
 use synsema_core::interpreter::{Control, Interpreter};
-use synsema_core::types::{syn_bytes, SynValue};
+use synsema_core::number::Number;
+use synsema_core::types::{syn_bytes, syn_int, syn_map, SynValue};
 
 use crate::blockchain::{arg, arg_bytes, err};
 
@@ -392,10 +396,226 @@ fn solana_tx(args: &[SynValue]) -> Result<SynValue, Control> {
 }
 
 // =========================================================
+// PDAs + SPL (Batch 13, alcance D) — PUROS
+// =========================================================
+
+/// El marcador de dominio de findProgramAddress (el literal del SDK oficial).
+const PDA_MARKER: &[u8] = b"ProgramDerivedAddress";
+/// Programas SPL conocidos (base58 del SDK oficial de Solana):
+const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const ATA_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+
+/// ¿Los 32 bytes decodifican a un punto ed25519 válido? EXACTAMENTE el chequeo
+/// `Pubkey::is_on_curve` del SDK (decompress de curve25519-dalek, el mismo crate):
+/// un PDA debe quedar FUERA de la curva (sin clave privada posible) — por eso el
+/// off-curve check NO es componible en userland.
+fn is_on_curve(bytes: &[u8; 32]) -> bool {
+    CompressedEdwardsY(*bytes).decompress().is_some()
+}
+
+/// Seeds del PDA: lista de bytes o text (UTF-8), cada uno ≤ 32 bytes, máximo 15
+/// (el bump ocupa el 16º slot que permite el protocolo).
+fn parse_seeds(v: &SynValue, fname: &str) -> Result<Vec<Vec<u8>>, Control> {
+    let list = match v {
+        SynValue::List(l) => l.borrow().clone(),
+        other => {
+            return Err(err(format!(
+                "{}: seeds must be a list of bytes/text, got {}",
+                fname,
+                other.type_name()
+            )))
+        }
+    };
+    if list.len() > 15 {
+        return Err(err(format!(
+            "{}: too many seeds ({}, max 15 — the bump seed uses the 16th slot)",
+            fname,
+            list.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(list.len());
+    for (i, s) in list.iter().enumerate() {
+        let b: Vec<u8> = match s {
+            SynValue::Bytes(b) => b[..].to_vec(),
+            SynValue::Text(t) => t.as_bytes().to_vec(),
+            SynValue::Secret(_) => {
+                return Err(err(format!(
+                    "{}: seed {} is a secret — PDA seeds are PUBLIC inputs, never key material",
+                    fname,
+                    i + 1
+                )))
+            }
+            other => {
+                return Err(err(format!(
+                    "{}: seed {} must be bytes or text, got {}",
+                    fname,
+                    i + 1,
+                    other.type_name()
+                )))
+            }
+        };
+        if b.len() > 32 {
+            return Err(err(format!(
+                "{}: seed {} is {} bytes (max 32 per seed)",
+                fname,
+                i + 1,
+                b.len()
+            )));
+        }
+        out.push(b);
+    }
+    Ok(out)
+}
+
+/// findProgramAddress: prueba bump 255→0; el primer hash FUERA de la curva es el
+/// PDA. Espeja `Pubkey::find_program_address` del SDK byte a byte.
+fn find_program_address(
+    seeds: &[Vec<u8>],
+    program: &[u8; 32],
+) -> Option<([u8; 32], u8)> {
+    for bump in (0u8..=255).rev() {
+        let mut h = Sha256::new();
+        for s in seeds {
+            h.update(s);
+        }
+        h.update([bump]);
+        h.update(program);
+        h.update(PDA_MARKER);
+        let candidate: [u8; 32] = h.finalize().into();
+        if !is_on_curve(&candidate) {
+            return Some((candidate, bump));
+        }
+    }
+    None
+}
+
+fn solana_pda(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "solana_pda";
+    let seeds = parse_seeds(arg(args, 0, F)?, F)?;
+    let program = pubkey32(arg(args, 1, F)?, "the program", F)?;
+    let (address, bump) = find_program_address(&seeds, &program).ok_or_else(|| {
+        err(format!(
+            "{}: no off-curve address exists for these seeds (astronomically unlikely; \
+             change a seed)",
+            F
+        ))
+    })?;
+    let mut m = indexmap::IndexMap::new();
+    m.insert("address".to_string(), syn_bytes(address.to_vec()));
+    m.insert("bump".to_string(), syn_int(bump as i64));
+    Ok(syn_map(m))
+}
+
+fn spl_ata(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "spl_ata";
+    let owner = pubkey32(arg(args, 0, F)?, "the owner", F)?;
+    let mint = pubkey32(arg(args, 1, F)?, "the mint", F)?;
+    let token_program = match args.get(2) {
+        None | Some(SynValue::Nothing) => {
+            base58_decode(TOKEN_PROGRAM).expect("constante válida").try_into().expect("32 bytes")
+        }
+        Some(v) => pubkey32(v, "the token program", F)?,
+    };
+    let ata_program: [u8; 32] =
+        base58_decode(ATA_PROGRAM).expect("constante válida").try_into().expect("32 bytes");
+    // El ATA es el PDA de [owner, token_program, mint] bajo el ATA program (la
+    // regla de get_associated_token_address del SDK spl-token).
+    let seeds = vec![owner.to_vec(), token_program.to_vec(), mint.to_vec()];
+    let (address, _bump) = find_program_address(&seeds, &ata_program).ok_or_else(|| {
+        err(format!("{}: no off-curve address exists (astronomically unlikely)", F))
+    })?;
+    Ok(syn_bytes(address.to_vec()))
+}
+
+/// u64 desde un Number del lenguaje (Int no-negativo o Big que entre en u64):
+/// los amounts de SPL son u64 y pueden exceder i64 en teoría.
+fn amount_u64(v: &SynValue, what: &str, fname: &str) -> Result<u64, Control> {
+    let n = match v {
+        SynValue::Number(n) => n,
+        other => {
+            return Err(err(format!(
+                "{}: {} must be an integer (base units), got {}",
+                fname,
+                what,
+                other.type_name()
+            )))
+        }
+    };
+    match n {
+        Number::Int(i) if *i >= 0 => Ok(*i as u64),
+        Number::Big(b) => {
+            let (sign, mag) = b.to_bytes_be();
+            if sign == num_bigint::Sign::Minus || mag.len() > 8 {
+                return Err(err(format!(
+                    "{}: {} must fit in an unsigned 64-bit integer",
+                    fname, what
+                )));
+            }
+            let mut buf = [0u8; 8];
+            buf[8 - mag.len()..].copy_from_slice(&mag);
+            Ok(u64::from_be_bytes(buf))
+        }
+        _ => Err(err(format!(
+            "{}: {} must be a non-negative integer (base units, no decimals)",
+            fname, what
+        ))),
+    }
+}
+
+fn spl_transfer_data(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "spl_transfer_data";
+    let amount = amount_u64(arg(args, 0, F)?, "the amount", F)?;
+    // Instrucción Transfer (tag 3) del Token Program: tag u8 + amount u64 LE.
+    let mut out = Vec::with_capacity(9);
+    out.push(3);
+    out.extend_from_slice(&amount.to_le_bytes());
+    Ok(syn_bytes(out))
+}
+
+fn spl_transfer_checked_data(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "spl_transfer_checked_data";
+    let amount = amount_u64(arg(args, 0, F)?, "the amount", F)?;
+    let decimals = match arg(args, 1, F)? {
+        SynValue::Number(n) => match n.to_i64_trunc() {
+            Some(d @ 0..=255) if n.is_integer() => d as u8,
+            _ => {
+                return Err(err(format!(
+                    "{}: decimals must be an integer 0..=255, got {}",
+                    F, n
+                )))
+            }
+        },
+        other => {
+            return Err(err(format!(
+                "{}: decimals must be a number, got {}",
+                F,
+                other.type_name()
+            )))
+        }
+    };
+    // TransferChecked (tag 12): valida el mint y sus decimales on-chain — la forma
+    // recomendada (Transfer a secas está deprecada en Token-2022).
+    let mut out = Vec::with_capacity(10);
+    out.push(12);
+    out.extend_from_slice(&amount.to_le_bytes());
+    out.push(decimals);
+    Ok(syn_bytes(out))
+}
+
+// =========================================================
 // Registro (todos PUROS — G13)
 // =========================================================
 
 pub(crate) fn register(interp: &Interpreter) {
     interp.register_builtin("solana_message", 1, Rc::new(|_i, a, _l| solana_message(a)));
     interp.register_builtin("solana_tx", 2, Rc::new(|_i, a, _l| solana_tx(a)));
+    // -- Batch 13 (alcance D): PDAs + SPL, PUROS (derivan direcciones/datos públicos) --
+    interp.register_builtin("solana_pda", 2, Rc::new(|_i, a, _l| solana_pda(a)));
+    interp.register_builtin("spl_ata", -1, Rc::new(|_i, a, _l| spl_ata(a)));
+    interp.register_builtin("spl_transfer_data", 1, Rc::new(|_i, a, _l| spl_transfer_data(a)));
+    interp.register_builtin(
+        "spl_transfer_checked_data",
+        2,
+        Rc::new(|_i, a, _l| spl_transfer_checked_data(a)),
+    );
 }

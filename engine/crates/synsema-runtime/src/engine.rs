@@ -86,6 +86,9 @@ pub(crate) fn wire_common_with_state(
     // Blockchain (Batch 11): encoding/verify/derive PUROS + firma GATEADA por `sign(NAME)`
     // + audit (cierra sobre el mismo CapabilitySet → sandbox lo vacía, deny-by-default).
     synsema_stdlib::blockchain::register_blockchain_builtins(interp, caps.clone());
+    // WebSocket cliente (Batch 13): transporte general gateado por `net(host)` (G21),
+    // la MISMA capability y scope que http_*/fetch — sandbox lo deniega igual.
+    synsema_stdlib::ws::register_ws_builtins(interp, caps.clone());
     // cron/db/progress/memory: sus builtins clonan el Rc internamente → viven mientras
     // viva el intérprete.
     // Cron con ejecución REAL también bajo run/test/conform: el ejecutor toma un
@@ -135,6 +138,15 @@ pub(crate) fn wire_common_with_state(
                 eprintln!(
                     "synsema: warning: bare `require sign` permits signing with ANY key; \
                      scope it with `require sign(\"KEY_NAME\")` (the name of the key's secret)"
+                );
+            }
+            // Ídem para `wallet`: crear custodia (mnemónicos/HD/keystores) sin scope
+            // habilita crear claves desde/para CUALQUIER secret (Batch 13).
+            if ty == CapabilityType::Wallet && scope.is_none() {
+                eprintln!(
+                    "synsema: warning: bare `require wallet` permits creating custody from ANY secret; \
+                     scope it with `require wallet(\"NAME\")` (the source secret's name, or the new \
+                     secret's label when generating)"
                 );
             }
             c.borrow_mut().grant(Capability::new(ty, scope.map(|s| s.to_string())));

@@ -173,6 +173,30 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std", "z
 sha3 = { version = "0.10", default-features = false, features = ["std"] }
 bs58 = "0.5"
 bech32 = "0.11"
+# Batch 13 (blockchain etapa 3): custodia HD + keystore V3 + Solana PDA + WebSocket.
+# TODO PURO-Rust, CERO `*-sys`/C (doctrina del binario único; verificar con `cargo tree`).
+#   bip39            : BIP-39 (rust-bitcoin). Wordlist inglesa embebida (la MISMA lista que
+#                      usa el mnemónico de 25 palabras de Algorand), checksum, PBKDF2→seed.
+#                      `unicode-normalization`: NFKD del passphrase (BIP-39 lo exige para
+#                      no-ASCII); `zeroize`: borra la frase al drop (mismo criterio que secret).
+#   pbkdf2           : KDF del keystore V3 variante pbkdf2 (RustCrypto; ya estaba transitivo).
+#   scrypt           : KDF del keystore V3 variante scrypt (RustCrypto). `default-features =
+#                      false`: fuera `simple`/password-hash (sólo se necesita la función cruda).
+#   aes + ctr        : AES-128-CTR del keystore V3 (RustCrypto).
+#   curve25519-dalek : decompress ed25519 para el off-curve check de `solana_pda`
+#                      (findProgramAddress) — EXACTAMENTE el mismo crate/chequeo que usa el
+#                      SDK oficial de Solana. Ya estaba en el árbol vía ed25519-dalek.
+#   tungstenite      : WebSocket cliente SÍNCRONO (calza con el engine sync). `default-features
+#                      = false` + `handshake`: NINGUNA feature TLS del crate (arrastrarían un
+#                      rustls con provider aws-lc-sys) — el TLS de `wss://` lo pone ws.rs con
+#                      el MISMO rustls/ring + rustls-native-certs que http.rs.
+bip39 = { version = "2", default-features = false, features = ["std", "unicode-normalization", "zeroize"] }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+scrypt = { version = "0.11", default-features = false }
+aes = "0.8"
+ctr = "0.9"
+curve25519-dalek = { version = "4", default-features = false }
+tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
 synsema-core = { path = "crates/synsema-core" }
 synsema-capabilities = { path = "crates/synsema-capabilities" }
 synsema-stdlib = { path = "crates/synsema-stdlib" }

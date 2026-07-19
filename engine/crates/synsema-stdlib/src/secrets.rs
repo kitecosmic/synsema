@@ -422,6 +422,21 @@ pub fn write_sign_audit(
     write_audit_op(&format!("sign curve={}", curve), "sign.log", name, loc, granted)
 }
 
+/// Entrada de audit de una operación de CUSTODIA (Batch 13, G20): generar/derivar/
+/// importar material de clave (mnemónicos, seeds, claves HD, keystores). Espeja el
+/// audit de `sign`: NUNCA el material — sólo timestamp, resultado, la operación
+/// (`generate`/`derive`/…), el name del secret involucrado, `file:line` y programa.
+/// Vive en `wallet.log`. Fail-loud en el camino concedido: sin auditoría no se crea
+/// custodia.
+pub fn write_wallet_audit(
+    name: &str,
+    op: &str,
+    loc: &SourceLocation,
+    granted: bool,
+) -> Result<(), String> {
+    write_audit_op(&format!("wallet op={}", op), "wallet.log", name, loc, granted)
+}
+
 /// Cuerpo compartido del audit append-only (reveal/sign). `op` es el prefijo de la
 /// línea (`"reveal"` o `"sign curve=…"`); `file` el nombre del log.
 fn write_audit_op(
