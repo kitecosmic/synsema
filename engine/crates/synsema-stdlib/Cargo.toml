@@ -57,6 +57,8 @@ num-bigint.workspace = true
 # de solana_pda (curve25519-dalek, el mismo del SDK oficial) y cliente WebSocket
 # (tungstenite sin TLS propio — wss usa el rustls/ring de este crate). Ver workspace.
 bip39.workspace = true
+# Batch 16 (Bitcoin): ripemd160 para hash160 (ver la justificación en el workspace).
+ripemd.workspace = true
 pbkdf2.workspace = true
 scrypt.workspace = true
 aes.workspace = true
