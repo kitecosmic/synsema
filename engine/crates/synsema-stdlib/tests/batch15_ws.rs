@@ -443,6 +443,77 @@ fn ws_on_full_drop_oldest_keeps_newest() {
 }
 
 // =========================================================
+// Regresión: un frame COALESCIDO con la respuesta 101 del handshake no se pierde
+// (el read bloqueante del handshake lo deja en el buffer de tungstenite — esos
+// bytes NO están en el kernel y epoll/kqueue/IOCP jamás los reportan; la cosecha
+// inicial de ws_connect los entrega)
+// =========================================================
+
+#[test]
+fn ws_frame_coalesced_with_handshake_is_not_lost() {
+    let _g = serial();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        use std::io::{Read as _, Write as _};
+        if let Ok((mut sock, _)) = listener.accept() {
+            // Leer el request del handshake y extraer Sec-WebSocket-Key.
+            let mut buf = [0u8; 4096];
+            let mut acc = Vec::new();
+            loop {
+                match sock.read(&mut buf) {
+                    Ok(0) => return,
+                    Ok(n) => {
+                        acc.extend_from_slice(&buf[..n]);
+                        if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+            let head = String::from_utf8_lossy(&acc);
+            let key = head
+                .lines()
+                .find_map(|l| l.strip_prefix("Sec-WebSocket-Key:"))
+                .map(str::trim)
+                .expect("key");
+            use sha1::{Digest, Sha1};
+            let accept = synsema_core::bytesutil::b64_encode(&Sha1::digest(
+                format!("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key).as_bytes(),
+            ));
+            // La respuesta 101 Y el primer frame (text "hola!") en UN SOLO write:
+            // el cliente los recibe juntos y el read del handshake se lleva el
+            // frame a su buffer interno — el caso que epoll no puede ver.
+            let mut resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+                accept
+            )
+            .into_bytes();
+            resp.extend_from_slice(&[0x81, 0x05]);
+            resp.extend_from_slice(b"hola!");
+            let _ = sock.write_all(&resp);
+            let _ = sock.flush();
+            // Mantener viva la conexión hasta que el cliente cierre.
+            loop {
+                match sock.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        }
+    });
+    let mut i = interp_net();
+    let c = as_i64(&ok(call(&mut i, "ws_connect", vec![syn_text(format!("ws://127.0.0.1:{}/", port).as_str())])));
+    // Con timeout CORTO: sin la cosecha inicial esto dormiría los 3 s y daría
+    // nothing (el bug de CI en Linux); con ella, el mensaje sale al instante.
+    let m = ok(call(&mut i, "ws_recv", vec![syn_int(c), syn_int(3)]));
+    assert_eq!(map_get(&m, "type").to_string(), "text", "el frame coalescido NO se pierde: {:?}", m.type_name());
+    assert_eq!(map_get(&m, "data").to_string(), "hola!");
+    ok(call(&mut i, "ws_close", vec![syn_int(c)]));
+}
+
+// =========================================================
 // Frames fragmentados a nivel TCP: ws_select junta el frame completo
 // =========================================================
 

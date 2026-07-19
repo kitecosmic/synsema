@@ -4245,6 +4245,7 @@ dependencies = [
  "rustls-pemfile",
  "scrypt",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
  "sha3",
  "subtle",

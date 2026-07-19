@@ -98,3 +98,6 @@ winreg = "0.52"
 [dev-dependencies]
 # Cert self-signed para los tests de integración TLS (backend ring, sin C/cmake).
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# Sec-WebSocket-Accept del mock hand-rolleado de batch15_ws (el server que coalesce
+# la respuesta 101 con el primer frame). Ya en el árbol vía tungstenite; puro-Rust.
+sha1 = "0.10"
