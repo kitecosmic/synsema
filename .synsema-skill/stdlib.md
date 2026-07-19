@@ -72,19 +72,87 @@ ws_close(conn)                      -- clean close frame (idempotent)
 ```
 
 - `ws_connect(url, headers?, opts?)` → handle. `headers` is a text→text map (a `secret`
-  value materializes only at the socket, like HTTP). `opts`: `{"timeout": secs,
-  "max_message_size": bytes}` (default 16 MiB, hard ceiling 64 MiB — a huge frame errors,
-  it never buffers unbounded).
-- `ws_recv(conn, timeout?)` → the message map, or **`nothing`** on timeout (default 30s,
-  same as `wait_for`). It NEVER blocks forever; ping/pong are handled transparently.
+  value materializes only at the socket, like HTTP). `opts`: `{"timeout", "max_message_size"
+  (16 MiB default, 64 MiB ceiling), "subprotocols" (list → negotiate Sec-WebSocket-Protocol),
+  "max_queue" (inbound cap in MESSAGES, default 1024), "max_queue_bytes" (inbound cap in
+  BYTES, default 64 MiB, ceiling 1 GiB — the queue is bounded in BOTH dimensions),
+  "on_full", "reconnect", "keepalive"}`.
+- `ws_recv(conn, timeout?)` → the message map, or **`nothing`** on timeout (default 30s).
+  NEVER blocks forever; ping/pong handled transparently.
 - `ws_send(conn, data)` / `ws_close(conn)`. A dead connection errors on send/recv (the
   handle is retired) — atrapable with `try`/`recover`.
-- **Under `serve`:** a handler can open an outbound WS (to an RPC/exchange) and forward it
-  over SSE — the "WS→SSE bridge". (Accepting *incoming* WS connections is a separate
-  feature; chat/notifications already ship with POST+SSE — see serve.md.)
+
+**Multiplexing thousands of feeds — `ws_select` (the event-loop primitive).** Watch M
+connections from ONE thread, react to the first ready, no thread-per-connection. This is
+Go's `select {}` over channels, in one call. Readiness-driven (epoll/kqueue/IOCP via `mio`):
+CPU ~0 while idle, scales to thousands.
+
+```
+require net("feed.example.com")
+let feeds be {"trades": ws_connect("wss://feed.example.com/trades"),
+              "book": ws_connect("wss://feed.example.com/book")}  -- name→handle map
+let live be true
+while live
+    let m be ws_select(feeds, 30)        -- first ready of ALL feeds, or nothing on timeout
+    when m == nothing
+        set live to false                 -- 30s idle → done (tune to your feed)
+    when m != nothing
+        -- m adds "conn" (WHICH handle fired) and, for a map, "name"
+        when m["type"] == "close"
+            print("feed " + m["name"] + " dropped")   -- you know exactly which one
+        when m["type"] == "text"
+            print(m["name"] + ": " + m["data"])
+```
+
+- `ws_select(conns, timeout?)` → `{conn, type, data, name?}` of the first ready connection,
+  or `nothing` on timeout. `conns` is a list of handles **or** a name→handle map (then the
+  result carries `name`). Delivery is **round-robin fair**: a chatty feed with a backlog
+  cannot starve the others. A connection that drops surfaces as `{type: "close", conn}` and is
+  retired — you know WHICH to resubscribe. A fatal protocol error surfaces as a catchable error.
+- `ws_select_all(conns, timeout?)` → a list of every message ready this tick (one per
+  connection; batch processing).
+- `ws_broadcast(conns, data)` → send the same message to many connections at once → count sent.
+
+**Resilience (opt-in — without these, batch-13 behavior is unchanged, nothing silent):**
+- `"reconnect": {"max_retries"?, "backoff"?, "backoff_max"?, "on_reconnect"?}` — transparent
+  reconnection with bounded exponential backoff. `on_reconnect` is a **task** run after
+  reconnecting (it receives the handle) — resubscribe there so you never lose your feed state.
+  Every reconnect re-checks `net(host)` (never escalates scope) and `wss` re-validates the cert.
+- `"keepalive": {"interval", "timeout"?}` — auto-ping every `interval`; no pong within `timeout`
+  → the connection is dead → reconnect (if enabled) or `close`. **Half-open detection** most
+  libraries skip.
+- `ws_status(conn)` → `"open" | "reconnecting" | "closed"`; `ws_stats(conn)` →
+  `{sent, received, reconnects, queued, queued_bytes, last_pong_ago (seconds since the
+  last pong, nothing if none yet), status, subprotocol}`. Stats never lie: `sent` counts
+  only messages that went out (or got queued for flush), never failed sends.
+- `on_full` (what happens when the inbound queue hits max_queue/max_queue_bytes):
+  `"block"` (default — real TCP backpressure: stop reading the socket, the TCP window
+  throttles the peer; no loss), `"drop_oldest"` (evict oldest until the new one fits),
+  `"error"` (TERMINAL: already-queued messages drain first, then a catchable error
+  naming the overflow — NEVER a silent drop; no reconnect, the condition is local).
+  Inbound traffic of any kind counts as liveness for keepalive — a pong delayed behind
+  a busy feed never falsely kills a live connection.
+
+**Fan-out with `parallel_map` (thousands of feeds across the pool).** Each worker gets its
+own interpreter (inheriting caps) and its OWN WebSocket registry — a worker `ws_connect`s its
+feed, processes it, returns. Handles do NOT cross workers (CSP isolation): never share a handle.
+
+```
+task watch(url)
+    let c be ws_connect(url)
+    let m be ws_recv(c, 30)
+    ws_close(c)
+    give m
+let results be parallel_map(watch, thousands_of_urls)   -- N workers × 1 conn each
+```
+
+- **Under `serve`:** a handler can open an outbound WS and forward it over SSE — the
+  "WS→SSE bridge". (Accepting *incoming* WS connections is a separate feature; chat/
+  notifications already ship with POST+SSE — see serve.md.) `ws_select` also works inside a
+  handler to multiplex several outbound WS on its thread.
 - **`eth_subscribe` (newHeads/logs) is composable in userland today:** `ws_connect` to the
-  node's WS endpoint, `ws_send` the JSON-RPC subscribe frame, `ws_recv` the notifications
-  (parse with `json_decode`); one-shot reads go through the typed read-side
+  node's WS endpoint, `ws_send` the JSON-RPC subscribe frame, `ws_recv`/`ws_select` the
+  notifications (parse with `json_decode`); one-shot reads go through the typed read-side
   (stdlib.md § Blockchain) instead.
 
 ## Database
