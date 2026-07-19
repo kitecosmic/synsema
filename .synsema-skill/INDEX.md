@@ -96,6 +96,7 @@ usually version skew, not a bug.
 - Numeric arrays / matrices / linear algebra (matmul/solve/eig/svd) → builtins.md (arrays section)
 - HTTP / SQL / cron → stdlib.md
 - Sign a blockchain tx / wallet / on-chain (Ethereum·EVM / Avalanche / Solana / Algorand) → stdlib.md (Blockchain)
+- Read the chain / send + confirm a tx (`eth_nonce`/`eth_balance`/`eth_fee_history`/`eth_call`/`tx_eip1559`/`eth_send_raw`/`eth_wait_receipt` · `solana_latest_blockhash`/`solana_send`/`solana_confirm`/`spl_balance` · `algorand_params`/`algorand_send`/`algorand_wait`) → stdlib.md (Blockchain)
 - Call a contract / ERC-20 / calldata (`abi_encode`/`abi_decode`) · SIWE login (`eip191_digest`) · permit / DEX order / typed-data (`eip712_digest`) → stdlib.md (Blockchain)
 - Solana transfer (`solana_message`/`solana_tx`) · SPL token / PDA / ATA (`solana_pda`/`spl_ata`/`spl_transfer_checked_data`) · Algorand pay (`algorand_tx_encode`/`algorand_tx`/`algo_address`) → stdlib.md (Blockchain)
 - Generate an HD wallet / seed phrase / derive accounts (`mnemonic_generate`/`mnemonic_to_seed`/`hd_derive`) · Algorand 25-word phrase (`algorand_mnemonic`) · import a keystore (`keystore_import`) · `require wallet` → stdlib.md (Blockchain) + capabilities.md

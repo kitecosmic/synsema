@@ -558,7 +558,9 @@ fn rlp_list_frame(payload: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-fn rlp_encode_val(v: &SynValue, depth: usize, out: &mut Vec<u8>) -> Result<(), Control> {
+/// `pub(crate)`: blockchain_rpc.rs (tx_eip1559/tx_eip1559_raw) serializa la lista
+/// de fields con el MISMO encoder RLP (una sola implementación de money-encoding).
+pub(crate) fn rlp_encode_val(v: &SynValue, depth: usize, out: &mut Vec<u8>) -> Result<(), Control> {
     if depth > RLP_MAX_DEPTH {
         return Err(err("rlp_encode: the list is nested too deeply (max 64 levels)"));
     }
@@ -763,5 +765,10 @@ pub fn register_blockchain_builtins(interp: &Interpreter, caps: Rc<RefCell<Capab
     // -- Batch 13 (custodia): HD wallets + keystore V3, TODO gateado por `wallet`
     //    (G20) y TODO devuelve `secret` (G19). Cierra sobre el mismo CapabilitySet
     //    → sandbox lo vacía, deny-by-default.
-    crate::blockchain_hd::register(interp, caps);
+    crate::blockchain_hd::register(interp, caps.clone());
+
+    // -- Batch 14 (read-side): JSON-RPC EVM/Solana + REST algod, TODO gateado por
+    //    `net(host)` (G22 — cero capability nueva; `sign` sigue siendo la única
+    //    puerta de valor) + los builders EIP-1559 puros.
+    crate::blockchain_rpc::register(interp, caps);
 }

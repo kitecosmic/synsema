@@ -73,7 +73,7 @@ pub fn http_request(
         }
         _ => url.to_string(),
     };
-    match do_request(method, &full_url, headers, body, timeout_secs) {
+    match do_request(method, &full_url, headers, body.map(str::as_bytes), timeout_secs) {
         Ok(r) => r,
         Err(e) => err_result(e),
     }
@@ -117,7 +117,7 @@ pub(crate) fn root_cert_store() -> Result<rustls::RootCertStore, String> {
     Ok(roots)
 }
 
-fn build_http_request(method: &str, path: &str, host: &str, headers: Option<&[(String, String)]>, body: Option<&str>) -> Vec<u8> {
+fn build_http_request(method: &str, path: &str, host: &str, headers: Option<&[(String, String)]>, body: Option<&[u8]>) -> Vec<u8> {
     let mut req = format!(
         "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
         method.to_uppercase(),
@@ -133,10 +133,11 @@ fn build_http_request(method: &str, path: &str, host: &str, headers: Option<&[(S
         req.push_str(&format!("Content-Length: {}\r\n", b.len()));
     }
     req.push_str("\r\n");
+    let mut out = req.into_bytes();
     if let Some(b) = body {
-        req.push_str(b);
+        out.extend_from_slice(b);
     }
-    req.into_bytes()
+    out
 }
 
 /// Conecta (TCP, o TLS para `https`) y envía el request; devuelve el stream listo
@@ -148,7 +149,7 @@ fn connect_and_send(
     method: &str,
     url: &str,
     headers: Option<&[(String, String)]>,
-    body: Option<&str>,
+    body: Option<&[u8]>,
     timeout_secs: u64,
 ) -> Result<Box<dyn Read>, String> {
     let (scheme, host, port, path) = parse_url(url)?;
@@ -198,7 +199,7 @@ fn fetch_raw(
     method: &str,
     url: &str,
     headers: Option<&[(String, String)]>,
-    body: Option<&str>,
+    body: Option<&[u8]>,
     timeout_secs: u64,
 ) -> Result<Vec<u8>, String> {
     let mut stream = connect_and_send(method, url, headers, body, timeout_secs)?;
@@ -225,7 +226,7 @@ pub fn http_request_stream(
     timeout_secs: u64,
     on_data: &mut dyn FnMut(&[u8]) -> bool,
 ) -> Result<(i64, Vec<(String, String)>), String> {
-    let mut stream = connect_and_send(method, url, headers, body, timeout_secs)?;
+    let mut stream = connect_and_send(method, url, headers, body.map(str::as_bytes), timeout_secs)?;
     let mut read_buf = [0u8; 8192];
 
     // Fase 1: acumular hasta el fin del head (`\r\n\r\n`) y parsearlo. Un EOF antes
@@ -281,11 +282,28 @@ fn do_request(
     method: &str,
     url: &str,
     headers: Option<&[(String, String)]>,
-    body: Option<&str>,
+    body: Option<&[u8]>,
     timeout_secs: u64,
 ) -> Result<HttpResult, String> {
     let buf = fetch_raw(method, url, headers, body, timeout_secs)?;
     parse_response(&buf)
+}
+
+/// Como `http_request` pero con el body como **bytes crudos** (para POSTear
+/// binarios sin corromperlos, p.ej. el SignedTxn msgpack de Algorand a
+/// `/v2/transactions` con `application/x-binary`). `pub(crate)`: lo usa
+/// blockchain_rpc.rs; el gate `net(host)` corre en el caller.
+pub(crate) fn http_request_body_bytes(
+    method: &str,
+    url: &str,
+    headers: Option<&[(String, String)]>,
+    body: &[u8],
+    timeout_secs: u64,
+) -> HttpResult {
+    match do_request(method, url, headers, Some(body), timeout_secs) {
+        Ok(r) => r,
+        Err(e) => err_result(e),
+    }
 }
 
 /// Respuesta HTTP con body binario: `(status, body_bytes, headers)`.
@@ -526,7 +544,9 @@ fn map_pairs(v: Option<&SynValue>) -> Option<Vec<(String, String)>> {
 /// Igual que `map_pairs` pero para **headers**: un `secret` (o el resultado de
 /// `bearer()`) se materializa a su plaintext SÓLO acá, en el borde del socket — el
 /// String vive en el runtime y se escribe al header; nunca vuelve a user-space (§4).
-fn header_pairs(v: Option<&SynValue>) -> Option<Vec<(String, String)>> {
+/// `pub(crate)`: blockchain_rpc.rs (headers de algod, p.ej. `X-Algo-API-Token`
+/// como secret) usa la MISMA regla de materialización en el borde.
+pub(crate) fn header_pairs(v: Option<&SynValue>) -> Option<Vec<(String, String)>> {
     match v {
         Some(SynValue::Map(m)) => Some(
             m.borrow()
