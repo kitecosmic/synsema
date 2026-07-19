@@ -185,8 +185,17 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `algorand_tx_encode` keeps `amt: 0` / empty `note` | Zero/empty/false fields are **OMITTED** (canonical msgpack, keys sorted) | That's what the network requires — emitting them changes the TXID or gets the tx rejected |
 | Solana keeps accounts in the order you list them | Reordered by runtime rules (payer first; writable signers → ro signers → writable non-signers → ro non-signers; buckets sorted by pubkey bytes) | Matches the official SDK byte-for-byte; instruction indices point at the reordered table |
 | Sign a v0 Solana message without its 0x80 prefix | Invalid signature on-chain — the signature **covers the version prefix** | `solana_message({..., "version": 0})` already includes the prefix; sign its output as-is |
-| Pass `lookup_tables` to `solana_message` | Clear error: "not supported yet" | v0 without tables works today; tables (and PDAs/SPL) are the next stage |
-| A deeply nested type / typed-data / txn is fine | Nesting over **64 levels** errors ("nested too deeply") | A DoS guard (like RLP's) — no real ABI/EIP-712/Algorand payload nests that deep; hostile input can't crash the process |
+| Pass `lookup_tables` to `solana_message` | Clear error: "not supported yet" | v0 without tables works today; PDAs/SPL now ship (`solana_pda`/`spl_ata`/`spl_transfer_checked_data`) |
+| A deeply nested type / typed-data / txn / derivation path is fine | Nesting over **64 levels** (or a path over 256 chars / 32 segments) errors, atrapable | A DoS guard (like RLP's) — no real payload/path is that deep; hostile input can't crash the process |
+| Derive Solana with a normal BIP-32 path | Wrong key — Solana uses **SLIP-0010**: `hd_derive(seed, "m/44'/501'/0'/0'", "ed25519")` (hardened-only; a non-hardened index errors) | ETH is the default `"secp256k1"`; ed25519 has no non-hardened derivation |
+| Load an Algorand wallet phrase with `mnemonic_to_seed` | Algorand's 25-word phrase is **NOT BIP-39** — use `algorand_mnemonic`/`algorand_mnemonic_to_key` | Different checksum (sha512_256 over the key) and 11-bit packing; the 12/24-word BIP-39 path is for ETH/Solana |
+| `mnemonic_generate`/`hd_derive`/`keystore_import` return usable bytes | They return a `secret` — `text()`/`json_encode` show `secret(NAME)`/`[redacted]` | Use it directly with `hd_derive`/`eth_address`/`secp256k1_sign`; back a phrase up on purpose with `reveal()` (gated + audited) |
+| `reveal("W")` reveals the seed derived from a `"W"` mnemonic | Derived secrets carry a **derived name**: `mnemonic_to_seed` → `W.seed`, `algorand_mnemonic` → `W.mnemonic`, `hd_derive` → `W/path` | Grant with the prefix `reveal("W*")` (or the exact derived name); the `wallet`/`sign` scope of a derived key follows the same derived name |
+| Custody works with `require sign` (or ambient) | Creating custody needs its OWN capability: `require wallet` (deny-by-default, audited in `wallet.log`, denied in `sandbox`) | `wallet` creates keys, `sign` moves value — an agent can derive addresses without spending |
+| A wrong keystore passphrase returns garbage / partial key | Clear "wrong passphrase" error, **no material** — the MAC is checked before decrypting | Same for a bad mnemonic checksum: the error never echoes the phrase |
+| A keystore with huge scrypt `n` grinds the CPU | Rejected fast ("out of the accepted range") before any KDF work | Anti-DoS cap on n·r and pbkdf2 c; Geth defaults (n=262144) pass |
+| `ws_recv` blocks until a message arrives | Returns **`nothing`** after the timeout (default 30s) — never blocks forever | `let m be ws_recv(conn, 5)`; ping/pong handled transparently; a huge frame errors (16 MiB default cap), never buffers unbounded |
+| `ws_connect` needs a new capability | It reuses **`net(host)`** (same scope as `http_*`); denied in `sandbox`; `wss://` validates the cert | No new door — WebSocket is transport, gated exactly like HTTP |
 
 ## Behavioral surprises
 

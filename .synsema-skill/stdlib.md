@@ -53,6 +53,36 @@ headers of r     -- response headers map
 error of r       -- error message if failed
 ```
 
+## WebSocket (live feeds — general transport, not just blockchain)
+
+A synchronous WebSocket **client** for anything that streams: RPC subscriptions,
+exchange fills, Discord/Slack, mempool. Replaces cron+polling with a live feed. Gated by
+the SAME `net(host)` capability and scope as HTTP (deny-by-default, denied in `sandbox`);
+`wss://` validates the server cert against the OS root CAs like `https://`.
+
+```
+require net("stream.exchange.com")
+let conn be ws_connect("wss://stream.exchange.com/ws")   -- opaque handle; headers? + opts? optional
+ws_send(conn, json_encode({"op": "subscribe", "channel": "trades"}))  -- text or bytes
+let msg be ws_recv(conn, 5)         -- next message, or `nothing` after the 5s timeout (never blocks forever)
+-- msg is {"type": "text"|"binary"|"close", "data": …}
+if msg is not nothing and msg["type"] is "text"
+    print(msg["data"])
+ws_close(conn)                      -- clean close frame (idempotent)
+```
+
+- `ws_connect(url, headers?, opts?)` → handle. `headers` is a text→text map (a `secret`
+  value materializes only at the socket, like HTTP). `opts`: `{"timeout": secs,
+  "max_message_size": bytes}` (default 16 MiB, hard ceiling 64 MiB — a huge frame errors,
+  it never buffers unbounded).
+- `ws_recv(conn, timeout?)` → the message map, or **`nothing`** on timeout (default 30s,
+  same as `wait_for`). It NEVER blocks forever; ping/pong are handled transparently.
+- `ws_send(conn, data)` / `ws_close(conn)`. A dead connection errors on send/recv (the
+  handle is retired) — atrapable with `try`/`recover`.
+- **Under `serve`:** a handler can open an outbound WS (to an RPC/exchange) and forward it
+  over SSE — the "WS→SSE bridge". (Accepting *incoming* WS connections is a separate
+  feature; chat/notifications already ship with POST+SSE — see serve.md.)
+
 ## Database
 
 Five backends, all pure-Rust (single static binary, no OpenSSL/`*-sys`), all opened with `db_open` and
@@ -352,6 +382,33 @@ let listo be algorand_tx_encode(txn)             -- "TX" || msgpack (zero fields
 let stx be algorand_tx(txn, ed25519_sign(listo, k))  -- POST /v2/transactions (x-binary)
 ```
 
+**HD wallets / custody (`require wallet` — creating custody, deny-by-default + audited):**
+An agent generates a wallet from scratch, backs it up as a phrase, and derives N
+accounts — like Metamask/Phantom. EVERYTHING returns a `secret` (the mnemonic/seed/key
+NEVER materialize); the phrase and passphrase come IN as secrets.
+
+```
+require wallet                                   -- creating custody (separate from `sign`)
+let phrase be mnemonic_generate(12, "W")         -- secret: 12 words, OS entropy (not seedable)
+let seed be mnemonic_to_seed(phrase)             -- secret: 64-byte BIP-39 seed (optional passphrase)
+let ethk be hd_derive(seed, "m/44'/60'/0'/0/0")  -- secret: BIP-32 secp256k1 (default) → use with eth_address/secp256k1_sign
+let solk be hd_derive(seed, "m/44'/501'/0'/0'", "ed25519")  -- secret: SLIP-0010 (Solana; hardened-only)
+print(eth_address(ethk))                         -- derive the PUBLIC address (no gate)
+-- Algorand phrase is its OWN 25-word format (NOT BIP-39):
+let am be algorand_mnemonic(algo_secret32)       -- secret: 25 words (Pera/Defly format)
+let ak be algorand_mnemonic_to_key(am)           -- secret: back to the 32-byte key
+-- Import an existing wallet from a Geth/MyEtherWallet keystore V3:
+let k be keystore_import(json_text, secret("KS_PASS"), "HOT")  -- secret; wrong pass → error, no leak
+let json be keystore_export(k, secret("KS_PASS"))             -- text (encrypted JSON V3)
+```
+
+**Solana PDAs + SPL (pure):**
+```
+let pda be solana_pda(["metadata", program_bytes, mint], program)  -- {address: bytes(32), bump: int}
+let ata be spl_ata(owner_pubkey, mint)           -- associated token account (a PDA)
+let data be spl_transfer_checked_data(amount, decimals)  -- SPL TransferChecked ix data (tag 12)
+```
+
 Builtins:
 - Hashes (pure): `keccak256(x)`/`sha512_256(x)` → bytes(32). ⚠️ keccak256 is PRE-NIST
   Keccak (Ethereum), NOT SHA3-256 — `keccak256("")` = `c5d24601…`, not `a7ffc6f8…`.
@@ -359,8 +416,9 @@ Builtins:
 - secp256k1: `secp256k1_sign(digest32, secret)` [**require sign**], `secp256k1_verify(digest, sig, pubkey)`, `secp256k1_recover(digest, sig65)`, `secp256k1_pubkey(secret, compressed?)`.
 - ed25519: `ed25519_sign(message, secret)` [**require sign**], `ed25519_verify(msg, sig, pubkey)`, `ed25519_pubkey(secret)`.
 - EVM (pure): `eth_address(pubkey_or_secret)` → EIP-55 text; `rlp_encode(value)` / `rlp_decode(bytes)`; `abi_encode(sig, values)` / `abi_decode(types, data)` / `abi_selector(sig)`; `eip191_digest(message)`; `eip712_digest(domain, types, primary, message)`.
-- Solana (pure): `solana_message(params)` (legacy + `"version": 0`; `lookup_tables` → error, stage 3) / `solana_tx(msg, sigs)`; `int_to_bytes_le(n, size)` for instruction data.
+- Solana (pure): `solana_message(params)` (legacy + `"version": 0`; `lookup_tables` → error) / `solana_tx(msg, sigs)`; `int_to_bytes_le(n, size)` for instruction data; `solana_pda(seeds, program)` → `{address, bump}`; `spl_ata(owner, mint, token_program?)`; `spl_transfer_data(amount)` / `spl_transfer_checked_data(amount, decimals)`.
 - Algorand (pure): `algorand_tx_encode(txn)` / `algorand_tx(txn, sig)` / `algo_address(pubkey_or_secret)`; TXID = `decode(sha512_256(algorand_tx_encode(txn)), "base32")`.
+- HD custody [**require wallet**]: `mnemonic_generate(words?, label?)`, `mnemonic_to_seed(mnemonic, passphrase?)`, `mnemonic_from_entropy(entropy, label?)` / `mnemonic_to_entropy(mnemonic)`, `hd_derive(seed, path, curve?, label?)` (`"secp256k1"` default | `"ed25519"` SLIP-0010), `algorand_mnemonic(secret32)` / `algorand_mnemonic_to_key(mnemonic, label?)`, `keystore_import(json, passphrase, label?)` / `keystore_export(secret, passphrase, opts?)` (`opts` = `{"kdf": "scrypt"|"pbkdf2", "n", "r", "p", "c"}`; defaults = Geth scrypt n=262144). ALL return a `secret`; `label?` names it (default: a derived name like `W.seed` / `W/path` — what `wallet`/`sign`/`reveal` scopes match).
 
 **Instinct vs. reality (money code — get these right):**
 - keccak256 ≠ SHA3-256 (different padding). Use `keccak256`, not any SHA3.
@@ -390,9 +448,24 @@ Builtins:
   matching the official SDK). The compiled indices point at the reordered table.
 - v0 Solana messages carry the 0x80 version prefix and the signature COVERS it —
   `solana_message({..., "version": 0})` already includes it; just `ed25519_sign` the bytes.
-- All pure-Rust (k256/ed25519-dalek/sha3/bech32), zero `*-sys`. Chains: ETH + Avalanche-C
-  + Solana + Algorand END-TO-END (build + sign + wire bytes, SDK-exact); Avalanche X/P
-  signable. Not yet (stage 3): HD wallets/mnemonics, Solana LUTs + PDAs/SPL, keystore JSON.
+- Custody (`require wallet`) is SEPARATE from signing (`require sign`): `wallet` creates
+  keys (mnemonic/seed/HD/keystore), `sign` moves value. An agent can derive addresses
+  without being able to spend. Both deny-by-default, audited, DENIED in `sandbox`, scoped
+  to the source secret's name.
+- BIP-32 ≠ SLIP-0010: Solana does NOT derive with plain BIP-32 — `hd_derive(seed, path,
+  "ed25519")` (SLIP-0010, hardened-only; a non-hardened index errors). ETH is the default
+  `"secp256k1"`. Standard paths: ETH `m/44'/60'/0'/0/i`, Solana `m/44'/501'/i'/0'`.
+- Algorand does NOT use BIP-39: its wallet phrase is a 25-word format (checksum over the
+  key via sha512_256), `algorand_mnemonic`/`_to_key` — feeding it to `mnemonic_to_seed`
+  is wrong. The BIP-39 12/24-word path is for ETH/Solana.
+- The mnemonic/seed/derived key is a `secret`, not a string — `text()`/`json_encode` show
+  `secret(NAME)`/`[redacted]`, never the value. Back a phrase up on purpose with
+  `reveal()` (gated by `reveal("NAME")` + audited). A bad checksum/passphrase → error
+  that never echoes the material.
+- All pure-Rust (k256/ed25519-dalek/sha3/bech32/bip39/scrypt/aes), zero `*-sys`. Chains:
+  ETH + Avalanche-C + Solana + Algorand END-TO-END (build + sign + wire bytes, SDK-exact),
+  now with HD custody + keystore V3 import/export + Solana PDAs/SPL; Avalanche X/P signable.
+  Not yet: Avalanche X/P serialization helpers, Bitcoin.
 
 ## Capabilities
 

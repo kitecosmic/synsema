@@ -29,9 +29,12 @@ binary, `array`/`matmul` for numeric work, `csv_parse`/`csv_encode` for spreadsh
 `chart_svg`/`chart()` + `median`/`percentile`/`histogram` for reports and dashboards (see
 [dataviz.md](dataviz.md)), `run(cmd, [args])` for OS processes/tools (gated by `exec`, see [processes.md](processes.md)),
 `secp256k1_sign`/`ed25519_sign` + `require sign` for on-chain signing with the key sealed as a
-`secret`, `abi_encode`/`eip712_digest` for contract calls and dApp typed-data, and
-`solana_message`/`algorand_tx_encode` for full Solana/Algorand transactions (see
-[stdlib.md](stdlib.md) § Blockchain). When something fails, point to [pitfalls.md](pitfalls.md)
+`secret`, `mnemonic_generate`/`hd_derive` + `require wallet` for generating an HD wallet from a
+seed phrase (BIP-39/BIP-32/SLIP-0010) and `keystore_import` for existing wallets,
+`abi_encode`/`eip712_digest` for contract calls and dApp typed-data,
+`solana_message`/`algorand_tx_encode` for full Solana/Algorand transactions, and
+`ws_connect`/`ws_recv` (gated by `net`) for live WebSocket feeds instead of cron+polling (see
+[stdlib.md](stdlib.md) § Blockchain, § WebSocket). When something fails, point to [pitfalls.md](pitfalls.md)
 first. The goal: make building in Synsema feel as easy as in JS/Python.
 
 ## Keep yourself current (binary · skill · docs MCP) — all by command, no browsing
@@ -58,7 +61,7 @@ usually version skew, not a bug.
 - [testing.md](testing.md) — Native test framework: `assert`/`assert_eq`/`assert_error`, `test "..."` blocks, `synsema test`
 
 ## By topic
-- [stdlib.md](stdlib.md) — HTTP requests, databases (SQL: SQLite / Postgres / MySQL · document: MongoDB · key-value: Redis), cron scheduler, **blockchain** (ETH/EVM · Avalanche · Solana · Algorand: gated `sign` + audit, keccak256, RLP, ABI calldata, EIP-191/712 typed-data digests, Solana message/tx, Algorand canonical msgpack, base58/base32/bech32, EIP-55 addresses) (zero dependencies)
+- [stdlib.md](stdlib.md) — HTTP requests, WebSocket client (live feeds, gated by `net`), databases (SQL: SQLite / Postgres / MySQL · document: MongoDB · key-value: Redis), cron scheduler, **blockchain** (ETH/EVM · Avalanche · Solana · Algorand: gated `sign` + audit, HD wallets/mnemonics gated by `wallet` — BIP-39/BIP-32/SLIP-0010/Algorand-25 + keystore V3, keccak256, RLP, ABI calldata, EIP-191/712 typed-data digests, Solana message/tx + PDAs/SPL, Algorand canonical msgpack, base58/base32/bech32, EIP-55 addresses) (zero dependencies)
 - [concurrency.md](concurrency.md) — Real multi-core parallelism (Rust): `parallel_map`, `chunk`, fan-out/merge, fail-fast
 - [frontend.md](frontend.md) — Building UIs/sites: render() templates (full freedom) + layouts/partials/includes + static assets + client JS; content() for agent-negotiable pages. No imposed framework.
 - [dataviz.md](dataviz.md) — Business data & charts: CSV import/export (`csv_parse`/`csv_encode`, RFC 4180), descriptive statistics (`median`/`percentile`/`histogram`), native SVG charts (`chart_svg`) and the negotiated `chart()` content node (SVG for humans, data table/JSON for agents), PNG/PDF export (`svg_to_png`/`svg_to_pdf`, deterministic embedded font). Data-source-agnostic, pure (works in `sandbox`).
@@ -94,7 +97,9 @@ usually version skew, not a bug.
 - HTTP / SQL / cron → stdlib.md
 - Sign a blockchain tx / wallet / on-chain (Ethereum·EVM / Avalanche / Solana / Algorand) → stdlib.md (Blockchain)
 - Call a contract / ERC-20 / calldata (`abi_encode`/`abi_decode`) · SIWE login (`eip191_digest`) · permit / DEX order / typed-data (`eip712_digest`) → stdlib.md (Blockchain)
-- Solana transfer (`solana_message`/`solana_tx`) · Algorand pay (`algorand_tx_encode`/`algorand_tx`/`algo_address`) → stdlib.md (Blockchain)
+- Solana transfer (`solana_message`/`solana_tx`) · SPL token / PDA / ATA (`solana_pda`/`spl_ata`/`spl_transfer_checked_data`) · Algorand pay (`algorand_tx_encode`/`algorand_tx`/`algo_address`) → stdlib.md (Blockchain)
+- Generate an HD wallet / seed phrase / derive accounts (`mnemonic_generate`/`mnemonic_to_seed`/`hd_derive`) · Algorand 25-word phrase (`algorand_mnemonic`) · import a keystore (`keystore_import`) · `require wallet` → stdlib.md (Blockchain) + capabilities.md
+- Live feed / WebSocket / subscribe to an RPC or exchange / mempool (`ws_connect`/`ws_send`/`ws_recv`/`ws_close`) → stdlib.md (WebSocket)
 - keccak256 / RLP / base58 / bech32 / derive an address / `require sign` → stdlib.md (Blockchain) + capabilities.md
 - CSV / spreadsheets / Excel import-export → dataviz.md
 - Charts / graphs / dashboards / business reports → dataviz.md

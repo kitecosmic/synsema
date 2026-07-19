@@ -33,6 +33,12 @@ pub enum CapabilityType {
     /// scope al NAME del secret de la clave (como `Reveal` scoped) y audit fail-loud.
     /// Nunca es ambiente. Batch 11 (blockchain).
     Sign,
+    /// Habilita CREAR CUSTODIA: generar/derivar/importar material de clave (mnemónicos
+    /// BIP-39, seeds, claves HD, keystores). No mueve valor (eso sigue siendo `Sign`),
+    /// pero crea claves que lo moverán: deny-by-default, con scope al NAME del secret
+    /// de origen (o al label del secret nuevo al generar) y audit fail-loud en
+    /// `wallet.log`. Nunca es ambiente. Batch 13 (G20).
+    Wallet,
 }
 
 impl CapabilityType {
@@ -57,6 +63,7 @@ impl CapabilityType {
             Secret => "secret",
             Reveal => "reveal",
             Sign => "sign",
+            Wallet => "wallet",
         }
     }
 }
@@ -81,6 +88,7 @@ pub fn capability_type_from_name(name: &str) -> Option<CapabilityType> {
         "secret" => Secret,
         "reveal" => Reveal,
         "sign" => Sign,
+        "wallet" => Wallet,
         _ => return None,
     })
 }
@@ -462,7 +470,7 @@ pub fn parse_capability(name: &str, scope: Option<&str>) -> Result<Capability, S
     match capability_type_from_name(name) {
         Some(ty) => Ok(Capability::new(ty, scope.map(|s| s.to_string()))),
         None => Err(format!(
-            "Unknown capability type: '{}'. Known: [net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal, sign]",
+            "Unknown capability type: '{}'. Known: [net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal, sign, wallet]",
             name
         )),
     }

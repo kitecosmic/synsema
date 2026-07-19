@@ -30,3 +30,8 @@ tokenizers = { workspace = true, optional = true }
 # feature, `SYNSEMA_LLM_PROVIDER=local` avisa por stderr y queda offline (placeholders) —
 # jamás elige otro provider en silencio.
 llm-local = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers"]
+
+[dev-dependencies]
+# E2E del Batch 13: un mini-servidor WS LOCAL para el dogfood del cliente WebSocket
+# (sin red externa). El mismo tungstenite que usa el stdlib, en modo `accept`.
+tungstenite = { workspace = true }

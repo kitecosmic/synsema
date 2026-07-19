@@ -757,6 +757,11 @@ pub fn register_blockchain_builtins(interp: &Interpreter, caps: Rc<RefCell<Capab
 
     // -- Batch 12 (todo PURO — G13: ninguna puerta de firma nueva) --
     crate::blockchain_abi::register(interp); // ABI + EIP-191 + EIP-712
-    crate::blockchain_solana::register(interp); // message/tx de Solana
+    crate::blockchain_solana::register(interp); // message/tx de Solana + PDA/SPL (Batch 13)
     crate::blockchain_algorand::register(interp); // msgpack canónico de Algorand
+
+    // -- Batch 13 (custodia): HD wallets + keystore V3, TODO gateado por `wallet`
+    //    (G20) y TODO devuelve `secret` (G19). Cierra sobre el mismo CapabilitySet
+    //    → sandbox lo vacía, deny-by-default.
+    crate::blockchain_hd::register(interp, caps);
 }

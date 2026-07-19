@@ -216,7 +216,7 @@ mod tests {
     fn validator_retries_then_succeeds() {
         let calls = std::rc::Rc::new(std::cell::RefCell::new(0));
         let c = calls.clone();
-        let llm: Box<dyn FnMut(&str, &HashMap<String, String>) -> String> = Box::new(move |_op, _d| {
+        let llm: LlmCallFn = Box::new(move |_op, _d| {
             *c.borrow_mut() += 1;
             if *c.borrow() < 2 {
                 "I think refund".to_string() // inválido (substring 'refund' está... )

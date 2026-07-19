@@ -52,6 +52,17 @@ bech32.workspace = true
 zeroize.workspace = true
 # BigInt para el encoding RLP de enteros grandes (ya en el árbol vía core; puro-Rust).
 num-bigint.workspace = true
+# Batch 13 (blockchain etapa 3): HD wallets (bip39 + BIP-32/SLIP-0010 hand-rolled con
+# hmac/sha2/k256 ya presentes), keystore V3 (scrypt/pbkdf2 + aes/ctr), off-curve check
+# de solana_pda (curve25519-dalek, el mismo del SDK oficial) y cliente WebSocket
+# (tungstenite sin TLS propio — wss usa el rustls/ring de este crate). Ver workspace.
+bip39.workspace = true
+pbkdf2.workspace = true
+scrypt.workspace = true
+aes.workspace = true
+ctr.workspace = true
+curve25519-dalek.workspace = true
+tungstenite.workspace = true
 # A2 stack web: gzip (miniz_oxide puro-Rust, sin C) + TLS (rustls con backend ring).
 flate2 = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

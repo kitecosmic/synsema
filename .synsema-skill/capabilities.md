@@ -4,13 +4,15 @@
 Nothing works without declaring capabilities.
 
 ## Capability types
-`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `db`, `serve`, `secret`, `reveal`, `sign`
+`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `db`, `serve`, `secret`, `reveal`, `sign`, `wallet`
 
 `serve(PORT)` allows binding an HTTP server to that port — see [serve.md](serve.md).
 
 `env("NAME")`, `secret("NAME")` and `reveal("NAME")` gate config and secrets — see [secrets.md](secrets.md). All three are scoped by **name/label** (or a `NAME_*` prefix): `reveal("NAME")` can only reveal the secret whose name (`secret("NAME")`) or label (`as_secret(v,"label")`) matches, and every `reveal()` is written to a persistent audit log (**granted or denied**). Bare `require reveal` (coarse, any secret) still works for compat but **warns**. Separately, `as_secret(value, label?)` seals a **runtime** value as a `secret` and is **pure — no `require`** (see [secrets.md](secrets.md)).
 
 `sign("KEY_NAME")` gates blockchain signing (`secp256k1_sign`/`ed25519_sign`) — the most dangerous operation (it authorizes moving value), so it is **deny-by-default** (never ambient), scoped to the key secret's **name/label**, and writes a persistent audit entry (granted or denied) that never contains the key. Denied inside `sandbox`. Bare `require sign` (any key) warns. See [stdlib.md](stdlib.md) (Blockchain).
+
+`wallet("NAME")` gates creating **custody** — generating/deriving/importing key material (`mnemonic_generate`, `mnemonic_to_seed`, `hd_derive`, `algorand_mnemonic*`, `keystore_import`/`keystore_export`, `mnemonic_from_entropy`/`_to_entropy`). Distinct from `sign`: `wallet` creates keys, `sign` moves value — an agent can derive addresses without being able to spend. Deny-by-default (never ambient), scoped to the **source secret's name** (or the new secret's label when generating), audited in `wallet.log` (granted or denied, never the material), denied inside `sandbox`. Bare `require wallet` (any) warns. WebSocket (`ws_connect`) needs no new capability — it reuses `net(host)`.
 
 ## Declaring capabilities
 ```
@@ -27,6 +29,8 @@ require reveal("STRIPE_API_KEY")    -- enable reveal() for THAT secret only (lou
 require time
 require llm                         -- enable LLM ops (reason/decide/analyze/generate)
 require serve(8080)                 -- bind an HTTP server to this port
+require sign("HOT_KEY")             -- enable signing with THAT key (deny-by-default + audited)
+require wallet                      -- enable creating custody (mnemonics/HD/keystore); scope with wallet("NAME")
 require db("./store.db")            -- open a SQLite database (scope = file path)
 require db("postgres://localhost/appdb")  -- Postgres (scope = canonical URL)
 require db("mysql://localhost/appdb")     -- MySQL (scope = canonical URL)
