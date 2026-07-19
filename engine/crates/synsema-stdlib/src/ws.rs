@@ -785,6 +785,10 @@ impl WsRegistry {
                         c.reconnect.as_ref().and_then(|r| r.on_reconnect.clone())
                     };
                     self.sync_interest(handle);
+                    // Misma cosecha inicial que ws_connect: el handshake de la
+                    // reconexión también puede dejar frames en el buffer.
+                    self.drain_reads(handle);
+                    self.sync_interest(handle);
                     if let Some(task) = task {
                         pending.push(PendingReconnect { handle, task });
                     }
@@ -1335,7 +1339,17 @@ fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
     r.conns.insert(handle, conn);
     r.token_to_handle.insert(token.0, handle);
     drop(r);
-    reg.borrow_mut().sync_interest(handle);
+    {
+        // Cosecha INICIAL: el handshake bloqueante puede haber sobre-leído y dejado
+        // frames enteros en el buffer de tungstenite (un server que pushea apenas
+        // conecta, coalescido con la respuesta 101). Esos bytes NO están en el
+        // kernel → epoll/kqueue/IOCP jamás los reportan: sin esta pasada, una
+        // conexión "con datos" dormiría hasta el timeout.
+        let mut r = reg.borrow_mut();
+        r.sync_interest(handle);
+        r.drain_reads(handle);
+        r.sync_interest(handle);
+    }
     Ok(syn_int(handle))
 }
 
