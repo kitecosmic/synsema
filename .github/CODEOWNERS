@@ -1,0 +1,7 @@
+# Code owners for Synsema.
+#
+# Every change to any path requires review from the owner below before it can be
+# merged (enforced by branch protection: "Require review from Code Owners" on main).
+# This is what keeps the project single-maintainer while staying open to forks.
+
+* @kitecosmic
