@@ -112,8 +112,8 @@ shortcut.
 ## Docker
 
 The image is **just the Synsema binary** — the same prebuilt static binary the site
-installs (no Python, no build from source; the `Dockerfile` fetches it from the GitHub
-release and verifies its checksum). Mount your `.syn` program into `/app`.
+installs; the `Dockerfile` fetches it from the GitHub release and verifies its checksum
+(it does not compile). Mount your `.syn` program into `/app`.
 
 ```bash
 docker build -t synsema .                      # or: --build-arg SYNSEMA_VERSION=v0.4.9
