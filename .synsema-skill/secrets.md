@@ -100,7 +100,9 @@ require serve(8080)
 
 serve on 8080
     route "POST /webhook/stripe"
-        let sig be header_of(request, "stripe-signature")
+        when not contains(request.headers, "stripe-signature")
+            give fail(400, "missing signature")
+        let sig be request.headers["stripe-signature"]   -- header names are lowercased
         when not verify_hmac(read_body(), sig, secret("STRIPE_WEBHOOK_SECRET"))
             give fail(400, "bad signature")
         give ok({"received": true})
@@ -154,7 +156,9 @@ From there it carries the same taint and redaction as any `secret`:
 ```
 -- Multi-tenant / SaaS: the end user brings their own key in a header.
 route "POST /proxy"
-    let user_key be as_secret(header_of(request, "x-provider-key"), "user_key")
+    when not contains(request.headers, "x-provider-key")
+        give fail(400, "missing x-provider-key")
+    let user_key be as_secret(request.headers["x-provider-key"], "user_key")
     let r be fetch("https://api.provider.com/v1/...", "POST",
                    {"Authorization": bearer(user_key)}, body)   -- materializes only at the socket
     give {"ok": true}
