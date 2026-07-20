@@ -1,14 +1,22 @@
-version: "3.8"
-
+# Run a Synsema program as a long-lived service.
+#
+#   docker compose up -d          # build the image + start
+#   docker compose logs -f        # follow output
+#
+# Put your program in this directory as app.syn (or change `command`/mounts).
+# The image is just the Synsema binary (see Dockerfile) — your .syn is mounted in.
 services:
-  agent:
+  app:
     build: .
-    command: ["run", "agent.syn", "--serve"]
-    restart: unless-stopped
+    command: ["serve", "app.syn"]
+    working_dir: /app
     volumes:
-      - ./data:/data
-      - ./programs:/programs
+      - ./:/app                    # your .syn program(s), mounted live
+      - ./data:/data               # persistent data (SQLite, agent state)
+    ports:
+      - "8080:8080"                # match `require serve(8080)` in app.syn
     environment:
+      # Secrets come from the environment in prod (overrides .env). Add the ones
+      # your program uses; unset keys are simply empty.
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - MINIMAX_API_KEY=${MINIMAX_API_KEY:-}
+    restart: unless-stopped
