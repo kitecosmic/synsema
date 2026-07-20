@@ -111,20 +111,23 @@ shortcut.
 
 ## Docker
 
+The image is **just the Synsema binary** — the same prebuilt static binary the site
+installs (no Python, no build from source; the `Dockerfile` fetches it from the GitHub
+release and verifies its checksum). Mount your `.syn` program into `/app`.
+
 ```bash
-# Build
-docker build -t synsema .
+docker build -t synsema .                      # or: --build-arg SYNSEMA_VERSION=v0.4.9
 
-# Run once
-docker run synsema run examples/hello.syn
+# Run once (mount the current directory)
+docker run --rm -v "$PWD":/app -w /app synsema run hello.syn
 
-# Run as persistent service
+# Persistent service
 docker run -d --restart unless-stopped \
     -e ANTHROPIC_API_KEY=sk-... \
-    -v $(pwd)/data:/data \
-    synsema serve my_agent.syn
+    -v "$PWD":/app -w /app -p 8080:8080 \
+    synsema serve app.syn
 
-# Docker Compose (edit docker-compose.yml)
+# Or Docker Compose (see docker-compose.yml)
 docker compose up -d
 ```
 
