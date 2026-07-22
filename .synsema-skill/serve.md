@@ -501,7 +501,8 @@ serve on 8080
   never crashes the server.
 - **Errors mid-stream:** the status was already sent, so the runtime emits a
   final `event: error` event and closes — never a crash.
-- **Isolation:** each stream runs in its own interpreter/scope, like any request.
+- **Isolation:** each stream runs in an isolated scope, like any request — nothing
+  it defines leaks into other requests or streams.
 - **Concurrency cap:** in the current one-thread-per-connection model each open
   stream holds a thread, so `max_streams N` (default 100) bounds concurrent
   streams. Over the cap a new stream gets `503 {"error":"too many concurrent

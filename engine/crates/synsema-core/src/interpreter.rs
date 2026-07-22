@@ -1687,7 +1687,25 @@ impl Interpreter {
                 let def = match self.agent_definitions.get(agent_name) {
                     Some(d) => (d.0.clone(), d.1.clone()),
                     None => {
-                        return Err(err_at(format!("No agent defined with name '{}'", agent_name), loc))
+                        // Error auto-diagnóstico (LLM-safe): decir qué agentes SÍ conoce este
+                        // contexto. Lista con nombres → typo del usuario. Lista VACÍA con el
+                        // agente definido en el programa → contexto de ejecución sin agentes
+                        // (p.ej. un intérprete reusado que no los restauró) — señal de runtime,
+                        // no del programa; ahorra ciclos de diagnóstico persiguiendo typos.
+                        let known: Vec<&str> =
+                            self.agent_definitions.keys().map(|s| s.as_str()).collect();
+                        let detail = if known.is_empty() {
+                            "no agents are defined in this execution context; if this agent IS \
+                             defined at the top level of the program, this is a runtime context \
+                             issue, not a problem in your code"
+                                .to_string()
+                        } else {
+                            format!("agents defined in this context: {}", known.join(", "))
+                        };
+                        return Err(err_at(
+                            format!("No agent defined with name '{}' ({})", agent_name, detail),
+                            loc,
+                        ));
                     }
                 };
                 let mut spawn_args = Vec::with_capacity(arguments.len());

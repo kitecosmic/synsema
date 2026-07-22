@@ -2,7 +2,7 @@
 # dropped into a slim base. The image carries the release binary; it does not compile.
 #
 #   docker build -t synsema .                                      # latest release
-#   docker build -t synsema --build-arg SYNSEMA_VERSION=v0.4.9 .   # pin a version
+#   docker build -t synsema --build-arg SYNSEMA_VERSION=v0.5.0 .   # pin a version
 #
 #   docker run --rm synsema version
 #   docker run --rm -v "$PWD":/app -w /app synsema run hello.syn

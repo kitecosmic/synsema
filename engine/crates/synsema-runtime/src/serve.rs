@@ -941,15 +941,14 @@ pub(crate) fn rebuild_globals(
     snapshot: &[(String, GlobalVal)],
 ) -> ModuleRegistry {
     let mut registry = ModuleRegistry::new();
+    // Agentes (Batch 6): van al mapa separado `agent_definitions` (NO a bindings). Se
+    // insertan vía `restore_agents` — el MISMO camino que la restauración post-request
+    // de `with_serve_interp` — para que build fresco y reset no puedan divergir (si
+    // divergieran, el bug pocos-cores volvería sólo en uno de los dos caminos).
+    restore_agents(interp, snapshot);
     for (k, gv) in snapshot {
         match gv {
-            // Agentes (Batch 6): van al mapa separado `agent_definitions` (NO a bindings),
-            // con el closure apuntando al global del intérprete nuevo (como las tasks). Sin
-            // esto, un `spawn Worker` desde una route daría "No agent defined".
-            GlobalVal::Agent { body } => {
-                let genv = interp.global_env.clone();
-                interp.agent_definitions.insert(k.clone(), (body.clone(), genv));
-            }
+            GlobalVal::Agent { .. } => {}
             other => {
                 // Top-level: las tasks cierran sobre el global (closure_target) y los
                 // nuevos module_env también cuelgan del global (base).
@@ -960,6 +959,22 @@ pub(crate) fn rebuild_globals(
         }
     }
     registry
+}
+
+/// Re-inserta SOLO los agentes del snapshot en `agent_definitions`. `reset_for_request`
+/// los borra (aislamiento: un `agent` definido dentro de un handler no se filtra al
+/// siguiente request), pero el intérprete base se REUSA entre requests del mismo worker
+/// — sin esta restauración, el segundo request del worker daría "No agent defined".
+/// Sólo se manifiesta con pocos workers (una VPS de 1-2 cores dimensiona el pool chico
+/// y los requests reusan siempre el mismo worker); con muchos cores cada request suele
+/// caer en un worker virgen y el bug queda latente.
+pub(crate) fn restore_agents(interp: &mut Interpreter, snapshot: &[(String, GlobalVal)]) {
+    for (k, gv) in snapshot {
+        if let GlobalVal::Agent { body } = gv {
+            let genv = interp.global_env.clone();
+            interp.agent_definitions.insert(k.clone(), (body.clone(), genv));
+        }
+    }
 }
 
 /// Intérprete base de un serve: wiring común + hooks del swarm + db compartida +
@@ -1230,6 +1245,9 @@ fn with_serve_interp<R>(
     // Limpieza por-request: estado transitorio del intérprete + capabilities al
     // snapshot del preámbulo (aislamiento entre requests reusando el mismo intérprete).
     base.interp.reset_for_request();
+    // El reset borra `agent_definitions`; los agentes top-level vuelven del snapshot —
+    // si no, el próximo request de este worker vería "No agent defined" (bug pocos-cores).
+    restore_agents(&mut base.interp, snapshot);
     {
         let mut c = base.caps.borrow_mut();
         *c = CapabilitySet::new("request");
