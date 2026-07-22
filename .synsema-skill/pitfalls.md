@@ -10,7 +10,7 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 | `Capability not granted: file_write(...)` | Missing `require` or scope too narrow | Add `require file("/path/*")` at top of program |
 | `Capability not granted: net(...)` | Missing `require` for the domain | Add `require net("domain.com")` |
 | `Invalid memory category: 'preferencia'` | Categories are English-only | Use exactly: `preference`, `rule`, `learning`, `decision`, `context` |
-| `No agent defined with name 'X'` | `spawn X` before `agent X` definition | Define the agent before spawning it |
+| `No agent defined with name 'X'` | `spawn X` before `agent X` definition (the error lists the agents the context DOES know) | Define the agent before spawning it. If the error says "no agents are defined in this execution context" and your agent IS defined top-level, that's the runtime, not your code — on engine ≤ v0.4.9, `spawn` inside a route fails from the 2nd request on a reused serve worker (fixed in v0.5.0; workaround: spawn a long-lived worker at boot and enqueue via `signal`) |
 | `Division by zero` | Divisor is 0 | Guard with `when divisor != 0` or use `try/recover` |
 | `Cannot iterate over number` | `each` on a non-list value | Check type with `type_of()` or wrap in `[value]` |
 | `Map has no key 'X'` | Accessing a property that doesn't exist | Check with `contains(map, "X")` first |

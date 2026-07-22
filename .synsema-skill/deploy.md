@@ -40,6 +40,11 @@ see [secrets.md](secrets.md). Resolution: **process environment → `.env` file 
 - `reveal()` (if you use it) appends to an audit log at `$SYNSEMA_AUDIT_DIR` or
   `~/.synsema/audit/reveal.log` — under systemd, set `SYNSEMA_AUDIT_DIR` or a writable
   `HOME`/`StateDirectory`, or `reveal()` will fail (by design: no audit, no reveal).
+- `SYNSEMA_SERVE_WORKERS=N` sizes the request-handling interpreter pool (default:
+  `#cores`, min 2). Raise it for I/O-bound handlers (more concurrent requests, more
+  RAM); it is read **once, from the process environment** (systemd `Environment=`,
+  `docker -e`, shell export — **not** `.env`, which only feeds `env()`/`secret()`)
+  before the first server starts.
 
 ## Serve deployment flags (dev-clean `.syn` + prod flags)
 
