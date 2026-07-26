@@ -48,8 +48,10 @@ does not snapshot variables for resume.
 
 ## Crash-resume / step tracking (the real mechanism — see builtins.md / memory.md)
 For "ingest done, died in validation, resume there", use the **progress** builtins, not
-`checkpoint`:
+`checkpoint` (they need the declared memory: `require memory("<name>")` at the top —
+[memory.md](memory.md)):
 ```
+require memory("import-agent")
 create_progress("import", ["ingest", "validate", "load"])
 start_step("import", "ingest")
 complete_step("import", "ingest", result)

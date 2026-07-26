@@ -280,6 +280,11 @@ Response helpers (set the HTTP status; body follows the response contract):
 - `cron_status()` → formatted text
 
 ## Agent operations
+
+**All of these require the declared-memory capability** — `require memory("name")` at the
+top of the program (deny-by-default, even under `run`; the name keys the `.db` file). See
+[memory.md](memory.md).
+
 - `create_progress(task_name, [step_names])` → task_name
 - `start_step(task_name, step_name)` → bool
 - `complete_step(task_name, step_name, result?)` → bool
@@ -287,8 +292,8 @@ Response helpers (set the HTTP status; body follows the response contract):
 - `resume_point(task_name)` → step name or nothing
 - `progress_display(task_name)` → formatted text
 - `progress_percent(task_name)` → number 0-100
-- `remember(category, content, tags?)` → entry_id
-- `recall(category?, tags?, search?, mode?)` → list of entries. `mode` (text) controls multi-tag matching: `"any"` (default, OR) or `"all"` (AND — entry must have every tag). `category`/`search` always narrow; pass `nothing` to skip a positional arg. See memory.md.
+- `remember(category, content, tags?)` → entry_id. Inside `agent X` the entry's `source` is `"X"`; top-level writes `"main"`.
+- `recall(category?, tags?, search?, mode?, limit?, from?)` → list of entries. `mode` (text) controls multi-tag matching: `"any"` (default, OR) or `"all"` (AND — entry must have every tag). `limit` (number) caps results (default 200). `from` (text) picks the `source` namespace: inside an agent the default is its OWN entries; `from = "other-agent"` crosses, `from = "*"` reads all; top-level defaults to all. All six accept named-arg form (`recall(from = "writer", limit = 10)`); pass `nothing` to skip a positional arg. See memory.md.
 - `forget_memory(entry_id)` → bool
 - `add_rule(name, level, description, category?)` → bool
 - `check_rules(category?, context_map?)` → list of violations

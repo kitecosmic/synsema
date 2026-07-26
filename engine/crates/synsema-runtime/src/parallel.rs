@@ -23,7 +23,7 @@ use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::number::Number;
 use synsema_core::types::{from_send, syn_list, to_send, SendValue, SynTaskValue, SynValue};
 
-use crate::engine::{wire_common, INTERP_STACK_SIZE};
+use crate::engine::{wire_common, MemoryCtx, INTERP_STACK_SIZE};
 use crate::serve::{
     rebuild_globals, rebuild_module_env, snapshot_globals, snapshot_module_env, GlobalVal,
     ModuleRegistry,
@@ -75,6 +75,7 @@ fn build_worker_interp(
     denied: &[Capability],
     secure: bool,
     ceiling: &Option<Arc<Vec<Capability>>>,
+    mem: &Option<MemoryCtx>,
 ) -> (Interpreter, ModuleRegistry) {
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("parallel")));
@@ -93,7 +94,10 @@ fn build_worker_interp(
             c.deny(cap.clone());
         }
     }
-    wire_common(&mut interp, &caps, secure);
+    // Memoria declarada (DB-M1): el worker comparte los MISMOS stores que el padre; el
+    // grant de `memory("<nombre>")` ya viene en `granted` (heredado del scope llamador),
+    // así que el gate del worker pasa exactamente cuando pasaba en el padre.
+    wire_common(&mut interp, &caps, secure, mem.as_ref(), "my-agent");
     let registry = rebuild_globals(&mut interp, globals);
     interp.freeze_intent(); // corre bajo el intent congelado
     (interp, registry)
@@ -147,6 +151,7 @@ fn run_parallel(
     limit: usize,
     secure: bool,
     ceiling: Option<Arc<Vec<Capability>>>,
+    mem: Option<MemoryCtx>,
 ) -> Result<Vec<SendValue>, RuntimeError> {
     let n = items.len();
     if n == 0 {
@@ -183,6 +188,7 @@ fn run_parallel(
             let granted = granted.clone();
             let denied = denied.clone();
             let ceiling = ceiling.clone();
+            let mem = mem.clone();
             let task_snap = task_snap.clone();
             let items = items.clone();
             let aborted = aborted.clone();
@@ -193,7 +199,7 @@ fn run_parallel(
                     return None;
                 }
                 let (mut interp, mut registry) =
-                    build_worker_interp(&globals, &granted, &denied, secure, &ceiling);
+                    build_worker_interp(&globals, &granted, &denied, secure, &ceiling, &mem);
                 let task_value = reconstruct_task(&interp, &task_snap, &mut registry);
                 let item = from_send(&items[i]);
                 match interp.call_task(task_value, vec![item]) {
@@ -224,8 +230,14 @@ fn run_parallel(
     })
 }
 
-/// Registra `parallel_map` y `chunk` (lo llama `wire_common`).
-pub fn register_parallel_builtins(interp: &Interpreter, caps: &Rc<RefCell<CapabilitySet>>, secure: bool) {
+/// Registra `parallel_map` y `chunk` (lo llama `wire_common`). `mem` = contexto de
+/// memoria declarada (DB-M1) que cada worker comparte.
+pub(crate) fn register_parallel_builtins(
+    interp: &Interpreter,
+    caps: &Rc<RefCell<CapabilitySet>>,
+    secure: bool,
+    mem: Option<MemoryCtx>,
+) {
     // chunk(list, size) — parte una lista en sublistas de `size`. Puro.
     interp.register_builtin(
         "chunk",
@@ -254,6 +266,7 @@ pub fn register_parallel_builtins(interp: &Interpreter, caps: &Rc<RefCell<Capabi
         "parallel_map",
         -1,
         Rc::new(move |i, args, _loc| {
+            let mem = mem.clone();
             let task = match args.first() {
                 Some(t @ (SynValue::Task(_) | SynValue::Builtin(_))) => t,
                 _ => return Err(err("parallel_map: first argument must be a task")),
@@ -317,6 +330,7 @@ pub fn register_parallel_builtins(interp: &Interpreter, caps: &Rc<RefCell<Capabi
                 limit,
                 secure,
                 ceiling,
+                mem,
             ) {
                 Ok(results) => Ok(syn_list(results.iter().map(from_send).collect())),
                 Err(re) => Err(Control::Error(re)),

@@ -4,7 +4,7 @@
 Nothing works without declaring capabilities.
 
 ## Capability types
-`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `db`, `serve`, `secret`, `reveal`, `sign`, `wallet`
+`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `db`, `serve`, `secret`, `reveal`, `sign`, `wallet`, `memory`
 
 `serve(PORT)` allows binding an HTTP server to that port — see [serve.md](serve.md).
 
@@ -13,6 +13,8 @@ Nothing works without declaring capabilities.
 `sign("KEY_NAME")` gates blockchain signing (`secp256k1_sign`/`ed25519_sign`) — the most dangerous operation (it authorizes moving value), so it is **deny-by-default** (never ambient), scoped to the key secret's **name/label**, and writes a persistent audit entry (granted or denied) that never contains the key. Denied inside `sandbox`. Bare `require sign` (any key) warns. See [stdlib.md](stdlib.md) (Blockchain).
 
 `wallet("NAME")` gates creating **custody** — generating/deriving/importing key material (`mnemonic_generate`, `mnemonic_to_seed`, `hd_derive`, `algorand_mnemonic*`, `keystore_import`/`keystore_export`, `mnemonic_from_entropy`/`_to_entropy`). Distinct from `sign`: `wallet` creates keys, `sign` moves value — an agent can derive addresses without being able to spend. Deny-by-default (never ambient), scoped to the **source secret's name** (or the new secret's label when generating), audited in `wallet.log` (granted or denied, never the material), denied inside `sandbox`. Bare `require wallet` (any) warns. WebSocket (`ws_connect`) needs no new capability — it reuses `net(host)`.
+
+`memory("NAME")` gates the **whole persistent-state family** — memory (`remember`/`recall`/`forget_memory`/`memory_summary`), owner rules (`add_rule`/`check_rules`/`get_rules`) and progress (`create_progress`/…/`resume_point`). The declared name **IS the identity**: state lives in `<program-dir>/.synsema/state/<NAME>.db`, keyed by the name, not the filename. Deny-by-default **even under `run`** (it writes files — never ambient); without the declaration the builtins fail with the exact line to add and **no file is created**. One name per program; bare `require memory` is a parse error (no name = no identity). Denied inside `sandbox`; `call_tool` intersects it; `--cap-set "memory=shop-*"` scopes by prefix. See [memory.md](memory.md).
 
 ## Declaring capabilities
 ```
@@ -37,6 +39,7 @@ require db("mysql://localhost/appdb")     -- MySQL (scope = canonical URL)
 require db("mongodb://localhost/appdb")   -- MongoDB (scope = canonical URL)
 require db("redis://localhost")           -- Redis (scope = canonical URL; redis://host:6379 → redis://host)
 require db("*")                     -- any database (file or remote); bare `require db` = same
+require memory("support-agent")     -- persistent agent state (remember/rules/progress); the name IS the .db identity
 ```
 
 `require` in the program body grants the capability for real. This is NOT just a declaration — it enables the operation.
@@ -156,8 +159,9 @@ synsema test --cap-set "stdout,time,random,secret,file=scratch_*" program.syn
 - It only ever **removes**, never widens. Auto-grants (`stdout`/`time`/`llm`) are filtered too (so
   `--sandbox` won't spend your LLM key). It propagates to **agents** and **`parallel_map` workers** — a
   spawned agent can't exceed the ceiling either.
-- **Scope `file`/`db`:** a bare `--cap-set "…,file"` lets the code read any absolute path; use a prefix
-  like `file=scratch_*` (or `db=:memory:`) so it can only touch what you intend.
+- **Scope `file`/`db`/`memory`:** a bare `--cap-set "…,file"` lets the code read any absolute path; use a prefix
+  like `file=scratch_*` (or `db=:memory:`, `memory=shop-*`) so it can only touch what you intend. A ceiling
+  without `memory` denies the persistent-state family entirely — and creates no `.db` file at all.
 
 This is what makes "run code you don't trust" safe at the language level. For a public deploy, compose
 it with an OS sandbox/container (defense in depth).

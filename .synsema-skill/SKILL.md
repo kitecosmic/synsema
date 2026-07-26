@@ -70,7 +70,7 @@ usually version skew, not a bug.
 - [llm.md](llm.md) — LLM operations: reason, decide, analyze, generate
 - [human.md](human.md) — Human interaction: approve, confirm, ask, show
 - [observability.md](observability.md) — trace, log, measure, checkpoint, diagnostics
-- [memory.md](memory.md) — Agent memory, owner rules, progress tracking
+- [memory.md](memory.md) — Declared agent memory (`require memory("name")` — the name IS the .db identity), per-agent namespaces (`recall(from = ...)`), owner rules, progress tracking
 - [patterns.md](patterns.md) — Common patterns and idioms
 
 **Project & deployment**

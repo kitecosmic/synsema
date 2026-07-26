@@ -24,6 +24,7 @@ let result be apply(process, where(items, is_valid))
 ```
 intent: "Process daily orders"
 require net("api.shop.com")
+require memory("daily-orders")      -- declared memory: gates remember/rules/progress, names the .db
 
 add_rule("max_discount", "must", "discount <= 0.20", "pricing")
 remember("context", "Peak season, expect high volume", ["operations"])

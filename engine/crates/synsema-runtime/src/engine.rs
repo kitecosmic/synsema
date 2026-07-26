@@ -23,7 +23,10 @@ use synsema_llm::provider::{LLMProvider, LLMRequest, MockProvider};
 // directo de `synsema-llm`.
 pub use synsema_llm::provider::{LlmStep, LlmStepResponse, ToolSpec};
 
-use synsema_agents::builtins::register_agent_builtins;
+use synsema_agents::builtins::{
+    register_agent_builtins, register_serve_memory_builtins, register_serve_progress_builtins,
+    register_shared_rules_builtins, MemoryGate,
+};
 use synsema_agents::memory::AgentMemory;
 use synsema_agents::progress::ProgressManager;
 use synsema_agents::swarm::{AgentState, Swarm};
@@ -45,27 +48,340 @@ use synsema_stdlib::secrets::{register_secret_builtins, EnvStore};
 
 pub(crate) const INTERP_STACK_SIZE: usize = 512 * 1024 * 1024;
 
+// =========================================================
+// Memoria declarada (DB-M1): identidad + stores compartidos
+// =========================================================
+
+/// Contexto de la memoria DECLARADA de un programa (`require memory("nombre")`).
+/// La declaración es la identidad (decisión #3): un solo `.db` (`<nombre>.db`),
+/// stores compartidos entre TODOS los contextos de ejecución del programa (top-level,
+/// agentes swarm, workers de `parallel_map`, ticks de cron, handlers de serve) y
+/// persistencia on-write. Todo `Arc` (Send+Sync) → cruza hilos sin copias divergentes.
+#[derive(Clone)]
+pub(crate) struct MemoryCtx {
+    /// Nombre declarado (ya validado, G-6). Es el scope de la capability `memory`.
+    pub(crate) name: String,
+    pub(crate) memory: std::sync::Arc<std::sync::Mutex<AgentMemory>>,
+    pub(crate) progress: std::sync::Arc<std::sync::Mutex<ProgressManager>>,
+    pub(crate) on_write_mem: std::sync::Arc<dyn Fn(&AgentMemory) + Send + Sync>,
+    pub(crate) on_write_prog: std::sync::Arc<dyn Fn(&ProgressManager) + Send + Sync>,
+}
+
+/// Identidad declarada resuelta: nombre + persistencia abierta (None si el `.db`
+/// no pudo abrirse — se degrada a memoria compartida en-proceso, sin romper).
+pub(crate) struct DeclaredState {
+    pub(crate) name: String,
+    pub(crate) persistence: Option<crate::persistence::StatePersistence>,
+}
+
+/// Sugerencia de nombre para el error/warning (decisión #8): el stem del archivo,
+/// saneado a `[a-zA-Z0-9_-]` para que la línea sugerida sea válida tal cual.
+pub(crate) fn suggested_memory_name(filename: &str) -> String {
+    if filename == "<stdin>" {
+        return "my-agent".to_string();
+    }
+    let stem = std::path::Path::new(filename)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let s: String = stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '-' })
+        .collect();
+    if s.is_empty() { "my-agent".to_string() } else { s }
+}
+
+/// Gate de memoria SIN declaración: toda la familia de estado persistente falla con
+/// el error de capability + el fix exacto (decisión #2/#8). No se crea ningún archivo
+/// (G-1): este gate corta antes de tocar los stores.
+pub(crate) fn undeclared_memory_gate(suggest: String) -> MemoryGate {
+    Rc::new(move || {
+        Err(format!(
+            "Capability not granted: memory. Persistent agent state (remember/recall, rules, progress) requires a declared memory — the declared name identifies its .db file. Add: require memory(\"{}\") at the top of the program",
+            suggest
+        ))
+    })
+}
+
+/// Gate de memoria CON declaración: chequea `memory("<nombre>")` contra el
+/// CapabilitySet VIVO del contexto — así `sandbox` (set vaciado), `call_tool`
+/// (intersección declarada) y el techo del host (`--sandbox`/`--cap-set`) lo
+/// deniegan por la misma maquinaria que el resto de capabilities (G-2).
+pub(crate) fn declared_memory_gate(caps: Rc<RefCell<CapabilitySet>>, name: String) -> MemoryGate {
+    Rc::new(move || {
+        caps.borrow_mut()
+            .require(
+                &Capability::new(CapabilityType::Memory, Some(name.clone())),
+                "memory builtin",
+            )
+            .map_err(|v| v.message)
+    })
+}
+
+/// Gate según haya o no contexto declarado. `suggest` alimenta el mensaje del caso
+/// sin declaración.
+pub(crate) fn memory_gate_for(
+    caps: &Rc<RefCell<CapabilitySet>>,
+    mem: Option<&MemoryCtx>,
+    suggest: &str,
+) -> MemoryGate {
+    match mem {
+        Some(ctx) => declared_memory_gate(caps.clone(), ctx.name.clone()),
+        None => undeclared_memory_gate(suggest.to_string()),
+    }
+}
+
+/// Escanea las declaraciones `require memory("<nombre>")` del TOP-LEVEL del programa
+/// (misma doctrina que el scan de requires de `call_tool`: sólo literales top-level;
+/// un require anidado/dinámico no define identidad). Valida G-6 y exige un único
+/// nombre (decisión #3). `Ok(None)` = programa sin memoria declarada.
+pub(crate) fn declared_memory_name(
+    statements: &[Node],
+) -> Result<Option<String>, String> {
+    use synsema_core::ast::NodeKind;
+    let mut found: Option<String> = None;
+    for stmt in statements {
+        if let NodeKind::RequireStatement { capability, scope } = &stmt.kind {
+            if capability != "memory" {
+                continue;
+            }
+            // El parser ya rechaza `require memory` sin scope; acá sólo cuentan los
+            // scopes LITERALES (la identidad no puede ser dinámica).
+            if let Some(scope_node) = scope {
+                if let NodeKind::TextLiteral { value } = &scope_node.kind {
+                    synsema_capabilities::model::validate_memory_name(value)?;
+                    match &found {
+                        Some(prev) if prev != value => {
+                            return Err(format!(
+                                "Multiple memory declarations: require memory(\"{}\") and require memory(\"{}\"). A program has exactly ONE declared memory (the declared name IS its identity) — keep one declaration",
+                                prev, value
+                            ));
+                        }
+                        _ => found = Some(value.clone()),
+                    }
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Resuelve la identidad declarada del programa (DB-M1, §3.2). Con declaración:
+/// abre `<dir>/.synsema/state/<nombre>.db` (`SYNSEMA_STATE_DIR` lo pisa; el dir se
+/// crea SOLO acá). Sin declaración: cero archivos (G-1) + chequeo de transición G-4
+/// (si existe el viejo `<stem>.db`, warning fuerte con el fix — nada se carga ni se
+/// escribe). `SYNSEMA_STATE_NAME` queda deprecada (decisión #6): warning si está
+/// seteada; con declaración se ignora. `ceiling` = techo del host (`--sandbox`/
+/// `--cap-set`): si NO cubre `memory("<nombre>")`, no se crea ni abre nada en disco
+/// (los builtins ya fallan con el error de capability; un `.db` vacío bajo un techo
+/// que deniega la memoria sería el efecto colateral que el techo debía impedir).
+pub(crate) fn resolve_declared_state(
+    statements: &[Node],
+    filename: &str,
+    ceiling: Option<&[Capability]>,
+) -> Result<Option<DeclaredState>, String> {
+    let declared = declared_memory_name(statements)?;
+    let legacy_name = std::env::var("SYNSEMA_STATE_NAME").ok().filter(|s| !s.is_empty());
+    match declared {
+        None => {
+            // G-4: transición ruidosa-no-rota. Localizar dónde habría vivido la DB del
+            // mundo viejo (stem + overrides de env) SIN crear nada; si existe, avisar.
+            if filename != "<stdin>" {
+                let stem = std::path::Path::new(filename)
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "default".to_string());
+                let old_name = legacy_name.clone().unwrap_or_else(|| stem.clone());
+                let old_dir = match std::env::var("SYNSEMA_STATE_DIR").ok().filter(|s| !s.is_empty()) {
+                    Some(d) => std::path::PathBuf::from(d),
+                    None => std::path::Path::new(filename)
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| std::path::PathBuf::from("."))
+                        .join(".synsema")
+                        .join("state"),
+                };
+                let old_db = old_dir.join(format!("{}.db", old_name));
+                if old_db.is_file() {
+                    eprintln!(
+                        "synsema: warning: found existing persistent state at '{}' but this program declares no memory.\n\
+                         Persistent state is now opt-in: nothing was loaded and nothing will be written.\n\
+                         To keep using this state, add this line at the top of the program:\n\
+                         \x20   require memory(\"{}\")\n\
+                         (the declared name maps to '<name>.db' in the same directory — keep the file if the name matches, or rename it)",
+                        old_db.display(),
+                        suggested_memory_name(filename)
+                    );
+                }
+            }
+            Ok(None)
+        }
+        Some(name) => {
+            if legacy_name.is_some() {
+                eprintln!(
+                    "synsema: warning: SYNSEMA_STATE_NAME is deprecated and ignored — the declared name in require memory(\"{}\") is the identity",
+                    name
+                );
+            }
+            // Techo del host: memoria declarada pero denegada por `--cap-set`/`--sandbox`
+            // → identidad sin disco (cero archivos; el uso falla con el error de siempre).
+            if let Some(ceil) = ceiling {
+                let want = Capability::new(CapabilityType::Memory, Some(name.clone()));
+                if !ceil.iter().any(|c| c.covers(&want)) {
+                    return Ok(Some(DeclaredState { name, persistence: None }));
+                }
+            }
+            // Dir de estado: override explícito, o project-local (`<dir>/.synsema/state`).
+            // `<stdin>` no tiene dir de programa: sin `SYNSEMA_STATE_DIR`, la memoria
+            // declarada queda compartida en-proceso pero SIN disco (no inventamos una
+            // ubicación; con el override sí hay una ubicación bien definida) — degradar
+            // con AVISO: el programa cree que persiste y no.
+            let dir = match std::env::var("SYNSEMA_STATE_DIR").ok().filter(|s| !s.is_empty()) {
+                Some(d) => std::path::PathBuf::from(d),
+                None if filename == "<stdin>" => {
+                    eprintln!(
+                        "synsema: warning: memory \"{}\" is declared but the program has no file location (<stdin>): state lives in memory for this run only and will NOT persist. Run from a .syn file, or set SYNSEMA_STATE_DIR, to persist it",
+                        name
+                    );
+                    return Ok(Some(DeclaredState { name, persistence: None }));
+                }
+                None => {
+                    let base = std::path::Path::new(filename)
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| std::path::PathBuf::from("."));
+                    base.join(".synsema").join("state")
+                }
+            };
+            // Crear el dir; si falla (read-only/permisos), fallback al global con warning.
+            let dir = match std::fs::create_dir_all(&dir) {
+                Ok(()) => dir,
+                Err(e) => {
+                    let fallback = crate::persistence::home_state_dir();
+                    eprintln!(
+                        "synsema: warning: could not create state dir '{}' ({}); using '{}'",
+                        dir.display(),
+                        e,
+                        fallback.display()
+                    );
+                    let _ = std::fs::create_dir_all(&fallback);
+                    fallback
+                }
+            };
+            let path = dir.join(format!("{}.db", name));
+            // Fallo al abrir (corrupto, lockeado, permisos): degradar con AVISO —
+            // la memoria funciona este run pero NO persiste (doctrina: las fallas no
+            // rompen la cadena del agente, pero siempre avisan).
+            let persistence = match crate::persistence::StatePersistence::open_path(&path) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!(
+                        "synsema: warning: could not open state db '{}' ({}): memory \"{}\" will work for this run but will NOT persist. Repair or remove the file to restore persistence",
+                        path.display(),
+                        e,
+                        name
+                    );
+                    None
+                }
+            };
+            Ok(Some(DeclaredState { name, persistence }))
+        }
+    }
+}
+
+/// Construye el `MemoryCtx` de un `DeclaredState`: stores compartidos, carga inicial
+/// desde el `.db` y callbacks on-write (misma pareja `save_memory_only`/
+/// `save_progress_only` que serve — tablas distintas, sin pisarse, DE-028).
+pub(crate) fn build_memory_ctx(rs: DeclaredState) -> MemoryCtx {
+    use std::sync::{Arc, Mutex};
+    let memory = Arc::new(Mutex::new(AgentMemory::new()));
+    let progress = Arc::new(Mutex::new(ProgressManager::new()));
+    let sp: Option<Arc<Mutex<crate::persistence::StatePersistence>>> =
+        rs.persistence.map(|p| Arc::new(Mutex::new(p)));
+    if let Some(p) = &sp {
+        p.lock().unwrap().load_into(&mut memory.lock().unwrap(), &mut progress.lock().unwrap());
+    }
+    let on_write_mem: Arc<dyn Fn(&AgentMemory) + Send + Sync> = {
+        let sp = sp.clone();
+        Arc::new(move |mem: &AgentMemory| {
+            if let Some(p) = &sp {
+                if let Ok(guard) = p.lock() {
+                    guard.save_memory_only(mem);
+                }
+            }
+        })
+    };
+    let on_write_prog: Arc<dyn Fn(&ProgressManager) + Send + Sync> = {
+        let sp = sp.clone();
+        Arc::new(move |prog: &ProgressManager| {
+            if let Some(p) = &sp {
+                if let Ok(guard) = p.lock() {
+                    guard.save_progress_only(prog);
+                }
+            }
+        })
+    };
+    MemoryCtx { name: rs.name, memory, progress, on_write_mem, on_write_prog }
+}
+
+/// Resolución + contexto en un paso (camino común de run/test/diag/swarm).
+/// `Err` = declaración inválida (G-6) o múltiple (decisión #3) → error de arranque.
+pub(crate) fn memory_ctx_for(
+    statements: &[Node],
+    filename: &str,
+    ceiling: Option<&[Capability]>,
+) -> Result<Option<MemoryCtx>, String> {
+    Ok(resolve_declared_state(statements, filename, ceiling)?.map(build_memory_ctx))
+}
+
 /// Wiring común de un intérprete: capabilities + builtins seguros/stdlib + grant hook.
 /// En modo no-secure se auto-conceden STDOUT, TIME y LLM; en secure/serve hay que
 /// declararlas (`require llm` para las ops LLM). También instala el gate de las ops LLM.
-pub(crate) fn wire_common(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, secure: bool) {
+/// `mem` es el contexto de memoria DECLARADA (DB-M1): con `Some`, los builtins de la
+/// familia de estado persistente van a los stores compartidos (gateados por
+/// `memory("<nombre>")`); con `None`, fallan con el error de capability + sugerencia.
+pub(crate) fn wire_common(
+    interp: &mut Interpreter,
+    caps: &Rc<RefCell<CapabilitySet>>,
+    secure: bool,
+    mem: Option<&MemoryCtx>,
+    suggest: &str,
+) {
+    let gate = memory_gate_for(caps, mem, suggest);
     wire_common_with_state(
         interp,
         caps,
         secure,
         Rc::new(RefCell::new(ProgressManager::new())),
         Rc::new(RefCell::new(AgentMemory::new())),
+        gate.clone(),
+        mem.cloned(),
     );
+    // Con memoria declarada: sobrescribir la familia per-intérprete con los stores
+    // COMPARTIDOS (misma maquinaria que serve, G-9) → una sola verdad + persistencia
+    // on-write en todos los contextos. Las REGLAS también (misma tabla del `.db`);
+    // serve NO pasa por acá para las reglas (mantiene el snapshot per-worker, gap-15).
+    if let Some(ctx) = mem {
+        register_serve_memory_builtins(interp, ctx.memory.clone(), ctx.on_write_mem.clone(), gate.clone());
+        register_serve_progress_builtins(interp, ctx.progress.clone(), ctx.on_write_prog.clone(), gate.clone());
+        register_shared_rules_builtins(interp, ctx.memory.clone(), ctx.on_write_mem.clone(), gate);
+    }
 }
 
 /// Igual que `wire_common` pero con handles de progress/memory provistos por el caller
-/// (para que `run_source` pueda cargar/guardar estado persistido alrededor del run).
+/// (serve pre-carga las reglas del top-level en su AgentMemory per-worker) y el gate de
+/// memoria explícito. `mem` (si hay) viaja a los ejecutores de cron y a los workers de
+/// `parallel_map` para que TODOS los contextos compartan la misma memoria declarada.
 pub(crate) fn wire_common_with_state(
     interp: &mut Interpreter,
     caps: &Rc<RefCell<CapabilitySet>>,
     secure: bool,
     progress: Rc<RefCell<ProgressManager>>,
     memory: Rc<RefCell<AgentMemory>>,
+    mem_gate: MemoryGate,
+    mem: Option<MemoryCtx>,
 ) {
     if !secure {
         caps.borrow_mut().grant(Capability::new(CapabilityType::Stdout, None));
@@ -100,15 +416,16 @@ pub(crate) fn wire_common_with_state(
     register_cron_builtins(
         interp,
         synsema_stdlib::cron::SchedRef::Strong(cron_sched.clone()),
-        crate::serve::run_mode_cron_executor(caps.clone(), secure, &cron_sched),
+        crate::serve::run_mode_cron_executor(caps.clone(), secure, &cron_sched, mem.clone()),
     );
     register_database_builtins(interp, Rc::new(RefCell::new(DatabaseManager::new())), caps.clone());
-    register_agent_builtins(interp, progress, memory);
+    register_agent_builtins(interp, progress, memory, mem_gate);
     // Helpers de respuesta + vocabulario de contenido (ok/created/.../content). El
     // oráculo los registra en el intérprete principal siempre.
     synsema_stdlib::server::register_serve_builtins(interp);
-    // A1 concurrencia (Fase 1): parallel_map + chunk.
-    crate::parallel::register_parallel_builtins(interp, caps, secure);
+    // A1 concurrencia (Fase 1): parallel_map + chunk. El ctx de memoria declarada viaja
+    // a los workers (comparten los mismos stores; sus caps heredadas traen el grant).
+    crate::parallel::register_parallel_builtins(interp, caps, secure, mem);
     // render real (sobrescribe el placeholder de core): SSR de templates → raw response.
     interp.register_builtin(
         "render",
@@ -351,9 +668,39 @@ fn run_inner(
                 caps.borrow_mut().ceiling = Some(Rc::new(cl.clone()));
             }
             let ceiling_arc: Option<Arc<Vec<Capability>>> = ceiling.map(Arc::new);
-            let progress = Rc::new(RefCell::new(ProgressManager::new()));
-            let memory = Rc::new(RefCell::new(AgentMemory::new()));
-            wire_common_with_state(&mut interp, &caps, secure, progress.clone(), memory.clone());
+            // Identidad declarada (DB-M1): scan top-level + apertura del `.db` (o el
+            // chequeo de transición G-4 si no hay declaración). Declaración inválida
+            // (G-6) o múltiple (decisión #3) = error de arranque.
+            let mem_ctx = match memory_ctx_for(
+                &program.statements,
+                filename,
+                ceiling_arc.as_ref().map(|a| a.as_slice()),
+            ) {
+                Ok(m) => m,
+                Err(msg) => {
+                    return RunResult {
+                        success: false,
+                        output: Vec::new(),
+                        errors: vec![format!("Runtime error: {}", msg)],
+                    }
+                }
+            };
+            let suggest = suggested_memory_name(filename);
+            let gate = memory_gate_for(&caps, mem_ctx.as_ref(), &suggest);
+            wire_common_with_state(
+                &mut interp,
+                &caps,
+                secure,
+                Rc::new(RefCell::new(ProgressManager::new())),
+                Rc::new(RefCell::new(AgentMemory::new())),
+                gate.clone(),
+                mem_ctx.clone(),
+            );
+            if let Some(ctx) = &mem_ctx {
+                register_serve_memory_builtins(&interp, ctx.memory.clone(), ctx.on_write_mem.clone(), gate.clone());
+                register_serve_progress_builtins(&interp, ctx.progress.clone(), ctx.on_write_prog.clone(), gate.clone());
+                register_shared_rules_builtins(&interp, ctx.memory.clone(), ctx.on_write_mem.clone(), gate.clone());
+            }
             // Conectividad LLM real: si hay provider por env, cablea texto + paso
             // tool-aware; offline (sin key) deja los placeholders del core.
             wire_real_llm_provider(&mut interp);
@@ -377,84 +724,18 @@ fn run_inner(
 
             // Swarm real (DE-011): los hooks de spawn/share/observe/signal/wait_for del
             // main van al swarm compartido → los agentes corren en hilos aislados. El techo
-            // del host se propaga a cada agente spawneado (nunca lo exceden).
+            // del host se propaga a cada agente spawneado (nunca lo exceden), y el ctx de
+            // memoria declarada también (namespaces por `source`, decisión #4).
             if let Some(sw) = swarm {
-                wire_swarm_hooks(&mut interp, sw, "main", ceiling_arc.clone());
+                wire_swarm_hooks(&mut interp, sw, "main", ceiling_arc.clone(), mem_ctx.clone());
             }
 
-            // StatePersistence cross-run (espeja engine.run_source del oráculo): para
-            // archivos nombrados (no "<stdin>") carga el estado previo antes de ejecutar
-            // y lo guarda después → memory/progress sobreviven reinicios.
-            let persistence = state_persistence_for(filename);
-            if let Some(p) = &persistence {
-                p.load_into(&mut memory.borrow_mut(), &mut progress.borrow_mut());
-            }
-
+            // La persistencia es on-write (el ctx guarda tras cada mutación, como serve):
+            // no hay save final que pueda perderse si el programa crashea a mitad.
             let r = interp.execute(&program);
-
-            if let Some(p) = &persistence {
-                p.save_from(&memory.borrow(), &progress.borrow());
-            }
             finish(interp, r)
         }
     }
-}
-
-/// Abre la persistencia de estado para `filename` (None si es `<stdin>`). DE-031: la ruta
-/// es **project-local** por default — `<dir-del-programa>/.synsema/state/<name>.db` — para
-/// que el estado viva junto al proyecto, sea portable/gitignorable y NO colisione entre
-/// proyectos distintos con el mismo nombre de archivo. Overrides (de mayor a menor
-/// prioridad):
-///   1. `SYNSEMA_STATE_DIR` — dir de estado explícito (absoluto o relativo al cwd).
-///      Escape hatch; restaura el viejo global con `SYNSEMA_STATE_DIR=~/.synsema/state`.
-///   2. project-local (default): el dir del archivo de programa.
-///
-/// Nombre de la DB: `SYNSEMA_STATE_NAME` si está (para que varios archivos de entrada del
-/// mismo proyecto compartan UNA memoria), si no el `stem` del archivo. Si el dir elegido
-/// no es escribible, cae al global `~/.synsema/state` con un warning (no rompe).
-pub(crate) fn state_persistence_for(filename: &str) -> Option<crate::persistence::StatePersistence> {
-    if filename == "<stdin>" {
-        return None;
-    }
-    // Nombre de la DB.
-    let name = std::env::var("SYNSEMA_STATE_NAME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            std::path::Path::new(filename)
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "default".to_string())
-        });
-    // Dir de estado: override explícito, o project-local (`<dir>/.synsema/state`).
-    let dir = match std::env::var("SYNSEMA_STATE_DIR").ok().filter(|s| !s.is_empty()) {
-        Some(d) => std::path::PathBuf::from(d),
-        None => {
-            let base = std::path::Path::new(filename)
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            base.join(".synsema").join("state")
-        }
-    };
-    // Crear el dir; si falla (read-only/permisos), fallback al global con warning.
-    let dir = match std::fs::create_dir_all(&dir) {
-        Ok(()) => dir,
-        Err(e) => {
-            let fallback = crate::persistence::home_state_dir();
-            eprintln!(
-                "warning: no se pudo crear el dir de estado '{}' ({}); usando '{}'",
-                dir.display(),
-                e,
-                fallback.display()
-            );
-            let _ = std::fs::create_dir_all(&fallback);
-            fallback
-        }
-    };
-    let path = dir.join(format!("{}.db", name));
-    crate::persistence::StatePersistence::open_path(&path).ok()
 }
 
 fn spawn_run(source: &str, filename: &str, secure: bool) -> RunResult {
@@ -569,10 +850,14 @@ fn run_tests_inner(source: &str, filename: &str, ceiling: Option<Vec<Capability>
     if let Some(cl) = &ceiling {
         caps.borrow_mut().ceiling = Some(Rc::new(cl.clone()));
     }
-    let progress = Rc::new(RefCell::new(ProgressManager::new()));
-    let memory = Rc::new(RefCell::new(AgentMemory::new()));
+    // Identidad declarada (DB-M1): misma resolución que `run` (§3.2 — aplica idéntico
+    // en run/test/conform/serve). Declaración inválida/múltiple = fallo de arranque.
+    let mem_ctx = match memory_ctx_for(&program.statements, filename, ceiling.as_deref()) {
+        Ok(m) => m,
+        Err(msg) => return report_with_failure("<startup>", format!("Runtime error: {}", msg)),
+    };
     // Wiring no-secure (igual que `run`): los `require` del archivo conceden capabilities (G4).
-    wire_common_with_state(&mut interp, &caps, false, progress, memory);
+    wire_common(&mut interp, &caps, false, mem_ctx.as_ref(), &suggested_memory_name(filename));
     let outcomes = interp.run_test_blocks(&program);
     let passed = outcomes.iter().filter(|o| o.passed).count();
     let failed = outcomes.len() - passed;
@@ -604,7 +889,35 @@ pub fn repl() {
     use std::io::{self, BufRead, Write};
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("repl")));
-    wire_common(&mut interp, &caps, false);
+    wire_common(&mut interp, &caps, false, None, "my-agent");
+    // DB-M1 en el REPL: la declaración llega DESPUÉS del wiring (línea a línea), así
+    // que el gate estático "sin declaración" dejaría la familia muerta con una
+    // sugerencia que no arregla nada. Acá el gate mira el CapabilitySet VIVO: tipear
+    // `require memory("<nombre>")` en la sesión habilita la memoria EFÍMERA del REPL
+    // (stores per-intérprete, sin disco — como `<stdin>`). Deny-by-default intacto.
+    let repl_gate: MemoryGate = {
+        let caps = caps.clone();
+        Rc::new(move || {
+            let declared = caps
+                .borrow()
+                .granted
+                .iter()
+                .any(|c| c.ty == CapabilityType::Memory);
+            if declared {
+                Ok(())
+            } else {
+                Err(
+                    "Capability not granted: memory. Persistent agent state (remember/recall, rules, progress) requires a declared memory. In the REPL, type: require memory(\"my-agent\") to enable a session-only in-memory store (nothing is written to disk)".to_string(),
+                )
+            }
+        })
+    };
+    register_agent_builtins(
+        &interp,
+        Rc::new(RefCell::new(ProgressManager::new())),
+        Rc::new(RefCell::new(AgentMemory::new())),
+        repl_gate,
+    );
     println!("Synsema REPL — escribí sentencias; Ctrl+Z (Windows) / Ctrl+D para salir.");
     let stdin = io::stdin();
     let mut handle = stdin.lock();
@@ -676,11 +989,30 @@ fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>, ceili
         caps.borrow_mut().ceiling = Some(Rc::new(cl.clone()));
     }
     let ceiling_arc: Option<Arc<Vec<Capability>>> = ceiling.map(Arc::new);
-    wire_common(&mut interp, &caps, false);
+    // Identidad declarada (DB-M1): `run --explain` es una variante de run — misma
+    // resolución/gate que run_inner.
+    let mem_ctx = match memory_ctx_for(
+        &program.statements,
+        filename,
+        ceiling_arc.as_ref().map(|a| a.as_slice()),
+    ) {
+        Ok(m) => m,
+        Err(msg) => {
+            return DiagRun {
+                result: RunResult {
+                    success: false,
+                    output: Vec::new(),
+                    errors: vec![format!("Runtime error: {}", msg)],
+                },
+                diagnostics: vec![ErrorReporter::new().build_diagnostic("RuntimeError", &msg, None, None)],
+            }
+        }
+    };
+    wire_common(&mut interp, &caps, false, mem_ctx.as_ref(), &suggested_memory_name(filename));
     // Swarm real (DE-014): mismos hooks que `run` → los agentes corren aislados y un
     // `raise` de agente no aborta el main ni trunca su diagnóstico.
     if let Some(sw) = swarm {
-        wire_swarm_hooks(&mut interp, sw, "main", ceiling_arc.clone());
+        wire_swarm_hooks(&mut interp, sw, "main", ceiling_arc.clone(), mem_ctx.clone());
     }
     match interp.execute(&program) {
         Ok(_) => DiagRun {
@@ -774,7 +1106,19 @@ fn run_configured(source: &str, filename: &str, configure: impl FnOnce(&mut Inte
         Ok(program) => {
             let mut interp = Interpreter::new();
             let caps = Rc::new(RefCell::new(CapabilitySet::new("program")));
-            wire_common(&mut interp, &caps, false);
+            // Identidad declarada (DB-M1): mismos gates que run también en los
+            // harnesses host-config (run_with_human/run_with_llm/…). Sin techo acá.
+            let mem_ctx = match memory_ctx_for(&program.statements, filename, None) {
+                Ok(m) => m,
+                Err(msg) => {
+                    return RunResult {
+                        success: false,
+                        output: Vec::new(),
+                        errors: vec![format!("Runtime error: {}", msg)],
+                    }
+                }
+            };
+            wire_common(&mut interp, &caps, false, mem_ctx.as_ref(), &suggested_memory_name(filename));
             configure(&mut interp);
             let r = interp.execute(&program);
             finish(interp, r)
@@ -964,6 +1308,7 @@ pub(crate) fn wire_swarm_hooks(
     swarm: Arc<Swarm>,
     agent_name: &str,
     ceiling: Option<Arc<Vec<Capability>>>,
+    mem: Option<MemoryCtx>,
 ) {
     let name = agent_name.to_string();
 
@@ -999,6 +1344,7 @@ pub(crate) fn wire_swarm_hooks(
     let spawn: synsema_core::interpreter::SpawnHook = {
         let sw = swarm.clone();
         let ceiling = ceiling.clone();
+        let mem = mem.clone();
         Rc::new(move |agent, body, args, globals| {
             let send_args: Vec<(String, SendValue)> =
                 args.iter().map(|(k, v)| (k.clone(), to_send(v))).collect();
@@ -1008,7 +1354,8 @@ pub(crate) fn wire_swarm_hooks(
             );
             // El techo del host se propaga al agente (Arc → Send cruza el hilo): un agente
             // spawneado jamás excede el techo, aunque su cuerpo declare `require exec(...)`.
-            Ok(spawn_agent(sw.clone(), agent.to_string(), body, send_args, global_snap, ceiling.clone()))
+            // El ctx de memoria declarada también (mismos stores + namespace por `source`).
+            Ok(spawn_agent(sw.clone(), agent.to_string(), body, send_args, global_snap, ceiling.clone(), mem.clone()))
         })
     };
 
@@ -1018,7 +1365,13 @@ pub(crate) fn wire_swarm_hooks(
 /// Crea un intérprete con el wiring común + los hooks del swarm.
 /// El `log_hook` manda los `log` del agente a stdout del proceso principal en tiempo
 /// real — así los agentes no son silenciosos durante el desarrollo.
-fn setup_swarm_interpreter(swarm: Arc<Swarm>, agent_name: &str, ceiling: Option<Arc<Vec<Capability>>>) -> Interpreter {
+fn setup_swarm_interpreter(
+    swarm: Arc<Swarm>,
+    agent_name: &str,
+    ceiling: Option<Arc<Vec<Capability>>>,
+    mem: Option<MemoryCtx>,
+    grant_memory: bool,
+) -> Interpreter {
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("agent")));
     // Techo del host: antes de wire_common (filtra los auto-grants stdout/time/llm del
@@ -1026,9 +1379,19 @@ fn setup_swarm_interpreter(swarm: Arc<Swarm>, agent_name: &str, ceiling: Option<
     if let Some(cl) = &ceiling {
         caps.borrow_mut().ceiling = Some(Rc::new((**cl).clone()));
     }
-    wire_common(&mut interp, &caps, false);
-    // Propaga el techo a los sub-agentes que este agente pudiera spawnear.
-    wire_swarm_hooks(&mut interp, swarm, agent_name, ceiling);
+    wire_common(&mut interp, &caps, false, mem.as_ref(), "my-agent");
+    // Para AGENTES spawneados de un programa con memoria declarada: la declaración
+    // top-level cubre a sus agentes (una identidad por programa, decisión #3) — el
+    // grant pasa por `grant()` así el techo del host sigue mandando (G-2). El "main"
+    // NO recibe este grant: su propio `require memory(...)` lo concede al ejecutarse.
+    if grant_memory {
+        if let Some(ctx) = &mem {
+            caps.borrow_mut()
+                .grant(Capability::new(CapabilityType::Memory, Some(ctx.name.clone())));
+        }
+    }
+    // Propaga el techo (y el ctx de memoria) a los sub-agentes que este agente spawnee.
+    wire_swarm_hooks(&mut interp, swarm, agent_name, ceiling, mem);
     let name = agent_name.to_string();
     interp.log_hook = Some(Arc::new(move |line: &str| {
         println!("[{}] {}", name, line);
@@ -1046,6 +1409,7 @@ fn spawn_agent(
     send_args: Vec<(String, SendValue)>,
     globals: Arc<Vec<(String, GlobalVal)>>,
     ceiling: Option<Arc<Vec<Capability>>>,
+    mem: Option<MemoryCtx>,
 ) -> String {
     let instance_id = swarm.register_new_agent(&agent_name);
     let sw = swarm.clone();
@@ -1054,7 +1418,11 @@ fn spawn_agent(
         .name(id.clone())
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
-            let mut interp = setup_swarm_interpreter(sw.clone(), &id, ceiling);
+            let mut interp = setup_swarm_interpreter(sw.clone(), &id, ceiling, mem, true);
+            // Namespace de memoria (DB-M1 #4): el `source` de remember/recall dentro
+            // del agente es su NOMBRE declarado (no el instance_id — `from = "writer"`
+            // debe cruzar a ese namespace sin adivinar sufijos de instancia).
+            interp.set_agent_context(&agent_name);
             // Restaurar tareas y valores del top-level para que el agente
             // los pueda llamar directamente sin necesitar HTTP.
             rebuild_globals(&mut interp, &globals);
@@ -1094,7 +1462,19 @@ fn run_swarm_inner(source: &str, filename: &str, swarm: Arc<Swarm>) -> RunResult
             errors: vec![format!("Parse error: {}", e)],
         },
         Ok(program) => {
-            let mut interp = setup_swarm_interpreter(swarm, "main", None);
+            // Identidad declarada (DB-M1): también en el camino con swarm retenido
+            // (`conform --swarm` / Engine::run).
+            let mem_ctx = match memory_ctx_for(&program.statements, filename, None) {
+                Ok(m) => m,
+                Err(msg) => {
+                    return RunResult {
+                        success: false,
+                        output: Vec::new(),
+                        errors: vec![format!("Runtime error: {}", msg)],
+                    }
+                }
+            };
+            let mut interp = setup_swarm_interpreter(swarm, "main", None, mem_ctx, false);
             let r = interp.execute(&program);
             finish(interp, r)
         }

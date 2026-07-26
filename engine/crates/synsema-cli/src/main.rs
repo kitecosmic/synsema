@@ -57,7 +57,7 @@ fn build_ceiling(sandbox: bool, cap_set: Option<&str>) -> Result<Option<Vec<Capa
                     Some(ty) => caps.push(Capability::new(ty, scope)),
                     None => {
                         return Err(format!(
-                            "--cap-set: unknown capability '{}'. Known: net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal",
+                            "--cap-set: unknown capability '{}'. Known: net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal, sign, wallet, memory",
                             name
                         ))
                     }
