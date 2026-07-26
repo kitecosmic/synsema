@@ -1058,6 +1058,15 @@ impl Parser {
             scope = Some(Box::new(self.parse_expression()?));
             self.expect(TokenType::RParen, "")?;
         }
+        // DB-M1 decisión #1: la declaración ES la identidad — `require memory` sin
+        // nombre no significa nada (¿qué .db abriría?). Error en el parse, no al
+        // persistir, con el fix exacto en el mensaje (LLM-safe, decisión #8).
+        if capability == "memory" && scope.is_none() {
+            return Err(ParseError::new(
+                "require memory needs a name: the declared name IS the memory identity (its .db file). Write: require memory(\"<name>\"), e.g. require memory(\"my-agent\")",
+                loc,
+            ));
+        }
         Ok(Node::new(loc, NodeKind::RequireStatement { capability, scope }))
     }
 

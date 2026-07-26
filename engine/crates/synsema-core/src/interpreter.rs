@@ -120,6 +120,10 @@ pub struct BuiltinTask {
     pub name: String,
     pub func: BuiltinFn,
     pub param_count: i32,
+    /// Nombres de parámetros, OPT-IN (G-8): sólo los builtins que los declaran
+    /// aceptan args nombrados (`recall(..., from = "writer")`), mapeados a
+    /// posicionales acá mismo. Los demás conservan el error de siempre.
+    pub param_names: Option<Vec<&'static str>>,
 }
 
 // =========================================================
@@ -337,6 +341,12 @@ pub struct Interpreter {
     pub live_output: bool,
     pub blackboard: HashMap<String, SynValue>,
     pub agent_definitions: HashMap<String, (Vec<Node>, Rc<RefCell<Environment>>)>,
+    /// Contexto de agente para los namespaces de memoria (DB-M1, decisión #4):
+    /// stack de nombres de agente en ejecución. Vacío = top-level (`source = "main"`).
+    /// El fallback in-process de `spawn` pushea/popea acá; el camino swarm (hilo
+    /// propio) lo fija una vez con `set_agent_context` al construir el intérprete
+    /// del agente. `current_agent()` es lo que leen `remember`/`recall`.
+    agent_context: Vec<String>,
     recursion_depth: usize,
     /// Concede capabilities declaradas con `require` (lo cablea el motor).
     grant_hook: Option<GrantHook>,
@@ -434,6 +444,7 @@ impl Interpreter {
             output: Vec::new(),
             blackboard: HashMap::new(),
             agent_definitions: HashMap::new(),
+            agent_context: Vec::new(),
             recursion_depth: 0,
             grant_hook: None,
             sandbox_depth: 0,
@@ -468,6 +479,7 @@ impl Interpreter {
                 name: name.to_string(),
                 func,
                 param_count,
+                param_names: None,
             })),
         );
     }
@@ -475,6 +487,27 @@ impl Interpreter {
     /// Registra un builtin externo (lo usa el motor para los builtins seguros).
     pub fn register_builtin(&self, name: &str, param_count: i32, func: BuiltinFn) {
         self.register(name, param_count, func);
+    }
+
+    /// Registra un builtin externo CON nombres de parámetros (G-8): habilita args
+    /// nombrados (`recall("x", from = "writer")`) mapeados a posicionales. Sólo
+    /// los builtins registrados por esta vía los aceptan; el resto conserva el
+    /// error de siempre.
+    pub fn register_builtin_named(
+        &self,
+        name: &str,
+        param_names: Vec<&'static str>,
+        func: BuiltinFn,
+    ) {
+        self.global_env.borrow_mut().bindings.insert(
+            name.to_string(),
+            SynValue::Builtin(Rc::new(BuiltinTask {
+                name: name.to_string(),
+                func,
+                param_count: param_names.len() as i32,
+                param_names: Some(param_names),
+            })),
+        );
     }
 
     /// Cablea el hook de concesión de capabilities (lo llama `require`).
@@ -583,6 +616,18 @@ impl Interpreter {
         env_set(&self.global_env, name, value);
     }
 
+    /// Nombre del agente en ejecución (namespaces de memoria, DB-M1). `None` =
+    /// top-level (`source = "main"`).
+    pub fn current_agent(&self) -> Option<&str> {
+        self.agent_context.last().map(|s| s.as_str())
+    }
+
+    /// Fija el contexto de agente de este intérprete (camino swarm: el intérprete
+    /// del hilo del agente ES el agente, de punta a punta).
+    pub fn set_agent_context(&mut self, name: &str) {
+        self.agent_context.push(name.to_string());
+    }
+
     /// Ejecuta un bloque de statements en el entorno global (cuerpo de un agente).
     /// Sin preámbulo/freeze (eso es sólo para el programa top-level).
     pub fn run_block(&mut self, stmts: &[Node]) -> Result<SynValue, Control> {
@@ -632,6 +677,7 @@ impl Interpreter {
         self.output.clear();
         self.blackboard.clear();
         self.agent_definitions.clear();
+        self.agent_context.clear();
         self.stream_emit = None;
         self.recursion_depth = 0;
     }
@@ -1615,6 +1661,7 @@ impl Interpreter {
                         name: name.clone(),
                         func,
                         param_count: count,
+                        param_names: None,
                     })),
                 );
                 Ok(SynValue::Nothing)
@@ -1664,6 +1711,7 @@ impl Interpreter {
                                 name: qualified.clone(),
                                 func,
                                 param_count: count,
+                                param_names: None,
                             })),
                         );
                     }
@@ -1734,7 +1782,13 @@ impl Interpreter {
                         for (k, v) in spawn_args {
                             env_set(&agent_env, &k, v);
                         }
-                        self.exec_block(&def.0, &agent_env)?;
+                        // Namespace de memoria (DB-M1): dentro del cuerpo, el agente ES
+                        // el contexto (remember → source = agent_name). Pop garantizado
+                        // aunque el cuerpo falle.
+                        self.agent_context.push(agent_name.clone());
+                        let r = self.exec_block(&def.0, &agent_env);
+                        self.agent_context.pop();
+                        r?;
                         Ok(syn_text(format!("agent:{}", agent_name)))
                     }
                 }
@@ -2357,20 +2411,74 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     ) -> Result<SynValue, Control> {
         match func {
             SynValue::Builtin(bt) => {
-                // Los builtins no declaran nombres de param: un arg nombrado es error
-                // claro (sintaxis nueva, G3). El camino posicional queda intacto.
-                let mut pos = Vec::with_capacity(args.len());
-                for (name, v) in args {
-                    if let Some(n) = name {
-                        return Err(err_at(
-                            format!("builtin '{}' does not accept named arguments", n),
-                            loc,
-                        ));
+                // Builtins con `param_names` (opt-in, G-8): los args nombrados se mapean
+                // a posicionales, con las mismas reglas que las tasks (posicional tras
+                // nombrado = error, duplicado = error, nombre desconocido = error, slot
+                // vacío = `nothing`). Sin `param_names`: un arg nombrado es error claro
+                // (sintaxis nueva, G3) y el camino posicional queda intacto.
+                match &bt.param_names {
+                    Some(names) => {
+                        let mut slots: Vec<Option<SynValue>> = vec![None; names.len()];
+                        let mut seen_named = false;
+                        let mut pos_idx = 0usize;
+                        for (name, value) in args {
+                            match name {
+                                None => {
+                                    if seen_named {
+                                        return Err(err_at(
+                                            "positional argument after named argument",
+                                            loc,
+                                        ));
+                                    }
+                                    if pos_idx < slots.len() {
+                                        slots[pos_idx] = Some(value);
+                                    }
+                                    pos_idx += 1;
+                                }
+                                Some(n) => {
+                                    seen_named = true;
+                                    match names.iter().position(|p| *p == n) {
+                                        Some(idx) => {
+                                            if slots[idx].is_some() {
+                                                return Err(err_at(
+                                                    format!("duplicate argument '{}'", n),
+                                                    loc,
+                                                ));
+                                            }
+                                            slots[idx] = Some(value);
+                                        }
+                                        None => {
+                                            return Err(err_at(
+                                                format!("unknown parameter '{}'", n),
+                                                loc,
+                                            ))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let pos: Vec<SynValue> = slots
+                            .into_iter()
+                            .map(|s| s.unwrap_or(SynValue::Nothing))
+                            .collect();
+                        let f = bt.func.clone();
+                        f(self, &pos, loc)
                     }
-                    pos.push(v);
+                    None => {
+                        let mut pos = Vec::with_capacity(args.len());
+                        for (name, v) in args {
+                            if let Some(n) = name {
+                                return Err(err_at(
+                                    format!("builtin '{}' does not accept named arguments", n),
+                                    loc,
+                                ));
+                            }
+                            pos.push(v);
+                        }
+                        let f = bt.func.clone();
+                        f(self, &pos, loc)
+                    }
                 }
-                let f = bt.func.clone();
-                f(self, &pos, loc)
             }
             SynValue::Task(task) => {
                 let call_env = Environment::child(&task.closure_env, &format!("call:{}", task.name));

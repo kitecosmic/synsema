@@ -46,7 +46,11 @@ share value as "result_" + text(id)      -- dynamic key
 observe "key" as variable                -- read (key can be expression too)
 observe "result_" + text(id) as data     -- dynamic key
 ```
-The blackboard is thread-safe, versioned, and watchable.
+The blackboard is thread-safe, versioned, and watchable. (It's ephemeral coordination —
+for state that must survive restarts, agents share the program's **declared memory**:
+`require memory("name")` at top-level covers every spawned agent, each agent writes under
+its own `source` namespace, and `recall()` inside an agent defaults to its OWN entries —
+cross with `recall(from = "other")` / `from = "*"`. See [memory.md](memory.md).)
 
 ## Signals (consumable queue)
 ```

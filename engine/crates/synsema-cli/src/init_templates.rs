@@ -24,8 +24,15 @@ pub const HELLO_SYN: &str = r#"-- Mi primer programa Synsema.
 intent: "Mi primer programa Synsema"
 
 -- Capacidades: Synsema es deny-by-default — `require` declara lo que el programa puede
--- tocar (llm, net, file, db, ...). Sin el permiso, la operación se deniega con error claro.
+-- tocar (llm, net, file, db, memory, ...). Sin el permiso, la operación se deniega con
+-- error claro.
 require llm
+
+-- Memoria persistente DECLARADA: esta línea habilita remember/recall (y reglas y
+-- progreso) y le da IDENTIDAD al estado — el nombre declarado (no el nombre del
+-- archivo) keyea `.synsema/state/hello.db` (el .gitignore generado ya lo excluye).
+-- Sin esta línea, remember/recall se deniegan y NO se crea ningún archivo.
+require memory("hello")
 
 -- Valores: `let` declara (texto, número, lista, map).
 let nombre be "mundo"
@@ -48,6 +55,15 @@ each n in numeros
 
 print(persona["nombre"] + " tiene " + text(persona["edad"]))
 
+-- Memoria del agente: sobrevive entre ejecuciones (gracias al `require memory` de
+-- arriba). Corré el programa DOS veces y mirá el contador crecer — eso es un agente
+-- que recuerda. `recall` filtra por categoría/tags/texto y devuelve lo más nuevo
+-- primero; dentro de un `agent`, cada agente lee su propio namespace por defecto
+-- (cruzá con `recall(from = "otro")`). Docs: https://docs.synsema.com → Memory & state.
+remember("learning", "corrí el tour de hello.syn", ["tour"])
+let memorias be recall("learning", ["tour"])
+print("memorias del tour: " + text(length(memorias)) + " (corré de nuevo y crece)")
+
 -- LLM nativo: con un provider conectado (ver .env.example) esto razona de verdad.
 -- Sin provider, DEGRADA CON AVISO y el programa sigue — la cadena nunca se rompe.
 when llm_available()
@@ -60,6 +76,11 @@ otherwise
 test "greet saluda con y sin default"
     assert_eq(greet("Synsema"), "hola Synsema")
     assert_eq(greet("Synsema", "buenas"), "buenas Synsema")
+
+test "la memoria declarada guarda y encuentra (más nuevo primero)"
+    remember("learning", "nota del test", ["test-tour"])
+    let notas be recall("learning", ["test-tour"])
+    assert_eq((notas[0])["content"], "nota del test")
 "#;
 
 /// `.env.example`: cada variable comentada EN SU LÍNEA para que se entienda sola; los

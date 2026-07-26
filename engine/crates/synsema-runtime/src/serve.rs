@@ -164,6 +164,9 @@ pub(crate) struct CronExecEnv {
     shared_state: SharedState,
     approvals: ServeApprovals,
     secure: bool,
+    /// Nombre de la memoria DECLARADA del programa (DB-M1) — `None` si no declara.
+    /// Define el gate de los builtins de estado persistente en el intérprete del tick.
+    mem_name: Option<String>,
 }
 
 /// Slot del entorno de ejecución: bajo serve se llena UNA vez (con el bind listo);
@@ -349,6 +352,7 @@ fn run_cron_tick_inner(
         &env.approvals,
         cron,
         env.secure,
+        &env.mem_name,
         |interp| {
             let task = interp.global_env.borrow().bindings.get(name).cloned();
             match task {
@@ -393,6 +397,7 @@ pub(crate) fn run_mode_cron_executor(
     caps: Rc<RefCell<CapabilitySet>>,
     secure: bool,
     sched: &Arc<CronScheduler>,
+    mem: Option<crate::engine::MemoryCtx>,
 ) -> CronExecutorFactory {
     // Compartidos entre TODOS los jobs registrados por este intérprete. El contexto
     // lleva (weak) el MISMO scheduler que registró el intérprete principal: un task
@@ -400,8 +405,18 @@ pub(crate) fn run_mode_cron_executor(
     let ctx = CronTickCtx { sched: Arc::downgrade(sched), slot: Arc::new(RwLock::new(None)) };
     let swarm: Arc<Swarm> = Arc::new(Swarm::new());
     let shared_db: SharedDb = Arc::new(Mutex::new(DatabaseManager::new()));
-    let shared_memory: SharedMemoryStore = Arc::new(Mutex::new(AgentMemory::new()));
-    let shared_progress: SharedProgressStore = Arc::new(Mutex::new(ProgressManager::new()));
+    // Memoria DECLARADA (DB-M1): los ticks comparten los stores (y la persistencia
+    // on-write) del programa. Sin declaración: stores descartables + gate cerrado
+    // (los builtins fallan; los stores quedan inalcanzables — G-1).
+    let mem_name = mem.as_ref().map(|m| m.name.clone());
+    let (shared_memory, on_write_mem): (SharedMemoryStore, OnWriteFn) = match &mem {
+        Some(m) => (m.memory.clone(), m.on_write_mem.clone()),
+        None => (Arc::new(Mutex::new(AgentMemory::new())), Arc::new(|_| {})),
+    };
+    let (shared_progress, on_write_prog): (SharedProgressStore, OnWriteProgressFn) = match &mem {
+        Some(m) => (m.progress.clone(), m.on_write_prog.clone()),
+        None => (Arc::new(Mutex::new(ProgressManager::new())), Arc::new(|_| {})),
+    };
     let shared_state: SharedState = Arc::new(Mutex::new(HashMap::new()));
     let log: Arc<dyn Fn(&str) + Send + Sync> =
         Arc::new(|line: &str| eprintln!("[synsema] {line}"));
@@ -423,12 +438,13 @@ pub(crate) fn run_mode_cron_executor(
             shared_db: shared_db.clone(),
             rules_snap: Arc::new(Vec::new()),
             shared_memory: shared_memory.clone(),
-            on_write: Arc::new(|_| {}),
+            on_write: on_write_mem.clone(),
             shared_progress: shared_progress.clone(),
-            on_write_progress: Arc::new(|_| {}),
+            on_write_progress: on_write_prog.clone(),
             shared_state: shared_state.clone(),
             approvals: approvals.clone(),
             secure,
+            mem_name: mem_name.clone(),
         };
         *ctx.slot.write().unwrap() = Some(env);
         let ctx = ctx.clone();
@@ -1108,6 +1124,7 @@ fn build_base_interp(
     approvals: &ServeApprovals,
     cron: &CronWiring,
     secure: bool,
+    mem_name: &Option<String>,
 ) -> (Interpreter, Rc<RefCell<CapabilitySet>>) {
     let mut interp = Interpreter::new();
     // DE-034: bajo `serve`, los `log`/`print`/`show` de DENTRO de un handler se
@@ -1117,6 +1134,23 @@ fn build_base_interp(
     // largos). El `run` NO se toca: este wiring es exclusivo de la ruta serve.
     interp.log_hook = Some(serve_log_sink());
     let caps = Rc::new(RefCell::new(CapabilitySet::new("request")));
+    // Gate de memoria declarada (DB-M1): mismo gate para la familia entera (memoria +
+    // reglas + progress) contra las caps del WORKER — el snapshot del preámbulo trae
+    // el grant de `memory("<nombre>")` si el programa lo declaró; un `sandbox` dentro
+    // del handler lo vacía como al resto (G-2/G-9).
+    let mem_gate = match mem_name {
+        Some(n) => crate::engine::declared_memory_gate(caps.clone(), n.clone()),
+        None => crate::engine::undeclared_memory_gate("my-agent".to_string()),
+    };
+    // Ctx compartido para lo que este worker propague (cron registrado desde rutas,
+    // workers de parallel_map dentro de un handler): mismos stores + on_write.
+    let mem_ctx: Option<crate::engine::MemoryCtx> = mem_name.as_ref().map(|n| crate::engine::MemoryCtx {
+        name: n.clone(),
+        memory: shared_memory.clone(),
+        progress: shared_progress.clone(),
+        on_write_mem: on_write.clone(),
+        on_write_prog: on_write_progress.clone(),
+    });
     // Pre-populamos el AgentMemory con las reglas del top-level para que
     // add_rule/check_rules/get_rules funcionen desde los route handlers.
     let mut mem = AgentMemory::new();
@@ -1129,6 +1163,8 @@ fn build_base_interp(
         secure,
         Rc::new(RefCell::new(ProgressManager::new())),
         Rc::new(RefCell::new(mem)),
+        mem_gate.clone(),
+        mem_ctx.clone(),
     );
     // DE-029: cablear el provider LLM real (texto + paso tool-aware) también bajo serve,
     // para que reason/decide/generate/llm_step de los handlers no caigan a placeholders.
@@ -1147,10 +1183,10 @@ fn build_base_interp(
     }
     // Sobrescribir los builtins de memoria (remember/recall/forget_memory/memory_summary)
     // con versiones que usan el AgentMemory compartido entre hilos.
-    register_serve_memory_builtins(&interp, shared_memory.clone(), on_write.clone());
+    register_serve_memory_builtins(&interp, shared_memory.clone(), on_write.clone(), mem_gate.clone());
     // DE-028: ídem para el progress (create_progress/start_step/…/resume_point) → el
     // ProgressManager compartido entre hilos/requests, no el fresco per-intérprete.
-    register_serve_progress_builtins(&interp, shared_progress.clone(), on_write_progress.clone());
+    register_serve_progress_builtins(&interp, shared_progress.clone(), on_write_progress.clone(), mem_gate);
     // Registrar los builtins de estado compartido (state_set/state_get/state_incr/…).
     register_serve_state_builtins(&interp, shared_state.clone());
     // Cron del PROCESO (ejecución real): sobrescribe el scheduler fresco de
@@ -1171,7 +1207,7 @@ fn build_base_interp(
     }
     // El techo del host (--sandbox/--cap-set) aún no se extiende a `serve` (extensión
     // posterior); los intérpretes de request corren sin techo (comportamiento actual).
-    wire_swarm_hooks(&mut interp, swarm, "request", None);
+    wire_swarm_hooks(&mut interp, swarm, "request", None, mem_ctx);
     register_database_builtins(&interp, shared_db, caps.clone());
     rebuild_globals(&mut interp, snapshot);
     (interp, caps)
@@ -1216,6 +1252,7 @@ fn with_serve_interp<R>(
     approvals: &ServeApprovals,
     cron: &CronWiring,
     secure: bool,
+    mem_name: &Option<String>,
     f: impl FnOnce(&mut Interpreter) -> R,
 ) -> R {
     let key = Arc::as_ptr(snapshot) as *const () as usize;
@@ -1236,6 +1273,7 @@ fn with_serve_interp<R>(
             approvals,
             cron,
             secure,
+            mem_name,
         );
         BaseInterp { interp, caps, _snapshot: snapshot.clone() }
     });
@@ -1319,6 +1357,7 @@ fn request_bindings(ctx: &Ctx) -> Vec<(String, SynValue)> {
     let read_body = SynValue::Builtin(Rc::new(BuiltinTask {
         name: "read_body".to_string(),
         param_count: 0,
+        param_names: None,
         func: Rc::new(move |_i, _a, _l| match &body_file {
             Some(bf) => Ok(syn_text(std::fs::read_to_string(bf).unwrap_or_default())),
             None => Ok(syn_text(body_text.as_str())),
@@ -1333,6 +1372,7 @@ fn request_bindings(ctx: &Ctx) -> Vec<(String, SynValue)> {
     let read_body_bytes = SynValue::Builtin(Rc::new(BuiltinTask {
         name: "read_body_bytes".to_string(),
         param_count: 0,
+        param_names: None,
         func: Rc::new(move |_i, _a, _l| match &body_file_b {
             Some(bf) => Ok(syn_bytes(std::fs::read(bf).unwrap_or_default())),
             None => Ok(syn_bytes(body_raw.clone())),
@@ -1365,8 +1405,9 @@ fn run_route(
     body: &[Node],
     ctx: &Ctx,
     secure: bool,
+    mem_name: &Option<String>,
 ) -> GiveOutcome {
-    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, |interp| {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, |interp| {
         match interp.run_request_block(body, request_bindings(ctx)) {
             Ok(_) => GiveOutcome::Give(None),
             Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
@@ -1405,9 +1446,10 @@ fn run_stream(
     body: &[Node],
     ctx: &Ctx,
     secure: bool,
+    mem_name: &Option<String>,
     emit: Emitter,
 ) -> StreamEnd {
-    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, move |interp| {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp| {
         let cell = Rc::new(RefCell::new(emit));
         let ec = cell.clone();
         interp.set_stream_emit(Rc::new(move |val: SynValue, event: Option<&str>| {
@@ -1511,6 +1553,7 @@ fn build_host_table(
     swarm: &Arc<Swarm>,
     shared_db: &SharedDb,
     secure: bool,
+    mem_name: &Option<String>,
 ) -> Result<HostTable, Control> {
     // -- static mounts (dedup por prefijo) --
     let mut static_mounts: Vec<(String, String)> = Vec::new();
@@ -1549,8 +1592,9 @@ fn build_host_table(
         let ap_a = approvals.clone();
         let cron_a = cron.clone();
         let db_a = shared_db.clone();
+        let mn_a = mem_name.clone();
         let h: AuthHandler = Arc::new(move |token: &str| -> Option<SynValue> {
-            with_serve_interp(&swarm_a, &snap_a, &caps_a, &db_a, &rules_a, &mem_a, &ow_a, &prog_a, &owp_a, &st_a, &ap_a, &cron_a, secure, |interp| {
+            with_serve_interp(&swarm_a, &snap_a, &caps_a, &db_a, &rules_a, &mem_a, &ow_a, &prog_a, &owp_a, &st_a, &ap_a, &cron_a, secure, &mn_a, |interp| {
                 let genv = interp.global_env.clone();
                 let task = match interp.eval(&auth_node, &genv) {
                     Ok(t) => t,
@@ -1611,8 +1655,9 @@ fn build_host_table(
             let ap_c = approvals.clone();
             let cron_c = cron.clone();
             let db_c = shared_db.clone();
+            let mn_c = mem_name.clone();
             let handler: Handler = Arc::new(move |ctx: &Ctx| {
-                run_route(&swarm_c, &snap_c, &caps_c, &db_c, &rules_c, &mem_c, &ow_c, &prog_c, &owp_c, &st_c, &ap_c, &cron_c, &body_c, ctx, secure)
+                run_route(&swarm_c, &snap_c, &caps_c, &db_c, &rules_c, &mem_c, &ow_c, &prog_c, &owp_c, &st_c, &ap_c, &cron_c, &body_c, ctx, secure, &mn_c)
             });
 
             let stream_handler: Option<StreamHandler> = if *streaming {
@@ -1629,9 +1674,10 @@ fn build_host_table(
                 let ap_s = approvals.clone();
                 let cron_s = cron.clone();
                 let db_s = shared_db.clone();
+                let mn_s = mem_name.clone();
                 Some(Arc::new(move |ctx: &Ctx, emit: Emitter| {
                     run_stream(
-                        &swarm_s, &snap_s, &caps_s, &db_s, &rules_s, &mem_s, &ow_s, &prog_s, &owp_s, &st_s, &ap_s, &cron_s, &body_s, ctx, secure, emit,
+                        &swarm_s, &snap_s, &caps_s, &db_s, &rules_s, &mem_s, &ow_s, &prog_s, &owp_s, &st_s, &ap_s, &cron_s, &body_s, ctx, secure, &mn_s, emit,
                     )
                 }))
             } else {
@@ -1671,6 +1717,7 @@ fn make_serve_hook(
     on_write_progress: OnWriteProgressFn,
     shared_state: SharedState,
     cron: CronWiring,
+    mem_name: Option<String>,
 ) -> ServeHook {
     Rc::new(move |interp, node, env| {
         let (
@@ -1897,6 +1944,7 @@ fn make_serve_hook(
             &swarm,
             &shared_db,
             secure,
+            &mem_name,
         )?;
 
         // -- vhosts (Lote 1): cada `host "..."` con su propia tabla + cert opcional (SNI) --
@@ -1940,6 +1988,7 @@ fn make_serve_hook(
                     &swarm,
                     &shared_db,
                     secure,
+                    &mem_name,
                 )?;
                 let cert_path = match tls_cert {
                     Some(c) => Some(interp.eval(c, env)?.to_string()),
@@ -2107,6 +2156,7 @@ fn make_serve_hook(
             shared_state: shared_state.clone(),
             approvals: approvals.clone(),
             secure,
+            mem_name: mem_name.clone(),
         };
         arm_cron(&cron, cron_env);
 
@@ -2246,15 +2296,21 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     // ambos modos. (Antes el progress del boot se cargaba en un `pm` descartado → DE-028.)
     let shared_memory: SharedMemoryStore = Arc::new(Mutex::new(AgentMemory::new()));
     let shared_progress: SharedProgressStore = Arc::new(Mutex::new(ProgressManager::new()));
-    {
-        let persistence = crate::engine::state_persistence_for(filename);
-        if let Some(ref p) = persistence {
-            p.load_into(
-                &mut shared_memory.lock().unwrap(),
-                &mut shared_progress.lock().unwrap(),
-            );
+    // Identidad DECLARADA (DB-M1): una sola resolución para todo el serve (un solo
+    // warning G-4, un solo `.db`). Sin declaración → cero archivos y gate cerrado en
+    // top-level, workers, cron y agentes (G-1); los stores quedan inalcanzables.
+    // (`serve` aún no soporta el techo del host — ceiling None, comportamiento actual.)
+    let declared = match crate::engine::resolve_declared_state(&program.statements, filename, None) {
+        Ok(d) => d,
+        Err(msg) => {
+            return RunResult {
+                success: false,
+                output: Vec::new(),
+                errors: vec![format!("Runtime error: {}", msg)],
+            }
         }
-    }
+    };
+    let mem_name: Option<String> = declared.as_ref().map(|d| d.name.clone());
     // Callbacks de persistencia: cada mutación se guarda al SQLite inmediatamente para
     // sobrevivir reinicios. Memoria y progress escriben tablas DISTINTAS y tienen
     // callbacks separados (`save_memory_only`/`save_progress_only`) para no pisarse —
@@ -2263,7 +2319,13 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     // `StatePersistence` (mismo .db), y ningún callback toma el lock del OTRO store, así
     // que no hay inversión de orden de locks.
     let shared_persistence: Option<Arc<Mutex<crate::persistence::StatePersistence>>> =
-        crate::engine::state_persistence_for(filename).map(|p| Arc::new(Mutex::new(p)));
+        declared.and_then(|d| d.persistence).map(|p| Arc::new(Mutex::new(p)));
+    if let Some(ref p) = shared_persistence {
+        p.lock().unwrap().load_into(
+            &mut shared_memory.lock().unwrap(),
+            &mut shared_progress.lock().unwrap(),
+        );
+    }
     let persist_memory: OnWriteFn = {
         let sp = shared_persistence.clone();
         Arc::new(move |mem: &AgentMemory| {
@@ -2285,6 +2347,18 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         })
     };
 
+    // Gate del top-level (DB-M1) + ctx para lo que el preámbulo propague (cron/parallel).
+    let top_gate = match &mem_name {
+        Some(n) => crate::engine::declared_memory_gate(caps.clone(), n.clone()),
+        None => crate::engine::undeclared_memory_gate(crate::engine::suggested_memory_name(filename)),
+    };
+    let top_mem_ctx: Option<crate::engine::MemoryCtx> = mem_name.as_ref().map(|n| crate::engine::MemoryCtx {
+        name: n.clone(),
+        memory: shared_memory.clone(),
+        progress: shared_progress.clone(),
+        on_write_mem: persist_memory.clone(),
+        on_write_prog: persist_progress.clone(),
+    });
     // `top_level_memory` sigue siendo el AgentMemory per-intérprete del top-level.
     // Gestiona add_rule/check_rules (gap-15). Para remember/recall usamos shared_memory.
     let top_level_memory = Rc::new(RefCell::new(AgentMemory::new()));
@@ -2294,6 +2368,8 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         secure,
         Rc::new(RefCell::new(ProgressManager::new())),
         top_level_memory.clone(),
+        top_gate.clone(),
+        top_mem_ctx.clone(),
     );
     // DE-029: el provider LLM real también en el intérprete del preámbulo, para que el
     // código top-level (antes del `serve on PORT`) pueda usar reason/decide/generate.
@@ -2301,12 +2377,12 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     // Sobrescribir los builtins de memoria/progress en el top-level con los compartidos,
     // para que `remember`/`create_progress` en el top-level también persistan a disco y
     // sean coherentes con lo que ven los handlers.
-    register_serve_memory_builtins(&interp, shared_memory.clone(), persist_memory.clone());
-    register_serve_progress_builtins(&interp, shared_progress.clone(), persist_progress.clone());
+    register_serve_memory_builtins(&interp, shared_memory.clone(), persist_memory.clone(), top_gate.clone());
+    register_serve_progress_builtins(&interp, shared_progress.clone(), persist_progress.clone(), top_gate);
 
     let swarm = Arc::new(Swarm::new());
     // Techo del host (--sandbox/--cap-set) aún no se extiende a `serve` (extensión posterior).
-    wire_swarm_hooks(&mut interp, swarm.clone(), "main", None);
+    wire_swarm_hooks(&mut interp, swarm.clone(), "main", None, top_mem_ctx);
     // db compartida: el top-level abre/crea tablas; los handlers (en sus hilos) la
     // comparten vía Arc<Mutex>. Sobrescribe la db fresca que dejó wire_common.
     let shared_db: SharedDb = Arc::new(Mutex::new(DatabaseManager::new()));
@@ -2343,6 +2419,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         persist_progress.clone(),
         shared_state.clone(),
         cron.clone(),
+        mem_name.clone(),
     ));
 
     let r = interp.execute(&program);
@@ -2378,6 +2455,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
                 shared_state,
                 approvals: default_approvals(),
                 secure,
+                mem_name,
             };
             arm_cron(&cron, env);
             println!("Serving {} cron job(s). Press Ctrl+C to stop.", n_jobs);

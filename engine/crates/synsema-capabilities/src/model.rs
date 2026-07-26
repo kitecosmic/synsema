@@ -39,6 +39,13 @@ pub enum CapabilityType {
     /// de origen (o al label del secret nuevo al generar) y audit fail-loud en
     /// `wallet.log`. Nunca es ambiente. Batch 13 (G20).
     Wallet,
+    /// Memoria persistente declarada del agente (`require memory("nombre")`). La
+    /// declaración ES la identidad: scope = nombre literal del `.db` (DB-M1). Gatea
+    /// toda la familia de estado persistente (memory + rules + progress + decisions).
+    /// Deny-by-default incluso en `run` (no es ambiente como stdout/time/llm). El
+    /// scope NO es una ruta: se compara literal + fnmatch, lo que da prefijos
+    /// `memory=shop-*` en `--cap-set` gratis. Nunca sin scope en un `require`.
+    Memory,
 }
 
 impl CapabilityType {
@@ -64,6 +71,7 @@ impl CapabilityType {
             Reveal => "reveal",
             Sign => "sign",
             Wallet => "wallet",
+            Memory => "memory",
         }
     }
 }
@@ -89,6 +97,7 @@ pub fn capability_type_from_name(name: &str) -> Option<CapabilityType> {
         "reveal" => Reveal,
         "sign" => Sign,
         "wallet" => Wallet,
+        "memory" => Memory,
         _ => return None,
     })
 }
@@ -470,10 +479,29 @@ pub fn parse_capability(name: &str, scope: Option<&str>) -> Result<Capability, S
     match capability_type_from_name(name) {
         Some(ty) => Ok(Capability::new(ty, scope.map(|s| s.to_string()))),
         None => Err(format!(
-            "Unknown capability type: '{}'. Known: [net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal, sign, wallet]",
+            "Unknown capability type: '{}'. Known: [net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal, sign, wallet, memory]",
             name
         )),
     }
+}
+
+/// G-6 (DB-M1): valida un nombre de memoria declarado (`require memory("nombre")`).
+/// Sólo `[a-zA-Z0-9_-]+`: sin `/`, `\`, `..`, ni vacío — el nombre se convierte en el
+/// filename `<nombre>.db`, así que un nombre inválido falla EN LA DECLARACIÓN, no al
+/// persistir. Mensaje en inglés, autocontenido y LLM-safe (Decisión #8).
+pub fn validate_memory_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(
+            "Invalid memory name: empty. Memory names must match [a-zA-Z0-9_-]+ (letters, digits, '_' and '-' only), e.g. require memory(\"my-agent\")".to_string(),
+        );
+    }
+    if let Some(bad) = name.chars().find(|c| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '-')) {
+        return Err(format!(
+            "Invalid memory name: \"{}\" contains '{}'. Memory names must match [a-zA-Z0-9_-]+ (letters, digits, '_' and '-' only) — no paths, no '/', no '\\', no '..'",
+            name, bad
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -661,6 +689,42 @@ mod tests {
         assert_eq!(cs.audit_log.len(), 2);
         assert!(cs.audit_log[0].granted);
         assert!(!cs.audit_log[1].granted);
+    }
+
+    // ---- memory (DB-M1) ----
+
+    #[test]
+    fn memory_capability_parses_and_displays() {
+        let c = parse_capability("memory", Some("shop")).unwrap();
+        assert_eq!(c.ty, CapabilityType::Memory);
+        assert_eq!(c.to_string(), "memory(\"shop\")");
+    }
+
+    #[test]
+    fn memory_scope_is_literal_not_path() {
+        // El scope de memory NO se canoniza como ruta: literal + fnmatch.
+        let exact = cap(CapabilityType::Memory, Some("shop"));
+        assert!(exact.covers(&cap(CapabilityType::Memory, Some("shop"))));
+        assert!(!exact.covers(&cap(CapabilityType::Memory, Some("other"))));
+        // Prefijo para el ceiling --cap-set "memory=shop-*".
+        let prefix = cap(CapabilityType::Memory, Some("shop-*"));
+        assert!(prefix.covers(&cap(CapabilityType::Memory, Some("shop-eu"))));
+        assert!(!prefix.covers(&cap(CapabilityType::Memory, Some("billing"))));
+        // Sin scope (sólo posible como ceiling) cubre cualquier nombre.
+        let bare = cap(CapabilityType::Memory, None);
+        assert!(bare.covers(&cap(CapabilityType::Memory, Some("anything"))));
+    }
+
+    #[test]
+    fn memory_name_validation_g6() {
+        assert!(validate_memory_name("shop").is_ok());
+        assert!(validate_memory_name("shop-agent_2").is_ok());
+        assert!(validate_memory_name("").is_err());
+        assert!(validate_memory_name("../x").is_err());
+        assert!(validate_memory_name("a/b").is_err());
+        assert!(validate_memory_name("a\\b").is_err());
+        assert!(validate_memory_name("a b").is_err());
+        assert!(validate_memory_name("a.db").is_err());
     }
 
     // ---- Techo del host (--sandbox / --cap-set) ----

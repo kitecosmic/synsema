@@ -245,7 +245,7 @@ impl AgentMemory {
         tags: Option<&[String]>,
         search: Option<&str>,
     ) -> Vec<MemoryEntry> {
-        self.recall_mode(category, tags, search, false, None)
+        self.recall_mode(category, tags, search, false, None, None)
     }
 
     /// Como `recall` pero con modo de tags configurable: `match_all=false` → OR (cualquier
@@ -258,11 +258,15 @@ impl AgentMemory {
         search: Option<&str>,
         match_all: bool,
         limit: Option<usize>,
+        source: Option<&str>,
     ) -> Vec<MemoryEntry> {
         let mut results: Vec<MemoryEntry> = self
             .entries
             .values()
             .filter(|e| e.active)
+            // Namespace por `source` (DB-M1, decisión #4): `Some(s)` = sólo las entradas
+            // de ese origen (agente o "main"); `None` = global (top-level o `from = "*"`).
+            .filter(|e| source.is_none_or(|s| e.source == s))
             .filter(|e| category.is_none_or(|c| e.category.value() == c))
             .filter(|e| match tags {
                 Some(ts) if match_all => ts.iter().all(|t| e.tags.contains(t)),
@@ -499,9 +503,9 @@ mod tests {
         m.remember("context", "B", JsonMap::new(), tags(&["s1", "obj"]), "agent").unwrap();
         // OR: ["s1","obj"] matchea ambas (las dos tienen s1).
         assert_eq!(m.recall(Some("context"), Some(&tags(&["s1", "obj"])), None).len(), 2);
-        assert_eq!(m.recall_mode(Some("context"), Some(&tags(&["s1", "obj"])), None, false, None).len(), 2);
+        assert_eq!(m.recall_mode(Some("context"), Some(&tags(&["s1", "obj"])), None, false, None, None).len(), 2);
         // AND: solo B tiene s1 Y obj.
-        let only_b = m.recall_mode(Some("context"), Some(&tags(&["s1", "obj"])), None, true, None);
+        let only_b = m.recall_mode(Some("context"), Some(&tags(&["s1", "obj"])), None, true, None, None);
         assert_eq!(only_b.len(), 1);
         assert_eq!(only_b[0].content, "B");
     }
@@ -531,11 +535,11 @@ mod tests {
             m.remember("context", &format!("entry-{i}"), JsonMap::new(), tags(&["lim"]), "agent").unwrap();
         }
         // Sin límite explícito: las 25 entran bajo el default; antes se truncaba a 20.
-        assert_eq!(m.recall_mode(Some("context"), Some(&tags(&["lim"])), None, false, None).len(), 25);
+        assert_eq!(m.recall_mode(Some("context"), Some(&tags(&["lim"])), None, false, None, None).len(), 25);
         // Límite explícito menor que el total.
-        assert_eq!(m.recall_mode(Some("context"), Some(&tags(&["lim"])), None, false, Some(10)).len(), 10);
+        assert_eq!(m.recall_mode(Some("context"), Some(&tags(&["lim"])), None, false, Some(10), None).len(), 10);
         // Límite explícito mayor que el total → devuelve todas.
-        assert_eq!(m.recall_mode(Some("context"), Some(&tags(&["lim"])), None, false, Some(100)).len(), 25);
+        assert_eq!(m.recall_mode(Some("context"), Some(&tags(&["lim"])), None, false, Some(100), None).len(), 25);
     }
 
     #[test]

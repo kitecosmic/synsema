@@ -9,6 +9,9 @@
 //!
 //! Filename `<stdin>` → sin persistencia a disco: este test verifica el SHARING en memoria
 //! (el must-have), hermético y sin tocar el filesystem.
+//!
+//! DB-M1: la familia de progress está gateada por la memoria declarada — el programa
+//! declara `require memory("plans")` (con `<stdin>` la identidad existe pero no toca disco).
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -24,6 +27,7 @@ fn free_port() -> u16 {
 fn start(port: u16) {
     let prog = format!(
         r#"require serve({p})
+require memory("plans")
 serve on {p}
     route "GET /plan-create"
         create_progress("myplan", ["uno", "dos", "tres"])

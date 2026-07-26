@@ -2,11 +2,13 @@
 //! `synsema/runtime/persistence.py`.
 //!
 //! La memoria del agente (entries + rules) y el progreso de tareas se persisten en
-//! SQLite. Al re-ejecutar el mismo programa, se cargan automáticamente. La RUTA la
-//! resuelve `engine::state_persistence_for` (DE-031): por default es **project-local**
-//! (`<dir-del-programa>/.synsema/state/<name>.db`), con overrides `SYNSEMA_STATE_DIR` y
-//! `SYNSEMA_STATE_NAME`, y fallback al dir global `~/.synsema/state`. El esquema sigue
-//! siendo el del oráculo (archivos intercambiables Python↔Rust).
+//! SQLite. La RUTA la resuelve `engine::resolve_declared_state` (DB-M1): la identidad
+//! es la memoria DECLARADA — `<dir-del-programa>/.synsema/state/<nombre>.db`, donde
+//! `<nombre>` es el de `require memory("<nombre>")`. `SYNSEMA_STATE_DIR` relocaliza el
+//! dir; `SYNSEMA_STATE_NAME` quedó deprecado (se ignora con warning); fallback al dir
+//! global `~/.synsema/state` si el project-local no es escribible. Sin declaración NO
+//! hay persistencia (G-1). El esquema sigue siendo el del oráculo (G-5: archivos
+//! intercambiables Python↔Rust; migrar identidad = renombrar el archivo).
 
 use std::path::PathBuf;
 
