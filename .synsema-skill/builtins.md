@@ -152,6 +152,14 @@ Resolution for `env`/`secret`: process environ → `.env` → default → else e
 - `constant_time_eq(a, b)` → bool, constant-time; accepts a `secret` on either side
 
 ## Intentional operations (replace loops)
+
+Dual-order: every op below that takes a callable accepts BOTH `(fn, list, …)` and
+`(list, fn, …)` — task/lambda and list are distinguishable at runtime, so either English
+reading works. The canonical documented order is the one shown. Extra args (`predicate?`,
+`initial?`) always stay at the end; two tasks or two lists where one-and-one is expected
+is an explicit error (never guessed). `collect` (property is text) and `flatten` (unary)
+have a single form.
+
 - `apply(function, list)` → list with function applied to each
 - `where(list, predicate)` → filtered list
 - `collect(list, "property_name")` → list of property values
@@ -165,6 +173,8 @@ Resolution for `env`/`secret`: process environ → `.env` → default → else e
 - `count_where(list, predicate)` → number
 - `flatten(list_of_lists)` → flat list
 - `zip_with(list_a, list_b, combiner)` → combined list
+- `unique(list)` → deduplicated, first-appearance order (structural equality, same as `==`/`contains` — maps/lists dedupe by value)
+- `index_of(list, item_or_predicate)` → 0-based index of the first match, or **`nothing`** if absent (not -1 — check `when idx != nothing`); callable 2nd arg = predicate, anything else = structural equality
 
 ## I/O (require capabilities)
 - `fetch(url, method?, headers?, body?)` → map with status, headers, body

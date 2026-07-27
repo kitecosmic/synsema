@@ -40,6 +40,7 @@ key-value API — see below.) Use `?` placeholders everywhere.
 | A `BLOB`/`BYTEA` column round-trips as text | It returns `bytes` (`type_of` "bytes"); `decode()` for text | Binary is byte-exact — use `bytes(...)` to insert, `decode(...)` to read text |
 | `DECIMAL`/`NUMERIC` comes back as a float | It's a `decimal` (`type_of` "decimal"), exact | Keep it as `decimal` for money; don't coerce through float |
 | `?` in a Postgres query must be `$1` | The runtime rewrites `?`→`$n` for you (MySQL uses `?` natively) | Just write `?` everywhere; for pgvector pass a list as `?::vector` |
+| A SQL trigger can call a Synsema task (e.g. re-embed on INSERT) | Triggers run inside the database — they can NEVER call back into your program | Keep the write-path in ONE task (e.g. `insert_product` that also updates the vector table) and use it everywhere; triggers are fine for SQL-only sync (like FTS5 external-content) |
 
 ## Database — MongoDB (document store, `mongo_*`)
 
@@ -98,6 +99,7 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | A `stream` route also runs `give` | `stream` and `give` are mutually exclusive | A route either streams (with `send`) or gives — not both |
 | POST with invalid JSON is silently ignored | With `Content-Type: application/json` it's a `400` | Send valid JSON, or omit the JSON content-type to get the raw body |
 | `serve on PORT` returns and the program exits | The CLI keeps the process alive while servers run (Ctrl+C to stop) | Expected; the server runs in the background |
+| `request` works inside a helper task called from a route | `Undefined variable: 'request'` — `request`/`query`/`params` exist ONLY in the handler's scope (the error says so) | Pass it as a parameter: `task handle(request)` and call `handle(request)` from the route |
 | `X-Forwarded-For` sets the client for rate limiting | The real peer IP is used; XFF is ignored | XFF is forgeable; trusted-proxy/per-user keying is future work |
 | `give "<h1>Hi</h1>"` renders as an HTML page | It's JSON — the response is the quoted string `"<h1>Hi</h1>"` | Use `html("<h1>Hi</h1>")` (or `respond(...)`) for a real page |
 | `static "./public"` also needs `require file(...)` | No — the `static` declaration **is** the read permission for that dir | Just declare `static "./public"`; the path is relative to the working dir |
@@ -145,6 +147,8 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `match x is {}` matches an empty map | Matches **any** map (`{}` is a map pattern) | To match an empty map use a guard: `is m when length(m) == 0` |
 | `match x is myvar` binds `myvar` | Top-level `is myvar` **compares** against the value of `myvar` (does NOT bind) | Binders live only inside `[...]`/`{...}`/variant patterns and `_`. To always match, use `is _`. |
 | `match x is {status}` works on a serve response value | Map patterns match plain `map` values, not server response values | Match the underlying map, or check fields with `of` |
+| `apply(list, fn)` errors ("apply takes fn first") | Both orders work now: the intentional family (`apply`/`where`/`transform`/`reduce`/`sort_by`/`group_by`/`find_first`/`every`/`some`/`count_where`/`zip_with`) accepts `(fn, list, …)` AND `(list, fn, …)` | Either reads fine; the canonical documented idiom stays `apply(fn, list)`. Two tasks or two lists where one-and-one is expected → explicit error (never guessed) |
+| `user of request.role` gets the user's role | It parses as `user of (request.role)` → `Map has no key 'role'` (the error now carries this hint) | Bind first: `let u be user of request`, then `u.role` |
 | `f(1)` to `task f(a, b)` errors (missing arg) | `b` becomes `nothing` (permissive arity) | Give `b` a default: `task f(a, b = 0)`; or pass it. |
 | `f(x = 1)` and `f(x == 1)` are the same | `=` is a **named arg**; `==` is an equality expression passed positionally | Use `=` for named args/defaults, `==` for comparison |
 | `test "..."` blocks run under `synsema run` | They're **skipped** by `run`; only `synsema test` runs them | Run `synsema test file.syn`. See [testing.md](testing.md). |
