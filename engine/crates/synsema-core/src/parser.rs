@@ -1956,6 +1956,7 @@ impl Parser {
                     NodeKind::PropertyAccess {
                         property_name: prop.as_str().to_string(),
                         object: Box::new(node),
+                        via_of: false,
                     },
                 );
             } else if self.check(TokenType::LBracket) {
@@ -1985,6 +1986,7 @@ impl Parser {
                     NodeKind::PropertyAccess {
                         property_name,
                         object: Box::new(obj),
+                        via_of: true,
                     },
                 );
             } else {

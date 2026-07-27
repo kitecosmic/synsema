@@ -847,6 +847,11 @@ impl Interpreter {
         self.register("count_where", 2, Rc::new(|i, a, l| i.b_count_where(a, l)));
         self.register("flatten", 1, Rc::new(|i, a, l| i.b_flatten(a, l)));
         self.register("zip_with", 3, Rc::new(|i, a, l| i.b_zip_with(a, l)));
+        // Mini-stdlib (batch DX). Nacen con UN orden canónico (lista primero, el de la
+        // familia): el dual-order existe para honrar un accidente histórico, no para lo
+        // nuevo (y evita la ambigüedad real de index_of(lista_de_listas, sublista)).
+        self.register("unique", 1, Rc::new(|i, a, l| i.b_unique(a, l)));
+        self.register("index_of", 2, Rc::new(|i, a, l| i.b_index_of(a, l)));
 
         // -- Librería matemática (math.rs) — funciones puras sobre Number.
         // NOTA: NO se registra un builtin `log` (choca con el soft keyword de
@@ -1033,7 +1038,7 @@ impl Interpreter {
             }
             NodeKind::MapPattern { fields } => self.match_map_pattern(fields, value, env),
             // Variante de enum sin payload: `is Enum.variant`.
-            NodeKind::PropertyAccess { property_name, object } => {
+            NodeKind::PropertyAccess { property_name, object, .. } => {
                 if let Some(id) = self.enum_variant_id(property_name, object, env)? {
                     return self.match_variant(value, &id, None, env);
                 }
@@ -1042,7 +1047,7 @@ impl Interpreter {
             }
             // Variante de enum con payload: `is Enum.variant(p1, …)` — sub-patrones.
             NodeKind::TaskCall { name, arguments } => {
-                if let NodeKind::PropertyAccess { property_name, object } = &name.kind {
+                if let NodeKind::PropertyAccess { property_name, object, .. } = &name.kind {
                     // Sólo es patrón de variante si todos los args son posicionales.
                     if arguments.iter().all(|a| a.name.is_none()) {
                         if let Some(id) = self.enum_variant_id(property_name, object, env)? {
@@ -1348,10 +1353,44 @@ impl Interpreter {
             // -- Identificadores y acceso --
             NodeKind::Identifier { name } => match env_get(env, name) {
                 Some(v) => Ok(v),
-                None => Err(err_at(format!("Undefined variable: '{}'", name), loc)),
+                None => {
+                    // Batch DX (decisión #6): los bindings que serve inyecta SOLO en el
+                    // scope de un route handler (`request`/`query`/`params`/`read_body`/
+                    // `read_body_bytes`, ver request_bindings) son el tropiezo #1 de las
+                    // tasks auxiliares — el hint dice el fix exacto. Cualquier otro
+                    // nombre conserva el mensaje de siempre.
+                    let mut msg = format!("Undefined variable: '{}'", name);
+                    if matches!(
+                        name.as_str(),
+                        "request" | "query" | "params" | "read_body" | "read_body_bytes"
+                    ) {
+                        msg.push_str(&format!(
+                            ". '{}' is only available inside route handlers (serve) — pass it as a parameter: task handle({})",
+                            name, name
+                        ));
+                    }
+                    Err(err_at(msg, loc))
+                }
             },
-            NodeKind::PropertyAccess { property_name, object } => {
-                let obj = self.exec(object, env)?;
+            NodeKind::PropertyAccess { property_name, object, via_of } => {
+                // Hint de precedencia de `of` (batch DX, decisión #7): `a of b.c` parsea
+                // como `a of (b.c)` — si ESTE nodo nació de `of` y su operando derecho es
+                // un property-access que falla con "Map has no key", el error gana el fix
+                // exacto. Cero costo en el camino feliz; cualquier otro error queda igual.
+                let obj = match self.exec(object, env) {
+                    Ok(v) => v,
+                    Err(Control::Error(mut e))
+                        if *via_of
+                            && matches!(object.kind, NodeKind::PropertyAccess { .. })
+                            && e.message.starts_with("Map has no key") =>
+                    {
+                        e.message.push_str(
+                            ". note: 'a of b.c' reads as 'a of (b.c)' — to get '(a of b).c', bind first: let x be a of b, then x.c",
+                        );
+                        return Err(Control::Error(e));
+                    }
+                    Err(other) => return Err(other),
+                };
                 match &obj {
                     SynValue::Map(m) => match m.borrow().get(property_name) {
                         Some(v) => Ok(v.clone()),
@@ -2334,7 +2373,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
                 Ok(value)
             }
-            NodeKind::PropertyAccess { property_name, object } => {
+            NodeKind::PropertyAccess { property_name, object, .. } => {
                 let obj = self.exec(object, env)?;
                 match &obj {
                     SynValue::Map(m) => {
@@ -3318,9 +3357,77 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
     }
 
+    /// Dual-order de la familia intencional (batch DX, decisión #16 del diseño madre):
+    /// los ops con callable aceptan `(fn, lista, …)` Y `(lista, fn, …)` — task/lambda
+    /// y lista son tipos distinguibles en runtime, así que no hay ambigüedad y ambas
+    /// lecturas inglesas quedan válidas. UNA regla, cero heurística por-op:
+    ///   - primer arg callable → orden clásico `(fn, lista)`;
+    ///   - primer arg lista → orden familia `(lista, fn)`;
+    ///   - dos callables / dos listas → error explícito con AMBAS firmas (G-2: jamás
+    ///     adivinar).
+    /// Los args extra (pred de `transform`, init de `reduce`) NO se reordenan: la
+    /// detección mira SOLO las posiciones 0-1.
+    fn dual_fn_list(
+        &self,
+        args: &[SynValue],
+        op: &str,
+    ) -> Result<(SynValue, Vec<SynValue>), Control> {
+        let a0 = nth(args, 0)?;
+        let a1 = nth(args, 1)?;
+        match (is_callable(a0), is_callable(a1)) {
+            (true, true) => Err(err(format!(
+                "{op}: expected one task and one list (either order: {op}(fn, list, ...) or {op}(list, fn, ...)), got two tasks"
+            ))),
+            (true, false) => Ok((a0.clone(), self.list_arg(a1, op)?)),
+            (false, true) => Ok((a1.clone(), self.list_arg(a0, op)?)),
+            (false, false) => {
+                let l0 = matches!(a0, SynValue::List(_));
+                let l1 = matches!(a1, SynValue::List(_));
+                if l0 && l1 {
+                    return Err(err(format!(
+                        "{op}: expected one task and one list (either order: {op}(fn, list, ...) or {op}(list, fn, ...)), got two lists"
+                    )));
+                }
+                // Uno (a lo sumo) es lista y el otro no es callable: se conserva el
+                // camino del orden que corresponde — el error de tipo lo produce
+                // `list_arg` o el intento de llamada, como hoy (mensajes ya claros).
+                if l0 {
+                    Ok((a1.clone(), self.list_arg(a0, op)?))
+                } else {
+                    Ok((a0.clone(), self.list_arg(a1, op)?))
+                }
+            }
+        }
+    }
+
+    /// Variante de tres args para `zip_with` (espera DOS listas y un callable):
+    /// callable primero → `(fn, a, b)`; lista primero → `(a, b, fn)` y el tercer arg
+    /// DEBE ser callable (si no, error explícito con ambas firmas — G-2).
+    fn dual_fn_two_lists(
+        &self,
+        args: &[SynValue],
+        op: &str,
+    ) -> Result<(SynValue, Vec<SynValue>, Vec<SynValue>), Control> {
+        let a0 = nth(args, 0)?;
+        if is_callable(a0) {
+            let a = self.list_arg(nth(args, 1)?, op)?;
+            let b = self.list_arg(nth(args, 2)?, op)?;
+            return Ok((a0.clone(), a, b));
+        }
+        let a2 = nth(args, 2)?;
+        if !is_callable(a2) {
+            return Err(err(format!(
+                "{op}: expected two lists and one task (either order: {op}(fn, list_a, list_b) or {op}(list_a, list_b, fn)), got {} as the combiner",
+                a2.type_name()
+            )));
+        }
+        let a = self.list_arg(a0, op)?;
+        let b = self.list_arg(nth(args, 1)?, op)?;
+        Ok((a2.clone(), a, b))
+    }
+
     fn b_apply(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let func = nth(args, 0)?.clone();
-        let items = self.list_arg(nth(args, 1)?, "apply")?;
+        let (func, items) = self.dual_fn_list(args, "apply")?;
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             out.push(self.call_value(func.clone(), vec![item], loc)?);
@@ -3460,8 +3567,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_where(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let items = self.list_arg(nth(args, 0)?, "where")?;
-        let pred = nth(args, 1)?.clone();
+        let (pred, items) = self.dual_fn_list(args, "where")?;
         let mut out = Vec::new();
         for item in items {
             if self.call_value(pred.clone(), vec![item.clone()], loc)?.is_truthy() {
@@ -3488,8 +3594,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_transform(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let items = self.list_arg(nth(args, 0)?, "transform")?;
-        let func = nth(args, 1)?.clone();
+        // Dual-order sólo en las posiciones 0-1; el `pred` opcional queda al final.
+        let (func, items) = self.dual_fn_list(args, "transform")?;
         let pred = args.get(2).cloned();
         let mut out = Vec::with_capacity(items.len());
         for item in items {
@@ -3507,8 +3613,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_reduce(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let items = self.list_arg(nth(args, 0)?, "reduce")?;
-        let func = nth(args, 1)?.clone();
+        // Dual-order sólo en las posiciones 0-1; `init` (aunque sea callable) queda al
+        // final y NO participa de la detección.
+        let (func, items) = self.dual_fn_list(args, "reduce")?;
         let mut acc = args.get(2).cloned().unwrap_or_else(|| syn_int(0));
         for item in items {
             acc = self.call_value(func.clone(), vec![acc, item], loc)?;
@@ -3517,8 +3624,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_sort_by(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let items = self.list_arg(nth(args, 0)?, "sort_by")?;
-        let key_func = nth(args, 1)?.clone();
+        let (key_func, items) = self.dual_fn_list(args, "sort_by")?;
         let mut keyed: Vec<(SynValue, SynValue)> = Vec::with_capacity(items.len());
         for it in items {
             let k = self.call_value(key_func.clone(), vec![it.clone()], loc)?;
@@ -3529,8 +3635,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_group_by(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let items = self.list_arg(nth(args, 0)?, "group_by")?;
-        let key_func = nth(args, 1)?.clone();
+        let (key_func, items) = self.dual_fn_list(args, "group_by")?;
         let mut groups: IndexMap<String, Vec<SynValue>> = IndexMap::new();
         for item in items {
             let key = self.call_value(key_func.clone(), vec![item.clone()], loc)?.to_string();
@@ -3544,8 +3649,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_find_first(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let items = self.list_arg(nth(args, 0)?, "find_first")?;
-        let pred = nth(args, 1)?.clone();
+        let (pred, items) = self.dual_fn_list(args, "find_first")?;
         for item in items {
             if self.call_value(pred.clone(), vec![item.clone()], loc)?.is_truthy() {
                 return Ok(item);
@@ -3555,8 +3659,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_every(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let items = self.list_arg(nth(args, 0)?, "every")?;
-        let pred = nth(args, 1)?.clone();
+        let (pred, items) = self.dual_fn_list(args, "every")?;
         for item in items {
             if !self.call_value(pred.clone(), vec![item], loc)?.is_truthy() {
                 return Ok(syn_bool(false));
@@ -3566,8 +3669,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_some(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let items = self.list_arg(nth(args, 0)?, "some")?;
-        let pred = nth(args, 1)?.clone();
+        let (pred, items) = self.dual_fn_list(args, "some")?;
         for item in items {
             if self.call_value(pred.clone(), vec![item], loc)?.is_truthy() {
                 return Ok(syn_bool(true));
@@ -3577,8 +3679,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_count_where(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let items = self.list_arg(nth(args, 0)?, "count_where")?;
-        let pred = nth(args, 1)?.clone();
+        let (pred, items) = self.dual_fn_list(args, "count_where")?;
         let mut count: i64 = 0;
         for item in items {
             if self.call_value(pred.clone(), vec![item], loc)?.is_truthy() {
@@ -3606,14 +3707,51 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_zip_with(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let a = self.list_arg(nth(args, 0)?, "zip_with")?;
-        let b = self.list_arg(nth(args, 1)?, "zip_with")?;
-        let combiner = nth(args, 2)?.clone();
+        let (combiner, a, b) = self.dual_fn_two_lists(args, "zip_with")?;
         let mut out = Vec::new();
         for (x, y) in a.into_iter().zip(b) {
             out.push(self.call_value(combiner.clone(), vec![x, y], loc)?);
         }
         Ok(syn_list(out))
+    }
+
+    /// `unique(lista)` — deduplica preservando el orden de PRIMERA aparición. La
+    /// igualdad es la estructural del lenguaje (`syn_equals`, la misma de `==`/
+    /// `contains`) — NO se reimplementa. O(n²) a propósito: hashear divergiría de la
+    /// igualdad estructural (maps/listas anidadas, números cross-repr).
+    fn b_unique(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        let items = self.list_arg(nth(args, 0)?, "unique")?;
+        let mut out: Vec<SynValue> = Vec::with_capacity(items.len());
+        for item in items {
+            if !out.iter().any(|e| e.syn_equals(&item)) {
+                out.push(item);
+            }
+        }
+        Ok(syn_list(out))
+    }
+
+    /// `index_of(lista, item_o_pred)` — índice (base 0) de la primera coincidencia.
+    /// 2º arg callable → predicado; si no → igualdad estructural con el item.
+    /// **No encontrado → `nothing`** (el patrón de ausencia del lenguaje, como
+    /// `find_first`/`resume_point`): un `-1` usado como índice sin chequear es un bug
+    /// silencioso; `nothing` como índice falla ruidoso.
+    fn b_index_of(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        let items = self.list_arg(nth(args, 0)?, "index_of")?;
+        let needle = nth(args, 1)?.clone();
+        if is_callable(&needle) {
+            for (i, item) in items.into_iter().enumerate() {
+                if self.call_value(needle.clone(), vec![item], loc)?.is_truthy() {
+                    return Ok(syn_int(i as i64));
+                }
+            }
+        } else {
+            for (i, item) in items.iter().enumerate() {
+                if item.syn_equals(&needle) {
+                    return Ok(syn_int(i as i64));
+                }
+            }
+        }
+        Ok(SynValue::Nothing)
     }
 }
 
@@ -3623,6 +3761,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 
 fn nth(args: &[SynValue], i: usize) -> Result<&SynValue, Control> {
     args.get(i).ok_or_else(|| err("missing argument"))
+}
+
+/// ¿El valor es invocable? (task de usuario, lambda o builtin). La base de la regla
+/// de detección del dual-order (batch DX) y del 2º arg de `index_of`.
+fn is_callable(v: &SynValue) -> bool {
+    matches!(v, SynValue::Task(_) | SynValue::Builtin(_))
 }
 
 /// Parsea el catálogo de tools que el programa pasa a `llm_step`: una lista de maps

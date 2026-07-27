@@ -80,6 +80,11 @@ pub enum NodeKind {
     PropertyAccess {
         property_name: String,
         object: Box<Node>,
+        /// True si el nodo nació de la forma `a of b` (batch DX, decisión #7): NO
+        /// cambia la semántica (ambas formas evalúan idéntico); sólo habilita el hint
+        /// de precedencia cuando `b` es un `.`-access que falla con "Map has no key"
+        /// (`user of request.role` lee como `user of (request.role)`).
+        via_of: bool,
     },
     /// `list[0]` o `map["key"]`
     IndexAccess {
