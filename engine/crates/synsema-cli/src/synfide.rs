@@ -119,15 +119,21 @@ enum UpgradeAction {
     KeepUserVersion,
 }
 
-fn upgrade_action(recorded: Option<&str>, on_disk: Option<&str>) -> UpgradeAction {
+fn upgrade_action(recorded: Option<&str>, on_disk: Option<&str>, new_hash: &str) -> UpgradeAction {
     match (recorded, on_disk) {
         // No existe en disco → instalar normal (también repone un borrado).
         (_, None) => UpgradeAction::Write,
-        // Instalación vieja sin MANIFEST (pre-manifest): no hay con qué comparar —
-        // comportamiento histórico (actualizar). Documentado en el mensaje final.
-        (None, Some(_)) => UpgradeAction::Write,
-        (Some(r), Some(d)) => {
-            if r == d {
+        // Instalado por nosotros y sin tocar desde entonces → actualizar.
+        (Some(r), Some(d)) if r == d => UpgradeAction::Write,
+        // Instalado por nosotros y EDITADO por el usuario → conservar el suyo.
+        (Some(_), Some(_)) => UpgradeAction::KeepUserVersion,
+        // SIN MANIFEST (instalación pre-manifest, o un directorio `synfide/` que ya
+        // existía por otra razón — pasó de verdad: un scaffold corrido en un cwd cuyo
+        // `synfide/` era OTRA cosa). Contenido de origen desconocido: si ya es
+        // byte-idéntico al release, escribir es un no-op seguro; si difiere, JAMÁS
+        // pisarlo — conservar y dejar el release al lado como `.new`.
+        (None, Some(d)) => {
+            if d == new_hash {
                 UpgradeAction::Write
             } else {
                 UpgradeAction::KeepUserVersion
@@ -183,7 +189,7 @@ pub(crate) fn install(base: &Path) -> Result<(), String> {
         );
         let disk_hash = std::fs::read(&path).ok().map(|b| sha256_hex(&b));
         let rec = recorded.get(&f.dest).and_then(|v| v.as_str());
-        match upgrade_action(rec, disk_hash.as_deref()) {
+        match upgrade_action(rec, disk_hash.as_deref(), &sha256_hex(&f.bytes)) {
             UpgradeAction::Write => {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)
@@ -251,15 +257,23 @@ mod tests {
     #[test]
     fn user_modified_framework_files_are_never_clobbered() {
         use super::UpgradeAction::*;
-        assert_eq!(upgrade_action(Some("aaa"), Some("aaa")), Write, "sin tocar → actualiza");
+        assert_eq!(upgrade_action(Some("aaa"), Some("aaa"), "nnn"), Write, "sin tocar → actualiza");
         assert_eq!(
-            upgrade_action(Some("aaa"), Some("bbb")),
+            upgrade_action(Some("aaa"), Some("bbb"), "nnn"),
             KeepUserVersion,
             "editado → se conserva el del usuario"
         );
-        assert_eq!(upgrade_action(Some("aaa"), None), Write, "borrado → se repone");
-        assert_eq!(upgrade_action(None, None), Write, "instalación nueva");
-        assert_eq!(upgrade_action(None, Some("bbb")), Write, "pre-manifest: histórico");
+        assert_eq!(upgrade_action(Some("aaa"), None, "nnn"), Write, "borrado → se repone");
+        assert_eq!(upgrade_action(None, None, "nnn"), Write, "instalación nueva");
+        // Sin MANIFEST y con contenido de origen desconocido: byte-idéntico al
+        // release → no-op seguro; distinto → JAMÁS pisar (el caso real: un
+        // `synfide/` preexistente que era OTRA cosa en ese cwd).
+        assert_eq!(upgrade_action(None, Some("nnn"), "nnn"), Write, "ya idéntico al release");
+        assert_eq!(
+            upgrade_action(None, Some("bbb"), "nnn"),
+            KeepUserVersion,
+            "desconocido y distinto → conservar + .new"
+        );
     }
 
     #[test]
