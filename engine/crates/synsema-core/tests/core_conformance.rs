@@ -490,3 +490,20 @@ fn flush_noop_when_not_live() {
     // (El drenado en vivo del camino `run` se verifica end-to-end contra el binario.)
     assert_output("print(\"X\")\nflush()\nprint(\"Y\")", &["X", "Y"]);
 }
+
+// -- raise como SENTENCIA (DX F1 follow-up): `raise "x"` lanza de verdad --
+// Antes parseaba como dos expresiones inertes → no-op silencioso.
+#[test]
+fn raise_statement_actually_raises() {
+    assert_output(
+        "task boom()\n    raise \"explota\"\ntry\n    boom()\nrecover err\n    print(\"atrapado: \" + err)\n",
+        &["atrapado: explota"],
+    );
+    // Re-propagación con identificador, sin paréntesis.
+    assert_output(
+        "task boom()\n    raise \"orig\"\nlet m be \"\"\ntry\n    try\n        boom()\n    recover e1\n        raise e1\nrecover e2\n    set m to e2\nprint(m)\n",
+        &["orig"],
+    );
+    // Sin try: el programa FALLA (nada de no-op).
+    assert_fails("raise \"boom\"\nprint(\"no debe llegar\")");
+}

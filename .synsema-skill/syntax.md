@@ -3,10 +3,10 @@
 ## Reserved (hard) keywords
 These cannot be used as names; using one (e.g. `let task be 1`) gives a clear
 "reserved word" error. This includes **member access and export names**: `mod.decide(...)`
-or `export task decide(...)` fail — and there the error reads `Expected IDENTIFIER,
-got DECIDE` (less obvious than the "reserved word" form; it's the same rule). The LLM
-words `reason`/`decide`/`analyze`/`generate` are the ones that bite in real APIs — name
-tasks `resolve`, `why`, etc.
+or `export task decide(...)` fail with the same "reserved word" error (on engine ≤ v0.5.1
+the member case read `Expected IDENTIFIER, got DECIDE` — same rule, worse message). The
+LLM words `reason`/`decide`/`analyze`/`generate` are the ones that bite in real APIs —
+name tasks `resolve`, `why`, etc.
 
 Flow: `when`, `otherwise`, `each`, `in`, `while`, `match`, `is`, `then`, `stop`
 Definitions: `task`, `give`, `let`, `be`, `set`, `to`, `type`, `as`, `of`, `with`
