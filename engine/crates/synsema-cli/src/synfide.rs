@@ -167,29 +167,42 @@ pub(crate) fn install(base: &Path) -> Result<(), String> {
     let mut new_hashes = serde_json::Map::new();
     for f in &fetched {
         let path = base.join(&f.dest);
+        // TODO archivo del manifest queda registrado (dest → sha256 del release):
+        // así el próximo upgrade puede distinguir "sin tocar" de "editado" también
+        // para los archivos del USUARIO (app.syn/console.syn/tests), y actualizar
+        // los que siguen prístinos — sin el registro, un fix a la consola jamás
+        // llegaba a proyectos existentes.
+        let new_hash = sha256_hex(&f.bytes);
+        new_hashes.insert(f.dest.clone(), serde_json::Value::String(new_hash.clone()));
+        let disk_hash = std::fs::read(&path).ok().map(|b| sha256_hex(&b));
+        let rec = recorded.get(&f.dest).and_then(|v| v.as_str());
         if !f.framework_owned {
-            if path.exists() {
-                println!("init: {} ya existe — no se toca", path.display());
-            } else {
-                if let Some(parent) = path.parent() {
-                    std::fs::create_dir_all(parent)
-                        .map_err(|e| format!("cannot create {}: {}", parent.display(), e))?;
+            match (disk_hash.as_deref(), rec) {
+                (None, _) => {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("cannot create {}: {}", parent.display(), e))?;
+                    }
+                    std::fs::write(&path, &f.bytes)
+                        .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
+                    println!("init: {} creado", path.display());
                 }
-                std::fs::write(&path, &f.bytes)
-                    .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
-                println!("init: {} creado", path.display());
+                // Prístino (idéntico a lo que el scaffold instaló) → recibir la
+                // versión nueva es seguro: todavía no es "su" código.
+                (Some(d), Some(r)) if d == r && d != new_hash => {
+                    std::fs::write(&path, &f.bytes)
+                        .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
+                    println!("init: {} actualizado (estaba sin ediciones tuyas)", path.display());
+                }
+                (Some(d), Some(r)) if d == r => {
+                    println!("init: {} al día", path.display());
+                }
+                // Editado, o sin registro previo con el que verificar → es SUYO.
+                _ => println!("init: {} ya existe — no se toca", path.display()),
             }
             continue;
         }
-        // Archivo del FRAMEWORK: registrar SIEMPRE el hash del release nuevo (así
-        // una edición local sigue protegida en el próximo upgrade también).
-        new_hashes.insert(
-            f.dest.clone(),
-            serde_json::Value::String(sha256_hex(&f.bytes)),
-        );
-        let disk_hash = std::fs::read(&path).ok().map(|b| sha256_hex(&b));
-        let rec = recorded.get(&f.dest).and_then(|v| v.as_str());
-        match upgrade_action(rec, disk_hash.as_deref(), &sha256_hex(&f.bytes)) {
+        match upgrade_action(rec, disk_hash.as_deref(), &new_hash) {
             UpgradeAction::Write => {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)
@@ -207,11 +220,23 @@ pub(crate) fn install(base: &Path) -> Result<(), String> {
                 let new_path = base.join(format!("{}.new", f.dest));
                 std::fs::write(&new_path, &f.bytes)
                     .map_err(|e| format!("cannot write {}: {}", new_path.display(), e))?;
-                println!(
-                    "init: ⚠ {} fue MODIFICADO por vos — se conserva TU versión; la nueva quedó en {}",
-                    path.display(),
-                    new_path.display()
-                );
+                // Sin registro previo NO podemos afirmar que el usuario lo editó
+                // (instalación con un binario pre-manifest, o un synfide/ que ya
+                // existía): el mensaje dice la verdad — "no puedo verificarlo" —
+                // en vez de acusar una edición que quizás nunca ocurrió.
+                if rec.is_some() {
+                    println!(
+                        "init: ⚠ {} fue MODIFICADO por vos — se conserva TU versión; la nueva quedó en {}",
+                        path.display(),
+                        new_path.display()
+                    );
+                } else {
+                    println!(
+                        "init: ⚠ {} difiere del release y no hay registro previo para verificar si lo editaste — se conserva por las dudas; la nueva quedó en {}. Si NO lo tocaste: reemplazalo con el .new (o borralo y re-corré init --synfide)",
+                        path.display(),
+                        new_path.display()
+                    );
+                }
                 kept.push(f.dest.clone());
             }
         }
