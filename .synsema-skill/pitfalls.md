@@ -18,7 +18,10 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 | `No agent defined with name 'X'` | `spawn X` before `agent X` definition (the error lists the agents the context DOES know) | Define the agent before spawning it. If the error says "no agents are defined in this execution context" and your agent IS defined top-level, that's the runtime, not your code — on engine ≤ v0.4.9, `spawn` inside a route fails from the 2nd request on a reused serve worker (fixed in v0.5.0; workaround: spawn a long-lived worker at boot and enqueue via `signal`) |
 | `Division by zero` | Divisor is 0 | Guard with `when divisor != 0` or use `try/recover` |
 | `Cannot iterate over number` | `each` on a non-list value | Check type with `type_of()` or wrap in `[value]` |
-| `Map has no key 'X'` | Accessing a property that doesn't exist | Check with `contains(map, "X")` first |
+| `Map has no key 'X'` | Accessing a property that doesn't exist | Check with `contains(map, "X")` first — in a **separate/nested `when`**, NOT `contains(m,"X") and m["X"]…`: `and` does not short-circuit, so the index still runs |
+| `contains(m,"k") and m["k"] == v` errors anyway | **`and`/`or` never short-circuit** — both sides always evaluate | Nest: `when contains(m, "k")` … then index inside. Same for `or`: don't rely on it to skip a side effect |
+| `raise "msg"` does nothing (no error raised) | Without parens it parses as TWO inert expressions (the identifier, then a string) — a silent no-op | `raise` is a **builtin**: always call it — `raise("msg")` |
+| `Expected IDENTIFIER, got DECIDE` (or REASON/…) | A hard keyword used as an export/member name — `mod.decide(...)`, `task wait(reason)` | LLM words `reason`/`decide`/`analyze`/`generate` are reserved everywhere; rename (`resolve`, `why`) — see [syntax.md](syntax.md) |
 | `Cannot set undefined variable` | Using `set` before `let` | Define with `let x be value` first, then `set x to new_value` |
 | `Loop exceeded maximum iterations` | Infinite loop (condition never false) | Check that loop variable actually changes |
 | `Expected indented block` | Missing indentation after when/each/task/etc | Indent body with 4 spaces |

@@ -2,7 +2,11 @@
 
 ## Reserved (hard) keywords
 These cannot be used as names; using one (e.g. `let task be 1`) gives a clear
-"reserved word" error.
+"reserved word" error. This includes **member access and export names**: `mod.decide(...)`
+or `export task decide(...)` fail — and there the error reads `Expected IDENTIFIER,
+got DECIDE` (less obvious than the "reserved word" form; it's the same rule). The LLM
+words `reason`/`decide`/`analyze`/`generate` are the ones that bite in real APIs — name
+tasks `resolve`, `why`, etc.
 
 Flow: `when`, `otherwise`, `each`, `in`, `while`, `match`, `is`, `then`, `stop`
 Definitions: `task`, `give`, `let`, `be`, `set`, `to`, `type`, `as`, `of`, `with`
@@ -34,6 +38,7 @@ never heuristics. See [serve.md](serve.md).
 ## Operators
 Arithmetic: `+`, `-`, `*`, `/`, `%`, `**` (on `array`, these are **elementwise** with broadcasting — matrix product is `matmul`)
 Comparison: `==`, `!=`, `<`, `>`, `<=`, `>=`
+Logic: `and`, `or`, `not` — ⚠️ **`and`/`or` do NOT short-circuit**: BOTH sides always evaluate (the boolean result is correct, but a guard like `contains(m, "k") and m["k"] == 1` still errors with `Map has no key 'k'` — the index runs even when `contains` is false). Guard with **nested `when`** instead: `when contains(m, "k")` … then index.
 Assignment of a default / named arg: `=` (in `task f(x, y = 1)` and `f(x, y = 2)`). Distinct from `==` (equality). `=` is NOT a general assignment statement — use `let`/`set`.
 Pipe: `|>` — chains: `data |> clean |> validate`
 Lambda: `(params) => expr`
