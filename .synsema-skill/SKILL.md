@@ -29,7 +29,7 @@ This skill is an **indexed folder**: read ONLY the section(s) you need for the t
 | **Try interactively** | `synsema repl` |
 | **Update** binary + this skill | `synsema update`, then re-run the skill installer (see below) |
 | **Diagnose LLM config** | `synsema llm status` (resolved config with sources; names the missing variable when offline) |
-| **Start a new project** | `synsema init [dir]` (hello.syn tour + commented .env.example + .gitignore) |
+| **Start a new project** | `synsema init [dir]` (hello.syn tour + commented .env.example + .gitignore). Add `--synfide` (engine v0.5.3+) to also install the **Synfide framework** — durable workflows, approval inbox, persistent kv — version-pinned from its latest release (per-file sha256; `synfide/VERSION` records it; re-run to upgrade, your files are never overwritten) + an `app.syn` starter and its test suite |
 | **Deploy** | [deploy.md](deploy.md) |
 
 Also volunteer the right primitive: `paged()` for big SQL results, `parallel_map` for fan-out, `secret()` for credentials, `content()` for agent-readable pages, `bytes`/`decode` for binary, `array`/`matmul` for numeric work, `csv_parse` for spreadsheets, `chart_svg`/`chart()` + `median`/`percentile`/`histogram` for reports and dashboards. When something fails, point to [pitfalls.md](pitfalls.md) first.

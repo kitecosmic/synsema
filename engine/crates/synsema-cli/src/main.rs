@@ -22,9 +22,10 @@ use synsema_runtime::engine::{
 use synsema_runtime::serve::{run_serve_program_with_overrides, ServeOverrides};
 
 mod init_templates;
+mod synfide;
 mod update;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] | test [-v] [--sandbox | --cap-set <list>] <archivo|dir> | check | tokens | ast | repl | daemon | init [dir] | llm status [--json] | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] | test [-v] [--sandbox | --cap-set <list>] <archivo|dir> | check | tokens | ast | repl | daemon | init [dir] [--synfide] | llm status [--json] | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
 
 /// Construye el techo de capabilities del host desde `--sandbox`/`--cap-set` (defense-in-depth:
 /// el operador impone un límite que el código ejecutado no puede exceder, sin importar qué
@@ -148,6 +149,10 @@ fn main() -> ExitCode {
 /// knobs comentados) y `.gitignore`. JAMÁS pisa un archivo existente (los saltea con
 /// aviso). Los templates están test-verificados contra el engine (init_templates.rs).
 fn cmd_init(args: &[String]) -> ExitCode {
+    // `--synfide`: además del scaffold base (sin hello.syn — el starter es app.syn),
+    // instala el framework Synfide VERSIONADO desde su último release (manifest +
+    // sha256 por archivo; ver synfide.rs).
+    let with_synfide = args.iter().any(|a| a == "--synfide");
     let dir = args
         .get(2)
         .filter(|a| !a.starts_with("--"))
@@ -160,6 +165,9 @@ fn cmd_init(args: &[String]) -> ExitCode {
     }
     let mut created = 0usize;
     for (name, content) in init_templates::INIT_FILES {
+        if with_synfide && name == "hello.syn" {
+            continue; // el tour lo reemplaza el app.syn del framework
+        }
         let path = base.join(name);
         if path.exists() {
             println!("init: {} ya existe — no se toca", path.display());
@@ -175,6 +183,20 @@ fn cmd_init(args: &[String]) -> ExitCode {
                 return ExitCode::from(1);
             }
         }
+    }
+    if with_synfide {
+        if let Err(e) = synfide::install(base) {
+            eprintln!("init: synfide no se pudo instalar: {}", e);
+            eprintln!("      (nada del framework quedó escrito a medias; reintentá con red)");
+            return ExitCode::from(1);
+        }
+        let prefix = if dir == "." { String::new() } else { format!("{}/", dir.trim_end_matches(['/', '\\'])) };
+        println!();
+        println!("Listo. Próximos pasos:");
+        println!("  cp {p}.env.example {p}.env       # elegí tu provider LLM y pegá su key", p = prefix);
+        println!("  synsema run {}app.syn        # tu primera app durable", prefix);
+        println!("  synsema test {}test_synfide.syn   # el suite del framework", prefix);
+        return ExitCode::from(0);
     }
     if created == 0 {
         println!("init: nada que hacer (los 3 archivos ya existían).");

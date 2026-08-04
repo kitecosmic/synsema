@@ -25,7 +25,7 @@ pub fn current_version() -> String {
 }
 
 /// Headers para la API de GitHub. El `User-Agent` es **obligatorio** (sin él, 403).
-fn gh_headers() -> Vec<(String, String)> {
+pub(crate) fn gh_headers() -> Vec<(String, String)> {
     vec![
         ("User-Agent".to_string(), format!("synsema-cli/{}", current_version())),
         ("Accept".to_string(), "application/vnd.github+json".to_string()),
@@ -88,7 +88,7 @@ fn asset_url(json: &serde_json::Value, name: &str) -> Option<String> {
 }
 
 /// GET siguiendo redirects (GitHub redirige los assets a otro host), devolviendo bytes.
-fn download(url: &str, max_redirects: u32) -> Result<Vec<u8>, String> {
+pub(crate) fn download(url: &str, max_redirects: u32) -> Result<Vec<u8>, String> {
     let mut current = url.to_string();
     for _ in 0..=max_redirects {
         let (status, body, headers) = http_request_bytes("GET", &current, Some(&gh_headers()), 120)?;
@@ -108,7 +108,7 @@ fn download(url: &str, max_redirects: u32) -> Result<Vec<u8>, String> {
     Err("too many redirects".to_string())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(bytes);
