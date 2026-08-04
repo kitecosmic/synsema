@@ -910,11 +910,11 @@ impl LLMProvider for LocalGgufProvider {
         let prompt = request.data.get("prompt").cloned().unwrap_or_default();
         let context = request.data.get("context").cloned().unwrap_or_default();
         let user = local_user_content(&prompt, &context);
-        let content = match self.generate_text(&user, None) {
-            Ok((text, _)) => text,
-            Err(e) => format!("[local error: {}]", e),
+        let (content, tokens) = match self.generate_text(&user, None) {
+            Ok((text, t)) => (text, t),
+            Err(e) => (format!("[local error: {}]", e), 0),
         };
-        LLMResponse { content, model: self.file_name.clone() }
+        LLMResponse { content, model: self.file_name.clone(), tokens_used: tokens }
     }
 
     /// Streaming real (F2): el único provider que emite token a token. Los errores van
@@ -936,11 +936,11 @@ impl LLMProvider for LocalGgufProvider {
             |sink| self.generate_text(&user, Some(sink)),
             on_chunk,
         );
-        let content = match result {
-            Ok(Ok((text, _))) => text,
-            Ok(Err(e)) | Err(e) => format!("[local error: {}]", e),
+        let (content, tokens) = match result {
+            Ok(Ok((text, t))) => (text, t),
+            Ok(Err(e)) | Err(e) => (format!("[local error: {}]", e), 0),
         };
-        LLMResponse { content, model: self.file_name.clone() }
+        LLMResponse { content, model: self.file_name.clone(), tokens_used: tokens }
     }
 
     fn name(&self) -> String {

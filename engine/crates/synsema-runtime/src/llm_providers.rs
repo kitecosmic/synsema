@@ -609,11 +609,11 @@ impl LLMProvider for AnthropicProvider {
                 );
                 self.post(body).and_then(|j| parse_anthropic_step(&j))
             };
-            let content = match result {
-                Ok((step, _)) => decide_step_to_text(step),
-                Err(e) => format!("[anthropic error: {}]", e),
+            let (content, tokens) = match result {
+                Ok((step, t)) => (decide_step_to_text(step), t),
+                Err(e) => (format!("[anthropic error: {}]", e), 0),
             };
-            return LLMResponse { content, model: self.model.clone() };
+            return LLMResponse { content, model: self.model.clone(), tokens_used: tokens };
         }
         let result = if self.stream_transport {
             let body = build_anthropic_body(&self.model, self.max_tokens, &prompt, &context, &[], true);
@@ -626,11 +626,11 @@ impl LLMProvider for AnthropicProvider {
                 build_anthropic_body(&self.model, self.max_tokens, &prompt, &context, &[], false);
             self.post(body).and_then(|j| parse_anthropic_text(&j))
         };
-        let content = match result {
-            Ok((text, _)) => text,
-            Err(e) => format!("[anthropic error: {}]", e),
+        let (content, tokens) = match result {
+            Ok((text, t)) => (text, t),
+            Err(e) => (format!("[anthropic error: {}]", e), 0),
         };
-        LLMResponse { content, model: self.model.clone() }
+        LLMResponse { content, model: self.model.clone(), tokens_used: tokens }
     }
 
     fn name(&self) -> String {
@@ -691,14 +691,14 @@ impl LLMProvider for AnthropicProvider {
         let prompt = request.data.get("prompt").cloned().unwrap_or_default();
         let context = request.data.get("context").cloned().unwrap_or_default();
         let body = build_anthropic_body(&self.model, self.max_tokens, &prompt, &context, &[], true);
-        let content = match self.post_sse(&body, on_chunk).and_then(|r| match r {
+        let (content, tokens) = match self.post_sse(&body, on_chunk).and_then(|r| match r {
             SsePost::Stream(st) => st.finish_text(),
             SsePost::Plain(j) => parse_anthropic_text(&j),
         }) {
-            Ok((text, _)) => text,
-            Err(e) => format!("[anthropic error: {}]", e),
+            Ok((text, t)) => (text, t),
+            Err(e) => (format!("[anthropic error: {}]", e), 0),
         };
-        LLMResponse { content, model: self.model.clone() }
+        LLMResponse { content, model: self.model.clone(), tokens_used: tokens }
     }
 }
 
@@ -1087,11 +1087,11 @@ impl LLMProvider for OpenAIProvider {
                 );
                 self.post(body).and_then(|j| parse_openai_step(&j))
             };
-            let content = match result {
-                Ok((step, _)) => decide_step_to_text(step),
-                Err(e) => format!("[openai error: {}]", e),
+            let (content, tokens) = match result {
+                Ok((step, t)) => (decide_step_to_text(step), t),
+                Err(e) => (format!("[openai error: {}]", e), 0),
             };
-            return LLMResponse { content, model: self.model.clone() };
+            return LLMResponse { content, model: self.model.clone(), tokens_used: tokens };
         }
         let result = if self.stream_transport {
             let body = build_openai_body(&self.model, self.max_tokens, &prompt, &context, &[], true);
@@ -1104,11 +1104,11 @@ impl LLMProvider for OpenAIProvider {
                 build_openai_body(&self.model, self.max_tokens, &prompt, &context, &[], false);
             self.post(body).and_then(|j| parse_openai_text(&j))
         };
-        let content = match result {
-            Ok((text, _)) => text,
-            Err(e) => format!("[openai error: {}]", e),
+        let (content, tokens) = match result {
+            Ok((text, t)) => (text, t),
+            Err(e) => (format!("[openai error: {}]", e), 0),
         };
-        LLMResponse { content, model: self.model.clone() }
+        LLMResponse { content, model: self.model.clone(), tokens_used: tokens }
     }
 
     fn name(&self) -> String {
@@ -1167,14 +1167,14 @@ impl LLMProvider for OpenAIProvider {
         let prompt = request.data.get("prompt").cloned().unwrap_or_default();
         let context = request.data.get("context").cloned().unwrap_or_default();
         let body = build_openai_body(&self.model, self.max_tokens, &prompt, &context, &[], true);
-        let content = match self.post_sse_with_retry(&body, on_chunk).and_then(|r| match r {
+        let (content, tokens) = match self.post_sse_with_retry(&body, on_chunk).and_then(|r| match r {
             SsePost::Stream(st) => st.finish_text(),
             SsePost::Plain(j) => parse_openai_text(&j),
         }) {
-            Ok((text, _)) => text,
-            Err(e) => format!("[openai error: {}]", e),
+            Ok((text, t)) => (text, t),
+            Err(e) => (format!("[openai error: {}]", e), 0),
         };
-        LLMResponse { content, model: self.model.clone() }
+        LLMResponse { content, model: self.model.clone(), tokens_used: tokens }
     }
 }
 
@@ -1319,6 +1319,147 @@ pub fn decide_with_contract(
     }
     note_decide_fallback();
     raw2
+}
+
+// =========================================================
+// Metering LLM + backstop de budget (FRAMEWORK F1 / F-A)
+// =========================================================
+
+/// Tokens LLM acumulados del PROCESO (input + output de cada llamada real). Lo
+/// alimenta `MeteredProvider` (envuelve al provider elegido en
+/// `provider_from_config`, con o sin budget) y lo lee el builtin `llm_usage()`.
+/// Monotónico por proceso: las ventanas de tiempo son política del framework, no
+/// del runtime.
+static LLM_TOKENS_USED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total de tokens LLM consumidos por este proceso (para cablear `llm_usage()`).
+pub fn llm_tokens_total() -> u64 {
+    LLM_TOKENS_USED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Aviso ÚNICO por proceso al cortar por budget (mismo patrón que LLM-offline).
+static BUDGET_CUT_NOTICED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Marker de degradación al superar `SYNSEMA_LLM_BUDGET`. MISMO patrón que offline:
+/// las ops LLM degradan con un texto descriptivo, NUNCA rompen la cadena del agente.
+/// Autocontenido y LLM-safe: dice qué pasó, quién lo fija y qué no hacer.
+fn budget_marker(used: u64, budget: u64) -> String {
+    format!("[llm budget exceeded: used {} of {} tokens]", used, budget)
+}
+
+fn note_budget_cut(used: u64, budget: u64) {
+    if first_time(&BUDGET_CUT_NOTICED) {
+        eprintln!(
+            "[synsema] notice: the LLM token budget is exhausted (used {} of {} tokens, set by \
+             the host via SYNSEMA_LLM_BUDGET). LLM operations now return the marker text \
+             \"[llm budget exceeded: …]\" instead of calling the model. An agent should not \
+             retry LLM operations in this process; raise the budget or start a new process.",
+            used, budget
+        );
+    }
+}
+
+/// Envuelve al provider real y METRA cada llamada: acumula `tokens_used` en el
+/// contador del proceso y, si hay `SYNSEMA_LLM_BUDGET`, corta ANTES de delegar cuando
+/// ya se alcanzó (degrada con marker + aviso único; jamás error — asimetría deliberada
+/// con `spend`, que sí es error duro). Cubre `call`/`call_step`/`call_stream` → las 6
+/// ops del lenguaje pasan por acá. `provider_from_config` lo aplica SIEMPRE (sin
+/// budget igual metra: `llm_usage()` funciona sin config).
+pub struct MeteredProvider {
+    pub inner: Arc<dyn LLMProvider>,
+    /// `None` = sin techo (solo metering). `Some(n)`: al llegar a `n` tokens usados,
+    /// las llamadas siguientes degradan sin tocar la red.
+    pub budget: Option<u64>,
+}
+
+impl MeteredProvider {
+    /// `Some(used)` si el budget ya está agotado (la llamada NO debe delegar).
+    fn over_budget(&self) -> Option<(u64, u64)> {
+        let budget = self.budget?;
+        let used = LLM_TOKENS_USED.load(std::sync::atomic::Ordering::Relaxed);
+        if used >= budget {
+            Some((used, budget))
+        } else {
+            None
+        }
+    }
+
+    fn meter(&self, tokens: u64) {
+        if tokens > 0 {
+            LLM_TOKENS_USED.fetch_add(tokens, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl LLMProvider for MeteredProvider {
+    fn call(&self, request: &LLMRequest) -> LLMResponse {
+        if let Some((used, budget)) = self.over_budget() {
+            note_budget_cut(used, budget);
+            return LLMResponse {
+                content: budget_marker(used, budget),
+                model: self.inner.name(),
+                tokens_used: 0,
+            };
+        }
+        let resp = self.inner.call(request);
+        self.meter(resp.tokens_used);
+        resp
+    }
+
+    /// Transparente: reporta el nombre del provider envuelto (así `llm_available` y
+    /// los logs no cambian por el metering).
+    fn name(&self) -> String {
+        self.inner.name()
+    }
+
+    fn call_step(&self, request: &LLMRequest) -> LlmStepResponse {
+        if let Some((used, budget)) = self.over_budget() {
+            note_budget_cut(used, budget);
+            return LlmStepResponse {
+                step: LlmStep::Final(budget_marker(used, budget)),
+                tokens_used: 0,
+            };
+        }
+        let resp = self.inner.call_step(request);
+        self.meter(resp.tokens_used);
+        resp
+    }
+
+    fn call_stream(
+        &self,
+        request: &LLMRequest,
+        on_chunk: &mut dyn FnMut(&str) -> bool,
+    ) -> LLMResponse {
+        if let Some((used, budget)) = self.over_budget() {
+            note_budget_cut(used, budget);
+            let marker = budget_marker(used, budget);
+            // Contrato de stream degradado (mismo que el default del trait): el marker
+            // se emite como UN chunk y como contenido final.
+            on_chunk(&marker);
+            return LLMResponse { content: marker, model: self.inner.name(), tokens_used: 0 };
+        }
+        let resp = self.inner.call_stream(request, on_chunk);
+        self.meter(resp.tokens_used);
+        resp
+    }
+}
+
+/// `SYNSEMA_LLM_BUDGET` → tope de tokens del proceso. Inválido o 0 → SIN budget, con
+/// warn (un techo silenciosamente ignorado sería peor que no tenerlo).
+fn resolve_llm_budget(store: &EnvStore) -> Option<u64> {
+    let raw = resolve_knob("SYNSEMA_LLM_BUDGET", store)?;
+    match raw.trim().parse::<u64>() {
+        Ok(n) if n > 0 => Some(n),
+        _ => {
+            eprintln!(
+                "synsema: warning: SYNSEMA_LLM_BUDGET='{}' is not a positive integer — \
+                 running WITHOUT an LLM token budget",
+                raw
+            );
+            None
+        }
+    }
 }
 
 // =========================================================
@@ -1498,6 +1639,17 @@ fn local_knobs_from_config(store: &EnvStore) -> crate::llm_local::LocalKnobs {
 /// environ ni queda accesible al programa `.syn` (que sigue necesitando `require env/secret`
 /// para tocar el `.env`, y aun así lo vería redactado).
 pub fn provider_from_config(store: &EnvStore) -> Option<Arc<dyn LLMProvider>> {
+    inner_provider_from_config(store).map(|inner| {
+        // Metering SIEMPRE (F-A): sin `SYNSEMA_LLM_BUDGET` igual se acumula, así
+        // `llm_usage()` funciona sin config; con budget, el wrapper corta al llegar.
+        Arc::new(MeteredProvider { inner, budget: resolve_llm_budget(store) })
+            as Arc<dyn LLMProvider>
+    })
+}
+
+/// Selección del provider CRUDO (sin el wrapper de metering). Separada para que el
+/// wrap de `provider_from_config` sea incondicional y no se pueda olvidar en una rama.
+fn inner_provider_from_config(store: &EnvStore) -> Option<Arc<dyn LLMProvider>> {
     let provider = match resolve_knob("SYNSEMA_LLM_PROVIDER", store) {
         Some(p) => p.trim().to_lowercase(),
         None => {
@@ -1681,6 +1833,7 @@ pub const LLM_ENV_VARS: &[&str] = &[
     "SYNSEMA_LLM_TIMEOUT",
     "SYNSEMA_LLM_HTTP_STREAM",
     "SYNSEMA_LLM_BASE_URL",
+    "SYNSEMA_LLM_BUDGET",
     "SYNSEMA_LLM_CTX",
     "SYNSEMA_LLM_THREADS",
     "SYNSEMA_LLM_TEMPERATURE",
@@ -3246,5 +3399,104 @@ mod tests {
             "error del provider: {}",
             resp.content
         );
+        // F-A live: una respuesta real trae usage → el metering tiene qué acumular.
+        assert!(resp.tokens_used > 0, "usage real esperado, got 0");
+    }
+
+    // =========================================================
+    // Metering + budget (FRAMEWORK F1 / F-A)
+    // =========================================================
+
+    /// El contador de tokens es GLOBAL del proceso (así es el contrato de
+    /// `llm_usage()`): estos tests se serializan entre sí y miden DELTAS, nunca
+    /// valores absolutos — otros tests del binario no tocan el contador.
+    static METER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn meter_lock() -> std::sync::MutexGuard<'static, ()> {
+        METER_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn step_req() -> LLMRequest {
+        let mut r = LLMRequest::new("reason");
+        r.data.insert("prompt".to_string(), "hola".to_string());
+        r
+    }
+
+    #[test]
+    fn metered_provider_accumulates() {
+        let _g = meter_lock();
+        // Mock guionado: call/call_stream reportan 5 tokens; el paso guionado, 7.
+        let mock = MockProvider::scripted(vec![LlmStepResponse {
+            step: LlmStep::Final("done".to_string()),
+            tokens_used: 7,
+        }])
+        .with_call_tokens(5);
+        let p = MeteredProvider { inner: Arc::new(mock), budget: None };
+        let before = llm_tokens_total();
+        let r1 = p.call(&step_req());
+        assert_eq!(r1.tokens_used, 5, "los tokens del mock fluyen a la LLMResponse");
+        let _ = p.call_stream(&step_req(), &mut |_| true);
+        let r3 = p.call_step(&step_req());
+        assert_eq!(r3.tokens_used, 7);
+        assert_eq!(
+            llm_tokens_total() - before,
+            5 + 5 + 7,
+            "call + call_stream + call_step acumulan en el contador del proceso"
+        );
+    }
+
+    #[test]
+    fn metered_provider_budget_cuts() {
+        let _g = meter_lock();
+        let mock =
+            Arc::new(MockProvider::new(std::collections::HashMap::new()).with_call_tokens(8));
+        let base = llm_tokens_total();
+        // Budget = base + 5: la primera llamada pasa (base < base+5) y suma 8; la
+        // segunda encuentra el contador ≥ budget → marker SIN delegar.
+        let p = MeteredProvider { inner: mock.clone(), budget: Some(base + 5) };
+        let r1 = p.call(&step_req());
+        assert!(!r1.content.contains("llm budget exceeded"), "la primera pasa: {}", r1.content);
+        assert_eq!(mock.call_log_len(), 1);
+        assert_eq!(llm_tokens_total(), base + 8);
+
+        let r2 = p.call(&step_req());
+        assert!(
+            r2.content.starts_with("[llm budget exceeded: used"),
+            "marker de degradación, no error: {}",
+            r2.content
+        );
+        assert_eq!(r2.tokens_used, 0);
+        assert_eq!(mock.call_log_len(), 1, "cortó ANTES de delegar (el mock no vio la 2ª)");
+        assert_eq!(llm_tokens_total(), base + 8, "el corte no acumula");
+
+        // Las 3 superficies cortan: call_step → Final(marker); call_stream → marker
+        // como único chunk y como content.
+        let s = p.call_step(&step_req());
+        match s.step {
+            LlmStep::Final(t) => assert!(t.starts_with("[llm budget exceeded"), "{}", t),
+            other => panic!("esperaba Final(marker), got {:?}", other),
+        }
+        let mut chunks: Vec<String> = Vec::new();
+        let st = p.call_stream(&step_req(), &mut |c| {
+            chunks.push(c.to_string());
+            true
+        });
+        assert!(st.content.starts_with("[llm budget exceeded"), "{}", st.content);
+        assert_eq!(chunks.len(), 1, "el marker sale como UN chunk (contrato degradado)");
+        assert_eq!(mock.call_log_len(), 1, "ninguna superficie delegó tras el corte");
+    }
+
+    #[test]
+    fn llm_budget_knob_parses_and_warns_on_invalid() {
+        // Válido → Some; inválido o 0 → None (con warn a stderr, no verificable acá).
+        let store = EnvStore::parse("SYNSEMA_LLM_BUDGET=1000");
+        // El environ del proceso podría tener la var en un entorno raro de CI; este
+        // test sólo usa el .env → no la seteamos ni la tocamos.
+        if std::env::var("SYNSEMA_LLM_BUDGET").is_err() {
+            assert_eq!(resolve_llm_budget(&store), Some(1000));
+            let bad = EnvStore::parse("SYNSEMA_LLM_BUDGET=abc");
+            assert_eq!(resolve_llm_budget(&bad), None);
+            let zero = EnvStore::parse("SYNSEMA_LLM_BUDGET=0");
+            assert_eq!(resolve_llm_budget(&zero), None);
+        }
     }
 }

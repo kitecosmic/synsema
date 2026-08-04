@@ -23,6 +23,7 @@
 - `read_line(prompt?)` → text — read one line from stdin (CLI). Optional `prompt` is printed first (no newline). Returns the line without the trailing newline; `nothing` on EOF. Works with a TTY **and** piped/redirected input (`printf 'x\n' | synsema run f.syn`) — unlike free-text `ask`. Under `synsema run` it **auto-flushes** pending `print` output before prompting, so a `read_line` loop is a real interactive REPL. (Reads stdin in any mode; the flush is `run`-only — see `flush`.) See [human.md](human.md).
 - `flush()` → nothing — `run`-interactive primitive: `print` output is buffered and shown when the program ends; `flush()` writes the pending output to stdout **now** (live feedback for REPLs / long loops). Mode-aware: under `conform`/`test`/`serve` (which collect output for JSON/responses) `flush()` and `read_line`'s auto-flush are **no-ops** — output stays collected, stdout is never polluted.
 - `llm_available()` → bool — `true` when a real LLM provider is wired, `false` offline. Branch on it instead of string-matching placeholders. See [llm.md](llm.md).
+- `llm_usage()` → number — LLM tokens (input + output) consumed by this **process** so far; `0` offline. No capability (introspection). Pairs with `SYNSEMA_LLM_BUDGET` (ops degrade to a `[llm budget exceeded: …]` marker at the ceiling — never an error). See [llm.md](llm.md).
 
 ## Error handling — `try` / `recover` / `raise`
 ```
@@ -150,6 +151,10 @@ Resolution for `env`/`secret`: process environ → `.env` → default → else e
 - `hmac_sha256(data, secret)` → hex MAC (not secret)
 - `verify_hmac(data, signature, secret, algo?)` → bool, constant-time. `algo` = `"sha256"` (default) or `"sha512"`; decodes hex/base64 signatures (Stripe/GitHub/Shopify). SHA-1 is rejected.
 - `constant_time_eq(a, b)` → bool, constant-time; accepts a `secret` on either side
+
+## Spend ledger (see [capabilities.md](capabilities.md))
+- `spend(amount, unit, reason)` → number (the unit's accumulated total after this spend) — **requires `spend("UNIT")`** (deny-by-default ALWAYS, never auto-granted; denied in `sandbox`; a tool must declare it for `call_tool`). Declares an external spend BEFORE the program makes the actual payment call: validates (`amount` > 0, `unit`/`reason` non-empty text), checks the capability, enforces the host ceiling (`SYNSEMA_SPEND_CEILING="USD:500,ETH:0.1"` — breach = **hard catchable error**; do NOT proceed with the payment call after it), and writes an append-only, **fail-loud** ledger entry to `spend.log` (amount as canonical decimal text + reason + file:line; no written entry → the spend errors). Amounts take the exact **decimal** path — cents never accumulate binary error. Totals are per **process**, monotonic.
+- `spend_total(unit)` → number — the process's accumulated total for that unit (`0` if none). Introspection, no capability (like `llm_usage()`). Time-windowed policy belongs to the framework: read `spend.log` (grant `file.read` over the audit dir — `$SYNSEMA_AUDIT_DIR` or `~/.synsema/audit`).
 
 ## Intentional operations (replace loops)
 

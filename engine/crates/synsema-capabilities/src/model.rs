@@ -39,6 +39,13 @@ pub enum CapabilityType {
     /// de origen (o al label del secret nuevo al generar) y audit fail-loud en
     /// `wallet.log`. Nunca es ambiente. Batch 13 (G20).
     Wallet,
+    /// Registrar un GASTO externo (`spend(monto, unidad, motivo)`, FRAMEWORK F1). No
+    /// mueve valor por sí misma (eso lo hace el PSP/exchange del programa), pero es la
+    /// declaración auditada de que se va a mover: deny-by-default SIEMPRE (jamás
+    /// auto-granted), scope = unidad (`spend("USD")`), matching literal + prefijo
+    /// trailing-`*` (mismas reglas que `secret`), audit fail-loud en `spend.log`.
+    /// Espejo exacto de `sign`/`wallet`.
+    Spend,
     /// Memoria persistente declarada del agente (`require memory("nombre")`). La
     /// declaración ES la identidad: scope = nombre literal del `.db` (DB-M1). Gatea
     /// toda la familia de estado persistente (memory + rules + progress + decisions).
@@ -71,6 +78,7 @@ impl CapabilityType {
             Reveal => "reveal",
             Sign => "sign",
             Wallet => "wallet",
+            Spend => "spend",
             Memory => "memory",
         }
     }
@@ -97,6 +105,7 @@ pub fn capability_type_from_name(name: &str) -> Option<CapabilityType> {
         "reveal" => Reveal,
         "sign" => Sign,
         "wallet" => Wallet,
+        "spend" => Spend,
         "memory" => Memory,
         _ => return None,
     })
@@ -479,7 +488,7 @@ pub fn parse_capability(name: &str, scope: Option<&str>) -> Result<Capability, S
     match capability_type_from_name(name) {
         Some(ty) => Ok(Capability::new(ty, scope.map(|s| s.to_string()))),
         None => Err(format!(
-            "Unknown capability type: '{}'. Known: [net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal, sign, wallet, memory]",
+            "Unknown capability type: '{}'. Known: [net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal, sign, wallet, spend, memory]",
             name
         )),
     }

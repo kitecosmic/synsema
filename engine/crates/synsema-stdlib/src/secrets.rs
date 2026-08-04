@@ -404,7 +404,7 @@ fn iso_now() -> String {
 /// Devuelve Err si no se puede escribir → en el camino CONCEDIDO `reveal()` falla (sin
 /// auditoría no hay revelación, §7).
 fn write_audit_entry(name: &str, loc: &SourceLocation, granted: bool) -> Result<(), String> {
-    write_audit_op("reveal", "reveal.log", name, loc, granted)
+    write_audit_op("reveal", "reveal.log", name, loc, granted, "")
 }
 
 /// Entrada de audit de una FIRMA (Batch 11), append-only, fail-loud. Espeja el audit
@@ -419,7 +419,49 @@ pub fn write_sign_audit(
     loc: &SourceLocation,
     granted: bool,
 ) -> Result<(), String> {
-    write_audit_op(&format!("sign curve={}", curve), "sign.log", name, loc, granted)
+    write_audit_op(&format!("sign curve={}", curve), "sign.log", name, loc, granted, "")
+}
+
+/// Entrada de audit de una firma DENEGADA POR TECHO (`SYNSEMA_SIGN_CEILING`,
+/// FRAMEWORK F1 / F-C): la capability estaba concedida pero el contador de firmas de
+/// esa clave llegó al tope del host. Misma línea que `write_sign_audit` denegado +
+/// `denied_by=ceiling` (para distinguirla en el forense de una denegación de
+/// capability). Best-effort como toda denegación (la firma ya NO va a ocurrir).
+pub fn write_sign_ceiling_audit(
+    name: &str,
+    curve: &str,
+    loc: &SourceLocation,
+) -> Result<(), String> {
+    write_audit_op(
+        &format!("sign curve={}", curve),
+        "sign.log",
+        name,
+        loc,
+        false,
+        "denied_by=ceiling",
+    )
+}
+
+/// Entrada de audit de un GASTO (`spend`, FRAMEWORK F1 / F-B), append-only, fail-loud
+/// en el camino concedido (sin auditoría no hay gasto — mismo contrato que `sign`).
+/// La línea lleva unidad (como `name=`, el scope), monto en TEXTO canónico (decimal,
+/// sin error binario), motivo (quoted, al final: puede tener espacios), `file:line` y
+/// programa. `ceiling_denied` agrega `denied_by=ceiling` (denegación por techo del
+/// host, no por capability).
+pub fn write_spend_audit(
+    unit: &str,
+    amount: &str,
+    reason: &str,
+    loc: &SourceLocation,
+    granted: bool,
+    ceiling_denied: bool,
+) -> Result<(), String> {
+    let extra = if ceiling_denied {
+        format!("denied_by=ceiling reason=\"{}\"", reason)
+    } else {
+        format!("reason=\"{}\"", reason)
+    };
+    write_audit_op(&format!("spend amount={}", amount), "spend.log", unit, loc, granted, &extra)
 }
 
 /// Entrada de audit de una operación de CUSTODIA (Batch 13, G20): generar/derivar/
@@ -434,17 +476,20 @@ pub fn write_wallet_audit(
     loc: &SourceLocation,
     granted: bool,
 ) -> Result<(), String> {
-    write_audit_op(&format!("wallet op={}", op), "wallet.log", name, loc, granted)
+    write_audit_op(&format!("wallet op={}", op), "wallet.log", name, loc, granted, "")
 }
 
-/// Cuerpo compartido del audit append-only (reveal/sign). `op` es el prefijo de la
-/// línea (`"reveal"` o `"sign curve=…"`); `file` el nombre del log.
+/// Cuerpo compartido del audit append-only (reveal/sign/wallet/spend). `op` es el
+/// prefijo de la línea (`"reveal"`, `"sign curve=…"`, `"spend amount=…"`); `file` el
+/// nombre del log; `extra` (opcional, puede ser vacío) va al FINAL de la línea
+/// (motivo/causa — los campos de posición fija quedan parseables por prefijo).
 fn write_audit_op(
     op: &str,
     file: &str,
     name: &str,
     loc: &SourceLocation,
     granted: bool,
+    extra: &str,
 ) -> Result<(), String> {
     let dir = audit_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -459,15 +504,17 @@ fn write_audit_op(
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| loc.file.clone());
     let result = if granted { "granted" } else { "denied" };
+    let tail = if extra.is_empty() { String::new() } else { format!(" {}", extra) };
     let line = format!(
-        "{} {} result={} name={} at={}:{} program={}\n",
+        "{} {} result={} name={} at={}:{} program={}{}\n",
         iso_now(),
         op,
         result,
         name,
         loc.file,
         loc.line,
-        program
+        program,
+        tail
     );
     f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
     Ok(())

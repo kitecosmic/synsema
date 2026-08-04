@@ -91,8 +91,26 @@ the engine returns descriptive placeholders, so programs stay runnable without a
 | `SYNSEMA_LLM_BASE_URL` | Endpoint base — point a provider at any compatible endpoint (e.g. a local server) | official endpoint |
 | `SYNSEMA_LLM_TIMEOUT` | HTTP timeout (seconds) for the network providers. With the default streaming transport it measures **silence between bytes** (each SSE chunk renews it), so long generations flow and a dead host still fails fast; on the non-stream path it caps the whole call. Invalid/≤0 → default | `60` |
 | `SYNSEMA_LLM_HTTP_STREAM` | Internal SSE transport for network providers (the language ops still return complete text). `0`/`false` → classic non-stream path (escape hatch for odd proxies) | `1` (on) |
+| `SYNSEMA_LLM_BUDGET` | Per-**process** LLM token budget (input + output, all ops). When the counter reaches it, every LLM op **degrades** to the marker text `[llm budget exceeded: used N of M tokens]` — no error, no network call, one stderr notice. Invalid/0 → no budget (with a warning) | — (unlimited) |
 
 Cost note: the default is **Sonnet** (cheaper); opt into Opus with `SYNSEMA_LLM_MODEL=claude-opus-4-8`.
+
+**Token metering — `llm_usage()`.** Every real provider call is metered: `llm_usage()` → number of
+LLM tokens (input + output) consumed by **this process** so far. Introspection, no capability needed
+(like `llm_available()`); offline or before any call → `0`. Works under `serve` too (one counter per
+process). Monotonic — time windows are framework policy, not runtime state. With `SYNSEMA_LLM_BUDGET`
+set, the ops degrade at the ceiling instead of erroring (an LLM op never breaks the agent chain —
+same pattern as offline placeholders), so code that must stop on exhaustion should branch on the
+marker or on `llm_usage()`:
+
+```
+require llm
+let before be llm_usage()
+let answer be reason about question
+when contains(answer, "llm budget exceeded")
+    give "(budget exhausted — not retrying)"
+print("this call cost " + text(llm_usage() - before) + " tokens")
+```
 
 **Detect offline vs real provider:** `llm_available()` → bool (`true` when a real provider is wired,
 `false` offline). Branch on it instead of string-matching placeholders. From the terminal, run
