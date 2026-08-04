@@ -20,8 +20,8 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 | `Cannot iterate over number` | `each` on a non-list value | Check type with `type_of()` or wrap in `[value]` |
 | `Map has no key 'X'` | Accessing a property that doesn't exist | Check with `contains(map, "X")` first — in a **separate/nested `when`**, NOT `contains(m,"X") and m["X"]…`: `and` does not short-circuit, so the index still runs |
 | `contains(m,"k") and m["k"] == v` errors anyway | **`and`/`or` never short-circuit** — both sides always evaluate | Nest: `when contains(m, "k")` … then index inside. Same for `or`: don't rely on it to skip a side effect |
-| `raise "msg"` does nothing (no error raised) | Without parens it parses as TWO inert expressions (the identifier, then a string) — a silent no-op | `raise` is a **builtin**: always call it — `raise("msg")` |
-| `Expected IDENTIFIER, got DECIDE` (or REASON/…) | A hard keyword used as an export/member name — `mod.decide(...)`, `task wait(reason)` | LLM words `reason`/`decide`/`analyze`/`generate` are reserved everywhere; rename (`resolve`, `why`) — see [syntax.md](syntax.md) |
+| `raise "msg"` does nothing (no error raised) | **Engine ≤ v0.5.1**: without parens it parsed as TWO inert expressions — a silent no-op | Upgrade (newer engines accept the statement form `raise "msg"` / `raise err`, and a bare `raise` errors loudly); on old binaries always `raise("msg")` |
+| `'decide' is a reserved word` naming an export/member (older engines: `Expected IDENTIFIER, got DECIDE`) | A hard keyword used as an export/member/param name — `mod.decide(...)`, `task wait(reason)` | LLM words `reason`/`decide`/`analyze`/`generate` are reserved everywhere; rename (`resolve`, `why`) — see [syntax.md](syntax.md) |
 | `Cannot set undefined variable` | Using `set` before `let` | Define with `let x be value` first, then `set x to new_value` |
 | `Loop exceeded maximum iterations` | Infinite loop (condition never false) | Check that loop variable actually changes |
 | `Expected indented block` | Missing indentation after when/each/task/etc | Indent body with 4 spaces |

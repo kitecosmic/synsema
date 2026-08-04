@@ -363,6 +363,33 @@ impl Parser {
         if self.check_word("test") && self.peek(1).ty == TokenType::Text {
             return Ok(Some(self.parse_test_block()?));
         }
+        // `raise` como sentencia (DX): `raise "msg"` / `raise err` equivalen a
+        // `raise(...)`. Sin esto, la forma sin paréntesis parseaba como DOS
+        // expresiones inertes (el identificador y luego el texto) y NO lanzaba
+        // nada — un no-op silencioso exactamente en el código que debía proteger.
+        // SOFT como los DSL: con token de uso-como-nombre después (`raise(x)`,
+        // `raise + 1`, `raise.x`, `raise[i]`) sigue siendo el identificador/builtin
+        // de siempre (cero ruptura); `raise` solo al final de línea → error ruidoso
+        // con el fix en el mensaje.
+        if self.soft_dsl("raise") {
+            let loc = self.location();
+            self.advance();
+            if matches!(
+                self.current().ty,
+                TokenType::Newline | TokenType::Dedent | TokenType::Eof
+            ) {
+                return Err(ParseError::new(
+                    "raise needs a message: raise(\"why\") — or `raise err` to re-propagate a caught error".to_string(),
+                    loc,
+                ));
+            }
+            let value = self.parse_expression()?;
+            let name = Node::new(loc.clone(), NodeKind::Identifier { name: "raise".to_string() });
+            return Ok(Some(Node::new(
+                loc,
+                NodeKind::TaskCall { name: Box::new(name), arguments: vec![Arg { name: None, value }] },
+            )));
+        }
 
         // DSL de features (agentes/human/observabilidad) — SOFT keywords: son su
         // construcción del DSL sólo si lideran el statement y no las sigue un token
@@ -1950,7 +1977,10 @@ impl Parser {
             } else if self.check(TokenType::Dot) {
                 let loc = self.location();
                 self.advance();
-                let prop = self.expect(TokenType::Identifier, "")?;
+                // `expect_name` (no `expect`): así `mod.decide(...)` da el error BUENO
+                // ("'decide' is a reserved word…") en vez del críptico
+                // "Expected IDENTIFIER, got DECIDE" — mismo trato que parámetros y lets.
+                let prop = self.expect_name("member after '.'")?;
                 node = Node::new(
                     loc,
                     NodeKind::PropertyAccess {
@@ -2465,6 +2495,57 @@ mod tests {
             "got: {}",
             err
         );
+    }
+
+    // DX: reservada tras '.' (member/export) da el error BUENO, no
+    // "Expected IDENTIFIER, got DECIDE".
+    #[test]
+    fn reserved_word_as_member_name() {
+        let err = parse_source("let x be mod.decide(1)", "<test>").unwrap_err();
+        assert!(
+            err.to_string().contains("'decide' is a reserved word in Synsema"),
+            "got: {}",
+            err
+        );
+    }
+
+    // DX: `raise "msg"` es SENTENCIA (desugar a la llamada al builtin) — antes
+    // parseaba como dos expresiones inertes y no lanzaba nada en silencio.
+    #[test]
+    fn raise_statement_without_parens_is_a_call() {
+        let prog = parse_source("raise \"boom\"", "<test>").unwrap();
+        assert_eq!(prog.statements.len(), 1, "UNA sentencia, no dos expresiones inertes");
+        let NodeKind::TaskCall { name, arguments } = &prog.statements[0].kind else {
+            panic!("esperaba TaskCall, got {:?}", prog.statements[0].kind);
+        };
+        assert!(matches!(&name.kind, NodeKind::Identifier { name } if name == "raise"));
+        assert_eq!(arguments.len(), 1);
+        // `raise err` (identificador) también.
+        let prog = parse_source("raise err", "<test>").unwrap();
+        assert!(matches!(&prog.statements[0].kind, NodeKind::TaskCall { .. }));
+    }
+
+    // La forma con paréntesis sigue siendo la expresión de siempre (cero ruptura),
+    // y los usos-como-nombre (`raise + 1`) caen al camino de expresión.
+    #[test]
+    fn raise_with_parens_and_name_uses_unchanged() {
+        let prog = parse_source("raise(\"boom\")", "<test>").unwrap();
+        assert!(matches!(&prog.statements[0].kind, NodeKind::TaskCall { .. }));
+        let prog = parse_source("let x be raise", "<test>").unwrap();
+        assert_eq!(prog.statements.len(), 1, "raise como valor sigue siendo identificador");
+    }
+
+    // `raise` solo (fin de línea) → error ruidoso con el fix, jamás no-op.
+    #[test]
+    fn bare_raise_errors_loudly() {
+        let err = parse_source("raise", "<test>").unwrap_err();
+        assert!(
+            err.to_string().contains("raise needs a message"),
+            "got: {}",
+            err
+        );
+        let err = parse_source("task f()\n    raise\n", "<test>").unwrap_err();
+        assert!(err.to_string().contains("raise needs a message"), "got: {}", err);
     }
 
     #[test]
