@@ -108,11 +108,40 @@ fn fetch_all(tag: &str) -> Result<Vec<Fetched>, String> {
     Ok(out)
 }
 
+/// ¿Qué hacer con un archivo del FRAMEWORK en un upgrade? Pura y testeable.
+/// `recorded` = sha256 que quedó registrado al instalarlo (synfide/MANIFEST.json);
+/// `on_disk` = sha256 de lo que hay ahora. Si difieren, el usuario lo EDITÓ:
+/// jamás pisar trabajo en silencio — se conserva el suyo y la versión nueva
+/// aterriza al lado como `<archivo>.new` (patrón conffiles de apt/pacman).
+#[derive(PartialEq, Debug)]
+enum UpgradeAction {
+    Write,
+    KeepUserVersion,
+}
+
+fn upgrade_action(recorded: Option<&str>, on_disk: Option<&str>) -> UpgradeAction {
+    match (recorded, on_disk) {
+        // No existe en disco → instalar normal (también repone un borrado).
+        (_, None) => UpgradeAction::Write,
+        // Instalación vieja sin MANIFEST (pre-manifest): no hay con qué comparar —
+        // comportamiento histórico (actualizar). Documentado en el mensaje final.
+        (None, Some(_)) => UpgradeAction::Write,
+        (Some(r), Some(d)) => {
+            if r == d {
+                UpgradeAction::Write
+            } else {
+                UpgradeAction::KeepUserVersion
+            }
+        }
+    }
+}
+
 /// Instala/actualiza Synfide en `base`. Devuelve mensajes ya impresos; `Err` = nada
 /// escrito (o error de escritura puntual, informado con la ruta).
 pub(crate) fn install(base: &Path) -> Result<(), String> {
     let tag = latest_tag()?;
     let version_path = base.join("synfide").join("VERSION");
+    let manifest_path = base.join("synfide").join("MANIFEST.json");
     let installed = std::fs::read_to_string(&version_path)
         .ok()
         .map(|s| s.trim().to_string());
@@ -120,34 +149,90 @@ pub(crate) fn install(base: &Path) -> Result<(), String> {
         println!("init: synfide {} ya está instalado y al día.", tag);
         return Ok(());
     }
+    // Hashes registrados en la instalación ANTERIOR (dest → sha256). Con esto un
+    // archivo del framework editado por el usuario se detecta y NO se pisa.
+    let recorded: serde_json::Value = std::fs::read_to_string(&manifest_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
     let fetched = fetch_all(&tag)?; // todo verificado ANTES de escribir
     let upgrading = installed.is_some();
+    let mut kept: Vec<String> = Vec::new();
+    let mut new_hashes = serde_json::Map::new();
     for f in &fetched {
         let path = base.join(&f.dest);
-        if !f.framework_owned && path.exists() {
-            println!("init: {} ya existe — no se toca", path.display());
+        if !f.framework_owned {
+            if path.exists() {
+                println!("init: {} ya existe — no se toca", path.display());
+            } else {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("cannot create {}: {}", parent.display(), e))?;
+                }
+                std::fs::write(&path, &f.bytes)
+                    .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
+                println!("init: {} creado", path.display());
+            }
             continue;
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("cannot create {}: {}", parent.display(), e))?;
-        }
-        std::fs::write(&path, &f.bytes)
-            .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
-        println!(
-            "init: {} {}",
-            path.display(),
-            if f.framework_owned && upgrading { "actualizado" } else { "creado" }
+        // Archivo del FRAMEWORK: registrar SIEMPRE el hash del release nuevo (así
+        // una edición local sigue protegida en el próximo upgrade también).
+        new_hashes.insert(
+            f.dest.clone(),
+            serde_json::Value::String(sha256_hex(&f.bytes)),
         );
+        let disk_hash = std::fs::read(&path).ok().map(|b| sha256_hex(&b));
+        let rec = recorded.get(&f.dest).and_then(|v| v.as_str());
+        match upgrade_action(rec, disk_hash.as_deref()) {
+            UpgradeAction::Write => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("cannot create {}: {}", parent.display(), e))?;
+                }
+                std::fs::write(&path, &f.bytes)
+                    .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
+                println!(
+                    "init: {} {}",
+                    path.display(),
+                    if upgrading { "actualizado" } else { "creado" }
+                );
+            }
+            UpgradeAction::KeepUserVersion => {
+                let new_path = base.join(format!("{}.new", f.dest));
+                std::fs::write(&new_path, &f.bytes)
+                    .map_err(|e| format!("cannot write {}: {}", new_path.display(), e))?;
+                println!(
+                    "init: ⚠ {} fue MODIFICADO por vos — se conserva TU versión; la nueva quedó en {}",
+                    path.display(),
+                    new_path.display()
+                );
+                kept.push(f.dest.clone());
+            }
+        }
     }
     if let Some(parent) = version_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     std::fs::write(&version_path, format!("{}\n", tag))
         .map_err(|e| format!("cannot write {}: {}", version_path.display(), e))?;
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&serde_json::Value::Object(new_hashes))
+            .unwrap_or_else(|_| "{}".to_string()),
+    )
+    .map_err(|e| format!("cannot write {}: {}", manifest_path.display(), e))?;
     match installed {
-        Some(old) => println!("init: synfide {} → {} (los archivos del framework se actualizaron; los tuyos no se tocaron)", old, tag),
+        Some(old) => println!("init: synfide {} → {} (framework actualizado; tus archivos no se tocaron)", old, tag),
         None => println!("init: synfide {} instalado.", tag),
+    }
+    if !kept.is_empty() {
+        println!();
+        println!("⚠ Archivos del framework con EDICIONES TUYAS (conservados; el release nuevo quedó como .new):");
+        for k in &kept {
+            println!("    {}", k);
+        }
+        println!("  Para mantener cambios propios a un paquete, movelo a TU carpeta (p.ej. mylib/) e importá esa —");
+        println!("  los upgrades jamás tocan tus carpetas. Si ya no querés tu versión: borrala y re-corré init --synfide.");
     }
     Ok(())
 }
@@ -159,6 +244,24 @@ mod tests {
     // La única lógica pura y peligrosa del módulo: la validación de rutas del
     // manifest (viaja por la red — un dest malicioso no puede escribir fuera del
     // proyecto). El resto es red + escritura, cubierto por la sonda E2E del release.
+    // La regla de upgrade que protege trabajo del usuario: un archivo del
+    // framework EDITADO localmente (hash de disco ≠ hash registrado) jamás se
+    // pisa — se conserva y el nuevo va a `.new`. Borrado → se repone; sin
+    // MANIFEST (instalación pre-manifest) → comportamiento histórico.
+    #[test]
+    fn user_modified_framework_files_are_never_clobbered() {
+        use super::UpgradeAction::*;
+        assert_eq!(upgrade_action(Some("aaa"), Some("aaa")), Write, "sin tocar → actualiza");
+        assert_eq!(
+            upgrade_action(Some("aaa"), Some("bbb")),
+            KeepUserVersion,
+            "editado → se conserva el del usuario"
+        );
+        assert_eq!(upgrade_action(Some("aaa"), None), Write, "borrado → se repone");
+        assert_eq!(upgrade_action(None, None), Write, "instalación nueva");
+        assert_eq!(upgrade_action(None, Some("bbb")), Write, "pre-manifest: histórico");
+    }
+
     #[test]
     fn manifest_dest_paths_are_validated() {
         for ok in ["app.syn", "synfide/store.syn", "a/b/c.syn"] {
