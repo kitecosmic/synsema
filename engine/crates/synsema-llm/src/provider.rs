@@ -42,6 +42,10 @@ impl LLMRequest {
 pub struct LLMResponse {
     pub content: String,
     pub model: String,
+    /// Tokens consumidos por ESTA llamada (input + output). 0 cuando el provider no
+    /// los conoce (mock sin configurar, providers viejos, error de red) — el metering
+    /// (FRAMEWORK F1) acumula lo que haya, nunca inventa.
+    pub tokens_used: u64,
 }
 
 /// Una tool ofrecida al LLM (la arma el programa como dato; ver el loop seguro).
@@ -103,11 +107,19 @@ pub struct MockProvider {
     /// `call_step` cae a `Final` desde `responses` → un Mock SIN `Final` nunca termina
     /// (habilita el test de `max_steps`).
     scripted: Mutex<VecDeque<LlmStepResponse>>,
+    /// Tokens que reporta cada `call`/`call_stream` (default 0). Para los tests de
+    /// metering (FRAMEWORK F1): un mock "con costo" sin tocar la red.
+    call_tokens: u64,
 }
 
 impl MockProvider {
     pub fn new(responses: HashMap<String, String>) -> Self {
-        Self { responses, call_log: Mutex::new(Vec::new()), scripted: Mutex::new(VecDeque::new()) }
+        Self {
+            responses,
+            call_log: Mutex::new(Vec::new()),
+            scripted: Mutex::new(VecDeque::new()),
+            call_tokens: 0,
+        }
     }
     /// Constructor guionado: una secuencia determinista de pasos (sin red). `responses`
     /// queda vacío; la cola se consume en orden por `call_step`.
@@ -116,7 +128,14 @@ impl MockProvider {
             responses: HashMap::new(),
             call_log: Mutex::new(Vec::new()),
             scripted: Mutex::new(steps.into_iter().collect()),
+            call_tokens: 0,
         }
+    }
+    /// Builder: fija los tokens que reportará cada `call`/`call_stream` (tests de
+    /// metering). Los pasos guionados llevan los suyos en `LlmStepResponse`.
+    pub fn with_call_tokens(mut self, tokens: u64) -> Self {
+        self.call_tokens = tokens;
+        self
     }
     /// Encola un paso guionado más.
     pub fn push_step(&self, s: LlmStepResponse) {
@@ -135,7 +154,7 @@ impl LLMProvider for MockProvider {
             .get(&request.operation)
             .cloned()
             .unwrap_or_else(|| format!("[mock:{}]", request.operation));
-        LLMResponse { content, model: "mock".to_string() }
+        LLMResponse { content, model: "mock".to_string(), tokens_used: self.call_tokens }
     }
     fn name(&self) -> String {
         "mock".to_string()
@@ -168,6 +187,7 @@ impl LLMProvider for NetworkProvider {
         LLMResponse {
             content: format!("[{} provider: real calls not implemented yet]", self.prefix),
             model: self.model.clone(),
+            tokens_used: 0,
         }
     }
     fn name(&self) -> String {

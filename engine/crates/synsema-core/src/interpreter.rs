@@ -389,6 +389,10 @@ pub struct Interpreter {
     /// `provider.call_stream`. Sin él: `llm_stream` devuelve el placeholder
     /// `"[no llm provider]"` sin invocar `on_chunk`.
     llm_stream_callback: Option<LlmStreamCallback>,
+    /// Callback de `llm_usage()` (FRAMEWORK F1): devuelve los tokens LLM acumulados
+    /// del proceso. Introspección sin gate (como `llm_available`). Sin él (offline /
+    /// sin provider): el builtin devuelve 0.
+    llm_usage_callback: Option<Rc<dyn Fn() -> u64>>,
     /// Gate de capability para las ops LLM: lo cablea el motor para exigir
     /// `require llm` antes de CUALQUIER op LLM (provider real o placeholder).
     /// `Err(msg)` → la op falla con `Capability not granted: llm`. Sin él: sin gate
@@ -459,6 +463,7 @@ impl Interpreter {
             llm_decide_callback: None,
             llm_step_callback: None,
             llm_stream_callback: None,
+            llm_usage_callback: None,
             llm_cap_hook: None,
             serve_hook: None,
             stream_emit: None,
@@ -573,6 +578,12 @@ impl Interpreter {
     /// Cablea el callback LLM de streaming (`llm_stream`, F2).
     pub fn set_llm_stream_callback(&mut self, cb: LlmStreamCallback) {
         self.llm_stream_callback = Some(cb);
+    }
+
+    /// Cablea el callback de `llm_usage()` (tokens LLM acumulados del proceso,
+    /// FRAMEWORK F1). Sin él, el builtin devuelve 0.
+    pub fn set_llm_usage_callback(&mut self, cb: Rc<dyn Fn() -> u64>) {
+        self.llm_usage_callback = Some(cb);
     }
 
     /// Cablea el gate de capability para las ops LLM (exige `require llm`).
@@ -812,6 +823,16 @@ impl Interpreter {
         self.register("flush", 0, Rc::new(|i, _a, _l| i.b_flush()));
         // Estado del provider LLM: true si el motor cableó uno real (vs placeholder offline).
         self.register("llm_available", 0, Rc::new(|i, _a, _l| Ok(syn_bool(i.llm_callback.is_some()))));
+        // Tokens LLM acumulados del proceso (FRAMEWORK F1). Introspección sin gate,
+        // como llm_available; offline/sin provider → 0.
+        self.register(
+            "llm_usage",
+            0,
+            Rc::new(|i, _a, _l| {
+                let total = i.llm_usage_callback.as_ref().map(|cb| cb()).unwrap_or(0);
+                Ok(syn_number(Number::parse_int_literal(&total.to_string())))
+            }),
+        );
         // Regex (computación pura, sin capability)
         self.register("matches", 2, Rc::new(|i, a, l| i.b_matches(a, l)));
         self.register("find_all", 2, Rc::new(|i, a, l| i.b_find_all(a, l)));

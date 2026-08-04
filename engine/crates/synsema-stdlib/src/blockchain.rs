@@ -149,6 +149,10 @@ pub(crate) fn gate_and_audit(
         let _ = write_sign_audit(name, curve, loc, false);
         return Err(sign_denied(name));
     }
+    // Techo de CANTIDAD de firmas del host (`SYNSEMA_SIGN_CEILING`, FRAMEWORK F1/F-C):
+    // chequea y reserva el cupo ANTES del audit concedido. Sin config → no-op
+    // byte-idéntico. Denegado por techo → audit `denied_by=ceiling` + error catchable.
+    crate::spend::sign_ceiling_reserve(name, curve, loc)?;
     write_sign_audit(name, curve, loc, true).map_err(|e| {
         err(format!(
             "sign(\"{name}\") failed: cannot write the audit log ({e}). Refusing to sign without an audit trail."

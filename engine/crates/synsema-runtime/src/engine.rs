@@ -402,6 +402,9 @@ pub(crate) fn wire_common_with_state(
     // Blockchain (Batch 11): encoding/verify/derive PUROS + firma GATEADA por `sign(NAME)`
     // + audit (cierra sobre el mismo CapabilitySet → sandbox lo vacía, deny-by-default).
     synsema_stdlib::blockchain::register_blockchain_builtins(interp, caps.clone());
+    // spend/spend_total (FRAMEWORK F1): gasto declarado y auditado, gateado por
+    // `spend(unidad)` — deny-by-default SIEMPRE (jamás auto-granted), como sign/wallet.
+    synsema_stdlib::spend::register_spend_builtins(interp, caps.clone());
     // WebSocket cliente (Batch 13): transporte general gateado por `net(host)` (G21),
     // la MISMA capability y scope que http_*/fetch — sandbox lo deniega igual.
     synsema_stdlib::ws::register_ws_builtins(interp, caps.clone());
@@ -455,6 +458,14 @@ pub(crate) fn wire_common_with_state(
                 eprintln!(
                     "synsema: warning: bare `require sign` permits signing with ANY key; \
                      scope it with `require sign(\"KEY_NAME\")` (the name of the key's secret)"
+                );
+            }
+            // Ídem para `spend`: sin scope habilita gastar en CUALQUIER unidad
+            // (FRAMEWORK F1). Compat permitida, con aviso — espejo de sign/wallet.
+            if ty == CapabilityType::Spend && scope.is_none() {
+                eprintln!(
+                    "synsema: warning: bare `require spend` permits spending in ANY unit; \
+                     scope it with `require spend(\"USD\")` (the unit being spent)"
                 );
             }
             // Ídem para `wallet`: crear custodia (mnemónicos/HD/keystores) sin scope
@@ -555,6 +566,10 @@ pub(crate) fn wire_real_llm_provider(interp: &mut Interpreter) {
         Some(p) => p,
         None => return,
     };
+    // llm_usage(): tokens LLM acumulados del proceso (F-A). Se cablea junto al
+    // provider (con provider real siempre hay metering — MeteredProvider); offline el
+    // callback no se setea y el builtin del core devuelve 0.
+    interp.set_llm_usage_callback(Rc::new(crate::llm_providers::llm_tokens_total));
     // Callback de texto: arma `LLMRequest::new(op)` + `data["prompt"]` → `call().content`.
     let p_text = provider.clone();
     interp.set_llm_callback(Rc::new(move |op: &str, prompt: &str| {
@@ -1204,6 +1219,11 @@ pub fn run_capturing_decide(
 }
 
 /// Corre con un proveedor LLM mock (host-config) con respuestas predecibles.
+///
+/// NOTA (F1): este harness — como [`run_with_llm_steps`] — cablea el mock DIRECTO al
+/// callback, bypaseando `provider_from_config` → NO pasa por `MeteredProvider` y no
+/// se metra (`llm_usage()` no crece acá). Deliberado y aceptable: son atajos de test
+/// sin red; el metering cubre todos los caminos con provider real.
 pub fn run_with_llm(source: &str, filename: &str, responses: HashMap<String, String>) -> RunResult {
     let src = source.to_string();
     let fname = filename.to_string();

@@ -141,6 +141,23 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # Ollama http://localhost:11434/v1 · LM Studio · vLLM · llama.cpp:
 # SYNSEMA_LLM_BASE_URL=
 
+# Presupuesto DURO de tokens LLM del proceso (input+output, TODAS las ops). Al
+# llegar al tope las ops degradan al marker "[llm budget exceeded: …]" sin tocar
+# la red (nunca error). El consumo se consulta con llm_usage():
+# SYNSEMA_LLM_BUDGET=
+
+# ══ Techos del host — dinero y firmas (el programa NO puede subirlos) ══
+
+# Techo de gasto por unidad para spend(monto, unidad, motivo): pares unidad:monto
+# separados por comas; unidades libres (USD, EUR, ETH, creditos, …). Excederlo hace
+# fallar spend() con error catchable — NO sigas con el pago externo. Acumulador por
+# proceso; el ledger persistente queda en spend.log del dir de audit:
+# SYNSEMA_SPEND_CEILING=USD:500,ETH:0.1
+
+# Techo de CANTIDAD de firmas por clave (name del secret de la clave): pares
+# clave:n separados por comas. La firma n+1 falla catchable y queda auditada:
+# SYNSEMA_SIGN_CEILING=HOT_KEY:100
+
 # Espera máxima (segundos) de approve/confirm/ask bajo serve antes de DENEGAR
 # fail-closed (por-gate: `approve "..." within 2h` le gana a esta variable):
 # SYNSEMA_HUMAN_TIMEOUT=300
@@ -176,6 +193,7 @@ pub const INIT_FILES: [(&str, &str); 3] = [
 mod tests {
     use super::*;
     use synsema_runtime::llm_providers::{HUMAN_ENV_VARS, LLM_ENV_VARS};
+    use synsema_stdlib::spend::CEILING_ENV_VARS;
 
     // Anti-rot 1: el hello.syn del template PARSEA con el parser real del engine.
     #[test]
@@ -221,8 +239,12 @@ mod tests {
             // nicho: relocaliza el estado (.synsema/state) — no es config de proyecto típica
             "SYNSEMA_STATE_DIR",
         ];
-        let canonical: Vec<&str> =
-            LLM_ENV_VARS.iter().chain(HUMAN_ENV_VARS.iter()).copied().collect();
+        let canonical: Vec<&str> = LLM_ENV_VARS
+            .iter()
+            .chain(HUMAN_ENV_VARS.iter())
+            .chain(CEILING_ENV_VARS.iter())
+            .copied()
+            .collect();
         let mentioned = mentioned_vars(ENV_EXAMPLE);
         for var in &mentioned {
             assert!(

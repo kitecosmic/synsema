@@ -203,6 +203,16 @@ The only way to reveal a given secret is to declare its `require reveal("NAME")`
 **source** — auditable by reading the `require` lines, and a prompt injection can't add
 one (injection is data, not code; capabilities freeze at startup).
 
+The same audit directory (`$SYNSEMA_AUDIT_DIR` or `~/.synsema/audit`) holds one
+append-only log per gated family, all with the same guarantees (every attempt recorded,
+never the sensitive value, fail-loud on the granted path): `reveal.log`, `sign.log`
+(signatures; a `denied_by=ceiling` entry marks a `SYNSEMA_SIGN_CEILING` cut),
+`wallet.log` (custody creation) and `spend.log` (the spend ledger: canonical decimal
+amount, unit, quoted reason, `file:line`, program; a `denied_by=ceiling` entry marks a
+`SYNSEMA_SPEND_CEILING` cut). A framework that needs time-windowed spend policy reads
+`spend.log` with `file.read` over that directory — the runtime itself only keeps the
+monotonic per-process totals (`spend_total(unit)`).
+
 Prefer `bearer`/`hmac_sha256`/`verify_hmac`/`constant_time_eq` — they consume the
 secret without ever exposing it.
 

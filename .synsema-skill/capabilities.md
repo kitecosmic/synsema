@@ -4,15 +4,17 @@
 Nothing works without declaring capabilities.
 
 ## Capability types
-`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `db`, `serve`, `secret`, `reveal`, `sign`, `wallet`, `memory`
+`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `db`, `serve`, `secret`, `reveal`, `sign`, `wallet`, `spend`, `memory`
 
 `serve(PORT)` allows binding an HTTP server to that port — see [serve.md](serve.md).
 
 `env("NAME")`, `secret("NAME")` and `reveal("NAME")` gate config and secrets — see [secrets.md](secrets.md). All three are scoped by **name/label** (or a `NAME_*` prefix): `reveal("NAME")` can only reveal the secret whose name (`secret("NAME")`) or label (`as_secret(v,"label")`) matches, and every `reveal()` is written to a persistent audit log (**granted or denied**). Bare `require reveal` (coarse, any secret) still works for compat but **warns**. Separately, `as_secret(value, label?)` seals a **runtime** value as a `secret` and is **pure — no `require`** (see [secrets.md](secrets.md)).
 
-`sign("KEY_NAME")` gates blockchain signing (`secp256k1_sign`/`ed25519_sign`) — the most dangerous operation (it authorizes moving value), so it is **deny-by-default** (never ambient), scoped to the key secret's **name/label**, and writes a persistent audit entry (granted or denied) that never contains the key. Denied inside `sandbox`. Bare `require sign` (any key) warns. See [stdlib.md](stdlib.md) (Blockchain).
+`sign("KEY_NAME")` gates blockchain signing (`secp256k1_sign`/`ed25519_sign`/`schnorr_sign`) — the most dangerous operation (it authorizes moving value), so it is **deny-by-default** (never ambient), scoped to the key secret's **name/label**, and writes a persistent audit entry (granted or denied) that never contains the key. Denied inside `sandbox`. Bare `require sign` (any key) warns. The host can additionally cap **how many** signatures each key makes per process: `SYNSEMA_SIGN_CEILING="HOT_KEY:100"` — signature N+1 fails with a catchable error and a `denied_by=ceiling` audit entry; without the variable, behavior is unchanged. See [stdlib.md](stdlib.md) (Blockchain).
 
 `wallet("NAME")` gates creating **custody** — generating/deriving/importing key material (`mnemonic_generate`, `mnemonic_to_seed`, `hd_derive`, `algorand_mnemonic*`, `keystore_import`/`keystore_export`, `mnemonic_from_entropy`/`_to_entropy`). Distinct from `sign`: `wallet` creates keys, `sign` moves value — an agent can derive addresses without being able to spend. Deny-by-default (never ambient), scoped to the **source secret's name** (or the new secret's label when generating), audited in `wallet.log` (granted or denied, never the material), denied inside `sandbox`. Bare `require wallet` (any) warns. WebSocket (`ws_connect`) needs no new capability — it reuses `net(host)`.
+
+`spend("UNIT")` gates `spend(amount, unit, reason)` — the audited declaration of an **external spend** (the actual payment call is the program's own `fetch`/tool; `spend` writes the forensic ledger entry BEFORE it and enforces the host ceiling). Deny-by-default **always** (never auto-granted, even under `run`), scoped by **unit** (`"USD"`, `"ETH"`, any string; exact name or a trailing-`*` prefix like `secret`), audited fail-loud in `spend.log` (no written entry → no approved spend). Denied inside `sandbox`; a tool that doesn't declare it can't spend via `call_tool` even if the program can. Bare `require spend` (any unit) warns. The host caps totals per process with `SYNSEMA_SPEND_CEILING="USD:500,ETH:0.1"` — a breach is a **hard catchable error** (`try`/`recover`): after it, do NOT proceed with the payment call. See [builtins.md](builtins.md) and [secrets.md](secrets.md) (audit).
 
 `memory("NAME")` gates the **whole persistent-state family** — memory (`remember`/`recall`/`forget_memory`/`memory_summary`), owner rules (`add_rule`/`check_rules`/`get_rules`) and progress (`create_progress`/…/`resume_point`). The declared name **IS the identity**: state lives in `<program-dir>/.synsema/state/<NAME>.db`, keyed by the name, not the filename. Deny-by-default **even under `run`** (it writes files — never ambient); without the declaration the builtins fail with the exact line to add and **no file is created**. One name per program; bare `require memory` is a parse error (no name = no identity). Denied inside `sandbox`; `call_tool` intersects it; `--cap-set "memory=shop-*"` scopes by prefix. See [memory.md](memory.md).
 
@@ -33,6 +35,7 @@ require llm                         -- enable LLM ops (reason/decide/analyze/gen
 require serve(8080)                 -- bind an HTTP server to this port
 require sign("HOT_KEY")             -- enable signing with THAT key (deny-by-default + audited)
 require wallet                      -- enable creating custody (mnemonics/HD/keystore); scope with wallet("NAME")
+require spend("USD")                -- enable spend(amount, "USD", reason) (deny-by-default + audited ledger)
 require db("./store.db")            -- open a SQLite database (scope = file path)
 require db("postgres://localhost/appdb")  -- Postgres (scope = canonical URL)
 require db("mysql://localhost/appdb")     -- MySQL (scope = canonical URL)
