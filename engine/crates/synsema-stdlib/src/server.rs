@@ -35,7 +35,7 @@ use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 
 use synsema_core::bytesutil::b64_encode;
-use synsema_core::interpreter::Interpreter;
+use synsema_core::interpreter::{Control, Interpreter};
 use synsema_core::number::{py_float_str, Number};
 use synsema_core::types::{
     syn_bool, syn_int, syn_list, syn_map, syn_nothing, syn_text, ServerValue, SynValue,
@@ -549,6 +549,9 @@ pub fn syn_to_json(v: &SynValue) -> Json {
                 ("redirect", Json::Str(location.clone())),
                 ("status", Json::Int(*status)),
             ]),
+            // Serializado como data (fuera del contrato de respuesta): el valor
+            // envuelto — los headers son metadata del transporte, no data.
+            ServerValue::WithHeaders { inner, .. } => syn_to_json(inner),
         },
     }
 }
@@ -740,7 +743,10 @@ pub enum GiveOutcome {
 }
 
 pub type Handler = Arc<dyn Fn(&Ctx) -> GiveOutcome + Send + Sync>;
-pub type AuthHandler = Arc<dyn Fn(&str) -> Option<SynValue> + Send + Sync>;
+/// Hook de `auth with`: recibe el bearer token Y el contexto de la request (para
+/// tasks de 2 parámetros — sesiones por cookie; ítem C de la tanda web-auth). El
+/// motor decide por la aridad declarada del task si le pasa 1 o 2 argumentos.
+pub type AuthHandler = Arc<dyn Fn(&str, &Ctx) -> Option<SynValue> + Send + Sync>;
 
 /// El cliente del SSE se desconectó (escribir al socket falló).
 pub struct StreamGone;
@@ -1562,10 +1568,11 @@ impl ServeRuntime {
             user: None,
         };
 
-        // Auth.
+        // Auth. El `ctx` ya existe (user aún nothing) — el hook lo recibe entero
+        // para tasks de 2 parámetros (sesiones por cookie, ítem C).
         if host.routes[idx].requires_auth {
             let token = bearer_token(&headers);
-            let user = host.auth_handler.as_ref().and_then(|ah| ah(&token));
+            let user = host.auth_handler.as_ref().and_then(|ah| ah(&token, &ctx));
             match &user {
                 None | Some(SynValue::Nothing) => {
                     return Dispatched::Response {
@@ -1622,8 +1629,24 @@ impl ServeRuntime {
         }
 
         // Correr el handler.
+        let mut custom_headers: Vec<(String, String)> = Vec::new();
         let (status, body) = match (host.routes[idx].handler)(&ctx) {
             GiveOutcome::Give(v) => {
+                // with_header()/set_cookie(): desenvolver el wrapper — `inner` se
+                // procesa exactamente como cualquier give-value y los headers
+                // acumulados se emiten al final (después de los de rate-limit).
+                // Cubre TODOS los caminos de salida: respuesta directa, negociación
+                // de contenido, envelope JSON y redirect.
+                let v = match v {
+                    Some(SynValue::Server(s)) => match &*s {
+                        ServerValue::WithHeaders { inner, headers } => {
+                            custom_headers = headers.clone();
+                            Some((**inner).clone())
+                        }
+                        _ => Some(SynValue::Server(s)),
+                    },
+                    other => other,
+                };
                 let is_content = matches!(
                     v.as_ref(),
                     Some(SynValue::Server(s)) if matches!(&**s, ServerValue::Content(_))
@@ -1653,7 +1676,9 @@ impl ServeRuntime {
             ),
             GiveOutcome::Error(msg) => (500, self.server_error(&msg)),
         };
-        Dispatched::Response { status, body, headers: rate_headers }
+        let mut headers = rate_headers;
+        headers.append(&mut custom_headers);
+        Dispatched::Response { status, body, headers }
     }
 }
 
@@ -2240,6 +2265,276 @@ fn make_redirect_val(location: String, status: i64) -> SynValue {
     SynValue::Server(Rc::new(ServerValue::Redirect { location, status }))
 }
 
+// =========================================================
+// Headers custom + cookies (tanda web-auth, ítems A/B)
+// =========================================================
+
+/// ¿`c` es un token char RFC 7230 §3.2.6? (los válidos en un nombre de header y
+/// también en un nombre de cookie, RFC 6265).
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c)
+}
+
+/// Headers que NO se pueden fijar con `with_header` (los maneja el server o tienen
+/// builtin propio). Cada uno con el porqué, para el mensaje de error.
+fn forbidden_header_reason(lower: &str) -> Option<&'static str> {
+    match lower {
+        "content-length" | "transfer-encoding" => {
+            Some("the server computes message framing itself")
+        }
+        "connection" | "keep-alive" | "upgrade" | "te" | "trailer" => {
+            Some("hop-by-hop headers are managed by the server")
+        }
+        "content-type" => Some("set it with respond(body, content_type) instead"),
+        _ => None,
+    }
+}
+
+/// Valida nombre y valor de un header custom (fallar fuerte, G2). `who` es el
+/// builtin que reporta el error (`with_header` / `set_cookie`).
+fn validate_header(who: &str, name: &str, value: &str) -> Result<(), Control> {
+    if name.is_empty() {
+        return Err(serve_err(&format!("{}: the header name cannot be empty", who)));
+    }
+    if let Some(bad) = name.chars().find(|c| !is_token_char(*c)) {
+        return Err(serve_err(&format!(
+            "{}: invalid header name {:?} — {:?} is not allowed (RFC 7230 token chars only: A-Za-z0-9 and !#$%&'*+-.^_`|~)",
+            who, name, bad
+        )));
+    }
+    if let Some(reason) = forbidden_header_reason(&name.to_ascii_lowercase()) {
+        return Err(serve_err(&format!(
+            "{}: the header {:?} cannot be set here — {}",
+            who, name, reason
+        )));
+    }
+    // Header injection / response splitting: misma doctrina que redirect() —
+    // rechazo explícito, jamás sanear en silencio. El resto de los controles
+    // también se rechaza (la capa de emisión los descartaría en silencio).
+    if value.contains('\r') || value.contains('\n') {
+        return Err(serve_err(&format!(
+            "{}: the value of {:?} must not contain CR or LF (header injection)",
+            who, name
+        )));
+    }
+    if value.chars().any(|c| c.is_ascii_control()) {
+        return Err(serve_err(&format!(
+            "{}: the value of {:?} must not contain control characters",
+            who, name
+        )));
+    }
+    Ok(())
+}
+
+/// Envuelve (o acumula sobre) un `WithHeaders`. `with_header` repetido sobre el
+/// mismo valor ACUMULA en el mismo wrapper — no anida; el orden se preserva y los
+/// nombres repetidos son válidos (`Set-Cookie` múltiple).
+fn append_header_val(resp: &SynValue, name: String, value: String) -> SynValue {
+    if let SynValue::Server(s) = resp {
+        if let ServerValue::WithHeaders { inner, headers } = &**s {
+            let mut hs = headers.clone();
+            hs.push((name, value));
+            return SynValue::Server(Rc::new(ServerValue::WithHeaders {
+                inner: inner.clone(),
+                headers: hs,
+            }));
+        }
+    }
+    SynValue::Server(Rc::new(ServerValue::WithHeaders {
+        inner: Box::new(resp.clone()),
+        headers: vec![(name, value)],
+    }))
+}
+
+/// ¿`c` es un cookie-octet RFC 6265 §4.1.1? (excluye controles, espacio, `"`,
+/// coma, punto y coma y backslash).
+fn is_cookie_octet(c: char) -> bool {
+    matches!(c, '\x21' | '\x23'..='\x2b' | '\x2d'..='\x3a' | '\x3c'..='\x5b' | '\x5d'..='\x7e')
+}
+
+/// Opciones de `set_cookie`/`clear_cookie` ya validadas.
+struct CookieOpts {
+    max_age: Option<i64>,
+    path: String,
+    domain: Option<String>,
+    secure: bool,
+    http_only: bool,
+    same_site: String,
+}
+
+/// Parsea y valida el map de opts (fallar fuerte: clave desconocida o valor
+/// inválido → error con el fix). `allow_all=false` (clear_cookie) sólo acepta
+/// `path`/`domain` — el resto de atributos no participa del borrado.
+fn parse_cookie_opts(who: &str, opts: Option<&SynValue>, allow_all: bool) -> Result<CookieOpts, Control> {
+    let mut out = CookieOpts {
+        max_age: None,
+        path: "/".to_string(),
+        domain: None,
+        secure: true,
+        http_only: true,
+        same_site: "Lax".to_string(),
+    };
+    let map = match opts {
+        None | Some(SynValue::Nothing) => return Ok(out),
+        Some(SynValue::Map(m)) => m.borrow().clone(),
+        Some(other) => {
+            return Err(serve_err(&format!(
+                "{}: opts must be a map, got {}",
+                who,
+                other.type_name()
+            )))
+        }
+    };
+    for (k, v) in &map {
+        match (k.as_str(), allow_all) {
+            ("path", _) => out.path = v.to_string(),
+            ("domain", _) => out.domain = Some(v.to_string()),
+            ("max_age", true) => match v {
+                SynValue::Number(n) => match n.to_i64_trunc() {
+                    Some(ma) if ma >= 0 => out.max_age = Some(ma),
+                    _ => {
+                        return Err(serve_err(&format!(
+                            "{}: max_age must be an integer >= 0 (seconds), got {}",
+                            who, v
+                        )))
+                    }
+                },
+                _ => {
+                    return Err(serve_err(&format!(
+                        "{}: max_age must be an integer >= 0 (seconds), got {}",
+                        who,
+                        v.type_name()
+                    )))
+                }
+            },
+            ("secure", true) => match v {
+                SynValue::Bool(b) => out.secure = *b,
+                _ => {
+                    return Err(serve_err(&format!(
+                        "{}: secure must be a bool, got {}",
+                        who,
+                        v.type_name()
+                    )))
+                }
+            },
+            ("http_only", true) => match v {
+                SynValue::Bool(b) => out.http_only = *b,
+                _ => {
+                    return Err(serve_err(&format!(
+                        "{}: http_only must be a bool, got {}",
+                        who,
+                        v.type_name()
+                    )))
+                }
+            },
+            ("same_site", true) => {
+                let s = v.to_string();
+                match s.to_ascii_lowercase().as_str() {
+                    "strict" => out.same_site = "Strict".to_string(),
+                    "lax" => out.same_site = "Lax".to_string(),
+                    "none" => out.same_site = "None".to_string(),
+                    _ => {
+                        return Err(serve_err(&format!(
+                            "{}: same_site must be \"Strict\", \"Lax\" or \"None\", got {:?}",
+                            who, s
+                        )))
+                    }
+                }
+            }
+            (other, _) => {
+                let valid = if allow_all {
+                    "max_age, path, domain, secure, http_only, same_site"
+                } else {
+                    "path, domain"
+                };
+                return Err(serve_err(&format!(
+                    "{}: unknown option {:?} (valid options: {})",
+                    who, other, valid
+                )));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Valida nombre/valor de cookie y path/domain (RFC 6265, fallar fuerte).
+fn validate_cookie(who: &str, name: &str, value: &str, o: &CookieOpts) -> Result<(), Control> {
+    if name.is_empty() {
+        return Err(serve_err(&format!("{}: the cookie name cannot be empty", who)));
+    }
+    if let Some(bad) = name.chars().find(|c| !is_token_char(*c)) {
+        return Err(serve_err(&format!(
+            "{}: invalid cookie name {:?} — {:?} is not allowed (token chars only: no spaces, '=', ';' or ',')",
+            who, name, bad
+        )));
+    }
+    if let Some(bad) = value.chars().find(|c| !is_cookie_octet(*c)) {
+        return Err(serve_err(&format!(
+            "{}: invalid cookie value — {:?} is not allowed (RFC 6265 forbids spaces, quotes, ';', ',', '\\' and control chars). Encode it first: decode(bytes(v), \"base64url\")",
+            who, bad
+        )));
+    }
+    // SameSite=None exige Secure: el browser rechaza la cookie si no — mejor
+    // fallar acá con el porqué que debuggear cookies que "no llegan".
+    if o.same_site == "None" && !o.secure {
+        return Err(serve_err(&format!(
+            "{}: same_site \"None\" requires secure: true (browsers reject SameSite=None cookies without Secure)",
+            who
+        )));
+    }
+    // El Path/Domain viajan dentro de un header: mismas reglas anti-injection.
+    for (attr, val) in [("path", &o.path), ("domain", o.domain.as_ref().unwrap_or(&String::new()))] {
+        if val.chars().any(|c| c.is_ascii_control() || c == ';') {
+            return Err(serve_err(&format!(
+                "{}: the {} option must not contain ';' or control characters",
+                who, attr
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Arma el string `Set-Cookie` (tras `validate_cookie`).
+fn build_set_cookie(who: &str, name: &str, value: &str, o: &CookieOpts) -> Result<String, Control> {
+    validate_cookie(who, name, value, o)?;
+    let mut s = format!("{}={}", name, value);
+    if let Some(ma) = o.max_age {
+        s.push_str(&format!("; Max-Age={}", ma));
+    }
+    s.push_str(&format!("; Path={}", o.path));
+    if let Some(d) = &o.domain {
+        s.push_str(&format!("; Domain={}", d));
+    }
+    if o.secure {
+        s.push_str("; Secure");
+    }
+    if o.http_only {
+        s.push_str("; HttpOnly");
+    }
+    s.push_str(&format!("; SameSite={}", o.same_site));
+    Ok(s)
+}
+
+/// Parsea el header `Cookie` entrante (RFC 6265 §5.4) → pares (nombre, valor) SIN
+/// decodificar nada: split por `;`, trim, el primer `=` separa nombre/valor.
+/// Nombre duplicado: gana la PRIMERA aparición (orden RFC). Sin header → vacío.
+/// Segmentos malformados (sin `=` o sin nombre) se saltean — el lado de lectura
+/// es tolerante; el de escritura (set_cookie) es el estricto.
+pub fn parse_cookies(headers: &[(String, String)]) -> Vec<(String, String)> {
+    let raw = header_value(headers, "cookie");
+    let mut out: Vec<(String, String)> = Vec::new();
+    for part in raw.split(';') {
+        let part = part.trim();
+        let Some((name, value)) = part.split_once('=') else { continue };
+        let name = name.trim();
+        if name.is_empty() || out.iter().any(|(n, _)| n == name) {
+            continue;
+        }
+        out.push((name.to_string(), value.trim().to_string()));
+    }
+    out
+}
+
 fn redirect_err(msg: &str) -> synsema_core::interpreter::Control {
     synsema_core::interpreter::Control::Error(synsema_core::interpreter::RuntimeError::new(
         msg.to_string(),
@@ -2421,6 +2716,68 @@ pub fn register_serve_builtins(interp: &Interpreter) {
                 _ => 200,
             };
             Ok(make_rawbytes_val(body, &ct, status))
+        }),
+    );
+    // with_header(resp, name, value) — header de respuesta custom sobre CUALQUIER
+    // valor que un handler pueda devolver (tanda web-auth, ítem A). Acumula sobre
+    // el mismo wrapper si el valor ya viene envuelto; los repetidos se emiten como
+    // líneas separadas (`Set-Cookie` múltiple).
+    interp.register_builtin(
+        "with_header",
+        3,
+        Rc::new(|_i, a, _l| {
+            let resp = a
+                .first()
+                .ok_or_else(|| serve_err("with_header(resp, name, value) requires a response"))?;
+            let name = text_arg(a.get(1));
+            let value = text_arg(a.get(2));
+            validate_header("with_header", &name, &value)?;
+            Ok(append_header_val(resp, name, value))
+        }),
+    );
+    // set_cookie(resp, name, value, opts?) — emite `Set-Cookie` con defaults
+    // seguros: Path=/; HttpOnly; Secure; SameSite=Lax (ítem B). opts: max_age
+    // (segundos), path, domain, secure (bool), http_only (bool), same_site
+    // ("Strict"|"Lax"|"None").
+    interp.register_builtin(
+        "set_cookie",
+        -1,
+        Rc::new(|_i, a, _l| {
+            if !(3..=4).contains(&a.len()) {
+                return Err(serve_err(
+                    "set_cookie(resp, name, value, opts?) takes 3 or 4 arguments",
+                ));
+            }
+            let name = text_arg(a.get(1));
+            let value = text_arg(a.get(2));
+            let opts = parse_cookie_opts("set_cookie", a.get(3), true)?;
+            let cookie = build_set_cookie("set_cookie", &name, &value, &opts)?;
+            Ok(append_header_val(&a[0], "Set-Cookie".to_string(), cookie))
+        }),
+    );
+    // clear_cookie(resp, name, opts?) — borra la cookie: Max-Age=0 + Expires en
+    // el pasado. `path`/`domain` deben coincidir con los del set para que el
+    // browser la borre (por eso son las únicas opts válidas acá).
+    interp.register_builtin(
+        "clear_cookie",
+        -1,
+        Rc::new(|_i, a, _l| {
+            if !(2..=3).contains(&a.len()) {
+                return Err(serve_err("clear_cookie(resp, name, opts?) takes 2 or 3 arguments"));
+            }
+            let name = text_arg(a.get(1));
+            let opts = parse_cookie_opts("clear_cookie", a.get(2), false)?;
+            validate_cookie("clear_cookie", &name, "", &opts)?;
+            // Expiración doble: Max-Age=0 (browsers modernos) + Expires en la
+            // época (los viejos). Path/Domain deben coincidir con los del set.
+            let mut cookie = format!(
+                "{}=; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Path={}",
+                name, opts.path
+            );
+            if let Some(d) = &opts.domain {
+                cookie.push_str(&format!("; Domain={}", d));
+            }
+            Ok(append_header_val(&a[0], "Set-Cookie".to_string(), cookie))
         }),
     );
     // Vocabulario de contenido semántico.
@@ -3581,5 +3938,163 @@ mod tests {
 
         // (5) path inexistente → None.
         assert!(rt.default_host.serve_static_full("/nope.html", &[]).is_none());
+    }
+
+    // ---- Tanda web-auth, ítems A/B: with_header + cookies ----
+
+    #[test]
+    fn validate_header_rules() {
+        assert!(validate_header("with_header", "X-Request-Id", "abc").is_ok());
+        assert!(validate_header("with_header", "Cache-Control", "no-store").is_ok());
+        // Nombre vacío, char inválido, prohibidos.
+        assert!(validate_header("with_header", "", "v").is_err());
+        assert!(validate_header("with_header", "X Header", "v").is_err(), "espacio");
+        assert!(validate_header("with_header", "X:Y", "v").is_err());
+        for banned in [
+            "Content-Length",
+            "transfer-encoding",
+            "Connection",
+            "keep-alive",
+            "Upgrade",
+            "TE",
+            "Trailer",
+            "Content-Type",
+        ] {
+            assert!(validate_header("with_header", banned, "v").is_err(), "{}", banned);
+        }
+        // CR/LF y controles en el valor → header injection, error.
+        assert!(validate_header("with_header", "X-A", "a\r\nSet-Cookie: pwn=1").is_err());
+        assert!(validate_header("with_header", "X-A", "a\nb").is_err());
+        assert!(validate_header("with_header", "X-A", "a\x01b").is_err());
+    }
+
+    #[test]
+    fn with_header_wraps_and_accumulates() {
+        let inner = make_raw_val("hola".to_string(), "text/plain", 200);
+        let w1 = append_header_val(&inner, "X-A".to_string(), "1".to_string());
+        let w2 = append_header_val(&w1, "X-B".to_string(), "2".to_string());
+        // Acumula en el MISMO wrapper (no anida) y preserva el orden.
+        match &w2 {
+            SynValue::Server(s) => match &**s {
+                ServerValue::WithHeaders { inner, headers } => {
+                    assert_eq!(
+                        headers,
+                        &vec![
+                            ("X-A".to_string(), "1".to_string()),
+                            ("X-B".to_string(), "2".to_string())
+                        ]
+                    );
+                    assert!(
+                        matches!(&**inner, SynValue::Server(i) if matches!(&**i, ServerValue::Raw { .. })),
+                        "inner es el Raw original, sin anidar"
+                    );
+                }
+                _ => panic!("expected WithHeaders"),
+            },
+            _ => panic!("expected Server value"),
+        }
+    }
+
+    #[test]
+    fn set_cookie_defaults_and_options() {
+        let o = parse_cookie_opts("set_cookie", None, true).ok().unwrap();
+        let c = build_set_cookie("set_cookie", "sid", "abc123", &o).ok().unwrap();
+        // Defaults seguros: Path=/; Secure; HttpOnly; SameSite=Lax.
+        assert_eq!(c, "sid=abc123; Path=/; Secure; HttpOnly; SameSite=Lax");
+        // max_age + overrides.
+        let mut m = IndexMap::new();
+        m.insert("max_age".to_string(), syn_int(86400));
+        m.insert("path".to_string(), syn_text("/app"));
+        m.insert("same_site".to_string(), syn_text("Strict"));
+        m.insert("http_only".to_string(), syn_bool(false));
+        let o = parse_cookie_opts("set_cookie", Some(&syn_map(m)), true).ok().unwrap();
+        let c = build_set_cookie("set_cookie", "sid", "v", &o).ok().unwrap();
+        assert_eq!(c, "sid=v; Max-Age=86400; Path=/app; Secure; SameSite=Strict");
+    }
+
+    #[test]
+    fn set_cookie_fail_strong() {
+        let o = parse_cookie_opts("set_cookie", None, true).ok().unwrap();
+        // Nombre/valor inválidos (RFC 6265): el error sugiere base64url.
+        assert!(build_set_cookie("set_cookie", "s id", "v", &o).is_err());
+        assert!(build_set_cookie("set_cookie", "", "v", &o).is_err());
+        match build_set_cookie("set_cookie", "sid", "a b", &o) {
+            Err(Control::Error(e)) => assert!(
+                e.to_string().contains("base64url"),
+                "el error sugiere el fix: {}",
+                e
+            ),
+            _ => panic!("valor con espacio debe fallar"),
+        }
+        assert!(build_set_cookie("set_cookie", "sid", "a;b", &o).is_err());
+        assert!(build_set_cookie("set_cookie", "sid", "a\"b", &o).is_err());
+        // same_site None sin Secure → error (el browser la rechazaría).
+        let mut m = IndexMap::new();
+        m.insert("same_site".to_string(), syn_text("None"));
+        m.insert("secure".to_string(), syn_bool(false));
+        let o = parse_cookie_opts("set_cookie", Some(&syn_map(m)), true).ok().unwrap();
+        assert!(build_set_cookie("set_cookie", "sid", "v", &o).is_err());
+        // …con Secure sí vale.
+        let mut m = IndexMap::new();
+        m.insert("same_site".to_string(), syn_text("None"));
+        let o = parse_cookie_opts("set_cookie", Some(&syn_map(m)), true).ok().unwrap();
+        let c = build_set_cookie("set_cookie", "sid", "v", &o).ok().unwrap();
+        assert!(c.ends_with("SameSite=None") && c.contains("Secure"));
+        // Opt desconocida → error con las válidas.
+        let mut m = IndexMap::new();
+        m.insert("httponly".to_string(), syn_bool(true));
+        assert!(parse_cookie_opts("set_cookie", Some(&syn_map(m)), true).is_err());
+        // max_age negativo o no-entero → error.
+        let mut m = IndexMap::new();
+        m.insert("max_age".to_string(), syn_int(-1));
+        assert!(parse_cookie_opts("set_cookie", Some(&syn_map(m)), true).is_err());
+        // clear_cookie sólo acepta path/domain.
+        let mut m = IndexMap::new();
+        m.insert("max_age".to_string(), syn_int(5));
+        assert!(parse_cookie_opts("clear_cookie", Some(&syn_map(m)), false).is_err());
+    }
+
+    #[test]
+    fn parse_cookies_rfc6265() {
+        let h = |v: &str| vec![("Cookie".to_string(), v.to_string())];
+        // split por `;`, trim, primer `=` separa, SIN decodificar.
+        assert_eq!(
+            parse_cookies(&h("sid=abc; theme=dark")),
+            vec![
+                ("sid".to_string(), "abc".to_string()),
+                ("theme".to_string(), "dark".to_string())
+            ]
+        );
+        // El valor conserva `=` internos (primer `=` separa).
+        assert_eq!(
+            parse_cookies(&h("tok=a=b=c")),
+            vec![("tok".to_string(), "a=b=c".to_string())]
+        );
+        // Duplicado: gana la PRIMERA aparición (orden RFC).
+        assert_eq!(
+            parse_cookies(&h("sid=first; sid=second")),
+            vec![("sid".to_string(), "first".to_string())]
+        );
+        // Sin header → vacío; segmentos malformados se saltean.
+        assert_eq!(parse_cookies(&[]), Vec::<(String, String)>::new());
+        assert_eq!(
+            parse_cookies(&h("junk; =nada; sid=ok")),
+            vec![("sid".to_string(), "ok".to_string())]
+        );
+        // No se URL-decodea (los %XX quedan tal cual).
+        assert_eq!(
+            parse_cookies(&h("v=a%20b")),
+            vec![("v".to_string(), "a%20b".to_string())]
+        );
+    }
+
+    #[test]
+    fn build_response_unwraps_nothing_for_with_headers() {
+        // El dispatch pela el wrapper ANTES de build_response; este test fija que
+        // el valor envuelto (inner) responde idéntico a como respondería solo.
+        let inner = make_raw_val("hola".to_string(), "text/plain", 201);
+        let q = IndexMap::new();
+        let (st_direct, _) = build_response(Some(&inner), &q).unwrap();
+        assert_eq!(st_direct, 201);
     }
 }

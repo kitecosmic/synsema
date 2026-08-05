@@ -87,6 +87,13 @@ pub enum ServerValue {
     Redirect { location: String, status: i64 },
     /// `paged()` — paginación lazy vía SQL. (_PAGED)
     Paged(Rc<PagedFetch>),
+    /// `with_header()`/`set_cookie()` — headers de respuesta custom sobre CUALQUIER
+    /// valor que un handler pueda devolver (`inner`: otro ServerValue o un valor
+    /// plano que se serializa a JSON). `with_header` sobre un valor ya envuelto
+    /// ACUMULA sobre el mismo wrapper (no anida). El orden de inserción se preserva
+    /// y los nombres repetidos son válidos (`Set-Cookie` múltiple los requiere:
+    /// cada par se emite como línea propia). (Tanda web-auth, ítem A)
+    WithHeaders { inner: Box<SynValue>, headers: Vec<(String, String)> },
 }
 
 impl ServerValue {
@@ -114,6 +121,13 @@ impl ServerValue {
             ServerValue::Redirect { location, status } => match key {
                 "location" => Some(syn_text(location.as_str())),
                 "status" => Some(syn_int(*status)),
+                _ => None,
+            },
+            // Acceso transparente al valor envuelto (los headers son metadata del
+            // transporte, no un campo del valor).
+            ServerValue::WithHeaders { inner, .. } => match &**inner {
+                SynValue::Server(s) => s.get_field(key),
+                SynValue::Map(m) => m.borrow().get(key).cloned(),
                 _ => None,
             },
             ServerValue::Content(_) | ServerValue::Paged(_) => None,
@@ -240,6 +254,10 @@ impl SynValue {
                     ServerValue::Redirect { location: l1, status: s1 },
                     ServerValue::Redirect { location: l2, status: s2 },
                 ) => l1 == l2 && s1 == s2,
+                (
+                    ServerValue::WithHeaders { inner: i1, headers: h1 },
+                    ServerValue::WithHeaders { inner: i2, headers: h2 },
+                ) => h1 == h2 && i1.syn_equals(i2),
                 _ => false,
             },
             // `bytes` sólo es igual a `bytes` (byte-a-byte). Nunca igual a text ni a
@@ -305,6 +323,11 @@ impl fmt::Display for SynValue {
                 ServerValue::Paged(_) => write!(f, "{{paged}}"),
                 ServerValue::Redirect { location, status } => {
                     write!(f, "{{redirect: {}, status: {}}}", location, status)
+                }
+                ServerValue::WithHeaders { inner, headers } => {
+                    let hs: Vec<String> =
+                        headers.iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
+                    write!(f, "{{value: {}, headers: {{{}}}}}", inner, hs.join(", "))
                 }
             },
             // Redacción de fondo: `secret(NAME)`, nunca el plaintext. Esto sella por
@@ -483,6 +506,9 @@ pub fn to_send(v: &SynValue) -> SendValue {
             }
             ServerValue::Content(inner) => to_send(inner),
             ServerValue::Paged(_) => SendValue::Text("{paged}".to_string()),
+            // El blackboard snapshotea el valor envuelto; los headers son metadata
+            // del transporte HTTP y no cruzan.
+            ServerValue::WithHeaders { inner, .. } => to_send(inner),
             ServerValue::Redirect { location, status } => SendValue::Map(vec![
                 ("redirect".to_string(), SendValue::Text(location.clone())),
                 ("status".to_string(), SendValue::Number(Number::Int(*status))),

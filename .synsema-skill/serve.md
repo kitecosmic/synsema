@@ -90,10 +90,11 @@ names — `let route be "/x"`, `let static be 1`, `let private be 1` and
 Inside a handler you have:
 
 ```
-request          -- map with .method .path .body .json .headers .user .body_file
+request          -- map with .method .path .body .json .headers .cookies .user .body_file
 json of request  -- parsed JSON body (a map), or nothing
 body of request  -- raw body text (in-memory bodies; "" when spilled to disk)
 headers of request
+cookies of request -- incoming cookies as a map (RFC 6265, undecoded; no header → empty map)
 user of request  -- set after auth (see below)
 ip of request    -- the client's real peer IP (used for rate limiting)
 body_file of request  -- temp file path when a large body spilled to disk, else nothing
@@ -582,6 +583,58 @@ task check_token(token)
 
 A route that uses `requires auth` must have an `auth with <task>` on the `serve`
 block — otherwise it's a parse error (`synsema check` catches it).
+
+### Cookie sessions — the auth task can take `(token, request)`
+
+Declare the auth task with **2 parameters** and it also receives the full request
+map (same shape the route handlers see, `user` still nothing) — that unlocks
+cookie sessions, since `request.cookies` is available before the route runs. A
+1-parameter task behaves exactly as before (bearer only). Any other arity is an
+error when the serve is built.
+
+```
+task check_session(token, request)
+    let sid be request.cookies.sid
+    when sid == nothing
+        give nothing                    -- nothing → 401, same contract
+    give redis_get(db, "sess:" + sid)   -- the value lands in request.user
+```
+
+### Response headers & cookies — `with_header`, `set_cookie`, `clear_cookie`
+
+Any value a handler can `give` can be wrapped with extra response headers.
+Repeated `with_header`/`set_cookie` calls accumulate (order preserved; repeated
+names emit separate lines — that's what multiple `Set-Cookie` needs).
+
+```
+give with_header(respond("hi", "text/plain"), "X-Request-Id", rid)
+give with_header(ok(data), "Cache-Control", "no-store")
+give set_cookie(redirect("/panel"), "sid", session_id, {"max_age": 86400})
+give clear_cookie(redirect("/"), "sid")          -- Max-Age=0 + epoch Expires
+let sid be request.cookies.sid                    -- incoming cookies (map, never nothing)
+```
+
+- `set_cookie(resp, name, value, opts?)` defaults are the safe ones: `Path=/;
+  Secure; HttpOnly; SameSite=Lax`. Opts: `max_age` (seconds), `path`, `domain`,
+  `secure`, `http_only` (bools), `same_site` (`"Strict"|"Lax"|"None"` — `None`
+  requires `secure: true`, the browser rejects it otherwise).
+- `clear_cookie(resp, name, opts?)` — `path`/`domain` must match the ones used
+  at set time or the browser won't delete it.
+- Everything **fails hard** (same doctrine as `redirect()`): CR/LF or control
+  chars in a value, invalid RFC 6265 cookie chars (the error suggests
+  `decode(bytes(v), "base64url")`), and framing/hop-by-hop headers
+  (`Content-Length`, `Transfer-Encoding`, `Connection`, … and `Content-Type` —
+  set that with `respond(body, ct)`).
+- Streaming (SSE) routes do not accept `with_header` yet — clear error, the
+  response head is already on the wire.
+- CSRF for cookie-based POSTs is userland: issue `token()` per session, embed it
+  in the form, compare with `constant_time_eq` in the handler.
+
+Full login flow (password → session cookie → protected route → logout): hash at
+signup with `password_hash`, verify at login with `password_verify`, create
+`sid = token()` (declare `require random` — same gate as `random()`), store the
+session (redis/sql/state_set), respond with `set_cookie(...)`; the 2-param auth
+task above resolves it on every request.
 
 ## Input validation
 

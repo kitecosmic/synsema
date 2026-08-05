@@ -134,6 +134,22 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `give <list>` with `LIMIT` in your SQL | `total` becomes wrong (it counts only what you returned) | Return the full list, or use `paged()` |
 | Long-lived SSE streams with default `max_streams` | Each holds a thread; you hit `503` under load | Size `max_streams` to your thread budget; keep streams short |
 
+### Web auth (cookies, passwords, JWT, TOTP)
+
+| What you expect | What actually happens | Why / workaround |
+|---|---|---|
+| `sha256(pw)` is fine for passwords | Fast hashes are crackable offline at GPU speed | ALWAYS `password_hash`/`password_verify` (argon2id, salted, tuned). `sha256`/`hmac_sha256` are for integrity, never for passwords |
+| `set_cookie(..., {"same_site": "None"})` just works | Error: `SameSite=None` requires `secure: true` | Browsers reject SameSite=None cookies without `Secure` — the builtin fails at write time instead of you debugging a cookie that "never arrives" |
+| Cookies work on `http://localhost` despite the `Secure` default | They DO — localhost is a secure context in modern browsers | If something odd remains, `{"secure": false}` in dev ONLY; never ship it |
+| `totp(secret("TOTP_B32"))` with a base32 secret | The text is taken as raw UTF-8 → wrong codes | The classic TOTP confusion: decode first — `totp(bytes(seed_b32, "base32"))` |
+| Any value can go in a cookie | RFC 6265 forbids spaces, quotes, `;`, `,`, `\` | Encode it: `set_cookie(resp, "v", decode(bytes(v), "base64url"))` (the error message says so) |
+| `cors "*"` + cookie sessions | The CORS spec forbids `*` for credentialed requests | Use a specific origin: `cors "https://app.example.com"` |
+| `jwt_verify` tells you WHY a token failed | It returns `nothing` for every failure (signature/exp/malformed) | By design: an endpoint must not be distinguishable by rejection cause. Log the attempt server-side if you need forensics |
+| `token(8)` for a short session id | Error: minimum is 16 bytes | Fewer than 16 bytes of entropy is guessable; the default 32 is right for sessions |
+| `token()`/`random_bytes()` work without a `require` | Capability error: `random` not granted | Randomness is deny-by-default, same gate as `random()` — add `require random`. The pure transforms (`password_hash`/`jwt_*`/`totp*`) need nothing |
+| `totp_verify(seed, 094287)` (code as number) | Error: the code must be text | Leading zeros matter — quote the code |
+| Store the PAT/API key as-is in the DB | A DB leak leaks every live credential | Store `sha256(token)`, compare hashes with `constant_time_eq` |
+
 ## Language features — bytes, complex, arrays, match, params, tests
 
 | What you expect | What actually happens | Why / workaround |

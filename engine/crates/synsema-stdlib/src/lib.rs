@@ -21,4 +21,5 @@ pub mod raster;
 pub mod secrets;
 pub mod server;
 pub mod spend;
+pub mod webauth;
 pub mod ws;

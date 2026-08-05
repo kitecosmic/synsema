@@ -197,6 +197,11 @@ bip39 = { version = "2", default-features = false, features = ["std", "unicode-n
 # el hash de direcciones de Bitcoin) que faltaba en el árbol. RustCrypto puro-Rust,
 # misma familia que hmac/sha2/pbkdf2 ya presentes; CERO `*-sys`/C (G8).
 ripemd = { version = "0.1", default-features = false }
+# Tanda web-auth: password hashing argon2id (password_hash/password_verify) con
+# parámetros OWASP. RustCrypto puro-Rust (misma familia que hmac/sha2/pbkdf2/scrypt
+# ya presentes), sin `*-sys`/C → preserva el binario único estático. La ÚNICA dep
+# nueva de la tanda (mismo criterio con que Batch 16 agregó `ripemd`).
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 scrypt = { version = "0.11", default-features = false }
 aes = "0.8"

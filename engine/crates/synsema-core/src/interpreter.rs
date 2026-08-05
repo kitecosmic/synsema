@@ -2774,6 +2774,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// - `bytes(text)` / `bytes(text, "utf8")` → UTF-8 del texto.
     /// - `bytes(text, "hex")` → decodifica hex (error si longitud impar o char no-hex).
     /// - `bytes(text, "base64")` → decodifica base64 RFC-4648 con padding (error si inválido).
+    /// - `bytes(text, "base64url")` → decodifica base64url (URL-safe `-_`, padding opcional).
     /// - `bytes(text, "base58")` → decodifica base58 (Bitcoin/Solana; error si char inválido).
     /// - `bytes(text, "base32")` → decodifica base32 RFC-4648 (Algorand; error si inválido).
     /// - `bytes(list)` → de una lista de enteros (error si algún elemento no es int 0..=255).
@@ -2794,12 +2795,15 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     "utf8" => Ok(syn_bytes(s.as_bytes().to_vec())),
                     "hex" => crate::bytesutil::hex_decode(s).map(syn_bytes).map_err(err),
                     "base64" => crate::bytesutil::b64_decode(s).map(syn_bytes).map_err(err),
+                    // Web auth: base64url (RFC 4648 §5, URL-safe `-_`); acepta con y
+                    // sin padding — la forma de JWT/tokens.
+                    "base64url" => crate::bytesutil::b64url_decode(s).map(syn_bytes).map_err(err),
                     // Batch 11 (blockchain): base58 de Bitcoin/Solana; base32 RFC 4648
                     // (mayúsculas sin padding — convención Algorand).
                     "base58" => crate::bytesutil::base58_decode(s).map(syn_bytes).map_err(err),
                     "base32" => crate::bytesutil::base32_decode(s).map(syn_bytes).map_err(err),
                     other => Err(err(format!(
-                        "unsupported encoding {:?} for bytes(); use one of: utf8, hex, base64, base58, base32",
+                        "unsupported encoding {:?} for bytes(); use one of: utf8, hex, base64, base64url, base58, base32",
                         other
                     ))),
                 }
@@ -2833,6 +2837,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// - `decode(bytes, "utf8_lossy")` → texto con `U+FFFD` en inválidos.
     /// - `decode(bytes, "hex")` → texto hex en minúsculas.
     /// - `decode(bytes, "base64")` → texto base64 con padding.
+    /// - `decode(bytes, "base64url")` → texto base64url (URL-safe `-_`), SIN padding.
     /// - `decode(bytes, "base58")` → texto base58 (Bitcoin/Solana).
     /// - `decode(bytes, "base32")` → texto base32 RFC-4648 mayúsculas sin padding (Algorand).
     /// - `decode(secret)` → ERROR (G6; cae al error de tipo: un secret no es bytes).
@@ -2856,12 +2861,14 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             "utf8_lossy" => Ok(syn_text(String::from_utf8_lossy(b).into_owned())),
             "hex" => Ok(syn_text(crate::bytesutil::hex_encode(b))),
             "base64" => Ok(syn_text(crate::bytesutil::b64_encode(b))),
+            // Web auth: base64url (RFC 4648 §5) SIN padding — la forma de JWT/tokens.
+            "base64url" => Ok(syn_text(crate::bytesutil::b64url_encode(b))),
             // Batch 11 (blockchain): base58 (Solana/Bitcoin) y base32 RFC 4648
             // mayúsculas sin padding (Algorand).
             "base58" => Ok(syn_text(crate::bytesutil::base58_encode(b))),
             "base32" => Ok(syn_text(crate::bytesutil::base32_encode(b))),
             other => Err(err(format!(
-                "unsupported encoding {:?} for decode(); use one of: utf8, utf8_lossy, hex, base64, base58, base32",
+                "unsupported encoding {:?} for decode(); use one of: utf8, utf8_lossy, hex, base64, base64url, base58, base32",
                 other
             ))),
         }

@@ -55,8 +55,8 @@ not errors and pass through `try/recover` untouched.
 - ⚠️ A pathological pattern can be slow (ReDoS) — don't feed untrusted input as a *pattern* without care.
 
 ## Bytes / binary (pure — no capability)
-- `bytes(text)` → utf8 bytes; `bytes(text, "hex"|"base64"|"base58"|"base32")` → decode; `bytes([72,73])` → from ints 0–255; `bytes(bytes)` → identity. `bytes(secret)` → **error** (plaintext never materializes). base58 = Bitcoin/Solana; base32 = RFC 4648 (Algorand). `bytes + bytes` = concat.
-- `decode(b)` / `decode(b, "utf8")` → text (UTF-8 **strict**, errors on invalid); `decode(b, "utf8_lossy")` → with `U+FFFD`; `decode(b, "hex"|"base64"|"base58"|"base32")` → text. (so `bytes(...)` ↔ `decode(...)` are inverses)
+- `bytes(text)` → utf8 bytes; `bytes(text, "hex"|"base64"|"base64url"|"base58"|"base32")` → decode; `bytes([72,73])` → from ints 0–255; `bytes(bytes)` → identity. `bytes(secret)` → **error** (plaintext never materializes). base58 = Bitcoin/Solana; base32 = RFC 4648 (Algorand); base64url = URL-safe `-_` (JWT/tokens; accepts input with or without `=` padding). `bytes + bytes` = concat.
+- `decode(b)` / `decode(b, "utf8")` → text (UTF-8 **strict**, errors on invalid); `decode(b, "utf8_lossy")` → with `U+FFFD`; `decode(b, "hex"|"base64"|"base64url"|"base58"|"base32")` → text (base64url output is unpadded). (so `bytes(...)` ↔ `decode(...)` are inverses)
 - `is_bytes(x)` → bool. `b[i]` → int 0–255; `bytes + bytes` → concatenation; `length`/`slice`/`contains` work on bytes.
 - `sha256(x)` / `sha512(x)` → **bytes** (raw digest). x: text → hashes utf8; bytes → raw. Hex via `decode(sha256(x), "hex")`. `sha256(secret)` → error.
 - `keccak256(x)` / `sha512_256(x)` → **bytes(32)**. ⚠️ `keccak256` is PRE-NIST Keccak (Ethereum), NOT SHA3-256 (`keccak256("")`=`c5d24601…`). Same rules as `sha256` (secret → error).
@@ -151,6 +151,31 @@ Resolution for `env`/`secret`: process environ → `.env` → default → else e
 - `hmac_sha256(data, secret)` → hex MAC (not secret)
 - `verify_hmac(data, signature, secret, algo?)` → bool, constant-time. `algo` = `"sha256"` (default) or `"sha512"`; decodes hex/base64 signatures (Stripe/GitHub/Shopify). SHA-1 is rejected.
 - `constant_time_eq(a, b)` → bool, constant-time; accepts a `secret` on either side
+
+## Web auth (passwords, JWT, TOTP, CSPRNG)
+`random_bytes`/`token` **require `require random`** — the same deny-by-default gate as
+`random()`/`random_int()` (their purpose IS producing randomness; denied in `sandbox`).
+The rest are pure transforms — no capability. Every key/password argument accepts a
+sealed `secret`, text (raw UTF-8 bytes) or `bytes`; anything else is a clear error.
+- `random_bytes(n)` → n bytes from the **OS CSPRNG** (1–65536). Never use `random()` for anything security-related.
+- `token(n?)` → unguessable base64url text of n random bytes (16–256, default 32 → 43 chars). Session ids, CSRF tokens, API keys, device codes.
+- `password_hash(pw)` → PHC text (`$argon2id$v=19$m=19456,t=2,p=1$…`, OWASP params, random salt). Store this string as-is.
+- `password_verify(pw, phc)` → bool (constant-time). Malformed/unknown PHC → **error**, not `false` ("wrong password" and "corrupt hash in DB" must never be confused).
+- `jwt_sign(claims, key, opts?)` → HS256 token. Sets `iat` (your explicit claim wins); `opts.expires_in` (seconds) sets `exp` (passing both an `exp` claim and `expires_in` is an error).
+- `jwt_verify(token, key, opts?)` → claims map or `nothing` on ANY failure (bad signature, expired `exp`, future `nbf`, malformed, `alg` ≠ HS256 — the verifier pins the algorithm; `"none"`/`RS256` tokens are rejected). `opts.leeway` seconds (default 60). RS256/ES256 (third-party OIDC) is not supported yet.
+- `totp(key, opts?)` → code text (defaults: sha1, 6 digits, 30 s — the Google Authenticator profile). Opts: `algo` (`"sha1"|"sha256"`), `digits` (6–8), `period`, `at` (unix ts, for deterministic tests).
+- `totp_verify(key, code, opts?)` → bool (constant-time), `opts.window` = ±N periods (default 1). The code must be **text** (leading zeros matter).
+
+```syn
+require random                                      -- gates token()/random_bytes only
+
+let phc be password_hash(pw)                        -- at signup
+when password_verify(pw, stored_phc)                -- at login
+    let sid be token()
+let seed be random_bytes(20)                        -- TOTP enrolment
+let uri be "otpauth://totp/App:user?secret=" + decode(seed, "base32") + "&issuer=App"
+when totp_verify(seed, submitted_code)              -- 2FA check
+```
 
 ## Spend ledger (see [capabilities.md](capabilities.md))
 - `spend(amount, unit, reason)` → number (the unit's accumulated total after this spend) — **requires `spend("UNIT")`** (deny-by-default ALWAYS, never auto-granted; denied in `sandbox`; a tool must declare it for `call_tool`). Declares an external spend BEFORE the program makes the actual payment call: validates (`amount` > 0, `unit`/`reason` non-empty text), checks the capability, enforces the host ceiling (`SYNSEMA_SPEND_CEILING="USD:500,ETH:0.1"` — breach = **hard catchable error**; do NOT proceed with the payment call after it), and writes an append-only, **fail-loud** ledger entry to `spend.log` (amount as canonical decimal text + reason + file:line; no written entry → the spend errors). Amounts take the exact **decimal** path — cents never accumulate binary error. Totals are per **process**, monotonic.
