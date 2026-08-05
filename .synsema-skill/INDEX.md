@@ -113,6 +113,9 @@ usually version skew, not a bug.
 - HTTPS / TLS / auto-HTTPS / certificates → serve.md (production web stack)
 - Multi-domain / virtual hosts / reverse proxy → serve.md (production web stack)
 - Building an HTTP API / web server → serve.md
+- Login / sessions / cookies / CSRF (`set_cookie`/`clear_cookie`/`request.cookies`, 2-param `auth with`) → serve.md (Auth) + builtins.md (Web auth)
+- Passwords / JWT / 2FA-TOTP / secure random tokens (`password_hash`/`jwt_sign`/`jwt_verify`/`totp`/`token`/`random_bytes`) → builtins.md (Web auth)
+- Custom response headers (`with_header`) → serve.md (Response headers & cookies)
 - Streaming / Server-Sent Events → serve.md
 - Rate limiting / anti-abuse → serve.md
 - Serving HTML pages / server-side rendering (templates) → serve.md

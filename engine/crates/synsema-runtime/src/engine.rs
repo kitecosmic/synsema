@@ -399,6 +399,13 @@ pub(crate) fn wire_common_with_state(
     register_http_builtins(interp, caps.clone());
     // Hashing SHA + Keccak (puro, sin capability): sha256/sha512/keccak256/sha512_256 → bytes.
     synsema_stdlib::hashing::register_hash_builtins(interp);
+    // Web auth (tanda web-auth): random_bytes/token/password_hash/password_verify/
+    // jwt_sign/jwt_verify/totp/totp_verify. random_bytes/token GATEADOS por
+    // `random` (la misma puerta deny-by-default de random()/random_int() — libres
+    // la volverían decorativa); el resto puro sin capability (criterio
+    // hmac_sha256). Registrados acá → existen en el intérprete principal Y en
+    // los de serve/parallel/cron.
+    synsema_stdlib::webauth::register_webauth_builtins(interp, caps.clone());
     // Blockchain (Batch 11): encoding/verify/derive PUROS + firma GATEADA por `sign(NAME)`
     // + audit (cierra sobre el mismo CapabilitySet → sandbox lo vacía, deny-by-default).
     synsema_stdlib::blockchain::register_blockchain_builtins(interp, caps.clone());

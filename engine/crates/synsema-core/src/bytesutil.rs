@@ -131,6 +131,66 @@ pub fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
 }
 
 // =========================================================
+// Base64url (RFC 4648 §5 — web auth; alfabeto URL-safe `-_`)
+// =========================================================
+
+/// Codifica bytes a base64url (alfabeto URL-safe `-_`), **SIN padding** — la
+/// convención de JWT/cookies (RFC 7515 §2 "Base64url Encoding"). Variante del
+/// `b64_encode` propio: mismo layout, alfabeto sustituido, `=` omitido.
+pub fn b64url_encode(b: &[u8]) -> String {
+    b64_encode(b)
+        .trim_end_matches('=')
+        .chars()
+        .map(|c| match c {
+            '+' => '-',
+            '/' => '_',
+            other => other,
+        })
+        .collect()
+}
+
+/// Valor de un char base64url, o None si no pertenece al alfabeto URL-safe.
+fn b64url_val(c: u8) -> Option<u8> {
+    match c {
+        b'-' => Some(62),
+        b'_' => Some(63),
+        b'+' | b'/' => None, // alfabeto estándar NO se acepta acá (estricto)
+        other => b64_val(other),
+    }
+}
+
+/// Decodifica base64url → bytes. Acepta **con y sin** padding `=` final (ambas
+/// formas circulan en la práctica); cualquier char fuera del alfabeto URL-safe es
+/// error. Estricto con la longitud: un resto de 1 char es imposible en base64.
+pub fn b64url_decode(s: &str) -> Result<Vec<u8>, String> {
+    let trimmed = s.trim_end_matches('=');
+    let bytes = trimmed.as_bytes();
+    // `=` sólo se tolera como padding FINAL; uno en el medio queda en `trimmed`
+    // y cae en el error de char inválido de abajo.
+    if bytes.len() % 4 == 1 {
+        return Err("invalid base64url: impossible length (4n+1 characters)".to_string());
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3 + 2);
+    let mut acc: u32 = 0;
+    let mut nbits: u32 = 0;
+    for &c in bytes {
+        let v = b64url_val(c)
+            .ok_or_else(|| format!("invalid base64url character: {:?}", c as char))?;
+        acc = (acc << 6) | v as u32;
+        nbits += 6;
+        if nbits >= 8 {
+            nbits -= 8;
+            out.push((acc >> nbits) as u8);
+        }
+    }
+    // Bits residuales no-cero = codificación no canónica (o input corrupto).
+    if nbits > 0 && (acc & ((1 << nbits) - 1)) != 0 {
+        return Err("invalid base64url: non-zero trailing bits".to_string());
+    }
+    Ok(out)
+}
+
+// =========================================================
 // Base58 (alfabeto de Bitcoin/Solana — Batch 11)
 // =========================================================
 
@@ -264,6 +324,52 @@ mod tests {
         assert!(b64_decode("Zg=").is_err()); // largo no múltiplo de 4
         assert!(b64_decode("Z===").is_err()); // padding mal ubicado
         assert!(b64_decode("Zm9v!mFy").is_err()); // char inválido
+    }
+
+    // ---- base64url (vectores RFC 4648 §10 en URL-safe, sin padding) ----
+
+    #[test]
+    fn b64url_known_vectors() {
+        assert_eq!(b64url_encode(b""), "");
+        assert_eq!(b64url_encode(b"f"), "Zg");
+        assert_eq!(b64url_encode(b"fo"), "Zm8");
+        assert_eq!(b64url_encode(b"foo"), "Zm9v");
+        assert_eq!(b64url_encode(b"foob"), "Zm9vYg");
+        assert_eq!(b64url_encode(b"fooba"), "Zm9vYmE");
+        assert_eq!(b64url_encode(b"foobar"), "Zm9vYmFy");
+        // Bytes que en estándar producen `+` y `/` → acá `-` y `_`.
+        assert_eq!(b64_encode(&[0xfb, 0xff]), "+/8=");
+        assert_eq!(b64url_encode(&[0xfb, 0xff]), "-_8");
+        assert_eq!(b64url_decode("-_8").unwrap(), vec![0xfb, 0xff]);
+        // Con y sin padding se aceptan al decodificar.
+        assert_eq!(b64url_decode("Zg").unwrap(), b"f");
+        assert_eq!(b64url_decode("Zg==").unwrap(), b"f");
+        assert_eq!(b64url_decode("Zm9vYmE=").unwrap(), b"fooba");
+        assert_eq!(b64url_decode("").unwrap(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn b64url_round_trip_all_bytes() {
+        let all: Vec<u8> = (0..=255u8).collect();
+        let enc = b64url_encode(&all);
+        assert!(!enc.contains('='), "sin padding");
+        assert!(!enc.contains('+') && !enc.contains('/'), "alfabeto URL-safe");
+        assert_eq!(b64url_decode(&enc).unwrap(), all);
+        // Roundtrip con largos 0..64 (cubre los 3 restos del chunk de 3).
+        for n in 0..64usize {
+            let v: Vec<u8> = (0..n as u8).map(|i| i.wrapping_mul(37).wrapping_add(11)).collect();
+            assert_eq!(b64url_decode(&b64url_encode(&v)).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn b64url_errors() {
+        assert!(b64url_decode("Zm9v!").is_err(), "char inválido");
+        assert!(b64url_decode("+_8").is_err(), "alfabeto estándar rechazado");
+        assert!(b64url_decode("Zm/v").is_err(), "alfabeto estándar rechazado");
+        assert!(b64url_decode("Zgzzz").is_err(), "largo 4n+1 imposible");
+        assert!(b64url_decode("Z=g").is_err(), "padding en el medio");
+        assert!(b64url_decode("Zh").is_err(), "bits residuales no-cero (no canónico)");
     }
 
     // ---- base58 (vectores del test suite de Bitcoin) ----

@@ -48,7 +48,7 @@ use synsema_core::number::Number;
 use synsema_core::parser::{parse_source, CompileError};
 use synsema_core::types::{
     from_send, syn_bool, syn_bytes, syn_map, syn_nothing, syn_text, to_send, SendValue,
-    SynTaskValue, SynValue,
+    ServerValue, SynTaskValue, SynValue,
 };
 use synsema_stdlib::acme;
 use synsema_stdlib::cron::{
@@ -1341,6 +1341,14 @@ fn build_request_syn(ctx: &Ctx) -> SynValue {
         },
     );
     m.insert("headers".to_string(), headers_map(&ctx.headers));
+    // Cookies entrantes (RFC 6265 §5.4), SIN decodificar; nombre duplicado: gana
+    // la primera aparición. Sin header `Cookie` → map VACÍO (nunca nothing:
+    // `request.cookies.sid` siempre es navegable).
+    let mut cookies = IndexMap::new();
+    for (k, v) in server::parse_cookies(&ctx.headers) {
+        cookies.insert(k, syn_text(v.as_str()));
+    }
+    m.insert("cookies".to_string(), syn_map(cookies));
     m.insert("query".to_string(), str_map(&ctx.query));
     m.insert("params".to_string(), str_map(&ctx.params));
     m.insert("ip".to_string(), syn_text(ctx.client_ip.as_str()));
@@ -1459,6 +1467,19 @@ fn run_stream(
             }
         }));
         match interp.run_request_block(body, request_bindings(ctx)) {
+            // Un `give with_header(...)` en una ruta de streaming NO puede aplicar
+            // headers (el head SSE ya se escribió al socket) — error claro, jamás
+            // ignorar en silencio (G2).
+            Err(Control::Give(SynValue::Server(s)))
+                if matches!(&*s, ServerValue::WithHeaders { .. }) =>
+            {
+                StreamEnd::Error(
+                    "streaming responses do not accept with_header/set_cookie yet \
+                     (the SSE response head is already written); set headers on a \
+                     non-streaming route"
+                        .to_string(),
+                )
+            }
             Ok(_) | Err(Control::Give(_)) | Err(Control::Stop(_)) => StreamEnd::Done,
             Err(Control::Error(e)) => {
                 let m = e.to_string();
@@ -1577,34 +1598,61 @@ fn build_host_table(
         }
     }
 
-    // -- auth handler: corre la task de `auth with <task>` con el bearer token --
-    let auth_handler: Option<AuthHandler> = auth_handler_n.map(|an| {
-        let auth_node = an.clone();
-        let swarm_a = swarm.clone();
-        let snap_a = snapshot.clone();
-        let caps_a = caps_snap.clone();
-        let rules_a = rules_snap.clone();
-        let mem_a = shared_memory.clone();
-        let ow_a = on_write.clone();
-        let prog_a = shared_progress.clone();
-        let owp_a = on_write_progress.clone();
-        let st_a = shared_state.clone();
-        let ap_a = approvals.clone();
-        let cron_a = cron.clone();
-        let db_a = shared_db.clone();
-        let mn_a = mem_name.clone();
-        let h: AuthHandler = Arc::new(move |token: &str| -> Option<SynValue> {
-            with_serve_interp(&swarm_a, &snap_a, &caps_a, &db_a, &rules_a, &mem_a, &ow_a, &prog_a, &owp_a, &st_a, &ap_a, &cron_a, secure, &mn_a, |interp| {
-                let genv = interp.global_env.clone();
-                let task = match interp.eval(&auth_node, &genv) {
-                    Ok(t) => t,
-                    Err(_) => return None,
-                };
-                interp.call_task(task, vec![syn_text(token)]).ok()
-            })
-        });
-        h
-    });
+    // -- auth handler: corre la task de `auth with <task>` con el bearer token —
+    // y, si el task declara 2 parámetros, también con el map `request` completo
+    // (sesiones por cookie, ítem C). La aridad se valida ACÁ, al construir el
+    // serve (fail-fast), no en runtime. 1 parámetro = comportamiento idéntico al
+    // histórico, byte a byte.
+    let auth_handler: Option<AuthHandler> = match auth_handler_n {
+        None => None,
+        Some(an) => {
+            // Aridad declarada del task. Si el nodo no evalúa acá (task aún no
+            // definido), se mantiene el comportamiento histórico: resolución lazy
+            // por request con 1 parámetro (y 401 si sigue sin resolver).
+            let arity: usize = match interp.eval(an, env) {
+                Ok(SynValue::Task(t)) => t.parameters.len(),
+                _ => 1,
+            };
+            if arity != 1 && arity != 2 {
+                return Err(Control::Error(RuntimeError::new(format!(
+                    "auth task must take 1 (token) or 2 (token, request) parameters, got {}",
+                    arity
+                ))));
+            }
+            let auth_node = an.clone();
+            let swarm_a = swarm.clone();
+            let snap_a = snapshot.clone();
+            let caps_a = caps_snap.clone();
+            let rules_a = rules_snap.clone();
+            let mem_a = shared_memory.clone();
+            let ow_a = on_write.clone();
+            let prog_a = shared_progress.clone();
+            let owp_a = on_write_progress.clone();
+            let st_a = shared_state.clone();
+            let ap_a = approvals.clone();
+            let cron_a = cron.clone();
+            let db_a = shared_db.clone();
+            let mn_a = mem_name.clone();
+            let h: AuthHandler = Arc::new(move |token: &str, ctx: &Ctx| -> Option<SynValue> {
+                with_serve_interp(&swarm_a, &snap_a, &caps_a, &db_a, &rules_a, &mem_a, &ow_a, &prog_a, &owp_a, &st_a, &ap_a, &cron_a, secure, &mn_a, |interp| {
+                    let genv = interp.global_env.clone();
+                    let task = match interp.eval(&auth_node, &genv) {
+                        Ok(t) => t,
+                        Err(_) => return None,
+                    };
+                    let args = if arity == 2 {
+                        // El MISMO map `request` que ve el handler de ruta
+                        // (incluye `cookies`; `user` aún nothing).
+                        vec![syn_text(token), build_request_syn(ctx)]
+                    } else {
+                        vec![syn_text(token)]
+                    };
+                    interp.call_task(task, args).ok()
+                })
+            });
+            Some(h)
+        }
+    };
 
     // -- rutas --
     let mut routes: Vec<RouteSpec> = Vec::new();

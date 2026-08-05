@@ -227,7 +227,7 @@ fn check_cap(caps: &Rc<RefCell<CapabilitySet>>, cap: Capability) -> bool {
 // =========================================================
 
 #[derive(Clone, Copy)]
-enum Algo {
+pub(crate) enum Algo {
     Sha256,
     Sha512,
 }
@@ -262,7 +262,7 @@ pub fn hmac_sha256_hex(key: &[u8], data: &[u8]) -> String {
     to_hex(&hmac_compute(Algo::Sha256, key, data))
 }
 
-fn hmac_compute(algo: Algo, key: &[u8], data: &[u8]) -> Vec<u8> {
+pub(crate) fn hmac_compute(algo: Algo, key: &[u8], data: &[u8]) -> Vec<u8> {
     match algo {
         Algo::Sha256 => {
             // HMAC acepta cualquier longitud de clave → new_from_slice no falla.

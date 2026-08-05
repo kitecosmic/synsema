@@ -59,6 +59,12 @@ num-bigint.workspace = true
 bip39.workspace = true
 # Batch 16 (Bitcoin): ripemd160 para hash160 (ver la justificación en el workspace).
 ripemd.workspace = true
+# Tanda web-auth (webauth.rs): password hashing argon2id — la única dep nueva de la
+# tanda (ver la justificación en el workspace). sha1 se PROMUEVE de dev-dep a directa
+# SOLO para el HMAC-SHA1 de TOTP (RFC 6238; ya estaba en el árbol vía tungstenite) —
+# NO se expone como builtin de hash.
+argon2.workspace = true
+sha1 = "0.10"
 pbkdf2.workspace = true
 scrypt.workspace = true
 aes.workspace = true
@@ -98,6 +104,3 @@ winreg = "0.52"
 [dev-dependencies]
 # Cert self-signed para los tests de integración TLS (backend ring, sin C/cmake).
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
-# Sec-WebSocket-Accept del mock hand-rolleado de batch15_ws (el server que coalesce
-# la respuesta 101 con el primer frame). Ya en el árbol vía tungstenite; puro-Rust.
-sha1 = "0.10"
