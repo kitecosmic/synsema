@@ -33,7 +33,7 @@ This skill is an **indexed folder**: read ONLY the section(s) you need for the t
 PROVENANCE — matching any past release means it came from the factory, so it gets the new
 version ("actualizado (estaba sin ediciones tuyas)"); only content that matches **no**
 release is treated as yours, kept, and the release copy lands beside it as `<file>.new`.
-That applies to `.env.example`/`.gitignore`/`hello.syn` too (engine v0.5.8+) — before it,
+That applies to `.env.example`/`.gitignore`/`hello.syn` too (engine v0.5.9+) — before it,
 `init` used mere existence as proof of ownership and froze stale scaffolds forever) + an `app.syn` starter and its test suite |
 | **Deploy** | [deploy.md](deploy.md) |
 
