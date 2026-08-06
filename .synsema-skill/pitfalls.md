@@ -150,6 +150,34 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `totp_verify(seed, 094287)` (code as number) | Error: the code must be text | Leading zeros matter — quote the code |
 | Store the PAT/API key as-is in the DB | A DB leak leaks every live credential | Store `sha256(token)`, compare hashes with `constant_time_eq` |
 
+### Spend ledger — units
+
+| What you expect | What actually happens | Why / workaround |
+|---|---|---|
+| The ledger is for money, so amounts are cents-sized | The unit is **free text and no currency is privileged** — fiat, crypto, commodities, credits, kWh | `spend(0.000000000000000001, "ETH", …)` (a wei) and `spend(1500, "JPY", …)` (no decimals) are equally valid; the scope of `require spend("…")` is whatever string you use |
+| Any tiny amount works | Up to **28 decimal places**; finer errors clearly | 18-decimal crypto fits whole. Below that, spend in the base unit (wei instead of ether) rather than losing precision silently |
+| `SYNSEMA_SPEND_CEILING="agent-1:EUR:50"` caps that agent | That's parsed as the **unit** `agent-1:EUR` | Per-identity ceilings live in their own variable with `=`: `SYNSEMA_SPEND_CEILING_PER_IDENTITY="agent-1=EUR:50"` — kept apart so a unit containing `:` can never collide with an identity |
+
+### Agent identity (captokens, signed requests, OIDC, mTLS)
+
+| What you expect | What actually happens | Why / workaround |
+|---|---|---|
+| `let key be secret("X")` at the top level works inside a route | The handler gets it **redacted as text** (`http_sign`/`hmac` then error with "got text") | Globals are snapshotted per request and secrets are redacted crossing that boundary — by design. Resolve it **inside** the handler: `route "…"` → `let key be secret("X")` |
+| `captoken_attenuate(t, caps, opts)` needs the root key | It deliberately does **not** take one — attenuating offline is the whole point | Only `mint` and `verify` take the key. If you find yourself passing it to attenuate, you're re-minting, not delegating |
+| A sub-agent's attenuated token gets its own rate-limit budget | It keeps the **root token's `id`**, so it shares the delegator's quota | On purpose: delegating must not multiply the budget. Mint separate tokens (different `id`) if you really want separate quotas |
+| `captoken_verify` tells you the token expired vs was forged | It returns `nothing` for every failure | Same doctrine as `jwt_verify`: an endpoint must not be distinguishable by rejection cause. Log server-side if you need forensics |
+| A token with an `aud`/`ip`/`method` caveat verifies without passing that context | It's **rejected** (fail-closed) | You can't claim a condition holds if you never checked it. Pass it: `captoken_verify(t, k, {"aud": "orders-api"})` |
+| `http_signature_verify(req, key)` picks the algorithm from the message | Error: `opts.alg` is required | Reading `alg` from the message is the classic confusion forgery (sign with the *public* key as an HMAC secret). The verifier pins it |
+| A signed request verifies with a different body | The `Content-Digest` is part of the signature → rejected | Expected. Sign and verify the **same bytes**: serialize once (`json_encode`) and pass that exact text as `body` |
+| `http_sign` works with a plain-string key | The key must be a sealed `secret` (its name is what scopes `require sign(...)`) | `secret("SIG_KEY")`, plus `require sign("SIG_KEY")`. Without the capability it's denied and audited, like signing on-chain |
+| An hmac-sha256 signing key can be any text | Yes — but an **ed25519** key as text must be **hex** | Each algorithm keeps the engine-wide rule for its material: curve keys are hex/bytes, shared HMAC strings are raw |
+| `jwt_verify` can check a Google/Auth0 token with `{"alg": "RS256"}` | It can't — that's `oidc_verify`, a different builtin | `jwt_verify` = HS256 with a secret you own (pure). `oidc_verify` = third-party RS256/ES256, mandatory `iss`+`aud`, and JWKS over the network (`require net(host)`) |
+| `oidc_verify` without `aud` just checks the signature | It's an **error**, on purpose | A valid token minted for *another app of the same provider* would verify — the confused-deputy attack. `aud` is mandatory |
+| A JWKS fetch failure means the token is invalid | Fetch failures are **errors**, not `nothing` | "I couldn't verify it" must never look like "it isn't valid". Only token problems are `nothing` |
+| `mtls_identity` applies to one request | It's **per process** (the certificate identifies the workload, SPIFFE-style) | Call it once at startup. Needs `require file.read` on both PEMs |
+| Without `opts.hosts`, the certificate only goes where you meant | It goes to **every host the program may reach** — any server that asks for a client cert gets your workload identity | Bounded by `require net`, so with a narrow `net` scope it's already contained. With a broad one, scope it: `mtls_identity(c, k, {"hosts": ["*.mesh.internal"]})` |
+| The server can require client certificates (`client_ca`) | Not yet — only the **client** side ships | Terminating mTLS on the serve side needs a new `serve` clause (parser work); use a reverse proxy in front meanwhile |
+
 ## Language features — bytes, complex, arrays, match, params, tests
 
 | What you expect | What actually happens | Why / workaround |

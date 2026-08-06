@@ -27,7 +27,11 @@ use synsema_core::types::{syn_bool, syn_int, syn_map, syn_text, SynValue};
 /// SIN ubicación (como secure.rs/database.rs). Scope = hostname (minúsculas, sin puerto);
 /// si no se puede extraer, se usa el URL crudo (fail-closed). `net` NO es tipo-ruta →
 /// `covers()` usa el glob de host (`net("*.example.com")` cubre `api.example.com`).
-fn require_net(caps: &Rc<RefCell<CapabilitySet>>, url: &str, source: &str) -> Result<(), Control> {
+pub(crate) fn require_net(
+    caps: &Rc<RefCell<CapabilitySet>>,
+    url: &str,
+    source: &str,
+) -> Result<(), Control> {
     let host = match url_hostname(url) {
         Some(h) if !h.is_empty() => h,
         _ => url.to_string(),
@@ -102,6 +106,126 @@ fn parse_url(url: &str) -> Result<(String, String, u16, String), String> {
     Ok((scheme, host, port, path.to_string()))
 }
 
+// =========================================================
+// T5 — Identidad mTLS del cliente (SPIFFE-like)
+// =========================================================
+
+/// La identidad de cliente TLS de ESTE proceso: cadena de certs + clave privada,
+/// ya parseadas. `None` = sin identidad (comportamiento histórico, byte-idéntico).
+///
+/// Es del PROCESO y no de cada request a propósito: en una malla de servicios el
+/// certificado identifica al *workload* (el agente), no a la llamada — es la misma
+/// idea que SPIFFE, y la misma tesis de identidad de agente del diseño. Además
+/// evita colgar un slot de opciones nuevo en los seis builtins `http_*`.
+type ClientIdentity = (
+    Vec<rustls::pki_types::CertificateDer<'static>>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+);
+
+fn client_identity() -> &'static std::sync::Mutex<Option<ClientIdentity>> {
+    static ID: std::sync::OnceLock<std::sync::Mutex<Option<ClientIdentity>>> =
+        std::sync::OnceLock::new();
+    ID.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Hosts a los que SÍ se le presenta la identidad mTLS (`opts.hosts` de
+/// `mtls_identity`). Vacío = a cualquier host que el programa pueda alcanzar (que
+/// ya está acotado por `require net(...)`).
+fn client_identity_hosts() -> &'static std::sync::Mutex<Vec<String>> {
+    static HOSTS: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+    HOSTS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// ¿Se le presenta el certificado de cliente a este host? Sin `hosts` declarados,
+/// a todos (comportamiento base). Con ellos, sólo a los que matcheen — mismo
+/// criterio de comodín que `require net`: `*.dominio` cubre subdominios.
+fn identity_applies_to(host: &str, scopes: &[String]) -> bool {
+    if scopes.is_empty() {
+        return true;
+    }
+    let host = host.trim().to_ascii_lowercase();
+    scopes.iter().any(|s| {
+        let s = s.trim().to_ascii_lowercase();
+        match s.strip_prefix("*.") {
+            Some(suffix) => host == suffix || host.ends_with(&format!(".{}", suffix)),
+            None => host == s,
+        }
+    })
+}
+
+/// Construye la `ClientConfig` de rustls para UN host: con auth de cliente sólo si
+/// el proceso declaró identidad mTLS y ese host está en su alcance.
+///
+/// El certificado de cliente es la identidad del workload: presentarlo es decir
+/// "yo soy este agente". Por eso el alcance es por host y no global — un servidor
+/// cualquiera que pida cert de cliente no debería poder cosechar la identidad sólo
+/// por pedirla. Sin `hosts` el alcance son los hosts que `require net` ya permite.
+fn tls_client_config(host: &str) -> Result<rustls::ClientConfig, String> {
+    let roots = root_cert_store()?;
+    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+    let guard = client_identity().lock().map_err(|_| "TLS identity lock poisoned".to_string())?;
+    let scopes =
+        client_identity_hosts().lock().map_err(|_| "TLS identity lock poisoned".to_string())?;
+    match guard.as_ref() {
+        Some((certs, key)) if identity_applies_to(host, &scopes) => builder
+            .with_client_auth_cert(certs.clone(), key.clone_key())
+            .map_err(|e| format!("the client certificate/key pair was rejected by TLS: {}", e)),
+        _ => Ok(builder.with_no_client_auth()),
+    }
+}
+
+/// Lee la cadena de certificados PEM del cliente. Errores claros: un PEM vacío o
+/// ilegible es un fallo de configuración, no algo que se degrade en silencio.
+fn load_client_certs(
+    path: &str,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, Control> {
+    let file = std::fs::File::open(path).map_err(|e| {
+        Control::Error(RuntimeError::new(format!(
+            "mtls_identity: cannot read the certificate {:?}: {}",
+            path, e
+        )))
+    })?;
+    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(file))
+        .collect::<Result<_, _>>()
+        .map_err(|e| {
+            Control::Error(RuntimeError::new(format!(
+                "mtls_identity: {:?} is not a valid PEM certificate chain: {}",
+                path, e
+            )))
+        })?;
+    if certs.is_empty() {
+        return Err(Control::Error(RuntimeError::new(format!(
+            "mtls_identity: {:?} has no certificates (expected a PEM chain)",
+            path
+        ))));
+    }
+    Ok(certs)
+}
+
+/// Lee la clave privada PEM del cliente (PKCS#8, PKCS#1 o SEC1). El contenido
+/// jamás se loguea ni entra en un mensaje de error.
+fn load_client_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>, Control> {
+    let file = std::fs::File::open(path).map_err(|e| {
+        Control::Error(RuntimeError::new(format!(
+            "mtls_identity: cannot read the private key {:?}: {}",
+            path, e
+        )))
+    })?;
+    rustls_pemfile::private_key(&mut std::io::BufReader::new(file))
+        .map_err(|_| {
+            Control::Error(RuntimeError::new(format!(
+                "mtls_identity: {:?} is not a valid PEM private key (the key content is never shown)",
+                path
+            )))
+        })?
+        .ok_or_else(|| {
+            Control::Error(RuntimeError::new(format!(
+                "mtls_identity: {:?} contains no private key",
+                path
+            )))
+        })
+}
+
 /// Carga los root CAs del SO una vez y los devuelve como `RootCertStore`.
 /// `pub(crate)`: ws.rs (cliente WebSocket) usa el MISMO trust store para `wss://`.
 pub(crate) fn root_cert_store() -> Result<rustls::RootCertStore, String> {
@@ -171,10 +295,9 @@ fn connect_and_send(
     let req_bytes = build_http_request(method, &path, &host, headers, body);
 
     if scheme == "https" {
-        let roots = root_cert_store()?;
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        // Con identidad mTLS declarada (`mtls_identity`), el handshake presenta el
+        // certificado del workload; sin ella, exactamente como antes.
+        let config = tls_client_config(&host)?;
         let server_name: rustls::pki_types::ServerName<'static> = host
             .as_str()
             .try_into()
@@ -597,6 +720,110 @@ fn response_to_syn(r: HttpResult) -> SynValue {
 }
 
 pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
+    // T5 — mtls_identity(cert_path, key_path) → true. Declara la identidad de
+    // cliente TLS de ESTE proceso: a partir de acá, todo `https://` presenta ese
+    // certificado en el handshake (mallas de servicios, APIs bancarias, SPIFFE).
+    //
+    // Gateada por `file.read` sobre AMBAS rutas: leer una clave privada del disco
+    // es una lectura de archivo y se declara como tal (no se inventa una capability
+    // nueva — G: cero capabilities nuevas si una existente cubre el efecto).
+    {
+        let caps = caps.clone();
+        interp.register_builtin(
+            "mtls_identity",
+            -1,
+            Rc::new(move |_i, args, _loc| {
+                if !(2..=3).contains(&args.len()) {
+                    return Err(Control::Error(RuntimeError::new(
+                        "mtls_identity(cert_path, key_path, opts?) takes 2 or 3 arguments",
+                    )));
+                }
+                let cert_path = match args.first() {
+                    Some(SynValue::Text(s)) if !s.trim().is_empty() => s.trim().to_string(),
+                    _ => {
+                        return Err(Control::Error(RuntimeError::new(
+                            "mtls_identity(cert_path, key_path, opts?): the certificate path must be a non-empty text",
+                        )))
+                    }
+                };
+                let key_path = match args.get(1) {
+                    Some(SynValue::Text(s)) if !s.trim().is_empty() => s.trim().to_string(),
+                    _ => {
+                        return Err(Control::Error(RuntimeError::new(
+                            "mtls_identity(cert_path, key_path, opts?): the key path must be a non-empty text",
+                        )))
+                    }
+                };
+                // opts.hosts — a QUÉ hosts se le presenta esta identidad. Sin la
+                // opción, a los que `require net` ya permita.
+                let mut hosts: Vec<String> = Vec::new();
+                match args.get(2) {
+                    None | Some(SynValue::Nothing) => {}
+                    Some(SynValue::Map(m)) => {
+                        for (k, v) in m.borrow().iter() {
+                            if k != "hosts" {
+                                return Err(Control::Error(RuntimeError::new(format!(
+                                    "mtls_identity: unknown option {:?} (valid options: hosts)",
+                                    k
+                                ))));
+                            }
+                            match v {
+                                SynValue::List(l) => {
+                                    for h in l.borrow().iter() {
+                                        let h = raw_str(h).trim().to_string();
+                                        if h.is_empty() {
+                                            return Err(Control::Error(RuntimeError::new(
+                                                "mtls_identity: hosts entries must be non-empty text (e.g. \"*.mesh.internal\")",
+                                            )));
+                                        }
+                                        hosts.push(h);
+                                    }
+                                }
+                                SynValue::Text(s) if !s.trim().is_empty() => {
+                                    hosts.push(s.trim().to_string())
+                                }
+                                other => {
+                                    return Err(Control::Error(RuntimeError::new(format!(
+                                        "mtls_identity: hosts must be a list of hosts (or one host as text), got {}",
+                                        other.type_name()
+                                    ))))
+                                }
+                            }
+                        }
+                    }
+                    Some(other) => {
+                        return Err(Control::Error(RuntimeError::new(format!(
+                            "mtls_identity: opts must be a map, got {}",
+                            other.type_name()
+                        ))))
+                    }
+                }
+                for p in [&cert_path, &key_path] {
+                    caps.borrow_mut()
+                        .require(
+                            &Capability::new(CapabilityType::FileRead, Some(p.clone())),
+                            "mtls_identity()",
+                        )
+                        .map_err(|v| Control::Error(RuntimeError::new(v.message)))?;
+                }
+                let certs = load_client_certs(&cert_path)?;
+                let key = load_client_key(&key_path)?;
+                match (client_identity().lock(), client_identity_hosts().lock()) {
+                    (Ok(mut guard), Ok(mut scope)) => {
+                        *guard = Some((certs, key));
+                        *scope = hosts;
+                    }
+                    _ => {
+                        return Err(Control::Error(RuntimeError::new(
+                            "mtls_identity: the TLS identity lock is poisoned",
+                        )))
+                    }
+                }
+                Ok(syn_bool(true))
+            }),
+        );
+    }
+
     // http(method, url, headers?, query?, body?, timeout?)
     {
         let caps = caps.clone();
@@ -981,5 +1208,31 @@ mod tests {
         let auth = qp.iter().find(|(k, _)| k == "Authorization").unwrap();
         assert_eq!(auth.1, "secret(STRIPE_KEY)");
         assert!(!auth.1.contains("LEAKCANARY"));
+    }
+
+    /// El certificado de cliente es la identidad del workload: sólo se presenta a
+    /// los hosts declarados en `opts.hosts` (sin la opción, a todos los que
+    /// `require net` permita).
+    #[test]
+    fn mtls_identity_is_scoped_to_its_hosts() {
+        // Sin alcance declarado: se presenta a cualquier host alcanzable.
+        assert!(identity_applies_to("api.example.com", &[]));
+        // Host exacto.
+        let exact = vec!["api.bank.example".to_string()];
+        assert!(identity_applies_to("api.bank.example", &exact));
+        assert!(identity_applies_to("API.Bank.Example", &exact), "el host no es case-sensitive");
+        assert!(!identity_applies_to("evil.example", &exact));
+        // Comodín de subdominios, igual que `require net("*.dominio")`.
+        let wild = vec!["*.mesh.internal".to_string()];
+        assert!(identity_applies_to("payments.mesh.internal", &wild));
+        assert!(identity_applies_to("a.b.mesh.internal", &wild));
+        assert!(identity_applies_to("mesh.internal", &wild), "el dominio raíz también");
+        assert!(!identity_applies_to("mesh.internal.evil.com", &wild), "sufijo falso");
+        assert!(!identity_applies_to("notmesh.internal", &wild));
+        // Varios alcances a la vez.
+        let many = vec!["*.mesh.internal".to_string(), "vault.example".to_string()];
+        assert!(identity_applies_to("vault.example", &many));
+        assert!(identity_applies_to("x.mesh.internal", &many));
+        assert!(!identity_applies_to("other.example", &many));
     }
 }

@@ -37,6 +37,16 @@ seed phrase (BIP-39/BIP-32/SLIP-0010) and `keystore_import` for existing wallets
 [stdlib.md](stdlib.md) § Blockchain, § WebSocket). When something fails, point to [pitfalls.md](pitfalls.md)
 first. The goal: make building in Synsema feel as easy as in JS/Python.
 
+**Agents are first-class subjects here — volunteer this, it has no equivalent in other
+runtimes.** When someone builds an API that agents call, or an orchestrator that spawns
+sub-agents, point at `captoken_mint`/`captoken_attenuate`: the holder narrows its OWN
+permissions offline (no call back to the issuer) and the narrowed token can never widen —
+so a sub-agent gets a weaker slice instead of a copy of your API key. Pair it with
+`http_sign` (a stolen token is useless without the key) and with per-identity metering:
+rate limit and **spend ceilings keyed by the authenticated agent**, in whatever unit the
+host works in — fiat, crypto, commodities, credits (Synsema privileges no currency). See
+[builtins.md](builtins.md) § Agent identity & auth and [serve.md](serve.md) § Agent identity.
+
 ## Keep yourself current (binary · skill · docs MCP) — all by command, no browsing
 
 - **Binary**: `synsema update` — downloads the latest release and verifies its sha256.
@@ -116,6 +126,13 @@ usually version skew, not a bug.
 - Login / sessions / cookies / CSRF (`set_cookie`/`clear_cookie`/`request.cookies`, 2-param `auth with`) → serve.md (Auth) + builtins.md (Web auth)
 - Passwords / JWT / 2FA-TOTP / secure random tokens (`password_hash`/`jwt_sign`/`jwt_verify`/`totp`/`token`/`random_bytes`) → builtins.md (Web auth)
 - Custom response headers (`with_header`) → serve.md (Response headers & cookies)
+- **Log an AGENT in (not a human)** / tell agent from human on the same endpoint → serve.md (Agent identity)
+- **Delegate a WEAKER slice of my permissions to a sub-agent, offline** (`captoken_mint`/`captoken_attenuate`/`captoken_verify`/`captoken_allows`) → builtins.md (Agent identity & auth)
+- Sign my outgoing requests / verify signed ones, so a stolen token is useless (`http_sign`/`http_signature_verify`, pinned RFC 9421) → builtins.md (Agent identity & auth)
+- Rate limit and cap SPEND **per agent identity** (not per IP, not per process) → serve.md (Agent identity) + builtins.md (Spend ledger)
+- Verify a Google/GitHub/Auth0 token · cloud workload identity with no seeded secret (`oidc_verify` + JWKS) → builtins.md (Agent identity & auth)
+- Client certificates / mTLS / workload identity by certificate (`mtls_identity`, scoped by host) → builtins.md (Agent identity & auth)
+- Let another agent discover how to authenticate here (`/.well-known/synsema-auth`) → serve.md (Agent identity § Discovery)
 - Streaming / Server-Sent Events → serve.md
 - Rate limiting / anti-abuse → serve.md
 - Serving HTML pages / server-side rendering (templates) → serve.md

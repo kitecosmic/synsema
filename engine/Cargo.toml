@@ -202,6 +202,15 @@ ripemd = { version = "0.1", default-features = false }
 # ya presentes), sin `*-sys`/C → preserva el binario único estático. La ÚNICA dep
 # nueva de la tanda (mismo criterio con que Batch 16 agregó `ripemd`).
 argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
+# T3 (OIDC entrante: "login with Google" + workload identity de nube). Verificar un
+# JWT de un IdP de TERCEROS exige los algoritmos asimétricos que el árbol no tenía:
+#   rsa  : RS256 (PKCS#1 v1.5 + SHA-256) — el default de Google/Microsoft/Auth0.
+#   p256 : ES256 (ECDSA sobre NIST P-256). ⚠️ El `k256` que YA está en el árbol es
+#          secp256k1 (Bitcoin/Ethereum) — curva DISTINTA, no sirve para ES256.
+# Ambas RustCrypto puro-Rust, misma familia que hmac/sha2/argon2 ya presentes; cero
+# `*-sys`/C → preservan el binario único estático.
+rsa = { version = "0.9", default-features = false, features = ["sha2"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 scrypt = { version = "0.11", default-features = false }
 aes = "0.8"

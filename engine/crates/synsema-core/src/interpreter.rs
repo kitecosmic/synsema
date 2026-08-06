@@ -347,6 +347,16 @@ pub struct Interpreter {
     /// propio) lo fija una vez con `set_agent_context` al construir el intérprete
     /// del agente. `current_agent()` es lo que leen `remember`/`recall`.
     agent_context: Vec<String>,
+    /// Identidad del SUJETO de la unidad de trabajo en curso (T6): la identidad de
+    /// agente que autenticó esta request del serve. NO es `agent_context` (ese es el
+    /// agente del swarm que corre el código); acá va *en nombre de quién* corre. La
+    /// consume el ledger de `spend` para contabilizar y limitar por identidad, y el
+    /// runtime la fija por request desde `request.user`.
+    request_identity: Option<String>,
+    /// Techo de gasto DELEGADO a esta identidad (unidad → monto en texto decimal),
+    /// típicamente el caveat `spend` de un captoken verificado. Se aplica ADEMÁS del
+    /// techo del host (fail-closed: mandan los dos, gana el más chico).
+    request_spend_limits: Vec<(String, String)>,
     recursion_depth: usize,
     /// Concede capabilities declaradas con `require` (lo cablea el motor).
     grant_hook: Option<GrantHook>,
@@ -449,6 +459,8 @@ impl Interpreter {
             blackboard: HashMap::new(),
             agent_definitions: HashMap::new(),
             agent_context: Vec::new(),
+            request_identity: None,
+            request_spend_limits: Vec::new(),
             recursion_depth: 0,
             grant_hook: None,
             sandbox_depth: 0,
@@ -639,6 +651,28 @@ impl Interpreter {
         self.agent_context.push(name.to_string());
     }
 
+    /// La identidad del sujeto autenticado de esta unidad de trabajo (T6), si la
+    /// hay. Precede a `current_agent()` para contabilidad: el gasto se le imputa a
+    /// QUIÉN pidió, no a qué agente ejecutó.
+    pub fn request_identity(&self) -> Option<&str> {
+        self.request_identity.as_deref()
+    }
+
+    /// El techo de gasto delegado a la identidad en curso (unidad → monto decimal
+    /// en texto). Vacío = sin techo delegado (sólo rige el del host).
+    pub fn request_spend_limits(&self) -> &[(String, String)] {
+        &self.request_spend_limits
+    }
+
+    /// Fija identidad + techos delegados para la unidad de trabajo en curso. Lo
+    /// llama el runtime de serve por request (desde `request.user`); se limpia en
+    /// `reset_for_request` para que NUNCA se filtre al request siguiente del
+    /// mismo worker.
+    pub fn set_request_identity(&mut self, id: Option<String>, spend_limits: Vec<(String, String)>) {
+        self.request_identity = id;
+        self.request_spend_limits = spend_limits;
+    }
+
     /// Ejecuta un bloque de statements en el entorno global (cuerpo de un agente).
     /// Sin preámbulo/freeze (eso es sólo para el programa top-level).
     pub fn run_block(&mut self, stmts: &[Node]) -> Result<SynValue, Control> {
@@ -689,6 +723,10 @@ impl Interpreter {
         self.blackboard.clear();
         self.agent_definitions.clear();
         self.agent_context.clear();
+        // La identidad del sujeto es POR REQUEST: si sobreviviera al reset, el
+        // próximo request de este worker gastaría contra la identidad anterior.
+        self.request_identity = None;
+        self.request_spend_limits.clear();
         self.stream_emit = None;
         self.recursion_depth = 0;
     }

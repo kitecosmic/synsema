@@ -636,6 +636,95 @@ signup with `password_hash`, verify at login with `password_verify`, create
 session (redis/sql/state_set), respond with `set_cookie(...)`; the 2-param auth
 task above resolves it on every request.
 
+## Agent identity — serving agents, not just browsers
+
+A human logs in with a password and carries a cookie. An **agent** carries a
+capability token or signs each request, and the runtime meters it **per identity**
+rather than per IP. Both kinds of subject go through the same `auth with` task —
+it just returns a different shape, and the userland branches on it.
+
+### The auth task returns the subject
+
+```
+task authenticate(token, request)
+    -- agent: a capability token (id, caps, caveats) — see builtins.md
+    let agent be captoken_verify(token, secret("ROOT_KEY"), {"aud": "orders-api"})
+    when agent != nothing
+        give agent
+    -- human: a session cookie
+    let sid be request.cookies.sid
+    when sid != nothing
+        give redis_get(db, "sess:" + sid)
+    give nothing
+```
+
+The runtime reads the **identity** from whatever the task returned, using the shape
+the verifiers already produce — no adapter needed:
+
+| Returned value | Identity used |
+|---|---|
+| map with `id` | `captoken_verify` |
+| map with `sub` | `jwt_verify` / `oidc_verify` |
+| map with `keyid` | `http_signature_verify` |
+| text | the text itself |
+| anything else | no identity (quotas fall back to the IP shield) |
+
+### What the runtime enforces per identity
+
+- **Rate limit.** A route's `rate_limit` is applied **twice**: once per client IP
+  before auth (that shield is what stops an anonymous flood from burning a worker
+  on every auth attempt) and once per identity after it. The effective budget is
+  the stricter of the two, and agents behind the same NAT stop stealing each
+  other's quota. An attenuated token keeps its root's `id` on purpose: delegating
+  must not multiply the delegator's budget.
+- **Spend.** `spend(...)` inside a handler is booked to that identity, the audit
+  line carries `identity="…"`, and a **captoken's `spend` caveat becomes a real
+  ceiling** — the orchestrator delegates `{"spend": {"ETH": 0.01}}` and the server
+  refuses the spend that would cross it, before the payment call happens. Read
+  back with `spend_total(unit, identity)`. Three ceilings can apply at once and the
+  strictest wins: per unit (`SYNSEMA_SPEND_CEILING`), per identity
+  (`SYNSEMA_SPEND_CEILING_PER_IDENTITY="agent-1=EUR:50"`) and the delegated one.
+  The **unit is free text** — fiat, crypto, commodities, credits: the ledger
+  privileges no currency and keeps up to 28 decimal places.
+
+### Signed requests as auth
+
+For machine-to-machine, the request itself is signed and the auth task verifies it
+— a stolen token is useless without the key (the 2-parameter form gives you the
+whole request, which is what verification needs):
+
+```
+task verify_agent(token, request)
+    let key be secret("AGENT_PUBKEY")
+    let v be http_signature_verify(
+        {"method": request.method, "url": base + request.path,
+         "headers": request.headers, "body": request.body},
+        key, {"alg": "ed25519"})
+    when v == nothing
+        give nothing
+    give {"keyid": v.keyid, "kind": "agent"}      -- keyid becomes the identity
+```
+
+`v.nonce` (when the client sent one) is what you check against a replay store for
+mutating routes — the builtin hands it to you; keeping it is userland.
+
+### Discovery — `/.well-known/synsema-auth`
+
+A serve that has auth wired publishes, in JSON, which mechanisms it understands
+(bearer/captoken/JWT, cookie, RFC 9421 signatures with the covered components and
+algorithms) and which endpoints are protected. It's the machine-readable companion
+to `/llms.txt`: an agent that never read your docs can still figure out how to
+authenticate. `private` hides it, exactly like `/llms.txt`.
+
+### Enrolment and revocation (userland patterns)
+
+- **Enrolling an agent:** it presents its ed25519 public key; a human approves via
+  the approvals queue (`approve`); you store the key. From then on everything it
+  does is signed and audited under that identity. De-registering = deleting the key.
+- **Revoking a token:** captokens are attenuated offline, so there is no central
+  check — keep TTLs short and pass a denylist of ids to `captoken_verify`
+  (`{"revoked": [...]}`), typically read from redis.
+
 ## Input validation
 
 ```
