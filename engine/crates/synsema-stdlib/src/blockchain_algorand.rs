@@ -83,7 +83,14 @@ pub(crate) fn address_to_pubkey(s: &str, what: &str, fname: &str) -> Result<[u8;
 
 /// Valor msgpack ya canónico: convertido, con las claves ordenadas y SIN
 /// zero-values (se podan al construir).
-enum Mp {
+///
+/// `pub(crate)`: el encoder de bajo nivel (`mp_write`) es el ÚNICO msgpack
+/// canónico del árbol y lo reusa `captoken.rs` (T4) para firmar sus bloques. Ojo
+/// —y por eso se comparte el WRITER y no `to_mp`—: la poda de zero-values de
+/// arriba es semántica de transacción Algorand y sería un agujero al firmar
+/// permisos (un `{spend: 0}` podado firmaría igual que un token sin ese campo).
+/// Quien reusa `mp_write` construye su propio árbol con SUS reglas.
+pub(crate) enum Mp {
     Uint(u64),
     Bytes(Vec<u8>),
     Str(String),
@@ -234,7 +241,7 @@ fn to_mp_in_list(v: &SynValue, path: &str, fname: &str, depth: usize) -> Result<
 }
 
 /// Emisión msgpack canónica: representación MÍNIMA para cada valor.
-fn mp_write(v: &Mp, out: &mut Vec<u8>) {
+pub(crate) fn mp_write(v: &Mp, out: &mut Vec<u8>) {
     match v {
         Mp::Uint(n) => {
             let n = *n;

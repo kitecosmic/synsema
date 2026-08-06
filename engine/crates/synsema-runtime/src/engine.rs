@@ -406,6 +406,16 @@ pub(crate) fn wire_common_with_state(
     // hmac_sha256). Registrados acá → existen en el intérprete principal Y en
     // los de serve/parallel/cron.
     synsema_stdlib::webauth::register_webauth_builtins(interp, caps.clone());
+    // Identidad de agentes (T2/T4): firmas de request con perfil RFC 9421 pineado
+    // (`http_sign` gateado por `sign(NAME)` + audit — la misma puerta que firmar
+    // on-chain; `http_signature_verify` puro) y tokens de capacidad atenuables
+    // (`captoken_*`, puros: el poder vive en la clave raíz sellada, y lo que un
+    // token concede lo sigue gateando el CapabilitySet de quien lo usa).
+    synsema_stdlib::httpsig::register_httpsig_builtins(interp, caps.clone());
+    synsema_stdlib::captoken::register_captoken_builtins(interp);
+    // T3 — OIDC de terceros (RS256/ES256 + JWKS): "login with Google" y workload
+    // identity de nube. El fetch del JWKS es red → gateado por `net(host)`.
+    synsema_stdlib::oidc::register_oidc_builtins(interp, caps.clone());
     // Blockchain (Batch 11): encoding/verify/derive PUROS + firma GATEADA por `sign(NAME)`
     // + audit (cierra sobre el mismo CapabilitySet → sandbox lo vacía, deny-by-default).
     synsema_stdlib::blockchain::register_blockchain_builtins(interp, caps.clone());

@@ -456,11 +456,30 @@ pub fn write_spend_audit(
     granted: bool,
     ceiling_denied: bool,
 ) -> Result<(), String> {
-    let extra = if ceiling_denied {
-        format!("denied_by=ceiling reason=\"{}\"", reason)
-    } else {
-        format!("reason=\"{}\"", reason)
-    };
+    write_spend_audit_for(None, unit, amount, reason, loc, granted, ceiling_denied)
+}
+
+/// Igual que `write_spend_audit` pero registrando además la IDENTIDAD del sujeto
+/// que gastó (T6.4): `identity="agent-1"` antes del motivo. Sin identidad la línea
+/// es byte-idéntica a la histórica (G1: el forense viejo sigue parseando).
+pub fn write_spend_audit_for(
+    identity: Option<&str>,
+    unit: &str,
+    amount: &str,
+    reason: &str,
+    loc: &SourceLocation,
+    granted: bool,
+    ceiling_denied: bool,
+) -> Result<(), String> {
+    let mut extra = String::new();
+    if ceiling_denied {
+        extra.push_str("denied_by=ceiling ");
+    }
+    if let Some(who) = identity {
+        // El `"` se escapa para no romper el parseo de la línea.
+        extra.push_str(&format!("identity=\"{}\" ", who.replace('"', "'")));
+    }
+    extra.push_str(&format!("reason=\"{}\"", reason));
     write_audit_op(&format!("spend amount={}", amount), "spend.log", unit, loc, granted, &extra)
 }
 

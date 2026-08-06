@@ -177,9 +177,52 @@ let uri be "otpauth://totp/App:user?secret=" + decode(seed, "base32") + "&issuer
 when totp_verify(seed, submitted_code)              -- 2FA check
 ```
 
+## Agent identity & auth (agents as first-class subjects)
+
+Web auth (above) is for a **human with a browser**. This section is for **agents**:
+proving who they are without carrying a long-lived secret, delegating a *weaker*
+slice of their own authority to sub-agents, and being metered per identity. See
+[serve.md](serve.md) § Agent identity for the server side.
+
+**Capability tokens — delegation that can only narrow** (pure, no capability):
+An orchestrator mints a token for itself and hands sub-agents an *attenuated* copy
+— offline, without the root key. Attenuation can **never** widen: it's checked when
+you attenuate (clear error) and again when you verify (rejected), so a hand-forged
+token can't widen either. The scopes are the same shapes as `require`.
+- `captoken_mint(caps, root_key, opts?)` → token text. `caps` = `{capability: scope | [scopes] | nothing}` (`nothing` = the capability with no scope). Opts: `id` (what you revoke; random if omitted), `ttl` (seconds, **default 900** — short on purpose, see revocation), `aud`, `ip`, `method`, `spend` (`{unit: max}`).
+- `captoken_attenuate(token, caps, opts?)` → a narrower token. **Takes no key** — that's the point. Same opts; anything wider than the parent is an error.
+- `captoken_verify(token, root_key, opts?)` → `{id, caps, depth, caveats}` or `nothing` on ANY failure. Opts supply the context the caveats are checked against — `aud`, `ip`, `method`, `at` (unix ts), `revoked` (list of ids). **Fail-closed:** a caveat in the token that you don't supply context for → rejected.
+- `captoken_allows(verified, capability, scope?)` → bool. Takes the *output of verify* (so you can't ask about an unverified token); `nothing` → `false`.
+- **Revocation:** attenuation is offline, so there is no central check. Short TTLs + a denylist of ids (`opts.revoked`, typically from redis) is the pattern. Say it out loud in your design; don't improvise it during an incident.
+
+```syn
+-- the unit is whatever the host works in (fiat, crypto, commodities, credits)
+let t be captoken_mint({"net": "*.example.com", "spend": "ETH"}, secret("ROOT_KEY"),
+                       {"ttl": 600, "spend": {"ETH": 0.5}})
+let sub be captoken_attenuate(t, {"net": "api.example.com"},        -- no root key here
+                              {"ttl": 60, "spend": {"ETH": 0.01}})
+let caps be captoken_verify(sub, secret("ROOT_KEY"))                -- map | nothing
+when captoken_allows(caps, "net", "api.example.com") ...
+```
+
+**Signed requests (proof-of-possession)** — a stolen bearer token is useless without
+the key. Pinned profile of RFC 9421: covers `@method`, `@target-uri` and
+`content-digest` (always, even with an empty body), plus `created`/`keyid`/`alg`.
+- `http_sign(request, key, opts?)` → map of headers to send (`Signature-Input`, `Signature`, `Content-Digest`). `request` = `{method, url, body?}`. **Requires `sign("KEY_NAME")`** + audit (the same door as signing on-chain); the key must be a sealed `secret`. Opts: `alg` (`"ed25519"` default, or `"hmac-sha256"`), `keyid` (defaults to the secret's name), `created`, `nonce`, `label`.
+- `http_signature_verify(request, key, opts?)` → `{keyid, alg, created, nonce}` or `nothing`. `request` = `{method, url, headers, body?}`. Pure (verifying signs nothing). **`opts.alg` is REQUIRED** — the verifier pins the algorithm; reading it from the message is the classic confusion forgery. Opts: `max_age` (seconds, default 300 — the anti-replay window; `created` in the future is rejected too).
+- The key material follows each algorithm's rule: ed25519 = curve material (hex text or bytes, like `ed25519_sign`); hmac-sha256 = the shared string's raw bytes.
+
+**Third-party OIDC (RS256/ES256)** — "login with Google" and cloud workload identity:
+- `oidc_verify(token, opts)` → claims map or `nothing`. **`iss` and `aud` are mandatory** (verifying a signature without checking the audience accepts tokens minted for another app of the same provider — the classic confused deputy). Keys: `jwks_url` (fetched and cached 10 min, re-fetched when a `kid` is unknown — **needs `require net(host)`**) or `jwks` (the document inline). Opts: `leeway` (default 60), `alg` (`RS256`/`ES256`; HS256 belongs to `jwt_verify`). RSA keys under 2048 bits are rejected.
+- A failing *token* is `nothing`; a failing *fetch* is an error — "I couldn't check it" must never look like "it isn't valid".
+
+**mTLS client identity** (workload identity by certificate):
+- `mtls_identity(cert_path, key_path, opts?)` → true. Declares this **process's** TLS client identity: `https://` requests to the hosts in scope present that certificate. **Requires `file.read`** on both PEMs. It's per-process, not per-request, because a certificate identifies the *workload* (SPIFFE-style). `opts.hosts` — a list of hosts (or one host as text) that the identity is presented to, with the same wildcard rule as `require net`: `"*.mesh.internal"` covers the domain and its subdomains. **Omit `hosts` and it goes to every host the program can reach** (already bounded by `require net`); declare them when your `net` scope is broad, so a third party can't harvest your workload identity just by asking for a client certificate.
+
 ## Spend ledger (see [capabilities.md](capabilities.md))
-- `spend(amount, unit, reason)` → number (the unit's accumulated total after this spend) — **requires `spend("UNIT")`** (deny-by-default ALWAYS, never auto-granted; denied in `sandbox`; a tool must declare it for `call_tool`). Declares an external spend BEFORE the program makes the actual payment call: validates (`amount` > 0, `unit`/`reason` non-empty text), checks the capability, enforces the host ceiling (`SYNSEMA_SPEND_CEILING="USD:500,ETH:0.1"` — breach = **hard catchable error**; do NOT proceed with the payment call after it), and writes an append-only, **fail-loud** ledger entry to `spend.log` (amount as canonical decimal text + reason + file:line; no written entry → the spend errors). Amounts take the exact **decimal** path — cents never accumulate binary error. Totals are per **process**, monotonic.
-- `spend_total(unit)` → number — the process's accumulated total for that unit (`0` if none). Introspection, no capability (like `llm_usage()`). Time-windowed policy belongs to the framework: read `spend.log` (grant `file.read` over the audit dir — `$SYNSEMA_AUDIT_DIR` or `~/.synsema/audit`).
+- `spend(amount, unit, reason)` → number (the unit's accumulated total after this spend) — **requires `spend("UNIT")`** (deny-by-default ALWAYS, never auto-granted; denied in `sandbox`; a tool must declare it for `call_tool`). Declares an external spend BEFORE the program makes the actual payment call: validates (`amount` > 0, `unit`/`reason` non-empty text), checks the capability, enforces the host ceiling (`SYNSEMA_SPEND_CEILING="EUR:500,ETH:0.1,bbl:100"` — breach = **hard catchable error**; do NOT proceed with the payment call after it), and writes an append-only, **fail-loud** ledger entry to `spend.log` (amount as canonical decimal text + reason + file:line; no written entry → the spend errors). The **unit is free text and no currency is privileged** — fiat, crypto, commodities, credits, kWh, tokens: `spend(0.000000000000000001, "ETH", …)` (one wei) and `spend(1500, "JPY", …)` (no decimals) are equally valid. Amounts take the exact **decimal** path with up to **28 decimal places** — an 18-decimal crypto unit fits whole and cents never accumulate binary error; a finer subdivision than 28 places errors clearly (spend in the base unit instead). Totals are per **process**, monotonic.
+- **Per-identity metering:** under `serve`, the spend is booked to the authenticated subject (`request.user`'s `id`/`sub`/`keyid`) and the audit line carries `identity="…"`. Three ceilings apply, all of them, always the strictest: the host's per-unit one (`SYNSEMA_SPEND_CEILING`), the host's per-identity one (`SYNSEMA_SPEND_CEILING_PER_IDENTITY="agent-1=EUR:50,researcher=ETH:0.01"` — its own variable, with `=` before the unit, so a unit containing `:` can never collide with an identity key) and the one **delegated by a captoken** (its `spend` caveat, when the auth task returns the verified token). That last one is how an orchestrator caps a sub-agent's budget and the server enforces it.
+- `spend_total(unit, identity?)` → number — without the 2nd argument, the process's accumulated total for that unit (`0` if none); with it, that identity's. Introspection, no capability (like `llm_usage()`). Time-windowed policy belongs to the framework: read `spend.log` (grant `file.read` over the audit dir — `$SYNSEMA_AUDIT_DIR` or `~/.synsema/audit`).
 
 ## Intentional operations (replace loops)
 

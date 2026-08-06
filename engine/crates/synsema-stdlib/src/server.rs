@@ -1213,9 +1213,87 @@ impl ServeRuntime {
         }
     }
 
+    /// T6.5 — descubrimiento máquina-a-máquina: qué formas de autenticación
+    /// entiende este server, en JSON. `/llms.txt` le dice a un agente QUÉ hace el
+    /// servicio; esto le dice CÓMO autenticarse, sin leer documentación humana.
+    ///
+    /// Se deriva de lo que el server realmente tiene cableado (no es una promesa
+    /// declarativa): si ninguna ruta pide auth, la lista de mecanismos va vacía.
+    fn auth_discovery(&self) -> String {
+        let requires_auth = self.default_host.routes.iter().any(|r| r.requires_auth)
+            || self.vhosts.iter().any(|h| h.routes.iter().any(|r| r.requires_auth));
+        let has_handler = self.default_host.auth_handler.is_some()
+            || self.vhosts.iter().any(|h| h.auth_handler.is_some());
+        let mut mechanisms: Vec<Json> = Vec::new();
+        if requires_auth && has_handler {
+            // El transporte del credencial siempre es el mismo (Authorization:
+            // Bearer o cookie de sesión); lo que varía es QUÉ se manda, y eso lo
+            // resuelve el auth task del programa. Se anuncian las formas que el
+            // engine sabe verificar de fábrica.
+            mechanisms.push(obj(vec![
+                ("scheme", Json::Str("bearer".into())),
+                ("transport", Json::Str("Authorization: Bearer <token>".into())),
+                (
+                    "token_types",
+                    Json::Array(vec![
+                        Json::Str("captoken".into()),
+                        Json::Str("jwt".into()),
+                        Json::Str("opaque".into()),
+                    ]),
+                ),
+            ]));
+            mechanisms.push(obj(vec![
+                ("scheme", Json::Str("cookie".into())),
+                ("transport", Json::Str("Cookie: <name>=<session id>".into())),
+            ]));
+            mechanisms.push(obj(vec![
+                ("scheme", Json::Str("http-message-signature".into())),
+                ("profile", Json::Str("rfc9421-pinned".into())),
+                (
+                    "covered",
+                    Json::Array(vec![
+                        Json::Str("@method".into()),
+                        Json::Str("@target-uri".into()),
+                        Json::Str("content-digest".into()),
+                    ]),
+                ),
+                (
+                    "algorithms",
+                    Json::Array(vec![Json::Str("ed25519".into()), Json::Str("hmac-sha256".into())]),
+                ),
+            ]));
+        }
+        // Rutas protegidas: un agente sabe adónde puede ir sin probar a ciegas.
+        let mut protected: Vec<Json> = self
+            .default_host
+            .routes
+            .iter()
+            .filter(|r| r.requires_auth)
+            .map(|r| Json::Str(format!("{} {}", r.method, r.path)))
+            .collect();
+        protected.sort_by(|a, b| match (a, b) {
+            (Json::Str(x), Json::Str(y)) => x.cmp(y),
+            _ => std::cmp::Ordering::Equal,
+        });
+        dumps(&obj(vec![
+            ("service", Json::Str(self.describe_about.clone().or_else(|| self.intent.clone()).unwrap_or_else(|| "Synsema service".to_string()))),
+            ("authentication", Json::Array(mechanisms)),
+            ("protected_endpoints", Json::Array(protected)),
+        ]))
+    }
+
     fn discovery_response(&self, path: &str) -> Option<RawResponse> {
         if path == "/llms.txt" && !self.private {
             return Some(RawResponse::text(self.llms_txt(), "text/plain; charset=utf-8", 200));
+        }
+        // Mismo criterio de `private` que /llms.txt: un server interno no publica
+        // su superficie de auth.
+        if path == "/.well-known/synsema-auth" && !self.private {
+            return Some(RawResponse::text(
+                self.auth_discovery(),
+                "application/json; charset=utf-8",
+                200,
+            ));
         }
         if path == "/robots.txt" {
             return Some(RawResponse::text(self.robots_txt(), "text/plain; charset=utf-8", 200));
@@ -1586,6 +1664,48 @@ impl ServeRuntime {
                 }
                 Some(_) => ctx.user = user,
             }
+            // T6.4 — SEGUNDA etapa del rate limit: por IDENTIDAD del sujeto ya
+            // autenticado, en su propio namespace de buckets.
+            //
+            // Por qué DOS etapas y no mover la primera acá: el chequeo por IP corre
+            // antes del auth a propósito, porque el auth task ejecuta el intérprete
+            // (un worker del pool por request). Si el único límite fuera por
+            // identidad, un atacante sin credenciales válidas quemaría workers
+            // gratis — el limitador dejaría de frenar justo el ataque que hoy sí
+            // frena. Con las dos, el presupuesto efectivo es el mínimo de ambos:
+            // la IP acota al anónimo, la identidad evita que agentes distintos
+            // detrás del mismo NAT se roben la cuota entre sí.
+            if let Some((capacity, window)) = host.routes[idx].rate_limit {
+                if let Some(id) = ctx.user.as_ref().and_then(identity_of) {
+                    let zone = host.routes[idx].rate_zone.as_deref().unwrap_or("None");
+                    let key = format!("user:{}|{}", zone, id);
+                    let (ok, remaining, retry_after, reset) =
+                        self.rate_limiter.check(&key, capacity, window);
+                    // Los headers reflejan el cupo de la identidad (el más
+                    // informativo para un cliente autenticado).
+                    rate_headers = vec![
+                        ("RateLimit-Limit".to_string(), capacity.to_string()),
+                        ("RateLimit-Remaining".to_string(), remaining.to_string()),
+                        ("RateLimit-Reset".to_string(), (reset as i64 + 1).to_string()),
+                    ];
+                    if !ok {
+                        let mut headers_429 = rate_headers.clone();
+                        headers_429[1] = ("RateLimit-Remaining".to_string(), "0".to_string());
+                        headers_429.push((
+                            "Retry-After".to_string(),
+                            (retry_after as i64 + 1).to_string(),
+                        ));
+                        return Dispatched::Response {
+                            status: 429,
+                            body: ResponseBody::Json(obj(vec![
+                                ("error", Json::Str("rate limit exceeded".into())),
+                                ("status", Json::Int(429)),
+                            ])),
+                            headers: headers_429,
+                        };
+                    }
+                }
+            }
         }
 
         // Reverse proxy (Lote 2): forwardea la request al upstream y devuelve su
@@ -1873,6 +1993,55 @@ fn header_value(headers: &[(String, String)], name: &str) -> String {
         }
     }
     String::new()
+}
+
+/// La IDENTIDAD del sujeto autenticado, desde el valor que devolvió el `auth with`
+/// (T6). Convención — deliberadamente la forma que ya devuelven las piezas del
+/// lenguaje, para que el caso feliz no requiera adaptadores:
+///   - map con `id`  → `captoken_verify` devuelve exactamente eso;
+///   - map con `sub` → un JWT/OIDC verificado (`jwt_verify`/`oidc_verify`);
+///   - map con `keyid` → `http_signature_verify` (firma de request, T2);
+///   - texto → se usa tal cual (el caso simple: el auth devuelve el nombre).
+///
+/// Cualquier otra forma → sin identidad: las cuotas caen al escudo por IP y el
+/// gasto se imputa al proceso. Nunca se inventa un id (dos sujetos distintos no
+/// pueden colapsar en el mismo bucket por una heurística).
+pub fn identity_of(user: &SynValue) -> Option<String> {
+    match user {
+        SynValue::Text(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        SynValue::Map(m) => {
+            let m = m.borrow();
+            for key in ["id", "sub", "keyid"] {
+                if let Some(v) = m.get(key) {
+                    let s = v.to_string();
+                    if !s.trim().is_empty() && !matches!(v, SynValue::Nothing) {
+                        return Some(s.trim().to_string());
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// El techo de gasto DELEGADO al sujeto, si su `request.user` lo trae: el caveat
+/// `spend` de un captoken verificado (`{caveats: {spend: {"USD": "10"}}}`). Lo
+/// aplica el ledger además del techo del host (T6.4).
+pub fn delegated_spend_of(user: &SynValue) -> Vec<(String, String)> {
+    let SynValue::Map(m) = user else { return Vec::new() };
+    let Some(SynValue::Map(cav)) = m.borrow().get("caveats").cloned() else {
+        return Vec::new();
+    };
+    let Some(SynValue::Map(sp)) = cav.borrow().get("spend").cloned() else {
+        return Vec::new();
+    };
+    let out: Vec<(String, String)> = sp
+        .borrow()
+        .iter()
+        .map(|(unit, amount)| (unit.clone(), amount.to_string()))
+        .collect();
+    out
 }
 
 fn bearer_token(headers: &[(String, String)]) -> String {

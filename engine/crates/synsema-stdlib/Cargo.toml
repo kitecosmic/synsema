@@ -65,6 +65,10 @@ ripemd.workspace = true
 # NO se expone como builtin de hash.
 argon2.workspace = true
 sha1 = "0.10"
+# T3 (oidc_verify): RS256 + ES256 para verificar tokens de IdPs de terceros. Ver la
+# justificación (y el aviso k256 ≠ P-256) en el Cargo.toml del workspace.
+rsa.workspace = true
+p256.workspace = true
 pbkdf2.workspace = true
 scrypt.workspace = true
 aes.workspace = true

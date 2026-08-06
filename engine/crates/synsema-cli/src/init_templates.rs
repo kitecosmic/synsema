@@ -149,10 +149,18 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # ══ Techos del host — dinero y firmas (el programa NO puede subirlos) ══
 
 # Techo de gasto por unidad para spend(monto, unidad, motivo): pares unidad:monto
-# separados por comas; unidades libres (USD, EUR, ETH, creditos, …). Excederlo hace
-# fallar spend() con error catchable — NO sigas con el pago externo. Acumulador por
-# proceso; el ledger persistente queda en spend.log del dir de audit:
-# SYNSEMA_SPEND_CEILING=USD:500,ETH:0.1
+# separados por comas. La unidad es texto LIBRE — fiat, cripto, commodities, creditos,
+# kWh: el ledger no privilegia ninguna moneda y acepta hasta 28 decimales (una unidad
+# de 18 decimales entra entera). Excederlo hace fallar spend() con error catchable —
+# NO sigas con el pago externo. Acumulador por proceso; el ledger persistente queda
+# en spend.log del dir de audit:
+# SYNSEMA_SPEND_CEILING=EUR:500,ETH:0.1,bbl:100
+
+# Techo de gasto POR IDENTIDAD de agente (T6.4): entradas identidad=UNIDAD:monto
+# separadas por comas. Va en su propia variable —y no como entradas del techo de
+# arriba— para que una unidad que contenga ':' jamas colisione con la clave de una
+# identidad. Se aplica ADEMAS del techo por unidad: manda el mas restrictivo:
+# SYNSEMA_SPEND_CEILING_PER_IDENTITY=agent-1=EUR:50,researcher=ETH:0.01
 
 # Techo de CANTIDAD de firmas por clave (name del secret de la clave): pares
 # clave:n separados por comas. La firma n+1 falla catchable y queda auditada:

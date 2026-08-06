@@ -1416,6 +1416,15 @@ fn run_route(
     mem_name: &Option<String>,
 ) -> GiveOutcome {
     with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, |interp| {
+        // T6.4 — identidad del sujeto de ESTA request (y su techo de gasto
+        // delegado, si el token lo trae): lo consume el ledger de `spend` para
+        // contabilizar y limitar por identidad. `reset_for_request` lo limpia al
+        // devolver el intérprete al pool, así no se filtra al request siguiente.
+        let (identity, limits) = match &ctx.user {
+            Some(u) => (server::identity_of(u), server::delegated_spend_of(u)),
+            None => (None, Vec::new()),
+        };
+        interp.set_request_identity(identity, limits);
         match interp.run_request_block(body, request_bindings(ctx)) {
             Ok(_) => GiveOutcome::Give(None),
             Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),

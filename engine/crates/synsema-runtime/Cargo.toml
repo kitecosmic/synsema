@@ -38,3 +38,6 @@ tungstenite = { workspace = true }
 # E2E del Batch 16 (Bitcoin): el mock Esplora recomputa el txid (dSHA256 sin
 # witness) de los bytes posteados para validar honestamente btc_send.
 sha2 = { workspace = true }
+# E2E de T5 (mTLS): par cert/clave de prueba para `mtls_identity`. Mismo crate y
+# features que ya usa synsema-stdlib en sus tests de TLS (backend ring, sin C).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
