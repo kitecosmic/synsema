@@ -53,6 +53,12 @@ LITERAL='no $interpolation here'
 - Blank lines ignored; invalid keys → warning, not a crash.
 - Override the location: `--env-file <path>` or `SYNSEMA_ENV_FILE=<path>`. Disable: `--no-env-file` (or `SYNSEMA_ENV_FILE=` empty).
 - **Commit a `.env.example`** (keys, no values) and keep the real `.env` in `.gitignore`.
+- `synsema init` writes that `.env.example` for you, and its last section is **your own
+  secrets** — the auth features expect keys you name yourself: `JWT_KEY` (`jwt_sign`/
+  `jwt_verify`), `CAPTOKEN_ROOT_KEY` (`captoken_mint`/`captoken_verify` — attenuating
+  needs no key, which is why a delegated sub-agent never sees it) and
+  `AGENT_SIGNING_KEY` (`http_sign`, which also needs `require sign("AGENT_SIGNING_KEY")`).
+  The name you pick IS the capability scope; add your own the same way.
 
 > `.env` is the *source*; `env()` vs `secret()` is *how you read* it. The same key can
 > be read plain (`env`) or tainted (`secret`).
