@@ -65,7 +65,7 @@ synsema serve <file> [--secure]
 |---|---|
 | `--port N` | Overrides `serve on N` **and grants the `serve(N)` capability** (the operator passing the flag is the authority, so the file's `require serve(...)` need not match). |
 | `--domain d1,d2` | Sets/overrides the ACME SAN domains (comma-separated). |
-| `--tls-auto <email>` | Turns on auto-HTTPS (ACME) with that account email. **Its presence is the dev↔prod toggle.** Brings up the `:80` challenge/redirect listener. Requires a domain (`--domain` or `domain` in the file). |
+| `--tls-auto <email>` | Turns on auto-HTTPS (ACME) with that account email. **Its presence is the dev↔prod toggle.** Brings up the `:80` challenge/redirect listener — move it with `SYNSEMA_ACME_HTTP_PORT=8080` (process env, not `.env`) when something else owns port 80, and forward external `:80` to it; the CA must reach the challenge from the public internet. Requires a domain (`--domain` or `domain` in the file). |
 | `--tls-cert <p> --tls-key <p>` | Manual TLS. **Mutually exclusive** with `--tls-auto`. |
 | `--bind <addr>` | Bind address (default `0.0.0.0`). |
 
