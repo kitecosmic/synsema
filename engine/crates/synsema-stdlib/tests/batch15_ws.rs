@@ -383,6 +383,12 @@ fn ws_on_full_error_surfaces_catchable_never_silent_drop() {
         "ws_connect",
         vec![syn_text(format!("ws://127.0.0.1:{}/", p).as_str()), SynValue::Nothing, syn_map(opts)],
     )));
+    // Esperar a que la cola SE LLENE antes de drenar. Sin esto el test depende de
+    // ganarle la carrera al emisor: bajo carga (varios binarios de test en paralelo)
+    // el server manda de a poco, el consumidor drena al mismo ritmo, la cola nunca
+    // desborda y el test falla por una razón que no es la que mide. El overflow lo
+    // registra el hilo lector, así que dormir lo vuelve determinista.
+    std::thread::sleep(std::time::Duration::from_millis(300));
     // Drenar: los ≤4 encolados salen, y DESPUÉS el overflow emerge como error
     // atrapable con mensaje claro — nunca un stream que sigue "andando" con hoyos.
     let mut drained = 0;

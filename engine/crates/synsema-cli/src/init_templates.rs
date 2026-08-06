@@ -232,6 +232,7 @@ pub struct InitFile {
 const HELLO_SYN_PAST: &[&str] = &[
     "e69804e5b0779fd4cea54a6c89d54719c75784960b3b2bafba145121ea0e74d8",
     "ef8518377fa71f6a4bd503670b3432a6c567ff502dab81273b17c66c1794b051",
+    "e5acaf4f81afd7d5b6ad09d1892d772f45e731244956298ec556f8e5859e637d",
 ];
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
@@ -242,10 +243,12 @@ const ENV_EXAMPLE_PAST: &[&str] = &[
     "5a38c2ef0ac9c5ec66c2902e0c4b90a0e2083e1b3234036a2cbe7dc14e79da7e",
     "2f5fb20f6175b65bde78669a20e7565cff513cd5f18668bc46c7e42b4827fa70",
     "8905d8b18d42449dc712dd9125cd11d49448e92c89b0e5c9c605821da4a3ccbe",
+    "439f3ab927a92bd090d281bb4aeb9052b295fa7cb55bab62f1a1819bfd464777",
 ];
 
-/// `.gitignore` nunca cambió desde que existe `init` — sin versiones anteriores.
-const GITIGNORE_PAST: &[&str] = &[];
+/// sha256 de cada contenido histórico de `.gitignore` (ver `InitFile::past`).
+const GITIGNORE_PAST: &[&str] =
+    &["20b449a6499a877f4e5a58d94be5ba3eabf779e2cdfadc1fecf0989a3e9a6314"];
 
 /// Los tres archivos que `synsema init` genera, en orden.
 pub const INIT_FILES: [InitFile; 3] = [
@@ -259,6 +262,72 @@ mod tests {
     use super::*;
     use synsema_runtime::llm_providers::{HUMAN_ENV_VARS, LLM_ENV_VARS};
     use synsema_stdlib::spend::CEILING_ENV_VARS;
+
+    /// Anti-rot 5: la lista de procedencia está COMPLETA — se deriva de git y se
+    /// compara con la declarada.
+    ///
+    /// Éste es el guard que hace segura toda la mecánica: `past` sólo sirve si
+    /// contiene TODOS los contenidos anteriores. Si alguien edita un template y se
+    /// olvida de agregar el sha del contenido viejo, cada proyecto existente que lo
+    /// tenga pasa a clasificarse como "editado por el usuario" y nunca más recibe
+    /// novedades — en silencio, que es como este bug llegó a producción la primera
+    /// vez. Acá falla el build y el mensaje trae la línea exacta para pegar.
+    ///
+    /// Se saltea si el repo es shallow o no hay git (tarball, sandbox): es un guard
+    /// de desarrollo, no una dependencia dura del build.
+    #[test]
+    fn init_file_history_is_complete() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("repo root")
+            .to_path_buf();
+        let rel = "engine/crates/synsema-cli/src/init_templates.rs";
+        let git = |args: &[&str]| -> Option<String> {
+            let o = std::process::Command::new("git").args(args).current_dir(&root).output().ok()?;
+            o.status.success().then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+        };
+        let Some(shallow) = git(&["rev-parse", "--is-shallow-repository"]) else {
+            eprintln!("(sin git: se saltea el chequeo de historia)");
+            return;
+        };
+        if shallow.trim() == "true" {
+            eprintln!("(repo shallow: se saltea el chequeo de historia)");
+            return;
+        }
+        let Some(log) = git(&["log", "--format=%H", "--reverse", "--", rel]) else { return };
+        for f in INIT_FILES {
+            let marker = format!(
+                "pub const {}: &str = r#\"",
+                match f.name {
+                    "hello.syn" => "HELLO_SYN",
+                    ".env.example" => "ENV_EXAMPLE",
+                    _ => "GITIGNORE",
+                }
+            );
+            let current = sha256_of(f.content);
+            let mut missing: Vec<String> = Vec::new();
+            for c in log.split_whitespace() {
+                let Some(src) = git(&["show", &format!("{}:{}", c, rel)]) else { continue };
+                let Some(i) = src.find(&marker) else { continue };
+                let body = &src[i + marker.len()..];
+                let Some(j) = body.find("\"#;") else { continue };
+                let h = sha256_of(&body[..j]);
+                if h != current && !f.past.contains(&h.as_str()) && !missing.contains(&h) {
+                    missing.push(h);
+                }
+            }
+            assert!(
+                missing.is_empty(),
+                "{}: faltan {} sha256 en su lista `past` — sin ellos, todo proyecto que                  tenga esa versión queda marcado como editado y no recibe novedades.                  Agregá estas líneas:
+{}",
+                f.name,
+                missing.len(),
+                missing.iter().map(|h| format!("    \"{}\",", h)).collect::<Vec<_>>().join("
+")
+            );
+        }
+    }
 
     /// Anti-rot 4: la lista de procedencia de cada archivo del scaffold está sana.
     ///
