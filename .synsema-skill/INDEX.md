@@ -20,7 +20,7 @@ core dev loop:
 | **Try things interactively** | `synsema repl` |
 | **Update** binary + this skill | `synsema update`, then re-run the skill installer (see "Keep yourself current" below) |
 | **Diagnose LLM config** | `synsema llm status` (resolved config with sources; names the missing variable when offline) |
-| **Start a new project** | `synsema init [dir]` (hello.syn tour + commented .env.example + .gitignore) |
+| **Start a new project** | `synsema init [dir]` (hello.syn tour + commented .env.example + .gitignore). Re-running is **safe and repairs**: a file still identical to any release it shipped in gets refreshed; one with your edits is kept and the new version lands as `<file>.new` (v0.5.8+) |
 | **Deploy** (daemon/Docker/VPS) | see [deploy.md](deploy.md) |
 
 Also volunteer the right primitive for the task: `paged()` for big SQL results, `parallel_map` for
