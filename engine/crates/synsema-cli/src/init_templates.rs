@@ -181,6 +181,29 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # Base pública de ESTE server — habilita los links listos para reenviar
 # (respond_link_yes/no: el humano decide abriendo una URL desde SMS/chat):
 # SYNSEMA_HUMAN_PUBLIC_URL=
+
+# ══ Secretos de TU programa (el nombre lo elegís vos, no el engine) ══
+
+# `secret("NOMBRE")` resuelve por: entorno del proceso > este .env > default; sin
+# ninguno de los tres, ERROR (nunca un valor vacío silencioso). El NOMBRE es tambien
+# lo que scopea la capability: `require secret("JWT_KEY")` habilita ESE secreto y no
+# otro, y `require sign("AGENT_SIGNING_KEY")` habilita firmar SOLO con esa clave.
+# El valor jamas se imprime ni viaja a un LLM: sale como `secret(NOMBRE)`.
+# Los de abajo son los que piden las features de auth — borra los que no uses y
+# agrega los tuyos con el mismo patron (API keys de terceros, webhooks, etc.).
+
+# Clave con la que firmas y verificas TUS tokens de sesion — jwt_sign/jwt_verify.
+# Cualquier texto largo y aleatorio sirve; generalo con: synsema repl → token()
+# JWT_KEY=
+
+# Clave RAIZ de los tokens de capacidad — captoken_mint/captoken_verify.
+# Atenuar NO la necesita (por eso un subagente delegado nunca la ve):
+# CAPTOKEN_ROOT_KEY=
+
+# Clave con la que tu agente FIRMA sus requests salientes — http_sign.
+# ed25519 en hex, o texto crudo si usas alg "hmac-sha256". Necesita ademas
+# `require sign("AGENT_SIGNING_KEY")` en el programa (deny-by-default + auditado):
+# AGENT_SIGNING_KEY=
 "#;
 
 pub const GITIGNORE: &str = r#"# Secretos / config local — nunca subir
