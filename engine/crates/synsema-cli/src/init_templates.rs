@@ -213,11 +213,45 @@ pub const GITIGNORE: &str = r#"# Secretos / config local — nunca subir
 .synsema/
 "#;
 
+/// Un archivo que `synsema init` genera, con la PROCEDENCIA de sus versiones
+/// anteriores.
+///
+/// `past` son los sha256 de todo contenido que este archivo tuvo en versiones
+/// previas del engine. Existir NO es lo mismo que ser tuyo: sin esta lista, un
+/// `.env.example` intacto de hace tres releases se confundía con uno editado y
+/// jamás recibía las variables nuevas (el usuario ni se enteraba de que existían).
+/// Con ella el upgrade distingue los tres estados reales — al día / de fábrica pero
+/// viejo / con ediciones tuyas — y sólo el último se conserva.
+pub struct InitFile {
+    pub name: &'static str,
+    pub content: &'static str,
+    pub past: &'static [&'static str],
+}
+
+/// sha256 de cada contenido histórico de `hello.syn` (ver `InitFile::past`).
+const HELLO_SYN_PAST: &[&str] = &[
+    "e69804e5b0779fd4cea54a6c89d54719c75784960b3b2bafba145121ea0e74d8",
+    "ef8518377fa71f6a4bd503670b3432a6c567ff502dab81273b17c66c1794b051",
+];
+
+/// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
+const ENV_EXAMPLE_PAST: &[&str] = &[
+    "89ce5ec7987119a7bf7579f74b93275ca3a61790766a143e06df26000b992bb9",
+    "2e2abfde4bfafc3e97b44c5caa20c66b945be4adb178693dc89aae0325ab0ea5",
+    "018e2caaad5b937d3f7f8e3866720f5225996f74f0ed5075848a85a9ebcb853b",
+    "5a38c2ef0ac9c5ec66c2902e0c4b90a0e2083e1b3234036a2cbe7dc14e79da7e",
+    "2f5fb20f6175b65bde78669a20e7565cff513cd5f18668bc46c7e42b4827fa70",
+    "8905d8b18d42449dc712dd9125cd11d49448e92c89b0e5c9c605821da4a3ccbe",
+];
+
+/// `.gitignore` nunca cambió desde que existe `init` — sin versiones anteriores.
+const GITIGNORE_PAST: &[&str] = &[];
+
 /// Los tres archivos que `synsema init` genera, en orden.
-pub const INIT_FILES: [(&str, &str); 3] = [
-    ("hello.syn", HELLO_SYN),
-    (".env.example", ENV_EXAMPLE),
-    (".gitignore", GITIGNORE),
+pub const INIT_FILES: [InitFile; 3] = [
+    InitFile { name: "hello.syn", content: HELLO_SYN, past: HELLO_SYN_PAST },
+    InitFile { name: ".env.example", content: ENV_EXAMPLE, past: ENV_EXAMPLE_PAST },
+    InitFile { name: ".gitignore", content: GITIGNORE, past: GITIGNORE_PAST },
 ];
 
 #[cfg(test)]
@@ -225,6 +259,47 @@ mod tests {
     use super::*;
     use synsema_runtime::llm_providers::{HUMAN_ENV_VARS, LLM_ENV_VARS};
     use synsema_stdlib::spend::CEILING_ENV_VARS;
+
+    /// Anti-rot 4: la lista de procedencia de cada archivo del scaffold está sana.
+    ///
+    /// `InitFile::past` es lo que permite distinguir "de fábrica pero viejo" de
+    /// "editado por vos". **Al cambiar un template hay que agregar el sha256 del
+    /// contenido ANTERIOR a su lista** — si no, todo proyecto que lo tenga queda
+    /// clasificado como editado y nunca más recibe novedades (ese fue el bug real).
+    /// Se puede recalcular la lista entera desde git:
+    /// `git log --reverse -- init_templates.rs` + sha256 del literal de cada commit.
+    #[test]
+    fn init_file_provenance_is_well_formed() {
+        for f in INIT_FILES {
+            let current = sha256_of(f.content);
+            for h in f.past {
+                assert_eq!(h.len(), 64, "{}: '{}' no es un sha256", f.name, h);
+                assert!(
+                    h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                    "{}: '{}' debe ser hex en minúsculas",
+                    f.name,
+                    h
+                );
+                assert_ne!(
+                    *h, current,
+                    "{}: el contenido ACTUAL no va en `past` (se compara aparte)",
+                    f.name
+                );
+            }
+            let mut seen: Vec<&str> = Vec::new();
+            for h in f.past {
+                assert!(!seen.contains(h), "{}: sha duplicado en `past`: {}", f.name, h);
+                seen.push(h);
+            }
+        }
+    }
+
+    fn sha256_of(s: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(s.as_bytes());
+        h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+    }
 
     // Anti-rot 1: el hello.syn del template PARSEA con el parser real del engine.
     #[test]

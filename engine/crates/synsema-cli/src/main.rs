@@ -144,10 +144,25 @@ fn main() -> ExitCode {
     }
 }
 
+/// Qué hacer con un archivo del scaffold que YA está en disco.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InitAction {
+    /// No existe → crearlo.
+    Write,
+    /// Idéntico al contenido actual → nada que hacer.
+    UpToDate,
+    /// De fábrica pero de una versión anterior → traerle las novedades.
+    Refresh,
+    /// No coincide con ninguna versión conocida → es TUYO, se conserva.
+    KeepYours,
+}
+
 /// `synsema init [directorio]` — scaffold de proyecto (Spec DX-2): genera `hello.syn`
 /// (tour del lenguaje con test), `.env.example` (providers como pares provider+key,
-/// knobs comentados) y `.gitignore`. JAMÁS pisa un archivo existente (los saltea con
-/// aviso). Los templates están test-verificados contra el engine (init_templates.rs).
+/// knobs comentados) y `.gitignore`. Un archivo existente JAMÁS se pisa si tiene
+/// ediciones tuyas; si sigue siendo de fábrica (aunque de una versión vieja) recibe
+/// las novedades. Los templates están test-verificados contra el engine
+/// (init_templates.rs).
 fn cmd_init(args: &[String]) -> ExitCode {
     // `--synfide`: además del scaffold base (sin hello.syn — el starter es app.syn),
     // instala el framework Synfide VERSIONADO desde su último release (manifest +
@@ -164,24 +179,64 @@ fn cmd_init(args: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     let mut created = 0usize;
-    for (name, content) in init_templates::INIT_FILES {
-        if with_synfide && name == "hello.syn" {
+    for f in init_templates::INIT_FILES {
+        if with_synfide && f.name == "hello.syn" {
             continue; // el tour lo reemplaza el app.syn del framework
         }
-        let path = base.join(name);
-        if path.exists() {
-            println!("init: {} ya existe — no se toca", path.display());
-            continue;
-        }
-        match std::fs::write(&path, content) {
-            Ok(()) => {
-                println!("init: {} creado", path.display());
-                created += 1;
+        let path = base.join(f.name);
+        // Existir NO alcanza para decidir: hay que saber SI es tuyo. Se compara el
+        // sha256 del disco contra el contenido actual y contra los históricos
+        // (`InitFile::past`) — así un archivo de fábrica pero viejo recibe las
+        // novedades en vez de quedar congelado para siempre, y uno con ediciones
+        // tuyas jamás se pisa.
+        let disk = std::fs::read(&path).ok();
+        let action = match disk.as_deref() {
+            None => InitAction::Write,
+            Some(bytes) => {
+                let h = crate::update::sha256_hex(bytes);
+                if h == crate::update::sha256_hex(f.content.as_bytes()) {
+                    InitAction::UpToDate
+                } else if f.past.contains(&h.as_str()) {
+                    InitAction::Refresh
+                } else {
+                    InitAction::KeepYours
+                }
             }
-            Err(e) => {
-                eprintln!("init: no se pudo escribir {}: {}", path.display(), e);
-                return ExitCode::from(1);
+        };
+        match action {
+            InitAction::UpToDate => println!("init: {} ya está al día", path.display()),
+            InitAction::KeepYours => {
+                // Patrón conffiles (apt/pacman): tu versión se conserva y la nueva
+                // aterriza al lado, para que puedas ver la diferencia. Sin el `.new`
+                // el usuario nunca se entera de qué se perdió.
+                let new_path = base.join(format!("{}.new", f.name));
+                if let Err(e) = std::fs::write(&new_path, f.content) {
+                    eprintln!("init: no se pudo escribir {}: {}", new_path.display(), e);
+                    return ExitCode::from(1);
+                }
+                println!(
+                    "init: ⚠ {} tiene cambios tuyos — se conserva; la versión nueva quedó en {}",
+                    path.display(),
+                    new_path.display()
+                );
             }
+            InitAction::Write | InitAction::Refresh => match std::fs::write(&path, f.content) {
+                Ok(()) => {
+                    if matches!(action, InitAction::Refresh) {
+                        println!(
+                            "init: {} actualizado (estaba sin ediciones tuyas)",
+                            path.display()
+                        );
+                    } else {
+                        println!("init: {} creado", path.display());
+                        created += 1;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("init: no se pudo escribir {}: {}", path.display(), e);
+                    return ExitCode::from(1);
+                }
+            },
         }
     }
     if with_synfide {
