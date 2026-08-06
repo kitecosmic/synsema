@@ -196,6 +196,28 @@ fn upgrade_action(
     }
 }
 
+/// La línea que se imprime cuando un archivo se CONSERVA. Dos situaciones muy
+/// distintas y el mensaje no las mezcla: o se pudo comprobar la procedencia y el
+/// contenido no salió de ningún release (es del usuario), o no se pudo comprobar
+/// (sin red). En ninguno de los dos casos se le encarga trabajo al usuario: su
+/// archivo queda intacto y el del release al lado. Decirle "si no lo tocaste,
+/// reemplazalo vos" es pedirle que resuelva a mano lo que la herramienta no supo.
+fn kept_line(provenance_known: bool, path: &Path, new_path: &Path) -> String {
+    if provenance_known {
+        format!(
+            "{} tiene cambios tuyos — se conserva; el del release quedó en {}",
+            path.display(),
+            new_path.display()
+        )
+    } else {
+        format!(
+            "{} no se pudo verificar (sin conexión para consultar los releases) — se conserva intacto; el del release quedó en {}",
+            path.display(),
+            new_path.display()
+        )
+    }
+}
+
 /// Instala/actualiza Synfide en `base`. Devuelve mensajes ya impresos; `Err` = nada
 /// escrito (o error de escritura puntual, informado con la ruta).
 pub(crate) fn install(base: &Path) -> Result<(), String> {
@@ -254,6 +276,9 @@ pub(crate) fn install(base: &Path) -> Result<(), String> {
     } else {
         std::collections::HashMap::new()
     };
+    // ¿Se pudo consultar la procedencia? Si hacía falta y volvió vacía, fue la red.
+    // El mensaje lo dice en vez de insinuar que el usuario editó algo.
+    let provenance_known = !needs_provenance || !upgrading || !factory.is_empty();
     for (f, disk_hash) in fetched.iter().zip(&disk) {
         let path = base.join(&f.dest);
         let new_hash = sha256_hex(&f.bytes);
@@ -306,11 +331,7 @@ pub(crate) fn install(base: &Path) -> Result<(), String> {
                     let new_path = base.join(format!("{}.new", f.dest));
                     std::fs::write(&new_path, &f.bytes)
                         .map_err(|e| format!("cannot write {}: {}", new_path.display(), e))?;
-                    println!(
-                        "init: ⚠ {} tiene cambios que no salieron de ningún release — se conserva TU versión; la nueva quedó en {}",
-                        path.display(),
-                        new_path.display()
-                    );
+                    println!("init: {}", kept_line(provenance_known, &path, &new_path));
                     kept.push(f.dest.clone());
                 }
             }
@@ -335,23 +356,7 @@ pub(crate) fn install(base: &Path) -> Result<(), String> {
                 let new_path = base.join(format!("{}.new", f.dest));
                 std::fs::write(&new_path, &f.bytes)
                     .map_err(|e| format!("cannot write {}: {}", new_path.display(), e))?;
-                // Sin registro previo NO podemos afirmar que el usuario lo editó
-                // (instalación con un binario pre-manifest, o un synfide/ que ya
-                // existía): el mensaje dice la verdad — "no puedo verificarlo" —
-                // en vez de acusar una edición que quizás nunca ocurrió.
-                if rec.is_some() {
-                    println!(
-                        "init: ⚠ {} fue MODIFICADO por vos — se conserva TU versión; la nueva quedó en {}",
-                        path.display(),
-                        new_path.display()
-                    );
-                } else {
-                    println!(
-                        "init: ⚠ {} difiere del release y no hay registro previo para verificar si lo editaste — se conserva por las dudas; la nueva quedó en {}. Si NO lo tocaste: reemplazalo con el .new (o borralo y re-corré init --synfide)",
-                        path.display(),
-                        new_path.display()
-                    );
-                }
+                println!("init: {}", kept_line(provenance_known, &path, &new_path));
                 kept.push(f.dest.clone());
             }
         }
