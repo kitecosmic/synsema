@@ -2,6 +2,13 @@
 
 Read this FIRST if something fails. Each row is a real mistake that costs hours to debug.
 
+> **Jump to the `## ` section that matches your failure:** Errors (parse/runtime messages) ·
+> Database SQL · Database MongoDB · Database Redis · HTTP server (serve) · Language features
+> (bytes, complex, arrays, match, params, tests) · Data & charts · Blockchain ·
+> Behavioral surprises · Anti-patterns · Secrets & config
+> Coming from Python? The traps that LOOK like Python but aren't are also collected in
+> [python-diff.md](python-diff.md).
+
 ## Errors
 
 | Error message | Cause | Solution |
