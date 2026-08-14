@@ -18,6 +18,7 @@ SKILL_FILES="
 SKILL.md
 INDEX.md
 why-synsema.md
+python-diff.md
 syntax.md
 builtins.md
 types.md

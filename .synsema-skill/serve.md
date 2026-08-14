@@ -10,6 +10,13 @@ single static binary.
 > available through the Synsema engine runtime"*. `serve` wires up that runtime
 > (HTTP, crons, agents) and keeps the process alive.
 
+> **This file is long (~1000 lines) — jump to the `## ` section you need instead of reading it all:**
+> Capability · Basic shape · The request · Shared mutable state (`state_*`) · Response contract ·
+> Serving web pages (HTML, static files, CORS) · Web for agents (SSR, negotiation & discoverability) ·
+> Pagination · Streaming responses (SSE) · Rate limiting · Auth (incoming) · Agent identity ·
+> Input validation · Request body limits · Isolation · Full example ·
+> Production web stack (TLS / auto-HTTPS / vhosts / reverse proxy / HTTP-2) · Template composition
+
 ## Capability
 
 Serving on a port requires the `serve` capability, scoped to that exact port:

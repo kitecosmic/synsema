@@ -5,6 +5,11 @@ Single static binary. The HTTP server runs on an async `hyper`/`tokio` stack; bu
 `rusqlite`. For numeric/scientific builtins (bytes, complex, special math, arrays + linear algebra)
 see [builtins.md](builtins.md).
 
+> **This file is long (~700 lines) — jump to the `## ` section you need instead of reading it all:**
+> HTTP · WebSocket (live feeds) · Database (SQL / MongoDB / Redis) · Cron (Scheduled Tasks) ·
+> Serve mode (keep crons alive) · Blockchain (ETH/Avalanche/Solana/Algorand/Bitcoin) ·
+> Capabilities · Platform
+
 ## HTTP
 
 ```

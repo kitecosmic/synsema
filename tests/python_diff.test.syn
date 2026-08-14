@@ -1,0 +1,186 @@
+-- Live probes backing .synsema-skill/python-diff.md (the Python → Synsema table).
+-- Every SEMANTIC claim in that table has an assertion here; keep the two in sync.
+-- PARSE-error rows (x = 5, # comments, f"...", [x for x in xs], xs[1:3], for/def/
+-- elif/except/import placement) cannot live in a file that must parse — they are
+-- verified with `synsema check` on the exact snippets shown in the doc.
+
+type Person
+    name: text
+    age: number
+
+task boom()
+    raise("kaput")
+
+task swallow_error()
+    try
+        boom()
+    recover err
+        give "ok"
+
+task reraise_error()
+    try
+        boom()
+    recover err
+        raise(err)
+
+task bad_return()
+    return 5
+
+task give_none()
+    give None
+
+task give_true()
+    give True
+
+task iterate_map_directly()
+    each k in {"a": 1}
+        print(k)
+
+task classify(status)
+    match status
+        is 200
+            give "ok"
+        is 404
+            give "missing"
+        otherwise
+            give "other"
+
+test "let/set instead of ="
+    let x be 1
+    set x to 2
+    assert_eq(x, 2)
+
+test "when / otherwise when / otherwise + inline form"
+    let n be 0
+    when n > 0
+        set n to 100
+    otherwise when n < 0
+        set n to -100
+    otherwise
+        set n to 7
+    assert_eq(n, 7)
+    let label be when n >= 5 then "big" otherwise "small"
+    assert_eq(label, "big")
+
+test "each over a list; each over a MAP errors (use keys())"
+    let total be 0
+    each x in [1, 2, 3]
+        set total to total + x
+    assert_eq(total, 6)
+    assert_error(iterate_map_directly)
+    let ks be []
+    each k in keys({"x": 1, "y": 2})
+        set ks to append(ks, k)
+    assert_eq(ks, ["x", "y"])
+
+test "give returns; Python 'return' is just an undefined name"
+    assert_eq(classify(200), "ok")
+    assert_eq(classify(404), "missing")
+    assert_eq(classify(500), "other")
+    assert_error(bad_return)
+
+test "None/True are undefined names; nothing/true/false are the literals"
+    assert_error(give_none)
+    assert_error(give_true)
+    assert_eq(nothing == nothing, true)
+    let x be nothing
+    when x == nothing
+        set x to "was nothing"
+    assert_eq(x, "was nothing")
+
+test "try/recover (not try/except); recover SWALLOWS unless you raise(err)"
+    let seen be ""
+    try
+        boom()
+    recover err
+        set seen to err
+    assert(contains(seen, "kaput"))
+    assert_eq(swallow_error(), "ok")
+    assert_error(reraise_error)
+
+test "and/or do NOT short-circuit"
+    let m be {"a": 1}
+    assert_error(() => contains(m, "b") and m["b"] == 1)
+    when contains(m, "a")
+        assert_eq(m["a"], 1)
+
+test "append returns a NEW list (no mutating .append)"
+    let xs be [1, 2]
+    let ys be append(xs, 3)
+    assert_eq(xs, [1, 2])
+    assert_eq(ys, [1, 2, 3])
+
+test "interpolation is backtick-only; quoted strings stay literal"
+    assert_eq(`n={1 + 1}`, "n=2")
+    assert(contains("n={1+1}", "{"))
+
+test "len/str are length/text; number() parses"
+    assert_eq(length("abc"), 3)
+    assert_eq(length([1, 2]), 2)
+    assert_eq(length({"a": 1}), 1)
+    assert_eq(text(42), "42")
+    assert_eq(number("42"), 42)
+
+test "text + number concatenates (unlike Python); text * n does not exist"
+    assert_eq("a" + 1, "a1")
+    assert_error(() => "ab" * 2)
+    assert_error(() => 1 + true)
+
+test "comprehension equivalent: apply + where"
+    assert_eq(apply((x) => x * 2, where([1, 2, 3], (x) => x > 1)), [4, 6])
+
+test "slicing is slice(), negatives ok; xs[1:3] is a parse error"
+    assert_eq(slice([10, 20, 30, 40], 1, 3), [20, 30])
+    assert_eq(slice([10, 20, 30, 40], -2, 4), [30, 40])
+    assert_eq(slice("hello", 1, 3), "el")
+
+test "the 'in' operator is contains(); maps check keys"
+    assert(contains([1, 2], 2))
+    assert(contains("abc", "b"))
+    assert(contains({"a": 1}, "a"))
+
+test "no dict.get(k, default); a missing key errors"
+    assert_error(() => {"a": 1}["b"])
+    assert_error(() => get({"a": 1}, "a"))
+
+test "string methods are plain tasks"
+    assert_eq(upper("hola"), "HOLA")
+    assert_eq(split("a,b,c", ","), ["a", "b", "c"])
+    assert_eq(join(["a", "b"], "-"), "a-b")
+    assert_eq(trim("  x  "), "x")
+
+test "sorted/sum/min/max equivalents"
+    assert_eq(sort_by([3, 1, 2], (x) => x), [1, 2, 3])
+    assert_eq(sort_by([3, 1, 2], (x) => 0 - x), [3, 2, 1])
+    assert_eq(sum([1, 2, 3]), 6)
+    assert_eq(min([5, 2, 9]), 2)
+    assert_eq(mean([1, 2, 3]), 2)
+
+test "division always float; // is floor(a/b); round is banker's like Python"
+    assert(10 / 3 > 3.33)
+    assert_eq(floor(7 / 2), 3)
+    assert_eq(round(2.5), 2)
+    assert_eq(round(3.5), 4)
+
+test "lambda is (x) => expr"
+    assert_eq(((x) => x + 1)(1), 2)
+
+test "index_of returns nothing when absent, not -1"
+    assert_eq(index_of([1, 2], 9), nothing)
+    assert_eq(index_of([1, 2], 2), 1)
+
+test "list + list concatenates like Python"
+    assert_eq([1] + [2], [1, 2])
+
+test "truthiness matches Python for the common cases"
+    assert_eq(when [] then 1 otherwise 0, 0)
+    assert_eq(when {} then 1 otherwise 0, 0)
+    assert_eq(when "" then 1 otherwise 0, 0)
+    assert_eq(when 0 then 1 otherwise 0, 0)
+    assert_eq(when [0] then 1 otherwise 0, 1)
+
+test "custom types: constructor + three access forms"
+    let p be Person("Alice", 30)
+    assert_eq(name of p, "Alice")
+    assert_eq(p.name, "Alice")
+    assert_eq(p["age"], 30)

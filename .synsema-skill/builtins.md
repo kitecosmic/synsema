@@ -1,5 +1,12 @@
 # Synsema Built-in Tasks
 
+> **This file is dense — jump to the `## ` section you need instead of reading it all:**
+> Core · Error handling (`try`/`recover`/`raise`) · Strings · Regex · Bytes / binary (hashing,
+> blockchain encoders, WebSocket client) · JSON · CSV · Math · Numeric arrays + linear algebra ·
+> Assertions / tests · Config & secrets · Web auth (passwords, JWT, TOTP) · Agent identity & auth ·
+> Spend ledger · Intentional operations (replace loops) · I/O · HTTP · Database ·
+> HTTP server (serve) · Cron · Agent operations
+
 ## Core
 - `print(values...)` — output text
 - `length(collection)` → number

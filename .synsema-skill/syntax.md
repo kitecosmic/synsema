@@ -1,5 +1,8 @@
 # Synsema Syntax
 
+> Coming from Python? Read [python-diff.md](python-diff.md) first — it maps the Python
+> reflexes to these forms and flags the semantic traps (verified against the engine).
+
 ## Reserved (hard) keywords
 These cannot be used as names; using one (e.g. `let task be 1`) gives a clear
 "reserved word" error. This includes **member access and export names**: `mod.decide(...)`
