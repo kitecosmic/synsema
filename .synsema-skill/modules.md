@@ -1,9 +1,9 @@
 # Synsema Modules (`use` / `export`)
 
 Your program doesn't have to live in one file. Synsema has **native modules**: split code across
-several `.syn` files and share `task`, `type`, `let`, and `enum` between them. **Local `.syn` only** —
-no `use "https://…"`, no FFI to other languages. That's deny-by-default security: no arbitrary code,
-no supply chain.
+several `.syn` files and share `task`, `type`, `let`, `enum` — and **`routes`** (whole groups of
+HTTP routes a serve can `mount`) — between them. **Local `.syn` only** — no `use "https://…"`, no
+FFI to other languages. That's deny-by-default security: no arbitrary code, no supply chain.
 
 ## In 30 seconds
 
@@ -57,6 +57,35 @@ let p be lex.Point(1, 2)               -- and the exported types
 Enums export too: `export enum Status`, then construct and `match` across files
 (`alias.Status.variant(...)`, `is alias.Status.variant`). See [types.md](types.md).
 
+## Export ROUTES — split a big serve into modules
+
+A module can export a whole **routes group**; the app's serve block mounts it. Route
+bodies can call the module's **private** helpers by simple name:
+
+```
+-- shop.syn
+task fmt(n)                        -- private
+    give "$" + text(n)
+
+export routes tienda
+    route "GET /shop"
+        give html("<h1>" + fmt(99) + "</h1>")
+    route "POST /shop/buy"
+        expect body {item: text}
+        ...
+```
+```
+-- app.syn
+use "./shop.syn" as shop
+serve on 8080
+    mount shop.tienda              -- or: mount shop.tienda at "/store"
+```
+
+Rules: only `route` entries inside the group (no `stream`, no per-route `rate_limit`
+yet — clear errors); a mounted `requires auth` still demands `auth with` on the serve
+block; the group's shape is validated when the serve is built. Full details in
+[serve.md](serve.md) ("Mounted routes").
+
 ## Rules (verified)
 
 - **Paths are relative to the importing file**, with directory traversal blocked — you can't escape your
@@ -99,3 +128,6 @@ The entry calls `core.handle(...)`; `core` uses `data.LABELS`, etc. `core`'s int
   (`mod.foo()`).
 - `test "…"` blocks can live in any file and run with `synsema test <file>`; they can call another
   module's exported API (e.g. `assert_eq(core.triage("…"), "task")`). See [testing.md](testing.md).
+- **`synsema check entry.syn` validates the whole import graph** (resolves and parses every
+  `use` recursively, with the same rules as the runtime — broken paths, cycles, `serve`/top-level
+  `require` inside a module all fail the check) and every `render("literal.html")` template.

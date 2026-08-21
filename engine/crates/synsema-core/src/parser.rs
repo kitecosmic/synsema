@@ -346,10 +346,11 @@ impl Parser {
         if self.check_word("use") && self.peek(1).ty == TokenType::Text {
             return Ok(Some(self.parse_use()?));
         }
-        // `enum` es soft keyword (Identifier con value "enum"), no un token type.
+        // `enum` y `routes` son soft keywords (Identifier), no token types.
         if self.check_word("export")
             && (matches!(self.peek(1).ty, TokenType::Task | TokenType::Type | TokenType::Let)
-                || self.peek_word(1, "enum"))
+                || self.peek_word(1, "enum")
+                || self.peek_word(1, "routes"))
         {
             return Ok(Some(self.parse_export()?));
         }
@@ -780,14 +781,55 @@ impl Parser {
             TokenType::Let => self.parse_let()?,
             // `enum` es soft keyword (Identifier con value "enum"), no un token type.
             _ if self.check_word("enum") => self.parse_enum()?,
+            // `routes` (soft keyword): grupo de rutas montable desde `serve` con `mount`.
+            _ if self.check_word("routes") => self.parse_routes_declaration()?,
             _ => {
                 return Err(ParseError::new(
-                    "export must be followed by task, type, let, or enum",
+                    "export must be followed by task, type, let, enum, or routes",
                     self.location(),
                 ))
             }
         };
         Ok(Node::new(loc, NodeKind::ExportDeclaration { declaration: Box::new(decl) }))
+    }
+
+    /// `routes <name>` + bloque indentado de SOLO `route ...` — un grupo de rutas que
+    /// un `serve` monta con `mount <alias>.<name> [at "/prefix"]`. Sólo existe bajo
+    /// `export` (su razón de ser es partir un serve grande en módulos).
+    fn parse_routes_declaration(&mut self) -> Result<Node, ParseError> {
+        let loc = self.location();
+        self.advance(); // soft keyword 'routes'
+        let name_tok = self.expect_name("routes group name after 'routes'")?;
+        let name = name_tok.as_str().to_string();
+        self.skip_newlines();
+        self.expect(TokenType::Indent, "Expected an indented block after 'routes <name>'")?;
+        self.skip_newlines();
+        let mut routes = Vec::new();
+        while !self.at_end() && !self.check(TokenType::Dedent) {
+            if self.check_word("route") {
+                routes.push(self.parse_route()?);
+            } else {
+                let tok = self.current();
+                return Err(ParseError::new(
+                    format!(
+                        "Inside 'routes', only 'route \"METHOD /path\"' definitions are allowed, got {}",
+                        tok.ty.name()
+                    ),
+                    tok.location.clone(),
+                ));
+            }
+            self.skip_newlines();
+        }
+        if self.check(TokenType::Dedent) {
+            self.advance();
+        }
+        if routes.is_empty() {
+            return Err(ParseError::new(
+                "a 'routes' group must contain at least one route",
+                loc.clone(),
+            ));
+        }
+        Ok(Node::new(loc, NodeKind::RoutesDeclaration { name, routes }))
     }
 
     // -- task --
@@ -1311,6 +1353,7 @@ impl Parser {
         let port = self.parse_expression()?;
 
         let mut auth_handler = None;
+        let mut error_handler = None;
         let mut max_body = None;
         let mut max_streams = None;
         let mut rate_limit: Option<Box<Node>> = None;
@@ -1326,6 +1369,7 @@ impl Parser {
         let mut tls_auto_email: Option<Box<Node>> = None;
         let mut domain: Option<Box<Node>> = None;
         let mut hosts: Vec<Node> = Vec::new();
+        let mut mounts: Vec<Node> = Vec::new();
 
         self.skip_newlines();
         self.expect(TokenType::Indent, "Expected an indented block after 'serve on PORT'")?;
@@ -1336,6 +1380,11 @@ impl Parser {
                 self.advance();
                 self.expect(TokenType::With, "Expected 'with' after 'auth' (auth with <task>)")?;
                 auth_handler = Some(Box::new(self.parse_expression()?));
+            } else if self.check_word("errors") {
+                // errors with <task> — páginas de error propias (401/404/405/500).
+                self.advance();
+                self.expect(TokenType::With, "Expected 'with' after 'errors' (errors with <task>)")?;
+                error_handler = Some(Box::new(self.parse_expression()?));
             } else if self.check_word("max_body") {
                 self.advance();
                 max_body = Some(Box::new(self.parse_expression()?));
@@ -1345,27 +1394,7 @@ impl Parser {
             } else if self.check_word("rate_limit") {
                 rate_limit = Some(Box::new(self.parse_rate_limit()?));
             } else if self.check_word("static") {
-                self.advance();
-                let first = self.parse_expression()?;
-                if self.check_word("from") {
-                    self.advance();
-                    let directory = self.parse_expression()?;
-                    static_mounts.push(Node::new(
-                        loc.clone(),
-                        NodeKind::StaticMount {
-                            directory: Box::new(directory),
-                            prefix: Some(Box::new(first)),
-                        },
-                    ));
-                } else {
-                    static_mounts.push(Node::new(
-                        loc.clone(),
-                        NodeKind::StaticMount {
-                            directory: Box::new(first),
-                            prefix: None,
-                        },
-                    ));
-                }
+                static_mounts.push(self.parse_static_mount(&loc)?);
             } else if self.check_word("cors") {
                 self.advance();
                 cors = Some(Box::new(self.parse_expression()?));
@@ -1405,11 +1434,26 @@ impl Parser {
                 redirect_https = true;
             } else if self.check_word("route") {
                 routes.push(self.parse_route()?);
+            } else if self.check_word("mount") {
+                // mount <expr> [at <expr>] — monta un grupo `export routes` de un módulo.
+                let mloc = self.location();
+                self.advance();
+                let source = self.parse_expression()?;
+                let prefix = if self.check_word("at") {
+                    self.advance();
+                    Some(Box::new(self.parse_expression()?))
+                } else {
+                    None
+                };
+                mounts.push(Node::new(
+                    mloc,
+                    NodeKind::MountClause { source: Box::new(source), prefix },
+                ));
             } else {
                 let tok = self.current();
                 return Err(ParseError::new(
                     format!(
-                        "Inside 'serve', expected 'auth with ...', 'route ...', 'static ...', 'tls ...', 'domain ...', 'host \"...\"', 'redirect https', 'cors ...', 'describe' or 'private', got {}",
+                        "Inside 'serve', expected 'auth with ...', 'errors with ...', 'route ...', 'mount ...', 'static ...', 'tls ...', 'domain ...', 'host \"...\"', 'redirect https', 'cors ...', 'describe' or 'private', got {}",
                         tok.ty.name()
                     ),
                     tok.location.clone(),
@@ -1450,6 +1494,7 @@ impl Parser {
             NodeKind::ServeBlock {
                 port: Box::new(port),
                 auth_handler,
+                error_handler,
                 max_body,
                 max_streams,
                 rate_limit,
@@ -1465,6 +1510,58 @@ impl Parser {
                 tls_auto_email,
                 domain,
                 hosts,
+                mounts,
+            },
+        ))
+    }
+
+    /// `static "./dir"` | `static "/p" from "./dir"`, con las cláusulas opcionales
+    /// `cache <expr>` (Cache-Control) y `fallback <expr>` (SPA history-fallback),
+    /// en cualquier orden. Compartido por `serve` y los bloques `host`.
+    fn parse_static_mount(&mut self, loc: &SourceLocation) -> Result<Node, ParseError> {
+        self.advance(); // 'static'
+        let first = self.parse_expression()?;
+        let (directory, prefix) = if self.check_word("from") {
+            self.advance();
+            let directory = self.parse_expression()?;
+            (directory, Some(Box::new(first)))
+        } else {
+            (first, None)
+        };
+        let mut cache: Option<Box<Node>> = None;
+        let mut fallback: Option<Box<Node>> = None;
+        loop {
+            if self.check_word("cache") {
+                self.advance();
+                if cache.is_some() {
+                    let tok = self.current();
+                    return Err(ParseError::new(
+                        "duplicate 'cache' clause on this static mount",
+                        tok.location.clone(),
+                    ));
+                }
+                cache = Some(Box::new(self.parse_expression()?));
+            } else if self.check_word("fallback") {
+                self.advance();
+                if fallback.is_some() {
+                    let tok = self.current();
+                    return Err(ParseError::new(
+                        "duplicate 'fallback' clause on this static mount",
+                        tok.location.clone(),
+                    ));
+                }
+                fallback = Some(Box::new(self.parse_expression()?));
+            } else {
+                break;
+            }
+        }
+        Ok(Node::new(
+            loc.clone(),
+            NodeKind::StaticMount {
+                directory: Box::new(directory),
+                prefix,
+                cache,
+                fallback,
             },
         ))
     }
@@ -1491,24 +1588,7 @@ impl Parser {
                 self.expect(TokenType::With, "Expected 'with' after 'auth' (auth with <task>)")?;
                 auth_handler = Some(Box::new(self.parse_expression()?));
             } else if self.check_word("static") {
-                self.advance();
-                let first = self.parse_expression()?;
-                if self.check_word("from") {
-                    self.advance();
-                    let directory = self.parse_expression()?;
-                    static_mounts.push(Node::new(
-                        loc.clone(),
-                        NodeKind::StaticMount {
-                            directory: Box::new(directory),
-                            prefix: Some(Box::new(first)),
-                        },
-                    ));
-                } else {
-                    static_mounts.push(Node::new(
-                        loc.clone(),
-                        NodeKind::StaticMount { directory: Box::new(first), prefix: None },
-                    ));
-                }
+                static_mounts.push(self.parse_static_mount(&loc)?);
             } else if self.check_word("tls") {
                 // tls cert <expr> key <expr>  (cert por-host para SNI)
                 self.advance();
@@ -2818,6 +2898,90 @@ mod tests {
             }
             other => panic!("esperaba UseImport, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn crlf_blank_line_inside_block_parses() {
+        // Archivo CRLF (Windows): una línea en blanco "\r\n" dentro de un bloque
+        // indentado no debe emitir un dedent fantasma (regresión del bug
+        // "Unexpected token: INDENT").
+        parse_ok("task f()\r\n    let a be 1\r\n\r\n    give a\r\nprint(f())\r\n");
+        parse_ok("serve on 8080\r\n    cors \"*\"\r\n\r\n    route \"GET /\"\r\n        give 1\r\n");
+    }
+
+    #[test]
+    fn export_routes_parses() {
+        let prog = parse_ok(
+            "export routes tienda\n    route \"GET /shop\"\n        give 1\n    route \"POST /shop\"\n        give 2",
+        );
+        let NodeKind::ExportDeclaration { declaration } = &prog.statements[0].kind else {
+            panic!("esperaba ExportDeclaration");
+        };
+        let NodeKind::RoutesDeclaration { name, routes } = &declaration.kind else {
+            panic!("esperaba RoutesDeclaration, got {:?}", declaration.kind);
+        };
+        assert_eq!(name, "tienda");
+        assert_eq!(routes.len(), 2);
+        // `routes` sigue siendo un identificador normal fuera del export.
+        parse_ok("let routes be 3\nprint(routes)");
+        // Un grupo vacío es error.
+        assert!(parse_source("export routes vacio\n    let x be 1", "<t>").is_err());
+    }
+
+    #[test]
+    fn serve_mount_parses() {
+        let prog = parse_ok(
+            "serve on 8080\n    mount shop.tienda\n    mount shop.tienda at \"/v2\"\n    route \"GET /\"\n        give 1",
+        );
+        let NodeKind::ServeBlock { mounts, .. } = &prog.statements[0].kind else {
+            panic!("esperaba ServeBlock");
+        };
+        assert_eq!(mounts.len(), 2);
+        let NodeKind::MountClause { prefix, .. } = &mounts[0].kind else {
+            panic!("esperaba MountClause");
+        };
+        assert!(prefix.is_none());
+        let NodeKind::MountClause { prefix, .. } = &mounts[1].kind else {
+            panic!("esperaba MountClause");
+        };
+        assert!(prefix.is_some());
+    }
+
+    #[test]
+    fn serve_errors_with_parses() {
+        let prog = parse_ok(
+            "serve on 8080\n    errors with pagina\n    route \"GET /\"\n        give 1",
+        );
+        let NodeKind::ServeBlock { error_handler, .. } = &prog.statements[0].kind else {
+            panic!("esperaba ServeBlock");
+        };
+        assert!(error_handler.is_some());
+    }
+
+    #[test]
+    fn static_cache_and_fallback_parse() {
+        let prog = parse_ok(
+            "serve on 8080\n    static \"/app\" from \"./dist\" cache \"1h\" fallback \"index.html\"\n    static \"./pub\" fallback \"index.html\" cache \"7d\"\n    route \"GET /\"\n        give 1",
+        );
+        let NodeKind::ServeBlock { static_mounts, .. } = &prog.statements[0].kind else {
+            panic!("esperaba ServeBlock");
+        };
+        assert_eq!(static_mounts.len(), 2);
+        for m in static_mounts {
+            let NodeKind::StaticMount { cache, fallback, .. } = &m.kind else {
+                panic!("esperaba StaticMount");
+            };
+            assert!(cache.is_some());
+            assert!(fallback.is_some());
+        }
+        // Cláusula duplicada → error.
+        assert!(parse_source(
+            "serve on 1\n    static \"./p\" cache \"1h\" cache \"2h\"\n    route \"GET /\"\n        give 1",
+            "<t>"
+        )
+        .is_err());
+        // `static` y `cache` siguen siendo identificadores normales fuera del serve.
+        parse_ok("let cache be 1\nlet fallback be 2\nprint(cache + fallback)");
     }
 
     #[test]

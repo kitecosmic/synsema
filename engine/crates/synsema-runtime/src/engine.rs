@@ -1431,10 +1431,21 @@ fn setup_swarm_interpreter(
     wire_swarm_hooks(&mut interp, swarm, agent_name, ceiling, mem);
     let name = agent_name.to_string();
     interp.log_hook = Some(Arc::new(move |line: &str| {
-        println!("[{}] {}", name, line);
+        // `conform` exige stdout = SOLO el JSON final: bajo ese modo el eco vivo
+        // ([main]/[agente]) va a stderr (sigue siendo visible, no rompe el parse).
+        if AGENT_ECHO_TO_STDERR.load(std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("[{}] {}", name, line);
+        } else {
+            println!("[{}] {}", name, line);
+        }
     }));
     interp
 }
+
+/// `conform` (JSON en stdout) activa esto para desviar el eco vivo de agentes a
+/// stderr. Default false: `run` conserva el eco en stdout (observabilidad en vivo).
+pub static AGENT_ECHO_TO_STDERR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Lanza un agente en su propio hilo con su propio `Interpreter`. Devuelve el
 /// instance_id. El estado pasa STARTING→WORKING→DONE/ERROR; el error se captura

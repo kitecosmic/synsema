@@ -116,7 +116,11 @@
         },
         {
           "name": "keyword.control.serve.synsema",
-          "match": "\\b(serve|on|route|auth|requires|expect|max_body|max_streams|stream|send|static|cors|describe|private|from|domain|tls|redirect|proxy|host|paged|per|rate_limit|unlimited|none)\\b"
+          "match": "\\b(serve|on|route|auth|errors|requires|expect|max_body|max_streams|stream|send|static|cache|fallback|cors|describe|private|from|domain|tls|redirect|proxy|host|paged|per|rate_limit|unlimited|none|mount|at)\\b"
+        },
+        {
+          "name": "keyword.control.module.synsema",
+          "match": "\\b(use|export|routes|enum)\\b"
         }
       ]
     },

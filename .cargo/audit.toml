@@ -1,0 +1,20 @@
+# Config de cargo-audit (CI: job `audit` en .github/workflows/ci.yml).
+# Cada ignore lleva su justificación — revisar al actualizar las deps involucradas.
+
+[advisories]
+ignore = [
+    # rkyv 0.7 (RUSTSEC-2026-0235): entra a Cargo.lock solo como dependencia OPCIONAL
+    # de rust_decimal, con la feature `rkyv` DESACTIVADA — el crate no se compila ni se
+    # linkea en ningún binario (verificable: `cargo tree -i rkyv` no imprime nada).
+    # rust_decimal 1.x pinnea rkyv 0.7; quitar este ignore cuando rust_decimal migre a
+    # rkyv >= 0.8.17 o el lock deje de listar opcionales no activados.
+    "RUSTSEC-2026-0235",
+
+    # rsa 0.9 (RUSTSEC-2023-0071, "Marvin"): timing sidechannel en operaciones de CLAVE
+    # PRIVADA (decrypt/sign). synsema-stdlib usa `rsa` EXCLUSIVAMENTE para VERIFICAR
+    # firmas RS256 con clave PÚBLICA (oidc.rs — jwt_verify/oidc_verify); el único uso de
+    # SigningKey vive en #[cfg(test)] para fabricar tokens de prueba. Sin clave privada
+    # en producción no hay superficie Marvin. Upstream no publica fix ("no fixed upgrade
+    # is available"); revisar si algún día firmamos RS256.
+    "RUSTSEC-2023-0071",
+]

@@ -1,0 +1,28 @@
+-- Módulo de rutas montable (`export routes`): la tienda vive acá, el app la monta.
+-- Los cuerpos de ruta pueden llamar helpers PRIVADOS del módulo (fmt_precio no se exporta).
+
+task fmt_precio(n)
+    give "$" + text(n)
+
+task catalogo()
+    give [
+        {"nombre": "Teclado", "precio": fmt_precio(89)},
+        {"nombre": "Mouse", "precio": fmt_precio(45)},
+        {"nombre": "Monitor </script>", "precio": fmt_precio(320)}
+    ]
+
+export routes tienda
+    route "GET /tienda"
+        give render("examples/templates/tienda.html", {
+            "title": "Tienda demo",
+            "productos": catalogo(),
+            "data_json": json_for_script(catalogo())
+        })
+
+    route "GET /api/productos"
+        give catalogo()
+
+    route "POST /api/comprar"
+        expect body {nombre: text}
+        let b be json of request
+        give created({"comprado": nombre of b})

@@ -47,7 +47,7 @@ use synsema_core::interpreter::{
 use synsema_core::number::Number;
 use synsema_core::parser::{parse_source, CompileError};
 use synsema_core::types::{
-    from_send, syn_bool, syn_bytes, syn_map, syn_nothing, syn_text, to_send, SendValue,
+    from_send, syn_bool, syn_bytes, syn_int, syn_map, syn_nothing, syn_text, to_send, SendValue,
     ServerValue, SynTaskValue, SynValue,
 };
 use synsema_stdlib::acme;
@@ -57,15 +57,15 @@ use synsema_stdlib::cron::{
 };
 use synsema_stdlib::database::{register_database_builtins, DatabaseManager};
 use synsema_stdlib::server::{
-    self, json_to_syn, serve_forever, AuthHandler, Ctx, Emitter, GiveOutcome, Handler, RouteSpec,
-    ServeRuntime, StreamEnd, StreamGone, StreamHandler,
+    self, json_to_syn, serve_forever, AuthHandler, Ctx, Emitter, ErrorHandler, GiveOutcome,
+    Handler, RouteSpec, ServeRuntime, StaticMountSpec, StreamEnd, StreamGone, StreamHandler,
 };
 
 /// Manager de base de datos compartido entre el top-level y los hilos de conexión.
 type SharedDb = Arc<Mutex<DatabaseManager>>;
 
 /// Tabla de un host (default o vhost): rutas + static mounts (prefijo, dir) + auth.
-type HostTable = (Vec<RouteSpec>, Vec<(String, String)>, Option<AuthHandler>);
+type HostTable = (Vec<RouteSpec>, Vec<StaticMountSpec>, Option<AuthHandler>);
 
 /// Estado mutable compartido entre todos los route handlers de un serve.
 /// Respaldo de `state_set`/`state_get`/`state_incr` — alternativa explícita
@@ -1351,9 +1351,63 @@ fn build_request_syn(ctx: &Ctx) -> SynValue {
     m.insert("cookies".to_string(), syn_map(cookies));
     m.insert("query".to_string(), str_map(&ctx.query));
     m.insert("params".to_string(), str_map(&ctx.params));
+    // `form of request` — body de formulario parseado según Content-Type:
+    //   application/x-www-form-urlencoded → {campo: texto}
+    //   multipart/form-data → campo de texto → texto; archivo → {filename,
+    //     content_type, data (bytes exactos)}
+    // Sin form body → map VACÍO (como cookies: siempre navegable, nunca nothing).
+    m.insert("form".to_string(), build_form_syn(ctx));
     m.insert("ip".to_string(), syn_text(ctx.client_ip.as_str()));
     m.insert("user".to_string(), ctx.user.clone().unwrap_or_else(syn_nothing));
     syn_map(m)
+}
+
+/// Parsea el body de formulario del request (urlencoded o multipart) → SynMap.
+/// Para bodies spilled a disco (grandes uploads multipart) lee el temp file.
+fn build_form_syn(ctx: &Ctx) -> SynValue {
+    let ctype = ctx
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let mut out = IndexMap::new();
+    if ctype.to_ascii_lowercase().contains("application/x-www-form-urlencoded") {
+        let body = if let Some(bf) = &ctx.body_file {
+            std::fs::read_to_string(bf).unwrap_or_default()
+        } else {
+            ctx.body.clone()
+        };
+        for (k, v) in server::parse_form_urlencoded(&body) {
+            out.insert(k, syn_text(v.as_str()));
+        }
+    } else if let Some(boundary) = server::multipart_boundary(ctype) {
+        let raw: Vec<u8> = if let Some(bf) = &ctx.body_file {
+            std::fs::read(bf).unwrap_or_default()
+        } else {
+            ctx.body_raw.clone()
+        };
+        for part in server::parse_multipart(&boundary, &raw) {
+            let value = match &part.filename {
+                None => syn_text(String::from_utf8_lossy(&part.data).as_ref()),
+                Some(fname) => {
+                    let mut f = IndexMap::new();
+                    f.insert("filename".to_string(), syn_text(fname.as_str()));
+                    f.insert(
+                        "content_type".to_string(),
+                        match &part.content_type {
+                            Some(ct) => syn_text(ct.as_str()),
+                            None => syn_nothing(),
+                        },
+                    );
+                    f.insert("data".to_string(), syn_bytes(part.data.clone()));
+                    syn_map(f)
+                }
+            };
+            out.insert(part.name, value);
+        }
+    }
+    syn_map(out)
 }
 
 /// Las bindings que ve un handler, LOCALES al scope hijo del request (no globales →
@@ -1560,6 +1614,45 @@ fn resolve_rate(
 
 type Servers = Arc<Mutex<Vec<JoinHandle<()>>>>;
 
+/// Validación al arranque de templates literales: cada `render("literal.html", ...)`
+/// en un cuerpo de ruta se resuelve y parsea (recursivo: incluye sus `include`/`layout`
+/// literales) ANTES de aceptar tráfico. Un typo o un template roto falla acá — no como
+/// un 500 en el primer request. Los `render(<expr>)` dinámicos no se pueden validar
+/// estáticamente y quedan para runtime, como siempre.
+fn validate_route_templates(routes_n: &[Node]) -> Result<(), Control> {
+    use synsema_core::ast::NodeKind as NK;
+    for r in routes_n {
+        let mut err: Option<String> = None;
+        synsema_core::ast_api::walk(r, &mut |n: &Node| {
+            if err.is_some() {
+                return;
+            }
+            if let NK::TaskCall { name, arguments } = &n.kind {
+                if matches!(&name.kind, NK::Identifier { name } if name == "render") {
+                    if let Some(first) = arguments.first() {
+                        if first.name.is_none() {
+                            if let NK::TextLiteral { value } = &first.value.kind {
+                                if let Err(e) =
+                                    synsema_core::templates::validate_template(value)
+                                {
+                                    err = Some(format!(
+                                        "template validation failed for render(\"{}\"): {}",
+                                        value, e
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        if let Some(e) = err {
+            return Err(Control::Error(RuntimeError::new(e)));
+        }
+    }
+    Ok(())
+}
+
 /// Construye la tabla (rutas + estáticos + auth) de un host (default o vhost) desde
 /// sus nodos AST. Reusado por el host default y por cada bloque `host "..."`.
 #[allow(clippy::too_many_arguments)]
@@ -1567,6 +1660,7 @@ fn build_host_table(
     interp: &mut Interpreter,
     env: &Rc<RefCell<synsema_core::interpreter::Environment>>,
     routes_n: &[Node],
+    mounts_n: &[Node],
     static_mounts_n: &[Node],
     auth_handler_n: Option<&Node>,
     block_limit: Option<(i64, f64)>,
@@ -1585,11 +1679,14 @@ fn build_host_table(
     secure: bool,
     mem_name: &Option<String>,
 ) -> Result<HostTable, Control> {
-    // -- static mounts (dedup por prefijo) --
-    let mut static_mounts: Vec<(String, String)> = Vec::new();
+    // Templates literales de las rutas: validados al construir el serve (fail-fast).
+    validate_route_templates(routes_n)?;
+
+    // -- static mounts (dedup por prefijo; cache/fallback validados fail-fast) --
+    let mut static_mounts: Vec<StaticMountSpec> = Vec::new();
     let mut seen_prefixes: Vec<String> = Vec::new();
     for mount in static_mounts_n {
-        if let NodeKind::StaticMount { directory, prefix } = &mount.kind {
+        if let NodeKind::StaticMount { directory, prefix, cache, fallback } = &mount.kind {
             let dir = interp.eval(directory, env)?.to_string();
             let prefix_str = match prefix {
                 Some(p) => interp.eval(p, env)?.to_string(),
@@ -1603,7 +1700,39 @@ fn build_host_table(
                 ))));
             }
             seen_prefixes.push(key);
-            static_mounts.push((prefix_str, dir));
+            // `cache "<spec>"` → valor Cache-Control, validado ACÁ (arranque), nunca
+            // en un request.
+            let cache_val = match cache {
+                Some(c) => {
+                    let spec = interp.eval(c, env)?.to_string();
+                    match server::cache_control_value(&spec) {
+                        Ok(v) => Some(v),
+                        Err(e) => return Err(Control::Error(RuntimeError::new(e))),
+                    }
+                }
+                None => None,
+            };
+            // `fallback "<file>"` → debe existir dentro del mount al arrancar.
+            let fallback_val = match fallback {
+                Some(f) => {
+                    let fb = interp.eval(f, env)?.to_string();
+                    let candidate = std::path::Path::new(&dir).join(&fb);
+                    if !candidate.is_file() {
+                        return Err(Control::Error(RuntimeError::new(format!(
+                            "static fallback '{}' not found in '{}' — the fallback file must exist when the server starts",
+                            fb, dir
+                        ))));
+                    }
+                    Some(fb)
+                }
+                None => None,
+            };
+            static_mounts.push(StaticMountSpec {
+                prefix: prefix_str,
+                dir,
+                cache: cache_val,
+                fallback: fallback_val,
+            });
         }
     }
 
@@ -1755,7 +1884,191 @@ fn build_host_table(
             });
         }
     }
+
+    // -- rutas montadas: `mount <expr> [at "/prefix"]` sobre un grupo `export routes` --
+    // El grupo se evalúa AHORA (fail-fast: forma inválida = error de arranque); el
+    // handler re-evalúa la expresión por request (igual que el auth handler) para
+    // obtener la task REBUILDEADA que cierra sobre el module_env del request.
+    for mnode in mounts_n {
+        if let NodeKind::MountClause { source, prefix } = &mnode.kind {
+            let group = interp.eval(source, env)?;
+            let metas: Vec<SynValue> = match &group {
+                SynValue::Map(m) => match m.borrow().get("_routes_meta") {
+                    Some(SynValue::List(l)) => l.borrow().clone(),
+                    _ => {
+                        return Err(Control::Error(RuntimeError::new(
+                            "mount expects a routes group (a module's `export routes ...`) — the value has no routes"
+                                .to_string(),
+                        )))
+                    }
+                },
+                other => {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "mount expects a routes group (a module's `export routes ...`), got {}",
+                        other.type_name()
+                    ))))
+                }
+            };
+            // Los templates literales de las rutas MONTADAS también se validan al
+            // arranque (los cuerpos viven en las handler-tasks del grupo).
+            if let SynValue::Map(m) = &group {
+                for (k, v) in m.borrow().iter() {
+                    if k.starts_with("_route_handler_") {
+                        if let SynValue::Task(t) = v {
+                            validate_route_templates(&t.body)?;
+                        }
+                    }
+                }
+            }
+            let prefix_str = match prefix {
+                Some(p) => {
+                    let s = interp.eval(p, env)?.to_string();
+                    if !s.starts_with('/') {
+                        return Err(Control::Error(RuntimeError::new(format!(
+                            "mount prefix must start with '/', got '{}'",
+                            s
+                        ))));
+                    }
+                    s.trim_end_matches('/').to_string()
+                }
+                None => String::new(),
+            };
+            for (i, meta) in metas.iter().enumerate() {
+                let mm = match meta {
+                    SynValue::Map(m) => m.borrow().clone(),
+                    _ => continue,
+                };
+                let method = mm.get("method").map(|v| v.to_string()).unwrap_or_default();
+                let rpath = mm.get("path").map(|v| v.to_string()).unwrap_or_default();
+                let requires_auth = matches!(mm.get("requires_auth"), Some(SynValue::Bool(true)));
+                let params: Vec<String> = match mm.get("params") {
+                    Some(SynValue::List(l)) => l.borrow().iter().map(|x| x.to_string()).collect(),
+                    _ => Vec::new(),
+                };
+                if requires_auth && auth_handler.is_none() {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "mounted route \"{} {}\" uses 'requires auth' but the 'serve' block declares no 'auth with <task>'",
+                        method, rpath
+                    ))));
+                }
+                let full_path = if prefix_str.is_empty() {
+                    rpath.clone()
+                } else if rpath == "/" {
+                    prefix_str.clone()
+                } else {
+                    format!("{}{}", prefix_str, rpath)
+                };
+                let (eff_rate, zone) = match block_limit {
+                    Some(bl) => (Some(bl), Some("__default__".to_string())),
+                    None => (None, None),
+                };
+                let source_c = source.as_ref().clone();
+                let key = format!("_route_handler_{}", i);
+                let swarm_c = swarm.clone();
+                let snap_c = snapshot.clone();
+                let caps_c = caps_snap.clone();
+                let rules_c = rules_snap.clone();
+                let mem_c = shared_memory.clone();
+                let ow_c = on_write.clone();
+                let prog_c = shared_progress.clone();
+                let owp_c = on_write_progress.clone();
+                let st_c = shared_state.clone();
+                let ap_c = approvals.clone();
+                let cron_c = cron.clone();
+                let db_c = shared_db.clone();
+                let mn_c = mem_name.clone();
+                let handler: Handler = Arc::new(move |ctx: &Ctx| {
+                    run_mounted_route(
+                        &swarm_c, &snap_c, &caps_c, &db_c, &rules_c, &mem_c, &ow_c, &prog_c,
+                        &owp_c, &st_c, &ap_c, &cron_c, &source_c, &key, ctx, secure, &mn_c,
+                    )
+                });
+                routes.push(RouteSpec {
+                    method,
+                    path: full_path,
+                    param_names: params,
+                    requires_auth,
+                    streaming: false,
+                    rate_limit: eff_rate,
+                    rate_zone: zone,
+                    handler,
+                    stream_handler: None,
+                    proxy_target: None,
+                });
+            }
+        }
+    }
     Ok((routes, static_mounts, auth_handler))
+}
+
+/// Corre el cuerpo de una ruta MONTADA desde un grupo `export routes`: re-evalúa la
+/// expresión del mount en el intérprete del request (los globals rebuildeados ya
+/// contienen el alias del módulo con su module_env compartido — DE-027/033), toma la
+/// handler-task y ejecuta su cuerpo con los bindings de request colgando del
+/// module_env → los helpers privados del módulo resuelven por nombre simple.
+#[allow(clippy::too_many_arguments)]
+fn run_mounted_route(
+    swarm: &Arc<Swarm>,
+    snapshot: &Arc<Vec<(String, GlobalVal)>>,
+    caps_snap: &Arc<Vec<Capability>>,
+    shared_db: &SharedDb,
+    rules_snap: &Arc<Vec<OwnerRule>>,
+    shared_memory: &SharedMemoryStore,
+    on_write: &OnWriteFn,
+    shared_progress: &SharedProgressStore,
+    on_write_progress: &OnWriteProgressFn,
+    shared_state: &SharedState,
+    approvals: &ServeApprovals,
+    cron: &CronWiring,
+    source: &Node,
+    handler_key: &str,
+    ctx: &Ctx,
+    secure: bool,
+    mem_name: &Option<String>,
+) -> GiveOutcome {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, |interp| {
+        let (identity, limits) = match &ctx.user {
+            Some(u) => (server::identity_of(u), server::delegated_spend_of(u)),
+            None => (None, Vec::new()),
+        };
+        interp.set_request_identity(identity, limits);
+        let genv = interp.global_env.clone();
+        let group = match interp.eval(source, &genv) {
+            Ok(v) => v,
+            Err(Control::Error(e)) => {
+                return GiveOutcome::Error(format!(
+                    "mounted routes group is not available: {}",
+                    e.message
+                ))
+            }
+            Err(_) => return GiveOutcome::Error("mounted routes group is not available".to_string()),
+        };
+        let task = match &group {
+            SynValue::Map(m) => m.borrow().get(handler_key).cloned(),
+            _ => None,
+        };
+        let task = match task {
+            Some(SynValue::Task(t)) => t,
+            _ => {
+                return GiveOutcome::Error(format!(
+                    "mounted route handler '{}' not found in the routes group",
+                    handler_key
+                ))
+            }
+        };
+        let parent = task.closure_env.clone();
+        match interp.run_request_block_in(&task.body, request_bindings(ctx), &parent) {
+            Ok(_) => GiveOutcome::Give(None),
+            Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
+            Err(Control::Error(e)) if e.is_validation => {
+                GiveOutcome::Validation { message: e.message.clone(), field: e.field.clone() }
+            }
+            Err(Control::Error(e)) => GiveOutcome::Error(e.to_string()),
+            Err(Control::Stop(_)) => {
+                GiveOutcome::Error("'give'/'stop' used outside of a task or loop".to_string())
+            }
+        }
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1780,6 +2093,7 @@ fn make_serve_hook(
         let (
             port_n,
             auth_handler_n,
+            error_handler_n,
             max_body_n,
             max_streams_n,
             block_rate_n,
@@ -1795,10 +2109,12 @@ fn make_serve_hook(
             tls_auto_email_n,
             domain_n,
             hosts_n,
+            mounts_n,
         ) = match &node.kind {
             NodeKind::ServeBlock {
                 port,
                 auth_handler,
+                error_handler,
                 max_body,
                 max_streams,
                 rate_limit,
@@ -1814,9 +2130,11 @@ fn make_serve_hook(
                 tls_auto_email,
                 domain,
                 hosts,
+                mounts,
             } => (
                 port.as_ref(),
                 auth_handler.as_deref(),
+                error_handler.as_deref(),
                 max_body.as_deref(),
                 max_streams.as_deref(),
                 rate_limit.as_deref(),
@@ -1832,6 +2150,7 @@ fn make_serve_hook(
                 tls_auto_email.as_deref(),
                 domain.as_deref(),
                 hosts,
+                mounts,
             ),
             _ => return Err(Control::Error(RuntimeError::new("internal: serve_hook on non-serve node"))),
         };
@@ -1985,6 +2304,7 @@ fn make_serve_hook(
             interp,
             env,
             routes_n,
+            mounts_n,
             static_mounts_n,
             auth_handler_n,
             block_limit,
@@ -2004,11 +2324,71 @@ fn make_serve_hook(
             &mem_name,
         )?;
 
+        // -- errors with <task> (serve-level): páginas de error propias para
+        // 401/404/405/500. Misma mecánica que el auth handler: la task corre en un
+        // intérprete de request con el snapshot de globals. Aridad fija (3) validada
+        // al construir el serve (fail-fast).
+        let error_handler: Option<ErrorHandler> = match error_handler_n {
+            None => None,
+            Some(en) => {
+                let arity: usize = match interp.eval(en, env) {
+                    Ok(SynValue::Task(t)) => t.parameters.len(),
+                    _ => 3,
+                };
+                if arity != 3 {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "errors task must take 3 parameters (status, message, request), got {}",
+                        arity
+                    ))));
+                }
+                let err_node = en.clone();
+                let swarm_e = swarm.clone();
+                let snap_e = snapshot.clone();
+                let caps_e = caps_snap.clone();
+                let rules_e = rules_snap.clone();
+                let mem_e = shared_memory.clone();
+                let ow_e = on_write.clone();
+                let prog_e = shared_progress.clone();
+                let owp_e = on_write_progress.clone();
+                let st_e = shared_state.clone();
+                let ap_e = approvals.clone();
+                let cron_e = cron.clone();
+                let db_e = shared_db.clone();
+                let mn_e = mem_name.clone();
+                let h: ErrorHandler = Arc::new(
+                    move |status: i64, message: &str, ctx: &Ctx| -> Option<SynValue> {
+                        with_serve_interp(&swarm_e, &snap_e, &caps_e, &db_e, &rules_e, &mem_e, &ow_e, &prog_e, &owp_e, &st_e, &ap_e, &cron_e, secure, &mn_e, |interp| {
+                            let genv = interp.global_env.clone();
+                            let task = match interp.eval(&err_node, &genv) {
+                                Ok(t) => t,
+                                Err(_) => return None,
+                            };
+                            let args =
+                                vec![syn_int(status), syn_text(message), build_request_syn(ctx)];
+                            match interp.call_task(task, args) {
+                                Ok(SynValue::Nothing) => None,
+                                Ok(v) => Some(v),
+                                Err(e) => {
+                                    // La task de errores falló: se loggea y el default
+                                    // JSON responde — un bug acá jamás tumba el error path.
+                                    if let Control::Error(re) = e {
+                                        eprintln!("[serve] errors task failed: {}", re.message);
+                                    }
+                                    None
+                                }
+                            }
+                        })
+                    },
+                );
+                Some(h)
+            }
+        };
+
         // -- vhosts (Lote 1): cada `host "..."` con su propia tabla + cert opcional (SNI) --
         struct VHostBuilt {
             pattern: String,
             routes: Vec<RouteSpec>,
-            static_mounts: Vec<(String, String)>,
+            static_mounts: Vec<StaticMountSpec>,
             auth_handler: Option<AuthHandler>,
             tls_cert: Option<String>,
             tls_key: Option<String>,
@@ -2029,6 +2409,7 @@ fn make_serve_hook(
                     interp,
                     env,
                     routes,
+                    &[],
                     static_mounts,
                     auth_handler.as_deref(),
                     block_limit,
@@ -2174,6 +2555,10 @@ fn make_serve_hook(
             secure,
         );
         runtime.tls_enabled = use_tls;
+        // `errors with <task>`: páginas de error propias (401/404/405/500).
+        if let Some(h) = error_handler {
+            runtime.set_error_handler(h);
+        }
         // Rutas reservadas /approvals (A1.v2): el server responde la cola de gates
         // humanos vía el gateway (GET lista sin tokens; POST con OTT responde).
         runtime.approvals = Some(Arc::new(QueueGateway(approvals.queue.clone())));

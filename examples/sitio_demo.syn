@@ -1,0 +1,36 @@
+intent: "Sitio demo de la tanda frontend: rutas montadas desde un módulo, páginas de error propias, formularios y estáticos con cache. Correr desde la raíz del repo: synsema serve examples/sitio_demo.syn (o con --watch para el loop de dev)."
+
+require serve(8095)
+
+use "./shop_routes.syn" as shop
+
+-- `errors with`: 404/500 con página HTML para navegadores, JSON intacto para agentes;
+-- 401 redirige al login. El status del error SIEMPRE se conserva (salvo redirect).
+task pagina_error(status, message, request)
+    when status == 401
+        give redirect("/tienda")
+    let accept be accept of (headers of request)
+    when accept == nothing
+        set accept to ""
+    when contains(accept, "text/html")
+        give html("<!DOCTYPE html><h1>" + text(status) + "</h1><p>" + message + "</p><a href=\"/tienda\">Volver a la tienda</a>")
+    give nothing
+
+serve on 8095
+    errors with pagina_error
+
+    -- Todas las rutas de la tienda viven en el módulo; el app solo las monta.
+    mount shop.tienda
+
+    -- Estáticos con política de cache y fallback SPA (try_files):
+    static "/assets" from "./examples/public" cache "1h"
+
+    route "GET /"
+        give redirect("/tienda")
+
+    -- `form of request`: un <form method="post"> clásico, sin fetch ni JSON.
+    route "POST /suscribir"
+        let f be form of request
+        when not contains(keys(f), "email")
+            give fail(422, "falta el email")
+        give {"suscripto": f.email}

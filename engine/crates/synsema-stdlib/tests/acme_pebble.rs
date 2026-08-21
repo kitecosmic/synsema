@@ -165,7 +165,12 @@ fn acme_http01_end_to_end_against_pebble() {
         None,
         None,
         64,
-        vec![("/".to_string(), www.to_string_lossy().into_owned())],
+        vec![server::StaticMountSpec {
+            prefix: "/".to_string(),
+            dir: www.to_string_lossy().into_owned(),
+            cache: None,
+            fallback: None,
+        }],
         None,
         None,
         None,

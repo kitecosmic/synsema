@@ -125,12 +125,19 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `give heading(...)` renders an HTML heading | Without `content()` a node degrades to its **JSON** form | Wrap the tree in `content(page([...]))` to get HTML/Markdown |
 | My internal server exposes `/llms.txt` with all its routes | `/llms.txt` + `/robots.txt` are ON by default (agent-discoverable) | Add `private` to the serve block: `/llms.txt` → 404, robots `Disallow: /` |
 | `describe`/`private` can't be used as variable names | They're soft keywords — only special in a serve block | `let private be 1` and `let describe be x` are still valid |
-| CSS `body { }` in a `render()` template breaks | `{`/`}` are template hole delimiters | Put CSS/JS in external files served by `static`; literal brace via `{ "{" }` |
+| CSS `body { }` inline in a `render()` template breaks | `{`/`}` are template hole delimiters | Wrap the CSS/JS block in `{ raw }` … `{ end }` (verbatim), or serve it from `static`; single literal brace via `{ "{" }` |
+| `<script>const D = { raw json_encode(x) };</script>` is safe | It's XSS — a value containing `</script>` breaks out of the tag | Use `{ raw json_for_script(x) }` (escapes `<`/`>`/`&` as `\u00XX`) |
 | User HTML in `{ expr }` renders as a live tag | `render()` auto-escapes every hole (XSS-safe) | Use `{ raw expr }` for trusted HTML on purpose |
 | `render("/etc/passwd", ...)` reads any file | Template paths are cwd-relative; escaping the cwd is blocked | Keep templates under the project; absolute/`..` paths error |
 | `{ type }` in a template fails ("reserved word") | A single-name hole is a direct data lookup — reserved words work | Just use `{ type }`; the field resolves from the data |
-| A typo in a `render("x.html")` path only fails on first request | `render("literal")` templates are validated **at startup** (fail-fast) | Fix the path/syntax; the program won't start until it's valid |
-| My `500` leaks a stack/message in production | Detail is shown in **dev**; `--secure` returns a generic body | Run with `--secure` in prod; the full detail still goes to the server log |
+| `{ include "partials/nav.html" }` inside `pages/home.html` looks in `pages/partials/` | Include/layout paths resolve against the **working dir**, not the including template | Write all template paths from the project root (`partials/nav.html` everywhere) |
+| `{ fmt(x) }` in a template → `Undefined variable` under serve | The task was defined **after** the `serve` block — the per-request snapshot is taken there | Define tasks **before** `serve on`; then they're callable in holes |
+| `{ each x in m }` over a map iterates entries | Hard error (`Cannot iterate over map`) | Iterate `{ each k in keys(m) }`; for indexes use `enumerate(list)` |
+| Editing a template/CSS needs a server restart | Templates & statics hot-reload **per request** (mtime-based) | Just refresh the browser; only `.syn` changes need a restart (`serve --watch` automates it) |
+| A typo in a `render("x.html")` path only fails on first request | `render("literal")` templates are validated **at startup** (fail-fast), and by `synsema check` | Fix the path/syntax; the program won't start until it's valid |
+| `f.email` on a form without that field gives nothing | A missing map key is a hard error (`Map has no key`) | Check first: `contains(keys(f), "email")` |
+| A CRLF (Windows) file with blank lines inside a block fails to parse | Fixed — blank `\r\n` lines no longer emit a phantom dedent (engine > v0.5.9) | Update the binary if you see `Unexpected token: INDENT` on a CRLF file |
+| My `500` leaks a stack/message in production | Detail is shown in **dev**; `--secure` returns a generic body | Run with `--secure` in prod; the full detail still goes to the server log; an `errors with` task receives the redacted message under `--secure` |
 
 ### Anti-patterns
 

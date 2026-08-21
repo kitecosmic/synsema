@@ -151,8 +151,11 @@ sandbox
 ```
 
 ## Modules (`use` / `export`)
-Split code across files. `export` makes a `task`/`type`/`let`/`enum` public; anything else is private.
-`use` imports a local `.syn` module under an alias (the module is a `map` of its exports).
+Split code across files. `export` makes a `task`/`type`/`let`/`enum`/`routes` public; anything
+else is private. `use` imports a local `.syn` module under an alias (the module is a `map` of
+its exports). An `export routes <name>` group (a block of `route ...` definitions) is mounted
+by a serve block with `mount alias.name [at "/prefix"]` — see [modules.md](modules.md) and
+[serve.md](serve.md).
 ```
 -- lib.syn
 export task greet(name)

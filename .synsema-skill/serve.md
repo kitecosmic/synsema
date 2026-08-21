@@ -10,9 +10,11 @@ single static binary.
 > available through the Synsema engine runtime"*. `serve` wires up that runtime
 > (HTTP, crons, agents) and keeps the process alive.
 
-> **This file is long (~1000 lines) — jump to the `## ` section you need instead of reading it all:**
-> Capability · Basic shape · The request · Shared mutable state (`state_*`) · Response contract ·
-> Serving web pages (HTML, static files, CORS) · Web for agents (SSR, negotiation & discoverability) ·
+> **This file is long (~1100 lines) — jump to the `## ` section you need instead of reading it all:**
+> Capability · Basic shape · Mounted routes (`mount`) · The request (incl. `form of request`) ·
+> Shared mutable state (`state_*`) · Response contract · Custom error pages (`errors with`) ·
+> Serving web pages (HTML, static files with cache/fallback, CORS) ·
+> Web for agents (SSR, negotiation & discoverability) ·
 > Pagination · Streaming responses (SSE) · Rate limiting · Auth (incoming) · Agent identity ·
 > Input validation · Request body limits · Isolation · Full example ·
 > Production web stack (TLS / auto-HTTPS / vhosts / reverse proxy / HTTP-2) · Template composition
@@ -82,23 +84,60 @@ first.
 
 ### Soft keywords
 
-`serve`, `on`, `route`, `auth`, `requires`, `expect`, `max_body`, `max_streams`,
-`stream`, `send`, `rate_limit`, `per`, `static`, `from`, `cors`, `describe` and
-`private` are **soft keywords**: they are special *only* at the start of their
-construction (`serve on N`, `route "..."`, `requires auth`, `expect body {...}`,
+`serve`, `on`, `route`, `auth`, `errors`, `requires`, `expect`, `max_body`,
+`max_streams`, `stream`, `send`, `rate_limit`, `per`, `static`, `from`, `cache`,
+`fallback`, `cors`, `describe`, `private`, `mount` and `at` are **soft keywords**:
+they are special *only* at the start of their construction (`serve on N`,
+`route "..."`, `requires auth`, `errors with <task>`, `expect body {...}`,
 `max_body "10mb"`, `max_streams N`, a `stream` block, `send` inside one,
-`rate_limit N per window`, `static "./dir"`, `static "/p" from "./dir"`,
-`cors "*"`, a `describe` block, `private`). Everywhere else they are ordinary
-names — `let route be "/x"`, `let static be 1`, `let private be 1` and
-`task auth(x)` are valid. The parser decides with fixed lookahead, never heuristics.
+`rate_limit N per window`, `static "./dir" [cache "1h"] [fallback "index.html"]`,
+`cors "*"`, a `describe` block, `private`, `mount <expr> [at "/p"]`). Everywhere
+else they are ordinary names — `let route be "/x"`, `let static be 1`,
+`let cache be 1` and `task auth(x)` are valid. The parser decides with fixed
+lookahead, never heuristics.
+
+### Mounted routes — `mount` (routes that live in a module)
+
+A module can export a **routes group** and the serve block mounts it — the way to
+split a big serve into files:
+
+```
+-- shop.syn (module)
+task fmt(n)                       -- PRIVATE helper: mounted bodies can call it
+    give "$" + text(n)
+export routes tienda
+    route "GET /shop"
+        give html("<h1>" + fmt(99) + "</h1>")
+    route "POST /shop/buy"
+        expect body {item: text}
+        ...
+
+-- app.syn
+use "./shop.syn" as shop
+serve on 8080
+    mount shop.tienda              -- routes join the table as declared
+    mount shop.tienda at "/v2"     -- same group under a prefix
+```
+
+- Mounted route bodies are ordinary route bodies: `request`/`query`/`params`,
+  `expect`, `give`, helpers of the module (exported or private) by simple name.
+- The group's shape is validated when the serve is built (fail-fast), including
+  "`requires auth` needs an `auth with` on the serve block". `render("literal.html")`
+  calls inside mounted bodies are startup-validated too, like any route.
+- Prefix rules: `at "/p"` must start with `/`; `route "GET /"` mounted at `/p`
+  answers at `/p`. Precedence/specificity work as for any route.
+- v1 limits (clear errors): no `stream` routes in a group, no per-route
+  `rate_limit` inside a group (the serve default applies), `mount` at serve level
+  only (not inside `host` blocks).
 
 ## The request
 
 Inside a handler you have:
 
 ```
-request          -- map with .method .path .body .json .headers .cookies .user .body_file
+request          -- map with .method .path .body .json .form .headers .cookies .user .body_file
 json of request  -- parsed JSON body (a map), or nothing
+form of request  -- parsed FORM body (a map; see below) — classic <form> posts
 body of request  -- raw body text (in-memory bodies; "" when spilled to disk)
 headers of request
 cookies of request -- incoming cookies as a map (RFC 6265, undecoded; no header → empty map)
@@ -113,6 +152,33 @@ params           -- path params as a map: /products/:id → params.id
 
 All `query` and `params` values are text. Use `read_body()` to get the whole
 body regardless of where it lives (memory or disk) — see "Request body limits".
+
+### `form of request` — classic HTML forms (no fetch/JSON needed)
+
+Parsed from the body according to `Content-Type`; no form body → **empty map**
+(always navigable, like `cookies`):
+
+- `application/x-www-form-urlencoded` (a plain `<form method="post">`) →
+  `{field: text}`, percent-decoded, `+` → space, last value wins.
+- `multipart/form-data` (`<form enctype="multipart/form-data">`) → text fields as
+  text; **file uploads** as `{filename, content_type, data}` where `data` is the
+  exact `bytes`. Large bodies spilled to disk are read from the temp file.
+
+```
+route "POST /signup"
+    let f be form of request
+    when not contains(keys(f), "email")
+        give fail(422, "missing email")
+    give {"ok": true, "email": f.email}
+
+route "POST /upload"
+    let file be archivo of (form of request)
+    write_file_bytes("uploads/" + (filename of file), data of file)   -- require file(...)
+    give created({"bytes": length(data of file)})
+```
+
+⚠️ A missing map key errors (`Map has no key 'email'`) — check membership with
+`contains(keys(f), "campo")` before accessing optional fields.
 
 ## Shared mutable state across requests (`state_*`)
 
@@ -188,6 +254,44 @@ on the mode:
 
 This applies to **all** uncaught 500s, not just templates.
 
+### Custom error pages — `errors with <task>`
+
+By default runtime errors are JSON. For a real website, declare an errors task on
+the serve block — it shapes the BODY of `401` / `404` / `405` / `500`:
+
+```
+task error_page(status, message, request)
+    when status == 401
+        give redirect("/login")                 -- a redirect's 3xx IS honored
+    let accept be accept of (headers of request)
+    when accept == nothing
+        set accept to ""
+    when contains(accept, "text/html")
+        give render("pages/error.html", {"status": status, "message": message})
+    give nothing                                -- nothing → default JSON (agents keep JSON)
+
+serve on 8080
+    errors with error_page
+    ...
+```
+
+- The task takes exactly **3 parameters** `(status, message, request)` — arity is
+  validated when the serve is built.
+- **The error status is preserved** — a 404 page is served WITH status 404 (no
+  soft-404s). The single exception: returning `redirect(...)` keeps its 3xx +
+  `Location` (the "401 → login" pattern).
+- Return `html(...)`, `render(...)`, a map, or `content(...)` (negotiated by
+  `Accept` — the same error page serves HTML to browsers and Markdown to agents).
+  `with_header`/`set_cookie` wrappers work.
+- `nothing` → the default JSON body. If the errors task itself errors, the default
+  JSON responds and the failure is logged — a bug here can never take down the
+  error path.
+- On a 500 under `--secure`, the task receives the already-redacted message
+  ("internal server error") so a custom page can't re-leak internals; the full
+  detail still goes to the server log.
+- The 405's `Allow` header and the 429/`expect`-400 bodies are untouched (429 and
+  validation 400s stay JSON by design).
+
 ### Request logging (the terminal is quiet by default)
 
 `serve` does **not** write an access log — add a `log` in your handlers to see requests live:
@@ -242,10 +346,20 @@ from it. You can mount several dirs, each at its own URL prefix:
 ```
 serve on 8090
     static "./public"                 -- root mount: "/" → ./public/index.html
-    static "/assets" from "./assets"  -- mount ./assets under the "/assets" prefix
+    static "/assets" from "./assets" cache "1h"          -- + Cache-Control policy
+    static "/app" from "./dist" fallback "index.html"    -- + SPA history-fallback
     route "POST /api/signup"          -- declared routes ALWAYS win over static
         ...
 ```
+
+- **`cache "<spec>"`** (optional, per mount) → a `Cache-Control` header on the
+  mount's responses (200/206/304): `"immutable"` (→ `public, max-age=31536000,
+  immutable`, for fingerprinted assets), `"no-store"`, raw seconds, or `<N>s/m/h/d`
+  (`"30s"`, `"5m"`, `"1h"`, `"7d"`). An invalid spec fails at startup, never on a
+  request. Without `cache`, no Cache-Control is sent (ETag/304 still apply).
+- **`fallback "<file>"`** (optional, per mount) → when a path misses inside the
+  mount, that file is served with **200** (nginx `try_files` semantics) — the SPA
+  history-fallback. The file must exist at startup (fail-fast).
 
 - A `GET`/`HEAD` with no matching route falls through to the static handler:
   the file is served with a content-type from its extension (`.html`, `.css`,
@@ -326,9 +440,11 @@ route "GET /"
 - **Auto-escape (XSS-safe by default):** every `{ expr }` value is HTML-escaped
   (`<script>` → `&lt;script&gt;`) — you never have to remember. `{ raw expr }`
   opts out for trusted HTML.
-- **Flow control reuses Synsema:** `{ each VAR in EXPR }…{ end }` and
-  `{ when EXPR }…{ otherwise }…{ end }` — the same `each`/`when` you already know,
-  not a new dialect.
+- **Flow control reuses Synsema:** `{ each VAR in EXPR }…{ end }` (with an optional
+  `{ otherwise }` empty-list branch, and `enumerate(xs)` for indexes) and
+  `{ when EXPR }…{ otherwise when EXPR2 }…{ otherwise }…{ end }` — the same
+  `each`/`when` chaining you already know, not a new dialect. `each` over a
+  non-list is a hard error (a map suggests `keys(m)`).
 - **Paths are cwd-relative** and may not escape the working directory (traversal
   blocked).
 - **Errors are caught early.** A template referenced as `render("literal.html")`
@@ -337,8 +453,15 @@ route "GET /"
   missing field) is a `500`: in dev the detail (with `file:line`) is returned so
   you or an agent can fix it; with `--secure` the body is generic and the detail
   only goes to the server log (see "Error responses" below).
-- **`{`/`}` are delimiters.** Keep CSS/JS (which use braces) in external files
-  served via `static`; for a literal brace use a string hole like `{ "{" }`.
+- **`{`/`}` are delimiters — inline CSS/JS goes in a `{ raw }`…`{ end }` verbatim
+  block** (everything inside is emitted literally, braces included). For a single
+  literal brace use `{ "{" }`. External files via `static` remain the best home
+  for big stylesheets/scripts. Holes themselves nest braces, so map literals in a
+  hole (`{ include "c.html" with {"k": v} }`) are fine.
+- **Template comments:** `{ -- anything }` emits nothing.
+- **Data into inline `<script>`:** `{ raw json_for_script(x) }` — never
+  `json_encode` there (a value containing `</script>` would break out of the tag;
+  `json_for_script` escapes `<`/`>`/`&` as `\u00XX`).
 
 ### Semantic content — `content()` (negotiated)
 
@@ -915,6 +1038,7 @@ and prod-ready via flags (systemd/Docker). The flags **override the `serve` bloc
 
 ```bash
 synsema serve <file>
+    [--watch]                       # dev loop: restart on any .syn change (templates/static already hot-reload)
     [--port N]                      # overrides `serve on N` AND grants serve(N)
     [--domain d1[,d2,...]]          # overrides the file's `domain`
     [--tls-auto <email> | --tls-cert <p> --tls-key <p>]
@@ -981,24 +1105,35 @@ The `static` mounts get production behavior automatically:
 - **ETag** + `304 Not Modified` on `If-None-Match`.
 - **Range** / `206 Partial Content` (+ `416` on invalid range) for media.
 - **gzip** when the client sends `Accept-Encoding: gzip` (compressible types).
+- **`Cache-Control`** via the mount's `cache "<spec>"` clause (see the static section).
+
+**Dynamic responses gzip too**: `render()`/`html()`/`content()`/JSON bodies ≥ 1 KB
+of a compressible type are gzip-compressed automatically when the client accepts it
+(`Vary: Accept-Encoding` included; SSE, 204/206/304 and already-encoded bodies are
+skipped).
 
 ---
 
-## Template composition (layouts, includes)
+## Template composition (layouts, named slots, includes with props)
 
 `render()` templates compose, so you don't duplicate the page chrome (head, nav, footer):
 
 - **`{ include "partials/nav.html" }`** — inline another template at this point. It renders
-  with the current data (and any surrounding `each` loop variables). Use for reusable
-  components: nav, footer, cards.
+  with the current data (and any surrounding `each` loop variables).
+- **`{ include "partials/card.html" with {"title": t} }`** — a component with **props**:
+  the partial sees ONLY the props map (plus tasks/globals) — fully isolated.
 - **`{ layout "layouts/base.html" }`** — declared at the top of a page. The page's output is
   rendered, then injected into the layout where the layout has **`{ slot }`**. Layouts can
   themselves declare a layout (nested). The slot content is inserted raw (already rendered).
+- **Named slots:** the layout declares `{ slot "head_extra" }`; the page provides
+  `{ fill "head_extra" }…{ end }` at its top level. Unfilled named slots render empty
+  (optional extension points); a `fill` without a `layout` is an error.
 
 A base layout:
 ```html
 <!DOCTYPE html><html><head><title>{ title }</title>
-<link rel="stylesheet" href="/assets/style.css"></head>
+<link rel="stylesheet" href="/assets/style.css">
+{ slot "head_extra" }</head>
 <body>
   { include "partials/nav.html" }
   { slot }
@@ -1008,11 +1143,14 @@ A base layout:
 A page that uses it:
 ```html
 { layout "layouts/base.html" }
+{ fill "head_extra" }<style>{ raw } .wrap { max-width: 60rem; } { end }</style>{ end }
 <main class="wrap"><h1>{ title }</h1> ... </main>
 ```
 
 Recommended project structure: `layouts/`, `partials/`, `pages/`, `static/` (CSS/JS),
-`content/` (markdown/content sources). Paths are cwd-relative and traversal-safe.
+`content/` (markdown/content sources). Paths are cwd-relative and traversal-safe —
+**including `include`/`layout` paths inside templates** (they resolve against the
+working directory, not against the including template).
 
 **content() and CSS:** a `content()` page's HTML is wrapped in `<main class="prose">` and
 can declare a stylesheet via page meta (`{"stylesheet": "/assets/style.css"}`) — head-only,

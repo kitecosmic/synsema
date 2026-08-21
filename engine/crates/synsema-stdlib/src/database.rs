@@ -1642,6 +1642,24 @@ pub fn register_database_builtins<H: DbHandle>(
         }),
     );
 
+    // json_for_script(value) → text: JSON seguro para incrustar en un <script> — igual que
+    // json_encode pero con `<`, `>` y `&` escapados como \u00XX, así un valor que contenga
+    // "</script>" no puede cerrar el tag ni inyectar HTML. Es el mismo escapado que el
+    // runtime ya usa para su JSON-LD. Uso: <script>const D = { raw json_for_script(x) };</script>.
+    // Puro, SIN capability.
+    interp.register_builtin(
+        "json_for_script",
+        1,
+        Rc::new(|_i, args, _loc| {
+            let v = args.first().ok_or_else(|| err("json_for_script: missing argument"))?;
+            let json = dumps(&syn_to_json(v))
+                .replace('<', "\\u003c")
+                .replace('>', "\\u003e")
+                .replace('&', "\\u0026");
+            Ok(syn_text(json))
+        }),
+    );
+
     // json_decode(text) → value: parsea un string JSON a un valor de Synsema (map/list/number/
     // text/bool/nothing). Error claro si el JSON es inválido. Sin capability.
     interp.register_builtin(

@@ -173,6 +173,7 @@ fn children(n: &Node) -> Vec<&Node> {
         ServeBlock {
             port,
             auth_handler,
+            error_handler,
             max_body,
             max_streams,
             rate_limit,
@@ -185,15 +186,28 @@ fn children(n: &Node) -> Vec<&Node> {
             tls_auto_email,
             domain,
             hosts,
+            mounts,
             ..
         } => {
             let mut v = vec![port.as_ref()];
-            for b in [auth_handler, max_body, max_streams, rate_limit, cors, describe, tls_cert, tls_key, tls_auto_email, domain].into_iter().flatten() {
+            for b in [auth_handler, error_handler, max_body, max_streams, rate_limit, cors, describe, tls_cert, tls_key, tls_auto_email, domain].into_iter().flatten() {
                 v.push(b);
             }
             v.extend(static_mounts.iter());
             v.extend(routes.iter());
             v.extend(hosts.iter());
+            v.extend(mounts.iter());
+            v
+        }
+        RoutesDeclaration { routes, .. } => routes.iter().collect(),
+        // Los walkers DEBEN descender en un export (el body de una task/routes
+        // exportada es código como cualquier otro).
+        ExportDeclaration { declaration } => vec![declaration.as_ref()],
+        MountClause { source, prefix } => {
+            let mut v = vec![source.as_ref()];
+            if let Some(p) = prefix {
+                v.push(p);
+            }
             v
         }
         HostBlock { pattern, auth_handler, static_mounts, routes, tls_cert, tls_key } => {
@@ -209,10 +223,10 @@ fn children(n: &Node) -> Vec<&Node> {
         ProxyStatement { target } => vec![target.as_ref()],
         SendStatement { value, .. } => vec![value],
         RateLimitClause { count, .. } => count.iter().map(|b| b.as_ref()).collect(),
-        StaticMount { directory, prefix } => {
+        StaticMount { directory, prefix, cache, fallback } => {
             let mut v = vec![directory.as_ref()];
-            if let Some(p) = prefix {
-                v.push(p);
+            for b in [prefix, cache, fallback].into_iter().flatten() {
+                v.push(b);
             }
             v
         }
@@ -638,6 +652,7 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
         ServeBlock {
             port,
             auth_handler,
+            error_handler,
             max_body,
             max_streams,
             rate_limit,
@@ -650,15 +665,26 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
             tls_auto_email,
             domain,
             hosts,
+            mounts,
             ..
         } => {
             let mut v = vec![port.as_mut()];
-            for b in [auth_handler, max_body, max_streams, rate_limit, cors, describe, tls_cert, tls_key, tls_auto_email, domain].into_iter().flatten() {
+            for b in [auth_handler, error_handler, max_body, max_streams, rate_limit, cors, describe, tls_cert, tls_key, tls_auto_email, domain].into_iter().flatten() {
                 v.push(b.as_mut());
             }
             v.extend(static_mounts.iter_mut());
             v.extend(routes.iter_mut());
             v.extend(hosts.iter_mut());
+            v.extend(mounts.iter_mut());
+            v
+        }
+        RoutesDeclaration { routes, .. } => routes.iter_mut().collect(),
+        ExportDeclaration { declaration } => vec![declaration.as_mut()],
+        MountClause { source, prefix } => {
+            let mut v = vec![source.as_mut()];
+            if let Some(p) = prefix {
+                v.push(p.as_mut());
+            }
             v
         }
         HostBlock { pattern, auth_handler, static_mounts, routes, tls_cert, tls_key } => {
@@ -674,10 +700,10 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
         ProxyStatement { target } => vec![target.as_mut()],
         SendStatement { value, .. } => vec![value.as_mut()],
         RateLimitClause { count, .. } => count.iter_mut().map(|b| b.as_mut()).collect(),
-        StaticMount { directory, prefix } => {
+        StaticMount { directory, prefix, cache, fallback } => {
             let mut v = vec![directory.as_mut()];
-            if let Some(p) = prefix {
-                v.push(p.as_mut());
+            for b in [prefix, cache, fallback].into_iter().flatten() {
+                v.push(b.as_mut());
             }
             v
         }
