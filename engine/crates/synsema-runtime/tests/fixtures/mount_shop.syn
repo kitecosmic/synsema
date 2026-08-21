@@ -1,0 +1,16 @@
+-- Fixture: grupo de rutas exportable, con helper PRIVADO del módulo.
+
+task fmt(n)
+    give "$" + text(n)
+
+export routes tienda
+    route "GET /shop"
+        give html("<h1>Shop " + fmt(99) + "</h1>")
+
+    route "GET /shop/:id"
+        give {"producto": params.id}
+
+    route "POST /shop/buy"
+        expect body {item: text}
+        let b be json of request
+        give created({"comprado": item of b})

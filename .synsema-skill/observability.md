@@ -29,7 +29,7 @@ serve on 8080
         give get_item(params.id)
 ```
 
-(A spawned agent's `log`/`print` also appear, prefixed `[AgentName]`.) Under plain `run`, `print`
+(A spawned agent's `log`/`print` also appear, prefixed `[AgentName]`.) Under `conform`/`conform --swarm` that live `[main]`/`[agent]` echo goes to **stderr** — stdout carries ONLY the final JSON (parse-safe). Under plain `run`, `print`
 **buffers** until the program ends — use `flush()` for live output (see builtins).
 
 ## Tracing / Measurement / Checkpoints (decorative markers — literal name)

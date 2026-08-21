@@ -732,6 +732,147 @@ pub struct Ctx {
     pub user: Option<SynValue>,
 }
 
+/// Ctx mínimo para el `errors with` de 404/405 (el error ocurre ANTES de armar el
+/// ctx del handler): method/path/query/headers reales, params vacíos, user nothing.
+#[allow(clippy::too_many_arguments)]
+fn min_ctx(
+    method: &str,
+    path: &str,
+    query: &IndexMap<String, String>,
+    headers: &[(String, String)],
+    body_str: &str,
+    body_raw: &[u8],
+    body_file: Option<&str>,
+    client_ip: &str,
+) -> Ctx {
+    Ctx {
+        method: method.to_string(),
+        path: path.to_string(),
+        query: query.clone(),
+        params: IndexMap::new(),
+        headers: headers.to_vec(),
+        body: body_str.to_string(),
+        body_raw: body_raw.to_vec(),
+        body_file: body_file.map(|s| s.to_string()),
+        json: None,
+        client_ip: client_ip.to_string(),
+        user: None,
+    }
+}
+
+// =========================================================
+// Form bodies (application/x-www-form-urlencoded + multipart/form-data)
+// =========================================================
+
+/// Parsea un body `application/x-www-form-urlencoded` → map (último valor gana,
+/// como el query string). `+` → espacio, percent-decoding UTF-8 lossy.
+pub fn parse_form_urlencoded(body: &str) -> IndexMap<String, String> {
+    let mut out = IndexMap::new();
+    for pair in body.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let (k, v) = match pair.split_once('=') {
+            Some((k, v)) => (k, v),
+            None => (pair, ""),
+        };
+        let key = unquote(&k.replace('+', " "));
+        if key.is_empty() {
+            continue;
+        }
+        out.insert(key, unquote(&v.replace('+', " ")));
+    }
+    out
+}
+
+/// Una parte de un body `multipart/form-data`: campo de texto (filename=None) o
+/// archivo subido (filename + content_type + bytes crudos).
+#[derive(Debug)]
+pub struct FormPart {
+    pub name: String,
+    pub filename: Option<String>,
+    pub content_type: Option<String>,
+    pub data: Vec<u8>,
+}
+
+/// Extrae el boundary de un `Content-Type: multipart/form-data; boundary=...`.
+pub fn multipart_boundary(content_type: &str) -> Option<String> {
+    let ct = content_type.trim();
+    if !ct.to_ascii_lowercase().starts_with("multipart/form-data") {
+        return None;
+    }
+    for param in ct.split(';').skip(1) {
+        let param = param.trim();
+        if let Some(v) = param.strip_prefix("boundary=") {
+            let v = v.trim().trim_matches('"');
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Parsea un body `multipart/form-data` (RFC 7578). Devuelve las partes en orden;
+/// partes malformadas se saltean (un browser real no las produce). Los bytes de un
+/// archivo se conservan EXACTOS (sin decodificación lossy).
+pub fn parse_multipart(boundary: &str, body: &[u8]) -> Vec<FormPart> {
+    let delim: Vec<u8> = [b"--", boundary.as_bytes()].concat();
+    let mut parts = Vec::new();
+    // Segmentos entre delimitadores.
+    let mut sections: Vec<&[u8]> = Vec::new();
+    let mut pos = 0usize;
+    let mut starts: Vec<usize> = Vec::new();
+    while pos + delim.len() <= body.len() {
+        if &body[pos..pos + delim.len()] == delim.as_slice() {
+            starts.push(pos);
+            pos += delim.len();
+        } else {
+            pos += 1;
+        }
+    }
+    for w in starts.windows(2) {
+        sections.push(&body[w[0] + delim.len()..w[1]]);
+    }
+    for sec in sections {
+        // Tras el delimitador viene \r\n (o `--` en el cierre, que no llega acá).
+        let sec = sec.strip_prefix(b"\r\n").unwrap_or(sec);
+        // Headers hasta \r\n\r\n.
+        let hdr_end = match sec.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(i) => i,
+            None => continue,
+        };
+        let head = String::from_utf8_lossy(&sec[..hdr_end]);
+        let mut content = &sec[hdr_end + 4..];
+        // El contenido termina en \r\n antes del próximo delimitador.
+        if content.ends_with(b"\r\n") {
+            content = &content[..content.len() - 2];
+        }
+        let mut name: Option<String> = None;
+        let mut filename: Option<String> = None;
+        let mut ctype: Option<String> = None;
+        for line in head.split("\r\n") {
+            let low = line.to_ascii_lowercase();
+            if low.starts_with("content-disposition:") {
+                for param in line.split(';').skip(1) {
+                    let param = param.trim();
+                    if let Some(v) = param.strip_prefix("name=") {
+                        name = Some(v.trim_matches('"').to_string());
+                    } else if let Some(v) = param.strip_prefix("filename=") {
+                        filename = Some(v.trim_matches('"').to_string());
+                    }
+                }
+            } else if low.starts_with("content-type:") {
+                ctype = Some(line[13..].trim().to_string());
+            }
+        }
+        if let Some(name) = name {
+            parts.push(FormPart { name, filename, content_type: ctype, data: content.to_vec() });
+        }
+    }
+    parts
+}
+
 /// Resultado de correr el cuerpo de una ruta.
 pub enum GiveOutcome {
     /// `give <valor>` (o None si el handler no dio nada → nothing).
@@ -747,6 +888,11 @@ pub type Handler = Arc<dyn Fn(&Ctx) -> GiveOutcome + Send + Sync>;
 /// tasks de 2 parámetros — sesiones por cookie; ítem C de la tanda web-auth). El
 /// motor decide por la aridad declarada del task si le pasa 1 o 2 argumentos.
 pub type AuthHandler = Arc<dyn Fn(&str, &Ctx) -> Option<SynValue> + Send + Sync>;
+
+/// `errors with <task>` — recibe (status, message, request-ctx) y devuelve el valor
+/// que da FORMA al body del error (html()/render()/content()/map/redirect), o None
+/// para el JSON por defecto. El runtime lo cablea igual que `auth with`.
+pub type ErrorHandler = Arc<dyn Fn(i64, &str, &Ctx) -> Option<SynValue> + Send + Sync>;
 
 /// El cliente del SSE se desconectó (escribir al socket falló).
 pub struct StreamGone;
@@ -850,6 +996,57 @@ impl RateLimiter {
 // ServeRuntime
 // =========================================================
 
+/// Spec de un mount estático tal como lo declara el programa: prefijo + dir +
+/// las cláusulas opcionales `cache` (Cache-Control) y `fallback` (SPA).
+#[derive(Clone, Debug)]
+pub struct StaticMountSpec {
+    pub prefix: String,
+    pub dir: String,
+    /// Valor YA resuelto de Cache-Control (el runtime valida la spec con
+    /// `cache_control_value` al construir el serve — fail-fast).
+    pub cache: Option<String>,
+    /// Archivo relativo al mount servido con 200 cuando el path no existe
+    /// (history-fallback de SPA, estilo `try_files ... /index.html`).
+    pub fallback: Option<String>,
+}
+
+/// Traduce la spec de `cache "<...>"` a un valor de header `Cache-Control`.
+/// Acepta: `"immutable"` (assets fingerprinteados), `"no-store"`, un número crudo
+/// (segundos) o `<N><s|m|h|d>` (`"30s"`, `"5m"`, `"1h"`, `"7d"`). Cualquier otra
+/// cosa es error (fail-loud al construir el serve, nunca en un request).
+pub fn cache_control_value(spec: &str) -> Result<String, String> {
+    let s = spec.trim().to_ascii_lowercase();
+    match s.as_str() {
+        "immutable" => return Ok("public, max-age=31536000, immutable".to_string()),
+        "no-store" => return Ok("no-store".to_string()),
+        _ => {}
+    }
+    let (digits, mult) = match s.chars().last() {
+        Some('s') => (&s[..s.len() - 1], 1u64),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('h') => (&s[..s.len() - 1], 3600),
+        Some('d') => (&s[..s.len() - 1], 86400),
+        Some(c) if c.is_ascii_digit() => (s.as_str(), 1),
+        _ => ("", 1),
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "invalid cache spec '{}' — use \"immutable\", \"no-store\", raw seconds, or <N>s/m/h/d (e.g. \"1h\", \"7d\")",
+            spec
+        ));
+    }
+    let secs: u64 = digits.parse().map_err(|_| format!("invalid cache spec '{}'", spec))?;
+    Ok(format!("public, max-age={}", secs * mult))
+}
+
+/// Un mount estático ya resuelto (realpath + prefijo normalizado).
+struct Mount {
+    prefix: String,
+    base: PathBuf,
+    cache: Option<String>,
+    fallback: Option<String>,
+}
+
 /// Tabla de ruteo de un host: rutas + estáticos + auth propios. El host `default`
 /// (pattern=None) es el comportamiento de siempre; los vhosts (Lote 1) agregan
 /// dominios con su propia tabla, seleccionados por el header `Host`.
@@ -857,7 +1054,7 @@ pub struct HostRouter {
     /// None = host default (serve-level). Some("a.com") exacto, Some("*.a.com") wildcard.
     pattern: Option<String>,
     routes: Vec<RouteSpec>,
-    static_mounts: Vec<(String, PathBuf)>,
+    static_mounts: Vec<Mount>,
     auth_handler: Option<AuthHandler>,
 }
 
@@ -865,20 +1062,21 @@ impl HostRouter {
     fn new(
         pattern: Option<String>,
         mut routes: Vec<RouteSpec>,
-        static_mounts: Vec<(String, String)>,
+        static_mounts: Vec<StaticMountSpec>,
         auth_handler: Option<AuthHandler>,
     ) -> Self {
         // Orden por especificidad (más específica primero): el primer match gana.
         routes.sort_by_key(|a| specificity(&a.path));
         // Mounts: prefijo normalizado + realpath del directorio, prefijo más largo primero.
-        let mut mounts: Vec<(String, PathBuf)> = static_mounts
+        let mut mounts: Vec<Mount> = static_mounts
             .into_iter()
-            .map(|(p, d)| {
-                let real = Path::new(&d).canonicalize().unwrap_or_else(|_| PathBuf::from(&d));
-                (norm_prefix(&p), real)
+            .map(|m| {
+                let real =
+                    Path::new(&m.dir).canonicalize().unwrap_or_else(|_| PathBuf::from(&m.dir));
+                Mount { prefix: norm_prefix(&m.prefix), base: real, cache: m.cache, fallback: m.fallback }
             })
             .collect();
-        mounts.sort_by_key(|m| std::cmp::Reverse(m.0.len()));
+        mounts.sort_by_key(|m| std::cmp::Reverse(m.prefix.len()));
         HostRouter { pattern, routes, static_mounts: mounts, auth_handler }
     }
 
@@ -924,7 +1122,8 @@ impl HostRouter {
     /// Sirve un estático de producción: ETag + 304 (If-None-Match), Range/206, gzip
     /// (Accept-Encoding + tipo comprimible). Devuelve status + body + headers extra.
     fn serve_static_full(&self, url_path: &str, headers: &[(String, String)]) -> Option<StaticResp> {
-        for (prefix, base) in &self.static_mounts {
+        for mount in &self.static_mounts {
+            let (prefix, base) = (&mount.prefix, &mount.base);
             let rel = if prefix == "/" {
                 url_path.to_string()
             } else if url_path == prefix.trim_end_matches('/') {
@@ -934,9 +1133,18 @@ impl HostRouter {
             } else {
                 continue;
             };
+            // Miss dentro del mount + `fallback` declarado → servir ese archivo con
+            // 200 (history-fallback de SPA, semántica try_files). Sin fallback, se
+            // sigue probando el próximo mount (comportamiento histórico).
             let target = match resolve_in(base, &rel) {
                 Some(t) => t,
-                None => continue,
+                None => match &mount.fallback {
+                    Some(fb) => match resolve_in(base, fb) {
+                        Some(t) => t,
+                        None => continue,
+                    },
+                    None => continue,
+                },
             };
             let data = match std::fs::read(&target) {
                 Ok(d) => d,
@@ -944,11 +1152,20 @@ impl HostRouter {
             };
             let ct = static_content_type(&target);
             let etag = etag_for(&target, data.len());
+            // `cache "<...>"` del mount → header Cache-Control en 200/206/304.
+            let finish = |mut sr: StaticResp| {
+                if let Some(c) = &mount.cache {
+                    if sr.status != 416 {
+                        sr.extra.push(("Cache-Control".into(), c.clone()));
+                    }
+                }
+                Some(sr)
+            };
 
             // If-None-Match → 304 (sin body).
             let inm = header_value(headers, "if-none-match");
             if !inm.is_empty() && inm.trim() == etag {
-                return Some(StaticResp {
+                return finish(StaticResp {
                     status: 304,
                     body: Vec::new(),
                     content_type: ct,
@@ -958,7 +1175,7 @@ impl HostRouter {
             // Range → 206 (sin gzip).
             let range = header_value(headers, "range");
             if !range.is_empty() {
-                return Some(match parse_range(&range, data.len()) {
+                return finish(match parse_range(&range, data.len()) {
                     Some((start, end)) => StaticResp {
                         status: 206,
                         body: data[start..=end].to_vec(),
@@ -981,7 +1198,7 @@ impl HostRouter {
             let ae = header_value(headers, "accept-encoding").to_lowercase();
             if ae.contains("gzip") && is_compressible(&ct) {
                 if let Some(gz) = gzip_bytes(&data) {
-                    return Some(StaticResp {
+                    return finish(StaticResp {
                         status: 200,
                         body: gz,
                         content_type: ct,
@@ -994,7 +1211,7 @@ impl HostRouter {
                     });
                 }
             }
-            return Some(StaticResp {
+            return finish(StaticResp {
                 status: 200,
                 body: data,
                 content_type: ct,
@@ -1066,6 +1283,8 @@ pub struct ServeRuntime {
     private: bool,
     rate_limiter: RateLimiter,
     active_streams: Mutex<i64>,
+    /// `errors with <task>` (serve-level): da forma a 401/404/405/500.
+    error_handler: Option<ErrorHandler>,
 }
 
 /// El resultado de `dispatch`: una respuesta lista, o un hand-off a streaming SSE.
@@ -1083,7 +1302,7 @@ impl ServeRuntime {
         auth_handler: Option<AuthHandler>,
         max_body: Option<i64>,
         max_streams: i64,
-        static_mounts: Vec<(String, String)>,
+        static_mounts: Vec<StaticMountSpec>,
         cors_origin: Option<String>,
         intent: Option<String>,
         describe_about: Option<String>,
@@ -1108,7 +1327,13 @@ impl ServeRuntime {
             private,
             rate_limiter: RateLimiter::new(),
             active_streams: Mutex::new(0),
+            error_handler: None,
         }
+    }
+
+    /// Cablea la task de `errors with` (el runtime la construye como el auth handler).
+    pub fn set_error_handler(&mut self, h: ErrorHandler) {
+        self.error_handler = Some(h);
     }
 
     /// Registra un vhost (Lote 1): dominio exacto o `*.dominio` con su propia tabla
@@ -1117,7 +1342,7 @@ impl ServeRuntime {
         &mut self,
         pattern: String,
         routes: Vec<RouteSpec>,
-        static_mounts: Vec<(String, String)>,
+        static_mounts: Vec<StaticMountSpec>,
         auth_handler: Option<AuthHandler>,
     ) {
         self.vhosts.push(HostRouter::new(Some(pattern), routes, static_mounts, auth_handler));
@@ -1299,6 +1524,70 @@ impl ServeRuntime {
             return Some(RawResponse::text(self.robots_txt(), "text/plain; charset=utf-8", 200));
         }
         None
+    }
+
+    /// 500 con `errors with`: el detalle SIEMPRE va al log del server (server_error);
+    /// a la task le llega el mismo texto que vería el cliente (redactado bajo --secure,
+    /// para que una página de error custom jamás re-filtre internals en producción).
+    fn shape_500(
+        &self,
+        detail: &str,
+        ctx: &Ctx,
+        extra: &mut Vec<(String, String)>,
+    ) -> (u16, ResponseBody) {
+        let default_body = self.server_error(detail);
+        let msg = if self.secure { "internal server error" } else { detail };
+        if let Some((st, body, hdrs)) = self.custom_error(500, msg, ctx) {
+            extra.extend(hdrs);
+            return (st, body);
+        }
+        (500, default_body)
+    }
+
+    /// `errors with`: intenta dar forma custom a un error del runtime. El STATUS del
+    /// error SE CONSERVA (jamás un 200 para un 404 — nada de soft-404), con una sola
+    /// excepción: si la task devuelve `redirect()`, su 3xx + Location se respetan
+    /// (patrón "401 → redirect al login"). `nothing` (o un error en la task) → None
+    /// y el JSON por defecto sigue intacto.
+    fn custom_error(
+        &self,
+        status: u16,
+        message: &str,
+        ctx: &Ctx,
+    ) -> Option<(u16, ResponseBody, Vec<(String, String)>)> {
+        let handler = self.error_handler.as_ref()?;
+        let v = handler(i64::from(status), message, ctx)?;
+        if matches!(v, SynValue::Nothing) {
+            return None;
+        }
+        // with_header()/set_cookie(): desenvolver el wrapper, igual que en dispatch.
+        let mut hdrs: Vec<(String, String)> = Vec::new();
+        let v = match v {
+            SynValue::Server(s) => match &*s {
+                ServerValue::WithHeaders { inner, headers } => {
+                    hdrs = headers.clone();
+                    (**inner).clone()
+                }
+                _ => SynValue::Server(s),
+            },
+            other => other,
+        };
+        // content() → negociado por Accept: la misma página de error sale como HTML
+        // al navegador y Markdown/JSON a un agente.
+        let is_content =
+            matches!(&v, SynValue::Server(s) if matches!(&**s, ServerValue::Content(_)));
+        if is_content {
+            let fmt = negotiate_format(&header_value(&ctx.headers, "accept"));
+            let raw = render_content(&v, &fmt);
+            return Some((status, ResponseBody::Raw(raw), hdrs));
+        }
+        match build_response(Some(&v), &ctx.query) {
+            Ok((st, body)) => match body {
+                ResponseBody::Redirect { .. } => Some((st, body, hdrs)),
+                other => Some((status, other, hdrs)),
+            },
+            Err(_) => None,
+        }
     }
 
     fn server_error(&self, detail: &str) -> ResponseBody {
@@ -1545,6 +1834,14 @@ impl ServeRuntime {
             None => {
                 let allowed = host.methods_for_path(path);
                 if !allowed.is_empty() {
+                    // 405 — `errors with` puede darle forma; el header Allow se conserva.
+                    if self.error_handler.is_some() {
+                        let ectx = min_ctx(method, path, &query, &headers, body_str, body_raw, body_file, client_ip);
+                        if let Some((st, body, mut hdrs)) = self.custom_error(405, "method not allowed", &ectx) {
+                            hdrs.push(("Allow".to_string(), allowed.join(", ")));
+                            return Dispatched::Response { status: st, body, headers: hdrs };
+                        }
+                    }
                     return Dispatched::Response {
                         status: 405,
                         body: ResponseBody::Json(obj(vec![
@@ -1572,10 +1869,17 @@ impl ServeRuntime {
                         return resp(disc.status, ResponseBody::Raw(disc));
                     }
                 }
+                let msg = format!("no route for {} {}", method, path);
+                if self.error_handler.is_some() {
+                    let ectx = min_ctx(method, path, &query, &headers, body_str, body_raw, body_file, client_ip);
+                    if let Some((st, body, hdrs)) = self.custom_error(404, &msg, &ectx) {
+                        return Dispatched::Response { status: st, body, headers: hdrs };
+                    }
+                }
                 return resp(
                     404,
                     ResponseBody::Json(obj(vec![
-                        ("error", Json::Str(format!("no route for {} {}", method, path))),
+                        ("error", Json::Str(msg)),
                         ("status", Json::Int(404)),
                     ])),
                 );
@@ -1653,6 +1957,11 @@ impl ServeRuntime {
             let user = host.auth_handler.as_ref().and_then(|ah| ah(&token, &ctx));
             match &user {
                 None | Some(SynValue::Nothing) => {
+                    // 401 — `errors with` puede redirigir al login o dar una página.
+                    if let Some((st, body, mut hdrs)) = self.custom_error(401, "unauthorized", &ctx) {
+                        hdrs.extend(rate_headers);
+                        return Dispatched::Response { status: st, body, headers: hdrs };
+                    }
                     return Dispatched::Response {
                         status: 401,
                         body: ResponseBody::Json(obj(vec![
@@ -1782,7 +2091,7 @@ impl ServeRuntime {
                 } else {
                     match build_response(v.as_ref(), &ctx.query) {
                         Ok(sb) => sb,
-                        Err(e) => (500, self.server_error(&e)),
+                        Err(e) => self.shape_500(&e, &ctx, &mut custom_headers),
                     }
                 }
             }
@@ -1794,7 +2103,7 @@ impl ServeRuntime {
                     ("field", field.map(Json::Str).unwrap_or(Json::Null)),
                 ])),
             ),
-            GiveOutcome::Error(msg) => (500, self.server_error(&msg)),
+            GiveOutcome::Error(msg) => self.shape_500(&msg, &ctx, &mut custom_headers),
         };
         let mut headers = rate_headers;
         headers.append(&mut custom_headers);
@@ -3467,6 +3776,8 @@ async fn handle_request(
     // sirve igual para el pool (sized) que para un hilo dedicado (stream).
     let job = move || {
         let bf = body_file.as_ref().map(|p| p.to_string_lossy().into_owned());
+        let accept_gzip =
+            header_value(&headers, "accept-encoding").to_ascii_lowercase().contains("gzip");
         match rt2.dispatch(
             &eff_method,
             &path,
@@ -3484,6 +3795,28 @@ async fn handle_request(
                     extra.push(("Location".to_string(), location.clone()));
                 }
                 let (ct, bytes) = response_body_bytes(body);
+                // gzip DINÁMICO (render()/html()/content()/JSON): los estáticos ya
+                // vienen comprimidos desde serve_static_full (traen Content-Encoding
+                // en `extra`, así que acá se saltean); 204/206/304 no llevan body
+                // comprimible y un body chico no amortiza el overhead.
+                let mut bytes = bytes;
+                if accept_gzip
+                    && bytes.len() >= 1024
+                    && !matches!(status, 204 | 206 | 304)
+                    && is_compressible(&ct)
+                    && !extra.iter().any(|(k, _)| {
+                        k.eq_ignore_ascii_case("content-encoding")
+                            || k.eq_ignore_ascii_case("content-range")
+                    })
+                {
+                    if let Some(gz) = gzip_bytes(&bytes) {
+                        if gz.len() < bytes.len() {
+                            bytes = Bytes::from(gz);
+                            extra.push(("Content-Encoding".to_string(), "gzip".to_string()));
+                            extra.push(("Vary".to_string(), "Accept-Encoding".to_string()));
+                        }
+                    }
+                }
                 let _ = head_tx.send(HeadInfo {
                     status,
                     content_type: Some(ct),
@@ -4026,6 +4359,90 @@ mod tests {
     }
 
     #[test]
+    fn cache_control_specs() {
+        assert_eq!(cache_control_value("immutable").unwrap(), "public, max-age=31536000, immutable");
+        assert_eq!(cache_control_value("no-store").unwrap(), "no-store");
+        assert_eq!(cache_control_value("30s").unwrap(), "public, max-age=30");
+        assert_eq!(cache_control_value("5m").unwrap(), "public, max-age=300");
+        assert_eq!(cache_control_value("1h").unwrap(), "public, max-age=3600");
+        assert_eq!(cache_control_value("7d").unwrap(), "public, max-age=604800");
+        assert_eq!(cache_control_value("120").unwrap(), "public, max-age=120");
+        assert_eq!(cache_control_value(" 1H ").unwrap(), "public, max-age=3600");
+        assert!(cache_control_value("rapido").is_err());
+        assert!(cache_control_value("1w").is_err());
+        assert!(cache_control_value("").is_err());
+    }
+
+    #[test]
+    fn form_urlencoded_parses() {
+        let m = parse_form_urlencoded("nombre=Jo%C3%ABl&email=a%40b.com&x=1+2&vacio=&=sin");
+        assert_eq!(m.get("nombre").unwrap(), "Joël");
+        assert_eq!(m.get("email").unwrap(), "a@b.com");
+        assert_eq!(m.get("x").unwrap(), "1 2");
+        assert_eq!(m.get("vacio").unwrap(), "");
+        assert!(!m.contains_key("")); // clave vacía ignorada, como el query string
+        // último valor gana
+        let m2 = parse_form_urlencoded("a=1&a=2");
+        assert_eq!(m2.get("a").unwrap(), "2");
+    }
+
+    #[test]
+    fn multipart_boundary_and_parts() {
+        assert_eq!(
+            multipart_boundary("multipart/form-data; boundary=----abc123").as_deref(),
+            Some("----abc123")
+        );
+        assert_eq!(
+            multipart_boundary("multipart/form-data; boundary=\"quoted\"").as_deref(),
+            Some("quoted")
+        );
+        assert!(multipart_boundary("application/json").is_none());
+
+        let body = b"--B\r\nContent-Disposition: form-data; name=\"campo\"\r\n\r\nvalor\r\n--B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"a.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n\x00\x01BIN\r\n--B--\r\n";
+        let parts = parse_multipart("B", body);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].name, "campo");
+        assert!(parts[0].filename.is_none());
+        assert_eq!(parts[0].data, b"valor");
+        assert_eq!(parts[1].name, "f");
+        assert_eq!(parts[1].filename.as_deref(), Some("a.bin"));
+        assert_eq!(parts[1].content_type.as_deref(), Some("application/octet-stream"));
+        assert_eq!(parts[1].data, b"\x00\x01BIN"); // bytes exactos, sin decodificar
+    }
+
+    #[test]
+    fn static_fallback_serves_index_on_miss() {
+        let dir = std::env::temp_dir().join("syn_static_fallback_test");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("index.html"), b"SHELL").unwrap();
+        let rt = ServeRuntime::new(
+            0,
+            "0.0.0.0".to_string(),
+            Vec::new(),
+            None,
+            None,
+            64,
+            vec![StaticMountSpec {
+                prefix: "/".to_string(),
+                dir: dir.to_string_lossy().into_owned(),
+                cache: Some("public, max-age=60".to_string()),
+                fallback: Some("index.html".to_string()),
+            }],
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            false,
+        );
+        // Miss → fallback con 200 + Cache-Control del mount.
+        let r = rt.default_host.serve_static_full("/ruta/spa/interna", &[]).expect("fallback");
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body, b"SHELL");
+        assert!(r.extra.iter().any(|(k, v)| k == "Cache-Control" && v == "public, max-age=60"));
+    }
+
+    #[test]
     fn gzip_roundtrip() {
         let data = b"hola mundo, esto se comprime bien bien bien bien bien".repeat(10);
         let gz = gzip_bytes(&data).expect("gzip");
@@ -4046,7 +4463,12 @@ mod tests {
             None,
             None,
             64,
-            vec![("/".to_string(), dir.to_string())],
+            vec![StaticMountSpec {
+                prefix: "/".to_string(),
+                dir: dir.to_string(),
+                cache: None,
+                fallback: None,
+            }],
             None,
             None,
             None,

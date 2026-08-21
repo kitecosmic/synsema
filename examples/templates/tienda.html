@@ -1,0 +1,29 @@
+{ layout "examples/templates/base.html" }
+{ -- CSS inline con llaves literales: el bloque { raw } ... { end } es verbatim }
+{ fill "head_extra" }<style>{ raw }
+  :root { --accent: #7c6cf0; }
+  body { margin: 0; font-family: system-ui, sans-serif; background: #0f1115; color: #e8e8ec; }
+  nav { display: flex; gap: 1rem; padding: 1rem 2rem; }
+  nav a { color: inherit; text-decoration: none; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1rem; padding: 2rem; }
+  .card { background: #1a1d24; border-radius: 12px; padding: 1.25rem; transition: transform .2s ease, box-shadow .2s ease; }
+  .card:hover { transform: translateY(-4px); box-shadow: 0 8px 24px rgb(0 0 0 / .4); }
+  .precio { color: var(--accent); font-weight: 600; }
+  footer { padding: 2rem; opacity: .6; }
+{ end }</style>{ end }
+<main>
+  <h1>{ title }</h1>
+  <div class="grid">
+    { each e in enumerate(productos) }
+    { include "examples/templates/card.html" with {"nombre": text(e.index + 1) + ". " + e.item.nombre, "precio": e.item.precio} }
+    { otherwise }
+    <p>No hay productos todavía.</p>
+    { end }
+  </div>
+</main>
+<script>
+window.__PRODUCTOS__ = { raw data_json };
+{ raw }
+document.querySelectorAll(".card").forEach((c, i) => { c.style.transitionDelay = `${i * 40}ms`; });
+{ end }
+</script>

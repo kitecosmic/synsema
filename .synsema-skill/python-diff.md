@@ -22,7 +22,7 @@ is verified against the engine by `tests/python_diff.test.syn` (semantics) and
 | `x if c else y` | `when c then x otherwise y` | inline expression form, usable in `let`/args |
 | `for x in xs:` | `each x in xs` | `for` → parse error |
 | `for k in a_dict:` | `each k in keys(m)` | **`each` cannot iterate a map**: `Cannot iterate over map`. Go through `keys(m)`/`values(m)` |
-| `for i, x in enumerate(xs):` | `each i in range(length(xs))` … `xs[i]` | no `enumerate` |
+| `for i, x in enumerate(xs):` | `each e in enumerate(xs)` … `e.index` / `e.item` | `enumerate(list)` → `[{index, item}, …]` (engine > v0.5.9; before it: `each i in range(length(xs))` … `xs[i]`) |
 | `while c:` | `while c` | same keyword, no colon; runaway loops hit `Loop exceeded maximum iterations` |
 | `def f(x): return v` | `task f(x)` … `give v` | `def` → parse error. `return` PARSES as a plain name, then fails at runtime: `Undefined variable: 'return'` — the word is `give` |
 | `lambda x: x + 1` | `(x) => x + 1` | — |

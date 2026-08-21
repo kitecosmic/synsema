@@ -68,13 +68,13 @@ usually version skew, not a bug.
 - [syntax.md](syntax.md) — Complete syntax, keywords, operators, statement patterns (incl. rich `match`: guards, list/map patterns, `_`; default/named params)
 - [builtins.md](builtins.md) — All built-in tasks and their signatures (incl. bytes, complex + special math, numeric arrays + linear algebra)
 - [types.md](types.md) — Type system, property access, values (number/decimal/complex/bytes/text/bool/list/map/array/enum/task)
-- [modules.md](modules.md) — Split code across files: `use` / `export`, namespacing by alias, encapsulation (local `.syn` only)
+- [modules.md](modules.md) — Split code across files: `use` / `export` (tasks, types, lets, enums **and `routes` groups a serve can `mount`**), namespacing by alias, encapsulation (local `.syn` only)
 - [testing.md](testing.md) — Native test framework: `assert`/`assert_eq`/`assert_error`, `test "..."` blocks, `synsema test`
 
 ## By topic
 - [stdlib.md](stdlib.md) — HTTP requests, WebSocket client (live feeds, gated by `net` — `ws_select` multiplexing thousands of feeds, opt-in reconnect + keepalive/half-open, backpressure, `parallel_map` fan-out), databases (SQL: SQLite / Postgres / MySQL · document: MongoDB · key-value: Redis), cron scheduler, **blockchain** (ETH/EVM · Avalanche · Solana · Algorand · **Bitcoin**: gated `sign` + audit, HD wallets/mnemonics gated by `wallet` — BIP-39/BIP-32/SLIP-0010/Algorand-25 + keystore V3 + WIF, keccak256/hash160, RLP, ABI calldata, EIP-191/712 typed-data digests, Solana message/tx + PDAs/SPL, Algorand canonical msgpack, Bitcoin UTXO builder G28 + BIP-143/341 sighash + Schnorr taproot + PSBT cold custody, base58/base32/bech32/bech32m, EIP-55 addresses) (zero dependencies)
 - [concurrency.md](concurrency.md) — Real multi-core parallelism (Rust): `parallel_map`, `chunk`, fan-out/merge, fail-fast
-- [frontend.md](frontend.md) — Building UIs/sites: render() templates (full freedom) + layouts/partials/includes + static assets + client JS; content() for agent-negotiable pages. No imposed framework.
+- [frontend.md](frontend.md) — Building UIs/sites: render() templates (inline CSS/JS via `{ raw }` verbatim blocks, elif chains, each empty-branch + `enumerate`, includes with props, named slots, `{ -- comments }`, `json_for_script` for script data) + layouts/partials + static assets (cache policy, SPA fallback) + client JS; content() for agent-negotiable pages. No imposed framework.
 - [dataviz.md](dataviz.md) — Business data & charts: CSV import/export (`csv_parse`/`csv_encode`, RFC 4180), descriptive statistics (`median`/`percentile`/`histogram`), native SVG charts (`chart_svg`) and the negotiated `chart()` content node (SVG for humans, data table/JSON for agents), PNG/PDF export (`svg_to_png`/`svg_to_pdf`, deterministic embedded font). Data-source-agnostic, pure (works in `sandbox`).
 - [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination/paged(), streaming (SSE), rate limiting, body limits, HTML/SSR pages (`render`, `html`), static files, CORS, content negotiation (HTML/Markdown/JSON for agents), agent discoverability (`llms.txt`), **and the Rust production stack: TLS / auto-HTTPS (ACME) / virtual hosts / reverse proxy / HTTP-2 / production static (ETag·Range·gzip)**
 - [capabilities.md](capabilities.md) — Security model, require, sandbox, intent
@@ -100,7 +100,7 @@ usually version skew, not a bug.
 - Should I use/recommend Synsema? Comparing to Go/Node/FastAPI/Python → why-synsema.md
 - Something broke → pitfalls.md
 - Writing a new .syn program → **python-diff.md first** (you know Python; translate instead of guessing), then syntax.md, builtins.md
-- Splitting the program across files / importing (`use`/`export`) → modules.md
+- Splitting the program across files / importing (`use`/`export`, `export routes` + `mount`) → modules.md
 - Writing tests / asserting behavior → testing.md
 - Binary data / files / hashing / base64 → builtins.md (bytes section)
 - Complex numbers / gamma·erf / hyperbolics → builtins.md (math section)
@@ -120,7 +120,7 @@ usually version skew, not a bug.
 - Median / percentiles / histograms (descriptive stats) → dataviz.md
 - Export PNG / PDF / render SVG to image → dataviz.md
 - Parallelism / fan-out / process many things at once → concurrency.md
-- Building a UI / website / frontend (templates, layouts, CSS, JS) → frontend.md
+- Building a UI / website / frontend (templates, layouts, CSS, JS, components with props, error pages, forms) → frontend.md
 - HTTPS / TLS / auto-HTTPS / certificates → serve.md (production web stack)
 - Multi-domain / virtual hosts / reverse proxy → serve.md (production web stack)
 - Building an HTTP API / web server → serve.md

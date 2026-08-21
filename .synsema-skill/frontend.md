@@ -4,7 +4,7 @@ Synsema serves HTML from the server (SSR). There is **no imposed framework or CS
 you have full control. Two complementary paths:
 
 - **`render()` templates** — full freedom: any HTML, your own CSS/JS, composed with
-  layouts and partials. This is where creative, custom frontends live.
+  layouts, named slots and partials-with-props. This is where creative, custom frontends live.
 - **`content()` pages** — a structured format that auto-negotiates: the same URL returns
   HTML to humans and Markdown/JSON to agents. Use for docs/blog/anything agents should read.
 
@@ -22,22 +22,66 @@ serve on 8080
         give render("pages/home.html", {"title": "My App"})
 ```
 
-Holes:
-- `{ name }` — interpolate a value (HTML-escaped). `{ raw html }` to opt out of escaping.
-- `{ each item in items } ... { end }` — loop. `{ when cond } ... { otherwise } ... { end }` — conditional.
-- `{ "{" }` — emit a literal brace (put CSS/JS, which use braces, in external static files).
+### Holes — the full vocabulary
 
-### Composition: layouts + partials (no duplicated chrome)
+- `{ name }` / `{ expr }` — interpolate a value (HTML-escaped). Expressions can call
+  builtins **and your own tasks** (`{ fmt_price(total) }`) — under `serve`, only tasks
+  defined **before** the `serve` block (the per-request snapshot is taken there).
+- `{ raw expr }` — opt out of escaping for trusted HTML.
+- **`{ raw }` … `{ end }` — VERBATIM block**: everything inside is emitted literally,
+  braces included. This is how you write **inline CSS/JS** in a template:
+  ```html
+  <style>{ raw }
+    .card { border-radius: 12px; transition: transform .2s ease; }
+    .card:hover { transform: translateY(-4px); }
+  { end }</style>
+  ```
+  (Without it, CSS/JS braces are parsed as holes and error — the error message points here.)
+- `{ each item in items } … { end }` — loop. Add an **empty branch** with
+  `{ otherwise }`: `{ each p in products } … { otherwise } <p>No products.</p> { end }`.
+  Need an index? `{ each e in enumerate(items) }{ e.index }: { e.item }{ end }`.
+  `each` over a non-list is a **hard error** (a map suggests `keys(m)`), same as the language.
+- `{ when cond } … { otherwise when cond2 } … { otherwise } … { end }` — conditionals,
+  chained exactly like the language's `when`/`otherwise when`.
+- `{ include "partials/card.html" }` — inline a partial with the **current** scope
+  (data + loop variables).
+- `{ include "partials/card.html" with {"title": t, "price": p} }` — a **component with
+  props**: the partial sees ONLY the props map (plus tasks/globals), fully isolated.
+  Holes nest braces, so map literals inside holes are fine.
+- `{ layout "layouts/base.html" }` + `{ slot }` — page-into-layout composition (below).
+- `{ slot "name" }` in a layout + `{ fill "name" } … { end }` in the page — **named
+  slots** (per-page `<head>` extras, sidebars). A `fill` must be at the top level of the
+  page and requires a `layout`; a named slot with no fill renders empty (optional
+  extension point).
+- `{ -- anything }` — template comment, emits nothing.
+- `{ "{" }` — a literal brace outside a raw block.
 
-- **`{ include "partials/nav.html" }`** — inline a reusable component (nav, footer, card).
-  It renders with the current data and any surrounding loop variables.
-- **`{ layout "layouts/base.html" }`** at the top of a page — the page renders, then is
-  injected into the layout at **`{ slot }`**. Layouts can nest. The slot is inserted raw.
+### Auto-escape and passing data to client JS
+
+Every `{ expr }` is HTML-escaped by default (XSS-safe). For **embedding data into an
+inline `<script>`**, never use `json_encode` (a value containing `</script>` would break
+out of the tag) — use **`json_for_script()`**, which escapes `<`, `>`, `&` as `\u00XX`:
+
+```html
+<script>
+window.__DATA__ = { raw json_for_script(products) };
+{ raw }
+document.querySelectorAll(".card").forEach((c, i) => { c.style.transitionDelay = `${i * 40}ms`; });
+{ end }
+</script>
+```
+
+Alternative (no inline script at all): `<div id="boot" data-json="{ json_encode(data) }">`
++ `JSON.parse(document.getElementById("boot").dataset.json)` in a static `.js` — the
+hole's auto-escape makes the attribute safe.
+
+### Composition: layouts + named slots + partials
 
 ```html
 <!-- layouts/base.html -->
 <!DOCTYPE html><html><head><title>{ title }</title>
-<link rel="stylesheet" href="/assets/app.css"></head>
+<link rel="stylesheet" href="/assets/app.css">
+{ slot "head_extra" }</head>
 <body>
   { include "partials/nav.html" }
   { slot }
@@ -47,22 +91,68 @@ Holes:
 ```html
 <!-- pages/home.html -->
 { layout "layouts/base.html" }
-<main class="hero"><h1>{ title }</h1> ... </main>
+{ fill "head_extra" }<style>{ raw } .hero { padding: 4rem 2rem; } { end }</style>{ end }
+<main class="hero"><h1>{ title }</h1>
+  { each e in enumerate(cards) }
+  { include "partials/card.html" with {"n": e.index + 1, "card": e.item} }
+  { otherwise }<p>Nothing here yet.</p>{ end }
+</main>
 ```
+
+- Layouts can nest (a layout may declare its own `{ layout }`).
+- **`include`/`layout` paths resolve against the working directory** (where you run
+  `synsema serve`), NOT against the including template — `{ include "partials/nav.html" }`
+  works the same from `pages/home.html` and from `layouts/base.html`.
 
 ### Suggested project structure (a convention, not a requirement)
 
 ```
-layouts/     base.html, ...        (page shells with { slot })
-partials/    nav.html, footer.html (reusable components)
-pages/       home.html, ...        (page templates, use a layout)
-static/      app.css, app.js, img/ (served via `static`, with ETag/Range/gzip)
+app.syn          serve block: mounts, static, error pages
+shop.syn         a module with `export routes` (see below)
+layouts/     base.html, ...        (page shells with { slot } / { slot "name" })
+partials/    nav.html, card.html   (reusable components; card takes props via `with`)
+pages/       home.html, ...        (page templates, use a layout + { fill })
+static/      app.css, app.js, img/ (served via `static`, with ETag/Range/gzip + cache policy)
 ```
 
-### Client-side interactivity
+### Splitting routes into modules — `export routes` + `mount`
 
-Serve your own JavaScript from `static/` and reference it in your templates. Synsema
-doesn't restrict the client: vanilla JS, a bundle, htmx, a framework — your call.
+A big site doesn't have to be one big serve block. A module can export a routes group
+and the app mounts it (bodies can call the module's PRIVATE helpers):
+
+```
+-- shop.syn
+export routes tienda
+    route "GET /shop"
+        give render("pages/shop.html", {"items": catalogo()})
+
+-- app.syn
+use "./shop.syn" as shop
+serve on 8080
+    mount shop.tienda              -- or: mount shop.tienda at "/store"
+```
+
+See [modules.md](modules.md) and [serve.md](serve.md) for the rules.
+
+### The dev loop
+
+- **Templates and static files hot-reload per request** — edit `pages/home.html` or
+  `static/app.css`, refresh the browser, done. No restart.
+- Changes to the `.syn` need a restart → run **`synsema serve app.syn --watch`**: it
+  restarts the server automatically when any `.syn` under the program's directory changes.
+- **`render("literal.html")` templates are validated at startup** (file exists + parses,
+  recursively through literal `include`/`layout`) — a typo fails before the first request.
+  `synsema check app.syn` validates them too, plus all `use` imports.
+
+## Forms, error pages, static policy (see [serve.md](serve.md))
+
+- Classic `<form method="post">` → **`form of request`** (urlencoded and multipart,
+  file uploads included) — no fetch/JSON needed.
+- **`errors with <task>`** on the serve block → your own 401/404/405/500 pages
+  (HTML for browsers, JSON stays for agents; 401 can `redirect("/login")`).
+- **`static ... cache "1h"`** (Cache-Control per mount, `"immutable"` for fingerprinted
+  assets) and **`static ... fallback "index.html"`** (SPA history-fallback).
+- Dynamic responses (render/html/content/JSON) are **gzip-compressed** automatically.
 
 ## content() — agent-negotiable pages
 
@@ -89,6 +179,7 @@ route "GET /docs/:slug"
 
 ## Performance
 
-SSR template rendering is in-memory string work — fast (the Rust runtime serves in the
-Go/Node tier). Render shared partials once at startup (`let nav be body of render(...)`)
-instead of per request. Static assets ship with ETag/304, Range, and gzip.
+SSR rendering is in-memory string work — fast (the Rust runtime serves in the Go/Node
+tier). Parsed templates are **cached** (invalidated by file mtime/size, so hot-reload
+still works) — an `include` inside a loop parses once, not per iteration. Static assets
+ship with ETag/304, Range, gzip, and your `cache` policy; dynamic HTML/JSON gzips too.

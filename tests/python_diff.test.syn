@@ -184,3 +184,12 @@ test "custom types: constructor + three access forms"
     assert_eq(name of p, "Alice")
     assert_eq(p.name, "Alice")
     assert_eq(p["age"], 30)
+
+test "enumerate gives {index, item} maps (Python's for i, x in enumerate)"
+    let e be enumerate(["a", "b"])
+    assert_eq(length(e), 2)
+    assert_eq(e[0].index, 0)
+    assert_eq(e[0].item, "a")
+    assert_eq(e[1].index, 1)
+    assert_eq(e[1].item, "b")
+    assert_eq(length(enumerate([])), 0)

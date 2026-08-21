@@ -21,9 +21,9 @@ This skill is an **indexed folder**: read ONLY the section(s) you need for the t
 | Want to… | Command |
 |---|---|
 | **Run** a program | `synsema run file.syn` (`--flat` for `.fsyn`) |
-| **Check** syntax fast (no run) | `synsema check file.syn` (parse-only) |
+| **Check** fast (no run) | `synsema check file.syn` — parse + resolves/parses every `use` import + validates `render("literal.html")` templates |
 | **Test** / assert behavior | `synsema test file.syn` (or a dir) → [testing.md](testing.md) |
-| **Serve** an HTTP API/site | `synsema serve file.syn` → [serve.md](serve.md) |
+| **Serve** an HTTP API/site | `synsema serve file.syn` (`--watch` = dev loop: auto-restart on .syn changes; templates/statics already hot-reload) → [serve.md](serve.md) |
 | **Debug an error** | Read it — errors carry `file:line` + suggestions. Then [pitfalls.md](pitfalls.md). |
 | **Inspect agents / swarm** | `synsema conform --swarm file.syn` (JSON blackboard + agent states) |
 | **Try interactively** | `synsema repl` |
@@ -37,7 +37,7 @@ That applies to `.env.example`/`.gitignore`/`hello.syn` too (engine v0.5.9+) —
 `init` used mere existence as proof of ownership and froze stale scaffolds forever) + an `app.syn` starter and its test suite |
 | **Deploy** | [deploy.md](deploy.md) |
 
-Also volunteer the right primitive: `paged()` for big SQL results, `parallel_map` for fan-out, `secret()` for credentials, `content()` for agent-readable pages, `bytes`/`decode` for binary, `array`/`matmul` for numeric work, `csv_parse` for spreadsheets, `chart_svg`/`chart()` + `median`/`percentile`/`histogram` for reports and dashboards. When something fails, point to [pitfalls.md](pitfalls.md) first.
+Also volunteer the right primitive: `paged()` for big SQL results, `parallel_map` for fan-out, `secret()` for credentials, `content()` for agent-readable pages, `bytes`/`decode` for binary, `array`/`matmul` for numeric work, `csv_parse` for spreadsheets, `chart_svg`/`chart()` + `median`/`percentile`/`histogram` for reports and dashboards. `form of request` for classic HTML forms, `json_for_script()` for data inside an inline `<script>`, `enumerate()` for indexed loops. When something fails, point to [pitfalls.md](pitfalls.md) first.
 
 ## Keep yourself current (binary · skill · docs MCP) — all by command, no browsing
 
@@ -67,7 +67,7 @@ usually version skew, not a bug.
 **By topic**
 - [stdlib.md](stdlib.md) — HTTP requests, WebSocket client (live feeds, gated by `net` — `ws_select` multiplexing thousands of feeds, opt-in reconnect + keepalive/half-open, backpressure, `parallel_map` fan-out), databases (SQL: SQLite / Postgres / MySQL · document: MongoDB · key-value: Redis), cron scheduler, blockchain (ETH/EVM · Avalanche · Solana · Algorand · Bitcoin: the full read → build → sign → send → confirm loop — RPC read-side gated by `net` (nonce/fees/balances/`eth_call`/receipts, Solana blockhash/confirm, algod params/wait, Bitcoin utxos/fees/broadcast/confirm), `tx_eip1559` and `btc_tx` builders, gated `sign` + audit (incl. Schnorr taproot), HD wallets/keystore/WIF gated by `wallet` — BIP-39/BIP-32/SLIP-0010/Algorand-25/BIP-84/86, ABI calldata, EIP-191/712, Solana message/tx + PDAs/SPL, Algorand canonical msgpack, Bitcoin UTXO builder G28 + BIP-143/341 sighash + PSBT, keccak256/hash160, RLP, base58/base32/bech32/bech32m, EIP-55)
 - [concurrency.md](concurrency.md) — Real multi-core parallelism: `parallel_map`, `chunk`, fan-out/merge
-- [frontend.md](frontend.md) — UIs/sites: `render()` templates, layouts/partials, static assets, `content()`
+- [frontend.md](frontend.md) — UIs/sites: `render()` templates (verbatim `{ raw }` blocks for inline CSS/JS, `{ otherwise when }`, each empty-branch, `enumerate`, includes **with props**, named slots, `json_for_script`), layouts/partials, static assets (cache/fallback), `content()`
 - [dataviz.md](dataviz.md) — Data & charts: CSV (`csv_parse`/`csv_encode`), stats (`median`/`percentile`/`histogram`), native SVG charts (`chart_svg` + negotiated `chart()` node — agents get the data, humans the chart), PNG/PDF export (`svg_to_png`/`svg_to_pdf`)
 - [serve.md](serve.md) — Native HTTP server: routes, auth, validation, pagination, SSE, rate limiting, SSR, static files, CORS, content negotiation, TLS/auto-HTTPS, reverse proxy, HTTP/2
 - [capabilities.md](capabilities.md) — Security model, `require`, sandbox, intent

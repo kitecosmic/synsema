@@ -692,7 +692,21 @@ impl Interpreter {
         stmts: &[Node],
         bindings: Vec<(String, SynValue)>,
     ) -> Result<SynValue, Control> {
-        let env = Environment::child(&self.global_env, "request");
+        let genv = self.global_env.clone();
+        self.run_request_block_in(stmts, bindings, &genv)
+    }
+
+    /// Como `run_request_block`, pero el scope del request cuelga de `parent` en vez
+    /// del global — el caso de una ruta montada desde un módulo (`mount`): su cuerpo
+    /// resuelve los helpers PRIVADOS del módulo por nombre simple, igual que una task
+    /// exportada (DE-027).
+    pub fn run_request_block_in(
+        &mut self,
+        stmts: &[Node],
+        bindings: Vec<(String, SynValue)>,
+        parent: &Rc<RefCell<Environment>>,
+    ) -> Result<SynValue, Control> {
+        let env = Environment::child(parent, "request");
         {
             let mut e = env.borrow_mut();
             for (k, v) in bindings {
@@ -840,6 +854,9 @@ impl Interpreter {
         self.register("append", 2, Rc::new(|i, a, l| i.b_append(a, l)));
         self.register("keys", 1, Rc::new(|i, a, l| i.b_keys(a, l)));
         self.register("values", 1, Rc::new(|i, a, l| i.b_values(a, l)));
+        // enumerate(list) → [{index, item}, …] — índice en loops (each e in enumerate(xs)),
+        // en el lenguaje Y en templates. PURO, sin capability.
+        self.register("enumerate", 1, Rc::new(|i, a, l| i.b_enumerate(a, l)));
         self.register("contains", 2, Rc::new(|i, a, l| i.b_contains(a, l)));
         self.register("split", 2, Rc::new(|i, a, l| i.b_split(a, l)));
         self.register("join", 2, Rc::new(|i, a, l| i.b_join(a, l)));
@@ -1711,14 +1728,83 @@ impl Interpreter {
                 env_set(env, alias, module_map.clone());
                 Ok(module_map)
             }
+            // `routes <name>`: grupo de rutas montable. Se ejecuta a un MAP PLANO
+            // {"_routes_meta": [<method/path/params/requires_auth>...],
+            //  "_route_handler_<i>": task} — cada handler-task cierra sobre ESTE env
+            // (el module_env cuando el grupo vive en un módulo), así el snapshot de
+            // serve lo trata como cualquier map de módulo (DE-032) y los cuerpos de
+            // ruta llaman helpers privados del módulo por nombre simple.
+            NodeKind::RoutesDeclaration { name, routes } => {
+                let mut map = IndexMap::new();
+                let mut meta: Vec<SynValue> = Vec::new();
+                for (i, r) in routes.iter().enumerate() {
+                    if let NodeKind::RouteDefinition {
+                        method,
+                        path,
+                        param_names,
+                        requires_auth,
+                        streaming,
+                        rate_limit,
+                        body,
+                    } = &r.kind
+                    {
+                        if *streaming {
+                            return Err(err_at(
+                                "a 'routes' group cannot contain 'stream' routes yet — declare streaming routes directly in the serve block",
+                                &r.location,
+                            ));
+                        }
+                        if rate_limit.is_some() {
+                            return Err(err_at(
+                                "'rate_limit' inside a 'routes' group is not supported yet — set it on the serve block",
+                                &r.location,
+                            ));
+                        }
+                        let task = SynValue::Task(Rc::new(SynTaskValue {
+                            name: format!("route {} {}", method, path),
+                            parameters: Vec::new(),
+                            body: body.clone(),
+                            closure_env: env.clone(),
+                            origin: Some(r.location.clone()),
+                            required_capabilities: Vec::new(),
+                        }));
+                        map.insert(format!("_route_handler_{}", i), task);
+                        let mut mm = IndexMap::new();
+                        mm.insert("method".to_string(), syn_text(method.as_str()));
+                        mm.insert("path".to_string(), syn_text(path.as_str()));
+                        mm.insert("requires_auth".to_string(), syn_bool(*requires_auth));
+                        mm.insert(
+                            "params".to_string(),
+                            syn_list(param_names.iter().map(|p| syn_text(p.as_str())).collect()),
+                        );
+                        meta.push(syn_map(mm));
+                    }
+                }
+                map.insert("_routes_meta".to_string(), syn_list(meta));
+                let value = syn_map(map);
+                env_set(env, name, value.clone());
+                Ok(value)
+            }
+
+            // Una cláusula `mount` suelta jamás se ejecuta sola: la consume el serve hook.
+            NodeKind::MountClause { .. } => {
+                Err(err_at("'mount' is only valid inside a serve block", loc))
+            }
+
             NodeKind::ExportDeclaration { declaration } => {
                 let value = self.exec(declaration, env)?;
                 let name = match &declaration.kind {
                     NodeKind::TaskDefinition { name, .. }
                     | NodeKind::TypeDefinition { name, .. }
                     | NodeKind::LetBinding { name, .. }
-                    | NodeKind::EnumDefinition { name, .. } => name.clone(),
-                    _ => return Err(err_at("export must wrap a task, type, let, or enum", loc)),
+                    | NodeKind::EnumDefinition { name, .. }
+                    | NodeKind::RoutesDeclaration { name, .. } => name.clone(),
+                    _ => {
+                        return Err(err_at(
+                            "export must wrap a task, type, let, enum, or routes",
+                            loc,
+                        ))
+                    }
                 };
                 // Registra el nombre en la superficie pública del módulo actual. El
                 // frame base (entrypoint) nunca se cosecha → allí es un no-op.
@@ -3112,6 +3198,26 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 Ok(syn_list(keys))
             }
             _ => Err(err("keys() requires a map")),
+        }
+    }
+
+    fn b_enumerate(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        match nth(args, 0)? {
+            SynValue::List(l) => {
+                let items: Vec<SynValue> = l
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let mut m = IndexMap::new();
+                        m.insert("index".to_string(), syn_int(i as i64));
+                        m.insert("item".to_string(), v.clone());
+                        syn_map(m)
+                    })
+                    .collect();
+                Ok(syn_list(items))
+            }
+            other => Err(err(format!("enumerate() requires a list, got {}", other.type_name()))),
         }
     }
 

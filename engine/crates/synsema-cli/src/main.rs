@@ -25,7 +25,7 @@ mod init_templates;
 mod synfide;
 mod update;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] | test [-v] [--sandbox | --cap-set <list>] <archivo|dir> | check | tokens | ast | repl | daemon | init [dir] [--synfide] | llm status [--json] | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] | test [-v] [--sandbox | --cap-set <list>] <archivo|dir> | check | tokens | ast | repl | daemon | init [dir] [--synfide] | llm status [--json] | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
 
 /// Construye el techo de capabilities del host desde `--sandbox`/`--cap-set` (defense-in-depth:
 /// el operador impone un límite que el código ejecutado no puede exceder, sin importar qué
@@ -423,6 +423,8 @@ fn cmd_llm_status(json: bool) -> ExitCode {
 
 fn cmd_conform(args: &[String]) -> ExitCode {
     // conform [--swarm] [--flat] [--env-file <p>|--no-env-file] <archivo.syn>
+    // stdout de conform = SOLO el JSON: el eco vivo de agentes va a stderr.
+    synsema_runtime::engine::AGENT_ECHO_TO_STDERR.store(true, std::sync::atomic::Ordering::Relaxed);
     let args = take_env_file_flags(args);
     let args = args.as_slice();
     let mut swarm = false;
@@ -489,6 +491,7 @@ fn cmd_conform(args: &[String]) -> ExitCode {
 fn cmd_serve(args: &[String]) -> ExitCode {
     let args = take_env_file_flags(args);
     let mut secure = false;
+    let mut watch = false;
     let mut path: Option<String> = None;
     let mut ov = ServeOverrides::default();
     let mut i = 2;
@@ -508,6 +511,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         }
         match args[i].as_str() {
             "--secure" => secure = true,
+            "--watch" => watch = true,
             "--port" => {
                 let v = next_val!("--port");
                 match v.parse::<u16>() {
@@ -557,6 +561,14 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // --watch: supervisor de dev — corre el serve en un proceso hijo y lo reinicia
+    // cuando cambia cualquier `.syn` bajo el directorio del programa. Los templates
+    // y estáticos YA se recargan por request (no necesitan reinicio); esto cierra el
+    // único hueco del loop de dev (cambios de rutas/lógica en el .syn).
+    if watch {
+        return run_serve_watch(&path);
+    }
 
     let source = match std::fs::read_to_string(&path) {
         Ok(s) => s,
@@ -870,6 +882,97 @@ fn collect_syn_dir(dir: &std::path::Path, out: &mut Vec<String>) -> std::io::Res
     Ok(())
 }
 
+/// `serve --watch`: proceso hijo `synsema serve <mismos args sin --watch>` + polling
+/// de mtimes de los `.syn` bajo el directorio del programa. Cambio → kill + respawn.
+/// Si el hijo muere solo (p.ej. error de arranque), se espera al PRÓXIMO cambio para
+/// reintentar (nada de crash-loop girando).
+fn run_serve_watch(entry: &str) -> ExitCode {
+    use std::collections::HashMap;
+    use std::time::{Duration, SystemTime};
+
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("synsema serve --watch: could not resolve current exe: {}", e);
+            return ExitCode::from(1);
+        }
+    };
+    // argv del hijo = argv original sin `--watch` y sin el nombre del binario.
+    let child_args: Vec<String> =
+        std::env::args().skip(1).filter(|a| a != "--watch").collect();
+    let entry_path = std::path::PathBuf::from(entry);
+    let watch_root = entry_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    let snapshot = |root: &std::path::Path| -> HashMap<String, SystemTime> {
+        let mut files: Vec<String> = vec![entry.to_string()];
+        let _ = collect_syn_dir(root, &mut files);
+        let mut map = HashMap::new();
+        for f in files {
+            if let Ok(meta) = std::fs::metadata(&f) {
+                if let Ok(m) = meta.modified() {
+                    map.insert(f, m);
+                }
+            }
+        }
+        map
+    };
+    let changed_file = |old: &HashMap<String, SystemTime>, new: &HashMap<String, SystemTime>| {
+        for (f, m) in new {
+            match old.get(f) {
+                None => return Some(f.clone()),
+                Some(om) if om != m => return Some(f.clone()),
+                _ => {}
+            }
+        }
+        old.keys().find(|f| !new.contains_key(*f)).cloned()
+    };
+
+    loop {
+        let mut snap = snapshot(&watch_root);
+        let mut child = match std::process::Command::new(&exe).args(&child_args).spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("synsema serve --watch: could not spawn server: {}", e);
+                return ExitCode::from(1);
+            }
+        };
+        // Vigilar: cambio de archivos → reinicio; hijo muerto → esperar un cambio.
+        let reason: String;
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            let now = snapshot(&watch_root);
+            if let Some(f) = changed_file(&snap, &now) {
+                let _ = child.kill();
+                let _ = child.wait();
+                reason = f;
+                break;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                eprintln!(
+                    "[watch] server exited ({}). Waiting for a file change to retry...",
+                    status
+                );
+                loop {
+                    std::thread::sleep(Duration::from_millis(500));
+                    let now = snapshot(&watch_root);
+                    if changed_file(&snap, &now).is_some() {
+                        break;
+                    }
+                    snap = now;
+                }
+                reason = "restart after exit".to_string();
+                break;
+            }
+            snap = now;
+        }
+        eprintln!("[watch] {} changed — restarting server", reason);
+    }
+}
+
 /// check <archivo.syn>: parsea sin ejecutar; reporta cantidad de statements o el error.
 fn cmd_check(args: &[String]) -> ExitCode {
     let path = match args.get(2) {
@@ -889,8 +992,34 @@ fn cmd_check(args: &[String]) -> ExitCode {
     use synsema_core::parser::CompileError;
     match synsema_core::parser::parse_source(&source, &path) {
         Ok(program) => {
-            println!("OK: {} statements parsed.", program.statements.len());
-            ExitCode::SUCCESS
+            // Chequeo estático profundo: módulos `use` (recursivo, mismas reglas que
+            // el runtime) + templates `render("literal")` (existen y parsean). Un
+            // import roto o un template con typo falla en `check`, no en producción.
+            match synsema_core::templates::check_program_static(&program, &path) {
+                Ok((modules, templates)) => {
+                    let mut extras = Vec::new();
+                    if modules > 0 {
+                        extras.push(format!("{} module(s)", modules));
+                    }
+                    if templates > 0 {
+                        extras.push(format!("{} template(s)", templates));
+                    }
+                    if extras.is_empty() {
+                        println!("OK: {} statements parsed.", program.statements.len());
+                    } else {
+                        println!(
+                            "OK: {} statements parsed. {} validated.",
+                            program.statements.len(),
+                            extras.join(" + ")
+                        );
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    ExitCode::from(1)
+                }
+            }
         }
         Err(CompileError::Lex(e)) => {
             eprintln!("Error: {}", e);

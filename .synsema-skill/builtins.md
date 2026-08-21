@@ -18,6 +18,7 @@
 - `round(x)` → nearest **integer**; ties round to the **even** value (banker's rounding, like Python's `round`): `round(2.5)` → `2`, `round(3.5)` → `4`. A non-number errors. These four are **pure** (no capability), and an already-integer argument is returned unchanged.
 - `append(list, item)` → new list with item added
 - `keys(map)` → list of keys
+- `enumerate(list)` → `[{index, item}, …]` — indexed iteration in the language AND in templates (`each e in enumerate(xs)` → `e.index` / `e.item`). Pure; non-list → error.
 - `values(map)` → list of values
 - `contains(collection, item)` → bool (lists/text/maps; also `bytes`: subsequence, or a single byte 0–255)
 - `split(text, separator)` → list
@@ -113,7 +114,8 @@ Blockchain — sign/verify/derive (all pure-Rust; see stdlib.md for the security
 - Note: `text(b)` / `print(b)` show a hex repr like `bytes(48656c6c6f)`, **not** a decode. `bytes != text` always.
 
 ## JSON (pure — no capability)
-- `json_encode(value)` → text: serialize any value to a JSON string. Maps/lists nest; **secret → `"[redacted]"`** (safe), `bytes` → base64 string, `decimal` (`1.50d`) → exact JSON number, `nothing` → `null`.
+- `json_encode(value)` → text: serialize any value to a JSON string. Maps/lists nest; **secret → `"[redacted]"`** (safe), `bytes` → base64 string, `decimal` (`1.50d`) → exact JSON number, `nothing` → `null`. ⚠️ NOT safe to embed inside a `<script>` tag — use `json_for_script` there.
+- `json_for_script(value)` → text: same JSON but with `<`, `>`, `&` escaped as `\u00XX` — **the safe way to embed data in an inline `<script>`** (`{ raw json_for_script(x) }`); a value containing `</script>` cannot break out of the tag.
 - `json_decode(text)` → value: parse a JSON string to a Synsema value (object→map, array→list, number→number, etc.). Errors clearly on invalid JSON.
 - Round-trippable: `json_decode(json_encode(x))` reconstructs `x` (the idiomatic way to store structured data in a Redis/text value: `redis_set(k, json_encode({...}))`).
 
@@ -339,7 +341,8 @@ Response helpers (set the HTTP status; body follows the response contract):
 - `fail(code, msg)` → `{"error": msg, "status": code}`; also `fail(msg)` → 400, and `fail(code)`
 - `html(content)` → 200, `text/html; charset=utf-8`, raw body (no JSON encoding)
 - `respond(content, content_type, status?)` → raw body with an arbitrary content-type and optional status
-- `render(template_path, data?)` → `text/html` from a template file. A hole `{ x }` is a **data field** (a single name — even a reserved word like `type`) or an **expression** (`{ format_time(created) }`). Values are auto-escaped (XSS-safe); `{ raw expr }` opts out; `{ each x in xs }…{ end }` and `{ when c }…{ otherwise }…{ end }` reuse Synsema flow. cwd-relative + traversal-blocked; `render("literal")` templates are validated at startup; errors carry `file:line`. See serve.md.
+- `render(template_path, data?)` → `text/html` from a template file. A hole `{ x }` is a **data field** (a single name — even a reserved word like `type`) or an **expression** (`{ format_time(created) }`, your own tasks included). Values are auto-escaped (XSS-safe); `{ raw expr }` opts out; **`{ raw }`…`{ end }` is a VERBATIM block (inline CSS/JS with literal braces)**; `{ each x in xs }…{ otherwise }…{ end }` (empty branch; `enumerate(xs)` for indexes) and `{ when c }…{ otherwise when c2 }…{ otherwise }…{ end }` reuse Synsema flow; `{ include "p" [with {props}] }`, `{ layout }`/`{ slot }`/`{ slot "name" }`+`{ fill "name" }` compose; `{ -- comment }`. Parsed templates are cached (mtime-invalidated → hot-reload per request). cwd-relative + traversal-blocked; `render("literal")` templates are validated at startup (recursively, includes/layouts too) and by `synsema check`; errors carry `file:line`. See serve.md and [frontend.md](frontend.md).
+- `form of request` → parsed form body (urlencoded → `{field: text}`; multipart → text fields + files as `{filename, content_type, data: bytes}`; no form body → empty map) — inside a route handler. See serve.md.
 - `read_body()` → full request body **text** (lossy for non-UTF-8) — inside a route handler
 - `read_body_bytes()` → full request body as `bytes` (byte-exact, for binary uploads) — inside a route handler
 - `binary(bytes, content_type?, status?)` → a binary response (default `application/octet-stream`, 200). Also `give bytes(...)` directly → octet-stream.

@@ -157,8 +157,11 @@ impl Lexer {
             }
         }
 
-        // Saltar líneas en blanco y líneas que sólo tienen comentario
-        if self.at_end() || self.peek(0) == Some('\n') {
+        // Saltar líneas en blanco y líneas que sólo tienen comentario. El `\r` cubre
+        // los archivos CRLF de Windows: una línea en blanco ahí es "\r\n" y sin este
+        // caso el dedent fantasma rompía el parser ("Unexpected token: INDENT") en
+        // cualquier bloque con una línea en blanco adentro.
+        if self.at_end() || self.peek(0) == Some('\n') || self.peek(0) == Some('\r') {
             return Ok(());
         }
         if self.peek(0) == Some('-') && self.peek(1) == Some('-') {

@@ -60,7 +60,12 @@ fn static_rt(www: &std::path::Path) -> ServeRuntime {
         None,
         None,
         64,
-        vec![("/".to_string(), www.to_string_lossy().into_owned())],
+        vec![synsema_stdlib::server::StaticMountSpec {
+            prefix: "/".to_string(),
+            dir: www.to_string_lossy().into_owned(),
+            cache: None,
+            fallback: None,
+        }],
         None,
         None,
         None,

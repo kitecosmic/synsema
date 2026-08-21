@@ -372,9 +372,29 @@ pub enum NodeKind {
         window: String,
         unlimited: bool,
     },
+    /// Grupo de rutas exportable desde un módulo: `export routes <name>` + bloque de
+    /// `route ...`. Se ejecuta a un MAP plano ({_routes_meta, _route_handler_i}) cuyo
+    /// handler-task cierra sobre el env del módulo — viaja por la misma maquinaria de
+    /// snapshot/rebuild que cualquier map de módulo (DE-027/032/033).
+    RoutesDeclaration {
+        name: String,
+        routes: Vec<Node>, // RouteDefinition
+    },
+    /// `mount <expr> [at "/prefix"]` dentro de `serve`: monta un grupo `export routes`
+    /// de un módulo en la tabla de rutas (opcionalmente bajo un prefijo).
+    MountClause {
+        source: Box<Node>,
+        prefix: Option<Box<Node>>,
+    },
     StaticMount {
         directory: Box<Node>,
         prefix: Option<Box<Node>>,
+        /// `cache <expr>` — política Cache-Control de los assets del mount
+        /// ("1h", "7d", "immutable", "no-store", segundos crudos).
+        cache: Option<Box<Node>>,
+        /// `fallback <expr>` — archivo servido (200) cuando el path no existe en el
+        /// mount (SPA history-fallback, estilo try_files).
+        fallback: Option<Box<Node>>,
     },
     DescribeClause {
         about: Option<Box<Node>>,
@@ -383,6 +403,9 @@ pub enum NodeKind {
     ServeBlock {
         port: Box<Node>,
         auth_handler: Option<Box<Node>>,
+        /// `errors with <task>` — task(status, message, request) que da forma al BODY
+        /// de los errores del runtime (401/404/405/500); nothing → JSON por defecto.
+        error_handler: Option<Box<Node>>,
         max_body: Option<Box<Node>>,
         max_streams: Option<Box<Node>>,
         rate_limit: Option<Box<Node>>,
@@ -401,6 +424,8 @@ pub enum NodeKind {
         domain: Option<Box<Node>>,
         // Lote 1 — vhost: bloques `host "..."` con su propia tabla (route/static/auth/tls).
         hosts: Vec<Node>, // HostBlock
+        /// `mount <expr> [at "/prefix"]` — grupos `export routes` montados en la tabla.
+        mounts: Vec<Node>, // MountClause
     },
     /// vhost: `host "dominio"` (o `*.dominio`) con su propia tabla dentro de `serve`.
     HostBlock {

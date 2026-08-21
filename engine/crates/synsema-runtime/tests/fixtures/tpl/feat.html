@@ -1,0 +1,10 @@
+{ -- comentario: no debe aparecer }
+<style>{ raw }
+body { margin: 0; }
+.card:hover { transform: translateY(-4px); }
+{ end }</style>
+{ when n == 1 }uno{ otherwise when n == 2 }dos{ otherwise }otro{ end }
+{ each e in enumerate(items) }[{ e.index }:{ e.item }]{ otherwise }SIN-ITEMS{ end }
+{ each x in vacio }({ x }){ otherwise }VACIO{ end }
+{ include "tests/fixtures/tpl/card.html" with {"titulo": "Props"} }
+<script>window.__D__ = { raw json_for_script(items) };</script>

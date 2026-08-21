@@ -48,6 +48,13 @@ The difference is **structural**: in other stacks security depends on the develo
 a `fetch` to that host **cannot run**, period. Security is a language property, not a
 discipline.
 
+**Websites too, not just APIs.** The template engine covers what Flask+Jinja / Go
+`html/template` cover — layouts, named slots, components with props, verbatim CSS/JS
+blocks, auto-escaping, `json_for_script` — plus classic form parsing (`form of request`),
+custom error pages (`errors with`), static cache policy / SPA fallback, per-request
+template hot-reload and `serve --watch`. A styled multi-page site is a `.syn` + templates
++ a stylesheet, no framework ([frontend.md](frontend.md)).
+
 ## 3. Agent-native — and the discovery layer is auto-generated
 
 For AI-agent / LLM workloads Synsema has primitives others lack: LLM reasoning ops
