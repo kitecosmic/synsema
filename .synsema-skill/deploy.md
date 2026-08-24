@@ -309,11 +309,17 @@ templates, the numeric tower + arrays, JSON/CSV/regex/stats, `chart_svg` + PNG/P
 export, hashing/HMAC/`secret`, the whole PURE blockchain side (`eth_address`, ABI,
 EIP-191/712, `tx_eip1559`, Solana/Algorand encode, Bitcoin builder/PSBT, gated
 `*_sign` + `wallet`), web-auth pure side (argon2 password hashing, JWT, TOTP,
-`oidc_verify` with inline JWKS), file I/O via WASI preopens (`--dir .`), and the
-security semantics (`sandbox`, `intent`, per-tool scoping).
+`oidc_verify` with inline JWKS), file I/O via WASI preopens (`--dir .`), the
+security semantics (`sandbox`, `intent`, per-tool scoping), the response helpers +
+`content()` vocabulary (`ok`/`page`/`heading`/…/`chart()`), multi-agent
+(`agent`/`spawn`/`share`/`observe`/`signal`/`wait_for` — the core's in-process
+fallback, agents run inline), and `parallel_map`/`chunk` (sequential in wasm: same
+input-order + fail-fast semantics, no thread pool).
 
 NOT in this profile (clear errors, not crashes): network (`fetch`/`http_*`/`ws_*`,
 blockchain RPC read-side), databases, `serve`, `cron`, persistent memory
-(`remember`/`recall`), `spawn`/blackboard, `parallel_map`; LLM ops fall back to the
-core offline placeholders. Engine CI runs the language suites + a known-vector probe
-under wasmtime on every push (`wasm` job in ci.yml; `probes/probe_wasm_pure.syn`).
+(`remember`/`recall`); real OS-thread parallelism (spawn/parallel_map run
+in-process/sequentially — wall-clock speedup needs the native binary); LLM ops fall
+back to the core offline placeholders. Engine CI runs the language suites + two probes
+under wasmtime on every push (`wasm` job in ci.yml; `probes/probe_wasm_pure.syn` and
+`probes/probe_wasm_agents.syn`).

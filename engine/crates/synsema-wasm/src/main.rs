@@ -32,9 +32,14 @@ use synsema_capabilities::model::{
     capability_type_from_name, Capability, CapabilitySet, CapabilityType,
 };
 use synsema_capabilities::secure::register_secure_builtins;
-use synsema_core::interpreter::{Control, Interpreter, RunResult};
+use synsema_core::interpreter::{Control, Interpreter, RunResult, RuntimeError};
 use synsema_core::parser::{parse_source, CompileError};
+use synsema_core::types::{syn_list, SynValue};
 use synsema_stdlib::secrets::{register_secret_builtins, EnvStore};
+
+fn rt_err(msg: &str) -> Control {
+    Control::Error(RuntimeError::new(msg.to_string()))
+}
 
 /// Mismo criterio que INTERP_STACK_SIZE del runtime (tree-walking recursivo). En
 /// wasm el stack se fija al linkear (ver .cargo/config.toml); esto es el fallback
@@ -59,10 +64,55 @@ fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>) {
     synsema_stdlib::oidc::register_oidc_builtins(interp, caps.clone());
     synsema_stdlib::blockchain::register_blockchain_builtins(interp, caps.clone());
     synsema_stdlib::spend::register_spend_builtins(interp, caps.clone());
-    // charts/raster: en el binario nativo los registra register_serve_builtins
-    // (server.rs, gateado por `native`) — acá directo de sus módulos puros.
-    synsema_stdlib::charts::register_chart_builtins(interp);
-    synsema_stdlib::raster::register_raster_builtins(interp);
+    // Respuesta + vocabulario content() (respond.rs, puro): ok/created/…/page/heading/
+    // prose/content — registra también charts y raster, el MISMO camino que el nativo.
+    synsema_stdlib::respond::register_serve_builtins(interp);
+
+    // chunk + parallel_map: en wasm no hay threads — chunk es puro (misma validación
+    // que runtime/parallel.rs) y parallel_map corre SECUENCIAL con la misma semántica
+    // observable (resultados en orden de entrada, fail-fast en el primer error, como
+    // el `apply` secuencial). `limit` se acepta y se ignora: es un knob de
+    // paralelismo, no de semántica.
+    interp.register_builtin(
+        "chunk",
+        2,
+        Rc::new(|_i, args, _loc| {
+            let list = match args.first() {
+                Some(SynValue::List(l)) => l.borrow().clone(),
+                _ => return Err(rt_err("chunk: first argument must be a list")),
+            };
+            let size = match args.get(1) {
+                Some(SynValue::Number(n)) => n.to_i64_trunc().unwrap_or(0),
+                _ => return Err(rt_err("chunk: size must be a number")),
+            };
+            if size <= 0 {
+                return Err(rt_err("chunk size must be positive"));
+            }
+            let size = size as usize;
+            let chunks: Vec<SynValue> =
+                list.chunks(size).map(|c| syn_list(c.to_vec())).collect();
+            Ok(syn_list(chunks))
+        }),
+    );
+    interp.register_builtin(
+        "parallel_map",
+        -1,
+        Rc::new(|i, args, _loc| {
+            let task = match args.first() {
+                Some(t @ (SynValue::Task(_) | SynValue::Builtin(_))) => t.clone(),
+                _ => return Err(rt_err("parallel_map: first argument must be a task")),
+            };
+            let list = match args.get(1) {
+                Some(SynValue::List(l)) => l.borrow().clone(),
+                _ => return Err(rt_err("parallel_map: second argument must be a list")),
+            };
+            let mut out = Vec::with_capacity(list.len());
+            for item in list {
+                out.push(i.call_task(task.clone(), vec![item])?);
+            }
+            Ok(syn_list(out))
+        }),
+    );
 
     // Familia de estado persistente: los builtins EXISTEN y fallan con la verdad
     // del entorno (sin almacenamiento durable), no con "unknown function".

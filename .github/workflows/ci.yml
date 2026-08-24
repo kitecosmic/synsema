@@ -63,6 +63,16 @@ jobs:
           echo "$out" | grep -q "keccak_vacio=c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
           echo "$out" | grep -q "addr_key1=0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
           echo "$out" | grep -q "svg_ok=true"
+      - name: Probe (agentes in-process, parallel_map secuencial, content)
+        run: |
+          out=$(wasmtime run --dir . engine/target/wasm32-wasip1/release/synsema-wasm.wasm probes/probe_wasm_agents.syn)
+          echo "$out"
+          echo "$out" | grep -q 'pmap=\[2, 4, 6, 8\]'
+          echo "$out" | grep -q 'chunk=\[\[1, 2\], \[3, 4\], \[5\]\]'
+          echo "$out" | grep -q 'pmap_error=item malo'
+          echo "$out" | grep -q 'agents=listo'
+          echo "$out" | grep -q '"type": "heading"'
+          echo "$out" | grep -q 'ok_envelope={"status": 200, "value": {"total": 395}}'
 
   # Supply-chain: cargo audit contra la base RustSec en cada push/PR.
   # Falla ante una vulnerabilidad conocida en Cargo.lock (los warnings
