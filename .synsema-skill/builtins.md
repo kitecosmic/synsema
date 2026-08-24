@@ -346,7 +346,7 @@ Response helpers (set the HTTP status; body follows the response contract):
 - `read_body()` → full request body **text** (lossy for non-UTF-8) — inside a route handler
 - `read_body_bytes()` → full request body as `bytes` (byte-exact, for binary uploads) — inside a route handler
 - `binary(bytes, content_type?, status?)` → a binary response (default `application/octet-stream`, 200). Also `give bytes(...)` directly → octet-stream.
-- **Shared state across requests** (serve): `state_set(key, value)`, `state_get(key, default?)`, `state_incr(key, delta?)`, `state_delete(key)` — an in-memory store shared across all handlers/requests (a `set` on a global does NOT persist across requests). See serve.md.
+- **Shared state across requests** (serve): `state_set(key, value)`, `state_get(key, default?)`, `state_incr(key, delta?)`, `state_delete(key)`, `state_all()` (snapshot map of every key) — an in-memory store shared across all handlers/requests (a `set` on a global does NOT persist across requests). See serve.md.
 
 ### Semantic content (negotiated HTML / Markdown / JSON — see serve.md)
 - `content(tree)` → a negotiable response: HTML (default), Markdown (`Accept: text/markdown` or `.md`), or JSON (`.json`). Opt-in; only `content()` is negotiated.

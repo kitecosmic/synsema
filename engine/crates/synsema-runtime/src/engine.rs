@@ -399,6 +399,10 @@ pub(crate) fn wire_common_with_state(
     register_http_builtins(interp, caps.clone());
     // Hashing SHA + Keccak (puro, sin capability): sha256/sha512/keccak256/sha512_256 → bytes.
     synsema_stdlib::hashing::register_hash_builtins(interp);
+    // JSON del lenguaje (puro, sin capability): json_encode/json_for_script/json_decode.
+    // Vivían dentro de register_database_builtins; ahora en json.rs para que existan
+    // también en el perfil wasm (sin `native`).
+    synsema_stdlib::json::register_json_builtins(interp);
     // Web auth (tanda web-auth): random_bytes/token/password_hash/password_verify/
     // jwt_sign/jwt_verify/totp/totp_verify. random_bytes/token GATEADOS por
     // `random` (la misma puerta deny-by-default de random()/random_int() — libres

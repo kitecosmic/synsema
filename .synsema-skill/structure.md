@@ -39,14 +39,19 @@ engine/
     │       ├── recovery.rs          # retry/fallback/escalation
     │       └── error_reporter.rs    # rich diagnostics + suggestions
     │
-    ├── synsema-stdlib/              # standard library
+    ├── synsema-stdlib/              # standard library — feature `native` (default) gates the
+    │   │                            # OS-facing modules; without it the PURE subset compiles
+    │   │                            # to wasm32 (CI-anchored against wasm32-wasip1)
     │   └── src/
-    │       ├── http.rs              # HTTP client (std::net + rustls for https)
-    │       ├── server.rs            # async HTTP server (hyper/tokio): response contract, TLS, vhost, proxy
-    │       ├── database.rs          # SQLite (rusqlite, bundled)
-    │       ├── cron.rs              # cron scheduler
+    │       ├── http.rs              # HTTP client (std::net + rustls for https) [native]
+    │       ├── http_stub.rs         # no-`native` stand-in: same transport signatures, errors at runtime
+    │       ├── server.rs            # async HTTP server (hyper/tokio): response contract, TLS, vhost, proxy [native]
+    │       ├── database.rs          # SQLite (rusqlite, bundled) + PG/MySQL/Mongo/Redis [native]
+    │       ├── cron.rs              # cron scheduler [native]
+    │       ├── json.rs              # JSON ↔ SynValue + content-tree-as-data + json_encode/decode builtins (pure)
+    │       ├── respond.rs           # response helpers (ok/created/…/set_cookie) + content() vocabulary (pure)
     │       ├── secrets.rs           # env/secret/reveal/bearer + HMAC/sha hashing
-    │       ├── acme.rs              # auto-HTTPS (ACME, instant-acme)
+    │       ├── acme.rs              # auto-HTTPS (ACME, instant-acme) [native]
     │       └── mimetypes.rs         # static-file content types
     │
     ├── synsema-agents/              # multi-agent system
@@ -55,8 +60,12 @@ engine/
     ├── synsema-llm/                 # LLM + human interaction
     │   └── src/{provider.rs, context.rs, validator.rs, human.rs}
     │
-    └── synsema-cli/                 # the `synsema` binary
-        └── src/main.rs             # subcommands: run / check / test / serve / conform / repl / daemon
+    ├── synsema-cli/                 # the `synsema` binary
+    │   └── src/main.rs             # subcommands: run / check / test / serve / conform / repl / daemon
+    │
+    ├── synsema-wasm/                # lib (pure wiring, run/test/check/handle, HostProvider) + wasip1 CLI bin (v0.6.0+)
+    └── synsema-wasm-web/            # cdylib wasm32-unknown-unknown: JSON ABI + `synsema_host` imports (browser/Node/Python/Go)
+        └── src/main.rs             # run / --test / stdin over the PURE stdlib profile (see deploy.md § WebAssembly)
 ```
 
 ## Key entry points

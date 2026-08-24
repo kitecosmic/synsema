@@ -16,49 +16,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 
-use indexmap::IndexMap;
 
 use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
-use synsema_capabilities::secure::url_hostname;
+
+// Lo puro del cliente (gate net, forma de respuesta, parsers de args, registro de
+// los seis builtins) vive en http_common y se comparte con el perfil wasm.
+pub use crate::http_common::{err_result, header_pairs, require_net, HttpResult};
+#[allow(unused_imports)]
+use crate::http_common::{
+    map_pairs, raw_str, register_http_client_builtins, response_to_syn, timeout_arg, url_with_query,
+    urlencode,
+};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
-use synsema_core::types::{syn_bool, syn_int, syn_map, syn_text, SynValue};
-
-/// Chequea la capability `net(host)` del URL; convierte la violación en `Control::Error`
-/// SIN ubicación (como secure.rs/database.rs). Scope = hostname (minúsculas, sin puerto);
-/// si no se puede extraer, se usa el URL crudo (fail-closed). `net` NO es tipo-ruta →
-/// `covers()` usa el glob de host (`net("*.example.com")` cubre `api.example.com`).
-pub(crate) fn require_net(
-    caps: &Rc<RefCell<CapabilitySet>>,
-    url: &str,
-    source: &str,
-) -> Result<(), Control> {
-    let host = match url_hostname(url) {
-        Some(h) if !h.is_empty() => h,
-        _ => url.to_string(),
-    };
-    caps.borrow_mut()
-        .require(&Capability::new(CapabilityType::Net, Some(host)), source)
-        .map_err(|v| Control::Error(RuntimeError::new(v.message)))
-}
-
-/// Respuesta estructurada (espeja el dict del oráculo).
-pub struct HttpResult {
-    pub status: i64,
-    pub ok: bool,
-    pub body: String,
-    pub headers: Vec<(String, String)>,
-    pub error: Option<String>,
-}
-
-fn err_result(error: String) -> HttpResult {
-    HttpResult {
-        status: 0,
-        ok: false,
-        body: String::new(),
-        headers: Vec::new(),
-        error: Some(error),
-    }
-}
+#[allow(unused_imports)]
+use synsema_core::types::{syn_bool, syn_float, syn_int, syn_nothing, syn_text, SynValue};
 
 /// Petición HTTP. Devuelve la respuesta o un resultado de error (nunca panica).
 pub fn http_request(
@@ -69,14 +40,7 @@ pub fn http_request(
     body: Option<&str>,
     timeout_secs: u64,
 ) -> HttpResult {
-    // URL con query.
-    let full_url = match query {
-        Some(q) if !q.is_empty() => {
-            let sep = if url.contains('?') { "&" } else { "?" };
-            format!("{}{}{}", url, sep, urlencode(q))
-        }
-        _ => url.to_string(),
-    };
+    let full_url = url_with_query(url, query);
     match do_request(method, &full_url, headers, body.map(str::as_bytes), timeout_secs) {
         Ok(r) => r,
         Err(e) => err_result(e),
@@ -618,107 +582,6 @@ impl ChunkDecoder {
     }
 }
 
-fn urlencode(q: &[(String, String)]) -> String {
-    q.iter()
-        .map(|(k, v)| format!("{}={}", pct(k), pct(v)))
-        .collect::<Vec<_>>()
-        .join("&")
-}
-
-fn pct(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    out
-}
-
-// -- Builtins (no gateados por capability) --
-
-fn raw_str(v: &SynValue) -> String {
-    match v {
-        SynValue::Text(s) => s.to_string(),
-        SynValue::Number(n) => n.to_string(),
-        SynValue::Bool(b) => if *b { "True" } else { "False" }.to_string(),
-        SynValue::Nothing => "None".to_string(),
-        other => other.to_string(),
-    }
-}
-
-/// Map SynValue → pares (clave, str(valor)). Para query params: un `secret` se
-/// **redacta** vía Display (fail-closed; los query params terminan en la URL, que se
-/// loguea). Para credenciales usar headers + `bearer()`.
-fn map_pairs(v: Option<&SynValue>) -> Option<Vec<(String, String)>> {
-    match v {
-        Some(SynValue::Map(m)) => Some(
-            m.borrow()
-                .iter()
-                .map(|(k, val)| (k.clone(), val.to_string()))
-                .collect(),
-        ),
-        _ => None,
-    }
-}
-
-/// Igual que `map_pairs` pero para **headers**: un `secret` (o el resultado de
-/// `bearer()`) se materializa a su plaintext SÓLO acá, en el borde del socket — el
-/// String vive en el runtime y se escribe al header; nunca vuelve a user-space (§4).
-/// `pub(crate)`: blockchain_rpc.rs (headers de algod, p.ej. `X-Algo-API-Token`
-/// como secret) usa la MISMA regla de materialización en el borde.
-pub(crate) fn header_pairs(v: Option<&SynValue>) -> Option<Vec<(String, String)>> {
-    match v {
-        Some(SynValue::Map(m)) => Some(
-            m.borrow()
-                .iter()
-                .map(|(k, val)| match val {
-                    SynValue::Secret(s) => (k.clone(), s.expose().to_string()),
-                    other => (k.clone(), other.to_string()),
-                })
-                .collect(),
-        ),
-        _ => None,
-    }
-}
-
-/// Timeout opcional de las builtins HTTP (MF-012): número positivo → segundos (piso 1);
-/// ausente/`Nothing`/inválido (0, negativo, texto) → 30, el default histórico. Tolerante
-/// como los knobs: un valor inválido cae al default, no es error.
-fn timeout_arg(v: Option<&SynValue>) -> u64 {
-    match v {
-        Some(SynValue::Number(n)) => {
-            let secs = n.to_f64();
-            if secs > 0.0 && secs.is_finite() {
-                (secs as u64).max(1)
-            } else {
-                30
-            }
-        }
-        _ => 30,
-    }
-}
-
-fn response_to_syn(r: HttpResult) -> SynValue {
-    let mut m = IndexMap::new();
-    m.insert("status".to_string(), syn_int(r.status));
-    m.insert("ok".to_string(), syn_bool(r.ok));
-    m.insert("body".to_string(), syn_text(r.body));
-    if !r.headers.is_empty() {
-        let mut hm = IndexMap::new();
-        for (k, v) in r.headers {
-            hm.insert(k, syn_text(v));
-        }
-        m.insert("headers".to_string(), syn_map(hm));
-    }
-    if let Some(e) = r.error {
-        m.insert("error".to_string(), syn_text(e));
-    }
-    syn_map(m)
-}
-
 pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
     // T5 — mtls_identity(cert_path, key_path) → true. Declara la identidad de
     // cliente TLS de ESTE proceso: a partir de acá, todo `https://` presenta ese
@@ -824,152 +687,9 @@ pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilityS
         );
     }
 
-    // http(method, url, headers?, query?, body?, timeout?)
-    {
-        let caps = caps.clone();
-        interp.register_builtin(
-            "http",
-            -1,
-            Rc::new(move |_i, args, _loc| {
-                let method = raw_str(args.first().unwrap_or(&SynValue::Nothing));
-                let url = raw_str(args.get(1).unwrap_or(&SynValue::Nothing));
-                require_net(&caps, &url, "http()")?;
-                let headers = header_pairs(args.get(2));
-                let query = map_pairs(args.get(3));
-                let body = args.get(4).map(raw_str);
-                let r = http_request(
-                    &method,
-                    &url,
-                    headers.as_deref(),
-                    query.as_deref(),
-                    body.as_deref(),
-                    timeout_arg(args.get(5)),
-                );
-                Ok(response_to_syn(r))
-            }),
-        );
-    }
-
-    // http_get(url, headers?, query?, timeout?)
-    {
-        let caps = caps.clone();
-        interp.register_builtin(
-            "http_get",
-            -1,
-            Rc::new(move |_i, args, _loc| {
-                let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
-                require_net(&caps, &url, "http_get()")?;
-                let headers = header_pairs(args.get(1));
-                let query = map_pairs(args.get(2));
-                let r = http_request(
-                    "GET",
-                    &url,
-                    headers.as_deref(),
-                    query.as_deref(),
-                    None,
-                    timeout_arg(args.get(3)),
-                );
-                Ok(response_to_syn(r))
-            }),
-        );
-    }
-
-    // http_post(url, body, headers?, timeout?)
-    {
-        let caps = caps.clone();
-        interp.register_builtin(
-            "http_post",
-            -1,
-            Rc::new(move |_i, args, _loc| {
-                let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
-                require_net(&caps, &url, "http_post()")?;
-                let body = args.get(1).map(raw_str);
-                let headers = header_pairs(args.get(2));
-                let r = http_request(
-                    "POST",
-                    &url,
-                    headers.as_deref(),
-                    None,
-                    body.as_deref(),
-                    timeout_arg(args.get(3)),
-                );
-                Ok(response_to_syn(r))
-            }),
-        );
-    }
-
-    // http_put(url, body, headers?, timeout?)
-    {
-        let caps = caps.clone();
-        interp.register_builtin(
-            "http_put",
-            -1,
-            Rc::new(move |_i, args, _loc| {
-                let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
-                require_net(&caps, &url, "http_put()")?;
-                let body = args.get(1).map(raw_str);
-                let headers = header_pairs(args.get(2));
-                let r = http_request(
-                    "PUT",
-                    &url,
-                    headers.as_deref(),
-                    None,
-                    body.as_deref(),
-                    timeout_arg(args.get(3)),
-                );
-                Ok(response_to_syn(r))
-            }),
-        );
-    }
-
-    // http_delete(url, headers?, timeout?)
-    {
-        let caps = caps.clone();
-        interp.register_builtin(
-            "http_delete",
-            -1,
-            Rc::new(move |_i, args, _loc| {
-                let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
-                require_net(&caps, &url, "http_delete()")?;
-                let headers = header_pairs(args.get(1));
-                let r = http_request(
-                    "DELETE",
-                    &url,
-                    headers.as_deref(),
-                    None,
-                    None,
-                    timeout_arg(args.get(2)),
-                );
-                Ok(response_to_syn(r))
-            }),
-        );
-    }
-
-    // fetch(url, method?, headers?, body?, timeout?) — cliente HTTP real, gateado por net.
-    // Default GET; mismo retorno que http_* (response_to_syn).
-    {
-        let caps = caps.clone();
-        interp.register_builtin(
-            "fetch",
-            -1,
-            Rc::new(move |_i, args, _loc| {
-                let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
-                require_net(&caps, &url, "fetch()")?;
-                let method = args.get(1).map(raw_str).unwrap_or_else(|| "GET".to_string());
-                let headers = header_pairs(args.get(2));
-                let body = args.get(3).map(raw_str);
-                let r = http_request(
-                    &method,
-                    &url,
-                    headers.as_deref(),
-                    None,
-                    body.as_deref(),
-                    timeout_arg(args.get(4)),
-                );
-                Ok(response_to_syn(r))
-            }),
-        );
-    }
+    // Los seis builtins cliente (http/http_get/http_post/http_put/http_delete/fetch):
+    // registro compartido con el perfil wasm (http_common), transporte = sockets.
+    register_http_client_builtins(interp, caps, http_request);
 }
 
 #[cfg(test)]

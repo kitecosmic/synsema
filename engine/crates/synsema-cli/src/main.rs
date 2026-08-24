@@ -13,7 +13,7 @@
 use std::process::ExitCode;
 
 // El conform usa el motor (runtime): intérprete + modelo de seguridad cableado.
-use synsema_capabilities::model::{capability_type_from_name, Capability, CapabilityType};
+use synsema_capabilities::model::build_ceiling;
 use synsema_runtime::daemon;
 use synsema_runtime::engine::{
     repl, run_program_ceiled, run_source, run_swarm_dump, run_tests_ceiled,
@@ -27,51 +27,8 @@ mod update;
 
 const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] | test [-v] [--sandbox | --cap-set <list>] <archivo|dir> | check | tokens | ast | repl | daemon | init [dir] [--synfide] | llm status [--json] | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
 
-/// Construye el techo de capabilities del host desde `--sandbox`/`--cap-set` (defense-in-depth:
-/// el operador impone un límite que el código ejecutado no puede exceder, sin importar qué
-/// `require`). `--sandbox` ≡ techo `[stdout, time]` (sólo cómputo + `print`). `--cap-set` parsea
-/// items separados por coma: `name` (wildcard, sin scope) o `name=scope`. Son mutuamente
-/// excluyentes. Devuelve `Ok(None)` cuando no hay ninguno (comportamiento por defecto, sin techo).
-fn build_ceiling(sandbox: bool, cap_set: Option<&str>) -> Result<Option<Vec<Capability>>, String> {
-    match (sandbox, cap_set) {
-        (true, Some(_)) => {
-            Err("--sandbox and --cap-set are mutually exclusive; choose one".to_string())
-        }
-        // Techo mínimo: cómputo + stdout (print) + time (now/sleep). Nada de net/exec/file/llm/…
-        (true, None) => Ok(Some(vec![
-            Capability::new(CapabilityType::Stdout, None),
-            Capability::new(CapabilityType::Time, None),
-        ])),
-        (false, Some(list)) => {
-            let mut caps = Vec::new();
-            for item in list.split(',') {
-                let item = item.trim();
-                if item.is_empty() {
-                    continue;
-                }
-                // `name=scope` (net=api.mock.test, db=:memory:, file.read=./data/*) o `name`.
-                let (name, scope) = match item.split_once('=') {
-                    Some((n, s)) => (n.trim(), Some(s.trim().to_string())),
-                    None => (item, None),
-                };
-                match capability_type_from_name(name) {
-                    Some(ty) => caps.push(Capability::new(ty, scope)),
-                    None => {
-                        return Err(format!(
-                            "--cap-set: unknown capability '{}'. Known: net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal, sign, wallet, memory",
-                            name
-                        ))
-                    }
-                }
-            }
-            if caps.is_empty() {
-                return Err("--cap-set requires at least one capability".to_string());
-            }
-            Ok(Some(caps))
-        }
-        (false, None) => Ok(None),
-    }
-}
+// `build_ceiling` (--sandbox/--cap-set → techo) vive en synsema-capabilities: lo comparten
+// este binario y `synsema-wasm` (mismas flags, misma semántica en los dos front-ends).
 
 /// Serializa un mapa (clave→string) como objeto JSON ordenado.
 fn json_obj(pairs: Vec<(String, String)>) -> String {

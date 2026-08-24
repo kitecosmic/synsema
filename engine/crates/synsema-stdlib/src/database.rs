@@ -53,7 +53,7 @@ use synsema_core::types::{
     SynValue,
 };
 
-use crate::server::{dumps, json_to_syn, syn_to_json};
+use crate::json::json_to_syn;
 
 /// Handle al `DatabaseManager` abstrayendo el modo de acceso: `Rc<RefCell>` para
 /// runs single-thread (conform), `Arc<Mutex>` para `serve` (db compartida entre
@@ -1629,49 +1629,8 @@ pub fn register_database_builtins<H: DbHandle>(
         );
     }
 
-    // json_encode(value) → text: serializa CUALQUIER valor a un string JSON. Compañero de la
-    // API de DB para datos estructurados (p.ej. redis_set(k, json_encode({...}))), pero es un
-    // builtin general (transform puro, SIN capability — como text/bytes/decode). Mismo mapeo que
-    // los bodies de serve: secrets → "[redacted]" (seguro), bytes → base64, decimal exacto.
-    interp.register_builtin(
-        "json_encode",
-        1,
-        Rc::new(|_i, args, _loc| {
-            let v = args.first().ok_or_else(|| err("json_encode: missing argument"))?;
-            Ok(syn_text(dumps(&syn_to_json(v))))
-        }),
-    );
-
-    // json_for_script(value) → text: JSON seguro para incrustar en un <script> — igual que
-    // json_encode pero con `<`, `>` y `&` escapados como \u00XX, así un valor que contenga
-    // "</script>" no puede cerrar el tag ni inyectar HTML. Es el mismo escapado que el
-    // runtime ya usa para su JSON-LD. Uso: <script>const D = { raw json_for_script(x) };</script>.
-    // Puro, SIN capability.
-    interp.register_builtin(
-        "json_for_script",
-        1,
-        Rc::new(|_i, args, _loc| {
-            let v = args.first().ok_or_else(|| err("json_for_script: missing argument"))?;
-            let json = dumps(&syn_to_json(v))
-                .replace('<', "\\u003c")
-                .replace('>', "\\u003e")
-                .replace('&', "\\u0026");
-            Ok(syn_text(json))
-        }),
-    );
-
-    // json_decode(text) → value: parsea un string JSON a un valor de Synsema (map/list/number/
-    // text/bool/nothing). Error claro si el JSON es inválido. Sin capability.
-    interp.register_builtin(
-        "json_decode",
-        1,
-        Rc::new(|_i, args, _loc| {
-            let s = raw_str(args.first().ok_or_else(|| err("json_decode: missing argument"))?);
-            let j: serde_json::Value = serde_json::from_str(&s)
-                .map_err(|e| err(format!("json_decode: invalid JSON: {}", e)))?;
-            Ok(json_to_syn(&j))
-        }),
-    );
+    // json_encode/json_for_script/json_decode: MOVIDOS a json.rs (register_json_builtins)
+    // — builtins generales puros (sin capability), existen también en el perfil wasm.
 
     // sql(query, params?) → lista de mapas-fila
     {

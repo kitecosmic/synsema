@@ -24,6 +24,159 @@ jobs:
       - name: Test
         run: cargo test --locked --manifest-path engine/Cargo.toml --workspace
 
+  # Perfil wasm: el subconjunto puro de la stdlib compila a wasm32-wasip1, el
+  # artefacto synsema-wasm buildea, y las suites puras del lenguaje + la sonda
+  # corren DE VERDAD bajo wasmtime. Ancla la garantía: una tanda futura que
+  # rompa el perfil puro falla acá, no en el disco de alguien.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('engine/Cargo.lock') }}
+      - name: Check pure profile (stdlib sin native)
+        run: cargo check --locked --manifest-path engine/Cargo.toml -p synsema-stdlib --no-default-features --target wasm32-wasip1
+      - name: Build synsema-wasm
+        run: cargo build --locked --manifest-path engine/Cargo.toml -p synsema-wasm --target wasm32-wasip1 --profile wasm
+      # Sin action de terceros (la allowlist del repo sólo admite oficiales + los
+      # pineados): release oficial de wasmtime, verificada con el attestation de
+      # GitHub (firma del build de bytecodealliance; wasmtime no publica checksums
+      # como asset) — misma doctrina que `synsema update`: verificar antes de correr.
+      - name: Setup wasmtime
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          V=v48.0.0
+          A=wasmtime-$V-x86_64-linux.tar.xz
+          gh release download "$V" -R bytecodealliance/wasmtime --pattern "$A"
+          gh attestation verify "$A" -R bytecodealliance/wasmtime
+          tar -xJf "$A"
+          echo "$PWD/wasmtime-$V-x86_64-linux" >> "$GITHUB_PATH"
+      - name: Language suites under wasmtime
+        run: |
+          for f in tests/lang.test.syn tests/math.test.syn tests/arrays.test.syn tests/python_diff.test.syn tests/batch6.test.syn; do
+            echo "== $f"
+            wasmtime run --dir . engine/target/wasm32-wasip1/wasm/synsema-wasm.wasm --test "$f"
+          done
+      - name: Probe (job puro con vectores conocidos)
+        run: |
+          out=$(wasmtime run --dir . --env ETH_KEY=0000000000000000000000000000000000000000000000000000000000000001 \
+            engine/target/wasm32-wasip1/wasm/synsema-wasm.wasm tests/wasm_pure.probe.syn)
+          echo "$out"
+          echo "$out" | grep -q "keccak_vacio=c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+          echo "$out" | grep -q "addr_key1=0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf"
+          echo "$out" | grep -q "svg_ok=true"
+      - name: Probe (agentes in-process, parallel_map secuencial, content)
+        run: |
+          out=$(wasmtime run --dir . engine/target/wasm32-wasip1/wasm/synsema-wasm.wasm tests/wasm_agents.probe.syn)
+          echo "$out"
+          echo "$out" | grep -q 'pmap=\[2, 4, 6, 8\]'
+          echo "$out" | grep -q 'chunk=\[\[1, 2\], \[3, 4\], \[5\]\]'
+          echo "$out" | grep -q 'pmap_error=item malo'
+          echo "$out" | grep -q 'agents=listo'
+          echo "$out" | grep -q '"type": "heading"'
+          echo "$out" | grep -q 'ok_envelope={"status": 200, "value": {"total": 395}}'
+      # Paridad nativo ↔ wasm: las sondas puras deben dar la MISMA salida byte a byte
+      # (mismo lenguaje, mismo resultado). El binario nativo se compila en debug acá
+      # (la caché lo hace incremental). wasm_pure excluye la línea de red: nativo
+      # deniega por capability, wasm dice que no hay sockets.
+      - name: Build native synsema (parity)
+        run: cargo build --locked --manifest-path engine/Cargo.toml -p synsema-cli
+      - name: Parity native vs wasm (byte-identical output)
+        env:
+          ETH_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
+        run: |
+          set -euo pipefail
+          W="wasmtime run --dir . --env ETH_KEY=$ETH_KEY engine/target/wasm32-wasip1/wasm/synsema-wasm.wasm"
+          for f in wasm_pure wasm_agents wasm_respond wasm_sandbox wasm_math; do
+            echo "== $f"
+            engine/target/debug/synsema run tests/$f.probe.syn | grep -v '^fetch_error=' > native.out
+            $W tests/$f.probe.syn | grep -v '^fetch_error=' > wasm.out
+            diff native.out wasm.out
+          done
+      # El front-end wasm honra el techo del host y no se traga flags desconocidas:
+      # `--sandbox` deniega el `require random` de la sonda; `--bogus` es error (exit 2),
+      # nunca "una ruta". Las familias nativas (net/db/cron) existen y fallan con la
+      # verdad del entorno — jamás con "Undefined variable".
+      - name: Host ceiling + unknown flags + unavailable families (wasm)
+        run: |
+          set -euo pipefail
+          W="wasmtime run --dir . --env ETH_KEY=00 engine/target/wasm32-wasip1/wasm/synsema-wasm.wasm"
+          if $W --sandbox tests/wasm_sandbox.probe.syn 2>err.txt; then echo "--sandbox ignorado"; exit 1; fi
+          grep -q 'Capability not granted: random' err.txt
+          if $W --cap-set stdout,random,secret=ETH_KEY tests/wasm_sandbox.probe.syn >cap.out; then :; else echo "--cap-set suficiente falló"; exit 1; fi
+          grep -q 'after_task=secret' cap.out
+          if $W --bogus tests/wasm_pure.probe.syn 2>err.txt; then echo "flag desconocida aceptada"; exit 1; fi
+          grep -q "unknown option '--bogus'" err.txt
+          $W tests/wasm_unavailable.probe.syn | tee un.out
+          # Fase 2: red = builtins reales gateados por net (igual que nativo); con la
+          # capability y sin host que preste `http`, el transporte lo dice.
+          grep -q 'fetch=Capability not granted: net("example.com")' un.out
+          grep -q 'eth_balance_con_net=eth_balance: .*provides no http transport' un.out
+          grep -q 'ws_connect=ws_connect: not available in the wasm profile' un.out
+          grep -q 'sql=sql: not available in the wasm profile' un.out
+          grep -q 'cron_every=cron_every: not available in the wasm profile' un.out
+          grep -q 'remember=Capability not granted: memory' un.out
+          if grep -q 'Undefined variable' un.out; then exit 1; fi
+          if grep -q 'DISPONIBLE' un.out; then exit 1; fi
+
+  # Fase 2 — artefacto EMBEBIBLE (wasm32-unknown-unknown, ABI JSON + hooks del host):
+  # se buildea y se sondea de verdad desde tres hosts — Node (paquete @synsema/wasm:
+  # red/LLM/KV del host, handler-mode, bridge async, paridad byte a byte con el nativo),
+  # Python (wasmtime-py) y Go (wazero). Lo que la doc afirma del embebido pasa por acá.
+  wasm-web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+          key: ${{ runner.os }}-cargo-wasm-web-${{ hashFiles('engine/Cargo.lock') }}
+      - name: Build synsema-wasm-web (cdylib)
+        run: cargo build --locked --manifest-path engine/Cargo.toml -p synsema-wasm-web --target wasm32-unknown-unknown --profile wasm
+      - name: Build native synsema (parity)
+        run: cargo build --locked --manifest-path engine/Cargo.toml -p synsema-cli
+      - name: Probe under Node (API, host hooks, handler-mode, async bridge, parity)
+        run: node tests/wasm_web.probe.mjs engine/target/wasm32-unknown-unknown/wasm/synsema_wasm_web.wasm engine/target/debug/synsema
+      - name: Probe under Python (wasmtime-py)
+        run: |
+          pip install wasmtime
+          PYTHONIOENCODING=utf-8 python examples/embed/python/demo.py engine/target/wasm32-unknown-unknown/wasm/synsema_wasm_web.wasm
+      - name: Probe under Go (wazero)
+        working-directory: examples/embed/go
+        run: go run . ../../../engine/target/wasm32-unknown-unknown/wasm/synsema_wasm_web.wasm
+      - name: Size budget (gzip < 5 MB)
+        run: |
+          gz=$(gzip -9 -c engine/target/wasm32-unknown-unknown/wasm/synsema_wasm_web.wasm | wc -c)
+          echo "gzip bytes: $gz"
+          test "$gz" -lt 5242880
+
   # Supply-chain: cargo audit contra la base RustSec en cada push/PR.
   # Falla ante una vulnerabilidad conocida en Cargo.lock (los warnings
   # "unmaintained" no cortan el build; se revisan al actualizar deps).

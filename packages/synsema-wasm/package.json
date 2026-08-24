@@ -1,0 +1,44 @@
+{
+  "name": "@synsema/wasm",
+  "version": "0.0.0-dev",
+  "description": "Synsema — the programming language for AI agents — embedded as WebAssembly: run .syn programs inside browsers, Node/Bun/Deno and edge runtimes, lending them http/kv/llm from your app",
+  "license": "MIT",
+  "type": "module",
+  "main": "./index.mjs",
+  "module": "./index.mjs",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.mjs"
+    },
+    "./synsema.wasm": "./synsema.wasm",
+    "./bridge.mjs": "./bridge.mjs",
+    "./worker.mjs": "./worker.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "bridge.mjs",
+    "worker.mjs",
+    "index.d.ts",
+    "synsema.wasm",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kitecosmic/synsema",
+    "directory": "packages/synsema-wasm"
+  },
+  "keywords": [
+    "synsema",
+    "wasm",
+    "webassembly",
+    "agents",
+    "llm",
+    "edge"
+  ]
+}

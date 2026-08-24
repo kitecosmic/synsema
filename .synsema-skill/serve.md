@@ -193,7 +193,7 @@ route "POST /visit"
 route "GET /count"
     give state_get("visits", 0)     -- default 0 if unset
 ```
-- `state_set(key, value)` / `state_get(key, default?)` / `state_incr(key, delta?)` / `state_delete(key)`.
+- `state_set(key, value)` / `state_get(key, default?)` / `state_incr(key, delta?)` / `state_delete(key)` / `state_all()` → a map snapshot of every key (`{"a": 1, "hits": 2}`).
 - In-memory (gone on restart). For durable state use SQL ([stdlib.md](stdlib.md)) or the agent
   memory (`remember`/`recall`) **and progress** (`create_progress`/`resume_point`/…) — **both persist
   across serve requests** (shared store), so a plan created in one request advances in the next.

@@ -1,0 +1,28 @@
+[package]
+name = "synsema-wasm-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Synsema embebible como módulo WebAssembly (wasm32-unknown-unknown): ABI cruda JSON + hooks del host (http/kv/llm/log/reloj) para navegador, Node/Bun/Deno, Python (wasmtime), Go (wazero)"
+
+# cdylib: el módulo exporta `synsema_call`/`synsema_alloc`/`synsema_free` e importa
+# el módulo `synsema_host`. Sin wasm-bindgen: la frontera es JSON en memoria lineal,
+# así el MISMO .wasm sirve a cualquier runtime (no sólo a JS) y no hay CLI de
+# post-proceso que pinear. `rlib` además para que los tests nativos del workspace
+# (cargo test --workspace) compilen la lógica de la frontera.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+synsema-wasm = { path = "../synsema-wasm" }
+synsema-core.workspace = true
+synsema-stdlib = { path = "../synsema-stdlib", default-features = false }
+serde_json.workspace = true
+
+# En wasm32-unknown-unknown no hay fuente de entropía del SO: getrandom 0.2 (el de
+# rand 0.8 / k256 / argon2 / rsa) se cablea al hook `random_fill` del host vía
+# `register_custom_getrandom!` (navegador: crypto.getRandomValues; Node: webcrypto;
+# Python: os.urandom; Go: crypto/rand). Sólo en ese target: wasip1 y nativo usan el
+# backend del SO de siempre.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["custom"] }
