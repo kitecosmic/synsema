@@ -19,7 +19,6 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -88,10 +87,7 @@ fn os_random(n: usize, who: &str) -> Result<Vec<u8>, Control> {
 
 /// Unix timestamp actual (segundos). std::time — chrono va sin feature `clock`.
 fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    synsema_core::clock::now_secs()
 }
 
 /// Entero i64 de un opt, con validación de tipo y rango inferior.

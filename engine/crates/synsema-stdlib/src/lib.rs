@@ -26,6 +26,10 @@ pub mod cron;
 #[cfg(feature = "native")]
 pub mod database;
 pub mod hashing;
+/// Protocolo host↔intérprete (F2): capabilities que un embebedor OFRECE (http/kv/llm/log).
+pub mod hostcap;
+/// Lo puro del cliente HTTP, compartido por los dos transportes.
+pub mod http_common;
 #[cfg(feature = "native")]
 pub mod http;
 #[cfg(not(feature = "native"))]
@@ -37,6 +41,8 @@ pub mod mimetypes;
 pub mod oidc;
 pub mod raster;
 pub mod respond;
+/// Router + contrato de respuesta de `serve`, PUROS (compartidos con el handler-mode wasm).
+pub mod routing;
 pub mod secrets;
 #[cfg(feature = "native")]
 pub mod server;

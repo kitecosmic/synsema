@@ -42,12 +42,12 @@ use synsema_agents::swarm::Swarm;
 use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
 use synsema_core::ast::{Node, NodeKind, Param};
 use synsema_core::interpreter::{
-    BuiltinTask, Control, Environment, Interpreter, RunResult, RuntimeError, ServeHook,
+    Control, Environment, Interpreter, RunResult, RuntimeError, ServeHook,
 };
 use synsema_core::number::Number;
 use synsema_core::parser::{parse_source, CompileError};
 use synsema_core::types::{
-    from_send, syn_bool, syn_bytes, syn_int, syn_map, syn_nothing, syn_text, to_send, SendValue,
+    from_send, syn_bool, syn_int, syn_text, to_send, SendValue,
     ServerValue, SynTaskValue, SynValue,
 };
 use synsema_stdlib::acme;
@@ -57,9 +57,11 @@ use synsema_stdlib::cron::{
 };
 use synsema_stdlib::database::{register_database_builtins, DatabaseManager};
 use synsema_stdlib::server::{
-    self, json_to_syn, serve_forever, AuthHandler, Ctx, Emitter, ErrorHandler, GiveOutcome,
+    self, serve_forever, AuthHandler, Ctx, Emitter, ErrorHandler, GiveOutcome,
     Handler, RouteSpec, ServeRuntime, StaticMountSpec, StreamEnd, StreamGone, StreamHandler,
 };
+#[allow(unused_imports)]
+use synsema_stdlib::routing::{build_form_syn, build_request_syn, headers_map, request_bindings, str_map};
 
 /// Manager de base de datos compartido entre el top-level y los hilos de conexión.
 type SharedDb = Arc<Mutex<DatabaseManager>>;
@@ -1304,150 +1306,9 @@ fn with_serve_interp<R>(
 // Construcción del contexto de request (SynValue)
 // =========================================================
 
-fn str_map(m: &IndexMap<String, String>) -> SynValue {
-    let mut out = IndexMap::new();
-    for (k, v) in m {
-        out.insert(k.clone(), syn_text(v.as_str()));
-    }
-    syn_map(out)
-}
-
-fn headers_map(headers: &[(String, String)]) -> SynValue {
-    let mut out = IndexMap::new();
-    for (k, v) in headers {
-        out.insert(k.clone(), syn_text(v.as_str())); // último gana (como dict de Python)
-    }
-    syn_map(out)
-}
-
-/// El map `request` que ve el handler (paridad con `_build_request`).
-fn build_request_syn(ctx: &Ctx) -> SynValue {
-    let mut m = IndexMap::new();
-    m.insert("method".to_string(), syn_text(ctx.method.as_str()));
-    m.insert("path".to_string(), syn_text(ctx.path.as_str()));
-    m.insert("body".to_string(), syn_text(ctx.body.as_str()));
-    m.insert(
-        "body_file".to_string(),
-        match &ctx.body_file {
-            Some(p) => syn_text(p.as_str()),
-            None => syn_nothing(),
-        },
-    );
-    m.insert(
-        "json".to_string(),
-        match &ctx.json {
-            Some(v) => json_to_syn(v),
-            None => syn_nothing(),
-        },
-    );
-    m.insert("headers".to_string(), headers_map(&ctx.headers));
-    // Cookies entrantes (RFC 6265 §5.4), SIN decodificar; nombre duplicado: gana
-    // la primera aparición. Sin header `Cookie` → map VACÍO (nunca nothing:
-    // `request.cookies.sid` siempre es navegable).
-    let mut cookies = IndexMap::new();
-    for (k, v) in server::parse_cookies(&ctx.headers) {
-        cookies.insert(k, syn_text(v.as_str()));
-    }
-    m.insert("cookies".to_string(), syn_map(cookies));
-    m.insert("query".to_string(), str_map(&ctx.query));
-    m.insert("params".to_string(), str_map(&ctx.params));
-    // `form of request` — body de formulario parseado según Content-Type:
-    //   application/x-www-form-urlencoded → {campo: texto}
-    //   multipart/form-data → campo de texto → texto; archivo → {filename,
-    //     content_type, data (bytes exactos)}
-    // Sin form body → map VACÍO (como cookies: siempre navegable, nunca nothing).
-    m.insert("form".to_string(), build_form_syn(ctx));
-    m.insert("ip".to_string(), syn_text(ctx.client_ip.as_str()));
-    m.insert("user".to_string(), ctx.user.clone().unwrap_or_else(syn_nothing));
-    syn_map(m)
-}
-
-/// Parsea el body de formulario del request (urlencoded o multipart) → SynMap.
-/// Para bodies spilled a disco (grandes uploads multipart) lee el temp file.
-fn build_form_syn(ctx: &Ctx) -> SynValue {
-    let ctype = ctx
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-        .map(|(_, v)| v.as_str())
-        .unwrap_or("");
-    let mut out = IndexMap::new();
-    if ctype.to_ascii_lowercase().contains("application/x-www-form-urlencoded") {
-        let body = if let Some(bf) = &ctx.body_file {
-            std::fs::read_to_string(bf).unwrap_or_default()
-        } else {
-            ctx.body.clone()
-        };
-        for (k, v) in server::parse_form_urlencoded(&body) {
-            out.insert(k, syn_text(v.as_str()));
-        }
-    } else if let Some(boundary) = server::multipart_boundary(ctype) {
-        let raw: Vec<u8> = if let Some(bf) = &ctx.body_file {
-            std::fs::read(bf).unwrap_or_default()
-        } else {
-            ctx.body_raw.clone()
-        };
-        for part in server::parse_multipart(&boundary, &raw) {
-            let value = match &part.filename {
-                None => syn_text(String::from_utf8_lossy(&part.data).as_ref()),
-                Some(fname) => {
-                    let mut f = IndexMap::new();
-                    f.insert("filename".to_string(), syn_text(fname.as_str()));
-                    f.insert(
-                        "content_type".to_string(),
-                        match &part.content_type {
-                            Some(ct) => syn_text(ct.as_str()),
-                            None => syn_nothing(),
-                        },
-                    );
-                    f.insert("data".to_string(), syn_bytes(part.data.clone()));
-                    syn_map(f)
-                }
-            };
-            out.insert(part.name, value);
-        }
-    }
-    syn_map(out)
-}
-
-/// Las bindings que ve un handler, LOCALES al scope hijo del request (no globales →
-/// no se filtran al siguiente request al reusar el intérprete): `request`, `query`,
-/// `params` y el builtin `read_body` (lee el cuerpo, en memoria o del temp file spilled).
-fn request_bindings(ctx: &Ctx) -> Vec<(String, SynValue)> {
-    let body_text = ctx.body.clone();
-    let body_file = ctx.body_file.clone();
-    let read_body = SynValue::Builtin(Rc::new(BuiltinTask {
-        name: "read_body".to_string(),
-        param_count: 0,
-        param_names: None,
-        func: Rc::new(move |_i, _a, _l| match &body_file {
-            Some(bf) => Ok(syn_text(std::fs::read_to_string(bf).unwrap_or_default())),
-            None => Ok(syn_text(body_text.as_str())),
-        }),
-    }));
-    // read_body_bytes() → bytes crudos (NO lossy). Prefiere el temp file spilled
-    // (`std::fs::read`, no `read_to_string`); para bodies en memoria usa `body_raw` (los
-    // bytes exactos), no `body` (que pasó por from_utf8_lossy aguas arriba). Cierra el
-    // punto lossy de read_body para binario; exactitud byte-a-byte (A4).
-    let body_raw = ctx.body_raw.clone();
-    let body_file_b = ctx.body_file.clone();
-    let read_body_bytes = SynValue::Builtin(Rc::new(BuiltinTask {
-        name: "read_body_bytes".to_string(),
-        param_count: 0,
-        param_names: None,
-        func: Rc::new(move |_i, _a, _l| match &body_file_b {
-            Some(bf) => Ok(syn_bytes(std::fs::read(bf).unwrap_or_default())),
-            None => Ok(syn_bytes(body_raw.clone())),
-        }),
-    }));
-    vec![
-        ("request".to_string(), build_request_syn(ctx)),
-        ("query".to_string(), str_map(&ctx.query)),
-        ("params".to_string(), str_map(&ctx.params)),
-        ("read_body".to_string(), read_body),
-        ("read_body_bytes".to_string(), read_body_bytes),
-    ]
-}
+// `str_map`/`headers_map`/`build_request_syn`/`build_form_syn`/`request_bindings`:
+// MOVIDOS a synsema_stdlib::routing (puros; el handler-mode wasm arma el mismo
+// `request`). Importados arriba.
 
 /// Corre el cuerpo de una ruta normal; captura el `give`-value.
 #[allow(clippy::too_many_arguments)]

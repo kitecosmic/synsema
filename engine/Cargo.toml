@@ -9,6 +9,7 @@ members = [
     "crates/synsema-runtime",
     "crates/synsema-cli",
     "crates/synsema-wasm",
+    "crates/synsema-wasm-web",
 ]
 
 [workspace.package]
@@ -31,7 +32,10 @@ indexmap = "2"
 regex = "1"
 # Decimal exacto base-10 para dinero/finanzas (tipo Decimal). Puro Rust (96-bit,
 # 28-29 dígitos significativos), sin deps C → preserva el binario único estático.
-rust_decimal = { version = "1", features = ["db-postgres"] }
+# `db-postgres` la enciende synsema-stdlib bajo su feature `native` (postgres-protocol
+# arrastra rand 0.10/getrandom 0.4, que no compila a wasm32-unknown-unknown; el perfil
+# puro no lo necesita). En el build nativo la unificación de features la enciende igual.
+rust_decimal = "1"
 # RNG no-cripto para los builtins random()/random_int() (paridad con el `random` de
 # Python). getrandom ya entra transitivamente; rand da la API de distribución/rango.
 rand = "0.8"
@@ -228,3 +232,14 @@ synsema-runtime = { path = "crates/synsema-runtime" }
 [profile.release]
 opt-level = 3
 lto = true
+
+# Perfil de los artefactos wasm (bin wasip1 + cdylib web): tamaño por sobre velocidad
+# pico (`s`: ~30% más chico que `3` sin el costo de `z` en el intérprete), un solo CGU
+# para que LTO recorte de verdad, `panic = "abort"` (en wasm un panic es un trap igual;
+# sin landing pads el módulo pesa menos) y símbolos fuera. `cargo build --profile wasm`.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+codegen-units = 1
+panic = "abort"
+strip = true

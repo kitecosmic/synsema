@@ -63,7 +63,8 @@ engine/
     ├── synsema-cli/                 # the `synsema` binary
     │   └── src/main.rs             # subcommands: run / check / test / serve / conform / repl / daemon
     │
-    └── synsema-wasm/                # the interpreter as a wasm32-wasip1 artifact (v0.6.0+)
+    ├── synsema-wasm/                # lib (pure wiring, run/test/check/handle, HostProvider) + wasip1 CLI bin (v0.6.0+)
+    └── synsema-wasm-web/            # cdylib wasm32-unknown-unknown: JSON ABI + `synsema_host` imports (browser/Node/Python/Go)
         └── src/main.rs             # run / --test / stdin over the PURE stdlib profile (see deploy.md § WebAssembly)
 ```
 

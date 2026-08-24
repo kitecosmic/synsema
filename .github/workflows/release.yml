@@ -99,5 +99,36 @@ jobs:
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
 
+  # Artefactos WebAssembly (fase 2): el bin wasip1 (wasmtime/TEEs) y el cdylib embebible
+  # (navegador/Node/Python/Go). Misma SYNSEMA_VERSION horneada (`synsema-wasm --version`,
+  # `version()` de la ABI). El playground de la doc y el paquete npm apuntan a estos assets.
+  wasm:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1,wasm32-unknown-unknown
+      - name: Build wasm artifacts
+        env:
+          SYNSEMA_VERSION: ${{ github.ref_name }}
+        run: |
+          cargo build --locked --manifest-path engine/Cargo.toml -p synsema-wasm --target wasm32-wasip1 --profile wasm
+          cargo build --locked --manifest-path engine/Cargo.toml -p synsema-wasm-web --target wasm32-unknown-unknown --profile wasm
+          cp engine/target/wasm32-wasip1/wasm/synsema-wasm.wasm synsema-wasm-wasip1.wasm
+          cp engine/target/wasm32-unknown-unknown/wasm/synsema_wasm_web.wasm synsema-wasm-web.wasm
+          shasum -a 256 synsema-wasm-wasip1.wasm > synsema-wasm-wasip1.wasm.sha256
+          shasum -a 256 synsema-wasm-web.wasm > synsema-wasm-web.wasm.sha256
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            synsema-wasm-wasip1.wasm
+            synsema-wasm-wasip1.wasm.sha256
+            synsema-wasm-web.wasm
+            synsema-wasm-web.wasm.sha256
+
   # NOTE: aarch64-linux is deferred (needs a C cross-toolchain for rusqlite's bundled
   # SQLite). Add it later via `cross` or a gcc-aarch64 setup if there's demand.

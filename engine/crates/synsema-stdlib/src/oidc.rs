@@ -50,10 +50,7 @@ const JWKS_TTL_SECS: u64 = 600;
 const JWKS_MAX_BYTES: usize = 512 * 1024;
 
 fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    synsema_core::clock::now_secs()
 }
 
 // =========================================================
@@ -71,10 +68,7 @@ fn jwks_cache() -> &'static Mutex<HashMap<String, CachedJwks>> {
 }
 
 fn monotonic_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+    synsema_core::clock::now_secs_u64()
 }
 
 /// Trae el JWKS de `url` (cacheado). `force` ignora el cache — lo usa el camino de

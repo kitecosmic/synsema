@@ -19,7 +19,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use indexmap::IndexMap;
 
@@ -36,7 +36,7 @@ use crate::blockchain_rpc::{
     as_obj, deadline_result, handle_poll_err, host_of, http_result_to_json_classified,
     jsonrpc_call_headers_classified, params_arg, poll_http_timeout, require_net, sleep_step,
     snippet, syn_to_plain_json, text_arg, url_arg, wait_timeout_arg, PollError,
-    MAX_RPC_RESPONSE, RPC_HTTP_TIMEOUT_SECS,
+    MAX_RPC_RESPONSE, RPC_HTTP_TIMEOUT_SECS, deadline_from,
 };
 use crate::http::{http_request, HttpResult};
 use crate::json::json_to_syn;
@@ -375,7 +375,7 @@ fn btc_wait(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynV
         }
     };
     let timeout = wait_timeout_arg(args.get(3), F)?;
-    let deadline = Instant::now() + timeout;
+    let deadline = deadline_from(timeout);
     let path = format!("/tx/{}/status", txid);
     let mut polled_ok = false;
     let mut warned = false;

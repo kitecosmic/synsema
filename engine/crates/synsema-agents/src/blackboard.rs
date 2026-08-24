@@ -7,16 +7,12 @@
 
 use std::collections::HashMap;
 use std::sync::{Condvar, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use indexmap::IndexMap;
 use synsema_core::types::SendValue;
 
 fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+    synsema_core::clock::now_secs_f64()
 }
 
 /// Una entrada del blackboard, con historial.

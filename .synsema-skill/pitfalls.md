@@ -332,3 +332,28 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | Comparing a secret with `==` in a loop over guesses | Fine — `==` on a secret is constant-time | For HMAC/signature checks use `verify_hmac` (also constant-time) |
 | Expecting `env("X")` to return `nothing` when unset | It raises a clear error (fail-loud) | Pass a default: `env("X", "devvalue")`, or set it in `.env`/the environment |
 | Putting a secret in a query param or JSON body | Redacted (fail-closed) → the upstream gets `secret(NAME)` | Send credentials via a header: `{"Authorization": bearer(secret("KEY"))}` |
+
+## WebAssembly (wasip1 CLI + `@synsema/wasm` embed) — see [deploy.md](deploy.md) § WebAssembly
+
+- **`.env` is NOT read by the embeddable artifact** (`synsema-wasm-web`): there is no
+  filesystem or process. Pass `env: {KEY: "..."}` in `run`/`handle` opts; `secret("KEY")`
+  resolves from there. (The wasip1 CLI DOES read `.env` through `wasmtime --dir .`.)
+- **An async host hook with the sync API fails, by design**: `syn.run(src, {host: {http: async …}})`
+  makes the call fail with `the host \`http\` hook returned a Promise — use runAsync/handleAsync`
+  (the program sees it in `r["error"]`; a `kv` write is dropped with that warning in `log`). Async
+  hooks (browser `fetch`, IndexedDB, LLM SDKs) need `runAsync`/`handleAsync` (Worker +
+  `Atomics.wait`); in browsers that needs cross-origin isolation (COOP `same-origin` + COEP
+  `require-corp`) — without it, use sync hooks.
+- **`require` still rules**: the host lending `http`/`kv`/`llm` grants nothing — without
+  `require net("host")`/`require memory("x")`/`require llm` the builtin fails with `Capability not
+  granted` BEFORE the host is called; and the embedder's `ceiling` denies above what the host lends.
+- **Handler mode is the native serve, not a lighter one**: `require serve(port)` is mandatory
+  (`serve on 8080 is not permitted: missing capability serve(8080)`), and each request runs on a
+  snapshot of the globals — a `set` on a global in a route does NOT persist; use `state_*`
+  (durable through the host `kv`). `stream`/`proxy to` answer 501; `static`/rate limits are the
+  platform's job.
+- **Not in either artifact** (names exist, errors say why): `ws_*`, `mtls_identity`, `db_open`/`sql`/
+  `mongo_*`/`redis_*`, `cron_*`, real threads (`spawn`/`parallel_map` run in-process). In wasip1
+  without a host, `fetch` with `require net` fails `this host provides no http transport`.
+- **A trap discards the instance** (a panic in wasm aborts): the JS glue recreates it on the next
+  call; program errors never trap — they come back in `errors[]`.

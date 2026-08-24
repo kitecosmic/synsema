@@ -3,16 +3,12 @@
 //! Estructuras puras (sin hilos), con persistencia JSON para resumir tras crash.
 
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+    synsema_core::clock::now_secs_f64()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,11 +254,22 @@ impl ProgressManager {
     pub fn load(&mut self) {
         if let Some(path) = &self.persist_path {
             if let Ok(s) = std::fs::read_to_string(path) {
-                if let Ok(map) = serde_json::from_str::<BTreeMap<String, TaskProgress>>(&s) {
-                    for (k, v) in map {
-                        self.tasks.insert(k, v);
-                    }
-                }
+                self.load_json(&s);
+            }
+        }
+    }
+
+    /// Estado como JSON — el mismo documento que `persist` escribe a disco (hosts sin FS).
+    pub fn to_json(&self) -> String {
+        let map: BTreeMap<&String, &TaskProgress> = self.tasks.iter().collect();
+        serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Carga el documento de `to_json`. Un JSON inválido se ignora (arranca vacío).
+    pub fn load_json(&mut self, json: &str) {
+        if let Ok(map) = serde_json::from_str::<BTreeMap<String, TaskProgress>>(json) {
+            for (k, v) in map {
+                self.tasks.insert(k, v);
             }
         }
     }

@@ -30,8 +30,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use indexmap::IndexMap;
 use num_bigint::BigInt;
@@ -316,22 +315,26 @@ pub(crate) fn wait_timeout_arg(v: Option<&SynValue>, fname: &str) -> Result<Dura
 
 /// Duerme un paso de polling ACOTADO por el deadline. `false` si ya venció (el
 /// caller devuelve `nothing` — mismo contrato que `ws_recv`).
-pub(crate) fn sleep_step(deadline: Instant, step: Duration) -> bool {
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
+pub(crate) fn sleep_step(deadline: f64, step: Duration) -> bool {
+    let remaining = deadline - synsema_core::clock::now_secs_f64();
+    if remaining <= 0.0 {
         return false;
     }
-    thread::sleep(remaining.min(step));
+    synsema_core::clock::sleep_secs(remaining.min(step.as_secs_f64()));
     true
+}
+
+/// Deadline absoluto (segundos unix, reloj del motor) a `timeout` de ahora. Va por
+/// `clock` y no por `Instant`: en un host sin SO `Instant::now()` panica.
+pub(crate) fn deadline_from(timeout: Duration) -> f64 {
+    synsema_core::clock::now_secs_f64() + timeout.as_secs_f64()
 }
 
 /// Timeout HTTP de un poll individual: lo que reste del deadline, con piso 1 s y
 /// techo el default — un nodo mudo no puede estirar la espera total.
-pub(crate) fn poll_http_timeout(deadline: Instant) -> u64 {
-    deadline
-        .saturating_duration_since(Instant::now())
-        .as_secs()
-        .clamp(1, RPC_HTTP_TIMEOUT_SECS)
+pub(crate) fn poll_http_timeout(deadline: f64) -> u64 {
+    let remaining = (deadline - synsema_core::clock::now_secs_f64()).max(0.0);
+    (remaining.floor() as u64).clamp(1, RPC_HTTP_TIMEOUT_SECS)
 }
 
 /// Aviso runtime (UNA vez por espera) cuando un poll falla transitoriamente y el
@@ -1014,7 +1017,7 @@ fn eth_wait_receipt(
         }
     };
     let timeout = wait_timeout_arg(args.get(3), F)?;
-    let deadline = Instant::now() + timeout;
+    let deadline = deadline_from(timeout);
     let mut polled_ok = false;
     let mut warned = false;
     let mut last_transient: Option<Control> = None;
@@ -1613,7 +1616,7 @@ fn solana_confirm(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Resul
     require_net(caps, &url, "solana_confirm()")?;
     let sig = solana_sig_arg(arg(args, 1, F)?, F)?;
     let timeout = wait_timeout_arg(args.get(2), F)?;
-    let deadline = Instant::now() + timeout;
+    let deadline = deadline_from(timeout);
     let mut polled_ok = false;
     let mut warned = false;
     let mut last_transient: Option<Control> = None;
@@ -1853,7 +1856,7 @@ fn algorand_wait(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result
     require_net(caps, &url, "algorand_wait()")?;
     let txid = algorand_txid_arg(arg(args, 1, F)?, F)?;
     let timeout = wait_timeout_arg(args.get(2), F)?;
-    let deadline = Instant::now() + timeout;
+    let deadline = deadline_from(timeout);
     let path = format!("/v2/transactions/pending/{}?format=json", txid);
     let mut polled_ok = false;
     let mut warned = false;

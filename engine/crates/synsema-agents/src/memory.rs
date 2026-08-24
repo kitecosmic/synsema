@@ -5,7 +5,6 @@
 //! contexto numérico (violación = la condición es falsa).
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use indexmap::IndexMap;
 use regex::Regex;
@@ -13,10 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+    synsema_core::clock::now_secs_f64()
 }
 
 /// Máximo de entradas que devuelve `recall`/`recall_mode` cuando no se pasa un límite
@@ -169,6 +165,10 @@ pub struct AgentMemory {
     pub violations: Vec<RuleViolation>,
     persist_path: Option<String>,
     counter: u64,
+    /// Etiqueta del backend de persistencia cuando NO es el nativo (p.ej. `host-kv`
+    /// en el perfil wasm): `memory_summary` la reporta para que el programa (y quien
+    /// lo lee) sepa dónde vive el estado. `None` = nativo (salida sin cambios).
+    pub backend: Option<String>,
 }
 
 impl Default for AgentMemory {
@@ -185,6 +185,7 @@ impl AgentMemory {
             violations: Vec::new(),
             persist_path: None,
             counter: 0,
+            backend: None,
         }
     }
     pub fn with_persist(path: &str) -> Self {
@@ -387,7 +388,36 @@ impl AgentMemory {
                 lines.push(format!("    [{:6}] {}: {}", r.level.value(), r.name, r.description));
             }
         }
+        if let Some(b) = &self.backend {
+            lines.push(format!("  Backend: {}", b));
+        }
         lines.join("\n")
+    }
+
+    /// Estado (entradas + reglas) como JSON — el MISMO documento que `persist` escribe
+    /// a disco. Para hosts sin FS (perfil wasm: KV del embebedor).
+    pub fn to_json(&self) -> String {
+        let p = Persisted {
+            entries: self.entries.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            rules: self.rules.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        };
+        serde_json::to_string(&p).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Carga el documento de `to_json` (idéntico a `load` pero desde texto). Sube el
+    /// contador de ids para no reusar `mem_N`. Un JSON inválido se ignora (arranca vacío).
+    pub fn load_json(&mut self, json: &str) {
+        if let Ok(p) = serde_json::from_str::<Persisted>(json) {
+            for (k, v) in p.entries {
+                if let Some(n) = k.strip_prefix("mem_").and_then(|n| n.parse::<u64>().ok()) {
+                    self.counter = self.counter.max(n);
+                }
+                self.entries.insert(k, v);
+            }
+            for (k, v) in p.rules {
+                self.rules.insert(k, v);
+            }
+        }
     }
 
     fn persist(&self) {

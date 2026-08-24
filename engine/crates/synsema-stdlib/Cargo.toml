@@ -110,6 +110,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 [features]
 default = ["native"]
 native = [
+    "rust_decimal/db-postgres",
     "dep:rusqlite",
     "dep:postgres",
     "dep:tokio-postgres-rustls",

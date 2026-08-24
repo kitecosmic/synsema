@@ -46,6 +46,12 @@ impl EnvStore {
         Self { vars: HashMap::new() }
     }
 
+    /// Un store desde un mapa ya resuelto — el `env` que un host embebedor le pasa al
+    /// intérprete wasm (reemplaza al `.env`: sin FS, sin environ de proceso).
+    pub fn from_vars(vars: HashMap<String, String>) -> Self {
+        Self { vars }
+    }
+
     pub fn get(&self, name: &str) -> Option<String> {
         self.vars.get(name).cloned()
     }
@@ -388,12 +394,12 @@ fn audit_dir() -> Result<PathBuf, String> {
 }
 
 fn iso_now() -> String {
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    match chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, d.subsec_nanos()) {
+    let secs = synsema_core::clock::now_secs_f64();
+    let whole = secs.floor();
+    let nanos = ((secs - whole) * 1e9).clamp(0.0, 999_999_999.0) as u32;
+    match chrono::DateTime::<chrono::Utc>::from_timestamp(whole as i64, nanos) {
         Some(dt) => dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-        None => d.as_secs().to_string(),
+        None => (whole as i64).to_string(),
     }
 }
 

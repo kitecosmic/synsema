@@ -1,72 +1,84 @@
-//! Stub del transporte HTTP para el build SIN `native` (perfil wasm: sin sockets).
-//! Mismas firmas que los símbolos de http.rs que consumen los módulos puros
-//! (blockchain_rpc/blockchain_btc_rpc) → esos módulos compilan enteros y sus
-//! builtins PUROS (tx_eip1559, builders, etc.) siguen completos; los de red fallan
-//! en runtime con un error claro en vez de desaparecer del lenguaje.
-//! Sin `register_http_builtins`: este módulo no registra http_get/http_post/fetch. El
-//! front-end wasm (synsema-wasm) los registra como stubs que fallan con un error claro
-//! ("not available in the wasm profile — this build has no network sockets"), igual
-//! que la familia de memoria: el nombre existe, el entorno no otorga `net`.
+//! Transporte HTTP del build SIN `native` (perfil wasm: sin sockets). Mismas firmas
+//! que los símbolos de http.rs que consumen los módulos puros (blockchain_rpc/
+//! blockchain_btc_rpc/oidc) → esos módulos compilan enteros.
+//!
+//! WASM fase 2 (F3): el transporte es el `http` del HOST vía `hostcap` — si el
+//! embebedor lo ofrece, `fetch`/`http_*`/RPC read-side funcionan de verdad; si no,
+//! fallan con la verdad del entorno. El gate `net(host)` corre ANTES, en los
+//! builtins compartidos de http_common (misma canonización que nativo). Los seis
+//! builtins cliente se registran acá con `register_http_builtins`, igual que en el
+//! perfil nativo — un solo registro, dos transportes.
 
-use synsema_core::types::SynValue;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use synsema_capabilities::model::CapabilitySet;
+use synsema_core::interpreter::Interpreter;
+
+pub use crate::http_common::{err_result, header_pairs, require_net, HttpResult};
+use crate::http_common::{register_http_client_builtins, url_with_query};
+use crate::hostcap::{self, HostHttpRequest};
 
 pub const NO_SOCKETS: &str =
     "this build has no network sockets (wasm profile) — network builtins are unavailable";
 
-/// Espeja `http::HttpResult` (mismos campos).
-pub struct HttpResult {
-    pub status: i64,
-    pub ok: bool,
-    pub body: String,
-    pub headers: Vec<(String, String)>,
-    pub error: Option<String>,
+/// Sin transporte del host: la verdad del entorno, con el fix.
+fn no_transport() -> HttpResult {
+    err_result(
+        "this host provides no http transport (wasm profile) — the embedder can offer one \
+         through the `http` host hook, or run the program with the native `synsema` binary"
+            .to_string(),
+    )
 }
 
-fn no_sockets() -> HttpResult {
-    HttpResult {
-        status: 0,
-        ok: false,
-        body: String::new(),
-        headers: Vec::new(),
-        error: Some(NO_SOCKETS.to_string()),
+fn via_host(
+    method: &str,
+    url: &str,
+    headers: Option<&[(String, String)]>,
+    body: Option<&[u8]>,
+    timeout_secs: u64,
+) -> HttpResult {
+    let Some(p) = hostcap::provider() else { return no_transport() };
+    let empty: [(String, String); 0] = [];
+    let req = HostHttpRequest {
+        method,
+        url,
+        headers: headers.unwrap_or(&empty),
+        body,
+        timeout_secs,
+    };
+    match p.http(&req) {
+        None => no_transport(),
+        Some(Ok(r)) => r,
+        Some(Err(e)) => err_result(e),
     }
 }
 
 pub fn http_request(
-    _method: &str,
-    _url: &str,
-    _headers: Option<&[(String, String)]>,
-    _query: Option<&[(String, String)]>,
-    _body: Option<&str>,
-    _timeout_secs: u64,
+    method: &str,
+    url: &str,
+    headers: Option<&[(String, String)]>,
+    query: Option<&[(String, String)]>,
+    body: Option<&str>,
+    timeout_secs: u64,
 ) -> HttpResult {
-    no_sockets()
+    let full = url_with_query(url, query);
+    via_host(method, &full, headers, body.map(str::as_bytes), timeout_secs)
 }
 
 pub(crate) fn http_request_body_bytes(
-    _method: &str,
-    _url: &str,
-    _headers: Option<&[(String, String)]>,
-    _body: &[u8],
-    _timeout_secs: u64,
+    method: &str,
+    url: &str,
+    headers: Option<&[(String, String)]>,
+    body: &[u8],
+    timeout_secs: u64,
 ) -> HttpResult {
-    no_sockets()
+    via_host(method, url, headers, Some(body), timeout_secs)
 }
 
-/// Idéntico al de http.rs (es puro): mapa de headers → pares, materializando
-/// secrets (el borde del socket es donde el secret se expone; acá no hay socket,
-/// pero el contrato de la firma se preserva para los callers compartidos).
-pub(crate) fn header_pairs(v: Option<&SynValue>) -> Option<Vec<(String, String)>> {
-    match v {
-        Some(SynValue::Map(m)) => Some(
-            m.borrow()
-                .iter()
-                .map(|(k, val)| match val {
-                    SynValue::Secret(s) => (k.clone(), s.expose().to_string()),
-                    other => (k.clone(), other.to_string()),
-                })
-                .collect(),
-        ),
-        _ => None,
-    }
+/// Los seis builtins cliente (`http`/`http_get`/`http_post`/`http_put`/`http_delete`/
+/// `fetch`) sobre el transporte del host. Sin `mtls_identity` (identidad TLS del
+/// proceso: no hay proceso ni TLS propio en este perfil).
+pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
+    register_http_client_builtins(interp, caps, http_request);
 }

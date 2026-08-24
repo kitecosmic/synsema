@@ -6,6 +6,8 @@ build/
 .eggs/
 *.json
 !examples/*.json
+# El paquete npm de la fase 2 de WASM (packages/synsema-wasm) tiene su package.json.
+!packages/**/*.json
 # La extensión de editor son archivos .json legítimos (no caen bajo la regla de arriba).
 !editors/**/*.json
 
@@ -49,3 +51,6 @@ tests/*.py
 # sin valores como plantilla). Ver .synsema-skill/secrets.md.
 .env
 !.env.example
+
+# Artefacto wasm copiado al paquete npm para uso local (lo genera el build, no se versiona).
+packages/synsema-wasm/synsema.wasm

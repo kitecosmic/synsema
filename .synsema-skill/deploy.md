@@ -285,64 +285,93 @@ spec:
 | macOS    | yes | yes   | yes    | yes    |
 | Windows  | yes | yes   | yes    | yes    |
 
-## WebAssembly (pure profile) — TEEs, confidential jobs, edge (v0.6.0+)
+## WebAssembly — TEEs, confidential jobs, edge, and embedding in other apps (v0.6.0+)
 
-The interpreter also ships as a **wasm32-wasip1 artifact**: `synsema-wasm.wasm` (~8 MB).
-Any wasm host (wasmtime, a TEE job runner, an edge runtime) loads it and hands it the
-`.syn` program — nobody installs Synsema on the host; the `.wasm` is the deployable
-unit, like a container image.
+Two wasm artifacts, one pure profile (same wiring, `engine/crates/synsema-wasm`):
+
+- **`synsema-wasm.wasm` (wasm32-wasip1)** — a CLI for wasmtime / TEE job runners / any
+  WASI host. Files and `.env` via WASI preopens; no host hooks (net/LLM/memory fail with
+  the truth of the environment). Also runs under Node's `node:wasi` (examples/embed/node/run-wasip1.mjs).
+- **`synsema-wasm-web.wasm` (wasm32-unknown-unknown, crate `synsema-wasm-web`)** — the
+  EMBEDDABLE artifact: a plain JSON ABI (`synsema_call`) + three imports (`synsema_host`).
+  Browser, Node/Bun/Deno (npm `@synsema/wasm`, packages/synsema-wasm), Python
+  (wasmtime-py, examples/embed/python), Go (wazero, examples/embed/go). The HOST lends
+  capabilities — `http`, `kv`, `llm`, `log`, `sleep` — and the program still declares
+  `require net/llm/memory`; a `ceiling` from the embedder denies above what the host lends.
+  No filesystem (`read_file` says so; pass data via `env`/source). ~7.5 MB (2.6 MB gzip).
 
 ```bash
-# build once (from a checkout)
-rustup target add wasm32-wasip1
-cargo build --manifest-path engine/Cargo.toml -p synsema-wasm --target wasm32-wasip1 --release
+# build (from a checkout)
+rustup target add wasm32-wasip1 wasm32-unknown-unknown
+cargo build --manifest-path engine/Cargo.toml -p synsema-wasm --target wasm32-wasip1 --profile wasm
+cargo build --manifest-path engine/Cargo.toml -p synsema-wasm-web --target wasm32-unknown-unknown --profile wasm
+# artifacts: engine/target/wasm32-wasip1/wasm/synsema-wasm.wasm
+#            engine/target/wasm32-unknown-unknown/wasm/synsema_wasm_web.wasm
 
-# run / test / stdin / env
+# wasip1 CLI (wasmtime): run / test / stdin / env / host ceiling — same flags as `synsema run`
 wasmtime run --dir . synsema-wasm.wasm program.syn
 wasmtime run --dir . synsema-wasm.wasm --test program.syn
 wasmtime run --env ETH_KEY=... synsema-wasm.wasm -  < program.syn
-
-# host ceiling — the SAME flags and parser as `synsema run` (--sandbox | --cap-set)
 wasmtime run --dir . synsema-wasm.wasm --sandbox program.syn                 # ceiling = [stdout, time]
 wasmtime run --dir . synsema-wasm.wasm --cap-set stdout,secret=ETH_* program.syn
+wasmtime run synsema-wasm.wasm --version      # the artifact's version (release tag, or v<crate>-dev)
 ```
 
-`synsema-wasm [--test] [--sandbox | --cap-set <list>] <file.syn | ->`. An **unknown
-`--flag` is an error (exit 2), never silently taken as the program path** — a mistyped
-`--sandbox` that ran the program without a ceiling would be a hole. One program per run.
-Exit codes: 0 ok, 1 runtime/test failure, 2 usage/read error.
+`synsema-wasm [--test] [--sandbox | --cap-set <list>] [--version] <file.syn | ->`. An unknown
+`--flag` is an error (exit 2), never silently taken as the program path. Exit codes: 0 ok,
+1 runtime/test failure, 2 usage/read error.
 
-**Not a dialect** — the same language in an environment that grants less (deny-by-default
-told by the host). Included (all probed live under wasmtime, output byte-identical to the
-native binary — CI diffs them on every push): the full language + templates, the numeric
-tower + arrays, JSON/CSV/regex/stats, `chart_svg` + PNG/PDF export, hashing/HMAC/`secret`,
-the whole PURE blockchain side (`eth_address`, ABI, EIP-191/712, `tx_eip1559`,
-Solana/Algorand encode, Bitcoin builder/PSBT, gated `*_sign` + `wallet`), web-auth pure
-side (argon2 password hashing, JWT, TOTP, `oidc_verify` with inline JWKS), file I/O via
-WASI preopens (`--dir .`), the security semantics (`sandbox`, `intent`, per-tool scoping,
-the host ceiling), the response helpers + `content()` vocabulary
-(`ok`/`created`/`fail`/`respond`/`html`/`redirect`/`binary`/`with_header`/`set_cookie`/
-`clear_cookie`, `page`/`heading`/`prose`/`list`/`ordered_list`/`link`/`image`/`section`/
-`code`/`raw`/`content`/`chart()`), multi-agent (`agent`/`spawn`/`share`/`observe`/`signal`/
-`wait_for` — the core's in-process fallback, agents run inline), and `parallel_map`/`chunk`
-(sequential in wasm: same input-order + fail-fast semantics, no thread pool).
+```js
+// embed (Node/Bun/browser) — @synsema/wasm
+import { Synsema } from "@synsema/wasm";
+const syn = await Synsema.load(new URL("@synsema/wasm/synsema.wasm", import.meta.url));
+await syn.ready();
+const host = {
+  http: (req) => ({ status: 200, headers: [], body: "{}" }),        // sync; or async with runAsync
+  kv: { get: (ns, k) => store.get(ns + "/" + k) ?? null, set: (ns, k, v) => store.set(ns + "/" + k, v) },
+  llm: (op, prompt) => ({ content: "...", tokens: 12 }),
+};
+syn.run('require memory("agenda")\nremember("preference", "dark mode")', { host, filename: "agenda.syn" });
+syn.run('require llm\nprint(reason about "x")', { host, ceiling: "stdout" });  // denied: ceiling wins
+const res = syn.handle('require serve(1)\nserve on 1\n    route "GET /hi/:n"\n        give {"hi": params.n}', { method: "GET", path: "/hi/ana" }, { host });
+await syn.runAsync(program, { host: { async http(req) { const r = await fetch(req.url); return { status: r.status, headers: r.headers, body: await r.text() }; } } });
+```
 
-NOT in this profile — **the names exist and fail with the truth of the environment**, never
-with `Undefined variable` (so an agent doesn't think it misspelled a builtin):
+API (same in JS/Python/Go): `run(source, {filename, env, ceiling, host})` →
+`{ok, output, errors, audit, llm_tokens}`; `test` → `{passed, failed, lines}`; `check` →
+`{ok, errors}` (parse + memory declaration, no execution); `handle(source, request)` →
+`{status, content_type, headers, body|body_base64, log, errors}` (serve in HANDLER mode:
+routes/params/query/`auth with`/`errors with`/`content()` negotiation/`redirect`/
+pagination/`state_*` durable through `kv`; NOT: `stream`, `proxy to`, rate limits,
+`static`, vhosts, TLS — the edge platform does those); `version()`. Handler mode keeps the
+native doctrine: `require serve(port)` is still mandatory (the manifest, not the socket), and
+each request runs on a **snapshot of the globals** — a `set` on a global inside a handler does
+NOT persist to the next request; shared state goes through `state_*` (durable via `kv`).
 
-| Family | Builtins | Error |
-|---|---|---|
-| Network | `fetch`, `http_*`, `mtls_identity`, `ws_*` | `<name>: not available in the wasm profile — this build has no network sockets (run the program with the native `synsema` binary)` |
-| Databases | `db_open`/`db_close`, `sql*`, `paged`, `mongo_*`, `redis_*` | `… — this build has no database drivers …` |
-| Cron | `cron_*` | `… — this build has no scheduler threads …` |
-| Blockchain RPC read-side (`eth_balance`, `solana_*`, `algorand_*`, `btc_utxos`, …) | gated by `net(host)` exactly as native; once granted, the transport fails: `<name>: request to <host> failed: this build has no network sockets (wasm profile)`. The pure builders (`tx_eip1559`, …) are complete. |
-| Persistent memory | `remember`/`recall`/rules/progress | `Capability not granted: memory … this wasm build has none — run the program with the native binary` |
-| `serve` | — | not compiled in (no sockets); a `serve` program is a native deployment |
+What the host lends: `http` backs `fetch`/`http_*`/blockchain RPC read-side AFTER the
+`net(host)` gate (same URL canonicalization as native); `kv` backs `remember`/`recall`/
+rules/progress (namespace `memory:<declared name>` — the declared name IS the identity;
+`memory_summary` reports `Backend: host-kv`) and `state_*` (namespace `state`); `llm`
+backs `reason`/`decide`/`analyze`/`generate` (`llm_available()` true, `llm_usage()` sums
+the tokens the host reports). Async hosts (browser fetch, LLM SDKs): `runAsync`/
+`handleAsync` run the interpreter in a Worker and block with `Atomics.wait` on a
+SharedArrayBuffer (browsers need COOP/COEP); Node/Bun work out of the box. `now()` =
+host clock, `random()`/`token()`/signature nonces = host entropy (`crypto.getRandomValues`,
+`os.urandom`, `crypto/rand`). A trap (panic) discards the instance; the glue recreates it.
+Errors of the program are DATA (`errors[]`), never exceptions. The `audit` lists every
+capability check the program made — the embedder sees what it asked for.
 
-Also: no real OS-thread parallelism (spawn/parallel_map run in-process/sequentially —
-wall-clock speedup needs the native binary); LLM ops fall back to the core offline
-placeholders. Engine CI runs the language suites + the probes under wasmtime on every push
-(`wasm` job in ci.yml): `tests/wasm_pure.probe.syn`, `wasm_agents`, `wasm_respond` (JSON +
-response helpers), `wasm_sandbox` (sandbox semantics + host ceiling), `wasm_math` (the math
-tower), `wasm_unavailable` (the table above) — the pure ones diffed byte-for-byte against
-the native binary.
+Not a dialect: full language + templates, numeric tower + arrays, JSON/CSV/regex/stats,
+`chart_svg` + PNG/PDF, hashing/HMAC/`secret`, the whole PURE blockchain side, web-auth
+pure side, `sandbox`/`intent`/per-tool scoping, response helpers + `content()`,
+multi-agent in-process, `parallel_map`/`chunk` sequential — all byte-identical to the
+native binary (CI diffs the probes under wasmtime AND through the embed API under Node).
+NOT in either artifact — the names exist and fail saying why: `ws_*`, `mtls_identity`
+(no sockets/event loop), `db_open`/`sql`/`mongo_*`/`redis_*` (no drivers — in edge, reach
+D1/Neon/Upstash over `http`), `cron_*` (the host schedules), real threads (`spawn`/
+`parallel_map` run in-process). Without a host `http`: `fetch: … this host provides no http
+transport`; without `kv`: `memory "x" is declared but this host provides no durable storage`;
+without `llm`: the core's offline placeholders. Playground: `/play` on the docs site
+(runs the wasm in the browser, no server). Release assets: `synsema-wasm-wasip1.wasm`,
+`synsema-wasm-web.wasm` (+ .sha256).
+

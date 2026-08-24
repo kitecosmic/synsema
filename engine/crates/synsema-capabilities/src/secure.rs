@@ -823,11 +823,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             0,
             Rc::new(move |_i, _args, _loc| {
                 require(&caps, Capability::new(CapabilityType::Time, None), "now()")?;
-                let secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0);
-                Ok(syn_float(secs))
+                Ok(syn_float(synsema_core::clock::now_secs_f64()))
             }),
         );
     }
