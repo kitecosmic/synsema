@@ -47,8 +47,21 @@ jobs:
         run: cargo check --locked --manifest-path engine/Cargo.toml -p synsema-stdlib --no-default-features --target wasm32-wasip1
       - name: Build synsema-wasm
         run: cargo build --locked --manifest-path engine/Cargo.toml -p synsema-wasm --target wasm32-wasip1 --release
+      # Sin action de terceros (la allowlist del repo sólo admite oficiales + los
+      # pineados): release oficial de wasmtime, verificada con el attestation de
+      # GitHub (firma del build de bytecodealliance; wasmtime no publica checksums
+      # como asset) — misma doctrina que `synsema update`: verificar antes de correr.
       - name: Setup wasmtime
-        uses: bytecodealliance/actions/wasmtime/setup@v1.1.3
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          V=v48.0.0
+          A=wasmtime-$V-x86_64-linux.tar.xz
+          gh release download "$V" -R bytecodealliance/wasmtime --pattern "$A"
+          gh attestation verify "$A" -R bytecodealliance/wasmtime
+          tar -xJf "$A"
+          echo "$PWD/wasmtime-$V-x86_64-linux" >> "$GITHUB_PATH"
       - name: Language suites under wasmtime
         run: |
           for f in tests/lang.test.syn tests/math.test.syn tests/arrays.test.syn tests/python_diff.test.syn tests/batch6.test.syn; do
