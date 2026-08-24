@@ -33,7 +33,7 @@ use synsema_core::bytesutil::b64url_decode;
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::types::{syn_nothing, SynValue};
 
-use crate::server::json_to_syn;
+use crate::json::json_to_syn;
 
 fn err(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::new(msg.into()))
@@ -46,6 +46,7 @@ const JWKS_TTL_SECS: u64 = 600;
 
 /// Tope del cuerpo del JWKS que se acepta (un IdP real está muy por debajo; esto
 /// acota un endpoint hostil o mal configurado).
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
 const JWKS_MAX_BYTES: usize = 512 * 1024;
 
 fn unix_now() -> i64 {
@@ -92,36 +93,51 @@ fn fetch_jwks(
             }
         }
     }
-    // Red = capability `net`, con el MISMO scope de host que `http_get` (el error
-    // ya sugiere el `require net("host")` exacto).
-    crate::http::require_net(caps, url, "oidc_verify() fetching the JWKS")?;
-    if !url.starts_with("https://") {
+    // Sin `native` (perfil wasm) no hay sockets: el fetch por URL no existe, pero el
+    // camino puro (JWKS inline vía `jwks`) sigue completo. Error claro, no un builtin
+    // ausente: el fix (pasar el documento inline) queda a la vista.
+    #[cfg(not(feature = "native"))]
+    {
+        let _ = caps;
         return Err(err(format!(
-            "oidc_verify: the JWKS URL must be https:// (got {:?}) — the signing keys of an \
-             identity provider cannot travel over plaintext",
+            "oidc_verify: fetching the JWKS from {} needs the network, and this build has no \
+             sockets — pass the JWKS document inline (jwks) instead of a URL",
             url
         )));
     }
-    let res = crate::http::http_request("GET", url, None, None, None, 10);
-    if !res.ok {
-        return Err(err(format!(
-            "oidc_verify: could not fetch the JWKS from {} (status {}). The token was NOT verified.",
-            url, res.status
-        )));
+    #[cfg(feature = "native")]
+    {
+        // Red = capability `net`, con el MISMO scope de host que `http_get` (el error
+        // ya sugiere el `require net("host")` exacto).
+        crate::http::require_net(caps, url, "oidc_verify() fetching the JWKS")?;
+        if !url.starts_with("https://") {
+            return Err(err(format!(
+                "oidc_verify: the JWKS URL must be https:// (got {:?}) — the signing keys of an \
+                 identity provider cannot travel over plaintext",
+                url
+            )));
+        }
+        let res = crate::http::http_request("GET", url, None, None, None, 10);
+        if !res.ok {
+            return Err(err(format!(
+                "oidc_verify: could not fetch the JWKS from {} (status {}). The token was NOT verified.",
+                url, res.status
+            )));
+        }
+        if res.body.len() > JWKS_MAX_BYTES {
+            return Err(err(format!(
+                "oidc_verify: the JWKS from {} is larger than {} bytes; refusing to parse it",
+                url, JWKS_MAX_BYTES
+            )));
+        }
+        if let Ok(mut cache) = jwks_cache().lock() {
+            cache.insert(
+                url.to_string(),
+                CachedJwks { fetched_at: monotonic_secs(), body: res.body.clone() },
+            );
+        }
+        Ok(res.body)
     }
-    if res.body.len() > JWKS_MAX_BYTES {
-        return Err(err(format!(
-            "oidc_verify: the JWKS from {} is larger than {} bytes; refusing to parse it",
-            url, JWKS_MAX_BYTES
-        )));
-    }
-    if let Ok(mut cache) = jwks_cache().lock() {
-        cache.insert(
-            url.to_string(),
-            CachedJwks { fetched_at: monotonic_secs(), body: res.body.clone() },
-        );
-    }
-    Ok(res.body)
 }
 
 // =========================================================
@@ -302,7 +318,7 @@ fn b_oidc_verify(
             "jwks" => {
                 jwks_inline = Some(match v {
                     SynValue::Text(s) => s.to_string(),
-                    SynValue::Map(_) => crate::server::dumps(&crate::server::syn_to_json(v)),
+                    SynValue::Map(_) => crate::json::dumps(&crate::json::syn_to_json(v)),
                     other => {
                         return Err(err(format!(
                             "{}: jwks must be the JWKS document as text or a map, got {}",

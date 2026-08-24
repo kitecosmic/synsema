@@ -39,7 +39,7 @@ use crate::blockchain_rpc::{
     MAX_RPC_RESPONSE, RPC_HTTP_TIMEOUT_SECS,
 };
 use crate::http::{http_request, HttpResult};
-use crate::server::json_to_syn;
+use crate::json::json_to_syn;
 
 /// Paso de polling de `btc_wait` (los bloques tardan ~10 min, pero la aparición
 /// en mempool es inmediata y los tests usan mocks — 2 s equilibra ambos).

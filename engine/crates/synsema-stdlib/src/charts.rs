@@ -32,7 +32,7 @@ use synsema_core::types::{
     syn_bool, syn_float, syn_int, syn_list, syn_map, syn_nothing, syn_text, SynValue,
 };
 
-use crate::server::esc;
+use crate::json::esc;
 
 fn err(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::new(msg))
@@ -3100,7 +3100,7 @@ pub fn chart_node(args: &[SynValue]) -> Result<SynValue, Control> {
         }
     }
     fields.push(("svg", syn_text(svg.as_str())));
-    Ok(crate::server::make_node("chart", fields))
+    Ok(crate::json::make_node("chart", fields))
 }
 
 // =========================================================

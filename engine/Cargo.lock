@@ -4388,6 +4388,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "synsema-wasm"
+version = "0.1.0"
+dependencies = [
+ "synsema-agents",
+ "synsema-capabilities",
+ "synsema-core",
+ "synsema-stdlib",
+]
+
+[[package]]
 name = "synstructure"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

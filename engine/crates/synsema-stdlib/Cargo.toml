@@ -9,21 +9,21 @@ description = "Synsema stdlib: http, database, templates, cron, server"
 synsema-core.workspace = true
 synsema-capabilities.workspace = true
 indexmap.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, optional = true }
 serde_json.workspace = true
 # M1 — Postgres nativo bajo la API universal db_open/sql. Puro-Rust + TLS rustls.
-postgres.workspace = true
-tokio-postgres-rustls.workspace = true
-uuid.workspace = true
+postgres = { workspace = true, optional = true }
+tokio-postgres-rustls = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 rust_decimal.workspace = true
 # M2 — MySQL nativo bajo la misma API. Driver sync puro-Rust + TLS rustls (opt-in).
-mysql.workspace = true
+mysql = { workspace = true, optional = true }
 # M3 — MongoDB (backend no-SQL, API propia mongo_*). Driver sync (wrapper async) + rustls ring.
-mongodb.workspace = true
+mongodb = { workspace = true, optional = true }
 # M4 — Redis (backend KV/cache/estructuras, API propia redis_*). Conexión SÍNCRONA nativa del
 # crate + TLS rustls (provider ring por unificación de features, sin `*-sys`). Ver el comentario
 # en el Cargo.toml del workspace.
-redis.workspace = true
+redis = { workspace = true, optional = true }
 # Token aleatorio del lock distribuido (redis_lock): se reusa el `rand` que el engine YA usa
 # (random()/random_int() en synsema-capabilities) — no se introduce un crate nuevo. Puro-Rust.
 rand.workspace = true
@@ -74,31 +74,63 @@ scrypt.workspace = true
 aes.workspace = true
 ctr.workspace = true
 curve25519-dalek.workspace = true
-tungstenite.workspace = true
+tungstenite = { workspace = true, optional = true }
 # Batch 15 (WebSocket de primera clase): poller de readiness cross-platform
 # (epoll/kqueue/IOCP) para el multiplexado no-bloqueante de ws_select. YA está en el
 # árbol (v1.2.1, transitivo de tokio/hyper) — hacerlo directo NO agrega crate ni C-ABI
 # nuevo (mio son bindings de syscalls del SO ya presentes, no una lib C que compile). G8.
-mio = { version = "1", features = ["os-poll", "net"] }
+mio = { version = "1", features = ["os-poll", "net"], optional = true }
 # A2 stack web: gzip (miniz_oxide puro-Rust, sin C) + TLS (rustls con backend ring).
-flate2 = "1"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
+flate2 = { version = "1", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
 # Cliente HTTPS (http_get/http_post con https://): root CAs del SO vía rustls-native-certs.
 # Ya está en Cargo.lock (transitivo de instant-acme); se hace directo para usarlo en http.rs.
-rustls-native-certs = "0.8"
+rustls-native-certs = { version = "0.8", optional = true }
 # A2 batch 2 — ACME/auto-HTTPS. instant-acme (cliente ACME) con backend ring (sin C/cmake),
 # cliente HTTP propio (hyper-rustls) y `rcgen` interno para keygen/CSR en finalize().
 # tokio = runtime async acotado SÓLO para obtener/renovar el cert; el server sigue std::net.
-instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "io-util", "sync", "macros"] }
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls", "rcgen"], optional = true }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "io-util", "sync", "macros"], optional = true }
 # Lote 2 — rewrite de serve a async: hyper (HTTP/1.1 + HTTP/2) + adaptadores tokio +
 # TLS async (tokio-rustls con ring). El intérprete sigue sync por request (spawn_blocking).
-hyper = { version = "1", default-features = false, features = ["server", "client", "http1", "http2"] }
-hyper-util = { version = "0.1", default-features = false, features = ["server", "server-auto", "server-graceful", "http1", "http2", "tokio"] }
-http-body-util = "0.1"
-bytes = "1"
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+hyper = { version = "1", default-features = false, features = ["server", "client", "http1", "http2"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["server", "server-auto", "server-graceful", "http1", "http2", "tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+
+# Perfil del crate. `native` (default) = los módulos que hablan con el SO: sockets
+# (http/server/ws/acme), threads de scheduler (cron) y drivers de DB (database) —
+# con TODAS sus deps (las `optional = true` de arriba). Sin `native`
+# (`--no-default-features`) queda el subconjunto PURO que compila a wasm32:
+# blockchain completo (con stub de transporte), hashing, webauth, oidc, httpsig,
+# captoken, secrets, spend, charts, raster, json, mimetypes. CI lo ancla contra
+# wasm32-wasip1 para que una tanda futura no lo rompa en silencio.
+[features]
+default = ["native"]
+native = [
+    "dep:rusqlite",
+    "dep:postgres",
+    "dep:tokio-postgres-rustls",
+    "dep:uuid",
+    "dep:mysql",
+    "dep:mongodb",
+    "dep:redis",
+    "dep:mio",
+    "dep:flate2",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:rustls-native-certs",
+    "dep:instant-acme",
+    "dep:tokio",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:bytes",
+    "dep:tokio-rustls",
+    "dep:tungstenite",
+]
 
 # Sólo Windows: leer HKCR para replicar mimetypes.read_windows_registry (content-type
 # de estáticos con extensión no pinneada). En otros SO el override del registro es no-op.

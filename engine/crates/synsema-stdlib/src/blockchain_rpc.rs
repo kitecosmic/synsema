@@ -51,7 +51,7 @@ use crate::blockchain_abi::addr20;
 use crate::blockchain_algorand::address_to_pubkey;
 use crate::blockchain_solana::{ata_address, pubkey32, token_program_default};
 use crate::http::{header_pairs, http_request, http_request_body_bytes, HttpResult};
-use crate::server::{dumps, json_to_syn, Json};
+use crate::json::{dumps, json_to_syn, Json};
 
 /// Timeout HTTP de cada request RPC individual (mismo default que `http_*`).
 /// `pub(crate)`: blockchain_btc_rpc.rs comparte transporte y doctrina (G22–G23).
