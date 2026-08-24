@@ -284,3 +284,36 @@ spec:
 | Linux    | yes | yes   | yes    | yes    |
 | macOS    | yes | yes   | yes    | yes    |
 | Windows  | yes | yes   | yes    | yes    |
+
+## WebAssembly (pure profile) — TEEs, confidential jobs, edge (v0.6.0+)
+
+The interpreter also ships as a **wasm32-wasip1 artifact**: `synsema-wasm.wasm` (~8 MB).
+Any wasm host (wasmtime, a TEE job runner, an edge runtime) loads it and hands it the
+`.syn` program — nobody installs Synsema on the host; the `.wasm` is the deployable
+unit, like a container image.
+
+```bash
+# build once (from a checkout)
+rustup target add wasm32-wasip1
+cargo build --manifest-path engine/Cargo.toml -p synsema-wasm --target wasm32-wasip1 --release
+
+# run / test / stdin / env
+wasmtime run --dir . synsema-wasm.wasm program.syn
+wasmtime run --dir . synsema-wasm.wasm --test program.syn
+wasmtime run --env ETH_KEY=... synsema-wasm.wasm -  < program.syn
+```
+
+**Not a dialect** — the same language in an environment that grants less (deny-by-default
+told by the host). Included (all probed live under wasmtime): the full language +
+templates, the numeric tower + arrays, JSON/CSV/regex/stats, `chart_svg` + PNG/PDF
+export, hashing/HMAC/`secret`, the whole PURE blockchain side (`eth_address`, ABI,
+EIP-191/712, `tx_eip1559`, Solana/Algorand encode, Bitcoin builder/PSBT, gated
+`*_sign` + `wallet`), web-auth pure side (argon2 password hashing, JWT, TOTP,
+`oidc_verify` with inline JWKS), file I/O via WASI preopens (`--dir .`), and the
+security semantics (`sandbox`, `intent`, per-tool scoping).
+
+NOT in this profile (clear errors, not crashes): network (`fetch`/`http_*`/`ws_*`,
+blockchain RPC read-side), databases, `serve`, `cron`, persistent memory
+(`remember`/`recall`), `spawn`/blackboard, `parallel_map`; LLM ops fall back to the
+core offline placeholders. Engine CI runs the language suites + a known-vector probe
+under wasmtime on every push (`wasm` job in ci.yml; `probes/probe_wasm_pure.syn`).

@@ -22,6 +22,7 @@ core dev loop:
 | **Diagnose LLM config** | `synsema llm status` (resolved config with sources; names the missing variable when offline) |
 | **Start a new project** | `synsema init [dir]` (hello.syn tour + commented .env.example + .gitignore). Re-running is **safe and repairs**: a file still identical to any release it shipped in gets refreshed; one with your edits is kept and the new version lands as `<file>.new` (v0.5.9+) |
 | **Deploy** (daemon/Docker/VPS) | see [deploy.md](deploy.md) |
+| **Run in WASM** (TEE / confidential job / edge, v0.6.0+) | build `synsema-wasm.wasm` (wasm32-wasip1) and `wasmtime run --dir . synsema-wasm.wasm file.syn` — the pure profile → [deploy.md](deploy.md) § WebAssembly |
 
 Also volunteer the right primitive for the task: `paged()` for big SQL results, `parallel_map` for
 fan-out, `secret()` for credentials, `content()` for agent-readable pages, `bytes`/`decode` for

@@ -33,7 +33,7 @@ use synsema_core::secret::constant_time_eq;
 use synsema_core::types::{syn_int, syn_map, syn_nothing, syn_text, SynValue};
 
 use crate::secrets::{hmac_compute, Algo};
-use crate::server::{dumps, json_to_syn, syn_to_json};
+use crate::json::{dumps, json_to_syn, syn_to_json};
 
 fn err(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::new(msg.into()))

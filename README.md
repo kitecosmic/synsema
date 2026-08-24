@@ -549,6 +549,7 @@ When Synsema connects to an LLM, responses are validated automatically:
 - [x] Rate limiting (`rate_limit N per <window>`, token bucket, per-IP)
 - [x] Native web stack: TLS, auto-HTTPS (ACME), virtual hosts, reverse proxy, HTTP/2
 - [x] Database (SQLite via `sql` / `db_open`)
+- [x] WebAssembly target (`synsema-wasm`, wasm32-wasip1): the pure profile for TEEs / confidential jobs / edge
 - [ ] Async interpreter for C100k+ I/O fan-out (deferred)
 - [ ] Distribution: cross-platform binaries, installer, mobile/IoT
 - [ ] Package manager for verified capabilities

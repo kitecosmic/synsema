@@ -774,7 +774,9 @@ pub fn register_blockchain_builtins(interp: &Interpreter, caps: Rc<RefCell<Capab
 
     // -- Batch 14 (read-side): JSON-RPC EVM/Solana + REST algod, TODO gateado por
     //    `net(host)` (G22 — cero capability nueva; `sign` sigue siendo la única
-    //    puerta de valor) + los builders EIP-1559 puros.
+    //    puerta de valor) + los builders EIP-1559 puros. Sin `native` el transporte
+    //    es el stub de http (falla con "no sockets in this build") → los builders
+    //    puros (tx_eip1559/…) siguen completos en el perfil wasm.
     crate::blockchain_rpc::register(interp, caps.clone());
 
     // -- Batch 16 (Bitcoin): direcciones/txid/builder UTXO/PSBT puros;

@@ -1,0 +1,9 @@
+# Stack del intérprete en los targets wasm: el intérprete es tree-walking (recursión
+# real) y el default de wasm-ld (1 MB) se queda corto. El stack vive al inicio de la
+# memoria lineal; 64 MB reservados no se tocan hasta usarse (commit lazy del runtime).
+# Sección target-specific: los builds nativos no la leen.
+[target.wasm32-wasip1]
+rustflags = ["-C", "link-args=-zstack-size=67108864"]
+
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-args=-zstack-size=67108864"]

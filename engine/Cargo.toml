@@ -8,6 +8,7 @@ members = [
     "crates/synsema-llm",
     "crates/synsema-runtime",
     "crates/synsema-cli",
+    "crates/synsema-wasm",
 ]
 
 [workspace.package]
