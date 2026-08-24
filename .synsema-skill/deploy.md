@@ -321,5 +321,5 @@ blockchain RPC read-side), databases, `serve`, `cron`, persistent memory
 (`remember`/`recall`); real OS-thread parallelism (spawn/parallel_map run
 in-process/sequentially — wall-clock speedup needs the native binary); LLM ops fall
 back to the core offline placeholders. Engine CI runs the language suites + two probes
-under wasmtime on every push (`wasm` job in ci.yml; `probes/probe_wasm_pure.syn` and
-`probes/probe_wasm_agents.syn`).
+under wasmtime on every push (`wasm` job in ci.yml; `tests/wasm_pure.probe.syn` and
+`tests/wasm_agents.probe.syn`).

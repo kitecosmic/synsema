@@ -1,0 +1,45 @@
+-- Sonda del perfil wasm (synsema-wasm / wasm32-wasip1): cómputo puro de punta a
+-- punta con vectores verificables — stats + chart SVG + keccak + derivación EVM —
+-- y la prueba de que la red NO existe en este perfil (el error es claro, no un
+-- crash). Corre igual en el binario nativo (mismo lenguaje, mismo resultado).
+
+require secret("ETH_KEY")
+
+let ventas be [
+    {"mes": "ene", "total": 120},
+    {"mes": "feb", "total": 180},
+    {"mes": "mar", "total": 95}
+]
+let totales be apply((r) => r["total"], ventas)
+let resumen be {
+    "suma": sum(totales),
+    "max": max(totales),
+    "mediana": median(totales)
+}
+
+-- El resultado como JSON + su hash (lo que un job confidencial registraría onchain).
+let cuerpo be json_encode(resumen)
+let digest be decode(keccak256(cuerpo), "hex")
+
+-- Vector conocido: keccak256("") pre-NIST (el de Ethereum).
+let keccak_vacio be decode(keccak256(""), "hex")
+
+-- Derivación EVM pura con vector conocido: la clave privada 0x…01 (sellada como
+-- secret, doctrina G1) da la dirección 0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf.
+let addr be eth_address(secret("ETH_KEY"))
+
+-- Chart SVG determinista (mismo renderer que el binario nativo).
+let svg be chart_svg("bar", ventas, {"x": "mes", "y": "total", "title": "Ventas"})
+
+print(`resumen={cuerpo}`)
+print(`keccak={digest}`)
+print(`keccak_vacio={keccak_vacio}`)
+print(`addr_key1={addr}`)
+print(`svg_ok={starts_with(svg, "<svg")}`)
+
+-- En este perfil no hay sockets: el builtin de red no existe y lo dice.
+try
+    let r be fetch("https://example.com")
+    print("fetch_disponible=true")
+recover err
+    print(`fetch_error={err}`)

@@ -1,0 +1,39 @@
+-- Sonda del perfil wasm, parte 2: agentes in-process (fallback del core, sin threads),
+-- parallel_map/chunk (secuencial en wasm, misma semántica observable) y el vocabulario
+-- content() (respond.rs puro). Corre igual en el binario nativo.
+
+task doble(x)
+    give x * 2
+
+let rs be parallel_map(doble, [1, 2, 3, 4])
+print(`pmap={json_encode(rs)}`)
+
+let cs be chunk([1, 2, 3, 4, 5], 2)
+print(`chunk={json_encode(cs)}`)
+
+-- fail-fast: el primer error propaga, como el apply secuencial
+task riesgo(x)
+    when x == 3
+        raise("item malo")
+    give x
+
+try
+    let z be parallel_map(riesgo, [1, 2, 3])
+    print("pmap_no_fallo")
+recover e
+    print(`pmap_error={e}`)
+
+-- blackboard + señales con el fallback in-process del core
+agent Worker
+    share "listo" as "saludo"
+    signal "done"
+
+spawn Worker
+wait_for "done" timeout 2
+observe "saludo" as s
+print(`agents={s}`)
+
+-- vocabulario de contenido: el nodo como data (la vista que ve un agente)
+print(`content={json_encode(heading(1, "Reporte"))}`)
+let env be ok({"total": 395})
+print(`ok_envelope={json_encode(env)}`)
