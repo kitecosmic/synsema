@@ -1,0 +1,29 @@
+-- Sonda del perfil wasm, parte 5: lo que el host wasm NO otorga (sockets, DB,
+-- scheduler, memoria durable) falla con un error que lo DICE — nunca con
+-- "Undefined variable" (que haría creer que el nombre no existe o está mal
+-- escrito). En el binario nativo los mismos nombres fallan por capability no
+-- concedida: en ambos perfiles el error nombra el problema real.
+
+task intenta(nombre, f)
+    try
+        f()
+        print(`{nombre}=DISPONIBLE`)
+    recover e
+        print(`{nombre}={e}`)
+
+intenta("fetch", () => fetch("https://example.com"))
+intenta("http_get", () => http_get("https://example.com"))
+intenta("http_post", () => http_post("https://example.com", {}))
+intenta("ws_connect", () => ws_connect("wss://example.com"))
+intenta("db_open", () => db_open("sqlite::memory:"))
+intenta("sql", () => sql("select 1"))
+intenta("redis_get", () => redis_get("k"))
+intenta("mongo_find", () => mongo_find("c", {}))
+intenta("cron_every", () => cron_every(60, intenta))
+intenta("eth_rpc_read", () => eth_balance("https://rpc.example", "0x0000000000000000000000000000000000000000"))
+intenta("remember", () => remember("k", "v"))
+
+-- read-side blockchain: la puerta es `net` como en nativo; concedida, en wasm el
+-- transporte dice que no hay sockets (el builder puro tx_eip1559 sigue completo).
+require net("rpc.example")
+intenta("eth_balance_con_net", () => eth_balance("https://rpc.example", "0x0000000000000000000000000000000000000000"))

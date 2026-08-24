@@ -29,7 +29,7 @@ use synsema_agents::builtins::{register_agent_builtins, MemoryGate};
 use synsema_agents::memory::AgentMemory;
 use synsema_agents::progress::ProgressManager;
 use synsema_capabilities::model::{
-    capability_type_from_name, Capability, CapabilitySet, CapabilityType,
+    build_ceiling, capability_type_from_name, Capability, CapabilitySet, CapabilityType,
 };
 use synsema_capabilities::secure::register_secure_builtins;
 use synsema_core::interpreter::{Control, Interpreter, RunResult, RuntimeError};
@@ -67,6 +67,11 @@ fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>) {
     // Respuesta + vocabulario content() (respond.rs, puro): ok/created/…/page/heading/
     // prose/content — registra también charts y raster, el MISMO camino que el nativo.
     synsema_stdlib::respond::register_serve_builtins(interp);
+    // Lo que este host NO otorga (sockets, DB, scheduler): los nombres EXISTEN y fallan
+    // con la verdad del entorno — misma doctrina que la familia de memoria de abajo.
+    // "Undefined variable: 'fetch'" haría creer que el nombre no existe o está mal
+    // escrito; el error debe nombrar el problema real y el fix (el binario nativo).
+    register_unavailable_stubs(interp);
 
     // chunk + parallel_map: en wasm no hay threads — chunk es puro (misma validación
     // que runtime/parallel.rs) y parallel_map corre SECUENCIAL con la misma semántica
@@ -234,7 +239,53 @@ fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>) {
     }));
 }
 
-fn run_program(source: &str, filename: &str) -> RunResult {
+/// Builtins de los módulos `native` (http/ws/database/cron) que este perfil no compila:
+/// se registran como stubs que fallan con un error claro. La lista espeja las
+/// registraciones de esos módulos; si uno suma un builtin, se suma acá (la sonda
+/// `tests/wasm_unavailable.probe.syn` cubre un representante de cada familia).
+fn register_unavailable_stubs(interp: &mut Interpreter) {
+    const NET: &[&str] = &[
+        "fetch", "http_get", "http_post", "http_put", "http_delete", "mtls_identity",
+        "ws_connect", "ws_send", "ws_recv", "ws_close", "ws_status", "ws_stats",
+        "ws_select", "ws_select_all", "ws_broadcast",
+    ];
+    const DB: &[&str] = &[
+        "db_open", "db_close", "sql", "sql_exec", "sql_tables", "sql_batch", "paged",
+        "mongo_find", "mongo_find_one", "mongo_insert", "mongo_insert_many", "mongo_update",
+        "mongo_delete", "mongo_count", "mongo_aggregate", "mongo_collections",
+        "redis_get", "redis_set", "redis_del", "redis_exists", "redis_expire", "redis_ttl",
+        "redis_persist", "redis_type", "redis_keys", "redis_incr", "redis_incrby",
+        "redis_decr", "redis_mget", "redis_mset", "redis_hget", "redis_hset", "redis_hdel",
+        "redis_hgetall", "redis_hincrby", "redis_lpush", "redis_rpush", "redis_lpop",
+        "redis_rpop", "redis_lrange", "redis_llen", "redis_sadd", "redis_srem",
+        "redis_smembers", "redis_sismember", "redis_lock", "redis_unlock",
+    ];
+    const CRON: &[&str] = &["cron_every", "cron_after", "cron_cancel", "cron_list", "cron_status"];
+    let families: [(&[&str], &str); 3] = [
+        (NET, "this build has no network sockets"),
+        (DB, "this build has no database drivers"),
+        (CRON, "this build has no scheduler threads"),
+    ];
+    for (names, why) in families {
+        for name in names {
+            let name: &'static str = name;
+            let why: &'static str = why;
+            interp.register_builtin(
+                name,
+                -1,
+                Rc::new(move |_i, _args, _loc| {
+                    Err(rt_err(&format!(
+                        "{}: not available in the wasm profile — {} (run the program with the \
+                         native `synsema` binary)",
+                        name, why
+                    )))
+                }),
+            );
+        }
+    }
+}
+
+fn run_program(source: &str, filename: &str, ceiling: Option<Vec<Capability>>) -> RunResult {
     let program = match parse_source(source, filename) {
         Err(CompileError::Lex(e)) => {
             return RunResult {
@@ -254,6 +305,11 @@ fn run_program(source: &str, filename: &str) -> RunResult {
     };
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("program")));
+    // Techo del host (--sandbox/--cap-set): ANTES de wire_pure para que los auto-grants
+    // (stdout/time/llm) también se filtren — idéntico al runtime.
+    if let Some(cl) = ceiling {
+        caps.borrow_mut().ceiling = Some(Rc::new(cl));
+    }
     wire_pure(&mut interp, &caps);
     let result = interp.execute(&program);
     match result {
@@ -277,7 +333,11 @@ fn run_program(source: &str, filename: &str) -> RunResult {
 
 /// `--test`: corre los bloques `test` con el mismo wiring puro. Devuelve
 /// (líneas de reporte, pasados, fallados).
-fn run_tests(source: &str, filename: &str) -> (Vec<String>, usize, usize) {
+fn run_tests(
+    source: &str,
+    filename: &str,
+    ceiling: Option<Vec<Capability>>,
+) -> (Vec<String>, usize, usize) {
     let program = match parse_source(source, filename) {
         Err(CompileError::Lex(e)) => return (vec![format!("Lexer error: {}", e)], 0, 1),
         Err(CompileError::Parse(e)) => return (vec![format!("Parse error: {}", e)], 0, 1),
@@ -285,6 +345,9 @@ fn run_tests(source: &str, filename: &str) -> (Vec<String>, usize, usize) {
     };
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("program")));
+    if let Some(cl) = ceiling {
+        caps.borrow_mut().ceiling = Some(Rc::new(cl));
+    }
     wire_pure(&mut interp, &caps);
     let outcomes = interp.run_test_blocks(&program);
     let mut lines = Vec::with_capacity(outcomes.len());
@@ -321,26 +384,71 @@ fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    const USAGE: &str = "usage: synsema-wasm [--test] [--sandbox | --cap-set <list>] <file.syn | ->";
     let mut test_mode = false;
+    let mut sandbox = false;
+    let mut cap_set: Option<String> = None;
     let mut path: Option<String> = None;
-    for a in &args[1..] {
-        match a.as_str() {
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
             "--test" => test_mode = true,
+            "--sandbox" => sandbox = true,
+            // Mismas formas que `synsema run`: `--cap-set <list>` y `--cap-set=<list>`.
+            "--cap-set" => match args.get(i + 1) {
+                Some(v) if !v.starts_with("--") => {
+                    cap_set = Some(v.clone());
+                    i += 1;
+                }
+                _ => {
+                    eprintln!(
+                        "synsema-wasm: --cap-set requires a value (e.g. \"stdout,secret=ETH_*\")"
+                    );
+                    std::process::exit(2);
+                }
+            },
+            p if p.starts_with("--cap-set=") => {
+                cap_set = Some(p.trim_start_matches("--cap-set=").to_string());
+            }
             "--help" | "-h" => {
                 println!(
-                    "synsema-wasm — run a Synsema program (pure profile)\n\n\
-                     usage: synsema-wasm [--test] <file.syn | ->\n\n\
-                     --test  run the file's `test` blocks instead of the program\n\
-                     -       read the program from stdin"
+                    "synsema-wasm — run a Synsema program (pure profile)\n\n{}\n\n\
+                     --test             run the file's `test` blocks instead of the program\n\
+                     --sandbox          host ceiling = [stdout, time] (compute + print only)\n\
+                     --cap-set <list>   host ceiling = the listed capabilities (name or name=scope,\n\
+                     \x20                  comma-separated) — a `require` above it is denied\n\
+                     -                  read the program from stdin",
+                    USAGE
                 );
                 return;
             }
-            other => path = Some(other.to_string()),
+            // Una flag desconocida NUNCA se toma como ruta: `--sandbox` mal tipeado que corre
+            // el programa sin techo y sin avisar sería un agujero, no una comodidad.
+            p if p.starts_with('-') && p != "-" => {
+                eprintln!("synsema-wasm: unknown option '{}'\n{}", p, USAGE);
+                std::process::exit(2);
+            }
+            other => {
+                if path.is_some() {
+                    eprintln!("synsema-wasm: only one program per run (got '{}')\n{}", other, USAGE);
+                    std::process::exit(2);
+                }
+                path = Some(other.to_string());
+            }
         }
+        i += 1;
     }
     let Some(path) = path else {
-        eprintln!("synsema-wasm: missing program (usage: synsema-wasm [--test] <file.syn | ->)");
+        eprintln!("synsema-wasm: missing program\n{}", USAGE);
         std::process::exit(2);
+    };
+    // Techo del host: mismo parser que `synsema run` (synsema-capabilities::build_ceiling).
+    let ceiling = match build_ceiling(sandbox, cap_set.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("synsema-wasm: {}", e);
+            std::process::exit(2);
+        }
     };
     let (source, filename) = if path == "-" {
         let mut buf = String::new();
@@ -360,14 +468,15 @@ fn main() {
     };
 
     if test_mode {
-        let (lines, passed, failed) = with_big_stack(move || run_tests(&source, &filename));
+        let (lines, passed, failed) =
+            with_big_stack(move || run_tests(&source, &filename, ceiling));
         for l in &lines {
             println!("{}", l);
         }
         println!("passed {}, failed {}", passed, failed);
         std::process::exit(if failed > 0 { 1 } else { 0 });
     } else {
-        let r = with_big_stack(move || run_program(&source, &filename));
+        let r = with_big_stack(move || run_program(&source, &filename, ceiling));
         for line in &r.output {
             println!("{}", line);
         }

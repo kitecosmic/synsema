@@ -301,25 +301,48 @@ cargo build --manifest-path engine/Cargo.toml -p synsema-wasm --target wasm32-wa
 wasmtime run --dir . synsema-wasm.wasm program.syn
 wasmtime run --dir . synsema-wasm.wasm --test program.syn
 wasmtime run --env ETH_KEY=... synsema-wasm.wasm -  < program.syn
+
+# host ceiling — the SAME flags and parser as `synsema run` (--sandbox | --cap-set)
+wasmtime run --dir . synsema-wasm.wasm --sandbox program.syn                 # ceiling = [stdout, time]
+wasmtime run --dir . synsema-wasm.wasm --cap-set stdout,secret=ETH_* program.syn
 ```
 
-**Not a dialect** — the same language in an environment that grants less (deny-by-default
-told by the host). Included (all probed live under wasmtime): the full language +
-templates, the numeric tower + arrays, JSON/CSV/regex/stats, `chart_svg` + PNG/PDF
-export, hashing/HMAC/`secret`, the whole PURE blockchain side (`eth_address`, ABI,
-EIP-191/712, `tx_eip1559`, Solana/Algorand encode, Bitcoin builder/PSBT, gated
-`*_sign` + `wallet`), web-auth pure side (argon2 password hashing, JWT, TOTP,
-`oidc_verify` with inline JWKS), file I/O via WASI preopens (`--dir .`), the
-security semantics (`sandbox`, `intent`, per-tool scoping), the response helpers +
-`content()` vocabulary (`ok`/`page`/`heading`/…/`chart()`), multi-agent
-(`agent`/`spawn`/`share`/`observe`/`signal`/`wait_for` — the core's in-process
-fallback, agents run inline), and `parallel_map`/`chunk` (sequential in wasm: same
-input-order + fail-fast semantics, no thread pool).
+`synsema-wasm [--test] [--sandbox | --cap-set <list>] <file.syn | ->`. An **unknown
+`--flag` is an error (exit 2), never silently taken as the program path** — a mistyped
+`--sandbox` that ran the program without a ceiling would be a hole. One program per run.
+Exit codes: 0 ok, 1 runtime/test failure, 2 usage/read error.
 
-NOT in this profile (clear errors, not crashes): network (`fetch`/`http_*`/`ws_*`,
-blockchain RPC read-side), databases, `serve`, `cron`, persistent memory
-(`remember`/`recall`); real OS-thread parallelism (spawn/parallel_map run
-in-process/sequentially — wall-clock speedup needs the native binary); LLM ops fall
-back to the core offline placeholders. Engine CI runs the language suites + two probes
-under wasmtime on every push (`wasm` job in ci.yml; `tests/wasm_pure.probe.syn` and
-`tests/wasm_agents.probe.syn`).
+**Not a dialect** — the same language in an environment that grants less (deny-by-default
+told by the host). Included (all probed live under wasmtime, output byte-identical to the
+native binary — CI diffs them on every push): the full language + templates, the numeric
+tower + arrays, JSON/CSV/regex/stats, `chart_svg` + PNG/PDF export, hashing/HMAC/`secret`,
+the whole PURE blockchain side (`eth_address`, ABI, EIP-191/712, `tx_eip1559`,
+Solana/Algorand encode, Bitcoin builder/PSBT, gated `*_sign` + `wallet`), web-auth pure
+side (argon2 password hashing, JWT, TOTP, `oidc_verify` with inline JWKS), file I/O via
+WASI preopens (`--dir .`), the security semantics (`sandbox`, `intent`, per-tool scoping,
+the host ceiling), the response helpers + `content()` vocabulary
+(`ok`/`created`/`fail`/`respond`/`html`/`redirect`/`binary`/`with_header`/`set_cookie`/
+`clear_cookie`, `page`/`heading`/`prose`/`list`/`ordered_list`/`link`/`image`/`section`/
+`code`/`raw`/`content`/`chart()`), multi-agent (`agent`/`spawn`/`share`/`observe`/`signal`/
+`wait_for` — the core's in-process fallback, agents run inline), and `parallel_map`/`chunk`
+(sequential in wasm: same input-order + fail-fast semantics, no thread pool).
+
+NOT in this profile — **the names exist and fail with the truth of the environment**, never
+with `Undefined variable` (so an agent doesn't think it misspelled a builtin):
+
+| Family | Builtins | Error |
+|---|---|---|
+| Network | `fetch`, `http_*`, `mtls_identity`, `ws_*` | `<name>: not available in the wasm profile — this build has no network sockets (run the program with the native `synsema` binary)` |
+| Databases | `db_open`/`db_close`, `sql*`, `paged`, `mongo_*`, `redis_*` | `… — this build has no database drivers …` |
+| Cron | `cron_*` | `… — this build has no scheduler threads …` |
+| Blockchain RPC read-side (`eth_balance`, `solana_*`, `algorand_*`, `btc_utxos`, …) | gated by `net(host)` exactly as native; once granted, the transport fails: `<name>: request to <host> failed: this build has no network sockets (wasm profile)`. The pure builders (`tx_eip1559`, …) are complete. |
+| Persistent memory | `remember`/`recall`/rules/progress | `Capability not granted: memory … this wasm build has none — run the program with the native binary` |
+| `serve` | — | not compiled in (no sockets); a `serve` program is a native deployment |
+
+Also: no real OS-thread parallelism (spawn/parallel_map run in-process/sequentially —
+wall-clock speedup needs the native binary); LLM ops fall back to the core offline
+placeholders. Engine CI runs the language suites + the probes under wasmtime on every push
+(`wasm` job in ci.yml): `tests/wasm_pure.probe.syn`, `wasm_agents`, `wasm_respond` (JSON +
+response helpers), `wasm_sandbox` (sandbox semantics + host ceiling), `wasm_math` (the math
+tower), `wasm_unavailable` (the table above) — the pure ones diffed byte-for-byte against
+the native binary.

@@ -86,6 +86,44 @@ jobs:
           echo "$out" | grep -q 'agents=listo'
           echo "$out" | grep -q '"type": "heading"'
           echo "$out" | grep -q 'ok_envelope={"status": 200, "value": {"total": 395}}'
+      # Paridad nativo ↔ wasm: las sondas puras deben dar la MISMA salida byte a byte
+      # (mismo lenguaje, mismo resultado). El binario nativo se compila en debug acá
+      # (la caché lo hace incremental). wasm_pure excluye la línea de red: nativo
+      # deniega por capability, wasm dice que no hay sockets.
+      - name: Build native synsema (parity)
+        run: cargo build --locked --manifest-path engine/Cargo.toml -p synsema-cli
+      - name: Parity native vs wasm (byte-identical output)
+        env:
+          ETH_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
+        run: |
+          set -euo pipefail
+          W="wasmtime run --dir . --env ETH_KEY=$ETH_KEY engine/target/wasm32-wasip1/release/synsema-wasm.wasm"
+          for f in wasm_pure wasm_agents wasm_respond wasm_sandbox wasm_math; do
+            echo "== $f"
+            engine/target/debug/synsema run tests/$f.probe.syn | grep -v '^fetch_error=' > native.out
+            $W tests/$f.probe.syn | grep -v '^fetch_error=' > wasm.out
+            diff native.out wasm.out
+          done
+      # El front-end wasm honra el techo del host y no se traga flags desconocidas:
+      # `--sandbox` deniega el `require random` de la sonda; `--bogus` es error (exit 2),
+      # nunca "una ruta". Las familias nativas (net/db/cron) existen y fallan con la
+      # verdad del entorno — jamás con "Undefined variable".
+      - name: Host ceiling + unknown flags + unavailable families (wasm)
+        run: |
+          set -euo pipefail
+          W="wasmtime run --dir . --env ETH_KEY=00 engine/target/wasm32-wasip1/release/synsema-wasm.wasm"
+          if $W --sandbox tests/wasm_sandbox.probe.syn 2>err.txt; then echo "--sandbox ignorado"; exit 1; fi
+          grep -q 'Capability not granted: random' err.txt
+          if $W --cap-set stdout,random,secret=ETH_KEY tests/wasm_sandbox.probe.syn >cap.out; then :; else echo "--cap-set suficiente falló"; exit 1; fi
+          grep -q 'after_task=secret' cap.out
+          if $W --bogus tests/wasm_pure.probe.syn 2>err.txt; then echo "flag desconocida aceptada"; exit 1; fi
+          grep -q "unknown option '--bogus'" err.txt
+          $W tests/wasm_unavailable.probe.syn | tee un.out
+          grep -q 'fetch=fetch: not available in the wasm profile' un.out
+          grep -q 'sql=sql: not available in the wasm profile' un.out
+          grep -q 'cron_every=cron_every: not available in the wasm profile' un.out
+          if grep -q 'Undefined variable' un.out; then exit 1; fi
+          if grep -q 'DISPONIBLE' un.out; then exit 1; fi
 
   # Supply-chain: cargo audit contra la base RustSec en cada push/PR.
   # Falla ante una vulnerabilidad conocida en Cargo.lock (los warnings

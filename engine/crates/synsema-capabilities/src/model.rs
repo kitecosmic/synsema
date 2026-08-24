@@ -828,3 +828,53 @@ mod tests {
         assert!(!sandbox.check(&cap(CapabilityType::Exec, Some("ls")), ""), "el sandbox nunca excede el techo");
     }
 }
+
+/// Construye el techo de capabilities del host desde `--sandbox`/`--cap-set` (defense-in-depth:
+/// el operador impone un límite que el código ejecutado no puede exceder, sin importar qué
+/// `require`). `--sandbox` ≡ techo `[stdout, time]` (sólo cómputo + `print`). `--cap-set` parsea
+/// items separados por coma: `name` (wildcard, sin scope) o `name=scope`. Son mutuamente
+/// excluyentes. Devuelve `Ok(None)` cuando no hay ninguno (comportamiento por defecto, sin techo).
+///
+/// Vive acá (y no en la CLI) para que TODOS los front-ends del intérprete —el binario
+/// `synsema` y el artefacto `synsema-wasm`— parseen las mismas flags con la misma
+/// semántica: un techo que se acepta en uno y se ignora en otro es un agujero, no un knob.
+pub fn build_ceiling(sandbox: bool, cap_set: Option<&str>) -> Result<Option<Vec<Capability>>, String> {
+    match (sandbox, cap_set) {
+        (true, Some(_)) => {
+            Err("--sandbox and --cap-set are mutually exclusive; choose one".to_string())
+        }
+        // Techo mínimo: cómputo + stdout (print) + time (now/sleep). Nada de net/exec/file/llm/…
+        (true, None) => Ok(Some(vec![
+            Capability::new(CapabilityType::Stdout, None),
+            Capability::new(CapabilityType::Time, None),
+        ])),
+        (false, Some(list)) => {
+            let mut caps = Vec::new();
+            for item in list.split(',') {
+                let item = item.trim();
+                if item.is_empty() {
+                    continue;
+                }
+                // `name=scope` (net=api.mock.test, db=:memory:, file.read=./data/*) o `name`.
+                let (name, scope) = match item.split_once('=') {
+                    Some((n, s)) => (n.trim(), Some(s.trim().to_string())),
+                    None => (item, None),
+                };
+                match capability_type_from_name(name) {
+                    Some(ty) => caps.push(Capability::new(ty, scope)),
+                    None => {
+                        return Err(format!(
+                            "--cap-set: unknown capability '{}'. Known: net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal, sign, wallet, memory",
+                            name
+                        ))
+                    }
+                }
+            }
+            if caps.is_empty() {
+                return Err("--cap-set requires at least one capability".to_string());
+            }
+            Ok(Some(caps))
+        }
+        (false, None) => Ok(None),
+    }
+}

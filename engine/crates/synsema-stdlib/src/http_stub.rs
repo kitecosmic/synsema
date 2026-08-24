@@ -3,8 +3,10 @@
 //! (blockchain_rpc/blockchain_btc_rpc) → esos módulos compilan enteros y sus
 //! builtins PUROS (tx_eip1559, builders, etc.) siguen completos; los de red fallan
 //! en runtime con un error claro en vez de desaparecer del lenguaje.
-//! Sin `register_http_builtins`: http_get/http_post/fetch NO existen en este perfil
-//! (el entorno no otorga `net` — misma doctrina deny-by-default, contada en docs).
+//! Sin `register_http_builtins`: este módulo no registra http_get/http_post/fetch. El
+//! front-end wasm (synsema-wasm) los registra como stubs que fallan con un error claro
+//! ("not available in the wasm profile — this build has no network sockets"), igual
+//! que la familia de memoria: el nombre existe, el entorno no otorga `net`.
 
 use synsema_core::types::SynValue;
 

@@ -1,0 +1,63 @@
+-- Sonda del perfil wasm, parte 3: lo que se MOVIÓ por compatibilidad en la tanda
+-- wasm — json_encode/json_decode/json_for_script (database.rs → json.rs) y los
+-- helpers de respuesta + vocabulario content() (server.rs → respond.rs). Cada
+-- línea es un vector determinista: la salida debe ser byte a byte idéntica entre
+-- el binario nativo y synsema-wasm bajo wasmtime.
+
+-- json: round-trip completo con todos los tipos del lenguaje
+let d be {"a": 1, "b": [1, 2.5, "x", false], "c": {"n": nothing, "t": true}, "s": "</script>&"}
+let enc be json_encode(d)
+print(`enc={enc}`)
+let back be json_decode(enc)
+print(`roundtrip={json_encode(back) == enc}`)
+print(`decoded_type={type_of(back)}`)
+print(`decoded_nested={back["c"]["t"]}`)
+print(`for_script={json_for_script({"s": "</script>&"})}`)
+print(`bytes_b64={json_encode({"b": bytes("hi")})}`)
+print(`decimal={json_encode({"d": decimal("1.10")})}`)
+try
+    json_decode("{bad")
+    print("bad_json=ACEPTADO")
+recover e
+    print(`bad_json={e}`)
+
+-- helpers de respuesta (respond.rs) vistos como data
+print(`ok={json_encode(ok({"x": 1}))}`)
+print(`created={json_encode(created({"id": 7}))}`)
+print(`not_found={json_encode(not_found("nope"))}`)
+print(`fail={json_encode(fail(422, "invalid"))}`)
+print(`redirect={json_encode(redirect("/login"))}`)
+print(`redirect_301={json_encode(redirect("/x", 301))}`)
+print(`html={json_encode(html("<b>hi</b>"))}`)
+print(`respond={json_encode(respond("hola", "text/plain", 201))}`)
+print(`binary={json_encode(binary(bytes("abc"), "application/octet-stream"))}`)
+
+-- headers y cookies: validación estricta (CR/LF falla) y defaults seguros
+let r be with_header(ok({"x": 1}), "X-Trace", "abc")
+print(`with_header={json_encode(r)}`)
+try
+    with_header(ok({}), "X-Bad", "a\r\nb")
+    print("header_crlf=ACEPTADO")
+recover e
+    print(`header_crlf={e}`)
+let c be set_cookie(ok({}), "sid", "tok123")
+print(`set_cookie={json_encode(c)}`)
+let c2 be set_cookie(ok({}), "sid", "tok", {"max_age": 60, "path": "/app", "same_site": "Strict"})
+print(`set_cookie_opts={json_encode(c2)}`)
+print(`clear_cookie={json_encode(clear_cookie(ok({}), "sid"))}`)
+
+-- vocabulario content(): cada nodo como data (la vista del agente)
+print(`heading={json_encode(heading(2, "Título"))}`)
+print(`prose={json_encode(prose("un <párrafo>"))}`)
+print(`list={json_encode(list(["a", "b"]))}`)
+print(`ordered_list={json_encode(ordered_list(["a", "b"]))}`)
+print(`link={json_encode(link("docs", "https://x.test/d"))}`)
+print(`image={json_encode(image("/i.png", "alt"))}`)
+print(`code={json_encode(code("let x be 1", "synsema"))}`)
+print(`raw={json_encode(raw("<i>x</i>"))}`)
+print(`section={json_encode(section([prose("a"), prose("b")]))}`)
+let pg be page([heading(1, "R"), prose("p")], {"title": "Reporte"})
+print(`page={json_encode(pg)}`)
+let ct be content(pg)
+print(`content_type={type_of(ct)}`)
+print(`content={json_encode(ct)}`)
