@@ -8,7 +8,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 use synsema_core::types::SendValue;
@@ -16,10 +16,7 @@ use synsema_core::types::SendValue;
 use crate::blackboard::Blackboard;
 
 fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
-        .unwrap_or(0.0)
+    synsema_core::clock::now_secs_f64()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

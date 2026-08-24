@@ -66,10 +66,7 @@ const MAX_DEPTH: usize = 32;
 const DEFAULT_TTL: i64 = 900;
 
 fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    synsema_core::clock::now_secs()
 }
 
 // =========================================================

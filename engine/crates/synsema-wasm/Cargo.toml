@@ -3,7 +3,16 @@ name = "synsema-wasm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Synsema como artefacto WebAssembly: el intérprete + el perfil puro de la stdlib (wasm32-wasip1)"
+description = "Synsema como artefacto WebAssembly: el intérprete + el perfil puro de la stdlib (lib compartida por el bin wasip1 y el cdylib web)"
+
+# Lib = una sola verdad del wiring puro + la API embebible (run/test/check/handle).
+# Bin = la CLI wasip1 (wasmtime, TEEs, runners) sobre esa lib.
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "synsema-wasm"
+path = "src/main.rs"
 
 [dependencies]
 synsema-core.workspace = true
@@ -12,6 +21,8 @@ synsema-agents.workspace = true
 # Sin `native`: el perfil PURO (sin sockets/DB/threads del SO). Dep por path (no
 # workspace = true): un member no puede apagar los default-features de una entrada
 # de workspace.dependencies — por path sí. En el build --workspace la unificación
-# de features vuelve a encender `native` (runtime la trae); este main sólo usa la
+# de features vuelve a encender `native` (runtime la trae); este crate sólo usa la
 # superficie compartida entre ambos perfiles, así que compila idéntico en los dos.
 synsema-stdlib = { path = "../synsema-stdlib", default-features = false }
+indexmap.workspace = true
+serde_json.workspace = true

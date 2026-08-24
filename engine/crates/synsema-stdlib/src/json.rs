@@ -90,7 +90,7 @@ pub enum Json {
     Object(Vec<(String, Json)>),
 }
 
-pub(crate) fn obj(pairs: Vec<(&str, Json)>) -> Json {
+pub fn obj(pairs: Vec<(&str, Json)>) -> Json {
     Json::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }
 
