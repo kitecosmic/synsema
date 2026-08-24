@@ -1,0 +1,73 @@
+-- Sonda del perfil wasm, parte 4: la semántica de `sandbox` no se malinterpreta —
+-- adentro TODO está denegado (random/secret/time), `require` adentro no re-concede,
+-- una task llamada desde adentro tampoco escapa, el estado se RESTAURA al salir
+-- (también tras un raise), anidado y como expresión. Misma salida nativo/wasm.
+-- Con `--sandbox` (techo del host) la primera línea ya debe fallar: `require random`
+-- está por encima del techo [stdout, time].
+
+require random
+require secret("ETH_KEY")
+
+print(`outside_random={type_of(random())}`)
+print(`outside_secret={type_of(secret("ETH_KEY"))}`)
+
+sandbox
+    try
+        random()
+        print("sandbox_random=PERMITIDO")
+    recover e
+        print(`sandbox_random={e}`)
+    try
+        secret("ETH_KEY")
+        print("sandbox_secret=PERMITIDO")
+    recover e
+        print(`sandbox_secret={e}`)
+    try
+        now()
+        print("sandbox_time=PERMITIDO")
+    recover e
+        print(`sandbox_time={e}`)
+    require random
+    try
+        random()
+        print("sandbox_require=ESCAPO")
+    recover e
+        print(`sandbox_require={e}`)
+    print(`sandbox_pure={sum([1, 2, 3])}`)
+
+print(`after_random={type_of(random())}`)
+print(`after_secret={type_of(secret("ETH_KEY"))}`)
+
+let v be sandbox 2 + 3
+print(`sandbox_expr={v}`)
+
+sandbox
+    sandbox
+        try
+            random()
+            print("nested_inner=PERMITIDO")
+        recover e
+            print(`nested_inner={e}`)
+    try
+        random()
+        print("nested_outer=PERMITIDO")
+    recover e
+        print(`nested_outer={e}`)
+print(`after_nested={type_of(random())}`)
+
+try
+    sandbox
+        raise("boom")
+recover e
+    print(`sandbox_raise={e}`)
+print(`after_raise={type_of(random())}`)
+
+task lee_secreto()
+    give secret("ETH_KEY")
+sandbox
+    try
+        lee_secreto()
+        print("task_in_sandbox=PERMITIDO")
+    recover e
+        print(`task_in_sandbox={e}`)
+print(`after_task={type_of(lee_secreto())}`)

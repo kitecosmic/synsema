@@ -49,6 +49,7 @@ engine/
     │       ├── database.rs          # SQLite (rusqlite, bundled) + PG/MySQL/Mongo/Redis [native]
     │       ├── cron.rs              # cron scheduler [native]
     │       ├── json.rs              # JSON ↔ SynValue + content-tree-as-data + json_encode/decode builtins (pure)
+    │       ├── respond.rs           # response helpers (ok/created/…/set_cookie) + content() vocabulary (pure)
     │       ├── secrets.rs           # env/secret/reveal/bearer + HMAC/sha hashing
     │       ├── acme.rs              # auto-HTTPS (ACME, instant-acme) [native]
     │       └── mimetypes.rs         # static-file content types

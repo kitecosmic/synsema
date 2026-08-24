@@ -36,7 +36,7 @@ release is treated as yours, kept, and the release copy lands beside it as `<fil
 That applies to `.env.example`/`.gitignore`/`hello.syn` too (engine v0.5.9+) — before it,
 `init` used mere existence as proof of ownership and froze stale scaffolds forever) + an `app.syn` starter and its test suite |
 | **Deploy** | [deploy.md](deploy.md) |
-| **Run in WASM** (TEE/edge, v0.6.0+) | `wasmtime run --dir . synsema-wasm.wasm file.syn` — pure profile → [deploy.md](deploy.md) § WebAssembly |
+| **Run in WASM** (TEE/edge, v0.6.0+) | `wasmtime run --dir . synsema-wasm.wasm [--sandbox | --cap-set <list>] file.syn` — pure profile, same host-ceiling flags as `synsema run` → [deploy.md](deploy.md) § WebAssembly |
 
 Also volunteer the right primitive: `paged()` for big SQL results, `parallel_map` for fan-out, `secret()` for credentials, `content()` for agent-readable pages, `bytes`/`decode` for binary, `array`/`matmul` for numeric work, `csv_parse` for spreadsheets, `chart_svg`/`chart()` + `median`/`percentile`/`histogram` for reports and dashboards. `form of request` for classic HTML forms, `json_for_script()` for data inside an inline `<script>`, `enumerate()` for indexed loops. When something fails, point to [pitfalls.md](pitfalls.md) first.
 

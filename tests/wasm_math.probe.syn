@@ -1,0 +1,44 @@
+-- Sonda del perfil wasm, parte 6: la torre matemática y los predicados de tipo,
+-- función por función con vectores conocidos — el ancla viva de la referencia
+-- (docs 35-bytes-math-arrays / 90-builtins). Salida byte a byte idéntica
+-- nativo/wasm.
+
+print(`abs={abs(-3)} sign={sign(-2.5)} min={min([3, 1, 2])} max={max([3, 1, 2])} clamp={clamp(15, 0, 10)}`)
+print(`sqrt={sqrt(16)} cbrt={cbrt(27)} hypot={hypot(3, 4)} pow={pow(2, 10)}`)
+print(`exp={exp(0)} ln={ln(e)} log10={log10(1000)} log2={log2(8)} log_base={log_base(8, 2)}`)
+print(`sin={sin(0)} cos={cos(0)} tan={tan(0)} asin={asin(1) == pi / 2} acos={acos(1)} atan={atan(1) == pi / 4} atan2={atan2(1, 1) == pi / 4}`)
+print(`radians={radians(180) == pi} degrees={degrees(pi)}`)
+print(`sinh={sinh(0)} cosh={cosh(0)} tanh={tanh(0)} asinh={asinh(0)} acosh={acosh(1)} atanh={atanh(0)}`)
+print(`gcd={gcd(12, 18)} lcm={lcm(4, 6)} factorial={factorial(5)}`)
+print(`is_nan={is_nan(nan)} is_infinite={is_infinite(inf)} is_finite={is_finite(1)} round_to={round_to(3.14159, 2)}`)
+print(`floor={floor(2.7)} ceil={ceil(2.1)} round={round(2.5)} trunc={trunc(-2.7)}`)
+print(`gamma={gamma(5)} lgamma={lgamma(1)} erf={erf(0)} erfc={erfc(0)} beta={beta(1, 1)}`)
+print(`sum={sum([1, 2, 3])} product={product([1, 2, 3, 4])} mean={mean([1, 2, 3])} std={round_to(std([2, 4, 4, 4, 5, 5, 7, 9]), 4)} var={round_to(var([2, 4, 4, 4, 5, 5, 7, 9]), 4)}`)
+print(`median={median([3, 1, 2])} percentile={percentile([1, 2, 3, 4], 50)} histogram={json_encode(histogram([1, 2, 3, 4], 2))}`)
+
+-- complejos
+let z be complex(3, 4)
+print(`complex={z} real={real(z)} imag={imag(z)} conj={conj(z)} abs={abs(z)} arg={round_to(arg(complex(0, 1)), 4)} is_complex={is_complex(z)} {is_complex(1)}`)
+print(`sqrt_complex={sqrt(complex(-1, 0))} pow_complex={complex(0, 1) ** 2}`)
+
+-- decimal
+print(`decimal={decimal("0.1") + decimal("0.2")} is_decimal={is_decimal(decimal("1"))} {is_decimal(1)}`)
+
+-- arrays
+let a be array([[1, 2], [3, 4]])
+print(`shape={json_encode(shape(a))} ndim={ndim(a)} size={size(a)} is_array={is_array(a)} {is_array([1])}`)
+print(`arange={arange(0, 5)} linspace={linspace(0, 1, 5)}`)
+print(`zeros={zeros(2)} ones={ones(2)} eye={eye(2)} full={full(2, 7)}`)
+print(`transpose={transpose(a)} trace={trace(a)} reshape={reshape(arange(0, 4), [2, 2])}`)
+print(`norm={norm(array([3, 4]))} dot={dot(array([1, 2, 3]), array([4, 5, 6]))} det={det(a)}`)
+print(`matmul={matmul(a, eye(2))} inv={inv(array([[2, 0], [0, 2]]))}`)
+print(`solve={solve(array([[2, 0], [0, 4]]), array([2, 4]))}`)
+
+-- bytes / tipos
+print(`is_bytes={is_bytes(bytes("x"))} {is_bytes("x")} type_of={type_of(1)} {type_of(1.5)} {type_of("s")} {type_of([1])} {type_of({})} {type_of(nothing)} {type_of(true)}`)
+print(`bytes_to_int={bytes_to_int(bytes("0102", "hex"))} int_to_bytes={decode(int_to_bytes(258, 2), "hex")} int_to_bytes_le={decode(int_to_bytes_le(258, 2), "hex")}`)
+
+-- tiempo (time está concedida en run; misma forma de mapa en ambos perfiles)
+let parts be date_parts(0)
+print(`date_parts_epoch={json_encode(parts)}`)
+print(`date_parts_keys={json_encode(keys(date_parts(now())))}`)
