@@ -48,7 +48,7 @@ jobs:
       - name: Build synsema-wasm
         run: cargo build --locked --manifest-path engine/Cargo.toml -p synsema-wasm --target wasm32-wasip1 --release
       - name: Setup wasmtime
-        uses: bytecodealliance/actions/wasmtime/setup@v1
+        uses: bytecodealliance/actions/wasmtime/setup@v1.1.3
       - name: Language suites under wasmtime
         run: |
           for f in tests/lang.test.syn tests/math.test.syn tests/arrays.test.syn tests/python_diff.test.syn tests/batch6.test.syn; do
