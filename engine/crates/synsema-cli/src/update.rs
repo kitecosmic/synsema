@@ -115,11 +115,38 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     h.finalize().iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// ¿Este binario lo administra npm (paquete `synsema` / `@synsema/cli-*`)? El launcher
+/// `bin/synsema.js` lo declara con `SYNSEMA_INSTALLED_BY=npm`; como respaldo, la ruta del
+/// ejecutable dentro de un `node_modules`. En ese caso `update` no se sobreescribe a sí
+/// mismo (npm perdería el rastro y `npm i -g synsema@latest` lo pisaría): sugiere el
+/// comando de npm.
+pub(crate) fn installed_by_npm() -> bool {
+    if std::env::var("SYNSEMA_INSTALLED_BY").map(|v| v == "npm").unwrap_or(false) {
+        return true;
+    }
+    std::env::current_exe()
+        .map(|p| p.components().any(|c| c.as_os_str() == "node_modules"))
+        .unwrap_or(false)
+}
+
 /// `synsema update`: descarga el último release para esta plataforma, verifica su
 /// sha256 y reemplaza el binario en ejecución.
 pub fn cmd_update() -> ExitCode {
     let current = current_version();
     println!("Versión actual: {}", current);
+    if installed_by_npm() {
+        match check_for_update() {
+            Some(tag) => println!(
+                "Este synsema lo instaló npm. Hay {} disponible — actualizá con:\n  npm i -g synsema@latest",
+                tag
+            ),
+            None => println!(
+                "Ya estás en la última versión ({}). (Instalado por npm: las actualizaciones van por `npm i -g synsema@latest`.)",
+                current
+            ),
+        }
+        return ExitCode::SUCCESS;
+    }
 
     let json = match latest_release_json() {
         Ok(j) => j,
@@ -309,7 +336,8 @@ pub fn check_for_update() -> Option<String> {
 /// Imprime a stderr un aviso si hay update disponible. Lo llaman comandos interactivos.
 pub fn notify_if_outdated() {
     if let Some(tag) = check_for_update() {
-        eprintln!("\nsynsema {} disponible (tenés {}) — corré `synsema update`", tag, current_version());
+        let how = if installed_by_npm() { "npm i -g synsema@latest" } else { "synsema update" };
+        eprintln!("\nsynsema {} disponible (tenés {}) — corré `{}`", tag, current_version(), how);
     }
 }
 

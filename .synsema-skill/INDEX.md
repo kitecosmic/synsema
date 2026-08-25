@@ -18,7 +18,8 @@ core dev loop:
 | **Re-propagate a caught error** | `raise(err)` inside `recover` (else `recover` swallows it) → [builtins.md](builtins.md) |
 | **Inspect agents / swarm state** | `synsema conform --swarm file.syn` (JSON dump: blackboard + agent states) |
 | **Try things interactively** | `synsema repl` |
-| **Update** binary + this skill | `synsema update`, then re-run the skill installer (see "Keep yourself current" below) |
+| **Install** | `curl -fsSL https://synsema.com/install.sh \| sh` (Linux/macOS), `irm https://synsema.com/install.ps1 \| iex` (Windows), or `npm i -g synsema` / `npx synsema …` (same native binary via npm, v0.6.3+) |
+| **Update** binary + this skill | `synsema update` (if installed by npm it says so: `npm i -g synsema@latest`), then re-run the skill installer (see "Keep yourself current" below) |
 | **Diagnose LLM config** | `synsema llm status` (resolved config with sources; names the missing variable when offline) |
 | **Start a new project** | `synsema init [dir]` (hello.syn tour + commented .env.example + .gitignore). Re-running is **safe and repairs**: a file still identical to any release it shipped in gets refreshed; one with your edits is kept and the new version lands as `<file>.new` (v0.5.9+) |
 | **Deploy** (daemon/Docker/VPS) | see [deploy.md](deploy.md) |

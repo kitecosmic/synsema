@@ -177,6 +177,46 @@ jobs:
           echo "gzip bytes: $gz"
           test "$gz" -lt 5242880
 
+  # Paquete npm `synsema` (tanda npm-cli): el launcher + el paquete de plataforma se arman
+  # desde el binario recién compilado (platforms.mjs con SOLO el asset linux), se empaquetan
+  # con `npm pack` y se instalan desde los tarballs en un proyecto vacío — sin registry —
+  # y se corre `npx synsema version` / `run` / `update` (que debe reconocer a npm).
+  npm-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+          key: ${{ runner.os }}-cargo-wasm-web-${{ hashFiles('engine/Cargo.lock') }}
+      - name: Build native synsema
+        run: cargo build --locked --manifest-path engine/Cargo.toml -p synsema-cli
+      - name: Probe the npm launcher end to end
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/assets /tmp/out /tmp/proj
+          cp engine/target/debug/synsema /tmp/assets/synsema-linux-x86_64
+          node packages/synsema-cli/platforms.mjs 0.0.0-ci /tmp/assets /tmp/out
+          (cd /tmp/out/cli-linux-x64 && npm pack --pack-destination /tmp)
+          (cd /tmp/out/synsema && npm pack --pack-destination /tmp)
+          cd /tmp/proj && npm init -y >/dev/null
+          npm install --no-audit --no-fund /tmp/synsema-cli-linux-x64-0.0.0-ci.tgz /tmp/synsema-0.0.0-ci.tgz
+          npx synsema version | tee v.txt
+          grep -q '^Synsema v' v.txt
+          printf 'print(1 + 2)\n' > t.syn
+          test "$(npx synsema run t.syn)" = "3"
+          SYNSEMA_NO_UPDATE_CHECK=1 npx synsema update | tee u.txt
+          grep -q 'npm i -g synsema@latest' u.txt
+          if npx synsema run nope.syn; then echo "exit code no propagado"; exit 1; fi
+
   # Supply-chain: cargo audit contra la base RustSec en cada push/PR.
   # Falla ante una vulnerabilidad conocida en Cargo.lock (los warnings
   # "unmaintained" no cortan el build; se revisan al actualizar deps).

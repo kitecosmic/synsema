@@ -152,5 +152,40 @@ jobs:
           npm version --no-git-tag-version "${GITHUB_REF_NAME#v}"
           npm publish --provenance --access public
 
+  # npm `synsema` (tanda npm-cli): con los 4 binarios YA en la release, arma los paquetes
+  # de plataforma @synsema/cli-<os>-<cpu> + el paquete `synsema` (launcher) y los publica
+  # por trusted publishing (cada uno de los 5 paquetes tiene su trusted publisher en npm).
+  # `needs` los 4 jobs del matrix: los assets se bajan de la release, no se recompilan.
+  npm-cli:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Download the release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          for a in synsema-linux-x86_64 synsema-macos-aarch64 synsema-macos-x86_64 synsema-windows-x86_64.exe; do
+            gh release download "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" --pattern "$a" --pattern "$a.sha256" -D assets --clobber
+            (cd assets && shasum -a 256 -c "$a.sha256")
+          done
+      - name: Build and publish the 5 packages
+        run: |
+          set -euo pipefail
+          npm install -g npm@latest
+          node packages/synsema-cli/platforms.mjs "${GITHUB_REF_NAME#v}" assets out
+          for d in cli-linux-x64 cli-darwin-arm64 cli-darwin-x64 cli-win32-x64 synsema; do
+            (cd "out/$d" && npm publish --provenance --access public)
+          done
+
   # NOTE: aarch64-linux is deferred (needs a C cross-toolchain for rusqlite's bundled
   # SQLite). Add it later via `cross` or a gcc-aarch64 setup if there's demand.

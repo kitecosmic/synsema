@@ -1,7 +1,7 @@
 # Synsema Deployment
 
 Synsema ships as a **single static binary** (the Rust build) — no Python, no Node, no
-runtime on the target. Install it with `cargo install --path engine/crates/synsema-cli` or
+runtime on the target. Install it with `npm i -g synsema` (the native binary via npm, v0.6.3+ — `npx synsema` works too), `cargo install --path engine/crates/synsema-cli` or
 grab a prebuilt binary from the GitHub Releases page.
 
 ## Running modes

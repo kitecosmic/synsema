@@ -29,6 +29,10 @@ A single self-contained binary — no Python, no npm, nothing to install on the 
 ```bash
 # one-liner (Linux/macOS) — once a release is published
 curl -fsSL https://synsema.com/install.sh | sh
+
+# or from npm (Linux/macOS/Windows): the same native binary, no runtime involved
+npm i -g synsema        # then: synsema run app.syn
+npx synsema run app.syn # per project, no global install
 ```
 
 ### Build from source

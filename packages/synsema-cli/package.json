@@ -1,0 +1,35 @@
+{
+  "name": "synsema",
+  "version": "0.0.0-dev",
+  "description": "Synsema — the programming language for AI agents. This package installs the native `synsema` binary (Linux, macOS, Windows) from npm: `npm i -g synsema` or `npx synsema run app.syn`.",
+  "license": "MIT",
+  "bin": {
+    "synsema": "bin/synsema.js"
+  },
+  "files": [
+    "bin/synsema.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@synsema/cli-linux-x64": "0.0.0-dev",
+    "@synsema/cli-darwin-arm64": "0.0.0-dev",
+    "@synsema/cli-darwin-x64": "0.0.0-dev",
+    "@synsema/cli-win32-x64": "0.0.0-dev"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kitecosmic/synsema.git",
+    "directory": "packages/synsema-cli"
+  },
+  "homepage": "https://docs.synsema.com",
+  "keywords": [
+    "synsema",
+    "agents",
+    "llm",
+    "language",
+    "cli"
+  ]
+}
