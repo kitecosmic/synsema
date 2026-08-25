@@ -159,8 +159,8 @@
 `  require ∩ ceiling`. A `require net("*")` under `--cap-set "net=api.mock"` grants **nothing** (the
 `  ceiling doesn't cover the wildcard) — the code never rises above the ceiling.
 `- Applies to `run` and `test`. `--sandbox` and `--cap-set` are mutually exclusive; an unknown name errors.
-- **The error names who can fix it.** Not declared → `Capability not granted: X` / `… missing capability — add `require X`
-`  (the program adds the line). Declared but above the ceiling → `… declared but above the host ceiling
+- **The error names who can fix it.** Not declared → `Capability not granted: X` / `… missing capability — add `require X``
+  (the program adds the line). Declared but above the ceiling → `… declared but above the host ceiling
 `  (--sandbox/--cap-set). The program cannot fix this; the host must widen the ceiling` — do NOT re-add a
 `  `require` you already have (that loop is exactly what this message prevents). The audit trail carries the
 `  same split: `reason` = `No matching grant found` / `above host ceiling (--sandbox/--cap-set)` /
