@@ -176,7 +176,12 @@ jobs:
           mkdir -p assets
           for a in synsema-linux-x86_64 synsema-macos-aarch64 synsema-macos-x86_64 synsema-windows-x86_64.exe; do
             gh release download "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" --pattern "$a" --pattern "$a.sha256" -D assets --clobber
-            (cd assets && shasum -a 256 -c "$a.sha256")
+            # El .sha256 de Windows lo escribe PowerShell (hash en mayúsculas, sin nombre de
+            # archivo); los demás, shasum ("hash  nombre"). Se compara el primer token, en minúsculas.
+            expected=$(tr -d '\r' < "assets/$a.sha256" | awk '{print tolower($1)}' | head -1)
+            actual=$(sha256sum "assets/$a" | awk '{print $1}')
+            if [ "$expected" != "$actual" ]; then echo "sha256 mismatch for $a: $expected != $actual"; exit 1; fi
+            echo "sha256 ok: $a"
           done
       - name: Build and publish the 5 packages
         run: |
