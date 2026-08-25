@@ -361,7 +361,18 @@ SharedArrayBuffer (browsers need COOP/COEP); Node/Bun work out of the box. `now(
 host clock, `random()`/`token()`/signature nonces = host entropy (`crypto.getRandomValues`,
 `os.urandom`, `crypto/rand`). A trap (panic) discards the instance; the glue recreates it.
 Errors of the program are DATA (`errors[]`), never exceptions. The `audit` lists every
-capability check the program made — the embedder sees what it asked for.
+capability check — `{capability, granted, source, reason, origin}`. `reason` says why a denial
+happened (`No matching grant found` = never declared; `above host ceiling (--sandbox/--cap-set)` =
+declared but the host doesn't lend it; `Explicitly denied by …`), and `origin` says who put the
+entry there: `"program"` (a `require` or a call of the program) vs `"runtime"` (an ambient grant
+the host tried — `time`/`llm` under a ceiling — that the program never asked for). "This tenant
+tried to read STRIPE_KEY" = `origin == "program" && !granted`; no need to re-parse the source.
+
+Value in wasm: `sign`/`spend`/`wallet`/`reveal` are fail-loud (no audit line → no operation). A wasm
+host has no filesystem, so the audit line goes to the host `kv` under namespace `audit` (key
+`sign.log`/`spend.log`/`wallet.log`/`reveal.log`, append-only, never key material). Offer `kv` → they
+work under your ceiling (`sign=ETH_KEY`, `spend=USD`, `wallet=mnemonic*`); no `kv` → *this host
+provides no audit sink*. Runaway recursion is a runtime error, never a trap.
 
 Not a dialect: full language + templates, numeric tower + arrays, JSON/CSV/regex/stats,
 `chart_svg` + PNG/PDF, hashing/HMAC/`secret`, the whole PURE blockchain side, web-auth

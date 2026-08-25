@@ -196,6 +196,23 @@ fn str_of(v: &Value) -> String {
 }
 
 impl HostProvider for WebHost {
+    /// El audit fail-loud (reveal/sign/wallet/spend) vive en el kv del embebedor:
+    /// `audit` / `<log>` → texto append-only. Sin `kv` → None → la operación se niega.
+    fn audit_append(&self, log: &str, line: &str) -> Option<Result<(), String>> {
+        if !self.offers("kv") {
+            return None;
+        }
+        let prev = host_call_json("kv_get", &json!({"ns": "audit", "key": log}))?
+            .get("value")
+            .and_then(Value::as_str)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let r = host_call_json("kv_set", &json!({"ns": "audit", "key": log, "value": format!("{}{}", prev, line)}))?;
+        Some(match r.get("error").and_then(Value::as_str) {
+            Some(e) if !e.is_empty() => Err(e.to_string()),
+            _ => Ok(()),
+        })
+    }
     fn offers(&self, what: &str) -> bool {
         self.offers.contains(what)
     }
@@ -394,7 +411,7 @@ fn audit_json(audit: &[synsema_wasm::AuditEntry]) -> Value {
     Value::Array(
         audit
             .iter()
-            .map(|a| json!({"capability": a.capability, "granted": a.granted, "source": a.source, "reason": a.reason}))
+            .map(|a| json!({"capability": a.capability, "granted": a.granted, "source": a.source, "reason": a.reason, "origin": a.origin}))
             .collect(),
     )
 }

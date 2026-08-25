@@ -286,6 +286,21 @@ pub fn normalize_path(p: &str) -> String {
     }
 }
 
+/// Por qué se denegó una capability. La distinción importa para QUIÉN puede
+/// arreglarlo: `NoGrant` lo arregla el programa (un `require`); `AboveCeiling` sólo
+/// el host (ampliar `--sandbox`/`--cap-set`/el ceiling del embebedor) — un agente que
+/// se auto-repara agregando un `require` que ya tiene entra en loop si no se lo decimos.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DenyCause {
+    ExplicitlyDenied(Capability),
+    AboveCeiling,
+    NoGrant,
+}
+
+/// El texto del techo, idéntico en todas las ramas (los clasificadores del audit
+/// comparan por string).
+pub const ABOVE_CEILING: &str = "above host ceiling (--sandbox/--cap-set)";
+
 /// Registro de un chequeo de capability (audit trail).
 #[derive(Clone, Debug)]
 pub struct CapabilityAuditEntry {
@@ -293,6 +308,11 @@ pub struct CapabilityAuditEntry {
     pub granted: bool,
     pub source: String,
     pub reason: String,
+    /// Quién originó la entrada: `"program"` (un `require` del programa o una llamada
+    /// que hizo) o `"runtime"` (un grant ambiente del host: stdout/time/llm bajo `run`,
+    /// `serve` concedido por `--port`…). Deja separar "este tenant quiso leer STRIPE_KEY"
+    /// del ruido de los grants ambientales rechazados por el techo.
+    pub origin: &'static str,
 }
 
 /// Conjunto de capabilities otorgadas, con audit trail. Cada contexto de ejecución
@@ -309,6 +329,9 @@ pub struct CapabilitySet {
     /// amplía: `caps_efectivas ⊆ require ∩ techo`. Se propaga (`Rc::clone`, barato) a todo
     /// set derivado (hijo/sandbox/worker/agente) para que su `grant()`/`check()` lo honren.
     pub ceiling: Option<Rc<Vec<Capability>>>,
+    /// Grants del PROGRAMA que el techo rechazó: la capability está DECLARADA aunque no
+    /// concedida — es lo que distingue "declared but above the ceiling" de "no grant".
+    pub rejected_by_ceiling: Vec<Capability>,
 }
 
 impl CapabilitySet {
@@ -318,6 +341,7 @@ impl CapabilitySet {
             granted: HashSet::new(),
             denied: HashSet::new(),
             audit_log: Vec::new(),
+            rejected_by_ceiling: Vec::new(),
             parent: None,
             ceiling: None,
         }
@@ -333,15 +357,31 @@ impl CapabilitySet {
         }
     }
 
+    /// Un grant del PROGRAMA (`require …`).
     pub fn grant(&mut self, capability: Capability) {
+        self.grant_from(capability, "program");
+    }
+
+    /// Un grant AMBIENTE del host/runtime (stdout/time/llm bajo `run`, `serve` por `--port`):
+    /// si el techo lo rechaza, la entrada del audit dice `origin: "runtime"` — el programa
+    /// nunca lo pidió.
+    pub fn grant_ambient(&mut self, capability: Capability) {
+        self.grant_from(capability, "runtime");
+    }
+
+    fn grant_from(&mut self, capability: Capability, origin: &'static str) {
         // Fail-closed: si el host puso un techo y no cubre esta capability, NO se inserta
         // (el techo nunca amplía). Se audita el rechazo. Sin techo → inserta como siempre.
         if !self.within_ceiling(&capability) {
+            if origin == "program" {
+                self.rejected_by_ceiling.push(capability.clone());
+            }
             self.audit_log.push(CapabilityAuditEntry {
                 capability,
                 granted: false,
                 source: "ceiling".to_string(),
-                reason: "above host ceiling (--sandbox/--cap-set)".to_string(),
+                reason: ABOVE_CEILING.to_string(),
+                origin,
             });
             return;
         }
@@ -355,6 +395,12 @@ impl CapabilitySet {
 
     /// ¿Está permitida? True si otorgada y no denegada. Cada chequeo se audita.
     pub fn check(&mut self, requested: &Capability, source: &str) -> bool {
+        self.check_cause(requested, source).is_ok()
+    }
+
+    /// Como `check`, pero dice POR QUÉ se denegó — para que el mensaje de error apunte
+    /// al actor correcto (programa vs host).
+    pub fn check_cause(&mut self, requested: &Capability, source: &str) -> Result<(), DenyCause> {
         // 1) Denegaciones explícitas primero.
         let denied_by: Option<Capability> =
             self.denied.iter().find(|d| d.covers(requested)).cloned();
@@ -364,8 +410,9 @@ impl CapabilitySet {
                 granted: false,
                 source: source.to_string(),
                 reason: format!("Explicitly denied by {}", d),
+                origin: "program",
             });
-            return false;
+            return Err(DenyCause::ExplicitlyDenied(d));
         }
 
         // 1.5) Techo del host (defense-in-depth, autoritativo): un USO por encima del techo
@@ -373,14 +420,18 @@ impl CapabilitySet {
         // `grant()` ya evita insertar por encima del techo; esto cierra cualquier fuga de un
         // set derivado que hubiera colado un grant. Sólo corre si hay techo (`is_some`) → el
         // hot-path por defecto (`ceiling = None`) no paga nada.
-        if self.ceiling.is_some() && !self.within_ceiling(requested) {
+        // Sólo es "declared but above the ceiling" si el programa la DECLARÓ (un grant
+        // vigente o uno que el techo rechazó, acá o en el padre); si no, es "no grant" —
+        // el programa tiene que agregar el `require` primero.
+        if self.ceiling.is_some() && !self.within_ceiling(requested) && self.is_declared(requested) {
             self.audit_log.push(CapabilityAuditEntry {
                 capability: requested.clone(),
                 granted: false,
                 source: source.to_string(),
-                reason: "Above host ceiling (--sandbox/--cap-set)".to_string(),
+                reason: ABOVE_CEILING.to_string(),
+                origin: "program",
             });
-            return false;
+            return Err(DenyCause::AboveCeiling);
         }
 
         // 2) Grants.
@@ -392,14 +443,17 @@ impl CapabilitySet {
                 granted: true,
                 source: source.to_string(),
                 reason: format!("Granted by {}", c),
+                origin: "program",
             });
-            return true;
+            return Ok(());
         }
 
         // 3) Padre (su check audita en el padre).
         if let Some(parent) = self.parent.clone() {
-            if parent.borrow_mut().check(requested, source) {
-                return true;
+            match parent.borrow_mut().check_cause(requested, source) {
+                Ok(()) => return Ok(()),
+                Err(DenyCause::AboveCeiling) => return Err(DenyCause::AboveCeiling),
+                Err(_) => {}
             }
         }
 
@@ -409,15 +463,36 @@ impl CapabilitySet {
             granted: false,
             source: source.to_string(),
             reason: "No matching grant found".to_string(),
+            origin: "program",
         });
-        false
+        Err(DenyCause::NoGrant)
+    }
+
+    fn is_declared(&self, requested: &Capability) -> bool {
+        self.granted.iter().any(|c| c.covers(requested))
+            || self.rejected_by_ceiling.iter().any(|c| c.covers(requested))
+            || self.parent.as_ref().map(|p| p.borrow().is_declared(requested)).unwrap_or(false)
+    }
+
+    /// El mensaje de una denegación, apuntando a quien puede resolverla.
+    pub fn denial_message(requested: &Capability, cause: &DenyCause) -> String {
+        match cause {
+            DenyCause::AboveCeiling => format!(
+                "Capability not granted: {} — declared but above the host ceiling (--sandbox/--cap-set). The program cannot fix this; the host must widen the ceiling",
+                requested
+            ),
+            DenyCause::ExplicitlyDenied(d) => {
+                format!("Capability not granted: {} — explicitly denied by {}", requested, d)
+            }
+            DenyCause::NoGrant => format!("Capability not granted: {}", requested),
+        }
     }
 
     /// Chequea y devuelve error si no está otorgada.
     pub fn require(&mut self, requested: &Capability, source: &str) -> Result<(), CapabilityViolation> {
-        if !self.check(requested, source) {
+        if let Err(cause) = self.check_cause(requested, source) {
             return Err(CapabilityViolation {
-                message: format!("Capability not granted: {}", requested),
+                message: Self::denial_message(requested, &cause),
                 requested: Some(requested.clone()),
                 source: source.to_string(),
             });
@@ -433,6 +508,7 @@ impl CapabilitySet {
             granted: HashSet::new(),
             denied: HashSet::new(),
             audit_log: Vec::new(),
+            rejected_by_ceiling: Vec::new(),
             parent: Some(parent.clone()),
             ceiling: parent.borrow().ceiling.clone(),
         }
@@ -515,6 +591,31 @@ pub fn validate_memory_name(name: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    // Discovery-era audit fixes: la causa llega al mensaje (programa vs host) y el audit
+    // distingue el origen (program vs runtime) — sin re-parsear el fuente.
+    #[test]
+    fn deny_cause_and_origin() {
+        let mut caps = CapabilitySet::new("t");
+        caps.ceiling = Some(Rc::new(vec![Capability::new(CapabilityType::Stdout, None)]));
+        caps.grant_ambient(Capability::new(CapabilityType::Time, None)); // runtime, rechazado
+        caps.grant(Capability::new(CapabilityType::Secret, Some("STRIPE_KEY".into()))); // program, rechazado
+        let secret = Capability::new(CapabilityType::Secret, Some("STRIPE_KEY".into()));
+        assert_eq!(caps.check_cause(&secret, "t"), Err(DenyCause::AboveCeiling));
+        let net = Capability::new(CapabilityType::Net, Some("x".into()));
+        assert_eq!(caps.check_cause(&net, "t"), Err(DenyCause::NoGrant), "no declarada: aunque el techo no la cubra, el programa va primero");
+        let mut open = CapabilitySet::new("open");
+        assert_eq!(open.check_cause(&net, "t"), Err(DenyCause::NoGrant));
+        let msg = CapabilitySet::denial_message(&secret, &DenyCause::AboveCeiling);
+        assert!(msg.contains("host must widen the ceiling") && !msg.contains("add `require"), "{}", msg);
+        let log = &caps.audit_log;
+        let time = log.iter().find(|e| e.capability.ty == CapabilityType::Time).unwrap();
+        assert_eq!((time.origin, time.source.as_str(), time.reason.as_str()), ("runtime", "ceiling", ABOVE_CEILING));
+        let sk = log.iter().find(|e| e.capability.ty == CapabilityType::Secret && e.source == "ceiling").unwrap();
+        assert_eq!(sk.origin, "program");
+        let call = log.iter().find(|e| e.capability.ty == CapabilityType::Secret && e.source == "t").unwrap();
+        assert_eq!((call.origin, call.reason.as_str()), ("program", ABOVE_CEILING));
+    }
+
     use super::*;
 
     fn cap(ty: CapabilityType, scope: Option<&str>) -> Capability {

@@ -24,7 +24,7 @@ use std::rc::Rc;
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Sha512};
 
-use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
+use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType, DenyCause};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::secret::constant_time_eq;
 use synsema_core::tokens::SourceLocation;
@@ -196,8 +196,16 @@ fn resolve(env: &EnvStore, name: &str, default: Option<&SynValue>) -> Option<Str
     default.map(raw_str)
 }
 
-/// Error de capability faltante que **sugiere el fix** (§1/§3), incl. el prefijo.
-fn cap_denied(kind: &str, name: &str) -> Control {
+/// Error de capability denegada que **sugiere el fix a quien puede hacerlo** (§1/§3):
+/// sin `require` → el programa lo agrega (incl. el prefijo); declarada pero sobre el
+/// techo del host → lo dice, porque agregar el `require` que ya está no arregla nada
+/// (un agente que se auto-repara con el mensaje viejo entraba en loop).
+fn cap_denied(kind: &str, name: &str, cause: DenyCause) -> Control {
+    if cause == DenyCause::AboveCeiling {
+        return Control::Error(RuntimeError::new(format!(
+            "{kind}(\"{name}\") not permitted: declared but above the host ceiling (--sandbox/--cap-set). The program cannot fix this; the host must widen the ceiling"
+        )));
+    }
     let prefix_hint = name
         .split_once('_')
         .map(|(p, _)| format!(" (or a prefix: `require {}(\"{}_*\")`)", kind, p))
@@ -224,8 +232,8 @@ fn undefined_var(kind: &str, name: &str) -> Control {
     )))
 }
 
-fn check_cap(caps: &Rc<RefCell<CapabilitySet>>, cap: Capability) -> bool {
-    caps.borrow_mut().check(&cap, "secret-builtin")
+fn check_cap(caps: &Rc<RefCell<CapabilitySet>>, cap: Capability) -> Result<(), DenyCause> {
+    caps.borrow_mut().check_cause(&cap, "secret-builtin")
 }
 
 // =========================================================
@@ -516,14 +524,6 @@ fn write_audit_op(
     granted: bool,
     extra: &str,
 ) -> Result<(), String> {
-    let dir = audit_dir()?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let path = dir.join(file);
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|e| e.to_string())?;
     let program = std::path::Path::new(&loc.file)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -541,6 +541,27 @@ fn write_audit_op(
         program,
         tail
     );
+    // Un host embebedor (wasm-web) puede ser el sink: kv/log del embebedor. Si está
+    // instalado y lo ofrece, manda él — no hay filesystem del que hablar.
+    if let Some(p) = crate::hostcap::provider() {
+        if let Some(r) = p.audit_append(file, &line) {
+            return r;
+        }
+    }
+    if cfg!(target_arch = "wasm32") && std::env::var("SYNSEMA_AUDIT_DIR").map(|d| d.is_empty()).unwrap_or(true) {
+        return Err(format!(
+            "this host provides no audit sink for {} — the embedder must offer `kv` (the audit lands under the `audit` namespace) or run the program with the native `synsema` binary",
+            file
+        ));
+    }
+    let dir = audit_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let path = dir.join(file);
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| e.to_string())?;
     f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -565,8 +586,8 @@ pub fn register_secret_builtins(
             -1,
             Rc::new(move |_i, args, _loc| {
                 let name = raw_str(arg(args, 0)?);
-                if !check_cap(&caps, Capability::new(CapabilityType::Env, Some(name.clone()))) {
-                    return Err(cap_denied("env", &name));
+                if let Err(cause) = check_cap(&caps, Capability::new(CapabilityType::Env, Some(name.clone()))) {
+                    return Err(cap_denied("env", &name, cause));
                 }
                 match resolve(&env, &name, args.get(1)) {
                     Some(v) => Ok(syn_text(v)),
@@ -585,8 +606,8 @@ pub fn register_secret_builtins(
             -1,
             Rc::new(move |_i, args, _loc| {
                 let name = raw_str(arg(args, 0)?);
-                if !check_cap(&caps, Capability::new(CapabilityType::Secret, Some(name.clone()))) {
-                    return Err(cap_denied("secret", &name));
+                if let Err(cause) = check_cap(&caps, Capability::new(CapabilityType::Secret, Some(name.clone()))) {
+                    return Err(cap_denied("secret", &name, cause));
                 }
                 match resolve(&env, &name, args.get(1)) {
                     Some(v) => Ok(syn_secret(name, v)),
@@ -619,11 +640,16 @@ pub fn register_secret_builtins(
                 let name = inner.name().to_string();
                 // El chequeo evalúa el name del secret QUE SE PASA: redirigir la variable
                 // a otro secret pasa a revelar ESE (con su propio name) y vuelve a chequear.
-                let granted =
-                    check_cap(&caps, Capability::new(CapabilityType::Reveal, Some(name.clone())));
-                if !granted {
+                if let Err(cause) =
+                    check_cap(&caps, Capability::new(CapabilityType::Reveal, Some(name.clone())))
+                {
                     // Auditar el intento DENEGADO (best-effort: ya se rechaza igual).
                     let _ = write_audit_entry(&name, loc, false);
+                    if cause == DenyCause::AboveCeiling {
+                        return Err(Control::Error(RuntimeError::new(format!(
+                            "reveal() not permitted: reveal(\"{name}\") is declared but above the host ceiling (--sandbox/--cap-set). The program cannot fix this; the host must widen the ceiling"
+                        ))));
+                    }
                     return Err(reveal_denied(&name));
                 }
                 // Concedido: sin auditoría no hay revelación (§7).

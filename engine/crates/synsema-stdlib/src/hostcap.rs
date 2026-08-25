@@ -78,6 +78,13 @@ pub trait HostProvider {
     fn sleep(&self, _secs: f64) -> bool {
         false
     }
+    /// Sink del audit fail-loud de `reveal`/`sign`/`wallet`/`spend` (una línea append-only
+    /// por evento en el log `log`, p. ej. `sign.log`). Un host sin filesystem (browser,
+    /// edge) lo respalda con lo que tenga (kv); `None` = no lo ofrece → esas operaciones
+    /// se niegan, porque sin audit no hay firma/gasto/revelación (§7).
+    fn audit_append(&self, _log: &str, _line: &str) -> Option<Result<(), String>> {
+        None
+    }
 }
 
 thread_local! {

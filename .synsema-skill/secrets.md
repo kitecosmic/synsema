@@ -28,6 +28,11 @@ secret("STRIPE_API_KEY") not permitted: missing capability —
   add `require secret("STRIPE_API_KEY")` (or a prefix: `require secret("STRIPE_*")`)
 ```
 
+If the `require` is there but the HOST ceiling (`--sandbox`/`--cap-set`/embedder `ceiling`)
+does not lend it, the error is different on purpose — *declared but above the host ceiling
+(--sandbox/--cap-set). The program cannot fix this; the host must widen the ceiling* — so an
+agent never "repairs" the code by re-adding a `require` it already has.
+
 ### Resolution order (highest priority first)
 
 1. **Process environment** (`X=… synsema run app.syn`, systemd `Environment=`, Docker `-e`) — always wins, so prod overrides without touching the repo.

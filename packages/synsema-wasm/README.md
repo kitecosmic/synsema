@@ -14,7 +14,9 @@ await syn.ready();
 const r = syn.run(`print(keccak256("hola"))`);
 r.output;  // ["…"]  — the program's print lines
 r.errors;  // []     — parse/runtime errors are data, never exceptions
-r.audit;   // every capability check the program made
+r.audit;   // every capability check: {capability, granted, source, reason, origin}
+           // origin: "program" (asked/called by the program) | "runtime" (ambient host grant)
+           // sign/spend/wallet/reveal need an audit sink: offer `kv` (namespace "audit") or they refuse
 ```
 
 ## Lending capabilities (the host)

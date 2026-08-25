@@ -202,7 +202,12 @@ fn env_update(env: &Rc<RefCell<Environment>>, name: &str, value: SynValue) -> Re
 /// produce un error atrapable. NOTA paridad: Python lanza RecursionError a una
 /// profundidad distinta (~100-150 niveles de task por su recursionlimit=1000).
 /// El corpus no prueba el límite exacto; divergencia documentada.
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_RECURSION: usize = 3000;
+/// wasm32: el stack es lineal (fijado al linkear, ver `engine/.cargo/config.toml`) y un
+/// overflow es un TRAP que descarta la instancia del embebedor — el guard salta antes.
+#[cfg(target_arch = "wasm32")]
+const MAX_RECURSION: usize = 600;
 
 /// Hook que el host (motor) cablea para que `require <tipo>(<scope>)` conceda en
 /// el `CapabilitySet` real (que vive fuera de core, para evitar el ciclo de deps).

@@ -2044,7 +2044,7 @@ fn make_serve_hook(
             // El operador que pasa `--port` es la autoridad: se concede `serve(N)`, así
             // que el `require serve(...)` del archivo no necesita coincidir.
             Some(p) => {
-                caps.borrow_mut().grant(Capability::new(CapabilityType::Serve, Some(p.to_string())));
+                caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Serve, Some(p.to_string())));
                 p as i64
             }
             None => {

@@ -128,6 +128,7 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | I declared `route "GET /docs"` and the API page vanished | Your route/static file wins over every generated document (`/llms.txt`, `/openapi.json`, `/docs`…) | Intended; rename your route, or use `docs off` if you only wanted the page gone |
 | `/sitemap.xml` lacks `/blog/:slug` | Parametric routes are never expanded (the runtime can't know the slugs); auth/stream/proxy routes are excluded too | Expected — declare literal routes for pages you want listed |
 | `x-synsema-capabilities` lists `net` for a route that never called `fetch` | It's static: the `require` of every task the route may call, transitively, plus builtin implications | Expected — it's the contract, not a trace; the runtime still gates each call |
+| `this host provides no audit sink for sign.log` (wasm) | `sign`/`spend`/`wallet`/`reveal` need an audit line; a wasm host has no files | Offer `kv` to the embedded runtime — the line lands in `kv` under the `audit` namespace |
 | `synsema openapi` exits 2 | The file has no `serve` block (or the path is missing) | Point it at the entry file that serves |
 | `describe`/`private`/`docs` can't be used as variable names | They're soft keywords — only special in a serve block | `let private be 1`, `let docs be 2` and `let describe be x` are still valid |
 | CSS `body { }` inline in a `render()` template breaks | `{`/`}` are template hole delimiters | Wrap the CSS/JS block in `{ raw }` … `{ end }` (verbatim), or serve it from `static`; single literal brace via `{ "{" }` |
@@ -334,6 +335,7 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | Committing `.env` | Leaks real secrets into git history | `.gitignore` the `.env`; commit a `.env.example` with keys (no values) |
 | `print(my_secret)` to debug | You only ever see `secret(NAME)` (redacted by design) | That's expected — secrets never print their value. If you truly need the value, `reveal()` (audited). |
 | `secret("X")` without `require secret("X")` | `secret("X") not permitted: missing capability` | Add `require secret("X")` (or a `require secret("X_*")` prefix). Same for `env`. |
+| `… not permitted: declared but above the host ceiling (--sandbox/--cap-set)` | The `require` IS there; the HOST's ceiling (`--sandbox`, `--cap-set`, the embedder's `ceiling`) does not lend it | Nothing to change in the program — do NOT add the `require` again (loop). The host widens the ceiling or the call stays denied. Same text for `net`/`db`/`file`… via `Capability not granted: … — declared but above the host ceiling` |
 | Comparing a secret with `==` in a loop over guesses | Fine — `==` on a secret is constant-time | For HMAC/signature checks use `verify_hmac` (also constant-time) |
 | Expecting `env("X")` to return `nothing` when unset | It raises a clear error (fail-loud) | Pass a default: `env("X", "devvalue")`, or set it in `.env`/the environment |
 | Putting a secret in a query param or JSON body | Redacted (fail-closed) → the upstream gets `secret(NAME)` | Send credentials via a header: `{"Authorization": bearer(secret("KEY"))}` |

@@ -64,6 +64,8 @@ export interface AuditEntry {
   granted: boolean;
   source: string;
   reason: string;
+  /** "program" (the program asked or called) or "runtime" (an ambient host grant, e.g. time/llm under a ceiling). */
+  origin: "program" | "runtime";
 }
 
 export interface RunResult {

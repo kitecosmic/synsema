@@ -36,7 +36,7 @@ use std::sync::{Mutex, OnceLock};
 
 use rust_decimal::Decimal;
 
-use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
+use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType, DenyCause};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::number::Number;
 use synsema_core::tokens::SourceLocation;
@@ -301,7 +301,10 @@ fn amount_to_decimal(n: &Number) -> Result<Decimal, String> {
     })
 }
 
-fn spend_cap_denied(unit: &str) -> Control {
+fn spend_cap_denied(unit: &str, cause: DenyCause) -> Control {
+    if cause == DenyCause::AboveCeiling {
+        return err(format!("Capability not granted: spend(\"{unit}\") — declared but above the host ceiling (--sandbox/--cap-set). The program cannot fix this; the host must widen the ceiling"));
+    }
     err(format!(
         "Capability not granted: spend(\"{unit}\") — add `require spend(\"{unit}\")` \
          (spending is deny-by-default and writes a persistent audit entry)"
@@ -385,10 +388,10 @@ pub fn register_spend_builtins(interp: &Interpreter, caps: Rc<RefCell<Capability
 
             // 2) Capability `spend(unidad)` — el chequeo queda en el audit-log del
             // CapabilitySet; concedida O denegada se registra también en spend.log.
-            let granted = caps
+            let checked = caps
                 .borrow_mut()
-                .check(&Capability::new(CapabilityType::Spend, Some(unit.clone())), "spend-builtin");
-            if !granted {
+                .check_cause(&Capability::new(CapabilityType::Spend, Some(unit.clone())), "spend-builtin");
+            if let Err(cause) = checked {
                 // 3) Denegación por capability: auditada best-effort (el gasto ya no ocurre).
                 let _ = write_spend_audit_for(
                     identity.as_deref(),
@@ -399,7 +402,7 @@ pub fn register_spend_builtins(interp: &Interpreter, caps: Rc<RefCell<Capability
                     false,
                     false,
                 );
-                return Err(spend_cap_denied(&unit));
+                return Err(spend_cap_denied(&unit, cause));
             }
 
             // 4-6) Techo + audit + acumulación BAJO EL MISMO LOCK: sin ventana entre el

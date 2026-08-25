@@ -1,0 +1,9 @@
+# Targets wasm: el stack de un módulo es memoria lineal fijada al linkear (default 1 MB).
+# El intérprete es tree-walking y recursivo: con 1 MB una recursión de ~200 niveles
+# desborda y el TRAP descarta la instancia entera del embebedor (sin pasar por el guard
+# `MAX_RECURSION`). 64 MB deja el guard (600 niveles bajo wasm32) por debajo del overflow.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-zstack-size=67108864"]
+
+[target.wasm32-wasip1]
+rustflags = ["-C", "link-arg=-zstack-size=67108864"]

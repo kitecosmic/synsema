@@ -38,7 +38,7 @@ use sha2::{Digest, Sha256, Sha512, Sha512_256};
 use sha3::Keccak256;
 use zeroize::Zeroize;
 
-use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
+use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType, DenyCause};
 use synsema_core::interpreter::{Control, Interpreter};
 use synsema_core::secret::constant_time_eq;
 use synsema_core::tokens::SourceLocation;
@@ -54,7 +54,10 @@ type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 // Gate + audit de custodia (G20)
 // =========================================================
 
-fn wallet_denied(name: &str) -> Control {
+fn wallet_denied(name: &str, cause: DenyCause) -> Control {
+    if cause == DenyCause::AboveCeiling {
+        return err(format!("wallet not permitted: wallet(\"{name}\") is declared but above the host ceiling (--sandbox/--cap-set). The program cannot fix this; the host must widen the ceiling"));
+    }
     err(format!(
         "wallet not permitted: Capability not granted: wallet(\"{name}\") — \
          add `require wallet(\"{name}\")` or a bare `require wallet` (creating key \
@@ -72,13 +75,13 @@ pub(crate) fn gate_wallet(
     op: &str,
     loc: &SourceLocation,
 ) -> Result<(), Control> {
-    let granted = caps
+    let checked = caps
         .borrow_mut()
-        .check(&Capability::new(CapabilityType::Wallet, Some(name.to_string())), "wallet-builtin");
-    if !granted {
+        .check_cause(&Capability::new(CapabilityType::Wallet, Some(name.to_string())), "wallet-builtin");
+    if let Err(cause) = checked {
         // Auditar el intento DENEGADO (best-effort: ya se rechaza igual).
         let _ = write_wallet_audit(name, op, loc, false);
-        return Err(wallet_denied(name));
+        return Err(wallet_denied(name, cause));
     }
     write_wallet_audit(name, op, loc, true).map_err(|e| {
         err(format!(

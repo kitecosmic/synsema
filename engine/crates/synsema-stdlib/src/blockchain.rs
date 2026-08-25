@@ -30,7 +30,7 @@ use k256::ecdsa::{RecoveryId, Signature as EcSignature, SigningKey as EcSigningK
 use sha3::{Digest, Keccak256};
 use zeroize::Zeroize;
 
-use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
+use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType, DenyCause};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::number::Number;
 use synsema_core::tokens::SourceLocation;
@@ -124,7 +124,10 @@ pub(crate) fn key_material(v: &SynValue, fname: &str) -> Result<(String, Vec<u8>
 // Gate + audit de la firma (decisión #2 / G3)
 // =========================================================
 
-fn sign_denied(name: &str) -> Control {
+fn sign_denied(name: &str, cause: DenyCause) -> Control {
+    if cause == DenyCause::AboveCeiling {
+        return err(format!("sign not permitted: sign(\"{name}\") is declared but above the host ceiling (--sandbox/--cap-set). The program cannot fix this; the host must widen the ceiling"));
+    }
     err(format!(
         "sign not permitted: Capability not granted: sign(\"{name}\") — \
          add `require sign(\"{name}\")` (signing moves value: it is deny-by-default and writes a persistent audit entry)"
@@ -141,13 +144,13 @@ pub(crate) fn gate_and_audit(
     curve: &str,
     loc: &SourceLocation,
 ) -> Result<(), Control> {
-    let granted = caps
+    let checked = caps
         .borrow_mut()
-        .check(&Capability::new(CapabilityType::Sign, Some(name.to_string())), "sign-builtin");
-    if !granted {
+        .check_cause(&Capability::new(CapabilityType::Sign, Some(name.to_string())), "sign-builtin");
+    if let Err(cause) = checked {
         // Auditar el intento DENEGADO (best-effort: ya se rechaza igual).
         let _ = write_sign_audit(name, curve, loc, false);
-        return Err(sign_denied(name));
+        return Err(sign_denied(name, cause));
     }
     // Techo de CANTIDAD de firmas del host (`SYNSEMA_SIGN_CEILING`, FRAMEWORK F1/F-C):
     // chequea y reserva el cupo ANTES del audit concedido. Sin config → no-op

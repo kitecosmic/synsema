@@ -164,6 +164,8 @@ jobs:
         run: cargo build --locked --manifest-path engine/Cargo.toml -p synsema-cli
       - name: Probe under Node (API, host hooks, handler-mode, async bridge, parity)
         run: node tests/wasm_web.probe.mjs engine/target/wasm32-unknown-unknown/wasm/synsema_wasm_web.wasm engine/target/debug/synsema
+      - name: Probe under Node (everyday: secrets, sign/spend/wallet under a ceiling, audit origin, bounded http, handler, no traps)
+        run: node tests/wasm_everyday.probe.mjs engine/target/wasm32-unknown-unknown/wasm/synsema_wasm_web.wasm
       - name: Probe under Python (wasmtime-py)
         run: |
           pip install wasmtime

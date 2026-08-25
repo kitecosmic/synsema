@@ -384,12 +384,12 @@ pub(crate) fn wire_common_with_state(
     mem: Option<MemoryCtx>,
 ) {
     if !secure {
-        caps.borrow_mut().grant(Capability::new(CapabilityType::Stdout, None));
-        caps.borrow_mut().grant(Capability::new(CapabilityType::Time, None));
+        caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Stdout, None));
+        caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Time, None));
         // Las ops LLM (reason/decide/analyze/generate) exigen la capability `llm`
         // (gateadas más abajo). En no-secure se auto-concede como stdout/time, por
         // ergonomía + retrocompat; en secure/serve hay que declarar `require llm`.
-        caps.borrow_mut().grant(Capability::new(CapabilityType::Llm, None));
+        caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Llm, None));
     }
     register_secure_builtins(interp, caps.clone());
     // Secretos/env: carga el `.env` (antes de evaluar require/serve) y registra

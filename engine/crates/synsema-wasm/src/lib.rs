@@ -112,6 +112,8 @@ pub struct AuditEntry {
     pub granted: bool,
     pub source: String,
     pub reason: String,
+    /// `"program"` (the program asked / called) or `"runtime"` (an ambient host grant).
+    pub origin: String,
 }
 
 fn export_audit(caps: &Rc<RefCell<CapabilitySet>>) -> Vec<AuditEntry> {
@@ -123,6 +125,7 @@ fn export_audit(caps: &Rc<RefCell<CapabilitySet>>) -> Vec<AuditEntry> {
             granted: e.granted,
             source: e.source.clone(),
             reason: e.reason.clone(),
+            origin: e.origin.to_string(),
         })
         .collect()
 }
@@ -277,9 +280,9 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
 
     // No-secure (paridad con `synsema run`): stdout/time/llm auto-concedidas; el
     // resto lo conceden los `require` del programa vía el grant hook de abajo.
-    caps.borrow_mut().grant(Capability::new(CapabilityType::Stdout, None));
-    caps.borrow_mut().grant(Capability::new(CapabilityType::Time, None));
-    caps.borrow_mut().grant(Capability::new(CapabilityType::Llm, None));
+    caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Stdout, None));
+    caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Time, None));
+    caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Llm, None));
 
     register_secure_builtins(interp, caps.clone());
     if ctx.no_fs {
