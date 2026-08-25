@@ -137,12 +137,16 @@ jobs:
             synsema-wasm-web.wasm.sha256
       # npm: @synsema/wasm con el MISMO .wasm del release adentro (el package.json lo lista
       # en `files`; en el repo está gitignoreado). La versión es la del tag sin la `v`.
-      # Requiere el secret NPM_TOKEN (granular, scope @synsema, bypass 2FA).
+      # Sin token: TRUSTED PUBLISHING (OIDC) — npm confía en este workflow de este repo
+      # (configurado en npmjs.com → paquete → Settings → Trusted Publisher: kitecosmic/synsema,
+      # release.yml). Los tokens que saltean 2FA están deprecados (EOTP en CI); el primer
+      # publish (0.6.1) fue manual, como exige npm para poder configurar el trusted publisher.
+      # Requiere npm ≥ 11.5.1 (el de Node 22 es 10.x).
       - name: Publish @synsema/wasm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
+          npm install -g npm@latest
+          npm --version
           cp synsema-wasm-web.wasm packages/synsema-wasm/synsema.wasm
           cd packages/synsema-wasm
           npm version --no-git-tag-version "${GITHUB_REF_NAME#v}"
