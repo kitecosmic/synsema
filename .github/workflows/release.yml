@@ -106,8 +106,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Provenance de npm: el paquete queda firmado como "construido por este workflow".
+      id-token: write
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-wasip1,wasm32-unknown-unknown
@@ -129,6 +135,18 @@ jobs:
             synsema-wasm-wasip1.wasm.sha256
             synsema-wasm-web.wasm
             synsema-wasm-web.wasm.sha256
+      # npm: @synsema/wasm con el MISMO .wasm del release adentro (el package.json lo lista
+      # en `files`; en el repo está gitignoreado). La versión es la del tag sin la `v`.
+      # Requiere el secret NPM_TOKEN (granular, scope @synsema, bypass 2FA).
+      - name: Publish @synsema/wasm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          cp synsema-wasm-web.wasm packages/synsema-wasm/synsema.wasm
+          cd packages/synsema-wasm
+          npm version --no-git-tag-version "${GITHUB_REF_NAME#v}"
+          npm publish --provenance --access public
 
   # NOTE: aarch64-linux is deferred (needs a C cross-toolchain for rusqlite's bundled
   # SQLite). Add it later via `cross` or a gcc-aarch64 setup if there's demand.
