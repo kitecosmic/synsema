@@ -97,13 +97,14 @@ fn redirect_builtin_and_vhost_e2e() {
     assert!(r.contains("location: https://example.com/new"), "head location: {}", r);
 
     // Selección de vhost por header Host (HTTP/1.1): www.example.com → catch-all que redirige.
-    let r = request(port, "GET", "/docs", "www.example.com");
+    let r = request(port, "GET", "/guide", "www.example.com");
     assert!(r.starts_with("http/1.1 301"), "vhost status: {}", r);
-    assert!(r.contains("location: https://example.com/docs"), "vhost location: {}", r);
+    assert!(r.contains("location: https://example.com/guide"), "vhost location: {}", r);
 
     // El mismo path en el host por defecto (apex) NO matchea el catch-all del vhost → 404.
-    let r = request(port, "GET", "/docs", "127.0.0.1");
-    assert!(r.starts_with("http/1.1 404"), "apex /docs debería ser 404: {}", r);
+    // (`/guide`, no `/docs`: ese path lo publica el server solo — discovery.)
+    let r = request(port, "GET", "/guide", "127.0.0.1");
+    assert!(r.starts_with("http/1.1 404"), "apex /guide debería ser 404: {}", r);
 
     // El bare root `/` del vhost también redirige: el catch-all `*path` NO matchea `/`,
     // así que el vhost necesita su `route "GET /"` explícita (caso más común).

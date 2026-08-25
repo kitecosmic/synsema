@@ -25,6 +25,7 @@ pub mod charts;
 pub mod cron;
 #[cfg(feature = "native")]
 pub mod database;
+pub mod discovery;
 pub mod hashing;
 /// Protocolo host↔intérprete (F2): capabilities que un embebedor OFRECE (http/kv/llm/log).
 pub mod hostcap;

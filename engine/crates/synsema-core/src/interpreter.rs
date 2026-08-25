@@ -153,7 +153,9 @@ impl Environment {
     }
 }
 
-pub(crate) fn env_get(env: &Rc<RefCell<Environment>>, name: &str) -> Option<SynValue> {
+/// Búsqueda léxica (el scope actual y sus padres). Pública para el análisis
+/// estático de rutas (`route_meta::env_lookup`).
+pub fn env_get(env: &Rc<RefCell<Environment>>, name: &str) -> Option<SynValue> {
     let mut cur = env.clone();
     loop {
         let next = {

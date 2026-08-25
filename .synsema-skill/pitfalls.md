@@ -123,8 +123,13 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `/blog/hola.json` runs `:slug` = "hola.json" | The `.md`/`.json`/`.html` suffix is stripped first; slug is "hola" | Expected for `content()` routes; a real `hola.json` file or a literal route wins |
 | `Accept: text/markdown` changes my JSON/`{map}` route | Negotiation applies **only** to `content()` values | Wrap the tree in `content(...)`; plain `give {map}` is always JSON |
 | `give heading(...)` renders an HTML heading | Without `content()` a node degrades to its **JSON** form | Wrap the tree in `content(page([...]))` to get HTML/Markdown |
-| My internal server exposes `/llms.txt` with all its routes | `/llms.txt` + `/robots.txt` are ON by default (agent-discoverable) | Add `private` to the serve block: `/llms.txt` → 404, robots `Disallow: /` |
-| `describe`/`private` can't be used as variable names | They're soft keywords — only special in a serve block | `let private be 1` and `let describe be x` are still valid |
+| My internal server exposes `/llms.txt` with all its routes | `/llms.txt`, `/robots.txt`, `/sitemap.xml`, `/openapi.json` and `/docs` are ON by default (agent-discoverable) | Add `private` to the serve block: the generated documents → 404, robots `Disallow: /` (`docs off` removes only the `/docs` page) |
+| `/openapi.json` shows no `requestBody` for my route | Only a **top-level** `expect body` in the route is a contract; one inside a `when` is a branch | Move the `expect` to the top of the route body |
+| I declared `route "GET /docs"` and the API page vanished | Your route/static file wins over every generated document (`/llms.txt`, `/openapi.json`, `/docs`…) | Intended; rename your route, or use `docs off` if you only wanted the page gone |
+| `/sitemap.xml` lacks `/blog/:slug` | Parametric routes are never expanded (the runtime can't know the slugs); auth/stream/proxy routes are excluded too | Expected — declare literal routes for pages you want listed |
+| `x-synsema-capabilities` lists `net` for a route that never called `fetch` | It's static: the `require` of every task the route may call, transitively, plus builtin implications | Expected — it's the contract, not a trace; the runtime still gates each call |
+| `synsema openapi` exits 2 | The file has no `serve` block (or the path is missing) | Point it at the entry file that serves |
+| `describe`/`private`/`docs` can't be used as variable names | They're soft keywords — only special in a serve block | `let private be 1`, `let docs be 2` and `let describe be x` are still valid |
 | CSS `body { }` inline in a `render()` template breaks | `{`/`}` are template hole delimiters | Wrap the CSS/JS block in `{ raw }` … `{ end }` (verbatim), or serve it from `static`; single literal brace via `{ "{" }` |
 | `<script>const D = { raw json_encode(x) };</script>` is safe | It's XSS — a value containing `</script>` breaks out of the tag | Use `{ raw json_for_script(x) }` (escapes `<`/`>`/`&` as `\u00XX`) |
 | User HTML in `{ expr }` renders as a live tag | `render()` auto-escapes every hole (XSS-safe) | Use `{ raw expr }` for trusted HTML on purpose |

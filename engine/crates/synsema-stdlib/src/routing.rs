@@ -543,6 +543,10 @@ pub struct RouteSpec {
     pub stream_handler: Option<StreamHandler>,
     /// Lote 2 — reverse proxy: si está, la route forwardea al upstream (URL base).
     pub proxy_target: Option<String>,
+    /// `rate_limit unlimited` explícito (para `/openapi.json`; el limiter ya lo trata como None).
+    pub rate_unlimited: bool,
+    /// Metadatos estáticos (expect/respuesta/capabilities) para `/openapi.json` y `/docs`.
+    pub meta: synsema_core::route_meta::RouteMeta,
 }
 
 /// Cuerpo de una respuesta HTTP.

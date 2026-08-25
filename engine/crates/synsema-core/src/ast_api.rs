@@ -230,13 +230,10 @@ fn children(n: &Node) -> Vec<&Node> {
             }
             v
         }
-        DescribeClause { about, api } => {
+        DescribeClause { about, api, version } => {
             let mut v = Vec::new();
-            if let Some(a) = about {
-                v.push(a.as_ref());
-            }
-            if let Some(a) = api {
-                v.push(a.as_ref());
+            for b in [about, api, version].into_iter().flatten() {
+                v.push(b.as_ref());
             }
             v
         }
@@ -707,13 +704,10 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
             }
             v
         }
-        DescribeClause { about, api } => {
+        DescribeClause { about, api, version } => {
             let mut v = Vec::new();
-            if let Some(a) = about {
-                v.push(a.as_mut());
-            }
-            if let Some(a) = api {
-                v.push(a.as_mut());
+            for b in [about, api, version].into_iter().flatten() {
+                v.push(b.as_mut());
             }
             v
         }

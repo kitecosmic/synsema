@@ -1667,6 +1667,10 @@ fn build_host_table(
         } = &r.kind
         {
             let rc = resolve_rate(interp, env, rate_limit.as_deref())?;
+            let rate_unlimited = matches!(rc, Some(RateKind::Unlimited));
+            // Metadatos estáticos para /openapi.json y /docs (expect, respuesta,
+            // capabilities transitivas): del AST + el entorno ya evaluado.
+            let meta = synsema_core::route_meta::route_meta(body, *streaming, &synsema_core::route_meta::env_lookup(env));
             let (eff_rate, zone) = match rc {
                 None => match block_limit {
                     Some(bl) => (Some(bl), Some("__default__".to_string())),
@@ -1742,6 +1746,8 @@ fn build_host_table(
                 handler,
                 stream_handler,
                 proxy_target,
+                rate_unlimited,
+                meta,
             });
         }
     }
@@ -1825,6 +1831,19 @@ fn build_host_table(
                 };
                 let source_c = source.as_ref().clone();
                 let key = format!("_route_handler_{}", i);
+                // El cuerpo de una ruta montada vive en su handler-task (cierra sobre el
+                // env del módulo): de ahí salen expect/respuesta/capabilities.
+                let meta = match &group {
+                    SynValue::Map(m) => match m.borrow().get(&key) {
+                        Some(SynValue::Task(t)) => synsema_core::route_meta::route_meta(
+                            &t.body,
+                            false,
+                            &synsema_core::route_meta::env_lookup(&t.closure_env),
+                        ),
+                        _ => Default::default(),
+                    },
+                    _ => Default::default(),
+                };
                 let swarm_c = swarm.clone();
                 let snap_c = snapshot.clone();
                 let caps_c = caps_snap.clone();
@@ -1855,6 +1874,8 @@ fn build_host_table(
                     handler,
                     stream_handler: None,
                     proxy_target: None,
+                    rate_unlimited: false,
+                    meta,
                 });
             }
         }
@@ -1962,6 +1983,7 @@ fn make_serve_hook(
             cors_n,
             describe_n,
             private,
+            docs_off,
             routes_n,
             tls_cert_n,
             tls_key_n,
@@ -1983,6 +2005,7 @@ fn make_serve_hook(
                 cors,
                 describe,
                 private,
+                docs_off,
                 routes,
                 tls_cert,
                 tls_key,
@@ -2003,6 +2026,7 @@ fn make_serve_hook(
                 cors.as_deref(),
                 describe.as_deref(),
                 *private,
+                *docs_off,
                 routes,
                 tls_cert.as_deref(),
                 tls_key.as_deref(),
@@ -2089,11 +2113,15 @@ fn make_serve_hook(
             Some(c) => Some(interp.eval(c, env)?.to_string()),
             None => None,
         };
-        let (describe_about, describe_api) = match describe_n {
+        let (describe_about, describe_api, describe_version) = match describe_n {
             Some(d) => {
-                if let NodeKind::DescribeClause { about, api } = &d.kind {
+                if let NodeKind::DescribeClause { about, api, version } = &d.kind {
                     let about_s = match about {
                         Some(a) => Some(interp.eval(a, env)?.to_string()),
+                        None => None,
+                    };
+                    let version_s = match version {
+                        Some(v) => Some(interp.eval(v, env)?.to_string()),
                         None => None,
                     };
                     let api_v = match api {
@@ -2103,12 +2131,12 @@ fn make_serve_hook(
                         },
                         None => Vec::new(),
                     };
-                    (about_s, api_v)
+                    (about_s, api_v, version_s)
                 } else {
-                    (None, Vec::new())
+                    (None, Vec::new(), None)
                 }
             }
-            None => (None, Vec::new()),
+            None => (None, Vec::new(), None),
         };
 
         // Snapshot de globales (una vez, ya corrió el top-level): cada request lo
@@ -2416,6 +2444,11 @@ fn make_serve_hook(
             secure,
         );
         runtime.tls_enabled = use_tls;
+        // Discovery: base URL absoluta (sitemap/openapi/robots), versión del API y
+        // si la página /docs está encendida.
+        runtime.domain = acme_domains.first().cloned();
+        runtime.describe_version = describe_version;
+        runtime.docs_enabled = !docs_off;
         // `errors with <task>`: páginas de error propias (401/404/405/500).
         if let Some(h) = error_handler {
             runtime.set_error_handler(h);

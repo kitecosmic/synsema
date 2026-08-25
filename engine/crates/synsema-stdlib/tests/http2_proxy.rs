@@ -92,6 +92,8 @@ fn reverse_proxy_forwards_to_upstream() {
         handler: dummy_handler(),
         stream_handler: None,
         proxy_target: Some(format!("http://127.0.0.1:{}", up)),
+        rate_unlimited: false,
+        meta: Default::default(),
     };
     let rt = empty_rt(vec![route], false);
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -213,6 +215,8 @@ fn vhost_selected_by_authority_over_http2() {
         handler: dummy_handler(),
         stream_handler: None,
         proxy_target: None,
+        rate_unlimited: false,
+        meta: Default::default(),
     };
     // vhost www.example.com: catch-all que redirige 301.
     let redir: Handler = Arc::new(|_ctx| {
@@ -233,6 +237,8 @@ fn vhost_selected_by_authority_over_http2() {
         handler: redir,
         stream_handler: None,
         proxy_target: None,
+        rate_unlimited: false,
+        meta: Default::default(),
     };
     let mut rtm = ServeRuntime::new(
         0,

@@ -32,7 +32,10 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 
+use synsema_core::route_meta::ApiRoute;
 use synsema_core::types::{ServerValue, SynValue};
+
+use crate::discovery::{self, ApiInfo};
 
 // =========================================================
 // Constantes
@@ -558,6 +561,12 @@ pub struct ServeRuntime {
     describe_about: Option<String>,
     describe_api: Vec<String>,
     private: bool,
+    /// `domain` del serve block → base URL absoluta de sitemap/openapi (si no, `Host`).
+    pub domain: Option<String>,
+    /// `describe version: "…"` → `info.version` de `/openapi.json` (default "0.0.0").
+    pub describe_version: Option<String>,
+    /// `docs off` apaga la página `/docs` (el `/openapi.json` sigue publicado).
+    pub docs_enabled: bool,
     rate_limiter: RateLimiter,
     active_streams: Mutex<i64>,
     /// `errors with <task>` (serve-level): da forma a 401/404/405/500.
@@ -602,6 +611,9 @@ impl ServeRuntime {
             describe_about,
             describe_api,
             private,
+            domain: None,
+            describe_version: None,
+            docs_enabled: true,
             rate_limiter: RateLimiter::new(),
             active_streams: Mutex::new(0),
             error_handler: None,
@@ -673,12 +685,58 @@ impl ServeRuntime {
 
     // -- discoverability --
 
-    fn llms_txt(&self) -> String {
-        let title = self
-            .describe_about
-            .clone()
-            .or_else(|| self.intent.clone())
-            .unwrap_or_else(|| "Synsema service".to_string());
+    /// Base URL absoluta (spec discovery §1.3): `domain` del serve block si está; si
+    /// no, el `Host` de la request. Esquema: https si hay TLS o el proxy de adelante
+    /// dice `X-Forwarded-Proto: https`. Sin `Host` ni `domain` no hay verdad → None.
+    fn base_url(&self, headers: &[(String, String)]) -> Option<String> {
+        let fwd = header_value(headers, "x-forwarded-proto");
+        let https = self.tls_enabled
+            || fwd.split(',').next().map(|s| s.trim().eq_ignore_ascii_case("https")).unwrap_or(false);
+        let host = match &self.domain {
+            Some(d) => d.clone(),
+            None => {
+                let h = header_value(headers, "host");
+                if h.is_empty() {
+                    return None;
+                }
+                h
+            }
+        };
+        Some(format!("{}://{}", if https { "https" } else { "http" }, host))
+    }
+
+    /// La tabla de un host como rutas "secas" (lo que discovery emite).
+    fn api_routes(host: &HostRouter) -> Vec<ApiRoute> {
+        host.routes
+            .iter()
+            .map(|r| ApiRoute {
+                method: r.method.clone(),
+                path: r.path.clone(),
+                param_names: r.param_names.clone(),
+                requires_auth: r.requires_auth,
+                streaming: r.streaming,
+                rate_limit: r.rate_limit,
+                rate_unlimited: r.rate_unlimited,
+                proxy: r.proxy_target.is_some(),
+                meta: r.meta.clone(),
+            })
+            .collect()
+    }
+
+    fn api_info(&self, host: &HostRouter, headers: &[(String, String)]) -> ApiInfo {
+        let title = ApiInfo::title_of(self.describe_about.as_deref(), self.intent.as_deref());
+        ApiInfo {
+            title,
+            description: self.intent.clone(),
+            version: self.describe_version.clone().unwrap_or_else(|| "0.0.0".to_string()),
+            base_url: self.base_url(headers),
+            has_auth: host.auth_handler.is_some() && host.routes.iter().any(|r| r.requires_auth),
+            describe_api: self.describe_api.clone(),
+        }
+    }
+
+    fn llms_txt(&self, host: &HostRouter) -> String {
+        let title = ApiInfo::title_of(self.describe_about.as_deref(), self.intent.as_deref());
         let mut lines = vec![format!("# {}", title)];
         if let Some(intent) = &self.intent {
             if *intent != title {
@@ -686,15 +744,19 @@ impl ServeRuntime {
                 lines.push(format!("> {}", intent));
             }
         }
-        let mut endpoints: Vec<(String, String)> =
-            self.default_host.routes.iter().map(|r| (r.method.clone(), r.path.clone())).collect();
-        endpoints.sort_by_key(|a| (a.1.clone(), a.0.clone()));
+        let routes = Self::api_routes(host);
+        let mut endpoints: Vec<(String, String, String)> = routes
+            .iter()
+            .map(|r| (r.path.clone(), r.method.clone(), discovery::caps_suffix(r)))
+            .collect();
+        endpoints.sort();
         endpoints.dedup();
         if !endpoints.is_empty() {
             lines.push(String::new());
             lines.push("## Endpoints".to_string());
-            for (m, p) in &endpoints {
-                lines.push(format!("- {} {}", m, p));
+            for (p, m, caps) in &endpoints {
+                // Sufijo `[net:host, llm]`: lo que la ruta PUEDE tocar según su contrato.
+                lines.push(format!("- {} {}{}", m, p, caps));
             }
         }
         if !self.describe_api.is_empty() {
@@ -704,14 +766,24 @@ impl ServeRuntime {
                 lines.push(format!("- {}", item));
             }
         }
+        lines.push(String::new());
+        lines.push("## Machine-readable".to_string());
+        lines.push("- /openapi.json".to_string());
+        if self.docs_enabled {
+            lines.push("- /docs".to_string());
+        }
+        lines.push("- /sitemap.xml".to_string());
+        lines.push("- /.well-known/synsema-auth".to_string());
         lines.join("\n") + "\n"
     }
 
-    fn robots_txt(&self) -> String {
+    fn robots_txt(&self, base: Option<&str>) -> String {
         if self.private {
-            "User-agent: *\nDisallow: /\n".to_string()
-        } else {
-            "User-agent: *\nAllow: /\n".to_string()
+            return "User-agent: *\nDisallow: /\n".to_string();
+        }
+        match base {
+            Some(b) => format!("User-agent: *\nAllow: /\nSitemap: {}/sitemap.xml\n", b),
+            None => "User-agent: *\nAllow: /\n".to_string(),
         }
     }
 
@@ -784,9 +856,40 @@ impl ServeRuntime {
         ]))
     }
 
-    fn discovery_response(&self, path: &str) -> Option<RawResponse> {
+    /// Las superficies auto-generadas. Se consultan DESPUÉS de las rutas declaradas
+    /// y de los estáticos (dispatch), así una `route "GET /docs"` propia gana. Con
+    /// `private` sólo queda `/robots.txt` (y dice `Disallow: /`).
+    fn discovery_response(
+        &self,
+        path: &str,
+        headers: &[(String, String)],
+        host: &HostRouter,
+    ) -> Option<RawResponse> {
         if path == "/llms.txt" && !self.private {
-            return Some(RawResponse::text(self.llms_txt(), "text/plain; charset=utf-8", 200));
+            return Some(RawResponse::text(self.llms_txt(host), "text/plain; charset=utf-8", 200));
+        }
+        if path == "/openapi.json" && !self.private {
+            let info = self.api_info(host, headers);
+            let doc = discovery::openapi_json(&info, &Self::api_routes(host));
+            return Some(RawResponse::text(dumps(&doc), "application/json; charset=utf-8", 200));
+        }
+        if path == "/sitemap.xml" && !self.private {
+            let base = self.base_url(headers)?;
+            return Some(RawResponse::text(
+                discovery::sitemap_xml(&base, &Self::api_routes(host)),
+                "application/xml; charset=utf-8",
+                200,
+            ));
+        }
+        if path == "/docs" && !self.private && self.docs_enabled {
+            // Negociada como `content()`: HTML para humanos, Markdown para agentes.
+            let info = self.api_info(host, headers);
+            let fmt = negotiate_format(&header_value(headers, "accept"));
+            return Some(if fmt == "md" {
+                RawResponse::text(discovery::docs_markdown(&info, &Self::api_routes(host)), "text/markdown; charset=utf-8", 200)
+            } else {
+                RawResponse::text(discovery::docs_html(&info), "text/html; charset=utf-8", 200)
+            });
         }
         // Mismo criterio de `private` que /llms.txt: un server interno no publica
         // su superficie de auth.
@@ -798,7 +901,8 @@ impl ServeRuntime {
             ));
         }
         if path == "/robots.txt" {
-            return Some(RawResponse::text(self.robots_txt(), "text/plain; charset=utf-8", 200));
+            let base = self.base_url(headers);
+            return Some(RawResponse::text(self.robots_txt(base.as_deref()), "text/plain; charset=utf-8", 200));
         }
         None
     }
@@ -1142,7 +1246,7 @@ impl ServeRuntime {
                             };
                         }
                     }
-                    if let Some(disc) = self.discovery_response(path) {
+                    if let Some(disc) = self.discovery_response(path, &headers, host) {
                         return resp(disc.status, ResponseBody::Raw(disc));
                     }
                 }

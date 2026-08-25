@@ -16,6 +16,7 @@ pub mod lexer;
 pub mod math;
 pub mod number;
 pub mod parser;
+pub mod route_meta;
 pub mod secret;
 pub mod templates;
 pub mod testgen;

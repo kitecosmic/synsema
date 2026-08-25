@@ -1,0 +1,17 @@
+-- Módulo del fixture de discovery: un grupo `export routes` con una task privada
+-- que declara capabilities (deben llegar a la ruta montada, transitivamente).
+
+task load(id)
+    require db("./shop.db")
+    give sql("select 1")
+
+export routes tienda
+    route "GET /shop"
+        give html("<h1>Shop</h1>")
+
+    route "GET /shop/:id"
+        give load(params.id)
+
+    route "POST /shop/buy"
+        expect body {item: text}
+        give {"bought": true}

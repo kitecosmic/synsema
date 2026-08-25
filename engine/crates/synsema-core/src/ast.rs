@@ -399,6 +399,8 @@ pub enum NodeKind {
     DescribeClause {
         about: Option<Box<Node>>,
         api: Option<Box<Node>>,
+        /// `version: "1.2.0"` → `info.version` de `/openapi.json` (tanda discovery).
+        version: Option<Box<Node>>,
     },
     ServeBlock {
         port: Box<Node>,
@@ -413,6 +415,8 @@ pub enum NodeKind {
         cors: Option<Box<Node>>,
         describe: Option<Box<Node>>, // DescribeClause
         private: bool,
+        /// `docs off`: apaga la página `/docs` sin esconder `/openapi.json` (discovery).
+        docs_off: bool,
         routes: Vec<Node>, // RouteDefinition
         // A2 stack web: `tls cert <expr> key <expr>` + `redirect https`.
         tls_cert: Option<Box<Node>>,

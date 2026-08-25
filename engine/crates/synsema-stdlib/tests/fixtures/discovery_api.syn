@@ -1,0 +1,50 @@
+-- Fixture del golden de discovery (openapi.json + sitemap.xml + docs.md).
+-- Cubre: path params, expect, auth, rate limit (propio + unlimited), SSE, content(),
+-- mount at, describe (about/api/version), intent, capabilities transitivas + builtin.
+intent: "Sell books to agents and humans"
+
+require serve(8080)
+use "./discovery_mod.syn" as shop
+
+task charge(amount)
+    require net("api.stripe.com")
+    require llm
+    give fetch("https://api.stripe.com/charge")
+
+task check_token(token)
+    give when token == "ok" then {"id": 1} otherwise nothing
+
+serve on 8080
+    auth with check_token
+    rate_limit 100 per minute
+    describe
+        about: "Bookshop API"
+        api: ["GET /books/:id -- one book", "POST /orders -- place an order"]
+        version: "1.4.0"
+    mount shop.tienda at "/v1"
+
+    route "GET /"
+        give content(page([heading("Bookshop")]))
+
+    route "GET /books/:id"
+        give {"id": params.id}
+
+    route "POST /orders" requires auth
+        rate_limit 5 per minute
+        expect body {book: text, qty: number, gift: bool}
+        let r be charge(10)
+        give {"ok": true}
+
+    route "GET /events"
+        stream
+            send {"tick": 1}
+
+    route "GET /health"
+        rate_limit unlimited
+        give html("<p>ok</p>")
+
+    route "GET /upstream/*path"
+        proxy to "http://127.0.0.1:9"
+
+    route "GET /go"
+        give redirect("/")

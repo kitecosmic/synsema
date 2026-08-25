@@ -339,7 +339,9 @@ await syn.runAsync(program, { host: { async http(req) { const r = await fetch(re
 
 API (same in JS/Python/Go): `run(source, {filename, env, ceiling, host})` →
 `{ok, output, errors, audit, llm_tokens}`; `test` → `{passed, failed, lines}`; `check` →
-`{ok, errors}` (parse + memory declaration, no execution); `handle(source, request)` →
+`{ok, errors}` (parse + the memory-declaration rule — one `require memory`, valid name; a
+`remember` WITHOUT `require memory` is NOT flagged here, it's denied at `run` — same as native
+`synsema check`); `handle(source, request)` →
 `{status, content_type, headers, body|body_base64, log, errors}` (serve in HANDLER mode:
 routes/params/query/`auth with`/`errors with`/`content()` negotiation/`redirect`/
 pagination/`state_*` durable through `kv`; NOT: `stream`, `proxy to`, rate limits,

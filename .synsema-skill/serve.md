@@ -86,12 +86,13 @@ first.
 
 `serve`, `on`, `route`, `auth`, `errors`, `requires`, `expect`, `max_body`,
 `max_streams`, `stream`, `send`, `rate_limit`, `per`, `static`, `from`, `cache`,
-`fallback`, `cors`, `describe`, `private`, `mount` and `at` are **soft keywords**:
+`fallback`, `cors`, `describe`, `private`, `docs`, `mount` and `at` are **soft keywords**:
 they are special *only* at the start of their construction (`serve on N`,
 `route "..."`, `requires auth`, `errors with <task>`, `expect body {...}`,
 `max_body "10mb"`, `max_streams N`, a `stream` block, `send` inside one,
 `rate_limit N per window`, `static "./dir" [cache "1h"] [fallback "index.html"]`,
-`cors "*"`, a `describe` block, `private`, `mount <expr> [at "/p"]`). Everywhere
+`cors "*"`, a `describe` block (`about:` / `api:` / `version:`), `private`, `docs off`,
+`mount <expr> [at "/p"]`). Everywhere
 else they are ordinary names — `let route be "/x"`, `let static be 1`,
 `let cache be 1` and `task auth(x)` are valid. The parser decides with fixed
 lookahead, never heuristics.
@@ -531,33 +532,47 @@ GET /blog/hola.json                         # explicit → JSON (the node tree)
   A `*catch-all` keeps the dotted value too (it's not negotiated).
 - Negotiation applies **only** to `content()` values; everything else is unchanged.
 
-### Discoverability — `/llms.txt`, `/robots.txt`, `describe`, `private`
+### Discoverability — `/llms.txt`, `/robots.txt`, `/sitemap.xml`, `/openapi.json`, `/docs`
 
-Every server is **discoverable by agents from day 1, zero config**:
+Every server is **discoverable by agents from day 1, zero config**. All of it is
+DERIVED from what is wired (route table, `expect`, `requires auth`, `rate_limit`,
+`describe`, the capabilities the routes' code declares); nothing is declared twice,
+and what can't be derived truthfully (a response schema) is omitted, not invented.
 
-- **`/llms.txt`** (the "robots.txt of the agent era") is auto-generated from the
-  program `intent:`, the route table (method + path), and the `describe` block.
-- **`/robots.txt`** is auto-served (allows crawlers and points them at the site).
+| URL | Content | Off with |
+|---|---|---|
+| `/llms.txt` | title + intent + every endpoint with the capabilities it may use (`- POST /pay  [net:api.stripe.com, llm]`) + `describe api:` list + `## Machine-readable` (links to the rest) | `private` |
+| `/robots.txt` | `Allow: /` + `Sitemap: <base>/sitemap.xml`; `Disallow: /` when `private` | — |
+| `/sitemap.xml` | GET routes with NO path params, NO `requires auth`, not `stream`/`proxy`. Parametric routes are NOT expanded (the runtime can't know the slugs); no `lastmod` | `private` |
+| `/openapi.json` | OpenAPI 3.1, deterministic (paths asc, GET/POST/PUT/PATCH/DELETE). `expect body` (top-level only) → `requestBody` (all fields required; text→string, number→number, bool→boolean, list→array, map→object); `:id`/`*rest` → `{id}` path params; `requires auth` → `security` + `securitySchemes` bearer/cookie/httpsig (when the block has `auth with`) + `401`; `rate_limit` → `429` + `x-synsema-rate-limit {count, window}`/`"unlimited"`; `stream` → `text/event-stream` + `x-synsema-streaming`; `proxy to` → `x-synsema-proxy`; last `give` of `html()/render()/page()` → `text/html`, `content()` → html+markdown+json, `redirect()` → `302`, else `application/json`. NO response schema. `x-synsema-capabilities`: what the operation MAY touch, static and transitive (`require` of called tasks + builtin implications: fetch→net, sql→db, read_file→file.read, reason→llm, remember→memory…), always present (`[]` when none). `describe api:` entry with the exact prefix `"POST /x"` → that operation's `description` | `private` |
+| `/docs` | own HTML page (inline CSS/JS, NO CDN) that reads `/openapi.json`: schema, forms, **Try it** (bearer field in sessionStorage; cookies travel alone). `Accept: text/markdown` → the same reference as Markdown for agents | `private` or `docs off` (keeps `/openapi.json`) |
+| `/.well-known/synsema-auth` | auth mechanisms + protected endpoints (§ Agent identity) | `private` |
 
-Enrich or opt out with two clauses on the serve block:
+Base URL for absolute links (`Sitemap:`, `<loc>`, OpenAPI `servers`): `domain "…"` of
+the serve block if declared, else the request `Host`; scheme `https` when TLS is on
+or the proxy in front sends `X-Forwarded-Proto: https`.
 
 ```
 serve on 8080
-    describe                       -- enriches /llms.txt (optional)
-        about: "Blog and waitlist for Synsema"
-        api: ["GET /blog/:slug — an article", "POST /api/signup — join"]
-    -- private                     -- opt-out: internal server, publish nothing
-    route "GET /blog/:slug"
-        give content(post_view(load_post(params.slug)))
+    describe                       -- optional; enriches everything
+        about: "Bookshop API"                     -- title (/llms.txt, info.title, /docs)
+        api: ["GET /books/:id -- one book", "POST /orders -- place an order"]
+        version: "1.4.0"                          -- info.version (default "0.0.0")
+    -- private                     -- internal server: the 5 documents → 404, robots Disallow: /
+    -- docs off                    -- only the /docs page goes away
+    route "POST /orders" requires auth
+        expect body {book: text, qty: number}
+        give {"ok": true}
 ```
 
-- **`describe`** (soft keyword): `about:` becomes the `/llms.txt` title and
-  `api:` a curated endpoint list. The `intent:` becomes the summary.
-- **`private`** (soft keyword): disables `/llms.txt` (returns `404`) and makes
-  `/robots.txt` `Disallow: /` — for internal servers/dashboards, so they don't
-  leak their shape (secure by default).
-- A declared route or a static file at `/llms.txt` or `/robots.txt` **overrides**
-  the auto-generated one.
+- A declared route or a static file at any of these paths **overrides** the
+  generated one (so `route "GET /docs"` replaces the API page — intended).
+- Mounted groups (`mount m.api at "/v1"`) are published with the prefix; each
+  `host "…"` publishes its own table under its `Host`.
+- **CI without a server:** `synsema openapi app.syn [--out openapi.json] [--base-url URL]`
+  emits the same document from the source (parse only: `route` + `mount m.group at "/p"`
+  resolved syntactically; exit 2 without `serve`). Same emitter as the live server, so
+  the two never drift.
 - Combined with the `content()` page metadata → JSON-LD, this closes the SEO +
   agent-discovery loop.
 

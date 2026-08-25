@@ -79,7 +79,7 @@ usually version skew, not a bug.
 - [concurrency.md](concurrency.md) — Real multi-core parallelism (Rust): `parallel_map`, `chunk`, fan-out/merge, fail-fast
 - [frontend.md](frontend.md) — Building UIs/sites: render() templates (inline CSS/JS via `{ raw }` verbatim blocks, elif chains, each empty-branch + `enumerate`, includes with props, named slots, `{ -- comments }`, `json_for_script` for script data) + layouts/partials + static assets (cache policy, SPA fallback) + client JS; content() for agent-negotiable pages. No imposed framework.
 - [dataviz.md](dataviz.md) — Business data & charts: CSV import/export (`csv_parse`/`csv_encode`, RFC 4180), descriptive statistics (`median`/`percentile`/`histogram`), native SVG charts (`chart_svg`) and the negotiated `chart()` content node (SVG for humans, data table/JSON for agents), PNG/PDF export (`svg_to_png`/`svg_to_pdf`, deterministic embedded font). Data-source-agnostic, pure (works in `sandbox`).
-- [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination/paged(), streaming (SSE), rate limiting, body limits, HTML/SSR pages (`render`, `html`), static files, CORS, content negotiation (HTML/Markdown/JSON for agents), agent discoverability (`llms.txt`), **and the Rust production stack: TLS / auto-HTTPS (ACME) / virtual hosts / reverse proxy / HTTP-2 / production static (ETag·Range·gzip)**
+- [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination/paged(), streaming (SSE), rate limiting, body limits, HTML/SSR pages (`render`, `html`), static files, CORS, content negotiation (HTML/Markdown/JSON for agents), agent discoverability (`/llms.txt`, `/robots.txt`, `/sitemap.xml`, `/openapi.json`, `/docs` — generated; `synsema openapi` for CI), **and the Rust production stack: TLS / auto-HTTPS (ACME) / virtual hosts / reverse proxy / HTTP-2 / production static (ETag·Range·gzip)**
 - [capabilities.md](capabilities.md) — Security model, require, sandbox, intent
 - [processes.md](processes.md) — Run OS processes/tools with `run` (gated by `exec`): shells/scripts/pipelines, timeout, cwd/env/stdin, capture limits, generate-and-run loop, giving an LLM a shell tool
 - [secrets.md](secrets.md) — Config by environment (`env`), LLM-proof secrets (`secret`, redacted everywhere), `.env`, `reveal()` + audit, HMAC/bearer/constant-time helpers
@@ -142,7 +142,8 @@ usually version skew, not a bug.
 - Serving HTML pages / server-side rendering (templates) → serve.md
 - Agent-readable content / content negotiation (HTML · Markdown · JSON) → serve.md
 - Static files (CSS/JS/images) → serve.md
-- Agent discoverability (llms.txt / robots.txt) → serve.md
+- Agent discoverability (llms.txt / robots.txt / sitemap.xml / openapi.json / docs, `private`, `docs off`, `describe version:`) → serve.md
+- Emit the OpenAPI spec in CI without starting the server (`synsema openapi app.syn --out`) → serve.md § Discoverability
 - Deploying to server → deploy.md
 - Adding security → capabilities.md
 - Running an OS command / script / shell (git, python, bash/powershell, ffmpeg) → processes.md

@@ -25,7 +25,7 @@ mod init_templates;
 mod synfide;
 mod update;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] | test [-v] [--sandbox | --cap-set <list>] <archivo|dir> | check | tokens | ast | repl | daemon | init [dir] [--synfide] | llm status [--json] | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] | test [-v] [--sandbox | --cap-set <list>] <archivo|dir> | check | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide] | llm status [--json] | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
 
 // `build_ceiling` (--sandbox/--cap-set → techo) vive en synsema-capabilities: lo comparten
 // este binario y `synsema-wasm` (mismas flags, misma semántica en los dos front-ends).
@@ -74,6 +74,7 @@ fn main() -> ExitCode {
         Some("run") => cmd_run(&args),
         Some("test") => cmd_test(&args),
         Some("check") => cmd_check(&args),
+        Some("openapi") => cmd_openapi(&args),
         Some("tokens") => cmd_tokens(&args),
         Some("ast") => cmd_ast(&args),
         Some("repl") => {
@@ -91,7 +92,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(other) => {
-            eprintln!("subcomando desconocido: '{}'. Disponibles: init, conform, serve, run, test, check, tokens, ast, repl, daemon, llm, version, update", other);
+            eprintln!("subcomando desconocido: '{}'. Disponibles: init, conform, serve, run, test, check, openapi, tokens, ast, repl, daemon, llm, version, update", other);
             ExitCode::from(2)
         }
         None => {
@@ -987,6 +988,91 @@ fn cmd_check(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// openapi <archivo.syn> [--out openapi.json] [--base-url URL]: el `/openapi.json` que
+/// el server publicaría, SIN ejecutar el programa ni abrir el puerto (para CI/build).
+/// Mismo emisor que el server; las rutas salen del AST (`route` + `mount` resueltos
+/// sintácticamente). Exit 2 si el archivo no tiene `serve`.
+fn cmd_openapi(args: &[String]) -> ExitCode {
+    let mut path: Option<String> = None;
+    let mut out: Option<String> = None;
+    let mut base: Option<String> = None;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => {
+                i += 1;
+                out = args.get(i).cloned();
+            }
+            "--base-url" => {
+                i += 1;
+                base = args.get(i).cloned();
+            }
+            other => path = Some(other.to_string()),
+        }
+        i += 1;
+    }
+    let path = match path {
+        Some(p) => p,
+        None => {
+            eprintln!("uso: synsema openapi <archivo.syn> [--out openapi.json] [--base-url URL]");
+            return ExitCode::from(2);
+        }
+    };
+    let source = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("no se pudo leer '{}': {}", path, e);
+            return ExitCode::from(1);
+        }
+    };
+    let program = match synsema_core::parser::parse_source(&source, &path) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return ExitCode::from(1);
+        }
+    };
+    use synsema_core::route_meta::{api_routes_static, StaticProgram};
+    let sp = match StaticProgram::load(program, &path) {
+        Ok(sp) => sp,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return ExitCode::from(1);
+        }
+    };
+    let (info, routes) = match api_routes_static(&sp) {
+        Ok(Some(x)) => x,
+        Ok(None) => {
+            eprintln!("{}: no 'serve' block — nothing to describe", path);
+            return ExitCode::from(2);
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return ExitCode::from(1);
+        }
+    };
+    let api = synsema_stdlib::discovery::ApiInfo {
+        title: synsema_stdlib::discovery::ApiInfo::title_of(info.describe_about.as_deref(), info.intent.as_deref()),
+        description: info.intent.clone(),
+        version: info.describe_version.clone().unwrap_or_else(|| "0.0.0".to_string()),
+        base_url: base.or_else(|| info.domain.as_ref().map(|d| format!("https://{}", d))),
+        has_auth: info.has_auth_handler && routes.iter().any(|r| r.requires_auth),
+        describe_api: info.describe_api.clone(),
+    };
+    let text = synsema_stdlib::discovery::openapi_text(&api, &routes);
+    match out {
+        Some(f) => {
+            if let Err(e) = std::fs::write(&f, text.as_bytes()) {
+                eprintln!("no se pudo escribir '{}': {}", f, e);
+                return ExitCode::from(1);
+            }
+            eprintln!("{}: {} operation(s) → {}", path, routes.len(), f);
+        }
+        None => println!("{}", text),
+    }
+    ExitCode::SUCCESS
 }
 
 /// tokens <archivo.syn>: muestra el stream de tokens (debug).

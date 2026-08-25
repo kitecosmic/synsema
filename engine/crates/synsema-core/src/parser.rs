@@ -1361,6 +1361,7 @@ impl Parser {
         let mut cors = None;
         let mut describe = None;
         let mut private = false;
+        let mut docs_off = false;
         let mut routes = Vec::new();
         let mut tls_cert: Option<Box<Node>> = None;
         let mut tls_key: Option<Box<Node>> = None;
@@ -1403,6 +1404,11 @@ impl Parser {
             } else if self.check_word("private") {
                 self.advance();
                 private = true;
+            } else if self.check_word("docs") {
+                // docs off → sin página /docs (el /openapi.json sigue publicado)
+                self.advance();
+                self.expect_word("off", "Expected 'off' after 'docs' (docs off)")?;
+                docs_off = true;
             } else if self.check_word("tls") {
                 self.advance();
                 if self.check_word("auto") {
@@ -1453,7 +1459,7 @@ impl Parser {
                 let tok = self.current();
                 return Err(ParseError::new(
                     format!(
-                        "Inside 'serve', expected 'auth with ...', 'errors with ...', 'route ...', 'mount ...', 'static ...', 'tls ...', 'domain ...', 'host \"...\"', 'redirect https', 'cors ...', 'describe' or 'private', got {}",
+                        "Inside 'serve', expected 'auth with ...', 'errors with ...', 'route ...', 'mount ...', 'static ...', 'tls ...', 'domain ...', 'host \"...\"', 'redirect https', 'cors ...', 'describe', 'private' or 'docs off', got {}",
                         tok.ty.name()
                     ),
                     tok.location.clone(),
@@ -1502,6 +1508,7 @@ impl Parser {
                 cors,
                 describe,
                 private,
+                docs_off,
                 routes,
                 tls_cert,
                 tls_key,
@@ -1633,6 +1640,7 @@ impl Parser {
         self.advance(); // 'describe'
         let mut about = None;
         let mut api = None;
+        let mut version = None;
         self.skip_newlines();
         self.expect(TokenType::Indent, "Expected an indented block after 'describe'")?;
         self.skip_newlines();
@@ -1645,11 +1653,15 @@ impl Parser {
                 self.advance();
                 self.expect(TokenType::Colon, "Expected ':' after 'api'")?;
                 api = Some(Box::new(self.parse_expression()?));
+            } else if self.check_word("version") {
+                self.advance();
+                self.expect(TokenType::Colon, "Expected ':' after 'version'")?;
+                version = Some(Box::new(self.parse_expression()?));
             } else {
                 let tok = self.current();
                 return Err(ParseError::new(
                     format!(
-                        "Inside 'describe', expected 'about:' or 'api:', got {}",
+                        "Inside 'describe', expected 'about:', 'api:' or 'version:', got {}",
                         tok.ty.name()
                     ),
                     tok.location.clone(),
@@ -1660,7 +1672,7 @@ impl Parser {
         if self.check(TokenType::Dedent) {
             self.advance();
         }
-        Ok(Node::new(loc, NodeKind::DescribeClause { about, api }))
+        Ok(Node::new(loc, NodeKind::DescribeClause { about, api, version }))
     }
 
     fn parse_route(&mut self) -> Result<Node, ParseError> {
