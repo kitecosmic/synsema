@@ -429,6 +429,10 @@ pub(crate) fn wire_common_with_state(
     // WebSocket cliente (Batch 13): transporte general gateado por `net(host)` (G21),
     // la MISMA capability y scope que http_*/fetch — sandbox lo deniega igual.
     synsema_stdlib::ws::register_ws_builtins(interp, caps.clone());
+    // Bus por defecto (programas sin swarm: run_source/conform/test): los `bus_*` existen
+    // y funcionan in-process. Con swarm, `wire_swarm_hooks` lo reemplaza por el del
+    // proceso ANTES de que corra código del usuario.
+    synsema_stdlib::ws::attach_bus(interp, Arc::new(synsema_agents::bus::Bus::new()));
     // cron/db/progress/memory: sus builtins clonan el Rc internamente → viven mientras
     // viva el intérprete.
     // Cron con ejecución REAL también bajo run/test/conform: el ejecutor toma un
@@ -763,7 +767,7 @@ fn run_inner(
             // del host se propaga a cada agente spawneado (nunca lo exceden), y el ctx de
             // memoria declarada también (namespaces por `source`, decisión #4).
             if let Some(sw) = swarm {
-                wire_swarm_hooks(&mut interp, sw, "main", ceiling_arc.clone(), mem_ctx.clone());
+                wire_swarm_hooks(&mut interp, sw, "main", ceiling_arc.clone(), mem_ctx.clone(), None);
             }
 
             // La persistencia es on-write (el ctx guarda tras cada mutación, como serve):
@@ -1048,7 +1052,7 @@ fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>, ceili
     // Swarm real (DE-014): mismos hooks que `run` → los agentes corren aislados y un
     // `raise` de agente no aborta el main ni trunca su diagnóstico.
     if let Some(sw) = swarm {
-        wire_swarm_hooks(&mut interp, sw, "main", ceiling_arc.clone(), mem_ctx.clone());
+        wire_swarm_hooks(&mut interp, sw, "main", ceiling_arc.clone(), mem_ctx.clone(), None);
     }
     match interp.execute(&program) {
         Ok(_) => DiagRun {
@@ -1344,14 +1348,78 @@ pub fn run_with_llm_stream(source: &str, filename: &str, chunks: Vec<String>) ->
 
 /// Cablea los hooks del swarm en un intérprete (capturando el `Arc<Swarm>` y el
 /// nombre del agente para las escrituras al blackboard).
+/// Constructor `Send` de intérpretes con el wiring completo de un `serve` (state_*, DB
+/// compartida, approvals, cron, bus, memoria). Los agentes spawneados desde handlers o
+/// ticks de cron nacen con él — no en una isla con builtins frescos.
+pub(crate) type InterpBuilder = Arc<dyn Fn() -> (Interpreter, Rc<RefCell<CapabilitySet>>) + Send + Sync>;
+
 pub(crate) fn wire_swarm_hooks(
     interp: &mut Interpreter,
     swarm: Arc<Swarm>,
     agent_name: &str,
     ceiling: Option<Arc<Vec<Capability>>>,
     mem: Option<MemoryCtx>,
+    builder: Option<InterpBuilder>,
 ) {
     let name = agent_name.to_string();
+    // Bus de eventos del proceso: `bus_*`/`select` del hub de I/O publican y suscriben
+    // contra el MISMO bus que agentes, cron y handlers (vive en el swarm).
+    synsema_stdlib::ws::attach_bus(interp, swarm.bus.clone());
+    // Observabilidad de agentes desde el lenguaje: `agents()` (snapshot de estados) y
+    // `agent_stop(id)` (cancelación cooperativa). Sin capability: introspección del
+    // propio proceso.
+    {
+        let sw = swarm.clone();
+        interp.register_builtin(
+            "agents",
+            0,
+            Rc::new(move |_i, _args, _loc| {
+                use synsema_core::types::{syn_map, syn_number, syn_text};
+                let items: Vec<SynValue> = sw
+                    .agents_info()
+                    .into_iter()
+                    .map(|(id, a)| {
+                        let mut m = indexmap::IndexMap::new();
+                        m.insert("id".to_string(), syn_text(id.clone()));
+                        // `name` = el agente declarado (sin el sufijo de instancia `_N`).
+                        let base = id.rsplit_once('_').map(|(b, n)| if n.bytes().all(|c| c.is_ascii_digit()) { b.to_string() } else { id.clone() }).unwrap_or(id.clone());
+                        m.insert("name".to_string(), syn_text(base));
+                        m.insert("state".to_string(), syn_text(agent_state_str(a.state)));
+                        m.insert("error".to_string(), a.error.clone().map(syn_text).unwrap_or(SynValue::Nothing));
+                        m.insert("started_at".to_string(), syn_number(synsema_core::number::Number::Float(a.started_at)));
+                        m.insert(
+                            "finished_at".to_string(),
+                            if a.finished_at > 0.0 { syn_number(synsema_core::number::Number::Float(a.finished_at)) } else { SynValue::Nothing },
+                        );
+                        syn_map(m)
+                    })
+                    .collect();
+                Ok(SynValue::List(Rc::new(RefCell::new(items))))
+            }),
+        );
+        let sw = swarm.clone();
+        interp.register_builtin(
+            "agent_stop",
+            -1,
+            Rc::new(move |_i, args, _loc| {
+                let id = match args.first() {
+                    Some(SynValue::Text(s)) => s.to_string(),
+                    Some(other) => {
+                        return Err(Control::Error(synsema_core::interpreter::RuntimeError::new(format!(
+                            "agent_stop: the agent id must be text (from agents()), got {}",
+                            other.type_name()
+                        ))))
+                    }
+                    None => return Err(Control::Error(synsema_core::interpreter::RuntimeError::new("agent_stop: missing the agent id"))),
+                };
+                let reason = match args.get(1) {
+                    Some(SynValue::Text(s)) => s.to_string(),
+                    _ => "stopped by agent_stop".to_string(),
+                };
+                Ok(synsema_core::types::syn_bool(sw.stop_agent(&id, &reason)))
+            }),
+        );
+    }
 
     let share: synsema_core::interpreter::ShareHook = {
         let sw = swarm.clone();
@@ -1371,13 +1439,18 @@ pub(crate) fn wire_swarm_hooks(
     let wait_for: synsema_core::interpreter::WaitForHook = {
         let sw = swarm.clone();
         let n = name.clone();
-        Rc::new(move |sig_name, timeout| {
+        Rc::new(move |sig_name, timeout, cancel: &Arc<std::sync::atomic::AtomicBool>| {
             // Timeout configurable (Batch 7): segundos del `wait_for ... timeout <expr>`, o
             // 30 s por defecto (G1). Clamp [0, 3600] como `sleep`.
             let secs = timeout.unwrap_or(30.0).clamp(0.0, 3600.0);
             // Estado WAITING mientras bloquea (no-op si `n` no es agente registrado, p.ej. "main").
             sw.set_state(&n, AgentState::Waiting);
-            let sig = sw.wait_for_signal(sig_name, Duration::from_secs_f64(secs));
+            // La espera sale apenas llega la cancelación (timeout de handler, shutdown,
+            // agent_stop): el intérprete la convierte en error al volver.
+            let c = cancel.clone();
+            let sig = sw.wait_for_signal_cancellable(sig_name, Duration::from_secs_f64(secs), &|| {
+                c.load(std::sync::atomic::Ordering::Relaxed)
+            });
             sw.set_state(&n, AgentState::Working);
             sig.and_then(|s| s.data).map(|d| from_send(&d))
         })
@@ -1386,6 +1459,7 @@ pub(crate) fn wire_swarm_hooks(
         let sw = swarm.clone();
         let ceiling = ceiling.clone();
         let mem = mem.clone();
+        let builder = builder.clone();
         Rc::new(move |agent, body, args, globals| {
             let send_args: Vec<(String, SendValue)> =
                 args.iter().map(|(k, v)| (k.clone(), to_send(v))).collect();
@@ -1396,7 +1470,7 @@ pub(crate) fn wire_swarm_hooks(
             // El techo del host se propaga al agente (Arc → Send cruza el hilo): un agente
             // spawneado jamás excede el techo, aunque su cuerpo declare `require exec(...)`.
             // El ctx de memoria declarada también (mismos stores + namespace por `source`).
-            Ok(spawn_agent(sw.clone(), agent.to_string(), body, send_args, global_snap, ceiling.clone(), mem.clone()))
+            Ok(spawn_agent(sw.clone(), agent.to_string(), body, send_args, global_snap, ceiling.clone(), mem.clone(), builder.clone()))
         })
     };
 
@@ -1432,7 +1506,7 @@ fn setup_swarm_interpreter(
         }
     }
     // Propaga el techo (y el ctx de memoria) a los sub-agentes que este agente spawnee.
-    wire_swarm_hooks(&mut interp, swarm, agent_name, ceiling, mem);
+    wire_swarm_hooks(&mut interp, swarm, agent_name, ceiling, mem, None);
     let name = agent_name.to_string();
     interp.log_hook = Some(Arc::new(move |line: &str| {
         // `conform` exige stdout = SOLO el JSON final: bajo ese modo el eco vivo
@@ -1454,6 +1528,7 @@ pub static AGENT_ECHO_TO_STDERR: std::sync::atomic::AtomicBool =
 /// Lanza un agente en su propio hilo con su propio `Interpreter`. Devuelve el
 /// instance_id. El estado pasa STARTING→WORKING→DONE/ERROR; el error se captura
 /// (no crashea el programa) y se emite una señal `__agent_error:<id>`.
+#[allow(clippy::too_many_arguments)]
 fn spawn_agent(
     swarm: Arc<Swarm>,
     agent_name: String,
@@ -1462,6 +1537,7 @@ fn spawn_agent(
     globals: Arc<Vec<(String, GlobalVal)>>,
     ceiling: Option<Arc<Vec<Capability>>>,
     mem: Option<MemoryCtx>,
+    builder: Option<InterpBuilder>,
 ) -> String {
     let instance_id = swarm.register_new_agent(&agent_name);
     let sw = swarm.clone();
@@ -1470,7 +1546,21 @@ fn spawn_agent(
         .name(id.clone())
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
-            let mut interp = setup_swarm_interpreter(sw.clone(), &id, ceiling, mem, true);
+            let mut interp = match &builder {
+                // Bajo serve: el MISMO wiring que un tick de cron (state_*, DB, approvals,
+                // cron, bus, memoria, techo del host); los hooks se re-cablean con la
+                // identidad del agente (share/observe/signal atribuyen por nombre).
+                Some(b) => {
+                    let (mut interp, _caps) = b();
+                    wire_swarm_hooks(&mut interp, sw.clone(), &id, ceiling.clone(), mem.clone(), Some(b.clone()));
+                    interp
+                }
+                None => setup_swarm_interpreter(sw.clone(), &id, ceiling, mem, true),
+            };
+            // Token de cancelación del agente (`agent_stop` / shutdown).
+            if let Some(tok) = sw.cancel_token(&id) {
+                interp.set_cancel_token(tok);
+            }
             // Namespace de memoria (DB-M1 #4): el `source` de remember/recall dentro
             // del agente es su NOMBRE declarado (no el instance_id — `from = "writer"`
             // debe cruzar a ese namespace sin adivinar sufijos de instancia).
@@ -1485,6 +1575,11 @@ fn spawn_agent(
             sw.set_state(&id, AgentState::Working);
             match interp.run_block(&body) {
                 Ok(_) => sw.set_state(&id, AgentState::Done),
+                // Cancelado cooperativamente (agent_stop/shutdown): estado STOPPED, no
+                // ERROR — parar un agente no es una falla del agente.
+                Err(Control::Error(_)) if interp.is_cancelled() => {
+                    sw.set_state(&id, AgentState::Stopped);
+                }
                 Err(Control::Error(e)) => {
                     sw.set_error(&id, e.to_string());
                     sw.signal(&format!("__agent_error:{}", id), &id, None);
@@ -1499,6 +1594,18 @@ fn spawn_agent(
         .expect("no se pudo crear el hilo del agente");
     swarm.add_thread(handle);
     instance_id
+}
+
+fn agent_state_str(s: AgentState) -> &'static str {
+    match s {
+        AgentState::Idle => "idle",
+        AgentState::Starting => "starting",
+        AgentState::Working => "working",
+        AgentState::Waiting => "waiting",
+        AgentState::Done => "done",
+        AgentState::Error => "error",
+        AgentState::Stopped => "stopped",
+    }
 }
 
 fn run_swarm_inner(source: &str, filename: &str, swarm: Arc<Swarm>) -> RunResult {

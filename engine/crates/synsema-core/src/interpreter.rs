@@ -15,6 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 use num_complex::Complex64;
@@ -287,7 +289,76 @@ pub type ObserveHook = Rc<dyn Fn(&str) -> Option<SynValue>>;
 /// Hook de señal (`signal`): (canal, payload opcional).
 pub type SignalHook = Rc<dyn Fn(&str, Option<SynValue>)>;
 /// Hook de espera de señal (`wait_for`): (canal, timeout_secs) → payload.
-pub type WaitForHook = Rc<dyn Fn(&str, Option<f64>) -> Option<SynValue>>;
+/// `(canal, timeout_secs, cancel)` — el hook DEBE vigilar `cancel` mientras bloquea
+/// (timeout de handler / shutdown / `agent_stop`): una espera larga no puede ignorar
+/// una cancelación cooperativa.
+pub type WaitForHook = Rc<dyn Fn(&str, Option<f64>, &Arc<AtomicBool>) -> Option<SynValue>>;
+
+/// Token de cancelación cooperativa de un intérprete (ver `Interpreter::cancel`).
+/// `Send + Sync`: el server lo crea por request y lo cancela desde el lado async; el
+/// swarm lo guarda por agente para `agent_stop`.
+pub type CancelWaker = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Clone)]
+pub struct CancelToken {
+    pub flag: Arc<AtomicBool>,
+    pub reason: Arc<std::sync::Mutex<String>>,
+    /// Despertadores: una espera bloqueante (select/recv sobre `mio::Poll`, condvar)
+    /// registra cómo despertarla; `cancel()` los invoca para que la cancelación sea
+    /// inmediata y no espere al timeout de la espera.
+    wakers: Arc<std::sync::Mutex<Vec<CancelWaker>>>,
+}
+
+impl fmt::Debug for CancelToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "CancelToken(cancelled={})", self.is_cancelled())
+    }
+}
+
+impl CancelToken {
+    pub fn new() -> Self {
+        CancelToken {
+            flag: Arc::new(AtomicBool::new(false)),
+            reason: Arc::new(std::sync::Mutex::new(String::new())),
+            wakers: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+    /// Marca la cancelación con un motivo (idempotente; el primer motivo gana) y
+    /// despierta a las esperas registradas.
+    pub fn cancel(&self, reason: &str) {
+        if let Ok(mut g) = self.reason.lock() {
+            if g.is_empty() {
+                g.push_str(reason);
+            }
+        }
+        self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let wakers: Vec<CancelWaker> = self.wakers.lock().map(|g| g.clone()).unwrap_or_default();
+        for w in wakers {
+            w();
+        }
+    }
+    /// Registra un despertador (idempotencia a cargo del caller: acotado por token).
+    pub fn add_waker(&self, w: CancelWaker) {
+        if let Ok(mut g) = self.wakers.lock() {
+            if g.len() < 64 {
+                g.push(w);
+            }
+        }
+    }
+    /// Identidad del token (para que un hub registre su waker UNA vez por token).
+    pub fn id(&self) -> usize {
+        Arc::as_ptr(&self.flag) as usize
+    }
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Default for CancelToken {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 /// Hook de `spawn`: (agente, body, args, snapshot de globals) → instance_id.
 pub type SpawnHook =
     Rc<dyn Fn(&str, Vec<Node>, Vec<(String, SynValue)>, Vec<(String, SynValue)>) -> Result<String, Control>>;
@@ -365,6 +436,16 @@ pub struct Interpreter {
     /// techo del host (fail-closed: mandan los dos, gana el más chico).
     request_spend_limits: Vec<(String, String)>,
     recursion_depth: usize,
+    /// Cancelación COOPERATIVA (timeout de handler, shutdown ordenado, `agent_stop`):
+    /// `exec_block` la chequea por statement y las esperas largas (select/recv/sleep/
+    /// wait_for/run) en su loop. Al verla → `Control::Error("cancelled: …")`; un
+    /// `try/recover` puede observarla pero no curarla (el flag sigue puesto y el próximo
+    /// statement vuelve a cortar). El `Arc` cruza hilos: el server/el swarm lo setean.
+    cancel: CancelToken,
+    /// Extensiones opacas del host (p. ej. el hub de I/O del stdlib): el core no conoce
+    /// sus tipos; quien las registra las recupera con `downcast`. Es el único slot
+    /// genérico — evita enhebrar tipos del stdlib por todas las firmas del motor.
+    pub ext: RefCell<HashMap<&'static str, Rc<dyn std::any::Any>>>,
     /// Concede capabilities declaradas con `require` (lo cablea el motor).
     grant_hook: Option<GrantHook>,
     /// Aislamiento de `sandbox`: profundidad de anidamiento (>0 = dentro de un sandbox)
@@ -469,6 +550,8 @@ impl Interpreter {
             request_identity: None,
             request_spend_limits: Vec::new(),
             recursion_depth: 0,
+            cancel: CancelToken::new(),
+            ext: RefCell::new(HashMap::new()),
             grant_hook: None,
             sandbox_depth: 0,
             sandbox_hook: None,
@@ -629,6 +712,43 @@ impl Interpreter {
         self.stream_emit = Some(emit);
     }
 
+    /// Token de cancelación cooperativa de ESTE intérprete (clonable, cruza hilos).
+    /// Quien lo setea (server/swarm) usa `CancelToken::cancel(reason)`.
+    pub fn cancel_token(&self) -> CancelToken {
+        self.cancel.clone()
+    }
+
+    /// Adopta un token externo (el server crea uno por request ANTES de correr el
+    /// handler, para poder cancelarlo desde el lado async aunque el head no salió).
+    pub fn set_cancel_token(&mut self, token: CancelToken) {
+        self.cancel = token;
+    }
+
+    /// ¿Hay una cancelación pendiente? (para loops de espera en builtins).
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.flag.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// El flag crudo (para pasarlo a esperas que no tienen el intérprete a mano).
+    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
+        self.cancel.flag.clone()
+    }
+
+    /// Corta con error si hay cancelación pendiente. Lo llaman `exec_block` (por
+    /// statement) y los builtins bloqueantes al salir de su espera.
+    pub fn check_cancel(&self) -> Result<(), Control> {
+        if self.cancel.flag.load(std::sync::atomic::Ordering::Relaxed) {
+            let reason = self.cancel.reason.lock().map(|g| g.clone()).unwrap_or_default();
+            let msg = if reason.is_empty() {
+                "cancelled".to_string()
+            } else {
+                format!("cancelled: {}", reason)
+            };
+            return Err(Control::Error(RuntimeError::new(msg)));
+        }
+        Ok(())
+    }
+
     /// Llama a un valor invocable (task/builtin) con argumentos. Para el motor
     /// (p.ej. el verificador de auth de `serve`). Un `give` interno → valor de retorno.
     pub fn call_task(&mut self, func: SynValue, args: Vec<SynValue>) -> Result<SynValue, Control> {
@@ -740,6 +860,9 @@ impl Interpreter {
     /// capturan los builtins). Sin esto, el estado de un request se filtraría al
     /// siguiente.
     pub fn reset_for_request(&mut self) {
+        // Token NUEVO por request: el job anterior (si sigue corriendo en otro hilo,
+        // p. ej. cancelado por timeout) conserva el suyo; éste arranca limpio.
+        self.cancel = CancelToken::new();
         self.output.clear();
         self.blackboard.clear();
         self.agent_definitions.clear();
@@ -1403,6 +1526,11 @@ impl Interpreter {
     ) -> Result<SynValue, Control> {
         let mut result = SynValue::Nothing;
         for s in stmts {
+            // Cancelación cooperativa: un `load` relajado por statement (despreciable
+            // frente al tree-walker) — un handler en `while true` deja de ser inmortal.
+            if self.cancel.flag.load(std::sync::atomic::Ordering::Relaxed) {
+                self.check_cancel()?;
+            }
             result = self.exec(s, env)?;
         }
         Ok(result)
@@ -1751,13 +1879,27 @@ impl Interpreter {
                         param_names,
                         requires_auth,
                         streaming,
+                        socket,
                         rate_limit,
+                        timeout,
                         body,
                     } = &r.kind
                     {
                         if *streaming {
                             return Err(err_at(
                                 "a 'routes' group cannot contain 'stream' routes yet — declare streaming routes directly in the serve block",
+                                &r.location,
+                            ));
+                        }
+                        if *socket {
+                            return Err(err_at(
+                                "a 'routes' group cannot contain 'socket' routes yet — declare WebSocket routes directly in the serve block",
+                                &r.location,
+                            ));
+                        }
+                        if timeout.is_some() {
+                            return Err(err_at(
+                                "'timeout' inside a 'routes' group is not supported yet — set it on the serve block",
                                 &r.location,
                             ));
                         }
@@ -2042,10 +2184,12 @@ impl Interpreter {
                     },
                     None => None,
                 };
+                let cancel = self.cancel.flag.clone();
                 let result = match self.swarm_hooks.as_ref().map(|s| s.wait_for.clone()) {
-                    Some(h) => h(&n, secs),
+                    Some(h) => h(&n, secs, &cancel),
                     None => None,
                 };
+                self.check_cancel()?;
                 match result {
                     Some(v) => {
                         if let Some(var) = variable {
@@ -2311,10 +2455,23 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 None => Err(err_at("serve is only available through the Synsema engine runtime", loc)),
             },
             NodeKind::RateLimitClause { .. } => Ok(SynValue::Nothing),
+            // El parser saca la cláusula del cuerpo de la route y del serve block;
+            // ejecutarla es haberla escrito en otro lado (dentro de un `when`, de una
+            // task, del top-level) — se dice, no se ignora en silencio.
+            NodeKind::TimeoutClause { .. } => Err(err_at(
+                "'timeout' is a clause of the serve block or of a route body (top level: `timeout 30` | `timeout none`), not a statement",
+                loc,
+            )),
             NodeKind::ProxyStatement { .. } => {
                 Err(err_at("proxy is only available inside a serve route", loc))
             }
             NodeKind::StreamBlock { body } => self.exec_block(body, env),
+            // El cuerpo de un `socket` lo corre el runtime de serve con el binding `socket`
+            // ya adoptado; llegar acá es ejecutarlo fuera de una ruta.
+            NodeKind::SocketBlock { .. } => Err(err_at(
+                "socket is only available inside a serve route (route \"GET /path\" + socket block)",
+                loc,
+            )),
             NodeKind::SendStatement { value, event_name } => match self.stream_emit.clone() {
                 Some(emit) => {
                     let v = self.exec(value, env)?;

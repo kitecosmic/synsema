@@ -693,10 +693,21 @@ pub fn register_unavailable_stubs(interp: &Interpreter) {
         "redis_smembers", "redis_sismember", "redis_lock", "redis_unlock",
     ];
     const CRON: &[&str] = &["cron_every", "cron_after", "cron_cancel", "cron_list", "cron_status"];
-    let families: [(&[&str], &str); 3] = [
+    // Hub de I/O (select unificado + procesos vivos + bus): necesita hilos/pipes/un
+    // proceso — un intérprete embebido no los tiene.
+    const PROC: &[&str] = &[
+        "select", "proc_spawn", "proc_send", "proc_close_stdin", "proc_recv", "proc_select",
+        "proc_status", "proc_kill", "proc_wait", "proc_close", "proc_stats",
+    ];
+    const BUS: &[&str] = &["bus_publish", "bus_subscribe", "bus_recv", "bus_unsubscribe", "bus_topics"];
+    const AGENTS: &[&str] = &["agents", "agent_stop"];
+    let families: [(&[&str], &str); 6] = [
         (NET, "this build has no network sockets (WebSocket/TLS identity need an event loop and a process)"),
         (DB, "this build has no database drivers"),
         (CRON, "this build has no scheduler threads"),
+        (PROC, "this build has no child processes nor an I/O hub (select/proc_* need a process)"),
+        (BUS, "this build has no event bus (a single embedded interpreter has no swarm)"),
+        (AGENTS, "this build has no agent threads"),
     ];
     for (names, why) in families {
         for name in names {

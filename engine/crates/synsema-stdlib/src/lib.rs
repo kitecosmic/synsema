@@ -50,4 +50,6 @@ pub mod server;
 pub mod spend;
 pub mod webauth;
 #[cfg(feature = "native")]
+pub mod proc;
+#[cfg(feature = "native")]
 pub mod ws;

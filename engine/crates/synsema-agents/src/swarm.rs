@@ -11,9 +11,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
+use synsema_core::interpreter::CancelToken;
 use synsema_core::types::SendValue;
 
 use crate::blackboard::Blackboard;
+use crate::bus::Bus;
 
 fn now_secs() -> f64 {
     synsema_core::clock::now_secs_f64()
@@ -51,6 +53,9 @@ pub struct AgentInfo {
     pub error: Option<String>,
     pub started_at: f64,
     pub finished_at: f64,
+    /// Token de cancelación cooperativa del agente (`agent_stop`): el intérprete del
+    /// agente lo adopta al arrancar; `agent_stop(id)` lo cancela desde cualquier hilo.
+    pub cancel: CancelToken,
 }
 
 #[derive(Clone, Debug)]
@@ -70,6 +75,8 @@ struct SwarmState {
 /// Estado compartido del swarm (tras `Arc<Swarm>`).
 pub struct Swarm {
     pub blackboard: Blackboard,
+    /// Bus de eventos pub/sub del proceso (fan-out; ver `bus.rs`).
+    pub bus: std::sync::Arc<Bus>,
     state: Mutex<SwarmState>,
     cvar: Condvar,
     threads: Mutex<Vec<JoinHandle<()>>>,
@@ -83,8 +90,15 @@ impl Default for Swarm {
 
 impl Swarm {
     pub fn new() -> Self {
+        Self::with_bus(std::sync::Arc::new(Bus::new()))
+    }
+
+    /// Un swarm que COMPARTE el bus de otro (ticks de cron en modo `run`: su swarm es
+    /// propio, pero los eventos deben ser los mismos que ve el programa principal).
+    pub fn with_bus(bus: std::sync::Arc<Bus>) -> Self {
         Self {
             blackboard: Blackboard::new(),
+            bus,
             state: Mutex::new(SwarmState {
                 agents: IndexMap::new(),
                 pending: HashMap::new(),
@@ -108,9 +122,49 @@ impl Swarm {
                 error: None,
                 started_at: now_secs(),
                 finished_at: 0.0,
+                cancel: CancelToken::new(),
             },
         );
         id
+    }
+
+    /// Token de cancelación de un agente registrado (para que su intérprete lo adopte).
+    pub fn cancel_token(&self, id: &str) -> Option<CancelToken> {
+        self.state.lock().unwrap().agents.get(id).map(|a| a.cancel.clone())
+    }
+
+    /// `agent_stop(id)`: cancela cooperativamente un agente vivo. `false` si no existe
+    /// o ya terminó (nunca silencio: el caller lo reporta).
+    pub fn stop_agent(&self, id: &str, reason: &str) -> bool {
+        let token = {
+            let g = self.state.lock().unwrap();
+            match g.agents.get(id) {
+                Some(a) if matches!(a.state, AgentState::Starting | AgentState::Working | AgentState::Waiting) => {
+                    Some(a.cancel.clone())
+                }
+                _ => None,
+            }
+        };
+        match token {
+            Some(t) => {
+                t.cancel(reason);
+                // Despertar a quien esté bloqueado en wait_for_signal.
+                self.cvar.notify_all();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Cancela TODOS los agentes vivos (shutdown ordenado del proceso).
+    pub fn stop_all_agents(&self, reason: &str) -> usize {
+        let ids: Vec<String> = self.state.lock().unwrap().agents.keys().cloned().collect();
+        ids.iter().filter(|id| self.stop_agent(id, reason)).count()
+    }
+
+    /// Snapshot de todos los agentes (para `agents()`).
+    pub fn agents_info(&self) -> Vec<(String, AgentInfo)> {
+        self.state.lock().unwrap().agents.iter().map(|(id, a)| (id.clone(), a.clone())).collect()
     }
 
     pub fn set_state(&self, id: &str, state: AgentState) {
@@ -164,6 +218,13 @@ impl Swarm {
     /// mismo (WAITING) → "no hay productor" → bail con None y la señal nunca se espera.
     /// El `timeout` acota los deadlocks reales (waiter sin emisor posible).
     pub fn wait_for_signal(&self, name: &str, timeout: Duration) -> Option<Signal> {
+        self.wait_for_signal_cancellable(name, timeout, &|| false)
+    }
+
+    /// Como `wait_for_signal`, pero sale (con `None`) apenas `cancelled()` sea true
+    /// (timeout de handler, shutdown, `agent_stop`). El chequeo corre en cada
+    /// despertar de la condvar y como mucho cada 100 ms.
+    pub fn wait_for_signal_cancellable(&self, name: &str, timeout: Duration, cancelled: &dyn Fn() -> bool) -> Option<Signal> {
         let deadline = Instant::now() + timeout;
         let mut g = self.state.lock().unwrap();
         loop {
@@ -182,15 +243,17 @@ impl Swarm {
             if !producer_alive && !g.agents.is_empty() {
                 return None;
             }
+            if cancelled() {
+                return None;
+            }
             let now = Instant::now();
             if now >= deadline {
                 return None;
             }
-            let (ng, res) = self.cvar.wait_timeout(g, deadline - now).unwrap();
+            let wait = (deadline - now).min(Duration::from_millis(100));
+            let (ng, _res) = self.cvar.wait_timeout(g, wait).unwrap();
             g = ng;
-            if res.timed_out() {
-                // Re-chequeo una vez más arriba del loop; si nada, saldrá por deadline.
-            }
+            // Re-chequeo arriba del loop (señal, productor muerto, cancelación, deadline).
         }
     }
 

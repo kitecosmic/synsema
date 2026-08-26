@@ -1,0 +1,128 @@
+//! Techo del host bajo `serve` (`synsema serve --sandbox | --cap-set`), spec
+//! `agentic-apps-gaps.md` §7: un handler Y un agente spawneado desde un handler no
+//! pueden exceder lo que el operador fijó, aunque su cuerpo declare `require`.
+//!
+//! Vive en su propio binario de test: el techo de serve es política del PROCESO
+//! (`OnceLock`), y no debe contaminar a los demás e2e del runtime.
+//!
+//! También verifica que el agente spawneado desde un handler nace con el wiring de
+//! serve (`state_*` compartido) y queda observable con `agents()`.
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::thread;
+use std::time::Duration;
+
+use synsema_capabilities::model::{Capability, CapabilityType};
+use synsema_runtime::serve::{run_serve_program_with_overrides, ServeOverrides};
+
+fn free_port() -> u16 {
+    TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port()
+}
+
+fn wait_ready(port: u16) {
+    for _ in 0..100 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            thread::sleep(Duration::from_millis(150));
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("el server no quedó listo en :{}", port);
+}
+
+fn get(port: u16, target: &str) -> String {
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    let req = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    sock.write_all(req.as_bytes()).unwrap();
+    let mut resp = String::new();
+    let _ = sock.read_to_string(&mut resp);
+    resp
+}
+
+fn status(resp: &str) -> u16 {
+    resp.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0)
+}
+
+fn shell() -> &'static str {
+    if cfg!(windows) {
+        "cmd"
+    } else {
+        "sh"
+    }
+}
+
+#[test]
+fn host_ceiling_binds_handlers_and_spawned_agents_under_serve() {
+    let port = free_port();
+    let sh = shell();
+    let run_call = if cfg!(windows) {
+        "run(\"cmd\", [\"/C\", \"echo hi\"])"
+    } else {
+        "run(\"sh\", [\"-c\", \"echo hi\"])"
+    };
+    let prog = format!(
+        r#"require serve({p})
+require time
+
+agent Runner
+    require exec("{sh}")
+    let r be {run_call}
+    state_set("agent_ran", r["stdout"])
+
+serve on {p}
+    route "GET /exec"
+        require exec("{sh}")
+        let r be {run_call}
+        give {{"out": r["stdout"]}}
+
+    route "GET /spawn"
+        spawn Runner
+        give {{"spawned": true}}
+
+    route "GET /state"
+        give {{"agent_ran": state_get("agent_ran"), "agents": agents()}}
+"#,
+        p = port,
+        sh = sh,
+        run_call = run_call
+    );
+    // Techo: stdout + time + el serve del puerto — SIN exec.
+    let ceiling = vec![
+        Capability::new(CapabilityType::Stdout, None),
+        Capability::new(CapabilityType::Time, None),
+        Capability::new(CapabilityType::Serve, Some(port.to_string())),
+    ];
+    let ov = ServeOverrides { ceiling: Some(ceiling), ..Default::default() };
+    thread::spawn(move || {
+        let r = run_serve_program_with_overrides(&prog, "<ceiling>", false, ov);
+        if !r.success {
+            eprintln!("serve terminó con errores: {:?}", r.errors);
+        }
+    });
+    wait_ready(port);
+
+    // El handler no puede `require exec` por encima del techo: 500 con motivo claro.
+    let r = get(port, "/exec");
+    assert_eq!(status(&r), 500, "{}", r);
+    let low = r.to_lowercase();
+    assert!(low.contains("exec") && (low.contains("not permitted") || low.contains("ceiling") || low.contains("denied") || low.contains("capability")), "{}", r);
+
+    // El agente spawneado desde el handler tampoco: termina en error, visible en agents().
+    let s = get(port, "/spawn");
+    assert_eq!(status(&s), 200, "{}", s);
+    let mut seen_error = false;
+    for _ in 0..40 {
+        thread::sleep(Duration::from_millis(100));
+        let st = get(port, "/state");
+        if st.contains("\"state\":\"error\"") || st.contains("\"state\": \"error\"") {
+            assert!(st.contains("\"agent_ran\":null") || st.contains("\"agent_ran\": null"), "el agente NO ejecutó: {}", st);
+            let low = st.to_lowercase();
+            assert!(low.contains("exec"), "el error nombra la capability: {}", st);
+            seen_error = true;
+            break;
+        }
+    }
+    assert!(seen_error, "el agente debía fallar por el techo del host");
+}

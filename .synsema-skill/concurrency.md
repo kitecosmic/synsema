@@ -60,6 +60,29 @@ let merged be flatten(partial)                            -- join the results
 - **`spawn` / swarm** (see agents.md) — run *different* agents concurrently that
   coordinate via blackboard/signals. Heterogeneous concurrency.
 
+## One event loop: `select` (sockets + processes + bus) — engine v0.6.7+
+
+An agent in the loop waits on several things at once: the client's socket, the process
+it launched, an upstream feed, the bus. `select` is **the one wait** for all of them —
+no polling with `sleep`:
+
+```
+let ev be select({"sock": socket, "child": child, "feed": feed, "cancel": sub}, 60)
+-- targets: a list of handles, or a map name → handle (any mix of ws_connect / socket /
+-- proc_spawn / bus_subscribe handles). Returns the FIRST ready event, tagged with
+--   source: "ws" | "proc" | "bus",  handle,  name (when you passed a map)
+-- plus the event's own fields (type/data for ws and proc; topic/data/timestamp for bus).
+-- nothing at the timeout, or when every target is gone.
+```
+
+Fair (round-robin between targets), sleeps in the kernel poller while idle (never
+busy-spins), fails fast with a catchable error when a target dies with a protocol/queue
+error, and wakes at once on cancellation (route `timeout`, shutdown, `agent_stop`).
+`ws_select` now accepts any handle too (it keeps its historical `conn` tag);
+`proc_select` is the same wait restricted to processes. Details: [serve.md](serve.md)
+§ WebSocket routes, [processes.md](processes.md) § Live processes, [agents.md](agents.md)
+§ Event bus.
+
 ## The HTTP server is already async (high concurrency, no `async` keyword)
 
 The `serve` stack runs on an async `hyper`/`tokio` runtime (one task per connection), with

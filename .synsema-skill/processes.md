@@ -103,8 +103,67 @@ Same language; the difference is one visible `require` line:
 
 No hidden "dangerous mode": the broad grant is declared and audited like any other.
 
+## Live processes — `proc_*` (incremental output, live stdin, kill) — engine v0.6.7+
+
+`run` captures everything and returns at the end. An agent driving `cargo test`, `npm run
+build`, a long `python worker.py` needs to **see the output as it comes**, feed stdin, and
+kill it: that is a process as a **handle** with events. Same gate as `run` (`exec(cmd)`,
+scope = the cmd as written), args as a list, never a shell. **No PTY** (pipes: a program
+that checks "is a tty" behaves as in CI) — deliberate; see below.
+
+```
+require exec("cargo")
+let p be proc_spawn("cargo", ["test"], {"cwd": "./repo"})
+while true
+    let ev be proc_recv(p, 60)          -- {type: "stdout"|"stderr"|"exit", data} or nothing (timeout)
+    when ev == nothing
+        proc_kill(p)                     -- no output in 60 s: TERM (KILL with "KILL")
+    otherwise when ev["type"] == "exit"
+        print("exit " + text(ev["data"]["exit_code"]))
+        stop
+    otherwise
+        print(ev["type"] + ": " + ev["data"])   -- one event per LINE (no trailing \n / \r)
+proc_close(p)
+```
+
+| Builtin | Returns |
+|---|---|
+| `proc_spawn(cmd, args?, opts?)` | handle (int) — also in `select` |
+| `proc_recv(h, timeout?)` | next event, or `nothing` at the timeout |
+| `proc_select(list \| map, timeout?)` | first ready event among processes (`select` accepts any handle) |
+| `proc_send(h, text \| bytes)` | `true`; error if stdin is closed. **Blocking write** — a child that never reads its stdin blocks the caller (pipe semantics) |
+| `proc_close_stdin(h)` | `true` (EOF to the child) |
+| `proc_status(h)` | `"running"` \| `"exited"` \| `"killed"` \| `"closed"` (after `proc_close`/unknown) |
+| `proc_kill(h, signal?)` | `true`; `"TERM"` (default, Unix SIGTERM) / `"KILL"`; Windows: both `TerminateProcess` |
+| `proc_wait(h, timeout?)` | `{exit_code, signal}` or `nothing` at the timeout |
+| `proc_stats(h)` | `{pid, cmd, status, exit_code, queued, queued_bytes, dropped, uptime}` |
+| `proc_close(h)` | releases the handle; **kills if still alive** (TERM, KILL after 2 s, then wait) — no orphans, idempotent |
+
+Events: `{type: "stdout"|"stderr", data: text}` (lossy UTF-8; `line_mode: false` gives raw
+`bytes` chunks of ≤ 64 KiB); `{type: "exit", data: {exit_code, signal}}` once, after the
+pipes are drained (`exit_code` `-1` when killed by a signal; `signal` is `nothing` on a
+normal exit and always on Windows). Every event from `select`/`proc_recv` also carries
+`source: "proc"`, `handle` (and `name` when you passed a map).
+
+`opts`: `cwd`, `env` (inherits + overrides; a `secret` value → error, `reveal()` it
+explicitly), `line_mode` (default `true`), `stderr` (`"separate"` default | `"merge"` →
+everything arrives as `stdout`), and the bounded queue: `max_queue` (4096 events),
+`max_queue_bytes` (64 MiB), `on_full` = `"block"` (default: the reader stops draining the
+pipe, the child blocks on its `write` — real backpressure, no loss) | `"drop_oldest"` |
+`"error"` (the next recv raises a catchable error and the process is killed).
+
+Lifecycle: **when the interpreter ends, every live process is killed** (end of a request
+under `serve`, end of the program, end of an agent). A handler never leaves a ghost; for
+work that must outlive the request use `cron_after` or an agent (own lifecycle). Budget:
+`SYNSEMA_PROC_MAX` live processes per interpreter (default 64, hard ceiling 1024) → error
+over it. A grandchild that keeps the pipe open after the child exited cannot hang you:
+1 s grace, then the `exit` event is delivered.
+
 ## Gotchas
 - Shell injection: `run(tool, [args])` is safe; `run("bash", ["-c", llm_string])` is not. Choose by trust.
+- `proc_*` is pipes, not a terminal: no PTY (`vim`, password prompts, progress bars that need a tty won't work). Cover 90 % of agent needs; a PTY would enter later as a `pty: true` option, not a new API.
+- `proc_send` blocks if the child never reads stdin; `proc_close_stdin` sends EOF (many tools wait for it).
+- Cancellation (route `timeout`, shutdown, `agent_stop`) kills the children of `run`/`proc_spawn` — they don't survive the handler.
 - No pipes/redirects/globs in `run` itself — use a shell for those.
 - No TTY/interactivity (capture only — not for `vim`/prompts).
 - `exit_code != 0` does NOT raise; `raise(...)` yourself if you want failure.

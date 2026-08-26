@@ -165,8 +165,9 @@ fn children(n: &Node) -> Vec<&Node> {
             v.extend(recover_body.iter());
             v
         }
-        RouteDefinition { rate_limit, body, .. } => {
+        RouteDefinition { rate_limit, timeout, body, .. } => {
             let mut v: Vec<&Node> = rate_limit.iter().map(|b| b.as_ref()).collect();
+            v.extend(timeout.iter().map(|b| b.as_ref()));
             v.extend(body.iter());
             v
         }
@@ -177,6 +178,7 @@ fn children(n: &Node) -> Vec<&Node> {
             max_body,
             max_streams,
             rate_limit,
+            timeout,
             static_mounts,
             cors,
             describe,
@@ -190,7 +192,7 @@ fn children(n: &Node) -> Vec<&Node> {
             ..
         } => {
             let mut v = vec![port.as_ref()];
-            for b in [auth_handler, error_handler, max_body, max_streams, rate_limit, cors, describe, tls_cert, tls_key, tls_auto_email, domain].into_iter().flatten() {
+            for b in [auth_handler, error_handler, max_body, max_streams, rate_limit, timeout, cors, describe, tls_cert, tls_key, tls_auto_email, domain].into_iter().flatten() {
                 v.push(b);
             }
             v.extend(static_mounts.iter());
@@ -220,6 +222,8 @@ fn children(n: &Node) -> Vec<&Node> {
             v
         }
         StreamBlock { body } => body.iter().collect(),
+        SocketBlock { body } => body.iter().collect(),
+        TimeoutClause { secs } => secs.iter().map(|b| b.as_ref()).collect(),
         ProxyStatement { target } => vec![target.as_ref()],
         SendStatement { value, .. } => vec![value],
         RateLimitClause { count, .. } => count.iter().map(|b| b.as_ref()).collect(),
@@ -641,8 +645,9 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
             v.extend(recover_body.iter_mut());
             v
         }
-        RouteDefinition { rate_limit, body, .. } => {
+        RouteDefinition { rate_limit, timeout, body, .. } => {
             let mut v: Vec<&mut Node> = rate_limit.iter_mut().map(|b| b.as_mut()).collect();
+            v.extend(timeout.iter_mut().map(|b| b.as_mut()));
             v.extend(body.iter_mut());
             v
         }
@@ -653,6 +658,7 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
             max_body,
             max_streams,
             rate_limit,
+            timeout,
             static_mounts,
             cors,
             describe,
@@ -666,7 +672,7 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
             ..
         } => {
             let mut v = vec![port.as_mut()];
-            for b in [auth_handler, error_handler, max_body, max_streams, rate_limit, cors, describe, tls_cert, tls_key, tls_auto_email, domain].into_iter().flatten() {
+            for b in [auth_handler, error_handler, max_body, max_streams, rate_limit, timeout, cors, describe, tls_cert, tls_key, tls_auto_email, domain].into_iter().flatten() {
                 v.push(b.as_mut());
             }
             v.extend(static_mounts.iter_mut());
@@ -694,6 +700,8 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
             v
         }
         StreamBlock { body } => body.iter_mut().collect(),
+        SocketBlock { body } => body.iter_mut().collect(),
+        TimeoutClause { secs } => secs.iter_mut().map(|b| b.as_mut()).collect(),
         ProxyStatement { target } => vec![target.as_mut()],
         SendStatement { value, .. } => vec![value.as_mut()],
         RateLimitClause { count, .. } => count.iter_mut().map(|b| b.as_mut()).collect(),

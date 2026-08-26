@@ -68,13 +68,14 @@ usually version skew, not a bug.
 
 **By topic**
 - [stdlib.md](stdlib.md) — HTTP requests, WebSocket client (live feeds, gated by `net` — `ws_select` multiplexing thousands of feeds, opt-in reconnect + keepalive/half-open, backpressure, `parallel_map` fan-out), databases (SQL: SQLite / Postgres / MySQL · document: MongoDB · key-value: Redis), cron scheduler, blockchain (ETH/EVM · Avalanche · Solana · Algorand · Bitcoin: the full read → build → sign → send → confirm loop — RPC read-side gated by `net` (nonce/fees/balances/`eth_call`/receipts, Solana blockhash/confirm, algod params/wait, Bitcoin utxos/fees/broadcast/confirm), `tx_eip1559` and `btc_tx` builders, gated `sign` + audit (incl. Schnorr taproot), HD wallets/keystore/WIF gated by `wallet` — BIP-39/BIP-32/SLIP-0010/Algorand-25/BIP-84/86, ABI calldata, EIP-191/712, Solana message/tx + PDAs/SPL, Algorand canonical msgpack, Bitcoin UTXO builder G28 + BIP-143/341 sighash + PSBT, keccak256/hash160, RLP, base58/base32/bech32/bech32m, EIP-55)
-- [concurrency.md](concurrency.md) — Real multi-core parallelism: `parallel_map`, `chunk`, fan-out/merge
+- [concurrency.md](concurrency.md) — Real multi-core parallelism: `parallel_map`, `chunk`, fan-out/merge; `select` — one event loop over sockets + processes + the event bus
+- [processes.md](processes.md) — OS processes: one-shot `run` and live `proc_*` (streamed output, stdin, kill), both gated by `exec`
 - [frontend.md](frontend.md) — UIs/sites: `render()` templates (verbatim `{ raw }` blocks for inline CSS/JS, `{ otherwise when }`, each empty-branch, `enumerate`, includes **with props**, named slots, `json_for_script`), layouts/partials, static assets (cache/fallback), `content()`
 - [dataviz.md](dataviz.md) — Data & charts: CSV (`csv_parse`/`csv_encode`), stats (`median`/`percentile`/`histogram`), native SVG charts (`chart_svg` + negotiated `chart()` node — agents get the data, humans the chart), PNG/PDF export (`svg_to_png`/`svg_to_pdf`)
-- [serve.md](serve.md) — Native HTTP server: routes, auth, validation, pagination, SSE, rate limiting, SSR, static files, CORS, content negotiation, TLS/auto-HTTPS, reverse proxy, HTTP/2
+- [serve.md](serve.md) — Native HTTP server: routes, auth, validation, pagination, SSE (auto heartbeat), incoming WebSocket routes (`socket`), handler `timeout` + cancellation, ordered shutdown, rate limiting, SSR, static files, CORS, content negotiation, TLS/auto-HTTPS, reverse proxy, HTTP/2
 - [capabilities.md](capabilities.md) — Security model, `require`, sandbox, intent
 - [secrets.md](secrets.md) — `env` config, LLM-proof `secret`, `.env`, `reveal()` + audit, HMAC/bearer helpers
-- [agents.md](agents.md) — Multi-agent coordination, blackboard, swarm, signals
+- [agents.md](agents.md) — Multi-agent coordination, blackboard, swarm, signals, event bus (`bus_*` fan-out), `agents()`/`agent_stop`
 - [llm.md](llm.md) — LLM operations: reason, decide, analyze, generate
 - [human.md](human.md) — Human interaction: approve, confirm, ask, show
 - [observability.md](observability.md) — trace, log, measure, checkpoint, diagnostics

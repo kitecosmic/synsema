@@ -125,6 +125,8 @@
 `**Directory-tree scope:** to read/write files under a dir, grant **both** `file("dir")` (the dir node,
 `for `list_dir`) **and** `file("dir/*")` (the files inside). Scopes are **literal** — `require exec(cmd)`
 `with a variable does not parse; use `require exec` for any command, `exec("git")` for one.
+`exec` gates both `run` (one-shot) and `proc_spawn` (live process, v0.6.7+) with the same
+scope; `/openapi.json` lists it under `x-synsema-capabilities` for routes that call either.
 `
 `Plain `call`/normal invocation does NOT isolate — use `call_tool` for untrusted, model-chosen tools.
 `

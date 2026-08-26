@@ -681,7 +681,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         interp.register_builtin(
             "run",
             -1,
-            Rc::new(move |_i, args, _loc| {
+            Rc::new(move |i, args, _loc| {
                 let cmd = raw_str(arg(args, 0)?);
                 // args_list (opcional; si está, debe ser lista).
                 let arg_list: Vec<String> = match args.get(1) {
@@ -770,6 +770,12 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     match child.try_wait() {
                         Ok(Some(st)) => break Some(st),
                         Ok(None) => {
+                            // Cancelación cooperativa: no dejar el hijo huérfano.
+                            if i.is_cancelled() {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                i.check_cancel()?;
+                            }
                             if Instant::now() >= deadline {
                                 let _ = child.kill();
                                 let _ = child.wait();
@@ -834,11 +840,21 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         interp.register_builtin(
             "sleep",
             1,
-            Rc::new(move |_i, args, _loc| {
+            Rc::new(move |i, args, _loc| {
                 require(&caps, Capability::new(CapabilityType::Time, None), "sleep()")?;
                 let secs = args.first().and_then(|v| arg_f64(v).ok()).unwrap_or(0.0);
                 let secs = secs.clamp(0.0, 3600.0);
-                std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+                // Dormir en tramos: una cancelación cooperativa (timeout de handler,
+                // shutdown, agent_stop) corta el sleep en ≤100 ms, no al vencer.
+                let deadline = Instant::now() + std::time::Duration::from_secs_f64(secs);
+                loop {
+                    i.check_cancel()?;
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    std::thread::sleep((deadline - now).min(std::time::Duration::from_millis(100)));
+                }
                 Ok(SynValue::Nothing)
             }),
         );

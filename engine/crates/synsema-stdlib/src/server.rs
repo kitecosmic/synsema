@@ -18,8 +18,9 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrd};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 
@@ -32,8 +33,11 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 
+use synsema_core::interpreter::CancelToken;
 use synsema_core::route_meta::ApiRoute;
 use synsema_core::types::{ServerValue, SynValue};
+
+use crate::ws::ServerSocketLink;
 
 use crate::discovery::{self, ApiInfo};
 
@@ -571,12 +575,39 @@ pub struct ServeRuntime {
     active_streams: Mutex<i64>,
     /// `errors with <task>` (serve-level): da forma a 401/404/405/500.
     error_handler: Option<ErrorHandler>,
+    /// `timeout N` del serve block: techo de vida por defecto de los handlers (segundos).
+    /// `None` = sin límite (comportamiento histórico). Una route lo sobreescribe.
+    pub default_timeout: Option<f64>,
+    /// Shutdown ordenado en curso (SIGINT/SIGTERM): no se aceptan requests nuevas
+    /// (503 + `Connection: close`) mientras se drenan las que están en vuelo.
+    shutting_down: AtomicBool,
+    /// Requests en vuelo (jobs del intérprete corriendo o encolados).
+    inflight: AtomicUsize,
+    /// Tokens de cancelación de los jobs en vuelo (`dedicated` = stream/socket): el
+    /// drain los cancela — primero los long-lived, al vencer la gracia todos.
+    active_cancels: Mutex<Vec<(CancelToken, bool)>>,
+    /// Hook del runtime al iniciar el drain (parar cron, cancelar agentes).
+    on_shutdown: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
-/// El resultado de `dispatch`: una respuesta lista, o un hand-off a streaming SSE.
+/// El resultado de `dispatch`: una respuesta lista, o un hand-off a streaming SSE /
+/// a un socket entrante.
 pub enum Dispatched {
     Response { status: u16, body: ResponseBody, headers: Vec<(String, String)> },
     Stream { stream_handler: Option<StreamHandler>, ctx: Box<Ctx> },
+    /// Ruta `socket`: el handler corre en hilo dedicado con el enlace al transporte.
+    Socket { socket_handler: Option<SocketHandler>, ctx: Box<Ctx> },
+}
+
+/// Cómo atender una request, resuelto ANTES de correr el intérprete (vhost + match).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RoutePlan {
+    /// Hilo dedicado (stream/socket/approvals) en vez del pool acotado.
+    pub dedicated: bool,
+    /// La ruta es un `socket` (WebSocket entrante).
+    pub socket: bool,
+    /// Techo de vida del handler (route > serve); `None` = sin límite.
+    pub timeout: Option<f64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -617,7 +648,80 @@ impl ServeRuntime {
             rate_limiter: RateLimiter::new(),
             active_streams: Mutex::new(0),
             error_handler: None,
+            default_timeout: None,
+            shutting_down: AtomicBool::new(false),
+            inflight: AtomicUsize::new(0),
+            active_cancels: Mutex::new(Vec::new()),
+            on_shutdown: Mutex::new(None),
         }
+    }
+
+    /// `timeout N` del serve block (segundos; `None` = sin límite).
+    pub fn set_default_timeout(&mut self, secs: Option<f64>) {
+        self.default_timeout = secs.filter(|s| s.is_finite() && *s > 0.0);
+    }
+
+    /// Hook que corre al iniciar el drain del shutdown (lo cablea el runtime).
+    pub fn set_on_shutdown(&self, f: Box<dyn Fn() + Send + Sync>) {
+        if let Ok(mut g) = self.on_shutdown.lock() {
+            *g = Some(f);
+        }
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(AtomicOrd::Relaxed)
+    }
+
+    /// Requests en vuelo (para el drain y la observabilidad).
+    pub fn inflight(&self) -> usize {
+        self.inflight.load(AtomicOrd::Relaxed)
+    }
+
+    fn begin_request(&self, cancel: &CancelToken, dedicated: bool) {
+        self.inflight.fetch_add(1, AtomicOrd::Relaxed);
+        if let Ok(mut g) = self.active_cancels.lock() {
+            g.push((cancel.clone(), dedicated));
+        }
+    }
+
+    fn end_request(&self, cancel: &CancelToken) {
+        self.inflight.fetch_sub(1, AtomicOrd::Relaxed);
+        if let Ok(mut g) = self.active_cancels.lock() {
+            let id = cancel.id();
+            g.retain(|(t, _)| t.id() != id);
+        }
+    }
+
+    /// Inicia el drain: no más requests nuevas; cancela los handlers long-lived
+    /// (stream/socket) — los sized terminan solos dentro de la gracia. Devuelve
+    /// cuántas requests quedaban en vuelo.
+    pub fn begin_shutdown(&self) -> usize {
+        self.shutting_down.store(true, AtomicOrd::SeqCst);
+        if let Ok(g) = self.on_shutdown.lock() {
+            if let Some(f) = g.as_ref() {
+                f();
+            }
+        }
+        if let Ok(g) = self.active_cancels.lock() {
+            for (t, dedicated) in g.iter() {
+                if *dedicated {
+                    t.cancel("server shutting down");
+                }
+            }
+        }
+        self.inflight()
+    }
+
+    /// Vencida la gracia: cancela TODO lo que siga en vuelo.
+    pub fn cancel_all_requests(&self) -> usize {
+        let mut n = 0;
+        if let Ok(g) = self.active_cancels.lock() {
+            for (t, _) in g.iter() {
+                t.cancel("server shutting down (grace period elapsed)");
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Cablea la task de `errors with` (el runtime la construye como el auth handler).
@@ -715,6 +819,7 @@ impl ServeRuntime {
                 param_names: r.param_names.clone(),
                 requires_auth: r.requires_auth,
                 streaming: r.streaming,
+                socket: r.socket,
                 rate_limit: r.rate_limit,
                 rate_unlimited: r.rate_unlimited,
                 proxy: r.proxy_target.is_some(),
@@ -972,7 +1077,13 @@ impl ServeRuntime {
     }
 
     fn server_error(&self, detail: &str) -> ResponseBody {
-        eprintln!("[serve:{}] 500 {}", self.port, detail);
+        // Un handler CANCELADO (timeout de la ruta → el cliente ya recibió 504; shutdown)
+        // no es un 500 del programa: el log lo dice con su nombre.
+        if detail.starts_with("cancelled") {
+            eprintln!("[serve:{}] handler {}", self.port, detail);
+        } else {
+            eprintln!("[serve:{}] 500 {}", self.port, detail);
+        }
         let body = if self.secure {
             obj(vec![("error", Json::Str("internal server error".into())), ("status", Json::Int(500))])
         } else {
@@ -987,10 +1098,24 @@ impl ServeRuntime {
     /// vhost + match de ruta (mismo criterio que el primer match de `dispatch`), sin correr
     /// auth ni el handler. Sirve para elegir el hilo: streams → hilo dedicado; sized → pool.
     pub fn route_is_streaming(&self, method: &str, path: &str, headers: &[(String, String)]) -> bool {
+        self.route_plan(method, path, headers).dedicated
+    }
+
+    /// Plan de atención de la request (hilo, socket, timeout) — resolución barata
+    /// (vhost + match de ruta, sin auth ni handler). Los streams y sockets (long-lived,
+    /// `Ctx` !Send) van a hilo dedicado; el timeout efectivo es route > serve.
+    pub fn route_plan(&self, method: &str, path: &str, headers: &[(String, String)]) -> RoutePlan {
         let host = self.select_host(&header_value(headers, "host"));
         match host.match_route(method, path) {
-            Some((i, _)) => host.routes[i].streaming,
-            None => false,
+            Some((i, _)) => {
+                let r = &host.routes[i];
+                RoutePlan {
+                    dedicated: r.streaming || r.socket,
+                    socket: r.socket,
+                    timeout: r.timeout.or(self.default_timeout).filter(|t| t.is_finite() && *t > 0.0),
+                }
+            }
+            None => RoutePlan::default(),
         }
     }
 
@@ -1165,6 +1290,7 @@ impl ServeRuntime {
         body_raw: &[u8],
         body_file: Option<&str>,
         client_ip: &str,
+        cancel: CancelToken,
     ) -> Dispatched {
         let resp = |status, body| Dispatched::Response { status, body, headers: vec![] };
 
@@ -1329,6 +1455,7 @@ impl ServeRuntime {
             json: json_obj,
             client_ip: client_ip.to_string(),
             user: None,
+            cancel,
         };
 
         // Auth. El `ctx` ya existe (user aún nothing) — el hook lo recibe entero
@@ -1417,6 +1544,26 @@ impl ServeRuntime {
                     body: self.server_error(&format!("proxy error: {}", e)),
                     headers: rate_headers,
                 },
+            };
+        }
+
+        // Socket entrante (ruta `socket`): ocupa un slot de stream (conexión larga con
+        // hilo propio) y delega al camino de socket. El upgrade HTTP lo hace el lado
+        // async (que ya validó los headers de RFC 6455 antes de llegar acá).
+        if host.routes[idx].socket {
+            if !self.try_acquire_stream() {
+                return Dispatched::Response {
+                    status: 503,
+                    body: ResponseBody::Json(obj(vec![
+                        ("error", Json::Str("too many concurrent streams".into())),
+                        ("status", Json::Int(503)),
+                    ])),
+                    headers: vec![("Retry-After".to_string(), "5".to_string())],
+                };
+            }
+            return Dispatched::Socket {
+                socket_handler: host.routes[idx].socket_handler.clone(),
+                ctx: Box::new(ctx),
             };
         }
 
@@ -1807,7 +1954,65 @@ pub fn serve_forever_tls_auto(rt: Arc<ServeRuntime>, listener: TcpListener, conf
     run_async(rt, listener, TlsMode::Swap(config));
 }
 
+/// Knobs del servidor que el runtime reconoce — del ENTORNO DEL PROCESO (export /
+/// systemd / Docker), no del `.env` (que alimenta `env()`/`secret()` y la config de
+/// LLM/humanos). Lista CANÓNICA (espejo de `LLM_ENV_VARS`/`HUMAN_ENV_VARS`/
+/// `CEILING_ENV_VARS`): el test anti-rot del CLI (`env_example_in_sync_with_engine_knobs`)
+/// la cruza con el `.env.example` de `init` — sumar un knob acá sin documentarlo en el
+/// template rompe el build a propósito.
+pub const SERVE_ENV_VARS: &[&str] = &[
+    "SYNSEMA_SERVE_WORKERS",
+    "SYNSEMA_SHUTDOWN_GRACE",
+    "SYNSEMA_SSE_KEEPALIVE",
+    "SYNSEMA_WS_SERVER_PING",
+    "SYNSEMA_WS_SUBPROTOCOLS",
+    "SYNSEMA_WS_MAX_MESSAGE",
+    "SYNSEMA_WS_MAX_CONNS",
+    "SYNSEMA_PROC_MAX",
+];
+
+/// Servidores (`run_async`) vivos en el proceso: con varios `serve on` en un programa,
+/// el shutdown ordenado sale del proceso cuando el ÚLTIMO terminó de drenar — no
+/// cuando el primero (que cortaría el drain de los demás).
+static LIVE_SERVERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Gracia del shutdown ordenado (segundos): `SYNSEMA_SHUTDOWN_GRACE`, default 10, `0` =
+/// inmediato.
+fn shutdown_grace() -> Duration {
+    let secs = std::env::var("SYNSEMA_SHUTDOWN_GRACE")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|f| f.is_finite() && *f >= 0.0)
+        .unwrap_or(10.0);
+    Duration::from_secs_f64(secs)
+}
+
+/// Resuelve al recibir SIGINT (Ctrl-C) o, en Unix, SIGTERM (lo que manda Docker/systemd).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = term => {}
+    }
+}
+
 fn run_async(rt: Arc<ServeRuntime>, listener: TcpListener, tls: TlsMode) {
+    LIVE_SERVERS.fetch_add(1, AtomicOrd::SeqCst);
     let _ = listener.set_nonblocking(true);
     // Arranca el pool del intérprete (stack grande, acotado) ANTES de aceptar conexiones.
     let _ = interp_pool();
@@ -1829,23 +2034,73 @@ fn run_async(rt: Arc<ServeRuntime>, listener: TcpListener, tls: TlsMode) {
             Ok(l) => l,
             Err(_) => return,
         };
+        // Shutdown ordenado (SIGINT/SIGTERM): dejar de aceptar, drenar lo que está en
+        // vuelo hasta la gracia, cancelar lo que quede, salir con 0 (fue pedido).
+        let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+        let mut shutdown = std::pin::pin!(shutdown_signal());
         loop {
-            let (tcp, peer) = match listener.accept().await {
-                Ok(x) => x,
-                Err(_) => continue,
-            };
-            let _ = tcp.set_nodelay(true);
-            let client_ip = peer.ip().to_string();
-            let rt = rt.clone();
-            let tls = tls.clone();
-            tokio::spawn(async move {
-                serve_conn(rt, tcp, client_ip, tls).await;
-            });
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (tcp, peer) = match accepted {
+                        Ok(x) => x,
+                        Err(_) => continue,
+                    };
+                    let _ = tcp.set_nodelay(true);
+                    let client_ip = peer.ip().to_string();
+                    let rt = rt.clone();
+                    let tls = tls.clone();
+                    let watcher = graceful.watcher();
+                    tokio::spawn(async move {
+                        serve_conn(rt, tcp, client_ip, tls, watcher).await;
+                    });
+                }
+                _ = &mut shutdown => break,
+            }
+        }
+        drop(listener);
+        let grace = shutdown_grace();
+        let inflight = rt.begin_shutdown();
+        eprintln!(
+            "[serve] shutting down: draining {} in-flight request(s), grace {:.0}s (SYNSEMA_SHUTDOWN_GRACE)",
+            inflight,
+            grace.as_secs_f64()
+        );
+        // Un segundo SIGINT durante el drain = salida inmediata (130, como un shell).
+        tokio::spawn(async {
+            shutdown_signal().await;
+            eprintln!("[serve] second signal: exiting now");
+            std::process::exit(130);
+        });
+        let deadline = Instant::now() + grace;
+        tokio::select! {
+            _ = graceful.shutdown() => {}
+            _ = tokio::time::sleep(grace) => {}
+        }
+        // Un `socket` ya upgradeado no es una conexión de hyper (el graceful no lo
+        // espera): la contabilidad propia (`inflight`) cubre streams, sockets y jobs
+        // encolados por igual — se espera hasta la gracia.
+        while rt.inflight() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if rt.inflight() > 0 {
+            let n = rt.cancel_all_requests();
+            eprintln!("[serve] grace period elapsed: cancelled {} request(s)", n);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        eprintln!("[serve] stopped");
+        if LIVE_SERVERS.fetch_sub(1, AtomicOrd::SeqCst) == 1 {
+            std::process::exit(0);
         }
     });
 }
 
-async fn serve_conn(rt: Arc<ServeRuntime>, tcp: tokio::net::TcpStream, client_ip: String, tls: TlsMode) {
+async fn serve_conn(
+    rt: Arc<ServeRuntime>,
+    tcp: tokio::net::TcpStream,
+    client_ip: String,
+    tls: TlsMode,
+    watcher: hyper_util::server::graceful::Watcher,
+) {
     let svc = {
         let rt = rt.clone();
         let ip = client_ip.clone();
@@ -1856,17 +2111,19 @@ async fn serve_conn(rt: Arc<ServeRuntime>, tcp: tokio::net::TcpStream, client_ip
         })
     };
     // auto::Builder negocia HTTP/1.1 o HTTP/2 (ALPN h2 sobre TLS; h2c o 1.1 en claro).
+    // `with_upgrades`: sin esto el `hyper::upgrade::on` de las rutas `socket` jamás
+    // resuelve. `watcher.watch`: la conexión participa del shutdown ordenado.
     let builder = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
     match tls {
         TlsMode::Plain => {
             let io = TokioIo::new(tcp);
-            let _ = builder.serve_connection(io, svc).await;
+            let _ = watcher.watch(builder.serve_connection_with_upgrades(io, svc)).await;
         }
         TlsMode::Fixed(cfg) => {
             let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
             if let Ok(stream) = acceptor.accept(tcp).await {
                 let io = TokioIo::new(stream);
-                let _ = builder.serve_connection(io, svc).await;
+                let _ = watcher.watch(builder.serve_connection_with_upgrades(io, svc)).await;
             }
         }
         TlsMode::Swap(cell) => {
@@ -1877,7 +2134,7 @@ async fn serve_conn(rt: Arc<ServeRuntime>, tcp: tokio::net::TcpStream, client_ip
             let acceptor = tokio_rustls::TlsAcceptor::from(cfg);
             if let Ok(stream) = acceptor.accept(tcp).await {
                 let io = TokioIo::new(stream);
-                let _ = builder.serve_connection(io, svc).await;
+                let _ = watcher.watch(builder.serve_connection_with_upgrades(io, svc)).await;
             }
         }
     }
@@ -1892,11 +2149,48 @@ struct HeadInfo {
     close: bool,
     cors: Option<String>,
     hsts: bool,
+    /// `101 Switching Protocols` de un socket entrante: `(Sec-WebSocket-Accept, protocolo)`.
+    upgrade: Option<(String, Option<String>)>,
+}
+
+/// Slot donde el hub deja su `mio::Waker` para el pump de un socket entrante.
+type WakerSlot = Arc<Mutex<Option<Arc<mio::Waker>>>>;
+
+/// Cierra la contabilidad de una request al terminar su job (o al paniquear).
+struct RequestGuard {
+    rt: Arc<ServeRuntime>,
+    cancel: CancelToken,
+}
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.rt.end_request(&self.cancel);
+    }
+}
+
+/// Intervalo del heartbeat SSE (`: keepalive` como comentario, invisible para
+/// `EventSource`): `SYNSEMA_SSE_KEEPALIVE` segundos, default 15, `0` lo apaga.
+fn sse_keepalive() -> Option<Duration> {
+    let secs = std::env::var("SYNSEMA_SSE_KEEPALIVE")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|f| f.is_finite() && *f >= 0.0)
+        .unwrap_or(15.0);
+    if secs > 0.0 {
+        Some(Duration::from_secs_f64(secs))
+    } else {
+        None
+    }
 }
 
 /// Body respaldado por un canal mpsc (SSE: frames a medida que el handler emite).
+/// Emite un comentario `: keepalive` si el handler lleva `keepalive` sin emitir —
+/// proxies y browsers dejan de cortar streams ociosos, sin tocar el protocolo. El
+/// `_done` avisa (al dropearse) que el body terminó: apaga el timer de timeout.
 struct ChannelBody {
     rx: tokio::sync::mpsc::Receiver<Bytes>,
+    keepalive: Option<Duration>,
+    idle: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    _done: Option<tokio::sync::oneshot::Sender<()>>,
 }
 impl hyper::body::Body for ChannelBody {
     type Data = Bytes;
@@ -1906,11 +2200,117 @@ impl hyper::body::Body for ChannelBody {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Bytes>, std::convert::Infallible>>> {
         match self.rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some(b)) => std::task::Poll::Ready(Some(Ok(Frame::data(b)))),
+            std::task::Poll::Ready(Some(b)) => {
+                self.idle = None; // hubo un frame real: el timer de idle arranca de nuevo
+                std::task::Poll::Ready(Some(Ok(Frame::data(b))))
+            }
             std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Pending => {
+                let Some(ka) = self.keepalive else { return std::task::Poll::Pending };
+                if self.idle.is_none() {
+                    self.idle = Some(Box::pin(tokio::time::sleep(ka)));
+                }
+                let fired = match self.idle.as_mut() {
+                    Some(s) => std::future::Future::poll(s.as_mut(), cx).is_ready(),
+                    None => false,
+                };
+                if fired {
+                    self.idle = Some(Box::pin(tokio::time::sleep(ka)));
+                    std::task::Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b": keepalive\n\n")))))
+                } else {
+                    std::task::Poll::Pending
+                }
+            }
         }
     }
+}
+
+/// `Sec-WebSocket-Accept` (RFC 6455 §4.2.2): base64(SHA-1(key + GUID)).
+fn ws_accept_key(key: &str) -> String {
+    use sha1::{Digest, Sha1};
+    let mut h = Sha1::new();
+    h.update(key.trim().as_bytes());
+    h.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    synsema_core::bytesutil::b64_encode(&h.finalize())
+}
+
+/// ¿La request pide un upgrade a WebSocket válido (RFC 6455)? Devuelve la key.
+fn websocket_upgrade_key(headers: &[(String, String)]) -> Option<String> {
+    let connection = header_value(headers, "connection").to_ascii_lowercase();
+    let upgrade = header_value(headers, "upgrade").to_ascii_lowercase();
+    let version = header_value(headers, "sec-websocket-version");
+    let key = header_value(headers, "sec-websocket-key");
+    let conn_ok = connection.split(',').any(|t| t.trim() == "upgrade");
+    if conn_ok && upgrade == "websocket" && version.trim() == "13" && !key.trim().is_empty() {
+        Some(key.trim().to_string())
+    } else {
+        None
+    }
+}
+
+/// Subprotocolo a acordar: el primero ofrecido por el cliente que figure en
+/// `SYNSEMA_WS_SUBPROTOCOLS` (lista separada por comas); sin la env no se acuerda
+/// ninguno (se omite el header, como manda la RFC).
+fn negotiate_subprotocol(headers: &[(String, String)]) -> Option<String> {
+    let offered = header_value(headers, "sec-websocket-protocol");
+    if offered.trim().is_empty() {
+        return None;
+    }
+    let allowed = std::env::var("SYNSEMA_WS_SUBPROTOCOLS").ok()?;
+    let allowed: Vec<String> = allowed.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    offered.split(',').map(|s| s.trim().to_string()).find(|o| allowed.iter().any(|a| a == o))
+}
+
+/// Bombea bytes entre el socket upgradeado (hyper) y el hilo del handler (canales del
+/// `ServerSocketLink`). Backpressure real en las dos direcciones: canales acotados —
+/// un handler lento frena la lectura del TCP (la ventana frena al cliente); un cliente
+/// lento frena las escrituras del handler (WouldBlock en el canal). Cada movimiento
+/// despierta al hub por el Waker que el hub dejó en `waker_slot`.
+async fn pump_upgraded_socket(
+    upgraded: hyper::upgrade::Upgraded,
+    in_tx: tokio::sync::mpsc::Sender<Bytes>,
+    mut out_rx: tokio::sync::mpsc::Receiver<Bytes>,
+    waker_slot: Arc<Mutex<Option<Arc<mio::Waker>>>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let io = TokioIo::new(upgraded);
+    let (mut rd, mut wr) = tokio::io::split(io);
+    let wake = move || {
+        if let Ok(g) = waker_slot.lock() {
+            if let Some(w) = g.as_ref() {
+                let _ = w.wake();
+            }
+        }
+    };
+    let wake_r = wake.clone();
+    let reader = async move {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match rd.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if in_tx.send(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
+                        break; // el handler cerró
+                    }
+                    wake_r();
+                }
+            }
+        }
+        drop(in_tx); // EOF hacia el handler → `close` en su próximo recv
+        wake_r();
+    };
+    let wake_w = wake.clone();
+    let writer = async move {
+        while let Some(b) = out_rx.recv().await {
+            wake_w(); // hay lugar en el canal: un write pendiente puede reintentar
+            if wr.write_all(&b).await.is_err() {
+                break;
+            }
+            let _ = wr.flush().await;
+        }
+        let _ = wr.shutdown().await;
+    };
+    tokio::join!(reader, writer);
 }
 
 fn response_body_bytes(body: ResponseBody) -> (String, Bytes) {
@@ -2032,6 +2432,7 @@ async fn handle_request(
         None => req.uri().path().to_string(),
     };
     let (path, query) = parse_path_query(&target);
+    let mut req = req;
     let mut headers: Vec<(String, String)> = req
         .headers()
         .iter()
@@ -2054,6 +2455,42 @@ async fn handle_request(
 
     let cors = rt.cors_origin().map(|s| s.to_string());
     let hsts = rt.tls_enabled;
+
+    // Shutdown ordenado en curso: no se aceptan requests nuevas (las que están en
+    // vuelo se drenan). 503 explícito + `Connection: close` (el balanceador reintenta
+    // en otra instancia).
+    if rt.is_shutting_down() {
+        let body = obj(vec![
+            ("error", Json::Str("server shutting down".into())),
+            ("status", Json::Int(503)),
+        ]);
+        return Ok(json_full(503, dumps(&body), &[("Retry-After".to_string(), "2".to_string())], cors.as_deref(), hsts, true));
+    }
+
+    // Plan de atención (vhost + match, sin auth ni handler): hilo, socket, timeout.
+    let plan = rt.route_plan(&eff_method, &path, &headers);
+
+    // Ruta `socket`: validar el upgrade RFC 6455 ANTES de consumir el body (el
+    // `hyper::upgrade::on` necesita la request entera). Sin upgrade → 426.
+    let mut on_upgrade: Option<(hyper::upgrade::OnUpgrade, String)> = None;
+    if plan.socket {
+        match websocket_upgrade_key(&headers) {
+            Some(key) if !is_head => {
+                on_upgrade = Some((hyper::upgrade::on(&mut req), key));
+            }
+            _ => {
+                let body = obj(vec![
+                    ("error", Json::Str("upgrade required: this route is a WebSocket endpoint (send Connection: Upgrade, Upgrade: websocket, Sec-WebSocket-Version: 13, Sec-WebSocket-Key)".into())),
+                    ("status", Json::Int(426)),
+                ]);
+                let extra = vec![
+                    ("Upgrade".to_string(), "websocket".to_string()),
+                    ("Connection".to_string(), "Upgrade".to_string()),
+                ];
+                return Ok(json_full(426, dumps(&body), &extra, cors.as_deref(), hsts, false));
+            }
+        }
+    }
 
     // Body con tope; excedido → 413 + cerrar.
     let body_bytes = match read_req_body(req.into_body(), rt.max_body).await {
@@ -2086,8 +2523,7 @@ async fn handle_request(
     // bloqueado OCUPA un worker del pool esperando su respuesta — si la respuesta
     // (POST /approvals/{id}) tuviera que esperar un worker libre, con el pool lleno de
     // gates nadie podría aprobar nada hasta los timeouts.
-    let streaming_route = rt.route_is_streaming(&eff_method, &path, &headers)
-        || rt.is_approvals_route(&eff_method, &path);
+    let streaming_route = plan.dedicated || rt.is_approvals_route(&eff_method, &path);
 
     // dispatch + (si stream) correr el handler; head por oneshot, body por mpsc (1 frame
     // para sized, N frames para SSE).
@@ -2096,14 +2532,55 @@ async fn handle_request(
     let rt2 = rt.clone();
     let cors_b = cors.clone();
 
+    // Token de cancelación de ESTA request: el handler lo adopta; el lado async lo
+    // cancela por timeout o shutdown. Se crea acá (antes del head) para poder cortar
+    // un handler que todavía no respondió nada.
+    let cancel = CancelToken::new();
+    rt.begin_request(&cancel, streaming_route);
+    let cancel_job = cancel.clone();
+
+    // Canales del socket entrante (sólo rutas `socket`): bytes del cliente → handler
+    // (`in`), bytes del handler → cliente (`out`); 64 slots por dirección = backpressure.
+    let socket_link: Option<(ServerSocketLink, tokio::sync::mpsc::Sender<Bytes>, tokio::sync::mpsc::Receiver<Bytes>, WakerSlot)> =
+        if on_upgrade.is_some() {
+            let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+            let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+            let slot: Arc<Mutex<Option<Arc<mio::Waker>>>> = Arc::new(Mutex::new(None));
+            let max_message = std::env::var("SYNSEMA_WS_MAX_MESSAGE")
+                .ok()
+                .and_then(|s| parse_body_size_str(&s))
+                .map(|n| n.max(1) as usize)
+                .unwrap_or(16 * 1024 * 1024);
+            let link = ServerSocketLink {
+                inbound: in_rx,
+                outbound: out_tx,
+                waker_slot: slot.clone(),
+                subprotocol: negotiate_subprotocol(&headers),
+                max_message,
+            };
+            Some((link, in_tx, out_rx, slot))
+        } else {
+            None
+        };
+    let (link_for_job, pump_parts) = match socket_link {
+        Some((link, in_tx, out_rx, slot)) => (Some(link), Some((in_tx, out_rx, slot))),
+        None => (None, None),
+    };
+    let accept_key = on_upgrade.as_ref().map(|(_, k)| ws_accept_key(k));
+    let subprotocol_ack = link_for_job.as_ref().and_then(|l| l.subprotocol.clone());
+
     // Un SOLO closure: corre el intérprete sync (dispatch + handler). El `Ctx` es !Send
     // pero queda LOCAL al job (nunca se captura) → el closure captura sólo inputs Send, así
     // sirve igual para el pool (sized) que para un hilo dedicado (stream).
     let job = move || {
+        // Contabilidad de la request (inflight + token activo): se cierra al terminar
+        // el job INCLUSO si el handler paniquea (el pool atrapa el panic; el Drop corre
+        // durante el desenrollado).
+        let _guard = RequestGuard { rt: rt2.clone(), cancel: cancel_job.clone() };
         let bf = body_file.as_ref().map(|p| p.to_string_lossy().into_owned());
         let accept_gzip =
             header_value(&headers, "accept-encoding").to_ascii_lowercase().contains("gzip");
-        match rt2.dispatch(
+        let dispatched = rt2.dispatch(
             &eff_method,
             &path,
             query,
@@ -2112,7 +2589,9 @@ async fn handle_request(
             &body_raw,
             bf.as_deref(),
             &client_ip,
-        ) {
+            cancel_job.clone(),
+        );
+        match dispatched {
             Dispatched::Response { status, body, headers: extra } => {
                 let mut extra = extra;
                 // redirect(): el destino se emite como header `Location`.
@@ -2150,8 +2629,50 @@ async fn handle_request(
                     close: false,
                     cors: cors_b,
                     hsts,
+                    upgrade: None,
                 });
                 let _ = body_tx.blocking_send(bytes);
+            }
+            Dispatched::Socket { socket_handler, ctx } => {
+                match (link_for_job, accept_key) {
+                    (Some(link), Some(accept)) => {
+                        let _ = head_tx.send(HeadInfo {
+                            status: 101,
+                            content_type: None,
+                            extra: Vec::new(),
+                            streaming: false,
+                            close: false,
+                            cors: cors_b,
+                            hsts,
+                            upgrade: Some((accept, subprotocol_ack)),
+                        });
+                        if let Some(sh) = socket_handler {
+                            // El error del handler ya viajó al cliente como Close 1011
+                            // (lo hace el runtime); acá sólo se libera el slot.
+                            let _ = sh(&ctx, Box::new(link));
+                        }
+                    }
+                    _ => {
+                        // No debería pasar: dispatch sólo devuelve Socket para rutas
+                        // `socket`, y esas llegan acá con upgrade validado. Fail-loud.
+                        let _ = head_tx.send(HeadInfo {
+                            status: 500,
+                            content_type: Some("application/json".to_string()),
+                            extra: Vec::new(),
+                            streaming: false,
+                            close: true,
+                            cors: cors_b,
+                            hsts,
+                            upgrade: None,
+                        });
+                        let body = obj(vec![
+                            ("error", Json::Str("socket route reached without an upgrade".into())),
+                            ("status", Json::Int(500)),
+                        ]);
+                        let _ = body_tx.blocking_send(Bytes::from(dumps(&body)));
+                    }
+                }
+                rt2.release_stream();
             }
             Dispatched::Stream { stream_handler, ctx } => {
                 let _ = head_tx.send(HeadInfo {
@@ -2165,6 +2686,7 @@ async fn handle_request(
                     close: true,
                     cors: cors_b,
                     hsts,
+                    upgrade: None,
                 });
                 if let Some(sh) = stream_handler {
                     let emit = channel_emitter(body_tx.clone());
@@ -2205,16 +2727,82 @@ async fn handle_request(
         interp_pool().submit(Box::new(job));
     }
 
-    let head = match head_rx.await {
-        Ok(h) => h,
-        Err(_) => {
-            let body = obj(vec![
-                ("error", Json::Str("internal server error".into())),
-                ("status", Json::Int(500)),
-            ]);
-            return Ok(json_full(500, dumps(&body), &[], cors.as_deref(), hsts, false));
+    // Timeout del handler (`timeout` de la route o del serve). Sized: se responde 504
+    // al vencer (aunque el handler siga — se lo cancela y termina al próximo statement
+    // o espera). Stream/socket: un timer cancela el token al vencer; se apaga cuando
+    // el body termina (`done`).
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    if let Some(secs) = plan.timeout {
+        if streaming_route {
+            let c = cancel.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs_f64(secs)) => {
+                        c.cancel(&format!("request timed out after {}s", secs));
+                    }
+                    _ = done_rx => {}
+                }
+            });
+        }
+    }
+    let head = if let (Some(secs), false) = (plan.timeout, streaming_route) {
+        match tokio::time::timeout(Duration::from_secs_f64(secs), head_rx).await {
+            Ok(Ok(h)) => h,
+            Ok(Err(_)) => {
+                let body = obj(vec![
+                    ("error", Json::Str("internal server error".into())),
+                    ("status", Json::Int(500)),
+                ]);
+                return Ok(json_full(500, dumps(&body), &[], cors.as_deref(), hsts, false));
+            }
+            Err(_) => {
+                cancel.cancel(&format!("request timed out after {}s", secs));
+                let body = obj(vec![
+                    ("error", Json::Str(format!("gateway timeout: the handler exceeded {}s", secs))),
+                    ("status", Json::Int(504)),
+                ]);
+                return Ok(json_full(504, dumps(&body), &[], cors.as_deref(), hsts, true));
+            }
+        }
+    } else {
+        match head_rx.await {
+            Ok(h) => h,
+            Err(_) => {
+                let body = obj(vec![
+                    ("error", Json::Str("internal server error".into())),
+                    ("status", Json::Int(500)),
+                ]);
+                return Ok(json_full(500, dumps(&body), &[], cors.as_deref(), hsts, false));
+            }
         }
     };
+
+    // 101 Switching Protocols: responder y, cuando hyper entregue el socket crudo,
+    // arrancar el pump hacia el hilo del handler.
+    if let Some((accept, protocol)) = head.upgrade {
+        if let (Some((on_up, _)), Some((in_tx, out_rx, slot))) = (on_upgrade, pump_parts) {
+            tokio::spawn(async move {
+                // El `done` del timeout vive lo que viva el socket (no lo que viva el 101).
+                let _done = done_tx;
+                match on_up.await {
+                    Ok(upgraded) => pump_upgraded_socket(upgraded, in_tx, out_rx, slot).await,
+                    Err(_) => {
+                        // El cliente se fue entre el 101 y el upgrade: dropear los canales
+                        // → el handler ve EOF (close) en su próximo recv.
+                    }
+                }
+            });
+        }
+        let mut builder = Response::builder()
+            .status(101)
+            .header("Upgrade", "websocket")
+            .header("Connection", "Upgrade")
+            .header("Sec-WebSocket-Accept", accept);
+        if let Some(p) = protocol {
+            builder = builder.header("Sec-WebSocket-Protocol", p);
+        }
+        return Ok(builder.body(Full::new(Bytes::new()).boxed()).unwrap());
+    }
 
     let mut builder = Response::builder().status(head.status);
     if let Some(ct) = &head.content_type {
@@ -2244,7 +2832,7 @@ async fn handle_request(
 
     let mut body_rx = body_rx;
     if head.streaming {
-        let body = ChannelBody { rx: body_rx }.boxed();
+        let body = ChannelBody { rx: body_rx, keepalive: sse_keepalive(), idle: None, _done: Some(done_tx) }.boxed();
         Ok(builder.body(body).unwrap())
     } else {
         // sized: 1 frame con el body completo → Full (hyper pone Content-Length).

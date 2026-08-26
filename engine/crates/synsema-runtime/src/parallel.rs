@@ -76,6 +76,7 @@ fn build_worker_interp(
     secure: bool,
     ceiling: &Option<Arc<Vec<Capability>>>,
     mem: &Option<MemoryCtx>,
+    bus: &Option<Arc<synsema_agents::bus::Bus>>,
 ) -> (Interpreter, ModuleRegistry) {
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("parallel")));
@@ -98,6 +99,11 @@ fn build_worker_interp(
     // grant de `memory("<nombre>")` ya viene en `granted` (heredado del scope llamador),
     // así que el gate del worker pasa exactamente cuando pasaba en el padre.
     wire_common(&mut interp, &caps, secure, mem.as_ref(), "my-agent");
+    // El worker ve el MISMO bus que el padre (bus_publish/subscribe/select): un worker
+    // no es una isla de eventos.
+    if let Some(b) = bus {
+        synsema_stdlib::ws::attach_bus(&interp, b.clone());
+    }
     let registry = rebuild_globals(&mut interp, globals);
     interp.freeze_intent(); // corre bajo el intent congelado
     (interp, registry)
@@ -152,6 +158,7 @@ fn run_parallel(
     secure: bool,
     ceiling: Option<Arc<Vec<Capability>>>,
     mem: Option<MemoryCtx>,
+    bus: Option<Arc<synsema_agents::bus::Bus>>,
 ) -> Result<Vec<SendValue>, RuntimeError> {
     let n = items.len();
     if n == 0 {
@@ -189,6 +196,7 @@ fn run_parallel(
             let denied = denied.clone();
             let ceiling = ceiling.clone();
             let mem = mem.clone();
+            let bus = bus.clone();
             let task_snap = task_snap.clone();
             let items = items.clone();
             let aborted = aborted.clone();
@@ -199,7 +207,7 @@ fn run_parallel(
                     return None;
                 }
                 let (mut interp, mut registry) =
-                    build_worker_interp(&globals, &granted, &denied, secure, &ceiling, &mem);
+                    build_worker_interp(&globals, &granted, &denied, secure, &ceiling, &mem, &bus);
                 let task_value = reconstruct_task(&interp, &task_snap, &mut registry);
                 let item = from_send(&items[i]);
                 match interp.call_task(task_value, vec![item]) {
@@ -331,6 +339,7 @@ pub(crate) fn register_parallel_builtins(
                 secure,
                 ceiling,
                 mem,
+                synsema_stdlib::ws::bus_of_interp(i),
             ) {
                 Ok(results) => Ok(syn_list(results.iter().map(from_send).collect())),
                 Err(re) => Err(Control::Error(re)),

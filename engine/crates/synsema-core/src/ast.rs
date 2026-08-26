@@ -353,11 +353,26 @@ pub enum NodeKind {
         param_names: Vec<String>,
         requires_auth: bool,
         streaming: bool,
+        /// Ruta `socket` (WebSocket entrante): el cuerpo corre con el binding `socket`
+        /// (handle de la conexión, misma familia `ws_*` que un `ws_connect`).
+        socket: bool,
         rate_limit: Option<Box<Node>>, // RateLimitClause
+        /// `timeout <segundos>` | `timeout none` dentro de la route (override).
+        timeout: Option<Box<Node>>, // TimeoutClause
         body: Vec<Node>,
     },
     StreamBlock {
         body: Vec<Node>,
+    },
+    /// `socket` + bloque: cuerpo de una ruta WebSocket entrante.
+    SocketBlock {
+        body: Vec<Node>,
+    },
+    /// `timeout <expr>` | `timeout none` — techo de vida de un handler (serve block =
+    /// default de todas las rutas; dentro de una route = override). `secs: None` = sin
+    /// límite explícito (`none`).
+    TimeoutClause {
+        secs: Option<Box<Node>>,
     },
     /// Lote 2 — reverse proxy: `proxy to <url>` dentro de una route → forwardea.
     ProxyStatement {
@@ -411,6 +426,8 @@ pub enum NodeKind {
         max_body: Option<Box<Node>>,
         max_streams: Option<Box<Node>>,
         rate_limit: Option<Box<Node>>,
+        /// `timeout <segundos>` | `timeout none`: default de timeout de las rutas.
+        timeout: Option<Box<Node>>, // TimeoutClause
         static_mounts: Vec<Node>, // StaticMount
         cors: Option<Box<Node>>,
         describe: Option<Box<Node>>, // DescribeClause

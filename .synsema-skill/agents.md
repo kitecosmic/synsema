@@ -83,6 +83,71 @@ real push channel.)
 - `wait_for` returns `nothing` if **no agents are alive** that could emit, or when the `timeout` elapses. Default is 30s — set `timeout <secs>` to bound it (e.g. in HTTP route handlers, to avoid hanging requests / exhausting threads).
 - Pattern for N workers: a dynamic channel per worker (`"work:" + text(id)`), or each worker writes to its own blackboard key and the coordinator reads all keys.
 
+## Event bus — `bus_*` (fan-out, no polling) — engine v0.6.7+
+
+`signal`/`wait_for` is point-to-point: one receiver consumes the signal. A live UI needs
+**fan-out**: N handlers (one per SSE/socket client) receive the same event an agent, a cron
+or another request published — without polling. That is the bus. **One bus per program**,
+seen from everywhere: top-level, `parallel_map` workers, cron ticks, spawned agents, and
+every handler of every `serve` worker. In-process only (no Redis yet — that will reuse this
+API). No capability (same trust level as `share`/`signal`).
+
+```
+-- publisher (an agent, a cron tick, a POST route…)
+bus_publish("agent.progress", {"step": 3, "of": 10})      -- → how many subscribers got it
+
+-- subscriber (an SSE route, a socket route, a worker loop…)
+let sub be bus_subscribe("agent.*")                        -- one topic or a list; globs `*` / `?`
+let ev be bus_recv(sub, 25)                                -- {type: "event", topic, data, timestamp} or nothing
+bus_unsubscribe(sub)
+bus_topics()                                               -- [{topic, subscribers}] (patterns as subscribed)
+```
+
+- The value must be **data** (text/number/bool/list/map/bytes): a task or a `secret` →
+  error, never silently degraded. Published topics are literal (a glob in `bus_publish` is
+  an error — globs belong to `bus_subscribe`).
+- **Bounded per subscriber**, in both count and bytes: `bus_subscribe(topic, {"max_queue":
+  1024, "max_queue_bytes": 16777216, "on_full": "drop_oldest"})`. Default
+  `"drop_oldest"` — a slow subscriber never stalls the publisher; `"error"` makes the
+  next recv raise a catchable error and drops the subscription.
+- A subscription lives as long as its interpreter: when a handler/agent ends, its
+  subscriptions are removed — a publisher never fills a queue nobody reads.
+- Inside `select` a bus event is tagged `source: "bus"` (+ `handle`, `name`).
+
+SSE fed by the bus (the whole point):
+
+```
+route "GET /events"
+    stream
+        let sub be bus_subscribe("agent.*")
+        while true
+            let ev be bus_recv(sub, 25)
+            when ev != nothing
+                send ev["data"] as ev["topic"]
+```
+
+## Observing and stopping agents — `agents()` / `agent_stop` (engine v0.6.7+)
+
+```
+agents()                 -- [{id, name, state, error, started_at, finished_at}]
+agent_stop(id, reason?)  -- true if it was alive; the agent ends in state "stopped"
+```
+
+`id` is the instance (`Researcher_0`), `name` the declared agent. States: `idle`,
+`starting`, `working`, `waiting`, `done`, `error`, `stopped`. `agent_stop` is
+**cooperative cancellation**: the agent's interpreter raises `cancelled: <reason>` before
+its next statement, and any wait (`wait_for`, `sleep`, `select`, `bus_recv`, `proc_*`,
+`run`) wakes immediately — a `while true` agent is no longer immortal. Available under
+`run` and `serve`, no capability (introspection of your own process).
+
+## Agents under `serve` (engine v0.6.7+)
+
+An agent spawned from a handler or a cron tick gets **the same wiring a cron tick has**:
+`state_*`, the shared database, the approvals queue, cron, the bus and the declared memory
+— not an island with fresh builtins. It runs under the host ceiling of `synsema serve
+--sandbox | --cap-set <list>` (a `require` inside it never exceeds what the operator
+fixed, exactly like `run`), and an ordered shutdown (`Ctrl-C`) stops it via `agent_stop`.
+
 ## Resource locking (preventive)
 Agents declare what they're working on BEFORE touching it:
 - `exclusive` — one agent only (write)

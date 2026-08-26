@@ -44,15 +44,30 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mio::net::TcpStream as MioTcp;
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Interest, Poll, Token, Waker};
 use tungstenite::client::IntoClientRequest;
-use tungstenite::protocol::{Message, WebSocket, WebSocketConfig};
+use tungstenite::protocol::{Message, Role, WebSocket, WebSocketConfig};
 use tungstenite::Bytes;
 
+use synsema_agents::bus::{Bus, OnFull as BusOnFull, SubscribeOpts, Subscriber};
 use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
 use synsema_capabilities::secure::url_hostname;
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
-use synsema_core::types::{syn_bool, syn_bytes, syn_int, syn_map, syn_number, syn_text, SynValue};
+use synsema_core::types::{from_send, syn_bool, syn_bytes, syn_int, syn_map, syn_number, syn_text, SendValue, SynValue};
+
+use crate::proc::{LiveProc, OnFull as ProcOnFull, ProcEvent, ProcStatus, SpawnOpts};
+
+/// Token reservado del `mio::Waker` del hub (los sockets arrancan en 1).
+const WAKER_TOKEN: Token = Token(0);
+/// Ping del servidor a un `socket` entrante (segundos); `SYNSEMA_WS_SERVER_PING` lo
+/// ajusta (0 = sin keepalive del lado servidor).
+const DEFAULT_SERVER_PING_SECS: f64 = 30.0;
+/// Tope de procesos vivos por intérprete (`SYNSEMA_PROC_MAX`, techo 1024).
+const DEFAULT_MAX_PROCS: usize = 64;
+const MAX_PROCS_CEILING: usize = 1024;
+/// Plazo de gracia para que los lectores de un proceso que YA salió lleguen a EOF
+/// (un nieto que retiene el pipe no puede colgar al `select` para siempre).
+const PROC_READER_GRACE: Duration = Duration::from_secs(1);
 
 fn err(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::new(msg))
@@ -97,8 +112,59 @@ enum StreamKind {
     PlainMio(MioTcp),
     TlsStd(Box<TlsStd>),
     TlsMio(Box<TlsMio>),
+    /// Socket ENTRANTE de `serve` (ruta `socket`): los bytes viajan por dos canales
+    /// acotados hacia/desde el pump async de hyper (el TCP/TLS lo tiene tokio). No se
+    /// registra en el `Poll`: el pump despierta al hub por el `Waker`.
+    Channel(ChannelStream),
     /// Placeholder transitorio durante la promoción (Read/Write erroran).
     Void,
+}
+
+/// Transporte por canales de un socket entrante. `read` es no-bloqueante (WouldBlock
+/// sin datos; 0 = el pump cerró → EOF), `write` encola (WouldBlock con el canal lleno:
+/// tungstenite deja el frame pendiente y el pump lo flushea cuando hay lugar — la
+/// ventana TCP del cliente frena al handler, no al revés).
+pub struct ChannelStream {
+    rx: tokio::sync::mpsc::Receiver<Bytes>,
+    tx: tokio::sync::mpsc::Sender<Bytes>,
+    leftover: Bytes,
+}
+
+impl Read for ChannelStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if !self.leftover.is_empty() {
+                let n = buf.len().min(self.leftover.len());
+                buf[..n].copy_from_slice(&self.leftover[..n]);
+                self.leftover = self.leftover.slice(n..);
+                return Ok(n);
+            }
+            match self.rx.try_recv() {
+                Ok(b) => self.leftover = b,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return Ok(0),
+            }
+        }
+    }
+}
+
+impl Write for ChannelStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.tx.try_send(Bytes::copy_from_slice(buf)) {
+            Ok(()) => Ok(buf.len()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 struct WsStream {
@@ -111,6 +177,13 @@ impl WsStream {
     }
     fn tls_std(s: TlsStd) -> Self {
         WsStream { inner: StreamKind::TlsStd(Box::new(s)) }
+    }
+    fn channel(c: ChannelStream) -> Self {
+        WsStream { inner: StreamKind::Channel(c) }
+    }
+    /// ¿Transporte por canal (socket entrante)? No tiene `source()` para el Poll.
+    fn is_channel(&self) -> bool {
+        matches!(self.inner, StreamKind::Channel(_))
     }
 
     /// Convierte el socket subyacente std (bloqueante, usado para el handshake) a mio
@@ -154,6 +227,7 @@ impl Read for WsStream {
             StreamKind::PlainMio(t) => t.read(buf),
             StreamKind::TlsStd(s) => s.read(buf),
             StreamKind::TlsMio(s) => s.read(buf),
+            StreamKind::Channel(c) => c.read(buf),
             StreamKind::Void => Err(std::io::Error::other("ws stream in transit")),
         }
     }
@@ -166,6 +240,7 @@ impl Write for WsStream {
             StreamKind::PlainMio(t) => t.write(buf),
             StreamKind::TlsStd(s) => s.write(buf),
             StreamKind::TlsMio(s) => s.write(buf),
+            StreamKind::Channel(c) => c.write(buf),
             StreamKind::Void => Err(std::io::Error::other("ws stream in transit")),
         }
     }
@@ -175,6 +250,7 @@ impl Write for WsStream {
             StreamKind::PlainMio(t) => t.flush(),
             StreamKind::TlsStd(s) => s.flush(),
             StreamKind::TlsMio(s) => s.flush(),
+            StreamKind::Channel(c) => c.flush(),
             StreamKind::Void => Ok(()),
         }
     }
@@ -267,6 +343,9 @@ struct Conn {
     /// reconexión: lo entrega el próximo recv/select como error atrapable (NO un
     /// `close` silencioso — el agente debe saber que el peer violó el protocolo).
     last_error: Option<String>,
+    /// Socket ENTRANTE (ruta `socket` de serve): sin reconexión posible (el peer es
+    /// quien reconecta), `ws_stats.role = "server"`.
+    server_side: bool,
 }
 
 impl Conn {
@@ -288,6 +367,11 @@ impl Conn {
 // Registro por-intérprete
 // =========================================================
 
+/// El HUB de I/O del intérprete: sockets (salientes y entrantes), procesos vivos y
+/// suscripciones al bus comparten UN contador de handles (jamás colisionan), UN
+/// `mio::Poll` (readiness de sockets) y UN `Waker` (procesos/bus/pump async/cancel
+/// despiertan la misma espera) → `select` es uno solo. Nació como registro ws
+/// (Batch 13/15); el nombre del struct se conserva por continuidad del código.
 struct WsRegistry {
     poll: Poll,
     events: Events,
@@ -299,6 +383,32 @@ struct WsRegistry {
     /// Cursor round-robin de `first_ready` (equidad de `ws_select`).
     rr: std::cell::Cell<usize>,
     caps: Rc<RefCell<CapabilitySet>>,
+    /// Despertador del Poll (procesos, bus, pump de sockets entrantes, cancelación).
+    waker: Arc<Waker>,
+    /// Procesos vivos (`proc_*`).
+    procs: HashMap<i64, LiveProc>,
+    max_procs: usize,
+    /// Suscripciones al bus (`bus_subscribe`).
+    subs: HashMap<i64, Arc<Subscriber>>,
+    /// El bus del proceso (lo adjunta el motor con `attach_bus` al cablear el swarm).
+    bus: Option<Arc<Bus>>,
+    /// Último token de cancelación al que registramos nuestro waker (uno por token).
+    cancel_seen: usize,
+    /// Flag del token vigente: el `pump` sale apenas se enciende (el waker lo despierta).
+    cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Drop for WsRegistry {
+    fn drop(&mut self) {
+        // Fin del intérprete = fin de sus procesos (LiveProc::drop mata + cosecha) y de
+        // sus suscripciones (el bus no acumula en colas huérfanas).
+        self.procs.clear();
+        if let Some(bus) = &self.bus {
+            for (_, s) in self.subs.drain() {
+                bus.unsubscribe(s.id);
+            }
+        }
+    }
 }
 
 /// Un `on_reconnect` que quedó pendiente de correr FUERA del borrow del registro
@@ -524,6 +634,10 @@ impl WsRegistry {
     fn sync_interest(&mut self, handle: i64) {
         let (want, had) = {
             let Some(c) = self.conns.get(&handle) else { return };
+            if c.ws.get_ref().is_channel() {
+                // Sin socket del kernel: el pump async despierta por el Waker.
+                return;
+            }
             (c.desired_interest(), c.current_interest)
         };
         if want == had {
@@ -610,8 +724,10 @@ impl WsRegistry {
         };
         {
             let Some(c) = self.conns.get_mut(&handle) else { return };
-            let source = c.ws.get_mut().source();
-            let _ = self.poll.registry().deregister(source);
+            if c.current_interest.is_some() {
+                let source = c.ws.get_mut().source();
+                let _ = self.poll.registry().deregister(source);
+            }
         }
         let Some(c) = self.conns.get_mut(&handle) else { return };
         c.current_interest = None;
@@ -683,6 +799,15 @@ impl WsRegistry {
                     self.mark_gone(handle, SynValue::Nothing);
                     return false;
                 }
+                Err(tungstenite::Error::Protocol(
+                    tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+                )) => {
+                    // El peer desapareció sin handshake de cierre (red caída, pestaña
+                    // matada, proceso muerto): es una DESCONEXIÓN, no una violación de
+                    // protocolo del programa → `close` con motivo (y reconexión si la hay).
+                    self.mark_gone(handle, syn_text("connection reset without closing handshake"));
+                    return false;
+                }
                 Err(e) => {
                     // Violación de protocolo (Capacity, frame inválido): error FATAL
                     // atrapable, no un close silencioso.
@@ -698,8 +823,8 @@ impl WsRegistry {
     /// si no, encola un `close` sintético y la deja lista para retirar.
     fn mark_gone(&mut self, handle: i64, reason: SynValue) {
         let Some(c) = self.conns.get_mut(&handle) else { return };
-        // Deregistrar el socket muerto del poller.
-        {
+        // Deregistrar el socket muerto del poller (los de canal nunca se registraron).
+        if c.current_interest.is_some() {
             let source = c.ws.get_mut().source();
             let _ = self.poll.registry().deregister(source);
         }
@@ -735,8 +860,10 @@ impl WsRegistry {
     fn fail_conn(&mut self, handle: i64, detail: String) {
         {
             let Some(c) = self.conns.get_mut(&handle) else { return };
-            let source = c.ws.get_mut().source();
-            let _ = self.poll.registry().deregister(source);
+            if c.current_interest.is_some() {
+                let source = c.ws.get_mut().source();
+                let _ = self.poll.registry().deregister(source);
+            }
         }
         let Some(c) = self.conns.get_mut(&handle) else { return };
         c.current_interest = None;
@@ -923,14 +1050,10 @@ impl WsRegistry {
     }
 
     /// ¿Algún target quedó "accionable" (mensaje en cola o error fatal pendiente)?
-    /// Es la condición para que el pump deje de dormir y el caller reaccione.
+    /// Es la condición para que el pump deje de dormir y el caller reaccione. Cubre
+    /// las TRES familias de handles (socket, proceso, suscripción).
     fn any_actionable(&self, targets: &[i64]) -> bool {
-        targets.iter().any(|h| {
-            self.conns
-                .get(h)
-                .map(|c| !c.inbound.is_empty() || c.last_error.is_some())
-                .unwrap_or(false)
-        })
+        targets.iter().any(|h| self.handle_actionable(*h))
     }
 
     /// Tickea los timers (keepalive/reconexión) y re-sincroniza el interés de cada
@@ -938,6 +1061,7 @@ impl WsRegistry {
     fn service_timers(&mut self, pending: &mut Vec<PendingReconnect>) {
         self.service_keepalive();
         self.try_reconnects(pending);
+        self.service_procs();
         let handles: Vec<i64> = self.conns.keys().copied().collect();
         for h in &handles {
             self.sync_interest(*h);
@@ -972,6 +1096,19 @@ impl WsRegistry {
                 self.drain_reads(handle);
             }
         }
+        // Sockets entrantes (canal): sin readiness del kernel — tras cada pasada del
+        // Poll (despertada por el Waker del pump, o por timeout) se flushea lo
+        // pendiente y se drena lo que el pump haya encolado (hasta WouldBlock).
+        let channel_conns: Vec<i64> = self
+            .conns
+            .iter()
+            .filter(|(_, c)| c.ws.get_ref().is_channel() && c.status == Status::Open)
+            .map(|(h, _)| *h)
+            .collect();
+        for h in channel_conns {
+            self.try_flush(h);
+            self.drain_reads(h);
+        }
     }
 
     /// El corazón: espera readiness hasta que alguno de `targets` tenga un mensaje/
@@ -980,7 +1117,7 @@ impl WsRegistry {
     fn pump(&mut self, targets: &[i64], deadline: Instant, pending: &mut Vec<PendingReconnect>) {
         loop {
             self.service_timers(pending);
-            if self.any_actionable(targets) {
+            if self.any_actionable(targets) || self.cancelled() {
                 return;
             }
             let now = Instant::now();
@@ -994,6 +1131,14 @@ impl WsRegistry {
         }
     }
 
+    /// ¿Cancelación cooperativa pendiente? (el caller la convierte en error).
+    fn cancelled(&self) -> bool {
+        self.cancel_flag
+            .as_ref()
+            .map(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
     /// Un tick NO-bloqueante (para `ws_status`): avanza timers y procesa lo que ya
     /// esté listo sin dormir, así el estado refleja la realidad sin colgar.
     fn tick(&mut self, pending: &mut Vec<PendingReconnect>) {
@@ -1005,6 +1150,19 @@ impl WsRegistry {
     /// Acota el sleep del poll para que los timers no se pasen. `MAX` si no hay.
     fn next_timer(&self, now: Instant) -> Duration {
         let mut soonest = Duration::from_secs(3600);
+        // Procesos: sólo hay que hacer polling en dos ventanas cortas — lectores en EOF
+        // pero exit aún no cosechado (carrera pipe-close/exit), o exit cosechado pero
+        // lectores vivos (nieto reteniendo el pipe → plazo de gracia). Un proceso
+        // silencioso en régimen NO despierta a nadie (los lectores avisan por el Waker).
+        for p in self.procs.values() {
+            if p.exit_code.is_none() && p.shared.readers_done() {
+                soonest = soonest.min(Duration::from_millis(20));
+            } else if let Some(at) = p.exited_at {
+                if !p.shared.readers_done() {
+                    soonest = soonest.min((at + PROC_READER_GRACE).saturating_duration_since(now).max(Duration::from_millis(20)));
+                }
+            }
+        }
         for c in self.conns.values() {
             if let Some(at) = c.reconnect_at {
                 soonest = soonest.min(at.saturating_duration_since(now));
@@ -1068,6 +1226,11 @@ impl WsRegistry {
                 let source = c.ws.get_mut().source();
                 let _ = self.poll.registry().deregister(source);
             }
+            // La respuesta al Close del peer (que tungstenite encola al leerlo) debe
+            // SALIR antes de soltar el transporte: si no, el cierre termina en RST y el
+            // cliente ve "connection reset without closing handshake" en vez de un
+            // handshake de cierre limpio. Best-effort (WouldBlock/closed se ignoran).
+            let _ = c.ws.flush();
         }
     }
 }
@@ -1312,6 +1475,7 @@ fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
     r.next_token += 1;
     let token = Token(r.next_token);
     let retries_left = opts.reconnect.as_ref().map(|rc| rc.max_retries).unwrap_or(0);
+    let server_side = false;
     let conn = Conn {
         ws,
         token,
@@ -1335,6 +1499,7 @@ fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         current_interest: None,
         closed_emitted: false,
         last_error: None,
+        server_side,
     };
     r.conns.insert(handle, conn);
     r.token_to_handle.insert(token.0, handle);
@@ -1414,7 +1579,9 @@ fn ws_recv(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Resul
         return Err(err(format!("{}: unknown or closed connection handle {}", F, handle)));
     }
     let deadline = Instant::now() + timeout;
+    watch_cancel(reg, interp);
     loop {
+        interp.check_cancel()?;
         // ¿Ya hay algo? entregarlo.
         if reg.borrow().conns.get(&handle).map(|c| !c.inbound.is_empty()).unwrap_or(false) {
             return Ok(reg.borrow_mut().take_message(handle).unwrap_or(SynValue::Nothing));
@@ -1489,42 +1656,9 @@ fn tag_message(msg: SynValue, handle: i64, names: &TargetNames) -> SynValue {
 }
 
 fn ws_select(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
-    const F: &str = "ws_select";
-    let (targets, names) = resolve_targets(args.first().ok_or_else(|| err(format!("{}: missing the connections", F)))?, F)?;
-    let timeout = timeout_arg(args.get(1), F)?;
-    if targets.is_empty() {
-        return Ok(SynValue::Nothing);
-    }
-    let deadline = Instant::now() + timeout;
-    loop {
-        // Equidad: buscar el primero listo en orden de la lista. (Extraer el handle
-        // ANTES de borrow_mut: el temporario de un scrutinee if-let vive todo el
-        // bloque en la edición actual → doble borrow si no se materializa antes.)
-        let ready = reg.borrow().first_ready(&targets);
-        if let Some(h) = ready {
-            let msg = reg.borrow_mut().take_message(h).unwrap_or(SynValue::Nothing);
-            return Ok(tag_message(msg, h, &names));
-        }
-        // Fail-fast: un error fatal en cualquier target sale como error (con `conn`).
-        let errored = targets.iter().copied().find(|h| {
-            reg.borrow().conns.get(h).map(|c| c.inbound.is_empty() && c.last_error.is_some()).unwrap_or(false)
-        });
-        if let Some(h) = errored {
-            let detail = reg.borrow_mut().take_error(h).unwrap_or_default();
-            return Err(err(format!("{}: connection {}: {}", F, h, detail)));
-        }
-        // Si TODAS las conexiones objetivo desaparecieron, no hay nada que esperar.
-        let all_gone = {
-            let r = reg.borrow();
-            targets.iter().all(|h| !r.conns.contains_key(h))
-        };
-        if all_gone || Instant::now() >= deadline {
-            return Ok(SynValue::Nothing);
-        }
-        let mut pending = Vec::new();
-        reg.borrow_mut().pump(&targets, deadline, &mut pending);
-        run_pending(interp, reg, pending)?;
-    }
+    // Desde el hub unificado, `ws_select` ES `select` (acepta cualquier handle) con
+    // el etiquetado histórico (`conn` + `name`) preservado.
+    select_impl(interp, args, reg, "ws_select")
 }
 
 fn ws_select_all(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
@@ -1535,8 +1669,10 @@ fn ws_select_all(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) ->
         return Ok(SynValue::List(Rc::new(RefCell::new(Vec::new()))));
     }
     let deadline = Instant::now() + timeout;
+    watch_cancel(reg, interp);
     // Esperar a que haya AL MENOS uno, después drenar todos los listos de un tick.
     loop {
+        interp.check_cancel()?;
         let any = reg.borrow().first_ready(&targets).is_some();
         let all_gone = {
             let r = reg.borrow();
@@ -1627,6 +1763,7 @@ fn ws_stats(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         "subprotocol".to_string(),
         c.negotiated_subprotocol.clone().map(syn_text).unwrap_or(SynValue::Nothing),
     );
+    m.insert("role".to_string(), syn_text(if c.server_side { "server" } else { "client" }));
     Ok(syn_map(m))
 }
 
@@ -1662,11 +1799,863 @@ fn ws_close(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
 }
 
 // =========================================================
+// Hub unificado: procesos + bus + sockets entrantes + `select`
+// =========================================================
+
+/// Clave del hub en `Interpreter::ext`.
+pub const IO_HUB_KEY: &str = "synsema.io_hub";
+
+/// El hub de un intérprete (si el stdlib ya cableó `register_ws_builtins`).
+fn hub_of(interp: &Interpreter) -> Option<Registry> {
+    interp.ext.borrow().get(IO_HUB_KEY).and_then(|a| a.downcast_ref::<Registry>().cloned())
+}
+
+/// Adjunta el bus del proceso al hub del intérprete (lo llama el motor al cablear el
+/// swarm: `bus_*` publican/suscriben contra el MISMO bus que agentes, cron y handlers).
+pub fn attach_bus(interp: &Interpreter, bus: Arc<Bus>) {
+    if let Some(reg) = hub_of(interp) {
+        reg.borrow_mut().bus = Some(bus);
+    }
+}
+
+/// Fin del trabajo de un intérprete REUSADO (`serve` cachea uno por worker y se lo
+/// presta a cada request/tick/stream): el hub vuelve a cero — los sockets se cierran
+/// con `Close` limpio (un handle NO cruza requests), los procesos vivos se matan y
+/// cosechan (nunca huérfanos), y las suscripciones se retiran del bus (un handler que
+/// terminó no sigue acumulando eventos en una cola que nadie lee). Sin esto, el
+/// `bus_subscribe` de un SSE cuyo cliente se fue viviría hasta que el worker muera.
+pub fn reset_hub(interp: &Interpreter) {
+    let Some(reg) = hub_of(interp) else { return };
+    let mut r = reg.borrow_mut();
+    let handles: Vec<i64> = r.conns.keys().copied().collect();
+    for h in handles {
+        if let Some(mut c) = r.conns.remove(&h) {
+            r.token_to_handle.remove(&c.token.0);
+            if c.current_interest.is_some() {
+                let source = c.ws.get_mut().source();
+                let _ = r.poll.registry().deregister(source);
+            }
+            let _ = c.ws.close(None);
+            let _ = c.ws.flush();
+        }
+    }
+    // `LiveProc::drop` → TERM, KILL a los 2 s, wait: ninguno sobrevive al request.
+    r.procs.clear();
+    let subs: Vec<Arc<Subscriber>> = r.subs.drain().map(|(_, s)| s).collect();
+    if let Some(bus) = r.bus.clone() {
+        for s in subs {
+            bus.unsubscribe(s.id);
+        }
+    }
+    r.cancel_seen = 0;
+    r.cancel_flag = None;
+    r.rr.set(0);
+}
+
+/// El bus adjunto al hub de este intérprete (para que workers de `parallel_map` y
+/// ticks de cron en modo `run` hereden el MISMO bus que su intérprete padre).
+pub fn bus_of_interp(interp: &Interpreter) -> Option<Arc<Bus>> {
+    hub_of(interp).and_then(|reg| reg.borrow().bus.clone())
+}
+
+/// Registra (una vez por token) el waker del hub en el token de cancelación del
+/// intérprete: una cancelación (timeout de handler, shutdown, `agent_stop`) despierta
+/// la espera del `Poll` de inmediato en vez de esperar su timeout.
+fn watch_cancel(reg: &Registry, interp: &Interpreter) {
+    let tok = interp.cancel_token();
+    let id = tok.id();
+    let mut r = reg.borrow_mut();
+    if r.cancel_seen == id {
+        return;
+    }
+    r.cancel_seen = id;
+    r.cancel_flag = Some(tok.flag.clone());
+    let w = r.waker.clone();
+    tok.add_waker(Arc::new(move || {
+        let _ = w.wake();
+    }));
+}
+
+/// Enlace de un socket ENTRANTE (ruta `socket` de serve): los dos canales acotados con
+/// el pump async de hyper + el slot donde el hub deja su `Waker` para que el pump lo
+/// despierte al encolar bytes / liberar lugar.
+pub struct ServerSocketLink {
+    pub inbound: tokio::sync::mpsc::Receiver<Bytes>,
+    pub outbound: tokio::sync::mpsc::Sender<Bytes>,
+    pub waker_slot: Arc<std::sync::Mutex<Option<Arc<Waker>>>>,
+    pub subprotocol: Option<String>,
+    pub max_message: usize,
+}
+
+/// Adopta un socket entrante en el hub del intérprete y devuelve su handle (el binding
+/// `socket` de la ruta). La familia `ws_*` entera opera sobre él como sobre un
+/// `ws_connect`, y `select` lo mezcla con procesos y bus.
+pub fn adopt_server_socket(interp: &Interpreter, link: ServerSocketLink) -> Result<i64, Control> {
+    let reg = hub_of(interp).ok_or_else(|| err("socket: the I/O hub is not wired in this interpreter"))?;
+    {
+        let r = reg.borrow();
+        if r.conns.len() >= r.max_conns {
+            return Err(err(format!(
+                "socket: connection budget reached ({} open, max {}); close some or raise SYNSEMA_WS_MAX_CONNS",
+                r.conns.len(),
+                r.max_conns
+            )));
+        }
+    }
+    let ServerSocketLink { inbound, outbound, waker_slot, subprotocol, max_message } = link;
+    let max_msg = max_message.clamp(1, MAX_MESSAGE_CEILING);
+    let stream = WsStream::channel(ChannelStream { rx: inbound, tx: outbound, leftover: Bytes::new() });
+    let config = WebSocketConfig::default().max_message_size(Some(max_msg)).max_frame_size(Some(max_msg));
+    let ws = WebSocket::from_raw_socket(stream, Role::Server, Some(config));
+    let ping_secs = std::env::var("SYNSEMA_WS_SERVER_PING")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|f| f.is_finite() && *f >= 0.0)
+        .unwrap_or(DEFAULT_SERVER_PING_SECS);
+    let keepalive = if ping_secs > 0.0 {
+        Some(KeepaliveCfg { interval: Duration::from_secs_f64(ping_secs), timeout: Duration::from_secs_f64(ping_secs * 2.0) })
+    } else {
+        None
+    };
+    let mut r = reg.borrow_mut();
+    if let Ok(mut slot) = waker_slot.lock() {
+        *slot = Some(r.waker.clone());
+    }
+    r.next_id += 1;
+    let handle = r.next_id;
+    r.next_token += 1;
+    let token = Token(r.next_token);
+    let conn = Conn {
+        ws,
+        token,
+        dial: DialParams {
+            url: "socket://incoming".to_string(),
+            host: String::new(),
+            port: 0,
+            tls: false,
+            headers: Vec::new(),
+            subprotocols: Vec::new(),
+            max_msg,
+            connect_timeout: Duration::from_secs(0),
+        },
+        negotiated_subprotocol: subprotocol,
+        inbound: VecDeque::new(),
+        queued_bytes: 0,
+        max_queue: DEFAULT_MAX_QUEUE,
+        max_queue_bytes: DEFAULT_MAX_QUEUE_BYTES,
+        on_full: OnFull::Block,
+        read_paused: false,
+        pending_flush: false,
+        reconnect: None,
+        keepalive,
+        status: Status::Open,
+        stats: Stats::default(),
+        last_activity: Instant::now(),
+        awaiting_pong_since: None,
+        retries_left: 0,
+        reconnect_at: None,
+        current_interest: None,
+        closed_emitted: false,
+        last_error: None,
+        server_side: true,
+    };
+    r.conns.insert(handle, conn);
+    r.token_to_handle.insert(token.0, handle);
+    // Cosecha inicial: el pump pudo encolar bytes antes de la adopción.
+    r.drain_reads(handle);
+    Ok(handle)
+}
+
+/// Cierra un socket entrante al terminar el cuerpo de la ruta: `Close 1000` si terminó
+/// bien, `Close 1011` + motivo (truncado a 123 bytes, el límite del frame) si el
+/// cuerpo falló, `Close 1001` (going away) + motivo si el server lo CANCELÓ (timeout de
+/// la ruta, shutdown ordenado) — el cliente distingue "el handler se rompió" de "el
+/// server me despidió". Idempotente (un `ws_close(socket)` previo lo dejó retirado).
+pub fn close_server_socket(interp: &Interpreter, handle: i64, error: Option<&str>, going_away: bool) {
+    let Some(reg) = hub_of(interp) else { return };
+    let removed = {
+        let mut r = reg.borrow_mut();
+        match r.conns.remove(&handle) {
+            Some(mut c) => {
+                r.token_to_handle.remove(&c.token.0);
+                if c.current_interest.is_some() {
+                    let source = c.ws.get_mut().source();
+                    let _ = r.poll.registry().deregister(source);
+                }
+                Some(c.ws)
+            }
+            None => None,
+        }
+    };
+    let Some(mut ws) = removed else { return };
+    use tungstenite::protocol::frame::coding::CloseCode;
+    use tungstenite::protocol::CloseFrame;
+    let frame = match error {
+        Some(msg) => {
+            let mut reason = msg.to_string();
+            while reason.len() > 123 {
+                reason.pop();
+            }
+            let code = if going_away { CloseCode::Away } else { CloseCode::Error };
+            CloseFrame { code, reason: reason.into() }
+        }
+        None => CloseFrame { code: CloseCode::Normal, reason: "".into() },
+    };
+    let _ = ws.close(Some(frame));
+    let _ = ws.flush();
+    // Dropear `ws` cierra el canal de salida → el pump termina la escritura y cierra el TCP.
+}
+
+/// Familia de un handle (para etiquetar eventos y validar builtins).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HandleKind {
+    Ws,
+    Proc,
+    Sub,
+}
+
+impl WsRegistry {
+    fn kind_of(&self, h: i64) -> Option<HandleKind> {
+        if self.conns.contains_key(&h) {
+            Some(HandleKind::Ws)
+        } else if self.procs.contains_key(&h) {
+            Some(HandleKind::Proc)
+        } else if self.subs.contains_key(&h) {
+            Some(HandleKind::Sub)
+        } else {
+            None
+        }
+    }
+
+    /// ¿El proceso tiene algo que entregar (salida, error de cola, o el exit)?
+    fn proc_ready(p: &LiveProc) -> bool {
+        if p.shared.is_ready() {
+            return true;
+        }
+        p.exit_code.is_some() && !p.exit_emitted && p.shared.readers_done()
+    }
+
+    /// ¿Un handle (de cualquier familia) tiene algo que entregar?
+    fn handle_actionable(&self, h: i64) -> bool {
+        if let Some(c) = self.conns.get(&h) {
+            return !c.inbound.is_empty() || c.last_error.is_some();
+        }
+        if let Some(p) = self.procs.get(&h) {
+            return Self::proc_ready(p);
+        }
+        if let Some(s) = self.subs.get(&h) {
+            return s.is_ready();
+        }
+        false
+    }
+
+    /// Primer handle listo (cualquier familia), round-robin desde el último entregado.
+    fn first_actionable(&self, targets: &[i64]) -> Option<i64> {
+        if targets.is_empty() {
+            return None;
+        }
+        let start = self.rr.get() % targets.len();
+        for off in 0..targets.len() {
+            let idx = (start + off) % targets.len();
+            let h = targets[idx];
+            if self.handle_actionable(h) {
+                self.rr.set(idx + 1);
+                return Some(h);
+            }
+        }
+        None
+    }
+
+    /// Tick de procesos: cosecha exits (try_wait, no bloquea) y aplica el plazo de
+    /// gracia a lectores que no llegan a EOF tras el exit (nieto con el pipe).
+    fn service_procs(&mut self) {
+        let now = Instant::now();
+        for p in self.procs.values_mut() {
+            if p.exit_code.is_none() && p.shared.readers_done() {
+                p.poll_exit();
+            } else if let Some(at) = p.exited_at {
+                if !p.shared.readers_done() && now.duration_since(at) >= PROC_READER_GRACE {
+                    p.shared.force_readers_done();
+                }
+            } else if p.status == ProcStatus::Running {
+                // Cosecha oportunista (barata): un try_wait por pasada mantiene
+                // `proc_status` honesto aunque nadie lea la salida.
+                p.poll_exit();
+            }
+        }
+    }
+
+    /// Toma el próximo evento de un handle de cualquier familia, ya etiquetado
+    /// (`source`, `handle`, y `conn` en sockets por compatibilidad). `Err` = error
+    /// terminal atrapable del handle.
+    fn take_event(&mut self, h: i64, names: &TargetNames) -> Option<Result<SynValue, String>> {
+        let kind = self.kind_of(h)?;
+        let tagged = |mut m: indexmap::IndexMap<String, SynValue>, source: &str| {
+            m.insert("source".to_string(), syn_text(source));
+            m.insert("handle".to_string(), syn_int(h));
+            if let Some(names) = names {
+                if let Some(name) = names.get(&h) {
+                    m.insert("name".to_string(), syn_text(name.clone()));
+                }
+            }
+            syn_map(m)
+        };
+        match kind {
+            HandleKind::Ws => {
+                if self.conns.get(&h).map(|c| !c.inbound.is_empty()).unwrap_or(false) {
+                    let msg = self.take_message(h)?;
+                    let mut m = match msg {
+                        SynValue::Map(m) => m.borrow().clone(),
+                        other => {
+                            let mut mm = indexmap::IndexMap::new();
+                            mm.insert("data".to_string(), other);
+                            mm
+                        }
+                    };
+                    m.insert("conn".to_string(), syn_int(h));
+                    return Some(Ok(tagged(m, "ws")));
+                }
+                self.take_error(h).map(|e| Err(format!("connection {}: {}", h, e)))
+            }
+            HandleKind::Proc => {
+                let p = self.procs.get_mut(&h)?;
+                match p.shared.try_recv() {
+                    Ok(Some(ev)) => {
+                        let mut m = indexmap::IndexMap::new();
+                        match ev {
+                            ProcEvent::Stdout(b) => {
+                                m.insert("type".to_string(), syn_text("stdout"));
+                                m.insert("data".to_string(), syn_text(String::from_utf8_lossy(&b).into_owned()));
+                            }
+                            ProcEvent::Stderr(b) => {
+                                m.insert("type".to_string(), syn_text("stderr"));
+                                m.insert("data".to_string(), syn_text(String::from_utf8_lossy(&b).into_owned()));
+                            }
+                            ProcEvent::Exit(code, sig) => {
+                                m.insert("type".to_string(), syn_text("exit"));
+                                m.insert("data".to_string(), exit_map(code, sig));
+                            }
+                        }
+                        Some(Ok(tagged(m, "proc")))
+                    }
+                    Ok(None) => {
+                        if p.exit_code.is_some() && !p.exit_emitted && p.shared.readers_done() {
+                            p.exit_emitted = true;
+                            let mut m = indexmap::IndexMap::new();
+                            m.insert("type".to_string(), syn_text("exit"));
+                            m.insert("data".to_string(), exit_map(p.exit_code.unwrap_or(-1), p.exit_signal));
+                            Some(Ok(tagged(m, "proc")))
+                        } else {
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        // Overflow con política Error: terminal → matar y retirar.
+                        if let Some(mut p) = self.procs.remove(&h) {
+                            p.shutdown();
+                        }
+                        Some(Err(format!("process {}: {}", h, e)))
+                    }
+                }
+            }
+            HandleKind::Sub => {
+                let s = self.subs.get(&h)?.clone();
+                match s.try_recv() {
+                    Ok(Some(ev)) => {
+                        let mut m = indexmap::IndexMap::new();
+                        m.insert("type".to_string(), syn_text("event"));
+                        m.insert("topic".to_string(), syn_text(ev.topic));
+                        m.insert("data".to_string(), from_send(&ev.data));
+                        m.insert(
+                            "timestamp".to_string(),
+                            syn_number(synsema_core::number::Number::Float(ev.timestamp)),
+                        );
+                        Some(Ok(tagged(m, "bus")))
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        self.subs.remove(&h);
+                        if let Some(bus) = &self.bus {
+                            bus.unsubscribe(s.id);
+                        }
+                        Some(Err(format!("subscription {}: {}", h, e)))
+                    }
+                }
+            }
+        }
+    }
+
+    fn all_gone(&self, targets: &[i64]) -> bool {
+        targets.iter().all(|h| self.kind_of(*h).is_none())
+    }
+}
+
+fn exit_map(code: i64, sig: Option<i32>) -> SynValue {
+    let mut m = indexmap::IndexMap::new();
+    m.insert("exit_code".to_string(), syn_int(code));
+    m.insert("signal".to_string(), sig.map(|s| syn_int(s as i64)).unwrap_or(SynValue::Nothing));
+    syn_map(m)
+}
+
+/// El corazón de `select`/`ws_select`/`proc_select`/`bus_recv`/`proc_recv`: espera al
+/// primer handle listo entre `targets` (readiness del Poll + Waker), con equidad,
+/// fail-fast en errores terminales, y cancelación cooperativa.
+fn select_impl(interp: &mut Interpreter, args: &[SynValue], reg: &Registry, fname: &str) -> Result<SynValue, Control> {
+    let (targets, names) = resolve_targets(args.first().ok_or_else(|| err(format!("{}: missing the handles", fname)))?, fname)?;
+    let timeout = timeout_arg(args.get(1), fname)?;
+    select_on(interp, reg, &targets, &names, timeout, fname)
+}
+
+fn select_on(
+    interp: &mut Interpreter,
+    reg: &Registry,
+    targets: &[i64],
+    names: &TargetNames,
+    timeout: Duration,
+    fname: &str,
+) -> Result<SynValue, Control> {
+    if targets.is_empty() {
+        return Ok(SynValue::Nothing);
+    }
+    let deadline = Instant::now() + timeout;
+    watch_cancel(reg, interp);
+    loop {
+        interp.check_cancel()?;
+        let ready = reg.borrow().first_actionable(targets);
+        if let Some(h) = ready {
+            let taken = reg.borrow_mut().take_event(h, names);
+            match taken {
+                Some(Ok(v)) => return Ok(v),
+                Some(Err(e)) => return Err(err(format!("{}: {}", fname, e))),
+                None => {} // carrera benigna: re-evaluar
+            }
+        }
+        let all_gone = reg.borrow().all_gone(targets);
+        if all_gone || Instant::now() >= deadline {
+            return Ok(SynValue::Nothing);
+        }
+        let mut pending = Vec::new();
+        reg.borrow_mut().pump(targets, deadline, &mut pending);
+        run_pending(interp, reg, pending)?;
+    }
+}
+
+fn select_builtin(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    select_impl(interp, args, reg, "select")
+}
+
+// ---------------------------------------------------------
+// Procesos vivos
+// ---------------------------------------------------------
+
+fn proc_handle(reg: &Registry, v: Option<&SynValue>, fname: &str) -> Result<i64, Control> {
+    let h = conn_handle(v.ok_or_else(|| err(format!("{}: missing the process handle", fname)))?, fname)?;
+    match reg.borrow().kind_of(h) {
+        Some(HandleKind::Proc) => Ok(h),
+        Some(HandleKind::Ws) => Err(err(format!("{}: handle {} is a WebSocket connection, not a process", fname, h))),
+        Some(HandleKind::Sub) => Err(err(format!("{}: handle {} is a bus subscription, not a process", fname, h))),
+        None => Err(err(format!("{}: unknown or closed process handle {}", fname, h))),
+    }
+}
+
+fn opt_map<'a>(v: Option<&'a SynValue>, fname: &str) -> Result<Option<std::cell::Ref<'a, indexmap::IndexMap<String, SynValue>>>, Control> {
+    match v {
+        None | Some(SynValue::Nothing) => Ok(None),
+        Some(SynValue::Map(m)) => Ok(Some(m.borrow())),
+        Some(other) => Err(err(format!("{}: options must be a map, got {}", fname, other.type_name()))),
+    }
+}
+
+fn opt_usize(m: &indexmap::IndexMap<String, SynValue>, key: &str, fname: &str) -> Result<Option<usize>, Control> {
+    match m.get(key) {
+        None | Some(SynValue::Nothing) => Ok(None),
+        Some(SynValue::Number(n)) => {
+            let f = n.to_f64();
+            if !f.is_finite() || f < 1.0 {
+                return Err(err(format!("{}: {} must be a positive number", fname, key)));
+            }
+            Ok(Some(f as usize))
+        }
+        Some(other) => Err(err(format!("{}: {} must be a number, got {}", fname, key, other.type_name()))),
+    }
+}
+
+fn proc_spawn(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "proc_spawn";
+    let cmd = match args.first() {
+        Some(SynValue::Text(s)) => s.to_string(),
+        Some(other) => return Err(err(format!("{}: the command must be text, got {}", F, other.type_name()))),
+        None => return Err(err(format!("{}: missing the command", F))),
+    };
+    let arg_list: Vec<String> = match args.get(1) {
+        None | Some(SynValue::Nothing) => Vec::new(),
+        Some(SynValue::List(l)) => l
+            .borrow()
+            .iter()
+            .map(|v| match v {
+                SynValue::Secret(_) => Err(err(format!("{}: cannot pass a secret as a process argument (reveal() it explicitly if you truly must)", F))),
+                SynValue::Text(s) => Ok(s.to_string()),
+                other => Ok(other.to_string()),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err(err(format!("{}: args must be a list", F))),
+    };
+    // Gate: exec(cmd) — el MISMO de run(); sandbox lo deniega.
+    {
+        let caps = reg.borrow().caps.clone();
+        caps.borrow_mut()
+            .require(&Capability::new(CapabilityType::Exec, Some(cmd.clone())), "proc_spawn()")
+            .map_err(|v| Control::Error(RuntimeError::new(v.message)))?;
+    }
+    {
+        let r = reg.borrow();
+        if r.procs.len() >= r.max_procs {
+            return Err(err(format!(
+                "{}: process budget reached ({} live, max {}); proc_close some or raise SYNSEMA_PROC_MAX",
+                F,
+                r.procs.len(),
+                r.max_procs
+            )));
+        }
+    }
+    let mut opts = SpawnOpts::default();
+    if let Some(m) = opt_map(args.get(2), F)? {
+        if let Some(SynValue::Text(d)) = m.get("cwd") {
+            opts.cwd = Some(d.to_string());
+        }
+        if let Some(SynValue::Map(em)) = m.get("env") {
+            for (k, v) in em.borrow().iter() {
+                if matches!(v, SynValue::Secret(_)) {
+                    return Err(err(format!(
+                        "{}: cannot pass a secret in the process env (key {:?}); reveal() it explicitly if you truly must",
+                        F, k
+                    )));
+                }
+                opts.env.push((k.clone(), v.to_string()));
+            }
+        }
+        if let Some(n) = opt_usize(&m, "max_queue", F)? {
+            opts.max_queue = n;
+        }
+        if let Some(n) = opt_usize(&m, "max_queue_bytes", F)? {
+            opts.max_queue_bytes = n;
+        }
+        if let Some(v) = m.get("on_full") {
+            opts.on_full = match v {
+                SynValue::Text(s) if s.as_ref() == "block" => ProcOnFull::Block,
+                SynValue::Text(s) if s.as_ref() == "drop_oldest" => ProcOnFull::DropOldest,
+                SynValue::Text(s) if s.as_ref() == "error" => ProcOnFull::Error,
+                _ => return Err(err(format!("{}: on_full must be \"block\", \"drop_oldest\" or \"error\"", F))),
+            };
+        }
+        if let Some(SynValue::Bool(b)) = m.get("line_mode") {
+            opts.line_mode = *b;
+        }
+        if let Some(v) = m.get("stderr") {
+            opts.merge_stderr = match v {
+                SynValue::Text(s) if s.as_ref() == "separate" => false,
+                SynValue::Text(s) if s.as_ref() == "merge" => true,
+                _ => return Err(err(format!("{}: stderr must be \"separate\" or \"merge\"", F))),
+            };
+        }
+    }
+    let live = LiveProc::spawn(&cmd, &arg_list, opts).map_err(|e| err(format!("{}: {}", F, e)))?;
+    let mut r = reg.borrow_mut();
+    let w = r.waker.clone();
+    live.shared.set_wake(Some(Arc::new(move || {
+        let _ = w.wake();
+    })));
+    r.next_id += 1;
+    let handle = r.next_id;
+    r.procs.insert(handle, live);
+    Ok(syn_int(handle))
+}
+
+fn proc_send(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "proc_send";
+    let h = proc_handle(reg, args.first(), F)?;
+    let data: Vec<u8> = match args.get(1) {
+        Some(SynValue::Text(s)) => s.as_bytes().to_vec(),
+        Some(SynValue::Bytes(b)) => b[..].to_vec(),
+        Some(SynValue::Secret(_)) => {
+            return Err(err(format!("{}: cannot send a secret to a process (reveal() it first if you truly must)", F)))
+        }
+        Some(other) => return Err(err(format!("{}: the data must be text or bytes, got {}", F, other.type_name()))),
+        None => return Err(err(format!("{}: missing the data", F))),
+    };
+    let mut r = reg.borrow_mut();
+    let p = r.procs.get_mut(&h).ok_or_else(|| err(format!("{}: unknown process handle {}", F, h)))?;
+    p.send_stdin(&data).map_err(|e| err(format!("{}: {}", F, e)))?;
+    Ok(syn_bool(true))
+}
+
+fn proc_close_stdin(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "proc_close_stdin";
+    let h = proc_handle(reg, args.first(), F)?;
+    if let Some(p) = reg.borrow_mut().procs.get_mut(&h) {
+        p.close_stdin();
+    }
+    Ok(syn_bool(true))
+}
+
+fn proc_recv(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "proc_recv";
+    let h = proc_handle(reg, args.first(), F)?;
+    let timeout = timeout_arg(args.get(1), F)?;
+    select_on(interp, reg, &[h], &None, timeout, F)
+}
+
+fn proc_select(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "proc_select";
+    let (targets, names) = resolve_targets(args.first().ok_or_else(|| err(format!("{}: missing the process handles", F)))?, F)?;
+    for h in &targets {
+        proc_handle(reg, Some(&syn_int(*h)), F)?;
+    }
+    let timeout = timeout_arg(args.get(1), F)?;
+    select_on(interp, reg, &targets, &names, timeout, F)
+}
+
+fn proc_status(_interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "proc_status";
+    let h = conn_handle(args.first().ok_or_else(|| err(format!("{}: missing the process handle", F)))?, F)?;
+    let mut r = reg.borrow_mut();
+    let Some(p) = r.procs.get_mut(&h) else {
+        return Ok(syn_text("closed"));
+    };
+    p.poll_exit();
+    Ok(syn_text(match p.status {
+        ProcStatus::Running => "running",
+        ProcStatus::Exited => "exited",
+        ProcStatus::Killed => "killed",
+    }))
+}
+
+fn proc_kill(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "proc_kill";
+    let h = proc_handle(reg, args.first(), F)?;
+    let graceful = match args.get(1) {
+        None | Some(SynValue::Nothing) => true,
+        Some(SynValue::Text(s)) if s.as_ref().eq_ignore_ascii_case("TERM") || s.as_ref().eq_ignore_ascii_case("SIGTERM") => true,
+        Some(SynValue::Text(s)) if s.as_ref().eq_ignore_ascii_case("KILL") || s.as_ref().eq_ignore_ascii_case("SIGKILL") => false,
+        Some(_) => return Err(err(format!("{}: the signal must be \"TERM\" (default) or \"KILL\"", F))),
+    };
+    let mut r = reg.borrow_mut();
+    let p = r.procs.get_mut(&h).ok_or_else(|| err(format!("{}: unknown process handle {}", F, h)))?;
+    p.kill(graceful).map_err(|e| err(format!("{}: {}", F, e)))?;
+    Ok(syn_bool(true))
+}
+
+fn proc_wait(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "proc_wait";
+    let h = proc_handle(reg, args.first(), F)?;
+    let timeout = timeout_arg(args.get(1), F)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        interp.check_cancel()?;
+        {
+            let mut r = reg.borrow_mut();
+            let p = r.procs.get_mut(&h).ok_or_else(|| err(format!("{}: unknown process handle {}", F, h)))?;
+            if p.poll_exit() {
+                return Ok(exit_map(p.exit_code.unwrap_or(-1), p.exit_signal));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Ok(SynValue::Nothing);
+        }
+        // Dormir en el Poll (el exit despierta por los lectores; si no, 20 ms).
+        let slice = deadline.saturating_duration_since(Instant::now()).min(Duration::from_millis(20));
+        reg.borrow_mut().poll_process(slice);
+    }
+}
+
+fn proc_close(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "proc_close";
+    let h = conn_handle(args.first().ok_or_else(|| err(format!("{}: missing the process handle", F)))?, F)?;
+    // Idempotente: cerrar un handle desconocido es no-op.
+    let removed = reg.borrow_mut().procs.remove(&h);
+    if let Some(mut p) = removed {
+        p.shutdown();
+    }
+    Ok(syn_bool(true))
+}
+
+fn proc_stats(_interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "proc_stats";
+    let h = proc_handle(reg, args.first(), F)?;
+    let mut r = reg.borrow_mut();
+    let p = r.procs.get_mut(&h).ok_or_else(|| err(format!("{}: unknown process handle {}", F, h)))?;
+    p.poll_exit();
+    let (queued, queued_bytes, dropped) = p.shared.stats();
+    let mut m = indexmap::IndexMap::new();
+    m.insert("pid".to_string(), syn_int(p.pid as i64));
+    m.insert("cmd".to_string(), syn_text(p.cmd.clone()));
+    m.insert(
+        "status".to_string(),
+        syn_text(match p.status {
+            ProcStatus::Running => "running",
+            ProcStatus::Exited => "exited",
+            ProcStatus::Killed => "killed",
+        }),
+    );
+    m.insert("exit_code".to_string(), p.exit_code.map(syn_int).unwrap_or(SynValue::Nothing));
+    m.insert("queued".to_string(), syn_int(queued as i64));
+    m.insert("queued_bytes".to_string(), syn_int(queued_bytes as i64));
+    m.insert("dropped".to_string(), syn_int(dropped as i64));
+    m.insert(
+        "uptime".to_string(),
+        syn_number(synsema_core::number::Number::Float(p.started_at.elapsed().as_secs_f64())),
+    );
+    Ok(syn_map(m))
+}
+
+// ---------------------------------------------------------
+// Bus de eventos
+// ---------------------------------------------------------
+
+fn bus_of(reg: &Registry, fname: &str) -> Result<Arc<Bus>, Control> {
+    reg.borrow()
+        .bus
+        .clone()
+        .ok_or_else(|| err(format!("{}: the event bus is not available in this context (it lives in the process swarm)", fname)))
+}
+
+/// Conversión ESTRICTA a `SendValue` para publicar: una task, un builtin o un secret no
+/// cruzan el bus (nunca degradados a texto en silencio — el suscriptor recibiría basura
+/// o un secret redactado sin saberlo).
+fn to_send_strict(v: &SynValue, fname: &str) -> Result<SendValue, Control> {
+    match v {
+        SynValue::Task(_) | SynValue::Builtin(_) => {
+            Err(err(format!("{}: cannot publish a task on the bus (publish data: text/number/bool/list/map/bytes)", fname)))
+        }
+        SynValue::Secret(_) => Err(err(format!("{}: cannot publish a secret on the bus", fname))),
+        SynValue::List(l) => Ok(SendValue::List(
+            l.borrow().iter().map(|x| to_send_strict(x, fname)).collect::<Result<Vec<_>, _>>()?,
+        )),
+        SynValue::Map(m) => Ok(SendValue::Map(
+            m.borrow()
+                .iter()
+                .map(|(k, x)| to_send_strict(x, fname).map(|sv| (k.clone(), sv)))
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        other => Ok(synsema_core::types::to_send(other)),
+    }
+}
+
+fn topic_arg(v: Option<&SynValue>, fname: &str) -> Result<String, Control> {
+    match v {
+        Some(SynValue::Text(s)) if !s.trim().is_empty() => Ok(s.to_string()),
+        Some(SynValue::Text(_)) => Err(err(format!("{}: the topic cannot be empty", fname))),
+        Some(other) => Err(err(format!("{}: the topic must be text, got {}", fname, other.type_name()))),
+        None => Err(err(format!("{}: missing the topic", fname))),
+    }
+}
+
+fn bus_publish(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "bus_publish";
+    let topic = topic_arg(args.first(), F)?;
+    if topic.contains('*') || topic.contains('?') {
+        return Err(err(format!("{}: a published topic is literal (globs belong to bus_subscribe), got {:?}", F, topic)));
+    }
+    let data = to_send_strict(args.get(1).unwrap_or(&SynValue::Nothing), F)?;
+    let bus = bus_of(reg, F)?;
+    Ok(syn_int(bus.publish(&topic, data) as i64))
+}
+
+fn bus_subscribe(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "bus_subscribe";
+    let patterns: Vec<String> = match args.first() {
+        Some(SynValue::List(l)) => l
+            .borrow()
+            .iter()
+            .map(|v| topic_arg(Some(v), F))
+            .collect::<Result<Vec<_>, _>>()?,
+        other => vec![topic_arg(other, F)?],
+    };
+    if patterns.is_empty() {
+        return Err(err(format!("{}: subscribe to at least one topic", F)));
+    }
+    let mut opts = SubscribeOpts::default();
+    if let Some(m) = opt_map(args.get(1), F)? {
+        if let Some(n) = opt_usize(&m, "max_queue", F)? {
+            opts.max_queue = n;
+        }
+        if let Some(n) = opt_usize(&m, "max_queue_bytes", F)? {
+            opts.max_queue_bytes = n;
+        }
+        if let Some(v) = m.get("on_full") {
+            opts.on_full = match v {
+                SynValue::Text(s) if s.as_ref() == "drop_oldest" => BusOnFull::DropOldest,
+                SynValue::Text(s) if s.as_ref() == "error" => BusOnFull::Error,
+                _ => return Err(err(format!("{}: on_full must be \"drop_oldest\" or \"error\"", F))),
+            };
+        }
+    }
+    let bus = bus_of(reg, F)?;
+    let sub = bus.subscribe(patterns, opts).map_err(err)?;
+    let mut r = reg.borrow_mut();
+    let w = r.waker.clone();
+    sub.set_wake(Some(Arc::new(move || {
+        let _ = w.wake();
+    })));
+    r.next_id += 1;
+    let handle = r.next_id;
+    r.subs.insert(handle, sub);
+    Ok(syn_int(handle))
+}
+
+fn bus_recv(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "bus_recv";
+    let h = conn_handle(args.first().ok_or_else(|| err(format!("{}: missing the subscription handle", F)))?, F)?;
+    match reg.borrow().kind_of(h) {
+        Some(HandleKind::Sub) => {}
+        Some(_) => return Err(err(format!("{}: handle {} is not a bus subscription", F, h))),
+        None => return Err(err(format!("{}: unknown or closed subscription handle {}", F, h))),
+    }
+    let timeout = timeout_arg(args.get(1), F)?;
+    select_on(interp, reg, &[h], &None, timeout, F)
+}
+
+fn bus_unsubscribe(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "bus_unsubscribe";
+    let h = conn_handle(args.first().ok_or_else(|| err(format!("{}: missing the subscription handle", F)))?, F)?;
+    let mut r = reg.borrow_mut();
+    if let Some(s) = r.subs.remove(&h) {
+        if let Some(bus) = &r.bus {
+            bus.unsubscribe(s.id);
+        }
+    }
+    Ok(syn_bool(true))
+}
+
+fn bus_topics(_args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "bus_topics";
+    let bus = bus_of(reg, F)?;
+    let items: Vec<SynValue> = bus
+        .topics()
+        .into_iter()
+        .map(|(topic, n)| {
+            let mut m = indexmap::IndexMap::new();
+            m.insert("topic".to_string(), syn_text(topic));
+            m.insert("subscribers".to_string(), syn_int(n as i64));
+            syn_map(m)
+        })
+        .collect();
+    Ok(SynValue::List(Rc::new(RefCell::new(items))))
+}
+
+// =========================================================
 // Registro
 // =========================================================
 
 pub fn register_ws_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
     let poll = Poll::new().expect("mio::Poll::new");
+    let waker = Arc::new(Waker::new(poll.registry(), WAKER_TOKEN).expect("mio::Waker::new"));
+    let max_procs = std::env::var("SYNSEMA_PROC_MAX")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| n.min(MAX_PROCS_CEILING))
+        .unwrap_or(DEFAULT_MAX_PROCS);
     // Tope de conexiones por intérprete: default DEFAULT_MAX_CONNS, ajustable con
     // `SYNSEMA_WS_MAX_CONNS` (acotado al techo duro; un valor inválido cae al default).
     let max_conns = std::env::var("SYNSEMA_WS_MAX_CONNS")
@@ -1685,7 +2674,17 @@ pub fn register_ws_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet
         max_conns,
         rr: std::cell::Cell::new(0),
         caps,
+        waker,
+        procs: HashMap::new(),
+        max_procs,
+        subs: HashMap::new(),
+        bus: None,
+        cancel_seen: 0,
+        cancel_flag: None,
     }));
+    // El hub queda alcanzable desde el intérprete (slot opaco): el motor adjunta el
+    // bus (`attach_bus`) y el serve adopta sockets entrantes (`adopt_server_socket`).
+    interp.ext.borrow_mut().insert(IO_HUB_KEY, Rc::new(reg.clone()) as Rc<dyn std::any::Any>);
 
     macro_rules! reg_fn {
         ($name:literal, $arity:expr, $f:ident) => {{
@@ -1709,4 +2708,26 @@ pub fn register_ws_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet
     reg_fn_interp!("ws_status", 1, ws_status);
     reg_fn!("ws_stats", 1, ws_stats);
     reg_fn!("ws_close", 1, ws_close);
+
+    // -- select unificado (sockets + procesos + bus) --
+    reg_fn_interp!("select", -1, select_builtin);
+
+    // -- procesos vivos --
+    reg_fn!("proc_spawn", -1, proc_spawn);
+    reg_fn!("proc_send", 2, proc_send);
+    reg_fn!("proc_close_stdin", 1, proc_close_stdin);
+    reg_fn_interp!("proc_recv", -1, proc_recv);
+    reg_fn_interp!("proc_select", -1, proc_select);
+    reg_fn_interp!("proc_status", 1, proc_status);
+    reg_fn!("proc_kill", -1, proc_kill);
+    reg_fn_interp!("proc_wait", -1, proc_wait);
+    reg_fn!("proc_close", 1, proc_close);
+    reg_fn_interp!("proc_stats", 1, proc_stats);
+
+    // -- bus de eventos (pub/sub in-process) --
+    reg_fn!("bus_publish", 2, bus_publish);
+    reg_fn!("bus_subscribe", -1, bus_subscribe);
+    reg_fn_interp!("bus_recv", -1, bus_recv);
+    reg_fn!("bus_unsubscribe", 1, bus_unsubscribe);
+    reg_fn!("bus_topics", 0, bus_topics);
 }

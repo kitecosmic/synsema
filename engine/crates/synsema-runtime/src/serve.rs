@@ -60,6 +60,22 @@ use synsema_stdlib::server::{
     self, serve_forever, AuthHandler, Ctx, Emitter, ErrorHandler, GiveOutcome,
     Handler, RouteSpec, ServeRuntime, StaticMountSpec, StreamEnd, StreamGone, StreamHandler,
 };
+use synsema_stdlib::routing::SocketHandler;
+use synsema_stdlib::ws::{adopt_server_socket, close_server_socket, ServerSocketLink};
+
+/// Techo del host para `serve` (`synsema serve --sandbox | --cap-set`): política del
+/// PROCESO (viene de la CLI), por eso vive en un slot global y no se enhebra por las
+/// firmas del motor. Lo leen los intérpretes de request, los ticks de cron y los
+/// agentes spawneados bajo serve — ninguno puede exceder lo que el operador fijó.
+static SERVE_CEILING: std::sync::OnceLock<Option<Arc<Vec<Capability>>>> = std::sync::OnceLock::new();
+
+fn set_serve_ceiling(ceiling: Option<Vec<Capability>>) {
+    let _ = SERVE_CEILING.set(ceiling.map(Arc::new));
+}
+
+fn serve_ceiling() -> Option<Arc<Vec<Capability>>> {
+    SERVE_CEILING.get().cloned().flatten()
+}
 #[allow(unused_imports)]
 use synsema_stdlib::routing::{build_form_syn, build_request_syn, headers_map, request_bindings, str_map};
 
@@ -405,7 +421,10 @@ pub(crate) fn run_mode_cron_executor(
     // lleva (weak) el MISMO scheduler que registró el intérprete principal: un task
     // de cron que registra otro cron es visible en cron_list() y ejecuta.
     let ctx = CronTickCtx { sched: Arc::downgrade(sched), slot: Arc::new(RwLock::new(None)) };
-    let swarm: Arc<Swarm> = Arc::new(Swarm::new());
+    // El swarm de los ticks es propio, pero se crea en la PRIMERA registración para
+    // compartir el bus del intérprete que registra: un `bus_publish` de un tick lo ven
+    // los suscriptores del programa principal (y viceversa).
+    let swarm_cell: Arc<std::sync::OnceLock<Arc<Swarm>>> = Arc::new(std::sync::OnceLock::new());
     let shared_db: SharedDb = Arc::new(Mutex::new(DatabaseManager::new()));
     // Memoria DECLARADA (DB-M1): los ticks comparten los stores (y la persistencia
     // on-write) del programa. Sin declaración: stores descartables + gate cerrado
@@ -433,6 +452,14 @@ pub(crate) fn run_mode_cron_executor(
         // Refrescar el snapshot en cada registración: los jobs ven el mundo del
         // momento en que el ÚLTIMO fue registrado (los stores compartidos son los
         // mismos Arc — el cache por-hilo se renueva solo al cambiar el snapshot).
+        let swarm = swarm_cell
+            .get_or_init(|| {
+                Arc::new(match synsema_stdlib::ws::bus_of_interp(interp) {
+                    Some(b) => Swarm::with_bus(b),
+                    None => Swarm::new(),
+                })
+            })
+            .clone();
         let env = CronExecEnv {
             swarm: swarm.clone(),
             snapshot: snapshot_globals(interp),
@@ -579,6 +606,9 @@ pub struct ServeOverrides {
     pub tls_key: Option<String>,
     /// `--bind <addr>`: dirección de bind (default `0.0.0.0`).
     pub bind: Option<String>,
+    /// `--sandbox` | `--cap-set <list>`: techo de capabilities del host para TODO el
+    /// serve (requests, cron, agentes). `None` = sin techo (comportamiento histórico).
+    pub ceiling: Option<Vec<Capability>>,
 }
 
 impl ServeOverrides {
@@ -1127,6 +1157,7 @@ fn build_base_interp(
     cron: &CronWiring,
     secure: bool,
     mem_name: &Option<String>,
+    agent_builder: Option<crate::engine::InterpBuilder>,
 ) -> (Interpreter, Rc<RefCell<CapabilitySet>>) {
     let mut interp = Interpreter::new();
     // DE-034: bajo `serve`, los `log`/`print`/`show` de DENTRO de un handler se
@@ -1136,6 +1167,12 @@ fn build_base_interp(
     // largos). El `run` NO se toca: este wiring es exclusivo de la ruta serve.
     interp.log_hook = Some(serve_log_sink());
     let caps = Rc::new(RefCell::new(CapabilitySet::new("request")));
+    // Techo del host (`serve --sandbox/--cap-set`): ANTES de wire_common para que los
+    // auto-grants ambientales también se filtren; se propaga a los agentes spawneados.
+    let host_ceiling = serve_ceiling();
+    if let Some(cl) = &host_ceiling {
+        caps.borrow_mut().ceiling = Some(Rc::new((**cl).clone()));
+    }
     // Gate de memoria declarada (DB-M1): mismo gate para la familia entera (memoria +
     // reglas + progress) contra las caps del WORKER — el snapshot del preámbulo trae
     // el grant de `memory("<nombre>")` si el programa lo declaró; un `sandbox` dentro
@@ -1207,9 +1244,10 @@ fn build_base_interp(
             c.grant(cap.clone());
         }
     }
-    // El techo del host (--sandbox/--cap-set) aún no se extiende a `serve` (extensión
-    // posterior); los intérpretes de request corren sin techo (comportamiento actual).
-    wire_swarm_hooks(&mut interp, swarm, "request", None, mem_ctx);
+    // Hooks del swarm con el techo del host y el CONSTRUCTOR de intérpretes de serve:
+    // un agente spawneado desde un handler nace con el mismo wiring que un tick de cron
+    // (state_*, DB compartida, approvals, cron, bus, memoria) — no en una isla.
+    wire_swarm_hooks(&mut interp, swarm, "request", host_ceiling, mem_ctx, agent_builder);
     register_database_builtins(&interp, shared_db, caps.clone());
     rebuild_globals(&mut interp, snapshot);
     (interp, caps)
@@ -1261,6 +1299,49 @@ fn with_serve_interp<R>(
     // Sacá el base del cache (o construilo la primera vez). Sacarlo (en vez de tomar
     // prestado) evita sostener el borrow del thread-local mientras corre `f`.
     let mut base = SERVE_INTERPS.with(|c| c.borrow_mut().remove(&key)).unwrap_or_else(|| {
+        // Constructor `Send` de intérpretes de ESTE serve (para agentes spawneados desde
+        // handlers/cron): captura los Arcs compartidos y se pasa a sí mismo (los agentes
+        // de agentes heredan el mismo wiring).
+        let builder: crate::engine::InterpBuilder = {
+            let cell: Arc<std::sync::OnceLock<crate::engine::InterpBuilder>> = Arc::new(std::sync::OnceLock::new());
+            let cell2 = cell.clone();
+            let (sw, sn, cs, db, rs, sm, ow, sp, owp, st, ap, cr, mn) = (
+                swarm.clone(),
+                snapshot.clone(),
+                caps_snap.clone(),
+                shared_db.clone(),
+                rules_snap.clone(),
+                shared_memory.clone(),
+                on_write.clone(),
+                shared_progress.clone(),
+                on_write_progress.clone(),
+                shared_state.clone(),
+                approvals.clone(),
+                cron.clone(),
+                mem_name.clone(),
+            );
+            let b: crate::engine::InterpBuilder = Arc::new(move || {
+                build_base_interp(
+                    sw.clone(),
+                    &sn,
+                    &cs,
+                    db.clone(),
+                    &rs,
+                    &sm,
+                    &ow,
+                    &sp,
+                    &owp,
+                    &st,
+                    &ap,
+                    &cr,
+                    secure,
+                    &mn,
+                    cell2.get().cloned(),
+                )
+            });
+            let _ = cell.set(b.clone());
+            b
+        };
         let (interp, caps) = build_base_interp(
             swarm.clone(),
             snapshot,
@@ -1276,6 +1357,7 @@ fn with_serve_interp<R>(
             cron,
             secure,
             mem_name,
+            Some(builder),
         );
         BaseInterp { interp, caps, _snapshot: snapshot.clone() }
     });
@@ -1284,6 +1366,9 @@ fn with_serve_interp<R>(
 
     // Limpieza por-request: estado transitorio del intérprete + capabilities al
     // snapshot del preámbulo (aislamiento entre requests reusando el mismo intérprete).
+    // El hub de I/O también: sockets cerrados, procesos matados, suscripciones al bus
+    // retiradas — nada de lo que abrió este request sobrevive al siguiente.
+    synsema_stdlib::ws::reset_hub(&base.interp);
     base.interp.reset_for_request();
     // El reset borra `agent_definitions`; los agentes top-level vuelven del snapshot —
     // si no, el próximo request de este worker vería "No agent defined" (bug pocos-cores).
@@ -1300,6 +1385,78 @@ fn with_serve_interp<R>(
     // `Drop` corta el ciclo Rc del global_env. El pool atrapa el panic.)
     SERVE_INTERPS.with(|c| c.borrow_mut().insert(key, base));
     out
+}
+
+/// Corre el cuerpo de una ruta `socket` (WebSocket entrante): adopta el enlace en el
+/// hub de I/O del intérprete (el binding `socket` es el handle, misma familia `ws_*`),
+/// corre el bloque, y cierra limpio (1000) o con 1011 + motivo si el cuerpo falló.
+#[allow(clippy::too_many_arguments)]
+fn run_socket(
+    swarm: &Arc<Swarm>,
+    snapshot: &Arc<Vec<(String, GlobalVal)>>,
+    caps_snap: &Arc<Vec<Capability>>,
+    shared_db: &SharedDb,
+    rules_snap: &Arc<Vec<OwnerRule>>,
+    shared_memory: &SharedMemoryStore,
+    on_write: &OnWriteFn,
+    shared_progress: &SharedProgressStore,
+    on_write_progress: &OnWriteProgressFn,
+    shared_state: &SharedState,
+    approvals: &ServeApprovals,
+    cron: &CronWiring,
+    body: &[Node],
+    ctx: &Ctx,
+    secure: bool,
+    mem_name: &Option<String>,
+    link: Box<dyn std::any::Any + Send>,
+) -> StreamEnd {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp| {
+        interp.set_cancel_token(ctx.cancel.clone());
+        let (identity, limits) = match &ctx.user {
+            Some(u) => (server::identity_of(u), server::delegated_spend_of(u)),
+            None => (None, Vec::new()),
+        };
+        interp.set_request_identity(identity, limits);
+        let link = match link.downcast::<ServerSocketLink>() {
+            Ok(l) => *l,
+            Err(_) => return StreamEnd::Error("socket: internal transport link type mismatch".to_string()),
+        };
+        let handle = match adopt_server_socket(interp, link) {
+            Ok(h) => h,
+            Err(Control::Error(e)) => return StreamEnd::Error(e.to_string()),
+            Err(_) => return StreamEnd::Error("socket: could not adopt the connection".to_string()),
+        };
+        let mut bindings = request_bindings(ctx);
+        bindings.push(("socket".to_string(), syn_int(handle)));
+        // El cuerpo de la ruta trae el nodo `SocketBlock`: se corre SU cuerpo (aplanado),
+        // igual que `stream` corre el suyo — el resto de statements de la ruta (antes
+        // del bloque) se ejecutan en orden.
+        let flat: Vec<Node> = body
+            .iter()
+            .flat_map(|s| match &s.kind {
+                NodeKind::SocketBlock { body } => body.clone(),
+                _ => vec![s.clone()],
+            })
+            .collect();
+        let end = match interp.run_request_block(&flat, bindings) {
+            Ok(_) | Err(Control::Give(_)) | Err(Control::Stop(_)) => StreamEnd::Done,
+            Err(Control::Error(e)) => StreamEnd::Error(e.to_string()),
+        };
+        // Cierre honesto: 1000 al terminar bien; 1011 + motivo si el cuerpo falló (el
+        // cliente sabe que el server se rompió, nunca un corte mudo); 1001 + motivo si
+        // fue el server quien cortó (timeout de la ruta / shutdown). Log del server.
+        let cancelled = interp.is_cancelled();
+        let reason = match &end {
+            StreamEnd::Error(m) => {
+                let what = if cancelled { "cancelled" } else { "handler failed" };
+                (serve_log_sink())(&format!("[socket] {} {}: {}: {}", ctx.method, ctx.path, what, m));
+                Some(m.as_str())
+            }
+            _ => None,
+        };
+        close_server_socket(interp, handle, reason, cancelled);
+        end
+    })
 }
 
 // =========================================================
@@ -1340,6 +1497,8 @@ fn run_route(
             None => (None, Vec::new()),
         };
         interp.set_request_identity(identity, limits);
+        // Token de cancelación de la request (timeout de handler / shutdown).
+        interp.set_cancel_token(ctx.cancel.clone());
         match interp.run_request_block(body, request_bindings(ctx)) {
             Ok(_) => GiveOutcome::Give(None),
             Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
@@ -1382,6 +1541,7 @@ fn run_stream(
     emit: Emitter,
 ) -> StreamEnd {
     with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp| {
+        interp.set_cancel_token(ctx.cancel.clone());
         let cell = Rc::new(RefCell::new(emit));
         let ec = cell.clone();
         interp.set_stream_emit(Rc::new(move |val: SynValue, event: Option<&str>| {
@@ -1480,6 +1640,26 @@ type Servers = Arc<Mutex<Vec<JoinHandle<()>>>>;
 /// literales) ANTES de aceptar tráfico. Un typo o un template roto falla acá — no como
 /// un 500 en el primer request. Los `render(<expr>)` dinámicos no se pueden validar
 /// estáticamente y quedan para runtime, como siempre.
+/// `timeout <expr>` | `timeout none` → `Some(segundos)`; `none` → `Some(0.0)` (sin
+/// límite explícito, distinto de "no declarado" = `None` → hereda el del serve).
+fn resolve_timeout(interp: &mut Interpreter, env: &Rc<RefCell<Environment>>, clause: Option<&Node>) -> Result<Option<f64>, Control> {
+    let Some(node) = clause else { return Ok(None) };
+    let NodeKind::TimeoutClause { secs } = &node.kind else { return Ok(None) };
+    match secs {
+        None => Ok(Some(0.0)),
+        Some(e) => {
+            let v = interp.eval(e, env)?;
+            match val_to_f64(&v) {
+                Some(f) if f.is_finite() && f > 0.0 => Ok(Some(f)),
+                _ => Err(Control::Error(RuntimeError::new(format!(
+                    "timeout must be a positive number of seconds (or `none`), got {}",
+                    v
+                )))),
+            }
+        }
+    }
+}
+
 fn validate_route_templates(routes_n: &[Node]) -> Result<(), Control> {
     use synsema_core::ast::NodeKind as NK;
     for r in routes_n {
@@ -1662,11 +1842,14 @@ fn build_host_table(
             param_names,
             requires_auth,
             streaming,
+            socket,
             rate_limit,
+            timeout,
             body,
         } = &r.kind
         {
             let rc = resolve_rate(interp, env, rate_limit.as_deref())?;
+            let route_timeout = resolve_timeout(interp, env, timeout.as_deref())?;
             let rate_unlimited = matches!(rc, Some(RateKind::Unlimited));
             // Metadatos estáticos para /openapi.json y /docs (expect, respuesta,
             // capabilities transitivas): del AST + el entorno ya evaluado.
@@ -1711,6 +1894,30 @@ fn build_host_table(
                 run_route(&swarm_c, &snap_c, &caps_c, &db_c, &rules_c, &mem_c, &ow_c, &prog_c, &owp_c, &st_c, &ap_c, &cron_c, &body_c, ctx, secure, &mn_c)
             });
 
+            let socket_handler: Option<SocketHandler> = if *socket {
+                let body_s = body.clone();
+                let swarm_s = swarm.clone();
+                let snap_s = snapshot.clone();
+                let caps_s = caps_snap.clone();
+                let rules_s = rules_snap.clone();
+                let mem_s = shared_memory.clone();
+                let ow_s = on_write.clone();
+                let prog_s = shared_progress.clone();
+                let owp_s = on_write_progress.clone();
+                let st_s = shared_state.clone();
+                let ap_s = approvals.clone();
+                let cron_s = cron.clone();
+                let db_s = shared_db.clone();
+                let mn_s = mem_name.clone();
+                Some(Arc::new(move |ctx: &Ctx, link: Box<dyn std::any::Any + Send>| {
+                    run_socket(
+                        &swarm_s, &snap_s, &caps_s, &db_s, &rules_s, &mem_s, &ow_s, &prog_s, &owp_s, &st_s, &ap_s, &cron_s, &body_s, ctx, secure, &mn_s, link,
+                    )
+                }))
+            } else {
+                None
+            };
+
             let stream_handler: Option<StreamHandler> = if *streaming {
                 let body_s = body.clone();
                 let swarm_s = swarm.clone();
@@ -1741,10 +1948,13 @@ fn build_host_table(
                 param_names: param_names.clone(),
                 requires_auth: *requires_auth,
                 streaming: *streaming,
+                socket: *socket,
                 rate_limit: eff_rate,
                 rate_zone: zone,
                 handler,
                 stream_handler,
+                socket_handler,
+                timeout: route_timeout,
                 proxy_target,
                 rate_unlimited,
                 meta,
@@ -1869,10 +2079,13 @@ fn build_host_table(
                     param_names: params,
                     requires_auth,
                     streaming: false,
+                    socket: false,
                     rate_limit: eff_rate,
                     rate_zone: zone,
                     handler,
                     stream_handler: None,
+                    socket_handler: None,
+                    timeout: None,
                     proxy_target: None,
                     rate_unlimited: false,
                     meta,
@@ -1939,6 +2152,7 @@ fn run_mounted_route(
             }
         };
         let parent = task.closure_env.clone();
+        interp.set_cancel_token(ctx.cancel.clone());
         match interp.run_request_block_in(&task.body, request_bindings(ctx), &parent) {
             Ok(_) => GiveOutcome::Give(None),
             Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
@@ -1979,6 +2193,7 @@ fn make_serve_hook(
             max_body_n,
             max_streams_n,
             block_rate_n,
+            timeout_n,
             static_mounts_n,
             cors_n,
             describe_n,
@@ -2001,6 +2216,7 @@ fn make_serve_hook(
                 max_body,
                 max_streams,
                 rate_limit,
+                timeout,
                 static_mounts,
                 cors,
                 describe,
@@ -2022,6 +2238,7 @@ fn make_serve_hook(
                 max_body.as_deref(),
                 max_streams.as_deref(),
                 rate_limit.as_deref(),
+                timeout.as_deref(),
                 static_mounts,
                 cors.as_deref(),
                 describe.as_deref(),
@@ -2100,6 +2317,9 @@ fn make_serve_hook(
             }
             None => server::DEFAULT_MAX_STREAMS,
         };
+
+        // -- timeout por defecto de los handlers (`timeout N` | `timeout none`) --
+        let default_timeout = resolve_timeout(interp, env, timeout_n)?;
 
         // -- rate limits --
         let block_rate = resolve_rate(interp, env, block_rate_n)?;
@@ -2444,6 +2664,21 @@ fn make_serve_hook(
             secure,
         );
         runtime.tls_enabled = use_tls;
+        // `timeout N` del serve block (Some(0) = `none` explícito = sin límite).
+        runtime.set_default_timeout(default_timeout.filter(|t| *t > 0.0));
+        // Shutdown ordenado: al iniciar el drain se paran los jobs de cron y se cancelan
+        // cooperativamente los agentes vivos (junto con los handlers long-lived).
+        {
+            let sched = cron.sched.clone();
+            let sw = swarm.clone();
+            runtime.set_on_shutdown(Box::new(move || {
+                sched.cancel_all();
+                let n = sw.stop_all_agents("server shutting down");
+                if n > 0 {
+                    (serve_log_sink())(&format!("[serve] shutdown: cancelling {} live agent(s)", n));
+                }
+            }));
+        }
         // Discovery: base URL absoluta (sitemap/openapi/robots), versión del API y
         // si la página /docs está encendida.
         runtime.domain = acme_domains.first().cloned();
@@ -2635,8 +2870,12 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     // Identidad DECLARADA (DB-M1): una sola resolución para todo el serve (un solo
     // warning G-4, un solo `.db`). Sin declaración → cero archivos y gate cerrado en
     // top-level, workers, cron y agentes (G-1); los stores quedan inalcanzables.
-    // (`serve` aún no soporta el techo del host — ceiling None, comportamiento actual.)
-    let declared = match crate::engine::resolve_declared_state(&program.statements, filename, None) {
+    let host_ceiling = serve_ceiling();
+    let declared = match crate::engine::resolve_declared_state(
+        &program.statements,
+        filename,
+        host_ceiling.as_ref().map(|a| a.as_slice()),
+    ) {
         Ok(d) => d,
         Err(msg) => {
             return RunResult {
@@ -2718,7 +2957,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
 
     let swarm = Arc::new(Swarm::new());
     // Techo del host (--sandbox/--cap-set) aún no se extiende a `serve` (extensión posterior).
-    wire_swarm_hooks(&mut interp, swarm.clone(), "main", None, top_mem_ctx);
+    wire_swarm_hooks(&mut interp, swarm.clone(), "main", serve_ceiling(), top_mem_ctx, None);
     // db compartida: el top-level abre/crea tablas; los handlers (en sus hilos) la
     // comparten vía Arc<Mutex>. Sobrescribe la db fresca que dejó wire_common.
     let shared_db: SharedDb = Arc::new(Mutex::new(DatabaseManager::new()));
@@ -2837,6 +3076,7 @@ pub fn run_serve_program_with_overrides(
 ) -> RunResult {
     let src = source.to_string();
     let fname = filename.to_string();
+    set_serve_ceiling(overrides.ceiling.clone());
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || serve_inner(&src, &fname, secure, overrides))

@@ -76,14 +76,14 @@ usually version skew, not a bug.
 
 ## By topic
 - [stdlib.md](stdlib.md) — HTTP requests, WebSocket client (live feeds, gated by `net` — `ws_select` multiplexing thousands of feeds, opt-in reconnect + keepalive/half-open, backpressure, `parallel_map` fan-out), databases (SQL: SQLite / Postgres / MySQL · document: MongoDB · key-value: Redis), cron scheduler, **blockchain** (ETH/EVM · Avalanche · Solana · Algorand · **Bitcoin**: gated `sign` + audit, HD wallets/mnemonics gated by `wallet` — BIP-39/BIP-32/SLIP-0010/Algorand-25 + keystore V3 + WIF, keccak256/hash160, RLP, ABI calldata, EIP-191/712 typed-data digests, Solana message/tx + PDAs/SPL, Algorand canonical msgpack, Bitcoin UTXO builder G28 + BIP-143/341 sighash + Schnorr taproot + PSBT cold custody, base58/base32/bech32/bech32m, EIP-55 addresses) (zero dependencies)
-- [concurrency.md](concurrency.md) — Real multi-core parallelism (Rust): `parallel_map`, `chunk`, fan-out/merge, fail-fast
+- [concurrency.md](concurrency.md) — Real multi-core parallelism (Rust): `parallel_map`, `chunk`, fan-out/merge, fail-fast; **`select` — one event loop over sockets + processes + bus**
 - [frontend.md](frontend.md) — Building UIs/sites: render() templates (inline CSS/JS via `{ raw }` verbatim blocks, elif chains, each empty-branch + `enumerate`, includes with props, named slots, `{ -- comments }`, `json_for_script` for script data) + layouts/partials + static assets (cache policy, SPA fallback) + client JS; content() for agent-negotiable pages. No imposed framework.
 - [dataviz.md](dataviz.md) — Business data & charts: CSV import/export (`csv_parse`/`csv_encode`, RFC 4180), descriptive statistics (`median`/`percentile`/`histogram`), native SVG charts (`chart_svg`) and the negotiated `chart()` content node (SVG for humans, data table/JSON for agents), PNG/PDF export (`svg_to_png`/`svg_to_pdf`, deterministic embedded font). Data-source-agnostic, pure (works in `sandbox`).
-- [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination/paged(), streaming (SSE), rate limiting, body limits, HTML/SSR pages (`render`, `html`), static files, CORS, content negotiation (HTML/Markdown/JSON for agents), agent discoverability (`/llms.txt`, `/robots.txt`, `/sitemap.xml`, `/openapi.json`, `/docs` — generated; `synsema openapi` for CI), **and the Rust production stack: TLS / auto-HTTPS (ACME) / virtual hosts / reverse proxy / HTTP-2 / production static (ETag·Range·gzip)**
+- [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination/paged(), streaming (SSE, automatic heartbeat), **incoming WebSocket routes (`socket`)**, handler **`timeout`** + cooperative cancellation, **ordered shutdown**, rate limiting, body limits, HTML/SSR pages (`render`, `html`), static files, CORS, content negotiation (HTML/Markdown/JSON for agents), agent discoverability (`/llms.txt`, `/robots.txt`, `/sitemap.xml`, `/openapi.json`, `/docs` — generated; `synsema openapi` for CI), **and the Rust production stack: TLS / auto-HTTPS (ACME) / virtual hosts / reverse proxy / HTTP-2 / production static (ETag·Range·gzip)**
 - [capabilities.md](capabilities.md) — Security model, require, sandbox, intent
-- [processes.md](processes.md) — Run OS processes/tools with `run` (gated by `exec`): shells/scripts/pipelines, timeout, cwd/env/stdin, capture limits, generate-and-run loop, giving an LLM a shell tool
+- [processes.md](processes.md) — Run OS processes/tools with `run` (gated by `exec`): shells/scripts/pipelines, timeout, cwd/env/stdin, capture limits, generate-and-run loop, giving an LLM a shell tool; **live processes `proc_*`** (streamed stdout/stderr, live stdin, kill, no orphans)
 - [secrets.md](secrets.md) — Config by environment (`env`), LLM-proof secrets (`secret`, redacted everywhere), `.env`, `reveal()` + audit, HMAC/bearer/constant-time helpers
-- [agents.md](agents.md) — Multi-agent coordination, blackboard, swarm, signals
+- [agents.md](agents.md) — Multi-agent coordination, blackboard, swarm, signals, **event bus (`bus_*` fan-out)**, `agents()`/`agent_stop`, agents under serve
 - [llm.md](llm.md) — LLM operations: reason, decide, analyze, generate
 - [human.md](human.md) — Human interaction: approve, confirm, ask, show
 - [observability.md](observability.md) — trace, log, measure, checkpoint, error diagnostics
@@ -138,6 +138,12 @@ usually version skew, not a bug.
 - Client certificates / mTLS / workload identity by certificate (`mtls_identity`, scoped by host) → builtins.md (Agent identity & auth)
 - Let another agent discover how to authenticate here (`/.well-known/synsema-auth`) → serve.md (Agent identity § Discovery)
 - Streaming / Server-Sent Events → serve.md
+- **Incoming WebSocket / chat / live console / bidirectional UI ↔ server** (`route … socket`, the `ws_*` family on the incoming handle) → serve.md § WebSocket routes
+- **Live child process** — see output as it streams, feed stdin, kill (`proc_spawn`/`proc_recv`/`proc_send`/`proc_kill`), e.g. an agent running `cargo test` → processes.md § Live processes
+- **Fan-out events to N clients / feed SSE or sockets from an agent, a cron, another request** (`bus_publish`/`bus_subscribe`/`bus_recv`) → agents.md § Event bus
+- **Wait on a socket + a process + the bus at once** (`select`, one event loop, no polling) → concurrency.md § `select`
+- Handler `timeout` (504 + cancellation), ordered shutdown on Ctrl-C/SIGTERM, SSE heartbeat → serve.md § Timeouts, cancellation & ordered shutdown
+- List / stop running agents (`agents()`, `agent_stop`), agents spawned under serve, `serve --sandbox | --cap-set` → agents.md
 - Rate limiting / anti-abuse → serve.md
 - Serving HTML pages / server-side rendering (templates) → serve.md
 - Agent-readable content / content negotiation (HTML · Markdown · JSON) → serve.md

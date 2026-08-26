@@ -220,6 +220,10 @@ fn operation(info: &ApiInfo, r: &ApiRoute) -> Json {
         Some(ResponseKind::Stream) => {
             responses.push(("200".into(), response("event stream", vec![media("text/event-stream", None)])));
         }
+        Some(ResponseKind::Socket) => {
+            responses.push(("101".into(), response("WebSocket (Switching Protocols)", Vec::new())));
+            responses.push(("426".into(), response("Upgrade Required (the request did not ask for a WebSocket upgrade)", vec![media("application/json", None)])));
+        }
         Some(ResponseKind::Html) => {
             responses.push(("200".into(), response("HTML page", vec![media("text/html", None)])));
         }
@@ -263,6 +267,9 @@ fn operation(info: &ApiInfo, r: &ApiRoute) -> Json {
     }
     if r.streaming {
         op.push(("x-synsema-streaming", Json::Bool(true)));
+    }
+    if r.socket {
+        op.push(("x-synsema-socket", Json::Bool(true)));
     }
     if r.proxy {
         op.push(("x-synsema-proxy", Json::Bool(true)));
@@ -323,6 +330,7 @@ pub fn sitemap_paths(routes: &[ApiRoute]) -> Vec<String> {
                 && r.param_names.is_empty()
                 && !r.requires_auth
                 && !r.streaming
+                && !r.socket
                 && !r.proxy
                 && !RESERVED_PATHS.contains(&r.path.as_str())
                 && !r.path.starts_with("/.well-known/")
@@ -384,6 +392,9 @@ pub fn docs_markdown(info: &ApiInfo, routes: &[ApiRoute]) -> String {
         if r.streaming {
             facts.push("streams server-sent events".into());
         }
+        if r.socket {
+            facts.push("WebSocket endpoint (upgrade)".into());
+        }
         if r.proxy {
             facts.push("reverse proxy".into());
         }
@@ -406,6 +417,7 @@ pub fn docs_markdown(info: &ApiInfo, routes: &[ApiRoute]) -> String {
         let resp = match r.meta.response_kind {
             Some(ResponseKind::Redirect) => "302 redirect",
             Some(ResponseKind::Stream) => "200 text/event-stream",
+            Some(ResponseKind::Socket) => "101 Switching Protocols (WebSocket)",
             Some(ResponseKind::Html) => "200 text/html",
             Some(ResponseKind::Content) => "200 negotiated by Accept: text/html, text/markdown or application/json",
             _ => "200 application/json",
@@ -494,6 +506,7 @@ pre{margin:10px 0 0;padding:10px 12px;background:var(--soft);border:1px solid va
       const rl=op['x-synsema-rate-limit'];
       if(rl)tags.append($('span',{class:'tag',text:rl==='unlimited'?'rate limit: unlimited':'rate limit: '+rl.count+' / '+rl.window+'s'}));
       if(op['x-synsema-streaming'])tags.append($('span',{class:'tag',text:'server-sent events'}));
+      if(op['x-synsema-socket'])tags.append($('span',{class:'tag',text:'websocket'}));
       if(op['x-synsema-proxy'])tags.append($('span',{class:'tag',text:'reverse proxy'}));
       for(const c of op['x-synsema-capabilities']||[])tags.append($('span',{class:'tag cap',text:c.scope?c.name+':'+c.scope:c.name}));
       if(tags.children.length)body.append(tags);

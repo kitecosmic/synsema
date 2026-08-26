@@ -372,6 +372,28 @@ Response helpers (set the HTTP status; body follows the response contract):
 - `cron_list()` → list of `{name, interval, repeating, active, run_count, errors}` — run_count = completed runs, errors = failed ticks (real counts, never phantom)
 - `cron_status()` → formatted text
 
+## Agentic apps — `select`, live processes, event bus, agent control (engine v0.6.7+)
+
+One wait for everything (no capability; handles from `ws_connect`, a `socket` route, `proc_spawn`, `bus_subscribe`):
+- `select(targets, timeout?)` → first ready event tagged `source` (`"ws"`/`"proc"`/`"bus"`), `handle`, `name` (map form); `nothing` at timeout / all gone. `targets` = list of handles or map name → handle. See [concurrency.md](concurrency.md).
+
+Live processes (gated by `exec(cmd)` like `run`; see [processes.md](processes.md)):
+- `proc_spawn(cmd, args?, opts?)` → handle. `opts`: `cwd`, `env`, `line_mode` (true), `stderr` (`"separate"`|`"merge"`), `max_queue` (4096), `max_queue_bytes` (64 MiB), `on_full` (`"block"`|`"drop_oldest"`|`"error"`)
+- `proc_recv(h, timeout?)` → `{type: "stdout"|"stderr"|"exit", data}` or `nothing`; `proc_select(list|map, timeout?)`
+- `proc_send(h, text|bytes)` → true (blocking write); `proc_close_stdin(h)`
+- `proc_status(h)` → `"running"|"exited"|"killed"|"closed"`; `proc_stats(h)` → `{pid, cmd, status, exit_code, queued, queued_bytes, dropped, uptime}`
+- `proc_kill(h, "TERM"|"KILL"?)`; `proc_wait(h, timeout?)` → `{exit_code, signal}` or `nothing`; `proc_close(h)` (kills if alive; no orphans)
+
+Event bus — one per program, in-process fan-out, no capability (see [agents.md](agents.md)):
+- `bus_publish(topic, value)` → subscribers reached (literal topic; data only — a task/secret errors)
+- `bus_subscribe(topic|[topics], opts?)` → handle; globs `*`/`?`; `opts`: `max_queue` (1024), `max_queue_bytes` (16 MiB), `on_full` (`"drop_oldest"` default | `"error"`)
+- `bus_recv(sub, timeout?)` → `{type: "event", topic, data, timestamp}` or `nothing`; `bus_unsubscribe(sub)`; `bus_topics()` → `[{topic, subscribers}]`
+
+Agent control (no capability; `run` and `serve`):
+- `agents()` → `[{id, name, state, error, started_at, finished_at}]`; `agent_stop(id, reason?)` → bool (cooperative cancellation → state `stopped`)
+
+Inside a `socket` route the binding `socket` is a WS handle: `ws_send`/`ws_recv`/`ws_select`/`ws_stats` (`role: "server"`)/`ws_close` all apply — [serve.md](serve.md) § WebSocket routes.
+
 ## Agent operations
 
 **All of these require the declared-memory capability** — `require memory("name")` at the

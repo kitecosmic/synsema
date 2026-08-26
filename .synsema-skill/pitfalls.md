@@ -144,6 +144,15 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `f.email` on a form without that field gives nothing | A missing map key is a hard error (`Map has no key`) | Check first: `contains(keys(f), "email")` |
 | A CRLF (Windows) file with blank lines inside a block fails to parse | Fixed — blank `\r\n` lines no longer emit a phantom dedent (engine > v0.5.9) | Update the binary if you see `Unexpected token: INDENT` on a CRLF file |
 | My `500` leaks a stack/message in production | Detail is shown in **dev**; `--secure` returns a generic body | Run with `--secure` in prod; the full detail still goes to the server log; an `errors with` task receives the redacted message under `--secure` |
+| A slow handler is cut off after 30 s | Only if you declared `timeout` — **by default there is no limit** | `timeout N` on the serve block / `timeout none` per route; at the deadline: `504` + the handler is cancelled (v0.6.7+) |
+| `try`/`recover` around a cancelled wait keeps the handler alive | Cancellation (`cancelled: …`) is observable but not curable — the next statement raises again | Clean up in `recover` and leave; kill/close what you own |
+| `timeout 30` inside a `when` / a task | Runtime error: it is a clause of the serve block or the top of a route body | Move it to the top of the route body (once) or to the serve block |
+| Opening a WebSocket to a `socket` route returns 426 | The request lacked the upgrade headers (or came over HTTP/2) | Use a real WebSocket client (`new WebSocket(url)`, `ws_connect`); the browser does it right |
+| A `socket` route declared as `POST` | Parse error — the handshake is a GET (RFC 6455) | `route "GET /ws"` + `socket` |
+| A `socket` handle stored in `state_*` to push from a cron | Handles don't cross requests (isolation) | Each socket handler subscribes to the bus (`bus_subscribe`) and forwards; the cron does `bus_publish` |
+| My SSE clients need a "ping" event so proxies don't cut them | The server already writes `: keepalive` every 15 s idle (`SYNSEMA_SSE_KEEPALIVE`) | Drop the ping loop; keep `bus_recv(sub, 25)`-style bounded waits |
+| Ctrl-C kills in-flight requests instantly | It drains: no new connections, streams/sockets cancelled, sized requests get `SYNSEMA_SHUTDOWN_GRACE` (10 s), exit 0 | Second Ctrl-C = exit 130 now; `SYNSEMA_SHUTDOWN_GRACE=0` for immediate |
+| `give agents()` returns `{"items": …}` | `give <list>` always paginates | Expected — read `items`; or `give {"agents": agents()}` |
 
 ### Anti-patterns
 
@@ -197,6 +206,22 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `mtls_identity` applies to one request | It's **per process** (the certificate identifies the workload, SPIFFE-style) | Call it once at startup. Needs `require file.read` on both PEMs |
 | Without `opts.hosts`, the certificate only goes where you meant | It goes to **every host the program may reach** — any server that asks for a client cert gets your workload identity | Bounded by `require net`, so with a narrow `net` scope it's already contained. With a broad one, scope it: `mtls_identity(c, k, {"hosts": ["*.mesh.internal"]})` |
 | The server can require client certificates (`client_ca`) | Not yet — only the **client** side ships | Terminating mTLS on the serve side needs a new `serve` clause (parser work); use a reverse proxy in front meanwhile |
+
+## Agentic apps — `select`, `proc_*`, `bus_*` (engine v0.6.7+)
+
+| What you expect | What actually happens | Why / workaround |
+|---|---|---|
+| `proc_spawn` works without a `require` | `Capability not granted: exec("cmd")` — same gate as `run`, never auto-granted | `require exec("cargo")` (scope = the command as written) |
+| A `proc_spawn` child outlives the request / program | It is killed when its interpreter ends (TERM, KILL after 2 s) | For work that must survive, use `cron_after` or an agent |
+| `proc_send` returns immediately | It is a blocking pipe write — a child that never reads stdin blocks you | Send what it reads; `proc_close_stdin` for EOF |
+| `proc_recv` gives me a prompt without a newline | `line_mode` delivers per line; a partial line arrives at exit/EOF | `{"line_mode": false}` for raw chunks (bytes) |
+| `bus_publish("agent.*", x)` broadcasts | Error: a published topic is literal — globs are for `bus_subscribe` | Publish `"agent.done"`; subscribe to `"agent.*"` |
+| `bus_publish(topic, my_task)` | Error: tasks/secrets don't cross the bus (data only) | Publish text/number/bool/list/map/bytes |
+| A slow subscriber stalls the publisher | Default `on_full` is `drop_oldest` (bounded queue); the publisher never blocks | Read faster / raise `max_queue`; `"error"` if losing events must be loud |
+| The bus reaches another process / node | In-process only | Same API on Redis is the roadmap; today one process |
+| `select([])` waits | Returns `nothing` at once (nothing to wait for) | Check you passed live handles |
+| `ws_select` rejects a process handle | It accepts any handle now (with its historical `conn` tag) | `select` is the same wait with `source`/`handle` tags |
+| `agent_stop(id)` returns `false` | The agent was already `done`/`error`/`stopped` (or the id is wrong — ids come from `agents()`) | Use the `id` (`Name_0`), not the declared name |
 
 ## Language features — bytes, complex, arrays, match, params, tests
 

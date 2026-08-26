@@ -45,6 +45,26 @@ see [secrets.md](secrets.md). Resolution: **process environment → `.env` file 
   RAM); it is read **once, from the process environment** (systemd `Environment=`,
   `docker -e`, shell export — **not** `.env`, which only feeds `env()`/`secret()`)
   before the first server starts.
+- **Server runtime knobs (all process environment, not `.env`; `synsema init` lists
+  them commented in `.env.example` with that warning):**
+
+  | Variable | Default | What |
+  |---|---|---|
+  | `SYNSEMA_SERVE_WORKERS` | #cores (min 2) | interpreter pool for sized handlers (streams/sockets use their own thread) |
+  | `SYNSEMA_SHUTDOWN_GRACE` | `10` | seconds to drain in-flight requests on SIGINT/SIGTERM; `0` = immediate |
+  | `SYNSEMA_SSE_KEEPALIVE` | `15` | idle seconds before a `: keepalive` SSE comment; `0` off |
+  | `SYNSEMA_WS_SERVER_PING` | `30` | server ping interval on `socket` routes; no pong in 2 intervals → `close`; `0` off |
+  | `SYNSEMA_WS_SUBPROTOCOLS` | (none) | comma-separated subprotocols the server may agree to on `socket` routes |
+  | `SYNSEMA_WS_MAX_MESSAGE` | `16MB` | max incoming WebSocket message on `socket` routes (ceiling 64MB) |
+  | `SYNSEMA_WS_MAX_CONNS` | `4096` | live WebSocket handles per interpreter (`ws_connect` + incoming) |
+  | `SYNSEMA_PROC_MAX` | `64` | live `proc_spawn` children per interpreter (hard ceiling 1024) |
+
+- **Host ceiling for a whole server:** `synsema serve app.syn --sandbox` or
+  `--cap-set "stdout,time,serve=8080,net=api.example.com"` caps what handlers, cron
+  ticks and spawned agents can `require` — the same flags and semantics as `run`.
+  Under systemd/Docker this is the operator's guarantee, independent of the program.
+- **Stopping:** `systemctl stop` / `docker stop` send SIGTERM → ordered shutdown (drain,
+  exit 0). Set the unit's `TimeoutStopSec` above `SYNSEMA_SHUTDOWN_GRACE`.
 
 ## Serve deployment flags (dev-clean `.syn` + prod flags)
 

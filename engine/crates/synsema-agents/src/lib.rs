@@ -6,6 +6,7 @@
 //! builtins (resource_lock no tiene test en el gate).
 
 pub mod blackboard;
+pub mod bus;
 pub mod builtins;
 pub mod memory;
 pub mod progress;

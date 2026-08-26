@@ -39,6 +39,8 @@ pub enum ResponseKind {
     Content,
     /// Ruta `stream` → `text/event-stream`.
     Stream,
+    /// Ruta `socket` → `101 Switching Protocols` (WebSocket entrante).
+    Socket,
     /// `redirect(...)` → 3xx sin body.
     Redirect,
     /// No se pudo inferir (sin `give`, o un `give` de una variable/task).
@@ -64,6 +66,8 @@ pub struct ApiRoute {
     pub param_names: Vec<String>,
     pub requires_auth: bool,
     pub streaming: bool,
+    /// Ruta `socket` (WebSocket entrante).
+    pub socket: bool,
     /// `(count, window_seconds)` efectivo, o `None` si no hay límite.
     pub rate_limit: Option<(i64, f64)>,
     /// `rate_limit unlimited` explícito (distinto de "sin límite declarado").
@@ -123,7 +127,7 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     ("read_file", "file.read"), ("read_file_bytes", "file.read"), ("list_dir", "file.read"),
     ("file_info", "file.read"), ("file_exists", "file.read"), ("grep", "file.read"),
     ("write_file", "file.write"), ("edit_file", "file.write"), ("append_file", "file.write"),
-    ("run", "exec"),
+    ("run", "exec"), ("proc_spawn", "exec"),
     // tiempo y azar
     ("now", "time"), ("sleep", "time"), ("format_time", "time"), ("parse_time", "time"),
     ("date_parts", "time"),
@@ -162,6 +166,9 @@ pub fn expect_shape(body: &[Node]) -> Option<Vec<(String, String)>> {
 
 /// Clase de respuesta según el último `give` de nivel superior (best-effort).
 pub fn response_kind(body: &[Node], streaming: bool) -> Option<ResponseKind> {
+    if body.iter().any(|s| matches!(s.kind, NodeKind::SocketBlock { .. })) {
+        return Some(ResponseKind::Socket);
+    }
     if streaming {
         return Some(ResponseKind::Stream);
     }
@@ -410,7 +417,7 @@ fn static_route(
     block_rate: Option<(i64, f64)>,
     lookup: &dyn Fn(&str) -> Option<TaskSrc>,
 ) -> Option<ApiRoute> {
-    let NodeKind::RouteDefinition { method, path, param_names, requires_auth, streaming, rate_limit, body } = &r.kind
+    let NodeKind::RouteDefinition { method, path, param_names, requires_auth, streaming, socket, rate_limit, body, .. } = &r.kind
     else {
         return None;
     };
@@ -429,6 +436,7 @@ fn static_route(
         param_names: param_names.clone(),
         requires_auth: *requires_auth,
         streaming: *streaming,
+        socket: *socket,
         rate_limit: rate,
         rate_unlimited: unlimited,
         proxy: body.len() == 1 && matches!(body[0].kind, NodeKind::ProxyStatement { .. }),

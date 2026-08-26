@@ -45,7 +45,9 @@ engine/
     │   └── src/
     │       ├── http.rs              # HTTP client (std::net + rustls for https) [native]
     │       ├── http_stub.rs         # no-`native` stand-in: same transport signatures, errors at runtime
-    │       ├── server.rs            # async HTTP server (hyper/tokio): response contract, TLS, vhost, proxy [native]
+    │       ├── server.rs            # async HTTP server (hyper/tokio): response contract, TLS, vhost, proxy, WebSocket upgrade, timeouts, ordered shutdown [native]
+    │       ├── ws.rs                # the I/O hub: ws client + incoming sockets + proc + bus subscriptions on one mio poll → `select` [native]
+    │       ├── proc.rs              # live child processes (`proc_*`): reader threads per pipe, bounded queues, kill/reap [native]
     │       ├── database.rs          # SQLite (rusqlite, bundled) + PG/MySQL/Mongo/Redis [native]
     │       ├── cron.rs              # cron scheduler [native]
     │       ├── json.rs              # JSON ↔ SynValue + content-tree-as-data + json_encode/decode builtins (pure)
@@ -55,7 +57,8 @@ engine/
     │       └── mimetypes.rs         # static-file content types
     │
     ├── synsema-agents/              # multi-agent system
-    │   └── src/{blackboard.rs, swarm.rs, resource_lock.rs, progress.rs, memory.rs, builtins.rs}
+    │   └── src/{blackboard.rs, bus.rs, swarm.rs, resource_lock.rs, progress.rs, memory.rs, builtins.rs}
+    │       # bus.rs = in-process pub/sub (bounded per-subscriber queues, glob topics) used by `bus_*`
     │
     ├── synsema-llm/                 # LLM + human interaction
     │   └── src/{provider.rs, context.rs, validator.rs, human.rs}

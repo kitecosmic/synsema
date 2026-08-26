@@ -182,6 +182,44 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # (respond_link_yes/no: el humano decide abriendo una URL desde SMS/chat):
 # SYNSEMA_HUMAN_PUBLIC_URL=
 
+# ══ Knobs del servidor (`synsema serve`) — SOLO del entorno del PROCESO ══
+
+# Estos los lee el proceso al arrancar (export / systemd / Docker -e), NO este
+# archivo: el .env alimenta env()/secret() y la config de LLM/humanos, no al runtime
+# del server. Van listados aca para que nadie tenga que adivinarlos.
+
+# Workers del pool de handlers sized (default: nucleos de la maquina; los stream y
+# socket usan hilo propio y no consumen pool):
+# SYNSEMA_SERVE_WORKERS=4
+
+# Gracia (segundos) del shutdown ordenado ante SIGINT/SIGTERM: se dejan de aceptar
+# requests (503 + Retry-After), se drenan las que estan en vuelo y al vencer se
+# cancelan. 0 = inmediato. Un segundo Ctrl-C durante el drain sale ya (codigo 130):
+# SYNSEMA_SHUTDOWN_GRACE=10
+
+# Heartbeat de los `stream` SSE: comentario `: keepalive` (invisible para EventSource)
+# tras N segundos sin frames, asi proxies y browsers no cortan streams ociosos. 0 apaga:
+# SYNSEMA_SSE_KEEPALIVE=15
+
+# Ping del server a cada `socket` (WebSocket entrante) cada N segundos mientras el
+# handler espera en ws_recv/select; sin Pong en 2 intervalos el handler recibe `close`
+# con reason "keepalive timeout". 0 apaga:
+# SYNSEMA_WS_SERVER_PING=30
+
+# Subprotocolos WebSocket que el server acepta acordar (separados por coma; se eco el
+# primero que el cliente ofrezca). Sin la variable no se acuerda ninguno:
+# SYNSEMA_WS_SUBPROTOCOLS=
+
+# Tamanio maximo de un mensaje WebSocket entrante (mas grande = error atrapable en el
+# handler, nunca un close mudo). Acepta 512KB, 16MB...; default 16MB, techo 64MB:
+# SYNSEMA_WS_MAX_MESSAGE=16MB
+
+# Conexiones WebSocket vivas por interprete — ws_connect + sockets entrantes (default 4096):
+# SYNSEMA_WS_MAX_CONNS=4096
+
+# Procesos vivos (proc_spawn) por interprete (default 64, techo duro 1024):
+# SYNSEMA_PROC_MAX=64
+
 # ══ Secretos de TU programa (el nombre lo elegís vos, no el engine) ══
 
 # `secret("NOMBRE")` resuelve por: entorno del proceso > este .env > default; sin
@@ -238,6 +276,8 @@ const HELLO_SYN_PAST: &[&str] = &[
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
 const ENV_EXAMPLE_PAST: &[&str] = &[
     "89ce5ec7987119a7bf7579f74b93275ca3a61790766a143e06df26000b992bb9",
+    // v0.6.6 (antes de la sección de knobs del servidor)
+    "5e1b399a09adeb2b0dcc02e4fcdc6f0141d71dfa8a8a679f9ec2548b543f966a",
     "2e2abfde4bfafc3e97b44c5caa20c66b945be4adb178693dc89aae0325ab0ea5",
     "018e2caaad5b937d3f7f8e3866720f5225996f74f0ed5075848a85a9ebcb853b",
     "5a38c2ef0ac9c5ec66c2902e0c4b90a0e2083e1b3234036a2cbe7dc14e79da7e",
@@ -418,6 +458,7 @@ mod tests {
             .iter()
             .chain(HUMAN_ENV_VARS.iter())
             .chain(CEILING_ENV_VARS.iter())
+            .chain(synsema_stdlib::server::SERVE_ENV_VARS.iter())
             .copied()
             .collect();
         let mentioned = mentioned_vars(ENV_EXAMPLE);

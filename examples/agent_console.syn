@@ -1,0 +1,64 @@
+-- Agent console — a live UI for an agent: one WebSocket per client, a child process
+-- whose output streams line by line, and a process-wide event bus that fans out to
+-- every open stream. Everything waits in ONE `select` (no polling).
+--
+-- Run:    synsema serve examples/agent_console.syn
+-- Try:    websocat ws://127.0.0.1:8080/console        (send "run" / "stop")
+--         curl -N http://127.0.0.1:8080/events         (server-sent events fed by the bus)
+--         curl -X POST http://127.0.0.1:8080/announce -d '{"msg":"deploy done"}'
+-- Stop:   Ctrl-C → ordered shutdown (in-flight requests drain, sockets get a Close)
+
+intent: "Drive an agent's child process from a live console and broadcast its events"
+
+require serve(8080)
+require time
+require exec("sh")
+
+serve on 8080
+    timeout 600                         -- no handler outlives 10 minutes (504 + cancel)
+
+    -- Bidirectional console: `socket` is this connection's handle (same ws_* family).
+    route "GET /console"
+        socket
+            let sub be bus_subscribe("agent.*")
+            let child be nothing
+            ws_send(socket, "ready — send `run` to start the worker, `stop` to kill it")
+            while true
+                let targets be when child == nothing then {"ui": socket, "bus": sub} otherwise {"ui": socket, "bus": sub, "child": child}
+                let ev be select(targets, 60)
+                when ev == nothing
+                    ws_send(socket, "idle")
+                otherwise when ev["name"] == "ui"
+                    when ev["type"] == "close"
+                        stop
+                    when ev["data"] == "run" and child == nothing
+                        set child to proc_spawn("sh", ["-c", "for i in 1 2 3; do echo step $i; sleep 1; done"])
+                        bus_publish("agent.started", {"by": "console"})
+                    when ev["data"] == "stop" and child != nothing
+                        proc_kill(child)
+                otherwise when ev["name"] == "child"
+                    when ev["type"] == "exit"
+                        ws_send(socket, "worker exited with " + text(ev["data"]["exit_code"]))
+                        bus_publish("agent.finished", ev["data"])
+                        proc_close(child)
+                        set child to nothing
+                    otherwise
+                        ws_send(socket, ev["type"] + ": " + ev["data"])
+                otherwise
+                    ws_send(socket, "[" + ev["topic"] + "] " + json_encode(ev["data"]))
+
+    -- Every SSE client sees every bus event (fan-out), with automatic keepalives.
+    route "GET /events"
+        stream
+            let sub be bus_subscribe("agent.*")
+            while true
+                let ev be bus_recv(sub, 30)
+                when ev != nothing
+                    send ev["data"] as "agent"
+
+    -- Any request (or cron, or agent) can publish; subscribers wake up immediately.
+    route "POST /announce"
+        give {"delivered": bus_publish("agent.announce", request.json)}
+
+    route "GET /agents"
+        give agents()

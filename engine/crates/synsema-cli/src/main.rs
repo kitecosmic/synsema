@@ -25,7 +25,7 @@ mod init_templates;
 mod synfide;
 mod update;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] | test [-v] [--sandbox | --cap-set <list>] <archivo|dir> | check | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide] | llm status [--json] | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--sandbox | --cap-set <list>] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] | test [-v] [--sandbox | --cap-set <list>] <archivo|dir> | check | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide] | llm status [--json] | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
 
 // `build_ceiling` (--sandbox/--cap-set → techo) vive en synsema-capabilities: lo comparten
 // este binario y `synsema-wasm` (mismas flags, misma semántica en los dos front-ends).
@@ -450,6 +450,8 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     let args = take_env_file_flags(args);
     let mut secure = false;
     let mut watch = false;
+    let mut serve_sandbox = false;
+    let mut serve_cap_set: Option<String> = None;
     let mut path: Option<String> = None;
     let mut ov = ServeOverrides::default();
     let mut i = 2;
@@ -470,6 +472,13 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         match args[i].as_str() {
             "--secure" => secure = true,
             "--watch" => watch = true,
+            // Techo del host para TODO el serve (requests, cron, agentes): mismas
+            // reglas que `run` (`build_ceiling`, mutuamente excluyentes).
+            "--sandbox" => serve_sandbox = true,
+            "--cap-set" => serve_cap_set = Some(next_val!("--cap-set")),
+            p if p.starts_with("--cap-set=") => {
+                serve_cap_set = Some(p.trim_start_matches("--cap-set=").to_string());
+            }
             "--port" => {
                 let v = next_val!("--port");
                 match v.parse::<u16>() {
@@ -511,6 +520,20 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         eprintln!("synsema serve: {}", e);
         return ExitCode::from(2);
     }
+    ov.ceiling = match build_ceiling(serve_sandbox, serve_cap_set.as_deref()) {
+        // `--sandbox` = [stdout, time] como en `run`; un serve necesita además `serve`
+        // (si no, jamás podría bindear). `--cap-set` lo lista el operador (p. ej.
+        // "stdout,time,serve=8080,net=api.example.com").
+        Ok(Some(mut c)) if serve_sandbox => {
+            c.push(synsema_capabilities::model::Capability::new(synsema_capabilities::model::CapabilityType::Serve, None));
+            Some(c)
+        }
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("synsema serve: {}", e);
+            return ExitCode::from(2);
+        }
+    };
 
     let path = match path {
         Some(p) => p,

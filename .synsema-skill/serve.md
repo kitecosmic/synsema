@@ -655,11 +655,162 @@ serve on 8080
   stream holds a thread, so `max_streams N` (default 100) bounds concurrent
   streams. Over the cap a new stream gets `503 {"error":"too many concurrent
   streams","status":503}` with a `Retry-After` header.
-- **Pacing / heartbeat:** `sleep(seconds)` (requires `require time`) paces a
-  stream; send a periodic event to keep proxies from timing out.
+- **Heartbeat is automatic (engine v0.6.7+):** after `SYNSEMA_SSE_KEEPALIVE` seconds
+  (default 15; `0` disables — process env, not `.env`) without a frame, the server
+  writes an SSE comment `: keepalive` — invisible to `EventSource`, enough to keep
+  proxies/browsers from cutting an idle stream. You no longer need a "ping" event.
+  `sleep(seconds)` (requires `require time`) still paces a stream if you want it to.
+- **Feeding a stream from elsewhere (an agent, a cron, another request):** subscribe to
+  the [event bus](agents.md#event-bus--bus_-fan-out-no-polling) and forward — `let sub
+  be bus_subscribe("agent.*")` then `bus_recv(sub, 30)` / `send ev.data as ev.topic`.
+  No polling, N clients see the same event.
 
 `stream`, `send` and `max_streams` are soft keywords — only special in this
 construction; `let send be 1` is still valid.
+
+## WebSocket routes — `socket` (bidirectional, engine v0.6.7+)
+
+A route with a `socket` block accepts an **incoming WebSocket**. Inside the block,
+`socket` is the handle of *this* connection — the same kind of handle `ws_connect`
+returns, so the whole `ws_*` family works on it unchanged (`ws_send`, `ws_recv`,
+`ws_select`, `ws_status`, `ws_stats`, `ws_close`), and `select` mixes it with processes
+and bus subscriptions:
+
+```
+require serve(8080)
+
+serve on 8080
+    route "GET /ws"                          -- the handshake is a GET (RFC 6455)
+        socket
+            ws_send(socket, {"hello": "agent"})
+            while true
+                let ev be ws_recv(socket, 30)      -- {type: "text"|"binary"|"close", data}
+                when ev == nothing                 -- 30 s idle
+                    stop
+                when ev["type"] == "close"
+                    stop
+                otherwise
+                    ws_send(socket, {"echo": ev["data"]})
+
+    route "GET /private" requires auth        -- auth runs BEFORE the upgrade (401, no upgrade)
+        socket
+            ws_send(socket, "hello " + request.user.name)
+```
+
+- `request`, `params`, `query`, `headers`, `user` are bound like in any route.
+  `ws_stats(socket)["role"]` is `"server"` (`"client"` for a `ws_connect` handle).
+- **Closing is honest, never silent:** the block ending (or `stop`) → `Close 1000`; an
+  uncaught error → `Close 1011` + the message (truncated to 123 bytes, the frame limit)
+  and a `[socket] … handler failed: …` line in the server log; the server cancelling the
+  handler (route `timeout`, ordered shutdown) → `Close 1001` (going away) + the reason.
+  A client that vanishes without a close handshake shows up as
+  `{type: "close", data: "connection reset without closing handshake"}` on the next
+  `ws_recv`/`select`.
+- A plain HTTP request to a socket route → **`426 Upgrade Required`** (JSON error +
+  `Upgrade: websocket`). HTTP/2 clients get the same 426 — browsers always open
+  WebSockets over HTTP/1.1, so this only matters for hand-written h2 clients.
+- **Keepalive:** the server answers client pings and sends its own every
+  `SYNSEMA_WS_SERVER_PING` seconds (default 30, `0` off) while the handler is waiting
+  in `ws_recv`/`select`; no pong in 2 intervals → a `close` with reason
+  `"keepalive timeout"`. Message cap `SYNSEMA_WS_MAX_MESSAGE` (default 16MB, ceiling
+  64MB; over it = catchable error). Subprotocols are agreed only if listed in
+  `SYNSEMA_WS_SUBPROTOCOLS`. Backpressure is real TCP backpressure in both directions.
+- **Budget:** a socket occupies one `max_streams` slot (long connection, own thread) →
+  `503` + `Retry-After` over the cap; it also counts against `SYNSEMA_WS_MAX_CONNS`.
+- **No new capability** — the route is already inside `serve`. `ws_connect` from a
+  handler still needs `net(host)`.
+- Rules: `GET` only (parse error otherwise); `socket` and `stream` in the same route is
+  a parse error; not supported inside an `export routes` group yet (clear error).
+  `socket` stays an ordinary identifier outside a route (`let socket be 3` is fine).
+- **The handle does not cross requests** (same isolation as a `ws_connect` inside a
+  handler). To push to N open sockets from a cron/agent/another request, each socket
+  handler subscribes to the bus and forwards — see the pattern below; there is
+  deliberately no global mutable socket table.
+
+The agentic pattern — one connection, one child process, one bus subscription, **one
+wait**:
+
+```
+require serve(8080)
+require exec("sh")
+
+serve on 8080
+    route "GET /console"
+        socket
+            let sub be bus_subscribe("agent.*")
+            let child be proc_spawn("sh", ["-c", "for i in 1 2 3; do echo step $i; sleep 1; done"])
+            while true
+                let ev be select({"ui": socket, "child": child, "bus": sub}, 60)
+                when ev == nothing
+                    ws_send(socket, "idle")
+                otherwise when ev["name"] == "ui"
+                    when ev["type"] == "close"
+                        stop
+                    otherwise
+                        ws_send(socket, "you said " + ev["data"])
+                otherwise when ev["name"] == "child"
+                    when ev["type"] == "exit"
+                        ws_send(socket, "exit " + text(ev["data"]["exit_code"]))
+                    otherwise
+                        ws_send(socket, ev["type"] + ": " + ev["data"])
+                otherwise
+                    ws_send(socket, "[" + ev["topic"] + "] " + json_encode(ev["data"]))
+```
+
+`select`, `proc_*` and `bus_*` are documented in [concurrency.md](concurrency.md),
+[processes.md](processes.md) and [agents.md](agents.md); the full runnable version is
+`examples/agent_console.syn` in the engine repo.
+
+## Timeouts, cancellation & ordered shutdown (engine v0.6.7+)
+
+**By default a handler has no time limit** (historical behaviour). Declare one on the
+serve block (default for every route) and/or per route:
+
+```
+serve on 8080
+    timeout 30                   -- seconds; default for all routes
+    route "POST /think"
+        timeout 300              -- route override (top of the route body, at most once)
+        give reason "…" given request.json
+    route "GET /events"
+        timeout none             -- opt this route out of the block default
+        stream
+            …
+```
+
+- **Sized routes:** at the deadline the client gets `504 {"error": "gateway timeout: the
+  handler exceeded 30s", "status": 504}` with `Connection: close`, and the handler is
+  **cancelled** — it does not keep burning a worker (log line: `handler cancelled: request
+  timed out after 30s`). Time spent queued for a pool worker counts.
+- **`stream`/`socket`:** the timeout is the connection's max lifetime — SSE ends with
+  `event: error` `{"error": "cancelled: request timed out after Ns"}`; a socket gets
+  `Close 1001` + that reason.
+- **Cancellation is cooperative and cannot be "cured":** the interpreter checks the flag
+  before every statement and inside every wait (`sleep`, `ws_recv`, `select`,
+  `proc_recv`/`proc_wait`, `bus_recv`, `wait_for`, `run`), raising
+  `cancelled: <reason>`. A `try`/`recover` can observe it, but the next statement raises
+  again — clean up and leave. Child processes started with `run`/`proc_spawn` are killed.
+- `timeout` is a clause: outside a serve block / route body top level (in a `when`, a
+  task, top-level) it is a **runtime error**, never silently ignored. Not supported inside
+  `export routes` groups yet (clear error) — set it on the serve block.
+- **Client disconnect on sized routes is not detected** (hyper does not expose it without
+  a pending body); streams/sockets do detect it. Not promised, documented.
+
+**Ordered shutdown (SIGINT / Ctrl-C, and SIGTERM on Unix):**
+
+1. The listener closes (new connections are refused); a request arriving on an open
+   keep-alive connection gets `503 {"error": "server shutting down"}` + `Retry-After: 2`.
+2. Log: `[serve] shutting down: draining N in-flight request(s), grace 10s
+   (SYNSEMA_SHUTDOWN_GRACE)`. Cron stops scheduling, live agents get `agent_stop`
+   (`"server shutting down"`), streams and sockets are cancelled at once (SSE
+   `event: error` `cancelled: server shutting down`; sockets `Close 1001`).
+3. Sized requests in flight finish within the grace (`SYNSEMA_SHUTDOWN_GRACE`, default
+   10 s, `0` = immediate); whatever is left is cancelled; `[serve] stopped`; **exit code
+   0** (it was asked for). A second Ctrl-C during the drain exits immediately with 130.
+4. A program with several `serve on` blocks exits when the **last** one has drained.
+
+`synsema run` is untouched (no listener). Under `serve --watch`, the supervisor restarts
+the child; Ctrl-C reaches both.
 
 ## Rate limiting
 
@@ -931,8 +1082,11 @@ on what can be served — large uploads stream to disk rather than being buffere
 
 Every request runs in its own isolated interpreter and scope (its own variables,
 logs and trace) — just like a spawned agent. There is **no shared mutable state**
-between requests except the blackboard (`share`/`observe`) and the database
-(`sql`/`sql_exec`). Always use parameterized `sql(..., [params])` — never string
+between requests except the blackboard (`share`/`observe`), `state_*`, the event bus and
+the database (`sql`/`sql_exec`). When a handler ends, everything it opened goes with it:
+WebSocket handles are closed, `proc_spawn` children are killed (TERM, then KILL after 2 s)
+and bus subscriptions are dropped — nothing leaks into the next request served by the
+same worker. Always use parameterized `sql(..., [params])` — never string
 concatenation — so path/query/body values can't inject SQL.
 
 ## Full example
@@ -1058,6 +1212,9 @@ synsema serve <file>
     [--domain d1[,d2,...]]          # overrides the file's `domain`
     [--tls-auto <email> | --tls-cert <p> --tls-key <p>]
     [--bind <addr>]                 # default 0.0.0.0
+    [--sandbox | --cap-set <list>]  # host ceiling for the WHOLE serve (v0.6.7+): handlers, cron ticks
+                                    # and spawned agents can `require` only within it — same rules as `run`.
+                                    # --sandbox = stdout,time + serve (so it can bind); --cap-set "stdout,time,serve=8080,net=api.example.com"
 ```
 
 **Precedence: CLI flag > file clause > default.**

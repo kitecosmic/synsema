@@ -8,6 +8,8 @@ description = "Synsema stdlib: http, database, templates, cron, server"
 [dependencies]
 synsema-core.workspace = true
 synsema-capabilities.workspace = true
+# Bus de eventos del proceso (pub/sub) — lo consume el hub de I/O de ws.rs (`select`).
+synsema-agents.workspace = true
 indexmap.workspace = true
 rusqlite = { workspace = true, optional = true }
 serde_json.workspace = true
@@ -91,7 +93,7 @@ rustls-native-certs = { version = "0.8", optional = true }
 # cliente HTTP propio (hyper-rustls) y `rcgen` interno para keygen/CSR en finalize().
 # tokio = runtime async acotado SÓLO para obtener/renovar el cert; el server sigue std::net.
 instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls", "rcgen"], optional = true }
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "io-util", "sync", "macros"], optional = true }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "io-util", "sync", "macros", "signal"], optional = true }
 # Lote 2 — rewrite de serve a async: hyper (HTTP/1.1 + HTTP/2) + adaptadores tokio +
 # TLS async (tokio-rustls con ring). El intérprete sigue sync por request (spawn_blocking).
 hyper = { version = "1", default-features = false, features = ["server", "client", "http1", "http2"], optional = true }
@@ -137,6 +139,11 @@ native = [
 # de estáticos con extensión no pinneada). En otros SO el override del registro es no-op.
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+
+# Sólo Unix: `proc_kill(h, "TERM")` manda SIGTERM (kill(2)). libc ya está en el árbol
+# (transitivo de mio/tokio); hacerlo directo no agrega crate ni C-ABI nuevo.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # Cert self-signed para los tests de integración TLS (backend ring, sin C/cmake).

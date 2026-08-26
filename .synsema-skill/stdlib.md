@@ -65,6 +65,11 @@ exchange fills, Discord/Slack, mempool. Replaces cron+polling with a live feed. 
 the SAME `net(host)` capability and scope as HTTP (deny-by-default, denied in `sandbox`);
 `wss://` validates the server cert against the OS root CAs like `https://`.
 
+> **Incoming WebSockets** (a WS *server*) are a `route … socket` block under `serve`
+> (engine v0.6.7+): the same `ws_*` family works on the incoming handle, and `select`
+> waits on sockets + child processes + the event bus at once — see [serve.md](serve.md)
+> § WebSocket routes and [concurrency.md](concurrency.md) § `select`.
+
 ```
 require net("stream.exchange.com")
 let conn be ws_connect("wss://stream.exchange.com/ws")   -- opaque handle; headers? + opts? optional

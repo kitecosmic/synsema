@@ -354,6 +354,9 @@ pub struct Ctx {
     pub json: Option<serde_json::Value>,
     pub client_ip: String,
     pub user: Option<SynValue>,
+    /// Token de cancelación cooperativa de la request (timeout de handler / shutdown):
+    /// el intérprete del handler lo adopta antes de correr el cuerpo.
+    pub cancel: synsema_core::interpreter::CancelToken,
 }
 
 /// Ctx mínimo para el `errors with` de 404/405 (el error ocurre ANTES de armar el
@@ -381,6 +384,7 @@ pub fn min_ctx(
         json: None,
         client_ip: client_ip.to_string(),
         user: None,
+        cancel: synsema_core::interpreter::CancelToken::new(),
     }
 }
 
@@ -530,6 +534,10 @@ pub enum StreamEnd {
     Error(String),
 }
 pub type StreamHandler = Arc<dyn Fn(&Ctx, Emitter) -> StreamEnd + Send + Sync>;
+/// Handler de una ruta `socket` (WebSocket entrante): recibe el enlace al transporte
+/// (un `ServerSocketLink` del server nativo, type-erased para que este módulo siga
+/// siendo puro/compartido con wasm) y corre el cuerpo con el binding `socket`.
+pub type SocketHandler = Arc<dyn Fn(&Ctx, Box<dyn std::any::Any + Send>) -> StreamEnd + Send + Sync>;
 
 pub struct RouteSpec {
     pub method: String,
@@ -537,10 +545,16 @@ pub struct RouteSpec {
     pub param_names: Vec<String>,
     pub requires_auth: bool,
     pub streaming: bool,
+    /// Ruta `socket` (WebSocket entrante).
+    pub socket: bool,
     pub rate_limit: Option<(i64, f64)>,
     pub rate_zone: Option<String>,
     pub handler: Handler,
     pub stream_handler: Option<StreamHandler>,
+    pub socket_handler: Option<SocketHandler>,
+    /// Techo de vida del handler en segundos (`timeout` de la route o del serve);
+    /// `None` = sin límite.
+    pub timeout: Option<f64>,
     /// Lote 2 — reverse proxy: si está, la route forwardea al upstream (URL base).
     pub proxy_target: Option<String>,
     /// `rate_limit unlimited` explícito (para `/openapi.json`; el limiter ya lo trata como None).

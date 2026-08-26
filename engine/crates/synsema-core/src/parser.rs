@@ -326,6 +326,22 @@ impl Parser {
         {
             return Ok(Some(self.parse_stream()?));
         }
+        // `socket` + bloque indentado → ruta WebSocket entrante (soft keyword: como
+        // identificador suelto sigue siendo una variable — dentro del bloque, `socket`
+        // ES el handle de la conexión).
+        if self.check_word("socket")
+            && self.peek(1).ty == TokenType::Newline
+            && self.peek(2).ty == TokenType::Indent
+        {
+            return Ok(Some(self.parse_socket()?));
+        }
+        // `timeout 30` | `timeout none` como cláusula (serve block / route body). Soft
+        // keyword con lookahead: `timeout` seguido de número o `none` en la misma línea.
+        if self.check_word("timeout")
+            && (self.peek(1).ty == TokenType::Number || self.peek_word(1, "none"))
+        {
+            return Ok(Some(self.parse_timeout_clause()?));
+        }
         if self.check_word("rate_limit")
             && (self.peek(1).ty == TokenType::Number
                 || self.peek_word(1, "none")
@@ -1356,6 +1372,7 @@ impl Parser {
         let mut error_handler = None;
         let mut max_body = None;
         let mut max_streams = None;
+        let mut timeout: Option<Box<Node>> = None;
         let mut rate_limit: Option<Box<Node>> = None;
         let mut static_mounts = Vec::new();
         let mut cors = None;
@@ -1392,6 +1409,15 @@ impl Parser {
             } else if self.check_word("max_streams") {
                 self.advance();
                 max_streams = Some(Box::new(self.parse_expression()?));
+            } else if self.check_word("timeout") {
+                if timeout.is_some() {
+                    let tok = self.current();
+                    return Err(ParseError::new(
+                        "the 'serve' block declares 'timeout' at most once".to_string(),
+                        tok.location.clone(),
+                    ));
+                }
+                timeout = Some(Box::new(self.parse_timeout_clause()?));
             } else if self.check_word("rate_limit") {
                 rate_limit = Some(Box::new(self.parse_rate_limit()?));
             } else if self.check_word("static") {
@@ -1459,7 +1485,7 @@ impl Parser {
                 let tok = self.current();
                 return Err(ParseError::new(
                     format!(
-                        "Inside 'serve', expected 'auth with ...', 'errors with ...', 'route ...', 'mount ...', 'static ...', 'tls ...', 'domain ...', 'host \"...\"', 'redirect https', 'cors ...', 'describe', 'private' or 'docs off', got {}",
+                        "Inside 'serve', expected 'auth with ...', 'errors with ...', 'route ...', 'mount ...', 'static ...', 'tls ...', 'domain ...', 'host \"...\"', 'redirect https', 'cors ...', 'timeout ...', 'describe', 'private' or 'docs off', got {}",
                         tok.ty.name()
                     ),
                     tok.location.clone(),
@@ -1504,6 +1530,7 @@ impl Parser {
                 max_body,
                 max_streams,
                 rate_limit,
+                timeout,
                 static_mounts,
                 cors,
                 describe,
@@ -1700,9 +1727,47 @@ impl Parser {
                 clean_body.push(s);
             }
         }
+        // Un `timeout` dentro del body de la route es un override de ruta.
+        let mut timeout = None;
+        let mut final_body = Vec::with_capacity(clean_body.len());
+        for s in clean_body {
+            if matches!(s.kind, NodeKind::TimeoutClause { .. }) {
+                if timeout.is_some() {
+                    return Err(ParseError::new(
+                        "a route declares 'timeout' at most once".to_string(),
+                        s.location.clone(),
+                    ));
+                }
+                timeout = Some(Box::new(s));
+            } else {
+                final_body.push(s);
+            }
+        }
+        let clean_body = final_body;
         let streaming = clean_body
             .iter()
             .any(|s| matches!(s.kind, NodeKind::StreamBlock { .. }));
+        let socket = clean_body
+            .iter()
+            .any(|s| matches!(s.kind, NodeKind::SocketBlock { .. }));
+        if streaming && socket {
+            return Err(ParseError::new(
+                format!(
+                    "route \"{} {}\" mixes 'stream' and 'socket': a route is either an SSE stream or a WebSocket, not both",
+                    method, path
+                ),
+                loc,
+            ));
+        }
+        if socket && method != "GET" {
+            return Err(ParseError::new(
+                format!(
+                    "route \"{} {}\" declares 'socket' but the WebSocket handshake is a GET (RFC 6455); declare it as \"GET {}\"",
+                    method, path, path
+                ),
+                loc,
+            ));
+        }
         Ok(Node::new(
             loc,
             NodeKind::RouteDefinition {
@@ -1711,7 +1776,9 @@ impl Parser {
                 param_names,
                 requires_auth,
                 streaming,
+                socket,
                 rate_limit,
+                timeout,
                 body: clean_body,
             },
         ))
@@ -1771,6 +1838,25 @@ impl Parser {
         self.stream_depth -= 1;
         let body = body_result?;
         Ok(Node::new(loc, NodeKind::StreamBlock { body }))
+    }
+
+    fn parse_socket(&mut self) -> Result<Node, ParseError> {
+        let loc = self.location();
+        self.advance(); // 'socket'
+        let body = self.parse_block()?;
+        Ok(Node::new(loc, NodeKind::SocketBlock { body }))
+    }
+
+    /// `timeout <expr>` | `timeout none` (serve block y route body).
+    fn parse_timeout_clause(&mut self) -> Result<Node, ParseError> {
+        let loc = self.location();
+        self.advance(); // 'timeout'
+        if self.check_word("none") {
+            self.advance();
+            return Ok(Node::new(loc, NodeKind::TimeoutClause { secs: None }));
+        }
+        let secs = self.parse_expression()?;
+        Ok(Node::new(loc, NodeKind::TimeoutClause { secs: Some(Box::new(secs)) }))
     }
 
     fn parse_send(&mut self) -> Result<Node, ParseError> {
