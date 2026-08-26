@@ -670,7 +670,9 @@ construction; `let send be 1` is still valid.
 
 ## WebSocket routes — `socket` (bidirectional, engine v0.6.7+)
 
-A route with a `socket` block accepts an **incoming WebSocket**. Inside the block,
+This is the primitive behind chat, multiplayer minigames, collaborative editing, live
+dashboards, terminals-in-the-browser — anything with live state between clients, not
+only agent UIs. A route with a `socket` block accepts an **incoming WebSocket**. Inside the block,
 `socket` is the handle of *this* connection — the same kind of handle `ws_connect`
 returns, so the whole `ws_*` family works on it unchanged (`ws_send`, `ws_recv`,
 `ws_select`, `ws_status`, `ws_stats`, `ws_close`), and `select` mixes it with processes

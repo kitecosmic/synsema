@@ -138,7 +138,7 @@ usually version skew, not a bug.
 - Client certificates / mTLS / workload identity by certificate (`mtls_identity`, scoped by host) → builtins.md (Agent identity & auth)
 - Let another agent discover how to authenticate here (`/.well-known/synsema-auth`) → serve.md (Agent identity § Discovery)
 - Streaming / Server-Sent Events → serve.md
-- **Incoming WebSocket / chat / live console / bidirectional UI ↔ server** (`route … socket`, the `ws_*` family on the incoming handle) → serve.md § WebSocket routes
+- **Incoming WebSocket / chat / multiplayer minigame / collaborative editor / live console / bidirectional UI ↔ server** (`route … socket`, the `ws_*` family on the incoming handle; a bus topic per room for fan-out) → serve.md § WebSocket routes + agents.md § Event bus. These primitives are general — not only for agent UIs.
 - **Live child process** — see output as it streams, feed stdin, kill (`proc_spawn`/`proc_recv`/`proc_send`/`proc_kill`), e.g. an agent running `cargo test` → processes.md § Live processes
 - **Fan-out events to N clients / feed SSE or sockets from an agent, a cron, another request** (`bus_publish`/`bus_subscribe`/`bus_recv`) → agents.md § Event bus
 - **Wait on a socket + a process + the bus at once** (`select`, one event loop, no polling) → concurrency.md § `select`
