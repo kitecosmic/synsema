@@ -213,6 +213,9 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 |---|---|---|
 | `proc_spawn` works without a `require` | `Capability not granted: exec("cmd")` — same gate as `run`, never auto-granted | `require exec("cargo")` (scope = the command as written) |
 | A `proc_spawn` child outlives the request / program | It is killed when its interpreter ends (TERM, KILL after 2 s) | For work that must survive, use `cron_after` or an agent |
+| `proc_close`/`proc_kill` only killed the shell, its `node`/`python` child kept running (port still taken) | Fixed in v0.6.9: the child runs in its own process group / Job Object and kill reaches the **tree** (`proc_stats(h)["tree"]` is `true`) | Older engines: `run("taskkill", ["/T", "/F", "/PID", ...])` / `kill -- -pgid` yourself; to keep a daemon alive on purpose use `{"process_group": false}` |
+| `watch` misses a change / reports it late | It polls (`interval`, default 0.5 s): the state at each tick, not the history | Lower `interval`; expect a rename as `delete` + `create`; dirs only `create`/`delete` |
+| `watch(".")` is slow or errors "more than 100000 entries" | It walks the tree every tick; `.git`/`node_modules`/`target` are skipped by default, the rest is not | Narrow the path, add `ignore`, or raise `max_entries` |
 | `proc_send` returns immediately | It is a blocking pipe write — a child that never reads stdin blocks you | Send what it reads; `proc_close_stdin` for EOF |
 | `proc_recv` gives me a prompt without a newline | `line_mode` delivers per line; a partial line arrives at exit/EOF | `{"line_mode": false}` for raw chunks (still **text**, ≤ 64 KiB, UTF-8 safe) |
 | The child skips its `y/N` question, hangs, or says "not a terminal" (`ssh`, `sudo`, `npm`, `inquirer` menus, `vim`, an agentic CLI) | Pipes are not a tty; the program decided before you could answer | `proc_spawn(cmd, args, {"pty": true})` (v0.6.8+); try `--yes` / `CI=1` first |

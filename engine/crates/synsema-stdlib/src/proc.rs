@@ -23,6 +23,11 @@
 //!   opt-in — espejo exacto de la cola inbound de ws.
 //! - **Nunca huérfanos**: `proc_close` mata si sigue vivo; al dropear el hub (fin de
 //!   request/programa) se matan todos. Un handler no deja procesos fantasma.
+//! - **El árbol, no sólo el hijo**: por defecto (`process_group: true`) el hijo nace
+//!   en su propio grupo de procesos (Unix) / Job Object con KILL_ON_JOB_CLOSE (Windows)
+//!   y `kill`/`close` alcanzan a los nietos (`sh -c "npm run dev"` → muere también el
+//!   `node`). En Windows el job se cierra con el handle: ni un crash del intérprete
+//!   deja el árbol vivo. `process_group: false` desprende un daemon a propósito.
 //! - **Gate**: `exec(cmd)` — idéntico a `run` (scope = el cmd pre-PATH); `sandbox` lo
 //!   deniega. Sin shell jamás (args es lista).
 
@@ -221,6 +226,10 @@ pub struct SpawnOpts {
     pub rows: u16,
     /// `TERM` del hijo en modo pty (default `xterm-256color`; `env.TERM` gana).
     pub term: Option<String>,
+    /// El hijo nace en su propio grupo de procesos (Unix) / Job Object (Windows), y
+    /// `kill`/`close` matan el ÁRBOL entero (nietos incluidos). `false` = sólo el hijo
+    /// directo (para desprender deliberadamente un daemon que deba sobrevivir).
+    pub process_group: bool,
 }
 
 impl Default for SpawnOpts {
@@ -237,6 +246,90 @@ impl Default for SpawnOpts {
             cols: 80,
             rows: 24,
             term: None,
+            process_group: true,
+        }
+    }
+}
+
+/// Job Object de Windows: el hijo (y todo lo que engendre) queda dentro de un job con
+/// `KILL_ON_JOB_CLOSE`. `terminate` mata el árbol de un golpe; soltar el handle (drop —
+/// incluso si el intérprete muere sin pasar por `shutdown`) también lo mata. Es el
+/// equivalente honesto del `kill(-pgid)` de Unix (Windows no tiene grupos de procesos
+/// matables). Windows ≥ 8 permite jobs anidados, así que funciona aunque synsema mismo
+/// corra dentro de otro job (cargo, un CI, un servicio).
+#[cfg(windows)]
+mod win {
+    use std::ffi::c_void;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+        TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
+
+    pub struct Job(HANDLE);
+
+    // Un HANDLE de job es un recurso del kernel sin afinidad de hilo.
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    impl Job {
+        fn create() -> Option<Job> {
+            let h = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if h == 0 {
+                return None;
+            }
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let ok = unsafe {
+                SetInformationJobObject(
+                    h,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if ok == 0 {
+                unsafe { CloseHandle(h) };
+                return None;
+            }
+            Some(Job(h))
+        }
+
+        /// Mete al proceso `ph` en un job nuevo. `None` si el SO lo rechaza (el caller
+        /// degrada a matar sólo el hijo directo y lo reporta en `tree: false`).
+        pub fn attach_handle(ph: HANDLE) -> Option<Job> {
+            let job = Self::create()?;
+            let ok = unsafe { AssignProcessToJobObject(job.0, ph) };
+            if ok == 0 {
+                return None;
+            }
+            Some(job)
+        }
+
+        pub fn attach_pid(pid: u32) -> Option<Job> {
+            if pid == 0 {
+                return None;
+            }
+            let ph = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
+            if ph == 0 {
+                return None;
+            }
+            let r = Self::attach_handle(ph);
+            unsafe { CloseHandle(ph) };
+            r
+        }
+
+        /// Mata TODO lo que hay en el job (exit code 1, el de `TerminateProcess`).
+        pub fn terminate(&self) -> bool {
+            unsafe { TerminateJobObject(self.0, 1) != 0 }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // KILL_ON_JOB_CLOSE: cerrar el último handle mata lo que quede.
+            unsafe { CloseHandle(self.0) };
         }
     }
 }
@@ -337,6 +430,11 @@ pub struct LiveProc {
     /// Momento en que se cosechó el exit (para el plazo de gracia de los lectores).
     pub exited_at: Option<Instant>,
     killed_by_us: bool,
+    /// `kill`/`close` alcanzan al árbol entero (grupo de procesos en Unix, Job Object
+    /// en Windows). `false` si se pidió `process_group: false` o el SO rechazó el job.
+    pub tree: bool,
+    #[cfg(windows)]
+    job: Option<win::Job>,
 }
 
 impl LiveProc {
@@ -353,7 +451,24 @@ impl LiveProc {
         for (k, v) in &opts.env {
             c.env(k, v);
         }
+        #[cfg(unix)]
+        if opts.process_group {
+            // Grupo propio (pgid = pid del hijo): `kill(-pid)` alcanza a los nietos.
+            use std::os::unix::process::CommandExt;
+            c.process_group(0);
+        }
         let mut child = c.spawn().map_err(|e| format!("cannot start \"{}\": {}", cmd, e))?;
+        #[cfg(windows)]
+        let job = if opts.process_group {
+            use std::os::windows::io::AsRawHandle;
+            win::Job::attach_handle(child.as_raw_handle() as _)
+        } else {
+            None
+        };
+        #[cfg(windows)]
+        let tree = job.is_some();
+        #[cfg(not(windows))]
+        let tree = opts.process_group;
         let shared = Self::new_shared(&opts);
         let stdin = child.stdin.take();
         let out = child.stdout.take();
@@ -391,6 +506,9 @@ impl LiveProc {
             started_at: Instant::now(),
             exited_at: None,
             killed_by_us: false,
+            tree,
+            #[cfg(windows)]
+            job,
         })
     }
 
@@ -446,9 +564,18 @@ impl LiveProc {
             .name("synsema-proc-pty".into())
             .spawn(move || reader_loop(PtyReader { inner: reader, handshake, held: Vec::new() }, sh, line_mode, false))
             .map_err(|e| format!("cannot start the pty reader: {}", e))?;
+        let pid = child.process_id().unwrap_or(0);
+        // Unix: el hijo del pty ya es líder de sesión (setsid) → el kill al grupo
+        // siempre es de árbol. Windows: mismo Job Object que en modo pipe.
+        #[cfg(windows)]
+        let job = if opts.process_group { win::Job::attach_pid(pid) } else { None };
+        #[cfg(windows)]
+        let tree = job.is_some();
+        #[cfg(not(windows))]
+        let tree = true;
         Ok(LiveProc {
             cmd: cmd.to_string(),
-            pid: child.process_id().unwrap_or(0),
+            pid,
             io: Io::Pty { child, master: Some(master), writer },
             pty: true,
             shared,
@@ -459,6 +586,9 @@ impl LiveProc {
             started_at: Instant::now(),
             exited_at: None,
             killed_by_us: false,
+            tree,
+            #[cfg(windows)]
+            job,
         })
     }
 
@@ -574,19 +704,27 @@ impl LiveProc {
     }
 
     /// Mata al proceso. `graceful` = TERM en Unix (KILL si no); en Windows siempre
-    /// TerminateProcess. Idempotente sobre un proceso ya terminado.
+    /// TerminateProcess. Con `tree` (default) la señal alcanza al árbol entero: el
+    /// grupo de procesos en Unix (`kill(-pgid)`), el Job Object en Windows.
+    /// Idempotente sobre un proceso ya terminado.
     pub fn kill(&mut self, graceful: bool) -> Result<(), String> {
         if self.poll_exit() {
             return Ok(());
         }
         self.killed_by_us = true;
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            if job.terminate() {
+                return Ok(());
+            }
+        }
         #[cfg(unix)]
         {
             // (`libc::kill` sobre un pid que ya cosechamos sería peligroso — por eso
             // `poll_exit` va antes.)
-            if self.pty && self.pid > 0 {
-                // El hijo del pty es líder de sesión (setsid): matar el GRUPO entero
-                // (pgid = pid) para no dejar nietos huérfanos colgados de la tty.
+            if self.tree && self.pid > 0 {
+                // El hijo es líder de grupo (process_group(0) en pipe, setsid en pty):
+                // matar el GRUPO entero (pgid = pid) para no dejar nietos huérfanos.
                 let sig = if graceful { libc::SIGTERM } else { libc::SIGKILL };
                 let r = unsafe { libc::kill(-(self.pid as libc::pid_t), sig) };
                 if r == 0 {

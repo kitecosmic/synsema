@@ -376,15 +376,20 @@ Response helpers (set the HTTP status; body follows the response contract):
 ## Agentic apps — `select`, live processes, event bus, agent control (engine v0.6.7+)
 
 One wait for everything (no capability; handles from `ws_connect`, a `socket` route, `proc_spawn`, `bus_subscribe`):
-- `select(targets, timeout?)` → first ready event tagged `source` (`"ws"`/`"proc"`/`"bus"`), `handle`, `name` (map form); `nothing` at timeout / all gone. `targets` = list of handles or map name → handle. See [concurrency.md](concurrency.md).
+- `select(targets, timeout?)` → first ready event tagged `source` (`"ws"`/`"proc"`/`"bus"`/`"watch"`), `handle`, `name` (map form); `nothing` at timeout / all gone. `targets` = list of handles or map name → handle. See [concurrency.md](concurrency.md).
 
 Live processes (gated by `exec(cmd)` like `run`; see [processes.md](processes.md)):
-- `proc_spawn(cmd, args?, opts?)` → handle. `opts`: `cwd`, `env`, `line_mode` (true), `stderr` (`"separate"`|`"merge"`), `max_queue` (4096), `max_queue_bytes` (64 MiB), `on_full` (`"block"`|`"drop_oldest"`|`"error"`), **`pty`** (false; v0.6.8+ — real pseudo-terminal for y/N prompts, passwords, TUIs; then one `stdout` stream, raw text chunks with ANSI (`data` is always text, never `bytes`), `line_mode` false, echo on), `cols` (80), `rows` (24), `term` (`"xterm-256color"`) — the last three only with `pty: true`
+- `proc_spawn(cmd, args?, opts?)` → handle. `opts`: `cwd`, `env`, `line_mode` (true), `stderr` (`"separate"`|`"merge"`), `max_queue` (4096), `max_queue_bytes` (64 MiB), `on_full` (`"block"`|`"drop_oldest"`|`"error"`), **`pty`** (false; v0.6.8+ — real pseudo-terminal for y/N prompts, passwords, TUIs; then one `stdout` stream, raw text chunks with ANSI (`data` is always text, never `bytes`), `line_mode` false, echo on), `cols` (80), `rows` (24), `term` (`"xterm-256color"`) — the last three only with `pty: true`; **`process_group`** (true; v0.6.9+ — own process group / Windows Job Object, so `proc_kill`/`proc_close` kill the whole tree incl. grandchildren; `false` detaches a daemon on purpose)
 - `proc_resize(h, cols, rows)` → true (pty only, v0.6.8+); `strip_ansi(text)` (Text section) to read pty output as a human
 - `proc_recv(h, timeout?)` → `{type: "stdout"|"stderr"|"exit", data}` or `nothing`; `proc_select(list|map, timeout?)`
 - `proc_send(h, text|bytes)` → true (blocking write; on a pty these are keystrokes: Enter = `"\r"`, Ctrl-C = `bytes([3])`); `proc_close_stdin(h)` (pipes only — on a pty it errors and names the EOF key)
-- `proc_status(h)` → `"running"|"exited"|"killed"|"closed"`; `proc_stats(h)` → `{pid, cmd, status, exit_code, pty, queued, queued_bytes, dropped, uptime}`
-- `proc_kill(h, "TERM"|"KILL"?)`; `proc_wait(h, timeout?)` → `{exit_code, signal}` or `nothing`; `proc_close(h)` (kills if alive; no orphans)
+- `proc_status(h)` → `"running"|"exited"|"killed"|"closed"`; `proc_stats(h)` → `{pid, cmd, status, exit_code, pty, tree, queued, queued_bytes, dropped, uptime}`
+- `proc_kill(h, "TERM"|"KILL"?)` (reaches the whole tree); `proc_wait(h, timeout?)` → `{exit_code, signal}` or `nothing`; `proc_close(h)` (kills the tree if alive; no orphans)
+
+File-watch (v0.6.9+; gated by `file_read(path)` like `list_dir`; polling with a snapshot — same events on every OS; see [processes.md](processes.md) § File-watch):
+- `watch(path, opts?)` → handle (also in `select`, `source: "watch"`). `opts`: `recursive` (true), `interval` seconds (0.5), `ignore` (names/`*` globs; default `[".git", "node_modules", "target"]`), `max_entries` (100000; over it → error), `max_queue` (4096, drop-oldest)
+- `watch_recv(h, timeout?)` → `{type: "create"|"modify"|"delete", path, is_dir}` or `nothing`; `path` with `/`, relative if the root was; rename = delete + create; dirs only create/delete; nothing for pre-existing content
+- `watch_stats(h)` → `{path, recursive, interval, entries, scans, queued, dropped}`; `watch_close(h)` (idempotent; stops the scanner). Budget `SYNSEMA_WATCH_MAX` (64)
 
 Event bus — one per program, in-process fan-out, no capability (see [agents.md](agents.md)):
 - `bus_publish(topic, value)` → subscribers reached (literal topic; data only — a task/secret errors)

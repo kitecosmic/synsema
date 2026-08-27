@@ -47,7 +47,8 @@ engine/
     │       ├── http_stub.rs         # no-`native` stand-in: same transport signatures, errors at runtime
     │       ├── server.rs            # async HTTP server (hyper/tokio): response contract, TLS, vhost, proxy, WebSocket upgrade, timeouts, ordered shutdown [native]
     │       ├── ws.rs                # the I/O hub: ws client + incoming sockets + proc + bus subscriptions on one mio poll → `select` [native]
-    │       ├── proc.rs              # live child processes (`proc_*`): reader threads per pipe, bounded queues, kill/reap; `pty: true` via portable-pty (openpty/ConPTY, DSR handshake) [native]
+    │       ├── proc.rs              # live child processes (`proc_*`): reader threads per pipe, bounded queues, tree-kill (process group / Windows Job Object), reap; `pty: true` via portable-pty (openpty/ConPTY, DSR handshake) [native]
+    │       ├── watch.rs             # file-watch (`watch_*`): polling scanner thread with a snapshot (mtime+size), bounded queue, feeds the hub's `select` [native]
     │       ├── database.rs          # SQLite (rusqlite, bundled) + PG/MySQL/Mongo/Redis [native]
     │       ├── cron.rs              # cron scheduler [native]
     │       ├── json.rs              # JSON ↔ SynValue + content-tree-as-data + json_encode/decode builtins (pure)

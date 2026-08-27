@@ -63,7 +63,7 @@ signals, resource locks), human-in-the-loop (`approve`/`confirm`/`ask`). See age
 llm.md, serve.md.
 
 **Live, stateful apps are in reach too (v0.6.7+):** incoming WebSocket routes (`socket`), an
-in-process event bus with fan-out (`bus_*`), child processes you watch line by line (`proc_*`) or drive inside a real terminal (`pty: true`, v0.6.8+),
+in-process event bus with fan-out (`bus_*`), child processes you watch line by line (`proc_*`) or drive inside a real terminal (`pty: true`, v0.6.8+) and kill as a whole tree, files you watch for changes (`watch`, v0.6.9+),
 one `select` over all of them, handler timeouts with real cancellation and an ordered shutdown —
 so a chat, a multiplayer minigame, a collaborative editor, a live dashboard or a build bot are
 plain Synsema programs, not "use Node for that part". See serve.md § WebSocket routes.

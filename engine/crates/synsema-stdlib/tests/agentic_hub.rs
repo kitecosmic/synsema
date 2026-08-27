@@ -10,7 +10,11 @@
 //! - una espera ociosa hace UNA iteración de `mio::Poll` (G25, no busy-spin);
 //! - la cancelación despierta la espera de inmediato (no espera al timeout);
 //! - colas acotadas: `drop_oldest` y `error` se comportan como se documenta;
-//! - dropear el intérprete retira sus suscripciones del bus.
+//! - dropear el intérprete retira sus suscripciones del bus;
+//! - tree-kill: `proc_kill`/`proc_close` matan al NIETO (grupo de procesos en Unix, Job
+//!   Object en Windows); `process_group: false` lo desprende a propósito;
+//! - file-watch: create/modify/delete honestos, `ignore`/`recursive`, gate `file_read`,
+//!   tope de entradas en voz alta, y el handle entra en `select` etiquetado.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -19,7 +23,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use synsema_agents::bus::Bus;
-use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
+use synsema_capabilities::model::{normalize_path, Capability, CapabilitySet, CapabilityType};
 use synsema_core::interpreter::{Control, Interpreter};
 use synsema_core::types::{syn_int, syn_map, syn_text, SynValue};
 use synsema_stdlib::ws::{attach_bus, register_ws_builtins, reset_hub, POLL_ITERS};
@@ -644,4 +648,363 @@ fn ws_select_accepts_any_handle_and_keeps_conn_tag() {
     // Un handle de proceso no es una conexión para proc_* ↔ ws_* cruzados.
     let e = err_msg(call(&mut i, "proc_recv", vec![syn_int(s), num(0.1)]));
     assert!(e.contains("bus subscription"), "{}", e);
+}
+
+// =========================================================
+// Tree-kill (el árbol, no sólo el hijo)
+// =========================================================
+
+/// Lanza un shell que engendra un NIETO de larga vida y devuelve `(handle, pid_nieto)`.
+/// Unix: `sh` publica el pid del `sleep` en background y se queda en `wait`.
+/// Windows: `cmd` corre `ping` (hijo directo de cmd = nieto de synsema); el pid se
+/// consulta al SO por el ParentProcessId.
+fn spawn_with_grandchild(i: &mut Interpreter, opts: Option<SynValue>) -> (i64, u32) {
+    let (cmd, args) = script("sleep 30 & echo $!; wait", "ping -n 31 127.0.0.1 > nul");
+    let mut a = vec![cmd, args];
+    if let Some(o) = opts {
+        a.push(o);
+    }
+    let h = int(&ok(call(i, "proc_spawn", a)));
+    let grandchild: u32 = if cfg!(windows) {
+        let pid = int(&get(&ok(call(i, "proc_stats", vec![syn_int(h)])), "pid"));
+        let mut found = 0u32;
+        for _ in 0..100 {
+            let out = std::process::Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-Command",
+                    &format!(
+                        "(Get-CimInstance Win32_Process -Filter \"ParentProcessId={}\" | Where-Object {{ $_.Name -like 'ping*' }} | Select-Object -First 1).ProcessId",
+                        pid
+                    ),
+                ])
+                .output()
+                .expect("powershell");
+            if let Ok(p) = String::from_utf8_lossy(&out.stdout).trim().parse::<u32>() {
+                found = p;
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        found
+    } else {
+        let ev = ok(call(i, "proc_recv", vec![syn_int(h), num(5.0)]));
+        assert_eq!(text(&get(&ev, "type")), "stdout");
+        text(&get(&ev, "data")).trim().parse().expect("pid del nieto")
+    };
+    assert!(grandchild > 0, "encontró el nieto");
+    (h, grandchild)
+}
+
+fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        if !alive {
+            return false;
+        }
+        // Distinguir zombie (Z) de vivo leyendo /proc si existe (Linux).
+        match std::fs::read_to_string(format!("/proc/{}/stat", pid)) {
+            Ok(st) => !st.contains(") Z"),
+            Err(_) => true,
+        }
+    }
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH", "/FO", "CSV"])
+            .output()
+            .expect("tasklist");
+        String::from_utf8_lossy(&out.stdout).contains(&format!("\"{}\"", pid))
+    }
+}
+
+fn wait_dead(pid: u32, max: Duration) -> bool {
+    let t0 = Instant::now();
+    while t0.elapsed() < max {
+        if !pid_alive(pid) {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    !pid_alive(pid)
+}
+
+fn kill_pid_hard(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+    }
+}
+
+#[test]
+fn tree_kill_close_reaches_the_grandchild() {
+    let _g = serial();
+    let mut i = interp();
+    let (h, gc) = spawn_with_grandchild(&mut i, None);
+    assert!(pid_alive(gc), "el nieto está vivo antes del close");
+    let stats = ok(call(&mut i, "proc_stats", vec![syn_int(h)]));
+    assert!(matches!(get(&stats, "tree"), SynValue::Bool(true)), "tree: true por defecto");
+    ok(call(&mut i, "proc_close", vec![syn_int(h)]));
+    let dead = wait_dead(gc, Duration::from_secs(5));
+    if !dead {
+        kill_pid_hard(gc);
+    }
+    assert!(dead, "proc_close mató al nieto {}", gc);
+}
+
+#[test]
+fn tree_kill_proc_kill_reaches_the_grandchild() {
+    let _g = serial();
+    let mut i = interp();
+    let (h, gc) = spawn_with_grandchild(&mut i, None);
+    ok(call(&mut i, "proc_kill", vec![syn_int(h)]));
+    let exit = ok(call(&mut i, "proc_wait", vec![syn_int(h), num(5.0)]));
+    assert!(!matches!(exit, SynValue::Nothing), "el hijo terminó");
+    let dead = wait_dead(gc, Duration::from_secs(5));
+    if !dead {
+        kill_pid_hard(gc);
+    }
+    assert!(dead, "proc_kill mató al nieto {}", gc);
+    ok(call(&mut i, "proc_close", vec![syn_int(h)]));
+}
+
+#[test]
+fn process_group_false_detaches_on_purpose() {
+    let _g = serial();
+    let mut i = interp();
+    let mut o = indexmap::IndexMap::new();
+    o.insert("process_group".to_string(), SynValue::Bool(false));
+    let (h, gc) = spawn_with_grandchild(&mut i, Some(syn_map(o)));
+    let stats = ok(call(&mut i, "proc_stats", vec![syn_int(h)]));
+    assert!(matches!(get(&stats, "tree"), SynValue::Bool(false)), "tree: false cuando se pidió");
+    ok(call(&mut i, "proc_close", vec![syn_int(h)]));
+    thread::sleep(Duration::from_millis(500));
+    let survived = pid_alive(gc);
+    kill_pid_hard(gc);
+    assert!(survived, "con process_group: false el nieto {} sobrevive al close", gc);
+}
+
+#[test]
+fn tree_kill_also_under_pty() {
+    let _g = serial();
+    let mut i = interp();
+    let (h, gc) = spawn_with_grandchild(&mut i, Some(pty_opts(&[])));
+    ok(call(&mut i, "proc_close", vec![syn_int(h)]));
+    let dead = wait_dead(gc, Duration::from_secs(5));
+    if !dead {
+        kill_pid_hard(gc);
+    }
+    assert!(dead, "close bajo pty mató al nieto {}", gc);
+}
+
+// =========================================================
+// File-watch
+// =========================================================
+
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> TempDir {
+        let p = std::env::temp_dir().join(format!("synsema-watch-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        TempDir(p)
+    }
+    fn path(&self) -> String {
+        normalize_path(&self.0.to_string_lossy())
+    }
+    fn file(&self, rel: &str) -> std::path::PathBuf {
+        self.0.join(rel)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn interp_fs(dir: &TempDir) -> Interpreter {
+    let interp = Interpreter::new();
+    let caps = Rc::new(RefCell::new(CapabilitySet::new("test")));
+    caps.borrow_mut().grant(Capability::new(CapabilityType::Exec, Some(shell().to_string())));
+    caps.borrow_mut().grant(Capability::new(CapabilityType::FileRead, Some(dir.path())));
+    caps.borrow_mut().grant(Capability::new(CapabilityType::FileRead, Some(format!("{}/*", dir.path()))));
+    register_ws_builtins(&interp, caps);
+    attach_bus(&interp, Arc::new(Bus::new()));
+    interp
+}
+
+fn fast_opts(extra: &[(&str, SynValue)]) -> SynValue {
+    let mut m = indexmap::IndexMap::new();
+    m.insert("interval".to_string(), num(0.05));
+    for (k, v) in extra {
+        m.insert(k.to_string(), v.clone());
+    }
+    syn_map(m)
+}
+
+/// Próximo evento del watch (hasta 3 s), o `nothing`.
+fn next_ev(i: &mut Interpreter, w: i64) -> SynValue {
+    ok(call(i, "watch_recv", vec![syn_int(w), num(3.0)]))
+}
+
+fn path_ends_with(ev: &SynValue, suffix: &str) -> bool {
+    text(&get(ev, "path")).ends_with(suffix)
+}
+
+#[test]
+fn watch_reports_create_modify_delete_and_nested_dirs() {
+    let _g = serial();
+    let d = TempDir::new("cmd");
+    let mut i = interp_fs(&d);
+    let w = int(&ok(call(&mut i, "watch", vec![syn_text(d.path()), fast_opts(&[])])));
+    // Nada del contenido inicial: silencio.
+    assert!(matches!(ok(call(&mut i, "watch_recv", vec![syn_int(w), num(0.2)])), SynValue::Nothing));
+
+    std::fs::write(d.file("a.txt"), "hola").unwrap();
+    let ev = next_ev(&mut i, w);
+    assert_eq!(text(&get(&ev, "type")), "create");
+    assert!(path_ends_with(&ev, "/a.txt"), "path con `/`: {}", text(&get(&ev, "path")));
+    assert!(matches!(get(&ev, "is_dir"), SynValue::Bool(false)));
+    assert_eq!(text(&get(&ev, "source")), "watch");
+    assert_eq!(int(&get(&ev, "handle")), w);
+
+    // Modificar: el tamaño cambia aunque el mtime tenga granularidad gruesa.
+    std::fs::write(d.file("a.txt"), "hola mundo").unwrap();
+    let ev = next_ev(&mut i, w);
+    assert_eq!(text(&get(&ev, "type")), "modify");
+    assert!(path_ends_with(&ev, "/a.txt"));
+
+    // Directorio anidado + archivo adentro (recursivo por defecto).
+    std::fs::create_dir(d.file("sub")).unwrap();
+    let ev = next_ev(&mut i, w);
+    assert_eq!(text(&get(&ev, "type")), "create");
+    assert!(path_ends_with(&ev, "/sub"));
+    assert!(matches!(get(&ev, "is_dir"), SynValue::Bool(true)));
+    std::fs::write(d.file("sub/b.txt"), "x").unwrap();
+    let ev = next_ev(&mut i, w);
+    assert_eq!(text(&get(&ev, "type")), "create");
+    assert!(path_ends_with(&ev, "/sub/b.txt"));
+
+    std::fs::remove_file(d.file("a.txt")).unwrap();
+    let ev = next_ev(&mut i, w);
+    assert_eq!(text(&get(&ev, "type")), "delete");
+    assert!(path_ends_with(&ev, "/a.txt"));
+
+    let st = ok(call(&mut i, "watch_stats", vec![syn_int(w)]));
+    assert_eq!(text(&get(&st, "path")), d.path());
+    assert!(int(&get(&st, "scans")) >= 4);
+    assert_eq!(int(&get(&st, "entries")), 3, "raíz + sub + sub/b.txt");
+    assert_eq!(int(&get(&st, "dropped")), 0);
+    ok(call(&mut i, "watch_close", vec![syn_int(w)]));
+    ok(call(&mut i, "watch_close", vec![syn_int(w)])); // idempotente
+    let e = err_msg(call(&mut i, "watch_recv", vec![syn_int(w), num(0.1)]));
+    assert!(e.contains("unknown or closed watch handle"), "{}", e);
+}
+
+#[test]
+fn watch_honours_ignore_and_non_recursive() {
+    let _g = serial();
+    let d = TempDir::new("ign");
+    std::fs::create_dir(d.file("sub")).unwrap();
+    let mut i = interp_fs(&d);
+    let ignore = list(vec![syn_text("*.log")]);
+    let w = int(&ok(call(
+        &mut i,
+        "watch",
+        vec![syn_text(d.path()), fast_opts(&[("recursive", SynValue::Bool(false)), ("ignore", ignore)])],
+    )));
+    std::fs::write(d.file("sub/deep.txt"), "x").unwrap();
+    std::fs::write(d.file("noise.log"), "x").unwrap();
+    assert!(
+        matches!(ok(call(&mut i, "watch_recv", vec![syn_int(w), num(0.4)])), SynValue::Nothing),
+        "ni lo anidado ni lo ignorado producen eventos"
+    );
+    std::fs::write(d.file("real.txt"), "x").unwrap();
+    let ev = next_ev(&mut i, w);
+    assert_eq!(text(&get(&ev, "type")), "create");
+    assert!(path_ends_with(&ev, "/real.txt"));
+}
+
+#[test]
+fn watch_joins_select_with_processes_and_is_tagged() {
+    let _g = serial();
+    let d = TempDir::new("sel");
+    let mut i = interp_fs(&d);
+    let w = int(&ok(call(&mut i, "watch", vec![syn_text(d.path()), fast_opts(&[])])));
+    let (cmd, args) = script("sleep 2", "ping -n 3 127.0.0.1 > nul");
+    let p = int(&ok(call(&mut i, "proc_spawn", vec![cmd, args])));
+    let mut targets = indexmap::IndexMap::new();
+    targets.insert("files".to_string(), syn_int(w));
+    targets.insert("build".to_string(), syn_int(p));
+    std::fs::write(d.file("c.txt"), "x").unwrap();
+    let ev = ok(call(&mut i, "select", vec![syn_map(targets), num(3.0)]));
+    assert_eq!(text(&get(&ev, "source")), "watch");
+    assert_eq!(text(&get(&ev, "name")), "files");
+    assert_eq!(text(&get(&ev, "type")), "create");
+    // Un handle de watch no es un proceso (y viceversa): el error lo dice.
+    let e = err_msg(call(&mut i, "proc_kill", vec![syn_int(w)]));
+    assert!(e.contains("is a file watch, not a process"), "{}", e);
+    let e = err_msg(call(&mut i, "watch_stats", vec![syn_int(p)]));
+    assert!(e.contains("is a process, not a file watch"), "{}", e);
+    ok(call(&mut i, "proc_close", vec![syn_int(p)]));
+}
+
+#[test]
+fn watch_needs_file_read_and_an_existing_path() {
+    let _g = serial();
+    let d = TempDir::new("gate");
+    let mut plain = interp();
+    let e = err_msg(call(&mut plain, "watch", vec![syn_text(d.path())]));
+    assert!(e.contains("file_read("), "{}", e);
+    let mut i = interp_fs(&d);
+    let e = err_msg(call(&mut i, "watch", vec![syn_text(format!("{}/nope", d.path()))]));
+    assert!(e.contains("no such file or directory"), "{}", e);
+    // Un archivo suelto también se puede mirar.
+    std::fs::write(d.file("one.txt"), "1").unwrap();
+    let w = int(&ok(call(&mut i, "watch", vec![syn_text(format!("{}/one.txt", d.path())), fast_opts(&[])])));
+    std::fs::write(d.file("one.txt"), "12").unwrap();
+    let ev = next_ev(&mut i, w);
+    assert_eq!(text(&get(&ev, "type")), "modify");
+    assert!(path_ends_with(&ev, "/one.txt"));
+}
+
+#[test]
+fn watch_max_entries_fails_loud_at_open_and_later() {
+    let _g = serial();
+    let d = TempDir::new("max");
+    for n in 0..5 {
+        std::fs::write(d.file(&format!("f{}.txt", n)), "x").unwrap();
+    }
+    let mut i = interp_fs(&d);
+    let e = err_msg(call(&mut i, "watch", vec![syn_text(d.path()), fast_opts(&[("max_entries", num(3.0))])]));
+    assert!(e.contains("more than 3 entries"), "{}", e);
+    // Con tope 10 arranca; al superarlo después, el próximo recv es un error terminal.
+    let w = int(&ok(call(&mut i, "watch", vec![syn_text(d.path()), fast_opts(&[("max_entries", num(10.0))])])));
+    for n in 5..20 {
+        std::fs::write(d.file(&format!("f{}.txt", n)), "x").unwrap();
+    }
+    let e = err_msg(call(&mut i, "watch_recv", vec![syn_int(w), num(3.0)]));
+    assert!(e.contains("more than 10 entries"), "{}", e);
+    let e = err_msg(call(&mut i, "watch_stats", vec![syn_int(w)]));
+    assert!(e.contains("unknown or closed watch handle"), "{}", e);
+}
+
+#[test]
+fn watch_budget_is_enforced() {
+    let _g = serial();
+    std::env::set_var("SYNSEMA_WATCH_MAX", "2");
+    let d = TempDir::new("budget");
+    let mut i = interp_fs(&d);
+    std::env::remove_var("SYNSEMA_WATCH_MAX");
+    ok(call(&mut i, "watch", vec![syn_text(d.path()), fast_opts(&[])]));
+    ok(call(&mut i, "watch", vec![syn_text(d.path()), fast_opts(&[])]));
+    let e = err_msg(call(&mut i, "watch", vec![syn_text(d.path()), fast_opts(&[])]));
+    assert!(e.contains("watch budget reached"), "{}", e);
 }

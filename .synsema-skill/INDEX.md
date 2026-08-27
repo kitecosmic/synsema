@@ -141,6 +141,7 @@ usually version skew, not a bug.
 - **Incoming WebSocket / chat / multiplayer minigame / collaborative editor / live console / bidirectional UI ↔ server** (`route … socket`, the `ws_*` family on the incoming handle; a bus topic per room for fan-out) → serve.md § WebSocket routes + agents.md § Event bus. These primitives are general — not only for agent UIs.
 - **Live child process** — see output as it streams, feed stdin, kill (`proc_spawn`/`proc_recv`/`proc_send`/`proc_kill`), e.g. an agent running `cargo test` → processes.md § Live processes
 - **Interactive CLI / y-N prompt / password / TUI / web terminal** — `proc_spawn(..., {pty: true})` + `proc_resize` + `strip_ansi` (real pseudo-terminal, same `exec` gate) → processes.md § Pseudo-terminal
+- **React to file changes / rebuild on save / hot-reload an agent's workspace** — `watch(path)` + `watch_recv`/`select` (create/modify/delete, `file_read` gate, polling — same on every OS) → processes.md § File-watch
 - **Fan-out events to N clients / feed SSE or sockets from an agent, a cron, another request** (`bus_publish`/`bus_subscribe`/`bus_recv`) → agents.md § Event bus
 - **Wait on a socket + a process + the bus at once** (`select`, one event loop, no polling) → concurrency.md § `select`
 - Handler `timeout` (504 + cancellation), ordered shutdown on Ctrl-C/SIGTERM, SSE heartbeat → serve.md § Timeouts, cancellation & ordered shutdown

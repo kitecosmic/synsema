@@ -98,7 +98,8 @@ More traps (databases, serve, blockchain, secrets, charts): [pitfalls.md](pitfal
   `parallel_map` → [agents.md](agents.md), [concurrency.md](concurrency.md)
 - **HTTP server as syntax**: `serve on 8080` + `route "GET /x"` blocks → [serve.md](serve.md)
 - **Agentic app plumbing without asyncio**: `subprocess.Popen` + reading pipes → `proc_spawn`/`proc_recv`;
-  `pexpect` / `pty.spawn` (interactive prompts, TUIs) → `proc_spawn(cmd, args, {"pty": true})` + `strip_ansi` (v0.6.8+)
+  `pexpect` / `pty.spawn` (interactive prompts, TUIs) → `proc_spawn(cmd, args, {"pty": true})` + `strip_ansi` (v0.6.8+);
+  `watchdog` / `inotify` observers → `watch(path)` + `watch_recv`/`select` (v0.6.9+); `psutil` tree-kill / `os.killpg` → `proc_close(h)` already kills the tree
   (events per line, `exec`-gated); `websockets.serve` → a `route "GET /ws"` + `socket` block;
   `asyncio.wait`/`selectors` → one blocking `select([...])` over sockets + processes + the bus;
   `signal.signal(SIGINT, …)` → nothing to write, `serve` drains on Ctrl-C by itself → [serve.md](serve.md),

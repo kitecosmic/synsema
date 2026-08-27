@@ -128,7 +128,8 @@
 `exec` gates both `run` (one-shot) and `proc_spawn` (live process, v0.6.7+; also with
 `pty: true`, v0.6.8+ — a pseudo-terminal grants no extra OS power, so there is no separate
 capability) with the same scope; `/openapi.json` lists it under `x-synsema-capabilities` for
-routes that call either.
+routes that call either. `file.read` also gates `watch(path)` (v0.6.9+): watching a tree is
+reading it, same scope shape as `list_dir` (`file("dir")` + `file("dir/*")`).
 `
 `Plain `call`/normal invocation does NOT isolate — use `call_tool` for untrusted, model-chosen tools.
 `

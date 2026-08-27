@@ -58,6 +58,7 @@ see [secrets.md](secrets.md). Resolution: **process environment → `.env` file 
   | `SYNSEMA_WS_MAX_MESSAGE` | `16MB` | max incoming WebSocket message on `socket` routes (ceiling 64MB) |
   | `SYNSEMA_WS_MAX_CONNS` | `4096` | live WebSocket handles per interpreter (`ws_connect` + incoming) |
   | `SYNSEMA_PROC_MAX` | `64` | live `proc_spawn` children per interpreter (hard ceiling 1024) |
+  | `SYNSEMA_WATCH_MAX` | `64` | live `watch` handles per interpreter (hard ceiling 1024; one scanner thread each) |
 
 - **Host ceiling for a whole server:** `synsema serve app.syn --sandbox` or
   `--cap-set "stdout,time,serve=8080,net=api.example.com"` caps what handlers, cron

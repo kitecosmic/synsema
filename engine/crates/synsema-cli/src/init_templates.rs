@@ -220,6 +220,9 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # Procesos vivos (proc_spawn) por interprete (default 64, techo duro 1024):
 # SYNSEMA_PROC_MAX=64
 
+# File-watches vivos (watch) por interprete (default 64, techo duro 1024; un hilo cada uno):
+# SYNSEMA_WATCH_MAX=64
+
 # ══ Secretos de TU programa (el nombre lo elegís vos, no el engine) ══
 
 # `secret("NOMBRE")` resuelve por: entorno del proceso > este .env > default; sin

@@ -52,4 +52,6 @@ pub mod webauth;
 #[cfg(feature = "native")]
 pub mod proc;
 #[cfg(feature = "native")]
+pub mod watch;
+#[cfg(feature = "native")]
 pub mod ws;

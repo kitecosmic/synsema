@@ -698,6 +698,7 @@ pub fn register_unavailable_stubs(interp: &Interpreter) {
     const PROC: &[&str] = &[
         "select", "proc_spawn", "proc_send", "proc_close_stdin", "proc_resize", "proc_recv",
         "proc_select", "proc_status", "proc_kill", "proc_wait", "proc_close", "proc_stats",
+        "watch", "watch_recv", "watch_stats", "watch_close",
     ];
     const BUS: &[&str] = &["bus_publish", "bus_subscribe", "bus_recv", "bus_unsubscribe", "bus_topics"];
     const AGENTS: &[&str] = &["agents", "agent_stop"];

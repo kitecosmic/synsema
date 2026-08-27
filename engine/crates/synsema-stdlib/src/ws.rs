@@ -50,12 +50,13 @@ use tungstenite::protocol::{Message, Role, WebSocket, WebSocketConfig};
 use tungstenite::Bytes;
 
 use synsema_agents::bus::{Bus, OnFull as BusOnFull, SubscribeOpts, Subscriber};
-use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
+use synsema_capabilities::model::{normalize_path, Capability, CapabilitySet, CapabilityType};
 use synsema_capabilities::secure::url_hostname;
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::types::{from_send, syn_bool, syn_bytes, syn_int, syn_map, syn_number, syn_text, SendValue, SynValue};
 
 use crate::proc::{LiveProc, OnFull as ProcOnFull, ProcEvent, ProcStatus, SpawnOpts};
+use crate::watch::{Watch, WatchOpts};
 
 /// Token reservado del `mio::Waker` del hub (los sockets arrancan en 1).
 const WAKER_TOKEN: Token = Token(0);
@@ -65,6 +66,9 @@ const DEFAULT_SERVER_PING_SECS: f64 = 30.0;
 /// Tope de procesos vivos por intérprete (`SYNSEMA_PROC_MAX`, techo 1024).
 const DEFAULT_MAX_PROCS: usize = 64;
 const MAX_PROCS_CEILING: usize = 1024;
+/// Tope de watches vivos por intérprete (cada uno es un hilo scanner).
+const DEFAULT_MAX_WATCHES: usize = 64;
+const MAX_WATCHES_CEILING: usize = 1024;
 /// Plazo de gracia para que los lectores de un proceso que YA salió lleguen a EOF
 /// (un nieto que retiene el pipe no puede colgar al `select` para siempre).
 const PROC_READER_GRACE: Duration = Duration::from_secs(1);
@@ -388,6 +392,9 @@ struct WsRegistry {
     /// Procesos vivos (`proc_*`).
     procs: HashMap<i64, LiveProc>,
     max_procs: usize,
+    /// File-watches vivos (`watch`).
+    watches: HashMap<i64, Watch>,
+    max_watches: usize,
     /// Suscripciones al bus (`bus_subscribe`).
     subs: HashMap<i64, Arc<Subscriber>>,
     /// El bus del proceso (lo adjunta el motor con `attach_bus` al cablear el swarm).
@@ -400,9 +407,11 @@ struct WsRegistry {
 
 impl Drop for WsRegistry {
     fn drop(&mut self) {
-        // Fin del intérprete = fin de sus procesos (LiveProc::drop mata + cosecha) y de
-        // sus suscripciones (el bus no acumula en colas huérfanas).
+        // Fin del intérprete = fin de sus procesos (LiveProc::drop mata + cosecha), de
+        // sus watches (Watch::drop apaga el scanner) y de sus suscripciones (el bus no
+        // acumula en colas huérfanas).
         self.procs.clear();
+        self.watches.clear();
         if let Some(bus) = &self.bus {
             for (_, s) in self.subs.drain() {
                 bus.unsubscribe(s.id);
@@ -1846,6 +1855,7 @@ pub fn reset_hub(interp: &Interpreter) {
     }
     // `LiveProc::drop` → TERM, KILL a los 2 s, wait: ninguno sobrevive al request.
     r.procs.clear();
+    r.watches.clear();
     let subs: Vec<Arc<Subscriber>> = r.subs.drain().map(|(_, s)| s).collect();
     if let Some(bus) = r.bus.clone() {
         for s in subs {
@@ -2017,6 +2027,7 @@ enum HandleKind {
     Ws,
     Proc,
     Sub,
+    Watch,
 }
 
 impl WsRegistry {
@@ -2027,6 +2038,8 @@ impl WsRegistry {
             Some(HandleKind::Proc)
         } else if self.subs.contains_key(&h) {
             Some(HandleKind::Sub)
+        } else if self.watches.contains_key(&h) {
+            Some(HandleKind::Watch)
         } else {
             None
         }
@@ -2050,6 +2063,9 @@ impl WsRegistry {
         }
         if let Some(s) = self.subs.get(&h) {
             return s.is_ready();
+        }
+        if let Some(w) = self.watches.get(&h) {
+            return w.shared.is_ready();
         }
         false
     }
@@ -2187,6 +2203,24 @@ impl WsRegistry {
                     }
                 }
             }
+            HandleKind::Watch => {
+                let w = self.watches.get(&h)?;
+                match w.shared.try_recv() {
+                    Ok(Some(ev)) => {
+                        let mut m = indexmap::IndexMap::new();
+                        m.insert("type".to_string(), syn_text(ev.kind.as_str()));
+                        m.insert("path".to_string(), syn_text(ev.path));
+                        m.insert("is_dir".to_string(), syn_bool(ev.is_dir));
+                        Some(Ok(tagged(m, "watch")))
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        // Terminal (tope de entradas superado): retirar el handle.
+                        self.watches.remove(&h);
+                        Some(Err(format!("watch {}: {}", h, e)))
+                    }
+                }
+            }
         }
     }
 
@@ -2259,7 +2293,19 @@ fn proc_handle(reg: &Registry, v: Option<&SynValue>, fname: &str) -> Result<i64,
         Some(HandleKind::Proc) => Ok(h),
         Some(HandleKind::Ws) => Err(err(format!("{}: handle {} is a WebSocket connection, not a process", fname, h))),
         Some(HandleKind::Sub) => Err(err(format!("{}: handle {} is a bus subscription, not a process", fname, h))),
+        Some(HandleKind::Watch) => Err(err(format!("{}: handle {} is a file watch, not a process", fname, h))),
         None => Err(err(format!("{}: unknown or closed process handle {}", fname, h))),
+    }
+}
+
+fn watch_handle(reg: &Registry, v: Option<&SynValue>, fname: &str) -> Result<i64, Control> {
+    let h = conn_handle(v.ok_or_else(|| err(format!("{}: missing the watch handle", fname)))?, fname)?;
+    match reg.borrow().kind_of(h) {
+        Some(HandleKind::Watch) => Ok(h),
+        Some(HandleKind::Ws) => Err(err(format!("{}: handle {} is a WebSocket connection, not a file watch", fname, h))),
+        Some(HandleKind::Proc) => Err(err(format!("{}: handle {} is a process, not a file watch", fname, h))),
+        Some(HandleKind::Sub) => Err(err(format!("{}: handle {} is a bus subscription, not a file watch", fname, h))),
+        None => Err(err(format!("{}: unknown or closed watch handle {}", fname, h))),
     }
 }
 
@@ -2386,6 +2432,13 @@ fn proc_spawn(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         }
         if !opts.pty && (m.contains_key("cols") || m.contains_key("rows") || m.contains_key("term")) {
             return Err(err(format!("{}: cols/rows/term only apply with pty: true", F)));
+        }
+        // Tree-kill (default): el hijo en su propio grupo/job → kill/close matan nietos.
+        // `false` desprende a propósito (un daemon que debe sobrevivir al handler).
+        match m.get("process_group") {
+            None | Some(SynValue::Nothing) => {}
+            Some(SynValue::Bool(b)) => opts.process_group = *b,
+            Some(other) => return Err(err(format!("{}: process_group must be a boolean, got {}", F, other.type_name()))),
         }
     }
     let live = LiveProc::spawn(&cmd, &arg_list, opts).map_err(|e| err(format!("{}: {}", F, e)))?;
@@ -2552,6 +2605,7 @@ fn proc_stats(_interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> R
     );
     m.insert("exit_code".to_string(), p.exit_code.map(syn_int).unwrap_or(SynValue::Nothing));
     m.insert("pty".to_string(), syn_bool(p.pty));
+    m.insert("tree".to_string(), syn_bool(p.tree));
     m.insert("queued".to_string(), syn_int(queued as i64));
     m.insert("queued_bytes".to_string(), syn_int(queued_bytes as i64));
     m.insert("dropped".to_string(), syn_int(dropped as i64));
@@ -2697,6 +2751,129 @@ fn bus_topics(_args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
     Ok(SynValue::List(Rc::new(RefCell::new(items))))
 }
 
+// ---------------------------------------------------------
+// File-watch
+// ---------------------------------------------------------
+
+fn opt_f64(m: &indexmap::IndexMap<String, SynValue>, key: &str, fname: &str) -> Result<Option<f64>, Control> {
+    match m.get(key) {
+        None | Some(SynValue::Nothing) => Ok(None),
+        Some(SynValue::Number(n)) => {
+            let f = n.to_f64();
+            if !f.is_finite() || f <= 0.0 {
+                return Err(err(format!("{}: {} must be a positive number", fname, key)));
+            }
+            Ok(Some(f))
+        }
+        Some(other) => Err(err(format!("{}: {} must be a number, got {}", fname, key, other.type_name()))),
+    }
+}
+
+/// `watch(path, opts?)` → handle. Gate `file_read(path)`: observar un árbol es leerlo.
+fn watch_open(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "watch";
+    let path = match args.first() {
+        Some(SynValue::Text(s)) => normalize_path(s),
+        Some(SynValue::Secret(_)) => return Err(err(format!("{}: the path cannot be a secret", F))),
+        Some(other) => return Err(err(format!("{}: the path must be text, got {}", F, other.type_name()))),
+        None => return Err(err(format!("{}: missing the path", F))),
+    };
+    if path.is_empty() {
+        return Err(err(format!("{}: the path is empty", F)));
+    }
+    {
+        let caps = reg.borrow().caps.clone();
+        caps.borrow_mut()
+            .require(&Capability::new(CapabilityType::FileRead, Some(path.clone())), "watch()")
+            .map_err(|v| Control::Error(RuntimeError::new(v.message)))?;
+    }
+    {
+        let r = reg.borrow();
+        if r.watches.len() >= r.max_watches {
+            return Err(err(format!(
+                "{}: watch budget reached ({} live, max {}); watch_close some or raise SYNSEMA_WATCH_MAX",
+                F,
+                r.watches.len(),
+                r.max_watches
+            )));
+        }
+    }
+    let mut opts = WatchOpts::default();
+    if let Some(m) = opt_map(args.get(1), F)? {
+        match m.get("recursive") {
+            None | Some(SynValue::Nothing) => {}
+            Some(SynValue::Bool(b)) => opts.recursive = *b,
+            Some(other) => return Err(err(format!("{}: recursive must be a boolean, got {}", F, other.type_name()))),
+        }
+        if let Some(secs) = opt_f64(&m, "interval", F)? {
+            opts.interval = Duration::from_secs_f64(secs).max(crate::watch::MIN_INTERVAL);
+        }
+        match m.get("ignore") {
+            None | Some(SynValue::Nothing) => {}
+            Some(SynValue::List(l)) => {
+                let mut pats = Vec::new();
+                for it in l.borrow().iter() {
+                    match it {
+                        SynValue::Text(s) if !s.is_empty() => pats.push(s.to_string()),
+                        SynValue::Text(_) => {}
+                        other => return Err(err(format!("{}: ignore must be a list of text patterns, got {}", F, other.type_name()))),
+                    }
+                }
+                opts.ignore = pats;
+            }
+            Some(other) => return Err(err(format!("{}: ignore must be a list, got {}", F, other.type_name()))),
+        }
+        if let Some(n) = opt_usize(&m, "max_entries", F)? {
+            opts.max_entries = n.min(crate::watch::MAX_ENTRIES_CEILING);
+        }
+        if let Some(n) = opt_usize(&m, "max_queue", F)? {
+            opts.max_queue = n;
+        }
+    }
+    let w = Watch::start(&path, opts).map_err(|e| err(format!("{}: {}", F, e)))?;
+    let mut r = reg.borrow_mut();
+    let wk = r.waker.clone();
+    w.shared.set_wake(Some(Arc::new(move || {
+        let _ = wk.wake();
+    })));
+    r.next_id += 1;
+    let handle = r.next_id;
+    r.watches.insert(handle, w);
+    Ok(syn_int(handle))
+}
+
+fn watch_recv(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "watch_recv";
+    let h = watch_handle(reg, args.first(), F)?;
+    let timeout = timeout_arg(args.get(1), F)?;
+    select_on(interp, reg, &[h], &None, timeout, F)
+}
+
+fn watch_stats(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "watch_stats";
+    let h = watch_handle(reg, args.first(), F)?;
+    let r = reg.borrow();
+    let w = r.watches.get(&h).ok_or_else(|| err(format!("{}: unknown watch handle {}", F, h)))?;
+    let (queued, dropped, entries, scans) = w.shared.stats();
+    let mut m = indexmap::IndexMap::new();
+    m.insert("path".to_string(), syn_text(w.shared.root.clone()));
+    m.insert("recursive".to_string(), syn_bool(w.shared.recursive));
+    m.insert("interval".to_string(), syn_number(synsema_core::number::Number::Float(w.shared.interval.as_secs_f64())));
+    m.insert("entries".to_string(), syn_int(entries as i64));
+    m.insert("scans".to_string(), syn_int(scans as i64));
+    m.insert("queued".to_string(), syn_int(queued as i64));
+    m.insert("dropped".to_string(), syn_int(dropped as i64));
+    Ok(syn_map(m))
+}
+
+fn watch_close(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "watch_close";
+    let h = conn_handle(args.first().ok_or_else(|| err(format!("{}: missing the watch handle", F)))?, F)?;
+    // Idempotente: cerrar un handle desconocido es no-op. Drop apaga el scanner.
+    reg.borrow_mut().watches.remove(&h);
+    Ok(syn_bool(true))
+}
+
 // =========================================================
 // Registro
 // =========================================================
@@ -2710,6 +2887,12 @@ pub fn register_ws_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet
         .filter(|&n| n > 0)
         .map(|n| n.min(MAX_PROCS_CEILING))
         .unwrap_or(DEFAULT_MAX_PROCS);
+    let max_watches = std::env::var("SYNSEMA_WATCH_MAX")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| n.min(MAX_WATCHES_CEILING))
+        .unwrap_or(DEFAULT_MAX_WATCHES);
     // Tope de conexiones por intérprete: default DEFAULT_MAX_CONNS, ajustable con
     // `SYNSEMA_WS_MAX_CONNS` (acotado al techo duro; un valor inválido cae al default).
     let max_conns = std::env::var("SYNSEMA_WS_MAX_CONNS")
@@ -2731,6 +2914,8 @@ pub fn register_ws_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet
         waker,
         procs: HashMap::new(),
         max_procs,
+        watches: HashMap::new(),
+        max_watches,
         subs: HashMap::new(),
         bus: None,
         cancel_seen: 0,
@@ -2778,6 +2963,12 @@ pub fn register_ws_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet
     reg_fn_interp!("proc_wait", -1, proc_wait);
     reg_fn!("proc_close", 1, proc_close);
     reg_fn_interp!("proc_stats", 1, proc_stats);
+
+    // -- file-watch (polling con snapshot; entra en `select`) --
+    reg_fn!("watch", -1, watch_open);
+    reg_fn_interp!("watch_recv", -1, watch_recv);
+    reg_fn!("watch_stats", 1, watch_stats);
+    reg_fn!("watch_close", 1, watch_close);
 
     // -- bus de eventos (pub/sub in-process) --
     reg_fn!("bus_publish", 2, bus_publish);

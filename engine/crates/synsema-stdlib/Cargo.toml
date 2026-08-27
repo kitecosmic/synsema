@@ -144,6 +144,10 @@ native = [
 # de estáticos con extensión no pinneada). En otros SO el override del registro es no-op.
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+# Tree-kill de `proc_*` en Windows: Job Objects (CreateJobObject / AssignProcessToJobObject /
+# TerminateJobObject, KILL_ON_JOB_CLOSE). windows-sys YA está en el árbol (mio/tokio/etc.);
+# hacerlo directo no agrega crate ni C-ABI nuevo — son bindings de syscalls, no una lib C.
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 # Sólo Unix: `proc_kill(h, "TERM")` manda SIGTERM (kill(2)). libc ya está en el árbol
 # (transitivo de mio/tokio); hacerlo directo no agrega crate ni C-ABI nuevo.
