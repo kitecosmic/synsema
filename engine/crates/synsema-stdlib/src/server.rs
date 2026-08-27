@@ -1969,6 +1969,7 @@ pub const SERVE_ENV_VARS: &[&str] = &[
     "SYNSEMA_WS_MAX_MESSAGE",
     "SYNSEMA_WS_MAX_CONNS",
     "SYNSEMA_PROC_MAX",
+    "SYNSEMA_WATCH_MAX",
 ];
 
 /// Servidores (`run_async`) vivos en el proceso: con varios `serve on` en un programa,
