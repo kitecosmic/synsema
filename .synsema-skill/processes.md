@@ -142,7 +142,7 @@ proc_close(p)
 | `proc_close(h)` | releases the handle; **kills if still alive** (TERM, KILL after 2 s, then wait) — no orphans, idempotent |
 
 Events: `{type: "stdout"|"stderr", data: text}` (lossy UTF-8; `line_mode: false` gives raw
-`bytes` chunks of ≤ 64 KiB); `{type: "exit", data: {exit_code, signal}}` once, after the
+raw **text** chunks of ≤ 64 KiB — `data` is always text, UTF-8 lossy, never split inside a character); `{type: "exit", data: {exit_code, signal}}` once, after the
 pipes are drained (`exit_code` `-1` when killed by a signal; `signal` is `nothing` on a
 normal exit and always on Windows). Every event from `select`/`proc_recv` also carries
 `source: "proc"`, `handle` (and `name` when you passed a map).
@@ -184,7 +184,7 @@ while true
     otherwise when ev["type"] == "exit"
         stop
     otherwise
-        set screen to screen + ev["data"]             -- raw bytes, ANSI included
+        set screen to screen + ev["data"]             -- raw text chunks, ANSI included
         when contains(strip_ansi(screen), "[y/N]")   -- read it like a human
             proc_send(p, "y\r")                      -- keystrokes: Enter is \r on a tty
             set screen to ""
@@ -193,8 +193,9 @@ proc_close(p)
 
 What changes in pty mode (all consequences of "it is a terminal", not new API):
 - **One stream**: the tty doesn't separate stderr — everything arrives as `stdout`.
-- **Raw bytes with escape sequences**: `line_mode` defaults to `false` (chunks, never
-  split inside a UTF-8 character). Feed them to xterm.js as-is, or `strip_ansi(text)`
+- **Raw text with escape sequences**: `line_mode` defaults to `false` — `data` is still
+  **text** (not `bytes`): UTF-8 chunks, never split inside a character, invalid bytes →
+  U+FFFD. Send them to xterm.js as text frames as-is, or `strip_ansi(text)`
   to get what a human would see (colors, cursor moves, OSC titles removed; `\r`
   redraws keep the last frame). The runtime never interprets VT.
 - **Echo is on**: what you `proc_send` comes back in the output. A revealed secret you
