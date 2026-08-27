@@ -5,9 +5,14 @@
 //! a medida que sale**, mandar stdin en vivo y matar el proceso: eso es un proceso como
 //! handle con eventos (`{type: "stdout"|"stderr"|"exit", data}`).
 //!
-//! - **Sin PTY** (a propósito): son pipes. Un programa que detecta "no es una tty" se
-//!   comporta como en CI. La terminal interactiva es un problema de sidecar, no de
-//!   lenguaje; si aparece demanda entra como `pty: true` sin cambiar la API.
+//! - **Pipes por defecto**: un programa que detecta "no es una tty" se comporta como en
+//!   CI. Con `pty: true` el hijo corre dentro de un pseudo-terminal (openpty en Unix,
+//!   ConPTY en Windows, vía `portable-pty`): prompts y/n, contraseñas, menús con
+//!   flechas, TUIs (`vim`, `htop`, un CLI agéntico) y programas que exigen tty. MISMA
+//!   API y mismos eventos; diferencias honestas: un solo stream (`stdout`, la tty no
+//!   separa stderr), bytes crudos con secuencias ANSI (`line_mode: false` implícito),
+//!   eco activo (lo que mandás vuelve), y `proc_resize(h, cols, rows)`. El runtime NO
+//!   interpreta VT: eso es del consumidor (xterm.js, `strip_ansi()`).
 //! - **Un hilo lector por pipe** (stdout, stderr): es el único modo portable — los
 //!   pipes no entran en `mio` en Windows — y `run()` ya lo hace. Cada lector encola en
 //!   la cola del proceso y despierta al hub de I/O (`wake`); el hub (ws.rs) hace el
@@ -23,7 +28,10 @@
 
 use std::collections::VecDeque;
 use std::io::Read;
+use std::io::Write;
 use std::process::{Child, ChildStdin, Command, Stdio};
+
+use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -207,6 +215,12 @@ pub struct SpawnOpts {
     pub on_full: OnFull,
     pub line_mode: bool,
     pub merge_stderr: bool,
+    /// Pseudo-terminal en vez de pipes.
+    pub pty: bool,
+    pub cols: u16,
+    pub rows: u16,
+    /// `TERM` del hijo en modo pty (default `xterm-256color`; `env.TERM` gana).
+    pub term: Option<String>,
 }
 
 impl Default for SpawnOpts {
@@ -219,7 +233,84 @@ impl Default for SpawnOpts {
             on_full: OnFull::Block,
             line_mode: true,
             merge_stderr: false,
+            pty: false,
+            cols: 80,
+            rows: 24,
+            term: None,
         }
+    }
+}
+
+/// Transporte del hijo: pipes (`std::process`) o pseudo-terminal (`portable-pty`).
+enum Io {
+    Pipe {
+        child: Child,
+        stdin: Option<ChildStdin>,
+    },
+    Pty {
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        /// `None` tras `shutdown`: soltar el master es lo que desbloquea al lector
+        /// (EIO en Unix; en Windows el pipe de ConPTY no cierra hasta `ClosePseudoConsole`).
+        master: Option<Box<dyn MasterPty + Send>>,
+        /// Compartido con el lector: en Windows contesta el handshake de ConPTY.
+        writer: PtyWriter,
+    },
+}
+
+type PtyWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
+
+/// Handshake de ConPTY (Windows): al arrancar, la pseudo-consola emite `ESC[6n`
+/// (consulta de posición del cursor) y NO entrega ninguna salida del hijo hasta recibir
+/// la respuesta `ESC[row;colR`. Un terminal real contesta solo; un programa que lee la
+/// salida como datos no — y el hijo parecería mudo. El lector contesta ese primer
+/// `ESC[6n` y lo quita del stream (un xterm.js del otro lado no lo ve, así no contesta
+/// dos veces). Los `ESC[6n` posteriores son de la aplicación y pasan intactos.
+const CONPTY_DSR: &[u8] = b"\x1b[6n";
+const CONPTY_DSR_REPLY: &[u8] = b"\x1b[1;1R";
+
+/// Tope de bytes iniciales dentro de los que se busca el DSR; pasado eso, no es un
+/// ConPTY que haga handshake y todo sigue de largo.
+const CONPTY_HANDSHAKE_WINDOW: usize = 512;
+
+/// Devuelve `Some(salida)` cuando el handshake está resuelto (respondido y quitado, o
+/// descartado por no aparecer en la ventana); `None` mientras haga falta leer más bytes.
+/// El DSR no siempre es lo primero que emite ConPTY (a veces van antes los modos
+/// `ESC[?9001h` / `ESC[?1004h`), por eso se busca dentro de la ventana y no al inicio.
+fn conpty_handshake(buf: &[u8], writer: &PtyWriter) -> Option<Vec<u8>> {
+    if let Some(pos) = buf.windows(CONPTY_DSR.len()).position(|w| w == CONPTY_DSR) {
+        if let Ok(mut g) = writer.lock() {
+            if let Some(w) = g.as_mut() {
+                let _ = w.write_all(CONPTY_DSR_REPLY).and_then(|_| w.flush());
+            }
+        }
+        let mut out = buf[..pos].to_vec();
+        out.extend_from_slice(&buf[pos + CONPTY_DSR.len()..]);
+        return Some(out);
+    }
+    if buf.len() >= CONPTY_HANDSHAKE_WINDOW {
+        return Some(buf.to_vec());
+    }
+    None
+}
+
+/// Nombre de señal de `portable-pty` (strsignal) → número; `None` si no es una de las
+/// conocidas (el `exit_code` -1 ya dice "murió por señal").
+fn signal_number(name: &str) -> Option<i32> {
+    let n = name.to_ascii_lowercase();
+    if n.starts_with("hangup") {
+        Some(1)
+    } else if n.starts_with("interrupt") {
+        Some(2)
+    } else if n.starts_with("killed") {
+        Some(9)
+    } else if n.starts_with("terminated") {
+        Some(15)
+    } else if n.starts_with("segmentation") {
+        Some(11)
+    } else if n.starts_with("abort") {
+        Some(6)
+    } else {
+        n.strip_prefix("signal ").and_then(|d| d.trim().parse().ok())
     }
 }
 
@@ -234,8 +325,8 @@ pub enum ProcStatus {
 pub struct LiveProc {
     pub cmd: String,
     pub pid: u32,
-    child: Child,
-    stdin: Option<ChildStdin>,
+    io: Io,
+    pub pty: bool,
     pub shared: Arc<ProcShared>,
     pub status: ProcStatus,
     /// Exit ya entregado como evento (para no repetirlo).
@@ -251,6 +342,9 @@ pub struct LiveProc {
 impl LiveProc {
     /// Lanza el proceso con sus lectores. NO chequea capabilities (lo hace el builtin).
     pub fn spawn(cmd: &str, args: &[String], opts: SpawnOpts) -> Result<LiveProc, String> {
+        if opts.pty {
+            return Self::spawn_pty(cmd, args, opts);
+        }
         let mut c = Command::new(cmd);
         c.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         if let Some(dir) = &opts.cwd {
@@ -260,16 +354,7 @@ impl LiveProc {
             c.env(k, v);
         }
         let mut child = c.spawn().map_err(|e| format!("cannot start \"{}\": {}", cmd, e))?;
-        let shared = Arc::new(ProcShared {
-            queue: Mutex::new(Queue { events: VecDeque::new(), queued_bytes: 0, error: None, dropped: 0 }),
-            drained: Condvar::new(),
-            max_queue: opts.max_queue.clamp(1, MAX_QUEUE_CEILING),
-            max_queue_bytes: opts.max_queue_bytes.clamp(1, MAX_QUEUE_BYTES_CEILING),
-            on_full: opts.on_full,
-            readers_done: AtomicUsize::new(0),
-            closed: AtomicBool::new(false),
-            wake: Mutex::new(None),
-        });
+        let shared = Self::new_shared(&opts);
         let stdin = child.stdin.take();
         let out = child.stdout.take();
         let err = child.stderr.take();
@@ -296,8 +381,8 @@ impl LiveProc {
         Ok(LiveProc {
             cmd: cmd.to_string(),
             pid: child.id(),
-            child,
-            stdin,
+            io: Io::Pipe { child, stdin },
+            pty: false,
             shared,
             status: ProcStatus::Running,
             exit_emitted: false,
@@ -309,18 +394,118 @@ impl LiveProc {
         })
     }
 
-    /// Escribe a stdin (bloqueante: stdin de un hijo que no lee frena al escritor —
-    /// es la semántica honesta de un pipe; `proc_send` lo documenta).
-    pub fn send_stdin(&mut self, data: &[u8]) -> Result<(), String> {
-        use std::io::Write;
-        match self.stdin.as_mut() {
-            Some(si) => si.write_all(data).and_then(|_| si.flush()).map_err(|e| format!("stdin write failed: {}", e)),
-            None => Err("stdin is closed".to_string()),
+    fn new_shared(opts: &SpawnOpts) -> Arc<ProcShared> {
+        Arc::new(ProcShared {
+            queue: Mutex::new(Queue { events: VecDeque::new(), queued_bytes: 0, error: None, dropped: 0 }),
+            drained: Condvar::new(),
+            max_queue: opts.max_queue.clamp(1, MAX_QUEUE_CEILING),
+            max_queue_bytes: opts.max_queue_bytes.clamp(1, MAX_QUEUE_BYTES_CEILING),
+            on_full: opts.on_full,
+            readers_done: AtomicUsize::new(0),
+            closed: AtomicBool::new(false),
+            wake: Mutex::new(None),
+        })
+    }
+
+    /// Lanza el proceso dentro de un pseudo-terminal. Un único lector (el master); el
+    /// contador de lectores arranca en 1 porque no hay stderr aparte.
+    fn spawn_pty(cmd: &str, args: &[String], opts: SpawnOpts) -> Result<LiveProc, String> {
+        let size = PtySize { rows: opts.rows.max(1), cols: opts.cols.max(1), pixel_width: 0, pixel_height: 0 };
+        let pair = portable_pty::native_pty_system()
+            .openpty(size)
+            .map_err(|e| format!("cannot open a pseudo-terminal: {}", e))?;
+        let mut b = CommandBuilder::new(cmd);
+        b.args(args);
+        if let Some(dir) = &opts.cwd {
+            b.cwd(dir);
+        }
+        let mut has_term = false;
+        for (k, v) in &opts.env {
+            if k == "TERM" {
+                has_term = true;
+            }
+            b.env(k, v);
+        }
+        if !has_term {
+            b.env("TERM", opts.term.as_deref().unwrap_or("xterm-256color"));
+        }
+        let child = pair.slave.spawn_command(b).map_err(|e| format!("cannot start \"{}\" in a pty: {}", cmd, e))?;
+        // Soltar el lado esclavo: el único dueño pasa a ser el hijo (así el EOF/EIO del
+        // master llega cuando el hijo termina).
+        drop(pair.slave);
+        let master = pair.master;
+        let reader = master.try_clone_reader().map_err(|e| format!("cannot read the pty: {}", e))?;
+        let writer = master.take_writer().map_err(|e| format!("cannot write to the pty: {}", e))?;
+        let writer: PtyWriter = Arc::new(Mutex::new(Some(writer)));
+        let shared = Self::new_shared(&opts);
+        shared.readers_done.fetch_add(1, Ordering::AcqRel);
+        let sh = shared.clone();
+        let line_mode = opts.line_mode;
+        let handshake = if cfg!(windows) { Some(writer.clone()) } else { None };
+        std::thread::Builder::new()
+            .name("synsema-proc-pty".into())
+            .spawn(move || reader_loop(PtyReader { inner: reader, handshake, held: Vec::new() }, sh, line_mode, false))
+            .map_err(|e| format!("cannot start the pty reader: {}", e))?;
+        Ok(LiveProc {
+            cmd: cmd.to_string(),
+            pid: child.process_id().unwrap_or(0),
+            io: Io::Pty { child, master: Some(master), writer },
+            pty: true,
+            shared,
+            status: ProcStatus::Running,
+            exit_emitted: false,
+            exit_code: None,
+            exit_signal: None,
+            started_at: Instant::now(),
+            exited_at: None,
+            killed_by_us: false,
+        })
+    }
+
+    /// Cambia el tamaño del pseudo-terminal (SIGWINCH / ResizePseudoConsole).
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
+        match &self.io {
+            Io::Pty { master: Some(m), .. } => m
+                .resize(PtySize { rows: rows.max(1), cols: cols.max(1), pixel_width: 0, pixel_height: 0 })
+                .map_err(|e| format!("resize failed: {}", e)),
+            Io::Pty { master: None, .. } => Err("the pty is closed".to_string()),
+            Io::Pipe { .. } => Err("the process has no pty (spawn it with {pty: true})".to_string()),
         }
     }
 
-    pub fn close_stdin(&mut self) {
-        self.stdin = None;
+    /// Escribe a stdin (bloqueante: stdin de un hijo que no lee frena al escritor —
+    /// es la semántica honesta de un pipe; `proc_send` lo documenta).
+    pub fn send_stdin(&mut self, data: &[u8]) -> Result<(), String> {
+        let write = |w: &mut dyn Write| w.write_all(data).and_then(|_| w.flush()).map_err(|e| format!("stdin write failed: {}", e));
+        match &mut self.io {
+            Io::Pipe { stdin, .. } => match stdin.as_mut() {
+                Some(si) => write(si),
+                None => Err("stdin is closed".to_string()),
+            },
+            Io::Pty { writer, .. } => {
+                let mut g = writer.lock().map_err(|_| "pty writer poisoned".to_string())?;
+                match g.as_mut() {
+                    Some(w) => write(w.as_mut()),
+                    None => Err("stdin is closed".to_string()),
+                }
+            }
+        }
+    }
+
+    /// EOF al hijo. Un pty no tiene un stdin aparte que cerrar: el EOF es una tecla
+    /// (Ctrl-D en Unix, Ctrl-Z + Enter en Windows) y depende del modo de la tty, así
+    /// que se le pide al programa que la mande explícitamente.
+    pub fn close_stdin(&mut self) -> Result<(), String> {
+        match &mut self.io {
+            Io::Pipe { stdin, .. } => {
+                *stdin = None;
+                Ok(())
+            }
+            Io::Pty { .. } => Err(
+                "a pty has no separate stdin to close; send the EOF key yourself: proc_send(h, bytes([4])) is Ctrl-D on Unix, bytes([26, 13]) is Ctrl-Z + Enter on Windows"
+                    .to_string(),
+            ),
+        }
     }
 
     /// `try_wait` no bloqueante: si el hijo terminó, registra el exit. Devuelve true
@@ -329,13 +514,38 @@ impl LiveProc {
         if self.exit_code.is_some() {
             return true;
         }
-        match self.child.try_wait() {
-            Ok(Some(st)) => {
-                self.record_exit(st);
+        let polled: Result<Option<(i64, Option<i32>)>, ()> = match &mut self.io {
+            Io::Pipe { child, .. } => match child.try_wait() {
+                Ok(Some(st)) => {
+                    let code = st.code().map(|c| c as i64).unwrap_or(-1);
+                    #[allow(unused_mut)]
+                    let mut sig = None;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::ExitStatusExt;
+                        sig = st.signal();
+                    }
+                    Ok(Some((code, sig)))
+                }
+                Ok(None) => Ok(None),
+                Err(_) => Err(()),
+            },
+            Io::Pty { child, .. } => match child.try_wait() {
+                Ok(Some(st)) => match st.signal() {
+                    Some(name) => Ok(Some((-1, signal_number(name)))),
+                    None => Ok(Some((st.exit_code() as i64, None))),
+                },
+                Ok(None) => Ok(None),
+                Err(_) => Err(()),
+            },
+        };
+        match polled {
+            Ok(Some((code, sig))) => {
+                self.record_exit(code, sig);
                 true
             }
             Ok(None) => false,
-            Err(_) => {
+            Err(()) => {
                 self.exit_code = Some(-1);
                 self.exited_at = Some(Instant::now());
                 self.status = ProcStatus::Exited;
@@ -344,17 +554,23 @@ impl LiveProc {
         }
     }
 
-    fn record_exit(&mut self, st: std::process::ExitStatus) {
-        let code = st.code().map(|c| c as i64).unwrap_or(-1);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            self.exit_signal = st.signal();
-        }
+    fn record_exit(&mut self, code: i64, signal: Option<i32>) {
+        self.exit_signal = signal;
         self.exit_code = Some(code);
         self.exited_at = Some(Instant::now());
         self.status = if self.killed_by_us { ProcStatus::Killed } else { ProcStatus::Exited };
-        self.stdin = None;
+        self.drop_writer();
+    }
+
+    fn drop_writer(&mut self) {
+        match &mut self.io {
+            Io::Pipe { stdin, .. } => *stdin = None,
+            Io::Pty { writer, .. } => {
+                if let Ok(mut g) = writer.lock() {
+                    *g = None;
+                }
+            }
+        }
     }
 
     /// Mata al proceso. `graceful` = TERM en Unix (KILL si no); en Windows siempre
@@ -366,9 +582,18 @@ impl LiveProc {
         self.killed_by_us = true;
         #[cfg(unix)]
         {
-            if graceful {
-                // SIGTERM: el hijo puede limpiar. (`libc::kill` sobre un pid que ya
-                // cosechamos sería peligroso — por eso `poll_exit` va antes.)
+            // (`libc::kill` sobre un pid que ya cosechamos sería peligroso — por eso
+            // `poll_exit` va antes.)
+            if self.pty && self.pid > 0 {
+                // El hijo del pty es líder de sesión (setsid): matar el GRUPO entero
+                // (pgid = pid) para no dejar nietos huérfanos colgados de la tty.
+                let sig = if graceful { libc::SIGTERM } else { libc::SIGKILL };
+                let r = unsafe { libc::kill(-(self.pid as libc::pid_t), sig) };
+                if r == 0 {
+                    return Ok(());
+                }
+            } else if graceful {
+                // SIGTERM: el hijo puede limpiar.
                 let r = unsafe { libc::kill(self.pid as libc::pid_t, libc::SIGTERM) };
                 if r == 0 {
                     return Ok(());
@@ -376,7 +601,10 @@ impl LiveProc {
             }
         }
         let _ = graceful;
-        self.child.kill().map_err(|e| format!("kill failed: {}", e))
+        match &mut self.io {
+            Io::Pipe { child, .. } => child.kill().map_err(|e| format!("kill failed: {}", e)),
+            Io::Pty { child, .. } => child.kill().map_err(|e| format!("kill failed: {}", e)),
+        }
     }
 
     /// Espera bloqueante (acotada) a que termine. Devuelve true si terminó.
@@ -401,20 +629,81 @@ impl LiveProc {
             let _ = self.kill(true);
             if !self.wait_timeout(Duration::from_secs(2), &|| false) {
                 let _ = self.kill(false);
-                let _ = self.child.wait();
+                match &mut self.io {
+                    Io::Pipe { child, .. } => {
+                        let _ = child.wait();
+                    }
+                    Io::Pty { child, .. } => {
+                        let _ = child.wait();
+                    }
+                }
                 if self.exit_code.is_none() {
                     self.exit_code = Some(-1);
                     self.status = ProcStatus::Killed;
                 }
             }
         }
-        self.stdin = None;
+        self.drop_writer();
+        if let Io::Pty { master, .. } = &mut self.io {
+            // Cerrar el master libera al hilo lector (ver `Io::Pty`).
+            *master = None;
+        }
     }
 }
 
 impl Drop for LiveProc {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+/// Lector del master con el handshake de ConPTY por delante (no-op fuera de Windows).
+struct PtyReader {
+    inner: Box<dyn Read + Send>,
+    handshake: Option<PtyWriter>,
+    held: Vec<u8>,
+}
+
+impl Read for PtyReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if !self.held.is_empty() {
+            let k = self.held.len().min(out.len());
+            out[..k].copy_from_slice(&self.held[..k]);
+            self.held.drain(..k);
+            return Ok(k);
+        }
+        let Some(writer) = self.handshake.clone() else {
+            return self.inner.read(out);
+        };
+        loop {
+            let mut tmp = vec![0u8; out.len().max(64)];
+            let n = self.inner.read(&mut tmp)?;
+            if n == 0 {
+                // EOF sin handshake: entregar lo retenido antes de cerrar.
+                self.handshake = None;
+                if self.held.is_empty() {
+                    return Ok(0);
+                }
+                let k = self.held.len().min(out.len());
+                out[..k].copy_from_slice(&self.held[..k]);
+                self.held.drain(..k);
+                return Ok(k);
+            }
+            self.held.extend_from_slice(&tmp[..n]);
+            if let Some(rest) = conpty_handshake(&self.held, &writer) {
+                self.handshake = None;
+                self.held = rest;
+                if self.held.is_empty() {
+                    // Resuelto y sin resto: de acá en más lectura directa.
+                    return self.inner.read(out);
+                }
+                let k = self.held.len().min(out.len());
+                out[..k].copy_from_slice(&self.held[..k]);
+                self.held.drain(..k);
+                // Lo que no entró lo devuelve la próxima lectura (handshake ya None).
+                return Ok(k);
+            }
+        }
     }
 }
 
@@ -433,8 +722,15 @@ fn reader_loop<R: Read>(mut r: R, shared: Arc<ProcShared>, line_mode: bool, is_s
             Err(_) => break,
         };
         if !line_mode {
-            if !shared.push(mk(buf[..n].to_vec())) {
-                break;
+            // Modo crudo: chunks tal cual, pero sin partir un carácter UTF-8 entre dos
+            // chunks (una tty escupe secuencias multibyte a mitad de `read`).
+            pending.extend_from_slice(&buf[..n]);
+            let cut = utf8_cut(&pending);
+            if cut > 0 {
+                let chunk: Vec<u8> = pending.drain(..cut).collect();
+                if !shared.push(mk(chunk)) {
+                    break;
+                }
             }
             continue;
         }
@@ -464,13 +760,39 @@ fn reader_loop<R: Read>(mut r: R, shared: Arc<ProcShared>, line_mode: bool, is_s
             }
         }
     }
-    if line_mode && !pending.is_empty() && !shared.closed.load(Ordering::Relaxed) {
+    if !pending.is_empty() && !shared.closed.load(Ordering::Relaxed) {
         let mut line = std::mem::take(&mut pending);
-        if line.last() == Some(&b'\r') {
+        if line_mode && line.last() == Some(&b'\r') {
             line.pop();
         }
         let _ = shared.push(mk(line));
     }
     shared.readers_done.fetch_add(1, Ordering::AcqRel);
     shared.wake_now();
+}
+
+/// Longitud del prefijo de `b` que termina en un límite de carácter UTF-8 (retiene a lo
+/// sumo los 3 bytes finales de una secuencia incompleta). Bytes inválidos no se retienen.
+fn utf8_cut(b: &[u8]) -> usize {
+    let n = b.len();
+    let start = n.saturating_sub(3);
+    let mut i = n;
+    while i > start {
+        let c = b[i - 1];
+        if c & 0xC0 != 0x80 {
+            // Byte inicial: ¿cuántos bytes debería tener la secuencia?
+            let need = if c >= 0xF0 {
+                4
+            } else if c >= 0xE0 {
+                3
+            } else if c >= 0xC0 {
+                2
+            } else {
+                1
+            };
+            return if n - (i - 1) < need { i - 1 } else { n };
+        }
+        i -= 1;
+    }
+    n
 }

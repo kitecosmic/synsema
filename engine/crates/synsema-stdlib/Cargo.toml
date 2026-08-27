@@ -77,6 +77,10 @@ aes.workspace = true
 ctr.workspace = true
 curve25519-dalek.workspace = true
 tungstenite = { workspace = true, optional = true }
+# Tanda pty (`proc_spawn(..., {pty: true})`): pseudo-terminal cross-platform — openpty en
+# Unix, ConPTY en Windows (>= 10 1809). Es la crate de WezTerm; sin C-ABI nuevo (libc /
+# winapi ya están en el árbol). Sólo la abre `proc.rs`; el runtime NO interpreta VT.
+portable-pty = { version = "0.9", optional = true }
 # Batch 15 (WebSocket de primera clase): poller de readiness cross-platform
 # (epoll/kqueue/IOCP) para el multiplexado no-bloqueante de ws_select. YA está en el
 # árbol (v1.2.1, transitivo de tokio/hyper) — hacerlo directo NO agrega crate ni C-ABI
@@ -133,6 +137,7 @@ native = [
     "dep:bytes",
     "dep:tokio-rustls",
     "dep:tungstenite",
+    "dep:portable-pty",
 ]
 
 # Sólo Windows: leer HKCR para replicar mimetypes.read_windows_registry (content-type

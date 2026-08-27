@@ -1002,6 +1002,10 @@ impl Interpreter {
         self.register("starts_with", 2, Rc::new(|i, a, l| i.b_starts_with(a, l)));
         self.register("ends_with", 2, Rc::new(|i, a, l| i.b_ends_with(a, l)));
         self.register("replace_text", 3, Rc::new(|i, a, l| i.b_replace_text(a, l)));
+        // strip_ansi: texto plano a partir de la salida de una terminal (secuencias
+        // ESC CSI/OSC/simples y \r de retorno de carro fuera). Puro; para leer la
+        // salida de `proc_spawn(..., {pty: true})` como un humano.
+        self.register("strip_ansi", 1, Rc::new(|i, a, l| i.b_strip_ansi(a, l)));
         // Entrada de stdin (CLI): lee una línea; `nothing` en EOF. Funciona con pipe.
         self.register("read_line", -1, Rc::new(|i, a, l| i.b_read_line(a, l)));
         // Vuelca la salida pendiente a stdout en vivo (REPLs/loops largos). Ver b_flush.
@@ -3627,6 +3631,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let to = raw_str(nth(args, 2)?);
         Ok(syn_text(s.replace(&from, &to)))
     }
+    fn b_strip_ansi(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        Ok(syn_text(strip_ansi(&raw_str(nth(args, 0)?))))
+    }
 
     // -- Regex --
 
@@ -5538,5 +5545,111 @@ mod decimal_tests {
         assert_eq!(line("print(text(contains([1.5d], 1.5)))"), "false");
         assert_eq!(line("print(text(contains([1.5d], 1.5d)))"), "true");
         assert_eq!(line("print(text(contains([1.5], 1.5d)))"), "false");
+    }
+}
+
+/// Quita las secuencias de escape de terminal (ECMA-48): CSI (`ESC [ ... final`), OSC
+/// (`ESC ] ... BEL | ESC \\`), DCS/PM/APC (`ESC P/^/_ ... ESC \\`), escapes de dos
+/// bytes (`ESC x`) y los C0 de control salvo `\n`/`\t`. Un `\r` seguido de texto en
+/// la misma línea (barra de progreso que se redibuja) conserva sólo el último redibujo.
+pub fn strip_ansi(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut line_start = 0usize;
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if c == 0x1B {
+            i += 1;
+            match b.get(i) {
+                Some(b'[') => {
+                    // CSI: parámetros 0x30-0x3F, intermedios 0x20-0x2F, final 0x40-0x7E.
+                    i += 1;
+                    while i < b.len() && (0x20..=0x3F).contains(&b[i]) {
+                        i += 1;
+                    }
+                    if i < b.len() {
+                        i += 1;
+                    }
+                }
+                Some(b']') | Some(b'P') | Some(b'^') | Some(b'_') | Some(b'X') => {
+                    // Cadena terminada por BEL o ST (ESC \).
+                    i += 1;
+                    while i < b.len() {
+                        if b[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if b[i] == 0x1B && b.get(i + 1) == Some(&b'\\') {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                Some(&x) if (0x20..=0x2F).contains(&x) => {
+                    // nF: intermedios 0x20-0x2F y un final (p. ej. `ESC ( B`, charset).
+                    while i < b.len() && (0x20..=0x2F).contains(&b[i]) {
+                        i += 1;
+                    }
+                    if i < b.len() {
+                        i += 1;
+                    }
+                }
+                Some(_) => i += 1,
+                None => {}
+            }
+            continue;
+        }
+        if c == b'\r' {
+            // Retorno de carro: si viene texto después en la misma línea, descarta lo
+            // ya escrito desde el inicio de la línea (redibujo).
+            let next = b.get(i + 1);
+            if matches!(next, Some(b'\n')) || next.is_none() {
+                i += 1;
+                continue;
+            }
+            out.truncate(line_start);
+            i += 1;
+            continue;
+        }
+        if c == b'\n' {
+            out.push(c);
+            line_start = out.len();
+            i += 1;
+            continue;
+        }
+        if c < 0x20 && c != b'\t' {
+            i += 1;
+            continue;
+        }
+        if c == 0x7F {
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+#[cfg(test)]
+mod strip_ansi_tests {
+    use super::strip_ansi;
+
+    #[test]
+    fn removes_csi_osc_and_controls() {
+        assert_eq!(strip_ansi("\x1b[1;32mok\x1b[0m done"), "ok done");
+        assert_eq!(strip_ansi("\x1b]0;title\x07x\x1b]2;t\x1b\\y"), "xy");
+        assert_eq!(strip_ansi("a\x1b[2J\x1b[H\x1b[?25lb\x1b(B"), "ab");
+        assert_eq!(strip_ansi("tab\tkeep\nline"), "tab\tkeep\nline");
+        assert_eq!(strip_ansi("bell\x07\x08x"), "bellx");
+    }
+
+    #[test]
+    fn carriage_return_keeps_the_last_redraw() {
+        assert_eq!(strip_ansi("10%\r50%\r100%\r\nend"), "100%\nend");
+        assert_eq!(strip_ansi("line\r\n"), "line\n");
+        assert_eq!(strip_ansi("ñandú \x1b[31mé\x1b[0m"), "ñandú é");
     }
 }

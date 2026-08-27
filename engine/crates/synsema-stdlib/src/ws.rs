@@ -1161,6 +1161,11 @@ impl WsRegistry {
                 if !p.shared.readers_done() {
                     soonest = soonest.min((at + PROC_READER_GRACE).saturating_duration_since(now).max(Duration::from_millis(20)));
                 }
+            } else if p.pty && p.status == ProcStatus::Running {
+                // Pty: el EOF del master no es puntual (ConPTY cierra su pipe tarde o
+                // nunca hasta ClosePseudoConsole), así que el exit no despierta a
+                // nadie por sí solo → try_wait barato cada 50 ms sólo mientras corre.
+                soonest = soonest.min(Duration::from_millis(50));
             }
         }
         for c in self.conns.values() {
@@ -2358,6 +2363,30 @@ fn proc_spawn(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
                 _ => return Err(err(format!("{}: stderr must be \"separate\" or \"merge\"", F))),
             };
         }
+        // Pseudo-terminal: mismos eventos, un solo stream y bytes crudos (ANSI incluido).
+        match m.get("pty") {
+            None | Some(SynValue::Nothing) | Some(SynValue::Bool(false)) => {}
+            Some(SynValue::Bool(true)) => {
+                opts.pty = true;
+                if !matches!(m.get("line_mode"), Some(SynValue::Bool(true))) {
+                    opts.line_mode = false;
+                }
+                opts.merge_stderr = true;
+            }
+            Some(other) => return Err(err(format!("{}: pty must be a boolean, got {}", F, other.type_name()))),
+        }
+        if let Some(n) = opt_usize(&m, "cols", F)? {
+            opts.cols = n.min(u16::MAX as usize) as u16;
+        }
+        if let Some(n) = opt_usize(&m, "rows", F)? {
+            opts.rows = n.min(u16::MAX as usize) as u16;
+        }
+        if let Some(SynValue::Text(t)) = m.get("term") {
+            opts.term = Some(t.to_string());
+        }
+        if !opts.pty && (m.contains_key("cols") || m.contains_key("rows") || m.contains_key("term")) {
+            return Err(err(format!("{}: cols/rows/term only apply with pty: true", F)));
+        }
     }
     let live = LiveProc::spawn(&cmd, &arg_list, opts).map_err(|e| err(format!("{}: {}", F, e)))?;
     let mut r = reg.borrow_mut();
@@ -2393,8 +2422,32 @@ fn proc_close_stdin(args: &[SynValue], reg: &Registry) -> Result<SynValue, Contr
     const F: &str = "proc_close_stdin";
     let h = proc_handle(reg, args.first(), F)?;
     if let Some(p) = reg.borrow_mut().procs.get_mut(&h) {
-        p.close_stdin();
+        p.close_stdin().map_err(|e| err(format!("{}: {}", F, e)))?;
     }
+    Ok(syn_bool(true))
+}
+
+fn proc_resize(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "proc_resize";
+    let h = proc_handle(reg, args.first(), F)?;
+    let dim = |v: Option<&SynValue>, name: &str| -> Result<u16, Control> {
+        match v {
+            Some(SynValue::Number(n)) => {
+                let f = n.to_f64();
+                if !f.is_finite() || f < 1.0 || f > u16::MAX as f64 {
+                    return Err(err(format!("{}: {} must be a positive number (1..65535)", F, name)));
+                }
+                Ok(f as u16)
+            }
+            Some(other) => Err(err(format!("{}: {} must be a number, got {}", F, name, other.type_name()))),
+            None => Err(err(format!("{}: missing {}", F, name))),
+        }
+    };
+    let cols = dim(args.get(1), "cols")?;
+    let rows = dim(args.get(2), "rows")?;
+    let mut r = reg.borrow_mut();
+    let p = r.procs.get_mut(&h).ok_or_else(|| err(format!("{}: unknown process handle {}", F, h)))?;
+    p.resize(cols, rows).map_err(|e| err(format!("{}: {}", F, e)))?;
     Ok(syn_bool(true))
 }
 
@@ -2498,6 +2551,7 @@ fn proc_stats(_interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> R
         }),
     );
     m.insert("exit_code".to_string(), p.exit_code.map(syn_int).unwrap_or(SynValue::Nothing));
+    m.insert("pty".to_string(), syn_bool(p.pty));
     m.insert("queued".to_string(), syn_int(queued as i64));
     m.insert("queued_bytes".to_string(), syn_int(queued_bytes as i64));
     m.insert("dropped".to_string(), syn_int(dropped as i64));
@@ -2716,6 +2770,7 @@ pub fn register_ws_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet
     reg_fn!("proc_spawn", -1, proc_spawn);
     reg_fn!("proc_send", 2, proc_send);
     reg_fn!("proc_close_stdin", 1, proc_close_stdin);
+    reg_fn!("proc_resize", 3, proc_resize);
     reg_fn_interp!("proc_recv", -1, proc_recv);
     reg_fn_interp!("proc_select", -1, proc_select);
     reg_fn_interp!("proc_status", 1, proc_status);

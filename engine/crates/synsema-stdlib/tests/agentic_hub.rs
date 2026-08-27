@@ -286,6 +286,157 @@ fn proc_denied_without_exec_capability() {
 }
 
 // =========================================================
+// Pseudo-terminal (`pty: true`)
+// =========================================================
+
+fn pty_opts(extra: &[(&str, SynValue)]) -> SynValue {
+    let mut m = indexmap::IndexMap::new();
+    m.insert("pty".to_string(), SynValue::Bool(true));
+    for (k, v) in extra {
+        m.insert(k.to_string(), v.clone());
+    }
+    syn_map(m)
+}
+
+/// Salida plana (sin ANSI) de todos los eventos stdout.
+fn plain_stdout(i: &mut Interpreter, evs: &[SynValue]) -> String {
+    let raw: String = evs
+        .iter()
+        .filter(|e| text(&get(e, "type")) == "stdout")
+        .map(|e| text(&get(e, "data")))
+        .collect::<Vec<_>>()
+        .join("");
+    text(&ok(call(i, "strip_ansi", vec![syn_text(raw)])))
+}
+
+#[test]
+fn pty_child_sees_a_terminal_and_output_is_one_stream() {
+    let _g = serial();
+    let mut i = interp();
+    // Unix: `-t 0` es la prueba canónica. Windows: bajo ConPTY `cmd` imprime igual;
+    // lo que se verifica ahí es que la salida llega, con exit real y `pty: true`.
+    let (cmd, args) = script(
+        "if [ -t 0 ] && [ -t 1 ]; then echo TTY_YES; else echo TTY_NO; fi; echo err_line >&2; exit 4",
+        "echo TTY_YES& (echo err_line)1>&2& exit /b 4",
+    );
+    let h = int(&ok(call(&mut i, "proc_spawn", vec![cmd, args, pty_opts(&[])])));
+    let st = ok(call(&mut i, "proc_stats", vec![syn_int(h)]));
+    assert!(matches!(get(&st, "pty"), SynValue::Bool(true)));
+    let evs = drain(&mut i, h);
+    let out = plain_stdout(&mut i, &evs);
+    assert!(out.contains("TTY_YES"), "el hijo ve una tty: {:?}", out);
+    // Un solo stream: stderr viaja por la tty como stdout.
+    assert!(out.contains("err_line"), "stderr llega por el mismo stream: {:?}", out);
+    assert!(evs.iter().all(|e| text(&get(e, "type")) != "stderr"), "no hay eventos stderr en modo pty");
+    let exit = evs.last().unwrap();
+    assert_eq!(text(&get(exit, "type")), "exit");
+    assert_eq!(int(&get(&get(exit, "data"), "exit_code")), 4, "exit code real");
+    ok(call(&mut i, "proc_close", vec![syn_int(h)]));
+}
+
+#[test]
+fn pty_answers_an_interactive_prompt() {
+    let _g = serial();
+    let mut i = interp();
+    let (cmd, args) = if cfg!(windows) {
+        (
+            syn_text("cmd"),
+            list(vec![syn_text("/V:ON"), syn_text("/C"), syn_text("set /p a=continue? [y/N] && echo got:!a!")]),
+        )
+    } else {
+        script("printf 'continue? [y/N] '; read a; echo \"got:$a\"", "")
+    };
+    let h = int(&ok(call(&mut i, "proc_spawn", vec![cmd, args, pty_opts(&[])])));
+    // Esperar el prompt (bytes crudos, puede venir en varios chunks).
+    let mut seen = String::new();
+    for _ in 0..50 {
+        let ev = ok(call(&mut i, "proc_recv", vec![syn_int(h), num(5.0)]));
+        if matches!(ev, SynValue::Nothing) {
+            break;
+        }
+        if text(&get(&ev, "type")) == "stdout" {
+            seen.push_str(&text(&get(&ev, "data")));
+        }
+        if seen.contains("[y/N]") {
+            break;
+        }
+    }
+    assert!(seen.contains("[y/N]"), "prompt visto: {:?}", seen);
+    ok(call(&mut i, "proc_send", vec![syn_int(h), syn_text("y\r")]));
+    let evs = drain(&mut i, h);
+    let out = plain_stdout(&mut i, &evs);
+    assert!(out.contains("got:y"), "la respuesta llegó al programa: {:?}", out);
+    assert_eq!(text(&get(evs.last().unwrap(), "type")), "exit");
+    ok(call(&mut i, "proc_close", vec![syn_int(h)]));
+}
+
+#[test]
+fn pty_resize_and_pipe_rejects_it() {
+    let _g = serial();
+    let mut i = interp();
+    let (cmd, args) = script("sleep 5", "ping -n 6 127.0.0.1 > nul");
+    let h = int(&ok(call(
+        &mut i,
+        "proc_spawn",
+        vec![cmd.clone(), args.clone(), pty_opts(&[("cols", num(120.0)), ("rows", num(40.0))])],
+    )));
+    ok(call(&mut i, "proc_resize", vec![syn_int(h), num(200.0), num(50.0)]));
+    let e = err_msg(call(&mut i, "proc_resize", vec![syn_int(h), num(0.0), num(50.0)]));
+    assert!(e.contains("cols"), "{}", e);
+    // Un pty no tiene stdin aparte que cerrar: error claro, no silencio.
+    let e = err_msg(call(&mut i, "proc_close_stdin", vec![syn_int(h)]));
+    assert!(e.contains("EOF key"), "{}", e);
+    ok(call(&mut i, "proc_close", vec![syn_int(h)]));
+
+    let h2 = int(&ok(call(&mut i, "proc_spawn", vec![cmd.clone(), args.clone()])));
+    let e = err_msg(call(&mut i, "proc_resize", vec![syn_int(h2), num(80.0), num(24.0)]));
+    assert!(e.contains("pty: true"), "{}", e);
+    ok(call(&mut i, "proc_close", vec![syn_int(h2)]));
+
+    // cols/rows sin pty: error de uso.
+    let mut m = indexmap::IndexMap::new();
+    m.insert("cols".to_string(), num(80.0));
+    let e = err_msg(call(&mut i, "proc_spawn", vec![cmd, args, syn_map(m)]));
+    assert!(e.contains("only apply with pty"), "{}", e);
+}
+
+#[test]
+fn pty_kill_and_close_terminate_the_session() {
+    let _g = serial();
+    let mut i = interp();
+    let (cmd, args) = script("sleep 30", "ping -n 31 127.0.0.1 > nul");
+    let h = int(&ok(call(&mut i, "proc_spawn", vec![cmd.clone(), args.clone(), pty_opts(&[])])));
+    assert_eq!(text(&ok(call(&mut i, "proc_status", vec![syn_int(h)]))), "running");
+    let t0 = Instant::now();
+    ok(call(&mut i, "proc_kill", vec![syn_int(h)]));
+    let exit = ok(call(&mut i, "proc_wait", vec![syn_int(h), num(5.0)]));
+    assert!(!matches!(exit, SynValue::Nothing), "proc_wait devolvió el exit tras kill");
+    assert!(t0.elapsed() < Duration::from_secs(5), "kill fue rápido");
+    assert_eq!(text(&ok(call(&mut i, "proc_status", vec![syn_int(h)]))), "killed");
+    let evs = drain(&mut i, h);
+    assert_eq!(evs.iter().filter(|e| text(&get(e, "type")) == "exit").count(), 1, "{:?}", evs.len());
+    ok(call(&mut i, "proc_close", vec![syn_int(h)]));
+
+    let h2 = int(&ok(call(&mut i, "proc_spawn", vec![cmd, args, pty_opts(&[])])));
+    let t1 = Instant::now();
+    ok(call(&mut i, "proc_close", vec![syn_int(h2)]));
+    assert!(t1.elapsed() < Duration::from_secs(5), "close mató y cosechó");
+    assert_eq!(text(&ok(call(&mut i, "proc_status", vec![syn_int(h2)]))), "closed");
+}
+
+#[test]
+fn pty_needs_the_same_exec_capability() {
+    let _g = serial();
+    let interp = Interpreter::new();
+    let caps = Rc::new(RefCell::new(CapabilitySet::new("test")));
+    register_ws_builtins(&interp, caps);
+    let mut i = interp;
+    let (cmd, args) = script("echo x", "echo x");
+    let e = err_msg(call(&mut i, "proc_spawn", vec![cmd, args, pty_opts(&[])]));
+    assert!(e.contains("exec"), "deny-by-default, mismo gate: {}", e);
+}
+
+// =========================================================
 // Bus + select
 // =========================================================
 

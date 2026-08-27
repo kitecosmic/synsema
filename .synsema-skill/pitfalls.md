@@ -215,6 +215,10 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | A `proc_spawn` child outlives the request / program | It is killed when its interpreter ends (TERM, KILL after 2 s) | For work that must survive, use `cron_after` or an agent |
 | `proc_send` returns immediately | It is a blocking pipe write — a child that never reads stdin blocks you | Send what it reads; `proc_close_stdin` for EOF |
 | `proc_recv` gives me a prompt without a newline | `line_mode` delivers per line; a partial line arrives at exit/EOF | `{"line_mode": false}` for raw chunks (bytes) |
+| The child skips its `y/N` question, hangs, or says "not a terminal" (`ssh`, `sudo`, `npm`, `inquirer` menus, `vim`, an agentic CLI) | Pipes are not a tty; the program decided before you could answer | `proc_spawn(cmd, args, {"pty": true})` (v0.6.8+); try `--yes` / `CI=1` first |
+| Under `pty: true` my `proc_send("y\n")` is ignored | A tty wants keystrokes: Enter is `\r`; the prompt text also arrives with ANSI noise | `proc_send(h, "y\r")`; read with `strip_ansi(...)`; Ctrl-C = `bytes([3])`, Ctrl-D = `bytes([4])` |
+| `proc_close_stdin` errors on a pty / stderr events never come | A pty has one stream and no separate stdin | Send the EOF key; stderr arrives as `stdout` |
+| `proc_resize` errors | Only a pty has a size | Spawn with `pty: true` (`cols`/`rows` there too) |
 | `bus_publish("agent.*", x)` broadcasts | Error: a published topic is literal — globs are for `bus_subscribe` | Publish `"agent.done"`; subscribe to `"agent.*"` |
 | `bus_publish(topic, my_task)` | Error: tasks/secrets don't cross the bus (data only) | Publish text/number/bool/list/map/bytes |
 | A slow subscriber stalls the publisher | Default `on_full` is `drop_oldest` (bounded queue); the publisher never blocks | Read faster / raise `max_queue`; `"error"` if losing events must be loud |

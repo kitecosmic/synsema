@@ -54,6 +54,7 @@ not errors and pass through `try/recover` untouched.
 - `starts_with(text, prefix)` → bool
 - `ends_with(text, suffix)` → bool
 - `replace_text(text, old, new)` → text with literal replacements
+- `strip_ansi(text)` → plain text out of terminal output: CSI/OSC/charset escapes and control bytes removed (`\n`/`\t` kept), `\r` redraws keep the last frame (`"10%\r100%\r\n"` → `"100%\n"`). Pure; pairs with `proc_spawn(..., {pty: true})` (processes.md)
 
 ## Regex (pure — no capability)
 - `matches(text, pattern)` → bool — **full match**: true only if the *whole* text matches. Built for validation, so an unanchored pattern is already safe (`matches("12345", "[0-9]+")` → true, `matches("a 5 b", "[0-9]+")` → false). For "does the pattern appear somewhere", use `find_all`/`capture`.
@@ -378,10 +379,11 @@ One wait for everything (no capability; handles from `ws_connect`, a `socket` ro
 - `select(targets, timeout?)` → first ready event tagged `source` (`"ws"`/`"proc"`/`"bus"`), `handle`, `name` (map form); `nothing` at timeout / all gone. `targets` = list of handles or map name → handle. See [concurrency.md](concurrency.md).
 
 Live processes (gated by `exec(cmd)` like `run`; see [processes.md](processes.md)):
-- `proc_spawn(cmd, args?, opts?)` → handle. `opts`: `cwd`, `env`, `line_mode` (true), `stderr` (`"separate"`|`"merge"`), `max_queue` (4096), `max_queue_bytes` (64 MiB), `on_full` (`"block"`|`"drop_oldest"`|`"error"`)
+- `proc_spawn(cmd, args?, opts?)` → handle. `opts`: `cwd`, `env`, `line_mode` (true), `stderr` (`"separate"`|`"merge"`), `max_queue` (4096), `max_queue_bytes` (64 MiB), `on_full` (`"block"`|`"drop_oldest"`|`"error"`), **`pty`** (false; v0.6.8+ — real pseudo-terminal for y/N prompts, passwords, TUIs; then one `stdout` stream, raw ANSI bytes, `line_mode` false, echo on), `cols` (80), `rows` (24), `term` (`"xterm-256color"`) — the last three only with `pty: true`
+- `proc_resize(h, cols, rows)` → true (pty only, v0.6.8+); `strip_ansi(text)` (Text section) to read pty output as a human
 - `proc_recv(h, timeout?)` → `{type: "stdout"|"stderr"|"exit", data}` or `nothing`; `proc_select(list|map, timeout?)`
-- `proc_send(h, text|bytes)` → true (blocking write); `proc_close_stdin(h)`
-- `proc_status(h)` → `"running"|"exited"|"killed"|"closed"`; `proc_stats(h)` → `{pid, cmd, status, exit_code, queued, queued_bytes, dropped, uptime}`
+- `proc_send(h, text|bytes)` → true (blocking write; on a pty these are keystrokes: Enter = `"\r"`, Ctrl-C = `bytes([3])`); `proc_close_stdin(h)` (pipes only — on a pty it errors and names the EOF key)
+- `proc_status(h)` → `"running"|"exited"|"killed"|"closed"`; `proc_stats(h)` → `{pid, cmd, status, exit_code, pty, queued, queued_bytes, dropped, uptime}`
 - `proc_kill(h, "TERM"|"KILL"?)`; `proc_wait(h, timeout?)` → `{exit_code, signal}` or `nothing`; `proc_close(h)` (kills if alive; no orphans)
 
 Event bus — one per program, in-process fan-out, no capability (see [agents.md](agents.md)):

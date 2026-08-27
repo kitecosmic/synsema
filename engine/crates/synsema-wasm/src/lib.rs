@@ -696,8 +696,8 @@ pub fn register_unavailable_stubs(interp: &Interpreter) {
     // Hub de I/O (select unificado + procesos vivos + bus): necesita hilos/pipes/un
     // proceso — un intérprete embebido no los tiene.
     const PROC: &[&str] = &[
-        "select", "proc_spawn", "proc_send", "proc_close_stdin", "proc_recv", "proc_select",
-        "proc_status", "proc_kill", "proc_wait", "proc_close", "proc_stats",
+        "select", "proc_spawn", "proc_send", "proc_close_stdin", "proc_resize", "proc_recv",
+        "proc_select", "proc_status", "proc_kill", "proc_wait", "proc_close", "proc_stats",
     ];
     const BUS: &[&str] = &["bus_publish", "bus_subscribe", "bus_recv", "bus_unsubscribe", "bus_topics"];
     const AGENTS: &[&str] = &["agents", "agent_stop"];
