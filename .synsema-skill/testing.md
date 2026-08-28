@@ -53,6 +53,11 @@ Exit code: **0** if all pass, **1** if any fail, **2** on usage/file error.
 run them). They run **only** under `synsema test`. So an `assert(false)` inside a `test` block
 does not fail a normal `run`.
 
+## Agents inside tests (engine v0.6.10+)
+`spawn` inside a `test` block starts a real agent thread (same swarm as `run`); `wait_for`,
+`observe`, `agents()` work. At the end of the block the runner joins its agents — an agent that
+ended in `ERROR` fails that test, the next block starts clean. See [agents.md](agents.md).
+
 ## Note
 `synsema check` is still parse-only (it does not run tests or do semantic checks). Use
 `synsema test` to actually execute assertions.

@@ -26,10 +26,23 @@ spawn Researcher with query = "AI safety"
   your top-level tasks directly, no HTTP needed. But it's a copy: mutating a value inside the
   agent does NOT affect the parent or other agents. Share state via the blackboard. (Secrets are
   redacted when they cross into an agent.)
+- **What the agent does NOT see**: tasks defined inside imported modules (only the entry
+  program's top-level bindings are snapshotted — re-export what the agent needs as a top-level
+  task), and a task passed as a `spawn` argument arrives as **text** (closures do not cross
+  threads — pass data, or the name of a top-level task and call it inside). Each agent is a
+  fresh interpreter with its own capability set: it needs its **own `require`** lines in its
+  body (bounded by the host ceiling), the parent's grants are not inherited.
 - **Agent `log`/`print` appears in the main process stdout**, prefixed `[AgentName]` — agents are
   not silent during development.
 
-**Agent lifecycle & isolation (`run`, `conform --swarm`, `serve` all use real threads).** An agent
+**Testing agents.** `synsema test` wires the same real swarm as `run` (engine v0.6.10+): inside a
+`test` block `spawn` runs the agent in its own thread, `agents()`/`agent_stop` exist, blackboard
+and signals work. When the block's body ends the runner **joins** that block's agents; an agent
+that finished in `ERROR` fails **that** test (message `Agent error [<id>]: …`), and the next
+block starts clean. On engines ≤ 0.6.9 `test` had no swarm (`spawn` ran the body in-process and
+blocking; `agents()` did not exist) — that is why older projects test agents from `synsema run`.
+
+**Agent lifecycle & isolation (`run`, `conform --swarm`, `serve`, `test` all use real threads).** An agent
 runs in its own isolated interpreter: a failing agent (e.g. a `raise` with no `recover`) is
 **contained** — it transitions to state `ERROR` and does **not** abort the main program or truncate
 its output. When the main program finishes, `synsema run` **joins** the spawned agents (waits for

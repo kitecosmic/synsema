@@ -98,11 +98,12 @@ test "try/recover (not try/except); recover SWALLOWS unless you raise(err)"
     assert_eq(swallow_error(), "ok")
     assert_error(reraise_error)
 
-test "and/or do NOT short-circuit"
+test "and/or short-circuit (v0.6.10+), result is always a bool"
     let m be {"a": 1}
-    assert_error(() => contains(m, "b") and m["b"] == 1)
-    when contains(m, "a")
-        assert_eq(m["a"], 1)
+    assert_eq(contains(m, "b") and m["b"] == 1, false)
+    assert_eq(contains(m, "a") and m["a"] == 1, true)
+    assert_eq(contains(m, "a") or m["zz"] == 1, true)
+    assert_eq(1 or 0, true)
 
 test "append returns a NEW list (no mutating .append)"
     let xs be [1, 2]

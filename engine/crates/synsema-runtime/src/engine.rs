@@ -898,7 +898,30 @@ fn run_tests_inner(source: &str, filename: &str, ceiling: Option<Vec<Capability>
     };
     // Wiring no-secure (igual que `run`): los `require` del archivo conceden capabilities (G4).
     wire_common(&mut interp, &caps, false, mem_ctx.as_ref(), &suggested_memory_name(filename));
-    let outcomes = interp.run_test_blocks(&program);
+    // Swarm real, como en `run` (v0.6.10+): `spawn` corre el agente en su propio hilo,
+    // `agents()`/`agent_stop` existen, el bus es el del swarm. Al terminar cada bloque
+    // `test` se joinean sus agentes y un agente en ERROR hace fallar ESE test — un
+    // programa con agentes se prueba con `synsema test`, sin scripts externos.
+    let swarm = Arc::new(Swarm::new());
+    let ceiling_arc: Option<Arc<Vec<Capability>>> = ceiling.as_ref().map(|c| Arc::new(c.clone()));
+    wire_swarm_hooks(&mut interp, swarm.clone(), "main", ceiling_arc, mem_ctx.clone(), None);
+    let mut reported: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut after_each = |_name: &str| -> Option<String> {
+        swarm.wait_all();
+        let mut fresh: Vec<String> = Vec::new();
+        for (id, st) in swarm.agent_states() {
+            if st == AgentState::Error && reported.insert(id.clone()) {
+                let msg = swarm.agent_error(&id).unwrap_or_else(|| "agent error".to_string());
+                fresh.push(format!("Agent error [{}]: {}", id, msg));
+            }
+        }
+        if fresh.is_empty() {
+            None
+        } else {
+            Some(fresh.join("; "))
+        }
+    };
+    let outcomes = interp.run_test_blocks_with(&program, &mut after_each);
     let passed = outcomes.iter().filter(|o| o.passed).count();
     let failed = outcomes.len() - passed;
     TestReport { outcomes, passed, failed, output: std::mem::take(&mut interp.output) }

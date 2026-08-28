@@ -41,7 +41,7 @@ never heuristics. See [serve.md](serve.md).
 ## Operators
 Arithmetic: `+`, `-`, `*`, `/`, `%`, `**` (on `array`, these are **elementwise** with broadcasting — matrix product is `matmul`)
 Comparison: `==`, `!=`, `<`, `>`, `<=`, `>=`
-Logic: `and`, `or`, `not` — ⚠️ **`and`/`or` do NOT short-circuit**: BOTH sides always evaluate (the boolean result is correct, but a guard like `contains(m, "k") and m["k"] == 1` still errors with `Map has no key 'k'` — the index runs even when `contains` is false). Guard with **nested `when`** instead: `when contains(m, "k")` … then index.
+Logic: `and`, `or`, `not` — **short-circuit** (engine v0.6.10+): `contains(m, "k") and m["k"] == 1` is a valid guard (the index does not run when `contains` is false; same for `or`). The result is always a **bool**, never the operand — `x or default` is NOT a Synsema idiom (use `when`). On engines ≤ 0.6.9 both sides always evaluated: guard with a nested `when` there.
 Assignment of a default / named arg: `=` (in `task f(x, y = 1)` and `f(x, y = 2)`). Distinct from `==` (equality). `=` is NOT a general assignment statement — use `let`/`set`.
 Pipe: `|>` — chains: `data |> clean |> validate`
 Lambda: `(params) => expr`

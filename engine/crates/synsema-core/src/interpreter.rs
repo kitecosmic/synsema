@@ -1458,6 +1458,18 @@ impl Interpreter {
     /// cada test SIN abortar a los demás. Si el setup falla, devuelve un único outcome de
     /// error de setup. Las defs top-level quedan visibles dentro de cada test.
     pub fn run_test_blocks(&mut self, program: &Program) -> Vec<TestOutcome> {
+        self.run_test_blocks_with(program, &mut |_| None)
+    }
+
+    /// Como `run_test_blocks`, con un hook `after_each(nombre)` que corre al terminar
+    /// cada bloque `test` (cuerpo incluido) y puede devolver un mensaje de fallo —
+    /// el motor lo usa para joinear los agentes que el test spawneó y reflejar sus
+    /// errores como fallo de ESE test (`synsema test` cablea el swarm real).
+    pub fn run_test_blocks_with(
+        &mut self,
+        program: &Program,
+        after_each: &mut dyn FnMut(&str) -> Option<String>,
+    ) -> Vec<TestOutcome> {
         let g = self.global_env.clone();
         // Preámbulo: intent/require al inicio, luego congelar intent (igual que execute).
         let mut split = 0;
@@ -1500,7 +1512,7 @@ impl Interpreter {
         for stmt in &program.statements {
             if let NodeKind::TestBlock { name, body } = &stmt.kind {
                 let test_env = Environment::child(&g, &format!("test:{}", name));
-                let outcome = match self.exec_block(body, &test_env) {
+                let mut outcome = match self.exec_block(body, &test_env) {
                     Ok(_) => {
                         TestOutcome { name: name.clone(), passed: true, message: None, assertion: false }
                     }
@@ -1517,6 +1529,14 @@ impl Interpreter {
                         assertion: false,
                     },
                 };
+                // Agentes del test: se esperan y sus errores cuentan como fallo del test.
+                if let Some(msg) = after_each(name) {
+                    outcome.passed = false;
+                    outcome.message = Some(match outcome.message.take() {
+                        Some(prev) => format!("{}; {}", prev, msg),
+                        None => msg,
+                    });
+                }
                 outcomes.push(outcome);
             }
         }
@@ -1665,6 +1685,24 @@ impl Interpreter {
             // -- Operadores --
             NodeKind::BinaryOp { left, operator, right } => {
                 let l = self.exec(left, env)?;
+                // `and`/`or` cortocircuitan (v0.6.10+): el lado derecho sólo se evalúa
+                // si hace falta, así `contains(m, "k") and m["k"] == 1` es un guard
+                // válido. Resultado siempre booleano (no devuelve el operando, como
+                // Python): `x or default` NO es un idioma de Synsema.
+                if operator == "and" {
+                    if !l.is_truthy() {
+                        return Ok(syn_bool(false));
+                    }
+                    let r = self.exec(right, env)?;
+                    return Ok(syn_bool(r.is_truthy()));
+                }
+                if operator == "or" {
+                    if l.is_truthy() {
+                        return Ok(syn_bool(true));
+                    }
+                    let r = self.exec(right, env)?;
+                    return Ok(syn_bool(r.is_truthy()));
+                }
                 let r = self.exec(right, env)?;
                 self.exec_binary(l, operator, r, loc)
             }
@@ -2524,7 +2562,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         right: SynValue,
         loc: &SourceLocation,
     ) -> Result<SynValue, Control> {
-        // Lógicos (Python evalúa AMBOS lados antes; no hay short-circuit acá).
+        // Lógicos: el cortocircuito vive en `exec` (BinaryOp); acá sólo llega un
+        // `and`/`or` ya evaluado por ambos lados (callers internos).
         if op == "and" {
             return Ok(syn_bool(left.is_truthy() && right.is_truthy()));
         }

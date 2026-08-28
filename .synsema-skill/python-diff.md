@@ -71,7 +71,7 @@ word in Synsema`. Name things `resolve`, `why`, etc.
 
 | It looks like | What actually happens (verified) |
 |---|---|
-| `a and b` short-circuits | **NO short-circuit — both sides ALWAYS evaluate.** `contains(m, "k") and m["k"] == 1` still errors `Map has no key 'k'` when the key is absent. Guard with **nested `when`** instead |
+| `a and b` short-circuits and returns the operand (`x or "default"`) | Short-circuits too (v0.6.10+) but **always returns a bool** — `x or "default"` is `true`/`false`, never the default. Use `when x == nothing` … `set x to "default"` |
 | `xs.append` mutates in place | `append` (and friends) return new values; the original is untouched. Reassign with `set` |
 | `d["missing"]` → KeyError you catch by type | `Map has no key 'missing'` — catchable only as `try/recover` (message text) |
 | `"a" + 1` → TypeError | **It concatenates**: `"a" + 1` → `"a1"` (text + number coerces). But `"ab" * 2` and `1 + true` ARE errors — no repetition, no bool arithmetic |

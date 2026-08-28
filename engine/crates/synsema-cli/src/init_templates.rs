@@ -287,6 +287,9 @@ const ENV_EXAMPLE_PAST: &[&str] = &[
     "2f5fb20f6175b65bde78669a20e7565cff513cd5f18668bc46c7e42b4827fa70",
     "8905d8b18d42449dc712dd9125cd11d49448e92c89b0e5c9c605821da4a3ccbe",
     "439f3ab927a92bd090d281bb4aeb9052b295fa7cb55bab62f1a1819bfd464777",
+    // v0.6.8 (antes de SYNSEMA_WATCH_MAX) y v0.6.9 (con él, sin el fix del knob)
+    "2228ce300d028873345409bb4e2aad0e5e72222f675580a5ccddb7c51a3e59cc",
+    "3f1e65e2d9b87302d4183381b92d26965b2db49dc7225a5056c124a7da16f1b2",
 ];
 
 /// sha256 de cada contenido histórico de `.gitignore` (ver `InitFile::past`).

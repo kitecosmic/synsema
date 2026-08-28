@@ -155,12 +155,12 @@ each item in items
 let result be apply(process, where(items, is_valid))
 ```
 
-### Guard a map key (`and` does NOT short-circuit — nest instead)
+### Guard a map key (`and` short-circuits from v0.6.10)
 ```
-when contains(m, "discount")
-    when m["discount"] > 0.2
-        raise("discount too high")
+when contains(m, "discount") and m["discount"] > 0.2
+    raise("discount too high")
 ```
+(On engines ≤ 0.6.9 both sides evaluated — nest two `when` there.)
 
 ### Re-propagate a caught error (recover swallows by default)
 ```

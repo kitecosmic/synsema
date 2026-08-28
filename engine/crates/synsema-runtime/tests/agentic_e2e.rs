@@ -539,3 +539,46 @@ fn socket_and_timeout_parse_errors_are_loud() {
     assert_eq!(r.output[0], "4");
 }
 
+
+
+// =========================================================
+// `synsema test` cablea el swarm (v0.6.10+)
+// =========================================================
+
+/// Bajo `synsema test` los agentes corren de verdad (hilo propio, `agents()` existe,
+/// blackboard/señales funcionan) y un agente que termina en ERROR hace fallar el test
+/// que lo spawneó — y sólo ese.
+#[test]
+fn synsema_test_runs_agents_for_real_and_agent_errors_fail_that_test() {
+    let src = r#"agent Worker
+    share n * 2 as "doubled"
+    signal "done"
+
+agent Broken
+    raise "agent exploded on purpose"
+
+test "spawn corre en su hilo y el blackboard llega"
+    spawn Worker with n = 21
+    wait_for "done" timeout 5
+    observe "doubled" as d
+    assert_eq(d, 42)
+    assert(length(agents()) >= 1)
+
+test "un agente roto hace fallar SU test"
+    spawn Broken
+    sleep(0.2)
+
+test "el test siguiente arranca limpio"
+    assert_eq(1 + 1, 2)
+"#;
+    let r = synsema_runtime::engine::run_tests(src, "<swarm-test>.syn");
+    let names: Vec<(String, bool, Option<String>)> =
+        r.outcomes.iter().map(|o| (o.name.clone(), o.passed, o.message.clone())).collect();
+    assert_eq!(r.outcomes.len(), 3, "{:?}", names);
+    assert!(r.outcomes[0].passed, "{:?}", names);
+    assert!(!r.outcomes[1].passed, "{:?}", names);
+    let msg = r.outcomes[1].message.clone().unwrap_or_default();
+    assert!(msg.contains("Agent error") && msg.contains("exploded on purpose"), "{}", msg);
+    assert!(r.outcomes[2].passed, "el error del agente no contamina el test siguiente: {:?}", names);
+    assert_eq!((r.passed, r.failed), (2, 1));
+}

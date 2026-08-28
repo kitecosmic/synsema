@@ -507,3 +507,25 @@ fn raise_statement_actually_raises() {
     // Sin try: el programa FALLA (nada de no-op).
     assert_fails("raise \"boom\"\nprint(\"no debe llegar\")");
 }
+
+
+// -- `and`/`or` cortocircuitan (v0.6.10+) --
+
+#[test]
+fn and_or_short_circuit_and_always_yield_bool() {
+    assert_output(
+        r#"let m be {"a": 1}
+print(contains(m, "b") and m["b"] == 1)
+print(contains(m, "a") and m["a"] == 1)
+print(contains(m, "a") or m["zz"] == 1)
+print(1 and 0)
+print(0 or 2)
+print(false and m["nope"])
+print(true or m["nope"])
+"#,
+        &["false", "true", "true", "false", "true", "false", "true"],
+    );
+    // El lado derecho SÍ se evalúa cuando hace falta: el error sigue siendo real.
+    assert_error_contains("let m be {}\nprint(true and m[\"b\"])", "no key");
+    assert_error_contains("let m be {}\nprint(false or m[\"b\"])", "no key");
+}
