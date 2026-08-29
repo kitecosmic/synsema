@@ -19,6 +19,7 @@ pub mod parser;
 pub mod route_meta;
 pub mod secret;
 pub mod templates;
+pub mod term_guard;
 pub mod testgen;
 pub mod tokens;
 pub mod types;

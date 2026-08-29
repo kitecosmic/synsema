@@ -127,6 +127,7 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     ("read_file", "file.read"), ("read_file_bytes", "file.read"), ("list_dir", "file.read"),
     ("file_info", "file.read"), ("file_exists", "file.read"), ("grep", "file.read"),
     ("watch", "file.read"),
+    ("term_open", "stdin"),
     ("write_file", "file.write"), ("edit_file", "file.write"), ("append_file", "file.write"),
     ("run", "exec"), ("proc_spawn", "exec"),
     // tiempo y azar

@@ -1008,3 +1008,74 @@ fn watch_budget_is_enforced() {
     let e = err_msg(call(&mut i, "watch", vec![syn_text(d.path()), fast_opts(&[])]));
     assert!(e.contains("watch budget reached"), "{}", e);
 }
+
+// =========================================================
+// Terminal propia (`term_*`) — contrato sin TTY (el harness no tiene consola)
+// =========================================================
+
+fn interp_stdin() -> Interpreter {
+    let interp = Interpreter::new();
+    let caps = Rc::new(RefCell::new(CapabilitySet::new("test")));
+    caps.borrow_mut().grant(Capability::new(CapabilityType::Stdin, None));
+    caps.borrow_mut().grant(Capability::new(CapabilityType::Exec, Some(shell().to_string())));
+    register_ws_builtins(&interp, caps);
+    attach_bus(&interp, Arc::new(Bus::new()));
+    interp
+}
+
+#[test]
+fn term_open_needs_stdin_capability_before_anything_else() {
+    let _g = serial();
+    let mut plain = interp();
+    plain.live_output = true;
+    let e = err_msg(call(&mut plain, "term_open", vec![]));
+    assert!(e.contains("stdin"), "{}", e);
+    assert!(!synsema_core::term_guard::is_raw());
+}
+
+#[test]
+fn term_open_without_tty_or_live_output_is_nothing_and_touches_nothing() {
+    let _g = serial();
+    // Sin salida en vivo (test/conform/serve): nothing, aunque hubiera consola.
+    let mut i = interp_stdin();
+    assert!(matches!(ok(call(&mut i, "term_open", vec![])), SynValue::Nothing));
+    // Con salida en vivo pero sin TTY (el harness): nothing, no error, sin raw mode.
+    i.live_output = true;
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        assert!(matches!(ok(call(&mut i, "term_open", vec![])), SynValue::Nothing));
+    }
+    assert!(!synsema_core::term_guard::is_raw());
+    // El resto de la familia exige un handle vivo; cerrar uno desconocido es no-op.
+    let e = err_msg(call(&mut i, "term_size", vec![syn_int(99)]));
+    assert!(e.contains("unknown or closed terminal handle"), "{}", e);
+    assert!(matches!(ok(call(&mut i, "term_close", vec![syn_int(99)])), SynValue::Bool(true)));
+    // Un handle de otra familia no es la terminal.
+    let (cmd, args) = script("echo hi", "echo hi");
+    let p = int(&ok(call(&mut i, "proc_spawn", vec![cmd, args])));
+    let e = err_msg(call(&mut i, "term_write", vec![syn_int(p), syn_text("x")]));
+    assert!(e.contains("is not the terminal"), "{}", e);
+    ok(call(&mut i, "proc_close", vec![syn_int(p)]));
+}
+
+#[test]
+fn term_open_validates_its_options_first() {
+    let _g = serial();
+    let mut i = interp_stdin();
+    i.live_output = true;
+    let mut m = indexmap::IndexMap::new();
+    m.insert("ctrl_c".to_string(), syn_text("nope"));
+    let e = err_msg(call(&mut i, "term_open", vec![syn_map(m)]));
+    assert!(e.contains("ctrl_c must be"), "{}", e);
+    let mut m = indexmap::IndexMap::new();
+    m.insert("mouse".to_string(), SynValue::Bool(true));
+    let e = err_msg(call(&mut i, "term_open", vec![syn_map(m)]));
+    assert!(e.contains("mouse capture is not implemented"), "{}", e);
+}
+
+#[test]
+fn term_guard_suspend_resume_are_noops_without_a_terminal() {
+    synsema_core::term_guard::suspend();
+    synsema_core::term_guard::resume();
+    assert!(!synsema_core::term_guard::is_raw());
+}

@@ -52,6 +52,12 @@ For raw stdin that works with pipes/redirection, use **`read_line(prompt?)`** (r
 ```
 let name be read_line("Your name: ")   -- works with `printf 'Ana\n' | synsema run f.syn`
 ```
+For an **interactive** prompt (a chat CLI, a `/` palette that filters as you type, history, a
+↑↓ menu to approve), `term_open()` (engine v0.6.11+, `require stdin`) delivers every key as an
+event in `select`; it returns `nothing` without a TTY so the `read_line` fallback is one `when` —
+see [processes.md](processes.md) § The program's own terminal. `ask`/`approve`/`confirm` keep
+working while it is open (raw mode is suspended while the human answers).
+
 For config-style input, `env()` / a file also work and are easy to test:
 ```
 let name be env("NAME", "")            -- works in CI, pipes, and tests

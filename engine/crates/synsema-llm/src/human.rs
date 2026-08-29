@@ -160,6 +160,18 @@ pub struct ConsoleHandler;
 
 impl HumanHandler for ConsoleHandler {
     fn handle(&self, request: &InteractionRequest) -> InteractionResponse {
+        // Con una terminal interactiva abierta (`term_open`, raw mode) el `read_line`
+        // cocinado de abajo no funcionaría: se suspende el raw mode mientras el humano
+        // responde y se reanuda al volver (no-op si no hay terminal abierta).
+        synsema_core::term_guard::suspend();
+        let r = self.handle_cooked(request);
+        synsema_core::term_guard::resume();
+        r
+    }
+}
+
+impl ConsoleHandler {
+    fn handle_cooked(&self, request: &InteractionRequest) -> InteractionResponse {
         use std::io::Write;
         let denied = |r: &InteractionRequest| InteractionResponse {
             request_id: r.id.clone(),

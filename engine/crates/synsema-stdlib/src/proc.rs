@@ -534,8 +534,15 @@ impl LiveProc {
             .map_err(|e| format!("cannot open a pseudo-terminal: {}", e))?;
         let mut b = CommandBuilder::new(cmd);
         b.args(args);
-        if let Some(dir) = &opts.cwd {
-            b.cwd(dir);
+        // portable-pty NO hereda el cwd del proceso (en Windows arranca en el del sistema):
+        // sin `cwd` explícito, el hijo pty ve el mismo directorio que el modo pipe.
+        match &opts.cwd {
+            Some(dir) => b.cwd(dir),
+            None => {
+                if let Ok(here) = std::env::current_dir() {
+                    b.cwd(here);
+                }
+            }
         }
         let mut has_term = false;
         for (k, v) in &opts.env {

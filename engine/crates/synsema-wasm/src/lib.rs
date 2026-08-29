@@ -676,6 +676,9 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
 /// Los de red (`fetch`/`http_*`) YA NO son stubs: son los builtins reales sobre el
 /// transporte del host (F3); `mtls_identity` sí (identidad TLS del proceso).
 pub fn register_unavailable_stubs(interp: &Interpreter) {
+    // `term_open` NO falla: sin terminal devuelve `nothing`, igual que sin TTY en el
+    // binario nativo, para que el fallback a `read_line` sea el mismo programa.
+    interp.register_builtin("term_open", -1, Rc::new(|_i, _args, _loc| Ok(SynValue::Nothing)));
     const NET: &[&str] = &[
         "mtls_identity",
         "ws_connect", "ws_send", "ws_recv", "ws_close", "ws_status", "ws_stats",
@@ -699,6 +702,7 @@ pub fn register_unavailable_stubs(interp: &Interpreter) {
         "select", "proc_spawn", "proc_send", "proc_close_stdin", "proc_resize", "proc_recv",
         "proc_select", "proc_status", "proc_kill", "proc_wait", "proc_close", "proc_stats",
         "watch", "watch_recv", "watch_stats", "watch_close",
+        "term_recv", "term_size", "term_write", "term_stats", "term_close",
     ];
     const BUS: &[&str] = &["bus_publish", "bus_subscribe", "bus_recv", "bus_unsubscribe", "bus_topics"];
     const AGENTS: &[&str] = &["agents", "agent_stop"];

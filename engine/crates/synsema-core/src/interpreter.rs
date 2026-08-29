@@ -3611,8 +3611,15 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// sólo ve lo que el programa NO drenó (los tests de conform no llaman flush/read_line).
     fn drain_output(&mut self) {
         use std::io::Write;
+        // Con la terminal en raw mode (`term_open`) un `\n` solo no vuelve al margen: la
+        // salida "escalera". Se escribe `\r\n` sólo en ese estado.
+        let raw = crate::term_guard::is_raw();
         for line in self.output.drain(..) {
-            println!("{}", line);
+            if raw {
+                print!("{}\r\n", line.replace('\n', "\r\n"));
+            } else {
+                println!("{}", line);
+            }
         }
         let _ = std::io::stdout().flush();
     }

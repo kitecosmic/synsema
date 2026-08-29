@@ -226,6 +226,70 @@ events → `socket_send`, a `{resize}` message → `proc_resize` (xterm.js rende
 is an app-level `auth` decision who gets that socket — the runtime adds no capability
 because there is nothing new to gate.
 
+## The program's own terminal — `term_*` (engine v0.6.11+)
+
+`read_line` gives one cooked line at a time. `term_open` puts the terminal in raw mode and
+delivers **every key as an event** in the same hub as `proc_*`/`bus_*`/`watch` — so a chat
+CLI, a `/` command palette that filters as you type, a line editor with history, or a ↑↓ menu
+for `approve` is a `select` loop in Synsema, not a runtime feature. Gate: `require stdin`.
+
+```
+require stdin
+require stdout
+let term be term_open()                  -- nothing without a TTY / under serve, test, wasm
+when term == nothing
+    let line be read_line("> ")          -- same program, pipes/CI keep working
+otherwise
+    let buf be ""
+    while true
+        term_write(term, "\r\x1b[2K> " + buf)          -- redraw NOW (bypasses print's buffer)
+        let ev be select({"keys": term, "agent": sub}, 60)  -- keys + a sub-agent's bus events
+        when ev == nothing
+            continue
+        when ev["source"] == "bus"
+            term_write(term, "\r\n[agent] " + json_encode(ev["data"]) + "\r\n")
+        otherwise when ev["type"] == "eof"
+            stop
+        otherwise when ev["type"] == "paste"
+            set buf to buf + ev["text"]
+        otherwise when ev["key"] == "char"
+            set buf to buf + ev["text"]
+        otherwise when ev["key"] == "backspace"
+            set buf to slice(buf, 0, len(buf) - 1)
+        otherwise when ev["key"] == "enter" and ev["alt"]
+            set buf to buf + "\n"                        -- Alt+Enter = multi-line
+        otherwise when ev["key"] == "enter"
+            stop
+    term_close(term)
+```
+
+| Builtin | Returns |
+|---|---|
+| `term_open(opts?)` | handle (int) — in `select`, tagged `source: "term"`; **`nothing`** when stdin/stdout is not a TTY, under `serve`/`test`/`conform`, in wasm |
+| `term_recv(h, timeout?)` | next event or `nothing` (default timeout 30 s — pass one when waiting for a human) |
+| `term_size(h)` | `{cols, rows}` |
+| `term_write(h, text)` | writes to stdout immediately; ANSI escapes allowed |
+| `term_stats(h)` | `{kitty, paste, ansi, keys, queued, dropped}` |
+| `term_close(h)` | restores the terminal; idempotent (the runtime restores anyway on drop/error/panic) |
+
+Events: `{type: "key", key, text, ctrl, alt, shift}` where `key` is a **name** — `"char"`
+(`text` = the character, Shift applied), `"enter"`, `"tab"`, `"backtab"`, `"backspace"`,
+`"delete"`, `"insert"`, `"escape"`, `"up"/"down"/"left"/"right"`, `"home"/"end"`,
+`"pageup"/"pagedown"`, `"f1"`…`"f12"`; Tab/Enter never come as `"\t"`/`"\r"`; `ctrl: true` →
+`text` is the lowercase letter; presses only. `{type: "paste", text}` (one event per paste, Unix;
+on Windows a paste is a burst of keys — `term_stats.paste` tells). `{type: "resize", cols, rows}`,
+`{type: "focus", gained}`. `{type: "eof"}` once, then the handle is gone (not an error).
+
+`opts`: `paste` (true), `kitty` (true — kitty keyboard protocol when the terminal supports it:
+Windows Terminal/kitty/WezTerm/foot/Ghostty; that is what makes **Shift+Enter** visible — use
+**Alt+Enter** as the portable multi-line shortcut), `ctrl_c` (`"exit"`: restore + exit 130, like
+SIGINT; `"key"`: delivered as Ctrl+c and you decide), `max_queue` (16384).
+
+Guarantees: `print`/`log` still work (runtime writes `\r\n`, no staircase); free-text `ask`,
+`approve`, `confirm` work with the terminal open (raw mode is suspended while the human answers);
+one terminal per process (a spawned agent gets an error while main holds it); restoring is the
+runtime's job — undo only what you drew yourself (hidden cursor, colours).
+
 ## File-watch — `watch` (engine v0.6.9+)
 
 Changes on disk as a **handle with events**, in the same hub as processes, sockets and the

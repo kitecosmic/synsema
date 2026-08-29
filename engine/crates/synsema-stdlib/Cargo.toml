@@ -81,6 +81,12 @@ tungstenite = { workspace = true, optional = true }
 # Unix, ConPTY en Windows (>= 10 1809). Es la crate de WezTerm; sin C-ABI nuevo (libc /
 # winapi ya están en el árbol). Sólo la abre `proc.rs`; el runtime NO interpreta VT.
 portable-pty = { version = "0.9", optional = true }
+# Tanda term (`term_open`: la terminal propia como handle del hub): raw mode + lector de
+# teclas + bracketed paste + kitty keyboard protocol + resize, cross-platform (termios vía
+# rustix en Unix, SetConsoleMode/ReadConsoleInput vía crossterm_winapi en Windows). Sin
+# `*-sys` nuevo (winapi/libc/mio/parking_lot ya están en el árbol; rustix y signal-hook son
+# puro Rust). Sin `event-stream`/`serde`. Sólo lo abre `term.rs`; el runtime NO dibuja.
+crossterm = { version = "0.29", default-features = false, features = ["events", "windows", "bracketed-paste"], optional = true }
 # Batch 15 (WebSocket de primera clase): poller de readiness cross-platform
 # (epoll/kqueue/IOCP) para el multiplexado no-bloqueante de ws_select. YA está en el
 # árbol (v1.2.1, transitivo de tokio/hyper) — hacerlo directo NO agrega crate ni C-ABI
@@ -138,6 +144,7 @@ native = [
     "dep:tokio-rustls",
     "dep:tungstenite",
     "dep:portable-pty",
+    "dep:crossterm",
 ]
 
 # Sólo Windows: leer HKCR para replicar mimetypes.read_windows_registry (content-type

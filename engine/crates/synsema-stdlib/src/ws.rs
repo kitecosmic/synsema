@@ -56,6 +56,7 @@ use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::types::{from_send, syn_bool, syn_bytes, syn_int, syn_map, syn_number, syn_text, SendValue, SynValue};
 
 use crate::proc::{LiveProc, OnFull as ProcOnFull, ProcEvent, ProcStatus, SpawnOpts};
+use crate::term::{Term, TermError, TermEvent, TermOpts};
 use crate::watch::{Watch, WatchOpts};
 
 /// Token reservado del `mio::Waker` del hub (los sockets arrancan en 1).
@@ -395,6 +396,8 @@ struct WsRegistry {
     /// File-watches vivos (`watch`).
     watches: HashMap<i64, Watch>,
     max_watches: usize,
+    /// La terminal propia (`term_open`): a lo sumo una por intérprete (y por proceso).
+    term: Option<(i64, Term)>,
     /// Suscripciones al bus (`bus_subscribe`).
     subs: HashMap<i64, Arc<Subscriber>>,
     /// El bus del proceso (lo adjunta el motor con `attach_bus` al cablear el swarm).
@@ -412,6 +415,7 @@ impl Drop for WsRegistry {
         // acumula en colas huérfanas).
         self.procs.clear();
         self.watches.clear();
+        self.term = None;
         if let Some(bus) = &self.bus {
             for (_, s) in self.subs.drain() {
                 bus.unsubscribe(s.id);
@@ -1856,6 +1860,7 @@ pub fn reset_hub(interp: &Interpreter) {
     // `LiveProc::drop` → TERM, KILL a los 2 s, wait: ninguno sobrevive al request.
     r.procs.clear();
     r.watches.clear();
+    r.term = None;
     let subs: Vec<Arc<Subscriber>> = r.subs.drain().map(|(_, s)| s).collect();
     if let Some(bus) = r.bus.clone() {
         for s in subs {
@@ -2028,6 +2033,7 @@ enum HandleKind {
     Proc,
     Sub,
     Watch,
+    Term,
 }
 
 impl WsRegistry {
@@ -2040,6 +2046,8 @@ impl WsRegistry {
             Some(HandleKind::Sub)
         } else if self.watches.contains_key(&h) {
             Some(HandleKind::Watch)
+        } else if matches!(&self.term, Some((th, _)) if *th == h) {
+            Some(HandleKind::Term)
         } else {
             None
         }
@@ -2066,6 +2074,11 @@ impl WsRegistry {
         }
         if let Some(w) = self.watches.get(&h) {
             return w.shared.is_ready();
+        }
+        if let Some((th, t)) = &self.term {
+            if *th == h {
+                return t.shared.is_ready();
+            }
         }
         false
     }
@@ -2221,6 +2234,42 @@ impl WsRegistry {
                     }
                 }
             }
+            HandleKind::Term => {
+                let ev = self.term.as_ref()?.1.shared.try_recv()?;
+                let mut m = indexmap::IndexMap::new();
+                match ev {
+                    TermEvent::Key { key, text, ctrl, alt, shift } => {
+                        m.insert("type".to_string(), syn_text("key"));
+                        m.insert("key".to_string(), syn_text(key));
+                        m.insert("text".to_string(), syn_text(text));
+                        m.insert("ctrl".to_string(), syn_bool(ctrl));
+                        m.insert("alt".to_string(), syn_bool(alt));
+                        m.insert("shift".to_string(), syn_bool(shift));
+                    }
+                    TermEvent::Paste(t) => {
+                        m.insert("type".to_string(), syn_text("paste"));
+                        m.insert("text".to_string(), syn_text(t));
+                    }
+                    TermEvent::Resize { cols, rows } => {
+                        m.insert("type".to_string(), syn_text("resize"));
+                        m.insert("cols".to_string(), syn_int(cols as i64));
+                        m.insert("rows".to_string(), syn_int(rows as i64));
+                    }
+                    TermEvent::Focus(g) => {
+                        m.insert("type".to_string(), syn_text("focus"));
+                        m.insert("gained".to_string(), syn_bool(g));
+                    }
+                    TermEvent::Eof => {
+                        // Fin de la entrada: no es un error atrapable (como `read_line` →
+                        // nothing). Se entrega una vez y el handle se retira (restaura).
+                        m.insert("type".to_string(), syn_text("eof"));
+                        let tagged_ev = tagged(m, "term");
+                        self.term = None;
+                        return Some(Ok(tagged_ev));
+                    }
+                }
+                Some(Ok(tagged(m, "term")))
+            }
         }
     }
 
@@ -2294,6 +2343,7 @@ fn proc_handle(reg: &Registry, v: Option<&SynValue>, fname: &str) -> Result<i64,
         Some(HandleKind::Ws) => Err(err(format!("{}: handle {} is a WebSocket connection, not a process", fname, h))),
         Some(HandleKind::Sub) => Err(err(format!("{}: handle {} is a bus subscription, not a process", fname, h))),
         Some(HandleKind::Watch) => Err(err(format!("{}: handle {} is a file watch, not a process", fname, h))),
+        Some(HandleKind::Term) => Err(err(format!("{}: handle {} is the terminal, not a process", fname, h))),
         None => Err(err(format!("{}: unknown or closed process handle {}", fname, h))),
     }
 }
@@ -2305,7 +2355,17 @@ fn watch_handle(reg: &Registry, v: Option<&SynValue>, fname: &str) -> Result<i64
         Some(HandleKind::Ws) => Err(err(format!("{}: handle {} is a WebSocket connection, not a file watch", fname, h))),
         Some(HandleKind::Proc) => Err(err(format!("{}: handle {} is a process, not a file watch", fname, h))),
         Some(HandleKind::Sub) => Err(err(format!("{}: handle {} is a bus subscription, not a file watch", fname, h))),
+        Some(HandleKind::Term) => Err(err(format!("{}: handle {} is the terminal, not a file watch", fname, h))),
         None => Err(err(format!("{}: unknown or closed watch handle {}", fname, h))),
+    }
+}
+
+fn term_handle(reg: &Registry, v: Option<&SynValue>, fname: &str) -> Result<i64, Control> {
+    let h = conn_handle(v.ok_or_else(|| err(format!("{}: missing the terminal handle", fname)))?, fname)?;
+    match reg.borrow().kind_of(h) {
+        Some(HandleKind::Term) => Ok(h),
+        Some(_) => Err(err(format!("{}: handle {} is not the terminal", fname, h))),
+        None => Err(err(format!("{}: unknown or closed terminal handle {}", fname, h))),
     }
 }
 
@@ -2874,6 +2934,126 @@ fn watch_close(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
     Ok(syn_bool(true))
 }
 
+// ---------------------------------------------------------
+// Terminal propia (`term_*`)
+// ---------------------------------------------------------
+
+/// `term_open(opts?)` → handle, o `nothing` sin TTY / bajo test-conform-serve / WASM.
+/// Gate `stdin` (se evalúa ANTES del chequeo de TTY: fail-closed primero).
+fn term_open(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "term_open";
+    {
+        let caps = reg.borrow().caps.clone();
+        caps.borrow_mut()
+            .require(&Capability::new(CapabilityType::Stdin, None), "term_open()")
+            .map_err(|v| Control::Error(RuntimeError::new(v.message)))?;
+    }
+    let mut opts = TermOpts::default();
+    if let Some(m) = opt_map(args.first(), F)? {
+        for (key, slot) in [("paste", &mut opts.paste), ("kitty", &mut opts.kitty)] {
+            match m.get(key) {
+                None | Some(SynValue::Nothing) => {}
+                Some(SynValue::Bool(b)) => *slot = *b,
+                Some(other) => return Err(err(format!("{}: {} must be a boolean, got {}", F, key, other.type_name()))),
+            }
+        }
+        match m.get("ctrl_c") {
+            None | Some(SynValue::Nothing) => {}
+            Some(SynValue::Text(t)) if t.as_ref() == "exit" => opts.ctrl_c_exit = true,
+            Some(SynValue::Text(t)) if t.as_ref() == "key" => opts.ctrl_c_exit = false,
+            Some(other) => return Err(err(format!("{}: ctrl_c must be \"exit\" or \"key\", got {}", F, other))),
+        }
+        match m.get("mouse") {
+            None | Some(SynValue::Nothing) | Some(SynValue::Bool(false)) => {}
+            Some(_) => return Err(err(format!("{}: mouse capture is not implemented yet (the option is reserved)", F))),
+        }
+        if let Some(n) = opt_usize(&m, "max_queue", F)? {
+            opts.max_queue = n;
+        }
+    }
+    // Sin salida en vivo (`synsema test`, `conform`, `serve`) no hay terminal interactiva:
+    // el programa cae a `read_line` como con un pipe. No es error.
+    if !interp.live_output {
+        return Ok(SynValue::Nothing);
+    }
+    if let Some((h, _)) = &reg.borrow().term {
+        return Err(err(format!("{}: a terminal is already open (handle {}); term_close it first", F, h)));
+    }
+    let t = match Term::open(opts) {
+        Ok(t) => t,
+        Err(TermError::NoTty) => return Ok(SynValue::Nothing),
+        Err(TermError::Busy) => return Err(err(format!("{}: the terminal is owned by another agent of this process", F))),
+        Err(TermError::Other(e)) => return Err(err(format!("{}: {}", F, e))),
+    };
+    let mut r = reg.borrow_mut();
+    let wk = r.waker.clone();
+    t.shared.set_wake(Some(Arc::new(move || {
+        let _ = wk.wake();
+    })));
+    r.next_id += 1;
+    let handle = r.next_id;
+    r.term = Some((handle, t));
+    Ok(syn_int(handle))
+}
+
+fn term_recv(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "term_recv";
+    let h = term_handle(reg, args.first(), F)?;
+    let timeout = timeout_arg(args.get(1), F)?;
+    select_on(interp, reg, &[h], &None, timeout, F)
+}
+
+fn term_size(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "term_size";
+    term_handle(reg, args.first(), F)?;
+    let (cols, rows) = Term::size().map_err(|e| err(format!("{}: {}", F, e)))?;
+    let mut m = indexmap::IndexMap::new();
+    m.insert("cols".to_string(), syn_int(cols as i64));
+    m.insert("rows".to_string(), syn_int(rows as i64));
+    Ok(syn_map(m))
+}
+
+/// `term_write(h, text)`: a stdout YA, sin pasar por el buffer de `print`.
+fn term_write(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "term_write";
+    term_handle(reg, args.first(), F)?;
+    let text = match args.get(1) {
+        Some(SynValue::Text(t)) => t.to_string(),
+        Some(SynValue::Secret(_)) => return Err(err(format!("{}: refusing to print a secret", F))),
+        Some(SynValue::Nothing) | None => String::new(),
+        Some(other) => other.to_string(),
+    };
+    Term::write(&text).map_err(|e| err(format!("{}: {}", F, e)))?;
+    Ok(SynValue::Nothing)
+}
+
+fn term_stats(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "term_stats";
+    let h = term_handle(reg, args.first(), F)?;
+    let r = reg.borrow();
+    let t = &r.term.as_ref().filter(|(th, _)| *th == h).ok_or_else(|| err(format!("{}: unknown terminal handle {}", F, h)))?.1;
+    let (queued, dropped, keys) = t.shared.stats();
+    let mut m = indexmap::IndexMap::new();
+    m.insert("kitty".to_string(), syn_bool(t.shared.kitty));
+    m.insert("paste".to_string(), syn_bool(t.shared.paste));
+    m.insert("ansi".to_string(), syn_bool(t.shared.ansi));
+    m.insert("keys".to_string(), syn_int(keys as i64));
+    m.insert("queued".to_string(), syn_int(queued as i64));
+    m.insert("dropped".to_string(), syn_int(dropped as i64));
+    Ok(syn_map(m))
+}
+
+fn term_close(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+    const F: &str = "term_close";
+    let h = conn_handle(args.first().ok_or_else(|| err(format!("{}: missing the terminal handle", F)))?, F)?;
+    // Idempotente: un handle desconocido es no-op. Drop restaura la consola y apaga el lector.
+    let mut r = reg.borrow_mut();
+    if matches!(&r.term, Some((th, _)) if *th == h) {
+        r.term = None;
+    }
+    Ok(syn_bool(true))
+}
+
 // =========================================================
 // Registro
 // =========================================================
@@ -2916,6 +3096,7 @@ pub fn register_ws_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet
         max_procs,
         watches: HashMap::new(),
         max_watches,
+        term: None,
         subs: HashMap::new(),
         bus: None,
         cancel_seen: 0,
@@ -2969,6 +3150,14 @@ pub fn register_ws_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet
     reg_fn_interp!("watch_recv", -1, watch_recv);
     reg_fn!("watch_stats", 1, watch_stats);
     reg_fn!("watch_close", 1, watch_close);
+
+    // -- terminal propia (raw mode + teclas como eventos; entra en `select`) --
+    reg_fn_interp!("term_open", -1, term_open);
+    reg_fn_interp!("term_recv", -1, term_recv);
+    reg_fn!("term_size", 1, term_size);
+    reg_fn!("term_write", 2, term_write);
+    reg_fn!("term_stats", 1, term_stats);
+    reg_fn!("term_close", 1, term_close);
 
     // -- bus de eventos (pub/sub in-process) --
     reg_fn!("bus_publish", 2, bus_publish);

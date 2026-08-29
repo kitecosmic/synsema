@@ -208,6 +208,24 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | Without `opts.hosts`, the certificate only goes where you meant | It goes to **every host the program may reach** — any server that asks for a client cert gets your workload identity | Bounded by `require net`, so with a narrow `net` scope it's already contained. With a broad one, scope it: `mtls_identity(c, k, {"hosts": ["*.mesh.internal"]})` |
 | The server can require client certificates (`client_ca`) | Not yet — only the **client** side ships | Terminating mTLS on the serve side needs a new `serve` clause (parser work); use a reverse proxy in front meanwhile |
 
+## The program's own terminal — `term_*` (engine v0.6.11+)
+
+- **`term_open` returned `nothing` — that is the pipe/CI/serve/test path, not a bug**: fall
+  back to `read_line`. It is also `nothing` in wasm. Never treat it as an error.
+- **Waiting for a human with the default timeout**: `term_recv(h)` / `select([term])` time out
+  after 30 s and return `nothing` — pass a timeout and `continue` on `nothing`.
+- **Ctrl+C in raw mode is a key, not SIGINT**: the default `ctrl_c: "exit"` restores and exits
+  130 for you; with `"key"` a hung loop is yours to break.
+- **Shift+Enter is a plain Enter on most terminals** (needs the kitty keyboard protocol):
+  make Alt+Enter the multi-line shortcut. On Windows a paste is a burst of `key` events, not one
+  `paste` (`term_stats(h)["paste"]` is `false`).
+- **Draw with `term_write`, not `print`**: `print` is buffered until `read_line`/`flush`/the end;
+  `term_write` hits stdout now. `print` still works (no staircase) — just not for redraws.
+- **A second `term_open` errors** (one per interpreter, one per process): `term_close` first;
+  a spawned agent cannot take the terminal while main holds it.
+- **Don't undo what you didn't do**: the runtime restores raw mode/paste/kitty on close, drop,
+  error and panic; the cursor you hid or the colours you set are yours to reset.
+
 ## Agentic apps — `select`, `proc_*`, `bus_*` (engine v0.6.7+)
 
 | What you expect | What actually happens | Why / workaround |
