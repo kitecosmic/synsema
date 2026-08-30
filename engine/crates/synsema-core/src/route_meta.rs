@@ -154,7 +154,7 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     ("spend", "spend"),
 ];
 
-fn builtin_cap(name: &str) -> Option<&'static str> {
+pub fn builtin_cap(name: &str) -> Option<&'static str> {
     BUILTIN_CAPS.iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
 }
 
@@ -205,7 +205,7 @@ pub fn response_kind(body: &[Node], streaming: bool) -> Option<ResponseKind> {
 }
 
 /// `f` → "f"; `m.f` → "m.f" (un nivel: módulo.task). Otra cosa → None.
-fn callee_name(name: &Node) -> Option<String> {
+pub fn callee_name(name: &Node) -> Option<String> {
     match &name.kind {
         NodeKind::Identifier { name } => Some(name.clone()),
         NodeKind::PropertyAccess { property_name, object, .. } => match &object.kind {
@@ -217,7 +217,7 @@ fn callee_name(name: &Node) -> Option<String> {
 }
 
 /// Un `require x(scope)` con scope literal → Some(texto); scope no literal → None.
-fn require_pair(capability: &str, scope: &Option<Box<Node>>) -> (String, Option<String>) {
+pub fn require_pair(capability: &str, scope: &Option<Box<Node>>) -> (String, Option<String>) {
     let s = scope.as_ref().and_then(|n| match &n.kind {
         NodeKind::TextLiteral { value } => Some(value.clone()),
         NodeKind::NumberLiteral { value } => Some(value.to_string()),

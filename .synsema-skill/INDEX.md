@@ -11,7 +11,8 @@ core dev loop:
 | Want to… | Tell them |
 |---|---|
 | **Run** a program | `synsema run file.syn` (`--flat` for `.fsyn`) |
-| **Check** syntax fast (no run) | `synsema check file.syn` (parse-only) |
+| **Check** syntax fast (no run) | `synsema check file.syn` (parse + imports + templates) |
+| **Understand a repo without reading it all** (v0.6.13+) | `synsema code outline` / `routes` / `refs <name>` / `caps` / `check` / `search <text>` (`--json`), or the `synsema-code` MCP that `synsema init` registers in `.mcp.json` → see [code.md](code.md) |
 | **Test** / assert behavior | `synsema test file.syn` (or a dir) — `assert`/`assert_eq`/`test "..."` → see [testing.md](testing.md) |
 | **Serve** an HTTP API/site | `synsema serve file.syn` (keeps the process alive) → see [serve.md](serve.md) |
 | **Debug an error** | Read it — errors carry `file:line` + context/suggestions. Then [pitfalls.md](pitfalls.md) ("read first if something fails"). |
@@ -73,6 +74,7 @@ usually version skew, not a bug.
 - [types.md](types.md) — Type system, property access, values (number/decimal/complex/bytes/text/bool/list/map/array/enum/task)
 - [modules.md](modules.md) — Split code across files: `use` / `export` (tasks, types, lets, enums **and `routes` groups a serve can `mount`**), namespacing by alias, encapsulation (local `.syn` only)
 - [testing.md](testing.md) — Native test framework: `assert`/`assert_eq`/`assert_error`, `test "..."` blocks, `synsema test`
+- [code.md](code.md) — `synsema code` (v0.6.13+): outline/symbol/refs/routes/caps/check/search/deps over a repo, static (from the parser); the same tools as the `synsema-code` MCP server (`synsema code --mcp`, `.mcp.json` from `init`) — NOT the MCP of your app
 
 ## By topic
 - [stdlib.md](stdlib.md) — HTTP requests, WebSocket client (live feeds, gated by `net` — `ws_select` multiplexing thousands of feeds, opt-in reconnect + keepalive/half-open, backpressure, `parallel_map` fan-out), databases (SQL: SQLite / Postgres / MySQL · document: MongoDB · key-value: Redis), cron scheduler, **blockchain** (ETH/EVM · Avalanche · Solana · Algorand · **Bitcoin**: gated `sign` + audit, HD wallets/mnemonics gated by `wallet` — BIP-39/BIP-32/SLIP-0010/Algorand-25 + keystore V3 + WIF, keccak256/hash160, RLP, ABI calldata, EIP-191/712 typed-data digests, Solana message/tx + PDAs/SPL, Algorand canonical msgpack, Bitcoin UTXO builder G28 + BIP-143/341 sighash + Schnorr taproot + PSBT cold custody, base58/base32/bech32/bech32m, EIP-55 addresses) (zero dependencies)
@@ -105,6 +107,7 @@ usually version skew, not a bug.
 - Writing a new .syn program → **python-diff.md first** (you know Python; translate instead of guessing), then syntax.md, builtins.md
 - Splitting the program across files / importing (`use`/`export`, `export routes` + `mount`) → modules.md
 - Writing tests / asserting behavior → testing.md
+- Navigating a Synsema repo as an agent (what's in a file, where a task is used, the route table, missing capabilities) → code.md
 - Binary data / files / hashing / base64 → builtins.md (bytes section)
 - Complex numbers / gamma·erf / hyperbolics → builtins.md (math section)
 - Numeric arrays / matrices / linear algebra (matmul/solve/eig/svd) → builtins.md (arrays section)

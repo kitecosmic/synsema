@@ -65,6 +65,7 @@ usually version skew, not a bug.
 - [builtins.md](builtins.md) — All built-in tasks + signatures (incl. bytes, math, numeric arrays/linear algebra)
 - [types.md](types.md) — Type system, property access, values
 - [testing.md](testing.md) — Native test framework: `assert`/`assert_eq`/`assert_error`, `test "..."`
+- [code.md](code.md) — `synsema code`: outline/refs/routes/caps/check/search over a repo without reading whole files (CLI `--json` + the `synsema-code` MCP server)
 
 **By topic**
 - [stdlib.md](stdlib.md) — HTTP requests, WebSocket client (live feeds, gated by `net` — `ws_select` multiplexing thousands of feeds, opt-in reconnect + keepalive/half-open, backpressure, `parallel_map` fan-out), databases (SQL: SQLite / Postgres / MySQL · document: MongoDB · key-value: Redis), cron scheduler, blockchain (ETH/EVM · Avalanche · Solana · Algorand · Bitcoin: the full read → build → sign → send → confirm loop — RPC read-side gated by `net` (nonce/fees/balances/`eth_call`/receipts, Solana blockhash/confirm, algod params/wait, Bitcoin utxos/fees/broadcast/confirm), `tx_eip1559` and `btc_tx` builders, gated `sign` + audit (incl. Schnorr taproot), HD wallets/keystore/WIF gated by `wallet` — BIP-39/BIP-32/SLIP-0010/Algorand-25/BIP-84/86, ABI calldata, EIP-191/712, Solana message/tx + PDAs/SPL, Algorand canonical msgpack, Bitcoin UTXO builder G28 + BIP-143/341 sighash + PSBT, keccak256/hash160, RLP, base58/base32/bech32/bech32m, EIP-55)

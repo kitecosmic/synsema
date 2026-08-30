@@ -4440,6 +4440,7 @@ dependencies = [
  "num-traits",
  "regex",
  "rust_decimal",
+ "serde_json",
  "subtle",
  "zeroize",
 ]

@@ -30,6 +30,7 @@ frontend.md
 dataviz.md
 serve.md
 processes.md
+code.md
 capabilities.md
 secrets.md
 agents.md

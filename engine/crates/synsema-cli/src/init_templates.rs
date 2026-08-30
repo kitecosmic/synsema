@@ -19,6 +19,8 @@ pub const HELLO_SYN: &str = r#"-- Mi primer programa Synsema.
 --     (instala el skill: el agente escribe Synsema idiomático solo)
 --   claude mcp add --transport http synsema-docs https://docs.synsema.com/mcp
 --     (MCP de docs: busca doc con search/get y VERIFICA sus snippets con run/test en sandbox)
+--   El .mcp.json de esta carpeta ya registra `synsema-code` (synsema code --mcp): outline,
+--     routes, refs, caps, check, search sobre TU código sin leer archivos enteros.
 -- Docs para humanos: https://docs.synsema.com
 
 intent: "Mi primer programa Synsema"
@@ -271,6 +273,8 @@ pub struct InitFile {
 
 /// sha256 de cada contenido histórico de `hello.syn` (ver `InitFile::past`).
 const HELLO_SYN_PAST: &[&str] = &[
+    // v0.6.12 (antes del puntero a `synsema code` / .mcp.json)
+    "d490f12d6f562f108730243f75586ce598bd38caa25d98f8abcfc00a7680390a",
     "e69804e5b0779fd4cea54a6c89d54719c75784960b3b2bafba145121ea0e74d8",
     "ef8518377fa71f6a4bd503670b3432a6c567ff502dab81273b17c66c1794b051",
     "e5acaf4f81afd7d5b6ad09d1892d772f45e731244956298ec556f8e5859e637d",
@@ -292,15 +296,32 @@ const ENV_EXAMPLE_PAST: &[&str] = &[
     "3f1e65e2d9b87302d4183381b92d26965b2db49dc7225a5056c124a7da16f1b2",
 ];
 
+/// `.mcp.json`: registra el servidor MCP local `synsema-code` (`synsema code --mcp`) para
+/// que cualquier agente que abra la carpeta lo descubra solo. Development-time, sobre el
+/// código de este proyecto; NO es el MCP que expone la app.
+pub const MCP_JSON: &str = r#"{
+  "mcpServers": {
+    "synsema-code": {
+      "command": "synsema",
+      "args": ["code", "--mcp"]
+    }
+  }
+}
+"#;
+
+/// sha256 de cada contenido histórico de `.mcp.json` (ver `InitFile::past`).
+const MCP_JSON_PAST: &[&str] = &[];
+
 /// sha256 de cada contenido histórico de `.gitignore` (ver `InitFile::past`).
 const GITIGNORE_PAST: &[&str] =
     &["20b449a6499a877f4e5a58d94be5ba3eabf779e2cdfadc1fecf0989a3e9a6314"];
 
-/// Los tres archivos que `synsema init` genera, en orden.
-pub const INIT_FILES: [InitFile; 3] = [
+/// Los archivos que `synsema init` genera, en orden.
+pub const INIT_FILES: [InitFile; 4] = [
     InitFile { name: "hello.syn", content: HELLO_SYN, past: HELLO_SYN_PAST },
     InitFile { name: ".env.example", content: ENV_EXAMPLE, past: ENV_EXAMPLE_PAST },
     InitFile { name: ".gitignore", content: GITIGNORE, past: GITIGNORE_PAST },
+    InitFile { name: ".mcp.json", content: MCP_JSON, past: MCP_JSON_PAST },
 ];
 
 #[cfg(test)]
@@ -348,6 +369,7 @@ mod tests {
                 match f.name {
                     "hello.syn" => "HELLO_SYN",
                     ".env.example" => "ENV_EXAMPLE",
+                    ".mcp.json" => "MCP_JSON",
                     _ => "GITIGNORE",
                 }
             );

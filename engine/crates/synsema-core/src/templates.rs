@@ -741,6 +741,23 @@ pub fn check_program_static(
     program: &crate::ast::Program,
     file_path: &str,
 ) -> Result<(usize, usize), String> {
+    check_program_static_with(program, file_path, &|resolved: &str, raw: &str| {
+        let src = std::fs::read_to_string(resolved).map_err(|_| format!("module not found: {}", raw))?;
+        crate::parser::parse_source(&src, resolved).map_err(|e| e.to_string())
+    })
+}
+
+/// Cómo obtener el programa de un módulo `use` ya resuelto: `(path resuelto, path crudo del
+/// `use`)` → programa. `check_program_static` lee y parsea del disco; `synsema code` inyecta su
+/// cache de parseo. Mismo recorrido y mismos errores en ambos casos.
+pub type ModuleLoader<'a> = &'a dyn Fn(&str, &str) -> Result<crate::ast::Program, String>;
+
+/// `check_program_static` con el loader de módulos inyectado.
+pub fn check_program_static_with(
+    program: &crate::ast::Program,
+    file_path: &str,
+    load: ModuleLoader<'_>,
+) -> Result<(usize, usize), String> {
     fn scan(
         program: &crate::ast::Program,
         file_path: &str,
@@ -749,6 +766,7 @@ pub fn check_program_static(
         stack: &mut Vec<String>,
         modules: &mut usize,
         templates_seen: &mut Vec<String>,
+        load: ModuleLoader<'_>,
     ) -> Result<(), String> {
         use crate::ast::NodeKind as NK;
         if is_module {
@@ -818,11 +836,9 @@ pub fn check_program_static(
             }
             seen.push(resolved.clone());
             *modules += 1;
-            let src = std::fs::read_to_string(&resolved)
-                .map_err(|_| format!("module not found: {}", raw))?;
-            let prog = crate::parser::parse_source(&src, &resolved).map_err(|e| e.to_string())?;
+            let prog = load(&resolved, &raw)?;
             stack.push(resolved.clone());
-            let r = scan(&prog, &resolved, true, seen, stack, modules, templates_seen);
+            let r = scan(&prog, &resolved, true, seen, stack, modules, templates_seen, load);
             stack.pop();
             r?;
         }
@@ -832,7 +848,7 @@ pub fn check_program_static(
     let mut stack = vec![file_path.to_string()];
     let mut modules = 0usize;
     let mut templates_seen = Vec::new();
-    scan(program, file_path, false, &mut seen, &mut stack, &mut modules, &mut templates_seen)?;
+    scan(program, file_path, false, &mut seen, &mut stack, &mut modules, &mut templates_seen, load)?;
     Ok((modules, templates_seen.len()))
 }
 

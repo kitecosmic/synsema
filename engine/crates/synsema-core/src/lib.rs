@@ -9,6 +9,7 @@ pub mod ast;
 pub mod ast_api;
 pub mod bytesutil;
 pub mod clock;
+pub mod codeintel;
 pub mod csv;
 pub mod flat_syntax;
 pub mod interpreter;

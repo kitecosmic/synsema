@@ -24,8 +24,9 @@ use synsema_runtime::serve::{run_serve_program_with_overrides, ServeOverrides};
 mod init_templates;
 mod synfide;
 mod update;
+mod code;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--sandbox | --cap-set <list>] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] | test [-v] [--sandbox | --cap-set <list>] <archivo|dir> | check | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide] | llm status [--json] | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--sandbox | --cap-set <list>] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] | test [-v] [--sandbox | --cap-set <list>] <archivo|dir> | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide] | llm status [--json] | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
 
 // `build_ceiling` (--sandbox/--cap-set → techo) vive en synsema-capabilities: lo comparten
 // este binario y `synsema-wasm` (mismas flags, misma semántica en los dos front-ends).
@@ -74,6 +75,7 @@ fn main() -> ExitCode {
         Some("run") => cmd_run(&args),
         Some("test") => cmd_test(&args),
         Some("check") => cmd_check(&args),
+        Some("code") => code::cmd_code(&args),
         Some("openapi") => cmd_openapi(&args),
         Some("tokens") => cmd_tokens(&args),
         Some("ast") => cmd_ast(&args),
@@ -92,7 +94,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(other) => {
-            eprintln!("subcomando desconocido: '{}'. Disponibles: init, conform, serve, run, test, check, openapi, tokens, ast, repl, daemon, llm, version, update", other);
+            eprintln!("subcomando desconocido: '{}'. Disponibles: init, conform, serve, run, test, check, code, openapi, tokens, ast, repl, daemon, llm, version, update", other);
             ExitCode::from(2)
         }
         None => {
