@@ -1262,12 +1262,35 @@ route "GET /api/*path"
     proxy to "http://127.0.0.1:9000"      -- forwards the request to the upstream
 ```
 
-The target is the base; the incoming path is appended (like nginx `proxy_pass`). Needs a
-`require net "<host>"` capability for the upstream. Forwards status + content-type + body
-**and the upstream's end-to-end response headers** (`Location`, `Set-Cookie`, `Cache-Control`,
-`ETag`, …), so redirects, cookies and caching work through it; hop-by-hop headers
-(`Connection`, `Transfer-Encoding`, …) are dropped, and invalid upstream headers are skipped
-(never panic the request).
+The target is the base; the incoming path + query is appended (like nginx `proxy_pass`).
+`http://` only — TLS terminates at the edge; an `https://` or host-less target is an error at
+**startup**, not a 502 per request. The upstream is an outbound connection, so it is gated like
+`http_get`/`ws_connect`: **`require net("<upstream host>")`** or the serve refuses to start
+(deny-by-default — the edge only reaches the hosts it declares). Auth, rate limit, vhost and CORS run on the edge BEFORE the
+upstream is contacted.
+
+**It streams** (v0.6.12+; before that `proxy to` buffered the whole response and dropped upgrades). The edge is a real edge for agentic apps, not a buffered forwarder:
+- **SSE / `stream` routes** of the backend pass through in real time (chunks forwarded as they
+  arrive; the edge adds no keepalive — the backend's `stream` already does).
+- **WebSocket**: a client `Upgrade: websocket` is forwarded; the upstream's `101` comes back and
+  the connection becomes a byte tunnel in both directions until either side closes — a backend
+  `socket` route works behind the edge (`ws_connect("ws://edge/…")` from any program).
+- **Large bodies** stream to the client; `Content-Length` is preserved when the upstream sent
+  one (chunked/close-delimited upstreams stay unsized). The **request** body is still read whole
+  (up to `max_body`) before forwarding — auth and validation need it.
+- Tunnels and unsized responses count against `max_streams` (503 + `Retry-After: 5` when full)
+  and are cancelled by the ordered shutdown, exactly like native `stream`/`socket` routes.
+- A route/serve `timeout` bounds connect + upstream head (504 past it); a body/tunnel has no
+  ceiling, like `stream`.
+
+Headers: status + content-type + the upstream's end-to-end response headers (`Location`,
+`Set-Cookie` ×N, `Cache-Control`, `ETag`, `Content-Encoding`, …) cross, so redirects, cookies
+and caching work through it; hop-by-hop (`Connection`, `Keep-Alive`, `Transfer-Encoding`, `TE`,
+`Trailer`, `Proxy-*`) are dropped. Request side: end-to-end headers cross (incl. `Accept-Encoding`
+— the upstream may compress and the bytes pass untouched), `Host` becomes the upstream's, and the
+edge adds `X-Forwarded-For` (appended), `X-Forwarded-Proto` and `X-Forwarded-Host`. A malformed
+upstream response (control byte in a header) is a `502 proxy error: …` — never a panic, the edge
+stays up. WebSocket over HTTP/2 (RFC 8441) does not tunnel (h2 clients don't send `Upgrade`).
 
 **Proxying a whole site?** `route "GET /*path"` does **not** match the root `/` (the wildcard
 needs ≥1 segment) — declare `route "GET /"` as well, and one route per method you forward

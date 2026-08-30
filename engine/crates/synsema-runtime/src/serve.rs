@@ -1868,7 +1868,33 @@ fn build_host_table(
             // Reverse proxy (Lote 2): body == `proxy to <url>` → forwardea al upstream.
             let proxy_target: Option<String> = if body.len() == 1 {
                 if let NodeKind::ProxyStatement { target } = &body[0].kind {
-                    Some(interp.eval(target, env)?.to_string())
+                    let url = interp.eval(target, env)?.to_string();
+                    // Validar al arrancar (la URL se evalúa una vez): un target https://
+                    // o sin host no puede ser un 502 por request.
+                    let (_, authority, _) = match synsema_stdlib::server::parse_proxy_target(&url) {
+                        Ok(t) => t,
+                        Err(m) => {
+                            return Err(Control::Error(RuntimeError::new(format!(
+                                "proxy to: {} (route \"{} {}\")",
+                                m, method, path
+                            ))))
+                        }
+                    };
+                    // El upstream es una conexión SALIENTE: mismo gate `net(host)` que
+                    // http_get/fetch/ws_connect (deny-by-default). Se chequea acá, al
+                    // arrancar, contra las capabilities del programa — nunca por request.
+                    let host = authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(&authority).to_ascii_lowercase();
+                    let mut check = CapabilitySet::new("proxy");
+                    for cap in caps_snap.iter() {
+                        check.grant(cap.clone());
+                    }
+                    if let Err(v) = check.require(
+                        &Capability::new(CapabilityType::Net, Some(host.clone())),
+                        &format!("proxy to \"{}\" (route \"{} {}\")", url, method, path),
+                    ) {
+                        return Err(Control::Error(RuntimeError::new(v.message)));
+                    }
+                    Some(url)
                 } else {
                     None
                 }

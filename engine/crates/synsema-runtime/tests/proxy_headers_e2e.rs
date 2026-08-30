@@ -1,8 +1,9 @@
 //! Gate end-to-end: el reverse proxy (`proxy to`) debe reenviar los headers
 //! end-to-end de la respuesta del upstream al cliente (Location, Set-Cookie,
 //! Cache-Control/ETag/Vary, headers custom), preservando status + content-type +
-//! body byte-exacto, SIN reenviar los hop-by-hop (RFC 7230 §6.1) y dejando que
-//! hyper recalcule Content-Length (incl. el caso chunked→dechunk).
+//! body byte-exacto, SIN reenviar los hop-by-hop (RFC 7230 §6.1), preservando el
+//! Content-Length del upstream y pasando un body chunked en streaming (sin
+//! dechunkear en memoria: el edge reenvía los chunks a medida que llegan).
 //!
 //! Corre un programa REAL con `proxy to "http://..."` contra un upstream de prueba
 //! que emite cada caso. Cubre parser + runtime + stdlib juntos.
@@ -76,8 +77,9 @@ fn spawn_upstream() -> u16 {
                 r.extend_from_slice(&body);
                 r
             } else if path.starts_with("/chunked") {
-                // §4.7: Transfer-Encoding: chunked → el proxy dechunkea; el cliente ve
-                // Content-Length real y NINGÚN Transfer-Encoding. Body = "Hello, world!".
+                // §4.7: Transfer-Encoding: chunked → el proxy lo pasa en streaming; el
+                // cliente ve el body entero ("Hello, world!") y ningún Content-Length
+                // inventado (hyper re-encodea como chunked hacia un cliente h1).
                 let mut r = Vec::new();
                 r.extend_from_slice(
                     b"HTTP/1.1 200 OK\r\n\
@@ -114,7 +116,7 @@ fn setup() -> u16 {
     let up = spawn_upstream();
     let port = free_port();
     let prog = format!(
-        "require serve({p})\nserve on {p}\n    route \"GET /*path\"\n        proxy to \"http://127.0.0.1:{up}\"\n",
+        "require serve({p})\nrequire net(\"127.0.0.1\")\nserve on {p}\n    route \"GET /*path\"\n        proxy to \"http://127.0.0.1:{up}\"\n",
         p = port,
         up = up
     );
@@ -214,26 +216,53 @@ fn proxy_drops_hop_by_hop_headers() {
     assert!(values(&hs, "keep-alive").is_empty(), "Keep-Alive no debe reenviarse: {}", head);
 }
 
-// §4.7 — chunked→dechunk: body correcto, Content-Length real, sin Transfer-Encoding.
+// §4.7 — chunked en streaming: el cliente recibe el body entero; el edge NO inventa
+// un Content-Length (no bufferiza) — hacia h1 vuelve a salir chunked.
 #[test]
-fn proxy_dechunks_and_sets_content_length() {
+fn proxy_streams_chunked_upstream() {
     let port = setup();
-    let (head, body) = raw_get(port, "/chunked");
+    let (head, raw) = raw_get(port, "/chunked");
     assert!(head.starts_with("HTTP/1.1 200"), "status: {}", head);
-    assert_eq!(body, b"Hello, world!".to_vec(), "body dechunkeado");
     let hs = header_pairs(&head);
-    assert_eq!(values(&hs, "content-length"), vec!["13"], "Content-Length: {}", head);
-    assert!(values(&hs, "transfer-encoding").is_empty(), "Transfer-Encoding no debe reenviarse: {}", head);
+    assert!(values(&hs, "content-length").is_empty(), "no debe inventar Content-Length: {}", head);
+    let body = if values(&hs, "transfer-encoding").iter().any(|v| v.contains("chunked")) {
+        dechunk(&raw)
+    } else {
+        raw
+    };
+    assert_eq!(body, b"Hello, world!".to_vec(), "body completo a través del edge");
 }
 
-// §9 — un header inválido del upstream (byte de control) se descarta sin panic:
-// el cliente recibe status + body sin ese header, y el edge sigue vivo después.
+/// De-chunk mínimo para el lado cliente del test.
+fn dechunk(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        let nl = match data[i..].windows(2).position(|w| w == b"\r\n") {
+            Some(n) => n,
+            None => break,
+        };
+        let size = usize::from_str_radix(String::from_utf8_lossy(&data[i..i + nl]).trim(), 16).unwrap_or(0);
+        i += nl + 2;
+        if size == 0 || i + size > data.len() {
+            break;
+        }
+        out.extend_from_slice(&data[i..i + size]);
+        i += size + 2;
+    }
+    out
+}
+
+// §9 — una respuesta malformada del upstream (byte de control en un header) jamás
+// tira el edge: el cliente recibe un 502 claro (el parser HTTP del cliente hyper la
+// rechaza — no se reenvía basura), el header inválido no cruza, y el edge sigue
+// vivo para la request siguiente.
 #[test]
 fn proxy_drops_invalid_upstream_header_without_panic() {
     let port = setup();
     let (head, body) = raw_get(port, "/badheader");
-    assert!(head.starts_with("HTTP/1.1 200"), "status: {}", head);
-    assert_eq!(body, b"ok-body".to_vec(), "body intacto pese al header inválido");
+    assert!(head.starts_with("HTTP/1.1 502"), "status: {}", head);
+    assert!(String::from_utf8_lossy(&body).contains("proxy error"), "{}", String::from_utf8_lossy(&body));
     let hs = header_pairs(&head);
     assert!(values(&hs, "x-bad").is_empty(), "el header inválido no debe cruzar: {}", head);
     // Request normal posterior: el edge no se cayó por el header malformado.

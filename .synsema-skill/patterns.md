@@ -135,6 +135,60 @@ it's a placeholder — that's why the `llm_available()` guard matters ([llm.md](
 
 ## Idioms
 
+### Wall-clock job that notices it ran late (no runtime catch-up by design)
+
+```
+require time
+require file("nightly.last_run")
+
+task nightly()
+    -- the job itself; runs at 03:00 UTC, then records when it ran
+    write_file("nightly.last_run", text(now()))
+
+cron_every("0 3 * * *", nightly)
+
+-- On boot: the runtime never replays missed runs — the program decides.
+let last be nothing
+try
+    set last to number(read_file("nightly.last_run"))
+recover err
+    set last to nothing                       -- first boot: no record yet
+when last != nothing and now() - last > 86400 + 3600
+    log "nightly did not run yesterday (last " + format_time(last) + ") — running it now"
+    cron_after(0, nightly)
+```
+
+`cron_list()[i]["next_run"]` tells you when the next fire is; `last_run` is state the program
+owns (a file here; a table or `state_*` + a db under serve work the same). That keeps the scheduler stateless and the catch-up policy explicit.
+
+
+### Wall-clock job that notices it ran late (no runtime catch-up by design)
+
+```
+require time
+require file("nightly.last_run")
+
+task nightly()
+    -- the job itself; runs at 03:00 UTC, then records when it ran
+    write_file("nightly.last_run", text(now()))
+
+cron_every("0 3 * * *", nightly)
+
+-- On boot: the runtime never replays missed runs — the program decides.
+let last be nothing
+try
+    set last to number(read_file("nightly.last_run"))
+recover err
+    set last to nothing                       -- first boot: no record yet
+when last != nothing and now() - last > 86400 + 3600
+    log "nightly did not run yesterday (last " + format_time(last) + ") — running it now"
+    cron_after(0, nightly)
+```
+
+`cron_list()[i]["next_run"]` tells you when the next fire is; `last_run` is state the program
+owns (a file here; a table or `state_*` + a db under serve work the same). That keeps the scheduler stateless and the catch-up policy explicit.
+
+
 ### Safe division
 ```
 when divisor != 0

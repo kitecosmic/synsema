@@ -106,7 +106,7 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `rate_limit 100 per minute` on the block = 100 per route | It's 100/min per IP **shared** across all routes using the default | For independent budgets, set `rate_limit` per route (own zone) |
 | No `rate_limit` and I'm already protected | No — rate limiting is **opt-in** | Declare `rate_limit` on the block and/or sensitive routes |
 | `read_body()` returns binary intact | Decodes as UTF-8 (lossy for binary) | Use `read_body_bytes()` for byte-exact binary uploads |
-| A reverse-proxy forwards a binary upstream/downstream body intact | The proxy path is still UTF-8-lossy | Known limitation; don't rely on `proxy to` for binary yet |
+| `proxy to` without `require net("<upstream host>")` | The upstream is an outbound connection: deny-by-default, the serve refuses to start | Declare the upstream host (`require net("127.0.0.1")` for local backends) |
 | A `stream` route also runs `give` | `stream` and `give` are mutually exclusive | A route either streams (with `send`) or gives — not both |
 | POST with invalid JSON is silently ignored | With `Content-Type: application/json` it's a `400` | Send valid JSON, or omit the JSON content-type to get the raw body |
 | `serve on PORT` returns and the program exits | The CLI keeps the process alive while servers run (Ctrl+C to stop) | Expected; the server runs in the background |

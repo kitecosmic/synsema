@@ -484,3 +484,134 @@ cron_every(0.2, marca)
     }
     let _ = std::fs::remove_file(&path);
 }
+
+// =========================================================
+// Expresiones cron de pared (`cron_every("0 9 * * *", task, opts?)`)
+// =========================================================
+
+#[test]
+fn expr_registers_and_lists_next_run() {
+    let o = out(
+        r#"require time
+task t()
+    print("tick")
+let name be cron_every("*/5 * * * *", t)
+print(name)
+let j be cron_list()[0]
+print(j["schedule"])
+print(j["interval"] == nothing)
+print(j["tz"])
+print(j["repeating"])
+let n be j["next_run"]
+print(n > now())
+print(n - now() <= 300)
+print(floor(n) % 300)
+print(contains(cron_status(), "at '*/5 * * * *' (UTC), next "))
+cron_cancel("t")"#,
+    );
+    assert_eq!(o, vec!["t", "*/5 * * * *", "true", "UTC", "true", "true", "true", "0", "true"]);
+}
+
+#[test]
+fn tz_offset_shifts_next_run() {
+    let o = out(
+        r#"require time
+task a()
+    print("a")
+task b()
+    print("b")
+cron_every("0 9 * * *", a)
+cron_every("0 9 * * *", b, {"tz": "-03:00"})
+let na be cron_list()[0]["next_run"]
+let nb be cron_list()[1]["next_run"]
+-- 09:00 en -03:00 es 12:00Z: la diferencia es +3 h (mod 24 h).
+print((floor(nb) - floor(na) + 86400) % 86400)
+cron_cancel("a")
+cron_cancel("b")"#,
+    );
+    assert_eq!(o, vec!["10800"]);
+}
+
+#[test]
+fn expr_errors_are_clear() {
+    let o = out(
+        r#"require time
+task t()
+    print("t")
+task probe(expr, opts)
+    try
+        when opts == nothing
+            cron_every(expr, t)
+        otherwise
+            cron_every(expr, t, opts)
+        give "registered"
+    recover err
+        give err
+print(probe("0 9 *", nothing))
+print(probe("0 25 * * *", nothing))
+print(probe("@reboot", nothing))
+print(probe("0 9 * * *", {"tz": "America/Sao_Paulo"}))
+print(probe("0 9 * * *", {"zone": "UTC"}))
+print(probe("0 0 31 2 *", nothing))
+print(probe(5, {"tz": "UTC"}))
+print(probe(true, nothing))
+print(length(cron_list()))"#,
+    );
+    assert!(o[0].contains("bad cron expression \"0 9 *\"") && o[0].contains("expected 5 fields"), "{}", o[0]);
+    assert!(o[1].contains("hour 25 is out of range 0-23"), "{}", o[1]);
+    assert!(o[2].contains("cron_after(0, task)"), "{}", o[2]);
+    assert!(o[3].contains("not supported") && o[3].contains("-03:00"), "{}", o[3]);
+    assert!(o[4].contains("unknown option \"zone\""), "{}", o[4]);
+    assert!(o[5].contains("never matches within the next 5 years"), "{}", o[5]);
+    assert!(o[6].contains("options are only accepted with a cron expression"), "{}", o[6]);
+    assert!(o[7].contains("number of seconds or a cron expression"), "{}", o[7]);
+    assert_eq!(o[8], "0", "ningún job debe quedar registrado tras los errores");
+}
+
+#[test]
+fn numeric_text_is_still_an_interval() {
+    let o = out(
+        r#"require time
+task t()
+    print("t")
+cron_every("2", t)
+let j be cron_list()[0]
+print(j["schedule"])
+print(j["interval"])
+print(j["tz"] == nothing)
+print(j["next_run"] > now())
+cron_cancel("t")"#,
+    );
+    assert_eq!(o, vec!["every 2.0s", "2.0", "true", "true"]);
+}
+
+// Dispara de verdad en el próximo minuto de pared (≤ 60 s + margen). El marker
+// prueba el efecto; `run_count` la contabilidad; `next_run` avanza 60 s exactos.
+#[test]
+fn expr_fires_at_the_next_wall_clock_minute() {
+    let (path, spath) = temp_marker("wall");
+    let o = out(&format!(
+        r#"require file("{p}")
+require time
+
+task cuenta()
+    append_file("{p}", "x")
+
+cron_every("* * * * *", cuenta)
+let first be cron_list()[0]["next_run"]
+let deadline be now() + 75
+while now() < deadline and cron_list()[0]["run_count"] < 1
+    sleep(0.5)
+let j be cron_list()[0]
+print(j["run_count"] >= 1)
+print(floor(j["next_run"]) - floor(first))
+print(floor(first) % 60)"#,
+        p = spath
+    ));
+    let effects = std::fs::read_to_string(&path).unwrap_or_default().matches('x').count();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(o[0], "true", "el job debe ejecutar en el próximo minuto de pared");
+    assert!(effects >= 1, "efecto observable ausente");
+    assert_eq!(o[1], "60", "next_run avanza exactamente un minuto");
+    assert_eq!(o[2], "0", "next_run está alineado al minuto");
+}

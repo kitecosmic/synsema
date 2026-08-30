@@ -597,6 +597,9 @@ pub enum Dispatched {
     Stream { stream_handler: Option<StreamHandler>, ctx: Box<Ctx> },
     /// Ruta `socket`: el handler corre en hilo dedicado con el enlace al transporte.
     Socket { socket_handler: Option<SocketHandler>, ctx: Box<Ctx> },
+    /// Ruta `proxy to`: auth/rate-limit ya pasaron; el lado async forwardea al
+    /// upstream en streaming (SSE, WebSocket, bodies grandes). `headers` = rate-limit.
+    Proxy { target: String, headers: Vec<(String, String)> },
 }
 
 /// Cómo atender una request, resuelto ANTES de correr el intérprete (vhost + match).
@@ -606,6 +609,8 @@ pub struct RoutePlan {
     pub dedicated: bool,
     /// La ruta es un `socket` (WebSocket entrante).
     pub socket: bool,
+    /// La ruta es un `proxy to` (el transporte la atiende en streaming).
+    pub proxy: bool,
     /// Techo de vida del handler (route > serve); `None` = sin límite.
     pub timeout: Option<f64>,
 }
@@ -1112,6 +1117,7 @@ impl ServeRuntime {
                 RoutePlan {
                     dedicated: r.streaming || r.socket,
                     socket: r.socket,
+                    proxy: r.proxy_target.is_some(),
                     timeout: r.timeout.or(self.default_timeout).filter(|t| t.is_finite() && *t > 0.0),
                 }
             }
@@ -1525,26 +1531,11 @@ impl ServeRuntime {
             }
         }
 
-        // Reverse proxy (Lote 2): forwardea la request al upstream y devuelve su
-        // respuesta (status + content-type + headers end-to-end + body).
+        // Reverse proxy: auth/rate-limit/vhost ya se resolvieron acá (sync). El forward
+        // en sí lo hace el lado async (`proxy_request`) en streaming: SSE, upgrade
+        // WebSocket (túnel) y bodies grandes pasan a medida que llegan.
         if let Some(target) = &host.routes[idx].proxy_target {
-            return match proxy_forward(target, &ctx) {
-                Ok((status, content_type, mut up_headers, body)) => {
-                    // rate-limit (si hubo) + los end-to-end del upstream.
-                    let mut headers = rate_headers;
-                    headers.append(&mut up_headers);
-                    Dispatched::Response {
-                        status,
-                        body: ResponseBody::Raw(RawResponse { body, content_type, status }),
-                        headers,
-                    }
-                }
-                Err(e) => Dispatched::Response {
-                    status: 502,
-                    body: self.server_error(&format!("proxy error: {}", e)),
-                    headers: rate_headers,
-                },
-            };
+            return Dispatched::Proxy { target: target.clone(), headers: rate_headers };
         }
 
         // Socket entrante (ruta `socket`): ocupa un slot de stream (conexión larga con
@@ -1637,130 +1628,6 @@ impl ServeRuntime {
         headers.append(&mut custom_headers);
         Dispatched::Response { status, body, headers }
     }
-}
-
-// -- reverse proxy (Lote 2) --
-
-/// Respuesta del upstream de un proxy: (status, content_type, headers, body).
-type ProxyResponse = (u16, String, Vec<(String, String)>, Vec<u8>);
-
-/// Forward sync de la request al upstream `http://host[:port][/base]`. Devuelve
-/// (status, content_type, headers end-to-end, body). Cliente HTTP/1.1 mínimo
-/// (Connection: close); corre dentro de spawn_blocking, así que bloquear está bien.
-fn proxy_forward(target: &str, ctx: &Ctx) -> Result<ProxyResponse, String> {
-    use std::io::Read;
-    let rest = target
-        .strip_prefix("http://")
-        .ok_or_else(|| "proxy target must start with http://".to_string())?;
-    let (authority, base) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, ""),
-    };
-    let addr = if authority.contains(':') {
-        authority.to_string()
-    } else {
-        format!("{}:80", authority)
-    };
-    let base = base.trim_end_matches('/');
-    let mut fwd_path = format!("{}{}", base, ctx.path);
-    if !ctx.query.is_empty() {
-        let qs: Vec<String> = ctx.query.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-        fwd_path.push('?');
-        fwd_path.push_str(&qs.join("&"));
-    }
-
-    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("connect {}: {}", addr, e))?;
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-    let mut req = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", ctx.method, fwd_path, authority);
-    for (k, v) in &ctx.headers {
-        let lk = k.to_lowercase();
-        // Saltar hop-by-hop / los que recalculamos.
-        if matches!(
-            lk.as_str(),
-            "host" | "connection" | "content-length" | "transfer-encoding" | "accept-encoding"
-        ) {
-            continue;
-        }
-        req.push_str(k);
-        req.push_str(": ");
-        req.push_str(v);
-        req.push_str("\r\n");
-    }
-    req.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n", ctx.body.len()));
-    stream.write_all(req.as_bytes()).map_err(|e| format!("write head: {}", e))?;
-    stream.write_all(ctx.body.as_bytes()).map_err(|e| format!("write body: {}", e))?;
-    let _ = stream.flush();
-
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).map_err(|e| format!("read: {}", e))?;
-    parse_proxy_response(&raw)
-}
-
-fn parse_proxy_response(raw: &[u8]) -> Result<ProxyResponse, String> {
-    let pos = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| "malformed upstream response".to_string())?;
-    let head = String::from_utf8_lossy(&raw[..pos]);
-    let body_start = pos + 4;
-    let mut lines = head.split("\r\n");
-    let status_line = lines.next().unwrap_or("");
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| "bad upstream status line".to_string())?;
-    let mut content_type = "application/octet-stream".to_string();
-    let mut chunked = false;
-    // Headers end-to-end del upstream a reenviar al cliente. Se excluyen: content-type
-    // (se devuelve aparte y hyper lo emite desde head.content_type), los hop-by-hop
-    // (RFC 7230 §6.1) y content-length (hyper lo recalcula, y tras dechunk cambia).
-    let mut headers: Vec<(String, String)> = Vec::new();
-    for l in lines {
-        if let Some((k, v)) = l.split_once(':') {
-            let lk = k.trim().to_lowercase();
-            let vv = v.trim();
-            match lk.as_str() {
-                "content-type" => content_type = vv.to_string(),
-                "transfer-encoding" => {
-                    if vv.to_lowercase().contains("chunked") {
-                        chunked = true;
-                    }
-                }
-                "content-length" | "connection" | "keep-alive" | "proxy-authenticate"
-                | "proxy-authorization" | "te" | "trailer" | "upgrade" => {}
-                // Todo lo demás end-to-end (Location, Set-Cookie [cada ocurrencia],
-                // Cache-Control, ETag, Last-Modified, Vary, WWW-Authenticate,
-                // Content-Encoding, X-*, …). Se preserva el casing original de la clave.
-                _ => headers.push((k.trim().to_string(), vv.to_string())),
-            }
-        }
-    }
-    let body_raw = &raw[body_start..];
-    let body = if chunked { dechunk(body_raw) } else { body_raw.to_vec() };
-    Ok((status, content_type, headers, body))
-}
-
-/// De-chunk de un body `Transfer-Encoding: chunked`.
-fn dechunk(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < data.len() {
-        let nl = match data[i..].windows(2).position(|w| w == b"\r\n") {
-            Some(n) => n,
-            None => break,
-        };
-        let size_str = String::from_utf8_lossy(&data[i..i + nl]);
-        let size = usize::from_str_radix(size_str.trim().split(';').next().unwrap_or("").trim(), 16)
-            .unwrap_or(0);
-        i += nl + 2;
-        if size == 0 || i + size > data.len() {
-            break;
-        }
-        out.extend_from_slice(&data[i..i + size]);
-        i += size + 2; // chunk + CRLF
-    }
-    out
 }
 
 // -- helpers de matching/estáticos (libres) --
@@ -2152,6 +2019,14 @@ struct HeadInfo {
     hsts: bool,
     /// `101 Switching Protocols` de un socket entrante: `(Sec-WebSocket-Accept, protocolo)`.
     upgrade: Option<(String, Option<String>)>,
+    /// Ruta `proxy to`: el lado async forwardea (streaming) en vez de emitir `body_rx`.
+    proxy: Option<ProxyPlan>,
+}
+
+/// Lo que el dispatch resolvió para una ruta `proxy to`: upstream + headers (rate-limit).
+struct ProxyPlan {
+    target: String,
+    headers: Vec<(String, String)>,
 }
 
 /// Slot donde el hub deja su `mio::Waker` para el pump de un socket entrante.
@@ -2314,6 +2189,350 @@ async fn pump_upgraded_socket(
     tokio::join!(reader, writer);
 }
 
+// -- reverse proxy en streaming (`proxy to`) --
+
+/// `http://host[:port][/base]` → (addr para conectar, authority para `Host`, base sin `/` final).
+pub fn parse_proxy_target(target: &str) -> Result<(String, String, String), String> {
+    let t = target.trim();
+    let rest = match t.strip_prefix("http://") {
+        Some(r) => r,
+        None => {
+            return Err(format!(
+                "the target must be an http:// URL (got \"{}\"); TLS terminates at the edge — point it at the backend's plain http port",
+                t
+            ))
+        }
+    };
+    let (authority, base) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    if authority.is_empty() || authority.starts_with(':') {
+        return Err(format!("the target needs a host (got \"{}\")", t));
+    }
+    let addr = if authority.rsplit(':').next().map(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty()).unwrap_or(false)
+        && authority.contains(':')
+    {
+        authority.to_string()
+    } else {
+        format!("{}:80", authority)
+    };
+    Ok((addr, authority.to_string(), base.trim_end_matches('/').to_string()))
+}
+
+/// Hop-by-hop (RFC 7230 §6.1): no cruzan el proxy en ninguna dirección.
+fn is_hop_by_hop(lower_name: &str) -> bool {
+    matches!(
+        lower_name,
+        "connection" | "keep-alive" | "proxy-authenticate" | "proxy-authorization" | "te" | "trailer"
+            | "transfer-encoding" | "upgrade"
+    )
+}
+
+fn proxy_error_response(
+    status: u16,
+    msg: String,
+    extra: &[(String, String)],
+    cors: Option<&str>,
+    hsts: bool,
+) -> Response<RespBody> {
+    let body = obj(vec![("error", Json::Str(msg)), ("status", Json::Int(status as i64))]);
+    json_full(status, dumps(&body), extra, cors, hsts, false)
+}
+
+/// Forward de una request `proxy to` al upstream, en streaming. El cliente hyper
+/// (http1) maneja chunked/length/close/upgrade; el edge NO parsea HTTP a mano.
+/// - respuesta normal: los frames del body se reenvían a medida que llegan
+///   (`ProxyBody`); `Content-Length` se preserva si el upstream lo dio.
+/// - `101` a un upgrade WebSocket del cliente: túnel bidireccional de bytes.
+/// - `timeout` (route/serve) acota connect + head del upstream; el body/túnel no
+///   tiene techo (como `stream`/`socket`) — lo corta el shutdown o cualquier extremo.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_request(
+    rt: Arc<ServeRuntime>,
+    plan: ProxyPlan,
+    method: String,
+    target_pq: String,
+    headers: Vec<(String, String)>,
+    body: Bytes,
+    client_ip: String,
+    upgrade: Option<hyper::upgrade::OnUpgrade>,
+    timeout: Option<f64>,
+    cors: Option<String>,
+    hsts: bool,
+) -> Response<RespBody> {
+    use hyper::body::Body as _;
+    use hyper::http::header::{HeaderName, HeaderValue};
+
+    let extra = plan.headers;
+    let (addr, authority, base) = match parse_proxy_target(&plan.target) {
+        Ok(x) => x,
+        Err(e) => return proxy_error_response(502, format!("proxy error: {}", e), &extra, cors.as_deref(), hsts),
+    };
+    let wait = Duration::from_secs_f64(timeout.filter(|t| t.is_finite() && *t > 0.0).unwrap_or(30.0));
+    let tcp = match tokio::time::timeout(wait, tokio::net::TcpStream::connect(&addr)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            return proxy_error_response(502, format!("proxy error: connect {}: {}", addr, e), &extra, cors.as_deref(), hsts)
+        }
+        Err(_) => {
+            return proxy_error_response(
+                504,
+                format!("gateway timeout: the upstream {} did not accept the connection within {}s", addr, wait.as_secs_f64()),
+                &extra,
+                cors.as_deref(),
+                hsts,
+            )
+        }
+    };
+    let _ = tcp.set_nodelay(true);
+    let (mut sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await {
+        Ok(x) => x,
+        Err(e) => return proxy_error_response(502, format!("proxy error: {}", e), &extra, cors.as_deref(), hsts),
+    };
+    tokio::spawn(async move {
+        let _ = conn.with_upgrades().await;
+    });
+
+    let is_ws = upgrade.is_some();
+    let pq = if target_pq.starts_with('/') { target_pq } else { format!("/{}", target_pq) };
+    let uri = format!("{}{}", base, pq);
+    let mut rb = Request::builder().method(method.as_str()).uri(uri.as_str());
+    rb = rb.header("Host", authority.as_str());
+    let mut fwd_for: Option<String> = None;
+    let mut orig_host: Option<String> = None;
+    for (k, v) in &headers {
+        let lk = k.to_ascii_lowercase();
+        match lk.as_str() {
+            "host" => {
+                orig_host = Some(v.clone());
+                continue;
+            }
+            "content-length" | "x-forwarded-proto" | "x-forwarded-host" => continue,
+            "x-forwarded-for" => {
+                fwd_for = Some(v.clone());
+                continue;
+            }
+            // En un upgrade WebSocket, `Upgrade` y `Sec-WebSocket-*` cruzan tal cual.
+            "upgrade" if is_ws => {}
+            _ if is_hop_by_hop(&lk) => continue,
+            _ => {}
+        }
+        if let (Ok(n), Ok(val)) = (HeaderName::try_from(k.as_str()), HeaderValue::try_from(v.as_str())) {
+            rb = rb.header(n, val);
+        }
+    }
+    if is_ws {
+        rb = rb.header("Connection", "Upgrade");
+    }
+    let xff = match fwd_for {
+        Some(prev) if !prev.trim().is_empty() => format!("{}, {}", prev.trim(), client_ip),
+        _ => client_ip.clone(),
+    };
+    rb = rb.header("X-Forwarded-For", xff.as_str());
+    rb = rb.header("X-Forwarded-Proto", if rt.tls_enabled { "https" } else { "http" });
+    if let Some(h) = orig_host {
+        if let Ok(val) = HeaderValue::try_from(h.as_str()) {
+            rb = rb.header("X-Forwarded-Host", val);
+        }
+    }
+    let req = match rb.body(Full::new(body)) {
+        Ok(r) => r,
+        Err(e) => return proxy_error_response(502, format!("proxy error: bad request for upstream: {}", e), &extra, cors.as_deref(), hsts),
+    };
+    let resp = match tokio::time::timeout(wait, sender.send_request(req)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return proxy_error_response(502, format!("proxy error: {}", e), &extra, cors.as_deref(), hsts),
+        Err(_) => {
+            return proxy_error_response(
+                504,
+                format!("gateway timeout: the upstream did not answer within {}s", wait.as_secs_f64()),
+                &extra,
+                cors.as_deref(),
+                hsts,
+            )
+        }
+    };
+    let status = resp.status().as_u16();
+
+    // 101 al upgrade del cliente → túnel de bytes en ambas direcciones.
+    if status == 101 {
+        let down = match upgrade {
+            Some(d) => d,
+            None => {
+                return proxy_error_response(
+                    502,
+                    "proxy error: the upstream switched protocols without an upgrade request".to_string(),
+                    &extra,
+                    cors.as_deref(),
+                    hsts,
+                )
+            }
+        };
+        if !rt.try_acquire_stream() {
+            return proxy_error_response(
+                503,
+                "too many concurrent streams".to_string(),
+                &[("Retry-After".to_string(), "5".to_string())],
+                cors.as_deref(),
+                hsts,
+            );
+        }
+        let mut builder = Response::builder().status(101).header("Upgrade", "websocket").header("Connection", "Upgrade");
+        for (k, v) in resp.headers() {
+            if k.as_str().starts_with("sec-websocket-") {
+                builder = builder.header(k.clone(), v.clone());
+            }
+        }
+        let cancel = CancelToken::new();
+        rt.begin_request(&cancel, true);
+        let guard = RequestGuard { rt: rt.clone(), cancel: cancel.clone() };
+        let rt2 = rt.clone();
+        tokio::spawn(async move {
+            let _guard = guard;
+            let mut resp = resp;
+            let up = hyper::upgrade::on(&mut resp).await;
+            let down = down.await;
+            if let (Ok(up), Ok(down)) = (up, down) {
+                let mut a = TokioIo::new(up);
+                let mut b = TokioIo::new(down);
+                let copy = tokio::io::copy_bidirectional(&mut a, &mut b);
+                tokio::pin!(copy);
+                loop {
+                    tokio::select! {
+                        _ = &mut copy => break,
+                        _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                            if cancel.is_cancelled() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            rt2.release_stream();
+        });
+        return builder.body(Full::new(Bytes::new()).boxed()).unwrap_or_else(|_| {
+            proxy_error_response(502, "proxy error: invalid upgrade response".to_string(), &[], None, false)
+        });
+    }
+
+    // Respuesta normal: status + headers end-to-end + body en streaming.
+    let mut builder = Response::builder().status(status);
+    for (k, v) in resp.headers() {
+        if is_hop_by_hop(k.as_str()) {
+            continue;
+        }
+        builder = builder.header(k.clone(), v.clone());
+    }
+    if let Some(o) = &cors {
+        builder = builder.header("Access-Control-Allow-Origin", o);
+    }
+    if hsts {
+        builder = builder.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+    }
+    for (k, v) in &extra {
+        if let (Ok(n), Ok(val)) = (HeaderName::try_from(k.as_str()), HeaderValue::try_from(v.as_str())) {
+            builder = builder.header(n, val);
+        }
+    }
+    let is_head = method.eq_ignore_ascii_case("HEAD");
+    let sized = resp.body().size_hint().exact().is_some() || resp.body().is_end_stream();
+    // Un body sin tamaño conocido (SSE, chunked, close-delimited) es long-lived:
+    // ocupa un slot de stream y se cancela en el shutdown, como `stream` nativo.
+    let slot = !sized && !is_head;
+    if slot && !rt.try_acquire_stream() {
+        return proxy_error_response(
+            503,
+            "too many concurrent streams".to_string(),
+            &[("Retry-After".to_string(), "5".to_string())],
+            cors.as_deref(),
+            hsts,
+        );
+    }
+    let cancel = CancelToken::new();
+    rt.begin_request(&cancel, slot);
+    let guard = RequestGuard { rt: rt.clone(), cancel: cancel.clone() };
+    let body = ProxyBody { inner: resp.into_body(), cancel, tick: None, slot, rt: rt.clone(), _guard: guard };
+    match builder.body(body.boxed()) {
+        Ok(r) => r,
+        Err(e) => proxy_error_response(502, format!("proxy error: invalid upstream response: {}", e), &extra, cors.as_deref(), hsts),
+    }
+}
+
+/// Body de una respuesta proxied: delega en el `Incoming` del cliente hyper frame a
+/// frame; termina si la request se cancela (shutdown); libera el slot de stream al
+/// dropearse. `size_hint` delegado → hyper emite `Content-Length` exacto cuando el
+/// upstream lo dio, chunked (h1) / DATA (h2) si no.
+struct ProxyBody {
+    inner: Incoming,
+    cancel: CancelToken,
+    tick: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    slot: bool,
+    rt: Arc<ServeRuntime>,
+    _guard: RequestGuard,
+}
+
+impl hyper::body::Body for ProxyBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Bytes>, std::convert::Infallible>>> {
+        use std::task::Poll;
+        if self.cancel.is_cancelled() {
+            return Poll::Ready(None);
+        }
+        match std::pin::Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Ready(Some(Ok(f))) => {
+                self.tick = None;
+                Poll::Ready(Some(Ok(f)))
+            }
+            // El upstream cortó a mitad: el cliente ve el fin (con Content-Length,
+            // hyper cierra la conexión por body corto — visible, no silencioso).
+            Poll::Ready(Some(Err(_))) | Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                if !self.slot {
+                    return Poll::Pending;
+                }
+                // Long-lived: vigilar la cancelación aunque el upstream esté callado.
+                if self.tick.is_none() {
+                    self.tick = Some(Box::pin(tokio::time::sleep(Duration::from_millis(250))));
+                }
+                let fired = match self.tick.as_mut() {
+                    Some(s) => std::future::Future::poll(s.as_mut(), cx).is_ready(),
+                    None => false,
+                };
+                if fired {
+                    if self.cancel.is_cancelled() {
+                        return Poll::Ready(None);
+                    }
+                    self.tick = Some(Box::pin(tokio::time::sleep(Duration::from_millis(250))));
+                    // Registrar el waker del timer nuevo.
+                    if let Some(s) = self.tick.as_mut() {
+                        let _ = std::future::Future::poll(s.as_mut(), cx);
+                    }
+                }
+                Poll::Pending
+            }
+        }
+    }
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+}
+
+impl Drop for ProxyBody {
+    fn drop(&mut self) {
+        if self.slot {
+            self.rt.release_stream();
+        }
+    }
+}
+
 fn response_body_bytes(body: ResponseBody) -> (String, Bytes) {
     match body {
         ResponseBody::Json(j) => ("application/json".to_string(), Bytes::from(dumps(&j))),
@@ -2471,6 +2690,13 @@ async fn handle_request(
     // Plan de atención (vhost + match, sin auth ni handler): hilo, socket, timeout.
     let plan = rt.route_plan(&eff_method, &path, &headers);
 
+    // Ruta `proxy to` con `Upgrade: websocket`: tomar el upgrade de hyper ANTES de
+    // consumir el body (como en `socket`); si el upstream responde 101 se tuneliza.
+    let mut proxy_upgrade: Option<hyper::upgrade::OnUpgrade> = None;
+    if plan.proxy && !is_head && websocket_upgrade_key(&headers).is_some() {
+        proxy_upgrade = Some(hyper::upgrade::on(&mut req));
+    }
+
     // Ruta `socket`: validar el upgrade RFC 6455 ANTES de consumir el body (el
     // `hyper::upgrade::on` necesita la request entera). Sin upgrade → 426.
     let mut on_upgrade: Option<(hyper::upgrade::OnUpgrade, String)> = None;
@@ -2516,6 +2742,12 @@ async fn handle_request(
         } else {
             (String::from_utf8_lossy(&body_bytes).into_owned(), body_bytes.to_vec(), None)
         };
+    // Lo que el forward de un `proxy to` necesita (el job sync consume el resto).
+    let proxy_req = if plan.proxy {
+        Some((method.clone(), target.clone(), headers.clone(), body_bytes.clone(), client_ip.clone()))
+    } else {
+        None
+    };
 
     // ¿La ruta que matchearía es un `stream`? Resolución barata (vhost + match de ruta,
     // sin auth ni handler) para decidir el hilo: los streams (long-lived, Ctx !Send) corren
@@ -2631,6 +2863,7 @@ async fn handle_request(
                     cors: cors_b,
                     hsts,
                     upgrade: None,
+                    proxy: None,
                 });
                 let _ = body_tx.blocking_send(bytes);
             }
@@ -2646,6 +2879,7 @@ async fn handle_request(
                             cors: cors_b,
                             hsts,
                             upgrade: Some((accept, subprotocol_ack)),
+                            proxy: None,
                         });
                         if let Some(sh) = socket_handler {
                             // El error del handler ya viajó al cliente como Close 1011
@@ -2665,6 +2899,7 @@ async fn handle_request(
                             cors: cors_b,
                             hsts,
                             upgrade: None,
+                            proxy: None,
                         });
                         let body = obj(vec![
                             ("error", Json::Str("socket route reached without an upgrade".into())),
@@ -2674,6 +2909,21 @@ async fn handle_request(
                     }
                 }
                 rt2.release_stream();
+            }
+            Dispatched::Proxy { target, headers } => {
+                // El forward corre del lado async; acá sólo se entrega el plan y el
+                // worker del pool queda libre.
+                let _ = head_tx.send(HeadInfo {
+                    status: 0,
+                    content_type: None,
+                    extra: Vec::new(),
+                    streaming: false,
+                    close: false,
+                    cors: cors_b,
+                    hsts,
+                    upgrade: None,
+                    proxy: Some(ProxyPlan { target, headers }),
+                });
             }
             Dispatched::Stream { stream_handler, ctx } => {
                 let _ = head_tx.send(HeadInfo {
@@ -2688,6 +2938,7 @@ async fn handle_request(
                     cors: cors_b,
                     hsts,
                     upgrade: None,
+                    proxy: None,
                 });
                 if let Some(sh) = stream_handler {
                     let emit = channel_emitter(body_tx.clone());
@@ -2777,6 +3028,13 @@ async fn handle_request(
             }
         }
     };
+
+    // Ruta `proxy to`: forward en streaming (SSE / túnel WebSocket / bodies grandes).
+    if let Some(pp) = head.proxy {
+        let (m, pq, hs, body, ip) =
+            proxy_req.unwrap_or_else(|| (method.clone(), target.clone(), Vec::new(), Bytes::new(), String::new()));
+        return Ok(proxy_request(rt.clone(), pp, m, pq, hs, body, ip, proxy_upgrade, plan.timeout, cors, hsts).await);
+    }
 
     // 101 Switching Protocols: responder y, cuando hyper entregue el socket crudo,
     // arrancar el pump hacia el hilo del handler.

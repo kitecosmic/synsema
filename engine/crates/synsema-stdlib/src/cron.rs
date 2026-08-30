@@ -6,8 +6,10 @@
 //! setea un flag y despierta el hilo (`unpark`) para que salga limpio.
 //!
 //! Semántica (documentada):
-//! - **Delay fijo entre FIN y próximo inicio** (no cron de pared): un job jamás se
-//!   solapa consigo mismo por construcción (hilo único por job).
+//! - **Intervalos**: delay fijo entre FIN y próximo inicio. **Expresiones cron** (de
+//!   pared, `cronexpr`): próximo minuto que matchea DESPUÉS de terminar la corrida
+//!   anterior (las ocurrencias que cayeron durante una corrida larga se saltean).
+//!   En ambos casos un job jamás se solapa consigo mismo (hilo único por job).
 //! - **Verdad observacional:** `run_count` sólo avanza cuando el task ejecutó
 //!   COMPLETO; un tick que termina en error incrementa `errors` (ya logueado por el
 //!   ejecutor). `run_count + errors` == ticks disparados.
@@ -25,9 +27,14 @@ use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 
+use chrono::FixedOffset;
+
+use synsema_core::clock::now_secs_f64;
 use synsema_core::interpreter::{Control, Interpreter};
 use synsema_core::number::py_float_str;
 use synsema_core::types::{syn_bool, syn_float, syn_int, syn_list, syn_map, syn_text, SynValue};
+
+use crate::cronexpr::{self, CronExpr};
 
 /// Tarea de un job (thread-safe, corre en el hilo del timer). Devuelve `Ok(())` si
 /// el task ejecutó completo y `Err(())` si terminó en error (el ejecutor ya lo
@@ -42,20 +49,72 @@ pub type Task = Box<dyn Fn() -> Result<(), ()> + Send + 'static>;
 pub type ExecutorFactory =
     Rc<dyn Fn(&Interpreter, &SynValue, &str) -> Result<(String, Task), String>>;
 
+/// Cuándo dispara un job.
+#[derive(Clone, Debug)]
+pub enum Schedule {
+    /// Cada N segundos entre fin y próximo inicio.
+    Every(f64),
+    /// Una sola vez tras N segundos.
+    After(f64),
+    /// Expresión cron de pared en un offset fijo.
+    At { expr: CronExpr, off: FixedOffset },
+}
+
+impl Schedule {
+    /// Texto para `cron_list()["schedule"]` / `cron_status()`.
+    pub fn label(&self) -> String {
+        match self {
+            Schedule::Every(s) => format!("every {}s", py_float_str(*s)),
+            Schedule::After(s) => format!("after {}s", py_float_str(*s)),
+            Schedule::At { expr, .. } => expr.source().to_string(),
+        }
+    }
+    pub fn repeating(&self) -> bool {
+        !matches!(self, Schedule::After(_))
+    }
+    pub fn interval(&self) -> Option<f64> {
+        match self {
+            Schedule::Every(s) | Schedule::After(s) => Some(*s),
+            Schedule::At { .. } => None,
+        }
+    }
+    pub fn tz(&self) -> Option<String> {
+        match self {
+            Schedule::At { off, .. } => Some(cronexpr::offset_label(*off)),
+            _ => None,
+        }
+    }
+    /// Próximo disparo desde ahora (unix secs) — lo que el hilo del job va a esperar.
+    fn first_fire(&self) -> Option<f64> {
+        match self {
+            Schedule::Every(s) | Schedule::After(s) => Some(now_secs_f64() + s.max(0.0)),
+            Schedule::At { expr, off } => expr.next_after(now_secs_f64().floor() as i64, *off).map(|t| t as f64),
+        }
+    }
+}
+
 /// Vista de un job para list_jobs/format_status.
 #[derive(Clone, Debug)]
 pub struct JobInfo {
     pub name: String,
-    pub interval: f64,
+    pub schedule: String,
+    /// `Some` en jobs de intervalo/after; `None` en expresiones cron.
+    pub interval: Option<f64>,
     pub repeating: bool,
     pub active: bool,
     pub run_count: u64,
     pub errors: u64,
+    /// Próximo disparo (unix secs); `None` si ya no hay (after ejecutado, pendiente de start).
+    pub next_run: Option<f64>,
+    pub tz: Option<String>,
 }
 
+/// Próximo disparo publicado por el hilo del job (unix secs, reloj de pared).
+type NextAt = Arc<Mutex<Option<f64>>>;
+
 struct JobHandle {
-    interval: f64,
-    repeating: bool,
+    schedule: Schedule,
+    next_at: NextAt,
     cancelled: Arc<AtomicBool>,
     run_count: Arc<AtomicU64>,
     errors: Arc<AtomicU64>,
@@ -94,11 +153,32 @@ impl CronScheduler {
     }
 
     pub fn every(&self, interval_seconds: f64, name: &str, task: Task) {
-        self.schedule(interval_seconds, name, task, true);
+        self.schedule(Schedule::Every(interval_seconds), name, task);
     }
 
     pub fn after(&self, delay_seconds: f64, name: &str, task: Task) {
-        self.schedule(delay_seconds, name, task, false);
+        self.schedule(Schedule::After(delay_seconds), name, task);
+    }
+
+    /// Expresión cron de pared (`"0 9 * * *"`) en un offset fijo.
+    pub fn at(&self, expr: CronExpr, off: FixedOffset, name: &str, task: Task) {
+        self.schedule(Schedule::At { expr, off }, name, task);
+    }
+
+    /// Espera `dur` parked (cero CPU), despertable por unpark (cancelación), robusta a
+    /// wakeups espurios. `true` si se canceló.
+    fn wait_parked(dur: Duration, cancelled: &AtomicBool) -> bool {
+        let deadline = Instant::now() + dur;
+        loop {
+            if cancelled.load(Ordering::SeqCst) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            thread::park_timeout(deadline - now);
+        }
     }
 
     /// Hilo de un job: espera parked → ejecuta → cuenta → reprograma (si repite).
@@ -106,31 +186,55 @@ impl CronScheduler {
     /// `run_count`; error → `errors`. El lock de jobs NO se sostiene nunca durante
     /// la ejecución (un task puede registrar otro cron sin deadlock).
     fn spawn_job_thread(
-        interval: f64,
-        repeating: bool,
+        schedule: Schedule,
         cancelled: Arc<AtomicBool>,
         run_count: Arc<AtomicU64>,
         errors: Arc<AtomicU64>,
+        next_at: NextAt,
         task: Task,
     ) -> thread::Thread {
-        let dur = Duration::from_secs_f64(interval.max(0.0));
+        let set_next = move |v: Option<f64>| {
+            if let Ok(mut g) = next_at.lock() {
+                *g = v;
+            }
+        };
         let jh = thread::spawn(move || loop {
-            // Espera `dur`, despertable por unpark (cancelación), robusto a wakeups
-            // espurios. Parked: cero CPU mientras espera.
-            let deadline = Instant::now() + dur;
-            loop {
-                if cancelled.load(Ordering::SeqCst) {
-                    return;
+            match &schedule {
+                Schedule::Every(secs) | Schedule::After(secs) => {
+                    let dur = Duration::from_secs_f64(secs.max(0.0));
+                    set_next(Some(now_secs_f64() + dur.as_secs_f64()));
+                    if Self::wait_parked(dur, &cancelled) {
+                        return;
+                    }
                 }
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
+                Schedule::At { expr, off } => {
+                    // Próximo minuto de pared que matchea, DESPUÉS de ahora. Se espera
+                    // en tramos de ≤ 60 s recomputando contra el reloj de pared: un
+                    // salto del reloj (NTP) no deja al job dormido de más ni de menos.
+                    let target = match expr.next_after(now_secs_f64().floor() as i64, *off) {
+                        Some(t) => t as f64,
+                        None => {
+                            set_next(None);
+                            return; // validado al registrar; defensivo
+                        }
+                    };
+                    set_next(Some(target));
+                    loop {
+                        let remaining = target - now_secs_f64();
+                        if remaining <= 0.0 {
+                            break;
+                        }
+                        let slice = Duration::from_secs_f64(remaining.min(60.0));
+                        if Self::wait_parked(slice, &cancelled) {
+                            return;
+                        }
+                    }
                 }
-                thread::park_timeout(deadline - now);
             }
             if cancelled.load(Ordering::SeqCst) {
                 return;
             }
+            set_next(None);
             match task() {
                 Ok(()) => {
                     run_count.fetch_add(1, Ordering::SeqCst);
@@ -139,32 +243,35 @@ impl CronScheduler {
                     errors.fetch_add(1, Ordering::SeqCst);
                 }
             }
-            if !repeating {
+            if !schedule.repeating() {
                 return;
             }
         });
         jh.thread().clone() // jh se dropea → hilo desacoplado (detached)
     }
 
-    fn schedule(&self, interval: f64, name: &str, task: Task, repeating: bool) {
+    fn schedule(&self, schedule: Schedule, name: &str, task: Task) {
         // Cancela un job existente con el mismo nombre (mismo nombre = reemplaza).
         self.cancel(name);
 
         let cancelled = Arc::new(AtomicBool::new(false));
         let run_count = Arc::new(AtomicU64::new(0));
         let errors = Arc::new(AtomicU64::new(0));
+        let next_at: NextAt = Arc::new(Mutex::new(None));
 
         // La decisión spawn-ahora vs pendiente se toma BAJO el lock de jobs (misma
         // sección crítica que `start()`): un job no puede ni perderse ni arrancar
         // dos veces por una carrera registración/arranque.
         let mut jobs = self.jobs.lock().unwrap();
         let (thread, pending) = if self.started.load(Ordering::SeqCst) {
+            // `next_run` visible YA en cron_list() (el hilo lo refina al arrancar).
+            *next_at.lock().unwrap() = schedule.first_fire();
             let t = Self::spawn_job_thread(
-                interval,
-                repeating,
+                schedule.clone(),
                 cancelled.clone(),
                 run_count.clone(),
                 errors.clone(),
+                next_at.clone(),
                 task,
             );
             (Some(t), None)
@@ -173,7 +280,7 @@ impl CronScheduler {
         };
         jobs.insert(
             name.to_string(),
-            JobHandle { interval, repeating, cancelled, run_count, errors, thread, pending },
+            JobHandle { schedule, next_at, cancelled, run_count, errors, thread, pending },
         );
     }
 
@@ -185,12 +292,13 @@ impl CronScheduler {
         self.started.store(true, Ordering::SeqCst);
         for (_, job) in jobs.iter_mut() {
             if let Some(task) = job.pending.take() {
+                *job.next_at.lock().unwrap() = job.schedule.first_fire();
                 job.thread = Some(Self::spawn_job_thread(
-                    job.interval,
-                    job.repeating,
+                    job.schedule.clone(),
                     job.cancelled.clone(),
                     job.run_count.clone(),
                     job.errors.clone(),
+                    job.next_at.clone(),
                     task,
                 ));
             }
@@ -231,11 +339,14 @@ impl CronScheduler {
             .iter()
             .map(|(name, j)| JobInfo {
                 name: name.clone(),
-                interval: j.interval,
-                repeating: j.repeating,
+                schedule: j.schedule.label(),
+                interval: j.schedule.interval(),
+                repeating: j.schedule.repeating(),
                 active: true,
                 run_count: j.run_count.load(Ordering::SeqCst),
                 errors: j.errors.load(Ordering::SeqCst),
+                next_run: j.next_at.lock().ok().and_then(|g| *g),
+                tz: j.schedule.tz(),
             })
             .collect()
     }
@@ -247,18 +358,30 @@ impl CronScheduler {
         }
         let mut lines = vec![format!("Scheduled Tasks ({}):", jobs.len())];
         for j in &jobs {
-            let repeat = if j.repeating {
-                format!("every {}s", py_float_str(j.interval))
-            } else {
-                "once".to_string()
+            let when = match (&j.tz, j.repeating) {
+                (Some(tz), _) => format!("at '{}' ({})", j.schedule, tz),
+                (None, true) => j.schedule.clone(),
+                (None, false) => "once".to_string(),
+            };
+            let next = match j.next_run {
+                Some(t) => format!(", next {}", iso_utc(t)),
+                None => String::new(),
             };
             let status = if j.active { "active" } else { "cancelled" };
             lines.push(format!(
-                "  [{}] {}: {}, runs: {}, errors: {}",
-                status, j.name, repeat, j.run_count, j.errors
+                "  [{}] {}: {}{}, runs: {}, errors: {}",
+                status, j.name, when, next, j.run_count, j.errors
             ));
         }
         lines.join("\n")
+    }
+}
+
+/// ISO-8601 UTC de un timestamp (para `cron_status()`; misma forma que `format_time`).
+fn iso_utc(ts: f64) -> String {
+    match chrono::DateTime::from_timestamp(ts.floor() as i64, 0) {
+        Some(dt) => dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        None => py_float_str(ts),
     }
 }
 
@@ -328,26 +451,95 @@ pub fn register_cron_builtins(
     executor: ExecutorFactory,
 ) {
     // cron_every(seconds, task) — job repetitivo: delay fijo entre fin y próximo inicio.
+    // cron_every(expr, task, opts?) — expresión cron de pared ("0 9 * * *", "@daily");
+    // opts: {"tz": "UTC" | "+HH:MM" | "-HH:MM"} (offset fijo; default UTC).
     {
         let sched = scheduler.clone();
         let exec = executor.clone();
         interp.register_builtin(
             "cron_every",
-            2,
+            -1,
             Rc::new(move |i, args, _loc| {
-                let interval = arg_f64(args.first().ok_or_else(|| err("missing argument"))?);
-                if !interval.is_finite() || interval <= 0.0 {
-                    // Un intervalo 0/negativo sería un loop de ejecución continua que
-                    // se come un core — error claro, jamás un spinner silencioso.
+                if args.len() < 2 || args.len() > 3 {
                     return Err(err(&format!(
-                        "cron_every: the interval must be a positive number of seconds, got {}",
-                        py_float_str(interval)
+                        "cron_every: expected (seconds, task) or (expression, task, options?), got {} argument(s)",
+                        args.len()
                     )));
                 }
-                let task_v = args.get(1).ok_or_else(|| err("missing argument"))?;
-                let (name, task) =
-                    exec(i, task_v, "cron_every").map_err(|m| err(&m))?;
-                sched_of(&sched, "cron_every")?.every(interval, &name, task);
+                let first = &args[0];
+                let task_v = &args[1];
+                // Un número (o texto numérico, compat) sigue siendo un intervalo.
+                let numeric = match first {
+                    SynValue::Number(n) => Some(n.to_f64()),
+                    SynValue::Text(s) => s.trim().parse::<f64>().ok(),
+                    _ => None,
+                };
+                if let Some(interval) = numeric {
+                    if args.len() == 3 {
+                        return Err(err(
+                            "cron_every: options are only accepted with a cron expression (cron_every(\"0 9 * * *\", task, {\"tz\": \"-03:00\"}))",
+                        ));
+                    }
+                    if !interval.is_finite() || interval <= 0.0 {
+                        // Un intervalo 0/negativo sería un loop de ejecución continua que
+                        // se come un core — error claro, jamás un spinner silencioso.
+                        return Err(err(&format!(
+                            "cron_every: the interval must be a positive number of seconds, got {}",
+                            py_float_str(interval)
+                        )));
+                    }
+                    let (name, task) = exec(i, task_v, "cron_every").map_err(|m| err(&m))?;
+                    sched_of(&sched, "cron_every")?.every(interval, &name, task);
+                    return Ok(syn_text(name));
+                }
+                let expr_src = match first {
+                    SynValue::Text(s) => s.to_string(),
+                    other => {
+                        return Err(err(&format!(
+                            "cron_every: the first argument must be a number of seconds or a cron expression (text), got {}",
+                            other.type_name()
+                        )))
+                    }
+                };
+                let expr = cronexpr::parse(&expr_src).map_err(|m| {
+                    err(&format!("cron_every: bad cron expression \"{}\": {}", expr_src.trim(), m))
+                })?;
+                let mut off = FixedOffset::east_opt(0).unwrap();
+                if let Some(opts) = args.get(2) {
+                    match opts {
+                        SynValue::Map(m) => {
+                            for (k, v) in m.borrow().iter() {
+                                match k.as_str() {
+                                    "tz" => {
+                                        off = cronexpr::parse_offset(&raw_str(v))
+                                            .map_err(|m| err(&format!("cron_every: {}", m)))?;
+                                    }
+                                    other => {
+                                        return Err(err(&format!(
+                                            "cron_every: unknown option \"{}\" (only \"tz\")",
+                                            other
+                                        )))
+                                    }
+                                }
+                            }
+                        }
+                        SynValue::Nothing => {}
+                        other => {
+                            return Err(err(&format!(
+                                "cron_every: options must be a map, got {}",
+                                other.type_name()
+                            )))
+                        }
+                    }
+                }
+                if expr.next_after(now_secs_f64().floor() as i64, off).is_none() {
+                    return Err(err(&format!(
+                        "cron_every: the cron expression \"{}\" never matches within the next 5 years",
+                        expr_src.trim()
+                    )));
+                }
+                let (name, task) = exec(i, task_v, "cron_every").map_err(|m| err(&m))?;
+                sched_of(&sched, "cron_every")?.at(expr, off, &name, task);
                 Ok(syn_text(name))
             }),
         );
@@ -403,11 +595,23 @@ pub fn register_cron_builtins(
                     .map(|j| {
                         let mut m = IndexMap::new();
                         m.insert("name".to_string(), syn_text(j.name.as_str()));
-                        m.insert("interval".to_string(), syn_float(j.interval));
+                        m.insert("schedule".to_string(), syn_text(j.schedule.as_str()));
+                        m.insert(
+                            "interval".to_string(),
+                            j.interval.map(syn_float).unwrap_or(SynValue::Nothing),
+                        );
                         m.insert("repeating".to_string(), syn_bool(j.repeating));
                         m.insert("active".to_string(), syn_bool(j.active));
                         m.insert("run_count".to_string(), syn_int(j.run_count as i64));
                         m.insert("errors".to_string(), syn_int(j.errors as i64));
+                        m.insert(
+                            "next_run".to_string(),
+                            j.next_run.map(syn_float).unwrap_or(SynValue::Nothing),
+                        );
+                        m.insert(
+                            "tz".to_string(),
+                            j.tz.as_deref().map(syn_text).unwrap_or(SynValue::Nothing),
+                        );
                         syn_map(m)
                     })
                     .collect();

@@ -247,7 +247,11 @@ synsema serve docs.syn --port 8791 --bind 127.0.0.1     # backend 2
 - **Per method:** `route` binds method+path — declare each method you forward (GET, POST, …).
 - `proxy to` forwards status + content-type + body **and** the upstream's end-to-end headers (`Location`,
   `Set-Cookie`, `Cache-Control`, `ETag`, …), so redirects/cookies/caching work through the edge; hop-by-hop
-  are dropped and invalid headers skipped.
+  are dropped; `X-Forwarded-For/Proto/Host` are added for the backend.
+- **Streams cross the edge:** a backend's `stream` (SSE) arrives event by event, a backend `socket`
+  (WebSocket) is tunnelled after the `101`, big downloads stream with their `Content-Length`. So a chat
+  backend and a plain API can each be their own process — own `require` contract, own port, own deploy —
+  behind one TLS edge. `http://` targets only (TLS ends at the edge; `https://` fails at startup).
 - **Independent deploys:** restart one backend without touching the others; each can even run a different
   Synsema version behind the same edge.
 

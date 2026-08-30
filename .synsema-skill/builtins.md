@@ -367,11 +367,12 @@ Response helpers (set the HTTP status; body follows the response contract):
 - `svg_to_pdf(svg, opts?)` → single-page **vector** PDF bytes. Opts: `width`/`height` in points (both must match the SVG aspect ratio). Compose: `write_file(path, b)`, `give binary(b, "image/png"|"application/pdf")`.
 
 ## Cron (Scheduled Tasks)
-- `cron_every(seconds, task)` → job name (repeating; executes the task for real; interval must be > 0; task must take 0 params and exist at top level — validated at registration)
+- `cron_every(seconds, task)` → job name (repeating; fixed delay between the END of a run and the next start; interval must be > 0; task must take 0 params and exist at top level — validated at registration)
+- `cron_every(expr, task, opts?)` → job name (v0.6.12+) — **wall-clock cron expression** (text): 5 fields `min hour day month weekday` (`*`, `a-b`, `*/n`, lists, `jan..dec`/`sun..sat`, `0`/`7` = Sunday; day+weekday both set → OR, like Vixie cron) or an alias `@hourly`/`@daily`/`@weekly`/`@monthly`/`@yearly`. `opts = {"tz": "UTC" | "+HH:MM" | "-HH:MM"}` (fixed offset; default UTC; IANA zones with DST are NOT supported → clear error). Fires at the next matching minute AFTER the previous run ends (occurrences skipped while a run is in progress are dropped, never queued); no persistence, no catch-up. Bad expression / never-matching (`0 0 31 2 *`) / unknown option → error at registration
 - `cron_after(seconds, task)` → job name (one-shot; delay ≥ 0; same validation)
 - `cron_cancel(name)` → bool
-- `cron_list()` → list of `{name, interval, repeating, active, run_count, errors}` — run_count = completed runs, errors = failed ticks (real counts, never phantom)
-- `cron_status()` → formatted text
+- `cron_list()` → list of `{name, schedule, interval, repeating, active, run_count, errors, next_run, tz}` — `schedule` = `"every 300.0s"` / `"after 60.0s"` / the cron expression; `interval` = seconds or `nothing` (expression jobs); `next_run` = unix timestamp of the next fire (`nothing` once a one-shot ran); `tz` = `"UTC"`/`"+HH:MM"` or `nothing` (interval jobs); run_count = completed runs, errors = failed ticks (real counts, never phantom)
+- `cron_status()` → formatted text (`[active] report: at '0 9 * * *' (UTC), next 2026-08-30T09:00:00Z, runs: 3, errors: 0`) (`[active] report: at '0 9 * * *' (UTC), next 2026-08-30T09:00:00Z, runs: 3, errors: 0`)
 
 ## Agentic apps — `select`, live processes, event bus, agent control (engine v0.6.7+)
 

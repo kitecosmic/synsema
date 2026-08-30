@@ -381,7 +381,16 @@ task sync_inventory()
     let data be http_get("https://api.warehouse.com/stock")
     share data as "inventory"
 
-cron_every(300, sync_inventory)    -- every 5 minutes
+cron_every(300, sync_inventory)    -- every 5 minutes (interval: end → next start)
+
+-- Wall-clock: a cron expression (5 fields) or an alias; UTC unless `tz` says otherwise
+task daily_report()
+    log "report"
+
+cron_every("0 9 * * *", daily_report)                         -- every day 09:00 UTC
+cron_every("30 8 * * mon-fri", daily_report, {"tz": "-03:00"}) -- weekdays 08:30 in a fixed -03:00 offset
+cron_every("*/15 * * * *", sync_inventory)                    -- :00 :15 :30 :45, aligned (an interval of 900 would drift)
+cron_every("@hourly", rotate_logs)    
 
 -- One-shot after delay (0 = right away)
 task send_reminder()
@@ -401,14 +410,28 @@ Semantics (know these before reaching for cron):
   a task reference (`sync_inventory`) or its name as text (`"sync_inventory"`).
 - The task must take **0 parameters** and be defined at the top level (the job runs it
   by name). Required parameters → clear error **at registration**; wrap it instead.
-- **Intervals, not wall-clock cron**: fixed delay between the END of one run and the
-  start of the next. No `"0 9 * * MON"` expressions. A job never overlaps itself.
-- `cron_every` requires interval > 0; `cron_after` accepts delay ≥ 0.
+- **Two kinds of schedule, one door.** A number = interval: fixed delay between the END of
+  one run and the start of the next (drifts by the run's duration — fine for "every 6 h").
+  A text = **cron expression**: `minute hour day month weekday` (`*`, `a-b`, `*/n`, lists,
+  `jan..dec`/`sun..sat`, `0`/`7` = Sunday; day AND weekday both restricted → either matches,
+  Vixie rule) or `@hourly`/`@daily`/`@weekly`/`@monthly`/`@yearly`. Fires at the next matching
+  minute (seconds = 0) **after the previous run ends** — occurrences that fall while a run is
+  in progress are skipped, not queued. Either way a job never overlaps itself.
+- **Time zone: UTC by default** (like every `time` builtin). `{"tz": "-03:00"}` / `"+05:30"` is a
+  FIXED offset. IANA names with DST (`America/Sao_Paulo`) are not supported (clear error) —
+  write the offset, or pick the UTC hour. A numeric text (`"300"`) is still an interval.
+- `cron_every` requires interval > 0; `cron_after` accepts delay ≥ 0. A bad expression, an
+  expression that never matches (`0 0 31 2 *`), `tz` not an offset, or options with an interval
+  → error **at registration** (the job is not created).
 - Same name re-registered → **replaces** the old job (counters restart at 0).
 - Errors: `errors`+1, one log line (`[serve] [cron] job 'x' failed: …`), the job stays
   scheduled and the process stays up. `run_count` counts COMPLETED runs only.
-- `cron_list()` entries: `{name, interval, repeating, active, run_count, errors}`.
-- In-memory, no persistence/catch-up: a restart re-registers with run_count = 0.
+- `cron_list()` entries: `{name, schedule, interval, repeating, active, run_count, errors,
+  next_run, tz}` — `next_run` is the unix timestamp of the next fire (`interval`/`tz` are
+  `nothing` when they don't apply). `cron_status()` prints `at '0 9 * * *' (UTC), next <ISO>`.
+- In-memory, no persistence/catch-up: a restart re-registers with run_count = 0, and runs
+  missed while the process was down do not exist. If you need "it ran late", keep `last_run`
+  yourself (a file or a table) and compare it with `next_run` on start — see patterns.md.
 - Under `serve`, jobs share the process state with routes (db, `state_*`, memory,
   blackboard) and run with the program's capabilities; top-level jobs start once the
   server is serving, and registering from a route works and is globally visible.

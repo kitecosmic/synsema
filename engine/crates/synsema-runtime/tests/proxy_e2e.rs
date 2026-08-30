@@ -50,7 +50,7 @@ fn proxy_to_parses_and_forwards() {
     let port = free_port();
     // Programa REAL: el parser debe aceptar `proxy to "..."`.
     let prog = format!(
-        "require serve({p})\nserve on {p}\n    route \"GET /up/*path\"\n        proxy to \"http://127.0.0.1:{up}\"\n",
+        "require serve({p})\nrequire net(\"127.0.0.1\")\nserve on {p}\n    route \"GET /up/*path\"\n        proxy to \"http://127.0.0.1:{up}\"\n",
         p = port,
         up = up
     );

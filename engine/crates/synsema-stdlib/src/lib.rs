@@ -23,6 +23,7 @@ pub mod captoken;
 pub mod charts;
 #[cfg(feature = "native")]
 pub mod cron;
+pub mod cronexpr;
 #[cfg(feature = "native")]
 pub mod database;
 pub mod discovery;
