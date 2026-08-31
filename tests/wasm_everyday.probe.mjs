@@ -60,8 +60,11 @@ console.log(`== synsema-wasm-web ${syn.version()} — everyday probe`);
   const bAudit = b.audit;
   const prog = bAudit.filter((e) => e.capability.includes("STRIPE_KEY"));
   check("audit: la denegación del programa lleva origin=program", prog.length >= 1 && prog.every((e) => e.origin === "program" && !e.granted), bAudit);
-  const ambient = bAudit.filter((e) => e.origin === "runtime");
-  check("audit: los grants ambientales rechazados por el techo llevan origin=runtime (time/llm)", ambient.length >= 1 && ambient.every((e) => e.source === "ceiling" && e.reason === "above host ceiling (--sandbox/--cap-set)"), bAudit);
+  // Los grants ambientales del runtime tienen origin=runtime: los CONCEDIDOS con
+  // source="ambient" (stdout), los RECHAZADOS por el techo con source="ceiling" (time/llm).
+  const ambientRejected = bAudit.filter((e) => e.origin === "runtime" && e.source === "ceiling");
+  check("audit: los grants ambientales rechazados por el techo llevan origin=runtime (time/llm)", ambientRejected.length >= 1 && ambientRejected.every((e) => !e.granted && e.reason === "above host ceiling (--sandbox/--cap-set)"), bAudit);
+  check("audit: un grant ambiental concedido deja rastro (origin=runtime, source=ambient)", bAudit.some((e) => e.origin === "runtime" && e.source === "ambient" && e.granted), bAudit);
   check("audit: el reason del techo es uno solo (misma grafía en grant y en check)", bAudit.filter((e) => /ceiling/i.test(e.reason)).every((e) => e.reason === "above host ceiling (--sandbox/--cap-set)"), bAudit);
   const c = syn.run(`require net("evil.example")\nlet r be fetch("https://evil.example/x")\nprint(r)`, { ceiling: "stdout", host: { http: () => ({ status: 200, headers: [], body: "LEAK" }) } });
   check("C: net declarado sobre el techo → mismo mensaje de host, no de programa", !c.ok && c.errors[0].includes("above the host ceiling") && !c.errors[0].includes("add `require"), c);
