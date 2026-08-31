@@ -73,8 +73,16 @@ for (const name of ["wasm_pure", "wasm_agents", "wasm_respond", "wasm_sandbox", 
     // misma secuencia de {capability, granted, source, reason, origin}, incluidos los
     // grants ambientales que el techo rechaza (origin "runtime") y los `require` por
     // encima del techo (source "ceiling").
-    const nat = JSON.parse(execFileSync(nativeBin, ["run", "--format", "json", "--sandbox", "--no-env-file", "tests/wasm_sandbox.probe.syn"],
-      { cwd: root, env: { ...process.env, ETH_KEY }, encoding: "utf8" }));
+    // El programa falla bajo --sandbox (require random denegado) → exit 1; execFileSync
+    // lanza en exit ≠0 pero el informe JSON igual sale por stdout (lo capturamos del throw).
+    let natOut;
+    try {
+      natOut = execFileSync(nativeBin, ["run", "--format", "json", "--sandbox", "--no-env-file", "tests/wasm_sandbox.probe.syn"],
+        { cwd: root, env: { ...process.env, ETH_KEY }, encoding: "utf8" });
+    } catch (e) {
+      natOut = e.stdout;
+    }
+    const nat = JSON.parse(natOut);
     const proj = (a) => a.map((e) => [e.capability, e.granted, e.source, e.reason, e.origin]);
     check("ceiling sandbox: audit idéntico nativo ↔ wasm", JSON.stringify(proj(nat.audit)) === JSON.stringify(proj(r.audit)), { native: proj(nat.audit), wasm: proj(r.audit) });
     check("ceiling sandbox: informe nativo con la forma de syn.run()", nat.ok === false && Array.isArray(nat.output) && Array.isArray(nat.errors) && nat.exit === 1 && typeof nat.llm_tokens === "number", nat);
