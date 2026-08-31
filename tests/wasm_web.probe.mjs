@@ -292,7 +292,7 @@ print("slept")`;
   const r2 = syn.run("print(1 / 0)");
   check("runtime error → errors[]", !r2.ok && r2.errors[0].startsWith("Runtime error"), r2);
   const r3 = syn.run('print(read_file("x.txt"))');
-  check("sin FS: read_file lo dice", !r3.ok && r3.errors[0].includes("this host has no filesystem"), r3);
+  check("sin FS: read_file lo dice", !r3.ok && r3.errors[0].includes("this run has no filesystem"), r3);
   const r4 = syn.run('sql("select 1")');
   check("sin DB: sql lo dice", !r4.ok && r4.errors[0].includes("not available in the pure profile"), r4);
   const t = syn.test('test "suma"\n    assert_eq(1 + 1, 2)\ntest "falla"\n    assert(1 == 2, "nope")');
