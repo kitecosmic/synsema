@@ -367,6 +367,10 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `number("1200")` gives integer | Gives `1200.0` (float) | `text()` on integers shows no decimal. Use `text(number(...))` for display. |
 | `/tmp/file.txt` works on Windows | Maps to `C:\tmp\file.txt` | Use absolute paths. For agent data, use `~/.synsema/` paths. |
 | Cron output appears after program ends | Output is buffered | Fixed in recent versions. Update to latest. Use `synsema serve` to keep the process alive for live output. |
+| An unknown `--flag` is ignored | (v0.6.14+) it's a **usage error, exit 2** on `run`/`test`/`conform` | Typos are caught, not silently dropped. `synsema run --audit json p.syn` now works; before, `--audit` was ignored and `json` taken as the path. |
+| `print` works under any `--cap-set` | (v0.6.14+) under a ceiling, `stdout` is a real capability | A `--cap-set` without `stdout` denies output at the first `print`/`show`/`log`. `--sandbox` includes it; no ceiling = output free. |
+| `render("page.html")` needs no capability | (v0.6.14+) a **disk** template read needs `require file.read("page.html")` | Closes reading arbitrary files via a request-derived path. Nested `include`/`layout` and **bundled** (`synsema build`) templates don't; one line covers a tree: `require file.read("templates/*")`. |
+| `run("printenv")` under `exec` dumps my API keys | (v0.6.14+) Synsema's secrets (provider keys + `.env` vars) are stripped from the child env | The base OS env (`PATH`…) is kept; pass a secret a child needs explicitly via `opts.env`. Same for `proc_spawn`. |
 
 ## Anti-patterns
 

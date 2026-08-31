@@ -24,7 +24,10 @@ core dev loop:
 | **Diagnose LLM config** | `synsema llm status` (resolved config with sources; names the missing variable when offline) |
 | **Start a new project** | `synsema init [dir]` (hello.syn tour + commented .env.example + .gitignore). Re-running is **safe and repairs**: a file still identical to any release it shipped in gets refreshed; one with your edits is kept and the new version lands as `<file>.new` (v0.5.9+) |
 | **Deploy** (daemon/Docker/VPS) | see [deploy.md](deploy.md) |
-| **Run in WASM** (TEE / confidential job / edge, v0.6.0+) | build `synsema-wasm.wasm` (wasm32-wasip1) and `wasmtime run --dir . synsema-wasm.wasm file.syn` — the pure profile → [deploy.md](deploy.md) § WebAssembly |
+| **Bundle into ONE binary** (v0.6.14+) | `synsema build app.syn -o app [--include assets/] [--cap-set "…"] [--profile pure]` — engine + program baked in, sha256-sealed; `FROM scratch`-deployable; `app --engine <cmd>` reaches the engine → [deploy.md](deploy.md) |
+| **Run code you DON'T trust** | host ceiling `--sandbox`/`--cap-set "…"` (on `run`/`test`/`conform`/`serve`; `none` = nothing), second wall `--profile pure`, log with `--audit json`; or from a program `run_program(source, {ceiling, profile, env, timeout})` (`require sandbox_run`) → [capabilities.md](capabilities.md) |
+| **Pass argv / read stdin** (v0.6.14+) | `synsema run app.syn -- a b` → `args()`; `synsema run -` reads source from stdin; `--format json` = the run as one JSON doc |
+| **Run in WASM** (TEE / confidential job / edge, v0.6.0+) | build `synsema-wasm.wasm` (wasm32-wasip1) and `wasmtime run --dir . synsema-wasm.wasm file.syn` — the pure profile (also `synsema run --profile pure` natively, v0.6.14+) → [deploy.md](deploy.md) § WebAssembly |
 | **Embed Synsema in a JS/Python/Go app** (browser, Node/Bun, edge handler) | `synsema-wasm-web.wasm` + npm `@synsema/wasm` (or the Python/Go glue in `examples/embed`): `syn.run(source, {host: {http, kv, llm}})`, `syn.handle(app, request)` — the host lends capabilities, the program still `require`s → [deploy.md](deploy.md) § WebAssembly |
 
 Also volunteer the right primitive for the task: `paged()` for big SQL results, `parallel_map` for

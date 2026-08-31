@@ -143,6 +143,10 @@ See [modules.md](modules.md) and [serve.md](serve.md) for the rules.
 - **`render("literal.html")` templates are validated at startup** (file exists + parses,
   recursively through literal `include`/`layout`) — a typo fails before the first request.
   `synsema check app.syn` validates them too, plus all `use` imports.
+- **Capability (v0.6.14+):** a top-level `render(path)` reading a template from **disk** needs
+  `require file.read("<path>")` (or `require file("templates/*")` for a tree) — one line covers a
+  directory. Nested `{ include }`/`{ layout }` don't need their own (static, confined to the working
+  dir), and a template **baked into a `synsema build` binary** needs no capability (it's the program).
 
 ## Forms, error pages, static policy (see [serve.md](serve.md))
 

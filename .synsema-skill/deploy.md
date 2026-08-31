@@ -23,6 +23,32 @@ synsema daemon stop program.syn         # graceful stop
 synsema daemon restart program.syn      # restart
 ```
 
+## `synsema build` — one self-contained binary (v0.6.14+)
+
+`synsema build main.syn -o app` produces a **single executable**: the engine + your program (the
+main `.syn`, its transitive `use` modules, the templates it `render`s by a literal name, and any
+`--include` assets), sealed with a sha256. The deliverable is a file — nothing to mount.
+
+```bash
+synsema build app.syn -o app                                  # this platform
+synsema build app.syn -o app --include static/ --include "data/*.csv"  # bundle assets (dir / one-level glob, repeatable)
+synsema build app.syn -o app --cap-set "stdout,net=api.example.com,serve=8080"  # BAKE a host ceiling
+synsema build app.syn -o app --profile pure                   # bake the pure profile (no fs/exec/db…)
+synsema build app.syn -o app-linux --engine-binary ./synsema-linux-x86_64  # cross: a donor engine
+```
+
+- The built binary **runs your program**: its whole argv is the program's (`args()`), the baked
+  `--cap-set`/`--profile` apply and can't be raised from inside, and it reads its own bundle — a
+  `read_file("static/x")` / `render("page.html")` on a **bundled** file needs no `file` capability
+  (it's part of the program), and a write to a bundled path is refused.
+- **Reach the engine** with `app --engine <subcommand>` (`app --engine version`, `app --engine run
+  other.syn`) — the only way in, since the flags are now the program's argv. `app --engine update`
+  is refused (rebuild instead). A tampered bundle refuses to run (`bundle corrupt`).
+- Errors (exit 2): `-o` missing, `--include` not found / escapes the bundle root, a `use` with a
+  **dynamic** path (the bundle is closed), building from an already-built binary.
+- **Deploy from `FROM scratch`/distroless** — `COPY app /app` + `ENTRYPOINT ["/app"]`. This is the
+  most self-contained deploy: the program and its guardrails travel as one artifact.
+
 ## Configuration & secrets (`.env` / environment)
 
 Read config with `env("NAME", default?)` and secrets with `secret("NAME", default?)` —
@@ -61,9 +87,13 @@ see [secrets.md](secrets.md). Resolution: **process environment → `.env` file 
   | `SYNSEMA_WATCH_MAX` | `64` | live `watch` handles per interpreter (hard ceiling 1024; one scanner thread each) |
 
 - **Host ceiling for a whole server:** `synsema serve app.syn --sandbox` or
-  `--cap-set "stdout,time,serve=8080,net=api.example.com"` caps what handlers, cron
-  ticks and spawned agents can `require` — the same flags and semantics as `run`.
+  `--cap-set "stdout,time,serve=8080,net=api.example.com"` caps the program's **preamble**, its
+  handlers, cron ticks and spawned agents — the same flags and semantics as `run`.
   Under systemd/Docker this is the operator's guarantee, independent of the program.
+  Add **`--audit json`** (or a path) to log every capability check, and **`--profile pure`** on
+  `run`/`test`/`conform`/`build` for a second wall where filesystem/exec/socket/db/cron builtins
+  don't exist (regardless of the ceiling; `serve --profile pure` is a usage error — a server binds a
+  socket). See [capabilities.md](capabilities.md).
 - **Stopping:** `systemctl stop` / `docker stop` send SIGTERM → ordered shutdown (drain,
   exit 0). Set the unit's `TimeoutStopSec` above `SYNSEMA_SHUTDOWN_GRACE`.
 

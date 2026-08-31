@@ -86,6 +86,35 @@ let r be run("python", ["./work/gen.py"], 60, {"cwd": "./work"})
 ```
 Combine with `grep` + `edit_file` (see [builtins.md](builtins.md)) for search → edit → run.
 
+**Note (v0.6.14+):** `run`/`proc_spawn` no longer leak Synsema's secrets to the child — the LLM
+provider keys and `.env`-loaded variables are stripped from the child's environment (the base OS env
+like `PATH` stays, so commands work). A secret the child truly needs is passed explicitly via
+`opts.env`. So `run("printenv")` under `require exec` no longer dumps your API keys.
+
+## Run **Synsema** under a ceiling — `run_program` (v0.6.14+)
+
+To run **generated Synsema code** (an agent's own output, a plugin, a playground snippet), don't
+`exec` the `synsema` binary and parse stderr — use `run_program`, which runs it in a child process
+of the **same** binary under a ceiling ∩ the parent's, and returns the result (and audit) as a value:
+
+```
+require sandbox_run
+require net("api.example.com")               -- what you'll LEND, you must hold
+let r be run_program(generated_code, {
+    "ceiling": "stdout,net=api.example.com",  -- --cap-set syntax (or "sandbox" / "none")
+    "profile": "pure",                        -- default "pure"; "native" only if the parent is native
+    "env":     {"TOOL": "x"},                 -- REPLACES the child's environment
+    "timeout": 30                             -- seconds; on expiry the child tree is killed
+})
+-- r = {ok, output:[…], errors:[…], audit:[…], exit, timed_out, llm_tokens}
+```
+
+The child **can never exceed the parent** (`net=*` under a parent that only holds `net("api.x")`
+collapses to nothing; the trim is recorded in the parent audit as `above parent ceiling`), a `secret`
+in `env` is refused (`reveal()` it on purpose), and no `synsema` on the `PATH` or stderr-parsing is
+involved. This is the language-level "run the code the LLM generated, safely" — the ceiling is
+enforced by the child process itself. See [capabilities.md](capabilities.md) and [builtins.md](builtins.md).
+
 ## Give an LLM a shell tool (least-privilege)
 A tool is a user task; wrap `run` and dispatch with `call_tool` (runs with ONLY what it declares):
 ```

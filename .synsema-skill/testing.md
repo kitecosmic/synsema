@@ -45,7 +45,12 @@ synsema test file.syn -v            -- also show the tests' print() output
 ```
 
 Output: `✓ name` / `✗ name: reason`, then `N passed, M failed (K total)`.
-Exit code: **0** if all pass, **1** if any fail, **2** on usage/file error.
+Exit code: **0** if all pass, **1** if any fail, **2** on usage/file error (incl. an unknown `--flag`, v0.6.14+).
+
+`test` honors the host ceiling and profile like `run`: `synsema test --sandbox tests.syn`,
+`--cap-set "stdout,time,net=api.x"`, `--profile pure` (the second wall — filesystem/exec/db/socket/
+cron builtins gone), and `--audit json|<path>|fd:N` to log every capability check. So you can prove a
+program stays inside a ceiling from a `test` block (v0.6.14+).
 
 ## Tests do NOT run under `synsema run`
 

@@ -1214,10 +1214,16 @@ synsema serve <file>
     [--domain d1[,d2,...]]          # overrides the file's `domain`
     [--tls-auto <email> | --tls-cert <p> --tls-key <p>]
     [--bind <addr>]                 # default 0.0.0.0
-    [--sandbox | --cap-set <list>]  # host ceiling for the WHOLE serve (v0.6.7+): handlers, cron ticks
-                                    # and spawned agents can `require` only within it — same rules as `run`.
+    [--sandbox | --cap-set <list>]  # host ceiling for the WHOLE serve (v0.6.7+): the PREAMBLE, handlers,
+                                    # cron ticks and spawned agents can `require` only within it — same as `run`.
                                     # --sandbox = stdout,time + serve (so it can bind); --cap-set "stdout,time,serve=8080,net=api.example.com"
+                                    # (with a ceiling, `stdout` must be listed for handler print/log — v0.6.14+)
+    [--audit json|<path>|fd:N]      # log every capability check (v0.6.14+); summary at shutdown
 ```
+
+> `serve --profile pure` is a usage error (a server binds a socket — the pure profile has no sockets).
+> `synsema conform` honors these same `--sandbox`/`--cap-set`/`--profile`/`--audit` flags too (v0.6.14+
+> — before, `conform` silently ignored the ceiling): the denials show up in its `{ok, out, err}` JSON.
 
 **Precedence: CLI flag > file clause > default.**
 
