@@ -41,6 +41,8 @@ pub mod httpsig;
 pub mod json;
 pub mod mimetypes;
 pub mod oidc;
+// El perfil puro como pared (stubs OS-facing compartidos por nativo `--profile pure` y wasm).
+pub mod pure;
 pub mod raster;
 pub mod respond;
 /// Router + contrato de respuesta de `serve`, PUROS (compartidos con el handler-mode wasm).

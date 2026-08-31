@@ -513,6 +513,27 @@ pub struct Interpreter {
     module_cache: HashMap<String, SynValue>,
     loading_modules: HashSet<String>,
     exports_collector: Vec<Vec<String>>,
+    /// Argumentos del programa (`args()`): lo que siguió al `--` en `synsema run`, o
+    /// todo el argv en un binario `synsema build`. Datos que el invocador escribió para
+    /// ESTE programa — sin capability (no es un recurso del host).
+    program_args: Vec<String>,
+    /// Gate de `stdout` (lo cablea el motor con el CapabilitySet): se consulta UNA vez
+    /// por intérprete en el primer `print`/`show`/`log` y el veredicto se memoiza —
+    /// el techo del host (`--cap-set` sin `stdout`) manda también sobre la salida.
+    stdout_hook: Option<Rc<dyn Fn() -> Result<(), String>>>,
+    stdout_verdict: Option<Result<(), String>>,
+    /// Gate de `file.read` para las lecturas de template a disco (`render`/`include`/
+    /// `layout`). Sin él, `render(".env")` leía cualquier archivo del cwd sin capability
+    /// —bypass del modelo entero—. Lo cablea el motor con el CapabilitySet; recibe el path
+    /// CRUDO (como se escribió en `render`/`{ include }`) para que el scope coincida con
+    /// `read_file`. Los assets del bundle NO pasan por acá (son el programa).
+    template_read_hook: Option<Rc<dyn Fn(&str) -> Result<(), String>>>,
+    /// Nombres de variables de entorno que Synsema considera SECRETAS (claves de
+    /// proveedor LLM, el webhook humano, y las cargadas del `.env`): `run()`/`proc_spawn`
+    /// las QUITAN del entorno del proceso hijo (a menos que el programa las pase explícito
+    /// por `opts.env`). Cierra la exfiltración `run("printenv")` con `exec` pero sin
+    /// `env`/`secret`. Vacío en usos standalone/wasm (sin proceso) → sin efecto.
+    sensitive_env: HashSet<String>,
 }
 
 impl Default for Interpreter {
@@ -574,9 +595,84 @@ impl Interpreter {
             loading_modules: HashSet::new(),
             exports_collector: vec![Vec::new()],
             live_output: false,
+            program_args: Vec::new(),
+            stdout_hook: None,
+            stdout_verdict: None,
+            template_read_hook: None,
+            sensitive_env: HashSet::new(),
         };
         interp.register_builtins();
         interp
+    }
+
+    /// Fija los argumentos del programa (`args()`).
+    pub fn set_program_args(&mut self, args: Vec<String>) {
+        self.program_args = args;
+    }
+
+    /// Instala el gate de `stdout` (el motor lo cablea al CapabilitySet).
+    pub fn set_stdout_hook(&mut self, hook: Rc<dyn Fn() -> Result<(), String>>) {
+        self.stdout_hook = Some(hook);
+        self.stdout_verdict = None;
+    }
+
+    /// Instala el gate de lectura de templates a disco (`render`/`include`/`layout`).
+    pub fn set_template_read_hook(&mut self, hook: Rc<dyn Fn(&str) -> Result<(), String>>) {
+        self.template_read_hook = Some(hook);
+    }
+
+    /// Fija los nombres de env que Synsema trata como secretos (los quita de los hijos
+    /// de `run()`/`proc_spawn`). Lo cablea el motor con las claves de proveedor + `.env`.
+    pub fn set_sensitive_env(&mut self, names: HashSet<String>) {
+        self.sensitive_env = names;
+    }
+
+    /// Los nombres de env sensibles (para que `run()`/`proc_spawn` los saquen del hijo).
+    pub fn sensitive_env(&self) -> &HashSet<String> {
+        &self.sensitive_env
+    }
+
+    /// Chequea `file.read` para un template LEÍDO DE DISCO (`raw_path` = como se escribió).
+    /// Un template del bundle NO llama a esto (es parte del programa). Sin hook cableado
+    /// (usos standalone/tests del core) es no-op — el motor siempre lo cablea.
+    pub fn gate_template_read(&self, raw_path: &str) -> Result<(), Control> {
+        if let Some(hook) = &self.template_read_hook {
+            hook(raw_path).map_err(|m| Control::Error(RuntimeError::new(m)))?;
+        }
+        Ok(())
+    }
+
+    /// Invoca un builtin anotando su ubicación para el audit (`--audit json` → `file`/
+    /// `line`). Sin sink instalado no anota nada (un atómico por llamada).
+    fn call_builtin_at(
+        &mut self,
+        f: &BuiltinFn,
+        args: &[SynValue],
+        loc: &SourceLocation,
+    ) -> Result<SynValue, Control> {
+        if !crate::audit_loc::enabled() {
+            return f(self, args, loc);
+        }
+        let prev = crate::audit_loc::replace(Some(loc.clone()));
+        let r = f(self, args, loc);
+        crate::audit_loc::replace(prev);
+        r
+    }
+
+    /// Primer `print`/`show`/`log`: consulta el gate una vez y memoiza el veredicto
+    /// (un chequeo por intérprete; el audit lo ve una vez, no por línea).
+    fn ensure_stdout(&mut self) -> Result<(), Control> {
+        if self.stdout_verdict.is_none() {
+            let verdict = match self.stdout_hook.clone() {
+                Some(h) => h(),
+                None => Ok(()),
+            };
+            self.stdout_verdict = Some(verdict);
+        }
+        match self.stdout_verdict.as_ref().unwrap() {
+            Ok(()) => Ok(()),
+            Err(m) => Err(Control::Error(RuntimeError::new(m.clone()))),
+        }
     }
 
     fn register(&self, name: &str, param_count: i32, func: BuiltinFn) {
@@ -873,6 +969,9 @@ impl Interpreter {
         self.request_spend_limits.clear();
         self.stream_emit = None;
         self.recursion_depth = 0;
+        // El gate de stdout se re-consulta por request (el set de capabilities se
+        // reconstruye afuera; el veredicto memoizado sería del request anterior).
+        self.stdout_verdict = None;
     }
 
     /// Evalúa un nodo en un entorno dado (templates + motor de serve).
@@ -907,8 +1006,14 @@ impl Interpreter {
     }
 
     fn load_module_inner(&mut self, raw_path: &str, resolved: &str) -> Result<SynValue, Control> {
-        let source = std::fs::read_to_string(resolved)
-            .map_err(|_| err(format!("module not found: {}", raw_path)))?;
+        // Overlay del bundle (`synsema build`): el módulo puede vivir dentro del
+        // ejecutable; si no está ahí, el disco como siempre.
+        let source = match crate::bundle::get(resolved) {
+            Some(bytes) => String::from_utf8(bytes.to_vec())
+                .map_err(|_| err(format!("module is not UTF-8: {}", raw_path)))?,
+            None => std::fs::read_to_string(resolved)
+                .map_err(|_| err(format!("module not found: {}", raw_path)))?,
+        };
         // Un error de compilación del módulo se reporta como runtime (la operación
         // de import falló), igual que en el oráculo Python.
         let program = parse_source(&source, resolved).map_err(|e| err(e.to_string()))?;
@@ -951,6 +1056,28 @@ impl Interpreter {
     fn register_builtins(&self) {
         // Núcleo
         self.register("print", -1, Rc::new(|i, a, l| i.b_print(a, l)));
+        // args(): los argumentos del programa (`synsema run prog.syn -- a b`, o el argv
+        // de un binario `synsema build`). Sin capability: es input escrito por quien
+        // invocó ESTE programa, no un recurso del host.
+        self.register(
+            "args",
+            0,
+            Rc::new(|i, _a, _l| Ok(syn_list(i.program_args.iter().map(|s| syn_text(s.as_str())).collect()))),
+        );
+        // self_path(): la ruta del ejecutable en curso, EXACTAMENTE como la devuelve el
+        // SO (es lo que hay que pasarle a `run`/`proc_spawn` — el scope de `exec` se
+        // compara byte a byte). Sin capability: identidad, no acceso.
+        self.register(
+            "self_path",
+            0,
+            Rc::new(|_i, _a, _l| match std::env::current_exe() {
+                Ok(p) => Ok(syn_text(p.to_string_lossy().into_owned())),
+                Err(e) => Err(Control::Error(RuntimeError::new(format!(
+                    "self_path: not available in the pure profile — this run has no process ({})",
+                    e
+                )))),
+            }),
+        );
         self.register("length", 1, Rc::new(|i, a, l| i.b_length(a, l)));
         self.register("text", 1, Rc::new(|i, a, l| i.b_to_text(a, l)));
         self.register("number", 1, Rc::new(|i, a, l| i.b_to_number(a, l)));
@@ -2262,7 +2389,17 @@ impl Interpreter {
                 // así que llega acá en runtime).
                 if !self.in_sandbox() && !self.in_tool_scope() {
                     if let Some(hook) = self.grant_hook.clone() {
+                        // Ubicación del `require` para el audit (`file`/`line` de un
+                        // grant rechazado por el techo). Sólo si hay sink instalado.
+                        let prev = if crate::audit_loc::enabled() {
+                            Some(crate::audit_loc::replace(Some(loc.clone())))
+                        } else {
+                            None
+                        };
                         hook(capability, scope_val.as_deref());
+                        if let Some(p) = prev {
+                            crate::audit_loc::replace(p);
+                        }
                     }
                 }
                 Ok(SynValue::Nothing)
@@ -2321,6 +2458,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             NodeKind::ShowStatement { value, label } => {
                 let v = self.exec(value, env)?;
+                self.ensure_stdout()?;
                 let label_str = match label {
                     Some(l) => format!("[{}] ", l),
                     None => String::new(),
@@ -2460,6 +2598,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             NodeKind::TraceBlock { body, .. } => self.exec_block(body, env),
             NodeKind::LogStatement { message, .. } => {
                 let m = self.exec(message, env)?;
+                self.ensure_stdout()?;
                 let line = format!("[LOG] {}", m);
                 if let Some(hook) = &self.log_hook {
                     hook(&line);
@@ -2853,7 +2992,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                             .map(|s| s.unwrap_or(SynValue::Nothing))
                             .collect();
                         let f = bt.func.clone();
-                        f(self, &pos, loc)
+                        self.call_builtin_at(&f, &pos, loc)
                     }
                     None => {
                         let mut pos = Vec::with_capacity(args.len());
@@ -2867,7 +3006,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                             pos.push(v);
                         }
                         let f = bt.func.clone();
-                        f(self, &pos, loc)
+                        self.call_builtin_at(&f, &pos, loc)
                     }
                 }
             }
@@ -2992,6 +3131,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     // =========================================================
 
     fn b_print(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        self.ensure_stdout()?;
         let s = args.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
         if let Some(hook) = &self.log_hook {
             hook(&s);
@@ -3647,6 +3787,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
         if let Some(p) = args.first() {
             if !matches!(p, SynValue::Nothing) {
+                // El prompt ES salida: bajo un techo sin `stdout` no debe escaparse por acá
+                // (print/show/log ya lo chequean; read_line era el único hueco).
+                self.ensure_stdout()?;
                 print!("{}", raw_str(p));
                 let _ = std::io::stdout().flush();
             }

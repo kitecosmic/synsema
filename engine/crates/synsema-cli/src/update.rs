@@ -133,6 +133,12 @@ pub(crate) fn installed_by_npm() -> bool {
 /// sha256 y reemplaza el binario en ejecución.
 pub fn cmd_update() -> ExitCode {
     let current = current_version();
+    // Un binario de `synsema build` lleva el programa anexado: reemplazarlo por el CLI
+    // pelado destruiría el programa. Se reconstruye con `synsema build`.
+    if std::env::current_exe().map(|p| synsema_core::bundle::is_built(&p)).unwrap_or(false) {
+        eprintln!("this is a built program (synsema build); rebuild it with a newer `synsema build` instead of updating it in place");
+        return ExitCode::from(2);
+    }
     println!("Versión actual: {}", current);
     if installed_by_npm() {
         match check_for_update() {

@@ -68,6 +68,17 @@ for (const name of ["wasm_pure", "wasm_agents", "wasm_respond", "wasm_sandbox", 
   const r = syn.run(src("tests/wasm_sandbox.probe.syn"), { env: { ETH_KEY }, ceiling: "sandbox" });
   check("ceiling sandbox: `require random` denegado", !r.ok && r.errors[0].includes("Capability not granted: random"), r.errors);
   check("ceiling sandbox: el audit registra la denegación", r.audit.some((a) => a.capability.includes("random") && a.granted === false), r.audit);
+  if (nativeBin && existsSync(nativeBin)) {
+    // Paridad del AUDIT con el binario nativo (`run --format json` = la forma de `syn.run()`):
+    // misma secuencia de {capability, granted, source, reason, origin}, incluidos los
+    // grants ambientales que el techo rechaza (origin "runtime") y los `require` por
+    // encima del techo (source "ceiling").
+    const nat = JSON.parse(execFileSync(nativeBin, ["run", "--format", "json", "--sandbox", "--no-env-file", "tests/wasm_sandbox.probe.syn"],
+      { cwd: root, env: { ...process.env, ETH_KEY }, encoding: "utf8" }));
+    const proj = (a) => a.map((e) => [e.capability, e.granted, e.source, e.reason, e.origin]);
+    check("ceiling sandbox: audit idéntico nativo ↔ wasm", JSON.stringify(proj(nat.audit)) === JSON.stringify(proj(r.audit)), { native: proj(nat.audit), wasm: proj(r.audit) });
+    check("ceiling sandbox: informe nativo con la forma de syn.run()", nat.ok === false && Array.isArray(nat.output) && Array.isArray(nat.errors) && nat.exit === 1 && typeof nat.llm_tokens === "number", nat);
+  }
   const r2 = syn.run(src("tests/wasm_sandbox.probe.syn"), { env: { ETH_KEY }, ceiling: "stdout,random,secret=ETH_KEY" });
   check("ceiling cap-set suficiente: corre", r2.ok && r2.output.includes("after_task=secret"), r2.errors);
   const r3 = syn.run("print(now() > 1700000000)");
@@ -275,7 +286,7 @@ print("slept")`;
   const r3 = syn.run('print(read_file("x.txt"))');
   check("sin FS: read_file lo dice", !r3.ok && r3.errors[0].includes("this host has no filesystem"), r3);
   const r4 = syn.run('sql("select 1")');
-  check("sin DB: sql lo dice", !r4.ok && r4.errors[0].includes("not available in the wasm profile"), r4);
+  check("sin DB: sql lo dice", !r4.ok && r4.errors[0].includes("not available in the pure profile"), r4);
   const t = syn.test('test "suma"\n    assert_eq(1 + 1, 2)\ntest "falla"\n    assert(1 == 2, "nope")');
   check("test(): cuenta pasados/fallados", t.passed === 1 && t.failed === 1, t);
   const c = syn.check('require memory("a")\nrequire memory("b")');

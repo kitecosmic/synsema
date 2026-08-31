@@ -70,6 +70,18 @@ fn is_bare_name(s: &str) -> bool {
 
 /// Resuelve un path de template (relativo al cwd, sin traversal).
 fn resolve_template_path(path: &str) -> Result<PathBuf, String> {
+    // Overlay del bundle (`synsema build`): las templates del programa viven dentro del
+    // ejecutable; el nombre normalizado es la clave (y el PathBuf que sigue el flujo).
+    if let Some(b) = crate::bundle::mounted() {
+        if Path::new(path).is_absolute() {
+            return Err(format!("template path must be relative to the working dir: '{}'", path));
+        }
+        if let Some(key) = crate::bundle::normalize_name(path) {
+            if b.contains(&key) {
+                return Ok(PathBuf::from(key));
+            }
+        }
+    }
     let cwd = std::env::current_dir()
         .and_then(|p| p.canonicalize())
         .map_err(|e| e.to_string())?;
@@ -140,10 +152,15 @@ pub(crate) fn resolve_module_path(raw_path: &str, base_dir: &Path) -> Result<Str
             raw_path
         ));
     }
+    let resolved = target.to_string_lossy().to_string();
+    // Overlay del bundle (`synsema build`): el módulo puede vivir dentro del ejecutable.
+    if crate::bundle::get(&resolved).is_some() {
+        return Ok(resolved);
+    }
     if !target.is_file() {
         return Err(format!("module not found: {}", raw_path));
     }
-    Ok(target.to_string_lossy().to_string())
+    Ok(resolved)
 }
 
 enum Seg {
@@ -498,10 +515,16 @@ thread_local! {
 /// Carga (con caché) el árbol de un template ya resuelto. `display` es el nombre
 /// que aparece en los errores (file_name, como siempre).
 fn load_template(target: &PathBuf, display: &str, raw_path: &str) -> Result<Rc<Vec<TNode>>, Control> {
-    let meta = std::fs::metadata(target)
-        .map_err(|_| Control::Error(RuntimeError::new(format!("template not found: {}", raw_path))))?;
-    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    let size = meta.len();
+    let bundled: Option<&'static [u8]> = crate::bundle::get(&target.to_string_lossy());
+    let (mtime, size) = match bundled {
+        // Inmutable: la clave del cache es el nombre; el tamaño basta como huella.
+        Some(bytes) => (SystemTime::UNIX_EPOCH, bytes.len() as u64),
+        None => {
+            let meta = std::fs::metadata(target)
+                .map_err(|_| Control::Error(RuntimeError::new(format!("template not found: {}", raw_path))))?;
+            (meta.modified().unwrap_or(SystemTime::UNIX_EPOCH), meta.len())
+        }
+    };
     let hit = TPL_CACHE.with(|c| {
         c.borrow().get(target).and_then(|e| {
             if e.mtime == mtime && e.size == size {
@@ -514,8 +537,11 @@ fn load_template(target: &PathBuf, display: &str, raw_path: &str) -> Result<Rc<V
     if let Some(tree) = hit {
         return Ok(tree);
     }
-    let src = std::fs::read_to_string(target)
-        .map_err(|_| Control::Error(RuntimeError::new(format!("template not found: {}", raw_path))))?;
+    let src = match bundled {
+        Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        None => std::fs::read_to_string(target)
+            .map_err(|_| Control::Error(RuntimeError::new(format!("template not found: {}", raw_path))))?,
+    };
     let segs = segments(&src, display)?;
     let mut pos = 0;
     let (tree, term) = parse_block(&segs, &mut pos, display, &[])?;
@@ -758,6 +784,15 @@ pub fn check_program_static_with(
     file_path: &str,
     load: ModuleLoader<'_>,
 ) -> Result<(usize, usize), String> {
+    check_program_static_inner(program, file_path, load, None)
+}
+
+fn check_program_static_inner(
+    program: &crate::ast::Program,
+    file_path: &str,
+    load: ModuleLoader<'_>,
+    closure: Option<&mut (Vec<String>, Vec<String>)>,
+) -> Result<(usize, usize), String> {
     fn scan(
         program: &crate::ast::Program,
         file_path: &str,
@@ -849,13 +884,41 @@ pub fn check_program_static_with(
     let mut modules = 0usize;
     let mut templates_seen = Vec::new();
     scan(program, file_path, false, &mut seen, &mut stack, &mut modules, &mut templates_seen, load)?;
+    if let Some(out) = closure {
+        *out = (seen, templates_seen.clone());
+    }
     Ok((modules, templates_seen.len()))
+}
+
+/// `check_program_static_with` que además devuelve la CLAUSURA: los paths resueltos de
+/// todos los módulos `use` (transitivo) y los paths crudos de cada `render("literal")`.
+/// Lo usa `synsema build` para saber qué va dentro del bundle.
+pub fn program_closure_with(
+    program: &crate::ast::Program,
+    file_path: &str,
+    load: ModuleLoader<'_>,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut out: (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    check_program_static_inner(program, file_path, load, Some(&mut out))?;
+    Ok(out)
+}
+
+/// Cierre de un template: él y, recursivamente, sus `include`/`layout` literales (paths
+/// crudos, relativos al working dir — las claves del bundle).
+pub fn template_closure(path: &str) -> Result<Vec<String>, String> {
+    let mut seen = Vec::new();
+    validate_template_walk(path, 0, &mut seen)?;
+    Ok(seen)
 }
 
 /// Valida (parsea) un template y, recursivamente, sus `include`/`layout` literales.
 /// Lo usa la validación al arranque de `serve` y `synsema check` — un typo en un
 /// `render("literal.html")` debe fallar ANTES del primer request.
 pub fn validate_template(path: &str) -> Result<(), String> {
+    validate_template_walk(path, 0, &mut Vec::new())
+}
+
+fn validate_template_walk(path: &str, depth: usize, seen: &mut Vec<String>) -> Result<(), String> {
     fn walk(path: &str, depth: usize, seen: &mut Vec<String>) -> Result<(), String> {
         if depth > 50 {
             return Err(format!("template nesting too deep ({})", path));
@@ -897,5 +960,5 @@ pub fn validate_template(path: &str) -> Result<(), String> {
         }
         Ok(())
     }
-    walk(path, 0, &mut Vec::new())
+    walk(path, depth, seen)
 }

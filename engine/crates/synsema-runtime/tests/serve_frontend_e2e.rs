@@ -76,7 +76,8 @@ fn post(port: u16, target: &str, ctype: &str, body: &str) -> String {
 #[test]
 fn template_features_render() {
     let r = run_source(
-        "let items be [\"a\", \"b</script>\"]\n\
+        "require file.read(\"tests/fixtures/tpl/feat.html\")\n\
+         let items be [\"a\", \"b</script>\"]\n\
          print(body of render(\"tests/fixtures/tpl/feat.html\", {\"n\": 2, \"items\": items, \"vacio\": []}))",
         "t.syn",
     );
@@ -105,7 +106,8 @@ fn template_features_render() {
 #[test]
 fn template_named_slots() {
     let r = run_source(
-        "print(body of render(\"tests/fixtures/tpl/page_fill.html\", {\"title\": \"Hola\"}))",
+        "require file.read(\"tests/fixtures/tpl/page_fill.html\")
+print(body of render(\"tests/fixtures/tpl/page_fill.html\", {\"title\": \"Hola\"}))",
         "t.syn",
     );
     assert!(r.success, "errs: {:?}", r.errors);
@@ -117,7 +119,8 @@ fn template_named_slots() {
 #[test]
 fn template_each_non_list_fails_loud() {
     let r = run_source(
-        "print(body of render(\"tests/fixtures/tpl/badeach.html\", {\"numero\": 7}))",
+        "require file.read(\"tests/fixtures/tpl/badeach.html\")
+print(body of render(\"tests/fixtures/tpl/badeach.html\", {\"numero\": 7}))",
         "t.syn",
     );
     assert!(!r.success);

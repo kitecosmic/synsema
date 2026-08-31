@@ -8,6 +8,7 @@
 pub mod daemon;
 pub mod engine;
 pub mod error_reporter;
+pub mod host;
 /// Provider LLM `local` (GGUF embebido con candle, CPU). Sólo con `--features llm-local`;
 /// sin la feature el binario no arrastra candle y se comporta idéntico a antes.
 #[cfg(feature = "llm-local")]
@@ -16,5 +17,6 @@ pub mod llm_providers;
 pub mod parallel;
 pub mod persistence;
 pub mod recovery;
+pub mod run_program;
 pub mod serve;
 pub mod speculative;

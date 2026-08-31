@@ -7,6 +7,8 @@ pub mod addressable;
 pub mod arrays;
 pub mod ast;
 pub mod ast_api;
+pub mod audit_loc;
+pub mod bundle;
 pub mod bytesutil;
 pub mod clock;
 pub mod codeintel;

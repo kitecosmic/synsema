@@ -361,7 +361,10 @@ impl StaticProgram {
             if let NodeKind::UseImport { path, alias } = &stmt.kind {
                 let resolved = crate::templates::resolve_module_path(path, &base_dir)
                     .map_err(|e| format!("{}: {}", file_path, e))?;
-                let src = std::fs::read_to_string(&resolved).map_err(|_| format!("module not found: {}", path))?;
+                let src = match crate::bundle::get(&resolved) {
+                    Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                    None => std::fs::read_to_string(&resolved).map_err(|_| format!("module not found: {}", path))?,
+                };
                 let prog = crate::parser::parse_source(&src, &resolved).map_err(|e| e.to_string())?;
                 modules.insert(alias.clone(), prog);
             }

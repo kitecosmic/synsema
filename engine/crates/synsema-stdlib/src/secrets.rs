@@ -56,6 +56,12 @@ impl EnvStore {
         self.vars.get(name).cloned()
     }
 
+    /// Los nombres cargados del `.env` (para que `run()`/`proc_spawn` no los filtren al
+    /// entorno de un proceso hijo — son la "bóveda de secretos" del programa).
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.vars.keys()
+    }
+
     /// Carga el `.env` según el spec §2:
     /// - `SYNSEMA_ENV_FILE=<path>` → ese archivo.
     /// - `SYNSEMA_ENV_FILE=` (vacío) → desactivado (≡ `--no-env-file`).

@@ -230,6 +230,10 @@ pub struct SpawnOpts {
     /// `kill`/`close` matan el ÁRBOL entero (nietos incluidos). `false` = sólo el hijo
     /// directo (para desprender deliberadamente un daemon que deba sobrevivir).
     pub process_group: bool,
+    /// Nombres de variables de entorno a QUITAR del hijo (los secretos de Synsema: claves
+    /// de proveedor, `.env`). Se aplica antes de `env` (que puede volver a pasar una
+    /// explícitamente). F3 de la auditoría de seguridad.
+    pub strip_env: Vec<String>,
 }
 
 impl Default for SpawnOpts {
@@ -247,6 +251,7 @@ impl Default for SpawnOpts {
             rows: 24,
             term: None,
             process_group: true,
+            strip_env: Vec::new(),
         }
     }
 }
@@ -447,6 +452,12 @@ impl LiveProc {
         c.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         if let Some(dir) = &opts.cwd {
             c.current_dir(dir);
+        }
+        for k in &opts.strip_env {
+            c.env_remove(k);
+        }
+        for k in &opts.strip_env {
+            c.env_remove(k);
         }
         for (k, v) in &opts.env {
             c.env(k, v);
@@ -940,4 +951,66 @@ fn utf8_cut(b: &[u8]) -> usize {
         i -= 1;
     }
     n
+}
+
+/// Un proceso hijo cualquiera (p. ej. el propio motor en `run_program`) que hay que
+/// poder matar como ÁRBOL: Job Object en Windows, grupo de procesos en Unix. No lee
+/// su salida: el caller maneja los pipes. Mismo mecanismo que `LiveProc`.
+pub struct TreeChild {
+    pub child: Child,
+    #[cfg(windows)]
+    job: Option<win::Job>,
+    tree: bool,
+}
+
+/// Lanza `cmd` en su propio grupo/job. `stdin/stdout/stderr` los configura el caller.
+pub fn spawn_tree(cmd: &mut Command) -> Result<TreeChild, String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd.spawn().map_err(|e| format!("cannot start the child process: {}", e))?;
+    #[cfg(windows)]
+    let job = {
+        use std::os::windows::io::AsRawHandle;
+        win::Job::attach_handle(child.as_raw_handle() as _)
+    };
+    #[cfg(windows)]
+    let tree = job.is_some();
+    #[cfg(not(windows))]
+    let tree = true;
+    Ok(TreeChild {
+        child,
+        #[cfg(windows)]
+        job,
+        tree,
+    })
+}
+
+impl TreeChild {
+    /// Mata el árbol entero (idempotente sobre un proceso ya terminado).
+    pub fn kill_tree(&mut self) {
+        if let Ok(Some(_)) = self.child.try_wait() {
+            return;
+        }
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            if job.terminate() {
+                return;
+            }
+        }
+        #[cfg(unix)]
+        if self.tree {
+            let pid = self.child.id();
+            if pid > 0 {
+                let r = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+                if r == 0 {
+                    return;
+                }
+            }
+        }
+        let _ = self.tree;
+        let _ = self.child.kill();
+    }
 }

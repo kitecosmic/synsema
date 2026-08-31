@@ -16,17 +16,19 @@ use std::process::ExitCode;
 use synsema_capabilities::model::build_ceiling;
 use synsema_runtime::daemon;
 use synsema_runtime::engine::{
-    repl, run_program_ceiled, run_source, run_swarm_dump, run_tests_ceiled,
-    run_with_diagnostics_ceiled, TestReport,
+    repl, run_program_ceiled, run_program_ceiled_opts, run_source_ceiled, run_swarm_dump_ceiled,
+    run_tests_ceiled, run_with_diagnostics_ceiled, TestReport,
 };
+use synsema_runtime::host::{self, Profile};
 use synsema_runtime::serve::{run_serve_program_with_overrides, ServeOverrides};
 
+mod build;
 mod init_templates;
 mod synfide;
 mod update;
 mod code;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--sandbox | --cap-set <list>] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] | test [-v] [--sandbox | --cap-set <list>] <archivo|dir> | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide] | llm status [--json] | version | update> [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] <archivo.syn | -> [-- args...] | test [-v] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide] | llm status [--json] | version | update> [--sandbox | --cap-set <list>] [--profile native|pure] [--audit json|<ruta>|fd:N] [--env-file <path> | --no-env-file] <archivo.syn>";
 
 // `build_ceiling` (--sandbox/--cap-set → techo) vive en synsema-capabilities: lo comparten
 // este binario y `synsema-wasm` (mismas flags, misma semántica en los dos front-ends).
@@ -37,40 +39,335 @@ fn json_obj(pairs: Vec<(String, String)>) -> String {
     serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// Procesa `--env-file <path>` / `--env-file=<path>` / `--no-env-file`: setea la
-/// env-var `SYNSEMA_ENV_FILE` (la fuente de verdad que lee el runtime) y devuelve los
-/// args sin esos flags, para que el resto del parseo no los confunda con el archivo.
-/// `--no-env-file` ≡ `SYNSEMA_ENV_FILE=` vacío (desactiva la auto-carga del `.env`).
-fn take_env_file_flags(args: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len());
+/// Flags del HOST comunes a `run`/`test`/`conform`/`serve`/`build`: el techo
+/// (`--sandbox`/`--cap-set`), el perfil (`--profile`), el audit (`--audit`), el `.env`
+/// (`--env-file`/`--no-env-file`), el `--` que separa los argumentos del programa y el
+/// `--filename` interno de `run -`. UN parser para todos (hasta v0.6.13 había cuatro
+/// copias con tres políticas distintas de flag desconocido). Lo que no es del host queda
+/// en `rest`, en orden, para que cada subcomando parsee lo suyo.
+#[derive(Default, Debug, Clone)]
+pub(crate) struct HostFlags {
+    pub sandbox: bool,
+    pub cap_set: Option<String>,
+    pub profile: Option<String>,
+    pub audit: Option<String>,
+    pub filename: Option<String>,
+    pub program_args: Vec<String>,
+    pub rest: Vec<String>,
+}
+
+impl HostFlags {
+    /// El techo del host (`build_ceiling`), o el error de uso ya impreso.
+    fn ceiling(&self, cmd: &str) -> Result<Option<Vec<synsema_capabilities::model::Capability>>, ExitCode> {
+        match build_ceiling(self.sandbox, self.cap_set.as_deref()) {
+            Ok(c) => Ok(c),
+            Err(e) => {
+                eprintln!("synsema {}: {}", cmd, e);
+                Err(ExitCode::from(2))
+            }
+        }
+    }
+
+    /// Fija el perfil del PROCESO (`--profile`), validando el nombre.
+    fn apply_profile(&self, cmd: &str) -> Result<Profile, ExitCode> {
+        let p = match self.profile.as_deref() {
+            None => Profile::Native,
+            Some(name) => match Profile::parse(name) {
+                Some(p) => p,
+                None => {
+                    eprintln!("synsema {}: --profile must be 'native' or 'pure', got '{}'", cmd, name);
+                    return Err(ExitCode::from(2));
+                }
+            },
+        };
+        host::set_profile(p);
+        Ok(p)
+    }
+
+    /// Instala el sink de audit (`--audit`), y el colector si el subcomando va a emitir
+    /// un informe JSON (`run --format json`).
+    fn apply_audit(&self, cmd: &str, collect: bool) -> Result<(), ExitCode> {
+        if self.audit.is_none() && !collect {
+            return Ok(());
+        }
+        if let Err(e) = audit::install(self.audit.as_deref(), collect) {
+            eprintln!("synsema {}: {}", cmd, e);
+            return Err(ExitCode::from(2));
+        }
+        Ok(())
+    }
+}
+
+/// Separa los flags del host de `args` (los que siguen al subcomando). Un valor de flag
+/// nunca puede empezar con `--` (`run --cap-set --sandbox` era un error confuso).
+pub(crate) fn take_host_flags(cmd: &str, args: &[String]) -> Result<HostFlags, ExitCode> {
+    let mut h = HostFlags::default();
     let mut i = 0;
+    let need_value = |flag: &str, v: Option<&String>| -> Result<String, ExitCode> {
+        match v {
+            Some(v) if !v.starts_with("--") => Ok(v.clone()),
+            _ => {
+                eprintln!("synsema {}: {} requires a value", cmd, flag);
+                Err(ExitCode::from(2))
+            }
+        }
+    };
     while i < args.len() {
         let a = args[i].as_str();
-        if a == "--no-env-file" {
-            std::env::set_var("SYNSEMA_ENV_FILE", "");
-        } else if a == "--env-file" {
-            match args.get(i + 1) {
-                Some(p) => {
-                    std::env::set_var("SYNSEMA_ENV_FILE", p);
-                    i += 1; // consume el valor
-                }
-                None => eprintln!("synsema: --env-file requires a path"),
+        match a {
+            "--" => {
+                h.program_args.extend(args[i + 1..].iter().cloned());
+                break;
             }
-        } else if let Some(p) = a.strip_prefix("--env-file=") {
-            std::env::set_var("SYNSEMA_ENV_FILE", p);
-        } else {
-            out.push(args[i].clone());
+            "--no-env-file" => std::env::set_var("SYNSEMA_ENV_FILE", ""),
+            "--env-file" => {
+                let v = need_value("--env-file", args.get(i + 1))?;
+                std::env::set_var("SYNSEMA_ENV_FILE", v);
+                i += 1;
+            }
+            "--sandbox" => h.sandbox = true,
+            "--cap-set" => {
+                h.cap_set = Some(need_value("--cap-set", args.get(i + 1))?);
+                i += 1;
+            }
+            "--profile" => {
+                h.profile = Some(need_value("--profile", args.get(i + 1))?);
+                i += 1;
+            }
+            "--audit" => {
+                h.audit = Some(need_value("--audit", args.get(i + 1))?);
+                i += 1;
+            }
+            "--filename" => {
+                h.filename = Some(need_value("--filename", args.get(i + 1))?);
+                i += 1;
+            }
+            _ => {
+                if let Some(p) = a.strip_prefix("--env-file=") {
+                    std::env::set_var("SYNSEMA_ENV_FILE", p);
+                } else if let Some(p) = a.strip_prefix("--cap-set=") {
+                    h.cap_set = Some(p.to_string());
+                } else if let Some(p) = a.strip_prefix("--profile=") {
+                    h.profile = Some(p.to_string());
+                } else if let Some(p) = a.strip_prefix("--audit=") {
+                    h.audit = Some(p.to_string());
+                } else if let Some(p) = a.strip_prefix("--filename=") {
+                    h.filename = Some(p.to_string());
+                } else {
+                    h.rest.push(args[i].clone());
+                }
+            }
         }
         i += 1;
     }
-    out
+    if h.sandbox && h.cap_set.is_some() {
+        eprintln!("synsema {}: --sandbox and --cap-set are mutually exclusive; choose one", cmd);
+        return Err(ExitCode::from(2));
+    }
+    Ok(h)
+}
+
+/// Sink de `--audit json|<ruta>|fd:N` + colector del informe `--format json`. Una línea
+/// JSON por chequeo (misma forma que `syn.run().audit` en wasm, más `ts`/`context`/
+/// `file`/`line`), y una línea `{"summary": …}` al terminar.
+mod audit {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use synsema_capabilities::model::audit_sink::{self, AuditEvent};
+
+    struct Sink {
+        writer: Option<Mutex<Box<dyn Write + Send>>>,
+        collect: Option<Mutex<Vec<serde_json::Value>>>,
+        granted: AtomicUsize,
+        denied: AtomicUsize,
+    }
+
+    static SINK: OnceLock<Arc<Sink>> = OnceLock::new();
+
+    fn event_json(ev: &AuditEvent<'_>) -> serde_json::Value {
+        serde_json::json!({
+            "ts": ev.ts,
+            "context": ev.context,
+            "capability": ev.entry.capability.to_string(),
+            "granted": ev.entry.granted,
+            "source": ev.entry.source,
+            "reason": ev.entry.reason,
+            "origin": ev.entry.origin,
+            "file": ev.file,
+            "line": ev.line,
+        })
+    }
+
+    pub fn install(dest: Option<&str>, collect: bool) -> Result<(), String> {
+        let writer: Option<Box<dyn Write + Send>> = match dest {
+            None => None,
+            Some("json") => Some(Box::new(std::io::stderr())),
+            Some(fd) if fd.starts_with("fd:") => {
+                let n: i32 = fd[3..].parse().map_err(|_| format!("--audit: invalid fd '{}'", fd))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::io::FromRawFd;
+                    if n < 3 {
+                        return Err("--audit fd:N needs N >= 3 (0-2 are stdin/stdout/stderr)".to_string());
+                    }
+                    Some(Box::new(unsafe { std::fs::File::from_raw_fd(n) }))
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = n;
+                    return Err("--audit fd:N is only available on Unix; use --audit <path> or --audit json".to_string());
+                }
+            }
+            Some(path) => Some(Box::new(
+                std::fs::File::create(path).map_err(|e| format!("--audit: cannot create {}: {}", path, e))?,
+            )),
+        };
+        let sink = Arc::new(Sink {
+            writer: writer.map(Mutex::new),
+            collect: if collect { Some(Mutex::new(Vec::new())) } else { None },
+            granted: AtomicUsize::new(0),
+            denied: AtomicUsize::new(0),
+        });
+        if SINK.set(sink.clone()).is_err() {
+            return Err("--audit: the audit sink is already installed".to_string());
+        }
+        let s = sink;
+        audit_sink::install(Box::new(move |ev: &AuditEvent<'_>| {
+            if ev.entry.granted {
+                s.granted.fetch_add(1, Ordering::Relaxed);
+            } else {
+                s.denied.fetch_add(1, Ordering::Relaxed);
+            }
+            let v = event_json(ev);
+            if let Some(w) = &s.writer {
+                if let Ok(mut w) = w.lock() {
+                    let _ = writeln!(w, "{}", v);
+                    let _ = w.flush();
+                }
+            }
+            if let Some(c) = &s.collect {
+                if let Ok(mut c) = c.lock() {
+                    c.push(v);
+                }
+            }
+        }));
+        Ok(())
+    }
+
+    /// La línea final `{"summary": {"granted", "denied", "exit"}}` (si hay writer).
+    pub fn summary(exit: i32) {
+        if let Some(s) = SINK.get() {
+            if let Some(w) = &s.writer {
+                if let Ok(mut w) = w.lock() {
+                    let _ = writeln!(
+                        w,
+                        "{}",
+                        serde_json::json!({"summary": {
+                            "granted": s.granted.load(Ordering::Relaxed),
+                            "denied": s.denied.load(Ordering::Relaxed),
+                            "exit": exit,
+                        }})
+                    );
+                    let _ = w.flush();
+                }
+            }
+        }
+    }
+
+    /// Las entradas colectadas (para `run --format json`).
+    pub fn collected() -> Vec<serde_json::Value> {
+        SINK.get()
+            .and_then(|s| s.collect.as_ref())
+            .and_then(|c| c.lock().ok().map(|c| c.clone()))
+            .unwrap_or_default()
+    }
+}
+
+/// Un binario de `synsema build` en MODO PROGRAMA: todo `argv` es del programa
+/// (`args()`), el techo y el perfil son los horneados, el bundle queda montado como
+/// overlay de lectura. `--engine` como primer argumento devuelve el CLI del motor.
+fn run_bundled(bundle: synsema_core::bundle::Bundle, program_args: Vec<String>) -> ExitCode {
+    let manifest = bundle.manifest.clone();
+    let profile = Profile::parse(&manifest.profile).unwrap_or(Profile::Native);
+    host::set_profile(profile);
+    host::set_program_args(program_args);
+    let ceiling = match manifest.ceiling.as_deref() {
+        None => None,
+        Some("sandbox") => match build_ceiling(true, None) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("synsema: bundle corrupt (ceiling): {}", e);
+                return ExitCode::from(1);
+            }
+        },
+        Some(list) => match build_ceiling(false, Some(list)) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("synsema: bundle corrupt (ceiling): {}", e);
+                return ExitCode::from(1);
+            }
+        },
+    };
+    let source = match bundle.get(&manifest.main) {
+        Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+        None => {
+            eprintln!("synsema: bundle corrupt (main '{}' missing)", manifest.main);
+            return ExitCode::from(1);
+        }
+    };
+    let filename = manifest.main.clone();
+    if !synsema_core::bundle::mount(bundle) {
+        eprintln!("synsema: bundle already mounted");
+        return ExitCode::from(1);
+    }
+    let source = if filename.ends_with(".fsyn") { synsema_core::flat_syntax::translate_flat(&source) } else { source };
+    let result = run_program_ceiled(&source, &filename, ceiling);
+    for line in &result.output {
+        println!("{}", line);
+    }
+    if !result.success {
+        for e in &result.errors {
+            eprintln!("{}", e);
+        }
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+
+    // `--engine` como primer argumento: el CLI del motor, en cualquier binario (en uno
+    // de `synsema build` es la ÚNICA forma de llegar al motor; en `synsema` es un
+    // prefijo no-op para que los scripts sean uniformes). Sin `--engine`, un binario
+    // con bundle corre su programa; uno sin bundle es el CLI de siempre.
+    let engine_prefix = args.get(1).map(|a| a == "--engine").unwrap_or(false);
+    if engine_prefix {
+        args.remove(1);
+    } else {
+        match std::env::current_exe()
+            .map_err(|e| e.to_string())
+            .and_then(|p| synsema_core::bundle::detect(&p))
+        {
+            Ok(synsema_core::bundle::Detected::Plain) => {}
+            Ok(synsema_core::bundle::Detected::Bundle(b)) => {
+                return run_bundled(b, args.iter().skip(1).cloned().collect());
+            }
+            Err(e) => {
+                eprintln!("synsema: {}", e);
+                return ExitCode::from(1);
+            }
+        }
+    }
 
     match args.get(1).map(String::as_str) {
         Some("conform") => cmd_conform(&args),
+        Some("build") => match take_host_flags("build", &args[2..]) {
+            Ok(h) => build::cmd_build(h),
+            Err(code) => code,
+        },
         Some("serve") => cmd_serve(&args),
         Some("run") => cmd_run(&args),
         Some("test") => cmd_test(&args),
@@ -94,7 +391,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(other) => {
-            eprintln!("subcomando desconocido: '{}'. Disponibles: init, conform, serve, run, test, check, code, openapi, tokens, ast, repl, daemon, llm, version, update", other);
+            eprintln!("subcomando desconocido: '{}'. Disponibles: init, conform, serve, run, test, build, check, code, openapi, tokens, ast, repl, daemon, llm, version, update", other);
             ExitCode::from(2)
         }
         None => {
@@ -232,7 +529,10 @@ fn cmd_init(args: &[String]) -> ExitCode {
 /// el reporte viene de `llm_config_report`, cuyo tipo no puede transportar secretos.
 /// No hace red. Exit: 0 = vivo, 1 = offline, 2 = uso.
 fn cmd_llm(args: &[String]) -> ExitCode {
-    let args = take_env_file_flags(args);
+    let args: Vec<String> = match take_host_flags("llm", &args[2..]) {
+        Ok(h) => std::iter::once(args[0].clone()).chain(std::iter::once(args[1].clone())).chain(h.rest).collect(),
+        Err(code) => return code,
+    };
     match args.get(2).map(String::as_str) {
         Some("status") => cmd_llm_status(args.iter().any(|a| a == "--json")),
         _ => {
@@ -382,20 +682,26 @@ fn cmd_llm_status(json: bool) -> ExitCode {
 }
 
 fn cmd_conform(args: &[String]) -> ExitCode {
-    // conform [--swarm] [--flat] [--env-file <p>|--no-env-file] <archivo.syn>
+    // conform [--swarm] [--flat] [--sandbox | --cap-set L] [--profile P] [--audit D]
+    //         [--env-file <p>|--no-env-file] <archivo.syn>
     // stdout de conform = SOLO el JSON: el eco vivo de agentes va a stderr.
     synsema_runtime::engine::AGENT_ECHO_TO_STDERR.store(true, std::sync::atomic::Ordering::Relaxed);
-    let args = take_env_file_flags(args);
-    let args = args.as_slice();
+    let host = match take_host_flags("conform", &args[2..]) {
+        Ok(h) => h,
+        Err(code) => return code,
+    };
     let mut swarm = false;
     let mut flat = false;
     let mut path: Option<String> = None;
-    for a in &args[2..] {
+    for a in &host.rest {
         match a.as_str() {
             "--swarm" => swarm = true,
             "--flat" => flat = true,
             p if !p.starts_with("--") => path = Some(p.to_string()),
-            _ => {}
+            other => {
+                eprintln!("synsema conform: unknown flag '{}'", other);
+                return ExitCode::from(2);
+            }
         }
     }
     let path = match path {
@@ -405,6 +711,19 @@ fn cmd_conform(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // El techo, el perfil y el audit: MISMA semántica que `run`/`test` (hasta v0.6.13
+    // conform los ignoraba en silencio — el único subcomando que no sandboxeaba).
+    let ceiling = match host.ceiling("conform") {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    if let Err(code) = host.apply_profile("conform") {
+        return code;
+    }
+    if let Err(code) = host.apply_audit("conform", false) {
+        return code;
+    }
+    host::set_program_args(host.program_args.clone());
 
     // Leer el archivo UTF-8. El path se usa tal cual como nombre de fuente para que
     // el prefijo de ubicación de los errores sea reproducible contra el oráculo.
@@ -415,14 +734,15 @@ fn cmd_conform(args: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    // --flat: pre-procesa sintaxis flat → estándar antes de ejecutar.
-    if flat {
+    // --flat (o `.fsyn`): pre-procesa sintaxis flat → estándar antes de ejecutar.
+    if flat || path.ends_with(".fsyn") {
         source = synsema_core::flat_syntax::translate_flat(&source);
     }
 
+    let ok;
     if swarm {
         // Modo swarm: tras joinear los hilos, agrega blackboard + estados de agentes.
-        let dump = run_swarm_dump(&source, &path);
+        let dump = run_swarm_dump_ceiled(&source, &path, ceiling);
         let out = serde_json::to_string(&dump.result.output).unwrap_or_else(|_| "[]".to_string());
         let err = serde_json::to_string(&dump.result.errors).unwrap_or_else(|_| "[]".to_string());
         println!(
@@ -433,14 +753,18 @@ fn cmd_conform(args: &[String]) -> ExitCode {
             json_obj(dump.blackboard),
             json_obj(dump.agents)
         );
+        ok = dump.result.success;
     } else {
-        let result = run_source(&source, &path);
+        let result = run_source_ceiled(&source, &path, ceiling);
         // serde_json escapa correctamente los strings (comillas, \n, control, unicode).
         let out = serde_json::to_string(&result.output).unwrap_or_else(|_| "[]".to_string());
         let err = serde_json::to_string(&result.errors).unwrap_or_else(|_| "[]".to_string());
         println!("{{\"ok\": {}, \"out\": {}, \"err\": {}}}", result.success, out, err);
+        ok = result.success;
     }
-
+    // El exit sigue siendo 0 (el fallo del programa va en el JSON); el summary del
+    // audit refleja el `ok` del programa.
+    audit::summary(if ok { 0 } else { 1 });
     ExitCode::SUCCESS
 }
 
@@ -449,14 +773,32 @@ fn cmd_conform(args: &[String]) -> ExitCode {
 /// default): `--port N`, `--domain d1,d2`, `--tls-auto <email>`, `--tls-cert <p>
 /// --tls-key <p>`, `--bind <addr>`. Imprime la línea de readiness a STDOUT.
 fn cmd_serve(args: &[String]) -> ExitCode {
-    let args = take_env_file_flags(args);
+    let host = match take_host_flags("serve", &args[2..]) {
+        Ok(h) => h,
+        Err(code) => return code,
+    };
+    // `serve` no corre bajo el perfil puro (bindear un puerto es OS-facing): exit 2,
+    // nunca en silencio.
+    match host.apply_profile("serve") {
+        Ok(Profile::Pure) => {
+            eprintln!("synsema serve: --profile pure is not supported (a server binds a socket); run it natively");
+            return ExitCode::from(2);
+        }
+        Ok(Profile::Native) => {}
+        Err(code) => return code,
+    }
+    if let Err(code) = host.apply_audit("serve", false) {
+        return code;
+    }
+    host::set_program_args(host.program_args.clone());
+    let serve_sandbox = host.sandbox;
+    let serve_cap_set = host.cap_set.clone();
+    let args = host.rest.clone();
     let mut secure = false;
     let mut watch = false;
-    let mut serve_sandbox = false;
-    let mut serve_cap_set: Option<String> = None;
     let mut path: Option<String> = None;
     let mut ov = ServeOverrides::default();
-    let mut i = 2;
+    let mut i = 0;
     while i < args.len() {
         // Toma el valor del flag siguiente, o error claro (fail-loud).
         macro_rules! next_val {
@@ -475,12 +817,7 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             "--secure" => secure = true,
             "--watch" => watch = true,
             // Techo del host para TODO el serve (requests, cron, agentes): mismas
-            // reglas que `run` (`build_ceiling`, mutuamente excluyentes).
-            "--sandbox" => serve_sandbox = true,
-            "--cap-set" => serve_cap_set = Some(next_val!("--cap-set")),
-            p if p.starts_with("--cap-set=") => {
-                serve_cap_set = Some(p.trim_start_matches("--cap-set=").to_string());
-            }
+            // reglas que `run` (`--sandbox`/`--cap-set` los parsea `take_host_flags`).
             "--port" => {
                 let v = next_val!("--port");
                 match v.parse::<u16>() {
@@ -567,8 +904,10 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         for e in &result.errors {
             eprintln!("{}", e);
         }
+        audit::summary(1);
         return ExitCode::from(1);
     }
+    audit::summary(0);
     ExitCode::SUCCESS
 }
 
@@ -581,38 +920,26 @@ fn cmd_serve(args: &[String]) -> ExitCode {
 /// scripting/CI). Con `--explain` el formato por defecto es humano (`format_human`); con
 /// `--format json` se emite JSON estructurado (`format_agent`) para herramientas/agentes.
 fn cmd_run(args: &[String]) -> ExitCode {
-    let args = take_env_file_flags(args);
+    let host = match take_host_flags("run", &args[2..]) {
+        Ok(h) => h,
+        Err(code) => return code,
+    };
     let mut flat = false;
     let mut explain = false;
-    let mut fmt_json = false; // --format json (sólo aplica con --explain)
-    let mut sandbox = false; // --sandbox: techo [stdout, time]
-    let mut cap_set: Option<String> = None; // --cap-set "<list>": techo explícito
+    let mut fmt_json = false; // --format json: con --explain, diagnóstico JSON; sin él, el INFORME
     let mut path: Option<String> = None;
-    let mut i = 2;
-    while i < args.len() {
-        match args[i].as_str() {
+    let mut program_args = host.program_args.clone();
+    let rest = &host.rest;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
             "--flat" => flat = true,
             "--explain" => explain = true,
-            "--sandbox" => sandbox = true,
-            // `--cap-set <list>` con lookahead, y forma `--cap-set=<list>`.
-            "--cap-set" => match args.get(i + 1) {
-                Some(v) => {
-                    cap_set = Some(v.clone());
-                    i += 1;
-                }
-                None => {
-                    eprintln!("synsema run: --cap-set requires a value (e.g. \"stdout,net=api.example.com\")");
-                    return ExitCode::from(2);
-                }
-            },
-            p if p.starts_with("--cap-set=") => {
-                cap_set = Some(p.trim_start_matches("--cap-set=").to_string());
-            }
             "--format=json" => fmt_json = true,
             "--format=human" => fmt_json = false,
             // `--format <valor>` con lookahead, igual que `--env-file`.
             "--format" => {
-                match args.get(i + 1).map(String::as_str) {
+                match rest.get(i + 1).map(String::as_str) {
                     Some("json") => fmt_json = true,
                     Some("human") => fmt_json = false,
                     Some(other) => {
@@ -631,7 +958,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
             }
             // `--provider <name>`: elige el proveedor LLM por flag (gana sobre env/.env,
             // setea SYNSEMA_LLM_PROVIDER antes de cablear el LLM). Forma `=` también.
-            "--provider" => match args.get(i + 1) {
+            "--provider" => match rest.get(i + 1) {
                 Some(name) if !name.starts_with("--") => {
                     std::env::set_var("SYNSEMA_LLM_PROVIDER", name);
                     i += 1;
@@ -644,42 +971,70 @@ fn cmd_run(args: &[String]) -> ExitCode {
             p if p.starts_with("--provider=") => {
                 std::env::set_var("SYNSEMA_LLM_PROVIDER", p.trim_start_matches("--provider="));
             }
-            p if !p.starts_with("--") => path = Some(p.to_string()),
-            _ => {}
+            // El programa: un path, o `-` (fuente por stdin). Lo que siga al programa
+            // (sin `--`) también es del programa, salvo que parezca un flag.
+            p if p == "-" || !p.starts_with('-') => {
+                if path.is_some() {
+                    program_args.push(p.to_string());
+                } else {
+                    path = Some(p.to_string());
+                }
+            }
+            other => {
+                // Un flag desconocido NUNCA se traga: `run --audit json p.syn` corriendo
+                // sin audit (y con `json` como path) sería un agujero, no una comodidad.
+                eprintln!("synsema run: unknown flag '{}'\n{}", other, USAGE);
+                return ExitCode::from(2);
+            }
         }
         i += 1;
     }
     let path = match path {
         Some(p) => p,
         None => {
-            eprintln!("uso: synsema run [--flat] [--explain] [--format human|json] [--provider <name>] <archivo.syn>");
+            eprintln!("uso: synsema run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | -> [-- args...]");
             return ExitCode::from(2);
         }
     };
-    let mut source = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("no se pudo leer '{}': {}", path, e);
+    let report_mode = fmt_json && !explain;
+    let (mut source, filename) = if path == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+            eprintln!("synsema run: could not read stdin: {}", e);
             return ExitCode::from(1);
         }
+        (buf, host.filename.clone().unwrap_or_else(|| "<stdin>".to_string()))
+    } else {
+        match std::fs::read_to_string(&path) {
+            Ok(s) => (s, path.clone()),
+            Err(e) => {
+                eprintln!("no se pudo leer '{}': {}", path, e);
+                return ExitCode::from(1);
+            }
+        }
     };
-    if flat || path.ends_with(".fsyn") {
+    if flat || filename.ends_with(".fsyn") {
         source = synsema_core::flat_syntax::translate_flat(&source);
     }
 
     // Techo de capabilities del host (--sandbox/--cap-set): opt-in, defense-in-depth.
-    let ceiling = match build_ceiling(sandbox, cap_set.as_deref()) {
+    let ceiling = match host.ceiling("run") {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("synsema run: {}", e);
-            return ExitCode::from(2);
-        }
+        Err(code) => return code,
     };
+    if let Err(code) = host.apply_profile("run") {
+        return code;
+    }
+    if let Err(code) = host.apply_audit("run", report_mode) {
+        return code;
+    }
+    host::set_program_args(program_args);
 
     // Camino opt-in: diagnóstico rico. Reusa la API pública del runtime; el default
     // (línea corta) queda intacto más abajo para no romper scripting/CI.
     if explain {
-        let run = run_with_diagnostics_ceiled(&source, &path, ceiling);
+        let run = run_with_diagnostics_ceiled(&source, &filename, ceiling);
         for line in &run.result.output {
             println!("{}", line);
         }
@@ -708,15 +1063,37 @@ fn cmd_run(args: &[String]) -> ExitCode {
                     eprintln!("{}", e);
                 }
             }
+            audit::summary(1);
             return ExitCode::from(1);
         }
+        audit::summary(0);
         return ExitCode::SUCCESS;
+    }
+
+    // `run --format json` (sin --explain): el INFORME con la forma de `syn.run()` de wasm
+    // — `{ok, output, errors, audit, exit, llm_tokens}` — como ÚNICO contenido de stdout.
+    // La salida del programa se colecta (no va en vivo). Es el transporte de
+    // `run_program` y una API para cualquier runner.
+    if report_mode {
+        let result = run_program_ceiled_opts(&source, &filename, ceiling, false);
+        let exit = if result.success { 0 } else { 1 };
+        let report = serde_json::json!({
+            "ok": result.success,
+            "output": result.output,
+            "errors": result.errors,
+            "audit": audit::collected(),
+            "exit": exit,
+            "llm_tokens": synsema_runtime::llm_providers::llm_tokens_total(),
+        });
+        println!("{}", report);
+        audit::summary(exit);
+        return ExitCode::from(exit as u8);
     }
 
     // Camino normal: swarm real (DE-011). Los `spawn` corren en hilos aislados; un agente
     // que falla NO tumba el main ni trunca su salida. Sale ≠0 si el main falla o si algún
     // agente terminó en ERROR. El techo del host (si hay) se propaga a los agentes.
-    let result = run_program_ceiled(&source, &path, ceiling);
+    let result = run_program_ceiled(&source, &filename, ceiling);
     for line in &result.output {
         println!("{}", line);
     }
@@ -724,60 +1101,53 @@ fn cmd_run(args: &[String]) -> ExitCode {
         for e in &result.errors {
             eprintln!("{}", e);
         }
+        audit::summary(1);
         return ExitCode::from(1);
     }
+    audit::summary(0);
     ExitCode::SUCCESS
 }
 
 /// test [-v] [--flat] <archivo.syn | dir>: corre los bloques `test` y reporta ✓/✗.
 /// Exit 0 si todos pasan; 1 si alguno falla; 2 por error de uso/archivo ilegible.
 fn cmd_test(args: &[String]) -> ExitCode {
-    let args = take_env_file_flags(args);
-    let args = args.as_slice();
+    let host = match take_host_flags("test", &args[2..]) {
+        Ok(h) => h,
+        Err(code) => return code,
+    };
     let mut flat = false;
     let mut verbose = false;
-    let mut sandbox = false; // --sandbox: techo [stdout, time]
-    let mut cap_set: Option<String> = None; // --cap-set "<list>": techo explícito
     let mut path: Option<String> = None;
-    let mut i = 2;
-    while i < args.len() {
-        match args[i].as_str() {
+    for a in &host.rest {
+        match a.as_str() {
             "--flat" => flat = true,
             "-v" | "--verbose" => verbose = true,
-            "--sandbox" => sandbox = true,
-            "--cap-set" => match args.get(i + 1) {
-                Some(v) => {
-                    cap_set = Some(v.clone());
-                    i += 1;
-                }
-                None => {
-                    eprintln!("synsema test: --cap-set requires a value (e.g. \"stdout,net=api.example.com\")");
-                    return ExitCode::from(2);
-                }
-            },
-            p if p.starts_with("--cap-set=") => {
-                cap_set = Some(p.trim_start_matches("--cap-set=").to_string());
-            }
             p if !p.starts_with('-') => path = Some(p.to_string()),
-            _ => {}
+            other => {
+                eprintln!("synsema test: unknown flag '{}'", other);
+                return ExitCode::from(2);
+            }
         }
-        i += 1;
     }
     let path = match path {
         Some(p) => p,
         None => {
-            eprintln!("uso: synsema test [-v] [--flat] [--sandbox | --cap-set <list>] <archivo.syn | dir>");
+            eprintln!("uso: synsema test [-v] [--flat] [--sandbox | --cap-set <list>] [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | dir>");
             return ExitCode::from(2);
         }
     };
     // Techo de capabilities del host (--sandbox/--cap-set): opt-in, defense-in-depth.
-    let ceiling = match build_ceiling(sandbox, cap_set.as_deref()) {
+    let ceiling = match host.ceiling("test") {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("synsema test: {}", e);
-            return ExitCode::from(2);
-        }
+        Err(code) => return code,
     };
+    if let Err(code) = host.apply_profile("test") {
+        return code;
+    }
+    if let Err(code) = host.apply_audit("test", false) {
+        return code;
+    }
+    host::set_program_args(host.program_args.clone());
     let files = match collect_syn_files(&path) {
         Ok(f) => f,
         Err(e) => {
@@ -815,8 +1185,10 @@ fn cmd_test(args: &[String]) -> ExitCode {
     let total = total_passed + total_failed;
     println!("{} passed, {} failed ({} total)", total_passed, total_failed, total);
     if total_failed > 0 {
+        audit::summary(1);
         ExitCode::from(1)
     } else {
+        audit::summary(0);
         ExitCode::SUCCESS
     }
 }

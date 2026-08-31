@@ -24,7 +24,9 @@ use synsema_core::types::{
     syn_bool, syn_bytes, syn_float, syn_int, syn_list, syn_map, syn_text, SynValue,
 };
 
-use crate::model::{fnmatch, normalize_path, Capability, CapabilityType, CapabilitySet};
+use crate::model::{
+    fnmatch, normalize_path, Capability, CapabilityAuditEntry, CapabilityType, CapabilitySet, BUNDLED_ASSET,
+};
 
 /// `str(value.raw)` estilo Python (texto crudo).
 fn raw_str(v: &SynValue) -> String {
@@ -40,6 +42,38 @@ fn raw_str(v: &SynValue) -> String {
 fn arg(args: &[SynValue], i: usize) -> Result<&SynValue, Control> {
     args.get(i)
         .ok_or_else(|| Control::Error(RuntimeError::new("missing argument")))
+}
+
+/// Lectura servida desde el bundle (`synsema build`): el asset es PARTE del programa,
+/// así que no pide `file.read` — pero queda en el audit, con la razón explícita.
+fn bundled_audit(caps: &Rc<RefCell<CapabilitySet>>, ty: CapabilityType, path: &str, source: &str) {
+    caps.borrow_mut().push_audit(CapabilityAuditEntry {
+        capability: Capability::new(ty, Some(path.to_string())),
+        granted: true,
+        source: source.to_string(),
+        reason: BUNDLED_ASSET.to_string(),
+        origin: "runtime",
+    });
+}
+
+/// Un path que está en el bundle es de sólo lectura: escribirlo sería mentir (la próxima
+/// lectura seguiría viniendo del bundle).
+fn reject_bundled_write(path: &str) -> Result<(), Control> {
+    if synsema_core::bundle::get(path).is_some() {
+        return Err(Control::Error(RuntimeError::new(format!(
+            "\"{}\" is part of the bundle (read-only)",
+            path
+        ))));
+    }
+    Ok(())
+}
+
+/// Rango de líneas 1-based (EOL preservado) sobre un texto en memoria (bundle).
+fn lines_range_str(s: &str, offset: usize, limit: Option<usize>) -> String {
+    s.split_inclusive('\n')
+        .skip(offset.saturating_sub(1))
+        .take(limit.unwrap_or(usize::MAX))
+        .collect()
 }
 
 /// Chequea una capability; convierte la violación en `Control::Error` SIN ubicación.
@@ -247,6 +281,109 @@ fn parse_time_ts(s: &str, pattern: Option<&str>) -> Result<f64, Control> {
     Err(Control::Error(RuntimeError::new(format!("invalid time: {}", s))))
 }
 
+/// Builtins de filesystem del PERFIL PURO: sin disco, pero el BUNDLE (`synsema build`)
+/// sigue disponible — es parte del programa, no filesystem. Las lecturas sirven del
+/// bundle o fallan con el error puro; las escrituras siempre fallan. Sobrescriben (por
+/// nombre) a los builtins normales cuando el motor entra en perfil puro.
+pub fn register_pure_fs(interp: &Interpreter, hint: &'static str) {
+    fn no_fs(name: &str, hint: &str) -> Control {
+        Control::Error(RuntimeError::new(format!(
+            "{}: not available in the pure profile — this run has no filesystem ({})",
+            name, hint
+        )))
+    }
+    interp.register_builtin("read_file", -1, Rc::new(move |_i, args, _loc| {
+        let path = normalize_path(&raw_str(arg(args, 0)?));
+        match synsema_core::bundle::get(&path) {
+            Some(bytes) => {
+                let text = String::from_utf8_lossy(bytes).into_owned();
+                if args.len() < 2 {
+                    return Ok(syn_text(text));
+                }
+                let offset = arg_i64(arg(args, 1)?)?;
+                if offset < 1 {
+                    return Err(Control::Error(RuntimeError::new("read_file: offset must be >= 1")));
+                }
+                let limit = match args.get(2) {
+                    Some(v) => Some(arg_i64(v)?.max(0) as usize),
+                    None => None,
+                };
+                Ok(syn_text(lines_range_str(&text, offset as usize, limit)))
+            }
+            None => Err(no_fs("read_file", hint)),
+        }
+    }));
+    interp.register_builtin("read_file_bytes", 1, Rc::new(move |_i, args, _loc| {
+        let path = normalize_path(&raw_str(arg(args, 0)?));
+        match synsema_core::bundle::get(&path) {
+            Some(bytes) => Ok(syn_bytes(bytes.to_vec())),
+            None => Err(no_fs("read_file_bytes", hint)),
+        }
+    }));
+    interp.register_builtin("file_exists", 1, Rc::new(move |_i, args, _loc| {
+        let path = normalize_path(&raw_str(arg(args, 0)?));
+        Ok(syn_bool(synsema_core::bundle::get(&path).is_some()))
+    }));
+    interp.register_builtin("file_info", 1, Rc::new(move |_i, args, _loc| {
+        let path = normalize_path(&raw_str(arg(args, 0)?));
+        let mut m = IndexMap::new();
+        match synsema_core::bundle::get(&path) {
+            Some(bytes) => {
+                m.insert("exists".to_string(), syn_bool(true));
+                m.insert("is_dir".to_string(), syn_bool(false));
+                m.insert("size".to_string(), syn_int(bytes.len() as i64));
+                m.insert("modified".to_string(), SynValue::Nothing);
+                m.insert("bundled".to_string(), syn_bool(true));
+            }
+            None => {
+                m.insert("exists".to_string(), syn_bool(false));
+                m.insert("is_dir".to_string(), syn_bool(false));
+                m.insert("size".to_string(), syn_int(0));
+                m.insert("modified".to_string(), SynValue::Nothing);
+            }
+        }
+        Ok(syn_map(m))
+    }));
+    interp.register_builtin("list_dir", 1, Rc::new(move |_i, args, _loc| {
+        let path = normalize_path(&raw_str(arg(args, 0)?));
+        let Some(b) = synsema_core::bundle::mounted() else {
+            return Err(no_fs("list_dir", hint));
+        };
+        let under = b.list(&path);
+        if under.is_empty() {
+            return Err(no_fs("list_dir", hint));
+        }
+        let root = path.trim_matches(|c| c == '.' || c == '/' || c == '\\').is_empty();
+        let prefix_len = match synsema_core::bundle::normalize_name(&path) {
+            Some(n) if !root => n.len() + 1,
+            _ => 0,
+        };
+        let mut seen: Vec<(String, bool, i64)> = Vec::new();
+        for (name, size) in under {
+            let rest = &name[prefix_len.min(name.len())..];
+            let (entry, is_dir) = match rest.split_once('/') {
+                Some((d, _)) => (d.to_string(), true),
+                None => (rest.to_string(), false),
+            };
+            if !seen.iter().any(|(n, _, _)| *n == entry) {
+                seen.push((entry, is_dir, if is_dir { 0 } else { size as i64 }));
+            }
+        }
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(syn_list(seen.into_iter().map(|(name, is_dir, size)| {
+            let mut m = IndexMap::new();
+            m.insert("name".to_string(), syn_text(name));
+            m.insert("is_dir".to_string(), syn_bool(is_dir));
+            m.insert("size".to_string(), syn_int(size));
+            syn_map(m)
+        }).collect()))
+    }));
+    for name in ["write_file", "append_file", "edit_file", "grep"] {
+        let name: &'static str = name;
+        interp.register_builtin(name, -1, Rc::new(move |_i, _args, _loc| Err(no_fs(name, hint))));
+    }
+}
+
 /// Registra los builtins seguros en el intérprete, compartiendo el `CapabilitySet`.
 pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
     // read_file(path, offset?, limit?) → text. Requiere file_read("<path>").
@@ -259,13 +396,21 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             -1,
             Rc::new(move |_i, args, _loc| {
                 let path = normalize_path(&raw_str(arg(args, 0)?));
-                require(
-                    &caps,
-                    Capability::new(CapabilityType::FileRead, Some(path.clone())),
-                    "read_file()",
-                )?;
+                let bundled = synsema_core::bundle::get(&path);
+                if bundled.is_some() {
+                    bundled_audit(&caps, CapabilityType::FileRead, &path, "read_file()");
+                } else {
+                    require(
+                        &caps,
+                        Capability::new(CapabilityType::FileRead, Some(path.clone())),
+                        "read_file()",
+                    )?;
+                }
                 // arity-1: archivo completo, idéntico a hoy (read_to_string estricto).
                 if args.len() < 2 {
+                    if let Some(bytes) = bundled {
+                        return Ok(syn_text(String::from_utf8_lossy(bytes).into_owned()));
+                    }
                     return match std::fs::read_to_string(&path) {
                         Ok(c) => Ok(syn_text(c)),
                         Err(_) => Err(Control::Error(RuntimeError::new(format!(
@@ -293,6 +438,9 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     }
                     None => None,
                 };
+                if let Some(bytes) = bundled {
+                    return Ok(syn_text(lines_range_str(&String::from_utf8_lossy(bytes), offset as usize, limit)));
+                }
                 match read_lines_range(&path, offset as usize, limit) {
                     Ok(s) => Ok(syn_text(s)),
                     Err(_) => Err(Control::Error(RuntimeError::new(format!(
@@ -313,6 +461,40 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             1,
             Rc::new(move |_i, args, _loc| {
                 let path = normalize_path(&raw_str(arg(args, 0)?));
+                if let Some(b) = synsema_core::bundle::mounted() {
+                    let under = b.list(&path);
+                    if !under.is_empty() {
+                        bundled_audit(&caps, CapabilityType::FileRead, &path, "list_dir()");
+                        let root = path.trim_matches(|c| c == '.' || c == '/' || c == '\\').is_empty();
+                        let prefix_len = match synsema_core::bundle::normalize_name(&path) {
+                            Some(n) if !root => n.len() + 1,
+                            _ => 0,
+                        };
+                        let mut seen: Vec<(String, bool, i64)> = Vec::new();
+                        for (name, size) in under {
+                            let rest = &name[prefix_len.min(name.len())..];
+                            let (entry, is_dir) = match rest.split_once('/') {
+                                Some((d, _)) => (d.to_string(), true),
+                                None => (rest.to_string(), false),
+                            };
+                            if !seen.iter().any(|(n, _, _)| *n == entry) {
+                                seen.push((entry, is_dir, if is_dir { 0 } else { size as i64 }));
+                            }
+                        }
+                        seen.sort_by(|a, b| a.0.cmp(&b.0));
+                        let items: Vec<SynValue> = seen
+                            .into_iter()
+                            .map(|(name, is_dir, size)| {
+                                let mut m = IndexMap::new();
+                                m.insert("name".to_string(), syn_text(name));
+                                m.insert("is_dir".to_string(), syn_bool(is_dir));
+                                m.insert("size".to_string(), syn_int(size));
+                                syn_map(m)
+                            })
+                            .collect();
+                        return Ok(syn_list(items));
+                    }
+                }
                 require(
                     &caps,
                     Capability::new(CapabilityType::FileRead, Some(path.clone())),
@@ -358,6 +540,16 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             1,
             Rc::new(move |_i, args, _loc| {
                 let path = normalize_path(&raw_str(arg(args, 0)?));
+                if let Some(bytes) = synsema_core::bundle::get(&path) {
+                    bundled_audit(&caps, CapabilityType::FileRead, &path, "file_info()");
+                    let mut m = IndexMap::new();
+                    m.insert("exists".to_string(), syn_bool(true));
+                    m.insert("is_dir".to_string(), syn_bool(false));
+                    m.insert("size".to_string(), syn_int(bytes.len() as i64));
+                    m.insert("modified".to_string(), SynValue::Nothing);
+                    m.insert("bundled".to_string(), syn_bool(true));
+                    return Ok(syn_map(m));
+                }
                 require(
                     &caps,
                     Capability::new(CapabilityType::FileRead, Some(path.clone())),
@@ -401,6 +593,10 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             1,
             Rc::new(move |_i, args, _loc| {
                 let path = normalize_path(&raw_str(arg(args, 0)?));
+                if synsema_core::bundle::get(&path).is_some() {
+                    bundled_audit(&caps, CapabilityType::FileRead, &path, "file_exists()");
+                    return Ok(syn_bool(true));
+                }
                 require(
                     &caps,
                     Capability::new(CapabilityType::FileRead, Some(path.clone())),
@@ -423,6 +619,12 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             Rc::new(move |_i, args, _loc| {
                 let target = normalize_path(&raw_str(arg(args, 0)?));
                 let pattern = raw_str(arg(args, 1)?);
+                if synsema_core::bundle::get(&target).is_some() {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "grep: \"{}\" is a bundled asset — grep runs over the filesystem; use read_file() on it",
+                        target
+                    ))));
+                }
                 require(
                     &caps,
                     Capability::new(CapabilityType::FileRead, Some(target.clone())),
@@ -533,6 +735,10 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             1,
             Rc::new(move |_i, args, _loc| {
                 let path = normalize_path(&raw_str(arg(args, 0)?));
+                if let Some(bytes) = synsema_core::bundle::get(&path) {
+                    bundled_audit(&caps, CapabilityType::FileRead, &path, "read_file_bytes()");
+                    return Ok(syn_bytes(bytes.to_vec()));
+                }
                 require(
                     &caps,
                     Capability::new(CapabilityType::FileRead, Some(path.clone())),
@@ -565,6 +771,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     Capability::new(CapabilityType::FileWrite, Some(path.clone())),
                     "write_file()",
                 )?;
+                reject_bundled_write(&path)?;
                 // Escritura atómica (temp+rename); crea dirs padre. Despacha por tipo.
                 let result = match arg(args, 1)? {
                     SynValue::Bytes(b) => atomic_write(&path, &b[..]),
@@ -600,6 +807,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     Capability::new(CapabilityType::FileWrite, Some(path.clone())),
                     "edit_file()",
                 )?;
+                reject_bundled_write(&path)?;
                 if old.is_empty() {
                     return Err(Control::Error(RuntimeError::new("edit_file: empty pattern")));
                 }
@@ -646,6 +854,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     Capability::new(CapabilityType::FileWrite, Some(path.clone())),
                     "append_file()",
                 )?;
+                reject_bundled_write(&path)?;
                 if let Some(parent) = Path::new(&path).parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
@@ -733,9 +942,16 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 if let Some(dir) = &cwd {
                     c.current_dir(dir);
                 }
+                // F3: sacar las variables SECRETAS de Synsema (claves de proveedor,
+                // secretos del `.env`) del entorno del hijo — un programa con `exec` pero
+                // sin `env`/`secret` no debe exfiltrarlas por `run("printenv")`. El
+                // programa que de verdad necesita una la pasa explícita por `opts.env`.
+                for name in i.sensitive_env() {
+                    c.env_remove(name);
+                }
                 if let Some(SynValue::Map(m)) = opt("env") {
                     for (k, v) in m.borrow().iter() {
-                        c.env(k, raw_str(v)); // hereda environ + override
+                        c.env(k, raw_str(v)); // override explícito (gana sobre el strip)
                     }
                 }
 

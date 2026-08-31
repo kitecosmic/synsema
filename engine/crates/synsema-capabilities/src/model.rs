@@ -53,6 +53,11 @@ pub enum CapabilityType {
     /// scope NO es una ruta: se compara literal + fnmatch, lo que da prefijos
     /// `memory=shop-*` en `--cap-set` gratis. Nunca sin scope en un `require`.
     Memory,
+    /// Habilita `run_program(source, opts)`: correr OTRO programa Synsema en un proceso
+    /// hijo del mismo binario, bajo un techo que es la intersección de lo pedido con lo
+    /// que el padre tiene efectivamente. Deny-by-default, sin scope. Lo que el padre
+    /// puede PRESTAR al hijo tiene que estar en sus propios `require`.
+    SandboxRun,
 }
 
 impl CapabilityType {
@@ -80,9 +85,23 @@ impl CapabilityType {
             Wallet => "wallet",
             Spend => "spend",
             Memory => "memory",
+            SandboxRun => "sandbox_run",
+        }
+    }
+
+    /// Nombre tal como lo entiende `--cap-set`/`require` (el inverso exacto de
+    /// `capability_type_from_name`): `file.read`, no `file_read`.
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            CapabilityType::FileRead => "file.read",
+            CapabilityType::FileWrite => "file.write",
+            other => other.name_lower(),
         }
     }
 }
+
+/// Nombres aceptados por `--cap-set` (para el mensaje de error y los docs).
+pub const KNOWN_CAPABILITY_NAMES: &str = "net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal, sign, wallet, spend, memory, sandbox_run";
 
 /// Mapa nombre→tipo (CAPABILITY_NAMES del oráculo).
 pub fn capability_type_from_name(name: &str) -> Option<CapabilityType> {
@@ -90,8 +109,10 @@ pub fn capability_type_from_name(name: &str) -> Option<CapabilityType> {
     Some(match name {
         "net" => Net,
         "file" => File,
-        "file.read" => FileRead,
-        "file.write" => FileWrite,
+        // `file_read`/`file_write` es como `Display` los imprime (un audit se puede
+        // volver a pegar en un `--cap-set`).
+        "file.read" | "file_read" => FileRead,
+        "file.write" | "file_write" => FileWrite,
         "exec" => Exec,
         "env" => Env,
         "time" => Time,
@@ -107,6 +128,7 @@ pub fn capability_type_from_name(name: &str) -> Option<CapabilityType> {
         "wallet" => Wallet,
         "spend" => Spend,
         "memory" => Memory,
+        "sandbox_run" => SandboxRun,
         _ => return None,
     })
 }
@@ -121,6 +143,16 @@ pub struct Capability {
 impl Capability {
     pub fn new(ty: CapabilityType, scope: Option<String>) -> Self {
         Self { ty, scope }
+    }
+
+    /// Serialización como item de `--cap-set` (`net=api.x`, `file.read=./data`,
+    /// `stdout`): el inverso exacto de `build_ceiling`, para que un techo calculado en
+    /// Rust (p. ej. la intersección de `run_program`) viaje a otro proceso por flag.
+    pub fn cap_set_item(&self) -> String {
+        match &self.scope {
+            Some(s) if !s.is_empty() => format!("{}={}", self.ty.wire_name(), s),
+            _ => self.ty.wire_name().to_string(),
+        }
     }
 
     /// ¿Este grant cubre la capability pedida?
@@ -150,6 +182,14 @@ impl Capability {
                 | CapabilityType::Db
         );
         let is_db = self.ty == CapabilityType::Db;
+        // F5 (defensa en profundidad): en filesystems case-insensitive (Windows, macOS)
+        // `./Secret` y `./secret` son el MISMO archivo. Se compara con case-fold para que
+        // un grant cubra ambos (correcto) y un `deny` no falle abierto. NO cambia la
+        // salida de `normalize_path` (paridad byte-a-byte con el oráculo preservada).
+        #[cfg(any(windows, target_os = "macos"))]
+        let case_fold = |s: String| -> String { s.to_lowercase() };
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let case_fold = |s: String| -> String { s };
         let canon = |s: &str| -> String {
             if is_db && s.contains("://") {
                 canon_url(s)
@@ -165,8 +205,8 @@ impl Capability {
                 None => false,
                 Some(other_scope) => {
                     if is_path {
-                        let grant = canon(self_scope);
-                        let req = canon(other_scope);
+                        let grant = case_fold(canon(self_scope));
+                        let req = case_fold(canon(other_scope));
                         grant == req || fnmatch(&req, &grant)
                     } else {
                         self_scope == other_scope || fnmatch(other_scope, self_scope)
@@ -300,6 +340,12 @@ pub enum DenyCause {
 /// El texto del techo, idéntico en todas las ramas (los clasificadores del audit
 /// comparan por string).
 pub const ABOVE_CEILING: &str = "above host ceiling (--sandbox/--cap-set)";
+/// `reason` de un grant ambiental que entró (stdout/time/llm bajo `run` no-secure,
+/// `serve(port)` por `--port`).
+pub const AMBIENT_GRANT: &str = "auto-granted by the runtime";
+/// `reason` de una lectura servida desde el bundle de `synsema build` (sin `file.read`:
+/// el asset es parte del programa, como un `use`).
+pub const BUNDLED_ASSET: &str = "bundled asset (part of the program)";
 
 /// Registro de un chequeo de capability (audit trail).
 #[derive(Clone, Debug)]
@@ -313,6 +359,112 @@ pub struct CapabilityAuditEntry {
     /// `serve` concedido por `--port`…). Deja separar "este tenant quiso leer STRIPE_KEY"
     /// del ruido de los grants ambientales rechazados por el techo.
     pub origin: &'static str,
+}
+
+/// Una entrada del audit en forma de strings (la frontera con el embebedor wasm, el
+/// informe `--format json` y el JSONL de `--audit`): `{capability, granted, source,
+/// reason, origin}`. Misma forma en todos los hosts.
+#[derive(Clone, Debug)]
+pub struct AuditEntry {
+    pub capability: String,
+    pub granted: bool,
+    pub source: String,
+    pub reason: String,
+    pub origin: String,
+}
+
+impl From<&CapabilityAuditEntry> for AuditEntry {
+    fn from(e: &CapabilityAuditEntry) -> Self {
+        AuditEntry {
+            capability: e.capability.to_string(),
+            granted: e.granted,
+            source: e.source.clone(),
+            reason: e.reason.clone(),
+            origin: e.origin.to_string(),
+        }
+    }
+}
+
+/// El `audit_log` de un set como lista de `AuditEntry`.
+pub fn export_audit(caps: &Rc<RefCell<CapabilitySet>>) -> Vec<AuditEntry> {
+    caps.borrow().audit_log.iter().map(AuditEntry::from).collect()
+}
+
+/// Sink de audit del PROCESO (`--audit json|<ruta>|fd:N`, `run --format json`): cada
+/// chequeo/grant de CUALQUIER `CapabilitySet` (main, agentes, workers, requests) se
+/// entrega al sink además de quedar en el `audit_log` del set. Un `OnceLock`: el sink es
+/// política de quien invocó el binario. Sin sink instalado no cuesta nada (un `get()`).
+pub mod audit_sink {
+    use super::CapabilityAuditEntry;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+
+    /// Un evento de audit tal como lo ve el sink: la entrada + de qué contexto vino +
+    /// dónde estaba el programa (si el intérprete lo sabía).
+    pub struct AuditEvent<'a> {
+        pub ts: String,
+        pub context: &'a str,
+        pub entry: &'a CapabilityAuditEntry,
+        pub file: Option<String>,
+        pub line: Option<usize>,
+    }
+
+    type Sink = Box<dyn Fn(&AuditEvent<'_>) + Send + Sync>;
+    static SINK: OnceLock<Sink> = OnceLock::new();
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+    /// Instala el sink (una vez por proceso). `false` si ya había uno.
+    pub fn install(sink: Sink) -> bool {
+        let ok = SINK.set(sink).is_ok();
+        if ok {
+            INSTALLED.store(true, Ordering::Release);
+            synsema_core::audit_loc::enable();
+        }
+        ok
+    }
+
+    pub fn installed() -> bool {
+        INSTALLED.load(Ordering::Acquire)
+    }
+
+    /// `2026-08-30T14:02:11.482Z` desde segundos Unix (reloj del core: funciona en
+    /// cualquier host, sin la feature `clock` de chrono que wasm no tiene).
+    fn iso8601_millis(secs: f64) -> String {
+        let total_ms = (secs * 1000.0).floor() as i64;
+        let s = total_ms.div_euclid(1000);
+        let ms = total_ms.rem_euclid(1000);
+        let days = s.div_euclid(86_400);
+        let rem = s.rem_euclid(86_400);
+        // Conversión civil (Howard Hinnant).
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            y, m, d, rem / 3600, (rem % 3600) / 60, rem % 60, ms
+        )
+    }
+
+    pub(super) fn emit(context: &str, entry: &CapabilityAuditEntry) {
+        if !INSTALLED.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(sink) = SINK.get() {
+            let (file, line) = match synsema_core::audit_loc::current() {
+                Some(loc) => (Some(loc.file), Some(loc.line)),
+                None => (None, None),
+            };
+            let ts = iso8601_millis(synsema_core::clock::now_secs_f64());
+            sink(&AuditEvent { ts, context, entry, file, line });
+        }
+    }
 }
 
 /// Conjunto de capabilities otorgadas, con audit trail. Cada contexto de ejecución
@@ -369,6 +521,13 @@ impl CapabilitySet {
         self.grant_from(capability, "runtime");
     }
 
+    /// Pushea una entrada al `audit_log` del set y la entrega al sink del proceso (si
+    /// hay). ÚNICO camino de escritura del audit: todo chequeo/grant pasa por acá.
+    pub fn push_audit(&mut self, entry: CapabilityAuditEntry) {
+        audit_sink::emit(&self.name, &entry);
+        self.audit_log.push(entry);
+    }
+
     fn grant_from(&mut self, capability: Capability, origin: &'static str) {
         // Fail-closed: si el host puso un techo y no cubre esta capability, NO se inserta
         // (el techo nunca amplía). Se audita el rechazo. Sin techo → inserta como siempre.
@@ -376,7 +535,7 @@ impl CapabilitySet {
             if origin == "program" {
                 self.rejected_by_ceiling.push(capability.clone());
             }
-            self.audit_log.push(CapabilityAuditEntry {
+            self.push_audit(CapabilityAuditEntry {
                 capability,
                 granted: false,
                 source: "ceiling".to_string(),
@@ -385,7 +544,27 @@ impl CapabilitySet {
             });
             return;
         }
+        // Un grant AMBIENTE que entra deja rastro: sin esta entrada el audit no puede
+        // distinguir "stdout auto-concedido por el runtime" de "nunca se habló de stdout".
+        if origin == "runtime" {
+            self.push_audit(CapabilityAuditEntry {
+                capability: capability.clone(),
+                granted: true,
+                source: "ambient".to_string(),
+                reason: AMBIENT_GRANT.to_string(),
+                origin,
+            });
+        }
         self.granted.insert(capability);
+    }
+
+    /// Vacía el set (grants, denials, audit, padre) CONSERVANDO el techo del host. Es lo
+    /// que un contexto reutilizado (un worker de `serve` entre requests) tiene que hacer:
+    /// `*set = CapabilitySet::new(..)` perdería el techo — y con él, el `--sandbox`.
+    pub fn reset_keeping_ceiling(&mut self, name: &str) {
+        let ceiling = self.ceiling.clone();
+        *self = CapabilitySet::new(name);
+        self.ceiling = ceiling;
     }
 
     /// Deniega explícitamente (sobrescribe grants).
@@ -401,17 +580,30 @@ impl CapabilitySet {
     /// Como `check`, pero dice POR QUÉ se denegó — para que el mensaje de error apunte
     /// al actor correcto (programa vs host).
     pub fn check_cause(&mut self, requested: &Capability, source: &str) -> Result<(), DenyCause> {
+        self.check_inner(requested, source, true)
+    }
+
+    /// La MISMA decisión que `check_cause` (denials, techo, grants, cadena de padres)
+    /// pero SIN dejar rastro en el audit. Para calcular una intersección ("¿el padre
+    /// cubriría esto?") sin que cada item recortado deje dos entradas.
+    pub fn check_silent(&mut self, requested: &Capability) -> bool {
+        self.check_inner(requested, "silent", false).is_ok()
+    }
+
+    fn check_inner(&mut self, requested: &Capability, source: &str, audit: bool) -> Result<(), DenyCause> {
         // 1) Denegaciones explícitas primero.
         let denied_by: Option<Capability> =
             self.denied.iter().find(|d| d.covers(requested)).cloned();
         if let Some(d) = denied_by {
-            self.audit_log.push(CapabilityAuditEntry {
-                capability: requested.clone(),
-                granted: false,
-                source: source.to_string(),
-                reason: format!("Explicitly denied by {}", d),
-                origin: "program",
-            });
+            if audit {
+                self.push_audit(CapabilityAuditEntry {
+                    capability: requested.clone(),
+                    granted: false,
+                    source: source.to_string(),
+                    reason: format!("Explicitly denied by {}", d),
+                    origin: "program",
+                });
+            }
             return Err(DenyCause::ExplicitlyDenied(d));
         }
 
@@ -424,13 +616,15 @@ impl CapabilitySet {
         // vigente o uno que el techo rechazó, acá o en el padre); si no, es "no grant" —
         // el programa tiene que agregar el `require` primero.
         if self.ceiling.is_some() && !self.within_ceiling(requested) && self.is_declared(requested) {
-            self.audit_log.push(CapabilityAuditEntry {
-                capability: requested.clone(),
-                granted: false,
-                source: source.to_string(),
-                reason: ABOVE_CEILING.to_string(),
-                origin: "program",
-            });
+            if audit {
+                self.push_audit(CapabilityAuditEntry {
+                    capability: requested.clone(),
+                    granted: false,
+                    source: source.to_string(),
+                    reason: ABOVE_CEILING.to_string(),
+                    origin: "program",
+                });
+            }
             return Err(DenyCause::AboveCeiling);
         }
 
@@ -438,19 +632,21 @@ impl CapabilitySet {
         let granted_by: Option<Capability> =
             self.granted.iter().find(|c| c.covers(requested)).cloned();
         if let Some(c) = granted_by {
-            self.audit_log.push(CapabilityAuditEntry {
-                capability: requested.clone(),
-                granted: true,
-                source: source.to_string(),
-                reason: format!("Granted by {}", c),
-                origin: "program",
-            });
+            if audit {
+                self.push_audit(CapabilityAuditEntry {
+                    capability: requested.clone(),
+                    granted: true,
+                    source: source.to_string(),
+                    reason: format!("Granted by {}", c),
+                    origin: "program",
+                });
+            }
             return Ok(());
         }
 
         // 3) Padre (su check audita en el padre).
         if let Some(parent) = self.parent.clone() {
-            match parent.borrow_mut().check_cause(requested, source) {
+            match parent.borrow_mut().check_inner(requested, source, audit) {
                 Ok(()) => return Ok(()),
                 Err(DenyCause::AboveCeiling) => return Err(DenyCause::AboveCeiling),
                 Err(_) => {}
@@ -458,13 +654,15 @@ impl CapabilitySet {
         }
 
         // 4) Sin grant.
-        self.audit_log.push(CapabilityAuditEntry {
-            capability: requested.clone(),
-            granted: false,
-            source: source.to_string(),
-            reason: "No matching grant found".to_string(),
-            origin: "program",
-        });
+        if audit {
+            self.push_audit(CapabilityAuditEntry {
+                capability: requested.clone(),
+                granted: false,
+                source: source.to_string(),
+                reason: "No matching grant found".to_string(),
+                origin: "program",
+            });
+        }
         Err(DenyCause::NoGrant)
     }
 
@@ -949,6 +1147,9 @@ pub fn build_ceiling(sandbox: bool, cap_set: Option<&str>) -> Result<Option<Vec<
             Capability::new(CapabilityType::Stdout, None),
             Capability::new(CapabilityType::Time, None),
         ])),
+        // `none`: un techo que no cubre NADA (ni stdout). Es lo que recibe el hijo de
+        // `run_program` cuando la intersección con el padre queda vacía.
+        (false, Some(list)) if list.trim() == "none" => Ok(Some(Vec::new())),
         (false, Some(list)) => {
             let mut caps = Vec::new();
             for item in list.split(',') {
@@ -965,8 +1166,8 @@ pub fn build_ceiling(sandbox: bool, cap_set: Option<&str>) -> Result<Option<Vec<
                     Some(ty) => caps.push(Capability::new(ty, scope)),
                     None => {
                         return Err(format!(
-                            "--cap-set: unknown capability '{}'. Known: net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal, sign, wallet, memory",
-                            name
+                            "--cap-set: unknown capability '{}'. Known: {} (or `none` for an empty ceiling)",
+                            name, KNOWN_CAPABILITY_NAMES
                         ))
                     }
                 }
@@ -977,5 +1178,92 @@ pub fn build_ceiling(sandbox: bool, cap_set: Option<&str>) -> Result<Option<Vec<
             Ok(Some(caps))
         }
         (false, None) => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tanda_motor_tests {
+    use super::*;
+
+    #[test]
+    fn reset_keeping_ceiling_preserves_ceiling() {
+        let mut cs = CapabilitySet::new("request");
+        cs.ceiling = Some(Rc::new(vec![Capability::new(CapabilityType::Stdout, None)]));
+        cs.grant(Capability::new(CapabilityType::Exec, Some("cmd".into())));
+        assert!(cs.granted.is_empty(), "el techo rechaza exec");
+        cs.reset_keeping_ceiling("request");
+        assert!(cs.ceiling.is_some());
+        assert!(cs.audit_log.is_empty());
+        cs.grant(Capability::new(CapabilityType::Exec, Some("cmd".into())));
+        assert!(!cs.check(&Capability::new(CapabilityType::Exec, Some("cmd".into())), "run()"));
+    }
+
+    #[test]
+    fn cap_set_item_round_trips_every_type() {
+        use CapabilityType::*;
+        for ty in [Net, FileRead, FileWrite, File, Exec, Env, Time, Random, Stdout, Stdin, Llm, Db, Serve, Secret, Reveal, Sign, Wallet, Spend, Memory, SandboxRun] {
+            for scope in [None, Some("x-*".to_string())] {
+                let cap = Capability::new(ty, scope.clone());
+                let back = build_ceiling(false, Some(&cap.cap_set_item())).unwrap().unwrap();
+                assert_eq!(back, vec![cap]);
+            }
+        }
+    }
+
+    #[test]
+    fn build_ceiling_none_is_empty_set_and_accepts_display_names() {
+        assert_eq!(build_ceiling(false, Some("none")).unwrap(), Some(vec![]));
+        let c = build_ceiling(false, Some("file_read=./a,file_write=./b")).unwrap().unwrap();
+        assert_eq!(c[0].ty, CapabilityType::FileRead);
+        assert_eq!(c[1].ty, CapabilityType::FileWrite);
+        let err = build_ceiling(false, Some("bogus")).unwrap_err();
+        assert!(err.contains("sandbox_run") && err.contains("spend"), "{}", err);
+    }
+
+    #[test]
+    fn ambient_grant_leaves_audit_entry() {
+        let mut cs = CapabilitySet::new("program");
+        cs.grant_ambient(Capability::new(CapabilityType::Stdout, None));
+        assert_eq!(cs.audit_log.len(), 1);
+        let e = &cs.audit_log[0];
+        assert!(e.granted);
+        assert_eq!(e.origin, "runtime");
+        assert_eq!(e.source, "ambient");
+        assert_eq!(e.reason, AMBIENT_GRANT);
+        // Un grant del programa que entra NO deja entrada (sólo los chequeos).
+        cs.grant(Capability::new(CapabilityType::Net, Some("a".into())));
+        assert_eq!(cs.audit_log.len(), 1);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn path_scope_matching_is_case_insensitive_on_case_insensitive_fs() {
+        // F5 (auditoría): en NTFS/APFS `./data` y `./DATA` son el mismo archivo. Un grant
+        // cubre ambas variantes (correcto), y un `deny` no falla abierto. En Linux
+        // (case-sensitive) NO se foldea (este test no corre ahí).
+        let grant = Capability::new(CapabilityType::FileRead, Some("data/x.txt".into()));
+        assert!(grant.covers(&Capability::new(CapabilityType::FileRead, Some("DATA/x.txt".into()))));
+        assert!(grant.covers(&Capability::new(CapabilityType::FileRead, Some("data/x.txt".into()))));
+        let glob = Capability::new(CapabilityType::FileRead, Some("data/*".into()));
+        assert!(glob.covers(&Capability::new(CapabilityType::FileRead, Some("DATA/secret.txt".into()))));
+        // net (no-path) sigue case-sensitive (los hostnames ya se bajan a minúscula aparte).
+        let net = Capability::new(CapabilityType::Net, Some("api.x".into()));
+        assert!(!net.covers(&Capability::new(CapabilityType::Net, Some("API.X".into()))));
+    }
+
+    #[test]
+    fn check_silent_matches_check_cause_without_audit() {
+        let mut cs = CapabilitySet::new("program");
+        cs.ceiling = Some(Rc::new(vec![Capability::new(CapabilityType::Net, Some("uno".into()))]));
+        cs.grant(Capability::new(CapabilityType::Net, Some("uno".into())));
+        let before = cs.audit_log.len();
+        assert!(cs.check_silent(&Capability::new(CapabilityType::Net, Some("uno".into()))));
+        // `net=*` pedido bajo `net("uno")` cae ENTERO (el patrón es el grant).
+        assert!(!cs.check_silent(&Capability::new(CapabilityType::Net, Some("*".into()))));
+        assert!(!cs.check_silent(&Capability::new(CapabilityType::Net, None)));
+        assert!(!cs.check_silent(&Capability::new(CapabilityType::Exec, Some("cmd".into()))));
+        assert_eq!(cs.audit_log.len(), before, "check_silent no audita");
+        assert!(cs.check(&Capability::new(CapabilityType::Net, Some("uno".into())), "x"));
+        assert_eq!(cs.audit_log.len(), before + 1);
     }
 }

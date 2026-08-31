@@ -105,30 +105,9 @@ pub fn parse_ceiling(spec: &str) -> Result<Option<Vec<Capability>>, String> {
 }
 
 /// Una entrada del audit log de capabilities: lo que el programa pidió y si se le
-/// concedió — el embebedor ve qué hizo el programa con sus capabilities.
-#[derive(Clone, Debug)]
-pub struct AuditEntry {
-    pub capability: String,
-    pub granted: bool,
-    pub source: String,
-    pub reason: String,
-    /// `"program"` (the program asked / called) or `"runtime"` (an ambient host grant).
-    pub origin: String,
-}
-
-fn export_audit(caps: &Rc<RefCell<CapabilitySet>>) -> Vec<AuditEntry> {
-    caps.borrow()
-        .audit_log
-        .iter()
-        .map(|e| AuditEntry {
-            capability: e.capability.to_string(),
-            granted: e.granted,
-            source: e.source.clone(),
-            reason: e.reason.clone(),
-            origin: e.origin.to_string(),
-        })
-        .collect()
-}
+/// concedió — el embebedor ve qué hizo el programa con sus capabilities. Es el MISMO
+/// tipo que exporta el binario nativo (`--audit json`, `run --format json`).
+pub use synsema_capabilities::model::{export_audit, AuditEntry};
 
 pub struct Report {
     pub ok: bool,
@@ -285,8 +264,30 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Llm, None));
 
     register_secure_builtins(interp, caps.clone());
+    // Gate de stdout bajo techo (paridad con el nativo): `ceiling` sin `stdout` deniega
+    // el primer `print` en vez de imprimir igual.
+    {
+        let caps_out = caps.clone();
+        interp.set_stdout_hook(Rc::new(move || {
+            let mut cs = caps_out.borrow_mut();
+            if cs.ceiling.is_none() {
+                return Ok(());
+            }
+            cs.require(&Capability::new(CapabilityType::Stdout, None), "print()").map_err(|v| v.message)
+        }));
+    }
+    {
+        let caps_tpl = caps.clone();
+        interp.set_template_read_hook(Rc::new(move |raw: &str| {
+            let path = synsema_capabilities::model::normalize_path(raw);
+            caps_tpl
+                .borrow_mut()
+                .require(&Capability::new(CapabilityType::FileRead, Some(path)), "render()")
+                .map_err(|v| v.message)
+        }));
+    }
     if ctx.no_fs {
-        register_no_fs_stubs(interp);
+        synsema_stdlib::pure::register_no_fs_stubs(interp, synsema_stdlib::pure::WEB_NO_FS_HINT);
     }
     register_secret_builtins(interp, caps.clone(), ctx.env.clone());
     synsema_stdlib::hashing::register_hash_builtins(interp);
@@ -306,7 +307,8 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     // Lo que este perfil NO compila (WebSocket, DB, scheduler): los nombres EXISTEN y
     // fallan con la verdad del entorno. "Undefined variable: 'sql'" haría creer que el
     // nombre no existe o está mal escrito; el error debe nombrar el problema y el fix.
-    register_unavailable_stubs(interp);
+    synsema_stdlib::pure::register_os_stubs(interp, synsema_stdlib::pure::WASM_HINT);
+    synsema_stdlib::pure::register_no_threads_stubs(interp, synsema_stdlib::pure::WASM_HINT);
 
     // sleep(): el de secure.rs usa std::thread::sleep, que en un host sin SO panica;
     // acá va por el reloj del motor (pausa del host o no-op). Misma capability `time`.
@@ -464,6 +466,10 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
         -1,
         Rc::new(|i, args, _loc| {
             let path = args.first().map(|v| v.to_string()).unwrap_or_default();
+            // Gate `file.read` de la llamada de nivel superior (paridad con el nativo).
+            if synsema_core::bundle::get(&synsema_core::bundle::normalize_name(&path).unwrap_or_default()).is_none() {
+                i.gate_template_read(&path)?;
+            }
             let html = synsema_core::templates::render_template(i, &path, args.get(1))?;
             Ok(synsema_core::templates::make_raw(html, "text/html; charset=utf-8", 200))
         }),
@@ -669,94 +675,9 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
     }
 }
 
-/// Builtins de los módulos `native` que este perfil no compila (ws/database/cron):
-/// se registran como stubs que fallan con un error claro. La lista espeja las
-/// registraciones de esos módulos; si uno suma un builtin, se suma acá (la sonda
-/// `tests/wasm_unavailable.probe.syn` cubre un representante de cada familia).
-/// Los de red (`fetch`/`http_*`) YA NO son stubs: son los builtins reales sobre el
-/// transporte del host (F3); `mtls_identity` sí (identidad TLS del proceso).
-pub fn register_unavailable_stubs(interp: &Interpreter) {
-    // `term_open` NO falla: sin terminal devuelve `nothing`, igual que sin TTY en el
-    // binario nativo, para que el fallback a `read_line` sea el mismo programa.
-    interp.register_builtin("term_open", -1, Rc::new(|_i, _args, _loc| Ok(SynValue::Nothing)));
-    const NET: &[&str] = &[
-        "mtls_identity",
-        "ws_connect", "ws_send", "ws_recv", "ws_close", "ws_status", "ws_stats",
-        "ws_select", "ws_select_all", "ws_broadcast",
-    ];
-    const DB: &[&str] = &[
-        "db_open", "db_close", "sql", "sql_exec", "sql_tables", "sql_batch", "paged",
-        "mongo_find", "mongo_find_one", "mongo_insert", "mongo_insert_many", "mongo_update",
-        "mongo_delete", "mongo_count", "mongo_aggregate", "mongo_collections",
-        "redis_get", "redis_set", "redis_del", "redis_exists", "redis_expire", "redis_ttl",
-        "redis_persist", "redis_type", "redis_keys", "redis_incr", "redis_incrby",
-        "redis_decr", "redis_mget", "redis_mset", "redis_hget", "redis_hset", "redis_hdel",
-        "redis_hgetall", "redis_hincrby", "redis_lpush", "redis_rpush", "redis_lpop",
-        "redis_rpop", "redis_lrange", "redis_llen", "redis_sadd", "redis_srem",
-        "redis_smembers", "redis_sismember", "redis_lock", "redis_unlock",
-    ];
-    const CRON: &[&str] = &["cron_every", "cron_after", "cron_cancel", "cron_list", "cron_status"];
-    // Hub de I/O (select unificado + procesos vivos + bus): necesita hilos/pipes/un
-    // proceso — un intérprete embebido no los tiene.
-    const PROC: &[&str] = &[
-        "select", "proc_spawn", "proc_send", "proc_close_stdin", "proc_resize", "proc_recv",
-        "proc_select", "proc_status", "proc_kill", "proc_wait", "proc_close", "proc_stats",
-        "watch", "watch_recv", "watch_stats", "watch_close",
-        "term_recv", "term_size", "term_write", "term_stats", "term_close",
-    ];
-    const BUS: &[&str] = &["bus_publish", "bus_subscribe", "bus_recv", "bus_unsubscribe", "bus_topics"];
-    const AGENTS: &[&str] = &["agents", "agent_stop"];
-    let families: [(&[&str], &str); 6] = [
-        (NET, "this build has no network sockets (WebSocket/TLS identity need an event loop and a process)"),
-        (DB, "this build has no database drivers"),
-        (CRON, "this build has no scheduler threads"),
-        (PROC, "this build has no child processes nor an I/O hub (select/proc_* need a process)"),
-        (BUS, "this build has no event bus (a single embedded interpreter has no swarm)"),
-        (AGENTS, "this build has no agent threads"),
-    ];
-    for (names, why) in families {
-        for name in names {
-            let name: &'static str = name;
-            let why: &'static str = why;
-            interp.register_builtin(
-                name,
-                -1,
-                Rc::new(move |_i, _args, _loc| {
-                    Err(rt_err(&format!(
-                        "{}: not available in the wasm profile — {} (run the program with the \
-                         native `synsema` binary)",
-                        name, why
-                    )))
-                }),
-            );
-        }
-    }
-}
-
-/// Builtins de archivos para un host SIN filesystem (navegador, Node sin WASI…): los
-/// nombres existen y fallan diciendo la verdad. El bin wasip1 NO los registra (tiene
-/// FS por WASI, `--dir`); los registra synsema-wasm-web.
-pub fn register_no_fs_stubs(interp: &Interpreter) {
-    const FS: &[&str] = &[
-        "read_file", "read_file_bytes", "write_file", "append_file", "edit_file", "list_dir",
-        "file_info", "file_exists", "grep", "run",
-    ];
-    for name in FS {
-        let name: &'static str = name;
-        interp.register_builtin(
-            name,
-            -1,
-            Rc::new(move |_i, _args, _loc| {
-                Err(rt_err(&format!(
-                    "{}: this host has no filesystem — pass data in through the program's \
-                     source/env, or run the program with the native `synsema` binary (or the \
-                     wasip1 build under wasmtime with --dir)",
-                    name
-                )))
-            }),
-        );
-    }
-}
+// Los stubs del perfil puro (sockets/DB/cron/hub/archivos/hilos) viven en
+// `synsema_stdlib::pure`: una sola lista para el nativo `--profile pure` y los dos
+// artefactos wasm (misma verdad del entorno, mismo texto salvo el hint).
 
 // =========================================================
 // run / test / check

@@ -123,9 +123,9 @@ jobs:
           # capability y sin host que preste `http`, el transporte lo dice.
           grep -q 'fetch=Capability not granted: net("example.com")' un.out
           grep -q 'eth_balance_con_net=eth_balance: .*provides no http transport' un.out
-          grep -q 'ws_connect=ws_connect: not available in the wasm profile' un.out
-          grep -q 'sql=sql: not available in the wasm profile' un.out
-          grep -q 'cron_every=cron_every: not available in the wasm profile' un.out
+          grep -q 'ws_connect=ws_connect: not available in the pure profile' un.out
+          grep -q 'sql=sql: not available in the pure profile' un.out
+          grep -q 'cron_every=cron_every: not available in the pure profile' un.out
           grep -q 'remember=Capability not granted: memory' un.out
           if grep -q 'Undefined variable' un.out; then exit 1; fi
           if grep -q 'DISPONIBLE' un.out; then exit 1; fi

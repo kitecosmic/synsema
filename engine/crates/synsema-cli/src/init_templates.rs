@@ -168,6 +168,10 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # clave:n separados por comas. La firma n+1 falla catchable y queda auditada:
 # SYNSEMA_SIGN_CEILING=HOT_KEY:100
 
+# Profundidad maxima de run_program() anidado (un hijo que a su vez corre run_program,
+# y asi): cada nivel es un proceso del mismo binario bajo techo ∩ padre. Default 4:
+# SYNSEMA_RUN_PROGRAM_MAX_DEPTH=4
+
 # Espera máxima (segundos) de approve/confirm/ask bajo serve antes de DENEGAR
 # fail-closed (por-gate: `approve "..." within 2h` le gana a esta variable):
 # SYNSEMA_HUMAN_TIMEOUT=300
@@ -278,6 +282,9 @@ const HELLO_SYN_PAST: &[&str] = &[
     "e69804e5b0779fd4cea54a6c89d54719c75784960b3b2bafba145121ea0e74d8",
     "ef8518377fa71f6a4bd503670b3432a6c567ff502dab81273b17c66c1794b051",
     "e5acaf4f81afd7d5b6ad09d1892d772f45e731244956298ec556f8e5859e637d",
+    // v0.6.13 (a69d6ae): el hello.syn que ship con `synsema code` — su sha nunca se
+    // agregó a `past` (el guard se saltea en CI shallow), así que estaba latente.
+    "2212d1b3304687f23f48a26833dc0616ca0a99d121f42285156236657d554bd3",
 ];
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
@@ -310,7 +317,11 @@ pub const MCP_JSON: &str = r#"{
 "#;
 
 /// sha256 de cada contenido histórico de `.mcp.json` (ver `InitFile::past`).
-const MCP_JSON_PAST: &[&str] = &[];
+const MCP_JSON_PAST: &[&str] = &[
+    // v0.6.13 (a69d6ae): el .mcp.json que introdujo `synsema code` — su sha nunca se
+    // agrego a `past` (nacio con la lista vacia; el guard se saltea en CI shallow).
+    "add7e6a0fc61c6eb639c5e01ad750e12d32683c305c427f255b2b20884039a39",
+];
 
 /// sha256 de cada contenido histórico de `.gitignore` (ver `InitFile::past`).
 const GITIGNORE_PAST: &[&str] =
@@ -487,6 +498,7 @@ mod tests {
             .chain(HUMAN_ENV_VARS.iter())
             .chain(CEILING_ENV_VARS.iter())
             .chain(synsema_stdlib::server::SERVE_ENV_VARS.iter())
+            .chain(synsema_runtime::run_program::RUN_PROGRAM_ENV_VARS.iter())
             .copied()
             .collect();
         let mentioned = mentioned_vars(ENV_EXAMPLE);

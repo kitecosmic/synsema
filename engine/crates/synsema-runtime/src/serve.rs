@@ -1374,8 +1374,11 @@ fn with_serve_interp<R>(
     // si no, el próximo request de este worker vería "No agent defined" (bug pocos-cores).
     restore_agents(&mut base.interp, snapshot);
     {
+        // CONSERVANDO el techo del host: `CapabilitySet::new` lo perdería y, del segundo
+        // request de este worker en adelante, un `require exec(...)` en un handler
+        // pasaría (bypass de `--sandbox`/`--cap-set`, v0.6.13).
         let mut c = base.caps.borrow_mut();
-        *c = CapabilitySet::new("request");
+        c.reset_keeping_ceiling("request");
         for cap in caps_snap.iter() {
             c.grant(cap.clone());
         }
@@ -1885,6 +1888,11 @@ fn build_host_table(
                     // arrancar, contra las capabilities del programa — nunca por request.
                     let host = authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(&authority).to_ascii_lowercase();
                     let mut check = CapabilitySet::new("proxy");
+                    // El set descartable lleva el techo del host: sin él, un grant del
+                    // snapshot que el techo rechazó entraría acá igual.
+                    if let Some(cl) = serve_ceiling() {
+                        check.ceiling = Some(Rc::new((*cl).clone()));
+                    }
                     for cap in caps_snap.iter() {
                         check.grant(cap.clone());
                     }
@@ -2897,6 +2905,13 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     // warning G-4, un solo `.db`). Sin declaración → cero archivos y gate cerrado en
     // top-level, workers, cron y agentes (G-1); los stores quedan inalcanzables.
     let host_ceiling = serve_ceiling();
+    // Techo del host TAMBIÉN en el top-level: sin esto, el PREÁMBULO del programa (los
+    // statements antes de `serve on`) corría sin techo — un `run("cmd")`/`fetch(...)`
+    // ahí escapaba `serve --sandbox`/`--cap-set`. Se setea ANTES de `wire_common` para
+    // que filtre los auto-grants y los `require` del preámbulo (mismo patrón que `run`).
+    if let Some(cl) = &host_ceiling {
+        caps.borrow_mut().ceiling = Some(Rc::new((**cl).clone()));
+    }
     let declared = match crate::engine::resolve_declared_state(
         &program.statements,
         filename,

@@ -31,3 +31,5 @@ csv.workspace = true
 # puro-Rust — código de direcciones de dinero: no se hand-rollea. base32 sí es
 # hand-rolled en bytesutil (RFC 4648, trivial).
 bs58.workspace = true
+# Bundle de `synsema build` (bundle.rs): sha256 del payload anexado al ejecutable.
+sha2.workspace = true

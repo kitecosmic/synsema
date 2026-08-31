@@ -2391,7 +2391,7 @@ fn opt_usize(m: &indexmap::IndexMap<String, SynValue>, key: &str, fname: &str) -
     }
 }
 
-fn proc_spawn(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
+fn proc_spawn(i: &Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
     const F: &str = "proc_spawn";
     let cmd = match args.first() {
         Some(SynValue::Text(s)) => s.to_string(),
@@ -2501,6 +2501,8 @@ fn proc_spawn(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
             Some(other) => return Err(err(format!("{}: process_group must be a boolean, got {}", F, other.type_name()))),
         }
     }
+    // F3: el hijo NO hereda los secretos de Synsema (mismo criterio que run()).
+    opts.strip_env = i.sensitive_env().iter().cloned().collect();
     let live = LiveProc::spawn(&cmd, &arg_list, opts).map_err(|e| err(format!("{}: {}", F, e)))?;
     let mut r = reg.borrow_mut();
     let w = r.waker.clone();
@@ -3133,7 +3135,7 @@ pub fn register_ws_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet
     reg_fn_interp!("select", -1, select_builtin);
 
     // -- procesos vivos --
-    reg_fn!("proc_spawn", -1, proc_spawn);
+    reg_fn_interp!("proc_spawn", -1, proc_spawn);
     reg_fn!("proc_send", 2, proc_send);
     reg_fn!("proc_close_stdin", 1, proc_close_stdin);
     reg_fn!("proc_resize", 3, proc_resize);

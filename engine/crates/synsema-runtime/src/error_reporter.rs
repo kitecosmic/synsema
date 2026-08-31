@@ -55,7 +55,7 @@ fn error_patterns() -> Vec<(&'static str, &'static str, bool, bool, Vec<&'static
         ]),
         ("Capability not granted", "capability", false, false, vec![
             "Add the matching 'require' at the top of the program",
-            "Run with the --grant flag, e.g. --grant file:/path/*",
+            "If the host set a ceiling (--sandbox/--cap-set), it must widen it — the program cannot",
             "Check if this operation matches the declared intent",
         ]),
         ("Intent violation", "capability", false, false, vec![

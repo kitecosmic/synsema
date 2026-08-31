@@ -224,6 +224,12 @@ pub(crate) fn resolve_declared_state(
                     name
                 );
             }
+            // Perfil puro (`--profile pure`): "sin filesystem" también cubre la memoria
+            // declarada — la identidad existe pero SIN disco (in-memory para esta corrida),
+            // igual que bajo wasm. El gate de la capability sigue mandando aparte.
+            if crate::host::profile() == crate::host::Profile::Pure {
+                return Ok(Some(DeclaredState { name, persistence: None }));
+            }
             // Techo del host: memoria declarada pero denegada por `--cap-set`/`--sandbox`
             // → identidad sin disco (cero archivos; el uso falla con el error de siempre).
             if let Some(ceil) = ceiling {
@@ -395,7 +401,18 @@ pub(crate) fn wire_common_with_state(
     // Secretos/env: carga el `.env` (antes de evaluar require/serve) y registra
     // env/secret/reveal/bearer/crypto. Deny-by-default: env()/secret()/reveal() exigen
     // su capability incluso en modo no-secure (NO se auto-conceden como stdout/time).
-    register_secret_builtins(interp, caps.clone(), Rc::new(EnvStore::load_default()));
+    let env_store = Rc::new(EnvStore::load_default());
+    // Nombres que Synsema trata como SECRETOS: `run()`/`proc_spawn` los quitan del entorno
+    // de un proceso hijo (cierra `run("printenv")` con `exec` pero sin `env`/`secret`).
+    // = claves de proveedor LLM + secretos del humano + lo cargado del `.env`.
+    {
+        let mut sensitive: std::collections::HashSet<String> =
+            crate::llm_providers::LLM_ENV_VARS.iter().map(|s| s.to_string()).collect();
+        sensitive.extend(crate::llm_providers::HUMAN_ENV_VARS.iter().map(|s| s.to_string()));
+        sensitive.extend(env_store.keys().cloned());
+        interp.set_sensitive_env(sensitive);
+    }
+    register_secret_builtins(interp, caps.clone(), env_store);
     register_http_builtins(interp, caps.clone());
     // Hashing SHA + Keccak (puro, sin capability): sha256/sha512/keccak256/sha512_256 → bytes.
     synsema_stdlib::hashing::register_hash_builtins(interp);
@@ -460,6 +477,13 @@ pub(crate) fn wire_common_with_state(
         -1,
         Rc::new(|i, args, _loc| {
             let path = args.first().map(|v| v.to_string()).unwrap_or_default();
+            // Gate de `file.read` para la llamada de NIVEL SUPERIOR (el vector de LFI: el
+            // path puede venir de un request). Un template del bundle es el programa: sin
+            // gate. Los include/layout ANIDADOS son estáticos y `resolve_template_path` los
+            // confina al cwd — parte del programa, cubiertos por este mismo render.
+            if synsema_core::bundle::get(&synsema_core::bundle::normalize_name(&path).unwrap_or_default()).is_none() {
+                i.gate_template_read(&path)?;
+            }
             let html = synsema_core::templates::render_template(i, &path, args.get(1))?;
             Ok(synsema_core::templates::make_raw(html, "text/html; charset=utf-8", 200))
         }),
@@ -570,6 +594,45 @@ pub(crate) fn wire_common_with_state(
             cs.parent = p;
         }
     }));
+
+    // args(): los argumentos del programa (proceso). Sin capability.
+    interp.set_program_args(crate::host::program_args());
+    // Gate de stdout: SÓLO cuando el host puso un techo (`--sandbox`/`--cap-set`). Sin
+    // techo, `print` sigue libre como siempre (secure incluido); con techo, un
+    // `--cap-set` sin `stdout` deniega la salida en el primer `print` — si no, el audit
+    // diría "stdout rechazado por el techo" mientras la salida aparece.
+    {
+        let caps_out = caps.clone();
+        interp.set_stdout_hook(Rc::new(move || {
+            let mut cs = caps_out.borrow_mut();
+            if cs.ceiling.is_none() {
+                return Ok(());
+            }
+            cs.require(&Capability::new(CapabilityType::Stdout, None), "print()")
+                .map_err(|v| v.message)
+        }));
+    }
+    // Gate de lectura de templates a disco (`render`/`include`/`layout`): mismo
+    // `file.read` que `read_file`, con el path CRUDO (los assets del bundle no llegan acá).
+    {
+        let caps_tpl = caps.clone();
+        interp.set_template_read_hook(Rc::new(move |raw: &str| {
+            let path = synsema_capabilities::model::normalize_path(raw);
+            caps_tpl
+                .borrow_mut()
+                .require(&Capability::new(CapabilityType::FileRead, Some(path)), "render()")
+                .map_err(|v| v.message)
+        }));
+    }
+    // run_program(source, opts): Synsema ejecutando Synsema en un proceso hijo bajo
+    // techo ∩ padre (gateado por `sandbox_run`).
+    crate::run_program::register_run_program_builtin(interp, caps.clone());
+    // `--profile pure`: la segunda pared. Se registra AL FINAL para pisar por nombre a
+    // los builtins OS-facing ya cableados (última registración gana).
+    if crate::host::profile() == crate::host::Profile::Pure {
+        synsema_stdlib::pure::register_os_stubs(interp, synsema_stdlib::pure::NATIVE_HINT);
+        synsema_stdlib::pure::register_no_fs_stubs(interp, synsema_stdlib::pure::NATIVE_HINT);
+    }
 }
 
 /// Cablea el provider LLM REAL (HTTP) si hay uno configurado. Resuelve los knobs con
@@ -779,11 +842,15 @@ fn run_inner(
 }
 
 fn spawn_run(source: &str, filename: &str, secure: bool) -> RunResult {
+    spawn_run_ceiled(source, filename, secure, None)
+}
+
+fn spawn_run_ceiled(source: &str, filename: &str, secure: bool, ceiling: Option<Vec<Capability>>) -> RunResult {
     let src = source.to_string();
     let fname = filename.to_string();
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_inner(&src, &fname, secure, None, false, None))
+        .spawn(move || run_inner(&src, &fname, secure, None, false, ceiling))
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|_| RunResult {
@@ -797,6 +864,12 @@ fn spawn_run(source: &str, filename: &str, secure: bool) -> RunResult {
 /// Camino de un solo hilo: `spawn` corre el agente in-process (sin swarm).
 pub fn run_source(source: &str, filename: &str) -> RunResult {
     spawn_run(source, filename, false)
+}
+
+/// Como `run_source` pero con el techo del host (`conform --sandbox/--cap-set`): la misma
+/// semántica que `run`/`test`, sin el swarm real.
+pub fn run_source_ceiled(source: &str, filename: &str, ceiling: Option<Vec<Capability>>) -> RunResult {
+    spawn_run_ceiled(source, filename, false, ceiling)
 }
 
 /// Camino de `synsema run` (DE-011): cablea el swarm real → cada `spawn` corre en su
@@ -829,13 +902,25 @@ pub fn run_program(source: &str, filename: &str) -> RunResult {
 /// (`--sandbox`/`--cap-set`): el programa y todos los agentes que spawnee jamás exceden
 /// `ceiling`. `None` = sin techo (idéntico a `run_program`).
 pub fn run_program_ceiled(source: &str, filename: &str, ceiling: Option<Vec<Capability>>) -> RunResult {
+    run_program_ceiled_opts(source, filename, ceiling, true)
+}
+
+/// Como `run_program_ceiled` pero eligiendo si la salida va en vivo a stdout
+/// (`live_output`, el `run` interactivo) o se COLECTA en `output` (`run --format json`,
+/// el informe con la forma de `syn.run()`).
+pub fn run_program_ceiled_opts(
+    source: &str,
+    filename: &str,
+    ceiling: Option<Vec<Capability>>,
+    live_output: bool,
+) -> RunResult {
     let swarm = Arc::new(Swarm::new());
     let sw = swarm.clone();
     let src = source.to_string();
     let fname = filename.to_string();
     let mut result = std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
-        .spawn(move || run_inner(&src, &fname, false, Some(sw), true, ceiling))
+        .spawn(move || run_inner(&src, &fname, false, Some(sw), live_output, ceiling))
         .expect("no se pudo crear el hilo del motor")
         .join()
         .unwrap_or_else(|_| RunResult {
@@ -1631,7 +1716,12 @@ fn agent_state_str(s: AgentState) -> &'static str {
     }
 }
 
-fn run_swarm_inner(source: &str, filename: &str, swarm: Arc<Swarm>) -> RunResult {
+fn run_swarm_inner(
+    source: &str,
+    filename: &str,
+    swarm: Arc<Swarm>,
+    ceiling: Option<Arc<Vec<Capability>>>,
+) -> RunResult {
     match parse_source(source, filename) {
         Err(CompileError::Lex(e)) => RunResult {
             success: false,
@@ -1646,7 +1736,11 @@ fn run_swarm_inner(source: &str, filename: &str, swarm: Arc<Swarm>) -> RunResult
         Ok(program) => {
             // Identidad declarada (DB-M1): también en el camino con swarm retenido
             // (`conform --swarm` / Engine::run).
-            let mem_ctx = match memory_ctx_for(&program.statements, filename, None) {
+            let mem_ctx = match memory_ctx_for(
+                &program.statements,
+                filename,
+                ceiling.as_ref().map(|a| a.as_slice()),
+            ) {
                 Ok(m) => m,
                 Err(msg) => {
                     return RunResult {
@@ -1656,7 +1750,7 @@ fn run_swarm_inner(source: &str, filename: &str, swarm: Arc<Swarm>) -> RunResult
                     }
                 }
             };
-            let mut interp = setup_swarm_interpreter(swarm, "main", None, mem_ctx, false);
+            let mut interp = setup_swarm_interpreter(swarm, "main", ceiling, mem_ctx, false);
             let r = interp.execute(&program);
             finish(interp, r)
         }
@@ -1682,12 +1776,18 @@ impl Engine {
     /// Corre el programa (con swarm cableado) en un hilo con stack grande. Los hilos
     /// de agentes lanzados quedan en `self.swarm` (usar `wait_all` para joinearlos).
     pub fn run(&self, source: &str, filename: &str) -> RunResult {
+        self.run_ceiled(source, filename, None)
+    }
+
+    /// Como `run` pero con el techo del host (`conform --swarm --sandbox/--cap-set`).
+    pub fn run_ceiled(&self, source: &str, filename: &str, ceiling: Option<Vec<Capability>>) -> RunResult {
         let swarm = self.swarm.clone();
         let src = source.to_string();
         let fname = filename.to_string();
+        let ceiling_arc = ceiling.map(Arc::new);
         std::thread::Builder::new()
             .stack_size(INTERP_STACK_SIZE)
-            .spawn(move || run_swarm_inner(&src, &fname, swarm))
+            .spawn(move || run_swarm_inner(&src, &fname, swarm, ceiling_arc))
             .expect("no se pudo crear el hilo del motor")
             .join()
             .unwrap_or_else(|_| RunResult {
@@ -1709,8 +1809,13 @@ pub struct SwarmDump {
 
 /// Corre con swarm, joinea todos los agentes, y devuelve el dump de estado interno.
 pub fn run_swarm_dump(source: &str, filename: &str) -> SwarmDump {
+    run_swarm_dump_ceiled(source, filename, None)
+}
+
+/// Como `run_swarm_dump` pero con el techo del host (`conform --swarm --sandbox/--cap-set`).
+pub fn run_swarm_dump_ceiled(source: &str, filename: &str, ceiling: Option<Vec<Capability>>) -> SwarmDump {
     let engine = Engine::new();
-    let result = engine.run(source, filename);
+    let result = engine.run_ceiled(source, filename, ceiling);
     engine.swarm.wait_all();
     let blackboard: Vec<(String, String)> = engine
         .swarm
