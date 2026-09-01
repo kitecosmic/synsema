@@ -797,6 +797,11 @@ impl ServeRuntime {
     /// Base URL absoluta (spec discovery §1.3): `domain` del serve block si está; si
     /// no, el `Host` de la request. Esquema: https si hay TLS o el proxy de adelante
     /// dice `X-Forwarded-Proto: https`. Sin `Host` ni `domain` no hay verdad → None.
+    ///
+    /// `X-Forwarded-Host` se ignora a propósito (misma postura que XFF para rate limit):
+    /// cualquier cliente lo puede inyectar y un proxy genérico (nginx, Cloudflare) lo deja
+    /// pasar tal cual → host header injection / cache poisoning del sitemap, robots y
+    /// `servers` de OpenAPI. Detrás de un proxy la verdad es `domain "…"`, declarada.
     fn base_url(&self, headers: &[(String, String)]) -> Option<String> {
         let fwd = header_value(headers, "x-forwarded-proto");
         let https = self.tls_enabled

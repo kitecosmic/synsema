@@ -128,6 +128,11 @@ fn openapi_sitemap_docs_llms_and_robots() {
     // Detrás de un proxy TLS: X-Forwarded-Proto manda el esquema.
     let (_, _, body) = get(port, "/sitemap.xml", "X-Forwarded-Proto: https\r\n");
     assert!(body.contains(&format!("https://127.0.0.1:{}/health", port)), "{}", body);
+    // `X-Forwarded-Host` NO manda: es inyectable por cualquier cliente y un proxy genérico lo
+    // deja pasar (host header injection). Detrás de un proxy la base URL se declara con `domain`.
+    let (_, _, body) = get(port, "/sitemap.xml", "X-Forwarded-Host: evil.example\r\n");
+    assert!(body.contains(&format!("http://127.0.0.1:{}/health", port)), "{}", body);
+    assert!(!body.contains("evil.example"), "{}", body);
 
     // /robots.txt apunta al sitemap.
     let (_, _, body) = get(port, "/robots.txt", "");

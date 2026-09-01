@@ -112,6 +112,7 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `serve on PORT` returns and the program exits | The CLI keeps the process alive while servers run (Ctrl+C to stop) | Expected; the server runs in the background |
 | `request` works inside a helper task called from a route | `Undefined variable: 'request'` — `request`/`query`/`params` exist ONLY in the handler's scope (the error says so) | Pass it as a parameter: `task handle(request)` and call `handle(request)` from the route |
 | `X-Forwarded-For` sets the client for rate limiting | The real peer IP is used; XFF is ignored | XFF is forgeable; trusted-proxy/per-user keying is future work |
+| Behind a proxy the sitemap/robots/OpenAPI `servers` say `https://127.0.0.1:PORT/...` | The proxy rewrote `Host` to the backend authority; `X-Forwarded-Host` is ignored on purpose (forgeable → host header injection) | Declare `domain "example.com"` in the serve block — that is the base URL |
 | `give "<h1>Hi</h1>"` renders as an HTML page | It's JSON — the response is the quoted string `"<h1>Hi</h1>"` | Use `html("<h1>Hi</h1>")` (or `respond(...)`) for a real page |
 | `static "./public"` also needs `require file(...)` | No — the `static` declaration **is** the read permission for that dir | Just declare `static "./public"`; the path is relative to the working dir |
 | `cors "*"` works with `Authorization`/cookies | The CORS spec forbids `*` for credentialed requests | Use a specific origin: `cors "https://app.example.com"` |

@@ -552,6 +552,12 @@ Base URL for absolute links (`Sitemap:`, `<loc>`, OpenAPI `servers`): `domain "â
 the serve block if declared, else the request `Host`; scheme `https` when TLS is on
 or the proxy in front sends `X-Forwarded-Proto: https`.
 
+**Behind a proxy, declare `domain`.** Proxies rewrite `Host` to the backend authority
+(nginx's default `$proxy_host`, the built-in `proxy to` too), so without `domain` the
+sitemap says `https://127.0.0.1:8090/...`. `X-Forwarded-Host` is deliberately ignored:
+any client can inject it and a generic proxy passes it through (host header injection â†’
+poisoned sitemap/robots/`servers`). Same stance as `X-Forwarded-For` for rate limiting.
+
 ```
 serve on 8080
     describe                       -- optional; enriches everything
