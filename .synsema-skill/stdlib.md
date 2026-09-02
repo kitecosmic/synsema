@@ -165,6 +165,40 @@ let results be parallel_map(watch, thousands_of_urls)   -- N workers × 1 conn e
   notifications (parse with `json_decode`); one-shot reads go through the typed read-side
   (stdlib.md § Blockchain) instead.
 
+## Web Push (installable apps notify their users — engine v0.6.15+)
+
+Native Web Push: the server encrypts a message for ONE browser (RFC 8291 `aes128gcm`) and
+hands it, signed with your VAPID key (RFC 8292), to that browser's push service (RFC 8030).
+Gate: **`net(<host of the subscription endpoint>)`** — the push service is a host like any
+other; the private VAPID key is accepted **only as a `secret`**. Full reference (every
+option, return fields, the four push-service hosts) in [builtins.md](builtins.md) § Web Push;
+the browser side and the scaffold in [serve.md](serve.md) § Installable app (PWA).
+
+```
+require random                          -- keygen, once (push_keys.syn from `synsema init --pwa`)
+require reveal("vapid_private")
+let k be push_vapid_keys()              -- {public: text, private: secret}
+print("VAPID_PUBLIC_KEY=" + k["public"] + "\nVAPID_PRIVATE_KEY=" + reveal(k["private"]))
+```
+
+```
+require secret("VAPID_PRIVATE_KEY")
+require env("VAPID_PUBLIC_KEY")
+require net("fcm.googleapis.com")       -- Chrome/Android; add *.notify.windows.com (Edge),
+require net("web.push.apple.com")       -- updates.push.services.mozilla.com (Firefox), Apple
+let vapid be {"public": env("VAPID_PUBLIC_KEY"), "private": secret("VAPID_PRIVATE_KEY"), "subject": "mailto:ops@example.com"}
+each sub in sql("SELECT endpoint, keys FROM push_subs")
+    let r be push_send({"endpoint": sub["endpoint"], "keys": json_decode(sub["keys"])},
+        {"title": "Report ready", "url": "/reports/today"}, {"vapid": vapid, "ttl": 3600, "topic": "report"})
+    when r["gone"]                      -- 404/410: the browser unsubscribed → forget it
+        sql_exec("DELETE FROM push_subs WHERE endpoint = ?", [sub["endpoint"]])
+```
+
+`payload`: text · map/list (JSON) · bytes · `nothing` (no body); ≤ 3993 bytes. Returns
+`{status, ok, gone, retry_after, body}`. A provider you already use (OneSignal/FCM/Pusher)
+keeps working through `http_post` — native push is optional. Not available in the wasm/pure
+profile (needs sockets); `push_vapid_keys` is.
+
 ## Database
 
 Five backends, all pure-Rust (single static binary, no OpenSSL/`*-sys`), all opened with `db_open` and

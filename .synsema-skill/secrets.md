@@ -227,6 +227,16 @@ monotonic per-process totals (`spend_total(unit)`).
 Prefer `bearer`/`hmac_sha256`/`verify_hmac`/`constant_time_eq` — they consume the
 secret without ever exposing it.
 
+## Private keys go in as a `secret`, never as a string
+
+Anything that *signs* — the blockchain key of `sign`, the VAPID private key of `push_send`
+(v0.6.15+) — is accepted **only as a `secret`**: `secret("VAPID_PRIVATE_KEY")` from `.env`, or
+`as_secret(value, "label")` for a value that arrives at runtime. A plain text key is refused
+with the fix in the message ("Never pass a private key as a plain string"); the key value
+itself never appears in any error. Keys the engine *generates* (`push_vapid_keys()`,
+`mnemonic_generate`) come back already sealed; persisting one is a deliberate
+`require reveal("<label>")` + `reveal()` — audited, once.
+
 ## Dev vs prod — the same code
 
 ```

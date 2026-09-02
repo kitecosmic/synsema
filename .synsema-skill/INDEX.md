@@ -25,6 +25,7 @@ core dev loop:
 | **Start a new project** | `synsema init [dir]` (hello.syn tour + commented .env.example + .gitignore). Re-running is **safe and repairs**: a file still identical to any release it shipped in gets refreshed; one with your edits is kept and the new version lands as `<file>.new` (v0.5.9+) |
 | **Deploy** (daemon/Docker/VPS) | see [deploy.md](deploy.md) |
 | **Bundle into ONE binary** (v0.6.14+) | `synsema build app.syn -o app [--include assets/] [--cap-set "…"] [--profile pure]` — engine + program baked in, sha256-sealed; `FROM scratch`-deployable; `app --engine <cmd>` reaches the engine → [deploy.md](deploy.md) |
+| **Make it installable on phones & desktop + push notifications** (v0.6.15+) | `synsema init [dir] --pwa` — a site that installs on Android/iOS/desktop (manifest, service worker, icons generated from an SVG, honest offline shell) with **native Web Push**: `push_keys.syn` → VAPID pair in `.env`, `push_send(sub, payload, {"vapid": …})` under `require net(<push service host>)`, `r["gone"]` = delete the subscription. A provider you already have keeps working via `http_post`. Existing app → run `init --pwa` in it (never overwrites) → [serve.md](serve.md) § Installable app (PWA) · [builtins.md](builtins.md) § Web Push |
 | **Run code you DON'T trust** | host ceiling `--sandbox`/`--cap-set "…"` (on `run`/`test`/`conform`/`serve`; `none` = nothing), second wall `--profile pure`, log with `--audit json`; or from a program `run_program(source, {ceiling, profile, env, timeout})` (`require sandbox_run`) → [capabilities.md](capabilities.md) |
 | **Pass argv / read stdin** (v0.6.14+) | `synsema run app.syn -- a b` → `args()`; `synsema run -` reads source from stdin; `--format json` = the run as one JSON doc |
 | **Run in WASM** (TEE / confidential job / edge, v0.6.0+) | build `synsema-wasm.wasm` (wasm32-wasip1) and `wasmtime run --dir . synsema-wasm.wasm file.syn` — the pure profile (also `synsema run --profile pure` natively, v0.6.14+) → [deploy.md](deploy.md) § WebAssembly |
@@ -130,6 +131,8 @@ usually version skew, not a bug.
 - Export PNG / PDF / render SVG to image → dataviz.md
 - Parallelism / fan-out / process many things at once → concurrency.md
 - Building a UI / website / frontend (templates, layouts, CSS, JS, components with props, error pages, forms) → frontend.md
+- **Mobile app / install on the phone / home-screen icon / offline / PWA / service worker / manifest** (`synsema init --pwa`, add it to an existing site) → serve.md § Installable app (PWA) + frontend.md § Installable
+- **Push notifications / Web Push / VAPID keys / notify users of an installed app** (`push_send`, `push_vapid_keys`, `require net(<push service>)`, `gone` subscriptions; or a provider via `http_post`) → builtins.md § Web Push + stdlib.md § Web Push + pitfalls.md § Web Push
 - HTTPS / TLS / auto-HTTPS / certificates → serve.md (production web stack)
 - Multi-domain / virtual hosts / reverse proxy → serve.md (production web stack)
 - Building an HTTP API / web server → serve.md

@@ -190,6 +190,66 @@ let uri be "otpauth://totp/App:user?secret=" + decode(seed, "base32") + "&issuer
 when totp_verify(seed, submitted_code)              -- 2FA check
 ```
 
+## Web Push — installable apps notify their users (engine v0.6.15+)
+Native **Web Push** (RFC 8030 protocol · RFC 8291/8188 `aes128gcm` encryption · RFC 8292 VAPID),
+the same thing `web-push`/`pywebpush` do — no provider needed. A provider you already have
+(OneSignal, FCM, Pusher Beams) still works: call its REST API with `http_post` under
+`require net(...)`; nothing forces the native path. The browser side (service worker,
+`pushManager.subscribe`, the install prompt) ships in `synsema init --pwa` — see
+[serve.md](serve.md) § Installable app (PWA).
+
+- `push_vapid_keys()` → `{public, private}` — a fresh P-256 pair. **`require random`** (it creates
+  secret material, like `token()`). `public` is base64url text (65-byte uncompressed point, 87
+  chars — what the browser needs in `applicationServerKey`); `private` is born **sealed** as a
+  `secret` labelled `vapid_private` (32-byte scalar, base64url). To persist it once:
+  `require reveal("vapid_private")` + `reveal(keys["private"])` → `.env` (audited, on purpose);
+  then load it with `secret("VAPID_PRIVATE_KEY")`. Same formats as `web-push generate-vapid-keys`.
+- `push_send(subscription, payload, opts)` → `{status, ok, gone, retry_after, body}`.
+  **`require net("<host of the endpoint>")`** — the push service is a host like any other:
+  `fcm.googleapis.com` (Chrome/Android/Brave/Opera), `*.notify.windows.com` (Edge/Windows),
+  `updates.push.services.mozilla.com` (Firefox), `web.push.apple.com` (Safari/iOS/macOS). A
+  browser you didn't declare → the usual capability error naming the exact `require net(...)`.
+  - `subscription`: the map the browser gives you — `PushSubscription.toJSON()`:
+    `{"endpoint": "https://…", "keys": {"p256dh": "…", "auth": "…"}}` (`expirationTime` is ignored).
+    Endpoint must be `https://` (plain `http://` only on loopback, for mocks/tests).
+  - `payload`: text as-is · map/list → JSON (same text as `json_encode`) · `bytes` · `nothing` =
+    no body (a "something changed" tickle). **Max 3993 bytes** (the encrypted body must stay
+    ≤ 4096, the services' limit). A `secret` payload is an error (it would leave the process);
+    a secret *inside* a map travels redacted.
+  - `opts.vapid` (**required**): `{"public": text, "private": secret, "subject": "mailto:you@x" | "https://…"}`.
+    `private` is accepted **only as a `secret`** (from `secret("VAPID_PRIVATE_KEY")`, `as_secret(...)`,
+    or `push_vapid_keys()`) — a plain string is refused, like the private key of `sign` (whoever
+    holds it can push to every user). `public` is checked against `private`: a crossed pair
+    fails here, not as an opaque 401 from the service.
+  - `opts.ttl` seconds the service keeps an undelivered message (default `86400`) ·
+    `opts.urgency` `"very-low" | "low" | "normal" | "high"` · `opts.topic` 1–32 chars
+    `[A-Za-z0-9_-]` (a newer message with the same topic replaces the pending one) ·
+    `opts.timeout` seconds (default 30).
+  - Returns: `status` (201 = accepted), `ok`, **`gone`** (`true` on 404/410 — the subscription is
+    dead: delete it), `retry_after` (text or `nothing`, on 429/503), `body`. The push service
+    unreachable → error. Encryption keys (an ephemeral P-256 key + a 16-byte salt) come from
+    the OS CSPRNG per message — protocol-internal, no `random` needed (like the TLS handshake).
+- Not in the wasm/pure profile (delivering needs sockets): `push_send` fails with the build's
+  message; `push_vapid_keys` works everywhere.
+
+```syn
+require random
+require reveal("vapid_private")                    -- only in the one-off keygen script
+let k be push_vapid_keys()
+print("VAPID_PUBLIC_KEY=" + k["public"])
+print("VAPID_PRIVATE_KEY=" + reveal(k["private"]))  -- paste both into .env, run once
+
+require secret("VAPID_PRIVATE_KEY")                -- in the app
+require env("VAPID_PUBLIC_KEY")
+require net("fcm.googleapis.com")                  -- one line per push service you serve
+require net("web.push.apple.com")
+let r be push_send(sub, {"title": "Order shipped", "body": "#1042 is on its way", "url": "/orders/1042"},
+    {"vapid": {"public": env("VAPID_PUBLIC_KEY"), "private": secret("VAPID_PRIVATE_KEY"), "subject": "mailto:ops@example.com"},
+     "ttl": 3600, "urgency": "high", "topic": "order-1042"})
+when r["gone"]
+    sql_exec("DELETE FROM push_subs WHERE endpoint = ?", [sub["endpoint"]])
+```
+
 ## Agent identity & auth (agents as first-class subjects)
 
 Web auth (above) is for a **human with a browser**. This section is for **agents**:

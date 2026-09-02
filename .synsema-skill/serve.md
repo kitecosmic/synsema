@@ -385,6 +385,65 @@ serve on 8090
 > **Same-origin tip:** if the landing page is served by `static` from the same
 > server as the API, the browser's `fetch` is **same-origin** and needs no CORS.
 
+### Installable app (PWA) — manifest, service worker, native push (engine v0.6.15+)
+
+A Synsema site **installs** on phones and desktops as an app: home-screen icon, full screen,
+an offline shell, and push notifications — with nothing but the web the server already
+renders. No native client, no store, no framework. `synsema init --pwa` writes the whole
+thing; this is what it is made of, so you can add it to any existing `serve`:
+
+```
+public/manifest.webmanifest   -- name, icons (192 + 512 png), start_url "/", display "standalone"
+public/sw.js                  -- service worker: caches the shell, NEVER /api/ nor failed responses, shows pushes
+public/app.js                 -- registers sw.js, install button (beforeinstallprompt), online/offline, push subscribe
+public/icon.svg (+ icon-192.png, icon-512.png, apple-touch-icon.png generated from it)
+index.html                    -- <link rel="manifest">, theme-color, apple-touch-icon, mobile-web-app-capable
+app.syn                       -- static "/" from "./public" + the API + push routes
+push_keys.syn                 -- one-off: prints the VAPID pair for .env
+```
+
+```
+require serve(8080)
+require file.read("index.html")            -- render() reads the page from disk
+serve on 8080
+    static "/" from "./public" cache "1h"  -- the service worker MUST live at /sw.js (scope "/")
+    route "GET /"
+        give render("index.html", {"title": "My app"})
+```
+
+- **`.webmanifest` is served as `application/manifest+json`** (pinned, whatever the host's registry
+  says) — that content-type is what makes the browser accept the manifest.
+- **Where it installs:** Android (Chrome/Edge/Samsung) → install prompt or menu, full screen,
+  push; iOS/iPadOS (Safari 16.4+) → *Share → Add to Home Screen* (no prompt API), full screen via
+  `apple-mobile-web-app-capable` + `apple-touch-icon`, **push only once installed** and after a
+  user gesture; desktop Edge/Chrome → "Install" from the menu, own window, Start-menu entry.
+  **HTTPS everywhere** except `localhost`/`127.0.0.1` (secure contexts) — iOS needs a *trusted*
+  certificate: `synsema serve app.syn --domain app.example.com --tls-auto you@example.com`.
+- **Offline honestly:** the scaffold's `sw.js` caches the shell (`/`, `/app.js`, manifest, icon),
+  answers `/api/*` with a 503 `{"error": "offline"}` when there is no network, and never caches a
+  non-OK response. If your `/` shows the logged-in user's data, take it out of the shell list
+  (cache a public "offline" page instead): the cache is per browser, not per user.
+- **Push, end to end:** `push_keys.syn` (`push_vapid_keys()` under `require random` +
+  `require reveal("vapid_private")`) → paste `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` /
+  `VAPID_SUBJECT` into `.env`. The page reads the public key from `GET /api/push/config`,
+  subscribes (`pushManager.subscribe`) and POSTs `PushSubscription.toJSON()` to
+  `POST /api/push/subscribe`; the server keeps it (a table in real life — the scaffold keeps
+  500 in `state_*`) and delivers with `push_send(sub, payload, {"vapid": …})` — see
+  [builtins.md](builtins.md) § Web Push for every option. Declare one `require net(...)` per
+  push service you serve: `fcm.googleapis.com`, `*.notify.windows.com`,
+  `updates.push.services.mozilla.com`, `web.push.apple.com`. `r["gone"]` (404/410) means the
+  subscription is dead → delete it. The scaffold's `POST /api/push/test` is a **demo** button
+  with `rate_limit 2 per minute`; in your app that route carries `requires auth` or the send
+  lives in a cron/agent, never in a public route.
+- **A provider instead (OneSignal, FCM, Pusher Beams…):** `http_post` to its REST API under
+  `require net(...)` and `bearer(secret(...))` — zero engine involvement; native push is a choice,
+  not a mandate.
+- **Existing app → PWA:** run `synsema init --pwa` in the project (it never overwrites: yours is
+  kept, the factory copy lands as `<file>.new`), mount `public/` at `/`, copy the `<head>` lines
+  of the scaffold's `index.html` into your layout, add the `require net` lines if you want push.
+- `synsema build` note: static mounts are not read from the bundle yet — a built single-binary
+  PWA needs `public/` on disk next to it (templates ARE bundled).
+
 ### CORS — `cors "*"` / `cors "https://app.com"`
 
 For APIs called from a browser on a **different** origin, declare CORS:

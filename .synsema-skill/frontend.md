@@ -148,6 +148,17 @@ See [modules.md](modules.md) and [serve.md](serve.md) for the rules.
   directory. Nested `{ include }`/`{ layout }` don't need their own (static, confined to the working
   dir), and a template **baked into a `synsema build` binary** needs no capability (it's the program).
 
+## Installable on phones and desktop — PWA (engine v0.6.15+)
+
+The same server-rendered site **installs** as an app (home-screen icon, full screen, offline shell,
+push notifications) with three web files — `manifest.webmanifest`, `sw.js`, the `<head>` lines —
+and nothing native. `synsema init --pwa` scaffolds all of it (page, service worker, icons
+generated from an SVG, the push routes, a one-off `push_keys.syn`); `.webmanifest` is served
+with its pinned content-type. Android/desktop Chromium install from a button; iOS via *Share →
+Add to Home Screen* (push only once installed; needs a trusted HTTPS cert). Full walkthrough
+and the "add it to an existing app" steps: [serve.md](serve.md) § Installable app (PWA); the
+push builtins (`push_send`, `push_vapid_keys`): [builtins.md](builtins.md) § Web Push.
+
 ## Forms, error pages, static policy (see [serve.md](serve.md))
 
 - Classic `<form method="post">` → **`form of request`** (urlencoded and multipart,

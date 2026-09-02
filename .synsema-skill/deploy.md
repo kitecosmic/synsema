@@ -142,6 +142,22 @@ serve on 8080
 > the **deployment structure** of `serve`. The `serve` block has no `when`/conditionals
 > by design — the flags keep it declarative.
 
+## Installable on phones and desktop — PWA (engine v0.6.15+)
+
+A served site becomes an installable app with the files `synsema init --pwa` writes (manifest,
+service worker, icons, the push routes). Deployment-wise only two things matter:
+
+- **HTTPS with a trusted certificate** — `synsema serve app.syn --domain app.example.com --tls-auto you@example.com`.
+  `localhost`/`127.0.0.1` are secure contexts (nothing needed in dev); iOS refuses to install or
+  run the service worker on a self-signed cert.
+- **Push needs `.env`** — `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT` (from
+  `synsema run push_keys.syn`, once) and one `require net(...)` per push service the app talks
+  to (`fcm.googleapis.com`, `*.notify.windows.com`, `updates.push.services.mozilla.com`,
+  `web.push.apple.com`). Without keys the app runs; the page just says push is off.
+
+`synsema build` caveat: templates are baked into the binary, static mounts are not (yet) — ship
+`public/` beside a built binary. Everything else: [serve.md](serve.md) § Installable app (PWA).
+
 ## `synsema daemon` vs systemd — pick ONE
 
 These are **two different supervisors**; don't run the same service under both.

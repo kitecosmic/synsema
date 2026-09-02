@@ -181,6 +181,22 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `totp_verify(seed, 094287)` (code as number) | Error: the code must be text | Leading zeros matter — quote the code |
 | Store the PAT/API key as-is in the DB | A DB leak leaks every live credential | Store `sha256(token)`, compare hashes with `constant_time_eq` |
 
+### Web Push / PWA (engine v0.6.15+)
+
+| What you expect | What actually happens | Why / workaround |
+|---|---|---|
+| `push_send(sub, msg, {"vapid": {"private": "BJx…"}})` with the key as text | Error: `opts.vapid.private must be a secret … Never pass a private key as a plain string` | Same doctrine as `sign`: `secret("VAPID_PRIVATE_KEY")` from `.env`, or `as_secret(v, "vapid")` for a runtime value |
+| One `require net` covers push | `Capability not granted: net("web.push.apple.com")` for Safari users | Each browser has its own push service: declare `fcm.googleapis.com`, `*.notify.windows.com`, `updates.push.services.mozilla.com`, `web.push.apple.com` (the error names the missing one) |
+| `push_send` needs `require random` (it encrypts) | It doesn't — only `push_vapid_keys()` does | The per-message salt/ephemeral key are protocol-internal (like TLS); creating the VAPID pair IS new secret material |
+| `print(keys["private"])` shows the key | `secret(vapid_private)` — redacted | It's born sealed; `require reveal("vapid_private")` + `reveal()` once (audited) to paste into `.env` |
+| `push_send` returns `ok: false` and you retry forever | `gone: true` (404/410) means the browser unsubscribed | Delete that subscription; `retry_after` is set on 429/503 |
+| A 5 KB notification body | Error: `payload is N bytes; Web Push allows at most 3993` | Push carries a pointer, not the data: send `{title, url}` and let the page fetch |
+| Push works on the iPhone from Safari | Nothing (no `PushManager`) | iOS 16.4+ only from the app **installed** to the Home Screen, and after a tap; the scaffold's page says so |
+| `/sw.js` mounted under `/static/` | The worker's scope is `/static/`, not the site | Serve it from the origin root: `static "/" from "./public"` |
+| `manifest.webmanifest` served as `application/octet-stream` | Chrome won't offer install | The engine pins `application/manifest+json` (v0.6.15+); on older engines use `respond(read_file(p), "application/manifest+json")` |
+| The scaffold's `POST /api/push/test` in production | Anyone can push to all your users | It's a demo button (rate-limited); put `requires auth` on it or send from a cron/agent |
+| `init --pwa` on top of my app overwrote `app.syn` | It didn't — yours is kept, the factory one is `app.syn.new` | Copy what you need from the `.new`; `public/` is new either way |
+
 ### Spend ledger — units
 
 | What you expect | What actually happens | Why / workaround |
