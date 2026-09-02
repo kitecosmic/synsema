@@ -240,6 +240,59 @@ pub fn cmd_update() -> ExitCode {
 /// Reemplaza el ejecutable en ejecución de forma cross-platform. En Unix se puede
 /// renombrar sobre el binario corriendo; en Windows no se puede sobrescribir un .exe en
 /// uso, pero sí renombrarlo: movemos el actual a `.old` y ponemos el nuevo en su lugar.
+/// El nombre al que se aparta el binario actual en Windows. Intenta limpiar TODOS los
+/// `synsema.exe.old*` de actualizaciones anteriores (un `serve` viejo todavía puede estar
+/// ejecutando alguno: ese no se deja borrar y se lo salta); devuelve `synsema.exe.old` si
+/// quedó libre y, si no, un nombre nuevo (`synsema.exe.old-<pid>`) que ningún proceso tiene.
+#[cfg(windows)]
+fn old_name_for(dir: &std::path::Path) -> PathBuf {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("synsema.exe.old") {
+                let _ = std::fs::remove_file(entry.path()); // en uso → queda; se reintenta la próxima
+            }
+        }
+    }
+    let base = dir.join("synsema.exe.old");
+    if base.exists() {
+        dir.join(format!("synsema.exe.old-{}", std::process::id()))
+    } else {
+        base
+    }
+}
+
+#[cfg(all(test, windows))]
+mod old_name_tests {
+    use super::old_name_for;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    /// Con un `.old` que NADIE tiene abierto se limpia y se reutiliza; con uno abierto sin
+    /// compartir (como la imagen de un proceso vivo) se elige otro nombre y no se toca.
+    #[test]
+    fn picks_a_fresh_name_when_the_old_binary_is_still_in_use() {
+        let dir = std::env::temp_dir().join(format!("synsema-old-name-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("synsema.exe.old");
+        std::fs::write(&old, b"v-old").unwrap();
+        std::fs::write(dir.join("synsema.exe.old-1"), b"stale").unwrap();
+        // Libre: se limpia todo y se reutiliza el nombre base.
+        assert_eq!(old_name_for(&dir), old);
+        assert!(!old.exists() && !dir.join("synsema.exe.old-1").exists());
+
+        // En uso (share_mode 0 = ni lectura, ni escritura, ni borrado): otro nombre.
+        std::fs::write(&old, b"v-old").unwrap();
+        let _guard = std::fs::OpenOptions::new().read(true).share_mode(0).open(&old).unwrap();
+        let picked = old_name_for(&dir);
+        assert_ne!(picked, old);
+        assert!(picked.file_name().unwrap().to_string_lossy().starts_with("synsema.exe.old-"));
+        assert!(old.exists(), "el .old en uso queda para la próxima limpieza");
+        drop(_guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 fn replace_running_exe(new_bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -259,17 +312,32 @@ fn replace_running_exe(new_bytes: &[u8]) -> Result<(), String> {
 
     #[cfg(windows)]
     {
-        let old = dir.join("synsema.exe.old");
-        let _ = std::fs::remove_file(&old);
-        std::fs::rename(&exe, &old).map_err(|e| format!("no se pudo mover el binario actual: {}", e))?;
+        // Un ejecutable en uso se puede RENOMBRAR pero no borrar ni pisar. El `.old` de una
+        // actualización anterior puede seguir ejecutándose (un `serve` que arrancó antes de aquel
+        // update): borrarlo falla y pisarlo con el rename da "Acceso denegado" (os error 5) —
+        // pasó de verdad. Entonces: si el `.old` no se deja borrar, se usa otro nombre, y los
+        // `.old*` que sobren se limpian en la próxima actualización.
+        let old = old_name_for(dir);
+        if let Err(e) = std::fs::rename(&exe, &old) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "no se pudo mover el binario actual: {} (¿otro proceso tiene abierto {}?)",
+                e,
+                old.display()
+            ));
+        }
         if let Err(e) = std::fs::rename(&tmp, &exe) {
             let _ = std::fs::rename(&old, &exe); // rollback
+            let _ = std::fs::remove_file(&tmp);
             return Err(format!("no se pudo instalar el nuevo binario: {}", e));
         }
     }
     #[cfg(not(windows))]
     {
-        std::fs::rename(&tmp, &exe).map_err(|e| format!("no se pudo instalar el nuevo binario: {}", e))?;
+        if let Err(e) = std::fs::rename(&tmp, &exe) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("no se pudo instalar el nuevo binario: {}", e));
+        }
     }
     Ok(())
 }
