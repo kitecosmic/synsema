@@ -823,6 +823,34 @@ fn check_program_static_inner(
                 }
             }
         }
+        // Lo que serve rechaza al arrancar sobre un grupo `export routes` se dice acá, en
+        // `check`, con el mismo mensaje: `stream` y `socket` no viajan por un grupo todavía
+        // (`rate_limit` y `timeout` por ruta sí, desde v0.6.19).
+        let mut group_error: Option<String> = None;
+        for stmt in &program.statements {
+            // `export routes` envuelve la declaración: se recorre todo el árbol.
+            crate::ast_api::walk(stmt, &mut |n| {
+                if let NK::RoutesDeclaration { routes, .. } = &n.kind {
+                    for r in routes {
+                        if let NK::RouteDefinition { streaming, socket, .. } = &r.kind {
+                            let unsupported = if *streaming {
+                                Some("a 'routes' group cannot contain 'stream' routes yet — declare streaming routes directly in the serve block")
+                            } else if *socket {
+                                Some("a 'routes' group cannot contain 'socket' routes yet — declare WebSocket routes directly in the serve block")
+                            } else {
+                                None
+                            };
+                            if let (Some(msg), None) = (unsupported, &group_error) {
+                                group_error = Some(format!("{}:{}:{}: {}", file_path, r.location.line, r.location.column, msg));
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        if let Some(e) = group_error {
+            return Err(e);
+        }
         let base_dir = Path::new(file_path)
             .parent()
             .map(|p| p.to_path_buf())

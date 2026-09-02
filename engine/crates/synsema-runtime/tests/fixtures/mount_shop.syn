@@ -14,3 +14,12 @@ export routes tienda
         expect body {item: text}
         let b be json of request
         give created({"comprado": item of b})
+
+    route "GET /shop/limited"
+        rate_limit 1 per minute
+        give {"limited": true}
+
+    route "GET /shop/slow"
+        timeout 1
+        sleep(3)
+        give {"slow": true}

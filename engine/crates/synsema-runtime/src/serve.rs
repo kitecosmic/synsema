@@ -2069,9 +2069,35 @@ fn build_host_table(
                 } else {
                     format!("{}{}", prefix_str, rpath)
                 };
-                let (eff_rate, zone) = match block_limit {
-                    Some(bl) => (Some(bl), Some("__default__".to_string())),
-                    None => (None, None),
+                // `rate_limit` / `timeout` declarados en la ruta del grupo viajan en la meta
+                // (evaluados al ejecutar el grupo) y se aplican igual que en una ruta directa:
+                // zona propia por ruta montada (el prefijo la hace distinta), o el default del bloque.
+                let rc: Option<RateKind> = match mm.get("rate_limit") {
+                    Some(SynValue::Map(r)) => {
+                        let r = r.borrow();
+                        if matches!(r.get("unlimited"), Some(SynValue::Bool(true))) {
+                            Some(RateKind::Unlimited)
+                        } else {
+                            let cap = r.get("count").and_then(val_to_f64).unwrap_or(0.0) as i64;
+                            let w = r.get("window").map(|v| v.to_string()).unwrap_or_default();
+                            Some(RateKind::Limit(cap, window_seconds(&w)))
+                        }
+                    }
+                    _ => None,
+                };
+                let rate_unlimited = matches!(rc, Some(RateKind::Unlimited));
+                let route_timeout: Option<f64> = match mm.get("timeout") {
+                    Some(SynValue::Text(t)) if t.to_string() == "none" => Some(0.0),
+                    Some(v) => val_to_f64(v),
+                    None => None,
+                };
+                let (eff_rate, zone) = match rc {
+                    None => match block_limit {
+                        Some(bl) => (Some(bl), Some("__default__".to_string())),
+                        None => (None, None),
+                    },
+                    Some(RateKind::Unlimited) => (None, None),
+                    Some(RateKind::Limit(c, s)) => (Some((c, s)), Some(format!("route:{} {}", method, full_path))),
                 };
                 let source_c = source.as_ref().clone();
                 let key = format!("_route_handler_{}", i);
@@ -2119,9 +2145,9 @@ fn build_host_table(
                     handler,
                     stream_handler: None,
                     socket_handler: None,
-                    timeout: None,
+                    timeout: route_timeout,
                     proxy_target: None,
-                    rate_unlimited: false,
+                    rate_unlimited,
                     meta,
                 });
             }

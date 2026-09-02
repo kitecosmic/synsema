@@ -204,8 +204,13 @@ synsema build desk.syn -o desk --serve --icon icon.svg --bundle --engine-binary 
   "msedge", "--app=" + url]` via `cmd`), `open -a "Google Chrome" --args --app=URL` (macOS),
   `google-chrome --app=URL` (Linux) — branch on `platform()["os"]`; a `socket` route that counts
   windows in `state_*` (`+1` on connect, `-1` on `{type: "close"}`, `state_set("last_close", now())`);
-  `cron_every(2, maybe_quit)` → `shutdown("window closed")` when `windows == 0` for > 3 s. The top
-  level continues after the serve block, so `open_window()` is called right after it.
+  `cron_every(2, maybe_quit)` → `shutdown("window closed")` when `windows == 0` for > 3 s, and
+  `shutdown("no window opened in 30 s")` when no socket EVER connected 30 s after start (`let
+  started be now()`; otherwise a browser that never opens leaves an invisible process). The top
+  level continues after the serve block, so `open_window()` is called right after it. Shortcut:
+  `synsema init --desktop` (v0.6.19+) writes `desk.syn` + `public/desk.js` on top of the PWA
+  scaffold, with the API in `api.syn` (`export routes api`, mounted by both entries — per-route
+  `rate_limit`/`timeout` inside a group work since v0.6.19; `DESK_NO_WINDOW=1` skips the browser).
 - **Honest limits:** fixed port (address in use dies silently under `--no-console` — pick an unusual
   one); Edge/Chrome are single-instance (watch the socket, not the launcher process); Firefox = a
   tab; no tray, no `.dmg`/`.msi`/AppImage (feed `--bundle`'s output to those tools); macOS downloads

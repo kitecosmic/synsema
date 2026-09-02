@@ -167,6 +167,7 @@ fn lexer_crlf_blank_line_in_block() {
 fn start_frontend_serve(port: u16, static_dir: &str) {
     let prog = format!(
         r#"require serve({p})
+require time
 use "./mount_shop.syn" as shop
 
 task pagina_error(status, message, request)
@@ -254,6 +255,17 @@ fn serve_frontend_full_stack() {
     let r = post(port, "/shop/buy", "application/json", "{\"item\": \"gorra\"}");
     assert!(r.contains("201"), "r: {}", r);
     assert!(r.contains("\"comprado\": \"gorra\""));
+
+    // mount: rate_limit POR RUTA del grupo (v0.6.19) — zona propia; el prefijo es otra zona
+    let r = get(port, "/shop/limited", "");
+    assert!(r.starts_with("HTTP/1.1 200"), "r: {}", r);
+    let r = get(port, "/shop/limited", "");
+    assert!(r.starts_with("HTTP/1.1 429"), "segundo request en el minuto: {}", r);
+    let r = get(port, "/v2/shop/limited", "");
+    assert!(r.starts_with("HTTP/1.1 200"), "el mount con prefijo tiene su propia zona: {}", r);
+    // mount: timeout POR RUTA del grupo → 504 con cancelación real
+    let r = get(port, "/shop/slow", "");
+    assert!(r.starts_with("HTTP/1.1 504"), "r: {}", r);
 
     // errors with: 404 HTML para Accept text/html, con status 404
     let r = get(port, "/nada", "Accept: text/html\r\n");

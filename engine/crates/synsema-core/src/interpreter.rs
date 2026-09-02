@@ -2066,17 +2066,54 @@ impl Interpreter {
                                 &r.location,
                             ));
                         }
-                        if timeout.is_some() {
-                            return Err(err_at(
-                                "'timeout' inside a 'routes' group is not supported yet — set it on the serve block",
-                                &r.location,
-                            ));
+                        // `rate_limit` y `timeout` por ruta viajan en la meta: se evalúan acá, una
+                        // vez, con el env del módulo (misma regla que una ruta directa: la
+                        // expresión se evalúa al arrancar), y serve los aplica al montar.
+                        let mut route_limit: Option<SynValue> = None;
+                        if let Some(rl) = rate_limit {
+                            if let NodeKind::RateLimitClause { count, window, unlimited } = &rl.kind {
+                                let cap: i64 = match count {
+                                    Some(c) => match self.eval(c, env)? {
+                                        SynValue::Number(Number::Int(i)) => i,
+                                        SynValue::Number(Number::Float(f)) => f as i64,
+                                        other => {
+                                            return Err(err_at(
+                                                format!("rate_limit count must be a number, got {}", other.type_name()),
+                                                &r.location,
+                                            ))
+                                        }
+                                    },
+                                    None => 0,
+                                };
+                                let mut lm = IndexMap::new();
+                                lm.insert("unlimited".to_string(), syn_bool(*unlimited));
+                                lm.insert("count".to_string(), SynValue::Number(Number::Int(cap)));
+                                lm.insert("window".to_string(), syn_text(window.as_str()));
+                                route_limit = Some(syn_map(lm));
+                            }
                         }
-                        if rate_limit.is_some() {
-                            return Err(err_at(
-                                "'rate_limit' inside a 'routes' group is not supported yet — set it on the serve block",
-                                &r.location,
-                            ));
+                        let mut route_timeout: Option<SynValue> = None;
+                        if let Some(t) = timeout {
+                            if let NodeKind::TimeoutClause { secs } = &t.kind {
+                                route_timeout = Some(match secs {
+                                    None => syn_text("none"),
+                                    Some(e) => {
+                                        let v = self.eval(e, env)?;
+                                        let f = match &v {
+                                            SynValue::Number(Number::Int(i)) => *i as f64,
+                                            SynValue::Number(Number::Float(f)) => *f,
+                                            _ => f64::NAN,
+                                        };
+                                        if !(f.is_finite() && f > 0.0) {
+                                            return Err(err_at(
+                                                format!("timeout must be a positive number of seconds (or `none`), got {}", v),
+                                                &r.location,
+                                            ));
+                                        }
+                                        SynValue::Number(Number::Float(f))
+                                    }
+                                });
+                            }
                         }
                         let task = SynValue::Task(Rc::new(SynTaskValue {
                             name: format!("route {} {}", method, path),
@@ -2095,6 +2132,12 @@ impl Interpreter {
                             "params".to_string(),
                             syn_list(param_names.iter().map(|p| syn_text(p.as_str())).collect()),
                         );
+                        if let Some(l) = route_limit {
+                            mm.insert("rate_limit".to_string(), l);
+                        }
+                        if let Some(t) = route_timeout {
+                            mm.insert("timeout".to_string(), t);
+                        }
                         meta.push(syn_map(mm));
                     }
                 }

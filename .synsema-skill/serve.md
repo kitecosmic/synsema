@@ -487,8 +487,12 @@ serve on 8080
   `xdg-open`; each attempt in `try … recover`, first success wins), count windows in a `socket`
   route (`state_incr("windows")` on connect, `state_incr("windows", -1)` + `state_set("last_close",
   now())` on `{type: "close"}`), `cron_every(2, maybe_quit)` calls `shutdown("window closed")` when
-  `state_get("windows", 0) == 0 and now() - state_get("last_close", now()) > 3`. The top level
-  continues after the serve block, so `open_window()` goes right after it. A page's inline JS
+  there is no window and `last_close` is older than 3 s — AND `shutdown("no window opened in 30 s")`
+  when `windows == 0`, `last_close` is still `nothing` and `now() - started > 30` (`let started be
+  now()` at the top): without that second branch a `--no-console` process whose browser never
+  opened stays invisible forever. The top level continues after the serve block, so
+  `open_window()` goes right after it. `synsema init --desktop` (v0.6.19+) writes exactly this as
+  `desk.syn` on top of the PWA scaffold, with the API shared in `api.syn`. A page's inline JS
   (`new WebSocket("ws://127.0.0.1:PORT/ws")`) must sit inside `{ raw } … { end }` in the template.
   Build flags: [deploy.md](deploy.md) § Desktop app.
 

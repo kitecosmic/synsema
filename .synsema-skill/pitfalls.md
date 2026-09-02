@@ -214,6 +214,9 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | Inline `<script>` in the desktop page breaks `render()` (`invalid expression { … }`) | Braces are template holes | Wrap literal JS/CSS in `{ raw } … { end }` or serve it from the static mount |
 | Explorer still shows the old icon after a rebuild | Explorer caches icons per file name | Use a new file name or restart Explorer; the shell does read the new `.rsrc` (verified with `ExtractAssociatedIcon`) |
 | `Name.app` from a download won't open on macOS | Gatekeeper: unsigned / not notarized, like any app without Developer ID | Right-click → Open (≤ 14) / "Open Anyway" (15); a locally built `.app` carries no quarantine. Built from Windows: `chmod +x Name.app/Contents/MacOS/<stem>` (the build says so) |
+| `'rate_limit' inside a 'routes' group is not supported yet` at serve start (≤ v0.6.18) | Per-route `rate_limit`/`timeout` inside `export routes` were rejected, so a shared API lost its fine limits | v0.6.19+: they work inside groups (own zone per mounted route, a mount prefix is another zone). Older engine: set them on the serve block, or `synsema update` |
+| `synsema check` says OK but `serve` refuses the routes group (`stream`/`socket` in a group) | ≤ v0.6.18 `check` did not run that validation | v0.6.19+ `check` fails with the same message; `stream`/`socket` routes stay in the serve block (not in groups) |
+| `synsema --version` is not the version you just installed | Two `synsema` binaries in PATH (e.g. `%LOCALAPPDATA%\Synsema` and an old `~/.cargo/bin`) | `where synsema` / `which -a synsema`; remove the stale one — `synsema update` only updates the binary it runs from |
 | Play/TWA can't verify the origin | It reads `/.well-known/assetlinks.json` | Put it under `public/.well-known/`; the static mount serves dot-directories as JSON |
 
 ### Spend ledger — units

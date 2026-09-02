@@ -351,14 +351,17 @@ pub const INIT_FILES: [InitFile; 4] = [
 
 /// El programa: sitio + manifest + service worker + API + push nativo (opcional).
 pub const PWA_APP_SYN: &str = r#"-- Tu app instalable (PWA). Este programa sirve el sitio, el manifest, el service
--- worker y el API. `synsema serve app.syn` → http://localhost:8080 (Chrome y Edge la
--- instalan desde localhost). Producción: `synsema serve app.syn --domain app.example.com
--- --tls-auto you@example.com` (iOS exige HTTPS con certificado confiable).
+-- worker y el API (api.syn). `synsema serve app.syn` → http://localhost:8080 (Chrome y
+-- Edge la instalan desde localhost). Producción: `synsema serve app.syn --domain
+-- app.example.com --tls-auto you@example.com` (iOS exige HTTPS con certificado confiable).
 --
 -- Push nativo (opcional): `synsema run push_keys.syn` imprime el par VAPID; pegalo en
 -- .env (VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT). Sin eso la página avisa
 -- que push no está configurado y todo lo demás funciona igual. ¿Ya tenés OneSignal,
 -- FCM u otro proveedor? Llamalo con http_post bajo `require net(...)`; nada te obliga.
+--
+-- El API vive en api.syn (un grupo `export routes`) para que la misma app corra también
+-- como app de escritorio (`synsema init --desktop` agrega desk.syn, que lo monta igual).
 
 require serve(8080)
 require time
@@ -375,10 +378,7 @@ require net("*.notify.windows.com")
 require net("updates.push.services.mozilla.com")
 require net("web.push.apple.com")
 
-let vapid_public be env("VAPID_PUBLIC_KEY", "")
-
-task vapid_opts()
-    give {"vapid": {"public": vapid_public, "private": secret("VAPID_PRIVATE_KEY"), "subject": env("VAPID_SUBJECT", "mailto:you@example.com")}}
+use "./api.syn" as api
 
 serve on 8080
     -- Todo lo estático vive en public/: manifest, service worker, íconos, JS.
@@ -386,59 +386,11 @@ serve on 8080
     static "/" from "./public" cache "1h"
 
     route "GET /"
-        give render("index.html", {"title": "My app"})
+        give render("index.html", {"title": "My app", "desktop": false})
 
-    route "GET /api/ping"
-        give ok({"pong": true, "at": now()})
-
-    -- La clave pública VAPID que el navegador necesita para suscribirse ("" = push apagado).
-    route "GET /api/push/config"
-        give ok({"vapid_public": vapid_public})
-
-    -- El navegador manda su PushSubscription.toJSON(). Acá se guarda en memoria (state_*:
-    -- vive lo que el proceso, tope 500 para que nadie la infle). En tu app: guardala en
-    -- una tabla, atada al usuario logueado (`requires auth`).
-    route "POST /api/push/subscribe"
-        rate_limit 10 per minute
-        expect body {endpoint: text, keys: map}
-        let subs be state_get("push_subs", [])
-        let known be false
-        each s in subs
-            when s["endpoint"] == request.json["endpoint"]
-                set known to true
-        when not known and length(subs) < 500
-            state_set("push_subs", append(subs, request.json))
-        give created({"subscriptions": length(state_get("push_subs", []))})
-
-    -- Botón de DEMO: manda una notificación de prueba a todas las suscripciones y olvida
-    -- las que el push service reporta como desaparecidas (404/410 → r["gone"]) o las que
-    -- ni siquiera se pueden cifrar (claves rotas). En tu app esta ruta lleva
-    -- `requires auth`, o el envío vive en un cron/agente y no en una ruta pública.
-    route "POST /api/push/test"
-        rate_limit 2 per minute
-        when vapid_public == ""
-            give fail(503, "push is not configured: run `synsema run push_keys.syn` and fill .env")
-        let sent be 0
-        let kept be []
-        each sub in state_get("push_subs", [])
-            try
-                let r be push_send(sub, {"title": "My app", "body": "Native push from Synsema", "url": "/", "tag": "test"}, vapid_opts())
-                when r["ok"]
-                    set sent to sent + 1
-                when not r["gone"]
-                    set kept to append(kept, sub)
-            recover err
-                -- Sólo se descarta una suscripción ROTA (claves/endpoint inválidos: el error
-                -- nombra "subscription"). Un push service no declarado (Capability not granted:
-                -- falta un `require net`) o un servicio inalcanzable es config o red del server,
-                -- no una suscripción muerta: se conserva y el log dice qué pasó.
-                when contains(err, "subscription")
-                    log "push dropped (broken subscription): " + err
-                otherwise
-                    log "push skipped, subscription kept: " + err
-                    set kept to append(kept, sub)
-        state_set("push_subs", kept)
-        give ok({"sent": sent, "kept": length(kept)})
+    -- /api/ping, /api/push/config, /api/push/subscribe, /api/push/test — con sus
+    -- rate_limit por ruta — vienen de api.syn.
+    mount api.api
 "#;
 
 /// Generador del par VAPID (una vez por app).
@@ -488,6 +440,10 @@ pub const PWA_INDEX_HTML: &str = r##"<!doctype html>
   <button id="notify">Notify me</button>
   <button id="test" hidden>Send a test push</button>
   <pre id="out"></pre>
+  { when desktop }
+  <!-- Escritorio (desk.syn): el socket por el que el proceso sabe que esta ventana existe. -->
+  <script src="/desk.js"></script>
+  { end }
   <script src="/app.js"></script>
 </body>
 </html>
@@ -767,14 +723,193 @@ pub const PWA_BADGE_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" view
 /// Los archivos de `synsema init --pwa`, en orden (el scaffold base va aparte, sin
 /// `hello.syn`: acá el starter es `app.syn`). Los PNG NO están en la lista: son
 /// derivados de `icon.svg` y los genera `cmd_init` (ver `pwa_icons`).
-pub const PWA_FILES: [InitFile; 9] = [
+/// El API compartido (grupo `export routes`): lo montan app.syn y desk.syn.
+pub const PWA_API_SYN: &str = r#"-- El API de tu app: un grupo `export routes` que cada entrada monta con `mount api.api`
+-- (app.syn para el servidor/PWA, desk.syn para el escritorio). Las capabilities que usa
+-- (env, secret, net) las declara la ENTRADA — un módulo no lleva `require`; acá sólo se usan.
+
+let vapid_public be env("VAPID_PUBLIC_KEY", "")
+
+task vapid_opts()
+    give {"vapid": {"public": vapid_public, "private": secret("VAPID_PRIVATE_KEY"), "subject": env("VAPID_SUBJECT", "mailto:you@example.com")}}
+
+export routes api
+    route "GET /api/ping"
+        give ok({"pong": true, "at": now()})
+
+    -- La clave pública VAPID que el navegador necesita para suscribirse ("" = push apagado).
+    route "GET /api/push/config"
+        give ok({"vapid_public": vapid_public})
+
+    -- El navegador manda su PushSubscription.toJSON(). Acá se guarda en memoria (state_*:
+    -- vive lo que el proceso, tope 500 para que nadie la infle). En tu app: guardala en
+    -- una tabla, atada al usuario logueado (`requires auth`).
+    route "POST /api/push/subscribe"
+        rate_limit 10 per minute
+        expect body {endpoint: text, keys: map}
+        let subs be state_get("push_subs", [])
+        let known be false
+        each s in subs
+            when s["endpoint"] == request.json["endpoint"]
+                set known to true
+        when not known and length(subs) < 500
+            state_set("push_subs", append(subs, request.json))
+        give created({"subscriptions": length(state_get("push_subs", []))})
+
+    -- Botón de DEMO: manda una notificación de prueba a todas las suscripciones y olvida
+    -- las que el push service reporta como desaparecidas (404/410 → r["gone"]) o las que
+    -- ni siquiera se pueden cifrar (claves rotas). En tu app esta ruta lleva
+    -- `requires auth`, o el envío vive en un cron/agente y no en una ruta pública.
+    route "POST /api/push/test"
+        rate_limit 2 per minute
+        when vapid_public == ""
+            give fail(503, "push is not configured: run `synsema run push_keys.syn` and fill .env")
+        let sent be 0
+        let kept be []
+        each sub in state_get("push_subs", [])
+            try
+                let r be push_send(sub, {"title": "My app", "body": "Native push from Synsema", "url": "/", "tag": "test"}, vapid_opts())
+                when r["ok"]
+                    set sent to sent + 1
+                when not r["gone"]
+                    set kept to append(kept, sub)
+            recover err
+                -- Sólo se descarta una suscripción ROTA (claves/endpoint inválidos: el error
+                -- nombra "subscription"). Un push service no declarado (Capability not granted:
+                -- falta un `require net`) o un servicio inalcanzable es config o red del server,
+                -- no una suscripción muerta: se conserva y el log dice qué pasó.
+                when contains(err, "subscription")
+                    log "push dropped (broken subscription): " + err
+                otherwise
+                    log "push skipped, subscription kept: " + err
+                    set kept to append(kept, sub)
+        state_set("push_subs", kept)
+        give ok({"sent": sent, "kept": length(kept)})
+"#;
+
+/// La entrada de escritorio (`synsema init --desktop`): el mismo sitio y el mismo API,
+/// en 127.0.0.1, abiertos como ventana de app del navegador; se apaga sola. Es la receta
+/// de docs 41c-desktop, verificada en vivo.
+pub const DESKTOP_DESK_SYN: &str = r#"-- Tu app como app de ESCRITORIO: el mismo sitio (index.html + public/) y el mismo API
+-- (api.syn) que app.syn, servidos sólo en 127.0.0.1 y abiertos como ventana de app del
+-- navegador que el usuario ya tiene (Edge/Chrome en modo --app=). Se apaga sola cuando se
+-- cierra la última ventana — y a los 30 s si nunca se abrió ninguna.
+--   synsema serve desk.syn                                   → desarrollo: abre la ventana
+--   synsema build desk.syn -o desk --serve --no-console --icon public/icon.svg   → Windows: desk.exe
+--   synsema build desk.syn -o desk --serve --icon public/icon.svg --bundle        → macOS .app / Linux dir + install.sh
+-- Sin consola no hay stdout/stderr: si querés un log, escribilo (append_file bajo file.write).
+-- DESK_NO_WINDOW=1 no abre el navegador (tests, CI). Docs: /0.6.x/41c-desktop.
+
+require serve(8123)
+require time
+require file.read("index.html")
+require env("DESK_NO_WINDOW")
+require exec("cmd")            -- Windows: Edge viene con Windows; --app= da una ventana sin barra de direcciones
+require exec("open")           -- macOS: Chrome/Edge en modo app; si no, el navegador por defecto (una pestaña)
+require exec("google-chrome")  -- Linux: modo app…
+require exec("chromium")
+require exec("xdg-open")       -- …o una pestaña (Firefox no tiene modo app)
+-- Lo que api.syn usa (push nativo, opcional): las mismas declaraciones que app.syn.
+require env("VAPID_PUBLIC_KEY")
+require env("VAPID_SUBJECT")
+require secret("VAPID_PRIVATE_KEY")
+require net("fcm.googleapis.com")
+require net("jmt17.google.com")
+require net("*.notify.windows.com")
+require net("updates.push.services.mozilla.com")
+require net("web.push.apple.com")
+
+use "./api.syn" as api
+
+let started be now()
+
+-- Cada intento es un run() bajo su propio exec(); "no se pudo lanzar" es un error atrapable,
+-- un exit_code distinto de cero es un dato. El primero que abre, gana.
+task try_open(cmd, args)
+    try
+        let r be run(cmd, args)
+        give r["exit_code"] == 0
+    recover err
+        give false
+
+task open_window()
+    let url be "http://127.0.0.1:8123/"
+    let p be platform()
+    when p["os"] == "windows"
+        give try_open("cmd", ["/c", "start", "", "msedge", "--app=" + url])
+    when p["os"] == "macos"
+        when try_open("open", ["-a", "Google Chrome", "--args", "--app=" + url])
+            give true
+        when try_open("open", ["-a", "Microsoft Edge", "--args", "--app=" + url])
+            give true
+        give try_open("open", [url])
+    otherwise
+        when try_open("google-chrome", ["--app=" + url])
+            give true
+        when try_open("chromium", ["--app=" + url])
+            give true
+        give try_open("xdg-open", [url])
+
+-- Hay ventana ⇔ hay WebSocket (desk.js abre uno por ventana). Un reload cierra y reabre
+-- el socket en menos de 1 s; por eso la guarda de 3 s.
+task maybe_quit()
+    when state_get("windows", 0) > 0
+        give nothing
+    let closed be state_get("last_close", nothing)
+    when closed != nothing and now() - closed > 3
+        shutdown("window closed")
+    when closed == nothing and now() - started > 30
+        shutdown("no window opened in 30 s")
+
+serve on 8123
+    bind "127.0.0.1"
+    static "/" from "./public" cache "1h"
+
+    route "GET /"
+        give render("index.html", {"title": "My app", "desktop": true})
+
+    route "GET /ws"
+        socket
+            state_incr("windows")
+            while true
+                let ev be ws_recv(socket, 30)
+                when ev != nothing and ev["type"] == "close"
+                    stop
+            state_incr("windows", -1)
+            state_set("last_close", now())
+
+    mount api.api
+
+cron_every(2, maybe_quit)
+when env("DESK_NO_WINDOW", "") == ""
+    log "window: " + text(open_window())
+"#;
+
+/// El socket de la ventana de escritorio (lo carga index.html sólo bajo desk.syn).
+pub const DESKTOP_DESK_JS: &str = r#"// Escritorio (desk.syn): este socket es cómo el proceso sabe que ESTA ventana existe.
+// Al cerrar la ventana el navegador cierra el socket y desk.syn se apaga solo (maybe_quit).
+// No hay nada más que hacer acá: la app es la misma que en el teléfono o en el servidor.
+(function () {
+  var ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
+  ws.onclose = function () {
+    var s = document.getElementById("status");
+    if (s) s.textContent = "app stopped — open it again from the Start menu or its icon";
+  };
+})();
+"#;
+
+pub const PWA_FILES: [InitFile; 10] = [
     // `past`: los sha256 (forma LF) de cada versión publicada — v0.6.15 fue la primera.
     InitFile { name: "app.syn", content: PWA_APP_SYN, past: &[
         "b35f3e66902c4380aececfcf717025d97f475d8f76226e0f345fc1266c5ec2ef", // v0.6.15
         "c871f31d0cebbda647c7020ce3416ec3b9f25f452cf7ab0c0574ef756859afe4", // v0.6.16
+        "4f589b3fa0ffb8177bf17fbfc35f816438482d557ea20e3091a854110ce65cd1", // v0.6.17–v0.6.18 (rutas inline)
     ] },
+    InitFile { name: "api.syn", content: PWA_API_SYN, past: &[] },
     InitFile { name: "push_keys.syn", content: PWA_PUSH_KEYS_SYN, past: &[] },
-    InitFile { name: "index.html", content: PWA_INDEX_HTML, past: &[] },
+    InitFile { name: "index.html", content: PWA_INDEX_HTML, past: &[
+        "97d922bc29832a0c4cd4c4ca925277651edf80344c12dbc559fad9627347a4e0", // v0.6.15–v0.6.18 (sin bloque desktop)
+    ] },
     InitFile { name: "public/manifest.webmanifest", content: PWA_MANIFEST, past: &["c48e191fff4cd83fb8231658dc88ad185abfb592d9614c1cb3983345bfe684ad"] },
     InitFile { name: "public/sw.js", content: PWA_SW_JS, past: &[
         "4aa649614a3aa18b32c2b16668b467be1c46220ff3f39e9c5bcd1bb70fbf64c1", // v0.6.15
@@ -787,6 +922,12 @@ pub const PWA_FILES: [InitFile; 9] = [
     InitFile { name: "public/icon.svg", content: PWA_ICON_SVG, past: &[] },
     InitFile { name: "public/icon-maskable.svg", content: PWA_ICON_MASKABLE_SVG, past: &[] },
     InitFile { name: "public/badge.svg", content: PWA_BADGE_SVG, past: &[] },
+];
+
+/// `synsema init --desktop`: sobre el scaffold PWA (modular), la entrada de escritorio y su socket.
+pub const DESKTOP_FILES: [InitFile; 2] = [
+    InitFile { name: "desk.syn", content: DESKTOP_DESK_SYN, past: &[] },
+    InitFile { name: "public/desk.js", content: DESKTOP_DESK_JS, past: &[] },
 ];
 
 /// Los SVG fuente del scaffold (ruta, contenido de fábrica): `init` sabe si el usuario los editó.
@@ -816,6 +957,9 @@ pub fn const_name(file: &str) -> &'static str {
         ".mcp.json" => "MCP_JSON",
         ".gitignore" => "GITIGNORE",
         "app.syn" => "PWA_APP_SYN",
+        "api.syn" => "PWA_API_SYN",
+        "desk.syn" => "DESKTOP_DESK_SYN",
+        "public/desk.js" => "DESKTOP_DESK_JS",
         "push_keys.syn" => "PWA_PUSH_KEYS_SYN",
         "index.html" => "PWA_INDEX_HTML",
         "public/manifest.webmanifest" => "PWA_MANIFEST",
@@ -867,7 +1011,7 @@ mod tests {
             return;
         }
         let Some(log) = git(&["log", "--format=%H", "--reverse", "--", rel]) else { return };
-        for f in INIT_FILES.iter().chain(PWA_FILES.iter()) {
+        for f in INIT_FILES.iter().chain(PWA_FILES.iter()).chain(DESKTOP_FILES.iter()) {
             // Un template con `"#` adentro (colores CSS) vive en `r##"…"##`; los demás
             // en `r#"…"#`. Se aceptan las dos formas (y un template puede cambiar de una
             // a otra sin perder su historia).
@@ -918,7 +1062,7 @@ mod tests {
     /// `git log --reverse -- init_templates.rs` + sha256 del literal de cada commit.
     #[test]
     fn init_file_provenance_is_well_formed() {
-        for f in INIT_FILES.iter().chain(PWA_FILES.iter()) {
+        for f in INIT_FILES.iter().chain(PWA_FILES.iter()).chain(DESKTOP_FILES.iter()) {
             let current = sha256_of(f.content);
             for h in f.past {
                 assert_eq!(h.len(), 64, "{}: '{}' no es un sha256", f.name, h);
@@ -998,8 +1142,11 @@ mod tests {
     /// el scaffold escribe o que init genera — un 404 en la shell rompe la instalación.
     #[test]
     fn pwa_scaffold_references_are_closed() {
+        // desk.js sólo existe bajo --desktop, y sólo lo referencia el bloque `{ when desktop }`
+        // que renderiza desk.syn — el mismo flag escribe los dos: la shell sigue cerrada.
         let served: Vec<String> = PWA_FILES
             .iter()
+            .chain(DESKTOP_FILES.iter())
             .filter_map(|f| f.name.strip_prefix("public/").map(|s| format!("/{}", s)))
             .chain(PWA_ICONS.iter().map(|(_, n, _)| format!("/{}", n.trim_start_matches("public/"))))
             .chain(["/".to_string()])

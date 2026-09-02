@@ -32,7 +32,7 @@ mod synfide;
 mod update;
 mod code;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] <archivo.syn | -> [-- args...] | test [-v] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide] | llm status [--json] | version | update> [--sandbox | --cap-set <list>] [--profile native|pure] [--audit json|<ruta>|fd:N] [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] <archivo.syn | -> [-- args...] | test [-v] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list>] [--profile native|pure] [--audit json|<ruta>|fd:N] [--env-file <path> | --no-env-file] <archivo.syn>";
 
 // `build_ceiling` (--sandbox/--cap-set → techo) vive en synsema-capabilities: lo comparten
 // este binario y `synsema-wasm` (mismas flags, misma semántica en los dos front-ends).
@@ -586,14 +586,22 @@ fn cmd_init(args: &[String]) -> ExitCode {
     // `--pwa`: scaffold EMBEBIDO de una app instalable (tanda PWA, specs/pwa-mobile.md):
     // app.syn + página + manifest + service worker + íconos generados desde icon.svg.
     // Tampoco lleva hello.syn (el starter es app.syn). No descarga nada.
+    // `--desktop` (tanda escritorio): el scaffold PWA (modular: app.syn monta api.syn) MÁS la
+    // entrada de escritorio desk.syn (bind 127.0.0.1, ventana de app del navegador, socket
+    // por ventana, shutdown() al cerrar la última) y public/desk.js. `--pwa --desktop` es lo mismo.
     let with_synfide = args.iter().any(|a| a == "--synfide");
-    let with_pwa = args.iter().any(|a| a == "--pwa");
+    let with_desktop = args.iter().any(|a| a == "--desktop");
+    let with_pwa = args.iter().any(|a| a == "--pwa") || with_desktop;
     if with_synfide && with_pwa {
-        eprintln!("init: --synfide y --pwa son starters distintos (cada uno trae su app.syn); elegí uno");
+        eprintln!("init: --synfide y --pwa/--desktop son starters distintos (cada uno trae su app.syn); elegí uno");
         return ExitCode::from(2);
     }
-    if let Some(bad) = args.iter().skip(2).find(|a| a.starts_with("--") && a.as_str() != "--synfide" && a.as_str() != "--pwa") {
-        eprintln!("init: flag desconocido '{}'\nuso: synsema init [dir] [--synfide | --pwa]", bad);
+    if let Some(bad) = args
+        .iter()
+        .skip(2)
+        .find(|a| a.starts_with("--") && !matches!(a.as_str(), "--synfide" | "--pwa" | "--desktop"))
+    {
+        eprintln!("init: flag desconocido '{}'\nuso: synsema init [dir] [--synfide | --pwa | --desktop]", bad);
         return ExitCode::from(2);
     }
     // El directorio es el primer positional, esté antes o después de los flags
@@ -627,6 +635,13 @@ fn cmd_init(args: &[String]) -> ExitCode {
                 return code;
             }
         }
+        if with_desktop {
+            for f in init_templates::DESKTOP_FILES {
+                if let Err(code) = scaffold_file(base, &f) {
+                    return code;
+                }
+            }
+        }
         match pwa_icons(base) {
             Ok(msg) => println!("{}", msg),
             Err(e) => {
@@ -641,6 +656,11 @@ fn cmd_init(args: &[String]) -> ExitCode {
         println!("  synsema run {p}push_keys.syn              # (opcional) par VAPID para push nativo → pegalo en {p}.env", p = prefix);
         println!("  synsema serve {p}app.syn --domain app.example.com --tls-auto you@example.com   # en el VPS: el teléfono la instala", p = prefix);
         println!("  editá {p}public/icon.svg y volvé a correr `synsema init --pwa` para regenerar los PNG", p = prefix);
+        if with_desktop {
+            println!("  synsema serve {p}desk.syn                 # escritorio: abre la ventana de app; cerrala y el proceso termina", p = prefix);
+            println!("  synsema build {p}desk.syn -o desk --serve --no-console --icon {p}public/icon.svg   # Windows: desk.exe con tu ícono", p = prefix);
+            println!("  synsema build {p}desk.syn -o desk --serve --icon {p}public/icon.svg --bundle       # macOS: desk.app · Linux: desk/ + install.sh", p = prefix);
+        }
         return ExitCode::SUCCESS;
     }
     if with_synfide {
