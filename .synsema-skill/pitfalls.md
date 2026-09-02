@@ -204,6 +204,15 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `navigator.onLine` says online but nothing works | It only knows if there is a network, not if YOUR server answers | Probe `/api/ping` with `{cache: "no-store"}` (the scaffold's status line does) |
 | Lighthouse: "any maskable" purpose flagged | Combined purposes are discouraged | Separate icons: `icon-512.png` (`any`) + `icon-maskable-512.png` (`maskable`) — what the v0.6.16+ manifest ships; add `screenshots` yourself |
 | `synsema build` of the PWA fails: `has a serve block; pass --serve` | A `serve on` program only runs under the serve runtime | `synsema build app.syn -o app --serve --bind 0.0.0.0` (v0.6.16+); `public/` is bundled automatically |
+| `synsema build --serve` stops with `needs to know where the server listens` | No `--bind` and no `bind "…"` clause in the serve block | Add `bind "127.0.0.1"` (local app) to the serve block or pass `--bind 0.0.0.0` (v0.6.18+; the flag wins) |
+| `--icon on a macOS/Linux engine needs --bundle` | There the icon lives in the `.app` / the launcher entry, not in the binary | Add `--bundle` (or `-o x.app` on a Mach-O engine); `--icon` alone is for Windows engines |
+| `--no-console applies to Windows executables (PE)` on a Mac/Linux build | The flag flips the PE subsystem; Mach-O/ELF have no console subsystem | Drop it: `LSUIElement` in the `.app` and `Terminal=false` in the `.desktop` are the equivalents `--bundle` writes |
+| A `--no-console` build prints nothing, not even errors | By design: a GUI-subsystem exe has no stdout/stderr (discarded, no panic) | Debug with the console build first; write your own log with `append_file` under `file.write` |
+| The desktop app never quits after its window is closed | Edge/Chrome are single-instance: the `--app=` launcher exits at once, so watching its process lies | Count windows with a `socket` route and call `shutdown()` from a cron tick when there are none (docs `41c-desktop`) |
+| `shutdown() is only available under serve` | Called from a `synsema run` program | A run program ends with its top level; `stop` leaves a loop or a task. `shutdown()` is for routes/sockets/cron/agents under `serve` |
+| Inline `<script>` in the desktop page breaks `render()` (`invalid expression { … }`) | Braces are template holes | Wrap literal JS/CSS in `{ raw } … { end }` or serve it from the static mount |
+| Explorer still shows the old icon after a rebuild | Explorer caches icons per file name | Use a new file name or restart Explorer; the shell does read the new `.rsrc` (verified with `ExtractAssociatedIcon`) |
+| `Name.app` from a download won't open on macOS | Gatekeeper: unsigned / not notarized, like any app without Developer ID | Right-click → Open (≤ 14) / "Open Anyway" (15); a locally built `.app` carries no quarantine. Built from Windows: `chmod +x Name.app/Contents/MacOS/<stem>` (the build says so) |
 | Play/TWA can't verify the origin | It reads `/.well-known/assetlinks.json` | Put it under `public/.well-known/`; the static mount serves dot-directories as JSON |
 
 ### Spend ledger — units

@@ -37,11 +37,13 @@ synsema build app.syn -o app --profile pure                   # bake the pure pr
 synsema build app.syn -o app-linux --engine-binary ./synsema-linux-x86_64  # cross: a donor engine
 synsema build app.syn -o app --serve --bind 0.0.0.0 --port 8080          # a SERVER binary (v0.6.16+): the serve
 synsema build app.syn -o app --serve --bind 0.0.0.0 --domain a.com --tls-auto x@a.com  # runtime + deploy flags baked in
+synsema build desk.syn -o desk --serve --no-console --icon icon.svg [--bundle]  # a DESKTOP app (v0.6.18+) — § Desktop app below
 ```
 
 - **`--serve` (v0.6.16+)**: a program with a `serve on` block MUST be built with `--serve` (the
-  build refuses otherwise: without it the binary would fail at run time). `--bind` is required —
-  a distributable says where it listens (`127.0.0.1` local app, `0.0.0.0` public); `--port`,
+  build refuses otherwise: without it the binary would fail at run time). A bind is required —
+  a distributable says where it listens (`127.0.0.1` local app, `0.0.0.0` public): `--bind`, or
+  the serve block's `bind "…"` clause (v0.6.18+; the flag wins; neither → exit 2); `--port`,
   `--domain`, `--tls-auto`, `--tls-cert`/`--tls-key`, `--secure` are the `synsema serve` knobs,
   baked in (TLS files are read from disk at start). The serve block's **static mounts are bundled
   automatically** (`static "/x" from "./public"` → `public/` goes in; a missing dir is a build
@@ -169,6 +171,47 @@ service worker, icons, the push routes). Deployment-wise only two things matter:
 One binary, the whole app (v0.6.16+): `synsema build app.syn -o app --serve --bind 0.0.0.0 --port 8080
 [--domain … --tls-auto …]` — the serve block's `public/` mount and the templates travel inside the
 file. Everything else: [serve.md](serve.md) § Installable app (PWA).
+
+## Desktop app — one binary, browser app window, icon, no console (engine v0.6.18+)
+
+The same server binary, built for double-click. No native layer, no webview, no tray. Verified live
+on Windows (Edge app window, icon read by the shell, self-quit on window close); macOS by CI on Apple
+Silicon (the appended bundle keeps the linker's ad-hoc signature valid — `open Name.app` serves and
+stops); Linux layout + `install.sh` by tests.
+
+```sh
+synsema build desk.syn -o desk --serve --no-console --icon icon.svg          # Windows: desk.exe (icon, no console window)
+synsema build desk.syn -o desk --serve --icon icon.svg --bundle              # macOS host: desk.app/ (LSUIElement agent + .icns)
+synsema build desk.syn -o desk --serve --icon icon.svg --bundle --name "My App" --id com.example.myapp
+synsema build desk.syn -o desk --serve --icon icon.svg --bundle --engine-binary ./synsema-linux-x86_64   # desk/ + .desktop + install.sh
+```
+
+- **Flags look at the ENGINE's format** (PE / Mach-O / ELF), never at the building host. `.exe` is
+  appended for a Windows engine when `-o` has no extension (any extension is kept). `--no-console`:
+  PE only (else exit 2); stdout/stderr are discarded, no panic — write your own log under
+  `file.write`. `--icon <svg|png|ico>`: PE → a `.rsrc` section merged with the engine's own
+  resources (GNU-built engines carry a manifest), 16/32/48/256 px; Mach-O/ELF → needs `--bundle`
+  (the icon lives in the bundle); an `.ico` with only BMP entries can't be rasterized for
+  macOS/Linux. `--bundle`: Mach-O → `Name.app/` (`Info.plist` with `LSUIElement`, `PkgInfo`,
+  `MacOS/<stem>`, `Resources/<stem>.icns`); ELF → `<stem>/` + `<stem>.desktop` (`Terminal=false`,
+  `Exec=__INSTALL_DIR__/…`) + PNG 256/512 + POSIX `install.sh` (`--uninstall` undoes; `~/.local`, no
+  root); PE → stated no-op. `--name`/`--id` only with `--bundle` (default id `dev.synsema.<stem>`);
+  `-o x.app` = `--bundle` on Mach-O. The `built …` line lists what was done; a stderr note says when
+  a Mac/Linux bundle was built on Windows (`chmod +x` on the target) or has no icon.
+- **The program** (full recipe in docs `41c-desktop`): `bind "127.0.0.1"` in the serve block (baked;
+  `--bind` wins); `require exec("cmd")` + `open` / `google-chrome` / `chromium` / `xdg-open`, and
+  `run(cmd, args)` inside `try … recover` to launch `msedge --app=URL` (Windows: `["/c", "start", "",
+  "msedge", "--app=" + url]` via `cmd`), `open -a "Google Chrome" --args --app=URL` (macOS),
+  `google-chrome --app=URL` (Linux) — branch on `platform()["os"]`; a `socket` route that counts
+  windows in `state_*` (`+1` on connect, `-1` on `{type: "close"}`, `state_set("last_close", now())`);
+  `cron_every(2, maybe_quit)` → `shutdown("window closed")` when `windows == 0` for > 3 s. The top
+  level continues after the serve block, so `open_window()` is called right after it.
+- **Honest limits:** fixed port (address in use dies silently under `--no-console` — pick an unusual
+  one); Edge/Chrome are single-instance (watch the socket, not the launcher process); Firefox = a
+  tab; no tray, no `.dmg`/`.msi`/AppImage (feed `--bundle`'s output to those tools); macOS downloads
+  without Developer ID hit Gatekeeper (right-click → Open ≤ 14, "Open Anyway" on 15; a locally built
+  `.app` has no quarantine); Explorer caches icons per file name (rebuild under a new name or restart
+  Explorer).
 
 ## `synsema daemon` vs systemd — pick ONE
 

@@ -471,6 +471,27 @@ serve on 8080
   the serve block's static mounts and the templates travel inside; served from the bundle before the
   disk. See [deploy.md](deploy.md) § `synsema build`.
 
+### Desktop app — `bind "127.0.0.1"` + `shutdown()` (engine v0.6.18+)
+
+- **`bind <expr>`** — a clause of the serve block: `bind "127.0.0.1"` (an IP or a host name,
+  evaluated at start). `synsema serve --bind` overrides it; no clause and no flag = `0.0.0.0`
+  (unchanged). Inside a `host` block: error (`bind belongs to the serve block`). `synsema build
+  --serve` bakes the literal — no `--bind` needed; neither → exit 2.
+- **`shutdown(reason?)`** — the ordered drain (same as Ctrl-C: listener closed, `503` on open
+  keep-alives, cron/agents stopped, grace `SYNSEMA_SHUTDOWN_GRACE`, `[serve] stopped`, exit 0) asked
+  from a route, a `socket` block, a cron job or an agent. Log: `[serve] shutdown requested by the
+  program: <reason>`. Idempotent. Error under `run` and before anything listens; a `secret` reason is
+  refused; **no capability**.
+- **The recipe** (verified live on Windows, `synsema serve` and the built `.exe` alike): open the
+  browser in app mode with `run()` under `exec` (`platform()["os"]` picks `cmd` / `open` /
+  `xdg-open`; each attempt in `try … recover`, first success wins), count windows in a `socket`
+  route (`state_incr("windows")` on connect, `state_incr("windows", -1)` + `state_set("last_close",
+  now())` on `{type: "close"}`), `cron_every(2, maybe_quit)` calls `shutdown("window closed")` when
+  `state_get("windows", 0) == 0 and now() - state_get("last_close", now()) > 3`. The top level
+  continues after the serve block, so `open_window()` goes right after it. A page's inline JS
+  (`new WebSocket("ws://127.0.0.1:PORT/ws")`) must sit inside `{ raw } … { end }` in the template.
+  Build flags: [deploy.md](deploy.md) § Desktop app.
+
 ### CORS — `cors "*"` / `cors "https://app.com"`
 
 For APIs called from a browser on a **different** origin, declare CORS:
