@@ -39,6 +39,7 @@ pub fn build(entries: &[(u32, Vec<u8>)]) -> Result<Vec<u8>, String> {
 }
 
 /// Las entradas `(tipo, datos)` de un `.icns` (para tests y verificación).
+#[cfg(test)]
 pub fn entries(icns: &[u8]) -> Result<Vec<([u8; 4], Vec<u8>)>, String> {
     if icns.len() < 8 || &icns[..4] != b"icns" {
         return Err("not an .icns file".to_string());

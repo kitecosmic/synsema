@@ -35,6 +35,8 @@ pub struct PeInfo {
     pub subsystem: u16,
     /// (RVA, size) del directorio de recursos (entrada 2).
     pub resource_dir: (u32, u32),
+    /// Nombres de las secciones (diagnóstico y tests).
+    #[allow(dead_code)]
     pub section_names: Vec<String>,
 }
 
@@ -470,8 +472,8 @@ pub fn ico_images(ico: &[u8]) -> Result<Vec<IconImage>, String> {
     Ok(out)
 }
 
-/// Un `.ico` mínimo (contenedor) a partir de imágenes PNG — para escribir el ícono también
-/// como archivo si hace falta (y para tests).
+/// Un `.ico` mínimo (contenedor) a partir de imágenes PNG (para tests).
+#[cfg(test)]
 pub fn ico_from_images(images: &[IconImage]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&0u16.to_le_bytes());

@@ -27,6 +27,7 @@ mod bundle_out;
 mod icns;
 mod init_templates;
 mod pe;
+mod stdio;
 mod synfide;
 mod update;
 mod code;
@@ -373,6 +374,8 @@ fn run_bundled(bundle: synsema_core::bundle::Bundle, program_args: Vec<String>) 
 }
 
 fn main() -> ExitCode {
+    // Antes del primer print: una salida sin lector nunca es un pánico (stdio.rs).
+    stdio::install_broken_pipe_guard();
     let mut args: Vec<String> = std::env::args().collect();
 
     // `--engine` como primer argumento: el CLI del motor, en cualquier binario (en uno
@@ -382,6 +385,9 @@ fn main() -> ExitCode {
     let engine_prefix = args.get(1).map(|a| a == "--engine").unwrap_or(false);
     if engine_prefix {
         args.remove(1);
+        // Un build `--no-console` (subsistema GUI) usado como CLI: que se vea en la consola
+        // del padre si la hay (cmd/PowerShell); sin consola padre no cambia nada.
+        stdio::attach_parent_console();
     } else {
         match std::env::current_exe()
             .map_err(|e| e.to_string())
