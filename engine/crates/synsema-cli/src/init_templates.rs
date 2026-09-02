@@ -367,8 +367,10 @@ require env("VAPID_PUBLIC_KEY")
 require env("VAPID_SUBJECT")
 require secret("VAPID_PRIVATE_KEY")
 -- Los push services a los que push_send() habla (deny-by-default: cada host se declara).
--- Chrome/Android → FCM, Edge → WNS, Firefox → Mozilla, Safari/iOS → Apple.
+-- Chrome/Android → FCM (dos dominios), Edge → WNS, Firefox → Mozilla, Safari/iOS → Apple.
+-- Un navegador nuevo = un host nuevo: el error de push_send dice exactamente cuál falta.
 require net("fcm.googleapis.com")
+require net("jmt17.google.com")
 require net("*.notify.windows.com")
 require net("updates.push.services.mozilla.com")
 require net("web.push.apple.com")
@@ -426,7 +428,15 @@ serve on 8080
                 when not r["gone"]
                     set kept to append(kept, sub)
             recover err
-                log "push dropped: " + err
+                -- Sólo se descarta una suscripción ROTA (claves/endpoint inválidos: el error
+                -- nombra "subscription"). Un push service no declarado (Capability not granted:
+                -- falta un `require net`) o un servicio inalcanzable es config o red del server,
+                -- no una suscripción muerta: se conserva y el log dice qué pasó.
+                when contains(err, "subscription")
+                    log "push dropped (broken subscription): " + err
+                otherwise
+                    log "push skipped, subscription kept: " + err
+                    set kept to append(kept, sub)
         state_set("push_subs", kept)
         give ok({"sent": sent, "kept": length(kept)})
 "#;
@@ -531,22 +541,25 @@ self.addEventListener("fetch", (e) => {
   const url = new URL(e.request.url);
   if (e.request.method !== "GET" || url.origin !== self.location.origin) return;
   if (url.pathname.startsWith("/api/")) {
-    // Red o nada: sin red el API responde 503 y la página lo dice.
+    // Red o nada: sin server alcanzable el API responde un 503 SINTÉTICO, marcado con
+    // X-Synsema-Offline para que la página lo distinga de un 503 real del server.
     e.respondWith(fetch(e.request).catch(() =>
-      new Response(JSON.stringify({ error: "offline" }), { status: 503, headers: { "Content-Type": "application/json" } })
+      new Response(JSON.stringify({ error: "offline" }), {
+        status: 503, headers: { "Content-Type": "application/json", "X-Synsema-Offline": "1" },
+      })
     ));
     return;
   }
   // Shell: lo cacheado responde ya; lo que llega bien por red reemplaza la copia para la
-  // próxima vez. Sin caché y sin red → error de red (la página lo dice).
-  e.respondWith(caches.open(CACHE).then(async (c) => {
-    const hit = await c.match(e.request);
-    const refresh = fetch(e.request).then((res) => {
-      if (res.ok) c.put(e.request, res.clone());
-      return res;
-    }).catch(() => hit || Response.error());
-    return hit || refresh;
-  }));
+  // próxima vez. El refresh va dentro de waitUntil: sin eso el navegador puede matar el
+  // worker apenas respondió y la revalidación se pierde. Sin caché y sin red → error de red.
+  const cache = caches.open(CACHE);
+  const refresh = fetch(e.request).then(async (res) => {
+    if (res.ok) { const c = await cache; await c.put(e.request, res.clone()); }
+    return res;
+  });
+  e.waitUntil(refresh.catch(() => {}));
+  e.respondWith(cache.then((c) => c.match(e.request)).then((hit) => hit || refresh.catch(() => Response.error())));
 });
 
 // Push: push_send() manda JSON si le pasás un map ({title, body, url, tag}); texto si le
@@ -620,25 +633,32 @@ const standalone = window.matchMedia("(display-mode: standalone)").matches || na
 if (isIOS && !standalone) $("ios-hint").hidden = false;
 
 // 3. Estado honesto. navigator.onLine sólo sabe si hay red; que el SERVER responda se
-//    prueba con /api/ping sin caché (un server caído con red andando es "online" para el
-//    navegador).
+//    prueba con /api/ping sin caché. Con el service worker activo un server caído no llega
+//    como error de red sino como el 503 sintético del worker (X-Synsema-Offline: 1): se
+//    distingue de un 503 real. Se re-prueba al volver del segundo plano y tras un API fallido.
 const status = async () => {
   const where = standalone ? "Installed · " : "";
   if (!navigator.onLine) { $("status").textContent = where + "offline — the shell works, the API does not"; return; }
   try {
     const r = await fetch("/api/ping", { cache: "no-store" });
-    $("status").textContent = where + (r.ok ? "online, server up" : "online, server answered " + r.status);
+    if (r.headers.get("X-Synsema-Offline") === "1") $("status").textContent = where + "online, but the server is unreachable";
+    else $("status").textContent = where + (r.ok ? "online, server up" : "online, server answered " + r.status);
   } catch (_) {
     $("status").textContent = where + "online, but the server is unreachable";
   }
 };
 window.addEventListener("online", status);
 window.addEventListener("offline", status);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") status(); });
 status();
 
 // 4. El API.
 $("ping").onclick = async () => {
-  try { const r = await fetch("/api/ping", { cache: "no-store" }); say(await r.text()); } catch (e) { say("offline: " + explain(e)); }
+  try {
+    const r = await fetch("/api/ping", { cache: "no-store" });
+    say(await r.text());
+    if (!r.ok) status();
+  } catch (e) { say("offline: " + explain(e)); status(); }
 };
 
 // 5. Push: la clave pública VAPID viene del server; la suscripción vuelve al server.
@@ -656,10 +676,16 @@ function sameKey(a, b) {
 async function activeWorker() {
   const reg = await navigator.serviceWorker.ready;
   const sw = reg.active || reg.waiting || reg.installing;
-  if (sw && sw.state !== "activated") {
-    await new Promise((ok) => sw.addEventListener("statechange", () => { if (sw.state === "activated") ok(); }));
-  }
-  return reg;
+  if (!sw || sw.state === "activated") return reg;
+  // Esperar al worker ACTIVO, con tope: si un sw.js nuevo lo reemplazó ("redundant") o no
+  // activa en 10 s, no se cuelga el botón — se vuelve a pedir `ready` o se explica.
+  await new Promise((ok, fail) => {
+    const timer = setTimeout(() => fail(new Error("the service worker did not activate in 10 s — reload the page and try again")), 10000);
+    sw.addEventListener("statechange", () => {
+      if (sw.state === "activated" || sw.state === "redundant") { clearTimeout(timer); ok(); }
+    });
+  });
+  return navigator.serviceWorker.ready;
 }
 async function subscribe(reg, key) {
   const existing = await reg.pushManager.getSubscription();
@@ -743,12 +769,21 @@ pub const PWA_BADGE_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" view
 /// derivados de `icon.svg` y los genera `cmd_init` (ver `pwa_icons`).
 pub const PWA_FILES: [InitFile; 9] = [
     // `past`: los sha256 (forma LF) de cada versión publicada — v0.6.15 fue la primera.
-    InitFile { name: "app.syn", content: PWA_APP_SYN, past: &["b35f3e66902c4380aececfcf717025d97f475d8f76226e0f345fc1266c5ec2ef"] },
+    InitFile { name: "app.syn", content: PWA_APP_SYN, past: &[
+        "b35f3e66902c4380aececfcf717025d97f475d8f76226e0f345fc1266c5ec2ef", // v0.6.15
+        "c871f31d0cebbda647c7020ce3416ec3b9f25f452cf7ab0c0574ef756859afe4", // v0.6.16
+    ] },
     InitFile { name: "push_keys.syn", content: PWA_PUSH_KEYS_SYN, past: &[] },
     InitFile { name: "index.html", content: PWA_INDEX_HTML, past: &[] },
     InitFile { name: "public/manifest.webmanifest", content: PWA_MANIFEST, past: &["c48e191fff4cd83fb8231658dc88ad185abfb592d9614c1cb3983345bfe684ad"] },
-    InitFile { name: "public/sw.js", content: PWA_SW_JS, past: &["4aa649614a3aa18b32c2b16668b467be1c46220ff3f39e9c5bcd1bb70fbf64c1"] },
-    InitFile { name: "public/app.js", content: PWA_APP_JS, past: &["94335092a403265f2e954afc1c2d80ad254e343c1c3cffae23dd3521244d1314"] },
+    InitFile { name: "public/sw.js", content: PWA_SW_JS, past: &[
+        "4aa649614a3aa18b32c2b16668b467be1c46220ff3f39e9c5bcd1bb70fbf64c1", // v0.6.15
+        "d8ea3c6b66672616782530e81c3075d9329dcc3e1824cdcff6bb6db97c5f117f", // v0.6.16
+    ] },
+    InitFile { name: "public/app.js", content: PWA_APP_JS, past: &[
+        "94335092a403265f2e954afc1c2d80ad254e343c1c3cffae23dd3521244d1314", // v0.6.15
+        "c6322257eb20df92ef0d615ea04238de16f11566d6ee6e64971afe669436646f", // v0.6.16
+    ] },
     InitFile { name: "public/icon.svg", content: PWA_ICON_SVG, past: &[] },
     InitFile { name: "public/icon-maskable.svg", content: PWA_ICON_MASKABLE_SVG, past: &[] },
     InitFile { name: "public/badge.svg", content: PWA_BADGE_SVG, past: &[] },
