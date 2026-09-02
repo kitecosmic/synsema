@@ -8,6 +8,13 @@
 //! El bundle es cerrado: un `use` que el resolutor estático no puede decidir es un error
 //! del build, no un "lo busco en disco después". Sin compresión, sin strip: el tamaño es
 //! el del motor.
+//!
+//! Escritorio (specs/build-serve-desktop.md): `--serve` hornea los settings de despliegue
+//! (`manifest.serve`, bind explícito por `--bind` o por la cláusula `bind "…"`); `.exe`
+//! automático si el MOTOR es PE; `--no-console` e `--icon` operan sobre la copia del motor
+//! ANTES de anexar el bundle (`pe.rs`); `--bundle` escribe el `.app` (Mach-O) o el directorio
+//! con `.desktop` + `install.sh` (ELF) (`bundle_out.rs`, `icns.rs`). Todo mira el formato del
+//! artefacto, no el host que construye.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -15,9 +22,41 @@ use std::process::ExitCode;
 use synsema_core::bundle::{self, Bundle, BundleMode, Manifest, ServeSettings};
 use synsema_core::templates::{program_closure_with, template_closure};
 
-use crate::HostFlags;
+use crate::bundle_out::{self, EngineFormat};
+use crate::{icns, pe, HostFlags};
 
-const USAGE_BUILD: &str = "uso: synsema build <main.syn> -o <salida> [--include <archivo|dir|patrón>]... [--sandbox | --cap-set <list>] [--profile native|pure] [--engine-binary <ruta>]";
+const USAGE_BUILD: &str = "uso: synsema build <main.syn> -o <salida> [--include <archivo|dir|patrón>]... [--sandbox | --cap-set <list>] [--profile native|pure] [--engine-binary <ruta>] [--serve [--bind <addr>] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--secure]] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <nombre>] [--id <com.ejemplo.app>]]";
+
+/// Los flags de escritorio (tanda escritorio, specs/build-serve-desktop.md §3.6–§3.9). Todos
+/// miran el FORMATO DEL MOTOR donante (PE / Mach-O / ELF), no el host que construye.
+#[derive(Debug, Clone, Default)]
+pub struct DesktopOptions {
+    /// `--no-console`: PE subsistema CONSOLE → GUI (sin ventana de consola).
+    pub no_console: bool,
+    /// `--icon <svg|png|ico>`: ícono del `.exe` (sección `.rsrc`), del `.app` (`.icns`) o del
+    /// lanzador Linux (PNG 256/512).
+    pub icon: Option<String>,
+    /// `--bundle`: Mach-O → `Nombre.app/`, ELF → `<stem>/` + `install.sh`, PE → nada que hacer.
+    pub bundle: bool,
+    /// `--name`: nombre visible del bundle (default: el stem de `-o`).
+    pub name: Option<String>,
+    /// `--id`: identificador inverso (default `dev.synsema.<stem>`).
+    pub id: Option<String>,
+}
+
+/// Lo que `build()` produjo, para la línea `built …`.
+pub struct BuildOutcome {
+    /// Ruta final: el binario, el `.app` o el directorio del bundle.
+    pub out: PathBuf,
+    pub files: usize,
+    pub bytes: u64,
+    /// Los settings de serve HORNEADOS (con el bind ya resuelto: `--bind` o la cláusula).
+    pub serve: Option<ServeSettings>,
+    /// Fragmentos de escritorio para la línea `built …` (`no-console`, `icon …`, `bundle …`).
+    pub desktop: Vec<String>,
+    /// Avisos (stderr) que no son errores: `+x` desde Windows, bundle sin ícono.
+    pub notes: Vec<String>,
+}
 
 pub fn cmd_build(host: HostFlags) -> ExitCode {
     let mut out: Option<String> = None;
@@ -27,6 +66,7 @@ pub fn cmd_build(host: HostFlags) -> ExitCode {
     let mut serve = false;
     let mut serve_secure = false;
     let mut serve_flags: Vec<(String, String)> = Vec::new();
+    let mut desktop = DesktopOptions::default();
     let rest = host.rest.clone();
     let mut i = 0;
     while i < rest.len() {
@@ -81,6 +121,27 @@ pub fn cmd_build(host: HostFlags) -> ExitCode {
                     }
                 }
             }
+            // Escritorio (§3.6–§3.9): cirugía sobre la copia del motor y layouts de bundle.
+            "--no-console" => desktop.no_console = true,
+            "--bundle" => desktop.bundle = true,
+            "--icon" | "--name" | "--id" => {
+                let flag = rest[i].clone();
+                i += 1;
+                match rest.get(i) {
+                    Some(v) if !v.starts_with('-') => match flag.as_str() {
+                        "--icon" => desktop.icon = Some(v.clone()),
+                        "--name" => desktop.name = Some(v.clone()),
+                        _ => desktop.id = Some(v.clone()),
+                    },
+                    _ => {
+                        eprintln!("synsema build: {} requires a value", flag);
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            p if p.starts_with("--icon=") => desktop.icon = Some(p.trim_start_matches("--icon=").to_string()),
+            p if p.starts_with("--name=") => desktop.name = Some(p.trim_start_matches("--name=").to_string()),
+            p if p.starts_with("--id=") => desktop.id = Some(p.trim_start_matches("--id=").to_string()),
             p if p.starts_with('-') => {
                 eprintln!("synsema build: unknown flag '{}'\n{}", p, USAGE_BUILD);
                 return ExitCode::from(2);
@@ -144,28 +205,42 @@ pub fn cmd_build(host: HostFlags) -> ExitCode {
         None
     };
 
-    match build(&main, &out, &includes, engine_binary.as_deref(), ceiling_text, &profile, serve_settings.clone()) {
-        Ok((n, bytes)) => {
-            match &serve_settings {
-                Some(s) => {
-                    let mut how = format!("serve · bind {}", s.bind);
-                    if let Some(p) = s.port {
-                        how.push_str(&format!(" · port {}", p));
-                    }
-                    if let Some(d) = &s.domains {
-                        how.push_str(&format!(" · domain {}", d.join(",")));
-                    }
-                    if s.tls_auto.is_some() {
-                        how.push_str(" · tls auto");
-                    } else if s.tls_cert.is_some() {
-                        how.push_str(" · tls cert");
-                    }
-                    if s.secure {
-                        how.push_str(" · secure");
-                    }
-                    println!("built {} ({} files, {} bytes) · {}", out, n, bytes, how);
+    // `--name`/`--id` describen un bundle: sin `--bundle` no significan nada (fail-loud).
+    if (desktop.name.is_some() || desktop.id.is_some()) && !desktop.bundle && !out.to_ascii_lowercase().ends_with(".app") {
+        let flag = if desktop.name.is_some() { "--name" } else { "--id" };
+        eprintln!("synsema build: {} applies to --bundle builds (add --bundle)", flag);
+        return ExitCode::from(2);
+    }
+
+    match build(&main, &out, &includes, engine_binary.as_deref(), ceiling_text, &profile, serve_settings, &desktop) {
+        Ok(r) => {
+            let mut how: Vec<String> = Vec::new();
+            if let Some(s) = &r.serve {
+                let mut h = format!("serve · bind {}", s.bind);
+                if let Some(p) = s.port {
+                    h.push_str(&format!(" · port {}", p));
                 }
-                None => println!("built {} ({} files, {} bytes)", out, n, bytes),
+                if let Some(d) = &s.domains {
+                    h.push_str(&format!(" · domain {}", d.join(",")));
+                }
+                if s.tls_auto.is_some() {
+                    h.push_str(" · tls auto");
+                } else if s.tls_cert.is_some() {
+                    h.push_str(" · tls cert");
+                }
+                if s.secure {
+                    h.push_str(" · secure");
+                }
+                how.push(h);
+            }
+            how.extend(r.desktop.iter().cloned());
+            if how.is_empty() {
+                println!("built {} ({} files, {} bytes)", r.out.display(), r.files, r.bytes);
+            } else {
+                println!("built {} ({} files, {} bytes) · {}", r.out.display(), r.files, r.bytes, how.join(" · "));
+            }
+            for n in &r.notes {
+                eprintln!("synsema build: note: {}", n);
             }
             ExitCode::SUCCESS
         }
@@ -205,9 +280,8 @@ fn serve_settings_from_flags(flags: &[(String, String)], secure: bool) -> Result
             other => return Err(format!("unknown serve flag '{}'", other)),
         }
     }
-    if s.bind.is_empty() {
-        return Err("--serve needs --bind: a built server must say where it listens (--bind 127.0.0.1 for a local app, --bind 0.0.0.0 for a public one)".to_string());
-    }
+    // `bind` vacío acá es válido: el build lo toma de la cláusula `bind "…"` del serve block
+    // (literal) y sólo si tampoco está ahí falla — ver `build()`.
     let ov = synsema_runtime::serve::ServeOverrides {
         port: s.port,
         domains: s.domains.clone(),
@@ -228,8 +302,9 @@ fn build(
     engine_binary: Option<&str>,
     ceiling: Option<String>,
     profile: &str,
-    serve: Option<ServeSettings>,
-) -> Result<(usize, u64), String> {
+    mut serve: Option<ServeSettings>,
+    desktop: &DesktopOptions,
+) -> Result<BuildOutcome, String> {
     let main_path = Path::new(main);
     if !main_path.is_file() {
         return Err(format!("cannot read '{}'", main));
@@ -253,7 +328,19 @@ fn build(
     std::env::set_current_dir(&root).map_err(|e| format!("cannot enter {}: {}", root.display(), e))?;
     let result = collect(&main_name, includes, serve.is_some());
     let _ = std::env::set_current_dir(&prev_cwd);
-    let entries = result?;
+    let (entries, bind_lit) = result?;
+    // El bind horneado: `--bind` gana; si no vino, la cláusula `bind "…"` literal del serve
+    // block; sin ninguna de las dos, un distribuible no adivina en qué interfaz escucha.
+    if let Some(s) = serve.as_mut() {
+        if s.bind.is_empty() {
+            match bind_lit {
+                Some(b) => s.bind = b,
+                None => {
+                    return Err("--serve needs to know where the server listens: pass --bind 127.0.0.1 (local app) or --bind 0.0.0.0 (public), or add `bind \"127.0.0.1\"` to the serve block".to_string())
+                }
+            }
+        }
+    }
 
     let engine_path: PathBuf = match engine_binary {
         Some(p) => PathBuf::from(p),
@@ -265,8 +352,80 @@ fn build(
             engine_path.display()
         ));
     }
-    let engine_bytes = std::fs::read(&engine_path)
+    let mut engine_bytes = std::fs::read(&engine_path)
         .map_err(|e| format!("cannot read the engine binary {}: {}", engine_path.display(), e))?;
+    // Un solo sitio decide el formato del ARTEFACTO; `.exe`, `--no-console`, `--icon` y
+    // `--bundle` lo consultan (un donante Linux construido desde Windows no recibe `.exe`).
+    let format = bundle_out::engine_format(&engine_bytes);
+
+    // Salida: `.exe` automático si el motor es PE y `-o` no tiene extensión; `-o x.app` sobre
+    // Mach-O es sinónimo de `--bundle` (y un error claro sobre cualquier otro formato).
+    let mut out_path = PathBuf::from(out);
+    let mut want_bundle = desktop.bundle;
+    let is_app = out_path.extension().is_some_and(|e| e.eq_ignore_ascii_case("app"));
+    if is_app {
+        if format != EngineFormat::MachO {
+            return Err(format!(
+                "-o '{}' ends with .app but the engine is {}; .app bundles are for macOS (Mach-O) engines",
+                out,
+                format.describe()
+            ));
+        }
+        want_bundle = true;
+        out_path.set_extension("");
+    } else if format == EngineFormat::Pe && out_path.extension().is_none() {
+        out_path.set_extension("exe");
+    }
+    let stem = out_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| format!("-o '{}' has no file name", out))?;
+
+    // Validaciones de escritorio contra el formato del motor: antes de escribir nada.
+    if desktop.no_console && format != EngineFormat::Pe {
+        return Err(format!("--no-console applies to Windows executables (PE); the engine is {}", format.describe()));
+    }
+    if want_bundle && format == EngineFormat::Unknown {
+        return Err(format!("--bundle: the engine is {}", format.describe()));
+    }
+    let icon = match &desktop.icon {
+        Some(p) => {
+            match format {
+                EngineFormat::Unknown => return Err(format!("--icon: the engine is {}", format.describe())),
+                EngineFormat::MachO | EngineFormat::Elf if !want_bundle => {
+                    return Err("--icon on a macOS/Linux engine needs --bundle (the icon lives in the .app / the launcher entry, not in the binary)".to_string())
+                }
+                _ => {}
+            }
+            Some(load_icon(p)?)
+        }
+        None => None,
+    };
+    if let Some(n) = &desktop.name {
+        if n.trim().is_empty() || n.contains('/') || n.contains('\\') {
+            return Err("--name must be a non-empty name without path separators".to_string());
+        }
+    }
+    if let Some(id) = &desktop.id {
+        if id.trim().is_empty() || id.contains(char::is_whitespace) {
+            return Err("--id must be a reverse-DNS identifier like com.example.app".to_string());
+        }
+    }
+
+    let mut how: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    // Cirugía PE sobre la copia del motor, ANTES de anexar el bundle (el sha del payload no
+    // cubre el motor ni tiene por qué).
+    if desktop.no_console {
+        pe::set_subsystem_gui(&mut engine_bytes)?;
+        how.push("no-console".to_string());
+    }
+    if let (Some(ic), EngineFormat::Pe) = (&icon, format) {
+        let images = ic.pe_images()?;
+        pe::add_icon(&mut engine_bytes, &images)?;
+        how.push(format!("icon {}", images.iter().map(|i| i.size.to_string()).collect::<Vec<_>>().join("/")));
+    }
 
     let manifest = Manifest {
         format: bundle::FORMAT,
@@ -276,7 +435,7 @@ fn build(
         profile: profile.to_string(),
         built_at: chrono_now(),
         mode: if serve.is_some() { BundleMode::Serve } else { BundleMode::Run },
-        serve,
+        serve: serve.clone(),
     };
     let n = entries.len();
     let b = Bundle::new(manifest, entries)?;
@@ -284,12 +443,91 @@ fn build(
     let base = file.len() as u64;
     file.extend_from_slice(&b.serialize(base));
 
-    // Escritura: temp al lado + rename (mismo patrón que `synsema update`), 0o755 en Unix.
-    let out_path = Path::new(out);
-    let dir = out_path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
+    let dir = out_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
+    let version = crate::update::current_version();
+    let display_name = desktop.name.clone().unwrap_or_else(|| stem.clone());
+    let bundle_id = desktop.id.clone().unwrap_or_else(|| default_bundle_id(&stem));
+    let final_path = match (want_bundle, format) {
+        (true, EngineFormat::MachO) => {
+            let icns = match &icon {
+                Some(ic) => Some(icns::build(&ic.pngs(&icns::ICNS_TYPES.iter().map(|(s, _)| *s).collect::<Vec<_>>())?)?),
+                None => None,
+            };
+            let spec = bundle_out::BundleSpec {
+                display_name: &display_name,
+                bin_name: &stem,
+                bundle_id: &bundle_id,
+                version: &version,
+                binary: &file,
+                icns: icns.as_deref(),
+                pngs: &[],
+            };
+            let app = bundle_out::write_macos_app(&dir, &spec)?;
+            if icns.is_some() {
+                how.push("icon icns 16…1024".to_string());
+            } else {
+                notes.push("no --icon: the .app has no icon (Finder shows the generic one)".to_string());
+            }
+            how.push(format!("bundle .app · id {}", bundle_id));
+            if cfg!(windows) {
+                notes.push(format!(
+                    "built on Windows, where the +x bit does not exist: on the Mac run chmod +x \"{}/Contents/MacOS/{}\"",
+                    app.display(),
+                    stem
+                ));
+            }
+            app
+        }
+        (true, EngineFormat::Elf) => {
+            let pngs = match &icon {
+                Some(ic) => ic.pngs(&[256, 512])?,
+                None => Vec::new(),
+            };
+            let spec = bundle_out::BundleSpec {
+                display_name: &display_name,
+                bin_name: &stem,
+                bundle_id: &bundle_id,
+                version: &version,
+                binary: &file,
+                icns: None,
+                pngs: &pngs,
+            };
+            let out_dir = bundle_out::write_linux_dir(&dir, &spec)?;
+            if pngs.is_empty() {
+                notes.push("no --icon: the launcher entry has no icon".to_string());
+            } else {
+                how.push("icon png 256/512".to_string());
+            }
+            how.push(format!("bundle dir + install.sh · id {}", bundle_id));
+            if cfg!(windows) {
+                notes.push(format!(
+                    "built on Windows, where the +x bit does not exist: on Linux run chmod +x \"{d}/{b}\" \"{d}/install.sh\"",
+                    d = out_dir.display(),
+                    b = stem
+                ));
+            }
+            out_dir
+        }
+        _ => {
+            if want_bundle {
+                how.push("bundle: none needed on Windows".to_string());
+            }
+            write_binary(&dir, &out_path, &file)?;
+            out_path.clone()
+        }
+    };
+    Ok(BuildOutcome { out: final_path, files: n, bytes: file.len() as u64, serve, desktop: how, notes })
+}
+
+/// Escritura del binario: temp al lado + rename (mismo patrón que `synsema update`), 0o755 en Unix.
+fn write_binary(dir: &Path, out_path: &Path, file: &[u8]) -> Result<(), String> {
     let tmp = dir.join(format!(".synsema-build-{}.tmp", std::process::id()));
-    std::fs::write(&tmp, &file).map_err(|e| format!("cannot write {}: {}", tmp.display(), e))?;
+    std::fs::write(&tmp, file).map_err(|e| format!("cannot write {}: {}", tmp.display(), e))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -299,13 +537,101 @@ fn build(
     std::fs::rename(&tmp, out_path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("cannot write {}: {}", out_path.display(), e)
-    })?;
-    Ok((n, file.len() as u64))
+    })
+}
+
+/// `dev.synsema.<stem>` con el stem saneado a `[A-Za-z0-9.-]` (documentado como default).
+fn default_bundle_id(stem: &str) -> String {
+    let safe: String = stem
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '-' })
+        .collect();
+    format!("dev.synsema.{}", safe)
+}
+
+/// La fuente del ícono (`--icon`): un SVG (se rasteriza a cada lado con el stack embebido),
+/// un PNG (se re-escala) o un `.ico` (sus entradas tal cual para el PE; para `.icns`/Linux se
+/// toma su PNG más grande y se re-escala — si sólo trae BMP, se dice).
+pub enum IconSource {
+    Svg(String),
+    Png(Vec<u8>),
+    Ico(Vec<pe::IconImage>),
+}
+
+const PNG_SIG: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+impl IconSource {
+    /// PNGs `(lado, bytes)` cuadrados para cada lado pedido.
+    pub fn pngs(&self, sides: &[u32]) -> Result<Vec<(u32, Vec<u8>)>, String> {
+        let mut out = Vec::with_capacity(sides.len());
+        match self {
+            IconSource::Svg(svg) => {
+                for &s in sides {
+                    let png = synsema_stdlib::raster::render_svg_png(svg, s, s).map_err(|e| format!("--icon: {}", e))?;
+                    out.push((s, png));
+                }
+            }
+            IconSource::Png(png) => {
+                for &s in sides {
+                    let p = synsema_stdlib::raster::resize_png(png, s).map_err(|e| format!("--icon: {}", e))?;
+                    out.push((s, p));
+                }
+            }
+            IconSource::Ico(images) => {
+                let best = images
+                    .iter()
+                    .filter(|i| i.bytes.starts_with(PNG_SIG))
+                    .max_by_key(|i| i.size)
+                    .ok_or_else(|| "--icon: the .ico has no PNG image (only BMP entries); use an .svg or .png so the icon can be rasterized for this platform".to_string())?;
+                for &s in sides {
+                    let p = synsema_stdlib::raster::resize_png(&best.bytes, s).map_err(|e| format!("--icon: {}", e))?;
+                    out.push((s, p));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Las imágenes del recurso PE: 16/32/48/256 desde SVG/PNG, o las entradas del `.ico`.
+    pub fn pe_images(&self) -> Result<Vec<pe::IconImage>, String> {
+        match self {
+            IconSource::Ico(images) => Ok(images.clone()),
+            _ => Ok(self
+                .pngs(&[16, 32, 48, 256])?
+                .into_iter()
+                .map(|(size, bytes)| pe::IconImage { size, bytes })
+                .collect()),
+        }
+    }
+}
+
+/// Lee `--icon` por extensión (`.svg`, `.png`, `.ico`); cualquier otra cosa es un error claro.
+pub fn load_icon(path: &str) -> Result<IconSource, String> {
+    let ext = Path::new(path)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let bytes = std::fs::read(path).map_err(|e| format!("--icon: cannot read '{}': {}", path, e))?;
+    match ext.as_str() {
+        "svg" => {
+            let svg = String::from_utf8(bytes).map_err(|_| format!("--icon: '{}' is not UTF-8 text", path))?;
+            Ok(IconSource::Svg(svg))
+        }
+        "png" => {
+            if !bytes.starts_with(PNG_SIG) {
+                return Err(format!("--icon: '{}' is not a PNG file", path));
+            }
+            Ok(IconSource::Png(bytes))
+        }
+        "ico" => Ok(IconSource::Ico(pe::ico_images(&bytes)?)),
+        _ => Err(format!("--icon accepts .svg, .png or .ico, got '{}'", path)),
+    }
 }
 
 /// Lee el programa principal, su clausura de `use` y templates, y los `--include`.
 /// Todos los nombres relativos a la raíz (= cwd durante la recolección).
-fn collect(main_name: &str, includes: &[String], serve_mode: bool) -> Result<Vec<(String, Vec<u8>)>, String> {
+/// Devuelve las entradas del bundle y el `bind "…"` literal del serve block (si hay).
+fn collect(main_name: &str, includes: &[String], serve_mode: bool) -> Result<(Vec<(String, Vec<u8>)>, Option<String>), String> {
     let source = std::fs::read_to_string(main_name).map_err(|e| format!("cannot read '{}': {}", main_name, e))?;
     let program = synsema_core::parser::parse_source(&source, main_name).map_err(|e| e.to_string())?;
     // Un programa con `serve on` sólo sirve bajo el runtime de serve: sin `--serve` el binario
@@ -313,10 +639,11 @@ fn collect(main_name: &str, includes: &[String], serve_mode: bool) -> Result<Vec
     // se dice acá, en el build.
     if synsema_core::route_meta::has_serve_block(&program) && !serve_mode {
         return Err(format!(
-            "'{}' has a serve block; pass --serve --bind <addr> to build a server binary",
+            "'{}' has a serve block; pass --serve (and --bind <addr>, or a `bind \"…\"` clause) to build a server binary",
             main_name
         ));
     }
+    let bind_lit = if serve_mode { synsema_core::route_meta::serve_bind_literal(&program)? } else { None };
     // Los mounts estáticos del serve (`static "/x" from "./dir"`) viajan dentro del binario:
     // el server los sirve del bundle antes que del disco. Un directorio que falta es un error
     // del build, no un 404 en producción.
@@ -373,7 +700,7 @@ fn collect(main_name: &str, includes: &[String], serve_mode: bool) -> Result<Vec
             return Err(format!("--include '{}' matched nothing", inc));
         }
     }
-    Ok(entries)
+    Ok((entries, bind_lit))
 }
 
 /// `--include`: un archivo, un directorio (recursivo) o un patrón `*`/`?` de UN nivel

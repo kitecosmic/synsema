@@ -299,6 +299,8 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     // Web Push: cifrado/VAPID puros; el POST al push service necesita sockets → en wasm
     // `push_send` falla con el error claro del build sin `native` (como oidc_verify).
     synsema_stdlib::webpush::register_webpush_builtins(interp, caps.clone());
+    // `platform()` existe también acá, con la verdad del host: `{os: "wasm", arch: "wasm32"}`.
+    synsema_stdlib::platform::register_platform_builtin(interp, "wasm", "wasm32");
     synsema_stdlib::blockchain::register_blockchain_builtins(interp, caps.clone());
     synsema_stdlib::spend::register_spend_builtins(interp, caps.clone());
     // Respuesta + vocabulario content() (respond.rs, puro): ok/created/…/page/heading/

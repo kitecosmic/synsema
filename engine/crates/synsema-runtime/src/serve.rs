@@ -2240,6 +2240,7 @@ fn make_serve_hook(
             tls_auto,
             tls_auto_email_n,
             domain_n,
+            bind_n,
             hosts_n,
             mounts_n,
         ) = match &node.kind {
@@ -2263,6 +2264,7 @@ fn make_serve_hook(
                 tls_auto,
                 tls_auto_email,
                 domain,
+                bind,
                 hosts,
                 mounts,
             } => (
@@ -2285,6 +2287,7 @@ fn make_serve_hook(
                 *tls_auto,
                 tls_auto_email.as_deref(),
                 domain.as_deref(),
+                bind.as_deref(),
                 hosts,
                 mounts,
             ),
@@ -2319,8 +2322,23 @@ fn make_serve_hook(
                 port_str
             ))));
         }
-        // Dirección de bind (precedencia: --bind > default 0.0.0.0).
-        let bind_addr: String = overrides.bind.clone().unwrap_or_else(|| "0.0.0.0".to_string());
+        // Dirección de bind (precedencia: --bind > cláusula `bind "…"` del archivo > 0.0.0.0).
+        let bind_addr: String = match (&overrides.bind, bind_n) {
+            (Some(b), _) => b.clone(),
+            (None, Some(n)) => {
+                let v = interp.eval(n, env)?;
+                match &v {
+                    SynValue::Text(t) if !t.trim().is_empty() => t.trim().to_string(),
+                    other => {
+                        return Err(Control::Error(RuntimeError::new(format!(
+                            "serve `bind` must be a non-empty text (an IP or a host name), got {}",
+                            other
+                        ))))
+                    }
+                }
+            }
+            (None, None) => "0.0.0.0".to_string(),
+        };
 
         // -- max_body / max_streams --
         let max_body = match max_body_n {
@@ -3075,12 +3093,13 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
             };
             arm_cron(&cron, env);
             println!("Serving {} cron job(s). Press Ctrl+C to stop.", n_jobs);
-            // Bloquea para siempre (como el join de los servers): los hilos de los
-            // jobs trabajan; este hilo espera PARKED (cero CPU) hasta que maten el
-            // proceso (Ctrl+C). Los wakeups espurios de park() sólo re-parkean.
-            loop {
-                std::thread::park();
-            }
+            // Bloquea (cero CPU) mientras los hilos de los jobs trabajan, hasta que maten el
+            // proceso (Ctrl+C) o el programa pida `shutdown()` desde un job: entonces se
+            // cancelan los jobs y se sale con 0, como el drain de un server.
+            synsema_stdlib::server::park_cron_only();
+            cron.sched.cancel_all();
+            eprintln!("[serve] stopped");
+            return RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() };
         }
         // Sin server ni jobs: resultado normal (un programa serve sin bloque serve válido).
         return match r {
@@ -3118,6 +3137,8 @@ pub fn run_serve_program_with_overrides(
     let src = source.to_string();
     let fname = filename.to_string();
     set_serve_ceiling(overrides.ceiling.clone());
+    // Desde acá `shutdown()` tiene sentido (bajo `run` es un error claro).
+    synsema_stdlib::server::mark_under_serve();
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || serve_inner(&src, &fname, secure, overrides))

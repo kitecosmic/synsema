@@ -338,10 +338,24 @@ fn build_serve_flags_are_validated_at_build_time() {
     let (code, _, err) = synsema(&dir, &["build", "app.syn", "-o", o]);
     assert_eq!(code, 2, "{}", err);
     assert!(err.contains("has a serve block; pass --serve"), "{}", err);
-    // --serve sin --bind: un distribuible no adivina la interfaz.
+    // --serve sin --bind ni cláusula `bind`: un distribuible no adivina la interfaz.
     let (code, _, err) = synsema(&dir, &["build", "app.syn", "-o", o, "--serve"]);
     assert_eq!(code, 2, "{}", err);
-    assert!(err.contains("--serve needs --bind"), "{}", err);
+    assert!(err.contains("--serve needs to know where the server listens"), "{}", err);
+    // Con la cláusula `bind "127.0.0.1"` en el archivo, --bind ya no hace falta: se hornea esa.
+    let src = std::fs::read_to_string(dir.join("app.syn")).unwrap();
+    std::fs::write(dir.join("app.syn"), src.replace("serve on", "serve on").replacen(
+        &format!("serve on {}\n", port),
+        &format!("serve on {}\n    bind \"127.0.0.1\"\n", port),
+        1,
+    )).unwrap();
+    let (code, stdout, err) = synsema(&dir, &["build", "app.syn", "-o", o, "--serve"]);
+    assert_eq!(code, 0, "{}\n{}", stdout, err);
+    assert!(stdout.contains("serve · bind 127.0.0.1"), "el bind de la cláusula queda horneado: {}", stdout);
+    // --bind le gana a la cláusula.
+    let (code, stdout, err) = synsema(&dir, &["build", "app.syn", "-o", o, "--serve", "--bind", "0.0.0.0"]);
+    assert_eq!(code, 0, "{}\n{}", stdout, err);
+    assert!(stdout.contains("serve · bind 0.0.0.0"), "{}", stdout);
     // Flags de despliegue sin --serve.
     let (code, _, err) = synsema(&dir, &["build", "app.syn", "-o", o, "--bind", "127.0.0.1"]);
     assert_eq!(code, 2, "{}", err);

@@ -85,6 +85,9 @@ pub struct ServeInfoStatic {
     pub describe_api: Vec<String>,
     pub describe_version: Option<String>,
     pub domain: Option<String>,
+    /// `bind "…"` del serve block cuando es un literal (lo que `synsema build --serve` hornea
+    /// si no se pasó `--bind`).
+    pub bind: Option<String>,
     pub private: bool,
     pub docs_off: bool,
     pub has_auth_handler: bool,
@@ -461,6 +464,23 @@ pub fn has_serve_block(program: &Program) -> bool {
     program.statements.iter().any(|s| matches!(s.kind, NodeKind::ServeBlock { .. }))
 }
 
+/// El `bind "…"` del serve block, si está y es un literal de texto. `Ok(None)` sin cláusula;
+/// `Err` si la cláusula es una expresión (el build no puede hornear lo que no puede leer).
+pub fn serve_bind_literal(program: &Program) -> Result<Option<String>, String> {
+    for s in &program.statements {
+        if let NodeKind::ServeBlock { bind: Some(b), .. } = &s.kind {
+            return match text_of(Some(b.as_ref())) {
+                Some(t) => Ok(Some(t)),
+                None => Err(format!(
+                    "{}: the serve block's `bind` must be a text literal to be baked by `synsema build` (or pass --bind)",
+                    b.location
+                )),
+            };
+        }
+    }
+    Ok(None)
+}
+
 /// Los directorios de TODOS los mounts estáticos del programa (`static "/x" from "./dir"`,
 /// en el serve block y en sus `host` blocks), como los escribió el programa. Un `from` que
 /// no es un literal de texto es un error: el bundle de `synsema build` es cerrado y no
@@ -504,7 +524,7 @@ pub fn api_routes_static(sp: &StaticProgram) -> Result<Option<(ServeInfoStatic, 
     let serve = sp.main.statements.iter().find(|s| matches!(s.kind, NodeKind::ServeBlock { .. }));
     let Some(serve) = serve else { return Ok(None) };
     let NodeKind::ServeBlock {
-        auth_handler, rate_limit, describe, private, docs_off, routes, domain, mounts, ..
+        auth_handler, rate_limit, describe, private, docs_off, routes, domain, bind, mounts, ..
     } = &serve.kind
     else {
         return Ok(None);
@@ -515,6 +535,7 @@ pub fn api_routes_static(sp: &StaticProgram) -> Result<Option<(ServeInfoStatic, 
         docs_off: *docs_off,
         has_auth_handler: auth_handler.is_some(),
         domain: text_of(domain.as_deref()),
+        bind: text_of(bind.as_deref()),
         ..Default::default()
     };
     for stmt in &sp.main.statements {

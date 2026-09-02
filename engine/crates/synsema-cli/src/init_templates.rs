@@ -808,6 +808,7 @@ pub const PWA_ICONS: [(&str, &str, u32); 5] = [
 ];
 
 /// Nombre de la constante que guarda cada archivo (para el guard de historia).
+#[cfg(test)]
 pub fn const_name(file: &str) -> &'static str {
     match file {
         "hello.syn" => "HELLO_SYN",

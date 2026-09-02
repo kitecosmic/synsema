@@ -41,6 +41,8 @@ pub mod httpsig;
 pub mod json;
 pub mod mimetypes;
 pub mod oidc;
+/// `platform()` → `{os, arch}`, sin capability (un hecho del binario, como `args()`).
+pub mod platform;
 // El perfil puro como pared (stubs OS-facing compartidos por nativo `--profile pure` y wasm).
 pub mod pure;
 pub mod raster;

@@ -71,8 +71,9 @@ pub const HUB: &[&str] = &[
 /// Sólo wasm (un intérprete embebido no tiene hilos): el nativo puro los conserva.
 pub const BUS: &[&str] = &["bus_publish", "bus_subscribe", "bus_recv", "bus_unsubscribe", "bus_topics"];
 pub const AGENTS: &[&str] = &["agents", "agent_stop"];
-/// Sólo wasm: sin proceso no hay `self_path` ni un hijo que spawnear.
-pub const PROCESS: &[&str] = &["self_path", "run_program"];
+/// Sólo wasm: sin proceso no hay `self_path`, un hijo que spawnear, ni un proceso que apagar
+/// (`shutdown()` es el drain ordenado de `synsema serve`).
+pub const PROCESS: &[&str] = &["self_path", "run_program", "shutdown"];
 
 /// La tabla del perfil puro NATIVO (`synsema run --profile pure`): (familia, nombres,
 /// por qué). Es la fuente de verdad de la tabla "Not in the pure profile" de las docs y

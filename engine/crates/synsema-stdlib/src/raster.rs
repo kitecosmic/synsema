@@ -124,6 +124,27 @@ pub fn render_svg_png(svg: &str, w: u32, h: u32) -> Result<Vec<u8>, String> {
     pixmap.encode_png().map_err(|e| format!("render_svg_png: PNG encoding failed: {}", e))
 }
 
+/// Decodifica un PNG y lo re-escala a `side`×`side` (bicúbico, encajado sin deformar y
+/// centrado sobre fondo transparente). Helper Rust-side para `synsema build --icon x.png`.
+/// Un PNG que ya mide `side`×`side` vuelve tal cual (sin recodificar). Puro.
+pub fn resize_png(png: &[u8], side: u32) -> Result<Vec<u8>, String> {
+    if side == 0 {
+        return Err("resize_png: side must be > 0".to_string());
+    }
+    let src = tiny_skia::Pixmap::decode_png(png).map_err(|e| format!("resize_png: invalid PNG: {}", e))?;
+    if src.width() == side && src.height() == side {
+        return Ok(png.to_vec());
+    }
+    let mut dst = tiny_skia::Pixmap::new(side, side)
+        .ok_or_else(|| format!("resize_png: cannot allocate a {}x{} pixmap", side, side))?;
+    let s = (side as f32 / src.width() as f32).min(side as f32 / src.height() as f32);
+    let dx = (side as f32 - src.width() as f32 * s) / 2.0;
+    let dy = (side as f32 - src.height() as f32 * s) / 2.0;
+    let paint = tiny_skia::PixmapPaint { quality: tiny_skia::FilterQuality::Bicubic, ..Default::default() };
+    dst.draw_pixmap(0, 0, src.as_ref(), &paint, tiny_skia::Transform::from_row(s, 0.0, 0.0, s, dx, dy), None);
+    dst.encode_png().map_err(|e| format!("resize_png: PNG encoding failed: {}", e))
+}
+
 // =========================================================
 // Lectura de opts
 // =========================================================

@@ -24,6 +24,61 @@ jobs:
       - name: Test
         run: cargo test --locked --manifest-path engine/Cargo.toml --workspace
 
+  # Escritorio (specs/build-serve-desktop.md §5/§8): la única plataforma donde el CI corre el
+  # motor REAL fuera de Linux. Cubre el riesgo "firma ad-hoc + bytes anexados" en Apple Silicon
+  # (ld64 firma ad-hoc todo binario arm64 y el kernel mata los inválidos con "Killed: 9"): un
+  # binario salido de `synsema build` tiene que seguir corriendo, y el `.app` de `--bundle`
+  # tiene que abrir por LaunchServices, servir y apagarse con `shutdown()`. Sin Finder: lo
+  # visual es de la sonda.
+  macos-desktop:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+          key: ${{ runner.os }}-cargo-desktop-${{ hashFiles('engine/Cargo.lock') }}
+      - name: Desktop suites (synthetic donors + the real engine)
+        run: cargo test --locked --manifest-path engine/Cargo.toml -p synsema-cli --test build_cli --test desktop_build_cli --test desktop_cli
+      - name: Real .app on Apple Silicon (appended bundle keeps running; open + curl + shutdown)
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path engine/Cargo.toml -p synsema-cli
+          SYN="$PWD/engine/target/debug/synsema"
+          mkdir -p /tmp/desk && cd /tmp/desk
+          cat > desk.syn <<'EOF'
+          require serve(8123)
+
+          serve on 8123
+              bind "127.0.0.1"
+              route "GET /ping"
+                  give ok({"pong": true, "os": platform()["os"]})
+              route "GET /quit"
+                  shutdown("ci done")
+                  give ok({"bye": true})
+          EOF
+          printf '%s' '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#0a84ff"/></svg>' > icon.svg
+          "$SYN" build desk.syn -o desk --serve --icon icon.svg --bundle --name "Desk CI" --id dev.synsema.ci
+          test -x "Desk CI.app/Contents/MacOS/desk"
+          plutil -lint "Desk CI.app/Contents/Info.plist"
+          file "Desk CI.app/Contents/MacOS/desk"
+          # 1) El binario con bytes anexados corre (si la firma ad-hoc no sobreviviera: "Killed: 9").
+          "Desk CI.app/Contents/MacOS/desk" --engine version | grep -q '^Synsema '
+          codesign --verify --verbose=2 "Desk CI.app/Contents/MacOS/desk" || echo "codesign: la firma no cubre los bytes anexados (informativo: el kernel lo dejó correr)"
+          # 2) LaunchServices abre el agente (LSUIElement); sirve; shutdown() lo apaga.
+          open "Desk CI.app"
+          for i in $(seq 1 100); do curl -fsS http://127.0.0.1:8123/ping >/dev/null 2>&1 && break; sleep 0.2; done
+          curl -fsS http://127.0.0.1:8123/ping | tee ping.json
+          grep -q macos ping.json
+          curl -fsS http://127.0.0.1:8123/quit
+          for i in $(seq 1 50); do curl -fsS http://127.0.0.1:8123/ping >/dev/null 2>&1 || break; sleep 0.2; done
+          if curl -fsS http://127.0.0.1:8123/ping >/dev/null 2>&1; then echo "shutdown() no apagó la app"; exit 1; fi
+
   # Perfil wasm: el subconjunto puro de la stdlib compila a wasm32-wasip1, el
   # artefacto synsema-wasm buildea, y las suites puras del lenguaje + la sonda
   # corren DE VERDAD bajo wasmtime. Ancla la garantía: una tanda futura que

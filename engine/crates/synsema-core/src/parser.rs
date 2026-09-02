@@ -1386,6 +1386,7 @@ impl Parser {
         let mut tls_auto = false;
         let mut tls_auto_email: Option<Box<Node>> = None;
         let mut domain: Option<Box<Node>> = None;
+        let mut bind: Option<Box<Node>> = None;
         let mut hosts: Vec<Node> = Vec::new();
         let mut mounts: Vec<Node> = Vec::new();
 
@@ -1456,6 +1457,17 @@ impl Parser {
                 // domain <expr>  → dominio para el cert ACME (auto-HTTPS)
                 self.advance();
                 domain = Some(Box::new(self.parse_expression()?));
+            } else if self.check_word("bind") {
+                // bind <expr>  → dirección del listener (el programa declara su exposición;
+                // `--bind` de la CLI le gana; default 0.0.0.0). Es del serve, no de un `host`.
+                self.advance();
+                if bind.is_some() {
+                    return Err(ParseError::new(
+                        "duplicate 'bind' clause in the serve block".to_string(),
+                        self.location(),
+                    ));
+                }
+                bind = Some(Box::new(self.parse_expression()?));
             } else if self.check_word("host") {
                 // host "dominio"  + bloque indentado → vhost (Lote 1)
                 hosts.push(self.parse_host_block()?);
@@ -1485,7 +1497,7 @@ impl Parser {
                 let tok = self.current();
                 return Err(ParseError::new(
                     format!(
-                        "Inside 'serve', expected 'auth with ...', 'errors with ...', 'route ...', 'mount ...', 'static ...', 'tls ...', 'domain ...', 'host \"...\"', 'redirect https', 'cors ...', 'timeout ...', 'describe', 'private' or 'docs off', got {}",
+                        "Inside 'serve', expected 'auth with ...', 'errors with ...', 'route ...', 'mount ...', 'static ...', 'tls ...', 'domain ...', 'bind \"...\"', 'host \"...\"', 'redirect https', 'cors ...', 'timeout ...', 'describe', 'private' or 'docs off', got {}",
                         tok.ty.name()
                     ),
                     tok.location.clone(),
@@ -1543,6 +1555,7 @@ impl Parser {
                 tls_auto,
                 tls_auto_email,
                 domain,
+                bind,
                 hosts,
                 mounts,
             },
@@ -1632,6 +1645,12 @@ impl Parser {
                 tls_key = Some(Box::new(self.parse_expression()?));
             } else if self.check_word("route") {
                 routes.push(self.parse_route()?);
+            } else if self.check_word("bind") {
+                // El bind es del LISTENER (el serve block), no de un vhost: se dice, no se ignora.
+                return Err(ParseError::new(
+                    "'bind' belongs to the serve block (it is the listener address), not to a host block",
+                    self.location(),
+                ));
             } else {
                 let tok = self.current();
                 return Err(ParseError::new(

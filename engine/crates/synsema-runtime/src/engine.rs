@@ -441,6 +441,10 @@ pub(crate) fn wire_common_with_state(
     // puerta que http_*/fetch (el push service es un host más); `push_vapid_keys`
     // gateado por `random` (material secreto nuevo, como token()/random_bytes()).
     synsema_stdlib::webpush::register_webpush_builtins(interp, caps.clone());
+    // Tanda escritorio: `platform()` (un hecho del binario, sin capability) y `shutdown(reason?)`
+    // (el drain ordenado de serve pedido por el programa; bajo `run` es un error claro).
+    synsema_stdlib::platform::register_platform_builtin(interp, std::env::consts::OS, std::env::consts::ARCH);
+    synsema_stdlib::server::register_shutdown_builtin(interp);
     // Blockchain (Batch 11): encoding/verify/derive PUROS + firma GATEADA por `sign(NAME)`
     // + audit (cierra sobre el mismo CapabilitySet → sandbox lo vacía, deny-by-default).
     synsema_stdlib::blockchain::register_blockchain_builtins(interp, caps.clone());

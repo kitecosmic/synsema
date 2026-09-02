@@ -443,6 +443,10 @@ pub enum NodeKind {
         tls_auto: bool,
         tls_auto_email: Option<Box<Node>>,
         domain: Option<Box<Node>>,
+        /// `bind <expr>` — dirección en la que escucha el listener (tanda escritorio): el
+        /// programa declara su exposición (`bind "127.0.0.1"` = sólo local). Precedencia:
+        /// `--bind` > esta cláusula > `0.0.0.0`.
+        bind: Option<Box<Node>>,
         // Lote 1 — vhost: bloques `host "..."` con su propia tabla (route/static/auth/tls).
         hosts: Vec<Node>, // HostBlock
         /// `mount <expr> [at "/prefix"]` — grupos `export routes` montados en la tabla.

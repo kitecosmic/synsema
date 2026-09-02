@@ -23,12 +23,15 @@ use synsema_runtime::host::{self, Profile};
 use synsema_runtime::serve::{run_serve_program_with_overrides, ServeOverrides};
 
 mod build;
+mod bundle_out;
+mod icns;
 mod init_templates;
+mod pe;
 mod synfide;
 mod update;
 mod code;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] <archivo.syn | -> [-- args...] | test [-v] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide] | llm status [--json] | version | update> [--sandbox | --cap-set <list>] [--profile native|pure] [--audit json|<ruta>|fd:N] [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] <archivo.syn | -> [-- args...] | test [-v] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide] | llm status [--json] | version | update> [--sandbox | --cap-set <list>] [--profile native|pure] [--audit json|<ruta>|fd:N] [--env-file <path> | --no-env-file] <archivo.syn>";
 
 // `build_ceiling` (--sandbox/--cap-set → techo) vive en synsema-capabilities: lo comparten
 // este binario y `synsema-wasm` (mismas flags, misma semántica en los dos front-ends).

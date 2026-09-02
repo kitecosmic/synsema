@@ -1909,6 +1909,137 @@ pub const SERVE_ENV_VARS: &[&str] = &[
 /// cuando el primero (que cortaría el drain de los demás).
 static LIVE_SERVERS: AtomicUsize = AtomicUsize::new(0);
 
+// =========================================================
+// Shutdown pedido por el PROGRAMA — `shutdown(reason?)` (tanda escritorio)
+// =========================================================
+//
+// El drain ordenado ya existía (SIGINT/SIGTERM); esto sólo agrega el otro disparador: el
+// programa mismo (una ventana que se cierra, un job que terminó). Mismo camino: no más
+// requests, drenar hasta la gracia, cancelar cron/agentes, exit 0.
+
+/// `synsema serve` corre en este proceso (top-level, workers, cron, agentes). Lo que
+/// `shutdown()` necesita para distinguir "sólo bajo serve" de "todavía no hay nada corriendo".
+static UNDER_SERVE: AtomicBool = AtomicBool::new(false);
+/// El hilo parkeado del camino sólo-cron (sin server), para despertarlo.
+static CRON_ONLY: std::sync::Mutex<Option<std::thread::Thread>> = std::sync::Mutex::new(None);
+
+fn shutdown_channel() -> &'static (tokio::sync::watch::Sender<bool>, tokio::sync::watch::Receiver<bool>) {
+    static CH: std::sync::OnceLock<(tokio::sync::watch::Sender<bool>, tokio::sync::watch::Receiver<bool>)> =
+        std::sync::OnceLock::new();
+    CH.get_or_init(|| tokio::sync::watch::channel(false))
+}
+
+pub fn mark_under_serve() {
+    UNDER_SERVE.store(true, AtomicOrd::SeqCst);
+}
+
+pub fn under_serve() -> bool {
+    UNDER_SERVE.load(AtomicOrd::SeqCst)
+}
+
+/// Cuántos listeners están vivos (0 = todavía no bindeó ninguno, o ya cerraron todos).
+pub fn servers_live() -> usize {
+    LIVE_SERVERS.load(AtomicOrd::SeqCst)
+}
+
+/// `true` si el camino sólo-cron está vivo (parkeado esperando).
+pub fn cron_only_live() -> bool {
+    CRON_ONLY.lock().map(|g| g.is_some()).unwrap_or(false)
+}
+
+/// `true` si el programa ya pidió el shutdown.
+pub fn shutdown_requested() -> bool {
+    *shutdown_channel().0.borrow()
+}
+
+/// Pide el shutdown ordenado desde el programa. Idempotente: `true` la primera vez.
+pub fn request_shutdown(reason: &str) -> bool {
+    let (tx, _) = shutdown_channel();
+    if *tx.borrow() {
+        return false;
+    }
+    let reason = if reason.trim().is_empty() { "no reason given" } else { reason };
+    eprintln!("[serve] shutdown requested by the program: {}", reason);
+    let _ = tx.send(true);
+    if let Ok(g) = CRON_ONLY.lock() {
+        if let Some(t) = g.as_ref() {
+            t.unpark();
+        }
+    }
+    true
+}
+
+/// Camino sólo-cron: registra este hilo y bloquea (cero CPU) hasta que el programa pida el
+/// shutdown. Ctrl+C sigue matando el proceso como siempre (no hay runtime que lo intercepte).
+pub fn park_cron_only() {
+    if let Ok(mut g) = CRON_ONLY.lock() {
+        *g = Some(std::thread::current());
+    }
+    loop {
+        if shutdown_requested() {
+            break;
+        }
+        std::thread::park();
+    }
+    if let Ok(mut g) = CRON_ONLY.lock() {
+        *g = None;
+    }
+}
+
+/// Resuelve cuando el programa pide el shutdown (nunca, si no lo pide).
+async fn program_shutdown() {
+    let mut rx = shutdown_channel().1.clone();
+    loop {
+        if *rx.borrow() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// `shutdown(reason?)`: el drain ordenado, pedido por el programa. Sin capability (apagarse
+/// no es un recurso del host). Fail-loud: bajo `run` no existe (un run termina cuando termina
+/// su top-level); bajo `serve` antes de que haya un server o un job vivo tampoco (no hay nada
+/// que apagar todavía).
+pub fn register_shutdown_builtin(interp: &synsema_core::interpreter::Interpreter) {
+    use std::rc::Rc;
+    use synsema_core::interpreter::{Control, RuntimeError};
+    interp.register_builtin(
+        "shutdown",
+        -1,
+        Rc::new(|_i, args, _loc| {
+            if args.len() > 1 {
+                return Err(Control::Error(RuntimeError::new(format!(
+                    "shutdown expects at most 1 argument (reason), got {}",
+                    args.len()
+                ))));
+            }
+            let reason = match args.first() {
+                None | Some(SynValue::Nothing) => String::new(),
+                Some(SynValue::Text(t)) => t.to_string(),
+                Some(SynValue::Secret(_)) => {
+                    return Err(Control::Error(RuntimeError::new("shutdown: the reason cannot be a secret (it goes to the log)")))
+                }
+                Some(other) => other.to_string(),
+            };
+            if !under_serve() {
+                return Err(Control::Error(RuntimeError::new(
+                    "shutdown() is only available under serve — a run program ends when its top level ends (use `stop` to leave a loop or a task)",
+                )));
+            }
+            if servers_live() == 0 && !cron_only_live() {
+                return Err(Control::Error(RuntimeError::new(
+                    "shutdown(): nothing is running yet (call it from a route, a socket, a cron job or an agent)",
+                )));
+            }
+            request_shutdown(&reason);
+            Ok(SynValue::Nothing)
+        }),
+    );
+}
+
 /// Gracia del shutdown ordenado (segundos): `SYNSEMA_SHUTDOWN_GRACE`, default 10, `0` =
 /// inmediato.
 fn shutdown_grace() -> Duration {
@@ -1971,8 +2102,11 @@ fn run_async(rt: Arc<ServeRuntime>, listener: TcpListener, tls: TlsMode) {
         // vuelo hasta la gracia, cancelar lo que quede, salir con 0 (fue pedido).
         let graceful = hyper_util::server::graceful::GracefulShutdown::new();
         let mut shutdown = std::pin::pin!(shutdown_signal());
+        // El otro disparador: `shutdown()` desde el programa (mismo drain).
+        let mut from_program = std::pin::pin!(program_shutdown());
         loop {
             tokio::select! {
+                _ = &mut from_program => break,
                 accepted = listener.accept() => {
                     let (tcp, peer) = match accepted {
                         Ok(x) => x,
