@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use synsema_core::bundle::{self, Bundle, Manifest};
+use synsema_core::bundle::{self, Bundle, BundleMode, Manifest, ServeSettings};
 use synsema_core::templates::{program_closure_with, template_closure};
 
 use crate::HostFlags;
@@ -24,6 +24,9 @@ pub fn cmd_build(host: HostFlags) -> ExitCode {
     let mut includes: Vec<String> = Vec::new();
     let mut engine_binary: Option<String> = None;
     let mut main: Option<String> = None;
+    let mut serve = false;
+    let mut serve_secure = false;
+    let mut serve_flags: Vec<(String, String)> = Vec::new();
     let rest = host.rest.clone();
     let mut i = 0;
     while i < rest.len() {
@@ -62,6 +65,21 @@ pub fn cmd_build(host: HostFlags) -> ExitCode {
             }
             p if p.starts_with("--engine-binary=") => {
                 engine_binary = Some(p.trim_start_matches("--engine-binary=").to_string())
+            }
+            // `--serve` + los flags de despliegue de `synsema serve`, HORNEADOS (en modo
+            // programa todo argv es del programa, así que se deciden al construir).
+            "--serve" => serve = true,
+            "--secure" => serve_secure = true,
+            "--bind" | "--port" | "--domain" | "--tls-auto" | "--tls-cert" | "--tls-key" => {
+                let flag = rest[i].clone();
+                i += 1;
+                match rest.get(i) {
+                    Some(v) if !v.starts_with('-') => serve_flags.push((flag, v.clone())),
+                    _ => {
+                        eprintln!("synsema build: {} requires a value", flag);
+                        return ExitCode::from(2);
+                    }
+                }
             }
             p if p.starts_with('-') => {
                 eprintln!("synsema build: unknown flag '{}'\n{}", p, USAGE_BUILD);
@@ -102,9 +120,53 @@ pub fn cmd_build(host: HostFlags) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    match build(&main, &out, &includes, engine_binary.as_deref(), ceiling_text, &profile) {
+    // `--serve`: el binario corre el runtime de `synsema serve`. Fail-loud en el build, no al
+    // correr: los flags de despliegue sin `--serve` no significan nada; `--serve` sin `--bind`
+    // no adivina en qué interfaz escucha un distribuible; el perfil puro no bindea sockets.
+    if !serve && (serve_secure || !serve_flags.is_empty()) {
+        let first = serve_flags.first().map(|(f, _)| f.as_str()).unwrap_or("--secure");
+        eprintln!("synsema build: {} applies to --serve builds (add --serve)", first);
+        return ExitCode::from(2);
+    }
+    let serve_settings = if serve {
+        if profile == "pure" {
+            eprintln!("synsema build: --serve --profile pure is not supported (a server binds a socket)");
+            return ExitCode::from(2);
+        }
+        match serve_settings_from_flags(&serve_flags, serve_secure) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("synsema build: {}", e);
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
+
+    match build(&main, &out, &includes, engine_binary.as_deref(), ceiling_text, &profile, serve_settings.clone()) {
         Ok((n, bytes)) => {
-            println!("built {} ({} files, {} bytes)", out, n, bytes);
+            match &serve_settings {
+                Some(s) => {
+                    let mut how = format!("serve · bind {}", s.bind);
+                    if let Some(p) = s.port {
+                        how.push_str(&format!(" · port {}", p));
+                    }
+                    if let Some(d) = &s.domains {
+                        how.push_str(&format!(" · domain {}", d.join(",")));
+                    }
+                    if s.tls_auto.is_some() {
+                        how.push_str(" · tls auto");
+                    } else if s.tls_cert.is_some() {
+                        how.push_str(" · tls cert");
+                    }
+                    if s.secure {
+                        how.push_str(" · secure");
+                    }
+                    println!("built {} ({} files, {} bytes) · {}", out, n, bytes, how);
+                }
+                None => println!("built {} ({} files, {} bytes)", out, n, bytes),
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -114,6 +176,51 @@ pub fn cmd_build(host: HostFlags) -> ExitCode {
     }
 }
 
+/// Los flags de despliegue de `synsema build --serve` → lo que se hornea. Misma validación
+/// que `synsema serve` (`ServeOverrides::validate`): puerto 1-65535, `--tls-auto` excluyente
+/// con `--tls-cert/--tls-key`, cert y key juntos. `--bind` es obligatorio.
+fn serve_settings_from_flags(flags: &[(String, String)], secure: bool) -> Result<ServeSettings, String> {
+    let mut s = ServeSettings { secure, ..Default::default() };
+    for (flag, v) in flags {
+        match flag.as_str() {
+            "--bind" => s.bind = v.clone(),
+            "--port" => {
+                s.port = Some(
+                    v.parse::<u16>()
+                        .ok()
+                        .filter(|p| *p >= 1)
+                        .ok_or_else(|| format!("--port must be a valid port (1-65535), got '{}'", v))?,
+                )
+            }
+            "--domain" => {
+                let ds: Vec<String> = v.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+                if ds.is_empty() {
+                    return Err("--domain requires at least one domain".to_string());
+                }
+                s.domains = Some(ds);
+            }
+            "--tls-auto" => s.tls_auto = Some(v.clone()),
+            "--tls-cert" => s.tls_cert = Some(v.clone()),
+            "--tls-key" => s.tls_key = Some(v.clone()),
+            other => return Err(format!("unknown serve flag '{}'", other)),
+        }
+    }
+    if s.bind.is_empty() {
+        return Err("--serve needs --bind: a built server must say where it listens (--bind 127.0.0.1 for a local app, --bind 0.0.0.0 for a public one)".to_string());
+    }
+    let ov = synsema_runtime::serve::ServeOverrides {
+        port: s.port,
+        domains: s.domains.clone(),
+        tls_auto_email: s.tls_auto.clone(),
+        tls_cert: s.tls_cert.clone(),
+        tls_key: s.tls_key.clone(),
+        bind: Some(s.bind.clone()),
+        ceiling: None,
+    };
+    ov.validate()?;
+    Ok(s)
+}
+
 fn build(
     main: &str,
     out: &str,
@@ -121,6 +228,7 @@ fn build(
     engine_binary: Option<&str>,
     ceiling: Option<String>,
     profile: &str,
+    serve: Option<ServeSettings>,
 ) -> Result<(usize, u64), String> {
     let main_path = Path::new(main);
     if !main_path.is_file() {
@@ -143,7 +251,7 @@ fn build(
     // cwd) se hacen con cwd = raíz del bundle, así los paths resueltos SON las claves.
     let prev_cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     std::env::set_current_dir(&root).map_err(|e| format!("cannot enter {}: {}", root.display(), e))?;
-    let result = collect(&main_name, includes);
+    let result = collect(&main_name, includes, serve.is_some());
     let _ = std::env::set_current_dir(&prev_cwd);
     let entries = result?;
 
@@ -167,6 +275,8 @@ fn build(
         ceiling,
         profile: profile.to_string(),
         built_at: chrono_now(),
+        mode: if serve.is_some() { BundleMode::Serve } else { BundleMode::Run },
+        serve,
     };
     let n = entries.len();
     let b = Bundle::new(manifest, entries)?;
@@ -195,9 +305,22 @@ fn build(
 
 /// Lee el programa principal, su clausura de `use` y templates, y los `--include`.
 /// Todos los nombres relativos a la raíz (= cwd durante la recolección).
-fn collect(main_name: &str, includes: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> {
+fn collect(main_name: &str, includes: &[String], serve_mode: bool) -> Result<Vec<(String, Vec<u8>)>, String> {
     let source = std::fs::read_to_string(main_name).map_err(|e| format!("cannot read '{}': {}", main_name, e))?;
     let program = synsema_core::parser::parse_source(&source, main_name).map_err(|e| e.to_string())?;
+    // Un programa con `serve on` sólo sirve bajo el runtime de serve: sin `--serve` el binario
+    // fallaría al correr con "serve is only available through the Synsema engine runtime" —
+    // se dice acá, en el build.
+    if synsema_core::route_meta::has_serve_block(&program) && !serve_mode {
+        return Err(format!(
+            "'{}' has a serve block; pass --serve --bind <addr> to build a server binary",
+            main_name
+        ));
+    }
+    // Los mounts estáticos del serve (`static "/x" from "./dir"`) viajan dentro del binario:
+    // el server los sirve del bundle antes que del disco. Un directorio que falta es un error
+    // del build, no un 404 en producción.
+    let static_dirs = synsema_core::route_meta::static_mount_dirs(&program)?;
     let (modules, templates) = program_closure_with(&program, main_name, &|resolved: &str, raw: &str| {
         let src = std::fs::read_to_string(resolved).map_err(|_| format!("module not found: {}", raw))?;
         synsema_core::parser::parse_source(&src, resolved).map_err(|e| e.to_string())
@@ -220,6 +343,21 @@ fn collect(main_name: &str, includes: &[String]) -> Result<Vec<(String, Vec<u8>)
         for tp in template_closure(&t)? {
             let bytes = std::fs::read(&tp).map_err(|e| format!("cannot read template {}: {}", tp, e))?;
             push(tp, bytes, &mut entries)?;
+        }
+    }
+    for dir in &static_dirs {
+        let p = Path::new(dir);
+        if !p.is_dir() {
+            return Err(format!(
+                "static mount '{}' (declared in the serve block) is not a directory under the bundle root",
+                dir
+            ));
+        }
+        for f in expand_include(dir)? {
+            let bytes = std::fs::read(&f).map_err(|e| format!("cannot read {}: {}", f.display(), e))?;
+            let name = f.to_string_lossy().into_owned();
+            let name = name.trim_start_matches("./").trim_start_matches(".\\").to_string();
+            push(name, bytes, &mut entries)?;
         }
     }
     for inc in includes {

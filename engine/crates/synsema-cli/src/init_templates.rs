@@ -420,7 +420,7 @@ serve on 8080
         let kept be []
         each sub in state_get("push_subs", [])
             try
-                let r be push_send(sub, {"title": "My app", "body": "Native push from Synsema", "url": "/"}, vapid_opts())
+                let r be push_send(sub, {"title": "My app", "body": "Native push from Synsema", "url": "/", "tag": "test"}, vapid_opts())
                 when r["ok"]
                     set sent to sent + 1
                 when not r["gone"]
@@ -485,6 +485,7 @@ pub const PWA_INDEX_HTML: &str = r##"<!doctype html>
 
 /// Manifest (el mismo archivo sirve para instalar en escritorio desde Edge/Chrome).
 pub const PWA_MANIFEST: &str = r##"{
+  "id": "/",
   "name": "My app",
   "short_name": "My app",
   "description": "An installable app served by Synsema",
@@ -494,8 +495,9 @@ pub const PWA_MANIFEST: &str = r##"{
   "background_color": "#111111",
   "theme_color": "#111111",
   "icons": [
-    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
-    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
   ]
 }
 "##;
@@ -507,8 +509,11 @@ pub const PWA_SW_JS: &str = r#"// Service worker de tu app: guarda la "shell" (l
 // una app que muestra datos viejos como nuevos es peor que una que avisa.
 // Si tu "/" muestra datos del usuario logueado, sacala de SHELL (cacheá una página
 // pública de "sin conexión" en su lugar): el caché es por navegador, no por usuario.
+// La shell se sirve "stale-while-revalidate": responde desde el caché y refresca en
+// segundo plano, así un cambio se ve en la SIGUIENTE apertura. Para forzarlo en la
+// actual, subí CACHE (app-shell-v2): el activate borra el caché viejo.
 const CACHE = "app-shell-v1";
-const SHELL = ["/", "/app.js", "/manifest.webmanifest", "/icon-192.png"];
+const SHELL = ["/", "/app.js", "/manifest.webmanifest", "/icon-192.png", "/badge-96.png"];
 
 self.addEventListener("install", (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
@@ -532,37 +537,67 @@ self.addEventListener("fetch", (e) => {
     ));
     return;
   }
-  // Shell: caché primero, y lo que llega bien por red se guarda para la próxima.
-  e.respondWith(caches.match(e.request).then((hit) => hit || fetch(e.request).then((res) => {
-    if (res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(e.request, copy)); }
-    return res;
-  })));
-});
-
-// Push: push_send() manda JSON si le pasás un map ({title, body, url}); texto si le pasás texto.
-self.addEventListener("push", (e) => {
-  let data = {};
-  try { data = e.data ? e.data.json() : {}; } catch (_) { data = { body: e.data ? e.data.text() : "" }; }
-  e.waitUntil(self.registration.showNotification(data.title || "My app", {
-    body: data.body || "", icon: "/icon-192.png", data,
+  // Shell: lo cacheado responde ya; lo que llega bien por red reemplaza la copia para la
+  // próxima vez. Sin caché y sin red → error de red (la página lo dice).
+  e.respondWith(caches.open(CACHE).then(async (c) => {
+    const hit = await c.match(e.request);
+    const refresh = fetch(e.request).then((res) => {
+      if (res.ok) c.put(e.request, res.clone());
+      return res;
+    }).catch(() => hit || Response.error());
+    return hit || refresh;
   }));
 });
 
+// Push: push_send() manda JSON si le pasás un map ({title, body, url, tag}); texto si le
+// pasás texto. badge = el ícono monocromo de la barra de estado (Android); tag + renotify =
+// un mensaje nuevo con el mismo tag reemplaza al anterior en vez de apilarse.
+self.addEventListener("push", (e) => {
+  let data = {};
+  try { data = e.data ? e.data.json() : {}; } catch (_) { data = { body: e.data ? e.data.text() : "" }; }
+  const opts = { body: data.body || "", icon: "/icon-192.png", badge: "/badge-96.png", data };
+  if (data.tag) { opts.tag = String(data.tag); opts.renotify = true; }
+  e.waitUntil(self.registration.showNotification(data.title || "My app", opts));
+});
+
+// Clic en la notificación: enfocar la ventana que ya está abierta (y avisarle qué se tocó)
+// en vez de abrir otra instancia sin estado; abrir una nueva sólo si no hay ninguna.
+// Si el SO mató la app, la ventana nueva arranca de cero: lo que tenga que sobrevivir
+// (borradores, filtros, la vista actual) va a localStorage/IndexedDB, no a variables.
 self.addEventListener("notificationclick", (e) => {
   e.notification.close();
-  e.waitUntil(clients.openWindow((e.notification.data && e.notification.data.url) || "/"));
+  const url = (e.notification.data && e.notification.data.url) || "/";
+  e.waitUntil(clients.matchAll({ type: "window", includeUncontrolled: true }).then((wins) => {
+    const win = wins.find((w) => "focus" in w);
+    if (win) {
+      win.postMessage({ type: "notificationclick", url, data: e.notification.data });
+      return win.focus();
+    }
+    return clients.openWindow(url);
+  }));
 });
 "#;
 
 /// La parte del navegador: registro del SW, instalar, online/offline, push.
-pub const PWA_APP_JS: &str = r#"// La parte del navegador: registra el service worker, ofrece instalar, dice si hay red,
-// y (si el server tiene claves VAPID) pide permiso y se suscribe a push.
+pub const PWA_APP_JS: &str = r#"// La parte del navegador: registra el service worker, ofrece instalar, dice si hay red
+// Y si el server responde, y (si el server tiene claves VAPID) pide permiso y se suscribe
+// a push.
 const $ = (id) => document.getElementById(id);
 const say = (t) => { $("out").textContent = t; };
+// Un error se muestra ENTERO (nombre + mensaje): "AbortError: Registration failed - push
+// service error" dice más que "[object DOMException]".
+const explain = (e) => (e && e.name ? e.name + ": " + e.message : String(e));
 
-// 1. Service worker: sin él no hay instalación en Android ni shell offline.
+// 1. Service worker: sin él no hay instalación en Android ni shell offline. El worker avisa
+//    por postMessage cuando el usuario toca una notificación con la app ya abierta.
 if ("serviceWorker" in navigator) {
-  navigator.serviceWorker.register("/sw.js").catch((e) => say("service worker failed: " + e));
+  navigator.serviceWorker.register("/sw.js").catch((e) => say("service worker failed: " + explain(e)));
+  navigator.serviceWorker.addEventListener("message", (ev) => {
+    if (ev.data && ev.data.type === "notificationclick") {
+      say("notification tapped → " + ev.data.url);
+      if (ev.data.url && ev.data.url !== location.pathname) location.assign(ev.data.url);
+    }
+  });
 }
 
 // 2. Instalar. Android y escritorio disparan beforeinstallprompt; iOS no tiene API
@@ -584,49 +619,91 @@ const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
 const standalone = window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
 if (isIOS && !standalone) $("ios-hint").hidden = false;
 
-// 3. Online/offline honesto.
-const net = () => {
-  $("status").textContent = navigator.onLine
-    ? (standalone ? "Installed · online" : "Online")
-    : "Offline — the shell works, the API does not";
+// 3. Estado honesto. navigator.onLine sólo sabe si hay red; que el SERVER responda se
+//    prueba con /api/ping sin caché (un server caído con red andando es "online" para el
+//    navegador).
+const status = async () => {
+  const where = standalone ? "Installed · " : "";
+  if (!navigator.onLine) { $("status").textContent = where + "offline — the shell works, the API does not"; return; }
+  try {
+    const r = await fetch("/api/ping", { cache: "no-store" });
+    $("status").textContent = where + (r.ok ? "online, server up" : "online, server answered " + r.status);
+  } catch (_) {
+    $("status").textContent = where + "online, but the server is unreachable";
+  }
 };
-window.addEventListener("online", net);
-window.addEventListener("offline", net);
-net();
+window.addEventListener("online", status);
+window.addEventListener("offline", status);
+status();
 
 // 4. El API.
 $("ping").onclick = async () => {
-  try { const r = await fetch("/api/ping"); say(await r.text()); } catch (e) { say("offline: " + e); }
+  try { const r = await fetch("/api/ping", { cache: "no-store" }); say(await r.text()); } catch (e) { say("offline: " + explain(e)); }
 };
 
 // 5. Push: la clave pública VAPID viene del server; la suscripción vuelve al server.
+//    En Android el PRIMER subscribe justo después de "Permitir" puede fallar y el segundo
+//    andar: se espera al worker ACTIVO (ready puede resolver con uno aún "activating"), se
+//    reusa la suscripción si ya existe con la misma clave, y se reintenta con backoff.
 function keyBytes(b64url) {
   const s = atob(b64url.replace(/-/g, "+").replace(/_/g, "/"));
   return Uint8Array.from(s, (c) => c.charCodeAt(0));
 }
+function sameKey(a, b) {
+  const x = new Uint8Array(a), y = new Uint8Array(b);
+  return x.length === y.length && x.every((v, i) => v === y[i]);
+}
+async function activeWorker() {
+  const reg = await navigator.serviceWorker.ready;
+  const sw = reg.active || reg.waiting || reg.installing;
+  if (sw && sw.state !== "activated") {
+    await new Promise((ok) => sw.addEventListener("statechange", () => { if (sw.state === "activated") ok(); }));
+  }
+  return reg;
+}
+async function subscribe(reg, key) {
+  const existing = await reg.pushManager.getSubscription();
+  if (existing) {
+    const cur = existing.options && existing.options.applicationServerKey;
+    if (!cur || sameKey(cur, keyBytes(key).buffer)) return existing;
+    await existing.unsubscribe();               // el server rotó la clave VAPID: la vieja no sirve
+  }
+  let last;
+  for (let i = 0; i < 3; i++) {
+    try {
+      return await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(key) });
+    } catch (e) {
+      last = e;
+      await new Promise((ok) => setTimeout(ok, 500 * (i + 1)));
+    }
+  }
+  throw last;
+}
 $("notify").onclick = async () => {
   try {
-    const cfg = await (await fetch("/api/push/config")).json();
+    const cfg = await (await fetch("/api/push/config", { cache: "no-store" })).json();
     if (!cfg.vapid_public) return say("push is not configured on the server (see app.syn)");
     if (!("PushManager" in window)) {
       return say(isIOS && !standalone
         ? "iOS: install the app first (Share → Add to Home Screen), then tap again"
         : "this browser has no Web Push");
     }
-    const perm = await Notification.requestPermission();
-    if (perm !== "granted") return say("notifications denied");
-    const reg = await navigator.serviceWorker.ready;
-    const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(cfg.vapid_public) });
+    if (Notification.permission === "denied") return say("notifications are blocked for this site — allow them in the browser settings");
+    if (Notification.permission !== "granted" && (await Notification.requestPermission()) !== "granted") return say("notifications denied");
+    const reg = await activeWorker();
+    const sub = await subscribe(reg, cfg.vapid_public);
     const r = await fetch("/api/push/subscribe", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(sub.toJSON()),
     });
     say("subscribed: " + (await r.text()));
     $("test").hidden = false;
-  } catch (e) { say("push failed: " + e); }
+  } catch (e) { say("push failed: " + explain(e)); }
 };
 $("test").onclick = async () => {
-  const r = await fetch("/api/push/test", { method: "POST" });
-  say(await r.text());
+  try {
+    const r = await fetch("/api/push/test", { method: "POST" });
+    say(await r.text());
+  } catch (e) { say("test failed: " + explain(e)); }
 };
 "#;
 
@@ -640,22 +717,60 @@ pub const PWA_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewB
 </svg>
 "##;
 
+/// Ícono "maskable" (Android recorta la forma): fondo a lienzo completo, dibujo en el 80% central.
+pub const PWA_ICON_MASKABLE_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Ícono "maskable" (Android recorta la forma: círculo, gota, cuadrado redondeado). El
+       fondo llena TODO el lienzo y el dibujo queda en el 80% central, la zona segura.
+       Editalo y volvé a correr el init con el flag pwa: regenera icon-maskable-512.png. -->
+  <rect width="512" height="512" fill="#111111"/>
+  <circle cx="256" cy="256" r="150" fill="none" stroke="#f5f5f5" stroke-width="28"/>
+  <circle cx="256" cy="256" r="52" fill="#f5f5f5"/>
+</svg>
+"##;
+
+/// Badge monocromo de la barra de estado (Android); el sistema lo tiñe.
+pub const PWA_BADGE_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Badge: el ícono MONOCROMO de la barra de estado de Android (blanco sobre transparente;
+       el sistema lo tiñe). Sin él, Android muestra un ícono genérico. Editalo y volvé a correr
+       el init con el flag pwa: regenera badge-96.png. -->
+  <circle cx="256" cy="256" r="150" fill="none" stroke="#ffffff" stroke-width="40"/>
+  <circle cx="256" cy="256" r="60" fill="#ffffff"/>
+</svg>
+"##;
+
 /// Los archivos de `synsema init --pwa`, en orden (el scaffold base va aparte, sin
 /// `hello.syn`: acá el starter es `app.syn`). Los PNG NO están en la lista: son
 /// derivados de `icon.svg` y los genera `cmd_init` (ver `pwa_icons`).
-pub const PWA_FILES: [InitFile; 7] = [
-    InitFile { name: "app.syn", content: PWA_APP_SYN, past: &[] },
+pub const PWA_FILES: [InitFile; 9] = [
+    // `past`: los sha256 (forma LF) de cada versión publicada — v0.6.15 fue la primera.
+    InitFile { name: "app.syn", content: PWA_APP_SYN, past: &["b35f3e66902c4380aececfcf717025d97f475d8f76226e0f345fc1266c5ec2ef"] },
     InitFile { name: "push_keys.syn", content: PWA_PUSH_KEYS_SYN, past: &[] },
     InitFile { name: "index.html", content: PWA_INDEX_HTML, past: &[] },
-    InitFile { name: "public/manifest.webmanifest", content: PWA_MANIFEST, past: &[] },
-    InitFile { name: "public/sw.js", content: PWA_SW_JS, past: &[] },
-    InitFile { name: "public/app.js", content: PWA_APP_JS, past: &[] },
+    InitFile { name: "public/manifest.webmanifest", content: PWA_MANIFEST, past: &["c48e191fff4cd83fb8231658dc88ad185abfb592d9614c1cb3983345bfe684ad"] },
+    InitFile { name: "public/sw.js", content: PWA_SW_JS, past: &["4aa649614a3aa18b32c2b16668b467be1c46220ff3f39e9c5bcd1bb70fbf64c1"] },
+    InitFile { name: "public/app.js", content: PWA_APP_JS, past: &["94335092a403265f2e954afc1c2d80ad254e343c1c3cffae23dd3521244d1314"] },
     InitFile { name: "public/icon.svg", content: PWA_ICON_SVG, past: &[] },
+    InitFile { name: "public/icon-maskable.svg", content: PWA_ICON_MASKABLE_SVG, past: &[] },
+    InitFile { name: "public/badge.svg", content: PWA_BADGE_SVG, past: &[] },
 ];
 
-/// Los PNG que init deriva de `public/icon.svg`: (nombre, lado en px).
-pub const PWA_ICONS: [(&str, u32); 3] =
-    [("public/icon-192.png", 192), ("public/icon-512.png", 512), ("public/apple-touch-icon.png", 180)];
+/// Los SVG fuente del scaffold (ruta, contenido de fábrica): `init` sabe si el usuario los editó.
+pub const PWA_ICON_SOURCES: [(&str, &str); 3] = [
+    ("public/icon.svg", PWA_ICON_SVG),
+    ("public/icon-maskable.svg", PWA_ICON_MASKABLE_SVG),
+    ("public/badge.svg", PWA_BADGE_SVG),
+];
+
+/// Los PNG que init deriva de los SVG: (SVG fuente, PNG, lado en px). 192/512 `any` +
+/// apple-touch-icon desde `icon.svg`; el `maskable` desde su propio SVG (fondo a lienzo
+/// completo); el badge monocromo de Android desde `badge.svg`.
+pub const PWA_ICONS: [(&str, &str, u32); 5] = [
+    ("public/icon.svg", "public/icon-192.png", 192),
+    ("public/icon.svg", "public/icon-512.png", 512),
+    ("public/icon.svg", "public/apple-touch-icon.png", 180),
+    ("public/icon-maskable.svg", "public/icon-maskable-512.png", 512),
+    ("public/badge.svg", "public/badge-96.png", 96),
+];
 
 /// Nombre de la constante que guarda cada archivo (para el guard de historia).
 pub fn const_name(file: &str) -> &'static str {
@@ -671,6 +786,8 @@ pub fn const_name(file: &str) -> &'static str {
         "public/sw.js" => "PWA_SW_JS",
         "public/app.js" => "PWA_APP_JS",
         "public/icon.svg" => "PWA_ICON_SVG",
+        "public/icon-maskable.svg" => "PWA_ICON_MASKABLE_SVG",
+        "public/badge.svg" => "PWA_BADGE_SVG",
         other => panic!("init_templates: no constant registered for '{}'", other),
     }
 }
@@ -824,13 +941,17 @@ mod tests {
         assert_eq!(m["start_url"], "/");
         assert_eq!(m["scope"], "/");
         assert_eq!(m["display"], "standalone");
+        assert_eq!(m["id"], "/", "un id estable: la app sigue siendo la misma si cambia start_url");
         let icons = m["icons"].as_array().expect("icons");
         let sizes: Vec<&str> = icons.iter().map(|i| i["sizes"].as_str().unwrap()).collect();
         assert!(sizes.contains(&"192x192") && sizes.contains(&"512x512"), "{:?}", sizes);
+        // `any` y `maskable` van en íconos DISTINTOS (Lighthouse desaconseja "any maskable" combinado).
+        let purposes: Vec<&str> = icons.iter().map(|i| i["purpose"].as_str().unwrap_or("any")).collect();
+        assert!(purposes.contains(&"maskable") && !purposes.iter().any(|p| p.contains(' ')), "{:?}", purposes);
         for i in icons {
             let src = i["src"].as_str().unwrap().trim_start_matches('/');
             assert!(
-                PWA_ICONS.iter().any(|(n, _)| n.trim_start_matches("public/") == src),
+                PWA_ICONS.iter().any(|(_, n, _)| n.trim_start_matches("public/") == src),
                 "el ícono {} no lo genera init",
                 src
             );
@@ -844,7 +965,7 @@ mod tests {
         let served: Vec<String> = PWA_FILES
             .iter()
             .filter_map(|f| f.name.strip_prefix("public/").map(|s| format!("/{}", s)))
-            .chain(PWA_ICONS.iter().map(|(n, _)| format!("/{}", n.trim_start_matches("public/"))))
+            .chain(PWA_ICONS.iter().map(|(_, n, _)| format!("/{}", n.trim_start_matches("public/"))))
             .chain(["/".to_string()])
             .collect();
         for text in [PWA_INDEX_HTML, PWA_SW_JS, PWA_APP_JS, PWA_MANIFEST] {
@@ -864,8 +985,9 @@ mod tests {
     /// Anti-rot (PWA): el SVG del ícono rasteriza a los tres tamaños que init escribe.
     #[test]
     fn pwa_icon_svg_rasterizes() {
-        for (_, px) in PWA_ICONS {
-            let png = synsema_stdlib::raster::render_svg_png(PWA_ICON_SVG, px, px).expect("render");
+        for (src, _, px) in PWA_ICONS {
+            let svg = PWA_ICON_SOURCES.iter().find(|(p, _)| *p == src).map(|(_, c)| *c).expect("source svg");
+            let png = synsema_stdlib::raster::render_svg_png(svg, px, px).expect("render");
             assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
             let w = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
             let h = u32::from_be_bytes([png[20], png[21], png[22], png[23]]);

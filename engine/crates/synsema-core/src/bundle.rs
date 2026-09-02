@@ -41,6 +41,84 @@ pub struct Manifest {
     /// `"native"` | `"pure"`.
     pub profile: String,
     pub built_at: String,
+    /// Cómo corre el binario: `Run` (el programa termina cuando termina) o `Serve` (el
+    /// runtime de `synsema serve`: bloquea, sirve, cron, agentes). Ausente en el JSON = `Run`,
+    /// así un bundle sin `--serve` es byte a byte el de siempre.
+    pub mode: BundleMode,
+    /// Los flags de despliegue de `synsema serve` horneados con `--serve` (`--bind` es
+    /// obligatorio: un distribuible no adivina en qué interfaz escucha).
+    pub serve: Option<ServeSettings>,
+}
+
+/// Modo de ejecución del binario construido.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BundleMode {
+    Run,
+    Serve,
+}
+
+/// Overrides de despliegue horneados (espejo de `ServeOverrides` del runtime, sin el techo:
+/// el techo va en `ceiling`). Las rutas de `tls_cert`/`tls_key` se leen del DISCO al
+/// arrancar — la clave privada no viaja dentro del binario.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ServeSettings {
+    pub bind: String,
+    pub port: Option<u16>,
+    pub domains: Option<Vec<String>>,
+    pub tls_auto: Option<String>,
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    pub secure: bool,
+}
+
+impl ServeSettings {
+    fn to_json(&self) -> serde_json::Value {
+        let mut m = serde_json::Map::new();
+        m.insert("bind".into(), serde_json::Value::from(self.bind.clone()));
+        m.insert("port".into(), self.port.map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+        m.insert(
+            "domains".into(),
+            match &self.domains {
+                Some(d) => serde_json::Value::from(d.clone()),
+                None => serde_json::Value::Null,
+            },
+        );
+        for (k, v) in [("tls_auto", &self.tls_auto), ("tls_cert", &self.tls_cert), ("tls_key", &self.tls_key)] {
+            m.insert(k.into(), v.clone().map(serde_json::Value::from).unwrap_or(serde_json::Value::Null));
+        }
+        m.insert("secure".into(), serde_json::Value::from(self.secure));
+        serde_json::Value::Object(m)
+    }
+
+    fn from_json(v: &serde_json::Value) -> Result<ServeSettings, String> {
+        let s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|x| x.to_string());
+        let bind = s("bind").filter(|b| !b.is_empty()).ok_or("bundle manifest: serve.bind is required")?;
+        let port = match v.get("port") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(p) => Some(
+                p.as_u64()
+                    .filter(|n| (1..=65535).contains(n))
+                    .map(|n| n as u16)
+                    .ok_or("bundle manifest: serve.port must be a port number")?,
+            ),
+        };
+        let domains = match v.get("domains") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Array(a)) => {
+                Some(a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+            }
+            Some(_) => return Err("bundle manifest: serve.domains must be a list".to_string()),
+        };
+        Ok(ServeSettings {
+            bind,
+            port,
+            domains,
+            tls_auto: s("tls_auto"),
+            tls_cert: s("tls_cert"),
+            tls_key: s("tls_key"),
+            secure: v.get("secure").and_then(|x| x.as_bool()).unwrap_or(false),
+        })
+    }
 }
 
 impl Manifest {
@@ -58,6 +136,13 @@ impl Manifest {
         );
         m.insert("profile".into(), serde_json::Value::from(self.profile.clone()));
         m.insert("built_at".into(), serde_json::Value::from(self.built_at.clone()));
+        // Sólo cuando hay algo que decir: un bundle de `run` no cambia ni un byte.
+        if self.mode == BundleMode::Serve {
+            m.insert("mode".into(), serde_json::Value::from("serve"));
+        }
+        if let Some(s) = &self.serve {
+            m.insert("serve".into(), s.to_json());
+        }
         serde_json::Value::Object(m).to_string()
     }
 
@@ -82,6 +167,21 @@ impl Manifest {
         if profile != "native" && profile != "pure" {
             return Err(format!("bundle manifest: unknown profile '{}'", profile));
         }
+        let mode = match v.get("mode").and_then(|x| x.as_str()) {
+            None | Some("run") => BundleMode::Run,
+            Some("serve") => BundleMode::Serve,
+            Some(other) => return Err(format!("bundle manifest: unknown mode '{}'", other)),
+        };
+        let serve = match v.get("serve") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(s) => Some(ServeSettings::from_json(s)?),
+        };
+        if mode == BundleMode::Serve && serve.is_none() {
+            return Err("bundle manifest: mode 'serve' without serve settings".to_string());
+        }
+        if mode == BundleMode::Serve && profile == "pure" {
+            return Err("bundle manifest: a serve bundle cannot run under the pure profile".to_string());
+        }
         Ok(Manifest {
             format,
             engine: str_field("engine")?,
@@ -89,6 +189,8 @@ impl Manifest {
             ceiling,
             profile,
             built_at: v.get("built_at").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            mode,
+            serve,
         })
     }
 }
@@ -159,6 +261,25 @@ impl Bundle {
     }
 
     /// Entradas (nombre, tamaño) bajo un prefijo de directorio (`""` = todas), en orden.
+    /// `true` si el bundle tiene al menos una entrada bajo `dir/` (un mount estático
+    /// declarado en el programa cuyos archivos viajan dentro del binario).
+    pub fn has_prefix(&self, dir: &str) -> bool {
+        match normalize_name(dir) {
+            Some(d) if d.is_empty() => !self.order.is_empty(),
+            Some(d) => {
+                let p = format!("{}/", d);
+                self.order.iter().any(|n| n.starts_with(&p))
+            }
+            None => false,
+        }
+    }
+
+    /// `true` si `key` es un "directorio" del bundle (tiene entradas debajo).
+    pub fn is_dir(&self, key: &str) -> bool {
+        let p = format!("{}/", key.trim_end_matches('/'));
+        !key.is_empty() && self.order.iter().any(|n| n.starts_with(&p))
+    }
+
     pub fn list(&self, dir: &str) -> Vec<(String, usize)> {
         let prefix = match dir.trim_matches(|c| c == '/' || c == '\\') {
             "" | "." => String::new(),
@@ -326,7 +447,42 @@ mod tests {
             ceiling: Some("stdout,net=api.example.com".into()),
             profile: "pure".into(),
             built_at: "2026-08-30T00:00:00Z".into(),
+            mode: BundleMode::Run,
+            serve: None,
         }
+    }
+
+    /// Un manifest `run` no escribe `mode`/`serve` (byte a byte el de v0.6.14); uno `serve`
+    /// los lleva y vuelve igual; los inválidos se rechazan al parsear.
+    #[test]
+    fn manifest_mode_and_serve_round_trip() {
+        let run = manifest();
+        let j = run.to_json();
+        assert!(!j.contains("\"mode\"") && !j.contains("\"serve\""), "{}", j);
+        assert_eq!(Manifest::from_json(&j).unwrap(), run);
+
+        let mut srv = manifest();
+        srv.profile = "native".into();
+        srv.mode = BundleMode::Serve;
+        srv.serve = Some(ServeSettings {
+            bind: "127.0.0.1".into(),
+            port: Some(8123),
+            domains: Some(vec!["a.example".into()]),
+            tls_auto: None,
+            tls_cert: Some("cert.pem".into()),
+            tls_key: Some("key.pem".into()),
+            secure: true,
+        });
+        let j = srv.to_json();
+        assert!(j.contains("\"mode\":\"serve\""), "{}", j);
+        assert_eq!(Manifest::from_json(&j).unwrap(), srv);
+
+        let bad = j.replace("\"mode\":\"serve\"", "\"mode\":\"daemon\"");
+        assert!(Manifest::from_json(&bad).unwrap_err().contains("unknown mode"));
+        let no_bind = j.replace("\"bind\":\"127.0.0.1\"", "\"bind\":\"\"");
+        assert!(Manifest::from_json(&no_bind).unwrap_err().contains("serve.bind is required"));
+        let pure = j.replace("\"profile\":\"native\"", "\"profile\":\"pure\"");
+        assert!(Manifest::from_json(&pure).unwrap_err().contains("pure profile"));
     }
 
     #[test]

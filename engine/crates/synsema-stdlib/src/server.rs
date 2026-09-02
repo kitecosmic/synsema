@@ -332,6 +332,10 @@ struct Mount {
     base: PathBuf,
     cache: Option<String>,
     fallback: Option<String>,
+    /// Clave normalizada del directorio dentro del bundle de `synsema build`, cuando el
+    /// binario lleva ese directorio adentro: el mount se sirve del bundle ANTES del disco
+    /// (la misma regla de overlay que `read_file`/`render`). `None` = disco solamente.
+    bundled: Option<String>,
 }
 
 /// Tabla de ruteo de un host: rutas + estáticos + auth propios. El host `default`
@@ -360,7 +364,13 @@ impl HostRouter {
             .map(|m| {
                 let real =
                     Path::new(&m.dir).canonicalize().unwrap_or_else(|_| PathBuf::from(&m.dir));
-                Mount { prefix: norm_prefix(&m.prefix), base: real, cache: m.cache, fallback: m.fallback }
+                // `synsema build`: si el directorio del mount viaja dentro del binario, se
+                // sirve de ahí (overlay: bundle antes que disco).
+                let bundled = synsema_core::bundle::mounted().and_then(|b| {
+                    let key = synsema_core::bundle::normalize_name(&m.dir)?;
+                    b.has_prefix(&key).then_some(key)
+                });
+                Mount { prefix: norm_prefix(&m.prefix), base: real, cache: m.cache, fallback: m.fallback, bundled }
             })
             .collect();
         mounts.sort_by_key(|m| std::cmp::Reverse(m.prefix.len()));
@@ -423,22 +433,30 @@ impl HostRouter {
             // Miss dentro del mount + `fallback` declarado → servir ese archivo con
             // 200 (history-fallback de SPA, semántica try_files). Sin fallback, se
             // sigue probando el próximo mount (comportamiento histórico).
-            let target = match resolve_in(base, &rel) {
-                Some(t) => t,
-                None => match &mount.fallback {
-                    Some(fb) => match resolve_in(base, fb) {
+            // Primero el bundle de `synsema build` (si el directorio viaja adentro), después
+            // el disco — el mismo orden de overlay que `read_file`/`render`.
+            let (data, ct, etag) = match bundled_static(mount, &rel) {
+                Some(hit) => hit,
+                None => {
+                    let target = match resolve_in(base, &rel) {
                         Some(t) => t,
-                        None => continue,
-                    },
-                    None => continue,
-                },
+                        None => match &mount.fallback {
+                            Some(fb) => match resolve_in(base, fb) {
+                                Some(t) => t,
+                                None => continue,
+                            },
+                            None => continue,
+                        },
+                    };
+                    let data = match std::fs::read(&target) {
+                        Ok(d) => d,
+                        Err(_) => continue,
+                    };
+                    let ct = static_content_type(&target);
+                    let etag = etag_for(&target, data.len());
+                    (data, ct, etag)
+                }
             };
-            let data = match std::fs::read(&target) {
-                Ok(d) => d,
-                Err(_) => continue,
-            };
-            let ct = static_content_type(&target);
-            let etag = etag_for(&target, data.len());
             // `cache "<...>"` del mount → header Cache-Control en 200/206/304.
             let finish = |mut sr: StaticResp| {
                 if let Some(c) = &mount.cache {
@@ -1674,6 +1692,45 @@ fn resolve_in(base: &Path, rel: &str) -> Option<PathBuf> {
         return None;
     }
     Some(target)
+}
+
+/// El mount servido desde el bundle de `synsema build`: `rel` se resuelve LÉXICAMENTE
+/// (el bundle no tiene symlinks) y sólo bajo el directorio del mount — nada del resto del
+/// bundle queda expuesto por tener un `static`. Directorio → `index.html`; miss → el
+/// `fallback` del mount; nada → `None` (y se prueba el disco, como siempre).
+fn bundled_static(mount: &Mount, rel: &str) -> Option<(Vec<u8>, String, String)> {
+    let dir = mount.bundled.as_deref()?;
+    let b = synsema_core::bundle::mounted()?;
+    let lookup = |rel: &str| -> Option<(Vec<u8>, String)> {
+        let rel = unquote(rel);
+        let rel = rel.trim_start_matches('/');
+        let rel = if rel.is_empty() { "index.html" } else { rel };
+        if Path::new(rel).is_absolute() || (rel.len() > 1 && rel.as_bytes()[1] == b':') {
+            return None;
+        }
+        let key = synsema_core::bundle::normalize_name(&format!("{}/{}", dir, rel))?;
+        let key = if b.is_dir(&key) { format!("{}/index.html", key) } else { key };
+        if key != dir && !key.starts_with(&format!("{}/", dir)) {
+            return None; // escapó del mount (`..`)
+        }
+        let bytes = b.get(&key)?;
+        Some((bytes.to_vec(), key))
+    };
+    let (data, key) = match lookup(rel) {
+        Some(hit) => hit,
+        None => lookup(mount.fallback.as_deref()?)?,
+    };
+    let ct = static_content_type(Path::new(&key));
+    // ETag por contenido (el bundle es inmutable y no tiene mtime): sha256 truncado.
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&data);
+        let out = h.finalize();
+        out.iter().take(8).map(|x| format!("{:02x}", x)).collect::<String>()
+    };
+    let etag = format!("\"b{:x}-{}\"", data.len(), digest);
+    Some((data, ct, etag))
 }
 
 fn static_content_type(path: &Path) -> String {

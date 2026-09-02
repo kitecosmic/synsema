@@ -213,3 +213,151 @@ fn build_usage_errors_exit_2() {
     assert_eq!(code, 2, "{}", err);
     assert!(err.contains("already a built program"), "{}", err);
 }
+
+// =========================================================
+// `synsema build --serve` (tanda PWA v0.6.16): el binario corre el runtime de serve con los
+// flags horneados y sirve los mounts estáticos DESDE EL BUNDLE (una PWA de un solo binario).
+// =========================================================
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+}
+
+/// Una request HTTP/1.1 cruda → (status, head, body).
+fn http(port: u16, path: &str) -> (u16, String, String) {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(std::time::Duration::from_secs(20))).unwrap();
+    s.write_all(format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", path).as_bytes()).unwrap();
+    let mut raw = Vec::new();
+    let _ = s.read_to_end(&mut raw);
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status: u16 = head.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    (status, head.to_string(), body.to_string())
+}
+
+fn header(head: &str, name: &str) -> Option<String> {
+    head.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.trim().eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+    })
+}
+
+fn serve_project(tag: &str, port: u16) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("synsema-build-serve-{}-{}", tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("public").join("sub")).unwrap();
+    std::fs::write(
+        dir.join("app.syn"),
+        format!(
+            "require serve({p})\n\nserve on {p}\n    static \"/\" from \"./public\" cache \"1h\"\n    route \"GET /\"\n        give render(\"index.html\", {{\"title\": \"bundled\"}})\n    route \"GET /api/ping\"\n        give ok({{\"pong\": true}})\n",
+            p = port
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("index.html"), "<h1>{ title }</h1>\n").unwrap();
+    std::fs::write(dir.join("public").join("app.js"), "console.log(\"from the bundle\");\n").unwrap();
+    std::fs::write(dir.join("public").join("sub").join("x.css"), "body{margin:0}\n").unwrap();
+    std::fs::write(dir.join("public").join("index.html"), "<p>static index</p>\n").unwrap();
+    dir
+}
+
+fn wait_ready(port: u16) {
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < std::time::Duration::from_secs(60) {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            let (st, _, _) = http(port, "/api/ping");
+            if st == 200 {
+                return;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+    panic!("el binario construido no levantó en 60 s");
+}
+
+#[test]
+fn build_serve_binary_serves_templates_and_statics_from_bundle() {
+    let port = free_port();
+    let dir = serve_project("ok", port);
+    let out_dir = std::env::temp_dir().join(format!("synsema-build-serve-out-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out_dir);
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let out = out_dir.join(exe_name("app"));
+    // Sin --include: los mounts estáticos del serve se bundlean solos.
+    let (code, stdout, err) = synsema(&dir, &["build", "app.syn", "-o", out.to_str().unwrap(), "--serve", "--bind", "127.0.0.1"]);
+    assert_eq!(code, 0, "{}\n{}", stdout, err);
+    assert!(stdout.contains("serve · bind 127.0.0.1"), "{}", stdout);
+    assert!(stdout.contains("5 files"), "app.syn + index.html + 3 estáticos: {}", stdout);
+    // El fuente desaparece: todo lo que sirva viene del bundle.
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let mut child = Command::new(&out)
+        .current_dir(&out_dir)
+        .env("SYNSEMA_NO_UPDATE_CHECK", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn built server");
+    wait_ready(port);
+
+    let (st, head, body) = http(port, "/");
+    assert_eq!(st, 200, "{}", head);
+    assert!(body.contains("<h1>bundled</h1>"), "la ruta declarada gana y el template viene del bundle: {}", body);
+    let (st, head, body) = http(port, "/app.js");
+    assert_eq!(st, 200, "{}", head);
+    assert!(header(&head, "content-type").unwrap().starts_with("text/javascript"), "{}", head);
+    assert!(body.contains("from the bundle"), "{}", body);
+    assert!(header(&head, "etag").unwrap().starts_with("\"b"), "ETag por contenido: {}", head);
+    assert_eq!(header(&head, "cache-control").as_deref(), Some("public, max-age=3600"));
+    let (st, _, body) = http(port, "/sub/x.css");
+    assert_eq!(st, 200);
+    assert_eq!(body.trim(), "body{margin:0}");
+    let (st, _, body) = http(port, "/sub/");
+    assert_eq!(st, 404, "un directorio sin index.html es 404, no un listado: {}", body);
+    let (st, _, _) = http(port, "/nope.txt");
+    assert_eq!(st, 404);
+    let (st, _, _) = http(port, "/../app.syn");
+    assert_ne!(st, 200, "el bundle no se expone fuera del mount");
+    let (st, _, _) = http(port, "/%2e%2e/app.syn");
+    assert_ne!(st, 200);
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+#[test]
+fn build_serve_flags_are_validated_at_build_time() {
+    let port = free_port();
+    let dir = serve_project("flags", port);
+    let out = dir.join(exe_name("app"));
+    let o = out.to_str().unwrap();
+    // Un programa con serve block sin --serve: se dice en el build, no al correr.
+    let (code, _, err) = synsema(&dir, &["build", "app.syn", "-o", o]);
+    assert_eq!(code, 2, "{}", err);
+    assert!(err.contains("has a serve block; pass --serve"), "{}", err);
+    // --serve sin --bind: un distribuible no adivina la interfaz.
+    let (code, _, err) = synsema(&dir, &["build", "app.syn", "-o", o, "--serve"]);
+    assert_eq!(code, 2, "{}", err);
+    assert!(err.contains("--serve needs --bind"), "{}", err);
+    // Flags de despliegue sin --serve.
+    let (code, _, err) = synsema(&dir, &["build", "app.syn", "-o", o, "--bind", "127.0.0.1"]);
+    assert_eq!(code, 2, "{}", err);
+    assert!(err.contains("applies to --serve builds"), "{}", err);
+    // El perfil puro no bindea sockets.
+    let (code, _, err) = synsema(&dir, &["build", "app.syn", "-o", o, "--serve", "--bind", "127.0.0.1", "--profile", "pure"]);
+    assert_eq!(code, 2, "{}", err);
+    assert!(err.contains("--serve --profile pure is not supported"), "{}", err);
+    // tls-auto y tls-cert son excluyentes (misma validación que `synsema serve`).
+    let (code, _, err) = synsema(&dir, &["build", "app.syn", "-o", o, "--serve", "--bind", "0.0.0.0", "--tls-auto", "a@b.c", "--tls-cert", "c.pem", "--tls-key", "k.pem"]);
+    assert_eq!(code, 2, "{}", err);
+    assert!(err.contains("mutually exclusive"), "{}", err);
+    // Un mount estático que no existe es un error del build.
+    std::fs::remove_dir_all(dir.join("public")).unwrap();
+    let (code, _, err) = synsema(&dir, &["build", "app.syn", "-o", o, "--serve", "--bind", "127.0.0.1"]);
+    assert_eq!(code, 2, "{}", err);
+    assert!(err.contains("static mount './public'"), "{}", err);
+    let _ = std::fs::remove_dir_all(&dir);
+}

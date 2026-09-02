@@ -323,6 +323,39 @@ fn run_bundled(bundle: synsema_core::bundle::Bundle, program_args: Vec<String>) 
         return ExitCode::from(1);
     }
     let source = if filename.ends_with(".fsyn") { synsema_core::flat_syntax::translate_flat(&source) } else { source };
+    // `synsema build --serve`: el runtime de `synsema serve` con los flags horneados. Bloquea
+    // mientras el server corra (Ctrl-C = shutdown ordenado, exit 0); exit 1 si no levanta.
+    if manifest.mode == synsema_core::bundle::BundleMode::Serve {
+        let Some(s) = manifest.serve.clone() else {
+            eprintln!("synsema: bundle corrupt (serve settings missing)");
+            return ExitCode::from(1);
+        };
+        let mut ov = ServeOverrides {
+            port: s.port,
+            domains: s.domains,
+            tls_auto_email: s.tls_auto,
+            tls_cert: s.tls_cert,
+            tls_key: s.tls_key,
+            bind: Some(s.bind),
+            ceiling: None,
+        };
+        // Igual que `synsema serve --sandbox`: un server necesita `serve` además del techo.
+        ov.ceiling = match (ceiling, manifest.ceiling.as_deref()) {
+            (Some(mut c), Some("sandbox")) => {
+                c.push(synsema_capabilities::model::Capability::new(synsema_capabilities::model::CapabilityType::Serve, None));
+                Some(c)
+            }
+            (c, _) => c,
+        };
+        let result = run_serve_program_with_overrides(&source, &filename, s.secure, ov);
+        if !result.success {
+            for e in &result.errors {
+                eprintln!("{}", e);
+            }
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
     let result = run_program_ceiled(&source, &filename, ceiling);
     for line in &result.output {
         println!("{}", line);
@@ -475,29 +508,47 @@ fn scaffold_file(base: &std::path::Path, f: &init_templates::InitFile) -> Result
 ///   (los PNG son derivados: "editá el svg y volvé a correr init" es el contrato);
 /// - sin `icon.svg` → no se toca nada (el usuario trajo sus PNG y se dice).
 fn pwa_icons(base: &std::path::Path) -> Result<String, String> {
-    let svg_path = base.join("public").join("icon.svg");
-    let svg = match std::fs::read_to_string(&svg_path) {
-        Ok(s) => s,
-        Err(_) => {
-            return Ok(
-                "init: public/icon.svg no está — no se generan PNG (traé los tuyos: icon-192.png, icon-512.png, apple-touch-icon.png)"
-                    .to_string(),
-            )
+    let mut generated: Vec<&str> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    for (src, factory_svg) in init_templates::PWA_ICON_SOURCES {
+        let outputs: Vec<(&str, u32)> = init_templates::PWA_ICONS
+            .iter()
+            .filter(|(s, _, _)| *s == src)
+            .map(|(_, out, px)| (*out, *px))
+            .collect();
+        let svg_path = base.join(src);
+        let svg = match std::fs::read_to_string(&svg_path) {
+            Ok(s) => s,
+            Err(_) => {
+                notes.push(format!(
+                    "{} no está — no se generan {} (traé los tuyos)",
+                    src,
+                    outputs.iter().map(|(o, _)| o.trim_start_matches("public/")).collect::<Vec<_>>().join(", ")
+                ));
+                continue;
+            }
+        };
+        let factory = svg == factory_svg;
+        let all_present = outputs.iter().all(|(o, _)| base.join(o).is_file());
+        if factory && all_present {
+            continue;
         }
+        for (out, px) in outputs {
+            let png = synsema_stdlib::raster::render_svg_png(&svg, px, px)
+                .map_err(|e| format!("no se pudo rasterizar {}: {}", svg_path.display(), e))?;
+            std::fs::write(base.join(out), png).map_err(|e| format!("no se pudo escribir {}: {}", out, e))?;
+            generated.push(out.trim_start_matches("public/"));
+        }
+    }
+    let mut msg = if generated.is_empty() {
+        "init: los PNG de los íconos ya están (SVG de fábrica)".to_string()
+    } else {
+        format!("init: {} generados desde los SVG de public/", generated.join(", "))
     };
-    let factory = svg == init_templates::PWA_ICON_SVG;
-    let all_present = init_templates::PWA_ICONS.iter().all(|(n, _)| base.join(n).is_file());
-    if factory && all_present {
-        return Ok("init: los PNG del ícono ya están (icon.svg de fábrica)".to_string());
+    for n in notes {
+        msg.push_str(&format!("\ninit: {}", n));
     }
-    let mut names: Vec<&str> = Vec::new();
-    for (name, px) in init_templates::PWA_ICONS {
-        let png = synsema_stdlib::raster::render_svg_png(&svg, px, px)
-            .map_err(|e| format!("no se pudo rasterizar {}: {}", svg_path.display(), e))?;
-        std::fs::write(base.join(name), png).map_err(|e| format!("no se pudo escribir {}: {}", name, e))?;
-        names.push(name.trim_start_matches("public/"));
-    }
-    Ok(format!("init: {} generados desde public/icon.svg", names.join(", ")))
+    Ok(msg)
 }
 
 /// Qué hacer con un archivo del scaffold que YA está en disco.

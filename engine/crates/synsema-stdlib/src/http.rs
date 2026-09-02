@@ -233,8 +233,16 @@ fn build_http_request(method: &str, path: &str, host: &str, headers: Option<&[(S
             req.push_str(&format!("{}: {}\r\n", k, v));
         }
     }
-    if let Some(b) = body {
-        req.push_str(&format!("Content-Length: {}\r\n", b.len()));
+    match body {
+        Some(b) => req.push_str(&format!("Content-Length: {}\r\n", b.len())),
+        // Un POST/PUT/PATCH sin cuerpo lleva `Content-Length: 0` (RFC 9110 §8.6: el método
+        // define un contenido, así que se declara que no hay) — sin él, algunos servidores
+        // responden 411 o esperan un cuerpo que nunca llega (visto con `push_send(sub, nothing)`).
+        None => {
+            if matches!(method.to_ascii_uppercase().as_str(), "POST" | "PUT" | "PATCH") {
+                req.push_str("Content-Length: 0\r\n");
+            }
+        }
     }
     req.push_str("\r\n");
     let mut out = req.into_bytes();
@@ -970,5 +978,29 @@ mod tests {
         assert!(identity_applies_to("vault.example", &many));
         assert!(identity_applies_to("x.mesh.internal", &many));
         assert!(!identity_applies_to("other.example", &many));
+    }
+}
+
+#[cfg(test)]
+mod content_length_tests {
+    use super::build_http_request;
+
+    /// RFC 9110 §8.6: un POST/PUT/PATCH sin cuerpo declara `Content-Length: 0`; un GET/DELETE
+    /// sin cuerpo no lleva ninguno; con cuerpo, el largo real.
+    #[test]
+    fn bodyless_post_declares_content_length_zero() {
+        let post = String::from_utf8(build_http_request("POST", "/push", "h", None, None)).unwrap();
+        assert!(post.contains("\r\nContent-Length: 0\r\n"), "{}", post);
+        assert!(post.ends_with("\r\n\r\n"));
+        for m in ["put", "PATCH"] {
+            let r = String::from_utf8(build_http_request(m, "/x", "h", None, None)).unwrap();
+            assert!(r.contains("Content-Length: 0"), "{}", r);
+        }
+        let get = String::from_utf8(build_http_request("GET", "/x", "h", None, None)).unwrap();
+        assert!(!get.contains("Content-Length"), "{}", get);
+        let del = String::from_utf8(build_http_request("DELETE", "/x", "h", None, None)).unwrap();
+        assert!(!del.contains("Content-Length"), "{}", del);
+        let with = String::from_utf8(build_http_request("POST", "/x", "h", None, Some(b"abc"))).unwrap();
+        assert!(with.contains("Content-Length: 3\r\n") && with.ends_with("\r\n\r\nabc"), "{}", with);
     }
 }

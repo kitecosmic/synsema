@@ -44,36 +44,41 @@ fn init_pwa_scaffolds_and_generates_icons() {
     let dir = tmp("scaffold");
     let (code, out, err) = synsema(&dir, &["init", "--pwa"]);
     assert_eq!(code, 0, "{}\n{}", out, err);
-    for name in ["app.syn", "push_keys.syn", "index.html", "public/manifest.webmanifest", "public/sw.js", "public/app.js", "public/icon.svg", ".env.example", ".gitignore", ".mcp.json"] {
+    for name in ["app.syn", "push_keys.syn", "index.html", "public/manifest.webmanifest", "public/sw.js", "public/app.js", "public/icon.svg", "public/icon-maskable.svg", "public/badge.svg", ".env.example", ".gitignore", ".mcp.json"] {
         assert!(dir.join(name).is_file(), "falta {}", name);
         assert!(out.contains(&format!("{} creado", dir.join(name).display())) || name.starts_with('.') || out.contains("creado"), "{}", out);
     }
     assert!(!dir.join("hello.syn").exists(), "el starter de --pwa es app.syn, no el tour");
-    assert!(out.contains("generados desde public/icon.svg"), "{}", out);
+    assert!(out.contains("generados desde los SVG"), "{}", out);
     assert!(out.contains("Próximos pasos"), "{}", out);
-    for (name, px) in [("public/icon-192.png", 192), ("public/icon-512.png", 512), ("public/apple-touch-icon.png", 180)] {
+    for (name, px) in [("public/icon-192.png", 192), ("public/icon-512.png", 512), ("public/apple-touch-icon.png", 180), ("public/icon-maskable-512.png", 512), ("public/badge-96.png", 96)] {
         let bytes = std::fs::read(dir.join(name)).unwrap();
         assert_eq!(png_dims(&bytes), (px, px), "{}", name);
     }
+    let manifest = std::fs::read_to_string(dir.join("public/manifest.webmanifest")).unwrap();
+    assert!(manifest.contains("\"id\": \"/\"") && manifest.contains("\"purpose\": \"maskable\""), "{}", manifest);
 
     // Segunda corrida: nada cambia, nada se pisa, los PNG no se regeneran.
     let before = std::fs::read(dir.join("public/icon-192.png")).unwrap();
+    let badge_before = std::fs::read(dir.join("public/badge-96.png")).unwrap();
     let (code, out, err) = synsema(&dir, &["init", "--pwa"]);
     assert_eq!(code, 0, "{}\n{}", out, err);
     assert!(out.contains("ya está al día"), "{}", out);
-    assert!(out.contains("los PNG del ícono ya están"), "{}", out);
+    assert!(out.contains("los PNG de los íconos ya están"), "{}", out);
     assert_eq!(std::fs::read(dir.join("public/icon-192.png")).unwrap(), before);
 
-    // El usuario edita icon.svg → los PNG se regeneran (y cambian).
+    // El usuario edita icon.svg → SUS PNG se regeneran (y cambian); los de los otros SVG no.
     let svg = std::fs::read_to_string(dir.join("public/icon.svg")).unwrap();
     std::fs::write(dir.join("public/icon.svg"), svg.replace("#111111", "#2266aa")).unwrap();
     let (code, out, err) = synsema(&dir, &["init", "--pwa"]);
     assert_eq!(code, 0, "{}\n{}", out, err);
-    assert!(out.contains("generados desde public/icon.svg"), "{}", out);
+    assert!(out.contains("icon-192.png, icon-512.png, apple-touch-icon.png generados"), "{}", out);
+    assert!(!out.contains("badge-96.png generados"), "el badge no se toca: {}", out);
     assert!(out.contains("icon.svg tiene cambios tuyos"), "el svg editado se conserva: {}", out);
     assert!(dir.join("public/icon.svg.new").is_file(), "y la versión de fábrica queda al lado");
     let after = std::fs::read(dir.join("public/icon-192.png")).unwrap();
     assert_ne!(after, before, "el PNG refleja el svg editado");
+    assert_eq!(std::fs::read(dir.join("public/badge-96.png")).unwrap(), badge_before);
 
     // Sin icon.svg (el usuario trajo sus PNG) → no se toca nada y se dice.
     std::fs::remove_file(dir.join("public/icon.svg")).unwrap();
@@ -82,7 +87,7 @@ fn init_pwa_scaffolds_and_generates_icons() {
     assert_eq!(code, 0, "{}\n{}", out, err);
     // init vuelve a escribir icon.svg de fábrica (es parte del scaffold) — pero ese
     // archivo recién creado ES de fábrica y los PNG ya existen → no se regeneran.
-    assert!(out.contains("los PNG del ícono ya están"), "{}", out);
+    assert!(out.contains("los PNG de los íconos ya están"), "{}", out);
     assert_eq!(std::fs::read(dir.join("public/icon-192.png")).unwrap(), after);
 
     // El directorio puede ir antes o después del flag (bug histórico: `--pwa miapp`
@@ -184,11 +189,21 @@ fn init_pwa_app_serves_manifest_sw_icons_and_api() {
     assert!(body.contains("rel=\"manifest\"") && body.contains("<title>My app</title>"), "{}", body);
     assert!(body.contains("body { margin: 0;"), "el bloque raw del CSS llega verbatim: {}", body);
 
-    for icon in ["/icon-192.png", "/icon-512.png", "/apple-touch-icon.png"] {
+    for icon in ["/icon-192.png", "/icon-512.png", "/apple-touch-icon.png", "/icon-maskable-512.png", "/badge-96.png"] {
         let (st, head, _) = http(port, "GET", icon, None);
         assert_eq!(st, 200, "{} {}", icon, head);
         assert_eq!(header(&head, "content-type").as_deref(), Some("image/png"), "{}", icon);
     }
+    // El manifest que el navegador lee: id estable + purpose separados.
+    let (_, _, body) = http(port, "GET", "/manifest.webmanifest", None);
+    assert!(body.contains("\"id\": \"/\"") && body.contains("\"purpose\": \"maskable\""), "{}", body);
+    // Un archivo bajo un directorio con punto (assetlinks de la Play Store) también se sirve, como JSON.
+    std::fs::create_dir_all(dir.join("public/.well-known")).unwrap();
+    std::fs::write(dir.join("public/.well-known/assetlinks.json"), "[]").unwrap();
+    let (st, head, body) = http(port, "GET", "/.well-known/assetlinks.json", None);
+    assert_eq!(st, 200, "{}", head);
+    assert!(header(&head, "content-type").unwrap().starts_with("application/json"), "{}", head);
+    assert_eq!(body.trim(), "[]");
     let (st, head, _) = http(port, "GET", "/icon.svg", None);
     assert_eq!(st, 200, "{}", head);
     assert_eq!(header(&head, "content-type").as_deref(), Some("image/svg+xml"));

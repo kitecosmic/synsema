@@ -455,6 +455,51 @@ fn static_route(
 /// rutas declaradas + `mount m.grupo [at "/prefijo"]` resueltos sintácticamente.
 /// Los `host "..."` (vhosts) no entran: publican su propia tabla bajo su Host.
 /// Devuelve `Ok(None)` si el programa no tiene `serve`.
+/// `true` si el programa tiene un bloque `serve` en el top-level (lo que `synsema build`
+/// necesita saber para exigir `--serve`).
+pub fn has_serve_block(program: &Program) -> bool {
+    program.statements.iter().any(|s| matches!(s.kind, NodeKind::ServeBlock { .. }))
+}
+
+/// Los directorios de TODOS los mounts estáticos del programa (`static "/x" from "./dir"`,
+/// en el serve block y en sus `host` blocks), como los escribió el programa. Un `from` que
+/// no es un literal de texto es un error: el bundle de `synsema build` es cerrado y no
+/// puede adivinar un directorio en runtime.
+pub fn static_mount_dirs(program: &Program) -> Result<Vec<String>, String> {
+    fn dirs_of(mounts: &[Node], out: &mut Vec<String>) -> Result<(), String> {
+        for m in mounts {
+            if let NodeKind::StaticMount { directory, .. } = &m.kind {
+                match text_of(Some(directory.as_ref())) {
+                    Some(d) => {
+                        if !out.contains(&d) {
+                            out.push(d);
+                        }
+                    }
+                    None => {
+                        return Err(format!(
+                            "{}: static mount directory must be a text literal to be bundled",
+                            m.location
+                        ))
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    for s in &program.statements {
+        if let NodeKind::ServeBlock { static_mounts, hosts, .. } = &s.kind {
+            dirs_of(static_mounts, &mut out)?;
+            for h in hosts {
+                if let NodeKind::HostBlock { static_mounts, .. } = &h.kind {
+                    dirs_of(static_mounts, &mut out)?;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn api_routes_static(sp: &StaticProgram) -> Result<Option<(ServeInfoStatic, Vec<ApiRoute>)>, String> {
     let serve = sp.main.statements.iter().find(|s| matches!(s.kind, NodeKind::ServeBlock { .. }));
     let Some(serve) = serve else { return Ok(None) };
