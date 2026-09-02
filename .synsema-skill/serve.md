@@ -441,8 +441,27 @@ serve on 8080
 - **Existing app → PWA:** run `synsema init --pwa` in the project (it never overwrites: yours is
   kept, the factory copy lands as `<file>.new`), mount `public/` at `/`, copy the `<head>` lines
   of the scaffold's `index.html` into your layout, add the `require net` lines if you want push.
-- `synsema build` note: static mounts are not read from the bundle yet — a built single-binary
-  PWA needs `public/` on disk next to it (templates ARE bundled).
+- **What the scaffold decides (v0.6.16+), so you don't relearn it on a phone:** the shell is
+  **stale-while-revalidate** (cached copy answers now, the network refreshes it for the next open —
+  bump `CACHE` in `sw.js` to force a new shell immediately); a tapped notification **focuses the
+  window already open** and tells it via `postMessage({type: "notificationclick", url})`, opening a
+  new one only when none exists (persist what must survive an OS kill in `localStorage`/IndexedDB);
+  notifications carry `badge: "/badge-96.png"` (the monochrome status-bar icon Android needs) and
+  `tag`/`renotify` when the payload has a `tag`; the manifest has `id: "/"` and **separate** `any` /
+  `maskable` icons (generated from `icon.svg` / `icon-maskable.svg` / `badge.svg`); `app.js` reports
+  a down server (a `no-store` probe of `/api/ping`, not just `navigator.onLine`), waits for the
+  *activated* worker, reuses an existing subscription, retries the first `subscribe` with backoff
+  (the first one after "Allow" fails on Android) and prints `name: message` on errors.
+- **Test on a real phone:** HTTPS is mandatory off the machine — a tunnel (`cloudflared tunnel --url
+  http://localhost:8080`, `ngrok http 8080`), `adb reverse tcp:8080 tcp:8080` + `http://localhost:8080`
+  on Android, or a VPS with `--domain … --tls-auto` (iOS: trusted cert only). Playwright runs: close
+  the browser in a `finally` and stop the serve child (orphans: `chrome.exe` with `ms-playwright`).
+- **Stores:** Play = Trusted Web Activity (PWABuilder/Bubblewrap) + `public/.well-known/assetlinks.json`
+  (served as JSON by the static mount); Microsoft Store takes the PWA directly; App Store needs a
+  native wrapper and **Web Push does not work in WKWebView**.
+- **One binary (v0.6.16+):** `synsema build app.syn -o app --serve --bind 0.0.0.0 --port 8080` —
+  the serve block's static mounts and the templates travel inside; served from the bundle before the
+  disk. See [deploy.md](deploy.md) § `synsema build`.
 
 ### CORS — `cors "*"` / `cors "https://app.com"`
 

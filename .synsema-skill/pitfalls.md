@@ -196,6 +196,14 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `manifest.webmanifest` served as `application/octet-stream` | Chrome won't offer install | The engine pins `application/manifest+json` (v0.6.15+); on older engines use `respond(read_file(p), "application/manifest+json")` |
 | The scaffold's `POST /api/push/test` in production | Anyone can push to all your users | It's a demo button (rate-limited); put `requires auth` on it or send from a cron/agent |
 | `init --pwa` on top of my app overwrote `app.syn` | It didn't — yours is kept, the factory one is `app.syn.new` | Copy what you need from the `.new`; `public/` is new either way |
+| I changed `app.js` but the installed app still runs the old one | The shell is stale-while-revalidate: the cached copy answers, the refresh lands for the NEXT open | Open twice, or bump `CACHE` in `sw.js` (its `activate` drops the old cache) when you need it now |
+| Tapping a notification opens a second, blank copy of the app | Not with the scaffold's `sw.js` (v0.6.16+): it focuses the open window and posts `{type: "notificationclick", url}` to it | Handle that message in `app.js` (the scaffold navigates to `url`); persist state that must survive an OS kill in `localStorage`/IndexedDB |
+| Android shows a generic bell in the status bar | No `badge` in the notification | The scaffold sends `badge: "/badge-96.png"` (monochrome, generated from `badge.svg`); keep the file when you add it to an existing app |
+| `pushManager.subscribe` fails right after "Allow" on Android | Known: the first subscribe after the permission grant can fail; the second works | The scaffold waits for the *activated* worker, reuses `getSubscription()`, and retries with backoff — copy that flow, and show `e.name + e.message` |
+| `navigator.onLine` says online but nothing works | It only knows if there is a network, not if YOUR server answers | Probe `/api/ping` with `{cache: "no-store"}` (the scaffold's status line does) |
+| Lighthouse: "any maskable" purpose flagged | Combined purposes are discouraged | Separate icons: `icon-512.png` (`any`) + `icon-maskable-512.png` (`maskable`) — what the v0.6.16+ manifest ships; add `screenshots` yourself |
+| `synsema build` of the PWA fails: `has a serve block; pass --serve` | A `serve on` program only runs under the serve runtime | `synsema build app.syn -o app --serve --bind 0.0.0.0` (v0.6.16+); `public/` is bundled automatically |
+| Play/TWA can't verify the origin | It reads `/.well-known/assetlinks.json` | Put it under `public/.well-known/`; the static mount serves dot-directories as JSON |
 
 ### Spend ledger — units
 

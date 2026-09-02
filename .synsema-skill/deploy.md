@@ -31,11 +31,22 @@ main `.syn`, its transitive `use` modules, the templates it `render`s by a liter
 
 ```bash
 synsema build app.syn -o app                                  # this platform
-synsema build app.syn -o app --include static/ --include "data/*.csv"  # bundle assets (dir / one-level glob, repeatable)
+synsema build app.syn -o app --include "data/*.csv"          # bundle extra assets (dir / one-level glob, repeatable)
 synsema build app.syn -o app --cap-set "stdout,net=api.example.com,serve=8080"  # BAKE a host ceiling
 synsema build app.syn -o app --profile pure                   # bake the pure profile (no fs/exec/db…)
 synsema build app.syn -o app-linux --engine-binary ./synsema-linux-x86_64  # cross: a donor engine
+synsema build app.syn -o app --serve --bind 0.0.0.0 --port 8080          # a SERVER binary (v0.6.16+): the serve
+synsema build app.syn -o app --serve --bind 0.0.0.0 --domain a.com --tls-auto x@a.com  # runtime + deploy flags baked in
 ```
+
+- **`--serve` (v0.6.16+)**: a program with a `serve on` block MUST be built with `--serve` (the
+  build refuses otherwise: without it the binary would fail at run time). `--bind` is required —
+  a distributable says where it listens (`127.0.0.1` local app, `0.0.0.0` public); `--port`,
+  `--domain`, `--tls-auto`, `--tls-cert`/`--tls-key`, `--secure` are the `synsema serve` knobs,
+  baked in (TLS files are read from disk at start). The serve block's **static mounts are bundled
+  automatically** (`static "/x" from "./public"` → `public/` goes in; a missing dir is a build
+  error) and served from the bundle before the disk, with a content ETag — an installable app
+  (PWA) is one file. Ctrl-C/SIGTERM = ordered shutdown, exit 0. `--serve --profile pure` is refused.
 
 - The built binary **runs your program**: its whole argv is the program's (`args()`), the baked
   `--cap-set`/`--profile` apply and can't be raised from inside, and it reads its own bundle — a
@@ -155,8 +166,9 @@ service worker, icons, the push routes). Deployment-wise only two things matter:
   to (`fcm.googleapis.com`, `*.notify.windows.com`, `updates.push.services.mozilla.com`,
   `web.push.apple.com`). Without keys the app runs; the page just says push is off.
 
-`synsema build` caveat: templates are baked into the binary, static mounts are not (yet) — ship
-`public/` beside a built binary. Everything else: [serve.md](serve.md) § Installable app (PWA).
+One binary, the whole app (v0.6.16+): `synsema build app.syn -o app --serve --bind 0.0.0.0 --port 8080
+[--domain … --tls-auto …]` — the serve block's `public/` mount and the templates travel inside the
+file. Everything else: [serve.md](serve.md) § Installable app (PWA).
 
 ## `synsema daemon` vs systemd — pick ONE
 
