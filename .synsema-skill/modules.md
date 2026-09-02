@@ -81,9 +81,12 @@ serve on 8080
     mount shop.tienda              -- or: mount shop.tienda at "/store"
 ```
 
-Rules: only `route` entries inside the group (no `stream`, no per-route `rate_limit`
-yet — clear errors); a mounted `requires auth` still demands `auth with` on the serve
-block; the group's shape is validated when the serve is built. Full details in
+Rules: `route` entries inside the group, each with its own `rate_limit` / `timeout`
+(v0.6.19+: a mounted route gets its own rate zone; a mount prefix is another zone —
+≤ v0.6.18 both were refused inside a group); no `stream`/`socket` routes in a group (they
+stay in the serve block — `synsema check` refuses them with the message `serve` would
+give); a mounted `requires auth` still demands `auth with` on the serve block; the
+group's shape is validated when the serve is built. Full details in
 [serve.md](serve.md) ("Mounted routes").
 
 ## Rules (verified)

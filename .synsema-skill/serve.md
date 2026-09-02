@@ -127,9 +127,10 @@ serve on 8080
   calls inside mounted bodies are startup-validated too, like any route.
 - Prefix rules: `at "/p"` must start with `/`; `route "GET /"` mounted at `/p`
   answers at `/p`. Precedence/specificity work as for any route.
-- v1 limits (clear errors): no `stream` routes in a group, no per-route
-  `rate_limit` inside a group (the serve default applies), `mount` at serve level
-  only (not inside `host` blocks).
+- Per-route `rate_limit` / `timeout` inside a group work since v0.6.19 (own zone per
+  mounted route; a mount prefix is another zone; ≤ v0.6.18 they were refused and the serve
+  default applied). Still not in a group (clear error, also from `synsema check`): `stream`
+  and `socket` routes; `mount` at serve level only (not inside `host` blocks).
 
 ## The request
 
@@ -398,7 +399,8 @@ public/sw.js                  -- service worker: caches the shell, NEVER /api/ n
 public/app.js                 -- registers sw.js, install button (beforeinstallprompt), online/offline, push subscribe
 public/icon.svg (+ icon-192.png, icon-512.png, apple-touch-icon.png generated from it)
 index.html                    -- <link rel="manifest">, theme-color, apple-touch-icon, mobile-web-app-capable
-app.syn                       -- static "/" from "./public" + the API + push routes
+app.syn                       -- static "/" from "./public" + the page + `mount api.api` (v0.6.19+; before: routes inline)
+api.syn                       -- v0.6.19+: the API as `export routes api` (/api/ping + push routes with per-route rate_limit) — shared with desk.syn (`init --desktop`)
 push_keys.syn                 -- one-off: prints the VAPID pair for .env
 ```
 
@@ -839,7 +841,8 @@ serve on 8080
 - **No new capability** — the route is already inside `serve`. `ws_connect` from a
   handler still needs `net(host)`.
 - Rules: `GET` only (parse error otherwise); `socket` and `stream` in the same route is
-  a parse error; not supported inside an `export routes` group yet (clear error).
+  a parse error; not supported inside an `export routes` group yet (clear error at serve
+  start — and from `synsema check` since v0.6.19).
   `socket` stays an ordinary identifier outside a route (`let socket be 3` is fine).
 - **The handle does not cross requests** (same isolation as a `ws_connect` inside a
   handler). To push to N open sockets from a cron/agent/another request, each socket
@@ -910,8 +913,9 @@ serve on 8080
   `cancelled: <reason>`. A `try`/`recover` can observe it, but the next statement raises
   again — clean up and leave. Child processes started with `run`/`proc_spawn` are killed.
 - `timeout` is a clause: outside a serve block / route body top level (in a `when`, a
-  task, top-level) it is a **runtime error**, never silently ignored. Not supported inside
-  `export routes` groups yet (clear error) — set it on the serve block.
+  task, top-level) it is a **runtime error**, never silently ignored. Inside an
+  `export routes` group it works since v0.6.19 (≤ v0.6.18: clear error — set it on the
+  serve block).
 - **Client disconnect on sized routes is not detected** (hyper does not expose it without
   a pending body); streams/sockets do detect it. Not promised, documented.
 
