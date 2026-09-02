@@ -47,6 +47,22 @@ pub fn http_request(
     }
 }
 
+/// Como `http_request` pero con body **binario** (un ciphertext, un PNG): el mismo
+/// transporte y el mismo `Content-Length`, sin pasar por `&str`. Lo usa `push_send`
+/// (el cuerpo `aes128gcm` de Web Push no es UTF-8).
+pub fn http_request_with_bytes(
+    method: &str,
+    url: &str,
+    headers: Option<&[(String, String)]>,
+    body: Option<&[u8]>,
+    timeout_secs: u64,
+) -> HttpResult {
+    match do_request(method, url, headers, body, timeout_secs) {
+        Ok(r) => r,
+        Err(e) => err_result(e),
+    }
+}
+
 fn parse_url(url: &str) -> Result<(String, String, u16, String), String> {
     let idx = url.find("://").ok_or_else(|| "invalid URL (no scheme)".to_string())?;
     let scheme = url[..idx].to_lowercase();

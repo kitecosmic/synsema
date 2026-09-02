@@ -52,6 +52,9 @@ pub mod secrets;
 pub mod server;
 pub mod spend;
 pub mod webauth;
+/// Web Push (RFC 8030/8291/8292): `push_send` gateado por `net(host)` + `push_vapid_keys`
+/// gateado por `random`. El cifrado y VAPID son puros; la red va por `http` (nativo).
+pub mod webpush;
 #[cfg(feature = "native")]
 pub mod proc;
 #[cfg(feature = "native")]

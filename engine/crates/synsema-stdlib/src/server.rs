@@ -61,6 +61,9 @@ pub fn web_content_type(ext: &str) -> Option<&'static str> {
         ".css" => "text/css; charset=utf-8",
         ".js" | ".mjs" => "text/javascript; charset=utf-8",
         ".json" | ".map" => "application/json; charset=utf-8",
+        // PWA: el manifest es lo que hace instalable a la app (tanda PWA); pinneado para
+        // que no dependa del registro del host (Windows puede no conocer la extensión).
+        ".webmanifest" => "application/manifest+json",
         ".svg" => "image/svg+xml",
         ".png" => "image/png",
         ".jpg" | ".jpeg" => "image/jpeg",

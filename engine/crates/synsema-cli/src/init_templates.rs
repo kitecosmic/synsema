@@ -301,6 +301,11 @@ const ENV_EXAMPLE_PAST: &[&str] = &[
     // v0.6.8 (antes de SYNSEMA_WATCH_MAX) y v0.6.9 (con él, sin el fix del knob)
     "2228ce300d028873345409bb4e2aad0e5e72222f675580a5ccddb7c51a3e59cc",
     "3f1e65e2d9b87302d4183381b92d26965b2db49dc7225a5056c124a7da16f1b2",
+    // Formas LF (lo que el binario escribe de verdad) de versiones commiteadas con CRLF:
+    // el guard las hasheaba con CRLF y esos shas jamás coincidían con un archivo real.
+    // Detectadas al normalizar el guard (tanda PWA, 2026-09-01).
+    "6c234f8044ab9ea0bd1fcf9df666409a56b2bdc8ce7069d37835351f4e64197c",
+    "17fda7b616215919a140c80176cce36c2852ec9c77b9966e36ab00bdbfd6e052",
 ];
 
 /// `.mcp.json`: registra el servidor MCP local `synsema-code` (`synsema code --mcp`) para
@@ -334,6 +339,341 @@ pub const INIT_FILES: [InitFile; 4] = [
     InitFile { name: ".gitignore", content: GITIGNORE, past: GITIGNORE_PAST },
     InitFile { name: ".mcp.json", content: MCP_JSON, past: MCP_JSON_PAST },
 ];
+
+// =========================================================
+// `synsema init --pwa` — app instalable (tanda PWA, specs/pwa-mobile.md)
+// =========================================================
+//
+// Scaffold EMBEBIDO (no descargado, como Synfide): siete archivos de texto que enseñan
+// un patrón y se testean contra el motor (regla anti-rot: `app.syn` y `push_keys.syn`
+// PARSEAN; el manifest es JSON con íconos 192/512; `index.html` y `sw.js` sólo
+// referencian archivos del scaffold o los PNG que init genera desde `icon.svg`).
+
+/// El programa: sitio + manifest + service worker + API + push nativo (opcional).
+pub const PWA_APP_SYN: &str = r#"-- Tu app instalable (PWA). Este programa sirve el sitio, el manifest, el service
+-- worker y el API. `synsema serve app.syn` → http://localhost:8080 (Chrome y Edge la
+-- instalan desde localhost). Producción: `synsema serve app.syn --domain app.example.com
+-- --tls-auto you@example.com` (iOS exige HTTPS con certificado confiable).
+--
+-- Push nativo (opcional): `synsema run push_keys.syn` imprime el par VAPID; pegalo en
+-- .env (VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT). Sin eso la página avisa
+-- que push no está configurado y todo lo demás funciona igual. ¿Ya tenés OneSignal,
+-- FCM u otro proveedor? Llamalo con http_post bajo `require net(...)`; nada te obliga.
+
+require serve(8080)
+require time
+require file.read("index.html")      -- render() lee la página del disco (en un `synsema build` no hace falta: va dentro del binario)
+require env("VAPID_PUBLIC_KEY")
+require env("VAPID_SUBJECT")
+require secret("VAPID_PRIVATE_KEY")
+-- Los push services a los que push_send() habla (deny-by-default: cada host se declara).
+-- Chrome/Android → FCM, Edge → WNS, Firefox → Mozilla, Safari/iOS → Apple.
+require net("fcm.googleapis.com")
+require net("*.notify.windows.com")
+require net("updates.push.services.mozilla.com")
+require net("web.push.apple.com")
+
+let vapid_public be env("VAPID_PUBLIC_KEY", "")
+
+task vapid_opts()
+    give {"vapid": {"public": vapid_public, "private": secret("VAPID_PRIVATE_KEY"), "subject": env("VAPID_SUBJECT", "mailto:you@example.com")}}
+
+serve on 8080
+    -- Todo lo estático vive en public/: manifest, service worker, íconos, JS.
+    -- Las rutas declaradas ganan sobre el estático; /api/* es lo que la app consume.
+    static "/" from "./public" cache "1h"
+
+    route "GET /"
+        give render("index.html", {"title": "My app"})
+
+    route "GET /api/ping"
+        give ok({"pong": true, "at": now()})
+
+    -- La clave pública VAPID que el navegador necesita para suscribirse ("" = push apagado).
+    route "GET /api/push/config"
+        give ok({"vapid_public": vapid_public})
+
+    -- El navegador manda su PushSubscription.toJSON(). Acá se guarda en memoria (state_*:
+    -- vive lo que el proceso, tope 500 para que nadie la infle). En tu app: guardala en
+    -- una tabla, atada al usuario logueado (`requires auth`).
+    route "POST /api/push/subscribe"
+        rate_limit 10 per minute
+        expect body {endpoint: text, keys: map}
+        let subs be state_get("push_subs", [])
+        let known be false
+        each s in subs
+            when s["endpoint"] == request.json["endpoint"]
+                set known to true
+        when not known and length(subs) < 500
+            state_set("push_subs", append(subs, request.json))
+        give created({"subscriptions": length(state_get("push_subs", []))})
+
+    -- Botón de DEMO: manda una notificación de prueba a todas las suscripciones y olvida
+    -- las que el push service reporta como desaparecidas (404/410 → r["gone"]) o las que
+    -- ni siquiera se pueden cifrar (claves rotas). En tu app esta ruta lleva
+    -- `requires auth`, o el envío vive en un cron/agente y no en una ruta pública.
+    route "POST /api/push/test"
+        rate_limit 2 per minute
+        when vapid_public == ""
+            give fail(503, "push is not configured: run `synsema run push_keys.syn` and fill .env")
+        let sent be 0
+        let kept be []
+        each sub in state_get("push_subs", [])
+            try
+                let r be push_send(sub, {"title": "My app", "body": "Native push from Synsema", "url": "/"}, vapid_opts())
+                when r["ok"]
+                    set sent to sent + 1
+                when not r["gone"]
+                    set kept to append(kept, sub)
+            recover err
+                log "push dropped: " + err
+        state_set("push_subs", kept)
+        give ok({"sent": sent, "kept": length(kept)})
+"#;
+
+/// Generador del par VAPID (una vez por app).
+pub const PWA_PUSH_KEYS_SYN: &str = r#"-- Genera el par de claves VAPID de tu app (una vez) y lo imprime para pegar en .env.
+-- La privada nace sellada (secret): reveal() la muestra a propósito, sólo acá, y deja
+-- rastro en el audit (por eso se declara).
+require random
+require reveal("vapid_private")
+
+let k be push_vapid_keys()
+print("VAPID_PUBLIC_KEY=" + k["public"])
+print("VAPID_PRIVATE_KEY=" + reveal(k["private"]))
+print("VAPID_SUBJECT=mailto:you@example.com")
+"#;
+
+/// La página: lo que iOS y Android necesitan para instalar, y nada más.
+pub const PWA_INDEX_HTML: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>{ title }</title>
+  <!-- El manifest es lo que hace instalable a la app (ícono, nombre, pantalla completa). -->
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#111111">
+  <!-- iOS: sin estas líneas Safari no abre en pantalla completa ni usa tu ícono. -->
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <style>{ raw }
+    :root { color-scheme: light dark; }
+    body { margin: 0; font: 16px/1.5 system-ui, sans-serif;
+           padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom)); }
+    button { font: inherit; padding: 10px 16px; margin: 4px 8px 4px 0; border-radius: 8px; border: 1px solid #8884; }
+    pre { white-space: pre-wrap; word-break: break-word; }
+    [hidden] { display: none !important; }
+  { end }</style>
+</head>
+<body>
+  <h1>{ title }</h1>
+  <p id="status">…</p>
+  <button id="install" hidden>Install</button>
+  <p id="ios-hint" hidden>On iPhone: Share → Add to Home Screen.</p>
+  <button id="ping">Ping the API</button>
+  <button id="notify">Notify me</button>
+  <button id="test" hidden>Send a test push</button>
+  <pre id="out"></pre>
+  <script src="/app.js"></script>
+</body>
+</html>
+"##;
+
+/// Manifest (el mismo archivo sirve para instalar en escritorio desde Edge/Chrome).
+pub const PWA_MANIFEST: &str = r##"{
+  "name": "My app",
+  "short_name": "My app",
+  "description": "An installable app served by Synsema",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#111111",
+  "theme_color": "#111111",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
+"##;
+
+/// Service worker: shell offline honesta (nunca cachea /api/ ni respuestas fallidas)
+/// + notificaciones push.
+pub const PWA_SW_JS: &str = r#"// Service worker de tu app: guarda la "shell" (lo que hace falta para abrir sin red) y
+// deja el API en red. Honesto: nunca guarda una respuesta de /api/ ni una que falló —
+// una app que muestra datos viejos como nuevos es peor que una que avisa.
+// Si tu "/" muestra datos del usuario logueado, sacala de SHELL (cacheá una página
+// pública de "sin conexión" en su lugar): el caché es por navegador, no por usuario.
+const CACHE = "app-shell-v1";
+const SHELL = ["/", "/app.js", "/manifest.webmanifest", "/icon-192.png"];
+
+self.addEventListener("install", (e) => {
+  e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
+});
+
+self.addEventListener("activate", (e) => {
+  e.waitUntil(
+    caches.keys()
+      .then((keys) => Promise.all(keys.filter((k) => k !== CACHE).map((k) => caches.delete(k))))
+      .then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener("fetch", (e) => {
+  const url = new URL(e.request.url);
+  if (e.request.method !== "GET" || url.origin !== self.location.origin) return;
+  if (url.pathname.startsWith("/api/")) {
+    // Red o nada: sin red el API responde 503 y la página lo dice.
+    e.respondWith(fetch(e.request).catch(() =>
+      new Response(JSON.stringify({ error: "offline" }), { status: 503, headers: { "Content-Type": "application/json" } })
+    ));
+    return;
+  }
+  // Shell: caché primero, y lo que llega bien por red se guarda para la próxima.
+  e.respondWith(caches.match(e.request).then((hit) => hit || fetch(e.request).then((res) => {
+    if (res.ok) { const copy = res.clone(); caches.open(CACHE).then((c) => c.put(e.request, copy)); }
+    return res;
+  })));
+});
+
+// Push: push_send() manda JSON si le pasás un map ({title, body, url}); texto si le pasás texto.
+self.addEventListener("push", (e) => {
+  let data = {};
+  try { data = e.data ? e.data.json() : {}; } catch (_) { data = { body: e.data ? e.data.text() : "" }; }
+  e.waitUntil(self.registration.showNotification(data.title || "My app", {
+    body: data.body || "", icon: "/icon-192.png", data,
+  }));
+});
+
+self.addEventListener("notificationclick", (e) => {
+  e.notification.close();
+  e.waitUntil(clients.openWindow((e.notification.data && e.notification.data.url) || "/"));
+});
+"#;
+
+/// La parte del navegador: registro del SW, instalar, online/offline, push.
+pub const PWA_APP_JS: &str = r#"// La parte del navegador: registra el service worker, ofrece instalar, dice si hay red,
+// y (si el server tiene claves VAPID) pide permiso y se suscribe a push.
+const $ = (id) => document.getElementById(id);
+const say = (t) => { $("out").textContent = t; };
+
+// 1. Service worker: sin él no hay instalación en Android ni shell offline.
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").catch((e) => say("service worker failed: " + e));
+}
+
+// 2. Instalar. Android y escritorio disparan beforeinstallprompt; iOS no tiene API
+//    (el usuario usa Compartir → Añadir a pantalla de inicio).
+let installEvent = null;
+window.addEventListener("beforeinstallprompt", (e) => {
+  e.preventDefault();
+  installEvent = e;
+  $("install").hidden = false;
+});
+$("install").onclick = async () => {
+  if (!installEvent) return;
+  installEvent.prompt();
+  await installEvent.userChoice;
+  installEvent = null;
+  $("install").hidden = true;
+};
+const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+const standalone = window.matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+if (isIOS && !standalone) $("ios-hint").hidden = false;
+
+// 3. Online/offline honesto.
+const net = () => {
+  $("status").textContent = navigator.onLine
+    ? (standalone ? "Installed · online" : "Online")
+    : "Offline — the shell works, the API does not";
+};
+window.addEventListener("online", net);
+window.addEventListener("offline", net);
+net();
+
+// 4. El API.
+$("ping").onclick = async () => {
+  try { const r = await fetch("/api/ping"); say(await r.text()); } catch (e) { say("offline: " + e); }
+};
+
+// 5. Push: la clave pública VAPID viene del server; la suscripción vuelve al server.
+function keyBytes(b64url) {
+  const s = atob(b64url.replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(s, (c) => c.charCodeAt(0));
+}
+$("notify").onclick = async () => {
+  try {
+    const cfg = await (await fetch("/api/push/config")).json();
+    if (!cfg.vapid_public) return say("push is not configured on the server (see app.syn)");
+    if (!("PushManager" in window)) {
+      return say(isIOS && !standalone
+        ? "iOS: install the app first (Share → Add to Home Screen), then tap again"
+        : "this browser has no Web Push");
+    }
+    const perm = await Notification.requestPermission();
+    if (perm !== "granted") return say("notifications denied");
+    const reg = await navigator.serviceWorker.ready;
+    const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(cfg.vapid_public) });
+    const r = await fetch("/api/push/subscribe", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(sub.toJSON()),
+    });
+    say("subscribed: " + (await r.text()));
+    $("test").hidden = false;
+  } catch (e) { say("push failed: " + e); }
+};
+$("test").onclick = async () => {
+  const r = await fetch("/api/push/test", { method: "POST" });
+  say(await r.text());
+};
+"#;
+
+/// Ícono fuente. Editalo y volvé a correr `synsema init --pwa`: los PNG se regeneran.
+pub const PWA_ICON_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Editá este archivo y volvé a correr el init con el flag pwa: regenera icon-192.png,
+       icon-512.png y apple-touch-icon.png. Zona segura para íconos "maskable": el 80% central. -->
+  <rect width="512" height="512" rx="96" fill="#111111"/>
+  <circle cx="256" cy="256" r="150" fill="none" stroke="#f5f5f5" stroke-width="28"/>
+  <circle cx="256" cy="256" r="52" fill="#f5f5f5"/>
+</svg>
+"##;
+
+/// Los archivos de `synsema init --pwa`, en orden (el scaffold base va aparte, sin
+/// `hello.syn`: acá el starter es `app.syn`). Los PNG NO están en la lista: son
+/// derivados de `icon.svg` y los genera `cmd_init` (ver `pwa_icons`).
+pub const PWA_FILES: [InitFile; 7] = [
+    InitFile { name: "app.syn", content: PWA_APP_SYN, past: &[] },
+    InitFile { name: "push_keys.syn", content: PWA_PUSH_KEYS_SYN, past: &[] },
+    InitFile { name: "index.html", content: PWA_INDEX_HTML, past: &[] },
+    InitFile { name: "public/manifest.webmanifest", content: PWA_MANIFEST, past: &[] },
+    InitFile { name: "public/sw.js", content: PWA_SW_JS, past: &[] },
+    InitFile { name: "public/app.js", content: PWA_APP_JS, past: &[] },
+    InitFile { name: "public/icon.svg", content: PWA_ICON_SVG, past: &[] },
+];
+
+/// Los PNG que init deriva de `public/icon.svg`: (nombre, lado en px).
+pub const PWA_ICONS: [(&str, u32); 3] =
+    [("public/icon-192.png", 192), ("public/icon-512.png", 512), ("public/apple-touch-icon.png", 180)];
+
+/// Nombre de la constante que guarda cada archivo (para el guard de historia).
+pub fn const_name(file: &str) -> &'static str {
+    match file {
+        "hello.syn" => "HELLO_SYN",
+        ".env.example" => "ENV_EXAMPLE",
+        ".mcp.json" => "MCP_JSON",
+        ".gitignore" => "GITIGNORE",
+        "app.syn" => "PWA_APP_SYN",
+        "push_keys.syn" => "PWA_PUSH_KEYS_SYN",
+        "index.html" => "PWA_INDEX_HTML",
+        "public/manifest.webmanifest" => "PWA_MANIFEST",
+        "public/sw.js" => "PWA_SW_JS",
+        "public/app.js" => "PWA_APP_JS",
+        "public/icon.svg" => "PWA_ICON_SVG",
+        other => panic!("init_templates: no constant registered for '{}'", other),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -374,24 +714,31 @@ mod tests {
             return;
         }
         let Some(log) = git(&["log", "--format=%H", "--reverse", "--", rel]) else { return };
-        for f in INIT_FILES {
-            let marker = format!(
-                "pub const {}: &str = r#\"",
-                match f.name {
-                    "hello.syn" => "HELLO_SYN",
-                    ".env.example" => "ENV_EXAMPLE",
-                    ".mcp.json" => "MCP_JSON",
-                    _ => "GITIGNORE",
-                }
-            );
+        for f in INIT_FILES.iter().chain(PWA_FILES.iter()) {
+            // Un template con `"#` adentro (colores CSS) vive en `r##"…"##`; los demás
+            // en `r#"…"#`. Se aceptan las dos formas (y un template puede cambiar de una
+            // a otra sin perder su historia).
+            let markers = [
+                (format!("pub const {}: &str = r##\"", const_name(f.name)), "\"##;"),
+                (format!("pub const {}: &str = r#\"", const_name(f.name)), "\"#;"),
+            ];
             let current = sha256_of(f.content);
             let mut missing: Vec<String> = Vec::new();
             for c in log.split_whitespace() {
                 let Some(src) = git(&["show", &format!("{}:{}", c, rel)]) else { continue };
-                let Some(i) = src.find(&marker) else { continue };
+                let Some((i, marker, close)) = markers
+                    .iter()
+                    .find_map(|(m, close)| src.find(m.as_str()).map(|i| (i, m, *close)))
+                else {
+                    continue;
+                };
                 let body = &src[i + marker.len()..];
-                let Some(j) = body.find("\"#;") else { continue };
-                let h = sha256_of(&body[..j]);
+                let Some(j) = body.find(close) else { continue };
+                // rustc normaliza CRLF → LF dentro de TODO literal (raw incluido): lo que
+                // el binario escribe en disco es la forma LF. Se hashea esa forma, así el
+                // sha corresponde a un archivo que un proyecto real puede tener, sin
+                // importar con qué finales de línea quedó commiteado el fuente.
+                let h = sha256_of(&body[..j].replace("\r\n", "\n"));
                 if h != current && !f.past.contains(&h.as_str()) && !missing.contains(&h) {
                     missing.push(h);
                 }
@@ -418,7 +765,7 @@ mod tests {
     /// `git log --reverse -- init_templates.rs` + sha256 del literal de cada commit.
     #[test]
     fn init_file_provenance_is_well_formed() {
-        for f in INIT_FILES {
+        for f in INIT_FILES.iter().chain(PWA_FILES.iter()) {
             let current = sha256_of(f.content);
             for h in f.past {
                 assert_eq!(h.len(), 64, "{}: '{}' no es un sha256", f.name, h);
@@ -456,6 +803,84 @@ mod tests {
             Ok(p) => assert!(p.statements.len() > 5, "template sospechosamente vacío"),
             Err(e) => panic!("el template hello.syn NO parsea: {:?}", e),
         }
+    }
+
+    // Anti-rot (PWA): los programas del scaffold PARSEAN con el parser real.
+    #[test]
+    fn pwa_programs_parse() {
+        for (name, src) in [("app.syn", PWA_APP_SYN), ("push_keys.syn", PWA_PUSH_KEYS_SYN)] {
+            if let Err(e) = synsema_core::parser::parse_source(src, name) {
+                panic!("el template {} NO parsea: {:?}", name, e);
+            }
+        }
+    }
+
+    /// Anti-rot (PWA): el manifest es JSON con los dos íconos que Android/Chrome exigen
+    /// para instalar (192 y 512), start_url/scope raíz y display standalone; y cada ícono
+    /// que nombra lo genera init.
+    #[test]
+    fn pwa_manifest_is_installable() {
+        let m: serde_json::Value = serde_json::from_str(PWA_MANIFEST).expect("manifest JSON");
+        assert_eq!(m["start_url"], "/");
+        assert_eq!(m["scope"], "/");
+        assert_eq!(m["display"], "standalone");
+        let icons = m["icons"].as_array().expect("icons");
+        let sizes: Vec<&str> = icons.iter().map(|i| i["sizes"].as_str().unwrap()).collect();
+        assert!(sizes.contains(&"192x192") && sizes.contains(&"512x512"), "{:?}", sizes);
+        for i in icons {
+            let src = i["src"].as_str().unwrap().trim_start_matches('/');
+            assert!(
+                PWA_ICONS.iter().any(|(n, _)| n.trim_start_matches("public/") == src),
+                "el ícono {} no lo genera init",
+                src
+            );
+        }
+    }
+
+    /// Anti-rot (PWA): index.html, sw.js, app.js y el manifest sólo referencian rutas que
+    /// el scaffold escribe o que init genera — un 404 en la shell rompe la instalación.
+    #[test]
+    fn pwa_scaffold_references_are_closed() {
+        let served: Vec<String> = PWA_FILES
+            .iter()
+            .filter_map(|f| f.name.strip_prefix("public/").map(|s| format!("/{}", s)))
+            .chain(PWA_ICONS.iter().map(|(n, _)| format!("/{}", n.trim_start_matches("public/"))))
+            .chain(["/".to_string()])
+            .collect();
+        for text in [PWA_INDEX_HTML, PWA_SW_JS, PWA_APP_JS, PWA_MANIFEST] {
+            for part in text.split('"') {
+                // Una ruta local de la shell: "/x.ext" o "/" (el API queda fuera: es red).
+                let is_local_path = part.starts_with('/')
+                    && !part.starts_with("/api/")
+                    && !part.contains(' ')
+                    && part.matches('/').count() == 1;
+                if is_local_path {
+                    assert!(served.contains(&part.to_string()), "{} se referencia pero el scaffold no lo sirve", part);
+                }
+            }
+        }
+    }
+
+    /// Anti-rot (PWA): el SVG del ícono rasteriza a los tres tamaños que init escribe.
+    #[test]
+    fn pwa_icon_svg_rasterizes() {
+        for (_, px) in PWA_ICONS {
+            let png = synsema_stdlib::raster::render_svg_png(PWA_ICON_SVG, px, px).expect("render");
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+            let w = u32::from_be_bytes([png[16], png[17], png[18], png[19]]);
+            let h = u32::from_be_bytes([png[20], png[21], png[22], png[23]]);
+            assert_eq!((w, h), (px, px));
+        }
+    }
+
+    /// Anti-rot (PWA): `.webmanifest` tiene content-type pinneado (lo que hace que el
+    /// navegador acepte el manifest sin depender del registro del host).
+    #[test]
+    fn pwa_manifest_content_type_is_pinned() {
+        assert_eq!(
+            synsema_stdlib::server::web_content_type(".webmanifest"),
+            Some("application/manifest+json")
+        );
     }
 
     /// Extrae los nombres de env-vars del runtime mencionados en un texto

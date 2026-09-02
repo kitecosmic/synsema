@@ -103,6 +103,27 @@ fn parse_tree(svg: &str, name: &str) -> Result<usvg::Tree, Control> {
         .map_err(|e| err(format!("{}: invalid SVG: {}", name, e)))
 }
 
+/// Rasteriza un SVG a un PNG de exactamente `w`×`h` píxeles (escala por eje: para
+/// íconos se pasa cuadrado). Helper **Rust-side** para `synsema init --pwa` y
+/// `synsema build --icon`: la misma fuente embebida y el mismo resolver sin I/O que
+/// `svg_to_png`, sin pasar por `SynValue`. Puro: no toca red, disco ni reloj.
+pub fn render_svg_png(svg: &str, w: u32, h: u32) -> Result<Vec<u8>, String> {
+    if w == 0 || h == 0 {
+        return Err("render_svg_png: width and height must be > 0".to_string());
+    }
+    let tree = parse_tree(svg, "render_svg_png").map_err(|c| match c {
+        Control::Error(e) => e.to_string(),
+        _ => "render_svg_png: invalid SVG".to_string(),
+    })?;
+    let (w0, h0) = (f64::from(tree.size().width()), f64::from(tree.size().height()));
+    let mut pixmap = tiny_skia::Pixmap::new(w, h)
+        .ok_or_else(|| format!("render_svg_png: cannot allocate a {}x{} pixmap", w, h))?;
+    let transform =
+        tiny_skia::Transform::from_scale((f64::from(w) / w0) as f32, (f64::from(h) / h0) as f32);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    pixmap.encode_png().map_err(|e| format!("render_svg_png: PNG encoding failed: {}", e))
+}
+
 // =========================================================
 // Lectura de opts
 // =========================================================

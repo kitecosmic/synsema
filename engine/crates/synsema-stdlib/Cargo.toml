@@ -75,6 +75,9 @@ pbkdf2.workspace = true
 scrypt.workspace = true
 aes.workspace = true
 ctr.workspace = true
+# Tanda PWA (webpush.rs): AES-128-GCM de Web Push — la ÚNICA dep nueva de la tanda
+# (ver la justificación en el workspace). ECDH P-256 es la feature `ecdh` de p256.
+aes-gcm.workspace = true
 curve25519-dalek.workspace = true
 tungstenite = { workspace = true, optional = true }
 # Tanda pty (`proc_spawn(..., {pty: true})`): pseudo-terminal cross-platform — openpty en

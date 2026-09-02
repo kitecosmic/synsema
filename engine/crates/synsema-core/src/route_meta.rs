@@ -106,6 +106,7 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     ("fetch", "net"), ("http", "net"), ("http_get", "net"), ("http_post", "net"),
     ("http_put", "net"), ("http_delete", "net"), ("mtls_identity", "net"),
     ("ws_connect", "net"),
+    ("push_send", "net"), // Web Push: el push service es un host más (tanda PWA)
     ("eth_rpc", "net"), ("eth_call", "net"), ("eth_send_raw", "net"), ("solana_rpc", "net"),
     ("algod", "net"), ("esplora", "net"),
     // bases de datos
@@ -133,6 +134,7 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     // tiempo y azar
     ("now", "time"), ("sleep", "time"), ("format_time", "time"), ("parse_time", "time"),
     ("date_parts", "time"),
+    ("push_vapid_keys", "random"), // material secreto nuevo, como token()/random_bytes()
     ("random", "random"), ("random_int", "random"), ("random_bytes", "random"),
     ("token", "random"),
     // llm (las expresiones reason/decide/analyze/generate se detectan por nodo)

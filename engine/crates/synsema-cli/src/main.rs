@@ -401,6 +401,105 @@ fn main() -> ExitCode {
     }
 }
 
+/// Escribe UN archivo del scaffold con el patrón conffiles. Devuelve `true` si lo creó.
+///
+/// Existir NO alcanza para decidir: hay que saber SI es tuyo. Se compara el sha256 del
+/// disco contra el contenido actual y contra los históricos (`InitFile::past`) — así un
+/// archivo de fábrica pero viejo recibe las novedades en vez de quedar congelado para
+/// siempre, y uno con ediciones tuyas jamás se pisa.
+fn scaffold_file(base: &std::path::Path, f: &init_templates::InitFile) -> Result<bool, ExitCode> {
+    let path = base.join(f.name);
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("init: no se pudo crear {}: {}", parent.display(), e);
+            return Err(ExitCode::from(1));
+        }
+    }
+    let disk = std::fs::read(&path).ok();
+    let action = match disk.as_deref() {
+        None => InitAction::Write,
+        Some(bytes) => {
+            let h = crate::update::sha256_hex(bytes);
+            if h == crate::update::sha256_hex(f.content.as_bytes()) {
+                InitAction::UpToDate
+            } else if f.past.contains(&h.as_str()) {
+                InitAction::Refresh
+            } else {
+                InitAction::KeepYours
+            }
+        }
+    };
+    match action {
+        InitAction::UpToDate => {
+            println!("init: {} ya está al día", path.display());
+            Ok(false)
+        }
+        InitAction::KeepYours => {
+            // Patrón conffiles (apt/pacman): tu versión se conserva y la nueva
+            // aterriza al lado, para que puedas ver la diferencia. Sin el `.new`
+            // el usuario nunca se entera de qué se perdió.
+            let new_path = base.join(format!("{}.new", f.name));
+            if let Err(e) = std::fs::write(&new_path, f.content) {
+                eprintln!("init: no se pudo escribir {}: {}", new_path.display(), e);
+                return Err(ExitCode::from(1));
+            }
+            println!(
+                "init: ⚠ {} tiene cambios tuyos — se conserva; la versión nueva quedó en {}",
+                path.display(),
+                new_path.display()
+            );
+            Ok(false)
+        }
+        InitAction::Write | InitAction::Refresh => match std::fs::write(&path, f.content) {
+            Ok(()) => {
+                if matches!(action, InitAction::Refresh) {
+                    println!("init: {} actualizado (estaba sin ediciones tuyas)", path.display());
+                    Ok(false)
+                } else {
+                    println!("init: {} creado", path.display());
+                    Ok(true)
+                }
+            }
+            Err(e) => {
+                eprintln!("init: no se pudo escribir {}: {}", path.display(), e);
+                Err(ExitCode::from(1))
+            }
+        },
+    }
+}
+
+/// Los PNG de la PWA, DERIVADOS de `public/icon.svg` con el rasterizador del motor
+/// (la misma fuente embebida que `svg_to_png`; sin herramientas externas). Regla:
+/// - `icon.svg` de fábrica y los tres PNG presentes → nada que hacer;
+/// - `icon.svg` editado por el usuario, o algún PNG faltante → se (re)generan los tres
+///   (los PNG son derivados: "editá el svg y volvé a correr init" es el contrato);
+/// - sin `icon.svg` → no se toca nada (el usuario trajo sus PNG y se dice).
+fn pwa_icons(base: &std::path::Path) -> Result<String, String> {
+    let svg_path = base.join("public").join("icon.svg");
+    let svg = match std::fs::read_to_string(&svg_path) {
+        Ok(s) => s,
+        Err(_) => {
+            return Ok(
+                "init: public/icon.svg no está — no se generan PNG (traé los tuyos: icon-192.png, icon-512.png, apple-touch-icon.png)"
+                    .to_string(),
+            )
+        }
+    };
+    let factory = svg == init_templates::PWA_ICON_SVG;
+    let all_present = init_templates::PWA_ICONS.iter().all(|(n, _)| base.join(n).is_file());
+    if factory && all_present {
+        return Ok("init: los PNG del ícono ya están (icon.svg de fábrica)".to_string());
+    }
+    let mut names: Vec<&str> = Vec::new();
+    for (name, px) in init_templates::PWA_ICONS {
+        let png = synsema_stdlib::raster::render_svg_png(&svg, px, px)
+            .map_err(|e| format!("no se pudo rasterizar {}: {}", svg_path.display(), e))?;
+        std::fs::write(base.join(name), png).map_err(|e| format!("no se pudo escribir {}: {}", name, e))?;
+        names.push(name.trim_start_matches("public/"));
+    }
+    Ok(format!("init: {} generados desde public/icon.svg", names.join(", ")))
+}
+
 /// Qué hacer con un archivo del scaffold que YA está en disco.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum InitAction {
@@ -424,10 +523,25 @@ fn cmd_init(args: &[String]) -> ExitCode {
     // `--synfide`: además del scaffold base (sin hello.syn — el starter es app.syn),
     // instala el framework Synfide VERSIONADO desde su último release (manifest +
     // sha256 por archivo; ver synfide.rs).
+    // `--pwa`: scaffold EMBEBIDO de una app instalable (tanda PWA, specs/pwa-mobile.md):
+    // app.syn + página + manifest + service worker + íconos generados desde icon.svg.
+    // Tampoco lleva hello.syn (el starter es app.syn). No descarga nada.
     let with_synfide = args.iter().any(|a| a == "--synfide");
+    let with_pwa = args.iter().any(|a| a == "--pwa");
+    if with_synfide && with_pwa {
+        eprintln!("init: --synfide y --pwa son starters distintos (cada uno trae su app.syn); elegí uno");
+        return ExitCode::from(2);
+    }
+    if let Some(bad) = args.iter().skip(2).find(|a| a.starts_with("--") && a.as_str() != "--synfide" && a.as_str() != "--pwa") {
+        eprintln!("init: flag desconocido '{}'\nuso: synsema init [dir] [--synfide | --pwa]", bad);
+        return ExitCode::from(2);
+    }
+    // El directorio es el primer positional, esté antes o después de los flags
+    // (`synsema init --pwa miapp` y `synsema init miapp --pwa` son lo mismo).
     let dir = args
-        .get(2)
-        .filter(|a| !a.starts_with("--"))
+        .iter()
+        .skip(2)
+        .find(|a| !a.starts_with("--"))
         .map(String::as_str)
         .unwrap_or(".");
     let base = std::path::Path::new(dir);
@@ -437,64 +551,37 @@ fn cmd_init(args: &[String]) -> ExitCode {
     }
     let mut created = 0usize;
     for f in init_templates::INIT_FILES {
-        if with_synfide && f.name == "hello.syn" {
-            continue; // el tour lo reemplaza el app.syn del framework
+        if (with_synfide || with_pwa) && f.name == "hello.syn" {
+            continue; // el tour lo reemplaza el app.syn del starter
         }
-        let path = base.join(f.name);
-        // Existir NO alcanza para decidir: hay que saber SI es tuyo. Se compara el
-        // sha256 del disco contra el contenido actual y contra los históricos
-        // (`InitFile::past`) — así un archivo de fábrica pero viejo recibe las
-        // novedades en vez de quedar congelado para siempre, y uno con ediciones
-        // tuyas jamás se pisa.
-        let disk = std::fs::read(&path).ok();
-        let action = match disk.as_deref() {
-            None => InitAction::Write,
-            Some(bytes) => {
-                let h = crate::update::sha256_hex(bytes);
-                if h == crate::update::sha256_hex(f.content.as_bytes()) {
-                    InitAction::UpToDate
-                } else if f.past.contains(&h.as_str()) {
-                    InitAction::Refresh
-                } else {
-                    InitAction::KeepYours
-                }
-            }
-        };
-        match action {
-            InitAction::UpToDate => println!("init: {} ya está al día", path.display()),
-            InitAction::KeepYours => {
-                // Patrón conffiles (apt/pacman): tu versión se conserva y la nueva
-                // aterriza al lado, para que puedas ver la diferencia. Sin el `.new`
-                // el usuario nunca se entera de qué se perdió.
-                let new_path = base.join(format!("{}.new", f.name));
-                if let Err(e) = std::fs::write(&new_path, f.content) {
-                    eprintln!("init: no se pudo escribir {}: {}", new_path.display(), e);
-                    return ExitCode::from(1);
-                }
-                println!(
-                    "init: ⚠ {} tiene cambios tuyos — se conserva; la versión nueva quedó en {}",
-                    path.display(),
-                    new_path.display()
-                );
-            }
-            InitAction::Write | InitAction::Refresh => match std::fs::write(&path, f.content) {
-                Ok(()) => {
-                    if matches!(action, InitAction::Refresh) {
-                        println!(
-                            "init: {} actualizado (estaba sin ediciones tuyas)",
-                            path.display()
-                        );
-                    } else {
-                        println!("init: {} creado", path.display());
-                        created += 1;
-                    }
-                }
-                Err(e) => {
-                    eprintln!("init: no se pudo escribir {}: {}", path.display(), e);
-                    return ExitCode::from(1);
-                }
-            },
+        match scaffold_file(base, &f) {
+            Ok(true) => created += 1,
+            Ok(false) => {}
+            Err(code) => return code,
         }
+    }
+    if with_pwa {
+        for f in init_templates::PWA_FILES {
+            // El resumen final de --pwa son los "próximos pasos", no un conteo.
+            if let Err(code) = scaffold_file(base, &f) {
+                return code;
+            }
+        }
+        match pwa_icons(base) {
+            Ok(msg) => println!("{}", msg),
+            Err(e) => {
+                eprintln!("init: {}", e);
+                return ExitCode::from(1);
+            }
+        }
+        let prefix = if dir == "." { String::new() } else { format!("{}/", dir.trim_end_matches(['/', '\\'])) };
+        println!();
+        println!("Listo. Próximos pasos:");
+        println!("  synsema serve {p}app.syn                  # http://localhost:8080 — Chrome/Edge la instalan desde localhost", p = prefix);
+        println!("  synsema run {p}push_keys.syn              # (opcional) par VAPID para push nativo → pegalo en {p}.env", p = prefix);
+        println!("  synsema serve {p}app.syn --domain app.example.com --tls-auto you@example.com   # en el VPS: el teléfono la instala", p = prefix);
+        println!("  editá {p}public/icon.svg y volvé a correr `synsema init --pwa` para regenerar los PNG", p = prefix);
+        return ExitCode::SUCCESS;
     }
     if with_synfide {
         if let Err(e) = synfide::install(base) {

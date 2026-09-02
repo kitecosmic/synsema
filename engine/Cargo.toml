@@ -215,7 +215,17 @@ argon2 = { version = "0.5", default-features = false, features = ["alloc", "pass
 # Ambas RustCrypto puro-Rust, misma familia que hmac/sha2/argon2 ya presentes; cero
 # `*-sys`/C → preservan el binario único estático.
 rsa = { version = "0.9", default-features = false, features = ["sha2"] }
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+# `ecdh` (tanda PWA): el acuerdo de claves de Web Push (RFC 8291) usa ECDH sobre la
+# MISMA P-256 — feature del crate ya presente (trae `hkdf` 0.12, RustCrypto; el HKDF de
+# webpush.rs es propio sobre hmac/sha2 y está fijado con el vector de RFC 5869).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh", "std"] }
+# Tanda PWA (webpush.rs): AES-128-GCM del cifrado de Web Push (RFC 8188 aes128gcm).
+# RustCrypto puro-Rust, misma familia que `aes`/`ctr` ya presentes (comparte `aes` 0.8 y
+# `ctr` 0.9; suma sólo el modo GCM: `aead`, `ghash`, `polyval`, `universal-hash`,
+# `opaque-debug`), CERO `*-sys`/C → preserva el binario único estático.
+# `default-features = false`: fuera `getrandom` (la sal y la clave efímera salen de OsRng,
+# como en webauth). Verificado en Cargo.lock: 7 entradas nuevas, ninguna `*-sys`.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 scrypt = { version = "0.11", default-features = false }
 aes = "0.8"

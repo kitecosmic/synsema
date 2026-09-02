@@ -437,6 +437,10 @@ pub(crate) fn wire_common_with_state(
     // T3 — OIDC de terceros (RS256/ES256 + JWKS): "login with Google" y workload
     // identity de nube. El fetch del JWKS es red → gateado por `net(host)`.
     synsema_stdlib::oidc::register_oidc_builtins(interp, caps.clone());
+    // Web Push (tanda PWA): `push_send` gateado por `net(host del endpoint)` — la MISMA
+    // puerta que http_*/fetch (el push service es un host más); `push_vapid_keys`
+    // gateado por `random` (material secreto nuevo, como token()/random_bytes()).
+    synsema_stdlib::webpush::register_webpush_builtins(interp, caps.clone());
     // Blockchain (Batch 11): encoding/verify/derive PUROS + firma GATEADA por `sign(NAME)`
     // + audit (cierra sobre el mismo CapabilitySet → sandbox lo vacía, deny-by-default).
     synsema_stdlib::blockchain::register_blockchain_builtins(interp, caps.clone());
