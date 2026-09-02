@@ -206,9 +206,12 @@ the same thing `web-push`/`pywebpush` do — no provider needed. A provider you 
   then load it with `secret("VAPID_PRIVATE_KEY")`. Same formats as `web-push generate-vapid-keys`.
 - `push_send(subscription, payload, opts)` → `{status, ok, gone, retry_after, body}`.
   **`require net("<host of the endpoint>")`** — the push service is a host like any other:
-  `fcm.googleapis.com` (Chrome/Android/Brave/Opera), `*.notify.windows.com` (Edge/Windows),
-  `updates.push.services.mozilla.com` (Firefox), `web.push.apple.com` (Safari/iOS/macOS). A
-  browser you didn't declare → the usual capability error naming the exact `require net(...)`.
+  `fcm.googleapis.com` **and** `jmt17.google.com` (Chrome/Android/Brave/Opera — Chrome hands out
+  either FCM domain), `*.notify.windows.com` (Edge/Windows), `updates.push.services.mozilla.com`
+  (Firefox), `web.push.apple.com` (Safari/iOS/macOS). A browser you didn't declare → the usual
+  capability error naming the exact `require net(...)`; treat it as **your config, not a dead
+  subscription** — keep the subscription, add the host, resend (the scaffold's `recover` does).
+  Exact hosts on purpose: `net("*.google.com")` would open egress far beyond push.
   - `subscription`: the map the browser gives you — `PushSubscription.toJSON()`:
     `{"endpoint": "https://…", "keys": {"p256dh": "…", "auth": "…"}}` (`expirationTime` is ignored).
     Endpoint must be `https://` (plain `http://` only on loopback, for mocks/tests).

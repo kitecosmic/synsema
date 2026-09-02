@@ -430,9 +430,12 @@ serve on 8080
   `POST /api/push/subscribe`; the server keeps it (a table in real life — the scaffold keeps
   500 in `state_*`) and delivers with `push_send(sub, payload, {"vapid": …})` — see
   [builtins.md](builtins.md) § Web Push for every option. Declare one `require net(...)` per
-  push service you serve: `fcm.googleapis.com`, `*.notify.windows.com`,
-  `updates.push.services.mozilla.com`, `web.push.apple.com`. `r["gone"]` (404/410) means the
-  subscription is dead → delete it. The scaffold's `POST /api/push/test` is a **demo** button
+  push service you serve: `fcm.googleapis.com` **and** `jmt17.google.com` (Chrome hands out
+  either), `*.notify.windows.com`, `updates.push.services.mozilla.com`, `web.push.apple.com`.
+  `r["gone"]` (404/410) means the subscription is dead → delete it. A **capability error**
+  (`Capability not granted: net("…")`) or an unreachable service is *your* config/network, not a
+  dead subscription: the scaffold's `recover` keeps it and logs which `require net` is missing;
+  it only drops a subscription whose error names `subscription` (broken keys/endpoint). The scaffold's `POST /api/push/test` is a **demo** button
   with `rate_limit 2 per minute`; in your app that route carries `requires auth` or the send
   lives in a cron/agent, never in a public route.
 - **A provider instead (OneSignal, FCM, Pusher Beams…):** `http_post` to its REST API under
@@ -448,10 +451,15 @@ serve on 8080
   new one only when none exists (persist what must survive an OS kill in `localStorage`/IndexedDB);
   notifications carry `badge: "/badge-96.png"` (the monochrome status-bar icon Android needs) and
   `tag`/`renotify` when the payload has a `tag`; the manifest has `id: "/"` and **separate** `any` /
-  `maskable` icons (generated from `icon.svg` / `icon-maskable.svg` / `badge.svg`); `app.js` reports
-  a down server (a `no-store` probe of `/api/ping`, not just `navigator.onLine`), waits for the
-  *activated* worker, reuses an existing subscription, retries the first `subscribe` with backoff
-  (the first one after "Allow" fails on Android) and prints `name: message` on errors.
+  `maskable` icons (generated from `icon.svg` / `icon-maskable.svg` / `badge.svg`); the SWR refresh
+  runs inside `e.waitUntil` (the browser may kill the worker right after it answered); the
+  worker's synthetic offline answer for `/api/*` carries `X-Synsema-Offline: 1`, so `app.js` can
+  tell "server unreachable" from a real 503 (a `no-store` probe of `/api/ping`, re-run on
+  `visibilitychange` and after a failed API call — `navigator.onLine` alone never sees a down
+  server); `app.js` waits for the *activated* worker with a 10 s cap and survives a `redundant`
+  one (a newer `sw.js` replaced it), reuses an existing subscription, retries the first
+  `subscribe` with backoff (the first one after "Allow" fails on Android) and prints
+  `name: message` on errors.
 - **Test on a real phone:** HTTPS is mandatory off the machine — a tunnel (`cloudflared tunnel --url
   http://localhost:8080`, `ngrok http 8080`), `adb reverse tcp:8080 tcp:8080` + `http://localhost:8080`
   on Android, or a VPS with `--domain … --tls-auto` (iOS: trusted cert only). Playwright runs: close

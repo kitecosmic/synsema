@@ -184,7 +184,8 @@ print("VAPID_PUBLIC_KEY=" + k["public"] + "\nVAPID_PRIVATE_KEY=" + reveal(k["pri
 ```
 require secret("VAPID_PRIVATE_KEY")
 require env("VAPID_PUBLIC_KEY")
-require net("fcm.googleapis.com")       -- Chrome/Android; add *.notify.windows.com (Edge),
+require net("fcm.googleapis.com")       -- Chrome/Android (Chrome also hands out jmt17.google.com);
+require net("jmt17.google.com")         -- add *.notify.windows.com (Edge),
 require net("web.push.apple.com")       -- updates.push.services.mozilla.com (Firefox), Apple
 let vapid be {"public": env("VAPID_PUBLIC_KEY"), "private": secret("VAPID_PRIVATE_KEY"), "subject": "mailto:ops@example.com"}
 each sub in sql("SELECT endpoint, keys FROM push_subs")
