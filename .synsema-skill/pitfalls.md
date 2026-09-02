@@ -408,6 +408,12 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | No `require` and wondering why I/O fails | Zero-access-by-default | Always declare `require` at top of program |
 | `set x to 5` without prior `let x be ...` | Runtime error | Always `let` before `set` |
 
+## `synsema update`
+
+| What you expect | What actually happens | Why / workaround |
+|---|---|---|
+| `synsema update` on Windows: `no se pudo mover el binario actual: Acceso denegado (os error 5)` | A `synsema serve` started **before the previous update** is still running the old image, now named `synsema.exe.old`; Windows lets a running exe be renamed but not deleted or overwritten, and the updater (≤ v0.6.16) tried to reuse that name | Restart those old serves (they run the old version anyway) or rename the file (`ren synsema.exe.old synsema.exe.old-x`) and run `synsema update` again. Fixed after v0.6.16: the updater picks a fresh `.old-<pid>` name and cleans stale ones next time |
+
 ## Secrets & config (see [secrets.md](secrets.md))
 
 | Pattern | Problem | Better approach |
