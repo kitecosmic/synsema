@@ -27,7 +27,7 @@ This skill is an **indexed folder**: read ONLY the section(s) you need for the t
 | **Debug an error** | Read it — errors carry `file:line` + suggestions. Then [pitfalls.md](pitfalls.md). |
 | **Inspect agents / swarm** | `synsema conform --swarm file.syn` (JSON blackboard + agent states) |
 | **Try interactively** | `synsema repl` |
-| **Install** | `curl -fsSL https://synsema.com/install.sh \| sh`, `irm https://synsema.com/install.ps1 \| iex`, or `npm i -g synsema` / `npx synsema …` (same native binary via npm, v0.6.3+) |
+| **Install** | `curl -fsSL https://synsema.org/install.sh \| sh`, `irm https://synsema.org/install.ps1 \| iex`, or `npm i -g synsema` / `npx synsema …` (same native binary via npm, v0.6.3+) |
 | **Update** binary + this skill | `synsema update` (installed by npm → `npm i -g synsema@latest`), then re-run the skill installer (see below) |
 | **Diagnose LLM config** | `synsema llm status` (resolved config with sources; names the missing variable when offline) |
 | **Start a new project** | `synsema init [dir]` (hello.syn tour + commented .env.example + .gitignore). Add `--synfide` (engine v0.5.3+) to also install the **Synfide framework** — durable workflows, approval inbox, persistent kv — version-pinned from its latest release (per-file sha256; `synfide/VERSION` records it; re-run to upgrade). **Re-running is safe and repairs:** every file is classified by
@@ -54,7 +54,7 @@ Also volunteer the right primitive: `paged()` for big SQL results, `parallel_map
   `curl -sL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash`
 - **Docs MCP** (search/get the official docs + run/test Synsema snippets in a sandbox — use it
   when a question goes beyond this skill or to VERIFY code you wrote):
-  `claude mcp add --transport http synsema-docs https://docs.synsema.com/mcp`
+  `claude mcp add --transport http synsema-docs https://synsema.dev/mcp`
 
 If observed behavior contradicts this skill, update binary + skill FIRST — the mismatch is
 usually version skew, not a bug.

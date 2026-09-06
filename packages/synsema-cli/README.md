@@ -1,6 +1,6 @@
 # synsema
 
-[Synsema](https://docs.synsema.com) — the programming language for AI agents — installed from npm.
+[Synsema](https://synsema.dev) — the programming language for AI agents — installed from npm.
 This package puts the **native `synsema` binary** (Rust, single static executable) on your
 PATH; it is the same binary as the GitHub release, wrapped for the Node ecosystem.
 
@@ -19,6 +19,6 @@ runs it with your arguments — no `postinstall`, no downloads at install time, 
 
 Updating: `npm i -g synsema@latest` (the binary's own `synsema update` notices it was
 installed by npm and tells you the same). Other install paths — `curl -fsSL
-https://synsema.com/install.sh | sh`, PowerShell, Docker, the WebAssembly artifacts and
+https://synsema.org/install.sh | sh`, PowerShell, Docker, the WebAssembly artifacts and
 the embeddable [`@synsema/wasm`](https://www.npmjs.com/package/@synsema/wasm) — are in the
-[docs](https://docs.synsema.com/en/latest/00-quickstart).
+[docs](https://synsema.dev).

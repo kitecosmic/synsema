@@ -24,7 +24,7 @@
     "url": "git+https://github.com/kitecosmic/synsema.git",
     "directory": "packages/synsema-cli"
   },
-  "homepage": "https://docs.synsema.com",
+  "homepage": "https://synsema.dev",
   "keywords": [
     "synsema",
     "agents",

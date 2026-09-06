@@ -17,11 +17,11 @@ pub const HELLO_SYN: &str = r#"-- Mi primer programa Synsema.
 -- con DOS comandos (los pega el dev o el propio agente — sin clonar nada):
 --   curl -sL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash
 --     (instala el skill: el agente escribe Synsema idiomático solo)
---   claude mcp add --transport http synsema-docs https://docs.synsema.com/mcp
+--   claude mcp add --transport http synsema-docs https://synsema.dev/mcp
 --     (MCP de docs: busca doc con search/get y VERIFICA sus snippets con run/test en sandbox)
 --   El .mcp.json de esta carpeta ya registra `synsema-code` (synsema code --mcp): outline,
 --     routes, refs, caps, check, search sobre TU código sin leer archivos enteros.
--- Docs para humanos: https://docs.synsema.com
+-- Docs para humanos: https://synsema.dev
 
 intent: "Mi primer programa Synsema"
 
@@ -61,7 +61,7 @@ print(persona["nombre"] + " tiene " + text(persona["edad"]))
 -- arriba). Corré el programa DOS veces y mirá el contador crecer — eso es un agente
 -- que recuerda. `recall` filtra por categoría/tags/texto y devuelve lo más nuevo
 -- primero; dentro de un `agent`, cada agente lee su propio namespace por defecto
--- (cruzá con `recall(from = "otro")`). Docs: https://docs.synsema.com → Memory & state.
+-- (cruzá con `recall(from = "otro")`). Docs: https://synsema.dev → Memory & state.
 remember("learning", "corrí el tour de hello.syn", ["tour"])
 let memorias be recall("learning", ["tour"])
 print("memorias del tour: " + text(length(memorias)) + " (corré de nuevo y crece)")
@@ -98,7 +98,7 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # Agentes (Claude Code y similares) — desarrollo potenciado desde el minuto 0,
 # DOS comandos y listo (en Windows, desde Git Bash el primero):
 #   curl -sL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash
-#   claude mcp add --transport http synsema-docs https://docs.synsema.com/mcp
+#   claude mcp add --transport http synsema-docs https://synsema.dev/mcp
 
 # ══ Provider LLM: elegí UN par (provider + SU key) y descomentá LAS DOS líneas ══
 # La key va SIEMPRE bajo la variable de SU provider (con provider=minimax, la key va

@@ -23,7 +23,7 @@ function binaryPath() {
   if (!pkg) {
     console.error(
       `synsema: no prebuilt binary for ${key} (supported: ${Object.keys(PLATFORMS).join(", ")}).\n` +
-        "Install the native binary instead: https://docs.synsema.com/en/latest/00-quickstart",
+        "Install the native binary instead: https://synsema.dev",
     );
     process.exit(2);
   }

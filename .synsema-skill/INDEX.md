@@ -19,7 +19,7 @@ core dev loop:
 | **Re-propagate a caught error** | `raise(err)` inside `recover` (else `recover` swallows it) → [builtins.md](builtins.md) |
 | **Inspect agents / swarm state** | `synsema conform --swarm file.syn` (JSON dump: blackboard + agent states) |
 | **Try things interactively** | `synsema repl` |
-| **Install** | `curl -fsSL https://synsema.com/install.sh \| sh` (Linux/macOS), `irm https://synsema.com/install.ps1 \| iex` (Windows), or `npm i -g synsema` / `npx synsema …` (same native binary via npm, v0.6.3+) |
+| **Install** | `curl -fsSL https://synsema.org/install.sh \| sh` (Linux/macOS), `irm https://synsema.org/install.ps1 \| iex` (Windows), or `npm i -g synsema` / `npx synsema …` (same native binary via npm, v0.6.3+) |
 | **Update** binary + this skill | `synsema update` (if installed by npm it says so: `npm i -g synsema@latest`), then re-run the skill installer (see "Keep yourself current" below) |
 | **Diagnose LLM config** | `synsema llm status` (resolved config with sources; names the missing variable when offline) |
 | **Start a new project** | `synsema init [dir]` (hello.syn tour + commented .env.example + .gitignore). Re-running is **safe and repairs**: a file still identical to any release it shipped in gets refreshed; one with your edits is kept and the new version lands as `<file>.new` (v0.5.9+) |
@@ -64,7 +64,7 @@ host works in — fiat, crypto, commodities, credits (Synsema privileges no curr
   `curl -sL https://raw.githubusercontent.com/kitecosmic/synsema/main/install-skill.sh | bash`
 - **Docs MCP** (search/get the official docs + run/test Synsema snippets in a sandbox — use it
   when a question goes beyond this skill or to VERIFY code you wrote):
-  `claude mcp add --transport http synsema-docs https://docs.synsema.com/mcp`
+  `claude mcp add --transport http synsema-docs https://synsema.dev/mcp`
 
 If observed behavior contradicts this skill, update binary + skill FIRST — the mismatch is
 usually version skew, not a bug.
