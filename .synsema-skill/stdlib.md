@@ -18,16 +18,22 @@ see [builtins.md](builtins.md).
 let r be http("POST", "https://api.store.com/orders",
     {"Authorization": bearer(secret("STORE_API_KEY")), "Content-Type": "application/json"},
     {"page": "1"},
-    {"product": "laptop", "quantity": 1}
+    json_encode({"product": "laptop", "quantity": 1})
 )
 
 -- Shorthands
 let r be http_get("https://api.store.com/products")
 let r be http_get(url, {"Authorization": bearer(secret("STORE_API_KEY"))}, {"page": "1"})
-let r be http_post(url, {"name": "Alice"}, {"Authorization": bearer(secret("STORE_API_KEY"))})
-let r be http_put(url, {"name": "Bob"})
+let r be http_post(url, json_encode({"name": "Alice"}),
+    {"Content-Type": "application/json", "Authorization": bearer(secret("STORE_API_KEY"))})
+let r be http_put(url, json_encode({"name": "Bob"}), {"Content-Type": "application/json"})
 let r be http_delete(url, {"x-api-key": secret("STORE_API_KEY")})  -- any header, not just Bearer
 ```
+
+> **The body goes out as text, exactly as you pass it.** A map passed as `body` is **not**
+> serialized: it is sent as its display text (`{name: Alice}`) with **no `Content-Type`**, and a
+> JSON API answers 400 (`request body is not a JSON object`). Always `json_encode(map)` plus
+> `{"Content-Type": "application/json"}` (verified v0.6.19 against a local `serve` echo route).
 
 **Timeout (optional, trailing arg on every HTTP builtin):** seconds as a positive number; absent
 or invalid → **30** (the historical default). Signatures: `http(method, url, headers?, query?,
@@ -48,15 +54,29 @@ root CAs — real certificate validation, pure-Rust). So `http_get("https://api.
 is fine for real-world APIs. **All HTTP (`http*` and `fetch`) is gated by `net(host)`** (deny-by-default,
 even in `run`): `require net("host")` — see capabilities.md. `require net` / `net("*")` = any host.
 
-Response is always a map:
+Response is always a map with exactly these keys (verified v0.6.19: `keys(r)` on a normal
+response is `[status, ok, body, headers]`):
 ```
 status of r      -- 200
 ok of r          -- true (200-299)
-body of r        -- raw text
-json of r        -- auto-parsed if content-type is json
-headers of r     -- response headers map
-error of r       -- error message if failed
+body of r        -- raw text — ALWAYS text (a binary body is lossy; no bytes variant yet)
+headers of r     -- response headers map, names exactly as the server sent them
+error of r       -- ONLY present when the transport failed (DNS, refused, timeout)
 ```
+
+- There is **no `json of r`**. Parse it yourself: `let data be json_decode(body of r)` — under
+  `try`/`recover` when the body may not be JSON.
+- `error of r` does **not** exist on a normal response, not even a 404/500 — reading it is
+  `Map has no key 'error'`. Branch on `ok of r` / `status of r`, or `contains(r, "error")`.
+- Header names keep the server's casing (`Content-Type` from GitHub, `content-type` from your
+  own `serve`). Look one up without guessing:
+  ```
+  task header(r, name)
+      each k in keys(headers of r)
+          when lower(k) == lower(name)
+              give (headers of r)[k]
+      give nothing
+  ```
 
 ## WebSocket (live feeds — general transport, not just blockchain)
 

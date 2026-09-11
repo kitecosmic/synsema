@@ -21,6 +21,7 @@ is verified against the engine by `tests/python_diff.test.syn` (semantics) and
 | `if / elif / else:` | `when / otherwise when / otherwise` (no colon) | a trailing `:` → parse error; `elif` is not a word |
 | `x if c else y` | `when c then x otherwise y` | inline expression form, usable in `let`/args |
 | `for x in xs:` | `each x in xs` | `for` → parse error |
+| `d["k"] = v` (add or overwrite a key) | `set m["k"] to v` | In place on an existing map: `{a: 1}` → `{a: 1, b: 2}` (v0.6.19). `m["k"]` reads it, `contains(m, "k")` tests it |
 | `for k in a_dict:` | `each k in keys(m)` | **`each` cannot iterate a map**: `Cannot iterate over map`. Go through `keys(m)`/`values(m)` |
 | `for i, x in enumerate(xs):` | `each e in enumerate(xs)` … `e.index` / `e.item` | `enumerate(list)` → `[{index, item}, …]` (engine > v0.5.9; before it: `each i in range(length(xs))` … `xs[i]`) |
 | `while c:` | `while c` | same keyword, no colon; runaway loops hit `Loop exceeded maximum iterations` |

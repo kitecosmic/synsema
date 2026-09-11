@@ -279,6 +279,10 @@ serve on 8080
 
 - The task takes exactly **3 parameters** `(status, message, request)` — arity is
   validated when the serve is built.
+- `request` is the **same map a route sees**: `path of request`, `query of request` (a map — the
+  query string is *not* inside `path`), `method`, `headers`, `cookies`, `ip`. Verified v0.6.19: a
+  404 for `/nope?next=/app/x` gives `path` = `"/nope"` and `query` = `{"next": "/app/x"}`, so the
+  "401 → login and come back" redirect can carry its parameters instead of losing them.
 - **The error status is preserved** — a 404 page is served WITH status 404 (no
   soft-404s). The single exception: returning `redirect(...)` keeps its 3xx +
   `Location` (the "401 → login" pattern).

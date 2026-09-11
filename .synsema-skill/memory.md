@@ -41,7 +41,8 @@ zero footprint on disk.
 - `require memory` without a name is a **parse error** (a declaration with no name has
   no identity).
 
-**Env vars:** `SYNSEMA_STATE_DIR` still relocates the state directory (tests, deploys;
+**Env vars:** `SYNSEMA_STATE_DIR` (process environment, not `.env`) relocates the state
+directory — verified v0.6.19: the `.db` lands there and no `.synsema/` is created in the project (tests, deploys;
 tip: `SYNSEMA_STATE_DIR=$(mktemp -d)` keeps test runs from writing `.synsema/` into the
 tree). `SYNSEMA_STATE_NAME` is **deprecated and ignored** (warning) — the declaration
 replaced it. If the project-local dir isn't writable it falls back to

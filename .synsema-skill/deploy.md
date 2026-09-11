@@ -98,6 +98,8 @@ see [secrets.md](secrets.md). Resolution: **process environment → `.env` file 
   | `SYNSEMA_WS_MAX_CONNS` | `4096` | live WebSocket handles per interpreter (`ws_connect` + incoming) |
   | `SYNSEMA_PROC_MAX` | `64` | live `proc_spawn` children per interpreter (hard ceiling 1024) |
   | `SYNSEMA_WATCH_MAX` | `64` | live `watch` handles per interpreter (hard ceiling 1024; one scanner thread each) |
+  | `SYNSEMA_STATE_DIR` | `<program dir>/.synsema/state` | where `memory("NAME")` keeps `<NAME>.db` — point it at a mounted volume and keep the code dir read-only (the `.db` is created there; nothing under the program dir) |
+  | `SYNSEMA_LLM_BUDGET` | unlimited | per-process LLM token ceiling — at the ceiling `reason`/`decide`/… degrade to a `[llm budget exceeded: …]` marker, never an error; unlike the rows above this one is also honored from `.env` — see [llm.md](llm.md) |
 
 - **Host ceiling for a whole server:** `synsema serve app.syn --sandbox` or
   `--cap-set "stdout,time,serve=8080,net=api.example.com"` caps the program's **preamble**, its
