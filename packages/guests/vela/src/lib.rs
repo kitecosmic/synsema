@@ -52,9 +52,47 @@ use std::cell::Cell;
 
 use serde_json::{json, Map, Value};
 
-/// El programa de la app, embebido en build (`SYNSEMA_VELA_APP`, default `app.syn`).
-const APP_SOURCE: &str = include_str!(concat!(env!("OUT_DIR"), "/app.syn"));
-const APP_NAME: &str = env!("SYNSEMA_VELA_APP_NAME");
+/// El programa de la app vive en un SLOT de tamaño fijo dentro de los datos del módulo
+/// (`build.rs` lo llena con `SYNSEMA_VELA_APP`, default `app.syn`). La cabecera lo hace
+/// localizable en el `.wasm` ya compilado: `tools/embed.syn` lo sobreescribe con otro programa sin
+/// compilador de por medio — mismo intérprete, y el SHA-256 que Vela verifica cubre a los dos.
+/// Layout: magic (16) · largo del nombre (1) · nombre (63) · largo u32 LE (4) · programa · relleno.
+const SLOT_MAGIC: &[u8; 16] = b"SYNSEMA.APPSLOT1";
+const SLOT_SIZE: usize = 524_288;
+const SLOT_HEADER: usize = 16 + 1 + 63 + 4;
+/// `static mut` a propósito: un `static` inmutable es una constante para LLVM, que podría plegar
+/// lecturas con el contenido del build; así siempre se lee lo que hay en memoria (lo parcheado).
+#[no_mangle]
+#[used]
+static mut APP_SLOT: [u8; SLOT_SIZE] = *include_bytes!(concat!(env!("OUT_DIR"), "/app.slot"));
+
+fn app_slot() -> &'static [u8] {
+    // SAFETY: el slot nunca se escribe en runtime; sólo se lee a través del puntero.
+    unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(APP_SLOT) as *const u8, SLOT_SIZE) }
+}
+
+/// El programa (texto) que hay en el slot; vacío si la cabecera no es la esperada.
+fn app_source() -> &'static str {
+    let s = app_slot();
+    if &s[..16] != SLOT_MAGIC {
+        return "";
+    }
+    let len = u32::from_le_bytes([s[80], s[81], s[82], s[83]]) as usize;
+    if len > SLOT_SIZE - SLOT_HEADER {
+        return "";
+    }
+    core::str::from_utf8(&s[SLOT_HEADER..SLOT_HEADER + len]).unwrap_or("")
+}
+
+/// El nombre del archivo del programa (para logs y errores), o `app.syn`.
+fn app_name() -> &'static str {
+    let s = app_slot();
+    let n = s[16] as usize;
+    if &s[..16] != SLOT_MAGIC || n == 0 || n > 63 {
+        return "app.syn";
+    }
+    core::str::from_utf8(&s[17..17 + n]).unwrap_or("app.syn")
+}
 
 /// Techo del programa: sólo `stdout` (los `print` se recogen como logs). Sin `time` ni `random`
 /// ni nada del host: el mismo input da siempre los mismos bytes.
@@ -160,11 +198,11 @@ unsafe fn input(ptr: i32, len: i32) -> &'static [u8] {
 /// inicial es el de `deploy` sin parámetros (lo que hace la app de referencia).
 #[no_mangle]
 pub extern "C" fn load_module(app_id: i64) -> i32 {
-    log("INF", &format!("synsema-vela-guest: engine {}, app {}", engine_version(), APP_NAME));
+    log("INF", &format!("synsema-vela-guest: engine {}, app {}", engine_version(), app_name()));
     let ctx = json!({"app_id": app_id, "kind": "load_module", "params": Value::Null});
     let r = run_app("load_module", Some("deploy"), &ctx);
     let steps = r.steps;
-    let own_task = defines_task(APP_SOURCE, "load_module");
+    let own_task = defines_task(app_source(), "load_module");
     let result = deploy_like_result(r);
     // Sin `load_module` propia, un `deploy` que exige params (p. ej. la dirección de un trigger
     // contract) no debe tumbar el warm-up: el Executor descarta este estado (sigue con el
@@ -185,7 +223,7 @@ pub extern "C" fn load_module(app_id: i64) -> i32 {
 /// Los punteros/longitudes los escribió el host con `allocate`.
 #[no_mangle]
 pub unsafe extern "C" fn deploy(app_id: i64, params_ptr: i32, params_len: i32) -> i32 {
-    log("INF", &format!("synsema-vela-guest: deploy app {} (engine {}, program {})", app_id, engine_version(), APP_NAME));
+    log("INF", &format!("synsema-vela-guest: deploy app {} (engine {}, program {})", app_id, engine_version(), app_name()));
     let params = decode_json_or_text(input(params_ptr, params_len));
     let ctx = json!({"app_id": app_id, "kind": "deploy", "params": params});
     let r = run_app("deploy", None, &ctx);
@@ -304,9 +342,9 @@ struct AppRun {
 /// logs de resultado: la ÚLTIMA línea impresa es el JSON del resultado (la imprime el driver);
 /// todo lo anterior son `print` de la app y van a los logs de Vela.
 fn run_app(task: &str, fallback: Option<&str>, ctx: &Value) -> AppRun {
-    let call = if defines_task(APP_SOURCE, task) {
+    let call = if defines_task(app_source(), task) {
         format!("set __vela_out to {}(__vela_in)", task)
-    } else if let Some(fb) = fallback.filter(|fb| defines_task(APP_SOURCE, fb)) {
+    } else if let Some(fb) = fallback.filter(|fb| defines_task(app_source(), fb)) {
         format!("set __vela_out to {}(__vela_in)", fb)
     } else {
         let mut m = Map::new();
@@ -315,11 +353,11 @@ fn run_app(task: &str, fallback: Option<&str>, ctx: &Value) -> AppRun {
     };
     let source = format!(
         "{}\n\nlet __vela_in be json_decode(\"{}\")\nlet __vela_out be nothing\n{}\nprint(json_encode(__vela_out))\n",
-        APP_SOURCE,
+        app_source(),
         syn_escape(&ctx.to_string()),
         call
     );
-    let req = json!({"op": "run", "source": source, "filename": APP_NAME, "ceiling": CEILING});
+    let req = json!({"op": "run", "source": source, "filename": app_name(), "ceiling": CEILING});
     let raw = synsema_wasm_web::call_json(&req.to_string());
     let resp: Value = match serde_json::from_str(&raw) {
         Ok(v) => v,

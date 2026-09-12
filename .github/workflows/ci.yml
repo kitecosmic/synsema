@@ -281,6 +281,13 @@ jobs:
       - name: Probe under wasmtime-go v1.0.0 (the Executor's exact runtime)
         working-directory: packages/guests/vela/tests/wasmtime-go
         run: go run . ../../../../../engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm
+      - name: The app slot — embed another program into the built module without a compiler, and probe it
+        # tools/embed.syn finds the slot in the .wasm and overwrites it: what a kit does with the
+        # release asset instead of building. The result must load and answer like a fresh build.
+        run: |
+          engine/target/debug/synsema test packages/guests/vela/tools/embed.syn
+          engine/target/debug/synsema run packages/guests/vela/tools/embed.syn -- engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm packages/guests/vela/examples/payment_app.syn /tmp/payment.wasm
+          cd packages/guests/vela/tests/wasmtime-go && go run . /tmp/payment.wasm
       - name: Size budget (< 50 MB is Vela's upload limit; keep it under 12 MB)
         run: |
           sz=$(wc -c < engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm)
