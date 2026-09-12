@@ -287,7 +287,8 @@ jobs:
         run: |
           engine/target/debug/synsema test packages/guests/vela/tools/embed.syn
           engine/target/debug/synsema run packages/guests/vela/tools/embed.syn -- engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm packages/guests/vela/examples/payment_app.syn /tmp/payment.wasm
-          cd packages/guests/vela/tests/wasmtime-go && go run . /tmp/payment.wasm
+          # the payment app speaks novaw's dialect: {type, transfer: {to, amount (hex)}}
+          cd packages/guests/vela/tests/wasmtime-go && PAYLOAD='{"type":"transfer","transfer":{"to":"0x2222222222222222222222222222222222222222","amount":"0x1"}}' go run . /tmp/payment.wasm
       - name: Size budget (< 50 MB is Vela's upload limit; keep it under 12 MB)
         run: |
           sz=$(wc -c < engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm)
