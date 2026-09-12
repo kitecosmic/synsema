@@ -90,7 +90,8 @@ usually version skew, not a bug.
 
 **Project & deployment**
 - [structure.md](structure.md) — File map of the codebase
-- [deploy.md](deploy.md) — Daemon mode, Docker, VPS, Kubernetes, systemd
+- [deploy.md](deploy.md) — Daemon mode, Docker, VPS, Kubernetes, systemd, the two wasm artifacts
+- [guests.md](guests.md) — Synsema **inside a host with its own wasm ABI** (Vela / Horizen's confidential coprocessor): the `.syn` contract (`deploy`/`deposit`/`process`/`deanonymize`/`trusted`, one map in, one map out, `payload_hex`/`data_hex`/subtype labels, fuel), the client in Synsema (keys, register, deploy with/without trigger, deposit ETH/ERC-20, encrypted send, reports, decrypted events, facilitator/meta-transactions), trigger contracts, the local starter kit recipe, and how to add another host
 
 **Troubleshooting**
 - [pitfalls.md](pitfalls.md) — Read first if something fails. Common errors, surprises, anti-patterns.

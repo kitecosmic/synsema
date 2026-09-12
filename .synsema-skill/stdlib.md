@@ -684,6 +684,13 @@ Builtins:
 - keccak256 ≠ SHA3-256 (different padding). Use `keccak256`, not any SHA3.
 - ed25519 signs the RAW message (hashes internally, RFC 8032) — do NOT pre-hash.
   secp256k1 takes a 32-byte digest; ed25519 takes the message.
+- The recovery byte `v` has two conventions. `secp256k1_sign` returns the RAW one, 0/1 (go-ethereum
+  `crypto.Sign`, libsecp256k1, typed EIP-1559 txs — `tx_eip1559_raw` wants exactly that). Anything a
+  CONTRACT verifies — `ecrecover`, OpenZeppelin `ECDSA.recover`, an EIP-2612 `permit`, an EIP-712
+  authorization — and every wallet (MetaMask / ethers / viem `personal_sign`, `signTypedData`) uses
+  27/28. Add 27 before handing a Synsema signature to a contract; subtract 27 from a wallet's signature
+  before `secp256k1_recover` (it accepts 0..3 only; `secp256k1_verify` ignores `v`). One line each way:
+  `slice(sig, 0, 64) + bytes([sig[64] + 27])`.
 - In the signed tx, r/s are RLP **integers** (minimal, leading zeros stripped), NOT
   32-byte blobs — pasting `slice(sig, 0, 32)` raw makes ~1 in 128 txs invalid.
   `tx_eip1559_raw(tx, sig)` handles v/r/s for you; hand-rolling, use

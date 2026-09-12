@@ -30,6 +30,7 @@ core dev loop:
 | **Run code you DON'T trust** | host ceiling `--sandbox`/`--cap-set "…"` (on `run`/`test`/`conform`/`serve`; `none` = nothing), second wall `--profile pure`, log with `--audit json`; or from a program `run_program(source, {ceiling, profile, env, timeout})` (`require sandbox_run`) → [capabilities.md](capabilities.md) |
 | **Pass argv / read stdin** (v0.6.14+) | `synsema run app.syn -- a b` → `args()`; `synsema run -` reads source from stdin; `--format json` = the run as one JSON doc |
 | **Run in WASM** (TEE / confidential job / edge, v0.6.0+) | build `synsema-wasm.wasm` (wasm32-wasip1) and `wasmtime run --dir . synsema-wasm.wasm file.syn` — the pure profile (also `synsema run --profile pure` natively, v0.6.14+) → [deploy.md](deploy.md) § WebAssembly |
+| **Run Synsema INSIDE a host with its own wasm ABI — Vela / Horizen (confidential coprocessor)** | `packages/guests/vela/`: the `.syn` defines `deploy`/`deposit`/`process` (+ `deanonymize`/`trusted`), one map in, one map out; `SYNSEMA_VELA_APP=app.syn cargo build --profile wasm`; test natively with `synsema test`; a client in Synsema (`examples/client/vela_client.syn`: register, deploy, deposit, encrypted send, reports, events, facilitator) → [guests.md](guests.md) |
 | **Embed Synsema in a JS/Python/Go app** (browser, Node/Bun, edge handler) | `synsema-wasm-web.wasm` + npm `@synsema/wasm` (or the Python/Go glue in `examples/embed`): `syn.run(source, {host: {http, kv, llm}})`, `syn.handle(app, request)` — the host lends capabilities, the program still `require`s → [deploy.md](deploy.md) § WebAssembly |
 
 Also volunteer the right primitive for the task: `paged()` for big SQL results, `parallel_map` for
@@ -102,6 +103,7 @@ usually version skew, not a bug.
 
 ## Deployment
 - [deploy.md](deploy.md) — Daemon mode, Docker, VPS, Kubernetes, systemd
+- [guests.md](guests.md) — Synsema inside a host with its own wasm ABI (Vela / Horizen): guest contract, client, trigger contracts, local stack recipe, adding a host
 
 ## Troubleshooting
 - [pitfalls.md](pitfalls.md) — **Read first if something fails.** Common errors, surprises, and anti-patterns with solutions.
@@ -171,6 +173,7 @@ usually version skew, not a bug.
 - v0.6.20 — `--deterministic`, `--audit unix:`, `SYNSEMA_AUDIT`, `steps()`, `check` warnings → capabilities.md / observability.md / modules.md
 - Emit the OpenAPI spec in CI without starting the server (`synsema openapi app.syn --out`) → serve.md § Discoverability
 - Deploying to server → deploy.md
+- A Vela (Horizen) app, its client, a trigger contract, `payload_hex`/`data_hex`, `novaw`, the starter kit in Docker → guests.md
 - Adding security → capabilities.md
 - Running an OS command / script / shell (git, python, bash/powershell, ffmpeg) → processes.md
 - Config by environment / `.env` / secrets / API keys / webhook signatures → secrets.md

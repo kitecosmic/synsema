@@ -432,6 +432,8 @@ spec:
 
 ## WebAssembly — TEEs, confidential jobs, edge, and embedding in other apps (v0.6.0+)
 
+**Guests (a host with its OWN wasm ABI — Vela / Horizen):** not a WASI command, not the embeddable artifact: a thin adapter in `packages/guests/<host>/` maps the host's exports onto `synsema_call`, with your `.syn` embedded. The whole contract (tasks, `ctx`, return shapes, fuel, determinism), the client in Synsema, trigger contracts and the local stack recipe are in [guests.md](guests.md).
+
 Two wasm artifacts, one pure profile (same wiring, `engine/crates/synsema-wasm`):
 
 - **`synsema-wasm.wasm` (wasm32-wasip1)** — a CLI for wasmtime / TEE job runners / any

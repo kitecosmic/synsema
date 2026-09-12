@@ -41,6 +41,7 @@ memory.md
 patterns.md
 structure.md
 deploy.md
+guests.md
 pitfalls.md
 "
 
