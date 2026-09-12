@@ -429,7 +429,18 @@ fn built_binary_sees_the_real_working_directory() {
     assert_eq!(lines[1], "disk", "read_file lee el disco: {}", out);
     assert_eq!(lines[2], "bundled", "bundle: fuerza el bundle: {}", out);
     assert_eq!(lines[3], "bundled", "un asset que NO está en disco cae al bundle: {}", out);
-    let cwd_norm = other.to_string_lossy().replace('\\', "/");
-    assert!(lines[4].eq_ignore_ascii_case(&cwd_norm), "cwd(): {} vs {}", lines[4], cwd_norm);
+    // `cwd()` devuelve el directorio tal como lo reporta el SO: en macOS el temp dir es un symlink
+    // (`/var/folders/...` -> `/private/var/folders/...`) y `current_dir()` da el resuelto. Se acepta la
+    // ruta pedida o su forma canonica (sin el prefijo verbatim `//?/` que Windows agrega al canonizar).
+    let norm = |p: &std::path::Path| p.to_string_lossy().replace('\\', "/").trim_start_matches("//?/").to_string();
+    let asked = norm(&other);
+    let canon = std::fs::canonicalize(&other).map(|p| norm(&p)).unwrap_or_else(|_| asked.clone());
+    assert!(
+        lines[4].eq_ignore_ascii_case(&asked) || lines[4].eq_ignore_ascii_case(&canon),
+        "cwd(): {} vs {} (canonica {})",
+        lines[4],
+        asked,
+        canon
+    );
     let _ = std::fs::remove_dir_all(&other);
 }
