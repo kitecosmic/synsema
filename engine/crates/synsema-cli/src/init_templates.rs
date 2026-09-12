@@ -148,6 +148,13 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # la red (nunca error). El consumo se consulta con llm_usage():
 # SYNSEMA_LLM_BUDGET=
 
+# Techo de tokens LLM POR IDENTIDAD bajo `serve` (la identidad que devuelve la task de
+# `auth with`): entradas identidad=tokens separadas por comas, UN contador por identidad
+# en todo el proceso (workers e hilos de stream lo comparten). Al llegar, las ops de ESA
+# identidad degradan al marker "[llm budget exceeded for identity …]" y las demas siguen.
+# Numeros reales: una tarea normal gasta 20k+ tokens por llamada:
+# SYNSEMA_LLM_BUDGET_PER_IDENTITY=agent-1=500000,researcher=2000000
+
 # ══ Techos del host — dinero y firmas (el programa NO puede subirlos) ══
 
 # Techo de gasto por unidad para spend(monto, unidad, motivo): pares unidad:monto
@@ -229,6 +236,17 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # File-watches vivos (watch) por interprete (default 64, techo duro 1024; un hilo cada uno):
 # SYNSEMA_WATCH_MAX=64
 
+# Endpoint de salud opt-in del HOST: GET <path> → 200 {ok, uptime_s, in_flight, engine},
+# sin auth ni rate limit y fuera del descubrimiento (llms.txt/openapi). Una ruta declarada
+# en ese path gana (aviso al arrancar). Igual que `serve --health /healthz`; no se hornea
+# en `build --serve`: se fija donde corre el binario:
+# SYNSEMA_HEALTH_PATH=/healthz
+
+# Stream de audit de capabilities SIN flag (una linea JSON por chequeo; los VALORES de los
+# secretos jamas aparecen): json | <ruta> | fd:N | unix:<ruta> (fd y unix solo en Unix).
+# Vale tambien dentro de un binario de `synsema build`; el flag --audit le gana:
+# SYNSEMA_AUDIT=json
+
 # ══ Secretos de TU programa (el nombre lo elegís vos, no el engine) ══
 
 # `secret("NOMBRE")` resuelve por: entorno del proceso > este .env > default; sin
@@ -292,6 +310,8 @@ const HELLO_SYN_PAST: &[&str] = &[
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
 const ENV_EXAMPLE_PAST: &[&str] = &[
+    // v0.6.21 (2026-09-12): antes de SYNSEMA_LLM_BUDGET_PER_IDENTITY, SYNSEMA_HEALTH_PATH y SYNSEMA_AUDIT.
+    "aa299c5ce19c7fa9a2252e1f5ca0ca3e3174566bab256dd2764ad363674a82e0",
     "89ce5ec7987119a7bf7579f74b93275ca3a61790766a143e06df26000b992bb9",
     // v0.6.6 (antes de la sección de knobs del servidor)
     "5e1b399a09adeb2b0dcc02e4fcdc6f0141d71dfa8a8a679f9ec2548b543f966a",
@@ -1235,6 +1255,7 @@ mod tests {
             .chain(CEILING_ENV_VARS.iter())
             .chain(synsema_stdlib::server::SERVE_ENV_VARS.iter())
             .chain(synsema_runtime::run_program::RUN_PROGRAM_ENV_VARS.iter())
+            .chain(crate::audit::HOST_ENV_VARS.iter())
             .copied()
             .collect();
         let mentioned = mentioned_vars(ENV_EXAMPLE);

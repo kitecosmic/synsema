@@ -179,7 +179,7 @@ jobs:
         env:
           SYNSEMA_VERSION: ${{ github.ref_name }}
         run: |
-          cargo build --locked --manifest-path packages/guests/vela/Cargo.toml --profile wasm
+          cargo build --locked --manifest-path packages/guests/vela/Cargo.toml --profile wasm --target wasm32-wasip1 --target-dir engine/target
           cp engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm synsema-vela-guest.wasm
           shasum -a 256 synsema-vela-guest.wasm > synsema-vela-guest.wasm.sha256
       - name: Upload to Release

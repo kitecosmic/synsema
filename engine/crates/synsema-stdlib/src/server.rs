@@ -1965,6 +1965,8 @@ pub const SERVE_ENV_VARS: &[&str] = &[
     "SYNSEMA_WS_MAX_CONNS",
     "SYNSEMA_PROC_MAX",
     "SYNSEMA_WATCH_MAX",
+    // v0.6.20 — salud opt-in del host (= `serve --health`).
+    "SYNSEMA_HEALTH_PATH",
 ];
 
 /// Servidores (`run_async`) vivos en el proceso: con varios `serve on` en un programa,

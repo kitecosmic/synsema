@@ -2,6 +2,9 @@
 # define los imports de WASI (stdout = logs) y llama a los exports del ABI; un módulo
 # wasm32-unknown-unknown de synsema-wasm-web importaría `synsema_host`, que Vela no provee.
 # El target dir se comparte con el motor para no recompilar el intérprete dos veces.
+# OJO: cargo lee este archivo sólo cuando corre DENTRO de este directorio. Desde otro cwd
+# (la raíz del repo, CI) hay que pasar `--target wasm32-wasip1 --target-dir engine/target`
+# a mano, o el build sale nativo y en packages/guests/vela/target.
 [build]
 target = "wasm32-wasip1"
 target-dir = "../../../engine/target"

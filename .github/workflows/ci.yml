@@ -264,7 +264,10 @@ jobs:
           engine/target/debug/synsema test packages/guests/vela/examples/trigger_app.syn
           engine/target/debug/synsema test packages/guests/vela/examples/client/vela_client.syn
       - name: Build the Vela guest (wasm32-wasip1, profile wasm)
-        run: cargo build --locked --manifest-path packages/guests/vela/Cargo.toml --profile wasm
+        # Target y target-dir explícitos: el .cargo/config.toml del crate sólo aplica cuando cargo corre
+        # DENTRO de packages/guests/vela; desde la raíz del repo hay que decirlos (si no, compila un
+        # cdylib nativo en packages/guests/vela/target y la sonda no encuentra el .wasm).
+        run: cargo build --locked --manifest-path packages/guests/vela/Cargo.toml --profile wasm --target wasm32-wasip1 --target-dir engine/target
       - name: Probe under Node WASI (imports, exports, every entry point, formats, determinism)
         run: node tests/vela_guest.probe.mjs engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm
       - name: Size budget (< 50 MB is Vela's upload limit; keep it under 12 MB)

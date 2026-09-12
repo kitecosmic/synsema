@@ -21,6 +21,10 @@ cargo build --profile wasm                       # default target: wasm32-wasip1
 # → ../../../engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm  (≈ 7–8 MB)
 
 SYNSEMA_VELA_APP=/path/to/my_app.syn cargo build --profile wasm   # embed YOUR program instead of app.syn
+
+# From any other directory (a CI job at the repo root) the crate's .cargo/config.toml does not
+# apply — say the target and the shared target dir explicitly, or you get a native cdylib:
+cargo build --locked --manifest-path packages/guests/vela/Cargo.toml --profile wasm --target wasm32-wasip1 --target-dir engine/target
 ```
 
 Test the program natively first — it is plain Synsema: `synsema test app.syn`. Then probe the
