@@ -133,7 +133,7 @@ serve on 8080
 
 **General SVG converters** (any SVG text — from `chart_svg`, handwritten, fetched), pure,
 deterministic across platforms (one embedded sans font — DejaVu Sans — so text rasterizes
-identically on Windows/Linux/macOS/Docker `FROM scratch`). Both return **`bytes`**:
+identically on Windows/Linux/macOS/Docker distroless). Both return **`bytes`**:
 
 ```
 let svg be chart_svg("bar", filas, {"x": "mes", "y": "total"})

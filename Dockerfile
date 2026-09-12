@@ -1,5 +1,6 @@
-# Synsema in a container — the same prebuilt static binary the website installs,
-# dropped into a slim base. The image carries the release binary; it does not compile.
+# Synsema in a container — the same prebuilt binary the website installs (a glibc-linked
+# binary: floor glibc 2.17 since v0.6.21; v0.6.20 needed 2.39 and does NOT start on bookworm),
+# dropped into a slim base that has glibc. The image carries the release binary; it does not compile.
 #
 #   docker build -t synsema .                                      # latest release
 #   docker build -t synsema --build-arg SYNSEMA_VERSION=v0.5.0 .   # pin a version

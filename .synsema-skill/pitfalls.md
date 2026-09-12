@@ -441,6 +441,7 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | A `stream` route with `requires auth` ignores per-identity ceilings | Since v0.6.20 it runs with the request's identity: per-identity `spend`/`sign`/LLM ceilings apply | Hardening; a service that relied on the gap now sees the ceilings |
 | `--deterministic` + `--sandbox` narrows further | Exit 2 — `--deterministic already fixes the ceiling` | It is `--profile pure` + `stdout`-only ceiling; use it alone |
 | `--audit unix:/x.sock` on Windows | Exit 2 (`only available on Unix`), like `fd:N` | Use `json` or a path |
+| The v0.6.20 Linux binary runs anywhere / `FROM scratch` | `GLIBC_2.39 not found` on Ubuntu 20.04/22.04 and Debian bookworm (it was linked on the 24.04 runner); `FROM scratch` has no libc at all | Upgrade to v0.6.21+ (glibc floor 2.17, guarded by the release); base images with a libc: `gcr.io/distroless/cc-debian12`, `debian:*-slim` |
 | `toml_encode({"a": nothing})` writes `a = null` | Error `TOML has no null` | Drop the key or give it a value |
 | `xml_parse` expands entities / fetches DTDs | Never (no XXE); a malformed doc errors with `line:col` | By design |
 

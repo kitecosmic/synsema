@@ -1,6 +1,6 @@
 # Synsema Deployment
 
-Synsema ships as a **single static binary** (the Rust build) — no Python, no Node, no
+Synsema ships as a **single self-contained binary** (the Rust build; on Linux a glibc-linked one — floor glibc 2.17 since v0.6.21, see Platform support) — no Python, no Node, no
 runtime on the target. Install it with `npm i -g synsema` (the native binary via npm, v0.6.3+ — `npx synsema` works too), `cargo install --path engine/crates/synsema-cli` or
 grab a prebuilt binary from the GitHub Releases page.
 
@@ -59,7 +59,7 @@ synsema build desk.syn -o desk --serve --no-console --icon icon.svg [--bundle]  
   is refused (rebuild instead). A tampered bundle refuses to run (`bundle corrupt`).
 - Errors (exit 2): `-o` missing, `--include` not found / escapes the bundle root, a `use` with a
   **dynamic** path (the bundle is closed), building from an already-built binary.
-- **Deploy from `FROM scratch`/distroless** — `COPY app /app` + `ENTRYPOINT ["/app"]`. This is the
+- **Deploy from a minimal image WITH a libc** (`gcr.io/distroless/cc-debian12`, `debian:*-slim`; NOT `FROM scratch` — the Linux binary is glibc-linked) — `COPY app /app` + `ENTRYPOINT ["/app"]`. This is the
   most self-contained deploy: the program and its guardrails travel as one artifact.
 
 ## Configuration & secrets (`.env` / environment)
@@ -255,7 +255,7 @@ shortcut.
 
 ## Docker
 
-The image is **just the Synsema binary** — the same prebuilt static binary the site
+The image is **just the Synsema binary** — the same prebuilt (glibc-linked) binary the site
 installs; the `Dockerfile` fetches it from the GitHub release and verifies its checksum
 (it does not compile). Mount your `.syn` program into `/app`.
 
@@ -421,6 +421,8 @@ spec:
 ```
 
 ## Platform support
+
+**Linux binary and glibc (v0.6.21+).** The Linux release is a dynamically linked glibc binary, not a static one. Since engine v0.6.21 it is built against **glibc 2.17**, so it runs on any distribution from 2014 on (Ubuntu 20.04/22.04/24.04, Debian 11/12/13, RHEL 7+, Amazon Linux 2, the `debian:*-slim` and `gcr.io/distroless/cc` images) and the release fails if that floor ever rises. **v0.6.20 was the exception:** it was linked on the runner's glibc 2.39 and only starts on Ubuntu 24.04+/Debian 13+ — on anything older it fails with `GLIBC_2.39 not found`; upgrade to v0.6.21. macOS and Windows binaries have no such floor. `FROM scratch` does not work (there is no libc in it) — use `gcr.io/distroless/cc-debian12` or `debian:bookworm-slim`; `install.sh` runs the binary once after installing and tells you plainly when a system is too old.
 
 | Platform | run | serve | daemon | Docker |
 |----------|-----|-------|--------|--------|
