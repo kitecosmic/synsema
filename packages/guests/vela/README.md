@@ -70,7 +70,12 @@ test ERC-20 from `examples/erc20/` locally. Verified end to end on the public de
 proposes payments with its own key; the enclave applies the owner's policy (proposers, payees with caps, an automatic
 limit, an allowance) and pays through its trigger contract (the cycle of `examples/trigger_app.syn`, with ERC-20) or holds the
 proposal for the owner's approval; the agent worker reads an inbox, and the client protocol is a module both it and the CLI
-use. Verified end to end on the public devnet. The three kits are recipes in [`synsema/recipes`](https://github.com/synsema/recipes).
+use. Verified end to end on the public devnet.
+
+[`synsema/vela-auction`](https://github.com/synsema/vela-auction) is a sealed-bid auction: bids encrypted to the enclave, the
+matching inside (uniform price or pay-as-bid, exact integer ranking), settlement from escrow, losing bids never
+revealed, public `opened`/`cleared` receipts with no bidder in them. The four kits are recipes in
+[`synsema/recipes`](https://github.com/synsema/recipes).
 
 ## The public devnet
 
