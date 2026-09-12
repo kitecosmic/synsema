@@ -6,6 +6,7 @@ its own exports (not a WASI command, not the `synsema_host` imports). Everything
 from HorizenOfficial's code (`vela`, `vela-common-go`, `vela-nova`, `vela-starterkit`, v0.2.0) and
 verified against the starter kit running in Docker; nothing is a guess. Repo:
 `packages/guests/vela/` (README = the contract), `tests/vela_guest.probe.mjs`.
+**Starter kit:** `github.com/synsema/vela-app` (template repo) — app + tests, the client, `scripts/build.sh` / `smoke.mjs` / `devnet.sh` / `e2e.sh`, CI that builds `app.wasm`. Point a user there first; a shared devnet for the cohort exists (`devnet.synsema.app`, token on request; the client declares `require net("devnet.synsema.app")`).
 
 **The two-axis rule.** Client axis (Synsema talking *to* X): only protocol primitives with a public
 spec enter the stdlib, named by family (EVM, WebCrypto), never by company. Host axis (Synsema
@@ -146,6 +147,7 @@ everything a client can do, natively, with the builtins from v0.6.20 — no Go, 
 | `synsema run vela_client.syn -- …` | Does |
 |---|---|
 | `keys` | a fresh P-521 pair printed for `.env` (`ecdh_keypair` + `reveal`) |
+| `address` | the signing address (`VELA_SECP_KEY`) |
 | `tee` | the Executor's P-521 key, read on-chain |
 | `deploy <wasm> [params-json\|-] [trigger]` | multipart upload to `<authority>/deploy/upload` (`multipart_encode`), then `submitDeployRequest(0, descriptor)` or `submitDeployRequestWithTrigger(0, descriptor, trigger)`; `applicationId`/`requestId` from the `DeployRequestSubmitted` log; waits on the subgraph; tells you the `VELA_APP_ID` |
 | `register` | AssociateKey (226 bytes) for `VELA_SECP_KEY`'s address |

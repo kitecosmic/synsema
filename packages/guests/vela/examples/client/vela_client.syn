@@ -5,6 +5,7 @@
 -- Executor, wait for completion through the subgraph, and decrypt your events. Any payload, any app.
 --
 --   synsema run vela_client.syn -- keys                          a fresh P-521 pair, printed for .env
+--   synsema run vela_client.syn -- address                       the signing address (VELA_SECP_KEY)
 --   synsema run vela_client.syn -- tee                           the Executor's P-521 key, read on-chain
 --   synsema run vela_client.syn -- deploy <app.wasm> [params-json|-] [trigger-address]
 --   synsema run vela_client.syn -- register                      AssociateKey: your key + encrypted seed
@@ -35,8 +36,10 @@
 --   requestId = topic 2 of RequestSubmitted; a deploy's applicationId = topic 1 of DeployRequestSubmitted
 intent: "vela client: keys, register, deploy, submit, wait, decrypt events"
 
+-- The hosts the client may talk to: the local starter kit, and the shared devnet. Add yours here.
 require net("localhost")
 require net("127.0.0.1")
+require net("devnet.synsema.app")
 require env("VELA_*")
 require secret("VELA_*")
 require sign("VELA_SECP_KEY")
@@ -421,7 +424,7 @@ task register_payload(c)
 -- ---- CLI ----
 
 task usage()
-    print("usage: synsema run vela_client.syn -- keys | tee | deploy <wasm> [params-json|-] [trigger] | register | deposit <amount> [token] | send '<json>' [wei] | report '<json>' | report-download <reportId> | events [n] | app-events [n] | status <requestId> | user | register-for | send-for '<json>' [amount token] | events-for [n]")
+    print("usage: synsema run vela_client.syn -- keys | address | tee | deploy <wasm> [params-json|-] [trigger] | register | deposit <amount> [token] | send '<json>' [wei] | report '<json>' | report-download <reportId> | events [n] | app-events [n] | status <requestId> | user | register-for | send-for '<json>' [amount token] | events-for [n]")
 
 task arg_or(a, i, default)
     give when length(a) > i then a[i] otherwise default
@@ -436,6 +439,8 @@ task run_cli(a)
             let kp be ecdh_keypair("P-521")
             print("VELA_P521_KEY=" + decode(reveal(kp["private"]), "hex"))
             print("VELA_P521_PUB=" + decode(kp["public"], "hex"))
+        is "address"
+            print(me())
         is "tee"
             print(hex_of(tee_public_key(c)))
         is "deploy"

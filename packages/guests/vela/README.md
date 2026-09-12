@@ -41,6 +41,21 @@ Executor's exact runtime) is unaffected, and CI runs both probes.
 The release publishes `synsema-vela-guest.wasm` — this crate built with the example `app.syn` —
 so you can deploy something to the Vela starter kit before writing a line.
 
+## Start from the kit
+
+[`synsema/vela-app`](https://github.com/synsema/vela-app) is a template repository built on this crate: the app with
+its tests, the client, `scripts/build.sh` (clones this repo at a release tag and builds the module with your
+app embedded), `scripts/smoke.mjs`, `scripts/devnet.sh` (Horizen's starter kit in Docker) and `scripts/e2e.sh`,
+plus a CI workflow that builds `app.wasm` for teams without Rust.
+
+## The shared devnet
+
+`devnet.synsema.app` hosts Horizen's starter kit v0.2.0 for the acceleration cohort, behind HTTPS with a
+token as the first path segment (`/<token>/rpc`, `/<token>/authority`, `/<token>/subgraph/…`). Ask for
+the token, put the URLs and the two contract addresses in `client/.env`, and the client works unchanged
+(it declares `require net("devnet.synsema.app")`). A devnet: Anvil's public keys, no attestation, reset
+from time to time. Details on the docs page.
+
 ## What ships with the crate
 
 | Path | What | Tests |
@@ -64,6 +79,7 @@ does all of it natively with the v0.6.20 builtins (`ecdh_*`, `hkdf_sha256`, `aes
 | `synsema run vela_client.syn -- …` | Does |
 |---|---|
 | `keys` | a fresh P-521 pair, printed for `.env` |
+| `address` | the signing address (`VELA_SECP_KEY`) |
 | `tee` | the Executor's P-521 key from `TeeAuthenticator.getPubSecp521r1()` |
 | `deploy <wasm> [params-json\|-] [trigger]` | multipart upload to `/deploy/upload`, then `submitDeployRequest` / `submitDeployRequestWithTrigger` with the JSON descriptor; ids from the `DeployRequestSubmitted` log; waits on the subgraph |
 | `register` | AssociateKey: your P-521 public key ‖ the seed encrypted for the Executor (226 bytes); the seed is `secp256k1_sign(keccak256("subtype-key-v1"))`, like novaw |
