@@ -67,6 +67,13 @@ word in Synsema`. Name things `resolve`, `why`, etc.
 | `print(...)` | `print(...)` (buffered under `run` until exit — `flush()` for live output) |
 | `re.fullmatch` / `re.findall` | `matches(s, pat)` (FULL match) / `find_all(s, pat)` ([builtins.md](builtins.md)) |
 | `open(p).read()` / `requests.get(url)` | `read_file(p)` + `require file(...)` / `fetch(url)` + `require net(host)` |
+| `requests.post(url, json=d)` / `r.json()` / `r.content` | `http_post(url, d)` (a map → JSON + Content-Type, v0.6.20+) / `json of r` (`nothing` if not JSON) / `http_bytes(...)` → `bytes of r` |
+| `xs[::-1]` / `list(s)` | `reverse(xs)` (also text) / `split(s, "")` (v0.6.20+) |
+| `os.getcwd()` / `os.path.expanduser("~/x")` | `cwd()` + `require file.read(".")` / `"~/x"` works as-is in paths and scopes (v0.6.20+) |
+| `os.remove(p)` / `shutil.rmtree(p)` | `delete_file(p)` / `delete_dir(p, {"recursive": true})` + `file.write` on every path (v0.6.20+) |
+| `zipfile` / `tarfile` | `zip_create`/`zip_extract` / `tar_create`/`tar_extract` (zip-slip rejected, real-bytes ceiling; v0.6.20+, native) |
+| `tomllib.loads(s)` / `xml.etree` / `xmltodict.parse` | `toml_parse(s)` (dates → ISO text) / `xml_parse(s)` (xmltodict shape) (v0.6.20+) |
+| `cryptography` ECDH/HKDF/AES-GCM | `ecdh_keypair`/`ecdh_shared_secret`/`hkdf_sha256`/`aes_gcm_encrypt`/`aes_gcm_decrypt` (secrets stay `secret`; v0.6.20+) |
 
 ## Semantic traps — looks like Python, behaves differently
 

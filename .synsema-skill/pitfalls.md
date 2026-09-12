@@ -332,7 +332,7 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | Boxplot draws a group of 1 value | Error — **≥2 values per group** (a 1-point box is garbage) | Aggregate differently or drop the group |
 | `svg_to_png` renders animations / scripts | The PNG is the **static** state (resvg ignores scripts/SMIL) | By design — nothing in an SVG ever executes |
 | A `<image href="http://...">` loads in the PNG | Never fetched — **no network, no disk** from a pure builtin | Embed the image as a `data:` URL if you need it rasterized |
-| Any font in the SVG renders as requested | One embedded sans (DejaVu); unknown families fall back to it; missing glyphs (full CJK, color emoji) → tofu | Deterministic by design; custom/system fonts may come later |
+| Any font in the SVG renders as requested | One embedded sans (DejaVu); unknown families fall back to it unless you pass them in `opts.fonts` (v0.6.20+, `file.read` per font); missing glyphs (full CJK, color emoji) → tofu | Deterministic by design; custom/system fonts may come later |
 | Huge `width`/`scale` just works | Above ~16.7M output pixels → error naming `max_pixels` | Deliberate anti-DoS ceiling; raise it explicitly: `{"max_pixels": n}` |
 
 ## Blockchain (sign/verify — see stdlib.md § Blockchain)
@@ -421,6 +421,28 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `share x as "result"` from N workers | Last write wins, others lost | Use dynamic keys: `share x as "result_" + text(n)` |
 | No `require` and wondering why I/O fails | Zero-access-by-default | Always declare `require` at top of program |
 | `set x to 5` without prior `let x be ...` | Runtime error | Always `let` before `set` |
+
+## v0.6.20 — what changed under your feet (verified live)
+
+| What you expect (from ≤ v0.6.19) | What actually happens now | Why / workaround |
+|---|---|---|
+| `http_post(url, {"a": 1})` sends `{a: 1}` as text with no header | It sends **JSON** with `Content-Type: application/json` (a list too); text goes as-is, bytes raw | Your own `Content-Type` header wins. `json_encode(map)` + header still works everywhere |
+| `json of r` → `Map has no key 'json'` | `json of r` exists: the parsed body when the server said JSON, else `nothing` | Branch on it; `json_decode(body of r)` still fine |
+| `body of r` is enough for a PDF/image | Still lossy text | `http_bytes(...)` → `bytes of r` (exact) |
+| `split(s, "")` errors | Returns the characters | Same as JS/Python `list(s)` |
+| `cwd()` works without a capability | `Capability not granted: file_read(".")` | `require file.read(".")` (or `./*` / `*`) — the grant of `list_dir(".")`; `./data/*` does NOT cover it |
+| `delete_dir("./tmp")` removes a tree | Error `"tmp" is not empty (pass {"recursive": true} …)` | `{"recursive": true}` + `file.write` on the dir AND every path inside (`./tmp` + `./tmp/*`) |
+| `zip_extract(z, "./out")` with `file.write("./out")` extracts | Denied at the first entry (`file_write("out/a.txt")`) | The grant is per path written: `file.write("./out/*")` (dest need not exist) |
+| `use "../lib/x.syn"` is always blocked | Allowed while it stays under the **project root** (the entry file's dir); above it → `escapes the project root` | Move the file into the project or restructure; the root is the entry's directory, not the cwd |
+| `route "GET /:lang"` serves `/openapi.json` as a lang | The reserved URLs (`/openapi.json`, `/docs`, `/llms.txt`, `/sitemap.xml`, `/robots.txt`) are served **first**; `synsema check` warns | Declare a **literal** route (or a static file at the exact path) if you really want to override one |
+| A `private` route is unreachable | `private` (route/group) only hides it from discovery/OpenAPI — it is still served | Auth is `requires auth`; `private` is about publication |
+| `give openapi_json()` returns the document | A bare `give` JSON-quotes the text (`"{\"openapi\"…"`) | `give respond(openapi_json(), "application/json")` |
+| `--health healthz` works | Exit 2: needs an absolute path | `--health /healthz` (or `SYNSEMA_HEALTH_PATH=/healthz`); a declared route at that path wins, with a warning |
+| A `stream` route with `requires auth` ignores per-identity ceilings | Since v0.6.20 it runs with the request's identity: per-identity `spend`/`sign`/LLM ceilings apply | Hardening; a service that relied on the gap now sees the ceilings |
+| `--deterministic` + `--sandbox` narrows further | Exit 2 — `--deterministic already fixes the ceiling` | It is `--profile pure` + `stdout`-only ceiling; use it alone |
+| `--audit unix:/x.sock` on Windows | Exit 2 (`only available on Unix`), like `fd:N` | Use `json` or a path |
+| `toml_encode({"a": nothing})` writes `a = null` | Error `TOML has no null` | Drop the key or give it a value |
+| `xml_parse` expands entities / fetches DTDs | Never (no XXE); a malformed doc errors with `line:col` | By design |
 
 ## `synsema update`
 

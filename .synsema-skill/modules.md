@@ -83,17 +83,21 @@ serve on 8080
 
 Rules: `route` entries inside the group, each with its own `rate_limit` / `timeout`
 (v0.6.19+: a mounted route gets its own rate zone; a mount prefix is another zone —
-≤ v0.6.18 both were refused inside a group); no `stream`/`socket` routes in a group (they
-stay in the serve block — `synsema check` refuses them with the message `serve` would
-give); a mounted `requires auth` still demands `auth with` on the serve block; the
+≤ v0.6.18 both were refused inside a group); `stream`/`socket` routes in a group work since
+v0.6.20 (mounted like a direct route); a route or the whole group can be `private` (v0.6.20+:
+the line `private` at the top — served but out of discovery/OpenAPI); a mounted `requires
+auth` still demands `auth with` on the serve block; the
 group's shape is validated when the serve is built. Full details in
 [serve.md](serve.md) ("Mounted routes").
 
 ## Rules (verified)
 
-- **Paths are relative to the importing file**, with directory traversal blocked — you can't escape your
-  project. Use `./` for the same directory; `../` is restricted (`module path escapes the importing
-  directory`).
+- **Paths are relative to the importing file.** `../` climbs **inside the project** (v0.6.20+): the
+  boundary is the **project root** = the directory of the entry file, so `src/site/pages.syn` can
+  `use "../core/i18n.syn"`; above the root → `module path escapes the project root` (from the entry
+  file itself the message stays `escapes the importing directory`). Decided on absolute paths, so
+  `cd proj && synsema run main.syn` is as safe as an absolute path. (≤ v0.6.19: `../` was blocked at
+  the importing directory.)
 - **`.syn` only.** `use "./x.txt"` errors (`module path must end in '.syn'`); absolute / root-relative
   paths are rejected (must be relative).
 - **Transitive imports:** a module can `use` another. If `main` uses `core` and `core` uses `data`, the
@@ -131,6 +135,8 @@ The entry calls `core.handle(...)`; `core` uses `data.LABELS`, etc. `core`'s int
   (`mod.foo()`).
 - `test "…"` blocks can live in any file and run with `synsema test <file>`; they can call another
   module's exported API (e.g. `assert_eq(core.triage("…"), "task")`). See [testing.md](testing.md).
+- **`synsema check` warns (v0.6.20+, exit code unchanged)** when a top-level `let` or an `export routes`
+  group has the same name as a `use … as` alias — inside that scope the name is the local, not the module.
 - **`synsema check entry.syn` validates the whole import graph** (resolves and parses every
   `use` recursively, with the same rules as the runtime — broken paths, cycles, `serve`/top-level
   `require` inside a module all fail the check) and every `render("literal.html")` template.

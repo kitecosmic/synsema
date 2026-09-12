@@ -165,6 +165,7 @@ synsema test --cap-set "stdout,time,random,secret,file=scratch_*" program.syn
   ceiling doesn't cover the wildcard) — the code never rises above the ceiling.
 - Applies to `run`, `test`, `conform` (v0.6.14+ — before, `conform` silently ignored the ceiling) and `serve`. `--sandbox` and `--cap-set` are mutually exclusive; an unknown capability name errors, and (v0.6.14+) an **unknown `--flag` is a usage error (exit 2)**, not silently ignored.
 - **`--cap-set none`** = an empty ceiling (nothing, not even `stdout`). **`stdout` is a real capability under a ceiling** (v0.6.14+): a `--cap-set` without `stdout` denies output at the first `print`/`show`/`log` (`--sandbox` includes it; no ceiling = output free). The audit gained two `reason`s: `auto-granted by the runtime` (an ambient grant that succeeded now leaves a trace, `origin: runtime`) and `bundled asset (part of the program)` (a `synsema build` read).
+- **`--deterministic`** (v0.6.20+, `run`/`test`/`build`) = `--profile pure` **plus** a ceiling of `stdout` only — no `time`, no `random` (`now()`/`random()` fail with `Capability not granted`): the same program gives the same output. An alias, so combining it with `--sandbox`/`--cap-set`/`--profile native` is exit 2 (`--deterministic already fixes the ceiling …`). `build` bakes it.
 - **The pure profile is a second, independent wall** (`--profile native|pure`, v0.6.14+): under `pure`, every filesystem/exec/socket/db/cron builtin fails with `<name>: not available in the pure profile — <why>`, regardless of the ceiling. `fetch`/`http_*` with `net`, agents, `run_program` and `remember` (in-memory) stay. `serve --profile pure` is a usage error. See [deploy.md](deploy.md) and the ceiling below compose.
 - **`sandbox_run` capability** (v0.6.14+): `require sandbox_run` lets a program run *another* Synsema program with `run_program(source, {ceiling, profile, env, timeout})` in a child process under a ceiling that is the intersection with its own — the child can never exceed the parent (asking for more is trimmed, not fatal, and the parent's audit records it as `above parent ceiling`). See [builtins.md](builtins.md) and [processes.md](processes.md).
 - **`render` of a disk template reads a file:** the top-level `render(path)` needs `require file.read("<path>")` (v0.6.14+; nested `include`/`layout` and bundled templates don't).
@@ -197,6 +198,9 @@ invariant: balance > 0              -- checked at runtime, error if false
 synsema run  --audit json        program.syn   # one JSON line per check, on stderr
 synsema run  --audit ./audit.jsonl program.syn # … to a file
 synsema run  --audit fd:3        program.syn   # … to a file descriptor (Unix only; Windows → exit 2)
+synsema run  --audit unix:/run/audit.sock program.syn   # … to a Unix socket (v0.6.20+; Unix only; fails loud if nobody listens)
+SYNSEMA_AUDIT=json ./app                       # v0.6.20+: the same values from the ENVIRON — no flag; also a synsema build binary
+synsema build app.syn -o app --audit json      # v0.6.20+: bake the sink into the binary (flag > SYNSEMA_AUDIT)
 ```
 
 One line per capability check: `{ts, context, capability, granted, source, reason, origin, file, line}`
@@ -211,7 +215,7 @@ names. Works on `run`/`test`/`conform`/`serve`. It is the same audit the wasm `r
 - Sandbox does NOT inherit parent capabilities
 - `call_tool` runs a task with ONLY its declared capabilities (∩ the program's); a plain call uses the program's ambient capabilities
 - Wildcard: `net("*.example.com")` covers all subdomains
-- Path glob: `file("/data/*")` covers all files in /data/. `file` grants **read+write**; use `file.read(scope)` / `file.write(scope)` for least-privilege. Path scope is **faithful**: a `..` escape (`file("./data/*")` + `read_file("./data/../../etc/passwd")`) normalizes outside the scope and is denied. `require file` / `file("*")` cover the whole disk.
+- Path glob: `file("/data/*")` covers all files in /data/. `file` grants **read+write**; use `file.read(scope)` / `file.write(scope)` for least-privilege. Path scope is **faithful**: a `..` escape (`file("./data/*")` + `read_file("./data/../../etc/passwd")`) normalizes outside the scope and is denied. `require file` / `file("*")` cover the whole disk. `~/` expands to the home dir in scopes AND paths (v0.6.20+: `file.read("~/.config/app/*")`; `~user/` unsupported). `cwd()` needs `file.read(".")` — the grant of `list_dir(".")` (`./*`, `*` cover it; `./data/*` does not). `delete_*` and `zip_extract`/`tar_extract` need `file.write` on **every** path they remove/write.
 - Name prefix: `secret("APP_*")` / `env("APP_*")` / `reveal("APP_*")` covers `APP_DB`, `APP_KEY`, … (only a trailing `*`)
 - `db` scope: a **file path** for SQLite; a **canonical URL** for remote engines (Postgres/MySQL/MongoDB/Redis) —
   `scheme://host/db` with **no credentials, port, or query** (so `mysql://user:pw@localhost:3306/appdb?ssl-mode=REQUIRED`

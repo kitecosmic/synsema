@@ -59,6 +59,22 @@ complete_step("import", "ingest", result)
 let where be resume_point("import")        -- the step to resume from
 ```
 
+## Step counter — `steps()` (v0.6.20+)
+`steps()` → statements executed so far in this program. Counts nodes, not time → deterministic
+(same program, same number); no capability; every profile. `synsema run --format json` reports it
+as `steps` next to `llm_tokens`. Use it as a cost for metering/tests/fuel-style limits:
+```
+let before be steps()
+process(batch)
+log "cost: " + text(steps() - before) + " steps"
+```
+
+## Capability audit without a flag (v0.6.20+)
+`SYNSEMA_AUDIT=json|<path>|fd:N|unix:<path>` in the process environ turns the audit stream on — the way
+a container does it, and it also works inside a `synsema build` binary; `synsema build --audit …`
+bakes the sink; the `--audit` flag wins over the variable. `unix:` (a socket somebody listens on;
+loud failure if nobody does) and `fd:N` are Unix only (Windows → exit 2). See [capabilities.md](capabilities.md).
+
 ## Error diagnostics
 When an error occurs, Synsema can provide a rich report:
 - **Location**: file, line, column

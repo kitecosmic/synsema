@@ -76,6 +76,11 @@ see [secrets.md](secrets.md). Resolution: **process environment → `.env` file 
   - Kubernetes: `env:` / `secretKeyRef:` (as in the example below)
 - Override the `.env` location with `--env-file <path>` (or `SYNSEMA_ENV_FILE=<path>`);
   disable it with `--no-env-file`.
+- **Rotate secrets without a restart (Unix, v0.6.20+):** `kill -HUP <pid>` (systemd:
+  `ExecReload=/bin/kill -HUP $MAINPID` + `systemctl reload`) → the server re-reads `.env` on the
+  next `secret()`/`env()` resolution and rebuilds the LLM provider with the new key. A `secret`
+  copied into a `let` at startup keeps its old value. The process environ is live anyway. No SIGHUP
+  on Windows → graceful restart.
 - `reveal()` (if you use it) appends to an audit log at `$SYNSEMA_AUDIT_DIR` or
   `~/.synsema/audit/reveal.log` — under systemd, set `SYNSEMA_AUDIT_DIR` or a writable
   `HOME`/`StateDirectory`, or `reveal()` will fail (by design: no audit, no reveal).
@@ -99,6 +104,9 @@ see [secrets.md](secrets.md). Resolution: **process environment → `.env` file 
   | `SYNSEMA_PROC_MAX` | `64` | live `proc_spawn` children per interpreter (hard ceiling 1024) |
   | `SYNSEMA_WATCH_MAX` | `64` | live `watch` handles per interpreter (hard ceiling 1024; one scanner thread each) |
   | `SYNSEMA_STATE_DIR` | `<program dir>/.synsema/state` | where `memory("NAME")` keeps `<NAME>.db` — point it at a mounted volume and keep the code dir read-only (the `.db` is created there; nothing under the program dir) |
+  | `SYNSEMA_LLM_BUDGET_PER_IDENTITY` | (none) | `id=N,id2=M` — per-identity LLM token ceilings under `serve` (the identity the auth task returns); one process-wide counter per identity; over the line that identity's ops degrade to `[llm budget exceeded for identity …]`, others continue (v0.6.20+; also read from `.env`) |
+  | `SYNSEMA_HEALTH_PATH` | (none) | opt-in host health endpoint: `GET <path>` → `200 {ok, uptime_s, in_flight, engine}`, no auth/rate limit, absent from discovery; a declared route at that path wins (warning at start); = `serve --health` (v0.6.20+) |
+  | `SYNSEMA_AUDIT` | (none) | `json` / `<path>` / `fd:N` / `unix:<path>` — the capability audit stream without the flag, also inside a `synsema build` binary; `--audit` wins (v0.6.20+) |
   | `SYNSEMA_LLM_BUDGET` | unlimited | per-process LLM token ceiling — at the ceiling `reason`/`decide`/… degrade to a `[llm budget exceeded: …]` marker, never an error; unlike the rows above this one is also honored from `.env` — see [llm.md](llm.md) |
 
 - **Host ceiling for a whole server:** `synsema serve app.syn --sandbox` or
@@ -125,6 +133,7 @@ synsema serve <file> [--secure]
     [--domain d1[,d2,...]]           # ACME SAN domains (overrides `domain` in the file)
     [--tls-auto <email> | --tls-cert <path> --tls-key <path>]
     [--bind <addr>]                  # bind address (default 0.0.0.0)
+    [--health <path>]                # v0.6.20+: opt-in host health endpoint (absolute path; = SYNSEMA_HEALTH_PATH)
 ```
 
 | Flag | Effect |
@@ -134,6 +143,7 @@ synsema serve <file> [--secure]
 | `--tls-auto <email>` | Turns on auto-HTTPS (ACME) with that account email. **Its presence is the dev↔prod toggle.** Brings up the `:80` challenge/redirect listener — move it with `SYNSEMA_ACME_HTTP_PORT=8080` (process env, not `.env`) when something else owns port 80, and forward external `:80` to it; the CA must reach the challenge from the public internet. Requires a domain (`--domain` or `domain` in the file). |
 | `--tls-cert <p> --tls-key <p>` | Manual TLS. **Mutually exclusive** with `--tls-auto`. |
 | `--bind <addr>` | Bind address (default `0.0.0.0`). |
+| `--health <path>` | (v0.6.20+) Opt-in health endpoint for the host — `GET <path>` → `200 {ok, uptime_s, in_flight, engine}`, no auth, no rate limit, not in discovery; a declared route there wins (warning). Same as `SYNSEMA_HEALTH_PATH`; a K8s probe target without touching the program. |
 
 **Precedence: CLI flag > file clause > default.**
 - No `--tls-auto` and no `tls` in the file → **plain HTTP** (dev).

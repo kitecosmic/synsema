@@ -129,8 +129,11 @@ serve on 8080
   answers at `/p`. Precedence/specificity work as for any route.
 - Per-route `rate_limit` / `timeout` inside a group work since v0.6.19 (own zone per
   mounted route; a mount prefix is another zone; ≤ v0.6.18 they were refused and the serve
-  default applied). Still not in a group (clear error, also from `synsema check`): `stream`
-  and `socket` routes; `mount` at serve level only (not inside `host` blocks).
+  default applied). `stream` and `socket` routes inside a group work since **v0.6.20** (mounted like
+  a direct route, own rate zone; before, `check` and `serve` refused them). A route in a group, or
+  the whole group, can be **`private`** (v0.6.20+: the line `private` at the top of the route body
+  or of the group) — served, but out of `/llms.txt`, `/openapi.json`, `/sitemap.xml`, `/docs` and
+  `synsema openapi`. `mount` at serve level only (not inside `host` blocks).
 
 ## The request
 
@@ -688,8 +691,23 @@ serve on 8080
         give {"ok": true}
 ```
 
-- A declared route or a static file at any of these paths **overrides** the
-  generated one (so `route "GET /docs"` replaces the API page — intended).
+- A declared **literal** route or a static file at any of these paths **overrides** the
+  generated one (so `route "GET /docs"` replaces the API page — intended). A **parametric**
+  route does NOT (v0.6.20+): `GET /:lang` no longer swallows `/openapi.json` — the reserved URLs
+  are served first (a static file at the exact path still wins), and `synsema check` warns about
+  such a route.
+- **`private` per route / per group** (v0.6.20+): the line `private` at the top of a route body or of
+  an `export routes` group keeps it served but out of the five documents and of `synsema openapi`
+  (the serve-level `private` still hides everything).
+- **`openapi_json()`** (v0.6.20+): the published document as text, from a route of your own —
+  `give respond(openapi_json(), "application/json")` (a bare `give` JSON-quotes it). Per server;
+  under `run` → `only available under serve`.
+- **Health, opt-in of the HOST** (v0.6.20+): the runtime invents no `/health`. `SYNSEMA_HEALTH_PATH=/healthz`
+  (process env) or `synsema serve --health /healthz` answers `GET /healthz` → `200
+  {"ok":true,"uptime_s":n,"in_flight":n,"engine":"<version>"}`, no auth, no rate limit, absent from
+  discovery. A declared `GET` route at that path **wins** (stderr warning at start: `collides with a
+  declared route; the route answers and the host health endpoint is disabled`). Not baked by `build
+  --serve`: set the variable where the binary runs. `--health healthz` (relative) → exit 2.
 - Mounted groups (`mount m.api at "/v1"`) are published with the prefix; each
   `host "…"` publishes its own table under its `Host`.
 - **CI without a server:** `synsema openapi app.syn [--out openapi.json] [--base-url URL]`
@@ -736,6 +754,8 @@ route "GET /products"
 - Outside a route handler, `paged()` degrades to the full result set.
 
 ## Streaming responses (SSE)
+
+(A `stream` route can also live inside an `export routes` group and be mounted — v0.6.20+.)
 
 A route can emit many messages over time on one connection — LLM tokens, a data
 feed, MCP events — using **Server-Sent Events**. Open a `stream` block and emit
@@ -1109,6 +1129,20 @@ the verifiers already produce — no adapter needed:
   (`SYNSEMA_SPEND_CEILING_PER_IDENTITY="agent-1=EUR:50"`) and the delegated one.
   The **unit is free text** — fiat, crypto, commodities, credits: the ledger
   privileges no currency and keeps up to 28 decimal places.
+- **LLM tokens (v0.6.20+).** `SYNSEMA_LLM_BUDGET_PER_IDENTITY="alice=200000,agent-7=1500000"`
+  (process env or `.env`) caps the tokens **each identity** may spend in this process — the same
+  identity as above (`id`/`sub`/`keyid` of what the auth task returns), on every kind of route
+  (`stream`/`socket` included). ONE process-wide counter per identity (workers and stream threads
+  share it), beside the global `SYNSEMA_LLM_BUDGET`. Over the line, that identity's ops return
+  `[llm budget exceeded for identity alice: used N of M tokens]` (marker, never an error; one
+  stderr notice per identity) — others and anonymous requests continue. No identity (no auth,
+  `run`, cron) → only the global budget. Real numbers: a normal task is 20k+ tokens per call, so
+  identity ceilings are hundreds of thousands. The LLM primitives did not change — this is a host
+  ceiling around the provider, like `SYNSEMA_SPEND_CEILING`; persistence across processes is the
+  platform's ledger (read `llm_usage()`).
+- **Since v0.6.20 a direct `stream` route with `requires auth` runs with the request's identity
+  too** — so the per-identity `spend`/`sign` ceilings apply there (in v0.6.19 they silently did
+  not). A service that relied on that gap will now see the ceilings.
 
 ### Signed requests as auth
 
@@ -1339,6 +1373,7 @@ synsema serve <file>
     [--domain d1[,d2,...]]          # overrides the file's `domain`
     [--tls-auto <email> | --tls-cert <p> --tls-key <p>]
     [--bind <addr>]                 # default 0.0.0.0
+    [--health <path>]               # v0.6.20+: opt-in host health endpoint (= SYNSEMA_HEALTH_PATH); absolute path (/healthz)
     [--sandbox | --cap-set <list>]  # host ceiling for the WHOLE serve (v0.6.7+): the PREAMBLE, handlers,
                                     # cron ticks and spawned agents can `require` only within it — same as `run`.
                                     # --sandbox = stdout,time + serve (so it can bind); --cap-set "stdout,time,serve=8080,net=api.example.com"
@@ -1347,6 +1382,11 @@ synsema serve <file>
 ```
 
 > `serve --profile pure` is a usage error (a server binds a socket — the pure profile has no sockets).
+> **Rotate secrets without a restart (Unix, v0.6.20+):** `kill -HUP <pid>` (systemd: `ExecReload=/bin/kill -HUP $MAINPID`)
+> makes the running server re-read its `.env` on the next `secret()`/`env()` resolution and rebuild the LLM
+> provider with the new key — no restart, no dropped connections. A `secret` copied into a `let` at startup
+> keeps the old value (resolve secrets where you use them). The process environ is read live (no signal).
+> Windows has no SIGHUP: graceful restart.
 > `synsema conform` honors these same `--sandbox`/`--cap-set`/`--profile`/`--audit` flags too (v0.6.14+
 > — before, `conform` silently ignored the ceiling): the denials show up in its `{ok, out, err}` JSON.
 

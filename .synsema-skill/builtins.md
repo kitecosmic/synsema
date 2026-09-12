@@ -21,7 +21,9 @@
 - `enumerate(list)` → `[{index, item}, …]` — indexed iteration in the language AND in templates (`each e in enumerate(xs)` → `e.index` / `e.item`). Pure; non-list → error.
 - `values(map)` → list of values
 - `contains(collection, item)` → bool (lists/text/maps; also `bytes`: subsequence, or a single byte 0–255)
-- `split(text, separator)` → list
+- `split(text, separator)` → list. `split(text, "")` → the **characters** (Unicode scalars) — v0.6.20+ (before: an error)
+- `reverse(list | text)` → a NEW list in reverse order; on text, the characters reversed (by Unicode scalar, not grapheme-aware) — v0.6.20+, pure. Anything else is a clear error
+- `steps()` → number (v0.6.20+) — statements the interpreter executed so far in this program. Counts nodes, not time: the same program gives the same number every run (a deterministic cost for metering/tests/fuel-style limits). No capability (introspection, like `llm_usage()`), every profile. `run --format json` reports the total as `steps`
 - `join(list, separator)` → text
 - `range(end)` or `range(start, end)` or `range(start, end, step)` → list
 - `type_of(value)` → text ("number", "decimal", "complex", "text", "bytes", "bool", "list", "map", "array", "task", "nothing")
@@ -119,11 +121,23 @@ Blockchain — sign/verify/derive (all pure-Rust; see stdlib.md for the security
   - Sync-engine boundary: keepalive/reconnect tick INSIDE `ws_select`/`ws_recv`/`ws_status`. Per-interpreter connection cap via `SYNSEMA_WS_MAX_CONNS` (default 4096). See stdlib.md § WebSocket.
 - Note: `text(b)` / `print(b)` show a hex repr like `bytes(48656c6c6f)`, **not** a decode. `bytes != text` always.
 
+## ECDH / HKDF / AES-GCM (pure except key generation — v0.6.20+)
+WebCrypto names and shapes. Secrets stay `secret` (a derived key is USED — as the AES key — never printed).
+- `ecdh_keypair(curve)` → `{private: secret, public: bytes}` — `curve` = `"P-256"` | `"P-521"` (anything else: clear error); public = SEC1 uncompressed point (65 / 133 bytes). **Requires `random`** (it creates a key — the gate of `random_bytes`).
+- `ecdh_shared_secret(private, peer_public, curve)` → secret (the raw X coordinate, like WebCrypto `deriveBits`). Pure.
+- `hkdf_sha256(ikm, salt, info, length)` → bytes (RFC 5869; a `secret` when `ikm` is one). Pure.
+- `aes_gcm_encrypt(key, nonce, plaintext, aad?)` → bytes (ciphertext ‖ 16-byte tag) / `aes_gcm_decrypt(key, nonce, ciphertext, aad?)` → bytes. Key 16 bytes = AES-128-GCM, 32 = AES-256-GCM (else: `the key must be 16 bytes … or 32 bytes`); nonce 12 bytes, never reused with a key; auth failure → `authentication failed (wrong key, nonce, aad, or tampered data)`, never partial bytes. Pure.
+
 ## JSON (pure — no capability)
 - `json_encode(value)` → text: serialize any value to a JSON string. Maps/lists nest; **secret → `"[redacted]"`** (safe), `bytes` → base64 string, `decimal` (`1.50d`) → exact JSON number, `nothing` → `null`. ⚠️ NOT safe to embed inside a `<script>` tag — use `json_for_script` there.
 - `json_for_script(value)` → text: same JSON but with `<`, `>`, `&` escaped as `\u00XX` — **the safe way to embed data in an inline `<script>`** (`{ raw json_for_script(x) }`); a value containing `</script>` cannot break out of the tag.
 - `json_decode(text)` → value: parse a JSON string to a Synsema value (object→map, array→list, number→number, etc.). Errors clearly on invalid JSON.
 - Round-trippable: `json_decode(json_encode(x))` reconstructs `x` (the idiomatic way to store structured data in a Redis/text value: `redis_set(k, json_encode({...}))`).
+
+## XML / TOML (pure — no capability — v0.6.20+)
+- `xml_parse(text)` → map, **xmltodict convention**: an element is a map, attributes are `@name` keys, a text-only element IS its text, repeated children → a **list**, namespace prefixes kept (`cfdi:Emisor`); root = `{"<root tag>": {...}}`. Malformed → error with `line:col`. DTDs/external entities NOT processed (no XXE). No `xml_encode`.
+- `toml_parse(text)` → map: tables → maps, arrays/`[[tables]]` → lists, ints/floats/bools → numbers/bools, **dates/times → ISO 8601 text** (no date type). Dotted keys, inline tables, multi-line strings OK.
+- `toml_encode(map)` → text for JSON-like values; `nothing` refused (`TOML has no null — <key> is nothing (drop the key or give it a value)`), `bytes`/`secret` too.
 
 ## CSV (pure — no capability; see [dataviz.md](dataviz.md))
 - `csv_parse(text, opts?)` → list of maps (first row = headers; the same shape `sql()` returns). RFC 4180 (quoted fields, `""` escapes, CRLF/LF, BOM). Opts: `{headers: false}` → list of lists, `{delimiter: ";"}`, `{numbers: true}` (default is **lossless text**: `"00123"` stays text). Errors carry the line (unclosed quote, uneven fields, duplicate headers, unknown option).
@@ -176,8 +190,9 @@ sealed `secret`, text (raw UTF-8 bytes) or `bytes`; anything else is a clear err
 - `token(n?)` → unguessable base64url text of n random bytes (16–256, default 32 → 43 chars). Session ids, CSRF tokens, API keys, device codes.
 - `password_hash(pw)` → PHC text (`$argon2id$v=19$m=19456,t=2,p=1$…`, OWASP params, random salt). Store this string as-is.
 - `password_verify(pw, phc)` → bool (constant-time). Malformed/unknown PHC → **error**, not `false` ("wrong password" and "corrupt hash in DB" must never be confused).
-- `jwt_sign(claims, key, opts?)` → HS256 token. Sets `iat` (your explicit claim wins); `opts.expires_in` (seconds) sets `exp` (passing both an `exp` claim and `expires_in` is an error).
-- `jwt_verify(token, key, opts?)` → claims map or `nothing` on ANY failure (bad signature, expired `exp`, future `nbf`, malformed, `alg` ≠ HS256 — the verifier pins the algorithm; `"none"`/`RS256` tokens are rejected). `opts.leeway` seconds (default 60). RS256/ES256 (third-party OIDC) is not supported yet.
+- `jwt_sign(claims, key, opts?)` → token. Default **HS256** with a shared key. **`opts.alg = "RS256" | "ES256"`** (v0.6.20+) signs with a **PEM private key passed as a `secret`** (PKCS#8 or PKCS#1 for RSA; PKCS#8 or SEC1 for P-256) — GitHub Apps, service accounts; `opts.kid` goes to the header. The signer picks the algorithm, never the token; an unknown `alg` is an error (`supported: HS256, RS256, ES256`). Sets `iat` (your explicit claim wins); `opts.expires_in` (seconds) sets `exp` (passing both an `exp` claim and `expires_in` is an error).
+- `jwt_verify(token, key, opts?)` → claims map or `nothing` on ANY failure (bad signature, expired `exp`, future `nbf`, malformed, `alg` ≠ HS256 — the verifier pins the algorithm; `"none"`/`RS256` tokens are rejected). `opts.leeway` seconds (default 60). Verifying a third party's RS256/ES256 token is `oidc_verify` (below).
+- `rsa_sign_sha256(msg, pem_secret)` → bytes (PKCS#1 v1.5, 256 bytes for a 2048-bit key) / `rsa_verify_sha256(msg, sig, pub_pem)` → bool; `ecdsa_p256_sign(msg, pem_secret)` → bytes / `ecdsa_p256_verify(msg, sig, pub_pem)` → bool (v0.6.20+) — the raw primitives behind RS256/ES256. Pure, **no `sign` capability** (that gate is for moving value on-chain; here the key is already a `secret`).
 - `totp(key, opts?)` → code text (defaults: sha1, 6 digits, 30 s — the Google Authenticator profile). Opts: `algo` (`"sha1"|"sha256"`), `digits` (6–8), `period`, `at` (unix ts, for deterministic tests).
 - `totp_verify(key, code, opts?)` → bool (constant-time), `opts.window` = ±N periods (default 1). The code must be **text** (leading zeros matter).
 
@@ -338,6 +353,12 @@ have a single form.
 - `grep(target, pattern, opts?)` → `{matches: [{file, line, col, text}], truncated}` — requires `file.read`. Searches **per line** (streams, never loads the whole file). `target` = file or directory (recursive). **Literal by default**; `opts`: `{regex, ignore_case, glob, max_results}` (`glob` filters filenames; `truncated:true` when `max_results` is hit). `line`/`col` are 1-based.
 - `edit_file(path, old, new, replace_all?)` → `{replaced: N}` — requires `file.write`. Exact-string replace; `old` must be **unique** (errors: `pattern not found` / `ambiguous, N occurrences`). `replace_all:true` replaces all. Atomic (temp+rename).
 - `append_file(path, content)` → bool — requires `file.write`. Appends to the end (creates the file + parent dirs). `content` bytes = raw, else text. Real append (not a full rewrite).
+- `delete_file(path)` → `true` (v0.6.20+) — requires `file.write` on that path. A missing file is an **error** (`File not found`), a directory too (`use delete_dir`); never a silent `false`. A path inside a `synsema build` bundle is read-only → refused.
+- `delete_dir(path, opts?)` → `true` (v0.6.20+) — requires `file.write` on the directory **and, with `{"recursive": true}`, on every path inside it** (checked before anything is deleted; the same grant that would let you delete them one by one — `file.write("./tmp")` alone fails at the first child `file_write("tmp/k")`, add `file.write("./tmp/*")`). Without `recursive` only an empty dir: `"tmp" is not empty (pass {"recursive": true} to delete its contents)`. Unknown option → error.
+- `cwd()` → text (v0.6.20+) — the REAL working directory, normalized to `/` (`C:/Users/me/proj`). Requires **`file.read(".")`** — the same grant `list_dir(".")` needs (`./*` and `*` cover it; `./data/*` does not): the absolute path is host information, not free under `--sandbox`. In a `synsema build` binary it is where the binary was started, never the bundle.
+- **`bundle:` / `disk:` prefixes** (v0.6.20+, `synsema build` binaries): a path that IS in the bundle is the program — `read_file`/`read_file_bytes`/`file_exists`/`file_info`/`grep` read it from the bundle with no `file` capability (audit `reason: bundled asset (part of the program)`), and a same-named file in the cwd never shadows it; a path NOT in the bundle is the user's → disk with `file.read`. `read_file("bundle:x")` forces the bundle (error if absent), `read_file("disk:x")` forces the disk. `list_dir(p)` lists the **disk** only; `list_dir("bundle:")` / `list_dir("bundle:sub/")` list the bundle.
+- `zip_create(entries, opts?)` → bytes / `tar_create(entries, {"gzip": true}?)` → bytes (v0.6.20+, native only) — `entries` = `[{"path", "bytes"} | {"path", "from": <file>}]`; `from` needs `file.read` (a bundled asset needs none). Archive paths normalized to `/`; `..`/absolute refused at creation. **Deterministic** (fixed mtimes: same entries → same bytes).
+- `zip_extract(bytes, dest, opts?)` / `tar_extract(bytes, dest, opts?)` → list of the paths written (v0.6.20+, native only; tar detects gzip by magic). Requires **`file.write` on every path it writes** (like `write_file` would: `file.write("./out/*")` extracts into `./out`, created if missing; an exact scope on `./out` alone is denied at the first entry). **Zip-slip rejected** (`entry "../evil.txt" would escape the destination directory (rejected, nothing written)`); symlinks/hardlinks skipped. `opts.max_entries` (10 000) and `opts.max_bytes` (512 MB) count the **real** decompressed bytes (a lying header does not help): over the ceiling → error, nothing written. Price of "nothing written": the content is held in memory up to `max_bytes` before the first file lands — lower it or extract in parts for huge archives. Under `--profile pure`/wasm all four are honest stubs.
 - `run(cmd, args_list?, timeout?, opts?)` → `{exit_code, stdout, stderr, stdout_truncated, stderr_truncated}` — requires `exec("<cmd>")`. Runs a process **without a shell** (args as a list → no quoting injection). `timeout` default 120s → on expiry kills the process and **raises** (`timed out after Ns`); catch with `try`/`recover`. `opts`: `{cwd, env (adds/overrides), stdin (text/bytes), max_output (default 10MB)}`. **Non-zero `exit_code` is data, not an error**; can't-launch and timeout raise. `exec` is deny-by-default (not auto-granted, even in `run`). Scope = the command string as passed. **The child does NOT inherit Synsema's secrets** (v0.6.14+): the LLM provider keys and `.env`-loaded variables are stripped from its environment (the base OS env — `PATH`, etc. — is kept, so commands work); pass a secret a child truly needs explicitly via `opts.env` (which routes through `reveal`/`env`). `proc_spawn` strips the same. To run **Synsema under a ceiling** instead of an OS command, prefer `run_program` (isolated env/cwd/timeout by construction).
 - `now()` → unix timestamp (number) — requires `time`
 - `sleep(seconds)` → pause execution (e.g. to pace an SSE stream) — requires `time`
@@ -348,12 +369,13 @@ have a single form.
 - `random_int(min, max)` → integer
 
 ## HTTP
-Both `http://` and **`https://` (TLS)** are supported (rustls + OS root CAs, real cert validation). **All HTTP (`http*` and `fetch`) is gated by `net(host)`** — `require net("host")` (deny-by-default, even in `run`; `require net` / `net("*")` = any). See capabilities.md.
-- `http(method, url, headers?, query?, body?, timeout?)` → response map {status, ok, body, json, headers, error}
-- `http_get(url, headers?, query?)` → response map
-- `http_post(url, body, headers?)` → response map
-- `http_put(url, body, headers?)` → response map
-- `http_delete(url, headers?)` → response map
+Both `http://` and **`https://` (TLS)** are supported (rustls + OS root CAs, real cert validation). **All HTTP (`http*` and `fetch`) is gated by `net(host)`** — `require net("host")` (deny-by-default, even in `run`; `require net` / `net("*")` = any). See capabilities.md and [stdlib.md](stdlib.md) § HTTP.
+- `http(method, url, headers?, query?, body?, timeout?)` → response map `{status, ok, body, json, headers}` (+ `error` ONLY when the transport failed)
+- `http_get(url, headers?, query?, timeout?)` / `http_post(url, body, headers?, timeout?)` / `http_put(url, body, headers?, timeout?)` / `http_delete(url, headers?, timeout?)` / `fetch(url, method?, headers?, body?, timeout?)` → response map
+- **Body by type (v0.6.20+):** a **map or list** is sent as JSON with `Content-Type: application/json` (your own `Content-Type` header wins); **text** goes out as-is (no content type added); **bytes** raw. (≤ v0.6.19 a map went out as display text with no header — `json_encode(map)` + the header still works.)
+- **`json of r`** (v0.6.20+): the parsed body when the response content type says JSON and it parses; otherwise `nothing` (never an error). `body of r` stays the raw text.
+- `http_bytes(method, url, headers?, query?, body?, timeout?)` → `{status, ok, bytes, headers}` (v0.6.20+) — the exact bytes the server sent (PDF, image, protobuf); no `body` key. Same `net` gate.
+- `multipart_encode(parts)` → `{body: bytes, content_type: "multipart/form-data; boundary=…"}` (v0.6.20+, pure, deterministic boundary) — `parts` = `[{"name", "value"} | {"name", "filename", "content_type"?, "bytes"}]`; send with `http_post(url, body of m, {"Content-Type": content_type of m})`; a Synsema `serve` reads it as `form of request`. Built in memory (no streaming of huge files).
 
 ## Database
 Opened with `db_open`, routed by target. SQL family (SQLite/Postgres/MySQL) + document family (MongoDB) +
@@ -415,6 +437,7 @@ Response helpers (set the HTTP status; body follows the response contract):
 - `read_body()` → full request body **text** (lossy for non-UTF-8) — inside a route handler
 - `read_body_bytes()` → full request body as `bytes` (byte-exact, for binary uploads) — inside a route handler
 - `binary(bytes, content_type?, status?)` → a binary response (default `application/octet-stream`, 200). Also `give bytes(...)` directly → octet-stream.
+- `openapi_json()` → text (v0.6.20+) — the OpenAPI document THIS server publishes (already filtered: `private` routes out), from a route of your own: `give respond(openapi_json(), "application/json")` (a bare `give` would JSON-quote the text). Per server (several `serve on` in one process → each its own). Under `run`: error `only available under serve`.
 - **Shared state across requests** (serve): `state_set(key, value)`, `state_get(key, default?)`, `state_incr(key, delta?)`, `state_delete(key)`, `state_all()` (snapshot map of every key) — an in-memory store shared across all handlers/requests (a `set` on a global does NOT persist across requests). See serve.md.
 
 ### Semantic content (negotiated HTML / Markdown / JSON — see serve.md)
@@ -431,7 +454,7 @@ Response helpers (set the HTTP status; body follows the response contract):
 - `chart_svg(kind, data, opts?)` → **plain SVG text** (embed with `{ raw ... }`, serve with `respond(svg, "image/svg+xml")`, save with `write_file`). `kind`: `"bar"`/`"line"`/`"pie"`/`"scatter"`. Data: list of maps + `{x, y}` opts (rows from any source), map label→value, list of numbers, `[x,y]` pairs, or 1-D `array`. Opts: `title`, `x`/`y` (multi-series: `y` as list), `x_label`/`y_label`, `width`/`height`, `colors` (replaces the palette), `legend`, `background`. Deterministic; XSS-safe; colorblind-safe 8-color palette in fixed order — **>8 series/slices without custom `colors` → error** (colors are never cycled); NaN/inf in plotted values → error.
 
 ### PNG / PDF export (pure — no capability; see [dataviz.md](dataviz.md))
-- `svg_to_png(svg, opts?)` → PNG **bytes** from ANY SVG text (deterministic: embedded font, no system fonts). Opts: `width`/`height` (one keeps aspect), `scale`, `background` (hex), `max_pixels` (overridable anti-DoS ceiling, default ~16.7M). External `<image href>` never fetched (no net/disk); `<script>` ignored; `secret` → error.
+- `svg_to_png(svg, opts?)` → PNG **bytes** from ANY SVG text (deterministic: embedded font; system fonts only if YOU pass them). Opts: `width`/`height` (one keeps aspect), `scale`, `background` (hex), `max_pixels` (overridable anti-DoS ceiling, default ~16.7M), **`fonts`** (v0.6.20+: list of `.ttf`/`.otf` paths, each under `file.read` — a bundled font needs none — loaded for that call; `font-family="Arial"` resolves with `C:/Windows/Fonts/arial.ttf`; unknown families still fall back to DejaVu; same SVG + same fonts → same bytes; `svg_to_pdf` takes it too). External `<image href>` never fetched (no net/disk); `<script>` ignored; `secret` → error.
 - `svg_to_pdf(svg, opts?)` → single-page **vector** PDF bytes. Opts: `width`/`height` in points (both must match the SVG aspect ratio). Compose: `write_file(path, b)`, `give binary(b, "image/png"|"application/pdf")`.
 
 ## Cron (Scheduled Tasks)

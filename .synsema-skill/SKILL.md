@@ -21,7 +21,7 @@ This skill is an **indexed folder**: read ONLY the section(s) you need for the t
 | Want to… | Command |
 |---|---|
 | **Run** a program | `synsema run file.syn` (`--flat` for `.fsyn`) |
-| **Check** fast (no run) | `synsema check file.syn` — parse + resolves/parses every `use` import + validates `render("literal.html")` templates |
+| **Check** fast (no run) | `synsema check file.syn` — parse + resolves/parses every `use` import + validates `render("literal.html")` templates; v0.6.20+ also **warns** (exit 0) about a `let`/`export routes` shadowing a `use` alias and a `GET /:x` that would cover the reserved discovery URLs |
 | **Test** / assert behavior | `synsema test file.syn` (or a dir) → [testing.md](testing.md) |
 | **Serve** an HTTP API/site | `synsema serve file.syn` (`--watch` = dev loop: auto-restart on .syn changes; templates/statics already hot-reload) → [serve.md](serve.md) |
 | **Debug an error** | Read it — errors carry `file:line` + suggestions. Then [pitfalls.md](pitfalls.md). |

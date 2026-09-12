@@ -145,7 +145,10 @@ route "GET /chart.pdf"
 - `svg_to_png(svg, opts?)` → PNG bytes (RGBA, transparent unless `background`). Opts:
   `width`/`height` (px; one alone keeps aspect), `scale` (e.g. `2` for retina — conflicts
   with width/height, explicit error), `background` (hex), `max_pixels` (anti-DoS ceiling,
-  default 16.7M ≈ 4096×4096, **overridable** — the error names the option).
+  default 16.7M ≈ 4096×4096, **overridable** — the error names the option), **`fonts`** (v0.6.20+:
+  a list of `.ttf`/`.otf` paths, each under `file.read` — a font bundled by `synsema build` needs
+  none — loaded for that call only; `font-family="Arial"` resolves with `C:/Windows/Fonts/arial.ttf`,
+  unknown families still fall back to DejaVu; same SVG + same fonts → same bytes; `svg_to_pdf` too).
 - `svg_to_pdf(svg, opts?)` → single-page **vector** PDF (crisp at any zoom, printable).
   Opts: `width`/`height` in points (one alone scales proportionally; both must match the
   SVG's aspect ratio or you get a clear error).

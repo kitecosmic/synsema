@@ -164,6 +164,11 @@ usually version skew, not a bug.
 - Agent-readable content / content negotiation (HTML · Markdown · JSON) → serve.md
 - Static files (CSS/JS/images) → serve.md
 - Agent discoverability (llms.txt / robots.txt / sitemap.xml / openapi.json / docs, `private`, `docs off`, `describe version:`) → serve.md
+- v0.6.20 — `private` per route/group, reserved URLs before `/:param`, `openapi_json()`, host health (`--health`/`SYNSEMA_HEALTH_PATH`), per-identity LLM budget, `.env` reload on SIGHUP → serve.md / deploy.md
+- v0.6.20 — delete files/dirs, `cwd()`, `~/`, zip/tar, `bundle:`/`disk:` in built binaries → builtins.md § I/O
+- v0.6.20 — HTTP body by type + `json of r` + `http_bytes` + `multipart_encode` → stdlib.md § HTTP
+- v0.6.20 — `xml_parse`, `toml_parse`/`toml_encode`, ECDH/HKDF/AES-GCM, `jwt_sign` RS256/ES256, `fonts` in `svg_to_*` → builtins.md
+- v0.6.20 — `--deterministic`, `--audit unix:`, `SYNSEMA_AUDIT`, `steps()`, `check` warnings → capabilities.md / observability.md / modules.md
 - Emit the OpenAPI spec in CI without starting the server (`synsema openapi app.syn --out`) → serve.md § Discoverability
 - Deploying to server → deploy.md
 - Adding security → capabilities.md
