@@ -12,23 +12,37 @@ It is an adapter outside the engine on purpose (see [`../README.md`](../README.m
 (`ecdh_*`, `hkdf_sha256`, `aes_gcm_*`) for the client side, `--deterministic`, `steps()` — went into
 the language with generic names.
 
-## Build
+## Your program → a module (no compiler)
+
+Every release publishes this crate built with the example `app.syn` as `synsema-vela-guest.wasm`. The
+program lives in an **app slot** — a fixed block of data with a header — and `tools/embed.syn` finds
+the slot in the file and overwrites it with any `.syn`, in a second, without Rust:
+
+```sh
+synsema run tools/embed.syn -- synsema-vela-guest.wasm my_app.syn my_app.wasm
+```
+
+Test the program natively first — it is plain Synsema: `synsema test my_app.syn`. The kits
+(`synsema/vela-app` and the templates built on it) wrap this in `scripts/build.sh`.
+
+## The adapter (Rust)
+
+Only if you change the adapter itself:
 
 ```sh
 rustup target add wasm32-wasip1
 cd packages/guests/vela
 cargo build --profile wasm                       # default target: wasm32-wasip1 (.cargo/config.toml)
-# → ../../../engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm  (≈ 7–8 MB)
+# → ../../../engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm  (≈ 7.8 MB, 512 KB of it the slot)
 
-SYNSEMA_VELA_APP=/path/to/my_app.syn cargo build --profile wasm   # embed YOUR program instead of app.syn
+SYNSEMA_VELA_APP=/path/to/my_app.syn cargo build --profile wasm   # fill the slot at build time instead of app.syn
 
 # From any other directory (a CI job at the repo root) the crate's .cargo/config.toml does not
 # apply — say the target and the shared target dir explicitly, or you get a native cdylib:
 cargo build --locked --manifest-path packages/guests/vela/Cargo.toml --profile wasm --target wasm32-wasip1 --target-dir engine/target
 ```
 
-Test the program natively first — it is plain Synsema: `synsema test app.syn`. Then probe the
-module the way the Executor drives it: `node ../../../tests/vela_guest.probe.mjs <the .wasm>`
+Then probe the module the way the Executor drives it: `node ../../../tests/vela_guest.probe.mjs <the .wasm>`
 (Node's WASI ≈ wasmtime-go's `DefineWasi()`; the probe checks imports, exports, every entry point,
 result formats, determinism and memory hygiene).
 
@@ -36,37 +50,36 @@ Run the Node probe on Node 20 or Node 24+ — **not 22**: Node 22.x segfaults in
 inside V8 while executing this module (the concurrent tier-up race; reproduced with 22.23.2 on
 Linux, one crash in three runs, none on 20 or 24). `node --no-wasm-dynamic-tiering …` works
 around it. It is the host, not the guest: `tests/wasmtime-go/` (wasmtime-go v1.0.0, the
-Executor's exact runtime) is unaffected, and CI runs both probes.
-
-The release publishes `synsema-vela-guest.wasm` — this crate built with the example `app.syn` —
-so you can deploy something to the Vela starter kit before writing a line.
+Executor's exact runtime) is unaffected, and CI runs both probes — and embeds another program with
+`tools/embed.syn` and probes that too.
 
 ## Start from the kit
 
 [`synsema/vela-app`](https://github.com/synsema/vela-app) is a template repository built on this crate: the app with
-its tests, the client, `scripts/build.sh` (clones this repo at a release tag and builds the module with your
-app embedded), `scripts/smoke.mjs`, `scripts/devnet.sh` (Horizen's starter kit in Docker) and `scripts/e2e.sh`,
-plus a CI workflow that builds `app.wasm` for teams without Rust.
+its tests, the client, `scripts/build.sh` (the release's guest with your app in its slot — no compiler), `scripts/smoke.mjs`,
+`scripts/devnet.sh` (Horizen's starter kit in Docker) and `scripts/e2e.sh`, plus a CI workflow that builds
+`app.wasm` on every push.
 
 [`synsema/vela-payroll`](https://github.com/synsema/vela-payroll) is a complete app built on the kit: private payroll in a
 stablecoin — pay runs from a CSV, one encrypted payslip per person, a public receipt per run, pull-payment withdrawals
 through the facilitator (people need no ETH), an auditor's report. Its client adds `fund`, `payrun`, `payslips`,
 `withdraw`, `pending` and `claim-for` with amounts in tokens, and its `scripts/devnet.sh` deploys and allowlists the
-test ERC-20 from `examples/erc20/` locally. Verified end to end on the shared devnet.
+test ERC-20 from `examples/erc20/` locally. Verified end to end on the public devnet.
 
 [`synsema/vela-treasury`](https://github.com/synsema/vela-treasury) is the agent treasury: policy inside, LLM outside. An agent
 proposes payments with its own key; the enclave applies the owner's policy (proposers, payees with caps, an automatic
 limit, an allowance) and pays through its trigger contract (the cycle of `examples/trigger_app.syn`, with ERC-20) or holds the
 proposal for the owner's approval; the agent worker reads an inbox, and the client protocol is a module both it and the CLI
-use. Verified end to end on the shared devnet. The three kits are recipes in [`synsema/recipes`](https://github.com/synsema/recipes).
+use. Verified end to end on the public devnet. The three kits are recipes in [`synsema/recipes`](https://github.com/synsema/recipes).
 
-## The shared devnet
+## The public devnet
 
-`devnet.synsema.app` hosts Horizen's starter kit v0.2.0 for the acceleration cohort, behind HTTPS with a
-token as the first path segment (`/<token>/rpc`, `/<token>/authority`, `/<token>/subgraph/…`). Ask for
-the token, put the URLs and the two contract addresses in `client/.env`, and the client works unchanged
-(it declares `require net("devnet.synsema.app")`). A devnet: Anvil's public keys, no attestation, reset
-from time to time. Details on the docs page.
+`devnet.synsema.app` runs Horizen's starter kit v0.2.0 behind HTTPS, with a token as the first path segment
+(`/<token>/rpc`, `/<token>/authority`, `/<token>/subgraph/…`). A token of your own is one command:
+`vela_client.syn -- devnet` (or `curl -X POST https://devnet.synsema.app/token`) writes the `VELA_*` lines into
+`.env`, and the client works unchanged (it declares `require net("devnet.synsema.app")`). The admin key is
+Anvil #0, public, so `allow-token` and `allow-authority` are yours to run. A devnet: Anvil's public keys, no
+attestation, reset from time to time. Details on the docs page.
 
 ## What ships with the crate
 

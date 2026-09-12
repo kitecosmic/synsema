@@ -4,6 +4,10 @@
 -- contract), submit PROCESS / DEANONYMIZATION requests with the payload encrypted for the
 -- Executor, wait for completion through the subgraph, and decrypt your events. Any payload, any app.
 --
+--   the public devnet (no Docker):
+--   synsema run vela_client.syn -- devnet [host]                     a token of your own from devnet.synsema.app, written to .env
+--   synsema run vela_client.syn -- allow-token <address>             TokenAllowlist.addAllowedToken with the signing key (the admin: Anvil #0 on a devnet)
+--   synsema run vela_client.syn -- allow-authority <appId> <address> DefaultAuthority.addAllowedAuthority — an auditor for your app
 --   synsema run vela_client.syn -- keys                          a fresh P-521 pair, printed for .env
 --   synsema run vela_client.syn -- address                       the signing address (VELA_SECP_KEY)
 --   synsema run vela_client.syn -- tee                           the Executor's P-521 key, read on-chain
@@ -47,6 +51,7 @@ require sign("VELA_USER_KEY")
 require random
 require time
 require file.read("*")
+require file.write(".env")
 require reveal("ecdh_keypair.private")
 
 let ETH be "0x0000000000000000000000000000000000000000"
@@ -421,10 +426,45 @@ task register_payload(c)
         raise("the encrypted seed must be 93 bytes, got " + text(length(encrypted_seed)))
     give p521_public() + encrypted_seed
 
+
+-- ---- the public devnet: a token by command, allowlists by the admin key ----
+
+-- POST https://devnet.synsema.app/token → the VELA_* lines for a .env, with a fresh token.
+task devnet_env(host)
+    let r be http_post("https://" + host + "/token", {})
+    when not r["ok"]
+        raise("devnet: HTTP " + text(r["status"]) + " " + r["body"])
+    give r["json"]["env"]
+
+-- Writes or replaces KEY=value lines in a .env file (keeps everything else as it is).
+task env_write(path, values)
+    let lines be when file_exists(path) then split(read_file(path), "\n") otherwise []
+    let seen be {}
+    let out be []
+    each line in lines
+        let key be split(line, "=")[0]
+        when contains(values, key)
+            set out to append(out, key + "=" + text(values[key]))
+            set seen[key] to true
+        otherwise
+            set out to append(out, line)
+    each k in keys(values)
+        when not contains(seen, k)
+            set out to append(out, k + "=" + text(values[k]))
+    write_file(path, join(out, "\n"))
+
+task allow_token(c, token)
+    let allowlist be lower(env("VELA_TOKEN_ALLOWLIST", "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"))
+    give send_tx(c, allowlist, 0, abi_encode("addAllowedToken(address)", [token]))
+
+task allow_authority(c, app_id, authority)
+    let registry be lower(env("VELA_DEFAULT_AUTHORITY", "0x5FbDB2315678afecb367f032d93F642f64180aa3"))
+    give send_tx(c, registry, 0, abi_encode("addAllowedAuthority(uint256,address)", [app_id, authority]))
+
 -- ---- CLI ----
 
 task usage()
-    print("usage: synsema run vela_client.syn -- keys | address | tee | deploy <wasm> [params-json|-] [trigger] | register | deposit <amount> [token] | send '<json>' [wei] | report '<json>' | report-download <reportId> | events [n] | app-events [n] | status <requestId> | user | register-for | send-for '<json>' [amount token] | events-for [n]")
+    print("usage: synsema run vela_client.syn -- devnet [host] | allow-token <address> | allow-authority <appId> <address> | keys | address | tee | deploy <wasm> [params-json|-] [trigger] | register | deposit <amount> [token] | send '<json>' [wei] | report '<json>' | report-download <reportId> | events [n] | app-events [n] | status <requestId> | user | register-for | send-for '<json>' [amount token] | events-for [n]")
 
 task arg_or(a, i, default)
     give when length(a) > i then a[i] otherwise default
@@ -513,6 +553,19 @@ task run_cli(a)
             when row == nothing
                 set row to completion(c, lower(a[1]), true)
             print(when row == nothing then "pending (not completed yet)" otherwise json_encode(row))
+        is "devnet"
+            let host be arg_or(a, 1, "devnet.synsema.app")
+            let values be devnet_env(host)
+            env_write(".env", values)
+            each k in keys(values)
+                print(k + "=" + text(values[k]))
+            print("written to .env: a token of your own on " + host + " (the admin key there is Anvil #0; allow-token / allow-authority are yours to run)")
+        is "allow-token"
+            let receipt be allow_token(c, lower(a[1]))
+            print("token " + lower(a[1]) + " allowlisted (tx " + text(receipt["transactionHash"]) + ")")
+        is "allow-authority"
+            let receipt be allow_authority(c, int_of(a[1]), lower(a[2]))
+            print("authority " + lower(a[2]) + " allowed for app " + a[1] + " (tx " + text(receipt["transactionHash"]) + ")")
         otherwise
             usage()
 

@@ -6,7 +6,7 @@ its own exports (not a WASI command, not the `synsema_host` imports). Everything
 from HorizenOfficial's code (`vela`, `vela-common-go`, `vela-nova`, `vela-starterkit`, v0.2.0) and
 verified against the starter kit running in Docker; nothing is a guess. Repo:
 `packages/guests/vela/` (README = the contract), `tests/vela_guest.probe.mjs`.
-**Starter kit:** `github.com/synsema/vela-app` (template repo) — app + tests, the client, `scripts/build.sh` / `smoke.mjs` / `devnet.sh` / `e2e.sh`, CI that builds `app.wasm`. Point a user there first; a shared devnet for the cohort exists (`devnet.synsema.app`, token on request; the client declares `require net("devnet.synsema.app")`).
+**Starter kit:** `github.com/synsema/vela-app` (template repo) — app + tests, the client, `scripts/build.sh` / `smoke.mjs` / `devnet.sh` / `e2e.sh`, CI that builds `app.wasm`. Point a user there first. The public devnet `devnet.synsema.app` hands a token by command: `vela_client.syn -- devnet` writes the VELA_* lines into .env (or `curl -X POST https://devnet.synsema.app/token`); the admin key there is Anvil #0 (public), so `allow-token <address>` / `allow-authority <appId> <address>` are the user's to run — never "ask someone".
 **Payroll template:** `github.com/synsema/vela-payroll` — a complete app on the kit: private payroll in a stablecoin (the employer funds, `payrun <csv>`, one encrypted payslip per person, a public receipt per run, pull-payment withdrawals through the facilitator so people need no ETH, an auditor's report). Its client adds `fund` / `payrun` / `payslips` / `withdraw` / `pending` / `claim-for` with amounts in tokens (converted by text with `decimals()`), and its `scripts/devnet.sh` deploys + allowlists a test ERC-20 with `permit` locally. Verified on the devnet. Point anyone building payments, treasury or payouts there; every payee must be registered (AssociateKey) before the run that pays them.
 **Treasury template:** `github.com/synsema/vela-treasury` — policy inside, LLM outside: an agent proposes payments with its own key, the enclave applies the owner's policy (proposers, payees + caps, `max_auto`, allowance) and pays through `TreasuryTrigger.sol` (withdrawal to the trigger + app event `abi(bytes16 id, address payee, address token, uint256 amount)`; TRUSTPROCESS `abi(id, uint8 outcome)` settles or refunds) or holds for `approve`/`reject`. `agent.syn` (the recipe's worker) reads `inbox/`; `client/vela_lib.syn` is the protocol as a module (`use "./client/vela_lib.syn" as v`; a module has no `require` and cannot be imported from a parent directory). Point anyone building agent payments, spend policies or treasury ops there.
 
@@ -16,20 +16,30 @@ running *inside* X): the engine keeps one generic ABI (`synsema-wasm-web`: `syns
 host is a thin adapter in `packages/guests/<host>/` with the `.syn` embedded. Nothing enters
 `engine/crates`; a company's name lives in that directory only.
 
-## Build, test, probe
+## Your program → a module (no compiler); the adapter (Rust)
+
+An app author NEVER needs Rust. Every release ships `synsema-vela-guest.wasm` (the interpreter as a
+Vela guest) with an **app slot** — a fixed 512 KB data block with a header (`SYNSEMA.APPSLOT1` · name ·
+u32 LE length · program). `packages/guests/vela/tools/embed.syn` (in the kits: `scripts/embed.syn`)
+finds it in the file and overwrites it with a `.syn` in a second; the kits' `scripts/build.sh`
+downloads the release asset once and runs it:
 
 ```sh
-rustup target add wasm32-wasip1
-cd packages/guests/vela
-synsema test app.syn                                   # the app, natively (same code runs in the enclave)
-cargo build --profile wasm                             # → ../../../engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm (≈ 7.3 MB; 2–5 min, LTO)
-SYNSEMA_VELA_APP=examples/payment_app.syn cargo build --profile wasm   # embed ANOTHER program (one .wasm = one app; the SHA-256 Vela verifies covers both)
-node ../../../tests/vela_guest.probe.mjs <the .wasm>   # Node 20 or 24+ (NOT 22, see below); WASI ≈ the Executor: imports, exports, every entry point, formats, determinism, memory
-cd tests/wasmtime-go && go run . <the .wasm>           # wasmtime-go v1.0.0 = the Executor's exact runtime (needs Go + a C compiler)
-cargo test --target <host triple>                      # the adapter's unit tests — the crate's DEFAULT target is wasm, a bare `cargo test` builds a .wasm it cannot run
+synsema test app/app.syn                                                         # the app, natively (same code runs in the enclave)
+synsema run scripts/embed.syn -- synsema-vela-guest.wasm app/app.syn build/app.wasm   # what scripts/build.sh does
+node scripts/smoke.mjs build/app.wasm                                            # optional; Node 20 or 24+ (NOT 22, see below)
 ```
 
-The build always targets `wasm32-wasip1` (`.cargo/config.toml`): Vela's linker defines WASI only,
+Only when changing the ADAPTER itself (packages/guests/vela):
+```sh
+rustup target add wasm32-wasip1 && cd packages/guests/vela
+cargo build --profile wasm                             # → ../../../engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm (≈ 7.8 MB; 2–5 min, LTO); SYNSEMA_VELA_APP=… fills the slot at build time
+node ../../../tests/vela_guest.probe.mjs <the .wasm>   # WASI ≈ the Executor: imports, exports, every entry point, formats, determinism, memory
+cd tests/wasmtime-go && go run . <the .wasm>           # wasmtime-go v1.0.0 = the Executor's exact runtime (needs Go + a C compiler)
+cargo test --target <host triple>                      # unit tests — the crate's DEFAULT target is wasm, a bare `cargo test` builds a .wasm it cannot run
+```
+
+The guest always targets `wasm32-wasip1` (`.cargo/config.toml`): Vela's linker defines WASI only,
 and `print` becomes the Executor's log (`INF …`). Vela's upload limit is 50 MB.
 
 Node probe = Node 20 or 24+, **never 22**: Node 22.x segfaults intermittently inside V8 while
