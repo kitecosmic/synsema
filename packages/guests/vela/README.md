@@ -32,6 +32,12 @@ module the way the Executor drives it: `node ../../../tests/vela_guest.probe.mjs
 (Node's WASI ≈ wasmtime-go's `DefineWasi()`; the probe checks imports, exports, every entry point,
 result formats, determinism and memory hygiene).
 
+Run the Node probe on Node 20 or Node 24+ — **not 22**: Node 22.x segfaults intermittently
+inside V8 while executing this module (the concurrent tier-up race; reproduced with 22.23.2 on
+Linux, one crash in three runs, none on 20 or 24). `node --no-wasm-dynamic-tiering …` works
+around it. It is the host, not the guest: `tests/wasmtime-go/` (wasmtime-go v1.0.0, the
+Executor's exact runtime) is unaffected, and CI runs both probes.
+
 The release publishes `synsema-vela-guest.wasm` — this crate built with the example `app.syn` —
 so you can deploy something to the Vela starter kit before writing a line.
 

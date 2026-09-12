@@ -21,13 +21,18 @@ cd packages/guests/vela
 synsema test app.syn                                   # the app, natively (same code runs in the enclave)
 cargo build --profile wasm                             # → ../../../engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm (≈ 7.3 MB; 2–5 min, LTO)
 SYNSEMA_VELA_APP=examples/payment_app.syn cargo build --profile wasm   # embed ANOTHER program (one .wasm = one app; the SHA-256 Vela verifies covers both)
-node ../../../tests/vela_guest.probe.mjs <the .wasm>   # Node WASI ≈ the Executor: imports, exports, every entry point, formats, determinism, memory
+node ../../../tests/vela_guest.probe.mjs <the .wasm>   # Node 20 or 24+ (NOT 22, see below); WASI ≈ the Executor: imports, exports, every entry point, formats, determinism, memory
 cd tests/wasmtime-go && go run . <the .wasm>           # wasmtime-go v1.0.0 = the Executor's exact runtime (needs Go + a C compiler)
 cargo test --target <host triple>                      # the adapter's unit tests — the crate's DEFAULT target is wasm, a bare `cargo test` builds a .wasm it cannot run
 ```
 
 The build always targets `wasm32-wasip1` (`.cargo/config.toml`): Vela's linker defines WASI only,
 and `print` becomes the Executor's log (`INF …`). Vela's upload limit is 50 MB.
+
+Node probe = Node 20 or 24+, **never 22**: Node 22.x segfaults intermittently inside V8 while
+running this module (concurrent tier-up race; 22.23.2 on Linux crashed 1 run in 3, 20 and 24
+never; `node --no-wasm-dynamic-tiering` is the workaround). Host bug, not guest: wasmtime-go
+v1.0.0 (the Executor) is unaffected — CI runs both probes.
 
 ## The `.syn` contract (one task per export, one map in, one map out)
 

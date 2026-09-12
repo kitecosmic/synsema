@@ -490,3 +490,7 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
   without a host, `fetch` with `require net` fails `this host provides no http transport`.
 - **A trap discards the instance** (a panic in wasm aborts): the JS glue recreates it on the next
   call; program errors never trap — they come back in `errors[]`.
+- **The Vela guest probe segfaults under Node 22 — host bug, not yours**: Node 22.x crashes
+  intermittently inside V8 (concurrent tier-up race) while running `synsema_vela_guest.wasm`
+  (22.23.2 on Linux: 1 run in 3). Use Node 20 or 24+, or `node --no-wasm-dynamic-tiering`.
+  wasmtime-go v1.0.0 (Vela's Executor) is unaffected — see [guests.md](guests.md).
