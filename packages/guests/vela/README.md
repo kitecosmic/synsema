@@ -52,8 +52,13 @@ plus a CI workflow that builds `app.wasm` for teams without Rust.
 stablecoin — pay runs from a CSV, one encrypted payslip per person, a public receipt per run, pull-payment withdrawals
 through the facilitator (people need no ETH), an auditor's report. Its client adds `fund`, `payrun`, `payslips`,
 `withdraw`, `pending` and `claim-for` with amounts in tokens, and its `scripts/devnet.sh` deploys and allowlists the
-test ERC-20 from `examples/erc20/` locally. Verified end to end on the shared devnet. Both kits are recipes in
-[`synsema/recipes`](https://github.com/synsema/recipes).
+test ERC-20 from `examples/erc20/` locally. Verified end to end on the shared devnet.
+
+[`synsema/vela-treasury`](https://github.com/synsema/vela-treasury) is the agent treasury: policy inside, LLM outside. An agent
+proposes payments with its own key; the enclave applies the owner's policy (proposers, payees with caps, an automatic
+limit, an allowance) and pays through its trigger contract (the cycle of `examples/trigger_app.syn`, with ERC-20) or holds the
+proposal for the owner's approval; the agent worker reads an inbox, and the client protocol is a module both it and the CLI
+use. Verified end to end on the shared devnet. The three kits are recipes in [`synsema/recipes`](https://github.com/synsema/recipes).
 
 ## The shared devnet
 
