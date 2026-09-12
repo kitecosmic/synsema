@@ -1,0 +1,6 @@
+# build.sh clones Vela's contracts (BSL) here and forge writes its artifacts next to them
+lib/vela/
+out/
+cache/
+deploy.log
+trigger.address

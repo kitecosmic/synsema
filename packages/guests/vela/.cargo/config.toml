@@ -1,0 +1,7 @@
+# El guest de Vela se compila SIEMPRE a wasm32-wasip1: el Executor de Vela (wasmtime-go 1.0) sólo
+# define los imports de WASI (stdout = logs) y llama a los exports del ABI; un módulo
+# wasm32-unknown-unknown de synsema-wasm-web importaría `synsema_host`, que Vela no provee.
+# El target dir se comparte con el motor para no recompilar el intérprete dos veces.
+[build]
+target = "wasm32-wasip1"
+target-dir = "../../../engine/target"

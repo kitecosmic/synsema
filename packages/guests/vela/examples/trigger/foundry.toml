@@ -1,0 +1,11 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+solc = "0.8.30"
+# Vela's base contracts are BSL-licensed and are not vendored: build.sh clones HorizenOfficial/vela
+# (tag v0.2.0) into lib/vela. IERC20 is the standard interface, kept in lib/oz.
+remappings = [
+    "vela/contracts/=lib/vela/contracts/contracts/",
+    "@openzeppelin/contracts/=lib/oz/",
+]

@@ -173,6 +173,15 @@ jobs:
           cp engine/target/wasm32-unknown-unknown/wasm/synsema_wasm_web.wasm synsema-wasm-web.wasm
           shasum -a 256 synsema-wasm-wasip1.wasm > synsema-wasm-wasip1.wasm.sha256
           shasum -a 256 synsema-wasm-web.wasm > synsema-wasm-web.wasm.sha256
+      # Guest de Vela con la app de ejemplo embebida (packages/guests/vela): para desplegar algo en
+      # el starter kit de Vela antes de escribir una línea; el propio se construye con SYNSEMA_VELA_APP.
+      - name: Build the Vela guest (example app)
+        env:
+          SYNSEMA_VERSION: ${{ github.ref_name }}
+        run: |
+          cargo build --locked --manifest-path packages/guests/vela/Cargo.toml --profile wasm
+          cp engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm synsema-vela-guest.wasm
+          shasum -a 256 synsema-vela-guest.wasm > synsema-vela-guest.wasm.sha256
       - name: Upload to Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -182,6 +191,8 @@ jobs:
             synsema-wasm-wasip1.wasm.sha256
             synsema-wasm-web.wasm
             synsema-wasm-web.wasm.sha256
+            synsema-vela-guest.wasm
+            synsema-vela-guest.wasm.sha256
       # npm: @synsema/wasm con el MISMO .wasm del release adentro (el package.json lo lista
       # en `files`; en el repo está gitignoreado). La versión es la del tag sin la `v`.
       # Sin token: TRUSTED PUBLISHING (OIDC) — npm confía en este workflow de este repo

@@ -1,0 +1,35 @@
+[package]
+name = "synsema-vela-guest"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+build = "build.rs"
+description = "Synsema as a Vela (Horizen) guest: the Vela WASM ABI (allocate/deallocate/load_module/deploy/deposit/process_request/trusted_request) as a thin adapter over the generic synsema-wasm-web ABI, with your .syn program embedded"
+
+# Fuera del workspace del motor a propósito (regla de dos ejes): el nombre de una empresa vive
+# acá, en packages/guests/<host>/, nunca en engine/crates. `[workspace]` vacío evita que cargo
+# lo cuelgue del workspace de arriba; comparte el target dir por .cargo/config.toml.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# El ABI genérico: `call_json({"op": …})` es la misma frontera JSON que `synsema_call` exporta;
+# acá se llama en-proceso y los ocho exports de Vela son traducciones de ida y vuelta.
+synsema-wasm-web = { path = "../../../engine/crates/synsema-wasm-web" }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+
+# Mismo perfil que los artefactos wasm del motor: tamaño por sobre velocidad pico, un solo CGU
+# para que LTO recorte, `panic = "abort"` (un panic es un trap igual) y símbolos fuera.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+codegen-units = 1
+panic = "abort"
+strip = true

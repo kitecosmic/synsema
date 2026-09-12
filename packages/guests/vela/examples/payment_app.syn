@@ -1,0 +1,305 @@
+-- Vela guest — the Private Transfer app (Horizen's `vela-nova` payment_app) in Synsema, wire-
+-- compatible with Horizen's own `novaw` wallet: the same payload instructions, event bodies,
+-- deploy params and reports, so `novaw deployapp / registeruser / deposit / privatetransfer /
+-- withdraw / getprivatebalance / requestreport` drive it unchanged. Amounts are exact 256-bit
+-- integers (`bytes_to_int`) and travel as Vela's Uint256 hex ("0x…", no leading zeros, "0x0").
+--
+--   build:  SYNSEMA_VELA_APP=examples/payment_app.syn cargo build --profile wasm
+--   test:   synsema test examples/payment_app.syn
+--
+-- Two differences from the Go reference, on purpose: (1) there is no clock inside the enclave —
+-- the reference stamps `time.Now()` on every transaction, which is exactly what a signed state
+-- root cannot afford — so the transaction log carries the nonce instead and `tx_history` filters
+-- by address only; (2) an instruction without a `type` is an error here, not a silent no-op.
+intent: "vela guest: private balances per account and token, novaw-compatible"
+
+let ETH be "0x0000000000000000000000000000000000000000"
+let MAX_TRANSACTIONS be 50
+let MAX_INVOICE_ID be 100
+
+-- ---- Uint256 hex ("0x…", no leading zeros) ↔ exact integers ----
+
+task hex_to_int(h)
+    when h == nothing or h == "" or h == "0x" or h == "0x0"
+        give 0
+    let digits be slice(h, 2, length(h))
+    when length(digits) % 2 == 1
+        set digits to "0" + digits
+    give bytes_to_int(bytes(digits, "hex"))
+
+task int_to_hex(n)
+    when n == 0
+        give "0x0"
+    let h be decode(int_to_bytes(n), "hex")
+    when starts_with(h, "0")
+        set h to slice(h, 1, length(h))
+    give "0x" + h
+
+task hex_bytes(h)
+    give bytes(slice(h, 2, length(h)), "hex")
+
+-- ---- state: {appId, accounts: {addr: {address, balances: {token: "0x…"}}}, allowedTokens, nonce, transactions} ----
+
+task new_state(app_id, allowed)
+    give {"appId": app_id, "accounts": {}, "allowedTokens": allowed, "nonce": 0, "transactions": []}
+
+task token_of(instruction)
+    when not contains(instruction, "tokenAddress") or instruction["tokenAddress"] == nothing or instruction["tokenAddress"] == ""
+        give ETH
+    give lower(instruction["tokenAddress"])
+
+task balance_of(state, account, token)
+    when not contains(state["accounts"], account)
+        give 0
+    let balances be state["accounts"][account]["balances"]
+    when not contains(balances, token)
+        give 0
+    give hex_to_int(balances[token])
+
+task set_balance(state, account, token, amount)
+    let accounts be state["accounts"]
+    let acc be when contains(accounts, account) then accounts[account] otherwise {"address": account, "balances": {}}
+    let balances be acc["balances"]
+    set balances[token] to int_to_hex(amount)
+    set acc["balances"] to balances
+    set accounts[account] to acc
+    set state["accounts"] to accounts
+    give state
+
+task record(state, kind, origin, dest, token, amount, invoice_id)
+    let tx be {"type": kind, "from": origin, "to": dest, "tokenAddress": token, "amount": int_to_hex(amount), "nonce": state["nonce"]}
+    when invoice_id != ""
+        set tx["invoice_id"] to invoice_id
+    let txs be append(state["transactions"], tx)
+    when length(txs) > MAX_TRANSACTIONS
+        set txs to slice(txs, length(txs) - MAX_TRANSACTIONS, length(txs))
+    set state["transactions"] to txs
+    give state
+
+-- ---- entry points ----
+
+task deploy(ctx)
+    let allowed be {}
+    set allowed[ETH] to true
+    let params be ctx["params"]
+    when params != nothing and contains(params, "allowedTokens") and params["allowedTokens"] != nothing
+        each t in params["allowedTokens"]
+            when not starts_with(lower(t), "0x") or length(t) != 42
+                give {"error": "invalid token address " + text(t)}
+            set allowed[lower(t)] to true
+    give {"state": new_state(ctx["app_id"], allowed), "fuel": "5"}
+
+-- Cache warm-up after an Executor restart: the state returned here is discarded.
+task load_module(ctx)
+    let allowed be {}
+    set allowed[ETH] to true
+    give {"state": new_state(ctx["app_id"], allowed), "fuel": "5"}
+
+task deposit(ctx)
+    let state be ctx["state"]
+    let token be lower(ctx["token"])
+    when not contains(state["allowedTokens"], token)
+        give {"error": "Token " + token + " is not allowed by this application"}
+    let amount be hex_to_int(ctx["value_hex"])
+    let sender be ctx["sender"]
+    let after be balance_of(state, sender, token) + amount
+    let s1 be set_balance(state, sender, token, after)
+    set s1["nonce"] to s1["nonce"] + 1
+    let s2 be record(s1, "deposit", sender, sender, token, amount, "")
+    let event be {"type": "deposit", "tokenAddress": token, "amount": int_to_hex(amount), "balance": int_to_hex(after), "nonce": s2["nonce"]}
+    give {"state": s2, "events": [{"user": sender, "data": event}], "fuel": "35"}
+
+task process(ctx)
+    let payload be ctx["payload"]
+    when payload == nothing or not contains(payload, "type") or payload["type"] == nothing
+        give {"error": "Unsupported instruction type: []"}
+    match payload["type"]
+        is "transfer"
+            give transfer(ctx, payload)
+        is "withdraw"
+            give withdraw(ctx, payload)
+        otherwise
+            give {"error": "Unsupported instruction type: [" + text(payload["type"]) + "]"}
+
+task transfer(ctx, payload)
+    when not contains(payload, "transfer") or payload["transfer"] == nothing
+        give {"error": "Transfer instruction is missing"}
+    let ins be payload["transfer"]
+    when not contains(ins, "amount") or ins["amount"] == nothing
+        give {"error": "Transfer amount is nil"}
+    let invoice be when contains(ins, "invoice_id") and ins["invoice_id"] != nothing then ins["invoice_id"] otherwise ""
+    when length(invoice) > MAX_INVOICE_ID
+        give {"error": "invoice_id exceeds maximum length of 100 characters"}
+    let state be ctx["state"]
+    let token be token_of(ins)
+    when not contains(state["allowedTokens"], token)
+        give {"error": "Token " + token + " is not allowed for transfer"}
+    let sender be ctx["sender"]
+    when not contains(state["accounts"], sender)
+        give {"error": "Account " + sender + " does not exist!"}
+    let amount be hex_to_int(ins["amount"])
+    let from_balance be balance_of(state, sender, token)
+    when from_balance < amount
+        give {"error": "Insufficient balance for transfer"}
+    let dest be lower(ins["to"])
+    -- Debit first, then read the recipient from the debited state: a transfer to oneself must
+    -- not create money (the Go reference gets this for free by sharing the balance pointer).
+    let s1 be set_balance(state, sender, token, from_balance - amount)
+    let dest_balance be balance_of(s1, dest, token) + amount
+    let s2 be set_balance(s1, dest, token, dest_balance)
+    set s2["nonce"] to s2["nonce"] + 1
+    let s3 be record(s2, "transfer", sender, dest, token, amount, invoice)
+    let sent be {"type": "transfer_sent", "to": dest, "tokenAddress": token, "amount": int_to_hex(amount), "balance": int_to_hex(from_balance - amount), "nonce": s3["nonce"]}
+    let received be {"type": "transfer_received", "from": sender, "tokenAddress": token, "amount": int_to_hex(amount), "balance": int_to_hex(dest_balance), "nonce": s3["nonce"]}
+    when invoice != ""
+        set sent["invoice_id"] to invoice
+        set received["invoice_id"] to invoice
+    let result be {"state": s3, "events": [{"user": sender, "data": sent}, {"user": dest, "data": received}], "fuel": "50"}
+    when invoice != ""
+        -- Public receipt (unencrypted app event, no data): the subtype is
+        -- keccak256(len(invoice) as u32 BE ‖ invoice ‖ sender ‖ token ‖ amount as 32 bytes ‖ to),
+        -- so a third party holding the invoice can verify the payment without learning anything else.
+        let digest be keccak256(int_to_bytes(length(bytes(invoice)), 4) + bytes(invoice) + hex_bytes(sender) + hex_bytes(token) + int_to_bytes(amount, 32) + hex_bytes(dest))
+        set result["app_events"] to [{"subtype": "0x" + decode(digest, "hex")}]
+    give result
+
+task withdraw(ctx, payload)
+    when not contains(payload, "withdraw") or payload["withdraw"] == nothing
+        give {"error": "Withdraw instruction is missing in payload"}
+    let ins be payload["withdraw"]
+    when not contains(ins, "amount") or ins["amount"] == nothing
+        give {"error": "Withdraw amount is nil"}
+    let state be ctx["state"]
+    let token be token_of(ins)
+    when not contains(state["allowedTokens"], token)
+        give {"error": "Token " + token + " is not allowed for withdrawal"}
+    let sender be ctx["sender"]
+    when not contains(state["accounts"], sender)
+        give {"error": "Account " + sender + " does not exist"}
+    let amount be hex_to_int(ins["amount"])
+    let from_balance be balance_of(state, sender, token)
+    when from_balance < amount
+        give {"error": "Insufficient balance " + text(from_balance) + " for withdrawal " + text(amount) + " for account " + sender}
+    let dest be lower(ins["to"])
+    let s1 be set_balance(state, sender, token, from_balance - amount)
+    set s1["nonce"] to s1["nonce"] + 1
+    let s2 be record(s1, "withdrawal", sender, dest, token, amount, "")
+    let event be {"type": "withdrawal", "to": dest, "tokenAddress": token, "amount": int_to_hex(amount), "balance": int_to_hex(from_balance - amount), "nonce": s2["nonce"]}
+    give {"state": s2, "events": [{"user": sender, "data": event}], "withdrawals": [{"token": token, "to": dest, "amount": text(amount)}], "fuel": "50"}
+
+-- request_type 2. `novaw requestreport` sends {"deanonymize": {"report_type", "address", …}}.
+task deanonymize(ctx)
+    let state be ctx["state"]
+    let payload be ctx["payload"]
+    let ins be when payload != nothing and contains(payload, "deanonymize") and payload["deanonymize"] != nothing then payload["deanonymize"] otherwise {}
+    let report_type be when contains(ins, "report_type") and ins["report_type"] != nothing and ins["report_type"] != "" then ins["report_type"] otherwise "balances"
+    match report_type
+        is "balances"
+            give {"report": {"accounts": state["accounts"], "nonce": state["nonce"]}, "fuel": "20"}
+        is "tx_history"
+            when not contains(ins, "address") or ins["address"] == nothing or lower(ins["address"]) == ETH
+                give {"error": "tx_history report requires a non-zero address"}
+            when (contains(ins, "from_timestamp") and ins["from_timestamp"] != nothing and ins["from_timestamp"] > 0) or (contains(ins, "to_timestamp") and ins["to_timestamp"] != nothing and ins["to_timestamp"] > 0)
+                give {"error": "there is no clock inside the enclave: tx_history carries nonces, not timestamps — filter by address"}
+            let addr be lower(ins["address"])
+            let mine be where(state["transactions"], (tx) => tx["from"] == addr or tx["to"] == addr)
+            let balances be when contains(state["accounts"], addr) then state["accounts"][addr]["balances"] otherwise {}
+            give {"report": {"address": addr, "balances": balances, "transactions": mine}, "fuel": "20"}
+        otherwise
+            give {"error": "Unsupported report type: " + text(report_type)}
+
+-- ---------------------------------------------------------------------------------------
+-- Tests (run natively: `synsema test examples/payment_app.syn`).
+-- ---------------------------------------------------------------------------------------
+
+let ALICE be "0x1111111111111111111111111111111111111111"
+let BOB be "0x2222222222222222222222222222222222222222"
+let USDC be "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+
+task fresh()
+    give deploy({"app_id": 1, "params": nothing})["state"]
+
+test "hex ↔ int is exact at 256 bits and follows Uint256.ToHex"
+    assert_eq(int_to_hex(0), "0x0")
+    assert_eq(int_to_hex(255), "0xff")
+    assert_eq(int_to_hex(256), "0x100")
+    assert_eq(hex_to_int("0xde0b6b3a7640000"), 1000000000000000000)
+    assert_eq(int_to_hex(hex_to_int("0xde0b6b3a7640000")), "0xde0b6b3a7640000")
+    let max be hex_to_int("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+    assert_eq(text(max), "115792089237316195423570985008687907853269984665640564039457584007913129639935")
+    assert_eq(int_to_hex(max), "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
+
+test "deploy allows ETH always and the listed ERC-20s; load_module is the bare state"
+    let r be deploy({"app_id": 7, "params": {"allowedTokens": [USDC]}})
+    assert(contains(r["state"]["allowedTokens"], ETH))
+    assert(contains(r["state"]["allowedTokens"], USDC))
+    assert_eq(r["state"]["appId"], 7)
+    let bad be deploy({"app_id": 7, "params": {"allowedTokens": ["nope"]}})
+    assert(starts_with(bad["error"], "invalid token address"))
+    let warm be load_module({"app_id": 7, "params": nothing})
+    assert(not contains(warm["state"]["allowedTokens"], USDC))
+
+test "deposit credits in Uint256 hex and the event carries the balance novaw reads"
+    let r be deposit({"app_id": 1, "sender": ALICE, "token": ETH, "value": "1000000000000000000", "value_hex": "0xde0b6b3a7640000", "state": fresh()})
+    assert_eq(r["state"]["accounts"][ALICE]["balances"][ETH], "0xde0b6b3a7640000")
+    assert_eq(r["events"][0]["user"], ALICE)
+    assert_eq(r["events"][0]["data"]["balance"], "0xde0b6b3a7640000")
+    assert_eq(r["events"][0]["data"]["tokenAddress"], ETH)
+    assert_eq(r["state"]["transactions"][0]["type"], "deposit")
+
+test "a deposit of an unlisted token is refused"
+    let r be deposit({"app_id": 1, "sender": ALICE, "token": USDC, "value": "5", "value_hex": "0x5", "state": fresh()})
+    assert(starts_with(r["error"], "Token "))
+
+test "transfer with an invoice: two encrypted events, a public keccak receipt, the tx log"
+    let s1 be deposit({"app_id": 1, "sender": ALICE, "token": ETH, "value": "300", "value_hex": "0x12c", "state": fresh()})["state"]
+    let payload be {"type": "transfer", "transfer": {"to": BOB, "amount": "0x78", "invoice_id": "INV-1"}}
+    let r be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": payload, "payload_hex": nothing, "state": s1})
+    assert_eq(r["state"]["accounts"][ALICE]["balances"][ETH], "0xb4")
+    assert_eq(r["state"]["accounts"][BOB]["balances"][ETH], "0x78")
+    assert_eq(length(r["events"]), 2)
+    assert_eq(r["events"][1]["user"], BOB)
+    assert_eq(r["events"][1]["data"]["type"], "transfer_received")
+    assert_eq(r["events"][1]["data"]["invoice_id"], "INV-1")
+    assert_eq(length(r["app_events"]), 1)
+    assert_eq(length(r["app_events"][0]["subtype"]), 66)
+    assert_eq(length(r["state"]["transactions"]), 2)
+    let bad be process({"app_id": 1, "sender": BOB, "request_type": 1, "kind": "process", "payload": {"type": "transfer", "transfer": {"to": ALICE, "amount": "0x79"}}, "payload_hex": nothing, "state": r["state"]})
+    assert_eq(bad["error"], "Insufficient balance for transfer")
+    -- Maps are shared by reference: a successful call mutates the state it was given, so it goes last.
+    let plain be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"type": "transfer", "transfer": {"to": BOB, "amount": "0x1"}}, "payload_hex": nothing, "state": r["state"]})
+    assert(not contains(plain, "app_events"))
+    assert_eq(plain["state"]["accounts"][BOB]["balances"][ETH], "0x79")
+
+test "a transfer to oneself changes nothing but the nonce (no money is created)"
+    let s1 be deposit({"app_id": 1, "sender": ALICE, "token": ETH, "value": "300", "value_hex": "0x12c", "state": fresh()})["state"]
+    let r be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"type": "transfer", "transfer": {"to": ALICE, "amount": "0x78"}}, "payload_hex": nothing, "state": s1})
+    assert_eq(r["state"]["accounts"][ALICE]["balances"][ETH], "0x12c")
+    assert_eq(r["events"][0]["data"]["balance"], "0xb4")
+    assert_eq(r["events"][1]["data"]["balance"], "0x12c")
+    assert_eq(r["state"]["nonce"], 2)
+
+test "withdraw debits and asks Vela for the pull-payment"
+    let s1 be deposit({"app_id": 1, "sender": ALICE, "token": ETH, "value": "50", "value_hex": "0x32", "state": fresh()})["state"]
+    let r be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"type": "withdraw", "withdraw": {"to": BOB, "amount": "0x14"}}, "payload_hex": nothing, "state": s1})
+    assert_eq(r["state"]["accounts"][ALICE]["balances"][ETH], "0x1e")
+    assert_eq(r["withdrawals"], [{"token": ETH, "to": BOB, "amount": "20"}])
+    assert_eq(r["events"][0]["data"]["type"], "withdrawal")
+
+test "deanonymize: balances by default, tx_history by address, no timestamps"
+    let s1 be deposit({"app_id": 1, "sender": ALICE, "token": ETH, "value": "7", "value_hex": "0x7", "state": fresh()})["state"]
+    let all be deanonymize({"app_id": 1, "sender": ALICE, "request_type": 2, "kind": "deanonymize", "payload": {}, "payload_hex": nothing, "state": s1})
+    assert_eq(all["report"]["accounts"][ALICE]["balances"][ETH], "0x7")
+    let hist be deanonymize({"app_id": 1, "sender": ALICE, "request_type": 2, "kind": "deanonymize", "payload": {"deanonymize": {"report_type": "tx_history", "address": ALICE}}, "payload_hex": nothing, "state": s1})
+    assert_eq(length(hist["report"]["transactions"]), 1)
+    assert_eq(hist["report"]["transactions"][0]["type"], "deposit")
+    let none be deanonymize({"app_id": 1, "sender": ALICE, "request_type": 2, "kind": "deanonymize", "payload": {"deanonymize": {"report_type": "tx_history", "address": BOB}}, "payload_hex": nothing, "state": s1})
+    assert_eq(length(none["report"]["transactions"]), 0)
+    let timed be deanonymize({"app_id": 1, "sender": ALICE, "request_type": 2, "kind": "deanonymize", "payload": {"deanonymize": {"report_type": "tx_history", "address": ALICE, "from_timestamp": 1700000000}}, "payload_hex": nothing, "state": s1})
+    assert(starts_with(timed["error"], "there is no clock"))
+
+test "an unknown instruction is an error, never a silent no-op"
+    let r be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"type": "mint"}, "payload_hex": nothing, "state": fresh()})
+    assert(starts_with(r["error"], "Unsupported instruction type"))
+    let untyped be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"deanonymize": {}}, "payload_hex": nothing, "state": fresh()})
+    assert(starts_with(untyped["error"], "Unsupported instruction type"))

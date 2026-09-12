@@ -1,0 +1,194 @@
+-- Vela guest — example app: a private ledger. Balances per account and token, transfers,
+-- withdrawals (with a public ABI receipt a contract can decode), a deanonymization report and a
+-- trusted top-up coming from a trigger contract. Amounts are exact decimals kept as text.
+--
+-- The adapter (src/lib.rs) calls ONE task per Vela entry point, each with ONE map and
+-- expecting ONE map back:
+--   deploy(ctx)       ctx = {app_id, params}                          → {state, fuel?}
+--   deposit(ctx)      ctx = {app_id, sender, token, value, value_hex, state} → {state?, events?, app_events?, fuel?, error?}
+--   process(ctx)      ctx = {app_id, sender, request_type, kind, payload, payload_hex, state} → {state?, events?, app_events?, withdrawals?, fuel?, error?}
+--   deanonymize(ctx)  request_type 2 (optional; falls back to `process`)    → {report, state?, fuel?}
+--   trusted(ctx)      TRUSTPROCESS from a trigger contract (optional; falls back to `process`):
+--                     `sender` is nothing and the payload is ABI bytes, exact in `payload_hex`
+-- Bytes out (`state`, `report`, an event's `data`): text as-is, a map as JSON, or `<field>_hex`
+-- ("0x…") when the bytes must be exact — what a contract decodes with abi.decode.
+-- No `now()`, no `random()`: the guest runs under a stdout-only ceiling — determinism by construction.
+-- Test it natively before building the module: `synsema test app.syn`.
+intent: "vela guest example: private balances per account"
+
+let ETH be "0x0000000000000000000000000000000000000000"
+
+-- "0x…" ↔ bytes (`bytes(x, "hex")` takes no 0x prefix).
+task hex_bytes(h)
+    give bytes(slice(h, 2, length(h)), "hex")
+
+task hex_of(b)
+    give "0x" + decode(b, "hex")
+
+task new_state(app_id)
+    give {"app_id": app_id, "balances": {}, "nonce": 0}
+
+task balance_of(state, account, token)
+    when contains(state["balances"], account) and contains(state["balances"][account], token)
+        give decimal(state["balances"][account][token])
+    give decimal("0")
+
+task set_balance(state, account, token, amount)
+    let balances be state["balances"]
+    when not contains(balances, account)
+        set balances[account] to {}
+    let mine be balances[account]
+    set mine[token] to text(amount)
+    set balances[account] to mine
+    set state["balances"] to balances
+    give state
+
+task deploy(ctx)
+    give {"state": new_state(ctx["app_id"]), "fuel": "5"}
+
+task deposit(ctx)
+    let state be ctx["state"]
+    let amount be decimal(ctx["value"])
+    let before be balance_of(state, ctx["sender"], ctx["token"])
+    let after be before + amount
+    let updated be set_balance(state, ctx["sender"], ctx["token"], after)
+    set updated["nonce"] to updated["nonce"] + 1
+    let event be {"type": "deposit", "token": ctx["token"], "amount": ctx["value"], "balance": text(after), "nonce": updated["nonce"]}
+    give {"state": updated, "events": [{"user": ctx["sender"], "data": event}], "fuel": "35"}
+
+task transfer(ctx, state, payload)
+    let token be when contains(payload, "token") then payload["token"] otherwise ETH
+    let amount be decimal(payload["amount"])
+    let from_balance be balance_of(state, ctx["sender"], token)
+    when from_balance < amount
+        give {"error": "insufficient balance for transfer"}
+    -- Debit first, then read the recipient from the debited state: a transfer to oneself must
+    -- not create money.
+    let s1 be set_balance(state, ctx["sender"], token, from_balance - amount)
+    let to_balance be balance_of(s1, payload["to"], token)
+    let s2 be set_balance(s1, payload["to"], token, to_balance + amount)
+    set s2["nonce"] to s2["nonce"] + 1
+    let sent be {"type": "transfer_sent", "to": payload["to"], "token": token, "amount": payload["amount"], "balance": text(from_balance - amount), "nonce": s2["nonce"]}
+    let received be {"type": "transfer_received", "from": ctx["sender"], "token": token, "amount": payload["amount"], "balance": text(to_balance + amount), "nonce": s2["nonce"]}
+    give {"state": s2, "events": [{"user": ctx["sender"], "data": sent}, {"user": payload["to"], "data": received}], "fuel": "50"}
+
+task withdraw(ctx, state, payload)
+    let token be when contains(payload, "token") then payload["token"] otherwise ETH
+    let amount be decimal(payload["amount"])
+    let from_balance be balance_of(state, ctx["sender"], token)
+    when from_balance < amount
+        give {"error": "insufficient balance for withdrawal"}
+    let s1 be set_balance(state, ctx["sender"], token, from_balance - amount)
+    set s1["nonce"] to s1["nonce"] + 1
+    let event be {"type": "withdrawal", "to": payload["to"], "token": token, "amount": payload["amount"], "balance": text(from_balance - amount), "nonce": s1["nonce"]}
+    -- A public receipt (app event, unencrypted) any contract can `abi.decode`: (to, token, amount).
+    -- `subtype` is a short label a trigger contract compares against; `data_hex` keeps the ABI
+    -- bytes exact (as JSON they would be re-encoded). `abi_encode` builds a call, so the 4-byte
+    -- selector is dropped to leave plain `abi.encode(...)` bytes.
+    let call be abi_encode("receipt(address,address,uint256)", [payload["to"], token, amount])
+    let receipt be {"subtype": "withdrawal", "data_hex": hex_of(slice(call, 4, length(call)))}
+    give {"state": s1, "events": [{"user": ctx["sender"], "data": event}], "app_events": [receipt], "withdrawals": [{"token": token, "to": payload["to"], "amount": payload["amount"]}], "fuel": "50"}
+
+task process(ctx)
+    let payload be ctx["payload"]
+    when payload == nothing or not contains(payload, "type")
+        give {"error": "payload needs a \"type\": transfer | withdraw"}
+    match payload["type"]
+        is "transfer"
+            give transfer(ctx, ctx["state"], payload)
+        is "withdraw"
+            give withdraw(ctx, ctx["state"], payload)
+        otherwise
+            give {"error": "unsupported instruction type: " + text(payload["type"])}
+
+task deanonymize(ctx)
+    -- The authority asks for the plain picture: the report travels encrypted to it.
+    give {"report": {"balances": ctx["state"]["balances"], "nonce": ctx["state"]["nonce"]}, "fuel": "20"}
+
+-- TRUSTPROCESS: a trigger contract (called back by the ProcessorEndpoint during stateUpdate)
+-- enqueued this with a clear-text ABI payload — here `(address account, address token,
+-- uint256 amount)`, a credit the chain vouches for. There is no `sender`. No user event on
+-- purpose (the account may never have registered a key, and an event to an unregistered user
+-- fails the whole request) and no app event (that would fire the trigger again).
+task trusted(ctx)
+    when ctx["payload_hex"] == nothing
+        give {"error": "trusted request without a payload"}
+    let decoded be abi_decode("(address,address,uint256)", hex_bytes(ctx["payload_hex"]))
+    let account be lower(decoded[0])
+    let token be lower(decoded[1])
+    let amount be decimal(text(decoded[2]))
+    let state be ctx["state"]
+    let after be balance_of(state, account, token) + amount
+    let updated be set_balance(state, account, token, after)
+    set updated["nonce"] to updated["nonce"] + 1
+    give {"state": updated, "fuel": "40"}
+
+-- ---------------------------------------------------------------------------------------
+-- Tests (run natively: `synsema test app.syn`). The same code runs inside the guest.
+-- ---------------------------------------------------------------------------------------
+
+let ALICE be "0x1111111111111111111111111111111111111111"
+let BOB be "0x2222222222222222222222222222222222222222"
+
+test "deploy gives an empty ledger"
+    let r be deploy({"app_id": 1, "params": nothing})
+    assert_eq(r["state"]["balances"], {})
+    assert_eq(r["state"]["nonce"], 0)
+
+test "deposit credits the exact amount (wei-sized numbers stay exact)"
+    let s0 be new_state(1)
+    let r be deposit({"app_id": 1, "sender": ALICE, "token": ETH, "value": "1000000000000000000", "value_hex": "0xde0b6b3a7640000", "state": s0})
+    assert_eq(r["state"]["balances"][ALICE][ETH], "1000000000000000000")
+    assert_eq(r["state"]["nonce"], 1)
+    assert_eq(length(r["events"]), 1)
+    assert_eq(r["events"][0]["user"], ALICE)
+
+test "transfer moves funds and emits one event per party; overdraft is a clean error"
+    let s0 be new_state(1)
+    let s1 be deposit({"app_id": 1, "sender": ALICE, "token": ETH, "value": "300", "value_hex": "0x12c", "state": s0})["state"]
+    let ok be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"type": "transfer", "to": BOB, "amount": "120"}, "payload_hex": nothing, "state": s1})
+    assert_eq(ok["state"]["balances"][ALICE][ETH], "180")
+    assert_eq(ok["state"]["balances"][BOB][ETH], "120")
+    assert_eq(length(ok["events"]), 2)
+    let bad be process({"app_id": 1, "sender": BOB, "request_type": 1, "kind": "process", "payload": {"type": "transfer", "to": ALICE, "amount": "121"}, "payload_hex": nothing, "state": ok["state"]})
+    assert_eq(bad["error"], "insufficient balance for transfer")
+
+test "a transfer to oneself changes nothing but the nonce (no money is created)"
+    let s0 be new_state(1)
+    let s1 be deposit({"app_id": 1, "sender": ALICE, "token": ETH, "value": "300", "value_hex": "0x12c", "state": s0})["state"]
+    let r be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"type": "transfer", "to": ALICE, "amount": "120"}, "payload_hex": nothing, "state": s1})
+    assert_eq(r["state"]["balances"][ALICE][ETH], "300")
+    assert_eq(r["state"]["nonce"], 2)
+
+test "withdraw debits, asks Vela for a pull-payment and leaves a public ABI receipt"
+    let s0 be new_state(1)
+    let s1 be deposit({"app_id": 1, "sender": ALICE, "token": ETH, "value": "50", "value_hex": "0x32", "state": s0})["state"]
+    let r be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"type": "withdraw", "to": BOB, "amount": "20"}, "payload_hex": nothing, "state": s1})
+    assert_eq(r["state"]["balances"][ALICE][ETH], "30")
+    assert_eq(r["withdrawals"], [{"token": ETH, "to": BOB, "amount": "20"}])
+    let receipt be r["app_events"][0]
+    assert_eq(receipt["subtype"], "withdrawal")
+    let decoded be abi_decode("(address,address,uint256)", hex_bytes(receipt["data_hex"]))
+    assert_eq(lower(decoded[0]), BOB)
+    assert_eq(lower(decoded[1]), ETH)
+    assert_eq(text(decoded[2]), "20")
+
+test "deanonymize reports the plain balances"
+    let s0 be new_state(1)
+    let s1 be deposit({"app_id": 1, "sender": ALICE, "token": ETH, "value": "7", "value_hex": "0x7", "state": s0})["state"]
+    let r be deanonymize({"app_id": 1, "sender": ALICE, "request_type": 2, "kind": "deanonymize", "payload": {}, "payload_hex": nothing, "state": s1})
+    assert_eq(r["report"]["balances"][ALICE][ETH], "7")
+
+test "a trusted ABI payload from a trigger contract credits an account, with no sender"
+    let call be abi_encode("credit(address,address,uint256)", [BOB, ETH, decimal("15")])
+    let payload_hex be hex_of(slice(call, 4, length(call)))
+    let r be trusted({"app_id": 1, "kind": "trusted", "request_type": 4, "sender": nothing, "payload": nothing, "payload_hex": payload_hex, "state": new_state(1)})
+    assert_eq(r["state"]["balances"][BOB][ETH], "15")
+    assert(not contains(r, "events"))
+    assert(not contains(r, "app_events"))
+    let empty be trusted({"app_id": 1, "kind": "trusted", "request_type": 4, "sender": nothing, "payload": nothing, "payload_hex": nothing, "state": new_state(1)})
+    assert_eq(empty["error"], "trusted request without a payload")
+
+test "an unknown instruction is an error, never a silent no-op"
+    let r be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"type": "mint"}, "payload_hex": nothing, "state": new_state(1)})
+    assert(starts_with(r["error"], "unsupported instruction type"))

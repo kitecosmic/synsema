@@ -1,0 +1,221 @@
+-- Vela guest — an execution pool driven by a trigger contract (the starter kit's "mixer" pattern,
+-- doc 4_trigger-contract-app.md), with `examples/trigger/src/PoolTrigger.sol` as its companion.
+--
+-- A user deposits ETH into a private balance, then asks the app to run an on-chain call from the
+-- pool's address. The app locks the funds and answers with a Withdrawal to the trigger contract
+-- plus ONE public app event carrying the call, ABI-encoded: (bytes16 lockId, address target,
+-- uint256 value, bytes data). During stateUpdate the ProcessorEndpoint claims the ETH into the
+-- trigger, calls `execute` (the call runs from the pool), sweeps what is left back, and enqueues
+-- a TRUSTPROCESS whose payload is abi.encode(bytes16 lockId, uint256 remain, uint8 outcome).
+-- That payload arrives here in `trusted(ctx)` as `payload_hex`: the app credits `remain` back to
+-- the lock's owner and emits nothing public (an app event would fire the trigger again).
+--
+--   build:  SYNSEMA_VELA_APP=examples/trigger_app.syn cargo build --profile wasm
+--   test:   synsema test examples/trigger_app.syn
+--   deploy: synsema run examples/client/vela_client.syn -- deploy <wasm> '{"triggerContract":"0x…"}' 0x…
+--
+-- Amounts are exact decimals kept as text; lock ids are deterministic (a counter in the low
+-- bytes of the bytes16) because there is no randomness in the enclave.
+intent: "vela guest: execution pool — lock, run a call from the pool, credit the remainder"
+
+let ETH be "0x0000000000000000000000000000000000000000"
+
+task hex_bytes(h)
+    give bytes(slice(h, 2, length(h)), "hex")
+
+task hex_of(b)
+    give "0x" + decode(b, "hex")
+
+-- An amount given as "0x…" (Uint256 hex) or as decimal text → exact decimal.
+task amount_of(v)
+    when v == nothing
+        give decimal("0")
+    let t be text(v)
+    when starts_with(t, "0x")
+        -- Uint256.ToHex strips leading zeros, so the digit count may be odd.
+        let digits be slice(t, 2, length(t))
+        when length(digits) % 2 == 1
+            set digits to "0" + digits
+        give decimal(text(bytes_to_int(bytes(digits, "hex"))))
+    give decimal(t)
+
+task new_state(app_id, trigger)
+    give {"app_id": app_id, "trigger": trigger, "balances": {}, "locks": {}, "lock_nonce": 0, "nonce": 0}
+
+task balance_of(state, account)
+    when contains(state["balances"], account)
+        give decimal(state["balances"][account])
+    give decimal("0")
+
+task set_balance(state, account, amount)
+    let balances be state["balances"]
+    set balances[account] to text(amount)
+    set state["balances"] to balances
+    give state
+
+-- ---- entry points ----
+
+-- constructorParams: {"triggerContract": "0x…"} — the same address passed on-chain to
+-- submitDeployRequestWithTrigger; the app stamps it into every Withdrawal.
+task deploy(ctx)
+    let params be ctx["params"]
+    when params == nothing or not contains(params, "triggerContract") or params["triggerContract"] == nothing
+        give {"error": "deploy needs constructorParams {\"triggerContract\": \"0x…\"}"}
+    let trigger be lower(params["triggerContract"])
+    when length(trigger) != 42 or not starts_with(trigger, "0x")
+        give {"error": "invalid trigger address " + text(params["triggerContract"])}
+    give {"state": new_state(ctx["app_id"], trigger), "fuel": "5"}
+
+-- Cache warm-up after an Executor restart; the state returned here is discarded.
+task load_module(ctx)
+    give {"state": new_state(ctx["app_id"], ""), "fuel": "5"}
+
+task deposit(ctx)
+    when lower(ctx["token"]) != ETH
+        give {"error": "the pool takes ETH only"}
+    let state be ctx["state"]
+    let after be balance_of(state, ctx["sender"]) + decimal(ctx["value"])
+    let s1 be set_balance(state, ctx["sender"], after)
+    set s1["nonce"] to s1["nonce"] + 1
+    let event be {"type": "deposit", "amount": ctx["value"], "balance": text(after), "nonce": s1["nonce"]}
+    give {"state": s1, "events": [{"user": ctx["sender"], "data": event}], "fuel": "35"}
+
+task process(ctx)
+    let payload be ctx["payload"]
+    when payload == nothing or not contains(payload, "command")
+        give {"error": "payload needs a \"command\": execute"}
+    match payload["command"]
+        is "execute"
+            give execute(ctx, ctx["state"], payload)
+        otherwise
+            give {"error": "unsupported command: " + text(payload["command"])}
+
+-- {"command": "execute", "execute": {"target": "0x…", "value": "0x…" | "wei", "data": "0x…"}}
+task execute(ctx, state, payload)
+    when state["trigger"] == ""
+        give {"error": "this app was deployed without a trigger contract"}
+    when not contains(payload, "execute") or payload["execute"] == nothing
+        give {"error": "execute instruction is missing"}
+    let ins be payload["execute"]
+    when not contains(ins, "target") or ins["target"] == nothing
+        give {"error": "execute needs a target address"}
+    let target be lower(ins["target"])
+    let value be amount_of(when contains(ins, "value") then ins["value"] otherwise "0")
+    let data be when contains(ins, "data") and ins["data"] != nothing and ins["data"] != "0x" then hex_bytes(ins["data"]) otherwise bytes([])
+    let sender be ctx["sender"]
+    let balance be balance_of(state, sender)
+    when balance < value
+        give {"error": "insufficient balance: " + text(balance) + " < " + text(value)}
+    let s1 be set_balance(state, sender, balance - value)
+    set s1["lock_nonce"] to s1["lock_nonce"] + 1
+    set s1["nonce"] to s1["nonce"] + 1
+    let lock_id be int_to_bytes(s1["lock_nonce"], 16)
+    let lock_key be hex_of(lock_id)
+    let locks be s1["locks"]
+    set locks[lock_key] to {"owner": sender, "amount": text(value)}
+    set s1["locks"] to locks
+    -- The app event the trigger decodes with abi.decode(events[0], (bytes16, address, uint256, bytes)).
+    let call be abi_encode("execute(bytes16,address,uint256,bytes)", [lock_id, target, value, data])
+    let app_event be {"subtype": "execute_requested", "data_hex": hex_of(slice(call, 4, length(call)))}
+    let event be {"type": "execute_requested", "lock_id": lock_key, "target": target, "value": text(value), "balance": text(balance - value), "nonce": s1["nonce"]}
+    give {"state": s1, "events": [{"user": sender, "data": event}], "app_events": [app_event], "withdrawals": [{"to": s1["trigger"], "amount": text(value)}], "fuel": "50"}
+
+-- TRUSTPROCESS from the trigger: abi.encode(bytes16 lockId, uint256 remain, uint8 outcome).
+-- No sender, no app events (the loop must end here), the payload in clear.
+task trusted(ctx)
+    when ctx["payload_hex"] == nothing
+        give {"error": "trusted request without a payload"}
+    let decoded be abi_decode("(bytes16,uint256,uint8)", hex_bytes(ctx["payload_hex"]))
+    let lock_key be hex_of(decoded[0])
+    let remain be decimal(text(decoded[1]))
+    let outcome be when decoded[2] == 0 then "success" otherwise "failure"
+    let state be ctx["state"]
+    when not contains(state["locks"], lock_key)
+        give {"error": "unknown or already-resolved lock " + lock_key}
+    let lock be state["locks"][lock_key]
+    let owner be lock["owner"]
+    let after be balance_of(state, owner) + remain
+    let s1 be set_balance(state, owner, after)
+    -- Idempotency: a replayed TRUSTPROCESS finds no lock.
+    let kept be {}
+    each k in keys(s1["locks"])
+        when k != lock_key
+            set kept[k] to s1["locks"][k]
+    set s1["locks"] to kept
+    set s1["nonce"] to s1["nonce"] + 1
+    let event be {"type": "execution_outcome", "lock_id": lock_key, "outcome": outcome, "locked": lock["amount"], "remain": text(remain), "balance": text(after), "nonce": s1["nonce"]}
+    give {"state": s1, "events": [{"user": owner, "data": event}], "fuel": "50"}
+
+task deanonymize(ctx)
+    give {"report": {"balances": ctx["state"]["balances"], "locks": ctx["state"]["locks"], "nonce": ctx["state"]["nonce"]}, "fuel": "20"}
+
+-- ---------------------------------------------------------------------------------------
+-- Tests (run natively: `synsema test examples/trigger_app.syn`).
+-- ---------------------------------------------------------------------------------------
+
+let ALICE be "0x1111111111111111111111111111111111111111"
+let TARGET be "0x3333333333333333333333333333333333333333"
+let TRIGGER be "0x4444444444444444444444444444444444444444"
+
+task pool()
+    give deploy({"app_id": 1, "params": {"triggerContract": TRIGGER}})["state"]
+
+task funded()
+    give deposit({"app_id": 1, "sender": ALICE, "token": ETH, "value": "1000", "value_hex": "0x3e8", "state": pool()})["state"]
+
+task run_execute(state, value)
+    let payload be {"command": "execute", "execute": {"target": TARGET, "value": value, "data": "0x"}}
+    give process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": payload, "payload_hex": nothing, "state": state})
+
+test "deploy needs the trigger address; load_module does not"
+    assert_eq(pool()["trigger"], TRIGGER)
+    assert(starts_with(deploy({"app_id": 1, "params": nothing})["error"], "deploy needs"))
+    assert_eq(load_module({"app_id": 1, "params": nothing})["state"]["trigger"], "")
+
+test "execute locks the funds, pays the trigger and emits the ABI call as a public event"
+    let r be run_execute(funded(), "0x12c")
+    assert_eq(r["state"]["balances"][ALICE], "700")
+    assert_eq(r["withdrawals"], [{"to": TRIGGER, "amount": "300"}])
+    assert_eq(length(r["app_events"]), 1)
+    assert_eq(r["app_events"][0]["subtype"], "execute_requested")
+    let decoded be abi_decode("(bytes16,address,uint256,bytes)", hex_bytes(r["app_events"][0]["data_hex"]))
+    assert_eq(hex_of(decoded[0]), "0x00000000000000000000000000000001")
+    assert_eq(lower(decoded[1]), TARGET)
+    assert_eq(text(decoded[2]), "300")
+    assert_eq(length(decoded[3]), 0)
+    assert_eq(r["state"]["locks"]["0x00000000000000000000000000000001"]["amount"], "300")
+    assert_eq(r["events"][0]["data"]["type"], "execute_requested")
+
+test "an overdraft, a missing target and an unknown command are clean errors"
+    assert(starts_with(run_execute(funded(), "2000")["error"], "insufficient balance"))
+    let no_target be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"command": "execute", "execute": {"value": "1"}}, "payload_hex": nothing, "state": funded()})
+    assert_eq(no_target["error"], "execute needs a target address")
+    let other be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"command": "mint"}, "payload_hex": nothing, "state": funded()})
+    assert(starts_with(other["error"], "unsupported command"))
+
+test "the trusted payload credits the remainder to the lock owner and clears the lock"
+    let locked be run_execute(funded(), "300")["state"]
+    let call be abi_encode("f(bytes16,uint256,uint8)", [int_to_bytes(1, 16), decimal("120"), 0])
+    let payload_hex be hex_of(slice(call, 4, length(call)))
+    let r be trusted({"app_id": 1, "kind": "trusted", "request_type": 4, "sender": nothing, "payload": nothing, "payload_hex": payload_hex, "state": locked})
+    assert_eq(r["state"]["balances"][ALICE], "820")
+    assert_eq(r["state"]["locks"], {})
+    assert(not contains(r, "app_events"))
+    assert_eq(r["events"][0]["user"], ALICE)
+    assert_eq(r["events"][0]["data"]["outcome"], "success")
+    assert_eq(r["events"][0]["data"]["remain"], "120")
+    let replay be trusted({"app_id": 1, "kind": "trusted", "request_type": 4, "sender": nothing, "payload": nothing, "payload_hex": payload_hex, "state": r["state"]})
+    assert(starts_with(replay["error"], "unknown or already-resolved lock"))
+
+test "a failed call comes back as outcome failure with everything returned"
+    let locked be run_execute(funded(), "300")["state"]
+    let call be abi_encode("f(bytes16,uint256,uint8)", [int_to_bytes(1, 16), decimal("300"), 1])
+    let r be trusted({"app_id": 1, "kind": "trusted", "request_type": 4, "sender": nothing, "payload": nothing, "payload_hex": hex_of(slice(call, 4, length(call))), "state": locked})
+    assert_eq(r["state"]["balances"][ALICE], "1000")
+    assert_eq(r["events"][0]["data"]["outcome"], "failure")
+
+test "deanonymize reports balances and open locks"
+    let locked be run_execute(funded(), "300")["state"]
+    let r be deanonymize({"app_id": 1, "sender": ALICE, "request_type": 2, "kind": "deanonymize", "payload": {}, "payload_hex": nothing, "state": locked})
+    assert_eq(r["report"]["balances"][ALICE], "700")
+    assert_eq(length(keys(r["report"]["locks"])), 1)
