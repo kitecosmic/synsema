@@ -283,13 +283,33 @@ fn glob(name: &[char], pat: &[char]) -> bool {
     }
 }
 
+/// v0.6.20 — `~`, `~/…` y `~\…` = el home del usuario (`HOME`, si no `USERPROFILE`).
+/// Vale igual para un scope (`require file("~/.synsema/*")`) y para el argumento de un
+/// builtin, porque los dos pasan por `normalize_path`: UNA expansión, `covers()` no cambia.
+/// Sin home resoluble se deja literal: un scope literal `~/…` no cubre ninguna ruta real →
+/// deniega (falla cerrado, nunca abierto). `~usuario/…` no se soporta a propósito.
+fn expand_home(p: &str) -> String {
+    let is_tilde = p == "~" || p.starts_with("~/") || p.starts_with("~\\");
+    if !is_tilde {
+        return p.to_string();
+    }
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok().filter(|h| !h.trim().is_empty()));
+    match home {
+        Some(h) => format!("{}{}", h.trim_end_matches(['/', '\\']), &p[1..]),
+        None => p.to_string(),
+    }
+}
+
 /// Normaliza una ruta de forma LÉXICA (sin tocar el filesystem): unifica separadores
 /// a `/`, colapsa `.` y `..`, quita un `./` inicial. NO resuelve symlinks ni vuelve la
 /// ruta absoluta (preserva relativa/absoluta y el prefijo de unidad Windows). Así el
 /// scope-glob de `file.read("./data/*")` se chequea contra la ruta REAL a la que apunta
 /// el argumento, cerrando el bypass `./data/../../etc` sin cambiar la semántica del scope.
 pub fn normalize_path(p: &str) -> String {
-    let p = p.replace('\\', "/");
+    let p = expand_home(p).replace('\\', "/");
     let (prefix, rest): (String, &str) = match p.as_bytes() {
         // Unidad Windows: "C:/..."
         [c, b':', b'/', ..] if c.is_ascii_alphabetic() => (p[..3].to_string(), &p[3..]),
@@ -1181,6 +1201,15 @@ pub fn build_ceiling(sandbox: bool, cap_set: Option<&str>) -> Result<Option<Vec<
     }
 }
 
+/// v0.6.20 — techo DETERMINISTA: el de `--sandbox` sin `time` (y sin `random`, que el
+/// sandbox tampoco tiene): sólo `stdout`. Es lo que el CLI empaqueta como `--deterministic`
+/// junto con `--profile pure`: un programa bajo este techo no puede leer el reloj ni
+/// entropía, así el determinismo es por construcción (VMs, TEEs, tests reproducibles), no
+/// por disciplina. Nombre genérico a propósito: le sirve a cualquier host, no a uno.
+pub fn build_ceiling_deterministic() -> Vec<Capability> {
+    vec![Capability::new(CapabilityType::Stdout, None)]
+}
+
 #[cfg(test)]
 mod tanda_motor_tests {
     use super::*;
@@ -1265,5 +1294,43 @@ mod tanda_motor_tests {
         assert_eq!(cs.audit_log.len(), before, "check_silent no audita");
         assert!(cs.check(&Capability::new(CapabilityType::Net, Some("uno".into())), "x"));
         assert_eq!(cs.audit_log.len(), before + 1);
+    }
+}
+
+#[cfg(test)]
+mod v0620_tests {
+    use super::*;
+
+    /// §4.3 — `~` se expande al home en scopes y rutas por igual; `~usuario` y un `~` en
+    /// medio no se tocan.
+    #[test]
+    fn tilde_expands_to_home_in_scopes_and_paths() {
+        let home = std::env::var("HOME")
+            .ok()
+            .filter(|h| !h.trim().is_empty())
+            .or_else(|| std::env::var("USERPROFILE").ok().filter(|h| !h.trim().is_empty()));
+        if let Some(h) = home {
+            let want = normalize_path(&format!("{}/.synsema/x", h));
+            assert_eq!(normalize_path("~/.synsema/x"), want);
+            assert_eq!(normalize_path("~\\.synsema\\x"), want);
+            assert_eq!(normalize_path("~"), normalize_path(&h));
+            let scope = Capability::new(CapabilityType::FileWrite, Some("~/.synsema/*".to_string()));
+            let inside = Capability::new(CapabilityType::FileWrite, Some(format!("{}/.synsema/token.json", h)));
+            let outside = Capability::new(CapabilityType::FileWrite, Some(format!("{}/other/token.json", h)));
+            assert!(scope.covers(&inside));
+            assert!(!scope.covers(&outside));
+        }
+        assert_eq!(normalize_path("~user/x"), "~user/x");
+        assert_eq!(normalize_path("data/~/x"), "data/~/x");
+    }
+
+    /// §4.5 — el techo determinista es sólo stdout: ni time ni random.
+    #[test]
+    fn deterministic_ceiling_has_only_stdout() {
+        let c = build_ceiling_deterministic();
+        assert_eq!(c.len(), 1);
+        assert!(c[0].covers(&Capability::new(CapabilityType::Stdout, None)));
+        assert!(!c.iter().any(|x| x.covers(&Capability::new(CapabilityType::Time, None))));
+        assert!(!c.iter().any(|x| x.covers(&Capability::new(CapabilityType::Random, None))));
     }
 }

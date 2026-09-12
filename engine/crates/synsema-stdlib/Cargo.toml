@@ -37,6 +37,9 @@ usvg.workspace = true
 tiny-skia.workspace = true
 fontdb.workspace = true
 svg2pdf.workspace = true
+# v0.6.20: xml_parse (roxmltree, ya transitiva de usvg) y toml_parse/toml_encode. Puros.
+roxmltree.workspace = true
+toml.workspace = true
 # Feature `secret`: builtins env/secret/reveal/bearer + crypto (hmac_sha256/verify_hmac/
 # constant_time_eq). Todo puro-Rust (RustCrypto), sin C → binario único estático.
 # chrono ya está en el workspace (sin feature `clock`); se usa para el timestamp del audit.
@@ -78,6 +81,9 @@ ctr.workspace = true
 # Tanda PWA (webpush.rs): AES-128-GCM de Web Push — la ÚNICA dep nueva de la tanda
 # (ver la justificación en el workspace). ECDH P-256 es la feature `ecdh` de p256.
 aes-gcm.workspace = true
+# v0.6.20 (crypto.rs): ECDH P-521 + HKDF-SHA256 (AES-GCM es el aes-gcm de arriba). Puros.
+p521.workspace = true
+hkdf.workspace = true
 curve25519-dalek.workspace = true
 tungstenite = { workspace = true, optional = true }
 # Tanda pty (`proc_spawn(..., {pty: true})`): pseudo-terminal cross-platform — openpty en
@@ -97,6 +103,10 @@ crossterm = { version = "0.29", default-features = false, features = ["events", 
 mio = { version = "1", features = ["os-poll", "net"], optional = true }
 # A2 stack web: gzip (miniz_oxide puro-Rust, sin C) + TLS (rustls con backend ring).
 flate2 = { version = "1", optional = true }
+# v0.6.20 (archive.rs): zip_*/tar_* — SÓLO native (extraer toca disco; en el perfil puro son
+# stubs). Comparten el flate2 de arriba.
+zip = { workspace = true, optional = true }
+tar = { workspace = true, optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
 # Cliente HTTPS (http_get/http_post con https://): root CAs del SO vía rustls-native-certs.
@@ -135,6 +145,8 @@ native = [
     "dep:redis",
     "dep:mio",
     "dep:flate2",
+    "dep:zip",
+    "dep:tar",
     "dep:rustls",
     "dep:rustls-pemfile",
     "dep:rustls-native-certs",

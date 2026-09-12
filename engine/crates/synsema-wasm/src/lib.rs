@@ -116,6 +116,9 @@ pub struct Report {
     pub audit: Vec<AuditEntry>,
     /// Tokens LLM consumidos vía el hook `llm` del host (lo que `llm_usage()` ve).
     pub llm_tokens: u64,
+    /// v0.6.20 — pasos del intérprete (nodos ejecutados): determinista, el "fuel" de un
+    /// host que lo exija y una medida de trabajo para budgets y tests.
+    pub steps: u64,
 }
 
 pub struct TestReport {
@@ -292,6 +295,10 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     register_secret_builtins(interp, caps.clone(), ctx.env.clone());
     synsema_stdlib::hashing::register_hash_builtins(interp);
     synsema_stdlib::json::register_json_builtins(interp);
+    // v0.6.20 — parsers y criptografía genérica, puros: el mismo camino que el nativo.
+    synsema_stdlib::xml::register_xml_builtins(interp);
+    synsema_stdlib::toml_fmt::register_toml_builtins(interp);
+    synsema_stdlib::crypto::register_crypto_builtins(interp, caps.clone());
     synsema_stdlib::webauth::register_webauth_builtins(interp, caps.clone());
     synsema_stdlib::httpsig::register_httpsig_builtins(interp, caps.clone());
     synsema_stdlib::captoken::register_captoken_builtins(interp);
@@ -742,14 +749,15 @@ pub(crate) fn finish_keep(interp: &mut Interpreter, result: Result<SynValue, Con
 pub fn run(source: &str, opts: &RunOptions) -> Report {
     let program = match parse_source(source, &opts.filename) {
         Err(e) => {
-            return Report { ok: false, output: Vec::new(), errors: vec![parse_errors(e)], audit: Vec::new(), llm_tokens: 0 }
+            return Report { ok: false, output: Vec::new(), errors: vec![parse_errors(e)], audit: Vec::new(), llm_tokens: 0, steps: 0 }
         }
         Ok(p) => p,
     };
     let (mut interp, caps) = prepare(&program, opts);
     let result = interp.execute(&program);
+    let steps = interp.steps();
     let r = finish(interp, result);
-    Report { ok: r.success, output: r.output, errors: r.errors, audit: export_audit(&caps), llm_tokens: llm_tokens_total() }
+    Report { ok: r.success, output: r.output, errors: r.errors, audit: export_audit(&caps), llm_tokens: llm_tokens_total(), steps }
 }
 
 /// Corre los bloques `test` del archivo con el mismo wiring puro.

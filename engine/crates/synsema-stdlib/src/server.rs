@@ -592,6 +592,11 @@ pub struct ServeRuntime {
     pub describe_version: Option<String>,
     /// `docs off` apaga la página `/docs` (el `/openapi.json` sigue publicado).
     pub docs_enabled: bool,
+    /// v0.6.20 — ruta de salud que pide el HOST (`SYNSEMA_HEALTH_PATH` o `--health`), no el
+    /// programa: `GET <path>` responde `{ok, uptime_s, in_flight, engine}` sin auth ni rate
+    /// limit y NO aparece en discovery. Sin la variable no existe: el servidor no inventa rutas.
+    pub health_path: Option<String>,
+    started: std::time::Instant,
     rate_limiter: RateLimiter,
     active_streams: Mutex<i64>,
     /// `errors with <task>` (serve-level): da forma a 401/404/405/500.
@@ -653,6 +658,22 @@ impl ServeRuntime {
         private: bool,
         secure: bool,
     ) -> Self {
+        // v0.6.20 — la salud opt-in del host NUNCA tapa una ruta declarada por el programa:
+        // si colisionan, la ruta gana y se avisa (auditoría).
+        let health_path = std::env::var("SYNSEMA_HEALTH_PATH")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| s.starts_with('/') && s.len() > 1)
+            .filter(|h| {
+                let taken = routes.iter().any(|r| r.method == "GET" && r.path == *h);
+                if taken {
+                    eprintln!(
+                        "[serve] warning: SYNSEMA_HEALTH_PATH={} collides with a declared route; the route answers and the host health endpoint is disabled",
+                        h
+                    );
+                }
+                !taken
+            });
         ServeRuntime {
             port,
             host,
@@ -671,6 +692,8 @@ impl ServeRuntime {
             domain: None,
             describe_version: None,
             docs_enabled: true,
+            health_path,
+            started: std::time::Instant::now(),
             rate_limiter: RateLimiter::new(),
             active_streams: Mutex::new(0),
             error_handler: None,
@@ -840,6 +863,13 @@ impl ServeRuntime {
         Some(format!("{}://{}", if https { "https" } else { "http" }, host))
     }
 
+    /// v0.6.20 — las rutas que se PUBLICAN: las de la tabla menos las `private`. Es lo que ven
+    /// /llms.txt, /openapi.json, /sitemap.xml y /docs; el `private` de nivel serve sigue
+    /// apagando todo.
+    fn public_routes(host: &HostRouter) -> Vec<ApiRoute> {
+        Self::api_routes(host).into_iter().filter(|r| !r.private).collect()
+    }
+
     /// La tabla de un host como rutas "secas" (lo que discovery emite).
     fn api_routes(host: &HostRouter) -> Vec<ApiRoute> {
         host.routes
@@ -851,6 +881,7 @@ impl ServeRuntime {
                 requires_auth: r.requires_auth,
                 streaming: r.streaming,
                 socket: r.socket,
+                private: r.private,
                 rate_limit: r.rate_limit,
                 rate_unlimited: r.rate_unlimited,
                 proxy: r.proxy_target.is_some(),
@@ -880,7 +911,7 @@ impl ServeRuntime {
                 lines.push(format!("> {}", intent));
             }
         }
-        let routes = Self::api_routes(host);
+        let routes = Self::public_routes(host);
         let mut endpoints: Vec<(String, String, String)> = routes
             .iter()
             .map(|r| (r.path.clone(), r.method.clone(), discovery::caps_suffix(r)))
@@ -1006,13 +1037,13 @@ impl ServeRuntime {
         }
         if path == "/openapi.json" && !self.private {
             let info = self.api_info(host, headers);
-            let doc = discovery::openapi_json(&info, &Self::api_routes(host));
+            let doc = discovery::openapi_json(&info, &Self::public_routes(host));
             return Some(RawResponse::text(dumps(&doc), "application/json; charset=utf-8", 200));
         }
         if path == "/sitemap.xml" && !self.private {
             let base = self.base_url(headers)?;
             return Some(RawResponse::text(
-                discovery::sitemap_xml(&base, &Self::api_routes(host)),
+                discovery::sitemap_xml(&base, &Self::public_routes(host)),
                 "application/xml; charset=utf-8",
                 200,
             ));
@@ -1022,7 +1053,7 @@ impl ServeRuntime {
             let info = self.api_info(host, headers);
             let fmt = negotiate_format(&header_value(headers, "accept"));
             return Some(if fmt == "md" {
-                RawResponse::text(discovery::docs_markdown(&info, &Self::api_routes(host)), "text/markdown; charset=utf-8", 200)
+                RawResponse::text(discovery::docs_markdown(&info, &Self::public_routes(host)), "text/markdown; charset=utf-8", 200)
             } else {
                 RawResponse::text(discovery::docs_html(&info), "text/html; charset=utf-8", 200)
             });
@@ -1325,11 +1356,23 @@ impl ServeRuntime {
         cancel: CancelToken,
     ) -> Dispatched {
         let resp = |status, body| Dispatched::Response { status, body, headers: vec![] };
+        // v0.6.20 — este hilo atiende a ESTE servidor (para `openapi_json()`).
+        CURRENT_SERVE_PORT.with(|c| c.set(Some(self.port)));
 
         // Rutas reservadas `/approvals` (A1.v2/v3): interceptadas ANTES de las rutas
         // de usuario (como `/llms.txt`); sólo existen si el runtime cableó la cola.
         if self.is_approvals_route(method, path) {
             return self.approvals_response(method, path, &query, body_str);
+        }
+        // v0.6.20 — salud opt-in del HOST: sin auth, sin rate limit, fuera de discovery.
+        if method == "GET" && self.health_path.as_deref() == Some(path) {
+            let body = format!(
+                "{{\"ok\":true,\"uptime_s\":{},\"in_flight\":{},\"engine\":\"{}\"}}",
+                self.started.elapsed().as_secs(),
+                self.inflight.load(AtomicOrd::SeqCst),
+                engine_version()
+            );
+            return resp(200, ResponseBody::Raw(RawResponse::text(body, "application/json; charset=utf-8", 200)));
         }
 
         // vhost (Lote 1): elegir la tabla del host según el header `Host`. Sin vhosts
@@ -1340,6 +1383,26 @@ impl ServeRuntime {
             Some((i, p)) => (Some(i), p),
             None => (None, IndexMap::new()),
         };
+        // v0.6.20 — las URLs reservadas del runtime van ANTES que una ruta CON parámetros
+        // (`GET /:lang` ya no se traga `/openapi.json`); una ruta literal declarada para
+        // ellas sigue ganando (params vacíos → no entra acá). Con `private`/`docs off` la
+        // superficie no existe y la ruta con parámetros la atiende como siempre.
+        if route_idx.is_some() && !params.is_empty() && RESERVED_PATHS.contains(&path) {
+            // Un estático real en ese path exacto sigue ganando (p. ej. un robots.txt propio),
+            // exactamente como cuando no hay ruta con parámetros.
+            if method == "GET" && !host.static_mounts.is_empty() {
+                if let Some(sr) = host.serve_static_full(path, &headers) {
+                    return Dispatched::Response {
+                        status: sr.status,
+                        body: ResponseBody::Raw(RawResponse { body: sr.body, content_type: sr.content_type, status: sr.status }),
+                        headers: sr.extra,
+                    };
+                }
+            }
+            if let Some(disc) = self.discovery_response(path, &headers, host) {
+                return resp(disc.status, ResponseBody::Raw(disc));
+            }
+        }
 
         // Negociación por sufijo de URL (.md/.json/.html): sólo si un :param se
         // tragó el sufijo. Un estático real en el path exacto gana primero.
@@ -1907,6 +1970,62 @@ pub const SERVE_ENV_VARS: &[&str] = &[
 /// Servidores (`run_async`) vivos en el proceso: con varios `serve on` en un programa,
 /// el shutdown ordenado sale del proceso cuando el ÚLTIMO terminó de drenar — no
 /// cuando el primero (que cortaría el drain de los demás).
+/// v0.6.20 — las URLs que el runtime publica solo: una ruta con parámetros no las captura.
+pub const RESERVED_PATHS: [&str; 5] = ["/openapi.json", "/docs", "/llms.txt", "/sitemap.xml", "/robots.txt"];
+
+/// Versión del motor para la respuesta de salud: la del release (`SYNSEMA_VERSION` al
+/// compilar) o la del crate.
+fn engine_version() -> &'static str {
+    option_env!("SYNSEMA_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
+
+/// v0.6.20 — proveedores del documento OpenAPI, UNO POR PUERTO (un proceso puede correr
+/// varios `serve on`), para el builtin `openapi_json()`: lo instala `run_async` al arrancar
+/// (el default host, rutas públicas).
+static OPENAPI_PROVIDERS: Mutex<Vec<(u16, Arc<dyn Fn() -> String + Send + Sync>)>> = Mutex::new(Vec::new());
+
+thread_local! {
+    /// El puerto del servidor cuyo request atiende este hilo (lo fija `dispatch`), para que
+    /// `openapi_json()` describa ESE servidor y no otro del mismo proceso.
+    static CURRENT_SERVE_PORT: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+}
+
+fn install_openapi_provider(rt: Arc<ServeRuntime>) {
+    let port = rt.port;
+    let f: Arc<dyn Fn() -> String + Send + Sync> = Arc::new(move || {
+        let host = &rt.default_host;
+        let info = rt.api_info(host, &[]);
+        discovery::openapi_text(&info, &ServeRuntime::public_routes(host))
+    });
+    if let Ok(mut g) = OPENAPI_PROVIDERS.lock() {
+        g.retain(|(p, _)| *p != port);
+        g.push((port, f));
+    }
+}
+
+/// El OpenAPI del servidor que atiende el request en curso. Fuera de un request (un cron,
+/// un agente) vale si hay UN solo servidor en el proceso; con varios, hay que estar dentro
+/// de una ruta para saber cuál.
+pub fn current_openapi_json() -> Result<String, String> {
+    let providers = OPENAPI_PROVIDERS.lock().map_err(|_| "openapi_json(): registry lock poisoned".to_string())?;
+    if providers.is_empty() {
+        return Err("openapi_json() is only available under serve (it describes the running server); under run there is no route table".to_string());
+    }
+    let port = CURRENT_SERVE_PORT.with(|c| c.get());
+    let f = match port.and_then(|p| providers.iter().find(|(q, _)| *q == p)) {
+        Some((_, f)) => f.clone(),
+        None if providers.len() == 1 => providers[0].1.clone(),
+        None => {
+            return Err(format!(
+                "openapi_json(): {} servers run in this process — call it from inside a route so it knows which one to describe",
+                providers.len()
+            ))
+        }
+    };
+    drop(providers);
+    Ok(f())
+}
+
 static LIVE_SERVERS: AtomicUsize = AtomicUsize::new(0);
 
 // =========================================================
@@ -2006,6 +2125,17 @@ async fn program_shutdown() {
 pub fn register_shutdown_builtin(interp: &synsema_core::interpreter::Interpreter) {
     use std::rc::Rc;
     use synsema_core::interpreter::{Control, RuntimeError};
+    // v0.6.20 — openapi_json() → el documento que el servidor publica (rutas públicas, ya
+    // filtradas), como texto, para servirlo desde una ruta propia con otro prefijo o filtro.
+    // Sin capability (introspección del propio servidor). Bajo `run` no hay servidor: error.
+    interp.register_builtin(
+        "openapi_json",
+        0,
+        Rc::new(|_i, _args, _loc| match current_openapi_json() {
+            Ok(doc) => Ok(synsema_core::types::syn_text(doc)),
+            Err(m) => Err(Control::Error(RuntimeError::new(m))),
+        }),
+    );
     interp.register_builtin(
         "shutdown",
         -1,
@@ -2077,6 +2207,7 @@ async fn shutdown_signal() {
 
 fn run_async(rt: Arc<ServeRuntime>, listener: TcpListener, tls: TlsMode) {
     LIVE_SERVERS.fetch_add(1, AtomicOrd::SeqCst);
+    install_openapi_provider(rt.clone());
     let _ = listener.set_nonblocking(true);
     // Arranca el pool del intérprete (stack grande, acotado) ANTES de aceptar conexiones.
     let _ = interp_pool();

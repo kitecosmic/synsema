@@ -547,6 +547,9 @@ pub struct RouteSpec {
     pub streaming: bool,
     /// Ruta `socket` (WebSocket entrante).
     pub socket: bool,
+    /// v0.6.20 — `private`: la ruta se sirve pero no se publica en /llms.txt, /openapi.json,
+    /// /sitemap.xml ni /docs (por ruta o heredado de su grupo `export routes`).
+    pub private: bool,
     pub rate_limit: Option<(i64, f64)>,
     pub rate_zone: Option<String>,
     pub handler: Handler,

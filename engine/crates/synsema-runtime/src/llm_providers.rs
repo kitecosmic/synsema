@@ -1371,33 +1371,218 @@ pub struct MeteredProvider {
     /// `None` = sin techo (solo metering). `Some(n)`: al llegar a `n` tokens usados,
     /// las llamadas siguientes degradan sin tocar la red.
     pub budget: Option<u64>,
+    /// v0.6.20 — techos por identidad autenticada (`SYNSEMA_LLM_BUDGET_PER_IDENTITY`,
+    /// `agent-1=20000,agent-2=5000`) y lo usado por cada una. La identidad la fija serve por
+    /// request (`identity_scope`); sin identidad (run, cron) sólo aplica el techo global.
+    per_identity: std::collections::HashMap<String, u64>,
+}
+
+/// v0.6.20 — tokens usados POR IDENTIDAD en todo el PROCESO (auditoría B1): `serve` construye
+/// un `MeteredProvider` por worker y por hilo de stream, así que un contador de instancia
+/// contaba por hilo y el techo se multiplicaba por el número de workers. Mismo patrón que
+/// `LLM_TOKENS_USED`: estático, sobrevive a la reconstrucción del provider.
+static IDENTITY_TOKENS_USED: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+fn identity_used(id: &str) -> u64 {
+    IDENTITY_TOKENS_USED
+        .lock()
+        .ok()
+        .and_then(|m| m.as_ref().and_then(|m| m.get(id).copied()))
+        .unwrap_or(0)
+}
+
+fn identity_add(id: String, tokens: u64) {
+    if let Ok(mut g) = IDENTITY_TOKENS_USED.lock() {
+        *g.get_or_insert_with(std::collections::HashMap::new).entry(id).or_insert(0) += tokens;
+    }
+}
+
+/// Tokens LLM consumidos por una identidad en este proceso (introspección/tests).
+pub fn llm_identity_tokens(identity: &str) -> u64 {
+    identity_used(identity)
+}
+
+thread_local! {
+    static CURRENT_LLM_IDENTITY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// v0.6.20 — la identidad autenticada del request en curso, para el techo LLM por identidad.
+/// Se limpia al soltar el guard: un cron o un agente en el mismo hilo nunca hereda la de
+/// un request anterior.
+pub struct LlmIdentityScope;
+
+impl Drop for LlmIdentityScope {
+    fn drop(&mut self) {
+        CURRENT_LLM_IDENTITY.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+pub fn identity_scope(identity: Option<String>) -> LlmIdentityScope {
+    CURRENT_LLM_IDENTITY.with(|c| *c.borrow_mut() = identity);
+    LlmIdentityScope
+}
+
+fn current_llm_identity() -> Option<String> {
+    CURRENT_LLM_IDENTITY.with(|c| c.borrow().clone())
+}
+
+/// Por qué se degrada una llamada: el techo del proceso o el de la identidad.
+enum BudgetCut {
+    Process(u64, u64),
+    Identity(String, u64, u64),
+}
+
+impl BudgetCut {
+    fn marker(&self) -> String {
+        match self {
+            BudgetCut::Process(used, budget) => budget_marker(*used, *budget),
+            BudgetCut::Identity(id, used, budget) => {
+                format!("[llm budget exceeded for identity {}: used {} of {} tokens]", id, used, budget)
+            }
+        }
+    }
+    fn note(&self) {
+        match self {
+            BudgetCut::Process(used, budget) => note_budget_cut(*used, *budget),
+            BudgetCut::Identity(id, used, budget) => {
+                static NOTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                if let Ok(mut seen) = NOTED.lock() {
+                    if !seen.iter().any(|s| s == id) {
+                        seen.push(id.clone());
+                        eprintln!(
+                            "[synsema] notice: the LLM token budget for identity {} is exhausted (used {} of {} tokens, set by the host via SYNSEMA_LLM_BUDGET_PER_IDENTITY). Its LLM operations now return the marker text \"[llm budget exceeded for identity …]\" instead of calling the model.",
+                            id, used, budget
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `SYNSEMA_LLM_BUDGET_PER_IDENTITY="id=N,id2=M"` → techos por identidad (mismo formato que
+/// `SYNSEMA_SPEND_CEILING_PER_IDENTITY`). Una entrada inválida se avisa y se salta.
+fn resolve_identity_budgets(store: &EnvStore) -> std::collections::HashMap<String, u64> {
+    let mut out = std::collections::HashMap::new();
+    let Some(raw) = resolve_knob("SYNSEMA_LLM_BUDGET_PER_IDENTITY", store) else {
+        return out;
+    };
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        match entry.split_once('=') {
+            Some((id, n)) if !id.trim().is_empty() => match n.trim().parse::<u64>() {
+                Ok(v) if v > 0 => {
+                    out.insert(id.trim().to_string(), v);
+                }
+                _ => eprintln!(
+                    "synsema: warning: SYNSEMA_LLM_BUDGET_PER_IDENTITY entry '{}' has no positive integer budget — ignored",
+                    entry
+                ),
+            },
+            _ => eprintln!(
+                "synsema: warning: SYNSEMA_LLM_BUDGET_PER_IDENTITY entry '{}' is not identity=tokens — ignored",
+                entry
+            ),
+        }
+    }
+    out
 }
 
 impl MeteredProvider {
     /// `Some(used)` si el budget ya está agotado (la llamada NO debe delegar).
-    fn over_budget(&self) -> Option<(u64, u64)> {
-        let budget = self.budget?;
-        let used = LLM_TOKENS_USED.load(std::sync::atomic::Ordering::Relaxed);
-        if used >= budget {
-            Some((used, budget))
-        } else {
-            None
+    pub fn new(inner: Arc<dyn LLMProvider>, budget: Option<u64>) -> Self {
+        Self::with_identity_budgets(inner, budget, std::collections::HashMap::new())
+    }
+    pub fn with_identity_budgets(
+        inner: Arc<dyn LLMProvider>,
+        budget: Option<u64>,
+        per_identity: std::collections::HashMap<String, u64>,
+    ) -> Self {
+        MeteredProvider { inner, budget, per_identity }
+    }
+    /// `Some(corte)` si algún techo ya está agotado (la llamada NO debe delegar): primero el
+    /// del proceso, después el de la identidad del request en curso (si tiene uno).
+    fn over_budget(&self) -> Option<BudgetCut> {
+        if let Some(budget) = self.budget {
+            let used = LLM_TOKENS_USED.load(std::sync::atomic::Ordering::Relaxed);
+            if used >= budget {
+                return Some(BudgetCut::Process(used, budget));
+            }
         }
+        if let Some(id) = current_llm_identity() {
+            if let Some(&limit) = self.per_identity.get(&id) {
+                let used = identity_used(&id);
+                if used >= limit {
+                    return Some(BudgetCut::Identity(id, used, limit));
+                }
+            }
+        }
+        None
     }
 
     fn meter(&self, tokens: u64) {
         if tokens > 0 {
             LLM_TOKENS_USED.fetch_add(tokens, std::sync::atomic::Ordering::Relaxed);
+            if let Some(id) = current_llm_identity() {
+                if self.per_identity.contains_key(&id) {
+                    identity_add(id, tokens);
+                }
+            }
         }
+    }
+}
+
+/// v0.6.20 (auditoría M1) — envuelve al provider real y lo RECONSTRUYE cuando el host pidió
+/// recargar el `.env` (SIGHUP → `secrets::request_env_reload`): la clave y los knobs nuevos
+/// valen para la próxima op LLM sin reiniciar. Los contadores (proceso e identidad) son
+/// estáticos y sobreviven a la reconstrucción. Sin provider configurado tras la recarga se
+/// conserva el anterior (quitar la clave no apaga un servicio vivo a mitad de un request).
+pub struct ReloadingProvider {
+    inner: std::sync::Mutex<(u64, Arc<dyn LLMProvider>)>,
+}
+
+impl ReloadingProvider {
+    pub fn new(inner: Arc<dyn LLMProvider>) -> Self {
+        ReloadingProvider { inner: std::sync::Mutex::new((synsema_stdlib::secrets::env_generation(), inner)) }
+    }
+    fn current(&self) -> Arc<dyn LLMProvider> {
+        let g = synsema_stdlib::secrets::env_generation();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.0 != g {
+            if let Some(p) = provider_from_config(&EnvStore::load_default()) {
+                guard.1 = p;
+            }
+            guard.0 = g;
+        }
+        guard.1.clone()
+    }
+}
+
+impl LLMProvider for ReloadingProvider {
+    fn call(&self, request: &LLMRequest) -> LLMResponse {
+        self.current().call(request)
+    }
+    fn name(&self) -> String {
+        self.current().name()
+    }
+    fn call_step(&self, request: &LLMRequest) -> LlmStepResponse {
+        self.current().call_step(request)
+    }
+    fn call_stream(&self, request: &LLMRequest, on_chunk: &mut dyn FnMut(&str) -> bool) -> LLMResponse {
+        self.current().call_stream(request, on_chunk)
     }
 }
 
 impl LLMProvider for MeteredProvider {
     fn call(&self, request: &LLMRequest) -> LLMResponse {
-        if let Some((used, budget)) = self.over_budget() {
-            note_budget_cut(used, budget);
+        if let Some(cut) = self.over_budget() {
+            cut.note();
             return LLMResponse {
-                content: budget_marker(used, budget),
+                content: cut.marker(),
                 model: self.inner.name(),
                 tokens_used: 0,
             };
@@ -1414,10 +1599,10 @@ impl LLMProvider for MeteredProvider {
     }
 
     fn call_step(&self, request: &LLMRequest) -> LlmStepResponse {
-        if let Some((used, budget)) = self.over_budget() {
-            note_budget_cut(used, budget);
+        if let Some(cut) = self.over_budget() {
+            cut.note();
             return LlmStepResponse {
-                step: LlmStep::Final(budget_marker(used, budget)),
+                step: LlmStep::Final(cut.marker()),
                 tokens_used: 0,
             };
         }
@@ -1431,9 +1616,9 @@ impl LLMProvider for MeteredProvider {
         request: &LLMRequest,
         on_chunk: &mut dyn FnMut(&str) -> bool,
     ) -> LLMResponse {
-        if let Some((used, budget)) = self.over_budget() {
-            note_budget_cut(used, budget);
-            let marker = budget_marker(used, budget);
+        if let Some(cut) = self.over_budget() {
+            cut.note();
+            let marker = cut.marker();
             // Contrato de stream degradado (mismo que el default del trait): el marker
             // se emite como UN chunk y como contenido final.
             on_chunk(&marker);
@@ -1642,7 +1827,7 @@ pub fn provider_from_config(store: &EnvStore) -> Option<Arc<dyn LLMProvider>> {
     inner_provider_from_config(store).map(|inner| {
         // Metering SIEMPRE (F-A): sin `SYNSEMA_LLM_BUDGET` igual se acumula, así
         // `llm_usage()` funciona sin config; con budget, el wrapper corta al llegar.
-        Arc::new(MeteredProvider { inner, budget: resolve_llm_budget(store) })
+        Arc::new(MeteredProvider::with_identity_budgets(inner, resolve_llm_budget(store), resolve_identity_budgets(store)))
             as Arc<dyn LLMProvider>
     })
 }
@@ -3430,7 +3615,7 @@ mod tests {
             tokens_used: 7,
         }])
         .with_call_tokens(5);
-        let p = MeteredProvider { inner: Arc::new(mock), budget: None };
+        let p = MeteredProvider::new(Arc::new(mock), None);
         let before = llm_tokens_total();
         let r1 = p.call(&step_req());
         assert_eq!(r1.tokens_used, 5, "los tokens del mock fluyen a la LLMResponse");
@@ -3444,6 +3629,42 @@ mod tests {
         );
     }
 
+    /// v0.6.20 — techo por identidad: corta sólo a esa identidad, las demás (y el anónimo)
+    /// siguen; el guard limpia la identidad al soltarse.
+    #[test]
+    fn metered_provider_identity_budget_cuts() {
+        let _g = meter_lock();
+        // Números de verdad: una tarea normal gasta 20k+ tokens; el techo de una identidad se
+        // piensa en cientos de miles. 25k por llamada, techo 60k → pasan 3 (75k), la 4ª corta.
+        let mock = Arc::new(MockProvider::new(std::collections::HashMap::new()).with_call_tokens(25_000));
+        let mut per = std::collections::HashMap::new();
+        per.insert("unit-agent-1".to_string(), 60_000u64);
+        // El contador es de PROCESO (auditoría B1): dos providers (dos workers) comparten el uso.
+        let p = MeteredProvider::with_identity_budgets(mock.clone(), None, per.clone());
+        let p2 = MeteredProvider::with_identity_budgets(mock.clone(), None, per);
+        {
+            let _scope = identity_scope(Some("unit-agent-1".to_string()));
+            assert!(!p.call(&step_req()).content.contains("budget exceeded"));
+            assert!(!p2.call(&step_req()).content.contains("budget exceeded"), "50k < 60k: pasa (otro worker)");
+            assert!(!p.call(&step_req()).content.contains("budget exceeded"), "50k < 60k: pasa");
+            let r4 = p2.call(&step_req());
+            assert!(r4.content.contains("budget exceeded for identity unit-agent-1"), "{}", r4.content);
+            assert_eq!(mock.call_log_len(), 3, "la cuarta no delegó aunque vino por otro provider");
+            assert_eq!(llm_identity_tokens("unit-agent-1"), 75_000);
+        }
+        // Fuera del scope (anónimo) y con otra identidad sin techo: pasan.
+        assert!(!p.call(&step_req()).content.contains("budget exceeded"));
+        {
+            let _scope = identity_scope(Some("unit-agent-2".to_string()));
+            assert!(!p.call(&step_req()).content.contains("budget exceeded"));
+        }
+        assert_eq!(mock.call_log_len(), 5);
+        let budgets = resolve_identity_budgets(&EnvStore::parse("SYNSEMA_LLM_BUDGET_PER_IDENTITY=a=100, b=5,bad,c=x\n"));
+        assert_eq!(budgets.get("a"), Some(&100));
+        assert_eq!(budgets.get("b"), Some(&5));
+        assert_eq!(budgets.len(), 2);
+    }
+
     #[test]
     fn metered_provider_budget_cuts() {
         let _g = meter_lock();
@@ -3452,7 +3673,7 @@ mod tests {
         let base = llm_tokens_total();
         // Budget = base + 5: la primera llamada pasa (base < base+5) y suma 8; la
         // segunda encuentra el contador ≥ budget → marker SIN delegar.
-        let p = MeteredProvider { inner: mock.clone(), budget: Some(base + 5) };
+        let p = MeteredProvider::new(mock.clone(), Some(base + 5));
         let r1 = p.call(&step_req());
         assert!(!r1.content.contains("llm budget exceeded"), "la primera pasa: {}", r1.content);
         assert_eq!(mock.call_log_len(), 1);

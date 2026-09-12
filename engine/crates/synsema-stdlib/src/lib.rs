@@ -20,6 +20,11 @@ pub mod blockchain_hd;
 pub mod blockchain_rpc;
 pub mod blockchain_solana;
 pub mod captoken;
+// v0.6.20 — archivos comprimidos: SÓLO native (extraer toca disco; en puro son stubs).
+#[cfg(feature = "native")]
+pub mod archive;
+// v0.6.20 — criptografía genérica (ECDH/HKDF/AES-GCM, nombres WebCrypto). Pura.
+pub mod crypto;
 pub mod charts;
 #[cfg(feature = "native")]
 pub mod cron;
@@ -46,6 +51,9 @@ pub mod platform;
 // El perfil puro como pared (stubs OS-facing compartidos por nativo `--profile pure` y wasm).
 pub mod pure;
 pub mod raster;
+// v0.6.20 — parsers de texto de la plataforma. Puros.
+pub mod toml_fmt;
+pub mod xml;
 pub mod respond;
 /// Router + contrato de respuesta de `serve`, PUROS (compartidos con el handler-mode wasm).
 pub mod routing;

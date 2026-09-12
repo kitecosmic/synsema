@@ -246,14 +246,23 @@ impl HostProvider for WebHost {
             }
         }
         let status = r.get("status").and_then(Value::as_i64).unwrap_or(0);
-        let body = match r.get("body_base64").and_then(Value::as_str) {
-            Some(b64) => String::from_utf8_lossy(&base64_decode(b64)).to_string(),
-            None => r.get("body").map(str_of).unwrap_or_default(),
+        // v0.6.20 — se conservan los bytes exactos (`body_base64` del host, o el texto).
+        let (body, body_bytes) = match r.get("body_base64").and_then(Value::as_str) {
+            Some(b64) => {
+                let bytes = base64_decode(b64);
+                (String::from_utf8_lossy(&bytes).to_string(), bytes)
+            }
+            None => {
+                let s = r.get("body").map(str_of).unwrap_or_default();
+                let bytes = s.as_bytes().to_vec();
+                (s, bytes)
+            }
         };
         Some(Ok(HttpResult {
             status,
             ok: (200..300).contains(&status),
             body,
+            body_bytes,
             headers: json_to_pairs(r.get("headers")),
             error: None,
         }))
@@ -449,7 +458,7 @@ fn dispatch(req: &Map<String, Value>) -> Value {
             match op {
                 "run" => {
                     let r = synsema_wasm::run(&source, &opts);
-                    json!({"ok": r.ok, "output": r.output, "errors": r.errors, "audit": audit_json(&r.audit), "llm_tokens": r.llm_tokens})
+                    json!({"ok": r.ok, "output": r.output, "errors": r.errors, "audit": audit_json(&r.audit), "llm_tokens": r.llm_tokens, "steps": r.steps})
                 }
                 "test" => {
                     let r = synsema_wasm::test(&source, &opts);

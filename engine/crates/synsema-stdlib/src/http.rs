@@ -31,6 +31,24 @@ use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 #[allow(unused_imports)]
 use synsema_core::types::{syn_bool, syn_float, syn_int, syn_nothing, syn_text, SynValue};
 
+/// v0.6.20 — el transporte de los builtins cliente: body en BYTES (texto, binario o el JSON
+/// que `http_common::body_arg` ya serializó). `http_request` (texto) queda para los módulos
+/// que lo llaman por nombre (blockchain_rpc, oidc, …).
+fn http_transport(
+    method: &str,
+    url: &str,
+    headers: Option<&[(String, String)]>,
+    query: Option<&[(String, String)]>,
+    body: Option<&[u8]>,
+    timeout_secs: u64,
+) -> HttpResult {
+    let full_url = url_with_query(url, query);
+    match do_request(method, &full_url, headers, body, timeout_secs) {
+        Ok(r) => r,
+        Err(e) => err_result(e),
+    }
+}
+
 /// Petición HTTP. Devuelve la respuesta o un resultado de error (nunca panica).
 pub fn http_request(
     method: &str,
@@ -491,24 +509,18 @@ fn parse_response(buf: &[u8]) -> Result<HttpResult, String> {
     let chunked = headers.iter().any(|(k, v)| {
         k.eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked")
     });
-    let body_bytes = &buf[split + 4..];
-    let body = if chunked {
-        dechunk_body(body_bytes)
-    } else {
-        String::from_utf8_lossy(body_bytes).to_string()
-    };
+    let body_raw = &buf[split + 4..];
+    // v0.6.20 — se conservan los bytes exactos; `body` es su lectura como texto.
+    let body_bytes = if chunked { dechunk_bytes(body_raw) } else { body_raw.to_vec() };
+    let body = String::from_utf8_lossy(&body_bytes).to_string();
     Ok(HttpResult {
         status,
         ok: (200..300).contains(&status),
         body,
+        body_bytes,
         headers,
         error: None,
     })
-}
-
-/// Des-chunkea un body `Transfer-Encoding: chunked` a `String` (texto).
-fn dechunk_body(data: &[u8]) -> String {
-    String::from_utf8_lossy(&dechunk_bytes(data)).to_string()
 }
 
 /// Des-chunkea un body `Transfer-Encoding: chunked` a bytes: cada chunk es
@@ -713,7 +725,7 @@ pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilityS
 
     // Los seis builtins cliente (http/http_get/http_post/http_put/http_delete/fetch):
     // registro compartido con el perfil wasm (http_common), transporte = sockets.
-    register_http_client_builtins(interp, caps, http_request);
+    register_http_client_builtins(interp, caps, http_transport);
 }
 
 #[cfg(test)]

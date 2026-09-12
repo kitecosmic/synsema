@@ -285,6 +285,9 @@ const HELLO_SYN_PAST: &[&str] = &[
     // v0.6.13 (a69d6ae): el hello.syn que ship con `synsema code` — su sha nunca se
     // agregó a `past` (el guard se saltea en CI shallow), así que estaba latente.
     "2212d1b3304687f23f48a26833dc0616ca0a99d121f42285156236657d554bd3",
+    // v0.6.19 (d7d12f8, 2026-09-06): el hello.syn previo al cambio de URLs a synsema.org /
+    // synsema.dev; su sha no se agregó en ese commit (el guard se saltea en CI shallow).
+    "af7a6c93900b99b083c8b263c339982b0de0a212000724ed9fd1ff9fff03abdc",
 ];
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
@@ -306,6 +309,9 @@ const ENV_EXAMPLE_PAST: &[&str] = &[
     // Detectadas al normalizar el guard (tanda PWA, 2026-09-01).
     "6c234f8044ab9ea0bd1fcf9df666409a56b2bdc8ce7069d37835351f4e64197c",
     "17fda7b616215919a140c80176cce36c2852ec9c77b9966e36ab00bdbfd6e052",
+    // v0.6.19 (d7d12f8, 2026-09-06): la versión previa al cambio de URLs a synsema.org /
+    // synsema.dev; el sha no se agregó en ese commit (el guard se saltea en CI shallow).
+    "0faf055b78cb0a2066c0697bad397a4332b642aff14adb30440ea4873deed96f",
 ];
 
 /// `.mcp.json`: registra el servidor MCP local `synsema-code` (`synsema code --mcp`) para

@@ -148,6 +148,24 @@ tokenizers = { version = "0.23", default-features = false, features = ["fancy-re
 # itoa/ryu/serde, cero `*-sys`) → preserva el binario único estático. Sólo la mecánica
 # de quoting/records; la conversión texto↔SynValue vive en synsema-core/src/csv.rs.
 csv = "1"
+# v0.6.20 — parsers de texto que pidió la plataforma (PURO-Rust, cero `*-sys`):
+#   roxmltree : XML → árbol de sólo lectura para `xml_parse` (factura electrónica CFDI/NF-e/
+#               Facturae/AFIP). YA estaba en el árbol (transitiva de usvg); hacerla directa no
+#               agrega crate. No resuelve DTD ni entidades externas → sin XXE por construcción.
+#   toml      : `toml_parse`/`toml_encode` (syn.toml, catalog.toml). La serie 1.x parsea con
+#               toml_parser/winnow (ya no arrastra toml_edit). `preserve_order`: las tablas salen
+#               en el orden del documento (mismo criterio que `preserve_order` de serde_json).
+roxmltree = "0.20"
+toml = { version = "1", default-features = false, features = ["std", "parse", "display", "serde", "preserve_order"] }
+# v0.6.20 — archivos comprimidos (`zip_*`/`tar_*`, stdlib/archive.rs), SÓLO perfil native:
+#   zip : `default-features = false` deja fuera aes-crypto/bzip2/zstd/lzma/ppmd/xz/time;
+#         `deflate-flate2` usa el MISMO flate2 (miniz_oxide, puro-Rust) del gzip del server,
+#         no zopfli ni zlib-rs. NO estaba en el árbol de stdlib (la 8.6 del lock es de otro
+#         paquete): es dependencia nueva.
+#   tar : sin `xattr` (unix-only y no lo necesitamos). Puro-Rust.
+# Verificado con `cargo tree -p synsema-stdlib`: cero `*-sys` nuevo.
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+tar = { version = "0.4", default-features = false }
 # Export PNG/PDF (Batch 9): rasterización SVG (stack resvg, RazrFalcon/linebender) +
 # SVG→PDF vectorial (svg2pdf, ecosistema typst). TODO PURO-Rust, SIN C (cero `*-sys`).
 # `default-features = false` en resvg/usvg: fuera `system-fonts` (I/O de fuentes del SO,
@@ -226,6 +244,15 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa", "ecdh"
 # `default-features = false`: fuera `getrandom` (la sal y la clave efímera salen de OsRng,
 # como en webauth). Verificado en Cargo.lock: 7 entradas nuevas, ninguna `*-sys`.
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+# v0.6.20 — criptografía genérica (stdlib/crypto.rs): ECDH P-521 + HKDF-SHA256 + AES-GCM con
+# nombres WebCrypto (lo pide un TEE; le sirve a cualquiera que cifre extremo a extremo).
+# p521 PINNEADA a 0.13 para compartir elliptic-curve 0.13 con p256/k256 (la 0.14 duplicaría
+# toda la pila RustCrypto: elliptic-curve/digest/sha2/hkdf por partida doble).
+# `default-features = false`: sólo `ecdh` + `std` (sin ecdsa/pem/getrandom; la clave sale de
+# OsRng como en webpush). hkdf ya era transitiva de elliptic-curve; directa no agrega crate.
+# AES-256-GCM es el MISMO aes-gcm de arriba (Aes256Gcm). Cero `*-sys`.
+p521 = { version = "0.13", default-features = false, features = ["ecdh", "std"] }
+hkdf = "0.12"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 scrypt = { version = "0.11", default-features = false }
 aes = "0.8"

@@ -1419,6 +1419,8 @@ fn run_socket(
             Some(u) => (server::identity_of(u), server::delegated_spend_of(u)),
             None => (None, Vec::new()),
         };
+        // v0.6.20 — la misma identidad alimenta el techo de tokens LLM por identidad.
+        let _llm_identity = crate::llm_providers::identity_scope(identity.clone());
         interp.set_request_identity(identity, limits);
         let link = match link.downcast::<ServerSocketLink>() {
             Ok(l) => *l,
@@ -1499,6 +1501,8 @@ fn run_route(
             Some(u) => (server::identity_of(u), server::delegated_spend_of(u)),
             None => (None, Vec::new()),
         };
+        // v0.6.20 — la misma identidad alimenta el techo de tokens LLM por identidad.
+        let _llm_identity = crate::llm_providers::identity_scope(identity.clone());
         interp.set_request_identity(identity, limits);
         // Token de cancelación de la request (timeout de handler / shutdown).
         interp.set_cancel_token(ctx.cancel.clone());
@@ -1544,6 +1548,15 @@ fn run_stream(
     emit: Emitter,
 ) -> StreamEnd {
     with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp| {
+        // Identidad del sujeto de ESTA request: la misma que fija `run_route`. Sin esto una
+        // ruta `stream` directa quedaba fuera de los techos por identidad (LLM, spend, sign):
+        // venía así desde v0.6.19 y la auditoría de v0.6.20 lo destapó con el techo LLM nuevo.
+        let (identity, limits) = match &ctx.user {
+            Some(u) => (server::identity_of(u), server::delegated_spend_of(u)),
+            None => (None, Vec::new()),
+        };
+        let _llm_identity = crate::llm_providers::identity_scope(identity.clone());
+        interp.set_request_identity(identity, limits);
         interp.set_cancel_token(ctx.cancel.clone());
         let cell = Rc::new(RefCell::new(emit));
         let ec = cell.clone();
@@ -1848,6 +1861,7 @@ fn build_host_table(
             socket,
             rate_limit,
             timeout,
+            private,
             body,
         } = &r.kind
         {
@@ -1983,6 +1997,7 @@ fn build_host_table(
                 requires_auth: *requires_auth,
                 streaming: *streaming,
                 socket: *socket,
+                private: *private,
                 rate_limit: eff_rate,
                 rate_zone: zone,
                 handler,
@@ -2052,6 +2067,10 @@ fn build_host_table(
                 let method = mm.get("method").map(|v| v.to_string()).unwrap_or_default();
                 let rpath = mm.get("path").map(|v| v.to_string()).unwrap_or_default();
                 let requires_auth = matches!(mm.get("requires_auth"), Some(SynValue::Bool(true)));
+                // v0.6.20 — clase de ruta y publicación, tal como viajan en la meta del grupo.
+                let streaming = matches!(mm.get("streaming"), Some(SynValue::Bool(true)));
+                let socket = matches!(mm.get("socket"), Some(SynValue::Bool(true)));
+                let private = matches!(mm.get("private"), Some(SynValue::Bool(true)));
                 let params: Vec<String> = match mm.get("params") {
                     Some(SynValue::List(l)) => l.borrow().iter().map(|x| x.to_string()).collect(),
                     _ => Vec::new(),
@@ -2107,7 +2126,7 @@ fn build_host_table(
                     SynValue::Map(m) => match m.borrow().get(&key) {
                         Some(SynValue::Task(t)) => synsema_core::route_meta::route_meta(
                             &t.body,
-                            false,
+                            streaming,
                             &synsema_core::route_meta::env_lookup(&t.closure_env),
                         ),
                         _ => Default::default(),
@@ -2127,24 +2146,76 @@ fn build_host_table(
                 let cron_c = cron.clone();
                 let db_c = shared_db.clone();
                 let mn_c = mem_name.clone();
+                // v0.6.20 — `stream`/`socket` montados: las mismas variantes que una ruta
+                // directa, resolviendo el cuerpo en la task del grupo (`_route_handler_i`).
+                let (source_s, key_s) = (source_c.clone(), key.clone());
                 let handler: Handler = Arc::new(move |ctx: &Ctx| {
                     run_mounted_route(
                         &swarm_c, &snap_c, &caps_c, &db_c, &rules_c, &mem_c, &ow_c, &prog_c,
                         &owp_c, &st_c, &ap_c, &cron_c, &source_c, &key, ctx, secure, &mn_c,
                     )
                 });
+                let stream_handler: Option<StreamHandler> = if streaming {
+                    let (source_s, key_s) = (source_s.clone(), key_s.clone());
+                    let swarm_s = swarm.clone();
+                    let snap_s = snapshot.clone();
+                    let caps_s = caps_snap.clone();
+                    let rules_s = rules_snap.clone();
+                    let mem_s = shared_memory.clone();
+                    let ow_s = on_write.clone();
+                    let prog_s = shared_progress.clone();
+                    let owp_s = on_write_progress.clone();
+                    let st_s = shared_state.clone();
+                    let ap_s = approvals.clone();
+                    let cron_s = cron.clone();
+                    let db_s = shared_db.clone();
+                    let mn_s = mem_name.clone();
+                    Some(Arc::new(move |ctx: &Ctx, emit: Emitter| {
+                        run_mounted_stream(
+                            &swarm_s, &snap_s, &caps_s, &db_s, &rules_s, &mem_s, &ow_s, &prog_s,
+                            &owp_s, &st_s, &ap_s, &cron_s, &source_s, &key_s, ctx, secure, &mn_s, emit,
+                        )
+                    }))
+                } else {
+                    None
+                };
+                let socket_handler: Option<SocketHandler> = if socket {
+                    let (source_s, key_s) = (source_s.clone(), key_s.clone());
+                    let swarm_s = swarm.clone();
+                    let snap_s = snapshot.clone();
+                    let caps_s = caps_snap.clone();
+                    let rules_s = rules_snap.clone();
+                    let mem_s = shared_memory.clone();
+                    let ow_s = on_write.clone();
+                    let prog_s = shared_progress.clone();
+                    let owp_s = on_write_progress.clone();
+                    let st_s = shared_state.clone();
+                    let ap_s = approvals.clone();
+                    let cron_s = cron.clone();
+                    let db_s = shared_db.clone();
+                    let mn_s = mem_name.clone();
+                    Some(Arc::new(move |ctx: &Ctx, link: Box<dyn std::any::Any + Send>| {
+                        run_mounted_socket(
+                            &swarm_s, &snap_s, &caps_s, &db_s, &rules_s, &mem_s, &ow_s, &prog_s,
+                            &owp_s, &st_s, &ap_s, &cron_s, &source_s, &key_s, ctx, secure, &mn_s, link,
+                        )
+                    }))
+                } else {
+                    None
+                };
                 routes.push(RouteSpec {
                     method,
                     path: full_path,
                     param_names: params,
                     requires_auth,
-                    streaming: false,
-                    socket: false,
+                    streaming,
+                    socket,
+                    private,
                     rate_limit: eff_rate,
                     rate_zone: zone,
                     handler,
-                    stream_handler: None,
-                    socket_handler: None,
+                    stream_handler,
+                    socket_handler,
                     timeout: route_timeout,
                     proxy_target: None,
                     rate_unlimited,
@@ -2186,6 +2257,8 @@ fn run_mounted_route(
             Some(u) => (server::identity_of(u), server::delegated_spend_of(u)),
             None => (None, Vec::new()),
         };
+        // v0.6.20 — la misma identidad alimenta el techo de tokens LLM por identidad.
+        let _llm_identity = crate::llm_providers::identity_scope(identity.clone());
         interp.set_request_identity(identity, limits);
         let genv = interp.global_env.clone();
         let group = match interp.eval(source, &genv) {
@@ -2224,6 +2297,167 @@ fn run_mounted_route(
                 GiveOutcome::Error("'give'/'stop' used outside of a task or loop".to_string())
             }
         }
+    })
+}
+
+/// v0.6.20 — resuelve la task `_route_handler_i` del grupo montado (con su env de módulo).
+fn mounted_task(
+    interp: &mut Interpreter,
+    source: &Node,
+    handler_key: &str,
+) -> Result<Rc<synsema_core::types::SynTaskValue>, String> {
+    let genv = interp.global_env.clone();
+    let group = match interp.eval(source, &genv) {
+        Ok(v) => v,
+        Err(Control::Error(e)) => return Err(format!("mounted routes group is not available: {}", e.message)),
+        Err(_) => return Err("mounted routes group is not available".to_string()),
+    };
+    let task = match &group {
+        SynValue::Map(m) => m.borrow().get(handler_key).cloned(),
+        _ => None,
+    };
+    match task {
+        Some(SynValue::Task(t)) => Ok(t),
+        _ => Err(format!("mounted route handler '{}' not found in the routes group", handler_key)),
+    }
+}
+
+/// v0.6.20 — ruta `stream` montada desde un grupo `export routes`: igual que `run_stream`,
+/// con el cuerpo y el env de la task del grupo.
+#[allow(clippy::too_many_arguments)]
+fn run_mounted_stream(
+    swarm: &Arc<Swarm>,
+    snapshot: &Arc<Vec<(String, GlobalVal)>>,
+    caps_snap: &Arc<Vec<Capability>>,
+    shared_db: &SharedDb,
+    rules_snap: &Arc<Vec<OwnerRule>>,
+    shared_memory: &SharedMemoryStore,
+    on_write: &OnWriteFn,
+    shared_progress: &SharedProgressStore,
+    on_write_progress: &OnWriteProgressFn,
+    shared_state: &SharedState,
+    approvals: &ServeApprovals,
+    cron: &CronWiring,
+    source: &Node,
+    handler_key: &str,
+    ctx: &Ctx,
+    secure: bool,
+    mem_name: &Option<String>,
+    emit: Emitter,
+) -> StreamEnd {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp| {
+        interp.set_cancel_token(ctx.cancel.clone());
+        let (identity, limits) = match &ctx.user {
+            Some(u) => (server::identity_of(u), server::delegated_spend_of(u)),
+            None => (None, Vec::new()),
+        };
+        let _llm_identity = crate::llm_providers::identity_scope(identity.clone());
+        interp.set_request_identity(identity, limits);
+        let task = match mounted_task(interp, source, handler_key) {
+            Ok(t) => t,
+            Err(m) => return StreamEnd::Error(m),
+        };
+        let cell = Rc::new(RefCell::new(emit));
+        let ec = cell.clone();
+        interp.set_stream_emit(Rc::new(move |val: SynValue, event: Option<&str>| {
+            match (*ec.borrow_mut())(&val, event) {
+                Ok(()) => Ok(()),
+                Err(StreamGone) => Err(Control::Error(RuntimeError::new(CLIENT_GONE))),
+            }
+        }));
+        let parent = task.closure_env.clone();
+        match interp.run_request_block_in(&task.body, request_bindings(ctx), &parent) {
+            Err(Control::Give(SynValue::Server(s))) if matches!(&*s, ServerValue::WithHeaders { .. }) => {
+                StreamEnd::Error(
+                    "streaming responses do not accept with_header/set_cookie yet \
+                     (the SSE response head is already written); set headers on a \
+                     non-streaming route"
+                        .to_string(),
+                )
+            }
+            Ok(_) | Err(Control::Give(_)) | Err(Control::Stop(_)) => StreamEnd::Done,
+            Err(Control::Error(e)) => {
+                let m = e.to_string();
+                if m == CLIENT_GONE {
+                    StreamEnd::ClientGone
+                } else {
+                    StreamEnd::Error(m)
+                }
+            }
+        }
+    })
+}
+
+/// v0.6.20 — ruta `socket` montada desde un grupo `export routes`: igual que `run_socket`,
+/// con el cuerpo y el env de la task del grupo.
+#[allow(clippy::too_many_arguments)]
+fn run_mounted_socket(
+    swarm: &Arc<Swarm>,
+    snapshot: &Arc<Vec<(String, GlobalVal)>>,
+    caps_snap: &Arc<Vec<Capability>>,
+    shared_db: &SharedDb,
+    rules_snap: &Arc<Vec<OwnerRule>>,
+    shared_memory: &SharedMemoryStore,
+    on_write: &OnWriteFn,
+    shared_progress: &SharedProgressStore,
+    on_write_progress: &OnWriteProgressFn,
+    shared_state: &SharedState,
+    approvals: &ServeApprovals,
+    cron: &CronWiring,
+    source: &Node,
+    handler_key: &str,
+    ctx: &Ctx,
+    secure: bool,
+    mem_name: &Option<String>,
+    link: Box<dyn std::any::Any + Send>,
+) -> StreamEnd {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp| {
+        interp.set_cancel_token(ctx.cancel.clone());
+        let (identity, limits) = match &ctx.user {
+            Some(u) => (server::identity_of(u), server::delegated_spend_of(u)),
+            None => (None, Vec::new()),
+        };
+        let _llm_identity = crate::llm_providers::identity_scope(identity.clone());
+        interp.set_request_identity(identity, limits);
+        let task = match mounted_task(interp, source, handler_key) {
+            Ok(t) => t,
+            Err(m) => return StreamEnd::Error(m),
+        };
+        let link = match link.downcast::<ServerSocketLink>() {
+            Ok(l) => *l,
+            Err(_) => return StreamEnd::Error("socket: internal transport link type mismatch".to_string()),
+        };
+        let handle = match adopt_server_socket(interp, link) {
+            Ok(h) => h,
+            Err(Control::Error(e)) => return StreamEnd::Error(e.to_string()),
+            Err(_) => return StreamEnd::Error("socket: could not adopt the connection".to_string()),
+        };
+        let mut bindings = request_bindings(ctx);
+        bindings.push(("socket".to_string(), syn_int(handle)));
+        let flat: Vec<Node> = task
+            .body
+            .iter()
+            .flat_map(|s| match &s.kind {
+                NodeKind::SocketBlock { body } => body.clone(),
+                _ => vec![s.clone()],
+            })
+            .collect();
+        let parent = task.closure_env.clone();
+        let end = match interp.run_request_block_in(&flat, bindings, &parent) {
+            Ok(_) | Err(Control::Give(_)) | Err(Control::Stop(_)) => StreamEnd::Done,
+            Err(Control::Error(e)) => StreamEnd::Error(e.to_string()),
+        };
+        let cancelled = interp.is_cancelled();
+        let reason = match &end {
+            StreamEnd::Error(m) => {
+                let what = if cancelled { "cancelled" } else { "handler failed" };
+                (serve_log_sink())(&format!("[socket] {} {}: {}: {}", ctx.method, ctx.path, what, m));
+                Some(m.as_str())
+            }
+            _ => None,
+        };
+        close_server_socket(interp, handle, reason, cancelled);
+        end
     })
 }
 
@@ -3147,6 +3381,36 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
 /// Corre un programa que contiene `serve on PORT`. Bindea (síncrono), imprime la
 /// línea de readiness y bloquea hasta que maten el proceso. Default no-secure
 /// (como `synsema run`); `secure=true` para el path seguro (body 500 genérico).
+/// v0.6.20 — SIGHUP recarga el `.env`: sube la generación global y cada intérprete relee el
+/// archivo en su próxima resolución de `secret()`/`env()` (`synsema_stdlib::secrets`). Un
+/// `secret` ya guardado en un `let` de arranque no se renueva (es un valor). Sólo Unix: en
+/// Windows no existe la señal y el camino sigue siendo reiniciar con drenado, dicho así.
+fn install_env_reload_on_sighup() {
+    #[cfg(unix)]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = std::thread::Builder::new().name("synsema-sighup".into()).spawn(|| {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+                    return;
+                };
+                rt.block_on(async {
+                    let Ok(mut sig) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) else {
+                        return;
+                    };
+                    while sig.recv().await.is_some() {
+                        let g = synsema_stdlib::secrets::request_env_reload();
+                        (serve_log_sink())(&format!(
+                            "[serve] SIGHUP: .env reload requested (generation {}); secret()/env() re-read the file on their next call",
+                            g
+                        ));
+                    }
+                });
+            });
+        });
+    }
+}
+
 pub fn run_serve_program(source: &str, filename: &str, secure: bool) -> RunResult {
     run_serve_program_with_overrides(source, filename, secure, ServeOverrides::default())
 }
@@ -3165,6 +3429,7 @@ pub fn run_serve_program_with_overrides(
     set_serve_ceiling(overrides.ceiling.clone());
     // Desde acá `shutdown()` tiene sentido (bajo `run` es un error claro).
     synsema_stdlib::server::mark_under_serve();
+    install_env_reload_on_sighup();
     std::thread::Builder::new()
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || serve_inner(&src, &fname, secure, overrides))

@@ -32,7 +32,7 @@ mod synfide;
 mod update;
 mod code;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] | run [--flat] [--explain] [--format human|json] [--provider <name>] <archivo.syn | -> [-- args...] | test [-v] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list>] [--profile native|pure] [--audit json|<ruta>|fd:N] [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--health <path>] | run [--flat] [--explain] [--format human|json] [--provider <name>] <archivo.syn | -> [-- args...] | test [-v] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
 
 // `build_ceiling` (--sandbox/--cap-set → techo) vive en synsema-capabilities: lo comparten
 // este binario y `synsema-wasm` (mismas flags, misma semántica en los dos front-ends).
@@ -55,6 +55,8 @@ pub(crate) struct HostFlags {
     pub cap_set: Option<String>,
     pub profile: Option<String>,
     pub audit: Option<String>,
+    /// v0.6.20 — `--deterministic`: perfil puro + techo sólo `stdout` (ni `time` ni `random`).
+    pub deterministic: bool,
     pub filename: Option<String>,
     pub program_args: Vec<String>,
     pub rest: Vec<String>,
@@ -63,6 +65,9 @@ pub(crate) struct HostFlags {
 impl HostFlags {
     /// El techo del host (`build_ceiling`), o el error de uso ya impreso.
     fn ceiling(&self, cmd: &str) -> Result<Option<Vec<synsema_capabilities::model::Capability>>, ExitCode> {
+        if self.deterministic {
+            return Ok(Some(synsema_capabilities::model::build_ceiling_deterministic()));
+        }
         match build_ceiling(self.sandbox, self.cap_set.as_deref()) {
             Ok(c) => Ok(c),
             Err(e) => {
@@ -75,6 +80,7 @@ impl HostFlags {
     /// Fija el perfil del PROCESO (`--profile`), validando el nombre.
     fn apply_profile(&self, cmd: &str) -> Result<Profile, ExitCode> {
         let p = match self.profile.as_deref() {
+            None if self.deterministic => Profile::Pure,
             None => Profile::Native,
             Some(name) => match Profile::parse(name) {
                 Some(p) => p,
@@ -84,6 +90,10 @@ impl HostFlags {
                 }
             },
         };
+        if self.deterministic && p != Profile::Pure {
+            eprintln!("synsema {}: --deterministic runs the pure profile; drop --profile native", cmd);
+            return Err(ExitCode::from(2));
+        }
         host::set_profile(p);
         Ok(p)
     }
@@ -91,10 +101,12 @@ impl HostFlags {
     /// Instala el sink de audit (`--audit`), y el colector si el subcomando va a emitir
     /// un informe JSON (`run --format json`).
     fn apply_audit(&self, cmd: &str, collect: bool) -> Result<(), ExitCode> {
-        if self.audit.is_none() && !collect {
+        // v0.6.20 — `SYNSEMA_AUDIT` (environ del proceso) enciende el sink sin flag; el flag gana.
+        let dest = self.audit.clone().or_else(audit::env_dest);
+        if dest.is_none() && !collect {
             return Ok(());
         }
-        if let Err(e) = audit::install(self.audit.as_deref(), collect) {
+        if let Err(e) = audit::install(dest.as_deref(), collect) {
             eprintln!("synsema {}: {}", cmd, e);
             return Err(ExitCode::from(2));
         }
@@ -130,6 +142,7 @@ pub(crate) fn take_host_flags(cmd: &str, args: &[String]) -> Result<HostFlags, E
                 i += 1;
             }
             "--sandbox" => h.sandbox = true,
+            "--deterministic" => h.deterministic = true,
             "--cap-set" => {
                 h.cap_set = Some(need_value("--cap-set", args.get(i + 1))?);
                 i += 1;
@@ -168,6 +181,13 @@ pub(crate) fn take_host_flags(cmd: &str, args: &[String]) -> Result<HostFlags, E
         eprintln!("synsema {}: --sandbox and --cap-set are mutually exclusive; choose one", cmd);
         return Err(ExitCode::from(2));
     }
+    if h.deterministic && (h.sandbox || h.cap_set.is_some()) {
+        eprintln!(
+            "synsema {}: --deterministic already fixes the ceiling (stdout only, no time/random); drop --sandbox/--cap-set",
+            cmd
+        );
+        return Err(ExitCode::from(2));
+    }
     Ok(h)
 }
 
@@ -204,6 +224,11 @@ mod audit {
         })
     }
 
+    /// v0.6.20 — `SYNSEMA_AUDIT` del environ (misma sintaxis que `--audit`): la forma de
+    /// encender el audit en un contenedor sin tocar la línea de comando.
+    pub fn env_dest() -> Option<String> {
+        std::env::var("SYNSEMA_AUDIT").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    }
     pub fn install(dest: Option<&str>, collect: bool) -> Result<(), String> {
         let writer: Option<Box<dyn Write + Send>> = match dest {
             None => None,
@@ -222,6 +247,22 @@ mod audit {
                 {
                     let _ = n;
                     return Err("--audit fd:N is only available on Unix; use --audit <path> or --audit json".to_string());
+                }
+            }
+            // v0.6.20 — `unix:<ruta>`: un socket Unix ya escuchando (el runner): streaming
+            // línea a línea y backpressure del kernel, sin cola ni reintentos en el motor.
+            Some(sock) if sock.starts_with("unix:") => {
+                let path = &sock[5..];
+                #[cfg(unix)]
+                {
+                    Some(Box::new(std::os::unix::net::UnixStream::connect(path).map_err(|e| {
+                        format!("--audit: cannot connect to unix socket {}: {} (is the collector listening?)", path, e)
+                    })?))
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = path;
+                    return Err("--audit unix:<path> is only available on Unix; use --audit <path> or --audit json".to_string());
                 }
             }
             Some(path) => Some(Box::new(
@@ -297,6 +338,13 @@ fn run_bundled(bundle: synsema_core::bundle::Bundle, program_args: Vec<String>) 
     let profile = Profile::parse(&manifest.profile).unwrap_or(Profile::Native);
     host::set_profile(profile);
     host::set_program_args(program_args);
+    // v0.6.20 — audit del binario: `SYNSEMA_AUDIT` del operador o el `--audit` horneado.
+    if let Some(dest) = audit::env_dest().or_else(|| manifest.audit.clone()) {
+        if let Err(e) = audit::install(Some(&dest), false) {
+            eprintln!("synsema: {}", e);
+            return ExitCode::from(2);
+        }
+    }
     let ceiling = match manifest.ceiling.as_deref() {
         None => None,
         Some("sandbox") => match build_ceiling(true, None) {
@@ -1012,6 +1060,15 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             "--tls-cert" => ov.tls_cert = Some(next_val!("--tls-cert")),
             "--tls-key" => ov.tls_key = Some(next_val!("--tls-key")),
             "--bind" => ov.bind = Some(next_val!("--bind")),
+            // v0.6.20 — salud opt-in del HOST (la misma variable que lee el runtime).
+            "--health" => {
+                let v = next_val!("--health");
+                if !v.starts_with('/') || v.len() < 2 {
+                    eprintln!("synsema serve: --health needs an absolute path like /healthz, got '{}'", v);
+                    return ExitCode::from(2);
+                }
+                std::env::set_var("SYNSEMA_HEALTH_PATH", v);
+            }
             p if !p.starts_with("--") => path = Some(p.to_string()),
             other => {
                 eprintln!("synsema serve: unknown flag '{}'", other);
@@ -1251,6 +1308,8 @@ fn cmd_run(args: &[String]) -> ExitCode {
             "audit": audit::collected(),
             "exit": exit,
             "llm_tokens": synsema_runtime::llm_providers::llm_tokens_total(),
+            // v0.6.20 — pasos del intérprete (contador determinista; ver `steps()`).
+            "steps": synsema_runtime::engine::last_run_steps(),
         });
         println!("{}", report);
         audit::summary(exit);
@@ -1517,8 +1576,14 @@ fn cmd_check(args: &[String]) -> ExitCode {
             // Chequeo estático profundo: módulos `use` (recursivo, mismas reglas que
             // el runtime) + templates `render("literal")` (existen y parsean). Un
             // import roto o un template con typo falla en `check`, no en producción.
-            match synsema_core::templates::check_program_static(&program, &path) {
-                Ok((modules, templates)) => {
+            // v0.6.20 — los avisos (alias sombreado, ruta `/:x` que tapa URLs reservadas) van a
+            // stderr después del OK; nunca cambian el exit code.
+            let load = |resolved: &str, raw: &str| -> Result<synsema_core::ast::Program, String> {
+                let src = std::fs::read_to_string(resolved).map_err(|_| format!("module not found: {}", raw))?;
+                synsema_core::parser::parse_source(&src, resolved).map_err(|e| e.to_string())
+            };
+            match synsema_core::templates::check_program_static_with_warnings(&program, &path, &load) {
+                Ok(((modules, templates), warnings)) => {
                     let mut extras = Vec::new();
                     if modules > 0 {
                         extras.push(format!("{} module(s)", modules));
@@ -1534,6 +1599,9 @@ fn cmd_check(args: &[String]) -> ExitCode {
                             program.statements.len(),
                             extras.join(" + ")
                         );
+                    }
+                    for w in &warnings {
+                        eprintln!("{}", w);
                     }
                     ExitCode::SUCCESS
                 }
@@ -1607,7 +1675,9 @@ fn cmd_openapi(args: &[String]) -> ExitCode {
         }
     };
     let (info, routes) = match api_routes_static(&sp) {
-        Ok(Some(x)) => x,
+        // v0.6.20 (auditoría M2) — el documento offline publica lo mismo que el servidor:
+        // las rutas `private` quedan fuera.
+        Ok(Some((info, routes))) => (info, routes.into_iter().filter(|r| !r.private).collect::<Vec<_>>()),
         Ok(None) => {
             eprintln!("{}: no 'serve' block — nothing to describe", path);
             return ExitCode::from(2);

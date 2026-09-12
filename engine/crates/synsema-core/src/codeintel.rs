@@ -802,8 +802,8 @@ fn resolve_alias(root: &Root, from_abs: &Path, prog: &Program, alias: &str) -> O
 /// Path canónico de un `use "<path>"` visto desde `from_abs`.
 fn resolve_import(root: &Root, from_abs: &Path, path: &str) -> Option<PathBuf> {
     let base = from_abs.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-    let _ = root;
-    let p = PathBuf::from(crate::templates::resolve_module_path(path, &base).ok()?);
+    // v0.6.20 — `../` sube mientras quede bajo la raíz del proyecto (la de `synsema code`).
+    let p = PathBuf::from(crate::templates::resolve_module_path(path, &base, Some(&root.dir)).ok()?);
     Some(canon(&p))
 }
 
@@ -1279,7 +1279,7 @@ pub fn routes(root: &Root, path: Option<&str>) -> Value {
         // vhosts: meta por ruta con el mismo lookup estático.
         for (host, hr) in &host_routes {
             for r in hr {
-                if let NodeKind::RouteDefinition { method, path, param_names, requires_auth, streaming, socket, body, rate_limit, .. } = &r.kind {
+                if let NodeKind::RouteDefinition { method, path, param_names, requires_auth, streaming, socket, private, body, rate_limit, .. } = &r.kind {
                     let proxy = body.len() == 1 && matches!(body[0].kind, NodeKind::ProxyStatement { .. });
                     let ar = ApiRoute {
                         method: method.clone(),
@@ -1288,6 +1288,7 @@ pub fn routes(root: &Root, path: Option<&str>) -> Value {
                         requires_auth: *requires_auth,
                         streaming: *streaming,
                         socket: *socket,
+                        private: *private,
                         rate_limit: rate_limit.as_deref().and_then(rate_of),
                         rate_unlimited: matches!(rate_limit.as_deref().map(|n| &n.kind), Some(NodeKind::RateLimitClause { unlimited: true, .. })),
                         proxy,

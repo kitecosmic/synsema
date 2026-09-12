@@ -2252,6 +2252,7 @@ mod tests {
             status,
             ok: ok_flag,
             body: body.to_string(),
+            body_bytes: body.as_bytes().to_vec(),
             headers: Vec::new(),
             error: error.map(str::to_string),
         };

@@ -350,3 +350,83 @@ fn profile_pure_stubs_os_builtins_but_keeps_pure_ones() {
     let (code, _, err) = synsema(&dir, &["run", "--profile", "bogus", "p.syn"], None);
     assert_eq!(code, 2, "{}", err);
 }
+
+fn synsema_in(dir: &PathBuf, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_synsema"));
+    cmd.args(args).current_dir(dir).env("SYNSEMA_NO_UPDATE_CHECK", "1");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn synsema");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// v0.6.20 — `--deterministic`: perfil puro + techo sólo stdout (ni `time` ni `random`), y
+/// excluye a `--sandbox`/`--cap-set`. `steps()` sigue disponible (es determinista).
+#[test]
+fn deterministic_alias_denies_time_and_random_and_excludes_other_ceilings() {
+    let dir = project("deterministic");
+    std::fs::write(dir.join("t.syn"), "print(now())\n").unwrap();
+    let (code, _, err) = synsema_in(&dir, &["run", "--deterministic", "t.syn"], &[]);
+    assert_ne!(code, 0, "{}", err);
+    assert!(err.contains("time"), "{}", err);
+    std::fs::write(dir.join("r.syn"), "print(random())\n").unwrap();
+    let (code, _, err) = synsema_in(&dir, &["run", "--deterministic", "r.syn"], &[]);
+    assert_ne!(code, 0, "{}", err);
+    assert!(err.contains("random"), "{}", err);
+    std::fs::write(dir.join("ok.syn"), "print(1 + 1)\nprint(steps() > 0)\n").unwrap();
+    let (code, out, err) = synsema_in(&dir, &["run", "--deterministic", "ok.syn"], &[]);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out.lines().map(str::trim).collect::<Vec<_>>(), vec!["2", "true"]);
+    let (code, _, err) = synsema_in(&dir, &["run", "--deterministic", "--sandbox", "ok.syn"], &[]);
+    assert_eq!(code, 2, "{}", err);
+    let (code, _, err) = synsema_in(&dir, &["run", "--deterministic", "--profile", "native", "ok.syn"], &[]);
+    assert_eq!(code, 2, "{}", err);
+    // El informe JSON trae `steps`.
+    let (code, out, err) = synsema_in(&dir, &["run", "--format", "json", "ok.syn"], &[]);
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("\"steps\":"), "{}", out);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// v0.6.20 — `SYNSEMA_AUDIT` enciende el sink sin flag, con la misma sintaxis.
+#[test]
+fn env_audit_enables_the_sink_without_the_flag() {
+    let dir = project("env-audit");
+    std::fs::write(dir.join("a.syn"), "require file.read(\"./*\")\nprint(file_exists(\"nope\"))\n").unwrap();
+    let (code, _, err) = synsema_in(&dir, &["run", "a.syn"], &[("SYNSEMA_AUDIT", "json")]);
+    assert_eq!(code, 0, "{}", err);
+    assert!(err.contains("\"capability\"") && err.contains("file_read"), "{}", err);
+    let (code, _, err) = synsema_in(&dir, &["run", "a.syn"], &[]);
+    assert_eq!(code, 0, "{}", err);
+    assert!(!err.contains("\"capability\""), "{}", err);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// v0.6.20 — `--audit unix:<ruta>`: una línea JSON por evento a un socket Unix ya escuchando.
+#[cfg(unix)]
+#[test]
+fn audit_unix_socket_sink_streams_lines() {
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+    let dir = project("audit-unix");
+    let sock = dir.join("audit.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    let reader = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut buf = String::new();
+        let _ = s.read_to_string(&mut buf);
+        buf
+    });
+    std::fs::write(dir.join("a.syn"), "require file.read(\"./*\")\nprint(file_exists(\"nope\"))\n").unwrap();
+    let dest = format!("unix:{}", sock.to_string_lossy());
+    let (code, _, err) = synsema_in(&dir, &["run", "--audit", &dest, "a.syn"], &[]);
+    assert_eq!(code, 0, "{}", err);
+    let received = reader.join().unwrap();
+    assert!(received.contains("\"capability\"") && received.contains("file_read"), "{}", received);
+    let _ = std::fs::remove_dir_all(&dir);
+}

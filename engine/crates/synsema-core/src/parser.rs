@@ -337,6 +337,15 @@ impl Parser {
         }
         // `timeout 30` | `timeout none` como cláusula (serve block / route body). Soft
         // keyword con lookahead: `timeout` seguido de número o `none` en la misma línea.
+        // v0.6.20 — `private` SOLO en la línea (route body / grupo `routes`): cláusula.
+        // `let private be 1` o `private(x)` siguen siendo nombres normales (lookahead fijo).
+        if self.check_word("private")
+            && matches!(self.peek(1).ty, TokenType::Newline | TokenType::Dedent | TokenType::Eof)
+        {
+            let loc = self.location();
+            self.advance(); // 'private'
+            return Ok(Some(Node::new(loc, NodeKind::PrivateClause)));
+        }
         if self.check_word("timeout")
             && (self.peek(1).ty == TokenType::Number || self.peek_word(1, "none"))
         {
@@ -821,14 +830,22 @@ impl Parser {
         self.expect(TokenType::Indent, "Expected an indented block after 'routes <name>'")?;
         self.skip_newlines();
         let mut routes = Vec::new();
+        // v0.6.20 — `private` como línea propia dentro del grupo: aplica a TODAS sus rutas
+        // (se propaga al parsear; la forma del AST del grupo no cambia).
+        let mut group_private = false;
         while !self.at_end() && !self.check(TokenType::Dedent) {
             if self.check_word("route") {
                 routes.push(self.parse_route()?);
+            } else if self.check_word("private")
+                && matches!(self.peek(1).ty, TokenType::Newline | TokenType::Dedent | TokenType::Eof)
+            {
+                self.advance();
+                group_private = true;
             } else {
                 let tok = self.current();
                 return Err(ParseError::new(
                     format!(
-                        "Inside 'routes', only 'route \"METHOD /path\"' definitions are allowed, got {}",
+                        "Inside 'routes', only 'route \"METHOD /path\"' definitions (and a 'private' line) are allowed, got {}",
                         tok.ty.name()
                     ),
                     tok.location.clone(),
@@ -844,6 +861,13 @@ impl Parser {
                 "a 'routes' group must contain at least one route",
                 loc.clone(),
             ));
+        }
+        if group_private {
+            for r in routes.iter_mut() {
+                if let NodeKind::RouteDefinition { private, .. } = &mut r.kind {
+                    *private = true;
+                }
+            }
         }
         Ok(Node::new(loc, NodeKind::RoutesDeclaration { name, routes }))
     }
@@ -1762,7 +1786,23 @@ impl Parser {
                 final_body.push(s);
             }
         }
-        let clean_body = final_body;
+        // v0.6.20 — `private` dentro del body de la route: se sirve, no se publica.
+        let mut private = false;
+        let mut public_body = Vec::with_capacity(final_body.len());
+        for s in final_body {
+            if matches!(s.kind, NodeKind::PrivateClause) {
+                if private {
+                    return Err(ParseError::new(
+                        "a route declares 'private' at most once".to_string(),
+                        s.location.clone(),
+                    ));
+                }
+                private = true;
+            } else {
+                public_body.push(s);
+            }
+        }
+        let clean_body = public_body;
         let streaming = clean_body
             .iter()
             .any(|s| matches!(s.kind, NodeKind::StreamBlock { .. }));
@@ -1798,6 +1838,7 @@ impl Parser {
                 socket,
                 rate_limit,
                 timeout,
+                private,
                 body: clean_body,
             },
         ))

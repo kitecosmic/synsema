@@ -359,6 +359,10 @@ pub enum NodeKind {
         rate_limit: Option<Box<Node>>, // RateLimitClause
         /// `timeout <segundos>` | `timeout none` dentro de la route (override).
         timeout: Option<Box<Node>>, // TimeoutClause
+        /// v0.6.20 — `private` dentro de la route (o del grupo `routes` que la contiene): la
+        /// ruta se sirve pero NO se publica en `/llms.txt`, `/openapi.json`, `/sitemap.xml` ni
+        /// `/docs`. Misma palabra que el `private` del serve block, menor alcance.
+        private: bool,
         body: Vec<Node>,
     },
     StreamBlock {
@@ -374,6 +378,8 @@ pub enum NodeKind {
     TimeoutClause {
         secs: Option<Box<Node>>,
     },
+    /// v0.6.20 — `private` solo en la línea, dentro de una route o de un grupo `routes`.
+    PrivateClause,
     /// Lote 2 — reverse proxy: `proxy to <url>` dentro de una route → forwardea.
     ProxyStatement {
         target: Box<Node>,

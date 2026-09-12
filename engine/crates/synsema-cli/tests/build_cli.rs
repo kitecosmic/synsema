@@ -375,3 +375,61 @@ fn build_serve_flags_are_validated_at_build_time() {
     assert!(err.contains("static mount './public'"), "{}", err);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// v0.6.20 — `--audit` HORNEADO y `SYNSEMA_AUDIT` del entorno: el binario emite el stream;
+/// sin ninguno de los dos no lo emite.
+#[test]
+fn baked_audit_and_env_audit_emit_the_stream() {
+    let dir = project("audit-baked");
+    std::fs::write(dir.join("lamp.syn"), "require file.read(\"./*\")\nprint(file_exists(\"nope.txt\"))\n").unwrap();
+    let lamp = build(&dir, &["--audit", "json"]);
+    let (code, out, err) = run(&lamp, &dir, &[]);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out.trim(), "false", "{}", out);
+    assert!(err.contains("\"capability\"") && err.contains("file_read"), "audit horneado en stderr: {}", err);
+
+    let dir2 = project("audit-env-var");
+    std::fs::write(dir2.join("lamp.syn"), "require file.read(\"./*\")\nprint(file_exists(\"nope.txt\"))\n").unwrap();
+    let lamp2 = build(&dir2, &[]);
+    let with_env = Command::new(&lamp2)
+        .current_dir(&dir2)
+        .env("SYNSEMA_NO_UPDATE_CHECK", "1")
+        .env("SYNSEMA_AUDIT", "json")
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&with_env.stderr).contains("\"capability\""), "{}", String::from_utf8_lossy(&with_env.stderr));
+    let without = Command::new(&lamp2).current_dir(&dir2).env("SYNSEMA_NO_UPDATE_CHECK", "1").output().unwrap();
+    assert!(!String::from_utf8_lossy(&without.stderr).contains("\"capability\""), "sin flag ni variable no hay audit");
+}
+
+/// v0.6.20 — un binario construido ve el DISCO donde lo invocan: `list_dir(".")`, `read_file`
+/// y `cwd()`; el bundle sólo como respaldo (un asset que no está en disco) o con `bundle:`.
+/// Antes el bundle sombreaba el cwd y un CLI hecho con `synsema build` listaba sus propios
+/// assets en vez de la carpeta del usuario, en silencio.
+#[test]
+fn built_binary_sees_the_real_working_directory() {
+    let dir = project("cwd");
+    std::fs::write(dir.join("assets").join("data.txt"), "bundled").unwrap();
+    std::fs::write(
+        dir.join("lamp.syn"),
+        "require file.read(\"*\")\nprint(length(list_dir(\".\")))\nprint(read_file(\"data.txt\"))\nprint(read_file(\"bundle:assets/data.txt\"))\nprint(read_file(\"assets/data.txt\"))\nprint(cwd())\n",
+    )
+    .unwrap();
+    let lamp = build(&dir, &[]);
+    let other = std::env::temp_dir().join(format!("synsema-build-cli-cwd-other-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&other);
+    std::fs::create_dir_all(&other).unwrap();
+    for (n, c) in [("data.txt", "disk"), ("b.txt", "2"), ("c.txt", "3")] {
+        std::fs::write(other.join(n), c).unwrap();
+    }
+    let (code, out, err) = run(&lamp, &other, &[]);
+    assert_eq!(code, 0, "{}", err);
+    let lines: Vec<&str> = out.lines().map(|l| l.trim()).collect();
+    assert_eq!(lines[0], "3", "list_dir lista el cwd real: {}", out);
+    assert_eq!(lines[1], "disk", "read_file lee el disco: {}", out);
+    assert_eq!(lines[2], "bundled", "bundle: fuerza el bundle: {}", out);
+    assert_eq!(lines[3], "bundled", "un asset que NO está en disco cae al bundle: {}", out);
+    let cwd_norm = other.to_string_lossy().replace('\\', "/");
+    assert!(lines[4].eq_ignore_ascii_case(&cwd_norm), "cwd(): {} vs {}", lines[4], cwd_norm);
+    let _ = std::fs::remove_dir_all(&other);
+}

@@ -90,8 +90,64 @@ fn svg_arg<'a>(args: &'a [SynValue], name: &str) -> Result<&'a str, Control> {
 /// externos (http://, rutas locales) devuelve None a propósito — un builtin puro no
 /// sale a la red ni toca disco (G8); sólo los data: URLs embebidos resuelven.
 fn parse_tree(svg: &str, name: &str) -> Result<usvg::Tree, Control> {
+    parse_tree_with(svg, name, embedded_fontdb())
+}
+
+/// v0.6.20 — la fontdb embebida MÁS las fuentes propias del caller (`opts.fonts`): una base
+/// nueva por llamada (clon de la embebida + cada archivo), así el determinismo se conserva
+/// (mismo SVG + mismas opts + mismas fuentes → mismos bytes) y el caso sin `fonts` sigue
+/// byte a byte igual (los goldens no cambian).
+fn fontdb_with(fonts: &[Vec<u8>]) -> Arc<fontdb::Database> {
+    if fonts.is_empty() {
+        return embedded_fontdb();
+    }
+    let mut db: fontdb::Database = (*embedded_fontdb()).clone();
+    for f in fonts {
+        db.load_font_data(f.clone());
+    }
+    Arc::new(db)
+}
+
+/// v0.6.20 — `opts.fonts`: lista de rutas; el `loader` (el host con capabilities) exige
+/// `file.read` por cada una y devuelve los bytes. Sin loader (perfil puro) la opción es un
+/// error claro, no un silencio.
+type FontLoader<'a> = &'a dyn Fn(&str) -> Result<Vec<u8>, Control>;
+
+fn fonts_opt(
+    opts: &IndexMap<String, SynValue>,
+    name: &str,
+    loader: Option<FontLoader<'_>>,
+) -> Result<Vec<Vec<u8>>, Control> {
+    let list = match opts.get("fonts") {
+        None | Some(SynValue::Nothing) => return Ok(Vec::new()),
+        Some(SynValue::List(l)) => l.borrow().clone(),
+        Some(other) => {
+            return Err(err(format!(
+                "{}: option \"fonts\" must be a list of font file paths, got {}",
+                name,
+                other.type_name()
+            )))
+        }
+    };
+    let Some(load) = loader else {
+        return Err(err(format!(
+            "{}: option \"fonts\" needs file access, which this profile does not have (the embedded font still works)",
+            name
+        )));
+    };
+    let mut out = Vec::with_capacity(list.len());
+    for item in &list {
+        let SynValue::Text(p) = item else {
+            return Err(err(format!("{}: every entry of \"fonts\" must be a path (text), got {}", name, item.type_name())));
+        };
+        out.push(load(p)?);
+    }
+    Ok(out)
+}
+
+fn parse_tree_with(svg: &str, name: &str, fontdb: Arc<fontdb::Database>) -> Result<usvg::Tree, Control> {
     let opt = usvg::Options {
-        fontdb: embedded_fontdb(),
+        fontdb,
         font_family: "DejaVu Sans".to_string(),
         image_href_resolver: usvg::ImageHrefResolver {
             resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
@@ -238,6 +294,12 @@ fn parse_hex_color(s: &str, name: &str) -> Result<(u8, u8, u8, u8), Control> {
 // =========================================================
 
 pub fn svg_to_png(args: &[SynValue]) -> Result<SynValue, Control> {
+    svg_to_png_with(args, None)
+}
+
+/// v0.6.20 — `svg_to_png` con acceso a fuentes propias (`opts.fonts`) a través del loader
+/// del host; `None` = perfil puro (la opción falla claro).
+pub fn svg_to_png_with(args: &[SynValue], loader: Option<FontLoader<'_>>) -> Result<SynValue, Control> {
     const NAME: &str = "svg_to_png";
     if args.is_empty() || args.len() > 2 {
         return Err(err(format!(
@@ -247,7 +309,8 @@ pub fn svg_to_png(args: &[SynValue]) -> Result<SynValue, Control> {
         )));
     }
     let svg = svg_arg(args, NAME)?;
-    let opts = opts_of(args, NAME, &["width", "height", "scale", "background", "max_pixels"])?;
+    let opts = opts_of(args, NAME, &["width", "height", "scale", "background", "max_pixels", "fonts"])?;
+    let fonts = fonts_opt(&opts, NAME, loader)?;
     let want_w = opt_pos_number(&opts, "width", NAME)?;
     let want_h = opt_pos_number(&opts, "height", NAME)?;
     let scale = opt_pos_number(&opts, "scale", NAME)?;
@@ -274,7 +337,7 @@ pub fn svg_to_png(args: &[SynValue]) -> Result<SynValue, Control> {
         }
     };
 
-    let tree = parse_tree(svg, NAME)?;
+    let tree = parse_tree_with(svg, NAME, fontdb_with(&fonts))?;
     let (w0, h0) = (f64::from(tree.size().width()), f64::from(tree.size().height()));
     // usvg garantiza tamaño > 0 (un SVG sin dimensiones deducibles ya falló al parsear).
     let (out_w, out_h) = match (want_w, want_h, scale) {
@@ -316,6 +379,11 @@ pub fn svg_to_png(args: &[SynValue]) -> Result<SynValue, Control> {
 // =========================================================
 
 pub fn svg_to_pdf(args: &[SynValue]) -> Result<SynValue, Control> {
+    svg_to_pdf_with(args, None)
+}
+
+/// v0.6.20 — `svg_to_pdf` con fuentes propias (`opts.fonts`) a través del loader del host.
+pub fn svg_to_pdf_with(args: &[SynValue], loader: Option<FontLoader<'_>>) -> Result<SynValue, Control> {
     const NAME: &str = "svg_to_pdf";
     if args.is_empty() || args.len() > 2 {
         return Err(err(format!(
@@ -325,11 +393,12 @@ pub fn svg_to_pdf(args: &[SynValue]) -> Result<SynValue, Control> {
         )));
     }
     let svg = svg_arg(args, NAME)?;
-    let opts = opts_of(args, NAME, &["width", "height"])?;
+    let opts = opts_of(args, NAME, &["width", "height", "fonts"])?;
     let want_w = opt_pos_number(&opts, "width", NAME)?;
     let want_h = opt_pos_number(&opts, "height", NAME)?;
+    let fonts = fonts_opt(&opts, NAME, loader)?;
 
-    let tree = parse_tree(svg, NAME)?;
+    let tree = parse_tree_with(svg, NAME, fontdb_with(&fonts))?;
     let (w0, h0) = (f64::from(tree.size().width()), f64::from(tree.size().height()));
 
     // Override de tamaño de página (en puntos) vía dpi UNIFORME (la conversión es
@@ -368,6 +437,53 @@ pub fn svg_to_pdf(args: &[SynValue]) -> Result<SynValue, Control> {
 pub fn register_raster_builtins(interp: &Interpreter) {
     interp.register_builtin("svg_to_png", -1, Rc::new(|_i, a, _l| svg_to_png(a)));
     interp.register_builtin("svg_to_pdf", -1, Rc::new(|_i, a, _l| svg_to_pdf(a)));
+}
+
+/// v0.6.20 — el mismo registro, con fuentes propias: cada ruta de `opts.fonts` pasa por
+/// `file.read` (disco; el bundle de `synsema build` como respaldo) — lo cablea el runtime
+/// nativo DESPUÉS de `register_serve_builtins` (la última registración por nombre gana).
+pub fn register_raster_builtins_with_caps(
+    interp: &Interpreter,
+    caps: std::rc::Rc<std::cell::RefCell<synsema_capabilities::model::CapabilitySet>>,
+) {
+    use synsema_capabilities::model::{normalize_path, Capability, CapabilityType};
+    fn make_loader<'a>(
+        caps: &'a std::rc::Rc<std::cell::RefCell<synsema_capabilities::model::CapabilitySet>>,
+        source: &'static str,
+    ) -> impl Fn(&str) -> Result<Vec<u8>, Control> + 'a {
+        move |raw: &str| {
+            let path = normalize_path(raw);
+            // Assets del programa desde el bundle (sin file.read, con su línea de audit); lo
+            // demás, del disco.
+            if let Some(bytes) = synsema_core::bundle::get(&path) {
+                synsema_capabilities::secure::bundled_audit(caps, CapabilityType::FileRead, &path, source);
+                return Ok(bytes.to_vec());
+            }
+            caps.borrow_mut()
+                .require(&Capability::new(CapabilityType::FileRead, Some(path.clone())), source)
+                .map_err(|v| Control::Error(RuntimeError::new(v.message)))?;
+            std::fs::read(&path).map_err(|e| err(format!("{}: cannot read font {}: {}", source, path, e)))
+        }
+    }
+    {
+        let caps = caps.clone();
+        interp.register_builtin(
+            "svg_to_png",
+            -1,
+            Rc::new(move |_i, a, _l| {
+                let loader = make_loader(&caps, "svg_to_png()");
+                svg_to_png_with(a, Some(&loader))
+            }),
+        );
+    }
+    interp.register_builtin(
+        "svg_to_pdf",
+        -1,
+        Rc::new(move |_i, a, _l| {
+            let loader = make_loader(&caps, "svg_to_pdf()");
+            svg_to_pdf_with(a, Some(&loader))
+        }),
+    );
 }
 
 #[cfg(test)]

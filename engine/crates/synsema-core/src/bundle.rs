@@ -48,6 +48,10 @@ pub struct Manifest {
     /// Los flags de despliegue de `synsema serve` horneados con `--serve` (`--bind` es
     /// obligatorio: un distribuible no adivina en qué interfaz escucha).
     pub serve: Option<ServeSettings>,
+    /// v0.6.20 — `--audit` horneado por `synsema build` (misma sintaxis que el flag:
+    /// `json` | `<ruta>` | `fd:N` | `unix:<ruta>`). Ausente en el JSON = sin audit, así un
+    /// bundle anterior se lee igual y uno sin `--audit` no cambia ni un byte.
+    pub audit: Option<String>,
 }
 
 /// Modo de ejecución del binario construido.
@@ -143,6 +147,9 @@ impl Manifest {
         if let Some(s) = &self.serve {
             m.insert("serve".into(), s.to_json());
         }
+        if let Some(a) = &self.audit {
+            m.insert("audit".into(), serde_json::Value::from(a.clone()));
+        }
         serde_json::Value::Object(m).to_string()
     }
 
@@ -182,6 +189,10 @@ impl Manifest {
         if mode == BundleMode::Serve && profile == "pure" {
             return Err("bundle manifest: a serve bundle cannot run under the pure profile".to_string());
         }
+        let audit = match v.get("audit") {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            _ => None,
+        };
         Ok(Manifest {
             format,
             engine: str_field("engine")?,
@@ -191,6 +202,7 @@ impl Manifest {
             built_at: v.get("built_at").and_then(|x| x.as_str()).unwrap_or("").to_string(),
             mode,
             serve,
+            audit,
         })
     }
 }
@@ -449,6 +461,7 @@ mod tests {
             built_at: "2026-08-30T00:00:00Z".into(),
             mode: BundleMode::Run,
             serve: None,
+            audit: None,
         }
     }
 
@@ -483,6 +496,19 @@ mod tests {
         assert!(Manifest::from_json(&no_bind).unwrap_err().contains("serve.bind is required"));
         let pure = j.replace("\"profile\":\"native\"", "\"profile\":\"pure\"");
         assert!(Manifest::from_json(&pure).unwrap_err().contains("pure profile"));
+    }
+
+    /// v0.6.20 — `audit` horneado: ausente = None (bundles anteriores), presente vuelve igual.
+    #[test]
+    fn manifest_audit_round_trip() {
+        let plain = manifest();
+        assert!(!plain.to_json().contains("\"audit\""));
+        assert_eq!(Manifest::from_json(&plain.to_json()).unwrap().audit, None);
+        let mut with = manifest();
+        with.audit = Some("fd:3".into());
+        let j = with.to_json();
+        assert!(j.contains("\"audit\":\"fd:3\""), "{}", j);
+        assert_eq!(Manifest::from_json(&j).unwrap(), with);
     }
 
     #[test]

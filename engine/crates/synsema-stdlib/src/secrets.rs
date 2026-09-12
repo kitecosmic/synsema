@@ -38,28 +38,108 @@ use synsema_core::types::{syn_bool, syn_bytes, syn_secret, syn_secret_bytes, syn
 /// se lee con `std::env::var` en cada resolución (precedencia §2.1, gana siempre).
 #[derive(Default)]
 pub struct EnvStore {
-    vars: HashMap<String, String>,
+    vars: std::cell::RefCell<HashMap<String, String>>,
+    /// v0.6.20 — de dónde salió el store, para poder RELEERLO cuando el host pide una
+    /// recarga (SIGHUP bajo `serve`). `Fixed` = un mapa dado (embebedor wasm, tests): no
+    /// hay archivo que releer.
+    origin: EnvOrigin,
+    /// Generación global vista la última vez; si cambió, `get()`/`keys()` releen primero.
+    generation: std::cell::Cell<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+enum EnvOrigin {
+    /// Sin `SYNSEMA_ENV_FILE`: `./.env` si existe (y si aparece después, también).
+    Default,
+    /// `SYNSEMA_ENV_FILE=<path>` o `from_file(path)`.
+    File(String),
+    /// Mapa fijo: nada que releer (el `Default` de `EnvStore`: vacío y fijo, como siempre).
+    #[default]
+    Fixed,
+}
+
+/// v0.6.20 — generación del `.env`: la sube `request_env_reload()` (el runtime, al recibir
+/// SIGHUP); cada `EnvStore` la compara en su próxima resolución y relee su archivo. El
+/// environ del proceso no participa: ya se lee en vivo en cada resolución.
+static ENV_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn env_generation() -> u64 {
+    ENV_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Pide a todos los stores del proceso que releen su `.env` en su próxima resolución.
+/// Devuelve la generación nueva. Un `secret` ya guardado en un `let` de arranque NO se
+/// renueva (es un valor, no una referencia): se documenta.
+pub fn request_env_reload() -> u64 {
+    ENV_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
+/// Lee y parsea un `.env`; si no se puede leer → warning y mapa vacío (no crashea).
+fn read_env_vars(path: &str) -> HashMap<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(c) => EnvStore::parse(&c).vars.into_inner(),
+        Err(e) => {
+            eprintln!("synsema: warning: cannot read env file '{}': {}", path, e);
+            HashMap::new()
+        }
+    }
+}
+
+fn default_env_vars() -> HashMap<String, String> {
+    if std::path::Path::new(".env").exists() {
+        read_env_vars(".env")
+    } else {
+        HashMap::new()
+    }
 }
 
 impl EnvStore {
     pub fn empty() -> Self {
-        Self { vars: HashMap::new() }
+        Self::with(HashMap::new(), EnvOrigin::Fixed)
+    }
+
+    fn with(vars: HashMap<String, String>, origin: EnvOrigin) -> Self {
+        Self {
+            vars: std::cell::RefCell::new(vars),
+            origin,
+            generation: std::cell::Cell::new(env_generation()),
+        }
+    }
+
+    /// v0.6.20 — si el host pidió una recarga desde la última vez, relee el archivo de
+    /// origen. Un store `Fixed` sólo actualiza la generación.
+    fn refresh_if_stale(&self) {
+        let g = env_generation();
+        if g == self.generation.get() {
+            return;
+        }
+        let fresh = match &self.origin {
+            EnvOrigin::Fixed => None,
+            EnvOrigin::File(p) => Some(read_env_vars(p)),
+            EnvOrigin::Default => Some(default_env_vars()),
+        };
+        if let Some(v) = fresh {
+            *self.vars.borrow_mut() = v;
+        }
+        self.generation.set(g);
     }
 
     /// Un store desde un mapa ya resuelto — el `env` que un host embebedor le pasa al
     /// intérprete wasm (reemplaza al `.env`: sin FS, sin environ de proceso).
     pub fn from_vars(vars: HashMap<String, String>) -> Self {
-        Self { vars }
+        Self::with(vars, EnvOrigin::Fixed)
     }
 
     pub fn get(&self, name: &str) -> Option<String> {
-        self.vars.get(name).cloned()
+        self.refresh_if_stale();
+        self.vars.borrow().get(name).cloned()
     }
 
     /// Los nombres cargados del `.env` (para que `run()`/`proc_spawn` no los filtren al
     /// entorno de un proceso hijo — son la "bóveda de secretos" del programa).
-    pub fn keys(&self) -> impl Iterator<Item = &String> {
-        self.vars.keys()
+    pub fn keys(&self) -> Vec<String> {
+        self.refresh_if_stale();
+        self.vars.borrow().keys().cloned().collect()
     }
 
     /// Carga el `.env` según el spec §2:
@@ -70,26 +150,15 @@ impl EnvStore {
         match std::env::var("SYNSEMA_ENV_FILE") {
             Ok(p) if p.is_empty() => EnvStore::empty(),
             Ok(p) => EnvStore::from_file(&p),
-            Err(_) => {
-                if std::path::Path::new(".env").exists() {
-                    EnvStore::from_file(".env")
-                } else {
-                    EnvStore::empty()
-                }
-            }
+            // Origen `Default`: si el `.env` aparece más tarde, una recarga lo toma.
+            Err(_) => Self::with(default_env_vars(), EnvOrigin::Default),
         }
     }
 
     /// Lee y parsea un archivo `.env`. Si no se puede leer → warning a stderr (no
     /// crashea: el programa puede igual resolver desde el environ o defaults).
     pub fn from_file(path: &str) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(c) => EnvStore::parse(&c),
-            Err(e) => {
-                eprintln!("synsema: warning: cannot read env file '{}': {}", path, e);
-                EnvStore::empty()
-            }
-        }
+        Self::with(read_env_vars(path), EnvOrigin::File(path.to_string()))
     }
 
     /// Parsea contenido dotenv minimalista: `KEY=VALUE` por línea; `#` comentario
@@ -118,7 +187,7 @@ impl EnvStore {
             let value = parse_value(&line[eq + 1..]);
             vars.insert(key.to_string(), value);
         }
-        Self { vars }
+        Self::with(vars, EnvOrigin::Fixed)
     }
 }
 
@@ -945,5 +1014,34 @@ mod tests {
             out.push(if n > 2 { A[(triple & 63) as usize] as char } else { '=' });
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod v0620_env_reload_tests {
+    use super::*;
+
+    /// §6.2 — un store con archivo relee al cambiar la generación; uno fijo no cambia.
+    #[test]
+    fn env_store_rereads_its_file_after_a_reload_request() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let p = std::env::temp_dir().join(format!("synsema-env-reload-{}-{}.env", std::process::id(), nanos));
+        let path = p.to_string_lossy().to_string();
+        std::fs::write(&p, "TOKEN=one\n").unwrap();
+        let store = EnvStore::from_file(&path);
+        assert_eq!(store.get("TOKEN").as_deref(), Some("one"));
+        std::fs::write(&p, "TOKEN=two\nEXTRA=x\n").unwrap();
+        // Sin pedido de recarga, el valor cargado se mantiene (nada relee a escondidas).
+        assert_eq!(store.get("TOKEN").as_deref(), Some("one"));
+        let fixed = EnvStore::from_vars([("TOKEN".to_string(), "fixed".to_string())].into_iter().collect());
+        let g = request_env_reload();
+        assert_eq!(env_generation(), g);
+        assert_eq!(store.get("TOKEN").as_deref(), Some("two"));
+        assert!(store.keys().contains(&"EXTRA".to_string()));
+        assert_eq!(fixed.get("TOKEN").as_deref(), Some("fixed"), "un mapa fijo no tiene archivo que releer");
+        let _ = std::fs::remove_file(&p);
     }
 }

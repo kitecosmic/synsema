@@ -25,7 +25,7 @@ use synsema_core::templates::{program_closure_with, template_closure};
 use crate::bundle_out::{self, EngineFormat};
 use crate::{icns, pe, HostFlags};
 
-const USAGE_BUILD: &str = "uso: synsema build <main.syn> -o <salida> [--include <archivo|dir|patrón>]... [--sandbox | --cap-set <list>] [--profile native|pure] [--engine-binary <ruta>] [--serve [--bind <addr>] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--secure]] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <nombre>] [--id <com.ejemplo.app>]]";
+const USAGE_BUILD: &str = "uso: synsema build <main.syn> -o <salida> [--include <archivo|dir|patrón>]... [--sandbox | --cap-set <list> | --deterministic] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--engine-binary <ruta>] [--serve [--bind <addr>] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--secure]] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <nombre>] [--id <com.ejemplo.app>]]";
 
 /// Los flags de escritorio (tanda escritorio, specs/build-serve-desktop.md §3.6–§3.9). Todos
 /// miran el FORMATO DEL MOTOR donante (PE / Mach-O / ELF), no el host que construye.
@@ -160,18 +160,25 @@ pub fn cmd_build(host: HostFlags) -> ExitCode {
         eprintln!("{}", USAGE_BUILD);
         return ExitCode::from(2);
     };
-    if host.audit.is_some() {
-        eprintln!("synsema build: --audit applies when the program runs, not to the build");
+    // v0.6.20 — `--audit` se HORNEA (como --cap-set/--profile): el binario emite el stream al
+    // correr. `--deterministic` = perfil puro + techo sólo stdout, y excluye a los demás.
+    if host.deterministic && (host.sandbox || host.cap_set.is_some() || matches!(host.profile.as_deref(), Some("native"))) {
+        eprintln!("synsema build: --deterministic already fixes the profile (pure) and the ceiling (stdout); drop --sandbox/--cap-set/--profile native");
         return ExitCode::from(2);
     }
-    let profile = host.profile.clone().unwrap_or_else(|| "native".to_string());
+    let profile = host
+        .profile
+        .clone()
+        .unwrap_or_else(|| if host.deterministic { "pure".to_string() } else { "native".to_string() });
     if synsema_runtime::host::Profile::parse(&profile).is_none() {
         eprintln!("synsema build: --profile must be 'native' or 'pure', got '{}'", profile);
         return ExitCode::from(2);
     }
     // El techo horneado se VALIDA acá con el mismo parser que `run` y se guarda como
     // texto (misma sintaxis) para que el manifest sea legible.
-    let ceiling_text: Option<String> = if host.sandbox {
+    let ceiling_text: Option<String> = if host.deterministic {
+        Some("stdout".to_string())
+    } else if host.sandbox {
         Some("sandbox".to_string())
     } else {
         host.cap_set.clone()
@@ -212,7 +219,7 @@ pub fn cmd_build(host: HostFlags) -> ExitCode {
         return ExitCode::from(2);
     }
 
-    match build(&main, &out, &includes, engine_binary.as_deref(), ceiling_text, &profile, serve_settings, &desktop) {
+    match build(&main, &out, &includes, engine_binary.as_deref(), ceiling_text, &profile, host.audit.clone(), serve_settings, &desktop) {
         Ok(r) => {
             let mut how: Vec<String> = Vec::new();
             if let Some(s) = &r.serve {
@@ -302,6 +309,7 @@ fn build(
     engine_binary: Option<&str>,
     ceiling: Option<String>,
     profile: &str,
+    audit: Option<String>,
     mut serve: Option<ServeSettings>,
     desktop: &DesktopOptions,
 ) -> Result<BuildOutcome, String> {
@@ -436,6 +444,7 @@ fn build(
         built_at: chrono_now(),
         mode: if serve.is_some() { BundleMode::Serve } else { BundleMode::Run },
         serve: serve.clone(),
+        audit,
     };
     let n = entries.len();
     let b = Bundle::new(manifest, entries)?;

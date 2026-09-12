@@ -68,6 +68,8 @@ pub struct ApiRoute {
     pub streaming: bool,
     /// Ruta `socket` (WebSocket entrante).
     pub socket: bool,
+    /// v0.6.20 — `private`: se sirve, no se publica en los documentos generados.
+    pub private: bool,
     /// `(count, window_seconds)` efectivo, o `None` si no hay límite.
     pub rate_limit: Option<(i64, f64)>,
     /// `rate_limit unlimited` explícito (distinto de "sin límite declarado").
@@ -107,6 +109,7 @@ pub struct TaskSrc {
 pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     // red
     ("fetch", "net"), ("http", "net"), ("http_get", "net"), ("http_post", "net"),
+    ("http_bytes", "net"),
     ("http_put", "net"), ("http_delete", "net"), ("mtls_identity", "net"),
     ("ws_connect", "net"),
     ("push_send", "net"), // Web Push: el push service es un host más (tanda PWA)
@@ -133,12 +136,17 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     ("watch", "file.read"),
     ("term_open", "stdin"),
     ("write_file", "file.write"), ("edit_file", "file.write"), ("append_file", "file.write"),
+    // v0.6.20 — borrar bajo el MISMO scope que escribir (Tanda 2, secure.rs).
+    ("delete_file", "file.write"), ("delete_dir", "file.write"),
+    ("zip_extract", "file.write"), ("tar_extract", "file.write"),
+    ("zip_create", "file.read"), ("tar_create", "file.read"), ("cwd", "file.read"),
     ("run", "exec"), ("proc_spawn", "exec"),
     // tiempo y azar
     ("now", "time"), ("sleep", "time"), ("format_time", "time"), ("parse_time", "time"),
     ("date_parts", "time"),
     ("push_vapid_keys", "random"), // material secreto nuevo, como token()/random_bytes()
     ("random", "random"), ("random_int", "random"), ("random_bytes", "random"),
+    ("ecdh_keypair", "random"),
     ("token", "random"),
     // llm (las expresiones reason/decide/analyze/generate se detectan por nodo)
     ("llm_step", "llm"),
@@ -364,7 +372,7 @@ impl StaticProgram {
         let mut modules = HashMap::new();
         for stmt in &main.statements {
             if let NodeKind::UseImport { path, alias } = &stmt.kind {
-                let resolved = crate::templates::resolve_module_path(path, &base_dir)
+                let resolved = crate::templates::resolve_module_path(path, &base_dir, Some(&base_dir))
                     .map_err(|e| format!("{}: {}", file_path, e))?;
                 let src = match crate::bundle::get(&resolved) {
                     Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
@@ -427,7 +435,7 @@ fn static_route(
     block_rate: Option<(i64, f64)>,
     lookup: &dyn Fn(&str) -> Option<TaskSrc>,
 ) -> Option<ApiRoute> {
-    let NodeKind::RouteDefinition { method, path, param_names, requires_auth, streaming, socket, rate_limit, body, .. } = &r.kind
+    let NodeKind::RouteDefinition { method, path, param_names, requires_auth, streaming, socket, rate_limit, private, body, .. } = &r.kind
     else {
         return None;
     };
@@ -447,6 +455,7 @@ fn static_route(
         requires_auth: *requires_auth,
         streaming: *streaming,
         socket: *socket,
+        private: *private,
         rate_limit: rate,
         rate_unlimited: unlimited,
         proxy: body.len() == 1 && matches!(body[0].kind, NodeKind::ProxyStatement { .. }),

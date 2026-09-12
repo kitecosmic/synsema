@@ -289,6 +289,8 @@ pub fn register_run_program_builtin(interp: &Interpreter, caps: Rc<RefCell<Capab
                         "llm_tokens".into(),
                         syn_int(v.get("llm_tokens").and_then(|x| x.as_i64()).unwrap_or(0)),
                     );
+                    // v0.6.20 — pasos del intérprete hijo (contador determinista; ver `steps()`).
+                    r.insert("steps".into(), syn_int(v.get("steps").and_then(|x| x.as_i64()).unwrap_or(0)));
                 }
                 None => {
                     let msg = if timed_out {
@@ -314,6 +316,7 @@ pub fn register_run_program_builtin(interp: &Interpreter, caps: Rc<RefCell<Capab
                     );
                     r.insert("timed_out".into(), syn_bool(timed_out));
                     r.insert("llm_tokens".into(), syn_int(0));
+                    r.insert("steps".into(), syn_int(0));
                 }
             }
             Ok(syn_map(r))

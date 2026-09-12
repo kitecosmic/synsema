@@ -128,7 +128,11 @@ fn lexical_normalize(p: &Path) -> PathBuf {
 /// emite un prefijo `\\?\` que `realpath` no; rompería la paridad de cualquier
 /// path que aparezca en un error/ubicación). Los errores citan el path RAW
 /// (nunca el resuelto), para no filtrar formas de path divergentes.
-pub(crate) fn resolve_module_path(raw_path: &str, base_dir: &Path) -> Result<String, String> {
+pub(crate) fn resolve_module_path(
+    raw_path: &str,
+    base_dir: &Path,
+    project_root: Option<&Path>,
+) -> Result<String, String> {
     // Una ruta drive-absoluta O con `/`/`\` inicial (root-relativa) se rechaza. El
     // chequeo del slash inicial mantiene la decisión idéntica entre plataformas/impls
     // (os.path.isabs y Path::is_absolute difieren en "/x" en Windows).
@@ -146,11 +150,31 @@ pub(crate) fn resolve_module_path(raw_path: &str, base_dir: &Path) -> Result<Str
     }
     let base = lexical_normalize(base_dir);
     let target = lexical_normalize(&base.join(raw_path));
-    if target != base && !target.starts_with(&base) {
-        return Err(format!(
-            "module path escapes the importing directory: '{}'",
-            raw_path
-        ));
+    // v0.6.20 — el límite de contención es la RAÍZ DEL PROYECTO (dir de la entrada) cuando
+    // el host la conoce: `../` sube mientras el destino quede bajo esa raíz. Sin raíz
+    // (`<stdin>`, embebedores que no la fijan) rige el criterio v0.6.19: el dir del importador.
+    // Auditoría M3 — la CONTENCIÓN se decide sobre rutas absolutas (cwd + ruta), porque sobre
+    // rutas relativas un `..` de más se pierde al normalizar (`src/../../x` quedaba `x`, dentro
+    // de `.`); el string RESUELTO sigue siendo el léxico de siempre (paridad de ubicaciones).
+    let abs = |p: &Path| -> PathBuf {
+        if p.is_absolute() {
+            lexical_normalize(p)
+        } else {
+            lexical_normalize(&std::env::current_dir().map(|c| c.join(p)).unwrap_or_else(|_| p.to_path_buf()))
+        }
+    };
+    let abs_base = abs(base_dir);
+    let abs_target = abs(&base_dir.join(raw_path));
+    let abs_bound = match project_root {
+        Some(root) => abs(root),
+        None => abs_base.clone(),
+    };
+    if abs_target != abs_bound && !abs_target.starts_with(&abs_bound) {
+        // El texto histórico se conserva cuando el importador ES la raíz (la entrada): es el
+        // único caso del corpus de conformidad y ahí las dos cosas coinciden. "project root"
+        // sólo aparece cuando un módulo anidado sube por encima de la raíz del proyecto.
+        let what = if abs_bound == abs_base { "importing directory" } else { "project root" };
+        return Err(format!("module path escapes the {}: '{}'", what, raw_path));
     }
     let resolved = target.to_string_lossy().to_string();
     // Overlay del bundle (`synsema build`): el módulo puede vivir dentro del ejecutable.
@@ -166,6 +190,24 @@ pub(crate) fn resolve_module_path(raw_path: &str, base_dir: &Path) -> Result<Str
 enum Seg {
     Text(String),
     Hole(String, usize),
+}
+
+/// v0.6.20 — contenido crudo de un `{…}` que es un cuantificador regex: `n`, `n,`, `n,m`
+/// (dígitos ASCII, sin espacios en ningún lado). Con espacios es un hueco normal.
+fn is_regex_quantifier(raw: &str) -> bool {
+    if raw.is_empty() || raw.chars().any(|c| c.is_whitespace()) {
+        return false;
+    }
+    let mut parts = raw.splitn(2, ',');
+    let first = parts.next().unwrap_or("");
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(first) {
+        return false;
+    }
+    match parts.next() {
+        None => true,
+        Some(second) => second.is_empty() || digits(second),
+    }
 }
 
 enum TNode {
@@ -265,6 +307,16 @@ fn segments(src: &str, filename: &str) -> Result<Vec<Seg>, Control> {
                 return Err(terr(filename, hole_line, "unclosed '{' in template"));
             }
             let trimmed = content.trim().to_string();
+            // v0.6.20 — `{4}` / `{1,40}` / `{2,}`: un cuantificador de expresión regular (el
+            // `pattern=` de HTML), no un hueco. Nadie escribe `{4}` para renderizar el cuatro;
+            // `{ 4 }` con espacios sí sigue siendo un hueco (una expresión legítima).
+            if is_regex_quantifier(&content) {
+                buf.push('{');
+                buf.push_str(&content);
+                buf.push('}');
+                i = j + 1;
+                continue;
+            }
             if trimmed == "raw" {
                 // Bloque verbatim: buscar el `{ end }` y copiar todo lo intermedio tal cual.
                 let start = j + 1;
@@ -784,6 +836,27 @@ pub fn check_program_static_with(
     file_path: &str,
     load: ModuleLoader<'_>,
 ) -> Result<(usize, usize), String> {
+    check_program_static_inner(program, file_path, load, None).map(|(counts, _warnings)| counts)
+}
+
+/// v0.6.20 — raíz del proyecto para el check: el dir del archivo de entrada. Una entrada
+/// sin dir (`<stdin>`, `<test>`) no tiene raíz → rige el criterio del importador.
+fn project_root_of(entry: &str) -> Option<std::path::PathBuf> {
+    if entry.starts_with('<') {
+        return None;
+    }
+    let parent = Path::new(entry).parent()?;
+    Some(if parent.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { parent.to_path_buf() })
+}
+
+/// v0.6.20 — como `check_program_static_with`, y además devuelve los AVISOS: lo que corre
+/// pero sorprende (alias de `use` sombreado por un grupo o un `let`; una ruta `GET /:x` que
+/// taparía las URLs reservadas). Un aviso nunca falla el check.
+pub fn check_program_static_with_warnings(
+    program: &crate::ast::Program,
+    file_path: &str,
+    load: ModuleLoader<'_>,
+) -> Result<((usize, usize), Vec<String>), String> {
     check_program_static_inner(program, file_path, load, None)
 }
 
@@ -792,7 +865,7 @@ fn check_program_static_inner(
     file_path: &str,
     load: ModuleLoader<'_>,
     closure: Option<&mut (Vec<String>, Vec<String>)>,
-) -> Result<(usize, usize), String> {
+) -> Result<((usize, usize), Vec<String>), String> {
     fn scan(
         program: &crate::ast::Program,
         file_path: &str,
@@ -801,9 +874,80 @@ fn check_program_static_inner(
         stack: &mut Vec<String>,
         modules: &mut usize,
         templates_seen: &mut Vec<String>,
+        warnings: &mut Vec<String>,
         load: ModuleLoader<'_>,
     ) -> Result<(), String> {
         use crate::ast::NodeKind as NK;
+        // v0.6.20 — AVISOS (no errores): lo que corre pero sorprende.
+        // (a) `export routes <n>` o `let <n>` de nivel superior que repite un alias de `use`:
+        //     dentro de las rutas del grupo, `<n>.algo` resuelve al grupo, no al módulo.
+        {
+            let mut aliases: Vec<(String, usize)> = Vec::new();
+            for stmt in &program.statements {
+                if let NK::UseImport { alias, .. } = &stmt.kind {
+                    aliases.push((alias.clone(), stmt.location.line));
+                }
+            }
+            if !aliases.is_empty() {
+                let mut candidates: Vec<(&'static str, String, usize)> = Vec::new();
+                for stmt in &program.statements {
+                    if let NK::LetBinding { name, .. } = &stmt.kind {
+                        candidates.push(("let", name.clone(), stmt.location.line));
+                    }
+                    crate::ast_api::walk(stmt, &mut |n| {
+                        if let NK::RoutesDeclaration { name, .. } = &n.kind {
+                            candidates.push(("routes group", name.clone(), n.location.line));
+                        }
+                    });
+                }
+                for (kind, name, line) in candidates {
+                    if let Some((_, use_line)) = aliases.iter().find(|(a, _)| *a == name) {
+                        warnings.push(format!(
+                            "{}:{}: warning: {} '{}' shadows the module alias `use ... as {}` (line {}) — inside the group's routes `{}.x` resolves to the group, not the module; rename one of them",
+                            file_path, line, kind, name, name, use_line, name
+                        ));
+                    }
+                }
+            }
+        }
+        // (b) una ruta `GET /:x` de un segmento tapa las URLs reservadas del runtime; desde
+        //     v0.6.20 el runtime las sirve primero, y acá se dice para que el autor lo sepa.
+        if !is_module {
+            const RESERVED: [&str; 5] = ["/openapi.json", "/docs", "/llms.txt", "/sitemap.xml", "/robots.txt"];
+            for stmt in &program.statements {
+                if let NK::ServeBlock { routes, .. } = &stmt.kind {
+                    let literal_get: Vec<&str> = routes
+                        .iter()
+                        .filter_map(|r| match &r.kind {
+                            NK::RouteDefinition { method, path, param_names, .. }
+                                if method == "GET" && param_names.is_empty() =>
+                            {
+                                Some(path.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    for r in routes {
+                        if let NK::RouteDefinition { method, path, param_names, .. } = &r.kind {
+                            let one_segment_param = method == "GET"
+                                && param_names.len() == 1
+                                && path.starts_with("/:")
+                                && !path[1..].contains('/');
+                            if one_segment_param {
+                                let taken: Vec<&str> =
+                                    RESERVED.iter().copied().filter(|u| !literal_get.contains(u)).collect();
+                                if !taken.is_empty() {
+                                    warnings.push(format!(
+                                        "{}:{}: warning: route \"GET {}\" would capture {} — the runtime serves these reserved URLs before a parametric route (v0.6.20+); declare a literal route if you really mean to override one",
+                                        file_path, r.location.line, path, taken.join(", ")
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if is_module {
             for stmt in &program.statements {
                 match &stmt.kind {
@@ -823,34 +967,8 @@ fn check_program_static_inner(
                 }
             }
         }
-        // Lo que serve rechaza al arrancar sobre un grupo `export routes` se dice acá, en
-        // `check`, con el mismo mensaje: `stream` y `socket` no viajan por un grupo todavía
-        // (`rate_limit` y `timeout` por ruta sí, desde v0.6.19).
-        let mut group_error: Option<String> = None;
-        for stmt in &program.statements {
-            // `export routes` envuelve la declaración: se recorre todo el árbol.
-            crate::ast_api::walk(stmt, &mut |n| {
-                if let NK::RoutesDeclaration { routes, .. } = &n.kind {
-                    for r in routes {
-                        if let NK::RouteDefinition { streaming, socket, .. } = &r.kind {
-                            let unsupported = if *streaming {
-                                Some("a 'routes' group cannot contain 'stream' routes yet — declare streaming routes directly in the serve block")
-                            } else if *socket {
-                                Some("a 'routes' group cannot contain 'socket' routes yet — declare WebSocket routes directly in the serve block")
-                            } else {
-                                None
-                            };
-                            if let (Some(msg), None) = (unsupported, &group_error) {
-                                group_error = Some(format!("{}:{}:{}: {}", file_path, r.location.line, r.location.column, msg));
-                            }
-                        }
-                    }
-                }
-            });
-        }
-        if let Some(e) = group_error {
-            return Err(e);
-        }
+        // v0.6.20 — `stream`/`socket` dentro de un grupo `export routes` ya viajan en la meta y
+        // serve los monta como rutas directas: `check` no los rechaza más.
         let base_dir = Path::new(file_path)
             .parent()
             .map(|p| p.to_path_buf())
@@ -885,8 +1003,11 @@ fn check_program_static_inner(
                 })?;
             }
         }
+        // v0.6.20 — la raíz del proyecto es el dir de la ENTRADA (fondo del stack), no el del
+        // módulo que importa: `../` sube mientras quede bajo ella.
+        let project_root = project_root_of(stack.first().map(String::as_str).unwrap_or(file_path));
         for raw in uses {
-            let resolved = resolve_module_path(&raw, &base_dir)
+            let resolved = resolve_module_path(&raw, &base_dir, project_root.as_deref())
                 .map_err(|e| format!("{}: {}", file_path, e))?;
             if stack.contains(&resolved) {
                 return Err(format!(
@@ -901,7 +1022,7 @@ fn check_program_static_inner(
             *modules += 1;
             let prog = load(&resolved, &raw)?;
             stack.push(resolved.clone());
-            let r = scan(&prog, &resolved, true, seen, stack, modules, templates_seen, load);
+            let r = scan(&prog, &resolved, true, seen, stack, modules, templates_seen, warnings, load);
             stack.pop();
             r?;
         }
@@ -911,11 +1032,12 @@ fn check_program_static_inner(
     let mut stack = vec![file_path.to_string()];
     let mut modules = 0usize;
     let mut templates_seen = Vec::new();
-    scan(program, file_path, false, &mut seen, &mut stack, &mut modules, &mut templates_seen, load)?;
+    let mut warnings = Vec::new();
+    scan(program, file_path, false, &mut seen, &mut stack, &mut modules, &mut templates_seen, &mut warnings, load)?;
     if let Some(out) = closure {
         *out = (seen, templates_seen.clone());
     }
-    Ok((modules, templates_seen.len()))
+    Ok(((modules, templates_seen.len()), warnings))
 }
 
 /// `check_program_static_with` que además devuelve la CLAUSURA: los paths resueltos de
@@ -989,4 +1111,50 @@ fn validate_template_walk(path: &str, depth: usize, seen: &mut Vec<String>) -> R
         Ok(())
     }
     walk(path, depth, seen)
+}
+
+#[cfg(test)]
+mod v0620_tests {
+    use super::{is_regex_quantifier, segments, Seg};
+
+    /// §3.2 — `{4}`, `{1,40}`, `{2,}` son cuantificadores regex (literal); con espacios o con
+    /// cualquier otra cosa dentro son huecos.
+    #[test]
+    fn regex_quantifiers_are_recognized_only_when_bare() {
+        for q in ["4", "1,40", "2,", "0", "12,34"] {
+            assert!(is_regex_quantifier(q), "{:?}", q);
+        }
+        for h in ["", " 4 ", "4 ", " 4", "x", "4,x", ",5", "a,b", "4 , 5", "name", "1,2,3"] {
+            assert!(!is_regex_quantifier(h), "{:?}", h);
+        }
+    }
+
+    /// Auditoría M3 — con rutas RELATIVAS (cd proj && synsema run main.syn), subir dos niveles
+    /// desde `src/` escapa la raíz `.` aunque la normalización léxica relativa lo perdiera.
+    #[test]
+    fn module_containment_holds_for_relative_entry_paths() {
+        use std::path::Path;
+        let e = super::resolve_module_path("../../outside.syn", Path::new("src"), Some(Path::new("."))).unwrap_err();
+        assert!(e.contains("escapes the project root"), "{}", e);
+        let e = super::resolve_module_path("../outside.syn", Path::new("."), Some(Path::new("."))).unwrap_err();
+        assert!(e.contains("escapes the importing directory"), "{}", e);
+        let e = super::resolve_module_path("../../../etc/x.syn", Path::new("a/b"), None).unwrap_err();
+        assert!(e.contains("escapes the importing directory"), "{}", e);
+    }
+
+    #[test]
+    fn pattern_attribute_quantifiers_stay_literal_and_spaced_holes_still_open() {
+        let src = "<input pattern=\"[a-z0-9]{4}-?[a-z0-9]{1,40}\" name=\"{ field }\"> { 4 }";
+        let segs = segments(src, "t.html").unwrap_or_else(|_| panic!("segments falló"));
+        let mut text = String::new();
+        let mut holes: Vec<String> = Vec::new();
+        for s in segs {
+            match s {
+                Seg::Text(t) => text.push_str(&t),
+                Seg::Hole(h, _) => holes.push(h),
+            }
+        }
+        assert!(text.contains("[a-z0-9]{4}-?[a-z0-9]{1,40}"), "{}", text);
+        assert_eq!(holes, vec!["field".to_string(), "4".to_string()]);
+    }
 }

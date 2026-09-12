@@ -45,8 +45,10 @@ fn arg(args: &[SynValue], i: usize) -> Result<&SynValue, Control> {
 }
 
 /// Lectura servida desde el bundle (`synsema build`): el asset es PARTE del programa,
-/// así que no pide `file.read` — pero queda en el audit, con la razón explícita.
-fn bundled_audit(caps: &Rc<RefCell<CapabilitySet>>, ty: CapabilityType, path: &str, source: &str) {
+/// así que no pide `file.read` — pero queda en el audit, con la razón explícita. Pública
+/// para que cualquier builtin que lea un asset del bundle (el `from` de `zip_create`, las
+/// `fonts` de `svg_to_*`) deje la misma línea que `read_file`.
+pub fn bundled_audit(caps: &Rc<RefCell<CapabilitySet>>, ty: CapabilityType, path: &str, source: &str) {
     caps.borrow_mut().push_audit(CapabilityAuditEntry {
         capability: Capability::new(ty, Some(path.to_string())),
         granted: true,
@@ -66,6 +68,56 @@ fn reject_bundled_write(path: &str) -> Result<(), Control> {
         ))));
     }
     Ok(())
+}
+
+/// v0.6.20 — prefijos de espacio: `bundle:<ruta>` fuerza el bundle de `synsema build`;
+/// `disk:<ruta>` fuerza el disco aunque el bundle tenga esa ruta. Devuelve
+/// `(espacio, ruta normalizada sin el prefijo)`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Space {
+    Auto,
+    Bundle,
+    Disk,
+}
+
+fn bundle_prefix(raw: &str) -> (Space, String) {
+    if let Some(rest) = raw.strip_prefix("bundle:") {
+        (Space::Bundle, normalize_path(rest))
+    } else if let Some(rest) = raw.strip_prefix("disk:") {
+        (Space::Disk, normalize_path(rest))
+    } else {
+        (Space::Auto, normalize_path(raw))
+    }
+}
+
+/// v0.6.20 — de dónde se lee un archivo. Los assets del PROGRAMA (todo lo que `synsema build`
+/// empaquetó: módulos, plantillas y lo pasado con `--include`) se resuelven contra el BUNDLE,
+/// sin `file.read` (son el programa, no un recurso del host) y con su línea de audit: un
+/// archivo dejado en el cwd jamás los sombrea. Todo lo demás es un archivo del USUARIO y va
+/// al disco con `file.read`. `bundle:`/`disk:` fuerzan un espacio cuando una herramienta lo
+/// necesita. La separación de espacios es lo que arregla al CLI construido con `synsema
+/// build`: `list_dir` (abajo) lista SÓLO el disco.
+enum Located {
+    Disk(String),
+    Bundled(String, &'static [u8]),
+}
+
+fn locate_for_read(caps: &Rc<RefCell<CapabilitySet>>, raw: &str, source: &str) -> Result<Located, Control> {
+    let (space, path) = bundle_prefix(raw);
+    if space != Space::Disk {
+        if let Some(bytes) = synsema_core::bundle::get(&path) {
+            bundled_audit(caps, CapabilityType::FileRead, &path, source);
+            return Ok(Located::Bundled(path, bytes));
+        }
+        if space == Space::Bundle {
+            return Err(Control::Error(RuntimeError::new(format!(
+                "\"bundle:{}\" is not in the bundle (the program was not built with it, or the name differs)",
+                path
+            ))));
+        }
+    }
+    require(caps, Capability::new(CapabilityType::FileRead, Some(path.clone())), source)?;
+    Ok(Located::Disk(path))
 }
 
 /// Rango de líneas 1-based (EOL preservado) sobre un texto en memoria (bundle).
@@ -344,6 +396,10 @@ pub fn register_pure_fs(interp: &Interpreter, hint: &'static str) {
         }
         Ok(syn_map(m))
     }));
+    // v0.6.20 — borrar y `cwd()` no existen sin filesystem (ni sobre el bundle: es de sólo lectura).
+    for name in ["delete_file", "delete_dir", "cwd"] {
+        interp.register_builtin(name, -1, Rc::new(move |_i, _args, _loc| Err(no_fs(name, hint))));
+    }
     interp.register_builtin("list_dir", 1, Rc::new(move |_i, args, _loc| {
         let path = normalize_path(&raw_str(arg(args, 0)?));
         let Some(b) = synsema_core::bundle::mounted() else {
@@ -395,17 +451,12 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             "read_file",
             -1,
             Rc::new(move |_i, args, _loc| {
-                let path = normalize_path(&raw_str(arg(args, 0)?));
-                let bundled = synsema_core::bundle::get(&path);
-                if bundled.is_some() {
-                    bundled_audit(&caps, CapabilityType::FileRead, &path, "read_file()");
-                } else {
-                    require(
-                        &caps,
-                        Capability::new(CapabilityType::FileRead, Some(path.clone())),
-                        "read_file()",
-                    )?;
-                }
+                // v0.6.20 — assets del programa desde el bundle; archivos del usuario desde el disco
+                // (ver locate_for_read).
+                let (path, bundled) = match locate_for_read(&caps, &raw_str(arg(args, 0)?), "read_file()")? {
+                    Located::Disk(p) => (p, None),
+                    Located::Bundled(p, b) => (p, Some(b)),
+                };
                 // arity-1: archivo completo, idéntico a hoy (read_to_string estricto).
                 if args.len() < 2 {
                     if let Some(bytes) = bundled {
@@ -460,10 +511,25 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             "list_dir",
             1,
             Rc::new(move |_i, args, _loc| {
-                let path = normalize_path(&raw_str(arg(args, 0)?));
-                if let Some(b) = synsema_core::bundle::mounted() {
+                let (space, path) = bundle_prefix(&raw_str(arg(args, 0)?));
+                // v0.6.20 — el DISCO es el directorio; el bundle sólo con `bundle:` explícito
+                // (`list_dir("bundle:")` = su raíz). Antes el bundle sombreaba el cwd y un CLI
+                // construido con `synsema build` listaba sus propios assets en vez de la carpeta
+                // donde lo invocaron.
+                if space == Space::Bundle {
+                    let Some(b) = synsema_core::bundle::mounted() else {
+                        return Err(Control::Error(RuntimeError::new(
+                            "list_dir(\"bundle:…\"): this program has no bundle (it was not built with `synsema build`)",
+                        )));
+                    };
                     let under = b.list(&path);
-                    if !under.is_empty() {
+                    if under.is_empty() {
+                        return Err(Control::Error(RuntimeError::new(format!(
+                            "list_dir: \"bundle:{}\" is not a directory in the bundle",
+                            path
+                        ))));
+                    }
+                    {
                         bundled_audit(&caps, CapabilityType::FileRead, &path, "list_dir()");
                         let root = path.trim_matches(|c| c == '.' || c == '/' || c == '\\').is_empty();
                         let prefix_len = match synsema_core::bundle::normalize_name(&path) {
@@ -539,22 +605,18 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             "file_info",
             1,
             Rc::new(move |_i, args, _loc| {
-                let path = normalize_path(&raw_str(arg(args, 0)?));
-                if let Some(bytes) = synsema_core::bundle::get(&path) {
-                    bundled_audit(&caps, CapabilityType::FileRead, &path, "file_info()");
-                    let mut m = IndexMap::new();
-                    m.insert("exists".to_string(), syn_bool(true));
-                    m.insert("is_dir".to_string(), syn_bool(false));
-                    m.insert("size".to_string(), syn_int(bytes.len() as i64));
-                    m.insert("modified".to_string(), SynValue::Nothing);
-                    m.insert("bundled".to_string(), syn_bool(true));
-                    return Ok(syn_map(m));
-                }
-                require(
-                    &caps,
-                    Capability::new(CapabilityType::FileRead, Some(path.clone())),
-                    "file_info()",
-                )?;
+                let path = match locate_for_read(&caps, &raw_str(arg(args, 0)?), "file_info()")? {
+                    Located::Bundled(_, bytes) => {
+                        let mut m = IndexMap::new();
+                        m.insert("exists".to_string(), syn_bool(true));
+                        m.insert("is_dir".to_string(), syn_bool(false));
+                        m.insert("size".to_string(), syn_int(bytes.len() as i64));
+                        m.insert("modified".to_string(), SynValue::Nothing);
+                        m.insert("bundled".to_string(), syn_bool(true));
+                        return Ok(syn_map(m));
+                    }
+                    Located::Disk(p) => p,
+                };
                 let mut m = IndexMap::new();
                 match std::fs::metadata(&path) {
                     Ok(md) => {
@@ -592,17 +654,10 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             "file_exists",
             1,
             Rc::new(move |_i, args, _loc| {
-                let path = normalize_path(&raw_str(arg(args, 0)?));
-                if synsema_core::bundle::get(&path).is_some() {
-                    bundled_audit(&caps, CapabilityType::FileRead, &path, "file_exists()");
-                    return Ok(syn_bool(true));
+                match locate_for_read(&caps, &raw_str(arg(args, 0)?), "file_exists()")? {
+                    Located::Bundled(..) => Ok(syn_bool(true)),
+                    Located::Disk(path) => Ok(syn_bool(std::fs::metadata(&path).is_ok())),
                 }
-                require(
-                    &caps,
-                    Capability::new(CapabilityType::FileRead, Some(path.clone())),
-                    "file_exists()",
-                )?;
-                Ok(syn_bool(std::fs::metadata(&path).is_ok()))
             }),
         );
     }
@@ -617,19 +672,16 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             "grep",
             -1,
             Rc::new(move |_i, args, _loc| {
-                let target = normalize_path(&raw_str(arg(args, 0)?));
                 let pattern = raw_str(arg(args, 1)?);
-                if synsema_core::bundle::get(&target).is_some() {
-                    return Err(Control::Error(RuntimeError::new(format!(
-                        "grep: \"{}\" is a bundled asset — grep runs over the filesystem; use read_file() on it",
-                        target
-                    ))));
-                }
-                require(
-                    &caps,
-                    Capability::new(CapabilityType::FileRead, Some(target.clone())),
-                    "grep()",
-                )?;
+                let target = match locate_for_read(&caps, &raw_str(arg(args, 0)?), "grep()")? {
+                    Located::Bundled(p, _) => {
+                        return Err(Control::Error(RuntimeError::new(format!(
+                            "grep: \"{}\" is a bundled asset — grep runs over the filesystem; use read_file() on it",
+                            p
+                        ))))
+                    }
+                    Located::Disk(p) => p,
+                };
                 if pattern.is_empty() {
                     return Err(Control::Error(RuntimeError::new("grep: empty pattern")));
                 }
@@ -734,16 +786,10 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             "read_file_bytes",
             1,
             Rc::new(move |_i, args, _loc| {
-                let path = normalize_path(&raw_str(arg(args, 0)?));
-                if let Some(bytes) = synsema_core::bundle::get(&path) {
-                    bundled_audit(&caps, CapabilityType::FileRead, &path, "read_file_bytes()");
-                    return Ok(syn_bytes(bytes.to_vec()));
-                }
-                require(
-                    &caps,
-                    Capability::new(CapabilityType::FileRead, Some(path.clone())),
-                    "read_file_bytes()",
-                )?;
+                let path = match locate_for_read(&caps, &raw_str(arg(args, 0)?), "read_file_bytes()")? {
+                    Located::Bundled(_, bytes) => return Ok(syn_bytes(bytes.to_vec())),
+                    Located::Disk(p) => p,
+                };
                 match std::fs::read(&path) {
                     Ok(b) => Ok(syn_bytes(b)),
                     Err(_) => Err(Control::Error(RuntimeError::new(format!(
@@ -751,6 +797,147 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                         path
                     )))),
                 }
+            }),
+        );
+    }
+
+    // v0.6.20 — delete_file(path) → true. Requiere file_write("<path>"): el MISMO scope que
+    // escribir (quien puede crear puede deshacer). Un asset del bundle es de sólo lectura.
+    // Antes, borrar un archivo propio exigía `exec("rm")`: no tenerlo EMPEORABA la seguridad.
+    {
+        let caps = caps.clone();
+        interp.register_builtin(
+            "delete_file",
+            1,
+            Rc::new(move |_i, args, _loc| {
+                let path = normalize_path(&raw_str(arg(args, 0)?));
+                require(
+                    &caps,
+                    Capability::new(CapabilityType::FileWrite, Some(path.clone())),
+                    "delete_file()",
+                )?;
+                reject_bundled_write(&path)?;
+                match std::fs::metadata(&path) {
+                    Err(_) => Err(Control::Error(RuntimeError::new(format!("File not found: {}", path)))),
+                    Ok(md) if md.is_dir() => Err(Control::Error(RuntimeError::new(format!(
+                        "delete_file: \"{}\" is a directory (use delete_dir)",
+                        path
+                    )))),
+                    Ok(_) => std::fs::remove_file(&path).map(|_| syn_bool(true)).map_err(|e| {
+                        Control::Error(RuntimeError::new(format!("Cannot delete file {}: {}", path, e)))
+                    }),
+                }
+            }),
+        );
+    }
+
+    // v0.6.20 — delete_dir(path, opts?) → true. Sólo vacío por defecto; `{"recursive": true}`
+    // borra el árbol entero. Requiere file_write("<path>") (el scope debe cubrir el dir).
+    {
+        let caps = caps.clone();
+        interp.register_builtin(
+            "delete_dir",
+            -1,
+            Rc::new(move |_i, args, _loc| {
+                let path = normalize_path(&raw_str(arg(args, 0)?));
+                let recursive = match args.get(1) {
+                    None | Some(SynValue::Nothing) => false,
+                    Some(SynValue::Map(m)) => {
+                        for (k, v) in m.borrow().iter() {
+                            if k != "recursive" {
+                                return Err(Control::Error(RuntimeError::new(format!(
+                                    "delete_dir: unknown option {:?} (valid options: recursive)",
+                                    k
+                                ))));
+                            }
+                            if !matches!(v, SynValue::Bool(_)) {
+                                return Err(Control::Error(RuntimeError::new(
+                                    "delete_dir: option `recursive` must be true or false",
+                                )));
+                            }
+                        }
+                        matches!(m.borrow().get("recursive"), Some(SynValue::Bool(true)))
+                    }
+                    Some(other) => {
+                        return Err(Control::Error(RuntimeError::new(format!(
+                            "delete_dir: opts must be a map, got {}",
+                            other.type_name()
+                        ))))
+                    }
+                };
+                require(
+                    &caps,
+                    Capability::new(CapabilityType::FileWrite, Some(path.clone())),
+                    "delete_dir()",
+                )?;
+                reject_bundled_write(&path)?;
+                match std::fs::metadata(&path) {
+                    Err(_) => {
+                        return Err(Control::Error(RuntimeError::new(format!("Directory not found: {}", path))))
+                    }
+                    Ok(md) if !md.is_dir() => {
+                        return Err(Control::Error(RuntimeError::new(format!(
+                            "delete_dir: \"{}\" is a file (use delete_file)",
+                            path
+                        ))))
+                    }
+                    Ok(_) => {}
+                }
+                // Auditoría B3 — recursivo: `file.write` sobre CADA ruta del árbol antes de borrar
+                // nada (el mismo scope que exigiría borrarlas una a una).
+                if recursive {
+                    let mut stack = vec![std::path::PathBuf::from(&path)];
+                    let mut all: Vec<String> = Vec::new();
+                    while let Some(dir) = stack.pop() {
+                        let rd = std::fs::read_dir(&dir).map_err(|e| {
+                            Control::Error(RuntimeError::new(format!("Cannot read directory {}: {}", dir.display(), e)))
+                        })?;
+                        for e in rd.flatten() {
+                            let p = e.path();
+                            all.push(normalize_path(&p.to_string_lossy()));
+                            if e.file_type().map(|t| t.is_dir() && !t.is_symlink()).unwrap_or(false) {
+                                stack.push(p);
+                            }
+                        }
+                    }
+                    for p in &all {
+                        require(&caps, Capability::new(CapabilityType::FileWrite, Some(p.clone())), "delete_dir()")?;
+                    }
+                }
+                let result = if recursive { std::fs::remove_dir_all(&path) } else { std::fs::remove_dir(&path) };
+                match result {
+                    Ok(_) => Ok(syn_bool(true)),
+                    Err(e) if !recursive && e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                        Err(Control::Error(RuntimeError::new(format!(
+                            "delete_dir: \"{}\" is not empty (pass {{\"recursive\": true}} to delete its contents)",
+                            path
+                        ))))
+                    }
+                    Err(e) => Err(Control::Error(RuntimeError::new(format!(
+                        "Cannot delete directory {}: {}",
+                        path, e
+                    )))),
+                }
+            }),
+        );
+    }
+
+    // v0.6.20 — cwd() → el directorio de trabajo real, normalizado. Bajo `file.read(".")`:
+    // el nombre absoluto de `.` es información del host (bajo --sandbox no se filtra gratis) y
+    // es exactamente la misma grant que exige `list_dir(".")`; `file.read("./*")` y `"*"`
+    // también la cubren. Bajo un binario de `synsema build` es el cwd de verdad, nunca el
+    // overlay del bundle.
+    {
+        let caps = caps.clone();
+        interp.register_builtin(
+            "cwd",
+            0,
+            Rc::new(move |_i, _args, _loc| match std::env::current_dir() {
+                Ok(p) => {
+                    require(&caps, Capability::new(CapabilityType::FileRead, Some(".".to_string())), "cwd()")?;
+                    Ok(syn_text(normalize_path(&p.to_string_lossy())))
+                }
+                Err(e) => Err(Control::Error(RuntimeError::new(format!("cwd: {}", e)))),
             }),
         );
     }
@@ -1171,5 +1358,158 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 Ok(syn_int(rand::thread_rng().gen_range(lo..=hi)))
             }),
         );
+    }
+}
+
+#[cfg(test)]
+mod v0620_tests {
+    use super::*;
+    use synsema_core::parser::parse_source;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let d = std::env::temp_dir().join(format!("synsema-caps-v0620-{}-{}-{}", std::process::id(), tag, nanos));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn slash(p: &std::path::Path) -> String {
+        p.to_string_lossy().replace('\\', "/")
+    }
+
+    /// Corre un `.syn` con los builtins seguros y los grants dados; devuelve lo impreso.
+    fn run(grants: &[(CapabilityType, Option<String>)], src: &str) -> Result<Vec<String>, String> {
+        let mut interp = Interpreter::new();
+        let mut set = CapabilitySet::new("test");
+        for (ty, scope) in grants {
+            set.grant(Capability::new(ty.clone(), scope.clone()));
+        }
+        register_secure_builtins(&interp, Rc::new(RefCell::new(set)));
+        let program = parse_source(src, "<test>").map_err(|e| e.to_string())?;
+        match interp.execute(&program) {
+            Ok(_) => Ok(std::mem::take(&mut interp.output)),
+            Err(Control::Error(e)) => Err(e.to_string()),
+            Err(_) => Err("control flow escaped the program".to_string()),
+        }
+    }
+
+    #[test]
+    fn bundle_prefix_is_recognized_and_stripped() {
+        assert_eq!(bundle_prefix("bundle:data/x.json"), (Space::Bundle, "data/x.json".to_string()));
+        assert_eq!(bundle_prefix("bundle:./data/../x"), (Space::Bundle, "x".to_string()));
+        assert_eq!(bundle_prefix("disk:data/x.json"), (Space::Disk, "data/x.json".to_string()));
+        assert_eq!(bundle_prefix("data/x.json"), (Space::Auto, "data/x.json".to_string()));
+        assert_eq!(bundle_prefix("bundle:"), (Space::Bundle, ".".to_string()));
+    }
+
+    /// §4.1 — borrar bajo file.write: sin grant deniega; con grant borra; tipos y ausencias
+    /// se dicen con claridad.
+    #[test]
+    fn delete_file_requires_file_write_and_is_honest() {
+        let d = scratch("delete-file");
+        let f = d.join("a.txt");
+        std::fs::write(&f, "x").unwrap();
+        let scope = format!("{}/*", slash(&d));
+        let fp = slash(&f);
+        let denied = run(&[], &format!("print(delete_file(\"{}\"))", fp)).unwrap_err();
+        assert!(denied.contains("Capability not granted"), "{}", denied);
+        assert!(f.exists(), "sin grant no se toca nada");
+        let out = run(&[(CapabilityType::FileWrite, Some(scope.clone()))], &format!("print(delete_file(\"{}\"))", fp)).unwrap();
+        assert_eq!(out, vec!["true"]);
+        assert!(!f.exists());
+        let missing = run(&[(CapabilityType::FileWrite, Some(scope.clone()))], &format!("print(delete_file(\"{}\"))", fp)).unwrap_err();
+        assert!(missing.contains("File not found"), "{}", missing);
+        // El scope `<dir>/*` cubre lo que está DENTRO del dir (no el dir mismo): el caso "es un
+        // directorio" se prueba sobre un subdirectorio cubierto.
+        let sub = d.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let on_dir = run(&[(CapabilityType::FileWrite, Some(scope))], &format!("print(delete_file(\"{}\"))", slash(&sub))).unwrap_err();
+        assert!(on_dir.contains("is a directory"), "{}", on_dir);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn delete_dir_is_non_recursive_by_default() {
+        let d = scratch("delete-dir");
+        let sub = d.join("sub");
+        std::fs::create_dir_all(sub.join("deep")).unwrap();
+        std::fs::write(sub.join("deep").join("f.txt"), "x").unwrap();
+        let empty = d.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let scope = format!("{}/*", slash(&d));
+        let g = [(CapabilityType::FileWrite, Some(scope))];
+        assert_eq!(run(&g, &format!("print(delete_dir(\"{}\"))", slash(&empty))).unwrap(), vec!["true"]);
+        assert!(!empty.exists());
+        let not_empty = run(&g, &format!("print(delete_dir(\"{}\"))", slash(&sub))).unwrap_err();
+        assert!(not_empty.contains("is not empty"), "{}", not_empty);
+        assert!(sub.exists(), "sin recursive no se borra nada");
+        let bad_opt = run(&g, &format!("print(delete_dir(\"{}\", {{\"force\": true}}))", slash(&sub))).unwrap_err();
+        assert!(bad_opt.contains("unknown option"), "{}", bad_opt);
+        assert_eq!(run(&g, &format!("print(delete_dir(\"{}\", {{\"recursive\": true}}))", slash(&sub))).unwrap(), vec!["true"]);
+        assert!(!sub.exists());
+        let on_file = {
+            let f = d.join("f.txt");
+            std::fs::write(&f, "x").unwrap();
+            run(&g, &format!("print(delete_dir(\"{}\"))", slash(&f))).unwrap_err()
+        };
+        assert!(on_file.contains("is a file"), "{}", on_file);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// §4.2 — cwd() bajo `file.read(".")` (la misma grant que `list_dir(".")`): sin grant o
+    /// con una grant que no cubre `.` deniega; con `.`, `./*` o `*` la devuelve normalizada.
+    #[test]
+    fn cwd_requires_file_read_on_dot() {
+        let want = normalize_path(&std::env::current_dir().unwrap().to_string_lossy());
+        let denied = run(&[], "print(cwd())").unwrap_err();
+        assert!(denied.contains("Capability not granted"), "{}", denied);
+        let denied = run(&[(CapabilityType::FileRead, Some("./data/*".to_string()))], "print(cwd())").unwrap_err();
+        assert!(denied.contains("Capability not granted"), "{}", denied);
+        for scope in [".", "./*", "*"] {
+            assert_eq!(run(&[(CapabilityType::FileRead, Some(scope.to_string()))], "print(cwd())").unwrap(), vec![want.clone()], "scope {}", scope);
+        }
+    }
+
+    /// Auditoría B3 — borrar recursivo exige `file.write` sobre cada ruta del árbol.
+    #[test]
+    fn delete_dir_recursive_requires_file_write_on_every_path() {
+        let d = scratch("delete-tree-scope");
+        let tree = d.join("tree");
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        std::fs::write(tree.join("sub").join("f.txt"), "x").unwrap();
+        // Scope exacto sobre el dir raíz: cubre borrarlo a él, no a lo que tiene adentro.
+        let exact = [(CapabilityType::FileWrite, Some(slash(&tree)))];
+        let e = run(&exact, &format!("print(delete_dir(\"{}\", {{\"recursive\": true}}))", slash(&tree))).unwrap_err();
+        assert!(e.contains("Capability not granted"), "{}", e);
+        assert!(tree.join("sub").join("f.txt").exists(), "nada borrado");
+        let wide = [(CapabilityType::FileWrite, Some(format!("{}/*", slash(&d))))];
+        assert_eq!(run(&wide, &format!("print(delete_dir(\"{}\", {{\"recursive\": true}}))", slash(&tree))).unwrap(), vec!["true"]);
+        assert!(!tree.exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// §4.4 — sin bundle montado: el disco manda y `bundle:` explícito falla claro.
+    #[test]
+    fn user_files_go_to_disk_and_explicit_bundle_prefix_without_a_bundle() {
+        let d = scratch("disk-first");
+        let f = d.join("data.txt");
+        std::fs::write(&f, "hola").unwrap();
+        let g = [(CapabilityType::FileRead, Some(format!("{}/*", slash(&d))))];
+        assert_eq!(run(&g, &format!("print(read_file(\"{}\"))", slash(&f))).unwrap(), vec!["hola"]);
+        assert_eq!(run(&g, &format!("print(file_exists(\"{}\"))", slash(&f))).unwrap(), vec!["true"]);
+        let e = run(&g, &format!("print(read_file(\"bundle:{}\"))", slash(&f))).unwrap_err();
+        assert!(e.contains("is not in the bundle"), "{}", e);
+        let e = run(&g, "print(list_dir(\"bundle:\"))").unwrap_err();
+        assert!(e.contains("has no bundle"), "{}", e);
+        // list_dir sobre el disco sigue igual (sobre un subdir cubierto por el scope `<dir>/*`).
+        let sub = d.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("one.txt"), "1").unwrap();
+        let out = run(&g, &format!("print(length(list_dir(\"{}\")))", slash(&sub))).unwrap();
+        assert_eq!(out, vec!["1"]);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

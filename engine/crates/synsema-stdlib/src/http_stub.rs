@@ -66,6 +66,19 @@ pub fn http_request(
     via_host(method, &full, headers, body.map(str::as_bytes), timeout_secs)
 }
 
+/// v0.6.20 — transporte de los builtins cliente (body en bytes), vía el host.
+fn host_transport(
+    method: &str,
+    url: &str,
+    headers: Option<&[(String, String)]>,
+    query: Option<&[(String, String)]>,
+    body: Option<&[u8]>,
+    timeout_secs: u64,
+) -> HttpResult {
+    let full = url_with_query(url, query);
+    via_host(method, &full, headers, body, timeout_secs)
+}
+
 pub(crate) fn http_request_body_bytes(
     method: &str,
     url: &str,
@@ -80,5 +93,5 @@ pub(crate) fn http_request_body_bytes(
 /// `fetch`) sobre el transporte del host. Sin `mtls_identity` (identidad TLS del
 /// proceso: no hay proceso ni TLS propio en este perfil).
 pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
-    register_http_client_builtins(interp, caps, http_request);
+    register_http_client_builtins(interp, caps, host_transport);
 }

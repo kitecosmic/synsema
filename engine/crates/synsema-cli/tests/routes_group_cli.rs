@@ -1,6 +1,7 @@
-//! Grupos `export routes` (v0.6.19): `rate_limit` y `timeout` por ruta viajan con el grupo y
-//! `synsema check` rechaza ESTÁTICAMENTE lo que serve rechazaría al arrancar (`stream`/`socket`
-//! dentro de un grupo), con el mismo mensaje — nada de "OK" en check y error en producción.
+//! Grupos `export routes`: `rate_limit` y `timeout` por ruta viajan con el grupo (v0.6.19) y,
+//! desde v0.6.20, también `stream`/`socket` (serve los monta como rutas directas): `synsema check`
+//! los acepta, y además AVISA (exit 0) lo que corre pero sorprende: un alias de `use` sombreado
+//! y una ruta `GET /:x` que taparía las URLs reservadas del runtime.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -45,22 +46,60 @@ fn check_accepts_rate_limit_and_timeout_inside_a_routes_group() {
 }
 
 #[test]
-fn check_rejects_stream_and_socket_inside_a_routes_group_like_serve_does() {
+fn check_accepts_stream_and_socket_inside_a_routes_group_since_0_6_20() {
+    // v0.6.20 — `stream`/`socket` viajan por el grupo y serve los monta: `check` ya no los rechaza.
     let dir = project(
         "socket",
         "export routes routes\n    route \"GET /ws\"\n        socket\n            give 1\n",
     );
-    let (code, _, err) = synsema(&dir, &["check", "app.syn"]);
-    assert_eq!(code, 1, "{}", err);
-    assert!(err.contains("routes.syn:2:5: a 'routes' group cannot contain 'socket' routes yet"), "{}", err);
-
+    let (code, out, err) = synsema(&dir, &["check", "app.syn"]);
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("1 module(s) validated"), "{}", out);
     let dir2 = project(
         "stream",
         "export routes routes\n    route \"GET /events\"\n        stream\n            send \"x\"\n",
     );
-    let (code, _, err) = synsema(&dir2, &["check", "app.syn"]);
-    assert_eq!(code, 1, "{}", err);
-    assert!(err.contains("a 'routes' group cannot contain 'stream' routes yet"), "{}", err);
+    let (code, out, err) = synsema(&dir2, &["check", "app.syn"]);
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.contains("1 module(s) validated"), "{}", out);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&dir2);
+}
+
+/// v0.6.20 — `check` avisa (exit 0) cuando un `let` sombrea un alias de `use` y cuando una ruta
+/// `GET /:x` de un segmento taparía las URLs reservadas del runtime.
+/// Auditoría M2 — `synsema openapi` (offline, sin levantar el server) publica LO MISMO que el
+/// servidor: una ruta `private` (directa o heredada del grupo) no aparece en el documento.
+#[test]
+fn openapi_offline_omits_private_routes_like_the_server_does() {
+    let dir = project(
+        "openapi-private",
+        "export routes routes\n    route \"GET /public\"\n        give ok(1)\n    route \"GET /admin/only\"\n        private\n        give ok(2)\n",
+    );
+    std::fs::write(
+        dir.join("app.syn"),
+        "require serve(8080)\nuse \"./routes.syn\" as api\n\nserve on 8080\n    mount api.routes\n    route \"GET /direct\"\n        give 1\n    route \"GET /direct/secret\"\n        private\n        give 2\n",
+    )
+    .unwrap();
+    let (code, out, err) = synsema(&dir, &["openapi", "app.syn"]);
+    assert_eq!(code, 0, "stdout: {}\nstderr: {}", out, err);
+    assert!(out.contains("\"/public\"") && out.contains("\"/direct\""), "{}", out);
+    assert!(!out.contains("/admin/only"), "la ruta private del grupo no se publica: {}", out);
+    assert!(!out.contains("/direct/secret"), "la ruta private directa no se publica: {}", out);
+}
+
+#[test]
+fn check_prints_warnings_for_alias_shadowing_and_reserved_urls() {
+    let dir = project("warn", "export routes routes\n    route \"GET /x\"\n        give 1\n");
+    std::fs::write(
+        dir.join("app.syn"),
+        "require serve(8080)\nuse \"./routes.syn\" as api\nlet api be 1\n\nserve on 8080\n    route \"GET /:lang\"\n        give 1\n    mount api.routes\n",
+    )
+    .unwrap();
+    let (code, out, err) = synsema(&dir, &["check", "app.syn"]);
+    assert_eq!(code, 0, "{}", err);
+    assert!(out.starts_with("OK:"), "{}", out);
+    assert!(err.contains("let 'api' shadows the module alias"), "{}", err);
+    assert!(err.contains("would capture /openapi.json"), "{}", err);
+    let _ = std::fs::remove_dir_all(&dir);
 }

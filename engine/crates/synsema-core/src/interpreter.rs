@@ -517,6 +517,15 @@ pub struct Interpreter {
     /// todo el argv en un binario `synsema build`. Datos que el invocador escribió para
     /// ESTE programa — sin capability (no es un recurso del host).
     program_args: Vec<String>,
+    /// v0.6.20 — contador de pasos: un incremento por nodo que pasa por `exec`. Determinista
+    /// por construcción (cuenta trabajo del intérprete, no tiempo). Lo expone `steps()` (sin
+    /// capability: introspección, como `llm_usage()`); el runtime y el wasm lo reportan.
+    steps: u64,
+    /// v0.6.20 — raíz del proyecto: el directorio del archivo de ENTRADA, límite de contención
+    /// de `use "../x.syn"`. La fija el host (`set_project_root`) o, si no, se captura del primer
+    /// `use` que se ejecuta (siempre el top-level de la entrada). `None` = criterio v0.6.19
+    /// (el directorio del importador).
+    project_root: Option<std::path::PathBuf>,
     /// Gate de `stdout` (lo cablea el motor con el CapabilitySet): se consulta UNA vez
     /// por intérprete en el primer `print`/`show`/`log` y el veredicto se memoiza —
     /// el techo del host (`--cap-set` sin `stdout`) manda también sobre la salida.
@@ -596,6 +605,8 @@ impl Interpreter {
             exports_collector: vec![Vec::new()],
             live_output: false,
             program_args: Vec::new(),
+            steps: 0,
+            project_root: None,
             stdout_hook: None,
             stdout_verdict: None,
             template_read_hook: None,
@@ -608,6 +619,16 @@ impl Interpreter {
     /// Fija los argumentos del programa (`args()`).
     pub fn set_program_args(&mut self, args: Vec<String>) {
         self.program_args = args;
+    }
+
+    /// v0.6.20 — raíz del proyecto para `use "../"` (el host la conoce: dir de la entrada).
+    pub fn set_project_root(&mut self, root: std::path::PathBuf) {
+        self.project_root = Some(root);
+    }
+
+    /// v0.6.20 — pasos ejecutados hasta ahora (nodos que pasaron por `exec`).
+    pub fn steps(&self) -> u64 {
+        self.steps
     }
 
     /// Instala el gate de `stdout` (el motor lo cablea al CapabilitySet).
@@ -985,7 +1006,14 @@ impl Interpreter {
     /// el módulo es un `SynValue::Map`.
     fn load_module(&mut self, raw_path: &str, importer_file: &str) -> Result<SynValue, Control> {
         let base_dir = Path::new(importer_file).parent().unwrap_or_else(|| Path::new("."));
-        let resolved = resolve_module_path(raw_path, base_dir).map_err(err)?;
+        // v0.6.20 — la raíz del proyecto acota `../`: la fijó el host o se captura acá, en el
+        // primer `use` (siempre el top-level de la entrada; los `use` de un módulo corren
+        // DENTRO de ese primero). `<stdin>`/`<test>` sin dir → sin raíz → criterio v0.6.19.
+        if self.project_root.is_none() && !importer_file.starts_with('<') {
+            let root = if base_dir.as_os_str().is_empty() { Path::new(".") } else { base_dir };
+            self.project_root = Some(root.to_path_buf());
+        }
+        let resolved = resolve_module_path(raw_path, base_dir, self.project_root.as_deref()).map_err(err)?;
 
         if self.loading_modules.contains(&resolved) {
             return Err(err(format!(
@@ -1188,6 +1216,9 @@ impl Interpreter {
         // familia): el dual-order existe para honrar un accidente histórico, no para lo
         // nuevo (y evita la ambigüedad real de index_of(lista_de_listas, sublista)).
         self.register("unique", 1, Rc::new(|i, a, l| i.b_unique(a, l)));
+        // v0.6.20 — `reverse(lista|texto)`; `steps()` (introspección, sin capability).
+        self.register("reverse", 1, Rc::new(|i, a, l| i.b_reverse(a, l)));
+        self.register("steps", 0, Rc::new(|i, _a, _l| Ok(SynValue::Number(Number::Int(i.steps as i64)))));
         self.register("index_of", 2, Rc::new(|i, a, l| i.b_index_of(a, l)));
 
         // -- Librería matemática (math.rs) — funciones puras sobre Number.
@@ -1688,6 +1719,8 @@ impl Interpreter {
     }
 
     fn exec(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        // v0.6.20 — un paso por nodo; `wrapping_add`: contar jamás puede ser un pánico.
+        self.steps = self.steps.wrapping_add(1);
         let loc = &node.location;
         match &node.kind {
             // -- Literales --
@@ -2051,21 +2084,12 @@ impl Interpreter {
                         socket,
                         rate_limit,
                         timeout,
+                        private,
                         body,
                     } = &r.kind
                     {
-                        if *streaming {
-                            return Err(err_at(
-                                "a 'routes' group cannot contain 'stream' routes yet — declare streaming routes directly in the serve block",
-                                &r.location,
-                            ));
-                        }
-                        if *socket {
-                            return Err(err_at(
-                                "a 'routes' group cannot contain 'socket' routes yet — declare WebSocket routes directly in the serve block",
-                                &r.location,
-                            ));
-                        }
+                        // v0.6.20 — `stream`/`socket` ya viajan por el grupo (clase en la meta);
+                        // serve los monta como rutas directas.
                         // `rate_limit` y `timeout` por ruta viajan en la meta: se evalúan acá, una
                         // vez, con el env del módulo (misma regla que una ruta directa: la
                         // expresión se evalúa al arrancar), y serve los aplica al montar.
@@ -2128,6 +2152,12 @@ impl Interpreter {
                         mm.insert("method".to_string(), syn_text(method.as_str()));
                         mm.insert("path".to_string(), syn_text(path.as_str()));
                         mm.insert("requires_auth".to_string(), syn_bool(*requires_auth));
+                        // v0.6.20 — `private` (fuera de los documentos generados) y la clase de
+                        // ruta (`stream`/`socket`) viajan en la meta para que serve las monte
+                        // exactamente como una ruta directa.
+                        mm.insert("private".to_string(), syn_bool(*private));
+                        mm.insert("streaming".to_string(), syn_bool(*streaming));
+                        mm.insert("socket".to_string(), syn_bool(*socket));
                         mm.insert(
                             "params".to_string(),
                             syn_list(param_names.iter().map(|p| syn_text(p.as_str())).collect()),
@@ -2684,6 +2714,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             // task, del top-level) — se dice, no se ignora en silencio.
             NodeKind::TimeoutClause { .. } => Err(err_at(
                 "'timeout' is a clause of the serve block or of a route body (top level: `timeout 30` | `timeout none`), not a statement",
+                loc,
+            )),
+            NodeKind::PrivateClause => Err(err_at(
+                "'private' is a clause of the serve block, of a route body or of a 'routes' group (a line with just `private`), not a statement",
                 loc,
             )),
             NodeKind::ProxyStatement { .. } => {
@@ -3660,7 +3694,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let text = raw_str(nth(args, 0)?);
         let sep = raw_str(nth(args, 1)?);
         if sep.is_empty() {
-            return Err(err("empty separator"));
+            // v0.6.20 — separador vacío = los caracteres del texto (scalars Unicode), como
+            // JS y como el rodeo `slice(t, i, i + 1)` que todo el mundo escribía.
+            let chars: Vec<SynValue> = text.chars().map(|c| syn_text(c.to_string())).collect();
+            return Ok(syn_list(chars));
         }
         let parts: Vec<SynValue> = text.split(&sep).map(syn_text).collect();
         Ok(syn_list(parts))
@@ -4294,6 +4331,19 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// igualdad es la estructural del lenguaje (`syn_equals`, la misma de `==`/
     /// `contains`) — NO se reimplementa. O(n²) a propósito: hashear divergiría de la
     /// igualdad estructural (maps/listas anidadas, números cross-repr).
+    /// v0.6.20 — `reverse(lista)` → lista al revés; `reverse(texto)` → texto al revés por
+    /// scalar Unicode (no grapheme-aware, mismo criterio que `slice`). Valor nuevo, el
+    /// original no se toca (como `append` y toda la familia).
+    fn b_reverse(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        match nth(args, 0)? {
+            SynValue::Text(s) => Ok(syn_text(s.chars().rev().collect::<String>())),
+            other => {
+                let items = self.list_arg(other, "reverse")?;
+                Ok(syn_list(items.into_iter().rev().collect()))
+            }
+        }
+    }
+
     fn b_unique(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
         let items = self.list_arg(nth(args, 0)?, "unique")?;
         let mut out: Vec<SynValue> = Vec::with_capacity(items.len());

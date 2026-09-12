@@ -409,7 +409,7 @@ pub(crate) fn wire_common_with_state(
         let mut sensitive: std::collections::HashSet<String> =
             crate::llm_providers::LLM_ENV_VARS.iter().map(|s| s.to_string()).collect();
         sensitive.extend(crate::llm_providers::HUMAN_ENV_VARS.iter().map(|s| s.to_string()));
-        sensitive.extend(env_store.keys().cloned());
+        sensitive.extend(env_store.keys());
         interp.set_sensitive_env(sensitive);
     }
     register_secret_builtins(interp, caps.clone(), env_store);
@@ -478,6 +478,13 @@ pub(crate) fn wire_common_with_state(
     synsema_stdlib::server::register_serve_builtins(interp);
     // A1 concurrencia (Fase 1): parallel_map + chunk. El ctx de memoria declarada viaja
     // a los workers (comparten los mismos stores; sus caps heredadas traen el grant).
+    // v0.6.20 — módulos nuevos de la stdlib + raster con fuentes propias (DESPUÉS de
+    // register_serve_builtins: la última registración por nombre gana).
+    synsema_stdlib::xml::register_xml_builtins(interp);
+    synsema_stdlib::toml_fmt::register_toml_builtins(interp);
+    synsema_stdlib::crypto::register_crypto_builtins(interp, caps.clone());
+    synsema_stdlib::archive::register_archive_builtins(interp, caps.clone());
+    synsema_stdlib::raster::register_raster_builtins_with_caps(interp, caps.clone());
     crate::parallel::register_parallel_builtins(interp, caps, secure, mem);
     // render real (sobrescribe el placeholder de core): SSR de templates → raw response.
     interp.register_builtin(
@@ -640,6 +647,9 @@ pub(crate) fn wire_common_with_state(
     if crate::host::profile() == crate::host::Profile::Pure {
         synsema_stdlib::pure::register_os_stubs(interp, synsema_stdlib::pure::NATIVE_HINT);
         synsema_stdlib::pure::register_no_fs_stubs(interp, synsema_stdlib::pure::NATIVE_HINT);
+        // v0.6.20 — en puro, `svg_to_*` vuelve a la variante sin acceso a archivos
+        // (`opts.fonts` falla claro en vez de leer disco).
+        synsema_stdlib::raster::register_raster_builtins(interp);
     }
 }
 
@@ -658,8 +668,10 @@ pub(crate) fn wire_real_llm_provider(interp: &mut Interpreter) {
     // `load_default` lee `SYNSEMA_ENV_FILE`/`.env` (idempotente; honra `--env-file` y
     // `--no-env-file`). El environ del proceso sigue ganando sobre el `.env`.
     let store = EnvStore::load_default();
-    let provider = match crate::llm_providers::provider_from_config(&store) {
-        Some(p) => p,
+    // v0.6.20 — envuelto en `ReloadingProvider`: un SIGHUP (recarga del .env) reconstruye el
+    // provider real con la clave nueva sin reiniciar el proceso.
+    let provider: Arc<dyn LLMProvider> = match crate::llm_providers::provider_from_config(&store) {
+        Some(p) => Arc::new(crate::llm_providers::ReloadingProvider::new(p)),
         None => return,
     };
     // llm_usage(): tokens LLM acumulados del proceso (F-A). Se cablea junto al
@@ -844,6 +856,7 @@ fn run_inner(
             // La persistencia es on-write (el ctx guarda tras cada mutación, como serve):
             // no hay save final que pueda perderse si el programa crashea a mitad.
             let r = interp.execute(&program);
+            note_run_steps(interp.steps());
             finish(interp, r)
         }
     }
@@ -870,6 +883,18 @@ fn spawn_run_ceiled(source: &str, filename: &str, secure: bool, ceiling: Option<
 
 /// Modo no-secure (default real): auto-concede STDOUT y TIME. Lo que usa `conform`.
 /// Camino de un solo hilo: `spawn` corre el agente in-process (sin swarm).
+/// v0.6.20 — pasos del intérprete del ÚLTIMO programa ejecutado en este proceso (`run`,
+/// `test`, `conform`): lo que `run --format json` reporta como `steps`. Determinista.
+static LAST_RUN_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_run_steps(steps: u64) {
+    LAST_RUN_STEPS.store(steps, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn last_run_steps() -> u64 {
+    LAST_RUN_STEPS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub fn run_source(source: &str, filename: &str) -> RunResult {
     spawn_run(source, filename, false)
 }
@@ -1277,6 +1302,7 @@ fn run_configured(source: &str, filename: &str, configure: impl FnOnce(&mut Inte
             wire_common(&mut interp, &caps, false, mem_ctx.as_ref(), &suggested_memory_name(filename));
             configure(&mut interp);
             let r = interp.execute(&program);
+            note_run_steps(interp.steps());
             finish(interp, r)
         }
     }
@@ -1760,6 +1786,7 @@ fn run_swarm_inner(
             };
             let mut interp = setup_swarm_interpreter(swarm, "main", ceiling, mem_ctx, false);
             let r = interp.execute(&program);
+            note_run_steps(interp.steps());
             finish(interp, r)
         }
     }
