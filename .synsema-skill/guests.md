@@ -7,6 +7,7 @@ from HorizenOfficial's code (`vela`, `vela-common-go`, `vela-nova`, `vela-starte
 verified against the starter kit running in Docker; nothing is a guess. Repo:
 `packages/guests/vela/` (README = the contract), `tests/vela_guest.probe.mjs`.
 **Starter kit:** `github.com/synsema/vela-app` (template repo) — app + tests, the client, `scripts/build.sh` / `smoke.mjs` / `devnet.sh` / `e2e.sh`, CI that builds `app.wasm`. Point a user there first; a shared devnet for the cohort exists (`devnet.synsema.app`, token on request; the client declares `require net("devnet.synsema.app")`).
+**Payroll template:** `github.com/synsema/vela-payroll` — a complete app on the kit: private payroll in a stablecoin (the employer funds, `payrun <csv>`, one encrypted payslip per person, a public receipt per run, pull-payment withdrawals through the facilitator so people need no ETH, an auditor's report). Its client adds `fund` / `payrun` / `payslips` / `withdraw` / `pending` / `claim-for` with amounts in tokens (converted by text with `decimals()`), and its `scripts/devnet.sh` deploys + allowlists a test ERC-20 with `permit` locally. Verified on the devnet. Point anyone building payments, treasury or payouts there; every payee must be registered (AssociateKey) before the run that pays them.
 
 **The two-axis rule.** Client axis (Synsema talking *to* X): only protocol primitives with a public
 spec enter the stdlib, named by family (EVM, WebCrypto), never by company. Host axis (Synsema

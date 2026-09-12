@@ -48,6 +48,13 @@ its tests, the client, `scripts/build.sh` (clones this repo at a release tag and
 app embedded), `scripts/smoke.mjs`, `scripts/devnet.sh` (Horizen's starter kit in Docker) and `scripts/e2e.sh`,
 plus a CI workflow that builds `app.wasm` for teams without Rust.
 
+[`synsema/vela-payroll`](https://github.com/synsema/vela-payroll) is a complete app built on the kit: private payroll in a
+stablecoin — pay runs from a CSV, one encrypted payslip per person, a public receipt per run, pull-payment withdrawals
+through the facilitator (people need no ETH), an auditor's report. Its client adds `fund`, `payrun`, `payslips`,
+`withdraw`, `pending` and `claim-for` with amounts in tokens, and its `scripts/devnet.sh` deploys and allowlists the
+test ERC-20 from `examples/erc20/` locally. Verified end to end on the shared devnet. Both kits are recipes in
+[`synsema/recipes`](https://github.com/synsema/recipes).
+
 ## The shared devnet
 
 `devnet.synsema.app` hosts Horizen's starter kit v0.2.0 for the acceleration cohort, behind HTTPS with a
