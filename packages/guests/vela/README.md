@@ -77,6 +77,12 @@ matching inside (uniform price or pay-as-bid, exact integer ranking), settlement
 revealed, public `opened`/`cleared` receipts with no bidder in them. The four kits are recipes in
 [`synsema/recipes`](https://github.com/synsema/recipes).
 
+Each kit's recipe entry is a web app (`web.syn`): the payroll console, the treasury console (its trigger made
+through a factory contract on the stack), the auction console (the seller's desk and a desk per bidder) and the
+starter kit's workbench (deploy your `app.syn`, register, deposit, any payload, events, users, reports). Deployed
+from synsema.com, a project's environment is provisioned from the public devnet at creation; locally,
+`synsema serve web.syn`. All four verified end to end on the public devnet from the browser.
+
 ## The public devnet
 
 `devnet.synsema.app` runs Horizen's starter kit v0.2.0 behind HTTPS, with a token as the first path segment
