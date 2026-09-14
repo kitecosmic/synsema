@@ -89,9 +89,9 @@ from synsema.com, a project's environment is provisioned from the public devnet 
 (`/<token>/rpc`, `/<token>/authority`, `/<token>/subgraph/…`). A token of your own is one command:
 `vela_client.syn -- devnet` (or `curl -X POST https://devnet.synsema.app/token`) writes the `VELA_*` lines into
 `.env`, and the client works unchanged (it declares `require net("devnet.synsema.app")`). The token brings an
-account of its own (ETH, `DEPLOYER_ROLE`, test tokens) and the admin key — Anvil #0, public — as
-`VELA_ADMIN_KEY`, which `allow-token` and `allow-authority` sign with: yours to run. A devnet: known keys, no
-attestation, reset from time to time; `https://devnet.synsema.app/` shows it live. Details on the docs page.
+account of its own (ETH, `DEPLOYER_ROLE`, test tokens) and an admin desk (`VELA_ADMIN_URL`) that signs
+`allow-token` and `allow-authority` for you: yours to run, and no admin key leaves the machine. A devnet: known
+keys, no attestation, reset from time to time; `https://devnet.synsema.app/` shows it live. Details on the docs page.
 
 ## What ships with the crate
 
