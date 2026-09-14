@@ -88,9 +88,10 @@ from synsema.com, a project's environment is provisioned from the public devnet 
 `devnet.synsema.app` runs Horizen's starter kit v0.2.0 behind HTTPS, with a token as the first path segment
 (`/<token>/rpc`, `/<token>/authority`, `/<token>/subgraph/…`). A token of your own is one command:
 `vela_client.syn -- devnet` (or `curl -X POST https://devnet.synsema.app/token`) writes the `VELA_*` lines into
-`.env`, and the client works unchanged (it declares `require net("devnet.synsema.app")`). The admin key is
-Anvil #0, public, so `allow-token` and `allow-authority` are yours to run. A devnet: Anvil's public keys, no
-attestation, reset from time to time. Details on the docs page.
+`.env`, and the client works unchanged (it declares `require net("devnet.synsema.app")`). The token brings an
+account of its own (ETH, `DEPLOYER_ROLE`, test tokens) and the admin key — Anvil #0, public — as
+`VELA_ADMIN_KEY`, which `allow-token` and `allow-authority` sign with: yours to run. A devnet: known keys, no
+attestation, reset from time to time; `https://devnet.synsema.app/` shows it live. Details on the docs page.
 
 ## What ships with the crate
 
