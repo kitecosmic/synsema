@@ -23,7 +23,7 @@ synsema run tools/embed.syn -- synsema-vela-guest.wasm my_app.syn my_app.wasm
 ```
 
 Test the program natively first — it is plain Synsema: `synsema test my_app.syn`. The kits
-(`synsema/vela-app` and the templates built on it) wrap this in `scripts/build.sh`.
+(`SYNSEMA/vela-transfers` and the templates built on it) wrap this in `scripts/build.sh`.
 
 ## The adapter (Rust)
 
@@ -55,31 +55,31 @@ Executor's exact runtime) is unaffected, and CI runs both probes — and embeds 
 
 ## Start from the kit
 
-[`synsema/vela-app`](https://github.com/synsema/vela-app) is a template repository built on this crate: the app with
+[`SYNSEMA/vela-transfers`](https://github.com/SYNSEMA/vela-transfers) is a template repository built on this crate, private transfers with an invoice and a public receipt each: the app with
 its tests, the client, `scripts/build.sh` (the release's guest with your app in its slot — no compiler), `scripts/smoke.mjs`,
 `scripts/devnet.sh` (Horizen's starter kit in Docker) and `scripts/e2e.sh`, plus a CI workflow that builds
 `app.wasm` on every push.
 
-[`synsema/vela-payroll`](https://github.com/synsema/vela-payroll) is a complete app built on the kit: private payroll in a
+[`SYNSEMA/vela-payroll`](https://github.com/SYNSEMA/vela-payroll) is a complete app built on the kit: private payroll in a
 stablecoin — pay runs from a CSV, one encrypted payslip per person, a public receipt per run, pull-payment withdrawals
 through the facilitator (people need no ETH), an auditor's report. Its client adds `fund`, `payrun`, `payslips`,
 `withdraw`, `pending` and `claim-for` with amounts in tokens, and its `scripts/devnet.sh` deploys and allowlists the
 test ERC-20 from `examples/erc20/` locally. Verified end to end on the public devnet.
 
-[`synsema/vela-treasury`](https://github.com/synsema/vela-treasury) is the agent treasury: policy inside, LLM outside. An agent
+[`SYNSEMA/vela-policy-engine`](https://github.com/SYNSEMA/vela-policy-engine) is the payment policy engine: policy inside, LLM outside. An agent
 proposes payments with its own key; the enclave applies the owner's policy (proposers, payees with caps, an automatic
 limit, an allowance) and pays through its trigger contract (the cycle of `examples/trigger_app.syn`, with ERC-20) or holds the
 proposal for the owner's approval; the agent worker reads an inbox, and the client protocol is a module both it and the CLI
 use. Verified end to end on the public devnet.
 
-[`synsema/vela-auction`](https://github.com/synsema/vela-auction) is a sealed-bid auction: bids encrypted to the enclave, the
+[`SYNSEMA/vela-dark-pool`](https://github.com/SYNSEMA/vela-dark-pool) is a dark pool for block trades, mechanically a sealed-bid batch auction: bids encrypted to the enclave, the
 matching inside (uniform price or pay-as-bid, exact integer ranking), settlement from escrow, losing bids never
 revealed, public `opened`/`cleared` receipts with no bidder in them. The four kits are recipes in
 [`synsema/recipes`](https://github.com/synsema/recipes).
 
-Each kit's recipe entry is a web app (`web.syn`): the payroll console, the treasury console (its trigger made
-through a factory contract on the stack), the auction console (the seller's desk and a desk per bidder) and the
-starter kit's workbench (deploy your `app.syn`, register, deposit, any payload, events, users, reports). Deployed
+Each kit's recipe entry is a web app (`web.syn`): the payroll console, the policy engine's console (its trigger made
+through a factory contract on the stack), the dark pool's console (the seller's desk and a desk per buyer) and the
+private transfers workbench (deploy your `app.syn`, register, deposit, any payload, events, users, reports). Deployed
 from synsema.com, a project's environment is provisioned from the public devnet at creation; locally,
 `synsema serve web.syn`. All four verified end to end on the public devnet from the browser.
 
