@@ -211,18 +211,62 @@ Anything unclear — an unknown driver, an odd `provider`, a response that does 
   is reproducible within one binary or `.wasm` but **not promised bit-for-bit across native and
   wasm** — 1 ulp differences are possible.
 
+## Verifying what you downloaded
+
+Attestation answers *which code is running inside the enclave*. The question before it is *which
+code did I install* — and the release answers that too, at three levels of strength. They are worth
+knowing, because `serve --attested` binds `program_sha` and `measurements.json` pins an image built
+from these very bytes: if you cannot tell where the binary came from, the rest of the chain rests on
+nothing.
+
+**1. The checksum — integrity of the download.** Every asset ships a `.sha256` next to it, and
+`install.sh` verifies it before installing. If it finds no `sha256sum`/`shasum` it **aborts** rather
+than installing unverified. This catches a truncated download or a tampered mirror; it does not tell
+you who built the file.
+
+**2. The build provenance — who built it, from what.** All eight artefacts of a release (the four
+platform binaries, the three `.wasm`, and `measurements.json`) are signed with GitHub's build
+provenance. Anyone can check it, with no trust in the project:
+
+```sh
+gh attestation verify synsema-linux-x86_64 --repo kitecosmic/synsema
+```
+
+It answers with the workflow, the commit and the tag that produced *those exact bytes* — for
+v0.6.24, `release.yml@refs/tags/v0.6.24` at commit `8284861`. This is the check to run, and the one
+`attested-image` runs on the Linux binary before it ever goes into the image whose digest
+`measurements.json` publishes.
+
+**3. Reproducibility — can someone else get the same bytes?** For the **Vela guest** the release
+rebuilds `synsema-vela-guest.wasm` on two different Ubuntu versions with the pinned toolchain and
+compares both against the asset it published. On v0.6.24 all three agreed:
+`87bad7b8d20c1d249fbfd06a9cf48c73e51af533bfd87754351922ee587d0325`. It matters there because the
+chain verifies a `wasmSha256`, so "rebuild it yourself and compare" is a real check a counterparty
+can run.
+
+**What is not promised, stated plainly.** That comparison **warns, it does not fail** the release:
+reproducibility is *reported*, not guaranteed. And the four native binaries have **no reproducibility
+check at all** — what is guaranteed for them is the provenance of level 2. Empirically, the Linux
+binary of v0.6.24 came out byte-identical across two independent release runs
+(`b57a7f630b60d4cf649b4e79bff605c1f827d6a824eabcd41758977ada05d0e0`); the Windows one did not. Do not
+read "the Linux build is reproducible" into that: it is one observation on one runner image, not a
+property the project enforces.
+
 ## Checklist for a confidential deployment
 
-1. Write the program so it works with labels on — `private` at the boundary, `declassify` with a
+1. **Check the engine you are deploying** — `gh attestation verify <the asset> --repo
+   kitecosmic/synsema` before it goes into an image or an enclave (above). Attesting a program
+   built by an engine of unknown provenance attests the wrong half.
+2. Write the program so it works with labels on — `private` at the boundary, `declassify` with a
    reason at every publication. `synsema run --labels` locally, `synsema code check --json` to read
    the declassify list before shipping.
-2. `serve --attested`, no `--watch`. Decide TLS: attested key (client pins) or operator certificate
+3. `serve --attested`, no `--watch`. Decide TLS: attested key (client pins) or operator certificate
    (client does not pin).
-3. Publish `program_sha` and the expected measurements wherever your users will look for them.
-4. The client fetches `/.well-known/attestation`, verifies with `attestation_verify` passing `now`
+4. Publish `program_sha` and the expected measurements wherever your users will look for them.
+5. The client fetches `/.well-known/attestation`, verifies with `attestation_verify` passing `now`
    and `expect.measurements`, recomputes `sha256(spki ‖ program_sha ‖ config_sha)`, compares with
    `user_data`, checks `config`, and **only then** pins the key and sends the data.
-5. In CI, `SYNSEMA_ATTEST=mock` with a fixed seed: the whole path is exercised, and the `mock: true`
+6. In CI, `SYNSEMA_ATTEST=mock` with a fixed seed: the whole path is exercised, and the `mock: true`
    marker makes it impossible to confuse with the real thing.
 
 ## See also
