@@ -37,6 +37,7 @@ attestation.md
 secrets.md
 agents.md
 llm.md
+judge.md
 human.md
 observability.md
 memory.md
