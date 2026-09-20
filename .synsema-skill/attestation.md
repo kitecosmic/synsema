@@ -44,7 +44,8 @@ print(seen["measurements"]["pcr0"])
   gets a different key, so data sealed to one build cannot be read by another. dstack derives it
   (`GetKey`); the `mock` driver uses HKDF of its seed. **Raw Nitro/TDX/SEV-SNP do not seal keys**
   and say so with an error that points at the KMS recipe in `packages/attested/README.md` — that is
-  a platform fact, not a missing feature.
+  a platform fact, not a missing feature. The secret's label carries the purpose
+  (`secret(attest_key:<purpose>)`), so two purposes are visibly two keys in a log.
 - **`attestation_document()` / `attestation_key()`** — the identity of the server you are running
   inside. Outside `serve --attested` they fail with a clear error, so a route that serves the
   document is honest by construction. `attestation_key()` returns a **sealed** secret: `reveal()`
@@ -107,7 +108,8 @@ serve on 8080
   attested identity underneath live clients.
 - **Reserved routes.** Under `--attested` the program cannot declare any of `/.well-known/attestation`
   (with or without a trailing slash), `/openapi.json`, `/docs`, `/llms.txt`, `/sitemap.xml` or
-  `/robots.txt` — it is a **load error** naming the collision, not a silent shadow.
+  `/robots.txt`. The server **refuses to start**, naming the route and the reserved list — the
+  declaration is never silently shadowed.
 
 The published JSON:
 

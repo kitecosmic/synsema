@@ -9,8 +9,11 @@ sink unless you say, in writing and on the record, why it may be published.
 **When it is on.** Off by default: `synsema run app.syn` behaves exactly as it always has, down to
 the step counter. It is on with `--labels` (also on `test`, `serve`, `conform`), always on under
 `serve --attested`, and always on inside a guest adapter (Vela). Write programs that work either
-way: with labels off, `private(…)` is a load error, so a program that uses labels declares that it
-needs them.
+way: with labels off, `private(…)` **raises the moment it is called** — `private: labels are off; run
+with --labels or serve --attested` — so a program that needs the second wall cannot quietly run
+without it. Note *called*, not loaded: `synsema check` passes, and a `private(…)` inside a branch
+that never runs never fires. If the program must refuse to start without labels, call one at the
+top.
 
 **When you want it.** A confidential deployment (TEE/enclave) where the operator runs the code but
 must not read the data; a multi-tenant service that must not cross tenants; anything where "we are
