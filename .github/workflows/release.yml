@@ -577,6 +577,12 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$SYNSEMA_SHA256"
+          # El builder por defecto del runner usa el driver `docker`, que NO tiene exporter OCI
+          # ("OCI exporter is not supported for the docker driver" — v0.6.24). El tar OCI es el
+          # punto entero de este job: el digest del index es lo que el cliente pinea. Así que el
+          # builder se crea explícito con el driver que sí lo soporta, en vez de agregar una
+          # action de terceros más al supply chain.
+          docker buildx create --name oci-attested --driver docker-container --use >/dev/null
           # One plain OCI manifest (no provenance/sbom attestation index), so index.json names it directly.
           docker buildx build --build-arg "SYNSEMA_VERSION=$TAG" --build-arg "SYNSEMA_SHA256=$SYNSEMA_SHA256" \
             --provenance=false --sbom=false --output type=oci,dest=attested.tar packages/attested
