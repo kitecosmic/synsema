@@ -303,7 +303,10 @@ TLS with that key, and publishes `GET /.well-known/attestation`. The client side
 `attestation_verify(document, opts)`.
 
 Deny-by-default like every other capability, and absent from every packaged ceiling, so
-`--deterministic` denies it on its own.
+`--deterministic` denies it on its own. `synsema run --attest` is the job form: one JSON
+artefact binding program, input, output and configuration, verifiable offline. The whole
+surface — the five builtins, which drivers have been exercised on hardware and which have not,
+and what a client must check — is in the skill's `attestation.md`.
 
 ### Intent
 
