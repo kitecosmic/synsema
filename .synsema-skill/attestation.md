@@ -105,9 +105,9 @@ serve on 8080
   before writing routes.
 - **`--attested` and `--watch` are mutually exclusive** (exit 2): a restart would change the
   attested identity underneath live clients.
-- **Reserved routes.** `/.well-known/attestation` (with or without a trailing slash) and
-  `/openapi.json` cannot be declared by the program under `--attested` — it is a **load error**, not
-  a silent shadow.
+- **Reserved routes.** Under `--attested` the program cannot declare any of `/.well-known/attestation`
+  (with or without a trailing slash), `/openapi.json`, `/docs`, `/llms.txt`, `/sitemap.xml` or
+  `/robots.txt` — it is a **load error** naming the collision, not a silent shadow.
 
 The published JSON:
 
@@ -119,6 +119,9 @@ The published JSON:
             "profile": "native", "tls_key": "attested"},
  "document": "<base64>", "tls_key": "attested"}
 ```
+
+The `mock` driver adds two keys of its own: `"mock": true` and `"root"` (its generated root, so a
+CI client can pass it as `opts.root`). A real platform sends neither.
 
 `config` is the **mode** the program ran under, not just which program: the ceiling, whether labels
 were on, the profile, and where the TLS key came from. `config_sha` is SHA-256 of that object as
