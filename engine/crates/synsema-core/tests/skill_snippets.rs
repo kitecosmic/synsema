@@ -24,19 +24,27 @@ fn skill_dir() -> Option<PathBuf> {
 }
 
 /// Los bloques ```synsema de un archivo Markdown, con la línea donde empieza cada uno.
+///
+/// El fence puede venir INDENTADO (un bloque dentro de un ítem de lista lo está), y saltárselo
+/// sería el peor agujero posible en un guard: el bloque se publica, alguien lo copia, y nadie lo
+/// comprobó. Se mide la sangría del fence y se le quita a cada línea del cuerpo, así el código
+/// llega al parser como lo muestra la página.
 fn synsema_blocks(md: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let mut lines = md.lines().enumerate();
     while let Some((i, l)) = lines.next() {
-        if l.trim_end() != "```synsema" {
+        if l.trim() != "```synsema" {
             continue;
         }
+        let indent = l.len() - l.trim_start().len();
         let mut body = String::new();
         for (_, b) in lines.by_ref() {
-            if b.trim_end() == "```" {
+            if b.trim() == "```" {
                 break;
             }
-            body.push_str(b);
+            // Quitar hasta `indent` espacios: una línea en blanco viene más corta y queda vacía.
+            let cut = b.chars().take(indent).take_while(|c| *c == ' ').count();
+            body.push_str(&b[cut..]);
             body.push('\n');
         }
         out.push((i + 2, body));
@@ -78,5 +86,8 @@ fn every_tagged_snippet_in_the_skill_loads() {
     }
     assert!(bad.is_empty(), "{} fragmento(s) de la skill no cargan:\n{}", bad.len(), bad.join("\n"));
     // Anti-rot: si alguien borra la etiqueta de todos los bloques, el test no debe pasar vacío.
-    assert!(checked >= 75, "sólo {} fragmentos etiquetados: ¿se perdieron las etiquetas?", checked);
+    // El piso va JUSTO por debajo de lo que hay (81 al cerrar v0.6.24, con `labels.md` y
+    // `attestation.md` sumando 8): perder un par de bloques tiene que doler, y si una página
+    // deja de tener ejemplos a propósito, este número se baja a mano y queda dicho en el diff.
+    assert!(checked >= 78, "sólo {} fragmentos etiquetados: ¿se perdieron las etiquetas?", checked);
 }

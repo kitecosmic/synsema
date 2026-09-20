@@ -36,13 +36,24 @@ print(code)                                -- insufficient
 - `declassify(value, "reason")` — publish it, on the record. The reason is mandatory and public;
   every `declassify` is logged with its source line and listed by `synsema code check --json`
   before anything runs, which is what an auditor reads.
-- `declassify(value, "reason", ["bank"])` — narrow instead of publishing: the result is private to
-  `bank` rather than public. `declassify` never *widens*.
+- `declassify(value, "reason", [...])` — narrow instead of publishing. The third argument must be
+  a **subset of what the value is already private to**, because `declassify` may only narrow:
+  a value private to `["app", "bank"]` can come out private to `["bank"]` alone, but asking a
+  value private to `"app"` for `["bank"]` is *widening* and the engine refuses it by name
+  (`cannot widen a label — [bank] is not a subset of what this value is private to`).
 - `label_of(v)` → the list of principals; `is_private(v)` → bool. **Both answers are as private
   as what you asked about**, which is why the example above prints them redacted: if they came
   back public they would be an oracle — one bit per question, and the branch you take on the
   answer would be a public branch on private data. Use them to *decide* inside the program, not
   to report.
+
+Narrowing, in one example:
+
+```synsema
+let joint be private(private(500, "app"), "bank")   -- private to both
+let only_bank be declassify(joint, "the bank settles it", ["bank"])
+print(declassify(text(label_of(only_bank)), "probe"))   -- [bank]
+```
 
 These five names (the four plus `print`) are **protected**: a program cannot bind them to
 something callable, because redefining one would silently un-label its own sources and mislead the
@@ -63,6 +74,15 @@ files, the network, databases, memory, processes, `parallel_map`, and **stdout**
 The second one surprises people, so it is worth stating plainly: the *number* of lines you print
 is not redactable even when each value is. One `print` per iteration of a loop that branches on a
 secret spells the secret out by line count.
+
+Two more that catch people, because the redaction happens **at the sink** and nowhere else:
+
+- **`text(v)` does not sanitise.** It returns the real content, still private. Passing a value
+  through `text` does not make it safe to hand to anything — `is_private(text(v))` is true, and
+  `declassify(text(v), …)` gives you the value back in full.
+- **A private value inside a concatenation takes the whole string with it.**
+  `print("balance: " + text(v))` prints `private(app)`, not `balance: private(app)`: the prefix
+  is part of a private text now, and the sink replaces the whole thing.
 
 ```synsema
 let secret be private(42, "app")

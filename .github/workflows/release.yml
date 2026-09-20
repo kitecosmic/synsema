@@ -379,7 +379,15 @@ jobs:
           cp synsema-wasm-web.wasm packages/synsema-wasm/synsema.wasm
           cd packages/synsema-wasm
           npm version --no-git-tag-version "${GITHUB_REF_NAME#v}"
-          npm publish --provenance --access public
+          # Idempotente, como el `prepare` de arriba: una RE-CORRIDA sobre el mismo tag (retag,
+          # re-dispatch, un job que se arregla y se vuelve a lanzar) encontraba la version ya
+          # publicada y moría con "You cannot publish over the previously published versions".
+          # npm no tiene un `--if-not-exists`, así que se pregunta antes.
+          if npm view "@synsema/wasm@${GITHUB_REF_NAME#v}" version >/dev/null 2>&1; then
+            echo "@synsema/wasm@${GITHUB_REF_NAME#v} ya está publicado — nada que hacer"
+          else
+            npm publish --provenance --access public
+          fi
 
   # npm `synsema` (tanda npm-cli): con los 4 binarios YA en la release, arma los paquetes
   # de plataforma @synsema/cli-<os>-<cpu> + el paquete `synsema` (launcher) y los publica
@@ -428,7 +436,15 @@ jobs:
           set -euo pipefail
           npm install -g npm@12.0.2
           node packages/synsema-cli/platforms.mjs "${GITHUB_REF_NAME#v}" assets out
+          # Idempotente por paquete (ver la nota del job de @synsema/wasm): una re-corrida sobre
+          # el mismo tag publica sólo lo que falte, en vez de morir en el primero que ya está.
           for d in cli-linux-x64 cli-darwin-arm64 cli-darwin-x64 cli-win32-x64 synsema; do
+            name=$(node -p "require('./out/$d/package.json').name")
+            ver=$(node -p "require('./out/$d/package.json').version")
+            if npm view "$name@$ver" version >/dev/null 2>&1; then
+              echo "$name@$ver ya está publicado — se omite"
+              continue
+            fi
             (cd "out/$d" && npm publish --provenance --access public)
           done
 
