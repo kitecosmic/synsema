@@ -1088,11 +1088,13 @@ fn run_app_with(app: &App, task: &str, fallback: Option<&str>, ctx: &Value, root
         log("INF", line);
     }
     if !ok || !errors.is_empty() {
-        // El log del Executor está FUERA del enclave. El MOTOR ya redacta el texto
-        // De todo error de runtime producido bajo control privado o tras desenvolver un privado
-        // (`file:line:col: private(app)`: queda la ubicación, jamás el saldo/índice/clave), y
-        // sólo deja en claro sus propios diagnósticos de etiquetas (caminos, principales). Acá se
-        // loguea ese texto tal cual, UNA sola vez (en `Failure::log`, L21).
+        // El log del Executor está FUERA del enclave. El MOTOR ya redacta el texto de todo error
+        // de runtime producido bajo control privado o tras desenvolver un privado: sale
+        // `private(<los principales DECLARADOS>)` y **nada más** — desde la ronda 7 tampoco viaja
+        // `file:line:col`, porque si el secreto elige cuál de N sitios falla la ubicación vale
+        // log₂(N) bits, y acá cada request es una corrida. Sólo deja en claro sus propios
+        // diagnósticos de etiquetas (el CAMINO del valor, que es lo que hay que ir a arreglar).
+        // Acá se loguea ese texto tal cual, UNA sola vez (en `Failure::log`, L21).
         let msg = if errors.is_empty() { "the program failed".to_string() } else { errors.join("; ") };
         return AppRun { result: Err(Failure::Runtime(msg)), steps, private_seen, detail_private: false };
     }

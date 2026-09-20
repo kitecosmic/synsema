@@ -129,10 +129,18 @@ fn run_attest_forces_deterministic_and_fails_closed_without_a_platform() {
     assert!(err.contains("run --attest") && err.contains("attest"), "{}", err);
     assert!(!out.contains("output_sha"), "{}", out);
     assert!(out.trim().is_empty(), "L20: el driver se valida antes de correr; stdout = {:?}", out);
-    // Sin SYNSEMA_ATTEST y sin dispositivo: el error canónico (o, sólo en un TEE real, un doc).
+    // Sin `SYNSEMA_ATTEST`, la autodetección decide, y lo que se exige es la PROPIEDAD, no un
+    // texto: o sale un documento (un TEE de verdad), o falla cerrado sin publicar nada.
+    //
+    // El texto no sirve porque depende de la máquina, y eso rompió el primer CI: el runner de
+    // GitHub tiene configfs-tsm MONTADO pero no escribible, así que la autodetección elige el
+    // driver `tsm` y muere con "Permission denied" en vez del "no attestation platform detected"
+    // que esperaba una máquina sin el dispositivo. Los dos son el mismo veredicto.
     let (code, out, err) = synsema(&dir, &["run", "--attest", "p.syn"], &[("SYNSEMA_ATTEST", None), ("DSTACK_SIMULATOR_ENDPOINT", None)]);
     if code != 0 {
-        assert!(err.contains("no attestation platform detected"), "{}", err);
+        assert!(err.contains("attest"), "el error nombra la capability: {}", err);
+        assert!(!out.contains("output_sha"), "no se publica nada al fallar: {}", out);
+        assert!(out.trim().is_empty(), "el driver se valida antes de correr; stdout = {:?}", out);
     } else {
         assert!(out.contains("output_sha"));
     }

@@ -32,6 +32,7 @@ serve.md
 processes.md
 code.md
 capabilities.md
+labels.md
 secrets.md
 agents.md
 llm.md

@@ -252,9 +252,18 @@ const pdep = note("app", g.deploy(1, JSON.stringify({ policy: POLICY })));
 check(pdep.json.error === undefined, `deploy with a policy ok: ${pdep.text.slice(0, 60)}`);
 const pstate0 = b64(pdep.json.state);
 const ps0 = JSON.parse(pstate0);
-check(lastKey(ps0) === "_vela" && JSON.stringify(ps0._vela) === JSON.stringify(POLICY), `the policy travels in the state under _vela, last key: ${pstate0}`);
+// `_vela` lleva la política declarada MÁS lo que pone el adaptador: el contador anti-repetición
+// `n` y el relleno `_` (ronda 4/V3).
+check(lastKey(ps0) === "_vela" && Object.entries(POLICY).every(([k, v]) => JSON.stringify(ps0._vela[k]) === JSON.stringify(v))
+      && ps0._vela.n === 0 && /^ *$/.test(ps0._vela._ ?? "") && pstate0.length % 256 === 0,
+      `the policy travels in the state under _vela (last key), with the counter and the padding: ${pstate0}`);
 check(pdep.json.fuel === dep.json.fuel, "same fuel with or without a policy");
 const isPadded = (ev) => b64len(ev.data) % 256 === 0;
+// Ronda 4/V3: bajo `reject: private` el estado ya NO vuelve byte a byte — el contador `_vela.n`
+// sube en toda transición (si no, "el root no se movió" era la señal) y `state_pad` iguala el
+// tamaño. Lo que sí queda intacto es lo que la app ve, así que se compara eso.
+const appPart = (raw) => { const o = JSON.parse(raw); delete o._vela; return JSON.stringify(o); };
+const counter = (raw) => JSON.parse(raw)._vela?.n ?? 0;
 
 const pd1 = note("app", g.deposit(1, ALICE, ETH, ONE_ETH, pstate0));
 check(pd1.json.error === undefined, "deposit under the policy ok");
@@ -276,7 +285,9 @@ const rejLog = g.logs().slice(logBeforeReject).trim();
 check(rejLog === "INF fuel: reported 0x32", `a private rejection logs one line and nothing else (audit R3/B2): ${JSON.stringify(rejLog)}`);
 check(!/insufficient_balance|rejected|app declared|declassify|steps/.test(rejLog), "no code, no \"rejected privately\", no declared fuel, no declassify trace, no steps");
 check(rej.json.error === undefined, `no error on-chain: ${rej.text.slice(0, 80)}`);
-check(b64(rej.json.state) === pstate1, "state intact, byte for byte");
+check(appPart(b64(rej.json.state)) === appPart(pstate1) && b64(rej.json.state) !== pstate1
+      && counter(b64(rej.json.state)) === counter(pstate1) + 1 && b64(rej.json.state).length % 256 === 0,
+      "what the app sees is intact; the root moved and the size is the same bucket (round 4/V3)");
 check(Array.isArray(rej.json.withdrawals) && rej.json.withdrawals.length === 0 && rej.json.appEvents.length === 0, "no withdrawals, no public events");
 check(rej.json.events.length === 2 && rej.json.events[0].userId === BOB, "two events (events_min), the first to the sender");
 const rejData = JSON.parse(b64(rej.json.events[0].data));
@@ -301,7 +312,7 @@ check(pwd.json.withdrawals.length === 1, "withdrawals are untouched");
 const pde = note("app", g.process(1, ALICE, 2, "{}", pstate2));
 const preport = JSON.parse(b64(pde.json.report));
 check(pde.json.error === undefined && !("_vela" in preport) && preport.balances[BOB][ETH] === "250000000000000000", "deanonymize sees the state without _vela");
-check(b64(pde.json.state) === pstate2, "and returns the state (with _vela) byte for byte");
+check(appPart(b64(pde.json.state)) === appPart(pstate2), "and returns the state the app sees, untouched");
 const ptp = note("app", g.trusted(1, trustedPayload, pstate2));
 check(ptp.json.error === undefined && ptp.json.events.length === 0, "a trusted request (no sender) gets no filler: nobody to pad to (WRN in the log)");
 check(/WRN events_min: 2 events wanted, 0 emitted, and no sender/.test(g.logs()), "…and says so in the log");
@@ -392,10 +403,11 @@ check(tdepo.json.error === undefined && JSON.parse(b64(tdepo.json.state)).total 
 const tlogs = t.logs();
 check(tlogs.includes("WRN app error app_error: (private)"), "the free text is redacted in the log (WRN): only the sender gets it, encrypted");
 check(!tlogs.includes("the seller holds 5"), "…and the seller's balance is nowhere in the log");
-// El motor redacta el mensaje y conserva file:line. El principal sale como `app` (un `private(x,
-// "app")` del programa) o como `#0` (una FUENTE que el adaptador marcó por la op `run`): en los dos
-// casos el valor no está. Lo segundo es cosmético del motor, no del guest.
-check(/ERR runtime_error: .*:\d+:\d+: private\((app|#\d+)\)/.test(tlogs) && !tlogs.includes("index 7 out of range"), "the raise text NEVER leaves the enclave: the engine redacts it, keeping only file:line");
+// El motor redacta el mensaje. Desde la ronda 7 tampoco viaja `file:line:col` hacia el host, y
+// desde la ronda 7 el principal que sale es el conjunto DECLARADO del programa (constante), no el
+// del valor concreto — ése variaba con cuál se había seleccionado y publicaba el dato.
+check(/ERR runtime_error: .*private\([^)]*\)/.test(tlogs) && !tlogs.includes("index 7 out of range") && !/ERR runtime_error: [^\n]*:\d+:\d+:/.test(tlogs),
+      "the raise text NEVER leaves the enclave, and since round 7 neither does file:line (which of N sites failed is log2(N) bits)");
 check(/ERR invariant_violation: \(private\)/.test(tlogs) && !tlogs.includes("conservation broken"), "an invariant description computed from the private state is redacted in the log");
 check(/INF fuel: reported 0x7$/m.test(tlogs), "fuel log for a task that declares none: the same single line");
 
@@ -427,7 +439,8 @@ const tpdep = note("tamper", t.deploy(2, JSON.stringify({ policy: { reject: "pri
 const tpstate0 = b64(tpdep.json.state);
 check(JSON.parse(tpstate0)._vela?.reject === "private", `policy stored: ${tpstate0}`);
 const tpfree = note("tamper", t.process(2, ALICE, 1, JSON.stringify({ type: "free" }), tpstate0));
-check(tpfree.json.error === undefined && b64(tpfree.json.state) === tpstate0, "free-text rejection under reject: private is a success with the state intact");
+check(tpfree.json.error === undefined && appPart(b64(tpfree.json.state)) === appPart(tpstate0),
+      "free-text rejection under reject: private is a success with the state the app sees intact");
 const tpfreeData = JSON.parse(b64(tpfree.json.events[0].data));
 check(tpfreeData.rejected === "app_error" && tpfreeData.detail === "the seller holds 5 but asked for 10", `the sender's event carries {rejected: app_error, detail: <the text>}: ${JSON.stringify(tpfreeData)}`);
 const tpmint = note("tamper", t.process(2, ALICE, 1, JSON.stringify({ type: "mint" }), tpstate0));

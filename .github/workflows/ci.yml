@@ -471,7 +471,12 @@ jobs:
           done
           echo "== load + self-test: synsema test --labels"
           for f in "${ALL[@]}"; do
-            out=$(timeout 120 "$SYN" test --labels "$f" 2>&1); rc=$?
+            # `shell: bash -e` mata el script si una ASIGNACION falla, y esta falla a proposito
+            # para un programa `serve` (que no corre bajo `test`). Sin el `|| rc=$?` el job moria
+            # en el primer caso esperado, antes de imprimir cual fue — que es lo que paso la
+            # primera vez que este gate corrio.
+            rc=0
+            out=$(timeout 120 "$SYN" test --labels "$f" 2>&1) || rc=$?
             if [ $rc -eq 0 ]; then
               printf '   ok   %-62s %s\n' "$f" "$(echo "$out" | tail -1)"; continue
             fi
