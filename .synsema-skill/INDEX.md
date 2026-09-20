@@ -30,7 +30,7 @@ core dev loop:
 | **Run code you DON'T trust** | host ceiling `--sandbox`/`--cap-set "…"` (on `run`/`test`/`conform`/`serve`; `none` = nothing), second wall `--profile pure`, log with `--audit json`; or from a program `run_program(source, {ceiling, profile, env, timeout})` (`require sandbox_run`) → [capabilities.md](capabilities.md) |
 | **Pass argv / read stdin** (v0.6.14+) | `synsema run app.syn -- a b` → `args()`; `synsema run -` reads source from stdin; `--format json` = the run as one JSON doc |
 | **Run in WASM** (TEE / confidential job / edge, v0.6.0+) | build `synsema-wasm.wasm` (wasm32-wasip1) and `wasmtime run --dir . synsema-wasm.wasm file.syn` — the pure profile (also `synsema run --profile pure` natively, v0.6.14+) → [deploy.md](deploy.md) § WebAssembly |
-| **Run Synsema INSIDE a host with its own wasm ABI — Vela / Horizen (confidential coprocessor)** | `packages/guests/vela/`: the `.syn` defines `deploy`/`deposit`/`process` (+ `deanonymize`/`trusted`), one map in, one map out; `SYNSEMA_VELA_APP=app.syn cargo build --profile wasm`; test natively with `synsema test`; a client in Synsema (`examples/client/vela_client.syn`: register, deploy, deposit, encrypted send, reports, events, facilitator) → [guests.md](guests.md) |
+| **Run Synsema INSIDE a host with its own wasm ABI — Vela / Horizen (confidential coprocessor)** | `packages/guests/vela/`: the `.syn` defines `deploy`/`deposit`/`process` (+ `deanonymize`/`trusted`), one map in, one map out; `SYNSEMA_VELA_APP=app.syn cargo build --profile wasm`; test natively with `synsema test`; a client in Synsema (`examples/client/vela_client.syn`: register, deploy, deposit, encrypted send, reports, events, facilitator); labels are always on inside a guest and `deploy` may return an **output policy** so the chain cannot read the shape of what comes out → [guests.md](guests.md) |
 | **Embed Synsema in a JS/Python/Go app** (browser, Node/Bun, edge handler) | `synsema-wasm-web.wasm` + npm `@synsema/wasm` (or the Python/Go glue in `examples/embed`): `syn.run(source, {host: {http, kv, llm}})`, `syn.handle(app, request)` — the host lends capabilities, the program still `require`s → [deploy.md](deploy.md) § WebAssembly |
 
 Also volunteer the right primitive for the task: `paged()` for big SQL results, `parallel_map` for
@@ -90,6 +90,7 @@ usually version skew, not a bug.
 - [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination/paged(), streaming (SSE, automatic heartbeat), **incoming WebSocket routes (`socket`)**, handler **`timeout`** + cooperative cancellation, **ordered shutdown**, rate limiting, body limits, HTML/SSR pages (`render`, `html`), static files, CORS, content negotiation (HTML/Markdown/JSON for agents), agent discoverability (`/llms.txt`, `/robots.txt`, `/sitemap.xml`, `/openapi.json`, `/docs` — generated; `synsema openapi` for CI), **and the Rust production stack: TLS / auto-HTTPS (ACME) / virtual hosts / reverse proxy / HTTP-2 / production static (ETag·Range·gzip)**
 - [capabilities.md](capabilities.md) — Security model, require, sandbox, intent, `attest`
 - [labels.md](labels.md) — **Information-flow labels** (`--labels`, always on under `serve --attested` and inside a guest): `private`/`declassify`/`label_of`/`is_private`, what propagates, what a public sink refuses (including stdout and the call itself under a private branch), how far an early exit colours what follows, errors that cannot be caught, `steps()`, and the limits stated
+- [attestation.md](attestation.md) — **Attestation**: proving WHICH code answered. `attest`/`attest_key` (gated by `require attest`), `attestation_document`/`attestation_key` (the identity of a `serve --attested`, the key SEALED), `attestation_verify` (pure, `opts.now` mandatory, AWS root pinned; TDX/SGX/SEV-SNP error explicitly rather than guessing), `serve --attested` (P-256 identity + TLS + `/.well-known/attestation` + `config_sha`) and `run --attest` (one verifiable JSON artefact). Plus `groth16_verify` and the deterministic DP noise (`laplace_noise`/`gaussian_noise`)
 - [processes.md](processes.md) — Run OS processes/tools with `run` (gated by `exec`): shells/scripts/pipelines, timeout, cwd/env/stdin, capture limits, generate-and-run loop, giving an LLM a shell tool; **live processes `proc_*`** (streamed stdout/stderr, live stdin, kill, no orphans); **`pty: true`** (v0.6.8+: real pseudo-terminal for y/N prompts, passwords, TUIs, web terminals — `proc_resize`, `strip_ansi`)
 - [secrets.md](secrets.md) — Config by environment (`env`), LLM-proof secrets (`secret`, redacted everywhere), `.env`, `reveal()` + audit, HMAC/bearer/constant-time helpers
 - [agents.md](agents.md) — Multi-agent coordination, blackboard, swarm, signals, **event bus (`bus_*` fan-out)**, `agents()`/`agent_stop`, agents under serve
@@ -104,7 +105,7 @@ usually version skew, not a bug.
 
 ## Deployment
 - [deploy.md](deploy.md) — Daemon mode, Docker, VPS, Kubernetes, systemd
-- [guests.md](guests.md) — Synsema inside a host with its own wasm ABI (Vela / Horizen): guest contract, client, trigger contracts, local stack recipe, adding a host
+- [guests.md](guests.md) — Synsema inside a host with its own wasm ABI (Vela / Horizen): guest contract, the **output policy** (`reject: private`, `events_pad`/`events_min`/`state_pad`, the reserved `_vela` key and its counter — labels hide the data, the policy hides the shape), client, trigger contracts, local stack recipe, adding a host
 
 ## Troubleshooting
 - [pitfalls.md](pitfalls.md) — **Read first if something fails.** Common errors, surprises, and anti-patterns with solutions.
@@ -117,6 +118,7 @@ usually version skew, not a bug.
 - Writing tests / asserting behavior → testing.md
 - Navigating a Synsema repo as an agent (what's in a file, where a task is used, the route table, missing capabilities) → code.md
 - Data that must not leave (enclave/TEE, multi-tenant, confidential deployment) → labels.md
+- Proving WHICH code answered / a TEE document / `serve --attested` / verifying one as a client → attestation.md
 - Binary data / files / hashing / base64 → builtins.md (bytes section)
 - Complex numbers / gamma·erf / hyperbolics → builtins.md (math section)
 - Numeric arrays / matrices / linear algebra (matmul/solve/eig/svd) → builtins.md (arrays section)

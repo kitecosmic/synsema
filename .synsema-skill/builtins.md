@@ -154,6 +154,35 @@ violation. Still without a total form: `parse_time`, `csv_parse`, `bytes(text, e
 `decode`, `psbt_decode` and key/index access — their arity is already variable, so the slot has to
 be decided one by one.
 
+## Attestation & confidential computing — see [attestation.md](attestation.md)
+
+Proving **which code** produced an answer. Full contract, drivers, the `serve --attested` identity
+and the `run --attest` artefact are in [attestation.md](attestation.md); the data half (`private` /
+`declassify`) is [labels.md](labels.md).
+
+- `attest(opts?)` → map. **`require attest`.** Asks the platform (AWS Nitro / TDX / SEV-SNP /
+  dstack, plus a `mock` driver for CI that is never auto-detected) for a document binding
+  `opts.report_data` (bytes, ≤ 64 — yours to choose) to the measurement of the running code.
+  → `{format, document: bytes, driver, report_data, aux?, event_log?, root?}`.
+- `attest_key(purpose)` → secret. **`require attest`.** A key the platform derives from the
+  measurement, so another build cannot read what this one sealed. Raw Nitro/TDX/SEV-SNP do not seal
+  keys and say so with an explicit error.
+- `attestation_document()` → map (no capability) and `attestation_key()` → secret
+  (**`require attest`**): the identity of the `serve --attested` you are running inside; outside
+  that mode, a clear error. The key is **sealed** — `reveal()` refuses it even with `reveal`.
+- `attestation_verify(doc, opts)` → map. Pure, no capability, no network. **`opts.now` (unix
+  seconds) is mandatory**: an enclave has no trustworthy clock and a verdict must be reproducible.
+  `opts.format` names the format, `opts.expect.measurements` compares PCRs. Verifies the COSE ES384
+  signature and the whole X.509 chain against the **pinned** AWS Nitro root. `tdx`/`sgx`/`sev-snp`
+  return an **explicit error** in this release, never an optimistic `true`.
+- `groth16_verify(vk, proof, public_inputs)` → bool. Pure. A Groth16 proof over BN254, taking
+  snarkjs's `verification_key.json` / `proof.json` / `public.json` as they are. An invalid proof is
+  `false`; a dubious format is an error.
+- `laplace_noise(seed, scale)` / `gaussian_noise(seed, sigma)` → float. Pure. Differential-privacy
+  noise **deterministic in its seed** (not from `random()`): the same query over the same state
+  gives the same noise, so repeating cannot average it away. You apply the snapping to the
+  published sum yourself — see [attestation.md](attestation.md).
+
 ## JSON (pure — no capability)
 - `json_encode(value)` → text: serialize any value to a JSON string. Maps/lists nest; **secret → `"[redacted]"`** (safe), `bytes` → base64 string, `decimal` (`1.50d`) → exact JSON number, `nothing` → `null`. ⚠️ NOT safe to embed inside a `<script>` tag — use `json_for_script` there.
 - `json_for_script(value)` → text: same JSON but with `<`, `>`, `&` escaped as `\u00XX` — **the safe way to embed data in an inline `<script>`** (`{ raw json_for_script(x) }`); a value containing `</script>` cannot break out of the tag.

@@ -36,8 +36,12 @@ Only when changing the ADAPTER itself (packages/guests/vela):
 ```sh
 rustup target add wasm32-wasip1 && cd packages/guests/vela
 cargo build --profile wasm                             # → ../../../engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm (≈ 7.8 MB; 2–5 min, LTO); SYNSEMA_VELA_APP=… fills the slot at build time
-node ../../../tests/vela_guest.probe.mjs <the .wasm>   # WASI ≈ the Executor: imports, exports, every entry point, formats, determinism, memory
-cd tests/wasmtime-go && go run . <the .wasm>           # wasmtime-go v1.0.0 = the Executor's exact runtime (needs Go + a C compiler)
+# THEN stub the WASI imports Vela refuses: the STUBBED file IS the module — what the probes load,
+# what the release publishes, what `embed.syn` fills. Run it from the REPO ROOT (inside the crate,
+# .cargo/config.toml would cross-compile the tool itself to wasm), hence the subshell:
+(cd ../../.. && W=engine/target/wasm32-wasip1/wasm/synsema_vela_guest; cargo run --locked --manifest-path packages/guests/vela/tools/wasi-stub/Cargo.toml -- $W.wasm $W.stubbed.wasm)   # imports: 21 -> 6
+node ../../../tests/vela_guest.probe.mjs <the STUBBED .wasm>   # WASI ≈ the Executor: imports, exports, every entry point, formats, determinism, memory
+cd tests/wasmtime-go && go run . <the STUBBED .wasm>   # wasmtime-go v1.0.0 = the Executor's exact runtime (needs Go + a C compiler)
 cargo test --target <host triple>                      # unit tests — the crate's DEFAULT target is wasm, a bare `cargo test` builds a .wasm it cannot run
 ```
 
@@ -57,7 +61,7 @@ v1.0.0 (the Executor) is unaffected — CI runs both probes.
 
 | Vela export | task | `ctx` | returns |
 |---|---|---|---|
-| `deploy(appId, params)` | `deploy(ctx)` | `{app_id, kind: "deploy", params}` — `params` = constructorParams JSON decoded, `nothing` if empty | `{state, fuel?}` (`state` required) |
+| `deploy(appId, params)` | `deploy(ctx)` | `{app_id, kind: "deploy", params}` — `params` = constructorParams JSON decoded, `nothing` if empty | `{state, policy?, fuel?}` (`state` required; `policy` = the output policy below, which the adapter stores inside the state under `_vela`) |
 | `load_module(appId)` | `load_module(ctx)` → falls back to `deploy` with `params: nothing` | `{app_id, kind: "load_module", params: nothing}` | `{state, fuel?}` — cache warm-up after an Executor restart, the state is **discarded**; if the fallback `deploy` errors (it needed params) the adapter answers an empty state with `WRN` (an error here would leave the app unloadable) |
 | `deposit(appId, sender, token, value, state)` | `deposit(ctx)` | `{app_id, kind: "deposit", sender, token, value, value_hex, state}` — addresses `0x`+40 hex lowercase; `value` exact **decimal text**, `value_hex` `0x…`; `state` = previous state decoded from JSON (text if not JSON) | `{state?, events?, app_events?, fuel?, error?}` |
 | `process_request(…, type 1)` | `process(ctx)` | `{app_id, kind: "process", request_type: 1, sender, payload, payload_hex, state}` — `payload` decoded from JSON (or text), `payload_hex` the raw bytes | `{state?, events?, app_events?, withdrawals?, fuel?, error?}` |
@@ -106,6 +110,44 @@ a decimal/big int is written as a bare JSON number and comes back as a float abo
 amounts as **text** in the state (`text(n)`, or Uint256 hex) and convert on use. Hex helpers you
 will write in every app (`bytes(h, "hex")` takes no `0x` and needs an even length; `Uint256.ToHex`
 strips leading zeros): see `hex_to_int`/`int_to_hex` in `examples/payment_app.syn`.
+
+## The output policy — what the CHAIN can see (engine v0.6.24+)
+
+Labels keep the data inside the enclave. They do **not** hide the *shape* of what comes out, and on
+a public chain the shape is readable by everyone: how many events a request emitted, how long they
+are, whether the state root moved. `deploy` returns an optional `policy` and the adapter enforces
+it on every later request.
+
+```synsema
+task deploy(ctx)
+    give {"state": {"total": 0},
+          "policy": {"reject": "private", "events_pad": 256, "events_min": 2}}
+```
+
+| key | value | what it closes |
+|---|---|---|
+| `reject` | `"private"` \| `"public"` (default) | on a **process** request only, an `{"error": …}` the app returns becomes a **successful** result — no withdrawals, no app events, the state the app sees unchanged — with one encrypted event to the sender carrying `{"rejected": <code>, "detail": …}`. On-chain the request just succeeded. Never for `deposit` (a failed deposit must fail, or the contract holds funds with no balance), `trusted` or `deanonymize`, and never for `runtime_error`/`invariant_violation`, which stay public |
+| `events_pad` | integer ≥ 1 (bytes) | every private event whose `data` is a JSON object is padded with a `"_"` key of spaces up to the next multiple of N, so length stops being a channel. Clients ignore `_` |
+| `events_min` | integer ≥ 0 | filler events to the sender until the request carries at least K — a transfer (2 events) and a withdrawal (1) stop being distinguishable by count. Needs a sender; a `trusted` request has none (`WRN`) |
+| `state_pad` | integer ≥ 0 (bytes), default **256** under `reject: "private"` | pads the whole state to the next multiple of N, so an accepted and a rejected request return states of the **same size**. `0` turns it off by hand |
+
+**Two things about the state that will bite you if you assume otherwise.**
+
+- **`_vela` is reserved.** The adapter stores the policy there, as the **last key** of the state
+  (the state must be a JSON object for this). The app never sees it: `ctx["state"]` arrives without
+  it and it is put back on the way out. Do not write a key called `_vela`, and do not assume the
+  state you returned is the state that goes on-chain byte for byte.
+- **The state root moves on every transition.** `_vela` carries a counter `n` that goes up on
+  *every* request. Without it, `reject: "private"` hid nothing: a rejected request returned the
+  previous state byte for byte, so "the root did not move" *was* the rejection signal — and with
+  `state_pad` off, the state's **length** recovered the exact amount of a sealed bid in 49 replays.
+  If you compare states in a test, compare what the app sees, not the raw bytes.
+
+**And one limit, stated.** Under `reject: "private"` the reason still reaches the sender, encrypted
+by the Executor. That encryption is Vela's, not ours. If you cannot rely on it, run with
+`reject: "public"`, or keep the detail out by returning `{"error": code}` with no `error_detail`.
+
+The full table, with the `WRN` each degraded case logs, is in `packages/guests/vela/README.md`.
 
 ## Vela facts the adapter encodes (so you don't have to re-read Go)
 

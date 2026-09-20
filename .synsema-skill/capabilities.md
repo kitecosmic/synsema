@@ -172,8 +172,9 @@ synsema test --cap-set "stdout,time,random,secret,file=scratch_*" program.syn
   Nitro, TDX/SEV-SNP via configfs-tsm, dstack, plus a `mock` driver for CI that is never
   auto-detected). It is I/O against a device or socket of the host, so it is deny-by-default like
   every other capability, and it is **absent from every packaged ceiling**: neither `--sandbox`
-  nor the deterministic one list it, so `--deterministic` denies it on its own. See
-  [guests.md](guests.md).
+  nor the deterministic one list it, so `--deterministic` denies it on its own. The whole family
+  (`attest`, `attest_key`, `attestation_document`, `attestation_key`, `attestation_verify`),
+  `serve --attested` and `run --attest` are in [attestation.md](attestation.md).
 
 - **`sandbox_run` capability** (v0.6.14+): `require sandbox_run` lets a program run *another* Synsema program with `run_program(source, {ceiling, profile, env, timeout})` in a child process under a ceiling that is the intersection with its own — the child can never exceed the parent (asking for more is trimmed, not fatal, and the parent's audit records it as `above parent ceiling`). See [builtins.md](builtins.md) and [processes.md](processes.md).
 - **`render` of a disk template reads a file:** the top-level `render(path)` needs `require file.read("<path>")` (v0.6.14+; nested `include`/`layout` and bundled templates don't).

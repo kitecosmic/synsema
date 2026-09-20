@@ -136,11 +136,19 @@ fn run_attest_forces_deterministic_and_fails_closed_without_a_platform() {
     // GitHub tiene configfs-tsm MONTADO pero no escribible, así que la autodetección elige el
     // driver `tsm` y muere con "Permission denied" en vez del "no attestation platform detected"
     // que esperaba una máquina sin el dispositivo. Los dos son el mismo veredicto.
+    //
+    // Tampoco se exige stdout vacío acá, y la diferencia con L20 (arriba) es real: con
+    // `SYNSEMA_ATTEST` explícito el driver se valida ANTES de correr, así que un nombre que esta
+    // máquina no puede servir corta de entrada; con autodetección el driver elegido SÍ existe y
+    // recién falla al pedirle el documento, con el programa ya corrido y su salida impresa — que
+    // es lo mismo que pasa en el camino feliz (primero la salida, después la línea JSON). Lo que
+    // no puede pasar en ninguno de los dos es que salga un artefacto atestado.
     let (code, out, err) = synsema(&dir, &["run", "--attest", "p.syn"], &[("SYNSEMA_ATTEST", None), ("DSTACK_SIMULATOR_ENDPOINT", None)]);
     if code != 0 {
         assert!(err.contains("attest"), "el error nombra la capability: {}", err);
-        assert!(!out.contains("output_sha"), "no se publica nada al fallar: {}", out);
-        assert!(out.trim().is_empty(), "el driver se valida antes de correr; stdout = {:?}", out);
+        for marca in ["output_sha", "attestation", "program_sha", "state_root"] {
+            assert!(!out.contains(marca), "al fallar no sale NADA del artefacto ({}): {:?}", marca, out);
+        }
     } else {
         assert!(out.contains("output_sha"));
     }

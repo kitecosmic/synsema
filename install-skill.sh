@@ -33,6 +33,7 @@ processes.md
 code.md
 capabilities.md
 labels.md
+attestation.md
 secrets.md
 agents.md
 llm.md

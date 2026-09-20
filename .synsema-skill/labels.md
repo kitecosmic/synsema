@@ -153,6 +153,12 @@ depending on which entry was selected, so a table of 256 entries spelled a byte 
 with the run succeeding and the static review green. In a multi-tenant deployment the principal
 *is* the tenant, so printing a redacted value told the operator whose data it was.
 
+**A label violation ends the whole `synsema test --labels` run**, with a single outcome naming the
+violation — not a `✗` on that block with the suite carrying on. A per-block verdict would be
+*catching the enforcement itself*: eight blocks each probing one bit, and the column of ✓/✗ spells
+the byte. An ordinary failure — a failed assertion, an error — is still a per-block verdict, as
+always.
+
 ## `steps()` and the cost of a run
 
 `steps()` is one step per AST node, so after a loop whose condition depended on a secret it *is*
@@ -199,6 +205,9 @@ nothing private, and every line of the listing is a decision somebody made and w
 
 ## See also
 
+- [attestation.md](attestation.md) — the other half of confidential computing: proving WHICH code
+  answered (`serve --attested`, `run --attest`, `attestation_verify`), and the deterministic
+  DP noise (`laplace_noise`/`gaussian_noise`) you publish an aggregate with
 - [capabilities.md](capabilities.md) — the other wall: `require`, ceilings, `sandbox`, `attest`
 - [guests.md](guests.md) — the guest adapter, where labels are always on and the sinks are the chain
 - [observability.md](observability.md) — `steps()` and the rest of the instrumentation
