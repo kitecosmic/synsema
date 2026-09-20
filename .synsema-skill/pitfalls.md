@@ -517,3 +517,32 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
   intermittently inside V8 (concurrent tier-up race) while running `synsema_vela_guest.wasm`
   (22.23.2 on Linux: 1 run in 3). Use Node 20 or 24+, or `node --no-wasm-dynamic-tiering`.
   wasmtime-go v1.0.0 (Vela's Executor) is unaffected — see [guests.md](guests.md).
+
+## `judge` (System One / Jev) — engine v0.6.25+ (see [judge.md](judge.md))
+
+- **`Unsupported operation: nothing > number` on `v.x.probability > 0.5`** — the judge is offline
+  (no `TYPESAFE_API_KEY`, over `SYNSEMA_JUDGE_BUDGET`, or the API failed) and the answer degraded to
+  `available: false` with `probability`/`choice`/`score` = `nothing`. That is the honest form — an
+  invented 0.5 would be indistinguishable from a real one. Gate on `available` or on `confidence`
+  (0 offline) before comparing; the stderr notice says what to set.
+- **`Capability not granted: judge` under `serve` although you wrote `require llm`** — `judge` is its
+  own capability. Add `require judge`. Under `--deterministic` it is denied by design (network I/O).
+- **`v.x.type` / `v.x.probabilities.nothing` do not parse** — `type` and `nothing` are reserved. The
+  field is `kind`; the escape key is `none` (`choice` itself is `nothing` when the escape wins).
+- **`'rate' takes ordered levels: write rate … across […]`** (or the mirror for `choose … across`) —
+  the prepositions are fixed: `between` = unordered options, `across` = ordered levels.
+- **Confident wrong answer on a state that fits no option** — you wrote `choose … between {…}`
+  without `or nothing`. Measured: 0.69 on a no-fit message, 0.79 at confidence 0.68 with the right
+  value missing from the candidates. Add `or nothing` and check `choice == nothing`.
+- **`choose needs at least 2 options`** — the API accepts one and answers with confidence 1.0; the
+  engine refuses before the call. Same for `rate` (2–10 levels, distinct ids).
+- **A `whether` about a total, a sum, a count of many items, or a date difference is wrong** — the
+  model recognises the shape of an answer, it does not calculate (a six-line total: 0.32 for a true
+  statement). Compute in Synsema, judge the result. Small counts were fine; do not rely on it.
+- **`P(A)` and `P(not A)` do not add up to 1** (0.37 + 0.78 measured) — never derive one from the
+  other; ask in the positive and negate in code.
+- **Your test asserts `probability == 0.72` and flakes** — the same request twice moves by a few
+  hundredths. Assert the winner and a range. `SYNSEMA_JUDGE_PROVIDER=mock` for exact, offline CI.
+- **`judge[0]` suddenly "expected an indented block"** — it cannot; `[` never opens `judge`. If you
+  see that error, `judge` is followed by an identifier, string, `{` or literal on the same line and
+  the block is missing or badly indented.

@@ -13,6 +13,8 @@ pub mod host;
 /// sin la feature el binario no arrastra candle y se comporta idéntico a antes.
 #[cfg(feature = "llm-local")]
 pub mod llm_local;
+/// Provider del primitivo `judge` (System One): slot paralelo al de LLM.
+pub mod judge_provider;
 pub mod llm_providers;
 pub mod parallel;
 pub mod persistence;

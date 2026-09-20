@@ -2503,6 +2503,13 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         if self.soft_dsl("show") {
             return self.parse_show();
         }
+        // `judge <state>` + bloque: palabra blanda en posición de expresión con lookahead
+        // POSITIVO (la primera en esa posición): abre la construcción sólo si lo sigue algo
+        // que puede empezar un operando. `f(judge, 2)`, `[judge]`, `let x be judge` a fin
+        // de línea y `judge.x` siguen siendo el identificador `judge`.
+        if self.judge_opens_here() {
+            return self.parse_judge_expr();
+        }
 
         match tok.ty {
             TokenType::Number => {
@@ -2669,6 +2676,191 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                 criteria: None,
             },
         ))
+    }
+
+    /// `judge` abre su construcción sólo si lo sigue un token que puede empezar un operando
+    /// (spec system-one-judge §10.1, punto 11). En cualquier otro contexto es un nombre.
+    fn judge_opens_here(&self) -> bool {
+        // `[` NO abre: `judge[0]` es un índice sobre la variable `judge`. Un state que es
+        // lista literal se liga antes (`let items be [...]` → `judge items`). Los literales
+        // escalares sí abren, para que `judge 42` dé el error de tipo del state y no un
+        // "unexpected NUMBER" sin explicación.
+        self.check_word("judge")
+            && matches!(
+                self.peek(1).ty,
+                TokenType::Identifier
+                    | TokenType::Text
+                    | TokenType::Template
+                    | TokenType::LBrace
+                    | TokenType::Number
+                    | TokenType::BoolTrue
+                    | TokenType::BoolFalse
+                    | TokenType::Nothing
+            )
+    }
+
+    /// `judge <state>` seguido de un bloque indentado de preguntas `id: verbo …`. El bloque
+    /// es la única forma a propósito: el batch es donde está el precio y la latencia, y una
+    /// sola pregunta son tres líneas igual.
+    fn parse_judge_expr(&mut self) -> Result<Node, ParseError> {
+        let loc = self.location();
+        self.advance(); // 'judge'
+        let state = self.parse_expression()?;
+        self.skip_newlines();
+        if !self.check(TokenType::Indent) {
+            return Err(ParseError::new(
+                "Expected an indented block of questions after 'judge <state>': one per line, \
+                 `id: whether \"…\"`, `id: choose \"…\" between {…}` or `id: rate \"…\" across […]`"
+                    .to_string(),
+                self.current().location.clone(),
+            ));
+        }
+        self.advance(); // Indent
+        self.skip_newlines();
+        let mut questions: Vec<crate::ast::JudgeQuestionNode> = Vec::new();
+        while !self.at_end() && !self.check(TokenType::Dedent) {
+            let q = self.parse_judge_question()?;
+            if questions.iter().any(|p| p.id == q.id) {
+                return Err(ParseError::new(
+                    format!(
+                        "judge: the question id '{}' is declared twice; each id names one answer",
+                        q.id
+                    ),
+                    q.loc.clone(),
+                ));
+            }
+            questions.push(q);
+            if !self.check_any(&[TokenType::Newline, TokenType::Dedent, TokenType::Eof]) {
+                let tok = self.current();
+                return Err(ParseError::new(
+                    format!(
+                        "judge: expected the end of the line after the question, got {}",
+                        tok.ty.name()
+                    ),
+                    tok.location.clone(),
+                ));
+            }
+            self.skip_newlines();
+        }
+        if self.check(TokenType::Dedent) {
+            self.advance();
+        }
+        if questions.is_empty() {
+            return Err(ParseError::new(
+                "judge: the block needs at least one question".to_string(),
+                loc,
+            ));
+        }
+        Ok(Node::new(
+            loc,
+            NodeKind::JudgeExpression {
+                state: Box::new(state),
+                questions,
+            },
+        ))
+    }
+
+    /// Una línea del bloque `judge`. Las preposiciones son obligatorias y distintas a
+    /// propósito: `between` dice opciones sin orden, `across` dice niveles ordenados; cruzarlas
+    /// es error con el fix exacto.
+    fn parse_judge_question(&mut self) -> Result<crate::ast::JudgeQuestionNode, ParseError> {
+        use crate::judge::JudgeKind;
+        let qloc = self.location();
+        let id_tok = self.expect_name("question id (as in `refund: whether \"…\"`)")?;
+        let id = id_tok.as_str().to_string();
+        self.expect(TokenType::Colon, "Expected ':' after the question id inside 'judge'")?;
+        let kind = if self.check_word("whether") {
+            JudgeKind::Whether
+        } else if self.check_word("choose") {
+            JudgeKind::Choose
+        } else if self.check_word("rate") {
+            JudgeKind::Rate
+        } else {
+            let tok = self.current();
+            return Err(ParseError::new(
+                format!(
+                    "Inside 'judge', expected 'whether', 'choose' or 'rate' after '{}:', got {}",
+                    id,
+                    tok.ty.name()
+                ),
+                tok.location.clone(),
+            ));
+        };
+        self.advance(); // el verbo
+        let instruction = self.parse_expression()?;
+        let mut criteria = None;
+        let mut escape = false;
+        match kind {
+            JudgeKind::Whether => {
+                if self.check_word("between") || self.check_word("across") {
+                    return Err(ParseError::new(
+                        "'whether' takes no options: it judges one statement. Use `choose \"…\" between {…}` \
+                         for options or `rate \"…\" across […]` for ordered levels"
+                            .to_string(),
+                        self.current().location.clone(),
+                    ));
+                }
+            }
+            JudgeKind::Choose => {
+                if self.check_word("across") {
+                    return Err(ParseError::new(
+                        "'choose' takes unordered options: write `choose \"…\" between {…}` \
+                         ('across' introduces the ordered levels of 'rate')"
+                            .to_string(),
+                        self.current().location.clone(),
+                    ));
+                }
+                self.expect_word(
+                    "between",
+                    "Expected 'between' after the choose instruction: `choose \"…\" between {\"id\": \"description\", …}`",
+                )?;
+                criteria = Some(Box::new(self.parse_postfix()?));
+                if self.check(TokenType::Or) {
+                    self.advance();
+                    if !self.check(TokenType::Nothing) {
+                        return Err(ParseError::new(
+                            "After the options of 'choose' only `or nothing` is allowed: it adds an escape \
+                             option, and `choice` is nothing when no option fits"
+                                .to_string(),
+                            self.current().location.clone(),
+                        ));
+                    }
+                    self.advance();
+                    escape = true;
+                }
+            }
+            JudgeKind::Rate => {
+                if self.check_word("between") {
+                    return Err(ParseError::new(
+                        "'rate' takes ordered levels: write `rate \"…\" across [\"low\", \"mid\", \"high\"]` \
+                         ('between' introduces the unordered options of 'choose')"
+                            .to_string(),
+                        self.current().location.clone(),
+                    ));
+                }
+                self.expect_word(
+                    "across",
+                    "Expected 'across' after the rate instruction: `rate \"…\" across [\"level\", …]`",
+                )?;
+                criteria = Some(Box::new(self.parse_postfix()?));
+                if self.check(TokenType::Or) {
+                    return Err(ParseError::new(
+                        "`or nothing` only applies to 'choose': an ordered scale has no escape level. \
+                         Guard the rate with a `whether` that asks if the state applies"
+                            .to_string(),
+                        self.current().location.clone(),
+                    ));
+                }
+            }
+        }
+        Ok(crate::ast::JudgeQuestionNode {
+            id,
+            kind,
+            instruction: Box::new(instruction),
+            criteria,
+            escape,
+            loc: qloc,
+        })
     }
 
     fn parse_analyze_expr(&mut self) -> Result<Node, ParseError> {

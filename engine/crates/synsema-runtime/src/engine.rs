@@ -475,7 +475,8 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     "attestation_document", "attestation_key", "attestation_verify",
     // Estado declarado y observabilidad, sólo LECTURA (las escrituras — `remember`, `add_rule`,
     // `create_progress`, `start_step`, `complete_step`, `fail_step`, `state_*` — sí son sumideros)
-    "check_rules", "get_rules", "llm_available", "llm_usage", "memory_summary", "openapi_json",
+    "check_rules", "get_rules", "judge_available", "judge_model", "judge_usage", "llm_available", "llm_usage",
+    "memory_summary", "openapi_json",
     "progress_display", "progress_percent", "resume_point", "spend_total",
     // Orden superior: no hacen efecto por sí mismos, DESPACHAN código del programa (el intérprete empuja el PC
     // A los callbacks, y los sumideros que use el callee se comprueban ahí). `parallel_map` NO está acá: cruza
@@ -590,6 +591,10 @@ pub(crate) fn wire_common_with_state(
         // (gateadas más abajo). En no-secure se auto-concede como stdout/time, por
         // ergonomía + retrocompat; en secure/serve hay que declarar `require llm`.
         caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Llm, None));
+        // `judge` (System One) es capability PROPIA: misma ergonomía que `llm` en no-secure,
+        // pero en secure/serve hay que declarar `require judge` (clasificar y generar son
+        // derechos distintos).
+        caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Judge, None));
     }
     register_secure_builtins(interp, caps.clone());
     // Secretos/env: carga el `.env` (antes de evaluar require/serve) y registra
@@ -603,6 +608,7 @@ pub(crate) fn wire_common_with_state(
         let mut sensitive: std::collections::HashSet<String> =
             crate::llm_providers::LLM_ENV_VARS.iter().map(|s| s.to_string()).collect();
         sensitive.extend(crate::llm_providers::HUMAN_ENV_VARS.iter().map(|s| s.to_string()));
+        sensitive.extend(crate::judge_provider::JUDGE_ENV_VARS.iter().map(|s| s.to_string()));
         sensitive.extend(env_store.keys());
         interp.set_sensitive_env(sensitive);
     }
@@ -758,6 +764,16 @@ pub(crate) fn wire_common_with_state(
             .require(&Capability::new(CapabilityType::Llm, None), "llm operation")
             .map_err(|v| v.message)
     }));
+    // Gate de `judge`: cada bloque exige la capability `judge`, propia y no concedida por
+    // `llm`. Mismo CapabilitySet → mismo audit_log. Sin provider cableado el bloque igual
+    // pasa por acá: el gate es del lenguaje, no del transporte.
+    let caps_judge = caps.clone();
+    interp.set_judge_cap_hook(Rc::new(move || {
+        caps_judge
+            .borrow_mut()
+            .require(&Capability::new(CapabilityType::Judge, None), "judge block")
+            .map_err(|v| v.message)
+    }));
     // Aislamiento de `sandbox`: al entrar guarda y VACÍA el CapabilitySet (deniega todo);
     // al salir, restaura. Stack para sandboxes anidados. Cubre TODOS los builtins gateados
     // de una sola vez (leen el mismo CapabilitySet vía el `caps` Rc compartido).
@@ -868,6 +884,23 @@ pub(crate) fn wire_common_with_state(
 /// `pub(crate)` para que `serve` también cablee el provider en sus intérpretes (DE-029):
 /// sin esto, `llm_available()` era false bajo serve y reason/decide/generate/llm_step caían
 /// a placeholders pese a `require llm` + `.env` con la clave.
+/// Cablea el provider de `judge` (System One) si hay uno configurado: `TYPESAFE_API_KEY`
+/// presente o `SYNSEMA_JUDGE_PROVIDER` explícito (`typesafe` | `mock`). Slot PARALELO al de
+/// LLM: los dos pueden estar cableados a la vez y es lo normal (Jev decide, el LLM escribe).
+/// Offline: no cablea nada → cada respuesta degrada a `available: false` con confianza 0.
+/// Se llama en los mismos tres lugares que `wire_real_llm_provider` (run y los dos caminos
+/// de serve): el bug DE-029 del LLM fue justamente olvidarse de serve.
+pub(crate) fn wire_real_judge_provider(interp: &mut Interpreter) {
+    let store = EnvStore::load_default();
+    let provider = match crate::judge_provider::provider_from_config(&store) {
+        Some(p) => p,
+        None => return,
+    };
+    interp.set_judge_usage_callback(Rc::new(crate::judge_provider::judge_tokens_total));
+    interp.set_judge_model_callback(Rc::new(crate::judge_provider::judge_last_model));
+    interp.set_judge_callback(Rc::new(move |req| provider.judge_for_interpreter(req)));
+}
+
 pub(crate) fn wire_real_llm_provider(interp: &mut Interpreter) {
     // `load_default` lee `SYNSEMA_ENV_FILE`/`.env` (idempotente; honra `--env-file` y
     // `--no-env-file`). El environ del proceso sigue ganando sobre el `.env`.
@@ -1034,6 +1067,7 @@ fn run_inner(
             // Conectividad LLM real: si hay provider por env, cablea texto + paso
             // tool-aware; offline (sin key) deja los placeholders del core.
             wire_real_llm_provider(&mut interp);
+            wire_real_judge_provider(&mut interp);
             // Gates humanos (DX-3 etapa 1, A1.v1): en `run` interactivo (TTY) el humano
             // decide DE VERDAD (ConsoleHandler espera en la terminal); sin TTY (pipe/CI)
             // se DENIEGA fail-closed con aviso — nunca auto-aprobar en silencio. En

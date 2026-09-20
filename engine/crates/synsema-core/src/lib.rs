@@ -15,6 +15,7 @@ pub mod codeintel;
 pub mod csv;
 pub mod flat_syntax;
 pub mod interpreter;
+pub mod judge;
 pub mod labels;
 pub mod lexer;
 pub mod math;

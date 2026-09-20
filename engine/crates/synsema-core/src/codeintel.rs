@@ -357,6 +357,7 @@ fn direct_caps(body: &[Node], ctx: &ScopeCtx) -> Vec<(String, Option<String>)> {
             | NodeKind::DecideExpression { .. }
             | NodeKind::AnalyzeExpression { .. }
             | NodeKind::GenerateExpression { .. } => push(("llm".to_string(), None)),
+            NodeKind::JudgeExpression { .. } => push(("judge".to_string(), None)),
             _ => {}
         });
     }

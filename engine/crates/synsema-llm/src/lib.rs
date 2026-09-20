@@ -4,5 +4,6 @@
 
 pub mod context;
 pub mod human;
+pub mod judge;
 pub mod provider;
 pub mod validator;

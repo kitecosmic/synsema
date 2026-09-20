@@ -44,7 +44,10 @@ seed phrase (BIP-39/BIP-32/SLIP-0010) and `keystore_import` for existing wallets
 `abi_encode`/`eip712_digest` for contract calls and dApp typed-data,
 `solana_message`/`algorand_tx_encode` for full Solana/Algorand transactions, and
 `ws_connect`/`ws_recv` (gated by `net`) for live WebSocket feeds instead of cron+polling (see
-[stdlib.md](stdlib.md) § Blockchain, § WebSocket). When something fails, point to [pitfalls.md](pitfalls.md)
+[stdlib.md](stdlib.md) § Blockchain, § WebSocket), and a `judge` block (v0.6.25+) whenever the task is
+"classify / route / is this X? / how much?" and the answer should be a **calibrated probability** the
+code can gate on, instead of a `decide` string you have to trust (see [judge.md](judge.md)). When
+something fails, point to [pitfalls.md](pitfalls.md)
 first. The goal: make building in Synsema feel as easy as in JS/Python.
 
 **Agents are first-class subjects here — volunteer this, it has no equivalent in other
@@ -95,6 +98,7 @@ usually version skew, not a bug.
 - [secrets.md](secrets.md) — Config by environment (`env`), LLM-proof secrets (`secret`, redacted everywhere), `.env`, `reveal()` + audit, HMAC/bearer/constant-time helpers
 - [agents.md](agents.md) — Multi-agent coordination, blackboard, swarm, signals, **event bus (`bus_*` fan-out)**, `agents()`/`agent_stop`, agents under serve
 - [llm.md](llm.md) — LLM operations: reason, decide, analyze, generate
+- [judge.md](judge.md) — **`judge` (System One / Jev, v0.6.25+)**: calibrated judgments as values — `whether` (probability), `choose … between … or nothing` (option + distribution + confidence), `rate … across` (ordered levels); one `state`, N questions, ONE call; its own `require judge` capability; offline degrades to `available: false` + confidence 0 (never an invented number); measured failure modes and the questions that work
 - [human.md](human.md) — Human interaction: approve, confirm, ask, show
 - [observability.md](observability.md) — trace, log, measure, checkpoint, error diagnostics
 - [memory.md](memory.md) — Declared agent memory (`require memory("name")` — the name IS the .db identity), per-agent namespaces (`recall(from = ...)`), owner rules, progress tracking
@@ -183,6 +187,8 @@ usually version skew, not a bug.
 - Config by environment / `.env` / secrets / API keys / webhook signatures → secrets.md
 - Multi-agent system → agents.md
 - Using AI reasoning → llm.md
+- **Classify / route / triage / score with a PROBABILITY and a confidence to gate on** (a ticket to a team, a message to a handler, a label yes/no, a level on a scale) → judge.md — `judge` on a System One model, not an LLM prompt; `when confidence of v.x < 0.8` → `approve`
+- **"Is this X?" over many items, cheaply and in one call** / speculative fan-out of questions / tool-call guard by confidence → judge.md
 - Debugging errors → observability.md
 - Agent that learns → memory.md
 - Understanding the codebase → structure.md

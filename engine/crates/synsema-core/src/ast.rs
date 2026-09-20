@@ -52,6 +52,19 @@ pub struct Arg {
     pub value: Node,
 }
 
+/// Una pregunta del bloque `judge`: `id: whether "…"`, `id: choose "…" between {…} [or nothing]`
+/// o `id: rate "…" across […]`. `criteria` es la expresión de opciones/niveles (lista o map);
+/// `escape` es el `or nothing` de `choose`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct JudgeQuestionNode {
+    pub id: String,
+    pub kind: crate::judge::JudgeKind,
+    pub instruction: Box<Node>,
+    pub criteria: Option<Box<Node>>,
+    pub escape: bool,
+    pub loc: SourceLocation,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum NodeKind {
     // -- Literales --
@@ -303,6 +316,12 @@ pub enum NodeKind {
         options: Option<Box<Node>>,
         given: Option<Box<Node>>,
         criteria: Option<String>,
+    },
+    /// `judge <state>` + bloque de preguntas (System One): un `state`, N juicios calibrados,
+    /// una llamada. Devuelve un map id → respuesta.
+    JudgeExpression {
+        state: Box<Node>,
+        questions: Vec<JudgeQuestionNode>,
     },
     AnalyzeExpression {
         data: Box<Node>,

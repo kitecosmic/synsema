@@ -4830,6 +4830,7 @@ dependencies = [
  "indexmap",
  "rand 0.8.6",
  "regex",
+ "serde_json",
  "synsema-capabilities",
  "synsema-core",
 ]

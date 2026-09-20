@@ -6,6 +6,49 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.25 — 2026-09-20
+
+No breaking changes. Programs that load on v0.6.24 load unchanged.
+
+### Added
+
+- **`judge` — calibrated judgments as values.** A new expression asks a *System One* model (the first
+  backend is TypeSafe's Jev) typed questions about one `state` and gets probabilities back, not text:
+  `whether "…"` (the probability a statement is true), `choose "…" between {…} [or nothing]` (an
+  option, its distribution and a confidence), `rate "…" across […]` (a position on ordered levels,
+  the winning level, the distribution and a confidence). One block is one call; the block is the
+  only form on purpose. The result is a flat map id → answer; every answer carries `kind` and
+  `available`. `or nothing` adds an escape option so a state that fits no option yields `choice` =
+  `nothing` instead of a confident wrong pick. Options and levels take a list or a map (id →
+  description) under one rule. The instruction may be a map (read as structure).
+
+- **`require judge`, a capability of its own.** Not granted by `llm` and not granting it: classifying
+  and generating are different rights. Auto-granted in plain `run`/`conform`, required under `serve`
+  and in secure mode, emptied in `sandbox`, denied under `--deterministic`, offline in a wasm guest.
+  Under `--labels` the block is a declared public sink.
+
+- **Honest degradation.** Without a provider, over `SYNSEMA_JUDGE_BUDGET`, or after a network
+  failure, every answer is `available: false` with `confidence: 0` and its main value `nothing` —
+  a confidence gate then routes to the human path by itself, and a direct comparison fails loud
+  instead of branching in silence. An invented probability is never returned.
+
+- **The parallel slot.** `TYPESAFE_API_KEY`, `SYNSEMA_JUDGE_PROVIDER` (`typesafe` | `mock`),
+  `SYNSEMA_JUDGE_MODEL`, `SYNSEMA_JUDGE_BASE_URL`, `SYNSEMA_JUDGE_TIMEOUT`, `SYNSEMA_JUDGE_BUDGET`,
+  all written by `synsema init` into `.env.example`. The key never enters the program; the host is
+  fixed by the runtime. 429/529 are retried with backoff honouring `retry-after`; a 400/422 is a
+  runtime error carrying the vendor's message. Builtins `judge_available()`, `judge_usage()`,
+  `judge_model()`.
+
+- **Checks before the call**: verbs and prepositions, `or nothing` only after `choose`, duplicate
+  ids and an empty block at load time; 2–255 options, 2–10 levels, duplicate option or level ids,
+  empty instruction and the type of the state at run time, before any token is spent.
+
+### Not in this release
+
+`synsema judge status`, static checking of option counts by `check`, `whether` with explicit yes/no
+criteria, the non-calibrated `llm` fallback, the Cloudflare Workers AI wire variant, and serving
+`decide` with the judge. The skill page `.synsema-skill/judge.md` lists what was measured live.
+
 ## v0.6.24 — 2026-09-20
 
 ### Breaking

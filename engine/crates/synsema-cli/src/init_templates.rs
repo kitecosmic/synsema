@@ -155,6 +155,24 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # Numeros reales: una tarea normal gasta 20k+ tokens por llamada:
 # SYNSEMA_LLM_BUDGET_PER_IDENTITY=agent-1=500000,researcher=2000000
 
+# ══ Judge (System One) — el bloque `judge` del lenguaje; slot PARALELO al LLM ══
+# Juicios calibrados (whether / choose / rate) sobre un `state`. No genera texto: no
+# sirve reason/decide/analyze/generate, y el LLM de arriba no sirve `judge`. Los dos
+# cableados a la vez es lo normal. Sin clave: `judge` queda OFFLINE y cada respuesta
+# vuelve con available: false y confianza 0 (nunca una probabilidad inventada).
+# La presencia de la clave autoselecciona el provider:
+# SYNSEMA_JUDGE_PROVIDER=typesafe   # TypeSafe (Jev) — o `mock` para tests y demos sin clave
+# TYPESAFE_API_KEY=
+# Id o alias del modelo (el que contesto se consulta con judge_model()):
+# SYNSEMA_JUDGE_MODEL=jev-latest
+# Endpoint base — cualquier host que sirva el mismo cable (p. ej. el AI Gateway de Vercel):
+# SYNSEMA_JUDGE_BASE_URL=https://api.typesafe.ai
+# Timeout HTTP en segundos:
+# SYNSEMA_JUDGE_TIMEOUT=60
+# Presupuesto DURO de tokens de ENTRADA de judge por proceso (la salida es gratis). Al
+# llegar, las respuestas degradan a available: false sin tocar la red; judge_usage() lo cuenta:
+# SYNSEMA_JUDGE_BUDGET=
+
 # ══ Techos del host — dinero y firmas (el programa NO puede subirlos) ══
 
 # Techo de gasto por unidad para spend(monto, unidad, motivo): pares unidad:monto
@@ -333,10 +351,15 @@ const HELLO_SYN_PAST: &[&str] = &[
     // v0.6.19 (d7d12f8, 2026-09-06): el hello.syn previo al cambio de URLs a synsema.org /
     // synsema.dev; su sha no se agregó en ese commit (el guard se saltea en CI shallow).
     "af7a6c93900b99b083c8b263c339982b0de0a212000724ed9fd1ff9fff03abdc",
+    // 2026-09-20 (tanda judge): una version intermedia de hello.syn cuyo sha nunca entro a
+    // `past` (el guard se saltea en CI shallow); latente hasta que el test corrio local.
+    "cde4fed8b007164a55992a2b539eba4a4bb5428695c38664effe913ecc1ec3bb",
 ];
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
 const ENV_EXAMPLE_PAST: &[&str] = &[
+    // V0.6.25 (2026-09-20): antes de la seccion "Judge (System One)" (SYNSEMA_JUDGE_*, TYPESAFE_API_KEY).
+    "7dfea9ca0c0a25c61f904cdf2800fe0ec130129920d89c72abacbc511976866f",
     // V0.6.23 (2026-09-18, auditoria externa): la seccion "Attestation (TEEs)" antes de DSTACK_SIMULATOR_ENDPOINT.
     "389916c6930df6c0b862824841025f60eb885e815e650568bd115d7b49b3c851",
     // V0.6.23 (2026-09-18): antes de la seccion "Attestation (TEEs)" (SYNSEMA_ATTEST*).
@@ -961,6 +984,8 @@ pub const PWA_FILES: [InitFile; 10] = [
         "b35f3e66902c4380aececfcf717025d97f475d8f76226e0f345fc1266c5ec2ef", // v0.6.15
         "c871f31d0cebbda647c7020ce3416ec3b9f25f452cf7ab0c0574ef756859afe4", // v0.6.16
         "4f589b3fa0ffb8177bf17fbfc35f816438482d557ea20e3091a854110ce65cd1", // v0.6.17–v0.6.18 (rutas inline)
+        // 2026-09-20 (tanda judge): version intermedia cuyo sha nunca entro (guard salteado en CI shallow).
+        "5028ebcd9aa63bd5cfe17971824d11f4a00fd30fca78c66545af51c1ec2740bc",
     ] },
     InitFile { name: "api.syn", content: PWA_API_SYN, past: &[] },
     InitFile { name: "push_keys.syn", content: PWA_PUSH_KEYS_SYN, past: &[] },
@@ -983,7 +1008,10 @@ pub const PWA_FILES: [InitFile; 10] = [
 
 /// `synsema init --desktop`: sobre el scaffold PWA (modular), la entrada de escritorio y su socket.
 pub const DESKTOP_FILES: [InitFile; 2] = [
-    InitFile { name: "desk.syn", content: DESKTOP_DESK_SYN, past: &[] },
+    InitFile { name: "desk.syn", content: DESKTOP_DESK_SYN, past: &[
+        // 2026-09-20 (tanda judge): version intermedia cuyo sha nunca entro (guard salteado en CI shallow).
+        "5badfe21c16dc374a42aa42b1e3c938d288c3c95cd6f973e0a17b4a1f36bbaa6",
+    ] },
     InitFile { name: "public/desk.js", content: DESKTOP_DESK_JS, past: &[] },
 ];
 
@@ -1290,6 +1318,7 @@ mod tests {
             .chain(synsema_stdlib::server::SERVE_ENV_VARS.iter())
             .chain(synsema_stdlib::attest::ATTEST_ENV_VARS.iter())
             .chain(synsema_runtime::run_program::RUN_PROGRAM_ENV_VARS.iter())
+            .chain(synsema_runtime::judge_provider::JUDGE_ENV_VARS.iter())
             .chain(crate::audit::HOST_ENV_VARS.iter())
             .copied()
             .collect();

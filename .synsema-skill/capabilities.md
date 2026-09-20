@@ -4,7 +4,7 @@
 Nothing works without declaring capabilities.
 
 ## Capability types
-`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `db`, `serve`, `secret`, `reveal`, `sign`, `wallet`, `spend`, `memory`, `sandbox_run` (v0.6.14+ — `run_program`), `attest` (ask the platform for an attestation document). In `--cap-set`, `none` = an empty ceiling.
+`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `judge` (v0.6.25+ — the `judge` block, see [judge.md](judge.md)), `db`, `serve`, `secret`, `reveal`, `sign`, `wallet`, `spend`, `memory`, `sandbox_run` (v0.6.14+ — `run_program`), `attest` (ask the platform for an attestation document). In `--cap-set`, `none` = an empty ceiling.
 
 `serve(PORT)` allows binding an HTTP server to that port — see [serve.md](serve.md).
 
@@ -32,6 +32,7 @@ require secret("APP_*")             -- name prefix: APP_DB, APP_KEY, … (only a
 require reveal("STRIPE_API_KEY")    -- enable reveal() for THAT secret only (loud + audited; scoped by name/label)
 require time
 require llm                         -- enable LLM ops (reason/decide/analyze/generate)
+require judge                       -- enable the `judge` block (System One judgments); NOT granted by `llm`
 require serve(8080)                 -- bind an HTTP server to this port
 require sign("HOT_KEY")             -- enable signing with THAT key (deny-by-default + audited)
 require wallet                      -- enable creating custody (mnemonics/HD/keystore); scope with wallet("NAME")
@@ -46,6 +47,16 @@ require memory("support-agent")     -- persistent agent state (remember/rules/pr
 ```
 
 `require` in the program body grants the capability for real. This is NOT just a declaration — it enables the operation.
+
+## The `judge` capability (v0.6.25+)
+
+The `judge` block ([judge.md](judge.md)) needs `require judge`. It is **its own** capability — `require llm`
+does not grant it and vice versa — because classifying and generating are different rights: a program
+that may judge cannot exfiltrate through free text or be talked into writing. Same ergonomics as `llm`
+otherwise: auto-granted in plain `run`/`conform`, required under `serve` and in secure mode
+(`Capability not granted: judge`), emptied inside `sandbox`, denied under `--deterministic` (network
+I/O), always offline in a wasm guest. Coarse, no scope: the host is fixed by the runtime
+(`SYNSEMA_JUDGE_BASE_URL`), never by the program. `--cap-set judge` = may judge, may not call the LLM.
 
 ## The `llm` capability
 

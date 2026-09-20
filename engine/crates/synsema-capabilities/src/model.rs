@@ -22,6 +22,10 @@ pub enum CapabilityType {
     Stdout,
     Stdin,
     Llm,
+    /// El primitivo `judge` (System One): juicios calibrados contra un `state`. Capability
+    /// PROPIA, no la concede `llm`: un programa puede tener derecho a clasificar sin tener
+    /// derecho a generar. Coarse, sin scope (el host lo fija el runtime, no el programa).
+    Judge,
     Db,
     Serve,
     /// Leer una variable como `secret` (valor opaco tainted). Scope = nombre/prefijo.
@@ -84,6 +88,7 @@ impl CapabilityType {
             Stdout => "stdout",
             Stdin => "stdin",
             Llm => "llm",
+            Judge => "judge",
             Db => "db",
             Serve => "serve",
             Secret => "secret",
@@ -109,7 +114,7 @@ impl CapabilityType {
 }
 
 /// Nombres aceptados por `--cap-set` (para el mensaje de error y los docs).
-pub const KNOWN_CAPABILITY_NAMES: &str = "net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal, sign, wallet, spend, memory, sandbox_run, attest";
+pub const KNOWN_CAPABILITY_NAMES: &str = "net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, judge, db, serve, secret, reveal, sign, wallet, spend, memory, sandbox_run, attest";
 
 /// Mapa nombre→tipo (CAPABILITY_NAMES del oráculo).
 pub fn capability_type_from_name(name: &str) -> Option<CapabilityType> {
@@ -128,6 +133,7 @@ pub fn capability_type_from_name(name: &str) -> Option<CapabilityType> {
         "stdout" => Stdout,
         "stdin" => Stdin,
         "llm" => Llm,
+        "judge" => Judge,
         "db" => Db,
         "serve" => Serve,
         "secret" => Secret,
@@ -1239,7 +1245,7 @@ mod tanda_motor_tests {
     #[test]
     fn cap_set_item_round_trips_every_type() {
         use CapabilityType::*;
-        for ty in [Net, FileRead, FileWrite, File, Exec, Env, Time, Random, Stdout, Stdin, Llm, Db, Serve, Secret, Reveal, Sign, Wallet, Spend, Memory, SandboxRun, Attest] {
+        for ty in [Net, FileRead, FileWrite, File, Exec, Env, Time, Random, Stdout, Stdin, Llm, Judge, Db, Serve, Secret, Reveal, Sign, Wallet, Spend, Memory, SandboxRun, Attest] {
             for scope in [None, Some("x-*".to_string())] {
                 let cap = Capability::new(ty, scope.clone());
                 let back = build_ceiling(false, Some(&cap.cap_set_item())).unwrap().unwrap();

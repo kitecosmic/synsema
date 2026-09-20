@@ -277,6 +277,7 @@ fn collect_caps(
             | NodeKind::DecideExpression { .. }
             | NodeKind::AnalyzeExpression { .. }
             | NodeKind::GenerateExpression { .. } => out.push(("llm".to_string(), None)),
+            NodeKind::JudgeExpression { .. } => out.push(("judge".to_string(), None)),
             _ => {}
         });
     }

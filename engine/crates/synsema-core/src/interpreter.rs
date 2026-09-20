@@ -388,6 +388,15 @@ pub type LlmTextCallback = Rc<dyn Fn(&str, &str) -> String>;
 /// de texto genérico (retrocompat: mocks y wirings viejos intactos).
 pub type LlmDecideCallback = Rc<dyn Fn(&str, &[String]) -> String>;
 
+/// Callback del primitivo `judge` (System One): el motor lo cablea con el provider real o
+/// el mock. `Ok(None)` = no disponible (offline, presupuesto agotado, red caída): cada
+/// respuesta degrada a `available: false` con confianza 0. `Err(msg)` = la API rechazó el
+/// pedido por culpa del programa (límites, instrucción vacía): error de runtime con el
+/// mensaje del vendor. Sin callback: offline.
+pub type JudgeCallback = Rc<
+    dyn Fn(&crate::judge::JudgeRequest) -> Result<Option<crate::judge::JudgeResponse>, String>,
+>;
+
 /// Callback de streaming (`llm_stream`, F2): `(prompt, context, sink) -> texto completo`.
 /// El motor lo cablea con `provider.call_stream`; el `sink` recibe cada fragmento a
 /// medida que se genera y devuelve `false` para CORTAR la generación (p.ej. el `send`
@@ -530,6 +539,22 @@ fn first_time(flag: &std::sync::atomic::AtomicBool) -> bool {
     !flag.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
+static JUDGE_OFFLINE_NOTICED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn note_judge_offline() {
+    if first_time(&JUDGE_OFFLINE_NOTICED) {
+        // En INGLÉS y auto-contenido, como el aviso LLM: lo leen humanos y agentes.
+        eprintln!(
+            "[synsema] notice: judge is OFFLINE — every `judge` answer is returning available: false \
+             with confidence 0 and its main value (probability/choice/score) as nothing, not a real \
+             judgment. The program keeps running; a confidence gate sends these to the human path by \
+             itself. To enable it, set TYPESAFE_API_KEY in the process environment or in the .env file \
+             (SYNSEMA_JUDGE_PROVIDER=mock serves deterministic answers for tests and demos)."
+        );
+    }
+}
+
 fn note_llm_offline() {
     if first_time(&LLM_OFFLINE_NOTICED) {
         // En INGLÉS y auto-contenido: este aviso lo leen humanos Y agentes LLM de
@@ -630,6 +655,14 @@ pub struct Interpreter {
     /// `Err(msg)` → la op falla con `Capability not granted: llm`. Sin él: sin gate
     /// (core no depende de capabilities; el motor provee la lógica).
     llm_cap_hook: Option<Rc<dyn Fn() -> Result<(), String>>>,
+    /// Callback de `judge` (ver [`JudgeCallback`]). Sin él: offline, `available: false`.
+    judge_callback: Option<JudgeCallback>,
+    /// `judge_usage()`: tokens de entrada acumulados del proceso. Sin él: 0.
+    judge_usage_callback: Option<Rc<dyn Fn() -> u64>>,
+    /// `judge_model()`: id versionado que contestó la última llamada. Sin él: nothing.
+    judge_model_callback: Option<Rc<dyn Fn() -> Option<String>>>,
+    /// Gate de la capability `judge` (propia: no la concede `llm`). Lo cablea el motor.
+    judge_cap_hook: Option<Rc<dyn Fn() -> Result<(), String>>>,
     /// Hook de `serve on PORT` (lo cablea el motor en el camino de serve).
     serve_hook: Option<ServeHook>,
     /// Sink de `send` dentro de un handler de stream SSE (lo cablea el motor por
@@ -820,6 +853,10 @@ impl Interpreter {
             llm_stream_callback: None,
             llm_usage_callback: None,
             llm_cap_hook: None,
+            judge_callback: None,
+            judge_usage_callback: None,
+            judge_model_callback: None,
+            judge_cap_hook: None,
             serve_hook: None,
             stream_emit: None,
             log_hook: None,
@@ -1797,6 +1834,32 @@ impl Interpreter {
         self.llm_cap_hook = Some(hook);
     }
 
+    /// Cablea el provider de `judge` (real o mock). Ver [`JudgeCallback`].
+    pub fn set_judge_callback(&mut self, cb: JudgeCallback) {
+        self.judge_callback = Some(cb);
+    }
+
+    pub fn set_judge_usage_callback(&mut self, cb: Rc<dyn Fn() -> u64>) {
+        self.judge_usage_callback = Some(cb);
+    }
+
+    pub fn set_judge_model_callback(&mut self, cb: Rc<dyn Fn() -> Option<String>>) {
+        self.judge_model_callback = Some(cb);
+    }
+
+    /// Gate de la capability `judge`: `Err(msg)` → el bloque falla con `Capability not
+    /// granted: judge`. Propia, no la concede `require llm`.
+    pub fn set_judge_cap_hook(&mut self, hook: Rc<dyn Fn() -> Result<(), String>>) {
+        self.judge_cap_hook = Some(hook);
+    }
+
+    fn check_judge_cap(&self) -> Result<(), Control> {
+        if let Some(hook) = &self.judge_cap_hook {
+            hook().map_err(|m| Control::Error(RuntimeError::new(m)))?;
+        }
+        Ok(())
+    }
+
     /// Chequea la capability `llm` (si hay gate). Se llama al inicio de cada op LLM,
     /// con o sin provider real. Sin gate cableado: no-op (no rompe `Interpreter::new`).
     fn check_llm_cap(&self) -> Result<(), Control> {
@@ -2194,6 +2257,28 @@ impl Interpreter {
         self.register("flush", 0, Rc::new(|i, _a, _l| i.b_flush()));
         // Estado del provider LLM: true si el motor cableó uno real (vs placeholder offline).
         self.register("llm_available", 0, Rc::new(|i, _a, _l| Ok(syn_bool(i.llm_callback.is_some()))));
+        // Introspección de `judge`, sin gate (como las de LLM): disponibilidad, tokens de
+        // entrada acumulados y el id versionado que contestó la última llamada.
+        self.register("judge_available", 0, Rc::new(|i, _a, _l| Ok(syn_bool(i.judge_callback.is_some()))));
+        self.register(
+            "judge_usage",
+            0,
+            Rc::new(|i, _a, _l| {
+                let total = i.judge_usage_callback.as_ref().map(|cb| cb()).unwrap_or(0);
+                Ok(syn_int(total as i64))
+            }),
+        );
+        self.register(
+            "judge_model",
+            0,
+            Rc::new(|i, _a, _l| {
+                Ok(i.judge_model_callback
+                    .as_ref()
+                    .and_then(|cb| cb())
+                    .map(|m| syn_text(m.as_str()))
+                    .unwrap_or(SynValue::Nothing))
+            }),
+        );
         // Tokens LLM acumulados del proceso (FRAMEWORK F1). Introspección sin gate,
         // como llm_available; offline/sin provider → 0.
         self.register(
@@ -4048,6 +4133,74 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         Ok(syn_text("[decision pending]"))
                     }
                 }
+            }
+            NodeKind::JudgeExpression { state, questions } => {
+                use crate::judge::{
+                    answer_to_value, is_valid_state, options_from_value, syn_to_json,
+                    validate_question, JudgeQuestion, JudgeRequest,
+                };
+                self.check_judge_cap()?;
+                let st = self.exec(state, env)?;
+                if !is_valid_state(&st) {
+                    return Err(err_at(
+                        format!(
+                            "judge: the state must be a text, a map or a list (got {}); the model reads \
+                             text, so wrap it with text() if you mean its rendering",
+                            st.type_name()
+                        ),
+                        loc,
+                    ));
+                }
+                let mut qs: Vec<JudgeQuestion> = Vec::with_capacity(questions.len());
+                let mut crossing: Vec<SynValue> = vec![st.clone()];
+                for qn in questions {
+                    let instr = self.exec(&qn.instruction, env)?;
+                    let options = match &qn.criteria {
+                        Some(c) => {
+                            let cv = self.exec(c, env)?;
+                            options_from_value(&cv)
+                                .map_err(|m| err_at(format!("judge '{}': {}", qn.id, m), &qn.loc))?
+                        }
+                        None => Vec::new(),
+                    };
+                    let q = JudgeQuestion {
+                        id: qn.id.clone(),
+                        kind: qn.kind,
+                        instruction: syn_to_json(&instr),
+                        options,
+                        escape: qn.escape,
+                        yes_no: None,
+                    };
+                    validate_question(&q).map_err(|m| err_at(m, &qn.loc))?;
+                    crossing.push(instr);
+                    qs.push(q);
+                }
+                // T5: el `state` y las instrucciones cruzan a un tercero — sumidero declarado,
+                // igual que `decide`. La respuesta al borde filoso nº 6 del vendor: el contenido
+                // adversario entra como dato y el motor sabe que ese dato salió del proceso.
+                if self.labels {
+                    let refs: Vec<&SynValue> = crossing.iter().collect();
+                    self.sink_check("judge", &refs, loc)?;
+                }
+                let req = JudgeRequest {
+                    state: syn_to_json(&st),
+                    questions: qs,
+                };
+                let response = match self.judge_callback.clone() {
+                    Some(cb) => cb(&req).map_err(|m| err_at(m, loc))?,
+                    None => {
+                        note_judge_offline();
+                        None
+                    }
+                };
+                // Map plano id → respuesta, en el orden del bloque. Sin metadatos mezclados:
+                // una pregunta llamada `usage` no colisiona con nada.
+                let mut out: IndexMap<String, SynValue> = IndexMap::new();
+                for (i, q) in req.questions.iter().enumerate() {
+                    let a = response.as_ref().and_then(|r| r.answers.get(i));
+                    out.insert(q.id.clone(), answer_to_value(q, a));
+                }
+                Ok(syn_map(out))
             }
             NodeKind::AnalyzeExpression { data, objective } => {
                 self.check_llm_cap()?;

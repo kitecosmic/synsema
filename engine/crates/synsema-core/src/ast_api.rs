@@ -140,6 +140,16 @@ fn children(n: &Node) -> Vec<&Node> {
             v.extend(body.iter());
             v
         }
+        JudgeExpression { state, questions } => {
+            let mut v = vec![state.as_ref()];
+            for q in questions {
+                v.push(q.instruction.as_ref());
+                if let Some(c) = &q.criteria {
+                    v.push(c.as_ref());
+                }
+            }
+            v
+        }
         DecideExpression { options, given, .. } => {
             let mut v = Vec::new();
             if let Some(o) = options {
@@ -620,6 +630,16 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
             }
             v.extend(context.iter_mut().map(|(_, node)| node));
             v.extend(body.iter_mut());
+            v
+        }
+        JudgeExpression { state, questions } => {
+            let mut v = vec![state.as_mut()];
+            for q in questions {
+                v.push(q.instruction.as_mut());
+                if let Some(c) = &mut q.criteria {
+                    v.push(c.as_mut());
+                }
+            }
             v
         }
         DecideExpression { options, given, .. } => {

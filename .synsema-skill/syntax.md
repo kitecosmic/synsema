@@ -38,6 +38,15 @@ never heuristics. See [serve.md](serve.md).
 (see [testing.md](testing.md)); anywhere else `test` is an ordinary identifier
 (`let test be 5`, `task f(test)` are valid).
 
+`judge` (v0.6.25+) is a soft keyword in **expression** position: `judge <state>` followed by an
+indented block of questions (see [judge.md](judge.md)) opens the construction only when the next
+token can start an operand — an identifier, a string, a template, `{` or a scalar literal. `judge[0]`,
+`f(judge, 2)`, `judge.x`, `x of judge` and `let x be judge` at the end of a line keep `judge` as an
+ordinary name (`[` never opens it: bind a list state first). Inside the block, `whether`, `choose`,
+`rate`, `between` and `across` are special; outside it they are plain identifiers
+(`let rate be 2` is valid). The answers use the field `kind` (not `type`) and the escape key `none`
+(not `nothing`) because those two are reserved words and would not parse after a `.`.
+
 ## Operators
 Arithmetic: `+`, `-`, `*`, `/`, `%`, `**` (on `array`, these are **elementwise** with broadcasting — matrix product is `matmul`)
 Comparison: `==`, `!=`, `<`, `>`, `<=`, `>=`

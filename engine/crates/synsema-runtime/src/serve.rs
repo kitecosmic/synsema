@@ -1393,6 +1393,7 @@ fn build_base_interp(
     // para que reason/decide/generate/llm_step de los handlers no caigan a placeholders.
     // Por-worker (no por-request): el provider se resuelve una vez al construir la base.
     crate::engine::wire_real_llm_provider(&mut interp);
+    crate::engine::wire_real_judge_provider(&mut interp);
     // Gates humanos (DX-3 etapa 1, A1.v2): bajo serve, `approve`/`confirm`/`ask` van a
     // la COLA compartida del server — el hilo del request BLOQUEA hasta la respuesta
     // humana (POST /approvals/{id} con el token de la consola) o el deadline (`within`
@@ -3612,6 +3613,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     // DE-029: el provider LLM real también en el intérprete del preámbulo, para que el
     // código top-level (antes del `serve on PORT`) pueda usar reason/decide/generate.
     crate::engine::wire_real_llm_provider(&mut interp);
+    crate::engine::wire_real_judge_provider(&mut interp);
     // Sobrescribir los builtins de memoria/progress en el top-level con los compartidos,
     // para que `remember`/`create_progress` en el top-level también persistan a disco y
     // sean coherentes con lo que ven los handlers.

@@ -338,3 +338,11 @@ deterministically with a scripted mock (engine host-config `run_with_llm_steps`)
 **Force a final answer (no tools).** For "tool-greedy" models that keep calling tools, pass an **empty
 catalog** to make the step return a `final`: `llm_step(prompt, [], ctx)`. Useful as the last turn of a
 loop ("you've gathered enough — now answer") or to bound a runaway tool loop.
+
+## Not an LLM op: `judge` (v0.6.25+)
+
+When the task is "which one / is this X / how much" and you want a **calibrated probability** to gate
+on rather than a string to trust, that is the `judge` block, not `decide` — see [judge.md](judge.md).
+It runs on a **System One model** (Jev) through its own slot (`SYNSEMA_JUDGE_*`, `require judge`):
+the LLM provider cannot serve it and it cannot serve `reason`/`generate`/`analyze`. Both wired at
+once is the normal setup — the judge decides, the LLM writes. `decide` is unchanged.

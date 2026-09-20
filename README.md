@@ -162,6 +162,26 @@ let sorted be sort_by(products, get_price)
 let groups be group_by(orders, get_status)
 ```
 
+### Calibrated judgments (`judge`, v0.6.25+)
+
+Ask a System One model (Jev) typed questions about one value and get **probabilities**, not text —
+one call for the whole block, and a confidence your code can gate on:
+
+```
+require judge
+
+let v be judge ticket
+    refund: whether "The customer is asking for money back"
+    team:   choose "Which team should handle this?" between {"billing": "Payments", "technical": "Bugs"} or nothing
+    anger:  rate "How frustrated is the customer?" across ["Calm", "Frustrated", "Very angry"]
+
+when confidence of v.team < 0.8
+    approve "Route this ticket to " + text(v.team.choice) + "?"
+```
+
+`judge` is its own capability (`require judge`, not granted by `llm`), and offline it degrades to
+`available: false` with confidence 0 — never an invented number. See `.synsema-skill/judge.md`.
+
 ### Concurrency
 
 Real, multi-core parallelism — no GIL. `parallel_map` runs a task over a list

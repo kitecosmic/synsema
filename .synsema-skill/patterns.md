@@ -133,6 +133,37 @@ otherwise
 With a provider, `choice` is guaranteed to be one of YOUR options byte-for-byte; offline
 it's a placeholder — that's why the `llm_available()` guard matters ([llm.md](llm.md)).
 
+## Complete program: calibrated triage with the human gate (`judge`, v0.6.25+)
+
+`synsema run triage.syn` — one call for the whole block; the machine measures, the human decides
+([judge.md](judge.md)). Offline every answer has confidence 0, so the gate routes to the human by itself.
+
+```synsema
+require judge
+
+let ticket be {"subject": "Payouts failing", "text": "I want my money back NOW or I'm cancelling"}
+
+let v be judge ticket
+    refund: whether "The customer is asking for money back"
+    team:   choose "Which team should handle this?" between {
+                "billing":   "Payments, invoicing, refunds",
+                "technical": "Bugs, outages, integrations"
+            } or nothing
+    anger:  rate "How frustrated is the customer?" across ["Calm", "Frustrated", "Very angry"]
+
+when v.team.available and v.team.choice != nothing and confidence of v.team >= 0.8
+    print("route to " + v.team.choice + " (" + v.anger.level + ")")
+otherwise
+    approve "No confident route for this ticket. Hand it to a person?"
+
+when v.refund.available and v.refund.probability > 0.8
+    print("refund requested — open the billing case")
+```
+
+`or nothing` is what keeps a message that fits no team from being routed anyway (measured: without
+it the model picks at confidence 0.4–0.7; with it, `choice` is `nothing`). `whether` has no
+`confidence` — the number *is* the answer; use two thresholds and send the middle to a person.
+
 ## Idioms
 
 ### Wall-clock job that notices it ran late (no runtime catch-up by design)
