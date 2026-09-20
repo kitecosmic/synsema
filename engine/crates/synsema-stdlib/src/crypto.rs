@@ -16,7 +16,6 @@
 //!   error, nunca bytes parciales.
 //!
 //! Todo RustCrypto puro-Rust, ya en el árbol salvo `p521` (0.13, misma pila que `p256`).
-//! Spec `specs/v0.6.20-faltantes-plataforma.md` §5.4.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -70,10 +69,16 @@ impl Curve {
 
 /// Bytes de un argumento: `bytes`, `secret` (expuesto sólo acá) o texto (UTF-8). Devuelve
 /// también si venía sellado, para que la salida herede el sello.
+///
+/// Un secret **sellado** (`attestation_key`) se RECHAZA acá —
+/// Era el camino por el que se extraía el escalar P-256 de la identidad atestada cifrándolo
+/// con `aes_gcm_encrypt` bajo una clave elegida por el programa y descifrándolo afuera. El
+/// único uso legítimo de ese material en este módulo es `ecdh_shared_secret` con la clave
+/// PROPIA, que pide los bytes por `private_key_arg`.
 fn bytes_arg(v: Option<&SynValue>, who: &str, what: &str) -> Result<(Vec<u8>, bool), Control> {
     match v {
         Some(SynValue::Bytes(b)) => Ok((b.to_vec(), false)),
-        Some(SynValue::Secret(s)) => Ok((s.expose_bytes().to_vec(), true)),
+        Some(SynValue::Secret(s)) => Ok((s.expose_bytes_checked(who).map_err(err)?.to_vec(), true)),
         Some(SynValue::Text(s)) => Ok((s.as_bytes().to_vec(), false)),
         Some(other) => Err(err(format!(
             "{}: {} must be bytes, a secret or text, got {}",
@@ -164,12 +169,22 @@ fn b_ecdh_keypair(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Resul
     Ok(syn_map(out))
 }
 
+/// La CLAVE PRIVADA de `ecdh_shared_secret`: igual que `bytes_arg` pero acepta un secret
+/// SELLADO — es el uso legítimo del material de la identidad atestada (MEDIO 0). El resultado
+/// del ECDH es un secret nuevo (no sellado): es un valor derivado, no la clave.
+fn private_key_arg(v: Option<&SynValue>, who: &str) -> Result<Vec<u8>, Control> {
+    match v {
+        Some(SynValue::Secret(s)) => Ok(s.expose_bytes().to_vec()),
+        other => bytes_arg(other, who, "the private key").map(|(b, _)| b),
+    }
+}
+
 fn b_ecdh_shared_secret(args: &[SynValue]) -> Result<SynValue, Control> {
     const F: &str = "ecdh_shared_secret";
     if args.len() != 3 {
         return Err(err(format!("{}(private, peer_public, curve) takes exactly 3 arguments", F)));
     }
-    let (mut private, _) = bytes_arg(args.first(), F, "the private key")?;
+    let mut private = private_key_arg(args.first(), F)?;
     let (peer, _) = bytes_arg(args.get(1), F, "the peer public key")?;
     let curve = Curve::parse(args.get(2), F)?;
     let r = shared_secret(curve, &private, &peer, F);
@@ -282,7 +297,10 @@ pub fn register_crypto_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
     interp.register_builtin("ecdh_shared_secret", -1, Rc::new(|_i, a, _l| b_ecdh_shared_secret(a)));
     interp.register_builtin("hkdf_sha256", -1, Rc::new(|_i, a, _l| b_hkdf_sha256(a)));
     interp.register_builtin("aes_gcm_encrypt", -1, Rc::new(|_i, a, _l| b_aes_gcm_encrypt(a)));
-    interp.register_builtin("aes_gcm_decrypt", -1, Rc::new(|_i, a, _l| b_aes_gcm_decrypt(a)));
+    // `aes_gcm_decrypt(key, nonce, ct, aad, default)` — la variante TOTAL de la operación
+    // canónica de un enclave: un tag manipulado es "rechazo esta petición", no "el proceso muere".
+    // El `aad` va explícito (puede ser `nothing`) para que el reemplazo quede en un lugar fijo.
+    interp.register_builtin("aes_gcm_decrypt", -1, synsema_core::interpreter::with_fallback(4, Rc::new(|_i, a, _l| b_aes_gcm_decrypt(a))));
 }
 
 #[cfg(test)]
@@ -297,6 +315,67 @@ mod tests {
 
     fn to_hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{:02x}", x)).collect()
+    }
+
+    /// Un secret SELLADO (`attestation_key`) no entra a ningún
+    /// borde criptográfico genérico — era el camino por el que se extraía el escalar P-256 de la
+    /// identidad atestada cifrándolo con `aes_gcm_encrypt` bajo una clave del programa. El único
+    /// uso legítimo, ECDH con la clave PROPIA, sigue funcionando; y el borde de TEXTO devuelve la
+    /// forma redactada, así que SQL, headers y concatenación tampoco lo materializan.
+    #[test]
+    fn a_sealed_secret_is_rejected_by_every_generic_crypto_border() {
+        use synsema_core::secret::SecretInner;
+        let scalar = vec![7u8; 32];
+        let sealed = SynValue::Secret(std::rc::Rc::new(SecretInner::new_bytes_sealed("attestation_key", scalar.clone())));
+        let msg = |r: Result<SynValue, Control>| -> String {
+            match r {
+                Err(Control::Error(e)) => e.message,
+                Ok(v) => panic!("esperaba error, devolvió {}", v),
+                Err(_) => panic!("esperaba error, hubo control flow"),
+            }
+        };
+        let nonce = syn_bytes(vec![0u8; 12]);
+        // AES-GCM: como clave y como plaintext (la extracción del auditor era la segunda).
+        let e = msg(b_aes_gcm_encrypt(&[sealed.clone(), nonce.clone(), syn_text("x")]));
+        assert!(e.contains("sealed") && e.contains("aes_gcm_encrypt"), "{}", e);
+        let e = msg(b_aes_gcm_encrypt(&[syn_bytes(vec![1u8; 32]), nonce.clone(), sealed.clone()]));
+        assert!(e.contains("sealed"), "{}", e);
+        let e = msg(b_aes_gcm_decrypt(&[sealed.clone(), nonce, syn_bytes(vec![0u8; 32])]));
+        assert!(e.contains("sealed"), "{}", e);
+        // HKDF: como IKM, como salt y como info.
+        for args in [
+            vec![sealed.clone(), syn_text(""), syn_text(""), SynValue::Number(synsema_core::number::Number::Int(32))],
+            vec![syn_bytes(vec![1u8; 32]), sealed.clone(), syn_text(""), SynValue::Number(synsema_core::number::Number::Int(32))],
+            vec![syn_bytes(vec![1u8; 32]), syn_text(""), sealed.clone(), SynValue::Number(synsema_core::number::Number::Int(32))],
+        ] {
+            let e = msg(b_hkdf_sha256(&args));
+            assert!(e.contains("sealed") && e.contains("hkdf_sha256"), "{}", e);
+        }
+        // ECDH con la clave PROPIA: es el uso legítimo y tiene que seguir andando.
+        let peer = {
+            let sk = p256::SecretKey::from_slice(&[9u8; 32]).unwrap();
+            sk.public_key().to_encoded_point(false).as_bytes().to_vec()
+        };
+        let own = p256::SecretKey::from_slice(&scalar).unwrap();
+        let out = match b_ecdh_shared_secret(&[sealed.clone(), syn_bytes(peer.clone()), syn_text("P-256")]) {
+            Ok(v) => v,
+            Err(Control::Error(e)) => panic!("ECDH con la clave propia falló: {}", e.message),
+            Err(_) => panic!("ECDH con la clave propia: control flow"),
+        };
+        let SynValue::Secret(shared) = &out else { panic!("el shared secret es un secret") };
+        assert!(!shared.is_sealed(), "el derivado NO hereda el sello (es un valor, no la clave)");
+        let expect = p256::ecdh::diffie_hellman(own.to_nonzero_scalar(), p256::PublicKey::from_sec1_bytes(&peer).unwrap().as_affine());
+        assert_eq!(shared.expose_bytes(), expect.raw_secret_bytes().as_slice());
+        // …pero el PEER público sellado no (ahí no hay uso legítimo).
+        let e = msg(b_ecdh_shared_secret(&[syn_bytes(scalar.clone()), sealed.clone(), syn_text("P-256")]));
+        assert!(e.contains("sealed"), "{}", e);
+        // Borde de TEXTO (SQL, header, concat, nombre de archivo): forma redactada, nunca el material.
+        let SynValue::Secret(inner) = &sealed else { unreachable!() };
+        assert_eq!(inner.expose(), "secret(attestation_key)");
+        assert!(inner.expose_bytes_checked("x").is_err());
+        // Un secret común no cambia en nada.
+        let plain = SecretInner::new_bytes("k", vec![1, 2, 3]);
+        assert_eq!(plain.expose_bytes_checked("x").unwrap(), &[1, 2, 3]);
     }
 
     fn bytes_of(v: SynValue) -> Vec<u8> {

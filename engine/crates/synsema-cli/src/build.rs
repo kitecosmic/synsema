@@ -9,7 +9,7 @@
 //! del build, no un "lo busco en disco después". Sin compresión, sin strip: el tamaño es
 //! el del motor.
 //!
-//! Escritorio (specs/build-serve-desktop.md): `--serve` hornea los settings de despliegue
+//! Escritorio: `--serve` hornea los settings de despliegue
 //! (`manifest.serve`, bind explícito por `--bind` o por la cláusula `bind "…"`); `.exe`
 //! automático si el MOTOR es PE; `--no-console` e `--icon` operan sobre la copia del motor
 //! ANTES de anexar el bundle (`pe.rs`); `--bundle` escribe el `.app` (Mach-O) o el directorio
@@ -27,7 +27,7 @@ use crate::{icns, pe, HostFlags};
 
 const USAGE_BUILD: &str = "uso: synsema build <main.syn> -o <salida> [--include <archivo|dir|patrón>]... [--sandbox | --cap-set <list> | --deterministic] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--engine-binary <ruta>] [--serve [--bind <addr>] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--secure]] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <nombre>] [--id <com.ejemplo.app>]]";
 
-/// Los flags de escritorio (tanda escritorio, specs/build-serve-desktop.md §3.6–§3.9). Todos
+/// Los flags de escritorio. Todos
 /// miran el FORMATO DEL MOTOR donante (PE / Mach-O / ELF), no el host que construye.
 #[derive(Debug, Clone, Default)]
 pub struct DesktopOptions {
@@ -297,6 +297,8 @@ fn serve_settings_from_flags(flags: &[(String, String)], secure: bool) -> Result
         tls_key: s.tls_key.clone(),
         bind: Some(s.bind.clone()),
         ceiling: None,
+        // `--attested` no se hornea en el binario: se decide donde corre (como el techo).
+        attested: false,
     };
     ov.validate()?;
     Ok(s)
@@ -367,7 +369,7 @@ fn build(
     let format = bundle_out::engine_format(&engine_bytes);
 
     // Salida: `.exe` automático si el motor es PE y `-o` no tiene extensión; `-o x.app` sobre
-    // Mach-O es sinónimo de `--bundle` (y un error claro sobre cualquier otro formato).
+    // mach-O es sinónimo de `--bundle` (y un error claro sobre cualquier otro formato).
     let mut out_path = PathBuf::from(out);
     let mut want_bundle = desktop.bundle;
     let is_app = out_path.extension().is_some_and(|e| e.eq_ignore_ascii_case("app"));

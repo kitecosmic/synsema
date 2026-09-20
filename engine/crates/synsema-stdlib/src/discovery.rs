@@ -1,4 +1,4 @@
-//! Discovery derivado de la tabla de rutas (tanda discovery — `specs/discovery-openapi.md`):
+//! Discovery derivado de la tabla de rutas:
 //! `/openapi.json`, `/sitemap.xml` y `/docs` (HTML para humanos, Markdown para agentes).
 //!
 //! Principio: todo sale de lo que el server realmente tiene cableado — `RouteSpec`

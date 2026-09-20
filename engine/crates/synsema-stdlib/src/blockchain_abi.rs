@@ -1446,7 +1446,7 @@ fn eip712_digest(args: &[SynValue]) -> Result<SynValue, Control> {
 
 pub(crate) fn register(interp: &Interpreter) {
     interp.register_builtin("abi_encode", 2, Rc::new(|_i, a, _l| abi_encode(a)));
-    interp.register_builtin("abi_decode", 2, Rc::new(|_i, a, _l| abi_decode(a)));
+    interp.register_builtin("abi_decode", -1, synsema_core::interpreter::with_fallback(2, Rc::new(|_i, a, _l| abi_decode(a))));
     interp.register_builtin("abi_selector", 1, Rc::new(|_i, a, _l| abi_selector(a)));
     interp.register_builtin("eip191_digest", 1, Rc::new(|_i, a, _l| eip191_digest(a)));
     interp.register_builtin("eip712_digest", 4, Rc::new(|_i, a, _l| eip712_digest(a)));

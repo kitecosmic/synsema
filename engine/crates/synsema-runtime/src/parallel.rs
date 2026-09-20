@@ -11,6 +11,28 @@
 //! El intérprete sigue síncrono; la concurrencia se agrega alrededor (std::thread).
 //! rayon (cómputo puro) y tokio (C100k, Fase 2) quedan diferidos. Coordinación
 //! cross-worker por blackboard no está en Fase 1 (cada worker aislado).
+//!
+//! **Etiquetas de flujo.** `parallel_map` está registrado
+//! como **SUMIDERO** (`LABEL_SINK_BUILTINS`), no como `label_aware`: con etiquetas encendidas, un
+//! argumento etiquetado (a cualquier profundidad) o un PC no vacío es `label_violation` ANTES de
+//! lanzar ningún worker. Es la opción FAIL-CLOSED y es deliberada; la alternativa —hacerlo
+//! consciente y propagar el valor etiquetado a los workers— es la que exige diseño:
+//!
+//!   * los items cruzan a otro hilo como `SendValue` (`to_send`/`from_send`). CUIDADO al leer
+//!     versiones viejas de esta nota: decían que `SendValue` no tenía variante para
+//!     `SynValue::Private` y que `types.rs` lo degradaba a texto. **Eso ya no es cierto**: la
+//!     variante existe (`types.rs:506`, mapeada en `:567` y `:602`), agregada al cerrar el
+//!     de-etiquetado del snapshot de `serve`. O sea que el obstáculo estructural que justificaba
+//!     "imposible" desapareció, y lo que queda es una decisión conservadora;
+//!   * antes de cambiarla hay que responder qué hace un worker con un valor etiquetado: los
+//!     sumideros del worker corren en OTRO intérprete, con su propio PC, y el resultado se vuelve
+//!     a unir en el padre. Mientras eso no esté especificado y testeado, rechazar es lo correcto.
+//!
+//! Antes de esto el despacho genérico despojaba los argumentos, el worker corría con las etiquetas
+//! encendidas pero con el dato EN CLARO (su `write_file`/`http_post` no veía nada que bloquear) y
+//! El resultado volvía etiquetado: el efecto se fugaba y el programa parecía seguir rastreado.
+//! Los otros caminos que cruzan a un intérprete nuevo ya fallan cerrado por la misma vía:
+//! `run_program` y `spawn`/`share`/`signal` son sumideros, y `cron_every`/`cron_after` también.
 
 use std::cell::RefCell;
 use std::rc::Rc;

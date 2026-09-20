@@ -12,6 +12,16 @@ on:
 permissions:
   contents: write
 
+# Una corrida por tag, y la que llega segunda ESPERA en vez de correr en paralelo (auditoría
+# ronda 4). El `prepare` de abajo resolvió la carrera ENTRE los cuatro jobs del matrix, pero no
+# la de dos corridas del workflow sobre el mismo tag (retag, re-dispatch, un push que llega
+# mientras la anterior sigue viva): las dos crean/adjuntan a la misma Release. `cancel-in-progress`
+# queda en false a propósito — cancelar a mitad de camino deja una Release con assets a medias,
+# que es peor que esperar.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   # Crea la Release UNA sola vez antes del matrix. Sin esto, los 4 jobs corren a
   # crearla concurrentemente y los que pierden la carrera mueren con
@@ -23,16 +33,27 @@ jobs:
     steps:
       - name: Create the release once
         if: startsWith(github.ref, 'refs/tags/')
+        # The tag and the repository travel as environment variables, never interpolated into the
+        # script text: `${{ }}` inside a `run:` is substituted before the shell sees it, so a value
+        # carrying shell metacharacters would be executed. Same pattern as every other step here.
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
         run: |
-          gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
-            gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --title "${{ github.ref_name }}" --generate-notes
+          set -euo pipefail
+          gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || \
+            gh release create "$TAG" --repo "$REPO" --title "$TAG" --generate-notes
 
   build:
     name: ${{ matrix.asset }}
     needs: prepare
     runs-on: ${{ matrix.os }}
+    # Only what the matrix needs: attach assets to the release. The SLSA provenance of the four
+    # binaries is signed by the `attest-binaries` job below, which compiles nothing — a matrix leg
+    # cannot scope permissions per platform, and signing beside a build is the risk worth avoiding.
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -52,10 +73,13 @@ jobs:
             target: x86_64-pc-windows-msvc
             asset: synsema-windows-x86_64.exe
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
+        with:
+          toolchain: "1.96.0"
           targets: ${{ matrix.target }}
 
       # Linux: se compila contra glibc 2.17 con zig como toolchain C/C++ (cargo-zigbuild), así el
@@ -75,7 +99,7 @@ jobs:
       # the runners don't ship it. Linux/macOS use the system assembler (no-op here).
       - name: Install NASM (Windows)
         if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@v1
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
 
       # SYNSEMA_VERSION = el tag que disparó el release (p. ej. v0.3.2). El binario lo
       # hornea como su versión (ver crates/synsema-cli/build.rs) → `synsema version`
@@ -130,7 +154,7 @@ jobs:
       # Siempre como artefacto del run (así un workflow_dispatch sobre una rama valida el build
       # sin publicar nada); a la Release sólo cuando lo disparó un tag.
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.asset }}
           path: |
@@ -139,34 +163,96 @@ jobs:
 
       - name: Upload to Release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
 
+  # SLSA build provenance for the four platform binaries, signed by GitHub's Sigstore instance as
+  # "built by this workflow from this commit". A job of its own so that `id-token` and
+  # `attestations` are granted here ONLY, and to a job that compiles nothing: a matrix leg cannot
+  # scope permissions per platform, and signing next to a third-party build is the blast radius
+  # worth avoiding. The subjects are the very files `build` produced (its run artifacts), each
+  # checked against the .sha256 written next to it before signing. Verified with
+  # `gh attestation verify <asset> --repo kitecosmic/synsema` (SECURITY-GUEST.md); the Linux
+  # binary's attestation is what `attested-image` and `npm-cli` check before they use it.
+  attest-binaries:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          # Only the four platform binaries of this run; every other artifact (wasm-assets,
+          # guest-sha-*, vela-guest-published-sha) has a name that does not start with `synsema-`.
+          pattern: synsema-*
+          merge-multiple: true
+      - name: Every artifact is the file build hashed
+        run: |
+          set -euo pipefail
+          ls -l
+          for a in synsema-linux-x86_64 synsema-macos-aarch64 synsema-macos-x86_64 synsema-windows-x86_64.exe; do
+            # Windows' .sha256 is written by PowerShell (uppercase hash, no file name); the rest by
+            # shasum ("hash  name"). Compare the first token, lowercased, against the real file.
+            expected=$(tr -d '\r' < "$a.sha256" | awk '{print tolower($1)}' | head -1)
+            actual=$(sha256sum "$a" | awk '{print $1}')
+            [ "$expected" = "$actual" ] || { echo "::error::sha256 mismatch for $a: $expected != $actual"; exit 1; }
+            echo "sha256 ok: $a"
+          done
+      - name: Attest build provenance (the four platform binaries)
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            synsema-linux-x86_64
+            synsema-macos-aarch64
+            synsema-macos-x86_64
+            synsema-windows-x86_64.exe
+
   # Artefactos WebAssembly (fase 2): el bin wasip1 (wasmtime/TEEs) y el cdylib embebible
   # (navegador/Node/Python/Go). Misma SYNSEMA_VERSION horneada (`synsema-wasm --version`,
   # `version()` de la ABI). El playground de la doc y el paquete npm apuntan a estos assets.
+  #
+  # Este job COMPILA y SONDEA, y no pide ningún permiso elevado: corre cargo, dos módulos de
+  # wasmtime-go, Node y el intérprete recién construido — la superficie de terceros más grande del
+  # release. Firmar y publicar es `wasm-publish`, que no compila nada. `needs: prepare` porque el
+  # paso de subida crea la Release si no existe, que es exactamente la carrera que `prepare`
+  # centraliza para evitar (ver el comentario de `prepare`).
   wasm:
+    needs: prepare
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      # Provenance de npm: el paquete queda firmado como "construido por este workflow".
-      id-token: write
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          node-version: "22"
-          registry-url: "https://registry.npmjs.org"
-      - uses: dtolnay/rust-toolchain@stable
+          persist-credentials: false
+      # Node 24, not 22: the Vela guest probe (tests/vela_guest.probe.mjs) runs here on the module the
+      # release publishes, and Node 22.x segfaults intermittently inside V8 while executing it (see
+      # packages/guests/vela/README.md).
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
+          node-version: "24"
+      # Go 1.24 + cgo for the two wasmtime-go probes (v1.0.0 = Vela v0.2.0's runtime, v47 = Vela dev's).
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: "1.24"
+          cache-dependency-path: |
+            packages/guests/vela/tests/wasmtime-go/go.sum
+            packages/guests/vela/tests/wasmtime-go-v47/go.sum
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
+        with:
+          toolchain: "1.96.0"
           targets: wasm32-wasip1,wasm32-unknown-unknown
       - name: Build wasm artifacts
         env:
           SYNSEMA_VERSION: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           cargo build --locked --manifest-path engine/Cargo.toml -p synsema-wasm --target wasm32-wasip1 --profile wasm
           cargo build --locked --manifest-path engine/Cargo.toml -p synsema-wasm-web --target wasm32-unknown-unknown --profile wasm
           cp engine/target/wasm32-wasip1/wasm/synsema-wasm.wasm synsema-wasm-wasip1.wasm
@@ -175,16 +261,100 @@ jobs:
           shasum -a 256 synsema-wasm-web.wasm > synsema-wasm-web.wasm.sha256
       # Guest de Vela con la app de ejemplo embebida (packages/guests/vela): para desplegar algo en
       # el starter kit de Vela antes de escribir una línea; el propio se construye con SYNSEMA_VELA_APP.
-      - name: Build the Vela guest (example app)
+      # The published asset is the STUBBED module: Vela v0.3.0 (pkg/wasm/guest_imports.go) refuses at
+      # load any module declaring a WASI import outside its closed set of eight, and Rust's std links
+      # fifteen more through std::fs that the `stdout` ceiling never reaches. tools/wasi-stub replaces
+      # them by local stubs returning ENOSYS (fd_prestat_get: EBADF). Every probe below runs on that
+      # module, and it is the one a kit embeds its app into with tools/embed.syn.
+      - name: Build the Vela guest (example app) and stub the imports Vela v0.3.0 refuses
         env:
           SYNSEMA_VERSION: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           cargo build --locked --manifest-path packages/guests/vela/Cargo.toml --profile wasm --target wasm32-wasip1 --target-dir engine/target
-          cp engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm synsema-vela-guest.wasm
+          cargo run --locked --manifest-path packages/guests/vela/tools/wasi-stub/Cargo.toml -- engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm synsema-vela-guest.wasm
           shasum -a 256 synsema-vela-guest.wasm > synsema-vela-guest.wasm.sha256
+      # The hash of the guest this run produced, handed to `guest-reproducible-compare` as a small
+      # artifact of its own (it needs the hash, not the 7 MB module).
+      - name: Hand the built guest's hash to the reproducibility check
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: vela-guest-published-sha
+          path: synsema-vela-guest.wasm.sha256
+      - name: Probe the Vela guest as the Executor drives it (Node WASI; wasmtime-go v1.0.0 and v47)
+        run: |
+          set -euo pipefail
+          node tests/vela_guest.probe.mjs synsema-vela-guest.wasm
+          (cd packages/guests/vela/tests/wasmtime-go && go run . ../../../../../synsema-vela-guest.wasm)
+          (cd packages/guests/vela/tests/wasmtime-go-v47 && go run . ../../../../../synsema-vela-guest.wasm)
+      # What a kit does with the asset: embed its program without a compiler, then load it. The native
+      # binary is only needed to run embed.syn (a debug build; the release binaries come from `build`).
+      - name: Embed another program into the built module (tools/embed.syn) and probe it; size budget
+        run: |
+          set -euo pipefail
+          cargo build --locked --manifest-path engine/Cargo.toml -p synsema-cli
+          engine/target/debug/synsema run packages/guests/vela/tools/embed.syn -- synsema-vela-guest.wasm packages/guests/vela/examples/payment_app.syn /tmp/payment.wasm
+          PAYLOAD='{"type":"transfer","transfer":{"to":"0x2222222222222222222222222222222222222222","amount":"0x1"}}'
+          (cd packages/guests/vela/tests/wasmtime-go && PAYLOAD="$PAYLOAD" go run . /tmp/payment.wasm)
+          (cd packages/guests/vela/tests/wasmtime-go-v47 && PAYLOAD="$PAYLOAD" go run . /tmp/payment.wasm)
+          sz=$(wc -c < synsema-vela-guest.wasm); echo "synsema-vela-guest.wasm: $sz bytes"; test "$sz" -lt 12582912
+      # The three assets travel to `wasm-publish` as a run artifact, so the job that signs them does
+      # not rebuild (or trust) anything: it re-checks every file against its .sha256 first.
+      - name: Upload the wasm assets for the publishing job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wasm-assets
+          path: |
+            synsema-wasm-wasip1.wasm
+            synsema-wasm-wasip1.wasm.sha256
+            synsema-wasm-web.wasm
+            synsema-wasm-web.wasm.sha256
+            synsema-vela-guest.wasm
+            synsema-vela-guest.wasm.sha256
+
+  # Firma y publica lo que `wasm` construyó, sin compilar nada: baja los artefactos del run, los
+  # vuelve a comprobar contra sus `.sha256`, los atesta y los adjunta a la Release. Es el único job
+  # del lado wasm con `id-token`/`attestations`, por la misma razón que `attest-binaries`: no correr
+  # código de terceros al lado de la firma. El `npm publish` de `@synsema/wasm` vive acá porque el
+  # trusted publishing de npm (OIDC, sin tokens) necesita el `id-token` del run.
+  #
+  # Provenance SLSA de los tres assets — el guest de Vela sobre todo, porque Vela verifica su
+  # SHA-256 on-chain y un cliente puede comprobar que ese hash lo construyó este workflow desde este
+  # tag: `gh attestation verify synsema-vela-guest.wasm --repo kitecosmic/synsema`.
+  wasm-publish:
+    needs: wasm
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: wasm-assets
+      - name: The artifacts are the files wasm built
+        run: |
+          set -euo pipefail
+          for a in synsema-wasm-wasip1.wasm synsema-wasm-web.wasm synsema-vela-guest.wasm; do
+            sha256sum -c "$a.sha256"
+          done
+      - name: Attest build provenance (wasm assets)
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            synsema-wasm-wasip1.wasm
+            synsema-wasm-web.wasm
+            synsema-vela-guest.wasm
       - name: Upload to Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             synsema-wasm-wasip1.wasm
@@ -199,12 +369,12 @@ jobs:
       # (configurado en npmjs.com → paquete → Settings → Trusted Publisher: kitecosmic/synsema,
       # release.yml). Los tokens que saltean 2FA están deprecados (EOTP en CI); el primer
       # publish (0.6.1) fue manual, como exige npm para poder configurar el trusted publisher.
-      # Requiere npm ≥ 11.5.1 (el de Node 22 es 10.x).
+      # npm ≥ 11.5.1 hace falta para trusted publishing; la versión va PINEADA y no `@latest`:
+      # este es el job que tiene el token OIDC, y un `@latest` roto o comprometido entraría solo.
       - name: Publish @synsema/wasm
-        if: startsWith(github.ref, 'refs/tags/')
         run: |
           set -euo pipefail
-          npm install -g npm@latest
+          npm install -g npm@12.0.2
           npm --version
           cp synsema-wasm-web.wasm packages/synsema-wasm/synsema.wasm
           cd packages/synsema-wasm
@@ -216,41 +386,225 @@ jobs:
   # por trusted publishing (cada uno de los 5 paquetes tiene su trusted publisher en npm).
   # `needs` los 4 jobs del matrix: los assets se bajan de la release, no se recompilan.
   npm-cli:
-    needs: [prepare, build]
+    # `attest-binaries` too: these four binaries are about to be republished to npm under this
+    # repository's name, so each one is checked against its GitHub build provenance — not only
+    # against the `.sha256` sitting next to it in the same release, which proves the download is
+    # intact and nothing about who produced it.
+    needs: [prepare, build, attest-binaries]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
-      - name: Download the release binaries
+      - name: Download the release binaries and verify their provenance
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           mkdir -p assets
           for a in synsema-linux-x86_64 synsema-macos-aarch64 synsema-macos-x86_64 synsema-windows-x86_64.exe; do
-            gh release download "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" --pattern "$a" --pattern "$a.sha256" -D assets --clobber
+            gh release download "$TAG" -R "$REPO" --pattern "$a" --pattern "$a.sha256" -D assets --clobber
             # El .sha256 de Windows lo escribe PowerShell (hash en mayúsculas, sin nombre de
             # archivo); los demás, shasum ("hash  nombre"). Se compara el primer token, en minúsculas.
             expected=$(tr -d '\r' < "assets/$a.sha256" | awk '{print tolower($1)}' | head -1)
             actual=$(sha256sum "assets/$a" | awk '{print $1}')
-            if [ "$expected" != "$actual" ]; then echo "sha256 mismatch for $a: $expected != $actual"; exit 1; fi
-            echo "sha256 ok: $a"
+            if [ "$expected" != "$actual" ]; then echo "::error::sha256 mismatch for $a: $expected != $actual"; exit 1; fi
+            # El eslabón fuerte: este archivo lo construyó ESTE workflow desde ESTE commit.
+            gh attestation verify "assets/$a" -R "$REPO"
+            echo "sha256 + provenance ok: $a"
           done
       - name: Build and publish the 5 packages
         run: |
           set -euo pipefail
-          npm install -g npm@latest
+          npm install -g npm@12.0.2
           node packages/synsema-cli/platforms.mjs "${GITHUB_REF_NAME#v}" assets out
           for d in cli-linux-x64 cli-darwin-arm64 cli-darwin-x64 cli-win32-x64 synsema; do
             (cd "out/$d" && npm publish --provenance --access public)
           done
+
+  # Reproducibility of the published Vela guest, MEASURED rather than promised. The same commit is
+  # built and stubbed on two runners (ubuntu-latest and ubuntu-22.04) with the pinned toolchain:
+  # `--locked` on both lockfiles and rustc 1.96.0 exactly — rust-toolchain.toml at the repo root
+  # pins it for rustup, and the same version is passed to dtolnay/rust-toolchain, which does not
+  # read that file. The compare job then puts THREE hashes side by side: the two rebuilds and the
+  # asset that was actually published — re-downloaded from the Release on a tag run, so the
+  # comparison is against what a user gets, not against a number this same workflow reported.
+  # A difference is a warning with all three SHAs and does NOT fail the release: a verifier relies
+  # on the provenance attestation, and this job only says whether "rebuild it yourself" holds too.
+  guest-reproducible:
+    name: guest-reproducible (${{ matrix.os }})
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
+        with:
+          toolchain: "1.96.0"
+          targets: wasm32-wasip1
+      - name: Build and stub the Vela guest
+        env:
+          SYNSEMA_VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          rustc -Vv | tee rustc.txt
+          cargo build --locked --manifest-path packages/guests/vela/Cargo.toml --profile wasm --target wasm32-wasip1 --target-dir engine/target
+          cargo run --locked --manifest-path packages/guests/vela/tools/wasi-stub/Cargo.toml -- engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm synsema-vela-guest.wasm
+          sha256sum synsema-vela-guest.wasm | awk '{print $1}' > guest.sha256
+          sha256sum engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm | awk '{print $1}' > guest-unstubbed.sha256
+          echo "${{ matrix.os }}: stubbed $(cat guest.sha256), unstubbed $(cat guest-unstubbed.sha256)"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: guest-sha-${{ matrix.os }}
+          path: |
+            guest.sha256
+            guest-unstubbed.sha256
+            rustc.txt
+
+  guest-reproducible-compare:
+    # `wasm-publish` too, so that on a tag run the asset is already attached and can be
+    # re-downloaded; on a branch dispatch that job is skipped and the check falls back to the hash
+    # the `wasm` job reported (stated as such in the log, never called "the published asset").
+    needs: [guest-reproducible, wasm, wasm-publish]
+    if: always() && needs.guest-reproducible.result == 'success' && needs.wasm.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: guest-sha-*
+          path: shas
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: vela-guest-published-sha
+          path: published
+      # The real published asset, fetched from the Release like any user would. Falls back to the
+      # hash `wasm` reported when there is nothing published yet (branch dispatch), and says which.
+      - name: Fetch the published asset's hash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "${{ startsWith(github.ref, 'refs/tags/') }}" = "true" ] && \
+             gh release download "$TAG" -R "$REPO" --pattern synsema-vela-guest.wasm -O released.wasm 2>/dev/null; then
+            sha256sum released.wasm | awk '{print $1}' > published.sha256
+            echo "source=the Release asset of $TAG (re-downloaded)" > published.source
+          else
+            awk '{print $1}' published/synsema-vela-guest.wasm.sha256 > published.sha256
+            echo "source=the hash the wasm job reported (nothing published on this run)" > published.source
+          fi
+          cat published.source; cat published.sha256
+      - name: Compare the two rebuilds with the published asset (warn on a difference, never fail)
+        run: |
+          set -euo pipefail
+          published=$(cat published.sha256)
+          echo "published: $published ($(cut -d= -f2 published.source))"
+          summary="published=$published"
+          for d in shas/*/; do
+            leg=$(basename "$d" | sed 's/^guest-sha-//')
+            echo "== $leg"; echo "stubbed:   $(cat "$d/guest.sha256")"; echo "unstubbed: $(cat "$d/guest-unstubbed.sha256")"; grep -E '^(release|host|commit-hash)' "$d/rustc.txt" || true
+            summary="$summary $leg=$(cat "$d/guest.sha256")"
+          done
+          distinct=$( { echo "$published"; cat shas/*/guest.sha256; } | sort -u | wc -l)
+          if [ "$distinct" = "1" ]; then
+            echo "::notice title=Vela guest reproducible::ubuntu-latest, ubuntu-22.04 and the published asset agree on synsema-vela-guest.wasm: $published"
+          else
+            echo "::warning title=Vela guest NOT bit-for-bit reproducible::$summary — the release stays valid (its provenance attestation is what a verifier checks); reproducibility is reported, not promised"
+          fi
+
+  # The attested base image for a container or VM where Synsema is its own host. Built only when
+  # packages/attested/Dockerfile exists; the image's digest is published as measurements.json so a
+  # client can pin it — clearly labelled as a Docker digest, NOT a TEE measurement (the PCR/MRTD of
+  # a platform depends on the platform's own image build).
+  #
+  # `needs: [prepare, build, attest-binaries]`: the Dockerfile downloads synsema-linux-x86_64 from
+  # the RELEASE, so it must run after `build` attached it (in parallel it raced a 404, or measured a
+  # stale binary left by an earlier attempt of the same tag) and after `attest-binaries` signed it,
+  # because this job verifies the asset's provenance with `gh attestation verify` before building
+  # and passes the verified hash to the Dockerfile (SYNSEMA_SHA256): the image then embeds a
+  # binary that GitHub attests was built by this workflow from this commit, not merely one whose
+  # .sha256 (same origin) matched. Tags only: the download is by tag; a workflow_dispatch from a
+  # branch has nothing to fetch. The Dockerfile check is at STEP level, after checkout: at job
+  # level hashFiles() runs before the workspace exists and is always empty.
+  attested-image:
+    needs: [prepare, build, attest-binaries]
+    runs-on: ubuntu-latest
+    # `attestations`/`id-token` because measurements.json is what a client pins the image by: it
+    # ships with its own .sha256 and its own provenance, like every other asset of the release.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Fetch the released binary and verify its provenance before it goes into an image
+        if: hashFiles('packages/attested/Dockerfile') != '' && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" --pattern synsema-linux-x86_64 --pattern synsema-linux-x86_64.sha256 --clobber
+          sha256sum -c synsema-linux-x86_64.sha256
+          gh attestation verify synsema-linux-x86_64 -R "$GITHUB_REPOSITORY"
+          echo "SYNSEMA_SHA256=$(sha256sum synsema-linux-x86_64 | awk '{print $1}')" >> "$GITHUB_ENV"
+      - name: Build the attested image and record its digest
+        if: hashFiles('packages/attested/Dockerfile') != '' && startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test -n "$SYNSEMA_SHA256"
+          # One plain OCI manifest (no provenance/sbom attestation index), so index.json names it directly.
+          docker buildx build --build-arg "SYNSEMA_VERSION=$TAG" --build-arg "SYNSEMA_SHA256=$SYNSEMA_SHA256" \
+            --provenance=false --sbom=false --output type=oci,dest=attested.tar packages/attested
+          digest=$(tar -xOf attested.tar index.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["manifests"][0]["digest"])')
+          echo "image digest: $digest"
+          python3 - "$digest" "$TAG" "$SYNSEMA_SHA256" <<'EOF' > measurements.json
+          import json, sys
+          print(json.dumps({"image_digest": sys.argv[1], "synsema_version": sys.argv[2],
+                            "synsema_linux_x86_64_sha256": sys.argv[3],
+                            "note": "docker image digest, not a TEE measurement; the binary's sha256 was checked against its GitHub build provenance before the build"}, indent=2))
+          EOF
+          cat measurements.json
+          shasum -a 256 measurements.json > measurements.json.sha256
+      - name: Attest build provenance (measurements.json)
+        if: hashFiles('packages/attested/Dockerfile') != '' && startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: measurements.json
+      - name: Upload measurements.json to the Release
+        if: hashFiles('packages/attested/Dockerfile') != '' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          files: |
+            measurements.json
+            measurements.json.sha256
+      - name: Nothing to build
+        if: hashFiles('packages/attested/Dockerfile') == '' || !startsWith(github.ref, 'refs/tags/')
+        run: echo "nothing to build - no packages/attested/Dockerfile, or not a tag run (the image embeds a released binary)"
 
   # NOTE: aarch64-linux is deferred (needs a C cross-toolchain for rusqlite's bundled
   # SQLite). Add it later via `cross` or a gcc-aarch64 setup if there's demand.

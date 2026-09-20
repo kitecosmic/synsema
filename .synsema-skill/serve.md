@@ -23,7 +23,7 @@ single static binary.
 
 Serving on a port requires the `serve` capability, scoped to that exact port:
 
-```
+```synsema
 require serve(8080)
 ```
 
@@ -47,7 +47,7 @@ The scope is the port — `require serve(8080)` does **not** allow `serve on 909
 
 ## Basic shape
 
-```
+```synsema
 require serve(8080)
 
 serve on 8080
@@ -876,7 +876,7 @@ serve on 8080
 The agentic pattern — one connection, one child process, one bus subscription, **one
 wait**:
 
-```
+```synsema
 require serve(8080)
 require exec("sh")
 
@@ -1004,7 +1004,7 @@ serve on 8080
 
 ## Auth (incoming)
 
-```
+```synsema
 serve on 8080
     auth with check_token
     route "GET /me" requires auth
@@ -1017,7 +1017,7 @@ For a route marked `requires auth`, the runtime:
 3. if it returns `nothing` → responds **401**,
 4. otherwise the returned value is placed in `request.user`.
 
-```
+```synsema
 task check_token(token)
     when token == "secret"
         give {"name": "alice"}
@@ -1150,7 +1150,7 @@ For machine-to-machine, the request itself is signed and the auth task verifies 
 — a stolen token is useless without the key (the 2-parameter form gives you the
 whole request, which is what verification needs):
 
-```
+```synsema
 task verify_agent(token, request)
     let key be secret("AGENT_PUBKEY")
     let v be http_signature_verify(
@@ -1213,7 +1213,7 @@ route "POST /signup"
 
 The request body is bounded so a single oversized request can't exhaust memory.
 
-```
+```synsema
 serve on 8080
     max_body "10mb"        -- optional; default 1mb
     route "POST /upload"
@@ -1252,7 +1252,7 @@ concatenation — so path/query/body values can't inject SQL.
 
 ## Full example
 
-```
+```synsema
 require serve(8080)
 require db("./store.db")
 

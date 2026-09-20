@@ -9,7 +9,7 @@ LLM-proof, with **zero cost on the hot path**.
 Define any variable once (in a `.env` file or the process environment) and read it
 by name. There are two ways to read, depending on sensitivity:
 
-```
+```synsema
 let port be env("PORT", 8080)                 -- plain string config
 let key  be secret("STRIPE_API_KEY")          -- opaque, redacted everywhere
 ```
@@ -105,7 +105,7 @@ reaches what it declares), there is no route for an LLM to read or emit a secret
 
 ## Using secrets safely (without revealing)
 
-```
+```synsema
 require secret("STRIPE_WEBHOOK_SECRET")
 require serve(8080)
 
@@ -119,7 +119,7 @@ serve on 8080
         give ok({"received": true})
 ```
 
-```
+```synsema
 require secret("STRIPE_API_KEY")
 require net("api.stripe.com")
 let r be fetch("https://api.stripe.com/v1/charges", "POST",
@@ -205,7 +205,7 @@ deliberately **loud** and **scoped**:
 - bare `require reveal` (no scope) still works for backward compat — it permits revealing
   **any** secret — but is **discouraged** and prints a warning. Prefer the scoped form.
 
-```
+```synsema
 require reveal("LEGACY_TOKEN")
 let plain be reveal(secret("LEGACY_TOKEN"))   -- audited; only LEGACY_TOKEN is revealable here
 ```

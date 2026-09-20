@@ -154,7 +154,7 @@ fn default_approvals() -> ServeApprovals {
 }
 
 // =========================================================
-// Cron real (ejecución de tasks Synsema desde el hilo del job)
+// cron real (ejecución de tasks Synsema desde el hilo del job)
 // =========================================================
 //
 // El problema de fondo: un task vive en un `Interpreter` (`Rc`, !Send) y no puede
@@ -485,7 +485,7 @@ pub(crate) fn run_mode_cron_executor(
 }
 
 // =========================================================
-// Webhook saliente de aprobaciones (A1.v3)
+// webhook saliente de aprobaciones (A1.v3)
 // =========================================================
 
 /// Config del webhook saliente de aprobaciones, resuelta de los knobs al armar el
@@ -586,7 +586,7 @@ fn fire_approval_webhook(cfg: Arc<ApprovalWebhook>, e: synsema_llm::human::Enque
 use crate::engine::{wire_common_with_state, wire_swarm_hooks, INTERP_STACK_SIZE};
 
 // =========================================================
-// Overrides de despliegue por CLI (Pieza A)
+// overrides de despliegue por CLI (Pieza A)
 // =========================================================
 
 /// Config de despliegue inyectada por flags de `synsema serve` (capa de lanzamiento).
@@ -609,6 +609,12 @@ pub struct ServeOverrides {
     /// `--sandbox` | `--cap-set <list>`: techo de capabilities del host para TODO el
     /// serve (requests, cron, agentes). `None` = sin techo (comportamiento histórico).
     pub ceiling: Option<Vec<Capability>>,
+    /// `--attested`: al arrancar se genera un par P-256, se pide a la
+    /// plataforma un documento que ata `sha256(spki ‖ program_sha)` y se publica en
+    /// `GET /.well-known/attestation`. Sin `--tls-cert`/`--tls-auto`, TLS va con un cert
+    /// autofirmado emitido con ESA clave (el cliente la pinea). Si la plataforma no responde,
+    /// el servidor NO arranca.
+    pub attested: bool,
 }
 
 impl ServeOverrides {
@@ -620,6 +626,7 @@ impl ServeOverrides {
             && self.tls_cert.is_none()
             && self.tls_key.is_none()
             && self.bind.is_none()
+            && !self.attested
     }
 
     /// Validación fail-loud de combinaciones inválidas (independiente del archivo).
@@ -639,7 +646,7 @@ impl ServeOverrides {
 }
 
 // =========================================================
-// Snapshot de globales (Send) → reconstrucción por request
+// snapshot de globales (Send) → reconstrucción por request
 // =========================================================
 
 pub(crate) enum GlobalVal {
@@ -1033,6 +1040,143 @@ pub(crate) fn restore_agents(interp: &mut Interpreter, snapshot: &[(String, Glob
 /// para un serve. El `SharedState` es un `HashMap<String, SendValue>` bajo `Arc<Mutex>`
 /// — compartido entre todos los route handlers y entre requests, con la misma vida que
 /// el servidor. No persiste a disco (para persistencia usar SQL o `remember`).
+/// T5 (ronda 7/8) — **lo que un request escribió en el almacén compartido no puede sobrevivirle
+/// si el chequeo de flujo lo cortó, y deshacerlo no puede pisar lo que otros confirmaron.**
+///
+/// El canal (ronda 7): el prefijo de un bucle incrementa `state_incr("n")` con PC público —legal
+/// en ese momento—, el request muere en la vuelta del secreto, y OTRA ruta lee ese contador como
+/// un número público.
+///
+/// El fallo de INTEGRIDAD que introdujo el primer arreglo (ronda 8): guardaba el valor ABSOLUTO
+/// previo y lo reponía, así que con concurrencia real el request que moría deshacía en silencio
+/// lo que otros tres habían recibido confirmado (medido: `visits` llega a 6 y vuelve a 2). Un
+/// arreglo de confidencialidad no puede pagarse con corrupción de datos.
+///
+/// Así que el diario deshace **sólo lo que se puede atribuir a este request**:
+///
+/// · `state_incr` anota el **delta acumulado** y el rollback resta. La suma conmuta, así que es
+///   correcto con cualquier intercalado: lo de los demás queda.
+/// · `state_set`/`state_delete` anotan el valor previo **y el que dejó este request**, y el
+///   rollback repone sólo si el valor actual sigue siendo el suyo (comparar-y-cambiar). Si otro
+///   escribió en el medio, no se toca: pisarlo sería el mismo fallo de integridad.
+/// · Una clave que recibió las dos formas se trata como absoluta, que es la conservadora.
+#[derive(Clone)]
+enum StateUndo {
+    /// Sólo incrementos: el delta acumulado por este request.
+    Delta(Number),
+    /// Hubo `set`/`delete`: el valor previo y el último que dejó este request.
+    Absolute { prev: Option<SendValue>, mine: Option<SendValue> },
+}
+
+thread_local! {
+    /// El diario del request en curso de ESTE worker (uno por vez). `None` = sin etiquetas.
+    static STATE_JOURNAL: RefCell<Option<Vec<(String, StateUndo)>>> = const { RefCell::new(None) };
+}
+
+/// Arranca el diario del request (sólo con etiquetas encendidas).
+fn arm_state_journal() {
+    if !crate::host::labels() {
+        return;
+    }
+    STATE_JOURNAL.with(|j| *j.borrow_mut() = Some(Vec::new()));
+}
+
+fn with_journal(f: impl FnOnce(&mut Vec<(String, StateUndo)>)) {
+    STATE_JOURNAL.with(|j| {
+        let mut j = j.borrow_mut();
+        if let Some(undo) = j.as_mut() {
+            f(undo);
+        }
+    });
+}
+
+/// Anota un incremento de `key` por `delta`.
+fn journal_state_incr(key: &str, delta: &Number) {
+    with_journal(|undo| {
+        if let Some((_, e)) = undo.iter_mut().find(|(k, _)| k == key) {
+            if let StateUndo::Delta(acc) = e {
+                *acc = match (&acc, delta) {
+                    (Number::Int(a), Number::Int(b)) => Number::Int(a + b),
+                    _ => Number::Float(acc.to_f64() + delta.to_f64()),
+                };
+            }
+            // Si ya es Absolute, la clave queda en el camino conservador: el `mine` lo
+            // actualiza `journal_state_write` en cada escritura posterior.
+            return;
+        }
+        undo.push((key.to_string(), StateUndo::Delta(delta.clone())));
+    });
+}
+
+/// Anota una escritura absoluta de `key`: el valor previo (la primera vez) y el que queda.
+fn journal_state_write(store: &HashMap<String, SendValue>, key: &str, mine: Option<SendValue>) {
+    with_journal(|undo| {
+        if let Some((_, e)) = undo.iter_mut().find(|(k, _)| k == key) {
+            match e {
+                StateUndo::Absolute { mine: m, .. } => *m = mine,
+                // Venía por incrementos: pasa a absoluta y se renuncia a deshacerlos (no se sabe
+                // el valor previo real). Conservador: sólo repone si nadie más tocó la clave.
+                StateUndo::Delta(_) => {
+                    *e = StateUndo::Absolute { prev: store.get(key).cloned(), mine };
+                }
+            }
+            return;
+        }
+        undo.push((key.to_string(), StateUndo::Absolute { prev: store.get(key).cloned(), mine }));
+    });
+}
+
+/// Cierra el diario. Con `rollback`, deshace lo atribuible a este request.
+fn finish_state_journal(state: &SharedState, rollback: bool) {
+    let undo = STATE_JOURNAL.with(|j| j.borrow_mut().take());
+    let Some(undo) = undo else { return };
+    if !rollback || undo.is_empty() {
+        return;
+    }
+    let mut guard = match state.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    for (key, u) in undo.into_iter().rev() {
+        match u {
+            StateUndo::Delta(d) => {
+                let current = match guard.get(&key) {
+                    Some(SendValue::Number(n)) => n.clone(),
+                    _ => continue, // ya no es un número: no es nuestro, no se toca
+                };
+                let back = match (&current, &d) {
+                    (Number::Int(a), Number::Int(b)) => Number::Int(a - b),
+                    _ => Number::Float(current.to_f64() - d.to_f64()),
+                };
+                guard.insert(key, to_send(&SynValue::Number(back)));
+            }
+            StateUndo::Absolute { prev, mine } => {
+                // Comparar-y-cambiar: sólo si el valor actual sigue siendo el que dejamos.
+                let current = guard.get(&key).cloned();
+                if send_eq(current.as_ref(), mine.as_ref()) {
+                    match prev {
+                        Some(v) => {
+                            guard.insert(key, v);
+                        }
+                        None => {
+                            guard.remove(&key);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Igualdad suficiente para el comparar-y-cambiar del diario (por su forma serializada).
+fn send_eq(a: Option<&SendValue>, b: Option<&SendValue>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => from_send(x).to_string() == from_send(y).to_string(),
+        _ => false,
+    }
+}
+
 fn register_serve_state_builtins(interp: &Interpreter, state: SharedState) {
     {
         let s = state.clone();
@@ -1042,7 +1186,10 @@ fn register_serve_state_builtins(interp: &Interpreter, state: SharedState) {
                 None => return Err(Control::Error(RuntimeError::new("state_set: missing key"))),
             };
             let val = args.get(1).cloned().unwrap_or(SynValue::Nothing);
-            s.lock().unwrap().insert(key, to_send(&val));
+            let mut guard = s.lock().unwrap();
+            let sent = to_send(&val);
+            journal_state_write(&guard, &key, Some(sent.clone()));
+            guard.insert(key, sent);
             Ok(val)
         }));
     }
@@ -1072,6 +1219,7 @@ fn register_serve_state_builtins(interp: &Interpreter, state: SharedState) {
                 _ => Number::Int(1), // default entero
             };
             let mut guard = s.lock().unwrap();
+            journal_state_incr(&key, &delta);
             let current = match guard.get(&key) {
                 Some(SendValue::Number(n)) => n.clone(),
                 _ => Number::Int(0),
@@ -1094,7 +1242,9 @@ fn register_serve_state_builtins(interp: &Interpreter, state: SharedState) {
                 Some(v) => v.to_string(),
                 None => return Err(Control::Error(RuntimeError::new("state_delete: missing key"))),
             };
-            s.lock().unwrap().remove(&key);
+            let mut guard = s.lock().unwrap();
+            journal_state_write(&guard, &key, None);
+            guard.remove(&key);
             Ok(syn_bool(true))
         }));
     }
@@ -1109,6 +1259,40 @@ fn register_serve_state_builtins(interp: &Interpreter, state: SharedState) {
             Ok(SynValue::Map(Rc::new(RefCell::new(map))))
         }));
     }
+}
+
+/// Tanda TEE (T5, auditoría ronda 3, M3) — los builtins que ve un WORKER de `serve`: el wiring
+/// común más lo que el runtime registra por worker (estado compartido, memoria/progreso
+/// compartidos, cron y db del proceso) y los del swarm (`agents`/`agent_stop`). El anti-rot
+/// `every_effectful_family_is_a_label_sink` lo cruza con las listas de clasificación igual que al
+/// wiring de `run`: sin esto la garantía no cubría justo el modo que usa `--attested`, y por ese
+/// hueco `state_all` era el único de su familia sin declarar.
+pub fn registered_serve_builtin_names() -> Vec<String> {
+    use std::collections::HashMap as StdHashMap;
+    let mut interp = Interpreter::new();
+    let caps = Rc::new(RefCell::new(CapabilitySet::new("probe")));
+    crate::engine::wire_common(&mut interp, &caps, false, None, "probe");
+    let shared_state: SharedState = Arc::new(Mutex::new(StdHashMap::new()));
+    register_serve_state_builtins(&interp, shared_state);
+    let shared_memory: SharedMemoryStore = Arc::new(Mutex::new(AgentMemory::new()));
+    let shared_progress: SharedProgressStore = Arc::new(Mutex::new(ProgressManager::new()));
+    let gate = crate::engine::undeclared_memory_gate("probe".to_string());
+    let on_write: OnWriteFn = Arc::new(|_: &AgentMemory| {});
+    let on_write_progress: OnWriteProgressFn = Arc::new(|_: &ProgressManager| {});
+    register_serve_memory_builtins(&interp, shared_memory, on_write, gate.clone());
+    register_serve_progress_builtins(&interp, shared_progress, on_write_progress, gate);
+    register_database_builtins(&interp, Arc::new(Mutex::new(DatabaseManager::new())), caps.clone());
+    // Swarm: `agents`/`agent_stop` (sólo existen con el swarm cableado, como bajo `serve`).
+    wire_swarm_hooks(&mut interp, Arc::new(Swarm::new()), "main", None, None, None);
+    let env = interp.global_env.borrow();
+    let mut names: Vec<String> = env
+        .bindings
+        .iter()
+        .filter(|(_, v)| matches!(v, SynValue::Builtin(_)))
+        .map(|(k, _)| k.clone())
+        .collect();
+    names.sort();
+    names
 }
 
 /// Sink global de las líneas de log de los handlers de `serve` (DE-034). Por defecto
@@ -1224,7 +1408,7 @@ fn build_base_interp(
     // con versiones que usan el AgentMemory compartido entre hilos.
     register_serve_memory_builtins(&interp, shared_memory.clone(), on_write.clone(), mem_gate.clone());
     // DE-028: ídem para el progress (create_progress/start_step/…/resume_point) → el
-    // ProgressManager compartido entre hilos/requests, no el fresco per-intérprete.
+    // progressManager compartido entre hilos/requests, no el fresco per-intérprete.
     register_serve_progress_builtins(&interp, shared_progress.clone(), on_write_progress.clone(), mem_gate);
     // Registrar los builtins de estado compartido (state_set/state_get/state_incr/…).
     register_serve_state_builtins(&interp, shared_state.clone());
@@ -1362,7 +1546,10 @@ fn with_serve_interp<R>(
         BaseInterp { interp, caps, _snapshot: snapshot.clone() }
     });
 
+    // T5 (ronda 7): el diario del almacén compartido cubre exactamente este request.
+    arm_state_journal();
     let out = f(&mut base.interp);
+    finish_state_journal(shared_state, base.interp.take_label_stop());
 
     // Limpieza por-request: estado transitorio del intérprete + capabilities al
     // snapshot del preámbulo (aislamiento entre requests reusando el mismo intérprete).
@@ -1428,7 +1615,7 @@ fn run_socket(
         };
         let handle = match adopt_server_socket(interp, link) {
             Ok(h) => h,
-            Err(Control::Error(e)) => return StreamEnd::Error(e.to_string()),
+            Err(Control::Error(e)) => return StreamEnd::Error(e.to_string_for_client()),
             Err(_) => return StreamEnd::Error("socket: could not adopt the connection".to_string()),
         };
         let mut bindings = request_bindings(ctx);
@@ -1445,7 +1632,7 @@ fn run_socket(
             .collect();
         let end = match interp.run_request_block(&flat, bindings) {
             Ok(_) | Err(Control::Give(_)) | Err(Control::Stop(_)) => StreamEnd::Done,
-            Err(Control::Error(e)) => StreamEnd::Error(e.to_string()),
+            Err(Control::Error(e)) => StreamEnd::Error(e.to_string_for_client()),
         };
         // Cierre honesto: 1000 al terminar bien; 1011 + motivo si el cuerpo falló (el
         // cliente sabe que el server se rompió, nunca un corte mudo); 1001 + motivo si
@@ -1465,7 +1652,7 @@ fn run_socket(
 }
 
 // =========================================================
-// Construcción del contexto de request (SynValue)
+// construcción del contexto de request (SynValue)
 // =========================================================
 
 // `str_map`/`headers_map`/`build_request_syn`/`build_form_syn`/`request_bindings`:
@@ -1513,7 +1700,7 @@ fn run_route(
             Err(Control::Error(e)) if e.is_validation => {
                 GiveOutcome::Validation { message: e.message.clone(), field: e.field.clone() }
             }
-            Err(Control::Error(e)) => GiveOutcome::Error(e.to_string()),
+            Err(Control::Error(e)) => GiveOutcome::Error(e.to_string_for_client()),
             Err(Control::Stop(_)) => {
                 GiveOutcome::Error("'give'/'stop' used outside of a task or loop".to_string())
             }
@@ -1561,6 +1748,11 @@ fn run_stream(
         let cell = Rc::new(RefCell::new(emit));
         let ec = cell.clone();
         interp.set_stream_emit(Rc::new(move |val: SynValue, event: Option<&str>| {
+            // Un stream es un sumidero PÚBLICO como la respuesta: un valor
+            // `private` no sale sin `declassify` (el error nombra el camino, nunca el valor).
+            if let Err(e) = synsema_core::labels::check_flow(&val, &[], "stream") {
+                return Err(Control::Error(RuntimeError::new(e.to_string())));
+            }
             match (*ec.borrow_mut())(&val, event) {
                 Ok(()) => Ok(()),
                 Err(StreamGone) => Err(Control::Error(RuntimeError::new(CLIENT_GONE))),
@@ -1582,11 +1774,12 @@ fn run_stream(
             }
             Ok(_) | Err(Control::Give(_)) | Err(Control::Stop(_)) => StreamEnd::Done,
             Err(Control::Error(e)) => {
-                let m = e.to_string();
-                if m == CLIENT_GONE {
+                // `CLIENT_GONE` es un centinela sin ubicación, así que se reconoce igual por el
+                // `Display`; lo que sale al cliente es la forma sin ruta absoluta.
+                if e.to_string() == CLIENT_GONE {
                     StreamEnd::ClientGone
                 } else {
-                    StreamEnd::Error(m)
+                    StreamEnd::Error(e.to_string_for_client())
                 }
             }
         }
@@ -1594,7 +1787,7 @@ fn run_stream(
 }
 
 // =========================================================
-// Resolución de opciones del bloque serve
+// resolución de opciones del bloque serve
 // =========================================================
 
 fn val_to_f64(v: &SynValue) -> Option<f64> {
@@ -1842,7 +2035,20 @@ fn build_host_table(
                     } else {
                         vec![syn_text(token)]
                     };
-                    interp.call_task(task, args).ok()
+                    // Auditoría ronda 5: un fallo DENTRO de la task de auth se convertía en
+                    // "sin usuario" sin dejar rastro: el operador veía a todos sus usuarios
+                    // afuera y ni una línea de por qué. El caso real es `jwt_verify` bajo
+                    // `--secure` sin `require time` (la capability no está concedida), que en
+                    // una ruta normal SÍ se loguea. Degradar con aviso: el veredicto no cambia
+                    // (no hay usuario), pero el motivo queda escrito.
+                    match interp.call_task(task, args) {
+                        Ok(v) => Some(v),
+                        Err(Control::Error(e)) => {
+                            eprintln!("[serve] auth task failed, so the request has no user: {}", e.message);
+                            None
+                        }
+                        Err(_) => None,
+                    }
                 })
             });
             Some(h)
@@ -2292,7 +2498,7 @@ fn run_mounted_route(
             Err(Control::Error(e)) if e.is_validation => {
                 GiveOutcome::Validation { message: e.message.clone(), field: e.field.clone() }
             }
-            Err(Control::Error(e)) => GiveOutcome::Error(e.to_string()),
+            Err(Control::Error(e)) => GiveOutcome::Error(e.to_string_for_client()),
             Err(Control::Stop(_)) => {
                 GiveOutcome::Error("'give'/'stop' used outside of a task or loop".to_string())
             }
@@ -2360,6 +2566,11 @@ fn run_mounted_stream(
         let cell = Rc::new(RefCell::new(emit));
         let ec = cell.clone();
         interp.set_stream_emit(Rc::new(move |val: SynValue, event: Option<&str>| {
+            // Un stream es un sumidero PÚBLICO como la respuesta: un valor
+            // `private` no sale sin `declassify` (el error nombra el camino, nunca el valor).
+            if let Err(e) = synsema_core::labels::check_flow(&val, &[], "stream") {
+                return Err(Control::Error(RuntimeError::new(e.to_string())));
+            }
             match (*ec.borrow_mut())(&val, event) {
                 Ok(()) => Ok(()),
                 Err(StreamGone) => Err(Control::Error(RuntimeError::new(CLIENT_GONE))),
@@ -2377,11 +2588,12 @@ fn run_mounted_stream(
             }
             Ok(_) | Err(Control::Give(_)) | Err(Control::Stop(_)) => StreamEnd::Done,
             Err(Control::Error(e)) => {
-                let m = e.to_string();
-                if m == CLIENT_GONE {
+                // `CLIENT_GONE` es un centinela sin ubicación, así que se reconoce igual por el
+                // `Display`; lo que sale al cliente es la forma sin ruta absoluta.
+                if e.to_string() == CLIENT_GONE {
                     StreamEnd::ClientGone
                 } else {
-                    StreamEnd::Error(m)
+                    StreamEnd::Error(e.to_string_for_client())
                 }
             }
         }
@@ -2429,7 +2641,7 @@ fn run_mounted_socket(
         };
         let handle = match adopt_server_socket(interp, link) {
             Ok(h) => h,
-            Err(Control::Error(e)) => return StreamEnd::Error(e.to_string()),
+            Err(Control::Error(e)) => return StreamEnd::Error(e.to_string_for_client()),
             Err(_) => return StreamEnd::Error("socket: could not adopt the connection".to_string()),
         };
         let mut bindings = request_bindings(ctx);
@@ -2445,7 +2657,7 @@ fn run_mounted_socket(
         let parent = task.closure_env.clone();
         let end = match interp.run_request_block_in(&flat, bindings, &parent) {
             Ok(_) | Err(Control::Give(_)) | Err(Control::Stop(_)) => StreamEnd::Done,
-            Err(Control::Error(e)) => StreamEnd::Error(e.to_string()),
+            Err(Control::Error(e)) => StreamEnd::Error(e.to_string_for_client()),
         };
         let cancelled = interp.is_cancelled();
         let reason = match &end {
@@ -2681,7 +2893,7 @@ fn make_serve_hook(
             Arc::new(caps.borrow().granted.iter().cloned().collect());
         // Snapshot de las reglas declaradas en el top-level con `add_rule`. Se clona
         // una vez aquí (el top-level ya corrió completo) y se pre-popula en el
-        // AgentMemory de cada intérprete de request, para que check_rules/get_rules
+        // agentMemory de cada intérprete de request, para que check_rules/get_rules
         // encuentren las reglas sin que el programador tenga que re-declararlas.
         let rules_snap: Arc<Vec<OwnerRule>> = Arc::new(
             top_level_memory.borrow().rules.values().cloned().collect(),
@@ -2957,6 +3169,54 @@ fn make_serve_hook(
                 "tls auto (auto-HTTPS) requires a domain — pass `--domain example.com` or add `domain \"example.com\"` to the serve block".to_string(),
             )));
         }
+        // Bajo `--attested` sin TLS propio, un cert autofirmado emitido con la
+        // clave P-256 de la identidad (la que `/.well-known/attestation` anuncia): el cliente
+        // verifica el documento y pinea el SPKI del cert a `public_key_hex`. Con `--tls-cert` o
+        // `--tls-auto` se respeta lo del operador; el pin sigue siendo la clave anunciada (sirve
+        // para cifrar bodies con `ecdh_*`), no la del cert.
+        let mut tls_config = tls_config;
+        let attested_identity = if overrides.attested {
+            let id = synsema_stdlib::attest::attested_identity().ok_or_else(|| {
+                Control::Error(RuntimeError::new("internal: serve --attested without an installed identity"))
+            })?;
+            // El modo TLS que se ató en `report_data` (decidido estáticamente en `serve_inner`)
+            // Tiene que ser EXACTAMENTE el que se va a servir; si no, fallar cerrado.
+            let operator_now = tls_config.is_some() || tls_auto_eff;
+            if (id.config.tls_key == "operator") != operator_now {
+                return Err(Control::Error(RuntimeError::new(format!(
+                    "serve --attested: TLS mode mismatch (attested as {:?}, resolved as {:?}); refusing to serve an identity that does not describe this server",
+                    id.config.tls_key,
+                    if operator_now { "operator" } else { "attested" }
+                ))));
+            }
+            // Auditoría externa: ninguna ruta del programa (host default ni vhosts) puede caer en
+            // una URL reservada del runtime — `/.well-known/attestation` incluida, con o sin
+            // barra final. Es error de CARGA, no un 404 tardío.
+            for (label, rs) in std::iter::once(("", &routes)).chain(built_vhosts.iter().map(|v| (v.pattern.as_str(), &v.routes))) {
+                if let Some(hit) = server::reserved_route_collision(rs) {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "serve --attested: route `{}`{} collides with a reserved path ({}); the program cannot declare reserved URLs under --attested",
+                        hit,
+                        if label.is_empty() { String::new() } else { format!(" (host {})", label) },
+                        server::RESERVED_PATHS.join(", ")
+                    ))));
+                }
+            }
+            if tls_config.is_none() && !tls_auto_eff {
+                let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+                if !matches!(bind_addr.as_str(), "0.0.0.0" | "::" | "[::]" | "localhost" | "127.0.0.1") {
+                    sans.push(bind_addr.clone());
+                }
+                let cert_der = synsema_stdlib::attest::self_signed_cert_der(&id, &sans)
+                    .map_err(|e| Control::Error(RuntimeError::new(e)))?;
+                let cfg = server::build_tls_config_from_der(cert_der, id.pkcs8_der.clone())
+                    .map_err(|e| Control::Error(RuntimeError::new(format!("serve --attested: TLS error: {}", e))))?;
+                tls_config = Some(cfg);
+            }
+            Some(id)
+        } else {
+            None
+        };
         let use_tls = tls_config.is_some() || tls_auto_eff;
 
         let n_routes = routes.len();
@@ -2976,6 +3236,9 @@ fn make_serve_hook(
             secure,
         );
         runtime.tls_enabled = use_tls;
+        if let Some(id) = &attested_identity {
+            runtime.attestation_json = Some(id.json().to_string());
+        }
         // `timeout N` del serve block (Some(0) = `none` explícito = sin límite).
         runtime.set_default_timeout(default_timeout.filter(|t| *t > 0.0));
         // Shutdown ordenado: al iniciar el drain se paran los jobs de cron y se cancelan
@@ -3020,6 +3283,15 @@ fn make_serve_hook(
         };
         let scheme = if use_tls { "HTTPS" } else { "HTTP" };
         println!("Serving {} on port {} ({} route(s))", scheme, port_str, n_routes);
+        if let Some(id) = &attested_identity {
+            println!(
+                "Attested: driver={} format={} program_sha={} — GET {}",
+                id.attestation.driver,
+                id.attestation.format,
+                synsema_core::bytesutil::hex_encode(&id.program_sha),
+                server::ATTESTATION_PATH
+            );
+        }
         let rt = Arc::new(runtime);
 
         // Cron real: con el bind YA listo, publicar el entorno de ejecución (snapshot
@@ -3162,10 +3434,82 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
                 success: false,
                 output: Vec::new(),
                 errors: vec![format!(
-                    "Runtime error: CLI serve flags (--port/--domain/--tls-*/--bind) require exactly one `serve` block, but found {}",
+                    "Runtime error: CLI serve flags (--port/--domain/--tls-*/--bind/--attested) require exactly one `serve` block, but found {}",
                     n_serve
                 )],
             };
+        }
+    }
+
+    // `--attested`: la identidad se genera ANTES de correr una línea del
+    // programa (par P-256 efímero + documento de la plataforma que ata sha256(spki ‖
+    // program_sha)). Si la plataforma no responde, el servidor no arranca: error claro, nunca
+    // Un serve "atestado" sin documento.
+    if overrides.attested {
+        // T5 — un `serve --attested` corre SIEMPRE con etiquetas de flujo. Hasta la ronda 3 eso lo
+        // hacía sólo `cmd_serve` al parsear la flag, así que cualquier OTRO front-end que use esta
+        // API pública (`run_serve_program_with_overrides` con `attested: true`: un embebedor, un
+        // test, el daemon) levantaba un servidor atestado SIN etiquetas — el mismo agujero de "un
+        // techo que se acepta en un front-end y se ignora en otro". Se fija acá, en el único
+        // camino por el que pasan todos.
+        crate::host::set_labels(true);
+        // Auditoría externa (chequeo ESTÁTICO, antes de generar la identidad): ninguna ruta literal
+        // del programa — host default o vhost — puede caer en una URL reservada del runtime
+        // (`/.well-known/attestation` incluida, con o sin barra final). Las rutas que llegan por
+        // grupos montados (`mount … at "/prefijo"`) las cubre el mismo chequeo sobre la tabla ya
+        // construida, en el hook.
+        for st in &program.statements {
+            let NodeKind::ServeBlock { routes, hosts, .. } = &st.kind else { continue };
+            let host_routes = hosts.iter().filter_map(|h| match &h.kind {
+                NodeKind::HostBlock { routes, pattern, .. } => Some((Some(pattern), routes)),
+                _ => None,
+            });
+            for (host, rs) in std::iter::once((None, routes)).chain(host_routes) {
+                for r in rs {
+                    let NodeKind::RouteDefinition { method, path, .. } = &r.kind else { continue };
+                    let norm = server::normalize_route_path(path);
+                    if server::RESERVED_PATHS.contains(&norm.as_str()) {
+                        return RunResult {
+                            success: false,
+                            output: Vec::new(),
+                            errors: vec![format!(
+                                "Runtime error: serve --attested: route `{} {}`{} collides with a reserved path ({}); the program cannot declare reserved URLs under --attested",
+                                method,
+                                path,
+                                host.map(|_| " (in a host block)".to_string()).unwrap_or_default(),
+                                server::RESERVED_PATHS.join(", ")
+                            )],
+                        };
+                    }
+                }
+            }
+        }
+        // Auditoría externa: `report_data` ata también un digest de CONFIGURACIÓN (etiquetas,
+        // Techo, modo TLS, motor, perfil). El modo TLS se decide acá, ESTÁTICAMENTE, con lo
+        // mismo que el hook aplicará después: `--tls-cert`/`--tls-auto` de la CLI o las
+        // cláusulas `tls cert`/`tls auto` del único bloque `serve` → "operator" (la clave
+        // anunciada NO es la del cert TLS; sirve para cifrar bodies); si no, "attested" (el cert
+        // autofirmado se emite con la clave anunciada). El hook re-verifica la coherencia.
+        let file_tls = program.statements.iter().any(|st| {
+            matches!(&st.kind, NodeKind::ServeBlock { tls_cert, tls_auto, .. } if tls_cert.is_some() || *tls_auto)
+        });
+        let operator_tls = overrides.tls_cert.is_some() || overrides.tls_auto_email.is_some() || file_tls;
+        let config = synsema_stdlib::attest::AttestConfig {
+            labels: crate::host::labels(),
+            ceiling: overrides.ceiling.clone(),
+            tls_key: if operator_tls { "operator" } else { "attested" },
+            profile: match crate::host::profile() {
+                crate::host::Profile::Pure => "pure",
+                crate::host::Profile::Native => "native",
+            },
+        };
+        match synsema_stdlib::attest::build_attested_identity(source, filename, config)
+            .and_then(synsema_stdlib::attest::install_attested_identity)
+        {
+            Ok(()) => {}
+            Err(e) => {
+                return RunResult { success: false, output: Vec::new(), errors: vec![format!("Runtime error: {}", e)] };
+            }
         }
     }
 

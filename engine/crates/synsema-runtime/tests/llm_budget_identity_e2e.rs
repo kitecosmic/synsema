@@ -1,4 +1,4 @@
-//! v0.6.20 (auditoría B1) — el techo LLM POR IDENTIDAD es del PROCESO bajo `serve`, no de cada
+//! V0.6.20  — el techo LLM POR IDENTIDAD es del PROCESO bajo `serve`, no de cada
 //! worker: con varios workers y requests que caen en hilos distintos, la suma de tokens de una
 //! misma identidad corta cuando corresponde. Números de verdad: cada llamada cuesta 25 000
 //! tokens (una tarea normal gasta 20k+); el techo de `alice` es 60 000 → pasan tres (75k) y la

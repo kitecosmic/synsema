@@ -1,7 +1,6 @@
 //! v0.6.20 — Tanda 1 (synsema-core): `reverse`, `split(t, "")` como caracteres, `steps()`,
 //! `use "../"` acotado a la raíz del proyecto, y los avisos nuevos del check estático.
 //! Programas `.syn` reales por el intérprete (`run_source`), como el resto de las suites.
-//! Spec: `specs/v0.6.20-faltantes-plataforma.md` §3.
 
 use std::path::{Path, PathBuf};
 use synsema_core::interpreter::run_source;
@@ -243,7 +242,11 @@ fn private_clause_parses_in_a_route_and_in_a_group() {
     let twice = "require serve(8080)\n\nserve on 8080\n    route \"GET /secret\"\n        private\n        private\n        give 1\n";
     let e = synsema_core::parser::parse_source(twice, "<test>").err().map(|e| e.to_string()).unwrap_or_default();
     assert!(e.contains("'private' at most once"), "{}", e);
-    // `private` como nombre sigue siendo un nombre (la cláusula es SOLO la línea `private`).
+    // `private` como nombre PARSEA como un nombre (la cláusula es SOLO la línea `private`),
+    // Pero desde T5 es un builtin protegido: ligarlo es error de CARGA , con
+    // etiquetas apagadas también.
+    // Ronda 3: la regla de nombres protegidos aplica SOLO a valores invocables, asi que
+    // `private` vuelve a ser una palabra clave blanda ligable a un valor comun.
     assert_eq!(out("let private be 3\nprint(private + 1)"), vec!["4"]);
 }
 

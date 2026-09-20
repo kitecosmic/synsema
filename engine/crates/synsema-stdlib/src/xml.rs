@@ -13,7 +13,7 @@
 //!
 //! Origen: la factura electrónica de los mercados de la plataforma es XML (CFDI en México,
 //! NF-e en Brasil, Facturae en España, AFIP en Argentina); se extrae sin LLM y el LLM sólo
-//! revisa. Spec `specs/v0.6.20-faltantes-plataforma.md` §5.2.
+//! revisa.
 
 use std::rc::Rc;
 

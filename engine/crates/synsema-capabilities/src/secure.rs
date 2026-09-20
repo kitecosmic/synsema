@@ -3,7 +3,7 @@
 //!
 //! Reemplazan I/O cruda por operaciones chequeadas. La violación produce un
 //! `Runtime error: Capability not granted: <cap>` (sin ubicación — la
-//! CapabilityViolation no la lleva; el prefijo de categoría lo agrega el motor).
+//! capabilityViolation no la lleva; el prefijo de categoría lo agrega el motor).
 //!
 //! Capa 5: read_file/write_file/run hacen la op real (filesystem/proceso). El HTTP
 //! (fetch/http_*) vive en synsema-stdlib/http.rs, gateado por `net`.
@@ -883,7 +883,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     }
                     Ok(_) => {}
                 }
-                // Auditoría B3 — recursivo: `file.write` sobre CADA ruta del árbol antes de borrar
+                // Auditoría externa — recursivo: `file.write` sobre CADA ruta del árbol antes de borrar
                 // nada (el mismo scope que exigiría borrarlas una a una).
                 if recursive {
                     let mut stack = vec![std::path::PathBuf::from(&path)];
@@ -1320,7 +1320,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
     }
 
     // -- Builtins de random (requieren la capability `random`) --
-    // Paridad con el oráculo: random() = float [0,1), random_int(lo,hi) = entero INCLUSIVO
+    // paridad con el oráculo: random() = float [0,1), random_int(lo,hi) = entero INCLUSIVO
     // [lo,hi]. RNG no-cripto como el `random` de Python (Mersenne Twister); los valores no
     // son byte-idénticos al oráculo (RNG distinto) — el contrato es rango+tipo+capability.
 
@@ -1473,7 +1473,7 @@ mod v0620_tests {
         }
     }
 
-    /// Auditoría B3 — borrar recursivo exige `file.write` sobre cada ruta del árbol.
+    /// Auditoría externa — borrar recursivo exige `file.write` sobre cada ruta del árbol.
     #[test]
     fn delete_dir_recursive_requires_file_write_on_every_path() {
         let d = scratch("delete-tree-scope");

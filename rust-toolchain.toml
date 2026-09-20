@@ -1,0 +1,17 @@
+# Toolchain pineado para TODO el repo (motor, guest de Vela, wasi-stub): rustup lo resuelve
+# subiendo directorios desde el CWD, y CI corre cargo desde la raíz con `--manifest-path`, así que
+# tiene que vivir acá (en `engine/` no lo vería un build lanzado desde la raíz).
+#
+# Por qué una versión exacta y no `stable`: la reproducibilidad del guest (release.yml,
+# `guest-reproducible`) y la provenance sólo significan algo si dos builds del mismo commit usan
+# el mismo compilador. 1.96.0 es la versión con la que se desarrolla y se valida localmente hoy
+# (2026-09-18); CI la pasa además explícita a dtolnay/rust-toolchain (`toolchain: "1.96.0"`),
+# porque esa action no lee este archivo. Subirla es un cambio deliberado: acá, en los workflows
+# y en el CHANGELOG de la release.
+#
+# OJO local: rustup trata `1.96.0` y `stable` como toolchains distintos aunque sean la misma
+# versión; la primera vez que corras cargo en el repo se instala `1.96.0-<host>` (una descarga,
+# ~1 GB con los targets de abajo). Después es transparente.
+[toolchain]
+channel = "1.96.0"
+targets = ["wasm32-wasip1", "wasm32-unknown-unknown"]

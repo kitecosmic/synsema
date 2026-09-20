@@ -8,7 +8,7 @@ verbatim against engine v0.5.9. If you know Python but are new to Synsema, read
 
 Pure — no capabilities needed. `synsema run report.syn`
 
-```
+```synsema
 let raw be `date,region,amount
 2026-01-05,north,120
 2026-01-06,south,80
@@ -34,7 +34,7 @@ Swap the literal for `read_file("data.csv")` + `require file("data.csv")`, or a
 
 `synsema serve api.syn` (NOT `run` — see [serve.md](serve.md))
 
-```
+```synsema
 require serve(8091)
 require db("./demo.db")
 
@@ -69,7 +69,7 @@ list you `give`). In production don't hardcode the token — `secret("API_TOKEN"
 `parallel_map` is fail-fast; the wrap-in-`try/recover` pattern collects partial results
 instead of aborting. `synsema run fanout.syn`
 
-```
+```synsema
 task risky_work(n)
     when n % 7 == 0
         raise("cannot process " + text(n))
@@ -95,7 +95,7 @@ For huge inputs, batch first: `chunk(items, 1000)` → [concurrency.md](concurre
 
 `synsema run duo.syn` — `run` joins spawned agents before exiting.
 
-```
+```synsema
 agent Doubler
     wait_for "job" timeout 5 as n
     share n * 2 as "doubled"
@@ -198,7 +198,7 @@ otherwise
 ```
 
 ### Intentional ops instead of loops
-```
+```synsema
 -- Instead of:
 let result be []
 each item in items
@@ -217,7 +217,7 @@ when contains(m, "discount") and m["discount"] > 0.2
 (On engines ≤ 0.6.9 both sides evaluated — nest two `when` there.)
 
 ### Re-propagate a caught error (recover swallows by default)
-```
+```synsema
 try
     risky_operation()
 recover err
@@ -226,7 +226,7 @@ recover err
 ```
 
 ### Agent with full lifecycle
-```
+```synsema
 intent: "Process daily orders"
 require net("api.shop.com")
 require memory("daily-orders")      -- declared memory: gates remember/rules/progress, names the .db
@@ -246,7 +246,7 @@ complete_step("daily", "fetch", text(length(orders)) + " orders")
 ```
 
 ### LLM with rule checking
-```
+```synsema
 let action be decide between ["discount", "full_price"] given customer_data
 let violations be check_rules("pricing", {"discount": 0.15})
 when length(violations) > 0
@@ -254,12 +254,12 @@ when length(violations) > 0
 ```
 
 ### Pipe chain
-```
+```synsema
 let report be raw_data |> clean |> validate |> summarize |> format
 ```
 
 ### Type constructor + collect
-```
+```synsema
 type Product
     name: text
     price: number
@@ -270,7 +270,7 @@ let expensive be where(products, is_expensive)
 ```
 
 ### Error-safe I/O
-```
+```synsema
 require file("/data/*")
 when file_exists("/data/cache.json")
     let cached be read_file("/data/cache.json")

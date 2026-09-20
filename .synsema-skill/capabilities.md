@@ -4,7 +4,7 @@
 Nothing works without declaring capabilities.
 
 ## Capability types
-`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `db`, `serve`, `secret`, `reveal`, `sign`, `wallet`, `spend`, `memory`, `sandbox_run` (v0.6.14+ — `run_program`). In `--cap-set`, `none` = an empty ceiling.
+`net`, `file`, `file.read`, `file.write`, `exec`, `env`, `time`, `random`, `stdout`, `stdin`, `llm`, `db`, `serve`, `secret`, `reveal`, `sign`, `wallet`, `spend`, `memory`, `sandbox_run` (v0.6.14+ — `run_program`), `attest` (ask the platform for an attestation document). In `--cap-set`, `none` = an empty ceiling.
 
 `serve(PORT)` allows binding an HTTP server to that port — see [serve.md](serve.md).
 
@@ -52,7 +52,7 @@ require memory("support-agent")     -- persistent agent state (remember/rules/pr
 The LLM operations — `reason`, `decide`, `analyze`, `generate` — and the tool-calling primitive
 `llm_step` are gated like every other side-effecting operation. They require the `llm` capability:
 
-```
+```synsema
 require llm
 let summary be generate "a summary" given report
 ```
@@ -71,7 +71,7 @@ For agent tool-calling, `llm` only gates the *decision* (`llm_step`); dispatch e
 
 ## Intent (descriptive)
 
-```
+```synsema
 intent: "Process customer orders and generate reports"
 ```
 
@@ -94,7 +94,7 @@ A plain task call runs with the program's **ambient** capabilities — a task's 
 declarations, not an automatic sandbox. To run a task under **least-privilege** (e.g. dispatching a
 model-chosen tool), use `call_tool`:
 
-```
+```synsema
 task fetch_orders()
     require net("api.shop.com")          -- the tool's declared capability
     give fetch("https://api.shop.com/orders")
@@ -134,7 +134,7 @@ reading it, same scope shape as `list_dir` (`file("dir")` + `file("dir/*")`).
 Plain `call`/normal invocation does NOT isolate — use `call_tool` for untrusted, model-chosen tools.
 
 ## Sandbox blocks
-```
+```synsema
 sandbox
     -- code here has NO capabilities (fully isolated): net/file/time/random/db/secret
     -- are all DENIED inside, even if the program granted them. `require` inside is a
@@ -167,6 +167,14 @@ synsema test --cap-set "stdout,time,random,secret,file=scratch_*" program.syn
 - **`--cap-set none`** = an empty ceiling (nothing, not even `stdout`). **`stdout` is a real capability under a ceiling** (v0.6.14+): a `--cap-set` without `stdout` denies output at the first `print`/`show`/`log` (`--sandbox` includes it; no ceiling = output free). The audit gained two `reason`s: `auto-granted by the runtime` (an ambient grant that succeeded now leaves a trace, `origin: runtime`) and `bundled asset (part of the program)` (a `synsema build` read).
 - **`--deterministic`** (v0.6.20+, `run`/`test`/`build`) = `--profile pure` **plus** a ceiling of `stdout` only — no `time`, no `random` (`now()`/`random()` fail with `Capability not granted`): the same program gives the same output. An alias, so combining it with `--sandbox`/`--cap-set`/`--profile native` is exit 2 (`--deterministic already fixes the ceiling …`). `build` bakes it.
 - **The pure profile is a second, independent wall** (`--profile native|pure`, v0.6.14+): under `pure`, every filesystem/exec/socket/db/cron builtin fails with `<name>: not available in the pure profile — <why>`, regardless of the ceiling. `fetch`/`http_*` with `net`, agents, `run_program` and `remember` (in-memory) stay. `serve --profile pure` is a usage error. See [deploy.md](deploy.md) and the ceiling below compose.
+- **`attest` capability**: `require attest` lets `attest(opts)` / `attest_key(purpose)` ask the
+  **platform** for an attestation document binding `report_data` to the code that is running (AWS
+  Nitro, TDX/SEV-SNP via configfs-tsm, dstack, plus a `mock` driver for CI that is never
+  auto-detected). It is I/O against a device or socket of the host, so it is deny-by-default like
+  every other capability, and it is **absent from every packaged ceiling**: neither `--sandbox`
+  nor the deterministic one list it, so `--deterministic` denies it on its own. See
+  [guests.md](guests.md).
+
 - **`sandbox_run` capability** (v0.6.14+): `require sandbox_run` lets a program run *another* Synsema program with `run_program(source, {ceiling, profile, env, timeout})` in a child process under a ceiling that is the intersection with its own — the child can never exceed the parent (asking for more is trimmed, not fatal, and the parent's audit records it as `above parent ceiling`). See [builtins.md](builtins.md) and [processes.md](processes.md).
 - **`render` of a disk template reads a file:** the top-level `render(path)` needs `require file.read("<path>")` (v0.6.14+; nested `include`/`layout` and bundled templates don't).
 - **The error names who can fix it.** Not declared → `Capability not granted: X` / `… missing capability — add require X`

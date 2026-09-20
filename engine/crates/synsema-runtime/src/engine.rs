@@ -49,7 +49,7 @@ use synsema_stdlib::secrets::{register_secret_builtins, EnvStore};
 pub(crate) const INTERP_STACK_SIZE: usize = 512 * 1024 * 1024;
 
 // =========================================================
-// Memoria declarada (DB-M1): identidad + stores compartidos
+// memoria declarada (DB-M1): identidad + stores compartidos
 // =========================================================
 
 /// Contexto de la memoria DECLARADA de un programa (`require memory("nombre")`).
@@ -104,7 +104,7 @@ pub(crate) fn undeclared_memory_gate(suggest: String) -> MemoryGate {
 }
 
 /// Gate de memoria CON declaración: chequea `memory("<nombre>")` contra el
-/// CapabilitySet VIVO del contexto — así `sandbox` (set vaciado), `call_tool`
+/// capabilitySet VIVO del contexto — así `sandbox` (set vaciado), `call_tool`
 /// (intersección declarada) y el techo del host (`--sandbox`/`--cap-set`) lo
 /// deniegan por la misma maquinaria que el resto de capabilities (G-2).
 pub(crate) fn declared_memory_gate(caps: Rc<RefCell<CapabilitySet>>, name: String) -> MemoryGate {
@@ -380,6 +380,173 @@ pub(crate) fn wire_common(
 /// (serve pre-carga las reglas del top-level en su AgentMemory per-worker) y el gate de
 /// memoria explícito. `mem` (si hay) viaja a los ejecutores de cron y a los workers de
 /// `parallel_map` para que TODOS los contextos compartan la misma memoria declarada.
+/// Builtins del stdlib/agents/runtime que tienen EFECTO fuera del
+/// programa (archivos, red, bases de datos, sockets, procesos, memoria persistente, entorno,
+/// Programas hijos, notificaciones, attestation, gasto): bajo etiquetas son sumideros públicos.
+/// Sumar un builtin con efecto sin listarlo acá lo deja fuera del chequeo: el test
+/// `every_effectful_family_is_a_label_sink` cruza esta lista con las familias registradas.
+pub const LABEL_SINK_BUILTINS: &[&str] = &[
+    // Archivos y procesos (synsema-capabilities/secure.rs, stdlib/proc.rs, watch.rs, term.rs)
+    "write_file", "append_file", "edit_file", "delete_file", "delete_dir", "read_file", "read_file_bytes",
+    "list_dir", "file_exists", "file_info", "grep", "run", "run_program",
+    "proc_spawn", "proc_send", "proc_close_stdin", "proc_kill", "proc_resize", "proc_wait", "proc_close",
+    "watch", "watch_close", "term_open", "term_write", "term_close", "shutdown",
+    // Red (stdlib/http.rs, ws.rs, webpush.rs, oidc.rs, blockchain_*_rpc.rs). `http` (el verbo
+    // genérico) faltaba: lo encontró el anti-rot cruzando la lista con lo registrado.
+    "http", "http_get", "http_post", "http_put", "http_delete", "http_bytes", "fetch",
+    "mtls_identity",
+    "ws_connect", "ws_send", "ws_broadcast", "ws_close", "push_send", "oidc_verify",
+    "eth_rpc", "eth_call", "eth_send_raw", "eth_balance", "eth_nonce", "eth_receipt", "eth_wait_receipt",
+    "eth_estimate_gas", "eth_gas_price", "eth_fee_history", "eth_chain_id",
+    "solana_rpc", "solana_send", "solana_confirm", "solana_balance", "solana_latest_blockhash", "spl_balance",
+    "algorand_send", "algorand_wait", "algorand_account", "algorand_params",
+    "btc_rpc", "btc_send", "btc_utxos", "btc_balance", "btc_fee_estimates", "btc_wait",
+    // Bases de datos (stdlib/database.rs)
+    "db_open", "db_close", "sql", "sql_exec", "sql_batch", "sql_tables", "paged",
+    "redis_get", "redis_set", "redis_del", "redis_incr", "redis_incrby", "redis_decr", "redis_exists", "redis_expire",
+    "redis_persist", "redis_ttl", "redis_type", "redis_keys", "redis_mget", "redis_mset", "redis_hget", "redis_hset",
+    "redis_hdel", "redis_hgetall", "redis_hincrby", "redis_lpush", "redis_rpush", "redis_lpop", "redis_rpop",
+    "redis_lrange", "redis_llen", "redis_sadd", "redis_srem", "redis_smembers", "redis_sismember", "redis_lock", "redis_unlock",
+    "mongo_find", "mongo_find_one", "mongo_insert", "mongo_insert_many", "mongo_update", "mongo_delete",
+    "mongo_count", "mongo_aggregate", "mongo_collections",
+    // Memoria persistente, estado y progreso (synsema-agents, serve)
+    "remember", "recall", "forget_memory", "add_rule", "create_progress", "start_step", "complete_step", "fail_step",
+    "state_set", "state_get", "state_incr", "state_delete", "state_all",
+    // Bus, cron, entorno, gasto, attestation, archivos comprimidos, exportes
+    "bus_publish", "bus_subscribe", "bus_unsubscribe", "cron_every", "cron_after", "cron_cancel",
+    "env", "secret", "reveal", "spend", "attest", "attest_key",
+    // Agentes (sólo con swarm cableado) y fan-out a otros intérpretes. `parallel_map` es un
+    // SUMIDERO, no `label_aware`: rechaza argumentos etiquetados ANTES de lanzar un worker. Es
+    // fail-closed deliberado, no una imposibilidad (`SendValue::Private` existe desde el cierre
+    // del snapshot de `serve`); la nota de `parallel.rs` explica qué habría que especificar para
+    // hacerlo consciente. Sin esto el mapper recibía el valor ya despojado y hacía el efecto EN
+    // CLARO mientras el resultado volvía etiquetado: la fuga parecía rastreada.
+    "agent_stop", "parallel_map",
+    "zip_create", "zip_extract", "tar_create", "tar_extract", "svg_to_png", "svg_to_pdf",
+];
+
+/// De las listas anteriores, los que NO existen en un intérprete de `run` pelado porque el runtime los
+/// registra más tarde: bajo `serve` (estado compartido, por worker) o con un swarm cableado (agentes).
+/// El anti-rot no puede buscarlos en el wiring base. La sentencia `emit` y la respuesta HTTP son
+/// sumideros del propio `serve` (`serve.rs`/`routing.rs`), no builtins.
+pub const LABEL_SINKS_SERVE_ONLY: &[&str] =
+    &["state_set", "state_get", "state_incr", "state_delete", "state_all", "agents", "agent_stop"];
+
+/// Familias OS-facing (las tablas de `synsema_stdlib::pure`) que NO son sumideros porque LEEN: entradas
+/// (stdin, sockets, procesos, terminal, watches, bus) y consultas del estado del host. Se declaran aparte
+/// para que el anti-rot pueda exigir que toda familia que hable con el SO esté clasificada a mano: o
+/// sumidero, o lectura declarada acá. Todas están además en `LABEL_PURE_BUILTINS`.
+pub const LABEL_OS_READ_BUILTINS: &[&str] = &[
+    "agents", "bus_recv", "bus_topics", "cron_list", "cron_status", "cwd", "proc_recv", "proc_select",
+    "proc_stats", "proc_status", "read_line", "select", "self_path", "term_recv", "term_size", "term_stats",
+    "watch_recv", "watch_stats", "ws_recv", "ws_select", "ws_select_all", "ws_stats", "ws_status",
+];
+
+/// la contracara EXPLÍCITA de
+/// `LABEL_SINK_BUILTINS`: todo builtin del wiring nativo que NO tiene efecto fuera del intérprete.
+/// Entre las dos listas (más `CORE_SINK_BUILTINS` y los `label_aware` del core) cubren EXACTAMENTE
+/// Lo que el motor registra: el anti-rot `every_effectful_family_is_a_label_sink` lo cruza contra
+/// `registered_builtin_names()`, así que un builtin NUEVO rompe el test hasta que alguien decida, a
+/// mano, de qué lado está. Ése es exactamente el hueco por el que pasó `parallel_map`.
+pub const LABEL_PURE_BUILTINS: &[&str] = &[
+    // Entradas y consultas del HOST: leen (stdin, sockets, procesos, terminal, watches, bus, cron, cwd) o
+    // describen el proceso. NO son sumideros: un dato no SALE por ellas; el host que quiera tratarlas como
+    // FUENTES las etiqueta en su borde. El anti-rot las cruza con las tablas OS-facing de `pure.rs`: toda
+    // familia que hable con el SO tiene que estar acá o en la lista de sumideros
+    // `agents` (swarm-only, como `agent_stop`) sólo aparece en el wiring de serve/swarm: lo destapó
+    // el anti-rot al extenderse a ese wiring (auditoría ronda 3, M3).
+    "agents",
+    "bus_recv", "bus_topics", "cron_list", "cron_status", "cwd", "proc_recv", "proc_select", "proc_stats",
+    "proc_status", "read_line", "select", "self_path", "term_recv", "term_size", "term_stats", "watch_recv",
+    "watch_stats", "ws_recv", "ws_select", "ws_select_all", "ws_stats", "ws_status",
+    // Reloj, entropía y args del proceso: fuentes sin efecto de salida (`now`/`sleep` son además el canal de
+    // TIEMPO que la spec declara NO cubierto)
+    "arg", "args", "date_parts", "flush", "format_time", "now", "parse_time", "platform", "push_vapid_keys",
+    "random", "random_bytes", "random_int", "sleep", "steps", "token",
+    // Firma y custodia: escriben una entrada de AUDIT (nombre de la clave y ubicación, ambos públicos) pero el
+    // material y el resultado se quedan DENTRO del programa — la firma de un dato privado sale privada por el
+    // despacho genérico, y publicarla exige pasar por un sumidero o un `declassify`
+    "algorand_mnemonic", "algorand_mnemonic_to_key", "ecdsa_p256_sign", "ed25519_pubkey", "ed25519_sign",
+    "hd_derive", "http_sign", "keystore_export", "keystore_import", "mnemonic_from_entropy",
+    "mnemonic_generate", "mnemonic_to_entropy", "mnemonic_to_seed", "rsa_sign_sha256", "schnorr_pubkey",
+    "schnorr_sign", "secp256k1_pubkey", "secp256k1_recover", "secp256k1_sign", "wif_import",
+    // Identidad atestada y verificación de documentos: leen lo que el propio proceso publica; `attestation_key`
+    // Devuelve un secret SELLADO  que sólo consumen firma y ECDH con la clave propia
+    "attestation_document", "attestation_key", "attestation_verify",
+    // Estado declarado y observabilidad, sólo LECTURA (las escrituras — `remember`, `add_rule`,
+    // `create_progress`, `start_step`, `complete_step`, `fail_step`, `state_*` — sí son sumideros)
+    "check_rules", "get_rules", "llm_available", "llm_usage", "memory_summary", "openapi_json",
+    "progress_display", "progress_percent", "resume_point", "spend_total",
+    // Orden superior: no hacen efecto por sí mismos, DESPACHAN código del programa (el intérprete empuja el PC
+    // A los callbacks, y los sumideros que use el callee se comprueban ahí). `parallel_map` NO está acá: cruza
+    // A otro intérprete, donde la etiqueta no llega
+    "apply", "call", "call_tool", "chunk", "collect", "count_where", "every", "find_all", "find_first",
+    "fold", "group_by", "reduce", "some", "sort_by", "transform", "where", "zip_with",
+    // Plantillas y vocabulario de respuesta: construyen VALORES (el sumidero es la respuesta HTTP, en `serve.rs`)
+    "binary", "chart", "chart_svg", "clear_cookie", "code", "content", "created", "heading", "html", "image",
+    "link", "list", "not_found", "ok", "ordered_list", "page", "prose", "raw", "redirect", "render",
+    "respond", "section", "set_cookie", "with_header",
+    // Cómputo puro: texto, colecciones, números, matrices, estadística, fechas, formatos (json/csv/toml/xml),
+    // Criptografía sin material propio (hashes, MAC, verificación, ZK, ruido determinista), encoders de
+    // blockchain y helpers de test. Cero efecto fuera del intérprete
+    "abi_decode", "abi_encode", "abi_selector", "abs", "acos", "acosh", "aes_gcm_decrypt", "aes_gcm_encrypt",
+    "algo_address", "algorand_tx", "algorand_tx_encode", "append", "arange", "array", "as_secret", "asin",
+    "asinh", "assert", "assert_eq", "assert_error", "assert_ne", "at", "atan", "atan2", "atanh", "bearer",
+    "bech32_decode", "bech32_encode", "beta", "btc_address", "btc_address_decode", "btc_script", "btc_tx",
+    "btc_tx_raw", "btc_txid", "bytes", "bytes_to_int", "captoken_allows", "captoken_attenuate",
+    "captoken_mint", "captoken_verify", "capture", "cbrt", "ceil", "clamp", "complex", "conj",
+    "constant_time_eq", "contains", "cos", "cosh", "csv_encode", "csv_parse", "decimal", "decode", "degrees",
+    "det", "dot", "ecdh_keypair", "ecdh_shared_secret", "ecdsa_p256_verify", "ed25519_verify", "eig",
+    "eip191_digest", "eip712_digest", "ends_with", "enumerate", "erf", "erfc", "eth_address", "exp", "eye",
+    "factorial", "fail", "flatten", "float", "floor", "fmt", "full", "gamma", "gaussian_noise", "gcd",
+    "groth16_verify", "hash160", "histogram", "hkdf_sha256", "hmac_sha256", "http_signature_verify", "hypot",
+    "identity", "imag", "index_of", "int_to_bytes", "int_to_bytes_le", "inv", "is_array", "is_bytes",
+    "is_complex", "is_decimal", "is_finite", "is_infinite", "is_nan", "join", "json_decode", "json_encode",
+    "json_for_script", "jwt_sign", "jwt_verify", "keccak256", "keys", "laplace_noise", "lcm", "length",
+    "lgamma", "linspace", "ln", "log10", "log2", "log_base", "lower", "matches", "matmul", "max", "mean",
+    "median", "min", "multipart_encode", "ndim", "norm", "number", "ones", "password_hash", "password_verify",
+    "percentile", "pow", "product", "psbt_decode", "psbt_encode", "psbt_finalize", "radians", "raise",
+    "range", "real", "replace_re", "replace_text", "reshape", "reverse", "rlp_decode", "rlp_encode", "round",
+    "round_to", "rsa_verify_sha256", "schnorr_verify", "secp256k1_verify", "sha256", "sha512", "sha512_256",
+    "shape", "sign", "sin", "sinh", "size", "slice", "solana_message", "solana_pda", "solana_tx", "solve",
+    "spl_ata", "spl_transfer_checked_data", "spl_transfer_data", "split", "sqrt", "starts_with", "std",
+    "strip_ansi", "sum", "svd", "tan", "tanh", "text", "to_list", "toml_encode", "toml_parse", "totp",
+    "totp_verify", "trace", "transpose", "trim", "trunc", "tx_eip1559", "tx_eip1559_raw", "type_of", "unique",
+    "upper", "values", "var", "verify_hmac", "xml_parse", "zeros",
+];
+
+/// Todos los builtins registrados en el wiring NATIVO (un intérprete de `run`), ordenados.
+/// Es la fuente de verdad del anti-rot `every_effectful_family_is_a_label_sink`: la lista de
+/// sumideros se cruza contra lo que el motor registra DE VERDAD, no contra sí misma.
+pub fn registered_builtin_names() -> Vec<String> {
+    let mut interp = Interpreter::new();
+    let caps = Rc::new(RefCell::new(CapabilitySet::new("probe")));
+    wire_common(&mut interp, &caps, false, None, "probe");
+    let env = interp.global_env.borrow();
+    let mut names: Vec<String> = env
+        .bindings
+        .iter()
+        .filter(|(_, v)| matches!(v, synsema_core::types::SynValue::Builtin(_)))
+        .map(|(k, _)| k.clone())
+        .collect();
+    names.sort();
+    names
+}
+
+/// ¿Existe un builtin con ese nombre en el wiring nativo? (anti-rot de `LABEL_SINK_BUILTINS`).
+pub fn builtin_exists(name: &str) -> bool {
+    thread_local! {
+        static NAMES: std::collections::HashSet<String> = {
+            let mut interp = Interpreter::new();
+            let caps = Rc::new(RefCell::new(CapabilitySet::new("probe")));
+            wire_common(&mut interp, &caps, false, None, "probe");
+            let set = interp.global_env.borrow().bindings.keys().cloned().collect();
+            set
+        };
+    }
+    NAMES.with(|n| n.contains(name))
+}
+
 pub(crate) fn wire_common_with_state(
     interp: &mut Interpreter,
     caps: &Rc<RefCell<CapabilitySet>>,
@@ -389,6 +556,33 @@ pub(crate) fn wire_common_with_state(
     mem_gate: MemoryGate,
     mem: Option<MemoryCtx>,
 ) {
+    // Etiquetas de flujo por proceso (`--labels`, `serve --attested`). Se fijan
+    // acá porque TODOS los intérpretes del runtime (run, serve por request, agentes, cron,
+    // Parallel_map) pasan por este wiring: un intérprete sin etiquetas en un proceso con
+    // etiquetas sería un agujero, no un knob.
+    if crate::host::labels() {
+        interp.set_labels(true);
+        // Todo builtin con EFECTO es un sumidero público. Un valor privado en
+        // cualquiera de sus argumentos, o la llamada bajo una rama que dependió de datos privados,
+        // Es `label_violation` ANTES de ejecutar el efecto (el archivo no se escribe, el socket no
+        // recibe nada). Los del core (`share`/`signal`/`send`/`reason`/... y `CORE_SINK_BUILTINS`)
+        // Ya lo hacen; éstos son los del stdlib/agents/runtime. Fail-closed: un nombre que no
+        // exista en este proceso se ignora (registrar de más no cuesta nada).
+        for name in LABEL_SINK_BUILTINS.iter().chain(synsema_core::interpreter::CORE_SINK_BUILTINS.iter()) {
+            interp.register_label_sink(name);
+        }
+        // Bajo `run/test --labels` el registro de `declassify` no se veía en ningún
+        // lado (sin `log_hook` sólo lo drena el host wasm). Si nadie instaló un hook (serve pone
+        // El suyo por worker), cada `declassify` sale por stderr como `[INF] declassify: …`; las
+        // demás líneas del hook (print/log/show ya van a `output`) se ignoran para no duplicarlas.
+        if interp.log_hook.is_none() {
+            interp.log_hook = Some(Arc::new(|line: &str| {
+                if line.starts_with("[INF] declassify:") {
+                    eprintln!("{}", line);
+                }
+            }));
+        }
+    }
     if !secure {
         caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Stdout, None));
         caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Time, None));
@@ -427,14 +621,14 @@ pub(crate) fn wire_common_with_state(
     // hmac_sha256). Registrados acá → existen en el intérprete principal Y en
     // los de serve/parallel/cron.
     synsema_stdlib::webauth::register_webauth_builtins(interp, caps.clone());
-    // Identidad de agentes (T2/T4): firmas de request con perfil RFC 9421 pineado
+    // Identidad de agentes : firmas de request con perfil RFC 9421 pineado
     // (`http_sign` gateado por `sign(NAME)` + audit — la misma puerta que firmar
     // on-chain; `http_signature_verify` puro) y tokens de capacidad atenuables
     // (`captoken_*`, puros: el poder vive en la clave raíz sellada, y lo que un
     // token concede lo sigue gateando el CapabilitySet de quien lo usa).
     synsema_stdlib::httpsig::register_httpsig_builtins(interp, caps.clone());
-    synsema_stdlib::captoken::register_captoken_builtins(interp);
-    // T3 — OIDC de terceros (RS256/ES256 + JWKS): "login with Google" y workload
+    synsema_stdlib::captoken::register_captoken_builtins(interp, caps.clone());
+    // OIDC de terceros (RS256/ES256 + JWKS): "login with Google" y workload
     // identity de nube. El fetch del JWKS es red → gateado por `net(host)`.
     synsema_stdlib::oidc::register_oidc_builtins(interp, caps.clone());
     // Web Push (tanda PWA): `push_send` gateado por `net(host del endpoint)` — la MISMA
@@ -483,6 +677,16 @@ pub(crate) fn wire_common_with_state(
     synsema_stdlib::xml::register_xml_builtins(interp);
     synsema_stdlib::toml_fmt::register_toml_builtins(interp);
     synsema_stdlib::crypto::register_crypto_builtins(interp, caps.clone());
+    // `attest`/`attest_key` gateados por `attest` (deny-by-default, jamás
+    // ambiente: ningún techo empaquetado la lista) + `attestation_document`/`attestation_key`
+    // (la identidad de `serve --attested`; fuera de ese modo, error claro).
+    synsema_stdlib::attest::register_attest_builtins(interp, caps.clone());
+    // Verificar attestation (nitro/mock; puro, `now` explícito), ruido
+    // determinista para privacidad de salida y verificación Groth16 (BN254, JSON de snarkjs).
+    // Puros y sin capability; los mismos que entran al perfil wasm.
+    synsema_stdlib::attestation::register_attestation_builtins(interp);
+    synsema_stdlib::privacy::register_privacy_builtins(interp);
+    synsema_stdlib::zk::register_zk_builtins(interp);
     synsema_stdlib::archive::register_archive_builtins(interp, caps.clone());
     synsema_stdlib::raster::register_raster_builtins_with_caps(interp, caps.clone());
     crate::parallel::register_parallel_builtins(interp, caps, secure, mem);
@@ -732,6 +936,9 @@ pub(crate) fn wire_real_llm_provider(interp: &mut Interpreter) {
 }
 
 fn finish(mut interp: Interpreter, result: Result<SynValue, Control>) -> RunResult {
+    // T5 (ronda 6, B2): la salida de una corrida cortada por el chequeo de flujo no se entrega
+    // — la cantidad de líneas antes del corte depende del dato privado. Ver `redact_output_for_host`.
+    interp.redact_output_for_host(&result);
     match result {
         Ok(_) => RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() },
         Err(Control::Error(e)) => RunResult {
@@ -748,7 +955,7 @@ fn finish(mut interp: Interpreter, result: Result<SynValue, Control>) -> RunResu
 }
 
 // =========================================================
-// Camino sin swarm (conform capas 1-6)
+// camino sin swarm (conform capas 1-6)
 // =========================================================
 
 /// Corre el main. Si `swarm` es `Some`, cablea sus hooks en el intérprete principal
@@ -856,7 +1063,7 @@ fn run_inner(
             // La persistencia es on-write (el ctx guarda tras cada mutación, como serve):
             // no hay save final que pueda perderse si el programa crashea a mitad.
             let r = interp.execute(&program);
-            note_run_steps(interp.steps());
+            note_run_steps(&interp);
             finish(interp, r)
         }
     }
@@ -886,13 +1093,24 @@ fn spawn_run_ceiled(source: &str, filename: &str, secure: bool, ceiling: Option<
 /// v0.6.20 — pasos del intérprete del ÚLTIMO programa ejecutado en este proceso (`run`,
 /// `test`, `conform`): lo que `run --format json` reporta como `steps`. Determinista.
 static LAST_RUN_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// T5 (ronda 5): ¿esa corrida tocó datos privados? El contador de pasos es lineal en lo que el
+/// programa recorrió, así que después de una rama privada ES el dato privado con otra aritmética
+/// encima — y el host lo publica solo, en `run --format json` y en el documento de `run --attest`,
+/// que es justo el artefacto que un tercero verifica. Con esto el host puede omitirlo.
+static LAST_RUN_PRIVATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn note_run_steps(steps: u64) {
-    LAST_RUN_STEPS.store(steps, std::sync::atomic::Ordering::SeqCst);
+fn note_run_steps(interp: &Interpreter) {
+    LAST_RUN_STEPS.store(interp.steps(), std::sync::atomic::Ordering::SeqCst);
+    LAST_RUN_PRIVATE.store(interp.private_seen(), std::sync::atomic::Ordering::SeqCst);
 }
 
 pub fn last_run_steps() -> u64 {
     LAST_RUN_STEPS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// ¿La última corrida tocó datos privados? Si sí, `steps` no se publica (ver `LAST_RUN_PRIVATE`).
+pub fn last_run_touched_private() -> bool {
+    LAST_RUN_PRIVATE.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 pub fn run_source(source: &str, filename: &str) -> RunResult {
@@ -975,7 +1193,7 @@ pub fn run_program_ceiled_opts(
 }
 
 // =========================================================
-// Test framework (Batch 3): `synsema test`
+// test framework (Batch 3): `synsema test`
 // =========================================================
 
 /// Reporte agregado de correr los bloques `test` de un archivo. `output` lleva los `print`
@@ -1302,7 +1520,7 @@ fn run_configured(source: &str, filename: &str, configure: impl FnOnce(&mut Inte
             wire_common(&mut interp, &caps, false, mem_ctx.as_ref(), &suggested_memory_name(filename));
             configure(&mut interp);
             let r = interp.execute(&program);
-            note_run_steps(interp.steps());
+            note_run_steps(&interp);
             finish(interp, r)
         }
     }
@@ -1485,7 +1703,7 @@ pub fn run_with_llm_stream(source: &str, filename: &str, chunks: Vec<String>) ->
 }
 
 // =========================================================
-// Camino con swarm (agentes en hilos)
+// camino con swarm (agentes en hilos)
 // =========================================================
 
 /// Cablea los hooks del swarm en un intérprete (capturando el `Arc<Swarm>` y el
@@ -1786,7 +2004,7 @@ fn run_swarm_inner(
             };
             let mut interp = setup_swarm_interpreter(swarm, "main", ceiling, mem_ctx, false);
             let r = interp.execute(&program);
-            note_run_steps(interp.steps());
+            note_run_steps(&interp);
             finish(interp, r)
         }
     }

@@ -1,4 +1,4 @@
-//! T2 — Firmas de request HTTP (proof-of-possession), perfil PINEADO de RFC 9421.
+//! Firmas de request HTTP (proof-of-possession), perfil PINEADO de RFC 9421.
 //!
 //! El paradigma (P1 del diseño de auth de agentes): un bearer token robado del
 //! contexto de un LLM lo usa cualquiera; una request FIRMADA exige poseer la clave
@@ -42,6 +42,7 @@ use synsema_core::types::{syn_int, syn_map, syn_nothing, syn_text, SynValue};
 
 use crate::blockchain::{ed25519_seed, gate_and_audit, key_material as curve_key_material};
 use crate::secrets::{hmac_compute, Algo};
+use crate::webauth::clock_or_error;
 
 fn err(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::new(msg.into()))
@@ -220,7 +221,9 @@ fn b_http_sign(
 
     let opts = opts_map(args.get(2), F)?;
     let mut alg = SigAlg::Ed25519;
-    let mut created = unix_now();
+    // M12: sin `created` explícito hay que leer el reloj → capability `time` (se resuelve DESPUÉS
+    // del gate `sign`, para no cambiar qué error ve primero un programa sin la capability).
+    let mut created_opt: Option<i64> = None;
     let mut keyid: Option<String> = None;
     let mut nonce: Option<String> = None;
     let mut label = DEFAULT_LABEL.to_string();
@@ -229,9 +232,9 @@ fn b_http_sign(
             "alg" => alg = SigAlg::parse(&v.to_string(), F)?,
             "created" => match v {
                 SynValue::Number(n) => {
-                    created = n.to_i64_trunc().ok_or_else(|| {
+                    created_opt = Some(n.to_i64_trunc().ok_or_else(|| {
                         err(format!("{}: created must be a unix timestamp (integer)", F))
-                    })?
+                    })?)
                 }
                 other => {
                     return Err(err(format!(
@@ -292,6 +295,17 @@ fn b_http_sign(
         return Err(e);
     }
 
+    let created = match created_opt {
+        Some(c) => c,
+        None => match clock_or_error(caps, F, "created") {
+            Ok(c) => c,
+            Err(e) => {
+                let mut k = key;
+                k.zeroize();
+                return Err(e);
+            }
+        },
+    };
     let digest = content_digest(&body);
     let params = signature_params(alg, created, &keyid, nonce.as_deref());
     let base = signature_base(&method, &url, &digest, &params);
@@ -365,7 +379,7 @@ fn param_int(params: &str, name: &str) -> Option<i64> {
     rest[..end].parse().ok()
 }
 
-fn b_http_signature_verify(args: &[SynValue]) -> Result<SynValue, Control> {
+fn b_http_signature_verify(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
     const F: &str = "http_signature_verify";
     if !(2..=3).contains(&args.len()) {
         return Err(err(format!("{}(request, key, opts?) takes 2 or 3 arguments", F)));
@@ -377,6 +391,8 @@ fn b_http_signature_verify(args: &[SynValue]) -> Result<SynValue, Control> {
     // mensaje permitiría el ataque de confusión de algoritmo (ver el doc del módulo).
     let mut alg: Option<SigAlg> = None;
     let mut max_age = DEFAULT_MAX_AGE;
+    // M12: la ventana anti-replay se mide contra un reloj; sin `now` explícito, capability `time`.
+    let mut now_opt: Option<i64> = None;
     for (k, v) in &opts {
         match k.as_str() {
             "alg" => alg = Some(SigAlg::parse(&v.to_string(), F)?),
@@ -393,9 +409,23 @@ fn b_http_signature_verify(args: &[SynValue]) -> Result<SynValue, Control> {
                     )))
                 }
             },
+            "now" => match v {
+                SynValue::Number(n) => {
+                    now_opt = Some(n.to_i64_trunc().ok_or_else(|| {
+                        err(format!("{}: now must be a unix timestamp (integer)", F))
+                    })?)
+                }
+                other => {
+                    return Err(err(format!(
+                        "{}: now must be a unix timestamp (integer), got {}",
+                        F,
+                        other.type_name()
+                    )))
+                }
+            },
             other => {
                 return Err(err(format!(
-                    "{}: unknown option {:?} (valid options: alg, max_age)",
+                    "{}: unknown option {:?} (valid options: alg, max_age, now)",
                     F, other
                 )))
             }
@@ -435,7 +465,11 @@ fn b_http_signature_verify(args: &[SynValue]) -> Result<SynValue, Control> {
 
     // Toda falla del mensaje → `nothing`, sin detalle de por qué (mismo contrato que
     // `jwt_verify`: un endpoint no debe poder distinguirse por la causa del rechazo).
-    Ok(verify_inner(&req, &key, alg, max_age).unwrap_or_else(syn_nothing))
+    let now = match now_opt {
+        Some(n) => n,
+        None => clock_or_error(caps, F, "now")?,
+    };
+    Ok(verify_inner(&req, &key, alg, max_age, now).unwrap_or_else(syn_nothing))
 }
 
 fn verify_inner(
@@ -443,6 +477,7 @@ fn verify_inner(
     key: &[u8],
     alg: SigAlg,
     max_age: i64,
+    now: i64,
 ) -> Option<SynValue> {
     let method = match req.get("method")? {
         SynValue::Text(s) => s.trim().to_string(),
@@ -483,8 +518,9 @@ fn verify_inner(
 
     // Ventana anti-replay: `created` dentro de ±max_age (un reloj adelantado del
     // cliente tampoco vale — la firma futura serviría para replay diferido).
-    let now = unix_now();
-    if max_age > 0 && (now - created).abs() > max_age {
+    // Saturante (M12, la instancia MÁS grave de la clase de M6): `created` lo elige el atacante y
+    // este chequeo corre ANTES de verificar la firma — `created = i64::MIN` paniqueaba el proceso.
+    if max_age > 0 && now.saturating_sub(created).saturating_abs() > max_age {
         return None;
     }
 
@@ -541,7 +577,7 @@ fn verify_inner(
 }
 
 // =========================================================
-// Registro
+// registro
 // =========================================================
 
 /// Registra `http_sign` (gateado por `sign(NAME)` + audit) y
@@ -553,11 +589,14 @@ pub fn register_httpsig_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabili
         -1,
         Rc::new(move |_i, a, l| b_http_sign(a, l, &c)),
     );
-    interp.register_builtin(
-        "http_signature_verify",
-        -1,
-        Rc::new(|_i, a, _l| b_http_signature_verify(a)),
-    );
+    {
+        let c = caps.clone();
+        interp.register_builtin(
+            "http_signature_verify",
+            -1,
+            Rc::new(move |_i, a, _l| b_http_signature_verify(a, &c)),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -591,6 +630,84 @@ mod tests {
             Err(Control::Error(e)) => panic!("unexpected error: {}", e),
             Err(_) => panic!("unexpected control flow"),
         }
+    }
+
+    fn err_of(r: Result<SynValue, Control>) -> String {
+        match r {
+            Err(Control::Error(e)) => e.to_string(),
+            Ok(v) => panic!("esperaba error, got {}", v),
+            Err(_) => panic!("control"),
+        }
+    }
+
+    /// Un CapabilitySet con `time` (el caso "reloj del host", como `run` sin `--deterministic`).
+    fn caps_with_time() -> Rc<RefCell<CapabilitySet>> {
+        let mut cs = CapabilitySet::new("test");
+        cs.grant(synsema_capabilities::model::Capability::new(
+            synsema_capabilities::model::CapabilityType::Time,
+            None,
+        ));
+        Rc::new(RefCell::new(cs))
+    }
+
+    fn hsv(args: &[SynValue]) -> Result<SynValue, Control> {
+        b_http_signature_verify(args, &caps_with_time())
+    }
+
+    fn caps_no_time() -> Rc<RefCell<CapabilitySet>> {
+        Rc::new(RefCell::new(CapabilitySet::new("deterministic")))
+    }
+
+    /// M12 : la ventana anti-replay se mide contra un reloj → sin `opts.now` exige
+    /// `time`; y `created` lo elige el atacante y se chequea ANTES de verificar la firma, así que
+    /// `created = i64::MIN` paniqueaba el proceso entero (la instancia más grave de la clase M6).
+    #[test]
+    fn verify_clock_is_gated_and_created_cannot_overflow() {
+        let key = b"shared-secret";
+        let url = "https://api.example.com/orders";
+        let created = 1_750_000_000;
+        let h = sign_hmac("POST", url, b"", key, created, None);
+        let opts = || map(vec![("alg", text("hmac-sha256"))]);
+        const MSG: &str = "http_signature_verify: this needs the clock. Add `require time` to the program, or pass opts.now explicitly (a unix timestamp in seconds) to verify against a clock you choose.";
+        assert_eq!(
+            err_of(b_http_signature_verify(&[request_with(h.clone(), ""), text("shared-secret"), opts()], &caps_no_time())),
+            MSG
+        );
+        // Con `now` explícito: veredicto reproducible sin `time`, dentro y fuera de la ventana.
+        let with_now = |n: i64| map(vec![("alg", text("hmac-sha256")), ("now", syn_int(n))]);
+        assert!(matches!(
+            ok(b_http_signature_verify(&[request_with(h.clone(), ""), text("shared-secret"), with_now(created + 10)], &caps_no_time())),
+            SynValue::Map(_)
+        ));
+        assert!(matches!(
+            ok(b_http_signature_verify(&[request_with(h.clone(), ""), text("shared-secret"), with_now(created + 3600)], &caps_no_time())),
+            SynValue::Nothing
+        ));
+        // `created = i64::MIN` y `i64::MAX` en el mensaje: rechazo limpio, sin overflow.
+        for extreme in [i64::MIN, i64::MAX] {
+            let h = sign_hmac("POST", url, b"", key, extreme, None);
+            assert!(matches!(
+                ok(b_http_signature_verify(&[request_with(h.clone(), ""), text("shared-secret"), with_now(created)], &caps_no_time())),
+                SynValue::Nothing
+            ));
+            // También con `time` concedida (el camino del reloj del host).
+            assert!(matches!(
+                ok(hsv(&[request_with(h, ""), text("shared-secret"), opts()])),
+                SynValue::Nothing
+            ));
+        }
+        // Con `max_age = 0` (ventana desactivada) un `created` extremo tampoco desborda: la firma
+        // manda, y la de i64::MIN es válida.
+        let h = sign_hmac("POST", url, b"", key, i64::MIN, None);
+        let no_window = map(vec![("alg", text("hmac-sha256")), ("max_age", syn_int(0)), ("now", syn_int(created))]);
+        assert!(matches!(
+            ok(b_http_signature_verify(&[request_with(h, ""), text("shared-secret"), no_window], &caps_no_time())),
+            SynValue::Map(_)
+        ));
+        // `now` mal tipado es error del caller.
+        let bad = map(vec![("alg", text("hmac-sha256")), ("now", text("x"))]);
+        assert!(err_of(b_http_signature_verify(&[request_with(sign_hmac("POST", url, b"", key, created, None), ""), text("shared-secret"), bad], &caps_no_time()))
+            .contains("now must be a unix timestamp"));
     }
 
     /// Firma HMAC directa (sin pasar por el builtin, que exige un secret sellado y
@@ -651,7 +768,7 @@ mod tests {
         let h = sign_hmac("POST", "https://api.example.com/orders", b"{\"n\":1}", key, now, None);
         let req = request_with(h, "{\"n\":1}");
         let opts = map(vec![("alg", text("hmac-sha256"))]);
-        let out = ok(b_http_signature_verify(&[req, text("shared-secret"), opts]));
+        let out = ok(hsv(&[req, text("shared-secret"), opts]));
         match out {
             SynValue::Map(m) => {
                 let m = m.borrow();
@@ -673,7 +790,7 @@ mod tests {
         // (1) Body cambiado (misma firma) → el Content-Digest ya no cierra.
         let req = request_with(good.clone(), "{\"n\":999}");
         assert!(matches!(
-            ok(b_http_signature_verify(&[req, text("shared-secret"), alg()])),
+            ok(hsv(&[req, text("shared-secret"), alg()])),
             SynValue::Nothing
         ));
 
@@ -686,7 +803,7 @@ mod tests {
         ]);
         let req = SynValue::Map(Rc::new(RefCell::new(std::mem::take(&mut m))));
         assert!(matches!(
-            ok(b_http_signature_verify(&[req, text("shared-secret"), alg()])),
+            ok(hsv(&[req, text("shared-secret"), alg()])),
             SynValue::Nothing
         ));
 
@@ -699,14 +816,14 @@ mod tests {
         ]);
         let req = SynValue::Map(Rc::new(RefCell::new(std::mem::take(&mut m))));
         assert!(matches!(
-            ok(b_http_signature_verify(&[req, text("shared-secret"), alg()])),
+            ok(hsv(&[req, text("shared-secret"), alg()])),
             SynValue::Nothing
         ));
 
         // (4) Clave equivocada.
         let req = request_with(good.clone(), "{\"n\":1}");
         assert!(matches!(
-            ok(b_http_signature_verify(&[req, text("otra-clave"), alg()])),
+            ok(hsv(&[req, text("otra-clave"), alg()])),
             SynValue::Nothing
         ));
 
@@ -715,14 +832,14 @@ mod tests {
         bad.insert("Signature".to_string(), text("sig1=:AAAA:"));
         let req = request_with(bad, "{\"n\":1}");
         assert!(matches!(
-            ok(b_http_signature_verify(&[req, text("shared-secret"), alg()])),
+            ok(hsv(&[req, text("shared-secret"), alg()])),
             SynValue::Nothing
         ));
 
         // (6) Sin headers de firma.
         let req = request_with(imap(vec![]), "{\"n\":1}");
         assert!(matches!(
-            ok(b_http_signature_verify(&[req, text("shared-secret"), alg()])),
+            ok(hsv(&[req, text("shared-secret"), alg()])),
             SynValue::Nothing
         ));
     }
@@ -736,7 +853,7 @@ mod tests {
         // Fuera de la ventana por defecto (300 s) → rechazo.
         let opts = map(vec![("alg", text("hmac-sha256"))]);
         assert!(matches!(
-            ok(b_http_signature_verify(&[req, text("shared-secret"), opts])),
+            ok(hsv(&[req, text("shared-secret"), opts])),
             SynValue::Nothing
         ));
         // Con una ventana amplia, la MISMA firma vale (prueba que lo que rechazó
@@ -744,7 +861,7 @@ mod tests {
         let req = request_with(h.clone(), "");
         let opts = map(vec![("alg", text("hmac-sha256")), ("max_age", syn_int(7200))]);
         assert!(matches!(
-            ok(b_http_signature_verify(&[req, text("shared-secret"), opts])),
+            ok(hsv(&[req, text("shared-secret"), opts])),
             SynValue::Map(_)
         ));
         // Un `created` en el FUTURO también se rechaza (replay diferido).
@@ -753,7 +870,7 @@ mod tests {
         let req = request_with(h, "");
         let opts = map(vec![("alg", text("hmac-sha256"))]);
         assert!(matches!(
-            ok(b_http_signature_verify(&[req, text("shared-secret"), opts])),
+            ok(hsv(&[req, text("shared-secret"), opts])),
             SynValue::Nothing
         ));
     }
@@ -769,13 +886,13 @@ mod tests {
         // El verificador pinea ed25519 → el mensaje hmac-sha256 se rechaza.
         let opts = map(vec![("alg", text("ed25519"))]);
         assert!(matches!(
-            ok(b_http_signature_verify(&[req, syn_bytes(pubkey.to_vec()), opts])),
+            ok(hsv(&[req, syn_bytes(pubkey.to_vec()), opts])),
             SynValue::Nothing
         ));
         // Y omitir `alg` es ERROR del programador, no un default permisivo.
         let h = sign_hmac("POST", "https://api.example.com/orders", b"", &pubkey, now, None);
         let req = request_with(h, "");
-        let e = b_http_signature_verify(&[req, syn_bytes(pubkey.to_vec())]);
+        let e = hsv(&[req, syn_bytes(pubkey.to_vec())]);
         assert!(e.is_err(), "sin opts.alg debe ser error");
     }
 
@@ -786,7 +903,7 @@ mod tests {
         let h = sign_hmac("POST", "https://api.example.com/orders", b"", key, now, Some("n-42"));
         let req = request_with(h, "");
         let opts = map(vec![("alg", text("hmac-sha256"))]);
-        match ok(b_http_signature_verify(&[req, text("shared-secret"), opts])) {
+        match ok(hsv(&[req, text("shared-secret"), opts])) {
             SynValue::Map(m) => {
                 assert_eq!(m.borrow().get("nonce").unwrap().to_string(), "n-42");
             }

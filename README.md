@@ -4,7 +4,7 @@ A programming language designed for AI agents.
 
 Synsema is not a framework or a library — it's a language where observability, security, multi-agent coordination, human interaction, and LLM integration are built-in primitives, not afterthoughts. It compiles to a single native binary: no runtime, no GIL, true multi-core.
 
-Docs: [synsema.dev](https://synsema.dev) · Community: [Discord](https://discord.gg/qCJuwsF5bT) · The platform: [synsema.com](https://synsema.com)
+Docs: [synsema.dev](https://synsema.dev) · Changelog: [CHANGELOG.md](CHANGELOG.md) · Community: [Discord](https://discord.gg/qCJuwsF5bT) · The platform: [synsema.com](https://synsema.com)
 
 ## Fast *and* secure
 
@@ -256,6 +256,10 @@ No external proxy, no extra processes — it's all in the one binary.
 
 ## Security
 
+Two walls, and they answer different questions. **Capabilities** answer *may this program touch the
+network at all?* **Information-flow labels** answer *may **this value** leave?* You can use the
+first without the second; the second is opt-in (`--labels`) and always on under `serve --attested`.
+
 ### Capabilities
 
 Zero access by default. Declare what you need:
@@ -267,6 +271,39 @@ require file("/data/*")
 let data be fetch("https://api.example.com/data")
 let content be read_file("/data/report.csv")
 ```
+
+### Information-flow labels (`--labels`, v0.6.24+)
+
+Capabilities say what the program may *reach*. Labels say what a **value** may *become*. Mark it,
+and the engine follows it through every operation and every branch taken because of it:
+
+```
+let balance be private(1200, "app")      -- belongs to the principal "app"
+let doubled be balance * 2               -- still private: every operation propagates
+give doubled                             -- label_violation: the response is a public sink
+give declassify(doubled, "the total is shown to the account holder")
+```
+
+Every public sink — the HTTP response, files, the network, databases, processes, stdout — refuses a
+labelled value *and* refuses the call itself when it sits under a branch that depended on private
+data. The only way out is `declassify(value, "reason")`, which is recorded and listed by
+`synsema code check --json` **before the program runs**: that listing is the review.
+
+Off by default, so `synsema run` is unchanged. Turn it on with `--labels`, and it is always on
+under `serve --attested` and inside a guest adapter. The full model, including the limits it does
+*not* cover, is in the skill's `labels.md`.
+
+### Attestation (`require attest`, `serve --attested`, v0.6.24+)
+
+For a confidential deployment: ask the platform for a document that binds what is running to the
+code that is running (AWS Nitro, TDX/SEV-SNP via configfs-tsm, dstack; plus a `mock` driver for CI
+that is never auto-detected). `serve --attested` generates a P-256 identity before the program's
+first statement, binds it and a hash of the program and its configuration into the document, serves
+TLS with that key, and publishes `GET /.well-known/attestation`. The client side is
+`attestation_verify(document, opts)`.
+
+Deny-by-default like every other capability, and absent from every packaged ceiling, so
+`--deterministic` denies it on its own.
 
 ### Intent
 

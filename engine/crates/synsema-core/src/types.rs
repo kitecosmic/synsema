@@ -22,6 +22,7 @@ use num_complex::Complex64;
 
 use crate::ast::{Node, Param};
 use crate::interpreter::{BuiltinTask, Environment};
+use crate::labels::Labelled;
 use crate::number::{py_float_str, Number};
 use crate::secret::{constant_time_eq, SecretInner};
 use crate::tokens::SourceLocation;
@@ -64,6 +65,13 @@ pub enum SynValue {
     /// resuelve en `exec_binary`; el álgebra lineal (faer) opera sobre el caso 2D.
     /// `*` es ELEMENTWISE (Hadamard); el producto matricial es `matmul`/`dot`.
     Array(Rc<ArrayD<f64>>),
+    /// Valor etiquetado con un conjunto de principales (`private`/`declassify`).
+    /// Variante **aislada** (como `secret`): se computa normalmente (el intérprete
+    /// desenvuelve, opera y re-envuelve con la unión de etiquetas) pero se redacta en
+    /// toda salida (`private(A,B)`) y sólo fluye a un sumidero que acepte a todos sus
+    /// principales. Sólo existe en runtime con `Interpreter::set_labels(true)`; nunca
+    /// envuelve a otro `Private` ni a un `Secret`, ni lleva etiqueta vacía. Ver `labels.rs`.
+    Private(Rc<Labelled>),
 }
 
 /// Closure de paginación lazy de `paged()`: `fetch(limit, offset) → (filas, total)`.
@@ -152,7 +160,7 @@ impl SynValue {
     pub fn type_name(&self) -> &'static str {
         match self {
             // `decimal` es un tipo de primera clase (vive dentro de Number, junto a
-            // Int/Float/Big). Abrir el sub-enum para que reporte su propio nombre, como
+            // int/Float/Big). Abrir el sub-enum para que reporte su propio nombre, como
             // complex/bytes/array (DE-021).
             SynValue::Number(n) => if n.is_decimal() { "decimal" } else { "number" },
             SynValue::Text(_) => "text",
@@ -167,6 +175,9 @@ impl SynValue {
             SynValue::Bytes(_) => "bytes",
             SynValue::Complex(_) => "complex",
             SynValue::Array(_) => "array",
+            // Sólo se ve en mensajes de error de caminos que no desenvuelven; `type_of`
+            // Pasa por el despacho de builtins y reporta el tipo del valor interno.
+            SynValue::Private(_) => "private",
         }
     }
 
@@ -174,6 +185,12 @@ impl SynValue {
     #[inline]
     pub fn is_secret(&self) -> bool {
         matches!(self, SynValue::Secret(_))
+    }
+
+    /// ¿Es un valor `private` (etiquetado, T5)? Comprobación de discriminante O(1).
+    #[inline]
+    pub fn is_private(&self) -> bool {
+        matches!(self, SynValue::Private(_))
     }
 
     /// Veracidad: nothing/false/0/""/[]/{} → false; el resto → true.
@@ -196,12 +213,19 @@ impl SynValue {
             SynValue::Complex(z) => z.re != 0.0 || z.im != 0.0,
             // Array no-vacío = true (espeja list).
             SynValue::Array(a) => !a.is_empty(),
+            // La veracidad del valor interno (el intérprete etiqueta el flujo de control
+            // que dependa de ella vía PC).
+            SynValue::Private(p) => p.value.is_truthy(),
         }
     }
 
     /// Igualdad por valor (operador `==`/`!=`, `match`, `contains`).
     pub fn syn_equals(&self, other: &SynValue) -> bool {
         match (self, other) {
+            // Private: compara los valores internos (el operador `==` ya sale privado por
+            // `exec_binary`; acá sólo importa que match/contains/unique vean el valor).
+            (SynValue::Private(a), b) => a.value.syn_equals(b),
+            (a, SynValue::Private(b)) => a.syn_equals(&b.value),
             // Secret: igualdad en **tiempo constante** (no filtra por timing, §5).
             // Comparar dos plaintexts internamente no los expone a user-space.
             (SynValue::Secret(a), SynValue::Secret(b)) => {
@@ -332,7 +356,7 @@ impl fmt::Display for SynValue {
             },
             // Redacción de fondo: `secret(NAME)`, nunca el plaintext. Esto sella por
             // sí solo print/log/error/coerción-a-texto/contexto-LLM (todo pasa por
-            // Display) — el plaintext no puede filtrarse por un `format!` accidental.
+            // display) — el plaintext no puede filtrarse por un `format!` accidental.
             SynValue::Secret(s) => write!(f, "{}", s),
             // Repr seguro y NO-lossy: `bytes(<hexlower>)`. Nunca decodifica a texto
             // (eso reintroduciría el lossy: G4). Sella print/text()/concat-con-texto.
@@ -342,6 +366,12 @@ impl fmt::Display for SynValue {
             SynValue::Complex(z) => write!(f, "{}", complex_display(z.re, z.im)),
             // Repr anidado estilo NumPy; ACOTADO a un resumen si size > 100.
             SynValue::Array(a) => write!(f, "{}", array_display(a)),
+            // Redacción: nunca el valor (como `secret(NAME)`). Sella print/show/log/coerción-a-
+            // texto fuera del despacho etiquetado. T5 (ronda 7): el texto NO lleva la etiqueta de
+            // ESTE valor —variaba con cuál se había seleccionado y publicaba el dato— sino el
+            // conjunto de principales que el programa declara, que es constante. Ver
+            // `labels::redacted_display`.
+            SynValue::Private(_) => write!(f, "{}", crate::labels::redacted_display()),
         }
     }
 }
@@ -444,7 +474,7 @@ pub fn syn_array(a: ArrayD<f64>) -> SynValue {
 }
 
 // =========================================================
-// SendValue — representación owned, `Send`+`Sync`, para cruzar hilos
+// sendValue — representación owned, `Send`+`Sync`, para cruzar hilos
 // =========================================================
 //
 // `SynValue` usa `Rc`/`RefCell` (no es `Send`), así que NO puede compartirse entre
@@ -469,6 +499,14 @@ pub enum SendValue {
     Complex(f64, f64),
     /// Snapshot de un array (shape, datos row-major): cruza el blackboard como copia (G7).
     Array(Vec<usize>, Vec<f64>),
+    /// T5 (auditoría ronda 3, bloqueante 3) — valor con ETIQUETA de flujo: los principales como
+    /// texto owned (el `Label` del intérprete es `Rc<[Rc<str>]>` y no es `Send`) más el valor
+    /// envuelto. Es la ÚNICA forma en que un privado cruza un snapshot —globales de `serve`,
+    /// `cron`, agentes del swarm, items de `parallel_map`— sin perder la etiqueta: hasta la ronda
+    /// 3 se degradaba al TEXTO `private(app)`, que era fail-open (la etiqueta desaparecía sin
+    /// aviso) y corrupción a la vez (el programa calculaba sobre el placeholder). `from_send` la
+    /// restaura con `labels::mark`, que normaliza y respeta los invariantes de la variante.
+    Private(Vec<String>, Box<SendValue>),
 }
 
 /// Snapshot de un `SynValue` a `SendValue` (deep copy). Task/Builtin no cruzan: se
@@ -524,6 +562,15 @@ pub fn to_send(v: &SynValue) -> SendValue {
         SynValue::Complex(z) => SendValue::Complex(z.re, z.im),
         // Snapshot del array (shape + datos row-major): copia owned (G7).
         SynValue::Array(a) => SendValue::Array(a.shape().to_vec(), a.iter().copied().collect()),
+        // T5: la etiqueta VIAJA con el valor (ronda 3, bloqueante 3). Los sumideros del host
+        // (`share`/`signal`/`bus_publish`/`parallel_map`…) siguen rechazando un privado ANTES de
+        // llegar acá; lo que este camino cubre es el snapshot interno del motor —globales de
+        // `serve`, `cron`, agentes—, donde antes la etiqueta se perdía en silencio y el valor se
+        // reemplazaba por el texto `private(app)`.
+        SynValue::Private(p) => SendValue::Private(
+            p.label.iter().map(|s| s.to_string()).collect(),
+            Box::new(to_send(&p.value)),
+        ),
     }
 }
 
@@ -552,6 +599,12 @@ pub fn from_send(v: &SendValue) -> SynValue {
                 Err(_) => syn_array(ArrayD::from_shape_vec(ndarray::IxDyn(&[data.len()]), data.clone()).unwrap()),
             }
         }
+        // T5 — restaura la etiqueta al otro lado del snapshot. `label_from` normaliza (ordena,
+        // dedupea, descarta vacíos) y `mark` respeta los invariantes de la variante (nunca
+        // privado de privado, nunca etiqueta vacía, nunca privado de secret).
+        SendValue::Private(principals, inner) => {
+            crate::labels::mark(from_send(inner), crate::labels::label_from(principals))
+        }
     }
 }
 
@@ -559,6 +612,8 @@ impl fmt::Display for SendValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SendValue::Nothing => write!(f, "nothing"),
+            // T5: se REDACTA, igual que `SynValue::Private` (un Display accidental no filtra).
+            SendValue::Private(l, _) => write!(f, "private({})", l.join(",")),
             SendValue::Bool(b) => write!(f, "{}", if *b { "true" } else { "false" }),
             SendValue::Number(n) => write!(f, "{}", n),
             SendValue::Text(s) => write!(f, "{}", s),

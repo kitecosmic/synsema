@@ -1,7 +1,7 @@
 //! Expresiones cron de pared (5 campos POSIX + alias `@daily`…). Puro: parsea y
 //! calcula "el próximo instante que matchea a partir de `t`" — nada de hilos ni I/O.
 //!
-//! Semántica (documentada en `specs/cron-wall-clock.md`):
+//! Semántica:
 //! - `minute hour day-of-month month day-of-week`; `*`, `a`, `a-b`, `*/n`, `a-b/n`,
 //!   listas; nombres `jan..dec`/`sun..sat`; `0` y `7` = domingo.
 //! - dom/dow con ambos restringidos → OR (regla de Vixie cron).

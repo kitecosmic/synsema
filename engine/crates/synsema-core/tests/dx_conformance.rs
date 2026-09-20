@@ -1,7 +1,7 @@
 //! Batch DX (db-nativa-ai): dual-order de la familia intencional + `unique`/`index_of`
 //! + mensajes con hint (`request` fuera de handler, precedencia de `of`).
 //!
-//! Plan §4 del spec `specs/db-nativa-ai-dx.md`. Programas `.syn` reales por el
+//! Programas `.syn` reales por el
 //! intérprete — el REPL y `run --explain` ven exactamente estos builtins (G-4: un solo
 //! punto de registro, `Interpreter::register`).
 

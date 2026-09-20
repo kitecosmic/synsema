@@ -43,3 +43,10 @@ sha2 = { workspace = true }
 # E2E de T5 (mTLS): par cert/clave de prueba para `mtls_identity`. Mismo crate y
 # features que ya usa synsema-stdlib en sus tests de TLS (backend ring, sin C).
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# E2E de T4 (serve --attested): cliente TLS que PINEA el SPKI anunciado en
+# /.well-known/attestation (un verificador custom, exactamente lo que hará un cliente). El
+# mismo rustls/ring que ya compila synsema-stdlib; cero crates nuevos.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Ídem: comprobar que el escalar de `attestation_key()` es la clave P-256 anunciada (ECDH
+# desde ambos lados). El mismo p256 que compila synsema-stdlib.
+p256 = { workspace = true }

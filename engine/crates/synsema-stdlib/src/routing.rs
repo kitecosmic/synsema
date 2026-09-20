@@ -284,6 +284,14 @@ pub fn build_response(
     give: Option<&SynValue>,
     query: &IndexMap<String, String>,
 ) -> Result<(u16, ResponseBody), String> {
+    // El cable es un sumidero PÚBLICO. Un valor `private` (o un contenedor con
+    // uno adentro) no sale por HTTP sin `declassify`; el error nombra el camino y la etiqueta,
+    // Nunca el valor. Sin etiquetas encendidas no hay `Private` y el recorrido es un no-op.
+    if let Some(v) = give {
+        if let Err(e) = synsema_core::labels::check_flow(v, &[], "response") {
+            return Err(e.to_string());
+        }
+    }
     if let Some(SynValue::Server(s)) = give {
         match &**s {
             ServerValue::Raw { body, content_type, status } => {
@@ -335,7 +343,7 @@ pub fn build_response(
 }
 
 // =========================================================
-// Tipos del dispatch (handlers inyectados por el motor)
+// tipos del dispatch (handlers inyectados por el motor)
 // =========================================================
 
 /// Contexto de una request (lo arma `dispatch`, lo consume el handler del motor).
@@ -389,7 +397,7 @@ pub fn min_ctx(
 }
 
 // =========================================================
-// Form bodies (application/x-www-form-urlencoded + multipart/form-data)
+// form bodies (application/x-www-form-urlencoded + multipart/form-data)
 // =========================================================
 
 /// Parsea un body `application/x-www-form-urlencoded` → map (último valor gana,
@@ -651,7 +659,7 @@ pub fn bearer_token(headers: &[(String, String)]) -> String {
 }
 
 // =========================================================
-// Árbol de contenido semántico (vocabulario content()) + renderers
+// árbol de contenido semántico (vocabulario content()) + renderers
 // =========================================================
 
 // -- HTML (semántico + <head> desde la metadata) --
@@ -716,7 +724,7 @@ pub fn render_html(tree: &SynValue) -> String {
     let title = meta.as_ref().and_then(|m| meta_get(m, "title"));
     let description = meta.as_ref().and_then(|m| meta_get(m, "description"));
     // Optional stylesheet for the HTML representation only (head-only; the
-    // Markdown/JSON representations of the same content() are unaffected).
+    // markdown/JSON representations of the same content() are unaffected).
     let stylesheet = meta.as_ref().and_then(|m| meta_get(m, "stylesheet"));
     let mut head = vec![
         "<meta charset=\"utf-8\">".to_string(),
@@ -855,7 +863,7 @@ pub fn render_content(content_value: &SynValue, fmt: &str) -> RawResponse {
 
 
 // ---- parse_cookies (movido verbatim desde server.rs) ----
-/// Parsea el header `Cookie` entrante (RFC 6265 §5.4) → pares (nombre, valor) SIN
+/// parsea el header `Cookie` entrante (RFC 6265 §5.4) → pares (nombre, valor) SIN
 /// decodificar nada: split por `;`, trim, el primer `=` separa nombre/valor.
 /// Nombre duplicado: gana la PRIMERA aparición (orden RFC). Sin header → vacío.
 /// Segmentos malformados (sin `=` o sin nombre) se saltean — el lado de lectura
@@ -930,7 +938,7 @@ pub fn build_request_syn(ctx: &Ctx) -> SynValue {
     //   application/x-www-form-urlencoded → {campo: texto}
     //   multipart/form-data → campo de texto → texto; archivo → {filename,
     //     content_type, data (bytes exactos)}
-    // Sin form body → map VACÍO (como cookies: siempre navegable, nunca nothing).
+    // sin form body → map VACÍO (como cookies: siempre navegable, nunca nothing).
     m.insert("form".to_string(), build_form_syn(ctx));
     m.insert("ip".to_string(), syn_text(ctx.client_ip.as_str()));
     m.insert("user".to_string(), ctx.user.clone().unwrap_or_else(syn_nothing));

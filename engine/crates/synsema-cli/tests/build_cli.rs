@@ -1,4 +1,4 @@
-//! E2E de `synsema build` sobre el binario real (spec `specs/tanda-motor-lamps.md`): el
+//! E2E de `synsema build` sobre el binario real: el
 //! binario único corre el programa con `args()`, `--engine` devuelve el CLI, el sha del
 //! bundle se verifica, los `use`/templates/assets viven dentro (sin disco), el techo y el
 //! perfil horneados mandan, y `update` se niega a pisar un programa construido.

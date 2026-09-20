@@ -20,7 +20,19 @@ pub mod blockchain_hd;
 pub mod blockchain_rpc;
 pub mod blockchain_solana;
 pub mod captoken;
-// v0.6.20 — archivos comprimidos: SÓLO native (extraer toca disco; en puro son stubs).
+// CBOR + COSE_Sign1 mínimos, compartidos por `attest` (producir) y
+// `attestation_verify` (consumir). Puro, sin deps.
+pub mod cbor;
+// `attest` — drivers de plataforma (nitro/tsm/dstack detrás de `cfg`, mock
+// En todo SO) + la identidad de `serve --attested`. Compila al perfil puro.
+pub mod attest;
+// `groth16_verify` sobre BN254 (JSON de snarkjs tal cual). Puro, sin deps del SO.
+pub mod zk;
+// `attestation_verify` (nitro/mock con raíz pineada) y ruido determinista
+// (laplace_noise/gaussian_noise). Puros, compilan al perfil wasm.
+pub mod attestation;
+pub mod privacy;
+// V0.6.20 — archivos comprimidos: SÓLO native (extraer toca disco; en puro son stubs).
 #[cfg(feature = "native")]
 pub mod archive;
 // v0.6.20 — criptografía genérica (ECDH/HKDF/AES-GCM, nombres WebCrypto). Pura.

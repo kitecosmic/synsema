@@ -1,4 +1,4 @@
-//! Goldens byte a byte de discovery (spec `specs/discovery-openapi.md` §3): el
+//! Goldens byte a byte de discovery: el
 //! `/openapi.json`, el `/sitemap.xml` y el `/docs` en Markdown que salen del fixture
 //! `tests/fixtures/discovery_api.syn` (con `mount` de `discovery_mod.syn`), por el
 //! MISMO camino estático que `synsema openapi` (sin ejecutar nada).

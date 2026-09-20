@@ -68,7 +68,7 @@ pub fn version() -> String {
 }
 
 // =========================================================
-// Opciones + reportes (la API embebible)
+// opciones + reportes (la API embebible)
 // =========================================================
 
 /// Cómo correr un programa. `env` reemplaza al `.env`/environ (un host sin FS ni
@@ -83,11 +83,39 @@ pub struct RunOptions {
     /// El host NO tiene filesystem (navegador, Node sin WASI…): los builtins de archivos
     /// existen y lo dicen. `false` en el bin wasip1 (FS por WASI, `--dir`).
     pub no_fs: bool,
+    /// Etiquetas de flujo de información encendidas (`private`/`declassify`).
+    /// Apagadas por defecto: la variante `Private` no existe en runtime y el coste es cero.
+    /// Un host que fija fuentes y sumideros (el adaptador de un enclave) las enciende.
+    pub labels: bool,
+    /// Nombre de una variable GLOBAL cuyo valor final se devuelve en
+    /// `Report.result` CON sus etiquetas intactas. Es el canal por el que un host aplica sus
+    /// sumideros: en vez de leer un `print(json_encode(x))` (que redactaría un privado), recibe
+    /// El valor estructurado y decide, por campo, quién puede verlo (`labels::check_flow`).
+    pub result: Option<String>,
+    /// La ENTRADA del host por API: `(variable global, valor JSON)`
+    /// Ligada ANTES de ejecutar el programa. Reemplaza al `let x be json_decode("…")` inyectado
+    /// En el fuente: sin escape de literales ni superficie de inyección, y las fuentes se
+    /// etiquetan desde Rust (`sources`), no con un `private(...)` que una `task private` del
+    /// programa pudiera sombrear.
+    pub input: Option<(String, serde_json::Value)>,
+    /// FUENTES: `(clave del mapa de entrada, principales)`. Cada clave listada
+    /// que exista y no sea `nothing` llega al programa como `private(valor, principales)`.
+    /// Exige `labels` (sin etiquetas no hay fuentes que marcar: error, no silencio).
+    pub sources: Vec<(String, Vec<String>)>,
 }
 
 impl RunOptions {
     pub fn new(filename: &str) -> Self {
-        RunOptions { filename: filename.to_string(), env: None, ceiling: None, no_fs: false }
+        RunOptions {
+            filename: filename.to_string(),
+            env: None,
+            ceiling: None,
+            no_fs: false,
+            labels: false,
+            result: None,
+            input: None,
+            sources: Vec::new(),
+        }
     }
 }
 
@@ -118,7 +146,124 @@ pub struct Report {
     pub llm_tokens: u64,
     /// v0.6.20 — pasos del intérprete (nodos ejecutados): determinista, el "fuel" de un
     /// host que lo exija y una medida de trabajo para budgets y tests.
+    ///
+    /// ⚠️ T5 (ronda 5) — **no publicarlo si `private_seen`**. Es un paso por nodo del AST, o sea
+    /// lineal en lo que el programa recorrió: después de un bucle cuya condición dependió de un
+    /// secreto, este número ES el secreto con una multiplicación y una suma encima (medido:
+    /// reconstruido exacto en una línea). El host lo recibe para medir costo, no para exponerlo;
+    /// `private_seen` viaja al lado justamente para decidirlo. El adaptador de Vela no lo loguea
+    /// ni lo manda a la cadena, y `synsema run --format json` lo reporta `null` en ese caso.
     pub steps: u64,
+    /// El valor final de `RunOptions.result` (si se pidió, la variable quedó
+    /// ligada y la corrida terminó bien) como JSON que CONSERVA las etiquetas (ver
+    /// [`labelled_json`]): el host aplica sus sumideros campo a campo. `Send` a propósito (el
+    /// bin nativo corre el programa en un hilo con stack grande).
+    pub result: Option<serde_json::Value>,
+    /// Cada `declassify` ejecutado (motivo, de qué etiqueta a cuál, dónde):
+    /// El host lo registra en su log; es la revisión que un auditor hace.
+    pub declassify: Vec<DeclassifyRecord>,
+    /// La corrida desenvolvió algún valor privado: el host debe
+    /// tratar los mensajes de error como sensibles (redactarlos fuera del enclave).
+    pub private_seen: bool,
+}
+
+/// Un `declassify` ejecutado, en forma plana (`Send`, serializable).
+#[derive(Clone, Debug)]
+pub struct DeclassifyRecord {
+    pub reason: String,
+    pub from: Vec<String>,
+    pub to: Vec<String>,
+    pub line: usize,
+    pub column: usize,
+}
+
+impl DeclassifyRecord {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({"reason": self.reason, "from": self.from, "to": self.to, "line": self.line, "column": self.column})
+    }
+}
+
+/// Un valor Synsema como JSON que CONSERVA las etiquetas: un `Private` sale
+/// como `{"$private": ["a", "b"], "value": …}` (y su interior sin repetir la etiqueta), los
+/// bytes como `{"$bytes": "<base64>"}`, un `secret` redactado (`"secret(NAME)"`), y lo demás
+/// con la MISMA forma que `json_encode` (enteros como número, big/decimal como número crudo:
+/// `syn_to_json` de la stdlib, para que un host que antes leía `print(json_encode(x))` vea lo
+/// mismo). toda clave de programa que empiece con `$` se ESCAPA anteponiendo otro
+/// `$` (`"$bytes"` del usuario → `"$$bytes"`), así los marcadores nunca colisionan con datos que
+/// controle un tercero; el host revierte el escape al quitar los marcadores.
+pub fn labelled_json(v: &SynValue) -> serde_json::Value {
+    use serde_json::{json, Value};
+    match v {
+        SynValue::Private(p) => json!({
+            "$private": p.label.iter().map(|s| Value::String(s.to_string())).collect::<Vec<_>>(),
+            "value": labelled_json(&p.value),
+        }),
+        SynValue::Nothing => Value::Null,
+        SynValue::Bool(b) => Value::Bool(*b),
+        SynValue::Text(t) => Value::String(t.to_string()),
+        SynValue::Bytes(b) => json!({"$bytes": base64_std(b)}),
+        SynValue::List(l) => Value::Array(l.borrow().iter().map(labelled_json).collect()),
+        SynValue::Map(m) => Value::Object(m.borrow().iter().map(|(k, v)| (escape_marker_key(k), labelled_json(v))).collect()),
+        // Redactado por `Display`: un secret jamás cruza esta frontera en claro.
+        SynValue::Secret(_) => Value::String(v.to_string()),
+        // Números (int/float/big/decimal), complejos, arrays y los valores del servidor
+        // (`ok(...)`, `html(...)`, nodos de contenido): exactamente como `json_encode`. Esa ruta
+        // No pasa por el brazo `Map` de arriba, así que el escape de claves `$` se aplica sobre
+        // El JSON ya producido — si no, un `ok({"$private": ["x"], "value": …})` armado por el
+        // sender vuelve a ser un marcador falso del lado del host.
+        other => {
+            let text = synsema_stdlib::json::dumps(&synsema_stdlib::json::syn_to_json(other));
+            let parsed = serde_json::from_str(&text).unwrap_or_else(|_| Value::String(other.to_string()));
+            escape_marker_keys_deep(parsed)
+        }
+    }
+}
+
+/// Aplica [`escape_marker_key`] a TODAS las claves de un JSON ya construido (la ruta que no pasa
+/// por el brazo `Map` de [`labelled_json`]).
+fn escape_marker_keys_deep(v: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match v {
+        Value::Object(m) => {
+            Value::Object(m.into_iter().map(|(k, val)| (escape_marker_key(&k), escape_marker_keys_deep(val))).collect())
+        }
+        Value::Array(a) => Value::Array(a.into_iter().map(escape_marker_keys_deep).collect()),
+        other => other,
+    }
+}
+
+/// `$x` → `$$x` (los marcadores `$private`/`$bytes` son sólo nuestros). Idempotente al revés
+/// con [`unescape_marker_key`].
+pub fn escape_marker_key(k: &str) -> String {
+    if k.starts_with('$') {
+        format!("${}", k)
+    } else {
+        k.to_string()
+    }
+}
+
+/// Revierte [`escape_marker_key`]: `$$x` → `$x`. Una clave `$private`/`$bytes` sin escapar es
+/// Un marcador y no pasa por acá.
+pub fn unescape_marker_key(k: &str) -> String {
+    match k.strip_prefix("$$") {
+        Some(rest) => format!("${}", rest),
+        None => k.to_string(),
+    }
+}
+
+/// Base64 estándar con padding (para `{"$bytes": …}`); sin dependencia nueva.
+fn base64_std(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
 }
 
 pub struct TestReport {
@@ -134,7 +279,7 @@ pub struct CheckReport {
 }
 
 // =========================================================
-// Estado compartido del wiring (memoria declarada, tokens LLM)
+// estado compartido del wiring (memoria declarada, tokens LLM)
 // =========================================================
 
 thread_local! {
@@ -242,7 +387,7 @@ fn kv_write(ns: &str, key: &str, value: &str) {
 }
 
 // =========================================================
-// Wiring puro
+// wiring puro
 // =========================================================
 
 /// Lo que `wire_pure` necesita además del intérprete y el CapabilitySet.
@@ -294,6 +439,13 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     }
     register_secret_builtins(interp, caps.clone(), ctx.env.clone());
     synsema_stdlib::hashing::register_hash_builtins(interp);
+    // Groth16_verify (puro; arkworks no_std sin parallel/asm). Medido en wasip1 --profile
+    // wasm: 7 144 498 → 7 288 665 bytes (+141 KB; el spec presupuestaba +1–1,5 MB).
+    synsema_stdlib::zk::register_zk_builtins(interp);
+    // Verificar attestation (nitro/mock; puro, `now` explícito) y ruido
+    // determinista para privacidad de salida. Ambos puros: entran al guest y al bin wasip1.
+    synsema_stdlib::attestation::register_attestation_builtins(interp);
+    synsema_stdlib::privacy::register_privacy_builtins(interp);
     synsema_stdlib::json::register_json_builtins(interp);
     // v0.6.20 — parsers y criptografía genérica, puros: el mismo camino que el nativo.
     synsema_stdlib::xml::register_xml_builtins(interp);
@@ -301,7 +453,7 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     synsema_stdlib::crypto::register_crypto_builtins(interp, caps.clone());
     synsema_stdlib::webauth::register_webauth_builtins(interp, caps.clone());
     synsema_stdlib::httpsig::register_httpsig_builtins(interp, caps.clone());
-    synsema_stdlib::captoken::register_captoken_builtins(interp);
+    synsema_stdlib::captoken::register_captoken_builtins(interp, caps.clone());
     synsema_stdlib::oidc::register_oidc_builtins(interp, caps.clone());
     // Web Push: cifrado/VAPID puros; el POST al push service necesita sockets → en wasm
     // `push_send` falla con el error claro del build sin `native` (como oidc_verify).
@@ -719,7 +871,50 @@ pub(crate) fn prepare(program: &Program, opts: &RunOptions) -> (Interpreter, Rc<
     }
     let ctx = WireCtx { env: env_store(opts), statements: &program.statements, filename: &opts.filename, no_fs: opts.no_fs };
     wire_pure(&mut interp, &caps, &ctx);
+    if opts.labels {
+        interp.set_labels(true);
+    }
     (interp, caps)
+}
+
+/// Liga la entrada del host (`RunOptions.input`) como variable global, con
+/// las FUENTES marcadas desde Rust: cada clave de `sources` presente y no-`nothing` pasa a
+/// `private(valor, principales)`. Error (no silencio) si hay fuentes sin etiquetas o si la
+/// entrada no es un mapa y se pidieron fuentes por clave.
+fn bind_input(interp: &Interpreter, opts: &RunOptions) -> Result<(), String> {
+    let Some((var, value)) = &opts.input else {
+        if !opts.sources.is_empty() {
+            return Err("sources were given without an input".to_string());
+        }
+        return Ok(());
+    };
+    if var.is_empty() {
+        return Err("input: the variable name is empty".to_string());
+    }
+    let v = synsema_stdlib::json::json_to_syn(value);
+    if !opts.sources.is_empty() {
+        if !opts.labels {
+            return Err("sources need labels: true (there is no Private variant to mark the input with)".to_string());
+        }
+        let SynValue::Map(m) = &v else {
+            return Err("sources: the input must be a map to label its keys".to_string());
+        };
+        let mut map = m.borrow_mut();
+        for (key, principals) in &opts.sources {
+            if principals.is_empty() {
+                return Err(format!("sources.{}: at least one principal is required", key));
+            }
+            if let Some(cur) = map.get(key.as_str()) {
+                if matches!(cur, SynValue::Nothing) {
+                    continue;
+                }
+                let marked = synsema_core::labels::mark(cur.clone(), synsema_core::labels::label_from(principals));
+                map.insert(key.clone(), marked);
+            }
+        }
+    }
+    interp.set_global(var, v);
+    Ok(())
 }
 
 pub(crate) fn finish(mut interp: Interpreter, result: Result<SynValue, Control>) -> RunResult {
@@ -728,12 +923,18 @@ pub(crate) fn finish(mut interp: Interpreter, result: Result<SynValue, Control>)
 
 /// Como `finish` pero sin consumir el intérprete (el handler-mode lo conserva).
 pub(crate) fn finish_keep(interp: &mut Interpreter, result: Result<SynValue, Control>) -> RunResult {
+    // T5 (ronda 6, B2): la salida de una corrida cortada por el chequeo de flujo no se entrega
+    // — la cantidad de líneas antes del corte depende del dato privado. Bajo el guest esas
+    // líneas son el log del Executor, que vive FUERA del enclave.
+    interp.redact_output_for_host(&result);
     match result {
         Ok(_) => RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() },
+        // Ronda 7: si el corte lo decidió el sistema de etiquetas, el error sale SIN ubicación —
+        // cuál de N sitios murió depende del dato, y bajo el guest este texto cruza al Executor.
         Err(Control::Error(e)) => RunResult {
             success: false,
             output: std::mem::take(&mut interp.output),
-            errors: vec![format!("Runtime error: {}", e)],
+            errors: vec![format!("Runtime error: {}", e.to_string_for_client())],
         },
         Err(Control::Give(_)) | Err(Control::Stop(_)) => RunResult {
             success: false,
@@ -749,15 +950,69 @@ pub(crate) fn finish_keep(interp: &mut Interpreter, result: Result<SynValue, Con
 pub fn run(source: &str, opts: &RunOptions) -> Report {
     let program = match parse_source(source, &opts.filename) {
         Err(e) => {
-            return Report { ok: false, output: Vec::new(), errors: vec![parse_errors(e)], audit: Vec::new(), llm_tokens: 0, steps: 0 }
+            return Report {
+                ok: false,
+                output: Vec::new(),
+                errors: vec![parse_errors(e)],
+                audit: Vec::new(),
+                llm_tokens: 0,
+                steps: 0,
+                result: None,
+                declassify: Vec::new(),
+                private_seen: false,
+            }
         }
         Ok(p) => p,
     };
     let (mut interp, caps) = prepare(&program, opts);
+    if let Err(e) = bind_input(&interp, opts) {
+        return Report {
+            ok: false,
+            output: Vec::new(),
+            errors: vec![format!("input: {}", e)],
+            audit: Vec::new(),
+            llm_tokens: 0,
+            steps: 0,
+            result: None,
+            declassify: Vec::new(),
+            private_seen: false,
+        };
+    }
     let result = interp.execute(&program);
     let steps = interp.steps();
+    let private_seen = interp.private_seen();
+    // El valor pedido se lee del entorno GLOBAL tal cual quedó (etiquetas incluidas) y sólo
+    // Si la corrida terminó bien: un programa que falló no tiene un resultado que entregar.
+    let value = match (&opts.result, &result) {
+        (Some(name), Ok(_)) => interp.global_env.borrow().bindings.get(name).map(labelled_json),
+        _ => None,
+    };
+    let declared = interp.declared_principals_list();
+    let declassify = interp
+        .take_declassify_log()
+        .into_iter()
+        .map(|e| DeclassifyRecord {
+            reason: e.reason,
+            // T5 (ronda 7): el `from` que sale al host es el conjunto DECLARADO por el programa,
+            // no la etiqueta de ese valor — ésa varía con cuál se seleccionó y publica el dato.
+            from: declared.clone(),
+            to: e.to.iter().map(|s| s.to_string()).collect(),
+            line: e.loc.line,
+            column: e.loc.column,
+        })
+        .collect();
     let r = finish(interp, result);
-    Report { ok: r.success, output: r.output, errors: r.errors, audit: export_audit(&caps), llm_tokens: llm_tokens_total(), steps }
+    Report {
+        ok: r.success,
+        output: r.output,
+        errors: r.errors,
+        audit: export_audit(&caps),
+        llm_tokens: llm_tokens_total(),
+        steps,
+        result: value,
+        declassify,
+        private_seen,
+    }
 }
 
 /// Corre los bloques `test` del archivo con el mismo wiring puro.

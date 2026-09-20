@@ -41,7 +41,7 @@
 - `run_program(source, opts)` → map (v0.6.14+) — **requires `sandbox_run`**. Runs another Synsema program in a **child process of the same binary** under a ceiling = `opts.ceiling ∩` the parent's — the child can never exceed the parent. `opts` (all optional): `ceiling` (`--cap-set` syntax, or `"sandbox"`/`"none"`; default `"sandbox"`), `profile` (`"native"`/`"pure"`, default `"pure"`, never above the parent), `env` (map — **replaces** the child's environment; a `secret` value is an error), `timeout` (seconds, default 30; on expiry kills the child tree), `cwd`, `filename`. Returns `{ok, output:[lines], errors:[text], audit:[entries], exit:n|nothing, timed_out:bool, llm_tokens:n}` — the audit is a **value**, not a log to parse. Asking for more than the parent lends is trimmed (parent audit: `above parent ceiling`), not fatal. Recursion allowed if the child holds `sandbox_run` (depth `SYNSEMA_RUN_PROGRAM_MAX_DEPTH`, default 4). See [processes.md](processes.md).
 
 ## Error handling — `try` / `recover` / `raise`
-```
+```synsema
 try
     risky()
 recover err
@@ -126,12 +126,38 @@ WebCrypto names and shapes. Secrets stay `secret` (a derived key is USED — as 
 - `ecdh_keypair(curve)` → `{private: secret, public: bytes}` — `curve` = `"P-256"` | `"P-521"` (anything else: clear error); public = SEC1 uncompressed point (65 / 133 bytes). **Requires `random`** (it creates a key — the gate of `random_bytes`).
 - `ecdh_shared_secret(private, peer_public, curve)` → secret (the raw X coordinate, like WebCrypto `deriveBits`). Pure.
 - `hkdf_sha256(ikm, salt, info, length)` → bytes (RFC 5869; a `secret` when `ikm` is one). Pure.
-- `aes_gcm_encrypt(key, nonce, plaintext, aad?)` → bytes (ciphertext ‖ 16-byte tag) / `aes_gcm_decrypt(key, nonce, ciphertext, aad?)` → bytes. Key 16 bytes = AES-128-GCM, 32 = AES-256-GCM (else: `the key must be 16 bytes … or 32 bytes`); nonce 12 bytes, never reused with a key; auth failure → `authentication failed (wrong key, nonce, aad, or tampered data)`, never partial bytes. Pure.
+- `aes_gcm_encrypt(key, nonce, plaintext, aad?)` → bytes (ciphertext ‖ 16-byte tag) / `aes_gcm_decrypt(key, nonce, ciphertext, aad?)` → bytes. Key 16 bytes = AES-128-GCM, 32 = AES-256-GCM (else: `the key must be 16 bytes … or 32 bytes`); nonce 12 bytes, never reused with a key; auth failure → `authentication failed (wrong key, nonce, aad, or tampered data)`, never partial bytes — or the fallback, with the total form `aes_gcm_decrypt(key, nonce, ct, aad, default)` (below). Pure.
+
+**Total variants — validating untrusted input without an exception (v0.6.24+).** Every parser below
+takes one **extra last argument** that is returned *instead of raising*, so a malformed payload is a
+value you test, not an error you catch:
+
+```synsema
+let d be json_decode(payload, nothing)     -- no error, so nothing to catch
+when d == nothing
+    give bad_request("malformed payload")
+```
+
+| operation | total form |
+|---|---|
+| `json_decode` | `json_decode(text, default)` |
+| `number` · `decimal` · `float` | `number(value, default)` |
+| `aes_gcm_decrypt` | `aes_gcm_decrypt(key, nonce, ct, aad, default)` — `aad` goes explicit (may be `nothing`) so the fallback has a fixed slot |
+| `toml_parse` · `bech32_decode` · `rlp_decode` | `f(x, default)` |
+| `abi_decode` | `abi_decode(types, data, default)` |
+
+Why it exists, beyond convenience: **under `--labels` an error caused by private data cannot be
+caught** (see [labels.md](labels.md)), so `try`/`recover` is not an option for input an enclave
+receives from anyone. With no error there is no bit. Two details: the fallback is **evaluated
+eagerly** (an effect inside it fires on the happy path too), and it never swallows a label
+violation. Still without a total form: `parse_time`, `csv_parse`, `bytes(text, encoding)`,
+`decode`, `psbt_decode` and key/index access — their arity is already variable, so the slot has to
+be decided one by one.
 
 ## JSON (pure — no capability)
 - `json_encode(value)` → text: serialize any value to a JSON string. Maps/lists nest; **secret → `"[redacted]"`** (safe), `bytes` → base64 string, `decimal` (`1.50d`) → exact JSON number, `nothing` → `null`. ⚠️ NOT safe to embed inside a `<script>` tag — use `json_for_script` there.
 - `json_for_script(value)` → text: same JSON but with `<`, `>`, `&` escaped as `\u00XX` — **the safe way to embed data in an inline `<script>`** (`{ raw json_for_script(x) }`); a value containing `</script>` cannot break out of the tag.
-- `json_decode(text)` → value: parse a JSON string to a Synsema value (object→map, array→list, number→number, etc.). Errors clearly on invalid JSON.
+- `json_decode(text)` → value: parse a JSON string to a Synsema value (object→map, array→list, number→number, etc.). Errors clearly on invalid JSON; `json_decode(text, default)` returns `default` instead (see **Total variants** above).
 - Round-trippable: `json_decode(json_encode(x))` reconstructs `x` (the idiomatic way to store structured data in a Redis/text value: `redis_set(k, json_encode({...}))`).
 
 ## XML / TOML (pure — no capability — v0.6.20+)
@@ -186,15 +212,32 @@ Resolution for `env`/`secret`: process environ → `.env` → default → else e
 `random()`/`random_int()` (their purpose IS producing randomness; denied in `sandbox`).
 The rest are pure transforms — no capability. Every key/password argument accepts a
 sealed `secret`, text (raw UTF-8 bytes) or `bytes`; anything else is a clear error.
+
+**Anything that reads the clock needs `require time`.** Ten builtins do: the verifiers
+`jwt_verify`, `totp_verify`, `captoken_verify`, `captoken_attenuate`, `http_signature_verify` and
+`oidc_verify`, the emitters `jwt_sign` (`iat`/`exp`), `captoken_mint` (`now`) and `http_signature`
+(`created`), and `totp`. Plain `synsema run` and `--sandbox` grant `time` automatically, so you
+only notice under a ceiling that does not — `--deterministic`, an explicit `--cap-set`, the guest
+of an enclave — and there the error names both ways out:
+
+```
+jwt_verify: this needs the clock. Add `require time` to the program, or pass opts.now
+explicitly (a unix timestamp in seconds) to verify against a clock you choose.
+```
+
+Passing the time explicitly is not a workaround, it is the right answer inside an enclave: a
+machine with no trustworthy clock must take the verifier's, and a verdict computed from an
+explicit timestamp is reproducible. (`attestation_verify` always requires `opts.now`, for the
+same reason.)
 - `random_bytes(n)` → n bytes from the **OS CSPRNG** (1–65536). Never use `random()` for anything security-related.
 - `token(n?)` → unguessable base64url text of n random bytes (16–256, default 32 → 43 chars). Session ids, CSRF tokens, API keys, device codes.
 - `password_hash(pw)` → PHC text (`$argon2id$v=19$m=19456,t=2,p=1$…`, OWASP params, random salt). Store this string as-is.
 - `password_verify(pw, phc)` → bool (constant-time). Malformed/unknown PHC → **error**, not `false` ("wrong password" and "corrupt hash in DB" must never be confused).
-- `jwt_sign(claims, key, opts?)` → token. Default **HS256** with a shared key. **`opts.alg = "RS256" | "ES256"`** (v0.6.20+) signs with a **PEM private key passed as a `secret`** (PKCS#8 or PKCS#1 for RSA; PKCS#8 or SEC1 for P-256) — GitHub Apps, service accounts; `opts.kid` goes to the header. The signer picks the algorithm, never the token; an unknown `alg` is an error (`supported: HS256, RS256, ES256`). Sets `iat` (your explicit claim wins); `opts.expires_in` (seconds) sets `exp` (passing both an `exp` claim and `expires_in` is an error).
-- `jwt_verify(token, key, opts?)` → claims map or `nothing` on ANY failure (bad signature, expired `exp`, future `nbf`, malformed, `alg` ≠ HS256 — the verifier pins the algorithm; `"none"`/`RS256` tokens are rejected). `opts.leeway` seconds (default 60). Verifying a third party's RS256/ES256 token is `oidc_verify` (below).
+- `jwt_sign(claims, key, opts?)` → token. Default **HS256** with a shared key. **`opts.alg = "RS256" | "ES256"`** (v0.6.20+) signs with a **PEM private key passed as a `secret`** (PKCS#8 or PKCS#1 for RSA; PKCS#8 or SEC1 for P-256) — GitHub Apps, service accounts; `opts.kid` goes to the header. The signer picks the algorithm, never the token; an unknown `alg` is an error (`supported: HS256, RS256, ES256`). Sets `iat` (your explicit claim wins); `opts.expires_in` (seconds) sets `exp` (passing both an `exp` claim and `expires_in` is an error). **Reads the clock → `require time`** (or pass it: `opts.iat` and `opts.exp` as explicit claims).
+- `jwt_verify(token, key, opts?)` → claims map or `nothing` on ANY failure (bad signature, expired `exp`, future `nbf`, malformed, `alg` ≠ HS256 — the verifier pins the algorithm; `"none"`/`RS256` tokens are rejected). `opts.leeway` seconds (default 60). Verifying a third party's RS256/ES256 token is `oidc_verify` (below). **Reads the clock → `require time`** (or pass it: `opts.now`, a unix timestamp in seconds).
 - `rsa_sign_sha256(msg, pem_secret)` → bytes (PKCS#1 v1.5, 256 bytes for a 2048-bit key) / `rsa_verify_sha256(msg, sig, pub_pem)` → bool; `ecdsa_p256_sign(msg, pem_secret)` → bytes / `ecdsa_p256_verify(msg, sig, pub_pem)` → bool (v0.6.20+) — the raw primitives behind RS256/ES256. Pure, **no `sign` capability** (that gate is for moving value on-chain; here the key is already a `secret`).
-- `totp(key, opts?)` → code text (defaults: sha1, 6 digits, 30 s — the Google Authenticator profile). Opts: `algo` (`"sha1"|"sha256"`), `digits` (6–8), `period`, `at` (unix ts, for deterministic tests).
-- `totp_verify(key, code, opts?)` → bool (constant-time), `opts.window` = ±N periods (default 1). The code must be **text** (leading zeros matter).
+- `totp(key, opts?)` → code text (defaults: sha1, 6 digits, 30 s — the Google Authenticator profile). Opts: `algo` (`"sha1"|"sha256"`), `digits` (6–8), `period`, `at` (unix ts, for deterministic tests). **Reads the clock → `require time`** (or pass it: `opts.at`).
+- `totp_verify(key, code, opts?)` → bool (constant-time), `opts.window` = ±N periods (default 1). The code must be **text** (leading zeros matter). **Reads the clock → `require time`** (or pass it: `opts.at`).
 
 ```syn
 require random                                      -- gates token()/random_bytes only
@@ -282,9 +325,9 @@ An orchestrator mints a token for itself and hands sub-agents an *attenuated* co
 — offline, without the root key. Attenuation can **never** widen: it's checked when
 you attenuate (clear error) and again when you verify (rejected), so a hand-forged
 token can't widen either. The scopes are the same shapes as `require`.
-- `captoken_mint(caps, root_key, opts?)` → token text. `caps` = `{capability: scope | [scopes] | nothing}` (`nothing` = the capability with no scope). Opts: `id` (what you revoke; random if omitted), `ttl` (seconds, **default 900** — short on purpose, see revocation), `aud`, `ip`, `method`, `spend` (`{unit: max}`).
-- `captoken_attenuate(token, caps, opts?)` → a narrower token. **Takes no key** — that's the point. Same opts; anything wider than the parent is an error.
-- `captoken_verify(token, root_key, opts?)` → `{id, caps, depth, caveats}` or `nothing` on ANY failure. Opts supply the context the caveats are checked against — `aud`, `ip`, `method`, `at` (unix ts), `revoked` (list of ids). **Fail-closed:** a caveat in the token that you don't supply context for → rejected.
+- `captoken_mint(caps, root_key, opts?)` → token text. `caps` = `{capability: scope | [scopes] | nothing}` (`nothing` = the capability with no scope). Opts: `id` (what you revoke; random if omitted), `ttl` (seconds, **default 900** — short on purpose, see revocation), `aud`, `ip`, `method`, `spend` (`{unit: max}`). **Reads the clock → `require time`** (or pass it: `opts.now`).
+- `captoken_attenuate(token, caps, opts?)` → a narrower token. **Takes no key** — that's the point. Same opts; anything wider than the parent is an error. **Reads the clock → `require time`** (or pass it: `opts.now`).
+- `captoken_verify(token, root_key, opts?)` → `{id, caps, depth, caveats}` or `nothing` on ANY failure. Opts supply the context the caveats are checked against — `aud`, `ip`, `method`, `at` (unix ts), `revoked` (list of ids). **Fail-closed:** a caveat in the token that you don't supply context for → rejected. **Reads the clock → `require time`** (or pass it: `opts.at`).
 - `captoken_allows(verified, capability, scope?)` → bool. Takes the *output of verify* (so you can't ask about an unverified token); `nothing` → `false`.
 - **Revocation:** attenuation is offline, so there is no central check. Short TTLs + a denylist of ids (`opts.revoked`, typically from redis) is the pattern. Say it out loud in your design; don't improvise it during an incident.
 
@@ -301,12 +344,12 @@ when captoken_allows(caps, "net", "api.example.com") ...
 **Signed requests (proof-of-possession)** — a stolen bearer token is useless without
 the key. Pinned profile of RFC 9421: covers `@method`, `@target-uri` and
 `content-digest` (always, even with an empty body), plus `created`/`keyid`/`alg`.
-- `http_sign(request, key, opts?)` → map of headers to send (`Signature-Input`, `Signature`, `Content-Digest`). `request` = `{method, url, body?}`. **Requires `sign("KEY_NAME")`** + audit (the same door as signing on-chain); the key must be a sealed `secret`. Opts: `alg` (`"ed25519"` default, or `"hmac-sha256"`), `keyid` (defaults to the secret's name), `created`, `nonce`, `label`.
-- `http_signature_verify(request, key, opts?)` → `{keyid, alg, created, nonce}` or `nothing`. `request` = `{method, url, headers, body?}`. Pure (verifying signs nothing). **`opts.alg` is REQUIRED** — the verifier pins the algorithm; reading it from the message is the classic confusion forgery. Opts: `max_age` (seconds, default 300 — the anti-replay window; `created` in the future is rejected too).
+- `http_sign(request, key, opts?)` → map of headers to send (`Signature-Input`, `Signature`, `Content-Digest`). `request` = `{method, url, body?}`. **Requires `sign("KEY_NAME")`** + audit (the same door as signing on-chain); the key must be a sealed `secret`. Opts: `alg` (`"ed25519"` default, or `"hmac-sha256"`), `keyid` (defaults to the secret's name), `created`, `nonce`, `label`. **Reads the clock → `require time`** (or pass it: `opts.created`).
+- `http_signature_verify(request, key, opts?)` → `{keyid, alg, created, nonce}` or `nothing`. `request` = `{method, url, headers, body?}`. Pure (verifying signs nothing). **`opts.alg` is REQUIRED** — the verifier pins the algorithm; reading it from the message is the classic confusion forgery. Opts: `max_age` (seconds, default 300 — the anti-replay window; `created` in the future is rejected too). **Reads the clock → `require time`** (or pass it: `opts.now`).
 - The key material follows each algorithm's rule: ed25519 = curve material (hex text or bytes, like `ed25519_sign`); hmac-sha256 = the shared string's raw bytes.
 
 **Third-party OIDC (RS256/ES256)** — "login with Google" and cloud workload identity:
-- `oidc_verify(token, opts)` → claims map or `nothing`. **`iss` and `aud` are mandatory** (verifying a signature without checking the audience accepts tokens minted for another app of the same provider — the classic confused deputy). Keys: `jwks_url` (fetched and cached 10 min, re-fetched when a `kid` is unknown — **needs `require net(host)`**) or `jwks` (the document inline). Opts: `leeway` (default 60), `alg` (`RS256`/`ES256`; HS256 belongs to `jwt_verify`). RSA keys under 2048 bits are rejected.
+- `oidc_verify(token, opts)` → claims map or `nothing`. **`iss` and `aud` are mandatory** (verifying a signature without checking the audience accepts tokens minted for another app of the same provider — the classic confused deputy). Keys: `jwks_url` (fetched and cached 10 min, re-fetched when a `kid` is unknown — **needs `require net(host)`**) or `jwks` (the document inline). Opts: `leeway` (default 60), `alg` (`RS256`/`ES256`; HS256 belongs to `jwt_verify`). RSA keys under 2048 bits are rejected. **Reads the clock → `require time`** (or pass it: `opts.now`).
 - A failing *token* is `nothing`; a failing *fetch* is an error — "I couldn't check it" must never look like "it isn't valid".
 
 **mTLS client identity** (workload identity by certificate):

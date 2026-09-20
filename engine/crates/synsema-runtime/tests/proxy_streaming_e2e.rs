@@ -1,4 +1,4 @@
-//! Gate end-to-end del reverse proxy en STREAMING (`specs/proxy-streaming.md`): a
+//! Gate end-to-end del reverse proxy en STREAMING: a
 //! través de un edge `proxy to` deben pasar SSE en tiempo real, un upgrade WebSocket
 //! (túnel bidireccional), bodies grandes con `Content-Length` preservado, HEAD como
 //! HEAD y los `X-Forwarded-*`; un upstream caído es 502, un target `https://` es

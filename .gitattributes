@@ -1,0 +1,7 @@
+# Synsema programs are text, always. `tools/embed.syn` builds the app-slot header with four NUL
+# bytes in a literal, and git's heuristic calls any file with a NUL in its first 8 KB binary — so
+# `git diff` refused to show one of the three tools a reviewer is supposed to read. `diff` marks
+# them diffable without touching how they are stored, and without the end-of-line normalisation
+# that `text` would impose (the repo keeps LF in the index and checks out as-is).
+*.syn diff
+*.fsyn diff

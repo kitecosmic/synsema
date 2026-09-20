@@ -68,7 +68,7 @@ fn check_accepts_stream_and_socket_inside_a_routes_group_since_0_6_20() {
 
 /// v0.6.20 — `check` avisa (exit 0) cuando un `let` sombrea un alias de `use` y cuando una ruta
 /// `GET /:x` de un segmento taparía las URLs reservadas del runtime.
-/// Auditoría M2 — `synsema openapi` (offline, sin levantar el server) publica LO MISMO que el
+/// Auditoría externa — `synsema openapi` (offline, sin levantar el server) publica LO MISMO que el
 /// servidor: una ruta `private` (directa o heredada del grupo) no aparece en el documento.
 #[test]
 fn openapi_offline_omits_private_routes_like_the_server_does() {

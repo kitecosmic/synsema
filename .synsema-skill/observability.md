@@ -8,7 +8,7 @@
 > expression); for **crash-resume / step tracking** use the progress builtins (NOT `checkpoint`).
 
 ## Logging (real)
-```
+```synsema
 log "Processing order " + order_id        -- `log` takes a full expression
 ```
 
@@ -22,7 +22,7 @@ There is **no automatic access log** — `serve` does **not** log requests for y
 is quiet by default (this surprises people and makes dev hard). **Add a `log` in your handlers** to
 see traffic while developing:
 
-```
+```synsema
 serve on 8080
     route "GET /items/:id"
         log "GET /items/" + params.id      -- shows as: [serve] [LOG] GET /items/42
@@ -50,7 +50,7 @@ does not snapshot variables for resume.
 For "ingest done, died in validation, resume there", use the **progress** builtins, not
 `checkpoint` (they need the declared memory: `require memory("<name>")` at the top —
 [memory.md](memory.md)):
-```
+```synsema
 require memory("import-agent")
 create_progress("import", ["ingest", "validate", "load"])
 start_step("import", "ingest")
@@ -63,11 +63,24 @@ let where be resume_point("import")        -- the step to resume from
 `steps()` → statements executed so far in this program. Counts nodes, not time → deterministic
 (same program, same number); no capability; every profile. `synsema run --format json` reports it
 as `steps` next to `llm_tokens`. Use it as a cost for metering/tests/fuel-style limits:
-```
+```synsema
 let before be steps()
 process(batch)
 log "cost: " + text(steps() - before) + " steps"
 ```
+
+**Under information-flow labels** (`--labels`, `serve --attested`) `steps()` carries the union of
+everything private the run has touched, and the host reports `"steps": null` in `--format json`
+and in the `--attest` document once the run touched private data. That is not caution: the counter
+is one step per AST node, so it is *linear in what the program walked*, and after a loop whose
+condition depended on a secret it **is** the secret with a multiplication and an addition on top —
+`(steps() - base - 24) / 4` reconstructed a private scalar exactly, in one line. Before the first
+private value it is a plain public number and works as it always did. To publish it afterwards,
+say so:
+```synsema
+let cost be declassify(steps(), "the step count is published as a cost metric")
+```
+which is recorded in the declassify log and listed by `synsema code check --json`.
 
 ## Capability audit without a flag (v0.6.20+)
 `SYNSEMA_AUDIT=json|<path>|fd:N|unix:<path>` in the process environ turns the audit stream on — the way

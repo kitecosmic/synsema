@@ -329,13 +329,24 @@ fn int_of(v: Option<&SynValue>, what: &str, default: i64, min: i64) -> Result<i6
 /// `sign` (blockchain.rs `key_material`): jamás como texto plano en el lenguaje. Lo que
 /// `push_vapid_keys()` devuelve ya viene sellado; de `.env` se carga con `secret()`.
 /// Los errores jamás incluyen el valor.
+///
+/// Un secret SELLADO se rechaza acá (`expose_bytes_checked`, auditoría ronda 4/V2). La clave de
+/// identidad de `serve --attested` es un escalar P-256 de 32 bytes y su pública se PUBLICA en
+/// `/.well-known/attestation`, mientras que el JWT VAPID es ES256 sobre esa misma curva: pasarla
+/// como `opts.vapid.private` dejaba que el programa firmara un token con `aud`, `sub` y `exp`
+/// elegidos por él, hacia un host elegido por él, y que la firma validara contra la clave
+/// atestada. No es recuperación de la clave, es SUPLANTACIÓN del enclave — justo lo que el sello
+/// existe para impedir, y el único borde crudo del engine que producía una firma verificable
+/// contra la identidad publicada (los de `captoken`/`httpsig`/`webauth` son MAC o hash, que
+/// nadie verifica contra esa pública; ver el inventario en `secret.rs::expose_bytes`).
 fn vapid_private_key(v: Option<&SynValue>) -> Result<p256::SecretKey, Control> {
     let mut raw: Vec<u8> = match v {
         Some(SynValue::Secret(inner)) => {
+            let material = inner.expose_bytes_checked("push_send").map_err(err)?;
             if inner.is_bytes() {
-                inner.expose_bytes().to_vec()
+                material.to_vec()
             } else {
-                decode_key_text(&String::from_utf8_lossy(inner.expose_bytes()))?
+                decode_key_text(&String::from_utf8_lossy(material))?
             }
         }
         Some(other) => {
@@ -662,6 +673,25 @@ mod tests {
             Err(Control::Error(e)) => e.to_string(),
             Err(_) => panic!("unexpected non-error control flow"),
         }
+    }
+
+    /// Auditoría ronda 4 / V2: la clave de identidad de `serve --attested` es un escalar P-256 y
+    /// su pública se PUBLICA en `/.well-known/attestation`; el JWT VAPID es ES256 sobre esa misma
+    /// curva. Pasarla como `opts.vapid.private` dejaba que el programa firmara un token con
+    /// destinatario, asunto y vencimiento elegidos por él, hacia un host elegido por él, y que la
+    /// firma validara contra la clave atestada: suplantación del enclave, que es exactamente lo
+    /// que el sello existe para impedir. Una clave VAPID normal (sellada con `as_secret` o
+    /// cargada con `secret()`) sigue funcionando: no se nerfea el uso legítimo.
+    #[test]
+    fn a_sealed_identity_key_cannot_sign_a_vapid_token() {
+        use std::rc::Rc;
+        use synsema_core::secret::SecretInner;
+        let sealed = SynValue::Secret(Rc::new(SecretInner::new_bytes_sealed("attestation_key", vec![7u8; 32])));
+        let e = errmsg(vapid_private_key(Some(&sealed)));
+        assert!(e.contains("sealed") && e.contains("push_send"), "{}", e);
+        // La misma clave, NO sellada, es material VAPID perfectamente válido.
+        let normal = SynValue::Secret(Rc::new(SecretInner::new_bytes("VAPID_PRIVATE_KEY", vec![7u8; 32])));
+        ok(vapid_private_key(Some(&normal)));
     }
 
     /// RFC 5869 Appendix A, test case 1.

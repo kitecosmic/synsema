@@ -288,7 +288,7 @@ impl Parser {
     }
 
     // =========================================================
-    // Top-level
+    // top-level
     // =========================================================
 
     pub fn parse(&mut self) -> Result<Program, ParseError> {
@@ -307,7 +307,7 @@ impl Parser {
     }
 
     // =========================================================
-    // Statements
+    // statements
     // =========================================================
 
     fn parse_statement(&mut self) -> Result<Option<Node>, ParseError> {
@@ -461,7 +461,7 @@ impl Parser {
         let node = match tt {
             TokenType::Let => self.parse_let()?,
             TokenType::Set => self.parse_set()?,
-            TokenType::When => self.parse_when()?,
+            TokenType::When => self.parse_when(true)?,
             TokenType::Each => self.parse_each()?,
             TokenType::While => self.parse_while()?,
             TokenType::Match => self.parse_match()?,
@@ -477,7 +477,37 @@ impl Parser {
             TokenType::Try => self.parse_try_recover()?,
             _ => self.parse_expression()?, // sentencia-expresión
         };
+        // Auditoría externa: una sentencia tiene que terminar donde termina su línea. Los tokens
+        // sobrantes se descartaban EN SILENCIO, y con ellos toda una familia de no-ops: 
+        // `print "hola"` (sin paréntesis) no imprimía nada, `let x be 1 "junk"` ligaba 1 y se
+        // comía el resto, y `let x be when c then raise "boom"` dejaba x valiendo el builtin
+        // `raise` sin llamarlo. Es la raíz de la clase que el `when … then` en posición de
+        // sentencia sólo tapaba en un caso.
+        let ended_block = self.pos > 0
+            && matches!(self.tokens[self.pos - 1].ty, TokenType::Dedent | TokenType::Newline);
+        if !ended_block
+            && !matches!(self.current().ty, TokenType::Newline | TokenType::Dedent | TokenType::Eof)
+        {
+            let tok = self.current();
+            return Err(ParseError::new(
+                format!(
+                    "unexpected {} after the end of this statement. If you meant to call something, write the parentheses: f(x). If you meant several statements, put them on separate lines",
+                    tok.ty.name()
+                ),
+                tok.location.clone(),
+            ));
+        }
         Ok(Some(node))
+    }
+
+    /// Despues de los NEWLINE que vienen (lineas en blanco o de comentario), ¿hay un INDENT?
+    /// Se mira sin consumir: es como se distingue un bloque de una forma inline.
+    fn indent_after_newlines(&self) -> bool {
+        let mut i = 1;
+        while self.peek(i).ty == TokenType::Newline {
+            i += 1;
+        }
+        self.peek(i).ty == TokenType::Indent
     }
 
     fn parse_block(&mut self) -> Result<Vec<Node>, ParseError> {
@@ -535,13 +565,31 @@ impl Parser {
 
     // -- when / otherwise --
 
-    fn parse_when(&mut self) -> Result<Node, ParseError> {
+    /// `stmt_pos`: este `when` se parsea como SENTENCIA (no como expresión). En esa posición
+    /// La forma inline `when … then …` es un error de carga: su valor se descarta, así que una
+    /// guarda escrita después de `then` (`raise`, `give`, `set`…) no tiene ningún efecto y el
+    /// programa sigue de largo sin aviso — una trampa silenciosa capaz de convertir una
+    /// verificación de seguridad en un no-op. Es ERROR y no warning porque no existe el caso
+    /// legítimo: en posición de sentencia el valor no se usa nunca, y la forma en bloque dice
+    /// exactamente lo mismo sin la trampa.
+    fn parse_when(&mut self, stmt_pos: bool) -> Result<Node, ParseError> {
         let loc = self.location();
         self.advance(); // 'when'
         let condition = self.parse_expression()?;
 
+        if stmt_pos && self.check(TokenType::Then) {
+            return Err(ParseError::new(
+                "'when <condition> then <value>' is the inline form: it is an expression, and in statement position its value is discarded, so a guard written after 'then' never takes effect. Write the block form:
+    when <condition>
+        <statement>
+The inline form belongs where a value is used: let x be when c then a otherwise b"
+                    .to_string(),
+                self.current().location.clone(),
+            ));
+        }
+
         // Forma inline: when <cond> then <expr> [otherwise [when ...] <expr>]
-        // Usable en cualquier posición de expresión (map literal, apply, let, etc.).
+        // usable en cualquier posición de expresión (map literal, apply, let, etc.).
         if self.match_tok(TokenType::Then).is_some() {
             let then_expr = self.parse_expression()?;
             let mut otherwise = None;
@@ -549,7 +597,8 @@ impl Parser {
             if self.match_tok(TokenType::Otherwise).is_some() {
                 self.skip_newlines();
                 if self.check(TokenType::When) {
-                    otherwise_when = Some(Box::new(self.parse_when()?));
+                    // Ya estamos en la forma inline: lo que sigue es expresión.
+                    otherwise_when = Some(Box::new(self.parse_when(false)?));
                 } else {
                     otherwise = Some(vec![self.parse_expression()?]);
                 }
@@ -573,7 +622,8 @@ impl Parser {
         if self.match_tok(TokenType::Otherwise).is_some() {
             self.skip_newlines();
             if self.check(TokenType::When) {
-                otherwise_when = Some(Box::new(self.parse_when()?));
+                // Un `otherwise when` de una cadena de bloques hereda la posición del raíz.
+                otherwise_when = Some(Box::new(self.parse_when(stmt_pos)?));
             } else {
                 otherwise = Some(self.parse_block()?);
             }
@@ -1166,6 +1216,11 @@ impl Parser {
         if self.match_tok(TokenType::LParen).is_some() {
             scope = Some(Box::new(self.parse_expression()?));
             self.expect(TokenType::RParen, "")?;
+        } else if matches!(self.current().ty, TokenType::Text | TokenType::Template | TokenType::Number) {
+            // M6 (ronda 3): la forma sin parentesis (`require net "x.com"`) se parseaba y el
+            // scope se DESCARTABA en silencio — la capability quedaba mas ancha que lo escrito,
+            // que es el peor no-op de la familia. Se honra lo que dice el programa.
+            scope = Some(Box::new(self.parse_expression()?));
         }
         // DB-M1 decisión #1: la declaración ES la identidad — `require memory` sin
         // nombre no significa nada (¿qué .db abriría?). Error en el parse, no al
@@ -1184,7 +1239,13 @@ impl Parser {
         self.advance(); // consume 'sandbox'
         // Forma de bloque:  sandbox\n    body...
         // Forma inline:     sandbox <expr>  (como expresión o en la misma línea)
-        let body = if self.check(TokenType::Newline) && self.peek(1).ty == TokenType::Indent {
+        // Auditoria ronda 6: mirar solo `peek(1)` fallaba cuando la primera linea del cuerpo
+        // era un COMENTARIO — el lexer emite un NEWLINE de mas antes del INDENT, asi que el
+        // `sandbox` se tomaba por la forma inline y moria con "Unexpected token: NEWLINE". Es
+        // lo que le pasa a un bloque que arranca explicando que hace, o sea a casi todos los de
+        // la documentacion. `task`/`when`/`each` no lo tenian porque usan `parse_block`, que
+        // hace `skip_newlines` primero; aca se mira igual, sin consumir.
+        let body = if self.check(TokenType::Newline) && self.indent_after_newlines() {
             self.parse_block()?
         } else {
             vec![self.parse_expression()?]
@@ -1198,16 +1259,43 @@ impl Parser {
         ))
     }
 
+    /// `invariant: expr` o `invariant "descripción": expr`. Un Text justo después de la palabra
+    /// Es la descripción (el mensaje pasa a ser `Invariant violation: <descripción>`; sin ella
+    /// sigue siendo "unnamed invariant"). Sólo cambia el parser: el nodo ya tenía el campo.
     fn parse_invariant(&mut self) -> Result<Node, ParseError> {
         let loc = self.location();
         self.advance();
+        // La descripción es un literal de texto; también se acepta un template con backticks
+        // Se guarda como texto ESTÁTICO — los huecos `{expr}` quedan escritos tal cual
+        // (la descripción es un rótulo para el auditor, no se evalúa).
+        let description = if self.check(TokenType::Text) {
+            Some(self.advance().as_str().to_string())
+        } else if self.check(TokenType::Template) {
+            let tok = self.advance();
+            let mut s = String::new();
+            if let TokenValue::Template(segs) = tok.value {
+                for seg in segs {
+                    match seg {
+                        TemplateSegment::Literal(t) => s.push_str(&t),
+                        TemplateSegment::Interp(src, _) => {
+                            s.push('{');
+                            s.push_str(src.trim());
+                            s.push('}');
+                        }
+                    }
+                }
+            }
+            Some(s)
+        } else {
+            None
+        };
         self.expect(TokenType::Colon, "")?;
         let condition = self.parse_expression()?;
         Ok(Node::new(
             loc,
             NodeKind::InvariantDeclaration {
                 condition: Box::new(condition),
-                description: None,
+                description,
             },
         ))
     }
@@ -2025,7 +2113,7 @@ impl Parser {
     }
 
     // =========================================================
-    // Expressions (Pratt / precedence climbing)
+    // expressions (Pratt / precedence climbing)
     // =========================================================
 
     fn parse_expression(&mut self) -> Result<Node, ParseError> {
@@ -2501,7 +2589,7 @@ impl Parser {
             TokenType::Analyze => self.parse_analyze_expr(),
             TokenType::Generate => self.parse_generate_expr(),
             TokenType::Sandbox => self.parse_sandbox(),
-            TokenType::When => self.parse_when(),
+            TokenType::When => self.parse_when(false),
             _ => Err(ParseError::new(
                 format!(
                     "Unexpected token: {} ({})",

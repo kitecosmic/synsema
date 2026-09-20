@@ -33,6 +33,9 @@ impl Profile {
 
 static PROFILE: OnceLock<Profile> = OnceLock::new();
 static PROGRAM_ARGS: OnceLock<Vec<String>> = OnceLock::new();
+/// Etiquetas de flujo de información (`private`/`declassify`) encendidas para
+/// TODOS los intérpretes del proceso (`run --labels`, `test --labels`, `serve --attested`).
+static LABELS: OnceLock<bool> = OnceLock::new();
 
 /// Fija el perfil del proceso (una vez). `false` si ya estaba fijado.
 pub fn set_profile(p: Profile) -> bool {
@@ -50,4 +53,15 @@ pub fn set_program_args(args: Vec<String>) -> bool {
 
 pub fn program_args() -> Vec<String> {
     PROGRAM_ARGS.get().cloned().unwrap_or_default()
+}
+
+/// Fija las etiquetas de flujo del proceso (una vez). `false` si ya estaban fijadas.
+pub fn set_labels(on: bool) -> bool {
+    LABELS.set(on).is_ok()
+}
+
+/// ¿Etiquetas de flujo encendidas? Apagadas por defecto: la variante `Private` no existe en
+/// runtime y el coste es cero (ver `synsema_core::labels`).
+pub fn labels() -> bool {
+    LABELS.get().copied().unwrap_or(false)
 }

@@ -31,7 +31,7 @@ use synsema_core::tokens::SourceLocation;
 use synsema_core::types::{syn_bool, syn_bytes, syn_secret, syn_secret_bytes, syn_text, SynValue};
 
 // =========================================================
-// EnvStore — el `.env` parseado (la fuente; environ se lee en vivo)
+// envStore — el `.env` parseado (la fuente; environ se lee en vivo)
 // =========================================================
 
 /// Variables provenientes del archivo `.env`. El environ del proceso NO vive acá:
@@ -230,7 +230,7 @@ fn parse_value(rhs: &str) -> String {
 }
 
 // =========================================================
-// Helpers de builtins
+// helpers de builtins
 // =========================================================
 
 fn arg(args: &[SynValue], i: usize) -> Result<&SynValue, Control> {
@@ -250,6 +250,12 @@ fn raw_str(v: &SynValue) -> String {
 
 /// Bytes para crypto: un secret aporta su plaintext (uso interno; la salida es una
 /// MAC/bool, no filtra). Texto → sus bytes; resto → su Display.
+///
+/// BORDE CRUDO DECLARADO (auditoría ronda 4/V2): acepta un secret SELLADO. Sus tres
+/// consumidores son `hmac_sha256`, `verify_hmac` y `constant_time_eq` — HMAC y comparación en
+/// tiempo constante, simétricos y de una vía: nada de lo que producen se verifica contra la
+/// clave pública que publica `/.well-known/attestation`, así que no hay suplantación del
+/// enclave. Ver el inventario completo en `synsema_core::secret::SecretInner::expose_bytes`.
 fn crypto_bytes(v: &SynValue) -> Vec<u8> {
     match v {
         SynValue::Secret(s) => s.expose_bytes().to_vec(),
@@ -312,7 +318,7 @@ fn check_cap(caps: &Rc<RefCell<CapabilitySet>>, cap: Capability) -> Result<(), D
 }
 
 // =========================================================
-// Crypto (HMAC-SHA256/512, hex/base64, constant-time)
+// crypto (HMAC-SHA256/512, hex/base64, constant-time)
 // =========================================================
 
 #[derive(Clone, Copy)]
@@ -459,7 +465,7 @@ fn decode_signature(sig: &str, mac_len: usize) -> Option<Vec<u8>> {
 }
 
 // =========================================================
-// Audit de reveal() — append-only, fail-loud (§7)
+// audit de reveal() — append-only, fail-loud (§7)
 // =========================================================
 
 /// Directorio del audit: `$SYNSEMA_AUDIT_DIR` o `~/.synsema/audit`.
@@ -642,7 +648,7 @@ fn write_audit_op(
 }
 
 // =========================================================
-// Registro de builtins
+// registro de builtins
 // =========================================================
 
 /// Registra los builtins de secretos/env, compartiendo el `CapabilitySet` y el
@@ -713,6 +719,16 @@ pub fn register_secret_builtins(
                     }
                 };
                 let name = inner.name().to_string();
+                // Auditoría externa: un secret SELLADO no se revela ni con la capability:
+                // Es material de identidad (`attestation_key()`) que sólo consumen los bordes
+                // criptográficos (ecdh_shared_secret/firma). El intento queda auditado igual.
+                if inner.is_sealed() {
+                    let _ = write_audit_entry(&name, loc, false);
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "reveal: secret({}) is sealed (only ecdh_shared_secret/signing can use it)",
+                        name
+                    ))));
+                }
                 // El chequeo evalúa el name del secret QUE SE PASA: redirigir la variable
                 // a otro secret pasa a revelar ESE (con su propio name) y vuelve a chequear.
                 if let Err(cause) =

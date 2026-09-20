@@ -16,7 +16,7 @@ agent Researcher
 ```
 
 ## Spawning (runs in a real thread)
-```
+```synsema
 spawn Researcher with query = "AI safety"
 ```
 - Each `spawn` creates a new thread with its own interpreter.
@@ -53,7 +53,7 @@ such failure is reported on stderr as `Agent error [<id>]: <message>`); a clean 
 `conform --swarm`.)
 
 ## Blackboard (shared state)
-```
+```synsema
 share value as "key"                     -- publish (key can be expression)
 share value as "result_" + text(id)      -- dynamic key
 observe "key" as variable                -- read (key can be expression too)
@@ -66,7 +66,7 @@ its own `source` namespace, and `recall()` inside an agent defaults to its OWN e
 cross with `recall(from = "other")` / `from = "*"`. See [memory.md](memory.md).)
 
 ## Signals (consumable queue)
-```
+```synsema
 signal "done"                    -- emit a signal
 signal "result" with data        -- emit with data
 wait_for "done" as result        -- blocks until signal arrives, CONSUMES it (default 30s)
@@ -79,12 +79,12 @@ request doesn't hang the default 30s when the emitter never signals. A non-numbe
 
 **The channel name is an EXPRESSION** (not only a literal) — so you can have an independent
 channel **per job/worker** (push, not poll):
-```
+```synsema
 -- cancel a specific job by id (e.g. from a DELETE route)
 signal "cancel:" + text(job_id)
 
 -- the worker for that job waits on its OWN channel
-wait_for "cancel:" + text(job_id) as reason
+wait_for "cancel:" + text(job_id) as why      -- `reason` is a keyword: pick another name
 ```
 With literal names all jobs share one namespace; with dynamic names each `job_id` is its own
 channel. (Per-job cancellation/coordination used to require polling blackboard keys — now it's a

@@ -1,0 +1,11 @@
+# Esta herramienta corre en el HOST (lee y escribe un .wasm; no es un .wasm). Cargo descubre la
+# config subiendo directorios desde el CWD, y `packages/guests/vela/.cargo/config.toml` fija
+# `target = "wasm32-wasip1"` + el target dir del motor para el guest: corriendo DESDE esta carpeta
+# esa config también aplica y el bin saldría como .wasm (no ejecutable). Cargo no permite anular
+# `build.target` desde una config más cercana (sólo reemplazarlo por otro triple), así que:
+# - Desde la raíz del repo (lo que hace CI y lo que documenta el README) ninguna de las dos aplica:
+#   `cargo run --locked --manifest-path packages/guests/vela/tools/wasi-stub/Cargo.toml -- in out`
+# - Desde esta carpeta, pasar el host a mano: `cargo run --target x86_64-unknown-linux-gnu -- …`
+# El target dir sí se anula acá: propio (`target/`, gitignoreado), nunca el del motor.
+[build]
+target-dir = "target"

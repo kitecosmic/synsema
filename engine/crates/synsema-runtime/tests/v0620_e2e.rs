@@ -6,7 +6,6 @@
 //! - cliente HTTP: un map como body viaja como JSON con Content-Type, `json of r`,
 //!   `http_bytes` exacto, `multipart_encode` que el servidor parsea como `form of request`;
 //! - una ruta `stream` montada desde un grupo `export routes`.
-//! Spec: `specs/v0.6.20-faltantes-plataforma.md` §5.1, §5.8, §6.3.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

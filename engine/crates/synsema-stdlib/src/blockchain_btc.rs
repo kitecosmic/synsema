@@ -72,7 +72,7 @@ const SECP_N_HALF: [u8; 32] = [
 ];
 
 // =========================================================
-// Hashes (hash160, dSHA256) y base58check
+// hashes (hash160, dSHA256) y base58check
 // =========================================================
 
 pub(crate) fn hash160(data: &[u8]) -> [u8; 20] {
@@ -117,7 +117,7 @@ fn base58check_decode(s: &str) -> Result<Vec<u8>, String> {
 }
 
 // =========================================================
-// Redes y tipos de dirección (G29)
+// redes y tipos de dirección (G29)
 // =========================================================
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -357,7 +357,7 @@ pub(crate) fn script_pubkey_of(kind: AddrKind, program: &[u8]) -> Vec<u8> {
 }
 
 // =========================================================
-// Taproot: tweak BIP-341 de key-path (interno — el usuario jamás tweakea)
+// taproot: tweak BIP-341 de key-path (interno — el usuario jamás tweakea)
 // =========================================================
 
 /// `t = int(tagged_hash("TapTweak", xonly ‖ merkle?))`, verificado `t < n`
@@ -443,7 +443,7 @@ fn tap_tweaked_signing_key(
 }
 
 // =========================================================
-// Schnorr BIP-340 (misma puerta `sign` — G30)
+// schnorr BIP-340 (misma puerta `sign` — G30)
 // =========================================================
 
 /// aux-rand FIJO (32 bytes cero): determinista (G5) y byte-exacto contra los
@@ -535,7 +535,7 @@ fn schnorr_pubkey(args: &[SynValue]) -> Result<SynValue, Control> {
 }
 
 // =========================================================
-// Direcciones y scripts (Alcance A)
+// direcciones y scripts (Alcance A)
 // =========================================================
 
 /// Pubkey COMPRIMIDA (33) desde un `secret` o bytes. Una pubkey sin comprimir es
@@ -695,7 +695,7 @@ fn btc_script(args: &[SynValue]) -> Result<SynValue, Control> {
 }
 
 // =========================================================
-// CompactSize + parser/serializador de transacciones
+// compactSize + parser/serializador de transacciones
 // =========================================================
 
 fn write_varint(n: u64, out: &mut Vec<u8>) {
@@ -917,7 +917,7 @@ fn btc_txid(args: &[SynValue]) -> Result<SynValue, Control> {
 }
 
 // =========================================================
-// Sighash BIP-143 (P2WPKH) y BIP-341 (P2TR key-path)
+// sighash BIP-143 (P2WPKH) y BIP-341 (P2TR key-path)
 // =========================================================
 
 /// La vista de una tx para FIRMAR: cada input con su amount y scriptPubKey
@@ -2275,7 +2275,11 @@ fn wif_import(
     const F: &str = "wif_import";
     let wif = match arg(args, 0, F)? {
         SynValue::Text(s) => s.to_string(),
-        SynValue::Secret(inner) => String::from_utf8_lossy(inner.expose_bytes()).into_owned(),
+        // Ronda 3 (bloqueante 4): un secret sellado tampoco por acá (este camino no pasa por
+        // `key_material`; el WIF llega como TEXTO y `expose_bytes` lo saltearía).
+        SynValue::Secret(inner) => {
+            String::from_utf8_lossy(inner.expose_bytes_checked(F).map_err(err)?).into_owned()
+        }
         other => {
             return Err(err(format!(
                 "{}: the WIF must be text (or a sealed secret), got {}",
@@ -2338,7 +2342,7 @@ fn wif_import(
 }
 
 // =========================================================
-// Registro
+// registro
 // =========================================================
 
 /// Registra los builtins de Bitcoin. PUROS salvo `schnorr_sign` (capability
@@ -2401,7 +2405,7 @@ pub(crate) fn register(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
 }
 
 // =========================================================
-// Tests — vectores OFICIALES (BIP-143/341/350/84/86) + compuestos (embit 0.8.0)
+// tests — vectores OFICIALES (BIP-143/341/350/84/86) + compuestos (embit 0.8.0)
 // =========================================================
 
 #[cfg(test)]

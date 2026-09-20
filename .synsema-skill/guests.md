@@ -42,7 +42,11 @@ cargo test --target <host triple>                      # unit tests — the crat
 ```
 
 The guest always targets `wasm32-wasip1` (`.cargo/config.toml`): Vela's linker defines WASI only,
-and `print` becomes the Executor's log (`INF …`). Vela's upload limit is 50 MB.
+and `print` becomes the Executor's log (`INF …`) — which under Nitro is written **outside** the
+enclave, so it is a public sink: with information-flow labels on (the guest always turns them on)
+`print`, `show` and `log` are refused with `label_violation` when they run under a private branch,
+because the number of lines is not redactable even when the value is. Printing a private value
+from public control flow still works and still shows `private(app)`. Vela's upload limit is 50 MB.
 
 Node probe = Node 20 or 24+, **never 22**: Node 22.x segfaults intermittently inside V8 while
 running this module (concurrent tier-up race; 22.23.2 on Linux crashed 1 run in 3, 20 and 24

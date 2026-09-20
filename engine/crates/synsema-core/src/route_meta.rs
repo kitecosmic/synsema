@@ -1,5 +1,4 @@
-//! Metadatos ESTÁTICOS de una ruta HTTP, derivados del AST sin ejecutar nada
-//! (tanda discovery — `specs/discovery-openapi.md`).
+//! Metadatos ESTÁTICOS de una ruta HTTP, derivados del AST sin ejecutar nada.
 //!
 //! Tres preguntas que un `/openapi.json` necesita contestar por operación y que el
 //! server no conocía hasta ahora:

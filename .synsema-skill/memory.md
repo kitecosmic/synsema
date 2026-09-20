@@ -8,7 +8,7 @@ Persistent agent state is **opt-in and declared**. The whole family — memory
 `fail_step`/`resume_point`/`progress_display`/`progress_percent`) — is gated by ONE
 capability you must declare at the top of the program:
 
-```
+```synsema
 require memory("support-agent")
 remember("context", "customer prefers email")
 ```
@@ -100,7 +100,7 @@ show progress_display("sync")
 Progress persists to disk. A restarted daemon resumes where it left off.
 
 ## Persistent memory
-```
+```synsema
 require memory("assistant")
 
 -- Store
@@ -150,7 +150,7 @@ writes `source = "X"`; top-level code (and serve route handlers) write `source =
 Reads are namespaced **by default** so agents sharing one memory don't confuse each
 other's notes:
 
-```
+```synsema
 require memory("newsroom")
 
 agent Writer
@@ -176,7 +176,7 @@ let top_only   be recall(from = "main")        -- just the top-level's own entri
   plan board).
 
 ## Owner rules
-```
+```synsema
 require memory("pricing-agent")
 
 -- Define rules
@@ -202,6 +202,6 @@ Rule levels:
 Rules with numeric conditions (e.g. `"discount <= 0.20"`) are auto-extracted and evaluated against the context map.
 
 ## Summary
-```
+```synsema
 print(memory_summary())
 ```

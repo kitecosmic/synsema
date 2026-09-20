@@ -1,0 +1,92 @@
+{
+  "deploy": {
+    "employer": "0x1111111111111111111111111111111111111111",
+    "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+  },
+  "steps": [
+    {
+      "kind": "deposit",
+      "sender": "0x1111111111111111111111111111111111111111",
+      "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "value": "5000000000"
+    },
+    {
+      "kind": "process",
+      "sender": "0x1111111111111111111111111111111111111111",
+      "payload": {
+        "type": "payrun",
+        "period": "2026-09",
+        "items": [
+          {
+            "to": "0x2222222222222222222222222222222222222222",
+            "amount": "1500500000",
+            "memo": "September"
+          },
+          {
+            "to": "0x3333333333333333333333333333333333333333",
+            "amount": "2000000000"
+          }
+        ],
+        "salt": "0f3c9a5b1e7d2408"
+      },
+      "expect": {
+        "app_events": 1,
+        "app_event_subtypes": [
+          "payrun"
+        ],
+        "app_event_bytes": [
+          64
+        ],
+        "withdrawals": 0
+      }
+    },
+    {
+      "kind": "process",
+      "sender": "0x2222222222222222222222222222222222222222",
+      "payload": {
+        "type": "withdraw",
+        "amount": "500000000"
+      },
+      "expect": {
+        "app_events": 0,
+        "withdrawals": 1,
+        "withdrawal_amounts": [
+          "0x1dcd6500"
+        ]
+      }
+    },
+    {
+      "kind": "process",
+      "sender": "0x2222222222222222222222222222222222222222",
+      "payload": {
+        "type": "withdraw",
+        "amount": "2000000000"
+      },
+      "expect_error": "insufficient_balance"
+    },
+    {
+      "kind": "process",
+      "sender": "0x2222222222222222222222222222222222222222",
+      "payload": {
+        "type": "payrun",
+        "period": "x",
+        "items": [
+          {
+            "to": "0x2222222222222222222222222222222222222222",
+            "amount": "1"
+          }
+        ],
+        "salt": "0f3c9a5b1e7d2408"
+      },
+      "expect_error": "*"
+    },
+    {
+      "kind": "process",
+      "sender": "0x1111111111111111111111111111111111111111",
+      "payload": {
+        "type": "mint"
+      },
+      "expect_error": "*"
+    }
+  ]
+}

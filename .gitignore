@@ -10,6 +10,9 @@ build/
 !packages/**/*.json
 # La extensión de editor son archivos .json legítimos (no caen bajo la regla de arriba).
 !editors/**/*.json
+# Los vectores de prueba embebidos con `include_str!` (groth16/plonk de snarkjs) son fuente:
+# sin esta excepción no entran al repo y `cargo test` NO COMPILA en un clon limpio.
+!engine/crates/**/fixtures/**/*.json
 
 # Rust
 target/

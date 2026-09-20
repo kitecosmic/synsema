@@ -40,7 +40,7 @@ Run it: `synsema run main.syn`.
   ```
 
 ## Export data and types, not just tasks
-```
+```synsema
 -- lexicon.syn
 export let VERBS be ["create", "fix", "document"]
 export type Point

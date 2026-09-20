@@ -1,0 +1,22 @@
+[package]
+name = "wasi-stub"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Post-processes a wasm32-wasip1 module so it declares only the WASI imports Vela v0.3.0 admits: every other wasi_snapshot_preview1 function import becomes a local stub that returns ENOSYS (EBADF for fd_prestat_get)"
+
+# Independiente del workspace del motor y del crate del guest (regla de dos ejes: `walrus` entra
+# sólo acá, nunca al lock del motor). `[workspace]` vacío para que cargo no lo cuelgue de arriba;
+# el target dir queda en esta carpeta (`target/`, gitignoreado).
+[workspace]
+
+[[bin]]
+name = "wasi-stub"
+path = "src/main.rs"
+
+[dependencies]
+walrus = "0.27.2"
+
+[dev-dependencies]
+wasmparser = "0.245"

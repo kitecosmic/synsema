@@ -4,8 +4,14 @@
 // acá, compila, instancia y responde en el Executor; la sonda de Node (`tests/vela_guest.probe.mjs`)
 // cubre el contrato en detalle, ésta cubre el runtime exacto.
 //
-//   cd packages/guests/vela/tests/wasmtime-go
-//   go run . ../../../../../engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm
+//	cd packages/guests/vela/tests/wasmtime-go
+//	go run . ../../../../../engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm
+//
+// Además afirma lo que Vela v0.3.0 (rama `dev`, `pkg/wasm/guest_imports.go`) exige al cargar: el
+// módulo sólo puede DECLARAR ocho imports de `wasi_snapshot_preview1`; cualquier otro se rechaza
+// antes de instanciar. Y mide compilación e instanciación en ms: v0.3.0 acota cada operación del
+// guest — la instanciación incluida — a 10 s (`EXECUTOR_GUEST_EXECUTION_TIMEOUT_MS`). La sonda
+// hermana `tests/wasmtime-go-v47/` hace el mismo recorrido bajo wasmtime-go v47, el runtime de dev.
 //
 // Necesita Go ≥ 1.21 y un compilador C (cgo): gcc/clang en Linux y macOS, MinGW-w64 en Windows.
 // Variables opcionales: DEPLOY_PARAMS (JSON de constructorParams) y PAYLOAD (el JSON del
@@ -18,10 +24,55 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/bytecodealliance/wasmtime-go"
 )
+
+// La lista cerrada de Vela dev (`guest_imports.go`, v0.3.0): el import set exacto que TinyGo emite
+// para un guest sin I/O. Nuestro guest (Rust/std) la cumple sólo después de `tools/wasi-stub`.
+// Cambiarla es un cambio de ABI de Vela; si Horizen la amplía, se amplía acá y en wasi-stub.
+var allowedGuestImports = map[string]struct{}{
+	"wasi_snapshot_preview1.args_get":          {},
+	"wasi_snapshot_preview1.args_sizes_get":    {},
+	"wasi_snapshot_preview1.clock_time_get":    {},
+	"wasi_snapshot_preview1.environ_get":       {},
+	"wasi_snapshot_preview1.environ_sizes_get": {},
+	"wasi_snapshot_preview1.fd_write":          {},
+	"wasi_snapshot_preview1.proc_exit":         {},
+	"wasi_snapshot_preview1.random_get":        {},
+}
+
+// checkGuestImportsAllowed: el mismo recorrido que Vela dev hace tras compilar y antes de
+// instanciar. Devuelve los imports declarados (para el resumen) y los rechazados, ordenados.
+func checkGuestImportsAllowed(module *wasmtime.Module) (declared []string, rejected []string) {
+	seen := map[string]struct{}{}
+	for _, imp := range module.Imports() {
+		name := "<module import>"
+		if n := imp.Name(); n != nil {
+			name = *n
+		}
+		q := imp.Module() + "." + name
+		declared = append(declared, strings.TrimPrefix(q, "wasi_snapshot_preview1."))
+		if _, ok := allowedGuestImports[q]; ok {
+			continue
+		}
+		if _, dup := seen[q]; dup {
+			continue
+		}
+		seen[q] = struct{}{}
+		rejected = append(rejected, q)
+	}
+	sort.Strings(declared)
+	sort.Strings(rejected)
+	return declared, rejected
+}
+
+func ms(d time.Duration) string {
+	return fmt.Sprintf("%.1f ms", float64(d.Microseconds())/1000.0)
+}
 
 type guest struct {
 	store *wasmtime.Store
@@ -117,11 +168,22 @@ func main() {
 		fail("read", err)
 	}
 	engine := wasmtime.NewEngine()
+	t0 := time.Now()
 	module, err := wasmtime.NewModule(engine, wasmBytes)
 	if err != nil {
 		fail("compile under wasmtime 1.0", err)
 	}
-	fmt.Printf("ok   compiled under wasmtime-go v1.0.0 (%d bytes)\n", len(wasmBytes))
+	compileTime := time.Since(t0)
+	fmt.Printf("ok   compiled under wasmtime-go v1.0.0 (%d bytes) in %s\n", len(wasmBytes), ms(compileTime))
+
+	// Vela v0.3.0: imports declarados ⊆ los ocho permitidos, o el módulo no carga (firmado como
+	// FAILED_LOADING_OR_GETTING_MODULE). Se lista todo lo sobrante de una vez, como hace Vela.
+	declared, rejected := checkGuestImportsAllowed(module)
+	if len(rejected) > 0 {
+		fail("imports (Vela v0.3.0 closed set)", fmt.Errorf("the module declares %d host import(s) Vela refuses: %s — run tools/wasi-stub on it", len(rejected), strings.Join(rejected, ", ")))
+	}
+	fmt.Printf("ok   imports ⊆ Vela v0.3.0's allowed set (%d declared: %s)\n", len(declared), strings.Join(declared, ", "))
+
 	store := wasmtime.NewStore(engine)
 	wasi := wasmtime.NewWasiConfig()
 	wasi.InheritStdout() // el Executor lo manda a su log server con prefijos INF/WRN/ERR
@@ -131,10 +193,12 @@ func main() {
 	if err := linker.DefineWasi(); err != nil {
 		fail("DefineWasi", err)
 	}
+	t1 := time.Now()
 	inst, err := linker.Instantiate(store, module)
 	if err != nil {
 		fail("instantiate (only WASI imports are provided)", err)
 	}
+	instantiateTime := time.Since(t1)
 	memExport := inst.GetExport(store, "memory")
 	if memExport == nil || memExport.Memory() == nil {
 		fail("memory export", fmt.Errorf("missing"))
@@ -145,16 +209,18 @@ func main() {
 			fail("export "+name, fmt.Errorf("missing"))
 		}
 	}
-	fmt.Println("ok   instantiated; all exports the Executor looks up are present")
+	fmt.Printf("ok   instantiated in %s; all exports the Executor looks up are present\n", ms(instantiateTime))
 
-	// load_module (cache warm-up)
+	// load_module (cache warm-up) — la primera llamada paga el arranque del intérprete
+	t2 := time.Now()
 	p, err := g.call("load_module", int64(1))
 	if err != nil {
 		fail("load_module (trap)", err)
 	}
+	firstCallTime := time.Since(t2)
 	out, _ := g.result(p)
 	parse(out, "load_module")
-	fmt.Printf("ok   load_module → %s\n", out)
+	fmt.Printf("ok   load_module in %s → %s\n", ms(firstCallTime), out)
 
 	// deploy
 	params := []byte(os.Getenv("DEPLOY_PARAMS"))
@@ -207,5 +273,9 @@ func main() {
 	out, _ = g.result(p)
 	parse(out, "process_request")
 	fmt.Printf("ok   process_request → %s\n", out)
+	// Vela v0.3.0 acota cada operación del guest a 10 s, la instanciación incluida: el número que
+	// importa es compile + instantiate + primera llamada, medido acá para dejarlo anotado.
+	fmt.Printf("timing: compile %s, instantiate %s, first call %s (Vela v0.3.0 bounds one guest operation, instantiation included, to 10 s)\n",
+		ms(compileTime), ms(instantiateTime), ms(firstCallTime))
 	fmt.Println("ALL OK under wasmtime-go v1.0.0")
 }

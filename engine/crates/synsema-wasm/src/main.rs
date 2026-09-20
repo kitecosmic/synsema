@@ -133,7 +133,7 @@ fn main() {
     };
     // `env: None` → EnvStore::load_default(): el `.env` llega por WASI (`--dir .`) y el
     // environ por `wasmtime --env`, igual que hasta ahora.
-    let opts = RunOptions { filename, env: None, ceiling, no_fs: false };
+    let opts = RunOptions { filename, env: None, ceiling, no_fs: false, labels: false, result: None, input: None, sources: Vec::new() };
 
     if test_mode {
         let r = with_big_stack(move || synsema_wasm::test(&source, &opts));

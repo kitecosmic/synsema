@@ -11,7 +11,7 @@
 /// los punteros de skill/MCP para desarrollar con agentes desde el minuto 0.
 pub const HELLO_SYN: &str = r#"-- Mi primer programa Synsema.
 --   Correlo:   synsema run hello.syn
---   Testealo:  synsema test hello.syn
+--   testealo:  synsema test hello.syn
 --
 -- ¿Desarrollás con un agente (Claude Code o similar)? Potencialo desde el minuto 0
 -- con DOS comandos (los pega el dev o el propio agente — sin clonar nada):
@@ -247,6 +247,33 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # Vale tambien dentro de un binario de `synsema build`; el flag --audit le gana:
 # SYNSEMA_AUDIT=json
 
+# ══ Attestation (TEEs) — `synsema serve --attested` / `synsema run --attest` / attest() ══
+
+# Driver de attestation. Sin la variable se AUTODETECTA en Linux por el dispositivo o socket
+# presente (/dev/nsm → nitro; /sys/kernel/config/tsm/report → tsm [TDX o SEV-SNP];
+# /var/run/dstack.sock o tappd.sock → dstack) y si no hay ninguno, error claro. `mock` es el
+# driver de desarrollo y CI (Windows/macOS incluidos): documento con forma Nitro firmado por
+# una cadena de prueba determinista; JAMAS se elige solo, hay que pedirlo:
+# SYNSEMA_ATTEST=mock
+
+# Semilla del driver mock (default "synsema-mock"): fija la clave, la cadena y por lo tanto
+# la raiz que un cliente de CI pasa como `root` a attestation_verify. Otra semilla = otra
+# identidad; la raiz sale en el campo `root` de attest():
+# SYNSEMA_ATTEST_MOCK_SEED=synsema-mock
+
+# PCRs que declara el documento mock: `indice=<96 hex>` separados por comas (0..=15, 48 bytes
+# cada uno; los que no nombres quedan en cero). Sirve para ensayar `expect.measurements`:
+# SYNSEMA_ATTEST_MOCK_PCRS=0=000000...,1=000000...
+
+# Timestamp (ms desde epoch) del documento mock (default 1700000000000), para ensayar la
+# validez temporal del verificador:
+# SYNSEMA_ATTEST_MOCK_TIMESTAMP=1700000000000
+
+# Endpoint del simulador de dstack (`dstack-simulator`): ruta de un socket unix o http://host:port.
+# SOLO se honra con SYNSEMA_ATTEST=dstack explicito — nunca cambia el driver por si solo (la
+# autodeteccion mira los sockets reales del guest agent). Misma variable que lee el SDK oficial:
+# DSTACK_SIMULATOR_ENDPOINT=
+
 # ══ Secretos de TU programa (el nombre lo elegís vos, no el engine) ══
 
 # `secret("NOMBRE")` resuelve por: entorno del proceso > este .env > default; sin
@@ -310,7 +337,11 @@ const HELLO_SYN_PAST: &[&str] = &[
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
 const ENV_EXAMPLE_PAST: &[&str] = &[
-    // v0.6.21 (2026-09-12): antes de SYNSEMA_LLM_BUDGET_PER_IDENTITY, SYNSEMA_HEALTH_PATH y SYNSEMA_AUDIT.
+    // V0.6.23 (2026-09-18, auditoria externa): la seccion "Attestation (TEEs)" antes de DSTACK_SIMULATOR_ENDPOINT.
+    "389916c6930df6c0b862824841025f60eb885e815e650568bd115d7b49b3c851",
+    // V0.6.23 (2026-09-18): antes de la seccion "Attestation (TEEs)" (SYNSEMA_ATTEST*).
+    "3ef3ddfeb448f36b535d02cb5f42be75352222d0c8c62daedcdb54f9cd280349",
+    // V0.6.21 (2026-09-12): antes de SYNSEMA_LLM_BUDGET_PER_IDENTITY, SYNSEMA_HEALTH_PATH y SYNSEMA_AUDIT.
     "aa299c5ce19c7fa9a2252e1f5ca0ca3e3174566bab256dd2764ad363674a82e0",
     "89ce5ec7987119a7bf7579f74b93275ca3a61790766a143e06df26000b992bb9",
     // v0.6.6 (antes de la sección de knobs del servidor)
@@ -367,7 +398,7 @@ pub const INIT_FILES: [InitFile; 4] = [
 ];
 
 // =========================================================
-// `synsema init --pwa` — app instalable (tanda PWA, specs/pwa-mobile.md)
+// `synsema init --pwa` — app instalable
 // =========================================================
 //
 // Scaffold EMBEBIDO (no descargado, como Synfide): siete archivos de texto que enseñan
@@ -378,7 +409,7 @@ pub const INIT_FILES: [InitFile; 4] = [
 /// El programa: sitio + manifest + service worker + API + push nativo (opcional).
 pub const PWA_APP_SYN: &str = r#"-- Tu app instalable (PWA). Este programa sirve el sitio, el manifest, el service
 -- worker y el API (api.syn). `synsema serve app.syn` → http://localhost:8080 (Chrome y
--- Edge la instalan desde localhost). Producción: `synsema serve app.syn --domain
+-- edge la instalan desde localhost). Producción: `synsema serve app.syn --domain
 -- app.example.com --tls-auto you@example.com` (iOS exige HTTPS con certificado confiable).
 --
 -- Push nativo (opcional): `synsema run push_keys.syn` imprime el par VAPID; pegalo en
@@ -823,7 +854,7 @@ pub const DESKTOP_DESK_SYN: &str = r#"-- Tu app como app de ESCRITORIO: el mismo
 --   synsema serve desk.syn                                   → desarrollo: abre la ventana
 --   synsema build desk.syn -o desk --serve --no-console --icon public/icon.svg   → Windows: desk.exe
 --   synsema build desk.syn -o desk --serve --icon public/icon.svg --bundle        → macOS .app / Linux dir + install.sh
--- Sin consola no hay stdout/stderr: si querés un log, escribilo (append_file bajo file.write).
+-- sin consola no hay stdout/stderr: si querés un log, escribilo (append_file bajo file.write).
 -- DESK_NO_WINDOW=1 no abre el navegador (tests, CI). Docs: /0.6.x/41c-desktop.
 
 require serve(8123)
@@ -1220,7 +1251,10 @@ mod tests {
         let mut out = Vec::new();
         for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
             let is_knob_var = (token.starts_with("SYNSEMA_") && token.len() > "SYNSEMA_".len())
-                || (token.ends_with("_API_KEY") && token.len() > "_API_KEY".len());
+                || (token.ends_with("_API_KEY") && token.len() > "_API_KEY".len())
+                // Knobs con nombre ajeno que el runtime honra tal cual (la misma variable
+                // que lee el SDK oficial de la plataforma): se listan explícitamente.
+                || token == "DSTACK_SIMULATOR_ENDPOINT";
             if is_knob_var && !out.contains(&token.to_string()) {
                 out.push(token.to_string());
             }
@@ -1254,6 +1288,7 @@ mod tests {
             .chain(HUMAN_ENV_VARS.iter())
             .chain(CEILING_ENV_VARS.iter())
             .chain(synsema_stdlib::server::SERVE_ENV_VARS.iter())
+            .chain(synsema_stdlib::attest::ATTEST_ENV_VARS.iter())
             .chain(synsema_runtime::run_program::RUN_PROGRAM_ENV_VARS.iter())
             .chain(crate::audit::HOST_ENV_VARS.iter())
             .copied()

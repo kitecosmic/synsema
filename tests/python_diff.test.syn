@@ -23,9 +23,6 @@ task reraise_error()
     recover err
         raise(err)
 
-task bad_return()
-    return 5
-
 task give_none()
     give None
 
@@ -73,11 +70,14 @@ test "each over a list; each over a MAP errors (use keys())"
         set ks to append(ks, k)
     assert_eq(ks, ["x", "y"])
 
-test "give returns; Python 'return' is just an undefined name"
+test "give returns; Python's `return x` does not even load"
     assert_eq(classify(200), "ok")
     assert_eq(classify(404), "missing")
     assert_eq(classify(500), "other")
-    assert_error(bad_return)
+    -- `return 5` is `return` (an undefined name) followed by a leftover `5`. The parser refuses
+    -- the leftover instead of discarding it, so the program does not load at all — the mistake is
+    -- caught before it runs, not when the task is first called. That is why there is no task here
+    -- to call: writing one would keep this whole file from loading.
 
 test "None/True are undefined names; nothing/true/false are the literals"
     assert_error(give_none)

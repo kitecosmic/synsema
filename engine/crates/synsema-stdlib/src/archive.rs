@@ -18,7 +18,6 @@
 //!   archivos grandes, bajar `max_bytes` o extraer por partes.
 //! - `.gitignore` no se interpreta acá: es política del CLI, que arma `entries`.
 //!
-//! Spec `specs/v0.6.20-faltantes-plataforma.md` §5.7.
 
 use std::cell::RefCell;
 use std::io::{Cursor, Read, Write};
@@ -263,7 +262,7 @@ fn extract_args(args: &[SynValue], who: &str) -> Result<(Vec<u8>, Extract), Cont
 }
 
 /// Destino final de una entrada: bajo `dest` o error (zip-slip). Devuelve el path relativo
-/// normalizado y el real en disco. **Exige `file.write` sobre ESA ruta** (auditoría B3): el
+/// normalizado y el real en disco. **Exige `file.write` sobre ESA ruta** : el
 /// scope que cubre `write_file("./out/a.txt")` es el mismo que cubre extraerlo; sólo el
 /// destino raíz no alcanza.
 fn target_of(caps: &Rc<RefCell<CapabilitySet>>, x: &Extract, raw: &str, who: &str) -> Result<(String, PathBuf), Control> {
@@ -278,7 +277,7 @@ fn target_of(caps: &Rc<RefCell<CapabilitySet>>, x: &Extract, raw: &str, who: &st
     Ok((name, target))
 }
 
-/// Lee una entrada acotando los bytes REALES (auditoría B2): el tamaño declarado en el
+/// Lee una entrada acotando los bytes REALES : el tamaño declarado en el
 /// header de un zip/tar puede mentir; lo que cuenta es lo que sale del descompresor.
 fn read_capped<R: Read>(r: &mut R, remaining: u64, name: &str, who: &str, max_bytes: u64) -> Result<Vec<u8>, Control> {
     let mut buf = Vec::new();
@@ -527,7 +526,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// Auditoría B2 — un zip cuyo header MIENTE el tamaño (declara poco, trae mucho) no pasa
+    /// Un zip cuyo header MIENTE el tamaño (declara poco, trae mucho) no pasa
     /// el techo de bytes reales, y nada queda escrito.
     #[test]
     fn extract_caps_real_bytes_not_declared_size_and_writes_nothing_on_failure() {
@@ -586,7 +585,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// Auditoría B3 — extraer exige `file.write` sobre CADA ruta escrita, no sólo sobre el
+    /// Extraer exige `file.write` sobre CADA ruta escrita, no sólo sobre el
     /// destino raíz: con un scope exacto (sin comodín) no se escribe nada dentro.
     #[test]
     fn extract_requires_file_write_per_entry() {

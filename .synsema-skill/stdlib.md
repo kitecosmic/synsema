@@ -103,7 +103,7 @@ let conn be ws_connect("wss://stream.exchange.com/ws")   -- opaque handle; heade
 ws_send(conn, json_encode({"op": "subscribe", "channel": "trades"}))  -- text or bytes
 let msg be ws_recv(conn, 5)         -- next message, or `nothing` after the 5s timeout (never blocks forever)
 -- msg is {"type": "text"|"binary"|"close", "data": …}
-if msg is not nothing and msg["type"] is "text"
+when msg != nothing and msg["type"] == "text"
     print(msg["data"])
 ws_close(conn)                      -- clean close frame (idempotent)
 ```
@@ -174,7 +174,7 @@ while live
 own interpreter (inheriting caps) and its OWN WebSocket registry — a worker `ws_connect`s its
 feed, processes it, returns. Handles do NOT cross workers (CSP isolation): never share a handle.
 
-```
+```synsema
 task watch(url)
     let c be ws_connect(url)
     let m be ws_recv(c, 30)
@@ -201,7 +201,7 @@ other; the private VAPID key is accepted **only as a `secret`**. Full reference 
 option, return fields, the four push-service hosts) in [builtins.md](builtins.md) § Web Push;
 the browser side and the scaffold in [serve.md](serve.md) § Installable app (PWA).
 
-```
+```synsema
 require random                          -- keygen, once (push_keys.syn from `synsema init --pwa`)
 require reveal("vapid_private")
 let k be push_vapid_keys()              -- {public: text, private: secret}
@@ -417,7 +417,7 @@ nil→`nothing`, array/set→`list`, hash→`map`. Structured data is explicit v
 ### Vector search with SQLite (no extension)
 No `sqlite-vec`/ANN (rusqlite is bundled without `load_extension`). For small/medium corpora, store
 embeddings as TEXT and rank by cosine **in Synsema** (`array`/`dot`/`norm`):
-```
+```synsema
 require db("./vec.db")
 task to_vec(s)
     give array(apply((x) => number(x), split(s, ",")))

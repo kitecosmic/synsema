@@ -7,7 +7,6 @@
 //! JSON-like con un map en la raíz (un documento TOML ES una tabla) y falla claro con
 //! `nothing`, `bytes` o `secret`. Puro: sin I/O.
 //!
-//! Spec `specs/v0.6.20-faltantes-plataforma.md` §5.3.
 
 use std::rc::Rc;
 use std::str::FromStr;
@@ -115,7 +114,7 @@ pub fn toml_encode(args: &[SynValue]) -> Result<SynValue, Control> {
 }
 
 pub fn register_toml_builtins(interp: &Interpreter) {
-    interp.register_builtin("toml_parse", 1, Rc::new(|_i, a, _l| toml_parse(a)));
+    interp.register_builtin("toml_parse", -1, synsema_core::interpreter::with_fallback(1, Rc::new(|_i, a, _l| toml_parse(a))));
     interp.register_builtin("toml_encode", 1, Rc::new(|_i, a, _l| toml_encode(a)));
 }
 

@@ -1,4 +1,4 @@
-//! Tanda escritorio, empaquetado (specs/build-serve-desktop.md §3.6, §3.8, §3.9) contra el
+//! Escritorio, empaquetado, contra el
 //! binario real de `synsema build`: `.exe` automático, `--no-console`, `--icon` y `--bundle`
 //! sobre DONANTES SINTÉTICOS (un PE/Mach-O/ELF mínimo escrito por el test — `build` sólo exige
 //! que el donante no esté ya construido), así corren en cualquier host. En Windows, además,

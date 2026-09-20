@@ -117,7 +117,7 @@ not — they are runtime output, stable to parse):
 | boxplot | `\| group \| min \| q1 \| median \| q3 \| max \| outliers \|` | `"groups": [{"name", "min", "q1", "median", "q3", "max", "outliers": [...]}]` |
 | waterfall | `\| label \| delta \| running \|` (+ total row if requested) | `"steps": [{"label", "delta", "running"}]`, `"total"` |
 
-```
+```synsema
 require db("app.db")
 serve on 8080
     route "GET /r/:name"
@@ -135,11 +135,13 @@ serve on 8080
 deterministic across platforms (one embedded sans font — DejaVu Sans — so text rasterizes
 identically on Windows/Linux/macOS/Docker distroless). Both return **`bytes`**:
 
-```
+```synsema
 let svg be chart_svg("bar", filas, {"x": "mes", "y": "total"})
 write_file("reporte.png", svg_to_png(svg, {"scale": 2}))      -- needs file.write
-route "GET /chart.pdf"
-    give binary(svg_to_pdf(svg), "application/pdf")
+
+serve on 8080
+    route "GET /chart.pdf"
+        give binary(svg_to_pdf(svg), "application/pdf")
 ```
 
 - `svg_to_png(svg, opts?)` → PNG bytes (RGBA, transparent unless `background`). Opts:

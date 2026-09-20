@@ -10,7 +10,7 @@ Applies `task` to each item of `list` **concurrently**, returns results **in inp
 order**. `limit` caps how many run at once (backpressure); omit it for a sensible default
 (64 for I/O fan-out, num-cpus for pure compute).
 
-```
+```synsema
 task fetch_user(id)
     give fetch("https://api.example.com/users/" + text(id))
 
@@ -23,7 +23,7 @@ let users be parallel_map(fetch_user, ids, 50)   -- 50 concurrent, order preserv
 **Failure (fail-fast):** the first error cancels the rest and propagates. To collect
 partial results instead, wrap the task so it returns a value-or-error:
 
-```
+```synsema
 task safe_fetch(id)
     try
         give fetch(url_for(id))
@@ -47,7 +47,7 @@ chunk([1, 2, 3, 4, 5], 2)   -- [[1, 2], [3, 4], [5]]
 
 ## The "10k as 10×1000, then merge" pattern
 
-```
+```synsema
 let batches be chunk(items, 1000)                         -- 10 batches
 let partial be parallel_map(process_batch, batches, 10)   -- 10 batches in parallel
 let merged be flatten(partial)                            -- join the results

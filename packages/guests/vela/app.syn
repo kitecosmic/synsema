@@ -4,19 +4,29 @@
 --
 -- The adapter (src/lib.rs) calls ONE task per Vela entry point, each with ONE map and
 -- expecting ONE map back:
---   deploy(ctx)       ctx = {app_id, params}                          → {state, fuel?}
+--   Deploy(ctx)       ctx = {app_id, params}                          → {state, policy?, fuel?}
 --   deposit(ctx)      ctx = {app_id, sender, token, value, value_hex, state} → {state?, events?, app_events?, fuel?, error?}
 --   process(ctx)      ctx = {app_id, sender, request_type, kind, payload, payload_hex, state} → {state?, events?, app_events?, withdrawals?, fuel?, error?}
 --   deanonymize(ctx)  request_type 2 (optional; falls back to `process`)    → {report, state?, fuel?}
 --   trusted(ctx)      TRUSTPROCESS from a trigger contract (optional; falls back to `process`):
 --                     `sender` is nothing and the payload is ABI bytes, exact in `payload_hex`
+--   Invariants(ctx)   optional, after every state transition: ctx = {kind, before, after, deposit?,
+--                     Withdrawals, events} → a list of broken-invariant descriptions ([] = fine)
 -- Bytes out (`state`, `report`, an event's `data`): text as-is, a map as JSON, or `<field>_hex`
 -- ("0x…") when the bytes must be exact — what a contract decodes with abi.decode.
+--
+-- What the chain sees is public: the fee (= fuel) and the error text of every request. So
+-- `error` is a CODE (`insufficient_balance`), never a sentence with a balance in it — the
+-- sentence goes in `error_detail`, which the adapter keeps in the Executor's log — and there is
+-- ONE fuel constant for the whole app (the adapter reports one value per app anyway).
 -- No `now()`, no `random()`: the guest runs under a stdout-only ceiling — determinism by construction.
 -- Test it natively before building the module: `synsema test app.syn`.
 intent: "vela guest example: private balances per account"
 
 let ETH be "0x0000000000000000000000000000000000000000"
+-- One fuel for every entry point: the fee is public on-chain, a per-branch value would tell an
+-- observer which instruction ran. The adapter reports this value in every response.
+let FUEL be "50"
 
 -- "0x…" ↔ bytes (`bytes(x, "hex")` takes no 0x prefix).
 task hex_bytes(h)
@@ -43,8 +53,15 @@ task set_balance(state, account, token, amount)
     set state["balances"] to balances
     give state
 
+-- ConstructorParams may carry {"policy": {...}} — the output policy (reject: "private",
+-- Events_pad, events_min, state_pad, fuel) the adapter stores under `_vela` in the state. Passing it
+-- through lets one build be deployed in either mode.
 task deploy(ctx)
-    give {"state": new_state(ctx["app_id"]), "fuel": "5"}
+    let r be {"state": new_state(ctx["app_id"]), "fuel": FUEL}
+    let params be ctx["params"]
+    when params != nothing and contains(params, "policy") and params["policy"] != nothing
+        set r["policy"] to params["policy"]
+    give r
 
 task deposit(ctx)
     let state be ctx["state"]
@@ -54,14 +71,14 @@ task deposit(ctx)
     let updated be set_balance(state, ctx["sender"], ctx["token"], after)
     set updated["nonce"] to updated["nonce"] + 1
     let event be {"type": "deposit", "token": ctx["token"], "amount": ctx["value"], "balance": text(after), "nonce": updated["nonce"]}
-    give {"state": updated, "events": [{"user": ctx["sender"], "data": event}], "fuel": "35"}
+    give {"state": updated, "events": [{"user": ctx["sender"], "data": event}], "fuel": FUEL}
 
 task transfer(ctx, state, payload)
     let token be when contains(payload, "token") then payload["token"] otherwise ETH
     let amount be decimal(payload["amount"])
     let from_balance be balance_of(state, ctx["sender"], token)
     when from_balance < amount
-        give {"error": "insufficient balance for transfer"}
+        give {"error": declassify("insufficient_balance", "the outcome code is public on-chain"), "error_detail": "transfer: have " + text(from_balance) + ", need " + text(amount)}
     -- Debit first, then read the recipient from the debited state: a transfer to oneself must
     -- not create money.
     let s1 be set_balance(state, ctx["sender"], token, from_balance - amount)
@@ -70,14 +87,14 @@ task transfer(ctx, state, payload)
     set s2["nonce"] to s2["nonce"] + 1
     let sent be {"type": "transfer_sent", "to": payload["to"], "token": token, "amount": payload["amount"], "balance": text(from_balance - amount), "nonce": s2["nonce"]}
     let received be {"type": "transfer_received", "from": ctx["sender"], "token": token, "amount": payload["amount"], "balance": text(to_balance + amount), "nonce": s2["nonce"]}
-    give {"state": s2, "events": [{"user": ctx["sender"], "data": sent}, {"user": payload["to"], "data": received}], "fuel": "50"}
+    give {"state": s2, "events": [{"user": ctx["sender"], "data": sent}, {"user": payload["to"], "data": received}], "fuel": FUEL}
 
 task withdraw(ctx, state, payload)
     let token be when contains(payload, "token") then payload["token"] otherwise ETH
     let amount be decimal(payload["amount"])
     let from_balance be balance_of(state, ctx["sender"], token)
     when from_balance < amount
-        give {"error": "insufficient balance for withdrawal"}
+        give {"error": declassify("insufficient_balance", "the outcome code is public on-chain"), "error_detail": "withdrawal: have " + text(from_balance) + ", need " + text(amount)}
     let s1 be set_balance(state, ctx["sender"], token, from_balance - amount)
     set s1["nonce"] to s1["nonce"] + 1
     let event be {"type": "withdrawal", "to": payload["to"], "token": token, "amount": payload["amount"], "balance": text(from_balance - amount), "nonce": s1["nonce"]}
@@ -86,24 +103,35 @@ task withdraw(ctx, state, payload)
     -- bytes exact (as JSON they would be re-encoded). `abi_encode` builds a call, so the 4-byte
     -- selector is dropped to leave plain `abi.encode(...)` bytes.
     let call be abi_encode("receipt(address,address,uint256)", [payload["to"], token, amount])
-    let receipt be {"subtype": "withdrawal", "data_hex": hex_of(slice(call, 4, length(call)))}
-    give {"state": s1, "events": [{"user": ctx["sender"], "data": event}], "app_events": [receipt], "withdrawals": [{"token": token, "to": payload["to"], "amount": payload["amount"]}], "fuel": "50"}
+    -- The receipt and the pull-payment are PUBLIC on-chain, and they were computed from the
+    -- private payload and state: they leave that label only through an explicit `declassify`
+    -- (the guest refuses an undeclared flow with `label_violation`; `synsema code check` lists
+    -- every declassify with its reason, which is what an auditor reviews).
+    let receipt be declassify({"subtype": "withdrawal", "data_hex": hex_of(slice(call, 4, length(call)))}, "public ABI receipt: (payee, token, amount) — the same three values the pull-payment already publishes")
+    let pull be declassify({"token": token, "to": payload["to"], "amount": payload["amount"]}, "the pull-payment settles on-chain: payee, token and amount are public by construction")
+    give {"state": s1, "events": [{"user": ctx["sender"], "data": event}], "app_events": [receipt], "withdrawals": [pull], "fuel": FUEL}
 
 task process(ctx)
     let payload be ctx["payload"]
     when payload == nothing or not contains(payload, "type")
-        give {"error": "payload needs a \"type\": transfer | withdraw"}
-    match payload["type"]
+        give {"error": declassify("missing_type", "the outcome code is public on-chain"), "error_detail": "payload needs a \"type\": transfer | withdraw"}
+    -- The payload is private, so branching on it labels everything this branch produces — and
+    -- that is fine: the adapter's root sink is {app}, and only the fields that really go on-chain
+    -- (the error code, a withdrawal, an app event) ask for a `declassify` of their own. The
+    -- dispatch is NOT declassified: the fee is uniform across every branch, so it does not reveal
+    -- the instruction, and nothing else here does either.
+    let kind be text(payload["type"])
+    match kind
         is "transfer"
             give transfer(ctx, ctx["state"], payload)
         is "withdraw"
             give withdraw(ctx, ctx["state"], payload)
         otherwise
-            give {"error": "unsupported instruction type: " + text(payload["type"])}
+            give {"error": declassify("unknown_type", "the outcome code is public on-chain"), "error_detail": "unsupported instruction type: " + text(payload["type"])}
 
 task deanonymize(ctx)
     -- The authority asks for the plain picture: the report travels encrypted to it.
-    give {"report": {"balances": ctx["state"]["balances"], "nonce": ctx["state"]["nonce"]}, "fuel": "20"}
+    give {"report": {"balances": ctx["state"]["balances"], "nonce": ctx["state"]["nonce"]}, "fuel": FUEL}
 
 -- TRUSTPROCESS: a trigger contract (called back by the ProcessorEndpoint during stateUpdate)
 -- enqueued this with a clear-text ABI payload — here `(address account, address token,
@@ -112,7 +140,7 @@ task deanonymize(ctx)
 -- fails the whole request) and no app event (that would fire the trigger again).
 task trusted(ctx)
     when ctx["payload_hex"] == nothing
-        give {"error": "trusted request without a payload"}
+        give {"error": declassify("missing_payload", "the outcome code is public on-chain"), "error_detail": "trusted request without a payload"}
     let decoded be abi_decode("(address,address,uint256)", hex_bytes(ctx["payload_hex"]))
     let account be lower(decoded[0])
     let token be lower(decoded[1])
@@ -121,48 +149,137 @@ task trusted(ctx)
     let after be balance_of(state, account, token) + amount
     let updated be set_balance(state, account, token, after)
     set updated["nonce"] to updated["nonce"] + 1
-    give {"state": updated, "fuel": "40"}
+    give {"state": updated, "fuel": FUEL}
 
 -- ---------------------------------------------------------------------------------------
--- Tests (run natively: `synsema test app.syn`). The same code runs inside the guest.
+-- invariants per transition. The adapter runs this after deploy/deposit/process/trusted with
+-- ctx = {kind, before, after, deposit: {token, value, value_hex}?, withdrawals: [{token, to,
+-- Amount, amount_hex}], events}. A non-empty list (or an error) fails the request with the
+-- public code `invariant_violation`; the descriptions go to the Executor's log; the state is
+-- not applied. A bug in `transfer` can no longer sign away money.
+-- ---------------------------------------------------------------------------------------
+
+-- Per-token totals of a ledger state ({} for nothing).
+task totals_of(state)
+    -- Written inside a loop over the private state: born private, or the write is refused.
+    let totals be private({}, "app")
+    when state == nothing
+        give totals
+    each account in keys(state["balances"])
+        let mine be state["balances"][account]
+        each token in keys(mine)
+            let prev be when contains(totals, token) then totals[token] otherwise decimal("0")
+            set totals[token] to prev + decimal(mine[token])
+    give totals
+
+task invariants(ctx)
+    let broken be private([], "app")
+    let after be ctx["after"]
+    -- 1. No balance is negative.
+    each account in keys(after["balances"])
+        each token in keys(after["balances"][account])
+            when decimal(after["balances"][account][token]) < decimal("0")
+                set broken to append(broken, "negative balance for " + account + " in " + token)
+    -- 2. The nonce advances exactly once per transition.
+    -- (`before` is nothing on deploy and on load_module, the Executor's cache warm-up.)
+    when ctx["before"] != nothing and after["nonce"] != ctx["before"]["nonce"] + 1
+        set broken to append(broken, "nonce did not advance by one")
+    -- 3. Conservation per token: sum(after) == sum(before) + deposit − withdrawn. A trusted
+    --    credit is money the chain vouches for (it enters without a deposit): there, the total
+    --    may only grow.
+    let expected be totals_of(ctx["before"])
+    when contains(ctx, "deposit")
+        let d be ctx["deposit"]
+        let prev be when contains(expected, d["token"]) then expected[d["token"]] otherwise decimal("0")
+        set expected[d["token"]] to prev + decimal(d["value"])
+    each w in ctx["withdrawals"]
+        let prev be when contains(expected, w["token"]) then expected[w["token"]] otherwise decimal("0")
+        set expected[w["token"]] to prev - decimal(w["amount"])
+    let actual be totals_of(after)
+    let tokens be keys(expected)
+    each t in keys(actual)
+        when not contains(expected, t)
+            set tokens to append(tokens, t)
+    each t in tokens
+        let want be when contains(expected, t) then expected[t] otherwise decimal("0")
+        let have be when contains(actual, t) then actual[t] otherwise decimal("0")
+        when ctx["kind"] == "trusted" and have < want
+            set broken to append(broken, "trusted: money vanished for token " + t)
+        when ctx["kind"] != "trusted" and have != want
+            set broken to append(broken, "conservation broken for token " + t + ": expected " + text(want) + ", have " + text(have))
+    give broken
+
+-- ---------------------------------------------------------------------------------------
+-- tests (run natively: `synsema test app.syn`). The same code runs inside the guest.
 -- ---------------------------------------------------------------------------------------
 
 let ALICE be "0x1111111111111111111111111111111111111111"
 let BOB be "0x2222222222222222222222222222222222222222"
 
-test "deploy gives an empty ledger"
+-- Maps are shared by reference and a successful call mutates the state it was given: snapshot
+-- `before` with a deep copy when a test needs both sides of a transition.
+task copy(v)
+    give json_decode(json_encode(v))
+
+-- The ctx the adapter builds for `invariants` after a process/trusted call.
+task transition(kind, before, r, deposit)
+    let ws be []
+    when contains(r, "withdrawals")
+        each w in r["withdrawals"]
+            set ws to append(ws, {"token": w["token"], "to": w["to"], "amount": w["amount"], "amount_hex": nothing})
+    let ctx be {"kind": kind, "before": before, "after": r["state"], "withdrawals": ws, "events": when contains(r, "events") then r["events"] otherwise []}
+    when deposit != nothing
+        set ctx["deposit"] to deposit
+    give ctx
+
+test "deploy gives an empty ledger and passes the output policy through"
     let r be deploy({"app_id": 1, "params": nothing})
     assert_eq(r["state"]["balances"], {})
     assert_eq(r["state"]["nonce"], 0)
+    assert_eq(r["fuel"], FUEL)
+    assert(not contains(r, "policy"))
+    let p be deploy({"app_id": 1, "params": {"policy": {"reject": "private", "events_pad": 256}}})
+    assert_eq(p["policy"], {"reject": "private", "events_pad": 256})
+    assert_eq(invariants({"kind": "deploy", "before": nothing, "after": r["state"], "withdrawals": [], "events": []}), [])
+    assert_eq(invariants({"kind": "load_module", "before": nothing, "after": r["state"], "withdrawals": [], "events": []}), [])
 
 test "deposit credits the exact amount (wei-sized numbers stay exact)"
     let s0 be new_state(1)
+    let before be copy(s0)
     let r be deposit({"app_id": 1, "sender": ALICE, "token": ETH, "value": "1000000000000000000", "value_hex": "0xde0b6b3a7640000", "state": s0})
     assert_eq(r["state"]["balances"][ALICE][ETH], "1000000000000000000")
     assert_eq(r["state"]["nonce"], 1)
     assert_eq(length(r["events"]), 1)
     assert_eq(r["events"][0]["user"], ALICE)
+    assert_eq(invariants(transition("deposit", before, r, {"token": ETH, "value": "1000000000000000000", "value_hex": "0xde0b6b3a7640000"})), [])
 
-test "transfer moves funds and emits one event per party; overdraft is a clean error"
+test "transfer moves funds and emits one event per party; overdraft is a coded error"
     let s0 be new_state(1)
     let s1 be deposit({"app_id": 1, "sender": ALICE, "token": ETH, "value": "300", "value_hex": "0x12c", "state": s0})["state"]
+    let before be copy(s1)
     let ok be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"type": "transfer", "to": BOB, "amount": "120"}, "payload_hex": nothing, "state": s1})
     assert_eq(ok["state"]["balances"][ALICE][ETH], "180")
     assert_eq(ok["state"]["balances"][BOB][ETH], "120")
     assert_eq(length(ok["events"]), 2)
+    assert_eq(ok["fuel"], FUEL)
+    assert_eq(invariants(transition("process", before, ok, nothing)), [])
     let bad be process({"app_id": 1, "sender": BOB, "request_type": 1, "kind": "process", "payload": {"type": "transfer", "to": ALICE, "amount": "121"}, "payload_hex": nothing, "state": ok["state"]})
-    assert_eq(bad["error"], "insufficient balance for transfer")
+    assert_eq(bad["error"], "insufficient_balance")
+    assert(starts_with(bad["error_detail"], "transfer: have 120, need 121"))
 
 test "a transfer to oneself changes nothing but the nonce (no money is created)"
     let s0 be new_state(1)
     let s1 be deposit({"app_id": 1, "sender": ALICE, "token": ETH, "value": "300", "value_hex": "0x12c", "state": s0})["state"]
+    let before be copy(s1)
     let r be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"type": "transfer", "to": ALICE, "amount": "120"}, "payload_hex": nothing, "state": s1})
     assert_eq(r["state"]["balances"][ALICE][ETH], "300")
     assert_eq(r["state"]["nonce"], 2)
+    assert_eq(invariants(transition("process", before, r, nothing)), [])
 
 test "withdraw debits, asks Vela for a pull-payment and leaves a public ABI receipt"
     let s0 be new_state(1)
     let s1 be deposit({"app_id": 1, "sender": ALICE, "token": ETH, "value": "50", "value_hex": "0x32", "state": s0})["state"]
+    let before be copy(s1)
     let r be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"type": "withdraw", "to": BOB, "amount": "20"}, "payload_hex": nothing, "state": s1})
     assert_eq(r["state"]["balances"][ALICE][ETH], "30")
     assert_eq(r["withdrawals"], [{"token": ETH, "to": BOB, "amount": "20"}])
@@ -172,6 +289,7 @@ test "withdraw debits, asks Vela for a pull-payment and leaves a public ABI rece
     assert_eq(lower(decoded[0]), BOB)
     assert_eq(lower(decoded[1]), ETH)
     assert_eq(text(decoded[2]), "20")
+    assert_eq(invariants(transition("process", before, r, nothing)), [])
 
 test "deanonymize reports the plain balances"
     let s0 be new_state(1)
@@ -182,13 +300,51 @@ test "deanonymize reports the plain balances"
 test "a trusted ABI payload from a trigger contract credits an account, with no sender"
     let call be abi_encode("credit(address,address,uint256)", [BOB, ETH, decimal("15")])
     let payload_hex be hex_of(slice(call, 4, length(call)))
-    let r be trusted({"app_id": 1, "kind": "trusted", "request_type": 4, "sender": nothing, "payload": nothing, "payload_hex": payload_hex, "state": new_state(1)})
+    let before be new_state(1)
+    let r be trusted({"app_id": 1, "kind": "trusted", "request_type": 4, "sender": nothing, "payload": nothing, "payload_hex": payload_hex, "state": copy(before)})
     assert_eq(r["state"]["balances"][BOB][ETH], "15")
     assert(not contains(r, "events"))
     assert(not contains(r, "app_events"))
+    -- The chain vouches for the credit: the total may grow on a trusted transition.
+    assert_eq(invariants(transition("trusted", before, r, nothing)), [])
     let empty be trusted({"app_id": 1, "kind": "trusted", "request_type": 4, "sender": nothing, "payload": nothing, "payload_hex": nothing, "state": new_state(1)})
-    assert_eq(empty["error"], "trusted request without a payload")
+    assert_eq(empty["error"], "missing_payload")
 
 test "an unknown instruction is an error, never a silent no-op"
     let r be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"type": "mint"}, "payload_hex": nothing, "state": new_state(1)})
-    assert(starts_with(r["error"], "unsupported instruction type"))
+    assert_eq(r["error"], "unknown_type")
+    assert(starts_with(r["error_detail"], "unsupported instruction type"))
+    let untyped be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {}, "payload_hex": nothing, "state": new_state(1)})
+    assert_eq(untyped["error"], "missing_type")
+
+test "every error is a code the chain may see; the detail is not"
+    -- Codes: ^[a-z0-9_]{1,32}$ — the adapter publishes anything else as `app_error`.
+    each code in ["insufficient_balance", "missing_type", "unknown_type", "missing_payload"]
+        assert(matches(code, "[a-z0-9_]{1,32}"), code)
+
+test "invariants catch a ledger that creates or loses money, a negative balance, a stuck nonce"
+    let s0 be new_state(1)
+    let s1 be deposit({"app_id": 1, "sender": ALICE, "token": ETH, "value": "300", "value_hex": "0x12c", "state": s0})["state"]
+    let before be copy(s1)
+    -- Minted: the recipient got credited without a debit.
+    let minted be copy(s1)
+    set minted to set_balance(minted, BOB, ETH, decimal("120"))
+    set minted["nonce"] to minted["nonce"] + 1
+    let r1 be invariants({"kind": "process", "before": before, "after": minted, "withdrawals": [], "events": []})
+    assert_eq(length(r1), 1)
+    assert(starts_with(r1[0], "conservation broken for token " + ETH))
+    -- Vanished: a withdrawal of 20 that debited 30.
+    let over be copy(s1)
+    set over to set_balance(over, ALICE, ETH, decimal("270"))
+    set over["nonce"] to over["nonce"] + 1
+    let r2 be invariants({"kind": "process", "before": before, "after": over, "withdrawals": [{"token": ETH, "to": BOB, "amount": "20", "amount_hex": "0x14"}], "events": []})
+    assert_eq(length(r2), 1)
+    -- Negative balance and a nonce that did not move: two descriptions (plus conservation).
+    let neg be copy(s1)
+    set neg to set_balance(neg, ALICE, ETH, decimal("-1"))
+    let r3 be invariants({"kind": "process", "before": before, "after": neg, "withdrawals": [], "events": []})
+    assert(contains(r3, "negative balance for " + ALICE + " in " + ETH))
+    assert(contains(r3, "nonce did not advance by one"))
+    -- A deposit that was not credited.
+    let r4 be invariants({"kind": "deposit", "before": before, "after": copy(s1), "deposit": {"token": ETH, "value": "5", "value_hex": "0x5"}, "withdrawals": [], "events": []})
+    assert_eq(length(r4), 2)

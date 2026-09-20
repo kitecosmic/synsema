@@ -54,18 +54,35 @@ pub fn register_json_builtins(interp: &Interpreter) {
 
     // json_decode(text) → value: parsea un string JSON a un valor de Synsema (map/list/
     // number/text/bool/nothing). Error claro si el JSON es inválido.
+    //
+    // json_decode(text, default) → la variante TOTAL: devuelve `default` en vez de lanzar.
+    // T5 (ronda 7) — bajo etiquetas un error causado por datos privados NO se atrapa (poder
+    // recuperarse de un fallo es el bit), así que validar una carga no confiable —lo que un
+    // enclave hace con todo lo que recibe— se quedaba sin ninguna frase que escribir: ni
+    // `try/recover`, ni declarar privado el destino. Sin error no hay bit:
+    // `let d be json_decode(payload, nothing)` y después `when d == nothing`.
     interp.register_builtin(
         "json_decode",
-        1,
+        -1,
         Rc::new(|_i, args, _loc| {
+            if args.is_empty() || args.len() > 2 {
+                return Err(err("json_decode(text, default?) takes 1 or 2 arguments"));
+            }
             let s = match args.first() {
                 Some(SynValue::Text(s)) => s.to_string(),
                 Some(other) => other.to_string(),
                 None => return Err(err("json_decode: missing argument")),
             };
-            let j: serde_json::Value = serde_json::from_str(&s)
-                .map_err(|e| err(format!("json_decode: invalid JSON: {}", e)))?;
-            Ok(json_to_syn(&j))
+            match serde_json::from_str::<serde_json::Value>(&s) {
+                Ok(j) => Ok(json_to_syn(&j)),
+                Err(e) => match args.get(1) {
+                    Some(d) => Ok(d.clone()),
+                    None => Err(err(format!(
+                        "json_decode: invalid JSON: {}. To validate untrusted input without raising, pass a fallback: json_decode(<text>, nothing)",
+                        e
+                    ))),
+                },
+            }
         }),
     );
 }
@@ -220,6 +237,20 @@ pub fn syn_to_json(v: &SynValue) -> Json {
         }
         // `array` en un body JSON → lista anidada (NumPy-like). Batch 5.
         SynValue::Array(a) => array_view_to_json(&a.view()),
+        // `private` en un body serializado: fail-closed, como el secret. Como BUILTIN,
+        // `json_encode` nunca ve un Private (el despacho etiquetado del intérprete le entrega
+        // El valor sin etiquetas y envuelve el texto resultante con ellas). Llegar acá con un
+        // private significa que un sumidero del host (respuesta HTTP/SSE) serializó sin pasar
+        // por `labels::check_flow` + `labels::strip_deep`: se redacta y se avisa, no se filtra.
+        SynValue::Private(p) => {
+            // T5 (ronda 8): el aviso nombra los principales DECLARADOS, no los de ESTE valor.
+            let _ = p;
+            eprintln!(
+                "[serve] warning: {} was redacted in a serialized response/SSE body (the sink did not check_flow/strip_deep)",
+                synsema_core::labels::redacted_display()
+            );
+            Json::Str("[redacted]".to_string())
+        }
         SynValue::Server(s) => match &**s {
             // _RAW/_ENVELOPE serializados como data (fuera del contrato) → su dict.
             ServerValue::Raw { body, content_type, status } => obj(vec![
@@ -283,7 +314,7 @@ pub fn json_to_syn(v: &serde_json::Value) -> SynValue {
 }
 
 // =========================================================
-// Árbol de contenido semántico (vocabulario content()): accesores + su vista JSON.
+// árbol de contenido semántico (vocabulario content()): accesores + su vista JSON.
 // Los renderers HTML/Markdown del árbol viven en server.rs (los usa serve); estos
 // accesores son puros y los comparten server, charts y el perfil wasm.
 // =========================================================
@@ -443,4 +474,58 @@ pub(crate) fn make_node(kind: &str, fields: Vec<(&str, SynValue)>) -> SynValue {
         m.insert(k.to_string(), v);
     }
     SynValue::Server(Rc::new(ServerValue::Node(Rc::new(RefCell::new(m)))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use synsema_core::tokens::SourceLocation;
+    use synsema_core::types::syn_text;
+
+    /// `Control` no es Debug a propósito (transporta valores del lenguaje): desempaquetar con
+    /// el mensaje del error, no con `unwrap`.
+    fn ok(r: Result<SynValue, Control>) -> SynValue {
+        match r {
+            Ok(v) => v,
+            Err(Control::Error(e)) => panic!("{}", e),
+            Err(_) => panic!("control flow inesperado"),
+        }
+    }
+
+    fn decode(args: &[SynValue]) -> Result<SynValue, Control> {
+        let mut interp = Interpreter::new();
+        register_json_builtins(&interp);
+        let f = match interp.global_env.borrow().bindings.get("json_decode") {
+            Some(SynValue::Builtin(bt)) => bt.func.clone(),
+            _ => panic!("json_decode no registrado"),
+        };
+        let loc = SourceLocation { file: "<test>".to_string(), line: 1, column: 1, offset: 0 };
+        f(&mut interp, args, &loc)
+    }
+
+    /// Auditoría ronda 7: sin una variante TOTAL no quedaba forma de validar una carga
+    /// malformada bajo etiquetas — el error causado por datos privados no se atrapa, así que
+    /// `try/recover` no sirve y declarar privado el destino tampoco. Con el segundo argumento
+    /// no hay error, así que no hay bit, y el programa valida sin excepciones.
+    #[test]
+    fn json_decode_has_a_total_variant() {
+        // Sin fallback: error, y el mensaje enseña la salida.
+        let e = match decode(&[syn_text("{roto")]) {
+            Err(Control::Error(e)) => e.message,
+            _ => panic!("un JSON inválido sin fallback tiene que fallar"),
+        };
+        assert!(e.contains("json_decode(<text>, nothing)"), "{}", e);
+        // Con fallback: lo devuelve en vez de lanzar.
+        let v = ok(decode(&[syn_text("{roto"), SynValue::Nothing]));
+        assert!(matches!(v, SynValue::Nothing));
+        let v = ok(decode(&[syn_text("{roto"), syn_text("bad")]));
+        assert_eq!(v.to_string(), "bad");
+        // Y un JSON válido pasa igual, con o sin fallback.
+        let a = ok(decode(&[syn_text("{\"a\": 1}")])).to_string();
+        let b = ok(decode(&[syn_text("{\"a\": 1}"), SynValue::Nothing])).to_string();
+        assert_eq!(a, b);
+        // Aridad fuera de rango: error claro.
+        assert!(decode(&[]).is_err());
+        assert!(decode(&[syn_text("1"), SynValue::Nothing, SynValue::Nothing]).is_err());
+    }
 }

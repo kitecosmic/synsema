@@ -1,7 +1,7 @@
 # Synsema Human Interaction
 
 ## Primitives
-```
+```synsema
 approve "Deploy to production?"                    -- yes/no gate
 confirm "Send email to 500 customers?"             -- confirmation
 show data as "Preview"                             -- display to human
@@ -9,7 +9,7 @@ let choice be ask "Which env?" with ["staging", "prod"]  -- question
 ```
 
 ## As expressions (return values)
-```
+```synsema
 let approved be approve "Large payment: $" + text(amount)
 when approved
     process_payment()
@@ -49,7 +49,7 @@ that no human actually answered. Don't rely on free-text `ask` for input in thos
 
 For raw stdin that works with pipes/redirection, use **`read_line(prompt?)`** (returns the line, or
 `nothing` on EOF) — see [builtins.md](builtins.md):
-```
+```synsema
 let name be read_line("Your name: ")   -- works with `printf 'Ana\n' | synsema run f.syn`
 ```
 For an **interactive** prompt (a chat CLI, a `/` palette that filters as you type, history, a
@@ -59,7 +59,7 @@ see [processes.md](processes.md) § The program's own terminal. `ask`/`approve`/
 working while it is open (raw mode is suspended while the human answers).
 
 For config-style input, `env()` / a file also work and are easy to test:
-```
+```synsema
 let name be env("NAME", "")            -- works in CI, pipes, and tests
 ```
 

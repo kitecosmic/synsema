@@ -1,4 +1,4 @@
-//! E2E de discovery (spec `specs/discovery-openapi.md`): `/openapi.json`, `/sitemap.xml`,
+//! E2E de discovery: `/openapi.json`, `/sitemap.xml`,
 //! `/docs` (negociado), `Sitemap:` en `/robots.txt` y las secciones nuevas de
 //! `/llms.txt` — contra un server REAL (`run_serve_program`), y las tres reglas
 //! comunes: gate `private`, `docs off`, override por route declarada.

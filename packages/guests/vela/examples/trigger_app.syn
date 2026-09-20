@@ -15,10 +15,15 @@
 --   deploy: synsema run examples/client/vela_client.syn -- deploy <wasm> '{"triggerContract":"0x…"}' 0x…
 --
 -- Amounts are exact decimals kept as text; lock ids are deterministic (a counter in the low
--- bytes of the bytes16) because there is no randomness in the enclave.
+-- bytes of the bytes16) because there is no randomness in the enclave. Errors are codes (the
+-- sentence goes to `error_detail`, log only: the fee and `errorMsg` of a request are public
+-- On-chain), there is ONE fuel for the whole app, and `invariants` checks that balances + locks
+-- account for every wei after each transition.
 intent: "vela guest: execution pool — lock, run a call from the pool, credit the remainder"
 
 let ETH be "0x0000000000000000000000000000000000000000"
+-- One fuel for every entry point: a per-branch value would name the instruction on-chain.
+let FUEL be "50"
 
 task hex_bytes(h)
     give bytes(slice(h, 2, length(h)), "hex")
@@ -55,57 +60,63 @@ task set_balance(state, account, amount)
 
 -- ---- entry points ----
 
--- constructorParams: {"triggerContract": "0x…"} — the same address passed on-chain to
--- submitDeployRequestWithTrigger; the app stamps it into every Withdrawal.
+-- ConstructorParams: {"triggerContract": "0x…"} — the same address passed on-chain to
+-- submitDeployRequestWithTrigger; the app stamps it into every Withdrawal. An optional
+-- {"policy": {...}} (reject: "private", events_pad, events_min, state_pad, fuel) passes through to the
+-- adapter, which keeps it under `_vela` in the state.
 task deploy(ctx)
     let params be ctx["params"]
     when params == nothing or not contains(params, "triggerContract") or params["triggerContract"] == nothing
-        give {"error": "deploy needs constructorParams {\"triggerContract\": \"0x…\"}"}
+        give {"error": declassify("missing_trigger", "the outcome code is public on-chain"), "error_detail": "deploy needs constructorParams {\"triggerContract\": \"0x…\"}"}
     let trigger be lower(params["triggerContract"])
     when length(trigger) != 42 or not starts_with(trigger, "0x")
-        give {"error": "invalid trigger address " + text(params["triggerContract"])}
-    give {"state": new_state(ctx["app_id"], trigger), "fuel": "5"}
+        give {"error": declassify("invalid_trigger", "the outcome code is public on-chain"), "error_detail": "invalid trigger address " + text(params["triggerContract"])}
+    let r be {"state": new_state(ctx["app_id"], trigger), "fuel": FUEL}
+    when contains(params, "policy") and params["policy"] != nothing
+        set r["policy"] to params["policy"]
+    give r
 
 -- Cache warm-up after an Executor restart; the state returned here is discarded.
 task load_module(ctx)
-    give {"state": new_state(ctx["app_id"], ""), "fuel": "5"}
+    give {"state": new_state(ctx["app_id"], ""), "fuel": FUEL}
 
 task deposit(ctx)
     when lower(ctx["token"]) != ETH
-        give {"error": "the pool takes ETH only"}
+        give {"error": declassify("eth_only", "the outcome code is public on-chain"), "error_detail": "the pool takes ETH only, got " + text(ctx["token"])}
     let state be ctx["state"]
     let after be balance_of(state, ctx["sender"]) + decimal(ctx["value"])
     let s1 be set_balance(state, ctx["sender"], after)
     set s1["nonce"] to s1["nonce"] + 1
     let event be {"type": "deposit", "amount": ctx["value"], "balance": text(after), "nonce": s1["nonce"]}
-    give {"state": s1, "events": [{"user": ctx["sender"], "data": event}], "fuel": "35"}
+    give {"state": s1, "events": [{"user": ctx["sender"], "data": event}], "fuel": FUEL}
 
 task process(ctx)
     let payload be ctx["payload"]
     when payload == nothing or not contains(payload, "command")
-        give {"error": "payload needs a \"command\": execute"}
-    match payload["command"]
+        give {"error": declassify("missing_command", "the outcome code is public on-chain"), "error_detail": "payload needs a \"command\": execute"}
+    let kind be text(payload["command"])
+    match kind
         is "execute"
             give execute(ctx, ctx["state"], payload)
         otherwise
-            give {"error": "unsupported command: " + text(payload["command"])}
+            give {"error": declassify("unknown_command", "the outcome code is public on-chain"), "error_detail": "unsupported command: " + text(payload["command"])}
 
 -- {"command": "execute", "execute": {"target": "0x…", "value": "0x…" | "wei", "data": "0x…"}}
 task execute(ctx, state, payload)
     when state["trigger"] == ""
-        give {"error": "this app was deployed without a trigger contract"}
+        give {"error": declassify("no_trigger", "the outcome code is public on-chain"), "error_detail": "this app was deployed without a trigger contract"}
     when not contains(payload, "execute") or payload["execute"] == nothing
-        give {"error": "execute instruction is missing"}
+        give {"error": declassify("missing_instruction", "the outcome code is public on-chain"), "error_detail": "execute instruction is missing"}
     let ins be payload["execute"]
     when not contains(ins, "target") or ins["target"] == nothing
-        give {"error": "execute needs a target address"}
+        give {"error": declassify("missing_target", "the outcome code is public on-chain"), "error_detail": "execute needs a target address"}
     let target be lower(ins["target"])
     let value be amount_of(when contains(ins, "value") then ins["value"] otherwise "0")
     let data be when contains(ins, "data") and ins["data"] != nothing and ins["data"] != "0x" then hex_bytes(ins["data"]) otherwise bytes([])
     let sender be ctx["sender"]
     let balance be balance_of(state, sender)
     when balance < value
-        give {"error": "insufficient balance: " + text(balance) + " < " + text(value)}
+        give {"error": declassify("insufficient_balance", "the outcome code is public on-chain"), "error_detail": "insufficient balance: " + text(balance) + " < " + text(value)}
     let s1 be set_balance(state, sender, balance - value)
     set s1["lock_nonce"] to s1["lock_nonce"] + 1
     set s1["nonce"] to s1["nonce"] + 1
@@ -116,41 +127,100 @@ task execute(ctx, state, payload)
     set s1["locks"] to locks
     -- The app event the trigger decodes with abi.decode(events[0], (bytes16, address, uint256, bytes)).
     let call be abi_encode("execute(bytes16,address,uint256,bytes)", [lock_id, target, value, data])
-    let app_event be {"subtype": "execute_requested", "data_hex": hex_of(slice(call, 4, length(call)))}
+    -- Both are public on-chain (the trigger decodes the app event; the funds move to the trigger
+    -- contract) and were computed from the private payload/state: an explicit `declassify` each,
+    -- Or the guest refuses the flow with `label_violation`.
+    let app_event be declassify({"subtype": "execute_requested", "data_hex": hex_of(slice(call, 4, length(call)))}, "the trigger runs this call from the pool: (lock id, target, value, calldata) are public — the caller's balance is not")
+    let pull be declassify({"to": s1["trigger"], "amount": text(value)}, "the pull-payment to the trigger is public: the trigger's address and the locked amount")
     let event be {"type": "execute_requested", "lock_id": lock_key, "target": target, "value": text(value), "balance": text(balance - value), "nonce": s1["nonce"]}
-    give {"state": s1, "events": [{"user": sender, "data": event}], "app_events": [app_event], "withdrawals": [{"to": s1["trigger"], "amount": text(value)}], "fuel": "50"}
+    give {"state": s1, "events": [{"user": sender, "data": event}], "app_events": [app_event], "withdrawals": [pull], "fuel": FUEL}
 
 -- TRUSTPROCESS from the trigger: abi.encode(bytes16 lockId, uint256 remain, uint8 outcome).
 -- No sender, no app events (the loop must end here), the payload in clear.
 task trusted(ctx)
     when ctx["payload_hex"] == nothing
-        give {"error": "trusted request without a payload"}
+        give {"error": declassify("missing_payload", "the outcome code is public on-chain"), "error_detail": "trusted request without a payload"}
     let decoded be abi_decode("(bytes16,uint256,uint8)", hex_bytes(ctx["payload_hex"]))
     let lock_key be hex_of(decoded[0])
     let remain be decimal(text(decoded[1]))
     let outcome be when decoded[2] == 0 then "success" otherwise "failure"
     let state be ctx["state"]
     when not contains(state["locks"], lock_key)
-        give {"error": "unknown or already-resolved lock " + lock_key}
+        give {"error": declassify("unknown_lock", "the outcome code is public on-chain"), "error_detail": "unknown or already-resolved lock " + lock_key}
     let lock be state["locks"][lock_key]
     let owner be lock["owner"]
     let after be balance_of(state, owner) + remain
     let s1 be set_balance(state, owner, after)
-    -- Idempotency: a replayed TRUSTPROCESS finds no lock.
-    let kept be {}
+    -- Idempotency: a replayed TRUSTPROCESS finds no lock. Written under a loop over the private
+    -- state: born private.
+    let kept be private({}, "app")
     each k in keys(s1["locks"])
         when k != lock_key
             set kept[k] to s1["locks"][k]
     set s1["locks"] to kept
     set s1["nonce"] to s1["nonce"] + 1
     let event be {"type": "execution_outcome", "lock_id": lock_key, "outcome": outcome, "locked": lock["amount"], "remain": text(remain), "balance": text(after), "nonce": s1["nonce"]}
-    give {"state": s1, "events": [{"user": owner, "data": event}], "fuel": "50"}
+    give {"state": s1, "events": [{"user": owner, "data": event}], "fuel": FUEL}
 
 task deanonymize(ctx)
-    give {"report": {"balances": ctx["state"]["balances"], "locks": ctx["state"]["locks"], "nonce": ctx["state"]["nonce"]}, "fuel": "20"}
+    give {"report": {"balances": ctx["state"]["balances"], "locks": ctx["state"]["locks"], "nonce": ctx["state"]["nonce"]}, "fuel": FUEL}
 
 -- ---------------------------------------------------------------------------------------
--- Tests (run natively: `synsema test examples/trigger_app.syn`).
+-- invariants per transition. The adapter runs this after deploy/deposit/process/trusted with
+-- ctx = {kind, before, after, deposit: {token, value, value_hex}?, withdrawals: [{token, to,
+-- Amount, amount_hex}], events}; a non-empty list fails the request as `invariant_violation`
+-- And the state is not applied. Every wei is in a balance or in a lock (in flight at the trigger):
+--   Deposit  Δbalances = +value, locks unchanged
+--   execute  Δbalances = −withdrawn, Δlocks = +withdrawn (the withdrawal goes to the trigger)
+--   Trusted  Δlocks = −lock, Δbalances = +remain ≤ lock — the difference was spent by the call
+-- ---------------------------------------------------------------------------------------
+
+task sum_balances(state)
+    -- Accumulated over the private state: born private.
+    let total be private(decimal("0"), "app")
+    when state == nothing
+        give total
+    each account in keys(state["balances"])
+        set total to total + decimal(state["balances"][account])
+    give total
+
+task sum_locks(state)
+    let total be private(decimal("0"), "app")
+    when state == nothing
+        give total
+    each k in keys(state["locks"])
+        set total to total + decimal(state["locks"][k]["amount"])
+    give total
+
+task invariants(ctx)
+    let broken be private([], "app")
+    let before be ctx["before"]
+    let after be ctx["after"]
+    each account in keys(after["balances"])
+        when decimal(after["balances"][account]) < decimal("0")
+            set broken to append(broken, "negative balance for " + account)
+    when ctx["kind"] == "deploy" or ctx["kind"] == "load_module"
+        give broken
+    when after["nonce"] != before["nonce"] + 1
+        set broken to append(broken, "nonce did not advance by one")
+    let withdrawn be decimal("0")
+    each w in ctx["withdrawals"]
+        set withdrawn to withdrawn + decimal(w["amount"])
+        when w["to"] != after["trigger"]
+            set broken to append(broken, "a withdrawal left the pool for " + text(w["to"]) + ", not the trigger")
+    let deposited be when contains(ctx, "deposit") then decimal(ctx["deposit"]["value"]) otherwise decimal("0")
+    let d_balances be sum_balances(after) - sum_balances(before)
+    let d_locks be sum_locks(after) - sum_locks(before)
+    when ctx["kind"] == "deposit" and (d_balances != deposited or d_locks != decimal("0"))
+        set broken to append(broken, "deposit: balances moved by " + text(d_balances) + " for a deposit of " + text(deposited) + ", locks by " + text(d_locks))
+    when ctx["kind"] == "process" and (d_balances != decimal("0") - withdrawn or d_locks != withdrawn)
+        set broken to append(broken, "execute: balances moved by " + text(d_balances) + " and locks by " + text(d_locks) + " for a withdrawal of " + text(withdrawn))
+    when ctx["kind"] == "trusted" and (withdrawn != decimal("0") or d_locks > decimal("0") or d_balances > decimal("0") - d_locks)
+        set broken to append(broken, "trusted: balances moved by " + text(d_balances) + " while locks moved by " + text(d_locks))
+    give broken
+
+-- ---------------------------------------------------------------------------------------
+-- tests (run natively: `synsema test examples/trigger_app.syn`).
 -- ---------------------------------------------------------------------------------------
 
 let ALICE be "0x1111111111111111111111111111111111111111"
@@ -167,13 +237,46 @@ task run_execute(state, value)
     let payload be {"command": "execute", "execute": {"target": TARGET, "value": value, "data": "0x"}}
     give process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": payload, "payload_hex": nothing, "state": state})
 
-test "deploy needs the trigger address; load_module does not"
+-- Maps are shared by reference and a successful call mutates the state it was given: snapshot
+-- `before` with a deep copy when a test needs both sides of a transition.
+task copy(v)
+    give json_decode(json_encode(v))
+
+-- The ctx the adapter builds for `invariants`; withdrawals normalized like the adapter does.
+task transition(kind, before, r, deposit)
+    let ws be []
+    when contains(r, "withdrawals")
+        each w in r["withdrawals"]
+            set ws to append(ws, {"token": ETH, "to": w["to"], "amount": w["amount"], "amount_hex": nothing})
+    let ctx be {"kind": kind, "before": before, "after": r["state"], "withdrawals": ws, "events": when contains(r, "events") then r["events"] otherwise []}
+    when deposit != nothing
+        set ctx["deposit"] to deposit
+    give ctx
+
+test "deploy needs the trigger address; load_module does not; the policy passes through"
     assert_eq(pool()["trigger"], TRIGGER)
-    assert(starts_with(deploy({"app_id": 1, "params": nothing})["error"], "deploy needs"))
+    let bare be deploy({"app_id": 1, "params": nothing})
+    assert_eq(bare["error"], "missing_trigger")
+    assert(starts_with(bare["error_detail"], "deploy needs"))
+    assert_eq(deploy({"app_id": 1, "params": {"triggerContract": "0x12"}})["error"], "invalid_trigger")
     assert_eq(load_module({"app_id": 1, "params": nothing})["state"]["trigger"], "")
+    let p be deploy({"app_id": 1, "params": {"triggerContract": TRIGGER, "policy": {"events_min": 1}}})
+    assert_eq(p["policy"], {"events_min": 1})
+    assert_eq(p["fuel"], FUEL)
+    assert_eq(invariants({"kind": "deploy", "before": nothing, "after": p["state"], "withdrawals": [], "events": []}), [])
+    assert_eq(invariants({"kind": "load_module", "before": nothing, "after": p["state"], "withdrawals": [], "events": []}), [])
+
+test "deposit takes ETH only and keeps every wei in a balance"
+    let before be pool()
+    let r be deposit({"app_id": 1, "sender": ALICE, "token": ETH, "value": "1000", "value_hex": "0x3e8", "state": copy(before)})
+    assert_eq(r["state"]["balances"][ALICE], "1000")
+    assert_eq(invariants(transition("deposit", before, r, {"token": ETH, "value": "1000", "value_hex": "0x3e8"})), [])
+    let token be deposit({"app_id": 1, "sender": ALICE, "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", "value": "5", "value_hex": "0x5", "state": pool()})
+    assert_eq(token["error"], "eth_only")
 
 test "execute locks the funds, pays the trigger and emits the ABI call as a public event"
-    let r be run_execute(funded(), "0x12c")
+    let before be funded()
+    let r be run_execute(copy(before), "0x12c")
     assert_eq(r["state"]["balances"][ALICE], "700")
     assert_eq(r["withdrawals"], [{"to": TRIGGER, "amount": "300"}])
     assert_eq(length(r["app_events"]), 1)
@@ -185,16 +288,24 @@ test "execute locks the funds, pays the trigger and emits the ABI call as a publ
     assert_eq(length(decoded[3]), 0)
     assert_eq(r["state"]["locks"]["0x00000000000000000000000000000001"]["amount"], "300")
     assert_eq(r["events"][0]["data"]["type"], "execute_requested")
+    assert_eq(r["fuel"], FUEL)
+    assert_eq(invariants(transition("process", before, r, nothing)), [])
 
-test "an overdraft, a missing target and an unknown command are clean errors"
-    assert(starts_with(run_execute(funded(), "2000")["error"], "insufficient balance"))
+test "an overdraft, a missing target and an unknown command are coded errors; the balance stays in the detail"
+    let over be run_execute(funded(), "2000")
+    assert_eq(over["error"], "insufficient_balance")
+    assert_eq(over["error_detail"], "insufficient balance: 1000 < 2000")
     let no_target be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"command": "execute", "execute": {"value": "1"}}, "payload_hex": nothing, "state": funded()})
-    assert_eq(no_target["error"], "execute needs a target address")
+    assert_eq(no_target["error"], "missing_target")
     let other be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"command": "mint"}, "payload_hex": nothing, "state": funded()})
-    assert(starts_with(other["error"], "unsupported command"))
+    assert_eq(other["error"], "unknown_command")
+    assert(starts_with(other["error_detail"], "unsupported command"))
+    let none be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {}, "payload_hex": nothing, "state": funded()})
+    assert_eq(none["error"], "missing_command")
 
 test "the trusted payload credits the remainder to the lock owner and clears the lock"
     let locked be run_execute(funded(), "300")["state"]
+    let before be copy(locked)
     let call be abi_encode("f(bytes16,uint256,uint8)", [int_to_bytes(1, 16), decimal("120"), 0])
     let payload_hex be hex_of(slice(call, 4, length(call)))
     let r be trusted({"app_id": 1, "kind": "trusted", "request_type": 4, "sender": nothing, "payload": nothing, "payload_hex": payload_hex, "state": locked})
@@ -204,18 +315,51 @@ test "the trusted payload credits the remainder to the lock owner and clears the
     assert_eq(r["events"][0]["user"], ALICE)
     assert_eq(r["events"][0]["data"]["outcome"], "success")
     assert_eq(r["events"][0]["data"]["remain"], "120")
+    -- 300 locked, 120 back: the 180 the call spent left the pool, nothing was minted.
+    assert_eq(invariants(transition("trusted", before, r, nothing)), [])
     let replay be trusted({"app_id": 1, "kind": "trusted", "request_type": 4, "sender": nothing, "payload": nothing, "payload_hex": payload_hex, "state": r["state"]})
-    assert(starts_with(replay["error"], "unknown or already-resolved lock"))
+    assert_eq(replay["error"], "unknown_lock")
+    assert(starts_with(replay["error_detail"], "unknown or already-resolved lock"))
+    let empty be trusted({"app_id": 1, "kind": "trusted", "request_type": 4, "sender": nothing, "payload": nothing, "payload_hex": nothing, "state": r["state"]})
+    assert_eq(empty["error"], "missing_payload")
 
 test "a failed call comes back as outcome failure with everything returned"
     let locked be run_execute(funded(), "300")["state"]
+    let before be copy(locked)
     let call be abi_encode("f(bytes16,uint256,uint8)", [int_to_bytes(1, 16), decimal("300"), 1])
     let r be trusted({"app_id": 1, "kind": "trusted", "request_type": 4, "sender": nothing, "payload": nothing, "payload_hex": hex_of(slice(call, 4, length(call))), "state": locked})
     assert_eq(r["state"]["balances"][ALICE], "1000")
     assert_eq(r["events"][0]["data"]["outcome"], "failure")
+    assert_eq(invariants(transition("trusted", before, r, nothing)), [])
 
 test "deanonymize reports balances and open locks"
     let locked be run_execute(funded(), "300")["state"]
     let r be deanonymize({"app_id": 1, "sender": ALICE, "request_type": 2, "kind": "deanonymize", "payload": {}, "payload_hex": nothing, "state": locked})
     assert_eq(r["report"]["balances"][ALICE], "700")
     assert_eq(length(keys(r["report"]["locks"])), 1)
+    assert_eq(r["fuel"], FUEL)
+
+test "invariants catch a lock that does not match its withdrawal, a trusted credit above the lock, a leak"
+    let before be funded()
+    -- Execute that withdrew 300 but locked 200 (100 wei leaked).
+    let r be run_execute(copy(before), "300")
+    let leaky be copy(r["state"])
+    set leaky["locks"]["0x00000000000000000000000000000001"] to {"owner": ALICE, "amount": "200"}
+    let r1 be invariants({"kind": "process", "before": before, "after": leaky, "withdrawals": [{"token": ETH, "to": TRIGGER, "amount": "300", "amount_hex": "0x12c"}], "events": []})
+    assert_eq(length(r1), 1)
+    assert(starts_with(r1[0], "execute: balances moved by -300 and locks by 200"))
+    -- A withdrawal to somebody other than the trigger.
+    let r2 be invariants({"kind": "process", "before": before, "after": r["state"], "withdrawals": [{"token": ETH, "to": TARGET, "amount": "300", "amount_hex": "0x12c"}], "events": []})
+    assert_eq(length(r2), 1)
+    -- Trusted that credited more than the lock held.
+    let locked be copy(r["state"])
+    let generous be copy(locked)
+    set generous to set_balance(generous, ALICE, decimal("1100"))
+    set generous["locks"] to {}
+    set generous["nonce"] to generous["nonce"] + 1
+    let r3 be invariants({"kind": "trusted", "before": locked, "after": generous, "withdrawals": [], "events": []})
+    assert_eq(length(r3), 1)
+    assert(starts_with(r3[0], "trusted: balances moved by 400 while locks moved by -300"))
+    -- A deposit that was not credited.
+    let r4 be invariants({"kind": "deposit", "before": before, "after": copy(before), "deposit": {"token": ETH, "value": "5", "value_hex": "0x5"}, "withdrawals": [], "events": []})
+    assert_eq(length(r4), 2)

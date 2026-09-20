@@ -7,14 +7,32 @@ on:
     branches: ["main"]
   pull_request:
 
+# The GITHUB_TOKEN every job gets: read the repository, nothing else. Without this block it takes
+# the repository/organisation default, which can be read-write on every push and pull request —
+# including from a fork's branch. No job here writes anything to GitHub: they build, test, and
+# download public releases. A job that ever needs more asks for it itself.
+permissions:
+  contents: read
+
+# Una corrida por rama/PR: un push nuevo cancela el anterior, que ya no interesa (auditoría
+# ronda 4). Acá sí se cancela — a diferencia del release, una corrida de CI a medias no deja nada
+# publicado — y de paso el runner deja de competir por sí mismo.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
+        with:
+          toolchain: "1.96.0"
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -24,7 +42,7 @@ jobs:
       - name: Test
         run: cargo test --locked --manifest-path engine/Cargo.toml --workspace
 
-  # Escritorio (specs/build-serve-desktop.md §5/§8): la única plataforma donde el CI corre el
+  # Escritorio: la única plataforma donde el CI corre el
   # motor REAL fuera de Linux. Cubre el riesgo "firma ad-hoc + bytes anexados" en Apple Silicon
   # (ld64 firma ad-hoc todo binario arm64 y el kernel mata los inválidos con "Killed: 9"): un
   # binario salido de `synsema build` tiene que seguir corriendo, y el `.app` de `--bundle`
@@ -33,10 +51,14 @@ jobs:
   macos-desktop:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
+        with:
+          toolchain: "1.96.0"
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -86,12 +108,15 @@ jobs:
   wasm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
+        with:
+          toolchain: "1.96.0"
           targets: wasm32-wasip1
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -192,21 +217,24 @@ jobs:
   wasm-web:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
+        with:
+          toolchain: "1.96.0"
           targets: wasm32-unknown-unknown
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.22"
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -223,7 +251,7 @@ jobs:
         run: node tests/wasm_everyday.probe.mjs engine/target/wasm32-unknown-unknown/wasm/synsema_wasm_web.wasm
       - name: Probe under Python (wasmtime-py)
         run: |
-          pip install wasmtime
+          pip install 'wasmtime==48.0.0'
           PYTHONIOENCODING=utf-8 python examples/embed/python/demo.py engine/target/wasm32-unknown-unknown/wasm/synsema_wasm_web.wasm
       - name: Probe under Go (wazero)
         working-directory: examples/embed/go
@@ -240,58 +268,87 @@ jobs:
   vela-guest:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
+        with:
+          toolchain: "1.96.0"
           targets: wasm32-wasip1
       # Node 20 o >= 24 para la sonda WASI: Node 22.x (V8 12.4) segfaultea de forma intermitente al
       # correr este módulo (carrera del tier-up concurrente Liftoff->TurboFan; reproducido con 22.23.2
       # en Linux, 1 corrida de 3; cualquier flag que apague el tiering dinámico lo evita). Es el host,
       # no el guest: wasmtime-go v1.0.0 -el runtime del Executor- no se ve afectado y se prueba abajo.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
-      - uses: actions/setup-go@v5
+      # Go 1.24: wasmtime-go v47 (the probe on Vela dev's runtime) needs >= 1.23; Vela dev itself is on 1.24.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
-          go-version: "1.22"
-          cache-dependency-path: packages/guests/vela/tests/wasmtime-go/go.sum
+          go-version: "1.24"
+          cache-dependency-path: |
+            packages/guests/vela/tests/wasmtime-go/go.sum
+            packages/guests/vela/tests/wasmtime-go-v47/go.sum
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             engine/target
-          key: ${{ runner.os }}-cargo-vela-guest-${{ hashFiles('engine/Cargo.lock', 'packages/guests/vela/Cargo.lock') }}
+            packages/guests/vela/tools/wasi-stub/target
+          key: ${{ runner.os }}-cargo-vela-guest-${{ hashFiles('engine/Cargo.lock', 'packages/guests/vela/Cargo.lock', 'packages/guests/vela/tools/wasi-stub/Cargo.lock') }}
       - name: Build native synsema (to test the example app)
         run: cargo build --locked --manifest-path engine/Cargo.toml -p synsema-cli
       - name: Test the example apps and the client natively (ledger, novaw-compatible payment app, execution pool, client)
         run: |
-          engine/target/debug/synsema test packages/guests/vela/app.syn
-          engine/target/debug/synsema test packages/guests/vela/examples/payment_app.syn
-          engine/target/debug/synsema test packages/guests/vela/examples/trigger_app.syn
-          engine/target/debug/synsema test packages/guests/vela/examples/client/vela_client.syn
+          engine/target/debug/synsema test --labels packages/guests/vela/app.syn
+          engine/target/debug/synsema test --labels packages/guests/vela/examples/payment_app.syn
+          engine/target/debug/synsema test --labels packages/guests/vela/examples/trigger_app.syn
+          engine/target/debug/synsema test --labels packages/guests/vela/examples/client/vela_client.syn
       - name: Build the Vela guest (wasm32-wasip1, profile wasm)
         # Target y target-dir explícitos: el .cargo/config.toml del crate sólo aplica cuando cargo corre
         # DENTRO de packages/guests/vela; desde la raíz del repo hay que decirlos (si no, compila un
         # cdylib nativo en packages/guests/vela/target y la sonda no encuentra el .wasm).
         run: cargo build --locked --manifest-path packages/guests/vela/Cargo.toml --profile wasm --target wasm32-wasip1 --target-dir engine/target
-      - name: Probe under Node WASI (imports, exports, every entry point, formats, determinism)
-        run: node tests/vela_guest.probe.mjs engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm
-      - name: Probe under wasmtime-go v1.0.0 (the Executor's exact runtime)
-        working-directory: packages/guests/vela/tests/wasmtime-go
-        run: go run . ../../../../../engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm
-      - name: The app slot — embed another program into the built module without a compiler, and probe it
-        # tools/embed.syn finds the slot in the .wasm and overwrites it: what a kit does with the
-        # release asset instead of building. The result must load and answer like a fresh build.
+      # Vela v0.3.0 (pkg/wasm/guest_imports.go) refuses at load any module that DECLARES a WASI import
+      # outside a closed set of eight. Rust's std links fd_*/path_*/poll_oneoff through std::fs even
+      # though the `stdout` ceiling (no_fs) never reaches them, so the built module is post-processed:
+      # tools/wasi-stub replaces every import outside the set by a local stub returning ENOSYS
+      # (fd_prestat_get: EBADF, which ends std's preopen scan cleanly). From here on EVERY probe runs
+      # on the stubbed module — it is what the release publishes and what a kit embeds its app into.
+      # The tool runs from the repo root on purpose: the guest's .cargo/config.toml would otherwise
+      # cross-compile the tool itself to wasm32-wasip1.
+      - name: Stub the WASI imports Vela v0.3.0 refuses (tools/wasi-stub)
         run: |
-          engine/target/debug/synsema test packages/guests/vela/tools/embed.syn
-          engine/target/debug/synsema run packages/guests/vela/tools/embed.syn -- engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm packages/guests/vela/examples/payment_app.syn /tmp/payment.wasm
+          cargo test --locked --manifest-path packages/guests/vela/tools/wasi-stub/Cargo.toml
+          cargo run --locked --manifest-path packages/guests/vela/tools/wasi-stub/Cargo.toml -- engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm engine/target/wasm32-wasip1/wasm/synsema_vela_guest.stubbed.wasm
+      - name: Probe under Node WASI (imports, exports, every entry point, formats, determinism)
+        run: node tests/vela_guest.probe.mjs engine/target/wasm32-wasip1/wasm/synsema_vela_guest.stubbed.wasm
+      - name: Probe under wasmtime-go v1.0.0 (the v0.2.0 Executor's runtime; v0.3.0's import check; compile + instantiate timings)
+        working-directory: packages/guests/vela/tests/wasmtime-go
+        run: go run . ../../../../../engine/target/wasm32-wasip1/wasm/synsema_vela_guest.stubbed.wasm
+      # wasmtime-go v47 is Vela dev's runtime: pinned wasm features, GC off, the closed import set
+      # checked before instantiation, epoch interruption with a 10 s bound per guest operation
+      # (instantiation included). The probe configures it flag by flag as the Executor does.
+      - name: "Probe under wasmtime-go v47 (Vela dev / v0.3.0's runtime: pinned engine, closed imports, epoch bound)"
+        working-directory: packages/guests/vela/tests/wasmtime-go-v47
+        run: go run . ../../../../../engine/target/wasm32-wasip1/wasm/synsema_vela_guest.stubbed.wasm
+      - name: The app slot — embed another program into the stubbed module without a compiler, and probe it
+        # tools/embed.syn finds the slot in the .wasm and overwrites it: what a kit does with the
+        # release asset instead of building. The result must load and answer like a fresh build,
+        # under both runtimes (the slot must survive the stub's re-encoding as one contiguous run).
+        run: |
+          engine/target/debug/synsema test --labels packages/guests/vela/tools/embed.syn
+          engine/target/debug/synsema test --labels packages/guests/vela/tools/verify.syn
+          engine/target/debug/synsema run packages/guests/vela/tools/embed.syn -- engine/target/wasm32-wasip1/wasm/synsema_vela_guest.stubbed.wasm packages/guests/vela/examples/payment_app.syn /tmp/payment.wasm
           # the payment app speaks novaw's dialect: {type, transfer: {to, amount (hex)}}
-          cd packages/guests/vela/tests/wasmtime-go && PAYLOAD='{"type":"transfer","transfer":{"to":"0x2222222222222222222222222222222222222222","amount":"0x1"}}' go run . /tmp/payment.wasm
+          PAYLOAD='{"type":"transfer","transfer":{"to":"0x2222222222222222222222222222222222222222","amount":"0x1"}}'
+          (cd packages/guests/vela/tests/wasmtime-go && PAYLOAD="$PAYLOAD" go run . /tmp/payment.wasm)
+          (cd packages/guests/vela/tests/wasmtime-go-v47 && PAYLOAD="$PAYLOAD" go run . /tmp/payment.wasm)
       - name: Size budget (< 50 MB is Vela's upload limit; keep it under 12 MB)
         run: |
-          sz=$(wc -c < engine/target/wasm32-wasip1/wasm/synsema_vela_guest.wasm)
+          sz=$(wc -c < engine/target/wasm32-wasip1/wasm/synsema_vela_guest.stubbed.wasm)
           echo "bytes: $sz"
           test "$sz" -lt 12582912
 
@@ -302,13 +359,17 @@ jobs:
   npm-cli:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
+        with:
+          toolchain: "1.96.0"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "22"
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -341,9 +402,90 @@ jobs:
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
+        with:
+          toolchain: "1.96.0"
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit
         run: cargo audit --file engine/Cargo.lock
+
+  # Every Synsema program in the repository still LOADS. This is the gate that was missing when a
+  # language rule stopped a program from loading and nobody noticed for a whole round: the engine's
+  # Rust suites never open these files, and the differential conformance suite that would have
+  # caught it lives in `conformance/`, which is NOT in the repository (see .gitignore) — so CI
+  # cannot run it. This job covers what CI *can* see: every `.syn`/`.fsyn` tracked by git.
+  #
+  # Two gates, because no single command separates "loads" from "runs":
+  #   - `synsema check` parses. It does NOT apply load-time rules, so it alone would have missed
+  #     the regression above; it is here for syntax. The flat dialect (`.fsyn`) is not supported
+  #     by `check`, so those files are covered by the second gate only.
+  #   - `synsema test` loads the program — module resolution, protected names, every rule that
+  #     runs before the first statement — and then runs its `test` blocks and nothing else. A
+  #     program with no tests still has to load. `--labels` because the guest apps declare their
+  #     accumulators with `private(...)`, which is an error with labels off, on purpose.
+  #
+  # Exactly two things are allowed to fail, both by their exact signature and never by pattern: a
+  # program whose top level opens a server (`test` has no serve runtime — it loaded, which is what
+  # this gate asserts), and the one example that raises at top level to show what an error looks
+  # like. Anything else fails the build.
+  programs-load:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master 2026-09-12; toolchain pinned below and in rust-toolchain.toml
+        with:
+          toolchain: "1.96.0"
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            engine/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('engine/Cargo.lock') }}
+      - name: Build native synsema
+        run: cargo build --locked --manifest-path engine/Cargo.toml -p synsema-cli
+      - name: Every versioned program loads
+        env:
+          SYN: engine/target/debug/synsema
+          # tests/wasm_pure.probe.syn and tests/wasm_sandbox.probe.syn read this key; it is the
+          # well-known test vector (private key 1), the same one the wasm job uses.
+          ETH_KEY: "0000000000000000000000000000000000000000000000000000000000000001"
+        run: |
+          set -uo pipefail
+          fail=0
+          mapfile -t ALL < <(git ls-files '*.syn' '*.fsyn' | sort)
+          echo "programs under gate: ${#ALL[@]}"
+          echo "== parse: synsema check (.syn only; check does not read the flat dialect)"
+          for f in "${ALL[@]}"; do
+            case "$f" in *.fsyn) continue ;; esac
+            if ! out=$("$SYN" check "$f" 2>&1); then
+              echo "::error file=$f::does not parse: $(echo "$out" | head -1)"; fail=1
+            fi
+          done
+          echo "== load + self-test: synsema test --labels"
+          for f in "${ALL[@]}"; do
+            out=$(timeout 120 "$SYN" test --labels "$f" 2>&1); rc=$?
+            if [ $rc -eq 0 ]; then
+              printf '   ok   %-62s %s\n' "$f" "$(echo "$out" | tail -1)"; continue
+            fi
+            if echo "$out" | grep -q "serve is only available through the Synsema engine runtime"; then
+              printf '   load %-62s (serve program: loads, not runnable under test)\n' "$f"; continue
+            fi
+            if [ "$f" = "examples/error_demo.syn" ]; then
+              printf '   load %-62s (error demo: raises at top level on purpose)\n' "$f"; continue
+            fi
+            echo "::error file=$f::failed to load or its tests failed"
+            echo "$out" | head -8 | sed 's/^/      /'
+            fail=1
+          done
+          if [ "$fail" != "0" ]; then
+            echo "::error::at least one versioned program no longer loads"; exit 1
+          fi
+          echo "all versioned programs load; every self-testing one is green"

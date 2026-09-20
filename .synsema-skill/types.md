@@ -15,7 +15,7 @@
 - `array` — n-dimensional **numeric** array (f64): `array([[1,2],[3,4]])`, `zeros`/`ones`/`arange`/`linspace`/`identity`. Vectorized math + broadcasting (`*` is **elementwise**, not matrix product); `matmul`/`solve`/`det`/`inv`/`eig`/`svd`. See [builtins.md](builtins.md). NumPy-equivalent core.
 
 ## Sum types (enums)
-```
+```synsema
 enum OrderStatus
     pending
     paid(amount)
@@ -34,7 +34,7 @@ Construct `Name.variant(...)`; nullary `Name.pending` is a value. Match by varia
 - `task` — function value, supports closures, default params (`task f(x, y = 10)`) and named args at call (`f(x, timeout = 5)`)
 
 ## Custom types
-```
+```synsema
 type Person
     name: text
     age: number

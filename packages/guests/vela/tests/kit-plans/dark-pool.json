@@ -1,0 +1,115 @@
+{
+  "deploy": null,
+  "steps": [
+    {
+      "kind": "deposit",
+      "sender": "0x1111111111111111111111111111111111111111",
+      "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+      "value": "1000000000"
+    },
+    {
+      "kind": "deposit",
+      "sender": "0x2222222222222222222222222222222222222222",
+      "token": "0x0000000000000000000000000000000000000000",
+      "value": "2000000000000000000"
+    },
+    {
+      "kind": "deposit",
+      "sender": "0x3333333333333333333333333333333333333333",
+      "token": "0x0000000000000000000000000000000000000000",
+      "value": "2000000000000000000"
+    },
+    {
+      "kind": "process",
+      "sender": "0x1111111111111111111111111111111111111111",
+      "payload": {
+        "type": "open",
+        "asset": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        "quantity": "1000000000",
+        "payment": "0x0000000000000000000000000000000000000000",
+        "reserve": "500000000000000000",
+        "kind": "uniform"
+      },
+      "expect": {
+        "app_events": 1,
+        "app_event_subtypes": [
+          "opened"
+        ],
+        "app_event_bytes": [
+          160
+        ],
+        "withdrawals": 0
+      }
+    },
+    {
+      "kind": "process",
+      "sender": "0x2222222222222222222222222222222222222222",
+      "payload": {
+        "type": "bid",
+        "auction": "0x00000000000000000000000000000001",
+        "quantity": "600000000",
+        "total": "900000000000000000"
+      }
+    },
+    {
+      "kind": "process",
+      "sender": "0x3333333333333333333333333333333333333333",
+      "payload": {
+        "type": "bid",
+        "auction": "0x00000000000000000000000000000001",
+        "quantity": "600000000",
+        "total": "600000000000000000"
+      }
+    },
+    {
+      "kind": "process",
+      "sender": "0x1111111111111111111111111111111111111111",
+      "payload": {
+        "type": "bid",
+        "auction": "0x00000000000000000000000000000001",
+        "quantity": "1",
+        "total": "1"
+      },
+      "expect_error": "seller_cannot_bid"
+    },
+    {
+      "kind": "process",
+      "sender": "0x1111111111111111111111111111111111111111",
+      "payload": {
+        "type": "close",
+        "auction": "0x00000000000000000000000000000001"
+      },
+      "expect": {
+        "app_events": 1,
+        "app_event_subtypes": [
+          "cleared"
+        ],
+        "app_event_bytes": [
+          96
+        ],
+        "withdrawals": 0
+      }
+    },
+    {
+      "kind": "process",
+      "sender": "0x2222222222222222222222222222222222222222",
+      "payload": {
+        "type": "withdraw",
+        "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        "amount": "600000000"
+      },
+      "expect": {
+        "app_events": 0,
+        "withdrawals": 1,
+        "withdrawal_amounts": [
+          "0x23c34600"
+        ]
+      }
+    },
+    {
+      "kind": "deanonymize",
+      "sender": "0x1111111111111111111111111111111111111111",
+      "payload": {}
+    }
+  ]
+}

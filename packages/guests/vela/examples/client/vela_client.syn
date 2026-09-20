@@ -4,32 +4,38 @@
 -- contract), submit PROCESS / DEANONYMIZATION requests with the payload encrypted for the
 -- Executor, wait for completion through the subgraph, and decrypt your events. Any payload, any app.
 --
---   the public devnet (no Docker):
---   synsema run vela_client.syn -- devnet [host]                     a token of your own from devnet.synsema.app, written to .env
---   synsema run vela_client.syn -- allow-token <address>             TokenAllowlist.addAllowedToken with the signing key (the admin: Anvil #0 on a devnet)
---   synsema run vela_client.syn -- allow-authority <appId> <address> DefaultAuthority.addAllowedAuthority — an auditor for your app
---   synsema run vela_client.syn -- keys                          a fresh P-521 pair, printed for .env
---   synsema run vela_client.syn -- address                       the signing address (VELA_SECP_KEY)
---   synsema run vela_client.syn -- tee                           the Executor's P-521 key, read on-chain
---   synsema run vela_client.syn -- deploy <app.wasm> [params-json|-] [trigger-address]
---   synsema run vela_client.syn -- register                      AssociateKey: your key + encrypted seed
---   synsema run vela_client.syn -- deposit <amount> [token]      ETH (wei) or an allowlisted ERC-20 into the app (the guest's `deposit`)
---   synsema run vela_client.syn -- send '<json>' [wei]           PROCESS (payload encrypted; optional deposit with it)
---   synsema run vela_client.syn -- report '<json>'               DEANONYMIZATION (the caller must be an allowed authority); prints the decrypted report
---   synsema run vela_client.syn -- report-download <reportId>    fetch + decrypt an earlier report from the authority service
---   synsema run vela_client.syn -- events [n]                    your last n events, decrypted
---   synsema run vela_client.syn -- app-events [n]                the app's public events (subtype + data)
---   synsema run vela_client.syn -- status <requestId>
+--   The public devnet (no Docker):
+--   Synsema run vela_client.syn -- devnet [host]                     a token of your own from devnet.synsema.app, written to .env
+--   Synsema run vela_client.syn -- allow-token <address>             TokenAllowlist.addAllowedToken with the signing key (the admin: Anvil #0 on a devnet)
+--   Synsema run vela_client.syn -- allow-authority <appId> <address> DefaultAuthority.addAllowedAuthority — an auditor for your app
+--   Synsema run vela_client.syn -- keys                          a fresh P-521 pair, printed for .env
+--   Synsema run vela_client.syn -- address                       the signing address (VELA_SECP_KEY)
+--   Synsema run vela_client.syn -- tee                           the Executor's P-521 key, read on-chain
+--   Synsema run vela_client.syn -- tee --verify [--pcr0 <hex>]   the Nitro attestation behind that key, verified here, not trusted from the contract
+--   Synsema run vela_client.syn -- governance [--json]           who controls what: owner, PCR0 and its history, authorities, fees
+--   Synsema run vela_client.syn -- deploy <app.wasm> [params-json|-] [trigger-address]
+--   Synsema run vela_client.syn -- register                      AssociateKey: your key + encrypted seed
+--   Synsema run vela_client.syn -- deposit <amount> [token]      ETH (wei) or an allowlisted ERC-20 into the app (the guest's `deposit`)
+--   Synsema run vela_client.syn -- send '<json>' [wei]           PROCESS (payload encrypted; optional deposit with it)
+--   Synsema run vela_client.syn -- report '<json>'               DEANONYMIZATION (the caller must be an allowed authority); prints the decrypted report
+--   Synsema run vela_client.syn -- report-download <reportId>    fetch + decrypt an earlier report from the authority service
+--   Synsema run vela_client.syn -- events [n]                    your last n events, decrypted
+--   Synsema run vela_client.syn -- app-events [n]                the app's public events (subtype + data)
+--   Synsema run vela_client.syn -- status <requestId>
 --   facilitator (the user signs, VELA_SECP_KEY pays gas and fee; the user needs no ETH):
---   synsema run vela_client.syn -- user                          the user's address (VELA_USER_KEY)
---   synsema run vela_client.syn -- register-for                  AssociateKey for the user, submitted by the facilitator
---   synsema run vela_client.syn -- send-for '<json>' [amount token]   PROCESS for the user; an ERC-20 deposit rides on an EIP-2612 permit
---   synsema run vela_client.syn -- events-for [n]                the user's events, decrypted
+--   Synsema run vela_client.syn -- user                          the user's address (VELA_USER_KEY)
+--   Synsema run vela_client.syn -- register-for                  AssociateKey for the user, submitted by the facilitator
+--   Synsema run vela_client.syn -- send-for '<json>' [amount token]   PROCESS for the user; an ERC-20 deposit rides on an EIP-2612 permit
+--   Synsema run vela_client.syn -- events-for [n]                the user's events, decrypted
+--   `--verified` on register / send / report / register-for / send-for: run `tee --verify` first and
+--   encrypt only if it passes (the payload never leaves the machine for an unattested key).
 --
 -- Config comes from .env (copy .env.example): VELA_RPC_URL, VELA_PROCESSOR, VELA_TEE_AUTHENTICATOR,
 -- VELA_AUTHORITY_URL, VELA_SUBGRAPH_URL, VELA_APP_ID, VELA_MAX_FEE (wei), VELA_SECP_KEY (hex),
 -- VELA_P521_KEY (hex, 66 bytes), VELA_P521_PUB (hex, 133 bytes, uncompressed), and for the
--- facilitator commands VELA_USER_KEY (the user's secp256k1 key, hex).
+-- facilitator commands VELA_USER_KEY (the user's secp256k1 key, hex). `governance` and `tee --verify`
+-- Read the contracts' logs from VELA_FROM_BLOCK (default 0; set it near the deployment block on an
+-- RPC that caps eth_getLogs ranges).
 --
 -- Wire formats, read from HorizenOfficial/vela v0.2.0 (`pkg/crypto/cipher.go`, `pkg/blockchain/client.go`,
 -- `contracts/ProcessorEndpoint.sol`) and the vela-nova wallet (`cmd/seed.go`, `cmd/deployapp.go`):
@@ -61,6 +67,16 @@ let DEANONYMIZATION be 2
 let ASSOCIATE_KEY be 3
 let SIG_REQUEST_SUBMITTED be "0x" + decode(keccak256("RequestSubmitted(uint64,bytes32,address,address)"), "hex")
 let SIG_DEPLOY_SUBMITTED be "0x" + decode(keccak256("DeployRequestSubmitted(uint64,bytes32,address)"), "hex")
+-- TeeAuthenticator (ITeeAuthenticatorAdmin.sol) and DefaultAuthority (IDefaultAuthorityChecker.sol) events
+let SIG_TEE_UPDATE be "0x" + decode(keccak256("TeeUpdate(address,address,bytes,bytes)"), "hex")
+let SIG_PCR0_UPDATE be "0x" + decode(keccak256("PcrZeroUpdate(bytes,bytes)"), "hex")
+let SIG_ADDED_AUTHORITY be "0x" + decode(keccak256("AddedAuthority(uint256,address)"), "hex")
+let SIG_REMOVED_AUTHORITY be "0x" + decode(keccak256("RemovedAuthority(uint256,address)"), "hex")
+-- The owner's transactions whose calldata `tee --verify` and `governance` read back
+let SEL_UPDATE_TEE be abi_selector("updateTee(bytes)")
+let SEL_UPDATE_TEE_STEP1 be abi_selector("updateTeeStep1(bytes)")
+let SEL_UPDATE_TEE_STEP4 be abi_selector("updateTeeStep4()")
+let SEL_UPDATE_PCR0 be abi_selector("updatePcr0(bytes)")
 
 -- ---- small helpers ----
 
@@ -77,6 +93,29 @@ task hex_bytes(h)
 
 task hex_of(b)
     give "0x" + decode(b, "hex")
+
+-- Lowercase hex without the 0x: the form two hashes, keys or addresses are compared in
+task hex_plain(h)
+    let l be lower(h)
+    give when starts_with(l, "0x") then slice(l, 2, length(l)) otherwise l
+
+-- A map's value, or nothing when the key is not there (a section the chain did not give us)
+task field(m, k)
+    give when contains(m, k) then m[k] otherwise nothing
+
+-- JSON-RPC quantities are hex text without leading zeros ("0x1a", "0x0"); `eth_rpc` passes them
+-- through untouched in both directions.
+task hex_quantity(n)
+    let h be decode(int_to_bytes(n), "hex")
+    while length(h) > 1 and starts_with(h, "0")
+        set h to slice(h, 1, length(h))
+    give when h == "" then "0x0" otherwise "0x" + h
+
+task quantity_of(h)
+    let s be hex_plain(h)
+    when length(s) % 2 == 1
+        set s to "0" + s
+    give bytes_to_int(bytes(s, "hex"))
 
 task cfg()
     give {
@@ -126,10 +165,47 @@ task tee_public_key(c)
         raise("the TEE authenticator returned " + text(length(pub)) + " bytes, not a 133-byte P-521 key")
     give pub
 
+-- ---- reading contracts and their logs ----
+
+task call_typed(c, dest, abi_type, signature, values)
+    give abi_decode(abi_type, eth_call(c["rpc"], {"to": dest, "data": abi_encode(signature, values)}))[0]
+
+-- A view this deployment may not have (v0.2.0 vs dev, a mock vs the real contract): its value, or
+-- `nothing` when the call reverts or returns nothing decodable.
+task call_optional(c, dest, abi_type, signature, values)
+    let out be nothing
+    try
+        set out to call_typed(c, dest, abi_type, signature, values)
+    recover err
+        set out to nothing
+    give out
+
+task from_block(c)
+    give hex_quantity(int_of(env("VELA_FROM_BLOCK", "0")))
+
+-- Eth_getLogs of one contract from VELA_FROM_BLOCK, oldest first (as the node returns them).
+task contract_logs(c, address, topics)
+    give eth_rpc(c["rpc"], "eth_getLogs", [{"address": address, "fromBlock": from_block(c), "toBlock": "latest", "topics": topics}])
+
+task transaction(c, hash)
+    let tx be eth_rpc(c["rpc"], "eth_getTransactionByHash", [hash])
+    when tx == nothing
+        raise("transaction " + text(hash) + " is unknown to " + c["rpc"])
+    give tx
+
+-- Block · 10^5 + logIndex: one number that orders logs the way the chain does
+task log_order(entry)
+    give quantity_of(entry["blockNumber"]) * 100000 + quantity_of(entry["logIndex"])
+
+-- An `address indexed` topic is the address left-padded to 32 bytes
+task address_of_topic(topic)
+    let h be hex_plain(topic)
+    give "0x" + slice(h, length(h) - 40, length(h))
+
 -- ---- the Executor's cipher (pkg/crypto/cipher.go) ----
 
-task derive_key(private, peer_public)
-    let shared be ecdh_shared_secret(private, peer_public, "P-521")
+task derive_key(own_private, peer_public)
+    let shared be ecdh_shared_secret(own_private, peer_public, "P-521")
     give hkdf_sha256(shared, bytes(""), bytes(""), 32)
 
 task seal(key, plaintext)
@@ -140,6 +216,17 @@ task open(key, blob)
     when length(blob) < 28
         raise("ciphertext too short (" + text(length(blob)) + " bytes)")
     give aes_gcm_decrypt(key, slice(blob, 0, 12), slice(blob, 12, length(blob)))
+
+-- Every byte encrypted for the Executor goes through here. With `--verified` the key is used only
+-- after `tee --verify` passed in this same run; without it, the contract's word is taken as today.
+task executor_key(c, verified)
+    when verified
+        let v be verify_tee(c, nothing)
+        print("tee --verify: OK (pcr0 " + v["attestation"]["measurements"]["pcr0"] + ", module " + text(v["attestation"]["module_id"]) + ")")
+    give tee_public_key(c)
+
+task seal_for_executor(c, plaintext, verified)
+    give seal(derive_key(p521_key(), executor_key(c, verified)), plaintext)
 
 -- ---- privacy seed and the 50 subtypes (vela-nova cmd/seed.go, vela-common-go/subtypes) ----
 
@@ -255,6 +342,15 @@ task completion(c, request_id, is_deploy)
         give nothing
     give rows[0]
 
+-- A failed request, as a message: the error's NAME first. `errorCode` is the ordinal of the
+-- contract's ErrorCode enum and Vela v0.3.0 renumbers it (INSUFFICIENT_FUEL 12 → 11), so nothing
+-- In this client branches on the number; it is shown as a datum, after the message.
+task failure_message(request_id, row)
+    let msg be row["errorMessage"]
+    when msg == nothing or text(msg) == ""
+        set msg to "(no message)"
+    give "request " + request_id + " failed: " + text(msg) + " [errorCode " + text(row["errorCode"]) + ", an enum ordinal that differs between Vela versions]"
+
 -- Polls until the Manager finalizes the request on-chain and the subgraph indexes it.
 task wait_completed(c, request_id, is_deploy)
     let waited be 0
@@ -262,7 +358,7 @@ task wait_completed(c, request_id, is_deploy)
         let row be completion(c, request_id, is_deploy)
         when row != nothing
             when text(row["status"]) != "0"
-                raise("request " + request_id + " failed: error " + text(row["errorCode"]) + " " + text(row["errorMessage"]))
+                raise(failure_message(request_id, row))
             give row
         sleep(2)
         set waited to waited + 2
@@ -315,7 +411,7 @@ task subtype_label(subtype)
     give decode(bytes(printable))
 
 -- ---- facilitator (meta-transactions, ProcessorEndpoint.submitRequestFor) ----
--- The USER signs an EIP-712 RequestAuthorization (domain Vela / version "0" / chainId / the
+-- the USER signs an EIP-712 RequestAuthorization (domain Vela / version "0" / chainId / the
 -- endpoint) and, for an ERC-20 deposit, an EIP-2612 permit; the FACILITATOR (VELA_SECP_KEY)
 -- submits the transaction, paying gas and the fee (msg.value = maxFeeValue). The request runs
 -- with sender = user. Only ASSOCIATEKEY and PROCESS; the deposit can only be an ERC-20 (permit),
@@ -365,7 +461,9 @@ task submit_for(c, request_type, payload, token, asset_amount)
     let app_id be int_of(need(c, "app_id", "VELA_APP_ID"))
     let chain_id be eth_chain_id(c["rpc"])
     let deadline be floor(now()) + 3600
-    let nonce be call_uint(c, processor, "getFacilitatorNonce(address)", [user])
+    -- The public mapping's getter: it exists in v0.2.0 and in dev, while getFacilitatorNonce(address)
+    -- Is removed in Vela v0.3.0 (CHANGELOG, "Breaking changes")
+    let nonce be call_uint(c, processor, "facilitatorNonces(address)", [user])
     let authorization be eth_signature(authorization_digest(chain_id, processor, user, app_id, request_type, payload, token, asset_amount, nonce, deadline), user_key())
     let permit be bytes([])
     when asset_amount > 0
@@ -379,8 +477,8 @@ task submit_for(c, request_type, payload, token, asset_amount)
     give request_id_of(receipt)
 
 -- The user's AssociateKey payload: the shared P-521 pair from .env, the seed signed by the USER's key.
-task register_payload_for(c)
-    let encrypted_seed be seal(derive_key(p521_key(), tee_public_key(c)), seed_of(user_key()))
+task register_payload_for(c, verified)
+    let encrypted_seed be seal_for_executor(c, seed_of(user_key()), verified)
     give p521_public() + encrypted_seed
 
 task events_for(c, limit)
@@ -419,9 +517,8 @@ task download_report(c, report_id)
 
 -- ---- the AssociateKey payload (133 or 226 bytes) ----
 
-task register_payload(c)
-    let tee be tee_public_key(c)
-    let encrypted_seed be seal(derive_key(p521_key(), tee), seed_of(secp_key()))
+task register_payload(c, verified)
+    let encrypted_seed be seal_for_executor(c, seed_of(secp_key()), verified)
     when length(encrypted_seed) != 93
         raise("the encrypted seed must be 93 bytes, got " + text(length(encrypted_seed)))
     give p521_public() + encrypted_seed
@@ -461,15 +558,296 @@ task allow_authority(c, app_id, authority)
     let registry be lower(env("VELA_DEFAULT_AUTHORITY", "0x5FbDB2315678afecb367f032d93F642f64180aa3"))
     give send_tx(c, registry, 0, abi_encode("addAllowedAuthority(uint256,address)", [app_id, authority]))
 
+-- ---- tee --verify: the attestation behind the Executor's key (TeeAuthenticator.sol) ----
+-- `tee` reads getPubSecp521r1() and trusts the contract. The contract accepted that key because
+-- the owner sent a Nitro attestation document that a NitroProver verified on-chain against pcr0()
+-- (only PCR0 is compared: `_checkAttestationContent`). That document is public calldata:
+-- UpdateTee(bytes) carries it whole; the step flow (updateTeeStep1..4, for chains where one
+-- verification does not fit in a block) carries it whole in updateTeeStep1(bytes) — steps 2-4
+-- take no calldata, the contract keeps the decoded parts in storage and getStep2TotalLength() is
+-- just how many step-2 calls the cabundle needs. So the document is always the single `bytes`
+-- Argument of one transaction, and we can verify it ourselves.
+
+-- Pure: the `bytes` argument of an updateTee / updateTeeStep1 call, and which one it was
+task attestation_of_calldata(input)
+    when length(input) < 4
+        raise("calldata too short to carry a selector (" + text(length(input)) + " bytes)")
+    let selector be slice(input, 0, 4)
+    when selector != SEL_UPDATE_TEE and selector != SEL_UPDATE_TEE_STEP1
+        raise("not an updateTee(bytes) / updateTeeStep1(bytes) call (selector " + hex_of(selector) + ")")
+    give {"document": abi_decode("bytes", slice(input, 4, length(input)))[0], "via": when selector == SEL_UPDATE_TEE then "updateTee" otherwise "updateTeeStep1"}
+
+-- The last TeeUpdate of the authenticator and the transaction that carried its attestation.
+task last_attestation(c, tee_auth)
+    let logs be contract_logs(c, tee_auth, [SIG_TEE_UPDATE])
+    when length(logs) == 0
+        raise("no TeeUpdate event from " + tee_auth + " since block " + from_block(c) + " (VELA_FROM_BLOCK too high, or the RPC caps the eth_getLogs range)")
+    let last be logs[length(logs) - 1]
+    let tx be transaction(c, last["transactionHash"])
+    when tx["to"] == nothing
+        raise("the last TeeUpdate came from the constructor (deployment tx " + text(last["transactionHash"]) + "): the key was set by the deployer, there is no attestation on-chain")
+    let input be hex_bytes(tx["input"])
+    when length(input) >= 4 and slice(input, 0, 4) == SEL_UPDATE_TEE_STEP4
+        -- The step flow: the document went in with updateTeeStep1 some blocks earlier
+        give step1_before(c, tee_auth, quantity_of(last["blockNumber"]), last["transactionHash"])
+    let found be attestation_of_calldata(input)
+    set found["tx"] to last["transactionHash"]
+    set found["block"] to quantity_of(last["blockNumber"])
+    give found
+
+-- Walks blocks backwards from `block` for the owner's updateTeeStep1(bytes) to `tee_auth`: one
+-- eth_getBlockByNumber per block, at most VELA_SCAN_BLOCKS of them (default 256).
+task step1_before(c, tee_auth, block, step4_tx)
+    let limit be int_of(env("VELA_SCAN_BLOCKS", "256"))
+    let target be lower(tee_auth)
+    let n be block
+    while n >= 0 and block - n <= limit
+        let b be eth_rpc(c["rpc"], "eth_getBlockByNumber", [hex_quantity(n), true])
+        each tx in reverse(b["transactions"])
+            when tx["to"] != nothing and lower(tx["to"]) == target and tx["hash"] != step4_tx
+                let input be hex_bytes(tx["input"])
+                when length(input) >= 4 and slice(input, 0, 4) == SEL_UPDATE_TEE_STEP1
+                    let found be attestation_of_calldata(input)
+                    set found["tx"] to tx["hash"]
+                    set found["block"] to n
+                    give found
+        set n to n - 1
+    raise("updateTeeStep4 at block " + text(block) + " but no updateTeeStep1 in the " + text(limit) + " blocks before it (raise VELA_SCAN_BLOCKS)")
+
+-- Pure: the document's public key against getPubSecp521r1(). The contract stores the raw point
+-- 0x04 ‖ X ‖ Y (133 bytes); a document may carry the same point raw or as DER
+-- subjectPublicKeyInfo, whose BIT STRING ends with those 133 bytes. Gives how it matched, or nothing.
+task key_matches(doc_key, onchain)
+    when doc_key == nothing or onchain == nothing
+        give nothing
+    when doc_key == onchain
+        give "raw (0x04 ‖ X ‖ Y)"
+    when length(doc_key) > 133 and slice(doc_key, length(doc_key) - 133, length(doc_key)) == onchain
+        give "DER SubjectPublicKeyInfo"
+    give nothing
+
+-- Pure: the checks that bind a verified document to what the chain trusts. `att` is the map
+-- attestation_verify gives; raises on the first thing that does not hold.
+task bind_attestation(att, onchain_key, signer, pcr0_onchain, expected_pcr0)
+    let form be key_matches(att["public_key"], onchain_key)
+    when form == nothing
+        raise("the attested public key is not getPubSecp521r1(): the chain trusts a key this document does not vouch for")
+    when att["user_data"] == nothing or length(att["user_data"]) != 20
+        raise("user_data is not a 20-byte address (the Executor's signer)")
+    when hex_plain(hex_of(att["user_data"])) != hex_plain(signer)
+        raise("user_data " + hex_of(att["user_data"]) + " is not getTeeSigner() " + signer)
+    let m be att["measurements"]
+    when not contains(m, "pcr0")
+        raise("the document has no PCR0 measurement")
+    when hex_plain(m["pcr0"]) != hex_plain(pcr0_onchain)
+        raise("the document's PCR0 " + m["pcr0"] + " is not the contract's pcr0() " + pcr0_onchain)
+    when expected_pcr0 != nothing and hex_plain(m["pcr0"]) != hex_plain(expected_pcr0)
+        raise("PCR0 " + m["pcr0"] + " is not the --pcr0 you expect (" + expected_pcr0 + ")")
+    give form
+
+-- Tee --verify: the chain says "this key belongs to the Executor"; this checks WHY it says so.
+task verify_tee(c, expected_pcr0)
+    let tee_auth be need(c, "tee_auth", "VELA_TEE_AUTHENTICATOR")
+    let pcr0 be call_optional(c, tee_auth, "bytes", "pcr0()", [])
+    when pcr0 == nothing
+        raise("this deployment has no attestation to verify: " + tee_auth + " has no pcr0() — a NoAttestationTeeAuthenticator (the starter kit, the public devnet) publishes the Executor's key on the owner's word alone")
+    let found be last_attestation(c, tee_auth)
+    let att be attestation_verify(found["document"], {"format": "nitro", "now": floor(now())})
+    let signer be call_typed(c, tee_auth, "address", "getTeeSigner()", [])
+    let form be bind_attestation(att, tee_public_key(c), signer, hex_of(pcr0), expected_pcr0)
+    give {"attestation": att, "found": found, "key_form": form, "signer": signer, "pcr0_onchain": hex_of(pcr0)}
+
+task print_verified(v)
+    let att be v["attestation"]
+    let m be att["measurements"]
+    print("verified: the Executor's key was made inside a Nitro enclave running the code the chain pinned")
+    print("  module_id    " + text(att["module_id"]))
+    each name in ["pcr0", "pcr1", "pcr2"]
+        when contains(m, name)
+            print("  " + name + "         " + text(m[name]) + (when name == "pcr0" then "  (= TeeAuthenticator.pcr0())" otherwise ""))
+    print("  timestamp    " + text(att["timestamp"]) + " (as in the document)")
+    print("  public_key   = getPubSecp521r1(), as " + v["key_form"])
+    print("  user_data    " + v["signer"] + " (= getTeeSigner(), the Executor's signer)")
+    print("  document     " + v["found"]["via"] + " in tx " + text(v["found"]["tx"]) + " at block " + text(v["found"]["block"]))
+    print("  chain")
+    each cert in att["chain"]
+        print("    " + text(cert["subject"]) + "  " + text(cert["not_before"]) + " → " + text(cert["not_after"]))
+    print("what this proves: the key came from an enclave whose code measured to that PCR0 (identity of the code).")
+    print("what it does not: the document dates from the enclave's start and carries no nonce of ours — not freshness, not that the same enclave is alive now.")
+
+-- ---- governance: what a user can watch, even if not control ----
+-- teeAuthenticator: owner() may updatePcr0 (a new enclave image) and updateTee (a new key) —
+-- Only PCR0 is compared. AuthorityRegistry: owner() decides which contract answers "is this
+-- authority allowed to deanonymize app X"; DefaultAuthority's owner() keeps the allowlist per app.
+-- ProcessorEndpoint: ADMIN role sets the fee collector; minFeePerRequest is what every request pays.
+
+-- Pure: updatePcr0(bytes) calldata → the new PCR0 as hex, or nothing when the calldata is not that
+-- call (a multisig's, say) or does not hash to the event's `indexed bytes` topic
+task pcr0_of_calldata(input, new_hash)
+    when length(input) < 4 or slice(input, 0, 4) != SEL_UPDATE_PCR0
+        give nothing
+    let value be abi_decode("bytes", slice(input, 4, length(input)))[0]
+    when hex_plain(hex_of(keccak256(value))) != hex_plain(new_hash)
+        give nothing
+    give hex_of(value)
+
+-- PcrZeroUpdate(bytes indexed oldPcr0, bytes indexed newPcr0): the topics are keccak256 of the
+-- values, so the values come from the calldata of the transaction that emitted each one.
+task pcr0_history(c, tee_auth)
+    let out be []
+    each entry in contract_logs(c, tee_auth, [SIG_PCR0_UPDATE])
+        let tx be transaction(c, entry["transactionHash"])
+        set out to append(out, {"block": quantity_of(entry["blockNumber"]), "tx": entry["transactionHash"], "old_hash": entry["topics"][1], "new_hash": entry["topics"][2], "new": pcr0_of_calldata(hex_bytes(tx["input"]), entry["topics"][2])})
+    give out
+
+task tee_updates(c, tee_auth)
+    let out be []
+    each entry in contract_logs(c, tee_auth, [SIG_TEE_UPDATE])
+        -- TeeUpdate has no indexed parameter: all four are in `data`
+        let fields be abi_decode("(address,address,bytes,bytes)", hex_bytes(entry["data"]))
+        set out to append(out, {"block": quantity_of(entry["blockNumber"]), "tx": entry["transactionHash"], "old_signer": fields[0], "new_signer": fields[1]})
+    give out
+
+-- Pure: AddedAuthority / RemovedAuthority logs replayed in chain order → the addresses allowed now
+task allowlist_replay(added, removed)
+    let events be []
+    each e in added
+        set events to append(events, {"order": log_order(e), "address": address_of_topic(e["topics"][2]), "allowed": true})
+    each e in removed
+        set events to append(events, {"order": log_order(e), "address": address_of_topic(e["topics"][2]), "allowed": false})
+    let state be {}
+    each e in sort_by(events, (x) => x["order"])
+        set state[e["address"]] to e["allowed"]
+    give where(keys(state), (k) => state[k])
+
+-- The allowlist of `authority_contract` for `app_id`: the events say whom to ask, the contract's
+-- checkAuthorityIsAllowed says whether they are allowed right now.
+task allowlist_of(c, authority_contract, app_id)
+    let topic_app be "0x" + decode(int_to_bytes(app_id, 32), "hex")
+    let added be contract_logs(c, authority_contract, [SIG_ADDED_AUTHORITY, topic_app])
+    let removed be contract_logs(c, authority_contract, [SIG_REMOVED_AUTHORITY, topic_app])
+    let out be []
+    each addr in allowlist_replay(added, removed)
+        set out to append(out, {"authority": addr, "allowed": call_typed(c, authority_contract, "bool", "checkAuthorityIsAllowed(uint256,address)", [app_id, addr])})
+    give out
+
+-- Everything `governance` prints, as one map (the `--json` output).
+task governance(c)
+    let processor be need(c, "processor", "VELA_PROCESSOR")
+    let tee_auth be need(c, "tee_auth", "VELA_TEE_AUTHENTICATOR")
+    let app_id be when c["app_id"] == "" then nothing otherwise int_of(c["app_id"])
+    let p be {"address": processor}
+    set p["tee_authenticator"] to call_optional(c, processor, "address", "teeAuthenticator()", [])
+    set p["authority_registry"] to call_optional(c, processor, "address", "authorityRegistry()", [])
+    set p["token_allowlist"] to call_optional(c, processor, "address", "tokenAllowlist()", [])
+    set p["fee_collector"] to call_optional(c, processor, "address", "feeCollector()", [])
+    set p["min_fee_per_request"] to call_optional(c, processor, "uint256", "minFeePerRequest()", [])
+    set p["max_num_of_applications"] to call_optional(c, processor, "uint256", "maxNumOfApplications()", [])
+    set p["max_queue_size"] to call_optional(c, processor, "uint256", "maxQueueSize()", [])
+    -- Vela dev (v0.3.0): the round-robin grace and the extension the endpoint delegates to; n/a on v0.2.0
+    set p["selection_grace"] to call_optional(c, processor, "uint256", "selectionGrace()", [])
+    set p["extension"] to call_optional(c, processor, "address", "extension()", [])
+    let t be {"address": tee_auth}
+    set t["owner"] to call_optional(c, tee_auth, "address", "owner()", [])
+    let pcr0 be call_optional(c, tee_auth, "bytes", "pcr0()", [])
+    set t["pcr0"] to when pcr0 == nothing then nothing otherwise hex_of(pcr0)
+    set t["attested"] to pcr0 != nothing
+    set t["tee_signer"] to call_optional(c, tee_auth, "address", "getTeeSigner()", [])
+    let pub be call_optional(c, tee_auth, "bytes", "getPubSecp521r1()", [])
+    set t["pub_secp521r1"] to when pub == nothing then nothing otherwise hex_of(pub)
+    set t["nitro_prover"] to call_optional(c, tee_auth, "address", "nitroProver()", [])
+    set t["max_verification_age"] to call_optional(c, tee_auth, "uint256", "maxVerificationAge()", [])
+    set t["pcr0_history"] to pcr0_history(c, tee_auth)
+    set t["tee_updates"] to tee_updates(c, tee_auth)
+    let registry be p["authority_registry"]
+    when registry == nothing
+        set registry to env("VELA_AUTHORITY_REGISTRY", "")
+        when registry == ""
+            set registry to nothing
+    let r be {"address": registry}
+    let a be {"app_id": app_id}
+    when registry != nothing
+        set r["owner"] to call_optional(c, registry, "address", "owner()", [])
+        set r["default_authority"] to call_optional(c, registry, "address", "defaultAuthorityContract()", [])
+        when app_id != nothing
+            let custom be call_optional(c, registry, "address", "appAuthorityContracts(uint256)", [app_id])
+            set r["app_authority"] to when custom == nothing or hex_plain(custom) == hex_plain(ETH) then nothing otherwise custom
+            set a["contract"] to when r["app_authority"] == nothing then r["default_authority"] otherwise r["app_authority"]
+            when a["contract"] != nothing
+                set a["owner"] to call_optional(c, a["contract"], "address", "owner()", [])
+                set a["allowlist"] to allowlist_of(c, a["contract"], app_id)
+    give {"processor": p, "tee_authenticator": t, "authority_registry": r, "authority": a, "from_block": from_block(c)}
+
+-- Pure: the report as [label, value] rows (a label alone is a heading)
+task governance_rows(g)
+    let p be g["processor"]
+    let t be g["tee_authenticator"]
+    let r be g["authority_registry"]
+    let a be g["authority"]
+    let rows be [["ProcessorEndpoint " + p["address"]]]
+    set rows to rows + [["  feeCollector", p["fee_collector"]], ["  minFeePerRequest", p["min_fee_per_request"]], ["  maxNumOfApplications", p["max_num_of_applications"]], ["  maxQueueSize", p["max_queue_size"]], ["  selectionGrace (dev)", p["selection_grace"]], ["  extension (dev)", p["extension"]], ["  teeAuthenticator", p["tee_authenticator"]], ["  authorityRegistry", p["authority_registry"]], ["  tokenAllowlist", p["token_allowlist"]]]
+    set rows to rows + [["TeeAuthenticator " + t["address"]], ["  owner", t["owner"]], ["  attestation", when t["attested"] then "Nitro, PCR0 pinned" otherwise "NONE: the key is the owner's word (NoAttestationTeeAuthenticator)"], ["  pcr0", t["pcr0"]], ["  nitroProver", t["nitro_prover"]], ["  maxVerificationAge", t["max_verification_age"]], ["  teeSigner", t["tee_signer"]], ["  pubSecp521r1", t["pub_secp521r1"]]]
+    set rows to rows + [["  PcrZeroUpdate history", when length(t["pcr0_history"]) == 0 then "none since block " + g["from_block"] + " (the initial pcr0 is set by the constructor, without an event)" otherwise text(length(t["pcr0_history"])) + " update(s)"]]
+    each h in t["pcr0_history"]
+        set rows to rows + [["    block " + text(h["block"]), (when h["new"] == nothing then "keccak(new) " + h["new_hash"] + " (value not in this tx's calldata)" otherwise h["new"]) + "  tx " + h["tx"]]]
+    set rows to rows + [["  TeeUpdate history", when length(t["tee_updates"]) == 0 then "none since block " + g["from_block"] otherwise text(length(t["tee_updates"])) + " update(s)"]]
+    each u in t["tee_updates"]
+        set rows to rows + [["    block " + text(u["block"]), u["old_signer"] + " → " + u["new_signer"] + "  tx " + u["tx"]]]
+    set rows to rows + [["AuthorityRegistry " + shown(r["address"])], ["  owner", field(r, "owner")], ["  defaultAuthorityContract", field(r, "default_authority")]]
+    when a["app_id"] == nothing
+        set rows to rows + [["  app authority", "set VELA_APP_ID to see the authority of your app"]]
+    otherwise
+        let custom be field(r, "app_authority")
+        set rows to rows + [["  appAuthorityContracts(" + text(a["app_id"]) + ")", when custom == nothing then "none: the default applies" otherwise custom]]
+        set rows to rows + [["Authority for app " + text(a["app_id"]) + " " + shown(field(a, "contract"))], ["  owner", field(a, "owner")]]
+        let allowlist be field(a, "allowlist")
+        when allowlist == nothing or length(allowlist) == 0
+            set rows to rows + [["  allowlist", "empty: nobody can deanonymize this app's data (no AddedAuthority since block " + g["from_block"] + ")"]]
+            set allowlist to []
+        each entry in allowlist
+            set rows to rows + [["  allowed", entry["authority"] + (when entry["allowed"] then "" otherwise "  (event replay says allowed, the contract says NO — check VELA_FROM_BLOCK)")]]
+    give rows
+
+task shown(v)
+    when v == nothing
+        give "n/a"
+    give text(v)
+
+task pad(s, n)
+    let out be s
+    while length(out) < n
+        set out to out + " "
+    give out
+
+-- pure: rows → aligned text
+task table(rows)
+    let width be 0
+    each r in rows
+        when length(r) > 1 and length(r[0]) > width
+            set width to length(r[0])
+    let lines be []
+    each r in rows
+        set lines to append(lines, when length(r) == 1 then r[0] otherwise pad(r[0], width) + "  " + shown(r[1]))
+    give join(lines, "\n")
+
 -- ---- CLI ----
 
 task usage()
-    print("usage: synsema run vela_client.syn -- devnet [host] | allow-token <address> | allow-authority <appId> <address> | keys | address | tee | deploy <wasm> [params-json|-] [trigger] | register | deposit <amount> [token] | send '<json>' [wei] | report '<json>' | report-download <reportId> | events [n] | app-events [n] | status <requestId> | user | register-for | send-for '<json>' [amount token] | events-for [n]")
+    print("usage: synsema run vela_client.syn -- devnet [host] | allow-token <address> | allow-authority <appId> <address> | keys | address | tee [--verify [--pcr0 <hex>]] | governance [--json] | deploy <wasm> [params-json|-] [trigger] | register | deposit <amount> [token] | send '<json>' [wei] | report '<json>' | report-download <reportId> | events [n] | app-events [n] | status <requestId> | user | register-for | send-for '<json>' [amount token] | events-for [n]   (--verified: `tee --verify` before encrypting anything)")
 
 task arg_or(a, i, default)
     give when length(a) > i then a[i] otherwise default
 
-task run_cli(a)
+-- The value after `--name`, or nothing when the flag is absent
+task flag_value(a, name)
+    let i be index_of(a, name)
+    when i == nothing
+        give nothing
+    when length(a) <= i + 1
+        raise(name + " needs a value")
+    give a[i + 1]
+
+task run_cli(a, verified)
     when length(a) == 0
         usage()
         give nothing
@@ -482,7 +860,16 @@ task run_cli(a)
         is "address"
             print(me())
         is "tee"
-            print(hex_of(tee_public_key(c)))
+            when contains(a, "--verify")
+                print_verified(verify_tee(c, flag_value(a, "--pcr0")))
+            otherwise
+                print(hex_of(tee_public_key(c)))
+        is "governance"
+            let g be governance(c)
+            when contains(a, "--json")
+                print(json_encode(g))
+            otherwise
+                print(table(governance_rows(g)))
         is "deploy"
             let params be when length(a) > 2 and a[2] != "-" then json_decode(a[2]) otherwise nothing
             let trigger be arg_or(a, 3, nothing)
@@ -491,7 +878,7 @@ task run_cli(a)
             let row be wait_completed(c, ids["request_id"], true)
             print("deploy completed at block " + text(row["blockNumber"]) + " — put VELA_APP_ID=" + text(ids["app_id"]) + " in .env")
         is "register"
-            let id be submit(c, ASSOCIATE_KEY, register_payload(c), ETH, 0)
+            let id be submit(c, ASSOCIATE_KEY, register_payload(c, verified), ETH, 0)
             print("register submitted: " + id)
             wait_completed(c, id, false)
             print("registered " + me() + " with a privacy seed (50 subtypes)")
@@ -508,14 +895,14 @@ task run_cli(a)
         is "send"
             let plain be json_encode(json_decode(a[1]))
             let wei be when length(a) > 2 then int_of(a[2]) otherwise 0
-            let payload be seal(derive_key(p521_key(), tee_public_key(c)), bytes(plain))
+            let payload be seal_for_executor(c, bytes(plain), verified)
             let id be submit(c, PROCESS, payload, ETH, wei)
             print("request submitted: " + id)
             let row be wait_completed(c, id, false)
             print("completed at block " + text(row["blockNumber"]) + ", fees " + text(row["applicationFees"]) + " wei")
         is "report"
             let plain be json_encode(json_decode(arg_or(a, 1, "{}")))
-            let payload be seal(derive_key(p521_key(), tee_public_key(c)), bytes(plain))
+            let payload be seal_for_executor(c, bytes(plain), verified)
             let id be submit(c, DEANONYMIZATION, payload, ETH, 0)
             print("report request submitted: " + id)
             wait_completed(c, id, false)
@@ -526,7 +913,7 @@ task run_cli(a)
         is "user"
             print(user_address())
         is "register-for"
-            let id be submit_for(c, ASSOCIATE_KEY, register_payload_for(c), ETH, 0)
+            let id be submit_for(c, ASSOCIATE_KEY, register_payload_for(c, verified), ETH, 0)
             print("register submitted by the facilitator: " + id)
             wait_completed(c, id, false)
             print("registered " + user_address() + " (the user paid nothing)")
@@ -534,7 +921,7 @@ task run_cli(a)
             let plain be json_encode(json_decode(a[1]))
             let amount be when length(a) > 2 then int_of(a[2]) otherwise 0
             let token be lower(arg_or(a, 3, ETH))
-            let payload be seal(derive_key(p521_key(), tee_public_key(c)), bytes(plain))
+            let payload be seal_for_executor(c, bytes(plain), verified)
             let id be submit_for(c, PROCESS, payload, token, amount)
             print("request submitted by the facilitator for " + user_address() + ": " + id)
             let row be wait_completed(c, id, false)
@@ -569,10 +956,12 @@ task run_cli(a)
         otherwise
             usage()
 
-run_cli(args())
+-- `--verified` may sit anywhere in the command line; it is a mode, not a positional argument.
+let argv be args()
+run_cli(where(argv, (x) => x != "--verified"), contains(argv, "--verified"))
 
 -- ---------------------------------------------------------------------------------------
--- Tests (pure: no chain, no network): `synsema test vela_client.syn`
+-- tests (pure: no chain, no network): `synsema test vela_client.syn`
 -- ---------------------------------------------------------------------------------------
 
 test "decimal text becomes an exact integer beyond 2^53"
@@ -642,3 +1031,103 @@ test "submitRequest calldata carries the selector and the ETH value rule is asse
     assert_eq(slice(data, 0, 4), abi_selector("submitRequest(uint8,uint64,uint8,bytes,address,uint256,uint256)"))
     assert_eq(length(SIG_REQUEST_SUBMITTED), 66)
     assert_eq(length(SIG_DEPLOY_SUBMITTED), 66)
+
+test "a failed request is reported by its message first; the code is a datum, never interpreted"
+    let m be failure_message("0xab", {"status": 1, "errorCode": 12, "errorMessage": "insufficient fuel"})
+    assert(starts_with(m, "request 0xab failed: insufficient fuel"))
+    assert(contains(m, "errorCode 12"))
+    assert(contains(failure_message("0xab", {"status": 1, "errorCode": 2, "errorMessage": nothing}), "(no message)"))
+
+test "updateTee / updateTeeStep1 calldata gives back the attestation document; anything else is refused"
+    let doc be bytes("a COSE_Sign1 document, in real life")
+    let whole be attestation_of_calldata(abi_encode("updateTee(bytes)", [doc]))
+    assert_eq(whole["document"], doc)
+    assert_eq(whole["via"], "updateTee")
+    let step be attestation_of_calldata(abi_encode("updateTeeStep1(bytes)", [doc]))
+    assert_eq(step["document"], doc)
+    assert_eq(step["via"], "updateTeeStep1")
+    -- The NoAttestationTeeAuthenticator's updateTee(address,bytes) is not an attestation
+    assert_error(() => attestation_of_calldata(abi_encode("updateTee(address,bytes)", ["0x1111111111111111111111111111111111111111", doc])))
+    assert_error(() => attestation_of_calldata(abi_encode("updateTeeStep4()", [])))
+    assert_error(() => attestation_of_calldata(bytes([1, 2])))
+
+test "the attested key matches getPubSecp521r1() raw or as DER, and nothing else"
+    let point be bytes([4]) + random_bytes(132)
+    let der be bytes("30819b301006072a8648ce3d020106052b81040023038186", "hex") + bytes([0]) + point
+    assert_eq(key_matches(point, point), "raw (0x04 ‖ X ‖ Y)")
+    assert_eq(key_matches(der, point), "DER SubjectPublicKeyInfo")
+    assert_eq(key_matches(bytes([4]) + random_bytes(132), point), nothing)
+    assert_eq(key_matches(nothing, point), nothing)
+
+test "binding the document to the chain fails on the key, the signer, the PCR0 or --pcr0, each on its own"
+    let key be bytes([4]) + random_bytes(132)
+    let signer be "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"
+    let pcr0 be "0x" + decode(random_bytes(48), "hex")
+    let att be {"public_key": key, "user_data": hex_bytes(signer), "measurements": {"pcr0": slice(pcr0, 2, length(pcr0))}}
+    assert_eq(bind_attestation(att, key, signer, pcr0, nothing), "raw (0x04 ‖ X ‖ Y)")
+    assert_eq(bind_attestation(att, key, lower(signer), upper(pcr0), pcr0), "raw (0x04 ‖ X ‖ Y)")
+    assert_error(() => bind_attestation(att, bytes([4]) + random_bytes(132), signer, pcr0, nothing))
+    assert_error(() => bind_attestation(att, key, "0x1111111111111111111111111111111111111111", pcr0, nothing))
+    assert_error(() => bind_attestation(att, key, signer, "0x" + decode(random_bytes(48), "hex"), nothing))
+    assert_error(() => bind_attestation(att, key, signer, pcr0, "0x" + decode(random_bytes(48), "hex")))
+    assert_error(() => bind_attestation({"public_key": key, "user_data": bytes([1, 2, 3]), "measurements": {"pcr0": pcr0}}, key, signer, pcr0, nothing))
+
+test "hex quantities round-trip the JSON-RPC way (no leading zeros, 0x0 for zero)"
+    assert_eq(hex_quantity(0), "0x0")
+    assert_eq(hex_quantity(5), "0x5")
+    assert_eq(hex_quantity(26), "0x1a")
+    assert_eq(hex_quantity(65536), "0x10000")
+    assert_eq(quantity_of("0x1a"), 26)
+    assert_eq(quantity_of("0x0"), 0)
+    assert_eq(quantity_of("0x10000"), 65536)
+    assert_eq(log_order({"blockNumber": "0x2", "logIndex": "0x3"}), 200003)
+    assert_eq(address_of_topic("0x000000000000000000000000dc64a140aa3e981100a9beca4e685f962f0cf6c9"), "0xdc64a140aa3e981100a9beca4e685f962f0cf6c9")
+
+test "updatePcr0 calldata yields the new PCR0 only when it hashes to the event's indexed topic"
+    let value be random_bytes(48)
+    let topic be hex_of(keccak256(value))
+    assert_eq(pcr0_of_calldata(abi_encode("updatePcr0(bytes)", [value]), topic), hex_of(value))
+    assert_eq(pcr0_of_calldata(abi_encode("updatePcr0(bytes)", [random_bytes(48)]), topic), nothing)
+    assert_eq(pcr0_of_calldata(abi_encode("updateTee(bytes)", [value]), topic), nothing)
+    assert_eq(pcr0_of_calldata(bytes([]), topic), nothing)
+
+test "the allowlist is the replay of AddedAuthority / RemovedAuthority in chain order"
+    task topic_of(addr)
+        give "0x" + decode(int_to_bytes(0, 12), "hex") + slice(addr, 2, length(addr))
+    let alice be "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    let bob be "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    let added be [{"blockNumber": "0x5", "logIndex": "0x0", "topics": [SIG_ADDED_AUTHORITY, "0x7", topic_of(alice)]}, {"blockNumber": "0x6", "logIndex": "0x1", "topics": [SIG_ADDED_AUTHORITY, "0x7", topic_of(bob)]}, {"blockNumber": "0x9", "logIndex": "0x0", "topics": [SIG_ADDED_AUTHORITY, "0x7", topic_of(alice)]}]
+    let removed be [{"blockNumber": "0x8", "logIndex": "0x0", "topics": [SIG_REMOVED_AUTHORITY, "0x7", topic_of(alice)]}]
+    assert_eq(allowlist_replay(added, removed), [alice, bob])
+    -- Removed after the last add: gone
+    let removed_late be removed + [{"blockNumber": "0x9", "logIndex": "0x1", "topics": [SIG_REMOVED_AUTHORITY, "0x7", topic_of(alice)]}]
+    assert_eq(allowlist_replay(added, removed_late), [bob])
+    assert_eq(allowlist_replay([], []), [])
+
+test "the governance report renders every section from a fixed map, as text and as JSON"
+    let g be {
+        "from_block": "0x0",
+        "processor": {"address": "0xP", "fee_collector": "0xF", "min_fee_per_request": 100, "max_num_of_applications": 10, "max_queue_size": 10, "selection_grace": nothing, "extension": nothing, "tee_authenticator": "0xT", "authority_registry": "0xR", "token_allowlist": "0xL"},
+        "tee_authenticator": {"address": "0xT", "owner": "0xO", "attested": true, "pcr0": "0xabc", "nitro_prover": "0xN", "max_verification_age": 3600, "tee_signer": "0xS", "pub_secp521r1": "0x04ff", "pcr0_history": [{"block": 12, "tx": "0xt1", "old_hash": "0xh0", "new_hash": "0xh1", "new": "0xabc"}, {"block": 15, "tx": "0xt2", "old_hash": "0xh1", "new_hash": "0xh2", "new": nothing}], "tee_updates": [{"block": 13, "tx": "0xt3", "old_signer": "0x0", "new_signer": "0xS"}]},
+        "authority_registry": {"address": "0xR", "owner": "0xO", "default_authority": "0xD", "app_authority": nothing},
+        "authority": {"app_id": 7, "contract": "0xD", "owner": "0xO", "allowlist": [{"authority": "0xa1", "allowed": true}, {"authority": "0xa2", "allowed": false}]}
+    }
+    let out be table(governance_rows(g))
+    assert(contains(out, "ProcessorEndpoint 0xP"))
+    assert(contains(out, "minFeePerRequest"))
+    assert(contains(out, "selectionGrace (dev)") and contains(out, "n/a"))
+    assert(contains(out, "Nitro, PCR0 pinned"))
+    assert(contains(out, "2 update(s)"))
+    assert(contains(out, "block 12") and contains(out, "0xabc  tx 0xt1"))
+    assert(contains(out, "value not in this tx's calldata"))
+    assert(contains(out, "0x0 → 0xS"))
+    assert(contains(out, "none: the default applies"))
+    assert(contains(out, "Authority for app 7 0xD"))
+    assert(contains(out, "0xa1") and contains(out, "0xa2  (event replay says allowed, the contract says NO"))
+    assert(length(json_decode(json_encode(g))["tee_authenticator"]["pcr0_history"]) == 2)
+    -- No attestation, no app id, empty history
+    let bare be {"from_block": "0x0", "processor": g["processor"], "tee_authenticator": {"address": "0xT", "owner": "0xO", "attested": false, "pcr0": nothing, "nitro_prover": nothing, "max_verification_age": nothing, "tee_signer": "0xS", "pub_secp521r1": "0x04ff", "pcr0_history": [], "tee_updates": []}, "authority_registry": {"address": nothing}, "authority": {"app_id": nothing}}
+    let out2 be table(governance_rows(bare))
+    assert(contains(out2, "NONE: the key is the owner's word"))
+    assert(contains(out2, "set by the constructor"))
+    assert(contains(out2, "set VELA_APP_ID"))

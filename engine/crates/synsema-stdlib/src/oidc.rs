@@ -1,4 +1,4 @@
-//! T3 — Verificación de tokens OIDC de TERCEROS (RS256/ES256) con JWKS.
+//! Verificación de tokens OIDC de TERCEROS (RS256/ES256) con JWKS.
 //!
 //! Destraba dos mundos con una sola pieza: "login with Google/GitHub/Auth0" en el
 //! mundo web, y **workload identity** en la nube (el agente corriendo en AWS/GCP/
@@ -34,6 +34,7 @@ use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::types::{syn_nothing, SynValue};
 
 use crate::json::json_to_syn;
+use crate::webauth::clock_or_error;
 
 fn err(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::new(msg.into()))
@@ -54,7 +55,7 @@ fn unix_now() -> i64 {
 }
 
 // =========================================================
-// Cache de JWKS (por URL, con TTL)
+// cache de JWKS (por URL, con TTL)
 // =========================================================
 
 struct CachedJwks {
@@ -135,25 +136,25 @@ fn fetch_jwks(
 }
 
 // =========================================================
-// Claves JWK
+// claves JWK
 // =========================================================
 
 /// Una clave pública del JWKS, ya en su forma verificable.
-enum Jwk {
+pub(crate) enum Jwk {
     Rsa { n: Vec<u8>, e: Vec<u8> },
     P256 { x: Vec<u8>, y: Vec<u8> },
 }
 
-struct KeyEntry {
-    kid: Option<String>,
-    alg: Option<String>,
-    key: Jwk,
+pub(crate) struct KeyEntry {
+    pub(crate) kid: Option<String>,
+    pub(crate) alg: Option<String>,
+    pub(crate) key: Jwk,
 }
 
 /// Parsea un documento JWKS. Las entradas que no se entienden se SALTEAN (un IdP
 /// puede publicar claves de tipos que no soportamos); si no queda ninguna útil, el
 /// verify falla por falta de clave, no por un parseo a medias.
-fn parse_jwks(body: &str) -> Vec<KeyEntry> {
+pub(crate) fn parse_jwks(body: &str) -> Vec<KeyEntry> {
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(body) else {
         return Vec::new();
     };
@@ -209,19 +210,21 @@ fn parse_jwks(body: &str) -> Vec<KeyEntry> {
 }
 
 /// Verifica la firma de `signing_input` con la clave dada, para el alg declarado.
-fn verify_with(key: &Jwk, alg: &str, signing_input: &[u8], sig: &[u8]) -> bool {
+pub(crate) fn verify_with(key: &Jwk, alg: &str, signing_input: &[u8], sig: &[u8]) -> bool {
     match (key, alg) {
         (Jwk::Rsa { n, e }, "RS256") => {
             use rsa::pkcs1v15::{Signature, VerifyingKey};
             use rsa::{BigUint, RsaPublicKey};
             // Módulo de menos de 2048 bits = clave débil: se rechaza en vez de
             // verificar contra ella (un IdP legítimo no publica claves así; si una
-            // aparece, es señal de configuración rota o de un JWKS suplantado).
-            if n.len() * 8 < 2040 {
+            // aparece, es señal de configuración rota o de un JWKS suplantado). Se mide
+            // En BITS del entero, no en bytes decodificados: un `n` de 1024 bits con ceros
+            // iniciales en el JWKS mediría 256 bytes y pasaría (L5 de la auditoría TEE).
+            let n = BigUint::from_bytes_be(n);
+            if n.bits() < 2048 {
                 return false;
             }
-            let Ok(pk) = RsaPublicKey::new(BigUint::from_bytes_be(n), BigUint::from_bytes_be(e))
-            else {
+            let Ok(pk) = RsaPublicKey::new(n, BigUint::from_bytes_be(e)) else {
                 return false;
             };
             let vk = VerifyingKey::<Sha256>::new(pk);
@@ -277,6 +280,9 @@ struct Expect {
     aud: Vec<String>,
     leeway: i64,
     algs: Vec<String>,
+    /// M12: el instante contra el que se mide `exp`/`nbf`/`iat`. Resuelto por el caller
+    /// (`opts.now`) o por el reloj del host, que exige la capability `time`.
+    now: i64,
 }
 
 fn b_oidc_verify(
@@ -298,6 +304,7 @@ fn b_oidc_verify(
     let mut jwks_url: Option<String> = None;
     let mut jwks_inline: Option<String> = None;
     let mut leeway: i64 = 60;
+    let mut now_opt: Option<i64> = None;
     let mut algs: Vec<String> = vec!["RS256".to_string(), "ES256".to_string()];
     for (k, v) in &opts {
         match k.as_str() {
@@ -322,6 +329,21 @@ fn b_oidc_verify(
                     }
                 })
             }
+            // M12: `now` reemplaza al reloj (enclave sin reloj confiable, veredicto reproducible).
+            "now" => match v {
+                SynValue::Number(n) => {
+                    now_opt = Some(n.to_i64_trunc().filter(|t| *t >= 0).ok_or_else(|| {
+                        err(format!("{}: now must be a unix timestamp in seconds (integer >= 0)", F))
+                    })?)
+                }
+                other => {
+                    return Err(err(format!(
+                        "{}: now must be an integer (unix seconds), got {}",
+                        F,
+                        other.type_name()
+                    )))
+                }
+            },
             "leeway" => match v {
                 SynValue::Number(n) => {
                     leeway = n.to_i64_trunc().filter(|l| *l >= 0).ok_or_else(|| {
@@ -354,7 +376,7 @@ fn b_oidc_verify(
             }
             other => {
                 return Err(err(format!(
-                    "{}: unknown option {:?} (valid options: iss, aud, jwks_url, jwks, leeway, alg)",
+                    "{}: unknown option {:?} (valid options: iss, aud, jwks_url, jwks, leeway, alg, now)",
                     F, other
                 )))
             }
@@ -389,7 +411,11 @@ fn b_oidc_verify(
         SynValue::Text(s) => s.to_string(),
         _ => return Ok(syn_nothing()),
     };
-    let expect = Expect { iss, aud, leeway, algs };
+    let now = match now_opt {
+        Some(n) => n,
+        None => clock_or_error(caps, F, "now")?,
+    };
+    let expect = Expect { iss, aud, leeway, algs, now };
 
     // Partido en dos pasos porque el `kid` desconocido fuerza un re-fetch (rotación
     // de claves del IdP) — y ese re-fetch es red, o sea que puede fallar con error.
@@ -422,7 +448,7 @@ fn b_oidc_verify(
 }
 
 /// Split del JWT + parse del header. `None` = malformado.
-fn split_token(token: &str) -> Option<(serde_json::Value, Vec<u8>, Vec<u8>)> {
+pub(crate) fn split_token(token: &str) -> Option<(serde_json::Value, Vec<u8>, Vec<u8>)> {
     let mut parts = token.split('.');
     let (h, p, s) = (parts.next()?, parts.next()?, parts.next()?);
     if parts.next().is_some() {
@@ -490,21 +516,22 @@ fn verify_claims(
             return None;
         }
     }
-    // Ventana temporal: `exp` es obligatorio en OIDC; `nbf`/`iat` si vienen.
-    let now = unix_now();
+    // Ventana temporal: `exp` es obligatorio en OIDC; `nbf`/`iat` si vienen. Aritmética saturante
+    // (clase de M6): los claims los elige quien manda el token, y `exp = i64::MAX` desbordaba.
+    let now = expect.now;
     let exp = claims.get("exp")?.as_i64()?;
-    if now > exp + expect.leeway {
+    if now > exp.saturating_add(expect.leeway) {
         return None;
     }
     if let Some(nbf) = claims.get("nbf") {
-        if now < nbf.as_i64()? - expect.leeway {
+        if now < nbf.as_i64()?.saturating_sub(expect.leeway) {
             return None;
         }
     }
     if let Some(iat) = claims.get("iat") {
         // Un `iat` en el futuro (fuera del leeway) es un token de un emisor con el
         // reloj roto o fabricado: rechazo.
-        if now < iat.as_i64()? - expect.leeway {
+        if now < iat.as_i64()?.saturating_sub(expect.leeway) {
             return None;
         }
     }
@@ -512,7 +539,7 @@ fn verify_claims(
 }
 
 // =========================================================
-// Registro
+// registro
 // =========================================================
 
 /// Registra `oidc_verify`. Cierra sobre el `CapabilitySet` porque el fetch del
@@ -529,7 +556,7 @@ pub fn register_oidc_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilityS
 mod tests {
     use super::*;
     use synsema_core::bytesutil::b64url_encode;
-    use synsema_core::types::{syn_list, syn_map, syn_text};
+    use synsema_core::types::{syn_int, syn_list, syn_map, syn_text};
 
     fn text(s: &str) -> SynValue {
         syn_text(s)
@@ -543,8 +570,19 @@ mod tests {
         syn_map(m)
     }
 
+    /// El caso "reloj del host" (como `run` sin `--deterministic`): `oidc_verify` sin `opts.now`
+    /// exige `time` desde M12.
     fn caps() -> Rc<RefCell<CapabilitySet>> {
-        Rc::new(RefCell::new(CapabilitySet::new("test")))
+        let mut cs = CapabilitySet::new("test");
+        cs.grant(synsema_capabilities::model::Capability::new(
+            synsema_capabilities::model::CapabilityType::Time,
+            None,
+        ));
+        Rc::new(RefCell::new(cs))
+    }
+
+    fn caps_no_time() -> Rc<RefCell<CapabilitySet>> {
+        Rc::new(RefCell::new(CapabilitySet::new("deterministic")))
     }
 
     fn ok(r: Result<SynValue, Control>) -> SynValue {
@@ -606,6 +644,61 @@ mod tests {
         let mut o = opts;
         o.push(("jwks", text(jwks)));
         ok(b_oidc_verify(&[text(token), map(o)], &caps()))
+    }
+
+    /// M12 : `oidc_verify` sin `opts.now` lee el reloj del host → exige `time`; con `now`
+    /// Explícito el veredicto es reproducible. Y los claims del token (que elige quien lo manda)
+    /// Ya no desbordan: `exp = i64::MAX`, `nbf`/`iat = i64::MIN` (clase de M6).
+    #[test]
+    fn clock_is_gated_and_claims_cannot_overflow() {
+        let idp = FakeIdp::new();
+        let jwks = idp.jwks("k1");
+        let token = idp.token("k1", &base_claims(""));
+        let base_opts = || {
+            vec![
+                ("iss", text("https://idp.example.com")),
+                ("aud", text("my-client-id")),
+                ("jwks", text(&jwks)),
+            ]
+        };
+        const MSG: &str = "oidc_verify: this needs the clock. Add `require time` to the program, or pass opts.now explicitly (a unix timestamp in seconds) to verify against a clock you choose.";
+        let e = match b_oidc_verify(&[text(&token), map(base_opts())], &caps_no_time()) {
+            Err(Control::Error(e)) => e.to_string(),
+            other => panic!("esperaba error, got {:?}", other.is_ok()),
+        };
+        assert_eq!(e, MSG);
+        // Con `now` explícito: verifica sin `time`, y fuera de la ventana rechaza.
+        let now = unix_now();
+        let mut o = base_opts();
+        o.push(("now", syn_int(now)));
+        assert!(matches!(ok(b_oidc_verify(&[text(&token), map(o)], &caps_no_time())), SynValue::Map(_)));
+        let mut o = base_opts();
+        o.push(("now", syn_int(now + 10_000)));
+        assert!(matches!(ok(b_oidc_verify(&[text(&token), map(o)], &caps_no_time())), SynValue::Nothing));
+        // Claims extremos: sin panic, con el veredicto correcto.
+        let cases: [(&str, bool); 4] = [
+            (r#""exp":9223372036854775807,"iat":1700000000"#, true),
+            (r#""exp":9223372036854775807,"nbf":-9223372036854775808,"iat":1700000000"#, true),
+            (r#""exp":-9223372036854775808,"iat":1700000000"#, false),
+            (r#""exp":9223372036854775807,"iat":9223372036854775807"#, false),
+        ];
+        for (claims, expect_ok) in cases {
+            let tok = idp.token(
+                "k1",
+                &format!(r#"{{"iss":"https://idp.example.com","aud":"my-client-id","sub":"u1",{}}}"#, claims),
+            );
+            let mut o = base_opts();
+            o.push(("now", syn_int(now)));
+            let out = ok(b_oidc_verify(&[text(&tok), map(o)], &caps_no_time()));
+            assert_eq!(matches!(out, SynValue::Map(_)), expect_ok, "claims {}", claims);
+        }
+        // `now` mal tipado / negativo: error del caller.
+        let mut o = base_opts();
+        o.push(("now", text("x")));
+        assert!(b_oidc_verify(&[text(&token), map(o)], &caps_no_time()).is_err());
+        let mut o = base_opts();
+        o.push(("now", syn_int(-1)));
+        assert!(b_oidc_verify(&[text(&token), map(o)], &caps_no_time()).is_err());
     }
 
     #[test]
@@ -959,7 +1052,20 @@ mod tests {
         let weak_signing: SigningKey<Sha256> = SigningKey::new(weak_sk);
         let weak_sig = weak_signing.sign(si.as_bytes());
         let weak_token = format!("{}.{}", si, b64url_encode(&weak_sig.to_bytes()));
-        assert!(matches!(verify(&weak_token, opts, &weak_jwks), SynValue::Nothing));
+        assert!(matches!(verify(&weak_token, opts.clone(), &weak_jwks), SynValue::Nothing));
+
+        // L5: el mismo `n` de 1024 bits rellenado con ceros iniciales hasta 256 bytes (2048 bits
+        // "de largo") sigue siendo débil: se mide en bits del entero, no en bytes.
+        let weak_n = weak_pk.n().to_bytes_be();
+        let mut padded_n = vec![0u8; 256 - weak_n.len()];
+        padded_n.extend_from_slice(&weak_n);
+        assert_eq!(padded_n.len(), 256);
+        let padded_jwks = format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"w1","alg":"RS256","use":"sig","n":"{}","e":"{}"}}]}}"#,
+            b64url_encode(&padded_n),
+            b64url_encode(&weak_pk.e().to_bytes_be())
+        );
+        assert!(matches!(verify(&weak_token, opts, &padded_jwks), SynValue::Nothing));
     }
 
     #[test]

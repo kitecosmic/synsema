@@ -20,7 +20,7 @@ assert_error(fn)                   -- passes if calling fn() raises an error; FA
 
 ## `test` blocks
 
-```
+```synsema
 task add(a, b)
     give a + b
 

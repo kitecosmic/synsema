@@ -1,4 +1,4 @@
-//! `synsema code` — inteligencia de código para agentes (spec `specs/code-intelligence.md`).
+//! `synsema code` — inteligencia de código para agentes.
 //!
 //! Dos superficies sobre el mismo índice (`synsema_core::codeintel`):
 //! - CLI: `synsema code <tool> [args] [--json]` (humano por defecto, JSON para scripts).

@@ -1,4 +1,4 @@
-//! E2E del binario real (spec `specs/tanda-motor-lamps.md`): los flags del host comunes
+//! E2E del binario real: los flags del host comunes
 //! (`--sandbox`/`--cap-set`/`--profile`/`--audit`), `conform` honrando el techo (hasta
 //! v0.6.13 lo ignoraba), flags desconocidos → exit 2, `run -` (stdin), `run --format json`
 //! (el informe con la forma de `syn.run()`), `--` para `args()`, y el JSONL de `--audit`.

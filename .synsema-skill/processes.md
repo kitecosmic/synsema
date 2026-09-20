@@ -4,7 +4,7 @@ Synsema orchestrates external tools (git, ffmpeg, python, node, a shell…) with
 **Deliberately not `bash`**: args go as a **list** (no shell parsing, no quoting injection), and each
 command is gated by the **`exec`** capability — auditable by reading the `require` lines.
 
-```
+```synsema
 require exec("git")
 let r be run("git", ["status", "--short"])
 when r["exit_code"] == 0
@@ -41,17 +41,17 @@ Without it: `Capability not granted: exec("<cmd>")`. See [capabilities.md](capab
 
 ## Patterns
 **Specific tool (safest, injection-proof)** — args as a list, even if from an LLM/user:
-```
+```synsema
 require exec("ffmpeg")
 run("ffmpeg", ["-i", input, "-vn", output])
 ```
 **Inline code:**
-```
+```synsema
 require exec("node")
 run("node", ["-e", "console.log(40+2)"])     -- or run("python", ["-c", code])
 ```
 **Pipelines / shell features** (`run` has no pipes; the shell does — pass the script as one arg):
-```
+```synsema
 require exec("bash")
 run("bash", ["-c", "ls | grep .syn | wc -l"])
 require exec("powershell")
@@ -68,7 +68,7 @@ run("sort", [], 30, {"stdin": "b\na\n"})                              -- text/by
 run("find", ["."], 60, {"max_output": 1000000})                      -- cap capture (check *_truncated)
 ```
 **Timeout (raise, catchable):**
-```
+```synsema
 try
     run("cargo", ["build"], 600)
 recover err
@@ -117,7 +117,7 @@ enforced by the child process itself. See [capabilities.md](capabilities.md) and
 
 ## Give an LLM a shell tool (least-privilege)
 A tool is a user task; wrap `run` and dispatch with `call_tool` (runs with ONLY what it declares):
-```
+```synsema
 task shell(cmd)
     require exec("bash")
     give run("bash", ["-c", cmd])
@@ -141,7 +141,7 @@ scope = the cmd as written), args as a list, never a shell. Pipes by default (a 
 that checks "is a tty" behaves as in CI); `pty: true` gives it a real terminal — see
 § Pseudo-terminal below.
 
-```
+```synsema
 require exec("cargo")
 let p be proc_spawn("cargo", ["test"], {"cwd": "./repo"})
 while true
@@ -208,7 +208,7 @@ the child inside a real pseudo-terminal (openpty on Linux/macOS, ConPTY on Windo
 pipe doesn't; it changes how the child behaves, not what it may do. `sandbox` denies it
 like any `exec`.
 
-```
+```synsema
 require exec("npm")
 let p be proc_spawn("npm", ["install"], {"pty": true, "cols": 120, "rows": 40})
 let screen be ""
@@ -262,7 +262,7 @@ delivers **every key as an event** in the same hub as `proc_*`/`bus_*`/`watch` �
 CLI, a `/` command palette that filters as you type, a line editor with history, or a ↑↓ menu
 for `approve` is a `select` loop in Synsema, not a runtime feature. Gate: `require stdin`.
 
-```
+```synsema
 require stdin
 require stdout
 let term be term_open()                  -- nothing without a TTY / under serve, test, wasm
@@ -325,7 +325,7 @@ Changes on disk as a **handle with events**, in the same hub as processes, socke
 bus (so it goes into `select`). Gate: `file_read(path)` — watching a tree is reading it
 (`require file("src")` + `require file("src/*")`, like `list_dir`).
 
-```
+```synsema
 require file("src")
 require file("src/*")
 require exec("cargo")

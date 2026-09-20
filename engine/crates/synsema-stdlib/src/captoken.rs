@@ -1,4 +1,4 @@
-//! T4 — Tokens de capacidad ATENUABLES (estilo macaroons/biscuits).
+//! Tokens de capacidad ATENUABLES (estilo macaroons/biscuits).
 //!
 //! Bearer/JWT responde "¿quién sos?"; un captoken responde "¿qué podés hacer?" y
 //! —la parte que no tiene ningún runtime mainstream— **el portador puede emitir
@@ -35,17 +35,19 @@
 //! (`opts.revoked`, típicamente leída de redis/sql). Sin esto, el primer incidente
 //! lo improvisa mal.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use indexmap::IndexMap;
 
-use synsema_capabilities::model::{capability_type_from_name, Capability};
+use synsema_capabilities::model::{capability_type_from_name, Capability, CapabilitySet};
 use synsema_core::bytesutil::{b64url_decode, b64url_encode};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::secret::constant_time_eq;
 use synsema_core::types::{syn_int, syn_list, syn_map, syn_nothing, syn_text, SynValue};
 
 use crate::blockchain_algorand::{mp_write, Mp};
+use crate::webauth::clock_or_error;
 use crate::secrets::{hmac_compute, Algo};
 
 fn err(msg: impl Into<String>) -> Control {
@@ -70,7 +72,7 @@ fn unix_now() -> i64 {
 }
 
 // =========================================================
-// Modelo
+// modelo
 // =========================================================
 
 /// Un bloque de la cadena: permisos + caveats. El bloque 0 lo firma la raíz; cada
@@ -106,7 +108,7 @@ struct Token {
 }
 
 // =========================================================
-// Serialización canónica (msgpack del árbol)
+// serialización canónica (msgpack del árbol)
 // =========================================================
 
 /// Un map canónico: claves ordenadas bytewise, SIN podar zero-values (a
@@ -205,7 +207,7 @@ fn encode_token(t: &Token) -> String {
 }
 
 // =========================================================
-// Decodificación (msgpack — el árbol no tiene decoder; este es acotado al formato)
+// decodificación (msgpack — el árbol no tiene decoder; este es acotado al formato)
 // =========================================================
 
 /// Cursor de lectura msgpack, estricto y acotado al subset que emite este módulo.
@@ -366,7 +368,7 @@ fn decode_token(s: &str) -> Option<Token> {
 }
 
 // =========================================================
-// Álgebra: la atenuación jamás amplía
+// álgebra: la atenuación jamás amplía
 // =========================================================
 
 /// Una capability concreta desde `(nombre, scope)`. El nombre debe existir en el
@@ -466,7 +468,7 @@ fn caveats_narrow(parent: &Caveats, child: &Caveats) -> bool {
 }
 
 // =========================================================
-// Lectura de args
+// lectura de args
 // =========================================================
 
 fn key_material(v: &SynValue, who: &str) -> Result<Vec<u8>, Control> {
@@ -541,9 +543,13 @@ fn parse_caveats(
     m: &IndexMap<String, SynValue>,
     who: &str,
     default_ttl: Option<i64>,
+    caps: &Rc<RefCell<CapabilitySet>>,
 ) -> Result<Caveats, Control> {
     let mut c = Caveats::default();
     let mut ttl: Option<i64> = None;
+    // M12: `ttl` es relativo, así que volverlo `exp` absoluto LEE EL RELOJ. `now` explícito evita
+    // tocarlo (y hace el token reproducible); sin él hace falta la capability `time`.
+    let mut now_opt: Option<i64> = None;
     for (k, v) in m {
         match k.as_str() {
             "ttl" => match v {
@@ -595,17 +601,37 @@ fn parse_caveats(
                 sp.sort();
                 c.spend = sp;
             }
+            "now" => match v {
+                SynValue::Number(n) => {
+                    now_opt = Some(n.to_i64_trunc().ok_or_else(|| {
+                        err(format!("{}: now must be a unix timestamp (integer)", who))
+                    })?)
+                }
+                other => {
+                    return Err(err(format!(
+                        "{}: now must be a unix timestamp (integer), got {}",
+                        who,
+                        other.type_name()
+                    )))
+                }
+            },
             other => {
                 return Err(err(format!(
-                    "{}: unknown caveat {:?} (valid caveats: ttl, aud, ip, method, spend)",
+                    "{}: unknown caveat {:?} (valid caveats: ttl, aud, ip, method, spend; plus now, \
+                     the instant ttl is measured from)",
                     who, other
                 )))
             }
         }
     }
-    // TTL → exp absoluto (el token viaja con el instante, no con la duración).
+    // TTL → exp absoluto (el token viaja con el instante, no con la duración). Saturante: `ttl`
+    // Viene del caller y `ttl = i64::MAX` desbordaba (misma clase que M6).
     if let Some(t) = ttl.or(default_ttl) {
-        c.exp = Some(unix_now() + t);
+        let base = match now_opt {
+            Some(n) => n,
+            None => clock_or_error(caps, who, "now")?,
+        };
+        c.exp = Some(base.saturating_add(t));
     }
     Ok(c)
 }
@@ -614,7 +640,7 @@ fn parse_caveats(
 // captoken_mint
 // =========================================================
 
-fn b_captoken_mint(args: &[SynValue]) -> Result<SynValue, Control> {
+fn b_captoken_mint(args: &[SynValue], time_caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
     const F: &str = "captoken_mint";
     if !(2..=3).contains(&args.len()) {
         return Err(err(format!("{}(caps, root_key, opts?) takes 2 or 3 arguments", F)));
@@ -644,7 +670,7 @@ fn b_captoken_mint(args: &[SynValue]) -> Result<SynValue, Control> {
         }
     }
     // El TTL por defecto es corto a propósito (sin revocación central).
-    let caveats = parse_caveats(&caveat_opts, F, Some(DEFAULT_TTL))?;
+    let caveats = parse_caveats(&caveat_opts, F, Some(DEFAULT_TTL), time_caps)?;
     let id = match id {
         Some(i) if !i.trim().is_empty() => i,
         Some(_) => return Err(err(format!("{}: id cannot be empty", F))),
@@ -665,7 +691,7 @@ fn b_captoken_mint(args: &[SynValue]) -> Result<SynValue, Control> {
 // captoken_attenuate — SIN la clave raíz
 // =========================================================
 
-fn b_captoken_attenuate(args: &[SynValue]) -> Result<SynValue, Control> {
+fn b_captoken_attenuate(args: &[SynValue], time_caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
     const F: &str = "captoken_attenuate";
     if !(2..=3).contains(&args.len()) {
         return Err(err(format!(
@@ -700,7 +726,7 @@ fn b_captoken_attenuate(args: &[SynValue]) -> Result<SynValue, Control> {
         Some(v) => as_map(v, F, "opts")?,
     };
     // Sin TTL propio, el bloque hereda el `exp` del padre (no lo extiende).
-    let mut caveats = parse_caveats(&opts, F, None)?;
+    let mut caveats = parse_caveats(&opts, F, None, time_caps)?;
     let parent = t.blocks.last().expect("decode garantiza >= 1 bloque").clone();
     if caveats.exp.is_none() {
         caveats.exp = parent.caveats.exp;
@@ -760,7 +786,7 @@ fn caps_to_syn(caps: &[(String, Vec<String>)]) -> SynValue {
     syn_map(m)
 }
 
-fn b_captoken_verify(args: &[SynValue]) -> Result<SynValue, Control> {
+fn b_captoken_verify(args: &[SynValue], time_caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
     const F: &str = "captoken_verify";
     if !(2..=3).contains(&args.len()) {
         return Err(err(format!("{}(token, root_key, opts?) takes 2 or 3 arguments", F)));
@@ -779,7 +805,8 @@ fn b_captoken_verify(args: &[SynValue]) -> Result<SynValue, Control> {
     let mut ctx_aud: Option<String> = None;
     let mut ctx_ip: Option<String> = None;
     let mut ctx_method: Option<String> = None;
-    let mut at: i64 = unix_now();
+    // M12: sin `at` explícito el veredicto depende del reloj del host → capability `time`.
+    let mut at_opt: Option<i64> = None;
     let mut revoked: Vec<String> = Vec::new();
     for (k, v) in &opts {
         match k.as_str() {
@@ -788,9 +815,9 @@ fn b_captoken_verify(args: &[SynValue]) -> Result<SynValue, Control> {
             "method" => ctx_method = Some(v.to_string().to_ascii_uppercase()),
             "at" => match v {
                 SynValue::Number(n) => {
-                    at = n.to_i64_trunc().ok_or_else(|| {
+                    at_opt = Some(n.to_i64_trunc().ok_or_else(|| {
                         err(format!("{}: at must be a unix timestamp (integer)", F))
-                    })?
+                    })?)
                 }
                 other => {
                     return Err(err(format!(
@@ -818,6 +845,12 @@ fn b_captoken_verify(args: &[SynValue]) -> Result<SynValue, Control> {
             }
         }
     }
+
+    // M12: sin `at` explícito, el instante sale del reloj del host → capability `time`.
+    let at = match at_opt {
+        Some(a) => a,
+        None => clock_or_error(time_caps, F, "at")?,
+    };
 
     // Toda falla → `nothing`, sin detalle de la causa (mismo contrato que
     // `jwt_verify`/`http_signature_verify`).
@@ -1012,7 +1045,7 @@ fn b_captoken_allows(args: &[SynValue]) -> Result<SynValue, Control> {
 }
 
 // =========================================================
-// Registro
+// registro
 // =========================================================
 
 /// Registra `captoken_mint`/`captoken_attenuate`/`captoken_verify`/
@@ -1020,14 +1053,25 @@ fn b_captoken_allows(args: &[SynValue]) -> Result<SynValue, Control> {
 /// transforms criptográficos locales — el poder está en la clave raíz, que es un
 /// `secret` sellado, y lo que un token concede sigue gateado por el
 /// `CapabilitySet` del proceso que lo usa. Wired en `wire_common_with_state`.
-pub fn register_captoken_builtins(interp: &Interpreter) {
-    interp.register_builtin("captoken_mint", -1, Rc::new(|_i, a, _l| b_captoken_mint(a)));
-    interp.register_builtin(
-        "captoken_attenuate",
-        -1,
-        Rc::new(|_i, a, _l| b_captoken_attenuate(a)),
-    );
-    interp.register_builtin("captoken_verify", -1, Rc::new(|_i, a, _l| b_captoken_verify(a)));
+pub fn register_captoken_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
+    // M12: `ttl`→`exp` (mint/attenuate) y el instante de `verify` leen el reloj cuando no vienen
+    // explícitos → misma puerta `time` que `now()`. Lo demás sigue puro.
+    {
+        let caps = caps.clone();
+        interp.register_builtin("captoken_mint", -1, Rc::new(move |_i, a, _l| b_captoken_mint(a, &caps)));
+    }
+    {
+        let caps = caps.clone();
+        interp.register_builtin(
+            "captoken_attenuate",
+            -1,
+            Rc::new(move |_i, a, _l| b_captoken_attenuate(a, &caps)),
+        );
+    }
+    {
+        let caps = caps.clone();
+        interp.register_builtin("captoken_verify", -1, Rc::new(move |_i, a, _l| b_captoken_verify(a, &caps)));
+    }
     interp.register_builtin("captoken_allows", -1, Rc::new(|_i, a, _l| b_captoken_allows(a)));
 }
 
@@ -1062,6 +1106,41 @@ mod tests {
         }
     }
 
+    fn err_of(r: Result<SynValue, Control>) -> String {
+        match r {
+            Err(Control::Error(e)) => e.to_string(),
+            Ok(v) => panic!("esperaba error, got {}", v),
+            Err(_) => panic!("control"),
+        }
+    }
+
+    /// El caso "reloj del host" (como `run` sin `--deterministic`): desde M12, `ttl`→`exp` y el
+    /// instante de `verify` exigen `time` cuando no vienen explícitos.
+    fn caps_with_time() -> Rc<RefCell<CapabilitySet>> {
+        let mut cs = CapabilitySet::new("test");
+        cs.grant(Capability::new(
+            synsema_capabilities::model::CapabilityType::Time,
+            None,
+        ));
+        Rc::new(RefCell::new(cs))
+    }
+
+    fn caps_no_time() -> Rc<RefCell<CapabilitySet>> {
+        Rc::new(RefCell::new(CapabilitySet::new("deterministic")))
+    }
+
+    fn cm(args: &[SynValue]) -> Result<SynValue, Control> {
+        b_captoken_mint(args, &caps_with_time())
+    }
+
+    fn ca(args: &[SynValue]) -> Result<SynValue, Control> {
+        b_captoken_attenuate(args, &caps_with_time())
+    }
+
+    fn cv(args: &[SynValue]) -> Result<SynValue, Control> {
+        b_captoken_verify(args, &caps_with_time())
+    }
+
     fn verified_map(v: &SynValue) -> IndexMap<String, SynValue> {
         match v {
             SynValue::Map(m) => m.borrow().clone(),
@@ -1072,7 +1151,57 @@ mod tests {
     const KEY: &str = "root-key";
 
     fn mint(caps: SynValue, opts: SynValue) -> String {
-        ok(b_captoken_mint(&[caps, text(KEY), opts])).to_string()
+        ok(cm(&[caps, text(KEY), opts])).to_string()
+    }
+
+    /// M12 : `ttl`→`exp` (mint/attenuate) y el instante de `verify` leen el reloj cuando
+    /// No vienen explícitos → exigen `time`. Con `now`/`at` explícitos el token es reproducible.
+    /// Y `ttl = i64::MAX` ya no desborda (clase de M6).
+    #[test]
+    fn clock_is_gated_and_ttl_cannot_overflow() {
+        let no_time = caps_no_time();
+        let caps_arg = || map(vec![("net", text("api.example.com"))]);
+        const MSG_MINT: &str = "captoken_mint: this needs the clock. Add `require time` to the program, or pass opts.now explicitly (a unix timestamp in seconds) to verify against a clock you choose.";
+        const MSG_VERIFY: &str = "captoken_verify: this needs the clock. Add `require time` to the program, or pass opts.at explicitly (a unix timestamp in seconds) to verify against a clock you choose.";
+        // Mint sin `now`: el TTL por defecto necesita el reloj.
+        assert_eq!(err_of(b_captoken_mint(&[caps_arg(), text(KEY), SynValue::Nothing], &no_time)), MSG_MINT);
+        assert_eq!(
+            err_of(b_captoken_mint(&[caps_arg(), text(KEY), map(vec![("ttl", syn_int(60))])], &no_time)),
+            MSG_MINT
+        );
+        // Con `now` explícito: firma sin tocar el reloj y el token es byte a byte reproducible.
+        let opts = || map(vec![("now", syn_int(1_750_000_000)), ("ttl", syn_int(3600)), ("id", text("fixed"))]);
+        let t1 = ok(b_captoken_mint(&[caps_arg(), text(KEY), opts()], &no_time)).to_string();
+        let t2 = ok(b_captoken_mint(&[caps_arg(), text(KEY), opts()], &no_time)).to_string();
+        assert_eq!(t1, t2, "sin reloj el token es determinista");
+        // Verify sin `at` → error; con `at` → veredicto reproducible dentro y fuera de la ventana.
+        assert_eq!(err_of(b_captoken_verify(&[text(&t1), text(KEY)], &no_time)), MSG_VERIFY);
+        let inside = map(vec![("at", syn_int(1_750_000_100))]);
+        let v = ok(b_captoken_verify(&[text(&t1), text(KEY), inside], &no_time));
+        let cav = verified_map(&verified_map(&v).get("caveats").unwrap().clone());
+        assert_eq!(cav.get("exp").unwrap().to_string(), "1750003600", "exp = now + ttl, sin reloj");
+        let outside = map(vec![("at", syn_int(1_750_003_601))]);
+        assert!(matches!(ok(b_captoken_verify(&[text(&t1), text(KEY), outside], &no_time)), SynValue::Nothing));
+        // Attenuate SIN ttl propio hereda el exp del padre: no toca el reloj ni necesita `time`.
+        let child = ok(b_captoken_attenuate(&[text(&t1), map(vec![("net", text("api.example.com"))]), SynValue::Nothing], &no_time)).to_string();
+        let at = map(vec![("at", syn_int(1_750_000_100))]);
+        assert!(matches!(ok(b_captoken_verify(&[text(&child), text(KEY), at], &no_time)), SynValue::Map(_)));
+        // …pero con `ttl` propio sí lo necesita.
+        assert!(err_of(b_captoken_attenuate(
+            &[text(&t1), map(vec![("net", text("api.example.com"))]), map(vec![("ttl", syn_int(10))])],
+            &no_time
+        ))
+        .contains("captoken_attenuate: this needs the clock"));
+        // `ttl = i64::MAX` con `now` grande: saturación, no panic.
+        let huge = map(vec![("now", syn_int(i64::MAX)), ("ttl", syn_int(i64::MAX))]);
+        let t3 = ok(b_captoken_mint(&[caps_arg(), text(KEY), huge], &no_time)).to_string();
+        assert!(matches!(
+            ok(b_captoken_verify(&[text(&t3), text(KEY), map(vec![("at", syn_int(0))])], &no_time)),
+            SynValue::Map(_)
+        ));
+        // El chequeo denegado quedó en el audit.
+        let log = synsema_capabilities::model::export_audit(&no_time);
+        assert!(log.iter().any(|e| e.source == "captoken_mint" && !e.granted && e.capability.contains("time")));
     }
 
     #[test]
@@ -1084,14 +1213,14 @@ mod tests {
             ]),
             SynValue::Nothing,
         );
-        let v = ok(b_captoken_verify(&[text(&t), text(KEY)]));
+        let v = ok(cv(&[text(&t), text(KEY)]));
         let m = verified_map(&v);
         assert_eq!(m.get("depth").unwrap().to_string(), "1");
         let caps = verified_map(&m.get("caps").unwrap().clone());
         assert!(caps.contains_key("net") && caps.contains_key("db"));
         // Clave equivocada → nothing.
         assert!(matches!(
-            ok(b_captoken_verify(&[text(&t), text("otra")])),
+            ok(cv(&[text(&t), text("otra")])),
             SynValue::Nothing
         ));
         // Un TTL corto por defecto vino puesto.
@@ -1112,7 +1241,7 @@ mod tests {
         );
         // Delega al subagente: sólo un host concreto, sin db, spend 10, ttl 300.
         // NOTA: no se pasa la clave raíz — ese es el punto.
-        let t2 = ok(b_captoken_attenuate(&[
+        let t2 = ok(ca(&[
             text(&t),
             map(vec![("net", text("api.example.com")), ("spend", text("USD"))]),
             map(vec![("ttl", syn_int(300)), ("spend", map(vec![("USD", syn_int(10))]))]),
@@ -1120,7 +1249,7 @@ mod tests {
         .to_string();
         assert_ne!(t, t2);
 
-        let v = ok(b_captoken_verify(&[text(&t2), text(KEY)]));
+        let v = ok(cv(&[text(&t2), text(KEY)]));
         let m = verified_map(&v);
         assert_eq!(m.get("depth").unwrap().to_string(), "2");
         let caps = verified_map(&m.get("caps").unwrap().clone());
@@ -1152,35 +1281,35 @@ mod tests {
             map(vec![("ttl", syn_int(300))]),
         );
         // (1) Capability nueva que el padre no tiene.
-        assert!(b_captoken_attenuate(&[
+        assert!(ca(&[
             text(&t),
             map(vec![("net", text("api.example.com")), ("exec", SynValue::Nothing)]),
             SynValue::Nothing
         ])
         .is_err());
         // (2) Scope más ancho (glob que cubre más que el padre).
-        assert!(b_captoken_attenuate(&[
+        assert!(ca(&[
             text(&t),
             map(vec![("net", text("*.example.com"))]),
             SynValue::Nothing
         ])
         .is_err());
         // (3) Host distinto.
-        assert!(b_captoken_attenuate(&[
+        assert!(ca(&[
             text(&t),
             map(vec![("net", text("evil.com"))]),
             SynValue::Nothing
         ])
         .is_err());
         // (4) Quitar el scope (pedir la capability entera).
-        assert!(b_captoken_attenuate(&[
+        assert!(ca(&[
             text(&t),
             map(vec![("net", SynValue::Nothing)]),
             SynValue::Nothing
         ])
         .is_err());
         // (5) TTL más largo que el del padre.
-        assert!(b_captoken_attenuate(&[
+        assert!(ca(&[
             text(&t),
             map(vec![("net", text("api.example.com"))]),
             map(vec![("ttl", syn_int(86400))])
@@ -1191,14 +1320,14 @@ mod tests {
             map(vec![("spend", text("USD"))]),
             map(vec![("spend", map(vec![("USD", syn_int(10))]))]),
         );
-        assert!(b_captoken_attenuate(&[
+        assert!(ca(&[
             text(&t_spend),
             map(vec![("spend", text("USD"))]),
             map(vec![("spend", map(vec![("USD", syn_int(1000))]))])
         ])
         .is_err());
         // (7) Lo LEGAL sí pasa: mismo scope, ttl menor.
-        assert!(b_captoken_attenuate(&[
+        assert!(ca(&[
             text(&t),
             map(vec![("net", text("api.example.com"))]),
             map(vec![("ttl", syn_int(60))])
@@ -1215,7 +1344,7 @@ mod tests {
         for i in 0..raw.len() {
             let mut bad = raw.clone();
             bad[i] ^= 0xff;
-            let out = ok(b_captoken_verify(&[text(&b64url_encode(&bad)), text(KEY)]));
+            let out = ok(cv(&[text(&b64url_encode(&bad)), text(KEY)]));
             assert!(
                 matches!(out, SynValue::Nothing),
                 "byte {} alterado no fue rechazado",
@@ -1223,11 +1352,11 @@ mod tests {
             );
         }
         // (2) Truncado.
-        let out = ok(b_captoken_verify(&[text(&b64url_encode(&raw[..raw.len() / 2])), text(KEY)]));
+        let out = ok(cv(&[text(&b64url_encode(&raw[..raw.len() / 2])), text(KEY)]));
         assert!(matches!(out, SynValue::Nothing));
         // (3) Basura y vacío.
-        assert!(matches!(ok(b_captoken_verify(&[text("no-es-token"), text(KEY)])), SynValue::Nothing));
-        assert!(matches!(ok(b_captoken_verify(&[text(""), text(KEY)])), SynValue::Nothing));
+        assert!(matches!(ok(cv(&[text("no-es-token"), text(KEY)])), SynValue::Nothing));
+        assert!(matches!(ok(cv(&[text(""), text(KEY)])), SynValue::Nothing));
     }
 
     #[test]
@@ -1246,7 +1375,7 @@ mod tests {
         tok.sig = sig;
         let forged = encode_token(&tok);
         assert!(
-            matches!(ok(b_captoken_verify(&[text(&forged), text(KEY)])), SynValue::Nothing),
+            matches!(ok(cv(&[text(&forged), text(KEY)])), SynValue::Nothing),
             "un bloque que amplía debe rechazarse aunque la firma cierre"
         );
     }
@@ -1256,27 +1385,27 @@ mod tests {
         let t = mint(map(vec![("net", text("x.com"))]), map(vec![("ttl", syn_int(60))]));
         // Dentro de la ventana.
         assert!(matches!(
-            ok(b_captoken_verify(&[text(&t), text(KEY)])),
+            ok(cv(&[text(&t), text(KEY)])),
             SynValue::Map(_)
         ));
         // Pasado el exp → nothing.
         let future = map(vec![("at", syn_int(unix_now() + 3600))]);
         assert!(matches!(
-            ok(b_captoken_verify(&[text(&t), text(KEY), future])),
+            ok(cv(&[text(&t), text(KEY), future])),
             SynValue::Nothing
         ));
         // Revocado por id (denylist).
-        let v = ok(b_captoken_verify(&[text(&t), text(KEY)]));
+        let v = ok(cv(&[text(&t), text(KEY)]));
         let id = verified_map(&v).get("id").unwrap().to_string();
         let revoked = map(vec![("revoked", syn_list(vec![text(&id)]))]);
         assert!(matches!(
-            ok(b_captoken_verify(&[text(&t), text(KEY), revoked])),
+            ok(cv(&[text(&t), text(KEY), revoked])),
             SynValue::Nothing
         ));
         // Otra id en la denylist no lo afecta.
         let other = map(vec![("revoked", syn_list(vec![text("otra-id")]))]);
         assert!(matches!(
-            ok(b_captoken_verify(&[text(&t), text(KEY), other])),
+            ok(cv(&[text(&t), text(KEY), other])),
             SynValue::Map(_)
         ));
     }
@@ -1290,25 +1419,25 @@ mod tests {
         // Contexto correcto → vale.
         let good = map(vec![("aud", text("api-1")), ("method", text("POST"))]);
         assert!(matches!(
-            ok(b_captoken_verify(&[text(&t), text(KEY), good])),
+            ok(cv(&[text(&t), text(KEY), good])),
             SynValue::Map(_)
         ));
         // Audiencia equivocada → nothing.
         let bad_aud = map(vec![("aud", text("api-2")), ("method", text("POST"))]);
         assert!(matches!(
-            ok(b_captoken_verify(&[text(&t), text(KEY), bad_aud])),
+            ok(cv(&[text(&t), text(KEY), bad_aud])),
             SynValue::Nothing
         ));
         // Método equivocado → nothing.
         let bad_m = map(vec![("aud", text("api-1")), ("method", text("GET"))]);
         assert!(matches!(
-            ok(b_captoken_verify(&[text(&t), text(KEY), bad_m])),
+            ok(cv(&[text(&t), text(KEY), bad_m])),
             SynValue::Nothing
         ));
         // Contexto AUSENTE con caveat presente → nothing (fail-closed: no se puede
         // afirmar que se cumple lo que no se chequeó).
         assert!(matches!(
-            ok(b_captoken_verify(&[text(&t), text(KEY)])),
+            ok(cv(&[text(&t), text(KEY)])),
             SynValue::Nothing
         ));
     }
@@ -1319,20 +1448,20 @@ mod tests {
             map(vec![("net", text("*.example.com")), ("spend", text("USD"))]),
             map(vec![("ttl", syn_int(3600)), ("spend", map(vec![("USD", syn_int(100))]))]),
         );
-        let t2 = ok(b_captoken_attenuate(&[
+        let t2 = ok(ca(&[
             text(&t),
             map(vec![("net", text("a.example.com")), ("spend", text("USD"))]),
             map(vec![("ttl", syn_int(60)), ("spend", map(vec![("USD", syn_int(5))]))]),
         ]))
         .to_string();
-        let t3 = ok(b_captoken_attenuate(&[
+        let t3 = ok(ca(&[
             text(&t2),
             map(vec![("net", text("a.example.com")), ("spend", text("USD"))]),
             SynValue::Nothing,
         ]))
         .to_string();
         // El tercer bloque no declara nada: hereda lo más restrictivo (5 USD, 60 s).
-        let m = verified_map(&ok(b_captoken_verify(&[text(&t3), text(KEY)])));
+        let m = verified_map(&ok(cv(&[text(&t3), text(KEY)])));
         let cav = verified_map(&m.get("caveats").unwrap().clone());
         let sp = verified_map(&cav.get("spend").unwrap().clone());
         assert_eq!(sp.get("USD").unwrap().to_string(), "5");
@@ -1342,38 +1471,38 @@ mod tests {
     #[test]
     fn mint_fails_strong_on_bad_input() {
         // Capability inexistente (typo) → error, no una cap muda.
-        assert!(b_captoken_mint(&[map(vec![("nett", text("x"))]), text(KEY)]).is_err());
+        assert!(cm(&[map(vec![("nett", text("x"))]), text(KEY)]).is_err());
         // Caps vacíos.
-        assert!(b_captoken_mint(&[map(vec![]), text(KEY)]).is_err());
+        assert!(cm(&[map(vec![]), text(KEY)]).is_err());
         // Caveat desconocido.
-        assert!(b_captoken_mint(&[
+        assert!(cm(&[
             map(vec![("net", text("x"))]),
             text(KEY),
             map(vec![("expires", syn_int(5))])
         ])
         .is_err());
         // Monto de spend inválido / negativo.
-        assert!(b_captoken_mint(&[
+        assert!(cm(&[
             map(vec![("spend", text("USD"))]),
             text(KEY),
             map(vec![("spend", map(vec![("USD", text("mucho"))]))])
         ])
         .is_err());
-        assert!(b_captoken_mint(&[
+        assert!(cm(&[
             map(vec![("spend", text("USD"))]),
             text(KEY),
             map(vec![("spend", map(vec![("USD", syn_int(-1))]))])
         ])
         .is_err());
         // Atenuar exige texto (y NO acepta la clave raíz como 2º argumento).
-        assert!(b_captoken_attenuate(&[syn_int(5), map(vec![("net", text("x"))])]).is_err());
+        assert!(ca(&[syn_int(5), map(vec![("net", text("x"))])]).is_err());
     }
 
     #[test]
     fn depth_is_bounded() {
         let mut t = mint(map(vec![("net", text("x.com"))]), map(vec![("ttl", syn_int(600))]));
         for _ in 1..MAX_DEPTH {
-            t = ok(b_captoken_attenuate(&[
+            t = ok(ca(&[
                 text(&t),
                 map(vec![("net", text("x.com"))]),
                 SynValue::Nothing,
@@ -1381,7 +1510,7 @@ mod tests {
             .to_string();
         }
         // El bloque MAX_DEPTH+1 se rechaza con un error claro.
-        assert!(b_captoken_attenuate(&[
+        assert!(ca(&[
             text(&t),
             map(vec![("net", text("x.com"))]),
             SynValue::Nothing
@@ -1389,7 +1518,7 @@ mod tests {
         .is_err());
         // Y el token de profundidad máxima sigue verificando.
         assert!(matches!(
-            ok(b_captoken_verify(&[text(&t), text(KEY)])),
+            ok(cv(&[text(&t), text(KEY)])),
             SynValue::Map(_)
         ));
     }
@@ -1427,7 +1556,7 @@ mod tests {
         ));
         // Capability sin scope en el token = wildcard de ese tipo.
         let t = mint(map(vec![("reveal", SynValue::Nothing)]), SynValue::Nothing);
-        let v = ok(b_captoken_verify(&[text(&t), text(KEY)]));
+        let v = ok(cv(&[text(&t), text(KEY)]));
         assert!(matches!(
             ok(b_captoken_allows(&[v.clone(), text("reveal"), text("CUALQUIERA")])),
             SynValue::Bool(true)

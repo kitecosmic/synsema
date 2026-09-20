@@ -2,12 +2,35 @@
 
 Read this FIRST if something fails. Each row is a real mistake that costs hours to debug.
 
+> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.24*, right below.
+>
 > **Jump to the `## ` section that matches your failure:** Errors (parse/runtime messages) ·
 > Database SQL · Database MongoDB · Database Redis · HTTP server (serve) · Language features
 > (bytes, complex, arrays, match, params, tests) · Data & charts · Blockchain ·
 > Behavioral surprises · Anti-patterns · Secrets & config
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
+
+## Upgrading to v0.6.24 — what stops working and what to write instead
+
+The full list with the reasoning is in [CHANGELOG.md](../CHANGELOG.md); this table is the short
+version, ordered by how likely it is to hit you. The first three affect programs that never
+touch labels or enclaves.
+
+| You see | What changed | What to write |
+|---|---|---|
+| `jwt_verify: this needs the clock…` (or `totp`, `captoken_*`, `http_sign*`, `oidc_verify`) | Ten builtins read the clock and now require it. Plain `run` and `--sandbox` grant `time` automatically, so this only bites under `--deterministic`, an explicit `--cap-set`, or inside a guest | `require time`, or pass it: `opts.now` / `opts.at` / `opts.created` / explicit `iat`+`exp` |
+| `unexpected TEXT after the end of this statement` on a line that used to run | A statement may no longer carry leftover tokens. `assert_eq 1, 2` parsed as the bare identifier and asserted **nothing** | Write the parentheses: `assert_eq(1, 2)` |
+| `Capability not granted: secret("B")` where `require secret "A"` used to be enough | `require <cap> "<scope>"` without parentheses used to **discard** the scope, granting the capability unscoped | Declare what you use — `require secret("B")` — or the wide form on purpose: `require secret` |
+| `'print' is a protected builtin…` at load | `private`, `declassify`, `label_of`, `is_private` and `print` cannot be bound to anything callable | Rename your task. Binding the name to a plain value is still fine |
+| `when cond then raise "…"` no longer raises | The inline `when … then …` is an *expression*; in statement position its value was discarded, so guards were silent no-ops. Now it is a load error | Use the block form (`when cond` + indented body) |
+| A public alias stopped seeing writes made through `private(container, …)` | `private()` over a list or map makes a **private copy** — sharing the `Rc` would leave a public alias into private data | Build the container after marking, or declassify the scalar you want to publish |
+| `label_violation: print called under private control flow` | Under `--labels`, stdout is a public sink: the *number* of lines is not redactable | Move it out of the private branch, or `declassify` the condition → [labels.md](labels.md) |
+| `try`/`recover` stopped catching something | Under `--labels`, an error **caused by private data** is not catchable — whether an operation failed is the bit | Use the **total variant**: `json_decode(x, nothing)`, `number(x, nothing)`, `aes_gcm_decrypt(k, n, ct, aad, nothing)` → [builtins.md](builtins.md) § Total variants |
+| `"steps": null` in `run --format json` | The step counter is linear in what the program walked, so after a private branch it *is* the secret | `declassify(steps(), "<why>")` if you mean to publish it |
+| The guest module is rejected by the Executor | The build has one more step | Run `packages/guests/vela/tools/wasi-stub` over the `.wasm` → [guests.md](guests.md) |
+
+Everything above is inert with labels off, except the first three rows.
 
 ## Errors
 

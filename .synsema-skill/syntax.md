@@ -61,7 +61,7 @@ Comments: `-- comment`
 - ⚠️ Common confusion: backticks are NOT "raw" — they DO process `\n`/`\t`. The difference from `"..."` is that backticks also allow **literal** newlines and `{expr}` interpolation.
 
 **Multi-line text (e.g. SQL):** use a backtick string with real newlines:
-```
+```synsema
 let q be `
     SELECT id, name FROM users
     WHERE active = 1

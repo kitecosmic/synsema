@@ -153,7 +153,7 @@ pub(crate) fn resolve_module_path(
     // v0.6.20 — el límite de contención es la RAÍZ DEL PROYECTO (dir de la entrada) cuando
     // el host la conoce: `../` sube mientras el destino quede bajo esa raíz. Sin raíz
     // (`<stdin>`, embebedores que no la fijan) rige el criterio v0.6.19: el dir del importador.
-    // Auditoría M3 — la CONTENCIÓN se decide sobre rutas absolutas (cwd + ruta), porque sobre
+    // Auditoría externa — la CONTENCIÓN se decide sobre rutas absolutas (cwd + ruta), porque sobre
     // rutas relativas un `..` de más se pierde al normalizar (`src/../../x` quedaba `x`, dentro
     // de `.`); el string RESUELTO sigue siendo el léxico de siempre (paridad de ubicaciones).
     let abs = |p: &Path| -> PathBuf {
@@ -548,7 +548,7 @@ fn parse_block(
 }
 
 // ---------------------------------------------------------------------------
-// Caché de templates parseados: path canónico → (mtime, size, árbol). El árbol
+// caché de templates parseados: path canónico → (mtime, size, árbol). El árbol
 // se comparte por Rc; una edición del archivo (mtime o size distintos) invalida
 // la entrada, así que el hot-reload por request se mantiene. thread_local: cada
 // worker de serve tiene su caché (los árboles contienen Node, que no es Sync).
@@ -1129,7 +1129,7 @@ mod v0620_tests {
         }
     }
 
-    /// Auditoría M3 — con rutas RELATIVAS (cd proj && synsema run main.syn), subir dos niveles
+    /// Auditoría externa — con rutas RELATIVAS (cd proj && synsema run main.syn), subir dos niveles
     /// desde `src/` escapa la raíz `.` aunque la normalización léxica relativa lo perdiera.
     #[test]
     fn module_containment_holds_for_relative_entry_paths() {

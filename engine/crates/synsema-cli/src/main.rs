@@ -6,7 +6,7 @@
 //!
 //! Ejecuta el programa y emite a STDOUT una sola línea JSON:
 //!     {"ok": <bool>, "out": [<líneas de print>], "err": [<errores>]}
-//! Exit 0 siempre que pueda producir el JSON (el fallo del programa va en el JSON).
+//! exit 0 siempre que pueda producir el JSON (el fallo del programa va en el JSON).
 //! Exit != 0 sólo si el CLI no pudo (archivo ilegible / args inválidos), con el
 //! motivo en STDERR. Nada más que el JSON va a STDOUT.
 
@@ -32,7 +32,7 @@ mod synfide;
 mod update;
 mod code;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--health <path>] | run [--flat] [--explain] [--format human|json] [--provider <name>] <archivo.syn | -> [-- args...] | test [-v] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--health <path>] [--attested] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] <archivo.syn | -> [-- args...] | test [-v] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--labels] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
 
 // `build_ceiling` (--sandbox/--cap-set → techo) vive en synsema-capabilities: lo comparten
 // este binario y `synsema-wasm` (mismas flags, misma semántica en los dos front-ends).
@@ -57,6 +57,9 @@ pub(crate) struct HostFlags {
     pub audit: Option<String>,
     /// v0.6.20 — `--deterministic`: perfil puro + techo sólo `stdout` (ni `time` ni `random`).
     pub deterministic: bool,
+    /// `--labels`: etiquetas de flujo de información (`private`/`declassify`)
+    /// Encendidas en todos los intérpretes del proceso. `serve --attested` las enciende solo.
+    pub labels: bool,
     pub filename: Option<String>,
     pub program_args: Vec<String>,
     pub rest: Vec<String>,
@@ -95,6 +98,9 @@ impl HostFlags {
             return Err(ExitCode::from(2));
         }
         host::set_profile(p);
+        if self.labels {
+            host::set_labels(true);
+        }
         Ok(p)
     }
 
@@ -143,6 +149,7 @@ pub(crate) fn take_host_flags(cmd: &str, args: &[String]) -> Result<HostFlags, E
             }
             "--sandbox" => h.sandbox = true,
             "--deterministic" => h.deterministic = true,
+            "--labels" => h.labels = true,
             "--cap-set" => {
                 h.cap_set = Some(need_value("--cap-set", args.get(i + 1))?);
                 i += 1;
@@ -394,6 +401,7 @@ fn run_bundled(bundle: synsema_core::bundle::Bundle, program_args: Vec<String>) 
             tls_key: s.tls_key,
             bind: Some(s.bind),
             ceiling: None,
+            attested: false,
         };
         // Igual que `synsema serve --sandbox`: un server necesita `serve` además del techo.
         ov.ceiling = match (ceiling, manifest.ceiling.as_deref()) {
@@ -635,7 +643,7 @@ fn cmd_init(args: &[String]) -> ExitCode {
     // `--synfide`: además del scaffold base (sin hello.syn — el starter es app.syn),
     // instala el framework Synfide VERSIONADO desde su último release (manifest +
     // sha256 por archivo; ver synfide.rs).
-    // `--pwa`: scaffold EMBEBIDO de una app instalable (tanda PWA, specs/pwa-mobile.md):
+    // `--pwa`: scaffold EMBEBIDO de una app instalable:
     // app.syn + página + manifest + service worker + íconos generados desde icon.svg.
     // Tampoco lleva hello.syn (el starter es app.syn). No descarga nada.
     // `--desktop` (tanda escritorio): el scaffold PWA (modular: app.syn monta api.syn) MÁS la
@@ -1035,6 +1043,14 @@ fn cmd_serve(args: &[String]) -> ExitCode {
         match args[i].as_str() {
             "--secure" => secure = true,
             "--watch" => watch = true,
+            // Identidad atestada del servidor (par P-256 + documento de la
+            // plataforma + `/.well-known/attestation`; TLS autofirmado con esa clave).
+            "--attested" => {
+                ov.attested = true;
+                // Un serve atestado corre con etiquetas de flujo; la respuesta
+                // HTTP y los streams son sumideros públicos (un privado ahí es `label_violation`).
+                host::set_labels(true);
+            }
             // Techo del host para TODO el serve (requests, cron, agentes): mismas
             // reglas que `run` (`--sandbox`/`--cap-set` los parsea `take_host_flags`).
             "--port" => {
@@ -1085,6 +1101,12 @@ fn cmd_serve(args: &[String]) -> ExitCode {
     // Validación fail-loud de combinaciones inválidas (mutua exclusión, par cert/key).
     if let Err(e) = ov.validate() {
         eprintln!("synsema serve: {}", e);
+        return ExitCode::from(2);
+    }
+    // `--attested` + `--watch`: el supervisor reinicia procesos y cada reinicio cambiaría la
+    // clave y el documento; un cliente que pineó la identidad se quedaría hablando con otra.
+    if ov.attested && watch {
+        eprintln!("synsema serve: --attested and --watch are mutually exclusive (a restart would change the attested identity)");
         return ExitCode::from(2);
     }
     ov.ceiling = match build_ceiling(serve_sandbox, serve_cap_set.as_deref()) {
@@ -1148,12 +1170,13 @@ fn cmd_serve(args: &[String]) -> ExitCode {
 /// scripting/CI). Con `--explain` el formato por defecto es humano (`format_human`); con
 /// `--format json` se emite JSON estructurado (`format_agent`) para herramientas/agentes.
 fn cmd_run(args: &[String]) -> ExitCode {
-    let host = match take_host_flags("run", &args[2..]) {
+    let mut host = match take_host_flags("run", &args[2..]) {
         Ok(h) => h,
         Err(code) => return code,
     };
     let mut flat = false;
     let mut explain = false;
+    let mut attest = false; // --attest: modo job atestado (fuerza --deterministic)
     let mut fmt_json = false; // --format json: con --explain, diagnóstico JSON; sin él, el INFORME
     let mut path: Option<String> = None;
     let mut program_args = host.program_args.clone();
@@ -1163,6 +1186,10 @@ fn cmd_run(args: &[String]) -> ExitCode {
         match rest[i].as_str() {
             "--flat" => flat = true,
             "--explain" => explain = true,
+            // Corre bajo --deterministic y cierra con una línea JSON
+            // `{output_sha, steps, state_root, program_sha, input_sha, attestation}` cuyo
+            // documento ata sha256(program_sha ‖ input_sha ‖ output_sha).
+            "--attest" => attest = true,
             "--format=json" => fmt_json = true,
             "--format=human" => fmt_json = false,
             // `--format <valor>` con lookahead, igual que `--env-file`.
@@ -1220,10 +1247,25 @@ fn cmd_run(args: &[String]) -> ExitCode {
     let path = match path {
         Some(p) => p,
         None => {
-            eprintln!("uso: synsema run [--flat] [--explain] [--format human|json] [--provider <name>] [--sandbox | --cap-set <list>] [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | -> [-- args...]");
+            eprintln!("uso: synsema run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] [--sandbox | --cap-set <list> | --deterministic] [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | -> [-- args...]");
             return ExitCode::from(2);
         }
     };
+    if attest {
+        if explain {
+            eprintln!("synsema run: --attest and --explain are mutually exclusive (the attested output is the program's, not a diagnostic)");
+            return ExitCode::from(2);
+        }
+        if host.sandbox || host.cap_set.is_some() {
+            eprintln!("synsema run: --attest runs under --deterministic (stdout only, pure profile); drop --sandbox/--cap-set");
+            return ExitCode::from(2);
+        }
+        if host.profile.as_deref().is_some_and(|p| p != "pure") {
+            eprintln!("synsema run: --attest runs the pure profile; drop --profile native");
+            return ExitCode::from(2);
+        }
+        host.deterministic = true;
+    }
     let report_mode = fmt_json && !explain;
     let (mut source, filename) = if path == "-" {
         use std::io::Read;
@@ -1256,6 +1298,27 @@ fn cmd_run(args: &[String]) -> ExitCode {
     }
     if let Err(code) = host.apply_audit("run", report_mode) {
         return code;
+    }
+    // `--attest`: la ENTRADA que se ata = los argumentos del programa unidos con \0 (y, con
+    // `run -`, el fuente leído de stdin). Se fija antes de que `program_args` se mueva.
+    let attest_input: Option<Vec<u8>> = attest.then(|| {
+        let mut input: Vec<u8> = program_args.join("\0").into_bytes();
+        if path == "-" {
+            input.push(0);
+            input.extend_from_slice(source.as_bytes());
+        }
+        input
+    });
+    // El driver y su plataforma se validan ANTES de ejecutar el programa (sin
+    // plataforma no se corre nada, y el aviso del mock sale antes de la salida del programa).
+    if attest_input.is_some() {
+        match synsema_stdlib::attest::preflight() {
+            Ok(d) => synsema_stdlib::attest::warn_if_mock(d),
+            Err(e) => {
+                eprintln!("synsema run --attest: {}", e);
+                return ExitCode::from(1);
+            }
+        }
     }
     host::set_program_args(program_args);
 
@@ -1305,7 +1368,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     if report_mode {
         let result = run_program_ceiled_opts(&source, &filename, ceiling, false);
         let exit = if result.success { 0 } else { 1 };
-        let report = serde_json::json!({
+        let mut report = serde_json::json!({
             "ok": result.success,
             "output": result.output,
             "errors": result.errors,
@@ -1313,11 +1376,58 @@ fn cmd_run(args: &[String]) -> ExitCode {
             "exit": exit,
             "llm_tokens": synsema_runtime::llm_providers::llm_tokens_total(),
             // v0.6.20 — pasos del intérprete (contador determinista; ver `steps()`).
-            "steps": synsema_runtime::engine::last_run_steps(),
+            // T5 (ronda 5): `null` si la corrida tocó datos privados. El contador es lineal en
+            // lo que el programa recorrió, así que después de una rama privada es el dato
+            // privado con aritmética encima — y esto lo publicaba solo, sin que el programa
+            // pidiera nada.
+            "steps": steps_field(),
         });
+        // `--attest --format json`: la attestation va DENTRO del informe (sólo si el run
+        // fue bien; no se atesta una salida fallida).
+        if let (Some(input), true) = (&attest_input, result.success) {
+            match attest_run(&source, &filename, input, &result.output) {
+                Ok(fields) => {
+                    for (k, v) in fields.as_object().into_iter().flatten() {
+                        report[k] = v.clone();
+                    }
+                }
+                Err(e) => {
+                    eprintln!("synsema run --attest: {}", e);
+                    audit::summary(1);
+                    return ExitCode::from(1);
+                }
+            }
+        }
         println!("{}", report);
         audit::summary(exit);
         return ExitCode::from(exit as u8);
+    }
+
+    // `run --attest`: la salida se COLECTA (no va en vivo) para poder hashearla; se imprime
+    // igual que siempre y al final UNA línea JSON con los hashes y el documento. Sin
+    // plataforma de attestation → error y exit ≠ 0 (nunca una salida "atestada" sin documento).
+    if let Some(input) = &attest_input {
+        let result = run_program_ceiled_opts(&source, &filename, ceiling, false);
+        for line in &result.output {
+            println!("{}", line);
+        }
+        if !result.success {
+            for e in &result.errors {
+                eprintln!("{}", e);
+            }
+            audit::summary(1);
+            return ExitCode::from(1);
+        }
+        match attest_run(&source, &filename, input, &result.output) {
+            Ok(fields) => println!("{}", fields),
+            Err(e) => {
+                eprintln!("synsema run --attest: {}", e);
+                audit::summary(1);
+                return ExitCode::from(1);
+            }
+        }
+        audit::summary(0);
+        return ExitCode::SUCCESS;
     }
 
     // Camino normal: swarm real (DE-011). Los `spawn` corren en hilos aislados; un agente
@@ -1338,7 +1448,88 @@ fn cmd_run(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// test [-v] [--flat] <archivo.syn | dir>: corre los bloques `test` y reporta ✓/✗.
+/// El campo `steps` de un informe JSON: el contador, o `null` si la corrida tocó datos privados.
+///
+/// T5 (ronda 5) — el contador de pasos es UN PASO POR NODO DEL AST, o sea lineal en lo que el
+/// programa recorrió. Después de un bucle cuya condición dependió de un secreto, `steps` ES el
+/// secreto con una multiplicación y una suma encima: `(steps() - base - 24) / 4` lo reconstruía
+/// exacto. El builtin `steps()` ya sale etiquetado con lo que la corrida tocó, pero este campo no
+/// pasa por el programa — lo publica el host por su cuenta, y por eso se omite acá.
+fn steps_field() -> serde_json::Value {
+    if synsema_runtime::engine::last_run_touched_private() {
+        return serde_json::Value::Null;
+    }
+    serde_json::json!(synsema_runtime::engine::last_run_steps())
+}
+
+/// El cierre de `run --attest`: hashea programa, entrada y salida, pide a la
+/// plataforma un documento con `report_data = sha256(program_sha ‖ input_sha ‖ output_sha ‖
+/// config_sha)` y devuelve `{output_sha, steps, state_root, program_sha, input_sha, config,
+/// Config_sha, attestation: {format, document (base64), driver, mock?}}`. `state_root` =
+/// keccak256 de la salida (lo que un contrato compararía entre dos TEEs).
+///
+/// Qué se ata y qué no : `output` es la salida COLECTADA del programa — las
+/// líneas de `print` **y las de `log`/`show`** (van al mismo buffer) — unida con `\n` sin `\n`
+/// Final; `steps` va en el JSON como dato informativo pero NO entra en `report_data` (depende
+/// del contador del intérprete, no del resultado). `config`  = `{labels, ceiling
+/// (el determinista, "stdout"), tls_key: "none", engine, profile: "pure"}`: el cliente sabe bajo
+/// qué modo corrió el programa, no sólo cuál.
+fn attest_run(source: &str, filename: &str, input: &[u8], output: &[String]) -> Result<serde_json::Value, String> {
+    use synsema_core::bytesutil::{b64_encode, hex_encode};
+    use synsema_stdlib::attest::{attest_document, keccak256, program_sha, sha256, AttestConfig, AttestRequest};
+    let joined = output.join("\n");
+    let program_sha = program_sha(source, filename)?;
+    let input_sha = sha256(input);
+    let output_sha = sha256(joined.as_bytes());
+    let state_root = keccak256(joined.as_bytes());
+    let config = AttestConfig {
+        labels: host::labels(),
+        ceiling: Some(synsema_capabilities::model::build_ceiling_deterministic()),
+        tls_key: "none",
+        profile: "pure",
+    };
+    let config_sha = config.sha();
+    let mut bound = Vec::with_capacity(128);
+    bound.extend_from_slice(&program_sha);
+    bound.extend_from_slice(&input_sha);
+    bound.extend_from_slice(&output_sha);
+    bound.extend_from_slice(&config_sha);
+    let report_data = sha256(&bound);
+    let res = attest_document(&AttestRequest { report_data: report_data.to_vec(), nonce: None, public_key: None })?;
+    let mut attestation = serde_json::json!({
+        "format": res.format,
+        "document": b64_encode(&res.document),
+        "driver": res.driver,
+    });
+    if res.driver == "mock" {
+        attestation["mock"] = serde_json::Value::Bool(true);
+    }
+    if let Some(aux) = &res.aux {
+        attestation["aux"] = serde_json::Value::String(b64_encode(aux));
+    }
+    if let Some(log) = &res.event_log {
+        attestation["event_log"] = serde_json::Value::String(log.clone());
+    }
+    if let Some(root) = &res.root {
+        attestation["root"] = serde_json::Value::String(b64_encode(root));
+    }
+    Ok(serde_json::json!({
+        "output_sha": hex_encode(&output_sha),
+        // T5 (ronda 5): `null` si la corrida tocó privados — ver `steps_field`. Acá pesa el
+        // doble: el documento atestado es el artefacto cuyo propósito es que un tercero lo
+        // verifique, y dos corridas con secretos distintos daban el MISMO `output_sha` con
+        // `steps` distinto.
+        "steps": steps_field(),
+        "state_root": hex_encode(&state_root),
+        "program_sha": hex_encode(&program_sha),
+        "input_sha": hex_encode(&input_sha),
+        "config": config.json(),
+        "config_sha": hex_encode(&config_sha),
+        "attestation": attestation,
+    }))
+}
+
+/// Test [-v] [--flat] <archivo.syn | dir>: corre los bloques `test` y reporta ✓/✗.
 /// Exit 0 si todos pasan; 1 si alguno falla; 2 por error de uso/archivo ilegible.
 fn cmd_test(args: &[String]) -> ExitCode {
     let host = match take_host_flags("test", &args[2..]) {
@@ -1679,7 +1870,7 @@ fn cmd_openapi(args: &[String]) -> ExitCode {
         }
     };
     let (info, routes) = match api_routes_static(&sp) {
-        // v0.6.20 (auditoría M2) — el documento offline publica lo mismo que el servidor:
+        // V0.6.20  — el documento offline publica lo mismo que el servidor:
         // las rutas `private` quedan fuera.
         Ok(Some((info, routes))) => (info, routes.into_iter().filter(|r| !r.private).collect::<Vec<_>>()),
         Ok(None) => {

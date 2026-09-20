@@ -58,6 +58,13 @@ pub enum CapabilityType {
     /// que el padre tiene efectivamente. Deny-by-default, sin scope. Lo que el padre
     /// puede PRESTAR al hijo tiene que estar en sus propios `require`.
     SandboxRun,
+    /// Pedir a la PLATAFORMA un documento de attestation (`attest(opts)`):
+    /// I/O no determinista contra un dispositivo o socket del host (NSM de Nitro,
+    /// Configfs-tsm de TDX/SEV-SNP, el socket de dstack, o el driver `mock` de CI).
+    /// Deny-by-default, sin scope, JAMÁS ambiente: no está en el techo `--sandbox` ni en
+    /// El determinista (`--deterministic` la niega solo). Nombre genérico a propósito:
+    /// Es una capability del motor, como `time` o `random`, no un adaptador.
+    Attest,
 }
 
 impl CapabilityType {
@@ -86,6 +93,7 @@ impl CapabilityType {
             Spend => "spend",
             Memory => "memory",
             SandboxRun => "sandbox_run",
+            Attest => "attest",
         }
     }
 
@@ -101,7 +109,7 @@ impl CapabilityType {
 }
 
 /// Nombres aceptados por `--cap-set` (para el mensaje de error y los docs).
-pub const KNOWN_CAPABILITY_NAMES: &str = "net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal, sign, wallet, spend, memory, sandbox_run";
+pub const KNOWN_CAPABILITY_NAMES: &str = "net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, db, serve, secret, reveal, sign, wallet, spend, memory, sandbox_run, attest";
 
 /// Mapa nombre→tipo (CAPABILITY_NAMES del oráculo).
 pub fn capability_type_from_name(name: &str) -> Option<CapabilityType> {
@@ -129,6 +137,7 @@ pub fn capability_type_from_name(name: &str) -> Option<CapabilityType> {
         "spend" => Spend,
         "memory" => Memory,
         "sandbox_run" => SandboxRun,
+        "attest" => Attest,
         _ => return None,
     })
 }
@@ -1230,7 +1239,7 @@ mod tanda_motor_tests {
     #[test]
     fn cap_set_item_round_trips_every_type() {
         use CapabilityType::*;
-        for ty in [Net, FileRead, FileWrite, File, Exec, Env, Time, Random, Stdout, Stdin, Llm, Db, Serve, Secret, Reveal, Sign, Wallet, Spend, Memory, SandboxRun] {
+        for ty in [Net, FileRead, FileWrite, File, Exec, Env, Time, Random, Stdout, Stdin, Llm, Db, Serve, Secret, Reveal, Sign, Wallet, Spend, Memory, SandboxRun, Attest] {
             for scope in [None, Some("x-*".to_string())] {
                 let cap = Capability::new(ty, scope.clone());
                 let back = build_ceiling(false, Some(&cap.cap_set_item())).unwrap().unwrap();
@@ -1332,5 +1341,36 @@ mod v0620_tests {
         assert!(c[0].covers(&Capability::new(CapabilityType::Stdout, None)));
         assert!(!c.iter().any(|x| x.covers(&Capability::new(CapabilityType::Time, None))));
         assert!(!c.iter().any(|x| x.covers(&Capability::new(CapabilityType::Random, None))));
+    }
+}
+
+#[cfg(test)]
+mod tee_tests {
+    use super::*;
+
+    /// `attest` es una capability más del motor (round-trip por `--cap-set` y
+    /// `require`), pero NO viene en ningún techo empaquetado: ni `--sandbox` ni el
+    /// determinista la listan, así que bajo `--deterministic` un `require attest` queda
+    /// negado solo (es I/O de plataforma, no determinista por definición).
+    #[test]
+    fn attest_is_known_but_absent_from_every_packaged_ceiling() {
+        assert_eq!(capability_type_from_name("attest"), Some(CapabilityType::Attest));
+        assert_eq!(CapabilityType::Attest.wire_name(), "attest");
+        assert!(KNOWN_CAPABILITY_NAMES.contains("attest"));
+        let want = Capability::new(CapabilityType::Attest, None);
+        let det = build_ceiling_deterministic();
+        assert!(!det.iter().any(|c| c.covers(&want)), "el techo determinista no cubre attest");
+        let sandbox = build_ceiling(true, None).unwrap().unwrap();
+        assert!(!sandbox.iter().any(|c| c.covers(&want)), "--sandbox no cubre attest");
+        // Bajo el techo determinista, un `require attest` del programa NO concede nada.
+        let mut cs = CapabilitySet::new("program");
+        cs.ceiling = Some(Rc::new(det));
+        cs.grant(want.clone());
+        assert!(!cs.check(&want, "attest()"), "attest negada bajo --deterministic");
+        // Sin techo y con `require attest` explícito sí pasa; sin el require, no (deny-by-default).
+        let mut open = CapabilitySet::new("program");
+        assert!(!open.check(&want, "attest()"));
+        open.grant(want.clone());
+        assert!(open.check(&want, "attest()"));
     }
 }

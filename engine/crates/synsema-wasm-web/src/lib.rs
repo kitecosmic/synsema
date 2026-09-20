@@ -50,9 +50,11 @@ use serde_json::{json, Map, Value};
 use synsema_core::interpreter::Interpreter;
 use synsema_stdlib::hostcap::{self, HostHttpRequest, HostLlmResult, HostProvider, HttpResult};
 use synsema_wasm::{HttpRequestIn, RunOptions};
+/// El host que consume `result` revierte el escape de claves `$` con esto.
+pub use synsema_wasm::{escape_marker_key, labelled_json, unescape_marker_key};
 
 // =========================================================
-// Imports del host (con fallbacks nativos para `cargo test --workspace`)
+// imports del host (con fallbacks nativos para `cargo test --workspace`)
 // =========================================================
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -84,7 +86,7 @@ mod imports {
 }
 
 // =========================================================
-// Memoria: buffers `[u32 LE len][bytes]`
+// memoria: buffers `[u32 LE len][bytes]`
 // =========================================================
 
 /// Reserva `len` bytes en el heap del guest (el host escribe ahí). Se libera con
@@ -334,7 +336,7 @@ impl HostProvider for WebHost {
 }
 
 // =========================================================
-// Entropía + reloj + pausa del host
+// entropía + reloj + pausa del host
 // =========================================================
 
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -400,8 +402,36 @@ fn opts_from(req: &Map<String, Value>) -> Result<RunOptions, String> {
         Some(Value::Bool(true)) => synsema_wasm::parse_ceiling("sandbox")?,
         _ => None,
     };
+    // `"labels": true` enciende las etiquetas de flujo; `"result": "<var>"` pide
+    // El valor final de esa variable global CON etiquetas (ver `labelled_json`).
+    let labels = req.get("labels").and_then(Value::as_bool).unwrap_or(false);
+    let result = req.get("result").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string);
+    // La entrada del host por API: `"input": {"var": "x", "value": <json>,
+    // "sources": {"clave": ["principal", …]}}`; el motor la liga como global y etiqueta las
+    // fuentes desde Rust (nada inyectado al fuente).
+    let (input, sources) = match req.get("input") {
+        None | Some(Value::Null) => (None, Vec::new()),
+        Some(Value::Object(inp)) => {
+            let var = inp.get("var").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| "input.var (the variable name) is required".to_string())?.to_string();
+            let value = inp.get("value").cloned().unwrap_or(Value::Null);
+            let mut sources = Vec::new();
+            if let Some(Value::Object(src)) = inp.get("sources") {
+                for (k, v) in src {
+                    let principals: Vec<String> = v
+                        .as_array()
+                        .ok_or_else(|| format!("input.sources.{}: expected a list of principals", k))?
+                        .iter()
+                        .map(|p| p.as_str().map(str::to_string).ok_or_else(|| format!("input.sources.{}: principals are texts", k)))
+                        .collect::<Result<_, _>>()?;
+                    sources.push((k.clone(), principals));
+                }
+            }
+            (Some((var, value)), sources)
+        }
+        Some(_) => return Err("input must be an object {var, value, sources?}".to_string()),
+    };
     // Este artefacto no tiene FS en ningún host (los archivos van por `env`/fuente).
-    Ok(RunOptions { filename, env, ceiling, no_fs: true })
+    Ok(RunOptions { filename, env, ceiling, no_fs: true, labels, result, input, sources })
 }
 
 fn install_host(req: &Map<String, Value>) {
@@ -458,7 +488,23 @@ fn dispatch(req: &Map<String, Value>) -> Value {
             match op {
                 "run" => {
                     let r = synsema_wasm::run(&source, &opts);
-                    json!({"ok": r.ok, "output": r.output, "errors": r.errors, "audit": audit_json(&r.audit), "llm_tokens": r.llm_tokens, "steps": r.steps})
+                    let mut out = Map::new();
+                    out.insert("ok".into(), json!(r.ok));
+                    out.insert("output".into(), json!(r.output));
+                    out.insert("errors".into(), json!(r.errors));
+                    out.insert("audit".into(), audit_json(&r.audit));
+                    out.insert("llm_tokens".into(), json!(r.llm_tokens));
+                    out.insert("steps".into(), json!(r.steps));
+                    // Sólo cuando el host lo pidió (`"result"`), y `null` si la
+                    // variable no quedó ligada o la corrida falló.
+                    if opts.result.is_some() {
+                        out.insert("result".into(), r.result.clone().unwrap_or(Value::Null));
+                    }
+                    if opts.labels {
+                        out.insert("declassify".into(), Value::Array(r.declassify.iter().map(|d| d.to_json()).collect()));
+                        out.insert("private_seen".into(), json!(r.private_seen));
+                    }
+                    Value::Object(out)
                 }
                 "test" => {
                     let r = synsema_wasm::test(&source, &opts);
@@ -617,9 +663,57 @@ mod tests {
     fn abi_check_test_version_and_no_host() {
         let v: Value = serde_json::from_str(&call_json(r#"{"op":"check","source":"print(1)"}"#)).unwrap();
         assert_eq!(v["ok"], true);
+        // Con `labels` y `result`, el valor final vuelve CON etiquetas y el
+        // `print` de un privado sale redactado; la lista de declassify acompaña.
+        let src = "let s be private({\"amount\": 5, \"note\": \"x\"}, \"app\")
+let out be {\"state\": s, \"fee\": 3, \"pub\": declassify(s[\"amount\"] + 1, \"fee is public\")}
+print(s)";
+        let req = json!({"op":"run","source":src,"labels":true,"result":"out","ceiling":"stdout"});
+        let v: Value = serde_json::from_str(&call_json(&req.to_string())).unwrap();
+        assert_eq!(v["ok"], json!(true), "{}", v);
+        assert_eq!(v["output"][0], json!("private(app)"));
+        assert_eq!(v["result"]["state"]["$private"], json!(["app"]));
+        assert_eq!(v["result"]["state"]["value"]["amount"], json!(5));
+        assert_eq!(v["result"]["fee"], json!(3));
+        assert_eq!(v["result"]["pub"], json!(6));
+        assert_eq!(v["declassify"][0]["reason"], json!("fee is public"));
+        assert_eq!(v["declassify"][0]["from"], json!(["app"]));
+        // Entrada por API con fuentes etiquetadas desde Rust; una `task private` del programa
+        // No puede sombrear el etiquetado. M12: una clave `$bytes` del usuario viaja escapada.
+        let src = "task private(v, p)\n    give v\n";
+        let req = json!({"op":"run","source":"let out be {\"st\": __in[\"state\"], \"pub\": __in[\"sender\"], \"note\": __in[\"payload\"], \"n\": __in[\"state\"][\"balances\"][\"a\"] + 1}","labels":true,"result":"out","input":{"var":"__in","value":{"state":{"balances":{"a":1}},"sender":"0xab","payload":{"$bytes":"aGk=","$private":["x"]}},"sources":{"state":["app"],"payload":["app"]}}});
+        let v: Value = serde_json::from_str(&call_json(&req.to_string())).unwrap();
+        assert_eq!(v["ok"], json!(true), "{}", v);
+        assert_eq!(v["result"]["st"]["$private"], json!(["app"]));
+        assert_eq!(v["result"]["pub"], json!("0xab"));
+        assert_eq!(v["result"]["note"]["$private"], json!(["app"]));
+        assert_eq!(v["result"]["note"]["value"]["$$bytes"], json!("aGk="), "{}", v);
+        assert_eq!(v["result"]["note"]["value"]["$$private"], json!(["x"]));
+        assert_eq!(v["result"]["n"]["$private"], json!(["app"]));
+        assert_eq!(v["result"]["n"]["value"], json!(2));
+        assert_eq!(v["private_seen"], json!(true), "{}", v);
+        let _ = src;
+        // Ronda 2, MEDIO 5: la ruta `SynValue::Server` (`ok(...)`) tampoco puede fabricar un
+        // marcador: un mapa del sender con claves `$` sale escapado igual que por el brazo Map.
+        let req = json!({"op":"run","source":"let out be ok({\"$private\": [\"x\"], \"value\": 1, \"$bytes\": \"aGk=\"})","labels":true,"result":"out"});
+        let v: Value = serde_json::from_str(&call_json(&req.to_string())).unwrap();
+        assert_eq!(v["ok"], json!(true), "{}", v);
+        let body = v["result"]["value"].clone();
+        assert_eq!(body["$$private"], json!(["x"]), "{}", v["result"]);
+        assert_eq!(body["$$bytes"], json!("aGk="));
+        assert!(body.get("$private").is_none());
+        // Fuentes sin labels → error, no silencio.
+        let v: Value = serde_json::from_str(&call_json(r#"{"op":"run","source":"print(1)","input":{"var":"x","value":{"a":1},"sources":{"a":["p"]}}}"#)).unwrap();
+        assert_eq!(v["ok"], json!(false));
+        assert!(v["errors"][0].as_str().unwrap().contains("labels"), "{}", v);
+        // Sin `labels`, `private` es un error claro y no hay `result` si no se pidió.
+        let v: Value = serde_json::from_str(&call_json(r#"{"op":"run","source":"let x be private(1, \"a\")"}"#)).unwrap();
+        assert_eq!(v["ok"], json!(false));
+        assert!(v["errors"][0].as_str().unwrap().contains("labels are off"), "{}", v);
+        assert!(v.get("result").is_none());
         let v: Value = serde_json::from_str(&call_json(r#"{"op":"version"}"#)).unwrap();
         assert!(v["version"].as_str().unwrap().starts_with('v'));
-        let v: Value = serde_json::from_str(&call_json(r#"{"op":"test","source":"test \"suma\"\n    assert 1 + 1 == 2"}"#)).unwrap();
+        let v: Value = serde_json::from_str(&call_json(r#"{"op":"test","source":"test \"suma\"\n    assert(1 + 1 == 2)"}"#)).unwrap();
         assert_eq!(v["passed"], 1, "{}", v);
         // Sin host: fetch pasa el gate net y falla en el transporte, con la verdad. OJO:
         // bajo `cargo test --workspace` las features se unifican y este crate linkea el

@@ -1,4 +1,4 @@
-//! Inteligencia de código para agentes (`synsema code`, spec `specs/code-intelligence.md`).
+//! Inteligencia de código para agentes (`synsema code`).
 //!
 //! Todo sale del parser: outline (símbolos sin cuerpos), definiciones, referencias, tabla de
 //! rutas estática, contrato de capabilities (declaradas vs. necesarias), check multi-archivo,
@@ -111,7 +111,7 @@ pub fn syn_files(root: &Root, path: Option<&str>) -> Vec<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// Parseo
+// parseo
 // ---------------------------------------------------------------------------
 
 /// Error de parseo/lexer con ubicación (para `check`/`outline`).
@@ -171,7 +171,7 @@ fn parse_file_uncached(root: &Root, abs: &Path) -> Result<Program, Diag> {
 }
 
 // ---------------------------------------------------------------------------
-// Símbolos
+// símbolos
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
@@ -744,7 +744,7 @@ fn enclosing(syms: &[Sym], line: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Tools
+// tools
 // ---------------------------------------------------------------------------
 
 /// `outline(path?, full?)`: estructura de cada `.syn`, sin cuerpos. Con más de un archivo
@@ -1492,19 +1492,169 @@ pub fn caps(root: &Root, path: Option<&str>) -> Value {
 }
 
 /// `check(path?)`: parse + imports + templates sobre uno o todos los `.syn`, en JSON.
+/// Un sitio de `declassify` en el programa: el listado estático que un auditor revisa.
+/// `reason`/`to` son `Some` sólo cuando son literales (texto, o lista de textos para `to`);
+/// `None` si falta o es una expresión (el auditor tiene que mirar el código).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeclassifySite {
+    pub line: usize,
+    pub col: usize,
+    pub reason: Option<String>,
+    pub to: Option<Vec<String>>,
+    /// El PRIMER argumento es un literal (escalar, o lista/mapa de literales) o un
+    /// identificador ligado a un literal en el top-level: el sitio no declassifica ningún
+    /// dato, sólo el PC del contexto (la rama en que está). `code check` los marca para que
+    /// El auditor los mire primero.
+    pub constant: bool,
+}
+
+/// ¿El nodo es un literal puro (escalar, o lista/mapa cuyos elementos lo son)?
+fn is_literal_node(n: &Node) -> bool {
+    match &n.kind {
+        NodeKind::NumberLiteral { .. }
+        | NodeKind::TextLiteral { .. }
+        | NodeKind::BoolLiteral { .. }
+        | NodeKind::NothingLiteral => true,
+        NodeKind::ListLiteral { elements } => elements.iter().all(is_literal_node),
+        NodeKind::MapLiteral { pairs } => pairs.iter().all(|(k, v)| is_literal_node(k) && is_literal_node(v)),
+        _ => false,
+    }
+}
+
+/// Nombres ligados en el top-level (también bajo `export`) a un literal puro.
+fn top_literal_names(program: &Program) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for stmt in &program.statements {
+        let inner = match &stmt.kind {
+            NodeKind::ExportDeclaration { declaration } => declaration.as_ref(),
+            _ => stmt,
+        };
+        if let NodeKind::LetBinding { name, value, .. } = &inner.kind {
+            if is_literal_node(value) {
+                out.insert(name.clone());
+            } else {
+                // Re-ligado a algo no literal: deja de ser constante.
+                out.remove(name);
+            }
+        }
+    }
+    out
+}
+
+/// Nombres ligados al builtin `declassify` por alias (`let d be declassify`), a cualquier
+/// profundidad. El listado del auditor los cuenta como sitios: si no, un alias lo vaciaba.
+/// No cubre un alias pasado como PARÁMETRO ni guardado en un mapa (eso no es decidible
+/// estáticamente): por eso el JSON de `check` declara `static_only`.
+fn declassify_aliases(program: &Program) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    out.insert("declassify".to_string());
+    // Punto fijo simple: `let a be declassify` y después `let b be a`.
+    loop {
+        let before = out.len();
+        for stmt in &program.statements {
+            walk(stmt, &mut |n| {
+                let inner = match &n.kind {
+                    NodeKind::ExportDeclaration { declaration } => declaration.as_ref(),
+                    _ => n,
+                };
+                if let NodeKind::LetBinding { name, value, .. } = &inner.kind {
+                    if value.as_identifier().is_some_and(|id| out.contains(id)) {
+                        out.insert(name.clone());
+                    }
+                }
+            });
+        }
+        if out.len() == before {
+            break;
+        }
+    }
+    out
+}
+
+/// Todos los `declassify(...)` del programa, en orden de aparición (estático, sobre el AST;
+/// Entra en lambdas, L2, y sigue los alias `let d be declassify`).
+pub fn declassify_sites(program: &Program) -> Vec<DeclassifySite> {
+    let consts = top_literal_names(program);
+    let aliases = declassify_aliases(program);
+    let mut out = Vec::new();
+    for stmt in &program.statements {
+        walk(stmt, &mut |n| {
+            if let NodeKind::TaskCall { name, arguments } = &n.kind {
+                if !name.as_identifier().is_some_and(|id| aliases.contains(id)) {
+                    return;
+                }
+                let constant = match arguments.first().map(|a| &a.value) {
+                    Some(v) if is_literal_node(v) => true,
+                    Some(v) => v.as_identifier().is_some_and(|id| consts.contains(id)),
+                    None => false,
+                };
+                let reason = match arguments.get(1).map(|a| &a.value.kind) {
+                    Some(NodeKind::TextLiteral { value }) => Some(value.clone()),
+                    _ => None,
+                };
+                let to = match arguments.get(2).map(|a| &a.value.kind) {
+                    Some(NodeKind::TextLiteral { value }) => Some(vec![value.clone()]),
+                    Some(NodeKind::ListLiteral { elements }) => elements
+                        .iter()
+                        .map(|e| match &e.kind {
+                            NodeKind::TextLiteral { value } => Some(value.clone()),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<String>>>(),
+                    _ => None,
+                };
+                out.push(DeclassifySite { line: n.location.line, col: n.location.column, reason, to, constant });
+            }
+        });
+    }
+    out
+}
+
 pub fn check(root: &Root, path: Option<&str>) -> Value {
     let mut errors: Vec<Value> = Vec::new();
     let mut warnings: Vec<Value> = Vec::new();
+    // Sitios de `declassify` de TODOS los archivos (módulos importados incluidos).
+    let mut declassify: Vec<Value> = Vec::new();
     let files = syn_files(root, path);
     let g = import_graph(root);
     for abs in &files {
         let rel = root.rel(abs);
         match parse_file(root, abs) {
             Err(d) => errors.push(d.to_json()),
-            // Un módulo importado se valida (imports + templates) desde su importador —
-            // repetirlo por módulo es trabajo redundante en un proyecto grande.
-            Ok(_) if g.importers.get(&canon(abs)).map(|v| !v.is_empty()).unwrap_or(false) => {}
             Ok(prog) => {
+                // Auditoría ronda 6: el control de nombres protegidos vivía SÓLO en la carga del
+                // intérprete, así que `code check` daba verde sobre un archivo de dos líneas que
+                // después no corre. Es puramente estático —recorre el AST y no evalúa nada—, así
+                // que moverlo acá no cuesta: la herramienta de revisión deja de aprobar lo que
+                // no carga.
+                if let Err(e) = crate::interpreter::check_protected_names(&prog) {
+                    let (message, line, column) = match &e {
+                        crate::interpreter::Control::Error(re) => (
+                            re.message.clone(),
+                            re.location.as_ref().map(|l| l.line).unwrap_or(0),
+                            re.location.as_ref().map(|l| l.column).unwrap_or(0),
+                        ),
+                        _ => (String::new(), 0, 0),
+                    };
+                    if !message.is_empty() {
+                        errors.push(json!({"file": rel, "line": line, "column": column, "message": message}));
+                    }
+                }
+                for s in declassify_sites(&prog) {
+                    declassify.push(json!({
+                        "file": rel,
+                        "line": s.line,
+                        "column": s.col,
+                        "reason": s.reason,
+                        "to": s.to,
+                        "constant": s.constant,
+                    }));
+                }
+                // Un módulo importado se valida (imports + templates) desde su importador —
+                // Repetirlo por módulo es trabajo redundante en un proyecto grande.
+                if g.importers.get(&canon(abs)).map(|v| !v.is_empty()).unwrap_or(false) {
+                    continue;
+                }
                 let loader = |resolved: &str, raw: &str| -> Result<Program, String> {
                     if !Path::new(resolved).exists() {
                         return Err(format!("module not found: {}", raw));
@@ -1552,7 +1702,11 @@ pub fn check(root: &Root, path: Option<&str>) -> Value {
     }
     dedup_sorted(&mut errors);
     dedup_sorted(&mut warnings);
-    json!({"ok": errors.is_empty(), "files": files.len(), "errors": errors, "warnings": warnings})
+    // `static_only`: el listado de `declassify` sale del AST (cubre lambdas y los alias
+    // `let d be declassify`), pero NO puede ver un alias que viajó como parámetro o dentro de
+    // Un contenedor. El registro de runtime (`Interpreter::declassify_log`) sí los ve todos:
+    // El auditor tiene que cruzar los dos.
+    json!({"ok": errors.is_empty(), "files": files.len(), "errors": errors, "warnings": warnings, "declassify": declassify, "declassify_static_only": true})
 }
 
 /// `search(pattern, path?, kinds?, regex?, limit?)`: texto en los archivos del proyecto.

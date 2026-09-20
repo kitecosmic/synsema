@@ -1,7 +1,7 @@
 # Synsema LLM Integration
 
 ## Operations
-```
+```synsema
 let analysis be analyze data for "trends and anomalies"
 let action be decide between ["refund", "replace", "escalate"] given ticket
 let email be generate "response email" given complaint with tone = "empathetic"
@@ -13,7 +13,7 @@ let insight be reason about problem with context = background_data
 All four operations are gated by the `llm` capability — they are side-effecting (a real provider
 hits the network and costs money), so they follow the same deny-by-default rule as `net`/`file`/`db`:
 
-```
+```synsema
 require llm
 let email be generate "response email" given complaint
 ```
@@ -193,7 +193,7 @@ in the manifest under `~/.ollama/models/manifests/…`; ollama need not be runni
 (`llm_step`) works via prompting — the model returns a `{"tool": …, "args": …}` JSON that the
 runtime parses.
 
-Honest limits (measured, see `specs/informe-f0-llm-local.md`): built for **short prompts** — CPU
+Honest limits (measured): built for **short prompts** — CPU
 prefill is ~12 tok/s, so a 1000-token prompt takes ~90s on a 0.5B; generation is ~11 tok/s (0.5B)
 / ~5 tok/s (3B, 4 threads). Model load (7s for 0.5B, ~35s for 3B) is paid **once per process** —
 under `serve` the first request loads, the rest reuse (measured: 8.2s → 1.3s). RAM: ~1GB (0.5B) /

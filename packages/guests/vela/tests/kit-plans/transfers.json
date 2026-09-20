@@ -1,0 +1,90 @@
+{
+  "deploy": null,
+  "steps": [
+    {
+      "kind": "deposit",
+      "sender": "0x1111111111111111111111111111111111111111",
+      "token": "0x0000000000000000000000000000000000000000",
+      "value": "300"
+    },
+    {
+      "kind": "process",
+      "sender": "0x1111111111111111111111111111111111111111",
+      "payload": {
+        "type": "transfer",
+        "to": "0x2222222222222222222222222222222222222222",
+        "amount": "120",
+        "invoice_id": "INV-2026-1"
+      },
+      "expect": {
+        "app_events": 1,
+        "events": 2
+      }
+    },
+    {
+      "kind": "process",
+      "sender": "0x2222222222222222222222222222222222222222",
+      "payload": {
+        "type": "transfer",
+        "to": "0x1111111111111111111111111111111111111111",
+        "amount": "121"
+      },
+      "expect_error": "insufficient_balance"
+    },
+    {
+      "kind": "process",
+      "sender": "0x1111111111111111111111111111111111111111",
+      "payload": {
+        "type": "transfer",
+        "to": "0x2222222222222222222222222222222222222222",
+        "amount": "1",
+        "token": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+      },
+      "expect_error": "token_not_allowed"
+    },
+    {
+      "kind": "process",
+      "sender": "0x1111111111111111111111111111111111111111",
+      "payload": {
+        "type": "withdraw",
+        "to": "0x2222222222222222222222222222222222222222",
+        "amount": "20"
+      },
+      "expect": {
+        "app_events": 1,
+        "app_event_subtypes": [
+          "withdrawal"
+        ],
+        "app_event_bytes": [
+          96
+        ],
+        "withdrawals": 1,
+        "withdrawal_amounts": [
+          "0x14"
+        ]
+      }
+    },
+    {
+      "kind": "process",
+      "sender": "0x1111111111111111111111111111111111111111",
+      "payload": {
+        "type": "mint"
+      },
+      "expect_error": "*"
+    },
+    {
+      "kind": "deanonymize",
+      "sender": "0x1111111111111111111111111111111111111111",
+      "payload": {}
+    },
+    {
+      "kind": "trusted",
+      "payload_hex": "0x00000000000000000000000022222222222222222222222222222222222222220000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000f",
+      "expect": {
+        "app_events": 0,
+        "withdrawals": 0,
+        "events": 0
+      }
+    }
+  ]
+}

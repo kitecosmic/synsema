@@ -12,7 +12,7 @@ fn gen_loc() -> SourceLocation {
 }
 
 // =========================================================
-// Walker del AST (espeja _walk de Python: recorre todos los Node hijos)
+// walker del AST (espeja _walk de Python: recorre todos los Node hijos)
 // =========================================================
 
 /// Nodos hijos directos de un nodo (todas las variantes con sub-Nodes).
@@ -32,6 +32,9 @@ fn children(n: &Node) -> Vec<&Node> {
         }
         LetBinding { value, .. } => vec![value],
         SetMutation { target, value } => vec![target, value],
+        // Una lambda es un cuerpo de una expresión: se desciende (L2: `declassify` dentro de
+        // `(x) => declassify(x, …)` tiene que verse en `codeintel`).
+        LambdaExpression { body, .. } => vec![body.as_ref()],
         WhenStatement { condition, body, otherwise, otherwise_when } => {
             let mut v = vec![condition.as_ref()];
             v.extend(body.iter());
@@ -258,7 +261,7 @@ pub fn walk<'a>(node: &'a Node, visitor: &mut dyn FnMut(&'a Node)) {
 }
 
 // =========================================================
-// Query
+// query
 // =========================================================
 
 pub fn find_tasks(program: &Program) -> Vec<&Node> {
@@ -351,7 +354,7 @@ pub fn get_dependency_graph(program: &Program) -> indexmap::IndexMap<String, Vec
 }
 
 // =========================================================
-// Mutación
+// mutación
 // =========================================================
 
 /// Renombra una task y todos sus usos (definición + identificadores). Devuelve el
@@ -416,7 +419,7 @@ pub fn extract_task(
 }
 
 // =========================================================
-// Generación de nodos
+// generación de nodos
 // =========================================================
 
 pub fn make_text(value: &str) -> Node {
@@ -438,7 +441,7 @@ pub fn make_call(task_name: &str, args: Vec<Node>) -> Node {
 }
 
 // =========================================================
-// Resumen
+// resumen
 // =========================================================
 
 #[derive(Debug, Default)]
@@ -495,7 +498,7 @@ pub fn summarize(program: &Program) -> Summary {
 }
 
 // =========================================================
-// Walker mutable (para rename)
+// walker mutable (para rename)
 // =========================================================
 
 fn children_mut(n: &mut Node) -> Vec<&mut Node> {
@@ -514,6 +517,7 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
         }
         LetBinding { value, .. } => vec![value.as_mut()],
         SetMutation { target, value } => vec![target.as_mut(), value.as_mut()],
+        LambdaExpression { body, .. } => vec![body.as_mut()],
         WhenStatement { condition, body, otherwise, otherwise_when } => {
             let mut v = vec![condition.as_mut()];
             v.extend(body.iter_mut());

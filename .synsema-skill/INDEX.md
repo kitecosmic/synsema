@@ -88,7 +88,8 @@ usually version skew, not a bug.
 - [frontend.md](frontend.md) — Building UIs/sites: render() templates (inline CSS/JS via `{ raw }` verbatim blocks, elif chains, each empty-branch + `enumerate`, includes with props, named slots, `{ -- comments }`, `json_for_script` for script data) + layouts/partials + static assets (cache policy, SPA fallback) + client JS; content() for agent-negotiable pages. No imposed framework.
 - [dataviz.md](dataviz.md) — Business data & charts: CSV import/export (`csv_parse`/`csv_encode`, RFC 4180), descriptive statistics (`median`/`percentile`/`histogram`), native SVG charts (`chart_svg`) and the negotiated `chart()` content node (SVG for humans, data table/JSON for agents), PNG/PDF export (`svg_to_png`/`svg_to_pdf`, deterministic embedded font). Data-source-agnostic, pure (works in `sandbox`).
 - [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination/paged(), streaming (SSE, automatic heartbeat), **incoming WebSocket routes (`socket`)**, handler **`timeout`** + cooperative cancellation, **ordered shutdown**, rate limiting, body limits, HTML/SSR pages (`render`, `html`), static files, CORS, content negotiation (HTML/Markdown/JSON for agents), agent discoverability (`/llms.txt`, `/robots.txt`, `/sitemap.xml`, `/openapi.json`, `/docs` — generated; `synsema openapi` for CI), **and the Rust production stack: TLS / auto-HTTPS (ACME) / virtual hosts / reverse proxy / HTTP-2 / production static (ETag·Range·gzip)**
-- [capabilities.md](capabilities.md) — Security model, require, sandbox, intent
+- [capabilities.md](capabilities.md) — Security model, require, sandbox, intent, `attest`
+- [labels.md](labels.md) — **Information-flow labels** (`--labels`, always on under `serve --attested` and inside a guest): `private`/`declassify`/`label_of`/`is_private`, what propagates, what a public sink refuses (including stdout and the call itself under a private branch), how far an early exit colours what follows, errors that cannot be caught, `steps()`, and the limits stated
 - [processes.md](processes.md) — Run OS processes/tools with `run` (gated by `exec`): shells/scripts/pipelines, timeout, cwd/env/stdin, capture limits, generate-and-run loop, giving an LLM a shell tool; **live processes `proc_*`** (streamed stdout/stderr, live stdin, kill, no orphans); **`pty: true`** (v0.6.8+: real pseudo-terminal for y/N prompts, passwords, TUIs, web terminals — `proc_resize`, `strip_ansi`)
 - [secrets.md](secrets.md) — Config by environment (`env`), LLM-proof secrets (`secret`, redacted everywhere), `.env`, `reveal()` + audit, HMAC/bearer/constant-time helpers
 - [agents.md](agents.md) — Multi-agent coordination, blackboard, swarm, signals, **event bus (`bus_*` fan-out)**, `agents()`/`agent_stop`, agents under serve
@@ -115,6 +116,7 @@ usually version skew, not a bug.
 - Splitting the program across files / importing (`use`/`export`, `export routes` + `mount`) → modules.md
 - Writing tests / asserting behavior → testing.md
 - Navigating a Synsema repo as an agent (what's in a file, where a task is used, the route table, missing capabilities) → code.md
+- Data that must not leave (enclave/TEE, multi-tenant, confidential deployment) → labels.md
 - Binary data / files / hashing / base64 → builtins.md (bytes section)
 - Complex numbers / gamma·erf / hyperbolics → builtins.md (math section)
 - Numeric arrays / matrices / linear algebra (matmul/solve/eig/svd) → builtins.md (arrays section)

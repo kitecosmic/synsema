@@ -1,4 +1,4 @@
-//! E2E de `synsema init --pwa` sobre el binario real (tanda PWA, specs/pwa-mobile.md):
+//! E2E de `synsema init --pwa` sobre el binario real:
 //! el scaffold se escribe entero (sin hello.syn), los PNG se derivan de icon.svg con las
 //! dimensiones prometidas y se regeneran sólo cuando corresponde, los flags inválidos
 //! fallan con exit 2, y el `app.syn` generado SIRVE lo que una PWA necesita con los

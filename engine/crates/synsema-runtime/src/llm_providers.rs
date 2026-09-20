@@ -16,7 +16,7 @@
 //! Conectividad LIBRE (los knobs los elige el usuario por env; el runtime no impone
 //! límites): `SYNSEMA_LLM_MODEL` (modelo), `SYNSEMA_LLM_MAX_TOKENS` (tope de salida),
 //! `SYNSEMA_LLM_BASE_URL` (endpoint → modelos LOCALES OpenAI-compatibles: Ollama/LM
-//! Studio/vLLM/llama.cpp), `SYNSEMA_LLM_TIMEOUT` (timeout HTTP en segundos, default 60 —
+//! studio/vLLM/llama.cpp), `SYNSEMA_LLM_TIMEOUT` (timeout HTTP en segundos, default 60 —
 //! con el transporte streaming mide SILENCIO entre bytes, no duración total),
 //! `SYNSEMA_LLM_HTTP_STREAM` (default `1`: los providers de red piden SSE y rearman la
 //! respuesta internamente; `0`/`false` → camino no-stream clásico, para proxies raros).
@@ -47,7 +47,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// Base-URL oficial de Anthropic (override por `SYNSEMA_LLM_BASE_URL`).
 const ANTHROPIC_DEFAULT_BASE: &str = "https://api.anthropic.com";
 /// Base-URL oficial de OpenAI (override por `SYNSEMA_LLM_BASE_URL` → modelos LOCALES
-/// OpenAI-compatibles, ej. `http://localhost:11434/v1` para Ollama).
+/// openAI-compatibles, ej. `http://localhost:11434/v1` para Ollama).
 const OPENAI_DEFAULT_BASE: &str = "https://api.openai.com/v1";
 /// Base de MiniMax: su API **Anthropic-compatible** (mismo formato `/v1/messages` +
 /// `x-api-key`), por eso reusa el `AnthropicProvider`. Override por `SYNSEMA_LLM_BASE_URL`.
@@ -70,7 +70,7 @@ pub const MINIMAX_DEFAULT_MODEL: &str = "MiniMax-M3";
 pub const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-chat";
 
 // =========================================================
-// Helpers puros compartidos
+// helpers puros compartidos
 // =========================================================
 
 /// Endpoint de Anthropic Messages: `{base}/v1/messages`. El base oficial NO incluye `/v1`.
@@ -120,7 +120,7 @@ fn api_error_message(err: &Value) -> String {
 }
 
 // =========================================================
-// Transporte streaming (SSE) — infraestructura compartida
+// transporte streaming (SSE) — infraestructura compartida
 // =========================================================
 
 /// Un evento SSE rearmado: `event:` opcional + las líneas `data:` concatenadas.
@@ -221,7 +221,7 @@ fn is_event_stream(headers: &[(String, String)]) -> bool {
 }
 
 // =========================================================
-// Anthropic
+// anthropic
 // =========================================================
 
 /// Arma el body JSON para `POST /v1/messages`. Si `tools` está vacío, OMITE la clave
@@ -360,7 +360,7 @@ pub fn parse_anthropic_text(json_str: &str) -> Result<(String, u64), String> {
 }
 
 /// Estado del rearmado de un stream SSE Anthropic-compatible (Anthropic canónico y
-/// MiniMax). `feed` procesa cada evento y devuelve el text-delta si lo hubo (para
+/// miniMax). `feed` procesa cada evento y devuelve el text-delta si lo hubo (para
 /// `on_chunk`); `finish_*` cierra y devuelve lo mismo que los parsers no-stream.
 ///
 /// Usage — regla que cubre AMBOS dialectos sin caso especial: Anthropic canónico manda
@@ -703,7 +703,7 @@ impl LLMProvider for AnthropicProvider {
 }
 
 // =========================================================
-// OpenAI (y compatibles: Ollama / LM Studio / vLLM / llama.cpp)
+// openAI (y compatibles: Ollama / LM Studio / vLLM / llama.cpp)
 // =========================================================
 
 /// Arma el body JSON para `POST /chat/completions`. Tools al estilo function-calling.
@@ -1322,7 +1322,7 @@ pub fn decide_with_contract(
 }
 
 // =========================================================
-// Metering LLM + backstop de budget (FRAMEWORK F1 / F-A)
+// metering LLM + backstop de budget (FRAMEWORK F1 / F-A)
 // =========================================================
 
 /// Tokens LLM acumulados del PROCESO (input + output de cada llamada real). Lo
@@ -1377,7 +1377,7 @@ pub struct MeteredProvider {
     per_identity: std::collections::HashMap<String, u64>,
 }
 
-/// v0.6.20 — tokens usados POR IDENTIDAD en todo el PROCESO (auditoría B1): `serve` construye
+/// V0.6.20 — tokens usados POR IDENTIDAD en todo el PROCESO : `serve` construye
 /// un `MeteredProvider` por worker y por hilo de stream, así que un contador de instancia
 /// contaba por hilo y el techo se multiplicaba por el número de workers. Mismo patrón que
 /// `LLM_TOKENS_USED`: estático, sobrevive a la reconstrucción del provider.
@@ -1536,7 +1536,7 @@ impl MeteredProvider {
     }
 }
 
-/// v0.6.20 (auditoría M1) — envuelve al provider real y lo RECONSTRUYE cuando el host pidió
+/// V0.6.20  — envuelve al provider real y lo RECONSTRUYE cuando el host pidió
 /// recargar el `.env` (SIGHUP → `secrets::request_env_reload`): la clave y los knobs nuevos
 /// valen para la próxima op LLM sin reiniciar. Los contadores (proceso e identidad) son
 /// estáticos y sobreviven a la reconstrucción. Sin provider configurado tras la recarga se
@@ -1648,7 +1648,7 @@ fn resolve_llm_budget(store: &EnvStore) -> Option<u64> {
 }
 
 // =========================================================
-// Factory + selección por env
+// factory + selección por env
 // =========================================================
 
 /// Construye un provider real por nombre (puro, testeable). `base_url=None` → el base
@@ -1917,7 +1917,7 @@ pub fn provider_from_env() -> Option<Arc<dyn LLMProvider>> {
 }
 
 // =========================================================
-// Reporte de configuración (`synsema llm status`) — datos puros
+// reporte de configuración (`synsema llm status`) — datos puros
 // =========================================================
 
 /// De dónde salió un valor resuelto. La 4ª "fuente" (flag `--provider`) llega como
@@ -2552,7 +2552,7 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // -- DE-007: resolución desde el `.env` protegido (precedencia environ > store) --
-    // Serializado vía ENV_LOCK para no carrear con los tests del provider local.
+    // serializado vía ENV_LOCK para no carrear con los tests del provider local.
     #[test]
     fn provider_from_config_dotenv_and_precedence() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -3307,7 +3307,7 @@ mod tests {
         assert_eq!(normalize_decide("azul oscuro", &sub), Some("azul oscuro".to_string()));
     }
 
-    // ADVERSARIO (auditoría Orden 1): la contención debe ser por PALABRA COMPLETA, no
+    // ADVERSARIO : la contención debe ser por PALABRA COMPLETA, no
     // substring — con opciones cortas tipo si/no, "nece*si*to" NO es una elección.
     // Devolver "si" acá sería inventar una decisión que el modelo no tomó (peor que el
     // bug DE-039 original, porque encima viene "validada" por el contrato).
@@ -3430,7 +3430,7 @@ mod tests {
     }
 
     /// Server fake que además CAPTURA cada request completo (head + body por
-    /// Content-Length) — para aseverar el feedback del reintento de decide.
+    /// content-Length) — para aseverar el feedback del reintento de decide.
     fn spawn_capture_server(
         responses: Vec<Vec<u8>>,
     ) -> (String, thread::JoinHandle<()>, Arc<std::sync::Mutex<Vec<String>>>) {
@@ -3590,7 +3590,7 @@ mod tests {
     }
 
     // =========================================================
-    // Metering + budget (FRAMEWORK F1 / F-A)
+    // metering + budget (FRAMEWORK F1 / F-A)
     // =========================================================
 
     /// El contador de tokens es GLOBAL del proceso (así es el contrato de
@@ -3640,7 +3640,7 @@ mod tests {
         let mock = Arc::new(MockProvider::new(std::collections::HashMap::new()).with_call_tokens(25_000));
         let mut per = std::collections::HashMap::new();
         per.insert("unit-agent-1".to_string(), 60_000u64);
-        // El contador es de PROCESO (auditoría B1): dos providers (dos workers) comparten el uso.
+        // El contador es de PROCESO : dos providers (dos workers) comparten el uso.
         let p = MeteredProvider::with_identity_budgets(mock.clone(), None, per.clone());
         let p2 = MeteredProvider::with_identity_budgets(mock.clone(), None, per);
         {

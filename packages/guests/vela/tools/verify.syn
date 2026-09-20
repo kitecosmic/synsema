@@ -1,0 +1,410 @@
+-- verify.syn — checks that a Vela guest module is a released interpreter plus the program in its
+-- app slot, and nothing else. The pair of embed.syn: that one writes the slot, this one reads it
+-- back and rebuilds what the module SHOULD be from the release asset, then compares byte by byte.
+--
+--   synsema run verify.syn -- app.wasm --release v0.6.23 [--source app.syn] [--extract out.syn]
+--                                      [--audited <sha256>] [--cache <dir>]
+--   synsema run verify.syn -- app.wasm --asset guest.wasm …      a guest on disk instead of the release's (offline)
+--
+-- In order:
+--   1. finds the app slot (magic SYNSEMA.APPSLOT1) and reads the program's name and bytes out of
+--      its header; `--extract` writes the program to a file, to read what really runs;
+--   2. `--source`: the program in the slot must be byte-identical to that file;
+--   3. downloads the release's synsema-vela-guest.wasm and its .sha256 from GitHub (following
+--      the redirect to GitHub's object store) and checks the asset against its sha256; `--cache
+--      <dir>` keeps the asset there and reuses it while its sha256 still matches;
+--   4. `--audited <sha256>`: the release asset must be the audited interpreter (SECURITY-GUEST.md
+--      names the sha256 an external audit covered);
+--   5. embeds the extracted program into the asset exactly as embed.syn does and compares the
+--      given module with the result: the first offset that differs, and whether it falls inside
+--      the slot (the program or its header) or outside it (the interpreter is not the release's);
+--   6. prints the module's sha256 — the wasmSha256 in the deploy descriptor the chain checks.
+--
+-- `--release` is mandatory: a program cannot read the CLI's own version, and the interpreter in a
+-- module is the release it was built from, not the synsema that runs this tool.
+--
+-- Limit: the module a Manager runs is not downloadable by third parties (the Manager keeps the
+-- artifact). `verify` serves whoever the app hands its `.wasm` to — the kit's release, a CI
+-- artifact — and its sha256 is what to compare with the deploy descriptor's wasmSha256 on-chain.
+-- Layout of the slot (524 288 bytes): magic (16) · name length (1) · name (63) · program length as
+-- u32 little-endian (4) · the program, UTF-8 · 0x20 filler to the end. Programs up to 524 204 bytes.
+intent: "verify a Vela guest module: a release's interpreter plus the program in its slot, byte by byte"
+
+require file.read("*")
+require file.write("*")
+-- the release assets: GitHub answers with a redirect to its object store (two hosts, old and new)
+require net("github.com")
+require net("objects.githubusercontent.com")
+require net("release-assets.githubusercontent.com")
+
+let MAGIC be "SYNSEMA.APPSLOT1"
+let SLOT be 524288
+let HEADER be 16 + 1 + 63 + 4
+let RELEASES be "https://github.com/kitecosmic/synsema/releases/download/"
+let ASSET be "synsema-vela-guest.wasm"
+
+-- ---- the slot (the same tasks as embed.syn; verify.syn must not `use` a program with a main) ----
+
+task u32_le(n)
+    give bytes([n % 256, floor(n / 256) % 256, floor(n / 65536) % 256, floor(n / 16777216) % 256])
+
+task u32_le_value(b)
+    give b[0] + b[1] * 256 + b[2] * 65536 + b[3] * 16777216
+
+-- n bytes of 0x20: the filler build.rs uses, byte for byte, after the name and after the program.
+-- Not zero on purpose — a long run of zeros could land in .bss or in a split segment, and the
+-- slot must stay ONE contiguous run of bytes in the file. Doubling: ~20 steps for a whole slot.
+task fill(n)
+    let s be bytes(" ")
+    while length(s) < n
+        set s to s + s
+    give slice(s, 0, n)
+
+task base_name(path)
+    let parts be split(replace_text(path, "\\", "/"), "/")
+    give parts[length(parts) - 1]
+
+task slot_offset(wasm)
+    -- the whole module as hex, split on the magic: exactly one slot, byte-aligned
+    let parts be split(decode(wasm, "hex"), decode(bytes(MAGIC), "hex"))
+    when length(parts) < 2
+        raise("no app slot in this module: it needs a guest from Synsema v0.6.23 or newer (the release asset " + ASSET + ")")
+    when length(parts) > 2
+        raise("the module has more than one app slot; refusing to guess")
+    when length(parts[0]) % 2 != 0
+        raise("the app slot is not byte-aligned; refusing to guess")
+    let off be floor(length(parts[0]) / 2)
+    when off + SLOT > length(wasm)
+        raise("the module ends before its app slot does (" + text(length(wasm)) + " bytes)")
+    give off
+
+-- embed.syn's `embed`, taking the program as bytes: what the module must be if it is honest
+task embed_bytes(wasm, body, name)
+    let off be slot_offset(wasm)
+    when length(body) > SLOT - HEADER
+        raise("the program is " + text(length(body)) + " bytes; the app slot holds at most " + text(SLOT - HEADER))
+    let n be bytes(name)
+    when length(n) > 63
+        set n to slice(n, 0, 63)
+    let header be bytes(MAGIC) + bytes([length(n)]) + n + fill(63 - length(n)) + u32_le(length(body))
+    let slot be header + body + fill(SLOT - HEADER - length(body))
+    give slice(wasm, 0, off) + slot + slice(wasm, off + SLOT, length(wasm))
+
+-- what the slot holds: {offset, name, program (bytes)}
+task slot_contents(wasm)
+    let off be slot_offset(wasm)
+    let name_len be wasm[off + 16]
+    when name_len > 63
+        raise("the slot header names a program with " + text(name_len) + " bytes of name; the field holds 63")
+    let program_len be u32_le_value(slice(wasm, off + 80, off + 84))
+    when program_len > SLOT - HEADER
+        raise("the slot header declares a program of " + text(program_len) + " bytes; the slot holds at most " + text(SLOT - HEADER))
+    give {"offset": off, "name": decode(slice(wasm, off + 17, off + 17 + name_len)), "program": slice(wasm, off + HEADER, off + HEADER + program_len)}
+
+-- ---- comparing ----
+
+-- the first offset where two byte strings differ, or nothing when they are identical (length too)
+task first_difference(a, b)
+    let n be min(length(a), length(b))
+    let off be differing_offset(a, b, 0, n, 65536)
+    when off != nothing
+        give off
+    give when length(a) == length(b) then nothing otherwise n
+
+-- narrows [from, to) by chunks of `step` (native comparisons), then 256× finer, down to the byte:
+-- a 7 MB module takes a few hundred steps instead of seven million
+task differing_offset(a, b, lo, hi, step)
+    let i be lo
+    while i < hi
+        let j be min(i + step, hi)
+        when slice(a, i, j) != slice(b, i, j)
+            when step <= 1
+                give i
+            give differing_offset(a, b, i, j, max(1, floor(step / 256)))
+        set i to j
+    give nothing
+
+-- where a differing offset falls, and what that means
+task locate(off, slot_off)
+    when off < slot_off
+        give "outside the app slot, before it (offset " + text(off) + "): the interpreter is not the release's"
+    when off >= slot_off + SLOT
+        give "outside the app slot, after it (offset " + text(off) + "): the interpreter is not the release's"
+    let rel be off - slot_off
+    when rel < HEADER
+        give "inside the app slot's header (offset " + text(off) + ", slot byte " + text(rel) + "): the program's name or length differ"
+    give "inside the app slot (offset " + text(off) + ", program byte " + text(rel - HEADER) + "): the program differs"
+
+-- a sha256 as people paste it → 64 lowercase hex digits
+task normalize_sha(s)
+    let t be lower(trim(s))
+    when starts_with(t, "sha256:")
+        set t to slice(t, 7, length(t))
+    when starts_with(t, "0x")
+        set t to slice(t, 2, length(t))
+    when length(t) != 64 or not matches(t, "[0-9a-f]{64}")
+        raise("not a sha256: " + s)
+    give t
+
+-- the release's `.sha256` file: "<hex>  synsema-vela-guest.wasm"
+task sha_of_listing(listing)
+    let first be split(trim(listing), " ")[0]
+    give normalize_sha(first)
+
+task sha_hex(b)
+    give decode(sha256(b), "hex")
+
+-- ---- the release asset ----
+
+task fetch_bytes(url, hops)
+    let r be http_bytes("GET", url, nothing, nothing, nothing, 300)
+    when r["status"] == 301 or r["status"] == 302 or r["status"] == 307 or r["status"] == 308
+        when hops == 0
+            raise("too many redirects fetching " + url)
+        let h be r["headers"]
+        give fetch_bytes(when contains(h, "location") then h["location"] otherwise h["Location"], hops - 1)
+    when r["status"] != 200
+        raise("HTTP " + text(r["status"]) + " fetching " + url)
+    give r["bytes"]
+
+-- synsema-vela-guest.wasm of `tag`, checked against its .sha256: {bytes, sha256, from}
+task release_asset(tag, cache_dir)
+    let base be RELEASES + tag + "/" + ASSET
+    let want be sha_of_listing(decode(fetch_bytes(base + ".sha256", 4)))
+    let cached be when cache_dir == nothing then nothing otherwise cache_dir + "/synsema-vela-guest-" + tag + ".wasm"
+    when cached != nothing and file_exists(cached)
+        let kept be read_file_bytes(cached)
+        when sha_hex(kept) == want
+            give asset_record(kept, "release " + tag + ": " + ASSET, "matches its .sha256; from " + cached)
+    let fresh be fetch_bytes(base, 4)
+    let got be sha_hex(fresh)
+    when got != want
+        raise("the asset of " + tag + " does not match its .sha256 (" + got + " vs " + want + "): refusing to use it")
+    when cached != nothing
+        write_file(cached, fresh)
+    give asset_record(fresh, "release " + tag + ": " + ASSET, "matches its .sha256; from " + (when cached == nothing then base otherwise cached))
+
+-- `--asset <file>`: a guest module on disk stands in for the release's (offline checks, a module
+-- built by build.rs in the working tree); nothing vouches for it but its own sha256, and the line says so
+task local_asset(path)
+    give asset_record(read_file_bytes(path), "asset " + path, "a local file, checked against no release .sha256")
+
+task asset_record(b, label, note)
+    let sha be sha_hex(b)
+    give {"bytes": b, "sha256": sha, "line": label + " " + text(length(b)) + " bytes, sha256 " + sha + " (" + note + ")"}
+
+-- ---- the command ----
+
+task parse_args(a)
+    let o be {"module": nothing, "release": nothing, "source": nothing, "extract": nothing, "audited": nothing, "cache": nothing, "asset": nothing}
+    let i be 0
+    while i < length(a)
+        let x be a[i]
+        when x == "--release" or x == "--source" or x == "--extract" or x == "--audited" or x == "--cache" or x == "--asset"
+            when i + 1 >= length(a)
+                raise(x + " needs a value")
+            set o[slice(x, 2, length(x))] to a[i + 1]
+            set i to i + 2
+        otherwise when starts_with(x, "--")
+            raise("unknown option " + x)
+        otherwise
+            when o["module"] != nothing
+                raise("one module at a time (got " + o["module"] + " and " + x + ")")
+            set o["module"] to x
+            set i to i + 1
+    when o["module"] == nothing
+        raise(USAGE)
+    when o["release"] != nothing and o["asset"] != nothing
+        raise("--release and --asset exclude each other: the interpreter comes from the release's asset or from that file")
+    give o
+
+let USAGE be "usage: synsema run verify.syn -- app.wasm (--release <tag> | --asset <guest.wasm>) [--source app.syn] [--extract out.syn] [--audited <sha256>] [--cache <dir>]"
+
+-- the verdicts that need no network, from the module's bytes and the options: a list of
+-- {"ok": bool, "line": text}; `source` is the --source file's bytes or nothing
+task local_checks(wasm, slot, source)
+    let out be [{"ok": true, "line": "app slot at offset " + text(slot["offset"]) + ": program " + slot["name"] + " (" + text(length(slot["program"])) + " bytes), sha256 " + sha_hex(slot["program"])}]
+    when source != nothing
+        let d be first_difference(slot["program"], source)
+        when d == nothing
+            set out to append(out, {"ok": true, "line": "source: identical to the program in the slot"})
+        otherwise
+            set out to append(out, {"ok": false, "line": "source: DIFFERS from the program in the slot at byte " + text(d) + " (slot program " + text(length(slot["program"])) + " bytes, source " + text(length(source)) + " bytes)"})
+    give out
+
+-- the module against the release asset with the slot's program embedded: one verdict
+task compare_with_release(wasm, slot, asset)
+    let expected be embed_bytes(asset, slot["program"], slot["name"])
+    let d be first_difference(wasm, expected)
+    when d == nothing
+        give {"ok": true, "line": "VERIFIED: the module is the release's interpreter with exactly this program in its slot"}
+    give {"ok": false, "line": "MISMATCH " + locate(d, slot["offset"]) + " (module " + text(length(wasm)) + " bytes, expected " + text(length(expected)) + ")"}
+
+task audited_check(asset_sha, audited)
+    let want be normalize_sha(audited)
+    when want == asset_sha
+        give {"ok": true, "line": "audited: the release asset is the audited interpreter (" + want + ")"}
+    give {"ok": false, "line": "NOT the audited interpreter: release asset " + asset_sha + ", audited " + want}
+
+task run_verify(o)
+    let wasm be read_file_bytes(o["module"])
+    let slot be slot_contents(wasm)
+    print(o["module"] + ": " + text(length(wasm)) + " bytes, sha256 " + sha_hex(wasm) + "  (the wasmSha256 the chain checks)")
+    when o["extract"] != nothing
+        write_file(o["extract"], slot["program"])
+        print("program written to " + o["extract"])
+    let source be when o["source"] == nothing then nothing otherwise read_file_bytes(o["source"])
+    let verdicts be local_checks(wasm, slot, source)
+    when o["release"] == nothing and o["asset"] == nothing
+        each v in verdicts
+            print(v["line"])
+        raise("--release <tag> is required: which Synsema release's interpreter should this module carry? (e.g. --release v0.6.23 — a program cannot read the CLI's version, and the module's interpreter is the release it was built from, not the synsema running this tool; --asset <guest.wasm> takes a local guest instead, unchecked against any release)")
+    let asset be when o["asset"] == nothing then release_asset(o["release"], o["cache"]) otherwise local_asset(o["asset"])
+    set verdicts to append(verdicts, {"ok": true, "line": asset["line"]})
+    when o["audited"] != nothing
+        set verdicts to append(verdicts, audited_check(asset["sha256"], o["audited"]))
+    set verdicts to append(verdicts, compare_with_release(wasm, slot, asset["bytes"]))
+    let failed be 0
+    each v in verdicts
+        print(v["line"])
+        when not v["ok"]
+            set failed to failed + 1
+    when failed > 0
+        raise(text(failed) + " check(s) failed: do not deploy this module, and do not trust a deployment whose wasmSha256 is " + sha_hex(wasm))
+    print("sha256 " + sha_hex(wasm) + " is safe to compare with the deploy descriptor's wasmSha256")
+
+let a be args()
+when length(a) == 0
+    print(USAGE)
+otherwise
+    run_verify(parse_args(a))
+
+-- ---------------------------------------------------------------------------------------
+-- Tests (pure: no network): `synsema test verify.syn`
+-- ---------------------------------------------------------------------------------------
+
+-- some bytes, then a slot laid out EXACTLY as build.rs writes it (magic · name length · name ·
+-- filler to byte 80 · u32 LE · program · filler to the end), then more bytes; `filler(k)` gives
+-- the k filler bytes, so a test can pin which filler is the right one
+task build_rs_module(program, filler)
+    let n be bytes("app.syn")
+    let header be bytes(MAGIC) + bytes([length(n)]) + n + filler(63 - length(n)) + u32_le(length(bytes(program)))
+    give bytes(" asm    before ") + header + bytes(program) + filler(SLOT - HEADER - length(bytes(program))) + bytes(" after")
+
+task fake_module(program)
+    give build_rs_module(program, (k) => fill(k))
+
+test "u32 little-endian, both ways"
+    assert_eq(u32_le(1), bytes([1, 0, 0, 0]))
+    assert_eq(u32_le(258), bytes([2, 1, 0, 0]))
+    assert_eq(u32_le_value(u32_le(16777217)), 16777217)
+    assert_eq(u32_le_value(u32_le(524204)), 524204)
+
+test "the filler is 0x20, as in build.rs: a module filled like build.rs verifies against itself, a zero-filled one mismatches in the header"
+    assert_eq(fill(0), bytes([]))
+    assert_eq(fill(3), bytes([32, 32, 32]))
+    assert_eq(length(fill(SLOT)), SLOT)
+    let program be "task deploy(ctx)\n    give {\"state\": {}}\n"
+    let m be build_rs_module(program, (k) => fill(k))
+    assert(compare_with_release(m, slot_contents(m), m)["ok"])
+    let zeros be build_rs_module(program, (k) => int_to_bytes(0, k))
+    let v be compare_with_release(zeros, slot_contents(zeros), zeros)
+    assert(not v["ok"])
+    assert(contains(v["line"], "header"))
+    -- the first byte that differs is the first filler byte, right after the name
+    assert_eq(first_difference(m, zeros), slot_offset(m) + 17 + length(bytes("app.syn")))
+
+test "the slot is found and its name and program are read back"
+    let program be "task deploy(ctx)\n    give {\"state\": {}}\n"
+    let m be fake_module(program)
+    let s be slot_contents(m)
+    assert_eq(s["offset"], 15)
+    assert_eq(s["name"], "app.syn")
+    assert_eq(s["program"], bytes(program))
+    -- what embed.syn writes, verify.syn reads: a round trip through another program and name
+    let other be bytes("task deploy(ctx)\n    give {\"state\": {\"v\": 2}}\n")
+    let s2 be slot_contents(embed_bytes(m, other, "other.syn"))
+    assert_eq(s2["name"], "other.syn")
+    assert_eq(s2["program"], other)
+    assert_error(() => slot_contents(bytes("no slot here")))
+    assert_error(() => slot_contents(m + m))
+
+test "the first difference is found byte-exactly, in and out of the slot, and length counts"
+    let m be fake_module("x")
+    assert_eq(first_difference(m, m), nothing)
+    let outside be bytes([65]) + slice(m, 1, length(m))
+    assert_eq(first_difference(m, outside), 0)
+    let off be slot_offset(m)
+    let inside be slice(m, 0, off + HEADER) + bytes("y") + slice(m, off + HEADER + 1, length(m))
+    assert_eq(first_difference(m, inside), off + HEADER)
+    let after be slice(m, 0, length(m) - 1) + bytes("!")
+    assert_eq(first_difference(m, after), length(m) - 1)
+    assert_eq(first_difference(m, slice(m, 0, 100)), 100)
+    -- a difference far into a big blob is still found exactly (chunks 65536 → 256 → 1)
+    let big be int_to_bytes(0, 300000)
+    let big2 be int_to_bytes(0, 299999) + bytes([1])
+    assert_eq(first_difference(big, big2), 299999)
+    let mid be int_to_bytes(0, 70000) + bytes([1]) + int_to_bytes(0, 229999)
+    assert_eq(first_difference(big, mid), 70000)
+
+test "a differing offset is located: interpreter before / after the slot, header, or program"
+    let off be 15
+    assert(contains(locate(3, off), "before it"))
+    assert(contains(locate(off + SLOT + 2, off), "after it"))
+    assert(contains(locate(off + 20, off), "header"))
+    assert(contains(locate(off + HEADER + 7, off), "program byte 7"))
+
+test "the module is compared with the release asset plus the slot's program"
+    let program be "task process(ctx)\n    give {\"state\": {}}\n"
+    let asset be fake_module("-- the example app the release ships with\n")
+    let m be embed_bytes(asset, bytes(program), "app.syn")
+    let slot be slot_contents(m)
+    assert(compare_with_release(m, slot, asset)["ok"])
+    -- the same program in a module whose interpreter differs by one byte: out of the slot
+    let tampered be bytes([66]) + slice(m, 1, length(m))
+    let v be compare_with_release(tampered, slot_contents(tampered), asset)
+    assert(not v["ok"])
+    assert(contains(v["line"], "before it"))
+    -- a slot whose padding is not zero is not what embed.syn writes: inside the slot
+    let dirty be slice(m, 0, slot["offset"] + SLOT - 1) + bytes([7]) + slice(m, slot["offset"] + SLOT, length(m))
+    let v2 be compare_with_release(dirty, slot_contents(dirty), asset)
+    assert(not v2["ok"])
+    assert(contains(v2["line"], "inside the app slot"))
+
+test "--source: identical, or the first byte that differs"
+    let program be "task deploy(ctx)\n    give {\"state\": {}}\n"
+    let m be fake_module(program)
+    let slot be slot_contents(m)
+    let same be local_checks(m, slot, bytes(program))
+    assert_eq(length(same), 2)
+    assert(same[1]["ok"])
+    let differs be local_checks(m, slot, bytes("task deploy(ctx)\n    give {\"state\": {\"v\": 2}}\n"))
+    assert(not differs[1]["ok"])
+    assert(contains(differs[1]["line"], "DIFFERS"))
+    assert_eq(length(local_checks(m, slot, nothing)), 1)
+
+test "--audited compares the release asset's sha256, whatever way the sha is pasted"
+    let sha be sha_hex(bytes("the interpreter"))
+    assert(audited_check(sha, sha)["ok"])
+    assert(audited_check(sha, "sha256:" + upper(sha))["ok"])
+    assert(audited_check(sha, " 0x" + sha + "\n")["ok"])
+    assert(not audited_check(sha, sha_hex(bytes("another interpreter")))["ok"])
+    assert_error(() => audited_check(sha, "not-a-sha"))
+    assert_eq(sha_of_listing(sha + "  synsema-vela-guest.wasm\n"), sha)
+    assert_error(() => sha_of_listing("garbage"))
+
+test "the command line: one module, options with values, nothing unknown"
+    let o be parse_args(["app.wasm", "--release", "v0.6.23", "--source", "app.syn", "--audited", "abc", "--cache", "build"])
+    assert_eq(o["module"], "app.wasm")
+    assert_eq(o["release"], "v0.6.23")
+    assert_eq(o["source"], "app.syn")
+    assert_eq(o["audited"], "abc")
+    assert_eq(o["cache"], "build")
+    assert_eq(o["extract"], nothing)
+    assert_eq(parse_args(["--extract", "out.syn", "app.wasm"])["extract"], "out.syn")
+    assert_eq(parse_args(["app.wasm", "--asset", "guest.wasm"])["asset"], "guest.wasm")
+    assert_error(() => parse_args(["app.wasm", "--asset", "guest.wasm", "--release", "v0.6.23"]))
+    assert_error(() => parse_args(["app.wasm", "--release"]))
+    assert_error(() => parse_args(["app.wasm", "--bogus", "x"]))
+    assert_error(() => parse_args(["a.wasm", "b.wasm"]))
+    assert_error(() => parse_args([]))

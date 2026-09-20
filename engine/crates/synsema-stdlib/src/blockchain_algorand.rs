@@ -34,7 +34,7 @@ use crate::blockchain::{arg, arg_bytes_len, ed25519_seed, err, key_material};
 const MAX_DEPTH: usize = 64;
 
 // =========================================================
-// Direcciones
+// direcciones
 // =========================================================
 
 /// Dirección Algorand desde la pubkey: base32(pk ‖ sha512_256(pk)[28..32]).
@@ -85,7 +85,7 @@ pub(crate) fn address_to_pubkey(s: &str, what: &str, fname: &str) -> Result<[u8;
 /// zero-values (se podan al construir).
 ///
 /// `pub(crate)`: el encoder de bajo nivel (`mp_write`) es el ÚNICO msgpack
-/// canónico del árbol y lo reusa `captoken.rs` (T4) para firmar sus bloques. Ojo
+/// canónico del árbol y lo reusa `captoken.rs`  para firmar sus bloques. Ojo
 /// —y por eso se comparte el WRITER y no `to_mp`—: la poda de zero-values de
 /// arriba es semántica de transacción Algorand y sería un agujero al firmar
 /// permisos (un `{spend: 0}` podado firmaría igual que un token sin ese campo).
@@ -349,7 +349,7 @@ fn txn_to_mp(v: &SynValue, fname: &str) -> Result<Mp, Control> {
 }
 
 // =========================================================
-// Builtins
+// builtins
 // =========================================================
 
 /// `algorand_tx_encode(txn)` → bytes `"TX" ‖ msgpack_canónico(txn)`, LISTOS para
@@ -409,7 +409,7 @@ fn algo_address(args: &[SynValue]) -> Result<SynValue, Control> {
 }
 
 // =========================================================
-// Registro (todos PUROS — G13)
+// registro (todos PUROS — G13)
 // =========================================================
 
 pub(crate) fn register(interp: &Interpreter) {

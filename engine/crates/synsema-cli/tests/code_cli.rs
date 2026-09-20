@@ -1,4 +1,4 @@
-//! E2E de `synsema code` sobre el binario real (spec `specs/code-intelligence.md`): CLI con
+//! E2E de `synsema code` sobre el binario real: CLI con
 //! `--json`, exit codes, y el servidor MCP por stdio (initialize → tools/list → tools/call →
 //! método desconocido → EOF), verificando que stdout sea SÓLO JSON, una línea por mensaje.
 

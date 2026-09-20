@@ -42,7 +42,7 @@ use crate::ws::ServerSocketLink;
 use crate::discovery::{self, ApiInfo};
 
 // =========================================================
-// Constantes
+// constantes
 // =========================================================
 
 /// Tope por defecto del body bufferizado en memoria (no es tope duro: `max_body`
@@ -218,7 +218,7 @@ pub use crate::routing::*;
 use crate::json::obj;
 
 // =========================================================
-// Rate limiter (token bucket, paridad con RateLimiter del oráculo)
+// rate limiter (token bucket, paridad con RateLimiter del oráculo)
 // =========================================================
 
 pub struct RateLimiter {
@@ -280,7 +280,7 @@ impl RateLimiter {
 }
 
 // =========================================================
-// ServeRuntime
+// serveRuntime
 // =========================================================
 
 /// Spec de un mount estático tal como lo declara el programa: prefijo + dir +
@@ -596,6 +596,9 @@ pub struct ServeRuntime {
     /// programa: `GET <path>` responde `{ok, uptime_s, in_flight, engine}` sin auth ni rate
     /// limit y NO aparece en discovery. Sin la variable no existe: el servidor no inventa rutas.
     pub health_path: Option<String>,
+    /// El JSON de `GET /.well-known/attestation` cuando el serve arrancó con
+    /// `--attested`; `None` = la ruta no existe (el servidor no inventa identidades).
+    pub attestation_json: Option<String>,
     started: std::time::Instant,
     rate_limiter: RateLimiter,
     active_streams: Mutex<i64>,
@@ -693,6 +696,7 @@ impl ServeRuntime {
             describe_version: None,
             docs_enabled: true,
             health_path,
+            attestation_json: None,
             started: std::time::Instant::now(),
             rate_limiter: RateLimiter::new(),
             active_streams: Mutex::new(0),
@@ -1374,6 +1378,19 @@ impl ServeRuntime {
             );
             return resp(200, ResponseBody::Raw(RawResponse::text(body, "application/json; charset=utf-8", 200)));
         }
+        // La identidad atestada del servidor, ANTES del router y sin auth ni
+        // rate limit (el cliente la lee para decidir si confía; nada del programa corre acá).
+        // Auditoría externa: se compara la ruta NORMALIZADA (el router ignora la barra final y las
+        // barras repetidas; `/.well-known/attestation/` es la misma URL reservada).
+        if method == "GET" && normalize_route_path(path) == ATTESTATION_PATH {
+            if let Some(json) = &self.attestation_json {
+                return Dispatched::Response {
+                    status: 200,
+                    body: ResponseBody::Raw(RawResponse::text(json.clone(), "application/json; charset=utf-8", 200)),
+                    headers: vec![("Cache-Control".to_string(), "no-store".to_string())],
+                };
+            }
+        }
 
         // vhost (Lote 1): elegir la tabla del host según el header `Host`. Sin vhosts
         // declarados, `host` es siempre el default → comportamiento idéntico al previo.
@@ -1622,7 +1639,7 @@ impl ServeRuntime {
 
         // Reverse proxy: auth/rate-limit/vhost ya se resolvieron acá (sync). El forward
         // en sí lo hace el lado async (`proxy_request`) en streaming: SSE, upgrade
-        // WebSocket (túnel) y bodies grandes pasan a medida que llegan.
+        // webSocket (túnel) y bodies grandes pasan a medida que llegan.
         if let Some(target) = &host.routes[idx].proxy_target {
             return Dispatched::Proxy { target: target.clone(), headers: rate_headers };
         }
@@ -1824,7 +1841,7 @@ fn static_content_type(path: &Path) -> String {
 pub use crate::respond::register_serve_builtins;
 
 // =========================================================
-// Servidor HTTP (thread-per-connection, std::net)
+// servidor HTTP (thread-per-connection, std::net)
 // =========================================================
 
 /// A2 batch 2 — Mapa compartido token→key-authorization que el listener HTTP sirve
@@ -1835,7 +1852,7 @@ pub type ChallengeStore = std::sync::Arc<std::sync::Mutex<HashMap<String, String
 pub type SharedServerConfig = std::sync::Arc<std::sync::RwLock<Arc<rustls::ServerConfig>>>;
 
 // =========================================================
-// Lote 2 — Servidor async (tokio/hyper/rustls)
+// lote 2 — Servidor async (tokio/hyper/rustls)
 // =========================================================
 //
 // Cáscara async: tokio acepta, hyper hace el framing HTTP/1.1+HTTP/2 (ALPN), y el
@@ -1972,8 +1989,35 @@ pub const SERVE_ENV_VARS: &[&str] = &[
 /// Servidores (`run_async`) vivos en el proceso: con varios `serve on` en un programa,
 /// el shutdown ordenado sale del proceso cuando el ÚLTIMO terminó de drenar — no
 /// cuando el primero (que cortaría el drain de los demás).
-/// v0.6.20 — las URLs que el runtime publica solo: una ruta con parámetros no las captura.
-pub const RESERVED_PATHS: [&str; 5] = ["/openapi.json", "/docs", "/llms.txt", "/sitemap.xml", "/robots.txt"];
+/// V0.6.20 — las URLs que el runtime publica solo: una ruta con parámetros no las captura.
+pub const RESERVED_PATHS: [&str; 6] =
+    ["/openapi.json", "/docs", "/llms.txt", "/sitemap.xml", "/robots.txt", ATTESTATION_PATH];
+
+/// La URL donde un `serve --attested` publica su identidad
+/// (`{format, document, public_key, public_key_hex, program_sha, engine, driver}`). Sólo
+/// existe bajo `--attested`; sin auth ni rate limit (es lo que el cliente lee ANTES de confiar).
+pub const ATTESTATION_PATH: &str = "/.well-known/attestation";
+
+/// Forma canónica de una ruta tal como la compara el router (`path_match` ignora segmentos
+/// vacíos): sin barra final ni barras repetidas; la raíz queda `/`.
+pub fn normalize_route_path(path: &str) -> String {
+    let segs = segments(path);
+    if segs.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", segs.join("/"))
+    }
+}
+
+/// Auditoría externa: la primera ruta declarada por el programa que, normalizada, cae en una URL
+/// reservada del runtime (`METHOD /path`), o `None`. Bajo `serve --attested` es error de carga:
+/// Una ruta del programa jamás puede sombrear `/.well-known/attestation` (ni con barra final).
+pub fn reserved_route_collision(routes: &[RouteSpec]) -> Option<String> {
+    routes
+        .iter()
+        .find(|r| RESERVED_PATHS.contains(&normalize_route_path(&r.path).as_str()))
+        .map(|r| format!("{} {}", r.method, r.path))
+}
 
 /// Versión del motor para la respuesta de salud: la del release (`SYNSEMA_VERSION` al
 /// compilar) o la del crate.
@@ -2031,7 +2075,7 @@ pub fn current_openapi_json() -> Result<String, String> {
 static LIVE_SERVERS: AtomicUsize = AtomicUsize::new(0);
 
 // =========================================================
-// Shutdown pedido por el PROGRAMA — `shutdown(reason?)` (tanda escritorio)
+// shutdown pedido por el PROGRAMA — `shutdown(reason?)` (tanda escritorio)
 // =========================================================
 //
 // El drain ordenado ya existía (SIGINT/SIGTERM); esto sólo agrega el otro disparador: el
@@ -3529,6 +3573,23 @@ pub fn build_tls_config(cert_path: &str, key_path: &str) -> Result<Arc<rustls::S
     // Lote 2 — HTTP/2: anunciar h2 (y http/1.1 fallback) por ALPN. El auto::Builder
     // sirve HTTP/2 cuando el cliente negocia h2; si no, HTTP/1.1.
     let mut config = config;
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
+/// `ServerConfig` desde un certificado y una clave YA EN MEMORIA (DER): el
+/// cert autofirmado de `serve --attested` se emite con la clave P-256 que la attestation ata y
+/// jamás toca el disco. Mismos defaults que `build_tls_config` (TLS 1.2+, ALPN h2/http1.1).
+pub fn build_tls_config_from_der(cert_der: Vec<u8>, key_pkcs8_der: Vec<u8>) -> Result<Arc<rustls::ServerConfig>, String> {
+    let certs = vec![rustls::pki_types::CertificateDer::from(cert_der)];
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(key_pkcs8_der));
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("TLS config error: {}", e))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| format!("TLS cert/key mismatch: {}", e))?;
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }

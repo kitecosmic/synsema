@@ -9,7 +9,7 @@
 //! engine completo (serve/send/expect con request) producen el mismo error que
 //! el oráculo. Builtins y intentional_ops están registrados como en Python.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -23,6 +23,7 @@ use num_complex::Complex64;
 use regex::Regex;
 
 use crate::ast::{Node, NodeKind, Param, Program};
+use crate::labels::{self, label_display_raw, DeclassifyEntry, Label};
 use crate::number::{Number, MIX_DECIMAL_FLOAT};
 use crate::parser::{parse_source, CompileError};
 use crate::templates::resolve_module_path;
@@ -30,7 +31,7 @@ use crate::tokens::SourceLocation;
 use crate::types::*;
 
 // =========================================================
-// Errores y control de flujo
+// errores y control de flujo
 // =========================================================
 
 /// Error en tiempo de ejecución, con ubicación opcional.
@@ -47,23 +48,74 @@ pub struct RuntimeError {
     /// de `synsema test` (distingue una aserción de otro error de runtime). NO cambia el
     /// `Display` ni el manejo del error; una aserción falla igual que cualquier error.
     pub is_assertion: bool,
+    /// T5 (regla 1.a): el error se ORIGINÓ con una etiqueta de PC no vacía. Un salto de
+    /// control desde un contexto privado no se puede observar, así que este error **no es
+    /// atrapable** (`try/recover` y `assert_error` lo re-propagan) y su texto se redacta al
+    /// salir hacia el host. Lo pone el intérprete, no los constructores: ver `exec`.
+    pub from_private_pc: bool,
+    /// Principales con los que este error se REDACTA al salir hacia el host (`"a,b"`;
+    /// Vacío = no se redacta). Lo pone el intérprete en el momento exacto del error: el PC de
+    /// ese instante UNIDO a lo privado que se desenvolvió evaluando ESE nodo. No es el `seen`
+    /// Monótono de toda la corrida (que volvía `private(app)` a cualquier error posterior,
+    /// Aunque no tuviera relación). Texto (no `Label`) para no meter `Rc` en un tipo que
+    /// cruza hilos en el runtime.
+    pub redact_label: String,
+    /// T5 (regla 3.c): el error lo produjo el PROPIO sistema de etiquetas (un
+    /// `label_violation`, un mal uso de `private`/`declassify`). Se distingue por este flag
+    /// Y NUNCA por el texto del mensaje: un `raise "label_violation: " + text(x)` del
+    /// programa no puede hacerse pasar por un diagnóstico para esquivar la redacción.
+    /// Tampoco es atrapable: el veredicto del enforcement no se recupera.
+    pub from_labels: bool,
 }
 
 impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), location: None, is_validation: false, field: None, is_assertion: false }
+        Self { message: message.into(), location: None, is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false }
     }
     pub fn at(message: impl Into<String>, location: SourceLocation) -> Self {
-        Self { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false }
+        Self { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false }
+    }
+    /// El texto de este error **hacia un cliente REMOTO** (el cuerpo de una respuesta HTTP, el
+    /// evento final de un stream): igual que `Display`, pero la ubicación viaja con el NOMBRE del
+    /// archivo y no con su ruta absoluta.
+    ///
+    /// Auditoría ronda 4: `err_labels` ya lo hacía para los diagnósticos de etiquetas, pero ése
+    /// era un embudo, no el camino — todo error que no fuera de etiquetas seguía contándole al
+    /// cliente dónde vive el programa en la máquina que lo corre (bajo `serve --attested`, dentro
+    /// del enclave). La ruta completa sigue saliendo por el CLI y por el log local, que son de
+    /// quien opera la máquina.
+    ///
+    /// Auditoría ronda 7: si el corte lo decidió el sistema de etiquetas, el mensaje sale **sin
+    /// ubicación**. El texto ya está redactado, pero *dónde* murió no: si el secreto elige cuál
+    /// de N sitios falla, la línea vale log₂(N) bits, y bajo servidor el atacante hace una
+    /// petición por consulta. Del lado del CLI local la ubicación se conserva — ahí el host es
+    /// quien escribió el `private(…)`, o sea el dueño del dato.
+    pub fn to_string_for_client(&self) -> String {
+        match &self.location {
+            _ if self.is_fatal_for_labels() || self.from_labels => self.message.clone(),
+            Some(loc) => format!("{}:{}:{}: {}", basename_of(&loc.file), loc.line, loc.column, self.message),
+            None => self.message.clone(),
+        }
     }
     /// Error de validación de cliente (input que no cumple `expect`): se mapea a HTTP 400
     /// con el nombre del campo ofensor, en vez de a un 500 genérico.
     pub fn validation(message: impl Into<String>, field: Option<String>) -> Self {
-        Self { message: message.into(), location: None, is_validation: true, field, is_assertion: false }
+        Self { message: message.into(), location: None, is_validation: true, field, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false }
     }
     /// Falla de aserción (`assert*`): marca `is_assertion` para el reporte de tests.
     pub fn assertion(message: impl Into<String>) -> Self {
-        Self { message: message.into(), location: None, is_validation: false, field: None, is_assertion: true }
+        Self { message: message.into(), location: None, is_validation: false, field: None, is_assertion: true, from_private_pc: false, redact_label: String::new(), from_labels: false }
+    }
+    /// Diagnóstico del sistema de etiquetas (`from_labels`), con ubicación.
+    pub fn labels(message: impl Into<String>, location: SourceLocation) -> Self {
+        Self { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: true }
+    }
+    /// ¿Este error NO se puede atrapar con `try/recover` ? Un salto de control desde PC
+    /// privado sería un bit observable por iteración, y el veredicto del enforcement no se
+    /// recupera: los dos casos se propagan hasta el host.
+    #[inline]
+    pub fn is_fatal_for_labels(&self) -> bool {
+        self.from_private_pc || self.from_labels
     }
 }
 
@@ -74,6 +126,20 @@ impl fmt::Display for RuntimeError {
             None => write!(f, "{}", self.message),
         }
     }
+}
+
+/// T5 (ronda 5) — el estado de tinta de continuación de una unidad de ejecución, guardado en un
+/// borde (llamada, agente, request, bloque `test`) para restaurarlo al volver. Las tres etiquetas
+/// tienen alcances distintos a propósito: ver `taint_branch`.
+struct TaintFrame {
+    /// Tinta del cuerpo de la task (nace de un `give`/`raise` bajo rama privada).
+    control: Label,
+    /// Tinta del bucle en curso (nace de un `stop`); muere al salir del bucle.
+    loops: Label,
+    /// La parte que escapa del cuerpo y corta el bucle del llamador.
+    escaping: Label,
+    /// Bucles abiertos en este cuerpo.
+    depth: usize,
 }
 
 /// Flujo no-lineal: error, `give` (return) o `stop` (break). Mapea las
@@ -98,6 +164,27 @@ fn err_at(msg: impl Into<String>, loc: &SourceLocation) -> Control {
 fn err_assertion(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::assertion(msg))
 }
+/// Diagnóstico del PROPIO sistema de etiquetas (`label_violation`, mal uso de
+/// `private`/`declassify`): se marca con un FLAG al construirlo, nunca por el texto (regla
+/// 3.c). No se redacta al salir al host (sólo lleva metadatos públicos: nombres del
+/// programa, caminos con claves literales y principales, que son públicos por construcción)
+/// y tampoco es atrapable.
+fn err_labels(msg: impl Into<String>, loc: &SourceLocation) -> Control {
+    // M2 (ronda 3): un diagnóstico de etiquetas NUNCA se redacta, y bajo `serve --attested`
+    // (que no implica `--secure`) su texto llega al cliente HTTP remoto. La ubicación viaja con
+    // el NOMBRE del archivo, no con la ruta absoluta de la máquina del enclave.
+    let mut short = loc.clone();
+    short.file = basename_of(&short.file).to_string();
+    Control::Error(RuntimeError::labels(msg, short))
+}
+
+/// Nombre de archivo de una ruta (sin directorios), para los diagnósticos que salen al cliente.
+fn basename_of(path: &str) -> &str {
+    match path.rfind(['/', '\\']) {
+        Some(i) => &path[i + 1..],
+        None => path,
+    }
+}
 /// Mensaje legible de un `Control` (para el reporte de tests): el error tal cual, o el
 /// mensaje estándar de `give`/`stop` fuera de task/loop.
 fn control_message(c: &Control) -> String {
@@ -110,11 +197,39 @@ fn control_message(c: &Control) -> String {
 }
 
 // =========================================================
-// Builtins
+// builtins
 // =========================================================
 
 pub type BuiltinFn =
     Rc<dyn Fn(&mut Interpreter, &[SynValue], &SourceLocation) -> Result<SynValue, Control>>;
+
+/// T5 (ronda 8) — envuelve un builtin que PARSEA entrada externa con su variante **total**: con
+/// un argumento de más, el último es el valor de reemplazo y el builtin no lanza.
+///
+/// Por qué hace falta y por qué se hace acá y no builtin por builtin: bajo etiquetas, un error
+/// causado por datos privados **no se atrapa** (poder recuperarse de un fallo es el bit), así que
+/// un programa que valida entrada no confiable —lo que un enclave hace con todo lo que recibe— se
+/// queda sin ninguna frase que escribir. El caso canónico es el descifrado autenticado: un tag
+/// manipulado tiene que ser "rechazo esta petición", no "el proceso muere".
+///
+/// **No se traga los errores del sistema de etiquetas.** Un `label_violation`, o un error nacido
+/// de datos privados, se re-propaga: si el reemplazo los absorbiera sería un `try/recover`
+/// encubierto y volvería a abrir el canal que la ronda 6 cerró.
+///
+/// Detalle del lenguaje, evaluación estricta: el valor de reemplazo **se evalúa siempre**, así
+/// que un efecto adentro (`json_decode(x, log_algo())`) dispara también en el camino feliz.
+pub fn with_fallback(base: usize, f: BuiltinFn) -> BuiltinFn {
+    Rc::new(move |i, args, loc| {
+        if args.len() != base + 1 {
+            return f(i, args, loc);
+        }
+        match f(i, &args[..base], loc) {
+            Ok(v) => Ok(v),
+            Err(Control::Error(e)) if !e.is_fatal_for_labels() => Ok(args[base].clone()),
+            Err(other) => Err(other),
+        }
+    })
+}
 
 /// Un task built-in (implementado en Rust). `param_count` es informativo (Python
 /// no lo fuerza en `_call_value`).
@@ -129,7 +244,7 @@ pub struct BuiltinTask {
 }
 
 // =========================================================
-// Entorno
+// entorno
 // =========================================================
 
 pub struct Environment {
@@ -196,7 +311,7 @@ fn env_update(env: &Rc<RefCell<Environment>>, name: &str, value: SynValue) -> Re
 }
 
 // =========================================================
-// Intérprete
+// intérprete
 // =========================================================
 
 /// Límite de profundidad de recursión de llamadas. Evita que una recursión
@@ -211,6 +326,25 @@ const MAX_RECURSION: usize = 3000;
 #[cfg(target_arch = "wasm32")]
 const MAX_RECURSION: usize = 600;
 
+/// Builtins del core CONSCIENTES de etiquetas (reciben los argumentos envueltos):
+/// Los cuatro de la feature y `print` (redacta por Display, y además RECHAZA la llamada bajo
+/// PC privado: la cuenta de líneas es un canal que la redacción del valor no tapa — ronda 4).
+/// `type_of` NO está: pasa por la regla genérica y por eso reporta el tipo del valor interno,
+/// envuelto.
+const CORE_LABEL_AWARE: &[&str] = &["private", "declassify", "label_of", "is_private", "print"];
+
+/// Nombres PROTEGIDOS (B8): definir una task, variable, parámetro o alias con uno de
+/// estos nombres es error de carga SIEMPRE (con etiquetas apagadas también): sombrear el
+/// builtin anularía el etiquetado de las fuentes y engañaría al listado del auditor.
+pub const PROTECTED_BUILTIN_NAMES: &[&str] = CORE_LABEL_AWARE;
+
+/// SUMIDEROS del core (B7): builtins del core con efecto fuera del intérprete. Los
+/// `llm_*` mandan el prompt al proveedor. Los demás sumideros (fs/http/sql/ws/memory/env/
+/// exec/blackboard/webpush/run/proc) viven en el stdlib/agents y los registra el host con
+/// `register_label_sink`. Las SENTENCIAS con efecto (`share`/`signal`/`send`/`spawn`/
+/// `approve`/`confirm`/`ask`/`reason`/`decide`/`analyze`/`generate`) se comprueban en `exec`.
+pub const CORE_SINK_BUILTINS: &[&str] = &["llm_step", "llm_stream"];
+
 /// Hook que el host (motor) cablea para que `require <tipo>(<scope>)` conceda en
 /// el `CapabilitySet` real (que vive fuera de core, para evitar el ciclo de deps).
 /// Espeja el callback `_grant_capability` del intérprete Python.
@@ -221,7 +355,7 @@ pub type GrantHook = Rc<dyn Fn(&str, Option<&str>)>;
 pub type SandboxHook = Rc<dyn Fn(bool)>;
 
 // --- FASE 1 tool-calling: el callback de paso del LLM (tipos PLANOS) ---
-// Core NO depende de `synsema-llm` (la dep va al revés vía runtime). Igual que
+// core NO depende de `synsema-llm` (la dep va al revés vía runtime). Igual que
 // `llm_callback`, el motor cablea este callback con el provider real; core sólo
 // conoce estos tipos planos (sin `ToolSpec`/`LlmStep` de llm).
 
@@ -425,7 +559,7 @@ pub struct Interpreter {
     /// propio) lo fija una vez con `set_agent_context` al construir el intérprete
     /// del agente. `current_agent()` es lo que leen `remember`/`recall`.
     agent_context: Vec<String>,
-    /// Identidad del SUJETO de la unidad de trabajo en curso (T6): la identidad de
+    /// Identidad del SUJETO de la unidad de trabajo en curso : la identidad de
     /// agente que autenticó esta request del serve. NO es `agent_context` (ese es el
     /// agente del swarm que corre el código); acá va *en nombre de quién* corre. La
     /// consume el ledger de `spend` para contabilizar y limitar por identidad, y el
@@ -468,7 +602,7 @@ pub struct Interpreter {
     /// Conexión al swarm real (lo cablea el motor para agentes en hilos).
     swarm_hooks: Option<SwarmHooks>,
     /// Callback humano (approve/confirm/ask). (action, message, timeout_secs) →
-    /// SynValue (bool para approve/confirm, texto para ask). `timeout_secs` es el
+    /// synValue (bool para approve/confirm, texto para ask). `timeout_secs` es el
     /// `within` del gate (None = sin `within`; decide el host). Sin él: auto-aprueba.
     human_callback: Option<HumanCallback>,
     /// Callback LLM (reason/decide/analyze/generate): (operación, prompt) → contenido.
@@ -543,6 +677,95 @@ pub struct Interpreter {
     /// por `opts.env`). Cierra la exfiltración `run("printenv")` con `exec` pero sin
     /// `env`/`secret`. Vacío en usos standalone/wasm (sin proceso) → sin efecto.
     sensitive_env: HashSet<String>,
+    /// Etiquetas de flujo por principal (`labels.rs`). Apagadas por default: con
+    /// `labels == false` ningún camino nuevo corre más allá de un `if self.labels` (mismos
+    /// resultados, mismos `steps`, misma salida que sin la feature).
+    labels: bool,
+    /// Stack de etiquetas de PC (flujos implícitos). Cada entrada es la etiqueta ACUMULADA
+    /// (unión con la de abajo), así `pc.last()` es la etiqueta efectiva del contexto.
+    pc: Vec<Label>,
+    /// Lo privado que se desenvolvió o gateó control evaluando el NODO en curso (se salva y
+    /// Se funde con el del padre en cada `exec`). Etiqueta el mensaje del error que atrapa un
+    /// `recover` y decide con qué principales se redacta un error: por eso es por nodo y no
+    /// acumulado de toda la corrida — si no, cualquier error posterior a haber tocado un
+    /// privado salía `private(app)` aunque no tuviera relación (indepurable).
+    seen: Label,
+    /// ¿La corrida tocó ALGÚN privado? (monótono; lo lee el host con `private_seen`).
+    seen_any: bool,
+    /// UNIÓN de todo lo privado que la corrida tocó, monótona (a diferencia de `seen`, que es
+    /// por nodo). Es la etiqueta del ESTADO AMBIENTE del intérprete —`steps()` hoy—: un
+    /// contador global no viaja por el resultado de una task, así que el borde de llamada no lo
+    /// alcanza y salía público después de una corrida privada (auditoría ronda 5).
+    touched: Label,
+    /// Registro de `declassify` ejecutados (motivo/from/to/ubicación), para el host.
+    declassify_log: Vec<DeclassifyEntry>,
+    /// Builtins que SABEN de etiquetas: reciben los argumentos tal cual (envueltos) y
+    /// deciden ellos (redactan, marcan, comprueban con `labels::check_flow`). Los del core
+    /// vienen de fábrica; el host agrega los suyos con `register_label_aware`.
+    label_aware: HashSet<String>,
+    /// SUMIDEROS (B7): builtins con efecto fuera del intérprete (I/O, red, DB, LLM…). Con
+    /// etiquetas encendidas se comprueban ANTES de ejecutarse: ningún argumento puede llevar
+    /// etiquetas (profundo, `check_flow` contra público) y el PC tiene que estar vacío.
+    /// Los del core (`CORE_SINK_BUILTINS`) vienen de fábrica; el host registra los suyos con
+    /// `register_label_sink`.
+    label_sinks: HashSet<String>,
+    /// Acumulador de etiquetas de los PATRONES evaluados durante un `match` (B3): cada valor
+    /// De patrón que se compara con el sujeto suma su etiqueta profunda; el cuerpo del arm
+    /// (y los arms siguientes, y el `otherwise`) corren bajo esa unión.
+    pattern_label: Label,
+    /// Etiqueta de CONTINUACIÓN de un `stop` disparado bajo PC
+    /// privado: cuántas vueltas alcanzó a dar el bucle es información privada, y lo que las
+    /// vueltas anteriores escribieron en variables públicas se lee DESPUÉS del bucle (caso
+    /// 1.c). Se une al PC en `pc_label()` y vale hasta el final del bloque/bucle y del resto
+    /// del cuerpo de la task donde saltó: se salva y restaura en el borde de llamada, y se
+    /// limpia al terminar un bloque `test`, un request o la unidad de ejecución (también por
+    /// El camino de error). Un `give` NO tiñe: su punto de llegada es el sitio de la llamada,
+    /// Que es un join point, y lo que transporta la información es el VALOR devuelto, que ya
+    /// sale etiquetado (B2).
+    control_taint: Label,
+    /// T5 (ronda 5) — la tinta de continuación de un `stop`: **muere al salir del bucle** del
+    /// que el `stop` sale (`enter_loop`/`exit_loop`). Adentro del bucle vale igual que
+    /// `control_taint`, así que un contador público sigue violando en la vuelta 0; al salir los
+    /// dos caminos convergen y no puede quedar nada público con la cuenta. Separarla de
+    /// `control_taint` es lo que devolvió la escribibilidad después de un bucle de búsqueda.
+    loop_taint: Label,
+    /// T5 (ronda 5) — la parte de la tinta que ESCAPA del cuerpo de esta task: un `stop` que no
+    /// tiene un bucle propio donde caer corta el bucle **del llamador**, así que `leave_call`
+    /// se la suma a él. Sin esto, un helper de una línea extraía el secreto entero por un
+    /// contador público del llamador (la fuga V1 en el sentido contrario).
+    escaping_taint: Label,
+    /// Bucles abiertos **en el cuerpo de la task en curso** (`enter_call` lo pone en 0: los
+    /// `stop` del callee no caen en un bucle nuestro). Decide adónde va la tinta de un `stop`.
+    loop_depth: usize,
+    /// Etiqueta vacía compartida (evita alocar un `Rc` por consulta de `pc_label()`).
+    no_label: Label,
+    /// T5 (M1, ronda 3) — principales que se pueden imprimir VERBATIM en un diagnóstico: los
+    /// literales que el propio programa escribió en un `private(…)` y los que el host registre
+    /// (`register_label_principal`). Cualquier otro sale como `#<índice>`: el nombre de un
+    /// principal viaja por el único canal que no se redacta, así que no se imprime un texto
+    /// cuyo origen no se conoce.
+    known_principals: RefCell<HashSet<String>>,
+    /// T5 (ronda 7) — los principales DECLARADOS por el programa (literales del AST) más los que
+    /// registró el host. Constante para la corrida: es lo único que se puede imprimir al
+    /// redactar sin que el texto delate qué valor se seleccionó. Ver `refresh_redaction_text`.
+    declared_principals: RefCell<HashSet<String>>,
+    /// El texto ya armado (`"app"`, `"app,bank"`, o vacío), para no re-ordenar en cada mensaje.
+    redaction_text: RefCell<String>,
+    /// T5 (ronda 7): ¿el último resultado que salió hacia el host lo cortó el sistema de
+    /// etiquetas? Lo lee el serve para reponer lo que el request alcanzó a escribir en el
+    /// almacén compartido antes del corte (`finish_state_journal`).
+    label_stop: Cell<bool>,
+    /// T5 (ronda 8): el conjunto con el que se redacta se SELLA después del recorrido estático
+    /// del programa de entrada. `use` es una sentencia ejecutable y puede ir dentro de una rama
+    /// privada, así que dejar que un módulo aporte principales al cargarse volvía a hacer variar
+    /// el texto con el camino tomado (ocho `use` condicionales = un byte).
+    principals_sealed: Cell<bool>,
+    /// T5 (regla 3.a) — máscara de qué argumentos de la llamada EN CURSO eran literales
+    /// escalares en el fuente. La fija el `TaskCall` justo antes de despachar y sólo la leen
+    /// `private`/`declassify` como primera cosa: un principal/motivo escrito como literal es
+    /// texto del programa (aunque bajo PC lleve la etiqueta del contexto), y uno computado a
+    /// partir de datos privados no puede serlo.
+    arg_literals: u32,
 }
 
 impl Default for Interpreter {
@@ -611,9 +834,674 @@ impl Interpreter {
             stdout_verdict: None,
             template_read_hook: None,
             sensitive_env: HashSet::new(),
+            labels: false,
+            pc: Vec::new(),
+            seen: labels::empty(),
+            seen_any: false,
+            touched: labels::empty(),
+            declassify_log: Vec::new(),
+            label_aware: CORE_LABEL_AWARE.iter().map(|s| s.to_string()).collect(),
+            label_sinks: CORE_SINK_BUILTINS.iter().map(|s| s.to_string()).collect(),
+            pattern_label: labels::empty(),
+            control_taint: labels::empty(),
+            loop_taint: labels::empty(),
+            escaping_taint: labels::empty(),
+            loop_depth: 0,
+            no_label: labels::empty(),
+            known_principals: RefCell::new(HashSet::new()),
+            declared_principals: RefCell::new(HashSet::new()),
+            redaction_text: RefCell::new(String::new()),
+            label_stop: Cell::new(false),
+            principals_sealed: Cell::new(false),
+            arg_literals: 0,
         };
         interp.register_builtins();
         interp
+    }
+
+    /// Declara un builtin como SUMIDERO (B7): con etiquetas encendidas, antes de ejecutarlo
+    /// Se exige que ningún argumento lleve etiquetas (profundo) y que el PC esté vacío;
+    /// Si no, `label_violation` con el camino (`name(argument i).campo`). Fail-closed: el
+    /// builtin no llega a correr. El host registra acá todo lo que tenga efecto fuera del
+    /// intérprete (fs/http/sql/ws/memory/env/exec/blackboard/llm/webpush/run/proc).
+    pub fn register_label_sink(&mut self, name: &str) {
+        self.label_sinks.insert(name.to_string());
+    }
+
+    /// T5 (M1): declara un principal como seguro de imprimir en un diagnóstico. Lo llama el
+    /// host que etiqueta fuentes con nombres propios (`labels::mark(v, label_from(&["app"]))`)
+    /// para que sus mensajes digan `app` en vez de `#0`.
+    pub fn register_label_principal(&self, name: &str) {
+        self.known_principals.borrow_mut().insert(name.to_string());
+        // Lo que fija el HOST antes de correr es constante para la corrida, así que entra al
+        // conjunto con el que se redacta (ronda 7).
+        self.declared_principals.borrow_mut().insert(name.to_string());
+        self.refresh_redaction_text();
+    }
+
+/// T5 (ronda 7) — **el texto con el que se redacta no puede depender de la etiqueta del valor.**
+    ///
+    /// Redactar imprimía `private(<los principales de ESE valor>)`, y esa lista varía con qué valor se
+    /// seleccionó, así que el mecanismo que existe para tapar el dato lo publicaba:
+    ///
+    /// ```text
+    /// let xs be [private(10, "p0"), private(20, "p1")]
+    /// print(xs[private(N, "app")])      N=0 → private(app,p0)   N=1 → private(app,p1)
+    /// ```
+    ///
+    /// Con una tabla de 256 entradas sale el byte entero en una línea, con salida exitosa y la
+    /// revisión estática en verde. Y no hace falta un programa adversario: en un despliegue
+    /// multi-inquilino el principal ES el inquilino, así que imprimir un valor redactado le dice al
+    /// operador de quién era el dato.
+    ///
+    /// Lo que se imprime ahora es **el conjunto de principales DECLARADOS en el programa**, que es
+    /// constante por construcción: los literales que el fuente escribió en `private(v, "…")` más los
+    /// que registró el host antes de correr. Para el caso normal —un programa con un solo principal,
+    /// que es el del guest y el de cualquier enclave— el texto no cambia (`private(app)`) y los
+    /// diagnósticos siguen sirviendo igual; lo que se pierde es la precisión en los programas con
+    /// varios principales, que es exactamente donde estaba el canal.
+    ///
+    /// Lo fija `set_declared_principals` al cargar el programa (un recorrido del AST, estático), y lo
+    /// leen tanto los mensajes del intérprete como el `Display` de un valor privado (por el
+    /// thread-local de `labels`, que es como el `Display` llega hasta acá).
+    fn refresh_redaction_text(&self) {
+        let mut names: Vec<String> = self.declared_principals.borrow().iter().cloned().collect();
+        names.sort();
+        names.dedup();
+        let text = if names.is_empty() { String::new() } else { names.join(",") };
+        crate::labels::set_redaction_text(&text);
+        *self.redaction_text.borrow_mut() = text;
+    }
+    
+    /// T5 (ronda 7): ¿el último resultado hacia el host lo cortó el sistema de etiquetas? Lo
+    /// consume el host (lo pone en `false` al leerlo).
+    pub fn take_label_stop(&self) -> bool {
+        self.label_stop.replace(false)
+    }
+
+    /// Los principales declarados, como lista — para un host que arma su propio informe (el ABI
+    /// wasm). Constante para la corrida, a diferencia de la etiqueta de un valor.
+    pub fn declared_principals_list(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.declared_principals.borrow().iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// El principal que se pega en el REMEDIO de un mensaje. Con uno solo declarado —el caso
+    /// normal, y el de cualquier enclave— es exacto y se puede copiar tal cual. Con varios no se
+    /// pega la lista: `private(…, "a,b")` no es sintaxis válida, y un remedio que no compila es
+    /// peor que un hueco. (Tampoco se pega el principal REAL del valor: ése es el canal que la
+    /// ronda 7 cerró.)
+    fn principal_hint(&self) -> String {
+        let d = self.declared_principals.borrow();
+        if d.len() == 1 {
+            d.iter().next().cloned().unwrap_or_else(|| "<principal>".to_string())
+        } else {
+            "<principal>".to_string()
+        }
+    }
+
+    /// El texto de redacción: constante para el programa. Ver `refresh_redaction_text`.
+    fn redaction_names(&self) -> String {
+        self.redaction_text.borrow().clone()
+    }
+    
+    /// Los principales que el PROGRAMA declara, recogidos del AST antes de ejecutar nada: los
+    /// literales de texto que aparecen como segundo argumento de `private(…)` y como tercer
+    /// argumento de `declassify(…)`. Es estático, así que el texto de redacción no puede depender
+    /// de qué camino tomó la corrida.
+    pub fn set_declared_principals(&self, program: &Program) {
+        // Sellado tras el programa de ENTRADA: un módulo cargado más tarde (y un `use` dentro de
+        // una rama privada es exactamente eso) ya no mueve el texto. Sus principales siguen
+        // entrando a `known_principals`, que es para otra cosa.
+        if self.principals_sealed.replace(true) {
+            return;
+        }
+        {
+            let mut d = self.declared_principals.borrow_mut();
+            for name in principal_literals(program) {
+                d.insert(name);
+            }
+        }
+        self.refresh_redaction_text();
+    }
+
+    /// T5 (M1): registra como conocidos los principales de un valor que ENTRA al intérprete ya
+    /// etiquetado — es decir, una fuente marcada por el HOST en Rust (`input.sources` de la op
+    /// `run`, los globales que inyecta un guest, los bindings de una request). Esos nombres los
+    /// fija el host, no el programa, así que son tan confiables como un literal del fuente y se
+    /// imprimen por nombre: si no, el diagnóstico del camino más usado decía `private(#0)` y el
+    /// operador perdía de quién era el dato. Los que el PROGRAMA elige ya están acotados a
+    /// literales (`private(v, "app")`), así que no hay texto de origen desconocido.
+    fn harvest_principals(&self, v: &SynValue) {
+        if !self.labels {
+            return;
+        }
+        let l = labels::label_deep(v);
+        if l.is_empty() {
+            return;
+        }
+        let mut changed = false;
+        {
+            let mut known = self.known_principals.borrow_mut();
+            let mut declared = self.declared_principals.borrow_mut();
+            for p in l.iter() {
+                known.insert(p.to_string());
+                // Lo marca el HOST en Rust, no el programa, así que es constante por cableado y
+                // puede entrar al conjunto con el que se redacta (ronda 7).
+                changed |= declared.insert(p.to_string());
+            }
+        }
+        if changed {
+            self.refresh_redaction_text();
+        }
+    }
+
+    /// T5 (M1): `a,#1` — los principales conocidos verbatim, el resto por índice.
+    /// El texto de principales que sale en un DIAGNÓSTICO.
+    ///
+    /// T5 (ronda 7) — **ignora `_l` a propósito.** Antes imprimía los principales de esa etiqueta
+    /// concreta (con `#índice` para los que el programa no había escrito como literal), y esa
+    /// lista varía con qué valor se seleccionó: `print(xs[idx_privado])` daba `private(app,p0)` o
+    /// `private(app,p1)` según el índice, o sea el mecanismo de redacción publicaba el dato. Se
+    /// imprime el conjunto DECLARADO, constante para el programa. Para el caso normal —un solo
+    /// principal, que es el del guest y el de cualquier enclave— el mensaje no cambia.
+    ///
+    /// El parámetro se conserva para que cada sitio siga diciendo QUÉ etiqueta quiso nombrar, y
+    /// para que volver a un texto dependiente del valor sea un cambio visible, no un descuido.
+    fn safe_label(&self, _l: &Label) -> String {
+        let text = self.redaction_names();
+        if text.is_empty() {
+            "…".to_string()
+        } else {
+            text
+        }
+    }
+
+    /// ¿La corrida desenvolvió algún valor privado o gateó control con uno ? El host lo
+    /// usa para saber que un error/salida de esta corrida tocó datos privados (M1).
+    pub fn private_seen(&self) -> bool {
+        self.seen_any
+    }
+
+    /// Comprobación de sumidero (B7) sobre valores ya evaluados: PC vacío y ningún valor con
+    /// etiquetas a ninguna profundidad. `what` nombra al sumidero en el camino del error.
+    fn sink_check(&self, what: &str, values: &[&SynValue], loc: &SourceLocation) -> Result<(), Control> {
+        if !self.pc_is_empty() {
+            return Err(err_labels(
+                format!(
+                    // Auditoría ronda 6: era el ÚNICO de la familia sin la forma exacta del
+                    // remedio, y es el más frecuente (todo builtin con efecto bajo una rama
+                    // privada). Sus dos hermanos —el de valor y el de stdout— ya la dan.
+                    "label_violation: {} called under private control flow (pc = [{}]); every builtin with an effect is a public sink, so the call itself cannot depend on private data. Move it out of the private branch, or declassify(<the condition>, \"<why it may be published>\") so the branch is public",
+                    what,
+                    self.safe_label(&self.pc_label())
+                ),
+                loc,
+            ));
+        }
+        for (i, v) in values.iter().enumerate() {
+            if let Err(viol) = labels::check_flow(v, &[], &format!("{}(argument {})", what, i)) {
+                return Err(err_labels(
+                    format!(
+                        "label_violation: {} is private to {}, the sink accepts (public); declassify(<that value>, \"<why it may be published>\") the scalar you want to publish and build the container outside the private branch",
+                        viol.path,
+                        self.safe_label(&viol.label)
+                    ),
+                    loc,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// M1: mensaje de un `Control` para el host (reporte de tests), redactado como
+    /// `redact_for_host`.
+    fn host_message(&self, c: &Control) -> String {
+        match c {
+            Control::Error(e) => self.redacted_message(e).unwrap_or_else(|| e.to_string()),
+            other => control_message(other),
+        }
+    }
+
+    /// M1 : ¿con qué texto sale este error HACIA EL HOST? `Some(redactado)` si el
+    /// error se originó bajo PC privado (`from_private_pc`, que el `exec` pone en el momento
+    /// exacto del error — no por el `seen` monótono de toda la corrida, que volvía indepurable
+    /// cualquier error posterior). Un diagnóstico del propio sistema de etiquetas
+    /// (`from_labels`) NO se redacta, y la decisión es por FLAG: un `raise "label_violation:
+    /// …"` del programa ya no puede hacerse pasar por uno (caso 1.j).
+    ///
+    /// Ronda 7: **sin ubicación**. El texto se redactaba y la línea no, así que si el secreto
+    /// elige cuál de N sitios falla, `file:line:col` vale log₂(N) bits. Esto es lo que sale al
+    /// HOST (el reporte del runner de tests); el CLI local, donde el host es el dueño del dato,
+    /// conserva la ubicación por `redact_for_host` + el `Display` de `RuntimeError`.
+    fn redacted_message(&self, e: &RuntimeError) -> Option<String> {
+        if !self.labels {
+            return None;
+        }
+        // Un diagnóstico del propio sistema de etiquetas no se redacta (su texto es el remedio),
+        // pero tampoco lleva ubicación: cuál de los sitios violó también depende del dato.
+        if e.from_labels {
+            return Some(e.message.clone());
+        }
+        if e.redact_label.is_empty() {
+            return None;
+        }
+        Some(format!("private({})", e.redact_label))
+    }
+
+    /// T5 (ronda 6, B2) — la SALIDA acumulada de una corrida que murió por etiquetas no se
+    /// entrega: se reemplaza por una línea fija.
+    ///
+    /// Es el canal de PROGRESO, y hay que nombrarlo por lo que es. El predicado que enciende la
+    /// tinta de rama (`block_exits_early`) sólo ve `give`, `stop` y un `raise` literal; un error
+    /// de runtime dentro de una rama privada —o un `raise` indirecto por un helper— no lo
+    /// enciende, así que las vueltas previas del bucle alcanzan a imprimir en claro y la
+    /// CANTIDAD de líneas deletrea el secreto, que es justo lo que el mensaje de `print`
+    /// advierte. Modelarlo estáticamente pedría tratar toda rama privada como salida temprana
+    /// (cualquier operación puede fallar), y eso teñiría la continuación de cualquier `when`
+    /// privado: rompe las siete apps del guest y no lo hago.
+    ///
+    /// Lo que sí se puede es no entregar el prefijo. Con el error ya fatal (B1), la corrida se
+    /// corta en la vuelta del secreto; vaciando acá el buffer, lo que queda observable es que
+    /// murió — un bit de terminación, que es el límite declarado —, no cuántas vueltas dio.
+    /// **Residuo, dicho sin maquillaje:** los efectos que el prefijo ya hizo sobre OTROS
+    /// sumideros (un `write_file` por vuelta) sí ocurrieron; eso no lo puede deshacer el motor
+    /// y está declarado como límite en la spec.
+    pub fn redact_output_for_host(&mut self, r: &Result<SynValue, Control>) {
+        if !self.labels || self.output.is_empty() {
+            return;
+        }
+        let fatal = matches!(r, Err(Control::Error(e)) if e.is_fatal_for_labels());
+        if fatal {
+            self.output.clear();
+            self.output.push(
+                "private(labels): the run was stopped by the flow checker; its output is withheld because the NUMBER of lines before the stop depends on private data"
+                    .to_string(),
+            );
+        }
+    }
+
+    /// M1: un error que sale HACIA EL HOST (no atrapado por `try/recover`) se redacta si se
+    /// originó bajo PC privado: el texto pasa a `private(<labels>)` (como `pc_redact`) y la
+    /// ubicación se conserva. Con etiquetas apagadas es la identidad.
+    fn redact_for_host(&mut self, r: Result<SynValue, Control>) -> Result<SynValue, Control> {
+        if !self.labels {
+            return r;
+        }
+        // T5 (ronda 6, B2): la salida acumulada tampoco sale si el chequeo de flujo cortó la
+        // corrida — acá, en el mismo embudo que el mensaje, para que no dependa de que cada
+        // host se acuerde. Idempotente: los hosts lo vuelven a llamar como segunda red.
+        self.redact_output_for_host(&r);
+        // T5 (ronda 7): y se deja anotado, para que el host pueda deshacer lo que el request
+        // escribió en el almacén compartido antes del corte.
+        if matches!(&r, Err(Control::Error(e)) if e.is_fatal_for_labels()) {
+            self.label_stop.set(true);
+        }
+        match r {
+            Err(Control::Error(mut e)) => {
+                if !e.redact_label.is_empty() && !e.from_labels {
+                    e.message = format!("private({})", e.redact_label);
+                }
+                Err(Control::Error(e))
+            }
+            other => other,
+        }
+    }
+
+    /// No-sensitive-upgrade ESTRICTO (B1/M4): asignar bajo PC privado a algo cuya etiqueta
+    /// efectiva (`have`) no cubre el PC es `label_violation`. Una variable/contenedor ya
+    /// privados que cubren el PC siguen funcionando (el ledger `set state["balances"][to]`).
+    fn nsu_check(&self, have: &Label, what: &str, loc: &SourceLocation) -> Result<(), Control> {
+        /// `what` llega entrecomillado para los identificadores (`'counter'`); el remedio se
+        /// escribe sin comillas.
+        const QUOTE: char = 0x27 as char;
+        let pc = self.pc_label();
+        if !pc.is_empty() && !labels::subset(&pc, have) {
+            return Err(err_labels(
+                format!(
+                    // Auditoría ronda 6: el remedio lleva el principal REAL y la forma tal cual
+                    // se escribe (con `let`), no un `<principal>` que hay que ir a buscar.
+                    "label_violation: cannot assign to {} ({}) under private control flow (pc = [{}]); declare it private first (let {} be private(<its initial value>, \"{}\")) or declassify(<the value>, \"<why it may be published>\") at this site",
+                    what,
+                    if have.is_empty() { "public".to_string() } else { format!("private to {}", self.safe_label(have)) },
+                    self.safe_label(&pc),
+                    what.trim_matches(QUOTE),
+                    self.principal_hint()
+                ),
+                loc,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Enciende/apaga las etiquetas de flujo (`private`/`declassify`). Apagadas
+    /// (default) la variante `Private` no existe en runtime y todo se comporta idéntico a
+    /// sin la feature. Lo fijan el host (`serve --attested`, el guest) o `--labels`.
+    pub fn set_labels(&mut self, on: bool) {
+        self.labels = on;
+        if !on {
+            self.pc.clear();
+            self.control_taint = labels::empty();
+            self.loop_taint = labels::empty();
+            self.escaping_taint = labels::empty();
+            self.touched = labels::empty();
+        }
+    }
+
+    /// ¿Están encendidas las etiquetas de flujo?
+    pub fn labels_enabled(&self) -> bool {
+        self.labels
+    }
+
+    /// Etiqueta de PC efectiva del contexto en curso: la del bloque en ejecución UNIDA a las dos
+    /// de continuación — la de la TASK (`control_taint`: lo que sigue a un `give`/`raise`
+    /// disparado desde un contexto privado) y la del BUCLE (`loop_taint`: lo que sigue a un
+    /// `stop`). Vacía fuera de todo contexto privado o con las etiquetas apagadas. Para que un
+    /// sumidero del host compruebe el flujo implícito además del explícito
+    /// (`labels::check_flow` sobre el valor).
+    pub fn pc_label(&self) -> Label {
+        let top = self.pc.last().unwrap_or(&self.no_label);
+        let cont = if self.control_taint.is_empty() {
+            self.loop_taint.clone()
+        } else if self.loop_taint.is_empty() {
+            self.control_taint.clone()
+        } else {
+            labels::union(&self.control_taint, &self.loop_taint)
+        };
+        if cont.is_empty() {
+            return top.clone();
+        }
+        labels::union(top, &cont)
+    }
+
+    /// ¿El PC efectivo está vacío? (sin alocar).
+    #[inline]
+    fn pc_is_empty(&self) -> bool {
+        self.control_taint.is_empty()
+            && self.loop_taint.is_empty()
+            && self.pc.last().map_or(true, |l| l.is_empty())
+    }
+
+    /// T5 (ronda 3, B1) — **la tinta va en la RAMA, no en el salto**. Al evaluar un
+    /// `when`/`match`/bucle con condición privada cuyo cuerpo puede SALIR antes de tiempo
+    /// (`give`/`stop`/`raise`, estático: `block_exits_early`), la continuación queda teñida
+    /// ahí mismo, **se tome o no la rama**.
+    ///
+    /// Teñir en el salto llegaba tarde: para cuando el `give` dispara en la vuelta 181, las
+    /// 181 vueltas anteriores ya escribieron el contador público con PC vacío y el secreto ya
+    /// está en la variable. Teñir en la rama hace que `set counter to counter + 1` viole en la
+    /// vuelta 0 y la corrida falle cerrada.
+    ///
+    /// T5 (ronda 5) — **hasta dónde llega depende de adónde salta**, y los tres casos son
+    /// distintos:
+    ///
+    /// · `give`/`raise` (`escapes_task`): el salto sale de la task. Llegar a la línea siguiente
+    ///   ya significa que la rama no disparó, así que tiñe el resto del cuerpo. Al volver, la
+    ///   información viaja en el VALOR, que sale etiquetado: no se propaga al llamador.
+    ///
+    /// · sólo `stop`, con un bucle de esta task donde caer: la tinta muere **al salir de ese
+    ///   bucle**. Adentro sigue valiendo, que es lo que hace violar en la vuelta 0 a cualquier
+    ///   contador público; al salir los dos caminos convergen y no puede quedar nada público
+    ///   que lleve la cuenta (si lo hubiera, habría violado adentro). Seguir tiñendo el resto
+    ///   de la task sólo sacaba escribibilidad: una línea de log pública y constante después de
+    ///   un bucle de búsqueda no lleva ni un bit, y no compilaba.
+    ///
+    /// · sólo `stop` y NINGÚN bucle en esta task: el salto sale de la task y corta el bucle
+    ///   **del llamador**. Tiñe lo que queda de este cuerpo y además viaja al llamador
+    ///   (`escaping_taint`, ver `leave_call`) — si no, un helper `task h(s, i) / when s == i /
+    ///   stop` llamado desde el bucle del llamador le extraía el secreto entero a un contador
+    ///   público suyo, que es la misma clase de fuga que V1 pero en el sentido contrario.
+    fn taint_branch(&mut self, l: &Label, escapes_task: bool) {
+        if !self.labels || l.is_empty() {
+            return;
+        }
+        if escapes_task {
+            self.control_taint = labels::union(&self.control_taint, l);
+        } else if self.loop_depth > 0 {
+            self.loop_taint = labels::union(&self.loop_taint, l);
+        } else {
+            self.control_taint = labels::union(&self.control_taint, l);
+            self.escaping_taint = labels::union(&self.escaping_taint, l);
+        }
+        self.note_seen(l);
+    }
+
+    /// T5: un `give` disparado bajo PC privado tiñe lo que sigue DENTRO de la task — el resto
+    /// del cuerpo del bucle, el bucle mismo y el resto del bloque donde vive, hasta el borde de
+    /// la task (`leave_call` restaura el valor del llamador, que es lo que evita que un retorno
+    /// normal deje PC residual sobre código público del llamador).
+    fn taint_after_give(&mut self) {
+        if !self.labels {
+            return;
+        }
+        let pc = self.pc_label();
+        if !pc.is_empty() {
+            self.control_taint = labels::union(&self.control_taint, &pc);
+            self.note_seen(&pc);
+        }
+    }
+
+    /// T5: un `stop` disparado bajo PC privado tiñe lo que sigue hasta salir del bucle del que
+    /// sale — el número de vueltas que alcanzó a dar es información privada que se lee dentro
+    /// del bucle (caso 1.c). Sin bucle propio, el salto corta el del llamador: ver
+    /// `taint_branch`, tercer caso.
+    fn taint_after_stop(&mut self) {
+        if !self.labels {
+            return;
+        }
+        let pc = self.pc_label();
+        if pc.is_empty() {
+            return;
+        }
+        if self.loop_depth > 0 {
+            self.loop_taint = labels::union(&self.loop_taint, &pc);
+        } else {
+            self.control_taint = labels::union(&self.control_taint, &pc);
+            self.escaping_taint = labels::union(&self.escaping_taint, &pc);
+        }
+        self.note_seen(&pc);
+    }
+
+    /// Entra al cuerpo de un bucle: la tinta que el cuerpo agregue por un `stop` muere al salir.
+    /// Devuelve el valor a pasarle a `exit_loop`.
+    #[inline]
+    fn enter_loop(&mut self) -> Label {
+        // Con etiquetas apagadas el camino queda idéntico al de siempre: una comparación.
+        if !self.labels {
+            return self.no_label.clone();
+        }
+        self.loop_depth += 1;
+        self.loop_taint.clone()
+    }
+
+    /// Sale del bucle: descarta la tinta de `stop` que nació adentro y deja la de afuera.
+    #[inline]
+    fn exit_loop(&mut self, saved: Label) {
+        if !self.labels {
+            return;
+        }
+        self.loop_depth = self.loop_depth.saturating_sub(1);
+        self.loop_taint = saved;
+    }
+
+    /// Guarda la tinta de continuación y la deja limpia. Es el borde de una UNIDAD DE EJECUCIÓN
+    /// NUEVA —cuerpo de agente, request del serve, bloque `test`—, no el de una llamada: una
+    /// task llamada desde código ya teñido sigue el MISMO flujo de control y hereda la tinta
+    /// (`enter_call`). El valor devuelto se restaura con `restore_taint`.
+    fn take_taint(&mut self) -> TaintFrame {
+        TaintFrame {
+            control: std::mem::replace(&mut self.control_taint, self.no_label.clone()),
+            loops: std::mem::replace(&mut self.loop_taint, self.no_label.clone()),
+            escaping: std::mem::replace(&mut self.escaping_taint, self.no_label.clone()),
+            depth: std::mem::replace(&mut self.loop_depth, 0),
+        }
+    }
+
+    /// Restaura la tinta de la unidad de afuera.
+    fn restore_taint(&mut self, saved: TaintFrame) {
+        self.control_taint = saved.control;
+        self.loop_taint = saved.loops;
+        self.escaping_taint = saved.escaping;
+        self.loop_depth = saved.depth;
+    }
+
+    /// Borde de LLAMADA: la tinta del llamador **queda puesta** para el callee (regla 1.b, V1 de
+    /// la ronda 4 — vaciarla acá dejaba que un helper sin argumentos escribiera estado público
+    /// sin chequeo). Lo que sí arranca de cero es el frame de bucles del callee: sus `stop` no
+    /// caen en un bucle nuestro.
+    fn enter_call(&mut self) -> TaintFrame {
+        TaintFrame {
+            control: self.control_taint.clone(),
+            loops: self.loop_taint.clone(),
+            escaping: std::mem::replace(&mut self.escaping_taint, self.no_label.clone()),
+            depth: std::mem::replace(&mut self.loop_depth, 0),
+        }
+    }
+
+    /// Vuelta de una llamada, por el camino normal y por el de error. Se restaura la tinta del
+    /// llamador —lo que pasó adentro no tiñe su continuación: el `give` llega a un join point y
+    /// el valor ya viaja etiquetado— salvo lo que ESCAPA del cuerpo del callee (un `stop` sin
+    /// bucle propio), que corta el bucle de acá y por eso se suma a nuestra tinta.
+    fn leave_call(&mut self, saved: TaintFrame) {
+        let escaped = std::mem::replace(&mut self.escaping_taint, saved.escaping);
+        self.loop_depth = saved.depth;
+        self.control_taint = saved.control;
+        self.loop_taint = saved.loops;
+        if !self.labels || escaped.is_empty() {
+            return;
+        }
+        if self.loop_depth > 0 {
+            self.loop_taint = labels::union(&self.loop_taint, &escaped);
+        } else {
+            self.control_taint = labels::union(&self.control_taint, &escaped);
+            self.escaping_taint = labels::union(&self.escaping_taint, &escaped);
+        }
+    }
+
+    /// Registro de los `declassify` ejecutados hasta ahora (en orden).
+    pub fn declassify_log(&self) -> &[DeclassifyEntry] {
+        &self.declassify_log
+    }
+
+    /// Vacía y devuelve el registro de `declassify` (para reportarlo por request/job).
+    pub fn take_declassify_log(&mut self) -> Vec<DeclassifyEntry> {
+        std::mem::take(&mut self.declassify_log)
+    }
+
+    /// Declara un builtin como CONSCIENTE de etiquetas: el despacho etiquetado le pasa los
+    /// argumentos envueltos (sin strip ni re-envoltura del resultado) para que él mismo
+    /// compruebe (`labels::check_flow`), redacte o marque. Es como el host registra sus
+    /// sumideros y fuentes (I/O bajo `serve --attested`).
+    pub fn register_label_aware(&mut self, name: &str) {
+        self.label_aware.insert(name.to_string());
+    }
+
+    /// Marca `v` con la etiqueta de PC (identidad con etiquetas apagadas o PC vacío). Un
+    /// `Secret` bajo PC es error (M2): elegir entre secrets por un privado lavaría la
+    /// etiqueta (un secret no se etiqueta y `reveal` la perdería).
+    ///
+    /// Regla 2 : el PC **no asciende contenedores**. Envolver una lista/mapa con el
+    /// PC fabricaba un envoltorio privado sobre el MISMO `Rc` — un alias que cubre el PC y por
+    /// El que se escribe al objeto público original (caso 1.f), y que además inflaba la
+    /// etiqueta del contenedor en el camino de `set` (caso 1.e). Los escalares de adentro ya
+    /// llevan el PC (B5) y `label_deep` los ve, así que nada se pierde. Para un contenedor
+    /// que SÍ tiene que quedar privado está `private(v, p)`, que copia.
+    #[inline]
+    fn pc_mark(&self, v: SynValue, loc: &SourceLocation) -> Result<SynValue, Control> {
+        if self.labels && !self.pc_is_empty() {
+            if v.is_secret() {
+                return Err(err_labels(
+                    "a secret is already opaque; use private on the value you compute",
+                    loc,
+                ));
+            }
+            if !labels::is_container(&v) {
+                return Ok(labels::mark(v, self.pc_label()));
+            }
+        }
+        Ok(v)
+    }
+
+    /// Empuja `l` al stack de PC (acumulada con la de abajo). Sólo se llama con etiquetas
+    /// encendidas y `l` no vacía. Siempre se aparea con `pc_pop`, también en error.
+    fn pc_push(&mut self, l: &Label) {
+        let joined = match self.pc.last() {
+            Some(top) => labels::union(top, l),
+            None => l.clone(),
+        };
+        self.note_seen(l);
+        self.pc.push(joined);
+    }
+
+    fn pc_pop(&mut self) {
+        self.pc.pop();
+    }
+
+    /// Anota que se desenvolvió un valor con etiqueta `l` (para el mensaje de error que
+    /// atrape un `recover`, también cuando la operación falla antes de re-envolver).
+    #[inline]
+    fn note_seen(&mut self, l: &Label) {
+        if !l.is_empty() {
+            self.seen = labels::union(&self.seen, l);
+            self.seen_any = true;
+            self.touched = labels::union(&self.touched, l);
+        }
+    }
+
+    /// La unión de todo lo privado que la corrida tocó hasta ahora (monótona). Con las
+    /// etiquetas apagadas siempre está vacía.
+    pub fn touched_label(&self) -> Label {
+        self.touched.clone()
+    }
+
+    /// Re-envuelve el resultado de una operación cuyos operandos eran privados con la
+    /// etiqueta `l` (unión si ya era privado). Un `Secret` no se etiqueta (ya es opaco y
+    /// La etiqueta se perdería en `reveal`): error explícito.
+    fn rewrap(&mut self, r: SynValue, l: Label, loc: &SourceLocation) -> Result<SynValue, Control> {
+        if l.is_empty() {
+            return Ok(r);
+        }
+        if r.is_secret() {
+            return Err(err_labels(
+                "a secret is already opaque; use private on the value you compute",
+                loc,
+            ));
+        }
+        self.note_seen(&l);
+        Ok(labels::mark(r, l))
+    }
+
+    /// Bajo una etiqueta de PC no vacía una línea de salida se redacta entera
+    /// (`private(A,B)`): que una rama privada imprima o no es un canal de terminación que
+    /// No se cubre; su CONTENIDO sí.
+    fn pc_redact(&self, s: String) -> String {
+        if self.labels && !self.pc_is_empty() {
+            return format!("private({})", self.safe_label(&self.pc_label()));
+        }
+        s
+    }
+
+    /// T5 (ronda 4) — el stdout del proceso es un SUMIDERO PÚBLICO, y `print`/`show`/`log` son
+    /// sus tres bocas. Redactar el VALOR era la mitad del trabajo: la CANTIDAD de líneas no se
+    /// redacta, así que una línea por vuelta de un bucle sobre datos privados se los deletrea a
+    /// quien lea la salida — y bajo el guest de un enclave el log del Executor vive FUERA de él.
+    /// Vale entonces la misma regla que el motor ya declara para todo builtin con efecto: la
+    /// llamada bajo una rama que dependió de datos privados es `label_violation` ANTES de
+    /// escribir. Lo que sigue funcionando igual es imprimir un valor privado con el PC público:
+    /// sale `private(A,B)` por Display, como siempre.
+    fn stdout_flow_check(&self, what: &str, loc: &SourceLocation) -> Result<(), Control> {
+        if !self.labels || self.pc_is_empty() {
+            return Ok(());
+        }
+        Err(err_labels(
+            format!(
+                "label_violation: {} under private control flow (pc = [{}]); stdout is public and the NUMBER of lines is not redacted, so one line per iteration spells the private data out. Move it out of the private branch, or declassify(<the condition>, \"<why it may be published>\")",
+                what,
+                self.safe_label(&self.pc_label())
+            ),
+            loc,
+        ))
     }
 
     /// Fija los argumentos del programa (`args()`).
@@ -678,6 +1566,105 @@ impl Interpreter {
         let r = f(self, args, loc);
         crate::audit_loc::replace(prev);
         r
+    }
+
+    /// Despacho de un builtin: el camino directo de siempre, o el etiquetado  cuando
+    /// las etiquetas están encendidas.
+    fn dispatch_builtin(
+        &mut self,
+        bt: &Rc<BuiltinTask>,
+        args: &[SynValue],
+        loc: &SourceLocation,
+    ) -> Result<SynValue, Control> {
+        if self.labels {
+            return self.call_builtin_labelled(bt, args, loc);
+        }
+        let f = bt.func.clone();
+        self.call_builtin_at(&f, args, loc)
+    }
+
+    /// Despacho etiquetado . Regla genérica: si algún argumento lleva etiquetas (a
+    /// cualquier profundidad) o hay etiqueta de PC, el builtin recibe los argumentos SIN
+    /// etiquetas (copia sólo de los contenedores con algo privado; los builtins no mutan sus
+    /// argumentos, así que la copia no rompe aliasing), corre bajo esa etiqueta de PC (sus
+    /// callbacks — apply/where/transform… — la heredan) y el resultado sale envuelto con la
+    /// unión. Los builtins CONSCIENTES (`label_aware`) reciben todo tal cual y deciden ellos.
+    fn call_builtin_labelled(
+        &mut self,
+        bt: &Rc<BuiltinTask>,
+        args: &[SynValue],
+        loc: &SourceLocation,
+    ) -> Result<SynValue, Control> {
+        let f = bt.func.clone();
+        // Sumideros (B7) primero, fail-closed: sin etiquetas en los argumentos y sin PC, o
+        // `label_violation` antes de que el builtin corra.
+        if self.label_sinks.contains(bt.name.as_str()) {
+            let refs: Vec<&SynValue> = args.iter().collect();
+            self.sink_check(&bt.name, &refs, loc)?;
+            return self.call_builtin_at(&f, args, loc);
+        }
+        if self.label_aware.contains(bt.name.as_str()) {
+            return self.call_builtin_at(&f, args, loc);
+        }
+        let mut arg_label = labels::empty();
+        for a in args {
+            arg_label = labels::union(&arg_label, &labels::label_deep(a));
+        }
+        let l = labels::union(&arg_label, &self.pc_label());
+        // T5 (ronda 8) — **lo que el builtin VE por dentro también etiqueta su resultado.**
+        //
+        // Hasta acá la etiqueta del resultado se calculaba SÓLO con los argumentos y el PC, y un
+        // callback que lee un privado por CAPTURA era invisible: el predicado decide en Rust, así
+        // que el contexto privado del lenguaje nunca entra. La misma cuenta escrita a mano falla
+        // cerrada y la idiomática publicaba el valor exacto:
+        //
+        //     let n be 0                                  let n be count_where(range(0,256),
+        //     each v in range(0, 256)                         (v) => v < SECRET)
+        //         when v < SECRET                         → n = 165, label_of(n) = []
+        //             set n to n + 1
+        //     → label_violation
+        //
+        // No es un canal lateral: es flujo EXPLÍCITO con etiqueta vacía, y alcanza a
+        // `count_where`/`where`/`find_first`/`index_of`/`every`/`some`/`sort_by`/`group_by` y a
+        // cualquiera que el host registre después.
+        //
+        // El arreglo es el mismo mecanismo que `exec` ya usa para `seen`, aplicado al borde con
+        // Rust: se acota `seen` a ESTA llamada, se corre, y lo que el builtin desenvolvió se une
+        // a la etiqueta del resultado. Estructural a propósito — parchear builtin por builtin
+        // deja el próximo abierto.
+        let outer_seen = std::mem::replace(&mut self.seen, self.no_label.clone());
+        let r = if l.is_empty() {
+            self.call_builtin_at(&f, args, loc)
+        } else if arg_label.is_empty() {
+            // Sólo PC: los argumentos ya están limpios.
+            self.pc_push(&l);
+            let r = self.call_builtin_at(&f, args, loc);
+            self.pc_pop();
+            r
+        } else {
+            let stripped: Vec<SynValue> = args.iter().map(labels::strip_deep).collect();
+            self.pc_push(&l);
+            let r = self.call_builtin_at(&f, &stripped, loc);
+            self.pc_pop();
+            r
+        };
+        // Lo que vio ESTA llamada, y la fusión con lo de afuera (igual que el scoping por nodo).
+        let saw = std::mem::replace(&mut self.seen, self.no_label.clone());
+        self.seen = labels::union(&outer_seen, &saw);
+        let r = r?;
+        let l = labels::union(&l, &saw);
+        if l.is_empty() {
+            return Ok(r);
+        }
+        if r.is_secret() {
+            return Err(err_labels("a secret is already opaque; use private on the value you compute", loc));
+        }
+        self.note_seen(&l);
+        // `mark_owned`: un builtin puede devolver un contenedor que COMPARTE `Rc` con un
+        // argumento público (p. ej. `where` sobre una lista pública bajo PC devuelve los
+        // mismos elementos). Envolverlo sin copiar fabricaría un alias privado escribible
+        // sobre un objeto público — la misma clase que 1.f.
+        Ok(labels::mark_owned(&r, l))
     }
 
     /// Primer `print`/`show`/`log`: consulta el gate una vez y memoiza el veredicto
@@ -869,8 +1856,13 @@ impl Interpreter {
     /// Llama a un valor invocable (task/builtin) con argumentos. Para el motor
     /// (p.ej. el verificador de auth de `serve`). Un `give` interno → valor de retorno.
     pub fn call_task(&mut self, func: SynValue, args: Vec<SynValue>) -> Result<SynValue, Control> {
+        for a in &args {
+            self.harvest_principals(a);
+        }
         let loc = SourceLocation { file: "<engine>".to_string(), line: 0, column: 0, offset: 0 };
-        self.call_value(func, args, &loc)
+        let r = self.call_value(func, args, &loc);
+        // T5 (M1): es un punto de salida hacia el host.
+        self.redact_for_host(r)
     }
 
     /// Intent declarado (para enriquecer /llms.txt). Texto descriptivo, no gatea nada.
@@ -880,6 +1872,7 @@ impl Interpreter {
 
     /// Bindea una variable en el entorno global (para los spawn_args de un agente).
     pub fn set_global(&self, name: &str, value: SynValue) {
+        self.harvest_principals(&value);
         env_set(&self.global_env, name, value);
     }
 
@@ -895,7 +1888,7 @@ impl Interpreter {
         self.agent_context.push(name.to_string());
     }
 
-    /// La identidad del sujeto autenticado de esta unidad de trabajo (T6), si la
+    /// La identidad del sujeto autenticado de esta unidad de trabajo , si la
     /// hay. Precede a `current_agent()` para contabilidad: el gasto se le imputa a
     /// QUIÉN pidió, no a qué agente ejecutó.
     pub fn request_identity(&self) -> Option<&str> {
@@ -921,7 +1914,10 @@ impl Interpreter {
     /// Sin preámbulo/freeze (eso es sólo para el programa top-level).
     pub fn run_block(&mut self, stmts: &[Node]) -> Result<SynValue, Control> {
         let g = self.global_env.clone();
-        self.exec_block(stmts, &g)
+        let saved = self.take_taint();
+        let r = self.exec_block(stmts, &g);
+        self.restore_taint(saved);
+        self.redact_for_host(r)
     }
 
     /// Corre el cuerpo de una ruta del serve en un scope HIJO del entorno global,
@@ -952,12 +1948,17 @@ impl Interpreter {
     ) -> Result<SynValue, Control> {
         let env = Environment::child(parent, "request");
         {
+            for (_, v) in &bindings {
+                self.harvest_principals(v);
+            }
             let mut e = env.borrow_mut();
             for (k, v) in bindings {
                 e.bindings.insert(k, v);
             }
         }
+        let saved_taint = self.take_taint();
         let result = self.exec_block(stmts, &env);
+        self.restore_taint(saved_taint);
         // Rompe cualquier ciclo Rc creado en el scope del request: si el handler hace
         // `define task` dentro del body, la task cierra sobre `env` (`closure_env`) y el
         // env la contiene en `bindings` → `env ⇄ task`, que Rc no libera (igual razón que
@@ -966,7 +1967,8 @@ impl Interpreter {
         // el ciclo → el env del request (bindings + lo que definió el handler) se libera.
         // El give-value (en `result`) es un valor owned, no referencia al env.
         env.borrow_mut().bindings.clear();
-        result
+        // T5 (M1): el error de un handler sale redactado hacia el host si tocó privados.
+        self.redact_for_host(result)
     }
 
     /// Limpia el estado transitorio entre requests del serve (cuando un worker reusa
@@ -990,9 +1992,30 @@ impl Interpreter {
         self.request_spend_limits.clear();
         self.stream_emit = None;
         self.recursion_depth = 0;
+        // T5 (ronda 6, B3) — el contador de pasos es POR REQUEST. El serve reusa el intérprete
+        // entre requests, así que sin esto el contador acumulaba el trabajo del request
+        // ANTERIOR — incluido el privado — y el siguiente lo leía con `touched` ya limpio, o
+        // sea público. Medido con dos secretos: las magnitudes difieren por un factor de quince,
+        // y vive justo en el despliegue atestado que motivó la tanda. Además es lo correcto
+        // aparte de las etiquetas: cada request es su propia unidad de trabajo, y el costo que
+        // `steps()` mide es el suyo, no el del vecino que le tocó el mismo worker.
+        self.steps = 0;
         // El gate de stdout se re-consulta por request (el set de capabilities se
         // reconstruye afuera; el veredicto memoizado sería del request anterior).
         self.stdout_verdict = None;
+        // El contexto de PC es por request (un handler cortado por timeout dentro de
+        // Un `when` privado no debe etiquetar al siguiente). El registro de declassify lo
+        // drena el host (`take_declassify_log`).
+        if self.labels {
+            self.pc.clear();
+            self.seen = labels::empty();
+            self.seen_any = false;
+            self.touched = labels::empty();
+            self.control_taint = labels::empty();
+            self.loop_taint = labels::empty();
+            self.escaping_taint = labels::empty();
+            self.loop_depth = 0;
+        }
     }
 
     /// Evalúa un nodo en un entorno dado (templates + motor de serve).
@@ -1045,6 +2068,10 @@ impl Interpreter {
         // Un error de compilación del módulo se reporta como runtime (la operación
         // de import falló), igual que en el oráculo Python.
         let program = parse_source(&source, resolved).map_err(|e| err(e.to_string()))?;
+        // T5 (B8): un módulo tampoco puede redefinir los nombres protegidos.
+        check_protected_names(&program)?;
+        // T5 (ronda 7): el conjunto con el que se redacta sale del AST, antes de correr nada.
+        self.set_declared_principals(&program);
 
         // Pre-escaneo antes de cualquier efecto: un módulo no puede arrancar un
         // servidor ni ensanchar capabilities globales (el `require` POR TASK sí va).
@@ -1108,10 +2135,10 @@ impl Interpreter {
         );
         self.register("length", 1, Rc::new(|i, a, l| i.b_length(a, l)));
         self.register("text", 1, Rc::new(|i, a, l| i.b_to_text(a, l)));
-        self.register("number", 1, Rc::new(|i, a, l| i.b_to_number(a, l)));
+        self.register("number", -1, Rc::new(|i, a, l| i.b_to_number(a, l)));
         // Tipo Decimal (dinero exacto): constructor + conversión a float + introspección.
-        self.register("decimal", 1, Rc::new(|i, a, l| i.b_decimal(a, l)));
-        self.register("float", 1, Rc::new(|i, a, l| i.b_float(a, l)));
+        self.register("decimal", -1, with_fallback(1, Rc::new(|i, a, l| i.b_decimal(a, l))));
+        self.register("float", -1, with_fallback(1, Rc::new(|i, a, l| i.b_float(a, l))));
         self.register("is_decimal", 1, Rc::new(|i, a, l| i.b_is_decimal(a, l)));
         // Tipo bytes (binario): constructor/conversión + introspección. PUROS (sin
         // capability, como text/number/decimal). El hex/base64 es hand-rolled (bytesutil).
@@ -1218,8 +2245,38 @@ impl Interpreter {
         self.register("unique", 1, Rc::new(|i, a, l| i.b_unique(a, l)));
         // v0.6.20 — `reverse(lista|texto)`; `steps()` (introspección, sin capability).
         self.register("reverse", 1, Rc::new(|i, a, l| i.b_reverse(a, l)));
-        self.register("steps", 0, Rc::new(|i, _a, _l| Ok(SynValue::Number(Number::Int(i.steps as i64)))));
+        // L1: `steps()` es un CANAL PUBLICO documentado (una rama privada cuenta distinto):
+        // Sale con la etiqueta del PC del sitio donde se lo llama (via el despacho generico),
+        // No con todo lo que la corrida toco — marcarlo con `seen` envenenaba la
+        // instrumentacion de cualquier programa que hubiera visto un privado alguna vez.
+        // T5 (ronda 5) — `steps()` es ESTADO AMBIENTE, no un valor que viaje por el resultado.
+        // Una corrida privada mueve el contador y el borde de llamada no lo alcanza: volvía con
+        // etiqueta vacía y `(steps() - base - 24) / 4` reconstruía el escalar privado entero,
+        // exacto, en una línea y sin `declassify`. Sale con la unión de todo lo privado que la
+        // corrida tocó, que es lo único que describe de qué depende el número.
+        self.register(
+            "steps",
+            0,
+            Rc::new(|i, _a, _l| {
+                let n = SynValue::Number(Number::Int(i.steps as i64));
+                if !i.labels {
+                    return Ok(n);
+                }
+                let t = i.touched_label();
+                if t.is_empty() {
+                    return Ok(n);
+                }
+                Ok(labels::mark(n, t))
+            }),
+        );
         self.register("index_of", 2, Rc::new(|i, a, l| i.b_index_of(a, l)));
+        // Etiquetas de flujo por principal (labels.rs). Siempre registrados: con las
+        // etiquetas apagadas `private` es un error claro, `declassify` es la identidad,
+        // `label_of` → [] e `is_private` → false. Son "conscientes" (CORE_LABEL_AWARE).
+        self.register("private", -1, Rc::new(|i, a, l| i.b_private(a, l)));
+        self.register("declassify", -1, Rc::new(|i, a, l| i.b_declassify(a, l)));
+        self.register("label_of", 1, Rc::new(|i, a, l| i.b_label_of(a, l)));
+        self.register("is_private", 1, Rc::new(|i, a, l| i.b_is_private(a, l)));
 
         // -- Librería matemática (math.rs) — funciones puras sobre Number.
         // NOTA: NO se registra un builtin `log` (choca con el soft keyword de
@@ -1276,7 +2333,7 @@ impl Interpreter {
         self.register("csv_encode", -1, Rc::new(|_i, a, _l| crate::csv::csv_encode(a)));
 
         // -- Completitud matemática (Batch 4) --
-        // Complejos: constructor + accesores (PUROS). Las transcendentales (sqrt/exp/…/pow)
+        // complejos: constructor + accesores (PUROS). Las transcendentales (sqrt/exp/…/pow)
         // ya registradas arriba se vuelven polimórficas internamente (real O complejo, G1).
         self.register("complex", 2, Rc::new(|_i, a, _l| crate::math::complex(a)));
         self.register("real", 1, Rc::new(|_i, a, _l| crate::math::real(a)));
@@ -1299,7 +2356,7 @@ impl Interpreter {
         self.register("beta", 2, Rc::new(|_i, a, _l| crate::math::beta(a)));
 
         // -- Arrays numéricos n-dimensionales + álgebra lineal (Batch 5). PUROS. --
-        // Construcción.
+        // construcción.
         self.register("array", 1, Rc::new(|_i, a, _l| crate::arrays::array(a)));
         self.register("zeros", 1, Rc::new(|_i, a, _l| crate::arrays::zeros(a)));
         self.register("ones", 1, Rc::new(|_i, a, _l| crate::arrays::ones(a)));
@@ -1383,6 +2440,7 @@ impl Interpreter {
             // Identificador suelto / literal / cualquier otra expresión → valor (G2).
             _ => {
                 let p = self.exec(pattern, env)?;
+                self.note_pattern(&p);
                 Ok(if value.syn_equals(&p) { Some(Vec::new()) } else { None })
             }
         }
@@ -1411,6 +2469,7 @@ impl Interpreter {
                     return self.match_variant(value, &id, None, env);
                 }
                 let p = self.exec(pattern, env)?;
+                self.note_pattern(&p);
                 Ok(if value.syn_equals(&p) { Some(Vec::new()) } else { None })
             }
             // Variante de enum con payload: `is Enum.variant(p1, …)` — sub-patrones.
@@ -1426,11 +2485,13 @@ impl Interpreter {
                 }
                 // No es variante → patrón de valor (evaluar + comparar).
                 let p = self.exec(pattern, env)?;
+                self.note_pattern(&p);
                 Ok(if value.syn_equals(&p) { Some(Vec::new()) } else { None })
             }
             // Literal / cualquier otra expresión → patrón de valor.
             _ => {
                 let p = self.exec(pattern, env)?;
+                self.note_pattern(&p);
                 Ok(if value.syn_equals(&p) { Some(Vec::new()) } else { None })
             }
         }
@@ -1578,11 +2639,25 @@ impl Interpreter {
     }
 
     // =========================================================
-    // Ejecución
+    // ejecución
     // =========================================================
 
     pub fn execute(&mut self, program: &Program) -> Result<SynValue, Control> {
+        // T5 (B8): nombres protegidos → error de carga, antes de correr nada.
+        check_protected_names(program)?;
+        // T5 (ronda 7): el conjunto con el que se redacta sale del AST, antes de correr nada.
+        self.set_declared_principals(program);
+        let r = self.execute_inner(program);
+        // T5 (M1): un error no atrapado sale redactado si la corrida tocó privados.
+        self.redact_for_host(r)
+    }
+
+    fn execute_inner(&mut self, program: &Program) -> Result<SynValue, Control> {
         let g = self.global_env.clone();
+        self.control_taint = self.no_label.clone();
+        self.loop_taint = self.no_label.clone();
+        self.escaping_taint = self.no_label.clone();
+        self.loop_depth = 0;
         // Preámbulo: las declaraciones `intent`/`require` al inicio se ejecutan
         // primero; luego, si se declaró un intent, se congela (anti prompt-injection);
         // luego el cuerpo (engine.py:785-809).
@@ -1643,6 +2718,10 @@ impl Interpreter {
         }
         // Setup: preámbulo + todas las sentencias no-`TestBlock`. Un fallo → outcome único.
         let setup: Result<(), Control> = (|| {
+            // T5 (B8): nombres protegidos → error de carga.
+            check_protected_names(program)?;
+            // T5 (ronda 7): idem, antes del setup de los bloques `test`.
+            self.set_declared_principals(program);
             for stmt in &program.statements[..split] {
                 self.exec(stmt, &g)?;
             }
@@ -1661,7 +2740,7 @@ impl Interpreter {
             return vec![TestOutcome {
                 name: "<setup>".to_string(),
                 passed: false,
-                message: Some(control_message(&c)),
+                message: Some(self.host_message(&c)),
                 assertion: matches!(&c, Control::Error(e) if e.is_assertion),
             }];
         }
@@ -1670,15 +2749,45 @@ impl Interpreter {
         for stmt in &program.statements {
             if let NodeKind::TestBlock { name, body } = &stmt.kind {
                 let test_env = Environment::child(&g, &format!("test:{}", name));
+                // Cada bloque `test` es su propia unidad — la tinta de continuación de uno
+                // No puede llegarle al siguiente (ni al setup).
+                let saved_taint = self.take_taint();
                 let mut outcome = match self.exec_block(body, &test_env) {
                     Ok(_) => {
                         TestOutcome { name: name.clone(), passed: true, message: None, assertion: false }
                     }
+                    // T5 (regla 1.a, ronda 5) — el veredicto del enforcement NO es atrapable, y
+                    // un runner que lo convierte en un ✗ por bloque lo atrapa igual que un
+                    // `try/recover`: con ocho bloques que prueban un bit cada uno, la columna de
+                    // ✓/✗ deletrea el byte (✗✓✗✓✗✗✓✗ = 181), y sirve incluso usando la propia
+                    // violación como bit. La corrida entera se corta acá, con UN outcome —el
+                    // límite que declara la spec es un bit por corrida, no uno por bloque.
+                    Err(Control::Error(e)) if self.labels && e.is_fatal_for_labels() => {
+                        let msg = self.host_message(&Control::Error(e));
+                        outcomes.clear();
+                        outcomes.push(TestOutcome {
+                            // Ronda 7: el nombre del bloque lo pone el ATACANTE, así que nombrar
+                            // en cuál murió es tantos bits como bloques haya — el mismo mensaje
+                            // que dice "un veredicto por bloque sería un bit por bloque" los
+                            // entregaba en su propio título.
+                            name: "labels: the run was stopped".to_string(),
+                            passed: false,
+                            assertion: false,
+                            message: Some(format!(
+                                "{} — a label violation stops the whole run: a per-block verdict would \
+                                 be one bit of private data per block. Fix it and run the suite again",
+                                msg
+                            )),
+                        });
+                        self.restore_taint(saved_taint);
+                        return outcomes;
+                    }
                     Err(Control::Error(e)) => TestOutcome {
                         name: name.clone(),
                         passed: false,
-                        message: Some(e.to_string()),
                         assertion: e.is_assertion,
+                        // T5 (M1): el mensaje sale redactado si el test tocó privados.
+                        message: Some(self.host_message(&Control::Error(e))),
                     },
                     Err(c @ (Control::Give(_) | Control::Stop(_))) => TestOutcome {
                         name: name.clone(),
@@ -1687,6 +2796,7 @@ impl Interpreter {
                         assertion: false,
                     },
                 };
+                self.restore_taint(saved_taint);
                 // Agentes del test: se esperan y sus errores cuentan como fallo del test.
                 if let Some(msg) = after_each(name) {
                     outcome.passed = false;
@@ -1707,27 +2817,81 @@ impl Interpreter {
         env: &Rc<RefCell<Environment>>,
     ) -> Result<SynValue, Control> {
         let mut result = SynValue::Nothing;
-        for s in stmts {
+        for (idx, s) in stmts.iter().enumerate() {
             // Cancelación cooperativa: un `load` relajado por statement (despreciable
             // frente al tree-walker) — un handler en `while true` deja de ser inmortal.
             if self.cancel.flag.load(std::sync::atomic::Ordering::Relaxed) {
                 self.check_cancel()?;
             }
+            let _ = idx;
             result = self.exec(s, env)?;
         }
         Ok(result)
     }
 
+    /// Todo error que **nace** con una etiqueta de PC no vacía queda
+    /// marcado ahí mismo (`from_private_pc` + los principales del momento). Con esa marca
+    /// deja de ser atrapable (`try/recover`, `assert_error` lo re-propagan) y sale redactado
+    /// Al host: que un salto de control desde un contexto privado se pueda observar —o peor,
+    /// Recuperar— es un bit por iteración, que es la extracción completa (casos 1.a–1.d).
+    /// Marcar acá, en el único embudo de evaluación, cubre TODA fuente de error (raise,
+    /// Índice, clave, aritmética, builtins) sin tocar cada sitio.
     fn exec(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
-        // v0.6.20 — un paso por nodo; `wrapping_add`: contar jamás puede ser un pánico.
+        if !self.labels {
+            return self.exec_node(node, env);
+        }
+        // `seen` se scopea al nodo: lo de afuera se guarda, el nodo arranca limpio, y al
+        // salir se funden. Así se sabe exactamente qué privados tocó ESTE nodo.
+        let outer = std::mem::replace(&mut self.seen, self.no_label.clone());
+        let mut r = self.exec_node(node, env);
+        let inner = std::mem::replace(&mut self.seen, self.no_label.clone());
+        self.seen = labels::union(&outer, &inner);
+        if let Err(Control::Error(e)) = &mut r {
+            // T5 (ronda 6, B1) — **la misma unión decide las dos cosas**. Hasta acá la
+            // atrapabilidad miraba SÓLO el PC y la redacción miraba el PC ∪ lo que el nodo
+            // tocó, y esa asimetría era el agujero: un error CAUSADO por un privado pero
+            // nacido sin rama (`1 / (secret - i)` dentro de un bucle público) salía redactado
+            // pero atrapable, así que un `recover` lo absorbía, la corrida terminaba bien y el
+            // prefijo del bucle ya había dejado el secreto entero en un contador público —
+            // medido: 42 y 181 exactos, `label_of` vacío, exit 0 y `code check` en verde.
+            //
+            // Con la unión, un error que depende de un dato privado es tan poco atrapable como
+            // uno nacido bajo rama privada: que se pueda observar —o peor, recuperar— si la
+            // operación falló es exactamente el bit que la regla 1.a prohíbe. De paso cierra el
+            // veredicto por bloque del runner de tests, que sólo cortaba con `is_fatal_for_labels`.
+            let pc_empty = self.pc_is_empty();
+            if !pc_empty || !inner.is_empty() {
+                let l = labels::union(&self.pc_label(), &inner);
+                if !l.is_empty() {
+                    e.from_private_pc = true;
+                    // Redacción: el PC de este instante ∪ lo privado que tocó ESTE nodo (no el
+                    // acumulado de la corrida). Así un `raise "saldo " + text(x)` con `x`
+                    // privado sale redactado aunque el PC esté vacío, y un `5 % 0` posterior
+                    // conserva su mensaje real. El error más interno gana (el conjunto más
+                    // chico): sólo se escribe si está vacío.
+                    if e.redact_label.is_empty() && !e.from_labels {
+                        e.redact_label = self.safe_label(&l);
+                    }
+                }
+            }
+        }
+        r
+    }
+
+    fn exec_node(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        // V0.6.20 — un paso por nodo; `wrapping_add`: contar jamás puede ser un pánico.
         self.steps = self.steps.wrapping_add(1);
         let loc = &node.location;
         match &node.kind {
             // -- Literales --
-            NodeKind::NumberLiteral { value } => Ok(syn_number(value.clone())),
-            NodeKind::TextLiteral { value } => Ok(syn_text(value.as_str())),
-            NodeKind::BoolLiteral { value } => Ok(syn_bool(*value)),
-            NodeKind::NothingLiteral => Ok(SynValue::Nothing),
+            // T5 (B5): un literal ESCALAR evaluado bajo PC privado lleva el PC (QUÉ literal se
+            // evaluó depende de la rama). Los literales List/Map NO se envuelven: sus
+            // elementos ya llevan lo suyo (un escalar marcado, un `declassify(...)` inline
+            // público, un identificador con su etiqueta). `pc_mark` es la identidad sin PC.
+            NodeKind::NumberLiteral { value } => self.pc_mark(syn_number(value.clone()), loc),
+            NodeKind::TextLiteral { value } => self.pc_mark(syn_text(value.as_str()), loc),
+            NodeKind::BoolLiteral { value } => self.pc_mark(syn_bool(*value), loc),
+            NodeKind::NothingLiteral => self.pc_mark(SynValue::Nothing, loc),
             NodeKind::ListLiteral { elements } => {
                 let mut items = Vec::with_capacity(elements.len());
                 for e in elements {
@@ -1737,12 +2901,31 @@ impl Interpreter {
             }
             NodeKind::MapLiteral { pairs } => {
                 let mut m = IndexMap::new();
+                // Una clave privada etiqueta el mapa entero (la clave es texto visible).
+                let mut key_label: Option<Label> = None;
                 for (k, v) in pairs {
                     let key = self.exec(k, env)?;
                     let val = self.exec(v, env)?;
+                    if self.labels && key.is_private() {
+                        // Una clave LITERAL bajo PC sólo lleva el PC (B5): es texto del
+                        // programa, no etiqueta el mapa (el `let`/`give` ya llevan el PC).
+                        // Una clave computada privada sí: su etiqueta es de datos.
+                        if !is_scalar_literal(k) {
+                            let kl = labels::label(&key);
+                            key_label = Some(match key_label {
+                                Some(l) => labels::union(&l, &kl),
+                                None => kl,
+                            });
+                        }
+                        m.insert(labels::unwrap(&key).to_string(), val);
+                        continue;
+                    }
                     m.insert(key.to_string(), val);
                 }
-                Ok(syn_map(m))
+                match key_label {
+                    Some(l) => self.rewrap(syn_map(m), l, loc),
+                    None => Ok(syn_map(m)),
+                }
             }
 
             // -- Identificadores y acceso --
@@ -1786,7 +2969,18 @@ impl Interpreter {
                     }
                     Err(other) => return Err(other),
                 };
-                match &obj {
+                // Leer un campo de un mapa privado da un valor privado (la etiqueta del
+                // contenedor se une a la del campo).
+                let mut plabel: Option<Label> = None;
+                let obj = if self.labels && obj.is_private() {
+                    let l = labels::label(&obj);
+                    self.note_seen(&l);
+                    plabel = Some(l);
+                    labels::unwrap(&obj).clone()
+                } else {
+                    obj
+                };
+                let r = match &obj {
                     SynValue::Map(m) => match m.borrow().get(property_name) {
                         Some(v) => Ok(v.clone()),
                         None => Err(err_at(format!("Map has no key '{}'", property_name), loc)),
@@ -1800,12 +2994,26 @@ impl Interpreter {
                         format!("Cannot access property '{}' of {}", property_name, obj.type_name()),
                         loc,
                     )),
+                };
+                match plabel {
+                    Some(l) => self.rewrap(r?, l, loc),
+                    None => r,
                 }
             }
             NodeKind::IndexAccess { object, index } => {
                 let obj = self.exec(object, env)?;
                 let idx = self.exec(index, env)?;
-                match &obj {
+                // Contenedor o índice privados → el elemento sale con la unión.
+                let mut plabel: Option<Label> = None;
+                let (obj, idx) = if self.labels && (obj.is_private() || labels::has_label_deep(&idx)) {
+                    let l = labels::union(&labels::label(&obj), &labels::label_deep(&idx));
+                    self.note_seen(&l);
+                    plabel = Some(l);
+                    (labels::unwrap(&obj).clone(), labels::unwrap(&idx).clone())
+                } else {
+                    (obj, idx)
+                };
+                let r = match &obj {
                     SynValue::List(l) => {
                         let items = l.borrow();
                         let i = num_to_i64(&idx)?;
@@ -1839,6 +3047,10 @@ impl Interpreter {
                     // `a[i]` → fila (nD) o escalar (1D). Negativo/fuera de rango → error.
                     SynValue::Array(a) => crate::arrays::index_row(a, num_to_i64(&idx)?),
                     _ => Err(err_at(format!("Cannot index into {}", obj.type_name()), loc)),
+                };
+                match plabel {
+                    Some(l) => self.rewrap(r?, l, loc),
+                    None => r,
                 }
             }
 
@@ -1849,35 +3061,42 @@ impl Interpreter {
                 // si hace falta, así `contains(m, "k") and m["k"] == 1` es un guard
                 // válido. Resultado siempre booleano (no devuelve el operando, como
                 // Python): `x or default` NO es un idioma de Synsema.
+                // El booleano sale con la unión de las etiquetas de lo evaluado.
                 if operator == "and" {
                     if !l.is_truthy() {
-                        return Ok(syn_bool(false));
+                        let res = syn_bool(false);
+                        return if self.labels { self.join_operands(res, &l, None, loc) } else { Ok(res) };
                     }
                     let r = self.exec(right, env)?;
-                    return Ok(syn_bool(r.is_truthy()));
+                    let res = syn_bool(r.is_truthy());
+                    return if self.labels { self.join_operands(res, &l, Some(&r), loc) } else { Ok(res) };
                 }
                 if operator == "or" {
                     if l.is_truthy() {
-                        return Ok(syn_bool(true));
+                        let res = syn_bool(true);
+                        return if self.labels { self.join_operands(res, &l, None, loc) } else { Ok(res) };
                     }
                     let r = self.exec(right, env)?;
-                    return Ok(syn_bool(r.is_truthy()));
+                    let res = syn_bool(r.is_truthy());
+                    return if self.labels { self.join_operands(res, &l, Some(&r), loc) } else { Ok(res) };
                 }
                 let r = self.exec(right, env)?;
                 self.exec_binary(l, operator, r, loc)
             }
             NodeKind::UnaryOp { operator, operand } => {
                 let v = self.exec(operand, env)?;
-                match operator.as_str() {
-                    "-" => match &v {
-                        SynValue::Number(n) => Ok(syn_number(n.neg())),
-                        SynValue::Complex(z) => Ok(SynValue::Complex(-z)),
-                        SynValue::Array(a) => Ok(crate::arrays::negate(a)),
-                        _ => Err(err_at(format!("Cannot negate {}", v.type_name()), loc)),
-                    },
-                    "not" => Ok(syn_bool(!v.is_truthy())),
-                    other => Err(err_at(format!("Unknown unary operator: {}", other), loc)),
+                // Operando privado (a cualquier profundidad, B4) → desenvolver la
+                // superficie, operar, re-envolver con la etiqueta profunda.
+                if self.labels {
+                    let l = labels::label_deep(&v);
+                    if !l.is_empty() {
+                        self.note_seen(&l);
+                        let inner = labels::unwrap(&v).clone();
+                        let r = self.exec_unary(operator, inner, loc)?;
+                        return self.rewrap(r, l, loc);
+                    }
                 }
+                self.exec_unary(operator, v, loc)
             }
             NodeKind::PipeExpression { value, transforms } => {
                 let mut v = self.exec(value, env)?;
@@ -1889,63 +3108,178 @@ impl Interpreter {
             }
 
             // -- Bindings --
+            // bajo una etiqueta de PC toda asignación etiqueta el valor
+            // ("no-sensitive-upgrade": asignar desde un contexto privado convierte la variable).
+            // No-sensitive-upgrade ESTRICTO (B1): re-ligar bajo PC un nombre ya existente en
+            // ESTE scope cuya etiqueta no cubre el PC es `label_violation` (un `let` nuevo o
+            // que sombrea un scope exterior no revela nada: nace privado).
+            // Excepción: si el lado derecho es SINTÁCTICAMENTE `declassify(...)` (resuelto
+            // Al builtin), el valor queda con la etiqueta que `declassify` devolvió (su `to`)
+            // Y NO se le une el PC: el programador declara en ese sitio auditado que ese valor
+            // sale de ese contexto con esa etiqueta (`codeintel::declassify_sites` lo lista y
+            // `declassify` registra el PC real en `from`).
             NodeKind::LetBinding { name, value, .. } => {
                 let v = self.exec(value, env)?;
+                let v = if self.labels && !self.is_declassify_call(value, env) {
+                    self.let_nsu_check(env, name, loc)?;
+                    self.pc_mark(v, loc)?
+                } else {
+                    v
+                };
                 env_set(env, name, v.clone());
                 Ok(v)
             }
             NodeKind::SetMutation { target, value } => {
                 let v = self.exec(value, env)?;
-                self.exec_set(target, v, env, loc)
+                let escape_pc = self.labels && self.is_declassify_call(value, env);
+                let v = if self.labels && !escape_pc { self.pc_mark(v, loc)? } else { v };
+                self.exec_set(target, v, env, loc, escape_pc)
             }
 
             // -- Control de flujo --
             NodeKind::WhenStatement { condition, body, otherwise, otherwise_when } => {
                 let cond = self.exec(condition, env)?;
-                if cond.is_truthy() {
-                    self.exec_block(body, env)
-                } else if let Some(ow) = otherwise_when {
-                    self.exec(ow, env)
-                } else if let Some(ob) = otherwise {
-                    self.exec_block(ob, env)
-                } else {
-                    Ok(SynValue::Nothing)
+                // Condición privada (a cualquier profundidad, B3) → toda la cadena
+                // when/otherwise corre bajo su etiqueta de PC (flujo implícito); se saca al
+                // salir, también en error. El valor IMPLÍCITO de la cadena sale con el PC (B2).
+                if self.labels {
+                    let l = labels::label_deep(&cond);
+                    if !l.is_empty() {
+                        // B1 (ronda 3): si alguna rama puede salir antes de tiempo, la
+                        // continuación queda teñida ACÁ, se tome o no la rama.
+                        if when_exits_early(body, otherwise, otherwise_when) {
+                            let escapes = when_exits_task(body, otherwise, otherwise_when);
+                            self.taint_branch(&l, escapes);
+                        }
+                        self.pc_push(&l);
+                    }
+                    let r = self.exec_when_branches(cond.is_truthy(), body, otherwise_when, otherwise, env);
+                    let r = r.and_then(|v| self.pc_mark(v, loc));
+                    if !l.is_empty() {
+                        self.pc_pop();
+                    }
+                    return r;
                 }
+                self.exec_when_branches(cond.is_truthy(), body, otherwise_when, otherwise, env)
             }
             NodeKind::EachStatement { variable, collection, body } => {
                 let coll = self.exec(collection, env)?;
+                // Colección con etiquetas (a cualquier profundidad, B3) → cada item sale
+                // con esa etiqueta y el cuerpo corre bajo ese PC; el valor implícito también.
+                let mut each_label: Option<Label> = None;
+                let coll = if self.labels {
+                    let l = labels::label_deep(&coll);
+                    if !l.is_empty() {
+                        each_label = Some(l);
+                    }
+                    labels::unwrap(&coll).clone()
+                } else {
+                    coll
+                };
                 let items = match &coll {
                     SynValue::List(l) => l.borrow().clone(),
                     _ => return Err(err_at(format!("Cannot iterate over {}", coll.type_name()), loc)),
                 };
+                // T5 (ronda 5): el frame de bucle se abre ANTES de teñir, porque un `stop` del
+                // cuerpo cae en ESTE bucle y su tinta tiene que morir con él.
+                let saved_loop = self.enter_loop();
+                if let Some(l) = &each_label {
+                    if block_exits_early(body) {
+                        let escapes = block_exits_task(body);
+                        let l = l.clone();
+                        self.taint_branch(&l, escapes);
+                    }
+                    self.pc_push(l);
+                }
                 let mut result = SynValue::Nothing;
+                let mut outcome: Result<(), Control> = Ok(());
                 for item in items {
                     let loop_env = Environment::child(env, &format!("each:{}", variable));
+                    // El item lleva la etiqueta de DATOS de la colección (no la de PC, que
+                    // desde la regla 2 no envuelve contenedores): un mapa dentro de una lista
+                    // privada tiene que salir privado, y compartir el `Rc` es correcto acá —
+                    // El elemento vive DENTRO del contenedor privado, no hay alias público.
+                    let item = match &each_label {
+                        Some(l) => labels::mark(item, l.clone()),
+                        None => item,
+                    };
+                    let item = match self.pc_mark(item, loc) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            outcome = Err(e);
+                            break;
+                        }
+                    };
                     env_set(&loop_env, variable, item);
-                    match self.exec_block(body, &loop_env) {
+                    match self.exec_block(body, &loop_env).and_then(|v| self.pc_mark(v, loc)) {
                         Ok(v) => result = v,
                         Err(Control::Stop(_)) => break,
-                        Err(other) => return Err(other),
+                        Err(other) => {
+                            outcome = Err(other);
+                            break;
+                        }
                     }
                 }
+                if each_label.is_some() {
+                    self.pc_pop();
+                }
+                self.exit_loop(saved_loop);
+                outcome?;
                 Ok(result)
             }
             NodeKind::WhileStatement { condition, body } => {
                 let mut result = SynValue::Nothing;
                 let max_iter = 1_000_000;
                 let mut i = 0;
+                // T5 (ronda 5): igual que `each` — la tinta de un `stop` del cuerpo muere acá.
+                // Por eso el cuerpo ya no puede salir con `return`: el frame quedaría abierto.
+                let saved_loop = self.enter_loop();
+                let mut outcome: Result<(), Control> = Ok(());
                 while i < max_iter {
-                    let cond = self.exec(condition, env)?;
+                    let cond = match self.exec(condition, env) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            outcome = Err(e);
+                            break;
+                        }
+                    };
                     if !cond.is_truthy() {
                         break;
                     }
-                    match self.exec_block(body, env) {
+                    // Condición con etiquetas (profundo, B3) → el cuerpo de ESTA
+                    // iteración y su valor implícito (B2) van bajo PC.
+                    let pushed = if self.labels {
+                        let l = labels::label_deep(&cond);
+                        if l.is_empty() {
+                            false
+                        } else {
+                            if block_exits_early(body) {
+                                let escapes = block_exits_task(body);
+                                self.taint_branch(&l, escapes);
+                            }
+                            self.pc_push(&l);
+                            true
+                        }
+                    } else {
+                        false
+                    };
+                    let r = self.exec_block(body, env);
+                    let r = if self.labels { r.and_then(|v| self.pc_mark(v, loc)) } else { r };
+                    if pushed {
+                        self.pc_pop();
+                    }
+                    match r {
                         Ok(v) => result = v,
                         Err(Control::Stop(_)) => break,
-                        Err(other) => return Err(other),
+                        Err(other) => {
+                            outcome = Err(other);
+                            break;
+                        }
                     }
                     i += 1;
                 }
+                self.exit_loop(saved_loop);
+                outcome?;
                 if i >= max_iter {
                     return Err(err_at("Loop exceeded maximum iterations (1,000,000)", loc));
                 }
@@ -1953,39 +3287,39 @@ impl Interpreter {
             }
             NodeKind::MatchStatement { value, arms, otherwise } => {
                 let v = self.exec(value, env)?;
-                for arm in arms {
-                    if let NodeKind::MatchArm { pattern, guard, body } = &arm.kind {
-                        // El patrón liga (en patrones estructurales/variantes) o compara
-                        // por valor (a nivel top, G2). `None` → no matchea, próximo arm.
-                        let binds = match self.match_pattern_top(pattern, &v, env)? {
-                            Some(b) => b,
-                            None => continue,
-                        };
-                        // Los binders viven en un Environment HIJO scopeado al arm; el
-                        // guard se evalúa con ellos en scope.
-                        let arm_env = Environment::child(env, "match-arm");
-                        for (name, val) in binds {
-                            env_set(&arm_env, &name, val);
+                // T5 (B3): sujeto con etiquetas a cualquier profundidad → se matchea la
+                // superficie desenvuelta bajo PC = label_deep(sujeto); los patrones y guards
+                // privados suman lo suyo dentro de `exec_match_arms`; binders y valor
+                // implícito salen etiquetados.
+                if self.labels {
+                    let l = labels::label_deep(&v);
+                    let inner = labels::unwrap(&v).clone();
+                    if !l.is_empty() {
+                        if match_exits_early(arms, otherwise) {
+                            let escapes = match_exits_task(arms, otherwise);
+                            self.taint_branch(&l, escapes);
                         }
-                        if let Some(g) = guard {
-                            if !self.exec(g, &arm_env)?.is_truthy() {
-                                continue; // guard falso → próximo arm
-                            }
-                        }
-                        return self.exec_block(body, &arm_env);
+                        self.pc_push(&l);
                     }
+                    let r = self.exec_match_arms(inner, arms, otherwise, env, loc, &l);
+                    if !l.is_empty() {
+                        self.pc_pop();
+                    }
+                    return r;
                 }
-                // Ningún arm `is` matcheó: corré el bloque `otherwise` si existe.
-                if let Some(body) = otherwise {
-                    return self.exec_block(body, env);
-                }
-                Ok(SynValue::Nothing)
+                let no_label = self.no_label.clone();
+                self.exec_match_arms(v, arms, otherwise, env, loc, &no_label)
             }
             NodeKind::StopStatement { value } => {
                 let v = match value {
                     Some(n) => Some(self.exec(n, env)?),
                     None => None,
                 };
+                // T5 (regla 1.b): cortar el bucle desde un contexto privado tiñe lo que sigue
+                // — el número de vueltas que alcanzó a dar (y lo que las vueltas previas
+                // escribieron en variables públicas) es información privada que se lee después
+                // del bucle (caso 1.c). El alcance llega hasta el borde de la task.
+                self.taint_after_stop();
                 Err(Control::Stop(v))
             }
 
@@ -2013,16 +3347,47 @@ impl Interpreter {
                     required_capabilities: required_caps,
                 });
                 let value = SynValue::Task(task);
+                // Definir una task bajo PC es una asignación más (NSU estricto + el
+                // callable sale etiquetado: QUÉ task quedó definida depende de la rama).
+                let value = if self.labels {
+                    self.let_nsu_check(env, name, loc)?;
+                    self.pc_mark(value, loc)?
+                } else {
+                    value
+                };
                 env_set(env, name, value.clone());
                 Ok(value)
             }
             NodeKind::TaskCall { name, arguments } => {
                 let func = self.exec(name, env)?;
+                // T5 (B8): `private(…)`/`declassify(…)`/`label_of(…)`/`is_private(…)`/`print(…)`
+                // tienen que resolver al builtin de verdad. Cubre los caminos dinámicos que el
+                // chequeo estático no ve (un parámetro con ese nombre, un alias de módulo).
+                if let Some(id) = name.as_identifier() {
+                    if PROTECTED_BUILTIN_NAMES.contains(&id) {
+                        check_protected_callee(id, &func, loc)?;
+                    }
+                }
                 // Evaluá cada arg preservando su `name` (named vs posicional).
                 let mut args = Vec::with_capacity(arguments.len());
                 for arg in arguments {
                     let val = self.exec(&arg.value, env)?;
                     args.push((arg.name.clone(), val));
+                }
+                // T5 (regla 3.a): que argumentos de ESTA llamada son literales escalares del
+                // fuente. Lo leen `private`/`declassify` como primera linea de su cuerpo para
+                // distinguir un principal/motivo escrito en el programa (texto fijo, aunque
+                // bajo PC lleve la etiqueta del contexto) de uno computado con datos privados.
+                // Se fija justo antes de despachar: los argumentos ya estan evaluados, asi que
+                // nada puede pisarla en el medio.
+                if self.labels {
+                    let mut mask = 0u32;
+                    for (i, arg) in arguments.iter().enumerate().take(32) {
+                        if is_literal_expr(&arg.value) {
+                            mask |= 1 << i;
+                        }
+                    }
+                    self.arg_literals = mask;
                 }
                 self.call_value_named(func, args, loc)
             }
@@ -2056,7 +3421,16 @@ impl Interpreter {
                     Some(n) => self.exec(n, env)?,
                     None => SynValue::Nothing,
                 };
-                Err(Control::Give(v))
+                // Un `give` desde un contexto privado devuelve un valor privado — salvo
+                // `give declassify(...)` (misma excepción que `let`/`set`: la etiqueta la
+                // fija ese sitio auditado).
+                let escapes = self.labels && value.as_deref().is_some_and(|n| self.is_declassify_call(n, env));
+                let out = if escapes { v } else { self.pc_mark(v, loc)? };
+                // Un `give` bajo PC privado corta el bloque (y el bucle donde viva), así que
+                // tiñe lo que sigue DENTRO de la task; el borde de llamada restaura la tinta
+                // del llamador, que es lo que evita el PC residual sobre su código público.
+                self.taint_after_give();
+                Err(Control::Give(out))
             }
 
             // -- Módulos locales (use / export) --
@@ -2335,6 +3709,11 @@ impl Interpreter {
                 for (k, vn) in arguments {
                     spawn_args.push((k.clone(), self.exec(vn, env)?));
                 }
+                // T5 (B7): el agente corre en otro hilo/intérprete — sumidero.
+                if self.labels {
+                    let refs: Vec<&SynValue> = spawn_args.iter().map(|(_, v)| v).collect();
+                    self.sink_check("spawn", &refs, loc)?;
+                }
                 match self.swarm_hooks.as_ref().map(|s| s.spawn.clone()) {
                     // Con swarm: el agente corre en su propio hilo (motor).
                     Some(spawn) => {
@@ -2372,7 +3751,12 @@ impl Interpreter {
             // -- Blackboard --
             NodeKind::ShareStatement { value, key } => {
                 let v = self.exec(value, env)?;
-                let k = self.exec(key, env)?.to_string();
+                let kv = self.exec(key, env)?;
+                // T5 (B7): el blackboard es un sumidero (otros agentes lo leen).
+                if self.labels {
+                    self.sink_check("share", &[&v, &kv], loc)?;
+                }
+                let k = kv.to_string();
                 match self.swarm_hooks.as_ref().map(|s| s.share.clone()) {
                     Some(h) => h(&k, &v),
                     None => {
@@ -2400,11 +3784,20 @@ impl Interpreter {
             }
             NodeKind::SignalStatement { name, data } => {
                 // El nombre del canal es una expresión (Batch 6): evaluar a texto.
-                let n = raw_str(&self.exec(name, env)?);
+                let nv = self.exec(name, env)?;
                 let d = match data {
                     Some(d) => Some(self.exec(d, env)?),
                     None => None,
                 };
+                // T5 (B7): la señal sale a otros agentes — sumidero.
+                if self.labels {
+                    let mut refs: Vec<&SynValue> = vec![&nv];
+                    if let Some(dv) = &d {
+                        refs.push(dv);
+                    }
+                    self.sink_check("signal", &refs, loc)?;
+                }
+                let n = raw_str(&nv);
                 if let Some(h) = self.swarm_hooks.as_ref().map(|s| s.signal.clone()) {
                     h(&n, d);
                 }
@@ -2496,6 +3889,14 @@ impl Interpreter {
             }
             NodeKind::InvariantDeclaration { condition, description } => {
                 let result = self.exec(condition, env)?;
+                // T5 (M1): el veredicto de un invariante sobre datos privados es un uso de
+                // privados: el error que produzca sale redactado hacia el host.
+                if self.labels {
+                    let l = labels::label_deep(&result);
+                    if !l.is_empty() {
+                        self.note_seen(&l);
+                    }
+                }
                 if !result.is_truthy() {
                     let desc = description.clone().unwrap_or_else(|| "unnamed invariant".to_string());
                     return Err(err_at(format!("Invariant violation: {}", desc), loc));
@@ -2515,8 +3916,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
 
             // -- Interacción humana (no-interactiva → auto) --
+            // T5 (B7): el mensaje a un humano sale del intérprete — sumidero.
             NodeKind::ApproveStatement { message, timeout, .. } => {
                 let m = self.exec(message, env)?;
+                if self.labels {
+                    self.sink_check("approve", &[&m], loc)?;
+                }
                 match self.human_callback.clone() {
                     Some(cb) => Ok(cb("approve", &m.to_string(), *timeout)),
                     None => Ok(syn_bool(true)),
@@ -2524,6 +3929,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             NodeKind::ConfirmStatement { message, timeout } => {
                 let m = self.exec(message, env)?;
+                if self.labels {
+                    self.sink_check("confirm", &[&m], loc)?;
+                }
                 match self.human_callback.clone() {
                     Some(cb) => Ok(cb("confirm", &m.to_string(), *timeout)),
                     None => Ok(syn_bool(true)),
@@ -2532,14 +3940,17 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             NodeKind::ShowStatement { value, label } => {
                 let v = self.exec(value, env)?;
                 self.ensure_stdout()?;
+                // T5 (ronda 4): la misma boca pública que `print` — ver `stdout_flow_check`.
+                self.stdout_flow_check("show", loc)?;
                 let label_str = match label {
                     Some(l) => format!("[{}] ", l),
                     None => String::new(),
                 };
-                let line = format!("{}{}", label_str, v);
+                // Un valor privado se redacta por Display; bajo PC se redacta la línea.
+                let line = format!("{}{}", label_str, self.pc_redact(v.to_string()));
                 // DE-034: espejo de `log`/`print` — si hay log_hook (p.ej. bajo serve),
                 // emitir en vivo además de bufferizar a `output`. Bajo `run` el hook es
-                // None, así que el comportamiento no cambia.
+                // none, así que el comportamiento no cambia.
                 if let Some(hook) = &self.log_hook {
                     hook(&line);
                 }
@@ -2548,6 +3959,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             NodeKind::AskExpression { prompt, options, timeout } => {
                 let p = self.exec(prompt, env)?;
+                if self.labels {
+                    self.sink_check("ask", &[&p], loc)?;
+                }
                 if let Some(cb) = self.human_callback.clone() {
                     let r = cb("ask", &p.to_string(), *timeout);
                     if r.is_truthy() {
@@ -2575,10 +3989,18 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 };
                 // Evaluá el contexto (`with k=v`/`given …`) y armalo para el prompt — el
                 // LLM necesita ver ese contexto, no sólo el subject.
-                let mut ctx_parts = Vec::new();
+                let mut ctx_vals = Vec::with_capacity(context.len());
                 for (name, v) in context {
-                    ctx_parts.push(format!("{}={}", name, self.exec(v, env)?));
+                    ctx_vals.push((name, self.exec(v, env)?));
                 }
+                // T5 (B7): el prompt va al proveedor LLM — sumidero.
+                if self.labels {
+                    let mut refs: Vec<&SynValue> = vec![&subj];
+                    refs.extend(ctx_vals.iter().map(|(_, v)| v));
+                    self.sink_check("reason", &refs, loc)?;
+                }
+                let ctx_parts: Vec<String> =
+                    ctx_vals.iter().map(|(name, v)| format!("{}={}", name, v)).collect();
                 match self.llm_callback.clone() {
                     Some(cb) => {
                         let prompt = if ctx_parts.is_empty() {
@@ -2604,6 +4026,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     Some(g) => self.exec(g, env)?,
                     None => SynValue::Nothing,
                 };
+                // T5 (B7): el prompt va al proveedor LLM — sumidero.
+                if self.labels {
+                    self.sink_check("decide", &[&opts, &giv], loc)?;
+                }
                 let prompt = format!("Decide between {} given {}", opts, giv);
                 // Camino dedicado (DE-039): las opciones viajan ESTRUCTURADAS al motor,
                 // que fuerza la elección por tool/enum + normaliza + reintenta. Sólo si
@@ -2626,6 +4052,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             NodeKind::AnalyzeExpression { data, objective } => {
                 self.check_llm_cap()?;
                 let d = self.exec(data, env)?;
+                // T5 (B7): el prompt va al proveedor LLM — sumidero.
+                if self.labels {
+                    self.sink_check("analyze", &[&d], loc)?;
+                }
                 match self.llm_callback.clone() {
                     Some(cb) => {
                         let prompt = format!("Analyze for {}: {}", objective, d);
@@ -2645,10 +4075,21 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     Some(g) => Some(self.exec(g, env)?),
                     None => None,
                 };
-                let mut param_parts = Vec::new();
+                let mut param_vals = Vec::with_capacity(parameters.len());
                 for (name, v) in parameters {
-                    param_parts.push(format!("{}={}", name, self.exec(v, env)?));
+                    param_vals.push((name, self.exec(v, env)?));
                 }
+                // T5 (B7): el prompt va al proveedor LLM — sumidero.
+                if self.labels {
+                    let mut refs: Vec<&SynValue> = Vec::new();
+                    if let Some(g) = &giv {
+                        refs.push(g);
+                    }
+                    refs.extend(param_vals.iter().map(|(_, v)| v));
+                    self.sink_check("generate", &refs, loc)?;
+                }
+                let param_parts: Vec<String> =
+                    param_vals.iter().map(|(name, v)| format!("{}={}", name, v)).collect();
                 match self.llm_callback.clone() {
                     Some(cb) => {
                         let mut prompt = format!("Generate {}", target);
@@ -2672,7 +4113,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             NodeKind::LogStatement { message, .. } => {
                 let m = self.exec(message, env)?;
                 self.ensure_stdout()?;
-                let line = format!("[LOG] {}", m);
+                // T5 (ronda 4): la misma boca pública que `print` — ver `stdout_flow_check`.
+                self.stdout_flow_check("log", loc)?;
+                let line = format!("[LOG] {}", self.pc_redact(m.to_string()));
                 if let Some(hook) = &self.log_hook {
                     hook(&line);
                 }
@@ -2690,15 +4133,50 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 
             // -- Errores --
             NodeKind::TryRecover { try_body, error_variable, recover_body } => {
-                match self.exec_block(try_body, env) {
+                // El mensaje del error atrapado sale etiquetado con todo lo privado que
+                // Se desenvolvió o gateó control DENTRO del `try` (aproximación conservadora:
+                // Un "Index 9 out of bounds" con un índice privado no llega público a `e`).
+                let r = self.exec_block(try_body, env);
+                // `self.seen` está scopeado a ESTE nodo (lo limpia `exec`), así que acá tiene
+                // exactamente lo privado que tocó el cuerpo del `try`.
+                let try_seen = if self.labels { Some(self.seen.clone()) } else { None };
+                match r {
                     Ok(v) => Ok(v),
                     Err(Control::Give(v)) => Err(Control::Give(v)),
                     Err(Control::Stop(v)) => Err(Control::Stop(v)),
+                    // T5 (regla 1.a): un error nacido bajo PC privado, y el veredicto del
+                    // propio enforcement, NO se atrapan — se propagan hasta el host (en el
+                    // guest: request fallida con código uniforme, que T1 cubre). Atraparlos
+                    // convertía el enforcement en el canal (1.a) y un `raise` dentro de la
+                    // rama privada en un bit por iteración (1.b, 1.d).
+                    Err(Control::Error(e)) if self.labels && e.is_fatal_for_labels() => {
+                        Err(Control::Error(e))
+                    }
                     Err(Control::Error(e)) => {
                         let msg = strip_loc_prefix(&e.to_string());
                         let recover_env = Environment::child(env, "recover");
-                        env_set(&recover_env, error_variable, syn_text(msg));
-                        self.exec_block(recover_body, &recover_env)
+                        let mut ev = syn_text(msg);
+                        if let Some(l) = &try_seen {
+                            ev = labels::mark(ev, l.clone());
+                        }
+                        let ev = self.pc_mark(ev, loc)?;
+                        env_set(&recover_env, error_variable, ev);
+                        // T5 (regla 1.c): que el cuerpo del `recover` CORRA es en sí mismo
+                        // información sobre lo que pasó adentro del `try` — corre bajo
+                        // PC ∪ etiqueta de lo privado que se tocó ahí dentro.
+                        let pushed = match &try_seen {
+                            Some(l) if self.labels && !l.is_empty() => {
+                                self.pc_push(l);
+                                true
+                            }
+                            _ => false,
+                        };
+                        let out = self.exec_block(recover_body, &recover_env);
+                        let out = if self.labels { out.and_then(|v| self.pc_mark(v, loc)) } else { out };
+                        if pushed {
+                            self.pc_pop();
+                        }
+                        out
                     }
                 }
             }
@@ -2733,6 +4211,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             NodeKind::SendStatement { value, event_name } => match self.stream_emit.clone() {
                 Some(emit) => {
                     let v = self.exec(value, env)?;
+                    // T5 (B7): el stream va al cliente — sumidero.
+                    if self.labels {
+                        self.sink_check("send", &[&v], loc)?;
+                    }
                     emit(v, event_name.as_deref())?;
                     Ok(SynValue::Nothing)
                 }
@@ -2771,7 +4253,212 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
     }
 
+    /// Selección de rama de un `when` (cuerpo / `otherwise when` / `otherwise`).
+    fn exec_when_branches(
+        &mut self,
+        truthy: bool,
+        body: &[Node],
+        otherwise_when: &Option<Box<Node>>,
+        otherwise: &Option<Vec<Node>>,
+        env: &Rc<RefCell<Environment>>,
+    ) -> Result<SynValue, Control> {
+        if truthy {
+            self.exec_block(body, env)
+        } else if let Some(ow) = otherwise_when {
+            self.exec(ow, env)
+        } else if let Some(ob) = otherwise {
+            self.exec_block(ob, env)
+        } else {
+            Ok(SynValue::Nothing)
+        }
+    }
+
+    /// Los arms de un `match` sobre el valor ya evaluado (y desenvuelto en la superficie, T5).
+    ///
+    /// T5 (B3): la DECISIÓN de qué arm corre depende del sujeto (ya en PC, lo empuja el
+    /// caller), de los valores de los patrones probados hasta acá (`pattern_label`, que suma
+    /// `match_pattern*` al evaluar cada patrón de valor) y de los guards evaluados. Esa unión
+    /// (`extra`) va al PC durante los binders, el guard y el cuerpo del arm tomado — y en el
+    /// `otherwise` (no haber matcheado también es información). Binders y valor implícito
+    /// salen etiquetados.
+    #[allow(clippy::too_many_arguments)]
+    fn exec_match_arms(
+        &mut self,
+        v: SynValue,
+        arms: &[Node],
+        otherwise: &Option<Vec<Node>>,
+        env: &Rc<RefCell<Environment>>,
+        loc: &SourceLocation,
+        subject_label: &Label,
+    ) -> Result<SynValue, Control> {
+        let mut extra = labels::empty();
+        for arm in arms {
+            if let NodeKind::MatchArm { pattern, guard, body } = &arm.kind {
+                // El patrón liga (en patrones estructurales/variantes) o compara
+                // por valor (a nivel top, G2). `None` → no matchea, próximo arm.
+                if self.labels {
+                    self.pattern_label = labels::empty();
+                }
+                let binds = self.match_pattern_top(pattern, &v, env)?;
+                if self.labels {
+                    extra = labels::union(&extra, &self.pattern_label);
+                }
+                let binds = match binds {
+                    Some(b) => b,
+                    None => continue,
+                };
+                // Los binders viven en un Environment HIJO scopeado al arm; el
+                // guard se evalúa con ellos en scope. bajo PC salen etiquetados.
+                let arm_env = Environment::child(env, "match-arm");
+                let pushed = self.labels && !extra.is_empty();
+                if pushed {
+                    self.pc_push(&extra);
+                }
+                let prep: Result<Option<SynValue>, Control> = (|| {
+                    for (name, val) in binds {
+                        // El binder sale con la etiqueta de DATOS del sujeto (el PC no
+                        // envuelve contenedores: un submapa ligado por el patrón tiene que
+                        // salir privado igual).
+                        let val = labels::mark(val, subject_label.clone());
+                        let val = self.pc_mark(val, loc)?;
+                        env_set(&arm_env, &name, val);
+                    }
+                    match guard {
+                        Some(g) => self.exec(g, &arm_env).map(Some),
+                        None => Ok(None),
+                    }
+                })();
+                if pushed {
+                    self.pc_pop();
+                }
+                let guard_val = prep?;
+                if let Some(gv) = &guard_val {
+                    if self.labels {
+                        extra = labels::union(&extra, &labels::label_deep(gv));
+                    }
+                    if !gv.is_truthy() {
+                        continue; // guard falso → próximo arm
+                    }
+                }
+                let pushed = self.labels && !extra.is_empty();
+                if pushed {
+                    self.pc_push(&extra);
+                }
+                let r = self.exec_block(body, &arm_env);
+                let r = if self.labels { r.and_then(|x| self.pc_mark(x, loc)) } else { r };
+                if pushed {
+                    self.pc_pop();
+                }
+                return r;
+            }
+        }
+        // Ningún arm `is` matcheó: corré el bloque `otherwise` si existe.
+        let pushed = self.labels && !extra.is_empty();
+        if pushed {
+            self.pc_push(&extra);
+        }
+        let r = match otherwise {
+            Some(body) => self.exec_block(body, env),
+            None => Ok(SynValue::Nothing),
+        };
+        let r = if self.labels { r.and_then(|x| self.pc_mark(x, loc)) } else { r };
+        if pushed {
+            self.pc_pop();
+        }
+        r
+    }
+
+    /// T5 (B3): anota la etiqueta profunda de un valor de PATRÓN que se comparó con el sujeto.
+    #[inline]
+    fn note_pattern(&mut self, p: &SynValue) {
+        if self.labels {
+            let l = labels::label_deep(p);
+            if !l.is_empty() {
+                self.pattern_label = labels::union(&self.pattern_label, &l);
+                self.seen = labels::union(&self.seen, &l);
+            }
+        }
+    }
+
+    /// T5 (B1): `let`/`task` bajo PC sobre un nombre que YA existe en este scope: su etiqueta
+    /// tiene que cubrir el PC (NSU estricto). Un nombre nuevo o de un scope exterior no revela
+    /// nada (nace privado / se sombrea).
+    fn let_nsu_check(&self, env: &Rc<RefCell<Environment>>, name: &str, loc: &SourceLocation) -> Result<(), Control> {
+        if self.pc_is_empty() {
+            return Ok(());
+        }
+        let existing = env.borrow().bindings.get(name).map(labels::label);
+        match existing {
+            Some(have) => self.nsu_check(&have, &format!("'{}'", name), loc),
+            None => Ok(()),
+        }
+    }
+
+    /// T5 (B8): ¿el nodo es SINTÁCTICAMENTE una llamada a `declassify(...)` Y el callee
+    /// RESUELTO en este entorno es el builtin (no una task/lambda del programa)?
+    fn is_declassify_call(&self, node: &Node, env: &Rc<RefCell<Environment>>) -> bool {
+        match &node.kind {
+            NodeKind::TaskCall { name, .. } if name.as_identifier() == Some("declassify") => {
+                matches!(env_get(env, "declassify"), Some(SynValue::Builtin(bt)) if bt.name == "declassify")
+            }
+            _ => false,
+        }
+    }
+
+    /// Operadores unarios sobre un valor ya evaluado (y desenvuelto, T5).
+    fn exec_unary(&mut self, operator: &str, v: SynValue, loc: &SourceLocation) -> Result<SynValue, Control> {
+        match operator {
+            "-" => match &v {
+                SynValue::Number(n) => Ok(syn_number(n.neg())),
+                SynValue::Complex(z) => Ok(SynValue::Complex(-z)),
+                SynValue::Array(a) => Ok(crate::arrays::negate(a)),
+                _ => Err(err_at(format!("Cannot negate {}", v.type_name()), loc)),
+            },
+            "not" => Ok(syn_bool(!v.is_truthy())),
+            other => Err(err_at(format!("Unknown unary operator: {}", other), loc)),
+        }
+    }
+
+    /// Re-envuelve `res` con la unión de las etiquetas PROFUNDAS de los operandos de un
+    /// `and`/`or` (identidad si ninguno lleva etiquetas). Sólo con etiquetas encendidas.
+    fn join_operands(
+        &mut self,
+        res: SynValue,
+        a: &SynValue,
+        b: Option<&SynValue>,
+        loc: &SourceLocation,
+    ) -> Result<SynValue, Control> {
+        let mut l = labels::label_deep(a);
+        if let Some(b) = b {
+            l = labels::union(&l, &labels::label_deep(b));
+        }
+        self.rewrap(res, l, loc)
+    }
+
+    /// Algún operando con etiquetas (a cualquier profundidad, B4: `{"k": private(1)} ==
+    /// {"k": 1}` sale privado) → desenvolver la superficie, operar y re-envolver con la unión
+    /// profunda. Vale para TODOS los operadores (aritmética, comparación, concat, bytes,
+    /// Listas). Sin etiquetas → `exec_binary_plain` directo.
     fn exec_binary(
+        &mut self,
+        left: SynValue,
+        op: &str,
+        right: SynValue,
+        loc: &SourceLocation,
+    ) -> Result<SynValue, Control> {
+        if self.labels {
+            let l = labels::union(&labels::label_deep(&left), &labels::label_deep(&right));
+            if !l.is_empty() {
+                self.note_seen(&l);
+                let (li, ri) = (labels::unwrap(&left).clone(), labels::unwrap(&right).clone());
+                let r = self.exec_binary_plain(li, op, ri, loc)?;
+                return self.rewrap(r, l, loc);
+            }
+        }
+        self.exec_binary_plain(left, op, right, loc)
+    }
+
+    fn exec_binary_plain(
         &mut self,
         left: SynValue,
         op: &str,
@@ -2817,7 +4504,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
         }
         // Aritmética complex (Batch 4): si alguno es Complex y ambos coercionan a
-        // Complex64 (Number→real, promoción). Va DESPUÉS de los concats de Text/List/Bytes
+        // complex64 (Number→real, promoción). Va DESPUÉS de los concats de Text/List/Bytes
         // (un `Complex + Text` sigue siendo concat de texto vía Display) y ANTES del camino
         // de Number (G2: el tower no se perturba). Sólo +,-,*,/,**; otros ops caen al error.
         if matches!(op, "+" | "-" | "*" | "/" | "**")
@@ -2845,7 +4532,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // array⊕scalar. `*` es ELEMENTWISE (Hadamard), NO producto matricial (eso es
         // matmul/dot). Va DESPUÉS de los concats de Text/List/Bytes y de la rama Complex,
         // y ANTES del camino Number (G2: el tower no se perturba). `array_binop` devuelve
-        // None si ningún operando es array → sigue al camino normal.
+        // none si ningún operando es array → sigue al camino normal.
         if matches!(op, "+" | "-" | "*" | "/") {
             if let Some(res) = crate::arrays::array_binop(&left, &right, op) {
                 return res;
@@ -2884,7 +4571,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
         }
         // Comparación de igualdad. El OPERADOR `==`/`!=` erroría al mezclar Decimal y
-        // Float (a diferencia de match/contains, que los consideran simplemente
+        // float (a diferencia de match/contains, que los consideran simplemente
         // distintos para mantener total esa comparación).
         if matches!(op, "==" | "!=") {
             if let (SynValue::Number(a), SynValue::Number(b)) = (&left, &right) {
@@ -2924,15 +4611,31 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         ))
     }
 
+    /// `escape_pc` : el lado derecho era `declassify(...)` — la escritura no une el PC
+    /// Ni al valor ni al contenedor destino (la etiqueta de una clave privada sí cuenta).
     fn exec_set(
         &mut self,
         target: &Node,
         value: SynValue,
         env: &Rc<RefCell<Environment>>,
         loc: &SourceLocation,
+        escape_pc: bool,
     ) -> Result<SynValue, Control> {
         match &target.kind {
             NodeKind::Identifier { name } => {
+                // T5 (B1): NSU estricto — la variable tiene que cubrir el PC (salvo que el
+                // lado derecho sea `declassify(...)`, el escape auditado).
+                if self.labels && !escape_pc && !self.pc_is_empty() {
+                    match env_get(env, name) {
+                        Some(cur) => self.nsu_check(&labels::label(&cur), &format!("'{}'", name), loc)?,
+                        None => {
+                            return Err(err(format!(
+                                "Cannot set undefined variable: '{}'. Use 'let' first.",
+                                name
+                            )))
+                        }
+                    }
+                }
                 if env_update(env, name, value.clone()).is_err() {
                     return Err(err(format!(
                         "Cannot set undefined variable: '{}'. Use 'let' first.",
@@ -2943,6 +4646,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             NodeKind::PropertyAccess { property_name, object, .. } => {
                 let obj = self.exec(object, env)?;
+                // Escritura a través de un contenedor privado o bajo PC (ver
+                // `set_through_labels`): la etiqueta vive en la variable raíz del camino.
+                let (obj, value) = if self.labels && (obj.is_private() || !self.pc_is_empty()) {
+                    self.set_through_labels(target, obj, labels::empty(), value, env, loc, escape_pc)?
+                } else {
+                    (obj, value)
+                };
                 match &obj {
                     SynValue::Map(m) => {
                         m.borrow_mut().insert(property_name.clone(), value.clone());
@@ -2954,6 +4664,20 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             NodeKind::IndexAccess { object, index } => {
                 let obj = self.exec(object, env)?;
                 let idx = self.exec(index, env)?;
+                // Índice/clave privado, contenedor privado o PC → `set_through_labels`
+                // Decide (el caso central: `set state["balances"][to] to x` con `state` y
+                // `to` privados {app} no revela nada nuevo y procede sin más).
+                let (obj, idx, value) =
+                    if self.labels && (obj.is_private() || labels::has_label_deep(&idx) || !self.pc_is_empty()) {
+                        // Una clave LITERAL sólo puede llevar el PC (B5): es texto del programa,
+                        // No una clave privada (el PC se suma aparte, salvo `escape_pc`).
+                        let key_label = if is_scalar_literal(index) { labels::empty() } else { labels::label_deep(&idx) };
+                        let (obj, value) =
+                            self.set_through_labels(target, obj, key_label, value, env, loc, escape_pc)?;
+                        (obj, labels::unwrap(&idx).clone(), value)
+                    } else {
+                        (obj, idx, value)
+                    };
                 match &obj {
                     SynValue::List(l) => {
                         let mut b = l.borrow_mut();
@@ -2977,6 +4701,58 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             _ => Err(err_at("Invalid set target", loc)),
         }
+    }
+
+    /// Escritura `set <raíz>[…][k] to v` / `set <raíz>.campo to v` con etiquetas.
+    ///
+    /// La etiqueta EFECTIVA del contenedor destino es la de `obj` tal como la evaluó `exec`
+    /// Por el camino desde la variable raíz (la del binding raíz ∪ cada envoltorio Private
+    /// atravesado ∪ los índices intermedios). NSU ESTRICTO (B1/M4): si `etiqueta(clave) ∪ PC
+    /// ⊆ efectiva` la escritura no revela nada nuevo (la posición ya era al menos tan privada:
+    /// El ledger `set state["balances"][to] to x` con `state` y `to` en {app}) y procede tal
+    /// cual; si no → `label_violation`. No hay "conversión" del contenedor: religar la raíz
+    /// dejaría públicos los alias del mismo Rc (`let n be m`, el parámetro de una task).
+    /// Con `escape_pc` (el lado derecho era `declassify(...)`) el PC no cuenta: sólo la
+    /// etiqueta de la clave. Devuelve el contenedor desenvuelto y el valor a escribir.
+    fn set_through_labels(
+        &mut self,
+        target: &Node,
+        obj: SynValue,
+        key_label: Label,
+        value: SynValue,
+        env: &Rc<RefCell<Environment>>,
+        loc: &SourceLocation,
+        escape_pc: bool,
+    ) -> Result<(SynValue, SynValue), Control> {
+        let needed = if escape_pc { key_label } else { labels::union(&key_label, &self.pc_label()) };
+        // 1.e: la etiqueta que manda es la del BINDING RAIZ del camino, no la del objeto
+        // intermedio recien evaluado. Un indice literal bajo PC salia marcado con el PC, el
+        // `rewrap` del `IndexAccess` devolvia el contenedor envuelto con ese mismo PC, y la
+        // comparacion se cumplia sola: `set m["a"]["b"]` pasaba y `set m.a.b` fallaba, con la
+        // proteccion dependiendo de que sintaxis eligio el programador.
+        let root = set_root_identifier(target);
+        let have = match root.and_then(|n| env_get(env, n)) {
+            Some(v) => labels::label(&v),
+            // Sin raiz religable (el destino no nace de una variable): no hay etiqueta que
+            // sostenga la escritura.
+            None => labels::empty(),
+        };
+        if labels::subset(&needed, &have) {
+            return Ok((labels::unwrap(&obj).clone(), value));
+        }
+        let what = match root {
+            Some(name) => format!("a position of '{}'", name),
+            None => "a position of a container that is not a variable".to_string(),
+        };
+        Err(err_labels(
+            format!(
+                "label_violation: cannot write {} ({}) with a key/context private to {}: the container is not at least as private (the written position would leak); bind it as private(…, \"<principal>\") first, or declassify the scalar you want to publish and build the container outside the private branch",
+                what,
+                if have.is_empty() { "public".to_string() } else { format!("private to {}", self.safe_label(&have)) },
+                self.safe_label(&needed)
+            ),
+            loc,
+        ))
     }
 
     /// Llamada con args sólo posicionales (camino de siempre: pipes, apply/where,
@@ -3068,8 +4844,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                             .into_iter()
                             .map(|s| s.unwrap_or(SynValue::Nothing))
                             .collect();
-                        let f = bt.func.clone();
-                        self.call_builtin_at(&f, &pos, loc)
+                        self.dispatch_builtin(&bt, &pos, loc)
                     }
                     None => {
                         let mut pos = Vec::with_capacity(args.len());
@@ -3082,8 +4857,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                             }
                             pos.push(v);
                         }
-                        let f = bt.func.clone();
-                        self.call_builtin_at(&f, &pos, loc)
+                        self.dispatch_builtin(&bt, &pos, loc)
                     }
                 }
             }
@@ -3142,11 +4916,62 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     };
                     env_set(&call_env, &param.name, v);
                 }
-                match self.exec_block(&task.body, &call_env) {
+                // T5 (regla 1.b) — la tinta de continuación del LLAMADOR VIAJA con la llamada.
+                // Vaciarla al entrar (lo que se hacía hasta la ronda 4) era la puerta más grande
+                // de la tanda: un helper SIN argumentos llamado desde un bucle ya teñido corría
+                // con tinta vacía y escribía estado público sin chequeo, así que
+                // `each i in range(0,256) / when secret == i / give` reconstruía el secreto
+                // entero en un contador público (medido: 181, y alcanza `write_file`, `remember`
+                // y una respuesta HTTP 200). El mismo helper CON argumento fallaba cerrado sólo
+                // por accidente: el argumento se evalúa en el llamador, bajo su tinta.
+                // Lo que sí es del cuerpo es lo que la task tiñe ADENTRO: al volver se restaura
+                // la tinta del llamador —también por el camino de error—, que es lo que evita el
+                // PC residual sobre su código público (un `give` llega a un join point y el
+                // valor ya viaja etiquetado).
+                let saved_taint = self.enter_call();
+                let out = match self.exec_block(&task.body, &call_env) {
                     Ok(v) => Ok(v),
                     Err(Control::Give(v)) => Ok(v),
                     Err(other) => Err(other),
+                };
+                // T5 (ronda 5) — un `stop` que SALE de la task corta el bucle del LLAMADOR, y
+                // ahí la tinta no siempre llega a tiempo. Cuando la rama que lo dispara está en
+                // el cuerpo del callee (`task h(s, i) / when s == i / stop`), `taint_branch` la
+                // pone en la vuelta 0 y todo cierra. Pero si la rama está en el LLAMADOR y el
+                // salto es indirecto (`when secret == i / bail()`, con `task bail() / stop`),
+                // el predicado estático no puede verlo —saber si una llamada corta el bucle es
+                // interprocedural— y para cuando el `stop` dispara en la vuelta 181, las 181
+                // vueltas anteriores ya escribieron un contador público en claro. Medido: el
+                // secreto entero, con `label_of` vacío.
+                //
+                // Así que se rechaza el constructo: un `stop` bajo control privado no puede
+                // dejar la task donde está escrito. `escaping_taint` no vacío en este punto
+                // significa exactamente "un `stop` de este cuerpo salió bajo PC privado".
+                let escaping_stop =
+                    self.labels && matches!(out, Err(Control::Stop(_))) && !self.escaping_taint.is_empty();
+                let escaped_pc = if escaping_stop { self.safe_label(&self.escaping_taint) } else { String::new() };
+                self.leave_call(saved_taint);
+                if escaping_stop {
+                    return Err(err_labels(
+                        format!(
+                            "label_violation: 'stop' left the task '{}' under private control flow (pc = [{}]); a 'stop' that breaks the CALLER's loop cannot be checked until the loop has already run, so it is refused. Write the 'stop' in the loop it belongs to (give a value and decide there), or declassify(<the condition>, \"<why it may be published>\")",
+                            task.name, escaped_pc
+                        ),
+                        loc,
+                    ));
                 }
+                out
+            }
+            // Un callable etiquetado (p. ej. una lambda ligada dentro de un `when`
+            // Privado) se llama bajo su etiqueta de PC y el resultado sale con ella: QUÉ
+            // función corrió es información privada.
+            SynValue::Private(p) if self.labels => {
+                let l = p.label.clone();
+                let inner = p.value.clone();
+                self.pc_push(&l);
+                let r = self.call_value_named_inner(inner, args, loc);
+                self.pc_pop();
+                self.rewrap(r?, l, loc)
             }
             other => Err(err_at(format!("Cannot call value of type {}", other.type_name()), loc)),
         }
@@ -3204,12 +5029,17 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     // =========================================================
-    // Builtins (núcleo)
+    // builtins (núcleo)
     // =========================================================
 
-    fn b_print(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+    fn b_print(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         self.ensure_stdout()?;
+        // T5 (ronda 4): `print` es un sumidero público — ver `stdout_flow_check`.
+        self.stdout_flow_check("print called", loc)?;
         let s = args.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
+        // Defensa de fondo: con el PC ya comprobado arriba esto es la identidad, y sigue acá
+        // por si algún camino futuro alcanza `b_print` sin pasar por el chequeo.
+        let s = self.pc_redact(s);
         if let Some(hook) = &self.log_hook {
             hook(&s);
         }
@@ -3249,8 +5079,29 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
     }
 
+    /// `number(x)` → float, o error. **`number(x, default)` → la variante TOTAL**: devuelve
+    /// `default` en vez de lanzar.
+    ///
+    /// T5 (ronda 7) — no es azúcar. Bajo etiquetas, un error causado por datos privados no se
+    /// atrapa (regla 1.a: poder recuperarse de un fallo ES el bit), así que un programa que
+    /// valida entrada no confiable —el caso de un enclave, que recibe cargas cifradas de
+    /// cualquiera— se quedaba **sin ninguna frase que escribir**: ni `try/recover`, ni declarar
+    /// privado el destino. Sin error no hay bit, y el programa valida sin excepciones:
+    /// `let n be number(campo, nothing)` y después `when n == nothing`.
     fn b_to_number(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        if args.is_empty() || args.len() > 2 {
+            return Err(err("number(value, default?) takes 1 or 2 arguments"));
+        }
         let v = nth(args, 0)?;
+        let bail = |v: &SynValue| -> Result<SynValue, Control> {
+            match args.get(1) {
+                Some(d) => Ok(d.clone()),
+                None => Err(err(format!(
+                    "Cannot convert {} to number. To validate untrusted input without raising, pass a fallback: number(<value>, nothing)",
+                    v
+                ))),
+            }
+        };
         let f = match v {
             SynValue::Number(n) => n.to_f64(),
             SynValue::Bool(b) => {
@@ -3262,9 +5113,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             SynValue::Text(s) => match s.trim().parse::<f64>() {
                 Ok(x) => x,
-                Err(_) => return Err(err(format!("Cannot convert {} to number", v))),
+                Err(_) => return bail(v),
             },
-            _ => return Err(err(format!("Cannot convert {} to number", v))),
+            _ => return bail(v),
         };
         Ok(syn_float(f))
     }
@@ -3582,6 +5433,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             ));
         }
         match self.call_value(func, Vec::new(), loc) {
+            // T5 (regla 1.a): un error nacido bajo PC privado / del enforcement tampoco se
+            // atrapa aca (si no, `assert_error` seria el `try` del atacante).
+            Err(Control::Error(e)) if self.labels && e.is_fatal_for_labels() => {
+                Err(Control::Error(e))
+            }
             // Lanzó un error → la aserción pasa.
             Err(Control::Error(_)) => Ok(SynValue::Nothing),
             // Retornó normal (incl. un `give`, que `call_value` materializa como Ok) → falla.
@@ -3595,10 +5451,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// texto. Re-propaga un error capturado en `recover` (un agente con try/recover+raise
     /// termina en ERROR, no DONE). Sin argumentos → error claro. `give`/`stop` no se ven
     /// afectados (raise es siempre un error, no un control de flujo).
-    fn b_raise(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+    fn b_raise(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         match args.first() {
-            Some(v) => Err(err(raw_str(v))),
-            None => Err(err("raise expects a message")),
+            // La ubicación viaja con el error (sin ella el programa es indepurable:
+            // Un `raise` perdía `file:line:col`). `try/recover` la sigue quitando del texto
+            // que liga (`strip_loc_prefix`), así que el contrato del lenguaje no cambia.
+            Some(v) => Err(err_at(raw_str(v), loc)),
+            None => Err(err_at("raise expects a message", loc)),
         }
     }
 
@@ -3754,6 +5613,159 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 
     fn b_type_of(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
         Ok(syn_text(nth(args, 0)?.type_name()))
+    }
+
+    // -- etiquetas de flujo por principal (labels.rs) --
+
+    /// `private(v, principal | [principales])` → `v` etiquetado (unión si ya lo estaba, y
+    /// con la etiqueta de PC del contexto). Un `secret` no se etiqueta (ya es opaco). Con las
+    /// etiquetas apagadas es un error claro: el programa está escrito para `--labels`.
+    fn b_private(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        let literals = self.arg_literals;
+        if !self.labels {
+            return Err(err_labels("private: labels are off; run with --labels or serve --attested", loc));
+        }
+        if args.len() != 2 {
+            return Err(err_labels(
+                format!("private: expects 2 arguments (value, principal), got {}", args.len()),
+                loc,
+            ));
+        }
+        let v = &args[0];
+        if v.is_secret() {
+            return Err(err_labels(
+                "private: a secret is already opaque; use private on the value you compute",
+                loc,
+            ));
+        }
+        let l = principals_arg(&args[1], "private", false, literals & 0b10 != 0, loc)?;
+        // M1: el principal vino de un literal del fuente → es texto del programa.
+        //
+        // T5 (ronda 7) — **NO alimenta el conjunto con el que se redacta.** Ese conjunto sale del
+        // recorrido ESTÁTICO del AST (`set_declared_principals`) justamente porque un `private`
+        // que corre o no según un secreto haría variar el texto otra vez:
+        // `when s == 0 / let a be private(1, "p0") / otherwise / let a be private(1, "p1")`.
+        for p in l.iter() {
+            self.known_principals.borrow_mut().insert(p.to_string());
+        }
+        let l = labels::union(&l, &self.pc_label());
+        self.note_seen(&l);
+        // Regla 2 (1.f): `mark_owned` COPIA el contenedor antes de envolverlo. Compartiendo el
+        // `Rc`, `let priv be private(pub, "app")` fabricaba un alias privado sobre el objeto
+        // PUBLICO: escribir por el alias (legal, cubre el PC) mutaba el original publico.
+        Ok(labels::mark_owned(&v, l))
+    }
+
+    /// `declassify(v, reason, to?)` → `v` con la etiqueta REDUCIDA a `to` (público sin `to`).
+    /// Nunca amplía (`to ⊆ etiqueta actual`, si no error). Registra motivo/from/to/ubicación
+    /// En `declassify_log` (y en el `log_hook` del host, si hay). Con las etiquetas apagadas
+    /// Es la identidad; el motivo se valida igual (es parte del programa, no del modo).
+    fn b_declassify(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        let literals = self.arg_literals;
+        if args.len() < 2 || args.len() > 3 {
+            return Err(err_labels(
+                format!("declassify: expects 2 or 3 arguments (value, reason, to?), got {}", args.len()),
+                loc,
+            ));
+        }
+        // M3 : el motivo es METADATO PUBLICO — va al log del host y al registro
+        // que lee el auditor. Tiene que ser un literal de texto EN ESTA llamada o un valor sin
+        // etiquetas: permitir `subset(PC)` dejaba meter un dato privado (un numero de tarjeta)
+        // Como motivo y verlo en claro en el log.
+        let pc = self.pc_label();
+        let rl = labels::label_deep(&args[1]);
+        if !rl.is_empty() && literals & 0b10 == 0 {
+            return Err(err_labels(
+                format!(
+                    "declassify: reason must be public (a text literal at this call, or a value with no labels), it is private to {}",
+                    self.safe_label(&rl)
+                ),
+                loc,
+            ));
+        }
+        let reason = match labels::unwrap(&args[1]) {
+            SynValue::Text(s) if !s.trim().is_empty() => s.to_string(),
+            _ => return Err(err_labels("declassify: reason must be a non-empty text", loc)),
+        };
+        if !self.labels {
+            return Ok(args[0].clone());
+        }
+        let v = &args[0];
+        // B6: el origen REAL es la etiqueta profunda del valor ∪ el PC del contexto — un
+        // literal declassificado dentro de una rama privada sale de `from [pc]`, y así queda
+        // registrado para el auditor.
+        let from = labels::union(&labels::label_deep(v), &pc);
+        let to = match args.get(2) {
+            Some(t) if !matches!(labels::unwrap(t), SynValue::Nothing) => {
+                principals_arg(t, "declassify", true, literals & 0b100 != 0, loc)?
+            }
+            _ => labels::empty(),
+        };
+        if !labels::subset(&to, &from) {
+            return Err(err_labels(
+                format!(
+                    // T5 (ronda 8): no se imprime la etiqueta del VALOR (varía con cuál es, y
+                    // por ahí salía el dato). El `to` sí: es el literal escrito en esta llamada.
+                    // Y con el `from` constante el texto viejo quedaba absurdo ("from [a,b] to
+                    // [a,b]"), así que el mensaje dice qué pasó y qué escribir en su lugar.
+                    "declassify: cannot widen a label — [{}] is not a subset of what this value is private to, and `declassify` may only narrow. Drop the third argument to publish it, or narrow to a subset of its own principals",
+                    label_display_raw(&to)
+                ),
+                loc,
+            ));
+        }
+        // T5 (ronda 7) — el `from` que sale al log NO es la etiqueta de ESTE valor. Varía con
+        // cuál se seleccionó, igual que la redacción: `declassify(xs[idx_privado], …)` daba
+        // `from [app,p0]` o `from [app,p1]` según el índice, o sea el rastro de auditoría
+        // publicaba el dato que el `declassify` estaba documentando. Sale el conjunto DECLARADO,
+        // constante. El `to` sí es de la etiqueta real: es el literal escrito en ESTE sitio, que
+        // no depende del valor. La revisión de verdad es `code check --json`, que es estática.
+        if let Some(hook) = &self.log_hook {
+            hook(&format!(
+                "[INF] declassify: {} (from [{}] to [{}]) at {}:{}",
+                reason,
+                self.safe_label(&from),
+                label_display_raw(&to),
+                loc.file,
+                loc.line
+            ));
+        }
+        self.declassify_log.push(DeclassifyEntry { reason, from: from.clone(), to: to.clone(), loc: loc.clone() });
+        self.note_seen(&from);
+        Ok(labels::mark(labels::strip_deep(v), to))
+    }
+
+    /// `label_of(v)` → lista de principales (union PROFUNDA); `[]` si es publico o con las
+    /// etiquetas apagadas.
+    ///
+    /// Regla 3.b (1.g): el RESULTADO sale etiquetado con `label_deep(v)` union PC. Devolverlo
+    /// publico lo convertia en un oraculo: escribir en un contenedor ya privado un valor de
+    /// OTRO principal es legal, y `length(label_of(m)) == 2` leia ese hecho —que depende de
+    /// datos privados— como booleano publico.
+    fn b_label_of(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        let v = nth(args, 0)?;
+        if !self.labels {
+            return Ok(syn_list(Vec::new()));
+        }
+        let l = labels::label_deep(v);
+        let meta = labels::union(&l, &self.pc_label());
+        // Los elementos (texto) llevan la etiqueta: `label_deep` de la lista la ve, y la lista
+        // En si queda sin envolver (regla 2: el PC no asciende contenedores).
+        Ok(syn_list(
+            l.iter().map(|p| labels::mark(SynValue::Text(p.clone()), meta.clone())).collect(),
+        ))
+    }
+
+    /// `is_private(v)` → ¿lleva alguna etiqueta (a cualquier profundidad)? `false` apagado.
+    /// Regla 3.b: el booleano sale etiquetado con `label_deep(v)` union PC (mismo oraculo que
+    /// `label_of`).
+    fn b_is_private(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        let v = nth(args, 0)?;
+        if !self.labels {
+            return Ok(syn_bool(false));
+        }
+        let meta = labels::union(&labels::label_deep(v), &self.pc_label());
+        Ok(labels::mark(syn_bool(labels::has_label_deep(v)), meta))
     }
 
     fn b_slice(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -3959,7 +5971,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     // =========================================================
-    // Operaciones intencionales
+    // operaciones intencionales
     // =========================================================
 
     fn list_arg(&self, v: &SynValue, who: &str) -> Result<Vec<SynValue>, Control> {
@@ -4250,7 +6262,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let (key_func, items) = self.dual_fn_list(args, "group_by")?;
         let mut groups: IndexMap<String, Vec<SynValue>> = IndexMap::new();
         for item in items {
-            let key = self.call_value(key_func.clone(), vec![item.clone()], loc)?.to_string();
+            // Bajo PC la clave vuelve etiquetada (`give`); el nombre del grupo es el
+            // valor interno (el mapa resultante sale etiquetado por el despacho).
+            let k = self.call_value(key_func.clone(), vec![item.clone()], loc)?;
+            let key = labels::unwrap(&k).to_string();
             groups.entry(key).or_default().push(item);
         }
         let mut result = IndexMap::new();
@@ -4381,11 +6396,287 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 }
 
 // =========================================================
-// Helpers libres
+// helpers libres
 // =========================================================
 
 fn nth(args: &[SynValue], i: usize) -> Result<&SynValue, Control> {
     args.get(i).ok_or_else(|| err("missing argument"))
+}
+
+/// T5 (B8): error de CARGA si el programa liga alguno de los nombres protegidos
+/// (`PROTECTED_BUILTIN_NAMES`) a un valor **invocable**: `task private(…)`, una lambda, o un
+/// tipo/enum/grupo de rutas (todos construyen algo llamable). Estático y SIEMPRE activo (con
+/// etiquetas apagadas también), porque el mismo programa puede cargarlo un host que las
+/// encienda y porque el chequeo que distingue un `declassify(...)` real depende de que el
+/// nombre no se pueda sombrear.
+///
+/// Lo que NO se prohíbe (ronda 3): ligarlos a un valor **no invocable**. `let private be 5`
+/// es la especificación por ejemplo de que `private` es una palabra clave BLANDA
+/// (`conformance/core/053`), y no reabre nada: el ataque era interceptar la LLAMADA, y de eso
+/// se ocupa además el guard de sitio de llamada (`check_protected_callee`), que exige que
+/// `private(…)`/`declassify(…)`/… resuelvan al builtin de verdad — cubriendo también los
+/// caminos dinámicos (un parámetro, un alias de módulo, un valor del blackboard).
+/// T5 (ronda 7) — los principales que el PROGRAMA declara, recogidos del AST antes de ejecutar
+/// nada: los literales de texto en el segundo argumento de `private(…)` y en el tercero de
+/// `declassify(…)` (la forma que acota en vez de publicar).
+///
+/// Estático a propósito. Recogerlos cuando el `private` CORRE haría que el texto de redacción
+/// dependiera de qué camino tomó la corrida, que es exactamente el canal que esto cierra:
+/// `when s == 0 / private(1, "p0") / otherwise / private(1, "p1")` daría un texto distinto según
+/// el secreto.
+pub fn principal_literals(program: &Program) -> Vec<String> {
+    fn literals_of(n: &Node, out: &mut Vec<String>) {
+        match &n.kind {
+            NodeKind::TextLiteral { value } => {
+                if !value.is_empty() && !out.iter().any(|x| x == value) {
+                    out.push(value.clone());
+                }
+            }
+            NodeKind::ListLiteral { elements } => {
+                for e in elements {
+                    literals_of(e, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for stmt in &program.statements {
+        crate::ast_api::walk(stmt, &mut |n| {
+            if let NodeKind::TaskCall { name, arguments } = &n.kind {
+                let idx = match name.as_identifier() {
+                    Some("private") => 1,
+                    Some("declassify") => 2,
+                    _ => return,
+                };
+                if let Some(arg) = arguments.get(idx) {
+                    literals_of(&arg.value, &mut out);
+                }
+            }
+        });
+    }
+    out
+}
+
+pub fn check_protected_names(program: &Program) -> Result<(), Control> {
+    let mut bad: Option<(String, SourceLocation)> = None;
+    let mut hit = |name: &str, loc: &SourceLocation| {
+        if bad.is_none() && PROTECTED_BUILTIN_NAMES.contains(&name) {
+            bad = Some((name.to_string(), loc.clone()));
+        }
+    };
+    for stmt in &program.statements {
+        crate::ast_api::walk(stmt, &mut |n| {
+            let loc = &n.location;
+            match &n.kind {
+                NodeKind::TaskDefinition { name, .. } => hit(name, loc),
+                NodeKind::TypeDefinition { name, .. }
+                | NodeKind::EnumDefinition { name, .. }
+                | NodeKind::RoutesDeclaration { name, .. } => hit(name, loc),
+                // `let f be (x) => …` / `set f to (x) => …`: liga un invocable.
+                NodeKind::LetBinding { name, value, .. } => {
+                    if matches!(value.kind, NodeKind::LambdaExpression { .. }) {
+                        hit(name, loc);
+                    }
+                }
+                NodeKind::SetMutation { target, value } => {
+                    if matches!(value.kind, NodeKind::LambdaExpression { .. }) {
+                        if let Some(name) = target.as_identifier() {
+                            hit(name, loc);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        });
+    }
+    match bad {
+        Some((name, loc)) => Err(err_labels(
+            format!(
+                "'{}' is a protected builtin and cannot be bound to something callable: the information-flow labels of the whole program are decided by these five builtins, so a program that redefines one could silently un-label its own sources and mislead the audit listing. Binding the name to a plain value (let {} be 5) is fine — it is a soft keyword. This holds with or without --labels, because the same program can be loaded by a host that turns them on",
+                name, name
+            ),
+            &loc,
+        )),
+        None => Ok(()),
+    }
+}
+
+/// T5 (B8): el callee de una llamada a un nombre protegido tiene que ser SU builtin.
+fn check_protected_callee(name: &str, func: &SynValue, loc: &SourceLocation) -> Result<(), Control> {
+    let ok = matches!(func, SynValue::Builtin(bt) if bt.name == name);
+    if ok {
+        return Ok(());
+    }
+    Err(err_labels(
+        format!(
+            "'{}' is a protected builtin and this call does not resolve to it (it resolves to {}): the information-flow labels of the program depend on these five builtins, so intercepting the call would silently un-label the program's own sources",
+            name,
+            func.type_name()
+        ),
+        loc,
+    ))
+}
+
+/// T5 (ronda 3, B1): ¿alguna sentencia de este bloque puede SALIR antes de tiempo dejando
+/// trabajo sin hacer — `give`, `stop` (del bucle que lo contiene) o `raise`? Estático sobre el
+/// AST; no entra a cuerpos de task ni de lambda (un `give` de ahí adentro sale de ESA task).
+pub fn block_exits_early(stmts: &[Node]) -> bool {
+    stmts.iter().any(|n| node_exits_early(n, false))
+}
+
+/// Las tres ramas de un `when` (cuerpo, `otherwise`, cadena `otherwise when`).
+fn when_exits_early(body: &[Node], otherwise: &Option<Vec<Node>>, otherwise_when: &Option<Box<Node>>) -> bool {
+    block_exits_early(body)
+        || otherwise.as_ref().is_some_and(|b| block_exits_early(b))
+        || otherwise_when.as_ref().is_some_and(|w| node_exits_early(w, false))
+}
+
+/// T5 (ronda 5) — ¿el bloque puede salir de la TASK ENTERA (`give`/`raise`), y no sólo de este
+/// bloque? Es `node_exits_early` con `in_nested_loop = true`, que es exactamente el predicado
+/// "un `stop` no me alcanza". Decide hasta dónde llega la tinta de la rama (ver `taint_branch`).
+pub fn block_exits_task(stmts: &[Node]) -> bool {
+    stmts.iter().any(|n| node_exits_early(n, true))
+}
+
+fn when_exits_task(body: &[Node], otherwise: &Option<Vec<Node>>, otherwise_when: &Option<Box<Node>>) -> bool {
+    block_exits_task(body)
+        || otherwise.as_ref().is_some_and(|b| block_exits_task(b))
+        || otherwise_when.as_ref().is_some_and(|w| node_exits_early(w, true))
+}
+
+fn match_exits_task(arms: &[Node], otherwise: &Option<Vec<Node>>) -> bool {
+    arms.iter().any(|a| node_exits_early(a, true))
+        || otherwise.as_ref().is_some_and(|b| block_exits_task(b))
+}
+
+/// Los cuerpos de los arms de un `match` y su `otherwise`.
+fn match_exits_early(arms: &[Node], otherwise: &Option<Vec<Node>>) -> bool {
+    arms.iter().any(|a| node_exits_early(a, false))
+        || otherwise.as_ref().is_some_and(|b| block_exits_early(b))
+}
+
+fn node_exits_early(n: &Node, in_nested_loop: bool) -> bool {
+    match &n.kind {
+        NodeKind::GiveStatement { .. } => true,
+        // Un `stop` dentro de un bucle ANIDADO corta ese bucle, no este bloque.
+        NodeKind::StopStatement { .. } => !in_nested_loop,
+        // `raise <msg>` es una llamada al builtin: corta la corrida entera.
+        NodeKind::TaskCall { name, .. } => name.as_identifier() == Some("raise"),
+        NodeKind::LetBinding { value, .. } => node_exits_early(value, in_nested_loop),
+        NodeKind::SetMutation { value, .. } => node_exits_early(value, in_nested_loop),
+        NodeKind::WhenStatement { body, otherwise, otherwise_when, .. } => {
+            body.iter().any(|s| node_exits_early(s, in_nested_loop))
+                || otherwise.as_ref().is_some_and(|b| b.iter().any(|s| node_exits_early(s, in_nested_loop)))
+                || otherwise_when.as_ref().is_some_and(|w| node_exits_early(w, in_nested_loop))
+        }
+        NodeKind::MatchStatement { arms, otherwise, .. } => {
+            arms.iter().any(|a| node_exits_early(a, in_nested_loop))
+                || otherwise.as_ref().is_some_and(|b| b.iter().any(|s| node_exits_early(s, in_nested_loop)))
+        }
+        NodeKind::MatchArm { body, .. } => body.iter().any(|s| node_exits_early(s, in_nested_loop)),
+        // Dentro de un bucle anidado, sólo `give`/`raise` salen de NUESTRO bloque.
+        NodeKind::EachStatement { body, .. } | NodeKind::WhileStatement { body, .. } => {
+            body.iter().any(|s| node_exits_early(s, true))
+        }
+        NodeKind::TryRecover { try_body, recover_body, .. } => {
+            try_body.iter().any(|s| node_exits_early(s, in_nested_loop))
+                || recover_body.iter().any(|s| node_exits_early(s, in_nested_loop))
+        }
+        NodeKind::SandboxBlock { body, .. }
+        | NodeKind::TraceBlock { body, .. }
+        | NodeKind::MeasureBlock { body, .. }
+        | NodeKind::StreamBlock { body } => body.iter().any(|s| node_exits_early(s, in_nested_loop)),
+        _ => false,
+    }
+}
+
+/// T5 (regla 3.a): ¿el nodo es un literal del fuente — escalar, o lista/mapa cuyos elementos
+/// Lo son? Un principal/motivo escrito así es texto del PROGRAMA: no varía con los datos
+/// (aunque bajo PC lleve la etiqueta del contexto, por B5).
+fn is_literal_expr(node: &Node) -> bool {
+    match &node.kind {
+        NodeKind::ListLiteral { elements } => elements.iter().all(is_literal_expr),
+        NodeKind::MapLiteral { pairs } => pairs.iter().all(|(k, v)| is_literal_expr(k) && is_literal_expr(v)),
+        _ => is_scalar_literal(node),
+    }
+}
+
+/// T5 (B5): ¿el nodo es un literal escalar (texto del programa)?
+fn is_scalar_literal(node: &Node) -> bool {
+    matches!(
+        node.kind,
+        NodeKind::NumberLiteral { .. } | NodeKind::TextLiteral { .. } | NodeKind::BoolLiteral { .. } | NodeKind::NothingLiteral
+    )
+}
+
+/// La variable raíz de un destino de `set` (`m` en `set m["a"][k].f to v`), si el camino
+/// nace de un identificador; `None` si nace de otra expresión (una llamada, un literal…).
+fn set_root_identifier(target: &Node) -> Option<&str> {
+    match &target.kind {
+        NodeKind::Identifier { name } => Some(name.as_str()),
+        NodeKind::IndexAccess { object, .. } | NodeKind::PropertyAccess { object, .. } => {
+            set_root_identifier(object)
+        }
+        _ => None,
+    }
+}
+
+/// El argumento "principal(es)" de `private`/`declassify`: un texto no vacío o una
+/// lista de textos no vacíos (`allow_empty`: la lista vacía vale como "público", sólo para
+/// El `to` de `declassify`). Los nombres son metadatos: se leen a través de un `Private`.
+fn principals_arg(
+    v: &SynValue,
+    who: &str,
+    allow_empty: bool,
+    is_literal: bool,
+    loc: &SourceLocation,
+) -> Result<Label, Control> {
+    let bad = || {
+        err_labels(
+            format!("{}: principal must be a non-empty text or a list of non-empty texts, got {}", who, v.type_name()),
+            loc,
+        )
+    };
+    // M3 : el principal es METADATO PUBLICO — es el NOMBRE de la etiqueta, y
+    // `label_of` lo devuelve. Tiene que ser un literal escrito en ESTA llamada (texto del
+    // programa: no varia con los datos, aunque bajo PC lleve la etiqueta del contexto) o un
+    // valor sin etiquetas. Aceptar `subset(PC)` dejaba pasar un dato privado a {app} dentro de
+    // una rama con PC {app}: su texto se volvia nombre de principal y salia en claro por
+    // `label_of` (un numero de documento escrito a disco en la repro del auditor).
+    // M1 (ronda 3): el principal tiene que ser un LITERAL escrito en esta llamada. Se va el
+    // escape "un valor sin etiquetas": una variable pública con texto arbitrario entraba como
+    // nombre de principal y salía verbatim por los mensajes `label_violation`, que son el único
+    // canal que nunca se redacta (y bajo `serve` llegan al cliente). Encadenado con una fuga de
+    // control, eso era exfiltración.
+    if !is_literal {
+        return Err(err_labels(
+            format!(
+                "{}: the principal must be a text literal written at this call (a computed value could carry data out through the label name, which is printed verbatim in diagnostics)",
+                who
+            ),
+            loc,
+        ));
+    }
+    match labels::unwrap(v) {
+        SynValue::Text(s) if !s.trim().is_empty() => Ok(labels::label_from(&[s.trim()])),
+        SynValue::List(l) => {
+            let items = l.borrow();
+            if items.is_empty() && !allow_empty {
+                return Err(bad());
+            }
+
+            let mut names: Vec<String> = Vec::with_capacity(items.len());
+            for it in items.iter() {
+                match labels::unwrap(it) {
+                    SynValue::Text(s) if !s.trim().is_empty() => names.push(s.trim().to_string()),
+                    _ => return Err(bad()),
+                }
+            }
+            Ok(labels::label_from(&names))
+        }
+        _ => Err(bad()),
+    }
 }
 
 /// ¿El valor es invocable? (task de usuario, lambda o builtin). La base de la regla
@@ -4480,7 +6771,7 @@ fn bytes_encoding_arg(args: &[SynValue]) -> Result<Option<String>, Control> {
 
 /// Concatenación que **propaga el taint** (#10): el resultado es un `secret` cuyo
 /// plaintext es la concatenación de los plaintexts (un operando no-secret aporta su
-/// Display, igual que la concatenación normal). El nombre se hereda del primer
+/// display, igual que la concatenación normal). El nombre se hereda del primer
 /// operando secret (sólo cosmético para la redacción `secret(NAME)`).
 fn secret_concat(left: &SynValue, right: &SynValue) -> SynValue {
     // (texto a concatenar, nombre si el operando es secret).
@@ -4549,6 +6840,10 @@ fn sort_cmp(a: &SynValue, b: &SynValue) -> Ordering {
     match (a, b) {
         (SynValue::Number(x), SynValue::Number(y)) => x.partial_cmp_num(y).unwrap_or(Ordering::Equal),
         (SynValue::Text(x), SynValue::Text(y)) => x.as_ref().cmp(y.as_ref()),
+        // Claves etiquetadas (un `give` bajo PC) se ordenan por su valor interno.
+        (SynValue::Private(_), _) | (_, SynValue::Private(_)) => {
+            sort_cmp(labels::unwrap(a), labels::unwrap(b))
+        }
         _ => Ordering::Equal,
     }
 }
@@ -4653,7 +6948,7 @@ fn translate_replacement(s: &str) -> String {
 }
 
 // =========================================================
-// Runner mínimo (espejo de engine.run_source para los tests de capa 4)
+// runner mínimo (espejo de engine.run_source para los tests de capa 4)
 // =========================================================
 
 /// Resultado observable de un programa. Sólo lleva datos `Send` (el `SynValue`

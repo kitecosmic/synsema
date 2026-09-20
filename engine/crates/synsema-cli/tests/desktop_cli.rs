@@ -1,4 +1,4 @@
-//! Tanda escritorio, motor (specs/build-serve-desktop.md §3.3–§3.5) contra el binario real:
+//! Escritorio, motor, contra el binario real:
 //! `shutdown(reason?)` dispara el drain ordenado desde el programa (ruta, cron sólo), es
 //! idempotente y falla claro bajo `run` o antes de que haya algo corriendo; la cláusula
 //! `bind "…"` del serve block decide dónde escucha el listener (y `--bind` le gana);

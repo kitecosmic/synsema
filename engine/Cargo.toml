@@ -252,6 +252,17 @@ aes-gcm = { version = "0.10", default-features = false, features = ["aes", "allo
 # OsRng como en webpush). hkdf ya era transitiva de elliptic-curve; directa no agrega crate.
 # AES-256-GCM es el MISMO aes-gcm de arriba (Aes256Gcm). Cero `*-sys`.
 p521 = { version = "0.13", default-features = false, features = ["ecdh", "std"] }
+# Attestation de plataforma (TEEs): verificar documentos y firmar la identidad del proceso.
+#   p384        : ES384 (ECDSA sobre NIST P-384). Nitro firma el documento COSE_Sign1 con ES384 y
+#                 toda su PKI (raiz, intermedios, hoja) es P-384 + SHA-384. Misma familia RustCrypto,
+#                 PINNEADA a 0.13 para compartir elliptic-curve 0.13 con p256/p521/k256. `ecdsa` da
+#                 verificar (y firmar, para el driver `mock`); sin `pem`/`getrandom`.
+#   x509-parser : parsear la cadena de certificados DER del documento (SPKI, validez, TBS,
+#                 firma, issuer/subject). YA estaba en el arbol (transitivo de rcgen 0.14 via
+#                 instant-acme); directo no agrega crate. `default-features = false` deja fuera su
+#                 `verify` (ring): la firma la verificamos nosotros con p384/p256.
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+x509-parser = { version = "0.18", default-features = false }
 hkdf = "0.12"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 scrypt = { version = "0.11", default-features = false }
@@ -259,6 +270,28 @@ aes = "0.8"
 ctr = "0.9"
 curve25519-dalek = { version = "4", default-features = false }
 tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+# `groth16_verify` sobre BN254 — verificar una prueba
+# Groth16 de circom/snarkjs (Semaphore, zk-passport, la mayoría de zkTLS) dentro del enclave sin
+# oráculo. SÓLO verificación (sin probador: acordado). arkworks es PURO-Rust y `no_std`; cero
+# `*-sys`/C. Verificado en Cargo.lock: entran 14 crates ark-* (bn254, groth16, ec, ff, ff-asm,
+# ff-macros, poly, relations, serialize, serialize-derive, snark, std, crypto-primitives y sus
+# macros) + derivative, educe, enum-ordinalize(-derive), foldhash 0.1, merlin y syn 3 — todos
+# puro-Rust (derive/proc-macro o aritmética); ningún `*-sys` nuevo.
+# Familia 0.6 (la estable actual; ark-ff/ark-ec/ark-serialize/ark-std comparten versión — una
+# mezcla 0.5/0.6 duplicaría toda la pila de campos). `default-features = false` en TODAS:
+#   - ark-groth16 tiene `default = ["parallel"]` → rayon. Fuera: el intérprete es sync y wasm no
+#     tiene hilos. Tampoco `r1cs` (síntesis de circuitos: sólo el probador la necesita).
+#   - ark-ff `asm` fuera (x86_64-only; el mismo código debe correr en wasm32).
+#   - sin `std`: la verificación es `alloc`-only; `ark-groth16/std` arrastraría `ark-relations/std`
+#     → tracing-subscriber (peso muerto en el wasm). ark-std sin `std` tampoco (default = std).
+#   - ark-bn254 `curve` = G1+G2+pairing+campo escalar (lo mínimo para verificar).
+# Los JSON de snarkjs se parsean a mano (decimal → Fq/Fr): ark-serialize sólo aporta el trait.
+ark-bn254 = { version = "0.6", default-features = false, features = ["curve"] }
+ark-groth16 = { version = "0.6", default-features = false }
+ark-ec = { version = "0.6", default-features = false }
+ark-ff = { version = "0.6", default-features = false }
+ark-serialize = { version = "0.6", default-features = false }
+ark-std = { version = "0.6", default-features = false }
 synsema-core = { path = "crates/synsema-core" }
 synsema-capabilities = { path = "crates/synsema-capabilities" }
 synsema-stdlib = { path = "crates/synsema-stdlib" }

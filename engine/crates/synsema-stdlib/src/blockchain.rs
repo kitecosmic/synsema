@@ -44,7 +44,7 @@ pub(crate) fn err(msg: impl Into<String>) -> Control {
 }
 
 // =========================================================
-// Lectura de argumentos (sin unwrap sobre input — G10)
+// lectura de argumentos (sin unwrap sobre input — G10)
 // =========================================================
 
 pub(crate) fn arg<'a>(args: &'a [SynValue], i: usize, fname: &str) -> Result<&'a SynValue, Control> {
@@ -84,7 +84,7 @@ pub(crate) fn arg_bytes_len<'a>(
 }
 
 // =========================================================
-// Extracción de la clave desde un `secret` (Rust-side, nunca al lenguaje — G2)
+// extracción de la clave desde un `secret` (Rust-side, nunca al lenguaje — G2)
 // =========================================================
 
 /// Devuelve `(name_del_secret, bytes_de_clave)`. El `name` NO es sensible (se usa para
@@ -95,12 +95,20 @@ pub(crate) fn key_material(v: &SynValue, fname: &str) -> Result<(String, Vec<u8>
     match v {
         SynValue::Secret(inner) => {
             let name = inner.name().to_string();
+            // Auditoría ronda 3 (bloqueante 4): un secret SELLADO (`attestation_key()`) no entra a
+            // NINGÚN builtin de esta familia. `key_material` es el embudo de firma, derivación,
+            // custodia y export (secp256k1/ed25519/btc/algorand + `hd_derive`, `keystore_export`,
+            // `mnemonic_from_entropy`), y por los tres últimos la clave de identidad salía entera:
+            // un keystore V3 cifrado con una contraseña que elige el programa, o 24 palabras
+            // BIP-39 en claro. La capability `wallet` no protegía: gatea sobre la etiqueta de
+            // salida que el programa inventa, no sobre el secret de entrada.
+            let raw = inner.expose_bytes_checked(fname).map_err(err)?;
             if inner.is_bytes() {
-                Ok((name, inner.expose_bytes().to_vec()))
+                Ok((name, raw.to_vec()))
             } else {
                 // Secret de texto → hex. `expose_bytes` de un secret de texto son sus
                 // bytes UTF-8; su forma de texto es válida por construcción.
-                let s = String::from_utf8_lossy(inner.expose_bytes());
+                let s = String::from_utf8_lossy(raw);
                 let t = s.trim();
                 let hexs = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
                 let key = synsema_core::bytesutil::hex_decode(hexs).map_err(|_| {
@@ -121,7 +129,7 @@ pub(crate) fn key_material(v: &SynValue, fname: &str) -> Result<(String, Vec<u8>
 }
 
 // =========================================================
-// Gate + audit de la firma (decisión #2 / G3)
+// gate + audit de la firma (decisión #2 / G3)
 // =========================================================
 
 fn sign_denied(name: &str, cause: DenyCause) -> Control {
@@ -410,7 +418,7 @@ fn bech32_decode(args: &[SynValue]) -> Result<SynValue, Control> {
         }
     };
     // Detectar la variante por el CHECKSUM (bech32::decode es agnóstico): probar
-    // Bech32 (BIP-173) y, si su checksum no valida, Bech32m (BIP-350). Un string sólo
+    // bech32 (BIP-173) y, si su checksum no valida, Bech32m (BIP-350). Un string sólo
     // valida contra UNA de las dos (los checksums difieren por diseño).
     use bech32::primitives::decode::CheckedHrpstring;
     let (hrp, data, variant) =
@@ -722,7 +730,7 @@ fn rlp_decode(args: &[SynValue]) -> Result<SynValue, Control> {
 }
 
 // =========================================================
-// Registro
+// registro
 // =========================================================
 
 /// Registra los builtins de blockchain. Los PUROS no tocan `caps`; los de FIRMA
@@ -758,12 +766,12 @@ pub fn register_blockchain_builtins(interp: &Interpreter, caps: Rc<RefCell<Capab
 
     // -- bech32 --
     interp.register_builtin("bech32_encode", -1, Rc::new(|_i, a, _l| bech32_encode(a)));
-    interp.register_builtin("bech32_decode", 1, Rc::new(|_i, a, _l| bech32_decode(a)));
+    interp.register_builtin("bech32_decode", -1, synsema_core::interpreter::with_fallback(1, Rc::new(|_i, a, _l| bech32_decode(a))));
 
     // -- EVM --
     interp.register_builtin("eth_address", 1, Rc::new(|_i, a, _l| eth_address(a)));
     interp.register_builtin("rlp_encode", 1, Rc::new(|_i, a, _l| rlp_encode(a)));
-    interp.register_builtin("rlp_decode", 1, Rc::new(|_i, a, _l| rlp_decode(a)));
+    interp.register_builtin("rlp_decode", -1, synsema_core::interpreter::with_fallback(1, Rc::new(|_i, a, _l| rlp_decode(a))));
 
     // -- Batch 12 (todo PURO — G13: ninguna puerta de firma nueva) --
     crate::blockchain_abi::register(interp); // ABI + EIP-191 + EIP-712
