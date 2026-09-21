@@ -1,12 +1,14 @@
-# `judge` — calibrated judgments from a System One model (Jev) — engine v0.6.25+
+# `judge` — calibrated judgments from a System One model (Jev) — engine v0.6.25+ (complete in v0.6.26)
 
 `judge` asks a **System One model** typed questions about one `state` and gets back **probabilities**,
 not text. It never generates: there is no `reason`, `generate` or `analyze` in it, and the LLM slot
 cannot serve it. It is a **parallel slot** to the LLM (`SYNSEMA_JUDGE_*` next to `SYNSEMA_LLM_*`): the
 judge decides, the LLM writes, and having both wired is the normal setup. The first backend is
-TypeSafe's **Jev** (`api.typesafe.ai`); any host that serves the same wire works through
-`SYNSEMA_JUDGE_BASE_URL`. Everything on this page was verified live against `jev-1.13.0` on
-2026-09-20 through the engine, not only against the vendor's docs.
+TypeSafe's **Jev** (`api.typesafe.ai`); another host that serves the same wire can be pointed at with
+`SYNSEMA_JUDGE_BASE_URL`, with the model id and key that host expects — only TypeSafe's own endpoint
+was verified live. Everything on this page was verified live against `jev-1.13.0` on 2026-09-20
+through the engine, not only against the vendor's docs. This page is the whole surface: nothing here
+requires reading the engine.
 
 ## The block — one state, N questions, ONE call
 
@@ -92,7 +94,12 @@ by the model — name them meaningfully; question ids are *not* sent).
 
 **The instruction is any expression**, not only a string. A map is read as structure, and reads
 better when the question needs data next to it. Reference nested state with backticks, the vendor's
-idiom — it points at the exact element (measured: `messages[0]` 0.99, `messages[1]` 0.01):
+idiom — it points at the exact element (measured: `messages[0]` 0.99, `messages[1]` 0.01). The
+runtime resolves every backticked path against the state **before the call** and warns once per path
+when it is missing (v0.6.26+; on a missing field the model answered 0.31, neither 0 nor 0.5). The
+common trap: `judge ticket` with `` `ticket.text` `` in the question — the model sees the *value* of
+`ticket`, not its name, so write `judge {"ticket": ticket}` or drop the prefix. The warning says
+which:
 
 ```synsema
 require judge
@@ -182,25 +189,62 @@ key may live only in the `.env`. `synsema init` writes all of these, commented, 
 | `SYNSEMA_JUDGE_BASE_URL` | endpoint base — any host that serves the same wire | `https://api.typesafe.ai` |
 | `SYNSEMA_JUDGE_TIMEOUT` | HTTP timeout, seconds | `60` |
 | `SYNSEMA_JUDGE_BUDGET` | hard ceiling of **input** tokens per process (output is free); at the ceiling answers degrade to `available: false` without touching the network | — (no ceiling) |
+| `SYNSEMA_JUDGE_DECIDE` (v0.6.26+) | `1`: every `decide between […] given X` is served by the judge as a calibrated `choose` instead of the LLM (see below) | off |
 
 429/529 are retried with exponential backoff honouring `retry-after`; after the retries the answer
 degrades. A 400/422 from the API is **your program's** error (limits, empty instruction, bad state)
 and surfaces as a runtime error carrying the vendor's message.
+
+## `synsema judge status` — what is resolved, and why it is offline (v0.6.26+)
+
+```
+synsema judge status            # provider, key PRESENCE (never the value), model, base URL, timeout,
+                                # budget, whether decide is served by the judge, each with its source
+synsema judge status --json     # the same for scripts; exit 0 = live, 1 = offline
+```
+
+No network. Offline, the last line names what is missing (`TYPESAFE_API_KEY`, or a provider name that
+is not `typesafe` | `mock`). Same host flags as the rest of the CLI: `--env-file <path>`,
+`--no-env-file`. Scriptable: `synsema judge status && synsema serve app.syn`.
+
+## Serving `decide` with the judge — `SYNSEMA_JUDGE_DECIDE=1` (v0.6.26+)
+
+`decide between ["refund", "replace", "escalate"] given ticket` is exactly one `choose` over one
+state. With the knob on and a judge provider wired, every `decide` in the process is answered by the
+judge: calibrated, one of **your** options byte-for-byte with no normalisation or retry, and cheaper
+and faster than a chat model. Nothing in the program changes — existing code gets better by
+configuration. Rules: opt-in and off by default (it changes *which model answers*); it needs the
+`judge` capability, so under `serve` a `decide` without `require judge` fails with an error that names
+the knob; if the judge is unavailable (offline, over budget, network) the `decide` falls back to the
+LLM path as before; `decide` still returns a string — write a `judge` block when you want the
+distribution and the confidence. Verified live: `decide between ["refund", "replace", "escalate"]`
+on a broken-item complaint returned `escalate`, 324 input tokens, `jev-1.13.0`.
 
 Introspection, no gate (like the LLM ones): `judge_available()` → bool; `judge_usage()` → input
 tokens accumulated in the process; `judge_model()` → the **versioned** id that answered the last call
 (`"jev-1.13.0"`, never the alias — the vendor moves aliases, and thresholds tuned against one version
 should be pinned to it) or `nothing`.
 
-## What the engine checks for you
+## What the engine checks for you — before spending a token
 
-At load time (`synsema check` and every run): the three verbs and their prepositions, `or nothing`
-only after `choose`, duplicate question ids, an empty block, `judge` used without a block. At run
-time, **before spending the call**: at least 2 options or levels (the API accepts one and answers
-with confidence 1.0 — an empty answer dressed as certainty), at most 255 options and 10 levels (the
-API's limits), duplicate option or level ids, an empty instruction, a `state` that is not text, map
-or list (a number is a type error, not a degraded answer). Everything else the API rejects comes
-back as a runtime error with its message.
+**At load (`synsema check` and every run):** the three verbs and their prepositions, `or nothing`
+only after `choose`, duplicate question ids, an empty block, `judge` used without a block.
+
+**`synsema check` fails (v0.6.26+)** when the criteria are literals and break a limit — fewer than 2
+options or levels (the API accepts one and answers with confidence 1.0: an empty answer dressed as
+certainty), more than 255 options or 10 levels, duplicate option or level ids — and on an empty
+literal instruction or a literal `state` that is a number, a bool or `nothing`. A 400 in production,
+caught at `check`.
+
+**`synsema check` warns (v0.6.26+)**, never fails, on the things that run but mislead: a `whether`
+phrased in the negative (`not`, `n't`, `never`, `without`, `free of`); an instruction that asks for
+arithmetic or counting over the state (`total`, `sum`, `exceeds 100`, `how many`); an empty literal
+state; and the same `judge <variable>` appearing in more than one block — the questions could share
+one call.
+
+**At run time, before the call:** the same limits when the criteria are dynamic, the type of the
+state, the empty instruction, and the backticked paths that the state does not have (a warning with
+the fix). Everything the API still rejects comes back as a runtime error with the vendor's message.
 
 ## Writing questions that work (measured, not folklore)
 
@@ -265,8 +309,9 @@ ranges (`v.team.choice == "billing"`, `v.refund.probability > 0.9`), never exact
 
 ## Not in this release
 
-`synsema judge status`; static checking of option counts by `check` when the criteria are literals
-(today they are checked at run time before the call); `whether` with explicit yes/no criteria; the
-marked, non-calibrated `llm` fallback; the Cloudflare Workers AI wire variant; serving `decide` with
-the judge. Aliases and rate limits are the vendor's and move without notice — pin the model id when
-thresholds matter.
+A dedicated syntax for `whether` with explicit yes/no criteria (write the instruction as a map with
+the question and the two definitions; the model reads it as structure); a non-calibrated `llm`
+fallback that fakes probabilities (deliberately absent: an invented probability is the one thing this
+block never returns); the Cloudflare Workers AI wire variant (its payload is wrapped differently and
+was not verified). Aliases and rate limits are the vendor's and move without notice — pin the model
+id when thresholds matter.

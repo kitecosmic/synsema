@@ -357,9 +357,299 @@ fn levels_list(q: &JudgeQuestion) -> SynValue {
     syn_list(q.options.iter().map(|o| syn_text(o.id.as_str())).collect())
 }
 
+// ---- Rutas con backticks: el runtime posee el valor, así que puede verificarlas -----------
+
+/// Las rutas `` `a.b[0].c` `` mencionadas en una instrucción (texto, o cualquier texto dentro
+/// de un map/list). Sólo lo que tiene forma de ruta: identificadores separados por `.`, con
+/// índices `[n]` opcionales. Un backtick con espacios o símbolos adentro es una cita, no una ruta.
+pub fn backtick_paths(instruction: &SynValue) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_paths(instruction, &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn collect_paths(v: &SynValue, out: &mut Vec<String>) {
+    match v {
+        SynValue::Text(t) => {
+            let s: &str = t;
+            let mut rest = s;
+            while let Some(start) = rest.find('`') {
+                let after = &rest[start + 1..];
+                let Some(end) = after.find('`') else { break };
+                let candidate = &after[..end];
+                if looks_like_path(candidate) {
+                    out.push(candidate.to_string());
+                }
+                rest = &after[end + 1..];
+            }
+        }
+        SynValue::List(l) => l.borrow().iter().for_each(|x| collect_paths(x, out)),
+        SynValue::Map(m) => m.borrow().values().for_each(|x| collect_paths(x, out)),
+        _ => {}
+    }
+}
+
+fn looks_like_path(s: &str) -> bool {
+    if s.is_empty() || s.len() > 200 {
+        return false;
+    }
+    for seg in s.split('.') {
+        let (name, idx) = match seg.find('[') {
+            Some(i) => (&seg[..i], &seg[i..]),
+            None => (seg, ""),
+        };
+        let mut chars = name.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+        if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return false;
+        }
+        let mut rest = idx;
+        while !rest.is_empty() {
+            let Some(close) = rest.find(']') else { return false };
+            if !rest.starts_with('[') || !rest[1..close].chars().all(|c| c.is_ascii_digit()) || close == 1 {
+                return false;
+            }
+            rest = &rest[close + 1..];
+        }
+    }
+    true
+}
+
+/// `true` si la ruta existe en el valor (map por clave, list por índice).
+pub fn resolve_path(root: &SynValue, path: &str) -> bool {
+    let mut cur = root.clone();
+    for seg in path.split('.') {
+        let (name, idx) = match seg.find('[') {
+            Some(i) => (&seg[..i], &seg[i..]),
+            None => (seg, ""),
+        };
+        cur = match &cur {
+            SynValue::Map(m) => match m.borrow().get(name) {
+                Some(v) => v.clone(),
+                None => return false,
+            },
+            _ => return false,
+        };
+        let mut rest = idx;
+        while let Some(close) = rest.find(']') {
+            let n: usize = match rest[1..close].parse() {
+                Ok(n) => n,
+                Err(_) => return false,
+            };
+            cur = match &cur {
+                SynValue::List(l) => match l.borrow().get(n) {
+                    Some(v) => v.clone(),
+                    None => return false,
+                },
+                _ => return false,
+            };
+            rest = &rest[close + 1..];
+        }
+    }
+    true
+}
+
+/// Rutas con backticks de la instrucción que no existen ni en el `state` ni en la propia
+/// instrucción (cuando es un map, el idioma del vendor referencia sus claves). Se avisa antes de
+/// gastar la llamada: sobre un campo inexistente el modelo contestó 0,31, ni cero ni medio.
+pub fn missing_paths(state: &SynValue, instruction: &SynValue) -> Vec<String> {
+    backtick_paths(instruction)
+        .into_iter()
+        .filter(|p| !resolve_path(state, p) && !resolve_path(instruction, p))
+        .collect()
+}
+
+// ---- Chequeo estático (`synsema check`): cobrar los límites antes de correr ---------------
+
+/// Reglas de `check` sobre los bloques `judge` de un programa. Errores (`Err`, el check falla):
+/// lo que la API rechazaría o lo que es una pregunta vacía disfrazada — `state` literal que no es
+/// texto/map/list, instrucción literal vacía, y con criteria LITERALES los límites de
+/// [`validate_question`]. Avisos (`warnings`, nunca fallan): un `whether` en negativo, una
+/// instrucción que pide aritmética sobre el state, un `state` literal vacío, y dos bloques sobre el
+/// mismo `state` que podrían ser uno. Con criteria dinámicas los límites se cobran en runtime.
+pub fn check_program(
+    program: &crate::ast::Program,
+    file_path: &str,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    use crate::ast::{JudgeQuestionNode, Node, NodeKind};
+    let mut blocks: Vec<(&Node, &Node, &Vec<JudgeQuestionNode>)> = Vec::new();
+    for stmt in &program.statements {
+        crate::ast_api::walk(stmt, &mut |n| {
+            if let NodeKind::JudgeExpression { state, questions } = &n.kind {
+                blocks.push((n, state.as_ref(), questions));
+            }
+        });
+    }
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    let at = |line: usize| format!("{}:{}", file_path, line);
+    let mut by_state: Vec<(String, Vec<usize>)> = Vec::new();
+    for (node, state, questions) in &blocks {
+        let line = node.location.line;
+        match &state.kind {
+            NodeKind::NumberLiteral { .. } | NodeKind::BoolLiteral { .. } | NodeKind::NothingLiteral => {
+                return Err(format!(
+                    "{}: judge: the state must be a text, a map or a list; a literal {} is not something the model can read",
+                    at(line),
+                    match &state.kind {
+                        NodeKind::NumberLiteral { .. } => "number",
+                        NodeKind::BoolLiteral { .. } => "bool",
+                        _ => "nothing",
+                    }
+                ));
+            }
+            NodeKind::TextLiteral { value } if value.trim().is_empty() => warnings.push(format!(
+                "{}: warning: judge over an empty state — the model answers about 0.5 to everything; pass the data you want judged",
+                at(line)
+            )),
+            NodeKind::Identifier { name } => match by_state.iter_mut().find(|(n, _)| n == name) {
+                Some((_, lines)) => lines.push(line),
+                None => by_state.push((name.clone(), vec![line])),
+            },
+            _ => {}
+        }
+        for qn in questions.iter() {
+            let qline = qn.loc.line;
+            let instruction = match &qn.instruction.kind {
+                NodeKind::TextLiteral { value } => {
+                    if value.trim().is_empty() {
+                        return Err(format!(
+                            "{}: judge '{}': the instruction is empty",
+                            at(qline),
+                            qn.id
+                        ));
+                    }
+                    Some(value.clone())
+                }
+                _ => None,
+            };
+            let options: Option<Vec<JudgeOption>> = match qn.criteria.as_deref().map(|c| &c.kind) {
+                Some(NodeKind::ListLiteral { elements }) => elements
+                    .iter()
+                    .map(|e| match &e.kind {
+                        NodeKind::TextLiteral { value } => Some(JudgeOption { id: value.clone(), description: None }),
+                        NodeKind::NumberLiteral { value } => {
+                            Some(JudgeOption { id: value.to_string(), description: None })
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+                Some(NodeKind::MapLiteral { pairs }) => pairs
+                    .iter()
+                    .map(|(k, _)| match &k.kind {
+                        NodeKind::TextLiteral { value } => Some(JudgeOption { id: value.clone(), description: None }),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => None,
+            };
+            if let Some(options) = options {
+                let q = JudgeQuestion {
+                    id: qn.id.clone(),
+                    kind: qn.kind,
+                    instruction: Json::String(instruction.clone().unwrap_or_else(|| "?".to_string())),
+                    options,
+                    escape: qn.escape,
+                    yes_no: None,
+                };
+                validate_question(&q).map_err(|m| format!("{}: {}", at(qline), m))?;
+            }
+            if let Some(text) = instruction {
+                let lower = text.to_ascii_lowercase();
+                if qn.kind == JudgeKind::Whether && is_negated(&lower) {
+                    warnings.push(format!(
+                        "{}: warning: judge '{}' asks in the negative — the model reads negations literally and P(not A) is not 1 − P(A) (measured 0.37 + 0.78); ask in the positive and negate in code",
+                        at(qline),
+                        qn.id
+                    ));
+                }
+                if asks_arithmetic(&lower) {
+                    warnings.push(format!(
+                        "{}: warning: judge '{}' asks for arithmetic or counting over the state — the model recognises the shape of an answer, it does not calculate (a six-line total came out wrong at 0.32); compute in Synsema and judge the result",
+                        at(qline),
+                        qn.id
+                    ));
+                }
+            }
+        }
+    }
+    for (name, lines) in by_state {
+        if lines.len() > 1 {
+            let ls: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+            warnings.push(format!(
+                "{}: warning: `judge {}` appears {} times (lines {}) — the same state can carry all the questions in one block, one call: batching is where the cost and the latency go",
+                at(lines[0]),
+                name,
+                lines.len(),
+                ls.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_negated(lower: &str) -> bool {
+    let padded = format!(" {} ", lower.replace(['?', '.', ',', '!'], " "));
+    padded.contains(" not ")
+        || padded.contains("n't ")
+        || padded.contains(" never ")
+        || padded.contains(" without ")
+        || padded.contains(" free of ")
+        || padded.contains(" no longer ")
+}
+
+fn asks_arithmetic(lower: &str) -> bool {
+    let has_digit = lower.chars().any(|c| c.is_ascii_digit());
+    let padded = format!(" {} ", lower.replace(['?', '.', ',', '!'], " "));
+    let counting = padded.contains(" how many ") || padded.contains(" count of ") || padded.contains(" number of ");
+    let arith = [" total ", " sum ", " sum of ", " average ", " mean of ", " exceeds ", " exceed ", " greater than ", " less than ", " more than ", " fewer than ", " at least ", " at most "]
+        .iter()
+        .any(|w| padded.contains(w));
+    counting || (arith && has_digit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backtick_paths_are_extracted_and_resolved() {
+        let mut inner = IndexMap::new();
+        inner.insert("text".to_string(), syn_text("hi"));
+        let msgs = syn_list(vec![syn_map(inner)]);
+        let mut ticket = IndexMap::new();
+        ticket.insert("messages".to_string(), msgs);
+        let mut state = IndexMap::new();
+        state.insert("ticket".to_string(), syn_map(ticket));
+        let state = syn_map(state);
+        let instr = syn_text("Does `ticket.messages[0].text` ask for a refund? Compare with `ticket.priority` and `not a path`.");
+        assert_eq!(backtick_paths(&instr), vec!["ticket.messages[0].text", "ticket.priority"]);
+        assert!(resolve_path(&state, "ticket.messages[0].text"));
+        assert!(!resolve_path(&state, "ticket.messages[1].text"));
+        assert_eq!(missing_paths(&state, &instr), vec!["ticket.priority"]);
+        // una clave de la propia instrucción (map) cuenta como existente
+        let mut im = IndexMap::new();
+        im.insert("question".to_string(), syn_text("Same person as `record`?"));
+        im.insert("record".to_string(), syn_text("Ana"));
+        assert!(missing_paths(&state, &syn_map(im)).is_empty());
+    }
+
+    #[test]
+    fn lint_heuristics() {
+        assert!(is_negated("the message does not mention a refund"));
+        assert!(is_negated("is the text free of personal data?"));
+        assert!(!is_negated("the customer is asking for money back"));
+        assert!(asks_arithmetic("the order total exceeds 100 usd"));
+        assert!(asks_arithmetic("how many messages are there?"));
+        assert!(!asks_arithmetic("the customer mentions a total outage"));
+    }
 
     fn q(kind: JudgeKind, ids: &[&str]) -> JudgeQuestion {
         JudgeQuestion {

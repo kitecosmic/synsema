@@ -878,6 +878,10 @@ fn check_program_static_inner(
         load: ModuleLoader<'_>,
     ) -> Result<(), String> {
         use crate::ast::NodeKind as NK;
+        // v0.6.26 — bloques `judge`: los límites de la API con criteria literales, el state
+        // literal inválido y la instrucción vacía FALLAN el check (un 400 en producción evitado);
+        // negaciones, aritmética, state vacío y bloques batcheables son avisos.
+        crate::judge::check_program(program, file_path, warnings)?;
         // v0.6.20 — AVISOS (no errores): lo que corre pero sorprende.
         // (a) `export routes <n>` o `let <n>` de nivel superior que repite un alias de `use`:
         //     dentro de las rutas del grupo, `<n>.algo` resuelve al grupo, no al módulo.

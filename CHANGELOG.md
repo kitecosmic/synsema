@@ -6,6 +6,37 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.26 — 2026-09-20
+
+No breaking changes to programs. `synsema check` is stricter on `judge` blocks: see below.
+
+### Added
+
+- **`synsema check` fails on a `judge` block the API would reject.** With literal criteria: fewer than
+  2 options or levels (the API accepts one and answers with confidence 1.0 — an empty answer dressed
+  as certainty), more than 255 options or 10 levels, duplicate option or level ids; also an empty
+  literal instruction and a literal `state` that is a number, a bool or `nothing`. These were a 400
+  in production or a fake certainty; they are a check error now. Dynamic criteria keep the run-time
+  check before the call.
+- **`synsema check` warns**, never fails, on a `whether` phrased in the negative (P(not A) is not
+  1 − P(A): measured 0.37 + 0.78), on an instruction that asks for arithmetic or counting over the
+  state (the model recognises the shape of an answer, it does not calculate), on an empty literal
+  state, and on the same `judge <variable>` appearing in more than one block (one call would do).
+- **Backticked paths are verified against the state before the call.** `` `ticket.messages[0].text` ``
+  is the vendor's idiom and it points at the exact element; a path the state does not have gets a
+  warning with the fix — including the common trap of `judge ticket` with `` `ticket.x` `` in the
+  question, where the model sees the value and not the variable name.
+- **`synsema judge status [--json]`**: the resolved configuration of the judge slot with the source
+  of each value — provider, key presence (never the value), model, base URL, timeout, budget, whether
+  `decide` is served by the judge — and, when offline, one line that names what is missing. Exit 0
+  live, 1 offline. Same `--env-file` / `--no-env-file` as the rest.
+- **`SYNSEMA_JUDGE_DECIDE=1`: `decide` served by the judge.** Every `decide between […] given X`
+  becomes one calibrated `choose`: one of your options byte-for-byte, no normalisation, no retry,
+  cheaper and faster than a chat model, with no change to the program. Opt-in and off by default
+  because it changes which model answers; it needs the `judge` capability (under `serve` a `decide`
+  without `require judge` fails naming the knob); when the judge is unavailable the `decide` falls
+  back to the LLM path. Verified live. Written by `synsema init` into `.env.example`.
+
 ## v0.6.25 — 2026-09-20
 
 No breaking changes. Programs that load on v0.6.24 load unchanged.

@@ -1740,7 +1740,7 @@ pub(crate) fn resolve_knob(name: &str, store: &EnvStore) -> Option<String> {
 /// Como [`resolve_knob`] pero además dice DE DÓNDE salió el valor (para el reporte de
 /// `synsema llm status`). Única implementación de la precedencia — `resolve_knob`
 /// delega acá, así el reporte no puede divergir de la resolución real.
-fn resolve_knob_src(name: &str, store: &EnvStore) -> Option<(String, KnobSource)> {
+pub(crate) fn resolve_knob_src(name: &str, store: &EnvStore) -> Option<(String, KnobSource)> {
     match std::env::var(name) {
         Ok(v) if !v.trim().is_empty() => Some((v, KnobSource::Environ)),
         _ => store

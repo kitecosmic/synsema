@@ -34,8 +34,105 @@ pub const JUDGE_ENV_VARS: &[&str] = &[
     "SYNSEMA_JUDGE_BASE_URL",
     "SYNSEMA_JUDGE_TIMEOUT",
     "SYNSEMA_JUDGE_BUDGET",
+    "SYNSEMA_JUDGE_DECIDE",
     "TYPESAFE_API_KEY",
 ];
+
+/// `SYNSEMA_JUDGE_DECIDE=1|true|yes|on`: `decide between […] given X` se sirve con el juez.
+pub fn decide_via_judge(store: &EnvStore) -> bool {
+    resolve_knob("SYNSEMA_JUDGE_DECIDE", store).map(|v| truthy(&v)).unwrap_or(false)
+}
+
+fn truthy(v: &str) -> bool {
+    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+// ---- `synsema judge status`: la configuración resuelta, con la fuente de cada valor ----------
+
+/// Reporte para `synsema judge status`. Nunca transporta el valor de la clave, sólo su presencia.
+#[derive(Debug, Clone)]
+pub struct JudgeConfigReport {
+    /// `typesafe` | `mock` | "" (ninguno).
+    pub provider: String,
+    pub selection: crate::llm_providers::ProviderSelection,
+    /// Presencia de `TYPESAFE_API_KEY` (None = falta). Nunca el valor.
+    pub key_present: Option<crate::llm_providers::KnobSource>,
+    pub model: crate::llm_providers::KnobReport,
+    pub base_url: crate::llm_providers::KnobReport,
+    pub timeout_secs: crate::llm_providers::KnobReport,
+    /// `""` sin techo.
+    pub budget: crate::llm_providers::KnobReport,
+    pub decide_via_judge: bool,
+    /// `None` = vivo. `Some(razón)` = offline, en una frase que dice qué falta.
+    pub offline: Option<String>,
+}
+
+impl JudgeConfigReport {
+    pub fn to_json(&self) -> String {
+        use crate::llm_providers::ProviderSelection;
+        let knob = |k: &crate::llm_providers::KnobReport| {
+            serde_json::json!({ "value": k.value, "source": k.source.label() })
+        };
+        let selection = match &self.selection {
+            ProviderSelection::Forced(src) => serde_json::json!({ "mode": "forced", "source": src.label() }),
+            ProviderSelection::Auto => serde_json::json!({ "mode": "auto" }),
+            ProviderSelection::None => serde_json::json!({ "mode": "none" }),
+        };
+        serde_json::json!({
+            "provider": self.provider,
+            "selection": selection,
+            "key_var": "TYPESAFE_API_KEY",
+            "key_present": self.key_present.map(|s| s.label()),
+            "model": knob(&self.model),
+            "base_url": knob(&self.base_url),
+            "timeout_secs": knob(&self.timeout_secs),
+            "budget": knob(&self.budget),
+            "decide_via_judge": self.decide_via_judge,
+            "offline": self.offline,
+            "alive": self.offline.is_none(),
+        })
+        .to_string()
+    }
+}
+
+pub fn judge_config_report(store: &EnvStore) -> JudgeConfigReport {
+    use crate::llm_providers::{resolve_knob_src, KnobReport, KnobSource, ProviderSelection};
+    let knob = |name: &str, default: &str| match resolve_knob_src(name, store) {
+        Some((v, src)) => KnobReport { value: v.trim().to_string(), source: src },
+        None => KnobReport { value: default.to_string(), source: KnobSource::Default },
+    };
+    let key_present = resolve_knob_src("TYPESAFE_API_KEY", store).map(|(_, src)| src);
+    let forced = resolve_knob_src("SYNSEMA_JUDGE_PROVIDER", store);
+    let (provider, selection) = match &forced {
+        Some((p, src)) => (p.trim().to_ascii_lowercase(), ProviderSelection::Forced(*src)),
+        None if key_present.is_some() => ("typesafe".to_string(), ProviderSelection::Auto),
+        None => (String::new(), ProviderSelection::None),
+    };
+    let offline = match provider.as_str() {
+        "typesafe" if key_present.is_none() => Some(
+            "SYNSEMA_JUDGE_PROVIDER=typesafe but TYPESAFE_API_KEY is missing — set it in the process environment or in the .env file".to_string(),
+        ),
+        "typesafe" | "mock" => None,
+        "" => Some(
+            "no judge provider: set TYPESAFE_API_KEY (auto-selects typesafe) or SYNSEMA_JUDGE_PROVIDER=mock for tests".to_string(),
+        ),
+        other => Some(format!(
+            "SYNSEMA_JUDGE_PROVIDER='{}' is not a judge provider (typesafe | mock)",
+            other
+        )),
+    };
+    JudgeConfigReport {
+        provider,
+        selection,
+        key_present,
+        model: knob("SYNSEMA_JUDGE_MODEL", DEFAULT_MODEL),
+        base_url: knob("SYNSEMA_JUDGE_BASE_URL", DEFAULT_BASE_URL),
+        timeout_secs: knob("SYNSEMA_JUDGE_TIMEOUT", &DEFAULT_TIMEOUT_SECS.to_string()),
+        budget: knob("SYNSEMA_JUDGE_BUDGET", ""),
+        decide_via_judge: decide_via_judge(store),
+        offline,
+    }
+}
 
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 pub const DEFAULT_MODEL: &str = "jev-latest";
@@ -580,6 +677,16 @@ mod tests {
         let pyd = r#"{"detail":[{"type":"missing","loc":["body","model"],"msg":"Field required"}]}"#;
         assert!(error_message(422, pyd).contains("body.model: Field required"));
         assert!(error_message(500, "<html>oops</html>").contains("<html>oops</html>"));
+    }
+
+    #[test]
+    fn decide_knob_is_truthy_on_the_usual_spellings() {
+        for v in ["1", "true", "YES", " on "] {
+            assert!(truthy(v), "{}", v);
+        }
+        for v in ["0", "false", "", "off", "maybe"] {
+            assert!(!truthy(v), "{}", v);
+        }
     }
 
     #[test]

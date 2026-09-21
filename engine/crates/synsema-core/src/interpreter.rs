@@ -542,6 +542,31 @@ fn first_time(flag: &std::sync::atomic::AtomicBool) -> bool {
 static JUDGE_OFFLINE_NOTICED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+static JUDGE_PATHS_WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+/// Aviso (una vez por ruta y pregunta en el proceso) de una ruta con backticks que la
+/// instrucción menciona y el `state` no tiene. Sobre un campo inexistente el modelo contestó
+/// 0,31 — ni cero ni medio — así que vale más avisar antes de gastar la llamada.
+fn note_judge_missing_path(qid: &str, path: &str, var_hint: Option<&str>, loc: &SourceLocation) {
+    let key = format!("{}\u{0}{}", qid, path);
+    let set = JUDGE_PATHS_WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let first = set.lock().map(|mut s| s.insert(key)).unwrap_or(true);
+    if first {
+        let fix = match var_hint {
+            Some(var) => format!(
+                "the model sees the value of `{v}`, not its name — pass `judge {{\"{v}\": {v}}}` if the question should say `{v}.…`, or drop the `{v}.` prefix",
+                v = var
+            ),
+            None => "fix the path or add the field to the state".to_string(),
+        };
+        eprintln!(
+            "[synsema] warning: {}:{}: judge '{}' refers to `{}` but the state has no such path — the model will answer about a field it cannot see; {}",
+            loc.file, loc.line, qid, path, fix
+        );
+    }
+}
+
 fn note_judge_offline() {
     if first_time(&JUDGE_OFFLINE_NOTICED) {
         // En INGLÉS y auto-contenido, como el aviso LLM: lo leen humanos y agentes.
@@ -663,6 +688,9 @@ pub struct Interpreter {
     judge_model_callback: Option<Rc<dyn Fn() -> Option<String>>>,
     /// Gate de la capability `judge` (propia: no la concede `llm`). Lo cablea el motor.
     judge_cap_hook: Option<Rc<dyn Fn() -> Result<(), String>>>,
+    /// `SYNSEMA_JUDGE_DECIDE=1`: `decide between […] given X` se sirve con el juez (una pregunta
+    /// `choose`) en vez del LLM. Opt-in del host; sin provider de judge cae al camino LLM.
+    decide_via_judge: bool,
     /// Hook de `serve on PORT` (lo cablea el motor en el camino de serve).
     serve_hook: Option<ServeHook>,
     /// Sink de `send` dentro de un handler de stream SSE (lo cablea el motor por
@@ -857,6 +885,7 @@ impl Interpreter {
             judge_usage_callback: None,
             judge_model_callback: None,
             judge_cap_hook: None,
+            decide_via_judge: false,
             serve_hook: None,
             stream_emit: None,
             log_hook: None,
@@ -1858,6 +1887,58 @@ impl Interpreter {
             hook().map_err(|m| Control::Error(RuntimeError::new(m)))?;
         }
         Ok(())
+    }
+
+    /// `SYNSEMA_JUDGE_DECIDE`: servir `decide` con el juez. Lo activa el motor sólo con un
+    /// provider de judge cableado.
+    pub fn set_decide_via_judge(&mut self, on: bool) {
+        self.decide_via_judge = on;
+    }
+
+    /// `decide between […] given X` como una pregunta `choose` al juez. `Ok(None)` = no aplica
+    /// o no disponible (el llamador sigue por el camino LLM); `Ok(Some(t))` = la opción elegida,
+    /// una de las del programa byte a byte.
+    fn decide_with_judge(
+        &self,
+        opts: &SynValue,
+        giv: &SynValue,
+        loc: &SourceLocation,
+    ) -> Result<Option<SynValue>, Control> {
+        use crate::judge::{syn_to_json, JudgeAnswer, JudgeKind, JudgeOption, JudgeQuestion, JudgeRequest, MAX_OPTIONS};
+        let Some(cb) = self.judge_callback.clone() else { return Ok(None) };
+        let SynValue::List(l) = opts else { return Ok(None) };
+        let ids: Vec<String> = l.borrow().iter().map(|v| v.to_string()).collect();
+        if ids.len() < 2 || ids.len() > MAX_OPTIONS {
+            return Ok(None);
+        }
+        if let Some(hook) = &self.judge_cap_hook {
+            if let Err(m) = hook() {
+                return Err(err_at(
+                    format!(
+                        "{} — this `decide` is served by the judge because SYNSEMA_JUDGE_DECIDE is set; add `require judge` (or unset the knob)",
+                        m
+                    ),
+                    loc,
+                ));
+            }
+        }
+        let q = JudgeQuestion {
+            id: "decision".to_string(),
+            kind: JudgeKind::Choose,
+            instruction: serde_json::json!("Which of the options applies to the state?"),
+            options: ids.iter().map(|id| JudgeOption { id: id.clone(), description: None }).collect(),
+            escape: false,
+            yes_no: None,
+        };
+        let req = JudgeRequest { state: syn_to_json(giv), questions: vec![q] };
+        match cb(&req) {
+            Ok(Some(resp)) => match resp.answers.first() {
+                Some(JudgeAnswer::Choose { choice: Some(c), .. }) => Ok(Some(syn_text(c.as_str()))),
+                _ => Ok(None),
+            },
+            Ok(None) => Ok(None),
+            Err(m) => Err(err_at(m, loc)),
+        }
     }
 
     /// Chequea la capability `llm` (si hay gate). Se llama al inicio de cada op LLM,
@@ -4115,6 +4196,14 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 if self.labels {
                     self.sink_check("decide", &[&opts, &giv], loc)?;
                 }
+                // v0.6.26 — `SYNSEMA_JUDGE_DECIDE`: el juez contesta con una de TUS opciones,
+                // calibrado y sin normalización ni reintento. Si no aplica o no está disponible,
+                // sigue el camino LLM de siempre.
+                if self.decide_via_judge {
+                    if let Some(chosen) = self.decide_with_judge(&opts, &giv, loc)? {
+                        return Ok(chosen);
+                    }
+                }
                 let prompt = format!("Decide between {} given {}", opts, giv);
                 // Camino dedicado (DE-039): las opciones viajan ESTRUCTURADAS al motor,
                 // que fuerza la elección por tool/enum + normaliza + reintenta. Sólo si
@@ -4172,6 +4261,22 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         yes_no: None,
                     };
                     validate_question(&q).map_err(|m| err_at(m, &qn.loc))?;
+                    // Rutas con backticks que no existen en el state (ni en la instrucción):
+                    // aviso una vez por ruta antes de gastar la llamada. Un SDK no puede; el
+                    // runtime tiene el valor en la mano.
+                    for path in crate::judge::missing_paths(&st, &instr) {
+                        // La trampa más común: `judge ticket` con `` `ticket.x` `` en la
+                        // pregunta. El modelo ve el VALOR, no el nombre de la variable.
+                        let var_hint = match &state.kind {
+                            NodeKind::Identifier { name }
+                                if path == *name || path.starts_with(&format!("{}.", name)) || path.starts_with(&format!("{}[", name)) =>
+                            {
+                                Some(name.as_str())
+                            }
+                            _ => None,
+                        };
+                        note_judge_missing_path(&qn.id, &path, var_hint, &qn.loc);
+                    }
                     crossing.push(instr);
                     qs.push(q);
                 }

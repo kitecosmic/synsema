@@ -546,3 +546,13 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 - **`judge[0]` suddenly "expected an indented block"** — it cannot; `[` never opens `judge`. If you
   see that error, `judge` is followed by an identifier, string, `{` or literal on the same line and
   the block is missing or badly indented.
+- **`warning: judge 'x' refers to `ticket.text` but the state has no such path`** (v0.6.26+) — you
+  wrote `judge ticket` and the question says `` `ticket.text` ``. The model sees the *value* of
+  `ticket`, not its name. Write `judge {"ticket": ticket}` or drop the `ticket.` prefix; the warning
+  says which.
+- **`synsema check` now fails on a `judge` block that used to run** (v0.6.26+) — literal criteria with
+  1 option, 11 levels or a duplicate id, an empty instruction, or a numeric literal state. Those were
+  a 400 or a fake certainty at run time; `check` catches them first. Warnings (negative `whether`,
+  arithmetic, two blocks over the same state) never change the exit code.
+- **`decide` says `Capability not granted: judge … SYNSEMA_JUDGE_DECIDE is set`** — the host serves
+  `decide` with the judge; under `serve` add `require judge`, or unset the knob.

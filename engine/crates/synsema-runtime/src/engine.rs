@@ -899,6 +899,12 @@ pub(crate) fn wire_real_judge_provider(interp: &mut Interpreter) {
     interp.set_judge_usage_callback(Rc::new(crate::judge_provider::judge_tokens_total));
     interp.set_judge_model_callback(Rc::new(crate::judge_provider::judge_last_model));
     interp.set_judge_callback(Rc::new(move |req| provider.judge_for_interpreter(req)));
+    // v0.6.26 — `SYNSEMA_JUDGE_DECIDE=1`: `decide between […] given X` se sirve con el juez
+    // (una pregunta `choose`), calibrado y sin normalización ni reintento. Opt-in del host:
+    // cambia qué modelo contesta. Sólo con provider de judge cableado (arriba).
+    if crate::judge_provider::decide_via_judge(&store) {
+        interp.set_decide_via_judge(true);
+    }
 }
 
 pub(crate) fn wire_real_llm_provider(interp: &mut Interpreter) {

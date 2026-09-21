@@ -57,6 +57,8 @@ otherwise: auto-granted in plain `run`/`conform`, required under `serve` and in 
 (`Capability not granted: judge`), emptied inside `sandbox`, denied under `--deterministic` (network
 I/O), always offline in a wasm guest. Coarse, no scope: the host is fixed by the runtime
 (`SYNSEMA_JUDGE_BASE_URL`), never by the program. `--cap-set judge` = may judge, may not call the LLM.
+With `SYNSEMA_JUDGE_DECIDE=1` (v0.6.26+) every `decide` is served by the judge and therefore needs
+this capability too — under `serve`, a `decide` without `require judge` fails naming the knob.
 
 ## The `llm` capability
 

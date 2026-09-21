@@ -389,6 +389,117 @@ fn map_form_levels_carry_ids_and_descriptions() {
     assert_eq!(w.output, ["upset", "0.7", "upset"]);
 }
 
+// ---- `synsema check`: los límites antes de correr, y los avisos ---------------------------
+
+fn check(src: &str) -> Result<Vec<String>, String> {
+    let program = parse_source(src, "<test>").unwrap_or_else(|e| panic!("parse: {:?}", e));
+    let load = |_resolved: &str, raw: &str| -> Result<synsema_core::ast::Program, String> {
+        Err(format!("module not found: {}", raw))
+    };
+    synsema_core::templates::check_program_static_with_warnings(&program, "<test>", &load)
+        .map(|(_counts, warnings)| warnings)
+}
+
+#[test]
+fn check_fails_on_literal_limits_before_any_call() {
+    let e = check("let v be judge \"x\"\n    a: choose \"Which?\" between {\"only\": \"One\"}\n").unwrap_err();
+    assert!(e.contains("at least 2") && e.contains("<test>:2"), "{}", e);
+    let e = check(
+        "let v be judge \"x\"\n    a: rate \"How?\" across [\"a\", \"b\", \"c\", \"d\", \"e\", \"f\", \"g\", \"h\", \"i\", \"j\", \"k\"]\n",
+    )
+    .unwrap_err();
+    assert!(e.contains("at most 10"), "{}", e);
+    let e = check("let v be judge \"x\"\n    a: rate \"How?\" across [\"Calm\", \"Calm\", \"Angry\"]\n").unwrap_err();
+    assert!(e.contains("declared twice"), "{}", e);
+    let e = check("let v be judge 42\n    a: whether \"Is it big?\"\n").unwrap_err();
+    assert!(e.contains("literal number"), "{}", e);
+    let e = check("let v be judge \"x\"\n    a: whether \"   \"\n").unwrap_err();
+    assert!(e.contains("instruction is empty"), "{}", e);
+}
+
+#[test]
+fn check_warns_on_negation_arithmetic_empty_state_and_batchable_blocks() {
+    let w = check(
+        "let ticket be \"x\"\nlet a be judge ticket\n    pii: whether \"Is the message free of personal data?\"\n\
+         let b be judge ticket\n    big: whether \"The order total exceeds 100 USD\"\nlet c be judge \"\"\n    q: whether \"Is it?\"\n",
+    )
+    .unwrap();
+    assert!(w.iter().any(|m| m.contains("negative") && m.contains("'pii'")), "{:?}", w);
+    assert!(w.iter().any(|m| m.contains("arithmetic") && m.contains("'big'")), "{:?}", w);
+    assert!(w.iter().any(|m| m.contains("empty state")), "{:?}", w);
+    assert!(w.iter().any(|m| m.contains("`judge ticket` appears 2 times")), "{:?}", w);
+}
+
+#[test]
+fn check_is_quiet_on_a_clean_block_and_dynamic_criteria() {
+    let w = check(&format!("{}print(1)\n", BLOCK)).unwrap();
+    assert!(w.is_empty(), "{:?}", w);
+    // criteria dinámicas: nada que cobrar en estático (se cobra en runtime)
+    let w = check("let opts be {\"only\": \"One\"}\nlet v be judge \"x\"\n    a: choose \"Which?\" between opts\n").unwrap();
+    assert!(w.is_empty(), "{:?}", w);
+}
+
+// ---- `decide` servido por el juez (SYNSEMA_JUDGE_DECIDE) ---------------------------------
+
+#[test]
+fn decide_via_judge_returns_the_chosen_option_and_asks_a_choose() {
+    let src = "let d be decide between [\"alpha\", \"beta\"] given {\"speed\": \"matters\"}\nprint(d)\n";
+    let out = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || {
+            let program = parse_source(src, "<test>").unwrap();
+            let mut interp = Interpreter::new();
+            let seen: Rc<RefCell<Vec<JudgeRequest>>> = Rc::new(RefCell::new(Vec::new()));
+            let seen2 = seen.clone();
+            interp.set_judge_callback(Rc::new(move |req| {
+                seen2.borrow_mut().push(req.clone());
+                Ok(Some(JudgeResponse {
+                    answers: vec![JudgeAnswer::Choose {
+                        choice: Some("beta".into()),
+                        probabilities: vec![("alpha".into(), 0.2), ("beta".into(), 0.8)],
+                        confidence: 0.6,
+                    }],
+                    model: "m".into(),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                }))
+            }));
+            interp.set_decide_via_judge(true);
+            interp.execute(&program).map_err(|_| "error").unwrap();
+            let reqs = seen.borrow().clone();
+            (std::mem::take(&mut interp.output), reqs)
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(out.0, ["beta"]);
+    assert_eq!(out.1.len(), 1);
+    let q = &out.1[0].questions[0];
+    assert_eq!(q.kind, JudgeKind::Choose);
+    let ids: Vec<&str> = q.options.iter().map(|o| o.id.as_str()).collect();
+    assert_eq!(ids, ["alpha", "beta"]);
+    assert_eq!(out.1[0].state["speed"], "matters", "el `given` viaja como state");
+}
+
+#[test]
+fn decide_via_judge_falls_back_to_the_llm_path_when_unavailable() {
+    let src = "let d be decide between [\"alpha\", \"beta\"] given \"x\"\nprint(d)\n";
+    let out = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || {
+            let program = parse_source(src, "<test>").unwrap();
+            let mut interp = Interpreter::new();
+            interp.set_judge_callback(Rc::new(|_| Ok(None)));
+            interp.set_decide_via_judge(true);
+            interp.execute(&program).map_err(|_| "error").unwrap();
+            std::mem::take(&mut interp.output)
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(out, ["[decision pending]"], "sin juez disponible sigue el camino LLM (offline: placeholder)");
+}
+
 #[test]
 fn instruction_can_be_a_structured_map() {
     fn check(req: &JudgeRequest) -> Result<Option<JudgeResponse>, String> {

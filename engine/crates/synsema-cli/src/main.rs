@@ -486,6 +486,7 @@ fn main() -> ExitCode {
         Some("daemon") => cmd_daemon(&args),
         Some("init") => cmd_init(&args),
         Some("llm") => cmd_llm(&args),
+        Some("judge") => cmd_judge(&args),
         Some("update") => update::cmd_update(),
         Some("version") | Some("--version") | Some("-V") => {
             println!("Synsema {}", update::current_version());
@@ -746,6 +747,7 @@ fn cmd_init(args: &[String]) -> ExitCode {
         println!("  synsema run {}hello.syn      # correlo (funciona sin LLM)", prefix);
         println!("  synsema test {}hello.syn     # corré su test", prefix);
         println!("  synsema llm status           # conectá un provider (copiá .env.example a .env)");
+        println!("  synsema judge status         # el slot `judge` (System One): provider, clave presente, knobs");
     }
     ExitCode::SUCCESS
 }
@@ -809,6 +811,95 @@ fn synsema_binaries_in_path() -> Vec<std::path::PathBuf> {
         }
     }
     seen
+}
+
+/// `synsema judge status [--json]` — la configuración del slot `judge` (System One) RESUELTA,
+/// con la fuente de cada valor. Nunca la clave: sólo su presencia. No hace red.
+/// Exit: 0 = vivo, 1 = offline, 2 = uso.
+fn cmd_judge(args: &[String]) -> ExitCode {
+    let args: Vec<String> = match take_host_flags("judge", &args[2..]) {
+        Ok(h) => std::iter::once(args[0].clone()).chain(std::iter::once(args[1].clone())).chain(h.rest).collect(),
+        Err(code) => return code,
+    };
+    match args.get(2).map(String::as_str) {
+        Some("status") => cmd_judge_status(args.iter().any(|a| a == "--json")),
+        _ => {
+            eprintln!("uso: synsema judge status [--json] [--env-file <path> | --no-env-file]");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn cmd_judge_status(json: bool) -> ExitCode {
+    use synsema_runtime::judge_provider::judge_config_report;
+    use synsema_runtime::llm_providers::ProviderSelection;
+    use synsema_stdlib::secrets::EnvStore;
+
+    let store = EnvStore::load_default();
+    let report = judge_config_report(&store);
+    if json {
+        println!("{}", report.to_json());
+        return if report.offline.is_none() { ExitCode::SUCCESS } else { ExitCode::from(1) };
+    }
+
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    println!("Synsema {} — {}", update::current_version(), exe);
+    match effective_env_file() {
+        Some(p) => println!(".env: {}", p),
+        None => println!(".env: (ninguno — solo environ del proceso y defaults)"),
+    }
+    println!();
+
+    let sel = match &report.selection {
+        ProviderSelection::Forced(src) => format!("(SYNSEMA_JUDGE_PROVIDER, {})", src.label()),
+        ProviderSelection::Auto => "(auto, por presencia de TYPESAFE_API_KEY)".to_string(),
+        ProviderSelection::None => String::new(),
+    };
+    if !report.provider.is_empty() {
+        println!("Provider    {:<28} {}", report.provider, sel);
+    }
+    match report.key_present {
+        Some(src) => println!("Key         {:<28} ✓ presente ({})", "TYPESAFE_API_KEY", src.label()),
+        None => println!("Key         {:<28} ✗ FALTA", "TYPESAFE_API_KEY"),
+    }
+    if report.provider != "mock" {
+        println!("Model       {:<28} (SYNSEMA_JUDGE_MODEL, {})", report.model.value, report.model.source.label());
+        println!("Base URL    {:<28} (SYNSEMA_JUDGE_BASE_URL, {})", report.base_url.value, report.base_url.source.label());
+        println!(
+            "Timeout     {:<28} (SYNSEMA_JUDGE_TIMEOUT, {})",
+            format!("{}s", report.timeout_secs.value),
+            report.timeout_secs.source.label()
+        );
+    }
+    let budget = if report.budget.value.is_empty() {
+        "(sin techo)".to_string()
+    } else {
+        format!("{} tokens de entrada", report.budget.value)
+    };
+    println!("Budget      {:<28} (SYNSEMA_JUDGE_BUDGET, {})", budget, report.budget.source.label());
+    println!(
+        "decide      {:<28} (SYNSEMA_JUDGE_DECIDE)",
+        if report.decide_via_judge { "servido por el juez" } else { "LLM (default)" }
+    );
+    println!();
+
+    match &report.offline {
+        None => {
+            if report.provider == "mock" {
+                println!("Estado: ✅ VIVO — los bloques `judge` van al mock determinista (sin red; tests y demos).");
+            } else {
+                println!("Estado: ✅ VIVO — los bloques `judge` van a un modelo System One real.");
+            }
+            ExitCode::SUCCESS
+        }
+        Some(reason) => {
+            println!("Estado: ⚠️  OFFLINE — cada respuesta de `judge` vuelve con available: false y confianza 0.");
+            println!("  {}", reason);
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn cmd_llm_status(json: bool) -> ExitCode {

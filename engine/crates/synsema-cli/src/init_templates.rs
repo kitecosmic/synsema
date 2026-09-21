@@ -172,6 +172,9 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # Presupuesto DURO de tokens de ENTRADA de judge por proceso (la salida es gratis). Al
 # llegar, las respuestas degradan a available: false sin tocar la red; judge_usage() lo cuenta:
 # SYNSEMA_JUDGE_BUDGET=
+# Servir `decide between [...] given X` con el juez (una pregunta choose calibrada) en vez del
+# LLM. Opt-in: cambia que modelo contesta, y bajo serve exige `require judge`:
+# SYNSEMA_JUDGE_DECIDE=1
 
 # ══ Techos del host — dinero y firmas (el programa NO puede subirlos) ══
 
@@ -358,6 +361,8 @@ const HELLO_SYN_PAST: &[&str] = &[
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
 const ENV_EXAMPLE_PAST: &[&str] = &[
+    // V0.6.26 (2026-09-20): antes de SYNSEMA_JUDGE_DECIDE en la seccion "Judge (System One)".
+    "e7881b22c8b0fcce9bc9d1c2d39931690c73cc678fd805bb95082cad07d885f5",
     // V0.6.25 (2026-09-20): antes de la seccion "Judge (System One)" (SYNSEMA_JUDGE_*, TYPESAFE_API_KEY).
     "7dfea9ca0c0a25c61f904cdf2800fe0ec130129920d89c72abacbc511976866f",
     // V0.6.23 (2026-09-18, auditoria externa): la seccion "Attestation (TEEs)" antes de DSTACK_SIMULATOR_ENDPOINT.

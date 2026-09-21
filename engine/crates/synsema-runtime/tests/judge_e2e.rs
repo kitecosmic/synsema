@@ -94,6 +94,23 @@ fn sandbox_denies_judge() {
 }
 
 #[test]
+fn decide_is_served_by_the_judge_when_the_knob_is_on() {
+    with_mock();
+    std::env::set_var("SYNSEMA_JUDGE_DECIDE", "1");
+    // El mock elige la primera opción: `decide` devuelve "alpha" byte a byte, sin LLM.
+    let src = "require judge\nlet d be decide between [\"alpha\", \"beta\"] given \"speed matters\"\nprint(d)\nprint(judge_usage())\n";
+    let r = run_source(src, "<test>");
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, ["alpha", "0"]);
+    // Bajo un techo sin `judge`, el `decide` servido por el juez lo dice con nombre y apellido.
+    let src = format!("require llm\nlet d be decide between [\"alpha\", \"beta\"] given \"x\"\nprint(d)\n");
+    let r = run_source_ceiled(&src, "<test>", Some(vec![cap(CapabilityType::Llm), cap(CapabilityType::Stdout)]));
+    assert!(!r.success, "{:?}", r.output);
+    assert!(r.errors.iter().any(|e| e.contains("SYNSEMA_JUDGE_DECIDE") && e.contains("require judge")), "{:?}", r.errors);
+    std::env::remove_var("SYNSEMA_JUDGE_DECIDE");
+}
+
+#[test]
 fn judge_and_llm_are_parallel_slots() {
     with_mock();
     // El slot de judge cableado no cablea el LLM ni viceversa: cada uno se consulta aparte.
