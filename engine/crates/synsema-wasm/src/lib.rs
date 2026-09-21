@@ -410,6 +410,10 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Stdout, None));
     caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Time, None));
     caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Llm, None));
+    // `judge` (System One) se concede ambiente como en el nativo — la sonda de paridad compara
+    // el audit nativo ↔ wasm bajo un ceiling y la denegación tiene que aparecer en los dos.
+    // En el guest no hay red ni provider: un bloque `judge` degrada siempre a `available: false`.
+    caps.borrow_mut().grant_ambient(Capability::new(CapabilityType::Judge, None));
 
     register_secure_builtins(interp, caps.clone());
     // Gate de stdout bajo techo (paridad con el nativo): `ceiling` sin `stdout` deniega
