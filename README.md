@@ -4,7 +4,7 @@ A programming language designed for AI agents.
 
 Synsema is not a framework or a library — it's a language where observability, security, multi-agent coordination, human interaction, and LLM integration are built-in primitives, not afterthoughts. It compiles to a single native binary: no runtime, no GIL, true multi-core.
 
-Docs: [synsema.dev](https://synsema.dev) · Changelog: [CHANGELOG.md](CHANGELOG.md) · Community: [Discord](https://discord.gg/qCJuwsF5bT) · The platform: [synsema.com](https://synsema.com)
+Site: [synsema.org](https://synsema.org) · Docs: [synsema.dev](https://synsema.dev) · Learn by building: [try.synsema.org](https://try.synsema.org) · Changelog: [CHANGELOG.md](CHANGELOG.md) · Community: [Discord](https://discord.gg/qCJuwsF5bT) · The platform: [synsema.com](https://synsema.com)
 
 ## Fast *and* secure
 
