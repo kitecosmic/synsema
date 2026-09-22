@@ -176,6 +176,13 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # La presencia de la clave autoselecciona el provider:
 # SYNSEMA_JUDGE_PROVIDER=typesafe   # TypeSafe (Jev) — o `mock` para tests y demos sin clave
 # TYPESAFE_API_KEY=
+#
+# O LOCAL, sin red, sin clave y sin costo por token: un checkpoint de Laya en disco contesta
+# las mismas preguntas. Con esto, estar offline deja de ser un destino y pasa a ser una
+# eleccion. No se descarga nada: el checkpoint son ~843 MB y bajarlo lo decidis vos.
+# SYNSEMA_JUDGE_PROVIDER=laya
+# SYNSEMA_JUDGE_MODEL=/ruta/al/checkpoint/laya   # con `laya`, MODEL es el DIRECTORIO del checkpoint
+#
 # Id o alias del modelo (el que contesto se consulta con judge_model()):
 # SYNSEMA_JUDGE_MODEL=jev-latest
 # Endpoint base — cualquier host que sirva el mismo cable (p. ej. el AI Gateway de Vercel):
@@ -374,6 +381,10 @@ const HELLO_SYN_PAST: &[&str] = &[
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
 const ENV_EXAMPLE_PAST: &[&str] = &[
+    // V0.6.27 (2026-09-21): antes de `SYNSEMA_JUDGE_PROVIDER=laya` (el judge local) en la
+    // seccion "Judge (System One)". `laya` es un valor nuevo de una variable vieja, y el test
+    // anti-rot mira nombres de variables, no valores: sin esta linea nadie se entera.
+    "70d4cab75fd5a29f336723e8aa85cfc16c0ab2e1311e749d00574360d9e752fc",
     // V0.6.26 (2026-09-21, tanda I5): antes de SYNSEMA_INFER_BACKEND y SYNSEMA_INFER_ARCHDEF.
     // OJO: SYNSEMA_INFER_BACKEND nacio en I4 y nunca se agrego aca — el test anti-rot no ve lo
     // que no esta en ninguna lista, asi que estuvo latente una tanda entera.
