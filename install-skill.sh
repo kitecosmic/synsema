@@ -38,6 +38,7 @@ secrets.md
 agents.md
 llm.md
 judge.md
+inference.md
 human.md
 observability.md
 memory.md

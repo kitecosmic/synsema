@@ -1,4 +1,4 @@
-# `judge` — calibrated judgments from a System One model (Jev) — engine v0.6.25+ (complete in v0.6.26)
+# `judge` — calibrated judgments from a System One model — engine v0.6.25+ (local backend in v0.6.27)
 
 `judge` asks a **System One model** typed questions about one `state` and gets back **probabilities**,
 not text. It never generates: there is no `reason`, `generate` or `analyze` in it, and the LLM slot
@@ -6,9 +6,12 @@ cannot serve it. It is a **parallel slot** to the LLM (`SYNSEMA_JUDGE_*` next to
 judge decides, the LLM writes, and having both wired is the normal setup. The first backend is
 TypeSafe's **Jev** (`api.typesafe.ai`); another host that serves the same wire can be pointed at with
 `SYNSEMA_JUDGE_BASE_URL`, with the model id and key that host expects — only TypeSafe's own endpoint
-was verified live. Everything on this page was verified live against `jev-1.13.0` on 2026-09-20
-through the engine, not only against the vendor's docs. This page is the whole surface: nothing here
-requires reading the engine.
+was verified live. Since v0.6.27 there is also a **local** backend that needs no network, no key and
+no vendor at all (`SYNSEMA_JUDGE_PROVIDER=laya`, below).
+
+Everything on this page was verified live through the engine, not only against docs: the hosted
+backend against `jev-1.13.0` on 2026-09-20, the local one against a Laya checkpoint on 2026-09-21.
+This page is the whole surface — nothing here requires reading the engine.
 
 ## The block — one state, N questions, ONE call
 
@@ -165,6 +168,45 @@ otherwise
 `judge_available()` tells you whether a provider is wired at all (it stays `true` when a wired
 provider is momentarily down; `available` on the answer is per call).
 
+Keep writing the gate even if you never expect to be offline — but note that since v0.6.27 offline
+is a **choice**, not a fate: `SYNSEMA_JUDGE_PROVIDER=laya` answers from a checkpoint on disk with no
+network and no key (below).
+
+## Running the judge LOCALLY — `SYNSEMA_JUDGE_PROVIDER=laya` (v0.6.27+)
+
+The judge slot is a **protocol, not a vendor**. The official binaries ship a second backend: a Laya
+(ModernBERT) checkpoint on disk answers `whether`, `choose` and `rate` **with no network, no secret
+and no cost per token**. The same block runs unchanged.
+
+```
+SYNSEMA_JUDGE_PROVIDER=laya
+SYNSEMA_JUDGE_MODEL=/models/laya      # the checkpoint directory, or an org/repo already in the HF cache
+```
+
+Nothing is downloaded for you: the checkpoint is ~843 MB and fetching it is the operator's decision,
+like a `.gguf`. If it is not there, the error says how to get it.
+
+What changes, and it is the point: **offline degradation stops being the common case.** A program
+with `require judge`, `deny net` and no secret at all still gets calibrated probabilities. Measured
+on the reference ticket (four questions, one block, CPU):
+
+| | |
+|---|---|
+| `refund.probability` | `0.8596` |
+| `team.choice` / `confidence` | `billing` / `0.3595` → the `< 0.8` gate correctly routes to a human |
+| `anger.level` / `score` | `furious` / `1.7154` |
+| `choose … or nothing` on an off-topic message | `nothing` at `0.8646` |
+| wall clock | **8.8 s** for the whole program, model load included |
+| determinism | 3/3 identical runs |
+
+The sequence the model sees is token-for-token identical to the upstream reference implementation —
+a permanent test asserts it, because that is the layer where an error does **not** fail: the markers
+would still run and the model would simply score something else.
+
+What it does not do: `laya` is a classifier, so `SYNSEMA_JUDGE_BUDGET` still counts input tokens but
+there is no bill behind them, and `judge_model()` reports `laya:<checkpoint>` so two runs with
+different weights never look alike in a log.
+
 ## Capability — `require judge`, and `llm` does not grant it
 
 `judge` is its own capability. A program may have the right to classify without the right to
@@ -184,8 +226,8 @@ key may live only in the `.env`. `synsema init` writes all of these, commented, 
 | Knob | For | Default |
 |---|---|---|
 | `TYPESAFE_API_KEY` | the key; its presence also selects the `typesafe` provider | — (offline if absent) |
-| `SYNSEMA_JUDGE_PROVIDER` | `typesafe` \| `mock` (deterministic answers, no network — tests and demos) | auto from the key |
-| `SYNSEMA_JUDGE_MODEL` | model id or alias | `jev-latest` |
+| `SYNSEMA_JUDGE_PROVIDER` | `typesafe` \| **`laya`** (LOCAL, v0.6.27+ — see below) \| `mock` (deterministic answers, no network — tests and demos) | auto from the key |
+| `SYNSEMA_JUDGE_MODEL` | model id or alias; **with `laya`, the checkpoint directory** (or an `org/repo` already in the Hugging Face cache) | `jev-latest` |
 | `SYNSEMA_JUDGE_BASE_URL` | endpoint base — any host that serves the same wire | `https://api.typesafe.ai` |
 | `SYNSEMA_JUDGE_TIMEOUT` | HTTP timeout, seconds | `60` |
 | `SYNSEMA_JUDGE_BUDGET` | hard ceiling of **input** tokens per process (output is free); at the ceiling answers degrade to `available: false` without touching the network | — (no ceiling) |
@@ -203,9 +245,11 @@ synsema judge status            # provider, key PRESENCE (never the value), mode
 synsema judge status --json     # the same for scripts; exit 0 = live, 1 = offline
 ```
 
-No network. Offline, the last line names what is missing (`TYPESAFE_API_KEY`, or a provider name that
-is not `typesafe` | `mock`). Same host flags as the rest of the CLI: `--env-file <path>`,
-`--no-env-file`. Scriptable: `synsema judge status && synsema serve app.syn`.
+No network. **Each backend shows only what applies to it** — `typesafe`: key, model, base URL and
+timeout; `laya`: the checkpoint; `mock`: none of those. Offline, the last line names what is missing
+(`TYPESAFE_API_KEY`, a checkpoint for `laya`, or a provider name that is not `typesafe` | `laya` |
+`mock`). Same host flags as the rest of the CLI: `--env-file <path>`, `--no-env-file`. Scriptable:
+`synsema judge status && synsema serve app.syn`.
 
 ## Serving `decide` with the judge — `SYNSEMA_JUDGE_DECIDE=1` (v0.6.26+)
 
@@ -307,6 +351,11 @@ option with all the mass (the escape if the instruction contains "nothing"), `ra
 level. Same block, same shape, no network — CI runs it. With a real key, assert the winner and
 ranges (`v.team.choice == "billing"`, `v.refund.probability > 0.9`), never exact numbers.
 
+`mock` and `laya` answer different questions. `mock` gives a **shape** with no meaning: use it in
+CI, where a checkpoint has no business being. `laya` gives **real judgments** with no key: use it
+when you want the answers to be right and the machine to stay offline. The same test file works with
+either — assert shape without a provider, winner and ranges with one.
+
 ## Not in this release
 
 A dedicated syntax for `whether` with explicit yes/no criteria (write the instruction as a map with
@@ -315,3 +364,11 @@ fallback that fakes probabilities (deliberately absent: an invented probability 
 block never returns); the Cloudflare Workers AI wire variant (its payload is wrapped differently and
 was not verified). Aliases and rate limits are the vendor's and move without notice — pin the model
 id when thresholds matter.
+
+About the local backend specifically: its `act_head` is left out on purpose (a parallel branch that
+does not touch the logits — the answer is identical with or without it, and `judge` exposes no
+action probability), it runs in `f32` even though the checkpoint is `f16` (half precision is
+emulated on CPU and comes out slower), and **numeric parity against the upstream implementation is
+open**: the tokens we feed it are identical, and on the case published upstream we get the same
+argmax with a different confidence (0.864 vs 0.94). Closing that needs running the upstream with
+PyTorch. Treat the local numbers as this engine's numbers, and assert ranges.

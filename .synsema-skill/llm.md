@@ -148,36 +148,72 @@ Security: the only capability needed to reach the LLM is `require llm` — the n
 configured host is part of that, **not** a separate `net` grant (the runtime fixes the host; the
 program can't change it). Use `net` only for egress the program itself directs.
 
-**Embedded local provider (`local`) — GGUF in-process, zero network.** With a binary compiled with
-`--features llm-local` (`cargo install --path crates/synsema-cli --features llm-local`), the runtime
-can run a quantized GGUF **inside the process** (candle, CPU): no server, no API key, no socket at
-all — the only provider that works under a total `deny net`. Always explicit (never auto-selected):
+**Embedded local provider (`local`) — a model in-process, zero network.** The official binaries ship
+it: the runtime runs a quantized GGUF **inside the Synsema process**, with no server, no API key and
+no socket at all — the only provider that works under a total `deny net`. Always explicit, never
+auto-selected.
+
+`SYNSEMA_LLM_MODEL` takes **three forms**, and none of them downloads anything (v0.6.27+):
 
 ```
-# .env — no API key of any kind:
 SYNSEMA_LLM_PROVIDER=local
-SYNSEMA_LLM_MODEL=C:\models\qwen2.5-0.5b-instruct-q4_k_m.gguf   # path to the .gguf (required)
+
+SYNSEMA_LLM_MODEL=/models/qwen2.5-3b-instruct-q4_k_m.gguf   # 1. a path to a .gguf
+SYNSEMA_LLM_MODEL=qwen3:0.6b                                # 2. a model:tag already in the Ollama cache
+SYNSEMA_LLM_MODEL=org/repo                                  # 3. a repo already in the Hugging Face cache
 ```
+
+If you already use Ollama you are done — `synsema llm status` lists what it found, by name, with the
+sha256 of the weights (Ollama's store is content-addressed, so the hash is free). `ollama` does not
+need to be running; only its files on disk are read. A name that is not there lists the three places
+it looked, with real paths.
 
 | Knob | Purpose | Default |
 |---|---|---|
-| `SYNSEMA_LLM_MODEL` | **Path to the `.gguf` file** (required; no default) | — |
+| `SYNSEMA_LLM_MODEL` | Path, `model:tag`, or `org/repo` (**required** for `local`) | — |
+| `SYNSEMA_INFER_BACKEND` | `rust` = the engine written by us; anything else = candle | candle |
+| `SYNSEMA_INFER_ARCHDEF` | Directory of `<arch>.archdef` files: architectures **without recompiling** | — |
 | `SYNSEMA_LLM_CTX` | Context window (capped to the GGUF's own limit) | `4096` |
-| `SYNSEMA_LLM_THREADS` | CPU threads for inference | engine default (all cores) |
+| `SYNSEMA_LLM_THREADS` | CPU threads for inference | all cores |
 | `SYNSEMA_LLM_TEMPERATURE` | `0` = greedy/deterministic; `>0` = sampling (fixed seed) | `0` |
 | `SYNSEMA_LLM_MAX_CONCURRENT` | Max model instances; `1` serializes concurrent calls under `serve` | `1` |
 | `SYNSEMA_LLM_STREAM_BUFFER` | Chunks in flight between generation and `llm_stream` emission | `32` |
 
-`SYNSEMA_LLM_MAX_TOKENS` applies as usual. Supported architectures: **llama, qwen2, qwen3** —
-the `general.architecture` string in the GGUF header, not the brand name; anything else fails with
-a clear `[local error: …]`. Popular families convert to GGUF declaring one of those three, so real
-coverage is wider. Verified live (probe = load + question + coherent answer + clean stop):
+All of them resolve `environ > .env > default`, like every other knob. `SYNSEMA_LLM_MAX_TOKENS`
+applies as usual.
+
+### Two engines, and why you would switch
+
+| | `candle` (default) | `SYNSEMA_INFER_BACKEND=rust` |
+|---|---|---|
+| Architectures | **llama, qwen2, qwen3**, compiled in | **llama, qwen2, qwen3, gemma3**, each one a file you can read and replace |
+| A new architecture | needs a new binary | needs a **text file** (`SYNSEMA_INFER_ARCHDEF`) |
+| SIMD | chosen at **compile time** — a plain build runs the scalar path (see the rebuild below) | chosen at **run time** (AVX / AVX2+FMA / AVX-512 / NEON): the official binary uses your CPU |
+| RAM | ~2.6× the size of the `.gguf` | ~1.1× — the file is memory-mapped and the big weights stay quantized |
+
+**Switching engines changes the generated text.** Both are correct; they approximate the same
+numbers differently (candle quantizes the activation before the matmul, we multiply in `f32`). So
+the engine is part of what you declare to reproduce an output, next to the binary and the weights.
+candle stays the default while both exist.
+
+Architecture is the `general.architecture` string in the GGUF header, not the brand name; anything
+else fails with a clear `[local error: …]` that says which engine *can* run it:
+
+```
+[local error: no se pudo cargar 'gemma3:270m': arquitectura 'gemma3' no soportada por el provider
+local (soportadas: llama, qwen2, qwen3)
+  El backend propio sí la soporta: probá con SYNSEMA_INFER_BACKEND=rust]
+```
+
+Popular families convert to GGUF declaring one of those names, so real coverage is wider than the
+list suggests. Verified live (probe = load + question + coherent answer + clean stop):
 
 | Model (GGUF probed) | declares | Verified |
 |---|---|---|
 | Qwen2.5 Instruct 0.5B/3B | `qwen2` | ✅ |
-| Qwen3 0.6B | `qwen3` | ✅ thinking model — emits raw `<think>…</think>`; budget max_tokens for it |
+| Qwen3 0.6B | `qwen3` | ✅ thinking model — emits raw `<think>…</think>`; budget `SYNSEMA_LLM_MAX_TOKENS` for it |
 | Qwen3 4B **Instruct**-2507 | `qwen3` | ✅ (2.5 GB GGUF, ran in 8 GB RAM); the 4B **Thinking**-2507 runs but thinks for thousands of tokens — impractical on CPU, prefer Instruct |
+| **Gemma 3 270M** | `gemma3` | ✅ **`rust` engine only** — token for token what Ollama generates |
 | Mistral 7B Instruct v0.3 | `llama` | ✅ its `[INST]` template is auto-detected |
 | Llama 3.2 1B Instruct | `llama` | ✅ llama3 template auto-detected |
 | SmolLM2 135M Instruct | `llama` | ✅ chatml |
@@ -185,35 +221,61 @@ coverage is wider. Verified live (probe = load + question + coherent answer + cl
 | TinyLlama 1.1B Chat | `llama` | ⚠️ loads and runs, but its zephyr template isn't recognized → plain fallback, behaves like a BASE model |
 
 A supported arch loads and runs; **chat usability also needs a recognized chat template** (chatml /
-llama3 / `[INST]`; otherwise plain fallback). gemma/phi/glm GGUFs are rejected on purpose (candle
-exposes no public KV-cache reset for them yet — request isolation first). Tip: ollama downloads are
-plain GGUF blobs and far faster than HF (~19 vs ~0.3 MB/s measured) — `ollama pull llama3.2:1b`,
-then point `SYNSEMA_LLM_MODEL` at the blob under `~/.ollama/models/blobs/sha256-…` (the digest is
-in the manifest under `~/.ollama/models/manifests/…`; ollama need not be running). Tool-calling
-(`llm_step`) works via prompting — the model returns a `{"tool": …, "args": …}` JSON that the
-runtime parses.
+llama3 / `[INST]` / gemma; otherwise plain fallback). phi and glm are still rejected.
 
-Honest limits (measured): built for **short prompts** — CPU
-prefill is ~12 tok/s, so a 1000-token prompt takes ~90s on a 0.5B; generation is ~11 tok/s (0.5B)
-/ ~5 tok/s (3B, 4 threads). Model load (7s for 0.5B, ~35s for 3B) is paid **once per process** —
-under `serve` the first request loads, the rest reuse (measured: 8.2s → 1.3s). RAM: ~1GB (0.5B) /
-~2.4GB (3B). On a binary **without** the feature, `SYNSEMA_LLM_PROVIDER=local` prints a clear
-stderr notice and stays offline (placeholders) — it never silently falls back to another provider.
+> **If you ran a llama, Mistral or Gemma GGUF before v0.6.27, its answers were wrong.** Those files
+> store token **ranks**, not log-probabilities, and the tokenizer was segmenting them as if they were
+> log-probabilities: `The capital of France is` entered the model as eleven fragments instead of five
+> words. Nothing failed — the model just answered badly. Fixed in v0.6.27; qwen and llama 3 (BPE) were
+> never affected.
 
-**Build for speed — one flag triples prefill (measured, informe F3).** candle selects its AVX2
-quantized kernels at **compile time** (`#[cfg(target_feature = "avx2")]`) and Rust's default x86-64
-target does NOT enable AVX2 — a plain build runs the scalar path. Compile your own llm-local binary
-with:
+### `synsema llm status` — what is actually on this machine
+
+It lists the models already downloaded, and the architectures **of the engine that will actually
+run**, each with where it came from and its sha. `--json` carries the same under an `inference` key,
+with the full sha, so a script can compare two runs instead of reading prose.
+
+```
+Modelos locales ya descargados (2):
+  gemma3:270m       ollama:gemma3:270m  sha256:735af2139dc6
+  qwen3:0.6b        ollama:qwen3:0.6b   sha256:7f4030143c1c
+  Usá SYNSEMA_LLM_MODEL=<nombre> — no se descarga nada.
+
+Arquitecturas que corre el backend `rust` (4):
+  gemma3 (20 pasos por capa, en el binario, sha b935fcfab2d6)
+  llama (16 pasos por capa, en el binario, sha a580fa45fdb6)
+  qwen2 (19 pasos por capa, en el binario, sha fbba11641175)
+  qwen3 (18 pasos por capa, ./archdefs/qwen3.archdef, sha 5b8d9db76a68)
+  Definiciones del operador: ./archdefs
+```
+
+### Architectures are a file, not a release
+
+An architecture is a flat list of named steps over the tensors of the GGUF. The four we ship are
+embedded in the binary; `SYNSEMA_INFER_ARCHDEF=<dir>` adds new ones — **or replaces ours** — with no
+compiler involved. This is the whole point: nobody has to wait for us to support a model. The format,
+the operations and a worked example are in **[inference.md](inference.md)**.
+
+Honest limits (measured, without the rebuild below): built for **short prompts** — CPU prefill is
+~12 tok/s, so a 1000-token prompt takes ~90s on a 0.5B; generation is ~11 tok/s (0.5B) / ~5 tok/s
+(3B, 4 threads). Model load (7s for 0.5B, ~35s for 3B) is paid **once per process** — under `serve`
+the first request loads and the rest reuse (measured: 8.2s → 1.3s). RAM with candle: ~1GB (0.5B) /
+~2.4GB (3B); with the `rust` engine, roughly the size of the `.gguf`. On a binary **without** the
+feature, `SYNSEMA_LLM_PROVIDER=local` prints a clear stderr notice and stays offline — it never
+silently falls back to another provider.
+
+**Rebuilding for speed — only worth it on candle.** candle picks its AVX2 quantized kernels at
+**compile time** (`#[cfg(target_feature = "avx2")]`) and Rust's default x86-64 target does not enable
+AVX2, so a plain build runs the scalar path. Measured gain of rebuilding: prefill **~3.1×** on a 0.5B
+(~11 → ~35 tok/s). The `rust` engine does not need this — it dispatches on the CPU it finds:
 
 ```bash
+# only if you stay on candle:
 RUSTFLAGS="-C target-cpu=native" cargo install --path crates/synsema-cli --features llm-local --force
 ```
 
-Measured gain: prefill **~3.1×** on the 0.5B (~11 → ~35 tok/s; a 512-token prompt drops from 48s to
-15.3s), 1.5× on the 3B, generation +21% (0.5B; the 3B barely moves — generation is memory-bound).
-The limits in the paragraph above are WITHOUT the flag. `native` ties the binary to that machine's
-CPU — right for your own VPS/dev box; for a binary you distribute, use
-`-C target-cpu=x86-64-v3` (AVX2+FMA, covers x86 CPUs from ~2015; fails cleanly on older ones).
+`native` ties the binary to that machine's CPU — right for your own VPS; for a binary you distribute
+use `-C target-cpu=x86-64-v3` (AVX2+FMA, covers x86 CPUs from ~2015).
 
 ## Streaming (`llm_stream`)
 

@@ -86,7 +86,9 @@ usually version skew, not a bug.
 - [attestation.md](attestation.md) — **Attestation**: proving which code answered. `attest`/`attest_key` under `require attest`, `attestation_document`/`attestation_key` inside a `serve --attested`, `attestation_verify` (pure, `opts.now` mandatory), the `/.well-known/attestation` identity and the `run --attest` artefact, which drivers are real and which are untested, plus `groth16_verify` and deterministic DP noise
 - [secrets.md](secrets.md) — `env` config, LLM-proof `secret`, `.env`, `reveal()` + audit, HMAC/bearer helpers
 - [agents.md](agents.md) — Multi-agent coordination, blackboard, swarm, signals, event bus (`bus_*` fan-out), `agents()`/`agent_stop`
-- [llm.md](llm.md) — LLM operations: reason, decide, analyze, generate
+- [llm.md](llm.md) — LLM operations: reason, decide, analyze, generate; the embedded `local` provider (a path, an Ollama `model:tag` or a Hugging Face `org/repo`)
+- [judge.md](judge.md) — **`judge`**: calibrated judgments as values — a probability, an option with its distribution, a level on a scale — from a System One model; its own `require judge`; runs LOCAL with `SYNSEMA_JUDGE_PROVIDER=laya` (no network, no key, no cost)
+- [inference.md](inference.md) — Local inference: the two engines, and **architectures as files** a compiled binary reads at startup — add a model without recompiling
 - [human.md](human.md) — Human interaction: approve, confirm, ask, show
 - [observability.md](observability.md) — trace, log, measure, checkpoint, diagnostics
 - [memory.md](memory.md) — Declared agent memory (`require memory("name")` — the name IS the .db identity), per-agent namespaces (`recall(from = ...)`), owner rules, progress tracking
