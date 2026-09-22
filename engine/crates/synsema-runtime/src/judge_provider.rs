@@ -113,11 +113,19 @@ pub fn judge_config_report(store: &EnvStore) -> JudgeConfigReport {
             "SYNSEMA_JUDGE_PROVIDER=typesafe but TYPESAFE_API_KEY is missing — set it in the process environment or in the .env file".to_string(),
         ),
         "typesafe" | "mock" => None,
+        // `laya` corre local: no necesita clave, necesita el checkpoint en disco.
+        "laya" => match resolve_knob("SYNSEMA_JUDGE_MODEL", store) {
+            Some(v) if !v.trim().is_empty() && v.trim() != DEFAULT_MODEL => None,
+            _ => Some(
+                "SYNSEMA_JUDGE_PROVIDER=laya needs SYNSEMA_JUDGE_MODEL pointing at a Laya checkpoint directory (or an org/repo already in the Hugging Face cache)"
+                    .to_string(),
+            ),
+        },
         "" => Some(
-            "no judge provider: set TYPESAFE_API_KEY (auto-selects typesafe) or SYNSEMA_JUDGE_PROVIDER=mock for tests".to_string(),
+            "no judge provider: set TYPESAFE_API_KEY (auto-selects typesafe), SYNSEMA_JUDGE_PROVIDER=laya for a local checkpoint, or =mock for tests".to_string(),
         ),
         other => Some(format!(
-            "SYNSEMA_JUDGE_PROVIDER='{}' is not a judge provider (typesafe | mock)",
+            "SYNSEMA_JUDGE_PROVIDER='{}' is not a judge provider (typesafe | laya | mock)",
             other
         )),
     };
@@ -219,6 +227,10 @@ pub fn config_from_store(store: &EnvStore) -> JudgeConfig {
 /// `synsema-llm` (tests y demos sin clave). Un provider desconocido avisa y queda offline:
 /// mejor `available: false` que una llamada a un host que no es.
 pub fn provider_from_config(store: &EnvStore) -> Option<Arc<WiredJudgeProvider>> {
+    // `laya` corre sobre el mismo motor que el LLM local, y un programa puede usar `judge` sin
+    // tocar `llm`: si la instalación colgara sólo del provider de LLM, `SYNSEMA_INFER_BACKEND`
+    // en un `.env` funcionaría para uno y no para el otro.
+    crate::llm_providers::install_infer_knobs(store);
     let cfg = config_from_store(store);
     let inner: Arc<dyn JudgeProvider> = match cfg.provider.as_str() {
         "typesafe" => {
@@ -229,6 +241,20 @@ pub fn provider_from_config(store: &EnvStore) -> Option<Arc<WiredJudgeProvider>>
                 base_url: cfg.base_url.clone(),
                 timeout_secs: cfg.timeout_secs,
             })
+        }
+        #[cfg(feature = "judge-laya")]
+        "laya" => {
+            let spec = resolve_knob("SYNSEMA_JUDGE_MODEL", store)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty() && v != DEFAULT_MODEL)?;
+            Arc::new(crate::judge_laya::LayaJudgeProvider::new(spec))
+        }
+        #[cfg(not(feature = "judge-laya"))]
+        "laya" => {
+            eprintln!(
+                "[synsema] SYNSEMA_JUDGE_PROVIDER=laya requiere un binario compilado con --features judge-laya; judge queda OFFLINE"
+            );
+            return None;
         }
         "mock" => Arc::new(MockJudgeProvider::new()),
         "none" => return None,

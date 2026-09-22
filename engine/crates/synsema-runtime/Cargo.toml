@@ -20,18 +20,24 @@ rusqlite.workspace = true
 # v0.6.20: `signal` para el listener de SIGHUP (recarga del .env bajo serve). La feature ya
 # entra al build por stdlib (unificación): cero compilación nueva de tokio.
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "sync", "signal"] }
-# LLM local (feature `llm-local`): candle + tokenizers, opcionales — el build default
-# no los compila ni los descarga al árbol de deps. Ver src/llm_local.rs.
-candle-core = { workspace = true, optional = true }
-candle-transformers = { workspace = true, optional = true }
-tokenizers = { workspace = true, optional = true }
+# LLM local (feature `llm-local`): el crate de inferencia, opcional — el build default no
+# lo compila ni descarga candle al árbol de deps. Ver src/llm_local.rs, que desde la tanda I1
+# es sólo el adaptador entre el protocolo LLM y `synsema-infer`: este crate ya NO nombra a
+# candle ni a tokenizers (criterio C1 del spec).
+synsema-infer = { workspace = true, optional = true }
 
 [features]
 # Provider LLM `local` (spec LLM-LOCAL F1): inferencia GGUF cuantizada embebida (candle,
 # CPU). Opt-in explícito: `cargo build --features llm-local` (o vía synsema-cli). Sin la
 # feature, `SYNSEMA_LLM_PROVIDER=local` avisa por stderr y queda offline (placeholders) —
 # jamás elige otro provider en silencio.
-llm-local = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers"]
+# Desde I5 tambien enciende `rust-backend`: el camino declarativo ES el decoder propio, y
+# tenerlo colgando de `judge-laya` hacia que `SYNSEMA_INFER_BACKEND=rust` dependiera de una
+# feature que no tiene nada que ver.
+llm-local = ["dep:synsema-infer", "synsema-infer/gguf", "synsema-infer/rust-backend"]
+# Backend LOCAL de `judge` (tanda I3): Laya, encoder ModernBERT + cabezas de decision. Opt-in
+# aparte de `llm-local` porque un build que solo quiere GGUF no tiene por que cargar el encoder.
+judge-laya = ["dep:synsema-infer", "synsema-infer/arch-modernbert", "synsema-infer/rust-backend"]
 
 [dev-dependencies]
 # E2E del Batch 13: un mini-servidor WS LOCAL para el dogfood del cliente WebSocket

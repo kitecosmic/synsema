@@ -1,0 +1,50 @@
+# gemma3 — la que candle no puede correr cuantizada (PR #3709, sin `clear_kv_cache`).
+#
+# Cuatro diferencias contra llama, y las cuatro dan números mal EN SILENCIO si faltan:
+#
+#   1. los embeddings se escalan por la raíz de la dimensión, antes de la primera capa;
+#   2. RMSNorm por cabeza en Q y K (igual que qwen3);
+#   3. una norma más DESPUÉS de la atención y del MLP, sobre la salida del bloque y antes de
+#      sumar el residual — no confundir con la norma de entrada, que también está;
+#   4. ventana deslizante alternada: cinco capas locales y una global.
+#
+# La ventana no se escribe acá porque el GGUF ya la declara (`attention.sliding_window`) y
+# repetirla sería mantenerla sincronizada a mano. Lo único que el GGUF NO dice es cada cuántas
+# capas hay una global, y eso sí es un `param`.
+
+arch gemma3
+kind decoder
+
+param sliding_window_type 6
+
+prologue
+  x = embed(token_embd.weight)
+  scale(x, sqrt(embedding_length))
+
+block
+  h = rms_norm(x, blk.{i}.attn_norm.weight)
+  q = matmul(h, blk.{i}.attn_q.weight)
+  k = matmul(h, blk.{i}.attn_k.weight)
+  v = matmul(h, blk.{i}.attn_v.weight)
+  norm_heads(q, blk.{i}.attn_q_norm.weight, head_count)
+  norm_heads(k, blk.{i}.attn_k_norm.weight, head_count_kv)
+  rope(q, head_count)
+  rope(k, head_count_kv)
+  a = attention(q, k, v)
+  o = matmul(a, blk.{i}.attn_output.weight)
+  o = rms_norm(o, blk.{i}.post_attention_norm.weight)
+  add(x, o)
+
+  h = rms_norm(x, blk.{i}.ffn_norm.weight)
+  g = matmul(h, blk.{i}.ffn_gate.weight)
+  gelu_tanh(g)
+  u = matmul(h, blk.{i}.ffn_up.weight)
+  mul(g, u)
+  d = matmul(g, blk.{i}.ffn_down.weight)
+  d = rms_norm(d, blk.{i}.post_ffw_norm.weight)
+  add(x, d)
+
+epilogue
+  x = rms_norm(x, output_norm.weight)
+  x = last(x)
+  logits = matmul(x, output.weight | token_embd.weight)

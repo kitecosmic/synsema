@@ -1770,6 +1770,29 @@ fn resolve_stream_transport(store: &EnvStore) -> bool {
         .unwrap_or(true)
 }
 
+/// Los knobs del MOTOR de inferencia (`SYNSEMA_INFER_BACKEND`, `SYNSEMA_INFER_ARCHDEF`),
+/// resueltos con la misma precedencia que el resto y entregados a `synsema-infer`.
+///
+/// Sin esto el crate de inferencia los leía sólo del entorno del proceso, y un `.env` —que es
+/// donde `synsema init` los documenta, junto al provider y al modelo— no los veía. Se instalan
+/// al elegir provider porque ése es el punto por el que pasa todo: `serve`, `run`, `test` y
+/// `llm status` resuelven el provider antes de cargar un solo peso.
+///
+/// La primera instalación gana (ver `synsema_infer::install_engine_knobs`): qué motor corre no
+/// puede cambiar a mitad de proceso sin invalidar los modelos ya cargados en el pool.
+#[cfg(any(feature = "llm-local", feature = "judge-laya"))]
+pub fn install_infer_knobs(store: &EnvStore) {
+    synsema_infer::install_engine_knobs(synsema_infer::EngineKnobs {
+        backend: resolve_knob("SYNSEMA_INFER_BACKEND", store),
+        archdef_dir: resolve_knob(synsema_infer::ARCHDEF_DIR_ENV, store),
+    });
+}
+
+/// Sin motor de inferencia compilado no hay nada que configurar: los dos knobs siguen en las
+/// listas canónicas (y en el `.env.example`) porque describen al binario que SÍ lo trae.
+#[cfg(not(any(feature = "llm-local", feature = "judge-laya")))]
+pub fn install_infer_knobs(_store: &EnvStore) {}
+
 /// Knobs del provider `local` (ignorados por los providers de red), resueltos con la
 /// MISMA precedencia `environ > .env > default` que el resto (`resolve_knob`):
 /// `SYNSEMA_LLM_CTX` (default 4096, capado al ctx del GGUF), `SYNSEMA_LLM_THREADS`
@@ -1824,6 +1847,7 @@ fn local_knobs_from_config(store: &EnvStore) -> crate::llm_local::LocalKnobs {
 /// environ ni queda accesible al programa `.syn` (que sigue necesitando `require env/secret`
 /// para tocar el `.env`, y aun así lo vería redactado).
 pub fn provider_from_config(store: &EnvStore) -> Option<Arc<dyn LLMProvider>> {
+    install_infer_knobs(store);
     inner_provider_from_config(store).map(|inner| {
         // Metering SIEMPRE (F-A): sin `SYNSEMA_LLM_BUDGET` igual se acumula, así
         // `llm_usage()` funciona sin config; con budget, el wrapper corta al llegar.
@@ -2025,6 +2049,10 @@ pub const LLM_ENV_VARS: &[&str] = &[
     "SYNSEMA_LLM_TEMPERATURE",
     "SYNSEMA_LLM_MAX_CONCURRENT",
     "SYNSEMA_LLM_STREAM_BUFFER",
+    // Inferencia local en proceso. `INFER` y no `LLM` porque no son knobs del protocolo sino
+    // del motor que corre los pesos: que backend, y que arquitecturas conoce.
+    "SYNSEMA_INFER_BACKEND",
+    "SYNSEMA_INFER_ARCHDEF",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "MINIMAX_API_KEY",

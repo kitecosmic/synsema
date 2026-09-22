@@ -1,0 +1,37 @@
+# qwen3 — llama con RMSNorm POR CABEZA en Q y K, antes de RoPE. Esa es toda la diferencia.
+#
+# El orden importa: normalizar después de RoPE da otro modelo, y uno que igual genera texto, así
+# que el error no se nota hasta comparar contra el upstream.
+
+arch qwen3
+kind decoder
+
+prologue
+  x = embed(token_embd.weight)
+
+block
+  h = rms_norm(x, blk.{i}.attn_norm.weight)
+  q = matmul(h, blk.{i}.attn_q.weight)
+  k = matmul(h, blk.{i}.attn_k.weight)
+  v = matmul(h, blk.{i}.attn_v.weight)
+  # Lo propio de qwen3, y lo único.
+  norm_heads(q, blk.{i}.attn_q_norm.weight, head_count)
+  norm_heads(k, blk.{i}.attn_k_norm.weight, head_count_kv)
+  rope(q, head_count)
+  rope(k, head_count_kv)
+  a = attention(q, k, v)
+  o = matmul(a, blk.{i}.attn_output.weight)
+  add(x, o)
+
+  h = rms_norm(x, blk.{i}.ffn_norm.weight)
+  g = matmul(h, blk.{i}.ffn_gate.weight)
+  silu(g)
+  u = matmul(h, blk.{i}.ffn_up.weight)
+  mul(g, u)
+  d = matmul(g, blk.{i}.ffn_down.weight)
+  add(x, d)
+
+epilogue
+  x = rms_norm(x, output_norm.weight)
+  x = last(x)
+  logits = matmul(x, output.weight | token_embd.weight)

@@ -110,17 +110,23 @@ jobs:
       # queda portable (los kernels AVX2 cuantizados de candle son compile-time y NO se
       # activan) — el prefill local es ~3× más lento que un build propio con
       # `-C target-cpu=native`; la doc (página 52) enseña ese build para quien lo quiera.
+      #
+      # `judge-laya` (desde la tanda I3 de `specs/synsema-infer.md`): el backend LOCAL del
+      # primitivo `judge`. Va en el binario oficial por el mismo motivo que `llm-local`: sin
+      # él, `SYNSEMA_JUDGE_PROVIDER=laya` le contesta a quien lo configure que se compile su
+      # propio binario, y una capacidad que la doc describe pero el release no trae no es una
+      # capacidad. El peso extra es el encoder y las cabezas — candle ya entra por `llm-local`.
       - name: Build (Linux, glibc 2.17 floor)
         if: runner.os == 'Linux'
         env:
           SYNSEMA_VERSION: ${{ github.ref_name }}
-        run: cargo zigbuild --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local --target ${{ matrix.target }}.2.17
+        run: cargo zigbuild --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target ${{ matrix.target }}.2.17
 
       - name: Build
         if: runner.os != 'Linux'
         env:
           SYNSEMA_VERSION: ${{ github.ref_name }}
-        run: cargo build --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local --target ${{ matrix.target }}
+        run: cargo build --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'

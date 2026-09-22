@@ -119,6 +119,19 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # Modelo LOCAL en proceso (GGUF: sin red, sin key; binario con --features llm-local):
 # SYNSEMA_LLM_PROVIDER=local
 # SYNSEMA_LLM_MODEL=/ruta/al/modelo.gguf   # para `local`, MODEL es la RUTA al .gguf (obligatorio)
+#
+# Motor de inferencia del provider `local`. `rust` = el backend propio: usa ~1,1x lo que pesa
+# el .gguf contra ~2,6x de candle, y corre arquitecturas que candle no trae cuantizadas (hoy,
+# gemma3). Cambiar de motor CAMBIA el texto generado, asi que es parte de lo que hay que
+# declarar para reproducir una salida, junto con el binario y los pesos.
+# SYNSEMA_INFER_BACKEND=rust
+#
+# Directorio con definiciones de arquitectura (`<arch>.archdef`). El binario ya trae llama,
+# qwen2, qwen3 y gemma3; esto es para sumar una NUEVA, o pisar una nuestra, SIN recompilar.
+# Una definicion es una lista recta de pasos: no tiene condicionales, bucles ni acceso a disco
+# o a red, asi que usar una ajena no ejecuta nada. `synsema llm status` dice cual corre y con
+# que sha.
+# SYNSEMA_INFER_ARCHDEF=./archdefs
 
 # ══ Knobs opcionales (todos con default sano; referencia: docs → 52-provider) ══
 
@@ -361,6 +374,10 @@ const HELLO_SYN_PAST: &[&str] = &[
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
 const ENV_EXAMPLE_PAST: &[&str] = &[
+    // V0.6.26 (2026-09-21, tanda I5): antes de SYNSEMA_INFER_BACKEND y SYNSEMA_INFER_ARCHDEF.
+    // OJO: SYNSEMA_INFER_BACKEND nacio en I4 y nunca se agrego aca — el test anti-rot no ve lo
+    // que no esta en ninguna lista, asi que estuvo latente una tanda entera.
+    "f299417bc16e3d6e769d0b2ac25918f7e412b0312b886e7a8658d5c8a561ca50",
     // V0.6.26 (2026-09-20): antes de SYNSEMA_JUDGE_DECIDE en la seccion "Judge (System One)".
     "e7881b22c8b0fcce9bc9d1c2d39931690c73cc678fd805bb95082cad07d885f5",
     // V0.6.25 (2026-09-20): antes de la seccion "Judge (System One)" (SYNSEMA_JUDGE_*, TYPESAFE_API_KEY).

@@ -832,13 +832,23 @@ fn cmd_judge(args: &[String]) -> ExitCode {
 
 fn cmd_judge_status(json: bool) -> ExitCode {
     use synsema_runtime::judge_provider::judge_config_report;
-    use synsema_runtime::llm_providers::ProviderSelection;
+    use synsema_runtime::llm_providers::{KnobSource, ProviderSelection};
     use synsema_stdlib::secrets::EnvStore;
 
     let store = EnvStore::load_default();
     let report = judge_config_report(&store);
     if json {
-        println!("{}", report.to_json());
+        // Mismo contenido que la salida humana, y por el mismo motivo: si `llm status` es el
+        // lugar donde se contesta «¿con qué corrió esto?», un agente tiene que poder contestarlo
+        // también. La parte de inferencia se agrega acá y no en `to_json()` porque el reporte de
+        // providers no conoce —ni tiene por qué— el motor local.
+        synsema_runtime::llm_providers::install_infer_knobs(&store);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&report.to_json()).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("inference".to_string(), inference_json());
+        }
+        println!("{}", v);
         return if report.offline.is_none() { ExitCode::SUCCESS } else { ExitCode::from(1) };
     }
 
@@ -860,11 +870,23 @@ fn cmd_judge_status(json: bool) -> ExitCode {
     if !report.provider.is_empty() {
         println!("Provider    {:<28} {}", report.provider, sel);
     }
-    match report.key_present {
-        Some(src) => println!("Key         {:<28} ✓ presente ({})", "TYPESAFE_API_KEY", src.label()),
-        None => println!("Key         {:<28} ✗ FALTA", "TYPESAFE_API_KEY"),
+    // Qué campos aplican depende del backend: `typesafe` habla HTTP con una clave, `laya` corre
+    // local contra un checkpoint en disco, y `mock` no necesita nada. Mostrarlos todos siempre
+    // hacía aparecer un `TYPESAFE_API_KEY ✗ FALTA` irrelevante y una `Base URL` a la que nadie
+    // iba a llamar — ruido que hace dudar de un diagnóstico que está bien.
+    let is_http = report.provider == "typesafe";
+    let is_local = report.provider == "laya";
+
+    // La clave sólo se nombra donde se usa, y cuando no hay provider (ahí explica qué falta).
+    if is_http || report.provider.is_empty() {
+        match report.key_present {
+            Some(src) => {
+                println!("Key         {:<28} ✓ presente ({})", "TYPESAFE_API_KEY", src.label())
+            }
+            None => println!("Key         {:<28} ✗ FALTA", "TYPESAFE_API_KEY"),
+        }
     }
-    if report.provider != "mock" {
+    if is_http {
         println!("Model       {:<28} (SYNSEMA_JUDGE_MODEL, {})", report.model.value, report.model.source.label());
         println!("Base URL    {:<28} (SYNSEMA_JUDGE_BASE_URL, {})", report.base_url.value, report.base_url.source.label());
         println!(
@@ -872,6 +894,15 @@ fn cmd_judge_status(json: bool) -> ExitCode {
             format!("{}s", report.timeout_secs.value),
             report.timeout_secs.source.label()
         );
+    } else if is_local {
+        // Sin configurar, `model` trae el default del slot (un id del vendor) que no es un
+        // checkpoint: decirlo así evita que alguien lo lea como una ruta válida.
+        let checkpoint = if matches!(report.model.source, KnobSource::Default) {
+            "(sin configurar)".to_string()
+        } else {
+            report.model.value.clone()
+        };
+        println!("Checkpoint  {:<28} (SYNSEMA_JUDGE_MODEL, {})", checkpoint, report.model.source.label());
     }
     let budget = if report.budget.value.is_empty() {
         "(sin techo)".to_string()
@@ -889,6 +920,8 @@ fn cmd_judge_status(json: bool) -> ExitCode {
         None => {
             if report.provider == "mock" {
                 println!("Estado: ✅ VIVO — los bloques `judge` van al mock determinista (sin red; tests y demos).");
+            } else if report.provider == "laya" {
+                println!("Estado: ✅ VIVO — los bloques `judge` corren LOCAL contra el checkpoint: sin red, sin clave y sin costo por token.");
             } else {
                 println!("Estado: ✅ VIVO — los bloques `judge` van a un modelo System One real.");
             }
@@ -912,7 +945,17 @@ fn cmd_llm_status(json: bool) -> ExitCode {
     let report = llm_config_report(&store);
 
     if json {
-        println!("{}", report.to_json());
+        // Mismo contenido que la salida humana, y por el mismo motivo: si `llm status` es el
+        // lugar donde se contesta «¿con qué corrió esto?», un agente tiene que poder contestarlo
+        // también. La parte de inferencia se agrega acá y no en `to_json()` porque el reporte de
+        // providers no conoce —ni tiene por qué— el motor local.
+        synsema_runtime::llm_providers::install_infer_knobs(&store);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&report.to_json()).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("inference".to_string(), inference_json());
+        }
+        println!("{}", v);
         return if report.offline.is_none() { ExitCode::SUCCESS } else { ExitCode::from(1) };
     }
 
@@ -962,6 +1005,13 @@ fn cmd_llm_status(json: bool) -> ExitCode {
     }
     println!();
 
+    // `llm status` no elige provider (sólo reporta), así que instala los knobs del motor a mano:
+    // sin esto la lista de arquitecturas ignoraría un `SYNSEMA_INFER_ARCHDEF` puesto en el `.env`
+    // y diría que corre algo distinto de lo que va a correr.
+    synsema_runtime::llm_providers::install_infer_knobs(&store);
+    print_local_models();
+    print_architectures();
+
     match &report.offline {
         None => {
             println!("Estado: ✅ VIVO — reason/decide/analyze/generate/llm_step van a un modelo real.");
@@ -983,7 +1033,9 @@ fn cmd_llm_status(json: bool) -> ExitCode {
                     println!("        SYNSEMA_LLM_PROVIDER. El .env del directorio actual se auto-carga.");
                 }
                 OfflineReason::LocalModelMissing => {
-                    println!("Estado: ✗ OFFLINE — provider `local` necesita SYNSEMA_LLM_MODEL=<ruta al .gguf>.");
+                    println!("Estado: ✗ OFFLINE — provider `local` necesita SYNSEMA_LLM_MODEL.");
+                    println!("        Acepta una ruta a un .gguf, un `modelo:tag` que ya tengas en Ollama,");
+                    println!("        o un `org/repo` que ya tengas en el cache de Hugging Face.");
                 }
                 OfflineReason::LocalFeatureMissing => {
                     println!("Estado: ✗ OFFLINE — este binario NO tiene la feature llm-local compilada.");
@@ -997,6 +1049,118 @@ fn cmd_llm_status(json: bool) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Los modelos que YA están en disco (cache de Ollama o de Hugging Face), para que
+/// `llm status` pueda decir "tenés esto, usá este nombre". Es la mitad visible de la tanda I2:
+/// el on-ramp sin descargas. Sin la feature no hay nada que listar.
+#[cfg(feature = "llm-local")]
+fn print_local_models() {
+    let found = synsema_runtime::llm_local::discovered_models();
+    if found.is_empty() {
+        return;
+    }
+    println!("Modelos locales ya descargados ({}):", found.len());
+    for m in found.iter().take(15) {
+        // El sha viene gratis del store de Ollama (es content-addressed); en HF no, y ahí se
+        // muestra sin él en vez de pagar el hash de varios GB para un diagnóstico.
+        let sha = match &m.digest {
+            Some(d) => format!("  sha256:{}", &d[..d.len().min(12)]),
+            None => String::new(),
+        };
+        println!("  {:<38} {}{}", m.name, m.origin.label(), sha);
+    }
+    if found.len() > 15 {
+        println!("  … y {} más", found.len() - 15);
+    }
+    println!("  Usá SYNSEMA_LLM_MODEL=<nombre> — no se descarga nada.");
+    println!();
+}
+
+#[cfg(not(feature = "llm-local"))]
+fn print_local_models() {}
+
+/// Las arquitecturas que este binario sabe correr (tanda I5).
+///
+/// Vale imprimirlas aunque parezcan fijas, porque **no lo son**: el operador puede sumar una con
+/// un archivo. La línea dice de dónde salió cada una y con qué sha, así que si alguien pisó la
+/// nuestra con la suya, se ve acá y no en el resultado de una generación.
+#[cfg(feature = "llm-local")]
+fn print_architectures() {
+    let r = synsema_runtime::llm_local::architecture_report();
+    if r.lines.is_empty() && r.problems.is_empty() {
+        return;
+    }
+    println!("Arquitecturas que corre el backend `{}` ({}):", r.backend, r.lines.len());
+    for line in &r.lines {
+        println!("  {}", line);
+    }
+    match (&r.dir, r.backend) {
+        (Some(d), _) => println!("  Definiciones del operador: {}", d),
+        // Con candle la lista está COMPILADA y un `.archdef` no la cambia: decir cómo sumar una
+        // sin nombrar el knob que la habilita sería mandar a alguien a un archivo que se ignora.
+        (None, "candle") => {
+            println!("  Esta lista está compilada. El backend propio corre definiciones:");
+            println!("  SYNSEMA_INFER_BACKEND=rust y SYNSEMA_INFER_ARCHDEF=<directorio>.");
+        }
+        (None, _) => {
+            println!("  Para sumar una sin recompilar: escribí <arch>.archdef y apuntá");
+            println!("  SYNSEMA_INFER_ARCHDEF a su directorio.");
+        }
+    }
+    for p in &r.problems {
+        println!("  ⚠ no cargó — {}", p);
+    }
+    println!();
+}
+
+#[cfg(not(feature = "llm-local"))]
+fn print_architectures() {}
+
+/// La parte de `llm status --json` que describe el motor local: qué backend corre, qué
+/// arquitecturas conoce con su sha completo, qué definiciones no cargaron y qué modelos hay ya
+/// en disco. Es la procedencia en campos — comparable entre corridas sin parsear una frase.
+#[cfg(feature = "llm-local")]
+fn inference_json() -> serde_json::Value {
+    let r = synsema_runtime::llm_local::architecture_report();
+    let archs: Vec<serde_json::Value> = r
+        .archs
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "name": a.name,
+                "kind": a.kind,
+                "steps_per_block": a.steps_per_block,
+                "origin": a.origin,
+                "sha256": a.sha256,
+            })
+        })
+        .collect();
+    let models: Vec<serde_json::Value> = synsema_runtime::llm_local::discovered_models()
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "name": m.name,
+                "origin": m.origin.label(),
+                "digest": m.digest,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "available": true,
+        "backend": r.backend,
+        "archdef_dir": r.dir,
+        "architectures": archs,
+        "problems": r.problems,
+        "models_on_disk": models,
+    })
+}
+
+/// Sin la feature no hay motor local: se dice, en vez de omitir la clave y que el que lee tenga
+/// que distinguir «no hay» de «no se sabe».
+#[cfg(not(feature = "llm-local"))]
+fn inference_json() -> serde_json::Value {
+    serde_json::json!({ "available": false })
 }
 
 fn cmd_conform(args: &[String]) -> ExitCode {

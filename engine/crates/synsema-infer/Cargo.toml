@@ -1,0 +1,47 @@
+[package]
+name = "synsema-infer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Synsema infer: inferencia local (GGUF/safetensors) en CPU, determinista y atestiguable"
+
+# Este crate NO depende de synsema-llm ni de synsema-runtime: invertiría las capas. Expone
+# `generate` / `embed` / `decide` puros; quien los cablea al protocolo LLM es el adaptador
+# `synsema-runtime/src/llm_local.rs`. Ver specs/synsema-infer.md §2.3.
+[dependencies]
+serde_json.workspace = true
+
+# El backend de cálculo de hoy (spec §0: inquilino temporal detrás de `backend.rs`).
+# TODO I4: cuando `backend_rust.rs` pase los goldens, estas tres se vuelven opcionales de
+# verdad y `arch_candle.rs` se borra entero.
+candle-core = { workspace = true, optional = true }
+candle-transformers = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+# El backend propio (I4): sin candle, sin HuggingFace.
+matrixmultiply = { workspace = true, optional = true }
+half = { workspace = true, optional = true }
+memmap2 = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+
+[features]
+default = []
+
+# El backend candle. En I1 es el único que existe, así que toda arquitectura lo implica.
+candle-backend = ["dep:candle-core", "dep:candle-transformers", "dep:candle-nn", "dep:tokenizers"]
+
+# Una feature por familia de arquitectura (spec §2.1, regla 5): un build chico se lleva
+# sólo lo que usa. En I1 las tres delegan en candle; en I4 pasan a `backend_rust`.
+arch-llama = ["candle-backend"]
+arch-qwen2 = ["candle-backend"]
+arch-qwen3 = ["candle-backend"]
+# Encoder ModernBERT + cabezas de decision de Laya: el `judge` local (tanda I3).
+arch-modernbert = ["candle-backend"]
+
+# EL BACKEND PROPIO (tanda I4): tensores f32 en Rust puro. NO implica candle.
+rust-backend = ["dep:matrixmultiply", "dep:half", "dep:memmap2"]
+
+# El agregado que enciende lo que hoy trae el binario oficial.
+gguf = ["arch-llama", "arch-qwen2", "arch-qwen3"]
+
+# El agregado que enciende todo lo que trae el binario oficial.
+full = ["gguf", "arch-modernbert"]

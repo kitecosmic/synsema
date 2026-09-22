@@ -6,6 +6,7 @@ members = [
     "crates/synsema-stdlib",
     "crates/synsema-agents",
     "crates/synsema-llm",
+    "crates/synsema-infer",
     "crates/synsema-runtime",
     "crates/synsema-cli",
     "crates/synsema-wasm",
@@ -132,6 +133,17 @@ redis = { version = "0.32", default-features = false, features = ["tls-rustls"] 
 # candle-core y candle-transformers PINNEADAS a la misma versión (comparten tipos).
 candle-core = { version = "0.11", default-features = false }
 candle-transformers = { version = "0.11", default-features = false }
+# candle-nn: las capas (Linear, LayerNorm, Embedding) con las que se escriben las cabezas
+# de Laya. Ya entra al arbol por candle-transformers; se declara para poder usarla directo.
+candle-nn = { version = "0.11", default-features = false }
+# matrixmultiply: el kernel de matmul del backend PROPIO (tanda I4). Puro Rust, con SIMD,
+# de bluss (ndarray) y ajeno a HuggingFace. Ya entraba al arbol; se declara para usarlo.
+matrixmultiply = { version = "0.3", default-features = false, features = ["std"] }
+# half: f16/bf16 -> f32 al leer un safetensors con nuestro propio lector (I4).
+half = { version = "2", default-features = false, features = ["std"] }
+# memmap2: mapear el GGUF en vez de copiarlo (I4-d). Sin esto un modelo de 7 GB pedia 14 GB
+# de RAM; con mmap el SO pagina bajo demanda y corre aunque no entre entero.
+memmap2 = { version = "0.9", default-features = false }
 # Tokenizer HF para reconstruir el vocabulario DESDE la metadata del GGUF (sin sidecar
 # tokenizer.json). NUESTRO tokenizers (0.23) es puro Rust: `fancy-regex` en vez del
 # default `onig`, sin `esaxx_fast` (C++, solo sirve para TRAINING). PERO candle-core 0.11
@@ -297,6 +309,9 @@ synsema-capabilities = { path = "crates/synsema-capabilities" }
 synsema-stdlib = { path = "crates/synsema-stdlib" }
 synsema-agents = { path = "crates/synsema-agents" }
 synsema-llm = { path = "crates/synsema-llm" }
+# Inferencia local (spec specs/synsema-infer.md): el crate propio que encapsula el backend
+# de calculo. Lo consume synsema-runtime bajo la feature `llm-local`.
+synsema-infer = { path = "crates/synsema-infer" }
 synsema-runtime = { path = "crates/synsema-runtime" }
 
 [profile.release]

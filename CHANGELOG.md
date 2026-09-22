@@ -6,6 +6,95 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.27 — 2026-09-21
+
+No breaking changes to programs: a program that loads on v0.6.26 loads unchanged, and the new
+inference engine is opt-in. **One answer does change, on purpose:** a GGUF of the llama family
+(llama 1/2, Mistral, Gemma) was being tokenised wrong and now is not, so with those weights the
+local provider generates different — correct — text than it did before. See *Fixed*.
+
+### Added
+
+- **`synsema-infer`: local inference is now a crate of our own.** The GGUF loading, the tokenizer,
+  the instance pool, the KV cache, generation and sampling moved out of `llm_local.rs` into
+  `engine/crates/synsema-infer`, behind a facade with three doors — `generate` (the `local` LLM
+  provider), `embed` and `decide` (the local judge). candle is one backend behind our own trait,
+  not the shape of the code. Nothing in the language changed; the reason is in
+  `specs/synsema-infer.md`.
+
+- **`SYNSEMA_LLM_MODEL` takes a name, not only a path.** Three forms, and **none of them downloads
+  anything**: a path to a `.gguf`, a `model:tag` already in the Ollama cache, or an `org/repo`
+  already in the Hugging Face cache. A developer who already has Ollama runs their first `.syn`
+  with a local model without fetching a byte. Ollama's store is content-addressed, so the sha256
+  of the weights comes for free and is reported as provenance.
+
+- **A backend written by us: `SYNSEMA_INFER_BACKEND=rust`.** No candle in the tree for that path.
+  Two things it buys today: it runs **gemma3**, which candle does not ship quantized, and it picks
+  its SIMD (AVX, AVX2+FMA, AVX-512, NEON) **at run time**, so the official binary uses the
+  instructions of the machine it lands on — the `-C target-cpu=native` rebuild that the docs used
+  to ask for is no longer the only way to get it. The default stays candle while both exist:
+  switching engines changes the generated text, so it is part of what you declare to reproduce an
+  output, next to the binary and the weights.
+
+- **Architectures are declared in a file, not compiled in: `SYNSEMA_INFER_ARCHDEF`.** An
+  architecture is a list of named steps over the tensors of a GGUF (`.archdef`) — the four we ship
+  (llama, qwen2, qwen3, gemma3) are embedded in the binary, and a directory of your own adds new
+  ones, or replaces ours, **without recompiling anything**. The format has no conditionals, no
+  loops and no way to read a file, open a socket or call anything, so using someone else's
+  definition does not execute their code: the worst it can do is not load, or give wrong numbers
+  with your own weights. A file that fails to parse leaves **that** architecture unavailable with
+  the error of the file — it never silently falls back to ours. `synsema llm status` says which
+  definition is running and with what sha.
+
+- **`judge` runs locally: `SYNSEMA_JUDGE_PROVIDER=laya`.** The third backend of the judge slot,
+  next to `typesafe` and `mock`: a Laya (ModernBERT) checkpoint on disk answers `whether`, `choose`
+  and `rate` **with no network, no secret and no cost per token**, so the offline degradation to
+  confidence 0 stops being the common case. The same `judge` block runs unchanged; point
+  `SYNSEMA_JUDGE_MODEL` at the checkpoint directory (or an `org/repo` already in the Hugging Face
+  cache). The official binaries ship with it compiled in.
+
+- **`synsema llm status` says what is actually on this machine.** The models already downloaded
+  (name, origin and sha when the store gives it for free), the architectures this binary knows with
+  their origin and sha, and the definitions from your directory that failed to load with their
+  error. `--json` carries the same under an `inference` key, with the **full** sha — provenance is
+  only useful if it can be compared, and comparing prose is not comparing.
+
+- **`synsema judge status` shows only what applies to the backend.** `typesafe` gets key, model,
+  base URL and timeout; `laya` gets the checkpoint; `mock` gets none of it. It used to print
+  `TYPESAFE_API_KEY ✗ FALTA` and a base URL nobody was going to call, which is noise that makes
+  people doubt a diagnosis that is right.
+
+### Fixed
+
+- **The SentencePiece tokenizer was wrong for the whole llama family.** GGUF files whose
+  `tokenizer.ggml.model` is `llama` (llama 1 and 2, Mistral, Gemma) store **ranks**, not
+  log-probabilities, and we were segmenting them with a Viterbi pass that maximises the sum of the
+  scores. `The capital of France is` entered the model as eleven fragments instead of five words,
+  and nothing failed — the model just answered badly. It is now the reference algorithm (merge the
+  neighbouring pair with the best score, as llama.cpp does), written by us, with literal
+  recognition of special tokens, byte fallback and `add_space_prefix` read from the metadata. The
+  BPE family (qwen, llama 3) was never affected.
+
+- **gemma3's MLP activation was `silu` and it is `gelu_pytorch_tanh`.** Copied from candle's
+  `quantized_gemma3`, which hardcodes `silu` while its own non-quantized `gemma3` reads the config.
+  With the tokenizer fixed, both produce readable text — the difference shows in the numbers (top
+  logit 7.91 vs 27.02) and in the exact answer. The engine now generates, token for token, what
+  Ollama generates for the same prompt.
+
+- **Gemma had no chat template.** `<start_of_turn>` was not recognised, so a gemma GGUF fell back
+  to plain mode and behaved like a base model.
+
+- **`synsema llm status` listed the wrong architectures with candle active.** It printed the four
+  `.archdef` definitions — gemma3 among them, and any file of yours — no matter which backend was
+  selected, while candle runs neither. The runtime was always right; the report was the one
+  dressing it up. It now lists the architectures of the backend that will actually run.
+
+- **`SYNSEMA_INFER_BACKEND` and `SYNSEMA_INFER_ARCHDEF` are read from the `.env`.** They were
+  resolved straight from the process environment while `synsema init` documents them in the LLM
+  section of `.env.example`, which is the part that *is* auto-loaded. Setting them there did
+  nothing, silently. They now follow the same `environ > .env > default` precedence as every other
+  knob, and `synsema init` writes both.
+
 ## v0.6.26 — 2026-09-20
 
 No breaking changes to programs. `synsema check` is stricter on `judge` blocks: see below.

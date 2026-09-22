@@ -1,0 +1,39 @@
+# llama — el decoder de referencia: RMSNorm pre-bloque, GQA, RoPE y SwiGLU.
+#
+# Las otras tres definiciones de este directorio son ésta con líneas agregadas. Leídas una al lado
+# de la otra, un `diff` muestra exactamente en qué se diferencian las arquitecturas — que era lo
+# único interesante y lo que un archivo de Rust con banderas escondía.
+
+arch llama
+kind decoder
+
+prologue
+  x = embed(token_embd.weight)
+
+block
+  # Atención.
+  h = rms_norm(x, blk.{i}.attn_norm.weight)
+  q = matmul(h, blk.{i}.attn_q.weight)
+  k = matmul(h, blk.{i}.attn_k.weight)
+  v = matmul(h, blk.{i}.attn_v.weight)
+  rope(q, head_count)
+  rope(k, head_count_kv)
+  a = attention(q, k, v)
+  o = matmul(a, blk.{i}.attn_output.weight)
+  add(x, o)
+
+  # SwiGLU: down( silu(gate(x)) * up(x) ).
+  h = rms_norm(x, blk.{i}.ffn_norm.weight)
+  g = matmul(h, blk.{i}.ffn_gate.weight)
+  silu(g)
+  u = matmul(h, blk.{i}.ffn_up.weight)
+  mul(g, u)
+  d = matmul(g, blk.{i}.ffn_down.weight)
+  add(x, d)
+
+epilogue
+  x = rms_norm(x, output_norm.weight)
+  # Sólo el último token importa: los logits de los anteriores ya no se usan.
+  x = last(x)
+  # Con embeddings atados no hay `output.weight` y la cabeza es la tabla de embeddings.
+  logits = matmul(x, output.weight | token_embd.weight)

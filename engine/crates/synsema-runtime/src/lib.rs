@@ -15,6 +15,10 @@ pub mod host;
 pub mod llm_local;
 /// Provider del primitivo `judge` (System One): slot paralelo al de LLM.
 pub mod judge_provider;
+/// Backend LOCAL de `judge`: Laya sobre `synsema-infer`. Sin red, sin secreto, sin costo.
+/// Sólo con `--features judge-laya`.
+#[cfg(feature = "judge-laya")]
+pub mod judge_laya;
 pub mod llm_providers;
 pub mod parallel;
 pub mod persistence;

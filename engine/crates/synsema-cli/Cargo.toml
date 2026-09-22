@@ -15,6 +15,8 @@ path = "src/main.rs"
 # Forward de la feature del runtime (spec LLM-LOCAL F1): binario con inferencia GGUF
 # embebida → `cargo install --path crates/synsema-cli --features llm-local`.
 llm-local = ["synsema-runtime/llm-local"]
+# Backend local de `judge` (tanda I3): `SYNSEMA_JUDGE_PROVIDER=laya` con un checkpoint en disco.
+judge-laya = ["synsema-runtime/judge-laya"]
 
 [dependencies]
 synsema-core.workspace = true

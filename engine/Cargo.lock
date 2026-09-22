@@ -4824,6 +4824,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "synsema-infer"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "candle-transformers",
+ "half",
+ "matrixmultiply",
+ "memmap2",
+ "serde_json",
+ "tokenizers 0.23.1",
+]
+
+[[package]]
 name = "synsema-llm"
 version = "0.1.0"
 dependencies = [
@@ -4839,8 +4853,6 @@ dependencies = [
 name = "synsema-runtime"
 version = "0.1.0"
 dependencies = [
- "candle-core",
- "candle-transformers",
  "indexmap",
  "p256",
  "rcgen 0.13.2",
@@ -4852,9 +4864,9 @@ dependencies = [
  "synsema-agents",
  "synsema-capabilities",
  "synsema-core",
+ "synsema-infer",
  "synsema-llm",
  "synsema-stdlib",
- "tokenizers 0.23.1",
  "tokio",
  "tungstenite",
 ]
