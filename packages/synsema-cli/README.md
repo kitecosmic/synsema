@@ -19,6 +19,6 @@ runs it with your arguments — no `postinstall`, no downloads at install time, 
 
 Updating: `npm i -g synsema@latest` (the binary's own `synsema update` notices it was
 installed by npm and tells you the same). Other install paths — `curl -fsSL
-https://synsema.org/install.sh | sh`, PowerShell, Docker, the WebAssembly artifacts and
+https://synsema.com/install.sh | sh`, PowerShell, Docker, the WebAssembly artifacts and
 the embeddable [`@synsema/wasm`](https://www.npmjs.com/package/@synsema/wasm) — are in the
 [docs](https://synsema.dev).

@@ -19,7 +19,7 @@ core dev loop:
 | **Re-propagate a caught error** | `raise(err)` inside `recover` (else `recover` swallows it) → [builtins.md](builtins.md) |
 | **Inspect agents / swarm state** | `synsema conform --swarm file.syn` (JSON dump: blackboard + agent states) |
 | **Try things interactively** | `synsema repl` |
-| **Install** | `curl -fsSL https://synsema.org/install.sh \| sh` (Linux/macOS), `irm https://synsema.org/install.ps1 \| iex` (Windows), or `npm i -g synsema` / `npx synsema …` (same native binary via npm, v0.6.3+) |
+| **Install** | `curl -fsSL https://synsema.com/install.sh \| sh` (Linux/macOS), `irm https://synsema.com/install.ps1 \| iex` (Windows), or `npm i -g synsema` / `npx synsema …` (same native binary via npm, v0.6.3+) |
 | **Update** binary + this skill | `synsema update` (if installed by npm it says so: `npm i -g synsema@latest`), then re-run the skill installer (see "Keep yourself current" below) |
 | **Diagnose LLM config** | `synsema llm status` (resolved config with sources; names the missing variable when offline; **which models are already on disk and which architectures the engine will run, with their sha** — v0.6.27+) |
 | **Run a model with no network, no key, no server** | a GGUF in-process: `SYNSEMA_LLM_PROVIDER=local` + `SYNSEMA_LLM_MODEL=<path \| ollama model:tag \| hf org/repo>` → [llm.md](llm.md); to add an architecture without recompiling → [inference.md](inference.md) |
