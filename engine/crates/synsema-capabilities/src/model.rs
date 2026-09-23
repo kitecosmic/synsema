@@ -116,6 +116,84 @@ impl CapabilityType {
 /// Nombres aceptados por `--cap-set` (para el mensaje de error y los docs).
 pub const KNOWN_CAPABILITY_NAMES: &str = "net, file, file.read, file.write, exec, env, time, random, stdout, stdin, llm, judge, db, serve, secret, reveal, sign, wallet, spend, memory, sandbox_run, attest";
 
+/// Capabilities LOCALES AL PROCESO: el stdout, el stdin, el reloj y la entropía del proceso
+/// que corre. Un techo DELEGADO (un captoken, un `sandbox under`) NO las gobierna: quien
+/// delega autoridad no posee el stdout ni el reloj del proceso del delegatario, así que no
+/// puede ni darlos ni quitarlos por `caps` (§12.1 del spec de identidad). Las gobiernan el
+/// HOST (`--cap-set`, `--deterministic`) y el programa (`require random`). Lo único que un
+/// emisor puede pedir sobre ellas es el caveat `deterministic` (sin reloj ni entropía), que
+/// es una restricción de ejecución, no autoridad — y va en `Delegation::deterministic`.
+pub const PROCESS_LOCAL: &[CapabilityType] =
+    &[CapabilityType::Stdout, CapabilityType::Stdin, CapabilityType::Time, CapabilityType::Random];
+
+/// ¿Es una capability local al proceso (no delegable por token ni por bloque)?
+pub fn is_process_local(ty: CapabilityType) -> bool {
+    PROCESS_LOCAL.contains(&ty)
+}
+
+/// De dónde viene un techo delegado: un captoken verificado (con su `id`, que es lo que se
+/// revoca — los captokens son simétricos y no tienen `keyid`) o un bloque `sandbox under`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DelegationSource {
+    Token(String),
+    Block,
+}
+
+impl DelegationSource {
+    /// El `source` de la entrada de audit cuando un grant se rechaza por este techo.
+    pub fn audit_source(&self) -> &'static str {
+        match self {
+            DelegationSource::Token(_) => "token",
+            DelegationSource::Block => "sandbox",
+        }
+    }
+}
+
+/// Un techo DELEGADO: lo que un captoken verificado (o un `sandbox under`) deja hacer a la
+/// unidad de trabajo que corre bajo él. Se apila sobre el techo del host y sólo RESTA:
+/// `caps_efectivas ⊆ require ∩ techo_host ∩ techo_delegado`. Gobierna la autoridad
+/// TRANSFERIBLE (net/file/exec/env/db/llm/judge/serve/secret/reveal/sign/wallet/spend/
+/// memory/sandbox_run/attest) y deja pasar lo local al proceso (`PROCESS_LOCAL`), salvo que
+/// el emisor haya pedido `deterministic`: entonces `time` y `random` se niegan, exactamente
+/// como el techo `--deterministic` del host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Delegation {
+    pub caps: Vec<Capability>,
+    pub source: DelegationSource,
+    pub deterministic: bool,
+}
+
+impl Delegation {
+    pub fn token(id: impl Into<String>, caps: Vec<Capability>, deterministic: bool) -> Self {
+        Delegation { caps, source: DelegationSource::Token(id.into()), deterministic }
+    }
+
+    pub fn block(caps: Vec<Capability>) -> Self {
+        Delegation { caps, source: DelegationSource::Block, deterministic: false }
+    }
+
+    /// ¿Este techo delegado cubre la capability? Mismo `covers()` que gatea los `require`
+    /// (misma canonización, mismo glob): no hay una segunda lógica de scopes.
+    pub fn covers(&self, cap: &Capability) -> bool {
+        if is_process_local(cap.ty) {
+            return !(self.deterministic && matches!(cap.ty, CapabilityType::Time | CapabilityType::Random));
+        }
+        self.caps.iter().any(|allowed| allowed.covers(cap))
+    }
+
+    /// El `reason` de la entrada de audit (y el sufijo del mensaje) de un rechazo.
+    pub fn reason_for(&self, cap: &Capability) -> String {
+        let deterministic = self.deterministic && is_process_local(cap.ty);
+        match (&self.source, deterministic) {
+            (DelegationSource::Token(id), false) => format!("above delegated ceiling (token {})", id),
+            (DelegationSource::Token(id), true) => {
+                format!("denied by the deterministic caveat of token {}", id)
+            }
+            (DelegationSource::Block, _) => "above sandbox ceiling (sandbox under)".to_string(),
+        }
+    }
+}
+
 /// Mapa nombre→tipo (CAPABILITY_NAMES del oráculo).
 pub fn capability_type_from_name(name: &str) -> Option<CapabilityType> {
     use CapabilityType::*;
@@ -369,6 +447,10 @@ pub fn normalize_path(p: &str) -> String {
 pub enum DenyCause {
     ExplicitlyDenied(Capability),
     AboveCeiling,
+    /// Declarada por el programa, pero por encima del techo DELEGADO (el token del caller
+    /// no la concede, o un `sandbox under` la dejó afuera). Si es un token, es culpa del
+    /// CALLER (bajo `serve` → 403 genérico), no del programa ni del host.
+    Delegated(Delegation),
     NoGrant,
 }
 
@@ -516,6 +598,14 @@ pub struct CapabilitySet {
     /// amplía: `caps_efectivas ⊆ require ∩ techo`. Se propaga (`Rc::clone`, barato) a todo
     /// set derivado (hijo/sandbox/worker/agente) para que su `grant()`/`check()` lo honren.
     pub ceiling: Option<Rc<Vec<Capability>>>,
+    /// Techos DELEGADOS (T1 del spec de identidad), apilados: el captoken que autenticó la
+    /// request (lo pone el runtime de serve por request), y encima cada `sandbox under`
+    /// anidado. Una capability pasa sólo si TODOS la cubren, además del techo del host.
+    /// Es el segundo dueño de la capa: el caller delega, el host gobierna, el programa
+    /// declara; ninguno amplía al otro. Se propaga a todo set derivado (hijo/sandbox/
+    /// worker/agente) igual que `ceiling`, y `reset_keeping_ceiling` lo VACÍA a propósito
+    /// (un techo delegado es de una unidad de trabajo, jamás del worker que la corrió).
+    pub delegated: Vec<Rc<Delegation>>,
     /// Grants del PROGRAMA que el techo rechazó: la capability está DECLARADA aunque no
     /// concedida — es lo que distingue "declared but above the ceiling" de "no grant".
     pub rejected_by_ceiling: Vec<Capability>,
@@ -531,6 +621,7 @@ impl CapabilitySet {
             rejected_by_ceiling: Vec::new(),
             parent: None,
             ceiling: None,
+            delegated: Vec::new(),
         }
     }
 
@@ -542,6 +633,33 @@ impl CapabilitySet {
             None => true,
             Some(c) => c.iter().any(|allowed| allowed.covers(cap)),
         }
+    }
+
+    /// El primer techo DELEGADO que NO cubre la capability (si hay alguno). Sin techos
+    /// delegados → `None` (el hot-path por defecto no paga nada).
+    fn rejected_by_delegation(&self, cap: &Capability) -> Option<Rc<Delegation>> {
+        self.delegated.iter().find(|d| !d.covers(cap)).cloned()
+    }
+
+    /// Apila un techo delegado (el token de la request, un `sandbox under`).
+    pub fn push_delegation(&mut self, delegation: Delegation) {
+        self.delegated.push(Rc::new(delegation));
+    }
+
+    /// Quita el último techo delegado apilado (al salir de un `sandbox under`).
+    pub fn pop_delegation(&mut self) -> Option<Rc<Delegation>> {
+        self.delegated.pop()
+    }
+
+    /// Los techos delegados vigentes, en forma OWNED (para cruzar a un hilo: un agente
+    /// spawneado, un worker de `parallel_map`).
+    pub fn delegations(&self) -> Vec<Delegation> {
+        self.delegated.iter().map(|d| (**d).clone()).collect()
+    }
+
+    /// Instala techos delegados heredados de la unidad de trabajo que creó ésta.
+    pub fn set_delegations(&mut self, delegations: Vec<Delegation>) {
+        self.delegated = delegations.into_iter().map(Rc::new).collect();
     }
 
     /// Un grant del PROGRAMA (`require …`).
@@ -579,6 +697,23 @@ impl CapabilitySet {
             });
             return;
         }
+        // Techo DELEGADO (token / `sandbox under`): mismo tratamiento que el del host — no se
+        // inserta, queda como DECLARADA (el programa la pidió; es el caller quien no la
+        // concede) y el audit dice de qué token vino.
+        if let Some(d) = self.rejected_by_delegation(&capability) {
+            if origin == "program" {
+                self.rejected_by_ceiling.push(capability.clone());
+            }
+            let reason = d.reason_for(&capability);
+            self.push_audit(CapabilityAuditEntry {
+                capability,
+                granted: false,
+                source: d.source.audit_source().to_string(),
+                reason,
+                origin,
+            });
+            return;
+        }
         // Un grant AMBIENTE que entra deja rastro: sin esta entrada el audit no puede
         // distinguir "stdout auto-concedido por el runtime" de "nunca se habló de stdout".
         if origin == "runtime" {
@@ -596,6 +731,9 @@ impl CapabilitySet {
     /// Vacía el set (grants, denials, audit, padre) CONSERVANDO el techo del host. Es lo
     /// que un contexto reutilizado (un worker de `serve` entre requests) tiene que hacer:
     /// `*set = CapabilitySet::new(..)` perdería el techo — y con él, el `--sandbox`.
+    /// Los techos DELEGADOS se vacían A PROPÓSITO: el token es de la request que se fue,
+    /// y el request siguiente del mismo worker tiene que ver el techo del host completo
+    /// (T1 del spec de identidad: "nunca un slot aparte").
     pub fn reset_keeping_ceiling(&mut self, name: &str) {
         let ceiling = self.ceiling.clone();
         *self = CapabilitySet::new(name);
@@ -663,6 +801,27 @@ impl CapabilitySet {
             return Err(DenyCause::AboveCeiling);
         }
 
+        // 1.6) Techos DELEGADOS (el token de la request, los `sandbox under` apilados): un
+        // USO por encima se deniega aunque el grant exista — el programa la declaró, el
+        // caller no la delegó. Mismo criterio que el host: sólo si está DECLARADA; si no,
+        // es "no grant" y la culpa es del programa, no del token.
+        if !self.delegated.is_empty() {
+            if let Some(d) = self.rejected_by_delegation(requested) {
+                if self.is_declared(requested) {
+                    if audit {
+                        self.push_audit(CapabilityAuditEntry {
+                            capability: requested.clone(),
+                            granted: false,
+                            source: source.to_string(),
+                            reason: d.reason_for(requested),
+                            origin: "program",
+                        });
+                    }
+                    return Err(DenyCause::Delegated((*d).clone()));
+                }
+            }
+        }
+
         // 2) Grants.
         let granted_by: Option<Capability> =
             self.granted.iter().find(|c| c.covers(requested)).cloned();
@@ -684,6 +843,7 @@ impl CapabilitySet {
             match parent.borrow_mut().check_inner(requested, source, audit) {
                 Ok(()) => return Ok(()),
                 Err(DenyCause::AboveCeiling) => return Err(DenyCause::AboveCeiling),
+                Err(DenyCause::Delegated(d)) => return Err(DenyCause::Delegated(d)),
                 Err(_) => {}
             }
         }
@@ -707,7 +867,18 @@ impl CapabilitySet {
             || self.parent.as_ref().map(|p| p.borrow().is_declared(requested)).unwrap_or(false)
     }
 
-    /// El mensaje de una denegación, apuntando a quien puede resolverla.
+    /// El `require` exacto que concedería la capability pedida (la forma que el programa
+    /// escribe: `require net("api.x")`, `require file.read("./data")`, `require llm`).
+    pub fn require_line(requested: &Capability) -> String {
+        match &requested.scope {
+            Some(s) if !s.is_empty() => format!("require {}(\"{}\")", requested.ty.wire_name(), s),
+            _ => format!("require {}", requested.ty.wire_name()),
+        }
+    }
+
+    /// El mensaje de una denegación, apuntando a quien puede resolverla — y diciendo en
+    /// voz alta que es un PERMISO, no un bug: un agente que codea y lee "not granted" sin
+    /// más se pone a inventar soluciones a algo que sólo un `require` arregla.
     pub fn denial_message(requested: &Capability, cause: &DenyCause) -> String {
         match cause {
             DenyCause::AboveCeiling => format!(
@@ -717,7 +888,25 @@ impl CapabilitySet {
             DenyCause::ExplicitlyDenied(d) => {
                 format!("Capability not granted: {} — explicitly denied by {}", requested, d)
             }
-            DenyCause::NoGrant => format!("Capability not granted: {}", requested),
+            DenyCause::Delegated(d) => match &d.source {
+                DelegationSource::Token(id) if d.deterministic && is_process_local(requested.ty) => format!(
+                    "Capability not granted: {} — denied by the deterministic caveat of token {}: the caller asked for a run without clock or entropy. The program cannot fix this; the caller must mint a token without that caveat",
+                    requested, id
+                ),
+                DelegationSource::Token(id) => format!(
+                    "Capability not granted: {} — denied by the delegated ceiling of token {}: the program declares it, but the caller's token does not grant it. The program cannot fix this; the caller must present a token that carries it",
+                    requested, id
+                ),
+                DelegationSource::Block => format!(
+                    "Capability not granted: {} — outside the ceiling of the enclosing `sandbox under` block; add it to that block's caps or run this outside the block",
+                    requested
+                ),
+            },
+            DenyCause::NoGrant => format!(
+                "Capability not granted: {} — this is a permission, not a bug: add `{}` to the program's preamble (or to the importing file, when this code runs in a module)",
+                requested,
+                Self::require_line(requested)
+            ),
         }
     }
 
@@ -728,9 +917,24 @@ impl CapabilitySet {
                 message: Self::denial_message(requested, &cause),
                 requested: Some(requested.clone()),
                 source: source.to_string(),
+                cause,
             });
         }
         Ok(())
+    }
+
+    /// La violación de una denegación YA decidida por `check_cause`: para los gates que
+    /// escriben su propio texto en el caso común (sign/spend/wallet/secret/reveal) pero deben
+    /// conservar la CAUSA cuando la culpa es del caller — un techo delegado → `denied_by_token`
+    /// → 403 bajo `serve`, jamás un 500 con "add `require …`" que manda a arreglar un programa
+    /// que ya lo declara y enumera la superficie hacia afuera (auditoría T1–T4, ronda 1).
+    pub fn violation(requested: &Capability, cause: DenyCause, source: &str) -> CapabilityViolation {
+        CapabilityViolation {
+            message: Self::denial_message(requested, &cause),
+            requested: Some(requested.clone()),
+            source: source.to_string(),
+            cause,
+        }
     }
 
     /// Crea un hijo que SÍ hereda del padre (cadena de scopes). El techo del host se
@@ -744,15 +948,18 @@ impl CapabilitySet {
             rejected_by_ceiling: Vec::new(),
             parent: Some(parent.clone()),
             ceiling: parent.borrow().ceiling.clone(),
+            delegated: parent.borrow().delegated.clone(),
         }
     }
 
     /// Crea un sandbox restringido que NO hereda: sólo los grants explícitos.
     /// (Ignora `self`, igual que el oráculo.) El techo del host SÍ se propaga (`Rc::clone`):
     /// el sandbox nunca puede conceder por encima del techo, aunque el grant sea explícito.
+    /// Los techos delegados también: un sandbox dentro de una request sigue bajo su token.
     pub fn create_sandbox(&self, name: &str, allowed: &[Capability]) -> CapabilitySet {
         let mut sandbox = CapabilitySet::new(&format!("sandbox:{}", name));
         sandbox.ceiling = self.ceiling.clone();
+        sandbox.delegated = self.delegated.clone();
         for cap in allowed {
             sandbox.grant(cap.clone());
         }
@@ -782,6 +989,25 @@ pub struct CapabilityViolation {
     pub message: String,
     pub requested: Option<Capability>,
     pub source: String,
+    /// Por qué: decide QUIÉN tiene la culpa (programa / host / el token del caller).
+    pub cause: DenyCause,
+}
+
+impl CapabilityViolation {
+    /// ¿La denegó el token del CALLER (techo delegado de un captoken)? Bajo `serve` eso es
+    /// un 403 genérico hacia afuera, no un 500: la culpa no es del server.
+    pub fn denied_by_token(&self) -> bool {
+        matches!(&self.cause, DenyCause::Delegated(d) if matches!(d.source, DelegationSource::Token(_)))
+    }
+
+    /// El error de runtime equivalente, con el flag `denied_by_token` puesto — la ÚNICA
+    /// forma de convertir una violación en error: el texto nunca decide el status HTTP.
+    pub fn into_error(self) -> synsema_core::interpreter::RuntimeError {
+        let denied_by_token = self.denied_by_token();
+        let mut e = synsema_core::interpreter::RuntimeError::new(self.message);
+        e.denied_by_token = denied_by_token;
+        e
+    }
 }
 
 impl fmt::Display for CapabilityViolation {
@@ -1378,5 +1604,138 @@ mod tee_tests {
         assert!(!open.check(&want, "attest()"));
         open.grant(want.clone());
         assert!(open.check(&want, "attest()"));
+    }
+}
+
+#[cfg(test)]
+mod delegated_ceiling_tests {
+    use super::*;
+
+    fn cap(name: &str, scope: Option<&str>) -> Capability {
+        Capability::new(capability_type_from_name(name).unwrap(), scope.map(|s| s.to_string()))
+    }
+
+    /// El token gobierna la autoridad transferible y deja pasar lo local al proceso.
+    #[test]
+    fn delegated_ceiling_cuts_transferable_and_passes_process_local() {
+        let mut cs = CapabilitySet::new("request");
+        cs.grant_ambient(cap("stdout", None));
+        cs.grant_ambient(cap("time", None));
+        cs.grant(cap("net", Some("api.example.com")));
+        cs.grant(cap("db", Some("orders")));
+        cs.push_delegation(Delegation::token("tok-1", vec![cap("db", Some("orders"))], false));
+
+        assert!(cs.check(&cap("db", Some("orders")), "sql()"), "lo que el token lista pasa");
+        assert!(cs.check(&cap("stdout", None), "print()"), "stdout es local al proceso");
+        assert!(cs.check(&cap("time", None), "now()"), "time es local al proceso");
+        let cause = cs.check_cause(&cap("net", Some("api.example.com")), "fetch()").unwrap_err();
+        match cause {
+            DenyCause::Delegated(d) => assert_eq!(d.source, DelegationSource::Token("tok-1".into())),
+            other => panic!("esperaba Delegated, got {:?}", other),
+        }
+        let msg = CapabilitySet::denial_message(&cap("net", Some("api.example.com")), &cause_of(&mut cs));
+        assert!(msg.contains("delegated ceiling of token tok-1"), "{}", msg);
+        // El audit dice de qué token vino.
+        let last = cs.audit_log.last().unwrap();
+        assert!(!last.granted);
+        assert!(last.reason.contains("token tok-1"), "{}", last.reason);
+    }
+
+    fn cause_of(cs: &mut CapabilitySet) -> DenyCause {
+        cs.check_cause(&cap("net", Some("api.example.com")), "fetch()").unwrap_err()
+    }
+
+    /// Una capability que el programa NUNCA declaró es "no grant" (culpa del programa), no
+    /// "denegada por el token": el 403 es sólo para lo que el programa pidió y el token no dio.
+    #[test]
+    fn undeclared_is_no_grant_even_under_a_token() {
+        let mut cs = CapabilitySet::new("request");
+        cs.push_delegation(Delegation::token("tok-1", vec![cap("db", Some("orders"))], false));
+        let cause = cs.check_cause(&cap("exec", None), "run()").unwrap_err();
+        assert_eq!(cause, DenyCause::NoGrant);
+        let msg = CapabilitySet::denial_message(&cap("exec", None), &cause);
+        assert!(msg.contains("this is a permission, not a bug") && msg.contains("add `require exec`"), "{}", msg);
+    }
+
+    /// `deterministic` niega el reloj y la entropía (y sólo eso) aunque sean locales.
+    #[test]
+    fn deterministic_caveat_denies_clock_and_entropy() {
+        let mut cs = CapabilitySet::new("request");
+        cs.grant_ambient(cap("stdout", None));
+        cs.grant_ambient(cap("time", None));
+        cs.grant(cap("random", None));
+        cs.push_delegation(Delegation::token("tok-det", vec![cap("net", None)], true));
+        assert!(cs.check(&cap("stdout", None), "print()"));
+        let t = cs.check_cause(&cap("time", None), "now()").unwrap_err();
+        assert!(matches!(t, DenyCause::Delegated(_)));
+        let msg = CapabilitySet::denial_message(&cap("time", None), &t);
+        assert!(msg.contains("deterministic caveat of token tok-det"), "{}", msg);
+        assert!(matches!(cs.check_cause(&cap("random", None), "token()").unwrap_err(), DenyCause::Delegated(_)));
+    }
+
+    /// Un `require` bajo un techo delegado que no lo cubre no se inserta, queda DECLARADO y
+    /// auditado con `source: token`; y el reset por request lo vacía todo.
+    #[test]
+    fn grant_above_delegation_is_rejected_and_reset_clears_delegations() {
+        let mut cs = CapabilitySet::new("request");
+        cs.push_delegation(Delegation::token("tok-1", vec![cap("db", Some("orders"))], false));
+        cs.grant(cap("net", Some("api.example.com")));
+        assert!(cs.granted.is_empty());
+        let e = cs.audit_log.last().unwrap();
+        assert_eq!(e.source, "token");
+        assert!(e.reason.contains("above delegated ceiling (token tok-1)"), "{}", e.reason);
+        assert!(matches!(cs.check_cause(&cap("net", Some("api.example.com")), "fetch()").unwrap_err(), DenyCause::Delegated(_)));
+
+        cs.reset_keeping_ceiling("request");
+        assert!(cs.delegated.is_empty(), "el techo delegado es de la request, no del worker");
+        cs.grant(cap("net", Some("api.example.com")));
+        assert!(cs.check(&cap("net", Some("api.example.com")), "fetch()"));
+    }
+
+    /// Los techos delegados se apilan (token de la request + `sandbox under`) y todos
+    /// tienen que cubrir; el host sigue mandando sobre todo, locales incluidas.
+    #[test]
+    fn delegations_stack_and_host_ceiling_still_wins() {
+        let mut cs = CapabilitySet::new("request");
+        cs.ceiling = Some(Rc::new(vec![cap("db", None), cap("net", None)]));
+        cs.grant(cap("db", Some("orders")));
+        cs.grant(cap("db", Some("audit")));
+        // `require time` del PROGRAMA (declarada): el host la rechaza al conceder y el uso
+        // dice "above host ceiling". (Un grant AMBIENTE rechazado no cuenta como declarado.)
+        cs.grant(cap("time", None));
+        cs.push_delegation(Delegation::token("tok-1", vec![cap("db", None)], false));
+        cs.push_delegation(Delegation::block(vec![cap("db", Some("orders"))]));
+        assert!(cs.check(&cap("db", Some("orders")), "sql()"));
+        let c = cs.check_cause(&cap("db", Some("audit")), "sql()").unwrap_err();
+        match c {
+            DenyCause::Delegated(d) => assert_eq!(d.source, DelegationSource::Block),
+            other => panic!("{:?}", other),
+        }
+        cs.pop_delegation();
+        assert!(cs.check(&cap("db", Some("audit")), "sql()"));
+        // El host no cubre `time` → denegada por el host aunque el token la deje pasar.
+        assert_eq!(cs.check_cause(&cap("time", None), "now()").unwrap_err(), DenyCause::AboveCeiling);
+        // Un hijo hereda los techos delegados.
+        let rc = Rc::new(RefCell::new(cs));
+        let child = CapabilitySet::create_child(&rc, "child");
+        assert_eq!(child.delegated.len(), 1);
+    }
+
+    #[test]
+    fn violation_carries_the_token_flag_into_the_runtime_error() {
+        let mut cs = CapabilitySet::new("request");
+        cs.grant(cap("net", None));
+        cs.push_delegation(Delegation::token("tok-1", vec![cap("db", None)], false));
+        let v = cs.require(&cap("net", None), "fetch()").unwrap_err();
+        assert!(v.denied_by_token());
+        let e = v.into_error();
+        assert!(e.denied_by_token);
+        // Un bloque `sandbox under` es decisión del programa: no es "del token".
+        let mut cs2 = CapabilitySet::new("request");
+        cs2.grant(cap("net", None));
+        cs2.push_delegation(Delegation::block(vec![cap("db", None)]));
+        let v2 = cs2.require(&cap("net", None), "fetch()").unwrap_err();
+        assert!(!v2.denied_by_token());
+        assert!(!v2.into_error().denied_by_token);
     }
 }

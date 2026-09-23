@@ -93,7 +93,7 @@ fn bytes_arg(v: Option<&SynValue>, who: &str, what: &str) -> Result<(Vec<u8>, bo
 fn require_random(caps: &Rc<RefCell<CapabilitySet>>, source: &str) -> Result<(), Control> {
     caps.borrow_mut()
         .require(&Capability::new(CapabilityType::Random, None), source)
-        .map_err(|v| Control::Error(RuntimeError::new(v.message)))
+        .map_err(|v| Control::Error(v.into_error()))
 }
 
 /// Escalar privado válido desde OsRng: `from_slice` rechaza 0 y ≥ n; se reintenta (la

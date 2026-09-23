@@ -212,6 +212,19 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # identidad. Se aplica ADEMAS del techo por unidad: manda el mas restrictivo:
 # SYNSEMA_SPEND_CEILING_PER_IDENTITY=agent-1=EUR:50,researcher=ETH:0.01
 
+# El SUJETO de `synsema run`: en nombre de quien corre el programa (el operador). Bajo
+# `serve` la identidad la pone la task de `auth with` por request y un tick de cron corre
+# como `cron:<job>`; bajo `run` no hay nadie salvo que lo digas aca. El ledger de spend,
+# el techo LLM por identidad y el audit imputan a este nombre, y los agentes que el main
+# spawnea lo heredan:
+# SYNSEMA_IDENTITY=operator
+
+# La IDENTIDAD del server bajo `serve`: la semilla ed25519 (64 hex) que firma la Agent Card
+# en /.well-known/agent-card.json y da el did:key del server (did_key_encode). Generala una
+# vez: `let seed be random_bytes(32)` + `decode(seed, "hex")`, y guardala como secreto.
+# Bajo `serve --attested` la identidad es la clave atestada y esta variable se ignora:
+# SYNSEMA_IDENTITY_KEY=
+
 # Techo de CANTIDAD de firmas por clave (name del secret de la clave): pares
 # clave:n separados por comas. La firma n+1 falla catchable y queda auditada:
 # SYNSEMA_SIGN_CEILING=HOT_KEY:100
@@ -381,6 +394,9 @@ const HELLO_SYN_PAST: &[&str] = &[
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
 const ENV_EXAMPLE_PAST: &[&str] = &[
+    // T1 identidad (2026-09-22, post v0.6.27): antes de SYNSEMA_IDENTITY (el sujeto de `run`)
+    // en la seccion de techos por identidad.
+    "dce31ea48a800f7c9e0f0279a6e3ab7a3aea5a18341bdfdae64e29efdab5dec1",
     // V0.6.27 (2026-09-21): antes de `SYNSEMA_JUDGE_PROVIDER=laya` (el judge local) en la
     // seccion "Judge (System One)". `laya` es un valor nuevo de una variable vieja, y el test
     // anti-rot mira nombres de variables, no valores: sin esta linea nadie se entera.
@@ -1350,6 +1366,7 @@ mod tests {
             .chain(CEILING_ENV_VARS.iter())
             .chain(synsema_stdlib::server::SERVE_ENV_VARS.iter())
             .chain(synsema_stdlib::attest::ATTEST_ENV_VARS.iter())
+            .chain(synsema_stdlib::routing::IDENTITY_ENV_VARS.iter())
             .chain(synsema_runtime::run_program::RUN_PROGRAM_ENV_VARS.iter())
             .chain(synsema_runtime::judge_provider::JUDGE_ENV_VARS.iter())
             .chain(crate::audit::HOST_ENV_VARS.iter())

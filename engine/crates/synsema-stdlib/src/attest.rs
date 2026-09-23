@@ -123,6 +123,22 @@ pub fn keccak256(data: &[u8]) -> [u8; 32] {
 /// `report_data` de `serve --attested` y `run --attest`: la imagen es genérica y la medida de
 /// la plataforma cubre la imagen; este hash dice QUÉ `.syn` corre. No cubre templates ni
 /// estáticos (van en la imagen). Forma: `sha256(main ‖ 0x00 ‖ sha256(mod_1) ‖ … ‖ sha256(mod_n))`.
+/// El sha del programa que corre en ESTE proceso (T4: el recibo lo lleva). Lo fija `run`,
+/// `test` y `serve` al arrancar; sin él (REPL, embebido sin fuente) el recibo lo omite.
+static PROGRAM_SHA: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+
+/// Anota el sha del programa principal (+ módulos) de este proceso. Best-effort: si el
+/// hash falla (un `use` que no resuelve) no se anota y el recibo lo omite.
+pub fn note_program_sha(source: &str, filename: &str) {
+    if let Ok(sha) = program_sha(source, filename) {
+        let _ = PROGRAM_SHA.set(sha);
+    }
+}
+
+pub fn current_program_sha() -> Option<[u8; 32]> {
+    PROGRAM_SHA.get().copied()
+}
+
 pub fn program_sha(source: &str, filename: &str) -> Result<[u8; 32], String> {
     let program = synsema_core::parser::parse_source(source, filename).map_err(|e| e.to_string())?;
     let modules: RefCell<Vec<[u8; 32]>> = RefCell::new(Vec::new());
@@ -1299,7 +1315,7 @@ pub fn attested_identity() -> Option<Arc<AttestedIdentity>> {
 fn require_attest(caps: &Rc<RefCell<CapabilitySet>>, source: &str) -> Result<(), Control> {
     caps.borrow_mut()
         .require(&Capability::new(CapabilityType::Attest, None), source)
-        .map_err(|v| err(v.message))
+        .map_err(|v| Control::Error(v.into_error()))
 }
 
 fn opt_bytes(m: &IndexMap<String, SynValue>, key: &str, who: &str) -> Result<Option<Vec<u8>>, Control> {

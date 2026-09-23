@@ -1405,6 +1405,10 @@ pub fn llm_identity_tokens(identity: &str) -> u64 {
 
 thread_local! {
     static CURRENT_LLM_IDENTITY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// T1 — el presupuesto LLM DELEGADO a la unidad de trabajo en curso (caveat `llm_tokens`
+    /// del captoken). Se cuenta contra la MISMA identidad (el `id` del token) y gana el más
+    /// chico entre éste y el techo por identidad del host.
+    static CURRENT_DELEGATED_LLM_BUDGET: std::cell::RefCell<Option<u64>> = const { std::cell::RefCell::new(None) };
 }
 
 /// v0.6.20 — la identidad autenticada del request en curso, para el techo LLM por identidad.
@@ -1415,11 +1419,18 @@ pub struct LlmIdentityScope;
 impl Drop for LlmIdentityScope {
     fn drop(&mut self) {
         CURRENT_LLM_IDENTITY.with(|c| *c.borrow_mut() = None);
+        CURRENT_DELEGATED_LLM_BUDGET.with(|c| *c.borrow_mut() = None);
     }
 }
 
 pub fn identity_scope(identity: Option<String>) -> LlmIdentityScope {
+    delegation_scope(identity, None)
+}
+
+/// T1: identidad + presupuesto LLM delegado (caveat `llm_tokens`) de la unidad en curso.
+pub fn delegation_scope(identity: Option<String>, delegated_budget: Option<u64>) -> LlmIdentityScope {
     CURRENT_LLM_IDENTITY.with(|c| *c.borrow_mut() = identity);
+    CURRENT_DELEGATED_LLM_BUDGET.with(|c| *c.borrow_mut() = delegated_budget);
     LlmIdentityScope
 }
 
@@ -1427,10 +1438,17 @@ fn current_llm_identity() -> Option<String> {
     CURRENT_LLM_IDENTITY.with(|c| c.borrow().clone())
 }
 
-/// Por qué se degrada una llamada: el techo del proceso o el de la identidad.
+/// El presupuesto LLM delegado vigente en este hilo (para propagarlo a un agente o worker).
+pub fn current_delegated_llm_budget() -> Option<u64> {
+    CURRENT_DELEGATED_LLM_BUDGET.with(|c| *c.borrow())
+}
+
+/// Por qué se degrada una llamada: el techo del proceso, el de la identidad (host) o el
+/// delegado por el token (T1).
 enum BudgetCut {
     Process(u64, u64),
     Identity(String, u64, u64),
+    Delegated(String, u64, u64),
 }
 
 impl BudgetCut {
@@ -1439,6 +1457,12 @@ impl BudgetCut {
             BudgetCut::Process(used, budget) => budget_marker(*used, *budget),
             BudgetCut::Identity(id, used, budget) => {
                 format!("[llm budget exceeded for identity {}: used {} of {} tokens]", id, used, budget)
+            }
+            BudgetCut::Delegated(id, used, budget) => {
+                format!(
+                    "[llm budget exceeded for identity {}: used {} of {} tokens delegated by its token]",
+                    id, used, budget
+                )
             }
         }
     }
@@ -1452,6 +1476,18 @@ impl BudgetCut {
                         seen.push(id.clone());
                         eprintln!(
                             "[synsema] notice: the LLM token budget for identity {} is exhausted (used {} of {} tokens, set by the host via SYNSEMA_LLM_BUDGET_PER_IDENTITY). Its LLM operations now return the marker text \"[llm budget exceeded for identity …]\" instead of calling the model.",
+                            id, used, budget
+                        );
+                    }
+                }
+            }
+            BudgetCut::Delegated(id, used, budget) => {
+                static NOTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+                if let Ok(mut seen) = NOTED.lock() {
+                    if !seen.iter().any(|s| s == id) {
+                        seen.push(id.clone());
+                        eprintln!(
+                            "[synsema] notice: the LLM token budget delegated to identity {} by its token is exhausted (used {} of {} tokens, caveat llm_tokens). Its LLM operations now return the marker text \"[llm budget exceeded for identity …]\" instead of calling the model.",
                             id, used, budget
                         );
                     }
@@ -1520,6 +1556,14 @@ impl MeteredProvider {
                     return Some(BudgetCut::Identity(id, used, limit));
                 }
             }
+            // T1: el presupuesto delegado por el token (caveat `llm_tokens`), contra el mismo
+            // contador de la identidad. Se aplica ADEMÁS del del host: gana el más chico.
+            if let Some(limit) = current_delegated_llm_budget() {
+                let used = identity_used(&id);
+                if used >= limit {
+                    return Some(BudgetCut::Delegated(id, used, limit));
+                }
+            }
         }
         None
     }
@@ -1528,7 +1572,7 @@ impl MeteredProvider {
         if tokens > 0 {
             LLM_TOKENS_USED.fetch_add(tokens, std::sync::atomic::Ordering::Relaxed);
             if let Some(id) = current_llm_identity() {
-                if self.per_identity.contains_key(&id) {
+                if self.per_identity.contains_key(&id) || current_delegated_llm_budget().is_some() {
                     identity_add(id, tokens);
                 }
             }

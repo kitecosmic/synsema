@@ -85,7 +85,7 @@ fn key_material(v: &SynValue, who: &str, what: &str) -> Result<Vec<u8>, Control>
 fn require_random(caps: &Rc<RefCell<CapabilitySet>>, source: &str) -> Result<(), Control> {
     caps.borrow_mut()
         .require(&Capability::new(CapabilityType::Random, None), source)
-        .map_err(|v| Control::Error(RuntimeError::new(v.message)))
+        .map_err(|v| Control::Error(v.into_error()))
 }
 
 /// n bytes del CSPRNG del SO (OsRng — jamás el `rand` no-cripto de `random()`).
@@ -253,7 +253,7 @@ fn b_password_verify(args: &[SynValue]) -> Result<SynValue, Control> {
 /// se lee del token (ver `b_jwt_verify`).
 const JWT_HEADER: &str = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
 
-fn b_jwt_sign(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
+fn b_jwt_sign(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>, loc: &synsema_core::tokens::SourceLocation) -> Result<SynValue, Control> {
     const F: &str = "jwt_sign";
     if !(2..=3).contains(&args.len()) {
         return Err(err(format!("{}(claims, key, opts?) takes 2 or 3 arguments", F)));
@@ -286,7 +286,7 @@ fn b_jwt_sign(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<Sy
                         None => {
                             key.zeroize();
                             return Err(err(format!(
-                                "{}: unknown alg {:?} (supported: HS256, RS256, ES256)",
+                                "{}: unknown alg {:?} (supported: HS256, RS256, ES256, EdDSA)",
                                 F, s
                             )));
                         }
@@ -347,6 +347,18 @@ fn b_jwt_sign(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<Sy
         payload.insert("exp".to_string(), syn_int(now.unwrap_or_default().saturating_add(ttl)));
     }
     let payload_json = dumps(&syn_to_json(&syn_map(payload)));
+    // EdDSA con un `secret` es firmar con la clave de IDENTIDAD (la misma que da el did:key):
+    // pasa por la puerta `sign("NAME")` + audit, igual que `ed25519_sign` y `document_sign`.
+    // Una clave en texto (PEM, semilla hex) no tiene puerta: el material ya es visible al
+    // programa (auditoría T1–T4, ronda 1).
+    if matches!(alg, JwtAlg::EdDsa) {
+        if let SynValue::Secret(inner) = &args[1] {
+            if let Err(e) = crate::blockchain::gate_and_audit(caps, inner.name(), "ed25519", loc) {
+                key.zeroize();
+                return Err(e);
+            }
+        }
+    }
     let header = jwt_header(alg, kid.as_deref());
     let signing_input = format!(
         "{}.{}",
@@ -355,6 +367,19 @@ fn b_jwt_sign(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<Sy
     );
     let signature = match alg {
         JwtAlg::Hs256 => hmac_compute(Algo::Sha256, &key, signing_input.as_bytes()),
+        // EdDSA: la clave es un PEM PKCS#8 Ed25519, o la SEMILLA de 32 bytes (hex como texto,
+        // o bytes crudos) — la misma forma que `ed25519_sign`/`http_sign` aceptan.
+        JwtAlg::EdDsa => {
+            use ed25519_dalek::Signer as _;
+            let sk = match ed25519_signing_key(&key, F) {
+                Ok(k) => k,
+                Err(e) => {
+                    key.zeroize();
+                    return Err(e);
+                }
+            };
+            sk.sign(signing_input.as_bytes()).to_bytes().to_vec()
+        }
         JwtAlg::Rs256 | JwtAlg::Es256 => {
             let pem = match String::from_utf8(key.clone()) {
                 Ok(s) => s,
@@ -370,14 +395,14 @@ fn b_jwt_sign(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<Sy
             let r = match (alg, private_key_from_pem(&pem, F)) {
                 (JwtAlg::Rs256, Ok(AsymPrivate::Rsa(k))) => Ok(rs256_sign(&k, signing_input.as_bytes())),
                 (JwtAlg::Es256, Ok(AsymPrivate::P256(k))) => Ok(es256_sign(&k, signing_input.as_bytes())),
-                (JwtAlg::Rs256, Ok(AsymPrivate::P256(_))) => {
-                    Err(err(format!("{}: alg RS256 needs an RSA private key, got an EC (P-256) key", F)))
+                (JwtAlg::Rs256, Ok(_)) => {
+                    Err(err(format!("{}: alg RS256 needs an RSA private key, got another key type", F)))
                 }
-                (JwtAlg::Es256, Ok(AsymPrivate::Rsa(_))) => {
-                    Err(err(format!("{}: alg ES256 needs a P-256 private key, got an RSA key", F)))
+                (JwtAlg::Es256, Ok(_)) => {
+                    Err(err(format!("{}: alg ES256 needs a P-256 private key, got another key type", F)))
                 }
                 (_, Err(e)) => Err(e),
-                (JwtAlg::Hs256, Ok(_)) => unreachable!("HS256 no pasa por acá"),
+                (JwtAlg::Hs256 | JwtAlg::EdDsa, Ok(_)) => unreachable!("no pasan por acá"),
             };
             match r {
                 Ok(s) => s,
@@ -408,6 +433,9 @@ enum JwtAlg {
     Hs256,
     Rs256,
     Es256,
+    /// T3 (identidad): ed25519 sobre el signing input (RFC 8037). La misma clave que
+    /// `http_sign`/`did:key`, así una Agent Card o un JWT los firma la identidad del server.
+    EdDsa,
 }
 
 impl JwtAlg {
@@ -416,6 +444,7 @@ impl JwtAlg {
             "HS256" => Some(JwtAlg::Hs256),
             "RS256" => Some(JwtAlg::Rs256),
             "ES256" => Some(JwtAlg::Es256),
+            "EDDSA" => Some(JwtAlg::EdDsa),
             _ => None,
         }
     }
@@ -424,6 +453,7 @@ impl JwtAlg {
             JwtAlg::Hs256 => "HS256",
             JwtAlg::Rs256 => "RS256",
             JwtAlg::Es256 => "ES256",
+            JwtAlg::EdDsa => "EdDSA",
         }
     }
 }
@@ -495,6 +525,8 @@ impl<'a> DerReader<'a> {
 
 const OID_RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
 const OID_EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+/// id-Ed25519 (RFC 8410): 1.3.101.112.
+const OID_ED25519: &[u8] = &[0x2b, 0x65, 0x70];
 
 /// SEC1 `ECPrivateKey ::= SEQUENCE { version, privateKey OCTET STRING, … }` → el escalar.
 fn ec_scalar_from_sec1(der: &[u8]) -> Result<Vec<u8>, String> {
@@ -551,17 +583,19 @@ fn spki_unwrap(der: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
     Ok((oid.to_vec(), bits[1..].to_vec()))
 }
 
-enum AsymPrivate {
+pub(crate) enum AsymPrivate {
     Rsa(rsa::RsaPrivateKey),
     P256(p256::SecretKey),
+    Ed25519(ed25519_dalek::SigningKey),
 }
 
-enum AsymPublic {
+pub(crate) enum AsymPublic {
     Rsa(rsa::RsaPublicKey),
     P256(p256::ecdsa::VerifyingKey),
+    Ed25519(ed25519_dalek::VerifyingKey),
 }
 
-fn private_key_from_pem(text: &str, who: &str) -> Result<AsymPrivate, Control> {
+pub(crate) fn private_key_from_pem(text: &str, who: &str) -> Result<AsymPrivate, Control> {
     use rsa::pkcs1::DecodeRsaPrivateKey;
     let (label, der) = pem_decode(text).map_err(|e| err(format!("{}: {}", who, e)))?;
     let bad = |what: &str| err(format!("{}: the PEM is not a valid {} ({})", who, label, what));
@@ -586,8 +620,16 @@ fn private_key_from_pem(text: &str, who: &str) -> Result<AsymPrivate, Control> {
                 p256::SecretKey::from_slice(&scalar)
                     .map(AsymPrivate::P256)
                     .map_err(|_| bad("P-256 scalar; only P-256 (prime256v1) is supported"))
+            } else if oid == OID_ED25519 {
+                // RFC 8410: privateKey = OCTET STRING { OCTET STRING (32 bytes de semilla) }
+                let (t, seed) = DerReader::new(&inner).tlv().map_err(|e| bad(&e))?;
+                if t != 0x04 || seed.len() != 32 {
+                    return Err(bad("Ed25519 seed (CurvePrivateKey OCTET STRING of 32 bytes)"));
+                }
+                let arr: [u8; 32] = seed.try_into().expect("32");
+                Ok(AsymPrivate::Ed25519(ed25519_dalek::SigningKey::from_bytes(&arr)))
             } else {
-                Err(bad("unsupported algorithm OID; RSA and P-256 are supported"))
+                Err(bad("unsupported algorithm OID; RSA, P-256 and Ed25519 are supported"))
             }
         }
         other => Err(err(format!(
@@ -597,7 +639,7 @@ fn private_key_from_pem(text: &str, who: &str) -> Result<AsymPrivate, Control> {
     }
 }
 
-fn public_key_from_pem(text: &str, who: &str) -> Result<AsymPublic, Control> {
+pub(crate) fn public_key_from_pem(text: &str, who: &str) -> Result<AsymPublic, Control> {
     use rsa::pkcs1::DecodeRsaPublicKey;
     let (label, der) = pem_decode(text).map_err(|e| err(format!("{}: {}", who, e)))?;
     let bad = |what: &str| err(format!("{}: the PEM is not a valid {} ({})", who, label, what));
@@ -615,8 +657,13 @@ fn public_key_from_pem(text: &str, who: &str) -> Result<AsymPublic, Control> {
                 p256::ecdsa::VerifyingKey::from_sec1_bytes(&bits)
                     .map(AsymPublic::P256)
                     .map_err(|_| bad("SEC1 P-256 point; only P-256 (prime256v1) is supported"))
+            } else if oid == OID_ED25519 {
+                let arr: [u8; 32] = bits.as_slice().try_into().map_err(|_| bad("Ed25519 public key of 32 bytes"))?;
+                ed25519_dalek::VerifyingKey::from_bytes(&arr)
+                    .map(AsymPublic::Ed25519)
+                    .map_err(|_| bad("Ed25519 point"))
             } else {
-                Err(bad("unsupported algorithm OID; RSA and P-256 are supported"))
+                Err(bad("unsupported algorithm OID; RSA, P-256 and Ed25519 are supported"))
             }
         }
         other => Err(err(format!(
@@ -624,6 +671,34 @@ fn public_key_from_pem(text: &str, who: &str) -> Result<AsymPublic, Control> {
             who, other
         ))),
     }
+}
+
+/// La clave de firma ed25519 de `jwt_sign` EdDSA: PEM PKCS#8 (texto), o la semilla de 32
+/// bytes como hex (texto) o bytes crudos.
+fn ed25519_signing_key(key: &[u8], who: &str) -> Result<ed25519_dalek::SigningKey, Control> {
+    if let Ok(text) = std::str::from_utf8(key) {
+        if text.contains("-----BEGIN") {
+            return match private_key_from_pem(text, who)? {
+                AsymPrivate::Ed25519(k) => Ok(k),
+                _ => Err(err(format!("{}: alg EdDSA needs an Ed25519 private key (PKCS#8 PEM or 32-byte seed)", who))),
+            };
+        }
+        let t = text.trim();
+        if t.len() == 64 {
+            if let Ok(seed) = synsema_core::bytesutil::hex_decode(t) {
+                let arr: [u8; 32] = seed.try_into().expect("32");
+                return Ok(ed25519_dalek::SigningKey::from_bytes(&arr));
+            }
+        }
+    }
+    if key.len() == 32 {
+        let arr: [u8; 32] = key.try_into().expect("32");
+        return Ok(ed25519_dalek::SigningKey::from_bytes(&arr));
+    }
+    Err(err(format!(
+        "{}: alg EdDSA needs an Ed25519 private key — a PKCS#8 PEM, or the 32-byte seed as hex text or bytes (the key value is never shown)",
+        who
+    )))
 }
 
 /// RSASSA-PKCS1-v1_5 con SHA-256 (RS256). Determinista.
@@ -646,7 +721,7 @@ fn rs256_verify(key: &rsa::RsaPublicKey, msg: &[u8], sig: &[u8]) -> bool {
 
 /// ECDSA P-256 con SHA-256 (ES256): firma CRUDA r‖s de 64 bytes (JWS), nonce RFC 6979
 /// (determinista, sin depender de la entropía del host).
-fn es256_sign(key: &p256::SecretKey, msg: &[u8]) -> Vec<u8> {
+pub(crate) fn es256_sign(key: &p256::SecretKey, msg: &[u8]) -> Vec<u8> {
     use p256::ecdsa::signature::Signer;
     use p256::ecdsa::{Signature, SigningKey};
     let sk = SigningKey::from(key.clone());
@@ -654,7 +729,7 @@ fn es256_sign(key: &p256::SecretKey, msg: &[u8]) -> Vec<u8> {
     sig.to_bytes().to_vec()
 }
 
-fn es256_verify(vk: &p256::ecdsa::VerifyingKey, msg: &[u8], sig: &[u8]) -> bool {
+pub(crate) fn es256_verify(vk: &p256::ecdsa::VerifyingKey, msg: &[u8], sig: &[u8]) -> bool {
     use p256::ecdsa::signature::Verifier;
     use p256::ecdsa::Signature;
     if sig.len() != 64 {
@@ -679,7 +754,7 @@ fn msg_bytes(v: &SynValue, who: &str) -> Result<Vec<u8>, Control> {
 /// rechaza con el error canónico: firmar con la clave de identidad atestada es suplantación del
 /// enclave (ver `webpush::vapid_private_key`). Hasta la ronda 4 fallaba de rebote —32 bytes de
 /// escalar no son UTF-8 válido, y menos un PEM—, que es seguridad por accidente, no por diseño.
-fn pem_text(v: &SynValue, who: &str, what: &str) -> Result<String, Control> {
+pub(crate) fn pem_text(v: &SynValue, who: &str, what: &str) -> Result<String, Control> {
     if let SynValue::Secret(s) = v {
         s.expose_bytes_checked(who).map_err(err)?;
     }
@@ -699,6 +774,7 @@ fn b_rsa_sign_sha256(args: &[SynValue]) -> Result<SynValue, Control> {
     match private_key_from_pem(&pem, F)? {
         AsymPrivate::Rsa(k) => Ok(syn_bytes(rs256_sign(&k, &msg))),
         AsymPrivate::P256(_) => Err(err(format!("{}: needs an RSA private key, got an EC key (use ecdsa_p256_sign)", F))),
+        AsymPrivate::Ed25519(_) => Err(err(format!("{}: needs an RSA private key, got an Ed25519 key (use ed25519_sign)", F))),
     }
 }
 
@@ -716,6 +792,7 @@ fn b_rsa_verify_sha256(args: &[SynValue]) -> Result<SynValue, Control> {
     match public_key_from_pem(&pem, F)? {
         AsymPublic::Rsa(k) => Ok(syn_bool(rs256_verify(&k, &msg, &sig))),
         AsymPublic::P256(_) => Err(err(format!("{}: needs an RSA public key, got an EC key (use ecdsa_p256_verify)", F))),
+        AsymPublic::Ed25519(_) => Err(err(format!("{}: needs an RSA public key, got an Ed25519 key (use ed25519_verify)", F))),
     }
 }
 
@@ -729,6 +806,7 @@ fn b_ecdsa_p256_sign(args: &[SynValue]) -> Result<SynValue, Control> {
     match private_key_from_pem(&pem, F)? {
         AsymPrivate::P256(k) => Ok(syn_bytes(es256_sign(&k, &msg))),
         AsymPrivate::Rsa(_) => Err(err(format!("{}: needs a P-256 private key, got an RSA key (use rsa_sign_sha256)", F))),
+        AsymPrivate::Ed25519(_) => Err(err(format!("{}: needs a P-256 private key, got an Ed25519 key (use ed25519_sign)", F))),
     }
 }
 
@@ -746,6 +824,7 @@ fn b_ecdsa_p256_verify(args: &[SynValue]) -> Result<SynValue, Control> {
     match public_key_from_pem(&pem, F)? {
         AsymPublic::P256(k) => Ok(syn_bool(es256_verify(&k, &msg, &sig))),
         AsymPublic::Rsa(_) => Err(err(format!("{}: needs a P-256 public key, got an RSA key (use rsa_verify_sha256)", F))),
+        AsymPublic::Ed25519(_) => Err(err(format!("{}: needs a P-256 public key, got an Ed25519 key (use ed25519_verify)", F))),
     }
 }
 
@@ -954,8 +1033,17 @@ fn check_time_and_claims(claims: &serde_json::Map<String, serde_json::Value>, o:
 fn inline_public_keys(m: &IndexMap<String, SynValue>, who: &str) -> Result<Vec<KeyEntry>, Control> {
     let mut jwks: Option<String> = None;
     let mut pem: Option<String> = None;
+    let mut did: Option<String> = None;
     for (k, v) in m {
         match k.as_str() {
+            // T3: la clave pública como `did:key` (ed25519 → EdDSA, P-256 → ES256), resuelta
+            // offline. Es como se verifica la Agent Card de otro server.
+            "did" => {
+                did = Some(match v {
+                    SynValue::Text(s) => s.to_string(),
+                    other => return Err(err(format!("{}: did must be text (\"did:key:z…\"), got {}", who, other.type_name()))),
+                })
+            }
             "jwks" => {
                 jwks = Some(match v {
                     SynValue::Text(s) => s.to_string(),
@@ -972,16 +1060,36 @@ fn inline_public_keys(m: &IndexMap<String, SynValue>, who: &str) -> Result<Vec<K
             "pem" => pem = Some(pem_text(v, who, "pem")?),
             other => {
                 return Err(err(format!(
-                    "{}: unknown key {:?} in the key map (valid: jwks, pem)",
+                    "{}: unknown key {:?} in the key map (valid: jwks, pem, did)",
                     who, other
                 )))
             }
         }
     }
+    if let Some(d) = did {
+        if jwks.is_some() || pem.is_some() {
+            return Err(err(format!("{}: give one of jwks, pem or did", who)));
+        }
+        let (alg, key, mb) = crate::didkey::decode(&d).map_err(|e| err(format!("{}: {}", who, e)))?;
+        let kid = Some(format!("did:key:{}#{}", mb, mb));
+        return match alg {
+            crate::didkey::KeyAlg::Ed25519 => Ok(vec![KeyEntry { kid, alg: Some("EdDSA".to_string()), key: Jwk::Ed25519 { x: key } }]),
+            crate::didkey::KeyAlg::P256 => {
+                let pk = p256::PublicKey::from_sec1_bytes(&key).map_err(|_| err(format!("{}: the did:key P-256 point is malformed", who)))?;
+                use p256::elliptic_curve::sec1::ToEncodedPoint;
+                let pt = pk.to_encoded_point(false);
+                match (pt.x(), pt.y()) {
+                    (Some(x), Some(y)) => Ok(vec![KeyEntry { kid, alg: Some("ES256".to_string()), key: Jwk::P256 { x: x.to_vec(), y: y.to_vec() } }]),
+                    _ => Err(err(format!("{}: the did:key P-256 point is malformed", who))),
+                }
+            }
+            other => Err(err(format!("{}: a {} did:key does not verify JWTs (ed25519 or P-256 only)", who, other.name()))),
+        };
+    }
     match (jwks, pem) {
         (Some(_), Some(_)) => Err(err(format!("{}: give either jwks or pem, not both", who))),
         (None, None) => Err(err(format!(
-            "{}: the key map must carry the public key: {{\"jwks\": {{...}}}} or {{\"pem\": \"-----BEGIN PUBLIC KEY-----...\"}}",
+            "{}: the key map must carry the public key: {{\"jwks\": {{...}}}}, {{\"pem\": \"-----BEGIN PUBLIC KEY-----...\"}} or {{\"did\": \"did:key:z…\"}}",
             who
         ))),
         (Some(body), None) => {
@@ -1008,6 +1116,7 @@ fn inline_public_keys(m: &IndexMap<String, SynValue>, who: &str) -> Result<Vec<K
                         _ => return Err(err(format!("{}: the P-256 public key is malformed", who))),
                     }
                 }
+                AsymPublic::Ed25519(vk) => KeyEntry { kid: None, alg: Some("EdDSA".to_string()), key: Jwk::Ed25519 { x: vk.to_bytes().to_vec() } },
             };
             Ok(vec![key])
         }
@@ -1020,7 +1129,7 @@ fn inline_public_keys(m: &IndexMap<String, SynValue>, who: &str) -> Result<Vec<K
 fn jwt_verify_asym(token: &str, keys: &[KeyEntry], o: &JwtVerifyOpts) -> Option<SynValue> {
     let (header, signing_input, sig) = split_token(token)?;
     let alg = header.get("alg")?.as_str()?;
-    if alg != "RS256" && alg != "ES256" {
+    if alg != "RS256" && alg != "ES256" && alg != "EdDSA" {
         return None;
     }
     // `kid` selecciona en el JWKS (una entrada con OTRO kid queda fuera); las claves sin `kid`
@@ -1267,7 +1376,7 @@ pub fn register_webauth_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabili
     // M5-bis: cierra sobre `caps` — `iat` implícito / `expires_in` leen el reloj → exigen `time`.
     {
         let caps = caps.clone();
-        interp.register_builtin("jwt_sign", -1, Rc::new(move |_i, a, _l| b_jwt_sign(a, &caps)));
+        interp.register_builtin("jwt_sign", -1, Rc::new(move |_i, a, l| b_jwt_sign(a, &caps, l)));
     }
     // V0.6.20 — firma asimétrica cruda (RS256 / ES256 sin el envoltorio JWT).
     interp.register_builtin("rsa_sign_sha256", -1, Rc::new(|_i, a, _l| b_rsa_sign_sha256(a)));
@@ -1306,8 +1415,12 @@ mod tests {
         b_jwt_verify(args, &caps_with_time())
     }
 
+    fn tloc() -> synsema_core::tokens::SourceLocation {
+        synsema_core::tokens::SourceLocation { file: "t.syn".to_string(), line: 1, column: 1, offset: 0 }
+    }
+
     fn js(args: &[SynValue]) -> Result<SynValue, Control> {
-        b_jwt_sign(args, &caps_with_time())
+        b_jwt_sign(args, &caps_with_time(), &tloc())
     }
 
     fn bt(args: &[SynValue]) -> Result<SynValue, Control> {
@@ -1618,8 +1731,12 @@ mod v0620_tests {
         b_jwt_verify(args, &caps_with_time())
     }
 
+    fn tloc() -> synsema_core::tokens::SourceLocation {
+        synsema_core::tokens::SourceLocation { file: "t.syn".to_string(), line: 1, column: 1, offset: 0 }
+    }
+
     fn js(args: &[SynValue]) -> Result<SynValue, Control> {
-        b_jwt_sign(args, &caps_with_time())
+        b_jwt_sign(args, &caps_with_time(), &tloc())
     }
     use p256::elliptic_curve::sec1::ToEncodedPoint;
     use synsema_core::bytesutil::b64_encode;
@@ -2031,16 +2148,16 @@ mod v0620_tests {
         let no_time = Rc::new(RefCell::new(CapabilitySet::new("deterministic")));
         const MSG: &str = "jwt_sign: this needs the clock. Add `require time` to the program, or pass \"iat\" (and \"exp\") explicitly (unix timestamps in seconds) to sign against a clock you choose.";
         // Sin iat → error (HS256 y ES256: la puerta es previa al algoritmo).
-        assert_eq!(err_of(b_jwt_sign(&[map(&[("sub", syn_text("u1"))]), syn_text("k")], &no_time)), MSG);
+        assert_eq!(err_of(b_jwt_sign(&[map(&[("sub", syn_text("u1"))]), syn_text("k")], &no_time, &tloc())), MSG);
         let (sec1, _, _) = p256_pems();
-        assert_eq!(err_of(b_jwt_sign(&[map(&[("sub", syn_text("u1"))]), syn_text(sec1.as_str()), map(&[("alg", syn_text("ES256"))])], &no_time)), MSG);
+        assert_eq!(err_of(b_jwt_sign(&[map(&[("sub", syn_text("u1"))]), syn_text(sec1.as_str()), map(&[("alg", syn_text("ES256"))])], &no_time, &tloc())), MSG);
         // Iat explícito pero expires_in (exp derivado del reloj) → error.
-        assert_eq!(err_of(b_jwt_sign(&[map(&[("sub", syn_text("u1")), ("iat", syn_int(1_700_000_000))]), syn_text("k"), map(&[("expires_in", syn_int(60))])], &no_time)), MSG);
+        assert_eq!(err_of(b_jwt_sign(&[map(&[("sub", syn_text("u1")), ("iat", syn_int(1_700_000_000))]), syn_text("k"), map(&[("expires_in", syn_int(60))])], &no_time, &tloc())), MSG);
         // Iat explícito (y exp explícito) → firma sin tocar el reloj; el payload lleva EXACTAMENTE
         // esos valores y el token es reproducible.
         let claims = map(&[("sub", syn_text("u1")), ("iat", syn_int(1_700_000_000)), ("exp", syn_int(1_800_000_000))]);
-        let t1 = ok(b_jwt_sign(&[claims.clone(), syn_text("k")], &no_time)).to_string();
-        let t2 = ok(b_jwt_sign(&[claims.clone(), syn_text("k")], &no_time)).to_string();
+        let t1 = ok(b_jwt_sign(&[claims.clone(), syn_text("k")], &no_time, &tloc())).to_string();
+        let t2 = ok(b_jwt_sign(&[claims.clone(), syn_text("k")], &no_time, &tloc())).to_string();
         assert_eq!(t1, t2, "sin reloj el token es determinista");
         let payload: serde_json::Value = serde_json::from_slice(&b64url_decode(t1.split('.').nth(1).unwrap()).unwrap()).unwrap();
         assert_eq!(payload["iat"].as_i64(), Some(1_700_000_000));
@@ -2054,5 +2171,116 @@ mod v0620_tests {
         // Las denegaciones quedaron en el audit con source "jwt_sign".
         let log = synsema_capabilities::model::export_audit(&no_time);
         assert!(log.iter().filter(|e| e.source == "jwt_sign" && !e.granted && e.capability.contains("time")).count() >= 3);
+    }
+
+    /// Clave ed25519 con semilla fija: PKCS#8 (RFC 8410) y SPKI armados a mano, y su did:key.
+    fn ed25519_pems() -> (String, String, [u8; 32], String) {
+        let seed = [3u8; 32];
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let pk = sk.verifying_key().to_bytes();
+        // PKCS#8: SEQUENCE { INTEGER 0, SEQUENCE { OID 1.3.101.112 }, OCTET STRING { OCTET STRING(32) } }
+        let mut pkcs8 = vec![0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20];
+        pkcs8.extend_from_slice(&seed);
+        // SPKI: SEQUENCE { SEQUENCE { OID 1.3.101.112 }, BIT STRING 00 || pk }
+        let mut spki = vec![0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+        spki.extend_from_slice(&pk);
+        let did = crate::didkey::encode(crate::didkey::KeyAlg::Ed25519, &pk).unwrap();
+        (pem("PRIVATE KEY", &pkcs8), pem("PUBLIC KEY", &spki), pk, did)
+    }
+
+    #[test]
+    fn jwt_sign_eddsa_with_a_secret_goes_through_the_sign_gate() {
+        use synsema_core::secret::SecretInner;
+        let seed_hex = synsema_core::bytesutil::hex_encode(&[3u8; 32]);
+        let k = SynValue::Secret(Rc::new(SecretInner::new("ID_SEED", seed_hex.clone())));
+        // Sin `require sign("ID_SEED")`: denegado, con el require exacto en el mensaje.
+        let e = match b_jwt_sign(&[std_claims(), k.clone(), map(&[("alg", syn_text("EdDSA"))])], &caps_with_time(), &tloc()) {
+            Err(Control::Error(e)) => e.to_string(),
+            _ => panic!("esperaba denegación"),
+        };
+        assert!(e.contains("sign(\"ID_SEED\")"), "{}", e);
+        // Con la capability: firma, y verifica con el did de la misma clave.
+        let mut cs = CapabilitySet::new("test");
+        cs.grant(Capability::new(CapabilityType::Time, None));
+        cs.grant(Capability::new(CapabilityType::Sign, Some("ID_SEED".to_string())));
+        let caps = Rc::new(RefCell::new(cs));
+        let tok = ok(b_jwt_sign(&[std_claims(), k, map(&[("alg", syn_text("EdDSA"))])], &caps, &tloc())).to_string();
+        let pk = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]).verifying_key().to_bytes();
+        let did = crate::didkey::encode(crate::didkey::KeyAlg::Ed25519, &pk).unwrap();
+        let now_ok = map(&[("now", syn_int(1_750_000_000))]);
+        assert!(!is_nothing(&ok(jv(&[syn_text(tok.as_str()), map(&[("did", syn_text(did.as_str()))]), now_ok]))));
+        // La misma semilla como TEXTO hex no tiene puerta (material ya visible), como
+        // document_sign con un PEM en texto.
+        assert!(b_jwt_sign(&[std_claims(), syn_text(seed_hex.as_str()), map(&[("alg", syn_text("EdDSA"))])], &caps_with_time(), &tloc()).is_ok());
+        // HS256 con un secret sigue sin puerta: una MAC no es la clave de identidad.
+        assert!(b_jwt_sign(&[std_claims(), SynValue::Secret(Rc::new(SecretInner::new("MAC", "shared".to_string())))], &caps_with_time(), &tloc()).is_ok());
+    }
+
+    #[test]
+    fn jwt_sign_eddsa_from_pem_or_seed_verifies_with_pem_jwks_and_did() {
+        use ed25519_dalek::Verifier as _;
+        let (pkcs8, spki, pk, did) = ed25519_pems();
+        let seed_hex = synsema_core::bytesutil::hex_encode(&[3u8; 32]);
+        let now_ok = || map(&[("now", syn_int(1_750_000_000))]);
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(&pk).unwrap();
+        for key in [pkcs8.clone(), seed_hex] {
+            let tok = ok(js(&[std_claims(), syn_text(key.as_str()), map(&[("alg", syn_text("EdDSA"))])])).to_string();
+            let (header, si, sig) = split_jwt(&tok);
+            assert_eq!(header, "{\"alg\":\"EdDSA\",\"typ\":\"JWT\"}");
+            assert_eq!(sig.len(), 64, "JWS EdDSA es R‖S crudo");
+            vk.verify(si.as_bytes(), &ed25519_dalek::Signature::from_slice(&sig).unwrap()).expect("firma ed25519 válida");
+            // Las tres formas de dar la clave pública: PEM SPKI, JWKS (OKP) y did:key.
+            let out = ok(jv(&[syn_text(tok.as_str()), map(&[("pem", syn_text(spki.as_str()))]), now_ok()]));
+            assert_eq!(text_of(&claims_of(&out)["sub"]), "u1");
+            let jwk = format!(r#"{{"kty":"OKP","crv":"Ed25519","kid":"e1","x":"{}"}}"#, b64url_encode(&pk));
+            let out = ok(jv(&[syn_text(tok.as_str()), map(&[("jwks", syn_text(jwks_doc(&[jwk]).as_str()))]), now_ok()]));
+            assert_eq!(text_of(&claims_of(&out)["sub"]), "u1");
+            let out = ok(jv(&[syn_text(tok.as_str()), map(&[("did", syn_text(did.as_str()))]), now_ok()]));
+            assert_eq!(text_of(&claims_of(&out)["sub"]), "u1");
+        }
+        let tok = ok(js(&[std_claims(), syn_text(pkcs8.as_str()), map(&[("alg", syn_text("EdDSA"))])])).to_string();
+        // Otra clave ed25519 → nothing; una P-256 (PEM o did) contra un token EdDSA → nothing.
+        let other_pk = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]).verifying_key().to_bytes();
+        let other = crate::didkey::encode(crate::didkey::KeyAlg::Ed25519, &other_pk).unwrap();
+        assert!(is_nothing(&ok(jv(&[syn_text(tok.as_str()), map(&[("did", syn_text(other.as_str()))]), now_ok()]))));
+        let (sec1, _, p256_spki) = p256_pems();
+        assert!(is_nothing(&ok(jv(&[syn_text(tok.as_str()), map(&[("pem", syn_text(p256_spki.as_str()))]), now_ok()]))));
+        let p256_did = {
+            let sk = p256::SecretKey::from_slice(&{
+                let mut s = [0u8; 32];
+                s[31] = 7;
+                s
+            })
+            .unwrap();
+            crate::didkey::encode(crate::didkey::KeyAlg::P256, sk.public_key().to_encoded_point(true).as_bytes()).unwrap()
+        };
+        assert!(is_nothing(&ok(jv(&[syn_text(tok.as_str()), map(&[("did", syn_text(p256_did.as_str()))]), now_ok()]))));
+        // Firma alterada → nothing.
+        let mut parts: Vec<String> = tok.split('.').map(str::to_string).collect();
+        let mut sig = b64url_decode(&parts[2]).unwrap();
+        sig[7] ^= 1;
+        parts[2] = b64url_encode(&sig);
+        assert!(is_nothing(&ok(jv(&[syn_text(parts.join(".").as_str()), map(&[("did", syn_text(did.as_str()))]), now_ok()]))));
+        // El `kid` de un token firmado con did:key es `did:key:z…#z…`: coincide con la entrada
+        // que el did inline produce; un kid ajeno no verifica (no se prueba "cualquiera").
+        let kid = format!("{}#{}", did, &did[8..]);
+        let tok_kid = ok(js(&[std_claims(), syn_text(pkcs8.as_str()), map(&[("alg", syn_text("EdDSA")), ("kid", syn_text(kid.as_str()))])])).to_string();
+        assert!(!is_nothing(&ok(jv(&[syn_text(tok_kid.as_str()), map(&[("did", syn_text(did.as_str()))]), now_ok()]))));
+        let tok_badkid = ok(js(&[std_claims(), syn_text(pkcs8.as_str()), map(&[("alg", syn_text("EdDSA")), ("kid", syn_text("other"))])])).to_string();
+        assert!(is_nothing(&ok(jv(&[syn_text(tok_badkid.as_str()), map(&[("did", syn_text(did.as_str()))]), now_ok()]))));
+        // Un did que no firma JWTs (x25519) y un ES256 contra un did ed25519: errores del caller /
+        // nothing, nunca pánico.
+        let x = crate::didkey::encode(crate::didkey::KeyAlg::X25519, &[9u8; 32]).unwrap();
+        assert!(jv(&[syn_text(tok.as_str()), map(&[("did", syn_text(x.as_str()))]), now_ok()]).is_err());
+        let es = ok(js(&[std_claims(), syn_text(sec1.as_str()), map(&[("alg", syn_text("ES256"))])])).to_string();
+        assert!(is_nothing(&ok(jv(&[syn_text(es.as_str()), map(&[("did", syn_text(did.as_str()))]), now_ok()]))));
+        // Y el ES256 sí verifica con el did P-256 de su clave.
+        assert!(!is_nothing(&ok(jv(&[syn_text(es.as_str()), map(&[("did", syn_text(p256_did.as_str()))]), now_ok()]))));
+        // Una clave P-256 con alg EdDSA es un error claro (la clave fija el algoritmo).
+        let e = match js(&[std_claims(), syn_text(sec1.as_str()), map(&[("alg", syn_text("EdDSA"))])]) {
+            Err(Control::Error(e)) => e.to_string(),
+            _ => panic!("esperaba error"),
+        };
+        assert!(e.contains("EdDSA") && e.contains("Ed25519"), "{}", e);
     }
 }

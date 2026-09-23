@@ -133,6 +133,12 @@ pub(crate) fn key_material(v: &SynValue, fname: &str) -> Result<(String, Vec<u8>
 // =========================================================
 
 fn sign_denied(name: &str, cause: DenyCause) -> Control {
+    // Denegada por el techo DELEGADO (el token del caller / un `sandbox under`): la causa
+    // viaja en el error (`denied_by_token` → 403 genérico bajo serve), nunca "add `require`".
+    if let DenyCause::Delegated(_) = &cause {
+        let cap = Capability::new(CapabilityType::Sign, Some(name.to_string()));
+        return Control::Error(CapabilitySet::violation(&cap, cause, "sign-builtin").into_error());
+    }
     if cause == DenyCause::AboveCeiling {
         return err(format!("sign not permitted: sign(\"{name}\") is declared but above the host ceiling (--sandbox/--cap-set). The program cannot fix this; the host must widen the ceiling"));
     }

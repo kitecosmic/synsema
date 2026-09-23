@@ -445,7 +445,7 @@ fn require_net(caps: &Rc<RefCell<CapabilitySet>>, url: &str) -> Result<(), Contr
     };
     caps.borrow_mut()
         .require(&Capability::new(CapabilityType::Net, Some(host)), "ws_connect()")
-        .map_err(|v| Control::Error(RuntimeError::new(v.message)))
+        .map_err(|v| Control::Error(v.into_error()))
 }
 
 fn parse_ws_url(url: &str, fname: &str) -> Result<(String, u16, bool), Control> {
@@ -2416,7 +2416,7 @@ fn proc_spawn(i: &Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynV
         let caps = reg.borrow().caps.clone();
         caps.borrow_mut()
             .require(&Capability::new(CapabilityType::Exec, Some(cmd.clone())), "proc_spawn()")
-            .map_err(|v| Control::Error(RuntimeError::new(v.message)))?;
+            .map_err(|v| Control::Error(v.into_error()))?;
     }
     {
         let r = reg.borrow();
@@ -2847,7 +2847,7 @@ fn watch_open(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         let caps = reg.borrow().caps.clone();
         caps.borrow_mut()
             .require(&Capability::new(CapabilityType::FileRead, Some(path.clone())), "watch()")
-            .map_err(|v| Control::Error(RuntimeError::new(v.message)))?;
+            .map_err(|v| Control::Error(v.into_error()))?;
     }
     {
         let r = reg.borrow();
@@ -2948,7 +2948,7 @@ fn term_open(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Res
         let caps = reg.borrow().caps.clone();
         caps.borrow_mut()
             .require(&Capability::new(CapabilityType::Stdin, None), "term_open()")
-            .map_err(|v| Control::Error(RuntimeError::new(v.message)))?;
+            .map_err(|v| Control::Error(v.into_error()))?;
     }
     let mut opts = TermOpts::default();
     if let Some(m) = opt_map(args.first(), F)? {

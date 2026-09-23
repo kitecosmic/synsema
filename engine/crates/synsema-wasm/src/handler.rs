@@ -33,7 +33,7 @@ use synsema_core::parser::parse_source;
 use synsema_core::types::{syn_int, syn_text, ServerValue, SynValue};
 use synsema_stdlib::json::{dumps, obj, Json};
 use synsema_stdlib::routing::{
-    bearer_token, build_request_syn, build_response, delegated_spend_of, header_value, identity_of,
+    bearer_token, build_request_syn, build_response, delegated_spend_of, delegation_of, header_value, identity_of,
     negotiate_format, param_last_segment, parse_path_query, path_match, render_content,
     request_bindings, specificity, split_format_suffix, Ctx, GiveOutcome, ResponseBody,
 };
@@ -521,17 +521,22 @@ fn dispatch(app: &mut App, req: &HttpRequestIn) -> (HttpResponseOut, Vec<String>
         None => (None, Vec::new()),
     };
     app.interp.set_request_identity(identity, limits);
+    // T1: los `caps` del captoken que devolvió `auth with` son el techo delegado de la
+    // request — mismo campo y misma regla que el runtime nativo (paridad del audit).
+    {
+        let delegations: Vec<_> = ctx.user.as_ref().and_then(delegation_of).into_iter().collect();
+        app.caps.borrow_mut().set_delegations(delegations);
+    }
     let outcome = match app.interp.run_request_block(&route.body, request_bindings(&ctx)) {
         Ok(_) => GiveOutcome::Give(None),
         Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
         Err(Control::Error(e)) if e.is_validation => {
             GiveOutcome::Validation { message: e.message.clone(), field: e.field.clone() }
         }
+        Err(Control::Error(e)) if e.denied_by_token => GiveOutcome::Forbidden(e.to_string()),
         Err(Control::Error(e)) => GiveOutcome::Error(e.to_string()),
         Err(Control::Stop(_)) => GiveOutcome::Error("'give'/'stop' used outside of a task or loop".to_string()),
     };
-    app.interp.set_request_identity(None, Vec::new());
-
     let mut custom_headers: Vec<(String, String)> = Vec::new();
     let shape_500 = |interp: &mut Interpreter, detail: &str, ctx: &Ctx, extra: &mut Vec<(String, String)>| -> (u16, ResponseBody) {
         if let Some(h) = &cap.error_handler {
@@ -580,7 +585,26 @@ fn dispatch(app: &mut App, req: &HttpRequestIn) -> (HttpResponseOut, Vec<String>
             ])),
         ),
         GiveOutcome::Error(msg) => shape_500(&mut app.interp, &msg, &ctx, &mut custom_headers),
+        // T1: denegada por el token del caller → 403 con cuerpo fijo (el detalle queda en el
+        // log del host, jamás en la respuesta). Mismo criterio que el serve nativo.
+        GiveOutcome::Forbidden(detail) => {
+            app.interp.output.push(format!("[handler] 403 {}", detail));
+            // Como el serve nativo: el cuerpo FIJO pasa por `errors with` (una página de error
+            // propia), el detalle jamás llega al cliente.
+            const MSG: &str = "insufficient permissions";
+            match cap.error_handler.as_ref().and_then(|h| custom_error(&mut app.interp, h, 403, MSG, &ctx)) {
+                Some((st, body, hdrs)) => {
+                    custom_headers.extend(hdrs);
+                    (st, body)
+                }
+                None => json_err(403, MSG),
+            }
+        }
     };
+    // El sujeto de la request se limpia DESPUÉS de dar forma a la respuesta: `errors with`
+    // corre bajo el mismo techo delegado que la ruta (paridad con el serve nativo).
+    app.interp.set_request_identity(None, Vec::new());
+    app.caps.borrow_mut().set_delegations(Vec::new());
     (finalize(status, body, custom_headers), std::mem::take(&mut app.interp.output))
 }
 

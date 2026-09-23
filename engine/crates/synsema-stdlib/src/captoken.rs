@@ -20,7 +20,16 @@
 //! token son las MISMAS formas de `require` (net/db/file/sign/spend/… con sus
 //! scopes) y la atenuación es intersección, verificada con el MISMO `covers()` que
 //! gatea los `require` — así no hay una segunda lógica de scopes que pueda
-//! divergir, y un futuro `require from_token(t)` es mapeo 1:1.
+//! divergir, y el volcado del token al techo (`ceiling_from_caps_map`) es mapeo 1:1.
+//!
+//! **El token ES el techo (T1 del spec de identidad).** Un token verificado no es
+//! consultivo: bajo `serve`, los `caps` del map que devuelve `auth with` se vuelven el
+//! TECHO DELEGADO de la request (`Delegation`), apilado sobre el del host; por proceso lo
+//! hace `run_program {ceiling: caps}` y dentro del programa `sandbox under caps`. Los
+//! `caps` son autoridad TRANSFERIBLE: las capabilities locales al proceso (stdout, stdin,
+//! time, random) no se pueden acuñar en un token — quien delega no posee el stdout ni el
+//! reloj del delegatario. Lo que sí puede pedir sobre la ejecución va en caveats:
+//! `deterministic` (sin reloj ni entropía) y `llm_tokens` (presupuesto LLM delegado).
 //!
 //! **La atenuación jamás amplía**, y eso se comprueba dos veces: al atenuar (error
 //! claro) y al verificar (rechazo) — un token forjado a mano tampoco puede ampliar.
@@ -40,7 +49,7 @@ use std::rc::Rc;
 
 use indexmap::IndexMap;
 
-use synsema_capabilities::model::{capability_type_from_name, Capability, CapabilitySet};
+use synsema_capabilities::model::{capability_type_from_name, is_process_local, Capability, CapabilitySet, Delegation};
 use synsema_core::bytesutil::{b64url_decode, b64url_encode};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::secret::constant_time_eq;
@@ -98,6 +107,11 @@ struct Caveats {
     method: Option<String>,
     /// Techo de gasto delegado (unidad → monto máximo, en texto decimal exacto).
     spend: Vec<(String, String)>,
+    /// El delegatario corre SIN reloj ni entropía (`time`/`random` negadas), como el techo
+    /// `--deterministic` del host. Sólo puede pasar de `false` a `true` al atenuar.
+    deterministic: bool,
+    /// Presupuesto LLM delegado (tokens). Al atenuar sólo puede bajar.
+    llm_tokens: Option<u64>,
 }
 
 /// El token completo, ya parseado.
@@ -154,6 +168,15 @@ fn caveats_to_mp(c: &Caveats) -> Mp {
             "spend".to_string(),
             mp_map(sp.into_iter().map(|(u, a)| (u, Mp::Str(a))).collect()),
         ));
+    }
+    // Sólo se serializan cuando están puestos: un token sin estos caveats es byte-idéntico
+    // al de antes de T1 (y un motor viejo lo verifica igual; uno con ellos lo RECHAZA, que
+    // es lo correcto: nunca ignorar una restricción que el emisor sí puso).
+    if c.deterministic {
+        entries.push(("deterministic".to_string(), Mp::Uint(1)));
+    }
+    if let Some(n) = c.llm_tokens {
+        entries.push(("llm_tokens".to_string(), Mp::Uint(n)));
     }
     mp_map(entries)
 }
@@ -309,6 +332,8 @@ fn decode_caveats(c: &mut Cur) -> Option<Caveats> {
                 }
                 out.spend = sp;
             }
+            "deterministic" => out.deterministic = c.uint()? == 1,
+            "llm_tokens" => out.llm_tokens = Some(c.uint()?),
             // Clave desconocida → el token viene de otra versión/implementación:
             // rechazo (nunca ignorar un caveat que no se entiende, sería aceptar
             // una restricción que el emisor SÍ puso).
@@ -434,6 +459,18 @@ fn caveats_narrow(parent: &Caveats, child: &Caveats) -> bool {
             _ => return false,
         }
     }
+    // deterministic: una vez pedido, ningún hijo recupera el reloj.
+    if parent.deterministic && !child.deterministic {
+        return false;
+    }
+    // llm_tokens: el hijo no puede tener más presupuesto que el padre (ni "sin límite"
+    // cuando el padre tenía uno).
+    if let Some(pl) = parent.llm_tokens {
+        match child.llm_tokens {
+            Some(cl) if cl <= pl => {}
+            _ => return false,
+        }
+    }
     // aud/ip/method: si el padre fijó uno, el hijo debe repetir EXACTAMENTE ese
     // (no puede cambiar de audiencia ni ampliar a otro método/IP).
     for (p, c) in [
@@ -502,7 +539,17 @@ fn parse_caps(m: &IndexMap<String, SynValue>, who: &str) -> Result<Vec<(String, 
     let mut out: Vec<(String, Vec<String>)> = Vec::new();
     for (name, v) in m {
         // Valida el nombre contra el vocabulario del lenguaje (falla en el typo).
-        to_capability(name, None, who)?;
+        let cap = to_capability(name, None, who)?;
+        // Las capabilities LOCALES AL PROCESO no son autoridad transferible: nadie puede
+        // delegar el stdout ni el reloj del proceso de otro. Fail-loud, como `caps` vacío.
+        if is_process_local(cap.ty) {
+            return Err(err(format!(
+                "{}: {:?} is process-local (stdout, stdin, time, random): a token cannot delegate it. \
+                 The host ceiling governs it; to run the holder without clock or entropy use the \
+                 caveat {{\"deterministic\": true}} instead",
+                who, name
+            )));
+        }
         let scopes = match v {
             SynValue::Nothing => Vec::new(),
             SynValue::Text(s) => vec![s.to_string()],
@@ -615,10 +662,38 @@ fn parse_caveats(
                     )))
                 }
             },
+            "deterministic" => match v {
+                SynValue::Bool(b) => c.deterministic = *b,
+                other => {
+                    return Err(err(format!(
+                        "{}: deterministic must be a bool, got {}",
+                        who,
+                        other.type_name()
+                    )))
+                }
+            },
+            "llm_tokens" => match v {
+                SynValue::Number(n) => match n.to_i64_trunc() {
+                    Some(t) if t >= 0 => c.llm_tokens = Some(t as u64),
+                    _ => {
+                        return Err(err(format!(
+                            "{}: llm_tokens must be a non-negative integer (tokens)",
+                            who
+                        )))
+                    }
+                },
+                other => {
+                    return Err(err(format!(
+                        "{}: llm_tokens must be an integer (tokens), got {}",
+                        who,
+                        other.type_name()
+                    )))
+                }
+            },
             other => {
                 return Err(err(format!(
-                    "{}: unknown caveat {:?} (valid caveats: ttl, aud, ip, method, spend; plus now, \
-                     the instant ttl is measured from)",
+                    "{}: unknown caveat {:?} (valid caveats: ttl, aud, ip, method, spend, deterministic, \
+                     llm_tokens; plus now, the instant ttl is measured from)",
                     who, other
                 )))
             }
@@ -743,6 +818,14 @@ fn b_captoken_attenuate(args: &[SynValue], time_caps: &Rc<RefCell<CapabilitySet>
     if caveats.spend.is_empty() {
         caveats.spend = parent.caveats.spend.clone();
     }
+    // `deterministic` y `llm_tokens` se heredan del padre si el hijo no los dice (no se
+    // pueden "olvidar" para recuperar el reloj o el presupuesto).
+    if parent.caveats.deterministic {
+        caveats.deterministic = true;
+    }
+    if caveats.llm_tokens.is_none() {
+        caveats.llm_tokens = parent.caveats.llm_tokens;
+    }
 
     // La atenuación JAMÁS amplía: se comprueba acá con un error que dice qué
     // sobra (y de nuevo en el verify, para un token forjado a mano).
@@ -757,7 +840,7 @@ fn b_captoken_attenuate(args: &[SynValue], time_caps: &Rc<RefCell<CapabilitySet>
     if !caveats_narrow(&parent.caveats, &caveats) {
         return Err(err(format!(
             "{}: the new caveats are wider than the token's (a longer ttl, a different aud/ip/method, \
-             or a higher spend limit) — attenuation can only narrow",
+             a higher spend or llm_tokens limit, or deterministic turned back off) — attenuation can only narrow",
             F
         )));
     }
@@ -929,6 +1012,14 @@ fn verify_inner(
                 None => eff.spend.push((unit.clone(), amount.clone())),
             }
         }
+        // T1: `deterministic` una vez puesto en cualquier bloque queda puesto; `llm_tokens`
+        // es el mínimo de la cadena.
+        if b.caveats.deterministic {
+            eff.deterministic = true;
+        }
+        if let Some(n) = b.caveats.llm_tokens {
+            eff.llm_tokens = Some(eff.llm_tokens.map_or(n, |cur| cur.min(n)));
+        }
     }
     // 5. Evaluación contextual.
     if let Some(exp) = eff.exp {
@@ -974,6 +1065,11 @@ fn verify_inner(
         sp.insert(unit.clone(), syn_text(amount.as_str()));
     }
     cav.insert("spend".to_string(), syn_map(sp));
+    cav.insert("deterministic".to_string(), SynValue::Bool(eff.deterministic));
+    cav.insert(
+        "llm_tokens".to_string(),
+        eff.llm_tokens.map(|n| syn_int(n as i64)).unwrap_or_else(syn_nothing),
+    );
     out.insert("caveats".to_string(), syn_map(cav));
     Ok(Some(syn_map(out)))
 }
@@ -1020,6 +1116,17 @@ fn b_captoken_allows(args: &[SynValue]) -> Result<SynValue, Control> {
         None | Some(SynValue::Nothing) => None,
         Some(v) => Some(v.to_string()),
     };
+    // Misma regla que al acuñar: preguntar si un token "permite stdout/time" es una pregunta
+    // mal formada, y la respuesta es un error, no un `false` que un programa interprete.
+    if let Some(ty) = capability_type_from_name(&name) {
+        if is_process_local(ty) {
+            return Err(err(format!(
+                "{}: {:?} is process-local (stdout, stdin, time, random): tokens never carry it — the host \
+                 ceiling governs it (and the caveat `deterministic` is what turns the clock off)",
+                F, name
+            )));
+        }
+    }
     let Some(entry) = caps_map.get(&name) else {
         return Ok(SynValue::Bool(false));
     };
@@ -1075,13 +1182,137 @@ pub fn register_captoken_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabil
     interp.register_builtin("captoken_allows", -1, Rc::new(|_i, a, _l| b_captoken_allows(a)));
 }
 
-/// Nota de diseño: la conversión de los caps del token a `Capability`s del modelo
-/// (el puente hacia un futuro `require from_token(t)`) NO vive acá todavía a
-/// propósito — sería código sin llamador. El consumo real de un token verificado
-/// hoy es `captoken_allows` (consulta puntual) y, del lado del serve,
-/// `identity_of`/`delegated_spend_of` de `server.rs` (identidad y techo de gasto,
-/// T6.4). Cuando el volcado al CapabilitySet exista, es una función de tres
-/// líneas sobre `caps`.
+/// Los `caps` de un token verificado (el map `{name: [scopes]}` que devuelve
+/// `captoken_verify`, o un map literal con la misma forma) como lista de `Capability`
+/// del modelo — el techo delegado (T1). Es el puente token → `CapabilitySet`: lo usan
+/// `delegation_of` (serve, por request), `run_program {ceiling: caps}` (por proceso) y
+/// `sandbox under caps` (por bloque). Mismos nombres que `require`; un scope vacío o
+/// `nothing` = la capability sin scope; las locales al proceso se rechazan como al acuñar.
+pub fn ceiling_from_caps_map(m: &IndexMap<String, SynValue>) -> Result<Vec<Capability>, String> {
+    let mut out = Vec::new();
+    for (name, v) in m {
+        let ty = capability_type_from_name(name).ok_or_else(|| {
+            format!(
+                "unknown capability {:?} — use the same names as `require` (net, db, file.read, sign, spend, …)",
+                name
+            )
+        })?;
+        if is_process_local(ty) {
+            return Err(format!(
+                "{:?} is process-local (stdout, stdin, time, random): a delegated ceiling cannot carry it; the host ceiling governs it",
+                name
+            ));
+        }
+        let scopes: Vec<String> = match v {
+            SynValue::Nothing => Vec::new(),
+            SynValue::Text(s) => vec![s.to_string()],
+            SynValue::List(l) => l.borrow().iter().map(|s| s.to_string()).collect(),
+            other => {
+                return Err(format!(
+                    "the scope of {:?} must be text, a list of text, or nothing (no scope), got {}",
+                    name,
+                    other.type_name()
+                ))
+            }
+        };
+        if scopes.is_empty() {
+            out.push(Capability::new(ty, None));
+        } else {
+            for s in scopes {
+                out.push(Capability::new(ty, Some(s)));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// El techo delegado de un token YA VERIFICADO (`delegation_of`, bajo `serve`): la
+/// conversión que **nunca abre**. Las capabilities locales al proceso (`stdout`, `stdin`,
+/// `time`, `random`) se IGNORAN — el techo delegado no las gobierna, así que es exacto, y un
+/// token acuñado por un motor anterior que las listaba sigue siendo un techo al actualizar.
+/// Un nombre desconocido o un scope mal formado CIERRA: techo vacío (el caller no delega
+/// nada reconocible: todo lo transferible se deniega) y un aviso por stderr, una vez por
+/// proceso. Antes, un token inconvertible corría SIN techo (auditoría T1–T4, ronda 1).
+pub fn delegated_ceiling_from_caps_map(m: &IndexMap<String, SynValue>) -> Vec<Capability> {
+    let mut out = Vec::new();
+    for (name, v) in m {
+        let Some(ty) = capability_type_from_name(name) else {
+            warn_unknown_delegated_once(name);
+            return Vec::new();
+        };
+        if is_process_local(ty) {
+            continue;
+        }
+        let scopes: Vec<String> = match v {
+            SynValue::Nothing => Vec::new(),
+            SynValue::Text(s) => vec![s.to_string()],
+            SynValue::List(l) => l.borrow().iter().map(|s| s.to_string()).collect(),
+            _ => {
+                warn_unknown_delegated_once(name);
+                return Vec::new();
+            }
+        };
+        if scopes.is_empty() {
+            out.push(Capability::new(ty, None));
+        } else {
+            for s in scopes {
+                out.push(Capability::new(ty, Some(s)));
+            }
+        }
+    }
+    out
+}
+
+fn warn_unknown_delegated_once(name: &str) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        eprintln!(
+            "synsema: warning: a verified capability token carries {:?}, which this engine cannot turn into a ceiling; the token delegates NOTHING (every transferable capability is denied for its holder) — mint tokens with the names `require` uses",
+            name
+        )
+    });
+}
+
+/// El techo delegado que expresa el valor de un `sandbox under <v>`: el map que devolvió
+/// `captoken_verify` (→ el techo de ESE token, con su `id` y su `deterministic`; una
+/// denegación adentro es "del token", como en un handler) o un map literal `{net: ["api.x"]}`
+/// (→ un techo de bloque: mínimo privilegio elegido por el programa).
+pub fn delegation_from_value(v: &SynValue) -> Result<Delegation, String> {
+    let SynValue::Map(m) = v else {
+        return Err(format!(
+            "expected a map of capabilities ({{\"net\": [\"api.x\"], \"db\": \"orders\"}}) or the map returned by captoken_verify, got {}",
+            v.type_name()
+        ));
+    };
+    let m = m.borrow();
+    if let (Some(SynValue::Text(id)), Some(SynValue::Map(caps))) = (m.get("id"), m.get("caps")) {
+        let deterministic = matches!(
+            m.get("caveats"),
+            Some(SynValue::Map(cv)) if matches!(cv.borrow().get("deterministic"), Some(SynValue::Bool(true)))
+        );
+        return Ok(Delegation::token(id.to_string(), ceiling_from_caps_map(&caps.borrow())?, deterministic));
+    }
+    Ok(Delegation::block(ceiling_from_caps_map(&m)?))
+}
+
+/// Instala el hook de `sandbox under` sobre `caps` (idéntico en el runtime nativo y en el
+/// host wasm, como el hook de `sandbox`): al entrar apila el techo delegado del bloque, al
+/// salir lo desapila. Lo que el bloque no lista se deniega; lo que lista sigue gateado por
+/// los grants del programa y por los techos de arriba (host, token de la request).
+pub fn install_ceiling_hook(interp: &mut Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
+    interp.set_ceiling_hook(Rc::new(move |v| match v {
+        Some(v) => {
+            let d = delegation_from_value(v).map_err(|e| format!("sandbox under: {}", e))?;
+            caps.borrow_mut().push_delegation(d);
+            Ok(())
+        }
+        None => {
+            caps.borrow_mut().pop_delegation();
+            Ok(())
+        }
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1565,5 +1796,153 @@ mod tests {
             ok(b_captoken_allows(&[v, text("net"), text("x")])),
             SynValue::Bool(false)
         ));
+    }
+}
+
+#[cfg(test)]
+mod t1_tests {
+    use super::*;
+
+    #[test]
+    fn a_verified_tokens_ceiling_never_opens() {
+        let m = |pairs: Vec<(&str, SynValue)>| {
+            let mut mm = IndexMap::new();
+            for (k, v) in pairs {
+                mm.insert(k.to_string(), v);
+            }
+            mm
+        };
+        // Lo local al proceso se ignora (un token de un motor anterior con `stdout`): el resto
+        // sigue siendo el techo.
+        let caps = delegated_ceiling_from_caps_map(&m(vec![("net", syn_text("api.example")), ("stdout", SynValue::Nothing)]));
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0].ty, CapabilityType::Net);
+        // Un nombre desconocido cierra: techo vacío, no "sin techo".
+        assert!(delegated_ceiling_from_caps_map(&m(vec![("net", syn_text("api.example")), ("teleport", SynValue::Nothing)])).is_empty());
+        // Un scope mal formado también cierra.
+        assert!(delegated_ceiling_from_caps_map(&m(vec![("net", syn_int(7))])).is_empty());
+        // La conversión ESTRICTA (sandbox under / run_program con un map literal) sigue
+        // rechazando lo local al proceso: ahí es un bug del programa, con el fix en el error.
+        assert!(ceiling_from_caps_map(&m(vec![("stdout", SynValue::Nothing)])).is_err());
+    }
+    use synsema_capabilities::model::{CapabilityType, DelegationSource};
+
+    fn text(s: &str) -> SynValue {
+        syn_text(s)
+    }
+
+    fn map(pairs: Vec<(&str, SynValue)>) -> SynValue {
+        let mut m = IndexMap::new();
+        for (k, v) in pairs {
+            m.insert(k.to_string(), v);
+        }
+        syn_map(m)
+    }
+
+    fn caps() -> Rc<RefCell<CapabilitySet>> {
+        Rc::new(RefCell::new(CapabilitySet::new("deterministic")))
+    }
+
+    fn ok(r: Result<SynValue, Control>) -> SynValue {
+        match r {
+            Ok(v) => v,
+            Err(Control::Error(e)) => panic!("unexpected error: {}", e),
+            Err(_) => panic!("unexpected control flow"),
+        }
+    }
+
+    fn err_text(r: Result<SynValue, Control>) -> String {
+        match r {
+            Err(Control::Error(e)) => e.to_string(),
+            Ok(v) => panic!("esperaba error, got {}", v),
+            Err(_) => panic!("control"),
+        }
+    }
+
+    fn verified(v: SynValue) -> IndexMap<String, SynValue> {
+        match v {
+            SynValue::Map(m) => m.borrow().clone(),
+            other => panic!("esperaba map, got {}", other),
+        }
+    }
+
+    fn entries(v: SynValue) -> IndexMap<String, SynValue> {
+        verified(v)
+    }
+
+    fn at(ts: i64) -> SynValue {
+        map(vec![("at", syn_int(ts))])
+    }
+
+    /// Las capabilities locales al proceso no se acuñan ni se atenúan ni se consultan.
+    #[test]
+    fn process_local_capabilities_are_not_delegable() {
+        for name in ["stdout", "stdin", "time", "random"] {
+            let e = err_text(b_captoken_mint(&[map(vec![(name, syn_nothing())]), text("k")], &caps()));
+            assert!(e.contains("process-local") && e.contains("deterministic"), "{}: {}", name, e);
+        }
+        let tok = ok(b_captoken_mint(&[map(vec![("net", text("a.example"))]), text("k"), map(vec![("now", syn_int(1000))])], &caps()));
+        let e = err_text(b_captoken_attenuate(&[tok.clone(), map(vec![("time", syn_nothing())])], &caps()));
+        assert!(e.contains("process-local"), "{}", e);
+        let v = ok(b_captoken_verify(&[tok, text("k"), at(1001)], &caps()));
+        let e = err_text(b_captoken_allows(&[v, text("time")]));
+        assert!(e.contains("process-local"), "{}", e);
+    }
+
+    /// `deterministic` y `llm_tokens` viajan en el token, sólo se estrechan al atenuar, y
+    /// un token sin ellos los reporta apagados.
+    #[test]
+    fn deterministic_and_llm_tokens_caveats_roundtrip_and_only_narrow() {
+        let c = caps();
+        let opts = map(vec![("now", syn_int(1000)), ("ttl", syn_int(100)), ("deterministic", SynValue::Bool(true)), ("llm_tokens", syn_int(1000))]);
+        let tok = ok(b_captoken_mint(&[map(vec![("net", text("a.example"))]), text("k"), opts], &c));
+        let v = verified(ok(b_captoken_verify(&[tok.clone(), text("k"), at(1001)], &c)));
+        let cav = entries(v.get("caveats").cloned().unwrap());
+        assert!(matches!(cav.get("deterministic"), Some(SynValue::Bool(true))));
+        assert_eq!(cav.get("llm_tokens").map(|x| x.to_string()), Some("1000".to_string()));
+
+        // Atenuar: más presupuesto → rechazo; menos → ok y el hijo lo lleva estrechado.
+        let e = err_text(b_captoken_attenuate(&[tok.clone(), map(vec![("net", text("a.example"))]), map(vec![("llm_tokens", syn_int(2000))])], &c));
+        assert!(e.contains("attenuation can only narrow"), "{}", e);
+        let narrower = ok(b_captoken_attenuate(&[tok.clone(), map(vec![("net", text("a.example"))]), map(vec![("llm_tokens", syn_int(500))])], &c));
+        let v2 = verified(ok(b_captoken_verify(&[narrower, text("k"), at(1001)], &c)));
+        let cav2 = entries(v2.get("caveats").cloned().unwrap());
+        assert_eq!(cav2.get("llm_tokens").map(|x| x.to_string()), Some("500".to_string()));
+        // `deterministic` no se puede apagar en un hijo: el bloque hereda el `true` del padre.
+        let still = ok(b_captoken_attenuate(&[tok.clone(), map(vec![("net", text("a.example"))]), map(vec![("deterministic", SynValue::Bool(false))])], &c));
+        let v3 = verified(ok(b_captoken_verify(&[still, text("k"), at(1001)], &c)));
+        let cav3 = entries(v3.get("caveats").cloned().unwrap());
+        assert!(matches!(cav3.get("deterministic"), Some(SynValue::Bool(true))));
+
+        // Sin los caveats nuevos, el verify los reporta apagados.
+        let plain = ok(b_captoken_mint(&[map(vec![("net", text("a.example"))]), text("k"), map(vec![("now", syn_int(1000))])], &c));
+        let vp = verified(ok(b_captoken_verify(&[plain, text("k"), at(1001)], &c)));
+        let cavp = entries(vp.get("caveats").cloned().unwrap());
+        assert!(matches!(cavp.get("deterministic"), Some(SynValue::Bool(false))));
+        assert!(matches!(cavp.get("llm_tokens"), Some(SynValue::Nothing)));
+    }
+
+    /// El puente token → techo: `ceiling_from_caps_map` y `delegation_from_value`.
+    #[test]
+    fn caps_map_becomes_a_ceiling_and_a_verified_token_becomes_a_delegation() {
+        let m = entries(map(vec![("net", syn_list(vec![text("a"), text("b")])), ("db", syn_nothing()), ("file.read", text("./data/*"))]));
+        let caps_list = ceiling_from_caps_map(&m).unwrap();
+        assert_eq!(caps_list.len(), 4);
+        assert!(caps_list.contains(&Capability::new(CapabilityType::Db, None)));
+        assert!(caps_list.contains(&Capability::new(CapabilityType::FileRead, Some("./data/*".into()))));
+        let bad = entries(map(vec![("stdout", syn_nothing())]));
+        assert!(ceiling_from_caps_map(&bad).unwrap_err().contains("process-local"));
+
+        let c = caps();
+        let tok = ok(b_captoken_mint(&[map(vec![("db", text("orders"))]), text("k"), map(vec![("now", syn_int(1000)), ("id", text("tok-x")), ("deterministic", SynValue::Bool(true))])], &c));
+        let v = ok(b_captoken_verify(&[tok, text("k"), at(1001)], &c));
+        let d = delegation_from_value(&v).unwrap();
+        assert_eq!(d.source, DelegationSource::Token("tok-x".into()));
+        assert!(d.deterministic);
+        assert_eq!(d.caps, vec![Capability::new(CapabilityType::Db, Some("orders".into()))]);
+        // Un map literal es un techo de bloque.
+        let b = delegation_from_value(&map(vec![("net", text("a.example"))])).unwrap();
+        assert_eq!(b.source, DelegationSource::Block);
+        assert!(delegation_from_value(&text("nope")).unwrap_err().contains("expected a map"));
     }
 }

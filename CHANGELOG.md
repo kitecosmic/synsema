@@ -6,6 +6,113 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.28 — 2026-09-22
+
+Identity and trust between agents: the token is the ceiling, passkeys, `did:key`, signed
+documents, receipts and the Agent Card. One breaking change, on purpose, below.
+
+**Breaking, on purpose.** Under `serve`, when the `auth with` task returns the map of
+`captoken_verify`, the token's `caps` are now the request's **delegated ceiling**: a capability the
+program declares but the token does not carry is **denied at use**, `llm` and `judge` included, and
+the client receives `403 {"error": "insufficient permissions", "status": 403}` — a fixed body that
+never names the capability. Before, the `caps` were advisory (`captoken_allows` only) and only the
+`spend` caveat was enforced; a handler that ignored the token's `caps` kept working. It keeps
+working only if the token carries what the handler uses. **What to write instead:** mint the token
+with the capabilities the holder needs (list `llm`/`judge` if it must reason); or, if you never
+wanted the ceiling, return the identity as text from `auth with` rather than the token map.
+
+**Breaking, on purpose (tokens).** `captoken_mint`/`captoken_attenuate` refuse the process-local
+capabilities `stdout`, `stdin`, `time`, `random` (`… is process-local: a token cannot delegate it`),
+and `captoken_allows` errors when asked about them. A token carries transferable authority, not
+another process's clock; the host ceiling governs those. To run a holder without clock or entropy,
+use the new caveat `deterministic: true`.
+
+### Added
+
+- **The delegated ceiling, in three places.** A verified captoken is the ceiling of a `serve`
+  request (above), of a child program (`run_program(src, {"ceiling": verified})`, which also takes a
+  plain `{capability: scopes}` map) and of a block: **`sandbox under <caps>`**, a least-privilege block
+  that runs its body under `caps ∩ the current ceiling` — a literal map or the map of
+  `captoken_verify` — with `require` inside still a no-op. Nested blocks stack; every level must cover
+  the use. Process-local capabilities are never delegable; the host ceiling always wins.
+- **Two caveats.** `deterministic: true` (the holder runs without `time` and `random`, like
+  `--deterministic`; once set, no attenuation turns it off) and `llm_tokens: N` (a delegated LLM
+  budget, metered on the token's `id` beside `SYNSEMA_LLM_BUDGET_PER_IDENTITY`; can only decrease).
+  `captoken_verify` reports both in `caveats`.
+- **The subject travels with the ceiling.** An agent spawned from a handler, a `parallel_map` worker
+  and a `run_program` child run on behalf of the same identity, under the same delegated ceiling,
+  spend limits and LLM budget (the child gets them through an internal variable set after the
+  program's `env`: a program cannot choose its child's identity); the `errors with` page runs under
+  the request's subject too; a cron tick runs as `cron:<job>`; `synsema run` runs as the operator
+  (`SYNSEMA_IDENTITY`, optional, from the environ or `.env`, in `.env.example`).
+- **A verified token's ceiling never opens.** Process-local names in a token's `caps` are ignored
+  (a token minted by an earlier engine keeps being a ceiling); an unknown name closes it (empty
+  ceiling, one stderr warning). The `sign`, `spend`, `wallet`, `secret`/`env`, `reveal` and
+  `render` gates keep the delegated cause: denied by the caller's token → the fixed 403, never a
+  500 that says `add require …` about a program that already declares it.
+- **Denials say they are permissions.** `Capability not granted: X` now ends with `— this is a
+  permission, not a bug: add `require X` to the program's preamble (or to the importing file, when
+  this code runs in a module)`; a denial by a token says `denied by the delegated ceiling of token
+  <id>` (the caller must present a token that carries it), a `sandbox under` one says so too. The
+  audit gains the reasons `above delegated ceiling (token <id>)` and `above sandbox ceiling (sandbox
+  under)`, with `source: token`/`sandbox` on rejected grants.
+- **`synsema check` warns about undeclared capabilities**, including what an imported module's tasks
+  need and the importing file does not declare, with the exact `require` to add (reusing `synsema
+  code caps`). Warning, not error.
+- **Handler mode (wasm)** applies the same delegated ceiling and 403, so the native ↔ wasm audit
+  parity holds.
+- **Passkeys (WebAuthn), pure.** `webauthn_register(credential, opts)` verifies the registration
+  ceremony and returns the credential's public key as a JWK (`id`, `public_key`, `alg`,
+  `sign_count`, `fmt`, `aaguid`, flags, `transports`); `webauthn_verify(assertion, credential,
+  opts)` takes the **stored credential map** (what register returned, plus the `sign_count` and
+  `user_handle` you keep) and verifies an authentication (challenge, origin — one or a list —,
+  `rp_id`, flags, signature over `authenticatorData ‖ sha256(clientDataJSON)`, the counter, and
+  that the assertion's credential id IS the stored one — `rawId`/`userHandle` are not signed, so the
+  returned `id`/`user_handle` are the stored ones, never what the assertion declares) and returns
+  `{id, user_handle, alg, sign_count, …}` or `nothing` on any failure. ES256, RS256 and EdDSA; the
+  registered key fixes the algorithm. Attestation is reported (`fmt`) and not verified, on
+  purpose; the builtins keep no state.
+- **`canonical_json` (RFC 8785 / JCS)**: deterministic bytes for hashing and signing; refuses what
+  JCS cannot carry exactly (integers beyond 2^53, decimals over 15 significant digits, bytes,
+  secrets) instead of approximating.
+- **`did:key`**: `did_key_encode(public_key, alg?)` (ed25519, p256, x25519, secp256k1),
+  `did_key_decode`, `did_key_document` (DID Document with Multikey verification methods and, for
+  ed25519, the derived X25519 `keyAgreement`).
+- **Signed documents (W3C Data Integrity)**: `document_sign(doc, key, opts?)` adds a
+  `DataIntegrityProof` — `eddsa-jcs-2022` with an ed25519 secret (gate `sign("NAME")`, audited) or
+  PKCS#8 PEM, `ecdsa-jcs-2019` with a P-256 scalar or PEM (`verificationMethod` defaults to the
+  signing key's `did:key`); `document_verify(doc, public_key, opts?)`
+  takes bytes, a `did:key`, a public-key PEM or a JWK and returns the proof's metadata or
+  `nothing`.
+- **Receipts**: `receipt(opts?)` — the receipt of the running unit of work as a Verifiable
+  Credential **derived by the engine**: identity, captoken ids in force, the capability audit (the
+  snapshot at issue time), this identity's spend totals per unit, `declassify` log, steps,
+  `program_sha`, engine version and `declared_result_sha256` (of the value the program passes as
+  `result`). `issuer` is always the `did:key` of the signing key and `validFrom`/`created` are the
+  engine's clock (omitted without `time`): neither is an option, so a receipt cannot be antedated
+  or issued in another's name. Opts: `sign`, `verification_method`, `cryptosuite`, `challenge`,
+  `domain`, `result`. `receipt_verify(receipt, public_key, opts?)` also requires the issuer and the
+  verification method to be the verifying key's did.
+- **EdDSA JWTs**: `jwt_sign` gains `opts.alg = "EdDSA"` (Ed25519 PKCS#8 PEM or the 32-byte seed;
+  with a `secret` it goes through `require sign("NAME")` + audit, like `ed25519_sign`);
+  `jwt_verify`'s key map gains `{"did": "did:key:z…"}` (ed25519 → EdDSA, P-256 → ES256, resolved
+  offline; a `kid` in the token must be `did:key:z…#z…`); `oidc_verify` accepts OKP/Ed25519 JWKs.
+- **The Agent Card, derived and signed.** Every `serve` publishes
+  `/.well-known/agent-card.json` (alias `/.well-known/agent.json`): the **A2A 1.0** card shape
+  (`message AgentCard` of `a2a.proto` in proto-JSON: `securitySchemes` as `httpAuthSecurityScheme`
+  / `apiKeySecurityScheme`, `securityRequirements`, no `url`) — skills from the route table,
+  security schemes when auth is wired, and inside `capabilities.extensions` the Synsema extension
+  with the server's `did:key`, base URL, OpenAPI, auth discovery, attestation (under `--attested`)
+  and engine — with `supportedInterfaces: []` because a Synsema server does not speak the A2A
+  transport and the card never claims it. Signed as a JWS (A2A §8.4, payload = JCS of the card, `kid` = the did's
+  verification method) with **`SYNSEMA_IDENTITY_KEY`** (new knob: the server's ed25519 seed, 64
+  hex, in `.env.example`) or, under `serve --attested`, with the attested P-256 key. Without a key
+  the card is served unsigned and without `did`. Both paths are reserved (`synsema check` warns
+  on a parametric route that would swallow them); `/llms.txt` lists the card.
+- **ERC-8004 as an example module** (`examples/erc8004/`): the registration file (pointing at the
+  Agent Card and the did), `document_hash`, and the calldata of the Identity, Reputation and
+  Validation registries via `abi_encode` — a client of the registry, not a primitive of the engine.
+
 ## v0.6.27 — 2026-09-21
 
 No breaking changes to programs: a program that loads on v0.6.26 loads unchanged, and the new

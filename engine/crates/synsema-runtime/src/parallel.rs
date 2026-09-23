@@ -99,7 +99,8 @@ fn build_worker_interp(
     ceiling: &Option<Arc<Vec<Capability>>>,
     mem: &Option<MemoryCtx>,
     bus: &Option<Arc<synsema_agents::bus::Bus>>,
-) -> (Interpreter, ModuleRegistry) {
+    subject: &crate::subject::Subject,
+) -> (Interpreter, ModuleRegistry, crate::llm_providers::LlmIdentityScope) {
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("parallel")));
     // Techo del host (--sandbox/--cap-set): setear ANTES de grants/wire_common. Así el
@@ -128,7 +129,10 @@ fn build_worker_interp(
     }
     let registry = rebuild_globals(&mut interp, globals);
     interp.freeze_intent(); // corre bajo el intent congelado
-    (interp, registry)
+    // T1: el worker corre EN NOMBRE del mismo sujeto que el llamador (identidad, techo de
+    // gasto, techo delegado del token, presupuesto LLM): la identidad viaja con el techo.
+    let scope = subject.apply(&mut interp, &caps);
+    (interp, registry, scope)
 }
 
 fn reconstruct_task(
@@ -181,6 +185,7 @@ fn run_parallel(
     ceiling: Option<Arc<Vec<Capability>>>,
     mem: Option<MemoryCtx>,
     bus: Option<Arc<synsema_agents::bus::Bus>>,
+    subject: crate::subject::Subject,
 ) -> Result<Vec<SendValue>, RuntimeError> {
     let n = items.len();
     if n == 0 {
@@ -223,13 +228,14 @@ fn run_parallel(
             let items = items.clone();
             let aborted = aborted.clone();
             let error = error.clone();
+            let subject = subject.clone();
             let h = tokio::task::spawn_blocking(move || -> Option<SendValue> {
                 let _permit = permit; // libera el slot al terminar
                 if aborted.load(Ordering::Relaxed) {
                     return None;
                 }
-                let (mut interp, mut registry) =
-                    build_worker_interp(&globals, &granted, &denied, secure, &ceiling, &mem, &bus);
+                let (mut interp, mut registry, _subject_scope) =
+                    build_worker_interp(&globals, &granted, &denied, secure, &ceiling, &mem, &bus, &subject);
                 let task_value = reconstruct_task(&interp, &task_snap, &mut registry);
                 let item = from_send(&items[i]);
                 match interp.call_task(task_value, vec![item]) {
@@ -350,6 +356,9 @@ pub(crate) fn register_parallel_builtins(
             // (Arc → cruza a los hilos de tokio). Sin techo → None (comportamiento actual).
             let ceiling: Option<Arc<Vec<Capability>>> =
                 caps.borrow().ceiling.as_ref().map(|rc| Arc::new((**rc).clone()));
+            // T1: el sujeto del llamador (identidad + techo delegado + presupuestos) viaja a
+            // cada worker junto con el techo del host.
+            let subject = crate::subject::Subject::capture(i, &caps);
             let items: Vec<SendValue> = list.iter().map(to_send).collect();
             match run_parallel(
                 globals,
@@ -362,6 +371,7 @@ pub(crate) fn register_parallel_builtins(
                 ceiling,
                 mem,
                 synsema_stdlib::ws::bus_of_interp(i),
+                subject,
             ) {
                 Ok(results) => Ok(syn_list(results.iter().map(from_send).collect())),
                 Err(re) => Err(Control::Error(re)),

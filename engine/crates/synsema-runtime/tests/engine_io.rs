@@ -47,7 +47,7 @@ fn io_builtins_deny_by_default() {
         let r = run(call, "<t>");
         assert_eq!(
             r.errors,
-            vec!["Runtime error: Capability not granted: file_read(\"X\")".to_string()],
+            vec!["Runtime error: Capability not granted: file_read(\"X\") — this is a permission, not a bug: add `require file.read(\"X\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()],
             "call: {}",
             call
         );
@@ -388,19 +388,19 @@ fn iop2_builtins_deny_by_default() {
     let r = run("let x be grep(\"X\", \"y\")", "<t>");
     assert_eq!(
         r.errors,
-        vec!["Runtime error: Capability not granted: file_read(\"X\")".to_string()]
+        vec!["Runtime error: Capability not granted: file_read(\"X\") — this is a permission, not a bug: add `require file.read(\"X\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
     );
 
     let r = run("let x be edit_file(\"X\", \"a\", \"b\")", "<t>");
     assert_eq!(
         r.errors,
-        vec!["Runtime error: Capability not granted: file_write(\"X\")".to_string()]
+        vec!["Runtime error: Capability not granted: file_write(\"X\") — this is a permission, not a bug: add `require file.write(\"X\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
     );
 
     let r = run("append_file(\"X\", \"y\")", "<t>");
     assert_eq!(
         r.errors,
-        vec!["Runtime error: Capability not granted: file_write(\"X\")".to_string()]
+        vec!["Runtime error: Capability not granted: file_write(\"X\") — this is a permission, not a bug: add `require file.write(\"X\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
     );
 }
 
@@ -687,7 +687,7 @@ fn run_deny_by_default() {
     let r = run("let r be run(\"echo\", [])", "<t>");
     assert_eq!(
         r.errors,
-        vec!["Runtime error: Capability not granted: exec(\"echo\")".to_string()]
+        vec!["Runtime error: Capability not granted: exec(\"echo\") — this is a permission, not a bug: add `require exec(\"echo\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
     );
 }
 

@@ -40,7 +40,7 @@ fn err(msg: impl Into<String>) -> Control {
 fn require(caps: &Rc<RefCell<CapabilitySet>>, ty: CapabilityType, scope: &str, source: &str) -> Result<(), Control> {
     caps.borrow_mut()
         .require(&Capability::new(ty, Some(scope.to_string())), source)
-        .map_err(|v| Control::Error(RuntimeError::new(v.message)))
+        .map_err(|v| Control::Error(v.into_error()))
 }
 
 /// Path DENTRO de un archivo: separadores `/`, sin `./`, sin `..`, sin absolutos ni unidades.

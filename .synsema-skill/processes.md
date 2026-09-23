@@ -112,7 +112,10 @@ let r be run_program(generated_code, {
 The child **can never exceed the parent** (`net=*` under a parent that only holds `net("api.x")`
 collapses to nothing; the trim is recorded in the parent audit as `above parent ceiling`), a `secret`
 in `env` is refused (`reveal()` it on purpose), and no `synsema` on the `PATH` or stderr-parsing is
-involved. This is the language-level "run the code the LLM generated, safely" — the ceiling is
+involved. **`ceiling` also takes a captoken (v0.6.28+):** `run_program(src, {"ceiling": captoken_verify(t,
+key)})` runs the child under **that token's authority** — the third way the token is the ceiling, beside a
+`serve` request and `sandbox under`. The child keeps `stdout` and `time` (process-local, not the token's to
+give) unless the token carries `deterministic: true`; a plain `{capability: scopes}` map works the same way. This is the language-level "run the code the LLM generated, safely" — the ceiling is
 enforced by the child process itself. See [capabilities.md](capabilities.md) and [builtins.md](builtins.md).
 
 ## Give an LLM a shell tool (least-privilege)

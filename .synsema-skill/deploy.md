@@ -106,6 +106,8 @@ see [secrets.md](secrets.md). Resolution: **process environment → `.env` file 
   | `SYNSEMA_STATE_DIR` | `<program dir>/.synsema/state` | where `memory("NAME")` keeps `<NAME>.db` — point it at a mounted volume and keep the code dir read-only (the `.db` is created there; nothing under the program dir) |
   | `SYNSEMA_LLM_BUDGET_PER_IDENTITY` | (none) | `id=N,id2=M` — per-identity LLM token ceilings under `serve` (the identity the auth task returns); one process-wide counter per identity; over the line that identity's ops degrade to `[llm budget exceeded for identity …]`, others continue (v0.6.20+; also read from `.env`) |
   | `SYNSEMA_HEALTH_PATH` | (none) | opt-in host health endpoint: `GET <path>` → `200 {ok, uptime_s, in_flight, engine}`, no auth/rate limit, absent from discovery; a declared route at that path wins (warning at start); = `serve --health` (v0.6.20+) |
+  | `SYNSEMA_IDENTITY` | (none) | v0.6.28+: the operator's identity for `synsema run` (the ledger, the per-identity LLM ceiling and receipts name it); environ or `.env` |
+  | `SYNSEMA_IDENTITY_KEY` | (none) | v0.6.28+: the SERVER's ed25519 seed (64 hex) — signs the Agent Card at `/.well-known/agent-card.json` and gives the server its `did:key`; environ or `.env`; ignored under `serve --attested` (the attested key signs) |
   | `SYNSEMA_AUDIT` | (none) | `json` / `<path>` / `fd:N` / `unix:<path>` — the capability audit stream without the flag, also inside a `synsema build` binary; `--audit` wins (v0.6.20+) |
   | `SYNSEMA_LLM_BUDGET` | unlimited | per-process LLM token ceiling — at the ceiling `reason`/`decide`/… degrade to a `[llm budget exceeded: …]` marker, never an error; unlike the rows above this one is also honored from `.env` — see [llm.md](llm.md) |
 

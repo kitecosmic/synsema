@@ -17,7 +17,7 @@ fn fetch_deny_by_default_in_run() {
     assert!(!r.success, "fetch debe ser deny-by-default incluso en run");
     assert_eq!(
         r.errors,
-        vec!["Runtime error: Capability not granted: net(\"evil.com\")".to_string()]
+        vec!["Runtime error: Capability not granted: net(\"evil.com\") — this is a permission, not a bug: add `require net(\"evil.com\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
     );
 }
 
@@ -27,7 +27,7 @@ fn http_get_deny_by_default_in_run() {
     assert!(!r.success);
     assert_eq!(
         r.errors,
-        vec!["Runtime error: Capability not granted: net(\"evil.com\")".to_string()]
+        vec!["Runtime error: Capability not granted: net(\"evil.com\") — this is a permission, not a bug: add `require net(\"evil.com\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
     );
 }
 
@@ -43,7 +43,7 @@ fn http_post_put_delete_deny_by_default() {
         assert!(!r.success, "{} debe violar sin require net", call);
         assert_eq!(
             r.errors,
-            vec![format!("Runtime error: Capability not granted: net(\"{host}\")")],
+            vec![format!("Runtime error: Capability not granted: net(\"{host}\") — this is a permission, not a bug: add `require net(\"{host}\")` to the program's preamble (or to the importing file, when this code runs in a module)")],
             "call: {}",
             call
         );
@@ -100,7 +100,7 @@ fn scope_mismatch_violates() {
     assert!(!r.success);
     assert_eq!(
         r.errors,
-        vec!["Runtime error: Capability not granted: net(\"otro.com\")".to_string()]
+        vec!["Runtime error: Capability not granted: net(\"otro.com\") — this is a permission, not a bug: add `require net(\"otro.com\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
     );
 }
 

@@ -36,7 +36,7 @@ pub fn require_net(
     };
     caps.borrow_mut()
         .require(&Capability::new(CapabilityType::Net, Some(host)), source)
-        .map_err(|v| Control::Error(RuntimeError::new(v.message)))
+        .map_err(|v| Control::Error(v.into_error()))
 }
 
 /// Respuesta estructurada (espeja el dict del oráculo).

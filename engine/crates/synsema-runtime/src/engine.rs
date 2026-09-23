@@ -36,7 +36,7 @@ use synsema_capabilities::model::{
 use synsema_capabilities::secure::register_secure_builtins;
 use synsema_core::ast::Node;
 use synsema_core::interpreter::{
-    Control, Interpreter, RunResult, StepCatalogEntry, StepResult, SwarmHooks, TestOutcome,
+    Control, Interpreter, RunResult, RuntimeError, StepCatalogEntry, StepResult, SwarmHooks, TestOutcome,
 };
 use synsema_core::parser::{parse_source, CompileError};
 use synsema_core::types::{from_send, to_send, SendValue, SynValue};
@@ -96,10 +96,10 @@ pub(crate) fn suggested_memory_name(filename: &str) -> String {
 /// (G-1): este gate corta antes de tocar los stores.
 pub(crate) fn undeclared_memory_gate(suggest: String) -> MemoryGate {
     Rc::new(move || {
-        Err(format!(
+        Err(RuntimeError::new(format!(
             "Capability not granted: memory. Persistent agent state (remember/recall, rules, progress) requires a declared memory — the declared name identifies its .db file. Add: require memory(\"{}\") at the top of the program",
             suggest
-        ))
+        )))
     })
 }
 
@@ -114,7 +114,7 @@ pub(crate) fn declared_memory_gate(caps: Rc<RefCell<CapabilitySet>>, name: Strin
                 &Capability::new(CapabilityType::Memory, Some(name.clone())),
                 "memory builtin",
             )
-            .map_err(|v| v.message)
+            .map_err(|v| v.into_error())
     })
 }
 
@@ -495,7 +495,7 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     "asinh", "assert", "assert_eq", "assert_error", "assert_ne", "at", "atan", "atan2", "atanh", "bearer",
     "bech32_decode", "bech32_encode", "beta", "btc_address", "btc_address_decode", "btc_script", "btc_tx",
     "btc_tx_raw", "btc_txid", "bytes", "bytes_to_int", "captoken_allows", "captoken_attenuate",
-    "captoken_mint", "captoken_verify", "capture", "cbrt", "ceil", "clamp", "complex", "conj",
+    "canonical_json", "captoken_mint", "captoken_verify", "capture", "cbrt", "ceil", "clamp", "complex", "conj",
     "constant_time_eq", "contains", "cos", "cosh", "csv_encode", "csv_parse", "decimal", "decode", "degrees",
     "det", "dot", "ecdh_keypair", "ecdh_shared_secret", "ecdsa_p256_verify", "ed25519_verify", "eig",
     "eip191_digest", "eip712_digest", "ends_with", "enumerate", "erf", "erfc", "eth_address", "exp", "eye",
@@ -513,7 +513,9 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     "spl_ata", "spl_transfer_checked_data", "spl_transfer_data", "split", "sqrt", "starts_with", "std",
     "strip_ansi", "sum", "svd", "tan", "tanh", "text", "to_list", "toml_encode", "toml_parse", "totp",
     "totp_verify", "trace", "transpose", "trim", "trunc", "tx_eip1559", "tx_eip1559_raw", "type_of", "unique",
-    "upper", "values", "var", "verify_hmac", "xml_parse", "zeros",
+    "upper", "values", "var", "verify_hmac", "webauthn_register", "webauthn_verify", "xml_parse", "zeros",
+    "did_key_decode", "did_key_document", "did_key_encode", "document_sign", "document_verify",
+    "receipt", "receipt_verify",
 ];
 
 /// Todos los builtins registrados en el wiring NATIVO (un intérprete de `run`), ordenados.
@@ -627,6 +629,13 @@ pub(crate) fn wire_common_with_state(
     // hmac_sha256). Registrados acá → existen en el intérprete principal Y en
     // los de serve/parallel/cron.
     synsema_stdlib::webauth::register_webauth_builtins(interp, caps.clone());
+    // T2 (identidad): WebAuthn / passkeys — verificación pura del registro y la assertion.
+    synsema_stdlib::webauthn::register_webauthn_builtins(interp);
+    // T3/T4 (identidad): JCS (RFC 8785), did:key y pruebas W3C Data Integrity.
+    synsema_stdlib::canonical::register_canonical_builtins(interp);
+    synsema_stdlib::didkey::register_didkey_builtins(interp);
+    synsema_stdlib::integrity::register_integrity_builtins(interp, caps.clone());
+    synsema_stdlib::receipt::register_receipt_builtins(interp, caps.clone());
     // Identidad de agentes : firmas de request con perfil RFC 9421 pineado
     // (`http_sign` gateado por `sign(NAME)` + audit — la misma puerta que firmar
     // on-chain; `http_signature_verify` puro) y tokens de capacidad atenuables
@@ -762,7 +771,7 @@ pub(crate) fn wire_common_with_state(
         caps_llm
             .borrow_mut()
             .require(&Capability::new(CapabilityType::Llm, None), "llm operation")
-            .map_err(|v| v.message)
+            .map_err(|v| v.into_error())
     }));
     // Gate de `judge`: cada bloque exige la capability `judge`, propia y no concedida por
     // `llm`. Mismo CapabilitySet → mismo audit_log. Sin provider cableado el bloque igual
@@ -772,8 +781,11 @@ pub(crate) fn wire_common_with_state(
         caps_judge
             .borrow_mut()
             .require(&Capability::new(CapabilityType::Judge, None), "judge block")
-            .map_err(|v| v.message)
+            .map_err(|v| v.into_error())
     }));
+    // `sandbox under <caps>` (T1): el cuerpo corre bajo un techo delegado apilado sobre el
+    // mismo CapabilitySet. Mismo helper que el host wasm (paridad).
+    synsema_stdlib::captoken::install_ceiling_hook(interp, caps.clone());
     // Aislamiento de `sandbox`: al entrar guarda y VACÍA el CapabilitySet (deniega todo);
     // al salir, restaura. Stack para sandboxes anidados. Cubre TODOS los builtins gateados
     // de una sola vez (leen el mismo CapabilitySet vía el `caps` Rc compartido).
@@ -856,7 +868,7 @@ pub(crate) fn wire_common_with_state(
             caps_tpl
                 .borrow_mut()
                 .require(&Capability::new(CapabilityType::FileRead, Some(path)), "render()")
-                .map_err(|v| v.message)
+                .map_err(|v| v.into_error())
         }));
     }
     // run_program(source, opts): Synsema ejecutando Synsema en un proceso hijo bajo
@@ -1013,6 +1025,8 @@ fn run_inner(
     live_output: bool,
     ceiling: Option<Vec<Capability>>,
 ) -> RunResult {
+    // T4: la medida del programa que corre, para el recibo (`receipt()`).
+    synsema_stdlib::attest::note_program_sha(source, filename);
     match parse_source(source, filename) {
         Err(CompileError::Lex(e)) => RunResult {
             success: false,
@@ -1097,8 +1111,11 @@ fn run_inner(
             // del host se propaga a cada agente spawneado (nunca lo exceden), y el ctx de
             // memoria declarada también (namespaces por `source`, decisión #4).
             if let Some(sw) = swarm {
-                wire_swarm_hooks(&mut interp, sw, "main", ceiling_arc.clone(), mem_ctx.clone(), None);
+                wire_swarm_hooks(&mut interp, sw, "main", ceiling_arc.clone(), mem_ctx.clone(), None, &caps);
             }
+            // T1: `run` corre en nombre del OPERADOR (`SYNSEMA_IDENTITY` si está puesto). Lo
+            // heredan los agentes que el main spawnee; sin él, el sujeto queda anónimo.
+            let _operator_scope = crate::subject::Subject::operator().apply(&mut interp, &caps);
 
             // La persistencia es on-write (el ctx guarda tras cada mutación, como serve):
             // no hay save final que pueda perderse si el programa crashea a mitad.
@@ -1280,7 +1297,7 @@ fn run_tests_inner(source: &str, filename: &str, ceiling: Option<Vec<Capability>
     // programa con agentes se prueba con `synsema test`, sin scripts externos.
     let swarm = Arc::new(Swarm::new());
     let ceiling_arc: Option<Arc<Vec<Capability>>> = ceiling.as_ref().map(|c| Arc::new(c.clone()));
-    wire_swarm_hooks(&mut interp, swarm.clone(), "main", ceiling_arc, mem_ctx.clone(), None);
+    wire_swarm_hooks(&mut interp, swarm.clone(), "main", ceiling_arc, mem_ctx.clone(), None, &caps);
     let mut reported: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut after_each = |_name: &str| -> Option<String> {
         swarm.wait_all();
@@ -1310,6 +1327,7 @@ pub fn run_tests(source: &str, filename: &str) -> TestReport {
 
 /// Como `run_tests` pero con un techo de capabilities del host (`--sandbox`/`--cap-set`).
 pub fn run_tests_ceiled(source: &str, filename: &str, ceiling: Option<Vec<Capability>>) -> TestReport {
+    synsema_stdlib::attest::note_program_sha(source, filename);
     let src = source.to_string();
     let fname = filename.to_string();
     std::thread::Builder::new()
@@ -1345,9 +1363,9 @@ pub fn repl() {
             if declared {
                 Ok(())
             } else {
-                Err(
-                    "Capability not granted: memory. Persistent agent state (remember/recall, rules, progress) requires a declared memory. In the REPL, type: require memory(\"my-agent\") to enable a session-only in-memory store (nothing is written to disk)".to_string(),
-                )
+                Err(RuntimeError::new(
+                    "Capability not granted: memory. Persistent agent state (remember/recall, rules, progress) requires a declared memory. In the REPL, type: require memory(\"my-agent\") to enable a session-only in-memory store (nothing is written to disk)",
+                ))
             }
         })
     };
@@ -1451,7 +1469,7 @@ fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>, ceili
     // Swarm real (DE-014): mismos hooks que `run` → los agentes corren aislados y un
     // `raise` de agente no aborta el main ni trunca su diagnóstico.
     if let Some(sw) = swarm {
-        wire_swarm_hooks(&mut interp, sw, "main", ceiling_arc.clone(), mem_ctx.clone(), None);
+        wire_swarm_hooks(&mut interp, sw, "main", ceiling_arc.clone(), mem_ctx.clone(), None, &caps);
     }
     match interp.execute(&program) {
         Ok(_) => DiagRun {
@@ -1760,6 +1778,7 @@ pub(crate) fn wire_swarm_hooks(
     ceiling: Option<Arc<Vec<Capability>>>,
     mem: Option<MemoryCtx>,
     builder: Option<InterpBuilder>,
+    caps: &Rc<RefCell<CapabilitySet>>,
 ) {
     let name = agent_name.to_string();
     // Bus de eventos del proceso: `bus_*`/`select` del hub de I/O publican y suscriben
@@ -1860,7 +1879,8 @@ pub(crate) fn wire_swarm_hooks(
         let ceiling = ceiling.clone();
         let mem = mem.clone();
         let builder = builder.clone();
-        Rc::new(move |agent, body, args, globals| {
+        let caps_spawn = caps.clone();
+        Rc::new(move |agent, body, args, globals, spawn_subject| {
             let send_args: Vec<(String, SendValue)> =
                 args.iter().map(|(k, v)| (k.clone(), to_send(v))).collect();
             // Convertir el snapshot de globales del llamador a GlobalVal (preserva tasks).
@@ -1870,7 +1890,15 @@ pub(crate) fn wire_swarm_hooks(
             // El techo del host se propaga al agente (Arc → Send cruza el hilo): un agente
             // spawneado jamás excede el techo, aunque su cuerpo declare `require exec(...)`.
             // El ctx de memoria declarada también (mismos stores + namespace por `source`).
-            Ok(spawn_agent(sw.clone(), agent.to_string(), body, send_args, global_snap, ceiling.clone(), mem.clone(), builder.clone()))
+            // T1: y el SUJETO entero del llamador — identidad, techo de gasto, techo
+            // delegado del token, presupuesto LLM — la identidad viaja con el techo.
+            let subject = crate::subject::Subject {
+                identity: spawn_subject.identity,
+                spend_limits: spawn_subject.spend_limits,
+                llm_tokens: crate::llm_providers::current_delegated_llm_budget(),
+                delegations: caps_spawn.borrow().delegations(),
+            };
+            Ok(spawn_agent(sw.clone(), agent.to_string(), body, send_args, global_snap, ceiling.clone(), mem.clone(), builder.clone(), subject))
         })
     };
 
@@ -1886,7 +1914,7 @@ fn setup_swarm_interpreter(
     ceiling: Option<Arc<Vec<Capability>>>,
     mem: Option<MemoryCtx>,
     grant_memory: bool,
-) -> Interpreter {
+) -> (Interpreter, Rc<RefCell<CapabilitySet>>) {
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("agent")));
     // Techo del host: antes de wire_common (filtra los auto-grants stdout/time/llm del
@@ -1906,7 +1934,7 @@ fn setup_swarm_interpreter(
         }
     }
     // Propaga el techo (y el ctx de memoria) a los sub-agentes que este agente spawnee.
-    wire_swarm_hooks(&mut interp, swarm, agent_name, ceiling, mem, None);
+    wire_swarm_hooks(&mut interp, swarm, agent_name, ceiling, mem, None, &caps);
     let name = agent_name.to_string();
     interp.log_hook = Some(Arc::new(move |line: &str| {
         // `conform` exige stdout = SOLO el JSON final: bajo ese modo el eco vivo
@@ -1917,7 +1945,7 @@ fn setup_swarm_interpreter(
             println!("[{}] {}", name, line);
         }
     }));
-    interp
+    (interp, caps)
 }
 
 /// `conform` (JSON en stdout) activa esto para desviar el eco vivo de agentes a
@@ -1938,6 +1966,7 @@ fn spawn_agent(
     ceiling: Option<Arc<Vec<Capability>>>,
     mem: Option<MemoryCtx>,
     builder: Option<InterpBuilder>,
+    subject: crate::subject::Subject,
 ) -> String {
     let instance_id = swarm.register_new_agent(&agent_name);
     let sw = swarm.clone();
@@ -1946,17 +1975,20 @@ fn spawn_agent(
         .name(id.clone())
         .stack_size(INTERP_STACK_SIZE)
         .spawn(move || {
-            let mut interp = match &builder {
+            let (mut interp, caps) = match &builder {
                 // Bajo serve: el MISMO wiring que un tick de cron (state_*, DB, approvals,
                 // cron, bus, memoria, techo del host); los hooks se re-cablean con la
                 // identidad del agente (share/observe/signal atribuyen por nombre).
                 Some(b) => {
-                    let (mut interp, _caps) = b();
-                    wire_swarm_hooks(&mut interp, sw.clone(), &id, ceiling.clone(), mem.clone(), Some(b.clone()));
-                    interp
+                    let (mut interp, caps) = b();
+                    wire_swarm_hooks(&mut interp, sw.clone(), &id, ceiling.clone(), mem.clone(), Some(b.clone()), &caps);
+                    (interp, caps)
                 }
                 None => setup_swarm_interpreter(sw.clone(), &id, ceiling, mem, true),
             };
+            // T1: el agente corre EN NOMBRE del sujeto que lo spawneó, bajo su techo delegado
+            // y sus presupuestos. El guard vive hasta el final del hilo.
+            let _subject_scope = subject.apply(&mut interp, &caps);
             // Token de cancelación del agente (`agent_stop` / shutdown).
             if let Some(tok) = sw.cancel_token(&id) {
                 interp.set_cancel_token(tok);
@@ -2042,7 +2074,8 @@ fn run_swarm_inner(
                     }
                 }
             };
-            let mut interp = setup_swarm_interpreter(swarm, "main", ceiling, mem_ctx, false);
+            let (mut interp, caps) = setup_swarm_interpreter(swarm, "main", ceiling, mem_ctx, false);
+            let _operator_scope = crate::subject::Subject::operator().apply(&mut interp, &caps);
             let r = interp.execute(&program);
             note_run_steps(&interp);
             finish(interp, r)

@@ -1,0 +1,80 @@
+-- ERC-8004 (Trustless Agents) desde Synsema: un MÓDULO cliente, no una primitiva del motor.
+--
+-- Qué hace: arma el registration file (el documento que el Identity Registry apunta como
+-- agentURI), lo apunta a lo que un server Synsema ya publica con verdad (su Agent Card en
+-- /.well-known/agent-card.json y su did:key), y produce el CALLDATA de las funciones de los
+-- tres registros (Identity, Reputation, Validation) con `abi_encode` (puro, sin capability).
+--
+-- Qué NO hace: mandar nada a la cadena. Eso es tu clave y tu red: `tx_eip1559` + `eth_send`
+-- bajo `require sign("HOT_KEY")` y `require net(...)`, en tu programa. Este módulo no pide
+-- ningún `require`; quien lo importa decide.
+--
+-- Las firmas de función son las de los contratos de referencia de ERC-8004 v1.0. Antes de
+-- mandar calldata a un despliegue concreto, compará los selectores con la ABI publicada:
+-- `abi_selector("register(string)")` debe coincidir con la del contrato (ver demo.syn).
+
+export let REGISTRATION_TYPE be "https://eips.ethereum.org/EIPS/eip-8004#registration-v1"
+
+-- El registration file. `agent` = {"name", "description", "image"}; `services` = lista de
+-- {"name", "endpoint", "version"?}; `registrations` = lista de {"agentId", "agentRegistry"}
+-- (CAIP-10, p. ej. "eip155:1:0x…"); `trust` = subconjunto de
+-- ["reputation", "crypto-economic", "tee-attestation"].
+export task registration_file(agent, services, registrations, trust)
+    give {
+        "type": REGISTRATION_TYPE,
+        "name": agent["name"],
+        "description": agent["description"],
+        "image": agent["image"],
+        "services": services,
+        "x402Support": false,
+        "active": true,
+        "registrations": registrations,
+        "supportedTrust": trust
+    }
+
+-- Los services que un server Synsema llena con VERDAD: su Agent Card (derivada de las rutas,
+-- firmada con su did:key), su DID y su OpenAPI. Nada declarado a mano.
+export task synsema_services(base_url, did)
+    give [
+        {"name": "A2A", "endpoint": base_url + "/.well-known/agent-card.json", "version": "1.0"},
+        {"name": "DID", "endpoint": did},
+        {"name": "OpenAPI", "endpoint": base_url + "/openapi.json"}
+    ]
+
+-- El agentURI cuando no querés hostear el archivo: el JSON canónico (RFC 8785) como data URI.
+-- Canónico a propósito: el mismo documento da siempre los mismos bytes y el mismo hash.
+export task agent_uri_data(file)
+    give "data:application/json;base64," + decode(bytes(canonical_json(file)), "base64")
+
+-- El hash que ERC-8004 espera de un documento off-chain (feedbackHash, requestHash,
+-- responseHash): keccak256 del JSON canónico.
+export task document_hash(doc)
+    give keccak256(canonical_json(doc))
+
+-- Identity Registry --------------------------------------------------------------------
+
+export task register_calldata(agent_uri)
+    give abi_encode("register(string)", [agent_uri])
+
+export task set_agent_uri_calldata(agent_id, agent_uri)
+    give abi_encode("setAgentURI(uint256,string)", [agent_id, agent_uri])
+
+export task set_metadata_calldata(agent_id, key, value)
+    give abi_encode("setMetadata(uint256,string,bytes)", [agent_id, key, value])
+
+-- Reputation Registry ------------------------------------------------------------------
+
+-- `value` con `decimals` (87.5 → value 875, decimals 1). `endpoint` es el service evaluado
+-- (la Agent Card, por ejemplo); `feedback_uri` + `feedback_hash` apuntan a la evidencia
+-- off-chain — un recibo de Synsema (`receipt`) es exactamente eso.
+export task give_feedback_calldata(agent_id, value, decimals, tag1, tag2, endpoint, feedback_uri, feedback_hash)
+    give abi_encode("giveFeedback(uint256,int128,uint8,string,string,string,string,bytes32)", [agent_id, value, decimals, tag1, tag2, endpoint, feedback_uri, feedback_hash])
+
+-- Validation Registry ------------------------------------------------------------------
+
+export task validation_request_calldata(validator, agent_id, request_uri, request_hash)
+    give abi_encode("validationRequest(address,uint256,string,bytes32)", [validator, agent_id, request_uri, request_hash])
+
+-- `response` va de 0 a 100.
+export task validation_response_calldata(request_hash, response, response_uri, response_hash, tag)
+    give abi_encode("validationResponse(bytes32,uint8,string,bytes32,string)", [request_hash, response, response_uri, response_hash, tag])

@@ -25,4 +25,5 @@ pub mod persistence;
 pub mod recovery;
 pub mod run_program;
 pub mod serve;
+pub mod subject;
 pub mod speculative;

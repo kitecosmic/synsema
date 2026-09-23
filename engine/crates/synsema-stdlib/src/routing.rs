@@ -517,6 +517,9 @@ pub enum GiveOutcome {
     Validation { message: String, field: Option<String> },
     /// Error no capturado → 500.
     Error(String),
+    /// Capability denegada por el TOKEN del caller (techo delegado, T1) → 403 con cuerpo
+    /// fijo `insufficient permissions`; el texto (detalle) va sólo al log del server.
+    Forbidden(String),
 }
 
 pub type Handler = Arc<dyn Fn(&Ctx) -> GiveOutcome + Send + Sync>;
@@ -594,6 +597,13 @@ pub fn header_value(headers: &[(String, String)], name: &str) -> String {
     String::new()
 }
 
+/// Vars de identidad que el runtime reconoce. Lista CANÓNICA (espejo de `LLM_ENV_VARS` /
+/// `CEILING_ENV_VARS`): el test anti-rot del CLI la cruza con el `.env.example` de `init`.
+/// `SYNSEMA_IDENTITY` = el sujeto de `synsema run` (el operador): el ledger de `spend`, el
+/// techo LLM por identidad y el audit imputan a ese nombre; los agentes que el main spawnea
+/// lo heredan (T1: "la identidad viaja con el techo").
+pub const IDENTITY_ENV_VARS: &[&str] = &["SYNSEMA_IDENTITY", "SYNSEMA_IDENTITY_KEY"];
+
 /// La IDENTIDAD del sujeto autenticado, desde el valor que devolvió el `auth with`
 /// (T6). Convención — deliberadamente la forma que ya devuelven las piezas del
 /// lenguaje, para que el caso feliz no requiera adaptadores:
@@ -620,6 +630,46 @@ pub fn identity_of(user: &SynValue) -> Option<String> {
             }
             None
         }
+        _ => None,
+    }
+}
+
+/// El techo DELEGADO al sujeto (T1 del spec de identidad): los `caps` del captoken
+/// verificado que devolvió `auth with`, más su caveat `deterministic`. Es el segundo techo
+/// de la unidad de trabajo, apilado sobre el del host: lo que el token no lista se deniega
+/// aunque el programa lo declare (y bajo `serve` eso es un 403 genérico, no un 500).
+/// Sólo un map con `id` y `caps` (la forma exacta de `captoken_verify`) produce techo: un
+/// JWT (`sub`), una firma (`keyid`) o un texto no delegan capabilities.
+pub fn delegation_of(user: &SynValue) -> Option<synsema_capabilities::model::Delegation> {
+    let SynValue::Map(m) = user else { return None };
+    let m = m.borrow();
+    let id = match m.get("id") {
+        Some(v @ SynValue::Text(_)) => v.to_string(),
+        _ => return None,
+    };
+    let caps_map = match m.get("caps") {
+        Some(SynValue::Map(c)) => c.clone(),
+        _ => return None,
+    };
+    // Nunca abre: lo local al proceso se ignora, lo desconocido cierra (techo vacío).
+    let caps = crate::captoken::delegated_ceiling_from_caps_map(&caps_map.borrow());
+    let deterministic = match m.get("caveats") {
+        Some(SynValue::Map(cav)) => matches!(cav.borrow().get("deterministic"), Some(SynValue::Bool(true))),
+        _ => false,
+    };
+    Some(synsema_capabilities::model::Delegation::token(id, caps, deterministic))
+}
+
+/// El presupuesto LLM DELEGADO al sujeto (caveat `llm_tokens` de un captoken verificado),
+/// si lo trae: se aplica ADEMÁS del techo por identidad del host, gana el más chico.
+pub fn delegated_llm_tokens_of(user: &SynValue) -> Option<u64> {
+    let SynValue::Map(m) = user else { return None };
+    let Some(SynValue::Map(cav)) = m.borrow().get("caveats").cloned() else {
+        return None;
+    };
+    let v = cav.borrow().get("llm_tokens").cloned()?;
+    match v {
+        SynValue::Number(n) => n.to_i64_trunc().filter(|t| *t >= 0).map(|t| t as u64),
         _ => None,
     }
 }

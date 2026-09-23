@@ -271,7 +271,10 @@ pub enum NodeKind {
     },
     SandboxBlock {
         body: Vec<Node>,
-        allowed_capabilities: Vec<String>,
+        /// `sandbox under <caps>`: la expresión del techo delegado del bloque (un map de
+        /// capabilities, o el map que devolvió `captoken_verify`). `None` = el `sandbox`
+        /// clásico, que deniega todo.
+        under: Option<Box<Node>>,
     },
     InvariantDeclaration {
         condition: Box<Node>,

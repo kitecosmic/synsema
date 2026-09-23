@@ -560,3 +560,475 @@ mod tests {
         assert_eq!(openapi_path("/a/:id/b/*rest"), "/a/{id}/b/{rest}");
     }
 }
+
+// =========================================================
+// T3 (identidad): la Agent Card firmada — `/.well-known/agent-card.json`
+// =========================================================
+//
+// La tarjeta del server, DERIVADA de la tabla de rutas viva (como `/openapi.json`) y con la
+// forma EXACTA de la **Agent Card de A2A 1.0** (`message AgentCard` de `a2a.proto`, package
+// `lf.a2a.v1`, en su mapping proto-JSON: nombres lowerCamelCase, los `oneof` como su propio
+// campo): `name`/`description`/`version`/`documentationUrl`, `supportedInterfaces`,
+// `capabilities` (con `extensions` ADENTRO), `securitySchemes` (`httpAuthSecurityScheme` /
+// `apiKeySecurityScheme`), `securityRequirements`, los modos, `skills` y `signatures`. Lo que
+// 1.0 no tiene (`url`, `security`, `stateTransitionHistory`, campos sueltos) no va: un parser
+// proto-JSON estricto rechaza la tarjeta entera por un campo desconocido (auditoría T1–T4,
+// ronda 1).
+//
+// Lo que A2A no modela va en UNA extensión declarada (`capabilities.extensions[0]`, uri
+// `https://synsema.org/ext/identity/v1`): el `did:key` del server, la URL base, `/openapi.json`,
+// `/.well-known/synsema-auth`, `/.well-known/attestation` (bajo `--attested`), la versión del
+// motor y la regla del techo delegado (`capabilityTokens: true`: los `caps` de un captoken son
+// el techo de la request).
+//
+// **Verdad derivada, jamás declarada:** `supportedInterfaces` va VACÍO porque este server no
+// habla el transporte A2A (`message/send` por JSON-RPC/gRPC/HTTP+JSON). Una tarjeta que dijera
+// lo contrario mentiría; lo que sí es cierto — quién es, qué sabe hacer, cómo se autentica —
+// lo lee cualquier cliente A2A y lo apunta un registro ERC-8004 (`services: [{name: "A2A",
+// endpoint: ".../.well-known/agent-card.json"}, {name: "DID", endpoint: "did:key:…"}]`).
+//
+// **La firma es la de A2A (§8.4):** JWS (RFC 7515) en serialización JSON, `signatures:
+// [{protected, signature}]`, con el payload = JCS (RFC 8785) de la tarjeta SIN `signatures`,
+// header protegido `{alg, kid, typ: "JOSE"}` y `kid` = la URL de verificación del `did:key`
+// del server (`did:key:z…#z…`): un verificador resuelve la clave offline, sin JWKS ni red.
+// Con la ed25519 de `SYNSEMA_IDENTITY_KEY` el alg es `EdDSA`; bajo `serve --attested` firma la
+// P-256 atestada (`ES256`), y entonces la identidad de la tarjeta ES la del documento de
+// attestation. Sin clave configurada la tarjeta sale sin `signatures` y sin `did` (lo que no
+// se deriva con verdad se omite). Verificarla desde Synsema: `jwt_verify(protected + "." +
+// b64url(canonical_json(card_sin_signatures)) + "." + signature, {"did": kid}, {…})`.
+
+pub const AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
+/// Alias que los clientes A2A anteriores a 0.3 piden.
+pub const AGENT_CARD_LEGACY_PATH: &str = "/.well-known/agent.json";
+pub const SYNSEMA_EXTENSION_URI: &str = "https://synsema.org/ext/identity/v1";
+
+/// La identidad que firma la tarjeta: la clave del server y su `did:key`.
+pub enum CardSigner {
+    Ed25519 { key: ed25519_dalek::SigningKey, did: String },
+    P256 { key: p256::SecretKey, did: String },
+}
+
+impl CardSigner {
+    pub fn ed25519_from_seed(seed: [u8; 32]) -> CardSigner {
+        let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let did = crate::didkey::encode(crate::didkey::KeyAlg::Ed25519, &key.verifying_key().to_bytes())
+            .expect("una clave ed25519 válida siempre codifica");
+        CardSigner::Ed25519 { key, did }
+    }
+
+    /// Desde el escalar P-256 (32 bytes) de la identidad atestada.
+    pub fn p256_from_scalar(scalar: &[u8]) -> Result<CardSigner, String> {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+        let key = p256::SecretKey::from_slice(scalar).map_err(|_| "not a valid P-256 scalar".to_string())?;
+        let pk = key.public_key().to_encoded_point(true).as_bytes().to_vec();
+        let did = crate::didkey::encode(crate::didkey::KeyAlg::P256, &pk)?;
+        Ok(CardSigner::P256 { key, did })
+    }
+
+    pub fn did(&self) -> &str {
+        match self {
+            CardSigner::Ed25519 { did, .. } | CardSigner::P256 { did, .. } => did,
+        }
+    }
+
+    /// `did:key:z…#z…` — la URL del verificationMethod (y el `kid` del JWS).
+    pub fn kid(&self) -> String {
+        let did = self.did();
+        let mb = did.strip_prefix("did:key:").unwrap_or(did);
+        format!("{}#{}", did, mb)
+    }
+
+    pub fn alg(&self) -> &'static str {
+        match self {
+            CardSigner::Ed25519 { .. } => "EdDSA",
+            CardSigner::P256 { .. } => "ES256",
+        }
+    }
+
+    fn sign(&self, input: &[u8]) -> Vec<u8> {
+        match self {
+            CardSigner::Ed25519 { key, .. } => {
+                use ed25519_dalek::Signer as _;
+                key.sign(input).to_bytes().to_vec()
+            }
+            CardSigner::P256 { key, .. } => crate::webauth::es256_sign(key, input),
+        }
+    }
+}
+
+/// Qué autenticación anuncia el server (las mismas condiciones que `/.well-known/synsema-auth`).
+pub struct CardAuth {
+    pub bearer: bool,
+    pub cookie: bool,
+    pub httpsig: bool,
+}
+
+fn str_list(items: &[&str]) -> Json {
+    Json::Array(items.iter().map(|s| Json::Str((*s).to_string())).collect())
+}
+
+/// `SecurityRequirement` de A2A: `{schemes: {<name>: {list: [...]}}}` (un `map<string,
+/// StringList>` en proto-JSON).
+fn security_requirement(name: &str) -> Json {
+    obj(vec![("schemes", obj(vec![(name, obj(vec![("list", Json::Array(Vec::new()))]))]))])
+}
+
+/// La Agent Card sin firmar, derivada de la tabla de rutas.
+pub fn agent_card(
+    info: &ApiInfo,
+    routes: &[ApiRoute],
+    auth: Option<&CardAuth>,
+    docs_enabled: bool,
+    attested: bool,
+    signer: Option<&CardSigner>,
+) -> Json {
+    let base = info.base_url.clone().unwrap_or_default();
+    let join = |p: &str| {
+        if base.is_empty() {
+            p.to_string()
+        } else {
+            format!("{}{}", base.trim_end_matches('/'), p)
+        }
+    };
+    let mut card: Vec<(&str, Json)> = Vec::new();
+    card.push(("name", Json::Str(info.title.clone())));
+    card.push((
+        "description",
+        Json::Str(info.description.clone().unwrap_or_else(|| "Synsema service".to_string())),
+    ));
+    // Verdad derivada: ningún transporte A2A. Ver el doc del bloque.
+    card.push(("supportedInterfaces", Json::Array(Vec::new())));
+    card.push(("version", Json::Str(info.version.clone())));
+    if docs_enabled && !base.is_empty() {
+        card.push(("documentationUrl", Json::Str(join("/docs"))));
+    }
+    // Lo que A2A no modela, como extensión declarada dentro de `capabilities` (donde el
+    // proto la pone), no como campos sueltos que un parser estricto rechazaría.
+    let mut params: Vec<(&str, Json)> = Vec::new();
+    if let Some(s) = signer {
+        params.push(("did", Json::Str(s.did().to_string())));
+    }
+    if !base.is_empty() {
+        params.push(("baseUrl", Json::Str(base.clone())));
+    }
+    params.push(("openapi", Json::Str(join("/openapi.json"))));
+    params.push(("auth", Json::Str(join("/.well-known/synsema-auth"))));
+    if attested {
+        params.push(("attestation", Json::Str(join("/.well-known/attestation"))));
+    }
+    params.push(("engine", Json::Str(crate::attest::engine_version().to_string())));
+    params.push(("capabilityTokens", Json::Bool(true)));
+    let extension = obj(vec![
+        ("uri", Json::Str(SYNSEMA_EXTENSION_URI.into())),
+        (
+            "description",
+            Json::Str(
+                "Synsema identity: did:key of this server, base URL, OpenAPI, auth discovery, attestation; a captoken's caps are the request's ceiling"
+                    .into(),
+            ),
+        ),
+        ("required", Json::Bool(false)),
+        ("params", obj(params)),
+    ]);
+    let streaming = routes.iter().any(|r| r.streaming);
+    card.push((
+        "capabilities",
+        obj(vec![
+            ("streaming", Json::Bool(streaming)),
+            ("pushNotifications", Json::Bool(false)),
+            ("extensions", Json::Array(vec![extension])),
+            ("extendedAgentCard", Json::Bool(false)),
+        ]),
+    ));
+    if let Some(a) = auth {
+        let mut schemes: Vec<(&str, Json)> = Vec::new();
+        let mut requirements: Vec<Json> = Vec::new();
+        if a.bearer {
+            schemes.push((
+                "bearer",
+                obj(vec![(
+                    "httpAuthSecurityScheme",
+                    obj(vec![
+                        ("description", Json::Str("Authorization: Bearer <token>".into())),
+                        ("scheme", Json::Str("bearer".into())),
+                        ("bearerFormat", Json::Str("captoken | jwt | opaque".into())),
+                    ]),
+                )]),
+            ));
+            requirements.push(security_requirement("bearer"));
+        }
+        if a.cookie {
+            schemes.push((
+                "cookie",
+                obj(vec![(
+                    "apiKeySecurityScheme",
+                    obj(vec![
+                        ("description", Json::Str("session cookie".into())),
+                        ("location", Json::Str("cookie".into())),
+                        ("name", Json::Str("session".into())),
+                    ]),
+                )]),
+            ));
+            requirements.push(security_requirement("cookie"));
+        }
+        if a.httpsig {
+            schemes.push((
+                "httpsig",
+                obj(vec![(
+                    "httpAuthSecurityScheme",
+                    obj(vec![
+                        (
+                            "description",
+                            Json::Str(
+                                "RFC 9421 HTTP Message Signature, pinned profile: @method, @target-uri, content-digest; ed25519 or hmac-sha256"
+                                    .into(),
+                            ),
+                        ),
+                        ("scheme", Json::Str("signature".into())),
+                    ]),
+                )]),
+            ));
+            requirements.push(security_requirement("httpsig"));
+        }
+        card.push(("securitySchemes", obj(schemes)));
+        card.push(("securityRequirements", Json::Array(requirements)));
+    }
+    card.push(("defaultInputModes", str_list(&["application/json"])));
+    let negotiates = routes.iter().any(|r| matches!(r.meta.response_kind, Some(ResponseKind::Content)));
+    card.push((
+        "defaultOutputModes",
+        if negotiates {
+            str_list(&["application/json", "text/markdown", "text/html"])
+        } else {
+            str_list(&["application/json"])
+        },
+    ));
+    // Skills: una por ruta pública, en el orden de OpenAPI. `tags` es REQUIRED en 1.0.
+    let skills: Vec<Json> = sorted_routes(routes)
+        .into_iter()
+        .map(|r| {
+            let mut tags = vec![r.method.to_ascii_lowercase()];
+            if r.requires_auth {
+                tags.push("auth".to_string());
+            }
+            if r.streaming {
+                tags.push("stream".to_string());
+            }
+            if r.socket {
+                tags.push("socket".to_string());
+            }
+            let output = match r.meta.response_kind {
+                Some(ResponseKind::Html) => str_list(&["text/html"]),
+                Some(ResponseKind::Content) => str_list(&["application/json", "text/markdown", "text/html"]),
+                Some(ResponseKind::Stream) => str_list(&["text/event-stream"]),
+                _ => str_list(&["application/json"]),
+            };
+            obj(vec![
+                ("id", Json::Str(operation_id(&r.method, &r.path))),
+                ("name", Json::Str(format!("{} {}", r.method, r.path))),
+                ("description", Json::Str(format!("{} {}{}", r.method, r.path, caps_suffix(r)))),
+                ("tags", Json::Array(tags.into_iter().map(Json::Str).collect())),
+                ("inputModes", str_list(&["application/json"])),
+                ("outputModes", output),
+            ])
+        })
+        .collect();
+    card.push(("skills", Json::Array(skills)));
+    obj(card)
+}
+
+/// JCS (RFC 8785) de un `Json` de discovery.
+fn canonical_of(j: &Json) -> Result<String, String> {
+    let v: serde_json::Value = serde_json::from_str(&dumps(j)).map_err(|e| e.to_string())?;
+    crate::canonical::canonical_json(&crate::json::json_to_syn(&v)).map_err(|e| match e {
+        synsema_core::interpreter::Control::Error(e) => e.to_string(),
+        _ => "canonical_json: control flow".to_string(),
+    })
+}
+
+/// Firma la tarjeta como manda A2A §8.4: JWS (serialización JSON) sobre el JCS de la tarjeta
+/// sin `signatures`, header protegido `{alg, kid, typ: "JOSE"}`.
+pub fn sign_card(card: &Json, signer: &CardSigner) -> Result<Json, String> {
+    use synsema_core::bytesutil::b64url_encode;
+    let Json::Object(fields) = card else {
+        return Err("the card must be an object".to_string());
+    };
+    let unsigned: Vec<(String, Json)> = fields.iter().filter(|(k, _)| k != "signatures").cloned().collect();
+    let payload = canonical_of(&Json::Object(unsigned.clone()))?;
+    // Header protegido ya canónico (claves en orden: alg, kid, typ).
+    let protected = format!(
+        "{{\"alg\":\"{}\",\"kid\":{},\"typ\":\"JOSE\"}}",
+        signer.alg(),
+        serde_json::Value::String(signer.kid())
+    );
+    let protected_b64 = b64url_encode(protected.as_bytes());
+    let input = format!("{}.{}", protected_b64, b64url_encode(payload.as_bytes()));
+    let sig = signer.sign(input.as_bytes());
+    let mut out = unsigned;
+    out.push((
+        "signatures".to_string(),
+        Json::Array(vec![obj(vec![
+            ("protected", Json::Str(protected_b64)),
+            ("signature", Json::Str(b64url_encode(&sig))),
+        ])]),
+    ));
+    Ok(Json::Object(out))
+}
+
+#[cfg(test)]
+mod agent_card_tests {
+    use super::*;
+    use synsema_core::route_meta::RouteMeta;
+
+    /// Los campos de `message AgentCard` de a2a.proto (1.0, package lf.a2a.v1) en proto-JSON.
+    /// Cualquier otro campo en el nivel superior rompe un parser estricto.
+    const AGENT_CARD_FIELDS: [&str; 14] = [
+        "name",
+        "description",
+        "supportedInterfaces",
+        "provider",
+        "version",
+        "documentationUrl",
+        "capabilities",
+        "securitySchemes",
+        "securityRequirements",
+        "defaultInputModes",
+        "defaultOutputModes",
+        "skills",
+        "signatures",
+        "iconUrl",
+    ];
+    const CAPABILITIES_FIELDS: [&str; 4] = ["streaming", "pushNotifications", "extensions", "extendedAgentCard"];
+    const SKILL_FIELDS: [&str; 8] = ["id", "name", "description", "tags", "examples", "inputModes", "outputModes", "securityRequirements"];
+
+    fn route(method: &str, path: &str, auth: bool) -> ApiRoute {
+        ApiRoute {
+            method: method.to_string(),
+            path: path.to_string(),
+            param_names: Vec::new(),
+            requires_auth: auth,
+            streaming: false,
+            socket: false,
+            private: false,
+            rate_limit: None,
+            rate_unlimited: false,
+            proxy: false,
+            meta: RouteMeta::default(),
+        }
+    }
+
+    fn info() -> ApiInfo {
+        ApiInfo {
+            title: "Demo".into(),
+            description: Some("a demo".into()),
+            version: "1.0.0".into(),
+            base_url: Some("https://demo.test".into()),
+            has_auth: true,
+            describe_api: Vec::new(),
+        }
+    }
+
+    fn only_known(v: &serde_json::Value, known: &[&str], what: &str) {
+        for k in v.as_object().unwrap().keys() {
+            assert!(known.contains(&k.as_str()), "{} carries {:?}, which a2a.proto 1.0 does not define", what, k);
+        }
+    }
+
+    #[test]
+    fn card_is_a2a_1_0_shaped_and_derived() {
+        let routes = vec![route("GET", "/health", false), route("POST", "/ask", true)];
+        let auth = CardAuth { bearer: true, cookie: true, httpsig: true };
+        let signer = CardSigner::ed25519_from_seed([7u8; 32]);
+        let card = agent_card(&info(), &routes, Some(&auth), true, false, Some(&signer));
+        let signed = sign_card(&card, &signer).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&dumps(&signed)).unwrap();
+        only_known(&v, &AGENT_CARD_FIELDS, "the card");
+        only_known(&v["capabilities"], &CAPABILITIES_FIELDS, "capabilities");
+        for s in v["skills"].as_array().unwrap() {
+            only_known(s, &SKILL_FIELDS, "a skill");
+        }
+        assert_eq!(v["name"], "Demo");
+        assert_eq!(v["documentationUrl"], "https://demo.test/docs");
+        assert!(v.get("url").is_none() && v.get("security").is_none(), "campos de 0.3 que 1.0 no tiene");
+        assert_eq!(v["supportedInterfaces"].as_array().unwrap().len(), 0, "no A2A transport → no interfaces");
+        let skills = v["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0]["id"], "post_ask");
+        assert!(skills[0]["tags"].as_array().unwrap().iter().any(|t| t == "auth"));
+        assert_eq!(skills[1]["id"], "get_health");
+        // securitySchemes: el oneof como campo propio; securityRequirements: {schemes: {name: {list}}}
+        assert_eq!(v["securitySchemes"]["bearer"]["httpAuthSecurityScheme"]["scheme"], "bearer");
+        assert_eq!(v["securitySchemes"]["cookie"]["apiKeySecurityScheme"]["location"], "cookie");
+        assert_eq!(v["securitySchemes"]["httpsig"]["httpAuthSecurityScheme"]["scheme"], "signature");
+        let reqs = v["securityRequirements"].as_array().unwrap();
+        assert_eq!(reqs.len(), 3);
+        assert!(reqs[0]["schemes"]["bearer"]["list"].as_array().unwrap().is_empty());
+        // La extensión vive en capabilities.extensions, con el did y las URLs.
+        let ext = &v["capabilities"]["extensions"][0];
+        assert_eq!(ext["uri"], SYNSEMA_EXTENSION_URI);
+        assert_eq!(ext["params"]["did"], signer.did());
+        assert_eq!(ext["params"]["baseUrl"], "https://demo.test");
+        assert_eq!(ext["params"]["openapi"], "https://demo.test/openapi.json");
+        assert!(ext["params"].get("attestation").is_none());
+        assert_eq!(v["signatures"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn without_signer_or_auth_nothing_is_invented() {
+        let routes = vec![route("GET", "/", false)];
+        let card = agent_card(&info(), &routes, None, false, false, None);
+        let v: serde_json::Value = serde_json::from_str(&dumps(&card)).unwrap();
+        only_known(&v, &AGENT_CARD_FIELDS, "the card");
+        assert!(v.get("securitySchemes").is_none() && v.get("securityRequirements").is_none());
+        assert!(v.get("signatures").is_none());
+        assert!(v["capabilities"]["extensions"][0]["params"].get("did").is_none(), "sin firmante no se inventa un did");
+        assert!(v.get("documentationUrl").is_none(), "docs off");
+    }
+
+    #[test]
+    fn signed_card_verifies_as_jws_over_jcs() {
+        use ed25519_dalek::Verifier as _;
+        let signer = CardSigner::ed25519_from_seed([7u8; 32]);
+        assert!(signer.did().starts_with("did:key:z6Mk"));
+        assert_eq!(signer.kid(), format!("{}#{}", signer.did(), &signer.did()[8..]));
+        let routes = vec![route("GET", "/", false)];
+        let card = agent_card(&info(), &routes, None, false, false, Some(&signer));
+        let signed = sign_card(&card, &signer).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&dumps(&signed)).unwrap();
+        assert_eq!(v["capabilities"]["extensions"][0]["params"]["did"], signer.did());
+        let sig = &v["signatures"][0];
+        let protected: serde_json::Value = serde_json::from_slice(
+            &synsema_core::bytesutil::b64url_decode(sig["protected"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(protected["alg"], "EdDSA");
+        assert_eq!(protected["kid"], signer.kid());
+        assert_eq!(protected["typ"], "JOSE");
+        // Reconstruir el input firmado: JCS de la tarjeta sin `signatures`.
+        let mut unsigned = v.clone();
+        unsigned.as_object_mut().unwrap().remove("signatures");
+        let payload = crate::canonical::canonical_json(&crate::json::json_to_syn(&unsigned)).map_err(|_| ()).unwrap();
+        let input = format!(
+            "{}.{}",
+            sig["protected"].as_str().unwrap(),
+            synsema_core::bytesutil::b64url_encode(payload.as_bytes())
+        );
+        let raw = synsema_core::bytesutil::b64url_decode(sig["signature"].as_str().unwrap()).unwrap();
+        let CardSigner::Ed25519 { key, .. } = &signer else { unreachable!() };
+        let s = ed25519_dalek::Signature::from_slice(&raw).unwrap();
+        key.verifying_key().verify(input.as_bytes(), &s).unwrap();
+        // Y la misma clave se resuelve desde el did (offline).
+        let (alg, pk, _mb) = crate::didkey::decode(signer.did()).unwrap();
+        assert_eq!(alg, crate::didkey::KeyAlg::Ed25519);
+        assert_eq!(pk, key.verifying_key().to_bytes());
+    }
+
+    #[test]
+    fn p256_signer_from_attested_scalar() {
+        let scalar = [9u8; 32];
+        let signer = CardSigner::p256_from_scalar(&scalar).unwrap();
+        assert!(signer.did().starts_with("did:key:zDn"));
+        assert_eq!(signer.alg(), "ES256");
+        assert!(CardSigner::p256_from_scalar(&[0u8; 32]).is_err(), "el escalar 0 no es una clave");
+    }
+}

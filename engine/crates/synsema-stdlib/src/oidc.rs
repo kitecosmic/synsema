@@ -143,6 +143,8 @@ fn fetch_jwks(
 pub(crate) enum Jwk {
     Rsa { n: Vec<u8>, e: Vec<u8> },
     P256 { x: Vec<u8>, y: Vec<u8> },
+    /// T3: OKP / Ed25519 (RFC 8037) — `alg: "EdDSA"`.
+    Ed25519 { x: Vec<u8> },
 }
 
 pub(crate) struct KeyEntry {
@@ -202,6 +204,17 @@ pub(crate) fn parse_jwks(body: &str) -> Vec<KeyEntry> {
                 }
                 Jwk::P256 { x, y }
             }
+            Some("OKP") => {
+                if k.get("crv").and_then(|v| v.as_str()) != Some("Ed25519") {
+                    continue;
+                }
+                let Some(x) = k.get("x").and_then(|v| v.as_str()) else { continue };
+                let Ok(x) = b64url_decode(x) else { continue };
+                if x.len() != 32 {
+                    continue;
+                }
+                Jwk::Ed25519 { x }
+            }
             _ => continue,
         };
         out.push(KeyEntry { kid, alg, key });
@@ -251,6 +264,13 @@ pub(crate) fn verify_with(key: &Jwk, alg: &str, signing_input: &[u8], sig: &[u8]
             // para VERIFICAR un token eso no habilita nada (el par (r,s) sigue
             // atado a la clave y al mensaje).
             vk.verify(signing_input, &signature).is_ok()
+        }
+        (Jwk::Ed25519 { x }, "EdDSA") => {
+            let Ok(pk): Result<[u8; 32], _> = x.as_slice().try_into() else { return false };
+            let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&pk) else { return false };
+            let Ok(sa): Result<[u8; 64], _> = sig.try_into() else { return false };
+            // strict, como `ed25519_verify` (rechaza puntos de orden chico).
+            vk.verify_strict(signing_input, &ed25519_dalek::Signature::from_bytes(&sa)).is_ok()
         }
         // Cualquier otra combinación (incluido `alg: "none"`, HS*, o una clave RSA
         // con alg ES256) → falso. El algoritmo se elige del PAR (clave, alg

@@ -29,7 +29,7 @@ fn redis_db_open_deny_without_require() {
     assert!(!r.success);
     assert_eq!(
         r.errors,
-        vec!["Runtime error: Capability not granted: db(\"redis://localhost/0\")".to_string()]
+        vec!["Runtime error: Capability not granted: db(\"redis://localhost/0\") — this is a permission, not a bug: add `require db(\"redis://localhost/0\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
     );
 }
 
@@ -40,7 +40,7 @@ fn redis_db_open_scope_without_db_index() {
     assert!(!r.success);
     assert_eq!(
         r.errors,
-        vec!["Runtime error: Capability not granted: db(\"redis://localhost\")".to_string()]
+        vec!["Runtime error: Capability not granted: db(\"redis://localhost\") — this is a permission, not a bug: add `require db(\"redis://localhost\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
     );
 }
 
@@ -54,7 +54,7 @@ fn redis_scope_mismatch_deny() {
     assert!(!r.success);
     assert_eq!(
         r.errors,
-        vec!["Runtime error: Capability not granted: db(\"redis://localhost/1\")".to_string()]
+        vec!["Runtime error: Capability not granted: db(\"redis://localhost/1\") — this is a permission, not a bug: add `require db(\"redis://localhost/1\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
     );
 }
 

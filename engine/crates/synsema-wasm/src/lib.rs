@@ -435,7 +435,7 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
             caps_tpl
                 .borrow_mut()
                 .require(&Capability::new(CapabilityType::FileRead, Some(path)), "render()")
-                .map_err(|v| v.message)
+                .map_err(|v| v.into_error())
         }));
     }
     if ctx.no_fs {
@@ -456,6 +456,11 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     synsema_stdlib::toml_fmt::register_toml_builtins(interp);
     synsema_stdlib::crypto::register_crypto_builtins(interp, caps.clone());
     synsema_stdlib::webauth::register_webauth_builtins(interp, caps.clone());
+    synsema_stdlib::webauthn::register_webauthn_builtins(interp);
+    synsema_stdlib::canonical::register_canonical_builtins(interp);
+    synsema_stdlib::didkey::register_didkey_builtins(interp);
+    synsema_stdlib::integrity::register_integrity_builtins(interp, caps.clone());
+    synsema_stdlib::receipt::register_receipt_builtins(interp, caps.clone());
     synsema_stdlib::httpsig::register_httpsig_builtins(interp, caps.clone());
     synsema_stdlib::captoken::register_captoken_builtins(interp, caps.clone());
     synsema_stdlib::oidc::register_oidc_builtins(interp, caps.clone());
@@ -489,7 +494,7 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
                 caps_sleep
                     .borrow_mut()
                     .require(&Capability::new(CapabilityType::Time, None), "sleep()")
-                    .map_err(|v| Control::Error(RuntimeError::new(v.message)))?;
+                    .map_err(|v| Control::Error(v.into_error()))?;
                 let secs = match args.first() {
                     Some(SynValue::Number(n)) => n.to_f64(),
                     _ => 0.0,
@@ -562,10 +567,10 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     let suggest = suggested_memory_name(ctx.filename);
     let gate: MemoryGate = match &declared {
         None => Rc::new(move || {
-            Err(format!(
+            Err(RuntimeError::new(format!(
                 "Capability not granted: memory. Persistent agent state (remember/recall, rules, progress) requires a declared memory — the declared name identifies its store. Add: require memory(\"{}\") at the top of the program",
                 suggest
-            ))
+            )))
         }),
         Some(name) => {
             let caps_m = caps.clone();
@@ -575,12 +580,12 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
                 caps_m
                     .borrow_mut()
                     .require(&Capability::new(CapabilityType::Memory, Some(name.clone())), "memory builtin")
-                    .map_err(|v| v.message)?;
+                    .map_err(|v| v.into_error())?;
                 if !has_kv {
-                    return Err(format!(
+                    return Err(RuntimeError::new(format!(
                         "memory \"{}\" is declared but this host provides no durable storage (wasm profile) — the embedder can offer it through the `kv` host hook, or run the program with the native `synsema` binary",
                         name
-                    ));
+                    )));
                 }
                 Ok(())
             })
@@ -685,8 +690,10 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
         caps_llm
             .borrow_mut()
             .require(&Capability::new(CapabilityType::Llm, None), "llm operation")
-            .map_err(|v| v.message)
+            .map_err(|v| v.into_error())
     }));
+    // `sandbox under <caps>` (T1): techo delegado por bloque — mismo helper que el runtime.
+    synsema_stdlib::captoken::install_ceiling_hook(interp, caps.clone());
 
     // Aislamiento de `sandbox`: guarda y VACÍA el CapabilitySet al entrar; restaura
     // al salir (stack para anidados) — idéntico al runtime.

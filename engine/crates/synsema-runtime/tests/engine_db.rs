@@ -54,7 +54,7 @@ fn db_deny_by_default_in_run() {
     assert!(!r.success, "db debe ser deny-by-default incluso en run");
     assert_eq!(
         r.errors,
-        vec!["Runtime error: Capability not granted: db(\":memory:\")".to_string()]
+        vec!["Runtime error: Capability not granted: db(\":memory:\") — this is a permission, not a bug: add `require db(\":memory:\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
     );
 }
 
@@ -79,7 +79,7 @@ fn db_scope_mismatch_violates() {
     assert!(!r.success);
     assert_eq!(
         r.errors,
-        vec!["Runtime error: Capability not granted: db(\"b.db\")".to_string()]
+        vec!["Runtime error: Capability not granted: db(\"b.db\") — this is a permission, not a bug: add `require db(\"b.db\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
     );
 }
 

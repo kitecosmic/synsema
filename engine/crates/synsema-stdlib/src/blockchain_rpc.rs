@@ -39,7 +39,7 @@ use sha3::{Digest, Keccak256};
 use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
 use synsema_capabilities::secure::url_hostname;
 use synsema_core::bytesutil::{b64_decode, b64_encode, base58_decode, base58_encode, hex_encode};
-use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
+use synsema_core::interpreter::{Control, Interpreter};
 use synsema_core::number::Number;
 use synsema_core::types::{
     syn_bool, syn_bytes, syn_int, syn_list, syn_map, syn_number, syn_text, SynValue,
@@ -85,7 +85,7 @@ pub(crate) fn require_net(caps: &Rc<RefCell<CapabilitySet>>, url: &str, source: 
     };
     caps.borrow_mut()
         .require(&Capability::new(CapabilityType::Net, Some(host)), source)
-        .map_err(|v| Control::Error(RuntimeError::new(v.message)))
+        .map_err(|v| Control::Error(v.into_error()))
 }
 
 /// Host para mensajes de error — JAMÁS el URL completo (la API key del RPC suele

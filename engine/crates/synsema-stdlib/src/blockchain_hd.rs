@@ -55,6 +55,10 @@ type Aes128Ctr = ctr::Ctr128BE<Aes128>;
 // =========================================================
 
 fn wallet_denied(name: &str, cause: DenyCause) -> Control {
+    if let DenyCause::Delegated(_) = &cause {
+        let cap = Capability::new(CapabilityType::Wallet, Some(name.to_string()));
+        return Control::Error(CapabilitySet::violation(&cap, cause, "wallet-builtin").into_error());
+    }
     if cause == DenyCause::AboveCeiling {
         return err(format!("wallet not permitted: wallet(\"{name}\") is declared but above the host ceiling (--sandbox/--cap-set). The program cannot fix this; the host must widen the ceiling"));
     }

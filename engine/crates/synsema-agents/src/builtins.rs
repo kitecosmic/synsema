@@ -59,7 +59,7 @@ fn opt_usize(v: Option<&SynValue>) -> Option<usize> {
 /// el builtin falla con ese mensaje (deny-by-default: sin declaración, sin sandbox
 /// escape, sin exceder el techo del host). Este crate no depende de capabilities:
 /// la lógica viaja en el closure, igual que `llm_cap_hook`.
-pub type MemoryGate = Rc<dyn Fn() -> Result<(), String>>;
+pub type MemoryGate = Rc<dyn Fn() -> Result<(), RuntimeError>>;
 
 /// `source` de una escritura / namespace por defecto de una lectura (DB-M1 #4):
 /// dentro de `agent X` es `"X"`; en el top-level es `"main"`.
@@ -95,7 +95,7 @@ pub fn register_agent_builtins(
         let p = progress.clone();
         let g = gate.clone();
         interp.register_builtin("create_progress", -1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let name = raw_str(nth(args, 0)?);
             let steps = str_list(args.get(1));
             p.borrow_mut().create(&name, &steps);
@@ -106,7 +106,7 @@ pub fn register_agent_builtins(
         let p = progress.clone();
         let g = gate.clone();
         interp.register_builtin("start_step", 2, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             p.borrow_mut().start_step(&raw_str(nth(args, 0)?), &raw_str(nth(args, 1)?)).map_err(err)?;
             Ok(syn_bool(true))
         }));
@@ -115,7 +115,7 @@ pub fn register_agent_builtins(
         let p = progress.clone();
         let g = gate.clone();
         interp.register_builtin("complete_step", -1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let result = args.get(2).map(raw_str);
             p.borrow_mut().complete_step(&raw_str(nth(args, 0)?), &raw_str(nth(args, 1)?), result).map_err(err)?;
             Ok(syn_bool(true))
@@ -125,7 +125,7 @@ pub fn register_agent_builtins(
         let p = progress.clone();
         let g = gate.clone();
         interp.register_builtin("fail_step", -1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let error = args.get(2).map(raw_str);
             p.borrow_mut().fail_step(&raw_str(nth(args, 0)?), &raw_str(nth(args, 1)?), error).map_err(err)?;
             Ok(syn_bool(true))
@@ -135,7 +135,7 @@ pub fn register_agent_builtins(
         let p = progress.clone();
         let g = gate.clone();
         interp.register_builtin("resume_point", 1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             match p.borrow().get_resume_point(&raw_str(nth(args, 0)?)) {
                 Some(name) => Ok(syn_text(name)),
                 None => Ok(SynValue::Nothing),
@@ -146,7 +146,7 @@ pub fn register_agent_builtins(
         let p = progress.clone();
         let g = gate.clone();
         interp.register_builtin("progress_display", 1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let name = raw_str(nth(args, 0)?);
             let pm = p.borrow();
             match pm.tasks.get(&name) {
@@ -159,7 +159,7 @@ pub fn register_agent_builtins(
         let p = progress.clone();
         let g = gate.clone();
         interp.register_builtin("progress_percent", 1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let name = raw_str(nth(args, 0)?);
             let pm = p.borrow();
             Ok(syn_float(pm.tasks.get(&name).map(|tp| tp.progress_percent()).unwrap_or(0.0)))
@@ -171,7 +171,7 @@ pub fn register_agent_builtins(
         let m = memory.clone();
         let g = gate.clone();
         interp.register_builtin("remember", -1, Rc::new(move |i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let category = raw_str(nth(args, 0)?);
             let content = raw_str(nth(args, 1)?);
             let tags = str_list(args.get(2));
@@ -185,7 +185,7 @@ pub fn register_agent_builtins(
         let m = memory.clone();
         let g = gate.clone();
         interp.register_builtin_named("recall", RECALL_PARAMS.to_vec(), Rc::new(move |i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             // `nothing` (o ausente) en category/search = sin filtro. Chequear el valor
             // directo: raw_str(nothing) es "None", no "nothing" → un filtro por string
             // no lo capturaba (bug preexistente en category, ahora corregido).
@@ -221,7 +221,7 @@ pub fn register_agent_builtins(
         let m = memory.clone();
         let g = gate.clone();
         interp.register_builtin("forget_memory", 1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             m.borrow_mut().forget(&raw_str(nth(args, 0)?));
             Ok(syn_bool(true))
         }));
@@ -232,7 +232,7 @@ pub fn register_agent_builtins(
         let m = memory.clone();
         let g = gate.clone();
         interp.register_builtin("add_rule", -1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let name = raw_str(nth(args, 0)?);
             let level = raw_str(nth(args, 1)?);
             let description = raw_str(nth(args, 2)?);
@@ -245,7 +245,7 @@ pub fn register_agent_builtins(
         let m = memory.clone();
         let g = gate.clone();
         interp.register_builtin("check_rules", -1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let category = args.first().map(raw_str);
             let mut context: HashMap<String, f64> = HashMap::new();
             if let Some(SynValue::Map(cm)) = args.get(1) {
@@ -270,7 +270,7 @@ pub fn register_agent_builtins(
         let m = memory.clone();
         let g = gate.clone();
         interp.register_builtin("get_rules", -1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let category = args.first().map(raw_str);
             let rules = m.borrow().get_rules(category.as_deref(), None);
             let result: Vec<SynValue> = rules.iter().map(|r| {
@@ -288,7 +288,7 @@ pub fn register_agent_builtins(
         let m = memory.clone();
         let g = gate.clone();
         interp.register_builtin("memory_summary", 0, Rc::new(move |_i, _args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             Ok(syn_text(m.borrow().format_summary()))
         }));
     }
@@ -319,7 +319,7 @@ pub fn register_serve_memory_builtins(
         let ow = on_write.clone();
         let g = gate.clone();
         interp.register_builtin("remember", -1, Rc::new(move |i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let category = raw_str(nth(args, 0)?);
             let content  = raw_str(nth(args, 1)?);
             let tags     = str_list(args.get(2));
@@ -336,7 +336,7 @@ pub fn register_serve_memory_builtins(
         let s = shared.clone();
         let g = gate.clone();
         interp.register_builtin_named("recall", RECALL_PARAMS.to_vec(), Rc::new(move |i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let category = args.first().map(raw_str).filter(|s| s != "nothing" && s != "None");
             let tags = if matches!(args.get(1), Some(SynValue::List(_))) {
                 Some(str_list(args.get(1)))
@@ -370,7 +370,7 @@ pub fn register_serve_memory_builtins(
         let ow = on_write.clone();
         let g = gate.clone();
         interp.register_builtin("forget_memory", 1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let mut mem = s.lock().unwrap();
             mem.forget(&raw_str(nth(args, 0)?));
             ow(&mem);
@@ -381,7 +381,7 @@ pub fn register_serve_memory_builtins(
         let s = shared.clone();
         let g = gate.clone();
         interp.register_builtin("memory_summary", 0, Rc::new(move |_i, _args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             Ok(syn_text(s.lock().unwrap().format_summary()))
         }));
     }
@@ -404,7 +404,7 @@ pub fn register_shared_rules_builtins(
         let ow = on_write.clone();
         let g = gate.clone();
         interp.register_builtin("add_rule", -1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let name = raw_str(nth(args, 0)?);
             let level = raw_str(nth(args, 1)?);
             let description = raw_str(nth(args, 2)?);
@@ -419,7 +419,7 @@ pub fn register_shared_rules_builtins(
         let s = shared.clone();
         let g = gate.clone();
         interp.register_builtin("check_rules", -1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let category = args.first().map(raw_str);
             let mut context: HashMap<String, f64> = HashMap::new();
             if let Some(SynValue::Map(cm)) = args.get(1) {
@@ -445,7 +445,7 @@ pub fn register_shared_rules_builtins(
         let s = shared.clone();
         let g = gate.clone();
         interp.register_builtin("get_rules", -1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let category = args.first().map(raw_str);
             let mem = s.lock().unwrap();
             let rules = mem.get_rules(category.as_deref(), None);
@@ -486,7 +486,7 @@ pub fn register_serve_progress_builtins(
         let ow = on_write.clone();
         let g = gate.clone();
         interp.register_builtin("create_progress", -1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let name = raw_str(nth(args, 0)?);
             let steps = str_list(args.get(1));
             let mut pm = s.lock().unwrap();
@@ -500,7 +500,7 @@ pub fn register_serve_progress_builtins(
         let ow = on_write.clone();
         let g = gate.clone();
         interp.register_builtin("start_step", 2, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let mut pm = s.lock().unwrap();
             pm.start_step(&raw_str(nth(args, 0)?), &raw_str(nth(args, 1)?)).map_err(err)?;
             ow(&pm);
@@ -512,7 +512,7 @@ pub fn register_serve_progress_builtins(
         let ow = on_write.clone();
         let g = gate.clone();
         interp.register_builtin("complete_step", -1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let result = args.get(2).map(raw_str);
             let mut pm = s.lock().unwrap();
             pm.complete_step(&raw_str(nth(args, 0)?), &raw_str(nth(args, 1)?), result).map_err(err)?;
@@ -525,7 +525,7 @@ pub fn register_serve_progress_builtins(
         let ow = on_write.clone();
         let g = gate.clone();
         interp.register_builtin("fail_step", -1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let error = args.get(2).map(raw_str);
             let mut pm = s.lock().unwrap();
             pm.fail_step(&raw_str(nth(args, 0)?), &raw_str(nth(args, 1)?), error).map_err(err)?;
@@ -537,7 +537,7 @@ pub fn register_serve_progress_builtins(
         let s = shared.clone();
         let g = gate.clone();
         interp.register_builtin("resume_point", 1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             match s.lock().unwrap().get_resume_point(&raw_str(nth(args, 0)?)) {
                 Some(name) => Ok(syn_text(name)),
                 None => Ok(SynValue::Nothing),
@@ -548,7 +548,7 @@ pub fn register_serve_progress_builtins(
         let s = shared.clone();
         let g = gate.clone();
         interp.register_builtin("progress_display", 1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let name = raw_str(nth(args, 0)?);
             let pm = s.lock().unwrap();
             match pm.tasks.get(&name) {
@@ -561,7 +561,7 @@ pub fn register_serve_progress_builtins(
         let s = shared.clone();
         let g = gate.clone();
         interp.register_builtin("progress_percent", 1, Rc::new(move |_i, args, _l| {
-            g().map_err(err)?;
+            g().map_err(Control::Error)?;
             let name = raw_str(nth(args, 0)?);
             let pm = s.lock().unwrap();
             Ok(syn_float(pm.tasks.get(&name).map(|tp| tp.progress_percent()).unwrap_or(0.0)))

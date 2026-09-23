@@ -43,6 +43,10 @@ pub const ABOVE_PARENT_PROFILE: &str = "above parent profile";
 pub const RUN_PROGRAM_ENV_VARS: &[&str] = &["SYNSEMA_RUN_PROGRAM_MAX_DEPTH"];
 /// Protocolo padre→hijo (NO es un knob de usuario): profundidad de anidamiento actual.
 pub const DEPTH_VAR: &str = "SYNSEMA_RUN_DEPTH";
+/// Protocolo interno padre → hijo (como `DEPTH_VAR`): el SUJETO del hijo (identidad, techo de
+/// gasto y presupuesto LLM delegados) en JSON. Lo fija el runtime DESPUÉS del `env` del
+/// programa: un programa no elige la identidad de su hijo. No es un knob del host.
+pub const RUN_SUBJECT_VAR: &str = "SYNSEMA_RUN_SUBJECT";
 pub const DEFAULT_MAX_DEPTH: u32 = 4;
 pub const DEFAULT_TIMEOUT_SECS: f64 = 30.0;
 
@@ -91,7 +95,7 @@ pub fn register_run_program_builtin(interp: &Interpreter, caps: Rc<RefCell<Capab
             // 1) La puerta: `require sandbox_run`.
             caps.borrow_mut()
                 .require(&Capability::new(CapabilityType::SandboxRun, None), "run_program()")
-                .map_err(|v| rt(v.message))?;
+                .map_err(|v| Control::Error(v.into_error()))?;
 
             let source = match args.first() {
                 Some(v) => text_of(v, "source")?,
@@ -129,16 +133,41 @@ pub fn register_run_program_builtin(interp: &Interpreter, caps: Rc<RefCell<Capab
             // 4) Techo pedido ∩ lo que el padre cubre. `check_silent` decide igual que un
             //    `check` (denials, techo del host, grants, padres, sandbox) sin auditar
             //    cada item; los recortados dejan UNA entrada con la razón.
-            let spec = match map_get(&opts, "ceiling") {
-                Some(v) => text_of(&v, "ceiling")?,
-                None => "sandbox".to_string(),
+            let requested: Vec<Capability> = match map_get(&opts, "ceiling") {
+                // T1 (identidad): el map que devolvió `captoken_verify` (o un map literal de
+                // caps): el hijo corre bajo ESA autoridad. Lo local al proceso sigue el
+                // baseline de `--sandbox` (stdout + time) — un token no lo gobierna — salvo el
+                // caveat `deterministic`, que le quita el reloj como se lo quita al padre.
+                Some(SynValue::Map(m)) => {
+                    let m = m.borrow();
+                    let (caps_map, deterministic) = match m.get("caps") {
+                        Some(SynValue::Map(c)) => (
+                            c.borrow().clone(),
+                            matches!(m.get("caveats"), Some(SynValue::Map(cv)) if matches!(cv.borrow().get("deterministic"), Some(SynValue::Bool(true)))),
+                        ),
+                        _ => (m.clone(), false),
+                    };
+                    let mut caps_list = synsema_stdlib::captoken::ceiling_from_caps_map(&caps_map)
+                        .map_err(|e| rt(format!("run_program: ceiling: {}", e)))?;
+                    caps_list.push(Capability::new(CapabilityType::Stdout, None));
+                    if !deterministic {
+                        caps_list.push(Capability::new(CapabilityType::Time, None));
+                    }
+                    caps_list
+                }
+                Some(v) => {
+                    let spec = text_of(&v, "ceiling")?;
+                    match spec.trim() {
+                        "sandbox" => build_ceiling(true, None),
+                        other => build_ceiling(false, Some(other)),
+                    }
+                    .map_err(|e| rt(format!("run_program: ceiling: {}", e)))?
+                    .unwrap_or_default()
+                }
+                None => build_ceiling(true, None)
+                    .map_err(|e| rt(format!("run_program: ceiling: {}", e)))?
+                    .unwrap_or_default(),
             };
-            let requested = match spec.trim() {
-                "sandbox" => build_ceiling(true, None),
-                other => build_ceiling(false, Some(other)),
-            }
-            .map_err(|e| rt(format!("run_program: ceiling: {}", e)))?
-            .unwrap_or_default();
             let mut kept: Vec<Capability> = Vec::new();
             for cap in requested {
                 let covered = caps.borrow_mut().check_silent(&cap);
@@ -171,6 +200,12 @@ pub fn register_run_program_builtin(interp: &Interpreter, caps: Rc<RefCell<Capab
                 }
                 Some(_) => return Err(rt("run_program: env must be a map of text")),
             }
+            // T1: el sujeto del hijo es el del padre — identidad, techo de gasto y presupuesto
+            // LLM delegados — por una variable interna que se pisa después del `env` del
+            // programa (el programa no elige la identidad de su hijo). El techo delegado ya
+            // viaja como `--cap-set`.
+            let subject = crate::subject::Subject::capture(i, &caps);
+            env.retain(|(k, _)| k != "SYNSEMA_IDENTITY" && k != RUN_SUBJECT_VAR);
             let timeout_secs = match map_get(&opts, "timeout") {
                 None | Some(SynValue::Nothing) => DEFAULT_TIMEOUT_SECS,
                 Some(SynValue::Number(n)) => n.to_f64(),
@@ -207,6 +242,7 @@ pub fn register_run_program_builtin(interp: &Interpreter, caps: Rc<RefCell<Capab
                 c.env(k, v);
             }
             c.env(DEPTH_VAR, (depth + 1).to_string())
+                .env(RUN_SUBJECT_VAR, subject.to_env_json())
                 .env("SYNSEMA_RUN_PROGRAM_MAX_DEPTH", max_depth.to_string())
                 .env("SYNSEMA_NO_UPDATE_CHECK", "1")
                 // Sin `.env` del cwd: el "reemplazo" de env no puede filtrar el del padre.

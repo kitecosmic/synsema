@@ -160,6 +160,30 @@ let enriched be sandbox transform(untrusted_data)   -- isolated AND returns a va
 Use it to run untrusted/enriching logic that must NOT touch the network, disk, or any
 capability — only pure computation in, value out.
 
+**`sandbox under <caps>` (v0.6.28+) — a least-privilege block.** The body runs under a **delegated
+ceiling** instead of with nothing: what the map lists stays (still gated by the program's own
+`require` and by the host ceiling), what it doesn't list is denied, and `require` inside is still a
+no-op. The map is either a literal `{capability: scope | [scopes] | nothing}` or the map returned
+by `captoken_verify` — then the block runs under **that token**, exactly like a `serve` request does:
+
+```synsema
+require net("api.example.com")
+require db("orders")
+
+sandbox under {"db": "orders"}                 -- this step may touch the DB, not the network
+    let rows be sql(db, "select …")
+
+let agent be captoken_verify(token, secret("ROOT_KEY"))
+sandbox under agent                            -- run this step with the caller's authority only
+    give summarize(fetch(url))                 -- fetch works only if the token carries net(url's host)
+```
+
+Needs an indented body on the next line. Process-local capabilities (`stdout`, `stdin`, `time`,
+`random`) are not delegable and error at the block (`… is process-local`); a nested `sandbox under`
+stacks (every ceiling on the stack must cover the use). A denial inside is `Capability not granted:
+X — outside the ceiling of the enclosing sandbox under block …` (catchable), or, when the block runs
+under a verified token, the token's own message.
+
 ## Host capability ceiling (`--sandbox` / `--cap-set`) — v0.4.3+
 
 `require`/`sandbox`/`call_tool` all assume you **trust** the code. When you don't — running an
@@ -191,17 +215,43 @@ synsema test --cap-set "stdout,time,random,secret,file=scratch_*" program.syn
 
 - **`sandbox_run` capability** (v0.6.14+): `require sandbox_run` lets a program run *another* Synsema program with `run_program(source, {ceiling, profile, env, timeout})` in a child process under a ceiling that is the intersection with its own — the child can never exceed the parent (asking for more is trimmed, not fatal, and the parent's audit records it as `above parent ceiling`). See [builtins.md](builtins.md) and [processes.md](processes.md).
 - **`render` of a disk template reads a file:** the top-level `render(path)` needs `require file.read("<path>")` (v0.6.14+; nested `include`/`layout` and bundled templates don't).
-- **The error names who can fix it.** Not declared → `Capability not granted: X` / `… missing capability — add require X`
-  (the program adds the line). Declared but above the ceiling → `… declared but above the host ceiling
-  (--sandbox/--cap-set). The program cannot fix this; the host must widen the ceiling` — do NOT re-add a
-  `require` you already have (that loop is exactly what this message prevents). The audit trail carries the
-  same split: `reason` = `No matching grant found` / `above host ceiling (--sandbox/--cap-set)` /
-  `Explicitly denied by …`, and `origin` = `program` (a `require` or a call of the program) vs `runtime`
-  (an ambient grant the host tried — `time`/`llm` under a ceiling — the program never asked). Same for
-  `sign`/`spend`/`wallet`/`reveal`.
+- **The error names who can fix it — and says it is a permission, not a bug.** Not declared →
+  `Capability not granted: X — this is a permission, not a bug: add `require X` to the program's preamble
+  (or to the importing file, when this code runs in a module)` (v0.6.28+: the exact line to add is in the
+  message; an agent reading it must not go looking for another cause). Declared but above the host ceiling →
+  `… declared but above the host ceiling (--sandbox/--cap-set). The program cannot fix this; the host must
+  widen the ceiling` — do NOT re-add a `require` you already have (that loop is exactly what this message
+  prevents). Declared but not delegated by the caller's captoken (v0.6.28+, see the delegated ceiling
+  below) → `… denied by the delegated ceiling of token <id>: the program declares it, but the caller's token
+  does not grant it` — the **caller** must present a token that carries it; under `serve` the client only
+  sees a 403 `insufficient permissions`. The audit trail carries the same split: `reason` = `No matching grant
+  found` / `above host ceiling (--sandbox/--cap-set)` / `above delegated ceiling (token <id>)` / `above sandbox
+  ceiling (sandbox under)` / `Explicitly denied by …`, and `origin` = `program` (a `require` or a call of the
+  program) vs `runtime` (an ambient grant the host tried — `time`/`llm` under a ceiling — the program never
+  asked). Same for `sign`/`spend`/`wallet`/`reveal`.
 - It only ever **removes**, never widens. Auto-grants (`stdout`/`time`/`llm`) are filtered too (so
   `--sandbox` won't spend your LLM key). It propagates to **agents** and **`parallel_map` workers** — a
   spawned agent can't exceed the ceiling either.
+- **The delegated ceiling — the token IS the ceiling (v0.6.28+).** A verified captoken is not advisory
+  any more. Three places apply it, all on the same `CapabilitySet` machinery, stacked *under* the host
+  ceiling (`caps_effective ⊆ require ∩ host ceiling ∩ token`): under **`serve`**, the `caps` of the map
+  your `auth with` task returns become the request's ceiling (see [serve.md](serve.md) § Agent identity);
+  **`run_program(src, {"ceiling": verified})`** runs the child under the token; **`sandbox under verified`**
+  runs a block under it in-process. `caps` are **transferable authority** (`net`, `file*`, `exec`, `env`, `db`,
+  `llm`, `judge`, `serve`, `secret`, `reveal`, `sign`, `wallet`, `spend`, `memory`, `sandbox_run`, `attest`):
+  what the token does not list is denied even though the program declares it, `llm` and `judge` included.
+  **Process-local** capabilities (`stdout`, `stdin`, `time`, `random`) are never in a token — nobody delegates
+  another process's clock — and a token cannot even be minted with them; the host ceiling and the program
+  govern them as always. Two caveats constrain *execution* instead: `deterministic: true` (the holder runs
+  without clock or entropy, like `--deterministic`) and `llm_tokens: N` (a delegated LLM budget, metered
+  against the token's `id` beside `SYNSEMA_LLM_BUDGET_PER_IDENTITY`). **The identity travels with the
+  ceiling**: agents spawned from a request, `parallel_map` workers and `run_program` children run on behalf
+  of the same subject, under the same delegated ceiling and budgets; a cron tick runs as `cron:<job>`; `run`
+  runs as the operator (`SYNSEMA_IDENTITY`, optional).
+- **The audit is a receipt.** `receipt()` turns the unit's audit (every capability asked, granted
+  or denied, with reason and source), its tokens, spend and `declassify` log into a Verifiable
+  Credential; `receipt({"sign": key, ...})` signs it (W3C Data Integrity). Derived, never
+  written by the program — see builtins.md § Identity documents.
 - **Scope `file`/`db`/`memory`:** a bare `--cap-set "…,file"` lets the code read any absolute path; use a prefix
   like `file=scratch_*` (or `db=:memory:`, `memory=shop-*`) so it can only touch what you intend. A ceiling
   without `memory` denies the persistent-state family entirely — and creates no `.db` file at all.

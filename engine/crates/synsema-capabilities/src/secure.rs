@@ -132,7 +132,7 @@ fn lines_range_str(s: &str, offset: usize, limit: Option<usize>) -> String {
 fn require(caps: &Rc<RefCell<CapabilitySet>>, cap: Capability, source: &str) -> Result<(), Control> {
     caps.borrow_mut()
         .require(&cap, source)
-        .map_err(|v| Control::Error(RuntimeError::new(v.message)))
+        .map_err(|v| Control::Error(v.into_error()))
 }
 
 /// Hostname de un URL, como `urlparse().hostname` de Python: minúsculas, sin

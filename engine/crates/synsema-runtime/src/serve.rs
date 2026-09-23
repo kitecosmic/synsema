@@ -371,7 +371,10 @@ fn run_cron_tick_inner(
         cron,
         env.secure,
         &env.mem_name,
-        |interp| {
+        |interp, caps| {
+            // T1: un tick de cron corre EN NOMBRE de `cron:<job>` — el ledger de `spend`, el
+            // techo LLM por identidad y el audit dicen qué job fue, nunca "nadie".
+            let _cron_subject = crate::subject::Subject::cron(name).apply(interp, caps);
             let task = interp.global_env.borrow().bindings.get(name).cloned();
             match task {
                 Some(t @ (SynValue::Task(_) | SynValue::Builtin(_))) => {
@@ -1283,7 +1286,7 @@ pub fn registered_serve_builtin_names() -> Vec<String> {
     register_serve_progress_builtins(&interp, shared_progress, on_write_progress, gate);
     register_database_builtins(&interp, Arc::new(Mutex::new(DatabaseManager::new())), caps.clone());
     // Swarm: `agents`/`agent_stop` (sólo existen con el swarm cableado, como bajo `serve`).
-    wire_swarm_hooks(&mut interp, Arc::new(Swarm::new()), "main", None, None, None);
+    wire_swarm_hooks(&mut interp, Arc::new(Swarm::new()), "main", None, None, None, &caps);
     let env = interp.global_env.borrow();
     let mut names: Vec<String> = env
         .bindings
@@ -1432,7 +1435,7 @@ fn build_base_interp(
     // Hooks del swarm con el techo del host y el CONSTRUCTOR de intérpretes de serve:
     // un agente spawneado desde un handler nace con el mismo wiring que un tick de cron
     // (state_*, DB compartida, approvals, cron, bus, memoria) — no en una isla.
-    wire_swarm_hooks(&mut interp, swarm, "request", host_ceiling, mem_ctx, agent_builder);
+    wire_swarm_hooks(&mut interp, swarm, "request", host_ceiling, mem_ctx, agent_builder, &caps);
     register_database_builtins(&interp, shared_db, caps.clone());
     rebuild_globals(&mut interp, snapshot);
     (interp, caps)
@@ -1478,7 +1481,7 @@ fn with_serve_interp<R>(
     cron: &CronWiring,
     secure: bool,
     mem_name: &Option<String>,
-    f: impl FnOnce(&mut Interpreter) -> R,
+    f: impl FnOnce(&mut Interpreter, &Rc<RefCell<CapabilitySet>>) -> R,
 ) -> R {
     let key = Arc::as_ptr(snapshot) as *const () as usize;
     // Sacá el base del cache (o construilo la primera vez). Sacarlo (en vez de tomar
@@ -1549,7 +1552,7 @@ fn with_serve_interp<R>(
 
     // T5 (ronda 7): el diario del almacén compartido cubre exactamente este request.
     arm_state_journal();
-    let out = f(&mut base.interp);
+    let out = f(&mut base.interp, &base.caps);
     finish_state_journal(shared_state, base.interp.take_label_stop());
 
     // Limpieza por-request: estado transitorio del intérprete + capabilities al
@@ -1601,15 +1604,12 @@ fn run_socket(
     mem_name: &Option<String>,
     link: Box<dyn std::any::Any + Send>,
 ) -> StreamEnd {
-    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp| {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp, caps| {
         interp.set_cancel_token(ctx.cancel.clone());
-        let (identity, limits) = match &ctx.user {
-            Some(u) => (server::identity_of(u), server::delegated_spend_of(u)),
-            None => (None, Vec::new()),
-        };
-        // v0.6.20 — la misma identidad alimenta el techo de tokens LLM por identidad.
-        let _llm_identity = crate::llm_providers::identity_scope(identity.clone());
-        interp.set_request_identity(identity, limits);
+        // T1 — el SUJETO de esta request (identidad, techo de gasto y techo delegado del
+        // token, presupuesto LLM delegado) sobre el intérprete y su CapabilitySet. Lo limpia
+        // `reset_for_request` / `reset_keeping_ceiling` al devolver el worker al pool.
+        let _llm_identity = crate::subject::Subject::of_user(ctx.user.as_ref()).apply(interp, caps);
         let link = match link.downcast::<ServerSocketLink>() {
             Ok(l) => *l,
             Err(_) => return StreamEnd::Error("socket: internal transport link type mismatch".to_string()),
@@ -1680,18 +1680,15 @@ fn run_route(
     secure: bool,
     mem_name: &Option<String>,
 ) -> GiveOutcome {
-    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, |interp| {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, |interp, caps| {
         // T6.4 — identidad del sujeto de ESTA request (y su techo de gasto
         // delegado, si el token lo trae): lo consume el ledger de `spend` para
         // contabilizar y limitar por identidad. `reset_for_request` lo limpia al
         // devolver el intérprete al pool, así no se filtra al request siguiente.
-        let (identity, limits) = match &ctx.user {
-            Some(u) => (server::identity_of(u), server::delegated_spend_of(u)),
-            None => (None, Vec::new()),
-        };
-        // v0.6.20 — la misma identidad alimenta el techo de tokens LLM por identidad.
-        let _llm_identity = crate::llm_providers::identity_scope(identity.clone());
-        interp.set_request_identity(identity, limits);
+        // T1 — el SUJETO de esta request (identidad, techo de gasto y techo delegado del
+        // token, presupuesto LLM delegado) sobre el intérprete y su CapabilitySet. Lo limpia
+        // `reset_for_request` / `reset_keeping_ceiling` al devolver el worker al pool.
+        let _llm_identity = crate::subject::Subject::of_user(ctx.user.as_ref()).apply(interp, caps);
         // Token de cancelación de la request (timeout de handler / shutdown).
         interp.set_cancel_token(ctx.cancel.clone());
         match interp.run_request_block(body, request_bindings(ctx)) {
@@ -1701,6 +1698,9 @@ fn run_route(
             Err(Control::Error(e)) if e.is_validation => {
                 GiveOutcome::Validation { message: e.message.clone(), field: e.field.clone() }
             }
+            // T1: denegada por el token del CALLER → 403 genérico, no 500 (la culpa no es del
+            // server). Se decide por el flag, jamás por el texto.
+            Err(Control::Error(e)) if e.denied_by_token => GiveOutcome::Forbidden(e.to_string_for_client()),
             Err(Control::Error(e)) => GiveOutcome::Error(e.to_string_for_client()),
             Err(Control::Stop(_)) => {
                 GiveOutcome::Error("'give'/'stop' used outside of a task or loop".to_string())
@@ -1711,6 +1711,21 @@ fn run_route(
 
 /// Marcador (en el mensaje del error) de desconexión del cliente SSE.
 const CLIENT_GONE: &str = "__client_gone__";
+
+/// `SYNSEMA_IDENTITY_KEY` (environ o `.env`): la semilla ed25519 (64 hex) de la identidad del
+/// server. Inválida → aviso por stderr y sin identidad (nunca una clave adivinada).
+fn identity_key_from_env() -> Option<[u8; 32]> {
+    let store = synsema_stdlib::secrets::EnvStore::load_default();
+    let raw = crate::llm_providers::resolve_knob("SYNSEMA_IDENTITY_KEY", &store)?;
+    let raw = raw.trim().trim_start_matches("0x");
+    match synsema_core::bytesutil::hex_decode(raw) {
+        Ok(b) if b.len() == 32 => Some(b.try_into().expect("32")),
+        _ => {
+            eprintln!("synsema: warning: SYNSEMA_IDENTITY_KEY must be the ed25519 seed as 64 hex chars — ignored; the agent card is served unsigned");
+            None
+        }
+    }
+}
 
 /// Corre el cuerpo de una ruta de streaming SSE: `send` emite vía el `Emitter`. Un
 /// `give` (o el fin del cuerpo) termina el stream limpio; un fallo de escritura
@@ -1735,16 +1750,14 @@ fn run_stream(
     mem_name: &Option<String>,
     emit: Emitter,
 ) -> StreamEnd {
-    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp| {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp, caps| {
         // Identidad del sujeto de ESTA request: la misma que fija `run_route`. Sin esto una
         // ruta `stream` directa quedaba fuera de los techos por identidad (LLM, spend, sign):
         // venía así desde v0.6.19 y la auditoría de v0.6.20 lo destapó con el techo LLM nuevo.
-        let (identity, limits) = match &ctx.user {
-            Some(u) => (server::identity_of(u), server::delegated_spend_of(u)),
-            None => (None, Vec::new()),
-        };
-        let _llm_identity = crate::llm_providers::identity_scope(identity.clone());
-        interp.set_request_identity(identity, limits);
+        // T1 — el SUJETO de esta request (identidad, techo de gasto y techo delegado del
+        // token, presupuesto LLM delegado) sobre el intérprete y su CapabilitySet. Lo limpia
+        // `reset_for_request` / `reset_keeping_ceiling` al devolver el worker al pool.
+        let _llm_identity = crate::subject::Subject::of_user(ctx.user.as_ref()).apply(interp, caps);
         interp.set_cancel_token(ctx.cancel.clone());
         let cell = Rc::new(RefCell::new(emit));
         let ec = cell.clone();
@@ -2023,7 +2036,7 @@ fn build_host_table(
             let db_a = shared_db.clone();
             let mn_a = mem_name.clone();
             let h: AuthHandler = Arc::new(move |token: &str, ctx: &Ctx| -> Option<SynValue> {
-                with_serve_interp(&swarm_a, &snap_a, &caps_a, &db_a, &rules_a, &mem_a, &ow_a, &prog_a, &owp_a, &st_a, &ap_a, &cron_a, secure, &mn_a, |interp| {
+                with_serve_interp(&swarm_a, &snap_a, &caps_a, &db_a, &rules_a, &mem_a, &ow_a, &prog_a, &owp_a, &st_a, &ap_a, &cron_a, secure, &mn_a, |interp, _caps| {
                     let genv = interp.global_env.clone();
                     let task = match interp.eval(&auth_node, &genv) {
                         Ok(t) => t,
@@ -2121,7 +2134,7 @@ fn build_host_table(
                         &Capability::new(CapabilityType::Net, Some(host.clone())),
                         &format!("proxy to \"{}\" (route \"{} {}\")", url, method, path),
                     ) {
-                        return Err(Control::Error(RuntimeError::new(v.message)));
+                        return Err(Control::Error(v.into_error()));
                     }
                     Some(url)
                 } else {
@@ -2459,14 +2472,11 @@ fn run_mounted_route(
     secure: bool,
     mem_name: &Option<String>,
 ) -> GiveOutcome {
-    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, |interp| {
-        let (identity, limits) = match &ctx.user {
-            Some(u) => (server::identity_of(u), server::delegated_spend_of(u)),
-            None => (None, Vec::new()),
-        };
-        // v0.6.20 — la misma identidad alimenta el techo de tokens LLM por identidad.
-        let _llm_identity = crate::llm_providers::identity_scope(identity.clone());
-        interp.set_request_identity(identity, limits);
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, |interp, caps| {
+        // T1 — el SUJETO de esta request (identidad, techo de gasto y techo delegado del
+        // token, presupuesto LLM delegado) sobre el intérprete y su CapabilitySet. Lo limpia
+        // `reset_for_request` / `reset_keeping_ceiling` al devolver el worker al pool.
+        let _llm_identity = crate::subject::Subject::of_user(ctx.user.as_ref()).apply(interp, caps);
         let genv = interp.global_env.clone();
         let group = match interp.eval(source, &genv) {
             Ok(v) => v,
@@ -2499,6 +2509,9 @@ fn run_mounted_route(
             Err(Control::Error(e)) if e.is_validation => {
                 GiveOutcome::Validation { message: e.message.clone(), field: e.field.clone() }
             }
+            // T1: denegada por el token del CALLER → 403 genérico, no 500 (la culpa no es del
+            // server). Se decide por el flag, jamás por el texto.
+            Err(Control::Error(e)) if e.denied_by_token => GiveOutcome::Forbidden(e.to_string_for_client()),
             Err(Control::Error(e)) => GiveOutcome::Error(e.to_string_for_client()),
             Err(Control::Stop(_)) => {
                 GiveOutcome::Error("'give'/'stop' used outside of a task or loop".to_string())
@@ -2552,14 +2565,12 @@ fn run_mounted_stream(
     mem_name: &Option<String>,
     emit: Emitter,
 ) -> StreamEnd {
-    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp| {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp, caps| {
         interp.set_cancel_token(ctx.cancel.clone());
-        let (identity, limits) = match &ctx.user {
-            Some(u) => (server::identity_of(u), server::delegated_spend_of(u)),
-            None => (None, Vec::new()),
-        };
-        let _llm_identity = crate::llm_providers::identity_scope(identity.clone());
-        interp.set_request_identity(identity, limits);
+        // T1 — el SUJETO de esta request (identidad, techo de gasto y techo delegado del
+        // token, presupuesto LLM delegado) sobre el intérprete y su CapabilitySet. Lo limpia
+        // `reset_for_request` / `reset_keeping_ceiling` al devolver el worker al pool.
+        let _llm_identity = crate::subject::Subject::of_user(ctx.user.as_ref()).apply(interp, caps);
         let task = match mounted_task(interp, source, handler_key) {
             Ok(t) => t,
             Err(m) => return StreamEnd::Error(m),
@@ -2624,14 +2635,12 @@ fn run_mounted_socket(
     mem_name: &Option<String>,
     link: Box<dyn std::any::Any + Send>,
 ) -> StreamEnd {
-    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp| {
+    with_serve_interp(swarm, snapshot, caps_snap, shared_db, rules_snap, shared_memory, on_write, shared_progress, on_write_progress, shared_state, approvals, cron, secure, mem_name, move |interp, caps| {
         interp.set_cancel_token(ctx.cancel.clone());
-        let (identity, limits) = match &ctx.user {
-            Some(u) => (server::identity_of(u), server::delegated_spend_of(u)),
-            None => (None, Vec::new()),
-        };
-        let _llm_identity = crate::llm_providers::identity_scope(identity.clone());
-        interp.set_request_identity(identity, limits);
+        // T1 — el SUJETO de esta request (identidad, techo de gasto y techo delegado del
+        // token, presupuesto LLM delegado) sobre el intérprete y su CapabilitySet. Lo limpia
+        // `reset_for_request` / `reset_keeping_ceiling` al devolver el worker al pool.
+        let _llm_identity = crate::subject::Subject::of_user(ctx.user.as_ref()).apply(interp, caps);
         let task = match mounted_task(interp, source, handler_key) {
             Ok(t) => t,
             Err(m) => return StreamEnd::Error(m),
@@ -2991,7 +3000,13 @@ fn make_serve_hook(
                 let mn_e = mem_name.clone();
                 let h: ErrorHandler = Arc::new(
                     move |status: i64, message: &str, ctx: &Ctx| -> Option<SynValue> {
-                        with_serve_interp(&swarm_e, &snap_e, &caps_e, &db_e, &rules_e, &mem_e, &ow_e, &prog_e, &owp_e, &st_e, &ap_e, &cron_e, secure, &mn_e, |interp| {
+                        with_serve_interp(&swarm_e, &snap_e, &caps_e, &db_e, &rules_e, &mem_e, &ow_e, &prog_e, &owp_e, &st_e, &ap_e, &cron_e, secure, &mn_e, |interp, caps| {
+                            // T1 — la página de error corre bajo el MISMO sujeto que la ruta
+                            // (identidad, techo delegado del token, presupuestos): el caller
+                            // dispara el error a voluntad, así que sin esto era una escalada
+                            // (auditoría ronda 1: el 403 de la ruta leía el archivo en el
+                            // cuerpo de su propia página de error).
+                            let _subject = crate::subject::Subject::of_user(ctx.user.as_ref()).apply(interp, caps);
                             let genv = interp.global_env.clone();
                             let task = match interp.eval(&err_node, &genv) {
                                 Ok(t) => t,
@@ -3240,6 +3255,13 @@ fn make_serve_hook(
         if let Some(id) = &attested_identity {
             runtime.attestation_json = Some(id.json().to_string());
         }
+        // T3: la identidad que firma la Agent Card. Bajo `--attested` ES la clave atestada
+        // (la tarjeta y el documento de attestation hablan de la misma clave); si no,
+        // `SYNSEMA_IDENTITY_KEY` (semilla ed25519 en hex). Sin ninguna, la tarjeta va sin firma.
+        runtime.card_signer = match &attested_identity {
+            Some(id) => synsema_stdlib::discovery::CardSigner::p256_from_scalar(&id.private_scalar).ok(),
+            None => identity_key_from_env().map(synsema_stdlib::discovery::CardSigner::ed25519_from_seed),
+        };
         // `timeout N` del serve block (Some(0) = `none` explícito = sin límite).
         runtime.set_default_timeout(default_timeout.filter(|t| *t > 0.0));
         // Shutdown ordenado: al iniciar el drain se paran los jobs de cron y se cancelan
@@ -3622,7 +3644,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
 
     let swarm = Arc::new(Swarm::new());
     // Techo del host (--sandbox/--cap-set) aún no se extiende a `serve` (extensión posterior).
-    wire_swarm_hooks(&mut interp, swarm.clone(), "main", serve_ceiling(), top_mem_ctx, None);
+    wire_swarm_hooks(&mut interp, swarm.clone(), "main", serve_ceiling(), top_mem_ctx, None, &caps);
     // db compartida: el top-level abre/crea tablas; los handlers (en sus hilos) la
     // comparten vía Arc<Mutex>. Sobrescribe la db fresca que dejó wire_common.
     let shared_db: SharedDb = Arc::new(Mutex::new(DatabaseManager::new()));
@@ -3772,6 +3794,8 @@ pub fn run_serve_program_with_overrides(
 ) -> RunResult {
     let src = source.to_string();
     let fname = filename.to_string();
+    // T4: la medida del programa que sirve, para el recibo (`receipt()`) de cada request.
+    synsema_stdlib::attest::note_program_sha(source, filename);
     set_serve_ceiling(overrides.ceiling.clone());
     // Desde acá `shutdown()` tiene sentido (bajo `run` es un error claro).
     synsema_stdlib::server::mark_under_serve();

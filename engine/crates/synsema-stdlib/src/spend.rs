@@ -223,6 +223,19 @@ fn identity_totals() -> &'static Mutex<HashMap<(String, String), Decimal>> {
     TOTALS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Lo gastado por una identidad en este proceso, por unidad (T4: el recibo lo lleva).
+/// Montos como texto decimal exacto, unidades ordenadas.
+pub fn identity_spend_snapshot(identity: &str) -> Vec<(String, String)> {
+    let totals = lock_unpoisoned(identity_totals());
+    let mut out: Vec<(String, String)> = totals
+        .iter()
+        .filter(|((id, _), _)| id == identity)
+        .map(|((_, unit), amount)| (unit.clone(), amount.normalize().to_string()))
+        .collect();
+    out.sort();
+    out
+}
+
 /// Firmas realizadas por name de clave en ESTE proceso (F-C).
 fn sign_counts() -> &'static Mutex<HashMap<String, u64>> {
     static COUNTS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
@@ -302,6 +315,12 @@ fn amount_to_decimal(n: &Number) -> Result<Decimal, String> {
 }
 
 fn spend_cap_denied(unit: &str, cause: DenyCause) -> Control {
+    // Denegada por el techo DELEGADO: la causa viaja en el error (403 bajo serve); el texto
+    // "add `require spend(…)`" sería un falso diagnóstico para un programa que ya lo declara.
+    if let DenyCause::Delegated(_) = &cause {
+        let cap = Capability::new(CapabilityType::Spend, Some(unit.to_string()));
+        return Control::Error(CapabilitySet::violation(&cap, cause, "spend-builtin").into_error());
+    }
     if cause == DenyCause::AboveCeiling {
         return err(format!("Capability not granted: spend(\"{unit}\") — declared but above the host ceiling (--sandbox/--cap-set). The program cannot fix this; the host must widen the ceiling"));
     }

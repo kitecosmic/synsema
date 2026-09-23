@@ -461,7 +461,7 @@ pub fn register_raster_builtins_with_caps(
             }
             caps.borrow_mut()
                 .require(&Capability::new(CapabilityType::FileRead, Some(path.clone())), source)
-                .map_err(|v| Control::Error(RuntimeError::new(v.message)))?;
+                .map_err(|v| Control::Error(v.into_error()))?;
             std::fs::read(&path).map_err(|e| err(format!("{}: cannot read font {}: {}", source, path, e)))
         }
     }

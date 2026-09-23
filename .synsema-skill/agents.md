@@ -31,7 +31,15 @@ spawn Researcher with query = "AI safety"
   task), and a task passed as a `spawn` argument arrives as **text** (closures do not cross
   threads — pass data, or the name of a top-level task and call it inside). Each agent is a
   fresh interpreter with its own capability set: it needs its **own `require`** lines in its
-  body (bounded by the host ceiling), the parent's grants are not inherited.
+  body (bounded by the host ceiling), the parent's grants are not inherited. The rule is
+  "a body of its own declares, a function inherits": `task` and `parallel_map` workers inherit
+  the caller's grants; `agent`, `run_program` and a module declare their own (a module's are
+  declared by the file that imports it).
+- **The agent runs on behalf of who spawned it (v0.6.28+).** The subject of the spawning unit of
+  work — the authenticated identity, its delegated spend limits, the captoken's delegated ceiling
+  and its LLM budget — travels to the agent with the host ceiling: `spend` inside the agent is
+  booked to the requester, and a capability the caller's token does not carry is denied in the agent
+  too, even if its body `require`s it. Under `run`, the subject is the operator (`SYNSEMA_IDENTITY`).
 - **Agent `log`/`print` appears in the main process stdout**, prefixed `[AgentName]` — agents are
   not silent during development.
 

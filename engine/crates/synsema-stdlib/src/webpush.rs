@@ -622,7 +622,7 @@ fn push_vapid_keys(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Resu
     }
     caps.borrow_mut()
         .require(&Capability::new(CapabilityType::Random, None), "push_vapid_keys()")
-        .map_err(|v| Control::Error(RuntimeError::new(v.message)))?;
+        .map_err(|v| Control::Error(v.into_error()))?;
     let sk = keygen();
     let public = public_b64(&sk);
     let private = private_b64(&sk);

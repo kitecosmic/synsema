@@ -1480,7 +1480,7 @@ fn db_scope_for(target: &str, mode: &str) -> String {
 fn require_db(caps: &Rc<RefCell<CapabilitySet>>, scope: &str, source: &str) -> Result<(), Control> {
     caps.borrow_mut()
         .require(&Capability::new(CapabilityType::Db, Some(scope.to_string())), source)
-        .map_err(|v| Control::Error(RuntimeError::new(v.message)))
+        .map_err(|v| Control::Error(v.into_error()))
 }
 
 // -- Helpers de args para los builtins `mongo_*` (map de Synsema ↔ BSON Document) --

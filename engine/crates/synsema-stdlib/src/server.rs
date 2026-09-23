@@ -599,6 +599,9 @@ pub struct ServeRuntime {
     /// El JSON de `GET /.well-known/attestation` cuando el serve arrancó con
     /// `--attested`; `None` = la ruta no existe (el servidor no inventa identidades).
     pub attestation_json: Option<String>,
+    /// T3 (identidad): la clave que firma la Agent Card (`/.well-known/agent-card.json`) y
+    /// da el `did:key` del server; `None` = tarjeta sin firma y sin `did` (no se inventa).
+    pub card_signer: Option<discovery::CardSigner>,
     started: std::time::Instant,
     rate_limiter: RateLimiter,
     active_streams: Mutex<i64>,
@@ -697,6 +700,7 @@ impl ServeRuntime {
             docs_enabled: true,
             health_path,
             attestation_json: None,
+            card_signer: None,
             started: std::time::Instant::now(),
             rate_limiter: RateLimiter::new(),
             active_streams: Mutex::new(0),
@@ -945,7 +949,36 @@ impl ServeRuntime {
         }
         lines.push("- /sitemap.xml".to_string());
         lines.push("- /.well-known/synsema-auth".to_string());
+        lines.push("- /.well-known/agent-card.json".to_string());
         lines.join("\n") + "\n"
+    }
+
+    /// T3: la Agent Card derivada de la tabla de rutas de este host, firmada si el server
+    /// tiene identidad (`card_signer`). Misma condición de auth que `auth_discovery`.
+    fn agent_card_json(&self, host: &HostRouter, headers: &[(String, String)]) -> String {
+        let info = self.api_info(host, headers);
+        let requires_auth = self.default_host.routes.iter().any(|r| r.requires_auth)
+            || self.vhosts.iter().any(|h| h.routes.iter().any(|r| r.requires_auth));
+        let has_handler = self.default_host.auth_handler.is_some()
+            || self.vhosts.iter().any(|h| h.auth_handler.is_some());
+        let auth = if requires_auth && has_handler {
+            Some(discovery::CardAuth { bearer: true, cookie: true, httpsig: true })
+        } else {
+            None
+        };
+        let card = discovery::agent_card(
+            &info,
+            &Self::public_routes(host),
+            auth.as_ref(),
+            self.docs_enabled,
+            self.attestation_json.is_some(),
+            self.card_signer.as_ref(),
+        );
+        let card = match &self.card_signer {
+            Some(s) => discovery::sign_card(&card, s).unwrap_or(card),
+            None => card,
+        };
+        dumps(&card)
     }
 
     fn robots_txt(&self, base: Option<&str>) -> String {
@@ -1067,6 +1100,15 @@ impl ServeRuntime {
         if path == "/.well-known/synsema-auth" && !self.private {
             return Some(RawResponse::text(
                 self.auth_discovery(),
+                "application/json; charset=utf-8",
+                200,
+            ));
+        }
+        // T3: la Agent Card (forma A2A, firma JWS con el did:key del server). Mismo criterio
+        // de `private` que el resto del discovery.
+        if (path == discovery::AGENT_CARD_PATH || path == discovery::AGENT_CARD_LEGACY_PATH) && !self.private {
+            return Some(RawResponse::text(
+                self.agent_card_json(host, headers),
                 "application/json; charset=utf-8",
                 200,
             ));
@@ -1729,10 +1771,35 @@ impl ServeRuntime {
                 ])),
             ),
             GiveOutcome::Error(msg) => self.shape_500(&msg, &ctx, &mut custom_headers),
+            GiveOutcome::Forbidden(detail) => self.shape_403(&detail, &ctx, &mut custom_headers),
         };
         let mut headers = rate_headers;
         headers.append(&mut custom_headers);
         Dispatched::Response { status, body, headers }
+    }
+
+    /// T1 (identidad): la capability la denegó el TOKEN del caller → **403 con cuerpo fijo**.
+    /// Hacia afuera no se nombra la capability, no se listan las que faltan y no se distingue
+    /// "no existe" de "no la tenés" (§10.4 del spec: un login dice "las credenciales no
+    /// coinciden", nunca "la contraseña está mal"). El detalle va al log del server y al
+    /// audit, que son del operador. `errors with` puede darle forma (status 403), pero el
+    /// mensaje que recibe ya es el genérico.
+    fn shape_403(
+        &self,
+        detail: &str,
+        ctx: &Ctx,
+        extra: &mut Vec<(String, String)>,
+    ) -> (u16, ResponseBody) {
+        eprintln!("[serve:{}] 403 {}", self.port, detail);
+        const MSG: &str = "insufficient permissions";
+        if let Some((st, body, hdrs)) = self.custom_error(403, MSG, ctx) {
+            extra.extend(hdrs);
+            return (st, body);
+        }
+        (
+            403,
+            ResponseBody::Json(obj(vec![("error", Json::Str(MSG.into())), ("status", Json::Int(403))])),
+        )
     }
 }
 
@@ -1990,8 +2057,16 @@ pub const SERVE_ENV_VARS: &[&str] = &[
 /// el shutdown ordenado sale del proceso cuando el ÚLTIMO terminó de drenar — no
 /// cuando el primero (que cortaría el drain de los demás).
 /// V0.6.20 — las URLs que el runtime publica solo: una ruta con parámetros no las captura.
-pub const RESERVED_PATHS: [&str; 6] =
-    ["/openapi.json", "/docs", "/llms.txt", "/sitemap.xml", "/robots.txt", ATTESTATION_PATH];
+pub const RESERVED_PATHS: [&str; 8] = [
+    "/openapi.json",
+    "/docs",
+    "/llms.txt",
+    "/sitemap.xml",
+    "/robots.txt",
+    ATTESTATION_PATH,
+    discovery::AGENT_CARD_PATH,
+    discovery::AGENT_CARD_LEGACY_PATH,
+];
 
 /// La URL donde un `serve --attested` publica su identidad
 /// (`{format, document, public_key, public_key_hex, program_sha, engine, driver}`). Sólo

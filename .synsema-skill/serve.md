@@ -667,6 +667,7 @@ and what can't be derived truthfully (a response schema) is omitted, not invente
 | `/openapi.json` | OpenAPI 3.1, deterministic (paths asc, GET/POST/PUT/PATCH/DELETE). `expect body` (top-level only) → `requestBody` (all fields required; text→string, number→number, bool→boolean, list→array, map→object); `:id`/`*rest` → `{id}` path params; `requires auth` → `security` + `securitySchemes` bearer/cookie/httpsig (when the block has `auth with`) + `401`; `rate_limit` → `429` + `x-synsema-rate-limit {count, window}`/`"unlimited"`; `stream` → `text/event-stream` + `x-synsema-streaming`; `proxy to` → `x-synsema-proxy`; last `give` of `html()/render()/page()` → `text/html`, `content()` → html+markdown+json, `redirect()` → `302`, else `application/json`. NO response schema. `x-synsema-capabilities`: what the operation MAY touch, static and transitive (`require` of called tasks + builtin implications: fetch→net, sql→db, read_file→file.read, reason→llm, remember→memory…), always present (`[]` when none). `describe api:` entry with the exact prefix `"POST /x"` → that operation's `description` | `private` |
 | `/docs` | own HTML page (inline CSS/JS, NO CDN) that reads `/openapi.json`: schema, forms, **Try it** (bearer field in sessionStorage; cookies travel alone). `Accept: text/markdown` → the same reference as Markdown for agents | `private` or `docs off` (keeps `/openapi.json`) |
 | `/.well-known/synsema-auth` | auth mechanisms + protected endpoints (§ Agent identity) | `private` |
+| `/.well-known/agent-card.json` (alias `/.well-known/agent.json`) | **Agent Card** (v0.6.28+): who this server is, in the **exact A2A 1.0 shape** (`message AgentCard` of `a2a.proto`, proto-JSON names — nothing a strict parser rejects): `name`/`description`/`version`/`documentationUrl`, one `skill` per route (`id` = OpenAPI operationId, tags `auth`/`stream`/`socket`, modes), `securitySchemes` (`httpAuthSecurityScheme` / `apiKeySecurityScheme`) + `securityRequirements` when auth is wired, `capabilities.streaming`, and — inside `capabilities.extensions` — the Synsema extension with the server's **`did:key`**, `baseUrl`, `/openapi.json`, `/.well-known/synsema-auth`, `/.well-known/attestation` (under `--attested`), engine version and `capabilityTokens: true`. **`supportedInterfaces` is `[]`** — this server does not speak the A2A transport and the card never claims it. **Signed** (JWS, A2A §8.4: `signatures: [{protected, signature}]` over the JCS of the card, `kid` = the did's verificationMethod URL) when the server has an identity: `SYNSEMA_IDENTITY_KEY` (ed25519 seed, 64 hex, `.env`) → `EdDSA`, or under `serve --attested` the attested P-256 key → `ES256` (card and attestation document then speak of the same key). No key → unsigned and without `did` (nothing is invented) | `private` |
 
 Base URL for absolute links (`Sitemap:`, `<loc>`, OpenAPI `servers`): `domain "…"` of
 the serve block if declared, else the request `Host`; scheme `https` when TLS is on
@@ -1143,6 +1144,26 @@ the verifiers already produce — no adapter needed:
 - **Since v0.6.20 a direct `stream` route with `requires auth` runs with the request's identity
   too** — so the per-identity `spend`/`sign` ceilings apply there (in v0.6.19 they silently did
   not). A service that relied on that gap will now see the ceilings.
+- **Capabilities — the token IS the ceiling (v0.6.28+, breaking on purpose).** When the auth task
+  returns the map of `captoken_verify`, its `caps` become the request's **delegated ceiling**, stacked
+  under the host's: a capability the program declares but the token does not carry is denied at use —
+  `db` in the handler with a token that only says `{"net": …}` fails, `llm` and `judge` included. The
+  client gets **`403 {"error": "insufficient permissions", "status": 403}`**, a fixed body that never names
+  the capability (a login says "credentials don't match", never "the password is wrong"); the detail goes
+  to the server log (`[serve:port] 403 …`) and the audit (`reason: above delegated ceiling (token <id>)`).
+  A denial the program itself caused (no `require`) stays a 500. `stdout`/`time`/`random` are process-local
+  and never token-governed — unless the token says `deterministic: true`, which switches the clock and
+  entropy off for that request. A `llm_tokens` caveat is a delegated LLM budget metered on the token's `id`
+  beside `SYNSEMA_LLM_BUDGET_PER_IDENTITY`. Before v0.6.28 the `caps` were advisory (`captoken_allows`
+  only): a handler that ignored them keeps working only if the token carries what it uses. If you don't want
+  the ceiling, return the identity as text instead of the token map. `errors with` receives the 403 with the
+  generic message.
+- **The subject travels with the ceiling (v0.6.28+).** An agent spawned from a handler, a `parallel_map`
+  worker and a `run_program` child run **on behalf of the same identity**, under the same delegated
+  ceiling, spend limits and LLM budget — `spend` inside a spawned agent is booked to who asked, not to the
+  agent's name. A cron tick runs as `cron:<job>` (never "nobody"), and `synsema run` runs as the operator
+  (`SYNSEMA_IDENTITY`, optional). `SYNSEMA_IDENTITY_KEY` is different: the SERVER's signing key
+  (Agent Card, did) — see § The Agent Card.
 
 ### Signed requests as auth
 
@@ -1172,6 +1193,39 @@ A serve that has auth wired publishes, in JSON, which mechanisms it understands
 algorithms) and which endpoints are protected. It's the machine-readable companion
 to `/llms.txt`: an agent that never read your docs can still figure out how to
 authenticate. `private` hides it, exactly like `/llms.txt`.
+
+### The Agent Card — `/.well-known/agent-card.json` (v0.6.28+)
+
+Who this server is, for another agent or an on-chain registry (ERC-8004 points its `services`
+at exactly this URL and at the did). Derived from the route table like `/openapi.json`, so it is
+never stale; signed with the server's key so it cannot be swapped by whoever sits between.
+
+```
+SYNSEMA_IDENTITY_KEY=<64 hex>        # .env — the ed25519 seed; did = did_key_encode(pubkey)
+```
+
+Verify one from Synsema, offline (the key comes from the did in the card, no JWKS):
+
+```syn
+let card be json_decode(fetch("https://other.example/.well-known/agent-card.json"))
+let unsigned be {}
+each k in keys(card)
+    when k != "signatures"
+        set unsigned[k] to card[k]
+let sig be card.signatures[0]
+let tok be sig.protected + "." + decode(bytes(canonical_json(unsigned)), "base64url") + "." + sig.signature
+let did be card.capabilities.extensions[0].params.did
+when jwt_verify(tok, {"did": did}, {"now": now()}) == nothing
+    give fail(502, "card signature does not verify")
+```
+
+Reserved like the other discovery paths: a declared literal route at `/.well-known/agent-card.json`
+overrides it (`synsema check` warns on a parametric route that would swallow it). Under `run` there
+is no card; the wasm handler mode publishes no discovery documents at all.
+
+**Receipts under `serve`:** a route can `give receipt({"sign": key, ...})` — the receipt's `id` is
+the request's identity (from `auth with`), `tokens` the captoken ids in force, `capabilities` the
+request's own audit. See builtins.md § Identity documents.
 
 ### Enrolment and revocation (userland patterns)
 

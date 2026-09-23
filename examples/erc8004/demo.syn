@@ -1,0 +1,28 @@
+intent: "ERC-8004 desde Synsema: arma el registration file de un server (Agent Card + did:key) y el calldata de register / setAgentURI / giveFeedback / validationRequest. Correr: synsema run examples/erc8004/demo.syn"
+
+use "./erc8004.syn" as erc
+
+-- La identidad del server: en producción es la de SYNSEMA_IDENTITY_KEY (la misma que firma la
+-- Agent Card); acá, la clave pública del vector de prueba 1 de RFC 8032 (ed25519).
+let did be did_key_encode(bytes("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "hex"))
+
+let agent be {"name": "Demo agent", "description": "a Synsema service", "image": "https://demo.example/logo.png"}
+let services be erc.synsema_services("https://demo.example", did)
+let registrations be [{"agentId": 22, "agentRegistry": "eip155:1:0x0000000000000000000000000000000000000000"}]
+let file be erc.registration_file(agent, services, registrations, ["reputation", "tee-attestation"])
+print("registration file: " + canonical_json(file))
+
+-- register(string agentURI): el archivo como data URI (o la URL donde lo publiques).
+let uri be erc.agent_uri_data(file)
+let calldata be erc.register_calldata(uri)
+print("register selector: " + decode(slice(calldata, 0, 4), "hex") + " (" + text(length(calldata)) + " bytes)")
+print("setAgentURI selector: " + decode(abi_selector("setAgentURI(uint256,string)"), "hex"))
+
+-- giveFeedback: 87.5 con un decimal, sobre la Agent Card, con un recibo como evidencia.
+let evidence be {"receipt": "https://reviews.example/22/1.json", "score": 87.5}
+let fb be erc.give_feedback_calldata(22, 875, 1, "quality", "", "https://demo.example/.well-known/agent-card.json", "https://reviews.example/22/1.json", erc.document_hash(evidence))
+print("giveFeedback selector: " + decode(slice(fb, 0, 4), "hex") + " (" + text(length(fb)) + " bytes)")
+
+-- validationRequest: un validador, el agente, y el documento a validar (un recibo firmado).
+let req be erc.validation_request_calldata("0x000000000000000000000000000000000000dead", 22, "https://demo.example/receipts/1.json", erc.document_hash({"receipt": 1}))
+print("validationRequest selector: " + decode(slice(req, 0, 4), "hex") + " (" + text(length(req)) + " bytes)")

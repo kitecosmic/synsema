@@ -703,7 +703,7 @@ pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilityS
                             &Capability::new(CapabilityType::FileRead, Some(p.clone())),
                             "mtls_identity()",
                         )
-                        .map_err(|v| Control::Error(RuntimeError::new(v.message)))?;
+                        .map_err(|v| Control::Error(v.into_error()))?;
                 }
                 let certs = load_client_certs(&cert_path)?;
                 let key = load_client_key(&key_path)?;

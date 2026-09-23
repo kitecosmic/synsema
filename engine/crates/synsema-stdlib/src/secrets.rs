@@ -282,6 +282,11 @@ fn resolve(env: &EnvStore, name: &str, default: Option<&SynValue>) -> Option<Str
 /// techo del host → lo dice, porque agregar el `require` que ya está no arregla nada
 /// (un agente que se auto-repara con el mensaje viejo entraba en loop).
 fn cap_denied(kind: &str, name: &str, cause: DenyCause) -> Control {
+    if let DenyCause::Delegated(_) = &cause {
+        let ty = if kind == "env" { CapabilityType::Env } else { CapabilityType::Secret };
+        let cap = Capability::new(ty, Some(name.to_string()));
+        return Control::Error(CapabilitySet::violation(&cap, cause, "secret-builtin").into_error());
+    }
     if cause == DenyCause::AboveCeiling {
         return Control::Error(RuntimeError::new(format!(
             "{kind}(\"{name}\") not permitted: declared but above the host ceiling (--sandbox/--cap-set). The program cannot fix this; the host must widen the ceiling"
@@ -736,6 +741,10 @@ pub fn register_secret_builtins(
                 {
                     // Auditar el intento DENEGADO (best-effort: ya se rechaza igual).
                     let _ = write_audit_entry(&name, loc, false);
+                    if let DenyCause::Delegated(_) = &cause {
+                        let cap = Capability::new(CapabilityType::Reveal, Some(name.clone()));
+                        return Err(Control::Error(CapabilitySet::violation(&cap, cause, "secret-builtin").into_error()));
+                    }
                     if cause == DenyCause::AboveCeiling {
                         return Err(Control::Error(RuntimeError::new(format!(
                             "reveal() not permitted: reveal(\"{name}\") is declared but above the host ceiling (--sandbox/--cap-set). The program cannot fix this; the host must widen the ceiling"

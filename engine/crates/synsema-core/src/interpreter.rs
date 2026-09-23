@@ -66,14 +66,20 @@ pub struct RuntimeError {
     /// programa no puede hacerse pasar por un diagnóstico para esquivar la redacción.
     /// Tampoco es atrapable: el veredicto del enforcement no se recupera.
     pub from_labels: bool,
+    /// T1 (identidad): la capability la denegó el TECHO DELEGADO de un captoken — el programa
+    /// la declara, el token del caller no la concede. Bajo `serve` es la culpa del caller: la
+    /// respuesta es un **403 genérico** (`insufficient permissions`), no un 500, y el detalle
+    /// queda sólo en el log y el audit del server. Se distingue por este flag y NUNCA por el
+    /// texto (lo pone `CapabilityViolation::into_error`, el único conversor).
+    pub denied_by_token: bool,
 }
 
 impl RuntimeError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), location: None, is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false }
+        Self { message: message.into(), location: None, is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false }
     }
     pub fn at(message: impl Into<String>, location: SourceLocation) -> Self {
-        Self { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false }
+        Self { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false }
     }
     /// El texto de este error **hacia un cliente REMOTO** (el cuerpo de una respuesta HTTP, el
     /// evento final de un stream): igual que `Display`, pero la ubicación viaja con el NOMBRE del
@@ -100,15 +106,15 @@ impl RuntimeError {
     /// Error de validación de cliente (input que no cumple `expect`): se mapea a HTTP 400
     /// con el nombre del campo ofensor, en vez de a un 500 genérico.
     pub fn validation(message: impl Into<String>, field: Option<String>) -> Self {
-        Self { message: message.into(), location: None, is_validation: true, field, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false }
+        Self { message: message.into(), location: None, is_validation: true, field, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false }
     }
     /// Falla de aserción (`assert*`): marca `is_assertion` para el reporte de tests.
     pub fn assertion(message: impl Into<String>) -> Self {
-        Self { message: message.into(), location: None, is_validation: false, field: None, is_assertion: true, from_private_pc: false, redact_label: String::new(), from_labels: false }
+        Self { message: message.into(), location: None, is_validation: false, field: None, is_assertion: true, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false }
     }
     /// Diagnóstico del sistema de etiquetas (`from_labels`), con ubicación.
     pub fn labels(message: impl Into<String>, location: SourceLocation) -> Self {
-        Self { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: true }
+        Self { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: true, denied_by_token: false }
     }
     /// ¿Este error NO se puede atrapar con `try/recover` ? Un salto de control desde PC
     /// privado sería un bit observable por iteración, y el veredicto del enforcement no se
@@ -353,6 +359,12 @@ pub type GrantHook = Rc<dyn Fn(&str, Option<&str>)>;
 /// `true` al entrar (deniega TODAS las capabilities), `false` al salir (restaura).
 /// Maneja sandboxes anidados (stack en el closure).
 pub type SandboxHook = Rc<dyn Fn(bool)>;
+/// Hook de `sandbox under <caps>` (T1 del spec de identidad): `Some(valor)` al entrar —
+/// el valor es el map de capabilities (o el map que devolvió `captoken_verify`) y el host
+/// lo apila como TECHO delegado sobre el CapabilitySet; `None` al salir (lo desapila).
+/// `Err(texto)` si el valor no es un techo válido (nombre de capability desconocido…).
+/// Core no conoce `Capability`: el host interpreta el valor.
+pub type CeilingHook = Rc<dyn Fn(Option<&SynValue>) -> Result<(), String>>;
 
 // --- FASE 1 tool-calling: el callback de paso del LLM (tipos PLANOS) ---
 // core NO depende de `synsema-llm` (la dep va al revés vía runtime). Igual que
@@ -503,8 +515,19 @@ impl Default for CancelToken {
     }
 }
 /// Hook de `spawn`: (agente, body, args, snapshot de globals) → instance_id.
-pub type SpawnHook =
-    Rc<dyn Fn(&str, Vec<Node>, Vec<(String, SynValue)>, Vec<(String, SynValue)>) -> Result<String, Control>>;
+pub type SpawnHook = Rc<
+    dyn Fn(&str, Vec<Node>, Vec<(String, SynValue)>, Vec<(String, SynValue)>, SpawnSubject) -> Result<String, Control>,
+>;
+
+/// T1 (identidad): lo que el intérprete sabe del SUJETO de la unidad de trabajo en curso y
+/// que el agente spawneado hereda — la identidad autenticada y su techo de gasto delegado.
+/// (El techo delegado de capabilities y el presupuesto LLM viven fuera de core: el motor
+/// los captura del CapabilitySet y del hilo al recibir esto.)
+#[derive(Clone, Debug, Default)]
+pub struct SpawnSubject {
+    pub identity: Option<String>,
+    pub spend_limits: Vec<(String, String)>,
+}
 
 /// Hooks que el host (motor) cablea para conectar `share`/`observe`/`signal`/
 /// `wait_for`/`spawn` al swarm real (blackboard + señales + hilos). Espejan los
@@ -637,6 +660,9 @@ pub struct Interpreter {
     /// dentro de un sandbox es no-op (no se puede re-grantear para escapar).
     sandbox_depth: u32,
     sandbox_hook: Option<SandboxHook>,
+    /// Hook de `sandbox under <caps>`: apila/desapila un techo delegado (lo instala el
+    /// motor con el CapabilitySet). Sin él, `sandbox under` es un error claro.
+    ceiling_hook: Option<CeilingHook>,
     /// Hook de aislamiento por-tool (least-privilege en `call_tool`). Lo instala el
     /// motor con el CapabilitySet. Sin él: las tools corren con las caps ambientes.
     tool_scope_hook: Option<ToolScopeHook>,
@@ -679,7 +705,7 @@ pub struct Interpreter {
     /// `require llm` antes de CUALQUIER op LLM (provider real o placeholder).
     /// `Err(msg)` → la op falla con `Capability not granted: llm`. Sin él: sin gate
     /// (core no depende de capabilities; el motor provee la lógica).
-    llm_cap_hook: Option<Rc<dyn Fn() -> Result<(), String>>>,
+    llm_cap_hook: Option<Rc<dyn Fn() -> Result<(), RuntimeError>>>,
     /// Callback de `judge` (ver [`JudgeCallback`]). Sin él: offline, `available: false`.
     judge_callback: Option<JudgeCallback>,
     /// `judge_usage()`: tokens de entrada acumulados del proceso. Sin él: 0.
@@ -687,7 +713,7 @@ pub struct Interpreter {
     /// `judge_model()`: id versionado que contestó la última llamada. Sin él: nothing.
     judge_model_callback: Option<Rc<dyn Fn() -> Option<String>>>,
     /// Gate de la capability `judge` (propia: no la concede `llm`). Lo cablea el motor.
-    judge_cap_hook: Option<Rc<dyn Fn() -> Result<(), String>>>,
+    judge_cap_hook: Option<Rc<dyn Fn() -> Result<(), RuntimeError>>>,
     /// `SYNSEMA_JUDGE_DECIDE=1`: `decide between […] given X` se sirve con el juez (una pregunta
     /// `choose`) en vez del LLM. Opt-in del host; sin provider de judge cae al camino LLM.
     decide_via_judge: bool,
@@ -731,7 +757,7 @@ pub struct Interpreter {
     /// —bypass del modelo entero—. Lo cablea el motor con el CapabilitySet; recibe el path
     /// CRUDO (como se escribió en `render`/`{ include }`) para que el scope coincida con
     /// `read_file`. Los assets del bundle NO pasan por acá (son el programa).
-    template_read_hook: Option<Rc<dyn Fn(&str) -> Result<(), String>>>,
+    template_read_hook: Option<Rc<dyn Fn(&str) -> Result<(), RuntimeError>>>,
     /// Nombres de variables de entorno que Synsema considera SECRETAS (claves de
     /// proveedor LLM, el webhook humano, y las cargadas del `.env`): `run()`/`proc_spawn`
     /// las QUITAN del entorno del proceso hijo (a menos que el programa las pase explícito
@@ -869,6 +895,7 @@ impl Interpreter {
             grant_hook: None,
             sandbox_depth: 0,
             sandbox_hook: None,
+            ceiling_hook: None,
             tool_scope_hook: None,
             tool_scope_depth: 0,
             intent: None,
@@ -1592,7 +1619,7 @@ impl Interpreter {
     }
 
     /// Instala el gate de lectura de templates a disco (`render`/`include`/`layout`).
-    pub fn set_template_read_hook(&mut self, hook: Rc<dyn Fn(&str) -> Result<(), String>>) {
+    pub fn set_template_read_hook(&mut self, hook: Rc<dyn Fn(&str) -> Result<(), RuntimeError>>) {
         self.template_read_hook = Some(hook);
     }
 
@@ -1612,7 +1639,7 @@ impl Interpreter {
     /// (usos standalone/tests del core) es no-op — el motor siempre lo cablea.
     pub fn gate_template_read(&self, raw_path: &str) -> Result<(), Control> {
         if let Some(hook) = &self.template_read_hook {
-            hook(raw_path).map_err(|m| Control::Error(RuntimeError::new(m)))?;
+            hook(raw_path).map_err(Control::Error)?;
         }
         Ok(())
     }
@@ -1797,6 +1824,11 @@ impl Interpreter {
         self.sandbox_hook = Some(hook);
     }
 
+    /// Cablea el hook de `sandbox under <caps>` (techo delegado por bloque).
+    pub fn set_ceiling_hook(&mut self, hook: CeilingHook) {
+        self.ceiling_hook = Some(hook);
+    }
+
     /// Cablea el hook de aislamiento por-tool (least-privilege en `call_tool`).
     pub fn set_tool_scope_hook(&mut self, hook: ToolScopeHook) {
         self.tool_scope_hook = Some(hook);
@@ -1858,8 +1890,10 @@ impl Interpreter {
         self.llm_usage_callback = Some(cb);
     }
 
-    /// Cablea el gate de capability para las ops LLM (exige `require llm`).
-    pub fn set_llm_cap_hook(&mut self, hook: Rc<dyn Fn() -> Result<(), String>>) {
+    /// Cablea el gate de capability para las ops LLM (exige `require llm`). El hook
+    /// devuelve el `RuntimeError` ya armado (con sus flags: `denied_by_token`…), no un texto:
+    /// el status HTTP de una denegación jamás se decide por el mensaje.
+    pub fn set_llm_cap_hook(&mut self, hook: Rc<dyn Fn() -> Result<(), RuntimeError>>) {
         self.llm_cap_hook = Some(hook);
     }
 
@@ -1878,13 +1912,13 @@ impl Interpreter {
 
     /// Gate de la capability `judge`: `Err(msg)` → el bloque falla con `Capability not
     /// granted: judge`. Propia, no la concede `require llm`.
-    pub fn set_judge_cap_hook(&mut self, hook: Rc<dyn Fn() -> Result<(), String>>) {
+    pub fn set_judge_cap_hook(&mut self, hook: Rc<dyn Fn() -> Result<(), RuntimeError>>) {
         self.judge_cap_hook = Some(hook);
     }
 
     fn check_judge_cap(&self) -> Result<(), Control> {
         if let Some(hook) = &self.judge_cap_hook {
-            hook().map_err(|m| Control::Error(RuntimeError::new(m)))?;
+            hook().map_err(Control::Error)?;
         }
         Ok(())
     }
@@ -1945,7 +1979,7 @@ impl Interpreter {
     /// con o sin provider real. Sin gate cableado: no-op (no rompe `Interpreter::new`).
     fn check_llm_cap(&self) -> Result<(), Control> {
         if let Some(hook) = &self.llm_cap_hook {
-            hook().map_err(|m| Control::Error(RuntimeError::new(m)))?;
+            hook().map_err(Control::Error)?;
         }
         Ok(())
     }
@@ -3893,7 +3927,13 @@ impl Interpreter {
                                 .map(|(k, v)| (k.clone(), v.clone()))
                                 .collect()
                         };
-                        let id = spawn(agent_name, def.0, spawn_args, global_vals)?;
+                        // T1: el agente corre EN NOMBRE de quien pidió (la identidad viaja
+                        // con el techo), no "como el agente".
+                        let subject = SpawnSubject {
+                            identity: self.request_identity.clone(),
+                            spend_limits: self.request_spend_limits.clone(),
+                        };
+                        let id = spawn(agent_name, def.0, spawn_args, global_vals, subject)?;
                         Ok(syn_text(id))
                     }
                     // Sin swarm: ejecución in-process (bloqueante), fallback.
@@ -4036,7 +4076,7 @@ impl Interpreter {
                 }
                 Ok(SynValue::Nothing)
             }
-            NodeKind::SandboxBlock { body, .. } => {
+            NodeKind::SandboxBlock { body, under: None } => {
                 // Aislamiento real: durante el cuerpo, todas las capabilities quedan
                 // DENEGADAS (el hook vacía el CapabilitySet; `require` es no-op). Se
                 // restaura al salir, también en el camino de error. El `print` no está
@@ -4050,6 +4090,30 @@ impl Interpreter {
                 if let Some(hook) = self.sandbox_hook.clone() {
                     hook(false);
                 }
+                self.sandbox_depth -= 1;
+                result
+            }
+            NodeKind::SandboxBlock { body, under: Some(caps_expr) } => {
+                // `sandbox under <caps>` (T1 del spec de identidad): el cuerpo corre bajo un
+                // TECHO delegado = caps ∩ lo vigente. No vacía nada: lo que el bloque no lista
+                // se deniega, lo que lista sigue gateado por los grants del programa y por los
+                // techos de arriba (host, token de la request). `caps` es el map que devolvió
+                // `captoken_verify` (el bloque queda bajo ESE token) o un map literal de mínimo
+                // privilegio. `require` adentro sigue siendo no-op (mismo `sandbox_depth`).
+                let caps_val = self.exec(caps_expr, env)?;
+                let Some(hook) = self.ceiling_hook.clone() else {
+                    return Err(Control::Error(RuntimeError::at(
+                        "`sandbox under` needs a host that installs capability ceilings; this host does not (run the program with the synsema binary or a wasm host with capabilities)",
+                        loc.clone(),
+                    )));
+                };
+                hook(Some(&caps_val)).map_err(|m| Control::Error(RuntimeError::at(m, loc.clone())))?;
+                let sandbox_env = Environment::child(env, "sandbox");
+                self.sandbox_depth += 1;
+                let result = self.exec_block(body, &sandbox_env);
+                // Se desapila también en el camino de error: un techo de bloque jamás
+                // sobrevive al bloque.
+                let _ = hook(None);
                 self.sandbox_depth -= 1;
                 result
             }

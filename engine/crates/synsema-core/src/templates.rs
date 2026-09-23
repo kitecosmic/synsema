@@ -917,7 +917,15 @@ fn check_program_static_inner(
         // (b) una ruta `GET /:x` de un segmento tapa las URLs reservadas del runtime; desde
         //     v0.6.20 el runtime las sirve primero, y acá se dice para que el autor lo sepa.
         if !is_module {
-            const RESERVED: [&str; 5] = ["/openapi.json", "/docs", "/llms.txt", "/sitemap.xml", "/robots.txt"];
+            const RESERVED: [&str; 7] = [
+                "/openapi.json",
+                "/docs",
+                "/llms.txt",
+                "/sitemap.xml",
+                "/robots.txt",
+                "/.well-known/agent-card.json",
+                "/.well-known/agent.json",
+            ];
             for stmt in &program.statements {
                 if let NK::ServeBlock { routes, .. } = &stmt.kind {
                     let literal_get: Vec<&str> = routes

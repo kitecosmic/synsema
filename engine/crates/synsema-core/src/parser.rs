@@ -1245,18 +1245,29 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         // lo que le pasa a un bloque que arranca explicando que hace, o sea a casi todos los de
         // la documentacion. `task`/`when`/`each` no lo tenian porque usan `parse_block`, que
         // hace `skip_newlines` primero; aca se mira igual, sin consumir.
+        // `sandbox under <caps>` + bloque indentado (T1 del spec de identidad): el cuerpo
+        // corre bajo un techo delegado en vez de sin capabilities. `under` no es palabra
+        // reservada: sólo cuenta como esta forma si le sigue una expresión en la misma línea
+        // (un `sandbox under` con `under` a fin de línea es la forma inline con una variable
+        // llamada así, como siempre).
+        if self.peek_word(0, "under") && !matches!(self.peek(1).ty, TokenType::Newline | TokenType::Eof) {
+            self.advance(); // consume 'under'
+            let caps = self.parse_expression()?;
+            if !(self.check(TokenType::Newline) && self.indent_after_newlines()) {
+                return Err(ParseError::new(
+                    "sandbox under <caps> needs an indented body on the next line (the block that runs under that ceiling)",
+                    loc,
+                ));
+            }
+            let body = self.parse_block()?;
+            return Ok(Node::new(loc, NodeKind::SandboxBlock { body, under: Some(Box::new(caps)) }));
+        }
         let body = if self.check(TokenType::Newline) && self.indent_after_newlines() {
             self.parse_block()?
         } else {
             vec![self.parse_expression()?]
         };
-        Ok(Node::new(
-            loc,
-            NodeKind::SandboxBlock {
-                body,
-                allowed_capabilities: Vec::new(),
-            },
-        ))
+        Ok(Node::new(loc, NodeKind::SandboxBlock { body, under: None }))
     }
 
     /// `invariant: expr` o `invariant "descripción": expr`. Un Text justo después de la palabra

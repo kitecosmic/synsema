@@ -30,7 +30,7 @@ fn mongo_db_open_deny_without_require() {
     assert!(!r.success);
     assert_eq!(
         r.errors,
-        vec!["Runtime error: Capability not granted: db(\"mongodb://localhost/appdb\")".to_string()]
+        vec!["Runtime error: Capability not granted: db(\"mongodb://localhost/appdb\") — this is a permission, not a bug: add `require db(\"mongodb://localhost/appdb\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
     );
 }
 
@@ -44,7 +44,7 @@ fn mongo_scope_mismatch_deny() {
     assert!(!r.success);
     assert_eq!(
         r.errors,
-        vec!["Runtime error: Capability not granted: db(\"mongodb://localhost/otra\")".to_string()]
+        vec!["Runtime error: Capability not granted: db(\"mongodb://localhost/otra\") — this is a permission, not a bug: add `require db(\"mongodb://localhost/otra\")` to the program's preamble (or to the importing file, when this code runs in a module)".to_string()]
     );
 }
 

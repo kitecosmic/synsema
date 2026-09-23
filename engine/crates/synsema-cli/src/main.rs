@@ -2005,6 +2005,53 @@ fn run_serve_watch(entry: &str) -> ExitCode {
 }
 
 /// check <archivo.syn>: parsea sin ejecutar; reporta cantidad de statements o el error.
+/// Los avisos de capabilities de `check` (T1): reusa el contrato por archivo de `synsema code
+/// caps` (declaradas / necesarias / faltantes, con importadores transitivos) y lo vuelca en
+/// una línea por capability faltante. Las ambiente bajo `run` (`time`, `llm`, `stdout`) no
+/// gritan: se auto-conceden ahí y `code caps` las marca aparte.
+fn capability_warnings(path: &str) -> Vec<String> {
+    use synsema_core::codeintel::{caps, Root};
+    let p = std::path::Path::new(path);
+    let dir = p
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let Some(file_name) = p.file_name().and_then(|s| s.to_str()) else { return Vec::new() };
+    let report = caps(&Root::new(dir), Some(file_name));
+    let mut out = Vec::new();
+    let Some(files) = report["files"].as_array() else { return out };
+    for f in files {
+        let rel = f["file"].as_str().unwrap_or(path);
+        let Some(missing) = f["missing"].as_array() else { continue };
+        for m in missing {
+            if m["ambient"].as_bool().unwrap_or(false) {
+                continue;
+            }
+            let cap = m["cap"].as_str().unwrap_or("?");
+            let scope = m["scope"].as_str().map(|s| format!("(\"{}\")", s)).unwrap_or_default();
+            let hint = m["hint"].as_str().unwrap_or("");
+            let by: Vec<String> = m["needed_by"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .map(|b| format!("{} (line {})", b["symbol"].as_str().unwrap_or("?"), b["line"]))
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(format!(
+                "warning: {}: {}{} is used by {} but no `require` grants it — {}. A module's needs are declared by the file that imports it.",
+                rel,
+                cap,
+                scope,
+                by.join(", "),
+                hint
+            ));
+        }
+    }
+    out
+}
+
 fn cmd_check(args: &[String]) -> ExitCode {
     let path = match args.get(2) {
         Some(p) => p.clone(),
@@ -2051,6 +2098,15 @@ fn cmd_check(args: &[String]) -> ExitCode {
                         );
                     }
                     for w in &warnings {
+                        eprintln!("{}", w);
+                    }
+                    // T1 (DX, §10.3 del spec de identidad): lo que el programa —o una task de un
+                    // módulo que importa— necesita y ningún `require` concede, con el `require`
+                    // exacto. El equivalente al "no importaste el tipo": el importador declara
+                    // (un `require` top-level en un módulo es error), y acá se entera ANTES de
+                    // que el runtime le diga "Capability not granted". Aviso, no error: un módulo
+                    // puede exponer tasks que este programa no llama.
+                    for w in capability_warnings(&path) {
                         eprintln!("{}", w);
                     }
                     ExitCode::SUCCESS
