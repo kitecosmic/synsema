@@ -28,7 +28,7 @@ print("Mas barato: " + name of (by_price[0]))
 
 -- 5. Agrupar por categoría  (group_by + lambda key)
 let groups be group_by(catalog, (p) => cat of p)
-print("Categorias: " + text(length(keys(groups))))
+print("Categorias: " + text(length(groups)))       -- [{key, items}], una entrada por categoría
 
 -- 6. ¿Hay algo premium?  (some + lambda)
 print("Algo > $1000? " + text(some(catalog, (p) => price of p > 1000)))

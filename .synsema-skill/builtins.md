@@ -2,9 +2,11 @@
 
 > **This file is dense — jump to the `## ` section you need instead of reading it all:**
 > Core · Error handling (`try`/`recover`/`raise`) · **Renamed in v0.6.29** (old → new names) · Strings · Regex · Bytes / binary (hashing,
-> blockchain encoders, WebSocket client) · JSON · CSV · Math · Numeric arrays + linear algebra ·
-> Assertions / tests · Config & secrets · Web auth (passwords, JWT, TOTP) · Agent identity & auth ·
-> Spend ledger · Intentional operations (replace loops) · I/O · HTTP · Database ·
+> blockchain encoders, WebSocket client) · JSON (+ JSON Lines) · CSV · Parquet · Math (**reductions:
+> the common rules**) · Numeric arrays + linear algebra · Statistics and fitting ·
+> Assertions / tests · Config & secrets · Web auth (passwords, JWT, TOTP) · Agent identity & auth
+> (receipts + **lineage**) · Spend ledger · Intentional operations (replace loops) · **Tables — data
+> analysis** · **Dates, instants and durations** · **Seeded randomness** · I/O · HTTP · Database ·
 > HTTP server (serve) · Cron · Agent operations
 
 ## Core
@@ -32,11 +34,11 @@
 - `split(text, separator)` → list. `split(text, "")` → the **characters** (Unicode scalars) — v0.6.20+ (before: an error)
 - `reverse(list | text)` → a NEW list in reverse order; on text, the characters reversed (by Unicode scalar, not grapheme-aware) — v0.6.20+, pure. Anything else is a clear error
 - `steps()` → number (v0.6.20+) — statements the interpreter executed so far in this program. Counts nodes, not time: the same program gives the same number every run (a deterministic cost for metering/tests/fuel-style limits). No capability (introspection, like `llm_usage()`), every profile. `run --format json` reports the total as `steps`
-- `join(list, separator)` → text
+- `join(list, separator)` → text. With **2 arguments** it joins TEXT; with 3–4 (`join(left, right, on, how?)`, v0.6.29+) it joins **tables** — see § Tables
 - `range(end)` or `range(start, end)` or `range(start, end, step)` → list. Every argument must be an integer (`2.0` is fine): `range(0, 2.5)` / `range(0, 1, 0.25)` → error `… must be an integer, got …` (v0.6.29+)
-- `type_of(value)` → text ("number", "decimal", "complex", "text", "bytes", "bool", "list", "map", "array", "task", "nothing")
-- `slice(collection, start, end?)` → sub-collection (lists/text/`bytes`; Python-style negatives)
-- `length(x)` also works on `bytes` (byte count) and `array` (total elements). Indexing `x[i]` works on lists, maps, `bytes` (→ int 0–255), `array` (→ row or scalar) and — v0.6.29+ — **text** (`s[i]` = one character, counted like `length`). Negative indexes count from the end (`xs[-1]`, `b[-1]`, `"abc"[-1]` → `"c"`). An index must be an integer: `xs[1.7]` → `index must be an integer, got 1.7` (`xs[1.0]` is fine).
+- `type_of(value)` → text ("number", "decimal", "complex", "text", "bytes", "bool", "list", "map", "array", "task", "nothing", and — v0.6.29+ — "date", "datetime", "duration")
+- `slice(collection, start, end?)` → sub-collection (lists/text/`bytes`; Python-style negatives). On an `array` (v0.6.29+) it slices **rows** (axis 0): `slice(array([[1,2],[3,4]]), -1)` → `[[3, 4]]`
+- `length(x)` also works on `bytes` (byte count) and `array` — the **first dimension**, like numpy's `len` (v0.6.29+: `length(array([[1,2],[3,4]]))` → `2`; before, it errored); `size(a)` is the total number of elements. Indexing `x[i]` works on lists, maps, `bytes` (→ int 0–255), `array` (→ row or scalar) and — v0.6.29+ — **text** (`s[i]` = one character, counted like `length`). Negative indexes count from the end (`xs[-1]`, `b[-1]`, `"abc"[-1]` → `"c"`). An index must be an integer: `xs[1.7]` → `index must be an integer, got 1.7` (`xs[1.0]` is fine).
 - **Calls check their arity** (v0.6.29+). A task or lambda called with too few arguments → `task 'f' is missing argument 'b' — pass it, or give the parameter a default`; too many → `task 'f' takes 1 argument, got 3`. A builtin given more than its maximum → `append() takes at most 2 arguments, got 3` (before, the extras were silently dropped — `trim(s, "x")`, `json_encode(x, 2)`, `upper("a", "b")`). Builtins take arguments **by position**: `f(x = …)` on one that has no named form → `f() does not accept named arguments (got x = …); pass it by position`. The named forms are the documented ones (`sort`/`sort_by` `desc = true`, `recall(from = …)`, …). Callbacks invoked BY a builtin or the host (`apply`/`where`/`reduce`, route handlers, cron, `errors with`) still receive what they get — the callback declares only what it uses.
 - `raise(message)` → **always raises a runtime error** with `message` (coerced to text). Use it to fail deliberately, or to **re-propagate** a caught error inside `recover` (see below). `raise()` with no arg errors. (`fail(...)` is for HTTP responses, NOT for raising runtime errors.) The statement form **`raise "msg"` / `raise err`** (no parens) also works — it desugars to the same call — and a bare `raise` alone is a loud parse error. ⚠️ **On engine ≤ v0.5.1 the no-parens form silently did NOTHING** (it parsed as two inert expressions); on those binaries always use `raise("msg")`.
 - `read_line(prompt?)` → text — read one line from stdin (CLI). Optional `prompt` is printed first (no newline; it's output, so under a `--cap-set` without `stdout` it's denied — v0.6.14+). Returns the line without the trailing newline; `nothing` on EOF. Works with a TTY **and** piped/redirected input (`printf 'x\n' | synsema run f.syn`) — unlike free-text `ask`. Under `synsema run` pending `print` output is already on screen before the prompt (v0.6.29+ writes each `print` immediately; older engines auto-flushed here), so a `read_line` loop is a real interactive REPL. It reads stdin in any mode. See [human.md](human.md).
@@ -233,6 +235,8 @@ and the `run --attest` artefact are in [attestation.md](attestation.md); the dat
 - `json_for_script(value)` → text: same JSON but with `<`, `>`, `&` escaped as `\u00XX` — **the safe way to embed data in an inline `<script>`** (`{ raw json_for_script(x) }`); a value containing `</script>` cannot break out of the tag.
 - `json_decode(text)` → value: parse a JSON string to a Synsema value (object→map, array→list, number→number, etc.). Integers of **any size stay exact** (v0.6.29+: `{"id": 12345678901234567890}`, a uint256 — they used to become floats); a number with `.` or an exponent is a float. Errors clearly on invalid JSON; `json_decode(text, default)` returns `default` instead (see **Total variants** above).
 - Round-trippable: `json_decode(json_encode(x))` reconstructs `x` (the idiomatic way to store structured data in a Redis/text value: `redis_set(k, json_encode({...}))`).
+- Dates (v0.6.29+): a `date`/`datetime`/`duration` encodes as its **ISO text** — `json_encode({"when": date(2026, 1, 31)})` → `{"when": "2026-01-31"}`. JSON has no date type, so `json_decode` gives the text back: re-type it with `date(x)` / `datetime(x)`.
+- **JSON Lines** (v0.6.29+, pure): `jsonl_encode(items)` → text, one JSON value per line, **every line ends with `\n`** (the list's items may be maps, lists, numbers…). `jsonl_decode(text)` → list; blank lines are skipped; a bad line → error **naming the line number**. `jsonl_decode(text, default)` returns `default` instead of raising (total form). `jsonl_decode(jsonl_encode([{"a": 1}, [2]]))` → `[{a: 1}, [2]]`; `jsonl_decode("{\n", nothing)` → `nothing`. Files: `jsonl_decode(read_file("events.jsonl"))`, `write_file("out.jsonl", jsonl_encode(rows))`.
 
 ## XML / TOML (pure — no capability — v0.6.20+)
 - `xml_parse(text)` → map, **xmltodict convention**: an element is a map, attributes are `@name` keys, a text-only element IS its text, repeated children → a **list**, namespace prefixes kept (`cfdi:Emisor`); root = `{"<root tag>": {...}}`. Malformed → error with `line:col`. DTDs/external entities NOT processed (no XXE). No `xml_encode`.
@@ -240,22 +244,49 @@ and the `run --attest` artefact are in [attestation.md](attestation.md); the dat
 - `toml_encode(map)` → text for JSON-like values; `nothing` refused (`TOML has no null — <key> is nothing (drop the key or give it a value)`), `bytes`/`secret` too.
 
 ## CSV (pure — no capability; see [dataviz.md](dataviz.md))
-- `csv_parse(text, opts?)` → list of maps (first row = headers; the same shape `sql()` returns). RFC 4180 (quoted fields, `""` escapes, CRLF/LF, BOM). Opts: `{headers: false}` → list of lists, `{delimiter: ";"}`, `{numbers: true}` (default is **lossless text**: `"00123"` stays text). Errors carry the line (unclosed quote, uneven fields, duplicate headers, unknown option).
-- `csv_encode(value, opts?)` → text. List of maps (headers = first map's keys) or list of lists. Opts: `{headers: [..]}` (order/subset), `{delimiter}`, `{eol}` (`"\r\n"` default). Minimal quoting; integers without decimals; `nothing` → empty; `bytes` → base64; **secret → `[redacted]`**; nested list/map → error suggesting `json_encode`.
+- `csv_parse(text, opts?)` → list of maps (first row = headers; the same shape `sql()` returns). RFC 4180 (quoted fields, `""` escapes, CRLF/LF, BOM). **An empty field is `nothing`** (missing data — v0.6.29+; it used to be `""`), always, typed or not. Otherwise the default is **lossless text** (`"00123"` stays `"00123"`). Opts:
+  - **`{"types": {"col": "int" | "float" | "decimal" | "text" | "bool" | "date" | "datetime"}}`** (v0.6.29+, the recommended form) — the type of each named column; unnamed columns stay text. `int` = exact integer (`"007"` → `7`), `decimal` = exact (`"1.50"` → `1.50`), `bool` accepts `true/false/1/0/yes/no` (any case), `date` = `YYYY-MM-DD`, `datetime` = ISO 8601 (no zone → UTC). A field that does not fit → error `csv_parse: line 2, column "a": "x" is not a int`. `types` names columns, so it needs headers; a column not in the header → error.
+  - `{"numbers": true}` — the old guess: every numeric-looking field becomes a number (`"007"` → `7`, so ids and zip codes break). Prefer `types`.
+  - `{"headers": false}` → list of lists; `{"delimiter": ";"}`.
+  - Errors carry the line (unclosed quote, uneven fields, duplicate headers, unknown option).
+  - `csv_parse("a,b,c,d\n007,,2026-01-02,1.50\n", {"types": {"a": "int", "c": "date", "d": "decimal"}})` → `[{a: 7, b: nothing, c: 2026-01-02, d: 1.50}]`; untyped: `csv_parse("a,b\n007,\n")` → `[{a: "007", b: nothing}]`.
+- `csv_encode(value, opts?)` → text. List of maps (headers = first map's keys) or list of lists. Opts: `{headers: [..]}` (order/subset), `{delimiter}`, `{eol}` (`"\r\n"` default). Minimal quoting; integers without decimals; `nothing` → empty (so `csv_parse(csv_encode(rows))` gives the `nothing` back); dates/datetimes/durations → their ISO text; `bytes` → base64; **secret → `[redacted]`**; nested list/map → error suggesting `json_encode`.
+
+## Parquet (pure — no capability; v0.6.29+; not in the wasm build)
+Columnar files as written by polars/pandas/Spark/DuckDB. Bytes in, bytes out — the file I/O is `read_file_bytes`/`write_file` with their own capability.
+- `parquet_read(bytes)` → rows (list of maps), typed: Int64 → exact int, Double → float, Decimal → `decimal`, String → text, Binary → `bytes`, Date → `date`, Timestamp → `datetime` (UTC), lists/groups → nested lists/maps, null → `nothing`. Reads zstd / snappy / gzip / lz4 (verified with files written by polars 1.44). Not a Parquet file → error `not a Parquet file`.
+- `parquet_write(rows, opts?)` → bytes. The schema is **inferred per column**, every column OPTIONAL (`nothing` = null): int → INT64, a number with decimals → DOUBLE (a column mixing int and float → DOUBLE), `decimal` → DECIMAL(38, the column's max scale), text → STRING, bool → BOOLEAN, `bytes` → BINARY, `date` → DATE, `datetime` → TIMESTAMP(µs, UTC). `opts.compression` = `"snappy"` (default) | `"zstd"` | `"gzip"` | `"lz4"` | `"none"`. **Errors:** a column that mixes types (`[{"a": 1}, {"a": "x"}]` → `column "a" mixes Int and Text — one type per column`), a nested list/map value (→ `json_encode` that column first), an int beyond 64 bits, a `duration` (→ store `in_units(d, "seconds")`). polars reads what it writes back with the exact types.
+```synsema
+require file.read("./data/*")
+require file.write("./out/*")
+let rows be parquet_read(read_file_bytes("./data/sales.parquet"))
+write_file("./out/clean.parquet", parquet_write(drop_missing(rows), {"compression": "zstd"}))
+```
 
 ## Math (pure — no capability)
 Constants (bare values): `pi`, `tau`, `e`, `inf`, `nan`.
-- magnitude/selection (type-preserving): `abs`, `sign`, `min`, `max`, `clamp`. `abs(complex)` → modulus. `min`/`max` (a list, or variadic `max(a, b, c)`) also take **texts** (all texts: `min(["b", "a"])` → `"a"`); `nothing` values are **skipped** as missing data (`min([3, nothing, 1])` → `1`); any NaN → the result is NaN; all values missing → error (v0.6.29+).
+- magnitude/selection (type-preserving): `abs`, `sign`, `min`, `max`, `clamp`. `abs(complex)` → modulus. `min`/`max` (a list, or variadic `max(a, b, c)`) also take **texts** (all texts: `min(["b", "a"])` → `"a"`); `nothing` values are **skipped** as missing data (`min([3, nothing, 1])` → `1`); any NaN → the result is NaN in **either position** (`min([nan, 3])` and `max([3, nan])` → `nan` — before v0.6.29 the answer depended on where the NaN was); all values missing → error (v0.6.29+). `min`/`max` also take dates, datetimes or durations (all of one type): `min([date(2026, 2, 1), date(2026, 1, 1)])` → `2026-01-01`.
 - floor division: the operator `a // b` (v0.6.29+) — exact for integers of any size, floors like Python (`-7 // 2` → `-4`, `7.5 // 2` → `3.0`); see [syntax.md](syntax.md). `a / b` is always float.
 - roots/powers: `sqrt`, `cbrt`, `hypot`, `pow`. exp/log: `exp`, `ln`, `log10`, `log2`, `log_base`. (no bare `log` — it's a soft keyword; use `ln`/`log10`/`log2`.)
 - trig (radians): `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `radians`, `degrees`.
 - hyperbolic: `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`.
 - number theory (integers): `gcd`, `lcm`, `factorial`.
-- introspection: `is_nan`, `is_infinite`, `is_finite`, `round_to`.
-- aggregates over a list: `sum`, `product`, `mean` (also work on `array`, see below).
-- **descriptive statistics** (list of numbers or `array`; see [dataviz.md](dataviz.md)): `median(x)`, `percentile(x, p)` (p ∈ [0,100], linear interpolation — NumPy default), `histogram(x, bins?)` → `{counts, edges}` (`bins` = int, default 10, or explicit ascending edges; last bin closed). Empty data or NaN → clear error.
+- introspection: `is_nan`, `is_infinite`, `is_finite`.
+- `round_to(x, n)` → `x` rounded to `n` decimal places (v0.6.29+ semantics). A **float** rounds its REAL binary value, like Python's `round(x, n)`: `round_to(2.675, 2)` → `2.67`, `round_to(0.125, 2)` → `0.12` (2.675 is stored as 2.67499…; the old version multiplied by 10ⁿ and got these wrong the other way). A **decimal** rounds in decimal, half to even, and stays decimal: `round_to(1.005d, 2)` → `1.00`. An integer comes back unchanged. For money, use decimals.
+- aggregates over a list or `array`: `sum`, `product`, `mean`, `median`, `percentile`, `quantile`, `std`, `var`, `min`, `max` — all follow **the common rules** below.
+- **descriptive statistics** (see [dataviz.md](dataviz.md)): `median(x)`; `percentile(x, p)` with **p ∈ [0, 100]**; `quantile(x, q)` with **q ∈ [0, 1]** (v0.6.29+; `quantile([1], 50)` → error `… between 0 and 1`) — both linear interpolation, the NumPy default, both take `axis =` on arrays; `percentile(x, 50) == quantile(x, 0.5) == median(x)`. `synsema check` warns on `percentile(x, 0.5)` (a literal p in (0, 1) — "for a fraction use quantile"). `histogram(x, bins?)` → `{counts, edges}` (`bins` = int, default 10, or explicit ascending edges; last bin closed). `mode(xs)` → the most frequent value (any type; first seen wins a tie; `nothing` skipped; empty → error). Correlation, covariance and fits: § Statistics and fitting.
+
+### Reductions — the common rules (v0.6.29+)
+Every reduction (`sum`, `product`, `mean`, `min`, `max`, `median`, `percentile`, `quantile`, `std`, `var`, and the table aggregates `sum_of`/`mean_of`/…) follows the same five rules — the polars/SQL model:
+1. **`nothing` is MISSING data and is skipped**: `mean([1, nothing, 3])` → `2.0`, `median([3, nothing, 1])` → `2.0`. Every value missing → error `every value is missing (nothing)`. An empty list → error, except `sum([])` → `0` and `product([])` → `1`. To make missing loud, check first: `when some(xs, is_missing)`.
+2. **NaN is an invalid result and PROPAGATES**: `sum([1, nan])` → `nan`, `min([nan, 3])` → `nan`, `median` of data with a NaN → `nan` (it used to error). Clean with `fill_nan(xs, 0)` or `where(xs, is_finite)` when a NaN should not poison the result.
+3. **Named axis on arrays**: `sum(m, axis = 0)` (down the columns), `mean(m, axis = -1)` (negatives count from the end). The positional `sum(m, 1)` still works for arrays. `axis` on a LIST → error `axis applies to arrays`.
+4. **`std`/`var` are SAMPLE statistics by default (`ddof = 1`)** — the same as pandas, polars, R, Python's `statistics.stdev` and Excel `STDEV.S`: `std([1, 2, 3, 4])` → `1.2909944487358056`, `var([1, 2, 3, 4])` → `1.6666666666666667`. The **population** form (numpy's default, Excel `STDEV.P`) is `std(xs, ddof = 0)` → `1.118033988749895`. Fewer than `ddof + 1` values → `nan`. Lists and arrays, with `axis`: `std(m, axis = 0, ddof = 0)`. ⚠️ Before v0.6.29 they were population — `synsema check` warns where you call them.
+5. **Decimals stay decimal**: `mean([1.5d, 2.5d])` → `2.0` (decimal), `median([1d, 2d, 4d, 8d])` → `3` (decimal), `sum([0.1d, 0.2d])` → `0.3` exactly.
+
+`ddof` is **named-only**: the population form is `std(xs, ddof = 0)`, never a positional `0` (the positional second argument of a reduction is the array axis).
 - **Special functions:** `gamma`, `lgamma`, `erf`, `erfc`, `beta` (real-only; via `libm`).
-- **Polymorphic:** `sqrt`/`exp`/`ln`/`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/hyperbolics accept a real **or** a `complex`. Real arg → real result (unchanged: `sqrt(-1)` → NaN). Complex arg → complex (cmath): `sqrt(complex(-1,0))` → `complex(0,1)`, `exp(complex(0, pi))` ≈ `-1`.
+- **Polymorphic:** `sqrt`/`exp`/`ln`/`sin`/`cos`/`tan`/`asin`/`acos`/`atan`/hyperbolics accept a real **or** a `complex`. Real arg → real result (unchanged: `sqrt(-1)` → NaN). Complex arg → complex (cmath): `sqrt(complex(-1,0))` → `complex(0,1)`, `exp(complex(0, pi))` ≈ `-1`. They also take an **`array`** and apply elementwise (v0.6.29+; see arrays below).
 
 ### Complex numbers
 - `complex(re, im)` → complex; `real(z)` / `imag(z)` → float; `conj(z)`, `arg(z)` (phase), `is_complex(x)`. Fluid arithmetic with real promotion (`3 + complex(0,2)`); `complex(0,1)**2` == `-1+0i` (exact). `complex(a,0) == a`; **not ordered** (`<`/`>` → error).
@@ -263,10 +294,19 @@ Constants (bare values): `pi`, `tau`, `e`, `inf`, `nan`.
 ## Numeric arrays + linear algebra (pure — no capability)
 n-dimensional f64 arrays (NumPy-equivalent core).
 - **Construct:** `array(nested_list)`, `zeros(shape)`, `ones(shape)`, `full(shape, v)`, `arange(start, stop, step?)`, `linspace(start, stop, n)`, `identity(n)` (`eye(n)` is its deprecated alias). `shape` is an int or a list like `[2,3]`.
-- **Inspect/convert:** `shape(a)`, `ndim(a)`, `size(a)`, `is_array(a)`, `to_list(a)`, `reshape(a, shape)`, `transpose(a)`, `flatten(a)`, `at(a, [i,j])` (element), `a[i]` (row or scalar).
-- **Vectorized:** `+ - * /` are **elementwise** with broadcasting (`array([1,2,3]) + array([10,20,30])`, `a * 2`). ⚠️ `*` is **elementwise (Hadamard), NOT matrix product** — use `matmul`.
-- **Reductions** (whole array or along an `axis`): `sum`, `mean`, `min`, `max`, `product`, `std`, `var` — e.g. `sum(a, 0)`.
-- **Linear algebra** (2D, via `faer`): `matmul(a, b)` / `dot(a, b)`, `solve(A, b)`, `det(A)`, `inv(A)`, `norm(a, kind?)`, `trace(A)`, `eig(A)` → `{values, vectors}` (eigenvalues are `complex`), `svd(A)` → `{u, s, vt}`. A singular matrix in `inv`/`solve` → clear error (never silent NaN).
+- **Inspect/convert:** `shape(a)`, `ndim(a)`, `size(a)` (total elements), `length(a)` (first dimension — numpy `len`, v0.6.29+), `is_array(a)`, `to_list(a)`, `reshape(a, shape)`, `transpose(a)`, `flatten(a)`, `at(a, [i,j])` (element), `a[i]` (row or scalar; `a[-1]` = last row, v0.6.29+), `slice(a, start, end?)` (rows, negatives ok, v0.6.29+).
+- **Vectorized:** `+ - * / ** // %` are **elementwise** with broadcasting (`array([1,2,3]) + array([10,20,30])`, `a * 2`, `m ** 2`, `m // 3`; `** // %` since v0.6.29). ⚠️ `*` is **elementwise (Hadamard), NOT matrix product** — use `matmul`. Elementwise math (v0.6.29+): `sqrt`, `exp`, `ln`, `log10`, `log2`, `sin`/`cos`/`tan`/…, `abs`, `floor`, `ceil`, `round`, `trunc` take an array and return an array (`sqrt(array([4, 9]))` → `[2, 3]`, `floor(array([1.5, -1.5]))` → `[1, -2]`).
+- **Map and mask** (v0.6.29+): `apply(a, f)` → array of the **same shape** (`f` must return a number: `apply(array([1,2,3]), (x) => x * 10)` → `[10, 20, 30]`); `where(a, pred)` → a **1-D array** of the elements that pass (the named boolean mask: `where(array([1,5,2,8]), (x) => x > 2)` → `[5, 8]`).
+- **Combine** (v0.6.29+): `concat([a, b, …], axis = 0)` joins along an existing axis (`concat([array([1,2]), array([3])])` → `[1, 2, 3]`; `concat([array([[1],[2]]), array([[3],[4]])], axis = 1)` → `[[1, 3], [2, 4]]`); `stack([a, b, …], axis = 0)` adds a NEW axis (`stack([array([1,2]), array([3,4])])` → `[[1, 2], [3, 4]]`).
+- **Locate and accumulate** (v0.6.29+, lists or arrays): `argmin(x, axis = k)` / `argmax(x, axis = k)` → position of the extreme (first on a tie; the first NaN if any): `argmax([3, 9, 2])` → `1`, `argmax(array([[1,5],[7,2]]), axis = 1)` → `[1, 0]`. `cumsum(x)` → running sums: a list stays exact (ints/decimals stay exact, a `nothing` stays `nothing` in its place), an array is flattened unless you pass `axis =` (`cumsum([1,2,3])` → `[1, 3, 6]`). `diff(x)` → consecutive differences (`diff([1,4,9])` → `[3, 5]`); on an array along the LAST axis by default (numpy), or `axis =`.
+- **Reductions** (whole array or along an `axis`): `sum`, `mean`, `min`, `max`, `product`, `median`, `percentile`, `quantile`, `std`, `var` — `sum(m, axis = 0)` or positional `sum(m, 0)`; `std`/`var` are sample (`ddof = 1`) — see § Reductions — the common rules. `m = array([[1,2],[3,4]])`: `sum(m, axis = 0)` → `[4, 6]`, `mean(m, axis = -1)` → `[1.5, 3.5]`, `std(m, axis = 0, ddof = 0)` → `[1, 1]`.
+- **Linear algebra** (2D, via `faer`): `matmul(a, b)` (the matrix product), `dot(a, b)` → the **inner product of two 1-D vectors only** (v0.6.29+: `dot(array([1,2]), array([3,4]))` → `11.0`; a 2-D argument → error pointing to `matmul(a, b)` — numpy's `dot` does both and confuses), `solve(A, b)`, `det(A)`, `inv(A)`, `norm(a, kind?)`, `trace(A)`, `eig(A)` → `{values, vectors}` (eigenvalues are `complex`), `svd(A)` → `{u, s, vt}`, `lstsq(A, b)` (§ Statistics and fitting). A singular matrix in `inv`/`solve` → clear error (never silent NaN). `identity(n)` is the identity matrix (`eye` is a deprecated alias).
+
+## Statistics and fitting (pure — v0.6.29+)
+- `corr(xs, ys)` → Pearson correlation (float). `cov(xs, ys, ddof = 1)` → covariance, sample by default like `std` (`cov([1,2,3], [1,2,3])` → `1.0`, `ddof = 0` → `0.666…`). Lists or 1-D arrays of equal length; a pair where either side is `nothing` is skipped (pairwise complete).
+- `lstsq(A, b)` → least-squares solution `x` of `A·x ≈ b` (QR). A 2-D `A`; a 1-D `b` gives a 1-D `x`: `lstsq(array([[1,0],[0,1],[1,1]]), array([1,2,3]))` → `[1.0, 2.0]`. A rank-deficient `A` → error (never a silent arbitrary answer).
+- `polyfit(xs, ys, degree)` → coefficients, **highest degree first** (numpy order): `polyfit(x, y, 1)` = `[slope, intercept]` (`polyfit([0,1,2,3], [1,3,5,7], 1)` → `[2.0, 1.0]`). `polyval(coefs, x)` evaluates them on a number, a list or an array (`polyval([2.0, 1.0], 10)` → `21.0`).
+- `mode(xs)` → the most frequent value (§ Math).
 
 ## Assertions / tests (see [testing.md](testing.md))
 - `assert(cond, msg?)`, `assert_eq(actual, expected, msg?)`, `assert_ne(a, b, msg?)`, `assert_error(fn)`. Work anywhere as defensive checks; `test "..."` blocks + `synsema test` are the harness.
@@ -284,7 +324,7 @@ Resolution for `env`/`secret`: process environ → `.env` → default → else e
 
 ## Web auth (passwords, JWT, TOTP, CSPRNG)
 `random_bytes`/`token` **require `require random`** — the same deny-by-default gate as
-`random()`/`random_int()` (their purpose IS producing randomness; denied in `sandbox`).
+`random()`/`random_int(lo, hi)` without a generator (their purpose IS producing randomness; denied in `sandbox`). The seeded forms (`random(g)` with `g = rng(seed)`, § Seeded randomness) are pure and need nothing — never use them for secrets.
 The rest are pure transforms — no capability. Every key/password argument accepts a
 sealed `secret`, text (raw UTF-8 bytes) or `bytes`; anything else is a clear error.
 
@@ -422,7 +462,7 @@ written by the agent. All pure except signing with a `secret` (gate `sign("NAME"
 - `did_key_document(did)` → the **DID Document** (`id`, `verificationMethod` [Multikey], `authentication`, `assertionMethod`, `capabilityInvocation`, `capabilityDelegation`; for ed25519 also `keyAgreement` with the derived X25519 key) — what a resolver would return, computed offline.
 - `document_sign(doc, key, opts?)` → the map with a `proof` (**W3C Data Integrity**, `type: "DataIntegrityProof"`). Suites: **`eddsa-jcs-2022`** (default; key = an ed25519 `secret` → **`require sign("NAME")`** + audit, or an Ed25519 PKCS#8 PEM as text) and **`ecdsa-jcs-2019`** (P-256: a 32-byte scalar `secret`, or a SEC1/PKCS#8 PEM as text, no gate — same rule as `ecdsa_p256_sign`). Opts: `verification_method` (default: the `did:key` of the signing key, `did:key:z…#z…` — pass your own URL to point elsewhere), `proof_purpose` (default `assertionMethod`), `created`, `cryptosuite`, `challenge`, `domain`. `proofValue` = `z` + base58 of the signature over `sha256(JCS(proof config)) ‖ sha256(JCS(document))`.
 - `document_verify(doc, public_key, opts?)` → `{verified: true, cryptosuite, verification_method, proof_purpose, created, challenge, domain}` or **`nothing` on ANY failure** (tampered, wrong key, wrong suite, `challenge`/`domain` in opts that do not match). `public_key` = 32 bytes / SEC1 bytes, a `did:key`, a public-key PEM, or a JWK map (`OKP`/`EC`). A key type that cannot verify these suites (RSA, x25519) is an error.
-- `receipt(opts?)` → the **receipt of the running unit of work**, derived by the engine: a Verifiable Credential (`@context` credentials/v2, `type: ["VerifiableCredential", "SynsemaReceipt"]`) whose `credentialSubject` is `{id (the request identity / agent), tokens (captoken ids in force), capabilities (the audit: every capability asked, granted or denied, with reason and source — the snapshot at issue time; the receipt's own signature comes after it), identity_spend_totals (this identity's running totals per unit, process-wide — the ledger meters identities, not units of work), declassified, steps, program_sha, engine, declared_result_sha256 (the sha256 of the value YOU pass as `result` — a declaration, and the name says so)}`. **Derived, not written:** `issuer` is always the `did:key` of the signing key (there is no `issuer` option — a receipt in someone else's name is what a verifier rejects); `validFrom` and the proof's `created` are the engine's clock when the unit has `time` and are omitted without it (no `created` option: a program cannot antedate). Opts: `sign` (a key as in `document_sign` → signed proof), `verification_method` (default: the signing key's did), `cryptosuite`, `challenge`, `domain`, `result`. Under `serve` the identity is the request's; under `run`, the operator's. Unsigned, it is the same document without `proof` and without `issuer`. **What a receipt cannot promise: completeness** — an agent only shows the receipts it likes; what it promises is that every receipt is true and verifiable.
+- `receipt(opts?)` → the **receipt of the running unit of work**, derived by the engine: a Verifiable Credential (`@context` credentials/v2, `type: ["VerifiableCredential", "SynsemaReceipt"]`) whose `credentialSubject` is `{id (the request identity / agent), tokens (captoken ids in force), capabilities (the audit: every capability asked, granted or denied, with reason and source — the snapshot at issue time; the receipt's own signature comes after it), identity_spend_totals (this identity's running totals per unit, process-wide — the ledger meters identities, not units of work), declassified, steps, program_sha, engine, declared_result_sha256 (the sha256 of the value YOU pass as `result` — a declaration, and the name says so), inputs (v0.6.29+: the **lineage** — every piece of data the unit read, see below; plus `inputs_truncated: true` after 10,000 entries)}`. **Derived, not written:** `issuer` is always the `did:key` of the signing key (there is no `issuer` option — a receipt in someone else's name is what a verifier rejects); `validFrom` and the proof's `created` are the engine's clock when the unit has `time` and are omitted without it (no `created` option: a program cannot antedate). Opts: `sign` (a key as in `document_sign` → signed proof), `verification_method` (default: the signing key's did), `cryptosuite`, `challenge`, `domain`, `result`. Under `serve` the identity is the request's; under `run`, the operator's. Unsigned, it is the same document without `proof` and without `issuer`. **What a receipt cannot promise: completeness** — an agent only shows the receipts it likes; what it promises is that every receipt is true and verifiable.
 - `receipt_verify(receipt, public_key, opts?)` → the `document_verify` map, or `nothing` — also when the document is not a receipt (no `SynsemaReceipt` in `type`) and when **the issuer is not the key**: `issuer` must be the `did:key` of `public_key` and `proof.verificationMethod` must belong to it (a receipt signed with your key "in the name of" another did is `nothing`).
 
 ```syn
@@ -434,6 +474,31 @@ let signed be document_sign({"offer": 12, "unit": "credits"}, k, {"verification_
 document_verify(signed, did)                           -- {verified: true, ...} — or nothing
 let r be receipt({"sign": k, "verification_method": vm, "result": answer})   -- what this unit did, signed
 ```
+
+### Lineage — a result you can prove (v0.6.29+)
+The **engine** (not your program) records every piece of data the program reads from outside, in order. You cannot add, edit or drop an entry.
+- `lineage()` → list of `{source, what, sha256, bytes}` so far. `sha256` = hex, **no `0x`**, of the bytes the program received; `bytes` = their length.
+
+| `source` (the builtin) | `what` | `sha256` covers |
+|---|---|---|
+| `read_file`, `read_file_bytes` | the path as passed | the file's content (for a text file, the file's own sha256) |
+| `http_get`, `http_post`, `http_put`, `http_delete`, `http`, `http_bytes`, `fetch` | the **HOST only** — never the path or query (an API key in the URL is never recorded) | the response body the program received (`http(method, url, …)` records the host of `url`) |
+| `sql`, `mongo_find`, `mongo_find_one`, `mongo_aggregate`, `redis_get`, `redis_hgetall`, `redis_lrange`, `redis_smembers` | `query sha256:<hex>` — the hash of the **whole query** (all its arguments as `canonical_json`, Mongo filters included), never the text (a query can carry data) | the result as `canonical_json(result)` (RFC 8785) — recompute it with `sha256(canonical_json(rows))` |
+| `read_line` | `stdin` | the line read |
+
+Nothing else is recorded: not what the program writes, not `env`/`secret`, not LLM calls, not the blackboard. Only successful reads count. The list stops at 10,000 entries (the receipt says `inputs_truncated: true`).
+
+`receipt()` carries the same list as `credentialSubject.inputs`, next to `program_sha`, `engine`, `capabilities` and `declared_result_sha256`. **Signed**, it proves *which inputs, which program and which output*; anyone re-checks it by recomputing the hashes of the inputs they hold (a file's sha256, a response body's) and `receipt_verify`.
+```synsema
+require file.read("./data/*")
+let t be read_file("./data/in.csv")
+let l be lineage()
+print(l[0].source, l[0].what, "0x" + l[0].sha256 == hex(sha256(t)))   -- read_file ./data/in.csv true
+let total be sum(collect(csv_parse(t, {"types": {"amount": "decimal"}}), "amount"))
+let r be receipt({"result": total})     -- sign it as in the example above: receipt({"sign": k, "verification_method": vm, "result": total})
+print(length(r.credentialSubject.inputs))                           -- 1
+```
+**Anchoring on a chain:** publish `sha256(canonical_json(r))` of the SIGNED receipt in a transaction — calldata, or an event of your own contract — with `evm_tx` + `evm_send` (stdlib.md § Blockchain). The chain then dates and fixes the receipt; the receipt itself stays wherever you keep it. `canonical_json` refuses integers beyond 2^53 and long decimals — keep such values as text inside the result you declare.
 
 ## Agent identity & auth (agents as first-class subjects)
 
@@ -492,13 +557,13 @@ reading works. The canonical documented order is the one shown. Extra args (`pre
 is an explicit error (never guessed). `collect` (property is text) and `flatten` (unary)
 have a single form.
 
-- `apply(function, list)` → list with function applied to each
-- `where(list, predicate)` → filtered list
+- `apply(function, list)` → list with function applied to each (on an `array`: an array of the same shape — § Numeric arrays)
+- `where(list, predicate)` → filtered list (on an `array`: a 1-D array of the elements that pass)
 - `collect(list, "property_name")` → list of property values
 - `transform(list, function, predicate?)` → selectively transformed list
 - `reduce(list, function, initial)` → single accumulated value
 - `sort_by(list, key_function)` / `sort_by(list, key_function, desc = true)` → sorted list (stable; the total order of `sort` — mixed incomparable keys or map keys → error, never a silently unsorted list as before v0.6.29)
-- `group_by(list, key_function)` → map of key → list
+- `group_by(list, key)` → **`[{key, items}]`** in first-appearance order (v0.6.29+; it used to return a map keyed by TEXT) — full contract in § Tables below
 - `find_first(list, predicate)` → first match or nothing
 - `every(list, predicate)` → true if all match
 - `some(list, predicate)` → true if any match
@@ -507,6 +572,63 @@ have a single form.
 - `zip_with(list_a, list_b, combiner)` → combined list
 - `unique(list)` → deduplicated, first-appearance order (structural equality, same as `==`/`contains` — maps/lists dedupe by value)
 - `index_of(list, item_or_predicate)` (on text: `index_of(text, piece)` → character position) → 0-based index of the first match, or **`nothing`** if absent (not -1 — check `when idx != nothing`); callable 2nd arg = predicate, anything else = structural equality
+
+## Tables — data analysis (pure — v0.6.29+)
+
+A **table is a list of maps** — exactly what `sql()`, `csv_parse`, `parquet_read`, `jsonl_decode` and `json_decode` give. There is no DataFrame, index or `loc`: every operation takes rows and returns rows, which go straight to the next step, to `chart_svg`/`chart()` (`{"x": col, "y": col}`), to `csv_encode`/`parquet_write`, or out of a route. The full pipeline and the missing-data model are in [dataviz.md](dataviz.md) § Data analysis.
+
+**Keys** (`group_by`, `summarize`, `count_by`): a column name (text), a list of column names (the key becomes a map `{col: value, …}`), or a function `(row) => …`. A group's key keeps its **value and type** and groups by language equality (`1` and `1.0` are one group; `1` and `"1"` are two). Groups come in **first-appearance order**.
+
+- `group_by(rows, key)` → `[{key, items}]`. `group_by(rows, "r")` → `[{key: "n", items: [{r: "n", m: 10}, {r: "n", m: 1}]}, {key: "s", items: […]}]`; `group_by([1, 1.0, 2], (v) => v)` → `[{key: 1, items: [1, 1.0]}, {key: 2, items: [2]}]`. The old argument order `group_by(f, rows)` still works. ⚠️ **Breaking** (v0.6.29): it returned a map keyed by the TEXT of the key — `groups["north"]` / `keys(group_by(…))` no longer work; iterate `each g in group_by(…)` … `g.key` / `g.items`, or use `summarize`. `synsema check` flags the call.
+- `summarize(rows, by, aggs)` → rows: the key column(s) + one column per aggregate. `aggs` = map `name → aggregate`. With `by` = a column, that column keeps its name; with a list, each key column; with a function, the key goes in a column `key`. Built-in aggregates (each returns a function of the group):
+  - `sum_of(col)`, `mean_of(col)`, `min_of(col)`, `max_of(col)`, `median_of(col)`, `quantile_of(col, q)` (q ∈ [0, 1]) — numeric columns; they **skip `nothing`** and **propagate NaN** (the common rules); a text value in the column → error. A group whose values are all missing: `sum_of` → `0`, the others → `nothing`.
+  - `first_of(col)` (the first row's value, `nothing` included), `n_unique_of(col)` (distinct non-missing values), `count()` (rows in the group, missing or not).
+  - Or any function of the group: `"span": (g) => max(collect(g, "m")) - min(collect(g, "m"))`.
+
+```synsema
+let rows be [{"r": "n", "m": 10}, {"r": "s", "m": 5}, {"r": "n", "m": 1}, {"r": "s", "m": nothing}]
+print(summarize(rows, "r", {"total": sum_of("m"), "n": count(), "avg": mean_of("m"), "top": max_of("m")}))
+-- [{r: "n", total: 11, n: 2, avg: 5.5, top: 10}, {r: "s", total: 5, n: 2, avg: 5.0, top: 5}]
+```
+
+- `count_by(rows, key)` → `[{key, count}]`, **most frequent first** (ties in appearance order) — pandas `value_counts`. `count_by(values)` (one argument) counts the values themselves: `count_by(["x", "y", "x"])` → `[{key: "x", count: 2}, {key: "y", count: 1}]`. The result column is always `key`, whatever the column was called.
+- `join(left, right, on, how?)` → rows. `on` = a column or a list of columns present on both sides; `how` = `"inner"` (default) | `"left"` | `"outer"`. A non-key column present on both sides: the right one gets the suffix **`_right`** (polars). A row with no match gets `nothing` in the other side's columns; a `nothing` key never matches. `join([{"id": 1, "a": "x"}, {"id": 2, "a": "y"}], [{"id": 1, "a": "z"}], "id", "left")` → `[{id: 1, a: "x", a_right: "z"}, {id: 2, a: "y", a_right: nothing}]`. ⚠️ **Arity decides**: `join(items, sep)` with 2 arguments is still the TEXT join (`join(["a", "b"], "-")` → `"a-b"`).
+- `pivot(rows, index, columns, values, agg?)` → one row per value of `index`, one column per distinct value of `columns` (in first-appearance order), cell = `values`. `index`/`columns`/`values` are column names (text). A cell that several rows fall into needs `agg` (an aggregate, e.g. `sum_of("v")`, or any `(group) => …`) — without it that is an **error** (`… rows fall in the same cell … — pass agg, e.g. sum_of("v")`), never a silent "first". A missing cell → `nothing`. `pivot([{"d": "lu", "p": "a", "v": 1}, {"d": "lu", "p": "b", "v": 2}, {"d": "ma", "p": "a", "v": 3}], "d", "p", "v")` → `[{d: "lu", a: 1, b: 2}, {d: "ma", a: 3, b: nothing}]`.
+- **Missing data** (`nothing` = missing; NaN = invalid number — different things):
+  - `is_missing(x)` → `x == nothing`.
+  - `fill_missing(list, value)` → each `nothing` replaced (`fill_missing([1, nothing], 0)` → `[1, 0]`). `fill_missing(rows, value)` fills every missing cell; `fill_missing(rows, {"col": value, …})` only those columns. It fills cells that are present with `nothing` (a key absent from a row stays absent).
+  - `drop_missing(list)` → without the `nothing`s. `drop_missing(rows)` drops rows with a `nothing` in ANY column; `drop_missing(rows, "col")` / `drop_missing(rows, ["a", "b"])` only looks at those (a column absent from a row counts as missing).
+  - `fill_nan(list | array, number)` → each NaN replaced (`fill_nan([nan, 1], 0)` → `[0, 1]`).
+- Sort the result with `sort_by(rows, (r) => r.total, desc = true)`; pick columns with `collect(rows, "col")`; filter with `where(rows, (r) => r.region == "north")`.
+
+## Dates, instants and durations (pure — v0.6.29+)
+
+Three types (see [types.md](types.md) § Dates): **`date`** (a civil day, no time or zone), **`datetime`** (an instant + an IANA zone, DST-aware), **`duration`** (an exact amount of time, nanoseconds). Building, parsing, formatting, comparing and computing are **pure** — only `now()` and `sleep()` read the clock and need `require time`.
+- `date(2026, 1, 31)`, `date("2026-01-31")` (ISO only — other formats: `parse_date`), `date(datetime)` (the civil day in the datetime's own zone). An invalid day → error `date(2026, 2, 30): not a valid calendar date`.
+- `datetime("2026-01-03T10:00:00Z")`, `datetime("2026-01-03T10:00:00-03:00")` (an offset without a zone name → shown in UTC), `datetime("2026-03-29T01:30:00", "Europe/Madrid")` (local time + zone), `datetime("2026-01-03")` (midnight UTC), `datetime("…[Europe/Madrid]")` (RFC 9557, what it prints), `datetime(2026, 1, 3, 10, 0, 0, "UTC")` (hour/minute/second optional, zone last, default UTC), `datetime(timestamp_seconds, tz?)`, `datetime(date, tz)` (midnight in `tz`). A local time inside a **DST gap** → error `… does not exist in Europe/Madrid (it falls in a daylight-saving gap)`; an ambiguous one (the hour that repeats when clocks go back) takes the **first** (java.time / Temporal "compatible"). An unknown zone → error suggesting IANA names (`"America/Buenos_Aires"`, `"Europe/Madrid"`, `"UTC"`).
+- `duration(days, hours, minutes, seconds, milliseconds, weeks)` — all optional, **by name**: `duration(hours = 1, minutes = 30)` → `PT1H30M`; fractions allowed (`duration(hours = 1.5)`). A day in a duration is exactly 24 h.
+- **Arithmetic**: `date ± duration` (whole days only — `date(2026, 1, 1) + duration(hours = 1)` → error `a date moves by whole days — use a datetime …`), `datetime ± duration` (exact elapsed time, DST-correct: Madrid 2026-03-29 01:30 + 1 h = `03:30+02:00`), `datetime − datetime` → duration, `date − date` → duration (`date("2026-03-01") - date(2026, 1, 31)` → `P29D`), `duration ± duration`, `duration * number`, `duration / number`, `duration / duration` → float. Comparisons (`<`, `==`, `sort`, `sort_by`) within one type (`date < datetime` → error `cannot order a date and a datetime`); datetimes compare by **instant**, whatever their zones. `min`/`max` and the `min_of`/`max_of` aggregates take them too (earliest / latest).
+- `add_days(t, n)` → calendar days: a datetime keeps its **local time** across a DST change (`add_days(datetime("2026-03-28T12:00:00", "Europe/Madrid"), 1)` → `2026-03-29T12:00:00+02:00[…]`, while `+ duration(days = 1)` is 24 h → `13:00`); on a date it is `d + duration(days = n)`.
+- `add_months(t, n)` → calendar months on a date or datetime (the day clamps to the month's end: `add_months(date(2026, 1, 31), 1)` → `2026-02-28`); negative `n` goes back. For "one year later": `add_months(t, 12)`.
+- `truncate(t, unit)` → the start of the period: `"year"`, `"quarter"`, `"month"`, `"week"` (Monday), `"day"`, `"hour"`, `"minute"`, `"second"` (the last three only on a datetime; in its own zone). The tool for **grouping by period**: `summarize(rows, (r) => truncate(r.when, "month"), {…})`.
+- `date_range(start, end, step?)` → list from `start` to `end` **inclusive**; `step` = a positive duration or `"day"` (default) | `"week"` | `"month"` | `"quarter"` | `"year"`. `date_range(date(2026,1,1), date(2026,1,3))` → `[2026-01-01, 2026-01-02, 2026-01-03]`. Start and end must be the same type.
+- `to_timezone(dt, "UTC")` → the same instant seen in another zone. `timestamp(dt)` → float unix seconds (a datetime only; for a date: `timestamp(datetime(d, "UTC"))`). `in_units(d, unit)` → float, unit = `"weeks"` | `"days"` | `"hours"` | `"minutes"` | `"seconds"` | `"milliseconds"` (`in_units(duration(hours = 1, minutes = 30), "minutes")` → `90.0`).
+- `parse_date(text, format?)` → date; `parse_datetime(text, format?, tz?)` → datetime (strftime: `parse_date("31/01/2026", "%d/%m/%Y")`; a format without an offset reads local time in `tz`, default UTC). A mismatch → error naming the text and the format.
+- Display: date `2026-01-31`; datetime RFC 3339, `…Z` in UTC and `2026-03-29T01:30:00+01:00[Europe/Madrid]` otherwise; duration ISO 8601 (`P29D`, `PT1H30M`). `json_encode`/`csv_encode` write that ISO text.
+
+## Seeded randomness (pure — v0.6.29+)
+
+- `rng(seed)` → a **generator**: a function value; `g()` returns the next uniform float in `[0, 1)`. The same seed gives the same sequence on every platform and every version (PCG64 XSL-RR 128/64 seeded by SplitMix64; normals by Box–Muller).
+- `random(g)` (same as `g()`), `random_int(g, lo, hi)` (inclusive), `random_normal(g, mean = 0, std = 1)` (`mean`/`std` by name), `shuffle(g, xs)` → a NEW list, `sample(g, xs, n)` → `n` distinct items without replacement (n > length → error), `choice(g, xs)` → one item (empty → error).
+- Pure: allowed under `--deterministic`, in `sandbox`, in tests — no capability. `random()` / `random_int(lo, hi)` **without** a generator still need `require random` (OS entropy). `random_int` bounds must be integers (`random_int(g, 1.5, 6)` → error; before v0.6.29 1.5 was truncated).
+- A generator is **one stream**: copies of `g` (`let h be g`, passing it to a task) draw from the SAME sequence. For independent streams make separate generators: `rng(1)`, `rng(2)`.
+- Not for secrets or tokens — that is `random_bytes`/`token` (OS CSPRNG, `require random`).
+```synsema
+let g be rng(42)
+let test_set be sample(g, range(0, 100), 5)       -- 5 distinct ids, the same every run
+let noise be random_normal(g, mean = 0, std = 0.1)
+let die be random_int(g, 1, 6)
+```
 
 ## I/O (require capabilities)
 - `fetch(url, method?, headers?, body?)` → map with status, headers, body
@@ -528,11 +650,11 @@ have a single form.
 - `run(cmd, args_list?, timeout?, opts?)` → `{exit_code, stdout, stderr, stdout_truncated, stderr_truncated}` — requires `exec("<cmd>")`. Runs a process **without a shell** (args as a list → no quoting injection). `timeout` default 120s → on expiry kills the process and **raises** (`timed out after Ns`); catch with `try`/`recover`. `opts`: `{cwd, env (adds/overrides), stdin (text/bytes), max_output (default 10MB)}`. **Non-zero `exit_code` is data, not an error**; can't-launch and timeout raise. `exec` is deny-by-default (not auto-granted, even in `run`). Scope = the command string as passed. **The child does NOT inherit Synsema's secrets** (v0.6.14+): the LLM provider keys and `.env`-loaded variables are stripped from its environment (the base OS env — `PATH`, etc. — is kept, so commands work); pass a secret a child truly needs explicitly via `opts.env` (which routes through `reveal`/`env`). `proc_spawn` strips the same. To run **Synsema under a ceiling** instead of an OS command, prefer `run_program` (isolated env/cwd/timeout by construction).
 - `now()` → unix timestamp (number) — requires `time`
 - `sleep(seconds)` → pause execution (e.g. to pace an SSE stream) — requires `time`
-- `format_time(timestamp, pattern?)` → text — requires `time`. Default ISO-8601 UTC (`format_time(0)` → `"1970-01-01T00:00:00Z"`); with a strftime pattern: `format_time(t, "%Y-%m-%d %H:%M")`
-- `parse_time(text, pattern?)` → timestamp — requires `time`. Inverse of `format_time` (ISO-8601 by default; a trailing `Z` is accepted; times are UTC)
-- `date_parts(timestamp)` → `{year, month, day, hour, minute, second}` (UTC) — requires `time`
-- `random()` → float 0-1
-- `random_int(min, max)` → integer
+- `format_time(value, pattern?)` → text — **pure** since v0.6.29 (it never read the clock; it used to require `time`). `value` = a unix timestamp, a `date` or a `datetime`. Default: ISO 8601 (`format_time(0)` → `"1970-01-01T00:00:00Z"`; a date/datetime → its display form); with a strftime pattern: `format_time(t, "%Y-%m-%d %H:%M")`, `format_time(date(2026, 1, 31), "%d/%m/%Y")` → `"31/01/2026"`. A datetime formats in its own zone.
+- `parse_time(text, pattern?)` → unix timestamp (float) — **pure** since v0.6.29. Inverse of `format_time` (ISO 8601 by default; a trailing `Z` is accepted; times are UTC). A date-only pattern now works and means midnight UTC: `parse_time("2026-01-03", "%Y-%m-%d")` → `1767398400.0` (it used to fail with `input is not enough for unique date and time`). For typed values prefer `parse_date` / `parse_datetime` (§ Dates).
+- `date_parts(value)` → map — **pure** since v0.6.29. A timestamp → `{year, month, day, hour, minute, second}` (UTC); a `datetime` → the same plus `weekday` (1 = Monday … 7 = Sunday), `yearday` and `zone`, in its own zone; a `date` → `{year, month, day, weekday, yearday}`.
+- `random()` → float in [0, 1) — requires `random`. `random(g)` with a generator from `rng(seed)` is pure (§ Seeded randomness)
+- `random_int(min, max)` → integer, both ends inclusive — requires `random`; bounds must be integers. `random_int(g, min, max)` is the pure seeded form
 
 ## HTTP
 Both `http://` and **`https://` (TLS)** are supported (rustls + OS root CAs, real cert validation). **All HTTP (`http*` and `fetch`) is gated by `net(host)`** — `require net("host")` (deny-by-default, even in `run`; `require net` / `net("*")` = any). See capabilities.md and [stdlib.md](stdlib.md) § HTTP.

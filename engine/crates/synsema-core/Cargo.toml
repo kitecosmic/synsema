@@ -33,3 +33,6 @@ csv.workspace = true
 bs58.workspace = true
 # Bundle de `synsema build` (bundle.rs): sha256 del payload anexado al ejecutable.
 sha2.workspace = true
+# Fechas, instantes y duraciones como tipos (v0.6.29, DATOS-13): chrono + la base IANA.
+chrono.workspace = true
+chrono-tz.workspace = true

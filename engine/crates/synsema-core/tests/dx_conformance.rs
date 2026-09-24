@@ -98,8 +98,8 @@ fn dual_order_sort_by() {
 #[test]
 fn dual_order_group_by() {
     both_orders(
-        "text(length(group_by((x) => x > 2, [1, 2, 3, 4])[\"true\"]))",
-        "text(length(group_by([1, 2, 3, 4], (x) => x > 2)[\"true\"]))",
+        "text(length(group_by((x) => x > 2, [1, 2, 3, 4])[1].items))",
+        "text(length(group_by([1, 2, 3, 4], (x) => x > 2)[1].items))",
         "2",
     );
 }

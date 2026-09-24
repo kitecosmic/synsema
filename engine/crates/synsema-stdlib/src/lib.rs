@@ -72,6 +72,8 @@ pub mod routing;
 pub mod secrets;
 #[cfg(feature = "native")]
 pub mod server;
+#[cfg(feature = "native")]
+pub mod parquet_io;
 pub mod spend;
 pub mod webauth;
 pub mod webauthn;

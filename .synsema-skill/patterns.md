@@ -15,20 +15,21 @@ let raw be `date,region,amount
 2026-01-07,north,200
 2026-01-08,west,150`
 
-let rows be csv_parse(raw, {"numbers": true})
+let rows be csv_parse(raw, {"types": {"date": "date", "amount": "int"}})
 let amounts be collect(rows, "amount")
 print("orders: " + text(length(rows)))
 print("total:  " + text(sum(amounts)))
 print("median: " + text(median(amounts)))
 
-let by_region be group_by(rows, (r) => r.region)
-each region in keys(by_region)
-    let subtotal be sum(collect(by_region[region], "amount"))
-    print(`  {region}: {subtotal}`)
+let by_region be summarize(rows, "region", {"subtotal": sum_of("amount"), "orders": count()})
+each r in sort_by(by_region, (r) => r.subtotal, desc = true)
+    print(`  {r.region}: {r.subtotal} ({r.orders})`)
 ```
 
-Swap the literal for `read_file("data.csv")` + `require file("data.csv")`, or a
-`sql(...)` query — the pipeline shape stays the same. Charts: [dataviz.md](dataviz.md).
+Swap the literal for `read_file("data.csv")` + `require file.read("data.csv")`, a
+`parquet_read(read_file_bytes(...))`, or a `sql(...)` query — the pipeline shape stays the same
+(a table is a list of maps). Missing data, joins, pivots, dates and charts:
+[dataviz.md](dataviz.md) § Data analysis.
 
 ## Complete program: JSON API (SQLite + bearer auth + validation)
 

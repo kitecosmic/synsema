@@ -7,7 +7,30 @@
 - `bytes` — binary data: `bytes("hi")` (utf8), `bytes(s, "hex"|"base64")`, `bytes([72,73])`; `decode(b, "utf8"|"utf8_lossy"|"hex"|"base64")` (utf8 **strict** by default); `is_bytes`. `b[i]`→int 0–255 (`b[-1]` last), `length`/`slice`/`contains`/`in`/`+`, `each x in b` (ints), `hex(b)` → `"0x…"`. `bytes == text` is **always `false`** (`bytes("abc") == "abc"` → false; compare `decode(b) == "abc"`); `text(b)`/`print(b)` show a hex repr, NOT a decode. See [builtins.md](builtins.md).
 - `text` — string: `"hello"`, `'world'`, supports `\n`, `\t`, `\\`; backtick `` `hi {x}` `` for interpolation + multiline. Indexable (v0.6.29+): `s[i]` is one character, counted like `length` (`"héllo"[1]` → `"é"`, `"abc"[-1]` → `"c"`); `each c in s` walks the characters. `text + number/bool` concatenates (`"n=" + 1`); `text + nothing/list/map/bytes` is an **error** (`Cannot add text and nothing — convert it on purpose: text(x), or interpolate it`). `is_text(x)`.
 - `bool` — `true` or `false`
-- `nothing` — null equivalent
+- `nothing` — null equivalent. In data (CSV, Parquet, SQL, tables) `nothing` means **missing**: reductions skip it (`mean([1, nothing, 3])` → `2.0`), `csv_parse` gives it for an empty field. NaN is a different thing — an invalid number, and it propagates. See [dataviz.md](dataviz.md) § Data analysis.
+- `date`, `datetime`, `duration` — time as types (v0.6.29+), see § Dates below.
+
+## Dates — `date`, `datetime`, `duration` (v0.6.29+)
+Three distinct types (the java.time / JS Temporal / polars model), `type_of` → `"date"` / `"datetime"` / `"duration"`. All pure: only `now()` and `sleep()` touch the clock. Constructors and every builtin: [builtins.md](builtins.md) § Dates, instants and durations.
+
+| Type | What it is | Build | Displays as |
+|---|---|---|---|
+| `date` | a civil day — no time, no zone | `date(2026, 1, 31)`, `date("2026-01-31")`, `parse_date(t, "%d/%m/%Y")` | `2026-01-31` |
+| `datetime` | an instant + an IANA zone (DST-aware) | `datetime("2026-01-03T10:00:00Z")`, `datetime("2026-03-29T01:30:00", "Europe/Madrid")`, `datetime(2026, 1, 3, 10, 0, 0, "UTC")`, `datetime(ts)` | RFC 3339: `2026-01-03T10:00:00Z` in UTC; `2026-03-29T01:30:00+01:00[Europe/Madrid]` otherwise (RFC 9557) |
+| `duration` | an exact amount of time (ns) | `duration(days = 1)`, `duration(hours = 1, minutes = 30)`, `t2 - t1` | ISO 8601: `P29D`, `PT1H30M`, `PT0S` |
+
+**Arithmetic** (anything else → `Unsupported operation: …`):
+- `date ± duration` → date, **whole days only**: `date(2026, 1, 31) + duration(days = 1)` → `2026-02-01`; `+ duration(hours = 1)` → error `a date moves by whole days — use a datetime for hours and minutes: datetime(d, tz) + duration(hours = …)`.
+- `datetime ± duration` → datetime; the duration is **elapsed time**, so it is DST-correct: in Madrid, `datetime("2026-03-29T01:30:00", "Europe/Madrid") + duration(hours = 1)` → `2026-03-29T03:30:00+02:00[Europe/Madrid]` (02:00–03:00 does not exist that night). `duration(days = 1)` is 24 h, not "same time tomorrow" across a DST change — that is `add_days(t, 1)`.
+- `datetime − datetime` and `date − date` → duration (`date("2026-03-01") - date(2026, 1, 31)` → `P29D`).
+- `duration ± duration`, `duration * number`, `duration / number` → duration; `duration / duration` → float (`duration(hours = 3) / duration(minutes = 30)` → `6.0`).
+- Calendar days and months are not fixed durations: `add_days(t, n)` keeps the local time, `add_months(t, n)` (31 Jan + 1 → 28/29 Feb).
+
+**Comparison**: `<`, `>`, `==`, `sort`, `sort_by` work within one type, and so do `min`/`max`/`min_of`/`max_of`. Datetimes compare by the **instant**, whatever their zones (`datetime("2026-01-01T12:00:00Z") == datetime("2026-01-01T09:00:00-03:00")` → true). A date is not a datetime: convert with `datetime(d, tz)` or `date(dt)`.
+
+**DST**: a local time that does not exist (the spring-forward gap) → error `… does not exist in Europe/Madrid (it falls in a daylight-saving gap)`; a local time that happens twice (fall back) → the **first** one. Zones are IANA names (`"America/Buenos_Aires"`), or `"UTC"`; an unknown one → error listing examples.
+
+**Crossing boundaries**: `json_encode` and `csv_encode` write the ISO text; `json_decode` gives text back (re-type with `date(x)`/`datetime(x)`); `csv_parse` types a column with `{"types": {"when": "date"}}`; Parquet DATE/TIMESTAMP ↔ date/datetime (UTC). `timestamp(dt)` → unix seconds (float), `datetime(seconds)` back.
 
 ## Collection types
 - `list` — `[1, 2, 3]`, `["a", "b"]`, mixed types allowed. `xs[-1]` is the last element. `is_list(x)`.

@@ -84,6 +84,42 @@ Also: the LLM words **`reason` / `decide` / `analyze` / `generate`** (like every
 | `tomllib.loads(s)` / `xml.etree` / `xmltodict.parse` | `toml_parse(s)` (dates → ISO text) / `xml_parse(s)` (xmltodict shape) (v0.6.20+) |
 | `cryptography` ECDH/HKDF/AES-GCM | `ecdh_keypair`/`ecdh_shared_secret`/`hkdf_sha256`/`aes_gcm_encrypt`/`aes_gcm_decrypt` (secrets stay `secret`; v0.6.20+) |
 
+## Data analysis — pandas / numpy / polars → Synsema (v0.6.29+)
+
+A table is a **list of maps** (no DataFrame, no index): every operation takes rows and returns
+rows. Full pipeline: [dataviz.md](dataviz.md) § Data analysis; contracts: [builtins.md](builtins.md) § Tables.
+
+| In Python | In Synsema | ⚠️ Divergence |
+|---|---|---|
+| `pd.read_csv(p, dtype={"id": str, "qty": int}, parse_dates=["day"])` | `csv_parse(read_file(p), {"types": {"qty": "int", "day": "date"}})` | untyped columns stay text (never guessed); an empty cell is `nothing` (pandas: NaN) |
+| `pd.read_parquet(p)` / `df.to_parquet(p)` | `parquet_read(read_file_bytes(p))` / `write_file(p, parquet_write(rows))` | flat columns, one type per column; not in the wasm build |
+| `pd.read_json(p, lines=True)` / `df.to_json(orient="records", lines=True)` | `jsonl_decode(read_file(p))` / `jsonl_encode(rows)` | `jsonl_decode(text, default)` is the no-raise form |
+| `df.groupby("r").agg(total=("m", "sum"), n=("m", "size"))` | `summarize(rows, "r", {"total": sum_of("m"), "n": count()})` | groups in first-appearance order (pandas sorts by key); also `mean_of`/`min_of`/`max_of`/`median_of`/`quantile_of(col, q)`/`first_of`/`n_unique_of`, or any `(group) => …` |
+| `for k, g in df.groupby("r"):` | `each g in group_by(rows, "r")` … `g.key` / `g.items` | `group_by` returns `[{key, items}]`, NOT a dict |
+| `df.merge(o, on="id", how="left")` | `join(rows, o, "id", "left")` | `how` = `"inner"`/`"left"`/`"outer"`; clashing columns get `_right` (pandas: `_x`/`_y`); `join(xs, sep)` with 2 args is still the text join |
+| `df.pivot_table(index="d", columns="p", values="v", aggfunc="sum")` | `pivot(rows, "d", "p", "v", sum_of("v"))` | without `agg`, two rows in one cell → error (never a silent first) |
+| `df["c"].value_counts()` | `count_by(rows, "c")` → `[{key, count}]` | also `count_by(values)` on a plain list |
+| `df.dropna()` / `df.dropna(subset=["m"])` / `df.fillna(0)` / `df.fillna({"m": 0})` | `drop_missing(rows)` / `drop_missing(rows, "m")` / `fill_missing(rows, 0)` / `fill_missing(rows, {"m": 0})` | missing = `nothing`; NaN is separate: `fill_nan(xs, 0)` |
+| `df.sort_values("t", ascending=False)` | `sort_by(rows, (r) => r.t, desc = true)` | stable; `nothing`/NaN last |
+| `df["c"]` / `df[df.x > 2]` | `collect(rows, "c")` / `where(rows, (r) => r.x > 2)` | — |
+| `df.std()` / `statistics.stdev(xs)` | `std(xs)` | same answer: **sample** (`ddof = 1`) |
+| `np.std(xs)` / `np.var(xs)` | `std(xs, ddof = 0)` / `var(xs, ddof = 0)` | numpy defaults to population; Synsema to sample |
+| `np.nanmean(xs)` / `df.mean()` (skips NaN) | `mean(xs)` skips **`nothing`** | NaN propagates in Synsema — `fill_nan` or `where(xs, is_finite)` first |
+| `np.percentile(xs, 90)` / `np.quantile(xs, 0.9)` | `percentile(xs, 90)` / `quantile(xs, 0.9)` | same interpolation (linear) |
+| `np.dot(A, B)` (matrices) / `A @ B` | `matmul(A, B)` | `dot` is 1-D vectors only |
+| `np.eye(n)` | `identity(n)` | `eye` is a deprecated alias |
+| `np.concatenate` / `np.stack` / `np.argmax` / `np.cumsum` / `np.diff` | `concat([a, b], axis = 0)` / `stack([a, b])` / `argmax(x, axis = k)` / `cumsum(x)` / `diff(x)` | `axis` is named |
+| `np.corrcoef(x, y)[0, 1]` / `np.cov(x, y)[0, 1]` / `np.linalg.lstsq(A, b)` / `np.polyfit(x, y, 1)` | `corr(x, y)` / `cov(x, y)` / `lstsq(A, b)` / `polyfit(x, y, 1)` + `polyval(c, x)` | `cov` is sample by default, like numpy's `cov` |
+| `len(arr)` / `arr.size` / `arr[-1]` / `arr[1:3]` | `length(a)` / `size(a)` / `a[-1]` / `slice(a, 1, 3)` | — |
+| `rng = np.random.default_rng(42)`; `rng.random()`, `rng.integers(1, 7)`, `rng.normal(0, 1)`, `rng.permutation(xs)`, `rng.choice(xs, 5, replace=False)`, `rng.choice(xs)` | `let g be rng(42)`; `g()`, `random_int(g, 1, 6)`, `random_normal(g, mean = 0, std = 1)`, `shuffle(g, xs)`, `sample(g, xs, 5)`, `choice(g, xs)` | `random_int` is **inclusive** on both ends; the sequence differs from numpy's (same seed ≠ same numbers across languages), but is identical across Synsema platforms/versions; pure, no capability |
+| `random.random()` | `random()` + `require random` | the unseeded form reads OS entropy |
+| `pd.to_datetime("2026-01-03")` / `datetime.date(2026, 1, 3)` | `datetime("2026-01-03")` / `date(2026, 1, 3)` | three types: `date`, `datetime` (instant + IANA zone), `duration` |
+| `datetime.strptime(s, "%d/%m/%Y")` / `dt.strftime(f)` | `parse_date(s, "%d/%m/%Y")` (or `parse_datetime`) / `format_time(dt, f)` | pure — no `require time` |
+| `timedelta(hours=1, minutes=30)` / `td.total_seconds()` | `duration(hours = 1, minutes = 30)` / `in_units(d, "seconds")` | a date moves by whole days only |
+| `dt.astimezone(ZoneInfo("UTC"))` / `ZoneInfo("Europe/Madrid")` | `to_timezone(dt, "UTC")` / the zone name as text | a nonexistent local time (DST gap) is an error, not shifted |
+| `df["d"].dt.to_period("M")` / `pd.date_range(a, b, freq="MS")` / `+ pd.DateOffset(months=1)` | `truncate(d, "month")` / `date_range(a, b, "month")` (inclusive) / `add_months(d, 1)` | — |
+| `dt.timestamp()` / `datetime.fromtimestamp(s, tz)` | `timestamp(dt)` / `datetime(s, tz)` | — |
+
 ## Semantic traps — looks like Python, behaves differently
 
 | It looks like | What actually happens (verified) |

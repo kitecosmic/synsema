@@ -319,8 +319,15 @@ fn ts_to_utc(ts: f64) -> Result<DateTime<Utc>, Control> {
 /// Inverso de format_time. Sin patrón parsea ISO-8601 (acepta 'Z'); naive→UTC.
 fn parse_time_ts(s: &str, pattern: Option<&str>) -> Result<f64, Control> {
     if let Some(p) = pattern {
-        let naive = NaiveDateTime::parse_from_str(s, p)
-            .map_err(|e| Control::Error(RuntimeError::new(format!("invalid time: {}", e))))?;
+        // Un patrón de SÓLO fecha ("%Y-%m-%d") es medianoche UTC (antes: "input is not enough
+        // for unique date and time").
+        let naive = match NaiveDateTime::parse_from_str(s, p) {
+            Ok(n) => n,
+            Err(e) => match chrono::NaiveDate::parse_from_str(s, p) {
+                Ok(d) => d.and_time(chrono::NaiveTime::MIN),
+                Err(_) => return Err(Control::Error(RuntimeError::new(format!("invalid time: {}", e)))),
+            },
+        };
         return Ok(naive.and_utc().timestamp() as f64);
     }
     let s2 = s.replace('Z', "+00:00");
@@ -1263,14 +1270,19 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         );
     }
 
-    // format_time(ts, pattern?) → text. Default ISO-8601 UTC ("…Z").
+    // format_time(ts | date | datetime, pattern?) → text. Default ISO-8601 ("…Z" para un
+    // timestamp). PURO desde v0.6.29: formatear no lee el reloj (sólo `now()` pide `time`).
     {
-        let caps = caps.clone();
         interp.register_builtin(
             "format_time",
             -1,
             Rc::new(move |_i, args, _loc| {
-                require(&caps, Capability::new(CapabilityType::Time, None), "format_time()")?;
+                if let SynValue::Time(t) = arg(args, 0)? {
+                    return match opt_pattern(args) {
+                        Some(p) => Ok(syn_text(synsema_core::temporal::format(t, &p)?)),
+                        None => Ok(syn_text(t.to_string())),
+                    };
+                }
                 let ts = arg_f64(arg(args, 0)?)?;
                 let dt = ts_to_utc(ts)?;
                 let out = match opt_pattern(args) {
@@ -1282,14 +1294,12 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         );
     }
 
-    // parse_time(text, pattern?) → timestamp (float). Inverso de format_time.
+    // parse_time(text, pattern?) → timestamp (float). Inverso de format_time. PURO (v0.6.29).
     {
-        let caps = caps.clone();
         interp.register_builtin(
             "parse_time",
             -1,
             Rc::new(move |_i, args, _loc| {
-                require(&caps, Capability::new(CapabilityType::Time, None), "parse_time()")?;
                 let s = raw_str(arg(args, 0)?);
                 let ts = parse_time_ts(&s, opt_pattern(args).as_deref())?;
                 Ok(syn_float(ts))
@@ -1297,14 +1307,17 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         );
     }
 
-    // date_parts(ts) → {year, month, day, hour, minute, second} (UTC).
+    // date_parts(ts | date | datetime) → {year, month, day, hour, minute, second, …}. PURO
+    // (v0.6.29); con un date/datetime, en su zona y con weekday/yearday.
     {
-        let caps = caps.clone();
         interp.register_builtin(
             "date_parts",
             1,
             Rc::new(move |_i, args, _loc| {
-                require(&caps, Capability::new(CapabilityType::Time, None), "date_parts()")?;
+                if let SynValue::Time(t) = arg(args, 0)? {
+                    return synsema_core::temporal::parts(t)
+                        .ok_or_else(|| Control::Error(RuntimeError::new("date_parts: a duration has no calendar parts")));
+                }
                 let ts = arg_f64(arg(args, 0)?)?;
                 let dt = ts_to_utc(ts)?;
                 let mut m = IndexMap::new();
@@ -1314,6 +1327,10 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 m.insert("hour".to_string(), syn_int(dt.hour() as i64));
                 m.insert("minute".to_string(), syn_int(dt.minute() as i64));
                 m.insert("second".to_string(), syn_int(dt.second() as i64));
+                // v0.6.29: las mismas claves que con un date/datetime (un timestamp es UTC).
+                m.insert("weekday".to_string(), syn_int(dt.weekday().number_from_monday() as i64));
+                m.insert("yearday".to_string(), syn_int(dt.ordinal() as i64));
+                m.insert("zone".to_string(), syn_text("UTC"));
                 Ok(syn_map(m))
             }),
         );
@@ -1329,8 +1346,13 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         let caps = caps.clone();
         interp.register_builtin(
             "random",
-            0,
-            Rc::new(move |_i, _args, _loc| {
+            -1,
+            Rc::new(move |i, args, loc| {
+                // v0.6.29 (DATOS-12): `random(g)` con un generador de `rng(seed)` es PURO y
+                // reproducible; `random()` sin generador sigue pidiendo la capability.
+                if let Some(g) = args.first() {
+                    return Ok(syn_float(synsema_core::rng::uniform(i, g, "random", loc)?));
+                }
                 require(&caps, Capability::new(CapabilityType::Random, None), "random()")?;
                 Ok(syn_float(rand::random::<f64>()))
             }),
@@ -1342,12 +1364,30 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         let caps = caps.clone();
         interp.register_builtin(
             "random_int",
-            2,
-            Rc::new(move |_i, args, _loc| {
+            -1,
+            Rc::new(move |i, args, loc| {
+                // Límites ENTEROS (v0.6.29): 1.7 ya no se trunca en silencio.
+                let whole = |v: &SynValue, what: &str| -> Result<i64, Control> {
+                    match v {
+                        SynValue::Number(n) if n.is_integer() => n
+                            .to_i64_trunc()
+                            .ok_or_else(|| Control::Error(RuntimeError::new(format!("random_int: {} out of range", what)))),
+                        other => Err(Control::Error(RuntimeError::new(format!(
+                            "random_int: {} must be an integer, got {}",
+                            what, other
+                        )))),
+                    }
+                };
+                // `random_int(g, min, max)` con un generador de `rng(seed)`: puro y reproducible.
+                if args.len() == 3 {
+                    let lo = whole(arg(args, 1)?, "min")?;
+                    let hi = whole(arg(args, 2)?, "max")?;
+                    let g = arg(args, 0)?.clone();
+                    return Ok(syn_int(synsema_core::rng::int_in(i, &g, lo, hi, "random_int", loc)?));
+                }
                 require(&caps, Capability::new(CapabilityType::Random, None), "random_int()")?;
-                // int(arg) trunca hacia cero, como `int(args[i].raw)` del oráculo.
-                let lo = arg_f64(arg(args, 0)?)?.trunc() as i64;
-                let hi = arg_f64(arg(args, 1)?)?.trunc() as i64;
+                let lo = whole(arg(args, 0)?, "min")?;
+                let hi = whole(arg(args, 1)?, "max")?;
                 if lo > hi {
                     return Err(Control::Error(RuntimeError::new(format!(
                         "random_int: min ({}) is greater than max ({})",

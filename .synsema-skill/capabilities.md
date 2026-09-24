@@ -202,7 +202,7 @@ synsema test --cap-set "stdout,time,random,secret,file=scratch_*" program.syn
   ceiling doesn't cover the wildcard) — the code never rises above the ceiling.
 - Applies to `run`, `test`, `conform` (v0.6.14+ — before, `conform` silently ignored the ceiling) and `serve`. `--sandbox` and `--cap-set` are mutually exclusive; an unknown capability name errors, and (v0.6.14+) an **unknown `--flag` is a usage error (exit 2)**, not silently ignored.
 - **`--cap-set none`** = an empty ceiling (nothing, not even `stdout`). **`stdout` is a real capability under a ceiling** (v0.6.14+): a `--cap-set` without `stdout` denies output at the first `print`/`show`/`log` (`--sandbox` includes it; no ceiling = output free). The audit gained two `reason`s: `auto-granted by the runtime` (an ambient grant that succeeded now leaves a trace, `origin: runtime`) and `bundled asset (part of the program)` (a `synsema build` read).
-- **`--deterministic`** (v0.6.20+, `run`/`test`/`build`) = `--profile pure` **plus** a ceiling of `stdout` only — no `time`, no `random` (`now()`/`random()` fail with `Capability not granted`): the same program gives the same output. An alias, so combining it with `--sandbox`/`--cap-set`/`--profile native` is exit 2 (`--deterministic already fixes the ceiling …`). `build` bakes it.
+- **`--deterministic`** (v0.6.20+, `run`/`test`/`build`) = `--profile pure` **plus** a ceiling of `stdout` only — no `time`, no `random` (`now()`/`random()` fail with `Capability not granted`): the same program gives the same output. What stays available because it is pure (v0.6.29+): seeded generators (`rng(seed)`, `random(g)`, `random_int(g, lo, hi)`, `shuffle`/`sample`/`choice`), the date types and `format_time`/`parse_time`/`date_parts` (they never read the clock) — see [builtins.md](builtins.md) § Seeded randomness / § Dates. An alias, so combining it with `--sandbox`/`--cap-set`/`--profile native` is exit 2 (`--deterministic already fixes the ceiling …`). `build` bakes it.
 - **The pure profile is a second, independent wall** (`--profile native|pure`, v0.6.14+): under `pure`, every filesystem/exec/socket/db/cron builtin fails with `<name>: not available in the pure profile — <why>`, regardless of the ceiling. `fetch`/`http_*` with `net`, agents, `run_program` and `remember` (in-memory) stay. `serve --profile pure` is a usage error. See [deploy.md](deploy.md) and the ceiling below compose.
 - **`attest` capability**: `require attest` lets `attest(opts)` / `attest_key(purpose)` ask the
   **platform** for an attestation document binding `report_data` to the code that is running (AWS
@@ -249,8 +249,9 @@ synsema test --cap-set "stdout,time,random,secret,file=scratch_*" program.syn
   of the same subject, under the same delegated ceiling and budgets; a cron tick runs as `cron:<job>`; `run`
   runs as the operator (`SYNSEMA_IDENTITY`, optional).
 - **The audit is a receipt.** `receipt()` turns the unit's audit (every capability asked, granted
-  or denied, with reason and source), its tokens, spend and `declassify` log into a Verifiable
-  Credential; `receipt({"sign": key, ...})` signs it (W3C Data Integrity). Derived, never
+  or denied, with reason and source), its tokens, spend, `declassify` log and — v0.6.29+ — the
+  **lineage** of every input it read (`inputs`: file path / HTTP host / query hash + sha256 of the
+  bytes received) into a Verifiable Credential; `receipt({"sign": key, ...})` signs it (W3C Data Integrity). Derived, never
   written by the program — see builtins.md § Identity documents.
 - **Scope `file`/`db`/`memory`:** a bare `--cap-set "…,file"` lets the code read any absolute path; use a prefix
   like `file=scratch_*` (or `db=:memory:`, `memory=shop-*`) so it can only touch what you intend. A ceiling

@@ -1,4 +1,4 @@
-# Data & Charts (CSV · statistics · native SVG charts · PNG/PDF export)
+# Data & Charts (CSV · Parquet · data analysis · statistics · native SVG charts · PNG/PDF export)
 
 The business-report pipeline is native: **data → aggregate → chart → deliver**, with no
 external libraries. All builtins on this page are **pure** (no capability): they work in
@@ -7,7 +7,65 @@ outside, transform inside).
 
 Everything is **data-source-agnostic**: charts and CSV consume plain values (lists, maps,
 arrays) — the same rows whether they came from `sql()` (SQLite/Postgres/MySQL),
-`mongo_find`, `csv_parse`, `http_get` or a literal.
+`mongo_find`, `csv_parse`, `parquet_read`, `jsonl_decode`, `http_get` or a literal.
+
+## Data analysis — tables are lists of maps (v0.6.29+)
+
+The pandas/polars workflow without a DataFrame: a **table is a list of maps** (the shape `sql()`,
+`csv_parse`, `parquet_read`, `jsonl_decode` give), and every step takes rows and returns rows.
+Contracts of each builtin: [builtins.md](builtins.md) § Tables, § Reductions — the common rules,
+§ Dates, § Parquet.
+
+```synsema
+let raw be `order,day,region,amount
+1,2026-01-05,north,120.50
+2,2026-01-06,south,80
+3,2026-01-19,north,
+4,2026-02-02,west,150.25
+5,2026-02-03,north,200`
+
+-- 1. Load with TYPES (an empty field is nothing = missing)
+let rows be csv_parse(raw, {"types": {"order": "int", "day": "date", "amount": "float"}})
+-- Parquet instead: parquet_read(read_file_bytes("sales.parquet")) comes already typed
+
+-- 2. Decide what missing means: here, an order without an amount is dropped
+let clean be drop_missing(rows, "amount")
+
+-- 3. Group and aggregate (one row per region)
+let by_region be summarize(clean, "region", {"total": sum_of("amount"), "orders": count(), "avg": mean_of("amount")})
+
+-- 4. Sort, biggest first
+let ranked be sort_by(by_region, (r) => r.total, desc = true)
+each r in ranked
+    print(`{r.region}: {r.total} in {r.orders} orders`)
+
+-- 5. By month: truncate the date, then summarize with a function key (it lands in column "key")
+let monthly be summarize(clean, (r) => format_time(truncate(r.day, "month"), "%Y-%m"), {"total": sum_of("amount")})
+
+-- 6. Deliver: a chart, a CSV, or both
+let svg be chart_svg("bar", ranked, {"x": "region", "y": "total", "title": "Sales by region"})
+print(csv_encode(monthly))
+```
+(`synsema run` it as is — pure, no capabilities. With files: `require file.read("./data/*")` +
+`read_file`, `require file.write("./out/*")` + `write_file("./out/sales.svg", svg)`.)
+
+**The missing-data model** (polars/SQL): `nothing` = a MISSING value, NaN = an INVALID number.
+- Reductions and `*_of` aggregates **skip `nothing`** and **propagate NaN** — `mean([1, nothing, 3])`
+  → `2.0`, `sum([1, nan])` → `nan`. All values missing → error (`sum_of` of an all-missing group →
+  `0`, the other aggregates → `nothing`).
+- Where missing comes from: an empty CSV field, a Parquet/SQL null, a cell with no match in
+  `join`/`pivot`.
+- Tools: `is_missing(x)`, `drop_missing(rows, cols?)`, `fill_missing(rows, value | {col: value})`,
+  `fill_nan(xs, number)`. Choose on purpose — dropping and filling give different answers.
+- `std`/`var` are **sample** (`ddof = 1`, like pandas); population is `std(xs, ddof = 0)`.
+
+**pandas / polars → Synsema**, one line each: `df.groupby("r").agg(...)` → `summarize(rows, "r", {...})` ·
+`df.merge(o, on="id", how="left")` → `join(rows, o, "id", "left")` · `pivot_table` → `pivot(rows, i, c, v, sum_of(v))` ·
+`value_counts()` → `count_by(rows, "col")` · `dropna()`/`fillna(0)` → `drop_missing(rows)`/`fill_missing(rows, 0)` ·
+`sort_values("t", ascending=False)` → `sort_by(rows, (r) => r.t, desc = true)` · `df["col"]` → `collect(rows, "col")` ·
+`df[df.x > 2]` → `where(rows, (r) => r.x > 2)` · `pd.to_datetime` → `date(x)`/`datetime(x)` · `dt.to_period("M")` →
+`truncate(d, "month")` · `read_parquet`/`to_parquet` → `parquet_read`/`parquet_write` · `read_json(lines=True)` →
+`jsonl_decode`. More in [python-diff.md](python-diff.md).
 
 ## CSV — `csv_parse` / `csv_encode`
 
@@ -16,33 +74,44 @@ delimiters/quotes/newlines, `""` escapes, CRLF and LF, UTF-8 BOM tolerated. File
 through `read_file`/`write_file` (their own capabilities).
 
 ```
-let rows be csv_parse(read_file("ventas.csv"), {"numbers": true})
--- rows is a LIST OF MAPS — the same shape sql() returns → group_by/chart directly
+let rows be csv_parse(read_file("ventas.csv"), {"types": {"monto": "decimal", "fecha": "date"}})
+-- rows is a LIST OF MAPS — the same shape sql() returns → summarize/chart directly
 write_file("out.csv", csv_encode(rows))
 ```
 
-- `csv_parse(text, opts?)` → list of maps (first row = headers). Opts:
+- `csv_parse(text, opts?)` → list of maps (first row = headers). **An empty field is `nothing`**
+  (missing — v0.6.29+; it was `""`). Opts:
+  - `"types": {"col": "int" | "float" | "decimal" | "text" | "bool" | "date" | "datetime"}` —
+    the type of each named column (v0.6.29+, the recommended form). A field that does not fit →
+    error with line and column (`csv_parse: line 2, column "a": "x" is not a int`). Needs headers.
+  - `"numbers": true` → every numeric-looking field becomes a number (a guess: `"007"` → `7`).
+    **Default is lossless text** (`"00123"` stays `"00123"`; `"inf"`/`"nan"` are never converted)
   - `"headers": false` → list of lists (all rows are data)
   - `"delimiter": ";"` (or `"\t"`) — single ASCII char
-  - `"numbers": true` → numeric-looking fields become numbers. **Default is lossless
-    text** (`"00123"` stays `"00123"`; `"inf"`/`"nan"` are never converted)
 - `csv_encode(value, opts?)` → text. Value = list of maps (headers from the first map's
   keys, in order) or list of lists. Opts: `"headers": [..]` (column order/subset),
   `"delimiter"`, `"eol"` (`"\r\n"` default — Excel-friendly; or `"\n"`).
 - Guarantees: minimal quoting; integers without decimals (`42`, not `42.0`); `nothing` →
-  empty field; `bytes` → base64; **`secret` → `[redacted]`** (never the plaintext); nested
+  empty field (and back to `nothing` on parse); dates/datetimes → ISO text; `bytes` → base64; **`secret` → `[redacted]`** (never the plaintext); nested
   list/map → clear error suggesting `json_encode` for that field.
 - Errors always carry the line/row: unclosed quote, uneven field count, duplicate
   headers, unknown option (typo guard). All catchable with `try`/`recover`.
 
-## Descriptive statistics — `median` / `percentile` / `histogram`
+## Descriptive statistics — `median` / `percentile` / `quantile` / `std` / `histogram`
 
-Work on a list of numbers OR a numeric `array` (same result). Empty data or NaN → clear
-error (never a silent garbage median).
+Work on a list of numbers OR a numeric `array` (same result), under the common rules of every
+reduction (v0.6.29+): `nothing` is skipped as missing, NaN propagates (`median` of data with a
+NaN is `nan` — it used to error), all values missing or empty data → clear error, decimals stay
+decimal. Full rules: [builtins.md](builtins.md) § Reductions — the common rules.
 
 - `median(x)` → number (even N → mean of the two middle values)
 - `percentile(x, p)` → number; `p` ∈ [0,100], **linear interpolation** (NumPy default;
   `percentile(x, 50) == median(x)`)
+- `quantile(x, q)` → the same with `q` ∈ [0, 1] (`quantile(x, 0.5) == median(x)`). `synsema check`
+  warns on `percentile(x, 0.5)` — a fraction belongs to `quantile`.
+- `std(x)` / `var(x)` → **sample** (`ddof = 1`, like pandas / Excel `STDEV.S`); population:
+  `std(x, ddof = 0)`. `corr`, `cov`, `polyfit`/`polyval`, `lstsq`, `mode`, `cumsum`, `diff`:
+  [builtins.md](builtins.md) § Statistics and fitting.
 - `histogram(x, bins?)` → `{"counts": [...], "edges": [...]}`. `bins` = integer (default
   10) or explicit ascending edge list. NumPy semantics: `length(edges) == length(counts)+1`,
   half-open bins `[a,b)` except the last `[a,b]`; with explicit edges, out-of-range values
@@ -61,8 +130,8 @@ or edit as text. Deterministic: same input → byte-identical SVG (cacheable).
 
 | Shape | Example | Kinds |
 |---|---|---|
-| list of maps (rows) + `{"x": ..., "y": ...}` | `sql(...)` / `csv_parse(...)` output | all except histogram (heatmap also needs `"value"`) |
-| map label → value | `{"ene": 10, "feb": 25}` (natural after `group_by`+`reduce`) | bar, line, area, pie, donut; **waterfall (label → DELTA)**; boxplot (label → LIST of numbers) |
+| list of maps (rows) + `{"x": ..., "y": ...}` | `sql(...)` / `csv_parse(...)` / `summarize(...)` output | all except histogram (heatmap also needs `"value"`) |
+| map label → value | `{"ene": 10, "feb": 25}` | bar, line, area, pie, donut; **waterfall (label → DELTA)**; boxplot (label → LIST of numbers) |
 | list of numbers | `[3, 1, 4]` (x = index) | bar, line, area, histogram, boxplot (one box) |
 | list of `[x, y]` pairs | `[[1, 2], [3, 4]]` | line, scatter, area |
 | 1-D `array` | `linspace(0, 1, 50)` results | bar, line, area, histogram, boxplot |
@@ -180,11 +249,12 @@ serve on 8080
   (by design, so a typo never silently ignores your intent). Unknown opts and opts on the
   wrong kind also error, naming what IS valid.
 - NaN/infinite values anywhere in plotted data → clear error; filter with
-  `where(...)` + `is_finite(...)` first.
+  `where(...)` + `is_finite(...)` first (or `fill_nan`). A `nothing` in a numeric column is
+  missing data — `drop_missing(rows, "col")` or `fill_missing` before charting.
 - Pie/donut take ONE series of non-negative values; a map of label→value is the natural
   input.
-- CSV parse is lossless text by default — pass `{"numbers": true}` when you want numbers
-  (round-trips: `csv_parse(csv_encode(x), {"numbers": true}) == x`).
+- CSV parse is lossless text by default — type the columns you need with
+  `{"types": {"col": "int"}}` (or the old guess `{"numbers": true}`); an empty field is `nothing`.
 - Charts are server-side SVG — for client-side interactivity (tooltips/zoom) serve a JS
   chart library from `static/` and feed it JSON; both approaches compose.
 - A `secret` as a label renders `[redacted]`; as a numeric value it is a type error.

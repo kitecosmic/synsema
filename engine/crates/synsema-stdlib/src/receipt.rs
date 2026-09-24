@@ -152,6 +152,27 @@ pub fn build_receipt(
         .collect();
     subject.insert("declassified".to_string(), syn_list(declassified));
     subject.insert("steps".to_string(), syn_int(interp.steps() as i64));
+    // v0.6.29 (DATOS-17): el LINAJE — cada dato que el programa leyó (archivo, host, consulta,
+    // stdin) con el sha256 de lo que recibió. Lo anota el motor, no el programa: con el
+    // `program_sha`, el `engine` y el `declared_result_sha256` el recibo dice qué entradas,
+    // qué programa y qué salida, y cualquiera lo verifica recalculando los hashes.
+    let inputs: Vec<SynValue> = interp
+        .lineage()
+        .iter()
+        .map(|e| {
+            let mut m = IndexMap::new();
+            m.insert("source".to_string(), syn_text(e.source.clone()));
+            m.insert("what".to_string(), syn_text(e.what.clone()));
+            m.insert("sha256".to_string(), syn_text(e.sha256.clone()));
+            m.insert("bytes".to_string(), syn_int(e.bytes as i64));
+            syn_map(m)
+        })
+        .collect();
+    let truncated = inputs.len() >= synsema_core::interpreter::MAX_LINEAGE;
+    subject.insert("inputs".to_string(), syn_list(inputs));
+    if truncated {
+        subject.insert("inputs_truncated".to_string(), SynValue::Bool(true));
+    }
     subject.insert(
         "program_sha".to_string(),
         crate::attest::current_program_sha().map(|s| syn_text(hex_encode(&s))).unwrap_or_else(syn_nothing),

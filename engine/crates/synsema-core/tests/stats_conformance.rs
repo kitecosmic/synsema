@@ -119,12 +119,13 @@ fn arrays_and_lists_agree() {
 #[test]
 fn errors_empty_nan_and_bad_p() {
     fails_with("median([])", "empty");
-    fails_with("median([1, nan, 3])", "NaN");
+    // v0.6.29: NaN se PROPAGA en toda reducción (antes median daba error).
+    shows("text(is_nan(median([1, nan, 3])))", "true");
     fails_with("percentile([1, 2], 101)", "between 0 and 100");
     fails_with("percentile([1, 2], -1)", "between 0 and 100");
     fails_with("histogram([1, 2], [3, 2])", "strictly increasing");
     fails_with("histogram([1, 2], 0)", "at least 1");
-    fails_with("median([1, \"x\"])", "expects a list of numbers");
+    fails_with("median([1, \"x\"])", "expects numbers");
     fails_with("median(\"nope\")", "list of numbers or an array");
 }
 

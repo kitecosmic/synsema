@@ -43,6 +43,14 @@ actually changes behavior:
 | `evm_tx` without `to` → error pointing to `evm_tx_create` | Contract creation has its own builder that computes the address and checks the signer | `evm_tx_create({…, "from": addr, "data": init_code})` |
 | A loop that used to stop at `Loop exceeded maximum iterations` now runs forever | `while` has no iteration cap (it was 1,000,000) | Make the condition change; bound it yourself if you relied on the cap |
 | Output of a long `synsema run` appears as it happens | `print` under `run` is written line by line (it was held until the end) | Nothing — `flush()` is no longer needed there |
+| `std`/`var` give a larger number than before (`std([1,2,3,4])` → `1.29…`, was `1.118…`) | `std`/`var` are **sample** statistics now (`ddof = 1`, like pandas/polars/R/Excel `STDEV.S`); they were population. `synsema check` warns at each call | Nothing if you wanted what pandas gives. For the old (numpy) value: `std(xs, ddof = 0)` |
+| `keys() requires a map` / `an index must be an integer, got text` on the result of `group_by` (`keys(groups)`, `groups["north"]`) | `group_by` returns **`[{key, items}]`** in first-appearance order (it returned a map keyed by the TEXT of the key); keys keep their type | `each g in group_by(rows, "region")` … `g.key` / `g.items`; for totals per group use `summarize(rows, "region", {"total": sum_of("amount")})` |
+| `dot(...)` errors `use matmul(a, b)` | `dot` is only the inner product of two **1-D vectors** now | `matmul(a, b)` for matrices; `dot(u, v)` for vectors |
+| A CSV field that was `""` is now `nothing` (and `text + nothing` errors, `== ""` is false) | `csv_parse` reads an **empty field as `nothing`** — missing data | `is_missing(x)` / `fill_missing(rows, "")` if you want the old empty text; `drop_missing(rows, "col")` to drop them |
+| `min([nan, 3])` is now `nan` (it gave `3`); `median` of data with a NaN returns `nan` instead of erroring | NaN **propagates** through every reduction, in any position; `nothing` is what gets skipped | `fill_nan(xs, 0)` or `where(xs, is_finite)` before reducing |
+| `format_time` / `parse_time` / `date_parts` work without `require time` | They never read the clock, so they are **pure** now; only `now()` and `sleep()` need `time` | Nothing (drop the `require time` if it was only for them) |
+| `random_int(1.5, 6)` errors | `random_int` bounds must be integers (1.5 used to be truncated) | `random_int(floor(x), 6)` on purpose |
+| `round_to(2.675, 2)` → `2.67` | `round_to` rounds the float's REAL value like Python (2.675 is 2.67499…); it used to multiply by 10ⁿ | For decimal-exact rounding use decimals: `round_to(2.675d, 2)` → `2.68`; they round half to EVEN (`round_to(1.005d, 2)` → `1.00`, `round_to(2.665d, 2)` → `2.66`) |
 
 ## Upgrading to v0.6.24 — what stops working and what to write instead
 
@@ -378,7 +386,7 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `bytes("0x9", "hex")` for a quantity | Error — odd length (the message points to `int("0x9")`) | `bytes(…, "hex")` is for data (the `0x` prefix is accepted since v0.6.29); a quantity is `int("0x9")` |
 | `sqrt(-1)` returns a complex number | Returns `NaN` (real math is unchanged) | Use `sqrt(complex(-1, 0))` → `complex(0,1)` for the complex root |
 | `complex(1,0) < complex(2,0)` works | Error: "complex numbers are not ordered" | Complex has no ordering (like Python). Compare `abs(z)` if you need magnitude. |
-| `array * array` is the matrix product | It's **elementwise** (Hadamard) | Use `matmul(a, b)` (or `dot`) for the matrix product. `*` is elementwise. |
+| `array * array` is the matrix product | It's **elementwise** (Hadamard) | Use `matmul(a, b)` for the matrix product (`dot` is 1-D vectors only since v0.6.29). `*` is elementwise. |
 | `inv`/`solve` of a singular matrix returns NaN | It **errors** (no silent NaN) | Check `det(A)` first, or `try/recover` |
 | Linear algebra works on n-D arrays | LA (`solve`/`det`/`eig`/`svd`) is **2D only** | Reshape to 2D; n-D is for storage/vectorized math (like `numpy.linalg`) |
 | An array holds ints/strings | Arrays are **f64** only (this version) | Use a `list` for mixed/other types; `to_list(a)` converts back |
@@ -394,7 +402,9 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `1e18` is an exact wei amount | `1e18` is a **float** (like Python) — `abi_encode` rejects it for a uint256, and a float is not exact money | `10**18` or `1_000_000_000_000_000_000` |
 | `sort([1, "a"])` puts numbers first | Error `cannot order number and text together`; maps → `… has no order` | Make the values comparable; `nothing`/NaN are fine (they go last, NaN before nothing) |
 | `sort(["b", "a", "C"])` is case-insensitive | Text sorts by code point: `["C", "a", "b"]` | `sort_by(xs, (s) => lower(s))` |
-| `min([3, nothing, 1])` errors | `nothing` is skipped as missing data → `1`; a NaN anywhere → NaN; all missing → error | Filter first if missing must be loud |
+| `min([3, nothing, 1])` errors | `nothing` is skipped as missing data → `1`; a NaN anywhere → NaN; all missing → error. Every reduction behaves the same (`sum`, `mean`, `median`, `std`, … — v0.6.29) | Filter first if missing must be loud |
+| `std(xs, 0)` is the population std | Error (`std() takes a list (or an array)` on a list; on an array the positional 2nd argument is the **axis**) | `ddof` is named-only: `std(xs, ddof = 0)` |
+| `length(array([[1,2],[3,4]]))` counts every element | It is the **first dimension** (`2`), like numpy `len` (v0.6.29) | `size(a)` for the total (`4`) |
 | `"x"[0]` / `xs[-1]` error | They work since v0.6.29 (text is indexable by character; negatives from the end) | — |
 | `f(x = 1)` and `f(x == 1)` are the same | `=` is a **named arg**; `==` is an equality expression passed positionally | Use `=` for named args/defaults, `==` for comparison |
 | `test "..."` blocks run under `synsema run` | They're **skipped** by `run`; only `synsema test` runs them | Run `synsema test file.syn`. See [testing.md](testing.md). |
@@ -407,7 +417,22 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 
 | What you expect | What actually happens | Why / workaround |
 |---|---|---|
-| `csv_parse` converts `"42"` to a number | Everything stays **text** by default (lossless: `"00123"` is preserved) | Pass `{"numbers": true}` to convert numeric-looking fields |
+| `csv_parse` converts `"42"` to a number | Everything stays **text** by default (lossless: `"00123"` is preserved) | Type the columns: `{"types": {"qty": "int", "price": "decimal", "day": "date"}}` (v0.6.29). `{"numbers": true}` still exists but guesses (`"007"` → `7`) |
+| An empty CSV cell is `""` | It is **`nothing`** (missing) since v0.6.29, typed or not | `drop_missing(rows, "col")` / `fill_missing(rows, {"col": 0})` on purpose |
+| `percentile(xs, 0.9)` is the 90th percentile | `percentile` takes **p ∈ [0, 100]** — that is the 0.9th percentile; `synsema check` warns on a literal in (0, 1) | `quantile(xs, 0.9)` (q ∈ [0, 1]) or `percentile(xs, 90)`. `quantile(xs, 90)` errors (`between 0 and 1`) |
+| `join(rows, other, "id")` joins text | With 3–4 arguments `join` joins **tables**; with 2 it joins text (`join(xs, ", ")`) | Arity decides — `join(xs, sep)` is unchanged |
+| A repeated column after `join` overwrote mine | The right side's non-key column gets the suffix **`_right`** (`a`, `a_right`) | Rename or `collect` the one you want after the join |
+| `pivot` keeps the first value when two rows share a cell | **Error** `… rows fall in the same cell … — pass agg` (never a silent first) | `pivot(rows, "day", "product", "qty", sum_of("qty"))` |
+| `summarize(rows, (r) => …, aggs)` keeps a column with my name | With a **function** key the key goes in a column called `key`; with a column name it keeps that name | Name the key column afterwards, or group by a real column |
+| `parquet_write` of rows with a list/map value, or a column mixing int and text | Error — Parquet here is flat and one type per column (`… mixes …`, `json_encode` first) | `json_encode` the nested column; make the column one type (int + float is fine → DOUBLE). A `duration` → store `in_units(d, "seconds")` |
+| `parquet_read` in the browser/wasm build | Not there — Parquet is native only | Convert on the server, ship JSON/JSONL |
+| `date(2026, 1, 1) + duration(hours = 1)` | Error: `a date moves by whole days — use a datetime …` | `datetime(d, "UTC") + duration(hours = 1)` (or the right zone) |
+| `datetime("2026-03-29T02:30:00", "Europe/Madrid")` | Error: that local time **does not exist** (DST gap); a repeated local time (fall back) takes the first | Build from UTC or an offset (`datetime("…T01:30:00Z")`), or catch it and move the time |
+| `dt + duration(days = 1)` keeps the wall-clock time | A duration is **elapsed** time: across a DST change `+1 day` lands an hour off (Madrid 12:00 → 13:00) | `add_days(dt, 1)` (same local time), `add_months` for months |
+| `datetime("2026-01-03T10:00:00-03:00")` keeps `-03:00` | An offset without a zone name is stored as the instant and shown in **UTC** (`…13:00:00Z`) | Pass the zone: `datetime("2026-01-03T10:00:00", "America/Buenos_Aires")`, or `to_timezone(dt, "America/Buenos_Aires")` |
+| `date("31/01/2026")` | Error — `date(text)` is ISO only (`YYYY-MM-DD`) | `parse_date("31/01/2026", "%d/%m/%Y")` |
+| `let h be g` gives an independent copy of the generator `g` | A generator is ONE stream: `g` and `h` take turns on the same sequence | Separate streams need separate seeds: `rng(1)`, `rng(2)` |
+| `rng(seed)` for a token/password/nonce | It is a reproducible PRNG — anyone with the seed has the output | `token()` / `random_bytes(n)` + `require random` |
 | A 9th series/pie-slice picks a 9th color | **Error** — colors are never cycled (colorblind-safety: the fixed order is the mechanism) | Group the tail into an "Other" bucket, or pass your own `{"colors": [...]}` |
 | `{"x": "mes"}` works with a map or number list | Error: `x`/`y` only apply to a **list of maps** (rows) | Other shapes carry their own x (labels/index/pairs) — drop the opts |
 | A NaN/infinite value plots as a gap | **Error** (a silent gap or a broken SVG would lie to the reader) | Filter first with `where(...)` + `is_finite(...)` |

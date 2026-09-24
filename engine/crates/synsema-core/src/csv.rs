@@ -176,6 +176,11 @@ fn field_as_number(s: &str) -> Option<Number> {
 }
 
 fn field_value(s: &str, numbers: bool) -> SynValue {
+    // v0.6.29 (DATOS-6): un campo vacío es un dato FALTANTE → `nothing` (y `csv_encode` escribe
+    // `nothing` como vacío: la ida y vuelta es simétrica).
+    if s.is_empty() {
+        return SynValue::Nothing;
+    }
     if numbers {
         if let Some(n) = field_as_number(s) {
             return syn_number(n);
@@ -213,9 +218,13 @@ pub fn csv_parse(args: &[SynValue]) -> Result<SynValue, Control> {
             )))
         }
     };
-    let opts = opts_map(args, "csv_parse", &["headers", "delimiter", "numbers"])?;
+    let opts = opts_map(args, "csv_parse", &["headers", "delimiter", "numbers", "types"])?;
     let headers = opt_bool(&opts, "headers", true, "csv_parse")?;
     let numbers = opt_bool(&opts, "numbers", false, "csv_parse")?;
+    let types = opt_types(&opts)?;
+    if types.is_some() && !headers {
+        return Err(err("csv_parse: \"types\" names columns, so it needs headers (drop {\"headers\": false})"));
+    }
     let delim = opt_delimiter(&opts, "csv_parse")?;
 
     // BOM UTF-8 tolerado al inicio (Excel lo escribe); texto vacío → [].
@@ -258,17 +267,81 @@ pub fn csv_parse(args: &[SynValue]) -> Result<SynValue, Control> {
             )));
         }
     }
-    let rows = records[1..]
-        .iter()
-        .map(|rec| {
-            let mut m = IndexMap::with_capacity(header_row.len());
-            for (h, f) in header_row.iter().zip(rec.iter()) {
-                m.insert(h.clone(), field_value(f, numbers));
+    if let Some(ts) = &types {
+        for c in ts.keys() {
+            if !header_row.contains(c) {
+                return Err(err(format!("csv_parse: \"types\" names column {:?}, which is not in the header", c)));
             }
-            syn_map(m)
-        })
-        .collect();
+        }
+    }
+    let mut rows = Vec::with_capacity(records.len().saturating_sub(1));
+    for (ri, rec) in records[1..].iter().enumerate() {
+        let mut m = IndexMap::with_capacity(header_row.len());
+        for (h, f) in header_row.iter().zip(rec.iter()) {
+            let v = match types.as_ref().and_then(|t| t.get(h)) {
+                Some(ty) => typed_field(f, ty, h, ri + 2)?,
+                None => field_value(f, numbers),
+            };
+            m.insert(h.clone(), v);
+        }
+        rows.push(syn_map(m));
+    }
     Ok(syn_list(rows))
+}
+
+/// `{"types": {"col": "int" | "float" | "decimal" | "text" | "bool"}}` (v0.6.29, DATOS-16):
+/// el tipo de cada columna, en vez de adivinar con `numbers: true` (que convierte `"007"` en 7
+/// en todo el archivo). Un campo que no es de su tipo es error con línea y columna.
+fn opt_types(opts: &IndexMap<String, SynValue>) -> Result<Option<IndexMap<String, String>>, Control> {
+    match opts.get("types") {
+        None | Some(SynValue::Nothing) => Ok(None),
+        Some(SynValue::Map(m)) => {
+            let mut out = IndexMap::new();
+            for (k, v) in m.borrow().iter() {
+                let t = match v {
+                    SynValue::Text(t) if matches!(t.as_ref(), "int" | "float" | "decimal" | "text" | "bool" | "date" | "datetime") => t.to_string(),
+                    other => {
+                        return Err(err(format!(
+                            "csv_parse: type of column {:?} must be \"int\", \"float\", \"decimal\", \"text\", \"bool\", \"date\" or \"datetime\", got {}",
+                            k, other
+                        )))
+                    }
+                };
+                out.insert(k.clone(), t);
+            }
+            Ok(Some(out))
+        }
+        Some(other) => Err(err(format!("csv_parse: option \"types\" must be a map column → type, got {}", other.type_name()))),
+    }
+}
+
+fn typed_field(s: &str, ty: &str, col: &str, line: usize) -> Result<SynValue, Control> {
+    if s.is_empty() {
+        return Ok(SynValue::Nothing);
+    }
+    let article = if matches!(ty, "int") { "an" } else { "a" };
+    let bad = || err(format!("csv_parse: line {}, column {:?}: {:?} is not {} {}", line, col, s, article, ty));
+    let t = s.trim();
+    Ok(match ty {
+        "text" => syn_text(s),
+        "int" => {
+            let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(bad());
+            }
+            syn_number(Number::from_bigint(t.parse::<BigInt>().map_err(|_| bad())?))
+        }
+        "float" => syn_number(Number::Float(t.parse::<f64>().map_err(|_| bad())?)),
+        "decimal" => syn_number(Number::Decimal(rust_decimal::Decimal::from_str_exact(t).map_err(|_| bad())?)),
+        "date" => crate::temporal::date(&[syn_text(t)]).map_err(|_| bad())?,
+        "datetime" => crate::temporal::datetime(&[syn_text(t)]).map_err(|_| bad())?,
+        "bool" => match t.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => crate::types::syn_bool(true),
+            "false" | "0" | "no" => crate::types::syn_bool(false),
+            _ => return Err(bad()),
+        },
+        _ => unreachable!(),
+    })
 }
 
 // =========================================================
@@ -328,6 +401,7 @@ fn encode_field(v: &SynValue, row: usize, col: &str) -> Result<String, Control> 
         SynValue::Number(n) => Ok(n.to_string()),
         SynValue::Bool(b) => Ok(if *b { "true" } else { "false" }.to_string()),
         SynValue::Nothing => Ok(String::new()),
+        SynValue::Time(t) => Ok(t.to_string()),
         SynValue::Bytes(b) => Ok(b64_encode(b)),
         // G8: un secret JAMÁS se filtra a un CSV (espeja json_encode).
         SynValue::Secret(_) => Ok("[redacted]".to_string()),

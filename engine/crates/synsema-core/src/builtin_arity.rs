@@ -6,7 +6,58 @@
 //! builtin de aridad fija que además acepta opcionales. Los de aridad fija exacta no hace
 //! falta listarlos: su `param_count` ya es la verdad.
 
+/// Argumentos SÓLO por nombre de builtins que además aceptan posicionales (v0.6.29, DATOS-4):
+/// `sum(m, axis = 0)`, `std(xs, ddof = 0)`. No cuentan para la aridad posicional. El builtin
+/// los lee con `Interpreter::kwarg`.
+pub const BUILTIN_KWARGS: &[(&str, &[&str])] = &[
+    ("sum", &["axis"]),
+    ("product", &["axis"]),
+    ("mean", &["axis"]),
+    ("min", &["axis"]),
+    ("max", &["axis"]),
+    ("median", &["axis"]),
+    ("percentile", &["axis"]),
+    ("quantile", &["axis"]),
+    ("std", &["axis", "ddof"]),
+    ("var", &["axis", "ddof"]),
+    ("argmin", &["axis"]),
+    ("argmax", &["axis"]),
+    ("cumsum", &["axis"]),
+    ("diff", &["axis"]),
+    ("concat", &["axis"]),
+    ("stack", &["axis"]),
+    ("cov", &["ddof"]),
+    ("random_normal", &["mean", "std"]),
+];
+
+pub fn kwargs_of(name: &str) -> &'static [&'static str] {
+    BUILTIN_KWARGS.iter().find(|(n, _)| *n == name).map(|(_, k)| *k).unwrap_or(&[])
+}
+
 pub const BUILTIN_ARITY: &[(&str, usize, Option<usize>)] = &[
+    ("random", 0, Some(1)),
+    ("random_int", 2, Some(3)),
+    ("parquet_write", 1, Some(2)),
+    ("sum", 1, Some(2)),
+    ("product", 1, Some(2)),
+    ("mean", 1, Some(2)),
+    ("min", 1, None),
+    ("max", 1, None),
+    ("median", 1, Some(2)),
+    ("percentile", 2, Some(3)),
+    ("quantile", 2, Some(3)),
+    ("std", 1, Some(2)),
+    ("var", 1, Some(2)),
+    ("date", 1, Some(3)),
+    ("datetime", 1, Some(7)),
+    ("parse_date", 1, Some(2)),
+    ("parse_datetime", 1, Some(3)),
+    ("date_range", 2, Some(3)),
+    ("jsonl_decode", 1, Some(2)),
+    ("drop_missing", 1, Some(2)),
+    ("count_by", 1, Some(2)),
+    ("join", 2, Some(4)),
+    ("pivot", 4, Some(5)),
     ("hmac", 2, Some(3)),
     ("evm_nonce", 2, Some(3)),
     ("solana_tx", 1, Some(2)),
@@ -117,9 +168,6 @@ pub const BUILTIN_ARITY: &[(&str, usize, Option<usize>)] = &[
     ("keystore_export", 2, Some(3)),
     ("keystore_import", 2, Some(3)),
     ("llm_step", 1, Some(3)),
-    ("max", 1, None),
-    ("mean", 1, Some(2)),
-    ("min", 1, None),
     ("mnemonic_from_entropy", 1, Some(2)),
     ("mnemonic_generate", 0, Some(2)),
     ("mnemonic_to_entropy", 1, Some(1)),
@@ -157,7 +205,6 @@ pub const BUILTIN_ARITY: &[(&str, usize, Option<usize>)] = &[
     ("proc_stats", 1, Some(1)),
     ("proc_status", 1, Some(1)),
     ("proc_wait", 1, Some(2)),
-    ("product", 1, Some(2)),
     ("psbt_decode", 1, Some(2)),
     ("push_send", 2, Some(3)),
     ("push_vapid_keys", 0, Some(0)),
@@ -230,8 +277,6 @@ pub const BUILTIN_ARITY: &[(&str, usize, Option<usize>)] = &[
     ("state_get", 1, Some(2)),
     ("state_incr", 1, Some(2)),
     ("state_set", 1, Some(2)),
-    ("std", 1, Some(2)),
-    ("sum", 1, Some(2)),
     ("svg_to_pdf", 1, Some(2)),
     ("svg_to_png", 1, Some(2)),
     ("tar_create", 1, Some(2)),
@@ -247,7 +292,6 @@ pub const BUILTIN_ARITY: &[(&str, usize, Option<usize>)] = &[
     ("totp", 1, Some(2)),
     ("totp_verify", 2, Some(3)),
     ("transform", 2, Some(3)),
-    ("var", 1, Some(2)),
     ("verify_hmac", 3, Some(4)),
     ("watch", 1, Some(2)),
     ("watch_close", 1, Some(1)),

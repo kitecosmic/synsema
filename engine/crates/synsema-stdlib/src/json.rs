@@ -35,6 +35,60 @@ pub fn register_json_builtins(interp: &Interpreter) {
         }),
     );
 
+    // v0.6.29 (DATOS-16): JSON Lines — un valor JSON por línea (logs, datasets, exportes
+    // de BigQuery/Spark). `jsonl_encode(items)` → texto con `\n` al final de cada línea;
+    // `jsonl_decode(text)` → lista (las líneas vacías se saltean; un error dice la línea);
+    // `jsonl_decode(text, default)` es la forma total.
+    interp.register_builtin(
+        "jsonl_encode",
+        1,
+        Rc::new(|_i, args, _loc| {
+            let items = match args.first() {
+                Some(SynValue::List(l)) => l.borrow().clone(),
+                Some(other) => return Err(err(format!("jsonl_encode: expected a list, got {}", other.type_name()))),
+                None => return Err(err("jsonl_encode(items)")),
+            };
+            let mut out = String::new();
+            for it in &items {
+                out.push_str(&dumps(&syn_to_json(it)));
+                out.push('\n');
+            }
+            Ok(syn_text(out))
+        }),
+    );
+    interp.register_builtin(
+        "jsonl_decode",
+        -1,
+        synsema_core::interpreter::with_fallback(
+            1,
+            Rc::new(|_i, args, _loc| {
+                let text = match args.first() {
+                    Some(SynValue::Text(t)) => t.to_string(),
+                    Some(other) => return Err(err(format!("jsonl_decode: expected text, got {}", other.type_name()))),
+                    None => return Err(err("jsonl_decode(text)")),
+                };
+                let mut out = Vec::new();
+                for (i, line) in text.lines().enumerate() {
+                    let l = line.trim();
+                    if l.is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<serde_json::Value>(l) {
+                        Ok(j) => out.push(json_to_syn(&j)),
+                        Err(e) => {
+                            return Err(err(format!(
+                                "jsonl_decode: line {}: invalid JSON: {}. To validate untrusted input without raising: jsonl_decode(text, nothing)",
+                                i + 1,
+                                e
+                            )))
+                        }
+                    }
+                }
+                Ok(synsema_core::types::syn_list(out))
+            }),
+        ),
+    );
+
     // json_for_script(value) → text: JSON seguro para incrustar en un <script> — igual que
     // json_encode pero con `<`, `>` y `&` escapados como \u00XX, así un valor que contenga
     // "</script>" no puede cerrar el tag ni inyectar HTML. Es el mismo escapado que el
@@ -203,6 +257,8 @@ fn array_view_to_json(a: &ndarray::ArrayViewD<f64>) -> Json {
 pub fn syn_to_json(v: &SynValue) -> Json {
     match v {
         SynValue::Nothing => Json::Null,
+        // v0.6.29: fecha / instante / duración → su texto ISO 8601 (lo que lee cualquier API).
+        SynValue::Time(t) => Json::Str(t.to_string()),
         SynValue::Bool(b) => Json::Bool(*b),
         SynValue::Number(Number::Int(i)) => Json::Int(*i),
         SynValue::Number(Number::Float(f)) => Json::Float(*f),

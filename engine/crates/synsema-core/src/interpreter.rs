@@ -857,6 +857,13 @@ pub struct Interpreter {
     /// texto del programa (aunque bajo PC lleve la etiqueta del contexto), y uno computado a
     /// partir de datos privados no puede serlo.
     arg_literals: u32,
+    /// Argumentos sólo-por-nombre de la llamada a builtin en curso (`BUILTIN_KWARGS`).
+    pending_kwargs: IndexMap<String, SynValue>,
+    /// Linaje (v0.6.29, DATOS-17): cada dato que el programa LEYÓ, anotado por el motor.
+    lineage: Vec<LineageEntry>,
+    /// Bytes canónicos de un valor estructurado para el linaje (el stdlib instala
+    /// `canonical_json`, RFC 8785): así cualquiera recalcula el hash de un resultado de SQL.
+    pub lineage_canonical: Option<Rc<dyn Fn(&SynValue) -> Option<Vec<u8>>>>,
 }
 
 impl Default for Interpreter {
@@ -951,6 +958,9 @@ impl Interpreter {
             label_stop: Cell::new(false),
             principals_sealed: Cell::new(false),
             arg_literals: 0,
+            pending_kwargs: IndexMap::new(),
+            lineage: Vec::new(),
+            lineage_canonical: None,
         };
         interp.register_builtins();
         interp
@@ -1679,6 +1689,12 @@ impl Interpreter {
             let f = bt.func.clone();
             self.call_builtin_at(&f, args, loc)
         };
+        // Linaje (DATOS-17): lo que entra al programa desde afuera queda anotado por el motor.
+        if let Ok(v) = &r {
+            if LINEAGE_SOURCES.contains(&bt.name.as_str()) {
+                self.record_input(&bt.name, args, v);
+            }
+        }
         // El "missing argument" genérico de `nth` no decía de qué función ni cuántos
         // argumentos esperaba (v0.6.29, V1-E2): se completa acá, donde se sabe.
         match r {
@@ -1840,6 +1856,63 @@ impl Interpreter {
                 param_names: Some(param_names),
             })),
         );
+    }
+
+    /// Las entradas que el programa leyó hasta ahora (DATOS-17), en orden.
+    pub fn lineage(&self) -> &[LineageEntry] {
+        &self.lineage
+    }
+
+    fn record_input(&mut self, source: &str, args: &[SynValue], result: &SynValue) {
+        if self.lineage.len() >= MAX_LINEAGE {
+            return;
+        }
+        let canon = self.lineage_canonical.clone();
+        let bytes_of = |v: &SynValue| -> Vec<u8> {
+            match v {
+                SynValue::Text(_) | SynValue::Bytes(_) | SynValue::Nothing => value_bytes(v),
+                // Estructurado → JSON canónico (RFC 8785), recalculable con canonical_json(x).
+                other => canon.as_ref().and_then(|f| f(other)).unwrap_or_else(|| value_bytes(other)),
+            }
+        };
+        let (what, payload): (String, Vec<u8>) = match source {
+            "read_file" | "read_file_bytes" => (args.first().map(|a| a.to_string()).unwrap_or_default(), bytes_of(result)),
+            "read_line" => ("stdin".to_string(), bytes_of(result)),
+            s if s.starts_with("http") || s == "fetch" => {
+                // Sólo el HOST: la clave de un RPC suele viajar en la ruta o la query y un recibo
+                // firmado no la puede publicar. `http(method, url, …)` lleva la URL segunda.
+                let url = args
+                    .iter()
+                    .find_map(|a| match a {
+                        SynValue::Text(t) if t.contains("://") => Some(t.to_string()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let host = url.split("://").nth(1).unwrap_or(&url).split(['/', '?', '#']).next().unwrap_or("").to_string();
+                let body = match result {
+                    SynValue::Map(m) => m.borrow().get("body").map(|b| bytes_of(b)).unwrap_or_else(|| bytes_of(result)),
+                    other => bytes_of(other),
+                };
+                (host, body)
+            }
+            _ => {
+                // Consultas a bases de datos: el hash de la consulta ENTERA (todos sus argumentos,
+                // filtros de Mongo incluidos; puede llevar datos) y el del resultado.
+                let q = bytes_of(&SynValue::List(Rc::new(RefCell::new(args.to_vec()))));
+                (format!("query sha256:{}", sha256_hex(&q)), bytes_of(result))
+            }
+        };
+        self.lineage.push(LineageEntry {
+            source: source.to_string(),
+            what,
+            sha256: sha256_hex(&payload),
+            bytes: payload.len(),
+        });
+    }
+
+    /// Lee (y consume) un argumento sólo-por-nombre de la llamada a builtin en curso.
+    pub fn kwarg(&mut self, name: &str) -> Option<SynValue> {
+        self.pending_kwargs.shift_remove(name)
     }
 
     /// Liga cada nombre deprecado (`deprecated::DEPRECATED_NAMES`) al builtin de su nombre
@@ -2407,7 +2480,15 @@ impl Interpreter {
         self.register("enumerate", 1, Rc::new(|i, a, l| i.b_enumerate(a, l)));
         self.register("contains", 2, Rc::new(|i, a, l| i.b_contains(a, l)));
         self.register("split", 2, Rc::new(|i, a, l| i.b_split(a, l)));
-        self.register("join", 2, Rc::new(|i, a, l| i.b_join(a, l)));
+        // `join(items, sep)` une texto; `join(left, right, on, how?)` une TABLAS (v0.6.29,
+        // DATOS-14): la forma de la llamada decide, como `join` en polars.
+        self.register("join", -1, Rc::new(|i, a, l| {
+            if a.len() >= 3 {
+                crate::tabular::join(a)
+            } else {
+                i.b_join(a, l)
+            }
+        }));
         self.register("range", -1, Rc::new(|i, a, l| i.b_range(a, l)));
         self.register("type_of", 1, Rc::new(|i, a, l| i.b_type_of(a, l)));
         self.register("slice", -1, Rc::new(|i, a, l| i.b_slice(a, l)));
@@ -2502,7 +2583,8 @@ impl Interpreter {
         // deja los faltantes (`nothing`, NaN) al final igual.
         self.register_builtin_named("sort_by", vec!["items", "key", "desc"], Rc::new(|i, a, l| i.b_sort_by(a, l)));
         self.register_builtin_named("sort", vec!["items", "desc"], Rc::new(|i, a, l| i.b_sort(a, l)));
-        self.register("group_by", 2, Rc::new(|i, a, l| i.b_group_by(a, l)));
+        // v0.6.29 (DATOS-3): `[{key, items}]` en orden de aparición, la clave con su tipo.
+        self.register("group_by", 2, Rc::new(|i, a, _l| crate::tabular::group_by(i, a)));
         self.register("find_first", 2, Rc::new(|i, a, l| i.b_find_first(a, l)));
         self.register("every", 2, Rc::new(|i, a, l| i.b_every(a, l)));
         self.register("some", 2, Rc::new(|i, a, l| i.b_some(a, l)));
@@ -2554,8 +2636,8 @@ impl Interpreter {
         // signo / magnitud / selección (preservan tipo)
         self.register("abs", 1, Rc::new(|_i, a, _l| crate::math::abs(a)));
         self.register("sign", 1, Rc::new(|_i, a, _l| crate::math::sign(a)));
-        self.register("min", -1, Rc::new(|_i, a, _l| crate::math::min(a)));
-        self.register("max", -1, Rc::new(|_i, a, _l| crate::math::max(a)));
+        self.register("min", -1, Rc::new(|i, a, _l| crate::stats::builtin(i, a, crate::stats::Kind::Min)));
+        self.register("max", -1, Rc::new(|i, a, _l| crate::stats::builtin(i, a, crate::stats::Kind::Max)));
         self.register("clamp", 3, Rc::new(|_i, a, _l| crate::math::clamp(a)));
         // raíces / potencias
         self.register("sqrt", 1, Rc::new(|_i, a, _l| crate::math::sqrt(a)));
@@ -2588,13 +2670,14 @@ impl Interpreter {
         self.register("is_finite", 1, Rc::new(|_i, a, _l| crate::math::is_finite(a)));
         self.register("round_to", 2, Rc::new(|_i, a, _l| crate::math::round_to(a)));
         // agregados sobre una lista
-        self.register("sum", -1, Rc::new(|_i, a, _l| crate::math::sum(a)));
-        self.register("product", -1, Rc::new(|_i, a, _l| crate::math::product(a)));
-        self.register("mean", -1, Rc::new(|_i, a, _l| crate::math::mean(a)));
-        // Estadística descriptiva (Batch 8) — PUROS, sobre lista de números o array.
-        // percentile con interpolación lineal (NumPy default); histogram → {counts, edges}.
-        self.register("median", 1, Rc::new(|_i, a, _l| crate::math::median(a)));
-        self.register("percentile", 2, Rc::new(|_i, a, _l| crate::math::percentile(a)));
+        // v0.6.29: UNA implementación (stats.rs) para listas y arrays — `nothing` se saltea,
+        // NaN se propaga, `axis =` con nombre, `ddof = 1` por defecto, decimal se conserva.
+        self.register("sum", -1, Rc::new(|i, a, _l| crate::stats::builtin(i, a, crate::stats::Kind::Sum)));
+        self.register("product", -1, Rc::new(|i, a, _l| crate::stats::builtin(i, a, crate::stats::Kind::Product)));
+        self.register("mean", -1, Rc::new(|i, a, _l| crate::stats::builtin(i, a, crate::stats::Kind::Mean)));
+        self.register("median", -1, Rc::new(|i, a, _l| crate::stats::builtin(i, a, crate::stats::Kind::Median)));
+        self.register("percentile", -1, Rc::new(|i, a, _l| crate::stats::builtin(i, a, crate::stats::Kind::Percentile)));
+        self.register("quantile", -1, Rc::new(|i, a, _l| crate::stats::builtin(i, a, crate::stats::Kind::Quantile)));
         self.register("histogram", -1, Rc::new(|_i, a, _l| crate::math::histogram(a)));
 
         // -- CSV (Batch 8) — transformación PURA texto↔valores (csv.rs), espejo de
@@ -2647,8 +2730,74 @@ impl Interpreter {
         // y delega los arrays a `crate::arrays::flatten` (G1: no pisa el de listas).
         self.register("at", 2, Rc::new(|_i, a, _l| crate::arrays::at(a)));
         // Reducciones nuevas (std/var). sum/mean/min/max/product se extienden en math.rs.
-        self.register("std", -1, Rc::new(|_i, a, _l| crate::arrays::std(a)));
-        self.register("var", -1, Rc::new(|_i, a, _l| crate::arrays::var(a)));
+        self.register("std", -1, Rc::new(|i, a, _l| crate::stats::builtin(i, a, crate::stats::Kind::Std)));
+        self.register("var", -1, Rc::new(|i, a, _l| crate::stats::builtin(i, a, crate::stats::Kind::Var)));
+        // v0.6.29 (DATOS-11/15): combinar, ubicar, acumular, relacionar, ajustar.
+        self.register("concat", 1, Rc::new(|i, a, _l| { let ax = i.kwarg("axis"); crate::arrays::concat_or_stack(a, ax, false) }));
+        self.register("stack", 1, Rc::new(|i, a, _l| { let ax = i.kwarg("axis"); crate::arrays::concat_or_stack(a, ax, true) }));
+        self.register("argmin", 1, Rc::new(|i, a, _l| { let ax = i.kwarg("axis"); crate::arrays::arg_extreme(a, ax, false) }));
+        self.register("argmax", 1, Rc::new(|i, a, _l| { let ax = i.kwarg("axis"); crate::arrays::arg_extreme(a, ax, true) }));
+        self.register("cumsum", 1, Rc::new(|i, a, _l| { let ax = i.kwarg("axis"); crate::arrays::cumsum(a, ax) }));
+        self.register("diff", 1, Rc::new(|i, a, _l| { let ax = i.kwarg("axis"); crate::arrays::diff(a, ax) }));
+        self.register("cov", 2, Rc::new(|i, a, _l| { let d = i.kwarg("ddof"); crate::arrays::cov(a, d) }));
+        self.register("corr", 2, Rc::new(|_i, a, _l| crate::arrays::corr(a)));
+        self.register("lstsq", 2, Rc::new(|_i, a, _l| crate::arrays::lstsq(a)));
+        self.register("polyfit", 3, Rc::new(|_i, a, _l| crate::arrays::polyfit(a)));
+        self.register("polyval", 2, Rc::new(|_i, a, _l| crate::arrays::polyval(a)));
+        self.register("mode", 1, Rc::new(|_i, a, _l| crate::tabular::mode(a)));
+        // DATOS-3/6/14: tablas como listas de mapas.
+        self.register("summarize", 3, Rc::new(|i, a, _l| crate::tabular::summarize(i, a)));
+        self.register("count_by", -1, Rc::new(|i, a, _l| crate::tabular::count_by(i, a)));
+        self.register("pivot", -1, Rc::new(|i, a, _l| crate::tabular::pivot(i, a)));
+        self.register("count", 0, Rc::new(|_i, a, _l| crate::tabular::aggregator("count", a)));
+        for kind in ["sum", "mean", "min", "max", "median", "first", "n_unique"] {
+            let name = format!("{}_of", kind);
+            self.register(&name, 1, Rc::new(move |_i, a, _l| crate::tabular::aggregator(kind, a)));
+        }
+        self.register("quantile_of", 2, Rc::new(|_i, a, _l| crate::tabular::aggregator("quantile", a)));
+        self.register("is_missing", 1, Rc::new(|_i, a, _l| crate::tabular::is_missing(a)));
+        self.register("fill_missing", 2, Rc::new(|_i, a, _l| crate::tabular::fill_missing(a)));
+        self.register("drop_missing", -1, Rc::new(|_i, a, _l| crate::tabular::drop_missing(a)));
+        self.register("fill_nan", 2, Rc::new(|_i, a, _l| crate::tabular::fill_nan(a)));
+        // DATOS-17: el linaje que el motor anotó (lo mismo que `receipt()` publica en `inputs`).
+        self.register("lineage", 0, Rc::new(|i, _a, _l| {
+            let items = i
+                .lineage()
+                .iter()
+                .map(|e| {
+                    let mut m = IndexMap::new();
+                    m.insert("source".to_string(), syn_text(e.source.as_str()));
+                    m.insert("what".to_string(), syn_text(e.what.as_str()));
+                    m.insert("sha256".to_string(), syn_text(e.sha256.as_str()));
+                    m.insert("bytes".to_string(), syn_int(e.bytes as i64));
+                    syn_map(m)
+                })
+                .collect();
+            Ok(syn_list(items))
+        }));
+        // DATOS-13: fechas, instantes y duraciones como tipos (puros; sólo `now()` pide time).
+        self.register("date", -1, Rc::new(|_i, a, _l| crate::temporal::date(a)));
+        self.register("datetime", -1, Rc::new(|_i, a, _l| crate::temporal::datetime(a)));
+        self.register_builtin_named(
+            "duration",
+            vec!["days", "hours", "minutes", "seconds", "milliseconds", "weeks"],
+            Rc::new(|_i, a, _l| crate::temporal::duration(a)),
+        );
+        self.register("parse_date", -1, Rc::new(|_i, a, _l| crate::temporal::parse_date(a)));
+        self.register("parse_datetime", -1, Rc::new(|_i, a, _l| crate::temporal::parse_datetime(a)));
+        self.register("truncate", 2, Rc::new(|_i, a, _l| crate::temporal::truncate(a)));
+        self.register("add_months", 2, Rc::new(|_i, a, _l| crate::temporal::add_months(a)));
+        self.register("add_days", 2, Rc::new(|_i, a, _l| crate::temporal::add_days(a)));
+        self.register("date_range", -1, Rc::new(|_i, a, _l| crate::temporal::date_range(a)));
+        self.register("timestamp", 1, Rc::new(|_i, a, _l| crate::temporal::timestamp(a)));
+        self.register("to_timezone", 2, Rc::new(|_i, a, _l| crate::temporal::to_timezone(a)));
+        self.register("in_units", 2, Rc::new(|_i, a, _l| crate::temporal::in_units(a)));
+        // DATOS-12: generadores con semilla (puros).
+        self.register("rng", 1, Rc::new(|_i, a, _l| crate::rng::make_rng(a)));
+        self.register("random_normal", 1, Rc::new(|i, a, l| crate::rng::b_normal(i, a, l)));
+        self.register("shuffle", 2, Rc::new(|i, a, l| crate::rng::b_shuffle(i, a, l)));
+        self.register("sample", 3, Rc::new(|i, a, l| crate::rng::b_sample(i, a, l)));
+        self.register("choice", 2, Rc::new(|i, a, l| crate::rng::b_choice(i, a, l)));
         // Álgebra lineal (faer, sobre 2D).
         self.register("matmul", 2, Rc::new(|_i, a, _l| crate::arrays::matmul(a)));
         self.register("dot", 2, Rc::new(|_i, a, _l| crate::arrays::dot(a)));
@@ -4956,9 +5105,15 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // matmul/dot). Va DESPUÉS de los concats de Text/List/Bytes y de la rama Complex,
         // y ANTES del camino Number (G2: el tower no se perturba). `array_binop` devuelve
         // none si ningún operando es array → sigue al camino normal.
-        if matches!(op, "+" | "-" | "*" | "/") {
+        if matches!(op, "+" | "-" | "*" | "/" | "**" | "//" | "%") {
             if let Some(res) = crate::arrays::array_binop(&left, &right, op) {
                 return res;
+            }
+        }
+        // Fechas, instantes y duraciones (v0.6.29).
+        if matches!(op, "+" | "-" | "*" | "/") {
+            if let Some(r) = crate::temporal::binop(&left, op, &right) {
+                return r;
             }
         }
         // Aritmética — por el camino FALIBLE: mezclar Decimal con Float es un error
@@ -5033,6 +5188,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             if let (SynValue::Text(a), SynValue::Text(b)) = (&left, &right) {
                 return Ok(syn_bool(ord_op(Some(a.as_ref().cmp(b.as_ref())), op)));
+            }
+            if let (SynValue::Time(a), SynValue::Time(b)) = (&left, &right) {
+                return match crate::temporal::cmp(a, b) {
+                    Some(o) => Ok(syn_bool(ord_op(Some(o), op))),
+                    None => Err(err_at(format!("cannot order a {} and a {}", a.type_name(), b.type_name()), loc)),
+                };
             }
         }
         Err(err_at(
@@ -5576,8 +5737,27 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     }
                     None => {
                         let mut pos = Vec::with_capacity(args.len());
+                        let allowed = crate::builtin_arity::kwargs_of(&bt.name);
+                        let mut kw: IndexMap<String, SynValue> = IndexMap::new();
                         for (name, v) in args {
                             if let Some(n) = name {
+                                if allowed.contains(&n.as_str()) {
+                                    if kw.insert(n.clone(), v).is_some() {
+                                        return Err(err_at(format!("duplicate argument '{}'", n), loc));
+                                    }
+                                    continue;
+                                }
+                                if !allowed.is_empty() {
+                                    return Err(err_at(
+                                        format!(
+                                            "{}() has no argument named '{}' (named arguments it takes: {})",
+                                            bt.name,
+                                            n,
+                                            allowed.join(", ")
+                                        ),
+                                        loc,
+                                    ));
+                                }
                                 return Err(err_at(
                                     format!(
                                         "{}() does not accept named arguments (got {} = …); pass it by position",
@@ -5588,7 +5768,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                             }
                             pos.push(v);
                         }
-                        self.dispatch_builtin(&bt, &pos, loc)
+                        let saved = std::mem::replace(&mut self.pending_kwargs, kw);
+                        let r = self.dispatch_builtin(&bt, &pos, loc);
+                        self.pending_kwargs = saved;
+                        r
                     }
                 }
             }
@@ -5796,6 +5979,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             SynValue::List(l) => Ok(syn_int(l.borrow().len() as i64)),
             SynValue::Map(m) => Ok(syn_int(m.borrow().len() as i64)),
             SynValue::Bytes(b) => Ok(syn_int(b.len() as i64)),
+            // v0.6.29 (DATOS-8): la primera dimensión, como `len` de numpy (`size` es el total).
+            SynValue::Array(a) => Ok(syn_int(a.shape().first().copied().unwrap_or(0) as i64)),
             _ => Err(err(format!("Cannot get length of {}", v.type_name()))),
         }
     }
@@ -5817,6 +6002,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         match v {
             SynValue::Number(Number::Float(x)) => Ok(SynValue::Number(Number::integer_from_f64(op(*x)))),
             SynValue::Number(n) => Ok(SynValue::Number(n.clone())), // Int/Big ya son enteros
+            // v0.6.29: sobre un array, elemento a elemento (sigue siendo un array de floats).
+            SynValue::Array(a) => Ok(crate::types::syn_array(a.mapv(op))),
             _ => Err(err(format!("{} expects a number, got {}", name, v.type_name()))),
         }
     }
@@ -6693,6 +6880,16 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 let (s, e) = py_slice_range(b.len(), start, end);
                 Ok(syn_bytes(b[s..e].to_vec()))
             }
+            // v0.6.29 (DATOS-11): filas `start..end` (el primer eje), negativos incluidos.
+            SynValue::Array(a) => {
+                if a.ndim() == 0 {
+                    return Err(err("Cannot slice a 0-dimensional array"));
+                }
+                let (s, e) = py_slice_range(a.shape()[0], start, end);
+                Ok(crate::types::syn_array(
+                    a.slice_axis(ndarray::Axis(0), ndarray::Slice::from(s..e)).to_owned(),
+                ))
+            }
             _ => Err(err(format!("Cannot slice {}", coll.type_name()))),
         }
     }
@@ -7018,6 +7215,24 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_apply(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        // v0.6.29 (DATOS-11): sobre un array, elemento a elemento → array de la misma forma.
+        if let Some((func, a)) = fn_and_array(args) {
+            let mut out = Vec::with_capacity(a.len());
+            for x in a.iter() {
+                match self.call_value(func.clone(), vec![syn_float(*x)], loc)? {
+                    SynValue::Number(n) => out.push(n.to_f64()),
+                    other => {
+                        return Err(err(format!(
+                            "apply over an array needs numbers back, got {} — use to_list(a) for other results",
+                            other.type_name()
+                        )))
+                    }
+                }
+            }
+            return Ok(crate::types::syn_array(
+                ndarray::ArrayD::from_shape_vec(a.raw_dim(), out).map_err(|e| err(e.to_string()))?,
+            ));
+        }
         let (func, items) = self.dual_fn_list(args, "apply")?;
         let mut out = Vec::with_capacity(items.len());
         for item in items {
@@ -7158,6 +7373,19 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_where(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        // v0.6.29 (DATOS-11): la máscara con nombre — los elementos que cumplen, como array 1-D.
+        if let Some((pred, a)) = fn_and_array(args) {
+            let mut out = Vec::new();
+            for x in a.iter() {
+                if self.call_value(pred.clone(), vec![syn_float(*x)], loc)?.is_truthy() {
+                    out.push(*x);
+                }
+            }
+            let n = out.len();
+            return Ok(crate::types::syn_array(
+                ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[n]), out).map_err(|e| err(e.to_string()))?,
+            ));
+        }
         let (pred, items) = self.dual_fn_list(args, "where")?;
         let mut out = Vec::new();
         for item in items {
@@ -7235,23 +7463,6 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         check_orderable(&items, "sort")?;
         items.sort_by(|a, b| order_for(a, b, desc));
         Ok(syn_list(items))
-    }
-
-    fn b_group_by(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let (key_func, items) = self.dual_fn_list(args, "group_by")?;
-        let mut groups: IndexMap<String, Vec<SynValue>> = IndexMap::new();
-        for item in items {
-            // Bajo PC la clave vuelve etiquetada (`give`); el nombre del grupo es el
-            // valor interno (el mapa resultante sale etiquetado por el despacho).
-            let k = self.call_value(key_func.clone(), vec![item.clone()], loc)?;
-            let key = labels::unwrap(&k).to_string();
-            groups.entry(key).or_default().push(item);
-        }
-        let mut result = IndexMap::new();
-        for (k, v) in groups {
-            result.insert(k, syn_list(v));
-        }
-        Ok(syn_map(result))
     }
 
     fn b_find_first(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -7674,6 +7885,15 @@ fn principals_arg(
 
 /// ¿El valor es invocable? (task de usuario, lambda o builtin). La base de la regla
 /// de detección del dual-order (batch DX) y del 2º arg de `index_of`.
+/// `(función, array)` en cualquier orden, si la llamada es sobre un array.
+fn fn_and_array(args: &[SynValue]) -> Option<(SynValue, Rc<ndarray::ArrayD<f64>>)> {
+    match (args.first(), args.get(1)) {
+        (Some(SynValue::Array(a)), Some(f)) if is_callable(f) => Some((f.clone(), a.clone())),
+        (Some(f), Some(SynValue::Array(a))) if is_callable(f) => Some((f.clone(), a.clone())),
+        _ => None,
+    }
+}
+
 fn is_callable(v: &SynValue) -> bool {
     matches!(v, SynValue::Task(_) | SynValue::Builtin(_))
 }
@@ -7848,6 +8068,41 @@ fn env_with_binding_mut<R>(
             None => return None,
         }
     }
+}
+
+/// Una entrada del linaje: de dónde vino, qué fue (ruta, host, hash de la consulta) y el
+/// sha256 de los bytes que recibió el programa (para un archivo de texto, el del archivo).
+#[derive(Clone, Debug)]
+pub struct LineageEntry {
+    pub source: String,
+    pub what: String,
+    pub sha256: String,
+    pub bytes: usize,
+}
+
+/// Builtins que TRAEN datos de afuera (archivos, red, bases, stdin).
+pub const LINEAGE_SOURCES: &[&str] = &[
+    "read_file", "read_file_bytes", "read_line", "http", "http_get", "http_post", "http_put",
+    "http_delete", "http_bytes", "fetch", "sql", "mongo_find", "mongo_find_one", "mongo_aggregate",
+    "redis_get", "redis_hgetall", "redis_lrange", "redis_smembers",
+];
+
+/// Tope de entradas del linaje por corrida (un bucle que lee un millón de archivos no crece
+/// sin límite; el recibo lo dice con `inputs_truncated`).
+pub const MAX_LINEAGE: usize = 10_000;
+
+fn value_bytes(v: &SynValue) -> Vec<u8> {
+    match v {
+        SynValue::Text(t) => t.as_bytes().to_vec(),
+        SynValue::Bytes(b) => b.to_vec(),
+        SynValue::Nothing => Vec::new(),
+        other => other.to_string().into_bytes(),
+    }
+}
+
+fn sha256_hex(b: &[u8]) -> String {
+    use sha2::Digest;
+    crate::bytesutil::hex_encode(&sha2::Sha256::digest(b))
 }
 
 /// Aridad ESTRICTA de una llamada escrita en el programa (v0.6.29): un argumento de más
@@ -8060,6 +8315,7 @@ fn order_class(v: &SynValue) -> Option<&'static str> {
         SynValue::Bool(_) => Some("bool"),
         SynValue::Bytes(_) => Some("bytes"),
         SynValue::List(_) => Some("list"),
+        SynValue::Time(t) => Some(t.type_name()),
         _ => None,
     }
 }
@@ -8078,6 +8334,7 @@ pub(crate) fn total_cmp(a: &SynValue, b: &SynValue) -> Ordering {
         (SynValue::Text(x), SynValue::Text(y)) => x.as_ref().cmp(y.as_ref()),
         (SynValue::Bool(x), SynValue::Bool(y)) => x.cmp(y),
         (SynValue::Bytes(x), SynValue::Bytes(y)) => x.as_ref().cmp(y.as_ref()),
+        (SynValue::Time(x), SynValue::Time(y)) => crate::temporal::cmp(x, y).unwrap_or(Ordering::Equal),
         (SynValue::List(x), SynValue::List(y)) => {
             let (x, y) = (x.borrow(), y.borrow());
             for (p, q) in x.iter().zip(y.iter()) {

@@ -6,7 +6,8 @@ Single static binary. The HTTP server runs on an async `hyper`/`tokio` stack; bu
 see [builtins.md](builtins.md).
 
 > **This file is long (~700 lines) — jump to the `## ` section you need instead of reading it all:**
-> HTTP · WebSocket (live feeds) · Database (SQL / MongoDB / Redis) · Cron (Scheduled Tasks) ·
+> HTTP · WebSocket (live feeds) · Database (SQL / MongoDB / Redis) · Data analysis (tables, files,
+> dates, seeded randomness, lineage) · Cron (Scheduled Tasks) ·
 > Serve mode (keep crons alive) · Blockchain (ETH/Avalanche/Solana/Algorand/Bitcoin) ·
 > Capabilities · Platform
 
@@ -431,6 +432,50 @@ let top be sort_by(scored, (x) => x["score"], desc = true)  -- best first
 ```
 For real ANN at scale: delegate to a server that does vectors (pgvector via a Postgres HTTP API, or
 ClickHouse over HTTP) and query it with `fetch` — the index runs server-side, no in-process extension.
+
+## Data analysis (v0.6.29+ — tables, file formats, dates, seeded randomness, lineage)
+
+What pandas/polars/numpy do, as plain builtins (all pure except reading the files). **A table is a
+list of maps** — the exact shape `sql()`, `mongo_find`, `csv_parse`, `parquet_read` and
+`jsonl_decode` return — so a query result goes straight into the same pipeline as a file.
+
+```synsema
+require db("./shop.db")
+require file.write("./out/*")
+db_open("./shop.db")
+
+-- SQL rows are already a table; nothing = NULL = missing
+let orders be sql("SELECT region, amount, created FROM orders")
+let clean be drop_missing(orders, "amount")
+let by_region be summarize(clean, "region", {"total": sum_of("amount"), "orders": count(), "p90": quantile_of("amount", 0.9)})
+let ranked be sort_by(by_region, (r) => r.total, desc = true)
+write_file("./out/by_region.csv", csv_encode(ranked))
+write_file("./out/by_region.parquet", parquet_write(ranked))
+write_file("./out/by_region.svg", chart_svg("bar", ranked, {"x": "region", "y": "total"}))
+```
+
+- **File formats:** CSV (`csv_parse` with `{"types": {...}}` — an empty field is `nothing`),
+  JSON Lines (`jsonl_encode`/`jsonl_decode`), Parquet (`parquet_read(bytes)`/`parquet_write(rows,
+  opts?)`, zstd/snappy/gzip/lz4, native only). Bytes/text in and out; the disk is
+  `read_file`/`read_file_bytes`/`write_file` with `file.read`/`file.write`.
+- **Tables:** `group_by` → `[{key, items}]`, `summarize` + `sum_of`/`mean_of`/`min_of`/`max_of`/
+  `median_of`/`quantile_of`/`first_of`/`n_unique_of`/`count()`, `count_by`, `join` (inner/left/outer),
+  `pivot`, `is_missing`/`fill_missing`/`drop_missing`/`fill_nan`.
+- **Reductions** (`sum`, `mean`, `median`, `std`, …): `nothing` skipped, NaN propagates, `axis =`
+  on arrays, `std`/`var` sample (`ddof = 1`), decimals stay decimal.
+- **Dates:** `date` / `datetime` (IANA zone, DST-aware) / `duration` types; `truncate(d, "month")` to
+  group by period; `date_range`, `add_months`, `parse_date`/`parse_datetime`, `to_timezone`. Pure —
+  only `now()` needs `require time`. A SQL `created` column arrives as whatever the driver gives
+  (text or number) — re-type it with `datetime(x)` / `datetime(ts)`.
+- **Seeded randomness:** `let g be rng(42)` → `g()`, `random_int(g, lo, hi)`, `random_normal(g)`,
+  `shuffle`/`sample`/`choice(g, …)` — reproducible, no capability (train/test splits, simulations).
+- **Lineage:** the engine records every read (`read_file`, HTTP host, the hash of each SQL/Mongo/Redis
+  query, stdin) → `lineage()`, and `receipt()` publishes it as `inputs` — sign it to prove which data
+  produced the result.
+
+Contracts and examples: [builtins.md](builtins.md) § Tables, § Reductions, § Dates, § Seeded
+randomness, § Parquet, § Lineage; the step-by-step pipeline and the missing-data model:
+[dataviz.md](dataviz.md) § Data analysis.
 
 ## Cron (Scheduled Tasks)
 

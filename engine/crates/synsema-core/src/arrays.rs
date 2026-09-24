@@ -11,7 +11,7 @@
 use ndarray::{ArrayD, Axis, IxDyn};
 
 use faer::linalg::matmul::matmul as faer_matmul_into;
-use faer::linalg::solvers::{DenseSolveCore, Solve};
+use faer::linalg::solvers::{DenseSolveCore, Solve, SolveLstsq};
 use faer::{Accum, Mat, Par};
 
 use indexmap::IndexMap;
@@ -19,7 +19,7 @@ use indexmap::IndexMap;
 use crate::interpreter::{Control, RuntimeError};
 use crate::number::Number;
 use crate::types::{
-    syn_array, syn_bool, syn_complex, syn_float, syn_int, syn_list, syn_map, SynValue,
+    syn_array, syn_bool, syn_complex, syn_float, syn_int, syn_list, syn_map, syn_number, SynValue,
 };
 
 // =========================================================
@@ -351,10 +351,12 @@ pub fn index_row(a: &ArrayD<f64>, i: i64) -> Result<SynValue, Control> {
         return Err(err("cannot index a 0-dimensional array"));
     }
     let len0 = a.shape()[0] as i64;
-    if i < 0 || i >= len0 {
+    // Negativos desde el final (v0.6.29), como listas y texto.
+    let j = if i < 0 { i + len0 } else { i };
+    if j < 0 || j >= len0 {
         return Err(err(format!("Index {} out of bounds (array axis 0 has length {})", i, len0)));
     }
-    let sub = a.index_axis(Axis(0), i as usize);
+    let sub = a.index_axis(Axis(0), j as usize);
     if sub.ndim() == 0 {
         Ok(syn_float(*sub.first().unwrap()))
     } else {
@@ -393,6 +395,9 @@ fn scalar_op(l: f64, r: f64, op: &str) -> f64 {
         "-" => l - r,
         "*" => l * r,
         "/" => l / r, // IEEE: /0 → ±Inf/NaN (es float elementwise, NO error)
+        "**" => l.powf(r),
+        "//" => (l / r).floor(),
+        "%" => l - (l / r).floor() * r, // piso, con el signo del divisor (como Python)
         _ => f64::NAN,
     }
 }
@@ -422,7 +427,11 @@ pub fn array_binop(left: &SynValue, right: &SynValue, op: &str) -> Option<Result
                         "-" => va - vb,
                         "*" => va * vb,
                         "/" => va / vb,
-                        _ => unreachable!(),
+                        _ => {
+                            let mut o = va.clone();
+                            ndarray::Zip::from(&mut o).and(&vb).for_each(|x, &y| *x = scalar_op(*x, y, op));
+                            o
+                        }
                     };
                     Ok(syn_array(out))
                 }
@@ -606,7 +615,13 @@ pub fn dot(args: &[SynValue]) -> Result<SynValue, Control> {
         let s: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
         return Ok(syn_float(s));
     }
-    matmul(args)
+    // v0.6.29 (DATOS-10): un nombre por concepto — `dot` es el producto interno de VECTORES;
+    // el producto de matrices es `matmul` (en numpy `dot` hace las dos cosas y confunde).
+    Err(err(format!(
+        "dot is the inner product of two 1-D vectors (got {}-D and {}-D) — for matrices use matmul(a, b)",
+        a.ndim(),
+        b.ndim()
+    )))
 }
 
 /// `solve(A, b)` — resuelve `A x = b` (A cuadrada n×n; b vector 1D o matriz 2D). Singular → error.
@@ -772,4 +787,304 @@ pub fn svd(args: &[SynValue]) -> Result<SynValue, Control> {
     m.insert("s".to_string(), syn_array(ArrayD::from_shape_vec(IxDyn(&[k]), s).unwrap()));
     m.insert("vt".to_string(), syn_array(vt));
     Ok(syn_map(m))
+}
+
+// =========================================================
+// v0.6.29 — datos (DATOS-10/11/15): combinar, ubicar, acumular, relacionar, ajustar
+// =========================================================
+
+/// `nd_result` público: 0-D → número, n-D → array.
+pub fn nd_value(a: ArrayD<f64>) -> SynValue {
+    nd_result(a)
+}
+
+/// Datos 1-D de una lista de números o un array 1-D (para corr/cov/polyfit/…).
+fn vector(v: &SynValue, name: &str) -> Result<Vec<f64>, Control> {
+    match v {
+        SynValue::Array(a) => {
+            if a.ndim() != 1 {
+                return Err(err(format!("{}: expected a 1-D array or a list, got a {}-D array", name, a.ndim())));
+            }
+            Ok(a.iter().copied().collect())
+        }
+        SynValue::List(l) => l
+            .borrow()
+            .iter()
+            .map(|x| match x {
+                SynValue::Number(n) => Ok(n.to_f64()),
+                SynValue::Nothing => Ok(f64::NAN),
+                other => Err(err(format!("{}: expected numbers, got {}", name, other.type_name()))),
+            })
+            .collect(),
+        other => Err(err(format!("{}: expected a list of numbers or an array, got {}", name, other.type_name()))),
+    }
+}
+
+fn axis_norm(k: i64, ndim: usize, name: &str) -> Result<usize, Control> {
+    let nd = ndim as i64;
+    let k2 = if k < 0 { k + nd } else { k };
+    if k2 < 0 || k2 >= nd {
+        return Err(err(format!("{}: axis {} out of range for a {}-D array", name, k, nd)));
+    }
+    Ok(k2 as usize)
+}
+
+fn int_value(v: &SynValue, what: &str, name: &str) -> Result<i64, Control> {
+    match v {
+        SynValue::Number(n) if n.is_integer() => n.to_i64_trunc().ok_or_else(|| err(format!("{}: {} out of range", name, what))),
+        other => Err(err(format!("{}: {} must be an integer, got {}", name, what, other))),
+    }
+}
+
+/// `concat([a, b, …], axis = 0)`: une arrays a lo largo de un eje existente.
+/// `stack([a, b, …], axis = 0)`: los apila en un eje NUEVO.
+pub fn concat_or_stack(args: &[SynValue], axis: Option<SynValue>, stack: bool) -> Result<SynValue, Control> {
+    let name = if stack { "stack" } else { "concat" };
+    let items = match arg(args, 0)? {
+        SynValue::List(l) => l.borrow().clone(),
+        other => return Err(err(format!("{}: expected a list of arrays, got {}", name, other.type_name()))),
+    };
+    if items.is_empty() {
+        return Err(err(format!("{}: the list of arrays is empty", name)));
+    }
+    let mut arrs: Vec<ArrayD<f64>> = Vec::with_capacity(items.len());
+    for (i, it) in items.iter().enumerate() {
+        match it {
+            SynValue::Array(a) => arrs.push((**a).clone()),
+            other => return Err(err(format!("{}: item {} is {}, not an array", name, i, other.type_name()))),
+        }
+    }
+    let k = match axis {
+        None | Some(SynValue::Nothing) => 0,
+        Some(v) => int_value(&v, "axis", name)?,
+    };
+    let ndim = if stack { arrs[0].ndim() + 1 } else { arrs[0].ndim() };
+    let ax = Axis(axis_norm(k, ndim, name)?);
+    let views: Vec<_> = arrs.iter().map(|a| a.view()).collect();
+    let r = if stack { ndarray::stack(ax, &views) } else { ndarray::concatenate(ax, &views) };
+    r.map(syn_array).map_err(|e| err(format!("{}: the shapes do not line up ({})", name, e)))
+}
+
+/// `argmin`/`argmax`: la posición del extremo (la primera si hay empate; la del primer NaN
+/// si hay alguno, como numpy). Lista o array (con `axis` → array de posiciones).
+pub fn arg_extreme(args: &[SynValue], axis: Option<SynValue>, max: bool) -> Result<SynValue, Control> {
+    let name = if max { "argmax" } else { "argmin" };
+    let lane = |v: &[f64]| -> f64 {
+        if let Some(i) = v.iter().position(|x| x.is_nan()) {
+            return i as f64;
+        }
+        let mut best = 0usize;
+        for (i, x) in v.iter().enumerate() {
+            if (max && *x > v[best]) || (!max && *x < v[best]) {
+                best = i;
+            }
+        }
+        best as f64
+    };
+    match (arg(args, 0)?, axis) {
+        (SynValue::Array(a), Some(k)) if !matches!(k, SynValue::Nothing) => {
+            let ax = axis_norm(int_value(&k, "axis", name)?, a.ndim(), name)?;
+            let out = a.map_axis(Axis(ax), |l| lane(&l.iter().copied().collect::<Vec<_>>()));
+            Ok(nd_result(out))
+        }
+        (v, _) => {
+            let data = match v {
+                SynValue::Array(a) => a.iter().copied().collect(),
+                other => vector(other, name)?,
+            };
+            if data.is_empty() {
+                return Err(err(format!("{} of an empty sequence", name)));
+            }
+            Ok(syn_int(lane(&data) as i64))
+        }
+    }
+}
+
+/// `cumsum(xs)`: sumas acumuladas. Lista → lista exacta (enteros/decimal sin pasar por
+/// float); array → array (aplanado sin `axis`, como numpy).
+pub fn cumsum(args: &[SynValue], axis: Option<SynValue>) -> Result<SynValue, Control> {
+    match arg(args, 0)? {
+        SynValue::List(l) => {
+            let mut acc = Number::Int(0);
+            let mut out = Vec::new();
+            for x in l.borrow().iter() {
+                match x {
+                    SynValue::Number(n) => {
+                        acc = acc.checked_add(n).map_err(err)?;
+                        out.push(syn_number(acc.clone()));
+                    }
+                    SynValue::Nothing => out.push(SynValue::Nothing),
+                    other => return Err(err(format!("cumsum: expected numbers, got {}", other.type_name()))),
+                }
+            }
+            Ok(crate::types::syn_list(out))
+        }
+        SynValue::Array(a) => match axis {
+            None | Some(SynValue::Nothing) => {
+                let mut acc = 0.0;
+                let flat: Vec<f64> = a.iter().map(|x| {
+                    acc += x;
+                    acc
+                }).collect();
+                Ok(syn_array(ArrayD::from_shape_vec(IxDyn(&[flat.len()]), flat).unwrap()))
+            }
+            Some(k) => {
+                let ax = axis_norm(int_value(&k, "axis", "cumsum")?, a.ndim(), "cumsum")?;
+                let mut out = (**a).clone();
+                out.accumulate_axis_inplace(Axis(ax), |&prev, cur| *cur += prev);
+                Ok(syn_array(out))
+            }
+        },
+        other => Err(err(format!("cumsum: expected a list or an array, got {}", other.type_name()))),
+    }
+}
+
+/// `diff(xs)`: diferencias consecutivas (`x[i+1] - x[i]`). Lista → lista exacta; array → a lo
+/// largo del ÚLTIMO eje por defecto (numpy) o de `axis`.
+pub fn diff(args: &[SynValue], axis: Option<SynValue>) -> Result<SynValue, Control> {
+    match arg(args, 0)? {
+        SynValue::List(l) => {
+            let items = l.borrow();
+            let mut out = Vec::new();
+            for w in items.windows(2) {
+                match (&w[0], &w[1]) {
+                    (SynValue::Number(a), SynValue::Number(b)) => out.push(syn_number(b.checked_sub(a).map_err(err)?)),
+                    (SynValue::Nothing, _) | (_, SynValue::Nothing) => out.push(SynValue::Nothing),
+                    (a, b) => return Err(err(format!("diff: expected numbers, got {} and {}", a.type_name(), b.type_name()))),
+                }
+            }
+            Ok(crate::types::syn_list(out))
+        }
+        SynValue::Array(a) => {
+            let k = match axis {
+                None | Some(SynValue::Nothing) => -1,
+                Some(v) => int_value(&v, "axis", "diff")?,
+            };
+            let ax = Axis(axis_norm(k, a.ndim(), "diff")?);
+            let n = a.len_of(ax);
+            if n == 0 {
+                return Ok(syn_array((**a).clone()));
+            }
+            let hi = a.slice_axis(ax, ndarray::Slice::from(1..));
+            let lo = a.slice_axis(ax, ndarray::Slice::from(..n - 1));
+            Ok(syn_array(&hi - &lo))
+        }
+        other => Err(err(format!("diff: expected a list or an array, got {}", other.type_name()))),
+    }
+}
+
+/// Pares presentes de dos vectores (se saltean los pares con un faltante; NaN propaga).
+fn pairs(x: &SynValue, y: &SynValue, name: &str) -> Result<(Vec<f64>, Vec<f64>), Control> {
+    let (xs, ys) = (vector(x, name)?, vector(y, name)?);
+    if xs.len() != ys.len() {
+        return Err(err(format!("{}: the two series have different lengths ({} and {})", name, xs.len(), ys.len())));
+    }
+    let missing = |v: &SynValue, i: usize| matches!(v, SynValue::List(l) if matches!(l.borrow().get(i), Some(SynValue::Nothing)));
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    for i in 0..xs.len() {
+        if missing(x, i) || missing(y, i) {
+            continue;
+        }
+        a.push(xs[i]);
+        b.push(ys[i]);
+    }
+    Ok((a, b))
+}
+
+/// `cov(xs, ys, ddof = 1)`: covarianza (muestral por defecto, como `std`).
+pub fn cov(args: &[SynValue], ddof: Option<SynValue>) -> Result<SynValue, Control> {
+    let (a, b) = pairs(arg(args, 0)?, arg(args, 1)?, "cov")?;
+    let d = match ddof {
+        None => 1.0,
+        Some(v) => int_value(&v, "ddof", "cov")? as f64,
+    };
+    let n = a.len() as f64;
+    if n - d <= 0.0 {
+        return Ok(syn_float(f64::NAN));
+    }
+    let (ma, mb) = (a.iter().sum::<f64>() / n, b.iter().sum::<f64>() / n);
+    Ok(syn_float(a.iter().zip(&b).map(|(x, y)| (x - ma) * (y - mb)).sum::<f64>() / (n - d)))
+}
+
+/// `corr(xs, ys)`: correlación de Pearson.
+pub fn corr(args: &[SynValue]) -> Result<SynValue, Control> {
+    let (a, b) = pairs(arg(args, 0)?, arg(args, 1)?, "corr")?;
+    let n = a.len() as f64;
+    if n < 2.0 {
+        return Ok(syn_float(f64::NAN));
+    }
+    let (ma, mb) = (a.iter().sum::<f64>() / n, b.iter().sum::<f64>() / n);
+    let sxy: f64 = a.iter().zip(&b).map(|(x, y)| (x - ma) * (y - mb)).sum();
+    let sxx: f64 = a.iter().map(|x| (x - ma) * (x - ma)).sum();
+    let syy: f64 = b.iter().map(|y| (y - mb) * (y - mb)).sum();
+    Ok(syn_float(sxy / (sxx * syy).sqrt()))
+}
+
+/// Mínimos cuadrados por QR (faer): `x` que minimiza `‖A·x − b‖`.
+fn least_squares(a: &Mat<f64>, b: &Mat<f64>, name: &str) -> Result<Mat<f64>, Control> {
+    if a.nrows() < a.ncols() {
+        return Err(err(format!("{}: {} equations for {} unknowns — need at least as many rows as columns", name, a.nrows(), a.ncols())));
+    }
+    let qr = a.qr();
+    let x = qr.solve_lstsq(b);
+    if !all_finite(&x) {
+        return Err(err(format!("{}: the system is rank-deficient (columns are linearly dependent)", name)));
+    }
+    Ok(x)
+}
+
+/// `lstsq(A, b)`: la solución de mínimos cuadrados (1-D si `b` es 1-D).
+pub fn lstsq(args: &[SynValue]) -> Result<SynValue, Control> {
+    let a = array_arg(args, 0, "lstsq")?;
+    let fa = nd_to_faer(a, "lstsq")?;
+    let (fb, one_d) = match arg(args, 1)? {
+        SynValue::Array(b) if b.ndim() == 1 => (Mat::from_fn(b.len(), 1, |i, _| b[[i]]), true),
+        SynValue::Array(b) => (nd_to_faer(b, "lstsq")?, false),
+        other => {
+            let v = vector(other, "lstsq")?;
+            (Mat::from_fn(v.len(), 1, |i, _| v[i]), true)
+        }
+    };
+    if fb.nrows() != fa.nrows() {
+        return Err(err(format!("lstsq: A has {} rows but b has {}", fa.nrows(), fb.nrows())));
+    }
+    let x = least_squares(&fa, &fb, "lstsq")?;
+    if one_d {
+        Ok(syn_array(ArrayD::from_shape_fn(IxDyn(&[x.nrows()]), |i| x[(i[0], 0)])))
+    } else {
+        Ok(syn_array(faer_to_nd(&x)))
+    }
+}
+
+/// `polyfit(xs, ys, degree)` → coeficientes del polinomio de mínimos cuadrados, del grado más
+/// ALTO al término independiente (el orden de numpy): `polyfit(x, y, 1)` = `[pendiente, ordenada]`.
+pub fn polyfit(args: &[SynValue]) -> Result<SynValue, Control> {
+    let (xs, ys) = pairs(arg(args, 0)?, arg(args, 1)?, "polyfit")?;
+    let deg = int_value(arg(args, 2)?, "the degree", "polyfit")?;
+    if deg < 0 {
+        return Err(err("polyfit: the degree must be 0 or more"));
+    }
+    let d = deg as usize;
+    if xs.len() <= d {
+        return Err(err(format!("polyfit: degree {} needs at least {} points, got {}", d, d + 1, xs.len())));
+    }
+    let a = Mat::from_fn(xs.len(), d + 1, |i, j| xs[i].powi((d - j) as i32));
+    let b = Mat::from_fn(ys.len(), 1, |i, _| ys[i]);
+    let c = least_squares(&a, &b, "polyfit")?;
+    Ok(crate::types::syn_list((0..=d).map(|j| syn_float(c[(j, 0)])).collect()))
+}
+
+/// `polyval(coefs, x)`: evalúa el polinomio (grado más alto primero) en un número, lista o array.
+pub fn polyval(args: &[SynValue]) -> Result<SynValue, Control> {
+    let coefs = vector(arg(args, 0)?, "polyval")?;
+    let eval = |x: f64| coefs.iter().fold(0.0, |acc, c| acc * x + c);
+    match arg(args, 1)? {
+        SynValue::Number(n) => Ok(syn_float(eval(n.to_f64()))),
+        SynValue::Array(a) => Ok(syn_array(a.mapv(eval))),
+        other => {
+            let xs = vector(other, "polyval")?;
+            Ok(crate::types::syn_list(xs.into_iter().map(|x| syn_float(eval(x))).collect()))
+        }
+    }
 }

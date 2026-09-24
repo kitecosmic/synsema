@@ -141,7 +141,7 @@ let big be where(xs, (v) => v > 1)\n";
     assert_eq!(label_of(&i, "sorted"), "a");
     assert_eq!(plain_of(&i, "sorted"), "[1, 2, 3]");
     assert_eq!(label_of(&i, "groups"), "a");
-    assert_eq!(plain_of(&i, "groups"), "{1: [3, 1], 0: [2]}");
+    assert_eq!(plain_of(&i, "groups"), "[{key: 1, items: [3, 1]}, {key: 0, items: [2]}]");
     assert_eq!(plain_of(&i, "big"), "[3, 2]");
 }
 
@@ -2351,7 +2351,7 @@ fn audit_r8_the_eight_higher_order_builtins_by_name() {
         "every(range(0, 10), (v) => v < SECRET)",
         "some(range(0, 10), (v) => v >= SECRET)",
         "sort_by([3, 1, 2], (v) => v * SECRET)[0]",
-        "length(keys(group_by(range(0, 4), (v) => text(v < SECRET))))",
+        "length(group_by(range(0, 4), (v) => text(v < SECRET)))",
     ] {
         let src = format!("let SECRET be private(165, \"app\")\nlet r be {}\n", call);
         let i = run_ok(&src);

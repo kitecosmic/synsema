@@ -188,6 +188,7 @@ pub fn send_size(v: &SendValue) -> usize {
         SendValue::Bytes(b) => b.len(),
         SendValue::Complex(_, _) => 16,
         SendValue::Array(_, d) => d.len() * 8 + 8,
+        SendValue::Time(_) => 24,
         // El envoltorio con etiqueta pesa lo que pesa su valor, más los principales.
         SendValue::Private(l, inner) => send_size(inner) + l.iter().map(|s| s.len()).sum::<usize>(),
     }

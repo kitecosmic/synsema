@@ -158,6 +158,17 @@ print(secp256k1_recover(d, slice(sig, 0, 64) + bytes([37])))"#
 }
 
 #[test]
+fn wallet_signature_vector_from_web3js_docs() {
+    // `web3.eth.accounts.sign("Some data", 0x4c08…2318)` — el vector publicado en la documentación
+    // de web3.js, con v = 28 (0x1c) tal como lo entrega una billetera.
+    assert_eq!(
+        out(r#"let sig be bytes("0xb91467e570a6466aa9e9876cbcd013baba02900b8979d43fe208a4a4f339f5fd6007e74cd82e037b800186422fc2da167c747ef045e5d18a5f5d4300f8e1a0291c", "hex")
+print(sig[64], evm_address(secp256k1_recover(eip191_digest("Some data"), sig)))"#),
+        vec!["28 0x2c7536E3605D9C16a7a3D7b1898e529396a65c23"]
+    );
+}
+
+#[test]
 fn contract_creation_with_verified_signer() {
     let build = format!(
         r#"require sign("K")

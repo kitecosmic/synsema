@@ -66,6 +66,10 @@ fn int_arg(args: &[SynValue], i: usize, name: &str) -> Result<BigInt, Control> {
 /// `name(x)` → `Float(f(x))` (raíces/exp/log/trig — siempre Float).
 fn unary_float(args: &[SynValue], name: &str, f: impl Fn(f64) -> f64) -> Result<SynValue, Control> {
     arity(args, 1, name)?;
+    // v0.6.29 (DATOS-10/11): sobre un array, elemento a elemento.
+    if let SynValue::Array(a) = arg(args, 0)? {
+        return Ok(crate::types::syn_array(a.mapv(f)));
+    }
     Ok(syn_float(f(num(args, 0, name)?.to_f64())))
 }
 
@@ -96,6 +100,7 @@ fn unary_poly(
     arity(args, 1, name)?;
     match arg(args, 0)? {
         SynValue::Number(n) => Ok(syn_float(real(n.to_f64()))),
+        SynValue::Array(a) => Ok(crate::types::syn_array(a.mapv(real))),
         SynValue::Complex(z) => Ok(SynValue::Complex(cplx(*z))),
         other => Err(err(format!("{} expects a number, got {}", name, other.type_name()))),
     }
@@ -146,6 +151,9 @@ pub fn abs(args: &[SynValue]) -> Result<SynValue, Control> {
     // Complex (Batch 4): módulo (Float). El resto preserva tipo (G1).
     if let SynValue::Complex(z) = arg(args, 0)? {
         return Ok(syn_float(z.norm()));
+    }
+    if let SynValue::Array(a) = arg(args, 0)? {
+        return Ok(crate::types::syn_array(a.mapv(f64::abs)));
     }
     let n = num(args, 0, "abs")?;
     Ok(syn_number(match n {
@@ -205,6 +213,20 @@ fn extreme(args: &[SynValue], name: &str, want: Ordering) -> Result<SynValue, Co
         } else {
             format!("{}: every value is missing (nothing)", name)
         }));
+    }
+    // Fechas, instantes o duraciones (todos del mismo tipo): el más temprano / el más tarde.
+    if present.iter().all(|v| matches!(v, SynValue::Time(_))) {
+        let mut best = present[0];
+        for v in &present[1..] {
+            if let (SynValue::Time(a), SynValue::Time(b)) = (v, best) {
+                match crate::temporal::cmp(a, b) {
+                    Some(o) if o == want => best = v,
+                    Some(_) => {}
+                    None => return Err(err(format!("{}: cannot compare a {} and a {}", name, a.type_name(), b.type_name()))),
+                }
+            }
+        }
+        return Ok((*best).clone());
     }
     if present.iter().all(|v| matches!(v, SynValue::Text(_))) {
         let mut best = present[0];
@@ -417,7 +439,8 @@ pub fn is_finite(args: &[SynValue]) -> Result<SynValue, Control> {
 /// el futuro tipo `Decimal`).
 pub fn round_to(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "round_to")?;
-    let x = num(args, 0, "round_to")?.to_f64();
+    let value = num(args, 0, "round_to")?.clone();
+    let x = value.to_f64();
     let d = num(args, 1, "round_to")?;
     if !d.is_integer() {
         return Err(err("round_to expects an integer number of decimals"));
@@ -428,8 +451,22 @@ pub fn round_to(args: &[SynValue]) -> Result<SynValue, Control> {
     if decimals < 0 {
         return Err(err("round_to expects a non-negative number of decimals"));
     }
-    let factor = 10f64.powi(decimals as i32);
-    Ok(syn_float((x * factor).round_ties_even() / factor))
+    // v0.6.29 (DATOS-7): un decimal se redondea EN decimal y sigue siendo decimal (mitad al
+    // par, como `round`); un float redondea su valor binario REAL, como Python y numpy —
+    // 2.675 es en realidad 2.67499999…, así que da 2.67 (multiplicar por 100 daba 2.68).
+    if let Number::Decimal(dd) = value {
+        return Ok(syn_number(Number::Decimal(
+            dd.round_dp_with_strategy(decimals.min(28) as u32, rust_decimal::RoundingStrategy::MidpointNearestEven),
+        )));
+    }
+    if value.is_integer() {
+        return Ok(syn_number(value));
+    }
+    if !x.is_finite() {
+        return Ok(syn_float(x));
+    }
+    let text = format!("{:.*}", decimals.min(340) as usize, x);
+    Ok(syn_float(text.parse::<f64>().unwrap_or(x)))
 }
 
 // =========================================================

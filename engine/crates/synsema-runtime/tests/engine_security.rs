@@ -59,9 +59,15 @@ fn intent_freeze_blocks_redeclaration() {
 
 #[test]
 fn time_builtins_require_time_capability() {
+    // v0.6.29: `time` protege el RELOJ (y el canal de tiempo): `now()` y `sleep()`. Formatear,
+    // parsear o descomponer una fecha no lee el reloj y es puro (también bajo --deterministic).
+    for call in ["format_time(0)", "parse_time(\"1970-01-01T00:00:00Z\")", "date_parts(0)"] {
+        let r = run_source(&format!("print({})", call), "<t>");
+        assert!(r.success, "{} ya no pide time: {:?}", call, r.errors);
+    }
     // Espejo de test_time_builtins_require_time_capability (secure=True): sin la
     // capability `time` → violación; con `require time` (grant en-lenguaje) → funciona.
-    for call in ["format_time(0)", "parse_time(\"1970-01-01T00:00:00Z\")", "date_parts(0)"] {
+    for call in ["now()", "sleep(0)"] {
         let r = run_source(&format!("print({})", call), "<t>");
         assert!(!r.success, "{} debería requerir time", call);
         assert!(

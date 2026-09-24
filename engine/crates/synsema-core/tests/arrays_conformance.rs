@@ -100,7 +100,9 @@ fn indexing() {
     t("array([[1, 2], [3, 4]])[0] == array([1, 2])"); // 2D → fila
     shows("text(at(array([[1, 2], [3, 4]]), [1, 1]))", "4.0");
     fails_with("print(array([1, 2, 3])[5])", "out of bounds");
-    fails_with("print(array([1, 2, 3])[-1])", "out of bounds");
+    // v0.6.29: negativos desde el final, como listas y texto.
+    shows("array([1, 2, 3])[-1]", "3.0");
+    fails_with("print(array([1, 2, 3])[-4])", "out of bounds");
     fails_with("print(at(array([[1, 2], [3, 4]]), [1]))", "expected 2 indices");
     fails_with("print(at(array([[1, 2], [3, 4]]), [5, 0]))", "out of bounds");
 }
@@ -155,11 +157,12 @@ fn reductions() {
     t("sum(array([[1, 2], [3, 4]]), 0) == array([4, 6])");
     t("sum(array([[1, 2], [3, 4]]), 1) == array([3, 7])");
     t("mean(array([[1, 2], [3, 4]]), 0) == array([2, 3])");
-    // std/var (poblacional, ddof=0)
-    shows("text(var(array([1, 2, 3])))", "0.6666666666666666");
-    t("abs(std(array([2, 4, 4, 4, 5, 5, 7, 9])) - 2) < 0.000000001");
+    // std/var: MUESTRALES por defecto desde v0.6.29 (ddof = 1, como pandas); ddof = 0 poblacional.
+    shows("text(var(array([1, 2, 3])))", "1.0");
+    shows("text(var(array([1, 2, 3]), ddof = 0))", "0.6666666666666666");
+    t("abs(std(array([2, 4, 4, 4, 5, 5, 7, 9]), ddof = 0) - 2) < 0.000000001");
     // std/var sobre lista (ergonomía)
-    shows("text(var([1, 2, 3]))", "0.6666666666666666");
+    shows("text(var([1, 2, 3]))", "1.0");
 }
 
 // =========================================================

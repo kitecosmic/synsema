@@ -77,6 +77,15 @@ pub fn used_in(program: &Program) -> Vec<(String, &'static str, usize)> {
     out
 }
 
+/// Builtins que CAMBIARON de comportamiento en v0.6.29 sin cambiar de nombre: `synsema check`
+/// lo dice una vez por nombre usado (hasta v1.0), con lo que hay que revisar.
+pub const CHANGED_IN_0629: &[(&str, &str)] = &[
+    ("std", "`std` is now the SAMPLE standard deviation (ddof = 1, like pandas); the population one is std(xs, ddof = 0)"),
+    ("var", "`var` is now the SAMPLE variance (ddof = 1, like pandas); the population one is var(xs, ddof = 0)"),
+    ("group_by", "`group_by` now returns [{key, items}] in first-appearance order with the key's own type (it was a map keyed by text)"),
+    ("dot", "`dot` is now the inner product of two vectors only; for matrices use matmul(a, b)"),
+];
+
 /// Avisos de `synsema check`.
 pub fn check_warnings(program: &Program, file_path: &str, warnings: &mut Vec<String>) {
     for (old, new, line) in used_in(program) {
@@ -84,6 +93,34 @@ pub fn check_warnings(program: &Program, file_path: &str, warnings: &mut Vec<Str
             "warning: {}:{}: `{}` is deprecated — use `{}` (the old name goes away in v1.0)",
             file_path, line, old, new
         ));
+    }
+    let mut seen = HashSet::new();
+    for st in &program.statements {
+        crate::ast_api::walk(st, &mut |n| {
+            if let NodeKind::TaskCall { name, arguments } = &n.kind {
+                let Some(id) = name.as_identifier() else { return };
+                if let Some((_, note)) = CHANGED_IN_0629.iter().find(|(c, _)| *c == id) {
+                    if seen.insert(id.to_string()) {
+                        warnings.push(format!("warning: {}:{}: changed in v0.6.29: {}", file_path, n.location.line, note));
+                    }
+                }
+                // `percentile(x, 0.5)`: el nivel va de 0 a 100; un literal en (0, 1) casi seguro
+                // quería `quantile`.
+                if id == "percentile" {
+                    if let Some(a) = arguments.get(1) {
+                        if let NodeKind::NumberLiteral { value } = &a.value.kind {
+                            let p = value.to_f64();
+                            if p > 0.0 && p < 1.0 {
+                                warnings.push(format!(
+                                    "warning: {}:{}: percentile takes p from 0 to 100 — percentile(x, {}) is the {}th percentile; for a fraction use quantile(x, {})",
+                                    file_path, n.location.line, value, value, value
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 }
 

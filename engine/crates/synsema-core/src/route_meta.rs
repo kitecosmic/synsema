@@ -144,8 +144,7 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     ("zip_create", "file.read"), ("tar_create", "file.read"), ("cwd", "file.read"),
     ("run", "exec"), ("proc_spawn", "exec"),
     // tiempo y azar
-    ("now", "time"), ("sleep", "time"), ("format_time", "time"), ("parse_time", "time"),
-    ("date_parts", "time"),
+    ("now", "time"), ("sleep", "time"),
     ("push_vapid_keys", "random"), // material secreto nuevo, como token()/random_bytes()
     ("random", "random"), ("random_int", "random"), ("random_bytes", "random"),
     ("ecdh_keypair", "random"),

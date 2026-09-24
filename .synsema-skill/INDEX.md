@@ -43,7 +43,10 @@ core dev loop:
 Also volunteer the right primitive for the task: `paged()` for big SQL results, `parallel_map` for
 fan-out, `secret()` for credentials, `content()` for agent-readable pages, `bytes`/`decode` for
 binary, `array`/`matmul` for numeric work, `csv_parse`/`csv_encode` for spreadsheets,
-`chart_svg`/`chart()` + `median`/`percentile`/`histogram` for reports and dashboards (see
+`summarize`/`join`/`pivot`/`count_by` over rows (a table is a list of maps — v0.6.29+) with
+`parquet_read`/`jsonl_decode` for data files, `date`/`datetime`/`duration` for time instead of
+floats, `rng(seed)` for reproducible randomness, `lineage()` + `receipt()` to prove which data a
+result came from, `chart_svg`/`chart()` + `median`/`quantile`/`histogram` for reports and dashboards (see
 [dataviz.md](dataviz.md)), `run(cmd, [args])` for OS processes/tools (gated by `exec`, see [processes.md](processes.md)),
 `secp256k1_sign`/`ed25519_sign` + `require sign` for on-chain signing with the key sealed as a
 `secret`, `mnemonic_generate`/`hd_derive` + `require wallet` for generating an HD wallet from a
@@ -97,7 +100,7 @@ usually version skew, not a bug.
 - [stdlib.md](stdlib.md) — HTTP requests, WebSocket client (live feeds, gated by `net` — `ws_select` multiplexing thousands of feeds, opt-in reconnect + keepalive/half-open, backpressure, `parallel_map` fan-out), databases (SQL: SQLite / Postgres / MySQL · document: MongoDB · key-value: Redis), cron scheduler, **blockchain** (ETH/EVM · Avalanche · Solana · Algorand · **Bitcoin**: gated `sign` + audit, HD wallets/mnemonics gated by `wallet` — BIP-39/BIP-32/SLIP-0010/Algorand-25 + keystore V3 + WIF, keccak256/hash160, RLP, ABI calldata, EIP-191/712 typed-data digests, Solana message/tx + PDAs/SPL, Algorand canonical msgpack, Bitcoin UTXO builder G28 + BIP-143/341 sighash + Schnorr taproot + PSBT cold custody, base58/base32/bech32/bech32m, EIP-55 addresses) (zero dependencies)
 - [concurrency.md](concurrency.md) — Real multi-core parallelism (Rust): `parallel_map`, `chunk`, fan-out/merge, fail-fast; **`select` — one event loop over sockets + processes + bus**
 - [frontend.md](frontend.md) — Building UIs/sites: render() templates (inline CSS/JS via `{ raw }` verbatim blocks, elif chains, each empty-branch + `enumerate`, includes with props, named slots, `{ -- comments }`, `json_for_script` for script data) + layouts/partials + static assets (cache policy, SPA fallback) + client JS; content() for agent-negotiable pages. No imposed framework.
-- [dataviz.md](dataviz.md) — Business data & charts: CSV import/export (`csv_parse`/`csv_encode`, RFC 4180), descriptive statistics (`median`/`percentile`/`histogram`), native SVG charts (`chart_svg`) and the negotiated `chart()` content node (SVG for humans, data table/JSON for agents), PNG/PDF export (`svg_to_png`/`svg_to_pdf`, deterministic embedded font). Data-source-agnostic, pure (works in `sandbox`).
+- [dataviz.md](dataviz.md) — Business data & charts: **data analysis** (v0.6.29+: tables as lists of maps — `summarize`/`join`/`pivot`/`count_by`, the missing-data model `nothing` vs NaN, a full CSV/Parquet → chart/CSV pipeline), CSV import/export (`csv_parse` with typed columns / `csv_encode`, RFC 4180), descriptive statistics (`median`/`percentile`/`quantile`/`std`/`histogram`), native SVG charts (`chart_svg`) and the negotiated `chart()` content node (SVG for humans, data table/JSON for agents), PNG/PDF export (`svg_to_png`/`svg_to_pdf`, deterministic embedded font). Data-source-agnostic, pure (works in `sandbox`).
 - [serve.md](serve.md) — Native HTTP **server** (`serve on PORT`): routes, auth, validation, pagination/paged(), streaming (SSE, automatic heartbeat), **incoming WebSocket routes (`socket`)**, handler **`timeout`** + cooperative cancellation, **ordered shutdown**, rate limiting, body limits, HTML/SSR pages (`render`, `html`), static files, CORS, content negotiation (HTML/Markdown/JSON for agents), agent discoverability (`/llms.txt`, `/robots.txt`, `/sitemap.xml`, `/openapi.json`, `/docs` — generated; `synsema openapi` for CI), **and the Rust production stack: TLS / auto-HTTPS (ACME) / virtual hosts / reverse proxy / HTTP-2 / production static (ETag·Range·gzip)**
 - [capabilities.md](capabilities.md) — Security model, require, sandbox, intent, `attest`
 - [labels.md](labels.md) — **Information-flow labels** (`--labels`, always on under `serve --attested` and inside a guest): `private`/`declassify`/`label_of`/`is_private`, what propagates, what a public sink refuses (including stdout and the call itself under a private branch), how far an early exit colours what follows, errors that cannot be caught, `steps()`, and the limits stated
@@ -135,9 +138,15 @@ usually version skew, not a bug.
 - Binary data / files / hashing / base64 → builtins.md (bytes section)
 - Exact integers / `int()` / `hex()` / `0x…` literals / floor division `//` / big numbers from JSON → builtins.md § Core + syntax.md § Numbers
 - Maps and lists: `get`/`items`/`merge`/`remove`, `sort`/`sort_by(…, desc = true)`, `in`/`not in`, `xs[-1]`, iterating a map, value semantics (copy-on-write) → builtins.md § Core + types.md § Values
-- Upgraded to v0.6.29 and something fails (strict arity, `text + nothing`, strict `fmt`, value semantics, renamed builtins) → pitfalls.md § Upgrading to v0.6.29 + builtins.md § Renamed in v0.6.29
+- Upgraded to v0.6.29 and something fails (strict arity, `text + nothing`, strict `fmt`, value semantics, renamed builtins; data: `std`/`var` now sample, `group_by` returns `[{key, items}]`, `dot` vectors only, an empty CSV field is `nothing`, NaN propagates in `min`/`max`) → pitfalls.md § Upgrading to v0.6.29 + builtins.md § Renamed in v0.6.29
 - Complex numbers / gamma·erf / hyperbolics → builtins.md (math section)
-- Numeric arrays / matrices / linear algebra (matmul/solve/eig/svd) → builtins.md (arrays section)
+- Numeric arrays / matrices / linear algebra (matmul/solve/eig/svd, `concat`/`stack`, `argmax`, `cumsum`/`diff`, `axis =`) → builtins.md (arrays section)
+- **Data analysis / pandas-style work** — group and aggregate (`summarize` + `sum_of`/`mean_of`/`count()`), `join`, `pivot`, `count_by`, missing data (`drop_missing`/`fill_missing`/`fill_nan`), sort and chart the result → dataviz.md § Data analysis (pipeline) + builtins.md § Tables + python-diff.md § Data analysis (pandas → Synsema)
+- Reductions and statistics rules (`nothing` skipped, NaN propagates, `axis =`, `std`/`var` sample with `ddof`, decimals exact, `quantile` vs `percentile`) · `corr`/`cov`/`lstsq`/`polyfit`/`mode` → builtins.md § Reductions — the common rules + § Statistics and fitting
+- **Dates and times** — `date`/`datetime`/`duration` types, time zones and DST, date arithmetic, group by month (`truncate`), `date_range`, `add_months`, parsing/formatting (`parse_date`, `format_time` — pure) → types.md § Dates + builtins.md § Dates, instants and durations
+- **Seeded / reproducible randomness** (`rng(seed)`, `random(g)`, `random_int(g, …)`, `random_normal`, `shuffle`/`sample`/`choice`; works under `--deterministic`) → builtins.md § Seeded randomness
+- **Parquet / JSON Lines** files (`parquet_read`/`parquet_write`, `jsonl_encode`/`jsonl_decode`) → builtins.md § Parquet + § JSON
+- **Lineage — prove which data produced a result** (`lineage()`, `receipt()` `inputs`, anchoring the signed receipt on a chain) → builtins.md § Lineage + attestation.md § Which DATA went in
 - HTTP / SQL / cron → stdlib.md
 - Sign a blockchain tx / wallet / on-chain (Ethereum·EVM / Avalanche / Solana / Algorand / Bitcoin) → stdlib.md (Blockchain)
 - Bitcoin: send BTC / UTXO tx / P2WPKH·taproot / build+sign+broadcast (`btc_utxos`/`btc_tx`/`btc_tx_raw`/`btc_send`/`btc_wait`) · addresses (`btc_address`/`btc_address_decode`) · Schnorr taproot (`schnorr_sign`) · PSBT cold custody (`psbt_encode`/`psbt_decode`/`psbt_finalize`) · WIF import (`wif_import`) → stdlib.md (Blockchain § Bitcoin)
@@ -151,7 +160,7 @@ usually version skew, not a bug.
 - keccak256 / RLP / base58 / bech32 / derive an address / `require sign` → stdlib.md (Blockchain) + capabilities.md
 - CSV / spreadsheets / Excel import-export → dataviz.md
 - Charts / graphs / dashboards / business reports → dataviz.md
-- Median / percentiles / histograms (descriptive stats) → dataviz.md
+- Median / percentiles / quantiles / std / histograms (descriptive stats) → dataviz.md
 - Export PNG / PDF / render SVG to image → dataviz.md
 - Parallelism / fan-out / process many things at once → concurrency.md
 - Building a UI / website / frontend (templates, layouts, CSS, JS, components with props, error pages, forms) → frontend.md

@@ -9,7 +9,8 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
 ## v0.6.29 — unreleased
 
 Everything that had to break before v1.0, broken once (after v1.0 nothing breaks), plus EVM
-contract deployment and events. Old names keep working as deprecated aliases until v1.0:
+contract deployment and events, and the start of data analysis (tables, dates, seeded randomness,
+Parquet, lineage). Old names keep working as deprecated aliases until v1.0:
 `synsema check` warns about each one, and a program that uses them says so once on stderr.
 
 **Breaking, on purpose.**
@@ -65,6 +66,46 @@ contract deployment and events. Old names keep working as deprecated aliases unt
   arguments), `evm_address` of 20 raw bytes.
 - **Errors that speak Python:** `return x`, `x = 1`, `if x:`, `len(xs)`, `None`, `xs.append(y)` and
   friends get the Synsema form in the message.
+
+**Breaking, on purpose (data).**
+
+- **`std` and `var` are sample statistics** (`ddof = 1`, like pandas, polars, R and Excel `STDEV.S`):
+  `std([1,2,3,4])` is 1.29, not 1.118. **What to write instead:** `std(xs, ddof = 0)` for the population
+  figure. `synsema check` flags every `std`/`var` until v1.0.
+- **`group_by(rows, key)` returns `[{key, items}]`** in first-appearance order, with the key's own type
+  (`1` and `1.0` are one group). It returned a map keyed by text. **What to write instead:**
+  `each g in group_by(rows, "region")` → `g.key`, `g.items`; for per-group figures, `summarize`.
+- **`dot` is the inner product of two vectors only**; for matrices use `matmul(a, b)`.
+- **Reductions skip `nothing` and propagate NaN** (`mean([1, nothing, 3])` is 2.0; `median` no longer
+  errors on NaN, it returns NaN).
+- **An empty CSV field is `nothing`** (was `""`).
+- **`round_to` rounds a float's real binary value, like Python** (`round_to(2.675, 2)` is 2.67) and keeps
+  decimals decimal.
+- `format_time`, `parse_time` and `date_parts` no longer require `time` (they don't read the clock).
+
+### Added (data)
+
+- **Tables** (lists of maps): `summarize(rows, by, aggs)` with `sum_of`, `mean_of`, `min_of`, `max_of`,
+  `median_of`, `quantile_of`, `first_of`, `n_unique_of`, `count()`; `count_by`; `join(left, right, on,
+  how?)` (inner/left/outer); `pivot(rows, index, columns, values, agg?)`; `is_missing`,
+  `fill_missing`, `drop_missing`, `fill_nan`; `mode`.
+- **Reductions:** named `axis =` and `ddof =`, `quantile(values, q)`, decimals kept, `min`/`max` on
+  dates. **Arrays:** elementwise math, `**`/`//`/`%`, `length`, negative index, `slice`, `apply`,
+  `where` as a mask, `concat`, `stack`, `argmin`, `argmax`, `cumsum`, `diff`. **Statistics:** `corr`,
+  `cov`, `lstsq`, `polyfit`, `polyval`.
+- **Seeded randomness, pure:** `let g be rng(42)`, `g()`, `random(g)`, `random_int(g, lo, hi)`,
+  `random_normal(g, mean =, std =)`, `shuffle`, `sample`, `choice` — PCG64, the same sequence on every
+  platform, allowed under `--deterministic`.
+- **Dates as types:** `date`, `datetime` (IANA zones, DST-correct) and `duration`, with arithmetic,
+  comparison, `add_days`, `add_months`, `truncate`, `date_range`, `to_timezone`, `timestamp`,
+  `in_units`, `parse_date`, `parse_datetime`; JSON and CSV write them as ISO 8601.
+- **Formats:** `csv_parse(text, {"types": {...}})` (int/float/decimal/text/bool/date/datetime per
+  column), `jsonl_encode`/`jsonl_decode`, `parquet_read`/`parquet_write` (read and written by polars in
+  tests; zstd/snappy/gzip/lz4; not in the wasm build).
+- **Lineage:** the engine records every input the program reads (path, host, the hash of a query,
+  stdin) with the sha256 of what it received; `lineage()` lists it and `receipt()` publishes it as
+  `inputs`, so a signed receipt proves which inputs, which program and which output.
+
 
 ## v0.6.28 — 2026-09-22
 

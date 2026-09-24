@@ -136,7 +136,7 @@ fn run_dash_reads_stdin_and_double_dash_feeds_args() {
     std::fs::write(dir.join("a.syn"), "print(args())\n").unwrap();
     let (code, out, _) = synsema(&dir, &["run", "a.syn", "x", "y"], None);
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), "[x, y]");
+    assert_eq!(out.trim(), "[\"x\", \"y\"]");
     // self_path() es el ejecutable en curso.
     std::fs::write(dir.join("s.syn"), "print(self_path())\n").unwrap();
     let (code, out, _) = synsema(&dir, &["run", "s.syn"], None);

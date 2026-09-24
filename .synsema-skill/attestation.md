@@ -211,6 +211,21 @@ Anything unclear — an unknown driver, an odd `provider`, a response that does 
   is reproducible within one binary or `.wasm` but **not promised bit-for-bit across native and
   wasm** — 1 ulp differences are possible.
 
+## Which DATA went in — the lineage in the receipt (v0.6.29+)
+
+Attestation proves *which code* ran; the receipt's lineage proves *which data it read*. The engine
+records every input — `read_file`/`read_file_bytes` (the path), HTTP (the **host only**, never the
+path or query where an API key may travel), SQL/Mongo/Redis reads (the **sha256 of the query text**,
+never the text), `read_line` (stdin) — each with the sha256 of the bytes the program received.
+`lineage()` returns that list; `receipt()` carries it as `credentialSubject.inputs` next to
+`program_sha`, `engine`, the capability audit and `declared_result_sha256`. Signed, one document
+then says: *this measured code read these
+inputs and declared this output*. A verifier recomputes the sha256 of the inputs it holds. To fix
+the receipt in time, anchor `sha256(canonical_json(signed_receipt))` on a chain (calldata or an event
+of your contract, via `evm_tx` + `evm_send`). What it does not cover: values that are
+not reads (`env`/`secret`, LLM answers, the blackboard) and completeness across units. Full
+contract: [builtins.md](builtins.md) § Lineage.
+
 ## Verifying what you downloaded
 
 Attestation answers *which code is running inside the enclave*. The question before it is *which

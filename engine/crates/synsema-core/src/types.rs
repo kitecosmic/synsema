@@ -72,6 +72,9 @@ pub enum SynValue {
     /// principales. Sólo existe en runtime con `Interpreter::set_labels(true)`; nunca
     /// envuelve a otro `Private` ni a un `Secret`, ni lleva etiqueta vacía. Ver `labels.rs`.
     Private(Rc<Labelled>),
+    /// Fecha, instante con zona o duración (v0.6.29, DATOS-13): `date`, `datetime`,
+    /// `duration`. Variante aislada, inmutable; la aritmética vive en `temporal::binop`.
+    Time(Rc<crate::temporal::Temporal>),
 }
 
 /// Closure de paginación lazy de `paged()`: `fetch(limit, offset) → (filas, total)`.
@@ -175,6 +178,7 @@ impl SynValue {
             SynValue::Bytes(_) => "bytes",
             SynValue::Complex(_) => "complex",
             SynValue::Array(_) => "array",
+            SynValue::Time(t) => t.type_name(),
             // Sólo se ve en mensajes de error de caminos que no desenvuelven; `type_of`
             // Pasa por el despacho de builtins y reporta el tipo del valor interno.
             SynValue::Private(_) => "private",
@@ -213,6 +217,8 @@ impl SynValue {
             SynValue::Complex(z) => z.re != 0.0 || z.im != 0.0,
             // Array no-vacío = true (espeja list).
             SynValue::Array(a) => !a.is_empty(),
+            // Una fecha o un instante siempre; una duración cero es falsa (como el 0).
+            SynValue::Time(t) => !matches!(&**t, crate::temporal::Temporal::Duration(d) if d.is_zero()),
             // La veracidad del valor interno (el intérprete etiqueta el flujo de control
             // que dependa de ella vía PC).
             SynValue::Private(p) => p.value.is_truthy(),
@@ -294,6 +300,10 @@ impl SynValue {
             | (SynValue::Number(n), SynValue::Complex(z)) => z.im == 0.0 && z.re == n.to_f64(),
             // Array (Batch 5): misma shape Y mismos datos. Nunca igual a otro tipo.
             (SynValue::Array(a), SynValue::Array(b)) => a == b,
+            // El mismo día / el mismo INSTANTE (aunque se vea en otra zona) / la misma duración.
+            (SynValue::Time(a), SynValue::Time(b)) => {
+                crate::temporal::cmp(a, b) == Some(std::cmp::Ordering::Equal)
+            }
             _ => false,
         }
     }
@@ -379,6 +389,7 @@ impl fmt::Display for SynValue {
             // `re±imi` (estilo Python cmath): enteros sin `.0` (3+2i), fracción con
             // decimales (1.5-2i). El signo lo da la parte imaginaria.
             SynValue::Complex(z) => write!(f, "{}", complex_display(z.re, z.im)),
+            SynValue::Time(t) => write!(f, "{}", t),
             // Repr anidado estilo NumPy; ACOTADO a un resumen si size > 100.
             SynValue::Array(a) => write!(f, "{}", array_display(a)),
             // Redacción: nunca el valor (como `secret(NAME)`). Sella print/show/log/coerción-a-
@@ -522,6 +533,8 @@ pub enum SendValue {
     /// aviso) y corrupción a la vez (el programa calculaba sobre el placeholder). `from_send` la
     /// restaura con `labels::mark`, que normaliza y respeta los invariantes de la variante.
     Private(Vec<String>, Box<SendValue>),
+    /// Fecha / instante / duración (v0.6.29): chrono es `Send`, cruza tal cual.
+    Time(crate::temporal::Temporal),
 }
 
 /// Snapshot de un `SynValue` a `SendValue` (deep copy). Task/Builtin no cruzan: se
@@ -577,6 +590,7 @@ pub fn to_send(v: &SynValue) -> SendValue {
         SynValue::Complex(z) => SendValue::Complex(z.re, z.im),
         // Snapshot del array (shape + datos row-major): copia owned (G7).
         SynValue::Array(a) => SendValue::Array(a.shape().to_vec(), a.iter().copied().collect()),
+        SynValue::Time(t) => SendValue::Time((**t).clone()),
         // T5: la etiqueta VIAJA con el valor (ronda 3, bloqueante 3). Los sumideros del host
         // (`share`/`signal`/`bus_publish`/`parallel_map`…) siguen rechazando un privado ANTES de
         // llegar acá; lo que este camino cubre es el snapshot interno del motor —globales de
@@ -620,6 +634,7 @@ pub fn from_send(v: &SendValue) -> SynValue {
         SendValue::Private(principals, inner) => {
             crate::labels::mark(from_send(inner), crate::labels::label_from(principals))
         }
+        SendValue::Time(t) => SynValue::Time(Rc::new(t.clone())),
     }
 }
 
@@ -631,6 +646,7 @@ impl fmt::Display for SendValue {
             SendValue::Private(l, _) => write!(f, "private({})", l.join(",")),
             SendValue::Bool(b) => write!(f, "{}", if *b { "true" } else { "false" }),
             SendValue::Number(n) => write!(f, "{}", n),
+            SendValue::Time(t) => write!(f, "{}", t),
             SendValue::Text(s) => write!(f, "{}", s),
             SendValue::List(items) => {
                 let parts: Vec<String> = items.iter().map(|v| v.to_string()).collect();

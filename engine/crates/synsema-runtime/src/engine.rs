@@ -529,6 +529,14 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     "evm_address", "evm_signature", "evm_tx", "evm_tx_raw", "evm_tx_create", "evm_create_address",
     "evm_create2_address", "abi_event_topic", "abi_decode_log", "algorand_address", "algorand_tx_raw",
     "solana_tx_raw",
+    // v0.6.29 (datos): tablas, faltantes, estadística, arrays, azar con semilla, fechas, JSONL,
+    // linaje. Todos puros (el azar con semilla es determinista; las fechas no leen el reloj).
+    "summarize", "count_by", "pivot", "count", "sum_of", "mean_of", "min_of", "max_of", "median_of",
+    "first_of", "n_unique_of", "quantile_of", "is_missing", "fill_missing", "drop_missing", "fill_nan",
+    "quantile", "concat", "stack", "argmin", "argmax", "cumsum", "diff", "cov", "corr", "lstsq",
+    "polyfit", "polyval", "mode", "rng", "random_normal", "shuffle", "sample", "choice", "date",
+    "datetime", "duration", "parse_date", "parse_datetime", "truncate", "add_months", "date_range",
+    "timestamp", "to_timezone", "in_units", "add_days", "jsonl_encode", "jsonl_decode", "lineage", "parquet_read", "parquet_write",
 ];
 
 /// Todos los builtins registrados en el wiring NATIVO (un intérprete de `run`), ordenados.
@@ -655,6 +663,8 @@ pub(crate) fn wire_common_with_state(
     // Vivían dentro de register_database_builtins; ahora en json.rs para que existan
     // también en el perfil wasm (sin `native`).
     synsema_stdlib::json::register_json_builtins(interp);
+    // v0.6.29 (DATOS-16): Parquet, bytes ↔ filas (puro; el archivo va por read_file_bytes/write_file).
+    synsema_stdlib::parquet_io::register_parquet_builtins(interp);
     // Web auth (tanda web-auth): random_bytes/token/password_hash/password_verify/
     // jwt_sign/jwt_verify/totp/totp_verify. random_bytes/token GATEADOS por
     // `random` (la misma puerta deny-by-default de random()/random_int() — libres
@@ -666,6 +676,10 @@ pub(crate) fn wire_common_with_state(
     synsema_stdlib::webauthn::register_webauthn_builtins(interp);
     // T3/T4 (identidad): JCS (RFC 8785), did:key y pruebas W3C Data Integrity.
     synsema_stdlib::canonical::register_canonical_builtins(interp);
+    // Linaje (DATOS-17): los resultados estructurados se hashean sobre su JSON canónico.
+    interp.lineage_canonical = Some(Rc::new(|v: &synsema_core::types::SynValue| {
+        synsema_stdlib::canonical::canonical_json(v).ok().map(|s| s.into_bytes())
+    }));
     synsema_stdlib::didkey::register_didkey_builtins(interp);
     synsema_stdlib::integrity::register_integrity_builtins(interp, caps.clone());
     synsema_stdlib::receipt::register_receipt_builtins(interp, caps.clone());
