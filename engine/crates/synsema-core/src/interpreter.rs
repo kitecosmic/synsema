@@ -4003,12 +4003,27 @@ impl Interpreter {
             NodeKind::WhileStatement { condition, body } => {
                 // Sin tope de iteraciones (v0.6.29): un bucle de eventos `while true` vive lo
                 // que viva el programa. Para acotarlo están `stop`, `timeout` y `agent_stop`.
+                // En wasm el tope de siempre se queda: ahí no hay `timeout`, hilos ni señal
+                // que corte un bucle sin fin, y el host (una pestaña, un handler) se colgaría.
+                #[cfg(target_arch = "wasm32")]
+                let mut wasm_iters: u64 = 0;
                 let mut result = SynValue::Nothing;
                 // T5 (ronda 5): igual que `each` — la tinta de un `stop` del cuerpo muere acá.
                 // Por eso el cuerpo ya no puede salir con `return`: el frame quedaría abierto.
                 let saved_loop = self.enter_loop();
                 let mut outcome: Result<(), Control> = Ok(());
                 loop {
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        wasm_iters += 1;
+                        if wasm_iters > 1_000_000 {
+                            outcome = Err(err_at(
+                                "Loop exceeded maximum iterations (1,000,000) — in the wasm build a `while` is capped, since the host cannot interrupt a loop that never ends; the native `synsema` has no cap",
+                                &node.location,
+                            ));
+                            break;
+                        }
+                    }
                     let cond = match self.exec(condition, env) {
                         Ok(v) => v,
                         Err(e) => {
@@ -8802,24 +8817,32 @@ pub fn salted_commitment(data: &[u8]) -> (String, String) {
 }
 
 /// 16 bytes impredecibles: sha256(secreto del proceso ‖ contador). El secreto sale de la
-/// entropía del sistema (claves de `RandomState`, sembradas por el SO), el reloj y el pid.
+/// entropía del SO (`getrandom`; en el navegador, la del host), más las claves de `RandomState`
+/// y, fuera de wasm32-unknown-unknown, el reloj y el pid.
 fn fresh_salt() -> [u8; 16] {
     use sha2::{Digest, Sha256};
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     static KEY: std::sync::OnceLock<[u8; 64]> = std::sync::OnceLock::new();
     let key = KEY.get_or_init(|| {
-        // Entropía del sistema vía las claves de `RandomState` (SipHash sembrado por el SO),
-        // más el reloj y el pid; se condensa con sha256.
         use std::hash::{BuildHasher, Hasher};
         let mut h = Sha256::new();
+        let mut os = [0u8; 32];
+        if getrandom::getrandom(&mut os).is_ok() {
+            h.update(os);
+        }
         for i in 0..8u64 {
             let mut s = std::collections::hash_map::RandomState::new().build_hasher();
             s.write_u64(i);
             h.update(s.finish().to_le_bytes());
         }
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-        h.update(now.to_le_bytes());
-        h.update(std::process::id().to_le_bytes());
+        // En wasm32-unknown-unknown no hay reloj ni proceso: `SystemTime::now()` y
+        // `process::id()` hacen pánico (un `unreachable` que tira la instancia).
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+            h.update(now.to_le_bytes());
+            h.update(std::process::id().to_le_bytes());
+        }
         let a = h.finalize();
         let mut k = [0u8; 64];
         k[..32].copy_from_slice(&a);

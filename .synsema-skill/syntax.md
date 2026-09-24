@@ -122,7 +122,7 @@ let kind be when n > 0 then "pos" otherwise when n < 0 then "neg" otherwise "zer
 each item in collection              -- list; map → its keys (insertion order); text → characters;
     body                             -- bytes → ints 0–255 (maps/text/bytes: v0.6.29+)
 
-while condition                      -- no iteration cap (v0.6.29+; it was 1,000,000)
+while condition                      -- no iteration cap (v0.6.29+; it was 1,000,000, and still is in the wasm build)
     body
 
 match value

@@ -101,7 +101,8 @@ Parquet, lineage). Old names keep working as deprecated aliases until v1.0:
   `true`). **What to write instead:** convert first, `decimal(x)` or `float(x)`.
 - **`join(xs, sep)` with `nothing`, a list or a map inside is an error** (it wrote "a,nothing"), and
   text + a task is an error like text + a list.
-- `while` has no iteration cap (was 1,000,000); `print`, `log` and `show` under `synsema run` are
+- `while` has no iteration cap (was 1,000,000; the wasm build keeps it — its host has no `timeout`,
+  threads or signal to stop a loop that never ends, and would hang); `print`, `log` and `show` under `synsema run` are
   written immediately, in order.
 
 ### Added

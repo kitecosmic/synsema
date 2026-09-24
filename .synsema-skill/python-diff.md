@@ -29,7 +29,7 @@ the current names; the full old → new list is in [builtins.md](builtins.md) §
 | `d["k"] = v` (add or overwrite a key) | `set m["k"] to v` | In place on an existing map: `{a: 1}` → `{a: 1, b: 2}` (v0.6.19). `m["k"]` reads it, `contains(m, "k")` tests it |
 | `for k in a_dict:` / `for k, v in d.items():` | `each k in m` / `each e in items(m)` … `e.key` / `e.value` | v0.6.29+: `each` walks a map's **keys** in insertion order (before: `Cannot iterate over map`); also text (characters) and bytes (ints). `{ each }` in a `render()` template does the same |
 | `for i, x in enumerate(xs):` | `each e in enumerate(xs)` … `e.index` / `e.item` | `enumerate(list)` → `[{index, item}, …]` (engine > v0.5.9; before it: `each i in range(length(xs))` … `xs[i]`) |
-| `while c:` | `while c` | same keyword, no colon; no iteration cap (v0.6.29+ — before, 1,000,000) |
+| `while c:` | `while c` | same keyword, no colon; no iteration cap (v0.6.29+ — before, 1,000,000; the wasm build keeps it) |
 | `def f(x): return v` | `task f(x)` … `give v` | load-time errors that name the Synsema word (v0.6.29+): ``return` is not a Synsema statement: `give <value>` returns from a task``; the same kind of hint for `def`/`function`/`fn`/`func`/`for`/`if`/`elif`/`else`/`import`/`from`/`class`/`except`/`catch`/`finally`/`var`/`const`/`pass`/`break`/`continue`/`throw` |
 | `lambda x: x + 1` | `(x) => x + 1` | `lambda y: y` → parse error `a lambda is (y) => y` |
 | `None` / `True` / `False` | `nothing` / `true` / `false` | capitalized forms parse, then fail naming the Synsema form (`Undefined variable: 'None'` — in Synsema: `nothing`); same hints for `len`/`str`/`null`/`filter`/`map`/`sorted`/`zip`/`isinstance`/`input`/`open`/`dict`/`list`/`self`/… (v0.6.29+) |

@@ -34,3 +34,7 @@ sha2.workspace = true
 # Fechas, instantes y duraciones como tipos (v0.6.29, DATOS-13): chrono + la base IANA.
 chrono.workspace = true
 chrono-tz.workspace = true
+# La sal de los compromisos del linaje (v0.6.29): entropía del SO. En wasm32-unknown-unknown la da
+# el host (synsema-wasm-web registra `register_custom_getrandom!` sobre crypto.getRandomValues);
+# el reloj del sistema ahí no existe y hacía pánico. Ya estaba en el árbol (0.2, vía rand).
+getrandom = "0.2"
