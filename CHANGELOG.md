@@ -6,6 +6,66 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.29 — unreleased
+
+Everything that had to break before v1.0, broken once (after v1.0 nothing breaks), plus EVM
+contract deployment and events. Old names keep working as deprecated aliases until v1.0:
+`synsema check` warns about each one, and a program that uses them says so once on stderr.
+
+**Breaking, on purpose.**
+
+- **Lists and maps are values (copy-on-write).** `let ys be xs` and passing a list or map to a task
+  give a logical copy: `set ys[0] to 9` changes only `ys`, and a task that `set`s inside a map it
+  received no longer changes the caller's. **What to write instead:** `give` the map back (that is
+  how a change leaves a task). Shared state stays explicit: blackboard, memory, bus, `state_*`.
+  Modules are namespaces, not values: `set mod.STATE[k] to v` still writes the module's state.
+- **Strict arity** for calls written in the program: a missing parameter without default or an
+  extra argument is an error (`task 'f' takes 1 argument, got 3`, `append() takes at most 2
+  arguments, got 3`). Before, extras were dropped silently (`append([1], 2, 3)` lost the 3,
+  `trim(s, "x")` ignored the `"x"`) and missing ones arrived as `nothing`. Callbacks that a builtin
+  or the host calls (`apply`, `where`, route handlers, cron) keep receiving what they get.
+- **`-2 ** 2` is -4** (power binds tighter than unary minus, as in math and Python).
+- **`|>` has the lowest precedence** and a call step receives the value as its first argument:
+  `1 + 2 |> double` is `double(3)`, `xs |> sort_by(f)` is `sort_by(xs, f)`.
+- **`number(text)` of an integer beyond ±2⁵³ is an error** naming `int` (it used to lose digits).
+- **Integer vs float comparison is exact**: `2**53 + 1 == 9007199254740992.0` is `false`.
+- **A non-integer index, position or step is an error** (`xs[1.7]`, `range(0, 2.5)`); `2.0` is fine.
+- **Text + `nothing`/list/map/bytes is an error** (was `"xnothing"`); text + number/bool still joins.
+- **Inside lists and maps, text is shown quoted**: `print(["1", 1])` → `["1", 1]`.
+- **`--` glued to a value is a lexer error** (`5--1` used to be `5` plus a comment).
+- **`sort_by` orders totally or errors** (it silently left mixed or NaN lists as they came);
+  `nothing` and NaN go last; `min`/`max` skip `nothing` and propagate NaN.
+- **`fmt` errors on a `{name}` without a value** (it was left in the text).
+- **`solana_tx` and `algorand_tx` now BUILD** (they were `solana_message` / `algorand_tx_encode`);
+  assembling the signed transaction is `solana_tx_raw` / `algorand_tx_raw`. The old two-argument
+  call errors pointing there.
+- `while` has no iteration cap (was 1,000,000); `print` under `synsema run` is written immediately.
+
+### Added
+
+- **Numbers:** `int(x)` / `int(x, default)` (exact; decimal, `0x…`, `0b…`), the floor-division
+  operator `//` (exact for integers of any size), `hex(x)` (quantity for integers, data for bytes),
+  literals `0x1f18`, `0b101`, `1e-9`, `json_decode` keeps integers of any size exact,
+  `bytes(s, "hex")` accepts `0x`, `is_integer`/`is_text`/`is_list`/`is_map`.
+- **Syntax:** `in` / `not in`, chained comparisons (`1 < x <= 10`), negative indexes (`xs[-1]`),
+  text indexing (`s[0]`), any word as a member after `.` (`ev.type`, `tx.to`), `each` over maps
+  (keys), text (characters) and bytes.
+- **Maps and order:** `get(m, k, default)`, `remove`, `merge`, `items`, `sort(xs, desc = true)`,
+  `sort_by(xs, key, desc = true)`, `index_of` on text, `min`/`max` on text.
+- **Renamed** (old names are deprecated aliases): `replace_text`→`replace`,
+  `find_all`→`regex_find_all`, `capture`→`regex_capture` (always a list or `nothing`),
+  `replace_re`→`regex_replace`, `fold`→`fold_text`, `eye`→`identity`, `hmac_sha256`→`hmac` (bytes).
+- **Blockchain, `<family>_<action>`:** `eth_*`/`tx_eip1559*` → `evm_*` (`evm_tx`, `evm_tx_raw`,
+  `evm_send`, `evm_wait`, `evm_balance`, …), `solana_confirm`→`solana_wait`,
+  `algo_address`→`algorand_address`. New: `evm_tx_create` (contract deployment; `evm_tx_raw`
+  verifies the signer is `from`), `evm_create_address`, `evm_create2_address`, `evm_signature`
+  (v = 27/28 for wallets and `ecrecover`), `secp256k1_recover` accepts v = 27/28,
+  `evm_block_number`, block parameters accept the node's `0x…` quantity, `evm_logs`,
+  `abi_event_topic`, `abi_decode_log`, `abi_encode(types, values)` without selector (constructor
+  arguments), `evm_address` of 20 raw bytes.
+- **Errors that speak Python:** `return x`, `x = 1`, `if x:`, `len(xs)`, `None`, `xs.append(y)` and
+  friends get the Synsema form in the message.
+
 ## v0.6.28 — 2026-09-22
 
 Identity and trust between agents: the token is the ceiling, passkeys, `did:key`, signed

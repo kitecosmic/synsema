@@ -14,7 +14,7 @@ assert_error(fn)                   -- passes if calling fn() raises an error; FA
 ```
 
 - Equality is structural value equality (same as `==`).
-- `assert_error` takes a 0-arg task/lambda. A `give` is NOT an error → a function that gives
+- `assert_error` takes a 0-arg task/lambda (`assert_error(() => int(1.5))`). A `give` is NOT an error → a function that gives
   makes `assert_error` FAIL (not pass).
 - An `assert` that fails inside a called task propagates and fails the surrounding test.
 
@@ -64,5 +64,10 @@ does not fail a normal `run`.
 ended in `ERROR` fails that test, the next block starts clean. See [agents.md](agents.md).
 
 ## Note
-`synsema check` is still parse-only (it does not run tests or do semantic checks). Use
-`synsema test` to actually execute assertions.
+`synsema check` does not run tests: it parses, resolves imports and templates, and warns (e.g. a
+deprecated builtin name — v0.6.29 renamed several, see [builtins.md](builtins.md) § Renamed in
+v0.6.29). Use `synsema test` to actually execute assertions.
+
+A test that compares **printed output** of lists/maps must expect text quoted inside them since
+v0.6.29 (`["1", 1]`, `{a: "b"}`); `assert_eq` on the values themselves is unaffected. Equality
+between int and float is exact (`2**53 + 1 == 9007199254740992.0` is `false`).

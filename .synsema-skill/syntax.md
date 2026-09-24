@@ -4,12 +4,13 @@
 > reflexes to these forms and flags the semantic traps (verified against the engine).
 
 ## Reserved (hard) keywords
-These cannot be used as names; using one (e.g. `let task be 1`) gives a clear
-"reserved word" error. This includes **member access and export names**: `mod.decide(...)`
-or `export task decide(...)` fail with the same "reserved word" error (on engine ≤ v0.5.1
-the member case read `Expected IDENTIFIER, got DECIDE` — same rule, worse message). The
-LLM words `reason`/`decide`/`analyze`/`generate` are the ones that bite in real APIs —
-name tasks `resolve`, `why`, etc.
+These cannot be used as names you **bind** — variables, parameters, task/export names; using one
+(e.g. `let task be 1`, `task send(to)`, `export task decide(...)`) gives a clear "reserved word"
+error. **After a `.` any word is a member name** (v0.6.29+): `ev.type`, `tx.to`, `r.match`,
+`mod.decide(…)` all parse (before v0.6.29 they failed with the same "reserved word" error). So a
+map with a `"to"` or `"type"` key reads naturally with a dot, but a parameter still cannot be
+called `to`. The LLM words `reason`/`decide`/`analyze`/`generate` are the ones that bite in real
+APIs — name tasks and parameters `resolve`, `why`, etc.
 
 Flow: `when`, `otherwise`, `each`, `in`, `while`, `match`, `is`, `then`, `stop`
 Definitions: `task`, `give`, `let`, `be`, `set`, `to`, `type`, `as`, `of`, `with`
@@ -45,16 +46,22 @@ token can start an operand — an identifier, a string, a template, `{` or a sca
 ordinary name (`[` never opens it: bind a list state first). Inside the block, `whether`, `choose`,
 `rate`, `between` and `across` are special; outside it they are plain identifiers
 (`let rate be 2` is valid). The answers use the field `kind` (not `type`) and the escape key `none`
-(not `nothing`) because those two are reserved words and would not parse after a `.`.
+(not `nothing`) — chosen when those reserved words could not follow a `.`; since v0.6.29 they
+parse there, but the fields are still named `kind` and `none` (`v.x.type` → no such key).
 
 ## Operators
-Arithmetic: `+`, `-`, `*`, `/`, `%`, `**` (on `array`, these are **elementwise** with broadcasting — matrix product is `matmul`)
-Comparison: `==`, `!=`, `<`, `>`, `<=`, `>=`
+Arithmetic: `+`, `-`, `*`, `/`, `//`, `%`, `**` (on `array`, these are **elementwise** with broadcasting — matrix product is `matmul`)
+- `/` always returns float (like Python 3). `//` (v0.6.29+) is **floor division**: exact for integers of any size, integer result (`(10**30) // 3` → `333…333`, `-7 // 2` → `-4`); with floats it floors like Python (`7.5 // 2` → `3.0`); decimal → decimal; `x // 0` → `Division by zero`. Invariant with `%`: `a == b * (a // b) + a % b`. Same precedence as `*` `/` `%`.
+- `**` binds tighter than unary minus and is right-associative (v0.6.29+): `-2 ** 2` → `-4`, `(-2) ** 2` → `4`, `2 ** -1` → `0.5`, `2 ** 3 ** 2` → `512`.
+
+Comparison: `==`, `!=`, `<`, `>`, `<=`, `>=`. **Chained like Python** (v0.6.29+): `1 < x <= 10` means `1 < x and x <= 10`; each operand is evaluated once and it short-circuits. Int vs float compare exactly (`2**53 + 1 == 9007199254740992.0` → `false`). `bytes == text` is always `false`.
+Membership (v0.6.29+): `x in coll` / `x not in coll` — list membership, map **key**, substring (text needs text: `1 in "a1"` is an error — `text(1) in "a1"`), bytes subsequence. (`in` also stays the keyword of `each x in xs`.)
 Logic: `and`, `or`, `not` — **short-circuit** (engine v0.6.10+): `contains(m, "k") and m["k"] == 1` is a valid guard (the index does not run when `contains` is false; same for `or`). The result is always a **bool**, never the operand — `x or default` is NOT a Synsema idiom (use `when`). On engines ≤ 0.6.9 both sides always evaluated: guard with a nested `when` there.
+Precedence, loosest first: `|>` · `or` · `and` · `not` · comparisons/`in` · `+ -` · `* / // %` · unary `-` · `**`.
 Assignment of a default / named arg: `=` (in `task f(x, y = 1)` and `f(x, y = 2)`). Distinct from `==` (equality). `=` is NOT a general assignment statement — use `let`/`set`.
-Pipe: `|>` — chains: `data |> clean |> validate`
+Pipe: `|>` — chains: `data |> clean |> validate`. It has the **lowest** precedence (v0.6.29+): `1 + 2 |> double` is `double(3)`. A bare function step is called with the value; a step that is a call receives the value as its **first** argument: `xs |> sort_by((x) => x.k)` = `sort_by(xs, (x) => x.k)`.
 Lambda: `(params) => expr`
-Comments: `-- comment`
+Comments: `-- comment`. `--` opens a comment only at the start of a line or after whitespace (or after `(`, `[`, `{`, `,`). Glued to a value — `5--1` — it is a lexer error that explains the two readings: `5 - -1` (subtraction of a negative) vs `5 -- comment`.
 
 ## Strings — two kinds
 
@@ -77,11 +84,15 @@ let q be `
     ORDER BY name
 `
 ```
-(`fmt("Hello {name}", {"name": value})` is the older map-based interpolation; backtick `{expr}` is usually nicer.)
+(`fmt("Hello {name}", {"name": value})` is the older map-based interpolation — strict since v0.6.29: a `{name}` missing from the map is an error, `{{`/`}}` are literal braces; backtick `{expr}` is usually nicer.)
+
+**Indexing text** (v0.6.29+): `s[i]` is one character (same counting as `length`), negatives from the end: `"abc"[-1]` → `"c"`.
 
 ## Numbers
 - Integer or float: `42`, `3.14`, `1_000_000`
-- Arithmetic always returns float for division: `10 / 3` → `3.333...`
+- Hex / binary integer literals (v0.6.29+): `0x1f18` (7960), `0b101` (5), `0xFF_FF` — exact integers. Exponent literals `1e3`, `1.5e-3`, `1E+9` are **floats** (like Python): `1e18` is a float, not an exact wei amount — write `10**18` or `1_000_000_000_000_000_000`.
+- Arithmetic always returns float for division: `10 / 3` → `3.333...`. Floor division is `//` (exact integer for integers): `10 // 3` → `3`.
+- `int(x)` → exact integer from text (`"-42"`, `"1_000"`, `"0x1f18"`, `"0b101"`) or a whole float; `int("ff", 16)` is NOT a base conversion (the 2nd argument is a default → `16`) — write `int("0xff")`. `hex(n)` → `"0x…"`.
 - `text(42)` → `"42"` (no decimal for integers), `text(3.14)` → `"3.14"`
 
 ## Blocks
@@ -106,10 +117,10 @@ let label be when score >= 50 then "pass" otherwise "fail"
 let kind be when n > 0 then "pos" otherwise when n < 0 then "neg" otherwise "zero"
 -- `when <cond> then <expr> [otherwise [when ...] <expr>]` returns the taken branch's value.
 
-each item in collection
-    body
+each item in collection              -- list; map → its keys (insertion order); text → characters;
+    body                             -- bytes → ints 0–255 (maps/text/bytes: v0.6.29+)
 
-while condition
+while condition                      -- no iteration cap (v0.6.29+; it was 1,000,000)
     body
 
 match value
@@ -133,6 +144,9 @@ task name(param1, param2 = 10)        -- default value with `=` (evaluated at ca
 name("a")                             -- param2 defaults to 10
 name("a", 20)                         -- positional
 name("a", param2 = 20)                -- named arg (any order; like `spawn ... with k = v`)
+-- Arity is strict (v0.6.29+): name() → "task 'name' is missing argument 'param1' — pass it, or
+-- give the parameter a default"; one argument too many is an error too (a 1-param task `f`
+-- called f(1, 2, 3) → "task 'f' takes 1 argument, got 3"). Lambdas too.
 
 test "description"                    -- test block (run only by `synsema test`, skipped by run)
     assert_eq(name("a"), expected)    -- see testing.md
@@ -185,9 +199,13 @@ cached, transitive, and cycle-checked. Full guide: [modules.md](modules.md).
 ## Property access
 ```
 name of person         -- natural
-person.name            -- dot
+person.name            -- dot (any word after the dot: tx.to, ev.type)
 person["name"]         -- index
+xs[-1]                 -- negative index = from the end (lists, text, bytes)
 ```
+`of` needs a plain name on its left: `p["a"] of p` → parse error ``of` needs a plain name on its
+left``. An index must be an integer (`xs[1.7]` → `index must be an integer, got 1.7`; `2.0` is fine).
+A missing key is an error (`Map has no key`); `get(m, "k", default)` returns a default instead.
 
 ## Paths
 Paths are resolved relative to the working directory. For portability:

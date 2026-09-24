@@ -218,6 +218,7 @@ impl Parser {
                 | TokenType::Minus
                 | TokenType::Star
                 | TokenType::Slash
+                | TokenType::FloorDiv
                 | TokenType::Percent
                 | TokenType::Power
                 | TokenType::Equal
@@ -315,6 +316,19 @@ impl Parser {
         if self.at_end() {
             return Ok(None);
         }
+        // v0.6.29 (V1-E1): `x = 1` al inicio de una sentencia nunca es válido acá; en vez del
+        // error genérico, la forma de Synsema.
+        if self.check(TokenType::Identifier) && self.peek(1).ty == TokenType::Assign {
+            let tok = self.current().clone();
+            return Err(ParseError::new(
+                format!(
+                    "`{name} = …` is not how you assign in Synsema: declare with `let {name} be …`, change it with `set {name} to …` (`=` only names an argument: f(x = 1))",
+                    name = tok.raw
+                ),
+                tok.location,
+            ));
+        }
+        let first_tok = self.current().clone();
 
         // Soft keywords (lookahead fijo).
         if self.stream_depth > 0 && self.check_word("send") {
@@ -489,6 +503,22 @@ impl Parser {
             && !matches!(self.current().ty, TokenType::Newline | TokenType::Dedent | TokenType::Eof)
         {
             let tok = self.current();
+            // v0.6.29 (V1-E1): `return x`, `for x in …`, `if x:` — el reflejo de otro lenguaje
+            // recibe la forma de Synsema, no la pista genérica de los paréntesis.
+            if first_tok.ty == TokenType::Identifier {
+                if let Some(h) = crate::reflexes::statement_hint(&first_tok.raw) {
+                    return Err(ParseError::new(
+                        format!("`{}` is not a Synsema statement: {}", first_tok.raw, h),
+                        first_tok.location.clone(),
+                    ));
+                }
+            }
+            if tok.ty == TokenType::Colon {
+                return Err(ParseError::new(
+                    "Synsema blocks have no colon: end the line and indent the body on the next one",
+                    tok.location.clone(),
+                ));
+            }
             return Err(ParseError::new(
                 format!(
                     "unexpected {} after the end of this statement. If you meant to call something, write the parentheses: f(x). If you meant several statements, put them on separate lines",
@@ -511,6 +541,12 @@ impl Parser {
     }
 
     fn parse_block(&mut self) -> Result<Vec<Node>, ParseError> {
+        if self.check(TokenType::Colon) {
+            return Err(ParseError::new(
+                "Synsema blocks have no colon: end the line and indent the body on the next one",
+                self.current().location.clone(),
+            ));
+        }
         self.skip_newlines();
         self.expect(TokenType::Indent, "Expected indented block")?;
         let mut statements = Vec::new();
@@ -2128,7 +2164,30 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
     // =========================================================
 
     fn parse_expression(&mut self) -> Result<Node, ParseError> {
-        self.parse_or()
+        self.parse_pipe()
+    }
+
+    /// `x |> f |> g(a)`: el operador de MENOR precedencia (v0.6.29), así `1 + 2 |> double`
+    /// es `double(3)`. Un paso que es una llamada recibe el valor como PRIMER argumento
+    /// (`xs |> sort_by(f)` = `sort_by(xs, f)`, como Elixir); cualquier otra cosa se llama
+    /// con el valor como único argumento.
+    fn parse_pipe(&mut self) -> Result<Node, ParseError> {
+        let left = self.parse_or()?;
+        if self.check(TokenType::Pipe) {
+            let loc = self.location();
+            let mut transforms = Vec::new();
+            while self.match_tok(TokenType::Pipe).is_some() {
+                transforms.push(self.parse_or()?);
+            }
+            return Ok(Node::new(
+                loc,
+                NodeKind::PipeExpression {
+                    value: Box::new(left),
+                    transforms,
+                },
+            ));
+        }
+        Ok(left)
     }
 
     fn parse_or(&mut self) -> Result<Node, ParseError> {
@@ -2180,28 +2239,54 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         self.parse_comparison()
     }
 
+    /// El operador de comparación en la posición actual, si hay: `==`, `!=`, `<`, `>`,
+    /// `<=`, `>=`, `in` y `not in` (v0.6.29), con cuántos tokens ocupa. No consume nada.
+    fn comparison_op_ahead(&self) -> Option<(&'static str, usize)> {
+        match self.current().ty {
+            TokenType::Equal => Some(("==", 1)),
+            TokenType::NotEqual => Some(("!=", 1)),
+            TokenType::Less => Some(("<", 1)),
+            TokenType::Greater => Some((">", 1)),
+            TokenType::LessEqual => Some(("<=", 1)),
+            TokenType::GreaterEqual => Some((">=", 1)),
+            TokenType::In => Some(("in", 1)),
+            TokenType::Not if self.peek(1).ty == TokenType::In => Some(("not in", 2)),
+            _ => None,
+        }
+    }
+
+    /// Comparaciones, encadenables como en Python (v0.6.29): `a < b < c` es
+    /// `a < b and b < c` evaluando `b` UNA sola vez y cortando en el primer falso.
     fn parse_comparison(&mut self) -> Result<Node, ParseError> {
-        let mut left = self.parse_addition()?;
-        while self.check_any(&[
-            TokenType::Equal,
-            TokenType::NotEqual,
-            TokenType::Less,
-            TokenType::Greater,
-            TokenType::LessEqual,
-            TokenType::GreaterEqual,
-        ]) {
-            let op = self.advance();
-            let right = self.parse_addition()?;
-            left = Node::new(
-                op.location.clone(),
+        let first = self.parse_addition()?;
+        let mut operands = vec![first];
+        let mut operators: Vec<String> = Vec::new();
+        let mut loc = None;
+        while let Some((op, width)) = self.comparison_op_ahead() {
+            let tok = self.advance();
+            if width == 2 {
+                self.advance();
+            }
+            loc.get_or_insert(tok.location);
+            operators.push(op.to_string());
+            operands.push(self.parse_addition()?);
+        }
+        let Some(loc) = loc else {
+            return Ok(operands.pop().unwrap());
+        };
+        if operators.len() == 1 {
+            let right = operands.pop().unwrap();
+            let left = operands.pop().unwrap();
+            return Ok(Node::new(
+                loc,
                 NodeKind::BinaryOp {
                     left: Box::new(left),
-                    operator: op.as_str().to_string(),
+                    operator: operators.pop().unwrap(),
                     right: Box::new(right),
                 },
-            );
+            ));
         }
-        Ok(left)
+        Ok(Node::new(loc, NodeKind::CompareChain { operands, operators }))
     }
 
     fn parse_addition(&mut self) -> Result<Node, ParseError> {
@@ -2222,10 +2307,10 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
     }
 
     fn parse_multiplication(&mut self) -> Result<Node, ParseError> {
-        let mut left = self.parse_power()?;
-        while self.check_any(&[TokenType::Star, TokenType::Slash, TokenType::Percent]) {
+        let mut left = self.parse_unary()?;
+        while self.check_any(&[TokenType::Star, TokenType::Slash, TokenType::FloorDiv, TokenType::Percent]) {
             let op = self.advance();
-            let right = self.parse_power()?;
+            let right = self.parse_unary()?;
             left = Node::new(
                 op.location.clone(),
                 NodeKind::BinaryOp {
@@ -2234,23 +2319,6 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                     right: Box::new(right),
                 },
             );
-        }
-        Ok(left)
-    }
-
-    fn parse_power(&mut self) -> Result<Node, ParseError> {
-        let left = self.parse_unary()?;
-        if self.check(TokenType::Power) {
-            let op = self.advance();
-            let right = self.parse_power()?; // asociativo a derecha
-            return Ok(Node::new(
-                op.location,
-                NodeKind::BinaryOp {
-                    left: Box::new(left),
-                    operator: "**".to_string(),
-                    right: Box::new(right),
-                },
-            ));
         }
         Ok(left)
     }
@@ -2267,22 +2335,23 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                 },
             ));
         }
-        self.parse_pipe()
+        self.parse_power()
     }
 
-    fn parse_pipe(&mut self) -> Result<Node, ParseError> {
+    /// `**` liga más fuerte que el menos unario de su izquierda (v0.6.29): `-2 ** 2` es
+    /// `-(2 ** 2)` = -4, como en matemática y Python. A su derecha acepta un unario
+    /// (`2 ** -1`) y es asociativo a derecha (`2 ** 3 ** 2` = 512).
+    fn parse_power(&mut self) -> Result<Node, ParseError> {
         let left = self.parse_postfix()?;
-        if self.check(TokenType::Pipe) {
-            let loc = self.location();
-            let mut transforms = Vec::new();
-            while self.match_tok(TokenType::Pipe).is_some() {
-                transforms.push(self.parse_postfix()?);
-            }
+        if self.check(TokenType::Power) {
+            let op = self.advance();
+            let right = self.parse_unary()?;
             return Ok(Node::new(
-                loc,
-                NodeKind::PipeExpression {
-                    value: Box::new(left),
-                    transforms,
+                op.location,
+                NodeKind::BinaryOp {
+                    left: Box::new(left),
+                    operator: "**".to_string(),
+                    right: Box::new(right),
                 },
             ));
         }
@@ -2317,7 +2386,15 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                 // `expect_name` (no `expect`): así `mod.decide(...)` da el error BUENO
                 // ("'decide' is a reserved word…") en vez del críptico
                 // "Expected IDENTIFIER, got DECIDE" — mismo trato que parámetros y lets.
-                let prop = self.expect_name("member after '.'")?;
+                // Después de `.` cualquier palabra es nombre de miembro (v0.6.29): `ev.type`,
+                // `tx.to`, `r.match` no son ambiguos y son claves JSON comunes.
+                let prop = if self.current().ty != TokenType::Identifier
+                    && keyword_lookup(&self.current().raw).is_some()
+                {
+                    self.advance()
+                } else {
+                    self.expect_name("member after '.'")?
+                };
                 node = Node::new(
                     loc,
                     NodeKind::PropertyAccess {
@@ -2342,12 +2419,16 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                 // "name of person" → PropertyAccess
                 let loc = self.location();
                 self.advance();
-                let obj = self.parse_postfix()?;
                 let property_name = match &node.kind {
                     NodeKind::Identifier { name } => name.clone(),
-                    // Camino casi inexistente (X no-identificador). str(node) en Python.
-                    _ => format!("{:?}", node.kind),
+                    _ => {
+                        return Err(ParseError::new(
+                            "`of` needs a plain name on its left (`name of person`); for a computed key use an index: `person[key]`",
+                            loc,
+                        ))
+                    }
                 };
+                let obj = self.parse_postfix()?;
                 node = Node::new(
                     loc,
                     NodeKind::PropertyAccess {
@@ -3030,12 +3111,9 @@ mod tests {
     // "Expected IDENTIFIER, got DECIDE".
     #[test]
     fn reserved_word_as_member_name() {
-        let err = parse_source("let x be mod.decide(1)", "<test>").unwrap_err();
-        assert!(
-            err.to_string().contains("'decide' is a reserved word in Synsema"),
-            "got: {}",
-            err
-        );
+        // v0.6.29: después de `.` cualquier palabra es un miembro (`ev.type`, `tx.to`,
+        // `mod.decide(…)`); no es ambiguo.
+        parse_source("let x be mod.decide(1)\nlet t be ev.type\nlet d be tx.to", "<test>").unwrap();
     }
 
     // DX: `raise "msg"` es SENTENCIA (desugar a la llamada al builtin) — antes
@@ -3078,16 +3156,16 @@ mod tests {
     }
 
     #[test]
-    fn unary_minus_below_power() {
-        // -2 ** 2 parsea como (-2) ** 2 (menos unario debajo de power).
+    fn power_binds_tighter_than_unary_minus() {
+        // v0.6.29: -2 ** 2 parsea como -(2 ** 2), como en matemática y Python.
         let prog = parse_ok("let x be -2 ** 2");
         if let NodeKind::LetBinding { value, .. } = &prog.statements[0].kind {
             match &value.kind {
-                NodeKind::BinaryOp { left, operator, .. } => {
-                    assert_eq!(operator, "**");
-                    assert!(matches!(left.kind, NodeKind::UnaryOp { .. }));
+                NodeKind::UnaryOp { operator, operand } => {
+                    assert_eq!(operator, "-");
+                    assert!(matches!(&operand.kind, NodeKind::BinaryOp { operator, .. } if operator == "**"));
                 }
-                other => panic!("esperaba BinaryOp **, got {:?}", other),
+                other => panic!("esperaba UnaryOp -, got {:?}", other),
             }
         } else {
             panic!("esperaba LetBinding");

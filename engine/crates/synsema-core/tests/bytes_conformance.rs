@@ -122,7 +122,9 @@ fn index_returns_byte_value() {
 #[test]
 fn index_out_of_bounds() {
     assert_error_contains("print(text(bytes(\"Hi\")[5]))", "out of bounds");
-    assert_error_contains("print(text(bytes(\"Hi\")[-1]))", "out of bounds");
+    // Negativos cuentan desde el final (v0.6.29); fuera de rango sigue siendo error.
+    assert_output("print(text(bytes(\"Hi\")[-1]))", &["105"]);
+    assert_error_contains("print(text(bytes(\"Hi\")[-3]))", "out of bounds");
 }
 
 #[test]
@@ -145,9 +147,11 @@ fn contains_bytes_and_byte() {
 #[test]
 fn concat_bytes() {
     assert_output("print(decode(bytes(\"Hel\") + bytes(\"lo\")))", &["Hello"]);
-    // bytes + text coerciona vía Display (texto con el repr hex) — consistente, no-lossy.
-    assert_output("print(bytes(\"Hi\") + \"!\")", &["bytes(4869)!"]);
-    assert_output("print(\"!\" + bytes(\"Hi\"))", &["!bytes(4869)"]);
+    // bytes + text es error desde v0.6.29: el repr hex pegado a un texto no era lo que
+    // nadie quería. La conversión se escribe: hex(b) o decode(b, "utf8").
+    assert_error_contains("print(bytes(\"Hi\") + \"!\")", "Cannot add text and bytes");
+    assert_error_contains("print(\"!\" + bytes(\"Hi\"))", "hex(b)");
+    assert_output("print(hex(bytes(\"Hi\")) + \"!\")", &["0x4869!"]);
 }
 
 #[test]

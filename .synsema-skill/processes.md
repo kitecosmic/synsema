@@ -274,7 +274,7 @@ when term == nothing
 otherwise
     let buf be ""
     while true
-        term_write(term, "\r\x1b[2K> " + buf)          -- redraw NOW (bypasses print's buffer)
+        term_write(term, "\r\x1b[2K> " + buf)          -- redraw NOW (made for redraws; `print` on engines ≤ v0.6.28 was buffered)
         let ev be select({"keys": term, "agent": sub}, 60)  -- keys + a sub-agent's bus events
         when ev == nothing
             continue

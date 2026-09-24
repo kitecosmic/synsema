@@ -70,7 +70,7 @@ test "mnemónico estándar → ETH m/44'/60'/0'/0/0 == vector de ethers"
     let frase be as_secret("{STD}", "W")
     let seed be mnemonic_to_seed(frase)
     let k be hd_derive(seed, "m/44'/60'/0'/0/0")
-    assert_eq(eth_address(k), "{ETH}")
+    assert_eq(evm_address(k), "{ETH}")
 
 test "mismo seed → Solana SLIP-0010 == la address 0 de Phantom"
     let frase be as_secret("{STD}", "W")
@@ -82,7 +82,7 @@ test "Algorand 25 palabras (NO BIP-39) round-trip == algosdk"
     let key be as_secret(bytes("{ALGOSEED}", "hex"), "W")
     let frase be algorand_mnemonic(key)
     let back be algorand_mnemonic_to_key(frase)
-    assert_eq(algo_address(back), "{ALGO}")
+    assert_eq(algorand_address(back), "{ALGO}")
 "#,
         STD = STD_MNEMONIC,
         ETH = ETH_ADDR0,
@@ -108,11 +108,11 @@ require sign("HOT")
 
 test "importar keystore V3 → address correcta → firmar con la clave importada"
     let k be keystore_import({KS:?}, as_secret("testpassword", "PW"), "HOT")
-    assert_eq(eth_address(k), "{ADDR}")
+    assert_eq(evm_address(k), "{ADDR}")
     -- la clave importada firma sin materializarse (gate `sign`)
     let sig be secp256k1_sign(keccak256("hello"), k)
     assert_eq(length(sig), 65)
-    assert_eq(eth_address(secp256k1_recover(keccak256("hello"), sig)), "{ADDR}")
+    assert_eq(evm_address(secp256k1_recover(keccak256("hello"), sig)), "{ADDR}")
 "#,
         KS = KS_PBKDF2,
         ADDR = KS_ADDR,
@@ -178,7 +178,7 @@ print(contains(custodyfail, "wallet"))
 -- afuera del sandbox la custodia anda de nuevo
 let seed be mnemonic_to_seed(frase)
 let k be hd_derive(seed, "m/44'/60'/0'/0/0")
-print(eth_address(k))
+print(evm_address(k))
 "#,
     );
     assert_eq!(o[0], "32", "solana_pda puro: address de 32 bytes en sandbox");

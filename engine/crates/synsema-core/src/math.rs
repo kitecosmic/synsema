@@ -173,55 +173,73 @@ pub fn sign(args: &[SynValue]) -> Result<SynValue, Control> {
     Ok(syn_int(s))
 }
 
-/// Reúne los números de un `min`/`max`: variádico `min(3, 5, 1)` o una sola lista
-/// `min([3, 5, 1])`. Lista vacía / sin args → error.
-fn select_numbers(args: &[SynValue], name: &str) -> Result<Vec<Number>, Control> {
-    let items: Vec<SynValue> = match args {
-        [SynValue::List(l)] => l.borrow().clone(),
-        _ => args.to_vec(),
-    };
-    if items.is_empty() {
-        return Err(err(format!("{} of an empty sequence", name)));
-    }
-    let mut nums = Vec::with_capacity(items.len());
-    for it in &items {
-        match it {
-            SynValue::Number(n) => nums.push(n.clone()),
-            other => {
-                return Err(err(format!("{} expects numbers, got {}", name, other.type_name())))
-            }
-        }
-    }
-    // Coherente con el orden del lenguaje: no mezclar Decimal y Float.
-    if nums.iter().any(|n| n.is_decimal()) && nums.iter().any(|n| matches!(n, Number::Float(_))) {
-        return Err(err(MIX_DECIMAL_FLOAT.to_string()));
-    }
-    Ok(nums)
-}
-
 pub fn min(args: &[SynValue]) -> Result<SynValue, Control> {
     // Array (Batch 5): reducción total o por eje (las listas/variádicos siguen igual, G1).
     if matches!(args.first(), Some(SynValue::Array(_))) {
         return crate::arrays::reduce(args, "min");
     }
-    let nums = select_numbers(args, "min")?;
-    let mut best = nums[0].clone();
-    for n in &nums[1..] {
-        if n.partial_cmp_num(&best) == Some(Ordering::Less) {
-            best = n.clone();
-        }
-    }
-    Ok(syn_number(best))
+    extreme(args, "min", Ordering::Less)
 }
 
 pub fn max(args: &[SynValue]) -> Result<SynValue, Control> {
     if matches!(args.first(), Some(SynValue::Array(_))) {
         return crate::arrays::reduce(args, "max");
     }
-    let nums = select_numbers(args, "max")?;
+    extreme(args, "max", Ordering::Greater)
+}
+
+/// `min`/`max` de una lista o de varios argumentos (v0.6.29):
+/// - `nothing` es un dato FALTANTE y se saltea (DATOS-2, el modelo de polars/SQL);
+/// - NaN es un resultado inválido y se PROPAGA: si hay uno, el resultado es NaN (antes
+///   dependía del orden: `min([nan, 3])` daba nan y `min([3, nan])` daba 3);
+/// - números o textos, todos de una clase (el texto se compara como con `<`).
+fn extreme(args: &[SynValue], name: &str, want: Ordering) -> Result<SynValue, Control> {
+    let items: Vec<SynValue> = match args {
+        [SynValue::List(l)] => l.borrow().clone(),
+        _ => args.to_vec(),
+    };
+    let present: Vec<&SynValue> = items.iter().filter(|v| !matches!(v, SynValue::Nothing)).collect();
+    if present.is_empty() {
+        return Err(err(if items.is_empty() {
+            format!("{} of an empty sequence", name)
+        } else {
+            format!("{}: every value is missing (nothing)", name)
+        }));
+    }
+    if present.iter().all(|v| matches!(v, SynValue::Text(_))) {
+        let mut best = present[0];
+        for v in &present[1..] {
+            if let (SynValue::Text(a), SynValue::Text(b)) = (v, best) {
+                if a.as_ref().cmp(b.as_ref()) == want {
+                    best = v;
+                }
+            }
+        }
+        return Ok((*best).clone());
+    }
+    let mut nums = Vec::with_capacity(present.len());
+    for it in &present {
+        match it {
+            SynValue::Number(n) => nums.push(n.clone()),
+            other => {
+                return Err(err(format!(
+                    "{} expects numbers or texts (all of one kind), got {}",
+                    name,
+                    other.type_name()
+                )))
+            }
+        }
+    }
+    if nums.iter().any(|n| matches!(n, Number::Float(x) if x.is_nan())) {
+        return Ok(syn_number(Number::Float(f64::NAN)));
+    }
+    // Coherente con el orden del lenguaje: no mezclar Decimal y Float.
+    if nums.iter().any(|n| n.is_decimal()) && nums.iter().any(|n| matches!(n, Number::Float(_))) {
+        return Err(err(MIX_DECIMAL_FLOAT.to_string()));
+    }
     let mut best = nums[0].clone();
     for n in &nums[1..] {
-        if n.partial_cmp_num(&best) == Some(Ordering::Greater) {
+        if n.partial_cmp_num(&best) == Some(want) {
             best = n.clone();
         }
     }

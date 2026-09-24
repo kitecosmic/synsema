@@ -2,18 +2,18 @@
 //! externa: mocks JSON-RPC (EVM/Solana) y REST (algod) sobre TcpListener local.
 //!
 //! - **El loop completo contra el vector eth-account:** leer (nonce/chainId/fees)
-//!   → construir (`tx_eip1559`) → firmar (`secp256k1_sign`, gate `sign`) →
-//!   ensamblar (`tx_eip1559_raw`) → enviar (`eth_send_raw`, el mock EXIGE los
-//!   bytes EXACTOS del vector del SDK) → confirmar (`eth_wait_receipt`). RFC 6979
+//!   → construir (`evm_tx`) → firmar (`secp256k1_sign`, gate `sign`) →
+//!   ensamblar (`evm_tx_raw`) → enviar (`evm_send`, el mock EXIGE los
+//!   bytes EXACTOS del vector del SDK) → confirmar (`evm_wait`). RFC 6979
 //!   es determinista: misma clave+digest → la MISMA firma que eth-account, así
 //!   que el raw coincide byte a byte o el mock rechaza.
-//! - **Solana:** blockhash → `solana_message` → `ed25519_sign` → `solana_tx` →
-//!   `solana_send` → `solana_confirm`; `solana_balance` + `spl_balance`.
+//! - **Solana:** blockhash → `solana_tx` → `ed25519_sign` → `solana_tx_raw` →
+//!   `solana_send` → `solana_wait`; `solana_balance` + `spl_balance`.
 //! - **Algorand:** `algorand_params` (fee POR BYTE + min_fee flat) → txn map →
-//!   `algorand_tx_encode` → `ed25519_sign` → `algorand_tx` → `algorand_send`
+//!   `algorand_tx` → `ed25519_sign` → `algorand_tx_raw` → `algorand_send`
 //!   (body BINARIO x-binary) → `algorand_wait`.
 //! - **G22:** sin `require net` → deny atrapable; dentro de `sandbox` → deny;
-//!   los builders puros (`tx_eip1559`) siguen andando en sandbox.
+//!   los builders puros (`evm_tx`) siguen andando en sandbox.
 //! - **G23:** hex-quantity con ceros a la izquierda, forma equivocada y respuesta
 //!   gigante (>16 MiB) → error atrapable, programa vivo.
 //! - **Polling acotado:** los tres `wait/confirm` devuelven `nothing` al timeout
@@ -219,17 +219,17 @@ require sign("HOT")
 test "leer → construir → firmar → enviar → confirmar == vector eth-account"
     let url be "http://127.0.0.1:{port}"
     let k be as_secret("{key}", "HOT")
-    let from be eth_address(k)
+    let from be evm_address(k)
     -- LEER (antes: JSON-RPC a mano con hex-quantities a pulso)
-    let nonce be eth_nonce(url, from)
+    let nonce be evm_nonce(url, from)
     assert_eq(nonce, 7)
-    let chain be eth_chain_id(url)
+    let chain be evm_chain_id(url)
     assert_eq(chain, 1)
-    let fees be eth_fee_history(url)
+    let fees be evm_fee_history(url)
     assert_eq(fees["base_fee"], 15000000000)
     assert_eq(fees["priority"], 1500000000)
     -- CONSTRUIR (G24: cada campo explícito; el builder ecoa los números)
-    let tx be tx_eip1559({{"chain_id": chain, "nonce": nonce,
+    let tx be evm_tx({{"chain_id": chain, "nonce": nonce,
         "to": "0x6Fac4D18c912343BF86fa7049364Dd4E424Ab9C0",
         "value": 100000000000000000, "gas": 21000,
         "max_fee": fees["base_fee"] * 2, "max_priority": fees["priority"]}})
@@ -237,26 +237,26 @@ test "leer → construir → firmar → enviar → confirmar == vector eth-accou
     assert_eq(tx["to"], "0x6Fac4D18c912343BF86fa7049364Dd4E424Ab9C0")
     -- FIRMAR (la ÚNICA puerta de valor) y ENSAMBLAR (sin hand-roll)
     let sig be secp256k1_sign(tx["digest"], k)
-    let raw be tx_eip1559_raw(tx, sig)
+    let raw be evm_tx_raw(tx, sig)
     -- ENVIAR: el mock EXIGE los bytes EXACTOS del vector del SDK
-    let hash be eth_send_raw(url, raw)
+    let hash be evm_send(url, raw)
     assert_eq(hash, "{hash}")
     -- CONFIRMAR: polling acotado (el receipt aparece en el 2º poll)
-    let receipt be eth_wait_receipt(url, hash, 1, 30)
+    let receipt be evm_wait(url, hash, 1, 30)
     assert_eq(receipt["status"], 1)
     assert_eq(receipt["gasUsed"], 21000)
     assert_eq(receipt["from"], "0x9858EfFD232B4033E47d90003D41EC34EcaEda94")
 
-test "lecturas sueltas: balance exacto > i64, eth_call + abi_decode, estimate"
+test "lecturas sueltas: balance exacto > i64, evm_call + abi_decode, estimate"
     let url be "http://127.0.0.1:{port}"
-    let bal be eth_balance(url, "0x9858EfFD232B4033E47d90003D41EC34EcaEda94")
+    let bal be evm_balance(url, "0x9858EfFD232B4033E47d90003D41EC34EcaEda94")
     assert_eq(bal, 1000000000000000000000)
     let calldata be abi_encode("balanceOf(address)", ["0x9858EfFD232B4033E47d90003D41EC34EcaEda94"])
-    let ret be eth_call(url, {{"to": "0x6Fac4D18c912343BF86fa7049364Dd4E424Ab9C0", "data": calldata}})
+    let ret be evm_call(url, {{"to": "0x6Fac4D18c912343BF86fa7049364Dd4E424Ab9C0", "data": calldata}})
     assert_eq(abi_decode("uint256", ret)[0], 123456)
-    let gas be eth_estimate_gas(url, {{"to": "0x6Fac4D18c912343BF86fa7049364Dd4E424Ab9C0", "value": 1}})
+    let gas be evm_estimate_gas(url, {{"to": "0x6Fac4D18c912343BF86fa7049364Dd4E424Ab9C0", "value": 1}})
     assert_eq(gas, 21000)
-    assert_eq(eth_gas_price(url), 1000000000)
+    assert_eq(evm_gas_price(url), 1000000000)
 "#,
         port = port,
         key = VEC_KEY,
@@ -347,15 +347,15 @@ test "blockhash → message → firmar → tx → enviar → confirmar"
     let me be ed25519_pubkey(k)
     let bh be solana_latest_blockhash(url)
     assert_eq(length(bh), 32)
-    let msg be solana_message({{"fee_payer": me, "recent_blockhash": bh,
+    let msg be solana_tx({{"fee_payer": me, "recent_blockhash": bh,
         "instructions": [{{"program": "11111111111111111111111111111111",
             "accounts": [{{"pubkey": me, "signer": true, "writable": true}}],
             "data": bytes([2, 0, 0, 0])}}]}})
     let sig be ed25519_sign(msg, k)
-    let tx be solana_tx(msg, sig)
+    let tx be solana_tx_raw(msg, sig)
     let signature be solana_send(url, tx)
     assert_eq(signature, "{sig58}")
-    let status be solana_confirm(url, signature, 30)
+    let status be solana_wait(url, signature, 30)
     assert_eq(status["confirmation_status"], "confirmed")
     assert_eq(status["err"], nothing)
 
@@ -369,7 +369,7 @@ test "solana_balance + spl_balance (amount con decimals, jamás un 0 inventado)"
 
 test "una tx que aterrizó pero FALLÓ on-chain: err no es nothing (el caller chequea)"
     let url be "http://127.0.0.1:{port}"
-    let status be solana_confirm(url, "{failed58}", 30)
+    let status be solana_wait(url, "{failed58}", 30)
     assert_eq(status["confirmation_status"], "finalized")
     assert(status["err"] != nothing)
 "#,
@@ -444,7 +444,7 @@ require sign("ALGO")
 test "params (fee POR BYTE + min_fee flat) → txn → firmar → enviar → confirmar"
     let url be "http://127.0.0.1:{port}"
     let k be as_secret(bytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "hex"), "ALGO")
-    let me be algo_address(k)
+    let me be algorand_address(k)
     let p be algorand_params(url)
     assert_eq(p["fee"], 0)
     assert_eq(p["min_fee"], 1000)
@@ -454,8 +454,8 @@ test "params (fee POR BYTE + min_fee flat) → txn → firmar → enviar → con
     let txn be {{"type": "pay", "snd": me, "rcv": me, "amt": 1,
         "fee": p["min_fee"], "fv": p["fv"], "lv": p["lv"],
         "gh": p["gh"], "gen": p["gen"]}}
-    let sig be ed25519_sign(algorand_tx_encode(txn), k)
-    let stx be algorand_tx(txn, sig)
+    let sig be ed25519_sign(algorand_tx(txn), k)
+    let stx be algorand_tx_raw(txn, sig)
     let txid be algorand_send(url, stx)
     assert_eq(length(txid), 52)
     let info be algorand_wait(url, txid, 30)
@@ -464,7 +464,7 @@ test "params (fee POR BYTE + min_fee flat) → txn → firmar → enviar → con
 test "algorand_account valida el checksum ANTES de tocar la red"
     let url be "http://127.0.0.1:{port}"
     let k be as_secret(bytes("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "hex"), "ALGO")
-    let acct be algorand_account(url, algo_address(k))
+    let acct be algorand_account(url, algorand_address(k))
     assert_eq(acct["amount"], 123456789)
     let bad be ""
     try
@@ -498,7 +498,7 @@ fn g22_deny_without_net_and_in_sandbox() {
     let o = out(&format!(
         r#"let denied be ""
 try
-    let n be eth_chain_id("http://127.0.0.1:{port}")
+    let n be evm_chain_id("http://127.0.0.1:{port}")
 recover e
     set denied to e
 print(contains(denied, "net"))
@@ -516,22 +516,22 @@ let denied be ""
 let digestlen be 0
 sandbox
     try
-        let n be eth_chain_id("http://127.0.0.1:{port}")
+        let n be evm_chain_id("http://127.0.0.1:{port}")
     recover e
         set denied to e
-    let tx be tx_eip1559({{"chain_id": 1, "nonce": 0,
+    let tx be evm_tx({{"chain_id": 1, "nonce": 0,
         "to": "0x6Fac4D18c912343BF86fa7049364Dd4E424Ab9C0", "value": 0,
         "gas": 21000, "max_fee": 2, "max_priority": 1}})
     set digestlen to length(tx["digest"])
 print(contains(denied, "net"))
 print(digestlen)
 -- afuera del sandbox la lectura anda de nuevo
-print(eth_chain_id("http://127.0.0.1:{port}"))
+print(evm_chain_id("http://127.0.0.1:{port}"))
 "#,
         port = port,
     ));
     assert_eq!(o2[0], "true", "en sandbox el RPC se deniega");
-    assert_eq!(o2[1], "32", "tx_eip1559 puro sigue andando en sandbox");
+    assert_eq!(o2[1], "32", "evm_tx puro sigue andando en sandbox");
     assert_eq!(o2[2], "1", "afuera del sandbox la lectura anda");
 }
 
@@ -582,25 +582,25 @@ test "hex no canónico, forma equivocada, respuesta gigante, id ajeno, round abs
     let url be "http://127.0.0.1:{port}"
     let e1 be ""
     try
-        let x be eth_balance(url, "0x9858EfFD232B4033E47d90003D41EC34EcaEda94")
+        let x be evm_balance(url, "0x9858EfFD232B4033E47d90003D41EC34EcaEda94")
     recover e
         set e1 to e
     assert(contains(e1, "non-canonical"))
     let e2 be ""
     try
-        let x be eth_chain_id(url)
+        let x be evm_chain_id(url)
     recover e
         set e2 to e
     assert(contains(e2, "hex quantity"))
     let e3 be ""
     try
-        let x be eth_gas_price(url)
+        let x be evm_gas_price(url)
     recover e
         set e3 to e
     assert(contains(e3, "limit"))
     let e4 be ""
     try
-        let x be eth_nonce(url, "0x9858EfFD232B4033E47d90003D41EC34EcaEda94")
+        let x be evm_nonce(url, "0x9858EfFD232B4033E47d90003D41EC34EcaEda94")
     recover e
         set e4 to e
     assert(contains(e4, "id"))
@@ -704,9 +704,9 @@ fn transient_failures_mid_wait_retry_dead_node_fails_fast() {
 test "un blip transitorio (5xx) en medio de la espera NO la mata: reintenta y confirma"
     let url be "http://127.0.0.1:{flaky}"
     let h be "0x6fb18223cd52476122a18a2b59a6c9faca40b36937217962a4f81b0da1c79880"
-    let receipt be eth_wait_receipt(url, h, 1, 15)
+    let receipt be evm_wait(url, h, 1, 15)
     assert_eq(receipt["status"], 1)
-    let status be solana_confirm(url, "{sig58}", 15)
+    let status be solana_wait(url, "{sig58}", 15)
     assert_eq(status["confirmation_status"], "confirmed")
     let info be algorand_wait(url, "{txid}", 15)
     assert_eq(info["confirmed-round"], 45)
@@ -714,7 +714,7 @@ test "un blip transitorio (5xx) en medio de la espera NO la mata: reintenta y co
 test "nodo muerto en el PRIMER poll: error inmediato, no una espera que miente"
     let e be ""
     try
-        let r be eth_wait_receipt("http://127.0.0.1:{dead}", "0x6fb18223cd52476122a18a2b59a6c9faca40b36937217962a4f81b0da1c79880", 1, 30)
+        let r be evm_wait("http://127.0.0.1:{dead}", "0x6fb18223cd52476122a18a2b59a6c9faca40b36937217962a4f81b0da1c79880", 1, 30)
     recover er
         set e to er
     assert(contains(e, "failed"))
@@ -722,7 +722,7 @@ test "nodo muerto en el PRIMER poll: error inmediato, no una espera que miente"
 test "el nodo muere DESPUÉS del primer poll: al vencer sube el ERROR, no nothing"
     let e be ""
     try
-        let r be eth_wait_receipt("http://127.0.0.1:{dark}", "0x6fb18223cd52476122a18a2b59a6c9faca40b36937217962a4f81b0da1c79880", 1, 3)
+        let r be evm_wait("http://127.0.0.1:{dark}", "0x6fb18223cd52476122a18a2b59a6c9faca40b36937217962a4f81b0da1c79880", 1, 3)
     recover er
         set e to er
     assert(contains(e, "HTTP 500"))
@@ -768,8 +768,8 @@ fn bounded_polling_returns_nothing_never_hangs() {
 test "los tres wait/confirm vencen a nothing"
     let url be "http://127.0.0.1:{port}"
     let h be "0x6fb18223cd52476122a18a2b59a6c9faca40b36937217962a4f81b0da1c79880"
-    assert_eq(eth_wait_receipt(url, h, 1, 1), nothing)
-    assert_eq(solana_confirm(url, "{sig58}", 1), nothing)
+    assert_eq(evm_wait(url, h, 1, 1), nothing)
+    assert_eq(solana_wait(url, "{sig58}", 1), nothing)
     assert_eq(algorand_wait(url, "{txid}", 1), nothing)
 "#,
         port = port,

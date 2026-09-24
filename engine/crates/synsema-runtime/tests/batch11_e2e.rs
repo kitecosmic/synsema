@@ -78,7 +78,7 @@ print(text(k))
 print(json_encode({{"key": k}}))
 print(contains(csv_encode([{{"k": k}}]), "{KEY1}"))
 -- derivar la pubkey/dirección es PURO y NO expone la clave
-print(eth_address(k))"#
+print(evm_address(k))"#
     ));
     // text(secret) y json_encode → secret(HOT_KEY)/[redacted], jamás el hex.
     assert!(o[0].contains("secret(HOT_KEY)"), "text(secret): {}", o[0]);
@@ -229,7 +229,7 @@ let k be as_secret("{KEY1}", "HOT_KEY")
 let addr be ""
 let signfail be ""
 sandbox
-    set addr to eth_address(k)
+    set addr to evm_address(k)
     let pk be secp256k1_pubkey(k)
     try
         let sig be secp256k1_sign(keccak256("hi"), k)
@@ -240,7 +240,7 @@ print(contains(signfail, "sign"))
 let sig be secp256k1_sign(keccak256("hi"), k)
 print(length(sig))"#
     ));
-    assert_eq!(o[0], ADDR1, "eth_address (puro) funciona dentro del sandbox");
+    assert_eq!(o[0], ADDR1, "evm_address (puro) funciona dentro del sandbox");
     assert_eq!(o[1], "true", "firmar dentro del sandbox está denegado");
     assert_eq!(o[2], "65", "afuera del sandbox, firmar anda de nuevo");
 }
@@ -290,7 +290,7 @@ fn dogfood_eth_end_to_end_via_synsema_test() {
 test "ETH: address, tx EIP-1559, firma determinista, ecrecover cierra el circuito"
     let k be as_secret("{KEY1}", "HOT_KEY")
     -- 1. dirección desde la clave (deriva la pubkey, no expone la privada)
-    assert_eq(eth_address(k), "{ADDR1}")
+    assert_eq(evm_address(k), "{ADDR1}")
 
     -- 2. construir el payload de una tx EIP-1559: 0x02 || rlp([campos])
     let to_bytes be bytes("5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed", "hex")
@@ -307,7 +307,7 @@ test "ETH: address, tx EIP-1559, firma determinista, ecrecover cierra el circuit
 
     -- 4. ecrecover: la pubkey recuperada rinde la MISMA dirección (cierra el circuito)
     let pub be secp256k1_recover(digest, sig)
-    assert_eq(eth_address(pub), "{ADDR1}")
+    assert_eq(evm_address(pub), "{ADDR1}")
 
     -- 5. verify con la pubkey derivada de la clave
     let pk be secp256k1_pubkey(k)
@@ -422,7 +422,7 @@ require sign("HOT_KEY")
 serve on {port}
     route "GET /addr"
         let k be as_secret("{KEY1}", "HOT_KEY")
-        give text(eth_address(k))
+        give text(evm_address(k))
     route "GET /badsign"
         -- clave de largo inválido → error de runtime (no captura) → 500, server vivo
         let k be as_secret("00", "HOT_KEY")

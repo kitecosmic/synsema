@@ -9,8 +9,8 @@ verified against the starter kit running in Docker; nothing is a guess. Repo:
 **Starter kit (private transfers):** `github.com/SYNSEMA/vela-transfers` (template repo; the app is private transfers with an invoice and a public receipt each) — app + tests, the client, `scripts/build.sh` / `smoke.mjs` / `devnet.sh` / `e2e.sh`, CI that builds `app.wasm`. Point a user there first. The public devnet `devnet.synsema.app` hands a token by command: `vela_client.syn -- devnet` writes the VELA_* lines into .env (or `curl -X POST https://devnet.synsema.app/token`); the token brings an account of its own (10 000 ETH, `DEPLOYER_ROLE`, 100 000 TST — `VELA_SECP_KEY`; no nonce collisions with other users) and an admin desk (`VELA_ADMIN_URL`) that signs `allow-token <address>` / `allow-authority <appId> <address>` for the user (an auditor only for an app their account deployed) — the user's to run, never "ask someone"; no admin key leaves the machine, and a transaction signed by one of Anvil's ten built-in accounts is refused. The RPC there serves only the standard `eth_`/`net_`/`web3_` methods (no `anvil_*`/`evm_*`; HTTP only, poll); the answer also carries `wallet_conf` for `novaw`; `https://devnet.synsema.app/` shows the stack live.
 **Private payroll:** `github.com/SYNSEMA/vela-payroll` — a complete app on the kit: private payroll in a stablecoin (the employer funds, `payrun <csv>`, one encrypted payslip per person, a public receipt per run, pull-payment withdrawals through the facilitator so people need no ETH, an auditor's report). Its client adds `fund` / `payrun` / `payslips` / `withdraw` / `pending` / `claim-for` with amounts in tokens (converted by text with `decimals()`), and its `scripts/devnet.sh` deploys + allowlists a test ERC-20 with `permit` locally. Verified on the devnet. Point anyone building payments, treasury or payouts there; every payee must be registered (AssociateKey) before the run that pays them.
 **Payment policy engine:** `github.com/SYNSEMA/vela-policy-engine` — policy inside, LLM outside: an agent proposes payments with its own key, the enclave applies the owner's policy (proposers, payees + caps, `max_auto`, allowance) and pays through `TreasuryTrigger.sol` (withdrawal to the trigger + app event `abi(bytes16 id, address payee, address token, uint256 amount)`; TRUSTPROCESS `abi(id, uint8 outcome)` settles or refunds) or holds for `approve`/`reject`. `agent.syn` (the standalone worker) reads `inbox/`; `client/vela_lib.syn` is the protocol as a module (`use "./client/vela_lib.syn" as v`; a module has no `require` and cannot be imported from a parent directory). Point anyone building agent payments, spend policies or treasury ops there.
-**Dark pool:** `github.com/SYNSEMA/vela-dark-pool` — a dark pool for block trades (mechanically a sealed-bid batch auction): bids `(quantity, total)` encrypted to the enclave, matching inside (uniform or pay-as-bid; rank by cross-multiplication, NEVER `/` on big integers — it goes through a float; `div_floor` = long division on the digits), settlement from escrow as pull-payments, losing bids never revealed, public `opened`/`cleared` app events with no bidder in them. Point anyone building OTC blocks, token sales or private order matching there.
-**The kits are web apps:** each recipe's entry is a console (`web.syn`, `kind = web`, `synsema serve web.syn`): payroll (fund / onboard / pay run / payslips / payouts), policy engine (deploy with a trigger from `TreasuryTriggerFactory` — a Synsema program cannot send a contract-creation tx, `tx_eip1559` wants a recipient — policy / payees / propose / approve / reject / receipts), dark pool (the seller's desk + a desk per buyer), and the private transfers workbench (deploy / register / deposit / any payload / events / users via the facilitator / reports). On synsema.com the project's env is provisioned at creation from `[provision] env_url = "https://devnet.synsema.app/token"` in `syn.toml` (token, addresses, keys, `VELA_TRIGGER_FACTORY`); declared `[secrets]` are stored as secrets. The library signs as any key the console custodies (`send_tx_as` / `submit_as`) or submits for it through the facilitator (`submit_for_with`; an ETH deposit cannot go through the facilitator — give the account ETH and let it deposit itself). The guest module comes from the release (`embed_lib.syn`: `release_guest(tag)` via `http_bytes` following redirects by hand, `embed(guest, program, name)`), cached on the volume. Templates: literal CSS/JS/JSON braces go inside `{ raw } … { end }`. A full devnet answers a deploy with `MaxNumOfApplicationsExceeded` (the kit's ProcessorEndpoint allows 10 apps; `devnet/admin.syn -- max-apps` raises it).
+**Dark pool:** `github.com/SYNSEMA/vela-dark-pool` — a dark pool for block trades (mechanically a sealed-bid batch auction): bids `(quantity, total)` encrypted to the enclave, matching inside (uniform or pay-as-bid; rank by cross-multiplication, NEVER `/` on big integers — it goes through a float; the kit's `div_floor` = long division on the digits, which `a // b` does exactly since v0.6.29), settlement from escrow as pull-payments, losing bids never revealed, public `opened`/`cleared` app events with no bidder in them. Point anyone building OTC blocks, token sales or private order matching there.
+**The kits are web apps:** each recipe's entry is a console (`web.syn`, `kind = web`, `synsema serve web.syn`): payroll (fund / onboard / pay run / payslips / payouts), policy engine (deploy with a trigger from `TreasuryTriggerFactory` — written when a Synsema program could not send a contract-creation tx; since v0.6.29 `evm_tx_create` can — policy / payees / propose / approve / reject / receipts), dark pool (the seller's desk + a desk per buyer), and the private transfers workbench (deploy / register / deposit / any payload / events / users via the facilitator / reports). On synsema.com the project's env is provisioned at creation from `[provision] env_url = "https://devnet.synsema.app/token"` in `syn.toml` (token, addresses, keys, `VELA_TRIGGER_FACTORY`); declared `[secrets]` are stored as secrets. The library signs as any key the console custodies (`send_tx_as` / `submit_as`) or submits for it through the facilitator (`submit_for_with`; an ETH deposit cannot go through the facilitator — give the account ETH and let it deposit itself). The guest module comes from the release (`embed_lib.syn`: `release_guest(tag)` via `http_bytes` following redirects by hand, `embed(guest, program, name)`), cached on the volume. Templates: literal CSS/JS/JSON braces go inside `{ raw } … { end }`. A full devnet answers a deploy with `MaxNumOfApplicationsExceeded` (the kit's ProcessorEndpoint allows 10 apps; `devnet/admin.syn -- max-apps` raises it).
 
 **The two-axis rule.** Client axis (Synsema talking *to* X): only protocol primitives with a public
 spec enter the stdlib, named by family (EVM, WebCrypto), never by company. Host axis (Synsema
@@ -105,11 +105,14 @@ network, files, LLM (the Go reference app stamps `time.Now()`; here that line ca
 Maps keep insertion order, JSON is emitted in that order — the same input gives the same bytes
 across runs and instances (verified: 5 processes, identical hashes). Available: types, JSON,
 `decimal` (exact, 28 digits), `bytes_to_int`/`int_to_bytes` (exact 256-bit), `keccak256`,
-`sha256`, `abi_encode`/`abi_decode`, `match`, `try`/`recover`, `test` blocks. **Numbers in JSON**:
-a decimal/big int is written as a bare JSON number and comes back as a float above 2⁵³ — keep
-amounts as **text** in the state (`text(n)`, or Uint256 hex) and convert on use. Hex helpers you
-will write in every app (`bytes(h, "hex")` takes no `0x` and needs an even length; `Uint256.ToHex`
-strips leading zeros): see `hex_to_int`/`int_to_hex` in `examples/payment_app.syn`.
+`sha256`, `abi_encode`/`abi_decode`, `match`, `try`/`recover`, `test` blocks, `int`/`hex`/`//`.
+**Numbers in JSON**: a decimal/big int is written as a bare JSON number. Before v0.6.29 it came
+back as a float above 2⁵³; since v0.6.29 `json_decode` keeps integers of any size exact (a number
+with `.` or an exponent is still a float) — keeping amounts as **text** in the state (`text(n)`, or
+Uint256 hex) and converting on use stays the portable choice. Hex: Go's `Uint256.ToHex` form
+(`"0x…"`, no leading zeros, `"0x0"`) is exactly `hex(n)`, and `int("0x…")` reads it back
+(v0.6.29+; the kit's `hex_to_int`/`int_to_hex` in `examples/payment_app.syn` predate them).
+`bytes(h, "hex")` accepts a `0x` prefix since v0.6.29 but still needs an even length.
 
 ## The output policy — what the CHAIN can see (engine v0.6.24+)
 
@@ -243,16 +246,20 @@ and subtypes, log parsing, calldata, EIP-712 digests.
 
 ## Language gotchas met while writing guests and clients
 
-- `to` and `from` are reserved words — not even as parameter names. No `0xab` literals — write
-  `171`. `index_of` takes a list, not text (digits: `floor(number(ch))`). Maps are shared by
-  reference: a task that `set`s inside the state it received mutates the caller's map (matters in
-  tests that reuse a state).
+- `to` is a reserved word — not as a parameter or variable name (`from` is a soft keyword, but
+  avoid it too). After a `.` any word works since v0.6.29 (`tx.to`, `ev.from`, `ev.type`). Hex
+  literals exist since v0.6.29 (`0xab`, `0b101`); a digit character is `int(ch)`; `index_of` also
+  takes text (`index_of(s, piece)` → position or `nothing`). **Maps and lists are values** since
+  v0.6.29: a task that `set`s inside the state it received changes its own copy, not the caller's
+  — `give` the new state back (on older engines it mutated the caller's map, which bit tests that
+  reuse a state).
 - `ecdh_shared_secret`/`hkdf_sha256`/`aes_gcm_*` take keys as **bytes/secret bytes**: a hex key from
   `.env` is `as_secret(bytes(env("K"), "hex"), "K")` (a text `secret()` is the hex characters).
-  `hmac_sha256(data, key)` stringifies a `bytes` — wrap both in `as_secret`. `ecdh_keypair`'s
+  The old `hmac_sha256(data, key)` stringified a `bytes` (wrap both in `as_secret` there); its
+  v0.6.29 replacement `hmac(data, key)` returns the MAC as **bytes** (`hex(mac)` to show). `ecdh_keypair`'s
   private is labelled `ecdh_keypair.private` (`require reveal("ecdh_keypair.private")` to print it).
 - `secp256k1_sign` returns `r‖s‖v` with v = 0/1; OpenZeppelin's `ECDSA.recover` and EIP-2612
-  `permit` want 27/28 — add 27. `eip712_digest(domain, types, primary, message)` with the standard
+  `permit` want 27/28 — `evm_signature(sig)` (v0.6.29+; before, add 27 by hand). `eip712_digest(domain, types, primary, message)` with the standard
   JSON shape (`{"Type": [{"name","type"}, …]}`, domain keys `name`/`version`/`chainId`/`verifyingContract`).
 - `http_post(url, map)` sends JSON with the Content-Type; `bytes` bodies go raw; the response has
   `status`, `ok`, `body`, `json`, `headers`. `multipart_encode(parts)` → `{body, content_type}`.

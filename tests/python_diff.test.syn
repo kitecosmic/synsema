@@ -29,9 +29,11 @@ task give_none()
 task give_true()
     give True
 
-task iterate_map_directly()
-    each k in {"a": 1}
-        print(k)
+task keys_by_each(m)
+    let ks be []
+    each k in m
+        set ks to append(ks, k)
+    give ks
 
 task classify(status)
     match status
@@ -59,16 +61,16 @@ test "when / otherwise when / otherwise + inline form"
     let label be when n >= 5 then "big" otherwise "small"
     assert_eq(label, "big")
 
-test "each over a list; each over a MAP errors (use keys())"
+test "each over a list; each over a map walks its keys (v0.6.29+)"
     let total be 0
     each x in [1, 2, 3]
         set total to total + x
     assert_eq(total, 6)
-    assert_error(iterate_map_directly)
-    let ks be []
-    each k in keys({"x": 1, "y": 2})
-        set ks to append(ks, k)
-    assert_eq(ks, ["x", "y"])
+    assert_eq(keys_by_each({"x": 1, "y": 2}), ["x", "y"])
+    let pairs be []
+    each e in items({"x": 1})
+        set pairs to append(pairs, [e.key, e.value])
+    assert_eq(pairs, [["x", 1]])
 
 test "give returns; Python's `return x` does not even load"
     assert_eq(classify(200), "ok")
@@ -115,12 +117,15 @@ test "interpolation is backtick-only; quoted strings stay literal"
     assert_eq(`n={1 + 1}`, "n=2")
     assert(contains("n={1+1}", "{"))
 
-test "len/str are length/text; number() parses"
+test "len/str/int are length/text/int; number() parses a float"
     assert_eq(length("abc"), 3)
     assert_eq(length([1, 2]), 2)
     assert_eq(length({"a": 1}), 1)
     assert_eq(text(42), "42")
     assert_eq(number("42"), 42)
+    assert_eq(int("123456789012345678901"), 123456789012345678901)
+    assert_eq(int("0x1f"), 31)
+    assert_error(() => int(1.5))
 
 test "text + number concatenates (unlike Python); text * n does not exist"
     assert_eq("a" + 1, "a1")
@@ -130,19 +135,25 @@ test "text + number concatenates (unlike Python); text * n does not exist"
 test "comprehension equivalent: apply + where"
     assert_eq(apply((x) => x * 2, where([1, 2, 3], (x) => x > 1)), [4, 6])
 
-test "slicing is slice(), negatives ok; xs[1:3] is a parse error"
+test "slicing is slice(), negatives ok; xs[1:3] is a parse error; xs[-1] works"
     assert_eq(slice([10, 20, 30, 40], 1, 3), [20, 30])
-    assert_eq(slice([10, 20, 30, 40], -2, 4), [30, 40])
+    assert_eq(slice([10, 20, 30, 40], -2), [30, 40])
     assert_eq(slice("hello", 1, 3), "el")
+    assert_eq([10, 20, 30][-1], 30)
+    assert_eq("hello"[0], "h")
 
-test "the 'in' operator is contains(); maps check keys"
+test "the 'in' operator works like Python (v0.6.29+); maps check keys"
+    assert(2 in [1, 2])
+    assert("b" in "abc")
+    assert("a" in {"a": 1})
+    assert(3 not in [1, 2])
     assert(contains([1, 2], 2))
-    assert(contains("abc", "b"))
-    assert(contains({"a": 1}, "a"))
 
-test "no dict.get(k, default); a missing key errors"
+test "m[k] on a missing key errors; get(m, k, default) is dict.get"
     assert_error(() => {"a": 1}["b"])
-    assert_error(() => get({"a": 1}, "a"))
+    assert_eq(get({"a": 1}, "a"), 1)
+    assert_eq(get({"a": 1}, "b"), nothing)
+    assert_eq(get({"a": 1}, "b", 0), 0)
 
 test "string methods are plain tasks"
     assert_eq(upper("hola"), "HOLA")
@@ -152,14 +163,17 @@ test "string methods are plain tasks"
 
 test "sorted/sum/min/max equivalents"
     assert_eq(sort_by([3, 1, 2], (x) => x), [1, 2, 3])
-    assert_eq(sort_by([3, 1, 2], (x) => 0 - x), [3, 2, 1])
+    assert_eq(sort([3, 1, 2], desc = true), [3, 2, 1])
+    assert_eq(sort(["b", "a"]), ["a", "b"])
     assert_eq(sum([1, 2, 3]), 6)
     assert_eq(min([5, 2, 9]), 2)
     assert_eq(mean([1, 2, 3]), 2)
 
-test "division always float; // is floor(a/b); round is banker's like Python"
+test "/ is always float; // is exact floor division; round is banker's like Python"
     assert(10 / 3 > 3.33)
-    assert_eq(floor(7 / 2), 3)
+    assert_eq(7 // 2, 3)
+    assert_eq(-7 // 2, -4)
+    assert_eq((10 ** 30) // 3, 333333333333333333333333333333)
     assert_eq(round(2.5), 2)
     assert_eq(round(3.5), 4)
 

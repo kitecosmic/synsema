@@ -401,6 +401,10 @@ pub const LABEL_SINK_BUILTINS: &[&str] = &[
     "solana_rpc", "solana_send", "solana_confirm", "solana_balance", "solana_latest_blockhash", "spl_balance",
     "algorand_send", "algorand_wait", "algorand_account", "algorand_params",
     "btc_rpc", "btc_send", "btc_utxos", "btc_balance", "btc_fee_estimates", "btc_wait",
+    // v0.6.29: `<familia>_<acción>` (los nombres de arriba quedan como alias hasta v1.0).
+    "evm_rpc", "evm_call", "evm_send", "evm_balance", "evm_nonce", "evm_receipt", "evm_wait",
+    "evm_estimate_gas", "evm_gas_price", "evm_fee_history", "evm_chain_id", "evm_block_number", "evm_logs",
+    "solana_wait",
     // Bases de datos (stdlib/database.rs)
     "db_open", "db_close", "sql", "sql_exec", "sql_batch", "sql_tables", "paged",
     "redis_get", "redis_set", "redis_del", "redis_incr", "redis_incrby", "redis_decr", "redis_exists", "redis_expire",
@@ -516,6 +520,15 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     "upper", "values", "var", "verify_hmac", "webauthn_register", "webauthn_verify", "xml_parse", "zeros",
     "did_key_decode", "did_key_document", "did_key_encode", "document_sign", "document_verify",
     "receipt", "receipt_verify",
+    // v0.6.29: entero exacto, `0x…` y predicados de tipo.
+    "int", "hex", "is_integer", "is_text", "is_list", "is_map",
+    // v0.6.29: mapas, orden, texto y regex con sus nombres nuevos; la MAC en bytes.
+    "get", "remove", "merge", "items", "sort", "replace", "regex_find_all", "regex_capture",
+    "regex_replace", "fold_text", "hmac",
+    // v0.6.29: blockchain `<familia>_<acción>` (puros: construir, derivar, decodificar).
+    "evm_address", "evm_signature", "evm_tx", "evm_tx_raw", "evm_tx_create", "evm_create_address",
+    "evm_create2_address", "abi_event_topic", "abi_decode_log", "algorand_address", "algorand_tx_raw",
+    "solana_tx_raw",
 ];
 
 /// Todos los builtins registrados en el wiring NATIVO (un intérprete de `run`), ordenados.
@@ -534,6 +547,26 @@ pub fn registered_builtin_names() -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// `(nombre, param_count)` de cada builtin del wiring nativo: el anti-rot de la aridad
+/// estricta (v0.6.29) exige que todo variádico (`-1`) esté en `BUILTIN_ARITY`.
+pub fn registered_builtin_arities() -> Vec<(String, i32)> {
+    let mut interp = Interpreter::new();
+    let caps = Rc::new(RefCell::new(CapabilitySet::new("probe")));
+    wire_common(&mut interp, &caps, false, None, "probe");
+    let env = interp.global_env.borrow();
+    let mut out: Vec<(String, i32)> = env
+        .bindings
+        .iter()
+        .filter_map(|(k, v)| match v {
+            // El nombre del BUILTIN, no el del binding: un alias deprecado comparte el del nuevo.
+            synsema_core::types::SynValue::Builtin(b) => { let _ = k; Some((b.name.clone(), b.param_count)) }
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// ¿Existe un builtin con ese nombre en el wiring nativo? (anti-rot de `LABEL_SINK_BUILTINS`).

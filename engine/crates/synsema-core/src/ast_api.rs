@@ -24,6 +24,7 @@ fn children(n: &Node) -> Vec<&Node> {
         PropertyAccess { object, .. } => vec![object],
         IndexAccess { object, index } => vec![object, index],
         BinaryOp { left, right, .. } => vec![left, right],
+        CompareChain { operands, .. } => operands.iter().collect(),
         UnaryOp { operand, .. } => vec![operand],
         PipeExpression { value, transforms } => {
             let mut v = vec![value.as_ref()];
@@ -519,6 +520,7 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
         PropertyAccess { object, .. } => vec![object.as_mut()],
         IndexAccess { object, index } => vec![object.as_mut(), index.as_mut()],
         BinaryOp { left, right, .. } => vec![left.as_mut(), right.as_mut()],
+        CompareChain { operands, .. } => operands.iter_mut().collect(),
         UnaryOp { operand, .. } => vec![operand.as_mut()],
         PipeExpression { value, transforms } => {
             let mut v = vec![value.as_mut()];

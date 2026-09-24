@@ -538,7 +538,7 @@ print(label_of(x))\nprint(label_of(7))\nprint(is_private(x))\nprint(is_private([
     );
     // El contenido es el correcto (el host lo lee sin redactar).
     let i = run_ok("let x be private(3, \"b\") + private(1, \"a\")\nlet l be label_of(x)\nlet p be is_private(x)\nlet q be is_private(7)\n");
-    assert_eq!(plain_of(&i, "l"), "[a, b]");
+    assert_eq!(plain_of(&i, "l"), "[\"a\", \"b\"]");
     assert_eq!(label_of(&i, "l"), "a,b");
     assert_eq!(plain_of(&i, "p"), "true");
     assert_eq!(label_of(&i, "p"), "a,b");
@@ -703,7 +703,7 @@ fn strip_deep_removes_every_label_and_shares_clean_containers() {
     assert_eq!(label_display_raw(&label_deep(&m)), "x,y,z");
     let s = strip_deep(&m);
     assert!(label_deep(&s).is_empty());
-    assert_eq!(s.to_string(), "{a: [1, 2], b: t}");
+    assert_eq!(s.to_string(), "{a: [1, 2], b: \"t\"}");
     // mark desde el host (una fuente): envuelve y une; etiqueta vacía = valor pelado.
     let src_v = mark(syn_list(vec![syn_int(1)]), labels::label_from(&["app"]));
     assert_eq!(label_display_raw(&labels::label(&src_v)), "app");
@@ -904,7 +904,7 @@ fn audit_b3_match_guard_pattern_and_container_push_the_pc() {
     let i = run_ok(container);
     assert_eq!(label_of(&i, "r"), "a");
     let inner = strip_deep(&env_get(&i.global_env, "r").unwrap());
-    assert_eq!(inner.to_string(), "[x, 1, has]");
+    assert_eq!(inner.to_string(), "[\"x\", 1, \"has\"]");
     // El binder público `n` también sale con el PC del sujeto.
     let r = env_get(&i.global_env, "r").unwrap();
     if let SynValue::List(l) = labels::unwrap(&r) {
@@ -1105,7 +1105,7 @@ fn audit_b8_protected_names_cannot_be_redefined() {
     assert!(msg.contains("does not resolve to it"), "{}", msg);
     // El programa correcto sigue funcionando.
     let i = run_ok("let x be private(5, \"app\")\nlet l be label_of(x)\n");
-    assert_eq!(plain_of(&i, "l"), "[app]");
+    assert_eq!(plain_of(&i, "l"), "[\"app\"]");
 }
 
 #[test]
@@ -1193,10 +1193,12 @@ fn audit_m4_aliases_cannot_be_written_under_pc() {
     assert!(msg.contains("label_violation") && msg.contains("'n'"), "{}", msg);
     let msg = run_err("let m be {}\ntask w(t)\n    set t[\"k\"] to 1\nlet f be private(true, \"a\")\nwhen f\n    w(m)\n");
     assert!(msg.contains("label_violation") && msg.contains("'t'"), "{}", msg);
-    // El alias de un contenedor privado que cubre el PC sí funciona (copia el envoltorio).
-    let i = run_ok("let s be private({}, \"a\")\nlet t be s\nlet f be private(true, \"a\")\nwhen f\n    set t[\"k\"] to 1\nlet v be s[\"k\"]\n");
+    // Escribir en la copia de un contenedor privado que cubre el PC funciona; desde v0.6.29
+    // (semántica de valor) la escritura queda en `t` y no llega a `s`.
+    let i = run_ok("let s be private({}, \"a\")\nlet t be s\nlet f be private(true, \"a\")\nwhen f\n    set t[\"k\"] to 1\nlet v be t[\"k\"]\nlet had be contains(s, \"k\")\n");
     assert_eq!(label_of(&i, "v"), "a");
     assert_eq!(plain_of(&i, "v"), "1");
+    assert_eq!(plain_of(&i, "had"), "false");
 }
 
 #[test]
@@ -1443,7 +1445,7 @@ when length(label_of(m)) == 2\n    set found to 99\n";
     assert!(msg.contains("label_violation") && msg.contains("'found'"), "{}", msg);
     // `label_of`/`is_private` describen un valor privado → su resultado es privado.
     let i = run_ok("let m be private({}, \"a\")\nset m[\"x\"] to private(1, \"b\")\nlet l be label_of(m)\nlet n be length(l)\nlet p be is_private(m)\n");
-    assert_eq!(plain_of(&i, "l"), "[a, b]");
+    assert_eq!(plain_of(&i, "l"), "[\"a\", \"b\"]");
     assert_eq!(label_of(&i, "l"), "a,b");
     assert_eq!(label_of(&i, "n"), "a,b");
     assert_eq!(label_of(&i, "p"), "a,b");

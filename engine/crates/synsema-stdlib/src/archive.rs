@@ -476,7 +476,7 @@ mod tests {
         let dest = d.join("out");
         let dest_s = dest.to_string_lossy().replace('\\', "/");
         let list = ok(zip_extract(&caps, &[syn_bytes(z1), syn_text(dest_s.as_str())]));
-        assert_eq!(list.to_string(), "[a.txt, dir/b.txt]");
+        assert_eq!(list.to_string(), "[\"a.txt\", \"dir/b.txt\"]");
         assert_eq!(std::fs::read_to_string(dest.join("dir").join("b.txt")).unwrap(), "mundo");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -496,7 +496,7 @@ mod tests {
             let dest = d.join(tag);
             let dest_s = dest.to_string_lossy().replace('\\', "/");
             let list = ok(tar_extract(&caps, &[syn_bytes(data), syn_text(dest_s.as_str())]));
-            assert_eq!(list.to_string(), "[x/y.txt, z.txt]", "{}", tag);
+            assert_eq!(list.to_string(), "[\"x/y.txt\", \"z.txt\"]", "{}", tag);
             assert_eq!(std::fs::read_to_string(dest.join("z.txt")).unwrap(), "22");
         }
         let _ = std::fs::remove_dir_all(&d);
@@ -555,7 +555,7 @@ mod tests {
         assert!(!dest.join("small.txt").exists(), "nada escrito, ni la entrada válida previa");
         // Con techo suficiente, sale entero.
         let list = ok(zip_extract(&caps, &[syn_bytes(z), syn_text(dest_s.as_str())]));
-        assert_eq!(list.to_string(), "[small.txt, big.bin]");
+        assert_eq!(list.to_string(), "[\"small.txt\", \"big.bin\"]");
         assert_eq!(std::fs::metadata(dest.join("big.bin")).unwrap().len(), 2 * 1024 * 1024);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -573,7 +573,7 @@ mod tests {
         let z = bytes_of(ok(zip_create(&caps_for(&d), &[syn_list(vec![entry("a/b.txt", "x"), entry("c.txt", "y")])])));
         assert!(!dest.exists());
         let list = ok(zip_extract(&caps, &[syn_bytes(z), syn_text(dest_s.as_str())]));
-        assert_eq!(list.to_string(), "[a/b.txt, c.txt]");
+        assert_eq!(list.to_string(), "[\"a/b.txt\", \"c.txt\"]");
         assert_eq!(std::fs::read_to_string(dest.join("a").join("b.txt")).unwrap(), "x");
         // Un archivo sin entradas no crea `dest` (no hay nada que escribir ni grant que lo cubra).
         let empty_dest = d.join("never");

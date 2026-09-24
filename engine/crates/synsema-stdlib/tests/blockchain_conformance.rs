@@ -235,7 +235,7 @@ fn secp256k1_verify_and_recover_roundtrip() {
     // ecrecover: recupera la pubkey firmante → su dirección == dirección de KEY1.
     let recovered = ok_bytes(call(&mut i, "secp256k1_recover", vec![digest, syn_bytes(sig)]));
     assert_eq!(recovered, pub_u, "ecrecover devuelve la pubkey sin comprimir de la clave");
-    let addr = ok_text(call(&mut i, "eth_address", vec![syn_bytes(recovered)]));
+    let addr = ok_text(call(&mut i, "evm_address", vec![syn_bytes(recovered)]));
     assert_eq!(addr, KEY1_ADDR);
 }
 
@@ -247,13 +247,13 @@ fn secp256k1_verify_and_recover_roundtrip() {
 fn eth_address_from_key_and_eip55_vectors() {
     let mut i = interp_with_sign("K");
     // Clave conocida → dirección conocida (deriva la pubkey Rust-side).
-    let addr = ok_text(call(&mut i, "eth_address", vec![syn_secret("K", KEY1_HEX)]));
+    let addr = ok_text(call(&mut i, "evm_address", vec![syn_secret("K", KEY1_HEX)]));
     assert_eq!(addr, KEY1_ADDR);
 
     // Los 4 vectores de checksum del EIP-55: dada la dirección (20 bytes), el
     // checksum mixed-case debe salir exacto. Reconstruimos vía una pubkey no —
     // en cambio verificamos el checksum sobre bytes conocidos derivando de la addr.
-    // (eth_address toma pubkey/secret; para chequear el checksum puro usamos la
+    // (evm_address toma pubkey/secret; para chequear el checksum puro usamos la
     // ruta pubkey: buscamos claves cuya dirección sea cada vector no es práctico,
     // así que validamos el algoritmo de checksum contra los 4 strings canónicos.)
     for want in [
@@ -906,7 +906,7 @@ fn eip191_digest_vectors_and_recover_closes_the_loop() {
     );
     assert_eq!(sig[64], 0, "v crudo 0 == v Ethereum 27");
     let pk = ok_bytes(call(&mut i, "secp256k1_recover", vec![syn_bytes(d), syn_bytes(sig)]));
-    assert_eq!(ok_text(call(&mut i, "eth_address", vec![syn_bytes(pk)])), KEY1_ADDR);
+    assert_eq!(ok_text(call(&mut i, "evm_address", vec![syn_bytes(pk)])), KEY1_ADDR);
 }
 
 // =========================================================
@@ -991,7 +991,7 @@ fn eip712_appendix_digest_and_cow_signature() {
     assert_eq!(sig[64], 1, "v crudo 1 == v Ethereum 28");
     let pk = ok_bytes(call(&mut i, "secp256k1_recover", vec![syn_bytes(digest), syn_bytes(sig)]));
     assert_eq!(
-        ok_text(call(&mut i, "eth_address", vec![syn_bytes(pk)])),
+        ok_text(call(&mut i, "evm_address", vec![syn_bytes(pk)])),
         "0xCD2a3d9F938E13CD947Ec05AbC7FE734Df8DD826"
     );
 }
@@ -1251,7 +1251,7 @@ fn solana_transfer_matches_solders_vectors() {
         syn_bytes(vec![0u8; 32]), // System Program = 32 bytes cero
         syn_bytes(vec![0x03; 32]),
     );
-    let msg = ok_bytes(call(&mut i, "solana_message", vec![params]));
+    let msg = ok_bytes(call(&mut i, "solana_tx", vec![params]));
     assert_eq!(hex_encode(&msg), SOL_LEGACY_MSG, "message legacy byte a byte contra solders");
 
     // El data del transfer se arma con int_to_bytes_le (u32 LE 2 ‖ u64 LE lamports).
@@ -1273,7 +1273,7 @@ fn solana_transfer_matches_solders_vectors() {
     )));
 
     // Wire format: shortvec(1) ‖ sig ‖ message — contra bytes(Transaction).
-    let tx = ok_bytes(call(&mut i, "solana_tx", vec![syn_bytes(msg.clone()), syn_bytes(sig)]));
+    let tx = ok_bytes(call(&mut i, "solana_tx_raw", vec![syn_bytes(msg.clone()), syn_bytes(sig)]));
     assert_eq!(hex_encode(&tx), format!("01{}{}", SOL_LEGACY_SIG, SOL_LEGACY_MSG));
 
     // Pubkeys/blockhash como base58 text → los MISMOS bytes.
@@ -1283,7 +1283,7 @@ fn solana_transfer_matches_solders_vectors() {
         syn_text("11111111111111111111111111111111"),
         syn_text("CktRuQ2mttgRGkXJtyksdKHjUdc2C4TgDzyB98oEzy8"),
     );
-    let msg58 = ok_bytes(call(&mut i, "solana_message", vec![params58]));
+    let msg58 = ok_bytes(call(&mut i, "solana_tx", vec![params58]));
     assert_eq!(msg58, msg, "base58 text y bytes producen el mismo message");
 }
 
@@ -1302,7 +1302,7 @@ fn solana_v0_matches_versioned_message_and_multi_instruction_ordering() {
         _ => unreachable!(),
     };
     params.insert("version".to_string(), syn_int(0));
-    let msg0 = ok_bytes(call(&mut i, "solana_message", vec![syn_map(params.clone())]));
+    let msg0 = ok_bytes(call(&mut i, "solana_tx", vec![syn_map(params.clone())]));
     assert_eq!(
         hex_encode(&msg0),
         format!("80{}00", SOL_LEGACY_MSG),
@@ -1314,7 +1314,7 @@ fn solana_v0_matches_versioned_message_and_multi_instruction_ordering() {
         vec![syn_bytes(msg0.clone()), syn_secret("K", SOL_SEED)],
     ));
     assert_eq!(hex_encode(&sig0), SOL_V0_SIG, "la firma v0 de solders cubre el prefijo 0x80");
-    let tx0 = ok_bytes(call(&mut i, "solana_tx", vec![syn_bytes(msg0), syn_bytes(sig0)]));
+    let tx0 = ok_bytes(call(&mut i, "solana_tx_raw", vec![syn_bytes(msg0), syn_bytes(sig0)]));
     assert_eq!(
         hex_encode(&tx0),
         format!("01{}80{}00", SOL_V0_SIG, SOL_LEGACY_MSG),
@@ -1323,7 +1323,7 @@ fn solana_v0_matches_versioned_message_and_multi_instruction_ordering() {
 
     // lookup_tables presente → error claro (etapa 3), no silencio.
     params.insert("lookup_tables".to_string(), syn_list(vec![]));
-    let e = ok_err(call(&mut i, "solana_message", vec![syn_map(params)]));
+    let e = ok_err(call(&mut i, "solana_tx", vec![syn_map(params)]));
     assert!(e.contains("not supported yet"), "{}", e);
 
     // Multi-instrucción con flags mezclados: el orden final es fee payer,
@@ -1366,7 +1366,7 @@ fn solana_v0_matches_versioned_message_and_multi_instruction_ordering() {
             ]),
         ),
     ]);
-    let msg = ok_bytes(call(&mut i, "solana_message", vec![multi]));
+    let msg = ok_bytes(call(&mut i, "solana_tx", vec![multi]));
     assert_eq!(
         hex_encode(&msg),
         "020103073d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660ce734ea6c2b6257de72355e472aa05a4c487e6b463c029ed306df2f01b5636b5802020202020202020202020202020202020202020202020202020202020202020404040404040404040404040404040404040404040404040404040404040404000000000000000000000000000000000000000000000000000000000000000005050505050505050505050505050505050505050505050505050505050505050606060606060606060606060606060606060606060606060606060606060606030303030303030303030303030303030303030303030303030303030303030302040200020c0200000040420f00000000000604050103020109",
@@ -1398,7 +1398,7 @@ fn solana_shortvec_borders_are_minimal() {
                 ])]),
             ),
         ]);
-        let msg = ok_bytes(call(&mut i, "solana_message", vec![params]));
+        let msg = ok_bytes(call(&mut i, "solana_tx", vec![params]));
         // Cola del message: shortvec(1 instr) ‖ prog_idx(1) ‖ shortvec(0 cuentas)
         // ‖ shortvec(len) ‖ data.
         let mut tail = vec![0x01, 0x01, 0x00];
@@ -1414,14 +1414,14 @@ fn solana_errors_are_clear_and_safe() {
     // Clave desconocida en params → error nombrándola (typo-proof).
     let e = ok_err(call(
         &mut i,
-        "solana_message",
+        "solana_tx",
         vec![m(&[("fee_payr", syn_bytes(vec![0u8; 32]))])],
     ));
     assert!(e.contains("fee_payr"), "{}", e);
     // Versión inexistente.
     let e = ok_err(call(
         &mut i,
-        "solana_message",
+        "solana_tx",
         vec![m(&[
             ("fee_payer", syn_bytes(hx(SOL_PAYER_PK))),
             ("recent_blockhash", syn_bytes(vec![3u8; 32])),
@@ -1433,7 +1433,7 @@ fn solana_errors_are_clear_and_safe() {
     // Un SECRET donde va una pubkey → error dirigido (la pubkey es pública).
     let e = ok_err(call(
         &mut i,
-        "solana_message",
+        "solana_tx",
         vec![m(&[
             ("fee_payer", syn_secret("K", SOL_SEED)),
             ("recent_blockhash", syn_bytes(vec![3u8; 32])),
@@ -1443,21 +1443,21 @@ fn solana_errors_are_clear_and_safe() {
     assert!(e.contains("ed25519_pubkey"), "{}", e);
     assert!(!e.contains(SOL_SEED), "sin fuga de material");
 
-    // solana_tx: cantidad de firmas ≠ las requeridas por el header.
+    // solana_tx_raw: cantidad de firmas ≠ las requeridas por el header.
     let msg = hx(SOL_LEGACY_MSG);
     let e = ok_err(call(
         &mut i,
-        "solana_tx",
+        "solana_tx_raw",
         vec![syn_bytes(msg.clone()), syn_list(vec![syn_bytes(vec![0u8; 64]), syn_bytes(vec![0u8; 64])])],
     ));
     assert!(e.contains("requires 1 signature"), "{}", e);
     // Firma de largo inválido.
-    let e = ok_err(call(&mut i, "solana_tx", vec![syn_bytes(msg), syn_bytes(vec![0u8; 63])]));
+    let e = ok_err(call(&mut i, "solana_tx_raw", vec![syn_bytes(msg), syn_bytes(vec![0u8; 63])]));
     assert!(e.contains("64 bytes"), "{}", e);
     // Versión desconocida en el message.
     let mut bad = hx(SOL_LEGACY_MSG);
     bad[0] = 0x81;
-    let e = ok_err(call(&mut i, "solana_tx", vec![syn_bytes(bad), syn_bytes(vec![0u8; 64])]));
+    let e = ok_err(call(&mut i, "solana_tx_raw", vec![syn_bytes(bad), syn_bytes(vec![0u8; 64])]));
     assert!(e.contains("version"), "{}", e);
 }
 
@@ -1495,7 +1495,7 @@ fn algo_pay_txn() -> SynValue {
 #[test]
 fn algorand_pay_matches_algosdk_vectors() {
     let mut i = interp_with_sign("K");
-    let encoded = ok_bytes(call(&mut i, "algorand_tx_encode", vec![algo_pay_txn()]));
+    let encoded = ok_bytes(call(&mut i, "algorand_tx", vec![algo_pay_txn()]));
     assert_eq!(
         hex_encode(&encoded),
         format!("5458{}", ALGO_PAY),
@@ -1511,7 +1511,7 @@ fn algorand_pay_matches_algosdk_vectors() {
     // SignedTxn {"sig", "txn"} → byte a byte contra algosdk.
     let stx = ok_bytes(call(
         &mut i,
-        "algorand_tx",
+        "algorand_tx_raw",
         vec![algo_pay_txn(), syn_bytes(sig)],
     ));
     assert_eq!(
@@ -1541,7 +1541,7 @@ fn algorand_canonical_omits_zero_values() {
         ("gh", syn_bytes(vec![0x07; 32])),
         ("note", syn_bytes(vec![])),
     ]);
-    let encoded = ok_bytes(call(&mut i, "algorand_tx_encode", vec![txn0]));
+    let encoded = ok_bytes(call(&mut i, "algorand_tx", vec![txn0]));
     assert_eq!(
         hex_encode(&encoded[2..]),
         "87a3666565cd03e8a26676cd03e8a26768c4200707070707070707070707070707070707070707070707070707070707070707a26c76cd07d0a3726376c4200202020202020202020202020202020202020202020202020202020202020202a3736e64c4203d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660ca474797065a3706179"
@@ -1549,7 +1549,7 @@ fn algorand_canonical_omits_zero_values() {
     // Una txn TODO-cero → error (no un payload vacío en silencio).
     let e = ok_err(call(
         &mut i,
-        "algorand_tx_encode",
+        "algorand_tx",
         vec![m(&[("amt", syn_int(0)), ("note", syn_bytes(vec![]))])],
     ));
     assert!(e.contains("no non-zero fields"), "{}", e);
@@ -1558,12 +1558,12 @@ fn algorand_canonical_omits_zero_values() {
 #[test]
 fn algorand_addresses_and_checksum() {
     let mut i = interp_with_sign("K");
-    // algo_address desde la pubkey y desde el SECRET (deriva Rust-side, G2).
-    let a = ok_text(call(&mut i, "algo_address", vec![syn_bytes(hx(SOL_PAYER_PK))]));
+    // algorand_address desde la pubkey y desde el SECRET (deriva Rust-side, G2).
+    let a = ok_text(call(&mut i, "algorand_address", vec![syn_bytes(hx(SOL_PAYER_PK))]));
     assert_eq!(a, ALGO_SENDER, "encoding.encode_address de algosdk");
-    let a2 = ok_text(call(&mut i, "algo_address", vec![syn_secret("K", SOL_SEED)]));
+    let a2 = ok_text(call(&mut i, "algorand_address", vec![syn_secret("K", SOL_SEED)]));
     assert_eq!(a2, ALGO_SENDER);
-    let r = ok_text(call(&mut i, "algo_address", vec![syn_bytes(vec![0x02; 32])]));
+    let r = ok_text(call(&mut i, "algorand_address", vec![syn_bytes(vec![0x02; 32])]));
     assert_eq!(r, ALGO_RCV);
 
     // Dirección con un caracter alterado → checksum inválido → error SIN enviar.
@@ -1571,7 +1571,7 @@ fn algorand_addresses_and_checksum() {
     bad.replace_range(10..11, if &ALGO_SENDER[10..11] == "A" { "B" } else { "A" });
     let e = ok_err(call(
         &mut i,
-        "algorand_tx_encode",
+        "algorand_tx",
         vec![m(&[("type", syn_text("pay")), ("snd", syn_text(bad.as_str()))])],
     ));
     assert!(e.contains("checksum"), "{}", e);
@@ -1583,28 +1583,28 @@ fn algorand_rejects_bad_amounts_and_secrets() {
     // Negativo → error (campos del protocolo son unsigned).
     let e = ok_err(call(
         &mut i,
-        "algorand_tx_encode",
+        "algorand_tx",
         vec![m(&[("type", syn_text("pay")), ("amt", syn_int(-1))])],
     ));
     assert!(e.contains("negative"), "{}", e);
     // Float → error dirigido a enteros exactos.
     let e = ok_err(call(
         &mut i,
-        "algorand_tx_encode",
+        "algorand_tx",
         vec![m(&[("type", syn_text("pay")), ("amt", SynValue::Number(Number::Float(1.5)))])],
     ));
     assert!(e.contains("exact integer"), "{}", e);
     // > u64 → error (uint64 del protocolo).
     let e = ok_err(call(
         &mut i,
-        "algorand_tx_encode",
+        "algorand_tx",
         vec![m(&[("type", syn_text("pay")), ("amt", big("18446744073709551616"))])],
     ));
     assert!(e.contains("64 bits"), "{}", e);
     // Un secret dentro de la txn → error sin fuga.
     let e = ok_err(call(
         &mut i,
-        "algorand_tx_encode",
+        "algorand_tx",
         vec![m(&[("type", syn_text("pay")), ("note", syn_secret("K", SOL_SEED))])],
     ));
     assert!(e.contains("secret"), "{}", e);
@@ -1696,7 +1696,7 @@ fn deep_nesting_errors_instead_of_crashing() {
             for _ in 0..10_000 {
                 txn = m(&[("apar", txn)]);
             }
-            let e = ok_err(call(&mut i, "algorand_tx_encode", vec![txn]));
+            let e = ok_err(call(&mut i, "algorand_tx", vec![txn]));
             assert!(e.contains("nested too deeply"), "algorand: {}", e);
         })
         .expect("spawn big-stack thread")

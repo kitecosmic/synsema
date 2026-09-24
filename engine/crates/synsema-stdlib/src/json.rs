@@ -292,14 +292,21 @@ pub fn json_to_syn(v: &serde_json::Value) -> SynValue {
     match v {
         V::Null => syn_nothing(),
         V::Bool(b) => syn_bool(*b),
+        // Un entero JSON de cualquier tamaño llega EXACTO (v0.6.29, `arbitrary_precision`):
+        // `18446744073709551615` o un uint256 ya no pasan por f64. Con punto o exponente
+        // es float, como siempre.
         V::Number(n) => {
             if let Some(i) = n.as_i64() {
-                syn_int(i)
-            } else if let Some(f) = n.as_f64() {
-                SynValue::Number(Number::Float(f))
-            } else {
-                syn_int(0)
+                return syn_int(i);
             }
+            let t = n.to_string();
+            let digits = t.strip_prefix('-').unwrap_or(&t);
+            if !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()) {
+                if let Ok(b) = t.parse::<num_bigint::BigInt>() {
+                    return SynValue::Number(Number::from_bigint(b));
+                }
+            }
+            SynValue::Number(Number::Float(n.as_f64().unwrap_or_else(|| t.parse::<f64>().unwrap_or(f64::NAN))))
         }
         V::String(s) => syn_text(s.as_str()),
         V::Array(a) => syn_list(a.iter().map(json_to_syn).collect()),

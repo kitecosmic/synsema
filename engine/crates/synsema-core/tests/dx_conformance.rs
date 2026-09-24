@@ -206,7 +206,7 @@ fn reduce_with_callable_init_is_valid() {
 fn unique_first_appearance_order_and_structural_equality() {
     shows("text(unique([3, 1, 3, 2, 1]))", "[3, 1, 2]");
     shows("text(unique([]))", "[]");
-    shows("text(unique([\"a\", \"b\", \"a\"]))", "[a, b]");
+    shows("text(unique([\"a\", \"b\", \"a\"]))", "[\"a\", \"b\"]");
     // Tipos mezclados conviven (la igualdad estructural no cruza tipos no comparables).
     shows("text(length(unique([1, \"x\", 1, \"x\"])))", "2");
     // Igualdad estructural: maps y listas anidadas deduplican por VALOR.

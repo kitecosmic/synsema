@@ -107,6 +107,8 @@ pub enum TokenType {
     Minus,
     Star,
     Slash,
+    /// `//` división entera con piso (v0.6.29).
+    FloorDiv,
     Percent,
     Power,
     Equal,
@@ -224,6 +226,7 @@ impl TokenType {
             Minus => "MINUS",
             Star => "STAR",
             Slash => "SLASH",
+            FloorDiv => "FLOORDIV",
             Percent => "PERCENT",
             Power => "POWER",
             Equal => "EQUAL",

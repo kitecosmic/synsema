@@ -71,7 +71,7 @@ fn build_hello_and_run_it_without_the_sources_on_disk() {
     assert_eq!(code, 0, "{}", err);
     let lines: Vec<&str> = out.lines().map(|l| l.trim()).collect();
     assert_eq!(lines[0], "42");
-    assert_eq!(lines[1], "[--hello, world]");
+    assert_eq!(lines[1], "[\"--hello\", \"world\"]");
     assert_eq!(lines[2], "{\"k\": 1}");
     assert_eq!(lines[3], "true");
     assert!(lines[4].contains("<b>lamp</b>"), "{}", out);
@@ -156,7 +156,7 @@ fn baked_cap_set_and_profile_pure_are_enforced() {
     let lamp = build(&dir, &[]);
     let (code, out, _) = run(&lamp, &dir, &["--sandbox", "--cap-set", "x"]);
     assert_eq!(code, 0);
-    assert_eq!(out.trim(), "[--sandbox, --cap-set, x]");
+    assert_eq!(out.trim(), "[\"--sandbox\", \"--cap-set\", \"x\"]");
     // Perfil puro horneado: `run` es un stub aunque el techo lo permita.
     std::fs::write(
         dir.join("lamp.syn"),

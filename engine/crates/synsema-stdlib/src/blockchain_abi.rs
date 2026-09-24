@@ -679,17 +679,72 @@ fn encode_scope(
     Ok(head)
 }
 
-fn abi_encode(args: &[SynValue]) -> Result<SynValue, Control> {
-    let sig = match arg(args, 0, "abi_encode")? {
-        SynValue::Text(s) => s.to_string(),
-        other => {
-            return Err(err(format!(
-                "abi_encode: the first argument must be the function signature as text, got {}",
-                other.type_name()
-            )))
+/// Los TIPOS en la forma de `abi_decode`: texto `"(address,uint256)"` / `"uint256"` o una
+/// lista de textos.
+fn types_arg(v: &SynValue, fname: &str) -> Result<Vec<AbiType>, Control> {
+    match v {
+        SynValue::Text(s) => {
+            let t = parse_single_type(s, false, fname)?;
+            Ok(match t {
+                AbiType::Tuple(ts) => ts,
+                single => vec![single],
+            })
         }
+        SynValue::List(l) => {
+            let items = l.borrow().clone();
+            let mut ts = Vec::with_capacity(items.len());
+            for (i, it) in items.iter().enumerate() {
+                match it {
+                    SynValue::Text(s) => ts.push(parse_single_type(s, false, fname)?),
+                    other => {
+                        return Err(err(format!(
+                            "{}: type {} in the list must be text, got {}",
+                            fname,
+                            i + 1,
+                            other.type_name()
+                        )))
+                    }
+                }
+            }
+            Ok(ts)
+        }
+        other => Err(err(format!(
+            "{}: the types must be text \"(address,uint256)\" or a list of texts, got {}",
+            fname,
+            other.type_name()
+        ))),
+    }
+}
+
+/// `abi_encode(signature, values)` → selector ‖ argumentos (una llamada). Con los TIPOS en
+/// vez de una firma —`abi_encode("(address,uint256)", values)` o una lista de textos, la
+/// forma de `abi_decode`— codifica los argumentos SIN selector (v0.6.29): lo que va
+/// después del bytecode en un deploy (argumentos del constructor), y el inverso exacto de
+/// `abi_decode`.
+fn abi_encode(args: &[SynValue]) -> Result<SynValue, Control> {
+    let first = arg(args, 0, "abi_encode")?;
+    let types_only = match first {
+        SynValue::List(_) => true,
+        SynValue::Text(s) => !s.contains('(') || s.starts_with('('),
+        _ => false,
     };
-    let (canonical, types) = parse_signature(&sig, "abi_encode")?;
+    let (canonical, types, selector) = if types_only {
+        let ts = types_arg(first, "abi_encode")?;
+        let c = format!("({})", ts.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
+        (c, ts, false)
+    } else {
+        let sig = match first {
+            SynValue::Text(s) => s.to_string(),
+            other => {
+                return Err(err(format!(
+                    "abi_encode: the first argument must be a function signature or the types, as text, got {}",
+                    other.type_name()
+                )))
+            }
+        };
+        let (c, ts) = parse_signature(&sig, "abi_encode")?;
+        (c, ts, true)
+    };
     let vals = match arg(args, 1, "abi_encode")? {
         SynValue::List(l) => l.borrow().clone(),
         other => {
@@ -707,7 +762,7 @@ fn abi_encode(args: &[SynValue]) -> Result<SynValue, Control> {
             vals.len()
         )));
     }
-    let mut out = Keccak256::digest(canonical.as_bytes())[..4].to_vec();
+    let mut out = if selector { Keccak256::digest(canonical.as_bytes())[..4].to_vec() } else { Vec::new() };
     // El error nombra el argumento 1-based y su tipo (posición humana, G4-style).
     let head_size: usize = types.iter().map(|t| t.head_size()).sum();
     let mut head = Vec::new();
@@ -955,38 +1010,7 @@ impl<'a> Dec<'a> {
 }
 
 fn abi_decode(args: &[SynValue]) -> Result<SynValue, Control> {
-    let types: Vec<AbiType> = match arg(args, 0, "abi_decode")? {
-        SynValue::Text(s) => {
-            let t = parse_single_type(s, false, "abi_decode")?;
-            match t {
-                AbiType::Tuple(ts) => ts,
-                single => vec![single],
-            }
-        }
-        SynValue::List(l) => {
-            let items = l.borrow().clone();
-            let mut ts = Vec::with_capacity(items.len());
-            for (i, it) in items.iter().enumerate() {
-                match it {
-                    SynValue::Text(s) => ts.push(parse_single_type(s, false, "abi_decode")?),
-                    other => {
-                        return Err(err(format!(
-                            "abi_decode: type {} in the list must be text, got {}",
-                            i + 1,
-                            other.type_name()
-                        )))
-                    }
-                }
-            }
-            ts
-        }
-        other => {
-            return Err(err(format!(
-                "abi_decode: the first argument must be the types — text \"(address,uint256)\" or a list of texts — got {}",
-                other.type_name()
-            )))
-        }
-    };
+    let types: Vec<AbiType> = types_arg(arg(args, 0, "abi_decode")?, "abi_decode")?;
     let data = arg_bytes(arg(args, 1, "abi_decode")?, "abi_decode", "the data")?;
     let dec = Dec { data, fname: "abi_decode" };
     let (vals, size) = dec.scope(&types, 0)?;
@@ -997,6 +1021,217 @@ fn abi_decode(args: &[SynValue]) -> Result<SynValue, Control> {
         )));
     }
     Ok(syn_list(vals))
+}
+
+// =========================================================
+// Eventos (v0.6.29): topic 0 y decodificación de logs
+// =========================================================
+
+/// `abi_event_topic("Transfer(address,address,uint256)")` → texto `0x…` (keccak de la firma
+/// canónica). TEXTO y no bytes porque se compara con `log["topics"][0]`, que es texto: con
+/// bytes el `==` daría `false` en silencio (regla bytes-vs-texto de blockchain_rpc.rs).
+fn abi_event_topic(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "abi_event_topic";
+    let sig = match arg(args, 0, F)? {
+        SynValue::Text(s) => s.to_string(),
+        SynValue::Map(_) => event_from_fragment(arg(args, 0, F)?, F)?.canonical,
+        other => {
+            return Err(err(format!(
+                "{}: expected the event signature as text (\"Transfer(address,address,uint256)\") or its ABI fragment, got {}",
+                F,
+                other.type_name()
+            )))
+        }
+    };
+    let canonical = parse_signature(&sig, F)?.0;
+    Ok(syn_text(format!("0x{}", synsema_core::bytesutil::hex_encode(&Keccak256::digest(canonical.as_bytes())))))
+}
+
+struct EventInput {
+    name: String,
+    ty: AbiType,
+    indexed: bool,
+}
+
+struct EventDef {
+    name: String,
+    canonical: String,
+    anonymous: bool,
+    inputs: Vec<EventInput>,
+}
+
+/// Tipo de un input del ABI JSON (`{"type": "tuple[]", "components": [...]}`) → texto
+/// canónico (`"(address,uint256)[]"`).
+fn json_abi_type(input: &SynValue, path: &str, fname: &str, depth: usize) -> Result<String, Control> {
+    if depth > MAX_DEPTH {
+        return Err(err(format!("{}: the ABI fragment is nested too deep", fname)));
+    }
+    let m = match input {
+        SynValue::Map(m) => m.borrow().clone(),
+        other => return Err(err(format!("{}: {} must be a map, got {}", fname, path, other.type_name()))),
+    };
+    let ty = match m.get("type") {
+        Some(SynValue::Text(t)) => t.to_string(),
+        _ => return Err(err(format!("{}: {} has no \"type\"", fname, path))),
+    };
+    if let Some(rest) = ty.strip_prefix("tuple") {
+        let comps = match m.get("components") {
+            Some(SynValue::List(l)) => l.borrow().clone(),
+            _ => return Err(err(format!("{}: {} is a tuple without \"components\"", fname, path))),
+        };
+        let mut parts = Vec::with_capacity(comps.len());
+        for (i, c) in comps.iter().enumerate() {
+            parts.push(json_abi_type(c, &format!("{}.components[{}]", path, i), fname, depth + 1)?);
+        }
+        return Ok(format!("({}){}", parts.join(","), rest));
+    }
+    Ok(ty)
+}
+
+/// El fragmento de evento del ABI JSON (lo que sale del artefacto de forge/solc):
+/// `{name, inputs: [{name, type, indexed, components?}], anonymous?}`.
+fn event_from_fragment(v: &SynValue, fname: &str) -> Result<EventDef, Control> {
+    let m = match v {
+        SynValue::Map(m) => m.borrow().clone(),
+        other => {
+            return Err(err(format!(
+                "{}: the event must be its ABI fragment (a map with name and inputs, as in the compiler's ABI JSON), got {}",
+                fname,
+                other.type_name()
+            )))
+        }
+    };
+    if let Some(SynValue::Text(t)) = m.get("type") {
+        if t.as_ref() != "event" {
+            return Err(err(format!("{}: the ABI fragment is a {:?}, not an event", fname, t.as_ref())));
+        }
+    }
+    let name = match m.get("name") {
+        Some(SynValue::Text(t)) if !t.is_empty() => t.to_string(),
+        _ => return Err(err(format!("{}: the event fragment has no \"name\"", fname))),
+    };
+    let anonymous = matches!(m.get("anonymous"), Some(SynValue::Bool(true)));
+    let raw_inputs = match m.get("inputs") {
+        Some(SynValue::List(l)) => l.borrow().clone(),
+        None => Vec::new(),
+        Some(other) => return Err(err(format!("{}: \"inputs\" must be a list, got {}", fname, other.type_name()))),
+    };
+    let mut inputs = Vec::with_capacity(raw_inputs.len());
+    let mut canon_types = Vec::with_capacity(raw_inputs.len());
+    for (i, inp) in raw_inputs.iter().enumerate() {
+        let path = format!("inputs[{}]", i);
+        let tys = json_abi_type(inp, &path, fname, 0)?;
+        let ty = parse_single_type(&tys, false, fname)?;
+        canon_types.push(ty.to_string());
+        let (nm, indexed) = match inp {
+            SynValue::Map(im) => {
+                let im = im.borrow();
+                let nm = match im.get("name") {
+                    Some(SynValue::Text(t)) if !t.is_empty() => t.to_string(),
+                    _ => format!("arg{}", i),
+                };
+                (nm, matches!(im.get("indexed"), Some(SynValue::Bool(true))))
+            }
+            _ => unreachable!("json_abi_type ya exigió un map"),
+        };
+        inputs.push(EventInput { name: nm, ty, indexed });
+    }
+    let canonical = format!("{}({})", name, canon_types.join(","));
+    Ok(EventDef { name, canonical, anonymous, inputs })
+}
+
+/// Un topic (texto `0x…` o bytes) → 32 bytes.
+fn topic_bytes(v: &SynValue, i: usize, fname: &str) -> Result<Vec<u8>, Control> {
+    let b = match v {
+        SynValue::Bytes(b) => b.to_vec(),
+        SynValue::Text(t) => {
+            let h = t.strip_prefix("0x").unwrap_or(t);
+            synsema_core::bytesutil::hex_decode(h).map_err(|e| err(format!("{}: topics[{}]: {}", fname, i, e)))?
+        }
+        other => return Err(err(format!("{}: topics[{}] must be text or bytes, got {}", fname, i, other.type_name()))),
+    };
+    if b.len() != 32 {
+        return Err(err(format!("{}: topics[{}] is {} bytes, a topic has 32", fname, i, b.len())));
+    }
+    Ok(b)
+}
+
+/// `abi_decode_log(event, log)` / `abi_decode_log(event, log, default)` → mapa por nombre.
+/// `event` = el fragmento del ABI JSON; `log` = un log de `evm_receipt`/`evm_wait`/`evm_logs`
+/// (`topics` y `data`). Estricto como `abi_decode`: el topic 0 tiene que ser el del evento
+/// (salvo `anonymous`), la cantidad de topics la de los parámetros `indexed`, y `data` se
+/// decodifica sin bytes de más. Un `indexed` dinámico (string, bytes, arrays, tuplas) sólo
+/// viaja como su keccak: sale como bytes(32), que es lo único que hay.
+fn abi_decode_log(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "abi_decode_log";
+    let ev = event_from_fragment(arg(args, 0, F)?, F)?;
+    let log = match arg(args, 1, F)? {
+        SynValue::Map(m) => m.borrow().clone(),
+        other => return Err(err(format!("{}: the log must be a map with topics and data, got {}", F, other.type_name()))),
+    };
+    let topics = match log.get("topics") {
+        Some(SynValue::List(l)) => l.borrow().clone(),
+        _ => return Err(err(format!("{}: the log has no \"topics\" list", F))),
+    };
+    let data: Vec<u8> = match log.get("data") {
+        Some(SynValue::Bytes(b)) => b.to_vec(),
+        Some(SynValue::Text(t)) => {
+            let h = t.strip_prefix("0x").unwrap_or(t);
+            synsema_core::bytesutil::hex_decode(h).map_err(|e| err(format!("{}: data: {}", F, e)))?
+        }
+        None | Some(SynValue::Nothing) => Vec::new(),
+        Some(other) => return Err(err(format!("{}: data must be bytes or hex text, got {}", F, other.type_name()))),
+    };
+    let mut ti = 0usize;
+    if !ev.anonymous {
+        let want = Keccak256::digest(ev.canonical.as_bytes()).to_vec();
+        let got = topics.first().map(|t| topic_bytes(t, 0, F)).transpose()?;
+        if got.as_deref() != Some(&want[..]) {
+            return Err(err(format!(
+                "{}: this log is not a {} event (topic 0 does not match keccak256(\"{}\"))",
+                F, ev.name, ev.canonical
+            )));
+        }
+        ti = 1;
+    }
+    let n_indexed = ev.inputs.iter().filter(|i| i.indexed).count();
+    if topics.len() != ti + n_indexed {
+        return Err(err(format!(
+            "{}: {} has {} indexed parameter(s), the log carries {} topic(s) after the signature",
+            F,
+            ev.name,
+            n_indexed,
+            topics.len().saturating_sub(ti)
+        )));
+    }
+    let data_types: Vec<AbiType> = ev.inputs.iter().filter(|i| !i.indexed).map(|i| i.ty.clone()).collect();
+    let dec = Dec { data: &data, fname: F };
+    let (mut data_vals, size) = dec.scope(&data_types, 0)?;
+    if size != data.len() {
+        return Err(err(format!(
+            "{}: {} trailing byte(s) after the event data (strict decode rejects extra data)",
+            F,
+            data.len() - size
+        )));
+    }
+    data_vals.reverse();
+    let mut out = indexmap::IndexMap::new();
+    for inp in &ev.inputs {
+        let v = if inp.indexed {
+            let word = topic_bytes(&topics[ti], ti, F)?;
+            ti += 1;
+            if inp.ty.is_dynamic() || matches!(inp.ty, AbiType::FixedArray(..) | AbiType::Tuple(_)) {
+                syn_bytes(word)
+            } else {
+                let d = Dec { data: &word, fname: F };
+                d.elem(&inp.ty, 0)?.0
+            }
+        } else {
+            data_vals.pop().unwrap_or(SynValue::Nothing)
+        };
+        out.insert(inp.name.clone(), v);
+    }
+    Ok(synsema_core::types::syn_map(out))
 }
 
 // =========================================================
@@ -1446,6 +1681,12 @@ fn eip712_digest(args: &[SynValue]) -> Result<SynValue, Control> {
 
 pub(crate) fn register(interp: &Interpreter) {
     interp.register_builtin("abi_encode", 2, Rc::new(|_i, a, _l| abi_encode(a)));
+    interp.register_builtin("abi_event_topic", 1, Rc::new(|_i, a, _l| abi_event_topic(a)));
+    interp.register_builtin(
+        "abi_decode_log",
+        -1,
+        synsema_core::interpreter::with_fallback(2, Rc::new(|_i, a, _l| abi_decode_log(a))),
+    );
     interp.register_builtin("abi_decode", -1, synsema_core::interpreter::with_fallback(2, Rc::new(|_i, a, _l| abi_decode(a))));
     interp.register_builtin("abi_selector", 1, Rc::new(|_i, a, _l| abi_selector(a)));
     interp.register_builtin("eip191_digest", 1, Rc::new(|_i, a, _l| eip191_digest(a)));

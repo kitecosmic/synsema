@@ -52,7 +52,7 @@ Narrowing, in one example:
 ```synsema
 let joint be private(private(500, "app"), "bank")   -- private to both
 let only_bank be declassify(joint, "the bank settles it", ["bank"])
-print(declassify(text(label_of(only_bank)), "probe"))   -- [bank]
+print(declassify(text(label_of(only_bank)), "probe"))   -- ["bank"]
 ```
 
 These five names (the four plus `print`) are **protected**: a program cannot bind them to

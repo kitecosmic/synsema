@@ -40,7 +40,8 @@ serve on 8080
 - `{ each item in items } … { end }` — loop. Add an **empty branch** with
   `{ otherwise }`: `{ each p in products } … { otherwise } <p>No products.</p> { end }`.
   Need an index? `{ each e in enumerate(items) }{ e.index }: { e.item }{ end }`.
-  `each` over a non-list is a **hard error** (a map suggests `keys(m)`), same as the language.
+  `each` over a non-list is a **hard error** (a map suggests `keys(m)`). Unlike the language's
+  `each`, which walks a map's keys since v0.6.29, a template still wants `keys(m)`.
 - `{ when cond } … { otherwise when cond2 } … { otherwise } … { end }` — conditionals,
   chained exactly like the language's `when`/`otherwise when`.
 - `{ include "partials/card.html" }` — inline a partial with the **current** scope

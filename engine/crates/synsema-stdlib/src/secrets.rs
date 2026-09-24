@@ -824,6 +824,28 @@ pub fn register_secret_builtins(
         }),
     );
 
+    // v0.6.29 (V1-D3): hmac(data, key, algo?) → BYTES, como sha256/keccak256 (la regla
+    // bytes-vs-texto: lo que se vuelve a usar es bytes; para mostrarlo, hex(mac)).
+    // `hmac_sha256` queda deprecado con su forma vieja (texto hex) hasta v1.0.
+    interp.register_builtin(
+        "hmac",
+        -1,
+        Rc::new(move |_i, args, _loc| {
+            if args.len() < 2 || args.len() > 3 {
+                return Err(Control::Error(RuntimeError::new(
+                    "hmac(data, key, algo?) takes 2 or 3 arguments",
+                )));
+            }
+            let data = crypto_bytes(arg(args, 0)?);
+            let key = crypto_bytes(arg(args, 1)?);
+            let algo = match args.get(2) {
+                Some(v) => parse_algo(&raw_str(v))?,
+                None => Algo::Sha256,
+            };
+            Ok(syn_bytes(hmac_compute(algo, &key, &data)))
+        }),
+    );
+
     // verify_hmac(data, signature, s, algo?) → bool, constant-time.
     interp.register_builtin(
         "verify_hmac",

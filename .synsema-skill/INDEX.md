@@ -48,8 +48,9 @@ binary, `array`/`matmul` for numeric work, `csv_parse`/`csv_encode` for spreadsh
 `secp256k1_sign`/`ed25519_sign` + `require sign` for on-chain signing with the key sealed as a
 `secret`, `mnemonic_generate`/`hd_derive` + `require wallet` for generating an HD wallet from a
 seed phrase (BIP-39/BIP-32/SLIP-0010) and `keystore_import` for existing wallets,
-`abi_encode`/`eip712_digest` for contract calls and dApp typed-data,
-`solana_message`/`algorand_tx_encode` for full Solana/Algorand transactions, and
+`abi_encode`/`eip712_digest` for contract calls and dApp typed-data, `evm_tx_create` to deploy a
+contract and `evm_logs` + `abi_decode_log` to read its events,
+`solana_tx`/`algorand_tx` for full Solana/Algorand transactions, and
 `ws_connect`/`ws_recv` (gated by `net`) for live WebSocket feeds instead of cron+polling (see
 [stdlib.md](stdlib.md) § Blockchain, § WebSocket), and a `judge` block (v0.6.25+) whenever the task is
 "classify / route / is this X? / how much?" and the answer should be a **calibrated probability** the
@@ -132,14 +133,18 @@ usually version skew, not a bug.
 - Data that must not leave (enclave/TEE, multi-tenant, confidential deployment) → labels.md
 - Proving WHICH code answered / a TEE document / `serve --attested` / verifying one as a client → attestation.md
 - Binary data / files / hashing / base64 → builtins.md (bytes section)
+- Exact integers / `int()` / `hex()` / `0x…` literals / floor division `//` / big numbers from JSON → builtins.md § Core + syntax.md § Numbers
+- Maps and lists: `get`/`items`/`merge`/`remove`, `sort`/`sort_by(…, desc = true)`, `in`/`not in`, `xs[-1]`, iterating a map, value semantics (copy-on-write) → builtins.md § Core + types.md § Values
+- Upgraded to v0.6.29 and something fails (strict arity, `text + nothing`, strict `fmt`, value semantics, renamed builtins) → pitfalls.md § Upgrading to v0.6.29 + builtins.md § Renamed in v0.6.29
 - Complex numbers / gamma·erf / hyperbolics → builtins.md (math section)
 - Numeric arrays / matrices / linear algebra (matmul/solve/eig/svd) → builtins.md (arrays section)
 - HTTP / SQL / cron → stdlib.md
 - Sign a blockchain tx / wallet / on-chain (Ethereum·EVM / Avalanche / Solana / Algorand / Bitcoin) → stdlib.md (Blockchain)
 - Bitcoin: send BTC / UTXO tx / P2WPKH·taproot / build+sign+broadcast (`btc_utxos`/`btc_tx`/`btc_tx_raw`/`btc_send`/`btc_wait`) · addresses (`btc_address`/`btc_address_decode`) · Schnorr taproot (`schnorr_sign`) · PSBT cold custody (`psbt_encode`/`psbt_decode`/`psbt_finalize`) · WIF import (`wif_import`) → stdlib.md (Blockchain § Bitcoin)
-- Read the chain / send + confirm a tx (`eth_nonce`/`eth_balance`/`eth_fee_history`/`eth_call`/`tx_eip1559`/`eth_send_raw`/`eth_wait_receipt` · `solana_latest_blockhash`/`solana_send`/`solana_confirm`/`spl_balance` · `algorand_params`/`algorand_send`/`algorand_wait`) → stdlib.md (Blockchain)
+- Read the chain / send + confirm a tx (`evm_nonce`/`evm_balance`/`evm_block_number`/`evm_fee_history`/`evm_call`/`evm_tx`/`evm_send`/`evm_wait` · `solana_latest_blockhash`/`solana_send`/`solana_wait`/`spl_balance` · `algorand_params`/`algorand_send`/`algorand_wait`) → stdlib.md (Blockchain). Names are `<family>_<action>` since v0.6.29; the old `eth_*`/`tx_eip1559`/`solana_confirm`… are deprecated aliases → builtins.md § Renamed in v0.6.29
+- Deploy a contract / CREATE·CREATE2 address / constructor args (`evm_tx_create`, `evm_create_address`, `evm_create2_address`, `abi_encode(types, values)`) · read events / logs (`evm_logs`, `abi_event_topic`, `abi_decode_log`) · a signature for a wallet/`ecrecover`/`permit` (`evm_signature`, v = 27/28) → stdlib.md (Blockchain) + builtins.md (Bytes / binary)
 - Call a contract / ERC-20 / calldata (`abi_encode`/`abi_decode`) · SIWE login (`eip191_digest`) · permit / DEX order / typed-data (`eip712_digest`) → stdlib.md (Blockchain)
-- Solana transfer (`solana_message`/`solana_tx`) · SPL token / PDA / ATA (`solana_pda`/`spl_ata`/`spl_transfer_checked_data`) · Algorand pay (`algorand_tx_encode`/`algorand_tx`/`algo_address`) → stdlib.md (Blockchain)
+- Solana transfer (`solana_tx`/`solana_tx_raw`) · SPL token / PDA / ATA (`solana_pda`/`spl_ata`/`spl_transfer_checked_data`) · Algorand pay (`algorand_tx`/`algorand_tx_raw`/`algorand_address`) → stdlib.md (Blockchain)
 - Generate an HD wallet / seed phrase / derive accounts (`mnemonic_generate`/`mnemonic_to_seed`/`hd_derive`) · Algorand 25-word phrase (`algorand_mnemonic`) · import a keystore (`keystore_import`) · `require wallet` → stdlib.md (Blockchain) + capabilities.md
 - Live feed / WebSocket / subscribe to an RPC or exchange / mempool (`ws_connect`/`ws_send`/`ws_recv`/`ws_close`) → stdlib.md (WebSocket)
 - Multiplex MANY live feeds / event-loop over N connections / reconnect + resubscribe / keepalive / fan-out feeds (`ws_select`/`ws_select_all`/`ws_status`/`ws_stats`/`ws_broadcast`, `reconnect`/`keepalive` opts, `parallel_map`) → stdlib.md (WebSocket)

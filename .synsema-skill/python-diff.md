@@ -10,62 +10,71 @@ it does not exist.** There is no `import`, no Python stdlib, no classes, no
 comprehensions, no decorators, no `with`, no generators, no method-call syntax on
 values (`xs.append(x)` → builtins are plain tasks: `append(xs, x)`). Every claim below
 is verified against the engine by `tests/python_diff.test.syn` (semantics) and
-`synsema check` probes (parse errors).
+`synsema check` probes (parse errors). Old names still work as **deprecated aliases** until
+v1.0 (`replace_text`, `find_all`, `capture`, `eth_*`…, `synsema check` warns) — the table uses
+the current names; the full old → new list is in [builtins.md](builtins.md) § Renamed in v0.6.29.
 
 ## Syntax reflexes
 
 | In Python | In Synsema | ⚠️ Divergence |
 |---|---|---|
-| `x = 5` … `x = 6` | `let x be 5` … `set x to 6` | `x = 5` → parse error `Unexpected token: ASSIGN ('=')`. `=` exists ONLY in default params / named args: `task f(x, y = 1)`, `f(x, y = 2)` |
+| `x = 5` … `x = 6` | `let x be 5` … `set x to 6` | `x = 5` → an error that says it: ``declare with `let x be …`, change it with `set x to …` `` (v0.6.29+). `=` exists ONLY in default params / named args: `task f(x, y = 1)`, `f(x, y = 2)` |
 | `# comment` | `-- comment` | `#` → `Unexpected character: '#'` |
-| `if / elif / else:` | `when / otherwise when / otherwise` (no colon) | a trailing `:` → parse error; `elif` is not a word |
+| `if / elif / else:` | `when / otherwise when / otherwise` (no colon) | a trailing `:` → parse error `Synsema blocks have no colon`; `elif` is not a word |
 | `x if c else y` | `when c then x otherwise y` | inline expression form, usable in `let`/args |
 | `for x in xs:` | `each x in xs` | `for` → parse error |
 | `d["k"] = v` (add or overwrite a key) | `set m["k"] to v` | In place on an existing map: `{a: 1}` → `{a: 1, b: 2}` (v0.6.19). `m["k"]` reads it, `contains(m, "k")` tests it |
-| `for k in a_dict:` | `each k in keys(m)` | **`each` cannot iterate a map**: `Cannot iterate over map`. Go through `keys(m)`/`values(m)` |
+| `for k in a_dict:` / `for k, v in d.items():` | `each k in m` / `each e in items(m)` … `e.key` / `e.value` | v0.6.29+: `each` walks a map's **keys** in insertion order (before: `Cannot iterate over map`); also text (characters) and bytes (ints). `{ each }` in a `render()` template does the same |
 | `for i, x in enumerate(xs):` | `each e in enumerate(xs)` … `e.index` / `e.item` | `enumerate(list)` → `[{index, item}, …]` (engine > v0.5.9; before it: `each i in range(length(xs))` … `xs[i]`) |
-| `while c:` | `while c` | same keyword, no colon; runaway loops hit `Loop exceeded maximum iterations` |
-| `def f(x): return v` | `task f(x)` … `give v` | `def` → parse error, and since v0.6.24 `return v` is one too: `unexpected IDENTIFIER after the end of this statement` (a leftover token no longer passes as two inert expressions). It fails at LOAD time now, not at runtime — the word is `give` |
+| `while c:` | `while c` | same keyword, no colon; no iteration cap (v0.6.29+ — before, 1,000,000) |
+| `def f(x): return v` | `task f(x)` … `give v` | load-time errors that name the Synsema word (v0.6.29+): ``return` is not a Synsema statement: `give <value>` returns from a task``; the same kind of hint for `def`/`function`/`fn`/`func`/`for`/`if`/`elif`/`else`/`import`/`from`/`class`/`except`/`catch`/`var`/`const`/`pass`/`break`/`continue`/`throw` |
 | `lambda x: x + 1` | `(x) => x + 1` | — |
-| `None` / `True` / `False` | `nothing` / `true` / `false` | capitalized forms parse, then fail: `Undefined variable: 'None'` (same for `True`/`False`) |
+| `None` / `True` / `False` | `nothing` / `true` / `false` | capitalized forms parse, then fail naming the Synsema form (`Undefined variable: 'None'` — in Synsema: `nothing`); same hints for `len`/`str`/`null`/`filter`/`map`/`sorted`/`zip`/`isinstance`/`input`/`open`/`dict`/`list`/`self`/… (v0.6.29+) |
 | `x is None` | `x == nothing` | no `is` operator for identity (`is` belongs to `match`) |
 | `f"n={n}"` | `` `n={n}` `` (backtick string) | `f"..."` → parse error. **Quoted `"..."` strings do NOT interpolate** (`"{n}"` stays literal) and a literal newline inside them is `Unterminated string` — backticks do both |
 | `"""multi-line"""` | `` `multi-line` `` | backticks allow real newlines + `{expr}` |
 | `[f(x) for x in xs if p(x)]` | `apply(f, where(xs, p))` | comprehension syntax → parse error |
+| `xs[-1]`, `s[0]` | `xs[-1]`, `s[0]` | same (v0.6.29+): negative indexes count from the end on lists/text/bytes; text is indexable by character. An index must be an integer (`xs[1.7]` → error) |
 | `xs[1:3]`, `xs[-2:]` | `slice(xs, 1, 3)`, `slice(xs, -2, length(xs))` | `[1:3]` → parse error; `slice` takes Python-style negatives, works on lists/text/bytes |
-| `x in xs` (operator) | `contains(xs, x)` | `in` is only valid inside `each`. On maps `contains` checks KEYS |
+| `x in xs` / `x not in xs` | `x in xs` / `x not in xs` | same (v0.6.29+): list membership, map **key**, substring, bytes subsequence. Text needs text: `1 in "a1"` is an error. `contains(xs, x)` still works |
+| `a < x <= b` | `a < x <= b` | chained comparisons like Python (v0.6.29+), each operand evaluated once |
 | `try/except E as e:` | `try` … `recover err` | `except` → parse error. `err` is the message TEXT (no exception types/hierarchy). **`recover` SWALLOWS by default** — re-propagate with `raise(err)` |
 | `raise ValueError("x")` | `raise("x")` (or statement `raise "x"`) | one error kind only; on engine ≤ v0.5.1 use the parens form |
-| `import json`, `import requests` | nothing to import — builtins are global | `import x` parses as a name and fails: `Undefined variable: 'import'`. JSON/HTTP/etc. are builtins gated by capabilities (below) |
+| `import json`, `import requests` | nothing to import — builtins are global | `import x` fails at load with a hint naming the Synsema form (v0.6.29+; older engines: `Undefined variable: 'import'`). JSON/HTTP/etc. are builtins gated by capabilities (below) |
 | `from mymodule import f` | `use "./mymodule.syn" as m` … `m.f()` | only local `.syn` modules; exports need `export` ([modules.md](modules.md)) |
-| `class Person:` | `type Person` (fields) + plain tasks | no methods/inheritance/`self`; construct `Person("Alice", 30)`, access `p.name` / `name of p` / `p["name"]` |
+| `class Person:` | `type Person` (fields) + plain tasks | no methods/inheritance/`self`; construct `Person("Alice", 30)`, access `p.name` / `name of p` / `p["name"]`. A method call like `xs.append(2)` → error with the translation (`Synsema has no methods: set xs to append(xs, item)`) |
 | `match/case` | `match` … `is pattern` | arms use `is`, default is `otherwise` ([syntax.md](syntax.md)) |
 
-Also: the LLM words **`reason` / `decide` / `analyze` / `generate` are reserved
-everywhere** (even as member/param names) — `let reason be 1` → `'reason' is a reserved
-word in Synsema`. Name things `resolve`, `why`, etc.
+Also: the LLM words **`reason` / `decide` / `analyze` / `generate`** (like every keyword —
+`to`, `type`, `match`…) are reserved as **names you bind** (variables, parameters, tasks) —
+`let reason be 1` → `'reason' is a reserved word in Synsema`. After a `.` any word is fine
+(v0.6.29+: `tx.to`, `ev.type`, `mod.decide(…)`). Name things `resolve`, `why`, etc.
 
 ## Builtin equivalents (methods are plain tasks)
 
 | In Python | In Synsema |
 |---|---|
 | `len(x)` | `length(x)` (text/list/map/bytes/array) |
-| `str(x)` / `int(s)` / `float(s)` | `text(x)` / `number(s)` (always float; `floor()` to get an integer) |
-| `xs.append(x)` (mutates) | `append(xs, x)` → **returns a NEW list**; reassign: `set xs to append(xs, x)` |
+| `str(x)` / `int(s)` / `float(s)` | `text(x)` / `int(s)` (exact integer, v0.6.29+: `"-42"`, `"1_000"`, `"0x1f"`, a whole float) / `number(s)` (float). ⚠️ `int("ff", 16)` is NOT a base: the 2nd argument is a default → `16`; write `int("0xff")`. `int(1.5)` errors — `floor`/`round`/`trunc` on purpose |
+| `hex(n)` / `b.hex()` | `hex(n)` → `"0x1f18"`, `hex(b)` → `"0x00ff"` (v0.6.29+, `0x`-prefixed) |
+| `isinstance(x, int)` / `str` / `list` / `dict` | `is_integer(x)` / `is_text(x)` / `is_list(x)` / `is_map(x)` (v0.6.29+), or `type_of(x)` |
+| `xs.append(x)` (mutates) | `append(xs, x)` → **returns a NEW list**; reassign: `set xs to append(xs, x)` — O(1) amortized (v0.6.29+), fine in a loop |
 | `s.upper()` / `s.lower()` / `s.strip()` | `upper(s)` / `lower(s)` / `trim(s)` |
 | `s.split(",")` / `",".join(xs)` | `split(s, ",")` / `join(xs, ",")` |
-| `s.startswith(p)` / `s.replace(a, b)` | `starts_with(s, p)` / `replace_text(s, a, b)` |
-| `sorted(xs, key=f)` / `reverse=True` | `sort_by(xs, f)` / `sort_by(xs, (x) => 0 - x)` (no bare `sort`) |
-| `sum(xs)` / `min(xs)` / `max(xs)` | `sum(xs)` / `min(xs)` / `max(xs)` (also variadic `max(a, b, c)`) |
+| `s.startswith(p)` / `s.replace(a, b)` / `s.find(p)` | `starts_with(s, p)` / `replace(s, a, b)` / `index_of(s, p)` (→ `nothing` when absent) |
+| `sorted(xs)` / `sorted(xs, key=f, reverse=True)` | `sort(xs)` / `sort_by(xs, f, desc = true)` (v0.6.29+; stable, total order: `nothing`/NaN last, mixed number + text → error) |
+| `sum(xs)` / `min(xs)` / `max(xs)` | `sum(xs)` / `min(xs)` / `max(xs)` (also variadic `max(a, b, c)`; texts too; `nothing` values skipped) |
+| `a // b` | `a // b` (v0.6.29+; exact for big ints, floors like Python) |
 | `map(f, xs)` / `filter(p, xs)` | `apply(f, xs)` / `where(xs, p)` — both accept either argument order |
 | `functools.reduce(f, xs, init)` | `reduce(xs, f, init)` |
-| `xs.index(v)` (raises) / `v in xs` | `index_of(xs, v)` → **`nothing`** when absent (not -1, no error) |
-| `d.get(k, default)` | does not exist — `when contains(m, "k")` then index (nested `when`, see traps) |
-| `d.keys()` / `d.values()` / `d.items()` | `keys(m)` / `values(m)` / no `items` — iterate `keys(m)` and index |
+| `xs.index(v)` (raises) | `index_of(xs, v)` → **`nothing`** when absent (not -1, no error); `v in xs` is the operator for membership |
+| `d.get(k, default)` / `d.pop(k)` / `{**a, **b}` | `get(m, k, default)` / `remove(m, k)` (new map) / `merge(a, b)` (new map, right wins) (v0.6.29+) |
+| `d.keys()` / `d.values()` / `d.items()` | `keys(m)` / `values(m)` / `items(m)` → `[{key, value}, …]` (v0.6.29+) |
 | `json.dumps(x)` / `json.loads(s)` | `json_encode(x)` / `json_decode(s)` (pure, no import) |
 | `range(n)` | `range(n)` → a real list (also `range(a, b, step)`) |
-| `print(...)` | `print(...)` (buffered under `run` until exit — `flush()` for live output) |
-| `re.fullmatch` / `re.findall` | `matches(s, pat)` (FULL match) / `find_all(s, pat)` ([builtins.md](builtins.md)) |
+| `print(...)` | `print(...)` (written immediately under `run`, v0.6.29+; text inside lists/maps prints quoted: `["1", 1]`) |
+| `re.fullmatch` / `re.findall` / `re.search(...).groups()` / `re.sub` | `matches(s, pat)` (FULL match) / `regex_find_all(s, pat)` / `regex_capture(s, pat)` (always a list, or `nothing`) / `regex_replace(s, pat, rep)` ([builtins.md](builtins.md)) |
+| `hmac.new(k, m, sha256).digest()` | `hmac(m, k)` → bytes (v0.6.29+) |
 | `open(p).read()` / `requests.get(url)` | `read_file(p)` + `require file(...)` / `fetch(url)` + `require net(host)` |
 | `requests.post(url, json=d)` / `r.json()` / `r.content` | `http_post(url, d)` (a map → JSON + Content-Type, v0.6.20+) / `json of r` (`nothing` if not JSON) / `http_bytes(...)` → `bytes of r` |
 | `xs[::-1]` / `list(s)` | `reverse(xs)` (also text) / `split(s, "")` (v0.6.20+) |
@@ -81,16 +90,21 @@ word in Synsema`. Name things `resolve`, `why`, etc.
 |---|---|
 | `a and b` short-circuits and returns the operand (`x or "default"`) | Short-circuits too (v0.6.10+) but **always returns a bool** — `x or "default"` is `true`/`false`, never the default. Use `when x == nothing` … `set x to "default"` |
 | `xs.append` mutates in place | `append` (and friends) return new values; the original is untouched. Reassign with `set` |
-| `d["missing"]` → KeyError you catch by type | `Map has no key 'missing'` — catchable only as `try/recover` (message text) |
-| `"a" + 1` → TypeError | **It concatenates**: `"a" + 1` → `"a1"` (text + number coerces). But `"ab" * 2` and `1 + true` ARE errors — no repetition, no bool arithmetic |
+| Two names for one list/dict see each other's changes | **Value semantics** (v0.6.29+): `let ys be xs` + `set ys[0] to 9` leaves `xs` alone; a task that `set`s inside a map it received does NOT change the caller's — `give` it back. Shared state is explicit (blackboard, memory, bus) |
+| `d["missing"]` → KeyError you catch by type | `Map has no key 'missing'` — catchable only as `try/recover` (message text). For an optional key use `get(m, "missing", default)` |
+| `"a" + 1` → TypeError | **It concatenates**: `"a" + 1` → `"a1"` (text + number/bool coerces). But text + `nothing`/list/map/bytes IS an error (v0.6.29+: `Cannot add text and nothing — convert it on purpose`), and so are `"ab" * 2` and `1 + true` — no repetition, no bool arithmetic |
 | `except:` keeps the program dying | `recover` **swallows the error entirely** (task ends normally). To fail upward, `raise(err)` inside `recover` |
-| iterating a dict yields keys | `each` over a map is an ERROR — use `keys(m)` |
 
 More traps (databases, serve, blockchain, secrets, charts): [pitfalls.md](pitfalls.md).
 
 ## Where Python intuition is SAFE (verified — trust it)
 
-- Division always returns float (`10 / 3` → `3.33…`), like Python 3. Floor-div: `floor(a / b)`.
+- Division always returns float (`10 / 3` → `3.33…`), like Python 3. Floor-div is `//` (v0.6.29+), exact for integers of any size — `floor(a / b)` goes through a float and loses big integers.
+- Int/float comparison is exact (`2**53 + 1 == 9007199254740992.0` → false), `json_decode` keeps big integers exact, `0x…`/`0b…` literals exist, `int()` exists (v0.6.29+).
+- Iterating a dict yields its keys (`each k in m`, v0.6.29+).
+- Calling with a missing or an extra argument is an error (v0.6.29+: `task 'f' is missing argument 'b'` — before, the missing one was silently `nothing`).
+- `-2 ** 2` → `-4`, `2 ** 3 ** 2` → `512`, and `1e18` is a **float** — exactly like Python (v0.6.29+). Write wei as `10**18`.
+- `fmt` fails on a `{name}` with no value, like `str.format` (v0.6.29+); `{{`/`}}` are literal braces.
 - `round()` is banker's rounding, same as Python: `round(2.5)` → `2`, `round(3.5)` → `4`.
 - Truthiness: `nothing`/`false`/`0`/`""`/`[]`/`{}` are falsy, everything else truthy.
 - `[1] + [2]` → `[1, 2]` (list concatenation), `slice` accepts negative indices.

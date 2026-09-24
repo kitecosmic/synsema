@@ -30,7 +30,7 @@ serve on 8080
 ```
 
 (A spawned agent's `log`/`print` also appear, prefixed `[AgentName]`.) Under `conform`/`conform --swarm` that live `[main]`/`[agent]` echo goes to **stderr** — stdout carries ONLY the final JSON (parse-safe). Under plain `run`, `print`
-**buffers** until the program ends — use `flush()` for live output (see builtins).
+is written **immediately**, line by line (v0.6.29+; older engines buffered it until the program ended — `flush()` there).
 
 ## Tracing / Measurement / Checkpoints (decorative markers — literal name)
 ```

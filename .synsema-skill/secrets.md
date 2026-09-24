@@ -141,7 +141,7 @@ let b be http_get("https://api.provider.com/v1/items",
 | Builtin | Returns |
 |---|---|
 | `bearer(s)` | a tainted `Bearer <secret>` auth header value |
-| `hmac_sha256(data, s)` | the MAC as a hex string (not secret) |
+| `hmac(data, s, algo?)` | the MAC as **bytes** (not secret; `hex(mac)` to show it). v0.6.29+ — the old `hmac_sha256` (hex text) is a deprecated alias |
 | `verify_hmac(data, sig, s, algo?)` | bool, **constant-time** (HMAC-SHA256/512; SHA-1 rejected) |
 | `constant_time_eq(a, b)` | bool, constant-time (accepts a `secret` on either side) |
 
@@ -224,7 +224,7 @@ amount, unit, quoted reason, `file:line`, program; a `denied_by=ceiling` entry m
 `spend.log` with `file.read` over that directory — the runtime itself only keeps the
 monotonic per-process totals (`spend_total(unit)`).
 
-Prefer `bearer`/`hmac_sha256`/`verify_hmac`/`constant_time_eq` — they consume the
+Prefer `bearer`/`hmac`/`verify_hmac`/`constant_time_eq` — they consume the
 secret without ever exposing it.
 
 ## Private keys go in as a `secret`, never as a string

@@ -299,6 +299,18 @@ impl SynValue {
     }
 }
 
+impl SynValue {
+    /// Cómo se muestra un valor DENTRO de una lista o mapa: el texto entre comillas
+    /// dobles con los escapes de JSON; todo lo demás, igual que `Display`.
+    pub fn nested_repr(&self) -> String {
+        match self {
+            // serde_json da exactamente los escapes de JSON.
+            SynValue::Text(s) => serde_json::to_string(&**s).unwrap_or_else(|_| format!("{:?}", s)),
+            other => other.to_string(),
+        }
+    }
+}
+
 impl fmt::Display for SynValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -306,15 +318,18 @@ impl fmt::Display for SynValue {
             SynValue::Bool(b) => write!(f, "{}", if *b { "true" } else { "false" }),
             SynValue::Number(n) => write!(f, "{}", n),
             SynValue::Text(s) => write!(f, "{}", s),
+            // Dentro de un contenedor el texto va entre comillas (v0.6.29): `["1", 1]`
+            // ya no se muestra igual que `[1, 1]`. Arriba de todo, `print("x")` sigue
+            // mostrando el texto tal cual.
             SynValue::List(l) => {
-                let parts: Vec<String> = l.borrow().iter().map(|v| v.to_string()).collect();
+                let parts: Vec<String> = l.borrow().iter().map(|v| v.nested_repr()).collect();
                 write!(f, "[{}]", parts.join(", "))
             }
             SynValue::Map(m) => {
                 let parts: Vec<String> = m
                     .borrow()
                     .iter()
-                    .map(|(k, v)| format!("{}: {}", k, v))
+                    .map(|(k, v)| format!("{}: {}", k, v.nested_repr()))
                     .collect();
                 write!(f, "{{{}}}", parts.join(", "))
             }
@@ -340,7 +355,7 @@ impl fmt::Display for SynValue {
                 }
                 ServerValue::Node(m) => {
                     let parts: Vec<String> =
-                        m.borrow().iter().map(|(k, v)| format!("{}: {}", k, v)).collect();
+                        m.borrow().iter().map(|(k, v)| format!("{}: {}", k, v.nested_repr())).collect();
                     write!(f, "{{{}}}", parts.join(", "))
                 }
                 ServerValue::Content(inner) => write!(f, "{}", inner),

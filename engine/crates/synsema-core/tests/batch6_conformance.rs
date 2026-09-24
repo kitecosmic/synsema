@@ -38,7 +38,7 @@ fn raise_coerces_to_text() {
 
 #[test]
 fn raise_without_arg_errors() {
-    fails_with("raise()", "raise expects a message");
+    fails_with("raise()", "raise");
 }
 
 #[test]

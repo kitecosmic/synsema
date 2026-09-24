@@ -564,8 +564,9 @@ route "GET /"
 - **Flow control reuses Synsema:** `{ each VAR in EXPR }…{ end }` (with an optional
   `{ otherwise }` empty-list branch, and `enumerate(xs)` for indexes) and
   `{ when EXPR }…{ otherwise when EXPR2 }…{ otherwise }…{ end }` — the same
-  `each`/`when` chaining you already know, not a new dialect. `each` over a
-  non-list is a hard error (a map suggests `keys(m)`).
+  `each`/`when` chaining you already know, not a new dialect. `{ each }` over a
+  non-list is a hard error (a map suggests `keys(m)`) — in templates only: the language's
+  `each` walks a map's keys since v0.6.29.
 - **Paths are cwd-relative** and may not escape the working directory (traversal
   blocked).
 - **Errors are caught early.** A template referenced as `render("literal.html")`
@@ -1261,7 +1262,7 @@ route "POST /signup"
     ...
 ```
 
-(For "does the pattern appear somewhere" use `find_all`/`capture` — see builtins.md.)
+(For "does the pattern appear somewhere" use `regex_find_all`/`regex_capture` — see builtins.md.)
 
 ## Request body limits
 

@@ -2,7 +2,8 @@
 
 Read this FIRST if something fails. Each row is a real mistake that costs hours to debug.
 
-> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.24*, right below.
+> **Just upgraded and something that worked now fails?** Start at *Upgrading to v0.6.29* (then
+> *Upgrading to v0.6.24*), right below.
 >
 > **Jump to the `## ` section that matches your failure:** Errors (parse/runtime messages) ·
 > Database SQL · Database MongoDB · Database Redis · HTTP server (serve) · Language features
@@ -10,6 +11,38 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Behavioral surprises · Anti-patterns · Secrets & config
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
+
+## Upgrading to v0.6.29 — what stops working and what to write instead
+
+v0.6.29 fixes the language before v1.0. Old builtin names keep working as **deprecated aliases**
+until v1.0 (a program that uses one prints one warning on stderr at load; `synsema check` flags
+each use) — the full old → new list is [builtins.md](builtins.md) § Renamed in v0.6.29. What
+actually changes behavior:
+
+| You see | What changed | What to write |
+|---|---|---|
+| `task 'f' is missing argument 'b' — pass it, or give the parameter a default` / `task 'f' takes 1 argument, got 3` | **Strict arity** for calls written in the program (tasks and lambdas). A missing argument used to become `nothing`; extras were ignored | Pass it, or give the parameter a default (`task f(a, b = 0)`). Callbacks that a builtin/host invokes (`apply`/`where`/`reduce`, route handlers, cron, `errors with`) are unchanged |
+| `append() takes at most 2 arguments, got 3` (also `trim(s, "x")`, `json_encode(x, 2)`, `upper("a", "b")`) | Extra arguments to a builtin used to be **silently dropped** | Remove them — they never did anything |
+| `… does not accept named arguments (got x = …); pass it by position` | Named arguments on a builtin that has no named form | Pass it by position. Named forms that exist: `sort`/`sort_by` `desc = true`, `recall(from = …)`… |
+| A task `set`s inside a map/list it received and the caller no longer sees it | Lists and maps have **value semantics** (copy-on-write): passing or `let`-binding gives a logical copy | `give` the changed value back and `set` it in the caller. Shared state goes through the blackboard, `memory`, the bus, `state_*` |
+| `Cannot add text and nothing — convert it on purpose: text(x), or interpolate it` (or `…and list/map/bytes`) | `text + nothing/list/map/bytes` used to concatenate the display form | `text(x)` on purpose, or a backtick string. `text + number/bool` still concatenates |
+| `fmt: no value for {a} — pass it in the map, or write {{a}} for a literal brace` | `fmt` used to leave an unknown `{a}` in the output | Pass the value, or write `{{a}}`. Braces that do not surround a name (JSON/CSS) still pass through |
+| `number(…)` errors naming `int` on a long integer text | An integer text beyond ±2^53 used to be **rounded silently** by `number` | `int(x)` (exact). `number(x, default)` returns the default instead |
+| `2**53 + 1 == 9007199254740992.0` is now `false`; a sort involving huge ints and floats changed order | Int vs float compare **exactly** (it went through a float) | Nothing to do unless code relied on the rounding |
+| `json_decode` returns an integer where you got a float (`{"id": 12345678901234567890}`) | JSON integers of any size stay **exact** | `number(x)` if you truly want a float; numbers with `.`/exponent are still floats |
+| `print(["1", 1])` shows `["1", 1]`, `text(list)` quotes its texts | Inside lists/maps text is shown **quoted** (keys stay bare). Top-level `print("x")` is unchanged | Fix tests that asserted the old `[1, 1]` form |
+| `sort_by` raises `cannot order number and text together` / `… has no order` | `sort_by` used to leave the list **unchanged** on keys it could not order | Make the keys comparable (all numbers or all texts); `nothing` and NaN are fine — they go last |
+| `index must be an integer, got 1.7` (also `range(0, 2.5)`, `range(0, 1, 0.25)`) | Indexes, positions and steps must be integers (`2.0` is fine) | `floor`/`round`/`trunc` on purpose, or build the float sequence with `apply` |
+| A lexer error about `--` on `5--1` | `--` opens a comment only at line start or after whitespace (or `(` `[` `{` `,`) | `5 - -1` for arithmetic, `5 -- note` for a comment |
+| `` `of` needs a plain name on its left `` | `p["a"] of p` (a non-name left of `of`) is a parse error | `p["a"]` or `a of p` |
+| `-2 ** 2` gives `-4`; `1 + 2 \|> f` gives `f(3)` | `**` binds tighter than unary minus; `\|>` has the lowest precedence and passes the value as the FIRST argument of a call step | Parenthesize if you meant `(-2) ** 2`; `xs \|> sort_by(f)` is `sort_by(xs, f)` |
+| `1 in "a1"` errors | Substring `in` needs text on both sides | `text(1) in "a1"` |
+| `capture` and `regex_capture` disagree | `regex_capture` is ALWAYS a list (`[match]` without groups) or `nothing`; the deprecated `capture` keeps the old shape | Switch to `regex_capture` and index `[0]` for the whole match |
+| `hmac(...)` returns bytes, `hmac_sha256` returned hex | The new name returns **bytes** | `hex(mac)` (`"0x…"`) or `decode(mac, "hex")` (bare hex, the old text) |
+| `solana_tx(message, signatures)` → error pointing to `solana_tx_raw`; `algorand_tx(txn, sig)` → error pointing to `algorand_tx_raw` | The names now mean **build** (`solana_tx(params)`, `algorand_tx(txn)`); assembling the signed tx is `…_raw` | `solana_tx_raw(msg, sigs)` / `algorand_tx_raw(txn, sig)` |
+| `evm_tx` without `to` → error pointing to `evm_tx_create` | Contract creation has its own builder that computes the address and checks the signer | `evm_tx_create({…, "from": addr, "data": init_code})` |
+| A loop that used to stop at `Loop exceeded maximum iterations` now runs forever | `while` has no iteration cap (it was 1,000,000) | Make the condition change; bound it yourself if you relied on the cap |
+| Output of a long `synsema run` appears as it happens | `print` under `run` is written line by line (it was held until the end) | Nothing — `flush()` is no longer needed there |
 
 ## Upgrading to v0.6.24 — what stops working and what to write instead
 
@@ -46,15 +79,19 @@ Everything above is inert with labels off, except the first three rows.
 | Old memory "disappeared" after upgrading | Identity moved from file-stem to the **declared name**; a warning on stderr names the old `.db` and the exact line to add | Add `require memory("<old-stem>")` to keep the same file, or rename the `.db` to the new declared name |
 | `remember` in one agent, `recall()` in another finds nothing | `recall()` inside an agent defaults to its OWN namespace (`source` = agent name) | Cross explicitly: `recall(from = "writer")`, or `from = "*"` for everything ([memory.md](memory.md)) |
 | `No agent defined with name 'X'` | `spawn X` before `agent X` definition (the error lists the agents the context DOES know) | Define the agent before spawning it. If the error says "no agents are defined in this execution context" and your agent IS defined top-level, that's the runtime, not your code — on engine ≤ v0.4.9, `spawn` inside a route fails from the 2nd request on a reused serve worker (fixed in v0.5.0; workaround: spawn a long-lived worker at boot and enqueue via `signal`) |
-| `Division by zero` | Divisor is 0 | Guard with `when divisor != 0` or use `try/recover` |
+| `Division by zero` | Divisor is 0 (`/`, `//`, `%`) | Guard with `when divisor != 0` or use `try/recover` |
+| ``return` is not a Synsema statement: `give <value>` returns from a task`` (also `def`, `for`, `if`, `import`, `class`, `break`, `throw`…) | A Python/JS reflex (v0.6.29+ names the Synsema word) | `give v`, `task`, `each`, `when`, `use`, `type`, `stop`, `raise` — see [python-diff.md](python-diff.md) |
+| ``declare with `let x be …`, change it with `set x to …` `` | `x = 6` | `let x be 6` the first time, `set x to 6` after |
+| `Synsema blocks have no colon` | `when x > 0:` | Drop the `:` |
+| `Undefined variable: 'len'` — in Synsema: `length(x)` (same for `str`, `None`, `null`, `True`, `filter`, `map`, `sorted`, `zip`, `isinstance`, `open`, `dict`, `self`…) | A Python builtin name | Use the name the error gives |
+| `Synsema has no methods: set xs to append(xs, item)` | `xs.append(2)` or another method call | Builtins are plain tasks: `append(xs, x)`, `upper(s)`, `keys(m)` |
 | `Cannot iterate over number` | `each` on a non-list value | Check type with `type_of()` or wrap in `[value]` |
-| `Map has no key 'X'` | Accessing a property that doesn't exist | Check with `contains(map, "X")` first — `contains(m, "X") and m["X"] == v` is fine on v0.6.10+ (`and` short-circuits); on older engines nest the `when` |
+| `Map has no key 'X'` | Accessing a property that doesn't exist | `get(map, "X", default)` (v0.6.29+) returns a default instead; or check with `"X" in map` / `contains(map, "X")` first — `contains(m, "X") and m["X"] == v` is fine on v0.6.10+ (`and` short-circuits); on older engines nest the `when` |
 | `contains(m,"k") and m["k"] == v` errors anyway | You are on an engine ≤ 0.6.9: `and`/`or` did not short-circuit there | `synsema update` (v0.6.10+ short-circuits) or nest: `when contains(m, "k")` … then index inside |
 | `let x be y or "default"` gives `true` | `and`/`or` always return a **bool** (they short-circuit, but never yield the operand like Python) | `let x be y` + `when x == nothing` … `set x to "default"` |
 | `raise "msg"` does nothing (no error raised) | **Engine ≤ v0.5.1**: without parens it parsed as TWO inert expressions — a silent no-op | Upgrade (newer engines accept the statement form `raise "msg"` / `raise err`, and a bare `raise` errors loudly); on old binaries always `raise("msg")` |
-| `'decide' is a reserved word` naming an export/member (older engines: `Expected IDENTIFIER, got DECIDE`) | A hard keyword used as an export/member/param name — `mod.decide(...)`, `task wait(reason)` | LLM words `reason`/`decide`/`analyze`/`generate` are reserved everywhere; rename (`resolve`, `why`) — see [syntax.md](syntax.md) |
+| `'decide' is a reserved word` naming an export/param/variable (older engines: `Expected IDENTIFIER, got DECIDE`) | A hard keyword used as a name you bind — `export task decide(...)`, `task wait(reason)`, `task send(to)` | Rename (`resolve`, `why`, `dest`) — see [syntax.md](syntax.md). After a `.` any word is fine since v0.6.29 (`mod.decide(...)`, `tx.to`, `ev.type`); on older engines that also failed |
 | `Cannot set undefined variable` | Using `set` before `let` | Define with `let x be value` first, then `set x to new_value` |
-| `Loop exceeded maximum iterations` | Infinite loop (condition never false) | Check that loop variable actually changes |
 | `Expected indented block` | Missing indentation after when/each/task/etc | Indent body with 4 spaces |
 | `'while' is a reserved word in Synsema` | Using a hard keyword as a name | Pick another name. (HTTP words like `route`/`auth` ARE allowed as names — they're soft keywords.) |
 
@@ -154,8 +191,8 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `/sitemap.xml` lacks `/blog/:slug` | Parametric routes are never expanded (the runtime can't know the slugs); auth/stream/proxy routes are excluded too | Expected — declare literal routes for pages you want listed |
 | `x-synsema-capabilities` lists `net` for a route that never called `fetch` | It's static: the `require` of every task the route may call, transitively, plus builtin implications | Expected — it's the contract, not a trace; the runtime still gates each call |
 | `this host provides no audit sink for sign.log` (wasm) | `sign`/`spend`/`wallet`/`reveal` need an audit line; a wasm host has no files | Offer `kv` to the embedded runtime — the line lands in `kv` under the `audit` namespace |
-| `secp256k1_recover: the recovery id (byte 65) must be 0..=3` | The signature came from a wallet or ethers/viem (`v` = 27/28, the Ethereum app-layer convention); Synsema's raw `v` is 0/1 | Subtract 27 first: `slice(sig, 0, 64) + bytes([sig[64] - 27])`. `secp256k1_verify` ignores `v` and needs nothing |
-| A contract reverts `InvalidSignature` / `InvalidSigner` / `invalid permit` on a signature made with `secp256k1_sign` | `ecrecover`, OpenZeppelin `ECDSA.recover` and EIP-2612 `permit` want `v` = 27/28; Synsema returns the raw recovery id 0/1 (what typed txs use) | Add 27 before sending it to a contract: `slice(sig, 0, 64) + bytes([sig[64] + 27])` (see stdlib.md § Blockchain) |
+| `secp256k1_recover: the recovery id (byte 65) must be 0..=3` (≤ v0.6.28) or an error about **EIP-155** | ≤ v0.6.28 rejected a wallet's 27/28; v0.6.29+ accepts `v` = 0, 1, 27, 28 and rejects only `v` ≥ 35 (a legacy EIP-155 `chain_id*2+35` value, not a message signature) | v0.6.29+: pass the wallet's signature as-is. On older engines subtract 27 by hand: `slice(sig, 0, 64) + bytes([sig[64] - 27])`. `secp256k1_verify` ignores `v` |
+| A contract reverts `InvalidSignature` / `InvalidSigner` / `invalid permit` on a signature made with `secp256k1_sign` | `ecrecover`, OpenZeppelin `ECDSA.recover` and EIP-2612 `permit` want `v` = 27/28; `secp256k1_sign` returns the raw recovery id 0/1 (what typed txs use) | `evm_signature(sig)` (v0.6.29+, idempotent) before sending it to a contract or a wallet; keep the raw `sig` for `evm_tx_raw` (see stdlib.md § Blockchain) |
 | `synsema openapi` exits 2 | The file has no `serve` block (or the path is missing) | Point it at the entry file that serves |
 | `describe`/`private`/`docs` can't be used as variable names | They're soft keywords — only special in a serve block | `let private be 1`, `let docs be 2` and `let describe be x` are still valid |
 | CSS `body { }` inline in a `render()` template breaks | `{`/`}` are template hole delimiters | Wrap the CSS/JS block in `{ raw }` … `{ end }` (verbatim), or serve it from `static`; single literal brace via `{ "{" }` |
@@ -165,10 +202,10 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `{ type }` in a template fails ("reserved word") | A single-name hole is a direct data lookup — reserved words work | Just use `{ type }`; the field resolves from the data |
 | `{ include "partials/nav.html" }` inside `pages/home.html` looks in `pages/partials/` | Include/layout paths resolve against the **working dir**, not the including template | Write all template paths from the project root (`partials/nav.html` everywhere) |
 | `{ fmt(x) }` in a template → `Undefined variable` under serve | The task was defined **after** the `serve` block — the per-request snapshot is taken there | Define tasks **before** `serve on`; then they're callable in holes |
-| `{ each x in m }` over a map iterates entries | Hard error (`Cannot iterate over map`) | Iterate `{ each k in keys(m) }`; for indexes use `enumerate(list)` |
+| `{ each x in m }` over a map iterates entries | It walks the **keys** (v0.6.29+, in templates and in the language alike) | For pairs, `{ each e in items(m) }` → `e.key` / `e.value`; for indexes use `enumerate(list)` |
 | Editing a template/CSS needs a server restart | Templates & statics hot-reload **per request** (mtime-based) | Just refresh the browser; only `.syn` changes need a restart (`serve --watch` automates it) |
 | A typo in a `render("x.html")` path only fails on first request | `render("literal")` templates are validated **at startup** (fail-fast), and by `synsema check` | Fix the path/syntax; the program won't start until it's valid |
-| `f.email` on a form without that field gives nothing | A missing map key is a hard error (`Map has no key`) | Check first: `contains(keys(f), "email")` |
+| `f.email` on a form without that field gives nothing | A missing map key is a hard error (`Map has no key`) | `get(f, "email")` → `nothing` when absent (v0.6.29+; `get(f, "email", "")` for a default), or check first: `"email" in f` / `contains(keys(f), "email")` |
 | A CRLF (Windows) file with blank lines inside a block fails to parse | Fixed — blank `\r\n` lines no longer emit a phantom dedent (engine > v0.5.9) | Update the binary if you see `Unexpected token: INDENT` on a CRLF file |
 | My `500` leaks a stack/message in production | Detail is shown in **dev**; `--secure` returns a generic body | Run with `--secure` in prod; the full detail still goes to the server log; an `errors with` task receives the redacted message under `--secure` |
 | A slow handler is cut off after 30 s | Only if you declared `timeout` — **by default there is no limit** | `timeout N` on the serve block / `timeout none` per route; at the deadline: `504` + the handler is cancelled (v0.6.7+) |
@@ -194,7 +231,7 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 
 | What you expect | What actually happens | Why / workaround |
 |---|---|---|
-| `sha256(pw)` is fine for passwords | Fast hashes are crackable offline at GPU speed | ALWAYS `password_hash`/`password_verify` (argon2id, salted, tuned). `sha256`/`hmac_sha256` are for integrity, never for passwords |
+| `sha256(pw)` is fine for passwords | Fast hashes are crackable offline at GPU speed | ALWAYS `password_hash`/`password_verify` (argon2id, salted, tuned). `sha256`/`hmac` are for integrity, never for passwords |
 | `set_cookie(..., {"same_site": "None"})` just works | Error: `SameSite=None` requires `secure: true` | Browsers reject SameSite=None cookies without `Secure` — the builtin fails at write time instead of you debugging a cookie that "never arrives" |
 | Cookies work on `http://localhost` despite the `Secure` default | They DO — localhost is a secure context in modern browsers | If something odd remains, `{"secure": false}` in dev ONLY; never ship it |
 | `totp(secret("TOTP_B32"))` with a base32 secret | The text is taken as raw UTF-8 → wrong codes | The classic TOTP confusion: decode first — `totp(bytes(seed_b32, "base32"))` |
@@ -299,8 +336,9 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 - **Shift+Enter is a plain Enter on most terminals** (needs the kitty keyboard protocol):
   make Alt+Enter the multi-line shortcut. On Windows a paste is a burst of `key` events, not one
   `paste` (`term_stats(h)["paste"]` is `false`).
-- **Draw with `term_write`, not `print`**: `print` is buffered until `read_line`/`flush`/the end;
-  `term_write` hits stdout now. `print` still works (no staircase) — just not for redraws.
+- **Draw with `term_write`, not `print`**: `term_write` hits stdout now and is made for redraws
+  (on engines ≤ v0.6.28 `print` was also held until `read_line`/`flush`/the end; v0.6.29+ writes it
+  line by line under `run`). `print` still works (no staircase) — just not for redraws.
 - **A second `term_open` errors** (one per interpreter, one per process): `term_close` first;
   a spawned agent cannot take the terminal while main holds it.
 - **Don't undo what you didn't do**: the runtime restores raw mode/paste/kitty on close, drop,
@@ -336,7 +374,8 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 |---|---|---|
 | `text(bytes(...))` decodes to a string | Shows a hex repr like `bytes(48656c6c6f)` | By design (non-lossy). Use `decode(b)` to get the text (UTF-8 strict). |
 | `decode(b)` on non-UTF-8 returns garbage | It **errors** (UTF-8 is strict by default) | Use `decode(b, "utf8_lossy")` to replace invalid bytes with `U+FFFD` |
-| `bytes("abc") == "abc"` | `false` — bytes never equals text | Compare `decode(b) == "abc"` instead |
+| `bytes("abc") == "abc"` | `false` — bytes **never** equals text, whatever the content | Compare `decode(b) == "abc"` instead (or `hex(b) == "0x…"`) |
+| `bytes("0x9", "hex")` for a quantity | Error — odd length (the message points to `int("0x9")`) | `bytes(…, "hex")` is for data (the `0x` prefix is accepted since v0.6.29); a quantity is `int("0x9")` |
 | `sqrt(-1)` returns a complex number | Returns `NaN` (real math is unchanged) | Use `sqrt(complex(-1, 0))` → `complex(0,1)` for the complex root |
 | `complex(1,0) < complex(2,0)` works | Error: "complex numbers are not ordered" | Complex has no ordering (like Python). Compare `abs(z)` if you need magnitude. |
 | `array * array` is the matrix product | It's **elementwise** (Hadamard) | Use `matmul(a, b)` (or `dot`) for the matrix product. `*` is elementwise. |
@@ -348,7 +387,15 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `match x is {status}` works on a serve response value | Map patterns match plain `map` values, not server response values | Match the underlying map, or check fields with `of` |
 | `apply(list, fn)` errors ("apply takes fn first") | Both orders work now: the intentional family (`apply`/`where`/`transform`/`reduce`/`sort_by`/`group_by`/`find_first`/`every`/`some`/`count_where`/`zip_with`) accepts `(fn, list, …)` AND `(list, fn, …)` | Either reads fine; the canonical documented idiom stays `apply(fn, list)`. Two tasks or two lists where one-and-one is expected → explicit error (never guessed) |
 | `user of request.role` gets the user's role | It parses as `user of (request.role)` → `Map has no key 'role'` (the error now carries this hint) | Bind first: `let u be user of request`, then `u.role` |
-| `f(1)` to `task f(a, b)` errors (missing arg) | `b` becomes `nothing` (permissive arity) | Give `b` a default: `task f(a, b = 0)`; or pass it. |
+| `f(1)` to `task f(a, b)` quietly passes `nothing` for `b` | Error since v0.6.29: `task 'f' is missing argument 'b' — pass it, or give the parameter a default` (before, `b` was `nothing`); one too many is an error too | Give `b` a default: `task f(a, b = 0)`; or pass it |
+| `set xs to append(xs, x)` in a loop is quadratic | O(1) amortized since v0.6.29 when nobody else holds the list (100k appends: minutes → under a second) | Keep writing it; don't keep an extra alias to the list inside the loop (a shared list is copied on write) |
+| A task changes the map it received and the caller sees it | Value semantics since v0.6.29: the task changed its own copy | `give` the new map and `set m to f(m)` in the caller |
+| `int("ff", 16)` parses hex | Returns **16** — there is no base argument; the 2nd argument is the default of the total form | `int("0xff")` (also `0b…`); `int(1.5)` errors on purpose (`floor`/`round`/`trunc`) |
+| `1e18` is an exact wei amount | `1e18` is a **float** (like Python) — `abi_encode` rejects it for a uint256, and a float is not exact money | `10**18` or `1_000_000_000_000_000_000` |
+| `sort([1, "a"])` puts numbers first | Error `cannot order number and text together`; maps → `… has no order` | Make the values comparable; `nothing`/NaN are fine (they go last, NaN before nothing) |
+| `sort(["b", "a", "C"])` is case-insensitive | Text sorts by code point: `["C", "a", "b"]` | `sort_by(xs, (s) => lower(s))` |
+| `min([3, nothing, 1])` errors | `nothing` is skipped as missing data → `1`; a NaN anywhere → NaN; all missing → error | Filter first if missing must be loud |
+| `"x"[0]` / `xs[-1]` error | They work since v0.6.29 (text is indexable by character; negatives from the end) | — |
 | `f(x = 1)` and `f(x == 1)` are the same | `=` is a **named arg**; `==` is an equality expression passed positionally | Use `=` for named args/defaults, `==` for comparison |
 | `test "..."` blocks run under `synsema run` | They're **skipped** by `run`; only `synsema test` runs them | Run `synsema test file.syn`. See [testing.md](testing.md). |
 | `assert_error(() => give 5)` passes | A `give` is not an error → it **fails** | `assert_error` passes only if the function raises a runtime error |
@@ -369,7 +416,7 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | A `"stacked_bar"` kind exists | No — stacking is an **opt**: `"bar"`/`"area"` + `{"stack": true}` | Stacked area with mixed signs at one x errors (ambiguous) → use stacked bar |
 | Waterfall takes running totals | It takes **deltas**; the running total is computed for you | The MD/JSON outputs include both `delta` and `running` |
 | `{"center": n}` works with the default heatmap scale | Error — `center` requires explicit `{"scale": "diverging"}` | `"auto"` already centers on 0 when values cross it; `center` is for other pivots |
-| `{"bins": 4.0}` (float) works like `4` | Error — bins must be an **integer** or an ascending **edge list** | Mirrors `histogram()`; convert first with `round(x)`/`floor(x)` (there is no `int()`) |
+| `{"bins": 4.0}` (float) works like `4` | Error — bins must be an **integer** or an ascending **edge list** | Mirrors `histogram()`; convert first with `int(x)` (whole floats) or `round(x)`/`floor(x)` |
 | Boxplot draws a group of 1 value | Error — **≥2 values per group** (a 1-point box is garbage) | Aggregate differently or drop the group |
 | `svg_to_png` renders animations / scripts | The PNG is the **static** state (resvg ignores scripts/SMIL) | By design — nothing in an SVG ever executes |
 | A `<image href="http://...">` loads in the PNG | Never fetched — **no network, no disk** from a pure builtin | Embed the image as a `data:` URL if you need it rasterized |
@@ -389,15 +436,17 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `ed25519_verify` accepts any RFC 8032 signature | **Strict**: small-order keys/points rejected (what Solana/Algorand reject) | A lenient verifier would accept forgeries the chain refuses |
 | Sign inside a `cron` job with a top-level secret | The secret crosses **redacted** (safe but unusable) | Resolve the key INSIDE the task body: `let k be secret("HOT_KEY")` |
 | `abi_encode("transfer(address to, uint256 amount)", …)` | Error — the ABI signature is **canonical** | No spaces, no parameter names: `"transfer(address,uint256)"` (the error shows the canonical form; `uint`→`uint256` normalizes) |
-| Pass a token amount as a float (`1e24`) | Error — uint256 needs **exact integers** | Write the integer literal (`1000000000000000000000000` promotes to big int exactly); floats lose precision on money |
-| `algorand_tx_encode` keeps `amt: 0` / empty `note` | Zero/empty/false fields are **OMITTED** (canonical msgpack, keys sorted) | That's what the network requires — emitting them changes the TXID or gets the tx rejected |
+| Pass a token amount as a float (`1e24`) | Error — uint256 needs **exact integers**, and `1e24` is a float literal | `10**24` or the integer literal (`1_000_000_000_000_000_000_000_000` promotes to big int exactly); from text, `int("…")`; floats lose precision on money |
+| Divide a big amount with `/` | `/` always goes through a float — above 2^53 it silently rounds | `a // b` (v0.6.29+) is exact floor division for integers of any size; `a % b` the remainder |
+| `number("123456789012345678901")` | Error naming `int` since v0.6.29 (it used to round silently) | `int("…")` — exact |
+| `algorand_tx` keeps `amt: 0` / empty `note` | Zero/empty/false fields are **OMITTED** (canonical msgpack, keys sorted) | That's what the network requires — emitting them changes the TXID or gets the tx rejected |
 | Solana keeps accounts in the order you list them | Reordered by runtime rules (payer first; writable signers → ro signers → writable non-signers → ro non-signers; buckets sorted by pubkey bytes) | Matches the official SDK byte-for-byte; instruction indices point at the reordered table |
-| Sign a v0 Solana message without its 0x80 prefix | Invalid signature on-chain — the signature **covers the version prefix** | `solana_message({..., "version": 0})` already includes the prefix; sign its output as-is |
-| Pass `lookup_tables` to `solana_message` | Clear error: "not supported yet" | v0 without tables works today; PDAs/SPL now ship (`solana_pda`/`spl_ata`/`spl_transfer_checked_data`) |
+| Sign a v0 Solana message without its 0x80 prefix | Invalid signature on-chain — the signature **covers the version prefix** | `solana_tx({..., "version": 0})` already includes the prefix; sign its output as-is |
+| Pass `lookup_tables` to `solana_tx` | Clear error: "not supported yet" | v0 without tables works today; PDAs/SPL now ship (`solana_pda`/`spl_ata`/`spl_transfer_checked_data`) |
 | A deeply nested type / typed-data / txn / derivation path is fine | Nesting over **64 levels** (or a path over 256 chars / 32 segments) errors, atrapable | A DoS guard (like RLP's) — no real payload/path is that deep; hostile input can't crash the process |
 | Derive Solana with a normal BIP-32 path | Wrong key — Solana uses **SLIP-0010**: `hd_derive(seed, "m/44'/501'/0'/0'", "ed25519")` (hardened-only; a non-hardened index errors) | ETH is the default `"secp256k1"`; ed25519 has no non-hardened derivation |
 | Load an Algorand wallet phrase with `mnemonic_to_seed` | Algorand's 25-word phrase is **NOT BIP-39** — use `algorand_mnemonic`/`algorand_mnemonic_to_key` | Different checksum (sha512_256 over the key) and 11-bit packing; the 12/24-word BIP-39 path is for ETH/Solana |
-| `mnemonic_generate`/`hd_derive`/`keystore_import` return usable bytes | They return a `secret` — `text()`/`json_encode` show `secret(NAME)`/`[redacted]` | Use it directly with `hd_derive`/`eth_address`/`secp256k1_sign`; back a phrase up on purpose with `reveal()` (gated + audited) |
+| `mnemonic_generate`/`hd_derive`/`keystore_import` return usable bytes | They return a `secret` — `text()`/`json_encode` show `secret(NAME)`/`[redacted]` | Use it directly with `hd_derive`/`evm_address`/`secp256k1_sign`; back a phrase up on purpose with `reveal()` (gated + audited) |
 | `reveal("W")` reveals the seed derived from a `"W"` mnemonic | Derived secrets carry a **derived name**: `mnemonic_to_seed` → `W.seed`, `algorand_mnemonic` → `W.mnemonic`, `hd_derive` → `W/path` | Grant with the prefix `reveal("W*")` (or the exact derived name); the `wallet`/`sign` scope of a derived key follows the same derived name |
 | Custody works with `require sign` (or ambient) | Creating custody needs its OWN capability: `require wallet` (deny-by-default, audited in `wallet.log`, denied in `sandbox`) | `wallet` creates keys, `sign` moves value — an agent can derive addresses without spending |
 | A wrong keystore passphrase returns garbage / partial key | Clear "wrong passphrase" error, **no material** — the MAC is checked before decrypting | Same for a bad mnemonic checksum: the error never echoes the phrase |
@@ -412,16 +461,23 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | A handle from one `parallel_map` worker works in another | Handles do **not** cross workers (CSP isolation) — each worker owns its own WS registry | The fan-out pattern is `parallel_map(watch_feed, urls)`: N workers × 1 connection each; never pass a handle between them |
 | A half-open socket (peer vanished silently) stays "open" | With `keepalive` it's detected within `timeout` (auto-ping, no pong → dead) → reconnect or `close` | `{"keepalive": {"interval": 20, "timeout": 10}}`; `ws_status`/`ws_stats` report the truth |
 | Opening connections in a loop is fine | A soft per-interpreter cap (`SYNSEMA_WS_MAX_CONNS`, default 4096) errors clearly when exceeded | Anti-footgun: a runaway loop can't open 100k sockets; close handles you're done with |
-| The RPC read-side (`eth_*`/`solana_*`/`algorand_*` net calls) needs a new capability | Same **`net(host)`** as `http_*`; broadcasting is `net`-gated too (the signature already happened; `sign` stays the only value door) | A monitor agent with `net` reads everything and spends nothing |
-| `tx_eip1559` fills sensible gas/fee defaults | **No silent defaults** — a missing `max_fee`/`gas`/`value` errors naming the reader helper (`eth_fee_history`/`eth_estimate_gas`) | Anti blind-signing extended to fees; the result map echoes every number for a `confirm` before signing |
-| Reassemble the signed tx by hand (`bytes([2]) + rlp_encode(...)`) | Still works, but `tx_eip1559_raw(tx, sig)` does v/r/s (y-parity, minimal ints) for you | Pass the 65-byte sig from `secp256k1_sign` as-is — 27/28 v values are rejected with a clear error |
+| The RPC read-side (`evm_*`/`solana_*`/`algorand_*`/`btc_*` net calls) needs a new capability | Same **`net(host)`** as `http_*`; broadcasting is `net`-gated too (the signature already happened; `sign` stays the only value door) | A monitor agent with `net` reads everything and spends nothing |
+| `evm_tx` fills sensible gas/fee defaults | **No silent defaults** — a missing `max_fee`/`gas`/`value` errors naming the reader helper (`evm_fee_history`/`evm_estimate_gas`) | Anti blind-signing extended to fees; the result map echoes every number for a `confirm` before signing |
+| Reassemble the signed tx by hand (`bytes([2]) + rlp_encode(...)`) | Still works, but `evm_tx_raw(tx, sig)` does v/r/s (y-parity, minimal ints) for you | Pass the 65-byte sig from `secp256k1_sign` as-is — 27/28 v values (an `evm_signature` output) are rejected with a clear error |
+| Deploy a contract with `evm_tx` and no `to` | Error pointing to `evm_tx_create` (v0.6.29+; before, a creation tx could not be built at all) | `evm_tx_create({chain_id, nonce, from, value, gas, max_fee, max_priority, data})` → `contract_address` included; `data` = bytecode + `abi_encode("(types)", args)`; empty `data` or > 49 152 bytes → error |
+| Sign a creation with a different key than `from` | `evm_tx_raw` recovers the signer and errors: `the signature is from 0x…, but the creation declared from 0x…` | The `contract_address` is derived from `from` + `nonce`; sign with that account's key |
+| `evm_create2_address(deployer, salt, hash)` with a short salt | Error — `salt` and the init-code hash are exactly 32 bytes | `int_to_bytes(n, 32)` / `keccak256(init_code)` |
+| Compare `abi_event_topic(…)` with `bytes` | It returns **text** `"0x…"` — the form `log.topics[0]` has | Compare text with text |
+| `abi_decode_log` on a log from another event / a different ABI | Error (topic0, topic count and `data` are all checked strictly) — or the `default` you pass | Filter by topic0 first (`evm_logs(url, {"topics": [topic]})`), or use the total form `abi_decode_log(ev, log, nothing)` |
+| An indexed `string` in `abi_decode_log` gives back the text | It gives its **bytes(32) keccak hash** — that is all the log carries | Compare with `keccak256("expected")` |
+| `evm_logs` filter with `from_block` / both `fromBlock` and `blockHash` | Error — the filter uses the node's **wire names** and they are validated | `fromBlock`/`toBlock` **or** `blockHash`; `topics` entries: `"0x…"`, `nothing` (any), a list (OR) |
 | A weird RPC response gets patched up | **Strict decode**: non-canonical hex-quantity (`0x01`), wrong shape, mismatched id, >16 MiB body → catchable error | A node is untrusted input (G23) — bad data never silently becomes a number |
-| `eth_wait_receipt` ≠ success; `receipt` ≠ profit | It confirms **inclusion**: check `receipt["status"]` (0 = reverted) and Solana `status["err"]` | A tx can land AND fail; the waiters return the data, you check it |
-| `eth_wait_receipt`/`solana_confirm`/`algorand_wait` hang until confirmed | Bounded polls: **`nothing`** at the timeout (default 60s), like `ws_recv` | An unconfirmed tx never hangs the agent; `algorand_wait` errors on a pool rejection (definitive) |
+| `evm_wait` ≠ success; `receipt` ≠ profit | It confirms **inclusion**: check `receipt["status"]` (0 = reverted) and Solana `status["err"]` | A tx can land AND fail; the waiters return the data, you check it |
+| `evm_wait`/`solana_wait`/`algorand_wait`/`btc_wait` hang until confirmed | Bounded polls: **`nothing`** at the timeout (default 60s), like `ws_recv` | An unconfirmed tx never hangs the agent; `algorand_wait` errors on a pool rejection (definitive) |
 | Algorand's suggested `fee` is the flat fee | It's **per byte** (often 0); the flat minimum is `min_fee` (1000 µAlgo) | `algorand_params` returns BOTH so neither mistake compiles into a rejected/overpaid tx |
 | `spl_balance` on a missing token account returns 0 | Catchable **error** (the ATA doesn't exist) | A wrong owner/mint would silently read 0 forever; on success the map includes the derived `ata` so you can verify it |
 | A network blip (5xx / dropped connection) mid-wait kills the waiter | After a first successful poll, **transient** failures retry until the deadline (one stderr notice, no agent action needed) | Deadline mid-failure → the ERROR surfaces (not `nothing`) — "unconfirmed" ≠ "node stopped answering"; a wrong URL still fails fast on the FIRST poll |
-| An L2 (Base/Arbitrum/Optimism) needs its own builtins | Same EVM wire — `eth_*`/`tx_eip1559` work as-is; read the chain id with `eth_chain_id(url)`, never hardcode | OP-stack: `eth_estimate_gas` is L2-execution only; the L1 data fee lands in the receipt (`l1Fee`, exact int) — total = gasUsed×effectiveGasPrice + l1Fee. Arbitrum folds it into gasUsed |
+| An L2 (Base/Arbitrum/Optimism) needs its own builtins | Same EVM wire — `evm_*` work as-is; read the chain id with `evm_chain_id(url)`, never hardcode | OP-stack: `evm_estimate_gas` is L2-execution only; the L1 data fee lands in the receipt (`l1Fee`, exact int) — total = gasUsed×effectiveGasPrice + l1Fee. Arbitrum folds it into gasUsed |
 | `btc_tx` puts the fee wherever there's leftover | The fee is IMPLICIT (inputs − outputs); `btc_tx` requires it **declared** and checks `sum(inputs) == sum(outputs) + fee` (G28) | If it doesn't balance, the error names the exact sat diff ("did you forget the change output?") — forgetting change donates it to miners |
 | The builder computes the change output | **No** — change is one more EXPLICIT output to your own address; coin selection is yours (out of scope) | Add `{"address": my_addr, "amount": total_in - sent - fee}`; a float amount errors (everything is exact SATS, 1 BTC = 100_000_000) |
 | Sign the Bitcoin transaction once | Sign **once per input** — `btc_tx` returns `digests` (one each, right sighash: BIP-143 P2WPKH / BIP-341 P2TR); pass one sig per input to `btc_tx_raw`, same order | Only SIGHASH_ALL/DEFAULT; NONE/SINGLE/ANYONECANPAY error (out of scope) |
@@ -444,7 +500,7 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 | `wait_for` hangs forever on dead agent | Returns `nothing` quickly | The runtime detects this and returns — but ONLY when agents WERE spawned and all of them died. |
 | `wait_for "x"` returns instantly when no agent was ever spawned | It blocks until the `timeout` (default 30s) | The fast return is for "all spawned agents died", not "zero agents". With no producer ever spawned, the runtime can't know none is coming → it waits. **Always pass a bounded `timeout`** when an emitter might be absent: `wait_for "x" timeout 2 as r`. |
 | Agent shares state with main program | Each agent has its own interpreter | Use `share`/`observe` via blackboard to communicate. |
-| `number("1200")` gives integer | Gives `1200.0` (float) | `text()` on integers shows no decimal. Use `text(number(...))` for display. |
+| `number("1200")` gives integer | Gives `1200.0` (float) | `int("1200")` → `1200` (exact, v0.6.29+) |
 | `/tmp/file.txt` works on Windows | Maps to `C:\tmp\file.txt` | Use absolute paths. For agent data, use `~/.synsema/` paths. |
 | Cron output appears after program ends | Output is buffered | Fixed in recent versions. Update to latest. Use `synsema serve` to keep the process alive for live output. |
 | An unknown `--flag` is ignored | (v0.6.14+) it's a **usage error, exit 2** on `run`/`test`/`conform` | Typos are caught, not silently dropped. `synsema run --audit json p.syn` now works; before, `--audit` was ignored and `json` taken as the path. |
@@ -496,7 +552,7 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
 
 | Pattern | Problem | Better approach |
 |---|---|---|
-| Using `reveal()` to "get the value" | Defeats the whole point; it's loud and audited | Use `bearer()`/`hmac_sha256()`/`verify_hmac()`/`constant_time_eq()` — they consume the secret without exposing it. `reveal` is a last resort. |
+| Using `reveal()` to "get the value" | Defeats the whole point; it's loud and audited | Use `bearer()`/`hmac()`/`verify_hmac()`/`constant_time_eq()` — they consume the secret without exposing it. `reveal` is a last resort. |
 | Committing `.env` | Leaks real secrets into git history | `.gitignore` the `.env`; commit a `.env.example` with keys (no values) |
 | `print(my_secret)` to debug | You only ever see `secret(NAME)` (redacted by design) | That's expected — secrets never print their value. If you truly need the value, `reveal()` (audited). |
 | `secret("X")` without `require secret("X")` | `secret("X") not permitted: missing capability` | Add `require secret("X")` (or a `require secret("X_*")` prefix). Same for `env`. |
@@ -543,8 +599,10 @@ byte-strings (text/bytes/number); structured data goes via `json_encode`/`json_d
   (0 offline) before comparing; the stderr notice says what to set.
 - **`Capability not granted: judge` under `serve` although you wrote `require llm`** — `judge` is its
   own capability. Add `require judge`. Under `--deterministic` it is denied by design (network I/O).
-- **`v.x.type` / `v.x.probabilities.nothing` do not parse** — `type` and `nothing` are reserved. The
-  field is `kind`; the escape key is `none` (`choice` itself is `nothing` when the escape wins).
+- **`v.x.type` / `v.x.probabilities.nothing` fail** — on engines ≤ v0.6.28 they do not parse (`type`
+  and `nothing` are reserved); since v0.6.29 any word parses after a `.`, but the fields do not
+  exist. The field is `kind`; the escape key is `none` (`choice` itself is `nothing` when the escape
+  wins).
 - **`'rate' takes ordered levels: write rate … across […]`** (or the mirror for `choose … across`) —
   the prepositions are fixed: `between` = unordered options, `across` = ordered levels.
 - **Confident wrong answer on a state that fits no option** — you wrote `choose … between {…}`

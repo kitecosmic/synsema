@@ -241,9 +241,10 @@ fn regex_matches() {
 
 #[test]
 fn regex_find_all() {
-    assert_output("print(find_all(\"a1b2\", \"[0-9]\"))", &["[1, 2]"]);
+    // Dentro de una lista el texto va entre comillas (v0.6.29).
+    assert_output("print(find_all(\"a1b2\", \"[0-9]\"))", &["[\"1\", \"2\"]"]);
     assert_output("print(text(length(find_all(\"a1b2c3\", \"[0-9]\"))))", &["3"]);
-    assert_output("print(find_all(\"ab12cd34\", \"[a-z]+[0-9]+\"))", &["[ab12, cd34]"]);
+    assert_output("print(find_all(\"ab12cd34\", \"[a-z]+[0-9]+\"))", &["[\"ab12\", \"cd34\"]"]);
 }
 
 #[test]
@@ -251,7 +252,7 @@ fn regex_capture() {
     assert_output("print(capture(\"hello world\", \"w[a-z]+\"))", &["world"]);
     assert_output(
         "print(capture(\"2026-06-19\", \"([0-9]+)-([0-9]+)-([0-9]+)\"))",
-        &["[2026, 06, 19]"],
+        &["[\"2026\", \"06\", \"19\"]"],
     );
     assert_output("print(text(capture(\"zzz\", \"q+\")))", &["nothing"]);
 }

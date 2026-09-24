@@ -420,6 +420,7 @@ fn run_bundled(bundle: synsema_core::bundle::Bundle, program_args: Vec<String>) 
         }
         return ExitCode::SUCCESS;
     }
+    synsema_core::interpreter::LIVE_STDOUT.store(true, std::sync::atomic::Ordering::Relaxed);
     let result = run_program_ceiled(&source, &filename, ceiling);
     for line in &result.output {
         println!("{}", line);
@@ -1688,6 +1689,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     // Camino normal: swarm real (DE-011). Los `spawn` corren en hilos aislados; un agente
     // que falla NO tumba el main ni trunca su salida. Sale ≠0 si el main falla o si algún
     // agente terminó en ERROR. El techo del host (si hay) se propaga a los agentes.
+    synsema_core::interpreter::LIVE_STDOUT.store(true, std::sync::atomic::Ordering::Relaxed);
     let result = run_program_ceiled(&source, &filename, ceiling);
     for line in &result.output {
         println!("{}", line);

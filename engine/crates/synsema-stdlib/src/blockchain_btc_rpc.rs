@@ -305,7 +305,7 @@ fn btc_fee_estimates(
     let v = esplora_get_json(&url, "/fee-estimates", F, RPC_HTTP_TIMEOUT_SECS)?;
     let obj = as_obj(&v, "the fee estimates", F)?;
     // Números CRUDOS objetivo-de-bloques → sat/vB (derivación transparente, no
-    // un oráculo — patrón eth_fee_history). Orden numérico ascendente estable.
+    // un oráculo — patrón evm_fee_history). Orden numérico ascendente estable.
     let mut entries: Vec<(u64, f64)> = Vec::with_capacity(obj.len());
     for (k, val) in obj {
         let target: u64 = k.parse().map_err(|_| {

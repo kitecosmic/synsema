@@ -341,7 +341,7 @@ fn a_private_value_in_a_global_keeps_its_label_across_the_serve_snapshot() {
     assert_eq!(st, 200, "{}", body);
     let j: serde_json::Value = serde_json::from_str(&body).expect("JSON");
     assert_eq!(j["priv"], true, "la etiqueta viaja: {}", body);
-    assert_eq!(j["labels"], "[app]", "{}", body);
+    assert_eq!(j["labels"], "[\"app\"]", "{}", body);
     assert_eq!(j["is500"], true, "el valor NO se corrompe (antes era el texto `private(app)`)");
 }
 

@@ -111,6 +111,12 @@ pub enum NodeKind {
         operator: String,
         right: Box<Node>,
     },
+    /// `a < b <= c` (v0.6.29): cada operando se evalúa una vez y se corta en el primer
+    /// par falso, como Python. `operators.len() == operands.len() - 1`, ≥ 2.
+    CompareChain {
+        operands: Vec<Node>,
+        operators: Vec<String>,
+    },
     UnaryOp {
         operator: String,
         operand: Box<Node>,

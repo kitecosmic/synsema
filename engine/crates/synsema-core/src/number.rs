@@ -413,10 +413,45 @@ impl Number {
         }
         match (self, other) {
             (Number::Float(a), Number::Float(b)) => a.partial_cmp(b),
-            (Number::Float(a), _) => a.partial_cmp(&other.to_f64()),
-            (_, Number::Float(b)) => self.to_f64().partial_cmp(b),
+            // Entero vs float: EXACTO, como Python (v0.6.29). Pasar el entero a f64
+            // hacía `2**53 + 1 == 9007199254740992.0` verdadero.
+            (Number::Float(a), _) => cmp_int_float(&other.as_bigint().unwrap(), *a).map(Ordering::reverse),
+            (_, Number::Float(b)) => cmp_int_float(&self.as_bigint().unwrap(), *b),
             _ => self.as_bigint().unwrap().partial_cmp(&other.as_bigint().unwrap()),
         }
+    }
+
+    /// `a // b`: división entera con piso (v0.6.29), exacta en enteros de cualquier
+    /// tamaño y coherente con `%`: `a == b * (a // b) + a % b`. Con float, `floor(a / b)`
+    /// como float (Python); con decimal, decimal. `None` si el divisor es cero.
+    pub fn floor_div(&self, other: &Number) -> Option<Number> {
+        if other.is_zero() {
+            return None;
+        }
+        if Number::any_decimal(self, other) && !Number::any_float(self, other) {
+            let (x, y) = (self.to_decimal()?, other.to_decimal()?);
+            return x.checked_div(y).map(|q| Number::Decimal(q.floor()));
+        }
+        if Number::any_float(self, other) {
+            let (a, b) = (self.to_f64(), other.to_f64());
+            // Como Python: (a - a % b) / b, que no sufre el redondeo de floor(a / b).
+            let m = a - (a / b).floor() * b;
+            return Some(Number::Float(((a - m) / b).round()));
+        }
+        match (self, other) {
+            (Number::Int(a), Number::Int(b)) => match a.checked_div_euclid(*b) {
+                // div_floor de num-integer maneja los signos como Python; i64::MIN / -1
+                // desborda y cae a BigInt.
+                Some(_) => Some(Number::Int(a.div_floor(b))),
+                None => Some(Number::from_bigint(BigInt::from(*a).div_floor(&BigInt::from(*b)))),
+            },
+            _ => Some(Number::from_bigint(self.as_bigint()?.div_floor(&other.as_bigint()?))),
+        }
+    }
+
+    pub fn checked_floor_div(&self, other: &Number) -> Result<Option<Number>, String> {
+        Self::guard_mix(self, other)?;
+        Ok(self.floor_div(other))
     }
 
     /// Igualdad numérica con semántica Python (`5 == 5.0` es true).
@@ -435,10 +470,30 @@ impl Number {
         }
         match (self, other) {
             (Number::Float(a), Number::Float(b)) => a == b,
-            (Number::Float(a), _) => *a == other.to_f64(),
-            (_, Number::Float(b)) => self.to_f64() == *b,
+            (Number::Float(a), _) => cmp_int_float(&other.as_bigint().unwrap(), *a) == Some(Ordering::Equal),
+            (_, Number::Float(b)) => cmp_int_float(&self.as_bigint().unwrap(), *b) == Some(Ordering::Equal),
             _ => self.as_bigint() == other.as_bigint(),
         }
+    }
+}
+
+/// Orden EXACTO entre un entero y un float (v0.6.29), como Python: sin pasar el
+/// entero a f64. NaN → `None`; ±inf quedan por encima/debajo de todo entero.
+fn cmp_int_float(i: &BigInt, f: f64) -> Option<Ordering> {
+    if f.is_nan() {
+        return None;
+    }
+    if f.is_infinite() {
+        return Some(if f > 0.0 { Ordering::Less } else { Ordering::Greater });
+    }
+    let fl = f.floor();
+    // Un f64 finito es un racional exacto: su piso es un entero exacto.
+    let floor = BigInt::from_f64(fl)?;
+    match i.cmp(&floor) {
+        Ordering::Less => Some(Ordering::Less),
+        Ordering::Greater => Some(Ordering::Greater),
+        // i == floor(f): igual si f es entero, menor si f tiene parte fraccionaria.
+        Ordering::Equal => Some(if fl == f { Ordering::Equal } else { Ordering::Less }),
     }
 }
 

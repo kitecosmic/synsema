@@ -44,7 +44,9 @@ rand = "0.8"
 # `preserve_order`: los objetos JSON entrantes preservan el orden de inserción (como
 # el dict de Python), para paridad byte-a-byte en las respuestas del server.
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+# arbitrary_precision (v0.6.29): un entero JSON fuera de i64 llega exacto (uint256, ids u64)
+# en vez de pasar por f64.
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 # Fecha/hora para los builtins de time (UTC). Sin feature `clock` → sin riesgo de C;
 # now() usa std::time. HTTP cliente: std::net + rustls para https (ver stdlib/src/http.rs);
 # cron usa std::thread.

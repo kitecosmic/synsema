@@ -79,11 +79,11 @@ fn reverse_list_and_text() {
 
 #[test]
 fn split_with_empty_separator_yields_characters() {
-    shows("split(\"abc\", \"\")", "[a, b, c]");
+    shows("split(\"abc\", \"\")", "[\"a\", \"b\", \"c\"]");
     shows("length(split(\"añb\", \"\"))", "3");
     shows("split(\"\", \"\")", "[]");
     // El separador no vacío no cambia.
-    shows("split(\"a,b\", \",\")", "[a, b]");
+    shows("split(\"a,b\", \",\")", "[\"a\", \"b\"]");
 }
 
 // ---------------------------------------------------------------------------------

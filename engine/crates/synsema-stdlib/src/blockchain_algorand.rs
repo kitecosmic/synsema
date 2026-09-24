@@ -13,7 +13,7 @@
 //! - El msgpack hand-rolled cubre el subset del protocolo (uint/bytes/str/bool/
 //!   map/list) — cero deps nuevas (G16), mismo molde que RLP.
 //!
-//! Se firma con `ed25519_sign(algorand_tx_encode(txn), key)` (gate del batch 11) y
+//! Se firma con `ed25519_sign(algorand_tx(txn), key)` (gate del batch 11) y
 //! se difunde con `http_post` a `/v2/transactions` (`application/x-binary`).
 //! El TXID (= base32(sha512_256("TX" ‖ msgpack))) queda componible en userland.
 
@@ -352,20 +352,28 @@ fn txn_to_mp(v: &SynValue, fname: &str) -> Result<Mp, Control> {
 // builtins
 // =========================================================
 
-/// `algorand_tx_encode(txn)` → bytes `"TX" ‖ msgpack_canónico(txn)`, LISTOS para
+/// `algorand_tx(txn)` → bytes `"TX" ‖ msgpack_canónico(txn)`, LISTOS para
 /// `ed25519_sign` (Algorand firma el msgpack con prefijo de dominio).
-fn algorand_tx_encode(args: &[SynValue]) -> Result<SynValue, Control> {
-    const F: &str = "algorand_tx_encode";
+fn algorand_tx(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "algorand_tx";
+    // v0.6.29: `algorand_tx` CONSTRUYE (era `algorand_tx_encode`); ensamblar la firmada es
+    // `algorand_tx_raw`.
+    if args.len() == 2 {
+        return Err(err(format!(
+            "{}: since v0.6.29 algorand_tx builds the bytes to sign (it was algorand_tx_encode) — to assemble a signed transaction use algorand_tx_raw(txn, signature)",
+            F
+        )));
+    }
     let mp = txn_to_mp(arg(args, 0, F)?, F)?;
     let mut out = b"TX".to_vec();
     mp_write(&mp, &mut out);
     Ok(syn_bytes(out))
 }
 
-/// `algorand_tx(txn, signature)` → bytes del SignedTxn (`{"sig": …, "txn": {…}}`)
+/// `algorand_tx_raw(txn, signature)` → bytes del SignedTxn (`{"sig": …, "txn": {…}}`)
 /// listos para POST a `/v2/transactions` (`Content-Type: application/x-binary`).
-fn algorand_tx(args: &[SynValue]) -> Result<SynValue, Control> {
-    const F: &str = "algorand_tx";
+fn algorand_tx_raw(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "algorand_tx_raw";
     let txn = txn_to_mp(arg(args, 0, F)?, F)?;
     let sig = arg_bytes_len(arg(args, 1, F)?, F, "the signature", 64)?;
     // "sig" < "txn" bytewise: el orden canónico ya viene dado.
@@ -378,11 +386,11 @@ fn algorand_tx(args: &[SynValue]) -> Result<SynValue, Control> {
     Ok(syn_bytes(out))
 }
 
-/// `algo_address(pubkey_or_secret)` → text base32 con checksum. Espeja
-/// `eth_address`: con un secret deriva la pubkey Rust-side (G2) — la clave
+/// `algorand_address(pubkey_or_secret)` → text base32 con checksum. Espeja
+/// `evm_address`: con un secret deriva la pubkey Rust-side (G2) — la clave
 /// jamás se materializa en user-space.
-fn algo_address(args: &[SynValue]) -> Result<SynValue, Control> {
-    const F: &str = "algo_address";
+fn algorand_address(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "algorand_address";
     let v = arg(args, 0, F)?;
     let pk: [u8; 32] = match v {
         SynValue::Secret(_) => {
@@ -413,7 +421,7 @@ fn algo_address(args: &[SynValue]) -> Result<SynValue, Control> {
 // =========================================================
 
 pub(crate) fn register(interp: &Interpreter) {
-    interp.register_builtin("algorand_tx_encode", 1, Rc::new(|_i, a, _l| algorand_tx_encode(a)));
-    interp.register_builtin("algorand_tx", 2, Rc::new(|_i, a, _l| algorand_tx(a)));
-    interp.register_builtin("algo_address", 1, Rc::new(|_i, a, _l| algo_address(a)));
+    interp.register_builtin("algorand_tx", -1, Rc::new(|_i, a, _l| algorand_tx(a)));
+    interp.register_builtin("algorand_tx_raw", 2, Rc::new(|_i, a, _l| algorand_tx_raw(a)));
+    interp.register_builtin("algorand_address", 1, Rc::new(|_i, a, _l| algorand_address(a)));
 }

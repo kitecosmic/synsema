@@ -83,7 +83,7 @@ test "permit ERC-2612: typed-data LEGIBLE → digest → firma gateada → recov
     assert_eq(length(digest), 32)
     let sig be secp256k1_sign(digest, k)
     -- el contrato hará ecrecover: el firmante ES el owner del permit
-    assert_eq(eth_address(secp256k1_recover(digest, sig)), "{ADDR1}")
+    assert_eq(evm_address(secp256k1_recover(digest, sig)), "{ADDR1}")
 
 test "calldata ABI → tx EIP-1559 → abi_decode lee de vuelta"
     let k be as_secret("{KEY1}", "HOT_KEY")
@@ -106,7 +106,7 @@ test "SIWE: eip191_digest → firma → recover == la address que se autentica"
     let msg be "app.example.com wants you to sign in with your Ethereum account: {ADDR1}"
     let digest be eip191_digest(msg)
     let sig be secp256k1_sign(digest, k)
-    let quien be eth_address(secp256k1_recover(digest, sig))
+    let quien be evm_address(secp256k1_recover(digest, sig))
     assert_eq(quien, "{ADDR1}")
 "#
     );
@@ -134,7 +134,7 @@ test "Solana: System transfer → message → firma → wire, contra solders"
     let payer be ed25519_pubkey(k)
     -- data del transfer: u32 LE 2 (instrucción) ‖ u64 LE lamports
     let data be int_to_bytes_le(2, 4) + int_to_bytes_le(1000000, 8)
-    let msg be solana_message({{
+    let msg be solana_tx({{
         "fee_payer": payer,
         "recent_blockhash": bytes("0303030303030303030303030303030303030303030303030303030303030303", "hex"),
         "instructions": [{{
@@ -147,7 +147,7 @@ test "Solana: System transfer → message → firma → wire, contra solders"
     let sig be ed25519_sign(msg, k)
     assert_eq(sig, bytes("{SOL_SIG}", "hex"))
     assert(ed25519_verify(msg, sig, payer))
-    let tx be solana_tx(msg, sig)
+    let tx be solana_tx_raw(msg, sig)
     assert_eq(slice(tx, 0, 1), bytes([1]))
     -- listo para JSON-RPC: base64 + sendTransaction vía http_post (userland)
     assert(length(decode(tx, "base64")) > 0)
@@ -161,15 +161,15 @@ test "Algorand: pay txn canónica → firma con prefijo TX → SignedTxn, contra
         "gen": "testnet-v1.0",
         "gh": bytes("0707070707070707070707070707070707070707070707070707070707070707", "hex"),
         "note": bytes("hi")}}
-    let listo be algorand_tx_encode(txn)
+    let listo be algorand_tx(txn)
     assert_eq(listo, bytes("{ALGO_TX}", "hex"))
     let sig be ed25519_sign(listo, k)
     assert(ed25519_verify(listo, sig, ed25519_pubkey(k)))
-    let stx be algorand_tx(txn, sig)
+    let stx be algorand_tx_raw(txn, sig)
     -- listo para POST binario a /v2/transactions (userland http_post)
     assert(length(stx) > length(listo))
-    -- la dirección se deriva del secret SIN exponer la clave (espeja eth_address)
-    assert_eq(algo_address(k), "{ALGO_SENDER}")
+    -- la dirección se deriva del secret SIN exponer la clave (espeja evm_address)
+    assert_eq(algorand_address(k), "{ALGO_SENDER}")
     -- TXID componible: base32(sha512_256("TX" ‖ msgpack))
     let txid be decode(sha512_256(listo), "base32")
     assert_eq(txid, "WTAEKXVRJW7GUKT6R2JOEJY4W2PDURTBEP3VM2DR6WC6RWWQOXQA")
@@ -206,11 +206,11 @@ sandbox
     set digestlen to length(d)
     set selector to abi_selector("transfer(address,uint256)")
     let payer be ed25519_pubkey(k)
-    let msg be solana_message({{"fee_payer": payer, "recent_blockhash": payer,
+    let msg be solana_tx({{"fee_payer": payer, "recent_blockhash": payer,
         "instructions": [{{"program": "11111111111111111111111111111111", "data": bytes([0])}}]}})
     set sollen to length(msg)
-    set algolen to length(algorand_tx_encode({{"type": "pay", "amt": 5}}))
-    set dir to algo_address(k)
+    set algolen to length(algorand_tx({{"type": "pay", "amt": 5}}))
+    set dir to algorand_address(k)
     try
         let sig be ed25519_sign(msg, k)
     recover errmsg
@@ -227,9 +227,9 @@ print(length(sig))"#
     ));
     assert_eq!(o[0], "32", "eip712_digest es puro: funciona en sandbox");
     assert_eq!(o[1], "a9059cbb", "abi_selector es puro");
-    assert_eq!(o[2], "true", "solana_message es puro");
-    assert_eq!(o[3], "true", "algorand_tx_encode es puro");
-    assert_eq!(o[4], ALGO_SENDER, "algo_address deriva sin exponer la clave");
+    assert_eq!(o[2], "true", "solana_tx es puro");
+    assert_eq!(o[3], "true", "algorand_tx es puro");
+    assert_eq!(o[4], ALGO_SENDER, "algorand_address deriva sin exponer la clave");
     assert_eq!(o[5], "true", "la firma dentro del sandbox se deniega");
     assert_eq!(o[6], "64", "afuera, la firma anda");
 }
@@ -244,7 +244,7 @@ let sel be abi_selector("balanceOf(address)")
 print(decode(sel, "hex"))
 let enc be abi_encode("baz(uint32,bool)", [69, true])
 print(length(enc))
-print(length(algorand_tx_encode({"type": "pay", "amt": 1})))"#,
+print(length(algorand_tx({"type": "pay", "amt": 1})))"#,
     );
     assert_eq!(o, vec!["32", "70a08231", "68", "17"]);
 }
@@ -265,11 +265,11 @@ try
 recover e1
     set m1 to e1
 try
-    let y be algorand_tx_encode({{"type": "pay", "note": k}})
+    let y be algorand_tx({{"type": "pay", "note": k}})
 recover e2
     set m2 to e2
 try
-    let z be solana_message({{"fee_payer": k, "recent_blockhash": bytes([0]), "instructions": []}})
+    let z be solana_tx({{"fee_payer": k, "recent_blockhash": bytes([0]), "instructions": []}})
 recover e3
     set m3 to e3
 print(contains(m1, "{SEED}"))

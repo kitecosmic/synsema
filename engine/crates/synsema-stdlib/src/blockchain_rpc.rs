@@ -8,7 +8,7 @@
 //! - **G22 — cero capability nueva.** Todo lo de acá es `net(host)`-gated (la MISMA
 //!   capability y scope que `http_*`/`fetch`/`ws_connect`) y por lo demás PURO.
 //!   Nada mueve valor: `sign` sigue siendo la ÚNICA puerta que autoriza gastar.
-//!   `eth_send_raw`/`solana_send`/`algorand_send` difunden bytes YA firmados — sin
+//!   `evm_send`/`solana_send`/`algorand_send` difunden bytes YA firmados — sin
 //!   una firma válida (que exigió `sign`) el nodo los rechaza.
 //! - **G23 — un nodo RPC es input NO confiable.** Puede mentir, estar comprometido
 //!   o devolver basura. Todo decode es ESTRICTO: hex-quantity malformado o con
@@ -16,15 +16,15 @@
 //!   → error atrapable, jamás panic, jamás data incorrecta en silencio. Los
 //!   errores nombran el HOST, nunca el URL completo (la API key suele viajar en el
 //!   path — Infura/Alchemy).
-//! - **G24 — sin defaults de fee/gas.** `tx_eip1559` exige cada campo que mueve
+//! - **G24 — sin defaults de fee/gas.** `evm_tx` exige cada campo que mueve
 //!   valor explícito (leído con los helpers o declarado) y DEVUELVE los números en
 //!   el map para que un `confirm`/`show` los muestre ANTES de firmar.
-//! - **Polling acotado.** `eth_wait_receipt`/`solana_confirm`/`algorand_wait`
+//! - **Polling acotado.** `evm_wait`/`solana_wait`/`algorand_wait`
 //!   vencen a `nothing` (mismo criterio que `ws_recv`) — jamás cuelgan.
 //!
 //! Convención de tipos de salida (una sola regla): lo que se **re-inyecta** a un
-//! builtin de construcción/decode va como `bytes` (retorno de `eth_call` →
-//! `abi_decode`; blockhash → `solana_message`; `gh` → el txn map de Algorand); lo
+//! builtin de construcción/decode va como `bytes` (retorno de `evm_call` →
+//! `abi_decode`; blockhash → `solana_tx`; `gh` → el txn map de Algorand); lo
 //! que se **muestra o compara** va como `text` (tx hashes `0x…`, direcciones
 //! EIP-55, signature base58, txid base32).
 
@@ -695,9 +695,14 @@ fn block_tag(v: Option<&SynValue>, fname: &str) -> Result<Json, Control> {
             let tag = s.to_string();
             if matches!(tag.as_str(), "latest" | "earliest" | "pending" | "safe" | "finalized") {
                 Ok(Json::Str(tag))
+            } else if tag.starts_with("0x") {
+                // v0.6.29: la cantidad hex que devuelve el propio nodo (`eth_blockNumber`),
+                // validada como cualquier cantidad (canónica, ≤ 256 bits) y reemitida.
+                let n = hexq_to_number(&tag, "the block number", fname)?;
+                Ok(Json::Str(number_to_hexq(&n, "the block number", fname)?))
             } else {
                 Err(err(format!(
-                    "{}: unknown block tag {:?} (use latest, earliest, pending, safe, finalized, or a number)",
+                    "{}: unknown block tag {:?} (use latest, earliest, pending, safe, finalized, a number or a 0x… quantity)",
                     fname, tag
                 )))
             }
@@ -718,13 +723,13 @@ fn expect_hexq(v: &serde_json::Value, what: &str, fname: &str) -> Result<Number,
     hexq_to_number(s, what, fname)
 }
 
-fn eth_rpc(
+fn evm_rpc(
     args: &[SynValue],
     caps: &Rc<RefCell<CapabilitySet>>,
 ) -> Result<SynValue, Control> {
-    const F: &str = "eth_rpc";
+    const F: &str = "evm_rpc";
     let url = url_arg(arg(args, 0, F)?, F)?;
-    require_net(caps, &url, "eth_rpc()")?;
+    require_net(caps, &url, "evm_rpc()")?;
     let method = text_arg(arg(args, 1, F)?, "the method", F)?;
     let params = params_arg(args.get(2), F, syn_to_eth_json)?;
     let result = jsonrpc_call(&url, &method, params, F, RPC_HTTP_TIMEOUT_SECS)?;
@@ -743,48 +748,151 @@ fn eth_qty_call(
     Ok(syn_number(expect_hexq(&result, what, fname)?))
 }
 
-fn eth_nonce(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
-    const F: &str = "eth_nonce";
+fn evm_nonce(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
+    const F: &str = "evm_nonce";
     let url = url_arg(arg(args, 0, F)?, F)?;
-    require_net(caps, &url, "eth_nonce()")?;
+    require_net(caps, &url, "evm_nonce()")?;
     let addr = eth_addr_hex(arg(args, 1, F)?, "the address", F)?;
-    // Tag "pending": el nonce que sigue contando las txs ya difundidas y aún no
-    // minadas — el que se usa para construir la PRÓXIMA tx.
-    let params = Json::Array(vec![Json::Str(addr), Json::Str("pending".to_string())]);
+    // Default "pending": el nonce que sigue contando las txs ya difundidas y aún no
+    // minadas — el que se usa para construir la PRÓXIMA tx. Con `block` (v0.6.29), el de
+    // esa altura, como los demás lectores.
+    let tag = match args.get(2) {
+        None | Some(SynValue::Nothing) => Json::Str("pending".to_string()),
+        b => block_tag(b, F)?,
+    };
+    let params = Json::Array(vec![Json::Str(addr), tag]);
     eth_qty_call(&url, "eth_getTransactionCount", params, "the nonce", F)
 }
 
-fn eth_balance(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
-    const F: &str = "eth_balance";
+fn evm_balance(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
+    const F: &str = "evm_balance";
     let url = url_arg(arg(args, 0, F)?, F)?;
-    require_net(caps, &url, "eth_balance()")?;
+    require_net(caps, &url, "evm_balance()")?;
     let addr = eth_addr_hex(arg(args, 1, F)?, "the address", F)?;
     let tag = block_tag(args.get(2), F)?;
     let params = Json::Array(vec![Json::Str(addr), tag]);
     eth_qty_call(&url, "eth_getBalance", params, "the balance", F)
 }
 
-fn eth_gas_price(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
-    const F: &str = "eth_gas_price";
+fn evm_gas_price(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
+    const F: &str = "evm_gas_price";
     let url = url_arg(arg(args, 0, F)?, F)?;
-    require_net(caps, &url, "eth_gas_price()")?;
+    require_net(caps, &url, "evm_gas_price()")?;
     eth_qty_call(&url, "eth_gasPrice", Json::Array(Vec::new()), "the gas price", F)
 }
 
-fn eth_chain_id(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
-    const F: &str = "eth_chain_id";
+fn evm_chain_id(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
+    const F: &str = "evm_chain_id";
     let url = url_arg(arg(args, 0, F)?, F)?;
-    require_net(caps, &url, "eth_chain_id()")?;
+    require_net(caps, &url, "evm_chain_id()")?;
     eth_qty_call(&url, "eth_chainId", Json::Array(Vec::new()), "the chain id", F)
 }
 
-fn eth_estimate_gas(
+/// `evm_block_number(url)` → la altura actual como entero (v0.6.29).
+fn evm_block_number(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
+    const F: &str = "evm_block_number";
+    let url = url_arg(arg(args, 0, F)?, F)?;
+    require_net(caps, &url, "evm_block_number()")?;
+    eth_qty_call(&url, "eth_blockNumber", Json::Array(Vec::new()), "the block number", F)
+}
+
+/// `evm_logs(url, filter)` → lista de logs (v0.6.29), decodificados con el MISMO parser
+/// estricto que los logs del recibo. `filter` usa las claves del wire, validadas:
+/// `address` (una o lista), `topics` (lista de posiciones: texto/bytes32, `nothing` =
+/// cualquiera, o lista = cualquiera de esas), `fromBlock`/`toBlock` (como `block`) o
+/// `blockHash`.
+fn evm_logs(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
+    const F: &str = "evm_logs";
+    let url = url_arg(arg(args, 0, F)?, F)?;
+    require_net(caps, &url, "evm_logs()")?;
+    let m = match arg(args, 1, F)? {
+        SynValue::Map(m) => m.borrow().clone(),
+        other => {
+            return Err(err(format!(
+                "{}: the filter must be a map ({{address, topics, fromBlock, toBlock}} or {{address, topics, blockHash}}), got {}",
+                F,
+                other.type_name()
+            )))
+        }
+    };
+    let topic_json = |v: &SynValue, path: &str| -> Result<Json, Control> {
+        match v {
+            SynValue::Nothing => Ok(Json::Null),
+            SynValue::Bytes(b) if b.len() == 32 => Ok(Json::Str(bytes_to_hexdata(b))),
+            SynValue::Text(t) => {
+                let b = hexdata_to_bytes(t, path, F)?;
+                if b.len() != 32 {
+                    return Err(err(format!("{}: {} must be 32 bytes, got {}", F, path, b.len())));
+                }
+                Ok(Json::Str(bytes_to_hexdata(&b)))
+            }
+            other => Err(err(format!("{}: {} must be a 0x… topic, 32 bytes or nothing, got {}", F, path, other.type_name()))),
+        }
+    };
+    let mut filter: Vec<(String, Json)> = Vec::new();
+    for (k, v) in &m {
+        let j = match k.as_str() {
+            "address" => match v {
+                SynValue::List(l) => {
+                    let mut out = Vec::new();
+                    for (i, a) in l.borrow().iter().enumerate() {
+                        out.push(Json::Str(eth_addr_hex(a, &format!("address[{}]", i), F)?));
+                    }
+                    Json::Array(out)
+                }
+                other => Json::Str(eth_addr_hex(other, "address", F)?),
+            },
+            "topics" => {
+                let items = match v {
+                    SynValue::List(l) => l.borrow().clone(),
+                    other => return Err(err(format!("{}: topics must be a list, got {}", F, other.type_name()))),
+                };
+                let mut out = Vec::new();
+                for (i, t) in items.iter().enumerate() {
+                    let path = format!("topics[{}]", i);
+                    out.push(match t {
+                        SynValue::List(alts) => {
+                            let mut a = Vec::new();
+                            for (j, x) in alts.borrow().iter().enumerate() {
+                                a.push(topic_json(x, &format!("{}[{}]", path, j))?);
+                            }
+                            Json::Array(a)
+                        }
+                        other => topic_json(other, &path)?,
+                    });
+                }
+                Json::Array(out)
+            }
+            "fromBlock" | "toBlock" => block_tag(Some(v), F)?,
+            "blockHash" => Json::Str(tx_hash_hex(v, F)?),
+            other => {
+                return Err(err(format!(
+                    "{}: unknown filter key {:?} (allowed: address, topics, fromBlock, toBlock, blockHash)",
+                    F, other
+                )))
+            }
+        };
+        filter.push((k.clone(), j));
+    }
+    if m.contains_key("blockHash") && (m.contains_key("fromBlock") || m.contains_key("toBlock")) {
+        return Err(err(format!("{}: blockHash excludes fromBlock/toBlock (pick one way to say which blocks)", F)));
+    }
+    let result = jsonrpc_call(&url, "eth_getLogs", Json::Array(vec![Json::Object(filter)]), F, RPC_HTTP_TIMEOUT_SECS)?;
+    let arr = result.as_array().ok_or_else(|| err(format!("{}: expected a list of logs, the node sent something else", F)))?;
+    let mut logs = Vec::with_capacity(arr.len());
+    for (i, l) in arr.iter().enumerate() {
+        logs.push(decode_log(l, i, F)?);
+    }
+    Ok(syn_list(logs))
+}
+
+fn evm_estimate_gas(
     args: &[SynValue],
     caps: &Rc<RefCell<CapabilitySet>>,
 ) -> Result<SynValue, Control> {
-    const F: &str = "eth_estimate_gas";
+    const F: &str = "evm_estimate_gas";
     let url = url_arg(arg(args, 0, F)?, F)?;
-    require_net(caps, &url, "eth_estimate_gas()")?;
+    require_net(caps, &url, "evm_estimate_gas()")?;
     let tx = match arg(args, 1, F)? {
         v @ SynValue::Map(_) => syn_to_eth_json(v, "the tx", F, 0)?,
         other => {
@@ -798,10 +906,10 @@ fn eth_estimate_gas(
     eth_qty_call(&url, "eth_estimateGas", Json::Array(vec![tx]), "the gas estimate", F)
 }
 
-fn eth_call(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
-    const F: &str = "eth_call";
+fn evm_call(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
+    const F: &str = "evm_call";
     let url = url_arg(arg(args, 0, F)?, F)?;
-    require_net(caps, &url, "eth_call()")?;
+    require_net(caps, &url, "evm_call()")?;
     let tx = match arg(args, 1, F)? {
         v @ SynValue::Map(_) => syn_to_eth_json(v, "the call", F, 0)?,
         other => {
@@ -822,10 +930,10 @@ fn eth_call(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynV
     Ok(syn_bytes(hexdata_to_bytes(s, "the return data", F)?))
 }
 
-fn eth_send_raw(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
-    const F: &str = "eth_send_raw";
+fn evm_send(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
+    const F: &str = "evm_send";
     let url = url_arg(arg(args, 0, F)?, F)?;
-    require_net(caps, &url, "eth_send_raw()")?;
+    require_net(caps, &url, "evm_send()")?;
     let raw = arg_bytes(arg(args, 1, F)?, F, "the signed transaction")?;
     let params = Json::Array(vec![Json::Str(bytes_to_hexdata(raw))]);
     let result = jsonrpc_call(&url, "eth_sendRawTransaction", params, F, RPC_HTTP_TIMEOUT_SECS)?;
@@ -971,10 +1079,10 @@ fn decode_receipt(v: &serde_json::Value, fname: &str) -> Result<SynValue, Contro
     Ok(syn_map(out))
 }
 
-fn eth_receipt(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
-    const F: &str = "eth_receipt";
+fn evm_receipt(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
+    const F: &str = "evm_receipt";
     let url = url_arg(arg(args, 0, F)?, F)?;
-    require_net(caps, &url, "eth_receipt()")?;
+    require_net(caps, &url, "evm_receipt()")?;
     let hash = tx_hash_hex(arg(args, 1, F)?, F)?;
     let result = jsonrpc_call(
         &url,
@@ -989,13 +1097,13 @@ fn eth_receipt(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<S
     decode_receipt(&result, F)
 }
 
-fn eth_wait_receipt(
+fn evm_wait(
     args: &[SynValue],
     caps: &Rc<RefCell<CapabilitySet>>,
 ) -> Result<SynValue, Control> {
-    const F: &str = "eth_wait_receipt";
+    const F: &str = "evm_wait";
     let url = url_arg(arg(args, 0, F)?, F)?;
-    require_net(caps, &url, "eth_wait_receipt()")?;
+    require_net(caps, &url, "evm_wait()")?;
     let hash = tx_hash_hex(arg(args, 1, F)?, F)?;
     let confirmations: i64 = match args.get(2) {
         None | Some(SynValue::Nothing) => 1,
@@ -1088,15 +1196,15 @@ fn eth_wait_receipt(
     }
 }
 
-// -- eth_fee_history: la lectura EIP-1559 con la derivación transparente --
+// -- evm_fee_history: la lectura EIP-1559 con la derivación transparente --
 
-fn eth_fee_history(
+fn evm_fee_history(
     args: &[SynValue],
     caps: &Rc<RefCell<CapabilitySet>>,
 ) -> Result<SynValue, Control> {
-    const F: &str = "eth_fee_history";
+    const F: &str = "evm_fee_history";
     let url = url_arg(arg(args, 0, F)?, F)?;
-    require_net(caps, &url, "eth_fee_history()")?;
+    require_net(caps, &url, "evm_fee_history()")?;
     let blocks: i64 = match args.get(1) {
         None | Some(SynValue::Nothing) => 5,
         Some(SynValue::Number(n)) => match n.to_i64_trunc() {
@@ -1221,7 +1329,7 @@ fn eth_fee_history(
 }
 
 // =========================================================
-// tx_eip1559 — builder PURO (G24: todo explícito, los números quedan a la vista)
+// evm_tx — builder PURO (G24: todo explícito, los números quedan a la vista)
 // =========================================================
 
 /// Campo entero requerido de `bits` como máximo. El error de campo faltante nombra
@@ -1342,17 +1450,36 @@ fn access_list_field(v: Option<&SynValue>, fname: &str) -> Result<SynValue, Cont
     Ok(syn_list(out))
 }
 
-/// `tx_eip1559(params)` → map `{digest, fields, …eco de los números}`. PURO: no
+/// `evm_tx(params)` → map `{digest, fields, …eco de los números}`. PURO: no
 /// firma ni difunde nada. El flujo completo (sin hand-rollear el ensamblado):
 /// ```text
-/// let tx be tx_eip1559({…})
+/// let tx be evm_tx({…})
 /// -- confirm con tx["max_fee"]/tx["value"] A LA VISTA (G24)
 /// let sig be secp256k1_sign(tx["digest"], secret("KEY"))   -- la ÚNICA puerta
-/// let raw be tx_eip1559_raw(tx, sig)
-/// let hash be eth_send_raw(url, raw)
+/// let raw be evm_tx_raw(tx, sig)
+/// let hash be evm_send(url, raw)
 /// ```
-fn tx_eip1559(args: &[SynValue]) -> Result<SynValue, Control> {
-    const F: &str = "tx_eip1559";
+fn evm_tx(args: &[SynValue]) -> Result<SynValue, Control> {
+    build_evm_tx(args, false)
+}
+
+/// `evm_tx_create({chain_id, nonce, from, value, gas, max_fee, max_priority, data,
+/// access_list?})` (v0.6.29): despliega un contrato. Aparte de `evm_tx` a propósito —ahí la
+/// falta de `to` sigue siendo un error (una creación por olvido quema fondos, G24)—. Exige
+/// `data` (el init code, ≤ 49152 bytes por EIP-3860) y `from`, porque la dirección del
+/// contrato depende de quién lo crea: la devuelve en `contract_address` junto a los demás
+/// números que se muestran ANTES de firmar, y `evm_tx_raw` verifica que la firma sea de
+/// `from` (si no, esa dirección mentiría).
+fn evm_tx_create(args: &[SynValue]) -> Result<SynValue, Control> {
+    build_evm_tx(args, true)
+}
+
+/// Tope de init code de EIP-3860 (Shanghai): 2 × 24576.
+const MAX_INITCODE: usize = 49152;
+
+fn build_evm_tx(args: &[SynValue], create: bool) -> Result<SynValue, Control> {
+    #[allow(non_snake_case)]
+    let F: &str = if create { "evm_tx_create" } else { "evm_tx" };
     let m = match arg(args, 0, F)? {
         SynValue::Map(m) => m.borrow().clone(),
         other => {
@@ -1364,23 +1491,40 @@ fn tx_eip1559(args: &[SynValue]) -> Result<SynValue, Control> {
         }
     };
     for k in m.keys() {
-        if !matches!(
-            k.as_str(),
-            "chain_id" | "nonce" | "to" | "value" | "data" | "gas" | "max_fee" | "max_priority"
-                | "access_list"
-        ) {
+        let known = if create {
+            matches!(
+                k.as_str(),
+                "chain_id" | "nonce" | "from" | "value" | "data" | "gas" | "max_fee" | "max_priority"
+                    | "access_list"
+            )
+        } else {
+            matches!(
+                k.as_str(),
+                "chain_id" | "nonce" | "to" | "value" | "data" | "gas" | "max_fee" | "max_priority"
+                    | "access_list"
+            )
+        };
+        if !known {
+            if create && k == "to" {
+                return Err(err(format!(
+                    "{}: a contract creation has no \"to\" — the address is derived from \"from\" and \"nonce\" (it comes back in contract_address)",
+                    F
+                )));
+            }
             return Err(err(format!(
-                "{}: unknown key {:?} in params (allowed: chain_id, nonce, to, value, data, gas, max_fee, max_priority, access_list)",
-                F, k
+                "{}: unknown key {:?} in params (allowed: chain_id, nonce, {}, value, data, gas, max_fee, max_priority, access_list)",
+                F,
+                k,
+                if create { "from" } else { "to" }
             )));
         }
     }
-    let chain_id = uint_field(&m, "chain_id", 64, "eth_chain_id(url)", F)?;
-    let nonce = uint_field(&m, "nonce", 64, "eth_nonce(url, from)", F)?;
-    let gas = uint_field(&m, "gas", 64, "eth_estimate_gas(url, tx)", F)?;
+    let chain_id = uint_field(&m, "chain_id", 64, "evm_chain_id(url)", F)?;
+    let nonce = uint_field(&m, "nonce", 64, "evm_nonce(url, from)", F)?;
+    let gas = uint_field(&m, "gas", 64, "evm_estimate_gas(url, tx)", F)?;
     let value = uint_field(&m, "value", 256, "an explicit amount (0 for a pure contract call)", F)?;
-    let max_fee = uint_field(&m, "max_fee", 256, "eth_fee_history(url)", F)?;
-    let max_priority = uint_field(&m, "max_priority", 256, "eth_fee_history(url)", F)?;
+    let max_fee = uint_field(&m, "max_fee", 256, "evm_fee_history(url)", F)?;
+    let max_priority = uint_field(&m, "max_priority", 256, "evm_fee_history(url)", F)?;
     // El nodo rechazaría igual, pero acá el error llega ANTES de firmar.
     if let (Some(mf), Some(mp)) = (max_fee.as_bigint(), max_priority.as_bigint()) {
         if mp > mf {
@@ -1390,20 +1534,48 @@ fn tx_eip1559(args: &[SynValue]) -> Result<SynValue, Control> {
             )));
         }
     }
-    let to = addr20(
-        m.get("to").ok_or_else(|| {
-            err(format!(
-                "{}: missing \"to\" — the destination is explicit; contract creation is not supported here",
-                F
-            ))
-        })?,
-        "\"to\"",
-        F,
-    )?;
+    let (to, from): (Vec<u8>, Option<[u8; 20]>) = if create {
+        let from = addr20(
+            m.get("from").ok_or_else(|| {
+                err(format!(
+                    "{}: missing \"from\" — the contract address depends on who deploys it (evm_address(secret(\"KEY\")))",
+                    F
+                ))
+            })?,
+            "\"from\"",
+            F,
+        )?;
+        (Vec::new(), Some(from))
+    } else {
+        let to = addr20(
+            m.get("to").ok_or_else(|| {
+                err(format!(
+                    "{}: missing \"to\" — the destination is explicit; to deploy a contract use evm_tx_create",
+                    F
+                ))
+            })?,
+            "\"to\"",
+            F,
+        )?;
+        (to.to_vec(), None)
+    };
     let data: Vec<u8> = match m.get("data") {
         None | Some(SynValue::Nothing) => Vec::new(),
         Some(v) => arg_bytes(v, F, "\"data\"")?.to_vec(),
     };
+    if create {
+        if data.is_empty() {
+            return Err(err(format!("{}: \"data\" is the contract's init code (bytecode ‖ constructor arguments) and cannot be empty", F)));
+        }
+        if data.len() > MAX_INITCODE {
+            return Err(err(format!(
+                "{}: the init code is {} bytes; EIP-3860 caps it at {}",
+                F,
+                data.len(),
+                MAX_INITCODE
+            )));
+        }
+    }
     let access_list = access_list_field(m.get("access_list"), F)?;
 
     // Orden EIP-1559: [chainId, nonce, maxPriorityFeePerGas, maxFeePerGas,
@@ -1414,7 +1586,7 @@ fn tx_eip1559(args: &[SynValue]) -> Result<SynValue, Control> {
         syn_number(max_priority.clone()),
         syn_number(max_fee.clone()),
         syn_number(gas.clone()),
-        syn_bytes(to.to_vec()),
+        syn_bytes(to.clone()),
         syn_number(value.clone()),
         syn_bytes(data),
         access_list,
@@ -1432,8 +1604,17 @@ fn tx_eip1559(args: &[SynValue]) -> Result<SynValue, Control> {
     // Eco de los números que mueven valor — para el confirm/show PREVIO a la
     // firma (G24): nada queda escondido dentro de un blob.
     out.insert("chain_id".to_string(), syn_number(chain_id));
+    match from {
+        Some(f) => {
+            out.insert("to".to_string(), SynValue::Nothing);
+            out.insert("from".to_string(), syn_text(eip55(&f)));
+            out.insert("contract_address".to_string(), syn_text(eip55(&create_address(&f, &nonce, F)?)));
+        }
+        None => {
+            out.insert("to".to_string(), syn_text(eip55(&to)));
+        }
+    }
     out.insert("nonce".to_string(), syn_number(nonce));
-    out.insert("to".to_string(), syn_text(eip55(&to)));
     out.insert("value".to_string(), syn_number(value));
     out.insert("gas".to_string(), syn_number(gas));
     out.insert("max_fee".to_string(), syn_number(max_fee));
@@ -1441,16 +1622,57 @@ fn tx_eip1559(args: &[SynValue]) -> Result<SynValue, Control> {
     Ok(syn_map(out))
 }
 
-/// `tx_eip1559_raw(tx, signature)` → bytes de la tx firmada lista para
-/// `eth_send_raw`. `tx` es el map de `tx_eip1559`; `signature` los 65 bytes de
+/// Dirección de CREATE: `keccak256(rlp([sender, nonce]))[12..]`.
+fn create_address(sender: &[u8; 20], nonce: &Number, fname: &str) -> Result<[u8; 20], Control> {
+    let fields = syn_list(vec![syn_bytes(sender.to_vec()), syn_number(nonce.clone())]);
+    let mut payload = Vec::new();
+    rlp_encode_val(&fields, 0, &mut payload)
+        .map_err(|_| err(format!("{}: the nonce must be a non-negative integer", fname)))?;
+    let h = Keccak256::digest(&payload);
+    let mut a = [0u8; 20];
+    a.copy_from_slice(&h[12..]);
+    Ok(a)
+}
+
+/// `evm_create_address(sender, nonce)` → la dirección EIP-55 del contrato que `sender`
+/// crearía con ese nonce (CREATE). Pura.
+fn evm_create_address(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "evm_create_address";
+    let sender = addr20(arg(args, 0, F)?, "the sender", F)?;
+    let nonce = match arg(args, 1, F)? {
+        SynValue::Number(n) if n.is_integer() && !n.is_negative() => n.clone(),
+        other => return Err(err(format!("{}: the nonce must be a non-negative integer, got {}", F, other))),
+    };
+    Ok(syn_text(eip55(&create_address(&sender, &nonce, F)?)))
+}
+
+/// `evm_create2_address(deployer, salt, init_code_hash)` → la dirección EIP-55 de CREATE2
+/// (EIP-1014): `keccak256(0xff ‖ deployer ‖ salt ‖ keccak256(init_code))[12..]`. `salt` e
+/// `init_code_hash` son bytes(32) (el hash, no el código: `keccak256(init_code)`). Pura.
+fn evm_create2_address(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "evm_create2_address";
+    let deployer = addr20(arg(args, 0, F)?, "the deployer", F)?;
+    let salt = arg_bytes_len(arg(args, 1, F)?, F, "the salt", 32)?;
+    let hash = arg_bytes_len(arg(args, 2, F)?, F, "the init code hash (keccak256(init_code))", 32)?;
+    let mut pre = Vec::with_capacity(85);
+    pre.push(0xff);
+    pre.extend_from_slice(&deployer);
+    pre.extend_from_slice(salt);
+    pre.extend_from_slice(hash);
+    let h = Keccak256::digest(&pre);
+    Ok(syn_text(eip55(&h[12..])))
+}
+
+/// `evm_tx_raw(tx, signature)` → bytes de la tx firmada lista para
+/// `evm_send`. `tx` es el map de `evm_tx`; `signature` los 65 bytes de
 /// `secp256k1_sign` (r‖s‖recovery_id). PURO: sólo ensambla.
-fn tx_eip1559_raw(args: &[SynValue]) -> Result<SynValue, Control> {
-    const F: &str = "tx_eip1559_raw";
+fn evm_tx_raw(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "evm_tx_raw";
     let m = match arg(args, 0, F)? {
         SynValue::Map(m) => m.borrow().clone(),
         other => {
             return Err(err(format!(
-                "{}: the first argument must be the map returned by tx_eip1559, got {}",
+                "{}: the first argument must be the map returned by evm_tx, got {}",
                 F,
                 other.type_name()
             )))
@@ -1460,14 +1682,14 @@ fn tx_eip1559_raw(args: &[SynValue]) -> Result<SynValue, Control> {
         Some(SynValue::List(l)) => l.borrow().clone(),
         _ => {
             return Err(err(format!(
-                "{}: the map has no \"fields\" list — pass the map returned by tx_eip1559",
+                "{}: the map has no \"fields\" list — pass the map returned by evm_tx",
                 F
             )))
         }
     };
     if fields.len() != 9 {
         return Err(err(format!(
-            "{}: \"fields\" has {} items, an EIP-1559 tx has 9 — pass the map returned by tx_eip1559 unmodified",
+            "{}: \"fields\" has {} items, an EIP-1559 tx has 9 — pass the map returned by evm_tx unmodified",
             F,
             fields.len()
         )));
@@ -1479,6 +1701,25 @@ fn tx_eip1559_raw(args: &[SynValue]) -> Result<SynValue, Control> {
             "{}: the recovery id (signature byte 65) must be 0 or 1, got {} — pass the signature from secp256k1_sign as-is (no 27/28 adjustment: typed txs use y-parity)",
             F, v
         )));
+    }
+    // Una creación (`evm_tx_create`) trae `from`: la firma TIENE que ser de esa cuenta, o
+    // la `contract_address` que se mostró antes de firmar sería falsa.
+    if let Some(from_v) = m.get("from") {
+        let want = addr20(from_v, "\"from\"", F)?;
+        let digest = match m.get("digest") {
+            Some(SynValue::Bytes(d)) if d.len() == 32 => d.to_vec(),
+            _ => return Err(err(format!("{}: the map has no 32-byte \"digest\" — pass the map returned by evm_tx_create unmodified", F))),
+        };
+        let pk = crate::blockchain::recover_pubkey(&digest, sig, F)?;
+        let got = crate::blockchain::address_of_pubkey(&pk);
+        if got != want {
+            return Err(err(format!(
+                "{}: the signature is from {}, but the creation declared from {} — the contract_address shown before signing would be wrong; sign with the key of \"from\"",
+                F,
+                eip55(&got),
+                eip55(&want)
+            )));
+        }
     }
     let r = Number::from_be_bytes(&sig[..32]);
     let s = Number::from_be_bytes(&sig[32..64]);
@@ -1536,7 +1777,7 @@ fn solana_latest_blockhash(
             raw.len()
         )));
     }
-    // bytes32 directo: se re-inyecta a solana_message({"recent_blockhash": …}).
+    // bytes32 directo: se re-inyecta a solana_tx({"recent_blockhash": …}).
     Ok(syn_bytes(raw))
 }
 
@@ -1610,10 +1851,10 @@ fn solana_sig_arg(v: &SynValue, fname: &str) -> Result<String, Control> {
     }
 }
 
-fn solana_confirm(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
-    const F: &str = "solana_confirm";
+fn solana_wait(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
+    const F: &str = "solana_wait";
     let url = url_arg(arg(args, 0, F)?, F)?;
-    require_net(caps, &url, "solana_confirm()")?;
+    require_net(caps, &url, "solana_wait()")?;
     let sig = solana_sig_arg(arg(args, 1, F)?, F)?;
     let timeout = wait_timeout_arg(args.get(2), F)?;
     let deadline = deadline_from(timeout);
@@ -1902,7 +2143,7 @@ fn algorand_wait(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result
 
 /// Registra el read-side. TODO lo que toca red cierra sobre el `CapabilitySet`
 /// para el gate `net(host)` (G22 — sandbox lo vacía, deny-by-default); los
-/// builders `tx_eip1559`/`tx_eip1559_raw` son PUROS. Wired desde
+/// builders `evm_tx`/`evm_tx_raw` son PUROS. Wired desde
 /// `register_blockchain_builtins`.
 pub(crate) fn register(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
     macro_rules! net_builtin {
@@ -1912,26 +2153,31 @@ pub(crate) fn register(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
         }};
     }
     // -- EVM --
-    net_builtin!("eth_rpc", -1, eth_rpc);
-    net_builtin!("eth_nonce", 2, eth_nonce);
-    net_builtin!("eth_balance", -1, eth_balance);
-    net_builtin!("eth_gas_price", 1, eth_gas_price);
-    net_builtin!("eth_chain_id", 1, eth_chain_id);
-    net_builtin!("eth_estimate_gas", 2, eth_estimate_gas);
-    net_builtin!("eth_call", -1, eth_call);
-    net_builtin!("eth_fee_history", -1, eth_fee_history);
-    net_builtin!("eth_send_raw", 2, eth_send_raw);
-    net_builtin!("eth_receipt", 2, eth_receipt);
-    net_builtin!("eth_wait_receipt", -1, eth_wait_receipt);
+    net_builtin!("evm_rpc", -1, evm_rpc);
+    net_builtin!("evm_nonce", -1, evm_nonce);
+    net_builtin!("evm_balance", -1, evm_balance);
+    net_builtin!("evm_gas_price", 1, evm_gas_price);
+    net_builtin!("evm_chain_id", 1, evm_chain_id);
+    net_builtin!("evm_estimate_gas", 2, evm_estimate_gas);
+    net_builtin!("evm_call", -1, evm_call);
+    net_builtin!("evm_fee_history", -1, evm_fee_history);
+    net_builtin!("evm_send", 2, evm_send);
+    net_builtin!("evm_receipt", 2, evm_receipt);
+    net_builtin!("evm_wait", -1, evm_wait);
+    net_builtin!("evm_block_number", 1, evm_block_number);
+    net_builtin!("evm_logs", 2, evm_logs);
     // -- builders EIP-1559 (PUROS: G13/G22 — firmar sigue siendo la única puerta) --
-    interp.register_builtin("tx_eip1559", 1, Rc::new(|_i, a, _l| tx_eip1559(a)));
-    interp.register_builtin("tx_eip1559_raw", 2, Rc::new(|_i, a, _l| tx_eip1559_raw(a)));
+    interp.register_builtin("evm_tx", 1, Rc::new(|_i, a, _l| evm_tx(a)));
+    interp.register_builtin("evm_tx_raw", 2, Rc::new(|_i, a, _l| evm_tx_raw(a)));
+    interp.register_builtin("evm_tx_create", 1, Rc::new(|_i, a, _l| evm_tx_create(a)));
+    interp.register_builtin("evm_create_address", 2, Rc::new(|_i, a, _l| evm_create_address(a)));
+    interp.register_builtin("evm_create2_address", 3, Rc::new(|_i, a, _l| evm_create2_address(a)));
     // -- Solana --
     net_builtin!("solana_rpc", -1, solana_rpc);
     net_builtin!("solana_latest_blockhash", 1, solana_latest_blockhash);
     net_builtin!("solana_balance", 2, solana_balance);
     net_builtin!("solana_send", 2, solana_send);
-    net_builtin!("solana_confirm", -1, solana_confirm);
+    net_builtin!("solana_wait", -1, solana_wait);
     net_builtin!("spl_balance", -1, spl_balance);
     // -- Algorand --
     net_builtin!("algorand_params", -1, algorand_params);
@@ -2056,11 +2302,11 @@ mod tests {
             ("max_fee", syn_int(30000000000)),
             ("max_priority", syn_int(1500000000)),
         ]);
-        let tx = ok(tx_eip1559(&[params]));
+        let tx = ok(evm_tx(&[params]));
         // El digest es el keccak de la raw SIN firma; verificable contra el hash
         // de la FIRMADA re-ensamblando con la firma del vector:
         let sig = sig_from_raw(VEC1_RAW);
-        let raw = ok(tx_eip1559_raw(&[tx.clone(), syn_bytes(sig)]));
+        let raw = ok(evm_tx_raw(&[tx.clone(), syn_bytes(sig)]));
         let raw_bytes = match &raw {
             SynValue::Bytes(b) => b[..].to_vec(),
             _ => panic!("raw debe ser bytes"),
@@ -2097,9 +2343,9 @@ mod tests {
                 ])]),
             ),
         ]);
-        let tx = ok(tx_eip1559(&[params]));
+        let tx = ok(evm_tx(&[params]));
         let sig = sig_from_raw(VEC2_RAW);
-        let raw = ok(tx_eip1559_raw(&[tx, syn_bytes(sig)]));
+        let raw = ok(evm_tx_raw(&[tx, syn_bytes(sig)]));
         let raw_bytes = match &raw {
             SynValue::Bytes(b) => b[..].to_vec(),
             _ => panic!("raw debe ser bytes"),
@@ -2119,7 +2365,7 @@ mod tests {
             ("gas", syn_int(21000)),
             ("max_priority", syn_int(1)),
         ]);
-        let e = match tx_eip1559(&[params]) {
+        let e = match evm_tx(&[params]) {
             Err(Control::Error(e)) => e.message,
             other => panic!("esperaba error, vino {:?}", other.is_ok()),
         };
@@ -2133,14 +2379,14 @@ mod tests {
             ("max_fee", syn_int(2)),
             ("max_priority", syn_int(1)),
         ]);
-        assert!(tx_eip1559(&[params]).is_err());
+        assert!(evm_tx(&[params]).is_err());
     }
 
     #[test]
     fn tx_eip1559_is_chain_agnostic_l2_chain_ids() {
         // El builder y todo el read-side son agnósticos de cadena: cualquier EVM
         // (L1 o L2) es el mismo wire. Base/Optimism/Arbitrum/Polygon construyen
-        // igual que mainnet — el chain_id se LEE del nodo (eth_chain_id), jamás
+        // igual que mainnet — el chain_id se LEE del nodo (evm_chain_id), jamás
         // se asume. (El vector de Avalanche 43114 ya lo prueba end-to-end; esto
         // documenta la intención para los L2 grandes.)
         for chain_id in [8453i64, 10, 42161, 137] {
@@ -2153,7 +2399,7 @@ mod tests {
                 ("max_fee", syn_int(2)),
                 ("max_priority", syn_int(1)),
             ]);
-            let tx = ok(tx_eip1559(&[params]));
+            let tx = ok(evm_tx(&[params]));
             assert!(matches!(get(&tx, "digest"), SynValue::Bytes(b) if b.len() == 32));
             assert_eq!(get(&tx, "chain_id").to_string(), chain_id.to_string());
         }
@@ -2170,7 +2416,7 @@ mod tests {
             ("max_fee", syn_int(10)),
             ("max_priority", syn_int(11)),
         ]);
-        let e = match tx_eip1559(&[params]) {
+        let e = match evm_tx(&[params]) {
             Err(Control::Error(e)) => e.message,
             _ => panic!("esperaba error"),
         };
@@ -2188,10 +2434,10 @@ mod tests {
             ("max_fee", syn_int(2)),
             ("max_priority", syn_int(1)),
         ]);
-        let tx = ok(tx_eip1559(&[params]));
+        let tx = ok(evm_tx(&[params]));
         let mut sig = vec![1u8; 65];
         sig[64] = 27; // el clásico v legacy — acá es y-parity 0/1
-        let e = match tx_eip1559_raw(&[tx, syn_bytes(sig)]) {
+        let e = match evm_tx_raw(&[tx, syn_bytes(sig)]) {
             Err(Control::Error(e)) => e.message,
             _ => panic!("esperaba error"),
         };

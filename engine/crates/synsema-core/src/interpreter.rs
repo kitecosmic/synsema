@@ -239,6 +239,10 @@ pub fn with_fallback(base: usize, f: BuiltinFn) -> BuiltinFn {
 
 /// Un task built-in (implementado en Rust). `param_count` es informativo (Python
 /// no lo fuerza en `_call_value`).
+/// `print` escribe directo a stdout en vez de juntar en `output` (v0.6.29). Lo prende
+/// sólo el camino normal de `synsema run`; todo lo demás (tests, serve, informes) junta.
+pub static LIVE_STDOUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub struct BuiltinTask {
     pub name: String,
     pub func: BuiltinFn,
@@ -1669,11 +1673,35 @@ impl Interpreter {
         args: &[SynValue],
         loc: &SourceLocation,
     ) -> Result<SynValue, Control> {
-        if self.labels {
-            return self.call_builtin_labelled(bt, args, loc);
+        let r = if self.labels {
+            self.call_builtin_labelled(bt, args, loc)
+        } else {
+            let f = bt.func.clone();
+            self.call_builtin_at(&f, args, loc)
+        };
+        // El "missing argument" genérico de `nth` no decía de qué función ni cuántos
+        // argumentos esperaba (v0.6.29, V1-E2): se completa acá, donde se sabe.
+        match r {
+            Err(Control::Error(mut e)) if e.message == "missing argument" => {
+                let (min, _) = builtin_arity(bt);
+                e.message = if min > args.len() {
+                    format!(
+                        "{}() needs {} argument{}, got {}",
+                        bt.name,
+                        min,
+                        if min == 1 { "" } else { "s" },
+                        args.len()
+                    )
+                } else {
+                    format!("{}() is missing an argument (got {})", bt.name, args.len())
+                };
+                if e.location.is_none() {
+                    e.location = Some(loc.clone());
+                }
+                Err(Control::Error(e))
+            }
+            other => other,
         }
-        let f = bt.func.clone();
-        self.call_builtin_at(&f, args, loc)
     }
 
     /// Despacho etiquetado . Regla genérica: si algún argumento lleva etiquetas (a
@@ -1812,6 +1840,21 @@ impl Interpreter {
                 param_names: Some(param_names),
             })),
         );
+    }
+
+    /// Liga cada nombre deprecado (`deprecated::DEPRECATED_NAMES`) al builtin de su nombre
+    /// nuevo, salvo que el viejo ya esté registrado por su cuenta (porque conserva su forma
+    /// vieja, como `capture`, o porque el nombre se reusó, como `solana_tx`).
+    pub fn register_deprecated_aliases(&self) {
+        let mut g = self.global_env.borrow_mut();
+        for (old, new) in crate::deprecated::DEPRECATED_NAMES {
+            if g.bindings.contains_key(*old) {
+                continue;
+            }
+            if let Some(v @ SynValue::Builtin(_)) = g.bindings.get(*new).cloned() {
+                g.bindings.insert(old.to_string(), v);
+            }
+        }
     }
 
     /// Cablea el hook de concesión de capabilities (lo llama `require`).
@@ -2318,6 +2361,15 @@ impl Interpreter {
         self.register("decimal", -1, with_fallback(1, Rc::new(|i, a, l| i.b_decimal(a, l))));
         self.register("float", -1, with_fallback(1, Rc::new(|i, a, l| i.b_float(a, l))));
         self.register("is_decimal", 1, Rc::new(|i, a, l| i.b_is_decimal(a, l)));
+        // v0.6.29: entero exacto (forma total como `number`), `0x…` y predicados de tipo.
+        self.register("int", -1, with_fallback(1, Rc::new(|i, a, l| i.b_int(a, l))));
+        self.register("hex", 1, Rc::new(|i, a, l| i.b_hex(a, l)));
+        self.register("is_integer", 1, Rc::new(|_i, a, _l| {
+            Ok(syn_bool(matches!(nth(a, 0)?, SynValue::Number(Number::Int(_) | Number::Big(_)))))
+        }));
+        self.register("is_text", 1, Rc::new(|_i, a, _l| Ok(syn_bool(matches!(nth(a, 0)?, SynValue::Text(_))))));
+        self.register("is_list", 1, Rc::new(|_i, a, _l| Ok(syn_bool(matches!(nth(a, 0)?, SynValue::List(_))))));
+        self.register("is_map", 1, Rc::new(|_i, a, _l| Ok(syn_bool(nth(a, 0)?.type_name() == "map"))));
         // Tipo bytes (binario): constructor/conversión + introspección. PUROS (sin
         // capability, como text/number/decimal). El hex/base64 es hand-rolled (bytesutil).
         self.register("bytes", -1, Rc::new(|i, a, l| i.b_bytes(a, l)));
@@ -2343,6 +2395,12 @@ impl Interpreter {
         self.register("trunc", 1, Rc::new(|i, a, l| i.b_round_op(a, l, "trunc", f64::trunc)));
         self.register("append", 2, Rc::new(|i, a, l| i.b_append(a, l)));
         self.register("keys", 1, Rc::new(|i, a, l| i.b_keys(a, l)));
+        // v0.6.29 (V1-C1): mapas. `get` es la forma total del índice (lista o mapa);
+        // `remove`/`merge` devuelven un mapa nuevo; `items` → [{key, value}].
+        self.register("get", -1, Rc::new(|i, a, l| i.b_get(a, l)));
+        self.register("remove", 2, Rc::new(|i, a, l| i.b_remove(a, l)));
+        self.register("merge", -1, Rc::new(|i, a, l| i.b_merge(a, l)));
+        self.register("items", 1, Rc::new(|i, a, l| i.b_items(a, l)));
         self.register("values", 1, Rc::new(|i, a, l| i.b_values(a, l)));
         // enumerate(list) → [{index, item}, …] — índice en loops (each e in enumerate(xs)),
         // en el lenguaje Y en templates. PURO, sin capability.
@@ -2357,10 +2415,13 @@ impl Interpreter {
         self.register("upper", 1, Rc::new(|i, a, l| i.b_upper(a, l)));
         self.register("lower", 1, Rc::new(|i, a, l| i.b_lower(a, l)));
         // fold: minúsculas + sin diacríticos (matching tolerante a acentos).
-        self.register("fold", 1, Rc::new(|i, a, l| i.b_fold(a, l)));
+        self.register("fold_text", 1, Rc::new(|i, a, l| i.b_fold(a, l)));
+        self.register("fold", 1, Rc::new(|i, a, l| i.b_fold(a, l))); // deprecado → fold_text
         self.register("trim", 1, Rc::new(|i, a, l| i.b_trim(a, l)));
         self.register("starts_with", 2, Rc::new(|i, a, l| i.b_starts_with(a, l)));
         self.register("ends_with", 2, Rc::new(|i, a, l| i.b_ends_with(a, l)));
+        // v0.6.29: `replace` es el nombre (el viejo `replace_text` queda como alias hasta v1.0).
+        self.register("replace", 3, Rc::new(|i, a, l| i.b_replace_text(a, l)));
         self.register("replace_text", 3, Rc::new(|i, a, l| i.b_replace_text(a, l)));
         // strip_ansi: texto plano a partir de la salida de una terminal (secuencias
         // ESC CSI/OSC/simples y \r de retorno de carro fuera). Puro; para leer la
@@ -2405,7 +2466,13 @@ impl Interpreter {
             }),
         );
         // Regex (computación pura, sin capability)
+        // v0.6.29: la familia `regex_*` (los nombres viejos quedan deprecados hasta v1.0;
+        // `capture` conserva su forma vieja de resultado, `regex_capture` devuelve SIEMPRE
+        // una lista o `nothing`).
         self.register("matches", 2, Rc::new(|i, a, l| i.b_matches(a, l)));
+        self.register("regex_find_all", 2, Rc::new(|i, a, l| i.b_find_all(a, l)));
+        self.register("regex_capture", 2, Rc::new(|i, a, l| i.b_regex_capture(a, l)));
+        self.register("regex_replace", 3, Rc::new(|i, a, l| i.b_replace_re(a, l)));
         self.register("find_all", 2, Rc::new(|i, a, l| i.b_find_all(a, l)));
         self.register("capture", 2, Rc::new(|i, a, l| i.b_capture(a, l)));
         self.register("replace_re", 3, Rc::new(|i, a, l| i.b_replace_re(a, l)));
@@ -2431,7 +2498,10 @@ impl Interpreter {
         self.register("collect", 2, Rc::new(|i, a, l| i.b_collect(a, l)));
         self.register("transform", -1, Rc::new(|i, a, l| i.b_transform(a, l)));
         self.register("reduce", -1, Rc::new(|i, a, l| i.b_reduce(a, l)));
-        self.register("sort_by", 2, Rc::new(|i, a, l| i.b_sort_by(a, l)));
+        // v0.6.29: orden TOTAL y estable; `desc = true` invierte sin romper la estabilidad y
+        // deja los faltantes (`nothing`, NaN) al final igual.
+        self.register_builtin_named("sort_by", vec!["items", "key", "desc"], Rc::new(|i, a, l| i.b_sort_by(a, l)));
+        self.register_builtin_named("sort", vec!["items", "desc"], Rc::new(|i, a, l| i.b_sort(a, l)));
         self.register("group_by", 2, Rc::new(|i, a, l| i.b_group_by(a, l)));
         self.register("find_first", 2, Rc::new(|i, a, l| i.b_find_first(a, l)));
         self.register("every", 2, Rc::new(|i, a, l| i.b_every(a, l)));
@@ -2845,6 +2915,10 @@ impl Interpreter {
     pub fn execute(&mut self, program: &Program) -> Result<SynValue, Control> {
         // T5 (B8): nombres protegidos → error de carga, antes de correr nada.
         check_protected_names(program)?;
+        // v0.6.29: nombres que cambiaron antes de v1.0 → un aviso por stderr, una vez.
+        if let Some(first) = program.statements.first() {
+            crate::deprecated::warn_once_at_load(program, &first.location.file);
+        }
         // T5 (ronda 7): el conjunto con el que se redacta sale del AST, antes de correr nada.
         self.set_declared_principals(program);
         let r = self.execute_inner(program);
@@ -3024,6 +3098,10 @@ impl Interpreter {
                 self.check_cancel()?;
             }
             let _ = idx;
+            // Soltar el valor de la sentencia anterior ANTES de ejecutar la siguiente: si
+            // no, esa copia viva hace parecer compartida la lista que la sentencia va a
+            // modificar y el copy-on-write copiaría de más (v0.6.29).
+            drop(std::mem::replace(&mut result, SynValue::Nothing));
             result = self.exec(s, env)?;
         }
         Ok(result)
@@ -3138,6 +3216,12 @@ impl Interpreter {
                     // tasks auxiliares — el hint dice el fix exacto. Cualquier otro
                     // nombre conserva el mensaje de siempre.
                     let mut msg = format!("Undefined variable: '{}'", name);
+                    // v0.6.29 (V1-E1): reflejos de otros lenguajes → la forma de Synsema.
+                    if let Some(h) = crate::reflexes::name_hint(name) {
+                        msg.push_str(&format!(" — in Synsema: {}", h));
+                    } else if let Some(h) = crate::reflexes::statement_hint(name) {
+                        msg.push_str(&format!(" — `{}` is not a Synsema statement: {}", name, h));
+                    }
                     if matches!(
                         name.as_str(),
                         "request" | "query" | "params" | "read_body" | "read_body_bytes"
@@ -3169,89 +3253,12 @@ impl Interpreter {
                     }
                     Err(other) => return Err(other),
                 };
-                // Leer un campo de un mapa privado da un valor privado (la etiqueta del
-                // contenedor se une a la del campo).
-                let mut plabel: Option<Label> = None;
-                let obj = if self.labels && obj.is_private() {
-                    let l = labels::label(&obj);
-                    self.note_seen(&l);
-                    plabel = Some(l);
-                    labels::unwrap(&obj).clone()
-                } else {
-                    obj
-                };
-                let r = match &obj {
-                    SynValue::Map(m) => match m.borrow().get(property_name) {
-                        Some(v) => Ok(v.clone()),
-                        None => Err(err_at(format!("Map has no key '{}'", property_name), loc)),
-                    },
-                    // Valores del servidor: acceso a su dict subyacente (body/status/…).
-                    SynValue::Server(s) => match s.get_field(property_name) {
-                        Some(v) => Ok(v),
-                        None => Err(err_at(format!("Map has no key '{}'", property_name), loc)),
-                    },
-                    _ => Err(err_at(
-                        format!("Cannot access property '{}' of {}", property_name, obj.type_name()),
-                        loc,
-                    )),
-                };
-                match plabel {
-                    Some(l) => self.rewrap(r?, l, loc),
-                    None => r,
-                }
+                self.property_read(obj, property_name, loc)
             }
             NodeKind::IndexAccess { object, index } => {
                 let obj = self.exec(object, env)?;
                 let idx = self.exec(index, env)?;
-                // Contenedor o índice privados → el elemento sale con la unión.
-                let mut plabel: Option<Label> = None;
-                let (obj, idx) = if self.labels && (obj.is_private() || labels::has_label_deep(&idx)) {
-                    let l = labels::union(&labels::label(&obj), &labels::label_deep(&idx));
-                    self.note_seen(&l);
-                    plabel = Some(l);
-                    (labels::unwrap(&obj).clone(), labels::unwrap(&idx).clone())
-                } else {
-                    (obj, idx)
-                };
-                let r = match &obj {
-                    SynValue::List(l) => {
-                        let items = l.borrow();
-                        let i = num_to_i64(&idx)?;
-                        if i < 0 || i >= items.len() as i64 {
-                            return Err(err_at(
-                                format!("Index {} out of bounds (list length {})", i, items.len()),
-                                loc,
-                            ));
-                        }
-                        Ok(items[i as usize].clone())
-                    }
-                    SynValue::Map(m) => {
-                        let key = idx.to_string();
-                        match m.borrow().get(&key) {
-                            Some(v) => Ok(v.clone()),
-                            None => Err(err_at(format!("Map has no key '{}'", key), loc)),
-                        }
-                    }
-                    // `b[i]` → entero (valor del byte 0..=255). Sin índices negativos
-                    // (out-of-bounds igual que la rama List; misma forma de mensaje).
-                    SynValue::Bytes(b) => {
-                        let i = num_to_i64(&idx)?;
-                        if i < 0 || i >= b.len() as i64 {
-                            return Err(err_at(
-                                format!("Index {} out of bounds (bytes length {})", i, b.len()),
-                                loc,
-                            ));
-                        }
-                        Ok(syn_int(b[i as usize] as i64))
-                    }
-                    // `a[i]` → fila (nD) o escalar (1D). Negativo/fuera de rango → error.
-                    SynValue::Array(a) => crate::arrays::index_row(a, num_to_i64(&idx)?),
-                    _ => Err(err_at(format!("Cannot index into {}", obj.type_name()), loc)),
-                };
-                match plabel {
-                    Some(l) => self.rewrap(r?, l, loc),
-                    None => r,
-                }
+                self.index_read(obj, idx, loc)
             }
 
             // -- Operadores --
@@ -3298,11 +3305,43 @@ impl Interpreter {
                 }
                 self.exec_unary(operator, v, loc)
             }
+            NodeKind::CompareChain { operands, operators } => {
+                // `a < b < c`: cada operando una vez, corte en el primer par falso. Bajo
+                // etiquetas el booleano une las etiquetas de lo evaluado, como `and`.
+                let mut prev = self.exec(&operands[0], env)?;
+                let mut acc: Option<SynValue> = None;
+                for (op, node) in operators.iter().zip(operands[1..].iter()) {
+                    let cur = self.exec(node, env)?;
+                    let c = self.exec_binary(prev, op, cur.clone(), loc)?;
+                    let joined = match acc {
+                        Some(a) if self.labels => {
+                            self.join_operands(syn_bool(c.is_truthy()), &a, Some(&c), loc)?
+                        }
+                        _ => c,
+                    };
+                    if !joined.is_truthy() {
+                        return if self.labels {
+                            self.join_operands(syn_bool(false), &joined, None, loc)
+                        } else {
+                            Ok(syn_bool(false))
+                        };
+                    }
+                    acc = Some(joined);
+                    prev = cur;
+                }
+                Ok(acc.unwrap_or_else(|| syn_bool(true)))
+            }
             NodeKind::PipeExpression { value, transforms } => {
                 let mut v = self.exec(value, env)?;
                 for t in transforms {
-                    let func = self.exec(t, env)?;
-                    v = self.call_value(func, vec![v], loc)?;
+                    // Un paso que es una llamada recibe el valor como PRIMER argumento
+                    // (v0.6.29): `xs |> sort_by(f)` = `sort_by(xs, f)`.
+                    if let NodeKind::TaskCall { name, arguments } = &t.kind {
+                        v = self.exec_call_with_first(name, arguments, v, env, loc)?;
+                    } else {
+                        let func = self.exec(t, env)?;
+                        v = self.call_value(func, vec![v], loc)?;
+                    }
                 }
                 Ok(v)
             }
@@ -3330,6 +3369,14 @@ impl Interpreter {
                 Ok(v)
             }
             NodeKind::SetMutation { target, value } => {
+                // `set xs to append(xs, v)` / `set xs to xs + [...]` en el lugar (v0.6.29):
+                // con semántica de valor el resultado es el mismo, pero si nadie más comparte
+                // la lista no hace falta copiarla: el idioma documentado pasa a ser O(1).
+                if !self.labels {
+                    if let Some(v) = self.try_append_in_place(target, value, env)? {
+                        return Ok(v);
+                    }
+                }
                 let v = self.exec(value, env)?;
                 let escape_pc = self.labels && self.is_declassify_call(value, env);
                 let v = if self.labels && !escape_pc { self.pc_mark(v, loc)? } else { v };
@@ -3376,9 +3423,22 @@ impl Interpreter {
                 } else {
                     coll
                 };
+                // v0.6.29: un mapa se recorre por sus claves y un texto por sus caracteres
+                // (como Python); bytes, por sus valores 0..=255.
                 let items = match &coll {
                     SynValue::List(l) => l.borrow().clone(),
-                    _ => return Err(err_at(format!("Cannot iterate over {}", coll.type_name()), loc)),
+                    SynValue::Map(m) => m.borrow().keys().map(|k| syn_text(k.as_str())).collect(),
+                    SynValue::Text(t) => t.chars().map(|c| syn_text(c.to_string())).collect(),
+                    SynValue::Bytes(b) => b.iter().map(|x| syn_int(*x as i64)).collect(),
+                    _ => {
+                        return Err(err_at(
+                            format!(
+                                "Cannot iterate over {} — each walks a list, the keys of a map, the characters of a text or the values of bytes",
+                                coll.type_name()
+                            ),
+                            loc,
+                        ))
+                    }
                 };
                 // T5 (ronda 5): el frame de bucle se abre ANTES de teñir, porque un `stop` del
                 // cuerpo cae en ESTE bucle y su tinta tiene que morir con él.
@@ -3411,6 +3471,8 @@ impl Interpreter {
                         }
                     };
                     env_set(&loop_env, variable, item);
+                    // Ver `exec_block`: el valor de la vuelta anterior no debe seguir vivo.
+                    drop(std::mem::replace(&mut result, SynValue::Nothing));
                     match self.exec_block(body, &loop_env).and_then(|v| self.pc_mark(v, loc)) {
                         Ok(v) => result = v,
                         Err(Control::Stop(_)) => break,
@@ -3428,14 +3490,14 @@ impl Interpreter {
                 Ok(result)
             }
             NodeKind::WhileStatement { condition, body } => {
+                // Sin tope de iteraciones (v0.6.29): un bucle de eventos `while true` vive lo
+                // que viva el programa. Para acotarlo están `stop`, `timeout` y `agent_stop`.
                 let mut result = SynValue::Nothing;
-                let max_iter = 1_000_000;
-                let mut i = 0;
                 // T5 (ronda 5): igual que `each` — la tinta de un `stop` del cuerpo muere acá.
                 // Por eso el cuerpo ya no puede salir con `return`: el frame quedaría abierto.
                 let saved_loop = self.enter_loop();
                 let mut outcome: Result<(), Control> = Ok(());
-                while i < max_iter {
+                loop {
                     let cond = match self.exec(condition, env) {
                         Ok(v) => v,
                         Err(e) => {
@@ -3463,6 +3525,7 @@ impl Interpreter {
                     } else {
                         false
                     };
+                    drop(std::mem::replace(&mut result, SynValue::Nothing));
                     let r = self.exec_block(body, env);
                     let r = if self.labels { r.and_then(|v| self.pc_mark(v, loc)) } else { r };
                     if pushed {
@@ -3476,13 +3539,9 @@ impl Interpreter {
                             break;
                         }
                     }
-                    i += 1;
                 }
                 self.exit_loop(saved_loop);
                 outcome?;
-                if i >= max_iter {
-                    return Err(err_at("Loop exceeded maximum iterations (1,000,000)", loc));
-                }
                 Ok(result)
             }
             NodeKind::MatchStatement { value, arms, otherwise } => {
@@ -3589,6 +3648,7 @@ impl Interpreter {
                     }
                     self.arg_literals = mask;
                 }
+                check_call_arity(&func, &args, loc)?;
                 self.call_value_named(func, args, loc)
             }
             NodeKind::LambdaExpression { parameters, body } => {
@@ -4795,8 +4855,49 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         if op == "or" {
             return Ok(syn_bool(left.is_truthy() || right.is_truthy()));
         }
-        // Concatenación de texto (un operando texto coerciona el otro vía str()).
+        // `x in xs` / `x not in xs` (v0.6.29): pertenencia en lista, clave de mapa,
+        // subtexto o subsecuencia de bytes — la misma igualdad que `contains`.
+        if op == "in" || op == "not in" {
+            if let (SynValue::Text(_), other) = (&right, &left) {
+                if !matches!(other, SynValue::Text(_)) {
+                    return Err(err_at(
+                        format!(
+                            "`in` on text looks for a piece of text, got {} — convert it first: text(x) in s",
+                            other.type_name()
+                        ),
+                        loc,
+                    ));
+                }
+            }
+            if !matches!(right, SynValue::List(_) | SynValue::Map(_) | SynValue::Text(_) | SynValue::Bytes(_)) {
+                return Err(err_at(
+                    format!("`in` needs a list, map, text or bytes on its right, got {}", right.type_name()),
+                    loc,
+                ));
+            }
+            let found = self.b_contains(&[right, left], loc)?.is_truthy();
+            return Ok(syn_bool(if op == "in" { found } else { !found }));
+        }
+        // Concatenación de texto: un operando texto coerciona al otro si es un escalar
+        // (número, bool). `nothing`, listas, mapas y bytes son error (v0.6.29): pegarlos
+        // en silencio daba "xnothing" o un repr que nadie quería.
         if op == "+" {
+            if matches!(left, SynValue::Text(_)) != matches!(right, SynValue::Text(_)) {
+                let other = if matches!(left, SynValue::Text(_)) { &right } else { &left };
+                if matches!(
+                    other,
+                    SynValue::Nothing | SynValue::List(_) | SynValue::Map(_) | SynValue::Bytes(_)
+                ) {
+                    return Err(err_at(
+                        format!(
+                            "Cannot add text and {} — convert it on purpose: text(x), or interpolate it: `...{{x}}`{}",
+                            other.type_name(),
+                            if matches!(other, SynValue::Bytes(_)) { " (for bytes: hex(b) or decode(b, \"utf8\"))" } else { "" }
+                        ),
+                        loc,
+                    ));
+                }
+            }
             // Propagación de taint (#10): si algún operando es `secret`, el resultado
             // es `secret` (sigue redactado). Esta es UNA comprobación de discriminante
             // que en código sin secretos es siempre falsa → rama no-tomada, coste
@@ -4883,6 +4984,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         Ok(None) => Err(err_at("Modulo by zero", loc)),
                     }
                 }
+                "//" => {
+                    return match a.checked_floor_div(b) {
+                        Err(e) => Err(err_at(e, loc)),
+                        Ok(Some(n)) => Ok(syn_number(n)),
+                        Ok(None) => Err(err_at("Division by zero", loc)),
+                    }
+                }
                 "**" => {
                     if a.is_zero() && b.is_negative() {
                         return Err(err_at("Zero cannot be raised to a negative power", loc));
@@ -4967,7 +5075,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 Ok(value)
             }
             NodeKind::PropertyAccess { property_name, object, .. } => {
-                let obj = self.exec(object, env)?;
+                let obj = self.exec_place(object, env)?;
                 // Escritura a través de un contenedor privado o bajo PC (ver
                 // `set_through_labels`): la etiqueta vive en la variable raíz del camino.
                 let (obj, value) = if self.labels && (obj.is_private() || !self.pc_is_empty()) {
@@ -4984,7 +5092,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
             }
             NodeKind::IndexAccess { object, index } => {
-                let obj = self.exec(object, env)?;
+                let obj = self.exec_place(object, env)?;
                 let idx = self.exec(index, env)?;
                 // Índice/clave privado, contenedor privado o PC → `set_through_labels`
                 // Decide (el caso central: `set state["balances"][to] to x` con `state` y
@@ -5075,6 +5183,304 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             ),
             loc,
         ))
+    }
+
+    /// Lectura de un campo (`m.k`, `k of m`): la misma para una expresión y para el
+    /// camino de un `set` (`exec_place`).
+    fn property_read(&mut self, obj: SynValue, property_name: &str, loc: &SourceLocation) -> Result<SynValue, Control> {
+        // Leer un campo de un mapa privado da un valor privado (la etiqueta del
+        // contenedor se une a la del campo).
+        let mut plabel: Option<Label> = None;
+        let obj = if self.labels && obj.is_private() {
+            let l = labels::label(&obj);
+            self.note_seen(&l);
+            plabel = Some(l);
+            labels::unwrap(&obj).clone()
+        } else {
+            obj
+        };
+        let r = match &obj {
+            SynValue::Map(m) => match m.borrow().get(property_name) {
+                Some(v) => Ok(v.clone()),
+                None => Err(err_at(format!("Map has no key '{}'", property_name), loc)),
+            },
+            // Valores del servidor: acceso a su dict subyacente (body/status/…).
+            SynValue::Server(s) => match s.get_field(property_name) {
+                Some(v) => Ok(v),
+                None => Err(err_at(format!("Map has no key '{}'", property_name), loc)),
+            },
+            _ => {
+                let mut msg = format!("Cannot access property '{}' of {}", property_name, obj.type_name());
+                // `xs.append(y)`: Synsema no tiene métodos, tiene funciones.
+                if let Some(h) = crate::reflexes::method_hint(property_name) {
+                    msg.push_str(&format!(" — Synsema has no methods: {}", h));
+                }
+                Err(err_at(msg, loc))
+            }
+        };
+        match plabel {
+            Some(l) => self.rewrap(r?, l, loc),
+            None => r,
+        }
+    }
+
+    /// Lectura de un índice (`xs[i]`, `m[k]`, `s[i]`, `b[i]`, `a[i]`): la misma para una
+    /// expresión y para el camino de un `set` (`exec_place`).
+    fn index_read(&mut self, obj: SynValue, idx: SynValue, loc: &SourceLocation) -> Result<SynValue, Control> {
+        // Contenedor o índice privados → el elemento sale con la unión.
+        let mut plabel: Option<Label> = None;
+        let (obj, idx) = if self.labels && (obj.is_private() || labels::has_label_deep(&idx)) {
+            let l = labels::union(&labels::label(&obj), &labels::label_deep(&idx));
+            self.note_seen(&l);
+            plabel = Some(l);
+            (labels::unwrap(&obj).clone(), labels::unwrap(&idx).clone())
+        } else {
+            (obj, idx)
+        };
+        let r = match &obj {
+            // Índices negativos cuentan desde el final (v0.6.29): `xs[-1]`.
+            SynValue::List(l) => {
+                let items = l.borrow();
+                let i = num_to_i64(&idx)?;
+                match resolve_index(i, items.len()) {
+                    Some(j) => Ok(items[j].clone()),
+                    None => Err(err_at(
+                        format!("Index {} out of bounds (list length {})", i, items.len()),
+                        loc,
+                    )),
+                }
+            }
+            // `s[i]` → un carácter (scalar Unicode, lo mismo que cuenta `length`).
+            SynValue::Text(t) => {
+                let i = num_to_i64(&idx)?;
+                let n = t.chars().count();
+                match resolve_index(i, n) {
+                    Some(j) => Ok(syn_text(t.chars().nth(j).unwrap().to_string())),
+                    None => Err(err_at(
+                        format!("Index {} out of bounds (text length {})", i, n),
+                        loc,
+                    )),
+                }
+            }
+            SynValue::Map(m) => {
+                let key = idx.to_string();
+                match m.borrow().get(&key) {
+                    Some(v) => Ok(v.clone()),
+                    None => Err(err_at(format!("Map has no key '{}'", key), loc)),
+                }
+            }
+            // `b[i]` → entero (valor del byte 0..=255); negativos desde el final.
+            SynValue::Bytes(b) => {
+                let i = num_to_i64(&idx)?;
+                match resolve_index(i, b.len()) {
+                    Some(j) => Ok(syn_int(b[j] as i64)),
+                    None => Err(err_at(
+                        format!("Index {} out of bounds (bytes length {})", i, b.len()),
+                        loc,
+                    )),
+                }
+            }
+            // `a[i]` → fila (nD) o escalar (1D). Negativo/fuera de rango → error.
+            SynValue::Array(a) => crate::arrays::index_row(a, num_to_i64(&idx)?),
+            _ => Err(err_at(format!("Cannot index into {}", obj.type_name()), loc)),
+        };
+        match plabel {
+            Some(l) => self.rewrap(r?, l, loc),
+            None => r,
+        }
+    }
+
+    /// Evalúa el CAMINO de un `set x[i].k to v` haciendo único cada contenedor que
+    /// atraviesa (v0.6.29, semántica de valor con copy-on-write): si otra variable, un
+    /// parámetro o un elemento comparte la lista o el mapa, se copia ese nivel —y sólo
+    /// ése— antes de escribir. Así `let ys be xs` + `set ys[0] to 9` no toca `xs`, y un
+    /// task que escribe en el mapa que recibió no cambia el del que llamó. Sin otro dueño
+    /// no se copia nada. Devuelve lo mismo que `exec` sobre ese nodo.
+    fn exec_place(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        match &node.kind {
+            NodeKind::Identifier { name } => {
+                // Un módulo (`use … as d`) es un ESPACIO DE NOMBRES, no un dato: `set d.STATE[k]`
+                // escribe el estado del módulo, que ven sus tasks. Ni el mapa del módulo ni sus
+                // exportaciones directas se copian.
+                if let Some(v) = env_get(env, name) {
+                    if self.is_module_map(&v) {
+                        return Ok(v);
+                    }
+                }
+                if let Some(v) = env_with_binding_mut(env, name, |slot| {
+                    make_unique(slot);
+                    slot.clone()
+                }) {
+                    return Ok(v);
+                }
+                self.exec(node, env)
+            }
+            NodeKind::PropertyAccess { property_name, object, .. } if self.place_is_module(object, env) => {
+                let parent = self.exec_place(object, env)?;
+                self.property_read(parent, property_name, loc)
+            }
+            NodeKind::IndexAccess { object, index } => {
+                let parent = self.exec_place(object, env)?;
+                let idx = self.exec(index, env)?;
+                match labels::unwrap(&parent) {
+                    SynValue::List(l) => {
+                        if let Ok(i) = num_to_i64(labels::unwrap(&idx)) {
+                            let mut items = l.borrow_mut();
+                            let n = items.len();
+                            if let Some(j) = resolve_index(i, n) {
+                                make_unique(&mut items[j]);
+                            }
+                        }
+                    }
+                    SynValue::Map(m) => {
+                        let key = labels::unwrap(&idx).to_string();
+                        if let Some(slot) = m.borrow_mut().get_mut(&key) {
+                            make_unique(slot);
+                        }
+                    }
+                    _ => {}
+                }
+                self.index_read(parent, idx, loc)
+            }
+            NodeKind::PropertyAccess { property_name, object, .. } => {
+                let parent = self.exec_place(object, env)?;
+                if let SynValue::Map(m) = labels::unwrap(&parent) {
+                    if let Some(slot) = m.borrow_mut().get_mut(property_name) {
+                        make_unique(slot);
+                    }
+                }
+                self.property_read(parent, property_name, loc)
+            }
+            _ => self.exec(node, env),
+        }
+    }
+
+    /// ¿Es `v` el mapa de exportaciones de un módulo cargado?
+    /// Bajo `run` es un valor de `module_cache`; en un worker (`parallel_map`, `serve`) el
+    /// alias se reconstruye, y se reconoce como allá (`serve::module_env_of`): tiene tasks que
+    /// cierran sobre un `module_env` y TODAS sus claves son nombres de ese módulo.
+    fn is_module_map(&self, v: &SynValue) -> bool {
+        let SynValue::Map(m) = v else { return false };
+        if self.module_cache.values().any(|mv| matches!(mv, SynValue::Map(x) if Rc::ptr_eq(x, m))) {
+            return true;
+        }
+        let map = m.borrow();
+        let env = map.values().find_map(|v| match v {
+            SynValue::Task(t) if t.closure_env.borrow().name.starts_with("module:") => Some(t.closure_env.clone()),
+            _ => None,
+        });
+        match env {
+            Some(e) => {
+                let e = e.borrow();
+                map.keys().all(|k| e.bindings.contains_key(k))
+            }
+            None => false,
+        }
+    }
+
+    /// ¿El nodo es un identificador ligado a un módulo? (sin evaluar nada con efectos)
+    fn place_is_module(&self, node: &Node, env: &Rc<RefCell<Environment>>) -> bool {
+        match &node.kind {
+            NodeKind::Identifier { name } => env_get(env, name).is_some_and(|v| self.is_module_map(&v)),
+            _ => false,
+        }
+    }
+
+    /// Camino rápido de `set x to append(x, v)` y `set x to x + <lista>`: agrega en la
+    /// lista de `x` (copiándola antes sólo si otro la comparte) en vez de construir una
+    /// nueva. `None` si la sentencia no tiene esa forma y va por el camino normal.
+    fn try_append_in_place(
+        &mut self,
+        target: &Node,
+        value: &Node,
+        env: &Rc<RefCell<Environment>>,
+    ) -> Result<Option<SynValue>, Control> {
+        let NodeKind::Identifier { name: tn } = &target.kind else { return Ok(None) };
+        let is_var = |n: &Node| matches!(&n.kind, NodeKind::Identifier { name } if name == tn);
+        // ¿`x` es hoy una lista?
+        let is_list = matches!(env_get(env, tn), Some(SynValue::List(_)));
+        if !is_list {
+            return Ok(None);
+        }
+        let extra: Vec<SynValue> = match &value.kind {
+            NodeKind::TaskCall { name, arguments }
+                if arguments.len() == 2
+                    && arguments.iter().all(|a| a.name.is_none())
+                    && is_var(&arguments[0].value)
+                    && name.as_identifier() == Some("append") =>
+            {
+                // Tiene que ser EL builtin (un task del usuario puede llamarse append).
+                match env_get(env, "append") {
+                    Some(SynValue::Builtin(b)) if b.name == "append" => {}
+                    _ => return Ok(None),
+                }
+                vec![self.exec(&arguments[1].value, env)?]
+            }
+            NodeKind::BinaryOp { left, operator, right } if operator == "+" && is_var(left) => {
+                match self.exec(right, env)? {
+                    SynValue::List(r) => r.borrow().clone(),
+                    other => {
+                        // No era concatenación de listas: terminar por el camino normal con
+                        // el lado derecho ya evaluado (no se evalúa dos veces).
+                        let l = env_get(env, tn).unwrap_or(SynValue::Nothing);
+                        let v = self.exec_binary(l, "+", other, &value.location)?;
+                        return self.exec_set(target, v, env, &target.location, false).map(Some);
+                    }
+                }
+            }
+            _ => return Ok(None),
+        };
+        let out = env_with_binding_mut(env, tn, |slot| {
+            if !matches!(slot, SynValue::List(_)) {
+                return None;
+            }
+            make_unique(slot);
+            if let SynValue::List(rc) = slot {
+                rc.borrow_mut().extend(extra);
+            }
+            Some(slot.clone())
+        });
+        match out.flatten() {
+            Some(v) => Ok(Some(v)),
+            None => Err(err_at(format!("'{}' stopped being a list while computing the value", tn), &value.location)),
+        }
+    }
+
+    /// Paso de un pipe que es una llamada: `v |> f(a, b = c)` = `f(v, a, b = c)`
+    /// (v0.6.29). Mismo camino que `TaskCall`, con el valor entubado como primer
+    /// posicional (nunca un literal del fuente para la regla 3.a de etiquetas).
+    fn exec_call_with_first(
+        &mut self,
+        name: &Node,
+        arguments: &[crate::ast::Arg],
+        first: SynValue,
+        env: &Rc<RefCell<Environment>>,
+        loc: &SourceLocation,
+    ) -> Result<SynValue, Control> {
+        let func = self.exec(name, env)?;
+        if let Some(id) = name.as_identifier() {
+            if PROTECTED_BUILTIN_NAMES.contains(&id) {
+                check_protected_callee(id, &func, loc)?;
+            }
+        }
+        let mut args = Vec::with_capacity(arguments.len() + 1);
+        args.push((None, first));
+        for arg in arguments {
+            let val = self.exec(&arg.value, env)?;
+            args.push((arg.name.clone(), val));
+        }
+        if self.labels {
+            let mut mask = 0u32;
+            for (i, arg) in arguments.iter().enumerate().take(31) {
+                if is_literal_expr(&arg.value) {
+                    mask |= 1 << (i + 1);
+                }
+            }
+            self.arg_literals = mask;
+        }
+        check_call_arity(&func, &args, loc)?;
+        self.call_value_named(func, args, loc)
     }
 
     /// Llamada con args sólo posicionales (camino de siempre: pipes, apply/where,
@@ -5173,7 +5579,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         for (name, v) in args {
                             if let Some(n) = name {
                                 return Err(err_at(
-                                    format!("builtin '{}' does not accept named arguments", n),
+                                    format!(
+                                        "{}() does not accept named arguments (got {} = …); pass it by position",
+                                        bt.name, n
+                                    ),
                                     loc,
                                 ));
                             }
@@ -5365,6 +5774,17 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         if let Some(hook) = &self.log_hook {
             hook(&s);
         }
+        // `synsema run` (camino normal) imprime cada línea al momento (v0.6.29): un script
+        // largo ya no parece colgado. `test`, `serve`, `conform` y los informes JSON siguen
+        // juntando la salida en `output`.
+        if LIVE_STDOUT.load(std::sync::atomic::Ordering::Relaxed) {
+            use std::io::Write;
+            let out = std::io::stdout();
+            let mut lock = out.lock();
+            let _ = writeln!(lock, "{}", s);
+            let _ = lock.flush();
+            return Ok(SynValue::Nothing);
+        }
         self.output.push(s);
         Ok(SynValue::Nothing)
     }
@@ -5433,13 +5853,93 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     0.0
                 }
             }
-            SynValue::Text(s) => match s.trim().parse::<f64>() {
-                Ok(x) => x,
-                Err(_) => return bail(v),
-            },
+            SynValue::Text(s) => {
+                // Un texto ENTERO fuera de ±2⁵³ no entra exacto en un float: antes se
+                // redondeaba sin avisar (`"123456789012345678901"` → …683968). Ahora es
+                // un error que nombra a `int` (v0.6.29).
+                if let Some(n) = parse_int_text(s) {
+                    let big = n.as_bigint().unwrap();
+                    let limit = num_bigint::BigInt::from(1u64 << 53);
+                    if big > limit || big < -limit {
+                        return match args.get(1) {
+                            Some(d) => Ok(d.clone()),
+                            None => Err(err(format!(
+                                "number({:?}) would lose digits: a float is exact only up to 2^53. Use int(x) for an exact integer",
+                                s.trim()
+                            ))),
+                        };
+                    }
+                }
+                match s.trim().parse::<f64>() {
+                    Ok(x) => x,
+                    Err(_) => return bail(v),
+                }
+            }
             _ => return bail(v),
         };
         Ok(syn_float(f))
+    }
+
+    /// `int(x)` → entero EXACTO, o error; `int(x, default)` es la forma total (v0.6.29).
+    /// Acepta un entero, un float/decimal con valor entero y texto: decimal con signo
+    /// (`"-42"`, `"1_000"`) o `0x…`/`0b…` (ceros a la izquierda permitidos: un topic viene
+    /// rellenado a 32 bytes). No trunca nunca: `int(1.5)` y `int("1.5")` son error.
+    fn b_int(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        let v = nth(args, 0)?;
+        let n = match v {
+            SynValue::Number(n @ (Number::Int(_) | Number::Big(_))) => n.clone(),
+            SynValue::Number(Number::Float(x)) => {
+                if !x.is_finite() || x.fract() != 0.0 {
+                    return Err(err(format!(
+                        "int({}): not a whole number — round it on purpose first: floor(x), round(x) or trunc(x)",
+                        crate::number::py_float_str(*x)
+                    )));
+                }
+                Number::integer_from_f64(*x)
+            }
+            SynValue::Number(d @ Number::Decimal(_)) => match d.as_bigint() {
+                Some(b) => Number::from_bigint(b),
+                None => {
+                    return Err(err(format!(
+                        "int({}): not a whole number — round it on purpose first: floor(x), round(x) or trunc(x)",
+                        d
+                    )))
+                }
+            },
+            SynValue::Text(s) => parse_int_text(s).ok_or_else(|| {
+                err(format!(
+                    "Cannot convert {:?} to an integer: expected digits with an optional sign, or 0x…/0b…. To validate untrusted input without raising: int(x, nothing)",
+                    s.as_ref()
+                ))
+            })?,
+            SynValue::Bytes(_) => {
+                return Err(err("int() does not read bytes; use bytes_to_int(b) (big-endian, unsigned)"))
+            }
+            other => return Err(err(format!("Cannot convert {} to an integer", other.type_name()))),
+        };
+        Ok(syn_number(n.normalized()))
+    }
+
+    /// `hex(x)` → texto `0x…` (v0.6.29). Un entero ≥ 0 da una **cantidad** (dígitos
+    /// mínimos, `hex(0)` = `"0x0"`, la forma del JSON-RPC); bytes dan un **dato** (dos
+    /// dígitos por byte, con los ceros). `int(hex(n)) == n` y `bytes(hex(b), "hex") == b`.
+    fn b_hex(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        match nth(args, 0)? {
+            SynValue::Number(n @ (Number::Int(_) | Number::Big(_))) => {
+                let b = n.as_bigint().unwrap();
+                if b.sign() == num_bigint::Sign::Minus {
+                    return Err(err(format!("hex({}): negative numbers have no hex quantity form", n)));
+                }
+                Ok(syn_text(format!("0x{}", b.to_str_radix(16))))
+            }
+            SynValue::Number(n) => Err(err(format!(
+                "hex() takes an integer or bytes, got {} — convert on purpose first: hex(int(x))",
+                n
+            ))),
+            SynValue::Bytes(b) => Ok(syn_text(format!("0x{}", crate::bytesutil::hex_encode(b)))),
+            SynValue::Secret(_) => Err(err("hex(): a secret is never shown")),
+            other => Err(err(format!("hex() takes an integer or bytes, got {}", other.type_name()))),
+        }
     }
 
     /// `decimal(x)` → Decimal exacto. `decimal("1234.56")`/`decimal(int)` exactos;
@@ -5514,7 +6014,21 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 let enc = bytes_encoding_arg(args)?;
                 match enc.as_deref().unwrap_or("utf8") {
                     "utf8" => Ok(syn_bytes(s.as_bytes().to_vec())),
-                    "hex" => crate::bytesutil::hex_decode(s).map(syn_bytes).map_err(err),
+                    // `0x`/`0X` opcional (v0.6.29): es como lo devuelve todo RPC.
+                    "hex" => {
+                        let h = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+                        crate::bytesutil::hex_decode(h).map(syn_bytes).map_err(|e| {
+                            if e.contains("odd") {
+                                err(format!(
+                                    "{} — an odd number of hex digits is a quantity, not bytes: int({:?})",
+                                    e,
+                                    s.as_ref()
+                                ))
+                            } else {
+                                err(e)
+                            }
+                        })
+                    }
                     "base64" => crate::bytesutil::b64_decode(s).map(syn_bytes).map_err(err),
                     // Web auth: base64url (RFC 4648 §5, URL-safe `-_`); acepta con y
                     // sin padding — la forma de JWT/tokens.
@@ -5793,6 +6307,76 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 Ok(syn_list(v))
             }
             _ => Err(err("First argument to append must be a list")),
+        }
+    }
+
+    /// `get(m, key)` / `get(m, key, default)` y `get(xs, i, default)`: el índice que no
+    /// falla. Sin default, lo que falta es `nothing`.
+    fn b_get(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        if args.len() < 2 || args.len() > 3 {
+            return Err(err(format!("get(collection, key, default?) takes 2 or 3 arguments, got {}", args.len())));
+        }
+        let default = args.get(2).cloned().unwrap_or(SynValue::Nothing);
+        match &args[0] {
+            SynValue::Map(m) => Ok(m.borrow().get(&args[1].to_string()).cloned().unwrap_or(default)),
+            SynValue::List(l) => {
+                let i = num_to_i64(&args[1])?;
+                let items = l.borrow();
+                Ok(resolve_index(i, items.len()).map(|j| items[j].clone()).unwrap_or(default))
+            }
+            SynValue::Server(sv) => Ok(sv.get_field(&args[1].to_string()).unwrap_or(default)),
+            other => Err(err(format!("get() reads a map or a list, got {}", other.type_name()))),
+        }
+    }
+
+    /// `remove(m, key)` → un mapa nuevo sin esa clave (si no estaba, igual al original).
+    fn b_remove(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        match nth(args, 0)? {
+            SynValue::Map(m) => {
+                let mut copy = m.borrow().clone();
+                copy.shift_remove(&nth(args, 1)?.to_string());
+                Ok(SynValue::Map(Rc::new(RefCell::new(copy))))
+            }
+            other => Err(err(format!("remove() takes a map, got {} — for a list use where(xs, …) or slice", other.type_name()))),
+        }
+    }
+
+    /// `merge(a, b, …)` → un mapa nuevo; ante la misma clave gana el de más a la derecha.
+    fn b_merge(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        if args.is_empty() {
+            return Err(err("merge() needs at least one map"));
+        }
+        let mut out: IndexMap<String, SynValue> = IndexMap::new();
+        for (i, a) in args.iter().enumerate() {
+            match a {
+                SynValue::Map(m) => {
+                    for (k, v) in m.borrow().iter() {
+                        out.insert(k.clone(), v.clone());
+                    }
+                }
+                other => {
+                    return Err(err(format!("merge(): argument {} is {}, not a map", i + 1, other.type_name())))
+                }
+            }
+        }
+        Ok(syn_map(out))
+    }
+
+    /// `items(m)` → `[{key, value}, …]` en orden de inserción (la forma de `enumerate`).
+    fn b_items(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        match nth(args, 0)? {
+            SynValue::Map(m) => Ok(syn_list(
+                m.borrow()
+                    .iter()
+                    .map(|(k, v)| {
+                        let mut e = IndexMap::new();
+                        e.insert("key".to_string(), syn_text(k.as_str()));
+                        e.insert("value".to_string(), v.clone());
+                        syn_map(e)
+                    })
+                    .collect(),
+            )),
+            other => Err(err(format!("items() takes a map, got {}", other.type_name()))),
         }
     }
 
@@ -6113,16 +6697,55 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
     }
 
+    /// `fmt(template, values)`: reemplaza cada `{nombre}` por su valor. Un `{nombre}` sin
+    /// valor es error (v0.6.29: antes quedaba tal cual, en silencio). `{{` y `}}` escriben
+    /// una llave literal; una llave que no rodea un nombre queda como está (JSON, CSS).
     fn b_fmt(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
-        let mut template = raw_str(nth(args, 0)?);
-        if args.len() > 1 {
-            if let SynValue::Map(m) = &args[1] {
-                for (k, v) in m.borrow().iter() {
-                    template = template.replace(&format!("{{{}}}", k), &v.to_string());
+        let template = raw_str(nth(args, 0)?);
+        let values = match args.get(1) {
+            None | Some(SynValue::Nothing) => None,
+            Some(SynValue::Map(m)) => Some(m.borrow().clone()),
+            Some(other) => return Err(err(format!("fmt(template, values): values must be a map, got {}", other.type_name()))),
+        };
+        let chars: Vec<char> = template.chars().collect();
+        let mut out = String::with_capacity(template.len());
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '{' && chars.get(i + 1) == Some(&'{') {
+                out.push('{');
+                i += 2;
+                continue;
+            }
+            if c == '}' && chars.get(i + 1) == Some(&'}') {
+                out.push('}');
+                i += 2;
+                continue;
+            }
+            if c == '{' {
+                let mut j = i + 1;
+                while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                if j > i + 1 && chars.get(j) == Some(&'}') {
+                    let name: String = chars[i + 1..j].iter().collect();
+                    match values.as_ref().and_then(|m| m.get(&name)) {
+                        Some(v) => out.push_str(&v.to_string()),
+                        None => {
+                            return Err(err(format!(
+                                "fmt: no value for {{{}}} — pass it in the map, or write {{{{{}}}}} for a literal brace",
+                                name, name
+                            )))
+                        }
+                    }
+                    i = j + 1;
+                    continue;
                 }
             }
+            out.push(c);
+            i += 1;
         }
-        Ok(syn_text(template))
+        Ok(syn_text(out))
     }
 
     fn b_upper(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -6253,6 +6876,28 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let re = compile_re(&pat)?;
         let out: Vec<SynValue> = re.find_iter(&text).map(|m| syn_text(m.as_str())).collect();
         Ok(syn_list(out))
+    }
+
+    /// `regex_capture(text, re)` → SIEMPRE una lista (los grupos; sin grupos, `[match]`) o
+    /// `nothing` si no hay coincidencia. Un grupo opcional que no participó es `nothing`.
+    fn b_regex_capture(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        let text = raw_str(nth(args, 0)?);
+        let pat = raw_str(nth(args, 1)?);
+        let re = compile_re(&pat)?;
+        match re.captures(&text) {
+            None => Ok(SynValue::Nothing),
+            Some(caps) => {
+                let ngroups = re.captures_len() - 1;
+                if ngroups == 0 {
+                    return Ok(syn_list(vec![syn_text(caps.get(0).unwrap().as_str())]));
+                }
+                Ok(syn_list(
+                    (1..=ngroups)
+                        .map(|i| caps.get(i).map(|m| syn_text(m.as_str())).unwrap_or(SynValue::Nothing))
+                        .collect(),
+                ))
+            }
+        }
     }
 
     fn b_capture(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -6571,13 +7216,25 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 
     fn b_sort_by(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         let (key_func, items) = self.dual_fn_list(args, "sort_by")?;
+        let desc = desc_flag(args.get(2), "sort_by")?;
         let mut keyed: Vec<(SynValue, SynValue)> = Vec::with_capacity(items.len());
         for it in items {
             let k = self.call_value(key_func.clone(), vec![it.clone()], loc)?;
             keyed.push((k, it));
         }
-        keyed.sort_by(|(ka, _), (kb, _)| sort_cmp(ka, kb));
+        let keys: Vec<SynValue> = keyed.iter().map(|(k, _)| k.clone()).collect();
+        check_orderable(&keys, "sort_by")?;
+        keyed.sort_by(|(ka, _), (kb, _)| order_for(ka, kb, desc));
         Ok(syn_list(keyed.into_iter().map(|(_, v)| v).collect()))
+    }
+
+    /// `sort(xs)` / `sort(xs, desc = true)`: orden total y estable de los valores mismos.
+    fn b_sort(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        let mut items = self.list_arg(nth(args, 0)?, "sort")?;
+        let desc = desc_flag(args.get(1), "sort")?;
+        check_orderable(&items, "sort")?;
+        items.sort_by(|a, b| order_for(a, b, desc));
+        Ok(syn_list(items))
     }
 
     fn b_group_by(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -6698,6 +7355,20 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// `find_first`/`resume_point`): un `-1` usado como índice sin chequear es un bug
     /// silencioso; `nothing` como índice falla ruidoso.
     fn b_index_of(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        // v0.6.29: también texto — la posición (en caracteres, como `length` y `s[i]`) de
+        // la primera aparición, o `nothing`.
+        if let SynValue::Text(hay) = nth(args, 0)? {
+            let needle = match nth(args, 1)? {
+                SynValue::Text(t) => t.clone(),
+                other => {
+                    return Err(err(format!("index_of(text, …) looks for a piece of text, got {}", other.type_name())))
+                }
+            };
+            return Ok(match hay.find(needle.as_ref()) {
+                Some(byte_pos) => syn_int(hay[..byte_pos].chars().count() as i64),
+                None => SynValue::Nothing,
+            });
+        }
         let items = self.list_arg(nth(args, 0)?, "index_of")?;
         let needle = nth(args, 1)?.clone();
         if is_callable(&needle) {
@@ -7120,10 +7791,223 @@ fn raw_str(v: &SynValue) -> String {
     }
 }
 
+/// Un índice, posición o paso: tiene que ser ENTERO (v0.6.29). `2.0` vale; `1.7` es
+/// error en vez de truncarse en silencio a 1.
+/// Copy-on-write de UN nivel (v0.6.29): si la lista o el mapa de `slot` tiene otro dueño,
+/// `slot` pasa a apuntar a una copia propia (los elementos se comparten; cada nivel se
+/// copia recién cuando alguien escribe en él). Un valor privado se copia por dentro y
+/// conserva su etiqueta.
+fn make_unique(slot: &mut SynValue) {
+    match slot {
+        SynValue::List(rc) if Rc::strong_count(rc) > 1 => {
+            let copy = rc.borrow().clone();
+            *slot = SynValue::List(Rc::new(RefCell::new(copy)));
+        }
+        SynValue::Map(rc) if Rc::strong_count(rc) > 1 => {
+            let copy = rc.borrow().clone();
+            *slot = SynValue::Map(Rc::new(RefCell::new(copy)));
+        }
+        SynValue::Private(p) => {
+            let shared_inner = match &p.value {
+                SynValue::List(rc) => Rc::strong_count(rc) > 1,
+                SynValue::Map(rc) => Rc::strong_count(rc) > 1,
+                _ => false,
+            };
+            if shared_inner || (Rc::strong_count(p) > 1 && matches!(p.value, SynValue::List(_) | SynValue::Map(_))) {
+                // Copia del contenedor interno aunque su cuenta sea 1 cuando el envoltorio
+                // está compartido: el alias ve el mismo Rc interno.
+                let inner = match &p.value {
+                    SynValue::List(rc) => SynValue::List(Rc::new(RefCell::new(rc.borrow().clone()))),
+                    SynValue::Map(rc) => SynValue::Map(Rc::new(RefCell::new(rc.borrow().clone()))),
+                    other => other.clone(),
+                };
+                *slot = SynValue::Private(Rc::new(labels::Labelled { value: inner, label: p.label.clone() }));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Acceso MUTABLE al binding de `name` (el scope más cercano que lo tiene).
+fn env_with_binding_mut<R>(
+    env: &Rc<RefCell<Environment>>,
+    name: &str,
+    f: impl FnOnce(&mut SynValue) -> R,
+) -> Option<R> {
+    let mut cur = env.clone();
+    loop {
+        let next = {
+            let mut e = cur.borrow_mut();
+            if let Some(slot) = e.bindings.get_mut(name) {
+                return Some(f(slot));
+            }
+            e.parent.clone()
+        };
+        match next {
+            Some(p) => cur = p,
+            None => return None,
+        }
+    }
+}
+
+/// Aridad ESTRICTA de una llamada escrita en el programa (v0.6.29): un argumento de más
+/// o un parámetro sin default que falta es error, en tasks, lambdas y builtins. Antes el
+/// extra se descartaba en silencio (`append([1], 2, 3)` perdía el 3, `trim(s, "x")`
+/// ignoraba la "x") y el faltante llegaba como `nothing`.
+///
+/// Sólo para llamadas del fuente: el host (rutas de `serve`, handlers, cron) y los
+/// builtins que invocan callbacks (`apply`, `where`, `reduce`, …) siguen pasando lo que
+/// tienen y el callback declara lo que usa.
+fn check_call_arity(
+    func: &SynValue,
+    args: &[(Option<String>, SynValue)],
+    loc: &SourceLocation,
+) -> Result<(), Control> {
+    let positional = args.iter().filter(|(n, _)| n.is_none()).count();
+    match func {
+        SynValue::Task(t) => {
+            let np = t.parameters.len();
+            let who = if t.name == "<lambda>" { "this lambda".to_string() } else { format!("task '{}'", t.name) };
+            if positional > np {
+                return Err(err_at(
+                    format!(
+                        "{} takes {} argument{}, got {}",
+                        who,
+                        np,
+                        if np == 1 { "" } else { "s" },
+                        positional
+                    ),
+                    loc,
+                ));
+            }
+            for (i, p) in t.parameters.iter().enumerate() {
+                let given = i < positional || args.iter().any(|(n, _)| n.as_deref() == Some(p.name.as_str()));
+                if !given && p.default.is_none() {
+                    return Err(err_at(
+                        format!(
+                            "{} is missing argument '{}' — pass it, or give the parameter a default in the task: {} = …",
+                            who, p.name, p.name
+                        ),
+                        loc,
+                    ));
+                }
+            }
+            Ok(())
+        }
+        SynValue::Builtin(b) => {
+            let (min, max) = builtin_arity(b);
+            let n = match &b.param_names {
+                // Con nombres: cuenta el slot más alto ocupado.
+                Some(names) => {
+                    let mut hi = positional;
+                    for (nm, _) in args {
+                        if let Some(nm) = nm {
+                            if let Some(i) = names.iter().position(|p| *p == nm.as_str()) {
+                                hi = hi.max(i + 1);
+                            }
+                        }
+                    }
+                    hi
+                }
+                None => positional,
+            };
+            if let Some(max) = max {
+                if n > max {
+                    return Err(err_at(
+                        format!(
+                            "{}() takes at most {} argument{}, got {}",
+                            b.name,
+                            max,
+                            if max == 1 { "" } else { "s" },
+                            n
+                        ),
+                        loc,
+                    ));
+                }
+            }
+            // El MÍNIMO lo valida cada builtin (sus mensajes dicen qué falta y por qué:
+            // `declassify` pide un motivo, un constructor cuenta campos); si no lo hace, el
+            // "missing argument" genérico sale con el nombre del builtin (`dispatch_builtin`).
+            let _ = min;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `(mínimo, máximo)` de argumentos de un builtin: la tabla `BUILTIN_ARITY` manda; si
+/// no está, un `param_count` fijo es exacto y -1 no se valida acá (el builtin lo hace).
+fn builtin_arity(b: &BuiltinTask) -> (usize, Option<usize>) {
+    if let Some((_, min, max)) = crate::builtin_arity::BUILTIN_ARITY.iter().find(|(n, _, _)| *n == b.name) {
+        return (*min, *max);
+    }
+    if b.param_count >= 0 {
+        (b.param_count as usize, Some(b.param_count as usize))
+    } else {
+        (0, None)
+    }
+}
+
+/// Texto → entero exacto: decimal con signo opcional (`_` sólo entre dígitos) o
+/// `0x…`/`0b…` sin signo. Espacios alrededor se recortan. `None` si no es eso.
+fn parse_int_text(s: &str) -> Option<Number> {
+    let t = s.trim();
+    let clean = |d: &str| -> Option<String> {
+        if d.is_empty() || d.starts_with('_') || d.ends_with('_') || d.contains("__") {
+            return None;
+        }
+        Some(d.chars().filter(|c| *c != '_').collect())
+    };
+    for (prefix, radix) in [("0x", 16), ("0X", 16), ("0b", 2), ("0B", 2)] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            let d = clean(rest)?;
+            if !d.chars().all(|c| c.is_digit(radix)) {
+                return None;
+            }
+            return num_bigint::BigInt::parse_bytes(d.as_bytes(), radix).map(Number::from_bigint);
+        }
+    }
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let d = clean(body)?;
+    if !d.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let b: num_bigint::BigInt = d.parse().ok()?;
+    Some(Number::from_bigint(if neg { -b } else { b }))
+}
+
 fn num_to_i64(v: &SynValue) -> Result<i64, Control> {
     match v {
-        SynValue::Number(n) => n.to_i64_trunc().ok_or_else(|| err("number too large for index")),
-        _ => Err(err(format!("expected a number, got {}", v.type_name()))),
+        SynValue::Number(n) => {
+            let integral = match n {
+                Number::Float(x) => x.fract() == 0.0,
+                Number::Decimal(d) => d.fract().is_zero(),
+                _ => true,
+            };
+            if !integral {
+                return Err(err(format!(
+                    "index must be an integer, got {} — use floor(x), round(x) or trunc(x) on purpose",
+                    n
+                )));
+            }
+            n.to_i64_trunc().ok_or_else(|| err("number too large for an index"))
+        }
+        _ => Err(err(format!("an index must be an integer, got {}", v.type_name()))),
+    }
+}
+
+/// Posición real de un índice que puede ser negativo (`-1` = el último), o `None` si
+/// queda fuera de `0..len`.
+fn resolve_index(i: i64, len: usize) -> Option<usize> {
+    let len = len as i64;
+    let j = if i < 0 { i + len } else { i };
+    if (0..len).contains(&j) {
+        Some(j as usize)
+    } else {
+        None
     }
 }
 
@@ -7158,6 +8042,108 @@ fn ord_op(ord: Option<Ordering>, op: &str) -> bool {
     }
 }
 
+/// Rango de "faltante" en el orden total: 0 = valor, 1 = NaN, 2 = `nothing`. Los
+/// faltantes van al FINAL tanto ascendente como descendente (como pandas `na_position`).
+fn missing_rank(v: &SynValue) -> u8 {
+    match labels::unwrap(v) {
+        SynValue::Nothing => 2,
+        SynValue::Number(Number::Float(x)) if x.is_nan() => 1,
+        _ => 0,
+    }
+}
+
+/// Clase de tipo para ordenar: sólo se ordenan entre sí valores de la misma clase.
+fn order_class(v: &SynValue) -> Option<&'static str> {
+    match labels::unwrap(v) {
+        SynValue::Number(_) => Some("number"),
+        SynValue::Text(_) => Some("text"),
+        SynValue::Bool(_) => Some("bool"),
+        SynValue::Bytes(_) => Some("bytes"),
+        SynValue::List(_) => Some("list"),
+        _ => None,
+    }
+}
+
+/// Orden TOTAL del lenguaje (v0.6.29, DATOS-1): números exactos (entero vs float sin pasar
+/// por f64), texto por punto de código, `false < true`, bytes y listas lexicográficos.
+/// Llamar sólo después de `check_orderable` (clases compatibles).
+pub(crate) fn total_cmp(a: &SynValue, b: &SynValue) -> Ordering {
+    let (a, b) = (labels::unwrap(a), labels::unwrap(b));
+    match (missing_rank(a), missing_rank(b)) {
+        (0, 0) => {}
+        (x, y) => return x.cmp(&y),
+    }
+    match (a, b) {
+        (SynValue::Number(x), SynValue::Number(y)) => x.partial_cmp_num(y).unwrap_or(Ordering::Equal),
+        (SynValue::Text(x), SynValue::Text(y)) => x.as_ref().cmp(y.as_ref()),
+        (SynValue::Bool(x), SynValue::Bool(y)) => x.cmp(y),
+        (SynValue::Bytes(x), SynValue::Bytes(y)) => x.as_ref().cmp(y.as_ref()),
+        (SynValue::List(x), SynValue::List(y)) => {
+            let (x, y) = (x.borrow(), y.borrow());
+            for (p, q) in x.iter().zip(y.iter()) {
+                let c = total_cmp(p, q);
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+        _ => Ordering::Equal,
+    }
+}
+
+/// Comparación para ordenar con dirección: los faltantes quedan al final en ambas.
+fn order_for(a: &SynValue, b: &SynValue, desc: bool) -> Ordering {
+    let (ma, mb) = (missing_rank(a), missing_rank(b));
+    if ma != 0 || mb != 0 {
+        return ma.cmp(&mb);
+    }
+    let c = total_cmp(a, b);
+    if desc {
+        c.reverse()
+    } else {
+        c
+    }
+}
+
+/// Error claro si los valores no se pueden ordenar juntos (texto con números, mapas…),
+/// en vez de dejar la lista como vino (lo que hacía `sort_by` hasta v0.6.28).
+fn check_orderable(vals: &[SynValue], who: &str) -> Result<(), Control> {
+    let mut class: Option<&'static str> = None;
+    for v in vals {
+        if missing_rank(v) != 0 {
+            continue;
+        }
+        let c = order_class(v).ok_or_else(|| {
+            err(format!("{}: a {} has no order — sort by a key that is a number, text, bool, bytes or list", who, labels::unwrap(v).type_name()))
+        })?;
+        if let (SynValue::Number(Number::Decimal(_)), Some("number")) = (labels::unwrap(v), class) {
+            // Decimal con Float se rechaza igual que en `<`.
+            if vals.iter().any(|w| matches!(labels::unwrap(w), SynValue::Number(Number::Float(x)) if !x.is_nan())) {
+                return Err(err(format!("{}: {}", who, MIX_DECIMAL_FLOAT)));
+            }
+        }
+        match class {
+            None => class = Some(c),
+            Some(k) if k != c => {
+                return Err(err(format!("{}: cannot order {} and {} together — make the key one type", who, k, c)))
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// El argumento `desc` de `sort`/`sort_by`: ausente o `nothing` = ascendente.
+fn desc_flag(v: Option<&SynValue>, who: &str) -> Result<bool, Control> {
+    match v {
+        None | Some(SynValue::Nothing) => Ok(false),
+        Some(SynValue::Bool(b)) => Ok(*b),
+        Some(other) => Err(err(format!("{}: desc must be true or false, got {}", who, other.type_name()))),
+    }
+}
+
+#[allow(dead_code)]
 fn sort_cmp(a: &SynValue, b: &SynValue) -> Ordering {
     match (a, b) {
         (SynValue::Number(x), SynValue::Number(y)) => x.partial_cmp_num(y).unwrap_or(Ordering::Equal),
@@ -7480,13 +8466,16 @@ mod lambda_tests {
     }
 
     #[test]
-    fn lambda_missing_arg_binds_nothing() {
-        assert_eq!(out("let f be (a, b) => b\nprint(text(f(5)))"), vec!["nothing"]);
+    fn lambda_missing_arg_is_an_error() {
+        // v0.6.29: una llamada escrita a una lambda cumple la misma aridad que un task.
+        let r = run_source("let f be (a, b) => b\nprint(text(f(5)))", "<test>");
+        assert!(!r.success && r.errors.iter().any(|e| e.contains("missing argument 'b'")), "{:?}", r.errors);
     }
 
     #[test]
-    fn lambda_extra_args_ignored() {
-        assert_eq!(out("let f be (x) => x\nprint(text(f(1, 2, 3)))"), vec!["1"]);
+    fn lambda_extra_args_are_an_error() {
+        let r = run_source("let f be (x) => x\nprint(text(f(1, 2, 3)))", "<test>");
+        assert!(!r.success && r.errors.iter().any(|e| e.contains("takes 1 argument, got 3")), "{:?}", r.errors);
     }
 
     #[test]

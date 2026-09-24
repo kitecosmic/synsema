@@ -44,15 +44,13 @@ fn g2_top_identifier_compares_by_value() {
 // =========================================================
 
 #[test]
-fn g3_permissive_arity_preserved() {
-    // f(1) a task f(a, b): no error; b = nothing.
-    assert_output("task f(a, b)\n    give a\nprint(text(f(1)))", &["1"]);
-    assert_output(
-        "task showb(a, b)\n    give b\nlet r be showb(1)\nprint(text(r == nothing))",
-        &["true"],
-    );
-    // Posicional extra se descarta (sin error), como antes.
-    assert_output("task g(a)\n    give a\nprint(text(g(7, 8, 9)))", &["7"]);
+fn strict_arity_replaces_g3() {
+    // v0.6.29: la aridad permisiva (G3) se fue. Un parámetro sin default que falta y un
+    // posicional de más son error, con el nombre del task y lo que esperaba.
+    assert_error_contains("task f(a, b)\n    give a\nprint(text(f(1)))", "missing argument 'b'");
+    assert_error_contains("task g(a)\n    give a\nprint(text(g(7, 8, 9)))", "takes 1 argument, got 3");
+    // Con default, omitirlo sigue siendo válido.
+    assert_output("task h(a, b = nothing)\n    give b\nprint(text(h(1) == nothing))", &["true"]);
 }
 
 // =========================================================

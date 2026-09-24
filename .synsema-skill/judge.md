@@ -28,8 +28,8 @@ let v be judge ticket
             } or nothing
     anger:  rate "How frustrated is the customer?" across ["Calm", "Frustrated", "Very angry"]
 
-when v.team.available and confidence of v.team >= 0.8
-    print("route to " + v.team.choice)
+when v.team.available and v.team.choice != nothing and confidence of v.team >= 0.8
+    print("route to " + v.team.choice)        -- text + nothing is an error (v0.6.29+): guard the escape
 otherwise
     approve "Route this ticket to " + text(v.team.choice) + "?"
 ```
@@ -70,8 +70,9 @@ v.anger.confidence      -- 0..1
 ```
 
 `confidence of v.team` works too (property access via `of`). The field is `kind`, not `type`, and the
-escape key is `none`, not `nothing`: `type` and `nothing` are reserved words, so `v.x.type` and
-`v.x.probabilities.nothing` do not parse.
+escape key is `none`, not `nothing` (chosen when those reserved words could not follow a `.`; since
+v0.6.29 `v.x.type` parses, but there is no such field — it is `kind`, and the escape is
+`probabilities.none`).
 
 **Options as a list or a map, one rule for both verbs.** A list: each item is the id *and* the
 description. A map: the key is your short id, the value is the description the model reads. Use the

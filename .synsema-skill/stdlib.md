@@ -189,8 +189,8 @@ let results be parallel_map(watch, thousands_of_urls)   -- N workers × 1 conn e
   handler to multiplex several outbound WS on its thread.
 - **`eth_subscribe` (newHeads/logs) is composable in userland today:** `ws_connect` to the
   node's WS endpoint, `ws_send` the JSON-RPC subscribe frame, `ws_recv`/`ws_select` the
-  notifications (parse with `json_decode`); one-shot reads go through the typed read-side
-  (stdlib.md § Blockchain) instead.
+  notifications (parse with `json_decode`; decode each log with `abi_decode_log`); one-shot reads
+  go through the typed read-side (`evm_logs`, `evm_receipt` — stdlib.md § Blockchain) instead.
 
 ## Web Push (installable apps notify their users — engine v0.6.15+)
 
@@ -427,7 +427,7 @@ task cosine(a, b)
 let q be array(query_embedding)                  -- from an embeddings API (http_post) or a model (run)
 let rows be sql("SELECT title, emb FROM docs")   -- pre-filter by metadata in SQL if you want
 let scored be apply((r) => {"title": r["title"], "score": cosine(to_vec(r["emb"]), q)}, rows)
-let top be sort_by(scored, (x) => 0 - x["score"])  -- best first
+let top be sort_by(scored, (x) => x["score"], desc = true)  -- best first
 ```
 For real ANN at scale: delegate to a server that does vectors (pgvector via a Postgres HTTP API, or
 ClickHouse over HTTP) and query it with `fetch` — the index runs server-side, no in-process extension.
@@ -519,48 +519,78 @@ JSON-RPC, no hex-quantity bugs. Reading/sending is `net(host)`-gated (same capab
 as `http_*`); ONLY signing moves value — a monitor agent with `net` can read everything
 and spend nothing.
 
+**Names follow `<family>_<action>`** (v0.6.29+): `evm_*` (every EVM chain — Ethereum, Avalanche C,
+L2s), `solana_*`, `algorand_*`, `btc_*`; the action is `tx` (build the bytes to sign), `tx_raw`
+(assemble the signed tx), `send`, `wait`, `address`. The old names (`eth_nonce`, `tx_eip1559`,
+`solana_message`, `solana_confirm`, `algorand_tx_encode`, `algo_address`…) still run as deprecated
+aliases until v1.0 and `synsema check` warns — table in [builtins.md](builtins.md) § Renamed in
+v0.6.29. JSON-RPC **method** names passed to `evm_rpc` stay as the node spells them (`"eth_call"`,
+`"eth_getLogs"`).
+
 ```
 require net("rpc.example.com")
 require sign("HOT_KEY")   -- signing is deny-by-default + audited (NOT ambient)
 let k be as_secret("<hex>", "HOT_KEY")   -- or secret("HOT_KEY") from .env
 let url be "https://rpc.example.com"
 
--- ETH end-to-end: read → build (tx_eip1559) → sign → assemble → send → confirm
-let nonce be eth_nonce(url, eth_address(k))      -- eth_getTransactionCount ("pending")
-let fees be eth_fee_history(url)                 -- {base_fee, priority, base_fees, rewards}
-let tx be tx_eip1559({"chain_id": eth_chain_id(url), "nonce": nonce,
-    "to": dest, "value": 100000000000000000, "gas": 21000,
+-- EVM end-to-end: read → build (evm_tx) → sign → assemble → send → confirm
+let nonce be evm_nonce(url, evm_address(k))      -- eth_getTransactionCount ("pending")
+let fees be evm_fee_history(url)                 -- {base_fee, priority, base_fees, rewards}
+let tx be evm_tx({"chain_id": evm_chain_id(url), "nonce": nonce,
+    "to": dest, "value": 10**17, "gas": 21000,   -- 0.1 ETH in wei: 10**17, never 1e17 (a float)
     "max_fee": fees["base_fee"] * 2, "max_priority": fees["priority"]})
--- tx echoes every value-moving number (tx["max_fee"], tx["value"], tx["to"]) —
+-- tx echoes every value-moving number (tx.max_fee, tx.value, tx.to) —
 -- show them in a `confirm` BEFORE signing (anti blind-signing, extended to fees)
-let sig be secp256k1_sign(tx["digest"], k)       -- bytes(65) r‖s‖v; RFC6979, low-s
-let raw be tx_eip1559_raw(tx, sig)               -- assembles 0x02||rlp(...+[v,r,s]) for you
-let hash be eth_send_raw(url, raw)               -- "0x…" tx hash (net-gated: already signed)
-let receipt be eth_wait_receipt(url, hash, 1, 120)  -- bounded poll; nothing on timeout
+let sig be secp256k1_sign(tx.digest, k)          -- bytes(65) r‖s‖v (v = 0/1); RFC6979, low-s
+let raw be evm_tx_raw(tx, sig)                   -- assembles 0x02||rlp(...+[v,r,s]) for you
+let hash be evm_send(url, raw)                   -- "0x…" tx hash (net-gated: already signed)
+let receipt be evm_wait(url, hash, 1, 120)       -- bounded poll; nothing on timeout
 -- receipt["status"] == 1 → success; 0 → REVERTED (it landed but failed — always check)
 
--- read contract state: eth_call returns RAW bytes → abi_decode
+-- read contract state: evm_call returns RAW bytes → abi_decode
 let calldata be abi_encode("balanceOf(address)", [owner])
-let bal be abi_decode("uint256", eth_call(url, {"to": token, "data": calldata}))[0]
+let bal be abi_decode("uint256", evm_call(url, {"to": token, "data": calldata}))[0]
 let d712 be eip712_digest(domain, types, "Permit", permit_map)  -- readable maps in
+let wallet_sig be evm_signature(secp256k1_sign(d712, k))       -- v = 27/28: what permit/ecrecover want
+
+-- deploy a contract: evm_tx_create computes where it lands and checks the signer
+let me be evm_address(k)
+let init be bytecode + abi_encode("(address,uint256)", [owner, 10**24])  -- constructor args, no selector
+let ctx be evm_tx_create({"chain_id": evm_chain_id(url), "nonce": evm_nonce(url, me),
+    "from": me, "value": 0, "gas": 1500000,
+    "max_fee": fees["base_fee"] * 2, "max_priority": fees["priority"], "data": init})
+print(ctx.contract_address)                      -- == evm_create_address(me, ctx.nonce), EIP-55
+let dh be evm_send(url, evm_tx_raw(ctx, secp256k1_sign(ctx.digest, k)))  -- errors if the signer is not `from`
+
+-- events: logs → maps by parameter name
+let transfer be {"name": "Transfer", "inputs": [
+    {"name": "from", "type": "address", "indexed": true},
+    {"name": "to", "type": "address", "indexed": true},
+    {"name": "value", "type": "uint256", "indexed": false}]}   -- the fragment from the contract's ABI JSON
+let head be evm_block_number(url)
+let logs be evm_logs(url, {"address": token, "topics": [abi_event_topic(transfer)],
+    "fromBlock": hex(head - 1000), "toBlock": "latest"})
+each lg in logs
+    let ev be abi_decode_log(transfer, lg)       -- {from, to, value}
+    print(ev.from + " → " + ev.to + ": " + text(ev.value))
 
 -- Solana end-to-end: blockhash → message → ed25519_sign → tx → send → confirm
-let bh be solana_latest_blockhash(url)           -- bytes(32), feeds solana_message directly
-let msg be solana_message({"fee_payer": payer, "recent_blockhash": bh,
+let bh be solana_latest_blockhash(url)           -- bytes(32), feeds solana_tx directly
+let msg be solana_tx({"fee_payer": payer, "recent_blockhash": bh,
     "instructions": [{"program": "11111111111111111111111111111111",
         "accounts": [{"pubkey": payer, "signer": true, "writable": true},
                      {"pubkey": dest_pk, "writable": true}],
         "data": int_to_bytes_le(2, 4) + int_to_bytes_le(lamports, 8)}]})
-let stx be solana_tx(msg, ed25519_sign(msg, k))
+let stx be solana_tx_raw(msg, ed25519_sign(msg, k))
 let signature be solana_send(url, stx)           -- base58 signature text
-let status be solana_confirm(url, signature, 60) -- waits confirmed/finalized; nothing on timeout
+let status be solana_wait(url, signature, 60)    -- waits confirmed/finalized; nothing on timeout
 -- status["err"] == nothing → success; anything else = landed but FAILED on-chain
 
 -- Algorand end-to-end: params → canonical msgpack → sign → send (BINARY) → wait
 let p be algorand_params(url)   -- {fee (PER-BYTE, often 0), min_fee (flat), fv, lv, gh, gen}
-let txn be {"type": "pay", "snd": algo_address(k), "rcv": rcv, "amt": 123456,
+let txn be {"type": "pay", "snd": algorand_address(k), "rcv": rcv, "amt": 123456,
     "fee": p["min_fee"], "fv": p["fv"], "lv": p["lv"], "gh": p["gh"], "gen": p["gen"]}
-let stx be algorand_tx(txn, ed25519_sign(algorand_tx_encode(txn), k))
+let stx be algorand_tx_raw(txn, ed25519_sign(algorand_tx(txn), k))
 let txid be algorand_send(url, stx)              -- POSTs application/x-binary for you
 let info be algorand_wait(url, txid, 60)         -- info["confirmed-round"]; nothing on timeout
 ```
@@ -574,9 +604,9 @@ NEVER materialize); the phrase and passphrase come IN as secrets.
 require wallet                                   -- creating custody (separate from `sign`)
 let phrase be mnemonic_generate(12, "W")         -- secret: 12 words, OS entropy (not seedable)
 let seed be mnemonic_to_seed(phrase)             -- secret: 64-byte BIP-39 seed (optional passphrase)
-let ethk be hd_derive(seed, "m/44'/60'/0'/0/0")  -- secret: BIP-32 secp256k1 (default) → use with eth_address/secp256k1_sign
+let ethk be hd_derive(seed, "m/44'/60'/0'/0/0")  -- secret: BIP-32 secp256k1 (default) → use with evm_address/secp256k1_sign
 let solk be hd_derive(seed, "m/44'/501'/0'/0'", "ed25519")  -- secret: SLIP-0010 (Solana; hardened-only)
-print(eth_address(ethk))                         -- derive the PUBLIC address (no gate)
+print(evm_address(ethk))                         -- derive the PUBLIC address (no gate)
 -- Algorand phrase is its OWN 25-word format (NOT BIP-39):
 let am be algorand_mnemonic(algo_secret32)       -- secret: 25 words (Pera/Defly format)
 let ak be algorand_mnemonic_to_key(am)           -- secret: back to the 32-byte key
@@ -626,31 +656,44 @@ let raw2 be psbt_finalize(signed_psbt)            -- → btc_send (the key never
 **Read-side / RPC builtins (all `net(host)`-gated; a node is UNTRUSTED input — every
 decode is strict, malformed/oversized/hostile responses → catchable error, never silent
 bad data; errors name the host only, never the full URL — API keys live in the path):**
-- EVM JSON-RPC: `eth_rpc(url, method, params?)` (escape hatch: ints→hex-quantity,
-  bytes→`0x…`, result as decoded JSON); `eth_nonce(url, addr)`; `eth_balance(url, addr, block?)`
-  → exact wei int; `eth_gas_price(url)`; `eth_chain_id(url)`; `eth_estimate_gas(url, tx_map)`;
-  `eth_call(url, {to, data}, block?)` → RAW bytes (feed `abi_decode`);
-  `eth_fee_history(url, blocks?, percentiles?)` → `{base_fee, priority, base_fees, rewards}`
-  (base_fee = NEXT block; priority = median of the first percentile column; raw arrays
-  included — the derivation is transparent, not an oracle); `eth_send_raw(url, raw)` → `"0x…"`
-  hash; `eth_receipt(url, hash)` → typed receipt map or `nothing`;
-  `eth_wait_receipt(url, hash, confirmations?, timeout?)` → receipt after N confs or `nothing`.
-  Receipt decoding is typed: quantities→int, addresses→EIP-55 text, hashes→`"0x…"` text,
-  log `data`→bytes.
+- EVM JSON-RPC: `evm_rpc(url, method, params?)` (escape hatch: ints→hex-quantity,
+  bytes→`0x…`, result as decoded JSON; `method` = the node's name, `"eth_…"`);
+  `evm_block_number(url)` → int; `evm_nonce(url, addr, block?)` (default `"pending"`);
+  `evm_balance(url, addr, block?)` → exact wei int; `evm_gas_price(url)`; `evm_chain_id(url)`;
+  `evm_estimate_gas(url, tx_map)`; `evm_call(url, {to, data}, block?)` → RAW bytes (feed
+  `abi_decode`); `evm_fee_history(url, blocks?, percentiles?)` → `{base_fee, priority, base_fees,
+  rewards}` (base_fee = NEXT block; priority = median of the first percentile column; raw arrays
+  included — the derivation is transparent, not an oracle); `evm_send(url, raw)` → `"0x…"`
+  hash; `evm_receipt(url, hash)` → typed receipt map or `nothing`;
+  `evm_wait(url, hash, confirmations?, timeout?)` → receipt after N confs or `nothing`;
+  `evm_logs(url, filter)` → logs decoded like receipt logs (filter = wire names, validated:
+  `address` one or a list, `topics` list — each `"0x…"`/bytes32, `nothing` = any, a list = OR —
+  and `fromBlock`/`toBlock` **or** `blockHash`, not both). A `block` argument is `"latest"`
+  (default) / `"earliest"`/`"pending"`/`"safe"`/`"finalized"` / a number / the node's own
+  `"0x…"` quantity (validated canonical, ≤ 256 bits — so `hex(n)` and a value read from the node
+  both work). Receipt decoding is typed: quantities→int, addresses→EIP-55 text, hashes→`"0x…"`
+  text, log `data`→bytes.
 - **EVM L2s work out of the box** (Base, Optimism, Arbitrum, Polygon — same JSON-RPC wire):
-  point the `url` at the L2's RPC and READ the chain id with `eth_chain_id(url)` (never
-  hardcode it). One honest caveat: on OP-stack chains (Base/Optimism) `eth_estimate_gas`
+  point the `url` at the L2's RPC and READ the chain id with `evm_chain_id(url)` (never
+  hardcode it). One honest caveat: on OP-stack chains (Base/Optimism) `evm_estimate_gas`
   covers only the L2 execution — the total cost adds an L1 DATA fee that arrives in the
   receipt as `l1Fee`/`l1GasUsed`/`l1GasPrice` (decoded to exact ints): total paid =
   `gasUsed × effectiveGasPrice + l1Fee`. Arbitrum folds its L1 component into `gasUsed`
   instead (no extra field).
-- EIP-1559 builders (PURE): `tx_eip1559(params)` with `{chain_id, nonce, to, value, gas,
+- EIP-1559 builders (PURE): `evm_tx(params)` with `{chain_id, nonce, to, value, gas,
   max_fee, max_priority, data?, access_list?}` — EVERY value-moving field explicit (no
-  silent defaults; a missing field errors naming the reader helper) → `{digest, fields,
-  + echo of every number}`; `tx_eip1559_raw(tx, sig65)` → signed raw bytes (v/r/s handled).
+  silent defaults; a missing field errors naming the reader helper; no `to` → error pointing
+  to `evm_tx_create`) → `{digest, fields, + echo of every number}`; `evm_tx_raw(tx, sig65)` →
+  signed raw bytes (v/r/s handled).
+- Contract creation (PURE): `evm_tx_create({chain_id, nonce, from, value, gas, max_fee,
+  max_priority, data, access_list?})` → the `evm_tx` map with `to: nothing` + `from` +
+  `contract_address` (EIP-55). `to` → error; empty `data` → error; `data` > 49 152 bytes
+  (EIP-3860) → error. `evm_tx_raw` on it recovers the signer and errors if it isn't `from`.
+  `evm_create_address(sender, nonce)` / `evm_create2_address(deployer, salt32,
+  init_code_hash32)` → EIP-55 text (CREATE / EIP-1014 CREATE2, pure).
 - Solana RPC: `solana_rpc(url, method, params?)` (escape hatch, plain JSON params);
   `solana_latest_blockhash(url)` → bytes(32); `solana_balance(url, pubkey)` → lamports int;
-  `solana_send(url, tx_bytes)` → base58 signature; `solana_confirm(url, sig, timeout?)` →
+  `solana_send(url, tx_bytes)` → base58 signature; `solana_wait(url, sig, timeout?)` →
   status map (`err`, `confirmation_status`, `slot`) or `nothing`;
   `spl_balance(url, owner, mint, token_program?)` → `{amount, decimals, ata}` — a missing
   ATA is a catchable ERROR, never a silent 0 (a wrong owner/mint would read 0 forever).
@@ -673,9 +716,9 @@ Builtins:
 - Encoding (pure): `bytes(t, "base58"|"base32")` / `decode(b, …)`; `bech32_encode(hrp, data, variant?)` / `bech32_decode(text)` → `{hrp, data, variant}`.
 - secp256k1: `secp256k1_sign(digest32, secret)` [**require sign**], `secp256k1_verify(digest, sig, pubkey)`, `secp256k1_recover(digest, sig65)`, `secp256k1_pubkey(secret, compressed?)`.
 - ed25519: `ed25519_sign(message, secret)` [**require sign**], `ed25519_verify(msg, sig, pubkey)`, `ed25519_pubkey(secret)`.
-- EVM (pure): `eth_address(pubkey_or_secret)` → EIP-55 text; `rlp_encode(value)` / `rlp_decode(bytes)`; `abi_encode(sig, values)` / `abi_decode(types, data)` / `abi_selector(sig)`; `eip191_digest(message)`; `eip712_digest(domain, types, primary, message)`.
-- Solana (pure): `solana_message(params)` (legacy + `"version": 0`; `lookup_tables` → error) / `solana_tx(msg, sigs)`; `int_to_bytes_le(n, size)` for instruction data; `solana_pda(seeds, program)` → `{address, bump}`; `spl_ata(owner, mint, token_program?)`; `spl_transfer_data(amount)` / `spl_transfer_checked_data(amount, decimals)`.
-- Algorand (pure): `algorand_tx_encode(txn)` / `algorand_tx(txn, sig)` / `algo_address(pubkey_or_secret)`; TXID = `decode(sha512_256(algorand_tx_encode(txn)), "base32")`.
+- EVM (pure): `evm_address(x)` → EIP-55 text (`x` = pubkey, key secret, 20 raw bytes or `"0x…"` text); `evm_create_address` / `evm_create2_address`; `evm_signature(sig)` → v = 27/28; `rlp_encode(value)` / `rlp_decode(bytes)`; `abi_encode(sig, values)` (selector + args) / `abi_encode(types, values)` (no selector — constructor args; inverse of `abi_decode`) / `abi_decode(types, data)` / `abi_selector(sig)`; `abi_event_topic(sig_or_fragment)` → `"0x…"` text; `abi_decode_log(event_fragment, log, default?)` → map by parameter name; `eip191_digest(message)`; `eip712_digest(domain, types, primary, message)`.
+- Solana (pure): `solana_tx(params)` (legacy + `"version": 0`; `lookup_tables` → error) / `solana_tx_raw(msg, sigs)`; `int_to_bytes_le(n, size)` for instruction data; `solana_pda(seeds, program)` → `{address, bump}`; `spl_ata(owner, mint, token_program?)`; `spl_transfer_data(amount)` / `spl_transfer_checked_data(amount, decimals)`.
+- Algorand (pure): `algorand_tx(txn)` (bytes to sign) / `algorand_tx_raw(txn, sig)` / `algorand_address(pubkey_or_secret)`; TXID = `decode(sha512_256(algorand_tx(txn)), "base32")`.
 - Bitcoin (pure): `hash160(x)` → bytes(20); `btc_address(pubkey_or_secret, kind?, network?)` (`"p2wpkh"` default | `"p2tr"` | `"p2pkh"`; networks mainnet/testnet/signet/regtest); `btc_address_decode(text)` → `{kind, network, program, encoding}` (BIP-350 strict); `btc_script(address)` → scriptPubKey bytes; `btc_txid(raw)` → hex (byte-reversed); `schnorr_sign(digest32, secret, "taproot"?)` [**require sign**] / `schnorr_verify(digest32, sig64, xonly32)` / `schnorr_pubkey(secret)`; `btc_tx(params)` → `{digests, fee, vsize, + echo}` (G28) / `btc_tx_raw(tx, signatures)`; `psbt_encode(tx)` / `psbt_decode(text, network?)` / `psbt_finalize(text)`.
 - Bitcoin read-side [**require net**]: `btc_utxos(url, addr)`, `btc_balance(url, addr)`, `btc_fee_estimates(url)`, `btc_send(url, raw)`, `btc_wait(url, txid, confs?, timeout?)`, `btc_rpc(url, method, params?, auth?)` (`auth.pass` may be a secret). `wif_import(text, label?)` [**require wallet**] → secret (no reverse export). HD: `hd_derive(seed, "m/84'/0'/0'/0/0")` BIP-84 / `"m/86'/0'/0'/0/0"` BIP-86 → `btc_address`.
 - HD custody [**require wallet**]: `mnemonic_generate(words?, label?)`, `mnemonic_to_seed(mnemonic, passphrase?)`, `mnemonic_from_entropy(entropy, label?)` / `mnemonic_to_entropy(mnemonic)`, `hd_derive(seed, path, curve?, label?)` (`"secp256k1"` default | `"ed25519"` SLIP-0010), `algorand_mnemonic(secret32)` / `algorand_mnemonic_to_key(mnemonic, label?)`, `keystore_import(json, passphrase, label?)` / `keystore_export(secret, passphrase, opts?)` (`opts` = `{"kdf": "scrypt"|"pbkdf2", "n", "r", "p", "c"}`; defaults = Geth scrypt n=262144). ALL return a `secret`; `label?` names it (default: a derived name like `W.seed` / `W/path` — what `wallet`/`sign`/`reveal` scopes match).
@@ -685,21 +728,22 @@ Builtins:
 - ed25519 signs the RAW message (hashes internally, RFC 8032) — do NOT pre-hash.
   secp256k1 takes a 32-byte digest; ed25519 takes the message.
 - The recovery byte `v` has two conventions. `secp256k1_sign` returns the RAW one, 0/1 (go-ethereum
-  `crypto.Sign`, libsecp256k1, typed EIP-1559 txs — `tx_eip1559_raw` wants exactly that). Anything a
+  `crypto.Sign`, libsecp256k1, typed EIP-1559 txs — `evm_tx_raw` wants exactly that). Anything a
   CONTRACT verifies — `ecrecover`, OpenZeppelin `ECDSA.recover`, an EIP-2612 `permit`, an EIP-712
   authorization — and every wallet (MetaMask / ethers / viem `personal_sign`, `signTypedData`) uses
-  27/28. Add 27 before handing a Synsema signature to a contract; subtract 27 from a wallet's signature
-  before `secp256k1_recover` (it accepts 0..3 only; `secp256k1_verify` ignores `v`). One line each way:
-  `slice(sig, 0, 64) + bytes([sig[64] + 27])`.
+  27/28: `evm_signature(sig)` converts (idempotent; any other `v` → error). The other way needs
+  nothing: `secp256k1_recover` accepts 0, 1, 27 and 28 (v ≥ 35 — a legacy EIP-155 value — is an
+  error that says so); `secp256k1_verify` ignores `v`. (≤ v0.6.28: add/subtract 27 by hand,
+  `slice(sig, 0, 64) + bytes([sig[64] + 27])`.)
 - In the signed tx, r/s are RLP **integers** (minimal, leading zeros stripped), NOT
   32-byte blobs — pasting `slice(sig, 0, 32)` raw makes ~1 in 128 txs invalid.
-  `tx_eip1559_raw(tx, sig)` handles v/r/s for you; hand-rolling, use
+  `evm_tx_raw(tx, sig)` handles v/r/s for you; hand-rolling, use
   `bytes_to_int(slice(sig, 0, 32))`; `int_to_bytes(n, 32)` restores the fixed width.
 - An RPC node is UNTRUSTED input: it can lie, be compromised, or return garbage. The
   read-side decodes strictly (a non-canonical hex-quantity, a wrong shape, a >16 MiB
   response → catchable error) — but WHICH node you trust is your decision; Synsema
   gives you the primitive, not the trust.
-- Broadcasting (`eth_send_raw`/`solana_send`/`algorand_send`) is `net`-gated, NOT
+- Broadcasting (`evm_send`/`solana_send`/`algorand_send`/`btc_send`) is `net`-gated, NOT
   `sign`-gated: the signature already happened upstream and without a valid one the
   node rejects the bytes. That split is useful: a read-only monitor agent holds `net`
   but not `sign` and cannot spend.
@@ -708,9 +752,12 @@ Builtins:
 - Algorand's suggested `fee` is PER BYTE (often 0); the real flat minimum is
   `min_fee` (1000 µAlgo). Confusing them = rejected tx or overpaid fee — that's why
   `algorand_params` returns BOTH.
-- `tx_eip1559` has NO fee/gas defaults on purpose: every value-moving field is
+- `evm_tx` has NO fee/gas defaults on purpose: every value-moving field is
   explicit (read it from the chain or state it) and echoed back in the result map —
   show the numbers in a `confirm` BEFORE `secp256k1_sign(tx["digest"], k)`.
+- Deploying is `evm_tx_create`, not `evm_tx` without `to`: it computes `contract_address`
+  from `from` + `nonce` and `evm_tx_raw` refuses a signature from any other account — the
+  address you print is the one the chain will use (given the right nonce).
 - Strict by default: `rlp_decode` rejects non-canonical encodings (like Ethereum's
   decoders); `ed25519_verify` is verify-strict (rejects small-order keys — what the
   chains reject). If either says no, the input is malformed, not the builtin.
@@ -723,15 +770,21 @@ Builtins:
 - ABI signatures are CANONICAL: no spaces, no parameter names — `"transfer(address,uint256)"`.
   A malformed signature = a different selector = a silent call to a nonexistent function;
   `abi_encode`/`abi_selector` reject it (and normalize `uint`→`uint256`).
-- uint256 amounts need EXACT integers — big int literals just work; floats are rejected
-  (`1e24` as a float is not exact money).
+- uint256 amounts need EXACT integers — big int literals just work; floats are rejected.
+  `1e24` IS a float literal (like Python) — write `10**24`; from text, `int("…")` (also
+  `int("0x…")` for a node's quantity). Divide amounts with `//` (exact), never `/` (a float).
+- `hex(n)` is the node's quantity form (`"0x1f18"`, `"0x0"`, no leading zeros); `hex(b)` the data
+  form (every byte). `bytes("0x…", "hex")` accepts the prefix; an odd-length `"0x9"` is a
+  quantity → `int("0x9")`. `json_decode` keeps a uint256 in JSON exact.
 - Algorand msgpack is CANONICAL: keys sorted bytewise and zero/empty/false fields OMITTED
   (`amt: 0` disappears — that's what the network requires; otherwise the TXID differs).
 - Solana does NOT keep your account order: fee payer first, then writable signers,
   ro signers, writable non-signers, ro non-signers (buckets sorted by pubkey bytes,
   matching the official SDK). The compiled indices point at the reordered table.
 - v0 Solana messages carry the 0x80 version prefix and the signature COVERS it —
-  `solana_message({..., "version": 0})` already includes it; just `ed25519_sign` the bytes.
+  `solana_tx({..., "version": 0})` already includes it; just `ed25519_sign` the bytes.
+- Solana PDA/ATA addresses stay **bytes** (`solana_pda(...).address`, `spl_ata(...)`) on
+  purpose: they re-enter as seeds and account keys. `decode(b, "base58")` to show one.
 - Custody (`require wallet`) is SEPARATE from signing (`require sign`): `wallet` creates
   keys (mnemonic/seed/HD/keystore), `sign` moves value. An agent can derive addresses
   without being able to spend. Both deny-by-default, audited, DENIED in `sandbox`, scoped
@@ -765,7 +818,7 @@ Builtins:
   END-TO-END (read → build → sign → send → confirm, vector-exact), with HD custody +
   keystore V3 + Solana PDAs/SPL + Bitcoin PSBT cold custody; Avalanche X/P signable. Not
   yet: Avalanche X/P serialization helpers, typed `eth_subscribe` over WS (composable in
-  userland with `ws_connect` + `eth_rpc`-style JSON, see the WebSocket section).
+  userland with `ws_connect` + `evm_rpc`-style JSON, see the WebSocket section).
 
 ## Capabilities
 

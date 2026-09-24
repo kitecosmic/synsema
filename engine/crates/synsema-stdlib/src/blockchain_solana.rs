@@ -111,11 +111,20 @@ fn get_bool(m: &indexmap::IndexMap<String, SynValue>, key: &str, what: &str, fna
 }
 
 // =========================================================
-// solana_message
+// solana_tx
 // =========================================================
 
-fn solana_message(args: &[SynValue]) -> Result<SynValue, Control> {
-    const F: &str = "solana_message";
+fn solana_tx(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "solana_tx";
+    // v0.6.29: `solana_tx` CONSTRUYE (era `solana_message`); ensamblar la firmada es
+    // `solana_tx_raw`. Un programa viejo que llama `solana_tx(message, signatures)` recibe
+    // la explicación, no un error de tipos.
+    if args.len() == 2 {
+        return Err(err(format!(
+            "{}: since v0.6.29 solana_tx builds the message (it was solana_message) — to assemble a signed transaction use solana_tx_raw(message, signatures)",
+            F
+        )));
+    }
     let params = get_map(arg(args, 0, F)?, "params", F)?;
 
     // Claves conocidas; un typo es error, no silencio.
@@ -327,11 +336,11 @@ fn solana_message(args: &[SynValue]) -> Result<SynValue, Control> {
 }
 
 // =========================================================
-// solana_tx — wire format listo para sendTransaction
+// solana_tx_raw — wire format listo para sendTransaction
 // =========================================================
 
-fn solana_tx(args: &[SynValue]) -> Result<SynValue, Control> {
-    const F: &str = "solana_tx";
+fn solana_tx_raw(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "solana_tx_raw";
     let msg = arg_bytes(arg(args, 0, F)?, F, "the message")?;
     if msg.len() < 4 {
         return Err(err(format!("{}: the message is too short to be a Solana message", F)));
@@ -623,8 +632,8 @@ fn spl_transfer_checked_data(args: &[SynValue]) -> Result<SynValue, Control> {
 // =========================================================
 
 pub(crate) fn register(interp: &Interpreter) {
-    interp.register_builtin("solana_message", 1, Rc::new(|_i, a, _l| solana_message(a)));
-    interp.register_builtin("solana_tx", 2, Rc::new(|_i, a, _l| solana_tx(a)));
+    interp.register_builtin("solana_tx", -1, Rc::new(|_i, a, _l| solana_tx(a)));
+    interp.register_builtin("solana_tx_raw", 2, Rc::new(|_i, a, _l| solana_tx_raw(a)));
     // -- Batch 13 (alcance D): PDAs + SPL, PUROS (derivan direcciones/datos públicos) --
     interp.register_builtin("solana_pda", 2, Rc::new(|_i, a, _l| solana_pda(a)));
     interp.register_builtin("spl_ata", -1, Rc::new(|_i, a, _l| spl_ata(a)));

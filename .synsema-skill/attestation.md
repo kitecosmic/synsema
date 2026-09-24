@@ -200,7 +200,7 @@ Anything unclear — an unknown driver, an odd `provider`, a response that does 
   from `random()`. That is the design, not a limitation: an enclave has no trustworthy entropy, and
   *the same query over the same state returns the same noise*, so repeating a query cannot average
   the noise away (the attack that beats fresh noise). Want fresh noise per query? Put a counter or a
-  report id in the seed — `hmac_sha256(keccak256(state), report_id)` is the pattern. The ε budget is
+  report id in the seed — `decode(hmac(keccak256(state), report_id), "hex")` is the pattern. The ε budget is
   the program's to carry in its own state. `scale`/`sigma` must be finite and `> 0`; the result is
   always a float.
 

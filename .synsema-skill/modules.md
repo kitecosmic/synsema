@@ -35,7 +35,7 @@ Run it: `synsema run main.syn`.
   and `alias.NAME` (constants / types / enums).
 - **Real encapsulation:** non-exported names are invisible from outside.
   ```
-  print(text(keys(orders)))     -- [total_orders, greet_order]   (only the exports)
+  print(text(keys(orders)))     -- ["total_orders", "greet_order"]   (only the exports)
   orders.secret_helper()        -- error: Map has no key 'secret_helper'
   ```
 

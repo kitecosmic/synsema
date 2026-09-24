@@ -347,11 +347,55 @@ impl Lexer {
         Err(LexerError::new("Unterminated template (reached end of file)", loc))
     }
 
-    /// Lee un literal numérico (entero o float).
+    /// Lee un literal numérico: entero (decimal, `0x…`, `0b…`), float (`1.5`, `1e-9`,
+    /// `1.5e3`) o decimal (`1.50d`). `_` separa dígitos en todas las formas.
     fn read_number(&mut self) -> Result<(), LexerError> {
         let loc = self.location();
         let start = self.pos;
         let mut has_dot = false;
+
+        // `0x…` / `0b…` → entero exacto (v0.6.29). Hace falta un dígito válido después
+        // del prefijo: `0x` solo, o `0xg`, es error y no "0 seguido de x".
+        if self.peek(0) == Some('0') {
+            if let Some(p) = self.peek(1) {
+                let radix = match p {
+                    'x' | 'X' => Some(16),
+                    'b' | 'B' => Some(2),
+                    _ => None,
+                };
+                if let Some(radix) = radix {
+                    self.advance();
+                    self.advance();
+                    let digits_start = self.pos;
+                    while let Some(c) = self.peek(0) {
+                        if c.is_digit(radix) || c == '_' {
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    let raw = self.slice(start, self.pos);
+                    let clean: String =
+                        self.slice(digits_start, self.pos).chars().filter(|c| *c != '_').collect();
+                    let bad_tail = matches!(self.peek(0), Some(c) if c.is_alphanumeric());
+                    if clean.is_empty() || bad_tail {
+                        let what = if radix == 16 { "hex (0-9, a-f)" } else { "binary (0 or 1)" };
+                        return Err(LexerError::new(
+                            format!("Invalid {} literal: {} — expected {} digits after the prefix", 
+                                if radix == 16 { "hex" } else { "binary" },
+                                if bad_tail { format!("{}{}", raw, self.peek(0).unwrap()) } else { raw.clone() },
+                                what),
+                            loc,
+                        ));
+                    }
+                    let value = Number::from_bigint(
+                        num_bigint::BigInt::parse_bytes(clean.as_bytes(), radix).unwrap_or_default(),
+                    );
+                    self.emit(TokenType::Number, TokenValue::Number(value), loc, raw);
+                    return Ok(());
+                }
+            }
+        }
 
         while !self.at_end() {
             let ch = self.peek(0).unwrap();
@@ -371,10 +415,27 @@ impl Lexer {
             }
         }
 
+        // Exponente → float, como Python: `1e3`, `1e-9`, `1.5E+3`. Sólo si lo sigue un
+        // dígito (con signo opcional): `2e` o `2ex` siguen siendo número + identificador.
+        let mut has_exp = false;
+        if matches!(self.peek(0), Some('e') | Some('E')) {
+            let digit_at = if matches!(self.peek(1), Some('+') | Some('-')) { 2 } else { 1 };
+            if matches!(self.peek(digit_at), Some(c) if c.is_ascii_digit()) {
+                has_exp = true;
+                for _ in 0..digit_at {
+                    self.advance();
+                }
+                while matches!(self.peek(0), Some(c) if c.is_ascii_digit() || c == '_') {
+                    self.advance();
+                }
+            }
+        }
+
         // Sufijo `d` → literal Decimal exacto (1.50d, 100d), pero SÓLO si no lo sigue
         // un char de continuación de identificador: `1.50d`→Decimal, `1.50 d`→número
         // + ident, `1.50dx`→número + ident `dx`.
-        let is_decimal = self.peek(0) == Some('d')
+        let is_decimal = !has_exp
+            && self.peek(0) == Some('d')
             && !matches!(self.peek(1), Some(c) if c.is_alphanumeric() || c == '_');
         if is_decimal {
             self.advance(); // consume el sufijo 'd'
@@ -387,7 +448,7 @@ impl Lexer {
             Number::Decimal(rust_decimal::Decimal::from_str_exact(&clean).map_err(|_| {
                 LexerError::new(format!("Invalid decimal literal: {}", raw), loc.clone())
             })?)
-        } else if has_dot {
+        } else if has_dot || has_exp {
             Number::Float(clean.parse::<f64>().map_err(|_| {
                 LexerError::new(format!("Invalid float literal: {}", raw), loc.clone())
             })?)
@@ -488,8 +549,18 @@ impl Lexer {
                 continue;
             }
 
-            // Comentarios
+            // Comentarios: `--` abre un comentario al inicio de línea o después de un
+            // espacio. Pegado a un operando (`5--1`) no es un comentario silencioso que
+            // corta la expresión: es un error que muestra las dos lecturas (v0.6.29).
             if ch == '-' && self.peek(1) == Some('-') {
+                let prev = if self.pos == 0 { None } else { self.source.get(self.pos - 1).copied() };
+                let glued = matches!(prev, Some(c) if !c.is_whitespace() && !matches!(c, '(' | '[' | '{' | ','));
+                if glued {
+                    return Err(LexerError::new(
+                        "`--` right after a value: a comment needs a space before `--`, and a negative operand needs a space after the operator (write `5 - -1`, or `5 -- comment`)",
+                        self.location(),
+                    ));
+                }
                 self.read_comment();
                 continue;
             }
@@ -570,6 +641,10 @@ impl Lexer {
             } else if ch == '*' {
                 self.advance();
                 self.emit(TokenType::Star, TokenValue::Str("*".into()), loc, "*".into());
+            } else if ch == '/' && self.peek(1) == Some('/') {
+                self.advance();
+                self.advance();
+                self.emit(TokenType::FloorDiv, TokenValue::Str("//".into()), loc, "//".into());
             } else if ch == '/' {
                 self.advance();
                 self.emit(TokenType::Slash, TokenValue::Str("/".into()), loc, "/".into());

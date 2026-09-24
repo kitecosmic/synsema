@@ -236,17 +236,75 @@ fn secp256k1_verify(args: &[SynValue]) -> Result<SynValue, Control> {
     Ok(syn_bool(vk.verify_prehash(digest, &sig).is_ok()))
 }
 
-fn secp256k1_recover(args: &[SynValue]) -> Result<SynValue, Control> {
-    let digest = arg_bytes_len(arg(args, 0, "secp256k1_recover")?, "secp256k1_recover", "the digest", 32)?;
-    let sig65 = arg_bytes_len(arg(args, 1, "secp256k1_recover")?, "secp256k1_recover", "the signature", 65)?;
+/// Recovery id de una firma de 65 bytes: acepta 0..=3 (la forma cruda de
+/// `secp256k1_sign`) y 27/28 (la de las billeteras y `ecrecover`, v0.6.29). Un `v` ≥ 35 es
+/// el de una transacción legacy EIP-155 y se explica en vez de adivinarlo.
+fn recovery_id(v: u8, fname: &str) -> Result<RecoveryId, Control> {
+    let normalized = match v {
+        0..=3 => v,
+        27 | 28 => v - 27,
+        35.. => {
+            return Err(err(format!(
+                "{}: v = {} is a legacy EIP-155 transaction v (chain_id * 2 + 35 + parity), not a message signature — use parity = (v - 35) % 2",
+                fname, v
+            )))
+        }
+        _ => {
+            return Err(err(format!(
+                "{}: the recovery id (byte 65) must be 0, 1, 27 or 28; got {}",
+                fname, v
+            )))
+        }
+    };
+    RecoveryId::from_byte(normalized)
+        .ok_or_else(|| err(format!("{}: the recovery id (byte 65) is out of range", fname)))
+}
+
+/// Clave pública (sin comprimir, 65 bytes) que firmó `digest` con `sig65`.
+pub(crate) fn recover_pubkey(digest: &[u8], sig65: &[u8], fname: &str) -> Result<Vec<u8>, Control> {
     let sig = EcSignature::from_slice(&sig65[..64])
-        .map_err(|_| err("secp256k1_recover: the signature is not a valid (r, s) pair"))?;
-    let recid = RecoveryId::from_byte(sig65[64]).ok_or_else(|| {
-        err("secp256k1_recover: the recovery id (byte 65) must be 0..=3; got an out-of-range value")
-    })?;
+        .map_err(|_| err(format!("{}: the signature is not a valid (r, s) pair", fname)))?;
+    let recid = recovery_id(sig65[64], fname)?;
     let vk = VerifyingKey::recover_from_prehash(digest, &sig, recid)
-        .map_err(|_| err("secp256k1_recover: could not recover a public key from this (digest, signature)"))?;
-    Ok(syn_bytes(vk.to_encoded_point(false).as_bytes().to_vec())) // uncompressed 65
+        .map_err(|_| err(format!("{}: could not recover a public key from this (digest, signature)", fname)))?;
+    Ok(vk.to_encoded_point(false).as_bytes().to_vec())
+}
+
+/// Dirección EVM (20 bytes) de una clave pública sin comprimir.
+pub(crate) fn address_of_pubkey(uncompressed: &[u8]) -> [u8; 20] {
+    let hash = Keccak256::digest(&uncompressed[1..]);
+    let mut a = [0u8; 20];
+    a.copy_from_slice(&hash[12..]);
+    a
+}
+
+fn secp256k1_recover(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "secp256k1_recover";
+    let digest = arg_bytes_len(arg(args, 0, F)?, F, "the digest", 32)?;
+    let sig65 = arg_bytes_len(arg(args, 1, F)?, F, "the signature", 65)?;
+    Ok(syn_bytes(recover_pubkey(digest, sig65, F)?)) // uncompressed 65
+}
+
+/// `evm_signature(sig)` → la misma firma con v = 27/28 (v0.6.29): la forma que esperan las
+/// billeteras, ethers/viem y `ecrecover` de Solidity (OpenZeppelin `ECDSA.recover`). La
+/// primitiva `secp256k1_sign` sigue devolviendo la paridad cruda 0/1 (la que usan las
+/// transacciones tipadas y Bitcoin). Idempotente.
+fn evm_signature(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "evm_signature";
+    let sig = arg_bytes_len(arg(args, 0, F)?, F, "the signature", 65)?;
+    let v = match sig[64] {
+        0 | 1 => sig[64] + 27,
+        27 | 28 => sig[64],
+        other => {
+            return Err(err(format!(
+                "{}: byte 65 must be 0/1 (from secp256k1_sign) or 27/28, got {}",
+                F, other
+            )))
+        }
+    };
+    let mut out = sig.to_vec();
+    out[64] = v;
+    Ok(syn_bytes(out))
 }
 
 fn secp256k1_pubkey(args: &[SynValue]) -> Result<SynValue, Control> {
@@ -504,11 +562,24 @@ pub(crate) fn eip55(addr20: &[u8]) -> String {
     out
 }
 
-fn eth_address(args: &[SynValue]) -> Result<SynValue, Control> {
-    let uncompressed = uncompressed_pubkey(arg(args, 0, "eth_address")?, "eth_address")?;
+/// `evm_address(x)` → la dirección EIP-55 de: una clave pública secp256k1 (33/65 bytes),
+/// un secret de clave privada, o una dirección ya hecha — 20 bytes o texto `0x…` de 40
+/// dígitos (v0.6.29: el checksum de una dirección sacada de un topic, de storage o de
+/// `evm_create2_address`). Un texto con mayúsculas y minúsculas mezcladas se valida.
+fn evm_address(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "evm_address";
+    let v = arg(args, 0, F)?;
+    match v {
+        SynValue::Bytes(b) if b.len() == 20 => return Ok(syn_text(eip55(b))),
+        SynValue::Text(_) => {
+            let a = crate::blockchain_abi::addr20(v, "the address", F)?;
+            return Ok(syn_text(eip55(&a)));
+        }
+        _ => {}
+    }
+    let uncompressed = uncompressed_pubkey(v, F)?;
     // keccak256(pubkey_sin_comprimir[1..])[12..] → 20 bytes.
-    let hash = Keccak256::digest(&uncompressed[1..]);
-    Ok(syn_text(eip55(&hash[12..])))
+    Ok(syn_text(eip55(&address_of_pubkey(&uncompressed))))
 }
 
 // -- RLP --
@@ -580,7 +651,7 @@ fn rlp_list_frame(payload: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// `pub(crate)`: blockchain_rpc.rs (tx_eip1559/tx_eip1559_raw) serializa la lista
+/// `pub(crate)`: blockchain_rpc.rs (evm_tx/evm_tx_raw) serializa la lista
 /// de fields con el MISMO encoder RLP (una sola implementación de money-encoding).
 pub(crate) fn rlp_encode_val(v: &SynValue, depth: usize, out: &mut Vec<u8>) -> Result<(), Control> {
     if depth > RLP_MAX_DEPTH {
@@ -775,7 +846,8 @@ pub fn register_blockchain_builtins(interp: &Interpreter, caps: Rc<RefCell<Capab
     interp.register_builtin("bech32_decode", -1, synsema_core::interpreter::with_fallback(1, Rc::new(|_i, a, _l| bech32_decode(a))));
 
     // -- EVM --
-    interp.register_builtin("eth_address", 1, Rc::new(|_i, a, _l| eth_address(a)));
+    interp.register_builtin("evm_address", 1, Rc::new(|_i, a, _l| evm_address(a)));
+    interp.register_builtin("evm_signature", 1, Rc::new(|_i, a, _l| evm_signature(a)));
     interp.register_builtin("rlp_encode", 1, Rc::new(|_i, a, _l| rlp_encode(a)));
     interp.register_builtin("rlp_decode", -1, synsema_core::interpreter::with_fallback(1, Rc::new(|_i, a, _l| rlp_decode(a))));
 
@@ -793,7 +865,7 @@ pub fn register_blockchain_builtins(interp: &Interpreter, caps: Rc<RefCell<Capab
     //    `net(host)` (G22 — cero capability nueva; `sign` sigue siendo la única
     //    puerta de valor) + los builders EIP-1559 puros. Sin `native` el transporte
     //    es el stub de http (falla con "no sockets in this build") → los builders
-    //    puros (tx_eip1559/…) siguen completos en el perfil wasm.
+    //    puros (evm_tx/…) siguen completos en el perfil wasm.
     crate::blockchain_rpc::register(interp, caps.clone());
 
     // -- Batch 16 (Bitcoin): direcciones/txid/builder UTXO/PSBT puros;
@@ -801,4 +873,8 @@ pub fn register_blockchain_builtins(interp: &Interpreter, caps: Rc<RefCell<Capab
     //    read-side Esplora/Core con `net(host)` (G30 — cero puerta nueva).
     crate::blockchain_btc::register(interp, caps.clone());
     crate::blockchain_btc_rpc::register(interp, caps);
+
+    // v0.6.29 — los nombres de antes de `<familia>_<acción>` (y los de texto/regex del core)
+    // siguen andando como alias hasta v1.0; `synsema check` los avisa.
+    interp.register_deprecated_aliases();
 }

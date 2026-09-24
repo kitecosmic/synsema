@@ -652,10 +652,8 @@ fn render_nodes(
                 let c = interp.eval(coll, env)?;
                 let items = match &c {
                     SynValue::List(l) => l.borrow().clone(),
-                    SynValue::Map(_) => {
-                        return Err(terr(filename, *line,
-                            "Cannot iterate over map in '{ each }' — iterate its keys: { each k in keys(m) }"));
-                    }
+                    // v0.6.29: como `each` del lenguaje — un mapa se recorre por sus claves.
+                    SynValue::Map(m) => m.borrow().keys().map(|k| crate::types::syn_text(k.as_str())).collect(),
                     other => {
                         return Err(terr(filename, *line,
                             &format!("Cannot iterate over {} in '{{ each }}'", other.type_name())));
@@ -882,6 +880,8 @@ fn check_program_static_inner(
         // literal inválido y la instrucción vacía FALLAN el check (un 400 en producción evitado);
         // negaciones, aritmética, state vacío y bloques batcheables son avisos.
         crate::judge::check_program(program, file_path, warnings)?;
+        // v0.6.29 — nombres que cambiaron antes de v1.0 (siguen andando hasta el corte).
+        crate::deprecated::check_warnings(program, file_path, warnings);
         // v0.6.20 — AVISOS (no errores): lo que corre pero sorprende.
         // (a) `export routes <n>` o `let <n>` de nivel superior que repite un alias de `use`:
         //     dentro de las rutas del grupo, `<n>.algo` resuelve al grupo, no al módulo.

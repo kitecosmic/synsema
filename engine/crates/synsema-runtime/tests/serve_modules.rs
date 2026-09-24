@@ -112,7 +112,7 @@ print(text(r))
 ";
     let r = run_source(src, &importer_path());
     assert!(r.success, "errors: {:?}", r.errors);
-    assert_eq!(r.output, vec!["[a!, b!, c!]".to_string()]);
+    assert_eq!(r.output, vec!["[\"a!\", \"b!\", \"c!\"]".to_string()]);
 }
 
 /// DE-030: pasar una task de módulo DIRECTO a `parallel_map` (sin wrapper top-level). La
@@ -138,7 +138,7 @@ print(text(b))
     assert!(r.success, "errors: {:?}", r.errors);
     assert_eq!(
         r.output,
-        vec!["[a!, b!]".to_string(), "[h:x, h:y]".to_string()]
+        vec!["[\"a!\", \"b!\"]".to_string(), "[\"h:x\", \"h:y\"]".to_string()]
     );
 }
 
@@ -197,5 +197,5 @@ print(text(parallel_map(m.dispatch, [\"a\", \"b\"])))
 ";
     let r = run_source(src, &importer_path());
     assert!(r.success, "errors: {:?}", r.errors);
-    assert_eq!(r.output, vec!["[h:a, h:b]".to_string()]);
+    assert_eq!(r.output, vec!["[\"h:a\", \"h:b\"]".to_string()]);
 }

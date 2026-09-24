@@ -131,7 +131,7 @@ fn run_dash_reads_stdin_and_double_dash_feeds_args() {
     let (code, out, err) = synsema(&dir, &["run", "-", "--", "--hello", "world"], Some(src));
     assert_eq!(code, 0, "{}", err);
     let lines: Vec<&str> = out.lines().map(|l| l.trim()).collect();
-    assert_eq!(lines, vec!["[--hello, world]", "2"], "{}", out);
+    assert_eq!(lines, vec!["[\"--hello\", \"world\"]", "2"], "{}", out);
     // Sin `--`, un positional tras el path también es del programa.
     std::fs::write(dir.join("a.syn"), "print(args())\n").unwrap();
     let (code, out, _) = synsema(&dir, &["run", "a.syn", "x", "y"], None);

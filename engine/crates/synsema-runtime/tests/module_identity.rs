@@ -73,7 +73,7 @@ print(text(parallel_map(rt, [\"hello\"])))
 ";
     let r = run_source(src, &importer_path());
     assert!(r.success, "errors: {:?}", r.errors);
-    assert_eq!(r.output, vec!["[hello]".to_string()]);
+    assert_eq!(r.output, vec!["[\"hello\"]".to_string()]);
 }
 
 /// P2 bajo `serve`: un route handler escribe vía B y lee vía C en el mismo request.
@@ -129,7 +129,7 @@ print(text(parallel_map(wr, [\"zz\"])))
 ";
     let r = run_source(src, &importer_path());
     assert!(r.success, "errors: {:?}", r.errors);
-    assert_eq!(r.output, vec!["[zz]".to_string()]);
+    assert_eq!(r.output, vec!["[\"zz\"]".to_string()]);
 }
 
 /// Task de módulo aplicada DIRECTO a `parallel_map` cuando el módulo TAMBIÉN es global:
@@ -146,5 +146,5 @@ print(text(parallel_map(b.bwrite, [\"z\"])))
 ";
     let r = run_source(src, &importer_path());
     assert!(r.success, "errors: {:?}", r.errors);
-    assert_eq!(r.output, vec!["[w]".to_string()]);
+    assert_eq!(r.output, vec!["[\"w\"]".to_string()]);
 }

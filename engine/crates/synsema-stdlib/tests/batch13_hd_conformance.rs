@@ -267,8 +267,8 @@ fn hd_derive_eth_matches_eth_account_vectors() {
     for (path, address, key) in HD_ETH {
         let k = ok_secret(call(&mut i, "hd_derive", vec![seed.clone(), syn_text(path)]));
         assert_eq!(hex_encode(&reveal_bytes(&mut i, &k)), key, "clave de {}", path);
-        // La clave derivada se usa DIRECTO con eth_address (sin materializarse).
-        assert_eq!(ok_text(call(&mut i, "eth_address", vec![k])), address,
+        // La clave derivada se usa DIRECTO con evm_address (sin materializarse).
+        assert_eq!(ok_text(call(&mut i, "evm_address", vec![k])), address,
             "address EIP-55 de {}", path);
     }
 }
@@ -371,7 +371,7 @@ fn algorand_25_words_matches_algosdk_roundtrip() {
     let m = ok_secret(call(&mut i, "algorand_mnemonic",
         vec![syn_secret_bytes("K", hx(ALGO_SEED))]));
     let k = ok_secret(call(&mut i, "algorand_mnemonic_to_key", vec![m]));
-    assert_eq!(ok_text(call(&mut i, "algo_address", vec![k])), ALGO_ADDR);
+    assert_eq!(ok_text(call(&mut i, "algorand_address", vec![k])), ALGO_ADDR);
 }
 
 #[test]
@@ -411,7 +411,7 @@ fn keystore_import_pbkdf2_and_scrypt_match_eth_keyfile() {
         let k = ok_secret(call(&mut i, "keystore_import",
             vec![syn_text(ks), syn_secret("PASS", "testpassword")]));
         assert_eq!(hex_encode(&reveal_bytes(&mut i, &k)), KS_KEY, "clave via {}", kdf);
-        assert_eq!(ok_text(call(&mut i, "eth_address", vec![k])), KS_ADDR,
+        assert_eq!(ok_text(call(&mut i, "evm_address", vec![k])), KS_ADDR,
             "address via {}", kdf);
     }
 }
@@ -629,7 +629,7 @@ fn spl_transfer_instruction_data_layout() {
 
 #[test]
 fn spl_transfer_full_message_matches_solders() {
-    // El transfer SPL COMPLETO: spl_ata + spl_transfer_checked_data + solana_message
+    // El transfer SPL COMPLETO: spl_ata + spl_transfer_checked_data + solana_tx
     // reproducen byte a byte el Message.new_with_blockhash de solders.
     let mut i = interp_full();
     let owner = syn_bytes(vec![2u8; 32]);
@@ -658,7 +658,7 @@ fn spl_transfer_full_message_matches_solders() {
     params.insert("fee_payer".to_string(), owner);
     params.insert("recent_blockhash".to_string(), syn_bytes(vec![7u8; 32]));
     params.insert("instructions".to_string(), syn_list(vec![syn_map(ix)]));
-    let msg = ok_bytes(call(&mut i, "solana_message", vec![syn_map(params)]));
+    let msg = ok_bytes(call(&mut i, "solana_tx", vec![syn_map(params)]));
     assert_eq!(hex_encode(&msg), SPL_MSG_HEX, "transfer SPL byte a byte contra solders");
 }
 

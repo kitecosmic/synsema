@@ -112,7 +112,10 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     ("http_put", "net"), ("http_delete", "net"), ("mtls_identity", "net"),
     ("ws_connect", "net"),
     ("push_send", "net"), // Web Push: el push service es un host más (tanda PWA)
-    ("eth_rpc", "net"), ("eth_call", "net"), ("eth_send_raw", "net"), ("solana_rpc", "net"),
+    ("evm_rpc", "net"), ("evm_call", "net"), ("evm_send", "net"), ("solana_rpc", "net"),
+    ("evm_logs", "net"), ("evm_block_number", "net"),
+    // nombres de antes de v0.6.29 (alias deprecados hasta v1.0)
+    ("eth_rpc", "net"), ("eth_call", "net"), ("eth_send_raw", "net"),
     ("algod", "net"), ("esplora", "net"),
     // bases de datos
     ("db_open", "db"), ("db_close", "db"), ("sql", "db"), ("sql_exec", "db"),
@@ -156,8 +159,10 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     ("add_rule", "memory"), ("check_rules", "memory"), ("get_rules", "memory"),
     // valor: firmar, custodiar, gastar
     ("secp256k1_sign", "sign"), ("ed25519_sign", "sign"), ("schnorr_sign", "sign"),
-    ("tx_eip1559", "sign"), ("tx_eip1559_raw", "sign"), ("solana_tx", "sign"),
-    ("algorand_tx", "sign"), ("btc_tx", "sign"), ("psbt_finalize", "sign"),
+    ("evm_tx", "sign"), ("evm_tx_create", "sign"), ("evm_tx_raw", "sign"), ("solana_tx", "sign"),
+    ("solana_tx_raw", "sign"), ("algorand_tx", "sign"), ("algorand_tx_raw", "sign"), ("btc_tx", "sign"),
+    ("psbt_finalize", "sign"),
+    ("tx_eip1559", "sign"), ("tx_eip1559_raw", "sign"), ("solana_message", "sign"), ("algorand_tx_encode", "sign"),
     ("mnemonic_generate", "wallet"), ("mnemonic_to_seed", "wallet"),
     ("mnemonic_from_entropy", "wallet"), ("mnemonic_to_entropy", "wallet"),
     ("hd_derive", "wallet"), ("algorand_mnemonic", "wallet"),
