@@ -14,7 +14,7 @@ regex.workspace = true
 # `codeintel` (synsema code): salida JSON determinista (preserve_order ya está en el workspace).
 serde_json.workspace = true
 # Tipo Decimal exacto (dinero/finanzas): rust_decimal, puro Rust, 96-bit.
-rust_decimal.workspace = true
+rust_decimal = { workspace = true, features = ["maths"] }
 # Tipo `secret`: zeroize del plaintext al drop + igualdad constant-time (§5 del spec).
 zeroize.workspace = true
 subtle.workspace = true
@@ -25,8 +25,6 @@ num-complex.workspace = true
 # Arrays n-dimensionales + álgebra lineal (Batch 5): ndarray + faer, puro-Rust sin C.
 ndarray.workspace = true
 faer.workspace = true
-# CSV RFC 4180 (Batch 8): csv_parse/csv_encode. Puro-Rust, sin C (ver workspace).
-csv.workspace = true
 # base58 (Batch 11): formato de bytes()/decode() (Solana/Bitcoin). Crate canónico
 # puro-Rust — código de direcciones de dinero: no se hand-rollea. base32 sí es
 # hand-rolled en bytesutil (RFC 4648, trivial).

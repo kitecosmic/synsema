@@ -44,9 +44,9 @@ rand = "0.8"
 # `preserve_order`: los objetos JSON entrantes preservan el orden de inserción (como
 # el dict de Python), para paridad byte-a-byte en las respuestas del server.
 serde = { version = "1", features = ["derive"] }
-# arbitrary_precision (v0.6.29): un entero JSON fuera de i64 llega exacto (uint256, ids u64)
-# en vez de pasar por f64.
-serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+# Sin `arbitrary_precision` a propósito: cambia el `Number` de serde_json para TODO el árbol
+# (candle, tokenizers, cualquier dep). Lo exacto de `json_decode` lo da `stdlib::json_exact`.
+serde_json = { version = "1", features = ["preserve_order"] }
 # Fecha/hora para los builtins de time (UTC). Sin feature `clock` → sin riesgo de C;
 # now() usa std::time. HTTP cliente: std::net + rustls para https (ver stdlib/src/http.rs);
 # cron usa std::thread.
@@ -160,10 +160,6 @@ memmap2 = { version = "0.9", default-features = false }
 # en NUESTRA copia (tokenizers usa el motor C cuando la feature está presente) — dos
 # copias con la nuestra limpia es el mejor arreglo disponible.
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
-# CSV RFC 4180 (Batch 8): parser/writer de BurntSushi, PURO-Rust sin C (deps: csv-core/
-# itoa/ryu/serde, cero `*-sys`) → preserva el binario único estático. Sólo la mecánica
-# de quoting/records; la conversión texto↔SynValue vive en synsema-core/src/csv.rs.
-csv = "1"
 # v0.6.20 — parsers de texto que pidió la plataforma (PURO-Rust, cero `*-sys`):
 #   roxmltree : XML → árbol de sólo lectura para `xml_parse` (factura electrónica CFDI/NF-e/
 #               Facturae/AFIP). YA estaba en el árbol (transitiva de usvg); hacerla directa no

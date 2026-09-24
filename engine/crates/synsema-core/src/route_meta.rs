@@ -114,6 +114,31 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     ("push_send", "net"), // Web Push: el push service es un host más (tanda PWA)
     ("evm_rpc", "net"), ("evm_call", "net"), ("evm_send", "net"), ("solana_rpc", "net"),
     ("evm_logs", "net"), ("evm_block_number", "net"),
+    // v0.6.29: todos los lectores y emisores de red de las cadenas (antes faltaban y el análisis
+    // estático —`synsema code caps`, OpenAPI— no los contaba).
+    ("evm_balance", "net"),
+    ("evm_chain_id", "net"),
+    ("evm_estimate_gas", "net"),
+    ("evm_fee_history", "net"),
+    ("evm_gas_price", "net"),
+    ("evm_nonce", "net"),
+    ("evm_receipt", "net"),
+    ("evm_wait", "net"),
+    ("solana_balance", "net"),
+    ("solana_latest_blockhash", "net"),
+    ("solana_send", "net"),
+    ("solana_wait", "net"),
+    ("spl_balance", "net"),
+    ("algorand_account", "net"),
+    ("algorand_params", "net"),
+    ("algorand_send", "net"),
+    ("algorand_wait", "net"),
+    ("btc_balance", "net"),
+    ("btc_fee_estimates", "net"),
+    ("btc_rpc", "net"),
+    ("btc_send", "net"),
+    ("btc_utxos", "net"),
+    ("btc_wait", "net"),
     // nombres de antes de v0.6.29 (alias deprecados hasta v1.0)
     ("eth_rpc", "net"), ("eth_call", "net"), ("eth_send_raw", "net"),
     ("algod", "net"), ("esplora", "net"),
@@ -171,7 +196,13 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
 ];
 
 pub fn builtin_cap(name: &str) -> Option<&'static str> {
-    BUILTIN_CAPS.iter().find(|(n, _)| *n == name).map(|(_, c)| *c)
+    BUILTIN_CAPS.iter().find(|(n, _)| *n == name).map(|(_, c)| *c).or_else(|| {
+        // Un nombre deprecado (`eth_balance`) pide lo mismo que su nombre nuevo.
+        crate::deprecated::DEPRECATED_NAMES
+            .iter()
+            .find(|(old, _)| *old == name)
+            .and_then(|(_, new)| BUILTIN_CAPS.iter().find(|(n, _)| n == new).map(|(_, c)| *c))
+    })
 }
 
 /// El primer `expect body {…}` de nivel superior del cuerpo.
@@ -239,6 +270,35 @@ pub fn require_pair(capability: &str, scope: &Option<Box<Node>>) -> (String, Opt
         NodeKind::NumberLiteral { value } => Some(value.to_string()),
         _ => None,
     });
+    // `net` es por host, o `host:puerto` si el puerto se escribió (como `Capability::new` en
+    // ejecución): `net("https://u:p@api.x.com/v1")` es `net("api.x.com")`,
+    // `net("http://localhost:8545")` es `net("localhost:8545")` y `net("[::1]")` es `net("::1")`.
+    let s = match (capability, s) {
+        ("net", Some(v)) if v.contains("://") => {
+            let rest = v.split_once("://").map(|(_, r)| r).unwrap_or(&v);
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+            let hostport = authority.rsplit('@').next().unwrap_or("");
+            let (host, port) = if let Some(inner) = hostport.strip_prefix('[') {
+                let (h, after) = inner.split_once(']').unwrap_or((inner, ""));
+                (h.to_string(), after.strip_prefix(':'))
+            } else {
+                match hostport.rsplit_once(':') {
+                    Some((h, p)) => (h.to_string(), Some(p)),
+                    None => (hostport.to_string(), None),
+                }
+            };
+            let port = port.filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+            let host = host.to_lowercase();
+            Some(match port {
+                _ if host.is_empty() => "<no host>".to_string(),
+                Some(p) if host.contains(':') => format!("[{}]:{}", host, p),
+                Some(p) => format!("{}:{}", host, p),
+                None => host,
+            })
+        }
+        ("net", Some(v)) if v.starts_with('[') && v.ends_with(']') => Some(v[1..v.len() - 1].to_lowercase()),
+        (_, s) => s,
+    };
     (capability.to_string(), s)
 }
 

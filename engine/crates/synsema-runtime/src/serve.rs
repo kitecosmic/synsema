@@ -654,6 +654,10 @@ impl ServeOverrides {
 
 pub(crate) enum GlobalVal {
     Value(SendValue),
+    /// Un generador de `rng()` que vive en un global: del otro lado (cada request de `serve`,
+    /// cada worker) sería una copia que REPITE la misma secuencia, así que llega como un valor
+    /// que al usarse explica qué hacer. El `String` es su nombre (`rng(42)`).
+    SharedRng(String),
     Task {
         name: String,
         parameters: Vec<Param>,
@@ -679,6 +683,10 @@ pub(crate) enum GlobalVal {
     Module {
         /// ID estable: el `name` del `module_env` original (`"module:<resolved>"`).
         id: String,
+        /// `true` si el map ERA el mapa de exportaciones del módulo (`use … as m`), no un map
+        /// de datos que guarda tasks del módulo (`{"f": m.f}`): el rebuild lo registra como
+        /// vista del módulo (`register_module`) y las escrituras `set m.X[k]` siguen al env.
+        is_alias: bool,
         /// Entradas del map (alias de módulo o map interno). `is_export = true` ⇔ en el
         /// snapshot la entry `(k, v)` era EL MISMO objeto (`Rc::ptr_eq`) que el binding
         /// `k` del `module_env` → en rebuild se cosecha del env reconstruido (identidad
@@ -761,6 +769,8 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
             body: t.body.clone(),
             required_capabilities: t.required_capabilities.clone(),
         },
+        // Un generador dentro de un global (`{"g": rng(1)}`) tampoco se copia en silencio.
+        SynValue::Builtin(b) if synsema_core::rng::snapshot(b).is_some() => GlobalVal::SharedRng(b.name.clone()),
         SynValue::Builtin(_) => GlobalVal::Value(to_send(v)),
         SynValue::Map(m) => {
             // ¿El map cierra sobre un `module_env`? (alias de `use`, o map interno cuyas
@@ -768,13 +778,14 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
             if let Some(module_env) = module_env_of(&m.borrow()) {
                 let key = Rc::as_ptr(&module_env) as usize;
                 let id = module_env.borrow().name.clone();
+                let is_alias = synsema_core::interpreter::module_env_of_map(m).is_some();
                 if state.in_progress.contains(&key) || state.done.contains(&key) {
                     // El env ya viaja (o viajó) en este árbol: referencia por id. Un solo
                     // camino cubre el map auto-referencial (DE-032), el diamante B→D←C
                     // (DE-033) y cualquier ciclo hipotético. En rebuild resuelve al MISMO
                     // env vía el registro.
                     let alias = snapshot_alias_entries(m, &module_env, state);
-                    return GlobalVal::Module { id, alias, env: None };
+                    return GlobalVal::Module { id, is_alias, alias, env: None };
                 }
                 // Primer encuentro: el env viaja inline (TODAS las bindings, DE-027).
                 state.in_progress.push(key);
@@ -788,7 +799,7 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
                 state.in_progress.pop();
                 state.done.insert(key);
                 let alias = snapshot_alias_entries(m, &module_env, state);
-                return GlobalVal::Module { id, alias, env: Some(env) };
+                return GlobalVal::Module { id, is_alias, alias, env: Some(env) };
             }
             let entries: Vec<(String, GlobalVal)> = m
                 .borrow()
@@ -797,12 +808,13 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
                 .collect();
             // Map puramente de valores primitivos → viaja barato como SendValue.
             if entries.iter().all(|(_, gv)| matches!(gv, GlobalVal::Value(_))) {
-                return GlobalVal::Value(to_send(&SynValue::Map(m.clone())));
+                return GlobalVal::Value(synsema_core::rng::with_stubbed_globals(|| to_send(&SynValue::Map(m.clone()))));
             }
             // Map de datos con callbacks (tasks que NO cierran sobre un módulo).
             GlobalVal::MapWithTasks(entries)
         }
-        other => GlobalVal::Value(to_send(other)),
+        // Una lista (o lo que sea) con un generador adentro: el generador cruza como stub.
+        other => GlobalVal::Value(synsema_core::rng::with_stubbed_globals(|| to_send(other))),
     }
 }
 
@@ -903,7 +915,7 @@ fn rebuild_global_val(
                 required_capabilities: required_capabilities.clone(),
             }))
         }
-        GlobalVal::Module { id, alias, env } => {
+        GlobalVal::Module { id, is_alias, alias, env } => {
             // Resolver el `module_env` compartido: el primer encuentro (env inline) lo
             // construye y registra; una referencia (env: None) lo toma del registro.
             let module_env = match env {
@@ -929,6 +941,21 @@ fn rebuild_global_val(
             // (mutar `d.STATE` y leer vía una task del módulo ven el mismo objeto). Las
             // demás se materializan cerrando sobre el module_env (donde viven las
             // hermanas), igual que antes.
+            // Un módulo tiene UN mapa de exportaciones: si este rebuild ya armó el del módulo (otro
+            // alias, un re-export `export let L be lib`, `{"l": lib}`), es ése — con sus entradas
+            // al día desde el env —, no una copia que después quedaría desconectada.
+            if *is_alias {
+                if let Some(existing) = synsema_core::interpreter::module_map_of_env(&module_env) {
+                    for (k, _, is_export) in alias {
+                        if *is_export {
+                            if let Some(v) = module_env.borrow().bindings.get(k.as_str()).cloned() {
+                                existing.borrow_mut().insert(k.clone(), v);
+                            }
+                        }
+                    }
+                    return SynValue::Map(existing);
+                }
+            }
             let mut m = IndexMap::new();
             for (k, gv, is_export) in alias {
                 let harvested = if *is_export {
@@ -945,8 +972,13 @@ fn rebuild_global_val(
                 };
                 m.insert(k.clone(), v);
             }
-            SynValue::Map(Rc::new(RefCell::new(m)))
+            let map = Rc::new(RefCell::new(m));
+            if *is_alias {
+                synsema_core::interpreter::register_module(&map, &module_env);
+            }
+            SynValue::Map(map)
         }
+        GlobalVal::SharedRng(name) => synsema_core::rng::top_level_stub(name),
         GlobalVal::MapWithTasks(entries) => {
             // Map de datos con callbacks: las tasks cierran sobre el global (como cualquier
             // task top-level), NO sobre un module_env compartido.
@@ -975,7 +1007,10 @@ pub(crate) fn snapshot_globals(interp: &Interpreter) -> Arc<Vec<(String, GlobalV
     // el env inline) siempre se procesa antes que sus referencias.
     let mut state = SnapState::default();
     for (k, v) in env.bindings.iter() {
-        if matches!(v, SynValue::Builtin(_)) {
+        if let SynValue::Builtin(b) = v {
+            if synsema_core::rng::snapshot(b).is_some() {
+                out.push((k.clone(), GlobalVal::SharedRng(b.name.clone())));
+            }
             continue; // re-registrados por wire_common
         }
         out.push((k.clone(), val_to_global_inner(v, &mut state)));
@@ -2130,8 +2165,9 @@ fn build_host_table(
                     for cap in caps_snap.iter() {
                         check.grant(cap.clone());
                     }
+                    let scope = synsema_capabilities::model::net_request_scope(&url).unwrap_or_else(|| host.clone());
                     if let Err(v) = check.require(
-                        &Capability::new(CapabilityType::Net, Some(host.clone())),
+                        &Capability::new(CapabilityType::Net, Some(scope)),
                         &format!("proxy to \"{}\" (route \"{} {}\")", url, method, path),
                     ) {
                         return Err(Control::Error(v.into_error()));
@@ -3805,10 +3841,10 @@ pub fn run_serve_program_with_overrides(
         .spawn(move || serve_inner(&src, &fname, secure, overrides))
         .expect("no se pudo crear el hilo del motor serve")
         .join()
-        .unwrap_or_else(|_| RunResult {
+        .unwrap_or_else(|p| RunResult {
             success: false,
             output: Vec::new(),
-            errors: vec!["el motor abortó (probable desborde de stack nativo)".to_string()],
+            errors: vec![crate::engine::abort_message(&p)],
         })
 }
 

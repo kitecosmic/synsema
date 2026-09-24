@@ -112,10 +112,18 @@ fn number_text(n: &Number, path: &str) -> Result<String, Control> {
             }
             Ok(es_number(*f))
         }
-        Number::Decimal(d) => {
+        Number::Decimal(_) | Number::BigDec(_) => {
             // Un decimal entra si vuelve EXACTO del double más corto: ≤ 15 dígitos
             // significativos garantizan la vuelta; más, y el double miente.
-            let text = d.normalize().to_string();
+            let text = {
+                let (mut m, mut s) = n.exact_ratio().unwrap();
+                let ten = num_bigint::BigInt::from(10);
+                while s > 0 && (&m % &ten) == num_bigint::BigInt::from(0) {
+                    m /= &ten;
+                    s -= 1;
+                }
+                Number::decimal_from_parts(m, s).to_string()
+            };
             let sig: usize = text.chars().filter(|c| c.is_ascii_digit()).collect::<String>().trim_start_matches('0').len();
             if sig > 15 {
                 return Err(err(format!(

@@ -83,6 +83,7 @@ impl SigAlg {
     }
 }
 
+#[cfg(test)]
 fn unix_now() -> i64 {
     synsema_core::clock::now_secs()
 }

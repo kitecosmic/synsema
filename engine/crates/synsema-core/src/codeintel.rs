@@ -272,7 +272,7 @@ fn resolve_text(node: &Node, ctx: &ScopeCtx, depth: usize) -> Vec<(String, bool)
             }
             ctx.params.get(name).map(|vs| vs.iter().map(|v| (v.clone(), false)).collect()).unwrap_or_default()
         }
-        NodeKind::BinaryOp { left, operator, right } if operator == "+" => {
+        NodeKind::BinaryOp { left, operator, right } if operator == "+" || operator == crate::ast::INTERP_CONCAT => {
             let lefts = resolve_text(left, ctx, depth + 1);
             if lefts.is_empty() {
                 return Vec::new();
@@ -1176,7 +1176,7 @@ fn infer_value(value: &Node, body: &[Node], lookup: &dyn Fn(&str) -> Option<rout
         }
         NodeKind::MapLiteral { .. } | NodeKind::ListLiteral { .. } | NodeKind::NumberLiteral { .. } | NodeKind::BoolLiteral { .. } => Some("json"),
         NodeKind::TextLiteral { .. } => Some("text"),
-        NodeKind::BinaryOp { left, operator, .. } if operator == "+" => {
+        NodeKind::BinaryOp { left, operator, .. } if operator == "+" || operator == crate::ast::INTERP_CONCAT => {
             match infer_value(left, body, lookup, depth + 1) {
                 Some("text") => Some("text"),
                 other => other,
@@ -1345,12 +1345,53 @@ fn covered(declared: &[(String, Option<String>)], cap: &str, scope: &Option<Stri
         if !same {
             return false;
         }
-        match (ds, scope) {
+        // `net("host:puerto")`: lo que necesita una llamada es su host (el puerto no se sigue
+        // estáticamente), así que se compara el host del grant — sin falsos positivos.
+        let ds = match ds {
+            Some(d) if cap == "net" => Some(net_scope_host(d)),
+            other => other.clone(),
+        };
+        match (&ds, scope) {
             (None, _) => true,          // `require net` sin scope cubre todo
             (Some(_), None) => true,     // scope dinámico/desconocido: el tipo declarado alcanza (sin falsos positivos)
-            (Some(d), Some(s)) => d == "*" || d == s || s.starts_with(&format!("{}/", d)) || s.ends_with(&format!(".{}", d.trim_start_matches("*."))) && d.starts_with("*."),
+            (Some(d), Some(s)) => {
+                d == "*"
+                    || d == s
+                    || s.starts_with(&format!("{}/", d))
+                    || s.ends_with(&format!(".{}", d.trim_start_matches("*."))) && d.starts_with("*.")
+                    // Un glob (`require file.read("./*")`) cubre lo que cubre en el runtime
+                    // (`fnmatch`: `*` es cualquier cosa, `?` un carácter).
+                    || (d.contains(['*', '?']) && fnmatch(s, d))
+            }
         }
     })
+}
+
+/// El host de un scope de `net` (`[::1]:8545` → `::1`, `api.x:443` → `api.x`, `::1` igual).
+fn net_scope_host(d: &str) -> String {
+    if let Some(inner) = d.strip_prefix('[') {
+        if let Some((h, _)) = inner.split_once(']') {
+            return h.to_string();
+        }
+    }
+    match d.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => h.to_string(),
+        _ => d.to_string(),
+    }
+}
+
+/// `fnmatch` como el del runtime (`synsema-capabilities`): `*` cero o más caracteres, `?` uno.
+fn fnmatch(name: &str, pattern: &str) -> bool {
+    fn go(n: &[char], p: &[char]) -> bool {
+        match p.split_first() {
+            None => n.is_empty(),
+            Some((&'*', rest)) => (0..=n.len()).any(|k| go(&n[k..], rest)),
+            Some((&'?', rest)) => !n.is_empty() && go(&n[1..], rest),
+            Some((&c, rest)) => !n.is_empty() && n[0] == c && go(&n[1..], rest),
+        }
+    }
+    let (n, p): (Vec<char>, Vec<char>) = (name.chars().collect(), pattern.chars().collect());
+    go(&n, &p)
 }
 
 /// `caps(path?)`: contrato de capabilities por archivo (declaradas, necesarias, faltantes).
@@ -1897,6 +1938,17 @@ task check_token(req)
         let home = rs.iter().find(|x| x["host"] == "docs.example").unwrap();
         assert_eq!(home["path"], "/");
         assert_eq!(s["hosts"], json!(["docs.example"]));
+    }
+
+    /// Un scope con glob cubre lo que cubre en el runtime: `./*` cubre `./x.csv` (ronda 6).
+    #[test]
+    fn caps_glob_scope_covers_like_runtime() {
+        let root = tmp_root(&[("g.syn", "require file.read(\"./*\")\nlet t be read_file(\"./x.csv\")\n")]);
+        let c = caps(&root, None);
+        assert_eq!(c["files"][0]["missing"].as_array().unwrap().len(), 0, "{}", c);
+        let root = tmp_root(&[("g.syn", "require file.read(\"./data/*.csv\")\nlet t be read_file(\"./x.csv\")\n")]);
+        let c = caps(&root, None);
+        assert_eq!(c["files"][0]["missing"].as_array().unwrap().len(), 1, "{}", c);
     }
 
     #[test]

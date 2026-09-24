@@ -386,14 +386,14 @@ fn writing_a_key_of_another_principal_is_refused() {
 
 #[test]
 fn writing_a_private_key_into_a_non_rebindable_target_is_refused() {
-    // (d) el destino no nace de una variable: no hay a quién subirle la etiqueta.
+    // (d) el destino no nace de una variable: no hay a quién subirle la etiqueta. Desde
+    // v0.6.29 (semántica de valor) un destino así es error siempre, con clave privada o
+    // pública: escribir a través del resultado de una llamada no escribe `store`.
     let src = "let store be {}\ntask box()\n    give store\nset box()[private(\"k\", \"a\")] to 1\n";
     let msg = run_err(src);
-    assert!(msg.contains("label_violation"), "{}", msg);
-    assert!(msg.contains("private to a"), "{}", msg);
-    // Con clave pública el mismo destino sigue funcionando.
-    let i = run_ok("let store be {}\ntask box()\n    give store\nset box()[\"k\"] to 1\n");
-    assert_eq!(plain_of(&i, "store"), "{k: 1}");
+    assert!(msg.contains("must start from a variable"), "{}", msg);
+    let msg = run_err("let store be {}\ntask box()\n    give store\nset box()[\"k\"] to 1\n");
+    assert!(msg.contains("must start from a variable"), "{}", msg);
 }
 
 #[test]

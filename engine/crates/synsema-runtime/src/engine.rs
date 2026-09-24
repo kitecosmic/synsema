@@ -505,7 +505,7 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     "eip191_digest", "eip712_digest", "ends_with", "enumerate", "erf", "erfc", "eth_address", "exp", "eye",
     "factorial", "fail", "flatten", "float", "floor", "fmt", "full", "gamma", "gaussian_noise", "gcd",
     "groth16_verify", "hash160", "histogram", "hkdf_sha256", "hmac_sha256", "http_signature_verify", "hypot",
-    "identity", "imag", "index_of", "int_to_bytes", "int_to_bytes_le", "inv", "is_array", "is_bytes",
+    "identity", "imag", "index_of", "insert", "int_to_bytes", "int_to_bytes_le", "inv", "is_array", "is_bytes",
     "is_complex", "is_decimal", "is_finite", "is_infinite", "is_nan", "join", "json_decode", "json_encode",
     "json_for_script", "jwt_sign", "jwt_verify", "keccak256", "keys", "laplace_noise", "lcm", "length",
     "lgamma", "linspace", "ln", "log10", "log2", "log_base", "lower", "matches", "matmul", "max", "mean",
@@ -531,10 +531,10 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     "solana_tx_raw",
     // v0.6.29 (datos): tablas, faltantes, estadística, arrays, azar con semilla, fechas, JSONL,
     // linaje. Todos puros (el azar con semilla es determinista; las fechas no leen el reloj).
-    "summarize", "count_by", "pivot", "count", "sum_of", "mean_of", "min_of", "max_of", "median_of",
+    "summarize", "count_by", "pivot", "count", "count_missing", "sum_of", "mean_of", "min_of", "max_of", "median_of",
     "first_of", "n_unique_of", "quantile_of", "is_missing", "fill_missing", "drop_missing", "fill_nan",
     "quantile", "concat", "stack", "argmin", "argmax", "cumsum", "diff", "cov", "corr", "lstsq",
-    "polyfit", "polyval", "mode", "rng", "random_normal", "shuffle", "sample", "choice", "date",
+    "polyfit", "polyval", "mode", "rng", "rng_spawn", "random_normal", "shuffle", "sample", "choice", "date",
     "datetime", "duration", "parse_date", "parse_datetime", "truncate", "add_months", "date_range",
     "timestamp", "to_timezone", "in_units", "add_days", "jsonl_encode", "jsonl_decode", "lineage", "parquet_read", "parquet_write",
 ];
@@ -678,7 +678,14 @@ pub(crate) fn wire_common_with_state(
     synsema_stdlib::canonical::register_canonical_builtins(interp);
     // Linaje (DATOS-17): los resultados estructurados se hashean sobre su JSON canónico.
     interp.lineage_canonical = Some(Rc::new(|v: &synsema_core::types::SynValue| {
-        synsema_stdlib::canonical::canonical_json(v).ok().map(|s| s.into_bytes())
+        match synsema_stdlib::canonical::canonical_json(v) {
+            Ok(s) => Some((s.into_bytes(), "jcs")),
+            // JCS no lleva enteros de más de 2^53: el JSON exacto de `json_encode`.
+            Err(_) => Some((
+                synsema_stdlib::json::dumps(&synsema_stdlib::json::syn_to_json(v)).into_bytes(),
+                "json",
+            )),
+        }
     }));
     synsema_stdlib::didkey::register_didkey_builtins(interp);
     synsema_stdlib::integrity::register_integrity_builtins(interp, caps.clone());
@@ -1177,6 +1184,18 @@ fn spawn_run(source: &str, filename: &str, secure: bool) -> RunResult {
     spawn_run_ceiled(source, filename, secure, None)
 }
 
+/// El error de un hilo del motor que terminó en pánico: es un BUG del motor (un error del
+/// programa nunca es un pánico), y el mensaje lo dice con el texto del pánico en vez de
+/// adivinar la causa. Un desborde de stack nativo no llega acá: aborta el proceso.
+pub fn abort_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    let what = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string());
+    format!("internal error in the engine (a bug, not your program — please report it): {}", what)
+}
+
 fn spawn_run_ceiled(source: &str, filename: &str, secure: bool, ceiling: Option<Vec<Capability>>) -> RunResult {
     let src = source.to_string();
     let fname = filename.to_string();
@@ -1185,10 +1204,10 @@ fn spawn_run_ceiled(source: &str, filename: &str, secure: bool, ceiling: Option<
         .spawn(move || run_inner(&src, &fname, secure, None, false, ceiling))
         .expect("no se pudo crear el hilo del motor")
         .join()
-        .unwrap_or_else(|_| RunResult {
+        .unwrap_or_else(|p| RunResult {
             success: false,
             output: Vec::new(),
-            errors: vec!["el motor abortó (probable desborde de stack nativo)".to_string()],
+            errors: vec![abort_message(&p)],
         })
 }
 
@@ -1278,10 +1297,10 @@ pub fn run_program_ceiled_opts(
         .spawn(move || run_inner(&src, &fname, false, Some(sw), live_output, ceiling))
         .expect("no se pudo crear el hilo del motor")
         .join()
-        .unwrap_or_else(|_| RunResult {
+        .unwrap_or_else(|p| RunResult {
             success: false,
             output: Vec::new(),
-            errors: vec!["el motor abortó (probable desborde de stack nativo)".to_string()],
+            errors: vec![abort_message(&p)],
         });
 
     // Joinea los agentes lanzados por el main; ya no hay nadie más que pueda spawnear.
@@ -1382,8 +1401,8 @@ pub fn run_tests_ceiled(source: &str, filename: &str, ceiling: Option<Vec<Capabi
         .spawn(move || run_tests_inner(&src, &fname, ceiling))
         .expect("no se pudo crear el hilo del motor")
         .join()
-        .unwrap_or_else(|_| {
-            report_with_failure("<runner>", "el motor abortó (probable desborde de stack nativo)".to_string())
+        .unwrap_or_else(|p| {
+            report_with_failure("<runner>", abort_message(&p))
         })
 }
 
@@ -1573,8 +1592,8 @@ pub fn run_with_diagnostics_ceiled(source: &str, filename: &str, ceiling: Option
         .spawn(move || run_diag_inner(&src, &fname, Some(sw), ceiling))
         .expect("no se pudo crear el hilo del motor")
         .join()
-        .unwrap_or_else(|_| DiagRun {
-            result: RunResult { success: false, output: Vec::new(), errors: vec!["el motor abortó".to_string()] },
+        .unwrap_or_else(|p| DiagRun {
+            result: RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)] },
             diagnostics: Vec::new(),
         });
 
@@ -1645,7 +1664,7 @@ pub fn run_with_human(source: &str, filename: &str, default_approve: bool) -> Ru
         })
         .expect("hilo del motor")
         .join()
-        .unwrap_or_else(|_| RunResult { success: false, output: Vec::new(), errors: vec!["el motor abortó".to_string()] })
+        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)] })
 }
 
 /// Host-config de test: corre con un callback de texto que GRABA `(op, prompt)` de cada
@@ -1671,7 +1690,7 @@ pub fn run_capturing_llm(source: &str, filename: &str) -> (RunResult, Vec<(Strin
         })
         .expect("hilo del motor")
         .join()
-        .unwrap_or_else(|_| RunResult { success: false, output: Vec::new(), errors: vec!["el motor abortó".to_string()] });
+        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)] });
     let pairs = cap_outer.lock().unwrap().clone();
     (result, pairs)
 }
@@ -1703,7 +1722,7 @@ pub fn run_capturing_decide(
         })
         .expect("hilo del motor")
         .join()
-        .unwrap_or_else(|_| RunResult { success: false, output: Vec::new(), errors: vec!["el motor abortó".to_string()] });
+        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)] });
     let pairs = cap_outer.lock().unwrap().clone();
     (result, pairs)
 }
@@ -1730,7 +1749,7 @@ pub fn run_with_llm(source: &str, filename: &str, responses: HashMap<String, Str
         })
         .expect("hilo del motor")
         .join()
-        .unwrap_or_else(|_| RunResult { success: false, output: Vec::new(), errors: vec!["el motor abortó".to_string()] })
+        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)] })
 }
 
 /// Corre con un proveedor LLM tool-aware GUIONADO (host-config, FASE 1): cablea
@@ -1773,7 +1792,7 @@ pub fn run_with_llm_steps(source: &str, filename: &str, steps: Vec<LlmStepRespon
         })
         .expect("hilo del motor")
         .join()
-        .unwrap_or_else(|_| RunResult { success: false, output: Vec::new(), errors: vec!["el motor abortó".to_string()] })
+        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)] })
 }
 
 /// Corre con un callback de STREAMING guionado (host-config, F2): `llm_stream` recibe
@@ -1804,7 +1823,7 @@ pub fn run_with_llm_stream(source: &str, filename: &str, chunks: Vec<String>) ->
         })
         .expect("hilo del motor")
         .join()
-        .unwrap_or_else(|_| RunResult { success: false, output: Vec::new(), errors: vec!["el motor abortó".to_string()] })
+        .unwrap_or_else(|p| RunResult { success: false, output: Vec::new(), errors: vec![abort_message(&p)] })
 }
 
 // =========================================================
@@ -2163,10 +2182,10 @@ impl Engine {
             .spawn(move || run_swarm_inner(&src, &fname, swarm, ceiling_arc))
             .expect("no se pudo crear el hilo del motor")
             .join()
-            .unwrap_or_else(|_| RunResult {
+            .unwrap_or_else(|p| RunResult {
                 success: false,
                 output: Vec::new(),
-                errors: vec!["el motor abortó (probable desborde de stack nativo)".to_string()],
+                errors: vec![abort_message(&p)],
             })
     }
 }

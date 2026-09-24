@@ -79,12 +79,20 @@ const MAX_DEPTH: usize = 64;
 /// La MISMA capability `net(host)` que http_*/fetch/ws_connect (G22): scope =
 /// hostname minúsculas sin puerto; sin host extraíble → URL crudo (fail-closed).
 pub(crate) fn require_net(caps: &Rc<RefCell<CapabilitySet>>, url: &str, source: &str) -> Result<(), Control> {
+    // Sin host extraíble no hay a qué darle permiso: error, y SIN ecoar el URL (puede llevar
+    // `user:pass@` o la clave de un RPC en la ruta).
     let host = match url_hostname(url) {
         Some(h) if !h.is_empty() => h,
-        _ => url.to_string(),
+        _ => {
+            return Err(Control::Error(synsema_core::interpreter::RuntimeError::new(format!(
+                "{}: the URL has no host (expected scheme://host/…)",
+                source
+            ))))
+        }
     };
+    let scope = synsema_capabilities::model::net_request_scope(url).unwrap_or(host);
     caps.borrow_mut()
-        .require(&Capability::new(CapabilityType::Net, Some(host)), source)
+        .require(&Capability::new(CapabilityType::Net, Some(scope)), source)
         .map_err(|v| Control::Error(v.into_error()))
 }
 
@@ -143,6 +151,28 @@ impl PollError {
     }
 }
 
+thread_local! {
+    /// El cuerpo de la última respuesta que traía un entero de más de 64 bits (serde_json lo
+    /// guarda como f64): los lectores crudos (`evm_rpc`, `solana_rpc`, `btc_rpc`, algod) lo
+    /// re-parsean exacto con `json_exact`.
+    static LAST_WIDE_BODY: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// El valor de una respuesta, exacto: si `v` no tiene enteros anchos, `json_to_syn`; si los
+/// tiene, el cuerpo re-parseado con `json_exact` (y su campo `field`, p. ej. `"result"`).
+pub(crate) fn exact_value(v: &serde_json::Value, field: Option<&str>) -> SynValue {
+    if !crate::json::has_wide_int(v) {
+        return json_to_syn(v);
+    }
+    let exact = LAST_WIDE_BODY.with(|b| b.borrow_mut().take()).and_then(|body| crate::json_exact::parse(&body).ok());
+    let exact = match (exact, field) {
+        (Some(SynValue::Map(m)), Some(f)) => m.borrow().get(f).cloned(),
+        (Some(x), None) => Some(x),
+        _ => None,
+    };
+    exact.unwrap_or_else(|| json_to_syn(v))
+}
+
 /// HttpResult → JSON parseado con los chequeos G23, clasificado: error de
 /// transporte y HTTP 5xx → `Transient`; body sobre el techo, 4xx y JSON
 /// inválido → `Definitive`.
@@ -181,7 +211,13 @@ pub(crate) fn http_result_to_json_classified(
             PollError::Definitive(c)
         });
     }
-    serde_json::from_str(&r.body).map_err(|e| {
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&r.body);
+    if let Ok(v) = &parsed {
+        if crate::json::has_wide_int(v) {
+            LAST_WIDE_BODY.with(|b| *b.borrow_mut() = Some(r.body.clone()));
+        }
+    }
+    parsed.map_err(|e| {
         PollError::Definitive(err(format!(
             "{}: {} returned invalid JSON: {}",
             fname,
@@ -231,7 +267,8 @@ pub(crate) fn jsonrpc_call_headers_classified(
             host_of(url)
         )))
     })?;
-    if let Some(e) = obj.get("error") {
+    // JSON-RPC 1.0 (Bitcoin Core) manda `"error": null` en TODA respuesta buena: null no es error.
+    if let Some(e) = obj.get("error").filter(|e| !e.is_null()) {
         let code = e
             .get("code")
             .and_then(serde_json::Value::as_i64)
@@ -576,7 +613,7 @@ pub(crate) fn syn_to_plain_json(v: &SynValue, path: &str, fname: &str, depth: us
             Number::Int(i) => Ok(Json::Int(*i)),
             Number::Big(b) => Ok(Json::BigInt(b.to_string())),
             Number::Float(f) => Ok(Json::Float(*f)),
-            Number::Decimal(d) => Ok(Json::BigInt(d.to_string())),
+            Number::Decimal(_) | Number::BigDec(_) => Ok(Json::BigInt(n.to_string())),
         },
         SynValue::Text(s) => Ok(Json::Str(s.to_string())),
         SynValue::Bool(b) => Ok(Json::Bool(*b)),
@@ -733,7 +770,7 @@ fn evm_rpc(
     let method = text_arg(arg(args, 1, F)?, "the method", F)?;
     let params = params_arg(args.get(2), F, syn_to_eth_json)?;
     let result = jsonrpc_call(&url, &method, params, F, RPC_HTTP_TIMEOUT_SECS)?;
-    Ok(json_to_syn(&result))
+    Ok(exact_value(&result, Some("result")))
 }
 
 /// Helper: llamada tipada que devuelve un hex-quantity → int.
@@ -847,6 +884,10 @@ fn evm_logs(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynV
                     SynValue::List(l) => l.borrow().clone(),
                     other => return Err(err(format!("{}: topics must be a list, got {}", F, other.type_name()))),
                 };
+                // Un log tiene a lo sumo 4 topics (LOG0..LOG4): un filtro con más no encuentra nada.
+                if items.len() > 4 {
+                    return Err(err(format!("{}: a log has at most 4 topics, the filter has {}", F, items.len())));
+                }
                 let mut out = Vec::new();
                 for (i, t) in items.iter().enumerate() {
                     let path = format!("topics[{}]", i);
@@ -903,7 +944,13 @@ fn evm_estimate_gas(
             )))
         }
     };
-    eth_qty_call(&url, "eth_estimateGas", Json::Array(vec![tx]), "the gas estimate", F)
+    // Con `block` (v0.6.29), la estimación contra el estado de esa altura; sin él, el nodo usa
+    // su default (no se manda el parámetro: algunos nodos viejos no lo aceptan).
+    let params = match args.get(2) {
+        None | Some(SynValue::Nothing) => Json::Array(vec![tx]),
+        b => Json::Array(vec![tx, block_tag(b, F)?]),
+    };
+    eth_qty_call(&url, "eth_estimateGas", params, "the gas estimate", F)
 }
 
 fn evm_call(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
@@ -1259,9 +1306,12 @@ fn evm_fee_history(
             )))
         }
     };
+    // El bloque más nuevo de la ventana (v0.6.29): por defecto "latest", o una altura /
+    // etiqueta como en los demás lectores — para reconstruir una estimación pasada.
+    let newest = block_tag(args.get(3), F)?;
     let params = Json::Array(vec![
         Json::Str(number_to_hexq(&Number::Int(blocks), "blocks", F)?),
-        Json::Str("latest".to_string()),
+        newest,
         Json::Array(percentiles),
     ]);
     let result = jsonrpc_call(&url, "eth_feeHistory", params, F, RPC_HTTP_TIMEOUT_SECS)?;
@@ -1643,6 +1693,10 @@ fn evm_create_address(args: &[SynValue]) -> Result<SynValue, Control> {
         SynValue::Number(n) if n.is_integer() && !n.is_negative() => n.clone(),
         other => return Err(err(format!("{}: the nonce must be a non-negative integer, got {}", F, other))),
     };
+    // EIP-2681: un nonce es menor que 2^64 − 1; una cuenta nunca llega a otro.
+    if nonce.as_bigint().is_none_or(|b| b >= num_bigint::BigInt::from(u64::MAX)) {
+        return Err(err(format!("{}: the nonce must be below 2^64 − 1 (EIP-2681), got {}", F, nonce)));
+    }
     Ok(syn_text(eip55(&create_address(&sender, &nonce, F)?)))
 }
 
@@ -1702,23 +1756,86 @@ fn evm_tx_raw(args: &[SynValue]) -> Result<SynValue, Control> {
             F, v
         )));
     }
-    // Una creación (`evm_tx_create`) trae `from`: la firma TIENE que ser de esa cuenta, o
-    // la `contract_address` que se mostró antes de firmar sería falsa.
+    // Lo que se firma es `fields`: el digest se RECALCULA de ahí (no se confía en el del
+    // mapa) y cada eco que se mostró antes de firmar (`to`, `value`, `nonce`, …) tiene que
+    // decir lo mismo que `fields`. Un mapa editado después de `evm_tx` es error, no una tx
+    // distinta de la que el usuario vio.
+    let digest = {
+        let mut payload = Vec::new();
+        rlp_encode_val(&syn_list(fields.clone()), 0, &mut payload)?;
+        let mut unsigned = Vec::with_capacity(1 + payload.len());
+        unsigned.push(0x02);
+        unsigned.extend_from_slice(&payload);
+        Keccak256::digest(&unsigned).to_vec()
+    };
+    let modified = |what: &str| {
+        err(format!(
+            "{}: {} does not match \"fields\" — the map was modified after evm_tx/evm_tx_create; build it again instead of editing it",
+            F, what
+        ))
+    };
+    if let Some(d) = m.get("digest") {
+        if !matches!(d, SynValue::Bytes(b) if b[..] == digest[..]) {
+            return Err(modified("\"digest\""));
+        }
+    }
+    for (key, idx) in [("chain_id", 0), ("nonce", 1), ("max_priority", 2), ("max_fee", 3), ("gas", 4), ("value", 6)] {
+        if let Some(echo) = m.get(key) {
+            let same = match (echo, &fields[idx]) {
+                (SynValue::Number(a), SynValue::Number(b)) => a.to_string() == b.to_string(),
+                _ => false,
+            };
+            if !same {
+                return Err(modified(&format!("\"{}\"", key)));
+            }
+        }
+    }
+    let to_field: Vec<u8> = match &fields[5] {
+        SynValue::Bytes(b) => b.to_vec(),
+        _ => return Err(modified("the `to` field")),
+    };
+    let is_create = to_field.is_empty();
+    match m.get("to") {
+        None => {}
+        Some(SynValue::Nothing) if is_create => {}
+        Some(t @ SynValue::Text(_)) if !is_create => {
+            if addr20(t, "\"to\"", F)?.as_slice() != to_field.as_slice() {
+                return Err(modified("\"to\""));
+            }
+        }
+        Some(_) => return Err(modified("\"to\"")),
+    }
+    // Una creación TIENE que traer `from` (evm_tx_create): sin él no hay con qué comprobar
+    // el firmante ni la `contract_address` que se mostró antes de firmar.
+    if is_create && m.get("from").is_none() {
+        return Err(err(format!(
+            "{}: a contract creation (empty \"to\") must carry \"from\" — build it with evm_tx_create(…, from = <address>) so the signer and the contract_address can be checked",
+            F
+        )));
+    }
     if let Some(from_v) = m.get("from") {
         let want = addr20(from_v, "\"from\"", F)?;
-        let digest = match m.get("digest") {
-            Some(SynValue::Bytes(d)) if d.len() == 32 => d.to_vec(),
-            _ => return Err(err(format!("{}: the map has no 32-byte \"digest\" — pass the map returned by evm_tx_create unmodified", F))),
-        };
         let pk = crate::blockchain::recover_pubkey(&digest, sig, F)?;
         let got = crate::blockchain::address_of_pubkey(&pk);
         if got != want {
             return Err(err(format!(
-                "{}: the signature is from {}, but the creation declared from {} — the contract_address shown before signing would be wrong; sign with the key of \"from\"",
+                "{}: the signature is from {}, but the transaction declared from {} — sign with the key of \"from\"{}",
                 F,
                 eip55(&got),
-                eip55(&want)
+                eip55(&want),
+                if is_create { " (otherwise the contract_address shown before signing would be wrong)" } else { "" }
             )));
+        }
+        if is_create {
+            let nonce = match &fields[1] {
+                SynValue::Number(n) => n.clone(),
+                _ => return Err(modified("the nonce field")),
+            };
+            let addr = eip55(&create_address(&want, &nonce, F)?);
+            match m.get("contract_address") {
+                Some(SynValue::Text(t)) if t.eq_ignore_ascii_case(&addr) => {}
+                _ => return Err(modified("\"contract_address\"")),
+            }
         }
     }
     let r = Number::from_be_bytes(&sig[..32]);
@@ -1746,7 +1863,7 @@ fn solana_rpc(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<Sy
     let method = text_arg(arg(args, 1, F)?, "the method", F)?;
     let params = params_arg(args.get(2), F, syn_to_plain_json)?;
     let result = jsonrpc_call(&url, &method, params, F, RPC_HTTP_TIMEOUT_SECS)?;
-    Ok(json_to_syn(&result))
+    Ok(exact_value(&result, Some("result")))
 }
 
 /// El envelope `{context, value}` de los métodos "commitment-aware" de Solana.
@@ -2056,7 +2173,7 @@ fn algorand_account(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Res
     // Checksum validado ANTES de tocar la red (una dirección con typo no se consulta).
     address_to_pubkey(&addr, "the address", F)?;
     let v = algod_get(&url, &format!("/v2/accounts/{}", addr), args.get(2), F, RPC_HTTP_TIMEOUT_SECS)?;
-    Ok(json_to_syn(&v))
+    Ok(exact_value(&v, None))
 }
 
 fn algorand_send(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynValue, Control> {
@@ -2128,7 +2245,7 @@ fn algorand_wait(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result
         }
         if let Some(round) = obj.get("confirmed-round").and_then(serde_json::Value::as_u64) {
             if round > 0 {
-                return Ok(json_to_syn(&v));
+                return Ok(exact_value(&v, None));
             }
         }
         if !sleep_step(deadline, ALGORAND_POLL) {
@@ -2158,7 +2275,7 @@ pub(crate) fn register(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet>>) {
     net_builtin!("evm_balance", -1, evm_balance);
     net_builtin!("evm_gas_price", 1, evm_gas_price);
     net_builtin!("evm_chain_id", 1, evm_chain_id);
-    net_builtin!("evm_estimate_gas", 2, evm_estimate_gas);
+    net_builtin!("evm_estimate_gas", -1, evm_estimate_gas);
     net_builtin!("evm_call", -1, evm_call);
     net_builtin!("evm_fee_history", -1, evm_fee_history);
     net_builtin!("evm_send", 2, evm_send);

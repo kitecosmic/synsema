@@ -50,6 +50,7 @@ const JWKS_TTL_SECS: u64 = 600;
 #[cfg_attr(not(feature = "native"), allow(dead_code))]
 const JWKS_MAX_BYTES: usize = 512 * 1024;
 
+#[cfg(test)]
 fn unix_now() -> i64 {
     synsema_core::clock::now_secs()
 }

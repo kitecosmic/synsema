@@ -95,6 +95,75 @@ impl Lexer {
         }
     }
 
+    /// `print(x --1)`: la pista sólo salta si todo apunta a restar un negativo — lo que sigue a
+    /// `--` es un dígito o `(`, antes hay un operando en la misma línea (separado por espacio: lo
+    /// pegado ya lo agarra `glued`), el bracket abierto más interno es un paréntesis y el `)` que
+    /// lo cierra está en ESTA línea, después del `--` (el comentario se lo comería). Cualquier otro
+    /// `--` (una nota en una llamada, lista o mapa de varias líneas, `--TODO`) es un comentario.
+    fn minus_comment_looks_like_subtraction(&self) -> bool {
+        if self.paren_depth <= 0 || !self.peek(2).is_some_and(|c| c.is_ascii_digit() || c == '(') {
+            return false;
+        }
+        let Some(last) = self.tokens.last() else { return false };
+        if last.location.line != self.line
+            || !matches!(
+                last.ty,
+                TokenType::Identifier | TokenType::Number | TokenType::RParen | TokenType::RBracket
+            )
+        {
+            return false;
+        }
+        let mut depth = 0usize;
+        for t in self.tokens.iter().rev() {
+            match t.ty {
+                TokenType::RParen | TokenType::RBracket | TokenType::RBrace => depth += 1,
+                TokenType::LParen | TokenType::LBracket | TokenType::LBrace => {
+                    if depth == 0 {
+                        return t.ty == TokenType::LParen && self.closing_paren_on_this_line();
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// ¿El `)` que cierra el paréntesis abierto está en esta línea, después del `--` actual?
+    /// Cuenta paréntesis hasta el fin de línea, salteando textos entre comillas.
+    fn closing_paren_on_this_line(&self) -> bool {
+        let mut depth = 1i64;
+        let mut i = self.pos + 2;
+        let mut quote: Option<char> = None;
+        while let Some(&c) = self.source.get(i) {
+            if c == '\n' {
+                return false;
+            }
+            match quote {
+                Some(q) => {
+                    if c == '\\' {
+                        i += 1;
+                    } else if c == q {
+                        quote = None;
+                    }
+                }
+                None => match c {
+                    '"' | '\'' | '`' => quote = Some(c),
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                },
+            }
+            i += 1;
+        }
+        false
+    }
+
     fn location(&self) -> SourceLocation {
         SourceLocation {
             file: self.filename.clone(),
@@ -197,6 +266,47 @@ impl Lexer {
         Ok(())
     }
 
+    /// `\uXXXX` y `\u{1F600}` (1 a 6 hex) (v0.6.29), mirando lo que sigue a la `u` ya
+    /// consumida: `Some((carácter, cuántos chars más consumir))` si es un escape válido. Si no
+    /// lo es (`"C:\users"`), `None` y queda literal, como antes. `\x` NO es escape (una ruta
+    /// `C:\build\x64` o una regex `a\x2eb` quedan como estaban); en un backtick `\u{…}` tampoco
+    /// (ahí `{…}` es interpolación: `x\u{a}y` sigue interpolando `a`), `braces = false`.
+    fn unicode_escape(&self, braces: bool) -> Option<(char, usize)> {
+        let hex_at = |i: usize| self.peek(i).filter(|c| c.is_ascii_hexdigit());
+        if self.peek(0) == Some('{') {
+            if !braces {
+                return None;
+            }
+            let mut n = 1;
+            let mut digits = String::new();
+            while let Some(c) = hex_at(n) {
+                digits.push(c);
+                n += 1;
+                if digits.len() > 6 {
+                    return None;
+                }
+            }
+            if digits.is_empty() || self.peek(n) != Some('}') {
+                return None;
+            }
+            let v = u32::from_str_radix(&digits, 16).ok()?;
+            return char::from_u32(v).map(|c| (c, n + 1));
+        }
+        let hex4 = |from: usize| -> Option<u32> {
+            let digits: String = (from..from + 4).map(hex_at).collect::<Option<String>>()?;
+            u32::from_str_radix(&digits, 16).ok()
+        };
+        let v = hex4(0)?;
+        // Un par sustituto (`\uD83D\uDE00`, como lo escriben JSON y JavaScript) es UN carácter.
+        if (0xD800..0xDC00).contains(&v) && self.peek(4) == Some('\\') && self.peek(5) == Some('u') {
+            let lo = hex4(6)?;
+            if (0xDC00..0xE000).contains(&lo) {
+                return char::from_u32(0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00)).map(|c| (c, 10));
+            }
+        }
+        char::from_u32(v).map(|c| (c, 4))
+    }
+
     /// Lee un literal de string. Soporta secuencias de escape.
     fn read_string(&mut self, quote: char) -> Result<(), LexerError> {
         let loc = self.location();
@@ -216,6 +326,13 @@ impl Lexer {
                     Some('\\') => chars.push('\\'),
                     Some('"') => chars.push('"'),
                     Some('\'') => chars.push('\''),
+                    Some('u') if self.unicode_escape(true).is_some() => {
+                        let (ch, n) = self.unicode_escape(true).unwrap();
+                        for _ in 0..n {
+                            self.advance();
+                        }
+                        chars.push(ch);
+                    }
                     // Escape no mapeado: backslash + char (escape_map.get(escape, f'\\{escape}'))
                     Some(other) => {
                         chars.push('\\');
@@ -268,6 +385,13 @@ impl Lexer {
                     Some('\'') => chars.push('\''),
                     Some('`') => chars.push('`'),
                     Some('{') => chars.push('{'),
+                    Some('u') if self.unicode_escape(false).is_some() => {
+                        let (ch, n) = self.unicode_escape(false).unwrap();
+                        for _ in 0..n {
+                            self.advance();
+                        }
+                        chars.push(ch);
+                    }
                     // Escape no mapeado: backslash + char (igual que read_string).
                     Some(other) => {
                         chars.push('\\');
@@ -350,6 +474,16 @@ impl Lexer {
     /// Lee un literal numérico: entero (decimal, `0x…`, `0b…`), float (`1.5`, `1e-9`,
     /// `1.5e3`) o decimal (`1.50d`). `_` separa dígitos en todas las formas.
     fn read_number(&mut self) -> Result<(), LexerError> {
+        /// `_` sólo entre dos dígitos (como Python): `1_000`, no `1__0`, `1_`, `1_.5` ni `1e_3`.
+        /// Tras el prefijo de base (`0x_1f`) también vale, como en Python.
+        fn underscores_ok(s: &str, radix: u32, after_prefix: bool) -> bool {
+            let c: Vec<char> = s.chars().collect();
+            (0..c.len()).all(|i| {
+                c[i] != '_'
+                    || ((i > 0 && c[i - 1].is_digit(radix)) || (i == 0 && after_prefix))
+                        && c.get(i + 1).is_some_and(|n| n.is_digit(radix))
+            })
+        }
         let loc = self.location();
         let start = self.pos;
         let mut has_dot = false;
@@ -360,6 +494,7 @@ impl Lexer {
             if let Some(p) = self.peek(1) {
                 let radix = match p {
                     'x' | 'X' => Some(16),
+                    'o' | 'O' => Some(8),
                     'b' | 'B' => Some(2),
                     _ => None,
                 };
@@ -378,13 +513,23 @@ impl Lexer {
                     let clean: String =
                         self.slice(digits_start, self.pos).chars().filter(|c| *c != '_').collect();
                     let bad_tail = matches!(self.peek(0), Some(c) if c.is_alphanumeric());
+                    let (name, what) = match radix {
+                        16 => ("hex", "hex (0-9, a-f)"),
+                        8 => ("octal", "octal (0-7)"),
+                        _ => ("binary", "binary (0 or 1)"),
+                    };
                     if clean.is_empty() || bad_tail {
-                        let what = if radix == 16 { "hex (0-9, a-f)" } else { "binary (0 or 1)" };
                         return Err(LexerError::new(
-                            format!("Invalid {} literal: {} — expected {} digits after the prefix", 
-                                if radix == 16 { "hex" } else { "binary" },
+                            format!("Invalid {} literal: {} — expected {} digits after the prefix",
+                                name,
                                 if bad_tail { format!("{}{}", raw, self.peek(0).unwrap()) } else { raw.clone() },
                                 what),
+                            loc,
+                        ));
+                    }
+                    if !underscores_ok(&raw[2..], radix, true) {
+                        return Err(LexerError::new(
+                            format!("Invalid {} literal: {} — `_` goes only between two digits (1_000)", name, raw),
                             loc,
                         ));
                     }
@@ -442,12 +587,19 @@ impl Lexer {
         }
 
         let raw = self.slice(start, self.pos);
+        if !underscores_ok(&raw, 10, false) {
+            return Err(LexerError::new(
+                format!("Invalid number literal: {} — `_` goes only between two digits (1_000, 1_000.5)", raw),
+                loc,
+            ));
+        }
         // dígitos sin separadores `_` ni el sufijo `d`.
         let clean: String = raw.chars().filter(|c| *c != '_' && *c != 'd').collect();
         let value = if is_decimal {
-            Number::Decimal(rust_decimal::Decimal::from_str_exact(&clean).map_err(|_| {
+            // Cualquier cantidad de dígitos (v0.6.29): más de 28 es un decimal grande, exacto.
+            Number::parse_decimal(&clean).ok_or_else(|| {
                 LexerError::new(format!("Invalid decimal literal: {}", raw), loc.clone())
-            })?)
+            })?
         } else if has_dot || has_exp {
             Number::Float(clean.parse::<f64>().map_err(|_| {
                 LexerError::new(format!("Invalid float literal: {}", raw), loc.clone())
@@ -555,9 +707,21 @@ impl Lexer {
             if ch == '-' && self.peek(1) == Some('-') {
                 let prev = if self.pos == 0 { None } else { self.source.get(self.pos - 1).copied() };
                 let glued = matches!(prev, Some(c) if !c.is_whitespace() && !matches!(c, '(' | '[' | '{' | ','));
-                if glued {
+                // Pegado a un valor, `--` es error SÓLO si lo que sigue es un número o `(`: `5--1`
+                // y `x--(y)` son la ambigüedad real (un resultado aritmético silencioso). El resto
+                // (`print(1)--nota`, `x--nota`, `"a"--nota`) es un comentario, como en v0.6.28.
+                let arithmetic_after = self.peek(2).is_some_and(|c| c.is_ascii_digit() || c == '(');
+                if glued && arithmetic_after {
                     return Err(LexerError::new(
                         "`--` right after a value: a comment needs a space before `--`, and a negative operand needs a space after the operator (write `5 - -1`, or `5 -- comment`)",
+                        self.location(),
+                    ));
+                }
+                // `print(x --1)`: con un paréntesis abierto, `--` pegado a lo que sigue casi seguro
+                // quería restar un negativo; como comentario se come el `)` y el error sale lejos.
+                if self.minus_comment_looks_like_subtraction() {
+                    return Err(LexerError::new(
+                        "`--` starts a comment (the rest of the line, including a closing `)`, is ignored) — to subtract a negative write `x - -1`; a comment inside parentheses needs a space after `--`",
                         self.location(),
                     ));
                 }
@@ -708,8 +872,14 @@ impl Lexer {
                 self.emit(TokenType::Colon, TokenValue::Str(":".into()), loc, ":".into());
             } else {
                 self.advance();
+                let hint = match ch {
+                    '?' => " — no `c ? a : b`: the inline form is `when c then a otherwise b`",
+                    '&' | '|' => " — the logical operators are `and` / `or`",
+                    ';' => " — one statement per line (no `;`)",
+                    _ => "",
+                };
                 return Err(LexerError::new(
-                    format!("Unexpected character: {}", py_char_repr(ch)),
+                    format!("Unexpected character: {}{}", py_char_repr(ch), hint),
                     loc,
                 ));
             }

@@ -147,8 +147,23 @@ pub fn url_hostname(url: &str) -> Option<String> {
         Some(i) => &netloc[i + 1..],
         None => netloc,
     };
+    // IPv6 entre corchetes (`[::1]:8080`, `[::1]`): el host es lo de adentro.
+    if let Some(inner) = host_port.strip_prefix('[') {
+        let close = inner.find(']')?;
+        let rest = &inner[close + 1..];
+        if !(rest.is_empty() || (rest.starts_with(':') && rest[1..].bytes().all(|b| b.is_ascii_digit()))) {
+            return Some(String::new());
+        }
+        return Some(inner[..close].to_lowercase());
+    }
     let host = match host_port.rfind(':') {
-        Some(i) => &host_port[..i],
+        Some(i) => {
+            // `host:1:2` (dos puertos) no es un host: sin host, fail-closed.
+            if host_port[..i].contains(':') || !host_port[i + 1..].bytes().all(|b| b.is_ascii_digit()) {
+                return Some(String::new());
+            }
+            &host_port[..i]
+        }
         None => host_port,
     };
     Some(host.to_lowercase())
@@ -478,7 +493,15 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     };
                 }
                 // rango por líneas (1-based)
-                let offset = arg_i64(arg(args, 1)?)?;
+                let offset = match arg(args, 1)? {
+                    SynValue::Number(_) => arg_i64(arg(args, 1)?)?,
+                    other => {
+                        return Err(Control::Error(RuntimeError::new(format!(
+                            "read_file(path, offset, limit?): offset is the first line to read (a number ≥ 1), got {} — to read a file that may not exist, check file_exists(path) first, or catch it with try/recover",
+                            other.type_name()
+                        ))))
+                    }
+                };
                 if offset < 1 {
                     return Err(Control::Error(RuntimeError::new(
                         "read_file: offset must be >= 1",
@@ -1286,7 +1309,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 let ts = arg_f64(arg(args, 0)?)?;
                 let dt = ts_to_utc(ts)?;
                 let out = match opt_pattern(args) {
-                    Some(p) => dt.format(&p).to_string(),
+                    Some(p) => synsema_core::temporal::strftime(&p, "format_time", "", |it| dt.format_with_items(it))?,
                     None => dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
                 };
                 Ok(syn_text(out))

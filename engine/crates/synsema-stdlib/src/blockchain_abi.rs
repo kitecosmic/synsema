@@ -1134,6 +1134,14 @@ fn event_from_fragment(v: &SynValue, fname: &str) -> Result<EventDef, Control> {
             }
             _ => unreachable!("json_abi_type ya exigió un map"),
         };
+        // Dos campos con el mismo nombre (o uno sin nombre, `arg<i>`, que choca con uno que se
+        // llama así) se pisarían en el mapa decodificado: error en vez de perder un valor.
+        if let Some(prev) = inputs.iter().position(|e: &EventInput| e.name == nm) {
+            return Err(err(format!(
+                "{}: inputs[{}] and inputs[{}] would both be named {:?} in the decoded map — give them distinct names",
+                fname, prev, i, nm
+            )));
+        }
         inputs.push(EventInput { name: nm, ty, indexed });
     }
     let canonical = format!("{}({})", name, canon_types.join(","));

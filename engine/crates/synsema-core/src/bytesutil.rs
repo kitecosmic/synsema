@@ -35,6 +35,11 @@ fn hex_val(c: u8) -> Option<u8> {
 /// Decodifica hex → bytes. Error si la longitud es impar o hay un char no-hex.
 /// La cadena vacía decodifica a `[]` (longitud 0, par).
 pub fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
+    // Primero el carácter que no es hex (con su posición): " 0x00" tiene un espacio, no un
+    // largo impar.
+    if let Some((i, c)) = s.chars().enumerate().find(|(_, c)| !c.is_ascii_hexdigit()) {
+        return Err(format!("invalid hex character: {:?} at position {}", c, i));
+    }
     let bytes = s.as_bytes();
     if !bytes.len().is_multiple_of(2) {
         return Err("invalid hex: odd-length string".to_string());

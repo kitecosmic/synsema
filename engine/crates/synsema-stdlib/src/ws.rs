@@ -439,12 +439,20 @@ type Registry = Rc<RefCell<WsRegistry>>;
 // =========================================================
 
 fn require_net(caps: &Rc<RefCell<CapabilitySet>>, url: &str) -> Result<(), Control> {
+    // Sin host extraíble no hay a qué darle permiso: error, y SIN ecoar el URL (puede llevar
+    // `user:pass@` o la clave de un RPC en la ruta).
     let host = match url_hostname(url) {
         Some(h) if !h.is_empty() => h,
-        _ => url.to_string(),
+        _ => {
+            return Err(Control::Error(RuntimeError::new(format!(
+                "{}: the URL has no host (expected scheme://host/…)",
+                "ws_connect()"
+            ))))
+        }
     };
+    let scope = synsema_capabilities::model::net_request_scope(url).unwrap_or(host);
     caps.borrow_mut()
-        .require(&Capability::new(CapabilityType::Net, Some(host)), "ws_connect()")
+        .require(&Capability::new(CapabilityType::Net, Some(scope)), "ws_connect()")
         .map_err(|v| Control::Error(v.into_error()))
 }
 

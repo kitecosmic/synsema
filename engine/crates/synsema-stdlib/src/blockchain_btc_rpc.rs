@@ -39,7 +39,6 @@ use crate::blockchain_rpc::{
     MAX_RPC_RESPONSE, RPC_HTTP_TIMEOUT_SECS, deadline_from,
 };
 use crate::http::{http_request, HttpResult};
-use crate::json::json_to_syn;
 
 /// Paso de polling de `btc_wait` (los bloques tardan ~10 min, pero la aparición
 /// en mempool es inmediata y los tests usan mocks — 2 s equilibra ambos).
@@ -518,7 +517,7 @@ fn btc_rpc(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynVa
     let result =
         jsonrpc_call_headers_classified(&url, &method, params, F, RPC_HTTP_TIMEOUT_SECS, &headers)
             .map_err(PollError::into_control)?;
-    Ok(json_to_syn(&result))
+    Ok(crate::blockchain_rpc::exact_value(&result, Some("result")))
 }
 
 // =========================================================

@@ -454,10 +454,15 @@ pub fn round_to(args: &[SynValue]) -> Result<SynValue, Control> {
     // v0.6.29 (DATOS-7): un decimal se redondea EN decimal y sigue siendo decimal (mitad al
     // par, como `round`); un float redondea su valor binario REAL, como Python y numpy —
     // 2.675 es en realidad 2.67499999…, así que da 2.67 (multiplicar por 100 daba 2.68).
-    if let Number::Decimal(dd) = value {
-        return Ok(syn_number(Number::Decimal(
-            dd.round_dp_with_strategy(decimals.min(28) as u32, rust_decimal::RoundingStrategy::MidpointNearestEven),
-        )));
+    if value.is_decimal() {
+        // Exacto a cualquier tamaño, mitad al par; la escala queda en `decimals` si tenía más.
+        let (m, s) = value.exact_ratio().unwrap();
+        let k = decimals.min(u32::MAX as i64) as u32;
+        if s <= k {
+            return Ok(syn_number(value));
+        }
+        let q = crate::number::div_round_half_even(&m, &crate::number::pow10_big(s - k));
+        return Ok(syn_number(Number::decimal_from_parts(q, k)));
     }
     if value.is_integer() {
         return Ok(syn_number(value));

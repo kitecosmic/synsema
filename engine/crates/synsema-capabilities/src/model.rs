@@ -235,6 +235,17 @@ pub struct Capability {
 
 impl Capability {
     pub fn new(ty: CapabilityType, scope: Option<String>) -> Self {
+        // `net` es un permiso por HOST, o por `host:puerto` si el puerto se escribió:
+        // `require net("https://user:pw@api.x.com/v1?key=…")` se guarda como `api.x.com` y
+        // `net("http://localhost:8545")` como `localhost:8545` (sólo ese puerto: un permiso nunca
+        // es más amplio que lo declarado). Nunca queda en el scope (ni en el audit, ni en un
+        // mensaje) lo que un URL trae además: credenciales, ruta, query.
+        let scope = match (ty, scope) {
+            (CapabilityType::Net, Some(s)) if s.contains("://") => Some(net_host_of(&s)),
+            (CapabilityType::Net, Some(s)) if s.starts_with('[') && s.ends_with(']') => Some(s[1..s.len() - 1].to_lowercase()),
+            (CapabilityType::Net, Some(s)) if s.starts_with('[') => Some(s.to_lowercase()),
+            (_, s) => s,
+        };
         Self { ty, scope }
     }
 
@@ -301,6 +312,13 @@ impl Capability {
                         let grant = case_fold(canon(self_scope));
                         let req = case_fold(canon(other_scope));
                         grant == req || fnmatch(&req, &grant)
+                    } else if self.ty == CapabilityType::Net {
+                        // Host y puerto por separado: un grant sin puerto cubre cualquier puerto
+                        // del host; con puerto, sólo ese.
+                        let (gh, gp) = split_net_scope(self_scope);
+                        let (rh, rp) = split_net_scope(other_scope);
+                        let host_ok = gh == rh || fnmatch(rh, gh) || self_scope == other_scope;
+                        host_ok && (gp.is_none() || gp == rp)
                     } else {
                         self_scope == other_scope || fnmatch(other_scope, self_scope)
                     }
@@ -318,6 +336,71 @@ impl fmt::Display for Capability {
             _ => write!(f, "{}", self.ty.name_lower()),
         }
     }
+}
+
+/// El host y el puerto EXPLÍCITO de un URL (minúsculas, sin credenciales): `(host, puerto)`.
+/// IPv6 va sin corchetes. `None` de puerto si el URL no lo escribe.
+fn url_host_port(url: &str) -> (String, Option<String>) {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let hostport = authority.rsplit('@').next().unwrap_or("");
+    let (host, port) = if let Some(inner) = hostport.strip_prefix('[') {
+        let (h, after) = inner.split_once(']').unwrap_or((inner, ""));
+        (h, after.strip_prefix(':'))
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (hostport, None),
+        }
+    };
+    let port = port.filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())).map(str::to_string);
+    (host.to_lowercase(), port)
+}
+
+/// `host` o `host:puerto` (IPv6 con puerto: `[::1]:8545`).
+fn join_net_scope(host: &str, port: Option<&str>) -> String {
+    match port {
+        Some(p) if host.contains(':') => format!("[{}]:{}", host, p),
+        Some(p) => format!("{}:{}", host, p),
+        None => host.to_string(),
+    }
+}
+
+/// Un scope de `net` → `(host, puerto)`. `[::1]:8545` y `host:8545` llevan puerto; `::1` (IPv6
+/// sin corchetes) y `host` no.
+pub fn split_net_scope(scope: &str) -> (&str, Option<&str>) {
+    if let Some(inner) = scope.strip_prefix('[') {
+        if let Some((h, after)) = inner.split_once(']') {
+            return (h, after.strip_prefix(':').filter(|p| !p.is_empty()));
+        }
+    }
+    match scope.rsplit_once(':') {
+        Some((h, p)) if !h.contains(':') && !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => (h, Some(p)),
+        _ => (scope, None),
+    }
+}
+
+/// El scope de `net` que declara un URL: su host, más el puerto si el URL lo escribe. Un URL
+/// sin host queda como `<no host>` (no cubre nada, y no ecoa el URL).
+fn net_host_of(url: &str) -> String {
+    let (host, port) = url_host_port(url);
+    if host.is_empty() {
+        "<no host>".to_string()
+    } else {
+        join_net_scope(&host, port.as_deref())
+    }
+}
+
+/// El scope de `net` que PIDE una conexión a `url`: el host, más el puerto si el URL lo escribe
+/// (`127.0.0.1:8545`). Sin puerto escrito se pide el host solo, como siempre (y los mensajes no
+/// cambian): lo cubre un grant sin puerto, y uno con puerto no, porque no dice ese puerto.
+/// `None` si no hay host.
+pub fn net_request_scope(url: &str) -> Option<String> {
+    let (host, port) = url_host_port(url);
+    if host.is_empty() {
+        return None;
+    }
+    Some(join_net_scope(&host, port.as_deref()))
 }
 
 /// Canoniza una URL de conexión (Postgres/MySQL/…) a `scheme://host/dbname`:

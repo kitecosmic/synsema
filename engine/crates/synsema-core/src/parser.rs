@@ -111,7 +111,7 @@ fn token_value_repr(v: &TokenValue) -> String {
         TokenValue::Number(Number::Int(n)) => n.to_string(),
         TokenValue::Number(Number::Big(b)) => b.to_string(),
         TokenValue::Number(Number::Float(x)) => py_float_repr(*x),
-        TokenValue::Number(Number::Decimal(d)) => d.to_string(),
+        TokenValue::Number(n @ (Number::Decimal(_) | Number::BigDec(_))) => n.to_string(),
         TokenValue::Str(s) => py_repr_str(s),
         TokenValue::Int(n) => n.to_string(),
         // Un TEMPLATE siempre tiene su propio arm en parse_primary, así que nunca
@@ -164,11 +164,63 @@ impl Parser {
         tok
     }
 
+    /// Pista para el token en `idx` cuando es un reflejo de Python/JS (v0.6.29): `x += 1`,
+    /// `f"…"`, `x is None`, `a if c else b`, `xs[1:]`, `type(x)`, `lambda y: y`.
+    fn reflex_note(&self, idx: usize) -> Option<&'static str> {
+        let cur = self.tokens.get(idx)?;
+        let prev = if idx > 0 { self.tokens.get(idx - 1) } else { None };
+        let prev_ty = prev.map(|p| p.ty);
+        Some(match cur.ty {
+            TokenType::Assign
+                if matches!(
+                    prev_ty,
+                    Some(TokenType::Plus | TokenType::Minus | TokenType::Star | TokenType::Slash | TokenType::Percent)
+                ) =>
+            {
+                "Synsema has no compound assignment (`+=`): write set x to x + 1"
+            }
+            TokenType::Text if prev.is_some_and(|p| {
+                p.ty == TokenType::Identifier
+                    && matches!(p.raw.as_str(), "f" | "F" | "fr" | "rf")
+                    && p.location.line == cur.location.line
+            }) =>
+            {
+                "an f-string is a template with backticks here: `total: {x}`"
+            }
+            TokenType::Text if prev.is_some_and(|p| {
+                p.ty == TokenType::Identifier && matches!(p.raw.as_str(), "b" | "B") && p.location.line == cur.location.line
+            }) =>
+            {
+                "a bytes literal is bytes(\"text\", \"utf8\") or bytes(\"00ff\", \"hex\")"
+            }
+            TokenType::Is => "`is` belongs to match arms; compare with == (x == nothing, or is_missing(x))",
+            TokenType::Identifier if cur.raw == "if" => {
+                "no `a if c else b`: the inline form is `when c then a otherwise b`"
+            }
+            TokenType::Identifier if cur.raw == "for" => {
+                "no comprehensions: apply(xs, (v) => …) to transform, where(xs, (v) => …) to filter"
+            }
+            TokenType::Colon if prev_ty.is_some() && self.tokens[..idx].iter().rev().take_while(|t| t.ty != TokenType::Newline).any(|t| t.ty == TokenType::LBracket) => {
+                "no slice syntax: slice(xs, start, end?) (negative counts from the end)"
+            }
+            TokenType::Identifier | TokenType::Colon if prev.is_some_and(|p| p.raw == "lambda") => {
+                "a lambda is (y) => y"
+            }
+            TokenType::Type if self.tokens.get(idx + 1).is_some_and(|t| t.ty == TokenType::LParen) => {
+                "the type of a value is type_of(x)"
+            }
+            _ => return None,
+        })
+    }
+
     fn expect(&mut self, ty: TokenType, message: &str) -> Result<Token, ParseError> {
         if self.current().ty != ty {
             let cur = self.current();
             let msg = if message.is_empty() {
-                format!("Expected {}, got {}", ty.name(), cur.ty.name())
+                match self.reflex_note(self.pos) {
+                    Some(h) => format!("Expected {}, got {} — {}", ty.name(), cur.ty.name(), h),
+                    None => format!("Expected {}, got {}", ty.name(), cur.ty.name()),
+                }
             } else {
                 message.to_string()
             };
@@ -304,7 +356,13 @@ impl Parser {
             self.skip_newlines();
         }
 
-        Ok(Program { location: loc, statements })
+        let escape_lines = self
+            .tokens
+            .iter()
+            .filter(|t| matches!(t.ty, TokenType::Text | TokenType::Template) && has_unicode_escape(&t.raw, t.ty == TokenType::Text))
+            .map(|t| t.location.line)
+            .collect();
+        Ok(Program { location: loc, statements, escape_lines })
     }
 
     // =========================================================
@@ -327,6 +385,18 @@ impl Parser {
                 ),
                 tok.location,
             ));
+        }
+        // `else` / `pass` / `break` / `continue` solos en su línea (sin nada después, ni `:`):
+        // la sentencia termina bien y el error saldría lejos ("Unexpected token: INDENT").
+        if self.check(TokenType::Identifier)
+            && matches!(self.peek(1).ty, TokenType::Newline | TokenType::Eof | TokenType::Dedent)
+        {
+            let tok = self.current().clone();
+            if matches!(tok.raw.as_str(), "else" | "pass" | "break" | "continue" | "elif" | "except" | "finally") {
+                if let Some(h) = crate::reflexes::statement_hint(&tok.raw) {
+                    return Err(ParseError::new(format!("`{}` is not a Synsema statement: {}", tok.raw, h), tok.location));
+                }
+            }
         }
         let first_tok = self.current().clone();
 
@@ -497,6 +567,19 @@ impl Parser {
         // comía el resto, y `let x be when c then raise "boom"` dejaba x valiendo el builtin
         // `raise` sin llamarlo. Es la raíz de la clase que el `when … then` en posición de
         // sentencia sólo tapaba en un caso.
+        // `if (x > 0)` / `while (…)` con un cuerpo indentado debajo: se lee como la llamada
+        // `if(…)` y el error saldría en la línea siguiente ("Unexpected token: INDENT").
+        if first_tok.ty == TokenType::Identifier
+            && self.check(TokenType::Newline)
+            && self.peek(1).ty == TokenType::Indent
+        {
+            if let Some(h) = crate::reflexes::statement_hint(&first_tok.raw) {
+                return Err(ParseError::new(
+                    format!("`{}` is not a Synsema statement: {}", first_tok.raw, h),
+                    first_tok.location.clone(),
+                ));
+            }
+        }
         let ended_block = self.pos > 0
             && matches!(self.tokens[self.pos - 1].ty, TokenType::Dedent | TokenType::Newline);
         if !ended_block
@@ -518,6 +601,9 @@ impl Parser {
                     "Synsema blocks have no colon: end the line and indent the body on the next one",
                     tok.location.clone(),
                 ));
+            }
+            if let Some(h) = self.reflex_note(self.pos) {
+                return Err(ParseError::new(format!("unexpected {} — {}", tok.ty.name(), h), tok.location.clone()));
             }
             return Err(ParseError::new(
                 format!(
@@ -1103,6 +1189,13 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         let try_body = self.parse_block()?;
 
         self.skip_newlines();
+        // `try: … except …` / `catch`: la forma de Synsema en el mensaje.
+        if !self.check(TokenType::Recover) && matches!(self.current().raw.as_str(), "except" | "catch") {
+            return Err(ParseError::new(
+                format!("`{}` is not Synsema: after the try block write `recover err` (the error text is in `err`)", self.current().raw),
+                self.location(),
+            ));
+        }
         self.expect(TokenType::Recover, "Expected 'recover' after try block")?;
 
         let mut error_var = "error".to_string();
@@ -1376,7 +1469,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
             "Expected a duration after 'within' (e.g. within 90s, 2m, 1h, 1d)",
         )?;
         let n = num_tok.as_number();
-        if matches!(n, Number::Decimal(_)) {
+        if n.is_decimal() {
             // sufijo `d` ya consumido por el lexer (literal Decimal) → días
             return Ok(Some(n.to_f64() * 86400.0));
         }
@@ -2369,6 +2462,9 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                 if !self.check(TokenType::RParen) {
                     args.push(self.parse_arg()?);
                     while self.match_tok(TokenType::Comma).is_some() {
+                        if self.check(TokenType::RParen) {
+                            break; // coma final, como en listas y mapas (y en Python)
+                        }
                         args.push(self.parse_arg()?);
                     }
                 }
@@ -2523,12 +2619,21 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
     ) -> Result<Node, ParseError> {
         let mut node: Option<Node> = None;
         for seg in segments {
-            let part = match seg {
+            let (part, op) = match seg {
                 TemplateSegment::Literal(text) => {
-                    Node::new(loc.clone(), NodeKind::TextLiteral { value: text })
+                    (Node::new(loc.clone(), NodeKind::TextLiteral { value: text }), "+")
                 }
-                TemplateSegment::Interp(src, _interp_loc) => {
-                    self.parse_interp_expression(&src, loc)?
+                TemplateSegment::Interp(src, interp_loc) => {
+                    // El hueco se parsea aparte: sus ubicaciones se corren a donde está en el
+                    // fuente (después de la `{` y de los espacios que el trim saca).
+                    let lead = src.chars().take_while(|c| c.is_whitespace()).count();
+                    let (line, col) = (interp_loc.line, interp_loc.column + 1 + lead);
+                    let mut e = self.parse_interp_expression(&src, loc).map_err(|mut e| {
+                        crate::ast_api::shift_location(&mut e.location, line, col);
+                        e
+                    })?;
+                    crate::ast_api::shift_locations(&mut e, line, col);
+                    (e, crate::ast::INTERP_CONCAT)
                 }
             };
             node = Some(match node {
@@ -2540,7 +2645,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                             loc.clone(),
                             NodeKind::TextLiteral { value: String::new() },
                         )),
-                        operator: "+".to_string(),
+                        operator: op.to_string(),
                         right: Box::new(part),
                     },
                 ),
@@ -2548,7 +2653,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                     loc.clone(),
                     NodeKind::BinaryOp {
                         left: Box::new(acc),
-                        operator: "+".to_string(),
+                        operator: op.to_string(),
                         right: Box::new(part),
                     },
                 ),
@@ -2690,11 +2795,10 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
             TokenType::Sandbox => self.parse_sandbox(),
             TokenType::When => self.parse_when(false),
             _ => Err(ParseError::new(
-                format!(
-                    "Unexpected token: {} ({})",
-                    tok.ty.name(),
-                    token_value_repr(&tok.value)
-                ),
+                match self.reflex_note(self.pos) {
+                    Some(h) => format!("Unexpected token: {} ({}) — {}", tok.ty.name(), token_value_repr(&tok.value), h),
+                    None => format!("Unexpected token: {} ({})", tok.ty.name(), token_value_repr(&tok.value)),
+                },
                 loc,
             )),
         }
@@ -3373,7 +3477,8 @@ mod tests {
         let NodeKind::BinaryOp { left: l2, operator: op2, right: r2 } = &left.kind else {
             panic!("esperaba BinaryOp interno");
         };
-        assert_eq!(op2, "+");
+        // El hueco usa el concat de interpolación (pega el texto de cualquier valor).
+        assert_eq!(op2, crate::ast::INTERP_CONCAT);
         assert!(matches!(&l2.kind, NodeKind::TextLiteral { value } if value == "a"));
         assert!(matches!(&r2.kind, NodeKind::Identifier { name } if name == "b"));
     }
@@ -3391,7 +3496,7 @@ mod tests {
         let NodeKind::BinaryOp { left, operator, right } = &val.kind else {
             panic!("esperaba BinaryOp");
         };
-        assert_eq!(operator, "+");
+        assert_eq!(operator, crate::ast::INTERP_CONCAT);
         assert!(matches!(&left.kind, NodeKind::TextLiteral { value } if value.is_empty()));
         assert!(matches!(&right.kind, NodeKind::Identifier { name } if name == "x"));
     }
@@ -3674,4 +3779,26 @@ mod tests {
         let p = parse_ok("let within be 5\nprint(within)");
         assert!(matches!(p.statements[0].kind, NodeKind::LetBinding { .. }));
     }
+}
+
+/// ¿El literal crudo usa un escape `\uXXXX` (o `\u{…}` fuera de un backtick)? La misma regla que
+/// el lexer, para el aviso de `synsema check`.
+fn has_unicode_escape(raw: &str, braces: bool) -> bool {
+    let c: Vec<char> = raw.chars().collect();
+    let mut i = 0;
+    while i + 1 < c.len() {
+        if c[i] == '\\' {
+            if c[i + 1] == 'u' {
+                let hex4 = (2..6).all(|k| c.get(i + k).is_some_and(|x| x.is_ascii_hexdigit()));
+                let brace = braces && c.get(i + 2) == Some(&'{') && c.get(i + 3).is_some_and(|x| x.is_ascii_hexdigit());
+                if hex4 || brace {
+                    return true;
+                }
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    false
 }

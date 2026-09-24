@@ -29,9 +29,28 @@ pub enum Number {
     Big(BigInt),
     /// Punto flotante.
     Float(f64),
-    /// Decimal exacto base-10 (dinero/finanzas): 96-bit, preserva escala.
+    /// Decimal exacto base-10 (dinero/finanzas): 96-bit, preserva escala. El caso común.
     Decimal(Decimal),
+    /// Decimal que NO entra en `Decimal` (más de 28-29 dígitos o más de 28 decimales), v0.6.29:
+    /// el mismo tipo `decimal` para el programa (como `Int`/`Big` son el mismo entero). Nunca
+    /// guarda un valor que entra en `Decimal` (lo garantiza `Number::decimal_from_parts`).
+    BigDec(Box<BigDec>),
 }
+
+/// Un decimal grande: valor = `m / 10^s`, exacto.
+#[derive(Clone, Debug)]
+pub struct BigDec {
+    pub m: BigInt,
+    pub s: u32,
+}
+
+/// Cifras significativas de una división o raíz decimal inexacta (el contexto por defecto de
+/// Python `decimal`); la parte entera nunca se trunca (como `numeric` de Postgres).
+pub const DEC_SIG_DIGITS: u32 = 28;
+
+/// Dígitos máximos de un decimal leído de texto (el tope de Python para enteros: convertir
+/// uno enorme es cuadrático).
+pub const MAX_DEC_TEXT_DIGITS: usize = 4300;
 
 impl Number {
     /// Parsea un literal entero ya limpio de `_`: `i64` si entra, si no `BigInt`.
@@ -108,9 +127,106 @@ impl Number {
         matches!(self, Number::Int(_) | Number::Big(_))
     }
 
-    /// True si es un `Decimal` (tipo dinero exacto).
+    /// True si es un `Decimal` (tipo dinero exacto), chico o grande.
     pub fn is_decimal(&self) -> bool {
-        matches!(self, Number::Decimal(_))
+        matches!(self, Number::Decimal(_) | Number::BigDec(_))
+    }
+
+    /// Un decimal exacto `m / 10^s`: `Decimal` si entra, si no `BigDec`. Con escala de más de
+    /// 28, los ceros de la derecha no son información y se quitan antes de decidir.
+    pub fn decimal_from_parts(mut m: BigInt, mut s: u32) -> Number {
+        if s > 28 {
+            let ten = BigInt::from(10);
+            while s > 28 && (&m % &ten).is_zero() {
+                m /= &ten;
+                s -= 1;
+            }
+        }
+        if s <= 28 {
+            if let Some(v) = m.to_i128() {
+                if v.unsigned_abs() < (1u128 << 96) {
+                    return Number::Decimal(Decimal::from_i128_with_scale(v, s));
+                }
+            }
+        }
+        Number::BigDec(Box::new(BigDec { m, s }))
+    }
+
+    /// Un decimal desde texto (`"1234.5678"`, `"-0.001"`, con cualquier cantidad de dígitos
+    /// hasta 4300). `None` si no es un decimal.
+    pub fn parse_decimal(text: &str) -> Option<Number> {
+        let t = text.trim();
+        if let Ok(d) = Decimal::from_str_exact(t) {
+            return Some(Number::Decimal(d));
+        }
+        let (neg, body) = match t.as_bytes().first()? {
+            b'-' => (true, &t[1..]),
+            b'+' => (false, &t[1..]),
+            _ => (false, t),
+        };
+        let (int_part, frac) = match body.split_once('.') {
+            Some((a, b)) => (a, b),
+            None => (body, ""),
+        };
+        if int_part.is_empty() && frac.is_empty() {
+            return None;
+        }
+        if !int_part.bytes().all(|b| b.is_ascii_digit()) || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if int_part.len() + frac.len() > MAX_DEC_TEXT_DIGITS {
+            return None;
+        }
+        let digits = format!("{}{}", int_part, frac);
+        let m: BigInt = if digits.is_empty() { BigInt::zero() } else { digits.parse().ok()? };
+        Some(Number::decimal_from_parts(if neg { -m } else { m }, frac.len() as u32))
+    }
+
+    /// `num / den` como decimal (`den != 0`): exacto si termina (recortando ceros hasta la escala
+    /// `ideal`, como Python); si no, redondeado mitad al par con 28 cifras significativas y nunca
+    /// menos de `min_scale` decimales; la parte entera siempre completa.
+    pub fn decimal_from_ratio(num: &BigInt, den: &BigInt, min_scale: u32, ideal: u32) -> Number {
+        let (num, den) = if den.is_negative() { (-num, -den) } else { (num.clone(), den.clone()) };
+        if num.is_zero() {
+            return Number::decimal_from_parts(BigInt::zero(), ideal.min(min_scale.max(ideal)));
+        }
+        let int_digits = magnitude_digits(&num, &den);
+        let scale = (min_scale as i64).max(DEC_SIG_DIGITS as i64 - int_digits).max(0) as u32;
+        let scaled = &num * pow10_big(scale);
+        let mut q = div_round_half_even(&scaled, &den);
+        let mut s = scale;
+        if &q * &den == scaled {
+            let ten = BigInt::from(10);
+            while s > ideal && (&q % &ten).is_zero() {
+                q /= &ten;
+                s -= 1;
+            }
+        }
+        Number::decimal_from_parts(q, s)
+    }
+
+    /// `sqrt(num / den)` como decimal (num ≥ 0, den > 0): exacta si lo es, si no 28 cifras.
+    pub fn decimal_sqrt_ratio(num: &BigInt, den: &BigInt) -> Number {
+        if num.is_zero() {
+            return Number::Decimal(Decimal::ZERO);
+        }
+        // Dígitos de la parte entera de la raíz: la mitad (hacia arriba) de los del radicando.
+        let e = magnitude_digits(num, den) - 1; // floor(log10(valor))
+        let int_digits = e.div_euclid(2) + 1;
+        let scale = (DEC_SIG_DIGITS as i64 - int_digits).max(0) as u32;
+        // floor(sqrt(valor · 10^(2·scale+2))) y el dígito de más para redondear.
+        let x = (num * pow10_big(2 * scale + 2)) / den;
+        let r = x.sqrt();
+        let mut q = div_round_half_even(&r, &BigInt::from(10));
+        let mut s = scale;
+        if &q * &q * den == num * pow10_big(2 * scale) {
+            let ten = BigInt::from(10);
+            while s > 0 && (&q % &ten).is_zero() {
+                q /= &ten;
+                s -= 1;
+            }
+        }
+        Number::decimal_from_parts(q, s)
     }
 
     /// True si el valor es cero (entero, float o decimal).
@@ -120,6 +236,7 @@ impl Number {
             Number::Big(b) => b.is_zero(),
             Number::Float(x) => *x == 0.0,
             Number::Decimal(d) => d.is_zero(),
+            Number::BigDec(_) => false,
         }
     }
 
@@ -130,6 +247,7 @@ impl Number {
             Number::Big(b) => b.sign() == Sign::Minus,
             Number::Float(x) => *x < 0.0,
             Number::Decimal(d) => d.is_sign_negative() && !d.is_zero(),
+            Number::BigDec(b) => b.m.is_negative(),
         }
     }
 
@@ -139,6 +257,7 @@ impl Number {
             Number::Big(b) => b.to_f64().unwrap_or(f64::INFINITY),
             Number::Float(x) => *x,
             Number::Decimal(d) => d.to_f64().unwrap_or(f64::NAN),
+            Number::BigDec(b) => ratio_f64(&b.m, &pow10_big(b.s)),
         }
     }
 
@@ -157,6 +276,14 @@ impl Number {
                     None
                 }
             }
+            Number::BigDec(b) => {
+                let (q, r) = b.m.div_rem(&pow10_big(b.s));
+                if r.is_zero() {
+                    Some(q)
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -167,6 +294,17 @@ impl Number {
             Number::Int(n) => Some(Decimal::from(*n)),
             Number::Big(b) => Decimal::from_str_exact(&b.to_string()).ok(),
             Number::Decimal(d) => Some(*d),
+            Number::Float(_) | Number::BigDec(_) => None,
+        }
+    }
+
+    /// El valor exacto como `(m, s)` = m / 10^s (Int/Big/Decimal); `None` para Float.
+    pub fn exact_ratio(&self) -> Option<(BigInt, u32)> {
+        match self {
+            Number::Int(n) => Some((BigInt::from(*n), 0)),
+            Number::Big(b) => Some((b.clone(), 0)),
+            Number::Decimal(d) => Some((BigInt::from(d.mantissa()), d.scale())),
+            Number::BigDec(b) => Some((b.m.clone(), b.s)),
             Number::Float(_) => None,
         }
     }
@@ -178,6 +316,7 @@ impl Number {
             Number::Big(b) => b.to_i64(),
             Number::Float(x) => Some(x.trunc() as i64),
             Number::Decimal(d) => d.to_i64(),
+            Number::BigDec(b) => (&b.m / pow10_big(b.s)).to_i64(),
         }
     }
 
@@ -195,31 +334,83 @@ impl Number {
             || (matches!(a, Number::Float(_)) && b.is_decimal())
     }
 
-    /// Operación binaria entre números donde al menos uno es Decimal. Decimal⊕
-    /// Decimal/Int/Big → Decimal exacto. La mezcla con Float NO debería llegar acá
-    /// (el intérprete usa los `checked_*` y erroría antes); por totalidad cae a
-    /// Float. Un overflow de Decimal o un Big fuera de rango también cae a Float.
+    /// Operación binaria entre números donde al menos uno es decimal. Decimal⊕
+    /// Decimal/Int/Big → decimal EXACTO de cualquier tamaño (como `BigDecimal` de Java y
+    /// `numeric` de Postgres): si no entra en `Decimal`, `BigDec`. La mezcla con Float NO
+    /// debería llegar acá (el intérprete usa los `checked_*` y erroría antes); por totalidad
+    /// cae a Float.
     fn decimal_binop(
         a: &Number,
         b: &Number,
         dec: impl Fn(Decimal, Decimal) -> Option<Decimal>,
         flt: impl Fn(f64, f64) -> f64,
+        op: char,
     ) -> Number {
         if Number::any_float(a, b) {
             return Number::Float(flt(a.to_f64(), b.to_f64()));
         }
+        let exact = || Number::exact_op(a, b, op).unwrap_or_else(|| Number::Float(flt(a.to_f64(), b.to_f64())));
+        if matches!(a, Number::BigDec(_)) || matches!(b, Number::BigDec(_)) {
+            return exact();
+        }
         match (a.to_decimal(), b.to_decimal()) {
             (Some(x), Some(y)) => match dec(x, y) {
                 Some(r) => Number::Decimal(r),
-                None => Number::Float(flt(a.to_f64(), b.to_f64())),
+                None => exact(),
             },
-            _ => Number::Float(flt(a.to_f64(), b.to_f64())),
+            _ => exact(),
         }
+    }
+
+    /// `a op b` exacto (`+`, `-`, `*`) sobre `m / 10^s`: siempre un decimal (`1d + 10**30` es
+    /// el decimal 1000000000000000000000000000001). `None` sólo con un float.
+    fn exact_op(a: &Number, b: &Number, op: char) -> Option<Number> {
+        let ((ma, sa), (mb, sb)) = (a.exact_ratio()?, b.exact_ratio()?);
+        let (m, s) = match op {
+            '*' => (ma * mb, sa + sb),
+            '+' | '-' => {
+                let s = sa.max(sb);
+                let (x, y) = (ma * pow10_big(s - sa), mb * pow10_big(s - sb));
+                (if op == '+' { x + y } else { x - y }, s)
+            }
+            _ => return None,
+        };
+        Some(Number::decimal_from_parts(m, s))
+    }
+
+    /// `a / b` decimal (b ≠ 0). Si los dos entran en `Decimal` y su cociente conserva 28
+    /// cifras (o es exacto), el de `rust_decimal`; si no (`1e-20d / 1e10d`, que daba 0), el
+    /// cociente exacto redondeado a 28 cifras significativas, sin truncar la parte entera.
+    fn decimal_div(a: &Number, b: &Number) -> Option<Number> {
+        if let (Number::Decimal(_) | Number::Int(_), Number::Decimal(_) | Number::Int(_)) = (a, b) {
+            if let (Some(x), Some(y)) = (a.to_decimal(), b.to_decimal()) {
+                if let Some(q) = x.checked_div(y) {
+                    let digits = q.mantissa().unsigned_abs().checked_ilog10().map(|d| d + 1).unwrap_or(1);
+                    if digits >= DEC_SIG_DIGITS || q.checked_mul(y) == Some(x) {
+                        return Some(Number::Decimal(q));
+                    }
+                }
+            }
+        }
+        let ((ma, sa), (mb, sb)) = (a.exact_ratio()?, b.exact_ratio()?);
+        if mb.is_zero() {
+            return None;
+        }
+        let num = ma * pow10_big(sb);
+        let den = mb * pow10_big(sa);
+        Some(Number::decimal_from_ratio(&num, &den, sa.max(sb), sa.saturating_sub(sb)))
+    }
+
+    /// Los dos decimales (o enteros) llevados a una escala común: `(A, B, s)` con a = A/10^s.
+    fn common_scale(a: &Number, b: &Number) -> Option<(BigInt, BigInt, u32)> {
+        let ((ma, sa), (mb, sb)) = (a.exact_ratio()?, b.exact_ratio()?);
+        let s = sa.max(sb);
+        Some((ma * pow10_big(s - sa), mb * pow10_big(s - sb), s))
     }
 
     pub fn add(&self, other: &Number) -> Number {
         if Number::any_decimal(self, other) {
-            return Number::decimal_binop(self, other, |x, y| x.checked_add(y), |x, y| x + y);
+            return Number::decimal_binop(self, other, |x, y| x.checked_add(y), |x, y| x + y, '+');
         }
         match (self, other) {
             _ if Number::any_float(self, other) => Number::Float(self.to_f64() + other.to_f64()),
@@ -233,7 +424,7 @@ impl Number {
 
     pub fn sub(&self, other: &Number) -> Number {
         if Number::any_decimal(self, other) {
-            return Number::decimal_binop(self, other, |x, y| x.checked_sub(y), |x, y| x - y);
+            return Number::decimal_binop(self, other, |x, y| x.checked_sub(y), |x, y| x - y, '-');
         }
         match (self, other) {
             _ if Number::any_float(self, other) => Number::Float(self.to_f64() - other.to_f64()),
@@ -247,7 +438,7 @@ impl Number {
 
     pub fn mul(&self, other: &Number) -> Number {
         if Number::any_decimal(self, other) {
-            return Number::decimal_binop(self, other, |x, y| x.checked_mul(y), |x, y| x * y);
+            return Number::decimal_binop(self, other, |x, y| x.checked_mul(y), |x, y| x * y, '*');
         }
         match (self, other) {
             _ if Number::any_float(self, other) => Number::Float(self.to_f64() * other.to_f64()),
@@ -265,10 +456,8 @@ impl Number {
     /// el intérprete antes de llamar.
     pub fn div(&self, other: &Number) -> Number {
         if Number::any_decimal(self, other) && !Number::any_float(self, other) {
-            if let (Some(x), Some(y)) = (self.to_decimal(), other.to_decimal()) {
-                if let Some(r) = x.checked_div(y) {
-                    return Number::Decimal(r);
-                }
+            if let Some(r) = Number::decimal_div(self, other) {
+                return r;
             }
         }
         Number::Float(self.to_f64() / other.to_f64())
@@ -277,31 +466,29 @@ impl Number {
     /// Módulo floored (signo del divisor, como Python). `None` si divisor es cero.
     pub fn modulo(&self, other: &Number) -> Option<Number> {
         if Number::any_decimal(self, other) && !Number::any_float(self, other) {
-            let (x, y) = (self.to_decimal()?, other.to_decimal()?);
+            // Exacto a cualquier tamaño, floored (el signo del divisor, como Python con `%`).
+            let (x, y, s) = Number::common_scale(self, other)?;
             if y.is_zero() {
                 return None;
             }
-            let r = x.checked_rem(y)?;
-            // Truncado → floored: ajustar al signo del divisor (como Python).
-            let r = if !r.is_zero() && (r.is_sign_negative() != y.is_sign_negative()) {
-                r.checked_add(y).unwrap_or(r)
-            } else {
-                r
-            };
-            return Some(Number::Decimal(r));
+            return Some(Number::decimal_from_parts(x.mod_floor(&y), s));
         }
         if Number::any_float(self, other) {
             let (a, b) = (self.to_f64(), other.to_f64());
             if b == 0.0 {
                 return None;
             }
-            // Python: a % b == a - floor(a/b)*b (signo del divisor).
-            return Some(Number::Float(a - (a / b).floor() * b));
+            // El `float_divmod` de CPython (fmod + ajuste de signo): `7 % 0.1` es
+            // 0.09999999999999962, no 0.0.
+            return Some(Number::Float(py_float_divmod(a, b).1));
         }
         match (self, other) {
             (Number::Int(a), Number::Int(b)) => {
                 if *b == 0 {
                     None
+                } else if *b == -1 {
+                    // `i64::MIN % -1` desborda en la CPU (y en num-integer); el resto es 0.
+                    Some(Number::Int(0))
                 } else {
                     Some(Number::Int(a.mod_floor(b)))
                 }
@@ -343,6 +530,7 @@ impl Number {
             Number::Big(b) => Number::from_bigint(-b),
             Number::Float(x) => Number::Float(-x),
             Number::Decimal(d) => Number::Decimal(-*d),
+            Number::BigDec(b) => Number::BigDec(Box::new(BigDec { m: -&b.m, s: b.s })),
         }
     }
 
@@ -381,10 +569,7 @@ impl Number {
                  exactness); use float(x) for an approximate power"
                     .to_string()
             })?;
-            let base = self
-                .to_decimal()
-                .ok_or_else(|| "number too large for an exact decimal power".to_string())?;
-            return decimal_powi(base, &exp);
+            return decimal_powi(self, &exp);
         }
         Ok(self.pow(other))
     }
@@ -408,7 +593,8 @@ impl Number {
         if Number::any_decimal(self, other) {
             return match (self.to_decimal(), other.to_decimal()) {
                 (Some(a), Some(b)) => a.partial_cmp(&b),
-                _ => None,
+                // Un decimal o un entero grandes (`10**30` contra `1d`): exacto como racional.
+                _ => Some(cmp_ratio(&self.exact_ratio()?, &other.exact_ratio()?)),
             };
         }
         match (self, other) {
@@ -429,14 +615,14 @@ impl Number {
             return None;
         }
         if Number::any_decimal(self, other) && !Number::any_float(self, other) {
-            let (x, y) = (self.to_decimal()?, other.to_decimal()?);
-            return x.checked_div(y).map(|q| Number::Decimal(q.floor()));
+            // Exacto (el cociente redondeado de `/` podía caer del otro lado de un entero).
+            let (x, y, _) = Number::common_scale(self, other)?;
+            return Some(Number::decimal_from_parts(x.div_floor(&y), 0));
         }
         if Number::any_float(self, other) {
             let (a, b) = (self.to_f64(), other.to_f64());
-            // Como Python: (a - a % b) / b, que no sufre el redondeo de floor(a / b).
-            let m = a - (a / b).floor() * b;
-            return Some(Number::Float(((a - m) / b).round()));
+            // El `float_divmod` de CPython: `7 // 0.1` es 69.0 (0.1 es un poco más que un décimo).
+            return Some(Number::Float(py_float_divmod(a, b).0));
         }
         match (self, other) {
             (Number::Int(a), Number::Int(b)) => match a.checked_div_euclid(*b) {
@@ -463,10 +649,13 @@ impl Number {
             return false;
         }
         if Number::any_decimal(self, other) {
-            return matches!(
-                (self.to_decimal(), other.to_decimal()),
-                (Some(a), Some(b)) if a == b
-            );
+            return match (self.to_decimal(), other.to_decimal()) {
+                (Some(a), Some(b)) => a == b,
+                _ => match (self.exact_ratio(), other.exact_ratio()) {
+                    (Some(a), Some(b)) => cmp_ratio(&a, &b) == Ordering::Equal,
+                    _ => false,
+                },
+            };
         }
         match (self, other) {
             (Number::Float(a), Number::Float(b)) => a == b,
@@ -475,6 +664,85 @@ impl Number {
             _ => self.as_bigint() == other.as_bigint(),
         }
     }
+}
+
+/// 10^k como entero.
+pub fn pow10_big(k: u32) -> BigInt {
+    num_traits::pow(BigInt::from(10), k as usize)
+}
+
+/// Cantidad de dígitos de la parte entera de `|num / den|` (den > 0): `floor(log10) + 1`,
+/// que es ≤ 0 para un valor menor que 1 (0.05 → -1).
+fn magnitude_digits(num: &BigInt, den: &BigInt) -> i64 {
+    let n = num.abs();
+    let digits = |x: &BigInt| x.to_string().len() as i64;
+    let mut e = digits(&n) - digits(den); // floor(log10) es e o e − 1
+    let ge = |e: i64| -> bool {
+        if e >= 0 {
+            n >= den * pow10_big(e as u32)
+        } else {
+            &n * pow10_big((-e) as u32) >= *den
+        }
+    };
+    if !ge(e) {
+        e -= 1;
+    }
+    e + 1
+}
+
+/// `num / den` (den > 0) al entero más cercano, mitades al par.
+pub fn div_round_half_even(num: &BigInt, den: &BigInt) -> BigInt {
+    let (q, r) = num.div_mod_floor(den);
+    match (&r * 2u32).cmp(den) {
+        Ordering::Less => q,
+        Ordering::Greater => q + 1,
+        Ordering::Equal => {
+            if q.is_even() {
+                q
+            } else {
+                q + 1
+            }
+        }
+    }
+}
+
+/// `num / den` como f64 sin desbordar en el camino.
+pub fn ratio_f64(num: &BigInt, den: &BigInt) -> f64 {
+    let bits = num.bits().max(den.bits());
+    let shift = bits.saturating_sub(1000);
+    let (n, d) = (num >> shift, den >> shift);
+    n.to_f64().unwrap_or(f64::NAN) / d.to_f64().unwrap_or(f64::NAN)
+}
+
+/// Orden de dos `(m, s)` = m / 10^s, exacto.
+pub fn cmp_ratio(a: &(BigInt, u32), b: &(BigInt, u32)) -> Ordering {
+    let s = a.1.max(b.1);
+    (&a.0 * pow10_big(s - a.1)).cmp(&(&b.0 * pow10_big(s - b.1)))
+}
+
+/// `divmod(a, b)` de floats exactamente como CPython (`Objects/floatobject.c: _float_div_mod`),
+/// `b != 0`.
+pub fn py_float_divmod(vx: f64, wx: f64) -> (f64, f64) {
+    let mut m = vx % wx; // fmod
+    let mut div = (vx - m) / wx;
+    if m != 0.0 {
+        if (wx < 0.0) != (m < 0.0) {
+            m += wx;
+            div -= 1.0;
+        }
+    } else {
+        m = 0.0_f64.copysign(wx);
+    }
+    let floordiv = if div != 0.0 {
+        let mut f = div.floor();
+        if div - f > 0.5 {
+            f += 1.0;
+        }
+        f
+    } else {
+        0.0_f64.copysign(vx / wx)
+    };
+    (floordiv, m)
 }
 
 /// Orden EXACTO entre un entero y un float (v0.6.29), como Python: sin pasar el
@@ -497,28 +765,39 @@ fn cmp_int_float(i: &BigInt, f: f64) -> Option<Ordering> {
     }
 }
 
-/// `base^exp` exacto con `exp` ENTERO (BigInt). Exp negativo → división con la
-/// precisión por defecto de rust_decimal. Overflow / exp gigante → error.
-fn decimal_powi(base: Decimal, exp: &BigInt) -> Result<Number, String> {
+/// `base^exp` EXACTO con `exp` entero, a cualquier tamaño (como `BigDecimal.pow` de Java).
+/// Exponente negativo → `1 / base^|exp|` con la regla de la división decimal. Un resultado de
+/// más de un millón de dígitos es error (usar float).
+fn decimal_powi(base: &Number, exp: &BigInt) -> Result<Number, String> {
+    let (m, s) = base.exact_ratio().ok_or_else(|| MIX_DECIMAL_FLOAT.to_string())?;
     let neg = exp.sign() == Sign::Minus;
-    let e = exp
-        .abs()
-        .to_u32()
-        .ok_or_else(|| "decimal exponent too large".to_string())?;
-    let mut acc = Decimal::ONE;
-    for _ in 0..e {
-        acc = acc
-            .checked_mul(base)
-            .ok_or_else(|| "decimal power overflow".to_string())?;
+    let e = exp.abs().to_u32().filter(|e| *e <= 1_000_000).ok_or_else(|| "decimal exponent too large".to_string())?;
+    let digits = (m.bits().max(1) as f64 * std::f64::consts::LOG10_2).ceil() * e as f64;
+    if digits > 1_000_000.0 {
+        return Err("decimal power too large for an exact result (more than a million digits); use float(x) for an approximate one".to_string());
     }
+    let scale = s.checked_mul(e).ok_or_else(|| "decimal exponent too large".to_string())?;
+    let pm = num_traits::pow(m, e as usize);
     if neg {
-        Decimal::ONE
-            .checked_div(acc)
-            .map(Number::Decimal)
-            .ok_or_else(|| "decimal power division failed".to_string())
+        if pm.is_zero() {
+            return Err("decimal power: zero to a negative power".to_string());
+        }
+        Ok(Number::decimal_from_ratio(&pow10_big(scale), &pm, 0, 0))
     } else {
-        Ok(Number::Decimal(acc))
+        Ok(Number::decimal_from_parts(pm, scale))
     }
+}
+
+/// `m / 10^s` en texto, con la escala completa (`1.50`), sin notación científica.
+fn fmt_scaled(m: &BigInt, s: u32) -> String {
+    if s == 0 {
+        return m.to_string();
+    }
+    let digits = m.abs().to_string();
+    let s = s as usize;
+    let padded = if digits.len() <= s { format!("{}{}", "0".repeat(s - digits.len() + 1), digits) } else { digits };
+    let (i, f) = padded.split_at(padded.len() - s);
+    format!("{}{}.{}", if m.is_negative() { "-" } else { "" }, i, f)
 }
 
 /// `str(float)`/`repr(float)` de Python (idénticos desde 3.1).
@@ -581,7 +860,10 @@ impl PartialEq for Number {
             (Number::Float(a), Number::Float(b)) => a == b,
             (Number::Float(_), _) | (_, Number::Float(_)) => false,
             (Number::Decimal(a), Number::Decimal(b)) => a == b,
-            (Number::Decimal(_), _) | (_, Number::Decimal(_)) => false,
+            (Number::Decimal(_) | Number::BigDec(_), Number::Decimal(_) | Number::BigDec(_)) => {
+                cmp_ratio(&self.exact_ratio().unwrap(), &other.exact_ratio().unwrap()) == Ordering::Equal
+            }
+            (Number::Decimal(_) | Number::BigDec(_), _) | (_, Number::Decimal(_) | Number::BigDec(_)) => false,
             _ => self.as_bigint() == other.as_bigint(),
         }
     }
@@ -595,6 +877,7 @@ impl fmt::Display for Number {
             Number::Float(x) => write!(f, "{}", py_float_str(*x)),
             // rust_decimal preserva la escala: 1.50d → "1.50", 100d → "100".
             Number::Decimal(d) => write!(f, "{}", d),
+            Number::BigDec(b) => write!(f, "{}", fmt_scaled(&b.m, b.s)),
         }
     }
 }

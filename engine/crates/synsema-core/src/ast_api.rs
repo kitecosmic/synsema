@@ -16,7 +16,7 @@ fn gen_loc() -> SourceLocation {
 // =========================================================
 
 /// Nodos hijos directos de un nodo (todas las variantes con sub-Nodes).
-fn children(n: &Node) -> Vec<&Node> {
+pub(crate) fn children(n: &Node) -> Vec<&Node> {
     use NodeKind::*;
     match &n.kind {
         ListLiteral { elements } => elements.iter().collect(),
@@ -511,6 +511,23 @@ pub fn summarize(program: &Program) -> Summary {
 // =========================================================
 // walker mutable (para rename)
 // =========================================================
+
+/// Lleva las ubicaciones de un árbol parseado desde un pedazo del fuente (un hueco de template,
+/// que se parsea aparte) a donde está ese pedazo: su línea 1, columna c es `line`, `col + c - 1`.
+/// Sin esto un error en `{zz}` apuntaba a 1:1.
+pub(crate) fn shift_location(l: &mut crate::tokens::SourceLocation, line: usize, col: usize) {
+    if l.line == 1 {
+        l.column = col + l.column.saturating_sub(1);
+    }
+    l.line = line + l.line.saturating_sub(1);
+}
+
+pub(crate) fn shift_locations(node: &mut Node, line: usize, col: usize) {
+    shift_location(&mut node.location, line, col);
+    for c in children_mut(node) {
+        shift_locations(c, line, col);
+    }
+}
 
 fn children_mut(n: &mut Node) -> Vec<&mut Node> {
     use NodeKind::*;

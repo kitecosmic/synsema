@@ -48,7 +48,12 @@ timeout?)`, `http_put(url, body, headers?, timeout?)`, `http_delete(url, headers
 > socket and redacted in logs/errors. `bearer(s)` is sugar for `Authorization: Bearer
 > <token>`. For a key that arrives at runtime (not from `.env`), seal it with
 > `as_secret(...)`. In query params and the body a `secret` is **redacted** (fail-closed).
-> See **[secrets.md](secrets.md)**.
+> See **[secrets.md](secrets.md)**. A URL with `user:pass@` sends `Authorization: Basic …`
+> (percent-decoded to raw bytes, like curl; your own `Authorization` header wins) — v0.6.29+. A
+> URL with no host (`http://alice:pw@/rpc`) is the error `the URL has no host`, which never echoes
+> the URL; `require net("https://user:pw@api.x.com/v1?k=…")` is stored as `net("api.x.com")`
+> (credentials, port, path and query are dropped from the scope), `require net("[::1]")` =
+> `net("::1")`.
 
 **HTTPS works**: `http://` and `https://` are both supported (TLS via `rustls` with the OS
 root CAs — real certificate validation, pure-Rust). So `http_get("https://api.example.com")`
@@ -294,7 +299,7 @@ connect-timeout (a dead host fails fast, never hangs).
 -- Postgres: `?` placeholders are rewritten to $1,$2…; no last_id (use RETURNING).
 require db("postgres://localhost/appdb")
 db_open("postgres://user:pw@host:5432/appdb")        -- TLS on by default; add ?sslmode=disable to turn off
-sql_exec("INSERT INTO users (name) VALUES (?) RETURNING id", ["Ada"])
+let row be sql("INSERT INTO users (name) VALUES (?) RETURNING id", ["Ada"])   -- rows back: sql, not sql_exec
 -- pgvector runs server-side: pass a list as ?::vector, order by <-> / <=>
 let near be sql("SELECT id FROM docs ORDER BY emb <-> ?::vector LIMIT ?", [q_embedding, 5])
 
@@ -459,8 +464,8 @@ write_file("./out/by_region.svg", chart_svg("bar", ranked, {"x": "region", "y": 
   opts?)`, zstd/snappy/gzip/lz4, native only). Bytes/text in and out; the disk is
   `read_file`/`read_file_bytes`/`write_file` with `file.read`/`file.write`.
 - **Tables:** `group_by` → `[{key, items}]`, `summarize` + `sum_of`/`mean_of`/`min_of`/`max_of`/
-  `median_of`/`quantile_of`/`first_of`/`n_unique_of`/`count()`, `count_by`, `join` (inner/left/outer),
-  `pivot`, `is_missing`/`fill_missing`/`drop_missing`/`fill_nan`.
+  `median_of`/`quantile_of`/`first_of`/`n_unique_of`/`count()`, `count_by`, `join` (inner/left/right/outer/semi/anti),
+  `pivot`, `is_missing`/`count`/`count_missing`/`fill_missing`/`drop_missing`/`fill_nan`.
 - **Reductions** (`sum`, `mean`, `median`, `std`, …): `nothing` skipped, NaN propagates, `axis =`
   on arrays, `std`/`var` sample (`ddof = 1`), decimals stay decimal.
 - **Dates:** `date` / `datetime` (IANA zone, DST-aware) / `duration` types; `truncate(d, "month")` to
@@ -468,10 +473,15 @@ write_file("./out/by_region.svg", chart_svg("bar", ranked, {"x": "region", "y": 
   only `now()` needs `require time`. A SQL `created` column arrives as whatever the driver gives
   (text or number) — re-type it with `datetime(x)` / `datetime(ts)`.
 - **Seeded randomness:** `let g be rng(42)` → `g()`, `random_int(g, lo, hi)`, `random_normal(g)`,
-  `shuffle`/`sample`/`choice(g, …)` — reproducible, no capability (train/test splits, simulations).
-- **Lineage:** the engine records every read (`read_file`, HTTP host, the hash of each SQL/Mongo/Redis
-  query, stdin) → `lineage()`, and `receipt()` publishes it as `inputs` — sign it to prove which data
-  produced the result.
+  `shuffle`/`sample`/`choice(g, …)`, `rng_spawn(g, n)` — the same numbers as
+  `numpy.random.default_rng(42)`, no capability (train/test splits, simulations).
+  `parallel_map(f, rng_spawn(g, n))` gives each worker a copy of its own child (numpy's
+  `g.spawn(n)`); one generator in two items is an error.
+- **Lineage:** the engine records every read (`read_file`/`list_dir`/`grep`/`parquet_read`, HTTP host,
+  the hash of each SQL/Mongo/Redis query, chain RPC reads, socket/process messages, model answers,
+  stdin, what `run`/`run_program` returned) → `lineage()`, and `receipt()` publishes it as
+  `inputs` — sign it to prove which data produced the result. Each entry's `encoding` (`text`,
+  `bytes`, `jcs`, `json`) says which bytes the sha256 covers, so it can be recomputed.
 
 Contracts and examples: [builtins.md](builtins.md) § Tables, § Reductions, § Dates, § Seeded
 randomness, § Parquet, § Lineage; the step-by-step pipeline and the missing-data model:
@@ -700,13 +710,15 @@ let raw2 be psbt_finalize(signed_psbt)            -- → btc_send (the key never
 
 **Read-side / RPC builtins (all `net(host)`-gated; a node is UNTRUSTED input — every
 decode is strict, malformed/oversized/hostile responses → catchable error, never silent
-bad data; errors name the host only, never the full URL — API keys live in the path):**
+bad data; errors name the host only, never the full URL — API keys live in the path; the raw
+answers of `evm_rpc`/`solana_rpc`/`btc_rpc`/`algorand_account`/`algorand_wait` keep integers beyond
+64 bits exact):**
 - EVM JSON-RPC: `evm_rpc(url, method, params?)` (escape hatch: ints→hex-quantity,
   bytes→`0x…`, result as decoded JSON; `method` = the node's name, `"eth_…"`);
   `evm_block_number(url)` → int; `evm_nonce(url, addr, block?)` (default `"pending"`);
   `evm_balance(url, addr, block?)` → exact wei int; `evm_gas_price(url)`; `evm_chain_id(url)`;
-  `evm_estimate_gas(url, tx_map)`; `evm_call(url, {to, data}, block?)` → RAW bytes (feed
-  `abi_decode`); `evm_fee_history(url, blocks?, percentiles?)` → `{base_fee, priority, base_fees,
+  `evm_estimate_gas(url, tx_map, block?)`; `evm_call(url, {to, data}, block?)` → RAW bytes (feed
+  `abi_decode`); `evm_fee_history(url, blocks?, percentiles?, newest?)` → `{base_fee, priority, base_fees,
   rewards}` (base_fee = NEXT block; priority = median of the first percentile column; raw arrays
   included — the derivation is transparent, not an oracle); `evm_send(url, raw)` → `"0x…"`
   hash; `evm_receipt(url, hash)` → typed receipt map or `nothing`;
@@ -729,11 +741,14 @@ bad data; errors name the host only, never the full URL — API keys live in the
   max_fee, max_priority, data?, access_list?}` — EVERY value-moving field explicit (no
   silent defaults; a missing field errors naming the reader helper; no `to` → error pointing
   to `evm_tx_create`) → `{digest, fields, + echo of every number}`; `evm_tx_raw(tx, sig65)` →
-  signed raw bytes (v/r/s handled).
+  signed raw bytes (v/r/s handled). `evm_tx_raw` recomputes the digest from `fields` and checks
+  every echoed number against them: an edited map → error (`… does not match "fields" — the map
+  was modified after evm_tx/evm_tx_create; build it again instead of editing it`).
 - Contract creation (PURE): `evm_tx_create({chain_id, nonce, from, value, gas, max_fee,
   max_priority, data, access_list?})` → the `evm_tx` map with `to: nothing` + `from` +
   `contract_address` (EIP-55). `to` → error; empty `data` → error; `data` > 49 152 bytes
-  (EIP-3860) → error. `evm_tx_raw` on it recovers the signer and errors if it isn't `from`.
+  (EIP-3860) → error. `evm_tx_raw` on it recovers the signer and errors if it isn't `from`; a
+  creation map without `from` → error, and `contract_address` is re-derived and must match.
   `evm_create_address(sender, nonce)` / `evm_create2_address(deployer, salt32,
   init_code_hash32)` → EIP-55 text (CREATE / EIP-1014 CREATE2, pure).
 - Solana RPC: `solana_rpc(url, method, params?)` (escape hatch, plain JSON params);

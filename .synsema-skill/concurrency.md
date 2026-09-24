@@ -35,11 +35,27 @@ let results be parallel_map(safe_fetch, ids)   -- never aborts; each item is val
 
 **Isolation:** each item runs in its own interpreter scope (CSP model — inputs are
 snapshot-copied, like `spawn`). It inherits the caller's capabilities under the frozen
-intent: a `fetch`/`read_file` inside still needs its `require`.
+intent: a `fetch`/`read_file` inside still needs its `require`. A module's exported state is one
+per worker, whichever alias reaches it ([modules.md](modules.md)).
+
+**Seeded generators** (v0.6.29+): a generator given as an item reaches its worker as a **copy of
+its state** — pass one child per item and the results are numpy's `g.spawn(n)` bit for bit. The
+same generator in two items is an error (each worker would draw the same numbers):
+
+```synsema
+task draw(g)
+    give g()
+let draws be parallel_map(draw, rng_spawn(rng(42), 3))   -- [0.9167441575549085, 0.4674907799518424, 0.07123920291270869]
+```
+Pass generators as items. A top-level generator used inside a worker (by name, or inside a global
+map) is an error — `the generator rng(1) was created at the top level; here it would restart the same sequence in every request/worker …` — because every worker would repeat the same numbers.
+See [builtins.md](builtins.md) § Seeded randomness.
 
 ## chunk(list, size)
 
-Splits a list into sublists of `size` (last one may be shorter). `size <= 0` is an error.
+Splits a list into sublists of `size` (last one may be shorter). `size <= 0` is an error, and so
+is a non-integer size (`chunk(xs, 1.5)` → `chunk: size must be an integer, got 1.5 — round it on
+purpose first`; a float like `2.0` too).
 
 ```
 chunk([1, 2, 3, 4, 5], 2)   -- [[1, 2], [3, 4], [5]]

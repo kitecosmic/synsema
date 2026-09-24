@@ -22,6 +22,7 @@ Nothing works without declaring capabilities.
 ```
 require net("api.example.com")
 require net("*.example.com")        -- wildcard
+require net("http://localhost:8545") -- only that port: stored as net("localhost:8545")
 require file("/data/*")             -- read AND write under /data/
 require file.read("./logs/*")       -- read-only (least-privilege)
 require file.write("./out/*")       -- write-only
@@ -250,7 +251,7 @@ synsema test --cap-set "stdout,time,random,secret,file=scratch_*" program.syn
   runs as the operator (`SYNSEMA_IDENTITY`, optional).
 - **The audit is a receipt.** `receipt()` turns the unit's audit (every capability asked, granted
   or denied, with reason and source), its tokens, spend, `declassify` log and — v0.6.29+ — the
-  **lineage** of every input it read (`inputs`: file path / HTTP host / query hash + sha256 of the
+  **lineage** of every input it read (`inputs`: file path / HTTP host / query hash / model answer + sha256 of the
   bytes received) into a Verifiable Credential; `receipt({"sign": key, ...})` signs it (W3C Data Integrity). Derived, never
   written by the program — see builtins.md § Identity documents.
 - **Scope `file`/`db`/`memory`:** a bare `--cap-set "…,file"` lets the code read any absolute path; use a prefix
@@ -288,6 +289,7 @@ names. Works on `run`/`test`/`conform`/`serve`. It is the same audit the wasm `r
 - Sandbox does NOT inherit parent capabilities
 - `call_tool` runs a task with ONLY its declared capabilities (∩ the program's); a plain call uses the program's ambient capabilities
 - Wildcard: `net("*.example.com")` covers all subdomains
+- `net` scope is a host, or `host:port` when a port is written (v0.6.29+): `net("api.x.com")` covers every port of that host; `net("localhost:8545")` or `net("http://localhost:8545/")` covers only port 8545, and a call to `http://localhost:8546/` is denied. IPv6 with a port is `net("[::1]:8545")`. A URL is stored without credentials, path or query.
 - Path glob: `file("/data/*")` covers all files in /data/. `file` grants **read+write**; use `file.read(scope)` / `file.write(scope)` for least-privilege. Path scope is **faithful**: a `..` escape (`file("./data/*")` + `read_file("./data/../../etc/passwd")`) normalizes outside the scope and is denied. `require file` / `file("*")` cover the whole disk. `~/` expands to the home dir in scopes AND paths (v0.6.20+: `file.read("~/.config/app/*")`; `~user/` unsupported). `cwd()` needs `file.read(".")` — the grant of `list_dir(".")` (`./*`, `*` cover it; `./data/*` does not). `delete_*` and `zip_extract`/`tar_extract` need `file.write` on **every** path they remove/write.
 - Name prefix: `secret("APP_*")` / `env("APP_*")` / `reveal("APP_*")` covers `APP_DB`, `APP_KEY`, … (only a trailing `*`)
 - `db` scope: a **file path** for SQLite; a **canonical URL** for remote engines (Postgres/MySQL/MongoDB/Redis) —

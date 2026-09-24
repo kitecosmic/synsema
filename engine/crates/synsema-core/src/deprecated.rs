@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 use std::sync::Mutex;
 
-use crate::ast::{NodeKind, Program};
+use crate::ast::{Node, NodeKind, Program};
 
 pub const DEPRECATED_NAMES: &[(&str, &str)] = &[
     // Texto y regex (V1-D1, V1-D2): una familia `regex_*`, `replace` para texto plano, y el
@@ -121,6 +121,151 @@ pub fn check_warnings(program: &Program, file_path: &str, warnings: &mut Vec<Str
                 }
             }
         });
+    }
+    // `\u00e9` en un literal: desde v0.6.29 es un escape (antes el texto quedaba tal cual).
+    let mut lines = program.escape_lines.clone();
+    lines.dedup();
+    for line in lines {
+        warnings.push(format!(
+            "warning: {}:{}: changed in v0.6.29: `\\uXXXX` in a string is now an escape (\"\\u00e9\" is \"é\") — for a literal backslash + u write `\\\\u`",
+            file_path, line
+        ));
+    }
+    // `x == ""` en un programa que lee CSV: desde v0.6.29 un campo vacío es `nothing`.
+    let mut reads_csv = false;
+    let mut empty_cmp: Option<usize> = None;
+    let is_empty_text = |n: &Node| matches!(&n.kind, NodeKind::TextLiteral { value } if value.is_empty());
+    for st in &program.statements {
+        crate::ast_api::walk(st, &mut |n| match &n.kind {
+            NodeKind::TaskCall { name, .. } if matches!(name.as_identifier(), Some("csv_parse" | "read_csv")) => {
+                reads_csv = true;
+            }
+            NodeKind::BinaryOp { left, operator, right }
+                if (operator == "==" || operator == "!=") && (is_empty_text(left) || is_empty_text(right)) =>
+            {
+                empty_cmp.get_or_insert(n.location.line);
+            }
+            _ => {}
+        });
+    }
+    if let (true, Some(line)) = (reads_csv, empty_cmp) {
+        warnings.push(format!(
+            "warning: {}:{}: changed in v0.6.29: an empty CSV field is `nothing`, so `x == \"\"` no longer finds it — use is_missing(x) (a quoted \"\" is still empty text)",
+            file_path, line
+        ));
+    }
+    // `each r in rows` + `set r[k] to v` cuando lo escrito se pierde: con semántica de valor eso
+    // cambia la copia del bucle, no la fila de `rows`. Lo escrito se usa si `r` sale entera del
+    // bucle (se pasa, se agrega, se imprime, se religa) o si se lee un campo que el bucle
+    // escribió; leer OTROS campos para calcular (`set r["t"] to r["p"] * 2`, `when r.p > 1`) no.
+    for st in &program.statements {
+        crate::ast_api::walk(st, &mut |n| {
+            let NodeKind::EachStatement { variable, body, .. } = &n.kind else { return };
+            let mut u = LoopUses::default();
+            for b in body {
+                u.scan(b, variable, false);
+            }
+            let read_written = u.reads.iter().any(|k| match k {
+                None => true,
+                Some(k) => u.written.iter().any(|w| w.as_deref().is_none_or(|w| w == k)),
+            });
+            if let (Some(line), false, false) = (u.set_line, u.escapes, read_written) {
+                warnings.push(format!(
+                    "warning: {}:{}: `set {}[…]` changes the loop's copy, not the item in the list (value semantics, v0.6.29) — build the new list: set xs to apply(xs, (r) => merge(r, {{…}})), or write by index: set xs[i][…] to …",
+                    file_path, line, variable
+                ));
+            }
+        });
+    }
+}
+
+/// La variable raíz de un destino `x[i].k`.
+fn set_root(n: &Node) -> Option<&str> {
+    match &n.kind {
+        NodeKind::Identifier { name } => Some(name),
+        NodeKind::IndexAccess { object, .. } | NodeKind::PropertyAccess { object, .. } => set_root(object),
+        _ => None,
+    }
+}
+
+/// Cómo usa el cuerpo de un `each` a la variable del bucle.
+#[derive(Default)]
+struct LoopUses {
+    /// La línea del primer `set var[…]` / `set var.k`.
+    set_line: Option<usize>,
+    /// La clave de primer nivel de cada escritura (`None`: dinámica, `set r[k]`).
+    written: Vec<Option<String>>,
+    /// La clave de primer nivel de cada lectura de un campo, fuera del valor de un `set var[…]`.
+    reads: Vec<Option<String>>,
+    /// La variable entera sale del bucle (se pasa, se agrega, se devuelve, se religa).
+    escapes: bool,
+}
+
+impl LoopUses {
+    /// `in_own_set`: dentro del valor de un `set var[…]` (leer la fila para calcular lo que se
+    /// le escribe no usa lo escrito).
+    fn scan(&mut self, n: &Node, var: &str, in_own_set: bool) {
+        match &n.kind {
+            NodeKind::SetMutation { target, value } => {
+                let on_var = !matches!(target.kind, NodeKind::Identifier { .. }) && set_root(target) == Some(var);
+                if on_var {
+                    self.set_line.get_or_insert(n.location.line);
+                    self.written.push(first_key(target));
+                }
+                match &target.kind {
+                    // `set r to …` religa la variable: lo escrito antes pudo usarse.
+                    NodeKind::Identifier { name } if name == var => self.escapes = true,
+                    NodeKind::Identifier { .. } => {}
+                    // En el destino sólo cuentan los índices (`set out[r.id] to …`), no la raíz.
+                    _ => self.scan_target(target, var, in_own_set),
+                }
+                self.scan(value, var, in_own_set || on_var);
+            }
+            NodeKind::IndexAccess { .. } | NodeKind::PropertyAccess { .. } if set_root(n) == Some(var) => {
+                if !in_own_set {
+                    self.reads.push(first_key(n));
+                }
+                self.scan_target(n, var, in_own_set);
+            }
+            NodeKind::Identifier { name } if name == var => self.escapes = true,
+            _ => {
+                for c in crate::ast_api::children(n) {
+                    self.scan(c, var, in_own_set);
+                }
+            }
+        }
+    }
+
+    /// Los índices de una cadena `x[i].k[j]` (no su raíz).
+    fn scan_target(&mut self, n: &Node, var: &str, in_own_set: bool) {
+        match &n.kind {
+            NodeKind::IndexAccess { object, index } => {
+                self.scan(index, var, in_own_set);
+                self.scan_target(object, var, in_own_set);
+            }
+            NodeKind::PropertyAccess { object, .. } => self.scan_target(object, var, in_own_set),
+            NodeKind::Identifier { .. } => {}
+            _ => self.scan(n, var, in_own_set),
+        }
+    }
+}
+
+/// La clave del primer nivel de `r["a"]["b"]` / `r.a.b` (`"a"`); `None` si es dinámica.
+fn first_key(n: &Node) -> Option<String> {
+    let mut cur = n;
+    loop {
+        let (object, key) = match &cur.kind {
+            NodeKind::IndexAccess { object, index } => match &index.kind {
+                NodeKind::TextLiteral { value } => (object, Some(value.clone())),
+                _ => (object, None),
+            },
+            NodeKind::PropertyAccess { object, property_name, .. } => (object, Some(property_name.clone())),
+            _ => return None,
+        };
+        if matches!(object.kind, NodeKind::Identifier { .. }) {
+            return key;
+        }
+        cur = object;
     }
 }
 

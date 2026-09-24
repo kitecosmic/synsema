@@ -78,13 +78,18 @@ fn opt_bool(opts: &IndexMap<String, SynValue>, key: &str, default: bool, name: &
     }
 }
 
-/// Delimitador: exactamente UN carácter ASCII (`,`, `;`, `\t`, …).
+/// Delimitador: exactamente UN carácter ASCII (`,`, `;`, `\t`, …) que no sea la comilla ni un
+/// fin de línea (con esos el archivo no se puede leer de vuelta).
 fn opt_delimiter(opts: &IndexMap<String, SynValue>, name: &str) -> Result<u8, Control> {
     match opts.get("delimiter") {
         None => Ok(b','),
         Some(SynValue::Text(s)) => {
             let mut chars = s.chars();
             match (chars.next(), chars.next()) {
+                (Some(c @ ('"' | '\r' | '\n')), None) => Err(err(format!(
+                    "{}: option \"delimiter\" cannot be {:?} (the quote and line ends have their own meaning in CSV)",
+                    name, c
+                ))),
                 (Some(c), None) if c.is_ascii() => Ok(c as u8),
                 _ => Err(err(format!(
                     "{}: option \"delimiter\" must be a single ASCII character, got {:?}",
@@ -125,7 +130,9 @@ fn check_unclosed_quote(src: &str, delim: u8) -> Result<(), Control> {
                         at_field_start = false;
                     }
                 }
+                // Como `tokenize`: `\r\n`, `\n` y `\r` solo son UN fin de línea.
                 '\n' => line += 1,
+                '\r' if it.peek() != Some(&'\n') => line += 1,
                 _ => {}
             }
         } else if c == '"' && at_field_start {
@@ -133,10 +140,13 @@ fn check_unclosed_quote(src: &str, delim: u8) -> Result<(), Control> {
             quote_line = line;
         } else if c == delim {
             at_field_start = true;
-        } else if c == '\n' {
-            line += 1;
+        } else if c == '\n' || c == '\r' {
+            // Un `\r` solo también termina el registro (el tokenizador lo lee así).
+            if !(c == '\r' && it.peek() == Some(&'\n')) {
+                line += 1;
+            }
             at_field_start = true;
-        } else if c != '\r' {
+        } else {
             at_field_start = false;
         }
     }
@@ -149,6 +159,98 @@ fn check_unclosed_quote(src: &str, delim: u8) -> Result<(), Control> {
     Ok(())
 }
 
+/// Un campo leído: su texto y si vino entre comillas (`""` es texto vacío; un campo vacío
+/// sin comillas es un dato faltante).
+struct Field {
+    text: String,
+    quoted: bool,
+}
+
+/// Una fila: su línea (1-based, donde empieza) y sus campos; `None` = línea en blanco.
+type Record = (usize, Option<Vec<Field>>);
+
+/// RFC 4180 (v0.6.29): el lector propio para saber qué campos vinieron entre comillas, cosa
+/// que el crate `csv` no expone. Fin de fila: `\n`, `\r\n` o `\r`. Una comilla sólo abre un
+/// campo al principio; `""` adentro es una comilla; lo que sigue a la comilla de cierre se
+/// agrega tal cual (`"x"y` → `xy`, como el crate `csv`). `check_unclosed_quote` ya corrió.
+fn tokenize(src: &str, delim: u8) -> Vec<Record> {
+    let delim = delim as char;
+    let mut out: Vec<Record> = Vec::new();
+    let mut line = 1usize;
+    let mut it = src.chars().peekable();
+    let mut fields: Vec<Field> = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut in_quotes = false;
+    let mut field_started = false; // hubo algo (texto o comillas) en la fila
+    let mut rec_line = 1usize;
+    loop {
+        let c = it.next();
+        if in_quotes {
+            match c {
+                Some('"') => {
+                    if it.peek() == Some(&'"') {
+                        it.next();
+                        cur.push('"');
+                    } else {
+                        in_quotes = false;
+                    }
+                }
+                Some(ch) => {
+                    // `\r\n`, `\n` y `\r` solo son UN fin de línea, dentro y fuera de comillas.
+                    if ch == '\n' || (ch == '\r' && it.peek() != Some(&'\n')) {
+                        line += 1;
+                    }
+                    cur.push(ch);
+                }
+                None => {}
+            }
+            if c.is_some() {
+                continue;
+            }
+        }
+        match c {
+            Some(ch) if ch == delim => {
+                fields.push(Field { text: std::mem::take(&mut cur), quoted });
+                quoted = false;
+                field_started = true;
+            }
+            Some('"') if cur.is_empty() && !quoted => {
+                quoted = true;
+                in_quotes = true;
+                field_started = true;
+            }
+            Some(ch @ ('\n' | '\r')) => {
+                if ch == '\r' && it.peek() == Some(&'\n') {
+                    it.next();
+                }
+                if field_started || !cur.is_empty() {
+                    fields.push(Field { text: std::mem::take(&mut cur), quoted });
+                    out.push((rec_line, Some(std::mem::take(&mut fields))));
+                } else {
+                    out.push((rec_line, None));
+                }
+                quoted = false;
+                field_started = false;
+                line += 1;
+                rec_line = line;
+            }
+            Some(ch) => {
+                cur.push(ch);
+                field_started = true;
+            }
+            None => {
+                if field_started || !cur.is_empty() {
+                    fields.push(Field { text: std::mem::take(&mut cur), quoted });
+                    out.push((rec_line, Some(fields)));
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Con `{"numbers": true}`: intenta leer el campo como número. Enteros preservan
 /// Int/Big; el resto va por f64 con guardia de charset para NO tragar "inf"/"nan"
 /// (que `f64::from_str` acepta pero un CSV de negocio no quiere convertir).
@@ -157,6 +259,11 @@ fn field_as_number(s: &str) -> Option<Number> {
         return None;
     }
     let body = s.strip_prefix(['+', '-']).unwrap_or(s);
+    // Más de 4300 dígitos no es un número que convertir (cuadrático, el tope de `int()` y
+    // JSON): queda como texto.
+    if body.len() > crate::number::MAX_DEC_TEXT_DIGITS {
+        return None;
+    }
     if !body.is_empty() && body.bytes().all(|b| b.is_ascii_digit()) {
         if let Ok(i) = s.parse::<i64>() {
             return Some(Number::Int(i));
@@ -175,10 +282,15 @@ fn field_as_number(s: &str) -> Option<Number> {
     None
 }
 
-fn field_value(s: &str, numbers: bool) -> SynValue {
-    // v0.6.29 (DATOS-6): un campo vacío es un dato FALTANTE → `nothing` (y `csv_encode` escribe
-    // `nothing` como vacío: la ida y vuelta es simétrica).
+fn field_value(f: &Field, numbers: bool, missing: &[String]) -> SynValue {
+    // v0.6.29 (DATOS-6): un campo vacío es un dato FALTANTE → `nothing`; `""` entre comillas es
+    // texto vacío (y `csv_encode` escribe `nothing` vacío y `""` entre comillas: la ida y
+    // vuelta es exacta).
+    let s = f.text.as_str();
     if s.is_empty() {
+        return if f.quoted { syn_text("") } else { SynValue::Nothing };
+    }
+    if is_missing_marker(f, missing) {
         return SynValue::Nothing;
     }
     if numbers {
@@ -189,17 +301,27 @@ fn field_value(s: &str, numbers: bool) -> SynValue {
     syn_text(s)
 }
 
-/// Traduce el error del crate `csv` a un mensaje autocontenido con línea (G5).
-fn reader_err(e: csv::Error, headers: bool) -> Control {
-    if let csv::ErrorKind::UnequalLengths { pos, expected_len, len } = e.kind() {
-        let line = pos.as_ref().map(|p| p.line()).unwrap_or(0);
-        let source = if headers { " (the header row)" } else { " (the first row)" };
-        return err(format!(
-            "csv_parse: line {}: record has {} field(s), but {} were expected from the first record{}",
-            line, len, expected_len, source
-        ));
+/// `{"missing": ["NA", "NULL", "-"]}` (como `null_values` de polars / `na_values` de pandas):
+/// esos textos, SIN comillas, son un dato faltante. Entre comillas (`"NA"`) siguen siendo texto:
+/// alguien lo escribió a propósito.
+fn is_missing_marker(f: &Field, missing: &[String]) -> bool {
+    !f.quoted && missing.iter().any(|m| m == &f.text)
+}
+
+fn opt_missing(opts: &IndexMap<String, SynValue>) -> Result<Vec<String>, Control> {
+    match opts.get("missing") {
+        None | Some(SynValue::Nothing) => Ok(Vec::new()),
+        Some(SynValue::Text(t)) => Ok(vec![t.to_string()]),
+        Some(SynValue::List(l)) => l
+            .borrow()
+            .iter()
+            .map(|v| match v {
+                SynValue::Text(t) => Ok(t.to_string()),
+                other => Err(err(format!("csv_parse: option \"missing\" must be a list of texts, got a {} inside", other.type_name()))),
+            })
+            .collect(),
+        Some(other) => Err(err(format!("csv_parse: option \"missing\" must be a list of texts (e.g. [\"NA\", \"NULL\"]), got {}", other.type_name()))),
     }
-    err(format!("csv_parse: {}", e))
 }
 
 pub fn csv_parse(args: &[SynValue]) -> Result<SynValue, Control> {
@@ -218,7 +340,8 @@ pub fn csv_parse(args: &[SynValue]) -> Result<SynValue, Control> {
             )))
         }
     };
-    let opts = opts_map(args, "csv_parse", &["headers", "delimiter", "numbers", "types"])?;
+    let opts = opts_map(args, "csv_parse", &["headers", "delimiter", "numbers", "types", "missing"])?;
+    let missing = opt_missing(&opts)?;
     let headers = opt_bool(&opts, "headers", true, "csv_parse")?;
     let numbers = opt_bool(&opts, "numbers", false, "csv_parse")?;
     let types = opt_types(&opts)?;
@@ -234,15 +357,29 @@ pub fn csv_parse(args: &[SynValue]) -> Result<SynValue, Control> {
     }
     check_unclosed_quote(src, delim)?;
 
-    let mut rdr = csv::ReaderBuilder::new()
-        .has_headers(false) // las cabeceras se manejan acá (duplicados + forma de salida)
-        .delimiter(delim)
-        .flexible(false)
-        .from_reader(src.as_bytes());
-
-    let mut records: Vec<csv::StringRecord> = Vec::new();
-    for rec in rdr.records() {
-        records.push(rec.map_err(|e| reader_err(e, headers))?);
+    let raw = tokenize(src, delim);
+    // El ancho lo fija la primera fila. Una línea en blanco se saltea SIEMPRE, también en un CSV
+    // de una columna (Python `csv`, pandas): por eso `csv_encode` escribe `""` una fila de un solo
+    // campo `nothing`. Una línea en blanco dentro de un campo entre comillas es parte del campo.
+    let width = raw.iter().find_map(|(_, r)| r.as_ref().map(|f| f.len())).unwrap_or(0);
+    let mut records: Vec<(usize, Vec<Field>)> = Vec::new();
+    for (ln, r) in raw.into_iter() {
+        match r {
+            Some(f) => {
+                if f.len() != width {
+                    let source = if headers { " (the header row)" } else { " (the first row)" };
+                    return Err(err(format!(
+                        "csv_parse: line {}: record has {} field(s), but {} were expected from the first record{}",
+                        ln,
+                        f.len(),
+                        width,
+                        source
+                    )));
+                }
+                records.push((ln, f));
+            }
+            None => {}
+        }
     }
     if records.is_empty() {
         return Ok(syn_list(Vec::new()));
@@ -252,13 +389,13 @@ pub fn csv_parse(args: &[SynValue]) -> Result<SynValue, Control> {
         // Lista de listas: todas las filas son datos.
         let rows = records
             .iter()
-            .map(|rec| syn_list(rec.iter().map(|f| field_value(f, numbers)).collect()))
+            .map(|(_, rec)| syn_list(rec.iter().map(|f| field_value(f, numbers, &missing)).collect()))
             .collect();
         return Ok(syn_list(rows));
     }
 
     // Lista de mapas: primera fila = cabeceras (misma forma que devuelve sql()).
-    let header_row: Vec<String> = records[0].iter().map(|s| s.to_string()).collect();
+    let header_row: Vec<String> = records[0].1.iter().map(|f| f.text.clone()).collect();
     for (i, h) in header_row.iter().enumerate() {
         if header_row[..i].contains(h) {
             return Err(err(format!(
@@ -275,12 +412,13 @@ pub fn csv_parse(args: &[SynValue]) -> Result<SynValue, Control> {
         }
     }
     let mut rows = Vec::with_capacity(records.len().saturating_sub(1));
-    for (ri, rec) in records[1..].iter().enumerate() {
+    for (ln, rec) in records[1..].iter() {
         let mut m = IndexMap::with_capacity(header_row.len());
         for (h, f) in header_row.iter().zip(rec.iter()) {
             let v = match types.as_ref().and_then(|t| t.get(h)) {
-                Some(ty) => typed_field(f, ty, h, ri + 2)?,
-                None => field_value(f, numbers),
+                Some(_) if is_missing_marker(f, &missing) => SynValue::Nothing,
+                Some(ty) => typed_field(&f.text, f.quoted, ty, h, *ln)?,
+                None => field_value(f, numbers, &missing),
             };
             m.insert(h.clone(), v);
         }
@@ -315,9 +453,11 @@ fn opt_types(opts: &IndexMap<String, SynValue>) -> Result<Option<IndexMap<String
     }
 }
 
-fn typed_field(s: &str, ty: &str, col: &str, line: usize) -> Result<SynValue, Control> {
+fn typed_field(s: &str, quoted: bool, ty: &str, col: &str, line: usize) -> Result<SynValue, Control> {
     if s.is_empty() {
-        return Ok(SynValue::Nothing);
+        // `""` entre comillas en una columna de texto es texto vacío; en las demás, y sin
+        // comillas, falta el dato.
+        return Ok(if quoted && ty == "text" { syn_text("") } else { SynValue::Nothing });
     }
     let article = if matches!(ty, "int") { "an" } else { "a" };
     let bad = || err(format!("csv_parse: line {}, column {:?}: {:?} is not {} {}", line, col, s, article, ty));
@@ -329,10 +469,29 @@ fn typed_field(s: &str, ty: &str, col: &str, line: usize) -> Result<SynValue, Co
             if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
                 return Err(bad());
             }
+            // El tope de `int()` y JSON: convertir un entero enorme es cuadrático.
+            if digits.len() > crate::number::MAX_DEC_TEXT_DIGITS {
+                return Err(err(format!(
+                    "csv_parse: line {}, column {:?}: an integer with {} digits; the limit is {} — read the column as text",
+                    line, col, digits.len(), crate::number::MAX_DEC_TEXT_DIGITS
+                )));
+            }
             syn_number(Number::from_bigint(t.parse::<BigInt>().map_err(|_| bad())?))
         }
-        "float" => syn_number(Number::Float(t.parse::<f64>().map_err(|_| bad())?)),
-        "decimal" => syn_number(Number::Decimal(rust_decimal::Decimal::from_str_exact(t).map_err(|_| bad())?)),
+        "float" => {
+            let x = t.parse::<f64>().map_err(|_| bad())?;
+            // `nan`/`inf` escritos así se leen; un número que no entra en un float (`1e400`)
+            // es error, no infinito (se perdería en silencio, como en `json_decode`).
+            let lower = t.trim_start_matches(['+', '-']).to_ascii_lowercase();
+            if x.is_infinite() && !matches!(lower.as_str(), "inf" | "infinity") {
+                return Err(err(format!(
+                    "csv_parse: line {}, column {:?}: {:?} is out of range for a float — read the column as decimal or text",
+                    line, col, s
+                )));
+            }
+            syn_number(Number::Float(x))
+        }
+        "decimal" => syn_number(Number::parse_decimal(t).ok_or_else(bad)?),
         "date" => crate::temporal::date(&[syn_text(t)]).map_err(|_| bad())?,
         "datetime" => crate::temporal::datetime(&[syn_text(t)]).map_err(|_| bad())?,
         "bool" => match t.to_ascii_lowercase().as_str() {
@@ -349,12 +508,12 @@ fn typed_field(s: &str, ty: &str, col: &str, line: usize) -> Result<SynValue, Co
 // =========================================================
 
 /// Fin de línea: `"\r\n"` (RFC 4180 / Excel, default) o `"\n"`.
-fn opt_eol(opts: &IndexMap<String, SynValue>) -> Result<csv::Terminator, Control> {
+fn opt_eol(opts: &IndexMap<String, SynValue>) -> Result<&'static str, Control> {
     match opts.get("eol") {
-        None => Ok(csv::Terminator::CRLF),
+        None => Ok("\r\n"),
         Some(SynValue::Text(s)) => match &**s {
-            "\r\n" => Ok(csv::Terminator::CRLF),
-            "\n" => Ok(csv::Terminator::Any(b'\n')),
+            "\r\n" => Ok("\r\n"),
+            "\n" => Ok("\n"),
             other => Err(err(format!(
                 "csv_encode: option \"eol\" must be \"\\r\\n\" or \"\\n\", got {:?}",
                 other
@@ -393,8 +552,52 @@ fn opt_headers_list(opts: &IndexMap<String, SynValue>) -> Result<Option<Vec<Stri
     }
 }
 
+/// Un campo a escribir: su texto, si es un texto vacío (que va entre comillas) y si vino de un
+/// texto (sólo el texto puede ser una fórmula: un número negativo `-5` no se toca).
+struct Cell {
+    text: String,
+    empty_text: bool,
+    is_text: bool,
+    /// Viene de `nothing` (con `{"missing": marca}` se escribe la marca).
+    is_missing: bool,
+}
+
+impl From<String> for Cell {
+    fn from(text: String) -> Cell {
+        Cell { text, empty_text: false, is_text: false, is_missing: false }
+    }
+}
+
+/// Una cabecera es texto (también puede ser una fórmula).
+fn header_cell(text: String) -> Cell {
+    Cell { text, empty_text: false, is_text: true, is_missing: false }
+}
+
+/// El aviso de `csv_encode` para una tabla de UNA columna con algún `nothing` y sin `missing`: ahí
+/// `nothing` se escribe `""` (una línea en blanco se ignoraría al leer) y vuelve como texto vacío.
+pub const ONE_COLUMN_NOTHING_WARNING: &str = "csv_encode: a one-column table writes nothing as \"\" (it reads back as empty text); pass {\"missing\": \"NA\"} and read it with {\"missing\": [\"NA\"]} for an exact round trip";
+
+/// Avisa una vez por proceso.
+fn warn_one_column_nothing() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| eprintln!("warning: {}", ONE_COLUMN_NOTHING_WARNING));
+}
+
+/// ¿Empieza como una fórmula de hoja de cálculo? (OWASP: `=`, `+`, `-`, `@`, tab, CR).
+fn t_starts_formula(t: &str) -> bool {
+    matches!(t.chars().next(), Some('=' | '+' | '-' | '@' | '\t' | '\r'))
+}
+
 /// Un valor escalar → su campo CSV. `row` es 1-based (para el mensaje de error).
-fn encode_field(v: &SynValue, row: usize, col: &str) -> Result<String, Control> {
+fn encode_field(v: &SynValue, row: usize, col: &str) -> Result<Cell, Control> {
+    if let SynValue::Text(s) = v {
+        return Ok(Cell { text: s.to_string(), empty_text: s.is_empty(), is_text: true, is_missing: false });
+    }
+    let is_missing = matches!(v, SynValue::Nothing);
+    encode_scalar(v, row, col).map(|text| Cell { is_missing, ..Cell::from(text) })
+}
+
+fn encode_scalar(v: &SynValue, row: usize, col: &str) -> Result<String, Control> {
     match v {
         SynValue::Text(s) => Ok(s.to_string()),
         // Espeja text(): enteros sin decimales ("42"), Float estilo Python, Decimal exacto.
@@ -436,24 +639,89 @@ pub fn csv_encode(args: &[SynValue]) -> Result<SynValue, Control> {
             )))
         }
     };
-    let opts = opts_map(args, "csv_encode", &["headers", "delimiter", "eol"])?;
+    let opts = opts_map(args, "csv_encode", &["headers", "delimiter", "eol", "escape_formulas", "missing"])?;
+    // OWASP "CSV injection": una celda de texto que empieza con = + - @ (o tab/CR) la abre
+    // Excel/Sheets como FÓRMULA. Con `escape_formulas` se le antepone `'`, que la muestra como
+    // texto. Apagado por defecto: cambia el dato (la ida y vuelta deja de ser exacta).
+    let escape_formulas = opt_bool(&opts, "escape_formulas", false, "csv_encode")?;
     let delim = opt_delimiter(&opts, "csv_encode")?;
     let eol = opt_eol(&opts)?;
     let explicit_headers = opt_headers_list(&opts)?;
+    // `{"missing": "NA"}` (el `na_rep` de pandas): cada `nothing` se escribe como la marca, sin
+    // comillas, y un texto igual a la marca va entre comillas — con `csv_parse(t, {"missing":
+    // ["NA"]})` la ida y vuelta es exacta con cualquier cantidad de columnas.
+    let missing: Option<String> = match opts.get("missing") {
+        None | Some(SynValue::Nothing) => None,
+        Some(SynValue::Text(t)) => {
+            let t = t.to_string();
+            // Vacía no marca nada (un campo vacío YA es `nothing`) y en una tabla de una columna
+            // escribiría líneas en blanco, que al leer se saltean: la fila se perdería.
+            if t.is_empty() {
+                return Err(err(
+                    "csv_encode: option \"missing\" cannot be empty — an empty field already reads as nothing; use a mark such as \"NA\" (and read it back with {\"missing\": [\"NA\"]})",
+                ));
+            }
+            if t.contains(delim as char) || t.contains('"') || t.contains('\n') || t.contains('\r') {
+                return Err(err(format!(
+                    "csv_encode: option \"missing\" cannot contain the delimiter, a quote or a line end, got {:?}",
+                    t
+                )));
+            }
+            Some(t)
+        }
+        Some(other) => {
+            return Err(err(format!(
+                "csv_encode: option \"missing\" must be a text (the mark written for nothing, e.g. \"NA\"), got {}",
+                other.type_name()
+            )))
+        }
+    };
 
-    let mut wtr = csv::WriterBuilder::new()
-        .delimiter(delim)
-        .terminator(eol)
-        .quote_style(csv::QuoteStyle::Necessary) // quoting mínimo RFC 4180
-        .from_writer(Vec::new());
-    let write = |wtr: &mut csv::Writer<Vec<u8>>, rec: &[String]| -> Result<(), Control> {
-        wtr.write_record(rec).map_err(|e| err(format!("csv_encode: {}", e)))
+    // Escritor RFC 4180 propio (v0.6.29): comillas sólo donde hacen falta —separador,
+    // comilla, fin de línea— y SIEMPRE en un texto vacío (`""`), que así se distingue de
+    // `nothing` (campo vacío sin comillas). Lo que escribe, `csv_parse` lo lee igual.
+    let mut wtr = String::new();
+    let d = delim as char;
+    let write = |wtr: &mut String, rec: &[Cell]| -> Result<(), Control> {
+        for (i, c) in rec.iter().enumerate() {
+            if i > 0 {
+                wtr.push(d);
+            }
+            if let (true, Some(mark)) = (c.is_missing, &missing) {
+                wtr.push_str(mark);
+                continue;
+            }
+            let escaped;
+            let t = if escape_formulas && c.is_text && t_starts_formula(&c.text) {
+                escaped = format!("'{}", c.text);
+                escaped.as_str()
+            } else {
+                c.text.as_str()
+            };
+            // Una fila de un solo campo vacío sería una línea en blanco, que al leer se ignora:
+            // se escribe `""`, como el writer de Python (un `nothing` ahí vuelve como `""`).
+            let lone_empty = rec.len() == 1 && t.is_empty();
+            if lone_empty && c.is_missing {
+                warn_one_column_nothing();
+            }
+            // Un texto igual a la marca de `missing` va entre comillas, para no leerse como faltante.
+            let is_mark = c.is_text && missing.as_deref() == Some(t);
+            if c.empty_text || lone_empty || is_mark || t.contains(d) || t.contains('"') || t.contains('\n') || t.contains('\r') {
+                wtr.push('"');
+                wtr.push_str(&t.replace('"', "\"\""));
+                wtr.push('"');
+            } else {
+                wtr.push_str(t);
+            }
+        }
+        wtr.push_str(eol);
+        Ok(())
     };
 
     if rows.is_empty() {
         // Sin filas: con cabeceras explícitas se emite solo esa fila; si no, texto vacío.
         if let Some(hs) = &explicit_headers {
-            write(&mut wtr, hs)?;
+            write(&mut wtr, &hs.iter().cloned().map(header_cell).collect::<Vec<_>>())?;
         }
     } else {
         match &rows[0] {
@@ -463,7 +731,7 @@ pub fn csv_encode(args: &[SynValue]) -> Result<SynValue, Control> {
                     Some(hs) => hs.clone(),
                     None => first.borrow().keys().cloned().collect(),
                 };
-                write(&mut wtr, &headers)?;
+                write(&mut wtr, &headers.iter().cloned().map(header_cell).collect::<Vec<_>>())?;
                 for (i, r) in rows.iter().enumerate() {
                     let m = match r {
                         SynValue::Map(m) => m.borrow(),
@@ -514,7 +782,7 @@ pub fn csv_encode(args: &[SynValue]) -> Result<SynValue, Control> {
                             width
                         )));
                     }
-                    write(&mut wtr, hs)?;
+                    write(&mut wtr, &hs.iter().cloned().map(header_cell).collect::<Vec<_>>())?;
                 }
                 for (i, r) in rows.iter().enumerate() {
                     let items = match r {
@@ -551,11 +819,7 @@ pub fn csv_encode(args: &[SynValue]) -> Result<SynValue, Control> {
         }
     }
 
-    let bytes = wtr
-        .into_inner()
-        .map_err(|e| err(format!("csv_encode: {}", e)))?;
-    let text = String::from_utf8(bytes).map_err(|e| err(format!("csv_encode: {}", e)))?;
-    Ok(syn_text(text))
+    Ok(syn_text(wtr))
 }
 
 #[cfg(test)]
@@ -637,6 +901,20 @@ mod tests {
             }
             _ => panic!("expected list row"),
         }
+    }
+
+    #[test]
+    fn blank_line_always_skipped() {
+        // También en un CSV de una columna; `nothing` solo en una fila se escribe `""`.
+        for src in ["x\n1\n2\n\n", "x\n1\n\n2\n"] {
+            match parse(src) {
+                SynValue::List(l) => assert_eq!(l.borrow().len(), 2, "{:?}", src),
+                _ => panic!(),
+            }
+        }
+        let mut m = IndexMap::new();
+        m.insert("a".to_string(), SynValue::Nothing);
+        assert_eq!(encode(syn_list(vec![syn_map(m)])), "a\r\n\"\"\r\n");
     }
 
     #[test]

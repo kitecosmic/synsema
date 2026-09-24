@@ -81,27 +81,73 @@ pub fn http_request_with_bytes(
     }
 }
 
-fn parse_url(url: &str) -> Result<(String, String, u16, String), String> {
+/// Una URL `http(s)://[user:pass@]host[:port][/path][?query]`: esquema, host (sin corchetes
+/// si es IPv6), puerto, ruta+query, y las credenciales si vinieron (`user:pass@`, ya
+/// decodificadas del %-encoding) — van como `Authorization: Basic`, como en curl o requests.
+fn parse_url(url: &str) -> Result<(String, String, u16, String, Option<Vec<u8>>), String> {
     let idx = url.find("://").ok_or_else(|| "invalid URL (no scheme)".to_string())?;
     let scheme = url[..idx].to_lowercase();
     let rest = &url[idx + 3..];
-    let path_start = rest.find('/').unwrap_or(rest.len());
+    let path_start = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..path_start];
-    let path = if path_start < rest.len() { &rest[path_start..] } else { "/" };
-    let (host, port) = match authority.rfind(':') {
-        Some(i) => {
-            let h = authority[..i].to_string();
-            let p: u16 = authority[i + 1..]
-                .parse()
-                .map_err(|_| format!("invalid port in URL: {}", authority))?;
-            (h, p)
-        }
-        None => (
-            authority.to_string(),
-            if scheme == "https" { 443 } else { 80 },
-        ),
+    let mut path = if path_start < rest.len() { rest[path_start..].to_string() } else { "/".to_string() };
+    if let Some(h) = path.find('#') {
+        path.truncate(h); // el fragmento no viaja
+    }
+    if path.starts_with('?') {
+        path.insert(0, '/');
+    }
+    if path.is_empty() {
+        path.push('/');
+    }
+    let (userinfo, hostport) = match authority.rfind('@') {
+        Some(i) => (Some(percent_decode(&authority[..i])), &authority[i + 1..]),
+        None => (None, authority),
     };
-    Ok((scheme, host, port, path.to_string()))
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    let (host, port) = if let Some(inner) = hostport.strip_prefix('[') {
+        // IPv6: `[::1]:8080`
+        let close = inner.find(']').ok_or_else(|| format!("invalid IPv6 host in URL: {}", hostport))?;
+        let h = inner[..close].to_string();
+        let after = &inner[close + 1..];
+        let p = match after.strip_prefix(':') {
+            Some(p) => p.parse().map_err(|_| format!("invalid port in URL: {}", hostport))?,
+            None => default_port,
+        };
+        (h, p)
+    } else {
+        match hostport.rfind(':') {
+            Some(i) => {
+                let p: u16 = hostport[i + 1..].parse().map_err(|_| format!("invalid port in URL: {}", hostport))?;
+                (hostport[..i].to_string(), p)
+            }
+            None => (hostport.to_string(), default_port),
+        }
+    };
+    if host.is_empty() {
+        return Err("invalid URL: it has no host (expected scheme://host/…)".to_string());
+    }
+    Ok((scheme, host, port, path, userinfo))
+}
+
+fn percent_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        // Bytes, no `&str`: `%` seguido de un carácter multibyte no es un borde de carácter.
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = |c: u8| (c as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
 }
 
 // =========================================================
@@ -282,12 +328,25 @@ fn connect_and_send(
     body: Option<&[u8]>,
     timeout_secs: u64,
 ) -> Result<Box<dyn Read>, String> {
-    let (scheme, host, port, path) = parse_url(url)?;
+    let (scheme, host, port, path, userinfo) = parse_url(url)?;
     if scheme != "http" && scheme != "https" {
         return Err(format!("unsupported scheme '{}': only http and https are supported", scheme));
     }
+    // `user:pass@` → `Authorization: Basic …`, salvo que el programa ya mande uno.
+    let with_auth: Option<Vec<(String, String)>> = match &userinfo {
+        Some(ui) if !headers.unwrap_or(&[]).iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization")) => {
+            let mut h: Vec<(String, String)> = headers.map(|h| h.to_vec()).unwrap_or_default();
+            h.push(("Authorization".to_string(), format!("Basic {}", synsema_core::bytesutil::b64_encode(ui))));
+            Some(h)
+        }
+        _ => None,
+    };
+    let headers: Option<&[(String, String)]> = match &with_auth {
+        Some(h) => Some(h.as_slice()),
+        None => headers,
+    };
 
-    let addr = format!("{}:{}", host, port);
+    let addr = if host.contains(':') { format!("[{}]:{}", host, port) } else { format!("{}:{}", host, port) };
     let sa = addr
         .to_socket_addrs()
         .map_err(|e| e.to_string())?
@@ -298,7 +357,15 @@ fn connect_and_send(
     let _ = tcp.set_read_timeout(Some(timeout));
     let _ = tcp.set_write_timeout(Some(timeout));
 
-    let req_bytes = build_http_request(method, &path, &host, headers, body);
+    // `Host` lleva el puerto si no es el del esquema (RFC 9110 §7.2) y los corchetes de IPv6.
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    let host_hdr = match (host.contains(':'), port == default_port) {
+        (true, true) => format!("[{}]", host),
+        (true, false) => format!("[{}]:{}", host, port),
+        (false, true) => host.clone(),
+        (false, false) => format!("{}:{}", host, port),
+    };
+    let req_bytes = build_http_request(method, &path, &host_hdr, headers, body);
 
     if scheme == "https" {
         // Con identidad mTLS declarada (`mtls_identity`), el handshake presenta el

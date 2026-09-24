@@ -19,6 +19,7 @@ pub const STATEMENT_REFLEXES: &[(&str, &str)] = &[
     ("from", "import a local module with `use \"./file.syn\" as name`"),
     ("class", "a record type is `type Name` with typed fields; behavior goes in tasks"),
     ("except", "catch errors with `try` … `recover err`"),
+    ("finally", "there is no `finally`: put the cleanup after the try/recover block (it runs either way unless the recover re-raises)"),
     ("catch", "catch errors with `try` … `recover err`"),
     ("var", "declare with `let name be value`"),
     ("const", "declare with `let name be value`"),
@@ -53,6 +54,15 @@ pub const NAME_REFLEXES: &[(&str, &str)] = &[
     ("console", "print(x)"),
     ("json", "json_encode(x) / json_decode(text)"),
     ("math", "the math functions are builtins: sqrt(x), floor(x), pi"),
+    // pandas
+    ("dropna", "drop_missing(rows)"),
+    ("fillna", "fill_missing(rows, value)"),
+    ("isna", "is_missing(x)"),
+    ("isnull", "is_missing(x)"),
+    ("groupby", "group_by(rows, key), or summarize(rows, key, {…}) for per-group figures"),
+    ("value_counts", "count_by(rows, key)"),
+    ("read_csv", "csv_parse(read_file(path), {\"types\": {…}})"),
+    ("to_csv", "csv_encode(rows)"),
 ];
 
 /// Métodos de otros lenguajes (`xs.append(y)`) → la función.
@@ -61,12 +71,12 @@ pub const METHOD_REFLEXES: &[(&str, &str)] = &[
     ("push", "set xs to append(xs, item)"),
     ("extend", "set xs to xs + other"),
     ("pop", "slice(xs, 0, -1) for the rest, xs[-1] for the last"),
-    ("insert", "slice(xs, 0, i) + [item] + slice(xs, i)"),
+    ("insert", "set xs to insert(xs, i, item)"),
     ("remove", "where(xs, (x) => x != item)"),
     ("sort", "sort(xs) or sort_by(xs, key)"),
     ("reverse", "reverse(xs)"),
     ("index", "index_of(xs, item)"),
-    ("count", "count_where(xs, (x) => x == item)"),
+    ("count", "count_where(xs, (x) => x == item), or count(xs) for the present values"),
     ("keys", "keys(m)"),
     ("values", "values(m)"),
     ("items", "items(m)"),

@@ -56,6 +56,7 @@ pub mod http;
 pub mod http;
 pub mod httpsig;
 pub mod json;
+pub mod json_exact;
 pub mod mimetypes;
 pub mod oidc;
 /// `platform()` → `{os, arch}`, sin capability (un hecho del binario, como `args()`).

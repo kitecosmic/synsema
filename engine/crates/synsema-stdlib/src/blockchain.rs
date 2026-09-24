@@ -615,7 +615,7 @@ fn int_be_minimal(n: &Number, fname: &str) -> Result<Vec<u8>, Control> {
         Number::Float(_) => {
             Err(err(format!("{}: cannot RLP-encode a float; RLP takes bytes, non-negative integers, and lists", fname)))
         }
-        Number::Decimal(_) => {
+        Number::Decimal(_) | Number::BigDec(_) => {
             Err(err(format!("{}: cannot RLP-encode a decimal; RLP takes bytes, non-negative integers, and lists", fname)))
         }
     }

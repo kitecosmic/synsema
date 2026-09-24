@@ -19,7 +19,7 @@ use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use sha2::{Digest, Sha256};
 use synsema_core::types::{syn_bool, syn_bytes, syn_int, syn_map, syn_nothing, syn_text, SynValue};
 
-use crate::json::{dumps, json_to_syn, syn_to_json};
+use crate::json::{dumps, syn_to_json};
 
 /// Chequea la capability `net(host)` del URL; convierte la violación en `Control::Error`
 /// SIN ubicación (como secure.rs/database.rs). Scope = hostname (minúsculas, sin puerto);
@@ -30,12 +30,20 @@ pub fn require_net(
     url: &str,
     source: &str,
 ) -> Result<(), Control> {
+    // Sin host extraíble no hay a qué darle permiso: error, y SIN ecoar el URL (puede llevar
+    // `user:pass@` o la clave de un RPC en la ruta).
     let host = match url_hostname(url) {
         Some(h) if !h.is_empty() => h,
-        _ => url.to_string(),
+        _ => {
+            return Err(Control::Error(RuntimeError::new(format!(
+                "{}: the URL has no host (expected scheme://host/…)",
+                source
+            ))))
+        }
     };
+    let scope = synsema_capabilities::model::net_request_scope(url).unwrap_or(host);
     caps.borrow_mut()
-        .require(&Capability::new(CapabilityType::Net, Some(host)), source)
+        .require(&Capability::new(CapabilityType::Net, Some(scope)), source)
         .map_err(|v| Control::Error(v.into_error()))
 }
 
@@ -199,10 +207,8 @@ fn parsed_json(headers: &[(String, String)], body: &str) -> SynValue {
     if !is_json {
         return syn_nothing();
     }
-    match serde_json::from_str::<serde_json::Value>(body) {
-        Ok(v) => json_to_syn(&v),
-        Err(_) => syn_nothing(),
-    }
+    // El mismo parser exacto que `json_decode`: un uint256 del body llega entero.
+    crate::json_exact::parse(body).unwrap_or_else(|_| syn_nothing())
 }
 
 /// v0.6.20 — la respuesta de `http_bytes`: `bytes` exactos en vez de `body` texto.

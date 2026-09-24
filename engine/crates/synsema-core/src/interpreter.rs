@@ -280,6 +280,200 @@ impl Environment {
     }
 }
 
+// =========================================================
+// módulos: registro explícito (v0.6.29)
+// =========================================================
+
+/// Un módulo cargado es DOS vistas del mismo estado: su entorno (`module:<ruta>`, donde viven
+/// sus variables y cierran sus tasks) y el mapa de exportaciones que devuelve `use … as m`. El
+/// registro las une por identidad —no por forma— para que (a) `m` se reconozca en O(1) como
+/// espacio de nombres (un mapa de datos con un task adentro no es un módulo) y (b) cada
+/// escritura a una exportación, desde adentro (`set STATE[k]` en un task) o desde afuera
+/// (`set m.STATE[k]`), deje las dos vistas apuntando al mismo valor. Por hilo, como el
+/// intérprete; los `Weak` no retienen el módulo y mantienen viva la dirección (no se
+/// reutiliza mientras esté registrada).
+#[derive(Default)]
+struct ModuleRegistry {
+    by_map: HashMap<usize, (std::rc::Weak<RefCell<IndexMap<String, SynValue>>>, std::rc::Weak<RefCell<Environment>>)>,
+    by_env: HashMap<usize, std::rc::Weak<RefCell<IndexMap<String, SynValue>>>>,
+    prune_at: usize,
+}
+
+thread_local! {
+    static MODULES: RefCell<ModuleRegistry> = RefCell::new(ModuleRegistry::default());
+}
+
+/// Registra el mapa de exportaciones `map` como la vista de `env` (lo llaman `load_module`
+/// y la reconstrucción de módulos de un worker de `serve`/`parallel_map`).
+pub fn register_module(map: &Rc<RefCell<IndexMap<String, SynValue>>>, env: &Rc<RefCell<Environment>>) {
+    MODULES.with(|r| {
+        let mut r = r.borrow_mut();
+        if r.by_map.len() >= r.prune_at.max(64) {
+            r.by_map.retain(|_, (m, e)| m.strong_count() > 0 && e.strong_count() > 0);
+            r.by_env.retain(|_, m| m.strong_count() > 0);
+            r.prune_at = r.by_map.len() * 2;
+        }
+        r.by_map.insert(Rc::as_ptr(map) as usize, (Rc::downgrade(map), Rc::downgrade(env)));
+        r.by_env.insert(Rc::as_ptr(env) as usize, Rc::downgrade(map));
+    });
+}
+
+/// El entorno del módulo cuyo mapa de exportaciones es `map`, si lo es.
+pub fn module_env_of_map(map: &Rc<RefCell<IndexMap<String, SynValue>>>) -> Option<Rc<RefCell<Environment>>> {
+    MODULES.with(|r| {
+        let r = r.borrow();
+        if r.by_map.is_empty() {
+            return None;
+        }
+        let (m, e) = r.by_map.get(&(Rc::as_ptr(map) as usize))?;
+        m.upgrade()?;
+        e.upgrade()
+    })
+}
+
+/// El mapa de exportaciones del módulo cuyo entorno es `env`, si lo es.
+pub fn module_map_of_env(env: &Rc<RefCell<Environment>>) -> Option<Rc<RefCell<IndexMap<String, SynValue>>>> {
+    MODULES.with(|r| r.borrow().by_env.get(&(Rc::as_ptr(env) as usize)).and_then(|m| m.upgrade()))
+}
+
+/// `set m.X to v` / `set m["X"] to v` sobre un módulo: religa SU variable (la que leen sus
+/// tasks), como `m.X = v` en Python; sus nombres son sus exportaciones y sus tasks no se
+/// reemplazan desde afuera.
+fn module_rebind(
+    m: &Rc<RefCell<IndexMap<String, SynValue>>>,
+    menv: &Rc<RefCell<Environment>>,
+    name: &str,
+    value: SynValue,
+    loc: &SourceLocation,
+) -> Result<SynValue, Control> {
+    let current = m.borrow().get(name).cloned();
+    match current {
+        None => Err(err_at(
+            format!("module has no export '{}' — a module's names are the ones it exports; add `export let {} be …` in the module", name, name),
+            loc,
+        )),
+        Some(SynValue::Task(_)) => Err(err_at(format!("cannot replace the module task '{}' from outside the module", name), loc)),
+        Some(_) => {
+            let _ = env_update(menv, name, value.clone());
+            Ok(value)
+        }
+    }
+}
+
+/// Si `parent` es el mapa de un módulo y `name` una de sus exportaciones: acceso único a la
+/// VARIABLE del módulo (sincroniza el mapa). `None` si no es un módulo o no exporta ese nombre.
+fn module_var_unique(parent: &SynValue, name: &str) -> Option<SynValue> {
+    let SynValue::Map(m) = parent else { return None };
+    if !m.borrow().contains_key(name) {
+        return None;
+    }
+    let menv = module_env_of_map(m)?;
+    with_unique_binding(&menv, name, |slot| slot.clone())
+}
+
+/// Un camino que se puede leer dos veces sin efectos: una variable, `p.campo` o `p[k]` con
+/// `k` literal o variable.
+fn is_pure_place(n: &Node) -> bool {
+    match &n.kind {
+        NodeKind::Identifier { .. } => true,
+        NodeKind::PropertyAccess { object, .. } => is_pure_place(object),
+        NodeKind::IndexAccess { object, index } => {
+            is_pure_place(object)
+                && matches!(
+                    index.kind,
+                    NodeKind::Identifier { .. } | NodeKind::NumberLiteral { .. } | NodeKind::TextLiteral { .. }
+                )
+        }
+        _ => false,
+    }
+}
+
+/// ¿`a` y `b` escriben el mismo camino puro? (misma forma, sin mirar ubicaciones)
+fn same_place(a: &Node, b: &Node) -> bool {
+    match (&a.kind, &b.kind) {
+        (NodeKind::Identifier { name: x }, NodeKind::Identifier { name: y }) => x == y,
+        (
+            NodeKind::PropertyAccess { object: oa, property_name: pa, .. },
+            NodeKind::PropertyAccess { object: ob, property_name: pb, .. },
+        ) => pa == pb && same_place(oa, ob),
+        (NodeKind::IndexAccess { object: oa, index: ia }, NodeKind::IndexAccess { object: ob, index: ib }) => {
+            same_place(oa, ob)
+                && match (&ia.kind, &ib.kind) {
+                    (NodeKind::Identifier { name: x }, NodeKind::Identifier { name: y }) => x == y,
+                    (NodeKind::TextLiteral { value: x }, NodeKind::TextLiteral { value: y }) => x == y,
+                    (NodeKind::NumberLiteral { .. }, NodeKind::NumberLiteral { .. }) => ia.kind == ib.kind,
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
+/// La posición de `insert(xs, i, v)`: `0..=len` (`len` agrega al final) y negativos desde el
+/// final como en `xs[i]` (`-1` inserta antes del último). Fuera de rango es error, no se
+/// recorta como en Python: un índice equivocado es un bug, no un "al final".
+fn insert_position(i: &SynValue, len: usize) -> Result<usize, String> {
+    let i = num_to_i64(i).map_err(|e| match e {
+        Control::Error(e) => e.message,
+        _ => "insert(): the position must be an integer".to_string(),
+    })?;
+    let n = len as i64;
+    let j = if i < 0 { i + n } else { i };
+    if j < 0 || j > n {
+        return Err(format!("insert(): position {} out of range for a list of length {} (valid: -{}..{})", i, len, len, len));
+    }
+    Ok(j as usize)
+}
+
+/// ¿`a` y `b` son el MISMO contenedor (misma lista, mapa o valor privado)?
+fn same_container(a: &SynValue, b: &SynValue) -> bool {
+    match (a, b) {
+        (SynValue::List(x), SynValue::List(y)) => Rc::ptr_eq(x, y),
+        (SynValue::Map(x), SynValue::Map(y)) => Rc::ptr_eq(x, y),
+        (SynValue::Private(x), SynValue::Private(y)) => Rc::ptr_eq(x, y),
+        _ => false,
+    }
+}
+
+/// Acceso MUTABLE y ÚNICO al binding `name` (el scope más cercano que lo tiene): el
+/// contenedor se copia antes si otro lo comparte (`make_unique`), `f` lo modifica, y si el
+/// binding es una exportación de un módulo, el mapa de exportaciones queda apuntando al
+/// resultado. El mapa del módulo NO cuenta como otro dueño: es la otra vista del mismo
+/// nombre, así que un task que escribe su estado no lo copia en cada vuelta, y `let snap be
+/// m.STATE` (un tercer dueño) sí queda como foto.
+fn with_unique_binding<R>(
+    env: &Rc<RefCell<Environment>>,
+    name: &str,
+    f: impl FnOnce(&mut SynValue) -> R,
+) -> Option<R> {
+    let mut cur = env.clone();
+    loop {
+        let next = {
+            let mut e = cur.borrow_mut();
+            let is_module = e.name.starts_with("module:");
+            if let Some(slot) = e.bindings.get_mut(name) {
+                let view = if is_module { module_map_of_env(&cur) } else { None };
+                let exported = view.as_ref().is_some_and(|m| m.borrow().contains_key(name));
+                let shared_with_view = exported
+                    && view.as_ref().is_some_and(|m| m.borrow().get(name).is_some_and(|v| same_container(v, slot)));
+                make_unique_n(slot, if shared_with_view { 1 } else { 0 });
+                let out = f(slot);
+                if exported {
+                    if let Some(m) = view {
+                        m.borrow_mut().insert(name.to_string(), slot.clone());
+                    }
+                }
+                return Some(out);
+            }
+            e.parent.clone()
+        };
+        match next {
+            Some(p) => cur = p,
+            None => return None,
+        }
+    }
+}
+
 /// Búsqueda léxica (el scope actual y sus padres). Pública para el análisis
 /// estático de rutas (`route_meta::env_lookup`).
 pub fn env_get(env: &Rc<RefCell<Environment>>, name: &str) -> Option<SynValue> {
@@ -309,6 +503,15 @@ fn env_update(env: &Rc<RefCell<Environment>>, name: &str, value: SynValue) -> Re
     loop {
         let has = cur.borrow().bindings.contains_key(name);
         if has {
+            let is_module = cur.borrow().name.starts_with("module:");
+            if is_module {
+                // Una exportación religada dentro del módulo: el mapa `use … as m` la sigue.
+                if let Some(m) = module_map_of_env(&cur) {
+                    if m.borrow().contains_key(name) {
+                        m.borrow_mut().insert(name.to_string(), value.clone());
+                    }
+                }
+            }
             cur.borrow_mut().bindings.insert(name.to_string(), value);
             return Ok(());
         }
@@ -863,7 +1066,7 @@ pub struct Interpreter {
     lineage: Vec<LineageEntry>,
     /// Bytes canónicos de un valor estructurado para el linaje (el stdlib instala
     /// `canonical_json`, RFC 8785): así cualquiera recalcula el hash de un resultado de SQL.
-    pub lineage_canonical: Option<Rc<dyn Fn(&SynValue) -> Option<Vec<u8>>>>,
+    pub lineage_canonical: Option<Rc<dyn Fn(&SynValue) -> Option<(Vec<u8>, &'static str)>>>,
 }
 
 impl Default for Interpreter {
@@ -1867,28 +2070,75 @@ impl Interpreter {
         if self.lineage.len() >= MAX_LINEAGE {
             return;
         }
+        // Un recv que venció sin mensaje no trajo nada.
+        if matches!(result, SynValue::Nothing)
+            && ["ws_", "proc_", "term_", "watch_"].iter().any(|p| source.starts_with(p))
+        {
+            return;
+        }
         let canon = self.lineage_canonical.clone();
+        // Qué bytes se hashean, y cómo recalcularlo (`encoding`): el texto (utf-8), los bytes
+        // tal cual, o un valor estructurado como `canonical_json(x)` ("jcs"); si trae enteros
+        // de más de 2^53 (que JCS no puede llevar), como `json_encode(x)` ("json").
+        let enc_cell: std::cell::Cell<&'static str> = std::cell::Cell::new("text");
         let bytes_of = |v: &SynValue| -> Vec<u8> {
             match v {
-                SynValue::Text(_) | SynValue::Bytes(_) | SynValue::Nothing => value_bytes(v),
-                // Estructurado → JSON canónico (RFC 8785), recalculable con canonical_json(x).
-                other => canon.as_ref().and_then(|f| f(other)).unwrap_or_else(|| value_bytes(other)),
+                SynValue::Text(_) | SynValue::Nothing => {
+                    enc_cell.set("text");
+                    value_bytes(v)
+                }
+                SynValue::Bytes(_) => {
+                    enc_cell.set("bytes");
+                    value_bytes(v)
+                }
+                other => match canon.as_ref().and_then(|f| f(other)) {
+                    Some((b, enc)) => {
+                        enc_cell.set(enc);
+                        b
+                    }
+                    None => {
+                        enc_cell.set("display");
+                        value_bytes(other)
+                    }
+                },
+            }
+        };
+        // Compromiso con sal de la consulta (ver abajo): la sal y cómo se codificó la consulta.
+        let mut salt: Option<(String, &'static str)> = None;
+        // `what` se publica en el recibo firmado: sólo una ruta que el programa pasó como texto,
+        // un host sin credenciales, un compromiso con sal o un tamaño — nunca datos. Un archivo
+        // pasado como bytes (`parquet_read(b)`) es `bytes <n>`, no su contenido; `grep(target,
+        // pattern)` publica el target, no el patrón (que puede ser el dato buscado).
+        let path_what = |a: Option<&SynValue>| -> String {
+            match a {
+                Some(SynValue::Text(t)) => t.to_string(),
+                Some(SynValue::Bytes(b)) => format!("bytes {}", b.len()),
+                Some(other) => other.type_name().to_string(),
+                None => String::new(),
             }
         };
         let (what, payload): (String, Vec<u8>) = match source {
-            "read_file" | "read_file_bytes" => (args.first().map(|a| a.to_string()).unwrap_or_default(), bytes_of(result)),
+            "read_file" | "read_file_bytes" | "list_dir" | "grep" | "parquet_read" | "file_info" => {
+                (path_what(args.first()), bytes_of(result))
+            }
             "read_line" => ("stdin".to_string(), bytes_of(result)),
             s if s.starts_with("http") || s == "fetch" => {
-                // Sólo el HOST: la clave de un RPC suele viajar en la ruta o la query y un recibo
-                // firmado no la puede publicar. `http(method, url, …)` lleva la URL segunda.
-                let url = args
-                    .iter()
-                    .find_map(|a| match a {
-                        SynValue::Text(t) if t.contains("://") => Some(t.to_string()),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                let host = url.split("://").nth(1).unwrap_or(&url).split(['/', '?', '#']).next().unwrap_or("").to_string();
+                // Una lectura que no llegó (sin conexión, DNS, TLS) no es una entrada: el mapa
+                // trae `error` y ningún dato.
+                if let SynValue::Map(m) = result {
+                    if m.borrow().contains_key("error") {
+                        return;
+                    }
+                }
+                let mut host = url_host(url_of_connection(source, args));
+                // Un 4xx/5xx sí trajo un cuerpo que el programa pudo usar: queda, con su estado.
+                if let SynValue::Map(m) = result {
+                    if let Some(SynValue::Number(Number::Int(st))) = m.borrow().get("status") {
+                        if !(200..300).contains(st) {
+                            host.push_str(&format!(" status {}", st));
+                        }
+                    }
+                }
                 let body = match result {
                     SynValue::Map(m) => m.borrow().get("body").map(|b| bytes_of(b)).unwrap_or_else(|| bytes_of(result)),
                     other => bytes_of(other),
@@ -1896,17 +2146,53 @@ impl Interpreter {
                 (host, body)
             }
             _ => {
-                // Consultas a bases de datos: el hash de la consulta ENTERA (todos sus argumentos,
-                // filtros de Mongo incluidos; puede llevar datos) y el del resultado.
+                // Consultas (bases de datos, nodos de una cadena, sockets, procesos): el hash de
+                // la llamada ENTERA (todos sus argumentos, filtros de Mongo incluidos; puede
+                // llevar datos o la clave de un RPC, por eso no va en claro) y el del resultado.
+                // Si la fuente tiene una conexión (el nodo de una cadena), su host va adelante,
+                // sin credenciales; la clave de redis/mongo/memoria nunca (`url_of_connection`).
+                // Un COMPROMISO CON SAL, como SD-JWT: sha256(sal ‖ consulta) con 128 bits de sal
+                // nueva por entrada. El recibo publica sólo el compromiso (un sha256 a secas de
+                // `run("id", "-u")` se revertía probando un diccionario de consultas); la sal
+                // queda en `lineage()`, así el dueño puede probar después qué consulta fue.
                 let q = bytes_of(&SynValue::List(Rc::new(RefCell::new(args.to_vec()))));
-                (format!("query sha256:{}", sha256_hex(&q)), bytes_of(result))
+                let q_enc = enc_cell.get();
+                let (sal, commit) = salted_commitment(&q);
+                salt = Some((sal, q_enc));
+                let host = url_host(url_of_connection(source, args));
+                let what = if host.is_empty() {
+                    format!("query sha256-salted:{}", commit)
+                } else {
+                    format!("{} query sha256-salted:{}", host, commit)
+                };
+                (what, bytes_of(result))
             }
         };
+        let encoding = enc_cell.get().to_string();
         self.lineage.push(LineageEntry {
             source: source.to_string(),
             what,
             sha256: sha256_hex(&payload),
             bytes: payload.len(),
+            encoding,
+            salt,
+        });
+    }
+
+    /// Linaje de una respuesta de modelo (`reason`, `decide`, `analyze`, `generate`): lo que
+    /// dijo el modelo también es una entrada del programa. Va el hash del prompt, no el prompt.
+    fn record_llm(&mut self, kind: &str, prompt: &str, out: &str) {
+        if self.lineage.len() >= MAX_LINEAGE {
+            return;
+        }
+        let (sal, commit) = salted_commitment(prompt.as_bytes());
+        self.lineage.push(LineageEntry {
+            source: "llm".to_string(),
+            what: format!("{} prompt sha256-salted:{}", kind, commit),
+            sha256: sha256_hex(out.as_bytes()),
+            bytes: out.len(),
+            encoding: "text".to_string(),
+            salt: Some((sal, "text")),
         });
     }
 
@@ -2399,7 +2685,9 @@ impl Interpreter {
                 exports.insert(name, v);
             }
         }
-        Ok(syn_map(exports))
+        let map = Rc::new(RefCell::new(exports));
+        register_module(&map, &module_env);
+        Ok(SynValue::Map(map))
     }
 
     fn register_builtins(&self) {
@@ -2435,7 +2723,61 @@ impl Interpreter {
         self.register("float", -1, with_fallback(1, Rc::new(|i, a, l| i.b_float(a, l))));
         self.register("is_decimal", 1, Rc::new(|i, a, l| i.b_is_decimal(a, l)));
         // v0.6.29: entero exacto (forma total como `number`), `0x…` y predicados de tipo.
-        self.register("int", -1, with_fallback(1, Rc::new(|i, a, l| i.b_int(a, l))));
+        // `int(x, fallback)` es la forma total (como `number`); la BASE va con nombre:
+        // `int("ff", base = 16)`. `int("ff", 16)` (la forma de Python) es error y lo dice, en
+        // vez de devolver 16 en silencio.
+        self.register("int", -1, Rc::new(|i, a, l| {
+            let base = i.kwarg("base");
+            // `int(text, fallback = 10)`: la forma total con el fallback por nombre (sirve
+            // también cuando el fallback es un número que parece una base).
+            let named_fb = i.kwarg("fallback");
+            let mut owned: Vec<SynValue>;
+            let a: &[SynValue] = match named_fb {
+                Some(fb) => {
+                    if a.len() > 1 {
+                        return Err(err("int(x, fallback = f): pass the fallback once (by name or second)"));
+                    }
+                    owned = a.to_vec();
+                    owned.push(fb);
+                    if base.is_none() {
+                        return with_fallback(1, Rc::new(|i: &mut Interpreter, a: &[SynValue], l: &SourceLocation| i.b_int(a, l)))(i, &owned, l);
+                    }
+                    &owned
+                }
+                None => a,
+            };
+            if base.is_none() {
+                // Sea cual sea `x` (texto, `nothing`, un número): que el resultado no dependa del dato.
+                if let (Some(_), Some(SynValue::Number(Number::Int(b)))) = (a.first(), a.get(1)) {
+                    if (2..=36).contains(b) {
+                        return Err(err(format!(
+                            "int(x, {b}): the second argument is the fallback value, not the base — for base {b} write int(x, base = {b}); for a fallback of {b}, name it: int(x, fallback = {b})"
+                        )));
+                    }
+                }
+                return with_fallback(1, Rc::new(|i: &mut Interpreter, a: &[SynValue], l: &SourceLocation| i.b_int(a, l)))(i, a, l);
+            }
+            let radix = match &base {
+                Some(SynValue::Number(Number::Int(b))) if (2..=36).contains(b) => *b as u32,
+                other => return Err(err(format!("int(text, base = b): b must be an integer from 2 to 36, got {}", other.as_ref().map(|v| v.to_string()).unwrap_or_default()))),
+            };
+            let parse = |v: &SynValue| -> Result<SynValue, Control> {
+                let SynValue::Text(t) = v else {
+                    return Err(err(format!("int(x, base = {}): x must be text, got {}", radix, v.type_name())));
+                };
+                parse_int_radix(t, radix).map(|n| syn_number(n.normalized())).ok_or_else(|| {
+                    err(format!(
+                        "Cannot convert {:?} to an integer in base {}. To validate untrusted input without raising: int(x, nothing, base = {})",
+                        t.as_ref(), radix, radix
+                    ))
+                })
+            };
+            match (a.first(), a.get(1)) {
+                (Some(x), None) => parse(x),
+                (Some(x), Some(fallback)) => Ok(parse(x).unwrap_or_else(|_| fallback.clone())),
+                _ => Err(err("int(x, fallback?, base = b)")),
+            }
+        }));
         self.register("hex", 1, Rc::new(|i, a, l| i.b_hex(a, l)));
         self.register("is_integer", 1, Rc::new(|_i, a, _l| {
             Ok(syn_bool(matches!(nth(a, 0)?, SynValue::Number(Number::Int(_) | Number::Big(_)))))
@@ -2467,6 +2809,7 @@ impl Interpreter {
         self.register("round", 1, Rc::new(|i, a, l| i.b_round_op(a, l, "round", f64::round_ties_even)));
         self.register("trunc", 1, Rc::new(|i, a, l| i.b_round_op(a, l, "trunc", f64::trunc)));
         self.register("append", 2, Rc::new(|i, a, l| i.b_append(a, l)));
+        self.register("insert", 3, Rc::new(|i, a, l| i.b_insert(a, l)));
         self.register("keys", 1, Rc::new(|i, a, l| i.b_keys(a, l)));
         // v0.6.29 (V1-C1): mapas. `get` es la forma total del índice (lista o mapa);
         // `remove`/`merge` devuelven un mapa nuevo; `items` → [{key, value}].
@@ -2749,7 +3092,18 @@ impl Interpreter {
         self.register("summarize", 3, Rc::new(|i, a, _l| crate::tabular::summarize(i, a)));
         self.register("count_by", -1, Rc::new(|i, a, _l| crate::tabular::count_by(i, a)));
         self.register("pivot", -1, Rc::new(|i, a, _l| crate::tabular::pivot(i, a)));
-        self.register("count", 0, Rc::new(|_i, a, _l| crate::tabular::aggregator("count", a)));
+        // `count()` es el agregado de `summarize` (filas del grupo); `count(xs)` cuenta los
+        // valores PRESENTES (el `count` de pandas/SQL: `nothing` no cuenta) y
+        // `count_missing(xs)` los que faltan.
+        self.register("count", -1, Rc::new(|_i, a, _l| match a.first() {
+            None => crate::tabular::aggregator("count", a),
+            Some(SynValue::List(l)) => Ok(syn_int(l.borrow().iter().filter(|v| !matches!(v, SynValue::Nothing)).count() as i64)),
+            Some(other) => Err(err(format!("count(values) counts the present values of a list, got {}; count() alone is the summarize aggregate", other.type_name()))),
+        }));
+        self.register("count_missing", 1, Rc::new(|_i, a, _l| match nth(a, 0)? {
+            SynValue::List(l) => Ok(syn_int(l.borrow().iter().filter(|v| matches!(v, SynValue::Nothing)).count() as i64)),
+            other => Err(err(format!("count_missing(values) needs a list, got {}", other.type_name()))),
+        }));
         for kind in ["sum", "mean", "min", "max", "median", "first", "n_unique"] {
             let name = format!("{}_of", kind);
             self.register(&name, 1, Rc::new(move |_i, a, _l| crate::tabular::aggregator(kind, a)));
@@ -2770,6 +3124,12 @@ impl Interpreter {
                     m.insert("what".to_string(), syn_text(e.what.as_str()));
                     m.insert("sha256".to_string(), syn_text(e.sha256.as_str()));
                     m.insert("bytes".to_string(), syn_int(e.bytes as i64));
+                    m.insert("encoding".to_string(), syn_text(e.encoding.as_str()));
+                    // Local, nunca en el recibo: con la sal el dueño revela una consulta.
+                    if let Some((salt, qenc)) = &e.salt {
+                        m.insert("salt".to_string(), syn_text(salt.as_str()));
+                        m.insert("committed_encoding".to_string(), syn_text(*qenc));
+                    }
                     syn_map(m)
                 })
                 .collect();
@@ -2794,6 +3154,7 @@ impl Interpreter {
         self.register("in_units", 2, Rc::new(|_i, a, _l| crate::temporal::in_units(a)));
         // DATOS-12: generadores con semilla (puros).
         self.register("rng", 1, Rc::new(|_i, a, _l| crate::rng::make_rng(a)));
+        self.register("rng_spawn", 2, Rc::new(|_i, a, _l| crate::rng::b_spawn(a)));
         self.register("random_normal", 1, Rc::new(|i, a, l| crate::rng::b_normal(i, a, l)));
         self.register("shuffle", 2, Rc::new(|i, a, l| crate::rng::b_shuffle(i, a, l)));
         self.register("sample", 3, Rc::new(|i, a, l| crate::rng::b_sample(i, a, l)));
@@ -2860,7 +3221,7 @@ impl Interpreter {
             _ => {
                 let p = self.exec(pattern, env)?;
                 self.note_pattern(&p);
-                Ok(if value.syn_equals(&p) { Some(Vec::new()) } else { None })
+                Ok(if pattern_eq(value, &p)? { Some(Vec::new()) } else { None })
             }
         }
     }
@@ -2889,7 +3250,7 @@ impl Interpreter {
                 }
                 let p = self.exec(pattern, env)?;
                 self.note_pattern(&p);
-                Ok(if value.syn_equals(&p) { Some(Vec::new()) } else { None })
+                Ok(if pattern_eq(value, &p)? { Some(Vec::new()) } else { None })
             }
             // Variante de enum con payload: `is Enum.variant(p1, …)` — sub-patrones.
             NodeKind::TaskCall { name, arguments } => {
@@ -2905,13 +3266,13 @@ impl Interpreter {
                 // No es variante → patrón de valor (evaluar + comparar).
                 let p = self.exec(pattern, env)?;
                 self.note_pattern(&p);
-                Ok(if value.syn_equals(&p) { Some(Vec::new()) } else { None })
+                Ok(if pattern_eq(value, &p)? { Some(Vec::new()) } else { None })
             }
             // Literal / cualquier otra expresión → patrón de valor.
             _ => {
                 let p = self.exec(pattern, env)?;
                 self.note_pattern(&p);
-                Ok(if value.syn_equals(&p) { Some(Vec::new()) } else { None })
+                Ok(if pattern_eq(value, &p)? { Some(Vec::new()) } else { None })
             }
         }
     }
@@ -3518,11 +3879,12 @@ impl Interpreter {
                 Ok(v)
             }
             NodeKind::SetMutation { target, value } => {
-                // `set xs to append(xs, v)` / `set xs to xs + [...]` en el lugar (v0.6.29):
-                // con semántica de valor el resultado es el mismo, pero si nadie más comparte
-                // la lista no hace falta copiarla: el idioma documentado pasa a ser O(1).
-                if !self.labels {
-                    if let Some(v) = self.try_append_in_place(target, value, env)? {
+                // `set P to append(P, v)`, `P + [...]`, `insert(P, i, v)` y `merge(P, m)` en el
+                // lugar (v0.6.29), con P una variable o un camino `x.campo[k]`: con semántica de
+                // valor el resultado es el mismo, pero si nadie más comparte el contenedor no
+                // hace falta copiarlo: el idioma documentado pasa a ser O(1) por vuelta.
+                if !self.labels || self.pc_is_empty() {
+                    if let Some(v) = self.try_update_in_place(target, value, env)? {
                         return Ok(v);
                     }
                 }
@@ -4390,10 +4752,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 // DE-034: espejo de `log`/`print` — si hay log_hook (p.ej. bajo serve),
                 // emitir en vivo además de bufferizar a `output`. Bajo `run` el hook es
                 // none, así que el comportamiento no cambia.
-                if let Some(hook) = &self.log_hook {
-                    hook(&line);
-                }
-                self.output.push(line);
+                self.emit_line(line);
                 Ok(v)
             }
             NodeKind::AskExpression { prompt, options, timeout } => {
@@ -4447,7 +4806,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         } else {
                             format!("Reason about: {} (context: {})", subj, ctx_parts.join(", "))
                         };
-                        Ok(syn_text(cb("reason", &prompt)))
+                        { let out = cb("reason", &prompt); self.record_llm("reason", &prompt, &out); Ok(syn_text(out)) }
                     }
                     None => {
                         note_llm_offline();
@@ -4489,7 +4848,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     return Ok(syn_text(cb(&prompt, &opt_list)));
                 }
                 match self.llm_callback.clone() {
-                    Some(cb) => Ok(syn_text(cb("decide", &prompt))),
+                    Some(cb) => { let out = cb("decide", &prompt); self.record_llm("decide", &prompt, &out); Ok(syn_text(out)) },
                     None => {
                         note_llm_offline();
                         Ok(syn_text("[decision pending]"))
@@ -4590,7 +4949,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 match self.llm_callback.clone() {
                     Some(cb) => {
                         let prompt = format!("Analyze for {}: {}", objective, d);
-                        Ok(syn_text(cb("analyze", &prompt)))
+                        { let out = cb("analyze", &prompt); self.record_llm("analyze", &prompt, &out); Ok(syn_text(out)) }
                     }
                     None => {
                         note_llm_offline();
@@ -4630,7 +4989,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         if !param_parts.is_empty() {
                             prompt.push_str(&format!(" with {}", param_parts.join(", ")));
                         }
-                        Ok(syn_text(cb("generate", &prompt)))
+                        { let out = cb("generate", &prompt); self.record_llm("generate", &prompt, &out); Ok(syn_text(out)) }
                     }
                     None => {
                         note_llm_offline();
@@ -4647,10 +5006,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 // T5 (ronda 4): la misma boca pública que `print` — ver `stdout_flow_check`.
                 self.stdout_flow_check("log", loc)?;
                 let line = format!("[LOG] {}", self.pc_redact(m.to_string()));
-                if let Some(hook) = &self.log_hook {
-                    hook(&line);
-                }
-                self.output.push(line);
+                self.emit_line(line);
                 Ok(SynValue::Nothing)
             }
             NodeKind::MeasureBlock { body, .. } => self.exec_block(body, env),
@@ -5024,9 +5380,36 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     loc,
                 ));
             }
+            // `1.5d in [1.5]` sería `false` en silencio: se compara elemento por elemento y, como
+            // en `==`, comparar un decimal con un float es error. Sólo el par que se compara: en
+            // `"a" in ["a", 1.5, 1d]` nunca se junta un decimal con un float.
+            if let SynValue::List(items) = &right {
+                let mut found = false;
+                for x in items.borrow().iter() {
+                    let eq = crate::tabular::strict_equals(&left, x)
+                        .map_err(|_| err_at(format!("`{}`: {}", op, crate::number::MIX_DECIMAL_FLOAT), loc))?;
+                    if eq {
+                        found = true;
+                        break;
+                    }
+                }
+                return Ok(syn_bool(if op == "in" { found } else { !found }));
+            }
             let found = self.b_contains(&[right, left], loc)?.is_truthy();
             return Ok(syn_bool(if op == "in" { found } else { !found }));
         }
+        // Hueco de un template con backticks: el texto de cualquier valor, como el f-string de
+        // Python (`xs={xs}` → "xs=[1, 2]"). Un secret sigue por `+` (queda secret y redactado).
+        let op = if op == crate::ast::INTERP_CONCAT {
+            if let SynValue::Text(l) = &left {
+                if !matches!(right, SynValue::Text(_) | SynValue::Secret(_)) {
+                    return Ok(syn_text(format!("{}{}", l, right)));
+                }
+            }
+            "+"
+        } else {
+            op
+        };
         // Concatenación de texto: un operando texto coerciona al otro si es un escalar
         // (número, bool). `nothing`, listas, mapas y bytes son error (v0.6.29): pegarlos
         // en silencio daba "xnothing" o un repr que nadie quería.
@@ -5035,7 +5418,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 let other = if matches!(left, SynValue::Text(_)) { &right } else { &left };
                 if matches!(
                     other,
-                    SynValue::Nothing | SynValue::List(_) | SynValue::Map(_) | SynValue::Bytes(_)
+                    SynValue::Nothing
+                        | SynValue::List(_)
+                        | SynValue::Map(_)
+                        | SynValue::Bytes(_)
+                        | SynValue::Task(_)
+                        | SynValue::Builtin(_)
                 ) {
                     return Err(err_at(
                         format!(
@@ -5155,16 +5543,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 _ => {}
             }
         }
-        // Comparación de igualdad. El OPERADOR `==`/`!=` erroría al mezclar Decimal y
-        // float (a diferencia de match/contains, que los consideran simplemente
-        // distintos para mantener total esa comparación).
+        // Comparación de igualdad. `==`/`!=` dan error al comparar un decimal con un float,
+        // también dentro de listas y mapas (en la posición o clave que se compara: `[1d] ==
+        // [1.0]`); lo mismo `in`, `match`, `contains` e `index_of` (`strict_equals`, una sola
+        // pasada que corta en la primera diferencia). Las claves internas de hash
+        // (`group_by`, `unique`, …) siguen usando la igualdad total de `probe_key`.
         if matches!(op, "==" | "!=") {
-            if let (SynValue::Number(a), SynValue::Number(b)) = (&left, &right) {
-                if Number::mixes_decimal_float(a, b) {
-                    return Err(err_at(MIX_DECIMAL_FLOAT, loc));
-                }
-            }
-            let eq = left.syn_equals(&right);
+            let eq = crate::tabular::strict_equals(&left, &right).map_err(|_| err_at(MIX_DECIMAL_FLOAT, loc))?;
             return Ok(syn_bool(if op == "==" { eq } else { !eq }));
         }
         // Orden
@@ -5196,8 +5581,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 };
             }
         }
+        let hint = if op == "%" && matches!(left, SynValue::Text(_)) {
+            " — there is no %-formatting: use a template `…{x}…` or fmt(template, {name: value})"
+        } else {
+            ""
+        };
         Err(err_at(
-            format!("Unsupported operation: {} {} {}", left.type_name(), op, right.type_name()),
+            format!("Unsupported operation: {} {} {}{}", left.type_name(), op, right.type_name(), hint),
             loc,
         ))
     }
@@ -5235,6 +5625,15 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
                 Ok(value)
             }
+            NodeKind::PropertyAccess { .. } | NodeKind::IndexAccess { .. } if set_root_identifier(target).is_none() => {
+                // `set get(m, "a")["b"] to v`: el destino nace de un VALOR (el resultado de una
+                // llamada), no de una variable. Con semántica de valor esa escritura o se
+                // pierde (en una copia) o toca un dato compartido; ninguna es lo que se quiso.
+                Err(err_at(
+                    "Invalid set target: it must start from a variable — write the path from the variable, e.g. set m[\"a\"][\"b\"] to v (not set get(m, \"a\")[\"b\"] to v)",
+                    loc,
+                ))
+            }
             NodeKind::PropertyAccess { property_name, object, .. } => {
                 let obj = self.exec_place(object, env)?;
                 // Escritura a través de un contenedor privado o bajo PC (ver
@@ -5246,6 +5645,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 };
                 match &obj {
                     SynValue::Map(m) => {
+                        // `set m.X to v` sobre un módulo religa SU variable (la que leen sus
+                        // tasks), como `m.X = v` en Python; sus nombres son sus exportaciones y
+                        // sus tasks no se reemplazan desde afuera.
+                        if let Some(menv) = module_env_of_map(m) {
+                            return module_rebind(m, &menv, property_name, value, loc);
+                        }
                         m.borrow_mut().insert(property_name.clone(), value.clone());
                         Ok(value)
                     }
@@ -5284,6 +5689,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         Ok(value)
                     }
                     SynValue::Map(m) => {
+                        // `set lib["X"] to v`: las mismas reglas que `set lib.X to v`.
+                        if let Some(menv) = module_env_of_map(m) {
+                            return module_rebind(m, &menv, &idx.to_string(), value, loc);
+                        }
                         m.borrow_mut().insert(idx.to_string(), value.clone());
                         Ok(value)
                     }
@@ -5363,7 +5772,23 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let r = match &obj {
             SynValue::Map(m) => match m.borrow().get(property_name) {
                 Some(v) => Ok(v.clone()),
-                None => Err(err_at(format!("Map has no key '{}'", property_name), loc)),
+                // `a.nx` donde `nx` existe en el módulo pero no se exporta (un `use` interno, un
+                // `let` sin `export`): decirlo en vez de "no key".
+                None if module_env_of_map(m).is_some_and(|e| e.borrow().bindings.contains_key(property_name)) => Err(err_at(
+                    format!(
+                        "the module has no export '{}' — it is defined inside the module but not exported (write `export let`/`export task` there; an import of that module is not re-exported: `use` its file directly)",
+                        property_name
+                    ),
+                    loc,
+                )),
+                // `d.get("a")`, `d.keys()`: un reflejo de método, no una clave que falta.
+                None => Err(err_at(
+                    match crate::reflexes::method_hint(property_name) {
+                        Some(h) => format!("Map has no key '{}' — if you meant a method, Synsema has no methods: {}", property_name, h),
+                        None => format!("Map has no key '{}'", property_name),
+                    },
+                    loc,
+                )),
             },
             // Valores del servidor: acceso a su dict subyacente (body/status/…).
             SynValue::Server(s) => match s.get_field(property_name) {
@@ -5462,28 +5887,24 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         match &node.kind {
             NodeKind::Identifier { name } => {
                 // Un módulo (`use … as d`) es un ESPACIO DE NOMBRES, no un dato: `set d.STATE[k]`
-                // escribe el estado del módulo, que ven sus tasks. Ni el mapa del módulo ni sus
-                // exportaciones directas se copian.
+                // escribe el estado del módulo, que ven sus tasks. El mapa del módulo no se copia.
                 if let Some(v) = env_get(env, name) {
                     if self.is_module_map(&v) {
                         return Ok(v);
                     }
                 }
-                if let Some(v) = env_with_binding_mut(env, name, |slot| {
-                    make_unique(slot);
-                    slot.clone()
-                }) {
+                if let Some(v) = with_unique_binding(env, name, |slot| slot.clone()) {
                     return Ok(v);
                 }
                 self.exec(node, env)
             }
-            NodeKind::PropertyAccess { property_name, object, .. } if self.place_is_module(object, env) => {
-                let parent = self.exec_place(object, env)?;
-                self.property_read(parent, property_name, loc)
-            }
             NodeKind::IndexAccess { object, index } => {
                 let parent = self.exec_place(object, env)?;
                 let idx = self.exec(index, env)?;
+                // `set d["STATE"][k]`, `set h.l.STATE[k]`: la VARIABLE del módulo, como `d.STATE`.
+                if let Some(v) = module_var_unique(&parent, &labels::unwrap(&idx).to_string()) {
+                    return Ok(v);
+                }
                 match labels::unwrap(&parent) {
                     SynValue::List(l) => {
                         if let Ok(i) = num_to_i64(labels::unwrap(&idx)) {
@@ -5506,6 +5927,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             NodeKind::PropertyAccess { property_name, object, .. } => {
                 let parent = self.exec_place(object, env)?;
+                // `set d.STATE[k] to v`: se escribe la VARIABLE del módulo (la misma que ven sus
+                // tasks), copiándola antes sólo si alguien más guardó una foto (`let s be d.STATE`),
+                // venga el mapa del módulo de una variable, de un re-export o de un campo.
+                if let Some(v) = module_var_unique(&parent, property_name) {
+                    return Ok(v);
+                }
                 if let SynValue::Map(m) = labels::unwrap(&parent) {
                     if let Some(slot) = m.borrow_mut().get_mut(property_name) {
                         make_unique(slot);
@@ -5523,88 +5950,207 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// cierran sobre un `module_env` y TODAS sus claves son nombres de ese módulo.
     fn is_module_map(&self, v: &SynValue) -> bool {
         let SynValue::Map(m) = v else { return false };
-        if self.module_cache.values().any(|mv| matches!(mv, SynValue::Map(x) if Rc::ptr_eq(x, m))) {
-            return true;
-        }
-        let map = m.borrow();
-        let env = map.values().find_map(|v| match v {
-            SynValue::Task(t) if t.closure_env.borrow().name.starts_with("module:") => Some(t.closure_env.clone()),
-            _ => None,
-        });
-        match env {
-            Some(e) => {
-                let e = e.borrow();
-                map.keys().all(|k| e.bindings.contains_key(k))
-            }
-            None => false,
-        }
+        module_env_of_map(m).is_some()
     }
 
-    /// ¿El nodo es un identificador ligado a un módulo? (sin evaluar nada con efectos)
-    fn place_is_module(&self, node: &Node, env: &Rc<RefCell<Environment>>) -> bool {
-        match &node.kind {
-            NodeKind::Identifier { name } => env_get(env, name).is_some_and(|v| self.is_module_map(&v)),
-            _ => false,
-        }
-    }
 
-    /// Camino rápido de `set x to append(x, v)` y `set x to x + <lista>`: agrega en la
-    /// lista de `x` (copiándola antes sólo si otro la comparte) en vez de construir una
-    /// nueva. `None` si la sentencia no tiene esa forma y va por el camino normal.
-    fn try_append_in_place(
+    /// Camino rápido de `set P to append(P, v)`, `set P to P + <lista>`, `set P to
+    /// insert(P, i, v)` y `set P to merge(P, m, …)`, con P una variable o un camino puro
+    /// (`x.campo`, `x[k]` con `k` literal o variable): modifica el contenedor de P (copiándolo
+    /// antes sólo si otro lo comparte) en vez de construir uno nuevo. El orden es el del camino
+    /// normal: se lee P, después se evalúan los argumentos; si eso religó P, el resultado sale
+    /// de la P leída y se asigna como siempre. `None` si la sentencia no tiene esa forma.
+    fn try_update_in_place(
         &mut self,
         target: &Node,
         value: &Node,
         env: &Rc<RefCell<Environment>>,
     ) -> Result<Option<SynValue>, Control> {
-        let NodeKind::Identifier { name: tn } = &target.kind else { return Ok(None) };
-        let is_var = |n: &Node| matches!(&n.kind, NodeKind::Identifier { name } if name == tn);
-        // ¿`x` es hoy una lista?
-        let is_list = matches!(env_get(env, tn), Some(SynValue::List(_)));
-        if !is_list {
+        if !is_pure_place(target) {
             return Ok(None);
         }
-        let extra: Vec<SynValue> = match &value.kind {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Op { Append, Concat, Insert, Merge }
+        let builtin_is = |this: &Self, name: &str| {
+            let _ = this;
+            matches!(env_get(env, name), Some(SynValue::Builtin(b)) if b.name == name)
+        };
+        let (op, rest): (Op, Vec<&Node>) = match &value.kind {
             NodeKind::TaskCall { name, arguments }
-                if arguments.len() == 2
+                if !arguments.is_empty()
                     && arguments.iter().all(|a| a.name.is_none())
-                    && is_var(&arguments[0].value)
-                    && name.as_identifier() == Some("append") =>
+                    && same_place(&arguments[0].value, target) =>
             {
-                // Tiene que ser EL builtin (un task del usuario puede llamarse append).
-                match env_get(env, "append") {
-                    Some(SynValue::Builtin(b)) if b.name == "append" => {}
+                let op = match (name.as_identifier(), arguments.len()) {
+                    (Some("append"), 2) => Op::Append,
+                    (Some("insert"), 3) => Op::Insert,
+                    (Some("merge"), n) if n >= 2 => Op::Merge,
                     _ => return Ok(None),
+                };
+                // Tiene que ser EL builtin (un task del usuario puede llamarse igual).
+                if !builtin_is(self, name.as_identifier().unwrap_or("")) {
+                    return Ok(None);
                 }
-                vec![self.exec(&arguments[1].value, env)?]
+                (op, arguments[1..].iter().map(|a| &a.value).collect())
             }
-            NodeKind::BinaryOp { left, operator, right } if operator == "+" && is_var(left) => {
-                match self.exec(right, env)? {
-                    SynValue::List(r) => r.borrow().clone(),
-                    other => {
-                        // No era concatenación de listas: terminar por el camino normal con
-                        // el lado derecho ya evaluado (no se evalúa dos veces).
-                        let l = env_get(env, tn).unwrap_or(SynValue::Nothing);
-                        let v = self.exec_binary(l, "+", other, &value.location)?;
-                        return self.exec_set(target, v, env, &target.location, false).map(Some);
-                    }
-                }
+            NodeKind::BinaryOp { left, operator, right } if operator == "+" && same_place(left, target) => {
+                (Op::Concat, vec![right.as_ref()])
             }
             _ => return Ok(None),
         };
-        let out = env_with_binding_mut(env, tn, |slot| {
-            if !matches!(slot, SynValue::List(_)) {
-                return None;
+        // Leer P. Si no se puede (clave que falta) o no es del tipo, camino normal.
+        let before = match self.exec(target, env) {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let fits = match (&before, op) {
+            (SynValue::List(_), Op::Append | Op::Concat | Op::Insert) => true,
+            (SynValue::Map(_), Op::Merge) => true,
+            _ => false,
+        };
+        if !fits {
+            return Ok(None);
+        }
+        let mut args = Vec::with_capacity(rest.len());
+        for n in &rest {
+            args.push(self.exec(n, env)?);
+        }
+        // Con etiquetas encendidas (y PC vacío, lo chequeó el llamador) sólo si nada de lo
+        // que entra está etiquetado: entonces el camino normal tampoco etiqueta nada.
+        if self.labels && args.iter().any(labels::has_label_deep) {
+            let mut all = vec![before];
+            all.extend(args);
+            let v = self.call_update_builtin(op as u8, all, env, &value.location)?;
+            return self.exec_set(target, v, env, &target.location, false).map(Some);
+        }
+        if op == Op::Concat && !matches!(args[0], SynValue::List(_)) {
+            let v = self.exec_binary(before, "+", args.pop().unwrap(), &value.location)?;
+            return self.exec_set(target, v, env, &target.location, false).map(Some);
+        }
+        // ¿Sigue ahí el MISMO contenedor? Si los argumentos religaron P, el resultado es el
+        // de la P leída.
+        let same = match self.exec(target, env) {
+            Ok(now) => same_container(&now, &before),
+            Err(_) => false,
+        };
+        if !same {
+            let mut all = vec![before];
+            all.extend(args);
+            let v = self.call_update_builtin(op as u8, all, env, &value.location)?;
+            return self.exec_set(target, v, env, &target.location, false).map(Some);
+        }
+        drop(before);
+        let loc = value.location.clone();
+        let apply = move |slot: &mut SynValue| -> Result<SynValue, Control> {
+            match (slot as &SynValue, op) {
+                (SynValue::List(rc), Op::Append) => rc.borrow_mut().push(args.into_iter().next().unwrap()),
+                (SynValue::List(rc), Op::Concat) => {
+                    if let Some(SynValue::List(r)) = args.first() {
+                        let extra = r.borrow().clone();
+                        rc.borrow_mut().extend(extra);
+                    }
+                }
+                (SynValue::List(rc), Op::Insert) => {
+                    let mut it = args.into_iter();
+                    let (i, v) = (it.next().unwrap(), it.next().unwrap());
+                    let mut items = rc.borrow_mut();
+                    let j = insert_position(&i, items.len()).map_err(|e| err_at(e, &loc))?;
+                    items.insert(j, v);
+                }
+                (SynValue::Map(rc), Op::Merge) => {
+                    for (n, a) in args.iter().enumerate() {
+                        if !matches!(a, SynValue::Map(_)) {
+                            return Err(err_at(
+                                format!("merge(): argument {} is {}, not a map", n + 2, a.type_name()),
+                                &loc,
+                            ));
+                        }
+                    }
+                    let mut out = rc.borrow_mut();
+                    for a in &args {
+                        if let SynValue::Map(m) = a {
+                            for (k, v) in m.borrow().iter() {
+                                out.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                }
+                _ => return Err(err_at("the value changed type while computing the update", &loc)),
             }
-            make_unique(slot);
-            if let SynValue::List(rc) = slot {
-                rc.borrow_mut().extend(extra);
+            Ok(slot.clone())
+        };
+        self.with_unique_place(target, env, apply).map(Some)
+    }
+
+    /// El builtin del camino rápido, por el camino normal (una copia nueva, con el mismo
+    /// manejo de etiquetas que una llamada escrita).
+    fn call_update_builtin(
+        &mut self,
+        op: u8,
+        mut all: Vec<SynValue>,
+        env: &Rc<RefCell<Environment>>,
+        loc: &SourceLocation,
+    ) -> Result<SynValue, Control> {
+        let name = match op {
+            0 => "append",
+            1 => {
+                let r = all.pop().unwrap_or(SynValue::Nothing);
+                let l = all.pop().unwrap_or(SynValue::Nothing);
+                return self.exec_binary(l, "+", r, loc);
             }
-            Some(slot.clone())
-        });
-        match out.flatten() {
-            Some(v) => Ok(Some(v)),
-            None => Err(err_at(format!("'{}' stopped being a list while computing the value", tn), &value.location)),
+            2 => "insert",
+            _ => "merge",
+        };
+        let func = env_get(env, name).ok_or_else(|| err_at(format!("Undefined variable: '{}'", name), loc))?;
+        self.call_value(func, all, loc)
+    }
+
+    /// Acceso único al contenedor de un camino puro: los niveles de arriba se hacen únicos
+    /// (`exec_place`), el último también, y `f` lo modifica. Una variable de un módulo sigue
+    /// al env del módulo (`with_unique_binding`).
+    fn with_unique_place(
+        &mut self,
+        target: &Node,
+        env: &Rc<RefCell<Environment>>,
+        f: impl FnOnce(&mut SynValue) -> Result<SynValue, Control>,
+    ) -> Result<SynValue, Control> {
+        let loc = &target.location;
+        let lost = || err_at("the place changed while computing the update", loc);
+        match &target.kind {
+            NodeKind::Identifier { name } => with_unique_binding(env, name, f).unwrap_or_else(|| Err(lost())),
+            NodeKind::PropertyAccess { property_name, object, .. } => {
+                let parent = self.exec_place(object, env)?;
+                let SynValue::Map(m) = &parent else { return Err(lost()) };
+                if let Some(menv) = module_env_of_map(m) {
+                    return with_unique_binding(&menv, property_name, f).unwrap_or_else(|| Err(lost()));
+                }
+                let mut map = m.borrow_mut();
+                let slot = map.get_mut(property_name.as_str()).ok_or_else(lost)?;
+                make_unique(slot);
+                f(slot)
+            }
+            NodeKind::IndexAccess { object, index } => {
+                let parent = self.exec_place(object, env)?;
+                let idx = self.exec(index, env)?;
+                match &parent {
+                    SynValue::List(l) => {
+                        let i = num_to_i64(&idx)?;
+                        let mut items = l.borrow_mut();
+                        let n = items.len();
+                        let j = resolve_index(i, n).ok_or_else(lost)?;
+                        make_unique(&mut items[j]);
+                        f(&mut items[j])
+                    }
+                    SynValue::Map(m) => {
+                        let mut map = m.borrow_mut();
+                        let slot = map.get_mut(&idx.to_string()).ok_or_else(lost)?;
+                        make_unique(slot);
+                        f(slot)
+                    }
+                    _ => Err(lost()),
+                }
+            }
+            _ => Err(lost()),
         }
     }
 
@@ -5954,22 +6500,28 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // Defensa de fondo: con el PC ya comprobado arriba esto es la identidad, y sigue acá
         // por si algún camino futuro alcanza `b_print` sin pasar por el chequeo.
         let s = self.pc_redact(s);
+        self.emit_line(s);
+        Ok(SynValue::Nothing)
+    }
+
+    /// La salida de `print`, `log` y `show`, en el orden en que ocurre. `synsema run` (camino
+    /// normal) escribe cada línea al momento (v0.6.29): un script largo ya no parece colgado.
+    /// `test`, `serve`, `conform`, los informes JSON y los agentes (que transmiten por su
+    /// `log_hook` con prefijo) siguen juntando en `output`. Con etiquetas encendidas tampoco se
+    /// transmite: `redact_output_for_host` tiene que poder retener TODO el prefijo si la corrida
+    /// muere por un flujo privado (cuántas líneas salieron depende del dato).
+    fn emit_line(&mut self, line: String) {
         if let Some(hook) = &self.log_hook {
-            hook(&s);
-        }
-        // `synsema run` (camino normal) imprime cada línea al momento (v0.6.29): un script
-        // largo ya no parece colgado. `test`, `serve`, `conform` y los informes JSON siguen
-        // juntando la salida en `output`.
-        if LIVE_STDOUT.load(std::sync::atomic::Ordering::Relaxed) {
+            hook(&line);
+        } else if !self.labels && LIVE_STDOUT.load(std::sync::atomic::Ordering::Relaxed) {
             use std::io::Write;
             let out = std::io::stdout();
             let mut lock = out.lock();
-            let _ = writeln!(lock, "{}", s);
+            let _ = writeln!(lock, "{}", line);
             let _ = lock.flush();
-            return Ok(SynValue::Nothing);
+            return;
         }
-        self.output.push(s);
-        Ok(SynValue::Nothing)
+        self.output.push(line);
     }
 
     fn b_length(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -6001,6 +6553,20 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let v = nth(args, 0)?;
         match v {
             SynValue::Number(Number::Float(x)) => Ok(SynValue::Number(Number::integer_from_f64(op(*x)))),
+            // Un decimal, EXACTO (v0.6.29; antes volvía sin cambiar): el entero que corresponde,
+            // como `math.floor(Decimal)` de Python. `round` es mitad al par, como con float.
+            SynValue::Number(n) if n.is_decimal() => {
+                let (m, s) = n.exact_ratio().unwrap();
+                let d = crate::number::pow10_big(s);
+                use num_integer::Integer;
+                let q = match name {
+                    "floor" => m.div_floor(&d),
+                    "ceil" => -((-&m).div_floor(&d)),
+                    "trunc" => &m / &d,
+                    _ => crate::number::div_round_half_even(&m, &d),
+                };
+                Ok(SynValue::Number(Number::from_bigint(q)))
+            }
             SynValue::Number(n) => Ok(SynValue::Number(n.clone())), // Int/Big ya son enteros
             // v0.6.29: sobre un array, elemento a elemento (sigue siendo un array de floats).
             SynValue::Array(a) => Ok(crate::types::syn_array(a.mapv(op))),
@@ -6044,6 +6610,15 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 // Un texto ENTERO fuera de ±2⁵³ no entra exacto en un float: antes se
                 // redondeaba sin avisar (`"123456789012345678901"` → …683968). Ahora es
                 // un error que nombra a `int` (v0.6.29).
+                if let Some(n) = over_digit_limit(s) {
+                    return match args.get(1) {
+                        Some(d) => Ok(d.clone()),
+                        None => Err(err(format!(
+                            "number(): text with {} digits; the limit is {} (converting longer ones is quadratic)",
+                            n, MAX_INT_TEXT_DIGITS
+                        ))),
+                    };
+                }
                 if let Some(n) = parse_int_text(s) {
                     let big = n.as_bigint().unwrap();
                     let limit = num_bigint::BigInt::from(1u64 << 53);
@@ -6057,7 +6632,23 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         };
                     }
                 }
-                match s.trim().parse::<f64>() {
+                // `_` entre dígitos, como en `int` y en los literales (`1_000.5`).
+                let t = s.trim();
+                let cleaned: String;
+                let t = if t.contains('_') {
+                    let b = t.as_bytes();
+                    let ok = b.iter().enumerate().all(|(i, c)| {
+                        *c != b'_' || (i > 0 && i + 1 < b.len() && b[i - 1].is_ascii_digit() && b[i + 1].is_ascii_digit())
+                    });
+                    if !ok {
+                        return bail(v);
+                    }
+                    cleaned = t.replace('_', "");
+                    cleaned.as_str()
+                } else {
+                    t
+                };
+                match t.parse::<f64>() {
                     Ok(x) => x,
                     Err(_) => return bail(v),
                 }
@@ -6084,7 +6675,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
                 Number::integer_from_f64(*x)
             }
-            SynValue::Number(d @ Number::Decimal(_)) => match d.as_bigint() {
+            SynValue::Number(d @ (Number::Decimal(_) | Number::BigDec(_))) => match d.as_bigint() {
                 Some(b) => Number::from_bigint(b),
                 None => {
                     return Err(err(format!(
@@ -6094,6 +6685,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
             },
             SynValue::Text(s) => parse_int_text(s).ok_or_else(|| {
+                if let Some(n) = over_digit_limit(s) {
+                    return err(format!(
+                        "int(): text with {} digits; the limit is {} (converting longer ones is quadratic). To validate untrusted input without raising: int(x, nothing)",
+                        n, MAX_INT_TEXT_DIGITS
+                    ));
+                }
                 err(format!(
                     "Cannot convert {:?} to an integer: expected digits with an optional sign, or 0x…/0b…. To validate untrusted input without raising: int(x, nothing)",
                     s.as_ref()
@@ -6134,21 +6731,28 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     fn b_decimal(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
         let v = nth(args, 0)?;
         let d = match v {
-            SynValue::Number(Number::Decimal(d)) => *d,
+            SynValue::Number(n) if n.is_decimal() => n.clone(),
             SynValue::Number(Number::Float(_)) => {
                 return Err(err(
                     "decimal(float) is not exact; use a string, e.g. decimal(\"1.50\"), \
                      to avoid float imprecision",
                 ))
             }
-            SynValue::Number(n) => n
-                .to_decimal()
-                .ok_or_else(|| err("number too large for an exact decimal"))?,
-            SynValue::Text(s) => rust_decimal::Decimal::from_str_exact(s.trim())
-                .map_err(|_| err(format!("Cannot parse {} as a decimal", v)))?,
+            // Un entero de cualquier tamaño es un decimal exacto (v0.6.29).
+            SynValue::Number(n) => {
+                let (m, s) = n.exact_ratio().ok_or_else(|| err("decimal(): not an exact number"))?;
+                Number::decimal_from_parts(m, s)
+            }
+            SynValue::Text(s) => Number::parse_decimal(s).ok_or_else(|| {
+                err(format!(
+                    "Cannot parse {} as a decimal (digits with an optional sign and point, up to {} digits)",
+                    v,
+                    crate::number::MAX_DEC_TEXT_DIGITS
+                ))
+            })?,
             _ => return Err(err(format!("Cannot convert {} to a decimal", v.type_name()))),
         };
-        Ok(syn_number(Number::Decimal(d)))
+        Ok(syn_number(d))
     }
 
     /// `float(x)` → Float (lossy a propósito): convierte Decimal→Float, o parsea texto.
@@ -6174,7 +6778,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 
     /// `is_decimal(x)` → true sólo si `x` es un Decimal.
     fn b_is_decimal(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
-        Ok(syn_bool(matches!(nth(args, 0)?, SynValue::Number(Number::Decimal(_)))))
+        Ok(syn_bool(matches!(nth(args, 0)?, SynValue::Number(n) if n.is_decimal())))
     }
 
     /// `bytes(value, encoding?)` → bytes. PURO (sin capability). Conversión hacia
@@ -6497,6 +7101,20 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
     }
 
+    /// `insert(xs, i, v)` → lista nueva con `v` en la posición `i` (v0.6.29). `set xs to
+    /// insert(xs, i, v)` es en el lugar.
+    fn b_insert(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        match nth(args, 0)? {
+            SynValue::List(l) => {
+                let mut v = l.borrow().clone();
+                let j = insert_position(nth(args, 1)?, v.len()).map_err(|e| err_at(e, loc))?;
+                v.insert(j, nth(args, 2)?.clone());
+                Ok(syn_list(v))
+            }
+            other => Err(err_at(format!("insert(list, position, value): the first argument is {}, not a list", other.type_name()), loc)),
+        }
+    }
+
     /// `get(m, key)` / `get(m, key, default)` y `get(xs, i, default)`: el índice que no
     /// falla. Sin default, lo que falta es `nothing`.
     fn b_get(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -6573,7 +7191,18 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 let keys: Vec<SynValue> = m.borrow().keys().map(|k| syn_text(k.as_str())).collect();
                 Ok(syn_list(keys))
             }
-            _ => Err(err("keys() requires a map")),
+            // El resultado de `group_by` (una lista de `{key, items}` desde v0.6.29) es el
+            // caso típico: decir cómo se lee.
+            SynValue::List(l)
+                if l.borrow().first().is_some_and(|g| {
+                    matches!(g, SynValue::Map(m) if m.borrow().contains_key("key") && m.borrow().contains_key("items"))
+                }) =>
+            {
+                Err(err(
+                    "keys() requires a map — group_by returns a list of {key, items} (v0.6.29): the keys are apply(groups, (g) => g.key), the count is length(groups), or use count_by(rows, key)",
+                ))
+            }
+            other => Err(err(format!("keys() requires a map, got {}", other.type_name()))),
         }
     }
 
@@ -6612,8 +7241,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let item = nth(args, 1)?;
         match collection {
             SynValue::List(l) => {
+                // Como `in`: un decimal contra un float es el error de `==`, no un "distinto".
                 for e in l.borrow().iter() {
-                    if e.syn_equals(item) {
+                    if crate::tabular::strict_equals(e, item).map_err(|_| err(format!("contains: {}", MIX_DECIMAL_FLOAT)))? {
                         return Ok(syn_bool(true));
                     }
                 }
@@ -6659,8 +7289,24 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let lst = nth(args, 0)?;
         let sep = raw_str(nth(args, 1)?);
         match lst {
+            // Las mismas reglas que `+` con texto: texto, números y bools se pegan; `nothing`,
+            // listas, mapas y bytes son error (pegarlos daba "a,nothing").
             SynValue::List(l) => {
-                let parts: Vec<String> = l.borrow().iter().map(|v| v.to_string()).collect();
+                let items = l.borrow();
+                let mut parts: Vec<String> = Vec::with_capacity(items.len());
+                for (i, v) in items.iter().enumerate() {
+                    if matches!(
+                        v,
+                        SynValue::Nothing | SynValue::List(_) | SynValue::Map(_) | SynValue::Bytes(_) | SynValue::Task(_) | SynValue::Builtin(_)
+                    ) {
+                        return Err(err(format!(
+                            "join: item {} is {} — convert it on purpose (text(x)), or drop the missing ones first: where(xs, (x) => x != nothing)",
+                            i + 1,
+                            v.type_name()
+                        )));
+                    }
+                    parts.push(v.to_string());
+                }
                 Ok(syn_text(parts.join(&sep)))
             }
             _ => Err(err("First argument to join must be a list")),
@@ -6920,13 +7566,54 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 continue;
             }
             if c == '{' {
-                let mut j = i + 1;
-                while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                // Lo que está entre llaves, si es EXACTAMENTE una clave del mapa, se sustituye
+                // siempre, tenga la forma que tenga (`{0}`, `{a-b}`, `{ x }` si la clave es " x ").
+                if let Some(close) = chars[i + 1..].iter().position(|&ch| ch == '}' || ch == '{') {
+                    let close = i + 1 + close;
+                    if chars[close] == '}' {
+                        let inner: String = chars[i + 1..close].iter().collect();
+                        if let Some(v) = values.as_ref().and_then(|m| m.get(&inner)) {
+                            out.push_str(&v.to_string());
+                            i = close + 1;
+                            continue;
+                        }
+                    }
+                }
+                // `{name}` y `{a.b}`: la clave EXACTA `"a.b"` si está; si no, el campo `b` del mapa
+                // `a`. Con espacios (`{ x }`, CSS/JS) queda literal, como siempre.
+                let start = i + 1;
+                let mut j = start;
+                while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_' || chars[j] == '.') {
                     j += 1;
                 }
-                if j > i + 1 && chars.get(j) == Some(&'}') {
-                    let name: String = chars[i + 1..j].iter().collect();
-                    match values.as_ref().and_then(|m| m.get(&name)) {
+                let end = j;
+                // Un hueco es `nombre(.nombre)*` con nombres que empiezan con letra o `_`: `{3}`,
+                // `{3,5}` (cuantificadores de regex), `{a..b}` y `{a.}` quedan literales.
+                let is_hole = end > start
+                    && chars[start..end].split(|c| *c == '.').all(|seg| {
+                        seg.first().is_some_and(|c| c.is_alphabetic() || *c == '_')
+                    });
+                if is_hole && chars.get(j) == Some(&'}') {
+                    let name: String = chars[start..end].iter().collect();
+                    let mut cur = values.as_ref().and_then(|m| m.get(&name)).cloned();
+                    if cur.is_none() && name.contains('.') {
+                        let mut parts = name.split('.');
+                        let first = parts.next().unwrap_or("");
+                        // `{obj.prop}` sin `obj` en el mapa: texto de otro lenguaje, queda literal.
+                        if values.as_ref().is_none_or(|m| !m.contains_key(first)) {
+                            out.push_str(&chars[i..=j].iter().collect::<String>());
+                            i = j + 1;
+                            continue;
+                        }
+                        cur = values.as_ref().and_then(|m| m.get(first)).cloned();
+                        for p in parts {
+                            cur = match cur {
+                                Some(SynValue::Map(m)) => m.borrow().get(p).cloned(),
+                                _ => None,
+                            };
+                        }
+                    }
+                    match cur {
                         Some(v) => out.push_str(&v.to_string()),
                         None => {
                             return Err(err(format!(
@@ -7452,7 +8139,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
         let keys: Vec<SynValue> = keyed.iter().map(|(k, _)| k.clone()).collect();
         check_orderable(&keys, "sort_by")?;
-        keyed.sort_by(|(ka, _), (kb, _)| order_for(ka, kb, desc));
+        sort_checked(&mut keyed, |(k, _)| k, desc, "sort_by")?;
         Ok(syn_list(keyed.into_iter().map(|(_, v)| v).collect()))
     }
 
@@ -7461,7 +8148,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let mut items = self.list_arg(nth(args, 0)?, "sort")?;
         let desc = desc_flag(args.get(1), "sort")?;
         check_orderable(&items, "sort")?;
-        items.sort_by(|a, b| order_for(a, b, desc));
+        sort_checked(&mut items, |v| v, desc, "sort")?;
         Ok(syn_list(items))
     }
 
@@ -7550,10 +8237,16 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_unique(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+        // En orden de primera aparición; lo que `==` iguala es un solo valor (`1` y `1.0`, un
+        // mapa con otro orden de claves, el mismo instante en otra zona). Los NaN cuentan como
+        // uno, como `numpy.unique` y pandas. Lineal: clave canónica en un hash.
         let items = self.list_arg(nth(args, 0)?, "unique")?;
         let mut out: Vec<SynValue> = Vec::with_capacity(items.len());
+        let mut seen: HashSet<String> = HashSet::with_capacity(items.len());
+        let mut mix = crate::tabular::NumMix::default();
         for item in items {
-            if !out.iter().any(|e| e.syn_equals(&item)) {
+            mix.check(&item, "unique")?;
+            if seen.insert(crate::tabular::probe_key(&item)) {
                 out.push(item);
             }
         }
@@ -7590,7 +8283,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
         } else {
             for (i, item) in items.iter().enumerate() {
-                if item.syn_equals(&needle) {
+                if crate::tabular::strict_equals(item, &needle).map_err(|_| err(format!("index_of: {}", MIX_DECIMAL_FLOAT)))? {
                     return Ok(syn_int(i as i64));
                 }
             }
@@ -8018,12 +8711,19 @@ fn raw_str(v: &SynValue) -> String {
 /// copia recién cuando alguien escribe en él). Un valor privado se copia por dentro y
 /// conserva su etiqueta.
 fn make_unique(slot: &mut SynValue) {
+    make_unique_n(slot, 0)
+}
+
+/// `make_unique` tolerando `extra` dueños conocidos del nivel de arriba (la vista del mapa de
+/// un módulo sobre su propia variable).
+fn make_unique_n(slot: &mut SynValue, extra: usize) {
+    let owners = 1 + extra;
     match slot {
-        SynValue::List(rc) if Rc::strong_count(rc) > 1 => {
+        SynValue::List(rc) if Rc::strong_count(rc) > owners => {
             let copy = rc.borrow().clone();
             *slot = SynValue::List(Rc::new(RefCell::new(copy)));
         }
-        SynValue::Map(rc) if Rc::strong_count(rc) > 1 => {
+        SynValue::Map(rc) if Rc::strong_count(rc) > owners && module_env_of_map(rc).is_none() => {
             let copy = rc.borrow().clone();
             *slot = SynValue::Map(Rc::new(RefCell::new(copy)));
         }
@@ -8033,7 +8733,7 @@ fn make_unique(slot: &mut SynValue) {
                 SynValue::Map(rc) => Rc::strong_count(rc) > 1,
                 _ => false,
             };
-            if shared_inner || (Rc::strong_count(p) > 1 && matches!(p.value, SynValue::List(_) | SynValue::Map(_))) {
+            if shared_inner || (Rc::strong_count(p) > owners && matches!(p.value, SynValue::List(_) | SynValue::Map(_))) {
                 // Copia del contenedor interno aunque su cuenta sea 1 cuando el envoltorio
                 // está compartido: el alias ve el mismo Rc interno.
                 let inner = match &p.value {
@@ -8048,28 +8748,6 @@ fn make_unique(slot: &mut SynValue) {
     }
 }
 
-/// Acceso MUTABLE al binding de `name` (el scope más cercano que lo tiene).
-fn env_with_binding_mut<R>(
-    env: &Rc<RefCell<Environment>>,
-    name: &str,
-    f: impl FnOnce(&mut SynValue) -> R,
-) -> Option<R> {
-    let mut cur = env.clone();
-    loop {
-        let next = {
-            let mut e = cur.borrow_mut();
-            if let Some(slot) = e.bindings.get_mut(name) {
-                return Some(f(slot));
-            }
-            e.parent.clone()
-        };
-        match next {
-            Some(p) => cur = p,
-            None => return None,
-        }
-    }
-}
-
 /// Una entrada del linaje: de dónde vino, qué fue (ruta, host, hash de la consulta) y el
 /// sha256 de los bytes que recibió el programa (para un archivo de texto, el del archivo).
 #[derive(Clone, Debug)]
@@ -8078,14 +8756,110 @@ pub struct LineageEntry {
     pub what: String,
     pub sha256: String,
     pub bytes: usize,
+    /// Cómo se obtuvieron los bytes hasheados: "text" (utf-8), "bytes", "jcs"
+    /// (`canonical_json(x)`) o "json" (`json_encode(x)`, cuando hay enteros > 2^53).
+    pub encoding: String,
+    /// La sal (hex) del compromiso de una consulta o un prompt y cómo se codificó lo que se
+    /// comprometió ("jcs": `canonical_json([args…])`, "json", "text"). Sólo en `lineage()`: el
+    /// recibo publica el compromiso, nunca la sal.
+    pub salt: Option<(String, &'static str)>,
 }
 
-/// Builtins que TRAEN datos de afuera (archivos, red, bases, stdin).
+/// Builtins que TRAEN datos de afuera (archivos, red, bases, nodos de una cadena, sockets,
+/// procesos, la terminal, stdin). Lo que sólo escribe o manda (`write_file`, `ws_send`,
+/// `evm_send`) no es una entrada.
 pub const LINEAGE_SOURCES: &[&str] = &[
-    "read_file", "read_file_bytes", "read_line", "http", "http_get", "http_post", "http_put",
-    "http_delete", "http_bytes", "fetch", "sql", "mongo_find", "mongo_find_one", "mongo_aggregate",
-    "redis_get", "redis_hgetall", "redis_lrange", "redis_smembers",
+    // archivos y stdin
+    "read_file", "read_file_bytes", "read_line", "list_dir", "file_info", "grep", "parquet_read",
+    "term_recv", "watch_recv",
+    // HTTP
+    "http", "http_get", "http_post", "http_put", "http_delete", "http_bytes", "fetch",
+    // bases
+    "sql", "sql_batch", "sql_tables", "paged", "mongo_find", "mongo_find_one", "mongo_aggregate",
+    "mongo_count", "mongo_collections", "redis_get", "redis_mget", "redis_hget", "redis_hgetall",
+    "redis_lrange", "redis_smembers", "redis_sismember", "redis_keys", "redis_exists", "redis_llen",
+    "redis_lpop", "redis_rpop", "redis_ttl", "redis_type", "redis_incr", "redis_incrby", "redis_decr",
+    "redis_hincrby", "recall",
+    // cadenas
+    "evm_rpc", "evm_call", "evm_balance", "evm_nonce", "evm_chain_id", "evm_gas_price",
+    "evm_estimate_gas", "evm_fee_history", "evm_block_number", "evm_logs", "evm_receipt", "evm_wait",
+    "solana_rpc", "solana_balance", "solana_latest_blockhash", "solana_wait", "solana_confirm",
+    "algorand_account", "algorand_params", "algorand_wait", "btc_rpc", "btc_balance", "btc_utxos",
+    "btc_fee_estimates", "btc_wait",
+    // sockets y procesos (lo que devuelve un comando externo también es una entrada)
+    "ws_recv", "ws_select", "ws_select_all", "proc_recv", "proc_select", "proc_wait", "run", "run_program",
 ];
+
+/// Compromiso con sal de `data` (como los "disclosures" de SD-JWT): `(sal, sha256(sal ‖ data))`
+/// en hex, con 128 bits de sal nueva por llamada. Sin la sal nadie revierte el compromiso
+/// probando valores; con la sal y `data`, cualquiera lo verifica.
+pub fn salted_commitment(data: &[u8]) -> (String, String) {
+    use sha2::{Digest, Sha256};
+    let salt = fresh_salt();
+    let commit = Sha256::new().chain_update(salt).chain_update(data).finalize();
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
+    (hex(&salt), hex(&commit))
+}
+
+/// 16 bytes impredecibles: sha256(secreto del proceso ‖ contador). El secreto sale de la
+/// entropía del sistema (claves de `RandomState`, sembradas por el SO), el reloj y el pid.
+fn fresh_salt() -> [u8; 16] {
+    use sha2::{Digest, Sha256};
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static KEY: std::sync::OnceLock<[u8; 64]> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        // Entropía del sistema vía las claves de `RandomState` (SipHash sembrado por el SO),
+        // más el reloj y el pid; se condensa con sha256.
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = Sha256::new();
+        for i in 0..8u64 {
+            let mut s = std::collections::hash_map::RandomState::new().build_hasher();
+            s.write_u64(i);
+            h.update(s.finish().to_le_bytes());
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        h.update(now.to_le_bytes());
+        h.update(std::process::id().to_le_bytes());
+        let a = h.finalize();
+        let mut k = [0u8; 64];
+        k[..32].copy_from_slice(&a);
+        k[32..].copy_from_slice(&Sha256::digest(a));
+        k
+    });
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let h = Sha256::new().chain_update(key).chain_update(n.to_le_bytes()).finalize();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&h[..16]);
+    out
+}
+
+/// El host de la URL de una CONEXIÓN, sin credenciales (`user:pass@`), ruta, query ni
+/// fragmento: un recibo firmado se publica y la clave de un RPC suele viajar ahí. Sólo cuenta un
+/// argumento que ES la conexión (`url_of_connection`) y cuyo esquema es de red (`http`, `https`,
+/// `ws`, `wss`): la clave de redis `"session://TOKEN"`, una categoría de `recall` o un `://` en
+/// medio de una consulta son datos, no hosts, y nunca salen en claro.
+fn url_host(url: Option<&SynValue>) -> String {
+    let Some(SynValue::Text(t)) = url else { return String::new() };
+    let t = t.trim();
+    let Some((scheme, rest)) = t.split_once("://") else { return String::new() };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https" | "ws" | "wss") || t.chars().any(char::is_whitespace) {
+        return String::new();
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    authority.rsplit('@').next().unwrap_or("").to_string()
+}
+
+/// El argumento que es la conexión de una fuente del linaje: la URL de `http_*`/`fetch` (la
+/// segunda en `http(method, url, …)`) y la del nodo en los lectores de cadena (el primero).
+/// Las bases, la memoria, los sockets y los procesos no tienen uno: sus argumentos son datos.
+fn url_of_connection<'a>(source: &str, args: &'a [SynValue]) -> Option<&'a SynValue> {
+    match source {
+        "http" => args.get(1),
+        s if s.starts_with("http") || s == "fetch" => args.first(),
+        s if ["evm_", "solana_", "algorand_", "btc_"].iter().any(|p| s.starts_with(p)) => args.first(),
+        _ => None,
+    }
+}
 
 /// Tope de entradas del linaje por corrida (un bucle que lee un millón de archivos no crece
 /// sin límite; el recibo lo dice con `inputs_truncated`).
@@ -8149,6 +8923,9 @@ fn check_call_arity(
             }
             Ok(())
         }
+        // El constructor de un tipo o de una variante (`Point(…)`, `Order.paid(…)`) cuenta
+        // sus campos él mismo, con un mensaje que nombra el tipo.
+        SynValue::Builtin(b) if b.name.starts_with(|c: char| c.is_ascii_uppercase()) => Ok(()),
         SynValue::Builtin(b) => {
             let (min, max) = builtin_arity(b);
             let n = match &b.param_names {
@@ -8168,13 +8945,21 @@ fn check_call_arity(
             };
             if let Some(max) = max {
                 if n > max {
+                    // Reflejos de Python con otra aridad: `round(x, 2)` es `round_to(x, 2)`.
+                    let hint = match b.name.as_str() {
+                        "round" => " — to round to n decimals: round_to(x, n)",
+                        "sort" => " — sort(xs, desc = true) for descending; sort_by(xs, key) for a key",
+                        "split" => " — split(text, sep) has no limit argument",
+                        _ => "",
+                    };
                     return Err(err_at(
                         format!(
-                            "{}() takes at most {} argument{}, got {}",
+                            "{}() takes at most {} argument{}, got {}{}",
                             b.name,
                             max,
                             if max == 1 { "" } else { "s" },
-                            n
+                            n,
+                            hint
                         ),
                         loc,
                     ));
@@ -8193,8 +8978,8 @@ fn check_call_arity(
 /// `(mínimo, máximo)` de argumentos de un builtin: la tabla `BUILTIN_ARITY` manda; si
 /// no está, un `param_count` fijo es exacto y -1 no se valida acá (el builtin lo hace).
 fn builtin_arity(b: &BuiltinTask) -> (usize, Option<usize>) {
-    if let Some((_, min, max)) = crate::builtin_arity::BUILTIN_ARITY.iter().find(|(n, _, _)| *n == b.name) {
-        return (*min, *max);
+    if let Some((min, max)) = crate::builtin_arity::arity_of(&b.name) {
+        return (min, max);
     }
     if b.param_count >= 0 {
         (b.param_count as usize, Some(b.param_count as usize))
@@ -8205,17 +8990,67 @@ fn builtin_arity(b: &BuiltinTask) -> (usize, Option<usize>) {
 
 /// Texto → entero exacto: decimal con signo opcional (`_` sólo entre dígitos) o
 /// `0x…`/`0b…` sin signo. Espacios alrededor se recortan. `None` si no es eso.
+/// Dígitos decimales máximos que `int(text)`/`number(text)` convierten: el tope de Python
+/// (`sys.int_info.default_max_str_digits`). Convertir texto decimal a entero es cuadrático;
+/// sin tope, un dato hostil de un megabyte compra minutos de CPU. `0x…`/`0b…` son lineales.
+pub const MAX_INT_TEXT_DIGITS: usize = 4300;
+
+/// ¿Es texto decimal (signo, `_`) con más dígitos que el tope? Devuelve cuántos.
+fn over_digit_limit(s: &str) -> Option<usize> {
+    let t = s.trim();
+    let t = t.strip_prefix('-').or_else(|| t.strip_prefix('+')).unwrap_or(t);
+    let n = t.bytes().filter(|c| c.is_ascii_digit()).count();
+    (n > MAX_INT_TEXT_DIGITS && t.bytes().all(|c| c.is_ascii_digit() || c == b'_')).then_some(n)
+}
+
+/// `int(text, base = b)`: signo, `_` entre dígitos y, en base 16/8/2, el prefijo `0x`/`0o`/`0b`
+/// opcional (como el `int(s, b)` de Python). Bases que no son potencia de 2 con el tope de
+/// dígitos (conversión cuadrática).
+fn parse_int_radix(s: &str, radix: u32) -> Option<Number> {
+    let t = s.trim();
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let prefix = match radix {
+        16 => Some(["0x", "0X"]),
+        8 => Some(["0o", "0O"]),
+        2 => Some(["0b", "0B"]),
+        _ => None,
+    };
+    let body = prefix
+        .and_then(|ps| ps.iter().find_map(|p| body.strip_prefix(p)))
+        .unwrap_or(body);
+    if body.is_empty() || body.starts_with('_') || body.ends_with('_') || body.contains("__") {
+        return None;
+    }
+    let d: String = body.chars().filter(|c| *c != '_').collect();
+    if !d.chars().all(|c| c.is_digit(radix)) || (!radix.is_power_of_two() && d.len() > MAX_INT_TEXT_DIGITS) {
+        return None;
+    }
+    let b = num_bigint::BigInt::parse_bytes(d.as_bytes(), radix)?;
+    Some(Number::from_bigint(if neg { -b } else { b }))
+}
+
 fn parse_int_text(s: &str) -> Option<Number> {
     let t = s.trim();
+    // Un signo delante de `0x…`/`0b…` también (`-0x10` es -16).
+    if let Some((neg, rest)) = t.strip_prefix('-').map(|r| (true, r)).or_else(|| t.strip_prefix('+').map(|r| (false, r))) {
+        if ["0x", "0X", "0o", "0O", "0b", "0B"].iter().any(|p| rest.starts_with(p)) {
+            let n = parse_int_text(rest)?;
+            return Some(if neg { n.neg() } else { n });
+        }
+    }
     let clean = |d: &str| -> Option<String> {
         if d.is_empty() || d.starts_with('_') || d.ends_with('_') || d.contains("__") {
             return None;
         }
         Some(d.chars().filter(|c| *c != '_').collect())
     };
-    for (prefix, radix) in [("0x", 16), ("0X", 16), ("0b", 2), ("0B", 2)] {
+    for (prefix, radix) in [("0x", 16), ("0X", 16), ("0o", 8), ("0O", 8), ("0b", 2), ("0B", 2)] {
         if let Some(rest) = t.strip_prefix(prefix) {
-            let d = clean(rest)?;
+            // Como el literal (y Python): un `_` justo después del prefijo vale (`0x_ff`).
+            let d = clean(rest.strip_prefix('_').unwrap_or(rest))?;
             if !d.chars().all(|c| c.is_digit(radix)) {
                 return None;
             }
@@ -8227,7 +9062,7 @@ fn parse_int_text(s: &str) -> Option<Number> {
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
     let d = clean(body)?;
-    if !d.chars().all(|c| c.is_ascii_digit()) {
+    if !d.chars().all(|c| c.is_ascii_digit()) || d.len() > MAX_INT_TEXT_DIGITS {
         return None;
     }
     let b: num_bigint::BigInt = d.parse().ok()?;
@@ -8239,7 +9074,7 @@ fn num_to_i64(v: &SynValue) -> Result<i64, Control> {
         SynValue::Number(n) => {
             let integral = match n {
                 Number::Float(x) => x.fract() == 0.0,
-                Number::Decimal(d) => d.fract().is_zero(),
+                Number::Decimal(_) | Number::BigDec(_) => n.as_bigint().is_some(),
                 _ => true,
             };
             if !integral {
@@ -8365,7 +9200,57 @@ fn order_for(a: &SynValue, b: &SynValue, desc: bool) -> Ordering {
 
 /// Error claro si los valores no se pueden ordenar juntos (texto con números, mapas…),
 /// en vez de dejar la lista como vino (lo que hacía `sort_by` hasta v0.6.28).
+/// La igualdad de un patrón de valor de `match`: la de `==` (`strict_equals`). Un decimal contra
+/// un float es error, no un "no matchea" que cae en `otherwise` en silencio.
+fn pattern_eq(value: &SynValue, p: &SynValue) -> Result<bool, Control> {
+    // `match 1.5d` contra `is 1.5` no cae en silencio en `otherwise`: es el error de `==`.
+    crate::tabular::strict_equals(value, p).map_err(|_| err(format!("match: {}", MIX_DECIMAL_FLOAT)))
+}
+
+/// ¿Comparar `a` con `b` para ordenar junta un decimal con un float? Como `<`: en listas, sólo
+/// las posiciones que la comparación lexicográfica llega a mirar (hasta la primera distinta).
+/// `sort([[1d, 1.5], [2d, 2.5]])` nunca compara un decimal con un float; `[[1.5d], [1.0]]` sí.
+fn order_clash(a: &SynValue, b: &SynValue) -> bool {
+    match (labels::unwrap(a), labels::unwrap(b)) {
+        (SynValue::List(x), SynValue::List(y)) => {
+            let (x, y) = (x.borrow(), y.borrow());
+            for (p, q) in x.iter().zip(y.iter()) {
+                if order_clash(p, q) {
+                    return true;
+                }
+                if order_for(p, q, false) != Ordering::Equal {
+                    return false;
+                }
+            }
+            false
+        }
+        (a, b) => {
+            let is_dec = |v: &SynValue| matches!(v, SynValue::Number(n) if n.is_decimal());
+            let is_flt = |v: &SynValue| matches!(v, SynValue::Number(Number::Float(x)) if !x.is_nan());
+            (is_dec(a) && is_flt(b)) || (is_flt(a) && is_dec(b))
+        }
+    }
+}
+
+/// Ordena con `order_for`, cortando con el error de `<` si una comparación real junta un decimal
+/// con un float.
+fn sort_checked<T>(items: &mut [T], key: impl Fn(&T) -> &SynValue, desc: bool, who: &str) -> Result<(), Control> {
+    let clash = std::cell::Cell::new(false);
+    items.sort_by(|a, b| {
+        let (a, b) = (key(a), key(b));
+        if !clash.get() && order_clash(a, b) {
+            clash.set(true);
+        }
+        order_for(a, b, desc)
+    });
+    if clash.get() {
+        return Err(err(format!("{}: {}", who, MIX_DECIMAL_FLOAT)));
+    }
+    Ok(())
+}
+
 fn check_orderable(vals: &[SynValue], who: &str) -> Result<(), Control> {
+    // Decimal con Float lo decide el comparador (`sort_checked`), sólo en comparaciones reales.
     let mut class: Option<&'static str> = None;
     for v in vals {
         if missing_rank(v) != 0 {
@@ -8374,12 +9259,6 @@ fn check_orderable(vals: &[SynValue], who: &str) -> Result<(), Control> {
         let c = order_class(v).ok_or_else(|| {
             err(format!("{}: a {} has no order — sort by a key that is a number, text, bool, bytes or list", who, labels::unwrap(v).type_name()))
         })?;
-        if let (SynValue::Number(Number::Decimal(_)), Some("number")) = (labels::unwrap(v), class) {
-            // Decimal con Float se rechaza igual que en `<`.
-            if vals.iter().any(|w| matches!(labels::unwrap(w), SynValue::Number(Number::Float(x)) if !x.is_nan())) {
-                return Err(err(format!("{}: {}", who, MIX_DECIMAL_FLOAT)));
-            }
-        }
         match class {
             None => class = Some(c),
             Some(k) if k != c => {
@@ -8592,11 +9471,41 @@ pub fn run_source(source: &str, filename: &str) -> RunResult {
         .spawn(move || run_inner(&src, &fname))
         .expect("no se pudo crear el hilo del intérprete")
         .join()
-        .unwrap_or_else(|_| RunResult {
+        .unwrap_or_else(|p| RunResult {
             success: false,
             output: Vec::new(),
-            errors: vec!["el intérprete abortó (probable desborde de stack nativo)".to_string()],
+            errors: vec![format!(
+                "internal error in the interpreter (a bug, not your program — please report it): {}",
+                p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default()
+            )],
         })
+}
+
+#[cfg(test)]
+mod lineage_host_tests {
+    use super::{url_host, url_of_connection};
+    use crate::types::{syn_list, syn_text};
+
+    fn host(source: &str, args: &[crate::types::SynValue]) -> String {
+        url_host(url_of_connection(source, args))
+    }
+
+    // Un recibo firmado publica el host de la CONEXIÓN y nada más: una clave de redis, una
+    // categoría de `recall` o un filtro con forma de URL son datos (antes, `recall("session://TOKEN")`
+    // publicaba `TOKEN` como host).
+    #[test]
+    fn only_the_connection_gives_a_host() {
+        assert_eq!(host("recall", &[syn_text("session://TOKEN-SECRETO")]), "");
+        assert_eq!(host("redis_get", &[syn_text("session://TOKEN-SECRETO")]), "");
+        assert_eq!(host("mongo_find", &[syn_text("db://x"), syn_text("https://a.b/c")]), "");
+        assert_eq!(host("sql", &[syn_text("SELECT 'http://x.com'"), syn_list(vec![])]), "");
+        assert_eq!(host("http_get", &[syn_text("http://alice:pw@api.x.com:8080/v1?k=K#f")]), "api.x.com:8080");
+        assert_eq!(host("http", &[syn_text("GET"), syn_text("HTTPS://api.x.com/v1")]), "api.x.com");
+        assert_eq!(host("evm_rpc", &[syn_text("https://rpc.x.org/KEY"), syn_text("eth_chainId")]), "rpc.x.org");
+        // Un esquema que no es de red no es un host, aunque venga en el lugar de la conexión.
+        assert_eq!(host("evm_rpc", &[syn_text("session://TOKEN")]), "");
+        assert_eq!(host("http_get", &[syn_text(" http://x.com")]), "x.com");
+    }
 }
 
 #[cfg(test)]
@@ -9682,14 +10591,21 @@ mod decimal_tests {
     }
 
     #[test]
-    fn match_and_contains_decimal_vs_float_unequal_no_error() {
-        // match: un Decimal contra un patrón Float NO matchea (y NO erroría).
-        let m = "let d be 1.5d\nmatch d\n    is 1.5\n        print(\"float\")\n    is 1.5d\n        print(\"decimal\")\n    otherwise\n        print(\"otro\")\n";
-        assert_eq!(line(m), "decimal");
-        // contains: Decimal vs Float → false (sin error); Decimal vs Decimal → true.
-        assert_eq!(line("print(text(contains([1.5d], 1.5)))"), "false");
+    fn match_and_contains_decimal_vs_float_are_the_error_of_eq() {
+        // match / contains / index_of usan la igualdad de `==`: un decimal contra un float es
+        // error (antes: "distinto" en silencio, y `1.5d == 1.5` ya era error).
+        let m = "let d be 1.5d\nmatch d\n    is 1.5\n        print(\"float\")\n    otherwise\n        print(\"otro\")\n";
+        fails_with(m, "cannot mix decimal and float");
+        fails_with("print(contains([1.5d], 1.5))", "cannot mix decimal and float");
+        fails_with("print(index_of([1d, 2.0], 1.0))", "cannot mix decimal and float");
+        // Sin mezclar, igual que antes; y con enteros no hay mezcla.
+        let ok = "let d be 1.5d\nmatch d\n    is 1.5d\n        print(\"decimal\")\n    otherwise\n        print(\"otro\")\n";
+        assert_eq!(line(ok), "decimal");
         assert_eq!(line("print(text(contains([1.5d], 1.5d)))"), "true");
-        assert_eq!(line("print(text(contains([1.5], 1.5d)))"), "false");
+        assert_eq!(line("print(text(contains([1d, 2d], 2)))"), "true");
+        // Corta en la primera diferencia: la posición 0 ya decide.
+        assert_eq!(line("print(text([\"a\", 1d] == [\"b\", 1.0]))"), "false");
+        assert_eq!(line("print(text({\"a\": 1d, \"b\": 1} == {\"a\": 1.0, \"c\": 1}))"), "false");
     }
 }
 

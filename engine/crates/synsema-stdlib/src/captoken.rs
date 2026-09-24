@@ -76,6 +76,7 @@ const MAX_DEPTH: usize = 32;
 /// principal. El emisor lo sube explícitamente si lo necesita.
 const DEFAULT_TTL: i64 = 900;
 
+#[cfg(test)]
 fn unix_now() -> i64 {
     synsema_core::clock::now_secs()
 }

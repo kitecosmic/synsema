@@ -61,7 +61,8 @@ pub fn register_json_builtins(interp: &Interpreter) {
         -1,
         synsema_core::interpreter::with_fallback(
             1,
-            Rc::new(|_i, args, _loc| {
+            Rc::new(|i, args, _loc| {
+                let allow_nan = allow_nan_kw(i, "jsonl_decode")?;
                 let text = match args.first() {
                     Some(SynValue::Text(t)) => t.to_string(),
                     Some(other) => return Err(err(format!("jsonl_decode: expected text, got {}", other.type_name()))),
@@ -73,8 +74,8 @@ pub fn register_json_builtins(interp: &Interpreter) {
                     if l.is_empty() {
                         continue;
                     }
-                    match serde_json::from_str::<serde_json::Value>(l) {
-                        Ok(j) => out.push(json_to_syn(&j)),
+                    match crate::json_exact::parse_opts(l, allow_nan) {
+                        Ok(v) => out.push(v),
                         Err(e) => {
                             return Err(err(format!(
                                 "jsonl_decode: line {}: invalid JSON: {}. To validate untrusted input without raising: jsonl_decode(text, nothing)",
@@ -97,7 +98,7 @@ pub fn register_json_builtins(interp: &Interpreter) {
         "json_for_script",
         1,
         Rc::new(|_i, args, _loc| {
-            let v = args.first().ok_or_else(|| err("json_for_script: missing argument"))?;
+            let v = args.first().ok_or_else(|| err("missing argument"))?;
             let json = dumps(&syn_to_json(v))
                 .replace('<', "\\u003c")
                 .replace('>', "\\u003e")
@@ -118,7 +119,8 @@ pub fn register_json_builtins(interp: &Interpreter) {
     interp.register_builtin(
         "json_decode",
         -1,
-        Rc::new(|_i, args, _loc| {
+        Rc::new(|i, args, _loc| {
+            let allow_nan = allow_nan_kw(i, "json_decode")?;
             if args.is_empty() || args.len() > 2 {
                 return Err(err("json_decode(text, default?) takes 1 or 2 arguments"));
             }
@@ -127,8 +129,8 @@ pub fn register_json_builtins(interp: &Interpreter) {
                 Some(other) => other.to_string(),
                 None => return Err(err("json_decode: missing argument")),
             };
-            match serde_json::from_str::<serde_json::Value>(&s) {
-                Ok(j) => Ok(json_to_syn(&j)),
+            match crate::json_exact::parse_opts(&s, allow_nan) {
+                Ok(v) => Ok(v),
                 Err(e) => match args.get(1) {
                     Some(d) => Ok(d.clone()),
                     None => Err(err(format!(
@@ -265,7 +267,7 @@ pub fn syn_to_json(v: &SynValue) -> Json {
         SynValue::Number(Number::Big(b)) => Json::BigInt(b.to_string()),
         // Decimal: número JSON exacto (string verbatim, preserva escala: 1.50d → 1.50).
         // Evita el drift de convertir a float; reusa el camino "número crudo".
-        SynValue::Number(Number::Decimal(d)) => Json::BigInt(d.to_string()),
+        SynValue::Number(n @ (Number::Decimal(_) | Number::BigDec(_))) => Json::BigInt(n.to_string()),
         SynValue::Text(s) => Json::Str(s.to_string()),
         SynValue::List(l) => Json::Array(l.borrow().iter().map(syn_to_json).collect()),
         SynValue::Map(m) => {
@@ -343,26 +345,37 @@ pub fn syn_to_json(v: &SynValue) -> Json {
 }
 
 /// serde_json::Value (body entrante parseado) → SynValue (como `python_to_syn`).
+/// ¿Hay algún número que serde_json no pudo guardar como entero de 64 bits pero que en el
+/// texto era un entero (sin punto ni exponente es imposible saberlo desde el `Value`: se
+/// aproxima por "float entero de magnitud ≥ 2^63")? Entonces vale la pena re-parsear exacto.
+pub fn has_wide_int(v: &serde_json::Value) -> bool {
+    use serde_json::Value as V;
+    match v {
+        V::Number(n) => {
+            !n.is_i64() && !n.is_u64() && n.as_f64().is_some_and(|f| f.fract() == 0.0 && f.abs() >= 9.2e18)
+        }
+        V::Array(a) => a.iter().any(has_wide_int),
+        V::Object(o) => o.values().any(has_wide_int),
+        _ => false,
+    }
+}
+
 pub fn json_to_syn(v: &serde_json::Value) -> SynValue {
     use serde_json::Value as V;
     match v {
         V::Null => syn_nothing(),
         V::Bool(b) => syn_bool(*b),
-        // Un entero JSON de cualquier tamaño llega EXACTO (v0.6.29, `arbitrary_precision`):
-        // `18446744073709551615` o un uint256 ya no pasan por f64. Con punto o exponente
-        // es float, como siempre.
+        // Enteros exactos hasta u64 (un id de 64 bits sin signo no pasa por f64). Lo que el
+        // programa decodifica él mismo (`json_decode`, `jsonl_decode`, el `json` de una
+        // respuesta HTTP) va por `json_exact`, exacto a cualquier tamaño.
         V::Number(n) => {
             if let Some(i) = n.as_i64() {
                 return syn_int(i);
             }
-            let t = n.to_string();
-            let digits = t.strip_prefix('-').unwrap_or(&t);
-            if !digits.is_empty() && digits.bytes().all(|c| c.is_ascii_digit()) {
-                if let Ok(b) = t.parse::<num_bigint::BigInt>() {
-                    return SynValue::Number(Number::from_bigint(b));
-                }
+            if let Some(u) = n.as_u64() {
+                return SynValue::Number(Number::from_bigint(num_bigint::BigInt::from(u)));
             }
-            SynValue::Number(Number::Float(n.as_f64().unwrap_or_else(|| t.parse::<f64>().unwrap_or(f64::NAN))))
+            SynValue::Number(Number::Float(n.as_f64().unwrap_or(f64::NAN)))
         }
         V::String(s) => syn_text(s.as_str()),
         V::Array(a) => syn_list(a.iter().map(json_to_syn).collect()),
@@ -590,5 +603,14 @@ mod tests {
         // Aridad fuera de rango: error claro.
         assert!(decode(&[]).is_err());
         assert!(decode(&[syn_text("1"), SynValue::Nothing, SynValue::Nothing]).is_err());
+    }
+}
+
+/// `allow_nan = true` de `json_decode`/`jsonl_decode`.
+fn allow_nan_kw(i: &mut synsema_core::interpreter::Interpreter, who: &str) -> Result<bool, synsema_core::interpreter::Control> {
+    match i.kwarg("allow_nan") {
+        None | Some(SynValue::Nothing) => Ok(false),
+        Some(SynValue::Bool(b)) => Ok(b),
+        Some(other) => Err(err(format!("{}: allow_nan must be true or false, got {}", who, other.type_name()))),
     }
 }

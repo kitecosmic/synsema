@@ -11,7 +11,7 @@
 use ndarray::{ArrayD, Axis, IxDyn};
 
 use faer::linalg::matmul::matmul as faer_matmul_into;
-use faer::linalg::solvers::{DenseSolveCore, Solve, SolveLstsq};
+use faer::linalg::solvers::{DenseSolveCore, Solve};
 use faer::{Accum, Mat, Par};
 
 use indexmap::IndexMap;
@@ -396,8 +396,12 @@ fn scalar_op(l: f64, r: f64, op: &str) -> f64 {
         "*" => l * r,
         "/" => l / r, // IEEE: /0 → ±Inf/NaN (es float elementwise, NO error)
         "**" => l.powf(r),
+        // El divmod de CPython/numpy (`np.floor_divide(7, 0.1)` es 69.0); con divisor 0, lo
+        // de numpy: ±inf / NaN.
+        "//" if r != 0.0 => crate::number::py_float_divmod(l, r).0,
+        "%" if r != 0.0 => crate::number::py_float_divmod(l, r).1,
         "//" => (l / r).floor(),
-        "%" => l - (l / r).floor() * r, // piso, con el signo del divisor (como Python)
+        "%" => f64::NAN,
         _ => f64::NAN,
     }
 }
@@ -887,6 +891,31 @@ pub fn arg_extreme(args: &[SynValue], axis: Option<SynValue>, max: bool) -> Resu
             let out = a.map_axis(Axis(ax), |l| lane(&l.iter().copied().collect::<Vec<_>>()));
             Ok(nd_result(out))
         }
+        // Una lista: `nothing` es un dato faltante y se saltea (como `min`/`max` y el
+        // `idxmin` de pandas); NaN sí cuenta y gana (como numpy: "el mínimo no está definido").
+        (SynValue::List(l), _) => {
+            let items = l.borrow();
+            let mut idx: Vec<usize> = Vec::with_capacity(items.len());
+            let mut data: Vec<f64> = Vec::with_capacity(items.len());
+            for (i, x) in items.iter().enumerate() {
+                match x {
+                    SynValue::Nothing => {}
+                    SynValue::Number(n) => {
+                        idx.push(i);
+                        data.push(n.to_f64());
+                    }
+                    other => return Err(err(format!("{}: expected numbers, got {} at position {}", name, other.type_name(), i))),
+                }
+            }
+            if data.is_empty() {
+                return Err(err(format!(
+                    "{} of {}",
+                    name,
+                    if items.is_empty() { "an empty sequence" } else { "a list where every value is missing" }
+                )));
+            }
+            Ok(syn_int(idx[lane(&data) as usize] as i64))
+        }
         (v, _) => {
             let data = match v {
                 SynValue::Array(a) => a.iter().copied().collect(),
@@ -1021,17 +1050,44 @@ pub fn corr(args: &[SynValue]) -> Result<SynValue, Control> {
     Ok(syn_float(sxy / (sxx * syy).sqrt()))
 }
 
-/// Mínimos cuadrados por QR (faer): `x` que minimiza `‖A·x − b‖`.
-fn least_squares(a: &Mat<f64>, b: &Mat<f64>, name: &str) -> Result<Mat<f64>, Control> {
-    if a.nrows() < a.ncols() {
-        return Err(err(format!("{}: {} equations for {} unknowns — need at least as many rows as columns", name, a.nrows(), a.ncols())));
+/// Mínimos cuadrados por SVD, como `numpy.linalg.lstsq` (LAPACK gelsd): `x` que minimiza
+/// `‖A·x − b‖` y, entre las que empatan, la de norma mínima. Los valores singulares por
+/// debajo de `eps · max(m, n) · s_max` (el `rcond` por defecto de numpy) cuentan como cero,
+/// así que un sistema con columnas dependientes o con menos filas que columnas tiene
+/// respuesta —la misma que numpy— en vez de números enormes. Devuelve también el rango.
+fn least_squares(a: &Mat<f64>, b: &Mat<f64>, name: &str) -> Result<(Mat<f64>, usize), Control> {
+    let (m, n) = (a.nrows(), a.ncols());
+    if m == 0 || n == 0 {
+        return Err(err(format!("{}: A is empty", name)));
     }
-    let qr = a.qr();
-    let x = qr.solve_lstsq(b);
-    if !all_finite(&x) {
-        return Err(err(format!("{}: the system is rank-deficient (columns are linearly dependent)", name)));
+    if !all_finite(a) || !all_finite(b) {
+        return Err(err(format!("{}: A and b must be finite (found NaN or infinity)", name)));
     }
-    Ok(x)
+    let dec = a.as_ref().thin_svd().map_err(|_| err(format!("{}: the SVD did not converge", name)))?;
+    let (u, v, sd) = (dec.U(), dec.V(), dec.S());
+    let k = sd.dim();
+    let smax = (0..k).map(|i| sd[i]).fold(0.0_f64, f64::max);
+    let tol = f64::EPSILON * (m.max(n) as f64) * smax;
+    let mut x = Mat::<f64>::zeros(n, b.ncols());
+    let mut rank = 0;
+    for i in 0..k {
+        let si = sd[i];
+        if si <= tol {
+            continue;
+        }
+        rank += 1;
+        for c in 0..b.ncols() {
+            let mut dot = 0.0;
+            for r in 0..m {
+                dot += u[(r, i)] * b[(r, c)];
+            }
+            let coef = dot / si;
+            for j in 0..n {
+                x[(j, c)] += v[(j, i)] * coef;
+            }
+        }
+    }
+    Ok((x, rank))
 }
 
 /// `lstsq(A, b)`: la solución de mínimos cuadrados (1-D si `b` es 1-D).
@@ -1049,7 +1105,7 @@ pub fn lstsq(args: &[SynValue]) -> Result<SynValue, Control> {
     if fb.nrows() != fa.nrows() {
         return Err(err(format!("lstsq: A has {} rows but b has {}", fa.nrows(), fb.nrows())));
     }
-    let x = least_squares(&fa, &fb, "lstsq")?;
+    let (x, _rank) = least_squares(&fa, &fb, "lstsq")?;
     if one_d {
         Ok(syn_array(ArrayD::from_shape_fn(IxDyn(&[x.nrows()]), |i| x[(i[0], 0)])))
     } else {
@@ -1069,10 +1125,31 @@ pub fn polyfit(args: &[SynValue]) -> Result<SynValue, Control> {
     if xs.len() <= d {
         return Err(err(format!("polyfit: degree {} needs at least {} points, got {}", d, d + 1, xs.len())));
     }
-    let a = Mat::from_fn(xs.len(), d + 1, |i, j| xs[i].powi((d - j) as i32));
+    // Vandermonde con las columnas escaladas a norma 1, como numpy (mejor condicionado).
+    let mut a = Mat::from_fn(xs.len(), d + 1, |i, j| xs[i].powi((d - j) as i32));
+    let scale: Vec<f64> = (0..=d)
+        .map(|j| {
+            let n = (0..xs.len()).map(|i| a[(i, j)] * a[(i, j)]).sum::<f64>().sqrt();
+            if n == 0.0 { 1.0 } else { n }
+        })
+        .collect();
+    for j in 0..=d {
+        for i in 0..xs.len() {
+            a[(i, j)] /= scale[j];
+        }
+    }
     let b = Mat::from_fn(ys.len(), 1, |i, _| ys[i]);
-    let c = least_squares(&a, &b, "polyfit")?;
-    Ok(crate::types::syn_list((0..=d).map(|j| syn_float(c[(j, 0)])).collect()))
+    let (c, rank) = least_squares(&a, &b, "polyfit")?;
+    // numpy avisa (`RankWarning`) y devuelve igual; acá es error: un ajuste que no queda
+    // determinado por los datos no es un resultado.
+    if rank < d + 1 {
+        return Err(err(format!(
+            "polyfit: the fit is not determined by the data (rank {} of {}): there are fewer distinct x values than degree + 1, or they are too close for this degree — lower the degree or rescale x",
+            rank,
+            d + 1
+        )));
+    }
+    Ok(crate::types::syn_list((0..=d).map(|j| syn_float(c[(j, 0)] / scale[j])).collect()))
 }
 
 /// `polyval(coefs, x)`: evalúa el polinomio (grado más alto primero) en un número, lista o array.

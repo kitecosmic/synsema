@@ -276,22 +276,21 @@ otherwise
     while true
         term_write(term, "\r\x1b[2K> " + buf)          -- redraw NOW (made for redraws; `print` on engines ≤ v0.6.28 was buffered)
         let ev be select({"keys": term, "agent": sub}, 60)  -- keys + a sub-agent's bus events
-        when ev == nothing
-            continue
-        when ev["source"] == "bus"
-            term_write(term, "\r\n[agent] " + json_encode(ev["data"]) + "\r\n")
-        otherwise when ev["type"] == "eof"
-            stop
-        otherwise when ev["type"] == "paste"
-            set buf to buf + ev["text"]
-        otherwise when ev["key"] == "char"
-            set buf to buf + ev["text"]
-        otherwise when ev["key"] == "backspace"
-            set buf to slice(buf, 0, len(buf) - 1)
-        otherwise when ev["key"] == "enter" and ev["alt"]
-            set buf to buf + "\n"                        -- Alt+Enter = multi-line
-        otherwise when ev["key"] == "enter"
-            stop
+        when ev != nothing                       -- nothing at the timeout: loop again (no `continue` in Synsema)
+            when ev["source"] == "bus"
+                term_write(term, "\r\n[agent] " + json_encode(ev["data"]) + "\r\n")
+            otherwise when ev["type"] == "eof"
+                stop
+            otherwise when ev["type"] == "paste"
+                set buf to buf + ev["text"]
+            otherwise when ev["key"] == "char"
+                set buf to buf + ev["text"]
+            otherwise when ev["key"] == "backspace"
+                set buf to slice(buf, 0, length(buf) - 1)
+            otherwise when ev["key"] == "enter" and ev["alt"]
+                set buf to buf + "\n"                        -- Alt+Enter = multi-line
+            otherwise when ev["key"] == "enter"
+                stop
     term_close(term)
 ```
 
@@ -336,14 +335,13 @@ let w be watch("src", {"interval": 0.2, "ignore": ["*.tmp", "target"]})
 let build be nothing
 while true
     let ev be select({"files": w, "build": build}, 60)
-    when ev == nothing
-        continue
-    when ev["source"] == "watch"                 -- {type: "create"|"modify"|"delete", path, is_dir}
-        when build != nothing
-            proc_close(build)                    -- kills the previous build (whole tree)
-        set build to proc_spawn("cargo", ["build"])
-    otherwise when ev["type"] == "exit"
-        print("build exit " + text(ev["data"]["exit_code"]))
+    when ev != nothing                       -- nothing at the timeout: loop again (no `continue` in Synsema)
+        when ev["source"] == "watch"                 -- {type: "create"|"modify"|"delete", path, is_dir}
+            when build != nothing
+                proc_close(build)                    -- kills the previous build (whole tree)
+            set build to proc_spawn("cargo", ["build"])
+        otherwise when ev["type"] == "exit"
+            print("build exit " + text(ev["data"]["exit_code"]))
 ```
 
 | Builtin | Returns |

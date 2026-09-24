@@ -28,7 +28,19 @@ pub const BUILTIN_KWARGS: &[(&str, &[&str])] = &[
     ("stack", &["axis"]),
     ("cov", &["ddof"]),
     ("random_normal", &["mean", "std"]),
+    ("int", &["base", "fallback"]),
+    ("json_decode", &["allow_nan"]),
+    ("jsonl_decode", &["allow_nan"]),
 ];
+
+/// `(mínimo, máximo)` de `name` en `BUILTIN_ARITY`, por hash (se consulta en cada llamada).
+pub fn arity_of(name: &str) -> Option<(usize, Option<usize>)> {
+    static MAP: std::sync::OnceLock<std::collections::HashMap<&'static str, (usize, Option<usize>)>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| BUILTIN_ARITY.iter().map(|(n, a, b)| (*n, (*a, *b))).collect())
+        .get(name)
+        .copied()
+}
 
 pub fn kwargs_of(name: &str) -> &'static [&'static str] {
     BUILTIN_KWARGS.iter().find(|(n, _)| *n == name).map(|(_, k)| *k).unwrap_or(&[])
@@ -38,6 +50,7 @@ pub const BUILTIN_ARITY: &[(&str, usize, Option<usize>)] = &[
     ("random", 0, Some(1)),
     ("random_int", 2, Some(3)),
     ("parquet_write", 1, Some(2)),
+    ("parquet_read", 1, Some(2)),
     ("sum", 1, Some(2)),
     ("product", 1, Some(2)),
     ("mean", 1, Some(2)),
@@ -56,6 +69,7 @@ pub const BUILTIN_ARITY: &[(&str, usize, Option<usize>)] = &[
     ("jsonl_decode", 1, Some(2)),
     ("drop_missing", 1, Some(2)),
     ("count_by", 1, Some(2)),
+    ("count", 0, Some(1)),
     ("join", 2, Some(4)),
     ("pivot", 4, Some(5)),
     ("hmac", 2, Some(3)),
@@ -137,7 +151,8 @@ pub const BUILTIN_ARITY: &[(&str, usize, Option<usize>)] = &[
     ("env", 1, Some(2)),
     ("evm_balance", 2, Some(3)),
     ("evm_call", 2, Some(3)),
-    ("evm_fee_history", 1, Some(3)),
+    ("evm_fee_history", 1, Some(4)),
+    ("evm_estimate_gas", 2, Some(3)),
     ("evm_rpc", 2, Some(3)),
     ("evm_wait", 2, Some(4)),
     ("fail", 0, Some(2)),

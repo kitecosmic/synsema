@@ -306,6 +306,16 @@ impl DatabaseManager {
         }
     }
 
+    /// El dialecto SQL de la conexión default (`None` sin conexión o si no es SQL).
+    fn default_dialect(&self) -> Option<SqlDialect> {
+        match self.connections.get(self.default_db.as_ref()?)? {
+            Backend::Sqlite(_) => Some(SqlDialect::Sqlite),
+            Backend::Postgres(_) => Some(SqlDialect::Postgres),
+            Backend::Mysql(_) => Some(SqlDialect::Mysql),
+            Backend::Mongo(_) | Backend::Redis(_) => None,
+        }
+    }
+
     /// Key de la conexión default (para el scope de la capability `db` en las ops de
     /// datos). `None` si no hay ninguna conexión abierta.
     pub fn default_path(&self) -> Option<String> {
@@ -795,6 +805,40 @@ fn pg_row_to_syn(row: &postgres::Row) -> Row {
 }
 
 /// Lee `Option<T>`: NULL o tipo no convertible → `None`.
+/// Un `numeric` de Postgres en su formato binario (sin tope de dígitos): ndigits, weight,
+/// sign, dscale y los dígitos en base 10000. NaN/±Infinity → float.
+struct PgNumeric(SynValue);
+
+impl<'a> FromSql<'a> for PgNumeric {
+    fn from_sql(_ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn StdError + Sync + Send>> {
+        let rd = |i: usize| -> Result<u16, Box<dyn StdError + Sync + Send>> {
+            raw.get(i..i + 2).map(|b| u16::from_be_bytes([b[0], b[1]])).ok_or_else(|| "numeric: short buffer".into())
+        };
+        let ndigits = rd(0)? as usize;
+        let weight = rd(2)? as i16 as i64;
+        let sign = rd(4)?;
+        let dscale = rd(6)? as u32;
+        match sign {
+            0xC000 => return Ok(PgNumeric(syn_float(f64::NAN))),
+            0xD000 => return Ok(PgNumeric(syn_float(f64::INFINITY))),
+            0xF000 => return Ok(PgNumeric(syn_float(f64::NEG_INFINITY))),
+            _ => {}
+        }
+        let mut d = num_bigint::BigInt::from(0);
+        for k in 0..ndigits {
+            d = d * 10000u32 + rd(8 + 2 * k)?;
+        }
+        // valor = d · 10000^(weight − ndigits + 1); con escala dscale: m = valor · 10^dscale.
+        let exp10 = 4 * (weight - ndigits as i64 + 1) + dscale as i64;
+        let m = if exp10 >= 0 { d * synsema_core::number::pow10_big(exp10 as u32) } else { d / synsema_core::number::pow10_big((-exp10) as u32) };
+        let m = if sign == 0x4000 { -m } else { m };
+        Ok(PgNumeric(syn_number(Number::decimal_from_parts(m, dscale))))
+    }
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::NUMERIC
+    }
+}
+
 fn cell_opt<'a, T: FromSql<'a>>(row: &'a postgres::Row, i: usize) -> Option<T> {
     row.try_get::<usize, Option<T>>(i).unwrap_or_default()
 }
@@ -820,9 +864,8 @@ fn pg_cell_to_syn(row: &postgres::Row, i: usize, ty: &Type) -> SynValue {
         return cell_opt::<f64>(row, i).map(syn_float).unwrap_or(nothing);
     }
     if *ty == Type::NUMERIC {
-        return cell_opt::<rust_decimal::Decimal>(row, i)
-            .map(|d| syn_number(Number::Decimal(d)))
-            .unwrap_or(nothing);
+        // Cualquier precisión (numeric sin tope): el decimal exacto, grande si hace falta.
+        return cell_opt::<PgNumeric>(row, i).map(|n| n.0).unwrap_or(nothing);
     }
     if *ty == Type::TEXT || *ty == Type::VARCHAR || *ty == Type::BPCHAR || *ty == Type::NAME {
         return cell_opt::<String>(row, i).map(syn_text).unwrap_or(nothing);
@@ -1081,9 +1124,9 @@ fn mysql_cell_to_syn(v: mysql::Value, col: &mysql::Column) -> SynValue {
                 // DECIMAL/NUMERIC: texto "9.99" → Decimal exacto (DE-009/21: type_of "decimal").
                 ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => {
                     let s = String::from_utf8_lossy(&b);
-                    match rust_decimal::Decimal::from_str_exact(s.trim()) {
-                        Ok(d) => syn_number(Number::Decimal(d)),
-                        Err(_) => syn_text(s.into_owned()),
+                    match Number::parse_decimal(s.trim()) {
+                        Some(d) => syn_number(d),
+                        None => syn_text(s.into_owned()),
                     }
                 }
                 // JSON → map/list (parsear con serde_json; reusa json_to_syn de M1).
@@ -1255,9 +1298,9 @@ fn bson_to_syn(b: &Bson) -> SynValue {
         Bson::Int32(i) => syn_int(*i as i64),
         Bson::Int64(i) => syn_int(*i),
         Bson::Double(f) => syn_float(*f),
-        Bson::Decimal128(d) => match rust_decimal::Decimal::from_str_exact(&d.to_string()) {
-            Ok(dec) => syn_number(Number::Decimal(dec)),
-            Err(_) => syn_text(d.to_string()),
+        Bson::Decimal128(d) => match Number::parse_decimal(&d.to_string()) {
+            Some(dec) => syn_number(dec),
+            None => syn_text(d.to_string()),
         },
         Bson::String(s) => syn_text(s.as_str()),
         Bson::Binary(bin) => syn_bytes(bin.bytes.clone()),
@@ -1645,7 +1688,7 @@ pub fn register_database_builtins<H: DbHandle>(
                 if let Some(p) = db.read(|m| m.default_path()) {
                     require_db(&caps, &p, "sql()")?;
                 }
-                let rows = db.write(|m| m.query(&query, &params)).map_err(err)?;
+                let rows = db.write(|m| m.query(&query, &params)).map_err(|e| sql_driver_error("sql", e))?;
                 Ok(syn_list(rows.into_iter().map(syn_map).collect()))
             }),
         );
@@ -1664,7 +1707,15 @@ pub fn register_database_builtins<H: DbHandle>(
                 if let Some(p) = db.read(|m| m.default_path()) {
                     require_db(&caps, &p, "sql_exec()")?;
                 }
-                let (affected, last_id) = db.write(|m| m.execute(&stmt, &params)).map_err(err)?;
+                // Con RETURNING el statement devuelve filas: el driver de SQLite lo EJECUTA y recién
+                // después se queja. Ahí se rechaza antes, para que no quede escrito sin que el
+                // programa lo sepa. Postgres y MySQL lo ejecutan bien y devuelven la cuenta.
+                if db.read(|m| m.default_dialect()) == Some(SqlDialect::Sqlite)
+                    && sql_code_words(&stmt, SqlDialect::Sqlite).any(|w| w.eq_ignore_ascii_case("RETURNING"))
+                {
+                    return Err(err("sql_exec: this statement returns rows (RETURNING) — run it with sql(statement, params) to get them (nothing was executed)"));
+                }
+                let (affected, last_id) = db.write(|m| m.execute(&stmt, &params)).map_err(|e| sql_driver_error("sql_exec", e))?;
                 let mut m = IndexMap::new();
                 m.insert("rows_affected".to_string(), syn_int(affected));
                 m.insert("last_id".to_string(), syn_int(last_id));
@@ -1708,7 +1759,14 @@ pub fn register_database_builtins<H: DbHandle>(
                     }
                     _ => Vec::new(),
                 };
-                let affected = db.write(|m| m.execute_many(&stmt, &params_list)).map_err(err)?;
+                // Como `sql_exec`: en SQLite un RETURNING escribe la fila y después falla, así que
+                // se rechaza ANTES de ejecutar ninguna del batch.
+                if db.read(|m| m.default_dialect()) == Some(SqlDialect::Sqlite)
+                    && sql_code_words(&stmt, SqlDialect::Sqlite).any(|w| w.eq_ignore_ascii_case("RETURNING"))
+                {
+                    return Err(err("sql_batch: this statement returns rows (RETURNING) — run it with sql(statement, params) for each row to get them (nothing was executed)"));
+                }
+                let affected = db.write(|m| m.execute_many(&stmt, &params_list)).map_err(|e| sql_driver_error("sql_batch", e))?;
                 let mut m = IndexMap::new();
                 m.insert("rows_affected".to_string(), syn_int(affected));
                 Ok(syn_map(m))
@@ -2201,8 +2259,56 @@ pub fn register_database_builtins<H: DbHandle>(
 mod tests {
     use super::*;
 
+    fn has_returning(sql: &str, d: SqlDialect) -> bool {
+        sql_code_words(sql, d).any(|w| w.eq_ignore_ascii_case("RETURNING"))
+    }
+
+    /// `\'` escapa la comilla dentro de un literal en MySQL; en SQLite y Postgres `\` es literal.
+    #[test]
+    fn sql_code_words_by_dialect() {
+        let my = r"INSERT INTO t VALUES ('it\'s', 'returning')";
+        assert!(!has_returning(my, SqlDialect::Mysql));
+        assert!(!has_returning(r#"INSERT INTO t VALUES ("a\"b returning")"#, SqlDialect::Mysql));
+        assert!(!has_returning(r"INSERT INTO t VALUES ('a\') RETURNING id", SqlDialect::Mysql));
+        assert!(has_returning(r"INSERT INTO t VALUES ('a\\') RETURNING id", SqlDialect::Mysql));
+        // SQLite / Postgres: `'a\'` es un literal completo; lo que sigue es código.
+        let lite = r"INSERT INTO t VALUES ('a\', 'returning')";
+        assert!(!has_returning(lite, SqlDialect::Sqlite));
+        assert!(has_returning(r"INSERT INTO t VALUES ('a\') RETURNING id", SqlDialect::Sqlite));
+        assert!(has_returning(r"INSERT INTO t VALUES ('a\') RETURNING id", SqlDialect::Postgres));
+        assert!(!has_returning("INSERT INTO t VALUES ('x''returning')", SqlDialect::Sqlite));
+        assert!(!has_returning("INSERT INTO t VALUES ('x') -- returning", SqlDialect::Postgres));
+    }
+
     fn cell(row: &Row, key: &str) -> SynValue {
         row.get(key).cloned().unwrap()
+    }
+
+    /// `numeric` de Postgres en binario, de cualquier precisión (rust_decimal cortaba en 28).
+    #[test]
+    fn pg_numeric_binary_any_precision() {
+        let enc = |ndigits: u16, weight: i16, sign: u16, dscale: u16, digits: &[u16]| {
+            let mut b = Vec::new();
+            for x in [ndigits, weight as u16, sign, dscale] {
+                b.extend_from_slice(&x.to_be_bytes());
+            }
+            for d in digits {
+                b.extend_from_slice(&d.to_be_bytes());
+            }
+            b
+        };
+        let read = |b: &[u8]| PgNumeric::from_sql(&Type::NUMERIC, b).unwrap().0.to_string();
+        // 12345.678: dígitos base 10000 [1, 2345, 6780], weight 1, dscale 3.
+        assert_eq!(read(&enc(3, 1, 0, 3, &[1, 2345, 6780])), "12345.678");
+        assert_eq!(read(&enc(3, 1, 0x4000, 3, &[1, 2345, 6780])), "-12345.678");
+        // 10^32 + 0.5: más de 28 dígitos, exacto.
+        assert_eq!(
+            read(&enc(10, 8, 0, 1, &[1, 0, 0, 0, 0, 0, 0, 0, 0, 5000])),
+            "100000000000000000000000000000000.5"
+        );
+        // 0.0001 y 0.00 (dscale 2, sin dígitos).
+        assert_eq!(read(&enc(1, -1, 0, 4, &[1])), "0.0001");
+        assert_eq!(read(&enc(0, 0, 0, 2, &[])), "0.00");
     }
 
     #[test]
@@ -2732,4 +2838,120 @@ mod tests {
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b, "cada adquisición debe dar un token distinto");
     }
+}
+
+/// Los textos del driver de SQLite que no dicen qué hacer en Synsema, reescritos: un statement
+/// que devuelve filas en `sql_exec`/`sql_batch` ("Execute returned results - did you mean to call
+/// query?") y la cuenta de parámetros ("Wrong number of parameters passed to query. Got 0,
+/// needed 1"). El resto pasa igual.
+fn sql_driver_error(who: &str, e: String) -> Control {
+    if e.contains("returned results") {
+        return err(format!(
+            "{}: this statement returns rows (SELECT, or RETURNING) — run it with sql(statement, params) to get them",
+            who
+        ));
+    }
+    if let Some(rest) = e.strip_prefix("Wrong number of parameters passed to query. Got ") {
+        if let Some((got, needed)) = rest.split_once(", needed ") {
+            return err(format!(
+                "{}: the statement has {} parameter(s) but {} value(s) were passed — pass one per `?` (or `:name`, `@name`, `$name`; in SQLite `$…` inside the SQL is a parameter too): sql(statement, [v1, …])",
+                who,
+                needed.trim(),
+                got.trim()
+            ));
+        }
+    }
+    err(e)
+}
+
+/// Cómo lee un motor los literales de un statement: en MySQL `\` escapa dentro de `'…'` y `"…"`;
+/// en SQLite y Postgres es un carácter más.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SqlDialect {
+    Sqlite,
+    Postgres,
+    Mysql,
+}
+
+/// Las palabras de CÓDIGO de un statement SQL: sin el contenido de literales `'…'`, identificadores
+/// entre comillas (`"…"`, `` `…` ``, `[…]`) ni comentarios (`-- …`, `/* … */`). `'returning'`
+/// dentro de un texto no es la cláusula RETURNING.
+fn sql_code_words(sql: &str, dialect: SqlDialect) -> impl Iterator<Item = String> {
+    let c: Vec<char> = sql.chars().collect();
+    let mut code = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < c.len() {
+        match c[i] {
+            q @ ('\'' | '"' | '`') => {
+                // Hasta la comilla que cierra; la comilla doblada (`''`) es una comilla adentro,
+                // y en MySQL también la escapada (`\'`).
+                i += 1;
+                while i < c.len() {
+                    if dialect == SqlDialect::Mysql && q != '`' && c[i] == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if c[i] == q {
+                        if c.get(i + 1) == Some(&q) {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+                code.push(' ');
+            }
+            '[' => {
+                while i < c.len() && c[i] != ']' {
+                    i += 1;
+                }
+                i += 1;
+                code.push(' ');
+            }
+            '-' if c.get(i + 1) == Some(&'-') => {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+                code.push(' ');
+            }
+            '/' if c.get(i + 1) == Some(&'*') => {
+                i += 2;
+                while i < c.len() && !(c[i] == '*' && c.get(i + 1) == Some(&'/')) {
+                    i += 1;
+                }
+                i += 2;
+                code.push(' ');
+            }
+            // `$tag$ … $tag$` de Postgres (dollar quoting).
+            '$' => {
+                let mut j = i + 1;
+                while j < c.len() && (c[j].is_ascii_alphanumeric() || c[j] == '_') {
+                    j += 1;
+                }
+                if c.get(j) == Some(&'$') && !(j > i + 1 && c[i + 1].is_ascii_digit()) {
+                    let tag: String = c[i..=j].iter().collect();
+                    let rest: String = c[j + 1..].iter().collect();
+                    match rest.find(&tag) {
+                        Some(k) => i = j + 1 + rest[..k].chars().count() + tag.chars().count(),
+                        None => i = c.len(),
+                    }
+                    code.push(' ');
+                } else {
+                    code.push('$');
+                    i += 1;
+                }
+            }
+            ch => {
+                code.push(ch);
+                i += 1;
+            }
+        }
+    }
+    code.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_string())
+        .collect::<Vec<_>>()
+        .into_iter()
 }

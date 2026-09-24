@@ -55,12 +55,12 @@ print(csv_encode(monthly))
   `0`, the other aggregates → `nothing`).
 - Where missing comes from: an empty CSV field, a Parquet/SQL null, a cell with no match in
   `join`/`pivot`.
-- Tools: `is_missing(x)`, `drop_missing(rows, cols?)`, `fill_missing(rows, value | {col: value})`,
-  `fill_nan(xs, number)`. Choose on purpose — dropping and filling give different answers.
+- Tools: `is_missing(x)`, `count(xs)` (present values) / `count_missing(xs)`, `drop_missing(rows, cols?)`,
+  `fill_missing(rows, value | {col: value})`, `fill_nan(xs, number)`. Choose on purpose — dropping and filling give different answers.
 - `std`/`var` are **sample** (`ddof = 1`, like pandas); population is `std(xs, ddof = 0)`.
 
 **pandas / polars → Synsema**, one line each: `df.groupby("r").agg(...)` → `summarize(rows, "r", {...})` ·
-`df.merge(o, on="id", how="left")` → `join(rows, o, "id", "left")` · `pivot_table` → `pivot(rows, i, c, v, sum_of(v))` ·
+`df.merge(o, on="id", how="left")` → `join(rows, o, "id", "left")` (also `"right"`/`"outer"`/`"semi"`/`"anti"`) · `pivot_table` → `pivot(rows, i, c, v, sum_of(v))` ·
 `value_counts()` → `count_by(rows, "col")` · `dropna()`/`fillna(0)` → `drop_missing(rows)`/`fill_missing(rows, 0)` ·
 `sort_values("t", ascending=False)` → `sort_by(rows, (r) => r.t, desc = true)` · `df["col"]` → `collect(rows, "col")` ·
 `df[df.x > 2]` → `where(rows, (r) => r.x > 2)` · `pd.to_datetime` → `date(x)`/`datetime(x)` · `dt.to_period("M")` →
@@ -80,7 +80,7 @@ write_file("out.csv", csv_encode(rows))
 ```
 
 - `csv_parse(text, opts?)` → list of maps (first row = headers). **An empty field is `nothing`**
-  (missing — v0.6.29+; it was `""`). Opts:
+  (missing — v0.6.29+; it was `""`); a **quoted** `""` is the empty text. Opts:
   - `"types": {"col": "int" | "float" | "decimal" | "text" | "bool" | "date" | "datetime"}` —
     the type of each named column (v0.6.29+, the recommended form). A field that does not fit →
     error with line and column (`csv_parse: line 2, column "a": "x" is not a int`). Needs headers.
@@ -92,7 +92,7 @@ write_file("out.csv", csv_encode(rows))
   keys, in order) or list of lists. Opts: `"headers": [..]` (column order/subset),
   `"delimiter"`, `"eol"` (`"\r\n"` default — Excel-friendly; or `"\n"`).
 - Guarantees: minimal quoting; integers without decimals (`42`, not `42.0`); `nothing` →
-  empty field (and back to `nothing` on parse); dates/datetimes → ISO text; `bytes` → base64; **`secret` → `[redacted]`** (never the plaintext); nested
+  empty field (and back to `nothing` on parse), the empty text → `""` (and back to `""`); dates/datetimes → ISO text; `bytes` → base64; **`secret` → `[redacted]`** (never the plaintext); nested
   list/map → clear error suggesting `json_encode` for that field.
 - Errors always carry the line/row: unclosed quote, uneven field count, duplicate
   headers, unknown option (typo guard). All catchable with `try`/`recover`.

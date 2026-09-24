@@ -13,6 +13,9 @@ use crate::tokens::{Number, SourceLocation};
 pub struct Program {
     pub location: SourceLocation,
     pub statements: Vec<Node>,
+    /// Líneas con un literal que usa un escape `\u` (nuevo en v0.6.29): `synsema check` avisa,
+    /// porque antes ese texto quedaba tal cual.
+    pub escape_lines: Vec<usize>,
 }
 
 /// Un nodo del AST. Todos llevan `location` para observabilidad.
@@ -64,6 +67,11 @@ pub struct JudgeQuestionNode {
     pub escape: bool,
     pub loc: SourceLocation,
 }
+
+/// Operador interno de un hueco `{x}` de un template con backticks (v0.6.29): pega el texto
+/// de cualquier valor (lista, mapa, nothing incluidos), como el f-string de Python. `+` sigue
+/// siendo estricto; este operador no tiene sintaxis propia, sólo lo produce el desugar.
+pub const INTERP_CONCAT: &str = "+`";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum NodeKind {

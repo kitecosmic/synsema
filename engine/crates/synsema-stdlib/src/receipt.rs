@@ -165,6 +165,7 @@ pub fn build_receipt(
             m.insert("what".to_string(), syn_text(e.what.clone()));
             m.insert("sha256".to_string(), syn_text(e.sha256.clone()));
             m.insert("bytes".to_string(), syn_int(e.bytes as i64));
+            m.insert("encoding".to_string(), syn_text(e.encoding.clone()));
             syn_map(m)
         })
         .collect();

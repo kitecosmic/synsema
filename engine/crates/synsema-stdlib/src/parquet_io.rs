@@ -8,7 +8,10 @@
 //! - `parquet_write(rows, opts?)` → bytes. El esquema sale de los datos, columna por columna
 //!   (todas opcionales: `nothing` es nulo): entero → INT64, número con decimales → DOUBLE,
 //!   decimal → DECIMAL(38, escala), texto → STRING, bool, bytes, date → DATE,
-//!   datetime → TIMESTAMP(µs, UTC). Una columna que mezcla tipos o un valor anidado es un error
+//!   datetime → TIMESTAMP(µs, UTC), y la zona IANA de cada columna de datetimes va en los
+//!   metadatos del archivo (`synsema.timezones`): al leer vuelve con su zona. Al leer también
+//!   se entienden timestamps en milisegundos, microsegundos y NANOSEGUNDOS (los de polars y
+//!   pandas). Una columna que mezcla tipos o un valor anidado es un error
 //!   con el nombre de la columna. `opts.compression` = "snappy" (default), "zstd", "gzip",
 //!   "lz4" o "none".
 
@@ -16,7 +19,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
-use num_bigint::{BigInt, Sign};
+use num_bigint::BigInt;
 
 use parquet::basic::{Compression, LogicalType, Repetition, TimeUnit, Type as PhysicalType};
 use parquet::data_type::ByteArray;
@@ -31,6 +34,9 @@ use synsema_core::number::Number;
 use synsema_core::temporal::Temporal;
 use synsema_core::types::{syn_bool, syn_bytes, syn_float, syn_list, syn_map, syn_number, syn_text, SynValue};
 
+/// Clave de los metadatos del archivo con la zona IANA de cada columna de datetimes.
+const TZ_KEY: &str = "synsema.timezones";
+
 fn err(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::new(msg))
 }
@@ -42,11 +48,8 @@ fn err(msg: impl Into<String>) -> Control {
 fn decimal_from_parquet(d: &parquet::data_type::Decimal) -> SynValue {
     let unscaled = BigInt::from_signed_bytes_be(d.data());
     let scale = d.scale().max(0) as u32;
-    match unscaled.to_string().parse::<i128>().ok().and_then(|i| rust_decimal::Decimal::try_from_i128_with_scale(i, scale).ok()) {
-        Some(dec) => syn_number(Number::Decimal(dec)),
-        // Más de 28 dígitos no entran en rust_decimal: se entrega exacto como texto.
-        None => syn_text(format!("{}e-{}", unscaled, scale)),
-    }
+    // Una columna decimal es decimal, de cualquier precisión (decimal(38, s) incluido): exacta.
+    syn_number(Number::decimal_from_parts(unscaled, scale))
 }
 
 fn field_to_syn(f: &Field) -> SynValue {
@@ -72,11 +75,11 @@ fn field_to_syn(f: &Field) -> SynValue {
             None => SynValue::Nothing,
         },
         Field::TimestampMillis(ms) => match DateTime::from_timestamp_millis(*ms) {
-            Some(dt) => SynValue::Time(Rc::new(Temporal::DateTime(dt.with_timezone(&chrono_tz::Tz::UTC)))),
+            Some(dt) => SynValue::Time(Rc::new(Temporal::DateTime(dt.with_timezone(&synsema_core::temporal::UTC)))),
             None => SynValue::Nothing,
         },
         Field::TimestampMicros(us) => match DateTime::from_timestamp_micros(*us) {
-            Some(dt) => SynValue::Time(Rc::new(Temporal::DateTime(dt.with_timezone(&chrono_tz::Tz::UTC)))),
+            Some(dt) => SynValue::Time(Rc::new(Temporal::DateTime(dt.with_timezone(&synsema_core::temporal::UTC)))),
             None => SynValue::Nothing,
         },
         Field::Group(row) => {
@@ -98,13 +101,287 @@ fn field_to_syn(f: &Field) -> SynValue {
             }
             syn_map(m)
         }
-        // Tipos que no usamos (tiempo del día, float16, …): su forma de texto.
-        other => syn_text(other.to_string()),
+        Field::Float16(h) => syn_float(f64::from(h.to_f32())),
+        // TIME (hora del día): Synsema no tiene ese tipo; es la `duration` desde medianoche.
+        Field::TimeMillis(ms) => time_of_day(chrono::Duration::milliseconds(*ms as i64)),
+        Field::TimeMicros(us) => time_of_day(chrono::Duration::microseconds(*us)),
     }
+}
+
+// =========================================================
+// Zona horaria del esquema Arrow (polars, pyarrow)
+// =========================================================
+
+/// Clave de los metadatos donde polars y pyarrow guardan el esquema Arrow: un mensaje IPC en
+/// base64 cuyo tipo `Timestamp` lleva la zona de la columna (Parquet sólo dice "ajustado a UTC").
+const ARROW_KEY: &str = "ARROW:schema";
+
+/// Lector mínimo de flatbuffers: tablas con su vtable, strings, vectores y uniones. Todo acceso
+/// está acotado: un esquema roto da `None`, nunca un pánico.
+struct Fb<'a>(&'a [u8]);
+
+impl<'a> Fb<'a> {
+    fn u16_at(&self, p: usize) -> Option<u16> {
+        self.0.get(p..p.checked_add(2)?).map(|b| u16::from_le_bytes([b[0], b[1]]))
+    }
+    fn u32_at(&self, p: usize) -> Option<u32> {
+        self.0.get(p..p.checked_add(4)?).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+    /// Sigue un offset relativo (uoffset) guardado en `p`.
+    fn deref(&self, p: usize) -> Option<usize> {
+        p.checked_add(self.u32_at(p)? as usize)
+    }
+    /// Posición del campo `i` de la tabla que empieza en `t`; `None` si no está.
+    fn field(&self, t: usize, i: usize) -> Option<usize> {
+        let soff = self.u32_at(t)? as i32 as i64;
+        let vt = usize::try_from(t as i64 - soff).ok()?;
+        let vsize = self.u16_at(vt)? as usize;
+        let at = 4 + 2 * i;
+        if at + 2 > vsize {
+            return None;
+        }
+        match self.u16_at(vt + at)? as usize {
+            0 => None,
+            off => t.checked_add(off),
+        }
+    }
+    fn table(&self, t: usize, i: usize) -> Option<usize> {
+        self.deref(self.field(t, i)?)
+    }
+    fn byte(&self, t: usize, i: usize) -> Option<u8> {
+        self.0.get(self.field(t, i)?).copied()
+    }
+    fn string(&self, t: usize, i: usize) -> Option<&'a str> {
+        let s = self.table(t, i)?;
+        let n = self.u32_at(s)? as usize;
+        std::str::from_utf8(self.0.get(s + 4..(s + 4).checked_add(n)?)?).ok()
+    }
+    /// Un vector: (posición del primer elemento, cantidad).
+    fn vector(&self, t: usize, i: usize) -> Option<(usize, usize)> {
+        let v = self.table(t, i)?;
+        Some((v + 4, self.u32_at(v)? as usize))
+    }
+}
+
+/// `columna → zona` de las columnas timestamp de primer nivel que traen zona en el esquema
+/// Arrow. Un esquema ilegible no es un error: el archivo se lee igual, en UTC.
+fn arrow_timezones(b64: &str) -> std::collections::HashMap<String, String> {
+    // Arrow: Message.header_type Schema = 1; Type Timestamp = 10.
+    const SCHEMA: u8 = 1;
+    const TIMESTAMP: u8 = 10;
+    let mut out = std::collections::HashMap::new();
+    let Ok(raw) = synsema_core::bytesutil::b64_decode(b64.trim()) else { return out };
+    // Mensaje encapsulado: [0xFFFFFFFF] + largo (i32) + flatbuffer (el formato viejo no trae la marca).
+    let mut p = if raw.get(..4) == Some(&[0xff; 4][..]) { 4 } else { 0 };
+    let msg = match raw.get(p..p + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize) {
+        Some(n) if raw.len() >= p + 4 + n && n > 0 => {
+            p += 4;
+            &raw[p..p + n]
+        }
+        _ => &raw[..],
+    };
+    let fb = Fb(msg);
+    let _ = (|| -> Option<()> {
+        let root = fb.deref(0)?;
+        if fb.byte(root, 1)? != SCHEMA {
+            return None;
+        }
+        let schema = fb.table(root, 2)?;
+        let (start, n) = fb.vector(schema, 1)?;
+        for k in 0..n.min(100_000) {
+            let f = fb.deref(start + 4 * k)?;
+            if fb.byte(f, 2) != Some(TIMESTAMP) {
+                continue;
+            }
+            if let (Some(name), Some(tz)) = (fb.string(f, 0), fb.table(f, 3).and_then(|ts| fb.string(ts, 1))) {
+                out.insert(name.to_string(), tz.to_string());
+            }
+        }
+        Some(())
+    })();
+    out
+}
+
+/// La zona de un esquema Arrow como zona de Synsema: un nombre IANA (`Europe/Madrid`), `UTC`/`Z`
+/// o un offset fijo (`+05:30`, que se conserva como offset, igual que en Arrow y pandas). Una
+/// zona que no se entiende no rompe la lectura: el instante es exacto y queda en UTC.
+fn arrow_zone(tz: &str) -> Option<synsema_core::temporal::Zone> {
+    synsema_core::temporal::tz_of(tz.trim(), "parquet_read").ok()
+}
+
+/// Una hora del día (`TIME` de Parquet) como `duration` desde medianoche.
+fn time_of_day(d: chrono::Duration) -> SynValue {
+    SynValue::Time(Rc::new(Temporal::Duration(d)))
+}
+
+// =========================================================
+// Topes de expansión (un archivo chico no puede pedir gigas)
+// =========================================================
+
+/// Tope por página descomprimida (un writer normal usa ~1 MiB; 256 MiB es generoso).
+const MAX_PAGE_BYTES: u64 = 256 * 1024 * 1024;
+/// Tope por defecto de celdas (filas × columnas) que se materializan; `{"max_cells": n}` lo sube.
+const DEFAULT_MAX_CELLS: u64 = 50_000_000;
+
+/// Lector mínimo de Thrift compact: lo justo para leer el encabezado de cada página
+/// (`uncompressed_page_size`, `compressed_page_size`) y saltear el resto.
+struct Thrift<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Thrift<'a> {
+    fn byte(&mut self) -> Option<u8> {
+        let v = *self.b.get(self.i)?;
+        self.i += 1;
+        Some(v)
+    }
+    fn varint(&mut self) -> Option<u64> {
+        let mut out = 0u64;
+        for shift in (0..70).step_by(7) {
+            let b = self.byte()?;
+            out |= ((b & 0x7f) as u64).checked_shl(shift)?;
+            if b & 0x80 == 0 {
+                return Some(out);
+            }
+        }
+        None
+    }
+    fn zigzag(&mut self) -> Option<i64> {
+        let v = self.varint()?;
+        Some(((v >> 1) as i64) ^ -((v & 1) as i64))
+    }
+    fn skip(&mut self, ty: u8, depth: u32) -> Option<()> {
+        if depth > 32 {
+            return None;
+        }
+        match ty {
+            1 | 2 => {}
+            3 => {
+                self.byte()?;
+            }
+            4..=6 => {
+                self.varint()?;
+            }
+            7 => {
+                self.i = self.i.checked_add(8)?;
+            }
+            8 => {
+                let n = self.varint()? as usize;
+                self.i = self.i.checked_add(n)?;
+            }
+            9 | 10 => {
+                let h = self.byte()?;
+                let n = if h >> 4 == 15 { self.varint()? } else { (h >> 4) as u64 };
+                for _ in 0..n {
+                    self.skip(h & 0x0f, depth + 1)?;
+                }
+            }
+            11 => {
+                let n = self.varint()?;
+                if n > 0 {
+                    let kv = self.byte()?;
+                    for _ in 0..n {
+                        self.skip(kv >> 4, depth + 1)?;
+                        self.skip(kv & 0x0f, depth + 1)?;
+                    }
+                }
+            }
+            12 => self.skip_struct(depth + 1).map(|_| ())?,
+            _ => return None,
+        }
+        (self.i <= self.b.len()).then_some(())
+    }
+    /// Recorre un struct; devuelve los i32 de los campos 2 y 3 del nivel de arriba.
+    fn skip_struct(&mut self, depth: u32) -> Option<(Option<i64>, Option<i64>)> {
+        let (mut f2, mut f3) = (None, None);
+        let mut last: i16 = 0;
+        loop {
+            let h = self.byte()?;
+            if h == 0 {
+                return Some((f2, f3));
+            }
+            let ty = h & 0x0f;
+            let delta = (h >> 4) as i16;
+            let id = if delta == 0 { self.zigzag()? as i16 } else { last.checked_add(delta)? };
+            last = id;
+            if ty == 5 && (id == 2 || id == 3) && depth == 0 {
+                let v = self.zigzag()?;
+                if id == 2 { f2 = Some(v) } else { f3 = Some(v) }
+            } else {
+                self.skip(ty, depth)?;
+            }
+        }
+    }
+}
+
+/// Recorre los encabezados de TODAS las páginas y rechaza el archivo si una página declara
+/// más de `MAX_PAGE_BYTES` descomprimidos o si el total supera `max_total` — antes de que el
+/// lector reserve esa memoria (un encabezado que miente pedía 2 GiB por columna y abortaba).
+fn check_expansion(data: &[u8], meta: &parquet::file::metadata::ParquetMetaData, max_total: u64, fname: &str) -> Result<(), Control> {
+    let mut total: u64 = 0;
+    for rg in meta.row_groups() {
+        for col in rg.columns() {
+            let start = col.dictionary_page_offset().unwrap_or(col.data_page_offset()).max(0) as usize;
+            let len = col.compressed_size().max(0) as usize;
+            let end = start.checked_add(len).filter(|e| *e <= data.len()).ok_or_else(|| {
+                err(format!("{}: a column chunk points outside the file (corrupt or truncated)", fname))
+            })?;
+            let mut pos = start;
+            while pos < end {
+                let mut t = Thrift { b: &data[..end], i: pos };
+                let (unc, comp) = t
+                    .skip_struct(0)
+                    .ok_or_else(|| err(format!("{}: unreadable page header (corrupt file)", fname)))?;
+                let (unc, comp) = match (unc, comp) {
+                    (Some(u), Some(c)) if u >= 0 && c >= 0 => (u as u64, c as u64),
+                    _ => return Err(err(format!("{}: a page header has no sizes (corrupt file)", fname))),
+                };
+                if unc > MAX_PAGE_BYTES {
+                    return Err(err(format!(
+                        "{}: a page declares {} MiB uncompressed (the limit is {} MiB per page; writers use about 1 MiB) — the file is malformed or hostile, refusing to allocate it",
+                        fname,
+                        unc / (1024 * 1024),
+                        MAX_PAGE_BYTES / (1024 * 1024)
+                    )));
+                }
+                total = total.saturating_add(unc);
+                if total > max_total {
+                    return Err(err(format!(
+                        "{}: the file expands to more than {} bytes uncompressed (max_bytes) — raise it on purpose with {{\"max_bytes\": n}}",
+                        fname,
+                        max_total
+                    )));
+                }
+                pos = t.i.checked_add(comp as usize).ok_or_else(|| err(format!("{}: corrupt page size", fname)))?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parquet_read(args: &[SynValue]) -> Result<SynValue, Control> {
     const F: &str = "parquet_read";
+    // `parquet_read(bytes, {"max_cells": n, "max_bytes": n})`: los topes contra un archivo
+    // hostil (por defecto 50 millones de celdas y max(1 GiB, 64 × el archivo) descomprimidos).
+    let (mut max_cells, mut max_bytes_opt) = (DEFAULT_MAX_CELLS, None::<u64>);
+    match args.get(1) {
+        None | Some(SynValue::Nothing) => {}
+        Some(SynValue::Map(m)) => {
+            for (k, v) in m.borrow().iter() {
+                let n = match v {
+                    SynValue::Number(Number::Int(n)) if *n > 0 => *n as u64,
+                    other => return Err(err(format!("{}: option {:?} must be a positive integer, got {}", F, k, other))),
+                };
+                match k.as_str() {
+                    "max_cells" => max_cells = n,
+                    "max_bytes" => max_bytes_opt = Some(n),
+                    other => return Err(err(format!("{}: unknown option {:?} (valid: max_cells, max_bytes)", F, other))),
+                }
+            }
+        }
+        Some(other) => return Err(err(format!("{}: opts must be a map, got {}", F, other.type_name()))),
+    }
     let data = match args.first() {
         Some(SynValue::Bytes(b)) => b.to_vec(),
         Some(other) => {
@@ -116,14 +393,91 @@ fn parquet_read(args: &[SynValue]) -> Result<SynValue, Control> {
         }
         None => return Err(err("parquet_read(bytes)")),
     };
-    let reader = SerializedFileReader::new(bytes::Bytes::from(data)).map_err(|e| err(format!("{}: not a Parquet file: {}", F, e)))?;
+    let file_len = data.len() as u64;
+    let reader = SerializedFileReader::new(bytes::Bytes::from(data.clone())).map_err(|e| err(format!("{}: not a Parquet file: {}", F, e)))?;
+    let max_bytes = max_bytes_opt.unwrap_or_else(|| (1024 * 1024 * 1024u64).max(file_len.saturating_mul(64)));
+    check_expansion(&data, reader.metadata(), max_bytes, F)?;
+    let cells = (reader.metadata().file_metadata().num_rows().max(0) as u64)
+        .saturating_mul(reader.metadata().file_metadata().schema_descr().num_columns() as u64);
+    if cells > max_cells {
+        return Err(err(format!(
+            "{}: the file has {} cells (rows × columns); the limit is {} — raise it on purpose with {{\"max_cells\": n}}",
+            F, cells, max_cells
+        )));
+    }
+    // Columnas TIMESTAMP en nanosegundos: el lector por filas del crate las entrega como un
+    // entero; acá se convierten. Y la zona de cada columna, si la escribió `parquet_write`.
+    let fmeta = reader.metadata().file_metadata();
+    // Dos columnas con el mismo nombre darían un mapa que pierde una en silencio.
+    let mut names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for f in fmeta.schema_descr().root_schema().get_fields() {
+        if !names.insert(f.name()) {
+            return Err(err(format!(
+                "{}: the file has two columns named {:?} — a row is a map and would lose one; rename it where the file is written",
+                F,
+                f.name()
+            )));
+        }
+    }
+    let mut nanos: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // TIME en nanosegundos (polars): el lector por filas también la entrega como un entero.
+    let mut time_nanos: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for c in fmeta.schema_descr().columns() {
+        match c.logical_type_ref() {
+            Some(LogicalType::Timestamp(ts)) if ts.unit == TimeUnit::NANOS => {
+                nanos.insert(c.name().to_string());
+            }
+            Some(LogicalType::Time(t)) if t.unit == TimeUnit::NANOS => {
+                time_nanos.insert(c.name().to_string());
+            }
+            _ => {}
+        }
+    }
+    let mut zones: std::collections::HashMap<String, synsema_core::temporal::Zone> = std::collections::HashMap::new();
+    if let Some(kvs) = fmeta.key_value_metadata() {
+        // Primero la zona del esquema Arrow (polars, pyarrow); la nuestra, si está, manda.
+        for kv in kvs.iter().filter(|kv| kv.key == ARROW_KEY) {
+            for (col, z) in arrow_timezones(kv.value.as_deref().unwrap_or("")) {
+                if let Some(tz) = arrow_zone(&z) {
+                    zones.insert(col, tz);
+                }
+            }
+        }
+        for kv in kvs {
+            if kv.key == TZ_KEY {
+                if let Some(Ok(serde_json::Value::Object(o))) = kv.value.as_deref().map(serde_json::from_str::<serde_json::Value>) {
+                    for (col, z) in o {
+                        if let Some(tz) = z.as_str().and_then(arrow_zone) {
+                            zones.insert(col, tz);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let rows = reader.get_row_iter(None).map_err(|e| err(format!("{}: {}", F, e)))?;
     let mut out = Vec::new();
     for row in rows {
         let row = row.map_err(|e| err(format!("{}: {}", F, e)))?;
         let mut m = IndexMap::new();
         for (k, v) in row.get_column_iter() {
-            m.insert(k.clone(), field_to_syn(v));
+            let mut val = match (v, nanos.contains(k)) {
+                (Field::Long(ns), true) => {
+                    let (secs, sub) = (ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000) as u32);
+                    match chrono::DateTime::from_timestamp(secs, sub) {
+                        Some(dt) => SynValue::Time(Rc::new(Temporal::DateTime(dt.with_timezone(&synsema_core::temporal::UTC)))),
+                        None => SynValue::Nothing,
+                    }
+                }
+                (Field::Long(ns), false) if time_nanos.contains(k) => time_of_day(chrono::Duration::nanoseconds(*ns)),
+                _ => field_to_syn(v),
+            };
+            if let (Some(tz), SynValue::Time(t)) = (zones.get(k), &val) {
+                if let Temporal::DateTime(dt) = &**t {
+                    val = SynValue::Time(Rc::new(Temporal::DateTime(dt.with_timezone(tz))));
+                }
+            }
+            m.insert(k.clone(), val);
         }
         out.push(syn_map(m));
     }
@@ -157,7 +511,7 @@ fn kind_of(v: &SynValue, col: &str) -> Result<Option<ColKind>, Control> {
             )))
         }
         SynValue::Number(Number::Float(_)) => ColKind::Float,
-        SynValue::Number(Number::Decimal(d)) => ColKind::Decimal(d.scale()),
+        SynValue::Number(n @ (Number::Decimal(_) | Number::BigDec(_))) => ColKind::Decimal(n.exact_ratio().unwrap().1),
         SynValue::Text(_) => ColKind::Text,
         SynValue::Bool(_) => ColKind::Bool,
         SynValue::Bytes(_) => ColKind::Bytes,
@@ -194,7 +548,7 @@ fn merge_kind(a: ColKind, b: ColKind, col: &str) -> Result<ColKind, Control> {
     })
 }
 
-fn build_type(name: &str, k: ColKind) -> Result<Type, Control> {
+fn build_type(name: &str, k: ColKind, nanos: bool) -> Result<Type, Control> {
     let b = match k {
         ColKind::Int => Type::primitive_type_builder(name, PhysicalType::INT64),
         ColKind::Float => Type::primitive_type_builder(name, PhysicalType::DOUBLE),
@@ -206,18 +560,26 @@ fn build_type(name: &str, k: ColKind) -> Result<Type, Control> {
         ColKind::Bool => Type::primitive_type_builder(name, PhysicalType::BOOLEAN),
         ColKind::Bytes => Type::primitive_type_builder(name, PhysicalType::BYTE_ARRAY),
         ColKind::Date => Type::primitive_type_builder(name, PhysicalType::INT32).with_logical_type(Some(LogicalType::Date)),
-        ColKind::DateTime => Type::primitive_type_builder(name, PhysicalType::INT64).with_logical_type(Some(LogicalType::timestamp(true, TimeUnit::MICROS))),
+        ColKind::DateTime => Type::primitive_type_builder(name, PhysicalType::INT64).with_logical_type(Some(LogicalType::timestamp(
+            true,
+            if nanos { TimeUnit::NANOS } else { TimeUnit::MICROS },
+        ))),
     };
     b.with_repetition(Repetition::OPTIONAL).build().map_err(|e| err(format!("parquet_write: column {:?}: {}", name, e)))
 }
 
-fn decimal_bytes(d: &rust_decimal::Decimal, scale: u32) -> Vec<u8> {
-    let mut x = *d;
-    x.rescale(scale);
-    let unscaled = BigInt::from(x.mantissa());
-    let (sign, _) = unscaled.to_bytes_be();
-    let _ = sign == Sign::Minus;
-    unscaled.to_signed_bytes_be()
+/// El valor sin escala de un decimal (o entero) en la escala `scale` de la columna, en bytes
+/// big-endian con signo (el formato de Parquet). `None` si perdería dígitos o pasa de 38.
+fn decimal_bytes(n: &Number, scale: u32) -> Option<Vec<u8>> {
+    let (m, s) = n.exact_ratio()?;
+    if s > scale {
+        return None;
+    }
+    let unscaled = m * synsema_core::number::pow10_big(scale - s);
+    if unscaled.magnitude().to_string().len() > 38 {
+        return None;
+    }
+    Some(unscaled.to_signed_bytes_be())
 }
 
 fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
@@ -271,15 +633,96 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
         }
         maps.push(m);
     }
+    // Una columna que mezcla enteros y floats se escribe DOUBLE: un entero más allá de 2^53 no
+    // entra exacto en un float y se redondearía en silencio.
+    for (name, k) in &cols {
+        if *k != Some(ColKind::Float) {
+            continue;
+        }
+        for (i, m) in maps.iter().enumerate() {
+            if let Some(SynValue::Number(Number::Int(n))) = m.get(name) {
+                if n.unsigned_abs() > 1u64 << 53 {
+                    return Err(err(format!(
+                        "{}: column {:?}, row {}: the integer {} does not fit a float exactly, and the column mixes integers and floats (it is written as DOUBLE) — convert the column to decimal or to text",
+                        F,
+                        name,
+                        i + 1,
+                        n
+                    )));
+                }
+            }
+        }
+    }
     let mut fields = Vec::with_capacity(cols.len());
+    let mut ns_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (name, k) in &cols {
         // Una columna toda `nothing` se escribe como texto opcional (todo nulo).
-        fields.push(Arc::new(build_type(name, k.unwrap_or(ColKind::Text))?));
+        // Una columna de datetimes va en microsegundos (lo más compatible, 290 000 años de
+        // rango) salvo que algún valor tenga nanosegundos: entonces en NANOS (como polars),
+        // para que la ida y vuelta no los pierda — si todos entran en su rango (1677–2262).
+        let nanos = *k == Some(ColKind::DateTime) && {
+            let vals = maps.iter().filter_map(|m| match m.get(name) {
+                Some(SynValue::Time(t)) => match &**t {
+                    Temporal::DateTime(dt) => Some(dt.clone()),
+                    _ => None,
+                },
+                _ => None,
+            });
+            let mut any_sub_micro = false;
+            let mut all_fit = true;
+            for dt in vals {
+                if dt.timestamp_subsec_nanos() % 1000 != 0 {
+                    any_sub_micro = true;
+                }
+                if dt.timestamp_nanos_opt().is_none() {
+                    all_fit = false;
+                }
+            }
+            any_sub_micro && all_fit
+        };
+        if nanos {
+            ns_cols.insert(name.clone());
+        }
+        fields.push(Arc::new(build_type(name, k.unwrap_or(ColKind::Text), nanos)?));
     }
     let schema = Arc::new(
         Type::group_type_builder("schema").with_fields(fields).build().map_err(|e| err(format!("{}: {}", F, e)))?,
     );
-    let props = Arc::new(WriterProperties::builder().set_compression(compression).build());
+    // La zona de cada columna de datetimes (si todos sus valores comparten una): Parquet guarda
+    // el instante en UTC; la zona viaja en los metadatos y `parquet_read` la devuelve.
+    let mut tzs = serde_json::Map::new();
+    for (name, k) in &cols {
+        if *k != Some(ColKind::DateTime) {
+            continue;
+        }
+        let mut zone: Option<String> = None;
+        let mut same = true;
+        for m in &maps {
+            if let Some(SynValue::Time(t)) = m.get(name) {
+                if let Temporal::DateTime(dt) = &**t {
+                    let z = dt.timezone().name().to_string();
+                    match &zone {
+                        None => zone = Some(z),
+                        Some(prev) if *prev != z => same = false,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let (true, Some(z)) = (same, zone) {
+            if z != "UTC" {
+                tzs.insert(name.clone(), serde_json::Value::String(z));
+            }
+        }
+    }
+    let mut pb = WriterProperties::builder().set_compression(compression);
+    if !tzs.is_empty() {
+        pb = pb.set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(
+            TZ_KEY.to_string(),
+            serde_json::Value::Object(tzs).to_string(),
+        )]));
+    }
+    let props = Arc::new(pb.build());
     let mut buf: Vec<u8> = Vec::new();
     {
         let mut w = SerializedFileWriter::new(&mut buf, schema, props).map_err(|e| err(format!("{}: {}", F, e)))?;
@@ -289,6 +732,20 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
             let vals: Vec<&SynValue> = maps.iter().map(|m| m.get(name).unwrap_or(&SynValue::Nothing)).collect();
             let defs: Vec<i16> = vals.iter().map(|v| if matches!(v, SynValue::Nothing) { 0 } else { 1 }).collect();
             let present = vals.iter().filter(|v| !matches!(v, SynValue::Nothing));
+            // Parquet guarda un decimal con precisión 38 como máximo: uno más largo es error, no
+            // un valor vacío.
+            if let ColKind::Decimal(s) = kind {
+                for v in vals.iter() {
+                    if let SynValue::Number(n) = v {
+                        if decimal_bytes(n, s).is_none() {
+                            return Err(err(format!(
+                                "{}: column {:?}: the decimal {} does not fit in Parquet's decimal(38, {}) — store the column as text (text(x))",
+                                F, name, n, s
+                            )));
+                        }
+                    }
+                }
+            }
             let mut col = rg
                 .next_column()
                 .map_err(|e| err(format!("{}: {}", F, e)))?
@@ -312,9 +769,8 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
                         .map(|x| match (x, kind) {
                             (SynValue::Text(t), _) => ByteArray::from(t.as_bytes().to_vec()),
                             (SynValue::Bytes(b), _) => ByteArray::from(b.to_vec()),
-                            (SynValue::Number(Number::Decimal(d)), ColKind::Decimal(s)) => ByteArray::from(decimal_bytes(d, s)),
-                            (SynValue::Number(Number::Int(i)), ColKind::Decimal(s)) => {
-                                ByteArray::from(decimal_bytes(&rust_decimal::Decimal::from(*i), s))
+                            (SynValue::Number(n), ColKind::Decimal(s)) if n.exact_ratio().is_some() => {
+                                ByteArray::from(decimal_bytes(n, s).unwrap_or_default())
                             }
                             (other, _) => ByteArray::from(other.to_string().into_bytes()),
                         })
@@ -335,9 +791,11 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
                     cw.write_batch(&v, Some(&defs), None).map_err(werr)?;
                 }
                 (ColumnWriter::Int64ColumnWriter(cw), ColKind::DateTime) => {
+                    let ns = ns_cols.contains(name);
                     let v: Vec<i64> = present
                         .map(|x| match x {
                             SynValue::Time(t) => match &**t {
+                                Temporal::DateTime(dt) if ns => dt.timestamp_nanos_opt().unwrap_or(0),
                                 Temporal::DateTime(dt) => dt.timestamp_micros(),
                                 _ => 0,
                             },
@@ -357,6 +815,6 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
 }
 
 pub fn register_parquet_builtins(interp: &Interpreter) {
-    interp.register_builtin("parquet_read", 1, Rc::new(|_i, a, _l| parquet_read(a)));
+    interp.register_builtin("parquet_read", -1, Rc::new(|_i, a, _l| parquet_read(a)));
     interp.register_builtin("parquet_write", -1, Rc::new(|_i, a, _l| parquet_write(a)));
 }

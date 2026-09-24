@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.29 — unreleased
+## v0.6.29 — 2026-09-24
 
 Everything that had to break before v1.0, broken once (after v1.0 nothing breaks), plus EVM
 contract deployment and events, and the start of data analysis (tables, dates, seeded randomness,
@@ -19,7 +19,16 @@ Parquet, lineage). Old names keep working as deprecated aliases until v1.0:
   give a logical copy: `set ys[0] to 9` changes only `ys`, and a task that `set`s inside a map it
   received no longer changes the caller's. **What to write instead:** `give` the map back (that is
   how a change leaves a task). Shared state stays explicit: blackboard, memory, bus, `state_*`.
-  Modules are namespaces, not values: `set mod.STATE[k] to v` still writes the module's state.
+  Modules are namespaces, not values: an exported variable is ONE variable, seen the same by the
+  module's tasks and by `mod.STATE` (`set mod.STATE[k] to v` writes it, `set mod.X to v` rebinds it);
+  `let snap be mod.STATE` is a snapshot — through every alias, a re-export (`export let L be mod`),
+  a module kept in a map, `parallel_map` and `serve`. A module gains no names from outside and its
+  tasks are not replaceable (`set mod.f to …` and `set mod["f"] to …` are errors). The common idioms
+  stay O(1) per step: `set xs to append(xs, v)`, `xs + [...]`, `insert(xs, i, v)`, `merge(m, …)` and
+  `set m[k] to v` write in place, also through a path (`set s.items to append(s.items, v)`).
+- **A `set` target starts from a variable**: `set get(m, "a")["b"] to 1` is an error (with value
+  semantics it either wrote a throwaway copy or leaked into shared data). **What to write instead:**
+  the path from the variable, `set m["a"]["b"] to 1`.
 - **Strict arity** for calls written in the program: a missing parameter without default or an
   extra argument is an error (`task 'f' takes 1 argument, got 3`, `append() takes at most 2
   arguments, got 3`). Before, extras were dropped silently (`append([1], 2, 3)` lost the 3,
@@ -32,40 +41,136 @@ Parquet, lineage). Old names keep working as deprecated aliases until v1.0:
 - **Integer vs float comparison is exact**: `2**53 + 1 == 9007199254740992.0` is `false`.
 - **A non-integer index, position or step is an error** (`xs[1.7]`, `range(0, 2.5)`); `2.0` is fine.
 - **Text + `nothing`/list/map/bytes is an error** (was `"xnothing"`); text + number/bool still joins.
+  A template hole takes any value, like an f-string: `` `xs={xs} n={nothing}` `` → `xs=[1, 2] n=nothing`.
 - **Inside lists and maps, text is shown quoted**: `print(["1", 1])` → `["1", 1]`.
-- **`--` glued to a value is a lexer error** (`5--1` used to be `5` plus a comment).
+- **`--` glued to a value and followed by a number or `(` is a lexer error** (`5--1` and `x--(y)` used
+  to be a value plus a comment: a silent arithmetic result). Followed by anything else it is still a
+  comment, as in v0.6.28: `print(1)--note`, `x--note`, `"a"--note`. Inside
+  parentheses, `print(x --1)` is a lexer error that points at `x - -1` (as a comment it would swallow
+  the `)`); it fires only when a value comes before on the same line, a digit or `(` comes after, the
+  innermost bracket is `(` and its closing `)` is on that same line. Any other `--` is a comment, as
+  always: `"a": 1,  --TODO` in a multiline map or list, or `4 --note` in a call that spans lines,
+  keeps working.
 - **`sort_by` orders totally or errors** (it silently left mixed or NaN lists as they came);
   `nothing` and NaN go last; `min`/`max` skip `nothing` and propagate NaN.
-- **`fmt` errors on a `{name}` without a value** (it was left in the text).
+- **`fmt` errors on a `{name}` without a value** (it was left in the text). `{a.b}` reads the key
+  `"a.b"` if the map has it, else the field `b` of the map `a`; `{ x }` with spaces, and `{obj.prop}`
+  when the map has no `obj`, stay literal (CSS and JavaScript in a template are safe). Text between
+  braces that is EXACTLY a key of the map is always replaced, whatever its shape
+  (`fmt("[{0}] {a-b}", {"0": "z", "a-b": 1})` → `[z] 1`). Otherwise a hole is a name that starts with
+  a letter or `_` (dots between names): regex quantifiers such as `{3}` and `{3,5}`, `{}` and `{a..b}`
+  stay literal — `fmt("^[0-9]{3}-{n}$", {"n": 1})` → `^[0-9]{3}-1$`.
 - **`solana_tx` and `algorand_tx` now BUILD** (they were `solana_message` / `algorand_tx_encode`);
   assembling the signed transaction is `solana_tx_raw` / `algorand_tx_raw`. The old two-argument
   call errors pointing there.
-- `while` has no iteration cap (was 1,000,000); `print` under `synsema run` is written immediately.
+- **`json_decode("1e400")` is an error** (it gave infinity, which JSON cannot carry back); integers of
+  more than 4300 digits are an error in `json_decode`/`jsonl_decode`/`int(text)`/`number(text)` (the
+  Python limit: converting them is quadratic, so a hostile document could buy minutes of CPU).
+- **`int("ff", 16)` is an error that says why** (any whole number 2..36 as the second argument of
+  `int`, whatever the first argument is — the result never depends on the data): that argument is the
+  fallback, not the base. **What to write instead:**
+  `int("ff", base = 16)`, or name a numeric fallback: `int(text, fallback = 10)`.
+- **Float `//` and `%` are CPython's**: `7 // 0.1` is 69.0 and `7 % 0.1` is 0.09999999999999962 (they
+  were 70.0 and 0.0); arrays too, as numpy.
+- **Number literals take `_` only between digits** (`1_000`, `0x_ff`): `1__0`, `1_`, `1_.5`, `1e3_`
+  are lexer errors, as in Python (`1__0` was 10 and `1_` was 1).
+- **`\uXXXX` and `\u{1F600}` in a string are escapes** (`"\u00e9"` is `"é"`; a surrogate pair
+  `"\uD83D\uDE00"` is one character); before, the six characters stayed as written. `synsema check`
+  flags every literal that uses one. **What to write instead:** `"\\u00e9"` for a literal backslash + u.
+  Anything that is not a complete escape stays literal (`"C:\users"`, `"\u12"`), `\x` is NOT an escape
+  (`"C:\build\x64"` and the regex `"a\x2eb"` are unchanged), and inside a backtick only the four-digit
+  form is one — `` `x\u{a}y` `` still interpolates `a`.
+- **`decimal` has arbitrary precision and a stable type** (the best of Java's `BigDecimal`,
+  Postgres `numeric`, Python `decimal` and Julia's promotion rules):
+  - `+`, `-`, `*`, `//`, `%`, `**` with an integer exponent and every comparison are EXACT at any size.
+    `1d + 10**30` is the decimal 1000000000000000000000000000001, `1d < 10**30` is true, and
+    `1.1d ** 30` has its 30 decimals. Before, a result past 28 digits turned into a float.
+  - `/` and `std` round to 28 SIGNIFICANT digits, half to even (Python's default context), never cutting
+    the integer part (like Postgres). `0.00000000000000000001d / 10000000000d` is 1e-30 exactly; it was
+    `0`, because the old decimal only had 28 places after the point.
+  - A decimal operation always gives a decimal; it never turns into a float or an integer depending on the
+    value. Literals, `decimal(text)`, CSV `decimal` columns, Parquet decimal columns and Postgres
+    `numeric` take any number of digits (up to 4300 in text). A Parquet decimal of more than 28 digits
+    used to come back as text.
+  - `floor`, `ceil`, `round` and `trunc` of a decimal give the exact integer. They returned the decimal
+    unchanged.
+- **A decimal compared with a float is an error wherever they really meet**, as `1d == 1.0` already
+  was: inside lists and maps (`[1d] == [1.0]`), in `in`, `match` value patterns, `contains` and
+  `index_of` (`contains([1.5d], 1.5)` was a silent `false`; a `match` fell to `otherwise`), and as a
+  key of `group_by`, `unique`, `join`… (details under Added). Integers mix freely (`[1d] == [1]` is
+  `true`). **What to write instead:** convert first, `decimal(x)` or `float(x)`.
+- **`join(xs, sep)` with `nothing`, a list or a map inside is an error** (it wrote "a,nothing"), and
+  text + a task is an error like text + a list.
+- `while` has no iteration cap (was 1,000,000); `print`, `log` and `show` under `synsema run` are
+  written immediately, in order.
 
 ### Added
 
-- **Numbers:** `int(x)` / `int(x, default)` (exact; decimal, `0x…`, `0b…`), the floor-division
+- **Numbers:** `int(x)` / `int(x, default)` / `int(text, base = b)` (exact; decimal, `0x…`, `0b…`,
+  a sign before `0x`), the floor-division
   operator `//` (exact for integers of any size), `hex(x)` (quantity for integers, data for bytes),
   literals `0x1f18`, `0b101`, `1e-9`, `json_decode` keeps integers of any size exact,
   `bytes(s, "hex")` accepts `0x`, `is_integer`/`is_text`/`is_list`/`is_map`.
 - **Syntax:** `in` / `not in`, chained comparisons (`1 < x <= 10`), negative indexes (`xs[-1]`),
   text indexing (`s[0]`), any word as a member after `.` (`ev.type`, `tx.to`), `each` over maps
-  (keys), text (characters) and bytes.
-- **Maps and order:** `get(m, k, default)`, `remove`, `merge`, `items`, `sort(xs, desc = true)`,
+  (keys), text (characters) and bytes, a trailing comma in calls, as in lists and maps.
+- **Maps and order:** `insert(xs, i, v)`, `get(m, k, default)`, `remove`, `merge`, `items`, `sort(xs, desc = true)`,
   `sort_by(xs, key, desc = true)`, `index_of` on text, `min`/`max` on text.
 - **Renamed** (old names are deprecated aliases): `replace_text`→`replace`,
   `find_all`→`regex_find_all`, `capture`→`regex_capture` (always a list or `nothing`),
   `replace_re`→`regex_replace`, `fold`→`fold_text`, `eye`→`identity`, `hmac_sha256`→`hmac` (bytes).
 - **Blockchain, `<family>_<action>`:** `eth_*`/`tx_eip1559*` → `evm_*` (`evm_tx`, `evm_tx_raw`,
   `evm_send`, `evm_wait`, `evm_balance`, …), `solana_confirm`→`solana_wait`,
-  `algo_address`→`algorand_address`. New: `evm_tx_create` (contract deployment; `evm_tx_raw`
-  verifies the signer is `from`), `evm_create_address`, `evm_create2_address`, `evm_signature`
+  `algo_address`→`algorand_address`. New: `evm_tx_create` (contract deployment), `evm_tx_raw` checks
+  what is signed (it recomputes the digest from `fields`, every echoed field must match `fields`, a
+  creation must carry `from`, the signer must be `from` and `contract_address` is re-derived — a map
+  edited after `evm_tx` is refused), `evm_create_address`, `evm_create2_address`, `evm_signature`
   (v = 27/28 for wallets and `ecrecover`), `secp256k1_recover` accepts v = 27/28,
-  `evm_block_number`, block parameters accept the node's `0x…` quantity, `evm_logs`,
+  `evm_block_number`, block parameters accept the node's `0x…` quantity (also in
+  `evm_estimate_gas(url, tx, block?)` and `evm_fee_history(url, blocks?, percentiles?, newest?)`), `evm_logs`,
   `abi_event_topic`, `abi_decode_log`, `abi_encode(types, values)` without selector (constructor
   arguments), `evm_address` of 20 raw bytes.
-- **Errors that speak Python:** `return x`, `x = 1`, `if x:`, `len(xs)`, `None`, `xs.append(y)` and
-  friends get the Synsema form in the message.
+- **Errors that speak Python:** `return x`, `x = 1`, `x += 1`, `if x:`, `len(xs)`, `None`,
+  `xs.append(y)`, `d.get(k)`, `f"…"`, `lambda y: y`, `x is None`, `a if c else b`, `xs[1:]`,
+  `type(x)`, `"%d" % x` and friends get the Synsema form in the message.
+- **HTTP:** a URL with `user:pass@` sends `Authorization: Basic` (as curl and requests do); a URL with
+  a query and no path, IPv6 hosts and fragments work; `Host` carries a non-default port. A URL
+  without a host is an error that does not echo the URL, and `require net("https://u:p@api.x.com/v1")`
+  is stored as `net("api.x.com")`: credentials never reach a message or the audit. An EXPLICIT port is
+  part of the grant: `require net("http://localhost:8545")` is `net("localhost:8545")` and covers only
+  that port (v0.6.28 did not take a URL as a grant at all); `net("localhost")` still covers any port,
+  and `[::1]:8545` works.
+- **Strings and numbers:** the `\u` escapes above; octal literals `0o17`; `number("1_000.5")`. A decimal
+  with a float is an error also inside lists when a comparison meets them at the same position
+  (`sort([[1.5d], [1.0]])`; `sort([[1d, 1.5], [2d, 2.5]])` sorts fine) and as a `join` key (they never
+  match — it returned `[]`). The same error, `cannot mix decimal and float`, whenever a decimal and a
+  float are really compared: in `x in list` (item by item: `1.5 in [1.5d]` is an error,
+  `"a" in ["a", 1.5, 1d]` is `true`), and in `group_by`, `count_by`, `summarize`, `unique`, `mode`,
+  `pivot` and `n_unique_of` when two keys land on the same number (`unique([1.5d, 1.5])` gave both;
+  `unique(["a", 1.5, 1d])` is fine, 1.5 and 1 never meet). NaN does not count. `match` value patterns,
+  `contains` and `index_of` follow the same rule (`contains([1.5d], 1.5)` was a silent `false`; a
+  `match` fell to `otherwise`). Every equality stops at the first difference: `["a", 1d] == ["b", 1.0]`
+  is `false`, and two maps with different keys are `false`. `==` on lists and maps
+  compares item by item with the same rule — `[1d] == [1.0]` and `{"a": 1d} == {"a": 1.0}` are the
+  error of `1d == 1.0` (they were `false` in silence), `[1d] == [1]` is `true`, and `in` compares
+  the same way.
+- **More Python/pandas reflexes:** `else`/`pass`/`break`/`continue` on their own line, `c ? a : b`,
+  comprehensions, `round(x, 2)`, `x --1` inside parentheses, `dropna`/`fillna`/`groupby`/`value_counts`.
+- An engine panic reports itself as an internal error with its message (it blamed a stack overflow).
+- Clearer errors: `if (x > 0)` with an indented body says `if` is not a Synsema statement (use
+  `when`) instead of `Unexpected token: INDENT` on the next line; an error inside a template hole
+  points at the hole (it said 1:1); SQLite's own texts are rewritten — a statement that returns rows
+  in `sql_exec`/`sql_batch`, and `the statement has 1 parameter(s) but 0 value(s) were passed`.
+  `synsema check` no longer says a glob `require file.read("./*")` misses `read_file("./x.csv")`.
+- **Fixed:** `btc_rpc` against a real Bitcoin Core failed with an empty `RPC error:` — JSON-RPC 1.0 sends
+  `"error": null` in every good answer. On SQLite, `sql_exec` refuses a `RETURNING`
+  statement before running it (SQLite had already written the row); the word inside a string or a
+  comment does not count. Postgres and MySQL run it as before and return the count. `sql_batch` does
+  the same check before running any row (it wrote the first one and then failed).
+  `abi_decode_log` refuses two inputs that would get the same name (one value was lost), `evm_logs` a
+  filter with more than 4 topics, `evm_create_address` a nonce of 2^64 − 1 or more (EIP-2681).
+  `synsema code caps` reads `require net(<url>)` as its host (and its port, when the URL has one), like
+  the runtime. `except`/`catch` after a `try` and `finally` name the Synsema form.
 
 **Breaking, on purpose (data).**
 
@@ -78,33 +183,125 @@ Parquet, lineage). Old names keep working as deprecated aliases until v1.0:
 - **`dot` is the inner product of two vectors only**; for matrices use `matmul(a, b)`.
 - **Reductions skip `nothing` and propagate NaN** (`mean([1, nothing, 3])` is 2.0; `median` no longer
   errors on NaN, it returns NaN).
-- **An empty CSV field is `nothing`** (was `""`).
+- **An empty CSV field is `nothing`** (was `""`); a quoted `""` is empty text, and `csv_encode` writes
+  them apart, so a round trip is exact. `synsema check` warns about `x == ""` in a program that reads CSV.
+  A blank line is always skipped when reading, also in a one-column CSV (like Python `csv` and pandas):
+  `csv_parse("x\n1\n\n2\n")` has 2 rows. So a row whose only field is `nothing` is written `""`, as
+  Python's writer does — the one case where the round trip does not tell `nothing` from `""`: in a
+  one-column CSV a missing value comes back as empty text (or `nothing` if the column has a type), and
+  `csv_encode` warns once on stderr. For an exact round trip with any number of columns,
+  `csv_encode(rows, {"missing": "NA"})` writes each `nothing` as `NA` without quotes (pandas'
+  `na_rep`) and quotes a text that equals the mark; read it back with `{"missing": ["NA"]}`. An empty
+  mark is an error (an empty field already reads as `nothing`, and in one column it would be a blank
+  line that reading skips).
+  A quote left open in a CSV whose lines end in `\r` (old Mac) is an error with the right line, like
+  `\n` and `\r\n` (it was read to the end of the text in silence).
+- **A column name that no row has is an error** in `group_by`, `summarize` aggregates (`sum_of("vv")`),
+  `join` and `pivot` (a misspelling summed to 0); an aggregate named like a key column, or two pivot
+  values that would become the same column, are errors instead of overwriting.
+- **`polyfit` errors when the data does not determine the fit** (fewer distinct x than degree + 1);
+  numpy only warns.
 - **`round_to` rounds a float's real binary value, like Python** (`round_to(2.675, 2)` is 2.67) and keeps
   decimals decimal.
 - `format_time`, `parse_time` and `date_parts` no longer require `time` (they don't read the clock).
+- **Fixed:** `format_time` with an unknown specifier (`%Q`), or with one the value does not have (`%H`
+  of a `date`), crashed the engine and `try` could not catch it. Now it is an error that names it:
+  `format_time: "%Q" is not a strftime specifier (…)`.
 
 ### Added (data)
 
 - **Tables** (lists of maps): `summarize(rows, by, aggs)` with `sum_of`, `mean_of`, `min_of`, `max_of`,
   `median_of`, `quantile_of`, `first_of`, `n_unique_of`, `count()`; `count_by`; `join(left, right, on,
-  how?)` (inner/left/outer); `pivot(rows, index, columns, values, agg?)`; `is_missing`,
-  `fill_missing`, `drop_missing`, `fill_nan`; `mode`.
+  how?)` (inner/left/right/outer/semi/anti, by hash, every output row with every column);
+  `pivot(rows, index, columns, values, agg?)`; `is_missing`, `fill_missing`, `drop_missing`,
+  `fill_nan`; `mode`; `count(xs)` (present values) and `count_missing(xs)`. A column is checked
+  against the whole table (ragged rows are fine; a name no row has is an error); `join` refuses an
+  output name that already exists (not in `semi`/`anti`, which add no right columns). Keys follow `==`: maps with
+  the same entries in another order, the same instant in another zone, `1` and `1.0` are one group;
+  the text `"1"` is another; NaN is one group. `unique`, `mode` and `n_unique_of` are linear.
 - **Reductions:** named `axis =` and `ddof =`, `quantile(values, q)`, decimals kept, `min`/`max` on
   dates. **Arrays:** elementwise math, `**`/`//`/`%`, `length`, negative index, `slice`, `apply`,
-  `where` as a mask, `concat`, `stack`, `argmin`, `argmax`, `cumsum`, `diff`. **Statistics:** `corr`,
-  `cov`, `lstsq`, `polyfit`, `polyval`.
-- **Seeded randomness, pure:** `let g be rng(42)`, `g()`, `random(g)`, `random_int(g, lo, hi)`,
-  `random_normal(g, mean =, std =)`, `shuffle`, `sample`, `choice` — PCG64, the same sequence on every
-  platform, allowed under `--deterministic`.
-- **Dates as types:** `date`, `datetime` (IANA zones, DST-correct) and `duration`, with arithmetic,
-  comparison, `add_days`, `add_months`, `truncate`, `date_range`, `to_timezone`, `timestamp`,
-  `in_units`, `parse_date`, `parse_datetime`; JSON and CSV write them as ISO 8601.
+  `where` as a mask, `concat`, `stack`, `argmin`, `argmax` (a list skips `nothing`), `cumsum`, `diff`.
+  **Statistics:** `corr`, `cov`, `lstsq` (numpy's: SVD, minimum norm, works rank-deficient),
+  `polyfit`, `polyval`. `median`, `var`, `std`, `quantile` and `percentile` of decimals (with integers of
+  any size) are computed exactly, like Python's `statistics`, and are always decimals — exact when the
+  result terminates, else 28 significant digits (`std` of decimals that differ by 1e-15 is
+  `0.000000000000001527525231651946668862682398`, never `0`).
+- **Seeded randomness, pure — the same numbers as numpy:** `rng(s)` is `numpy.random.default_rng(s)`
+  bit for bit (SeedSequence + PCG64): `g()`/`random(g)`, `random_int(g, lo, hi)` (=
+  `integers(lo, hi + 1)`), `random_normal(g, mean =, std =)` (numpy's ziggurat), `shuffle`
+  (`permutation`), `choice`, `sample` (`choice(…, replace=False)`) and `rng_spawn(g, n)` (`spawn`) —
+  verified value by value against numpy 2.2. A generator is a process, like numpy's: `let h be g` is
+  the same stream; `rng_spawn` gives independent ones, and they travel to `parallel_map` workers,
+  which hand back how far they advanced (as `apply` would: using `g` or the children again continues
+  the sequence). Passing the SAME generator to two items (at any depth), or using a top-level
+  generator — by name, inside a global map or list — inside a worker or a `serve` request, is an
+  error (numpy silently repeats the sequence).
+  Allowed under `--deterministic`.
+- **Dates as types:** `date`, `datetime` (an IANA zone, DST-correct, or a fixed offset) and `duration`,
+  with arithmetic,
+  comparison, `add_days`, `add_months`, `truncate`, `date_range` (by `"second"`, `"minute"`, `"hour"`
+  — elapsed time — or by a calendar unit or a duration), `to_timezone`, `timestamp`,
+  `in_units`, `parse_date`, `parse_datetime`; JSON and CSV write them as ISO 8601. Calendar steps keep
+  the local time across a DST change, a day without midnight starts when it starts (01:00), a day
+  that never existed is skipped by `date_range` instead of repeating the next one (Pacific/Apia,
+  30/12/2011), and
+  truncating or adding days/months inside the repeated hour keeps which of the two it was
+  (`add_days(t, 0)` is `t`); a day whose midnight repeats is one day. **An offset is kept**, as in
+  Python, java.time, Temporal, Arrow and pandas: `datetime("2026-09-24T02:00:00+05:30")` prints as
+  such, `date_parts` gives hour 2 and zone `"+05:30"`, and calendar operations use that local time
+  (equality and order are by instant); `+0530` reads too, and a zone can be a fixed offset anywhere
+  (`to_timezone(t, "-03:00")`, `parse_datetime` with `%z`). RFC 9557 as in Temporal:
+  `…T10:00:00[Asia/Kolkata]` is 10:00 local time there (a DST gap → error), and an offset that does
+  not match its bracketed zone → error.
 - **Formats:** `csv_parse(text, {"types": {...}})` (int/float/decimal/text/bool/date/datetime per
-  column), `jsonl_encode`/`jsonl_decode`, `parquet_read`/`parquet_write` (read and written by polars in
-  tests; zstd/snappy/gzip/lz4; not in the wasm build).
-- **Lineage:** the engine records every input the program reads (path, host, the hash of a query,
-  stdin) with the sha256 of what it received; `lineage()` lists it and `receipt()` publishes it as
-  `inputs`, so a signed receipt proves which inputs, which program and which output.
+  column) and `{"missing": ["NA", "NULL"]}` (those texts, unquoted, are `nothing` — polars'
+  `null_values`; a quoted `"NA"` stays text); a `float` column refuses `1e400` (it was infinity) and
+  reads `nan`/`inf` written as such; an integer of more than 4300 digits is an error, as in `int()`;
+  the delimiter cannot be the quote or a line end. `csv_encode(rows, {"escape_formulas": true})`
+  prefixes `'` to a text that starts with `=`, `+`, `-`, `@`, tab or CR, so Excel and Sheets show it
+  instead of running it (OWASP "CSV injection"; off by default because it changes the data).
+  `jsonl_encode`/`jsonl_decode`, `parquet_read`/`parquet_write` (read and written by polars in
+  tests; zstd/snappy/gzip/lz4; a datetime column keeps its zone, also the zone polars and pyarrow
+  write in the Arrow schema (`ARROW:schema`), a fixed offset such as `+05:30` included; nanoseconds
+  are read and written; a file with two columns of the same name is an error, and so is writing an
+  integer beyond 2^53 in a column that mixes integers and floats (it would be rounded to a DOUBLE); a
+  `TIME` column (time of day) reads as a `duration` since midnight, in ms, µs or ns (polars writes ns;
+  it came back as a bare integer);
+  a file that would expand past its caps — a page over 256 MiB, max(1 GiB, 64 × the file), 50 million
+  cells — is refused before allocating, `{"max_cells": n, "max_bytes": n}` raises them; not in the
+  wasm build). `json_decode` skips a BOM and reads the `NaN`/`Infinity` that `json_encode` writes only
+  when asked — `json_decode(text, allow_nan = true)` (also `jsonl_decode`); by default they are an
+  error, because a NaN passes every `amount <= 0` check;
+  raw RPC answers (`evm_rpc`, `solana_rpc`, `btc_rpc`, algod) keep integers beyond 64 bits exact.
+- **Lineage:** the engine records every input the program reads — files, directory listings, `grep`,
+  Parquet, stdin and the terminal, HTTP, SQL/Mongo/Redis reads, `recall`, chain nodes (EVM, Solana,
+  Algorand, Bitcoin), sockets and processes, and every model answer (`reason`/`decide`/`analyze`/
+  `generate`) and what `run`/`run_program` return — with the sha256 of what it received and its
+  `encoding` — `"text"` (utf-8), `"bytes"`, `"jcs"` (`canonical_json(x)`), `"json"` (`json_encode(x)`,
+  for integers beyond 2^53 or NaN) or `"display"` (the printed form, for what neither can carry) — so
+  anyone recomputes it; `lineage()` lists it and `receipt()` publishes it as `inputs`, so a signed receipt
+  proves which inputs, which program and which output. A host is published without credentials,
+  path or query; a read that never arrived is not an input.
+  - **The receipt never carries data.** An input's `what` is only a path the program passed as text,
+    a host, a salted commitment or a size: `parquet_read(bytes)` records `bytes <n>` (not the file's
+    first bytes), `grep` the target and never the pattern, and a host comes only from the CONNECTION —
+    the URL of `http_*`/`fetch` or the node of a chain reader — with a network scheme (`http`, `https`,
+    `ws`, `wss`): a `://` inside a SQL query, a redis or Mongo key, or a `recall` category such as
+    `"session://TOKEN"` is data, not a host, and only its salted commitment is published.
+  - **Queries and prompts are salted commitments**, like SD-JWT disclosures. This covers a SQL query, a
+    Mongo filter, `run` arguments, an RPC call and a model prompt.
+  - The receipt publishes `query sha256-salted:<hex>` = `sha256(salt ‖ canonical_json([args…]))`, with a
+    fresh 128-bit salt per entry. Nobody can recover the query by hashing guesses (a plain sha256 of
+    `run("id", "-u")` can be recovered that way).
+  - The salt stays in the local `lineage()` (`salt`, `committed_encoding`) and never in the receipt.
+    With it, the owner can later reveal one query and anyone can check it:
+    `hex(sha256(bytes(salt, "hex") + bytes(canonical_json(args), "utf8")))`.
+  - Redis counters (`redis_incr`, `redis_incrby`, `redis_decr`, `redis_hincrby`) are inputs too.
+- **`synsema check`** also warns about `each r in rows` + `set r[…]` (it changes the loop's copy):
+  it warns when the write is lost, even if the loop reads other fields to compute it
+  (`set r["total"] to r["p"] * 2`, `when r.p > 1`), and stays quiet when `r` leaves the loop whole
+  (passed, appended, printed) or a field the loop wrote is read afterwards.
 
 
 ## v0.6.28 — 2026-09-22

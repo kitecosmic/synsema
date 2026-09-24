@@ -535,6 +535,9 @@ pub enum SendValue {
     Private(Vec<String>, Box<SendValue>),
     /// Fecha / instante / duración (v0.6.29): chrono es `Send`, cruza tal cual.
     Time(crate::temporal::Temporal),
+    /// Un generador de `rng()`/`rng_spawn()` (v0.6.29): cruza su ESTADO (una copia, como un
+    /// generador de numpy que se pasa a otro proceso). Del otro lado vuelve a ser un generador.
+    Rng(Option<Box<crate::rng::Generator>>, String),
 }
 
 /// Snapshot de un `SynValue` a `SendValue` (deep copy). Task/Builtin no cruzan: se
@@ -549,7 +552,14 @@ pub fn to_send(v: &SynValue) -> SendValue {
         SynValue::Map(m) => {
             SendValue::Map(m.borrow().iter().map(|(k, v)| (k.clone(), to_send(v))).collect())
         }
-        SynValue::Task(_) | SynValue::Builtin(_) => SendValue::Text(v.to_string()),
+        SynValue::Builtin(b) => match crate::rng::snapshot(b) {
+            // Snapshot de GLOBALES (serve, workers): un generador de nivel superior no cruza como
+            // copia que repite la secuencia; cruza como un aviso que dice qué hacer.
+            Some(_) if crate::rng::stubbing_globals() => SendValue::Rng(None, b.name.clone()),
+            Some(g) => SendValue::Rng(Some(Box::new(g)), b.name.clone()),
+            None => SendValue::Text(v.to_string()),
+        },
+        SynValue::Task(_) => SendValue::Text(v.to_string()),
         // Los valores del servidor casi nunca cruzan el blackboard; se degradan a
         // un snapshot map-like (o texto para paged).
         SynValue::Server(s) => match &**s {
@@ -635,6 +645,8 @@ pub fn from_send(v: &SendValue) -> SynValue {
             crate::labels::mark(from_send(inner), crate::labels::label_from(principals))
         }
         SendValue::Time(t) => SynValue::Time(Rc::new(t.clone())),
+        SendValue::Rng(Some(g), name) => crate::rng::restore((**g).clone(), name.clone()),
+        SendValue::Rng(None, name) => crate::rng::top_level_stub(name),
     }
 }
 
@@ -647,6 +659,7 @@ impl fmt::Display for SendValue {
             SendValue::Bool(b) => write!(f, "{}", if *b { "true" } else { "false" }),
             SendValue::Number(n) => write!(f, "{}", n),
             SendValue::Time(t) => write!(f, "{}", t),
+            SendValue::Rng(_, name) => write!(f, "builtin:{}", name),
             SendValue::Text(s) => write!(f, "{}", s),
             SendValue::List(items) => {
                 let parts: Vec<String> = items.iter().map(|v| v.to_string()).collect();

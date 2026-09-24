@@ -66,6 +66,26 @@ fn int_kw(v: SynValue, what: &str, who: &str) -> Result<i64, Control> {
     }
 }
 
+thread_local! {
+    /// El nivel EXACTO (como decimal) del `quantile`/`percentile` en curso, para el camino
+    /// decimal: `percentile(d, 90)` interpola con 0.9 exacto, no con 90.0/100 en f64.
+    static EXACT_LEVEL: std::cell::Cell<Option<rust_decimal::Decimal>> = const { std::cell::Cell::new(None) };
+}
+
+fn exact_level(kind: Kind, v: Option<&SynValue>) -> Option<rust_decimal::Decimal> {
+    use rust_decimal::prelude::*;
+    let d = match v? {
+        SynValue::Number(Number::Float(x)) => Decimal::from_str(&crate::number::py_float_str(*x)).ok()?,
+        SynValue::Number(n) => n.to_decimal()?,
+        _ => return None,
+    };
+    if kind == Kind::Percentile {
+        d.checked_div(Decimal::ONE_HUNDRED)
+    } else {
+        Some(d)
+    }
+}
+
 /// Nivel de percentil/cuantil como fracción en [0, 1].
 fn level(kind: Kind, v: Option<&SynValue>) -> Result<f64, Control> {
     let who = kind.name();
@@ -162,6 +182,15 @@ pub fn builtin(interp: &mut Interpreter, args: &[SynValue], kind: Kind) -> Resul
     };
     let first = args.first().ok_or_else(|| err(format!("{}() needs the values", who)))?;
     let lvl = if kind.takes_level() { level(kind, args.get(1))? } else { 0.0 };
+    let exact = if kind.takes_level() { exact_level(kind, args.get(1)) } else { None };
+    EXACT_LEVEL.with(|c| c.set(exact));
+    struct ClearLevel;
+    impl Drop for ClearLevel {
+        fn drop(&mut self) {
+            EXACT_LEVEL.with(|c| c.set(None));
+        }
+    }
+    let _clear = ClearLevel;
     match first {
         SynValue::Array(a) => {
             // Eje: con nombre, o (compatibilidad) posicional después de los valores.
@@ -287,22 +316,122 @@ fn reduce_list(v: &SynValue, kind: Kind, lvl: f64, ddof: f64) -> Result<SynValue
     let all_exact_decimal = nums.iter().any(|n| n.is_decimal()) && nums.iter().all(|n| !matches!(n, Number::Float(_)));
     match kind {
         Kind::Mean if all_exact_decimal => {
+            // La suma es exacta a cualquier tamaño; la división sigue la regla de `/` decimal.
             let mut acc = Number::Int(0);
             for n in &nums {
                 acc = acc.checked_add(n).map_err(err)?;
             }
-            Ok(syn_number(acc.div(&Number::Int(nums.len() as i64))))
+            Ok(syn_number(as_decimal(&acc).div(&Number::Int(nums.len() as i64))))
         }
-        Kind::Median if all_exact_decimal => {
-            let mut ds: Vec<rust_decimal::Decimal> = nums.iter().filter_map(|n| n.to_decimal()).collect();
-            ds.sort();
-            let m = ds.len();
-            let med = if m % 2 == 1 { ds[m / 2] } else { (ds[m / 2 - 1] + ds[m / 2]) / rust_decimal::Decimal::TWO };
-            Ok(syn_number(Number::Decimal(med)))
+        // Mediana, varianza, desviación y cuantiles de decimales (con o sin enteros de cualquier
+        // tamaño): EXACTOS sobre racionales m / 10^s y SIEMPRE decimales (ver `exact_stat`).
+        Kind::Median | Kind::Var | Kind::Std | Kind::Percentile | Kind::Quantile if all_exact_decimal => {
+            Ok(match exact_stat(kind, &nums, lvl, ddof) {
+                Some(n) => syn_number(n),
+                None => syn_float(f64::NAN),
+            })
         }
         _ => {
             let vals: Vec<f64> = nums.iter().map(|n| n.to_f64()).collect();
             Ok(syn_float(reduce_f64(kind, &vals, lvl, ddof)))
+        }
+    }
+}
+
+use num_bigint::BigInt;
+use num_integer::Integer;
+use num_traits::Zero;
+use crate::number::{cmp_ratio, pow10_big};
+
+/// Los valores exactos llevados a una escala común `s`: cada uno es `x / 10^s`.
+fn common_scale(nums: &[Number]) -> (Vec<BigInt>, u32) {
+    let rs: Vec<(BigInt, u32)> = nums.iter().filter_map(|n| n.exact_ratio()).collect();
+    debug_assert_eq!(rs.len(), nums.len(), "exact_stat sin floats");
+    let s = rs.iter().map(|r| r.1).max().unwrap_or(0);
+    (rs.into_iter().map(|(m, k)| m * pow10_big(s - k)).collect(), s)
+}
+
+/// Un valor exacto como decimal (un entero de la lista también: el resultado es decimal).
+fn as_decimal(n: &Number) -> Number {
+    match n.exact_ratio() {
+        Some((m, s)) if !n.is_decimal() => Number::decimal_from_parts(m, s),
+        _ => n.clone(),
+    }
+}
+
+/// Un decimal sin los ceros de la derecha (`2.50` → `2.5`), como `normalize` de Python.
+fn trimmed(n: Number) -> Number {
+    match n.exact_ratio() {
+        Some((mut m, mut s)) => {
+            let ten = BigInt::from(10);
+            while s > 0 && (&m % &ten).is_zero() {
+                m /= &ten;
+                s -= 1;
+            }
+            Number::decimal_from_parts(m, s)
+        }
+        None => n,
+    }
+}
+
+/// Mediana / cuantil / varianza / desviación EXACTAS de valores exactos (decimales y enteros de
+/// cualquier tamaño), como `statistics` de Python con `Decimal`: el resultado es SIEMPRE un
+/// decimal — exacto si termina, si no con 28 cifras significativas. `None` = NaN (menos valores
+/// que `ddof`).
+fn exact_stat(kind: Kind, nums: &[Number], lvl: f64, ddof: f64) -> Option<Number> {
+    use rust_decimal::prelude::*;
+    let n = nums.len();
+    match kind {
+        Kind::Var | Kind::Std => {
+            let dd = ddof as u64;
+            if (n as u64) <= dd {
+                return None;
+            }
+            // var = (n·Σx² − (Σx)²) / (n·(n−ddof)·10^(2s)), todo entero.
+            let (xs, s) = common_scale(nums);
+            let s1: BigInt = xs.iter().sum();
+            let s2: BigInt = xs.iter().map(|x| x * x).sum();
+            let nb = BigInt::from(n);
+            let num = &nb * s2 - &s1 * &s1;
+            let den = &nb * BigInt::from(n as u64 - dd) * pow10_big(2 * s);
+            let num = if num < BigInt::zero() { BigInt::zero() } else { num };
+            Some(trimmed(if kind == Kind::Var {
+                Number::decimal_from_ratio(&num, &den, 0, 0)
+            } else {
+                Number::decimal_sqrt_ratio(&num, &den)
+            }))
+        }
+        _ => {
+            let mut sorted: Vec<&Number> = nums.iter().collect();
+            sorted.sort_by(|a, b| cmp_ratio(&a.exact_ratio().unwrap(), &b.exact_ratio().unwrap()));
+            if kind == Kind::Median {
+                if n % 2 == 1 {
+                    return Some(as_decimal(sorted[n / 2]));
+                }
+                // (a + b) / 2 exacto: la suma par se divide en su escala; impar, un decimal más.
+                let pair = [sorted[n / 2 - 1].clone(), sorted[n / 2].clone()];
+                let (xs, s) = common_scale(&pair);
+                let sum = &xs[0] + &xs[1];
+                let (q, k) = if sum.is_even() { (sum / 2, s) } else { (sum * 5, s + 1) };
+                return Some(Number::decimal_from_parts(q, k));
+            }
+            // La interpolación lineal de numpy con el nivel exacto: pos = q·(n−1).
+            let q = match EXACT_LEVEL.with(|c| c.get()) {
+                Some(q) => q,
+                None => Decimal::from_str(&crate::number::py_float_str(lvl)).ok()?,
+            };
+            let (qm, qs) = (BigInt::from(q.mantissa()), q.scale());
+            let pos = qm * BigInt::from(n - 1);
+            let (lo, frac) = pos.div_mod_floor(&pow10_big(qs));
+            let i = lo.to_usize()?;
+            if frac.is_zero() || i + 1 >= n {
+                return Some(as_decimal(sorted[i.min(n - 1)]));
+            }
+            let pair = [sorted[i].clone(), sorted[i + 1].clone()];
+            let (xs, s) = common_scale(&pair);
+            // a + (b − a)·frac/10^qs, exacto sobre 10^(s+qs).
+            let num = &xs[0] * pow10_big(qs) + (&xs[1] - &xs[0]) * frac;
+            Some(trimmed(Number::decimal_from_parts(num, s + qs)))
         }
     }
 }

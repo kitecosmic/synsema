@@ -3,12 +3,60 @@
 //! bundle se verifica, los `use`/templates/assets viven dentro (sin disco), el techo y el
 //! perfil horneados mandan, y `update` se niega a pisar un programa construido.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn project(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("synsema-build-cli-{}-{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+/// Un directorio de `%TEMP%` que se borra al terminar el test, TAMBIÉN si el test entra en
+/// pánico: cada uno guarda binarios construidos de ~180 MB, y dejarlos llenó el disco.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(name: String) -> Self {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        TempDir(dir)
+    }
+}
+
+impl std::ops::Deref for TempDir {
+    type Target = PathBuf;
+    fn deref(&self) -> &PathBuf {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for TempDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        // En Windows un .exe que acaba de terminar puede seguir bloqueado un momento.
+        for _ in 0..50 {
+            if std::fs::remove_dir_all(&self.0).is_ok() || !self.0.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+/// Un proceso hijo (un servidor construido) que se mata al salir, también en un pánico: vivo,
+/// su .exe no se puede borrar.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn project(tag: &str) -> TempDir {
+    let dir = TempDir::new(format!("synsema-build-cli-{}-{}", tag, std::process::id()));
     std::fs::create_dir_all(dir.join("lib")).unwrap();
     std::fs::create_dir_all(dir.join("assets")).unwrap();
     std::fs::write(
@@ -244,9 +292,8 @@ fn header(head: &str, name: &str) -> Option<String> {
     })
 }
 
-fn serve_project(tag: &str, port: u16) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("synsema-build-serve-{}-{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+fn serve_project(tag: &str, port: u16) -> TempDir {
+    let dir = TempDir::new(format!("synsema-build-serve-{}-{}", tag, std::process::id()));
     std::fs::create_dir_all(dir.join("public").join("sub")).unwrap();
     std::fs::write(
         dir.join("app.syn"),
@@ -281,9 +328,7 @@ fn wait_ready(port: u16) {
 fn build_serve_binary_serves_templates_and_statics_from_bundle() {
     let port = free_port();
     let dir = serve_project("ok", port);
-    let out_dir = std::env::temp_dir().join(format!("synsema-build-serve-out-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&out_dir);
-    std::fs::create_dir_all(&out_dir).unwrap();
+    let out_dir = TempDir::new(format!("synsema-build-serve-out-{}", std::process::id()));
     let out = out_dir.join(exe_name("app"));
     // Sin --include: los mounts estáticos del serve se bundlean solos.
     let (code, stdout, err) = synsema(&dir, &["build", "app.syn", "-o", out.to_str().unwrap(), "--serve", "--bind", "127.0.0.1"]);
@@ -293,13 +338,15 @@ fn build_serve_binary_serves_templates_and_statics_from_bundle() {
     // El fuente desaparece: todo lo que sirva viene del bundle.
     std::fs::remove_dir_all(&dir).unwrap();
 
-    let mut child = Command::new(&out)
-        .current_dir(&out_dir)
-        .env("SYNSEMA_NO_UPDATE_CHECK", "1")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn built server");
+    let child = KillOnDrop(
+        Command::new(&out)
+            .current_dir(&*out_dir)
+            .env("SYNSEMA_NO_UPDATE_CHECK", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn built server"),
+    );
     wait_ready(port);
 
     let (st, head, body) = http(port, "/");
@@ -323,9 +370,7 @@ fn build_serve_binary_serves_templates_and_statics_from_bundle() {
     let (st, _, _) = http(port, "/%2e%2e/app.syn");
     assert_ne!(st, 200);
 
-    let _ = child.kill();
-    let _ = child.wait();
-    let _ = std::fs::remove_dir_all(&out_dir);
+    drop(child);
 }
 
 #[test]
@@ -373,7 +418,6 @@ fn build_serve_flags_are_validated_at_build_time() {
     let (code, _, err) = synsema(&dir, &["build", "app.syn", "-o", o, "--serve", "--bind", "127.0.0.1"]);
     assert_eq!(code, 2, "{}", err);
     assert!(err.contains("static mount './public'"), "{}", err);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// v0.6.20 — `--audit` HORNEADO y `SYNSEMA_AUDIT` del entorno: el binario emite el stream;
@@ -416,9 +460,7 @@ fn built_binary_sees_the_real_working_directory() {
     )
     .unwrap();
     let lamp = build(&dir, &[]);
-    let other = std::env::temp_dir().join(format!("synsema-build-cli-cwd-other-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&other);
-    std::fs::create_dir_all(&other).unwrap();
+    let other = TempDir::new(format!("synsema-build-cli-cwd-other-{}", std::process::id()));
     for (n, c) in [("data.txt", "disk"), ("b.txt", "2"), ("c.txt", "3")] {
         std::fs::write(other.join(n), c).unwrap();
     }
@@ -442,5 +484,4 @@ fn built_binary_sees_the_real_working_directory() {
         asked,
         canon
     );
-    let _ = std::fs::remove_dir_all(&other);
 }

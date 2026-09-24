@@ -168,6 +168,16 @@ fn reconstruct_task(
     }
 }
 
+/// Los generadores dentro de `v`, en orden de recorrido (listas en orden, mapas en su orden).
+fn generators_in(v: &SynValue, out: &mut Vec<Rc<synsema_core::interpreter::BuiltinTask>>) {
+    match v {
+        SynValue::Builtin(b) if synsema_core::rng::snapshot(b).is_some() => out.push(b.clone()),
+        SynValue::List(l) => l.borrow().iter().for_each(|x| generators_in(x, out)),
+        SynValue::Map(m) => m.borrow().values().for_each(|x| generators_in(x, out)),
+        _ => {}
+    }
+}
+
 /// A1 Fase 2 — Corre `task` sobre `items` con concurrencia `limit` sobre **tokio**
 /// (runtime multi-thread + `spawn_blocking` por item, acotado por un semáforo). Cada
 /// item corre en un intérprete sync fresco (modelo CSP). Resultados **en orden de
@@ -186,7 +196,7 @@ fn run_parallel(
     mem: Option<MemoryCtx>,
     bus: Option<Arc<synsema_agents::bus::Bus>>,
     subject: crate::subject::Subject,
-) -> Result<Vec<SendValue>, RuntimeError> {
+) -> Result<Vec<(SendValue, Vec<synsema_core::rng::Generator>)>, RuntimeError> {
     let n = items.len();
     if n == 0 {
         return Ok(Vec::new());
@@ -229,7 +239,7 @@ fn run_parallel(
             let aborted = aborted.clone();
             let error = error.clone();
             let subject = subject.clone();
-            let h = tokio::task::spawn_blocking(move || -> Option<SendValue> {
+            let h = tokio::task::spawn_blocking(move || -> Option<(SendValue, Vec<synsema_core::rng::Generator>)> {
                 let _permit = permit; // libera el slot al terminar
                 if aborted.load(Ordering::Relaxed) {
                     return None;
@@ -238,8 +248,15 @@ fn run_parallel(
                     build_worker_interp(&globals, &granted, &denied, secure, &ceiling, &mem, &bus, &subject);
                 let task_value = reconstruct_task(&interp, &task_snap, &mut registry);
                 let item = from_send(&items[i]);
+                let keep = item.clone();
                 match interp.call_task(task_value, vec![item]) {
-                    Ok(v) => Some(to_send(&v)),
+                    Ok(v) => {
+                        // El estado final de los generadores del item, en orden de recorrido.
+                        let mut gens = Vec::new();
+                        generators_in(&keep, &mut gens);
+                        let states = gens.iter().filter_map(synsema_core::rng::snapshot).collect();
+                        Some((to_send(&v), states))
+                    }
                     Err(c) => {
                         let re = control_to_error(c);
                         let mut e = error.lock().unwrap();
@@ -255,9 +272,9 @@ fn run_parallel(
         }
 
         // Resultados en orden de entrada (handles en orden 0..n).
-        let mut out: Vec<SendValue> = Vec::with_capacity(handles.len());
+        let mut out: Vec<(SendValue, Vec<synsema_core::rng::Generator>)> = Vec::with_capacity(handles.len());
         for h in handles {
-            out.push(h.await.ok().flatten().unwrap_or(SendValue::Nothing));
+            out.push(h.await.ok().flatten().unwrap_or((SendValue::Nothing, Vec::new())));
         }
         if let Some((_, re)) = error.lock().unwrap().take() {
             return Err(re);
@@ -284,7 +301,10 @@ pub(crate) fn register_parallel_builtins(
                 _ => return Err(err("chunk: first argument must be a list")),
             };
             let size = match args.get(1) {
-                Some(SynValue::Number(n)) => num_i64(n),
+                Some(SynValue::Number(n)) if n.is_integer() => num_i64(n),
+                Some(SynValue::Number(n)) => {
+                    return Err(err(&format!("chunk: size must be an integer, got {} — round it on purpose first", n)))
+                }
                 _ => return Err(err("chunk: size must be a number")),
             };
             if size <= 0 {
@@ -311,6 +331,28 @@ pub(crate) fn register_parallel_builtins(
                 Some(SynValue::List(l)) => l.borrow().clone(),
                 _ => return Err(err("parallel_map: second argument must be a list")),
             };
+            // Un generador cruza a un worker como COPIA de su estado: el mismo generador en dos
+            // items daría la MISMA secuencia en los dos workers (numpy lo hace en silencio al
+            // copiarlo a otro proceso). Acá es error, con la forma correcta.
+            {
+                // A cualquier profundidad (el anidamiento de valores es finito: semántica de valor).
+                fn walk(v: &SynValue, seen: &mut std::collections::HashSet<usize>) -> bool {
+                    match v {
+                        SynValue::Builtin(b) if synsema_core::rng::snapshot(b).is_some() => {
+                            !seen.insert(Rc::as_ptr(b) as usize)
+                        }
+                        SynValue::List(l) => l.borrow().iter().any(|x| walk(x, seen)),
+                        SynValue::Map(m) => m.borrow().values().any(|x| walk(x, seen)),
+                        _ => false,
+                    }
+                }
+                let mut seen = std::collections::HashSet::new();
+                if list.iter().any(|x| walk(x, &mut seen)) {
+                    return Err(err(
+                        "parallel_map: the same generator reaches more than one item — each worker would draw the same numbers; give each item its own: rng_spawn(g, length(items))",
+                    ));
+                }
+            }
             let limit = match args.get(2) {
                 Some(SynValue::Number(n)) => {
                     let v = num_i64(n);
@@ -373,7 +415,19 @@ pub(crate) fn register_parallel_builtins(
                 synsema_stdlib::ws::bus_of_interp(i),
                 subject,
             ) {
-                Ok(results) => Ok(syn_list(results.iter().map(from_send).collect())),
+                Ok(results) => {
+                    // Lo que cada worker avanzó de SUS generadores vuelve al padre (como con
+                    // `apply`): `g` después de `parallel_map(w, [g])`, o los hijos de un
+                    // `rng_spawn` usados otra vez, siguen la secuencia en vez de repetirla.
+                    for (item, (_, states)) in list.iter().zip(results.iter()) {
+                        let mut gens = Vec::new();
+                        generators_in(item, &mut gens);
+                        for (b, g) in gens.iter().zip(states.iter()) {
+                            synsema_core::rng::set_state(b, g.clone());
+                        }
+                    }
+                    Ok(syn_list(results.iter().map(|(v, _)| from_send(v)).collect()))
+                }
                 Err(re) => Err(Control::Error(re)),
             }
         }),
