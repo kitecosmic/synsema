@@ -2611,6 +2611,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "faer",
+ "getrandom",
  "indexmap",
  "libm",
  "ndarray",
