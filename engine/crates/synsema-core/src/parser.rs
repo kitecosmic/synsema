@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use crate::ast::{Arg, Node, NodeKind, Param, Program};
+use crate::ast::{Arg, BinOp, Node, NodeKind, Param, Program, UnOp};
 use crate::lexer::{Lexer, LexerError};
 use crate::tokens::{
     keyword_lookup, Number, SourceLocation, TemplateSegment, Token, TokenType, TokenValue,
@@ -2292,7 +2292,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                 op.location,
                 NodeKind::BinaryOp {
                     left: Box::new(left),
-                    operator: "or".to_string(),
+                    operator: BinOp::Or,
                     right: Box::new(right),
                 },
             );
@@ -2309,7 +2309,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                 op.location,
                 NodeKind::BinaryOp {
                     left: Box::new(left),
-                    operator: "and".to_string(),
+                    operator: BinOp::And,
                     right: Box::new(right),
                 },
             );
@@ -2324,7 +2324,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
             return Ok(Node::new(
                 op.location,
                 NodeKind::UnaryOp {
-                    operator: "not".to_string(),
+                    operator: UnOp::Not,
                     operand: Box::new(operand),
                 },
             ));
@@ -2334,16 +2334,16 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
 
     /// El operador de comparación en la posición actual, si hay: `==`, `!=`, `<`, `>`,
     /// `<=`, `>=`, `in` y `not in` (v0.6.29), con cuántos tokens ocupa. No consume nada.
-    fn comparison_op_ahead(&self) -> Option<(&'static str, usize)> {
+    fn comparison_op_ahead(&self) -> Option<(BinOp, usize)> {
         match self.current().ty {
-            TokenType::Equal => Some(("==", 1)),
-            TokenType::NotEqual => Some(("!=", 1)),
-            TokenType::Less => Some(("<", 1)),
-            TokenType::Greater => Some((">", 1)),
-            TokenType::LessEqual => Some(("<=", 1)),
-            TokenType::GreaterEqual => Some((">=", 1)),
-            TokenType::In => Some(("in", 1)),
-            TokenType::Not if self.peek(1).ty == TokenType::In => Some(("not in", 2)),
+            TokenType::Equal => Some((BinOp::Eq, 1)),
+            TokenType::NotEqual => Some((BinOp::Ne, 1)),
+            TokenType::Less => Some((BinOp::Lt, 1)),
+            TokenType::Greater => Some((BinOp::Gt, 1)),
+            TokenType::LessEqual => Some((BinOp::Le, 1)),
+            TokenType::GreaterEqual => Some((BinOp::Ge, 1)),
+            TokenType::In => Some((BinOp::In, 1)),
+            TokenType::Not if self.peek(1).ty == TokenType::In => Some((BinOp::NotIn, 2)),
             _ => None,
         }
     }
@@ -2353,7 +2353,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
     fn parse_comparison(&mut self) -> Result<Node, ParseError> {
         let first = self.parse_addition()?;
         let mut operands = vec![first];
-        let mut operators: Vec<String> = Vec::new();
+        let mut operators: Vec<BinOp> = Vec::new();
         let mut loc = None;
         while let Some((op, width)) = self.comparison_op_ahead() {
             let tok = self.advance();
@@ -2361,7 +2361,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                 self.advance();
             }
             loc.get_or_insert(tok.location);
-            operators.push(op.to_string());
+            operators.push(op);
             operands.push(self.parse_addition()?);
         }
         let Some(loc) = loc else {
@@ -2386,12 +2386,13 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         let mut left = self.parse_multiplication()?;
         while self.check_any(&[TokenType::Plus, TokenType::Minus]) {
             let op = self.advance();
+            let operator = if op.ty == TokenType::Plus { BinOp::Add } else { BinOp::Sub };
             let right = self.parse_multiplication()?;
             left = Node::new(
                 op.location.clone(),
                 NodeKind::BinaryOp {
                     left: Box::new(left),
-                    operator: op.as_str().to_string(),
+                    operator,
                     right: Box::new(right),
                 },
             );
@@ -2403,12 +2404,18 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         let mut left = self.parse_unary()?;
         while self.check_any(&[TokenType::Star, TokenType::Slash, TokenType::FloorDiv, TokenType::Percent]) {
             let op = self.advance();
+            let operator = match op.ty {
+                TokenType::Star => BinOp::Mul,
+                TokenType::Slash => BinOp::Div,
+                TokenType::FloorDiv => BinOp::FloorDiv,
+                _ => BinOp::Mod,
+            };
             let right = self.parse_unary()?;
             left = Node::new(
                 op.location.clone(),
                 NodeKind::BinaryOp {
                     left: Box::new(left),
-                    operator: op.as_str().to_string(),
+                    operator,
                     right: Box::new(right),
                 },
             );
@@ -2423,7 +2430,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
             return Ok(Node::new(
                 op.location,
                 NodeKind::UnaryOp {
-                    operator: "-".to_string(),
+                    operator: UnOp::Neg,
                     operand: Box::new(operand),
                 },
             ));
@@ -2443,7 +2450,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                 op.location,
                 NodeKind::BinaryOp {
                     left: Box::new(left),
-                    operator: "**".to_string(),
+                    operator: BinOp::Pow,
                     right: Box::new(right),
                 },
             ));
@@ -2621,7 +2628,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         for seg in segments {
             let (part, op) = match seg {
                 TemplateSegment::Literal(text) => {
-                    (Node::new(loc.clone(), NodeKind::TextLiteral { value: text }), "+")
+                    (Node::new(loc.clone(), NodeKind::TextLiteral { value: text }), BinOp::Add)
                 }
                 TemplateSegment::Interp(src, interp_loc) => {
                     // El hueco se parsea aparte: sus ubicaciones se corren a donde está en el
@@ -2633,7 +2640,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                         e
                     })?;
                     crate::ast_api::shift_locations(&mut e, line, col);
-                    (e, crate::ast::INTERP_CONCAT)
+                    (e, BinOp::InterpConcat)
                 }
             };
             node = Some(match node {
@@ -2645,7 +2652,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                             loc.clone(),
                             NodeKind::TextLiteral { value: String::new() },
                         )),
-                        operator: op.to_string(),
+                        operator: op,
                         right: Box::new(part),
                     },
                 ),
@@ -2653,7 +2660,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                     loc.clone(),
                     NodeKind::BinaryOp {
                         left: Box::new(acc),
-                        operator: op.to_string(),
+                        operator: op,
                         right: Box::new(part),
                     },
                 ),

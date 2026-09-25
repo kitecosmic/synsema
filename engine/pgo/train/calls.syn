@@ -1,0 +1,19 @@
+-- Entrenamiento PGO: llamadas, recursión, argumentos nombrados y por defecto, lambdas, pipes.
+task fib(n)
+    when n < 2
+        give n
+    give fib(n - 1) + fib(n - 2)
+task scale(x, factor = 2, offset = 0)
+    give x * factor + offset
+task double(x)
+    give x * 2
+task inc(x)
+    give x + 1
+let acc be 0
+each k in range(0, 60000)
+    set acc to acc + scale(k) + scale(k, 3) + scale(k, offset = 1)
+let square be (x) => x * x
+let s be 0
+each k in range(0, 60000)
+    set s to s + square(k % 100)
+print(fib(22), acc, s, 5 |> double |> inc)

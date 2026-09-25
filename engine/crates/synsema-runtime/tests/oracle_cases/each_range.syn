@@ -1,0 +1,13 @@
+let total be 0
+each i in range(10)
+    set total to total + i
+each i in range(2, 6)
+    set total to total + i
+each i in range(20, 0, -7)
+    set total to total + i
+each i in range(0)
+    set total to total + 1000
+let n be 3
+each i in range(n * 2)
+    set total to total + i
+print(total, steps())

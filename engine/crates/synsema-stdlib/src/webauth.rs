@@ -1416,7 +1416,7 @@ mod tests {
     }
 
     fn tloc() -> synsema_core::tokens::SourceLocation {
-        synsema_core::tokens::SourceLocation { file: "t.syn".to_string(), line: 1, column: 1, offset: 0 }
+        synsema_core::tokens::SourceLocation { file: "t.syn".into(), line: 1, column: 1, offset: 0 }
     }
 
     fn js(args: &[SynValue]) -> Result<SynValue, Control> {
@@ -1732,7 +1732,7 @@ mod v0620_tests {
     }
 
     fn tloc() -> synsema_core::tokens::SourceLocation {
-        synsema_core::tokens::SourceLocation { file: "t.syn".to_string(), line: 1, column: 1, offset: 0 }
+        synsema_core::tokens::SourceLocation { file: "t.syn".into(), line: 1, column: 1, offset: 0 }
     }
 
     fn js(args: &[SynValue]) -> Result<SynValue, Control> {

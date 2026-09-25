@@ -329,7 +329,7 @@ mod tests {
         let sealed = SynValue::Secret(std::rc::Rc::new(SecretInner::new_bytes_sealed("attestation_key", scalar.clone())));
         let msg = |r: Result<SynValue, Control>| -> String {
             match r {
-                Err(Control::Error(e)) => e.message,
+                Err(Control::Error(e)) => e.into_message(),
                 Ok(v) => panic!("esperaba error, devolvió {}", v),
                 Err(_) => panic!("esperaba error, hubo control flow"),
             }

@@ -22,6 +22,13 @@ use synsema_runtime::engine::{
 use synsema_runtime::host::{self, Profile};
 use synsema_runtime::serve::{run_serve_program_with_overrides, ServeOverrides};
 
+// Windows: el allocator del sistema (HeapAlloc) cuesta 1,3–1,5× el de Linux en todo lo que pide
+// memoria; con mimalloc la diferencia baja a 1,03–1,09× (specs/compute-rendimiento.md F1.13). Sólo
+// este binario y sólo en Windows: en Linux no aporta, y wasm y las librerías no se tocan.
+#[cfg(windows)]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod build;
 mod bundle_out;
 mod icns;

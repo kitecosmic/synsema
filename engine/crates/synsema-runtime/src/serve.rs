@@ -777,7 +777,7 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
             // tasks cierran sobre el módulo — heurística por el nombre "module:…").
             if let Some(module_env) = module_env_of(&m.borrow()) {
                 let key = Rc::as_ptr(&module_env) as usize;
-                let id = module_env.borrow().name.clone();
+                let id = module_env.borrow().name.to_string();
                 let is_alias = synsema_core::interpreter::module_env_of_map(m).is_some();
                 if state.in_progress.contains(&key) || state.done.contains(&key) {
                     // El env ya viaja (o viajó) en este árbol: referencia por id. Un solo

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# `zig` intermedio para el build instrumentado de PGO en Linux (release.yml). rustc le pide al
+# linker `-u __llvm_profile_runtime` (que no descarte el runtime de perfilado) y `zig cc` toma el
+# símbolo como un archivo de entrada (`ld.lld: error: cannot open __llvm_profile_runtime`). Acá
+# `-u <símbolo>` se reescribe como `-Wl,-u,<símbolo>`, que es lo mismo; todo lo demás pasa intacto al
+# zig real: `$REAL_ZIG` si está, si no el de `pip install ziglang` (el que usa cargo-zigbuild en CI).
+args=()
+while [ $# -gt 0 ]; do
+    if [ "$1" = "-u" ] && [ $# -ge 2 ]; then
+        args+=("-Wl,-u,$2")
+        shift 2
+    else
+        args+=("$1")
+        shift
+    fi
+done
+if [ -n "${REAL_ZIG:-}" ]; then
+    exec "$REAL_ZIG" "${args[@]}"
+fi
+exec python3 -m ziglang "${args[@]}"

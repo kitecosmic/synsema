@@ -85,7 +85,7 @@ fn ok(r: Result<SynValue, Control>) -> SynValue {
 
 fn err_msg(r: Result<SynValue, Control>) -> String {
     match r {
-        Err(Control::Error(e)) => e.message,
+        Err(Control::Error(e)) => e.into_message(),
         Ok(v) => panic!("esperaba error, got {:?}", v.to_string()),
         Err(_) => panic!("control inesperado"),
     }

@@ -331,7 +331,10 @@ pub fn keyword_lookup(word: &str) -> Option<TokenType> {
 /// `offset` cuenta code points (igual que el `pos` del lexer Python).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SourceLocation {
-    pub file: String,
+    /// El archivo, compartido por todas las ubicaciones del mismo archivo: el lexer lo copiaba en
+    /// un `String` nuevo por cada token (specs/compute-rendimiento.md F1.10). `Arc` y no `Rc`
+    /// porque el AST cruza hilos (serve, parallel_map, agentes).
+    pub file: std::sync::Arc<str>,
     pub line: usize,
     pub column: usize,
     pub offset: usize,

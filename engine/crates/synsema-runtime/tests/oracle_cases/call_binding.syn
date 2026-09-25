@@ -1,0 +1,8 @@
+let base be 100
+task f(a, b = 10, c = base + 1)
+    give [a, b, c]
+task g()
+    give "g"
+print(f(1), f(1, 2), f(1, 2, 3))
+print(f(a = 5), f(1, c = 7), f(b = 3, a = 4))
+print(g(), steps())

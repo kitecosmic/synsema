@@ -1,0 +1,6 @@
+let xs be [1, 2]
+task swap()
+    set xs to [7, 7, 7]
+    give 5
+set xs to append(xs, swap())
+print(xs, steps())

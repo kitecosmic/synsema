@@ -610,7 +610,7 @@ mod tests {
             Some(SynValue::Builtin(bt)) => bt.func.clone(),
             _ => panic!("json_decode no registrado"),
         };
-        let loc = SourceLocation { file: "<test>".to_string(), line: 1, column: 1, offset: 0 };
+        let loc = SourceLocation { file: "<test>".into(), line: 1, column: 1, offset: 0 };
         f(&mut interp, args, &loc)
     }
 
@@ -622,7 +622,7 @@ mod tests {
     fn json_decode_has_a_total_variant() {
         // Sin fallback: error, y el mensaje enseña la salida.
         let e = match decode(&[syn_text("{roto")]) {
-            Err(Control::Error(e)) => e.message,
+            Err(Control::Error(e)) => e.into_message(),
             _ => panic!("un JSON inválido sin fallback tiene que fallar"),
         };
         assert!(e.contains("json_decode(<text>, nothing)"), "{}", e);

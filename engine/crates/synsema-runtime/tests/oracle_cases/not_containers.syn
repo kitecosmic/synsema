@@ -1,0 +1,7 @@
+let s be "ab"
+let f be 0.5
+let d be 1.5d
+set s to s + "c"
+set f to f + 1
+set d to d + 2d
+print(s, f, d, steps())

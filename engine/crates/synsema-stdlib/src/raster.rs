@@ -503,7 +503,7 @@ mod tests {
 
     fn msg(r: Result<SynValue, Control>) -> String {
         match r {
-            Err(Control::Error(e)) => e.message,
+            Err(Control::Error(e)) => e.into_message(),
             Ok(v) => panic!("esperaba error, dio {}", v.type_name()),
             Err(_) => panic!("control inesperado"),
         }

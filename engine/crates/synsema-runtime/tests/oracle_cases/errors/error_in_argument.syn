@@ -1,0 +1,3 @@
+let xs be [1]
+print(steps())
+set xs to append(xs, missing_variable)

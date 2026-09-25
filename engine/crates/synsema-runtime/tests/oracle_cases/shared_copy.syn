@@ -1,0 +1,7 @@
+let a be [1]
+let b be a
+set a to append(a, 2)
+let m be {"k": 1}
+let snap be m
+set m to merge(m, {"j": 2})
+print(a, b, m, snap, steps())

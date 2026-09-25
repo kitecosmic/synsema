@@ -1,0 +1,15 @@
+-- Entrenamiento PGO: texto, templates, split/join, búsqueda.
+let words be []
+each k in range(0, 8000)
+    set words to append(words, "w" + text(k % 37))
+let line be join(words, " ")
+let parts be split(line, " ")
+let n be 0
+each p in parts
+    when "w1" in p
+        set n to n + 1
+let out be ""
+each k in range(0, 3000)
+    set out to `{out}{k % 10}`
+let up be upper("synsema " + text(length(parts)))
+print(length(parts), n, length(out), up, replace("a-b-c", "-", "+"))

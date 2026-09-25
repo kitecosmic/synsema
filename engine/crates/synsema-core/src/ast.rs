@@ -73,6 +73,122 @@ pub struct JudgeQuestionNode {
 /// siendo estricto; este operador no tiene sintaxis propia, sólo lo produce el desugar.
 pub const INTERP_CONCAT: &str = "+`";
 
+/// Operador binario. Antes era un `String` que el intérprete comparaba texto por texto en cada
+/// evaluación (specs/compute-rendimiento.md F1.9). `as_str()` da exactamente el texto de siempre,
+/// que es lo que ven los mensajes de error, `codeintel` y `deprecated`, y se compara con un
+/// `&str` como antes (`op == "+"`). `Debug` imprime ese mismo texto entre comillas.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    FloorDiv,
+    Mod,
+    Pow,
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    And,
+    Or,
+    In,
+    NotIn,
+    /// El hueco de un template con backticks (`INTERP_CONCAT`).
+    InterpConcat,
+}
+
+impl BinOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::FloorDiv => "//",
+            BinOp::Mod => "%",
+            BinOp::Pow => "**",
+            BinOp::Eq => "==",
+            BinOp::Ne => "!=",
+            BinOp::Lt => "<",
+            BinOp::Gt => ">",
+            BinOp::Le => "<=",
+            BinOp::Ge => ">=",
+            BinOp::And => "and",
+            BinOp::Or => "or",
+            BinOp::In => "in",
+            BinOp::NotIn => "not in",
+            BinOp::InterpConcat => INTERP_CONCAT,
+        }
+    }
+}
+
+impl std::fmt::Debug for BinOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.as_str())
+    }
+}
+
+impl std::fmt::Display for BinOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl PartialEq<str> for BinOp {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for BinOp {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+/// Operador unario (`-` y `not`); ver `BinOp`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnOp {
+    Neg,
+    Not,
+}
+
+impl UnOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnOp::Neg => "-",
+            UnOp::Not => "not",
+        }
+    }
+}
+
+impl std::fmt::Debug for UnOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.as_str())
+    }
+}
+
+impl std::fmt::Display for UnOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl PartialEq<str> for UnOp {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for UnOp {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum NodeKind {
     // -- Literales --
@@ -116,17 +232,17 @@ pub enum NodeKind {
     // -- Operadores --
     BinaryOp {
         left: Box<Node>,
-        operator: String,
+        operator: BinOp,
         right: Box<Node>,
     },
     /// `a < b <= c` (v0.6.29): cada operando se evalúa una vez y se corta en el primer
     /// par falso, como Python. `operators.len() == operands.len() - 1`, ≥ 2.
     CompareChain {
         operands: Vec<Node>,
-        operators: Vec<String>,
+        operators: Vec<BinOp>,
     },
     UnaryOp {
-        operator: String,
+        operator: UnOp,
         operand: Box<Node>,
     },
     PipeExpression {

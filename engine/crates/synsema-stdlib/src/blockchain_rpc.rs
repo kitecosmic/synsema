@@ -548,7 +548,7 @@ fn get_u64(
 pub(crate) fn u64_number(u: u64) -> SynValue {
     match i64::try_from(u) {
         Ok(i) => syn_int(i),
-        Err(_) => syn_number(Number::Big(BigInt::from(u))),
+        Err(_) => syn_number(Number::Big(Box::new(BigInt::from(u)))),
     }
 }
 
@@ -2330,7 +2330,7 @@ mod tests {
             assert_eq!(ok(number_to_hexq(&Number::Int(*n), "x", "t")), *want);
         }
         // Big > i64: exacto, sin ceros a la izquierda.
-        let big = Number::Big(BigInt::parse_bytes(b"1000000000000000000000", 10).unwrap());
+        let big = Number::Big(Box::new(BigInt::parse_bytes(b"1000000000000000000000", 10).unwrap()));
         assert_eq!(ok(number_to_hexq(&big, "x", "t")), "0x3635c9adc5dea00000");
         // Negativo y float → error.
         assert!(number_to_hexq(&Number::Int(-1), "x", "t").is_err());
@@ -2414,7 +2414,7 @@ mod tests {
             ("chain_id", syn_int(1)),
             ("nonce", syn_int(7)),
             ("to", syn_text("0x6Fac4D18c912343BF86fa7049364Dd4E424Ab9C0")),
-            ("value", syn_number(Number::Big(BigInt::parse_bytes(b"100000000000000000", 10).unwrap()))),
+            ("value", syn_number(Number::Big(Box::new(BigInt::parse_bytes(b"100000000000000000", 10).unwrap())))),
             ("gas", syn_int(21000)),
             ("max_fee", syn_int(30000000000)),
             ("max_priority", syn_int(1500000000)),
@@ -2483,7 +2483,7 @@ mod tests {
             ("max_priority", syn_int(1)),
         ]);
         let e = match evm_tx(&[params]) {
-            Err(Control::Error(e)) => e.message,
+            Err(Control::Error(e)) => e.into_message(),
             other => panic!("esperaba error, vino {:?}", other.is_ok()),
         };
         assert!(e.contains("max_fee") && e.contains("G24"), "error G24 dirigido: {}", e);
@@ -2534,7 +2534,7 @@ mod tests {
             ("max_priority", syn_int(11)),
         ]);
         let e = match evm_tx(&[params]) {
-            Err(Control::Error(e)) => e.message,
+            Err(Control::Error(e)) => e.into_message(),
             _ => panic!("esperaba error"),
         };
         assert!(e.contains("max_priority"), "{}", e);
@@ -2555,7 +2555,7 @@ mod tests {
         let mut sig = vec![1u8; 65];
         sig[64] = 27; // el clásico v legacy — acá es y-parity 0/1
         let e = match evm_tx_raw(&[tx, syn_bytes(sig)]) {
-            Err(Control::Error(e)) => e.message,
+            Err(Control::Error(e)) => e.into_message(),
             _ => panic!("esperaba error"),
         };
         assert!(e.contains("recovery id"), "{}", e);

@@ -6,6 +6,55 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.31 — 2026-09-25
+
+Speed. The same language — every program gives the same result — only faster: the interpreter's hot
+paths no longer allocate or compare text, the released binaries are built with profile-guided
+optimization, and the Windows binary uses a faster memory allocator. Three small fixes came out of
+the checks that prove nothing else changed.
+
+**Faster.** Measured on the interpreter (release build, same machine, best of 9 alternating runs,
+before → after, without counting PGO below):
+
+- a `while` loop: **−52 %**; `<` and `==` between integers: **−61 % / −56 %**; `set`: **−53 %**;
+  `let`: **−50 %**; a builtin call: **−48 %**; task calls: **−47 % to −64 %**; `each`: **−43 %**;
+  recursive `fib(27)`: **−37 %**. A loop, a `set`, a `let` and an integer comparison no longer ask
+  for memory at all (they asked 4 to 7 times per iteration).
+- **`each i in range(…)` does not build the list**: `each i in range(0, 5000000)` peaks at 6 MB
+  instead of 311 MB, and `each` over a list no longer copies it first (a list of a million: 67 →
+  36 MB).
+- **Parsing**: a 20,000-line program loads 32 % faster (the file name was copied for every token).
+- **Profile-guided optimization** in the released binaries: an instrumented build runs a training
+  corpus (`engine/pgo/`) and the published binary is compiled with that profile. On Linux, measured
+  on the release path: a further **−24 % to −38 %** on every row. The release fails if the profile
+  did not apply, instead of shipping a slower binary.
+- **Windows**: the binary uses mimalloc as its allocator. The system allocator made everything that
+  allocates (calls, `each`, maps, lists, text, closures) 1.3–1.5× slower than on Linux; now the gap
+  is 1.03–1.09× (**−17 % to −28 %** on those programs on Windows). Linux, macOS and wasm keep their
+  allocator.
+- A debug build of the engine (the one tests use) no longer crashes with a stack overflow at about
+  1,750 levels of recursion: it reaches the 3,000 limit and gives the catchable
+  `maximum recursion depth exceeded`, like the release build always did.
+
+**Fixes (behaves differently).**
+
+- **`steps()` counts one step per evaluated node on every path.** Since v0.6.29, `set x to x + 1`
+  counted one step too many and `set xs to append(xs, v)` (also `insert`, `merge`, `xs + […]` on
+  the same variable) one or two too few, because an internal shortcut took them. The count is now
+  the same as the reference path; a program that stored exact `steps()` values for those
+  statements sees them move by one or two. (The Vela guest's fee never used `steps()`.)
+- **`range(a, b, step)` near the integer limits ends**: `range(9223372036854775800,
+  9223372036854775807, 5)` → two numbers, like Python. It used to wrap around to negative numbers in
+  the release build and loop until memory ran out.
+- **`merge()` errors say where**: `merge(m, 5)` → `app.syn:3:15: merge(): argument 2 is number, not
+  a map`. The line was missing when the call was written as `let n be merge(m, 5)` and present when
+  it was `set m to merge(m, 5)`.
+
+**For contributors.** `cargo test` gained guards that keep this from regressing: a differential
+oracle that runs every `.syn` in the repo with and without the engine's shortcuts and demands the
+same result, output, errors and `steps()`; exact heap-allocation counts per construct; size caps on
+the values every evaluation moves; and a test of recursion near the limit.
+
 ## v0.6.30 — 2026-09-25
 
 Fixes from the v0.6.29 audit, plus three things data and scheduling code kept asking for: cron in

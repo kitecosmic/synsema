@@ -1,0 +1,22 @@
+-- Entrenamiento PGO: listas, mapas, each, índices y caminos, en el lugar y con copia.
+let xs be []
+each k in range(0, 30000)
+    set xs to append(xs, k * 2)
+let sum be 0
+each x in xs
+    set sum to sum + x
+let m be {"count": 0, "items": [], "by": {}}
+each k in range(0, 20000)
+    set m.count to m.count + 1
+    set m["items"] to append(m["items"], k % 10)
+    let key be "k" + text(k % 50)
+    when contains(m.by, key)
+        set m.by[key] to m.by[key] + 1
+    otherwise
+        set m.by[key] to 1
+let grid be [[0, 0, 0], [0, 0, 0]]
+each k in range(0, 10000)
+    set grid[k % 2][k % 3] to grid[k % 2][k % 3] + 1
+let snapshot be xs
+set xs to xs + [1, 2, 3]
+print(sum, m.count, length(m["items"]), length(keys(m.by)), grid, length(snapshot), length(xs))

@@ -1,0 +1,32 @@
+-- Entrenamiento PGO: match, errores atrapados, stop, bucles anidados.
+let hits be {"a": 0, "b": 0, "other": 0}
+each k in range(0, 30000)
+    let tag be "c"
+    when k % 3 == 0
+        set tag to "a"
+    otherwise when k % 3 == 1
+        set tag to "b"
+    match tag
+        is "a"
+            set hits.a to hits.a + 1
+        is "b"
+            set hits.b to hits.b + 1
+        otherwise
+            set hits.other to hits.other + 1
+let caught be 0
+each k in range(0, 3000)
+    try
+        when k % 5 == 0
+            raise "boom " + text(k)
+        set caught to caught + 0
+    recover e
+        set caught to caught + 1
+let found be -1
+each a in range(0, 200)
+    each b in range(0, 200)
+        when a * b == 391
+            set found to a * 1000 + b
+            stop
+    when found >= 0
+        stop
+print(hits, caught, found)

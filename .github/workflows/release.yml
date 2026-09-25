@@ -101,6 +101,70 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
 
+      # PGO (F1.12 de specs/compute-rendimiento.md; medido: −16 % a −32 % en el arnés, fib −23 %).
+      # Un `synsema` instrumentado corre el corpus de engine/pgo/ y el binario publicado se compila
+      # con ese perfil: el compilador ordena y optimiza el código según lo que el intérprete ejecuta
+      # de verdad. No cambia lo que hace ningún programa. El instrumentado se compila con `cargo
+      # build` en macOS y Windows y con `cargo zigbuild` en Linux, igual que el final: sólo se usa para
+      # entrenar y nunca se publica. macOS x86_64 se compila en el runner ARM: el instrumentado corre
+      # bajo Rosetta.
+      - name: PGO - tools
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rustup component add llvm-tools --toolchain 1.96.0
+          if [ "$TARGET" = "x86_64-apple-darwin" ]; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          # Linux: el instrumentado y el final pasan por el `zig` de engine/pgo/ (arregla el
+          # `-u <símbolo>` que zig cc no entiende; al build normal lo deja igual). Los DOS builds tienen
+          # que hacerse igual salvo el perfil: si difieren, cambian los nombres internos de las
+          # funciones y el perfil no se aplica, en silencio (medido: un perfil de `cargo build`
+          # aplicado a un build de zigbuild no dio ninguna ganancia).
+          # cargo-zigbuild busca PRIMERO el `ziglang` de Python y sólo si falla mira
+          # CARGO_ZIGBUILD_ZIG_PATH (y el PATH): con el ziglang de pip instalado, el shim nunca se
+          # llamaba (así fallaron dos intentos en CI). CARGO_ZIGBUILD_PYTHON_PATH apunta a algo que no
+          # existe para que descarte Python y use el shim, que a su vez llama a `python3 -m ziglang`:
+          # el zig es el mismo de siempre. Verificado en una máquina con un ziglang de Python presente.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            chmod +x engine/pgo/zig
+            echo "CARGO_ZIGBUILD_ZIG_PATH=$GITHUB_WORKSPACE/engine/pgo/zig" >> "$GITHUB_ENV"
+            echo "CARGO_ZIGBUILD_PYTHON_PATH=/nonexistent/use-the-pgo-zig-shim" >> "$GITHUB_ENV"
+          fi
+
+      - name: PGO - instrumented build and training
+        shell: bash
+        env:
+          SYNSEMA_VERSION: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          RUSTFLAGS: -Cprofile-generate=${{ runner.temp }}/pgo-raw
+        run: |
+          set -euo pipefail
+          # El mismo comando y el mismo directorio que el build final de abajo, con otro RUSTFLAGS.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cargo zigbuild --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target "$TARGET.2.17"
+          else
+            cargo build --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target "$TARGET"
+          fi
+          bin="engine/target/$TARGET/release/synsema"
+          if [ -f "$bin.exe" ]; then bin="$bin.exe"; fi
+          # Windows: runner.temp es una ruta de Windows; bash la quiere en formato unix.
+          if command -v cygpath >/dev/null 2>&1; then bin=$(cygpath -u "$bin"); fi
+          bash engine/pgo/train.sh "$bin"
+
+      - name: PGO - merge the profile
+        shell: bash
+        env:
+          PGO_DIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          host=$(rustc +1.96.0 -vV | sed -n 's/^host: //p')
+          profdata="$(rustc +1.96.0 --print sysroot)/lib/rustlib/$host/bin/llvm-profdata"
+          "$profdata" merge -o "$PGO_DIR/pgo.profdata" "$PGO_DIR/pgo-raw"
+          ls -la "$PGO_DIR/pgo.profdata"
+
       # SYNSEMA_VERSION = el tag que disparó el release (p. ej. v0.3.2). El binario lo
       # hornea como su versión (ver crates/synsema-cli/build.rs) → `synsema version`
       # reporta el release, no el commit de main.
@@ -116,17 +180,45 @@ jobs:
       # él, `SYNSEMA_JUDGE_PROVIDER=laya` le contesta a quien lo configure que se compile su
       # propio binario, y una capacidad que la doc describe pero el release no trae no es una
       # capacidad. El peso extra es el encoder y las cabezas — candle ya entra por `llm-local`.
+      # Los dos builds finales guardan su log: `-pgo-warn-missing-function` hace que LLVM nombre cada
+      # función compilada SIN datos del perfil, y el paso siguiente lo revisa.
       - name: Build (Linux, glibc 2.17 floor)
         if: runner.os == 'Linux'
+        shell: bash
         env:
           SYNSEMA_VERSION: ${{ github.ref_name }}
-        run: cargo zigbuild --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target ${{ matrix.target }}.2.17
+          TARGET: ${{ matrix.target }}
+          RUSTFLAGS: -Cprofile-use=${{ runner.temp }}/pgo.profdata -Cllvm-args=-pgo-warn-missing-function
+        run: |
+          set -euo pipefail
+          cargo zigbuild --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target "$TARGET.2.17" 2>&1 | tee "$RUNNER_TEMP/pgo-final-build.log"
 
       - name: Build
         if: runner.os != 'Linux'
+        shell: bash
         env:
           SYNSEMA_VERSION: ${{ github.ref_name }}
-        run: cargo build --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target ${{ matrix.target }}
+          TARGET: ${{ matrix.target }}
+          RUSTFLAGS: -Cprofile-use=${{ runner.temp }}/pgo.profdata -Cllvm-args=-pgo-warn-missing-function
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target "$TARGET" 2>&1 | tee "$RUNNER_TEMP/pgo-final-build.log"
+
+      # Un perfil que no calza con el build final NO rompe nada: el binario sale igual, sin la ganancia,
+      # y en verde (pasó al probarlo: un perfil de `cargo build` sobre un build de zigbuild dejó 4.970
+      # funciones sin datos, `exec_node` entre ellas; el que calza, ninguna). Si el corazón del
+      # intérprete se compiló sin perfil, el release falla acá en vez de publicar un binario más lento.
+      - name: PGO - check the profile was applied
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/pgo-final-build.log"
+          missing=$(grep -c "no profile data available for function" "$log" || true)
+          echo "functions compiled without profile data: $missing"
+          if grep "no profile data available for function" "$log" | grep -q "exec_node"; then
+            echo "::error::PGO did not apply: exec_node was compiled without profile data (the instrumented and the final build differ)"
+            exit 1
+          fi
 
       - name: Package (unix)
         if: runner.os != 'Windows'

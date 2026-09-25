@@ -1,0 +1,6 @@
+let i be 0
+let total be 0
+while i < 10
+    set total to total + i
+    set i to i + 1
+print(i, total, steps())

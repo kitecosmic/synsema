@@ -1,0 +1,7 @@
+let xs be []
+let i be 0
+while i < 5
+    set xs to append(xs, i)
+    set xs to xs + [i * 10]
+    set i to i + 1
+print(xs, steps())

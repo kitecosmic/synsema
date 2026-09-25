@@ -1,0 +1,8 @@
+let xs be [1, 2, 3]
+let out be []
+each a in xs
+    each b in xs
+        set out to append(out, a * b)
+    when a == 2
+        stop
+print(out, steps())

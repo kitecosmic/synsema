@@ -580,7 +580,7 @@ pub mod audit_sink {
         }
         if let Some(sink) = SINK.get() {
             let (file, line) = match synsema_core::audit_loc::current() {
-                Some(loc) => (Some(loc.file), Some(loc.line)),
+                Some(loc) => (Some(loc.file.to_string()), Some(loc.line)),
                 None => (None, None),
             };
             let ts = iso8601_millis(synsema_core::clock::now_secs_f64());

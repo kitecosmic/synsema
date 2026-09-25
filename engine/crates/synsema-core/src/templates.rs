@@ -663,7 +663,7 @@ fn render_nodes(
                     render_nodes(els, interp, env, out, filename, slots, depth)?;
                 } else {
                     for item in items {
-                        let child = Environment::child(env, "template:each");
+                        let child = Environment::child_scope(env, "template:each");
                         env_set(&child, var, item);
                         render_nodes(body, interp, &child, out, filename, slots, depth)?;
                     }
@@ -723,7 +723,7 @@ fn render_nodes(
                                 ))));
                             }
                         };
-                        let child = Environment::child(&interp.global_env, "template:include");
+                        let child = Environment::child_scope(&interp.global_env, "template:include");
                         for (k, v) in m.borrow().iter() {
                             env_set(&child, k, v.clone());
                         }
@@ -1095,7 +1095,7 @@ fn validate_template_walk(path: &str, depth: usize, seen: &mut Vec<String>) -> R
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string());
         let tree = load_template(&target, &display, path).map_err(|c| match c {
-            Control::Error(e) => e.message,
+            Control::Error(e) => e.into_message(),
             _ => "template error".to_string(),
         })?;
         fn refs(nodes: &[TNode], acc: &mut Vec<String>) {

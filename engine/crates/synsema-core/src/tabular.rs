@@ -517,7 +517,7 @@ fn in_table_op<T>(f: impl FnOnce() -> T) -> T {
 }
 
 fn builtin_value(name: String, f: crate::interpreter::BuiltinFn) -> SynValue {
-    SynValue::Builtin(Rc::new(BuiltinTask { name, func: f, param_count: 1, param_names: None }))
+    SynValue::Builtin(Rc::new(BuiltinTask::new(name, 1, None, f)))
 }
 
 /// Constructores de agregados: `sum_of("monto")` devuelve la función `(group) => …`.

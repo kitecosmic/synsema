@@ -70,7 +70,7 @@ fn py_char_repr(ch: char) -> String {
 /// Transforma código fuente Synsema en tokens.
 pub struct Lexer {
     source: Vec<char>,
-    filename: String,
+    filename: std::sync::Arc<str>,
     pos: usize,
     line: usize,
     column: usize,
@@ -84,7 +84,7 @@ impl Lexer {
     pub fn new(source: &str, filename: &str) -> Self {
         Self {
             source: source.chars().collect(),
-            filename: filename.to_string(),
+            filename: std::sync::Arc::from(filename),
             pos: 0,
             line: 1,
             column: 1,

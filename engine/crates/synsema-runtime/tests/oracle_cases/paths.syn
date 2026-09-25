@@ -1,0 +1,13 @@
+let m be {"a": [1], "b": {"c": [2]}}
+let k be "a"
+let ys be [[1], [2]]
+let j be 1
+set m.a to append(m.a, 3)
+set m["a"] to append(m["a"], 4)
+set m[k] to m[k] + [5]
+set m.b.c to insert(m.b.c, 0, 0)
+set ys[j] to append(ys[j], 9)
+set ys[0] to ys[0] + [8]
+let n be {"x": 1}
+set n to merge(n, {"y": 2}, {"z": 3})
+print(m, ys, n, steps())

@@ -45,7 +45,7 @@ impl EnvironmentSnapshot {
         let e = env.borrow();
         let bindings = e.bindings.iter().map(|(k, v)| (k.clone(), deep_copy(v))).collect();
         let parent_snapshot = e.parent.as_ref().map(|p| Box::new(EnvironmentSnapshot::new(p)));
-        EnvironmentSnapshot { name: e.name.clone(), bindings, parent_snapshot }
+        EnvironmentSnapshot { name: e.name.to_string(), bindings, parent_snapshot }
     }
 
     pub fn restore(&self, env: &Rc<RefCell<Environment>>) {

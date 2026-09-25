@@ -1259,7 +1259,7 @@ pub fn build_attested_identity(source: &str, filename: &str, config: AttestConfi
     let mut scalar = None;
     for _ in 0..16 {
         let bytes = crate::webauth::os_random(32, "serve --attested").map_err(|e| match e {
-            Control::Error(re) => re.message,
+            Control::Error(re) => re.into_message(),
             _ => "serve --attested: OS random source unavailable".to_string(),
         })?;
         if p256::SecretKey::from_slice(&bytes).is_ok() {
@@ -1612,7 +1612,7 @@ mod tests {
             register_attest_builtins(&interp, caps.clone());
             let r = b_attest(&caps, &[]);
             r.map_err(|c| match c {
-                Control::Error(e) => e.message,
+                Control::Error(e) => e.into_message(),
                 _ => "?".to_string(),
             })
         };
@@ -1642,7 +1642,7 @@ mod tests {
         let sealed = SynValue::Secret(Rc::new(SecretInner::new_bytes_sealed("attestation_key", vec![7u8; 32])));
         for who in ["keystore_export", "mnemonic_from_entropy", "hd_derive", "secp256k1_sign", "ed25519_sign"] {
             let e = match crate::blockchain::key_material(&sealed, who) {
-                Err(Control::Error(e)) => e.message,
+                Err(Control::Error(e)) => e.into_message(),
                 Ok(_) => panic!("{}: la clave sellada NO puede salir por key_material", who),
                 Err(_) => panic!("{}: control flow", who),
             };
@@ -1667,12 +1667,12 @@ mod tests {
         register_attest_builtins(&interp, caps.clone());
         if attested_identity().is_none() {
             let e = match b_attestation_document(&[]) {
-                Err(Control::Error(e)) => e.message,
+                Err(Control::Error(e)) => e.into_message(),
                 _ => panic!(),
             };
             assert!(e.contains("--attested"), "{}", e);
             let e = match b_attestation_key(&caps, &[]) {
-                Err(Control::Error(e)) => e.message,
+                Err(Control::Error(e)) => e.into_message(),
                 _ => panic!(),
             };
             assert!(e.contains("--attested"), "{}", e);
@@ -1680,7 +1680,7 @@ mod tests {
         // Sin la capability, attestation_key se niega ANTES de mirar la identidad.
         let bare = Rc::new(RefCell::new(CapabilitySet::new("program")));
         let e = match b_attestation_key(&bare, &[]) {
-            Err(Control::Error(e)) => e.message,
+            Err(Control::Error(e)) => e.into_message(),
             _ => panic!(),
         };
         assert!(e.contains("attest"), "{}", e);

@@ -38,3 +38,6 @@ chrono-tz.workspace = true
 # el host (synsema-wasm-web registra `register_custom_getrandom!` sobre crypto.getRandomValues);
 # el reloj del sistema ahí no existe y hacía pánico. Ya estaba en el árbol (0.2, vía rand).
 getrandom = "0.2"
+# Los argumentos de una llamada sin pedir memoria para los primeros 4 (F1.7 de
+# specs/compute-rendimiento.md). Ya estaba en el árbol (vía stdlib); directa no agrega crate.
+smallvec.workspace = true

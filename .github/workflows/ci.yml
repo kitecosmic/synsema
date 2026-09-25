@@ -306,6 +306,11 @@ jobs:
           engine/target/debug/synsema test --labels packages/guests/vela/examples/payment_app.syn
           engine/target/debug/synsema test --labels packages/guests/vela/examples/trigger_app.syn
           engine/target/debug/synsema test --labels packages/guests/vela/examples/client/vela_client.syn
+      # El corpus de entrenamiento de PGO del release (engine/pgo/): release.yml lo corre con el binario
+      # instrumentado y falla si un programa del corpus deja de correr. Acá se entera en cada push, no el
+      # día del release.
+      - name: The PGO training corpus still runs
+        run: bash engine/pgo/train.sh "$GITHUB_WORKSPACE/engine/target/debug/synsema"
       - name: Build the Vela guest (wasm32-wasip1, profile wasm)
         # Target y target-dir explícitos: el .cargo/config.toml del crate sólo aplica cuando cargo corre
         # DENTRO de packages/guests/vela; desde la raíz del repo hay que decirlos (si no, compila un
@@ -486,6 +491,11 @@ jobs:
             if [ "$f" = "examples/error_demo.syn" ]; then
               printf '   load %-62s (error demo: raises at top level on purpose)\n' "$f"; continue
             fi
+            # Casos del oráculo diferencial que prueban caminos de ERROR (reference_oracle.rs compara
+            # el error de los dos caminos): terminan en error a propósito.
+            case "$f" in engine/crates/synsema-runtime/tests/oracle_cases/errors/*)
+              printf '   load %-62s (oracle error case: ends in an error on purpose)\n' "$f"; continue ;;
+            esac
             echo "::error file=$f::failed to load or its tests failed"
             echo "$out" | head -8 | sed 's/^/      /'
             fail=1
