@@ -27,11 +27,10 @@ use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 
-use chrono::FixedOffset;
-
 use synsema_core::clock::now_secs_f64;
 use synsema_core::interpreter::{Control, Interpreter};
 use synsema_core::number::py_float_str;
+use synsema_core::temporal::Zone;
 use synsema_core::types::{syn_bool, syn_float, syn_int, syn_list, syn_map, syn_text, SynValue};
 
 use crate::cronexpr::{self, CronExpr};
@@ -56,8 +55,9 @@ pub enum Schedule {
     Every(f64),
     /// Una sola vez tras N segundos.
     After(f64),
-    /// Expresión cron de pared en un offset fijo.
-    At { expr: CronExpr, off: FixedOffset },
+    /// Expresión cron de pared en una zona: UTC, un offset fijo o una IANA con sus cambios
+    /// de hora.
+    At { expr: CronExpr, zone: Zone },
 }
 
 impl Schedule {
@@ -80,7 +80,7 @@ impl Schedule {
     }
     pub fn tz(&self) -> Option<String> {
         match self {
-            Schedule::At { off, .. } => Some(cronexpr::offset_label(*off)),
+            Schedule::At { zone, .. } => Some(zone.name()),
             _ => None,
         }
     }
@@ -88,7 +88,7 @@ impl Schedule {
     fn first_fire(&self) -> Option<f64> {
         match self {
             Schedule::Every(s) | Schedule::After(s) => Some(now_secs_f64() + s.max(0.0)),
-            Schedule::At { expr, off } => expr.next_after(now_secs_f64().floor() as i64, *off).map(|t| t as f64),
+            Schedule::At { expr, zone } => expr.next_after(now_secs_f64().floor() as i64, *zone).map(|t| t as f64),
         }
     }
 }
@@ -160,9 +160,9 @@ impl CronScheduler {
         self.schedule(Schedule::After(delay_seconds), name, task);
     }
 
-    /// Expresión cron de pared (`"0 9 * * *"`) en un offset fijo.
-    pub fn at(&self, expr: CronExpr, off: FixedOffset, name: &str, task: Task) {
-        self.schedule(Schedule::At { expr, off }, name, task);
+    /// Expresión cron de pared (`"0 9 * * *"`) en una zona.
+    pub fn at(&self, expr: CronExpr, zone: Zone, name: &str, task: Task) {
+        self.schedule(Schedule::At { expr, zone }, name, task);
     }
 
     /// Espera `dur` parked (cero CPU), despertable por unpark (cancelación), robusta a
@@ -207,11 +207,11 @@ impl CronScheduler {
                         return;
                     }
                 }
-                Schedule::At { expr, off } => {
+                Schedule::At { expr, zone } => {
                     // Próximo minuto de pared que matchea, DESPUÉS de ahora. Se espera
                     // en tramos de ≤ 60 s recomputando contra el reloj de pared: un
                     // salto del reloj (NTP) no deja al job dormido de más ni de menos.
-                    let target = match expr.next_after(now_secs_f64().floor() as i64, *off) {
+                    let target = match expr.next_after(now_secs_f64().floor() as i64, *zone) {
                         Some(t) => t as f64,
                         None => {
                             set_next(None);
@@ -504,15 +504,14 @@ pub fn register_cron_builtins(
                 let expr = cronexpr::parse(&expr_src).map_err(|m| {
                     err(&format!("cron_every: bad cron expression \"{}\": {}", expr_src.trim(), m))
                 })?;
-                let mut off = FixedOffset::east_opt(0).unwrap();
+                let mut zone = synsema_core::temporal::UTC;
                 if let Some(opts) = args.get(2) {
                     match opts {
                         SynValue::Map(m) => {
                             for (k, v) in m.borrow().iter() {
                                 match k.as_str() {
                                     "tz" => {
-                                        off = cronexpr::parse_offset(&raw_str(v))
-                                            .map_err(|m| err(&format!("cron_every: {}", m)))?;
+                                        zone = cronexpr::parse_zone(&raw_str(v))?;
                                     }
                                     other => {
                                         return Err(err(&format!(
@@ -532,14 +531,14 @@ pub fn register_cron_builtins(
                         }
                     }
                 }
-                if expr.next_after(now_secs_f64().floor() as i64, off).is_none() {
+                if expr.next_after(now_secs_f64().floor() as i64, zone).is_none() {
                     return Err(err(&format!(
                         "cron_every: the cron expression \"{}\" never matches within the next 5 years",
                         expr_src.trim()
                     )));
                 }
                 let (name, task) = exec(i, task_v, "cron_every").map_err(|m| err(&m))?;
-                sched_of(&sched, "cron_every")?.at(expr, off, &name, task);
+                sched_of(&sched, "cron_every")?.at(expr, zone, &name, task);
                 Ok(syn_text(name))
             }),
         );

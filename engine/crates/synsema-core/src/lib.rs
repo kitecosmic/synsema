@@ -11,6 +11,7 @@ pub mod builtin_arity;
 pub mod audit_loc;
 pub mod bundle;
 pub mod bytesutil;
+pub mod capscope;
 pub mod clock;
 pub mod codeintel;
 pub mod csv;

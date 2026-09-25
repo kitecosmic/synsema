@@ -41,6 +41,7 @@ test "bytes round-trip"
 ```bash
 synsema test path/to/file.syn       -- run the test blocks in a file
 synsema test path/to/dir            -- run every .syn under a directory
+synsema test a.syn b.syn "tests/*.test.syn"   -- several files; a glob the shell left as is (PowerShell, cmd) is expanded
 synsema test file.syn -v            -- also show the tests' print() output
 ```
 

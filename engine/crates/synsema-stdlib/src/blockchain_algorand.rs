@@ -422,6 +422,21 @@ fn algorand_address(args: &[SynValue]) -> Result<SynValue, Control> {
 
 pub(crate) fn register(interp: &Interpreter) {
     interp.register_builtin("algorand_tx", -1, Rc::new(|_i, a, _l| algorand_tx(a)));
+    // El nombre viejo (deprecado, hasta v1.0) por su cuenta: sus errores nombran la función
+    // que el programa llamó, y la de dos argumentos no es la `algorand_tx` vieja.
+    interp.register_builtin(
+        "algorand_tx_encode",
+        -1,
+        Rc::new(|_i, a, _l| {
+            if a.len() != 1 {
+                return Err(err(format!(
+                    "algorand_tx_encode(txn) takes 1 argument (the transaction map), got {} — its new name is algorand_tx(txn); to assemble a signed transaction use algorand_tx_raw(txn, signature)",
+                    a.len()
+                )));
+            }
+            algorand_tx(a)
+        }),
+    );
     interp.register_builtin("algorand_tx_raw", 2, Rc::new(|_i, a, _l| algorand_tx_raw(a)));
     interp.register_builtin("algorand_address", 1, Rc::new(|_i, a, _l| algorand_address(a)));
 }

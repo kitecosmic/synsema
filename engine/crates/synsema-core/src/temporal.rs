@@ -827,11 +827,37 @@ pub fn strftime<'a, F: fmt::Display>(
             who, spec
         )));
     }
+    // `%#z` es de chrono sólo para leer (acepta `+05`, `+0530` o `+05:30`); al escribir falla
+    // como si el valor no tuviera offset.
+    if find_spec(pattern, "#z").is_some() {
+        return Err(err(format!(
+            "{}: %#z is a parsing-only specifier (it reads +05, +0530 or +05:30) — to write the offset use %z (+0530) or %:z (+05:30)",
+            who
+        )));
+    }
     let mut out = String::new();
     write!(out, "{}", render(StrftimeItems::new(pattern))).map_err(|_| {
         err(format!("{}: the pattern {:?} asks for a field the value does not have{}", who, pattern, missing))
     })?;
     Ok(out)
+}
+
+/// La posición (en bytes) del primer `%<spec>` de `pattern` que es un especificador: `%%Z` es
+/// un `%` literal seguido de una `Z`, no un `%Z`.
+fn find_spec(pattern: &str, spec: &str) -> Option<usize> {
+    let b = pattern.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            if pattern[i + 1..].starts_with(spec) {
+                return Some(i);
+            }
+            i += if b.get(i + 1) == Some(&b'%') { 2 } else { 1 };
+            continue;
+        }
+        i += 1;
+    }
+    None
 }
 
 /// El primer especificador de `pattern` que chrono no entiende: el `%` con lo que lo sigue.
@@ -862,6 +888,15 @@ pub fn parse_date(args: &[SynValue]) -> Result<SynValue, Control> {
     }
 }
 
+/// La hora de pared de `text` con `format`; un formato de SÓLO fecha (`%Y-%m-%d`) es la
+/// medianoche de ese día, como el `strptime` de Python, `datetime("2026-01-03")` y `parse_time`.
+fn naive_from_format(text: &str, format: &str) -> Result<NaiveDateTime, chrono::ParseError> {
+    NaiveDateTime::parse_from_str(text, format).or_else(|e| match NaiveDate::parse_from_str(text, format) {
+        Ok(d) => Ok(d.and_time(NaiveTime::MIN)),
+        Err(_) => Err(e),
+    })
+}
+
 pub fn parse_datetime(args: &[SynValue]) -> Result<SynValue, Control> {
     const W: &str = "parse_datetime";
     let tz = match args.get(2) {
@@ -871,12 +906,38 @@ pub fn parse_datetime(args: &[SynValue]) -> Result<SynValue, Control> {
     match (args.first(), args.get(1)) {
         (Some(SynValue::Text(t)), None | Some(SynValue::Nothing)) => parse_iso_datetime(t, tz, W).map(|d| value(Temporal::DateTime(d))),
         (Some(SynValue::Text(t)), Some(SynValue::Text(f))) => {
+            // `%Z` al parsear: chrono se saltea la abreviatura, y `IST` es India, Irlanda o
+            // Israel. Sólo las marcas que nombran UTC sin ambigüedad (`UTC`, `GMT`, `Z`, como
+            // acepta el `strptime` de Python, en cualquier caja) valen; cualquier otra es un
+            // error, no 10:00 UTC. Si el formato también lee un offset (`%z %Z`, como
+            // `+0530 (IST)`), el offset identifica el instante y la abreviatura es sólo texto.
+            let has_offset = ["z", ":z", "::z", ":::z", "#z"].iter().any(|s| find_spec(f, s).is_some());
+            if let (Some(i), false) = (find_spec(f, "Z"), has_offset) {
+                for mark in ["UTC", "utc", "Utc", "GMT", "gmt", "Gmt", "Z", "z"] {
+                    let lit = format!("{}{}{}", &f[..i], mark, &f[i + 2..]);
+                    if let Ok(naive) = naive_from_format(t.trim(), &lit) {
+                        let dt = UTC.from_utc_datetime(&naive);
+                        return Ok(value(Temporal::DateTime(match tz {
+                            Some(z) => dt.with_timezone(&z),
+                            None => dt,
+                        })));
+                    }
+                }
+                // Si el resto del texto encaja, lo que sobra es la abreviatura; si no, el
+                // problema está en otra parte y lo dice el error de siempre (abajo).
+                if naive_from_format(t.trim(), f).is_ok() {
+                    return Err(err(format!(
+                        "{}: %Z reads a zone abbreviation, and an abbreviation does not identify a zone (IST is India, Ireland or Israel) — only UTC and GMT are accepted there; for an offset use %z (\"+05:30\"), or drop the abbreviation and pass the zone: parse_datetime(text, format, \"Asia/Kolkata\")",
+                        W
+                    )));
+                }
+            }
             // Con `%z` el texto trae su offset: se conserva (o se convierte a `tz` si se pasó).
             if let Ok(dt) = DateTime::parse_from_str(t.trim(), f) {
                 let zone = tz.unwrap_or_else(|| Zone::fixed(dt.offset().local_minus_utc()));
                 return Ok(value(Temporal::DateTime(dt.with_timezone(&zone))));
             }
-            let naive = NaiveDateTime::parse_from_str(t.trim(), f)
+            let naive = naive_from_format(t.trim(), f)
                 .map_err(|e| err(format!("{}: {:?} does not match {:?}: {}", W, t.as_ref(), f.as_ref(), e)))?;
             local_to_dt(tz.unwrap_or(UTC), naive, W).map(|d| value(Temporal::DateTime(d)))
         }

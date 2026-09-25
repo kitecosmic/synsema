@@ -430,3 +430,24 @@ fn audit_unix_socket_sink_streams_lines() {
     assert!(received.contains("\"capability\"") && received.contains("file_read"), "{}", received);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// v0.6.30: `synsema test a b` corre los dos (antes quedaba el último, en silencio), y un glob
+/// que el shell no expandió (PowerShell, cmd) se expande en el último componente.
+#[test]
+fn test_takes_several_files_and_a_glob() {
+    let dir = project("test-many");
+    std::fs::create_dir_all(dir.join("t")).unwrap();
+    std::fs::write(dir.join("t/a.test.syn"), "test \"a\"\n    assert_eq(1, 1)\n").unwrap();
+    std::fs::write(dir.join("t/b.test.syn"), "test \"b\"\n    assert_eq(2, 3)\n").unwrap();
+    std::fs::write(dir.join("t/c.syn"), "test \"c\"\n    assert_eq(3, 3)\n").unwrap();
+    let (code, out, _) = synsema(&dir, &["test", "t/a.test.syn", "t/b.test.syn"], None);
+    assert_eq!(code, 1, "{}", out);
+    assert!(out.contains("t/a.test.syn:") && out.contains("t/b.test.syn:") && out.contains("1 passed, 1 failed (2 total)"), "{}", out);
+    let (code, out, _) = synsema(&dir, &["test", "t/*.test.syn"], None);
+    assert_eq!(code, 1, "{}", out);
+    assert!(out.contains("t/a.test.syn:") && !out.contains("c.syn") && out.contains("(2 total)"), "{}", out);
+    let (code, _, err) = synsema(&dir, &["test", "t/*.nope"], None);
+    assert_eq!(code, 2);
+    assert!(err.contains("no .syn files in 't/*.nope'"), "{}", err);
+    let _ = std::fs::remove_dir_all(&dir);
+}

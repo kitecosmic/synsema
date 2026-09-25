@@ -76,6 +76,9 @@ pub const BUILTIN_ARITY: &[(&str, usize, Option<usize>)] = &[
     ("evm_nonce", 2, Some(3)),
     ("solana_tx", 1, Some(2)),
     ("algorand_tx", 1, Some(2)),
+    // Los nombres viejos aceptan el segundo argumento para explicar que ya no existe.
+    ("solana_message", 1, Some(2)),
+    ("algorand_tx_encode", 1, Some(2)),
     ("abi_decode_log", 2, Some(3)),
     ("sort", 1, Some(2)),
     ("sort_by", 2, Some(3)),

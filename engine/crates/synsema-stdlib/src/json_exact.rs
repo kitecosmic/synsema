@@ -71,6 +71,12 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// ¿Empieza acá la palabra `word`, entera (no seguida de una letra, dígito o `_`)?
+    fn word_at(&self, word: &[u8]) -> bool {
+        self.s[self.i..].starts_with(word)
+            && !self.s.get(self.i + word.len()).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+    }
+
     fn lit(&mut self, word: &[u8], v: SynValue) -> Result<SynValue, String> {
         if self.s[self.i..].starts_with(word) {
             self.i += word.len();
@@ -91,12 +97,14 @@ impl<'a> Parser<'a> {
             Some(b'{') => self.object(),
             // `NaN`, `Infinity`, `-Infinity`: no son JSON estándar, pero son lo que escriben
             // `json_encode` (y Python) para esos floats; se leen sólo si se pidió.
-            Some(b'N' | b'I') if !self.allow_nan => Err(self.fail(
+            // Sólo la palabra entera: `NaNa` o `Infinityx` son basura, no un NaN.
+            Some(b'N' | b'I') if !self.allow_nan && (self.word_at(b"NaN") || self.word_at(b"Infinity")) => Err(self.fail(
                 "NaN/Infinity is not JSON (a NaN passes every `x <= 0` check) — to read them on purpose: json_decode(text, allow_nan = true)",
             )),
-            Some(b'-') if !self.allow_nan && self.s[self.i..].starts_with(b"-Infinity") => Err(self.fail(
+            Some(b'-') if !self.allow_nan && self.word_at(b"-Infinity") => Err(self.fail(
                 "-Infinity is not JSON — to read it on purpose: json_decode(text, allow_nan = true)",
             )),
+            Some(b'N' | b'I') if !self.allow_nan => Err(self.fail("expected value")),
             Some(b'N') => self.lit(b"NaN", SynValue::Number(Number::Float(f64::NAN))),
             Some(b'I') => self.lit(b"Infinity", SynValue::Number(Number::Float(f64::INFINITY))),
             Some(b'-') if self.s[self.i..].starts_with(b"-Infinity") => {

@@ -187,6 +187,13 @@ fn write(v: &SynValue, out: &mut String, depth: usize, path: &str) -> Result<(),
                 path
             )))
         }
+        SynValue::Task(_) | SynValue::Builtin(_) => {
+            return Err(err(format!(
+                "canonical_json: {} is {}, not data — JSON cannot represent it (only text, numbers, bools, nothing, lists and maps)",
+                path,
+                synsema_core::rng::code_noun(v)
+            )))
+        }
         other => {
             return Err(err(format!(
                 "canonical_json: {} is a {} and JSON cannot represent it (only text, numbers, bools, nothing, lists and maps)",

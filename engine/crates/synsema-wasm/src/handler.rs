@@ -414,7 +414,7 @@ fn dispatch(app: &mut App, req: &HttpRequestIn) -> (HttpResponseOut, Vec<String>
         }
     }
 
-    let min_ctx = |params: IndexMap<String, String>, json: Option<serde_json::Value>| Ctx {
+    let min_ctx = |params: IndexMap<String, String>, json: Option<SynValue>| Ctx {
         method: method.clone(),
         path: path.clone(),
         query: query.clone(),
@@ -464,10 +464,12 @@ fn dispatch(app: &mut App, req: &HttpRequestIn) -> (HttpResponseOut, Vec<String>
     let route = &cap.routes[idx];
 
     // Parse del body JSON (sólo error si el cliente declaró JSON).
-    let mut json_obj: Option<serde_json::Value> = None;
+    // El parser de `json_decode` (como el server nativo): `request.json` y
+    // `json_decode(request.body)` dan lo mismo.
+    let mut json_obj: Option<SynValue> = None;
     if !body_str.is_empty() {
         let ctype = header_value(&req.headers, "content-type").to_lowercase();
-        match serde_json::from_str::<serde_json::Value>(&body_str) {
+        match synsema_stdlib::json_exact::parse(&body_str) {
             Ok(v) => json_obj = Some(v),
             Err(_) => {
                 if ctype.contains("json") {

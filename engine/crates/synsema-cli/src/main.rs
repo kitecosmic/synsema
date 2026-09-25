@@ -1795,25 +1795,24 @@ fn cmd_test(args: &[String]) -> ExitCode {
     };
     let mut flat = false;
     let mut verbose = false;
-    let mut path: Option<String> = None;
+    // Varios archivos o directorios, como `cargo test`/`pytest`/`go test` (antes quedaba el
+    // último en silencio: `synsema test a.syn b.syn` corría sólo b.syn).
+    let mut paths: Vec<String> = Vec::new();
     for a in &host.rest {
         match a.as_str() {
             "--flat" => flat = true,
             "-v" | "--verbose" => verbose = true,
-            p if !p.starts_with('-') => path = Some(p.to_string()),
+            p if !p.starts_with('-') => paths.push(p.to_string()),
             other => {
                 eprintln!("synsema test: unknown flag '{}'", other);
                 return ExitCode::from(2);
             }
         }
     }
-    let path = match path {
-        Some(p) => p,
-        None => {
-            eprintln!("uso: synsema test [-v] [--flat] [--sandbox | --cap-set <list>] [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | dir>");
-            return ExitCode::from(2);
-        }
-    };
+    if paths.is_empty() {
+        eprintln!("uso: synsema test [-v] [--flat] [--sandbox | --cap-set <list>] [--profile native|pure] [--audit json|<ruta>|fd:N] <archivo.syn | dir>...");
+        return ExitCode::from(2);
+    }
     // Techo de capabilities del host (--sandbox/--cap-set): opt-in, defense-in-depth.
     let ceiling = match host.ceiling("test") {
         Ok(c) => c,
@@ -1826,16 +1825,24 @@ fn cmd_test(args: &[String]) -> ExitCode {
         return code;
     }
     host::set_program_args(host.program_args.clone());
-    let files = match collect_syn_files(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("no se pudo acceder a '{}': {}", path, e);
+    let mut files: Vec<String> = Vec::new();
+    for path in &paths {
+        let found = match collect_syn_files(path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("synsema test: cannot read '{}': {}", path, e);
+                return ExitCode::from(2);
+            }
+        };
+        if found.is_empty() {
+            eprintln!("synsema test: no .syn files in '{}'", path);
             return ExitCode::from(2);
         }
-    };
-    if files.is_empty() {
-        eprintln!("no se encontraron archivos .syn en '{}'", path);
-        return ExitCode::from(2);
+        for f in found {
+            if !files.contains(&f) {
+                files.push(f);
+            }
+        }
     }
     let multi = files.len() > 1;
     let mut total_passed = 0usize;
@@ -1900,7 +1907,24 @@ fn collect_syn_files(path: &str) -> std::io::Result<Vec<String>> {
         out.sort();
         return Ok(out);
     }
-    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no es un archivo ni un directorio"))
+    // `tests/*.test.syn` llega sin expandir desde PowerShell y cmd (no expanden globs): se
+    // expande acá, en el último componente, con el mismo `fnmatch` de los scopes.
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name.contains(['*', '?']) {
+        // El directorio como lo escribió el usuario (`tests/`), no reescrito con `\`.
+        let dir = &path[..path.len() - name.len()];
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(if dir.is_empty() { "." } else { dir })? {
+            let entry = entry?;
+            let file = entry.file_name().to_string_lossy().into_owned();
+            if entry.path().is_file() && synsema_core::capscope::fnmatch(&file, name) {
+                out.push(format!("{}{}", dir, file));
+            }
+        }
+        out.sort();
+        return Ok(out);
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::NotFound, "not a file or a directory"))
 }
 
 fn collect_syn_dir(dir: &std::path::Path, out: &mut Vec<String>) -> std::io::Result<()> {

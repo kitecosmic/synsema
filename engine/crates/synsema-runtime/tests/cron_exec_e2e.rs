@@ -550,7 +550,7 @@ task probe(expr, opts)
 print(probe("0 9 *", nothing))
 print(probe("0 25 * * *", nothing))
 print(probe("@reboot", nothing))
-print(probe("0 9 * * *", {"tz": "America/Sao_Paulo"}))
+print(probe("0 9 * * *", {"tz": "Mars/Olympus"}))
 print(probe("0 9 * * *", {"zone": "UTC"}))
 print(probe("0 0 31 2 *", nothing))
 print(probe(5, {"tz": "UTC"}))
@@ -560,7 +560,7 @@ print(length(cron_list()))"#,
     assert!(o[0].contains("bad cron expression \"0 9 *\"") && o[0].contains("expected 5 fields"), "{}", o[0]);
     assert!(o[1].contains("hour 25 is out of range 0-23"), "{}", o[1]);
     assert!(o[2].contains("cron_after(0, task)"), "{}", o[2]);
-    assert!(o[3].contains("not supported") && o[3].contains("-03:00"), "{}", o[3]);
+    assert!(o[3].contains("unknown time zone \"Mars/Olympus\"") && o[3].contains("America/Buenos_Aires"), "{}", o[3]);
     assert!(o[4].contains("unknown option \"zone\""), "{}", o[4]);
     assert!(o[5].contains("never matches within the next 5 years"), "{}", o[5]);
     assert!(o[6].contains("options are only accepted with a cron expression"), "{}", o[6]);

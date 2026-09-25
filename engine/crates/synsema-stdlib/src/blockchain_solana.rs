@@ -633,6 +633,21 @@ fn spl_transfer_checked_data(args: &[SynValue]) -> Result<SynValue, Control> {
 
 pub(crate) fn register(interp: &Interpreter) {
     interp.register_builtin("solana_tx", -1, Rc::new(|_i, a, _l| solana_tx(a)));
+    // El nombre viejo (deprecado, hasta v1.0) por su cuenta: sus errores nombran la función
+    // que el programa llamó, y la de dos argumentos no es la `solana_tx` vieja.
+    interp.register_builtin(
+        "solana_message",
+        -1,
+        Rc::new(|_i, a, _l| {
+            if a.len() != 1 {
+                return Err(err(format!(
+                    "solana_message(params) takes 1 argument (the params map), got {} — its new name is solana_tx(params); to assemble a signed transaction use solana_tx_raw(message, signatures)",
+                    a.len()
+                )));
+            }
+            solana_tx(a)
+        }),
+    );
     interp.register_builtin("solana_tx_raw", 2, Rc::new(|_i, a, _l| solana_tx_raw(a)));
     // -- Batch 13 (alcance D): PDAs + SPL, PUROS (derivan direcciones/datos públicos) --
     interp.register_builtin("solana_pda", 2, Rc::new(|_i, a, _l| solana_pda(a)));

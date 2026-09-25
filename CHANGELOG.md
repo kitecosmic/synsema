@@ -6,6 +6,102 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.30 — unreleased
+
+Fixes from the v0.6.29 audit, plus three things data and scheduling code kept asking for: cron in
+an IANA time zone, decimals written with an exponent, and Parquet files that pandas and polars read
+with their types. Nothing that worked right stops working; what changes is silent wrong results that
+are now errors, and error messages that now say what to write.
+
+**New.**
+
+- **`cron_every` takes an IANA zone**: `cron_every("0 9 * * *", report, {"tz": "America/Santiago"})`
+  runs at 09:00 Santiago time all year. Clock changes follow the rule every Linux cron uses (Vixie
+  cron / cronie): a fixed time that falls in the hour skipped in spring runs right after the jump
+  instead of being lost; a fixed time in the hour repeated in autumn runs once, the first time; a job
+  with `*` in the minute or hour field (`*/15 * * * *`, `0 * * * *`) follows real time, so skipped
+  minutes do not exist and the repeated hour runs twice. Fixed offsets (`"-03:00"`) work as before;
+  an unknown zone is an error at registration. `cron_list()` shows the zone name in `tz`.
+- **A decimal can be written with an exponent**: `decimal("1.5e-3")` → `0.0015`, `decimal("1e5")` →
+  `100000`, `2e3d` → `2000`. The value is exact (mantissa × 10^exponent), like Postgres `numeric`;
+  the scale is the mantissa's minus the exponent (`decimal("1.50e1")` → `15.0`). A CSV column typed
+  `decimal` reads the same way. A value of more than 4300 digits (`"1e999999999"`) is an error, so a
+  short text cannot ask for unbounded memory.
+- **`parquet_write` writes the Arrow schema** (`ARROW:schema`), as pyarrow, polars and arrow-rs do:
+  pandas, pyarrow and polars read a `duration` column as a duration (`timedelta64`) and a `datetime`
+  column with its IANA zone (`datetime64[us, Europe/Madrid]`), not as an integer and UTC. A
+  fixed-offset zone (`+05:30`) goes as UTC in that schema, because polars cannot open a file with
+  one; Synsema still reads the offset back.
+- **`synsema test` takes several files and directories** (`synsema test a.syn b.syn tests/`), and
+  expands a glob the shell passed as is (PowerShell and cmd do not expand `tests/*.test.syn`). It
+  used to run only the last path, without saying so.
+
+**Silent wrong results that are now errors (or right).**
+
+- **`parse_datetime` with `%Z` no longer ignores the zone.** `parse_datetime("24/09/2026 10:00 IST",
+  "%d/%m/%Y %H:%M %Z")` gave 10:00 UTC. An abbreviation does not identify a zone (IST is India,
+  Ireland or Israel), so it is now an error. `UTC` and `GMT` are unambiguous and still work, in any
+  case, as in Python (an HTTP date parses); with `%z` in the same format (`"+0530 (IST)"`) the offset
+  decides and the abbreviation is just text. **What to write instead:** `%z` for an offset
+  (`+05:30`), or drop the abbreviation from the text and pass the zone:
+  `parse_datetime(text, format, "Asia/Kolkata")`.
+- **`parse_datetime` with a date-only format is midnight**: `parse_datetime("03/01/2026", "%d/%m/%Y")`
+  → `2026-01-03T00:00:00Z` (it failed with `input is not enough`), like Python's `strptime` and
+  `parse_time`; with a zone, midnight in that zone.
+- **`polyval` keeps `nothing` apart from NaN.** A missing coefficient is an error (there is no
+  polynomial); a missing `x` in a list stays `nothing` in its place, like `cumsum`:
+  `polyval([2.0, 1.0], [1, nothing, 3])` → `[3.0, nothing, 7.0]` (was `[3.0, nan, 7.0]`). The same
+  error for a missing value in `lstsq`'s `b`. **What to write instead:** `drop_missing(xs)` first.
+- **`length` of a 0-d array is an error** (it gave 0, so a scalar looked empty; numpy raises too).
+  **What to write instead:** `size(a)`, which is 1.
+- **`json_encode`, `jsonl_encode` and `json_for_script` reject a task or a generator** instead of
+  writing its text (`json_encode(rng(1))` gave `"builtin:rng(1)"`, revealing the seed and not the
+  state). The error names where it is: `json_encode: the value["f"] is a task, not data`.
+  `canonical_json` now says "generator" for a generator. **What to write instead:** store what the
+  task computes, or leave it out of the value.
+- **`int(x, 2.0)` is the same mistake as `int(x, 2)`**: a number with an integral value from 2 to
+  36 in second place is an error that points at `base =` or `fallback =` (it returned `2.0` for any
+  text that did not parse). **What to write instead:** `int(x, base = 2)` or `int(x, fallback = 2.0)`.
+- **`request.json` reads the body with the same parser as `json_decode`**: `{"v": -0}` gives `0` in
+  both (it was `-0.0` in `request.json`), and a body that starts with a byte order mark is read
+  instead of answered with 400.
+- **Parquet: durations round-trip.** `parquet_write` writes a `duration` column as INT64 (as Arrow
+  does) with its unit in the file metadata (`synsema.durations`), in microseconds, or nanoseconds
+  when a value needs them; `parquet_read` reads it back as a duration, and also reads the Arrow
+  `duration` type that pyarrow and polars write (it came back as an integer without a unit).
+  `parquet_read(parquet_write(rows)) == rows` holds with durations, including a `TIME` column read
+  from another tool.
+
+**Faster.**
+
+- **`index_of` no longer copies the list** before searching: an early hit is O(1), like `in` and
+  `contains`.
+
+**Warnings and messages.**
+
+- The deprecated-name warning is printed for a module loaded with `use`, once, like for the main file.
+- `solana_message(1, 2)` and `algorand_tx_encode({}, 1)` name the function that was called (they
+  spoke about `solana_tx` and `algorand_tx`).
+- A C-style `//` comment gets the hint "comments in Synsema start with `--`": at the start of a line,
+  after code (`let x be 1 // a note of several words`, whose error was about whatever word came
+  next), on an indented line of its own, and when the note has an apostrophe (`// don't`, an
+  unterminated string); also in `let x be 1 // note` when `note` is not a variable. `//` is integer
+  division, which does not change.
+- `set xs[10] to 1` out of range says where and the length, like reading `xs[10]`.
+- `bytes(33)` suggests `int_to_bytes(33, size)` and `bytes([33])`.
+- `json_decode("Infinityx")` and `json_decode("NaNa")` are the generic invalid-JSON error with the
+  position, not "NaN/Infinity is not JSON".
+- `format_time(t, "%#z")` says that `%#z` is a parsing-only specifier and points at `%z` / `%:z`.
+- `synsema check` warns about `\u` only where the escape is decoded (`"\uD800"` alone and
+  `"\u{110000}"` stay literal text, as before).
+- `synsema check` warns when a task writes into a parameter and neither gives it back, passes it on,
+  nor reads what it wrote: with value semantics that write is lost. **What to write instead:** end
+  the task with `give cfg` and call it as `set c to touch(c)`.
+- Reading a name a module does not export suggests the form it has: `export enum Color`,
+  `export task helper`.
+- `synsema check` decides file scopes with the runtime's own matcher: `require file.read("./**")`
+  covers `read_file("x.csv")`, as it does when the program runs.
+
 ## v0.6.29 — 2026-09-24
 
 Everything that had to break before v1.0, broken once (after v1.0 nothing breaks), plus EVM

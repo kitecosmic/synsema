@@ -803,7 +803,24 @@ pub fn nd_value(a: ArrayD<f64>) -> SynValue {
 }
 
 /// Datos 1-D de una lista de números o un array 1-D (para corr/cov/polyfit/…).
+/// Un vector de floats. Un `nothing` (dato faltante) es un error: pasarlo a NaN (resultado
+/// inválido) confundiría las dos cosas en silencio. Quien sabe saltear faltantes usa
+/// `vector_with_gaps` y los mira en la lista original.
 fn vector(v: &SynValue, name: &str) -> Result<Vec<f64>, Control> {
+    if let SynValue::List(l) = v {
+        if let Some(i) = l.borrow().iter().position(|x| matches!(x, SynValue::Nothing)) {
+            return Err(err(format!(
+                "{}: position {} is nothing (a missing value), and there is no number to compute with — drop the missing values first: drop_missing(xs)",
+                name, i
+            )));
+        }
+    }
+    vector_with_gaps(v, name)
+}
+
+/// Como `vector`, con NaN en el lugar de cada `nothing`: sólo para quien después saltea esas
+/// posiciones mirando la lista original (`pairs`).
+fn vector_with_gaps(v: &SynValue, name: &str) -> Result<Vec<f64>, Control> {
     match v {
         SynValue::Array(a) => {
             if a.ndim() != 1 {
@@ -1004,7 +1021,7 @@ pub fn diff(args: &[SynValue], axis: Option<SynValue>) -> Result<SynValue, Contr
 
 /// Pares presentes de dos vectores (se saltean los pares con un faltante; NaN propaga).
 fn pairs(x: &SynValue, y: &SynValue, name: &str) -> Result<(Vec<f64>, Vec<f64>), Control> {
-    let (xs, ys) = (vector(x, name)?, vector(y, name)?);
+    let (xs, ys) = (vector_with_gaps(x, name)?, vector_with_gaps(y, name)?);
     if xs.len() != ys.len() {
         return Err(err(format!("{}: the two series have different lengths ({} and {})", name, xs.len(), ys.len())));
     }
@@ -1153,15 +1170,21 @@ pub fn polyfit(args: &[SynValue]) -> Result<SynValue, Control> {
 }
 
 /// `polyval(coefs, x)`: evalúa el polinomio (grado más alto primero) en un número, lista o array.
+/// Un coeficiente faltante es un error (no hay polinomio); un `x` faltante en una lista queda
+/// `nothing` en su lugar, como en `cumsum`.
 pub fn polyval(args: &[SynValue]) -> Result<SynValue, Control> {
     let coefs = vector(arg(args, 0)?, "polyval")?;
     let eval = |x: f64| coefs.iter().fold(0.0, |acc, c| acc * x + c);
     match arg(args, 1)? {
         SynValue::Number(n) => Ok(syn_float(eval(n.to_f64()))),
         SynValue::Array(a) => Ok(syn_array(a.mapv(eval))),
+        SynValue::Nothing => Ok(SynValue::Nothing),
         other => {
-            let xs = vector(other, "polyval")?;
-            Ok(crate::types::syn_list(xs.into_iter().map(|x| syn_float(eval(x))).collect()))
+            let xs = vector_with_gaps(other, "polyval")?;
+            let gap = |i: usize| matches!(other, SynValue::List(l) if matches!(l.borrow().get(i), Some(SynValue::Nothing)));
+            Ok(crate::types::syn_list(
+                xs.into_iter().enumerate().map(|(i, x)| if gap(i) { SynValue::Nothing } else { syn_float(eval(x)) }).collect(),
+            ))
         }
     }
 }

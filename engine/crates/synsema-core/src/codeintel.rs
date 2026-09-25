@@ -1359,7 +1359,10 @@ fn covered(declared: &[(String, Option<String>)], cap: &str, scope: &Option<Stri
                     || d == s
                     || s.starts_with(&format!("{}/", d))
                     || s.ends_with(&format!(".{}", d.trim_start_matches("*."))) && d.starts_with("*.")
-                    // Un glob (`require file.read("./*")`) cubre lo que cubre en el runtime
+                    // Una ruta se decide con el MISMO matcher que el runtime (`./**` cubre
+                    // `x.csv`: las dos se normalizan antes del glob).
+                    || (cap.starts_with("file") && crate::capscope::path_covers(d, s))
+                    // Un glob (`require net("*.x")`…) cubre lo que cubre en el runtime
                     // (`fnmatch`: `*` es cualquier cosa, `?` un carácter).
                     || (d.contains(['*', '?']) && fnmatch(s, d))
             }
@@ -1380,19 +1383,8 @@ fn net_scope_host(d: &str) -> String {
     }
 }
 
-/// `fnmatch` como el del runtime (`synsema-capabilities`): `*` cero o más caracteres, `?` uno.
-fn fnmatch(name: &str, pattern: &str) -> bool {
-    fn go(n: &[char], p: &[char]) -> bool {
-        match p.split_first() {
-            None => n.is_empty(),
-            Some((&'*', rest)) => (0..=n.len()).any(|k| go(&n[k..], rest)),
-            Some((&'?', rest)) => !n.is_empty() && go(&n[1..], rest),
-            Some((&c, rest)) => !n.is_empty() && n[0] == c && go(&n[1..], rest),
-        }
-    }
-    let (n, p): (Vec<char>, Vec<char>) = (name.chars().collect(), pattern.chars().collect());
-    go(&n, &p)
-}
+// `fnmatch` del runtime (`synsema-capabilities` lo re-exporta de acá): `*` cero o más, `?` uno.
+use crate::capscope::fnmatch;
 
 /// `caps(path?)`: contrato de capabilities por archivo (declaradas, necesarias, faltantes).
 pub fn caps(root: &Root, path: Option<&str>) -> Value {
@@ -1949,6 +1941,25 @@ task check_token(req)
         let root = tmp_root(&[("g.syn", "require file.read(\"./data/*.csv\")\nlet t be read_file(\"./x.csv\")\n")]);
         let c = caps(&root, None);
         assert_eq!(c["files"][0]["missing"].as_array().unwrap().len(), 1, "{}", c);
+    }
+
+    /// v0.6.30: el mismo matcher que el runtime, con las rutas normalizadas: `./**` cubre
+    /// `x.csv` y `sub/y.csv` (el runtime las permite), `./data/*` cubre `data/../data/z.csv`, y
+    /// un glob que no las cubre sigue avisando.
+    #[test]
+    fn caps_glob_scope_normalizes_like_runtime() {
+        let missing = |src: &str| -> usize {
+            let root = tmp_root(&[("g.syn", src)]);
+            caps(&root, None)["files"][0]["missing"].as_array().unwrap().len()
+        };
+        assert_eq!(missing("require file.read(\"./**\")\nlet t be read_file(\"x.csv\")\n"), 0);
+        assert_eq!(missing("require file.read(\"./**\")\nlet t be read_file(\"sub/y.csv\")\n"), 0);
+        assert_eq!(missing("require file.read(\"./data/*\")\nlet t be read_file(\"data/../data/z.csv\")\n"), 0);
+        assert_eq!(missing("require file.read(\"./data/*\")\nlet t be read_file(\"data/../x.csv\")\n"), 1);
+        assert_eq!(missing("require file.read(\"./*.json\")\nlet t be read_file(\"x.csv\")\n"), 1);
+        for (grant, req) in [("./**", "x.csv"), ("./data/*", "./data/../data/z.csv"), ("x.csv", "./x.csv")] {
+            assert!(crate::capscope::path_covers(grant, req), "{} ⊇ {}", grant, req);
+        }
     }
 
     #[test]

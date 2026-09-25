@@ -9,7 +9,9 @@
 //!   (todas opcionales: `nothing` es nulo): entero → INT64, número con decimales → DOUBLE,
 //!   decimal → DECIMAL(38, escala), texto → STRING, bool, bytes, date → DATE,
 //!   datetime → TIMESTAMP(µs, UTC), y la zona IANA de cada columna de datetimes va en los
-//!   metadatos del archivo (`synsema.timezones`): al leer vuelve con su zona. Al leer también
+//!   metadatos del archivo (`synsema.timezones`): al leer vuelve con su zona. Una `duration`
+//!   va como INT64 (como la guarda Arrow) con su unidad en `synsema.durations`; al leer se
+//!   reconoce esa clave y el tipo `Duration` del esquema Arrow (pyarrow, polars). Al leer también
 //!   se entienden timestamps en milisegundos, microsegundos y NANOSEGUNDOS (los de polars y
 //!   pandas). Una columna que mezcla tipos o un valor anidado es un error
 //!   con el nombre de la columna. `opts.compression` = "snappy" (default), "zstd", "gzip",
@@ -36,6 +38,8 @@ use synsema_core::types::{syn_bool, syn_bytes, syn_float, syn_list, syn_map, syn
 
 /// Clave de los metadatos del archivo con la zona IANA de cada columna de datetimes.
 const TZ_KEY: &str = "synsema.timezones";
+/// Clave de los metadatos con la unidad (`"us"` o `"ns"`) de cada columna de durations.
+const DUR_KEY: &str = "synsema.durations";
 
 fn err(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::new(msg))
@@ -151,6 +155,9 @@ impl<'a> Fb<'a> {
     fn byte(&self, t: usize, i: usize) -> Option<u8> {
         self.0.get(self.field(t, i)?).copied()
     }
+    fn short(&self, t: usize, i: usize) -> Option<i16> {
+        self.u16_at(self.field(t, i)?).map(|v| v as i16)
+    }
     fn string(&self, t: usize, i: usize) -> Option<&'a str> {
         let s = self.table(t, i)?;
         let n = self.u32_at(s)? as usize;
@@ -163,14 +170,20 @@ impl<'a> Fb<'a> {
     }
 }
 
-/// `columna → zona` de las columnas timestamp de primer nivel que traen zona en el esquema
-/// Arrow. Un esquema ilegible no es un error: el archivo se lee igual, en UTC.
-fn arrow_timezones(b64: &str) -> std::collections::HashMap<String, String> {
-    // Arrow: Message.header_type Schema = 1; Type Timestamp = 10.
+/// Lo que el esquema Arrow dice de las columnas de primer nivel: `columna → zona` de los
+/// timestamps con zona, y `columna → nanosegundos por unidad` de las durations (Arrow las guarda
+/// como INT64 sin tipo lógico de Parquet: sin esto llegarían como enteros sin unidad). Un
+/// esquema ilegible no es un error: el archivo se lee igual, en UTC y sin durations.
+#[allow(clippy::type_complexity)]
+fn arrow_schema(b64: &str) -> (std::collections::HashMap<String, String>, std::collections::HashMap<String, i64>) {
+    // Arrow: Message.header_type Schema = 1; Type Timestamp = 10, Duration = 18;
+    // TimeUnit SECOND = 0, MILLISECOND = 1 (el default de Duration), MICROSECOND = 2, NANOSECOND = 3.
     const SCHEMA: u8 = 1;
     const TIMESTAMP: u8 = 10;
+    const DURATION: u8 = 18;
     let mut out = std::collections::HashMap::new();
-    let Ok(raw) = synsema_core::bytesutil::b64_decode(b64.trim()) else { return out };
+    let mut durs = std::collections::HashMap::new();
+    let Ok(raw) = synsema_core::bytesutil::b64_decode(b64.trim()) else { return (out, durs) };
     // Mensaje encapsulado: [0xFFFFFFFF] + largo (i32) + flatbuffer (el formato viejo no trae la marca).
     let mut p = if raw.get(..4) == Some(&[0xff; 4][..]) { 4 } else { 0 };
     let msg = match raw.get(p..p + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize) {
@@ -190,16 +203,41 @@ fn arrow_timezones(b64: &str) -> std::collections::HashMap<String, String> {
         let (start, n) = fb.vector(schema, 1)?;
         for k in 0..n.min(100_000) {
             let f = fb.deref(start + 4 * k)?;
-            if fb.byte(f, 2) != Some(TIMESTAMP) {
-                continue;
-            }
-            if let (Some(name), Some(tz)) = (fb.string(f, 0), fb.table(f, 3).and_then(|ts| fb.string(ts, 1))) {
-                out.insert(name.to_string(), tz.to_string());
+            match fb.byte(f, 2) {
+                Some(TIMESTAMP) => {
+                    if let (Some(name), Some(tz)) = (fb.string(f, 0), fb.table(f, 3).and_then(|ts| fb.string(ts, 1))) {
+                        out.insert(name.to_string(), tz.to_string());
+                    }
+                }
+                Some(DURATION) => {
+                    let per = match fb.table(f, 3).and_then(|d| fb.short(d, 0)).unwrap_or(1) {
+                        0 => 1_000_000_000,
+                        1 => 1_000_000,
+                        2 => 1_000,
+                        3 => 1,
+                        _ => continue,
+                    };
+                    if let Some(name) = fb.string(f, 0) {
+                        durs.insert(name.to_string(), per);
+                    }
+                }
+                _ => {}
             }
         }
         Some(())
     })();
-    out
+    (out, durs)
+}
+
+/// Una duration de `n` unidades de `per` nanosegundos; `None` si no entra en una duration.
+fn duration_of(n: i64, per: i64) -> Option<SynValue> {
+    let d = match per {
+        1 => chrono::Duration::nanoseconds(n),
+        1_000 => chrono::Duration::microseconds(n),
+        1_000_000 => chrono::Duration::try_milliseconds(n)?,
+        _ => chrono::Duration::try_seconds(n)?,
+    };
+    Some(SynValue::Time(Rc::new(Temporal::Duration(d))))
 }
 
 /// La zona de un esquema Arrow como zona de Synsema: un nombre IANA (`Europe/Madrid`), `UTC`/`Z`
@@ -434,15 +472,40 @@ fn parquet_read(args: &[SynValue]) -> Result<SynValue, Control> {
         }
     }
     let mut zones: std::collections::HashMap<String, synsema_core::temporal::Zone> = std::collections::HashMap::new();
+    // Columnas INT64 que son durations: `columna → nanosegundos por unidad`.
+    let mut durs: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
     if let Some(kvs) = fmeta.key_value_metadata() {
         // Primero la zona del esquema Arrow (polars, pyarrow); la nuestra, si está, manda.
         for kv in kvs.iter().filter(|kv| kv.key == ARROW_KEY) {
-            for (col, z) in arrow_timezones(kv.value.as_deref().unwrap_or("")) {
+            let (tzs, ds) = arrow_schema(kv.value.as_deref().unwrap_or(""));
+            for (col, z) in tzs {
                 if let Some(tz) = arrow_zone(&z) {
                     zones.insert(col, tz);
                 }
             }
+            durs.extend(ds);
         }
+        for kv in kvs.iter().filter(|kv| kv.key == DUR_KEY) {
+            if let Some(Ok(serde_json::Value::Object(o))) = kv.value.as_deref().map(serde_json::from_str::<serde_json::Value>) {
+                for (col, u) in o {
+                    match u.as_str() {
+                        Some("ns") => durs.insert(col, 1),
+                        Some("us") => durs.insert(col, 1_000),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        // Sólo cuentan las columnas INT64 de primer nivel sin tipo lógico: un metadato que diga
+        // otra cosa de una columna de texto o de timestamps no la reinterpreta.
+        let plain_i64: std::collections::HashSet<String> = fmeta
+            .schema_descr()
+            .columns()
+            .iter()
+            .filter(|c| c.physical_type() == PhysicalType::INT64 && c.logical_type_ref().is_none() && c.path().parts().len() == 1)
+            .map(|c| c.name().to_string())
+            .collect();
+        durs.retain(|c, _| plain_i64.contains(c));
         for kv in kvs {
             if kv.key == TZ_KEY {
                 if let Some(Ok(serde_json::Value::Object(o))) = kv.value.as_deref().map(serde_json::from_str::<serde_json::Value>) {
@@ -470,6 +533,9 @@ fn parquet_read(args: &[SynValue]) -> Result<SynValue, Control> {
                     }
                 }
                 (Field::Long(ns), false) if time_nanos.contains(k) => time_of_day(chrono::Duration::nanoseconds(*ns)),
+                (Field::Long(n), false) if durs.contains_key(k) => duration_of(*n, durs[k]).ok_or_else(|| {
+                    err(format!("{}: column {:?}: {} is out of the range of a duration", F, k, n))
+                })?,
                 _ => field_to_syn(v),
             };
             if let (Some(tz), SynValue::Time(t)) = (zones.get(k), &val) {
@@ -498,6 +564,7 @@ enum ColKind {
     Bytes,
     Date,
     DateTime,
+    Duration,
 }
 
 fn kind_of(v: &SynValue, col: &str) -> Result<Option<ColKind>, Control> {
@@ -518,9 +585,7 @@ fn kind_of(v: &SynValue, col: &str) -> Result<Option<ColKind>, Control> {
         SynValue::Time(t) => match &**t {
             Temporal::Date(_) => ColKind::Date,
             Temporal::DateTime(_) => ColKind::DateTime,
-            Temporal::Duration(_) => {
-                return Err(err(format!("parquet_write: column {:?} has a duration — store in_units(d, \"seconds\")", col)))
-            }
+            Temporal::Duration(_) => ColKind::Duration,
         },
         other => {
             return Err(err(format!(
@@ -530,6 +595,155 @@ fn kind_of(v: &SynValue, col: &str) -> Result<Option<ColKind>, Control> {
             )))
         }
     }))
+}
+
+/// Un valor de un flatbuffer a escribir: lo justo para el esquema Arrow.
+enum Fv {
+    U8(u8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    Str(String),
+    /// Una tabla: sus campos por índice (`None` = ausente).
+    Table(Vec<Option<Fv>>),
+    /// Un vector de tablas o strings.
+    Vec(Vec<Fv>),
+}
+
+/// Escritor mínimo de flatbuffers, hacia adelante: cada tabla va después de su vtable y cada
+/// referencia apunta a algo escrito después (los uoffset son positivos). Todo queda alineado a
+/// su tamaño desde el principio del buffer, como pide el verificador de flatbuffers (Arrow C++
+/// verifica el esquema antes de leerlo).
+#[derive(Default)]
+struct FbWriter(Vec<u8>);
+
+impl FbWriter {
+    fn align(&mut self, n: usize) {
+        while self.0.len() % n != 0 {
+            self.0.push(0);
+        }
+    }
+    fn patch(&mut self, at: usize, target: usize) {
+        self.0[at..at + 4].copy_from_slice(&((target - at) as u32).to_le_bytes());
+    }
+    /// Escribe `v` (una tabla, un string o un vector) y devuelve su posición.
+    fn write(&mut self, v: &Fv) -> usize {
+        match v {
+            Fv::Str(t) => {
+                self.align(4);
+                let at = self.0.len();
+                self.0.extend_from_slice(&(t.len() as u32).to_le_bytes());
+                self.0.extend_from_slice(t.as_bytes());
+                self.0.push(0);
+                at
+            }
+            Fv::Vec(items) => {
+                self.align(4);
+                let at = self.0.len();
+                self.0.extend_from_slice(&(items.len() as u32).to_le_bytes());
+                let slots: Vec<usize> = items
+                    .iter()
+                    .map(|_| {
+                        self.0.extend_from_slice(&[0; 4]);
+                        self.0.len() - 4
+                    })
+                    .collect();
+                for (slot, item) in slots.into_iter().zip(items) {
+                    let target = self.write(item);
+                    self.patch(slot, target);
+                }
+                at
+            }
+            Fv::Table(fields) => {
+                // La vtable: tamaño de la vtable, tamaño de la tabla y el offset de cada campo.
+                self.align(4);
+                let vt = self.0.len();
+                self.0.resize(vt + 4 + 2 * fields.len(), 0);
+                self.align(8);
+                let t = self.0.len();
+                self.0.extend_from_slice(&((t - vt) as i32).to_le_bytes());
+                let mut refs = Vec::new();
+                for (i, f) in fields.iter().enumerate() {
+                    let Some(f) = f else { continue };
+                    let size = match f {
+                        Fv::U8(_) => 1,
+                        Fv::I16(_) => 2,
+                        Fv::I64(_) => 8,
+                        _ => 4,
+                    };
+                    self.align(size);
+                    let at = self.0.len();
+                    match f {
+                        Fv::U8(x) => self.0.push(*x),
+                        Fv::I16(x) => self.0.extend_from_slice(&x.to_le_bytes()),
+                        Fv::I32(x) => self.0.extend_from_slice(&x.to_le_bytes()),
+                        Fv::I64(x) => self.0.extend_from_slice(&x.to_le_bytes()),
+                        other => {
+                            self.0.extend_from_slice(&[0; 4]);
+                            refs.push((at, other));
+                        }
+                    }
+                    self.0[vt + 4 + 2 * i..vt + 6 + 2 * i].copy_from_slice(&((at - t) as u16).to_le_bytes());
+                }
+                let tsize = self.0.len() - t;
+                self.0[vt..vt + 2].copy_from_slice(&((4 + 2 * fields.len()) as u16).to_le_bytes());
+                self.0[vt + 2..vt + 4].copy_from_slice(&(tsize as u16).to_le_bytes());
+                for (at, child) in refs {
+                    let target = self.write(child);
+                    self.patch(at, target);
+                }
+                t
+            }
+            Fv::U8(_) | Fv::I16(_) | Fv::I32(_) | Fv::I64(_) => unreachable!("un escalar va dentro de una tabla"),
+        }
+    }
+}
+
+/// El tipo Arrow de una columna, como lo escriben pyarrow, polars y arrow-rs.
+fn arrow_type(k: ColKind, nanos: bool, zone: &str) -> (u8, Fv) {
+    // Unidades de tiempo: MICROSECOND = 2, NANOSECOND = 3.
+    let unit = Fv::I16(if nanos { 3 } else { 2 });
+    match k {
+        ColKind::Int => (2, Fv::Table(vec![Some(Fv::I32(64)), Some(Fv::U8(1))])),
+        ColKind::Float => (3, Fv::Table(vec![Some(Fv::I16(2))])),
+        ColKind::Bytes => (4, Fv::Table(vec![])),
+        ColKind::Text => (5, Fv::Table(vec![])),
+        ColKind::Bool => (6, Fv::Table(vec![])),
+        ColKind::Decimal(sc) => (7, Fv::Table(vec![Some(Fv::I32(38)), Some(Fv::I32(sc as i32)), Some(Fv::I32(128))])),
+        // DateUnit DAY = 0 (el default del esquema es MILLISECOND: va explícito).
+        ColKind::Date => (8, Fv::Table(vec![Some(Fv::I16(0))])),
+        ColKind::DateTime => (10, Fv::Table(vec![Some(unit), Some(Fv::Str(zone.to_string()))])),
+        ColKind::Duration => (18, Fv::Table(vec![Some(unit)])),
+    }
+}
+
+/// El esquema Arrow del archivo (`ARROW:schema`): un mensaje IPC `Schema` en base64. Con él,
+/// pyarrow, pandas y polars leen cada columna con su tipo: una `duration` como duration (sin
+/// él, un INT64 sin unidad) y un `datetime` con su zona (sin él, UTC).
+fn arrow_schema_b64(cols: &[(String, ColKind, bool, String)]) -> String {
+    let fields = cols
+        .iter()
+        .map(|(name, k, nanos, zone)| {
+            let (type_type, ty) = arrow_type(*k, *nanos, zone);
+            // Field: name, nullable, type_type, type, dictionary, children (vacío, pero presente:
+            // Arrow C++ lo exige).
+            Fv::Table(vec![Some(Fv::Str(name.clone())), Some(Fv::U8(1)), Some(Fv::U8(type_type)), Some(ty), None, Some(Fv::Vec(vec![]))])
+        })
+        .collect();
+    // Schema: endianness (Little = 0), fields. Message: version (V5 = 4), header_type
+    // (Schema = 1), header, bodyLength (0).
+    let schema = Fv::Table(vec![Some(Fv::I16(0)), Some(Fv::Vec(fields))]);
+    let message = Fv::Table(vec![Some(Fv::I16(4)), Some(Fv::U8(1)), Some(schema), Some(Fv::I64(0))]);
+    let mut w = FbWriter::default();
+    w.0.extend_from_slice(&[0; 8]); // offset a la raíz + relleno: la raíz queda alineada a 8
+    let root = w.write(&message);
+    w.patch(0, root);
+    w.align(8);
+    // Mensaje encapsulado: marca de continuación, largo, flatbuffer.
+    let mut out = vec![0xff; 4];
+    out.extend_from_slice(&(w.0.len() as u32).to_le_bytes());
+    out.extend_from_slice(&w.0);
+    synsema_core::bytesutil::b64_encode(&out)
 }
 
 fn merge_kind(a: ColKind, b: ColKind, col: &str) -> Result<ColKind, Control> {
@@ -560,6 +774,8 @@ fn build_type(name: &str, k: ColKind, nanos: bool) -> Result<Type, Control> {
         ColKind::Bool => Type::primitive_type_builder(name, PhysicalType::BOOLEAN),
         ColKind::Bytes => Type::primitive_type_builder(name, PhysicalType::BYTE_ARRAY),
         ColKind::Date => Type::primitive_type_builder(name, PhysicalType::INT32).with_logical_type(Some(LogicalType::Date)),
+        // Como Arrow: INT64 sin tipo lógico; la unidad va en `synsema.durations`.
+        ColKind::Duration => Type::primitive_type_builder(name, PhysicalType::INT64),
         ColKind::DateTime => Type::primitive_type_builder(name, PhysicalType::INT64).with_logical_type(Some(LogicalType::timestamp(
             true,
             if nanos { TimeUnit::NANOS } else { TimeUnit::MICROS },
@@ -655,6 +871,9 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
     }
     let mut fields = Vec::with_capacity(cols.len());
     let mut ns_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut durs = serde_json::Map::new();
+    // Por columna: (nombre, tipo, en nanosegundos) para el esquema Arrow.
+    let mut arrow_cols: Vec<(String, ColKind, bool, String)> = Vec::with_capacity(cols.len());
     for (name, k) in &cols {
         // Una columna toda `nothing` se escribe como texto opcional (todo nulo).
         // Una columna de datetimes va en microsegundos (lo más compatible, 290 000 años de
@@ -680,9 +899,27 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
             }
             any_sub_micro && all_fit
         };
-        if nanos {
+        // Una columna de durations: en microsegundos (±292 000 años) salvo que algún valor tenga
+        // nanosegundos y todos entren en nanosegundos (±292 años), como los datetimes.
+        let dur_nanos = *k == Some(ColKind::Duration) && {
+            let (mut any_sub_micro, mut all_fit) = (false, true);
+            for m in &maps {
+                if let Some(SynValue::Time(t)) = m.get(name) {
+                    if let Temporal::Duration(d) = &**t {
+                        any_sub_micro |= d.subsec_nanos() % 1000 != 0;
+                        all_fit &= d.num_nanoseconds().is_some();
+                    }
+                }
+            }
+            any_sub_micro && all_fit
+        };
+        if *k == Some(ColKind::Duration) {
+            durs.insert(name.clone(), serde_json::Value::String(if dur_nanos { "ns" } else { "us" }.to_string()));
+        }
+        if nanos || dur_nanos {
             ns_cols.insert(name.clone());
         }
+        arrow_cols.push((name.clone(), k.unwrap_or(ColKind::Text), nanos || dur_nanos, "UTC".to_string()));
         fields.push(Arc::new(build_type(name, k.unwrap_or(ColKind::Text), nanos)?));
     }
     let schema = Arc::new(
@@ -711,17 +948,25 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
         }
         if let (true, Some(z)) = (same, zone) {
             if z != "UTC" {
+                // En el esquema Arrow sólo una zona IANA: polars no acepta un offset fijo
+                // (`+05:30`) y no abre el archivo. Con un offset, los demás ven el instante en
+                // UTC y Synsema recupera el offset de `synsema.timezones`.
+                if let (Some(c), true) = (arrow_cols.iter_mut().find(|c| c.0 == *name), z.contains('/')) {
+                    c.3 = z.clone();
+                }
                 tzs.insert(name.clone(), serde_json::Value::String(z));
             }
         }
     }
     let mut pb = WriterProperties::builder().set_compression(compression);
+    let mut kvs = vec![parquet::file::metadata::KeyValue::new(ARROW_KEY.to_string(), arrow_schema_b64(&arrow_cols))];
     if !tzs.is_empty() {
-        pb = pb.set_key_value_metadata(Some(vec![parquet::file::metadata::KeyValue::new(
-            TZ_KEY.to_string(),
-            serde_json::Value::Object(tzs).to_string(),
-        )]));
+        kvs.push(parquet::file::metadata::KeyValue::new(TZ_KEY.to_string(), serde_json::Value::Object(tzs).to_string()));
     }
+    if !durs.is_empty() {
+        kvs.push(parquet::file::metadata::KeyValue::new(DUR_KEY.to_string(), serde_json::Value::Object(durs).to_string()));
+    }
+    pb = pb.set_key_value_metadata(Some(kvs));
     let props = Arc::new(pb.build());
     let mut buf: Vec<u8> = Vec::new();
     {
@@ -804,6 +1049,21 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
                         .collect();
                     cw.write_batch(&v, Some(&defs), None).map_err(werr)?;
                 }
+                (ColumnWriter::Int64ColumnWriter(cw), ColKind::Duration) => {
+                    let ns = ns_cols.contains(name);
+                    let mut v: Vec<i64> = Vec::new();
+                    for x in present {
+                        if let SynValue::Time(t) = x {
+                            if let Temporal::Duration(d) = &**t {
+                                let n = if ns { d.num_nanoseconds() } else { d.num_microseconds() };
+                                v.push(n.ok_or_else(|| {
+                                    err(format!("{}: column {:?}: the duration {} does not fit 64-bit microseconds", F, name, x))
+                                })?);
+                            }
+                        }
+                    }
+                    cw.write_batch(&v, Some(&defs), None).map_err(werr)?;
+                }
                 _ => return Err(err(format!("{}: internal: writer/type mismatch in column {:?}", F, name))),
             }
             col.close().map_err(|e| err(format!("{}: {}", F, e)))?;
@@ -817,4 +1077,33 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
 pub fn register_parquet_builtins(interp: &Interpreter) {
     interp.register_builtin("parquet_read", -1, Rc::new(|_i, a, _l| parquet_read(a)));
     interp.register_builtin("parquet_write", -1, Rc::new(|_i, a, _l| parquet_write(a)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// El esquema Arrow que escribe `parquet_write` se lee de vuelta: cada columna con su tipo, la
+    /// zona IANA de un timestamp y la unidad de una duration (pyarrow, pandas y polars lo leen
+    /// igual; verificado con pyarrow 25 y polars al escribirlo).
+    #[test]
+    fn arrow_schema_round_trips_through_the_reader() {
+        let cols = vec![
+            ("i".to_string(), ColKind::Int, false, "UTC".to_string()),
+            ("when".to_string(), ColKind::DateTime, false, "Europe/Madrid".to_string()),
+            ("d".to_string(), ColKind::Duration, true, "UTC".to_string()),
+            ("m".to_string(), ColKind::Duration, false, "UTC".to_string()),
+            ("x".to_string(), ColKind::Decimal(2), false, "UTC".to_string()),
+        ];
+        let b64 = arrow_schema_b64(&cols);
+        let raw = synsema_core::bytesutil::b64_decode(&b64).unwrap();
+        assert_eq!(&raw[..4], &[0xff; 4], "mensaje encapsulado");
+        assert_eq!(raw.len() % 8, 0, "alineado a 8");
+        let (zones, durs) = arrow_schema(&b64);
+        assert_eq!(zones.get("when").map(String::as_str), Some("Europe/Madrid"));
+        assert_eq!(zones.get("i"), None);
+        assert_eq!(durs.get("d"), Some(&1));
+        assert_eq!(durs.get("m"), Some(&1_000));
+        assert_eq!(durs.len(), 2);
+    }
 }

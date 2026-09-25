@@ -272,41 +272,51 @@ impl Lexer {
     /// `C:\build\x64` o una regex `a\x2eb` quedan como estaban); en un backtick `\u{…}` tampoco
     /// (ahí `{…}` es interpolación: `x\u{a}y` sigue interpolando `a`), `braces = false`.
     fn unicode_escape(&self, braces: bool) -> Option<(char, usize)> {
-        let hex_at = |i: usize| self.peek(i).filter(|c| c.is_ascii_hexdigit());
-        if self.peek(0) == Some('{') {
-            if !braces {
-                return None;
-            }
-            let mut n = 1;
-            let mut digits = String::new();
-            while let Some(c) = hex_at(n) {
-                digits.push(c);
-                n += 1;
-                if digits.len() > 6 {
-                    return None;
-                }
-            }
-            if digits.is_empty() || self.peek(n) != Some('}') {
-                return None;
-            }
-            let v = u32::from_str_radix(&digits, 16).ok()?;
-            return char::from_u32(v).map(|c| (c, n + 1));
-        }
-        let hex4 = |from: usize| -> Option<u32> {
-            let digits: String = (from..from + 4).map(hex_at).collect::<Option<String>>()?;
-            u32::from_str_radix(&digits, 16).ok()
-        };
-        let v = hex4(0)?;
-        // Un par sustituto (`\uD83D\uDE00`, como lo escriben JSON y JavaScript) es UN carácter.
-        if (0xD800..0xDC00).contains(&v) && self.peek(4) == Some('\\') && self.peek(5) == Some('u') {
-            let lo = hex4(6)?;
-            if (0xDC00..0xE000).contains(&lo) {
-                return char::from_u32(0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00)).map(|c| (c, 10));
-            }
-        }
-        char::from_u32(v).map(|c| (c, 4))
+        unicode_escape_at(self.source.get(self.pos..).unwrap_or(&[]), braces)
     }
+}
 
+/// La decodificación de `\u…` del lexer, sobre lo que sigue a la `u` (`s[0]` es el primer
+/// carácter después de `\u`). La comparte `synsema check`, que avisa sólo de los escapes que
+/// de verdad se decodifican (`"\uD800"` suelto o `"\u{110000}"` siguen siendo literales).
+pub(crate) fn unicode_escape_at(s: &[char], braces: bool) -> Option<(char, usize)> {
+    let peek = |i: usize| s.get(i).copied();
+    let hex_at = |i: usize| peek(i).filter(|c| c.is_ascii_hexdigit());
+    if peek(0) == Some('{') {
+        if !braces {
+            return None;
+        }
+        let mut n = 1;
+        let mut digits = String::new();
+        while let Some(c) = hex_at(n) {
+            digits.push(c);
+            n += 1;
+            if digits.len() > 6 {
+                return None;
+            }
+        }
+        if digits.is_empty() || peek(n) != Some('}') {
+            return None;
+        }
+        let v = u32::from_str_radix(&digits, 16).ok()?;
+        return char::from_u32(v).map(|c| (c, n + 1));
+    }
+    let hex4 = |from: usize| -> Option<u32> {
+        let digits: String = (from..from + 4).map(hex_at).collect::<Option<String>>()?;
+        u32::from_str_radix(&digits, 16).ok()
+    };
+    let v = hex4(0)?;
+    // Un par sustituto (`\uD83D\uDE00`, como lo escriben JSON y JavaScript) es UN carácter.
+    if (0xD800..0xDC00).contains(&v) && peek(4) == Some('\\') && peek(5) == Some('u') {
+        let lo = hex4(6)?;
+        if (0xDC00..0xE000).contains(&lo) {
+            return char::from_u32(0x10000 + ((v - 0xD800) << 10) + (lo - 0xDC00)).map(|c| (c, 10));
+        }
+    }
+    char::from_u32(v).map(|c| (c, 4))
+}
+
+impl Lexer {
     /// Lee un literal de string. Soporta secuencias de escape.
     fn read_string(&mut self, quote: char) -> Result<(), LexerError> {
         let loc = self.location();
@@ -578,9 +588,9 @@ impl Lexer {
 
         // Sufijo `d` → literal Decimal exacto (1.50d, 100d), pero SÓLO si no lo sigue
         // un char de continuación de identificador: `1.50d`→Decimal, `1.50 d`→número
-        // + ident, `1.50dx`→número + ident `dx`.
-        let is_decimal = !has_exp
-            && self.peek(0) == Some('d')
+        // + ident, `1.50dx`→número + ident `dx`. Con exponente (`1.5e-3d`) también: el valor
+        // exacto, por el mismo camino que `decimal("1.5e-3")`.
+        let is_decimal = self.peek(0) == Some('d')
             && !matches!(self.peek(1), Some(c) if c.is_alphanumeric() || c == '_');
         if is_decimal {
             self.advance(); // consume el sufijo 'd'

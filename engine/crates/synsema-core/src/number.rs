@@ -153,9 +153,34 @@ impl Number {
     }
 
     /// Un decimal desde texto (`"1234.5678"`, `"-0.001"`, con cualquier cantidad de dígitos
-    /// hasta 4300). `None` si no es un decimal.
+    /// hasta 4300), también con exponente (`"1e5"`, `"1.5E-3"`): el valor exacto, mantisa ×
+    /// 10^exp, como `numeric` de Postgres y `Decimal` de Python (`"1.50e1"` es `15.0`: la escala
+    /// es la de la mantisa menos el exponente, nunca negativa). `None` si no es un decimal o si
+    /// el resultado pasaría de 4300 dígitos (`"1e999999999"` no puede pedir memoria sin tope).
     pub fn parse_decimal(text: &str) -> Option<Number> {
         let t = text.trim();
+        if let Some(i) = t.find(['e', 'E']) {
+            let (mant, exp) = (&t[..i], &t[i + 1..]);
+            let digits = exp.strip_prefix(['+', '-']).unwrap_or(exp);
+            if digits.is_empty() || digits.len() > 9 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let exp: i64 = exp.parse().ok()?;
+            if mant.contains(['e', 'E']) {
+                return None;
+            }
+            let (m, s) = Number::parse_decimal(mant)?.exact_ratio()?;
+            let scale = s as i64 - exp;
+            let int_digits = m.abs().to_string().len() as i64 - s as i64;
+            if scale > MAX_DEC_TEXT_DIGITS as i64 || int_digits + exp.max(0) > MAX_DEC_TEXT_DIGITS as i64 {
+                return None;
+            }
+            return Some(if scale >= 0 {
+                Number::decimal_from_parts(m, scale as u32)
+            } else {
+                Number::decimal_from_parts(m * pow10_big((-scale) as u32), 0)
+            });
+        }
         if let Ok(d) = Decimal::from_str_exact(t) {
             return Some(Number::Decimal(d));
         }

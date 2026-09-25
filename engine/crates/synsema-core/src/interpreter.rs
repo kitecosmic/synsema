@@ -2650,6 +2650,9 @@ impl Interpreter {
         let program = parse_source(&source, resolved).map_err(|e| err(e.to_string()))?;
         // T5 (B8): un módulo tampoco puede redefinir los nombres protegidos.
         check_protected_names(&program)?;
+        // Un nombre deprecado en un módulo avisa igual que en el archivo principal (una vez
+        // por nombre y por proceso), con el archivo del módulo.
+        crate::deprecated::warn_once_at_load(&program, raw_path.trim_start_matches("./"));
         // T5 (ronda 7): el conjunto con el que se redacta sale del AST, antes de correr nada.
         self.set_declared_principals(&program);
 
@@ -2748,10 +2751,13 @@ impl Interpreter {
             };
             if base.is_none() {
                 // Sea cual sea `x` (texto, `nothing`, un número): que el resultado no dependa del dato.
-                if let (Some(_), Some(SynValue::Number(Number::Int(b)))) = (a.first(), a.get(1)) {
-                    if (2..=36).contains(b) {
+                // `2.0` (o `2.0d`) se lee igual que `2`: un número con valor entero de 2 a 36.
+                if let (Some(_), Some(SynValue::Number(n))) = (a.first(), a.get(1)) {
+                    let f = n.to_f64();
+                    if f.fract() == 0.0 && (2.0..=36.0).contains(&f) {
+                        let (shown, b) = (n.to_string(), f as i64);
                         return Err(err(format!(
-                            "int(x, {b}): the second argument is the fallback value, not the base — for base {b} write int(x, base = {b}); for a fallback of {b}, name it: int(x, fallback = {b})"
+                            "int(x, {shown}): the second argument is the fallback value, not the base — for base {b} write int(x, base = {b}); for a fallback of {shown}, name it: int(x, fallback = {shown})"
                         )));
                     }
                 }
@@ -3796,6 +3802,23 @@ impl Interpreter {
                     let r = self.exec(right, env)?;
                     let res = syn_bool(r.is_truthy());
                     return if self.labels { self.join_operands(res, &l, Some(&r), loc) } else { Ok(res) };
+                }
+                // `x // nota`: un comentario al estilo C se lee como división entera por la
+                // variable `nota`. Si esa palabra no existe, el error lo dice (sólo con espacio
+                // después de `//`, como se escribe un comentario; la semántica de `//` no cambia).
+                if operator == "//" {
+                    if let NodeKind::Identifier { .. } = &right.kind {
+                        if right.location.line == loc.line && right.location.column > loc.column + 2 {
+                            let r = self.exec(right, env).map_err(|c| match c {
+                                Control::Error(mut e) if e.message.starts_with("Undefined variable") => {
+                                    e.message.push_str(" — `//` is integer division; comments in Synsema start with `--`");
+                                    Control::Error(e)
+                                }
+                                other => other,
+                            })?;
+                            return self.exec_binary(l, operator, r, loc);
+                        }
+                    }
                 }
                 let r = self.exec(right, env)?;
                 self.exec_binary(l, operator, r, loc)
@@ -5693,12 +5716,17 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     SynValue::List(l) => {
                         let mut b = l.borrow_mut();
                         let len = b.len() as i64;
-                        let mut i = num_to_i64(&idx)?;
+                        let given = num_to_i64(&idx)?;
+                        let mut i = given;
                         if i < 0 {
                             i += len;
                         }
+                        // El mismo mensaje y lugar que la lectura `xs[i]`.
                         if i < 0 || i >= len {
-                            return Err(err("list assignment index out of range"));
+                            return Err(err_at(
+                                format!("Index {} out of bounds (list length {}) — to add an item: set xs to append(xs, x)", given, len),
+                                &target.location,
+                            ));
                         }
                         b[i as usize] = value.clone();
                         Ok(value)
@@ -5789,13 +5817,23 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 Some(v) => Ok(v.clone()),
                 // `a.nx` donde `nx` existe en el módulo pero no se exporta (un `use` interno, un
                 // `let` sin `export`): decirlo en vez de "no key".
-                None if module_env_of_map(m).is_some_and(|e| e.borrow().bindings.contains_key(property_name)) => Err(err_at(
-                    format!(
-                        "the module has no export '{}' — it is defined inside the module but not exported (write `export let`/`export task` there; an import of that module is not re-exported: `use` its file directly)",
-                        property_name
-                    ),
-                    loc,
-                )),
+                None if module_env_of_map(m).is_some_and(|e| e.borrow().bindings.contains_key(property_name)) => {
+                    // La pista nombra la forma de lo que está definido: un enum se exporta con
+                    // `export enum`, un task con `export task`.
+                    let binding = module_env_of_map(m).and_then(|e| e.borrow().bindings.get(property_name).cloned());
+                    let how = match &binding {
+                        Some(SynValue::Map(b)) if b.borrow().contains_key("__enum") => format!("write `export enum {}` there", property_name),
+                        Some(SynValue::Task(_)) => format!("write `export task {}` there", property_name),
+                        _ => "write `export let`/`export task`/`export enum`/`export type` there".to_string(),
+                    };
+                    Err(err_at(
+                        format!(
+                            "the module has no export '{}' — it is defined inside the module but not exported ({}; an import of that module is not re-exported: `use` its file directly)",
+                            property_name, how
+                        ),
+                        loc,
+                    ))
+                }
                 // `d.get("a")`, `d.keys()`: un reflejo de método, no una clave que falta.
                 None => Err(err_at(
                     match crate::reflexes::method_hint(property_name) {
@@ -6547,7 +6585,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             SynValue::Map(m) => Ok(syn_int(m.borrow().len() as i64)),
             SynValue::Bytes(b) => Ok(syn_int(b.len() as i64)),
             // v0.6.29 (DATOS-8): la primera dimensión, como `len` de numpy (`size` es el total).
-            SynValue::Array(a) => Ok(syn_int(a.shape().first().copied().unwrap_or(0) as i64)),
+            // Un array 0-D es un escalar: no tiene largo (numpy da TypeError en `len()`); dar 0
+            // lo haría pasar por vacío.
+            SynValue::Array(a) if a.ndim() == 0 => Err(err("length: a 0-d array has no length (it is a scalar) — use size(a), which is 1")),
+            SynValue::Array(a) => Ok(syn_int(a.shape()[0] as i64)),
             _ => Err(err(format!("Cannot get length of {}", v.type_name()))),
         }
     }
@@ -6760,7 +6801,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             SynValue::Text(s) => Number::parse_decimal(s).ok_or_else(|| {
                 err(format!(
-                    "Cannot parse {} as a decimal (digits with an optional sign and point, up to {} digits)",
+                    "Cannot parse {} as a decimal (digits with an optional sign, point and exponent — 12.50, 1.5e-3 — up to {} digits)",
                     v,
                     crate::number::MAX_DEC_TEXT_DIGITS
                 ))
@@ -6867,6 +6908,16 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
                 Ok(syn_bytes(out))
             }
+            // Python da `bytes(33)` = 33 ceros; Synsema no adivina qué se quería.
+            SynValue::Number(n) => Err(err(format!(
+                "Cannot convert number to bytes: bytes({}) does not say how to encode it — for the integer's bytes use int_to_bytes({}, size) (big-endian; int_to_bytes_le for little-endian){}",
+                n,
+                n,
+                match n {
+                    Number::Int(b) if (0..=255).contains(b) => format!("; for the single byte {} use bytes([{}])", b, b),
+                    _ => String::new(),
+                }
+            ))),
             other => Err(err(format!("Cannot convert {} to bytes", other.type_name()))),
         }
     }
@@ -8288,17 +8339,29 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 None => SynValue::Nothing,
             });
         }
-        let items = self.list_arg(nth(args, 0)?, "index_of")?;
-        let needle = nth(args, 1)?.clone();
-        if is_callable(&needle) {
-            for (i, item) in items.into_iter().enumerate() {
+        // Sin copiar la lista (como `in` y `contains`): un acierto temprano es O(1).
+        let SynValue::List(list) = nth(args, 0)? else {
+            return Err(err(format!("index_of expects a list, got {}", nth(args, 0)?.type_name())));
+        };
+        let needle = nth(args, 1)?;
+        if is_callable(needle) {
+            // El predicado corre código: no se retiene el préstamo mientras corre. Este `Rc` es
+            // una foto (una escritura del predicado a la lista copia, por copy-on-write), así
+            // que el largo no cambia; se relee igual por si acaso.
+            let mut i = 0;
+            loop {
+                let item = match list.borrow().get(i) {
+                    Some(x) => x.clone(),
+                    None => break,
+                };
                 if self.call_value(needle.clone(), vec![item], loc)?.is_truthy() {
                     return Ok(syn_int(i as i64));
                 }
+                i += 1;
             }
         } else {
-            for (i, item) in items.iter().enumerate() {
-                if crate::tabular::strict_equals(item, &needle).map_err(|_| err(format!("index_of: {}", MIX_DECIMAL_FLOAT)))? {
+            for (i, item) in list.borrow().iter().enumerate() {
+                if crate::tabular::strict_equals(item, needle).map_err(|_| err(format!("index_of: {}", MIX_DECIMAL_FLOAT)))? {
                     return Ok(syn_int(i as i64));
                 }
             }

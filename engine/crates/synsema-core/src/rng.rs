@@ -436,6 +436,17 @@ pub fn top_level_stub(name: &str) -> SynValue {
     }))
 }
 
+/// ¿`v` es un generador de `rng()`/`rng_spawn()`? (Para nombrarlo bien en un error: por
+/// fuera es un builtin, pero no es una función cualquiera.)
+pub fn is_generator(v: &SynValue) -> bool {
+    generator_of(v).is_some()
+}
+
+/// Cómo nombrar un valor que es código en un mensaje: `a generator` o `a task`.
+pub fn code_noun(v: &SynValue) -> &'static str {
+    if is_generator(v) { "a generator (from rng)" } else { "a task" }
+}
+
 /// El estado numpy de `g`, si `g` salió de `rng()`/`rng_spawn()`.
 fn generator_of(g: &SynValue) -> Option<GenCell> {
     let SynValue::Builtin(b) = g else { return None };

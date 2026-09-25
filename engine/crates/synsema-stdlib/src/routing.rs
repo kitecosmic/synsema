@@ -359,7 +359,9 @@ pub struct Ctx {
     /// spilleó a disco (entonces `body_file` es la fuente cruda; ver §8.1).
     pub body_raw: Vec<u8>,
     pub body_file: Option<String>,
-    pub json: Option<serde_json::Value>,
+    /// El body como JSON, leído con el mismo parser que `json_decode` (`json_exact`): `-0`
+    /// es `0`, un uint256 llega exacto, un BOM al principio se ignora.
+    pub json: Option<SynValue>,
     pub client_ip: String,
     pub user: Option<SynValue>,
     /// Token de cancelación cooperativa de la request (timeout de handler / shutdown):
@@ -969,12 +971,8 @@ pub fn build_request_syn(ctx: &Ctx) -> SynValue {
     m.insert(
         "json".to_string(),
         match &ctx.json {
-            // Un entero que no entra en 64 bits (un uint256 en el body) llega exacto, como
-            // en `json_decode`: se re-parsea el body con `json_exact` sólo en ese caso.
-            Some(v) if crate::json::has_wide_int(v) => {
-                crate::json_exact::parse(&ctx.body).unwrap_or_else(|_| json_to_syn(v))
-            }
-            Some(v) => json_to_syn(v),
+            // Copy-on-write: compartir el valor es seguro (una escritura del handler copia).
+            Some(v) => v.clone(),
             None => syn_nothing(),
         },
     );

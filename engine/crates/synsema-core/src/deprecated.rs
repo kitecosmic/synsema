@@ -177,6 +177,30 @@ pub fn check_warnings(program: &Program, file_path: &str, warnings: &mut Vec<Str
             }
         });
     }
+    // Lo mismo con un parámetro: `task touch(cfg)` + `set cfg[k] to v` escribe en la copia del
+    // task. Si el task no lo devuelve, no lo pasa a otra llamada ni lee lo que escribió, la
+    // escritura se pierde para cualquiera que lo llame.
+    for st in &program.statements {
+        crate::ast_api::walk(st, &mut |n| {
+            let NodeKind::TaskDefinition { name, parameters, body, .. } = &n.kind else { return };
+            for p in parameters {
+                let mut u = LoopUses::default();
+                for b in body {
+                    u.scan(b, &p.name, false);
+                }
+                let read_written = u.reads.iter().any(|k| match k {
+                    None => true,
+                    Some(k) => u.written.iter().any(|w| w.as_deref().is_none_or(|w| w == k)),
+                });
+                if let (Some(line), false, false) = (u.set_line, u.escapes, read_written) {
+                    warnings.push(format!(
+                        "warning: {}:{}: `set {}[…]` changes task {}'s own copy of the argument, not the caller's value (value semantics, v0.6.29), and the task does not give it back — end the task with `give {}` and call it as `set x to {}(x)`",
+                        file_path, line, p.name, name, p.name, name
+                    ));
+                }
+            }
+        });
+    }
 }
 
 /// La variable raíz de un destino `x[i].k`.
@@ -269,10 +293,18 @@ fn first_key(n: &Node) -> Option<String> {
     }
 }
 
+static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Los nombres deprecados que este proceso ya avisó al cargar (para los tests: el aviso va
+/// a stderr).
+pub fn warned_at_load() -> Vec<String> {
+    let guard = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().map(|s| s.iter().cloned().collect()).unwrap_or_default()
+}
+
 /// Aviso en tiempo de carga: una vez por nombre y por proceso (un `serve` con N workers
 /// no lo repite N veces).
 pub fn warn_once_at_load(program: &Program, file_path: &str) {
-    static SEEN: Mutex<Option<HashSet<String>>> = Mutex::new(None);
     let used = used_in(program);
     if used.is_empty() {
         return;

@@ -535,10 +535,14 @@ Semantics (know these before reaching for cron):
   minute (seconds = 0) **after the previous run ends** — occurrences that fall while a run is
   in progress are skipped, not queued. Either way a job never overlaps itself.
 - **Time zone: UTC by default** (like every `time` builtin). `{"tz": "-03:00"}` / `"+05:30"` is a
-  FIXED offset. IANA names with DST (`America/Sao_Paulo`) are not supported (clear error) —
-  write the offset, or pick the UTC hour. A numeric text (`"300"`) is still an interval.
+  fixed offset; `{"tz": "America/Santiago"}` is an IANA zone and follows its clock changes with the
+  rule every Linux cron uses (Vixie cron / cronie): a FIXED time (`30 2 * * *`) that falls in the
+  skipped spring hour runs right after the jump (not lost); in the repeated autumn hour it runs
+  once, the first time. A job with `*` in the minute or hour field (`*/15 * * * *`, `0 * * * *`)
+  follows real time: skipped minutes do not exist, the repeated hour runs twice. A numeric text
+  (`"300"`) is still an interval.
 - `cron_every` requires interval > 0; `cron_after` accepts delay ≥ 0. A bad expression, an
-  expression that never matches (`0 0 31 2 *`), `tz` not an offset, or options with an interval
+  expression that never matches (`0 0 31 2 *`), an unknown `tz`, or options with an interval
   → error **at registration** (the job is not created).
 - Same name re-registered → **replaces** the old job (counters restart at 0).
 - Errors: `errors`+1, one log line (`[serve] [cron] job 'x' failed: …`), the job stays

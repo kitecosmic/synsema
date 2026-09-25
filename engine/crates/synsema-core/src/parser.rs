@@ -2794,6 +2794,15 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
             TokenType::Generate => self.parse_generate_expr(),
             TokenType::Sandbox => self.parse_sandbox(),
             TokenType::When => self.parse_when(false),
+            // `// nota` donde va un valor (al principio de una línea): un comentario al estilo C.
+            TokenType::FloorDiv => Err(ParseError::new(
+                format!(
+                    "Unexpected token: {} ({}) — comments in Synsema start with `--` (`//` is integer division and needs a value on its left)",
+                    tok.ty.name(),
+                    token_value_repr(&tok.value)
+                ),
+                loc,
+            )),
             _ => Err(ParseError::new(
                 match self.reflex_note(self.pos) {
                     Some(h) => format!("Unexpected token: {} ({}) — {}", tok.ty.name(), token_value_repr(&tok.value), h),
@@ -3126,9 +3135,46 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
 
 /// Conveniencia: código fuente → AST (lexer + parser).
 pub fn parse_source(source: &str, filename: &str) -> Result<Program, CompileError> {
-    let tokens = Lexer::new(source, filename).tokenize_filtered()?;
+    // `x // una nota de varias palabras` (o `    // nota` sola en una línea indentada) no
+    // parsea por lo que viene después del `//`, y el error habla de eso (un `is`, un `:`, una
+    // comilla sin cerrar en `// don't`). Si la línea del error tiene un `//` escrito como
+    // comentario, la pista lo nombra.
+    let hint = |line: usize, message: &mut String| {
+        if !message.contains("start with `--`") && source.lines().nth(line.wrapping_sub(1)).is_some_and(c_comment_on) {
+            message.push_str(" — if `// …` on this line is a comment: comments in Synsema start with `--` (`//` is integer division)");
+        }
+    };
+    let tokens = Lexer::new(source, filename).tokenize_filtered().map_err(|mut e| {
+        hint(e.location.line, &mut e.message);
+        e
+    })?;
     let mut parser = Parser::new(tokens, filename);
-    Ok(parser.parse()?)
+    parser.parse().map_err(|mut e| {
+        hint(e.location.line, &mut e.message);
+        e.into()
+    })
+}
+
+/// ¿La línea tiene un `//` fuera de un string, seguido de un espacio o al final? Así se
+/// escribe un comentario de C; `a//b` o `"https://x"` no cuentan.
+fn c_comment_on(line: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut prev = '\0';
+    let cs: Vec<char> = line.chars().collect();
+    for (i, &c) in cs.iter().enumerate() {
+        match quote {
+            Some(q) if c == q && prev != '\\' => quote = None,
+            Some(_) => {}
+            None if matches!(c, '"' | '\'' | '`') => quote = Some(c),
+            None if c == '-' && cs.get(i + 1) == Some(&'-') => return false,
+            None if c == '/' && cs.get(i + 1) == Some(&'/') => {
+                return cs.get(i + 2).is_none_or(|n| n.is_whitespace());
+            }
+            None => {}
+        }
+        prev = if prev == '\\' && c == '\\' { '\0' } else { c };
+    }
+    false
 }
 
 /// Parsea una sola expresión (para los holes `{ expr }` de templates).
@@ -3781,19 +3827,16 @@ mod tests {
     }
 }
 
-/// ¿El literal crudo usa un escape `\uXXXX` (o `\u{…}` fuera de un backtick)? La misma regla que
-/// el lexer, para el aviso de `synsema check`.
+/// ¿El literal crudo tiene un escape `\u…` que el lexer DECODIFICA? La misma función que el
+/// lexer, para el aviso de `synsema check`: un sustituto suelto o un código fuera de Unicode
+/// siguen siendo texto literal (no cambiaron de significado) y no avisan.
 fn has_unicode_escape(raw: &str, braces: bool) -> bool {
     let c: Vec<char> = raw.chars().collect();
     let mut i = 0;
     while i + 1 < c.len() {
         if c[i] == '\\' {
-            if c[i + 1] == 'u' {
-                let hex4 = (2..6).all(|k| c.get(i + k).is_some_and(|x| x.is_ascii_hexdigit()));
-                let brace = braces && c.get(i + 2) == Some(&'{') && c.get(i + 3).is_some_and(|x| x.is_ascii_hexdigit());
-                if hex4 || brace {
-                    return true;
-                }
+            if c[i + 1] == 'u' && crate::lexer::unicode_escape_at(&c[i + 2..], braces).is_some() {
+                return true;
             }
             i += 2;
             continue;

@@ -1577,10 +1577,12 @@ impl ServeRuntime {
         }
 
         // Parse del body JSON (sólo error si el cliente declaró JSON).
-        let mut json_obj: Option<serde_json::Value> = None;
+        // `json_exact`, el parser de `json_decode`: `request.json` y `json_decode(request.body)`
+        // dan lo mismo (`-0` es `0`, un BOM se ignora, un uint256 llega exacto).
+        let mut json_obj: Option<SynValue> = None;
         if !body_str.is_empty() {
             let ctype = header_value(&headers, "content-type").to_lowercase();
-            match serde_json::from_str::<serde_json::Value>(body_str) {
+            match crate::json_exact::parse(body_str) {
                 Ok(v) => json_obj = Some(v),
                 Err(_) => {
                     if ctype.contains("json") {

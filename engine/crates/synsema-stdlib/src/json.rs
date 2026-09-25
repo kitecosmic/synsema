@@ -19,6 +19,38 @@ fn err(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::new(msg.into()))
 }
 
+/// Un task o un generador no es un dato: `json_encode` lo escribía como texto
+/// (`"builtin:rng(1)"`, con la semilla y sin el estado) sin avisar. Es un error que nombra
+/// dónde está, como `canonical_json` y el `TypeError` de Python. (Los bodies de `serve`
+/// siguen su propio contrato, en `syn_to_json`.)
+fn reject_code(v: &SynValue, who: &str, path: &str) -> Result<(), Control> {
+    match v {
+        SynValue::Task(_) | SynValue::Builtin(_) => Err(err(format!(
+            "{}: {} is {}, not data — JSON cannot hold code; store what it computes, or leave it out",
+            who,
+            path,
+            synsema_core::rng::code_noun(v)
+        ))),
+        SynValue::List(l) => {
+            for (i, x) in l.borrow().iter().enumerate() {
+                if matches!(x, SynValue::Task(_) | SynValue::Builtin(_) | SynValue::List(_) | SynValue::Map(_)) {
+                    reject_code(x, who, &format!("{}[{}]", path, i))?;
+                }
+            }
+            Ok(())
+        }
+        SynValue::Map(m) => {
+            for (k, x) in m.borrow().iter() {
+                if matches!(x, SynValue::Task(_) | SynValue::Builtin(_) | SynValue::List(_) | SynValue::Map(_)) {
+                    reject_code(x, who, &format!("{}[{:?}]", path, k))?;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Los builtins JSON del lenguaje (puros, SIN capability — como text/bytes/decode).
 /// Vivían en register_database_builtins; acá también existen en el perfil wasm.
 /// Wired desde wire_common_with_state (runtime) y desde synsema-wasm.
@@ -31,6 +63,7 @@ pub fn register_json_builtins(interp: &Interpreter) {
         1,
         Rc::new(|_i, args, _loc| {
             let v = args.first().ok_or_else(|| err("json_encode: missing argument"))?;
+            reject_code(v, "json_encode", "the value")?;
             Ok(syn_text(dumps(&syn_to_json(v))))
         }),
     );
@@ -49,7 +82,8 @@ pub fn register_json_builtins(interp: &Interpreter) {
                 None => return Err(err("jsonl_encode(items)")),
             };
             let mut out = String::new();
-            for it in &items {
+            for (i, it) in items.iter().enumerate() {
+                reject_code(it, "jsonl_encode", &format!("item {}", i))?;
                 out.push_str(&dumps(&syn_to_json(it)));
                 out.push('\n');
             }
@@ -99,6 +133,7 @@ pub fn register_json_builtins(interp: &Interpreter) {
         1,
         Rc::new(|_i, args, _loc| {
             let v = args.first().ok_or_else(|| err("missing argument"))?;
+            reject_code(v, "json_for_script", "the value")?;
             let json = dumps(&syn_to_json(v))
                 .replace('<', "\\u003c")
                 .replace('>', "\\u003e")
