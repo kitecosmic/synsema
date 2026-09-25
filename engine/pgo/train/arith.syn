@@ -1,0 +1,23 @@
+-- Entrenamiento PGO: aritmética y control de flujo sobre enteros, floats y decimales.
+let total be 0
+let odd be 0
+let i be 0
+while i < 200000
+    set total to total + i * 3 - i // 2
+    when i % 2 == 1
+        set odd to odd + 1
+    otherwise when i % 3 == 0
+        set total to total - 1
+    otherwise
+        set total to total + 1
+    set i to i + 1
+let f be 0.0
+each k in range(0, 50000)
+    set f to f + k / 7 + 0.5
+let d be 0d
+each k in range(0, 20000)
+    set d to d + 1.25d
+let big be 2 ** 70
+each k in range(0, 2000)
+    set big to big + k
+print(total, odd, round_to(f, 2), d, big > 2 ** 70, 3 < 5 <= 9)

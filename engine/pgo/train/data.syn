@@ -1,0 +1,12 @@
+-- Entrenamiento PGO: funciones de orden superior, orden, agrupar, JSON.
+let rows be []
+each k in range(0, 5000)
+    set rows to append(rows, {"id": k, "cat": "c" + text(k % 7), "price": (k * 13) % 101})
+let cheap be where(rows, (r) => price of r < 30)
+let prices be apply((r) => price of r, rows)
+let total be reduce(rows, (acc, r) => acc + price of r, 0)
+let sorted be sort_by(rows, (r) => price of r)
+let groups be group_by(rows, (r) => cat of r)
+let blob be json_encode(cheap)
+let back be json_decode(blob)
+print(length(cheap), length(prices), total, price of (sorted[0]), length(groups), length(back))

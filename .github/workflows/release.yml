@@ -101,6 +101,64 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
 
+      # PGO (F1.12 de specs/compute-rendimiento.md; medido: −16 % a −32 % en el arnés, fib −23 %).
+      # Un `synsema` instrumentado corre el corpus de engine/pgo/ y el binario publicado se compila
+      # con ese perfil: el compilador ordena y optimiza el código según lo que el intérprete ejecuta
+      # de verdad. No cambia lo que hace ningún programa. El instrumentado se compila con `cargo
+      # build` en macOS y Windows y con `cargo zigbuild` en Linux, igual que el final: sólo se usa para
+      # entrenar y nunca se publica. macOS x86_64 se compila en el runner ARM: el instrumentado corre
+      # bajo Rosetta.
+      - name: PGO - tools
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rustup component add llvm-tools --toolchain 1.96.0
+          if [ "$TARGET" = "x86_64-apple-darwin" ]; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          # Linux: el instrumentado y el final pasan por el `zig` de engine/pgo/ (arregla el
+          # `-u <símbolo>` que zig cc no entiende; al build normal lo deja igual). Los DOS builds tienen
+          # que hacerse igual salvo el perfil: si difieren, cambian los nombres internos de las
+          # funciones y el perfil no se aplica, en silencio (medido: un perfil de `cargo build`
+          # aplicado a un build de zigbuild no dio ninguna ganancia).
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            chmod +x engine/pgo/zig
+            echo "$GITHUB_WORKSPACE/engine/pgo" >> "$GITHUB_PATH"
+          fi
+
+      - name: PGO - instrumented build and training
+        shell: bash
+        env:
+          SYNSEMA_VERSION: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          RUSTFLAGS: -Cprofile-generate=${{ runner.temp }}/pgo-raw
+        run: |
+          set -euo pipefail
+          # El mismo comando y el mismo directorio que el build final de abajo, con otro RUSTFLAGS.
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            cargo zigbuild --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target "$TARGET.2.17"
+          else
+            cargo build --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target "$TARGET"
+          fi
+          bin="engine/target/$TARGET/release/synsema"
+          if [ -f "$bin.exe" ]; then bin="$bin.exe"; fi
+          # Windows: runner.temp es una ruta de Windows; bash la quiere en formato unix.
+          if command -v cygpath >/dev/null 2>&1; then bin=$(cygpath -u "$bin"); fi
+          bash engine/pgo/train.sh "$bin"
+
+      - name: PGO - merge the profile
+        shell: bash
+        env:
+          PGO_DIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          host=$(rustc +1.96.0 -vV | sed -n 's/^host: //p')
+          profdata="$(rustc +1.96.0 --print sysroot)/lib/rustlib/$host/bin/llvm-profdata"
+          "$profdata" merge -o "$PGO_DIR/pgo.profdata" "$PGO_DIR/pgo-raw"
+          ls -la "$PGO_DIR/pgo.profdata"
+
       # SYNSEMA_VERSION = el tag que disparó el release (p. ej. v0.3.2). El binario lo
       # hornea como su versión (ver crates/synsema-cli/build.rs) → `synsema version`
       # reporta el release, no el commit de main.
@@ -120,12 +178,14 @@ jobs:
         if: runner.os == 'Linux'
         env:
           SYNSEMA_VERSION: ${{ github.ref_name }}
+          RUSTFLAGS: -Cprofile-use=${{ runner.temp }}/pgo.profdata
         run: cargo zigbuild --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target ${{ matrix.target }}.2.17
 
       - name: Build
         if: runner.os != 'Linux'
         env:
           SYNSEMA_VERSION: ${{ github.ref_name }}
+          RUSTFLAGS: -Cprofile-use=${{ runner.temp }}/pgo.profdata
         run: cargo build --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target ${{ matrix.target }}
 
       - name: Package (unix)
