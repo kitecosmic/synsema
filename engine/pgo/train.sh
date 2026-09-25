@@ -38,7 +38,7 @@ for f in "$ROOT"/engine/pgo/train/*.syn; do
         bad=$((bad + 1))
     fi
 done
-for f in "$ROOT"/engine/crates/synsema-runtime/tests/oracle_cases/*.syn; do
+for f in "$ROOT"/engine/crates/synsema-runtime/tests/oracle_cases/*.syn "$ROOT"/engine/crates/synsema-runtime/tests/oracle_cases/errors/*.syn; do
     n=$((n + 1))
     (cd "$(dirname "$f")" && run_limited "$BIN" run "$f") || true
 done

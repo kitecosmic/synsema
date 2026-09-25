@@ -491,6 +491,11 @@ jobs:
             if [ "$f" = "examples/error_demo.syn" ]; then
               printf '   load %-62s (error demo: raises at top level on purpose)\n' "$f"; continue
             fi
+            # Casos del oráculo diferencial que prueban caminos de ERROR (reference_oracle.rs compara
+            # el error de los dos caminos): terminan en error a propósito.
+            case "$f" in engine/crates/synsema-runtime/tests/oracle_cases/errors/*)
+              printf '   load %-62s (oracle error case: ends in an error on purpose)\n' "$f"; continue ;;
+            esac
             echo "::error file=$f::failed to load or its tests failed"
             echo "$out" | head -8 | sed 's/^/      /'
             fail=1
