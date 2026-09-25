@@ -310,8 +310,8 @@ let USDC be "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 task fresh()
     give private(deploy({"app_id": 1, "params": nothing})["state"], "app")
 
--- Maps are shared by reference and a successful call mutates the state it was given: snapshot
--- `before` with a deep copy when a test needs both sides of a transition.
+-- Maps are values since v0.6.29: a call never changes the state it was given, so `before` is safe
+-- as it is. The deep copy stays as a snapshot that does not depend on that guarantee.
 task copy(v)
     give json_decode(json_encode(v))
 
@@ -389,7 +389,7 @@ test "transfer with an invoice: two encrypted events, a public keccak receipt, t
     let bad be process({"app_id": 1, "sender": BOB, "request_type": 1, "kind": "process", "payload": {"type": "transfer", "transfer": {"to": ALICE, "amount": "0x79"}}, "payload_hex": nothing, "state": r["state"]})
     assert_eq(bad["error"], "insufficient_balance")
     assert_eq(bad["error_detail"], "Insufficient balance for transfer")
-    -- Maps are shared by reference: a successful call mutates the state it was given, so it goes last.
+    -- Maps are values since v0.6.29: this call leaves r["state"] as it was.
     let plain be process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": {"type": "transfer", "transfer": {"to": BOB, "amount": "0x1"}}, "payload_hex": nothing, "state": r["state"]})
     assert(not contains(plain, "app_events"))
     assert_eq(plain["state"]["accounts"][BOB]["balances"][ETH], "0x79")

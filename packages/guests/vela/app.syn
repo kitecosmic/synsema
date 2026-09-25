@@ -216,8 +216,8 @@ task invariants(ctx)
 let ALICE be "0x1111111111111111111111111111111111111111"
 let BOB be "0x2222222222222222222222222222222222222222"
 
--- Maps are shared by reference and a successful call mutates the state it was given: snapshot
--- `before` with a deep copy when a test needs both sides of a transition.
+-- Maps are values since v0.6.29: a call never changes the state it was given, so `before` is safe
+-- as it is. The deep copy stays as a snapshot that does not depend on that guarantee.
 task copy(v)
     give json_decode(json_encode(v))
 

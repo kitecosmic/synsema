@@ -237,8 +237,8 @@ task run_execute(state, value)
     let payload be {"command": "execute", "execute": {"target": TARGET, "value": value, "data": "0x"}}
     give process({"app_id": 1, "sender": ALICE, "request_type": 1, "kind": "process", "payload": payload, "payload_hex": nothing, "state": state})
 
--- Maps are shared by reference and a successful call mutates the state it was given: snapshot
--- `before` with a deep copy when a test needs both sides of a transition.
+-- Maps are values since v0.6.29: a call never changes the state it was given, so `before` is safe
+-- as it is. The deep copy stays as a snapshot that does not depend on that guarantee.
 task copy(v)
     give json_decode(json_encode(v))
 

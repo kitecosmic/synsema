@@ -61,7 +61,7 @@ task fill(n)
     give slice(s, 0, n)
 
 task base_name(path)
-    let parts be split(replace_text(path, "\\", "/"), "/")
+    let parts be split(replace(path, "\\", "/"), "/")
     give parts[length(parts) - 1]
 
 task slot_offset(wasm)

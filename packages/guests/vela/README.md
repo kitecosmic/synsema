@@ -179,7 +179,7 @@ keys, no attestation, reset from time to time; `https://devnet.synsema.app/` sho
 
 `novaw` only speaks the payment app's payload; every other app needs its own client. `examples/client/vela_client.syn`
 does all of it natively with the v0.6.20 builtins (`ecdh_*`, `hkdf_sha256`, `aes_gcm_*`, `abi_*`,
-`eip712_digest`, `tx_eip1559`, `multipart_encode`, `http_post`). Copy `.env.example` to `.env`
+`eip712_digest`, `evm_tx`, `multipart_encode`, `http_post`). Copy `.env.example` to `.env`
 (`VELA_RPC_URL`, `VELA_PROCESSOR`, `VELA_TEE_AUTHENTICATOR`, `VELA_AUTHORITY_URL`, `VELA_SUBGRAPH_URL`,
 `VELA_APP_ID`, `VELA_MAX_FEE`, `VELA_SECP_KEY`, `VELA_P521_KEY`/`VELA_P521_PUB`, `VELA_USER_KEY`).
 
