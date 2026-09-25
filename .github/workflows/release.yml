@@ -123,9 +123,12 @@ jobs:
           # que hacerse igual salvo el perfil: si difieren, cambian los nombres internos de las
           # funciones y el perfil no se aplica, en silencio (medido: un perfil de `cargo build`
           # aplicado a un build de zigbuild no dio ninguna ganancia).
+          # Se le pasa a cargo-zigbuild por CARGO_ZIGBUILD_ZIG_PATH y no por el PATH: con `ziglang`
+          # instalado por pip, cargo-zigbuild usa ése antes que cualquier `zig` del PATH (así falló el
+          # primer intento en CI; en una máquina sin ziglang de pip el PATH alcanzaba).
           if [ "$RUNNER_OS" = "Linux" ]; then
             chmod +x engine/pgo/zig
-            echo "$GITHUB_WORKSPACE/engine/pgo" >> "$GITHUB_PATH"
+            echo "CARGO_ZIGBUILD_ZIG_PATH=$GITHUB_WORKSPACE/engine/pgo/zig" >> "$GITHUB_ENV"
           fi
 
       - name: PGO - instrumented build and training
