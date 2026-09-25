@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.30 — unreleased
+## v0.6.30 — 2026-09-25
 
 Fixes from the v0.6.29 audit, plus three things data and scheduling code kept asking for: cron in
 an IANA time zone, decimals written with an exponent, and Parquet files that pandas and polars read
