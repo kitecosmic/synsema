@@ -71,6 +71,11 @@ are now errors, and error messages that now say what to write.
   `duration` type that pyarrow and polars write (it came back as an integer without a unit).
   `parquet_read(parquet_write(rows)) == rows` holds with durations, including a `TIME` column read
   from another tool.
+- **Parquet: nanoseconds are never dropped.** A column is written in one unit; one that had a value
+  with nanoseconds and another beyond the nanosecond range (a datetime outside 1677-2262, a duration
+  beyond ±292 years) went in microseconds and lost the nanoseconds without a word. It is now an
+  error naming the column, as in pyarrow. **What to write instead:** put the far values in another
+  column, or store that column as text (`text(x)` keeps every digit).
 
 **Faster.**
 

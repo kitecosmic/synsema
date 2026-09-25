@@ -376,3 +376,19 @@ fn parquet_writes_the_arrow_schema() {
     let o = out("let rows be [{\"d\": duration(seconds = 90), \"w\": datetime(\"2026-01-03T10:00:00\", \"Europe/Madrid\"), \"n\": 1}]\nlet bin be parquet_write(rows)\nprint(contains(hex(bin), replace(hex(bytes(\"ARROW:schema\")), \"0x\", \"\")))\nprint(parquet_read(bin) == rows)");
     assert_eq!(o, vec!["true", "true"]);
 }
+
+// Parquet — una columna con nanosegundos y un valor que no entra en nanosegundos (±292 años) no
+// se escribe en microsegundos perdiéndolos en silencio: es un error que nombra la columna.
+#[test]
+fn parquet_refuses_to_drop_nanoseconds() {
+    let far = "let far be datetime(\"2400-01-01T00:00:00Z\") - datetime(\"1800-01-01T00:00:00Z\")\n";
+    let e = fails(&format!("{far}print(parquet_write([{{\"d\": duration(seconds = 0.0000015)}}, {{\"d\": far}}]))"));
+    assert!(e.contains("column \"d\" has a duration with nanoseconds and one beyond ±292 years") && e.contains("text(x)"), "{}", e);
+    let e = fails("print(parquet_write([{\"t\": datetime(\"2026-01-03T10:00:00.000000001Z\")}, {\"t\": datetime(\"2400-01-01T00:00:00Z\")}]))");
+    assert!(e.contains("column \"t\" has a datetime with nanoseconds and one outside 1677-2262"), "{}", e);
+    // Sin nanosegundos, lo lejano va en microsegundos como siempre; con todo en rango, en nanosegundos.
+    assert_eq!(
+        out(&format!("{far}let a be [{{\"d\": far}}, {{\"d\": duration(seconds = 1)}}]\nprint(parquet_read(parquet_write(a)) == a)\nlet b be [{{\"t\": datetime(\"2026-01-03T10:00:00.000000001Z\")}}]\nprint(parquet_read(parquet_write(b)) == b)")),
+        vec!["true", "true"]
+    );
+}

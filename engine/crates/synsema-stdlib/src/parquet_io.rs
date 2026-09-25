@@ -746,6 +746,15 @@ fn arrow_schema_b64(cols: &[(String, ColKind, bool, String)]) -> String {
     synsema_core::bytesutil::b64_encode(&out)
 }
 
+/// Una columna con nanosegundos y un valor que no entra en nanosegundos: en microsegundos se
+/// perderían en silencio (pyarrow también lo rechaza).
+fn lost_nanos(col: &str, what: &str, range: &str) -> Control {
+    err(format!(
+        "parquet_write: column {:?} has {} with nanoseconds and one {} — one unit per column, and nanoseconds do not reach that far, so they would be lost — put the far values in another column, or store this one as text (text(x) keeps every digit)",
+        col, what, range
+    ))
+}
+
 fn merge_kind(a: ColKind, b: ColKind, col: &str) -> Result<ColKind, Control> {
     use ColKind::*;
     Ok(match (a, b) {
@@ -897,7 +906,10 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
                     all_fit = false;
                 }
             }
-            any_sub_micro && all_fit
+            if any_sub_micro && !all_fit {
+                return Err(lost_nanos(name, "a datetime", "outside 1677-2262"));
+            }
+            any_sub_micro
         };
         // Una columna de durations: en microsegundos (±292 000 años) salvo que algún valor tenga
         // nanosegundos y todos entren en nanosegundos (±292 años), como los datetimes.
@@ -911,7 +923,10 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
                     }
                 }
             }
-            any_sub_micro && all_fit
+            if any_sub_micro && !all_fit {
+                return Err(lost_nanos(name, "a duration", "beyond ±292 years"));
+            }
+            any_sub_micro
         };
         if *k == Some(ColKind::Duration) {
             durs.insert(name.clone(), serde_json::Value::String(if dur_nanos { "ns" } else { "us" }.to_string()));
