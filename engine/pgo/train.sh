@@ -12,7 +12,9 @@
 # oráculo (algunos terminan en error a propósito) y los tests del lenguaje. No usa
 # specs/compute-bench, que es con lo que se mide la ganancia.
 set -u
-BIN=$1
+# Ruta absoluta: cada programa corre desde su carpeta (sus `use` relativos), y release.yml pasa la
+# ruta del binario relativa a la raíz del repo.
+BIN="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 LIMIT=120
 
