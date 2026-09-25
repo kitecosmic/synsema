@@ -610,10 +610,10 @@ fn write_audit_op(
     granted: bool,
     extra: &str,
 ) -> Result<(), String> {
-    let program = std::path::Path::new(&loc.file)
+    let program = std::path::Path::new(&*loc.file)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| loc.file.clone());
+        .unwrap_or_else(|| loc.file.to_string());
     let result = if granted { "granted" } else { "denied" };
     let tail = if extra.is_empty() { String::new() } else { format!(" {}", extra) };
     let line = format!(
@@ -938,7 +938,7 @@ mod tests {
     fn audit_writes_name_not_value_appends_and_fails_when_unwritable() {
         let _g = lock();
         use synsema_core::tokens::SourceLocation;
-        let loc = SourceLocation { file: "app.syn".to_string(), line: 7, column: 0, offset: 0 };
+        let loc = SourceLocation { file: "app.syn".into(), line: 7, column: 0, offset: 0 };
 
         // Dir escribible: entrada con nombre + file:line + programa. (No hay valor que
         // escribir: write_audit_entry no recibe el plaintext — garantía estructural.)

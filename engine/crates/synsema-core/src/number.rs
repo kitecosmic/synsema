@@ -25,8 +25,9 @@ pub const MIX_DECIMAL_FLOAT: &str =
 pub enum Number {
     /// Entero que entra en i64 (caso común).
     Int(i64),
-    /// Entero de precisión arbitraria (al desbordar i64).
-    Big(BigInt),
+    /// Entero de precisión arbitraria (al desbordar i64). En `Box`, como `BigDec`: es el caso raro
+    /// y en línea dimensionaba `Number` (y `SynValue`) a 32 bytes (specs/compute-rendimiento.md F1.10).
+    Big(Box<BigInt>),
     /// Punto flotante.
     Float(f64),
     /// Decimal exacto base-10 (dinero/finanzas): 96-bit, preserva escala. El caso común.
@@ -68,7 +69,7 @@ impl Number {
     pub fn from_bigint(b: BigInt) -> Number {
         match b.to_i64() {
             Some(n) => Number::Int(n),
-            None => Number::Big(b),
+            None => Number::Big(Box::new(b)),
         }
     }
 
@@ -117,7 +118,7 @@ impl Number {
     /// Demueve `Big` a `Int` si entra en i64.
     pub fn normalized(self) -> Number {
         match self {
-            Number::Big(b) => Number::from_bigint(b),
+            Number::Big(b) => Number::from_bigint(*b),
             other => other,
         }
     }
@@ -291,7 +292,7 @@ impl Number {
     pub fn as_bigint(&self) -> Option<BigInt> {
         match self {
             Number::Int(n) => Some(BigInt::from(*n)),
-            Number::Big(b) => Some(b.clone()),
+            Number::Big(b) => Some((**b).clone()),
             Number::Float(_) => None,
             Number::Decimal(d) => {
                 if d.fract().is_zero() {
@@ -327,7 +328,7 @@ impl Number {
     pub fn exact_ratio(&self) -> Option<(BigInt, u32)> {
         match self {
             Number::Int(n) => Some((BigInt::from(*n), 0)),
-            Number::Big(b) => Some((b.clone(), 0)),
+            Number::Big(b) => Some(((**b).clone(), 0)),
             Number::Decimal(d) => Some((BigInt::from(d.mantissa()), d.scale())),
             Number::BigDec(b) => Some((b.m.clone(), b.s)),
             Number::Float(_) => None,
@@ -552,7 +553,7 @@ impl Number {
                 Some(r) => Number::Int(r),
                 None => Number::from_bigint(-BigInt::from(*n)),
             },
-            Number::Big(b) => Number::from_bigint(-b),
+            Number::Big(b) => Number::from_bigint(-&**b),
             Number::Float(x) => Number::Float(-x),
             Number::Decimal(d) => Number::Decimal(-*d),
             Number::BigDec(b) => Number::BigDec(Box::new(BigDec { m: -&b.m, s: b.s })),
@@ -1007,7 +1008,7 @@ mod tests {
 
     #[test]
     fn int_eq_big_by_value() {
-        assert_eq!(Number::Int(100), Number::Big("100".parse().unwrap()));
+        assert_eq!(Number::Int(100), Number::Big(Box::new("100".parse().unwrap())));
     }
 
     /// El orden i64×float sin BigInt da exactamente lo mismo que el camino exacto con BigInt, en
@@ -1046,7 +1047,7 @@ mod tests {
     /// un `Big` construido con un valor que entra en `i64`.
     #[test]
     fn int_big_order_matches_the_bigint_path() {
-        let big = |s: &str| Number::Big(s.parse().unwrap());
+        let big = |s: &str| Number::Big(Box::new(s.parse().unwrap()));
         let vals = [
             Number::Int(0),
             Number::Int(-3),

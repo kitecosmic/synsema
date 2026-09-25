@@ -160,7 +160,7 @@ fn reveal_bytes(interp: &mut Interpreter, s: &SynValue) -> Vec<u8> {
 
 fn err_msg(r: Result<SynValue, Control>) -> String {
     match r {
-        Err(Control::Error(e)) => e.message,
+        Err(Control::Error(e)) => e.into_message(),
         Ok(v) => panic!("esperaba error, obtuve {}", v.type_name()),
         Err(_) => panic!("control inesperado"),
     }

@@ -295,11 +295,11 @@ impl ErrorReporter {
         };
         if let Some(loc) = location {
             diag.location = Some(loc.clone());
-            diag.file = loc.file.clone();
+            diag.file = loc.file.to_string();
             diag.line = loc.line;
             diag.column = loc.column;
             // Contexto: 3 líneas antes y después.
-            if let Some(lines) = self.source_lines.get(&loc.file) {
+            if let Some(lines) = self.source_lines.get(&*loc.file) {
                 let start = loc.line.saturating_sub(4);
                 let end = (loc.line + 3).min(lines.len());
                 diag.source_context = lines[start..end].to_vec();

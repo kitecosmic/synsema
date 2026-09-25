@@ -2424,7 +2424,7 @@ mod tests {
 
     fn errmsg<T>(r: Result<T, Control>) -> String {
         match r {
-            Err(Control::Error(e)) => e.message,
+            Err(Control::Error(e)) => e.into_message(),
             Ok(_) => panic!("esperaba error, vino Ok"),
             Err(_) => panic!("control-flow inesperado"),
         }

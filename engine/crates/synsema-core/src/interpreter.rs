@@ -35,9 +35,46 @@ use crate::types::*;
 // errores y control de flujo
 // =========================================================
 
-/// Error en tiempo de ejecución, con ubicación opcional.
+/// Error en tiempo de ejecución, con ubicación opcional. Los datos van en un `Box`: toda
+/// evaluación devuelve `Result<SynValue, Control>`, y con el error por valor ese `Result` medía
+/// 128 bytes aunque el error no ocurriera nunca (specs/compute-rendimiento.md F1.10). Los campos se
+/// leen y escriben como siempre (`e.message`, `e.location = …`) a través de `Deref`.
+#[derive(Clone)]
+pub struct RuntimeError(Box<RuntimeErrorData>);
+
+impl std::ops::Deref for RuntimeError {
+    type Target = RuntimeErrorData;
+    fn deref(&self) -> &RuntimeErrorData {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for RuntimeError {
+    fn deref_mut(&mut self) -> &mut RuntimeErrorData {
+        &mut self.0
+    }
+}
+
+/// La misma salida que daba `#[derive(Debug)]` cuando los campos estaban en `RuntimeError`.
+impl fmt::Debug for RuntimeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RuntimeError")
+            .field("message", &self.message)
+            .field("location", &self.location)
+            .field("is_validation", &self.is_validation)
+            .field("field", &self.field)
+            .field("is_assertion", &self.is_assertion)
+            .field("from_private_pc", &self.from_private_pc)
+            .field("redact_label", &self.redact_label)
+            .field("from_labels", &self.from_labels)
+            .field("denied_by_token", &self.denied_by_token)
+            .finish()
+    }
+}
+
+/// Los datos de un `RuntimeError`.
 #[derive(Debug, Clone)]
-pub struct RuntimeError {
+pub struct RuntimeErrorData {
     pub message: String,
     pub location: Option<SourceLocation>,
     /// Error de VALIDACIÓN de cliente (p.ej. una falla de `expect body`): el serve lo
@@ -76,11 +113,15 @@ pub struct RuntimeError {
 }
 
 impl RuntimeError {
+    /// El mensaje, consumiendo el error (los datos van en un `Box`: no se puede mover un campo).
+    pub fn into_message(self) -> String {
+        self.0.message
+    }
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), location: None, is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false }
+        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: None, is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false }))
     }
     pub fn at(message: impl Into<String>, location: SourceLocation) -> Self {
-        Self { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false }
+        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false }))
     }
     /// El texto de este error **hacia un cliente REMOTO** (el cuerpo de una respuesta HTTP, el
     /// evento final de un stream): igual que `Display`, pero la ubicación viaja con el NOMBRE del
@@ -107,15 +148,15 @@ impl RuntimeError {
     /// Error de validación de cliente (input que no cumple `expect`): se mapea a HTTP 400
     /// con el nombre del campo ofensor, en vez de a un 500 genérico.
     pub fn validation(message: impl Into<String>, field: Option<String>) -> Self {
-        Self { message: message.into(), location: None, is_validation: true, field, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false }
+        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: None, is_validation: true, field, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false }))
     }
     /// Falla de aserción (`assert*`): marca `is_assertion` para el reporte de tests.
     pub fn assertion(message: impl Into<String>) -> Self {
-        Self { message: message.into(), location: None, is_validation: false, field: None, is_assertion: true, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false }
+        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: None, is_validation: false, field: None, is_assertion: true, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false }))
     }
     /// Diagnóstico del sistema de etiquetas (`from_labels`), con ubicación.
     pub fn labels(message: impl Into<String>, location: SourceLocation) -> Self {
-        Self { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: true, denied_by_token: false }
+        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: true, denied_by_token: false }))
     }
     /// ¿Este error NO se puede atrapar con `try/recover` ? Un salto de control desde PC
     /// privado sería un bit observable por iteración, y el veredicto del enforcement no se
@@ -181,7 +222,7 @@ fn err_labels(msg: impl Into<String>, loc: &SourceLocation) -> Control {
     // (que no implica `--secure`) su texto llega al cliente HTTP remoto. La ubicación viaja con
     // el NOMBRE del archivo, no con la ruta absoluta de la máquina del enclave.
     let mut short = loc.clone();
-    short.file = basename_of(&short.file).to_string();
+    short.file = basename_of(&short.file).into();
     Control::Error(RuntimeError::labels(msg, short))
 }
 
@@ -569,7 +610,7 @@ fn same_place(a: &Node, b: &Node) -> bool {
 /// recorta como en Python: un índice equivocado es un bug, no un "al final".
 fn insert_position(i: &SynValue, len: usize) -> Result<usize, String> {
     let i = num_to_i64(i).map_err(|e| match e {
-        Control::Error(e) => e.message,
+        Control::Error(e) => e.into_message(),
         _ => "insert(): the position must be an integer".to_string(),
     })?;
     let n = len as i64;
@@ -2591,7 +2632,7 @@ impl Interpreter {
         for a in &args {
             self.harvest_principals(a);
         }
-        let loc = SourceLocation { file: "<engine>".to_string(), line: 0, column: 0, offset: 0 };
+        let loc = SourceLocation { file: "<engine>".into(), line: 0, column: 0, offset: 0 };
         let r = self.call_value(func, args, &loc);
         // T5 (M1): es un punto de salida hacia el host.
         self.redact_for_host(r)
@@ -4096,34 +4137,51 @@ impl Interpreter {
                 self.exec_when_branches(cond.is_truthy(), body, otherwise_when, otherwise, env)
             }
             NodeKind::EachStatement { variable, collection, body } => {
-                let coll = self.exec(collection, env)?;
-                // Colección con etiquetas (a cualquier profundidad, B3) → cada item sale
-                // con esa etiqueta y el cuerpo corre bajo ese PC; el valor implícito también.
+                // `each i in range(…)` sin armar la lista (atajo, F1.11; ver `each_over_range`).
+                let lazy = if self.shortcuts && !self.labels { self.each_over_range(collection, env)? } else { None };
                 let mut each_label: Option<Label> = None;
-                let coll = if self.labels {
-                    let l = labels::label_deep(&coll);
-                    if !l.is_empty() {
-                        each_label = Some(l);
-                    }
-                    labels::unwrap(&coll).clone()
-                } else {
-                    coll
-                };
-                // v0.6.29: un mapa se recorre por sus claves y un texto por sus caracteres
-                // (como Python); bytes, por sus valores 0..=255.
-                let items = match &coll {
-                    SynValue::List(l) => l.borrow().clone(),
-                    SynValue::Map(m) => m.borrow().keys().map(|k| syn_text(k.as_str())).collect(),
-                    SynValue::Text(t) => t.chars().map(|c| syn_text(c.to_string())).collect(),
-                    SynValue::Bytes(b) => b.iter().map(|x| syn_int(*x as i64)).collect(),
-                    _ => {
-                        return Err(err_at(
-                            format!(
-                                "Cannot iterate over {} — each walks a list, the keys of a map, the characters of a text or the values of bytes",
-                                coll.type_name()
+                let mut items = match lazy {
+                    Some(r) => EachItems::Range(r),
+                    None => {
+                        let coll = self.exec(collection, env)?;
+                        // Colección con etiquetas (a cualquier profundidad, B3) → cada item sale
+                        // con esa etiqueta y el cuerpo corre bajo ese PC; el valor implícito también.
+                        let coll = if self.labels {
+                            let l = labels::label_deep(&coll);
+                            if !l.is_empty() {
+                                each_label = Some(l);
+                            }
+                            labels::unwrap(&coll).clone()
+                        } else {
+                            coll
+                        };
+                        // v0.6.29: un mapa se recorre por sus claves y un texto por sus caracteres
+                        // (como Python); bytes, por sus valores 0..=255.
+                        match &coll {
+                            // Atajo (F1.11): la lista se recorre por índice en vez de copiarla
+                            // entera. La foto la sigue dando la semántica de valor: si el cuerpo la
+                            // modifica, el copy-on-write ve este `Rc` compartido y copia (una vez).
+                            SynValue::List(l) if self.shortcuts => EachItems::List(l.clone(), 0),
+                            SynValue::List(l) => EachItems::Owned(l.borrow().clone().into_iter()),
+                            SynValue::Map(m) => EachItems::Owned(
+                                m.borrow().keys().map(|k| syn_text(k.as_str())).collect::<Vec<_>>().into_iter(),
                             ),
-                            loc,
-                        ))
+                            SynValue::Text(t) => {
+                                EachItems::Owned(t.chars().map(|c| syn_text(c.to_string())).collect::<Vec<_>>().into_iter())
+                            }
+                            SynValue::Bytes(b) => {
+                                EachItems::Owned(b.iter().map(|x| syn_int(*x as i64)).collect::<Vec<_>>().into_iter())
+                            }
+                            _ => {
+                                return Err(err_at(
+                                    format!(
+                                        "Cannot iterate over {} — each walks a list, the keys of a map, the characters of a text or the values of bytes",
+                                        coll.type_name()
+                                    ),
+                                    loc,
+                                ))
+                            }
+                        }
                     }
                 };
                 // T5 (ronda 5): el frame de bucle se abre ANTES de teñir, porque un `stop` del
@@ -4139,7 +4197,7 @@ impl Interpreter {
                 }
                 let mut result = SynValue::Nothing;
                 let mut outcome: Result<(), Control> = Ok(());
-                for item in items {
+                while let Some(item) = items.next_item() {
                     let loop_env = Environment::child_scope(env, "each");
                     // El item lleva la etiqueta de DATOS de la colección (no la de PC, que
                     // desde la regla 2 no envuelve contenedores): un mapa dentro de una lista
@@ -4284,40 +4342,7 @@ impl Interpreter {
             }
 
             // -- Tasks --
-            NodeKind::TaskDefinition { name, parameters, body, .. } => {
-                let mut required_caps = Vec::new();
-                let mut clean_body = Vec::new();
-                for stmt in body {
-                    if let NodeKind::RequireStatement { capability, scope } = &stmt.kind {
-                        let scope_val = match scope {
-                            Some(s) => Some(self.exec(s, env)?.to_string()),
-                            None => None,
-                        };
-                        required_caps.push((capability.clone(), scope_val));
-                    } else {
-                        clean_body.push(stmt.clone());
-                    }
-                }
-                let task = Rc::new(SynTaskValue {
-                    name: name.clone(),
-                    parameters: parameters.clone(),
-                    body: clean_body,
-                    closure_env: env.clone(),
-                    origin: Some(loc.clone()),
-                    required_capabilities: required_caps,
-                });
-                let value = SynValue::Task(task);
-                // Definir una task bajo PC es una asignación más (NSU estricto + el
-                // callable sale etiquetado: QUÉ task quedó definida depende de la rama).
-                let value = if self.labels {
-                    self.let_nsu_check(env, name, loc)?;
-                    self.pc_mark(value, loc)?
-                } else {
-                    value
-                };
-                env_set(env, name, value.clone());
-                Ok(value)
-            }
+            NodeKind::TaskDefinition { .. } => self.exec_task_definition(node, env),
             NodeKind::TaskCall { name, arguments } => {
                 let func = self.exec(name, env)?;
                 // T5 (B8): `private(…)`/`declassify(…)`/`label_of(…)`/`is_private(…)`/`print(…)`
@@ -4396,800 +4421,61 @@ impl Interpreter {
             }
 
             // -- Módulos locales (use / export) --
-            NodeKind::UseImport { path, alias } => {
-                let module_map = self.load_module(path, &loc.file)?;
-                env_set(env, alias, module_map.clone());
-                Ok(module_map)
-            }
+            NodeKind::UseImport { .. } => self.exec_use_import(node, env),
             // `routes <name>`: grupo de rutas montable. Se ejecuta a un MAP PLANO
             // {"_routes_meta": [<method/path/params/requires_auth>...],
             //  "_route_handler_<i>": task} — cada handler-task cierra sobre ESTE env
             // (el module_env cuando el grupo vive en un módulo), así el snapshot de
             // serve lo trata como cualquier map de módulo (DE-032) y los cuerpos de
             // ruta llaman helpers privados del módulo por nombre simple.
-            NodeKind::RoutesDeclaration { name, routes } => {
-                let mut map = IndexMap::new();
-                let mut meta: Vec<SynValue> = Vec::new();
-                for (i, r) in routes.iter().enumerate() {
-                    if let NodeKind::RouteDefinition {
-                        method,
-                        path,
-                        param_names,
-                        requires_auth,
-                        streaming,
-                        socket,
-                        rate_limit,
-                        timeout,
-                        private,
-                        body,
-                    } = &r.kind
-                    {
-                        // v0.6.20 — `stream`/`socket` ya viajan por el grupo (clase en la meta);
-                        // serve los monta como rutas directas.
-                        // `rate_limit` y `timeout` por ruta viajan en la meta: se evalúan acá, una
-                        // vez, con el env del módulo (misma regla que una ruta directa: la
-                        // expresión se evalúa al arrancar), y serve los aplica al montar.
-                        let mut route_limit: Option<SynValue> = None;
-                        if let Some(rl) = rate_limit {
-                            if let NodeKind::RateLimitClause { count, window, unlimited } = &rl.kind {
-                                let cap: i64 = match count {
-                                    Some(c) => match self.eval(c, env)? {
-                                        SynValue::Number(Number::Int(i)) => i,
-                                        SynValue::Number(Number::Float(f)) => f as i64,
-                                        other => {
-                                            return Err(err_at(
-                                                format!("rate_limit count must be a number, got {}", other.type_name()),
-                                                &r.location,
-                                            ))
-                                        }
-                                    },
-                                    None => 0,
-                                };
-                                let mut lm = IndexMap::new();
-                                lm.insert("unlimited".to_string(), syn_bool(*unlimited));
-                                lm.insert("count".to_string(), SynValue::Number(Number::Int(cap)));
-                                lm.insert("window".to_string(), syn_text(window.as_str()));
-                                route_limit = Some(syn_map(lm));
-                            }
-                        }
-                        let mut route_timeout: Option<SynValue> = None;
-                        if let Some(t) = timeout {
-                            if let NodeKind::TimeoutClause { secs } = &t.kind {
-                                route_timeout = Some(match secs {
-                                    None => syn_text("none"),
-                                    Some(e) => {
-                                        let v = self.eval(e, env)?;
-                                        let f = match &v {
-                                            SynValue::Number(Number::Int(i)) => *i as f64,
-                                            SynValue::Number(Number::Float(f)) => *f,
-                                            _ => f64::NAN,
-                                        };
-                                        if !(f.is_finite() && f > 0.0) {
-                                            return Err(err_at(
-                                                format!("timeout must be a positive number of seconds (or `none`), got {}", v),
-                                                &r.location,
-                                            ));
-                                        }
-                                        SynValue::Number(Number::Float(f))
-                                    }
-                                });
-                            }
-                        }
-                        let task = SynValue::Task(Rc::new(SynTaskValue {
-                            name: format!("route {} {}", method, path),
-                            parameters: Vec::new(),
-                            body: body.clone(),
-                            closure_env: env.clone(),
-                            origin: Some(r.location.clone()),
-                            required_capabilities: Vec::new(),
-                        }));
-                        map.insert(format!("_route_handler_{}", i), task);
-                        let mut mm = IndexMap::new();
-                        mm.insert("method".to_string(), syn_text(method.as_str()));
-                        mm.insert("path".to_string(), syn_text(path.as_str()));
-                        mm.insert("requires_auth".to_string(), syn_bool(*requires_auth));
-                        // v0.6.20 — `private` (fuera de los documentos generados) y la clase de
-                        // ruta (`stream`/`socket`) viajan en la meta para que serve las monte
-                        // exactamente como una ruta directa.
-                        mm.insert("private".to_string(), syn_bool(*private));
-                        mm.insert("streaming".to_string(), syn_bool(*streaming));
-                        mm.insert("socket".to_string(), syn_bool(*socket));
-                        mm.insert(
-                            "params".to_string(),
-                            syn_list(param_names.iter().map(|p| syn_text(p.as_str())).collect()),
-                        );
-                        if let Some(l) = route_limit {
-                            mm.insert("rate_limit".to_string(), l);
-                        }
-                        if let Some(t) = route_timeout {
-                            mm.insert("timeout".to_string(), t);
-                        }
-                        meta.push(syn_map(mm));
-                    }
-                }
-                map.insert("_routes_meta".to_string(), syn_list(meta));
-                let value = syn_map(map);
-                env_set(env, name, value.clone());
-                Ok(value)
-            }
+            NodeKind::RoutesDeclaration { .. } => self.exec_routes_declaration(node, env),
 
             // Una cláusula `mount` suelta jamás se ejecuta sola: la consume el serve hook.
             NodeKind::MountClause { .. } => {
                 Err(err_at("'mount' is only valid inside a serve block", loc))
             }
 
-            NodeKind::ExportDeclaration { declaration } => {
-                let value = self.exec(declaration, env)?;
-                let name = match &declaration.kind {
-                    NodeKind::TaskDefinition { name, .. }
-                    | NodeKind::TypeDefinition { name, .. }
-                    | NodeKind::LetBinding { name, .. }
-                    | NodeKind::EnumDefinition { name, .. }
-                    | NodeKind::RoutesDeclaration { name, .. } => name.clone(),
-                    _ => {
-                        return Err(err_at(
-                            "export must wrap a task, type, let, enum, or routes",
-                            loc,
-                        ))
-                    }
-                };
-                // Registra el nombre en la superficie pública del módulo actual. El
-                // frame base (entrypoint) nunca se cosecha → allí es un no-op.
-                if let Some(frame) = self.exports_collector.last_mut() {
-                    frame.push(name);
-                }
-                Ok(value)
-            }
+            NodeKind::ExportDeclaration { .. } => self.exec_export_declaration(node, env),
 
             // -- Tipos --
-            NodeKind::TypeDefinition { name, fields } => {
-                let field_names: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
-                let count = field_names.len() as i32;
-                let type_name = name.clone();
-                let def_loc = loc.clone();
-                let func: BuiltinFn = Rc::new(move |_i, args, _l| {
-                    if args.len() != field_names.len() {
-                        return Err(err_at(
-                            format!(
-                                "Type {} expects {} fields, got {}",
-                                type_name,
-                                field_names.len(),
-                                args.len()
-                            ),
-                            &def_loc,
-                        ));
-                    }
-                    let mut m = IndexMap::new();
-                    for (n, v) in field_names.iter().zip(args.iter()) {
-                        m.insert(n.clone(), v.clone());
-                    }
-                    Ok(syn_map(m))
-                });
-                env_set(
-                    env,
-                    name,
-                    SynValue::Builtin(Rc::new(BuiltinTask::new(name.clone(), count, None, func))),
-                );
-                Ok(SynValue::Nothing)
-            }
+            NodeKind::TypeDefinition { .. } => self.exec_type_definition(node, env),
 
-            NodeKind::EnumDefinition { name, variants } => {
-                // Valor de variante = map etiquetado {"__variant": "Enum.var", <campos>};
-                // tipo enum = map namespace {"__enum": "Enum", <var>: valor|ctor}. Sin
-                // tipo de runtime nuevo: construcción = property-access + call.
-                let mut namespace = IndexMap::new();
-                namespace.insert("__enum".to_string(), syn_text(name.as_str()));
-                for (variant_name, fields) in variants {
-                    let qualified = format!("{}.{}", name, variant_name);
-                    if fields.is_empty() {
-                        // Variante nullary → un map etiquetado constante.
-                        let mut m = IndexMap::new();
-                        m.insert("__variant".to_string(), syn_text(qualified.as_str()));
-                        namespace.insert(variant_name.clone(), syn_map(m));
-                    } else {
-                        // Variante con payload → constructor builtin de aridad EXACTA.
-                        let field_names = fields.clone();
-                        let count = field_names.len() as i32;
-                        let q = qualified.clone();
-                        let def_loc = loc.clone();
-                        let func: BuiltinFn = Rc::new(move |_i, args, _l| {
-                            if args.len() != field_names.len() {
-                                return Err(err_at(
-                                    format!(
-                                        "variant {} expects {} fields, got {}",
-                                        q,
-                                        field_names.len(),
-                                        args.len()
-                                    ),
-                                    &def_loc,
-                                ));
-                            }
-                            let mut m = IndexMap::new();
-                            m.insert("__variant".to_string(), syn_text(q.as_str()));
-                            for (n, val) in field_names.iter().zip(args.iter()) {
-                                m.insert(n.clone(), val.clone());
-                            }
-                            Ok(syn_map(m))
-                        });
-                        namespace.insert(
-                            variant_name.clone(),
-                            SynValue::Builtin(Rc::new(BuiltinTask::new(qualified.clone(), count, None, func))),
-                        );
-                    }
-                }
-                let value = syn_map(namespace);
-                env_set(env, name, value.clone());
-                Ok(value)
-            }
+            NodeKind::EnumDefinition { .. } => self.exec_enum_definition(node, env),
 
             // -- Agentes (fallback in-process; sin swarm en capa 4) --
-            NodeKind::AgentDefinition { name, body, .. } => {
-                self.agent_definitions.insert(name.clone(), (body.clone(), env.clone()));
-                let mut m = IndexMap::new();
-                m.insert("name".to_string(), syn_text(name.as_str()));
-                m.insert("state".to_string(), syn_text("defined"));
-                let agent_data = syn_map(m);
-                env_set(env, name, agent_data.clone());
-                Ok(agent_data)
-            }
-            NodeKind::SpawnStatement { agent_name, arguments } => {
-                let def = match self.agent_definitions.get(agent_name) {
-                    Some(d) => (d.0.clone(), d.1.clone()),
-                    None => {
-                        // Error auto-diagnóstico (LLM-safe): decir qué agentes SÍ conoce este
-                        // contexto. Lista con nombres → typo del usuario. Lista VACÍA con el
-                        // agente definido en el programa → contexto de ejecución sin agentes
-                        // (p.ej. un intérprete reusado que no los restauró) — señal de runtime,
-                        // no del programa; ahorra ciclos de diagnóstico persiguiendo typos.
-                        let known: Vec<&str> =
-                            self.agent_definitions.keys().map(|s| s.as_str()).collect();
-                        let detail = if known.is_empty() {
-                            "no agents are defined in this execution context; if this agent IS \
-                             defined at the top level of the program, this is a runtime context \
-                             issue, not a problem in your code"
-                                .to_string()
-                        } else {
-                            format!("agents defined in this context: {}", known.join(", "))
-                        };
-                        return Err(err_at(
-                            format!("No agent defined with name '{}' ({})", agent_name, detail),
-                            loc,
-                        ));
-                    }
-                };
-                let mut spawn_args = Vec::with_capacity(arguments.len());
-                for (k, vn) in arguments {
-                    spawn_args.push((k.clone(), self.exec(vn, env)?));
-                }
-                // T5 (B7): el agente corre en otro hilo/intérprete — sumidero.
-                if self.labels {
-                    let refs: Vec<&SynValue> = spawn_args.iter().map(|(_, v)| v).collect();
-                    self.sink_check("spawn", &refs, loc)?;
-                }
-                match self.swarm_hooks.as_ref().map(|s| s.spawn.clone()) {
-                    // Con swarm: el agente corre en su propio hilo (motor).
-                    Some(spawn) => {
-                        // Snapshot de globales del intérprete llamador: tareas, valores
-                        // y módulos (excluye builtins). Viajan al intérprete del agente
-                        // para que pueda llamar tasks del top-level sin HTTP.
-                        let global_vals: Vec<(String, SynValue)> = {
-                            let env = self.global_env.borrow();
-                            env.bindings.iter()
-                                .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
-                                .map(|(k, v)| (k.clone(), v.clone()))
-                                .collect()
-                        };
-                        // T1: el agente corre EN NOMBRE de quien pidió (la identidad viaja
-                        // con el techo), no "como el agente".
-                        let subject = SpawnSubject {
-                            identity: self.request_identity.clone(),
-                            spend_limits: self.request_spend_limits.clone(),
-                        };
-                        let id = spawn(agent_name, def.0, spawn_args, global_vals, subject)?;
-                        Ok(syn_text(id))
-                    }
-                    // Sin swarm: ejecución in-process (bloqueante), fallback.
-                    None => {
-                        let agent_env = Environment::child(&def.1, &format!("agent:{}", agent_name));
-                        for (k, v) in spawn_args {
-                            env_set(&agent_env, &k, v);
-                        }
-                        // Namespace de memoria (DB-M1): dentro del cuerpo, el agente ES
-                        // el contexto (remember → source = agent_name). Pop garantizado
-                        // aunque el cuerpo falle.
-                        self.agent_context.push(agent_name.clone());
-                        let r = self.exec_block(&def.0, &agent_env);
-                        self.agent_context.pop();
-                        r?;
-                        Ok(syn_text(format!("agent:{}", agent_name)))
-                    }
-                }
-            }
+            NodeKind::AgentDefinition { .. } => self.exec_agent_definition(node, env),
+            NodeKind::SpawnStatement { .. } => self.exec_spawn_statement(node, env),
 
             // -- Blackboard --
-            NodeKind::ShareStatement { value, key } => {
-                let v = self.exec(value, env)?;
-                let kv = self.exec(key, env)?;
-                // T5 (B7): el blackboard es un sumidero (otros agentes lo leen).
-                if self.labels {
-                    self.sink_check("share", &[&v, &kv], loc)?;
-                }
-                let k = kv.to_string();
-                match self.swarm_hooks.as_ref().map(|s| s.share.clone()) {
-                    Some(h) => h(&k, &v),
-                    None => {
-                        self.blackboard.insert(k, v.clone());
-                    }
-                }
-                Ok(v)
-            }
-            NodeKind::ObserveStatement { key, variable } => {
-                let k = self.exec(key, env)?.to_string();
-                let val = match self.swarm_hooks.as_ref().map(|s| s.observe.clone()) {
-                    Some(h) => h(&k),
-                    None => self.blackboard.get(&k).cloned(),
-                };
-                match val {
-                    Some(v) => {
-                        env_set(env, variable, v.clone());
-                        Ok(v)
-                    }
-                    None => {
-                        env_set(env, variable, SynValue::Nothing);
-                        Ok(SynValue::Nothing)
-                    }
-                }
-            }
-            NodeKind::SignalStatement { name, data } => {
-                // El nombre del canal es una expresión (Batch 6): evaluar a texto.
-                let nv = self.exec(name, env)?;
-                let d = match data {
-                    Some(d) => Some(self.exec(d, env)?),
-                    None => None,
-                };
-                // T5 (B7): la señal sale a otros agentes — sumidero.
-                if self.labels {
-                    let mut refs: Vec<&SynValue> = vec![&nv];
-                    if let Some(dv) = &d {
-                        refs.push(dv);
-                    }
-                    self.sink_check("signal", &refs, loc)?;
-                }
-                let n = raw_str(&nv);
-                if let Some(h) = self.swarm_hooks.as_ref().map(|s| s.signal.clone()) {
-                    h(&n, d);
-                }
-                Ok(SynValue::Nothing)
-            }
-            NodeKind::WaitForStatement { signal_name, variable, timeout } => {
-                let n = raw_str(&self.exec(signal_name, env)?);
-                // Timeout opcional (Batch 7): segundos como número (no-número → error claro);
-                // clamp a [0, 3600] como `sleep`. `None` = default (30 s) en el hook.
-                let secs: Option<f64> = match timeout {
-                    Some(t) => match self.exec(t, env)? {
-                        SynValue::Number(num) => Some(num.to_f64().clamp(0.0, 3600.0)),
-                        _ => {
-                            return Err(err_at(
-                                "wait_for timeout must be a number of seconds",
-                                loc,
-                            ))
-                        }
-                    },
-                    None => None,
-                };
-                let cancel = self.cancel.flag.clone();
-                let result = match self.swarm_hooks.as_ref().map(|s| s.wait_for.clone()) {
-                    Some(h) => h(&n, secs, &cancel),
-                    None => None,
-                };
-                self.check_cancel()?;
-                match result {
-                    Some(v) => {
-                        if let Some(var) = variable {
-                            env_set(env, var, v.clone());
-                        }
-                        Ok(v)
-                    }
-                    None => {
-                        if let Some(var) = variable {
-                            env_set(env, var, SynValue::Nothing);
-                        }
-                        Ok(SynValue::Nothing)
-                    }
-                }
-            }
+            NodeKind::ShareStatement { .. } => self.exec_share_statement(node, env),
+            NodeKind::ObserveStatement { .. } => self.exec_observe_statement(node, env),
+            NodeKind::SignalStatement { .. } => self.exec_signal_statement(node, env),
+            NodeKind::WaitForStatement { .. } => self.exec_wait_for_statement(node, env),
 
             // -- Capacidades --
-            NodeKind::RequireStatement { capability, scope } => {
-                // El scope se evalúa a su str (igual que el oráculo: str(eval(scope))).
-                let scope_val = match scope {
-                    Some(s) => Some(self.exec(s, env)?.to_string()),
-                    None => None,
-                };
-                // Dentro de un `sandbox` o del cuerpo de una tool (`call_tool`) NO se
-                // conceden capabilities: un `require` ahí es no-op. Si no, se podría
-                // re-grantear para escapar del aislamiento / del least-privilege por-tool
-                // (un `require` anidado bajo when/if no se extrae a required_capabilities,
-                // así que llega acá en runtime).
-                if !self.in_sandbox() && !self.in_tool_scope() {
-                    if let Some(hook) = self.grant_hook.clone() {
-                        // Ubicación del `require` para el audit (`file`/`line` de un
-                        // grant rechazado por el techo). Sólo si hay sink instalado.
-                        let prev = if crate::audit_loc::enabled() {
-                            Some(crate::audit_loc::replace(Some(loc.clone())))
-                        } else {
-                            None
-                        };
-                        hook(capability, scope_val.as_deref());
-                        if let Some(p) = prev {
-                            crate::audit_loc::replace(p);
-                        }
-                    }
-                }
-                Ok(SynValue::Nothing)
-            }
-            NodeKind::SandboxBlock { body, under: None } => {
-                // Aislamiento real: durante el cuerpo, todas las capabilities quedan
-                // DENEGADAS (el hook vacía el CapabilitySet; `require` es no-op). Se
-                // restaura al salir, también en el camino de error. El `print` no está
-                // gateado, así que el sandbox puede computar y devolver un valor.
-                let sandbox_env = Environment::child_scope(env, "sandbox");
-                self.sandbox_depth += 1;
-                if let Some(hook) = self.sandbox_hook.clone() {
-                    hook(true);
-                }
-                let result = self.exec_block(body, &sandbox_env);
-                if let Some(hook) = self.sandbox_hook.clone() {
-                    hook(false);
-                }
-                self.sandbox_depth -= 1;
-                result
-            }
-            NodeKind::SandboxBlock { body, under: Some(caps_expr) } => {
-                // `sandbox under <caps>` (T1 del spec de identidad): el cuerpo corre bajo un
-                // TECHO delegado = caps ∩ lo vigente. No vacía nada: lo que el bloque no lista
-                // se deniega, lo que lista sigue gateado por los grants del programa y por los
-                // techos de arriba (host, token de la request). `caps` es el map que devolvió
-                // `captoken_verify` (el bloque queda bajo ESE token) o un map literal de mínimo
-                // privilegio. `require` adentro sigue siendo no-op (mismo `sandbox_depth`).
-                let caps_val = self.exec(caps_expr, env)?;
-                let Some(hook) = self.ceiling_hook.clone() else {
-                    return Err(Control::Error(RuntimeError::at(
-                        "`sandbox under` needs a host that installs capability ceilings; this host does not (run the program with the synsema binary or a wasm host with capabilities)",
-                        loc.clone(),
-                    )));
-                };
-                hook(Some(&caps_val)).map_err(|m| Control::Error(RuntimeError::at(m, loc.clone())))?;
-                let sandbox_env = Environment::child_scope(env, "sandbox");
-                self.sandbox_depth += 1;
-                let result = self.exec_block(body, &sandbox_env);
-                // Se desapila también en el camino de error: un techo de bloque jamás
-                // sobrevive al bloque.
-                let _ = hook(None);
-                self.sandbox_depth -= 1;
-                result
-            }
-            NodeKind::InvariantDeclaration { condition, description } => {
-                let result = self.exec(condition, env)?;
-                // T5 (M1): el veredicto de un invariante sobre datos privados es un uso de
-                // privados: el error que produzca sale redactado hacia el host.
-                if self.labels {
-                    let l = labels::label_deep(&result);
-                    if !l.is_empty() {
-                        self.note_seen(&l);
-                    }
-                }
-                if !result.is_truthy() {
-                    let desc = description.clone().unwrap_or_else(|| "unnamed invariant".to_string());
-                    return Err(err_at(format!("Invariant violation: {}", desc), loc));
-                }
-                Ok(syn_bool(true))
-            }
-            NodeKind::IntentDeclaration { description } => {
-                if self.intent_frozen {
-                    return Err(err_at(
-                        "Cannot declare a new intent after execution has started. \
-Intent is frozen to prevent prompt injection from expanding the mandate.",
-                        loc,
-                    ));
-                }
-                self.intent = Some(description.clone());
-                Ok(SynValue::Nothing)
-            }
+            NodeKind::RequireStatement { .. } => self.exec_require_statement(node, env),
+            NodeKind::SandboxBlock { under: None, .. } => self.exec_sandbox_block(node, env),
+            NodeKind::SandboxBlock { under: Some(_), .. } => self.exec_sandbox_block_under(node, env),
+            NodeKind::InvariantDeclaration { .. } => self.exec_invariant_declaration(node, env),
+            NodeKind::IntentDeclaration { .. } => self.exec_intent_declaration(node, env),
 
             // -- Interacción humana (no-interactiva → auto) --
             // T5 (B7): el mensaje a un humano sale del intérprete — sumidero.
-            NodeKind::ApproveStatement { message, timeout, .. } => {
-                let m = self.exec(message, env)?;
-                if self.labels {
-                    self.sink_check("approve", &[&m], loc)?;
-                }
-                match self.human_callback.clone() {
-                    Some(cb) => Ok(cb("approve", &m.to_string(), *timeout)),
-                    None => Ok(syn_bool(true)),
-                }
-            }
-            NodeKind::ConfirmStatement { message, timeout } => {
-                let m = self.exec(message, env)?;
-                if self.labels {
-                    self.sink_check("confirm", &[&m], loc)?;
-                }
-                match self.human_callback.clone() {
-                    Some(cb) => Ok(cb("confirm", &m.to_string(), *timeout)),
-                    None => Ok(syn_bool(true)),
-                }
-            }
-            NodeKind::ShowStatement { value, label } => {
-                let v = self.exec(value, env)?;
-                self.ensure_stdout()?;
-                // T5 (ronda 4): la misma boca pública que `print` — ver `stdout_flow_check`.
-                self.stdout_flow_check("show", loc)?;
-                let label_str = match label {
-                    Some(l) => format!("[{}] ", l),
-                    None => String::new(),
-                };
-                // Un valor privado se redacta por Display; bajo PC se redacta la línea.
-                let line = format!("{}{}", label_str, self.pc_redact(v.to_string()));
-                // DE-034: espejo de `log`/`print` — si hay log_hook (p.ej. bajo serve),
-                // emitir en vivo además de bufferizar a `output`. Bajo `run` el hook es
-                // none, así que el comportamiento no cambia.
-                self.emit_line(line);
-                Ok(v)
-            }
-            NodeKind::AskExpression { prompt, options, timeout } => {
-                let p = self.exec(prompt, env)?;
-                if self.labels {
-                    self.sink_check("ask", &[&p], loc)?;
-                }
-                if let Some(cb) = self.human_callback.clone() {
-                    let r = cb("ask", &p.to_string(), *timeout);
-                    if r.is_truthy() {
-                        return Ok(syn_text(r.to_string()));
-                    }
-                }
-                // Fallback no-interactivo: primera opción si hay lista.
-                if let Some(opts) = options {
-                    let o = self.exec(opts, env)?;
-                    if let SynValue::List(l) = &o {
-                        if let Some(first) = l.borrow().first() {
-                            return Ok(first.clone());
-                        }
-                    }
-                }
-                Ok(syn_text(""))
-            }
+            NodeKind::ApproveStatement { .. } => self.exec_approve_statement(node, env),
+            NodeKind::ConfirmStatement { .. } => self.exec_confirm_statement(node, env),
+            NodeKind::ShowStatement { .. } => self.exec_show_statement(node, env),
+            NodeKind::AskExpression { .. } => self.exec_ask_expression(node, env),
 
             // -- LLM (sin callback → placeholders) --
-            NodeKind::ReasonExpression { subject, context, .. } => {
-                self.check_llm_cap()?;
-                let subj = match subject {
-                    Some(s) => self.exec(s, env)?,
-                    None => SynValue::Nothing,
-                };
-                // Evaluá el contexto (`with k=v`/`given …`) y armalo para el prompt — el
-                // LLM necesita ver ese contexto, no sólo el subject.
-                let mut ctx_vals = Vec::with_capacity(context.len());
-                for (name, v) in context {
-                    ctx_vals.push((name, self.exec(v, env)?));
-                }
-                // T5 (B7): el prompt va al proveedor LLM — sumidero.
-                if self.labels {
-                    let mut refs: Vec<&SynValue> = vec![&subj];
-                    refs.extend(ctx_vals.iter().map(|(_, v)| v));
-                    self.sink_check("reason", &refs, loc)?;
-                }
-                let ctx_parts: Vec<String> =
-                    ctx_vals.iter().map(|(name, v)| format!("{}={}", name, v)).collect();
-                match self.llm_callback.clone() {
-                    Some(cb) => {
-                        let prompt = if ctx_parts.is_empty() {
-                            subj.to_string()
-                        } else {
-                            format!("Reason about: {} (context: {})", subj, ctx_parts.join(", "))
-                        };
-                        { let out = cb("reason", &prompt); self.record_llm("reason", &prompt, &out); Ok(syn_text(out)) }
-                    }
-                    None => {
-                        note_llm_offline();
-                        Ok(syn_text(format!("[reasoning about: {}]", subj)))
-                    }
-                }
-            }
-            NodeKind::DecideExpression { options, given, .. } => {
-                self.check_llm_cap()?;
-                let opts = match options {
-                    Some(o) => self.exec(o, env)?,
-                    None => SynValue::Nothing,
-                };
-                let giv = match given {
-                    Some(g) => self.exec(g, env)?,
-                    None => SynValue::Nothing,
-                };
-                // T5 (B7): el prompt va al proveedor LLM — sumidero.
-                if self.labels {
-                    self.sink_check("decide", &[&opts, &giv], loc)?;
-                }
-                // v0.6.26 — `SYNSEMA_JUDGE_DECIDE`: el juez contesta con una de TUS opciones,
-                // calibrado y sin normalización ni reintento. Si no aplica o no está disponible,
-                // sigue el camino LLM de siempre.
-                if self.decide_via_judge {
-                    if let Some(chosen) = self.decide_with_judge(&opts, &giv, loc)? {
-                        return Ok(chosen);
-                    }
-                }
-                let prompt = format!("Decide between {} given {}", opts, giv);
-                // Camino dedicado (DE-039): las opciones viajan ESTRUCTURADAS al motor,
-                // que fuerza la elección por tool/enum + normaliza + reintenta. Sólo si
-                // el motor lo cableó; si no, el callback de texto genérico de siempre.
-                if let Some(cb) = self.llm_decide_callback.clone() {
-                    let opt_list: Vec<String> = match &opts {
-                        SynValue::List(l) => l.borrow().iter().map(|v| v.to_string()).collect(),
-                        _ => Vec::new(),
-                    };
-                    return Ok(syn_text(cb(&prompt, &opt_list)));
-                }
-                match self.llm_callback.clone() {
-                    Some(cb) => { let out = cb("decide", &prompt); self.record_llm("decide", &prompt, &out); Ok(syn_text(out)) },
-                    None => {
-                        note_llm_offline();
-                        Ok(syn_text("[decision pending]"))
-                    }
-                }
-            }
-            NodeKind::JudgeExpression { state, questions } => {
-                use crate::judge::{
-                    answer_to_value, is_valid_state, options_from_value, syn_to_json,
-                    validate_question, JudgeQuestion, JudgeRequest,
-                };
-                self.check_judge_cap()?;
-                let st = self.exec(state, env)?;
-                if !is_valid_state(&st) {
-                    return Err(err_at(
-                        format!(
-                            "judge: the state must be a text, a map or a list (got {}); the model reads \
-                             text, so wrap it with text() if you mean its rendering",
-                            st.type_name()
-                        ),
-                        loc,
-                    ));
-                }
-                let mut qs: Vec<JudgeQuestion> = Vec::with_capacity(questions.len());
-                let mut crossing: Vec<SynValue> = vec![st.clone()];
-                for qn in questions {
-                    let instr = self.exec(&qn.instruction, env)?;
-                    let options = match &qn.criteria {
-                        Some(c) => {
-                            let cv = self.exec(c, env)?;
-                            options_from_value(&cv)
-                                .map_err(|m| err_at(format!("judge '{}': {}", qn.id, m), &qn.loc))?
-                        }
-                        None => Vec::new(),
-                    };
-                    let q = JudgeQuestion {
-                        id: qn.id.clone(),
-                        kind: qn.kind,
-                        instruction: syn_to_json(&instr),
-                        options,
-                        escape: qn.escape,
-                        yes_no: None,
-                    };
-                    validate_question(&q).map_err(|m| err_at(m, &qn.loc))?;
-                    // Rutas con backticks que no existen en el state (ni en la instrucción):
-                    // aviso una vez por ruta antes de gastar la llamada. Un SDK no puede; el
-                    // runtime tiene el valor en la mano.
-                    for path in crate::judge::missing_paths(&st, &instr) {
-                        // La trampa más común: `judge ticket` con `` `ticket.x` `` en la
-                        // pregunta. El modelo ve el VALOR, no el nombre de la variable.
-                        let var_hint = match &state.kind {
-                            NodeKind::Identifier { name }
-                                if path == *name || path.starts_with(&format!("{}.", name)) || path.starts_with(&format!("{}[", name)) =>
-                            {
-                                Some(name.as_str())
-                            }
-                            _ => None,
-                        };
-                        note_judge_missing_path(&qn.id, &path, var_hint, &qn.loc);
-                    }
-                    crossing.push(instr);
-                    qs.push(q);
-                }
-                // T5: el `state` y las instrucciones cruzan a un tercero — sumidero declarado,
-                // igual que `decide`. La respuesta al borde filoso nº 6 del vendor: el contenido
-                // adversario entra como dato y el motor sabe que ese dato salió del proceso.
-                if self.labels {
-                    let refs: Vec<&SynValue> = crossing.iter().collect();
-                    self.sink_check("judge", &refs, loc)?;
-                }
-                let req = JudgeRequest {
-                    state: syn_to_json(&st),
-                    questions: qs,
-                };
-                let response = match self.judge_callback.clone() {
-                    Some(cb) => cb(&req).map_err(|m| err_at(m, loc))?,
-                    None => {
-                        note_judge_offline();
-                        None
-                    }
-                };
-                // Map plano id → respuesta, en el orden del bloque. Sin metadatos mezclados:
-                // una pregunta llamada `usage` no colisiona con nada.
-                let mut out: IndexMap<String, SynValue> = IndexMap::new();
-                for (i, q) in req.questions.iter().enumerate() {
-                    let a = response.as_ref().and_then(|r| r.answers.get(i));
-                    out.insert(q.id.clone(), answer_to_value(q, a));
-                }
-                Ok(syn_map(out))
-            }
-            NodeKind::AnalyzeExpression { data, objective } => {
-                self.check_llm_cap()?;
-                let d = self.exec(data, env)?;
-                // T5 (B7): el prompt va al proveedor LLM — sumidero.
-                if self.labels {
-                    self.sink_check("analyze", &[&d], loc)?;
-                }
-                match self.llm_callback.clone() {
-                    Some(cb) => {
-                        let prompt = format!("Analyze for {}: {}", objective, d);
-                        { let out = cb("analyze", &prompt); self.record_llm("analyze", &prompt, &out); Ok(syn_text(out)) }
-                    }
-                    None => {
-                        note_llm_offline();
-                        Ok(syn_text(format!("[analysis of: {}]", objective)))
-                    }
-                }
-            }
-            NodeKind::GenerateExpression { target, given, parameters } => {
-                self.check_llm_cap()?;
-                // Evaluá given/parameters y armalos para el prompt (el LLM los necesita,
-                // no sólo el target).
-                let giv = match given {
-                    Some(g) => Some(self.exec(g, env)?),
-                    None => None,
-                };
-                let mut param_vals = Vec::with_capacity(parameters.len());
-                for (name, v) in parameters {
-                    param_vals.push((name, self.exec(v, env)?));
-                }
-                // T5 (B7): el prompt va al proveedor LLM — sumidero.
-                if self.labels {
-                    let mut refs: Vec<&SynValue> = Vec::new();
-                    if let Some(g) = &giv {
-                        refs.push(g);
-                    }
-                    refs.extend(param_vals.iter().map(|(_, v)| v));
-                    self.sink_check("generate", &refs, loc)?;
-                }
-                let param_parts: Vec<String> =
-                    param_vals.iter().map(|(name, v)| format!("{}={}", name, v)).collect();
-                match self.llm_callback.clone() {
-                    Some(cb) => {
-                        let mut prompt = format!("Generate {}", target);
-                        if let Some(g) = &giv {
-                            prompt.push_str(&format!(" given {}", g));
-                        }
-                        if !param_parts.is_empty() {
-                            prompt.push_str(&format!(" with {}", param_parts.join(", ")));
-                        }
-                        { let out = cb("generate", &prompt); self.record_llm("generate", &prompt, &out); Ok(syn_text(out)) }
-                    }
-                    None => {
-                        note_llm_offline();
-                        Ok(syn_text(format!("[generated: {}]", target)))
-                    }
-                }
-            }
+            NodeKind::ReasonExpression { .. } => self.exec_reason_expression(node, env),
+            NodeKind::DecideExpression { .. } => self.exec_decide_expression(node, env),
+            NodeKind::JudgeExpression { .. } => self.exec_judge_expression(node, env),
+            NodeKind::AnalyzeExpression { .. } => self.exec_analyze_expression(node, env),
+            NodeKind::GenerateExpression { .. } => self.exec_generate_expression(node, env),
 
             // -- Observabilidad --
             NodeKind::TraceBlock { body, .. } => self.exec_block(body, env),
-            NodeKind::LogStatement { message, .. } => {
-                let m = self.exec(message, env)?;
-                self.ensure_stdout()?;
-                // T5 (ronda 4): la misma boca pública que `print` — ver `stdout_flow_check`.
-                self.stdout_flow_check("log", loc)?;
-                let line = format!("[LOG] {}", self.pc_redact(m.to_string()));
-                self.emit_line(line);
-                Ok(SynValue::Nothing)
-            }
+            NodeKind::LogStatement { .. } => self.exec_log_statement(node, env),
             NodeKind::MeasureBlock { body, .. } => self.exec_block(body, env),
             NodeKind::CheckpointStatement { name } => {
                 self.exec(name, env)?; // evalúa la expresión (resuelve variables), descarta el valor
@@ -5200,54 +4486,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             NodeKind::TestBlock { .. } => Ok(SynValue::Nothing),
 
             // -- Errores --
-            NodeKind::TryRecover { try_body, error_variable, recover_body } => {
-                // El mensaje del error atrapado sale etiquetado con todo lo privado que
-                // Se desenvolvió o gateó control DENTRO del `try` (aproximación conservadora:
-                // Un "Index 9 out of bounds" con un índice privado no llega público a `e`).
-                let r = self.exec_block(try_body, env);
-                // `self.seen` está scopeado a ESTE nodo (lo limpia `exec`), así que acá tiene
-                // exactamente lo privado que tocó el cuerpo del `try`.
-                let try_seen = if self.labels { Some(self.seen.clone()) } else { None };
-                match r {
-                    Ok(v) => Ok(v),
-                    Err(Control::Give(v)) => Err(Control::Give(v)),
-                    Err(Control::Stop(v)) => Err(Control::Stop(v)),
-                    // T5 (regla 1.a): un error nacido bajo PC privado, y el veredicto del
-                    // propio enforcement, NO se atrapan — se propagan hasta el host (en el
-                    // guest: request fallida con código uniforme, que T1 cubre). Atraparlos
-                    // convertía el enforcement en el canal (1.a) y un `raise` dentro de la
-                    // rama privada en un bit por iteración (1.b, 1.d).
-                    Err(Control::Error(e)) if self.labels && e.is_fatal_for_labels() => {
-                        Err(Control::Error(e))
-                    }
-                    Err(Control::Error(e)) => {
-                        let msg = strip_loc_prefix(&e.to_string());
-                        let recover_env = Environment::child_scope(env, "recover");
-                        let mut ev = syn_text(msg);
-                        if let Some(l) = &try_seen {
-                            ev = labels::mark(ev, l.clone());
-                        }
-                        let ev = self.pc_mark(ev, loc)?;
-                        env_set(&recover_env, error_variable, ev);
-                        // T5 (regla 1.c): que el cuerpo del `recover` CORRA es en sí mismo
-                        // información sobre lo que pasó adentro del `try` — corre bajo
-                        // PC ∪ etiqueta de lo privado que se tocó ahí dentro.
-                        let pushed = match &try_seen {
-                            Some(l) if self.labels && !l.is_empty() => {
-                                self.pc_push(l);
-                                true
-                            }
-                            _ => false,
-                        };
-                        let out = self.exec_block(recover_body, &recover_env);
-                        let out = if self.labels { out.and_then(|v| self.pc_mark(v, loc)) } else { out };
-                        if pushed {
-                            self.pc_pop();
-                        }
-                        out
-                    }
-                }
-            }
+            NodeKind::TryRecover { .. } => self.exec_try_recover(node, env),
 
             // -- HTTP server (lo provee el motor vía serve_hook en capa 8) --
             NodeKind::ServeBlock { .. } => match self.serve_hook.clone() {
@@ -5276,18 +4515,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 "socket is only available inside a serve route (route \"GET /path\" + socket block)",
                 loc,
             )),
-            NodeKind::SendStatement { value, event_name } => match self.stream_emit.clone() {
-                Some(emit) => {
-                    let v = self.exec(value, env)?;
-                    // T5 (B7): el stream va al cliente — sumidero.
-                    if self.labels {
-                        self.sink_check("send", &[&v], loc)?;
-                    }
-                    emit(v, event_name.as_deref())?;
-                    Ok(SynValue::Nothing)
-                }
-                None => Err(err_at("send can only be used inside a stream route handler", loc)),
-            },
+            NodeKind::SendStatement { .. } => self.exec_send_statement(node, env),
             NodeKind::ExpectStatement { shape, .. } => self.exec_expect(shape, env),
 
             // -- Sin executor en el oráculo (no alcanzables en programas válidos) --
@@ -5319,6 +4547,1040 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 Err(err_at("No executor for node type: StateTransition", loc))
             }
         }
+    }
+
+    // Brazos poco usados de `exec_node`, cada uno en su función (specs/compute-rendimiento.md
+    // F1.10): con todos adentro, el frame de `exec_node` se dimensionaba para el peor de ellos y
+    // cada nivel de expresión y de llamada pagaba esa pila. El cuerpo es el del brazo, sin cambios.
+
+    #[inline(never)]
+    fn exec_agent_definition(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let NodeKind::AgentDefinition { name, body, .. } = &node.kind else { unreachable!("exec_agent_definition: otro nodo") };
+        {
+        self.agent_definitions.insert(name.clone(), (body.clone(), env.clone()));
+        let mut m = IndexMap::new();
+        m.insert("name".to_string(), syn_text(name.as_str()));
+        m.insert("state".to_string(), syn_text("defined"));
+        let agent_data = syn_map(m);
+        env_set(env, name, agent_data.clone());
+        Ok(agent_data)
+    }
+    }
+
+    #[inline(never)]
+    fn exec_analyze_expression(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::AnalyzeExpression { data, objective } = &node.kind else { unreachable!("exec_analyze_expression: otro nodo") };
+        {
+        self.check_llm_cap()?;
+        let d = self.exec(data, env)?;
+        // T5 (B7): el prompt va al proveedor LLM — sumidero.
+        if self.labels {
+            self.sink_check("analyze", &[&d], loc)?;
+        }
+        match self.llm_callback.clone() {
+            Some(cb) => {
+                let prompt = format!("Analyze for {}: {}", objective, d);
+                { let out = cb("analyze", &prompt); self.record_llm("analyze", &prompt, &out); Ok(syn_text(out)) }
+            }
+            None => {
+                note_llm_offline();
+                Ok(syn_text(format!("[analysis of: {}]", objective)))
+            }
+        }
+    }
+    }
+
+    #[inline(never)]
+    fn exec_approve_statement(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::ApproveStatement { message, timeout, .. } = &node.kind else { unreachable!("exec_approve_statement: otro nodo") };
+        {
+        let m = self.exec(message, env)?;
+        if self.labels {
+            self.sink_check("approve", &[&m], loc)?;
+        }
+        match self.human_callback.clone() {
+            Some(cb) => Ok(cb("approve", &m.to_string(), *timeout)),
+            None => Ok(syn_bool(true)),
+        }
+    }
+    }
+
+    #[inline(never)]
+    fn exec_ask_expression(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::AskExpression { prompt, options, timeout } = &node.kind else { unreachable!("exec_ask_expression: otro nodo") };
+        {
+        let p = self.exec(prompt, env)?;
+        if self.labels {
+            self.sink_check("ask", &[&p], loc)?;
+        }
+        if let Some(cb) = self.human_callback.clone() {
+            let r = cb("ask", &p.to_string(), *timeout);
+            if r.is_truthy() {
+                return Ok(syn_text(r.to_string()));
+            }
+        }
+        // Fallback no-interactivo: primera opción si hay lista.
+        if let Some(opts) = options {
+            let o = self.exec(opts, env)?;
+            if let SynValue::List(l) = &o {
+                if let Some(first) = l.borrow().first() {
+                    return Ok(first.clone());
+                }
+            }
+        }
+        Ok(syn_text(""))
+    }
+    }
+
+    #[inline(never)]
+    fn exec_confirm_statement(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::ConfirmStatement { message, timeout } = &node.kind else { unreachable!("exec_confirm_statement: otro nodo") };
+        {
+        let m = self.exec(message, env)?;
+        if self.labels {
+            self.sink_check("confirm", &[&m], loc)?;
+        }
+        match self.human_callback.clone() {
+            Some(cb) => Ok(cb("confirm", &m.to_string(), *timeout)),
+            None => Ok(syn_bool(true)),
+        }
+    }
+    }
+
+    #[inline(never)]
+    fn exec_decide_expression(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::DecideExpression { options, given, .. } = &node.kind else { unreachable!("exec_decide_expression: otro nodo") };
+        {
+        self.check_llm_cap()?;
+        let opts = match options {
+            Some(o) => self.exec(o, env)?,
+            None => SynValue::Nothing,
+        };
+        let giv = match given {
+            Some(g) => self.exec(g, env)?,
+            None => SynValue::Nothing,
+        };
+        // T5 (B7): el prompt va al proveedor LLM — sumidero.
+        if self.labels {
+            self.sink_check("decide", &[&opts, &giv], loc)?;
+        }
+        // v0.6.26 — `SYNSEMA_JUDGE_DECIDE`: el juez contesta con una de TUS opciones,
+        // calibrado y sin normalización ni reintento. Si no aplica o no está disponible,
+        // sigue el camino LLM de siempre.
+        if self.decide_via_judge {
+            if let Some(chosen) = self.decide_with_judge(&opts, &giv, loc)? {
+                return Ok(chosen);
+            }
+        }
+        let prompt = format!("Decide between {} given {}", opts, giv);
+        // Camino dedicado (DE-039): las opciones viajan ESTRUCTURADAS al motor,
+        // que fuerza la elección por tool/enum + normaliza + reintenta. Sólo si
+        // el motor lo cableó; si no, el callback de texto genérico de siempre.
+        if let Some(cb) = self.llm_decide_callback.clone() {
+            let opt_list: Vec<String> = match &opts {
+                SynValue::List(l) => l.borrow().iter().map(|v| v.to_string()).collect(),
+                _ => Vec::new(),
+            };
+            return Ok(syn_text(cb(&prompt, &opt_list)));
+        }
+        match self.llm_callback.clone() {
+            Some(cb) => { let out = cb("decide", &prompt); self.record_llm("decide", &prompt, &out); Ok(syn_text(out)) },
+            None => {
+                note_llm_offline();
+                Ok(syn_text("[decision pending]"))
+            }
+        }
+    }
+    }
+
+    #[inline(never)]
+    fn exec_enum_definition(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::EnumDefinition { name, variants } = &node.kind else { unreachable!("exec_enum_definition: otro nodo") };
+        {
+        // Valor de variante = map etiquetado {"__variant": "Enum.var", <campos>};
+        // tipo enum = map namespace {"__enum": "Enum", <var>: valor|ctor}. Sin
+        // tipo de runtime nuevo: construcción = property-access + call.
+        let mut namespace = IndexMap::new();
+        namespace.insert("__enum".to_string(), syn_text(name.as_str()));
+        for (variant_name, fields) in variants {
+            let qualified = format!("{}.{}", name, variant_name);
+            if fields.is_empty() {
+                // Variante nullary → un map etiquetado constante.
+                let mut m = IndexMap::new();
+                m.insert("__variant".to_string(), syn_text(qualified.as_str()));
+                namespace.insert(variant_name.clone(), syn_map(m));
+            } else {
+                // Variante con payload → constructor builtin de aridad EXACTA.
+                let field_names = fields.clone();
+                let count = field_names.len() as i32;
+                let q = qualified.clone();
+                let def_loc = loc.clone();
+                let func: BuiltinFn = Rc::new(move |_i, args, _l| {
+                    if args.len() != field_names.len() {
+                        return Err(err_at(
+                            format!(
+                                "variant {} expects {} fields, got {}",
+                                q,
+                                field_names.len(),
+                                args.len()
+                            ),
+                            &def_loc,
+                        ));
+                    }
+                    let mut m = IndexMap::new();
+                    m.insert("__variant".to_string(), syn_text(q.as_str()));
+                    for (n, val) in field_names.iter().zip(args.iter()) {
+                        m.insert(n.clone(), val.clone());
+                    }
+                    Ok(syn_map(m))
+                });
+                namespace.insert(
+                    variant_name.clone(),
+                    SynValue::Builtin(Rc::new(BuiltinTask::new(qualified.clone(), count, None, func))),
+                );
+            }
+        }
+        let value = syn_map(namespace);
+        env_set(env, name, value.clone());
+        Ok(value)
+    }
+    }
+
+    #[inline(never)]
+    fn exec_export_declaration(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::ExportDeclaration { declaration } = &node.kind else { unreachable!("exec_export_declaration: otro nodo") };
+        {
+        let value = self.exec(declaration, env)?;
+        let name = match &declaration.kind {
+            NodeKind::TaskDefinition { name, .. }
+            | NodeKind::TypeDefinition { name, .. }
+            | NodeKind::LetBinding { name, .. }
+            | NodeKind::EnumDefinition { name, .. }
+            | NodeKind::RoutesDeclaration { name, .. } => name.clone(),
+            _ => {
+                return Err(err_at(
+                    "export must wrap a task, type, let, enum, or routes",
+                    loc,
+                ))
+            }
+        };
+        // Registra el nombre en la superficie pública del módulo actual. El
+        // frame base (entrypoint) nunca se cosecha → allí es un no-op.
+        if let Some(frame) = self.exports_collector.last_mut() {
+            frame.push(name);
+        }
+        Ok(value)
+    }
+    }
+
+    #[inline(never)]
+    fn exec_generate_expression(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::GenerateExpression { target, given, parameters } = &node.kind else { unreachable!("exec_generate_expression: otro nodo") };
+        {
+        self.check_llm_cap()?;
+        // Evaluá given/parameters y armalos para el prompt (el LLM los necesita,
+        // no sólo el target).
+        let giv = match given {
+            Some(g) => Some(self.exec(g, env)?),
+            None => None,
+        };
+        let mut param_vals = Vec::with_capacity(parameters.len());
+        for (name, v) in parameters {
+            param_vals.push((name, self.exec(v, env)?));
+        }
+        // T5 (B7): el prompt va al proveedor LLM — sumidero.
+        if self.labels {
+            let mut refs: Vec<&SynValue> = Vec::new();
+            if let Some(g) = &giv {
+                refs.push(g);
+            }
+            refs.extend(param_vals.iter().map(|(_, v)| v));
+            self.sink_check("generate", &refs, loc)?;
+        }
+        let param_parts: Vec<String> =
+            param_vals.iter().map(|(name, v)| format!("{}={}", name, v)).collect();
+        match self.llm_callback.clone() {
+            Some(cb) => {
+                let mut prompt = format!("Generate {}", target);
+                if let Some(g) = &giv {
+                    prompt.push_str(&format!(" given {}", g));
+                }
+                if !param_parts.is_empty() {
+                    prompt.push_str(&format!(" with {}", param_parts.join(", ")));
+                }
+                { let out = cb("generate", &prompt); self.record_llm("generate", &prompt, &out); Ok(syn_text(out)) }
+            }
+            None => {
+                note_llm_offline();
+                Ok(syn_text(format!("[generated: {}]", target)))
+            }
+        }
+    }
+    }
+
+    #[inline(never)]
+    fn exec_intent_declaration(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let _ = env;
+        let NodeKind::IntentDeclaration { description } = &node.kind else { unreachable!("exec_intent_declaration: otro nodo") };
+        {
+        if self.intent_frozen {
+            return Err(err_at(
+                "Cannot declare a new intent after execution has started. \
+Intent is frozen to prevent prompt injection from expanding the mandate.",
+                loc,
+            ));
+        }
+        self.intent = Some(description.clone());
+        Ok(SynValue::Nothing)
+    }
+    }
+
+    #[inline(never)]
+    fn exec_invariant_declaration(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::InvariantDeclaration { condition, description } = &node.kind else { unreachable!("exec_invariant_declaration: otro nodo") };
+        {
+        let result = self.exec(condition, env)?;
+        // T5 (M1): el veredicto de un invariante sobre datos privados es un uso de
+        // privados: el error que produzca sale redactado hacia el host.
+        if self.labels {
+            let l = labels::label_deep(&result);
+            if !l.is_empty() {
+                self.note_seen(&l);
+            }
+        }
+        if !result.is_truthy() {
+            let desc = description.clone().unwrap_or_else(|| "unnamed invariant".to_string());
+            return Err(err_at(format!("Invariant violation: {}", desc), loc));
+        }
+        Ok(syn_bool(true))
+    }
+    }
+
+    #[inline(never)]
+    fn exec_judge_expression(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::JudgeExpression { state, questions } = &node.kind else { unreachable!("exec_judge_expression: otro nodo") };
+        {
+        use crate::judge::{
+            answer_to_value, is_valid_state, options_from_value, syn_to_json,
+            validate_question, JudgeQuestion, JudgeRequest,
+        };
+        self.check_judge_cap()?;
+        let st = self.exec(state, env)?;
+        if !is_valid_state(&st) {
+            return Err(err_at(
+                format!(
+                    "judge: the state must be a text, a map or a list (got {}); the model reads \
+                     text, so wrap it with text() if you mean its rendering",
+                    st.type_name()
+                ),
+                loc,
+            ));
+        }
+        let mut qs: Vec<JudgeQuestion> = Vec::with_capacity(questions.len());
+        let mut crossing: Vec<SynValue> = vec![st.clone()];
+        for qn in questions {
+            let instr = self.exec(&qn.instruction, env)?;
+            let options = match &qn.criteria {
+                Some(c) => {
+                    let cv = self.exec(c, env)?;
+                    options_from_value(&cv)
+                        .map_err(|m| err_at(format!("judge '{}': {}", qn.id, m), &qn.loc))?
+                }
+                None => Vec::new(),
+            };
+            let q = JudgeQuestion {
+                id: qn.id.clone(),
+                kind: qn.kind,
+                instruction: syn_to_json(&instr),
+                options,
+                escape: qn.escape,
+                yes_no: None,
+            };
+            validate_question(&q).map_err(|m| err_at(m, &qn.loc))?;
+            // Rutas con backticks que no existen en el state (ni en la instrucción):
+            // aviso una vez por ruta antes de gastar la llamada. Un SDK no puede; el
+            // runtime tiene el valor en la mano.
+            for path in crate::judge::missing_paths(&st, &instr) {
+                // La trampa más común: `judge ticket` con `` `ticket.x` `` en la
+                // pregunta. El modelo ve el VALOR, no el nombre de la variable.
+                let var_hint = match &state.kind {
+                    NodeKind::Identifier { name }
+                        if path == *name || path.starts_with(&format!("{}.", name)) || path.starts_with(&format!("{}[", name)) =>
+                    {
+                        Some(name.as_str())
+                    }
+                    _ => None,
+                };
+                note_judge_missing_path(&qn.id, &path, var_hint, &qn.loc);
+            }
+            crossing.push(instr);
+            qs.push(q);
+        }
+        // T5: el `state` y las instrucciones cruzan a un tercero — sumidero declarado,
+        // igual que `decide`. La respuesta al borde filoso nº 6 del vendor: el contenido
+        // adversario entra como dato y el motor sabe que ese dato salió del proceso.
+        if self.labels {
+            let refs: Vec<&SynValue> = crossing.iter().collect();
+            self.sink_check("judge", &refs, loc)?;
+        }
+        let req = JudgeRequest {
+            state: syn_to_json(&st),
+            questions: qs,
+        };
+        let response = match self.judge_callback.clone() {
+            Some(cb) => cb(&req).map_err(|m| err_at(m, loc))?,
+            None => {
+                note_judge_offline();
+                None
+            }
+        };
+        // Map plano id → respuesta, en el orden del bloque. Sin metadatos mezclados:
+        // una pregunta llamada `usage` no colisiona con nada.
+        let mut out: IndexMap<String, SynValue> = IndexMap::new();
+        for (i, q) in req.questions.iter().enumerate() {
+            let a = response.as_ref().and_then(|r| r.answers.get(i));
+            out.insert(q.id.clone(), answer_to_value(q, a));
+        }
+        Ok(syn_map(out))
+    }
+    }
+
+    #[inline(never)]
+    fn exec_log_statement(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::LogStatement { message, .. } = &node.kind else { unreachable!("exec_log_statement: otro nodo") };
+        {
+        let m = self.exec(message, env)?;
+        self.ensure_stdout()?;
+        // T5 (ronda 4): la misma boca pública que `print` — ver `stdout_flow_check`.
+        self.stdout_flow_check("log", loc)?;
+        let line = format!("[LOG] {}", self.pc_redact(m.to_string()));
+        self.emit_line(line);
+        Ok(SynValue::Nothing)
+    }
+    }
+
+    #[inline(never)]
+    fn exec_observe_statement(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let NodeKind::ObserveStatement { key, variable } = &node.kind else { unreachable!("exec_observe_statement: otro nodo") };
+        {
+        let k = self.exec(key, env)?.to_string();
+        let val = match self.swarm_hooks.as_ref().map(|s| s.observe.clone()) {
+            Some(h) => h(&k),
+            None => self.blackboard.get(&k).cloned(),
+        };
+        match val {
+            Some(v) => {
+                env_set(env, variable, v.clone());
+                Ok(v)
+            }
+            None => {
+                env_set(env, variable, SynValue::Nothing);
+                Ok(SynValue::Nothing)
+            }
+        }
+    }
+    }
+
+    #[inline(never)]
+    fn exec_reason_expression(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::ReasonExpression { subject, context, .. } = &node.kind else { unreachable!("exec_reason_expression: otro nodo") };
+        {
+        self.check_llm_cap()?;
+        let subj = match subject {
+            Some(s) => self.exec(s, env)?,
+            None => SynValue::Nothing,
+        };
+        // Evaluá el contexto (`with k=v`/`given …`) y armalo para el prompt — el
+        // LLM necesita ver ese contexto, no sólo el subject.
+        let mut ctx_vals = Vec::with_capacity(context.len());
+        for (name, v) in context {
+            ctx_vals.push((name, self.exec(v, env)?));
+        }
+        // T5 (B7): el prompt va al proveedor LLM — sumidero.
+        if self.labels {
+            let mut refs: Vec<&SynValue> = vec![&subj];
+            refs.extend(ctx_vals.iter().map(|(_, v)| v));
+            self.sink_check("reason", &refs, loc)?;
+        }
+        let ctx_parts: Vec<String> =
+            ctx_vals.iter().map(|(name, v)| format!("{}={}", name, v)).collect();
+        match self.llm_callback.clone() {
+            Some(cb) => {
+                let prompt = if ctx_parts.is_empty() {
+                    subj.to_string()
+                } else {
+                    format!("Reason about: {} (context: {})", subj, ctx_parts.join(", "))
+                };
+                { let out = cb("reason", &prompt); self.record_llm("reason", &prompt, &out); Ok(syn_text(out)) }
+            }
+            None => {
+                note_llm_offline();
+                Ok(syn_text(format!("[reasoning about: {}]", subj)))
+            }
+        }
+    }
+    }
+
+    #[inline(never)]
+    fn exec_require_statement(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::RequireStatement { capability, scope } = &node.kind else { unreachable!("exec_require_statement: otro nodo") };
+        {
+        // El scope se evalúa a su str (igual que el oráculo: str(eval(scope))).
+        let scope_val = match scope {
+            Some(s) => Some(self.exec(s, env)?.to_string()),
+            None => None,
+        };
+        // Dentro de un `sandbox` o del cuerpo de una tool (`call_tool`) NO se
+        // conceden capabilities: un `require` ahí es no-op. Si no, se podría
+        // re-grantear para escapar del aislamiento / del least-privilege por-tool
+        // (un `require` anidado bajo when/if no se extrae a required_capabilities,
+        // así que llega acá en runtime).
+        if !self.in_sandbox() && !self.in_tool_scope() {
+            if let Some(hook) = self.grant_hook.clone() {
+                // Ubicación del `require` para el audit (`file`/`line` de un
+                // grant rechazado por el techo). Sólo si hay sink instalado.
+                let prev = if crate::audit_loc::enabled() {
+                    Some(crate::audit_loc::replace(Some(loc.clone())))
+                } else {
+                    None
+                };
+                hook(capability, scope_val.as_deref());
+                if let Some(p) = prev {
+                    crate::audit_loc::replace(p);
+                }
+            }
+        }
+        Ok(SynValue::Nothing)
+    }
+    }
+
+    #[inline(never)]
+    fn exec_routes_declaration(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let NodeKind::RoutesDeclaration { name, routes } = &node.kind else { unreachable!("exec_routes_declaration: otro nodo") };
+        {
+        let mut map = IndexMap::new();
+        let mut meta: Vec<SynValue> = Vec::new();
+        for (i, r) in routes.iter().enumerate() {
+            if let NodeKind::RouteDefinition {
+                method,
+                path,
+                param_names,
+                requires_auth,
+                streaming,
+                socket,
+                rate_limit,
+                timeout,
+                private,
+                body,
+            } = &r.kind
+            {
+                // v0.6.20 — `stream`/`socket` ya viajan por el grupo (clase en la meta);
+                // serve los monta como rutas directas.
+                // `rate_limit` y `timeout` por ruta viajan en la meta: se evalúan acá, una
+                // vez, con el env del módulo (misma regla que una ruta directa: la
+                // expresión se evalúa al arrancar), y serve los aplica al montar.
+                let mut route_limit: Option<SynValue> = None;
+                if let Some(rl) = rate_limit {
+                    if let NodeKind::RateLimitClause { count, window, unlimited } = &rl.kind {
+                        let cap: i64 = match count {
+                            Some(c) => match self.eval(c, env)? {
+                                SynValue::Number(Number::Int(i)) => i,
+                                SynValue::Number(Number::Float(f)) => f as i64,
+                                other => {
+                                    return Err(err_at(
+                                        format!("rate_limit count must be a number, got {}", other.type_name()),
+                                        &r.location,
+                                    ))
+                                }
+                            },
+                            None => 0,
+                        };
+                        let mut lm = IndexMap::new();
+                        lm.insert("unlimited".to_string(), syn_bool(*unlimited));
+                        lm.insert("count".to_string(), SynValue::Number(Number::Int(cap)));
+                        lm.insert("window".to_string(), syn_text(window.as_str()));
+                        route_limit = Some(syn_map(lm));
+                    }
+                }
+                let mut route_timeout: Option<SynValue> = None;
+                if let Some(t) = timeout {
+                    if let NodeKind::TimeoutClause { secs } = &t.kind {
+                        route_timeout = Some(match secs {
+                            None => syn_text("none"),
+                            Some(e) => {
+                                let v = self.eval(e, env)?;
+                                let f = match &v {
+                                    SynValue::Number(Number::Int(i)) => *i as f64,
+                                    SynValue::Number(Number::Float(f)) => *f,
+                                    _ => f64::NAN,
+                                };
+                                if !(f.is_finite() && f > 0.0) {
+                                    return Err(err_at(
+                                        format!("timeout must be a positive number of seconds (or `none`), got {}", v),
+                                        &r.location,
+                                    ));
+                                }
+                                SynValue::Number(Number::Float(f))
+                            }
+                        });
+                    }
+                }
+                let task = SynValue::Task(Rc::new(SynTaskValue {
+                    name: format!("route {} {}", method, path),
+                    parameters: Vec::new(),
+                    body: body.clone(),
+                    closure_env: env.clone(),
+                    origin: Some(r.location.clone()),
+                    required_capabilities: Vec::new(),
+                }));
+                map.insert(format!("_route_handler_{}", i), task);
+                let mut mm = IndexMap::new();
+                mm.insert("method".to_string(), syn_text(method.as_str()));
+                mm.insert("path".to_string(), syn_text(path.as_str()));
+                mm.insert("requires_auth".to_string(), syn_bool(*requires_auth));
+                // v0.6.20 — `private` (fuera de los documentos generados) y la clase de
+                // ruta (`stream`/`socket`) viajan en la meta para que serve las monte
+                // exactamente como una ruta directa.
+                mm.insert("private".to_string(), syn_bool(*private));
+                mm.insert("streaming".to_string(), syn_bool(*streaming));
+                mm.insert("socket".to_string(), syn_bool(*socket));
+                mm.insert(
+                    "params".to_string(),
+                    syn_list(param_names.iter().map(|p| syn_text(p.as_str())).collect()),
+                );
+                if let Some(l) = route_limit {
+                    mm.insert("rate_limit".to_string(), l);
+                }
+                if let Some(t) = route_timeout {
+                    mm.insert("timeout".to_string(), t);
+                }
+                meta.push(syn_map(mm));
+            }
+        }
+        map.insert("_routes_meta".to_string(), syn_list(meta));
+        let value = syn_map(map);
+        env_set(env, name, value.clone());
+        Ok(value)
+    }
+    }
+
+    #[inline(never)]
+    fn exec_sandbox_block(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let NodeKind::SandboxBlock { body, under: None } = &node.kind else { unreachable!("exec_sandbox_block: otro nodo") };
+        {
+        // Aislamiento real: durante el cuerpo, todas las capabilities quedan
+        // DENEGADAS (el hook vacía el CapabilitySet; `require` es no-op). Se
+        // restaura al salir, también en el camino de error. El `print` no está
+        // gateado, así que el sandbox puede computar y devolver un valor.
+        let sandbox_env = Environment::child_scope(env, "sandbox");
+        self.sandbox_depth += 1;
+        if let Some(hook) = self.sandbox_hook.clone() {
+            hook(true);
+        }
+        let result = self.exec_block(body, &sandbox_env);
+        if let Some(hook) = self.sandbox_hook.clone() {
+            hook(false);
+        }
+        self.sandbox_depth -= 1;
+        result
+    }
+    }
+
+    #[inline(never)]
+    fn exec_sandbox_block_under(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::SandboxBlock { body, under: Some(caps_expr) } = &node.kind else { unreachable!("exec_sandbox_block_under: otro nodo") };
+        {
+        // `sandbox under <caps>` (T1 del spec de identidad): el cuerpo corre bajo un
+        // TECHO delegado = caps ∩ lo vigente. No vacía nada: lo que el bloque no lista
+        // se deniega, lo que lista sigue gateado por los grants del programa y por los
+        // techos de arriba (host, token de la request). `caps` es el map que devolvió
+        // `captoken_verify` (el bloque queda bajo ESE token) o un map literal de mínimo
+        // privilegio. `require` adentro sigue siendo no-op (mismo `sandbox_depth`).
+        let caps_val = self.exec(caps_expr, env)?;
+        let Some(hook) = self.ceiling_hook.clone() else {
+            return Err(Control::Error(RuntimeError::at(
+                "`sandbox under` needs a host that installs capability ceilings; this host does not (run the program with the synsema binary or a wasm host with capabilities)",
+                loc.clone(),
+            )));
+        };
+        hook(Some(&caps_val)).map_err(|m| Control::Error(RuntimeError::at(m, loc.clone())))?;
+        let sandbox_env = Environment::child_scope(env, "sandbox");
+        self.sandbox_depth += 1;
+        let result = self.exec_block(body, &sandbox_env);
+        // Se desapila también en el camino de error: un techo de bloque jamás
+        // sobrevive al bloque.
+        let _ = hook(None);
+        self.sandbox_depth -= 1;
+        result
+    }
+    }
+
+    #[inline(never)]
+    fn exec_send_statement(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::SendStatement { value, event_name } = &node.kind else { unreachable!("exec_send_statement: otro nodo") };
+        match self.stream_emit.clone() {
+        Some(emit) => {
+            let v = self.exec(value, env)?;
+            // T5 (B7): el stream va al cliente — sumidero.
+            if self.labels {
+                self.sink_check("send", &[&v], loc)?;
+            }
+            emit(v, event_name.as_deref())?;
+            Ok(SynValue::Nothing)
+        }
+        None => Err(err_at("send can only be used inside a stream route handler", loc)),
+    }
+    }
+
+    #[inline(never)]
+    fn exec_share_statement(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::ShareStatement { value, key } = &node.kind else { unreachable!("exec_share_statement: otro nodo") };
+        {
+        let v = self.exec(value, env)?;
+        let kv = self.exec(key, env)?;
+        // T5 (B7): el blackboard es un sumidero (otros agentes lo leen).
+        if self.labels {
+            self.sink_check("share", &[&v, &kv], loc)?;
+        }
+        let k = kv.to_string();
+        match self.swarm_hooks.as_ref().map(|s| s.share.clone()) {
+            Some(h) => h(&k, &v),
+            None => {
+                self.blackboard.insert(k, v.clone());
+            }
+        }
+        Ok(v)
+    }
+    }
+
+    #[inline(never)]
+    fn exec_show_statement(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::ShowStatement { value, label } = &node.kind else { unreachable!("exec_show_statement: otro nodo") };
+        {
+        let v = self.exec(value, env)?;
+        self.ensure_stdout()?;
+        // T5 (ronda 4): la misma boca pública que `print` — ver `stdout_flow_check`.
+        self.stdout_flow_check("show", loc)?;
+        let label_str = match label {
+            Some(l) => format!("[{}] ", l),
+            None => String::new(),
+        };
+        // Un valor privado se redacta por Display; bajo PC se redacta la línea.
+        let line = format!("{}{}", label_str, self.pc_redact(v.to_string()));
+        // DE-034: espejo de `log`/`print` — si hay log_hook (p.ej. bajo serve),
+        // emitir en vivo además de bufferizar a `output`. Bajo `run` el hook es
+        // none, así que el comportamiento no cambia.
+        self.emit_line(line);
+        Ok(v)
+    }
+    }
+
+    #[inline(never)]
+    fn exec_signal_statement(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::SignalStatement { name, data } = &node.kind else { unreachable!("exec_signal_statement: otro nodo") };
+        {
+        // El nombre del canal es una expresión (Batch 6): evaluar a texto.
+        let nv = self.exec(name, env)?;
+        let d = match data {
+            Some(d) => Some(self.exec(d, env)?),
+            None => None,
+        };
+        // T5 (B7): la señal sale a otros agentes — sumidero.
+        if self.labels {
+            let mut refs: Vec<&SynValue> = vec![&nv];
+            if let Some(dv) = &d {
+                refs.push(dv);
+            }
+            self.sink_check("signal", &refs, loc)?;
+        }
+        let n = raw_str(&nv);
+        if let Some(h) = self.swarm_hooks.as_ref().map(|s| s.signal.clone()) {
+            h(&n, d);
+        }
+        Ok(SynValue::Nothing)
+    }
+    }
+
+    #[inline(never)]
+    fn exec_spawn_statement(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::SpawnStatement { agent_name, arguments } = &node.kind else { unreachable!("exec_spawn_statement: otro nodo") };
+        {
+        let def = match self.agent_definitions.get(agent_name) {
+            Some(d) => (d.0.clone(), d.1.clone()),
+            None => {
+                // Error auto-diagnóstico (LLM-safe): decir qué agentes SÍ conoce este
+                // contexto. Lista con nombres → typo del usuario. Lista VACÍA con el
+                // agente definido en el programa → contexto de ejecución sin agentes
+                // (p.ej. un intérprete reusado que no los restauró) — señal de runtime,
+                // no del programa; ahorra ciclos de diagnóstico persiguiendo typos.
+                let known: Vec<&str> =
+                    self.agent_definitions.keys().map(|s| s.as_str()).collect();
+                let detail = if known.is_empty() {
+                    "no agents are defined in this execution context; if this agent IS \
+                     defined at the top level of the program, this is a runtime context \
+                     issue, not a problem in your code"
+                        .to_string()
+                } else {
+                    format!("agents defined in this context: {}", known.join(", "))
+                };
+                return Err(err_at(
+                    format!("No agent defined with name '{}' ({})", agent_name, detail),
+                    loc,
+                ));
+            }
+        };
+        let mut spawn_args = Vec::with_capacity(arguments.len());
+        for (k, vn) in arguments {
+            spawn_args.push((k.clone(), self.exec(vn, env)?));
+        }
+        // T5 (B7): el agente corre en otro hilo/intérprete — sumidero.
+        if self.labels {
+            let refs: Vec<&SynValue> = spawn_args.iter().map(|(_, v)| v).collect();
+            self.sink_check("spawn", &refs, loc)?;
+        }
+        match self.swarm_hooks.as_ref().map(|s| s.spawn.clone()) {
+            // Con swarm: el agente corre en su propio hilo (motor).
+            Some(spawn) => {
+                // Snapshot de globales del intérprete llamador: tareas, valores
+                // y módulos (excluye builtins). Viajan al intérprete del agente
+                // para que pueda llamar tasks del top-level sin HTTP.
+                let global_vals: Vec<(String, SynValue)> = {
+                    let env = self.global_env.borrow();
+                    env.bindings.iter()
+                        .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                };
+                // T1: el agente corre EN NOMBRE de quien pidió (la identidad viaja
+                // con el techo), no "como el agente".
+                let subject = SpawnSubject {
+                    identity: self.request_identity.clone(),
+                    spend_limits: self.request_spend_limits.clone(),
+                };
+                let id = spawn(agent_name, def.0, spawn_args, global_vals, subject)?;
+                Ok(syn_text(id))
+            }
+            // Sin swarm: ejecución in-process (bloqueante), fallback.
+            None => {
+                let agent_env = Environment::child(&def.1, &format!("agent:{}", agent_name));
+                for (k, v) in spawn_args {
+                    env_set(&agent_env, &k, v);
+                }
+                // Namespace de memoria (DB-M1): dentro del cuerpo, el agente ES
+                // el contexto (remember → source = agent_name). Pop garantizado
+                // aunque el cuerpo falle.
+                self.agent_context.push(agent_name.clone());
+                let r = self.exec_block(&def.0, &agent_env);
+                self.agent_context.pop();
+                r?;
+                Ok(syn_text(format!("agent:{}", agent_name)))
+            }
+        }
+    }
+    }
+
+    #[inline(never)]
+    fn exec_task_definition(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::TaskDefinition { name, parameters, body, .. } = &node.kind else { unreachable!("exec_task_definition: otro nodo") };
+        {
+        let mut required_caps = Vec::new();
+        let mut clean_body = Vec::new();
+        for stmt in body {
+            if let NodeKind::RequireStatement { capability, scope } = &stmt.kind {
+                let scope_val = match scope {
+                    Some(s) => Some(self.exec(s, env)?.to_string()),
+                    None => None,
+                };
+                required_caps.push((capability.clone(), scope_val));
+            } else {
+                clean_body.push(stmt.clone());
+            }
+        }
+        let task = Rc::new(SynTaskValue {
+            name: name.clone(),
+            parameters: parameters.clone(),
+            body: clean_body,
+            closure_env: env.clone(),
+            origin: Some(loc.clone()),
+            required_capabilities: required_caps,
+        });
+        let value = SynValue::Task(task);
+        // Definir una task bajo PC es una asignación más (NSU estricto + el
+        // callable sale etiquetado: QUÉ task quedó definida depende de la rama).
+        let value = if self.labels {
+            self.let_nsu_check(env, name, loc)?;
+            self.pc_mark(value, loc)?
+        } else {
+            value
+        };
+        env_set(env, name, value.clone());
+        Ok(value)
+    }
+    }
+
+    #[inline(never)]
+    fn exec_try_recover(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::TryRecover { try_body, error_variable, recover_body } = &node.kind else { unreachable!("exec_try_recover: otro nodo") };
+        {
+        // El mensaje del error atrapado sale etiquetado con todo lo privado que
+        // Se desenvolvió o gateó control DENTRO del `try` (aproximación conservadora:
+        // Un "Index 9 out of bounds" con un índice privado no llega público a `e`).
+        let r = self.exec_block(try_body, env);
+        // `self.seen` está scopeado a ESTE nodo (lo limpia `exec`), así que acá tiene
+        // exactamente lo privado que tocó el cuerpo del `try`.
+        let try_seen = if self.labels { Some(self.seen.clone()) } else { None };
+        match r {
+            Ok(v) => Ok(v),
+            Err(Control::Give(v)) => Err(Control::Give(v)),
+            Err(Control::Stop(v)) => Err(Control::Stop(v)),
+            // T5 (regla 1.a): un error nacido bajo PC privado, y el veredicto del
+            // propio enforcement, NO se atrapan — se propagan hasta el host (en el
+            // guest: request fallida con código uniforme, que T1 cubre). Atraparlos
+            // convertía el enforcement en el canal (1.a) y un `raise` dentro de la
+            // rama privada en un bit por iteración (1.b, 1.d).
+            Err(Control::Error(e)) if self.labels && e.is_fatal_for_labels() => {
+                Err(Control::Error(e))
+            }
+            Err(Control::Error(e)) => {
+                let msg = strip_loc_prefix(&e.to_string());
+                let recover_env = Environment::child_scope(env, "recover");
+                let mut ev = syn_text(msg);
+                if let Some(l) = &try_seen {
+                    ev = labels::mark(ev, l.clone());
+                }
+                let ev = self.pc_mark(ev, loc)?;
+                env_set(&recover_env, error_variable, ev);
+                // T5 (regla 1.c): que el cuerpo del `recover` CORRA es en sí mismo
+                // información sobre lo que pasó adentro del `try` — corre bajo
+                // PC ∪ etiqueta de lo privado que se tocó ahí dentro.
+                let pushed = match &try_seen {
+                    Some(l) if self.labels && !l.is_empty() => {
+                        self.pc_push(l);
+                        true
+                    }
+                    _ => false,
+                };
+                let out = self.exec_block(recover_body, &recover_env);
+                let out = if self.labels { out.and_then(|v| self.pc_mark(v, loc)) } else { out };
+                if pushed {
+                    self.pc_pop();
+                }
+                out
+            }
+        }
+    }
+    }
+
+    #[inline(never)]
+    fn exec_type_definition(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::TypeDefinition { name, fields } = &node.kind else { unreachable!("exec_type_definition: otro nodo") };
+        {
+        let field_names: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+        let count = field_names.len() as i32;
+        let type_name = name.clone();
+        let def_loc = loc.clone();
+        let func: BuiltinFn = Rc::new(move |_i, args, _l| {
+            if args.len() != field_names.len() {
+                return Err(err_at(
+                    format!(
+                        "Type {} expects {} fields, got {}",
+                        type_name,
+                        field_names.len(),
+                        args.len()
+                    ),
+                    &def_loc,
+                ));
+            }
+            let mut m = IndexMap::new();
+            for (n, v) in field_names.iter().zip(args.iter()) {
+                m.insert(n.clone(), v.clone());
+            }
+            Ok(syn_map(m))
+        });
+        env_set(
+            env,
+            name,
+            SynValue::Builtin(Rc::new(BuiltinTask::new(name.clone(), count, None, func))),
+        );
+        Ok(SynValue::Nothing)
+    }
+    }
+
+    #[inline(never)]
+    fn exec_use_import(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::UseImport { path, alias } = &node.kind else { unreachable!("exec_use_import: otro nodo") };
+        {
+        let module_map = self.load_module(path, &loc.file)?;
+        env_set(env, alias, module_map.clone());
+        Ok(module_map)
+    }
+    }
+
+    #[inline(never)]
+    fn exec_wait_for_statement(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::WaitForStatement { signal_name, variable, timeout } = &node.kind else { unreachable!("exec_wait_for_statement: otro nodo") };
+        {
+        let n = raw_str(&self.exec(signal_name, env)?);
+        // Timeout opcional (Batch 7): segundos como número (no-número → error claro);
+        // clamp a [0, 3600] como `sleep`. `None` = default (30 s) en el hook.
+        let secs: Option<f64> = match timeout {
+            Some(t) => match self.exec(t, env)? {
+                SynValue::Number(num) => Some(num.to_f64().clamp(0.0, 3600.0)),
+                _ => {
+                    return Err(err_at(
+                        "wait_for timeout must be a number of seconds",
+                        loc,
+                    ))
+                }
+            },
+            None => None,
+        };
+        let cancel = self.cancel.flag.clone();
+        let result = match self.swarm_hooks.as_ref().map(|s| s.wait_for.clone()) {
+            Some(h) => h(&n, secs, &cancel),
+            None => None,
+        };
+        self.check_cancel()?;
+        match result {
+            Some(v) => {
+                if let Some(var) = variable {
+                    env_set(env, var, v.clone());
+                }
+                Ok(v)
+            }
+            None => {
+                if let Some(var) = variable {
+                    env_set(env, var, SynValue::Nothing);
+                }
+                Ok(SynValue::Nothing)
+            }
+        }
+    }
     }
 
     /// Selección de rama de un `when` (cuerpo / `otherwise when` / `otherwise`).
@@ -7582,40 +7844,49 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_range(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
-        match args.len() {
-            1 => {
-                let n = num_to_i64(nth(args, 0)?)?;
-                Ok(syn_list((0..n).map(syn_int).collect()))
-            }
-            2 => {
-                let lo = num_to_i64(nth(args, 0)?)?;
-                let hi = num_to_i64(nth(args, 1)?)?;
-                Ok(syn_list((lo..hi).map(syn_int).collect()))
-            }
-            3 => {
-                let lo = num_to_i64(nth(args, 0)?)?;
-                let hi = num_to_i64(nth(args, 1)?)?;
-                let step = num_to_i64(nth(args, 2)?)?;
-                if step == 0 {
-                    return Err(err("range() arg 3 must not be zero"));
-                }
-                let mut out = Vec::new();
-                let mut i = lo;
-                if step > 0 {
-                    while i < hi {
-                        out.push(syn_int(i));
-                        i += step;
-                    }
-                } else {
-                    while i > hi {
-                        out.push(syn_int(i));
-                        i += step;
-                    }
-                }
-                Ok(syn_list(out))
-            }
-            _ => Err(err("range() takes 1-3 arguments")),
+        let (lo, hi, step) = range_spec(args)?;
+        if step == 1 {
+            return Ok(syn_list((lo..hi).map(syn_int).collect()));
         }
+        Ok(syn_list(RangeIter::new(lo, hi, step).map(syn_int).collect()))
+    }
+
+    /// `each x in range(…)` con `range` el builtin de verdad (se mira sin evaluar nada): evalúa el
+    /// nombre y los argumentos como la llamada normal —mismos pasos, mismos errores, la misma
+    /// validación que `b_range`— y devuelve el iterador, sin armar la lista (F1.11:
+    /// `range(0, 900000)` pedía ~36 MB). `None` si la colección no tiene esa forma; entonces no
+    /// evaluó nada y sigue el camino de siempre.
+    fn each_over_range(
+        &mut self,
+        collection: &Node,
+        env: &Rc<RefCell<Environment>>,
+    ) -> Result<Option<RangeIter>, Control> {
+        let NodeKind::TaskCall { name, arguments } = &collection.kind else { return Ok(None) };
+        if name.as_identifier() != Some("range")
+            || arguments.is_empty()
+            || arguments.len() > 3
+            || arguments.iter().any(|a| a.name.is_some())
+        {
+            return Ok(None);
+        }
+        // Tiene que ser EL builtin (un task del usuario puede llamarse igual).
+        if !matches!(env_get(env, "range"), Some(SynValue::Builtin(b)) if b.name == "range") {
+            return Ok(None);
+        }
+        // Lo que la referencia evalúa y cuenta: el nodo de la llamada, el nombre y los argumentos.
+        // (La aridad no puede fallar: 1 a 3 posicionales es lo que `range` acepta.)
+        self.steps = self.steps.wrapping_add(1);
+        self.exec(name, env)?;
+        let mut vals: SmallVec<[SynValue; 3]> = SmallVec::new();
+        for a in arguments {
+            vals.push(self.exec(&a.value, env)?);
+        }
+        // Una llamada a builtin cuenta un nivel de recursión (`call_value_named`).
+        if self.recursion_depth + 1 > MAX_RECURSION {
+            return Err(err("maximum recursion depth exceeded"));
+        }
+        let (lo, hi, step) = range_spec(&vals)?;
+        Ok(Some(RangeIter::new(lo, hi, step)))
     }
 
     fn b_type_of(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -8575,6 +8846,78 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 // =========================================================
 // helpers libres
 // =========================================================
+
+/// `(desde, hasta, paso)` de `range(…)`: la validación que comparten `b_range` y el `each`
+/// perezoso, así los dos caminos dan los mismos errores.
+fn range_spec(args: &[SynValue]) -> Result<(i64, i64, i64), Control> {
+    match args.len() {
+        1 => Ok((0, num_to_i64(nth(args, 0)?)?, 1)),
+        2 => Ok((num_to_i64(nth(args, 0)?)?, num_to_i64(nth(args, 1)?)?, 1)),
+        3 => {
+            let lo = num_to_i64(nth(args, 0)?)?;
+            let hi = num_to_i64(nth(args, 1)?)?;
+            let step = num_to_i64(nth(args, 2)?)?;
+            if step == 0 {
+                return Err(err("range() arg 3 must not be zero"));
+            }
+            Ok((lo, hi, step))
+        }
+        _ => Err(err("range() takes 1-3 arguments")),
+    }
+}
+
+/// Los enteros de un `range`, sin armar la lista. Avanza con `checked_add`: si el paso pasa de
+/// `i64::MAX` (o de `i64::MIN`), el rango terminó, como en Python. Antes `i += step` daba la
+/// vuelta en release y el bucle no terminaba (specs/compute-rendimiento.md §3.10).
+pub(crate) struct RangeIter {
+    next: Option<i64>,
+    hi: i64,
+    step: i64,
+}
+
+impl RangeIter {
+    fn new(lo: i64, hi: i64, step: i64) -> Self {
+        RangeIter { next: Some(lo), hi, step }
+    }
+}
+
+impl Iterator for RangeIter {
+    type Item = i64;
+    fn next(&mut self) -> Option<i64> {
+        let i = self.next?;
+        let inside = if self.step > 0 { i < self.hi } else { i > self.hi };
+        if !inside {
+            self.next = None;
+            return None;
+        }
+        self.next = i.checked_add(self.step);
+        Some(i)
+    }
+}
+
+/// De dónde salen los elementos de un `each`.
+enum EachItems {
+    /// Ya armados (claves de un mapa, caracteres, bytes; o la copia de la lista en modo referencia).
+    Owned(std::vec::IntoIter<SynValue>),
+    /// Una lista recorrida por índice, sin copiarla (F1.11).
+    List(ListRef, usize),
+    /// `range(…)` sin armar la lista (F1.11).
+    Range(RangeIter),
+}
+
+impl EachItems {
+    fn next_item(&mut self) -> Option<SynValue> {
+        match self {
+            EachItems::Owned(it) => it.next(),
+            EachItems::List(l, i) => {
+                let item = l.borrow().get(*i).cloned();
+                *i += 1;
+                item
+            }
+            EachItems::Range(r) => r.next().map(syn_int),
+        }
+    }
+}
 
 fn nth(args: &[SynValue], i: usize) -> Result<&SynValue, Control> {
     args.get(i).ok_or_else(|| err("missing argument"))

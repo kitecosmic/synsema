@@ -269,7 +269,7 @@ fn field_as_number(s: &str) -> Option<Number> {
             return Some(Number::Int(i));
         }
         if let Ok(b) = s.parse::<BigInt>() {
-            return Some(Number::Big(b));
+            return Some(Number::Big(Box::new(b)));
         }
     }
     if s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')) {
@@ -838,7 +838,7 @@ mod tests {
 
     fn msg(r: Result<SynValue, Control>) -> String {
         match r {
-            Err(Control::Error(e)) => e.message,
+            Err(Control::Error(e)) => e.into_message(),
             Ok(v) => panic!("esperaba error, dio {}", v),
             Err(_) => panic!("control inesperado"),
         }

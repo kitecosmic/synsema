@@ -3399,7 +3399,7 @@ mod tests {
 
     fn err_of(args: &[SynValue]) -> String {
         match chart_svg(args) {
-            Err(Control::Error(re)) => re.message,
+            Err(Control::Error(re)) => re.into_message(),
             other => panic!("expected an error, got {:?}", other.is_ok()),
         }
     }

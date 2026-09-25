@@ -299,7 +299,7 @@ fn an_error_that_depends_on_private_data_is_not_catchable() {
     let msg = match r {
         Err(Control::Error(e)) => {
             assert!(e.is_fatal_for_labels(), "tiene que ser no atrapable");
-            e.message
+            e.into_message()
         }
         _ => panic!("un error causado por un privado no se atrapa"),
     };
@@ -572,7 +572,7 @@ fn audit_r4_v4_stdout_is_a_public_sink_under_a_private_branch() {
     ] {
         let (i, r) = run(src, true);
         let msg = match r {
-            Err(Control::Error(e)) => e.message,
+            Err(Control::Error(e)) => e.into_message(),
             _ => panic!("{} tenia que violar bajo PC privado", what),
         };
         assert!(msg.contains("label_violation") && msg.contains(what), "{}: {}", what, msg);
@@ -1029,7 +1029,7 @@ fn audit_b7_sinks_are_checked_before_running() {
     }
     fn err_of(r: Result<SynValue, Control>) -> String {
         match r {
-            Err(Control::Error(e)) => e.message,
+            Err(Control::Error(e)) => e.into_message(),
             _ => panic!("se esperaba error"),
         }
     }
@@ -1285,7 +1285,7 @@ try\n    let z be xs[9]\nrecover e\n    print(e)\n";
 fn assert_not_extracted(src: &str, var: &str) -> Option<String> {
     let (i, r) = run(src, true);
     match r {
-        Err(Control::Error(e)) => Some(e.message),
+        Err(Control::Error(e)) => Some(e.into_message()),
         Err(_) => Some("give/stop fuera de lugar".to_string()),
         Ok(_) => {
             let v = env_get(&i.global_env, var).unwrap_or_else(|| panic!("sin variable {}", var));
@@ -1611,7 +1611,7 @@ fn assert_closed_on(src: &str, var: &str) -> String {
                 e.message,
                 src
             );
-            e.message
+            e.into_message()
         }
         Err(_) => panic!("give/stop fuera de lugar\nfuente:\n{}", src),
         Ok(_) => {
@@ -1904,7 +1904,7 @@ when ctx[\"balance\"] > 1
     m2.insert("balance".to_string(), syn_int(500));
     i2.set_global("ctx", mark(syn_map(m2), labels::label_from(&["app"])));
     let msg = match i2.execute(&program2) {
-        Err(Control::Error(e)) => e.message,
+        Err(Control::Error(e)) => e.into_message(),
         _ => panic!("se esperaba label_violation"),
     };
     assert!(msg.contains("pc = [app]") && !msg.contains("#0"), "{}", msg);
@@ -1941,7 +1941,7 @@ task probe(secret)\n    each i in range(0, 256)\n        when secret == i\n     
 let r be probe(private(181, \"app\"))\n";
     let (i, r) = run(src, true);
     let msg = match r {
-        Err(Control::Error(e)) => e.message,
+        Err(Control::Error(e)) => e.into_message(),
         _ => panic!("un `stop` bajo control privado no puede dejar su task"),
     };
     assert!(msg.contains("label_violation") && msg.contains("'stop' left the task 'bail'"), "{}", msg);
@@ -2167,7 +2167,7 @@ fn audit_r7_the_redaction_text_does_not_depend_on_the_value() {
         );
         let (_i, r) = run(&src, true);
         if let Err(Control::Error(e)) = r {
-            msgs.push(e.message);
+            msgs.push(e.into_message());
         }
     }
     if msgs.len() == 2 {

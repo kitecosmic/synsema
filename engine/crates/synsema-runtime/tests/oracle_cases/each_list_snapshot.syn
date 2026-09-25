@@ -1,0 +1,16 @@
+let xs be [1, 2, 3]
+each x in xs
+    set xs to append(xs, x * 10)
+print(xs, steps())
+let ys be [1, 2, 3]
+each y in ys
+    set ys[0] to y + 100
+print(ys, steps())
+let rows be [{"v": 1}, {"v": 2}]
+each r in rows
+    set r.v to r.v + 1
+print(rows, steps())
+each r in rows
+    set rows[1].v to 99
+    print(r.v)
+print(rows, steps())

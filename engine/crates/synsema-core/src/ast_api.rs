@@ -8,7 +8,7 @@ use crate::ast::{Arg, Node, NodeKind, Param, Program};
 use crate::tokens::SourceLocation;
 
 fn gen_loc() -> SourceLocation {
-    SourceLocation { file: "<generated>".to_string(), line: 0, column: 0, offset: 0 }
+    SourceLocation { file: "<generated>".into(), line: 0, column: 0, offset: 0 }
 }
 
 // =========================================================

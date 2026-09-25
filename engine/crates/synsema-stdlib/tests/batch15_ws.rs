@@ -399,7 +399,7 @@ fn ws_on_full_error_surfaces_catchable_never_silent_drop() {
                 assert!(drained <= 4, "con max_queue 4 no pueden salir más de 4 mensajes antes del error");
             }
             Ok(_) => panic!("no debe devolver nothing: el overflow debe ERROREAR"),
-            Err(Control::Error(e)) => break e.message,
+            Err(Control::Error(e)) => break e.into_message(),
             Err(_) => panic!("control inesperado"),
         }
     };

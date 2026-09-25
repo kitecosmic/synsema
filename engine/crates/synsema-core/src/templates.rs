@@ -1095,7 +1095,7 @@ fn validate_template_walk(path: &str, depth: usize, seen: &mut Vec<String>) -> R
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string());
         let tree = load_template(&target, &display, path).map_err(|c| match c {
-            Control::Error(e) => e.message,
+            Control::Error(e) => e.into_message(),
             _ => "template error".to_string(),
         })?;
         fn refs(nodes: &[TNode], acc: &mut Vec<String>) {

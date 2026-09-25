@@ -550,7 +550,7 @@ mod tests {
         b.iter().map(|x| format!("{:02x}", x)).collect()
     }
     fn loc() -> SourceLocation {
-        SourceLocation { file: "t.syn".to_string(), line: 1, column: 1, offset: 0 }
+        SourceLocation { file: "t.syn".into(), line: 1, column: 1, offset: 0 }
     }
     fn ok(r: Result<SynValue, Control>) -> SynValue {
         match r {
