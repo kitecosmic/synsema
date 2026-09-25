@@ -174,19 +174,45 @@ jobs:
       # él, `SYNSEMA_JUDGE_PROVIDER=laya` le contesta a quien lo configure que se compile su
       # propio binario, y una capacidad que la doc describe pero el release no trae no es una
       # capacidad. El peso extra es el encoder y las cabezas — candle ya entra por `llm-local`.
+      # Los dos builds finales guardan su log: `-pgo-warn-missing-function` hace que LLVM nombre cada
+      # función compilada SIN datos del perfil, y el paso siguiente lo revisa.
       - name: Build (Linux, glibc 2.17 floor)
         if: runner.os == 'Linux'
+        shell: bash
         env:
           SYNSEMA_VERSION: ${{ github.ref_name }}
-          RUSTFLAGS: -Cprofile-use=${{ runner.temp }}/pgo.profdata
-        run: cargo zigbuild --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target ${{ matrix.target }}.2.17
+          TARGET: ${{ matrix.target }}
+          RUSTFLAGS: -Cprofile-use=${{ runner.temp }}/pgo.profdata -Cllvm-args=-pgo-warn-missing-function
+        run: |
+          set -euo pipefail
+          cargo zigbuild --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target "$TARGET.2.17" 2>&1 | tee "$RUNNER_TEMP/pgo-final-build.log"
 
       - name: Build
         if: runner.os != 'Linux'
+        shell: bash
         env:
           SYNSEMA_VERSION: ${{ github.ref_name }}
-          RUSTFLAGS: -Cprofile-use=${{ runner.temp }}/pgo.profdata
-        run: cargo build --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target ${{ matrix.target }}
+          TARGET: ${{ matrix.target }}
+          RUSTFLAGS: -Cprofile-use=${{ runner.temp }}/pgo.profdata -Cllvm-args=-pgo-warn-missing-function
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --manifest-path engine/Cargo.toml -p synsema-cli --features llm-local,judge-laya --target "$TARGET" 2>&1 | tee "$RUNNER_TEMP/pgo-final-build.log"
+
+      # Un perfil que no calza con el build final NO rompe nada: el binario sale igual, sin la ganancia,
+      # y en verde (pasó al probarlo: un perfil de `cargo build` sobre un build de zigbuild dejó 4.970
+      # funciones sin datos, `exec_node` entre ellas; el que calza, ninguna). Si el corazón del
+      # intérprete se compiló sin perfil, el release falla acá en vez de publicar un binario más lento.
+      - name: PGO - check the profile was applied
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/pgo-final-build.log"
+          missing=$(grep -c "no profile data available for function" "$log" || true)
+          echo "functions compiled without profile data: $missing"
+          if grep "no profile data available for function" "$log" | grep -q "exec_node"; then
+            echo "::error::PGO did not apply: exec_node was compiled without profile data (the instrumented and the final build differ)"
+            exit 1
+          fi
 
       - name: Package (unix)
         if: runner.os != 'Windows'
