@@ -123,12 +123,15 @@ jobs:
           # que hacerse igual salvo el perfil: si difieren, cambian los nombres internos de las
           # funciones y el perfil no se aplica, en silencio (medido: un perfil de `cargo build`
           # aplicado a un build de zigbuild no dio ninguna ganancia).
-          # Se le pasa a cargo-zigbuild por CARGO_ZIGBUILD_ZIG_PATH y no por el PATH: con `ziglang`
-          # instalado por pip, cargo-zigbuild usa ése antes que cualquier `zig` del PATH (así falló el
-          # primer intento en CI; en una máquina sin ziglang de pip el PATH alcanzaba).
+          # cargo-zigbuild busca PRIMERO el `ziglang` de Python y sólo si falla mira
+          # CARGO_ZIGBUILD_ZIG_PATH (y el PATH): con el ziglang de pip instalado, el shim nunca se
+          # llamaba (así fallaron dos intentos en CI). CARGO_ZIGBUILD_PYTHON_PATH apunta a algo que no
+          # existe para que descarte Python y use el shim, que a su vez llama a `python3 -m ziglang`:
+          # el zig es el mismo de siempre. Verificado en una máquina con un ziglang de Python presente.
           if [ "$RUNNER_OS" = "Linux" ]; then
             chmod +x engine/pgo/zig
             echo "CARGO_ZIGBUILD_ZIG_PATH=$GITHUB_WORKSPACE/engine/pgo/zig" >> "$GITHUB_ENV"
+            echo "CARGO_ZIGBUILD_PYTHON_PATH=/nonexistent/use-the-pgo-zig-shim" >> "$GITHUB_ENV"
           fi
 
       - name: PGO - instrumented build and training
