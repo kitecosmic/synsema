@@ -280,6 +280,12 @@ hkdf = "0.12"
 # specs/compute-rendimiento.md). YA estaba en el árbol (kurbo/hyper vía stdlib, también en los
 # builds wasm): directa no agrega crate. Puro Rust, sin `*-sys`.
 smallvec = "1"
+# Allocator del binario SÓLO en Windows (F1.13 de specs/compute-rendimiento.md). Medido con release +
+# LTO: HeapAlloc cuesta 1,3–1,5× el malloc de glibc en todo lo que pide memoria (llamadas, `each`,
+# mapas, listas, textos, closures), y con mimalloc la diferencia baja a 1,03–1,09× (−17 % a −28 % en
+# esas filas); en Linux no aporta, por eso no se usa ahí. Es C (el de Microsoft, MIT): decisión
+# explícita de Joel, sólo por Windows. `default-features = false`: sin `secure`/`override`.
+mimalloc = { version = "0.1", default-features = false }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 scrypt = { version = "0.11", default-features = false }
 aes = "0.8"

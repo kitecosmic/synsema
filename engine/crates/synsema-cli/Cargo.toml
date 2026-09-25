@@ -18,6 +18,10 @@ llm-local = ["synsema-runtime/llm-local"]
 # Backend local de `judge` (tanda I3): `SYNSEMA_JUDGE_PROVIDER=laya` con un checkpoint en disco.
 judge-laya = ["synsema-runtime/judge-laya"]
 
+# Allocator del binario sólo en Windows (ver el comentario en el Cargo.toml del workspace).
+[target.'cfg(windows)'.dependencies]
+mimalloc.workspace = true
+
 [dependencies]
 synsema-core.workspace = true
 synsema-capabilities.workspace = true
