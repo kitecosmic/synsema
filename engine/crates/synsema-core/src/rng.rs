@@ -361,12 +361,12 @@ fn err(msg: impl Into<String>) -> Control {
 fn wrap(gen: Generator, name: String) -> SynValue {
     let cell: GenCell = Rc::new(RefCell::new(gen));
     let st = cell.clone();
-    let task = Rc::new(BuiltinTask {
+    let task = Rc::new(BuiltinTask::new(
         name,
-        func: Rc::new(move |_i, _a, _l| Ok(syn_float(st.borrow_mut().next_f64()))),
-        param_count: 0,
-        param_names: None,
-    });
+        0,
+        None,
+        Rc::new(move |_i, _a, _l| Ok(syn_float(st.borrow_mut().next_f64()))),
+    ));
     GENERATORS.with(|r| {
         let mut r = r.borrow_mut();
         // Poda amortizada (al duplicar el tamaño): podar en cada alta era cuadrático.
@@ -428,12 +428,12 @@ pub fn top_level_stub(name: &str) -> SynValue {
         "the generator {} was created at the top level; here it would restart the same sequence in every request/worker — create it where you use it (rng(seed) from something per request), or give each parallel_map item its own with rng_spawn(g, n)",
         name
     );
-    SynValue::Builtin(Rc::new(BuiltinTask {
-        name: name.to_string(),
-        func: Rc::new(move |_i, _a, _l| Err(crate::interpreter::Control::Error(crate::interpreter::RuntimeError::new(msg.clone())))),
-        param_count: 0,
-        param_names: None,
-    }))
+    SynValue::Builtin(Rc::new(BuiltinTask::new(
+        name,
+        0,
+        None,
+        Rc::new(move |_i, _a, _l| Err(crate::interpreter::Control::Error(crate::interpreter::RuntimeError::new(msg.clone())))),
+    )))
 }
 
 /// ¿`v` es un generador de `rng()`/`rng_spawn()`? (Para nombrarlo bien en un error: por

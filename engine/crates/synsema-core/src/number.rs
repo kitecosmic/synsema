@@ -609,6 +609,11 @@ impl Number {
 
     /// Orden numérico (para `< > <= >=`). `None` sólo con NaN.
     pub fn partial_cmp_num(&self, other: &Number) -> Option<Ordering> {
+        // Int×Int primero: es la condición de todo bucle y de todo `when` sobre enteros, y no
+        // hay decimal ni float en juego. Sin BigInt (antes: dos asignaciones por comparación).
+        if let (Number::Int(a), Number::Int(b)) = (self, other) {
+            return Some(a.cmp(b));
+        }
         // Decimal⊕Float: incomparable acá (el operador de orden erroría antes vía el
         // chequeo de mezcla; en sort cae a Equal con unwrap_or). Decimal con Int/Big/
         // Decimal: comparación de valor exacta.
@@ -626,9 +631,11 @@ impl Number {
             (Number::Float(a), Number::Float(b)) => a.partial_cmp(b),
             // Entero vs float: EXACTO, como Python (v0.6.29). Pasar el entero a f64
             // hacía `2**53 + 1 == 9007199254740992.0` verdadero.
+            (Number::Float(a), Number::Int(i)) => cmp_i64_float(*i, *a).map(Ordering::reverse),
+            (Number::Int(i), Number::Float(b)) => cmp_i64_float(*i, *b),
             (Number::Float(a), _) => cmp_int_float(&other.as_bigint().unwrap(), *a).map(Ordering::reverse),
             (_, Number::Float(b)) => cmp_int_float(&self.as_bigint().unwrap(), *b),
-            _ => self.as_bigint().unwrap().partial_cmp(&other.as_bigint().unwrap()),
+            _ => Some(cmp_int_big(self, other)),
         }
     }
 
@@ -667,6 +674,10 @@ impl Number {
 
     /// Igualdad numérica con semántica Python (`5 == 5.0` es true).
     pub fn num_eq(&self, other: &Number) -> bool {
+        // Int×Int primero, sin BigInt (ver `partial_cmp_num`).
+        if let (Number::Int(a), Number::Int(b)) = (self, other) {
+            return a == b;
+        }
         // Decimal⊕Float: simplemente distintos (sin error — mantiene total el `==`
         // de match/contains). Decimal con Int/Big/Decimal: igualdad de valor exacta
         // (`5 == 5d` → true; `1.50d == 1.5d` → true).
@@ -684,10 +695,56 @@ impl Number {
         }
         match (self, other) {
             (Number::Float(a), Number::Float(b)) => a == b,
+            (Number::Float(a), Number::Int(i)) | (Number::Int(i), Number::Float(a)) => {
+                cmp_i64_float(*i, *a) == Some(Ordering::Equal)
+            }
             (Number::Float(a), _) => cmp_int_float(&other.as_bigint().unwrap(), *a) == Some(Ordering::Equal),
             (_, Number::Float(b)) => cmp_int_float(&self.as_bigint().unwrap(), *b) == Some(Ordering::Equal),
-            _ => self.as_bigint() == other.as_bigint(),
+            _ => cmp_int_big(self, other) == Ordering::Equal,
         }
+    }
+}
+
+/// Orden entre dos enteros exactos (`Int`/`Big`) sin asignar: un `Big` se compara por valor
+/// contra un `Int` (no se asume que un `Big` nunca entra en `i64`: puede venir construido así).
+/// Sólo para enteros; lo que no es entero no llega acá.
+fn cmp_int_big(a: &Number, b: &Number) -> Ordering {
+    match (a, b) {
+        (Number::Int(x), Number::Int(y)) => x.cmp(y),
+        (Number::Big(x), Number::Big(y)) => x.cmp(y),
+        (Number::Int(x), Number::Big(y)) => match y.to_i64() {
+            Some(y) => x.cmp(&y),
+            None if y.sign() == Sign::Minus => Ordering::Greater,
+            None => Ordering::Less,
+        },
+        (Number::Big(_), Number::Int(_)) => cmp_int_big(b, a).reverse(),
+        // Inalcanzable desde los llamadores (decimal y float se resuelven antes); el camino
+        // general de siempre, por las dudas.
+        _ => a.as_bigint().cmp(&b.as_bigint()),
+    }
+}
+
+/// Orden EXACTO entre un `i64` y un float, sin `BigInt`: la misma cuenta que `cmp_int_float`.
+/// 2^63 es exacto en f64; todo float ≥ 2^63 queda por encima de cualquier `i64` y todo float
+/// < −2^63 por debajo (los infinitos incluidos). En el medio, el piso del float entra exacto en
+/// `i64`. NaN → `None`.
+fn cmp_i64_float(i: i64, f: f64) -> Option<Ordering> {
+    const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+    if f.is_nan() {
+        return None;
+    }
+    if f >= TWO_63 {
+        return Some(Ordering::Less);
+    }
+    if f < -TWO_63 {
+        return Some(Ordering::Greater);
+    }
+    let fl = f.floor();
+    match i.cmp(&(fl as i64)) {
+        Ordering::Less => Some(Ordering::Less),
+        Ordering::Greater => Some(Ordering::Greater),
+        // i == floor(f): igual si f es entero, menor si f tiene parte fraccionaria.
+        Ordering::Equal => Some(if fl == f { Ordering::Equal } else { Ordering::Less }),
     }
 }
 
@@ -889,7 +946,7 @@ impl PartialEq for Number {
                 cmp_ratio(&self.exact_ratio().unwrap(), &other.exact_ratio().unwrap()) == Ordering::Equal
             }
             (Number::Decimal(_) | Number::BigDec(_), _) | (_, Number::Decimal(_) | Number::BigDec(_)) => false,
-            _ => self.as_bigint() == other.as_bigint(),
+            _ => cmp_int_big(self, other) == Ordering::Equal,
         }
     }
 }
@@ -951,5 +1008,63 @@ mod tests {
     #[test]
     fn int_eq_big_by_value() {
         assert_eq!(Number::Int(100), Number::Big("100".parse().unwrap()));
+    }
+
+    /// El orden i64×float sin BigInt da exactamente lo mismo que el camino exacto con BigInt, en
+    /// los bordes: ±2^53 (donde f64 deja de representar todo entero), ±2^63, i64::MIN/MAX,
+    /// fracciones, ±0.0, infinitos y NaN.
+    #[test]
+    fn i64_float_order_matches_the_bigint_path() {
+        let p53 = 9_007_199_254_740_992_i64;
+        let ints = [
+            0, 1, -1, 2, -2, 5, -5, 7, p53 - 1, p53, p53 + 1, -p53 - 1, -p53, -p53 + 1,
+            i64::MAX, i64::MAX - 1, i64::MIN, i64::MIN + 1, 1 << 62, -(1 << 62),
+        ];
+        let mut floats = vec![
+            0.0, -0.0, 0.5, -0.5, 1.0, -1.0, 1.5, -1.5, 4.999999999999999, 5.0, 5.000000000000001,
+            -5.0, 9_007_199_254_740_992.0, 9_007_199_254_740_994.0, -9_007_199_254_740_992.0,
+            9_223_372_036_854_775_808.0, -9_223_372_036_854_775_808.0, 9_223_372_036_854_774_784.0,
+            -9_223_372_036_854_774_784.0, 1e300, -1e300, f64::MIN_POSITIVE, -f64::MIN_POSITIVE,
+            f64::INFINITY, f64::NEG_INFINITY, f64::NAN,
+        ];
+        floats.extend(ints.iter().map(|i| *i as f64));
+        for &i in &ints {
+            for &f in &floats {
+                let slow = cmp_int_float(&BigInt::from(i), f);
+                assert_eq!(cmp_i64_float(i, f), slow, "i = {}, f = {:?}", i, f);
+                let (n, x) = (Number::Int(i), Number::Float(f));
+                assert_eq!(n.partial_cmp_num(&x), slow, "partial_cmp_num({}, {:?})", i, f);
+                assert_eq!(x.partial_cmp_num(&n), slow.map(Ordering::reverse), "partial_cmp_num({:?}, {})", f, i);
+                assert_eq!(n.num_eq(&x), slow == Some(Ordering::Equal), "num_eq({}, {:?})", i, f);
+            }
+        }
+        // El caso que motivó el camino exacto (v0.6.29).
+        assert!(!Number::Int(p53 + 1).num_eq(&Number::Float(9_007_199_254_740_992.0)));
+    }
+
+    /// El orden entre enteros exactos sin asignar da lo mismo que comparar como BigInt, incluido
+    /// un `Big` construido con un valor que entra en `i64`.
+    #[test]
+    fn int_big_order_matches_the_bigint_path() {
+        let big = |s: &str| Number::Big(s.parse().unwrap());
+        let vals = [
+            Number::Int(0),
+            Number::Int(-3),
+            Number::Int(i64::MAX),
+            Number::Int(i64::MIN),
+            big("100"),
+            big("-100"),
+            big("9223372036854775808"),
+            big("-9223372036854775809"),
+            big("123456789012345678901234567890"),
+        ];
+        for a in &vals {
+            for b in &vals {
+                let slow = a.as_bigint().unwrap().cmp(&b.as_bigint().unwrap());
+                assert_eq!(a.partial_cmp_num(b), Some(slow), "{} vs {}", a, b);
+                assert_eq!(a.num_eq(b), slow == Ordering::Equal, "{} == {}", a, b);
+                assert_eq!(a == b, slow == Ordering::Equal, "PartialEq {} {}", a, b);
+            }
+        }
     }
 }

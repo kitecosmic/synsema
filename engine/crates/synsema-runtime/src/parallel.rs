@@ -373,7 +373,7 @@ pub(crate) fn register_parallel_builtins(
                     // dentro de un route handler bajo serve, porque el rebuild preserva
                     // los nombres originales ("module:<resolved>", nunca un placeholder).
                     let module = {
-                        let env_name = t.closure_env.borrow().name.clone();
+                        let env_name = t.closure_env.borrow().name.to_string();
                         if env_name.starts_with("module:") {
                             Some((env_name, snapshot_module_env(&t.closure_env)))
                         } else {

@@ -1,0 +1,3 @@
+let xs be [1, 2]
+print(steps())
+set xs to insert(xs, 99, 0)

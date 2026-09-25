@@ -1052,30 +1052,30 @@ pub fn build_form_syn(ctx: &Ctx) -> SynValue {
 pub fn request_bindings(ctx: &Ctx) -> Vec<(String, SynValue)> {
     let body_text = ctx.body.clone();
     let body_file = ctx.body_file.clone();
-    let read_body = SynValue::Builtin(Rc::new(BuiltinTask {
-        name: "read_body".to_string(),
-        param_count: 0,
-        param_names: None,
-        func: Rc::new(move |_i, _a, _l| match &body_file {
+    let read_body = SynValue::Builtin(Rc::new(BuiltinTask::new(
+        "read_body",
+        0,
+        None,
+        Rc::new(move |_i, _a, _l| match &body_file {
             Some(bf) => Ok(syn_text(std::fs::read_to_string(bf).unwrap_or_default())),
             None => Ok(syn_text(body_text.as_str())),
         }),
-    }));
+    )));
     // read_body_bytes() → bytes crudos (NO lossy). Prefiere el temp file spilled
     // (`std::fs::read`, no `read_to_string`); para bodies en memoria usa `body_raw` (los
     // bytes exactos), no `body` (que pasó por from_utf8_lossy aguas arriba). Cierra el
     // punto lossy de read_body para binario; exactitud byte-a-byte (A4).
     let body_raw = ctx.body_raw.clone();
     let body_file_b = ctx.body_file.clone();
-    let read_body_bytes = SynValue::Builtin(Rc::new(BuiltinTask {
-        name: "read_body_bytes".to_string(),
-        param_count: 0,
-        param_names: None,
-        func: Rc::new(move |_i, _a, _l| match &body_file_b {
+    let read_body_bytes = SynValue::Builtin(Rc::new(BuiltinTask::new(
+        "read_body_bytes",
+        0,
+        None,
+        Rc::new(move |_i, _a, _l| match &body_file_b {
             Some(bf) => Ok(syn_bytes(std::fs::read(bf).unwrap_or_default())),
             None => Ok(syn_bytes(body_raw.clone())),
         }),
-    }));
+    )));
     vec![
         ("request".to_string(), build_request_syn(ctx)),
         ("query".to_string(), str_map(&ctx.query)),

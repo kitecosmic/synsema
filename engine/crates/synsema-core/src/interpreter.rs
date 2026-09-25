@@ -19,10 +19,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
+use smallvec::{smallvec, SmallVec};
 use num_complex::Complex64;
 use regex::Regex;
 
-use crate::ast::{Node, NodeKind, Param, Program};
+use crate::ast::{BinOp, Node, NodeKind, Param, Program, UnOp};
 use crate::labels::{self, label_display_raw, DeclassifyEntry, Label};
 use crate::number::{Number, MIX_DECIMAL_FLOAT};
 use crate::parser::{parse_source, CompileError};
@@ -206,6 +207,11 @@ fn control_message(c: &Control) -> String {
 // builtins
 // =========================================================
 
+/// Los argumentos de una llamada, cada uno con su nombre si es nombrado. Un `Vec` (24 bytes, sin
+/// memoria si no hay argumentos): con un `SmallVec` en línea las llamadas sin argumentos iban 5–8 %
+/// más lentas (specs/compute-rendimiento.md F1.7, medido).
+pub type CallArgs = Vec<(Option<String>, SynValue)>;
+
 pub type BuiltinFn =
     Rc<dyn Fn(&mut Interpreter, &[SynValue], &SourceLocation) -> Result<SynValue, Control>>;
 
@@ -243,6 +249,19 @@ pub fn with_fallback(base: usize, f: BuiltinFn) -> BuiltinFn {
 /// sólo el camino normal de `synsema run`; todo lo demás (tests, serve, informes) junta.
 pub static LIVE_STDOUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Modo REFERENCIA, sólo para tests: los intérpretes creados con él prendido no toman ningún
+/// atajo de ejecución (hoy `try_update_in_place`) y corren el camino de referencia. Lo usa el
+/// oráculo diferencial, que compara las dos corridas: un atajo tiene que dar exactamente lo mismo
+/// (valor, salida, errores, `steps()`). No es un knob: ni variable de entorno ni flag del CLI.
+static REFERENCE_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Prende o apaga el modo referencia para los intérpretes que se creen después (ver
+/// `REFERENCE_MODE`).
+#[doc(hidden)]
+pub fn set_reference_mode(on: bool) {
+    REFERENCE_MODE.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
 pub struct BuiltinTask {
     pub name: String,
     pub func: BuiltinFn,
@@ -251,6 +270,49 @@ pub struct BuiltinTask {
     /// aceptan args nombrados (`recall(..., from = "writer")`), mapeados a
     /// posicionales acá mismo. Los demás conservan el error de siempre.
     pub param_names: Option<Vec<&'static str>>,
+    /// Lo que cada llamada consulta del builtin, resuelto una vez al crearlo: antes se buscaba
+    /// por nombre en tablas en cada llamada (specs/compute-rendimiento.md §3.4). Lo arma
+    /// `BuiltinTask::new`, el único constructor.
+    pub meta: BuiltinMeta,
+}
+
+/// Ver `BuiltinTask::meta`. Las tablas (`BUILTIN_ARITY`, `BUILTIN_KWARGS`, `LINEAGE_SOURCES`)
+/// siguen siendo la fuente de verdad; esto es su lectura para un builtin concreto.
+#[derive(Clone, Copy, Debug)]
+pub struct BuiltinMeta {
+    /// `(mínimo, máximo)` de argumentos (ver `builtin_arity`).
+    pub arity: (usize, Option<usize>),
+    /// Argumentos nombrados que acepta sin `param_names` (`BUILTIN_KWARGS`).
+    pub kwargs: &'static [&'static str],
+    /// Lo que devuelve entra al programa desde afuera y se anota en el linaje (`LINEAGE_SOURCES`).
+    pub lineage_source: bool,
+    /// Constructor de un tipo o de una variante (`Point(…)`, `Order.paid(…)`): cuenta sus campos él.
+    pub constructor: bool,
+}
+
+impl BuiltinTask {
+    pub fn new(
+        name: impl Into<String>,
+        param_count: i32,
+        param_names: Option<Vec<&'static str>>,
+        func: BuiltinFn,
+    ) -> Self {
+        let name = name.into();
+        // La tabla `BUILTIN_ARITY` manda; si no está, un `param_count` fijo es exacto y -1 no se
+        // valida acá (el builtin lo hace).
+        let arity = match crate::builtin_arity::arity_of(&name) {
+            Some(a) => a,
+            None if param_count >= 0 => (param_count as usize, Some(param_count as usize)),
+            None => (0, None),
+        };
+        let meta = BuiltinMeta {
+            arity,
+            kwargs: crate::builtin_arity::kwargs_of(&name),
+            lineage_source: LINEAGE_SOURCES.contains(&name.as_str()),
+            constructor: name.starts_with(|c: char| c.is_ascii_uppercase()),
+        };
+        BuiltinTask { name, func, param_count, param_names, meta }
+    }
 }
 
 // =========================================================
@@ -259,24 +321,117 @@ pub struct BuiltinTask {
 
 pub struct Environment {
     pub parent: Option<Rc<RefCell<Environment>>>,
-    pub name: String,
-    pub bindings: HashMap<String, SynValue>,
+    pub name: EnvName,
+    pub bindings: Bindings,
 }
 
 impl Environment {
     pub fn root(name: &str) -> Rc<RefCell<Environment>> {
         Rc::new(RefCell::new(Environment {
             parent: None,
-            name: name.to_string(),
-            bindings: HashMap::new(),
+            name: EnvName::Owned(Rc::from(name)),
+            bindings: Bindings::default(),
         }))
     }
+    /// Un scope con identidad (`module:<ruta>`, un test, un template): el nombre se guarda.
     pub fn child(parent: &Rc<RefCell<Environment>>, name: &str) -> Rc<RefCell<Environment>> {
         Rc::new(RefCell::new(Environment {
             parent: Some(parent.clone()),
-            name: name.to_string(),
-            bindings: HashMap::new(),
+            name: EnvName::Owned(Rc::from(name)),
+            bindings: Bindings::default(),
         }))
+    }
+    /// Un scope de ejecución que nadie identifica por nombre (una llamada, una vuelta de `each`,
+    /// un brazo de `match`, un request): etiqueta fija, sin pedir memoria para el nombre.
+    pub fn child_scope(parent: &Rc<RefCell<Environment>>, kind: &'static str) -> Rc<RefCell<Environment>> {
+        Rc::new(RefCell::new(Environment {
+            parent: Some(parent.clone()),
+            name: EnvName::Static(kind),
+            bindings: Bindings::default(),
+        }))
+    }
+}
+
+/// El nombre de un scope. Antes era un `String` armado con `format!` en cada llamada y en cada
+/// vuelta de `each` (`"call:fib"`, `"each:i"`), que nadie leía (specs/compute-rendimiento.md
+/// §3.3). Sólo los módulos se identifican por nombre: `module:<ruta>` es el id estable con el que
+/// `serve` y `parallel_map` los reconstruyen en otro hilo.
+#[derive(Clone, Debug)]
+pub enum EnvName {
+    /// Scopes de ejecución: una etiqueta fija (`"call"`, `"each"`, `"match-arm"`, …).
+    Static(&'static str),
+    /// Scopes con identidad: módulos, tests, templates, forks.
+    Owned(Rc<str>),
+}
+
+impl EnvName {
+    pub fn as_str(&self) -> &str {
+        match self {
+            EnvName::Static(s) => s,
+            EnvName::Owned(s) => s,
+        }
+    }
+}
+
+impl std::ops::Deref for EnvName {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for EnvName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Las variables de un scope. Es un tipo propio y no un `HashMap` a la vista para que la
+/// representación pueda cambiar sin tocar a quienes lo usan (specs/compute-rendimiento.md §6.0:
+/// esta API es la definitiva; F2a cambia lo de adentro).
+#[derive(Default)]
+pub struct Bindings {
+    map: HashMap<String, SynValue>,
+}
+
+impl Bindings {
+    pub fn get(&self, name: &str) -> Option<&SynValue> {
+        self.map.get(name)
+    }
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut SynValue> {
+        self.map.get_mut(name)
+    }
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.map.contains_key(name)
+    }
+    /// Agrega o reemplaza con una clave ya armada (devuelve el valor anterior).
+    pub fn insert(&mut self, name: String, value: SynValue) -> Option<SynValue> {
+        self.map.insert(name, value)
+    }
+    /// Liga `name`: si ya existe, reemplaza el valor en el lugar sin crear otra clave; si no, la
+    /// agrega. Es lo que hace `let` (re-ligar en un bucle no pide memoria).
+    pub fn set(&mut self, name: &str, value: SynValue) {
+        match self.map.get_mut(name) {
+            Some(slot) => *slot = value,
+            None => {
+                self.map.insert(name.to_string(), value);
+            }
+        }
+    }
+    pub fn remove(&mut self, name: &str) -> Option<SynValue> {
+        self.map.remove(name)
+    }
+    pub fn clear(&mut self) {
+        self.map.clear()
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &SynValue)> {
+        self.map.iter()
+    }
+    pub fn keys(&self) -> impl Iterator<Item = &String> {
+        self.map.keys()
+    }
+    pub fn values(&self) -> impl Iterator<Item = &SynValue> {
+        self.map.values()
     }
 }
 
@@ -494,28 +649,32 @@ pub fn env_get(env: &Rc<RefCell<Environment>>, name: &str) -> Option<SynValue> {
 }
 
 pub(crate) fn env_set(env: &Rc<RefCell<Environment>>, name: &str, value: SynValue) {
-    env.borrow_mut().bindings.insert(name.to_string(), value);
+    env.borrow_mut().bindings.set(name, value);
 }
 
-/// Actualiza una variable existente en cualquier scope. `Err(())` si no existe.
+/// Actualiza una variable existente en cualquier scope. `Err(())` si no existe. Una búsqueda por
+/// scope y la asignación en el lugar: sin crear la clave otra vez ni hashear dos veces.
 fn env_update(env: &Rc<RefCell<Environment>>, name: &str, value: SynValue) -> Result<(), ()> {
     let mut cur = env.clone();
     loop {
-        let has = cur.borrow().bindings.contains_key(name);
-        if has {
-            let is_module = cur.borrow().name.starts_with("module:");
-            if is_module {
-                // Una exportación religada dentro del módulo: el mapa `use … as m` la sigue.
-                if let Some(m) = module_map_of_env(&cur) {
-                    if m.borrow().contains_key(name) {
-                        m.borrow_mut().insert(name.to_string(), value.clone());
+        let next = {
+            let mut e = cur.borrow_mut();
+            let Environment { parent, name: env_name, bindings } = &mut *e;
+            if let Some(slot) = bindings.get_mut(name) {
+                // Una exportación religada dentro del módulo: el mapa `use … as m` la sigue. (Sólo
+                // se mira en el scope donde está la variable.)
+                if env_name.starts_with("module:") {
+                    if let Some(m) = module_map_of_env(&cur) {
+                        if m.borrow().contains_key(name) {
+                            m.borrow_mut().insert(name.to_string(), value.clone());
+                        }
                     }
                 }
+                *slot = value;
+                return Ok(());
             }
-            cur.borrow_mut().bindings.insert(name.to_string(), value);
-            return Ok(());
-        }
-        let next = cur.borrow().parent.clone();
+            parent.clone()
+        };
         match next {
             Some(p) => cur = p,
             None => return Err(()),
@@ -949,6 +1108,8 @@ pub struct Interpreter {
     /// por construcción (cuenta trabajo del intérprete, no tiempo). Lo expone `steps()` (sin
     /// capability: introspección, como `llm_usage()`); el runtime y el wasm lo reportan.
     steps: u64,
+    /// ¿Se pueden tomar atajos de ejecución? `false` en modo referencia (ver `REFERENCE_MODE`).
+    shortcuts: bool,
     /// v0.6.20 — raíz del proyecto: el directorio del archivo de ENTRADA, límite de contención
     /// de `use "../x.syn"`. La fija el host (`set_project_root`) o, si no, se captura del primer
     /// `use` que se ejecuta (siempre el top-level de la entrada). `None` = criterio v0.6.19
@@ -1136,6 +1297,7 @@ impl Interpreter {
             live_output: false,
             program_args: Vec::new(),
             steps: 0,
+            shortcuts: !REFERENCE_MODE.load(std::sync::atomic::Ordering::SeqCst),
             project_root: None,
             stdout_hook: None,
             stdout_verdict: None,
@@ -1894,7 +2056,7 @@ impl Interpreter {
         };
         // Linaje (DATOS-17): lo que entra al programa desde afuera queda anotado por el motor.
         if let Ok(v) = &r {
-            if LINEAGE_SOURCES.contains(&bt.name.as_str()) {
+            if bt.meta.lineage_source {
                 self.record_input(&bt.name, args, v);
             }
         }
@@ -2026,12 +2188,7 @@ impl Interpreter {
     fn register(&self, name: &str, param_count: i32, func: BuiltinFn) {
         self.global_env.borrow_mut().bindings.insert(
             name.to_string(),
-            SynValue::Builtin(Rc::new(BuiltinTask {
-                name: name.to_string(),
-                func,
-                param_count,
-                param_names: None,
-            })),
+            SynValue::Builtin(Rc::new(BuiltinTask::new(name, param_count, None, func))),
         );
     }
 
@@ -2052,12 +2209,7 @@ impl Interpreter {
     ) {
         self.global_env.borrow_mut().bindings.insert(
             name.to_string(),
-            SynValue::Builtin(Rc::new(BuiltinTask {
-                name: name.to_string(),
-                func,
-                param_count: param_names.len() as i32,
-                param_names: Some(param_names),
-            })),
+            SynValue::Builtin(Rc::new(BuiltinTask::new(name, param_names.len() as i32, Some(param_names), func))),
         );
     }
 
@@ -2526,7 +2678,7 @@ impl Interpreter {
         bindings: Vec<(String, SynValue)>,
         parent: &Rc<RefCell<Environment>>,
     ) -> Result<SynValue, Control> {
-        let env = Environment::child(parent, "request");
+        let env = Environment::child_scope(parent, "request");
         {
             for (_, v) in &bindings {
                 self.harvest_principals(v);
@@ -3785,7 +3937,7 @@ impl Interpreter {
                 // válido. Resultado siempre booleano (no devuelve el operando, como
                 // Python): `x or default` NO es un idioma de Synsema.
                 // El booleano sale con la unión de las etiquetas de lo evaluado.
-                if operator == "and" {
+                if *operator == BinOp::And {
                     if !l.is_truthy() {
                         let res = syn_bool(false);
                         return if self.labels { self.join_operands(res, &l, None, loc) } else { Ok(res) };
@@ -3794,7 +3946,7 @@ impl Interpreter {
                     let res = syn_bool(r.is_truthy());
                     return if self.labels { self.join_operands(res, &l, Some(&r), loc) } else { Ok(res) };
                 }
-                if operator == "or" {
+                if *operator == BinOp::Or {
                     if l.is_truthy() {
                         let res = syn_bool(true);
                         return if self.labels { self.join_operands(res, &l, None, loc) } else { Ok(res) };
@@ -3806,7 +3958,7 @@ impl Interpreter {
                 // `x // nota`: un comentario al estilo C se lee como división entera por la
                 // variable `nota`. Si esa palabra no existe, el error lo dice (sólo con espacio
                 // después de `//`, como se escribe un comentario; la semántica de `//` no cambia).
-                if operator == "//" {
+                if *operator == BinOp::FloorDiv {
                     if let NodeKind::Identifier { .. } = &right.kind {
                         if right.location.line == loc.line && right.location.column > loc.column + 2 {
                             let r = self.exec(right, env).map_err(|c| match c {
@@ -3816,12 +3968,12 @@ impl Interpreter {
                                 }
                                 other => other,
                             })?;
-                            return self.exec_binary(l, operator, r, loc);
+                            return self.exec_binary(l, *operator, r, loc);
                         }
                     }
                 }
                 let r = self.exec(right, env)?;
-                self.exec_binary(l, operator, r, loc)
+                self.exec_binary(l, *operator, r, loc)
             }
             NodeKind::UnaryOp { operator, operand } => {
                 let v = self.exec(operand, env)?;
@@ -3832,11 +3984,11 @@ impl Interpreter {
                     if !l.is_empty() {
                         self.note_seen(&l);
                         let inner = labels::unwrap(&v).clone();
-                        let r = self.exec_unary(operator, inner, loc)?;
+                        let r = self.exec_unary(*operator, inner, loc)?;
                         return self.rewrap(r, l, loc);
                     }
                 }
-                self.exec_unary(operator, v, loc)
+                self.exec_unary(*operator, v, loc)
             }
             NodeKind::CompareChain { operands, operators } => {
                 // `a < b < c`: cada operando una vez, corte en el primer par falso. Bajo
@@ -3845,7 +3997,7 @@ impl Interpreter {
                 let mut acc: Option<SynValue> = None;
                 for (op, node) in operators.iter().zip(operands[1..].iter()) {
                     let cur = self.exec(node, env)?;
-                    let c = self.exec_binary(prev, op, cur.clone(), loc)?;
+                    let c = self.exec_binary(prev, *op, cur.clone(), loc)?;
                     let joined = match acc {
                         Some(a) if self.labels => {
                             self.join_operands(syn_bool(c.is_truthy()), &a, Some(&c), loc)?
@@ -3906,7 +4058,7 @@ impl Interpreter {
                 // lugar (v0.6.29), con P una variable o un camino `x.campo[k]`: con semántica de
                 // valor el resultado es el mismo, pero si nadie más comparte el contenedor no
                 // hace falta copiarlo: el idioma documentado pasa a ser O(1) por vuelta.
-                if !self.labels || self.pc_is_empty() {
+                if self.shortcuts && (!self.labels || self.pc_is_empty()) {
                     if let Some(v) = self.try_update_in_place(target, value, env)? {
                         return Ok(v);
                     }
@@ -3988,7 +4140,7 @@ impl Interpreter {
                 let mut result = SynValue::Nothing;
                 let mut outcome: Result<(), Control> = Ok(());
                 for item in items {
-                    let loop_env = Environment::child(env, &format!("each:{}", variable));
+                    let loop_env = Environment::child_scope(env, "each");
                     // El item lleva la etiqueta de DATOS de la colección (no la de PC, que
                     // desde la regla 2 no envuelve contenedores): un mapa dentro de una lista
                     // privada tiene que salir privado, y compartir el `Rc` es correcto acá —
@@ -4176,8 +4328,9 @@ impl Interpreter {
                         check_protected_callee(id, &func, loc)?;
                     }
                 }
-                // Evaluá cada arg preservando su `name` (named vs posicional).
-                let mut args = Vec::with_capacity(arguments.len());
+                // Evaluá cada arg preservando su `name` (named vs posicional). Hasta 4 sin
+                // pedir memoria (`CallArgs`).
+                let mut args = CallArgs::with_capacity(arguments.len());
                 for arg in arguments {
                     let val = self.exec(&arg.value, env)?;
                     args.push((arg.name.clone(), val));
@@ -4198,7 +4351,7 @@ impl Interpreter {
                     self.arg_literals = mask;
                 }
                 check_call_arity(&func, &args, loc)?;
-                self.call_value_named(func, args, loc)
+                self.call_value_named(func, &mut args, loc)
             }
             NodeKind::LambdaExpression { parameters, body } => {
                 // Una lambda es un task anónimo cuyo cuerpo es un `give <expr>`
@@ -4415,12 +4568,7 @@ impl Interpreter {
                 env_set(
                     env,
                     name,
-                    SynValue::Builtin(Rc::new(BuiltinTask {
-                        name: name.clone(),
-                        func,
-                        param_count: count,
-                        param_names: None,
-                    })),
+                    SynValue::Builtin(Rc::new(BuiltinTask::new(name.clone(), count, None, func))),
                 );
                 Ok(SynValue::Nothing)
             }
@@ -4465,12 +4613,7 @@ impl Interpreter {
                         });
                         namespace.insert(
                             variant_name.clone(),
-                            SynValue::Builtin(Rc::new(BuiltinTask {
-                                name: qualified.clone(),
-                                func,
-                                param_count: count,
-                                param_names: None,
-                            })),
+                            SynValue::Builtin(Rc::new(BuiltinTask::new(qualified.clone(), count, None, func))),
                         );
                     }
                 }
@@ -4690,7 +4833,7 @@ impl Interpreter {
                 // DENEGADAS (el hook vacía el CapabilitySet; `require` es no-op). Se
                 // restaura al salir, también en el camino de error. El `print` no está
                 // gateado, así que el sandbox puede computar y devolver un valor.
-                let sandbox_env = Environment::child(env, "sandbox");
+                let sandbox_env = Environment::child_scope(env, "sandbox");
                 self.sandbox_depth += 1;
                 if let Some(hook) = self.sandbox_hook.clone() {
                     hook(true);
@@ -4717,7 +4860,7 @@ impl Interpreter {
                     )));
                 };
                 hook(Some(&caps_val)).map_err(|m| Control::Error(RuntimeError::at(m, loc.clone())))?;
-                let sandbox_env = Environment::child(env, "sandbox");
+                let sandbox_env = Environment::child_scope(env, "sandbox");
                 self.sandbox_depth += 1;
                 let result = self.exec_block(body, &sandbox_env);
                 // Se desapila también en el camino de error: un techo de bloque jamás
@@ -5079,7 +5222,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     }
                     Err(Control::Error(e)) => {
                         let msg = strip_loc_prefix(&e.to_string());
-                        let recover_env = Environment::child(env, "recover");
+                        let recover_env = Environment::child_scope(env, "recover");
                         let mut ev = syn_text(msg);
                         if let Some(l) = &try_seen {
                             ev = labels::mark(ev, l.clone());
@@ -5234,7 +5377,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 };
                 // Los binders viven en un Environment HIJO scopeado al arm; el
                 // guard se evalúa con ellos en scope. bajo PC salen etiquetados.
-                let arm_env = Environment::child(env, "match-arm");
+                let arm_env = Environment::child_scope(env, "match-arm");
                 let pushed = self.labels && !extra.is_empty();
                 if pushed {
                     self.pc_push(&extra);
@@ -5331,16 +5474,15 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     /// Operadores unarios sobre un valor ya evaluado (y desenvuelto, T5).
-    fn exec_unary(&mut self, operator: &str, v: SynValue, loc: &SourceLocation) -> Result<SynValue, Control> {
+    fn exec_unary(&mut self, operator: UnOp, v: SynValue, loc: &SourceLocation) -> Result<SynValue, Control> {
         match operator {
-            "-" => match &v {
+            UnOp::Neg => match &v {
                 SynValue::Number(n) => Ok(syn_number(n.neg())),
                 SynValue::Complex(z) => Ok(SynValue::Complex(-z)),
                 SynValue::Array(a) => Ok(crate::arrays::negate(a)),
                 _ => Err(err_at(format!("Cannot negate {}", v.type_name()), loc)),
             },
-            "not" => Ok(syn_bool(!v.is_truthy())),
-            other => Err(err_at(format!("Unknown unary operator: {}", other), loc)),
+            UnOp::Not => Ok(syn_bool(!v.is_truthy())),
         }
     }
 
@@ -5367,7 +5509,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     fn exec_binary(
         &mut self,
         left: SynValue,
-        op: &str,
+        op: BinOp,
         right: SynValue,
         loc: &SourceLocation,
     ) -> Result<SynValue, Control> {
@@ -5386,21 +5528,21 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     fn exec_binary_plain(
         &mut self,
         left: SynValue,
-        op: &str,
+        op: BinOp,
         right: SynValue,
         loc: &SourceLocation,
     ) -> Result<SynValue, Control> {
         // Lógicos: el cortocircuito vive en `exec` (BinaryOp); acá sólo llega un
         // `and`/`or` ya evaluado por ambos lados (callers internos).
-        if op == "and" {
+        if op == BinOp::And {
             return Ok(syn_bool(left.is_truthy() && right.is_truthy()));
         }
-        if op == "or" {
+        if op == BinOp::Or {
             return Ok(syn_bool(left.is_truthy() || right.is_truthy()));
         }
         // `x in xs` / `x not in xs` (v0.6.29): pertenencia en lista, clave de mapa,
         // subtexto o subsecuencia de bytes — la misma igualdad que `contains`.
-        if op == "in" || op == "not in" {
+        if matches!(op, BinOp::In | BinOp::NotIn) {
             if let (SynValue::Text(_), other) = (&right, &left) {
                 if !matches!(other, SynValue::Text(_)) {
                     return Err(err_at(
@@ -5431,27 +5573,27 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         break;
                     }
                 }
-                return Ok(syn_bool(if op == "in" { found } else { !found }));
+                return Ok(syn_bool(if op == BinOp::In { found } else { !found }));
             }
             let found = self.b_contains(&[right, left], loc)?.is_truthy();
-            return Ok(syn_bool(if op == "in" { found } else { !found }));
+            return Ok(syn_bool(if op == BinOp::In { found } else { !found }));
         }
         // Hueco de un template con backticks: el texto de cualquier valor, como el f-string de
         // Python (`xs={xs}` → "xs=[1, 2]"). Un secret sigue por `+` (queda secret y redactado).
-        let op = if op == crate::ast::INTERP_CONCAT {
+        let op = if op == BinOp::InterpConcat {
             if let SynValue::Text(l) = &left {
                 if !matches!(right, SynValue::Text(_) | SynValue::Secret(_)) {
                     return Ok(syn_text(format!("{}{}", l, right)));
                 }
             }
-            "+"
+            BinOp::Add
         } else {
             op
         };
         // Concatenación de texto: un operando texto coerciona al otro si es un escalar
         // (número, bool). `nothing`, listas, mapas y bytes son error (v0.6.29): pegarlos
         // en silencio daba "xnothing" o un repr que nadie quería.
-        if op == "+" {
+        if op == BinOp::Add {
             if matches!(left, SynValue::Text(_)) != matches!(right, SynValue::Text(_)) {
                 let other = if matches!(left, SynValue::Text(_)) { &right } else { &left };
                 if matches!(
@@ -5505,22 +5647,22 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // complex64 (Number→real, promoción). Va DESPUÉS de los concats de Text/List/Bytes
         // (un `Complex + Text` sigue siendo concat de texto vía Display) y ANTES del camino
         // de Number (G2: el tower no se perturba). Sólo +,-,*,/,**; otros ops caen al error.
-        if matches!(op, "+" | "-" | "*" | "/" | "**")
+        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Pow)
             && (matches!(left, SynValue::Complex(_)) || matches!(right, SynValue::Complex(_)))
         {
             if let (Some(a), Some(b)) = (as_complex(&left), as_complex(&right)) {
                 let z = match op {
-                    "+" => a + b,
-                    "-" => a - b,
-                    "*" => a * b,
-                    "/" => {
+                    BinOp::Add => a + b,
+                    BinOp::Sub => a - b,
+                    BinOp::Mul => a * b,
+                    BinOp::Div => {
                         if b.re == 0.0 && b.im == 0.0 {
                             return Err(err_at("Division by zero", loc));
                         }
                         a / b
                     }
                     // Exponente entero → potencia EXACTA (powi), como Python; si no, powc.
-                    "**" => crate::math::complex_pow(a, &right, b),
+                    BinOp::Pow => crate::math::complex_pow(a, &right, b),
                     _ => unreachable!(),
                 };
                 return Ok(SynValue::Complex(z));
@@ -5531,14 +5673,14 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // matmul/dot). Va DESPUÉS de los concats de Text/List/Bytes y de la rama Complex,
         // y ANTES del camino Number (G2: el tower no se perturba). `array_binop` devuelve
         // none si ningún operando es array → sigue al camino normal.
-        if matches!(op, "+" | "-" | "*" | "/" | "**" | "//" | "%") {
-            if let Some(res) = crate::arrays::array_binop(&left, &right, op) {
+        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Pow | BinOp::FloorDiv | BinOp::Mod) {
+            if let Some(res) = crate::arrays::array_binop(&left, &right, op.as_str()) {
                 return res;
             }
         }
         // Fechas, instantes y duraciones (v0.6.29).
-        if matches!(op, "+" | "-" | "*" | "/") {
-            if let Some(r) = crate::temporal::binop(&left, op, &right) {
+        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
+            if let Some(r) = crate::temporal::binop(&left, op.as_str(), &right) {
                 return r;
             }
         }
@@ -5546,10 +5688,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // claro. Int/Big mezclan libremente con ambos.
         if let (SynValue::Number(a), SynValue::Number(b)) = (&left, &right) {
             match op {
-                "+" => return a.checked_add(b).map(syn_number).map_err(|e| err_at(e, loc)),
-                "-" => return a.checked_sub(b).map(syn_number).map_err(|e| err_at(e, loc)),
-                "*" => return a.checked_mul(b).map(syn_number).map_err(|e| err_at(e, loc)),
-                "/" => {
+                BinOp::Add => return a.checked_add(b).map(syn_number).map_err(|e| err_at(e, loc)),
+                BinOp::Sub => return a.checked_sub(b).map(syn_number).map_err(|e| err_at(e, loc)),
+                BinOp::Mul => return a.checked_mul(b).map(syn_number).map_err(|e| err_at(e, loc)),
+                BinOp::Div => {
                     if Number::mixes_decimal_float(a, b) {
                         return Err(err_at(MIX_DECIMAL_FLOAT, loc));
                     }
@@ -5558,21 +5700,21 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     }
                     return Ok(syn_number(a.div(b)));
                 }
-                "%" => {
+                BinOp::Mod => {
                     return match a.checked_modulo(b) {
                         Err(e) => Err(err_at(e, loc)),
                         Ok(Some(n)) => Ok(syn_number(n)),
                         Ok(None) => Err(err_at("Modulo by zero", loc)),
                     }
                 }
-                "//" => {
+                BinOp::FloorDiv => {
                     return match a.checked_floor_div(b) {
                         Err(e) => Err(err_at(e, loc)),
                         Ok(Some(n)) => Ok(syn_number(n)),
                         Ok(None) => Err(err_at("Division by zero", loc)),
                     }
                 }
-                "**" => {
+                BinOp::Pow => {
                     if a.is_zero() && b.is_negative() {
                         return Err(err_at("Zero cannot be raised to a negative power", loc));
                     }
@@ -5586,12 +5728,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // [1.0]`); lo mismo `in`, `match`, `contains` e `index_of` (`strict_equals`, una sola
         // pasada que corta en la primera diferencia). Las claves internas de hash
         // (`group_by`, `unique`, …) siguen usando la igualdad total de `probe_key`.
-        if matches!(op, "==" | "!=") {
+        if matches!(op, BinOp::Eq | BinOp::Ne) {
             let eq = crate::tabular::strict_equals(&left, &right).map_err(|_| err_at(MIX_DECIMAL_FLOAT, loc))?;
-            return Ok(syn_bool(if op == "==" { eq } else { !eq }));
+            return Ok(syn_bool(if op == BinOp::Eq { eq } else { !eq }));
         }
         // Orden
-        if matches!(op, "<" | ">" | "<=" | ">=") {
+        if matches!(op, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge) {
             // Los complejos NO son ordenables (G3): error claro, como Python.
             if matches!(left, SynValue::Complex(_)) || matches!(right, SynValue::Complex(_)) {
                 return Err(err_at("complex numbers are not ordered", loc));
@@ -5619,7 +5761,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 };
             }
         }
-        let hint = if op == "%" && matches!(left, SynValue::Text(_)) {
+        let hint = if op == BinOp::Mod && matches!(left, SynValue::Text(_)) {
             " — there is no %-formatting: use a template `…{x}…` or fmt(template, {name: value})"
         } else {
             ""
@@ -6013,6 +6155,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// antes sólo si otro lo comparte) en vez de construir uno nuevo. El orden es el del camino
     /// normal: se lee P, después se evalúan los argumentos; si eso religó P, el resultado sale
     /// de la P leída y se asigna como siempre. `None` si la sentencia no tiene esa forma.
+    ///
+    /// Es un atajo: lo observable tiene que ser idéntico al camino de referencia, `steps()`
+    /// incluido (specs/compute-rendimiento.md §3.6). Si no aplica, no deja rastro (ni pasos ni
+    /// asignaciones); si aplica, los pasos quedan como los habría contado la referencia: el nodo
+    /// del valor y el identificador de la función, los nodos de P una vez, los argumentos y lo que
+    /// `exec_set` evalúa del destino.
     fn try_update_in_place(
         &mut self,
         target: &Node,
@@ -6024,11 +6172,19 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
         #[derive(Clone, Copy, PartialEq)]
         enum Op { Append, Concat, Insert, Merge }
+        /// Los argumentos que siguen a P, sin juntarlos en un `Vec` antes de saber si el atajo
+        /// aplica.
+        enum Rest<'a> {
+            Args(&'a [crate::ast::Arg]),
+            One(&'a Node),
+        }
         let builtin_is = |this: &Self, name: &str| {
             let _ = this;
             matches!(env_get(env, name), Some(SynValue::Builtin(b)) if b.name == name)
         };
-        let (op, rest): (Op, Vec<&Node>) = match &value.kind {
+        // `overhead`: los nodos que la referencia evalúa antes de P y el atajo no (la llamada y
+        // el identificador de la función, o el `+`).
+        let (op, rest, overhead): (Op, Rest, u64) = match &value.kind {
             NodeKind::TaskCall { name, arguments }
                 if !arguments.is_empty()
                     && arguments.iter().all(|a| a.name.is_none())
@@ -6044,29 +6200,45 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 if !builtin_is(self, name.as_identifier().unwrap_or("")) {
                     return Ok(None);
                 }
-                (op, arguments[1..].iter().map(|a| &a.value).collect())
+                (op, Rest::Args(&arguments[1..]), 2)
             }
-            NodeKind::BinaryOp { left, operator, right } if operator == "+" && same_place(left, target) => {
-                (Op::Concat, vec![right.as_ref()])
+            NodeKind::BinaryOp { left, operator, right } if *operator == BinOp::Add && same_place(left, target) => {
+                (Op::Concat, Rest::One(right.as_ref()), 1)
             }
             _ => return Ok(None),
         };
-        // Leer P. Si no se puede (clave que falta) o no es del tipo, camino normal.
+        let s0 = self.steps;
+        // Leer P. Si no se puede (clave que falta) o no es del tipo, camino normal, y sin rastro:
+        // lo que esta lectura contó no lo cuenta la referencia (`set i to i + 1` contaba un paso
+        // de más).
         let before = match self.exec(target, env) {
             Ok(v) => v,
-            Err(_) => return Ok(None),
+            Err(_) => {
+                self.steps = s0;
+                return Ok(None);
+            }
         };
+        let place_steps = self.steps.wrapping_sub(s0);
         let fits = match (&before, op) {
             (SynValue::List(_), Op::Append | Op::Concat | Op::Insert) => true,
             (SynValue::Map(_), Op::Merge) => true,
             _ => false,
         };
         if !fits {
+            self.steps = s0;
             return Ok(None);
         }
-        let mut args = Vec::with_capacity(rest.len());
-        for n in &rest {
-            args.push(self.exec(n, env)?);
+        // Desde acá el atajo corre y los pasos siguen a la referencia, que evalúa el nodo del
+        // valor (y el de la función) antes que P.
+        self.steps = s0.wrapping_add(overhead).wrapping_add(place_steps);
+        let mut args = Vec::new();
+        match rest {
+            Rest::Args(a) => {
+                for x in a {
+                    args.push(self.exec(&x.value, env)?);
+                }
+            }
+            Rest::One(n) => args.push(self.exec(n, env)?),
         }
         // Con etiquetas encendidas (y PC vacío, lo chequeó el llamador) sólo si nada de lo
         // que entra está etiquetado: entonces el camino normal tampoco etiqueta nada.
@@ -6077,15 +6249,17 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             return self.exec_set(target, v, env, &target.location, false).map(Some);
         }
         if op == Op::Concat && !matches!(args[0], SynValue::List(_)) {
-            let v = self.exec_binary(before, "+", args.pop().unwrap(), &value.location)?;
+            let v = self.exec_binary(before, BinOp::Add, args.pop().unwrap(), &value.location)?;
             return self.exec_set(target, v, env, &target.location, false).map(Some);
         }
         // ¿Sigue ahí el MISMO contenedor? Si los argumentos religaron P, el resultado es el
-        // de la P leída.
+        // de la P leída. (Esta segunda lectura no existe en la referencia: no cuenta.)
+        let before_check = self.steps;
         let same = match self.exec(target, env) {
             Ok(now) => same_container(&now, &before),
             Err(_) => false,
         };
+        self.steps = before_check;
         if !same {
             let mut all = vec![before];
             all.extend(args);
@@ -6113,6 +6287,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 (SynValue::Map(rc), Op::Merge) => {
                     for (n, a) in args.iter().enumerate() {
                         if !matches!(a, SynValue::Map(_)) {
+                            // El mismo error que el builtin (`b_merge`), con la ubicación de la llamada.
                             return Err(err_at(
                                 format!("merge(): argument {} is {}, not a map", n + 2, a.type_name()),
                                 &loc,
@@ -6132,7 +6307,15 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             }
             Ok(slot.clone())
         };
-        self.with_unique_place(target, env, apply).map(Some)
+        // `with_unique_place` recorre el destino como `exec_set` (mismos pasos). Si la operación
+        // falla (posición de `insert` fuera de rango, `merge` con algo que no es mapa), en la
+        // referencia el error sale del builtin, antes de asignar: esos pasos no se cuentan.
+        let before_set = self.steps;
+        let r = self.with_unique_place(target, env, apply);
+        if r.is_err() {
+            self.steps = before_set;
+        }
+        r.map(Some)
     }
 
     /// El builtin del camino rápido, por el camino normal (una copia nueva, con el mismo
@@ -6149,7 +6332,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             1 => {
                 let r = all.pop().unwrap_or(SynValue::Nothing);
                 let l = all.pop().unwrap_or(SynValue::Nothing);
-                return self.exec_binary(l, "+", r, loc);
+                return self.exec_binary(l, BinOp::Add, r, loc);
             }
             2 => "insert",
             _ => "merge",
@@ -6224,7 +6407,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 check_protected_callee(id, &func, loc)?;
             }
         }
-        let mut args = Vec::with_capacity(arguments.len() + 1);
+        let mut args = CallArgs::with_capacity(arguments.len() + 1);
         args.push((None, first));
         for arg in arguments {
             let val = self.exec(&arg.value, env)?;
@@ -6240,7 +6423,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             self.arg_literals = mask;
         }
         check_call_arity(&func, &args, loc)?;
-        self.call_value_named(func, args, loc)
+        self.call_value_named(func, &mut args, loc)
     }
 
     /// Llamada con args sólo posicionales (camino de siempre: pipes, apply/where,
@@ -6252,16 +6435,17 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         args: Vec<SynValue>,
         loc: &SourceLocation,
     ) -> Result<SynValue, Control> {
-        let named = args.into_iter().map(|v| (None, v)).collect();
-        self.call_value_named(func, named, loc)
+        let mut named: CallArgs = args.into_iter().map(|v| (None, v)).collect();
+        self.call_value_named(func, &mut named, loc)
     }
 
     /// Llamada con args posicionales y/o nombrados (Batch 2). Lleva el tracking de
     /// recursión; el binding lo hace `call_value_named_inner`.
+    /// `args` va por referencia y se consume (queda vacía).
     fn call_value_named(
         &mut self,
         func: SynValue,
-        args: Vec<(Option<String>, SynValue)>,
+        args: &mut CallArgs,
         loc: &SourceLocation,
     ) -> Result<SynValue, Control> {
         self.recursion_depth += 1;
@@ -6277,7 +6461,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     fn call_value_named_inner(
         &mut self,
         func: SynValue,
-        args: Vec<(Option<String>, SynValue)>,
+        args: &mut CallArgs,
         loc: &SourceLocation,
     ) -> Result<SynValue, Control> {
         match func {
@@ -6289,10 +6473,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 // (sintaxis nueva, G3) y el camino posicional queda intacto.
                 match &bt.param_names {
                     Some(names) => {
-                        let mut slots: Vec<Option<SynValue>> = vec![None; names.len()];
+                        let mut slots: SmallVec<[Option<SynValue>; 4]> = smallvec![None; names.len()];
                         let mut seen_named = false;
                         let mut pos_idx = 0usize;
-                        for (name, value) in args {
+                        for (name, value) in args.drain(..) {
                             match name {
                                 None => {
                                     if seen_named {
@@ -6328,17 +6512,17 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                                 }
                             }
                         }
-                        let pos: Vec<SynValue> = slots
+                        let pos: SmallVec<[SynValue; 4]> = slots
                             .into_iter()
                             .map(|s| s.unwrap_or(SynValue::Nothing))
                             .collect();
                         self.dispatch_builtin(&bt, &pos, loc)
                     }
                     None => {
-                        let mut pos = Vec::with_capacity(args.len());
-                        let allowed = crate::builtin_arity::kwargs_of(&bt.name);
+                        let mut pos: SmallVec<[SynValue; 4]> = SmallVec::with_capacity(args.len());
+                        let allowed = bt.meta.kwargs;
                         let mut kw: IndexMap<String, SynValue> = IndexMap::new();
-                        for (name, v) in args {
+                        for (name, v) in args.drain(..) {
                             if let Some(n) = name {
                                 if allowed.contains(&n.as_str()) {
                                     if kw.insert(n.clone(), v).is_some() {
@@ -6375,59 +6559,77 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
             }
             SynValue::Task(task) => {
-                let call_env = Environment::child(&task.closure_env, &format!("call:{}", task.name));
+                let call_env = Environment::child_scope(&task.closure_env, "call");
                 let nparams = task.parameters.len();
-                // Repartición: cada slot de param recibe a lo sumo un valor.
-                let mut slots: Vec<Option<SynValue>> = vec![None; nparams];
-                let mut seen_named = false;
-                let mut pos_idx = 0usize;
-                for (name, value) in args {
-                    match name {
-                        None => {
-                            // Posicional tras nombrado → error (sintaxis nueva, G3).
-                            if seen_named {
-                                return Err(err_at(
-                                    "positional argument after named argument",
-                                    loc,
-                                ));
-                            }
-                            // Aridad permisiva (G3): un posicional extra se descarta,
-                            // igual que antes (no es error).
-                            if pos_idx < nparams {
-                                slots[pos_idx] = Some(value);
-                            }
-                            pos_idx += 1;
-                        }
-                        Some(n) => {
-                            seen_named = true;
-                            match task.parameters.iter().position(|p| p.name == n) {
-                                Some(idx) => {
-                                    if slots[idx].is_some() {
-                                        return Err(err_at(
-                                            format!("duplicate argument '{}'", n),
-                                            loc,
-                                        ));
-                                    }
-                                    slots[idx] = Some(value);
+                if args.iter().all(|(n, _)| n.is_none()) {
+                    // Todos posicionales (el caso común): el i-ésimo argumento es el i-ésimo
+                    // parámetro, sin repartir en slots (F1.7). Los de más (aridad permisiva, G3)
+                    // se sueltan antes de evaluar defaults, igual que en el reparto de abajo.
+                    args.truncate(nparams);
+                    let mut given = args.drain(..);
+                    for param in task.parameters.iter() {
+                        let v = match given.next() {
+                            Some((_, v)) => v,
+                            None => match &param.default {
+                                Some(default_node) => self.exec(default_node, &task.closure_env)?,
+                                None => SynValue::Nothing,
+                            },
+                        };
+                        env_set(&call_env, &param.name, v);
+                    }
+                } else {
+                    // Repartición: cada slot de param recibe a lo sumo un valor.
+                    let mut slots: Vec<Option<SynValue>> = vec![None; nparams];
+                    let mut seen_named = false;
+                    let mut pos_idx = 0usize;
+                    for (name, value) in args.drain(..) {
+                        match name {
+                            None => {
+                                // Posicional tras nombrado → error (sintaxis nueva, G3).
+                                if seen_named {
+                                    return Err(err_at(
+                                        "positional argument after named argument",
+                                        loc,
+                                    ));
                                 }
-                                None => {
-                                    return Err(err_at(format!("unknown parameter '{}'", n), loc))
+                                // Aridad permisiva (G3): un posicional extra se descarta,
+                                // igual que antes (no es error).
+                                if pos_idx < nparams {
+                                    slots[pos_idx] = Some(value);
+                                }
+                                pos_idx += 1;
+                            }
+                            Some(n) => {
+                                seen_named = true;
+                                match task.parameters.iter().position(|p| p.name == n) {
+                                    Some(idx) => {
+                                        if slots[idx].is_some() {
+                                            return Err(err_at(
+                                                format!("duplicate argument '{}'", n),
+                                                loc,
+                                            ));
+                                        }
+                                        slots[idx] = Some(value);
+                                    }
+                                    None => {
+                                        return Err(err_at(format!("unknown parameter '{}'", n), loc))
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                // Llená cada param: valor recibido, o default (eval en call time en el
-                // closure_env, G5), o `nothing` (aridad permisiva, G3).
-                for (i, param) in task.parameters.iter().enumerate() {
-                    let v = match slots[i].take() {
-                        Some(v) => v,
-                        None => match &param.default {
-                            Some(default_node) => self.exec(default_node, &task.closure_env)?,
-                            None => SynValue::Nothing,
-                        },
-                    };
-                    env_set(&call_env, &param.name, v);
+                    // Llená cada param: valor recibido, o default (eval en call time en el
+                    // closure_env, G5), o `nothing` (aridad permisiva, G3).
+                    for (i, param) in task.parameters.iter().enumerate() {
+                        let v = match slots[i].take() {
+                            Some(v) => v,
+                            None => match &param.default {
+                                Some(default_node) => self.exec(default_node, &task.closure_env)?,
+                                None => SynValue::Nothing,
+                            },
+                        };
+                        env_set(&call_env, &param.name, v);
+                    }
                 }
                 // T5 (regla 1.b) — la tinta de continuación del LLAMADOR VIAJA con la llamada.
                 // Vaciarla al entrar (lo que se hacía hasta la ronda 4) era la puerta más grande
@@ -7213,9 +7415,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     /// `merge(a, b, …)` → un mapa nuevo; ante la misma clave gana el de más a la derecha.
-    fn b_merge(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
+    fn b_merge(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         if args.is_empty() {
-            return Err(err("merge() needs at least one map"));
+            return Err(err_at("merge() needs at least one map", loc));
         }
         let mut out: IndexMap<String, SynValue> = IndexMap::new();
         for (i, a) in args.iter().enumerate() {
@@ -7226,7 +7428,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     }
                 }
                 other => {
-                    return Err(err(format!("merge(): argument {} is {}, not a map", i + 1, other.type_name())))
+                    return Err(err_at(format!("merge(): argument {} is {}, not a map", i + 1, other.type_name()), loc))
                 }
             }
         }
@@ -7999,11 +8201,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// (binding + defaults + give-unwrap ya existentes). NO toca `apply`.
     fn b_call(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         let func = nth(args, 0)?.clone();
-        let named: Vec<(Option<String>, SynValue)> = match nth(args, 1)? {
+        let mut named: CallArgs = match nth(args, 1)? {
             SynValue::Map(m) => {
                 m.borrow().iter().map(|(k, v)| (Some(k.clone()), v.clone())).collect()
             }
-            SynValue::Nothing => Vec::new(),
+            SynValue::Nothing => CallArgs::new(),
             other => {
                 return Err(err_at(
                     format!("call expects a map of named args, got {}", other.type_name()),
@@ -8011,7 +8213,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 ))
             }
         };
-        self.call_value_named(func, named, loc)
+        self.call_value_named(func, &mut named, loc)
     }
 
     /// `call_tool(task, args_map)` — despacha `task` COMO TOOL: igual que `call`, pero
@@ -8022,11 +8224,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     /// `tool_scope_hook` cableado → corre con las caps ambientes (no-op).
     fn b_call_tool(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         let func = nth(args, 0)?.clone();
-        let named: Vec<(Option<String>, SynValue)> = match nth(args, 1)? {
+        let mut named: CallArgs = match nth(args, 1)? {
             SynValue::Map(m) => {
                 m.borrow().iter().map(|(k, v)| (Some(k.clone()), v.clone())).collect()
             }
-            SynValue::Nothing => Vec::new(),
+            SynValue::Nothing => CallArgs::new(),
             other => {
                 return Err(err_at(
                     format!("call_tool expects a map of named args, got {}", other.type_name()),
@@ -8048,7 +8250,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // required_capabilities) sea no-op y no pueda auto-concederse caps (espejo del
         // sandbox). Decremento garantizado (también si el cuerpo falla).
         self.tool_scope_depth += 1;
-        let result = self.call_value_named(func, named, loc);
+        let result = self.call_value_named(func, &mut named, loc);
         self.tool_scope_depth -= 1;
         if let Some(hook) = self.tool_scope_hook.clone() {
             hook(false, &[]);
@@ -8982,12 +9184,13 @@ fn check_call_arity(
     match func {
         SynValue::Task(t) => {
             let np = t.parameters.len();
-            let who = if t.name == "<lambda>" { "this lambda".to_string() } else { format!("task '{}'", t.name) };
+            // Sólo para el mensaje: se arma cuando hay error, no en cada llamada.
+            let who = || if t.name == "<lambda>" { "this lambda".to_string() } else { format!("task '{}'", t.name) };
             if positional > np {
                 return Err(err_at(
                     format!(
                         "{} takes {} argument{}, got {}",
-                        who,
+                        who(),
                         np,
                         if np == 1 { "" } else { "s" },
                         positional
@@ -9001,7 +9204,7 @@ fn check_call_arity(
                     return Err(err_at(
                         format!(
                             "{} is missing argument '{}' — pass it, or give the parameter a default in the task: {} = …",
-                            who, p.name, p.name
+                            who(), p.name, p.name
                         ),
                         loc,
                     ));
@@ -9011,7 +9214,7 @@ fn check_call_arity(
         }
         // El constructor de un tipo o de una variante (`Point(…)`, `Order.paid(…)`) cuenta
         // sus campos él mismo, con un mensaje que nombra el tipo.
-        SynValue::Builtin(b) if b.name.starts_with(|c: char| c.is_ascii_uppercase()) => Ok(()),
+        SynValue::Builtin(b) if b.meta.constructor => Ok(()),
         SynValue::Builtin(b) => {
             let (min, max) = builtin_arity(b);
             let n = match &b.param_names {
@@ -9064,14 +9267,7 @@ fn check_call_arity(
 /// `(mínimo, máximo)` de argumentos de un builtin: la tabla `BUILTIN_ARITY` manda; si
 /// no está, un `param_count` fijo es exacto y -1 no se valida acá (el builtin lo hace).
 fn builtin_arity(b: &BuiltinTask) -> (usize, Option<usize>) {
-    if let Some((min, max)) = crate::builtin_arity::arity_of(&b.name) {
-        return (min, max);
-    }
-    if b.param_count >= 0 {
-        (b.param_count as usize, Some(b.param_count as usize))
-    } else {
-        (0, None)
-    }
+    b.meta.arity
 }
 
 /// Texto → entero exacto: decimal con signo opcional (`_` sólo entre dígitos) o
@@ -9205,14 +9401,14 @@ fn py_slice_range(len: usize, start: i64, end: Option<i64>) -> (usize, usize) {
     }
 }
 
-fn ord_op(ord: Option<Ordering>, op: &str) -> bool {
+fn ord_op(ord: Option<Ordering>, op: BinOp) -> bool {
     match ord {
         None => false, // NaN
         Some(o) => match op {
-            "<" => o == Ordering::Less,
-            ">" => o == Ordering::Greater,
-            "<=" => o != Ordering::Greater,
-            ">=" => o != Ordering::Less,
+            BinOp::Lt => o == Ordering::Less,
+            BinOp::Gt => o == Ordering::Greater,
+            BinOp::Le => o != Ordering::Greater,
+            BinOp::Ge => o != Ordering::Less,
             _ => false,
         },
     }
@@ -9657,7 +9853,7 @@ mod drop_tests {
         {
             // Replica lo que hace run_request_block: child env + una task que cierra
             // sobre él (lo que produciría un `define task` dentro del handler).
-            let env = Environment::child(&interp.global_env, "request");
+            let env = Environment::child_scope(&interp.global_env, "request");
             let task = SynValue::Task(Rc::new(SynTaskValue {
                 name: "t".to_string(),
                 parameters: vec![],

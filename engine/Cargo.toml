@@ -276,6 +276,10 @@ p521 = { version = "0.13", default-features = false, features = ["ecdh", "std"] 
 p384 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 x509-parser = { version = "0.18", default-features = false }
 hkdf = "0.12"
+# Los argumentos de una llamada sin pedir memoria para los primeros 4 (core, F1.7 de
+# specs/compute-rendimiento.md). YA estaba en el árbol (kurbo/hyper vía stdlib, también en los
+# builds wasm): directa no agrega crate. Puro Rust, sin `*-sys`.
+smallvec = "1"
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 scrypt = { version = "0.11", default-features = false }
 aes = "0.8"
