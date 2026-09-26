@@ -186,6 +186,27 @@ pub fn resolve_block(stmts: &[Node]) -> Resolution {
     Resolution { scopes, units, accesses, loops, opened }
 }
 
+/// Resuelve el cuerpo de una task o lambda por sí solo (sin el programa donde se definió): su
+/// scope de llamada es la raíz estática y todo lo de afuera queda `Free` (se busca por nombre,
+/// que siempre es correcto). Es lo que usa la VM para una task que definió el tree-walker.
+/// `body` ya viene sin los `require` del tope (los sacó `exec_task_definition`).
+pub fn resolve_function(params: &[Arc<str>], body: &[Node]) -> (Resolution, ScopeId) {
+    let mut c = Collector::default();
+    c.units.push(Unit { kind: UnitKind::Task, node: 0, scope: Some(0) });
+    let s = c.new_scope(ScopeKind::Call, None, 0);
+    for p in params {
+        c.bind(Some(s), p);
+    }
+    c.block(body, Some(s), 0);
+    let Collector { scopes, units, opened } = c;
+    let mut r = Resolver { scopes, opened: &opened, accesses: Vec::new(), loops: Vec::new(), defs: Vec::new() };
+    r.push(s, distinct(params.iter().map(|p| &**p)));
+    r.block(body, Some(s));
+    r.pop();
+    let Resolver { scopes, accesses, loops, .. } = r;
+    (Resolution { scopes, units, accesses, loops, opened }, s)
+}
+
 // ---------------------------------------------------------------------------------------------
 // Pase 1: los scopes, qué nombres puede ligar cada uno y qué escapa.
 // ---------------------------------------------------------------------------------------------

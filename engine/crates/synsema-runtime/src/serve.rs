@@ -913,6 +913,7 @@ fn rebuild_global_val(
                 closure_env: closure_target.clone(),
                 origin: None,
                 required_capabilities: required_capabilities.clone(),
+                code: Default::default(),
             }))
         }
         GlobalVal::Module { id, is_alias, alias, env } => {

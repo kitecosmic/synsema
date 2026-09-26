@@ -1,0 +1,9 @@
+-- `set` a una variable que no existe, en código compilado: el error sin ubicación, como la
+-- referencia.
+task f(a)
+    when a > 2
+        set zzz to a + 1
+    give a
+print(f(1))
+print(f(2))
+print(f(3))

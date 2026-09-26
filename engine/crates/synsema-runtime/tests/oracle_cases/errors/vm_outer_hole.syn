@@ -1,0 +1,9 @@
+-- Una task anidada lee una variable de afuera que quedó en un hueco (la rama no corrió).
+task outer(flag)
+    when flag
+        let hidden be 1
+    task inner()
+        give hidden + 1
+    give inner() + inner()
+print(outer(true))
+print(outer(false))

@@ -208,6 +208,32 @@ fn err_validation(msg: impl Into<String>, field: Option<String>) -> Control {
 fn err_at(msg: impl Into<String>, loc: &SourceLocation) -> Control {
     Control::Error(RuntimeError::at(msg, loc.clone()))
 }
+/// El error de leer una variable que no existe (el mismo texto en el tree-walker y en la VM).
+fn undefined_variable(name: &str, loc: &SourceLocation) -> Control {
+    // Batch DX (decisión #6): los bindings que serve inyecta SOLO en el
+    // scope de un route handler (`request`/`query`/`params`/`read_body`/
+    // `read_body_bytes`, ver request_bindings) son el tropiezo #1 de las
+    // tasks auxiliares — el hint dice el fix exacto. Cualquier otro
+    // nombre conserva el mensaje de siempre.
+    let mut msg = format!("Undefined variable: '{}'", name);
+    // v0.6.29 (V1-E1): reflejos de otros lenguajes → la forma de Synsema.
+    if let Some(h) = crate::reflexes::name_hint(name) {
+        msg.push_str(&format!(" — in Synsema: {}", h));
+    } else if let Some(h) = crate::reflexes::statement_hint(name) {
+        msg.push_str(&format!(" — `{}` is not a Synsema statement: {}", name, h));
+    }
+    if matches!(
+        name,
+        "request" | "query" | "params" | "read_body" | "read_body_bytes"
+    ) {
+        msg.push_str(&format!(
+            ". '{}' is only available inside route handlers (serve) — pass it as a parameter: task handle({})",
+            name, name
+        ));
+    }
+    err_at(msg, loc)
+}
+
 /// Falla de aserción (`assert*`, Batch 3): error de runtime marcado `is_assertion`.
 fn err_assertion(msg: impl Into<String>) -> Control {
     Control::Error(RuntimeError::assertion(msg))
@@ -356,6 +382,14 @@ impl BuiltinTask {
     }
 }
 
+// La VM de bytecode (F3): un hijo de este módulo, para usar las mismas funciones que el
+// tree-walker (operadores, errores, atajos) en vez de reescribirlas.
+#[path = "vm.rs"]
+mod vm;
+pub use vm::TaskCode;
+#[doc(hidden)]
+pub use vm::explain_source;
+
 // =========================================================
 // entorno
 // =========================================================
@@ -443,6 +477,9 @@ pub struct Bindings {
     names: SmallVec<[Arc<str>; INLINE_BINDINGS]>,
     slots: SmallVec<[Option<SynValue>; INLINE_BINDINGS]>,
     index: Option<Box<HashMap<Arc<str>, u32, rustc_hash::FxBuildHasher>>>,
+    /// Si la VM preparó este frame (F3): el orden de sus nombres es el del resolver, y el slot `k`
+    /// es la variable `k` de ese scope. Se pierde al vaciarlo.
+    layout: Option<Rc<vm::Layout>>,
 }
 
 const INLINE_BINDINGS: usize = 8;
@@ -513,6 +550,64 @@ impl Bindings {
         self.names.clear();
         self.slots.clear();
         self.index = None;
+        self.layout = None;
+    }
+    /// Prepara un frame de llamada para la VM: los parámetros ya ligados tienen que ser los
+    /// primeros nombres del layout, en su orden; el resto queda como hueco ("no está acá").
+    /// `false` (y el frame sin tocar) si no coinciden.
+    pub(crate) fn lay_out(&mut self, layout: &Rc<vm::Layout>) -> bool {
+        let n = self.names.len();
+        if n > layout.names.len() || self.names.iter().zip(layout.names.iter()).any(|(a, b)| **a != **b) {
+            return false;
+        }
+        for name in &layout.names[n..] {
+            self.push(name.clone(), SynValue::Nothing);
+            let k = self.slots.len() - 1;
+            self.slots[k] = None;
+        }
+        self.layout = Some(layout.clone());
+        true
+    }
+    #[inline]
+    pub(crate) fn laid_out_as(&self, layout: &Rc<vm::Layout>) -> bool {
+        self.layout.as_ref().is_some_and(|l| Rc::ptr_eq(l, layout))
+    }
+    #[inline]
+    pub(crate) fn slot(&self, k: usize) -> Option<&SynValue> {
+        self.slots[k].as_ref()
+    }
+    #[inline]
+    pub(crate) fn slot_set(&mut self, k: usize, v: SynValue) {
+        self.slots[k] = Some(v);
+    }
+    pub(crate) fn slot_name(&self, k: usize) -> Arc<str> {
+        self.names[k].clone()
+    }
+    /// `get` con una caché del índice (el de la última vez; un índice nunca cambia): si en ese
+    /// slot está este nombre, no se busca. Un hueco es "no está acá", como en `get`.
+    #[inline]
+    pub(crate) fn get_cached(&self, name: &Arc<str>, ic: &Cell<u32>) -> Option<&SynValue> {
+        let k = self.cached_index(name, ic)?;
+        self.slots[k].as_ref()
+    }
+    #[inline]
+    pub(crate) fn get_cached_mut(&mut self, name: &Arc<str>, ic: &Cell<u32>) -> Option<&mut SynValue> {
+        let k = self.cached_index(name, ic)?;
+        self.slots[k].as_mut()
+    }
+    #[inline]
+    fn cached_index(&self, name: &Arc<str>, ic: &Cell<u32>) -> Option<usize> {
+        let c = ic.get() as usize;
+        if c > 0 {
+            if let Some(n) = self.names.get(c - 1) {
+                if Arc::ptr_eq(n, name) || **n == **name {
+                    return Some(c - 1);
+                }
+            }
+        }
+        let k = self.find(name)?;
+        ic.set(k as u32 + 1);
+        Some(k)
     }
     pub fn iter(&self) -> impl Iterator<Item = (&Arc<str>, &SynValue)> {
         self.names.iter().zip(self.slots.iter()).filter_map(|(n, v)| v.as_ref().map(|v| (n, v)))
@@ -1211,6 +1306,8 @@ pub struct Interpreter {
     free_frames: Vec<Rc<RefCell<Environment>>>,
     /// Los `Vec` de argumentos de las llamadas, por la misma razón (F2a.3): vacíos, con su capacidad.
     free_args: Vec<CallArgs>,
+    /// Los registros de la VM (F3): cada chunk en ejecución usa una ventana al final.
+    vm_regs: Vec<SynValue>,
     /// v0.6.20 — raíz del proyecto: el directorio del archivo de ENTRADA, límite de contención
     /// de `use "../x.syn"`. La fija el host (`set_project_root`) o, si no, se captura del primer
     /// `use` que se ejecuta (siempre el top-level de la entrada). `None` = criterio v0.6.19
@@ -1457,6 +1554,7 @@ impl Interpreter {
             shortcuts: !REFERENCE_MODE.load(std::sync::atomic::Ordering::SeqCst),
             free_frames: Vec::new(),
             free_args: Vec::new(),
+            vm_regs: Vec::new(),
             project_root: None,
             stdout_hook: None,
             stdout_verdict: None,
@@ -3784,7 +3882,12 @@ impl Interpreter {
         if self.intent.is_some() {
             self.intent_frozen = true;
         }
-        for stmt in &program.statements[split..] {
+        let rest = &program.statements[split..];
+        // La VM (F3) corre el programa con atajos y sin etiquetas; si no, el tree-walker.
+        if self.shortcuts && !self.labels && !rest.is_empty() {
+            return self.run_program_chunk(rest, &g);
+        }
+        for stmt in rest {
             last = self.exec(stmt, &g)?;
         }
         Ok(last)
@@ -4044,30 +4147,7 @@ impl Interpreter {
                 env_get(env, name)
             } {
                 Some(v) => Ok(v),
-                None => {
-                    // Batch DX (decisión #6): los bindings que serve inyecta SOLO en el
-                    // scope de un route handler (`request`/`query`/`params`/`read_body`/
-                    // `read_body_bytes`, ver request_bindings) son el tropiezo #1 de las
-                    // tasks auxiliares — el hint dice el fix exacto. Cualquier otro
-                    // nombre conserva el mensaje de siempre.
-                    let mut msg = format!("Undefined variable: '{}'", name);
-                    // v0.6.29 (V1-E1): reflejos de otros lenguajes → la forma de Synsema.
-                    if let Some(h) = crate::reflexes::name_hint(name) {
-                        msg.push_str(&format!(" — in Synsema: {}", h));
-                    } else if let Some(h) = crate::reflexes::statement_hint(name) {
-                        msg.push_str(&format!(" — `{}` is not a Synsema statement: {}", name, h));
-                    }
-                    if matches!(
-                        name.as_str(),
-                        "request" | "query" | "params" | "read_body" | "read_body_bytes"
-                    ) {
-                        msg.push_str(&format!(
-                            ". '{}' is only available inside route handlers (serve) — pass it as a parameter: task handle({})",
-                            name, name
-                        ));
-                    }
-                    Err(err_at(msg, loc))
-                }
+                None => Err(undefined_variable(name, loc)),
             },
             NodeKind::PropertyAccess { property_name, object, via_of } => {
                 // Hint de precedencia de `of` (batch DX, decisión #7): `a of b.c` parsea
@@ -4534,6 +4614,7 @@ impl Interpreter {
                     closure_env: env.clone(),
                     origin: Some(loc.clone()),
                     required_capabilities: Vec::new(),
+                    code: Default::default(),
                 });
                 Ok(SynValue::Task(task))
             }
@@ -5280,6 +5361,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     closure_env: env.clone(),
                     origin: Some(r.location.clone()),
                     required_capabilities: Vec::new(),
+                    code: Default::default(),
                 }));
                 map.insert(format!("_route_handler_{}", i), task);
                 let mut mm = IndexMap::new();
@@ -5558,6 +5640,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             closure_env: env.clone(),
             origin: Some(loc.clone()),
             required_capabilities: required_caps,
+            code: Default::default(),
         });
         let value = SynValue::Task(task);
         // Definir una task bajo PC es una asignación más (NSU estricto + el
@@ -7042,7 +7125,15 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 // PC residual sobre su código público (un `give` llega a un join point y el
                 // valor ya viaja etiquetado).
                 let saved_taint = self.enter_call();
-                let out = match self.exec_block(&task.body, &call_env) {
+                // La VM (F3) corre el cuerpo si lo tiene compilado y el frame se pudo preparar; si
+                // no, el tree-walker. Los dos devuelven lo mismo (el oráculo los compara).
+                let body = match self.vm_code_for(&task) {
+                    Some(code) if code.frame.as_ref().is_some_and(|l| call_env.borrow_mut().bindings.lay_out(l)) => {
+                        self.run_chunk(code, &call_env)
+                    }
+                    _ => self.exec_block(&task.body, &call_env),
+                };
+                let out = match body {
                     Ok(v) => Ok(v),
                     Err(Control::Give(v)) => Ok(v),
                     Err(other) => Err(other),
@@ -10309,6 +10400,7 @@ mod drop_tests {
                 closure_env: interp.global_env.clone(), // task → global_env (la mitad del ciclo)
                 origin: None,
                 required_capabilities: vec![],
+                code: Default::default(),
             }));
             interp.set_global("f", task); // global_env → task (la otra mitad)
             weak = Rc::downgrade(&interp.global_env);
@@ -10341,6 +10433,7 @@ mod drop_tests {
                 closure_env: env.clone(), // task → child (mitad del ciclo)
                 origin: None,
                 required_capabilities: vec![],
+                code: Default::default(),
             }));
             env.borrow_mut().bindings.insert("t".to_string(), task); // child → task (otra mitad)
             weak = Rc::downgrade(&env);

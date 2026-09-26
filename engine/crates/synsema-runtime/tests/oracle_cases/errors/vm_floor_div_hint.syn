@@ -1,0 +1,3 @@
+-- `x // nota`: el aviso de comentario en el error de variable indefinida.
+let x be 10
+print(x // mitad)

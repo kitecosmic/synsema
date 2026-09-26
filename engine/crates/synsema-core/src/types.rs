@@ -156,6 +156,9 @@ pub struct SynTaskValue {
     pub origin: Option<SourceLocation>,
     /// (capability, scope) declaradas con `require` dentro del task.
     pub required_capabilities: Vec<(String, Option<String>)>,
+    /// El cuerpo compilado para la VM (F3), si ya lo hay. Es de este hilo, como el resto del
+    /// valor; quien arma un `SynTaskValue` nuevo pone `Default::default()`.
+    pub code: crate::interpreter::TaskCode,
 }
 
 impl SynValue {

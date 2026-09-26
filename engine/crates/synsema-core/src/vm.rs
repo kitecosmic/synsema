@@ -1,0 +1,1347 @@
+//! La VM de bytecode (F3 de specs/compute-rendimiento.md). Corre al lado del tree-walker, nunca en
+//! su lugar: sólo con atajos y con etiquetas apagadas (`shortcuts && !labels`); en modo referencia
+//! y con etiquetas corre el tree-walker, y el oráculo diferencial compara los dos caminos.
+//!
+//! **Formato** (pensado para lo que viene, §6.1 del spec):
+//! - VM de **registros** (L4): cada expresión deja su valor en un registro temporal; las variables
+//!   locales son los slots del frame de F2a (el mismo `Environment`, con los nombres puestos de
+//!   antemano en el orden del resolver), así que las closures y el copy-on-write ven lo mismo.
+//! - **Estado explícito**: código, `pc`, ventana de registros y frame; nada escondido en la pila de
+//!   Rust entre instrucciones (lo que habilita, más adelante, llamadas sin recursión, OSR y
+//!   volver desde código nativo).
+//! - **`steps()` por bloque básico** (como el *fuel* de wasmtime): cada nodo que la referencia
+//!   evalúa suma 1 a la primera instrucción de su subárbol; un bloque básico suma todo al entrar
+//!   (`Steps`) y, si una instrucción falla a mitad de bloque, `rest` dice cuánto sobra. Un bloque
+//!   termina en cada instrucción que puede observar el contador (llamar al tree-walker) o saltar,
+//!   así que en esos puntos el número es exacto.
+//! - Constantes en un pool, ubicaciones en una tabla, un slot de *feedback* por operación
+//!   (reservado: lo usa el quickening de F3.4) y los encabezados de bucle (reservados: calor/OSR).
+//!
+//! **Qué se compila** (F3.1): literales, variables, operadores, `and`/`or`, cadenas de comparación,
+//! `let`, `set` a una variable, `when`, `while`, `give`, `stop` y la definición de tasks y lambdas
+//! (su cuerpo se compila también). Todo lo demás es `Exec`: el nodo lo corre el tree-walker con el
+//! frame de la VM como entorno (§6.0 punto 4), y cuenta sus propios pasos.
+
+use super::*;
+use crate::resolve::{self, Resolution, ScopeId, Target};
+use std::cell::Cell;
+
+pub(crate) type Reg = u16;
+/// Registro destino "no hace falta el valor": se suelta en el acto.
+const DISCARD: Reg = Reg::MAX;
+const NONE: u32 = u32::MAX;
+
+/// Un operando: un registro que se consume, uno que se copia, una constante o un slot del frame
+/// propio que está ligado seguro.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Opnd {
+    Reg(Reg),
+    Copy(Reg),
+    Const(u32),
+    Local(u16),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Ins {
+    /// Entrada a un bloque básico: los pasos de todos sus nodos.
+    Steps(u32),
+    /// Sólo existe mientras se compila (lleva pasos); no queda en el código final.
+    Nop,
+    CheckCancel,
+    Const { dst: Reg, k: u32 },
+    /// Un literal de texto: un `Rc<str>` nuevo por evaluación, como la referencia (el pool de F3.3
+    /// lo cambia).
+    Text { dst: Reg, k: u32 },
+    Move { dst: Reg, src: Opnd },
+    Drop { r: Reg },
+    /// Slot del frame propio que puede estar vacío: si lo está, por nombre desde el padre.
+    LoadLocal { dst: Reg, slot: u16, name: u32 },
+    /// Slot de un frame de afuera, con guarda por frame.
+    LoadOuter { dst: Reg, depth: u16, slot: u16, name: u32 },
+    /// Por nombre, desde el primer frame que no es del resolver (ver `free_start`), con una caché
+    /// del slot donde estaba (el índice de un slot no cambia nunca, F2a).
+    LoadName { dst: Reg, name: u32, ic: u32 },
+    /// `fb`: su slot de feedback (reservado para el quickening de F3.4).
+    Binary { dst: Reg, op: BinOp, a: Opnd, b: Opnd, #[allow(dead_code)] fb: u16 },
+    Unary { dst: Reg, op: UnOp, a: Opnd },
+    ToBool { dst: Reg, src: Opnd },
+    Jump { to: u32 },
+    JumpIfFalsy { src: Opnd, to: u32 },
+    LetLocal { src: Opnd, slot: u16, dst: Reg },
+    LetName { src: Opnd, name: u32, dst: Reg },
+    SetLocal { src: Opnd, slot: u16, name: u32, dst: Reg },
+    SetOuter { src: Opnd, depth: u16, slot: u16, name: u32, dst: Reg },
+    SetName { src: Opnd, name: u32, dst: Reg, ic: u32 },
+    /// `set P to append(P, …)` y compañía: la vía en el lugar de la referencia
+    /// (`try_update_in_place`) si la variable es una lista o un mapa; si aplica, salta a `done`.
+    /// `ic` = `NONE` si la variable es del resolver (se mira por nombre desde el frame propio).
+    TryInPlace { dst: Reg, node: u32, name: u32, done: u32, ic: u32 },
+    /// El nodo lo corre el tree-walker. Un `stop` que sale de él corta el bucle compilado que lo
+    /// rodea (`stop_to`), si hay uno.
+    Exec { dst: Reg, node: u32, stop_to: u32 },
+    /// Define una task o lambda (el tree-walker) y le cuelga su cuerpo compilado.
+    Define { dst: Reg, node: u32, child: u32 },
+    Give { src: Opnd },
+    /// `stop` fuera de un bucle compilado: sale del cuerpo como `Control::Stop`.
+    StopOut { src: Opnd, has: bool },
+    End { src: Opnd },
+    /// wasm32: el tope de vueltas de un `while` (ahí nadie puede cortar un bucle sin fin).
+    WasmTick { ctr: Reg },
+}
+
+/// Los nombres de un frame en el orden del resolver (parámetros primero). Un frame que la VM
+/// preparó lleva este `Rc`: es la guarda de las lecturas de afuera.
+pub struct Layout {
+    pub(crate) names: Vec<Arc<str>>,
+}
+
+pub(crate) struct Chunk {
+    code: Vec<Ins>,
+    /// Por instrucción: los pasos que su bloque sumó de más si ésta falla.
+    rest: Vec<u32>,
+    loc: Vec<u32>,
+    locs: Vec<SourceLocation>,
+    consts: Vec<SynValue>,
+    texts: Vec<String>,
+    names: Vec<Arc<str>>,
+    nodes: Vec<Node>,
+    children: Vec<Rc<Chunk>>,
+    layouts: Rc<Vec<Rc<Layout>>>,
+    parents: Rc<Vec<Option<ScopeId>>>,
+    /// El scope del frame propio (tasks y lambdas) y su layout.
+    frame_scope: Option<ScopeId>,
+    pub(crate) frame: Option<Rc<Layout>>,
+    nregs: u16,
+    /// Las cachés de `LoadName`/`SetName`/`TryInPlace` (0 = vacía; si no, slot + 1).
+    ics: Vec<Cell<u32>>,
+    /// Cuántos frames del resolver hay entre el frame propio y la raíz dinámica: una variable
+    /// `Free` no está en ninguno (0 si alguno es dinámico: ahí se busca desde el frame propio).
+    free_skip: u16,
+    /// Reservado (F3.4): cuántos slots de feedback hay.
+    #[allow(dead_code)]
+    feedback: u16,
+    /// Reservado (calor/OSR): dónde empieza cada bucle.
+    #[allow(dead_code)]
+    loop_heads: Vec<u32>,
+}
+
+/// El código compilado de una task, y cuántas veces se llamó antes de compilarla.
+#[derive(Default)]
+pub struct TaskCode {
+    code: std::cell::OnceCell<Rc<Chunk>>,
+    calls: Cell<u32>,
+}
+
+/// Una task definida por el tree-walker se compila recién en su segunda llamada: una lambda que
+/// se arma en cada vuelta y se llama una vez no paga el compilador.
+const COMPILE_AT_CALL: u32 = 2;
+
+impl TaskCode {
+    #[inline]
+    pub(crate) fn get(&self) -> Option<&Rc<Chunk>> {
+        self.code.get()
+    }
+    fn set(&self, c: Rc<Chunk>) {
+        let _ = self.code.set(c);
+    }
+}
+
+// =============================================================================================
+// Compilador
+// =============================================================================================
+
+/// El programa (las sentencias después del preámbulo `intent`/`require`), con las tasks y lambdas
+/// que define compiladas también.
+pub(crate) fn compile_program(stmts: &[Node]) -> Rc<Chunk> {
+    let res = resolve::resolve_block(stmts);
+    let shared = Shared::new(&res);
+    let mut c = Compiler::new(&res, &shared, None);
+    c.block(stmts, Some(0), false);
+    c.finish(Opnd::Reg(0))
+}
+
+/// El cuerpo de una task o lambda que definió el tree-walker, resuelto por sí solo.
+pub(crate) fn compile_function(params: &[Arc<str>], body: &[Node]) -> Rc<Chunk> {
+    let (res, s) = resolve::resolve_function(params, body);
+    let shared = Shared::new(&res);
+    let mut c = Compiler::new(&res, &shared, Some(s));
+    c.block(body, Some(0), true);
+    c.finish(Opnd::Reg(0))
+}
+
+/// Lo que comparten un chunk y los de sus tasks anidadas: los layouts de todos los scopes.
+struct Shared<'r> {
+    by_node: HashMap<usize, &'r resolve::Access>,
+    layouts: Rc<Vec<Rc<Layout>>>,
+    parents: Rc<Vec<Option<ScopeId>>>,
+}
+
+impl<'r> Shared<'r> {
+    fn new(res: &'r Resolution) -> Self {
+        let layouts = res.scopes.iter().map(|s| Rc::new(Layout { names: s.names.clone() })).collect();
+        let parents = res.scopes.iter().map(|s| s.parent).collect();
+        Shared { by_node: res.by_node(), layouts: Rc::new(layouts), parents: Rc::new(parents) }
+    }
+}
+
+struct Compiler<'r, 's> {
+    res: &'r Resolution,
+    shared: &'s Shared<'r>,
+    frame_scope: Option<ScopeId>,
+    code: Vec<Ins>,
+    weight: Vec<u32>,
+    loc: Vec<u32>,
+    locs: Vec<SourceLocation>,
+    consts: Vec<SynValue>,
+    texts: Vec<String>,
+    names: Vec<Arc<str>>,
+    nodes: Vec<Node>,
+    children: Vec<Rc<Chunk>>,
+    /// Nodos que la referencia ya "entró" y todavía no tienen instrucción.
+    pending: u32,
+    next_reg: Reg,
+    max_reg: Reg,
+    /// Label → instrucción (o `NONE` mientras no se ligó).
+    labels: Vec<u32>,
+    /// Salida de cada bucle compilado abierto.
+    loops: Vec<u32>,
+    feedback: u16,
+    loop_heads: Vec<u32>,
+    cur_loc: u32,
+    ics: u32,
+}
+
+impl<'r, 's> Compiler<'r, 's> {
+    fn new(res: &'r Resolution, shared: &'s Shared<'r>, frame_scope: Option<ScopeId>) -> Self {
+        Compiler {
+            res,
+            shared,
+            frame_scope,
+            code: Vec::new(),
+            weight: Vec::new(),
+            loc: Vec::new(),
+            locs: Vec::new(),
+            consts: Vec::new(),
+            texts: Vec::new(),
+            names: Vec::new(),
+            nodes: Vec::new(),
+            children: Vec::new(),
+            pending: 0,
+            // r0: el valor del bloque de más afuera.
+            next_reg: 1,
+            max_reg: 1,
+            labels: Vec::new(),
+            loops: Vec::new(),
+            feedback: 0,
+            loop_heads: Vec::new(),
+            cur_loc: 0,
+            ics: 0,
+        }
+    }
+
+    // -- emisión --------------------------------------------------------------------------------
+
+    fn at(&mut self, loc: &SourceLocation) {
+        if self.locs.last() != Some(loc) {
+            self.locs.push(loc.clone());
+        }
+        self.cur_loc = (self.locs.len() - 1) as u32;
+    }
+
+    fn emit(&mut self, ins: Ins) {
+        self.code.push(ins);
+        self.weight.push(std::mem::take(&mut self.pending));
+        self.loc.push(self.cur_loc);
+    }
+
+    /// La referencia entra a un nodo: un paso.
+    fn enter(&mut self) {
+        self.pending += 1;
+    }
+
+    /// Los pasos pendientes no pueden cruzar un label ni el final de una sentencia.
+    fn flush(&mut self) {
+        if self.pending > 0 {
+            self.emit(Ins::Nop);
+        }
+    }
+
+    fn label(&mut self) -> u32 {
+        self.labels.push(NONE);
+        (self.labels.len() - 1) as u32
+    }
+
+    fn bind(&mut self, l: u32) {
+        self.flush();
+        self.labels[l as usize] = self.code.len() as u32;
+    }
+
+    fn reg(&mut self) -> Reg {
+        let r = self.next_reg;
+        self.next_reg += 1;
+        self.max_reg = self.max_reg.max(self.next_reg);
+        r
+    }
+
+    fn konst(&mut self, v: SynValue) -> u32 {
+        self.consts.push(v);
+        (self.consts.len() - 1) as u32
+    }
+
+    fn name(&mut self, n: &str) -> u32 {
+        if let Some(i) = self.names.iter().position(|x| &**x == n) {
+            return i as u32;
+        }
+        self.names.push(Arc::from(n));
+        (self.names.len() - 1) as u32
+    }
+
+    fn shared_name(&mut self, n: &Arc<str>) -> u32 {
+        if let Some(i) = self.names.iter().position(|x| Arc::ptr_eq(x, n)) {
+            return i as u32;
+        }
+        self.names.push(n.clone());
+        (self.names.len() - 1) as u32
+    }
+
+    fn ic(&mut self) -> u32 {
+        self.ics += 1;
+        self.ics - 1
+    }
+
+    fn cold(&mut self, n: &Node) -> u32 {
+        self.nodes.push(n.clone());
+        (self.nodes.len() - 1) as u32
+    }
+
+    fn target(&self, n: &Node) -> Target {
+        self.shared.by_node.get(&(n as *const Node as usize)).map(|a| a.target).unwrap_or(Target::Free)
+    }
+
+    /// Un `Local`/`Outer` sólo vale para scopes de la cadena del frame propio.
+    fn in_frame(&self, scope: ScopeId, depth: u16) -> bool {
+        let mut s = self.frame_scope;
+        for _ in 0..depth {
+            s = s.and_then(|x| self.shared.parents[x as usize]);
+        }
+        s == Some(scope)
+    }
+
+    fn stop_to(&self) -> u32 {
+        self.loops.last().copied().unwrap_or(NONE)
+    }
+
+    // -- sentencias -----------------------------------------------------------------------------
+
+    /// Un bloque (`exec_block`): cancelación antes de cada sentencia (salvo en el nivel de más
+    /// afuera del programa) y el valor de la última en `want`.
+    fn block(&mut self, stmts: &[Node], want: Option<Reg>, cancel: bool) {
+        let refs: Vec<&Node> = stmts.iter().collect();
+        self.block_of(&refs, want, cancel);
+    }
+
+    fn block_of(&mut self, stmts: &[&Node], want: Option<Reg>, cancel: bool) {
+        if stmts.is_empty() {
+            if let Some(d) = want {
+                let k = self.konst(SynValue::Nothing);
+                self.emit(Ins::Const { dst: d, k });
+            }
+            return;
+        }
+        let last = stmts.len() - 1;
+        for (i, s) in stmts.iter().enumerate() {
+            if cancel {
+                self.at(&s.location);
+                self.emit(Ins::CheckCancel);
+            }
+            let mark = self.next_reg;
+            self.stmt(s, if i == last { want } else { None });
+            self.flush();
+            self.next_reg = mark;
+        }
+    }
+
+    fn stmt(&mut self, n: &Node, want: Option<Reg>) {
+        use NodeKind as K;
+        let dst = want.unwrap_or(DISCARD);
+        self.at(&n.location);
+        match &n.kind {
+            K::LetBinding { name, value, .. } => {
+                self.enter();
+                let v = self.expr(value);
+                self.at(&n.location);
+                match self.target_of_bind(n) {
+                    Some(slot) => self.emit(Ins::LetLocal { src: v, slot, dst }),
+                    None => {
+                        let name = self.shared_name(name);
+                        self.emit(Ins::LetName { src: v, name, dst })
+                    }
+                }
+            }
+            K::SetMutation { target, value } if matches!(target.kind, K::Identifier { .. }) => {
+                let K::Identifier { name } = &target.kind else { unreachable!() };
+                self.enter();
+                let done = if in_place_shape(target, value) {
+                    let node = self.cold(n);
+                    let nm = self.name(name);
+                    let done = self.label();
+                    let ic = if self.target(target) == Target::Free { self.ic() } else { NONE };
+                    self.emit(Ins::TryInPlace { dst, node, name: nm, done, ic });
+                    Some(done)
+                } else {
+                    None
+                };
+                let v = self.expr(value);
+                self.at(&n.location);
+                let nm = self.name(name);
+                match self.target(target) {
+                    Target::Slot { depth: 0, scope, slot, .. } if self.in_frame(scope, 0) => {
+                        self.emit(Ins::SetLocal { src: v, slot, name: nm, dst })
+                    }
+                    Target::Slot { depth, scope, slot, .. } if self.in_frame(scope, depth) => {
+                        self.emit(Ins::SetOuter { src: v, depth, slot, name: nm, dst })
+                    }
+                    _ => {
+                        let ic = self.ic();
+                        self.emit(Ins::SetName { src: v, name: nm, dst, ic })
+                    }
+                }
+                if let Some(d) = done {
+                    self.bind(d);
+                }
+            }
+            K::WhenStatement { .. } => self.when(n, want),
+            K::WhileStatement { condition, body } => {
+                self.enter();
+                self.flush();
+                if let Some(d) = want {
+                    let k = self.konst(SynValue::Nothing);
+                    self.emit(Ins::Const { dst: d, k });
+                }
+                let ctr = if cfg!(target_arch = "wasm32") {
+                    let r = self.reg();
+                    let k = self.konst(syn_int(0));
+                    self.emit(Ins::Const { dst: r, k });
+                    Some(r)
+                } else {
+                    None
+                };
+                let head = self.label();
+                let exit = self.label();
+                self.bind(head);
+                self.loop_heads.push(head);
+                if let Some(r) = ctr {
+                    self.at(&n.location);
+                    self.emit(Ins::WasmTick { ctr: r });
+                }
+                let c = self.expr(condition);
+                self.at(&n.location);
+                self.emit(Ins::JumpIfFalsy { src: c, to: exit });
+                if let Some(d) = want {
+                    let k = self.konst(SynValue::Nothing);
+                    self.emit(Ins::Const { dst: d, k });
+                }
+                self.loops.push(exit);
+                self.block(body, want, true);
+                self.loops.pop();
+                self.emit(Ins::Jump { to: head });
+                self.bind(exit);
+            }
+            K::GiveStatement { value } => {
+                self.enter();
+                let v = match value {
+                    Some(v) => self.expr(v),
+                    None => Opnd::Const(self.konst(SynValue::Nothing)),
+                };
+                self.at(&n.location);
+                self.emit(Ins::Give { src: v });
+            }
+            K::StopStatement { value } => {
+                self.enter();
+                let v = value.as_ref().map(|v| self.expr(v));
+                self.at(&n.location);
+                match self.loops.last().copied() {
+                    Some(exit) => {
+                        if let Some(Opnd::Reg(r)) = v {
+                            self.emit(Ins::Drop { r });
+                        }
+                        self.emit(Ins::Jump { to: exit });
+                    }
+                    None => {
+                        let has = v.is_some();
+                        let src = v.unwrap_or_else(|| Opnd::Const(self.konst(SynValue::Nothing)));
+                        self.emit(Ins::StopOut { src, has });
+                    }
+                }
+            }
+            K::TaskDefinition { .. } => self.define(n, dst),
+            _ if is_expression(&n.kind) => {
+                let v = self.expr(n);
+                match (want, v) {
+                    (Some(d), v) => self.emit(Ins::Move { dst: d, src: v }),
+                    (None, Opnd::Reg(r)) => self.emit(Ins::Drop { r }),
+                    (None, _) => {}
+                }
+            }
+            _ => {
+                let node = self.cold(n);
+                let stop_to = self.stop_to();
+                self.emit(Ins::Exec { dst, node, stop_to });
+            }
+        }
+    }
+
+    fn target_of_bind(&self, n: &Node) -> Option<u16> {
+        let a = self.shared.by_node.get(&(n as *const Node as usize))?;
+        match a.target {
+            Target::Slot { depth: 0, scope, slot, .. } if self.in_frame(scope, 0) => Some(slot),
+            _ => None,
+        }
+    }
+
+    fn when(&mut self, n: &Node, want: Option<Reg>) {
+        let NodeKind::WhenStatement { condition, body, otherwise, otherwise_when } = &n.kind else { unreachable!() };
+        self.enter();
+        let c = self.expr(condition);
+        self.at(&n.location);
+        let other = self.label();
+        let end = self.label();
+        self.emit(Ins::JumpIfFalsy { src: c, to: other });
+        self.block(body, want, true);
+        self.emit(Ins::Jump { to: end });
+        self.bind(other);
+        if let Some(ow) = otherwise_when {
+            // `exec_when_branches` lo evalúa con `exec`, no como bloque: sin chequeo de cancelación.
+            let mark = self.next_reg;
+            self.stmt(ow, want);
+            self.flush();
+            self.next_reg = mark;
+        } else if let Some(o) = otherwise {
+            self.block(o, want, true);
+        } else if let Some(d) = want {
+            let k = self.konst(SynValue::Nothing);
+            self.emit(Ins::Const { dst: d, k });
+        }
+        self.bind(end);
+    }
+
+    /// Una task o lambda: la define el tree-walker; su cuerpo se compila acá.
+    fn define(&mut self, n: &Node, dst: Reg) {
+        let child = match (&n.kind, self.res.scope_opened_by(n)) {
+            (NodeKind::TaskDefinition { body, .. }, Some(s)) => {
+                let body: Vec<&Node> =
+                    body.iter().filter(|x| !matches!(x.kind, NodeKind::RequireStatement { .. })).collect();
+                Some(self.child(s, &body, false))
+            }
+            (NodeKind::LambdaExpression { body, .. }, Some(s)) => Some(self.child(s, &[&**body], true)),
+            _ => None,
+        };
+        let node = self.cold(n);
+        match child {
+            Some(c) => {
+                self.children.push(c);
+                let child = (self.children.len() - 1) as u32;
+                self.emit(Ins::Define { dst, node, child });
+            }
+            None => {
+                let stop_to = self.stop_to();
+                self.emit(Ins::Exec { dst, node, stop_to });
+            }
+        }
+    }
+
+    fn child(&mut self, scope: ScopeId, body: &[&Node], lambda: bool) -> Rc<Chunk> {
+        let mut c = Compiler::new(self.res, self.shared, Some(scope));
+        if lambda {
+            // El cuerpo de una lambda es un bloque de una sentencia, el `give <expr>` que arma el
+            // intérprete: el chequeo de cancelación del bloque y un nodo más.
+            let e = body[0];
+            c.at(&e.location);
+            c.emit(Ins::CheckCancel);
+            c.enter();
+            let v = c.expr(e);
+            c.at(&e.location);
+            c.emit(Ins::Give { src: v });
+            return c.finish(Opnd::Reg(0));
+        }
+        c.block_of(body, Some(0), true);
+        c.finish(Opnd::Reg(0))
+    }
+
+    // -- expresiones ----------------------------------------------------------------------------
+
+    fn expr(&mut self, n: &Node) -> Opnd {
+        use NodeKind as K;
+        self.at(&n.location);
+        match &n.kind {
+            K::NumberLiteral { value } => {
+                self.enter();
+                Opnd::Const(self.konst(syn_number(value.clone())))
+            }
+            K::BoolLiteral { value } => {
+                self.enter();
+                Opnd::Const(self.konst(syn_bool(*value)))
+            }
+            K::NothingLiteral => {
+                self.enter();
+                Opnd::Const(self.konst(SynValue::Nothing))
+            }
+            K::TextLiteral { value } => {
+                self.enter();
+                self.texts.push(value.clone());
+                let k = (self.texts.len() - 1) as u32;
+                let dst = self.reg();
+                self.emit(Ins::Text { dst, k });
+                Opnd::Reg(dst)
+            }
+            K::Identifier { name } => {
+                self.enter();
+                let nm = self.name(name);
+                match self.target(n) {
+                    Target::Slot { depth: 0, scope, slot, definite: true } if self.in_frame(scope, 0) => {
+                        Opnd::Local(slot)
+                    }
+                    Target::Slot { depth: 0, scope, slot, .. } if self.in_frame(scope, 0) => {
+                        let dst = self.reg();
+                        self.emit(Ins::LoadLocal { dst, slot, name: nm });
+                        Opnd::Reg(dst)
+                    }
+                    Target::Slot { depth, scope, slot, .. } if self.in_frame(scope, depth) => {
+                        let dst = self.reg();
+                        self.emit(Ins::LoadOuter { dst, depth, slot, name: nm });
+                        Opnd::Reg(dst)
+                    }
+                    _ => {
+                        let dst = self.reg();
+                        let ic = self.ic();
+                        self.emit(Ins::LoadName { dst, name: nm, ic });
+                        Opnd::Reg(dst)
+                    }
+                }
+            }
+            K::BinaryOp { left, operator, right } if matches!(operator, BinOp::And | BinOp::Or) => {
+                self.enter();
+                let l = self.expr(left);
+                self.at(&n.location);
+                let dst = self.reg();
+                let short = self.label();
+                let end = self.label();
+                if *operator == BinOp::And {
+                    self.emit(Ins::JumpIfFalsy { src: l, to: short });
+                } else {
+                    // `or`: si el lado izquierdo es verdadero, `true` sin evaluar el derecho.
+                    self.emit(Ins::ToBool { dst, src: l });
+                    self.emit(Ins::JumpIfFalsy { src: Opnd::Copy(dst), to: short });
+                    let k = self.konst(syn_bool(true));
+                    self.emit(Ins::Const { dst, k });
+                    self.emit(Ins::Jump { to: end });
+                    self.bind(short);
+                    let r = self.expr(right);
+                    self.at(&n.location);
+                    self.emit(Ins::ToBool { dst, src: r });
+                    self.bind(end);
+                    return Opnd::Reg(dst);
+                }
+                let r = self.expr(right);
+                self.at(&n.location);
+                self.emit(Ins::ToBool { dst, src: r });
+                self.emit(Ins::Jump { to: end });
+                self.bind(short);
+                let k = self.konst(syn_bool(false));
+                self.emit(Ins::Const { dst, k });
+                self.bind(end);
+                Opnd::Reg(dst)
+            }
+            K::BinaryOp { operator, right, .. } if *operator == BinOp::FloorDiv && floor_div_hint(n, right) => {
+                self.exec_expr(n)
+            }
+            K::BinaryOp { left, operator, right } => {
+                self.enter();
+                let a = self.expr(left);
+                let a = self.keep_until(a, right);
+                let b = self.expr(right);
+                self.at(&n.location);
+                let dst = self.reg();
+                let fb = self.feedback;
+                self.feedback = self.feedback.saturating_add(1);
+                self.emit(Ins::Binary { dst, op: *operator, a, b, fb });
+                Opnd::Reg(dst)
+            }
+            K::UnaryOp { operator, operand } => {
+                self.enter();
+                let a = self.expr(operand);
+                self.at(&n.location);
+                let dst = self.reg();
+                self.emit(Ins::Unary { dst, op: *operator, a });
+                Opnd::Reg(dst)
+            }
+            K::CompareChain { operands, operators } => {
+                self.enter();
+                let dst = self.reg();
+                let fail = self.label();
+                let end = self.label();
+                let mut prev = self.expr(&operands[0]);
+                for (i, (op, node)) in operators.iter().zip(operands[1..].iter()).enumerate() {
+                    prev = self.keep_until(prev, node);
+                    let cur = self.expr(node);
+                    let cur = self.to_reg(cur);
+                    self.at(&n.location);
+                    let fb = self.feedback;
+                    self.feedback = self.feedback.saturating_add(1);
+                    self.emit(Ins::Binary { dst, op: *op, a: prev, b: Opnd::Copy(cur), fb });
+                    self.emit(Ins::JumpIfFalsy { src: Opnd::Copy(dst), to: fail });
+                    if i + 1 == operators.len() {
+                        self.emit(Ins::Drop { r: cur });
+                    }
+                    prev = Opnd::Reg(cur);
+                }
+                self.emit(Ins::Jump { to: end });
+                self.bind(fail);
+                // Cortó en un par falso: el operando que quedó se suelta, como en la referencia.
+                if let Opnd::Reg(r) = prev {
+                    self.emit(Ins::Drop { r });
+                }
+                let k = self.konst(syn_bool(false));
+                self.emit(Ins::Const { dst, k });
+                self.bind(end);
+                Opnd::Reg(dst)
+            }
+            K::LambdaExpression { .. } => {
+                let dst = self.reg();
+                self.define(n, dst);
+                Opnd::Reg(dst)
+            }
+            _ => self.exec_expr(n),
+        }
+    }
+
+    fn exec_expr(&mut self, n: &Node) -> Opnd {
+        let dst = self.reg();
+        let node = self.cold(n);
+        let stop_to = self.stop_to();
+        self.emit(Ins::Exec { dst, node, stop_to });
+        Opnd::Reg(dst)
+    }
+
+    /// Un slot leído como operando se lee cuando lo usa la instrucción. Si entre la lectura (en el
+    /// orden de la referencia) y el uso se evalúa algo que puede cambiar variables (una llamada,
+    /// un nodo del tree-walker), se copia a un registro en su lugar.
+    fn keep_until(&mut self, a: Opnd, later: &Node) -> Opnd {
+        match a {
+            Opnd::Local(_) if !is_simple(later) => Opnd::Reg(self.to_reg(a)),
+            _ => a,
+        }
+    }
+
+    fn to_reg(&mut self, a: Opnd) -> Reg {
+        match a {
+            Opnd::Reg(r) => r,
+            other => {
+                let dst = self.reg();
+                self.emit(Ins::Move { dst, src: other });
+                dst
+            }
+        }
+    }
+
+    // -- ensamblado -----------------------------------------------------------------------------
+
+    fn finish(mut self, result: Opnd) -> Rc<Chunk> {
+        self.flush();
+        self.emit(Ins::End { src: result });
+        let n = self.code.len();
+        let target = |labels: &Vec<u32>, l: u32| labels[l as usize] as usize;
+        // Bloques básicos: empiezan en 0, en cada destino de salto y después de cada instrucción
+        // que salta, sale o puede mirar el contador.
+        let mut leader = vec![false; n + 1];
+        leader[0] = true;
+        for (i, ins) in self.code.iter().enumerate() {
+            match *ins {
+                Ins::Jump { to } | Ins::JumpIfFalsy { to, .. } => {
+                    leader[target(&self.labels, to)] = true;
+                    leader[i + 1] = true;
+                }
+                Ins::TryInPlace { done, .. } => {
+                    leader[target(&self.labels, done)] = true;
+                    leader[i + 1] = true;
+                }
+                Ins::Exec { stop_to, .. } => {
+                    if stop_to != NONE {
+                        leader[target(&self.labels, stop_to)] = true;
+                    }
+                    leader[i + 1] = true;
+                }
+                Ins::Define { .. } | Ins::Give { .. } | Ins::StopOut { .. } | Ins::End { .. } => leader[i + 1] = true,
+                _ => {}
+            }
+        }
+        // Lo que sobra si falla la instrucción i: los pesos de las que siguen en su bloque.
+        let mut rest = vec![0u32; n];
+        let mut acc = 0u32;
+        for i in (0..n).rev() {
+            rest[i] = acc;
+            acc = if leader[i] { 0 } else { acc + self.weight[i] };
+        }
+        let mut new_index = vec![0u32; n + 1];
+        let mut code = Vec::with_capacity(n);
+        let mut new_rest = Vec::with_capacity(n);
+        let mut new_loc = Vec::with_capacity(n);
+        let mut i = 0;
+        while i < n {
+            // Un bloque: suma sus pesos en su primera instrucción.
+            let mut j = i + 1;
+            while j < n && !leader[j] {
+                j += 1;
+            }
+            let total: u32 = self.weight[i..j].iter().sum();
+            let start = code.len() as u32;
+            if total > 0 {
+                code.push(Ins::Steps(total));
+                new_rest.push(0);
+                new_loc.push(self.loc[i]);
+            }
+            for k in i..j {
+                // Un salto al comienzo del bloque cae en su `Steps`.
+                new_index[k] = if k == i { start } else { code.len() as u32 };
+                if matches!(self.code[k], Ins::Nop) {
+                    continue;
+                }
+                code.push(self.code[k]);
+                new_rest.push(rest[k]);
+                new_loc.push(self.loc[k]);
+            }
+            i = j;
+        }
+        new_index[n] = code.len() as u32;
+        let map = |l: u32, labels: &Vec<u32>| new_index[labels[l as usize] as usize];
+        for ins in code.iter_mut() {
+            match ins {
+                Ins::Jump { to } | Ins::JumpIfFalsy { to, .. } => *to = map(*to, &self.labels),
+                Ins::TryInPlace { done, .. } => *done = map(*done, &self.labels),
+                Ins::Exec { stop_to, .. } if *stop_to != NONE => *stop_to = map(*stop_to, &self.labels),
+                _ => {}
+            }
+        }
+        let loop_heads = self.loop_heads.iter().map(|&l| map(l, &self.labels)).collect();
+        let frame = self.frame_scope.map(|s| self.shared.layouts[s as usize].clone());
+        let mut free_skip = 0u16;
+        let mut s = self.frame_scope;
+        while let Some(x) = s {
+            if self.res.scopes[x as usize].dynamic {
+                free_skip = 0;
+                break;
+            }
+            free_skip += 1;
+            s = self.shared.parents[x as usize];
+        }
+        Rc::new(Chunk {
+            code,
+            rest: new_rest,
+            loc: new_loc,
+            locs: self.locs,
+            consts: self.consts,
+            texts: self.texts,
+            names: self.names,
+            nodes: self.nodes,
+            children: self.children,
+            layouts: self.shared.layouts.clone(),
+            parents: self.shared.parents.clone(),
+            frame_scope: self.frame_scope,
+            frame,
+            nregs: self.max_reg,
+            ics: (0..self.ics).map(|_| Cell::new(0)).collect(),
+            free_skip,
+            feedback: self.feedback,
+            loop_heads,
+        })
+    }
+}
+
+/// Sentencias que son expresiones (su valor es el del bloque si van últimas).
+fn is_expression(k: &NodeKind) -> bool {
+    use NodeKind as K;
+    matches!(
+        k,
+        K::NumberLiteral { .. }
+            | K::TextLiteral { .. }
+            | K::BoolLiteral { .. }
+            | K::NothingLiteral
+            | K::Identifier { .. }
+            | K::BinaryOp { .. }
+            | K::UnaryOp { .. }
+            | K::CompareChain { .. }
+            | K::LambdaExpression { .. }
+    )
+}
+
+/// No llama a nada ni corre nada en el tree-walker: no puede cambiar una variable.
+fn is_simple(n: &Node) -> bool {
+    use NodeKind as K;
+    match &n.kind {
+        K::NumberLiteral { .. } | K::TextLiteral { .. } | K::BoolLiteral { .. } | K::NothingLiteral | K::Identifier { .. } => true,
+        K::BinaryOp { left, operator, right } => {
+            !(*operator == BinOp::FloorDiv && floor_div_hint(n, right)) && is_simple(left) && is_simple(right)
+        }
+        K::UnaryOp { operand, .. } => is_simple(operand),
+        K::CompareChain { operands, .. } => operands.iter().all(is_simple),
+        _ => false,
+    }
+}
+
+/// `x // nota` con espacio: la referencia agrega un aviso al error de variable indefinida.
+fn floor_div_hint(n: &Node, right: &Node) -> bool {
+    matches!(right.kind, NodeKind::Identifier { .. })
+        && right.location.line == n.location.line
+        && right.location.column > n.location.column + 2
+}
+
+/// Las formas que `try_update_in_place` puede hacer en el lugar (la función vuelve a chequear
+/// todo; esto sólo evita llamarla cuando no puede aplicar).
+fn in_place_shape(target: &Node, value: &Node) -> bool {
+    match &value.kind {
+        NodeKind::TaskCall { name, arguments } => {
+            matches!(name.as_identifier(), Some("append" | "insert" | "merge"))
+                && !arguments.is_empty()
+                && same_place(&arguments[0].value, target)
+        }
+        NodeKind::BinaryOp { left, operator, .. } => *operator == BinOp::Add && same_place(left, target),
+        _ => false,
+    }
+}
+
+// =============================================================================================
+// Ejecución
+// =============================================================================================
+
+impl Interpreter {
+    /// El código de una task para esta llamada, si la VM la corre: compilado al definirla desde
+    /// código compilado, o acá en su segunda llamada.
+    #[inline]
+    pub(super) fn vm_code_for<'t>(&mut self, task: &'t SynTaskValue) -> Option<&'t Rc<Chunk>> {
+        if !self.shortcuts || self.labels {
+            return None;
+        }
+        if let Some(c) = task.code.get() {
+            return Some(c);
+        }
+        self.compile_task(task)
+    }
+
+    #[inline(never)]
+    fn compile_task<'t>(&mut self, task: &'t SynTaskValue) -> Option<&'t Rc<Chunk>> {
+        let n = task.code.calls.get() + 1;
+        task.code.calls.set(n);
+        if n < COMPILE_AT_CALL {
+            return None;
+        }
+        let params: Vec<Arc<str>> = task.parameters.iter().map(|p| p.name.clone()).collect();
+        task.code.set(compile_function(&params, &task.body));
+        task.code.get()
+    }
+
+    /// El programa por la VM (sentencias después del preámbulo).
+    pub(super) fn run_program_chunk(&mut self, stmts: &[Node], env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let chunk = compile_program(stmts);
+        self.run_chunk(&chunk, env)
+    }
+
+    /// Corre un chunk en `env` (el frame de la llamada, ya preparado, o la raíz del programa).
+    /// Devuelve lo mismo que `exec_block` sobre ese cuerpo.
+    pub(super) fn run_chunk(&mut self, chunk: &Rc<Chunk>, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        // Los slots `Local` sólo valen en el frame que la llamada preparó con el layout del chunk.
+        debug_assert!(chunk.frame.as_ref().is_none_or(|l| env.borrow().bindings.laid_out_as(l)));
+        let base = self.vm_regs.len();
+        self.vm_regs.resize(base + chunk.nregs as usize, SynValue::Nothing);
+        let r = self.run_chunk_at(chunk, env, base);
+        self.vm_regs.truncate(base);
+        r
+    }
+
+    #[inline]
+    fn put(&mut self, base: usize, dst: Reg, v: SynValue) {
+        if dst != DISCARD {
+            self.vm_regs[base + dst as usize] = v;
+        }
+    }
+
+    #[inline]
+    fn opnd(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, o: Opnd, at: usize) -> Result<SynValue, Control> {
+        Ok(match o {
+            Opnd::Reg(r) => std::mem::replace(&mut self.vm_regs[base + r as usize], SynValue::Nothing),
+            Opnd::Copy(r) => self.vm_regs[base + r as usize].clone(),
+            Opnd::Const(k) => chunk.consts[k as usize].clone(),
+            Opnd::Local(k) => {
+                let v = env.borrow().bindings.slot(k as usize).cloned();
+                match v {
+                    Some(v) => v,
+                    // Ligado seguro según el resolver: no pasa. Si pasara, por nombre.
+                    None => {
+                        let name = env.borrow().bindings.slot_name(k as usize);
+                        return self.load_by_name_from_parent(env, &name, Some(&chunk.locs[chunk.loc[at] as usize]));
+                    }
+                }
+            }
+        })
+    }
+
+    fn load_by_name_from_parent(
+        &mut self,
+        frame: &Rc<RefCell<Environment>>,
+        name: &str,
+        loc: Option<&SourceLocation>,
+    ) -> Result<SynValue, Control> {
+        let parent = frame.borrow().parent.clone();
+        match parent.and_then(|p| env_get(&p, name)) {
+            Some(v) => Ok(v),
+            None => Err(match loc {
+                Some(l) => undefined_variable(name, l),
+                None => err(format!("Undefined variable: '{}'", name)),
+            }),
+        }
+    }
+
+    /// Dónde empieza la búsqueda de una variable `Free`: pasando los frames del resolver (que no
+    /// la tienen: el oráculo del resolver lo verifica en todo el corpus), si cada uno es el que
+    /// el resolver vio; si no, el frame propio.
+    fn free_start(&self, chunk: &Chunk, env: &Rc<RefCell<Environment>>) -> Rc<RefCell<Environment>> {
+        let (Some(mut s), n) = (chunk.frame_scope, chunk.free_skip) else { return env.clone() };
+        let mut f = env.clone();
+        for i in 0..n {
+            if !f.borrow().bindings.laid_out_as(&chunk.layouts[s as usize]) {
+                return env.clone();
+            }
+            let Some(p) = f.borrow().parent.clone() else { return env.clone() };
+            f = p;
+            if i + 1 < n {
+                match chunk.parents[s as usize] {
+                    Some(x) => s = x,
+                    None => return env.clone(),
+                }
+            }
+        }
+        f
+    }
+
+    /// Una variable `Free`: en el primer frame de la búsqueda, por la caché; si no está ahí, por
+    /// nombre hacia afuera (lo mismo que `env_get`).
+    fn load_free(&self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, name: u32, ic: u32) -> Option<SynValue> {
+        let nm = &chunk.names[name as usize];
+        let start = self.free_start(chunk, env);
+        let parent = {
+            let e = start.borrow();
+            if let Some(v) = e.bindings.get_cached(nm, &chunk.ics[ic as usize]) {
+                return Some(v.clone());
+            }
+            e.parent.clone()
+        };
+        parent.and_then(|p| env_get(&p, nm))
+    }
+
+    /// `set` a una variable `Free`: lo mismo que `env_update` desde el primer frame de la búsqueda.
+    fn set_free(&self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, name: u32, ic: u32, v: SynValue) -> bool {
+        let nm = &chunk.names[name as usize];
+        let start = self.free_start(chunk, env);
+        // Un módulo sincroniza su mapa de exportaciones: por el camino de siempre.
+        if start.borrow().name.starts_with("module:") {
+            return env_update(&start, nm, v).is_ok();
+        }
+        let parent = {
+            let mut e = start.borrow_mut();
+            if let Some(slot) = e.bindings.get_cached_mut(nm, &chunk.ics[ic as usize]) {
+                *slot = v;
+                return true;
+            }
+            e.parent.clone()
+        };
+        parent.is_some_and(|p| env_update(&p, nm, v).is_ok())
+    }
+
+    /// El frame `depth` niveles afuera, si cada frame del camino es el que el resolver vio.
+    fn guarded_frame(
+        &self,
+        chunk: &Chunk,
+        env: &Rc<RefCell<Environment>>,
+        depth: u16,
+    ) -> Option<Rc<RefCell<Environment>>> {
+        let mut f = env.clone();
+        let mut s = chunk.frame_scope?;
+        for _ in 0..depth {
+            if !f.borrow().bindings.laid_out_as(&chunk.layouts[s as usize]) {
+                return None;
+            }
+            let p = f.borrow().parent.clone()?;
+            f = p;
+            s = chunk.parents[s as usize]?;
+        }
+        if f.borrow().bindings.laid_out_as(&chunk.layouts[s as usize]) {
+            Some(f)
+        } else {
+            None
+        }
+    }
+
+    fn run_chunk_at(&mut self, chunk: &Rc<Chunk>, env: &Rc<RefCell<Environment>>, base: usize) -> Result<SynValue, Control> {
+        let mut pc = 0usize;
+        loop {
+            let at = pc;
+            let ins = chunk.code[at];
+            pc += 1;
+            let out: Result<(), Control> = match ins {
+                Ins::Steps(w) => {
+                    self.steps = self.steps.wrapping_add(w as u64);
+                    Ok(())
+                }
+                Ins::Nop => Ok(()),
+                Ins::CheckCancel => {
+                    if self.cancel.flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.check_cancel()
+                    } else {
+                        Ok(())
+                    }
+                }
+                Ins::Const { dst, k } => {
+                    let v = chunk.consts[k as usize].clone();
+                    self.put(base, dst, v);
+                    Ok(())
+                }
+                Ins::Text { dst, k } => {
+                    let v = syn_text(chunk.texts[k as usize].as_str());
+                    self.put(base, dst, v);
+                    Ok(())
+                }
+                Ins::Move { dst, src } => self.opnd(chunk, env, base, src, at).map(|v| self.put(base, dst, v)),
+                Ins::Drop { r } => {
+                    drop(std::mem::replace(&mut self.vm_regs[base + r as usize], SynValue::Nothing));
+                    Ok(())
+                }
+                Ins::LoadLocal { dst, slot, name } => {
+                    let v = env.borrow().bindings.slot(slot as usize).cloned();
+                    match v {
+                        Some(v) => {
+                            self.put(base, dst, v);
+                            Ok(())
+                        }
+                        None => {
+                            let loc = &chunk.locs[chunk.loc[at] as usize];
+                            self.load_by_name_from_parent(env, &chunk.names[name as usize], Some(loc))
+                                .map(|v| self.put(base, dst, v))
+                        }
+                    }
+                }
+                Ins::LoadOuter { dst, depth, slot, name } => {
+                    let nm = &chunk.names[name as usize];
+                    let loc = &chunk.locs[chunk.loc[at] as usize];
+                    let found = match self.guarded_frame(chunk, env, depth) {
+                        Some(f) => {
+                            let v = f.borrow().bindings.slot(slot as usize).cloned();
+                            match v {
+                                Some(v) => Some(v),
+                                None => f.borrow().parent.clone().and_then(|p| env_get(&p, nm)),
+                            }
+                        }
+                        None => env_get(env, nm),
+                    };
+                    match found {
+                        Some(v) => {
+                            self.put(base, dst, v);
+                            Ok(())
+                        }
+                        None => Err(undefined_variable(nm, loc)),
+                    }
+                }
+                Ins::LoadName { dst, name, ic } => match self.load_free(chunk, env, name, ic) {
+                    Some(v) => {
+                        self.put(base, dst, v);
+                        Ok(())
+                    }
+                    None => Err(undefined_variable(&chunk.names[name as usize], &chunk.locs[chunk.loc[at] as usize])),
+                },
+                Ins::Binary { dst, op, a, b, .. } => (|| {
+                    let a = self.opnd(chunk, env, base, a, at)?;
+                    let b = self.opnd(chunk, env, base, b, at)?;
+                    let v = self.exec_binary(a, op, b, &chunk.locs[chunk.loc[at] as usize])?;
+                    self.put(base, dst, v);
+                    Ok(())
+                })(),
+                Ins::Unary { dst, op, a } => (|| {
+                    let a = self.opnd(chunk, env, base, a, at)?;
+                    let v = self.exec_unary(op, a, &chunk.locs[chunk.loc[at] as usize])?;
+                    self.put(base, dst, v);
+                    Ok(())
+                })(),
+                Ins::ToBool { dst, src } => self.opnd(chunk, env, base, src, at).map(|v| self.put(base, dst, syn_bool(v.is_truthy()))),
+                Ins::Jump { to } => {
+                    pc = to as usize;
+                    Ok(())
+                }
+                Ins::JumpIfFalsy { src, to } => self.opnd(chunk, env, base, src, at).map(|v| {
+                    if !v.is_truthy() {
+                        pc = to as usize;
+                    }
+                }),
+                Ins::LetLocal { src, slot, dst } => self.opnd(chunk, env, base, src, at).map(|v| {
+                    if dst == DISCARD {
+                        env.borrow_mut().bindings.slot_set(slot as usize, v);
+                    } else {
+                        env.borrow_mut().bindings.slot_set(slot as usize, v.clone());
+                        self.put(base, dst, v);
+                    }
+                }),
+                Ins::LetName { src, name, dst } => self.opnd(chunk, env, base, src, at).map(|v| {
+                    env_set_shared(env, &chunk.names[name as usize], v.clone());
+                    self.put(base, dst, v);
+                }),
+                Ins::SetLocal { src, slot, name, dst } => (|| {
+                    let v = self.opnd(chunk, env, base, src, at)?;
+                    let present = env.borrow().bindings.slot(slot as usize).is_some();
+                    if present {
+                        env.borrow_mut().bindings.slot_set(slot as usize, v.clone());
+                    } else {
+                        let parent = env.borrow().parent.clone();
+                        let nm = &chunk.names[name as usize];
+                        if parent.map(|p| env_update(&p, nm, v.clone())).unwrap_or(Err(())).is_err() {
+                            return Err(set_undefined(nm));
+                        }
+                    }
+                    self.put(base, dst, v);
+                    Ok(())
+                })(),
+                Ins::SetOuter { src, depth, slot, name, dst } => (|| {
+                    let v = self.opnd(chunk, env, base, src, at)?;
+                    let nm = &chunk.names[name as usize];
+                    let ok = match self.guarded_frame(chunk, env, depth) {
+                        Some(f) => {
+                            let present = f.borrow().bindings.slot(slot as usize).is_some();
+                            if present {
+                                f.borrow_mut().bindings.slot_set(slot as usize, v.clone());
+                                true
+                            } else {
+                                let parent = f.borrow().parent.clone();
+                                parent.map(|p| env_update(&p, nm, v.clone()).is_ok()).unwrap_or(false)
+                            }
+                        }
+                        None => env_update(env, nm, v.clone()).is_ok(),
+                    };
+                    if !ok {
+                        return Err(set_undefined(nm));
+                    }
+                    self.put(base, dst, v);
+                    Ok(())
+                })(),
+                Ins::SetName { src, name, dst, ic } => (|| {
+                    let v = self.opnd(chunk, env, base, src, at)?;
+                    if !self.set_free(chunk, env, name, ic, v.clone()) {
+                        return Err(set_undefined(&chunk.names[name as usize]));
+                    }
+                    self.put(base, dst, v);
+                    Ok(())
+                })(),
+                Ins::TryInPlace { dst, node, name, done, ic } => (|| {
+                    // Sólo con una lista o un mapa puede aplicar; con cualquier otra cosa la
+                    // referencia lee la variable, ve que no encaja y deja todo como estaba.
+                    let now = if ic == NONE {
+                        env_get(env, &chunk.names[name as usize])
+                    } else {
+                        self.load_free(chunk, env, name, ic)
+                    };
+                    let fits = matches!(now, Some(SynValue::List(_) | SynValue::Map(_)));
+                    drop(now);
+                    if !fits {
+                        return Ok(());
+                    }
+                    let NodeKind::SetMutation { target, value } = &chunk.nodes[node as usize].kind else {
+                        unreachable!("TryInPlace sobre otro nodo")
+                    };
+                    if let Some(v) = self.try_update_in_place(target, value, env)? {
+                        self.put(base, dst, v);
+                        pc = done as usize;
+                    }
+                    Ok(())
+                })(),
+                Ins::Exec { dst, node, stop_to } => match self.exec(&chunk.nodes[node as usize], env) {
+                    Ok(v) => {
+                        self.put(base, dst, v);
+                        Ok(())
+                    }
+                    Err(Control::Stop(_)) if stop_to != NONE => {
+                        pc = stop_to as usize;
+                        Ok(())
+                    }
+                    Err(c) => Err(c),
+                },
+                Ins::Define { dst, node, child } => self.exec(&chunk.nodes[node as usize], env).map(|v| {
+                    if let SynValue::Task(t) = &v {
+                        t.code.set(chunk.children[child as usize].clone());
+                    }
+                    self.put(base, dst, v);
+                }),
+                Ins::Give { src } => match self.opnd(chunk, env, base, src, at) {
+                    Ok(v) => Err(Control::Give(v)),
+                    Err(c) => Err(c),
+                },
+                Ins::StopOut { src, has } => match self.opnd(chunk, env, base, src, at) {
+                    Ok(v) => Err(Control::Stop(if has { Some(v) } else { None })),
+                    Err(c) => Err(c),
+                },
+                Ins::End { src } => return self.opnd(chunk, env, base, src, at),
+                Ins::WasmTick { ctr } => {
+                    let n = match &self.vm_regs[base + ctr as usize] {
+                        SynValue::Number(Number::Int(i)) => *i + 1,
+                        _ => 1,
+                    };
+                    self.vm_regs[base + ctr as usize] = syn_int(n);
+                    if n > 1_000_000 {
+                        Err(err_at(
+                            "Loop exceeded maximum iterations (1,000,000) — in the wasm build a `while` is capped, since the host cannot interrupt a loop that never ends; the native `synsema` has no cap",
+                            &chunk.locs[chunk.loc[at] as usize],
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+            };
+            if let Err(c) = out {
+                // Los pasos que el bloque sumó por adelantado y la referencia no llegó a contar.
+                // `give` y `stop` también salen por acá: terminan su bloque, así que no sobra nada.
+                self.steps = self.steps.wrapping_sub(chunk.rest[at] as u64);
+                return Err(c);
+            }
+        }
+    }
+}
+
+fn set_undefined(name: &str) -> Control {
+    err(format!("Cannot set undefined variable: '{}'. Use 'let' first.", name))
+}
+
+// =============================================================================================
+// `explain` (L10): las instrucciones de un chunk, para tests y para depurar la VM.
+// =============================================================================================
+
+#[doc(hidden)]
+pub fn explain_source(source: &str) -> String {
+    let program = match crate::parser::parse_source(source, "<explain>") {
+        Ok(p) => p,
+        Err(e) => return format!("parse error: {}", e),
+    };
+    let chunk = compile_program(&program.statements);
+    let mut out = String::new();
+    explain_chunk(&chunk, "program", &mut out);
+    out
+}
+
+fn explain_chunk(c: &Chunk, title: &str, out: &mut String) {
+    use std::fmt::Write;
+    let _ = writeln!(out, "== {} ({} registros)", title, c.nregs);
+    if let Some(f) = &c.frame {
+        let names: Vec<&str> = f.names.iter().map(|n| &**n).collect();
+        let _ = writeln!(out, "   frame: [{}]", names.join(", "));
+    }
+    for (i, ins) in c.code.iter().enumerate() {
+        let l = &c.locs[c.loc[i] as usize];
+        let _ = writeln!(out, "{:04} {:<60} rest={} @{}:{}", i, format!("{:?}", ins), c.rest[i], l.line, l.column);
+    }
+    for (i, ch) in c.children.iter().enumerate() {
+        explain_chunk(ch, &format!("{} / hijo {}", title, i), out);
+    }
+}

@@ -160,6 +160,7 @@ fn reconstruct_task(
                 closure_env,
                 origin: None,
                 required_capabilities: required_capabilities.clone(),
+                code: Default::default(),
             }))
         }
         TaskSnapshot::Builtin(name) => {
