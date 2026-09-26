@@ -6,6 +6,8 @@
 //! tipados dinámicamente en Python (p.ej. `arms`, `routes`) se guardan como
 //! `Vec<Node>` del `NodeKind` esperado, igual de laxo que el oráculo.
 
+use std::sync::Arc;
+
 use crate::tokens::{Number, SourceLocation};
 
 /// Raíz del programa: secuencia de sentencias.
@@ -43,7 +45,9 @@ impl Node {
 /// `Node` (AST) que se evalúa en CALL TIME, en el `closure_env` del task (G5).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Param {
-    pub name: String,
+    /// `Arc<str>` y no `String`: ligar el parámetro en cada llamada clona el `Arc` del AST en vez
+    /// de copiar el nombre (F2a de specs/compute-rendimiento.md). `Arc` porque el AST cruza hilos.
+    pub name: Arc<str>,
     pub default: Option<Node>,
 }
 
@@ -252,7 +256,7 @@ pub enum NodeKind {
 
     // -- Bindings y mutación --
     LetBinding {
-        name: String,
+        name: Arc<str>,
         value: Box<Node>,
         type_annotation: Option<String>,
     },
@@ -270,7 +274,7 @@ pub enum NodeKind {
         otherwise_when: Option<Box<Node>>,
     },
     EachStatement {
-        variable: String,
+        variable: Arc<str>,
         collection: Box<Node>,
         body: Vec<Node>,
     },
@@ -326,7 +330,7 @@ pub enum NodeKind {
     /// Función anónima de una sola expresión: `(params) => expr`.
     /// Evalúa a un valor función (tipo "task") que captura el entorno actual.
     LambdaExpression {
-        parameters: Vec<String>,
+        parameters: Vec<Arc<str>>,
         body: Box<Node>,
     },
     GiveStatement {

@@ -155,7 +155,7 @@ impl TestGenerator {
         for task in find_tasks(program) {
             let (name, params): (String, Vec<String>) = match &task.kind {
                 NodeKind::TaskDefinition { name, parameters, .. } => {
-                    (name.clone(), parameters.iter().map(|p| p.name.clone()).collect())
+                    (name.clone(), parameters.iter().map(|p| p.name.to_string()).collect())
                 }
                 _ => continue,
             };

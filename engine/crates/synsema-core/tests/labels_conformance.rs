@@ -2277,7 +2277,7 @@ fn audit_r8_no_builtin_returns_a_result_less_labelled_than_what_its_callback_tou
             .bindings
             .iter()
             .filter(|(_, val)| matches!(val, SynValue::Builtin(_)))
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| k.to_string())
             .collect();
         v.sort();
         v

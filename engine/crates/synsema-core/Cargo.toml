@@ -41,3 +41,5 @@ getrandom = "0.2"
 # Los argumentos de una llamada sin pedir memoria para los primeros 4 (F1.7 de
 # specs/compute-rendimiento.md). Ya estaba en el árbol (vía stdlib); directa no agrega crate.
 smallvec.workspace = true
+# El índice de nombres de un entorno con muchos bindings (F2a). Ya estaba en el árbol.
+rustc-hash.workspace = true

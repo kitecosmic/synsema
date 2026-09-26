@@ -344,7 +344,7 @@ impl fmt::Display for SynValue {
                 write!(f, "{{{}}}", parts.join(", "))
             }
             SynValue::Task(t) => {
-                let names: Vec<&str> = t.parameters.iter().map(|p| p.name.as_str()).collect();
+                let names: Vec<&str> = t.parameters.iter().map(|p| &*p.name).collect();
                 write!(f, "task {}({})", t.name, names.join(", "))
             }
             SynValue::Builtin(b) => write!(f, "builtin:{}", b.name),

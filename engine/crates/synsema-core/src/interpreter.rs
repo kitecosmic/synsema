@@ -429,50 +429,99 @@ impl fmt::Display for EnvName {
 
 /// Las variables de un scope. Es un tipo propio y no un `HashMap` a la vista para que la
 /// representación pueda cambiar sin tocar a quienes lo usan (specs/compute-rendimiento.md §6.0:
-/// esta API es la definitiva; F2a cambia lo de adentro).
+/// esta API es la definitiva; F2a cambió lo de adentro).
+///
+/// Formato de frame (F2a, el que F2b indexa y la VM de F3 usa como registros): dos arreglos en
+/// paralelo, `names[k]` y `slots[k]`. Un binding **nunca cambia de índice**: `remove` deja el hueco
+/// (`None`) con su nombre, y volver a ligar ese nombre reusa el mismo slot. Los primeros
+/// `INLINE_BINDINGS` viven adentro del entorno (una llamada o una vuelta de `each` no piden memoria
+/// para la tabla); la búsqueda es lineal, que en scopes chicos gana al hash. Pasados
+/// `INDEX_AT` bindings (el global, un módulo) se arma un índice nombre → slot. El orden de
+/// iteración es el de inserción (antes era el orden arbitrario del `HashMap`).
 #[derive(Default)]
 pub struct Bindings {
-    map: HashMap<String, SynValue>,
+    names: SmallVec<[Arc<str>; INLINE_BINDINGS]>,
+    slots: SmallVec<[Option<SynValue>; INLINE_BINDINGS]>,
+    index: Option<Box<HashMap<Arc<str>, u32, rustc_hash::FxBuildHasher>>>,
 }
 
+const INLINE_BINDINGS: usize = 8;
+const INDEX_AT: usize = 16;
+
 impl Bindings {
+    #[inline]
+    fn find(&self, name: &str) -> Option<usize> {
+        match &self.index {
+            Some(ix) => ix.get(name).map(|&k| k as usize),
+            None => self.names.iter().position(|n| &**n == name),
+        }
+    }
+    fn push(&mut self, name: Arc<str>, value: SynValue) {
+        let k = self.names.len();
+        if let Some(ix) = &mut self.index {
+            ix.insert(name.clone(), k as u32);
+        } else if k + 1 > INDEX_AT {
+            let mut ix: HashMap<Arc<str>, u32, rustc_hash::FxBuildHasher> = HashMap::with_capacity_and_hasher(k * 2, Default::default());
+            for (i, n) in self.names.iter().enumerate() {
+                ix.insert(n.clone(), i as u32);
+            }
+            ix.insert(name.clone(), k as u32);
+            self.index = Some(Box::new(ix));
+        }
+        self.names.push(name);
+        self.slots.push(Some(value));
+    }
     pub fn get(&self, name: &str) -> Option<&SynValue> {
-        self.map.get(name)
+        self.find(name).and_then(|k| self.slots[k].as_ref())
     }
     pub fn get_mut(&mut self, name: &str) -> Option<&mut SynValue> {
-        self.map.get_mut(name)
+        self.find(name).and_then(|k| self.slots[k].as_mut())
     }
     pub fn contains_key(&self, name: &str) -> bool {
-        self.map.contains_key(name)
+        self.get(name).is_some()
     }
-    /// Agrega o reemplaza con una clave ya armada (devuelve el valor anterior).
-    pub fn insert(&mut self, name: String, value: SynValue) -> Option<SynValue> {
-        self.map.insert(name, value)
+    /// Agrega o reemplaza (devuelve el valor anterior). La clave sólo se convierte si es nueva.
+    pub fn insert<K: AsRef<str> + Into<Arc<str>>>(&mut self, name: K, value: SynValue) -> Option<SynValue> {
+        match self.find(name.as_ref()) {
+            Some(k) => self.slots[k].replace(value),
+            None => {
+                self.push(name.into(), value);
+                None
+            }
+        }
     }
     /// Liga `name`: si ya existe, reemplaza el valor en el lugar sin crear otra clave; si no, la
     /// agrega. Es lo que hace `let` (re-ligar en un bucle no pide memoria).
     pub fn set(&mut self, name: &str, value: SynValue) {
-        match self.map.get_mut(name) {
-            Some(slot) => *slot = value,
-            None => {
-                self.map.insert(name.to_string(), value);
-            }
+        match self.find(name) {
+            Some(k) => self.slots[k] = Some(value),
+            None => self.push(Arc::from(name), value),
+        }
+    }
+    /// `set` con el nombre ya compartido (el del AST): si es nuevo, la clave es ese mismo `Arc`
+    /// y ligar no pide memoria (F2a.2).
+    pub fn set_shared(&mut self, name: &Arc<str>, value: SynValue) {
+        match self.find(name) {
+            Some(k) => self.slots[k] = Some(value),
+            None => self.push(name.clone(), value),
         }
     }
     pub fn remove(&mut self, name: &str) -> Option<SynValue> {
-        self.map.remove(name)
+        self.find(name).and_then(|k| self.slots[k].take())
     }
     pub fn clear(&mut self) {
-        self.map.clear()
+        self.names.clear();
+        self.slots.clear();
+        self.index = None;
     }
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &SynValue)> {
-        self.map.iter()
+    pub fn iter(&self) -> impl Iterator<Item = (&Arc<str>, &SynValue)> {
+        self.names.iter().zip(self.slots.iter()).filter_map(|(n, v)| v.as_ref().map(|v| (n, v)))
     }
-    pub fn keys(&self) -> impl Iterator<Item = &String> {
-        self.map.keys()
+    pub fn keys(&self) -> impl Iterator<Item = &Arc<str>> {
+        self.iter().map(|(n, _)| n)
     }
     pub fn values(&self) -> impl Iterator<Item = &SynValue> {
-        self.map.values()
+        self.slots.iter().flatten()
     }
 }
 
@@ -691,6 +740,11 @@ pub fn env_get(env: &Rc<RefCell<Environment>>, name: &str) -> Option<SynValue> {
 
 pub(crate) fn env_set(env: &Rc<RefCell<Environment>>, name: &str, value: SynValue) {
     env.borrow_mut().bindings.set(name, value);
+}
+
+/// `env_set` con el nombre del AST: no copia el nombre si el binding es nuevo.
+fn env_set_shared(env: &Rc<RefCell<Environment>>, name: &Arc<str>, value: SynValue) {
+    env.borrow_mut().bindings.set_shared(name, value);
 }
 
 /// Actualiza una variable existente en cualquier scope. `Err(())` si no existe. Una búsqueda por
@@ -4091,7 +4145,7 @@ impl Interpreter {
                 } else {
                     v
                 };
-                env_set(env, name, v.clone());
+                env_set_shared(env, name, v.clone());
                 Ok(v)
             }
             NodeKind::SetMutation { target, value } => {
@@ -4214,7 +4268,7 @@ impl Interpreter {
                             break;
                         }
                     };
-                    env_set(&loop_env, variable, item);
+                    env_set_shared(&loop_env, variable, item);
                     // Ver `exec_block`: el valor de la vuelta anterior no debe seguir vivo.
                     drop(std::mem::replace(&mut result, SynValue::Nothing));
                     match self.exec_block(body, &loop_env).and_then(|v| self.pc_mark(v, loc)) {
@@ -4761,9 +4815,9 @@ impl Interpreter {
         let name = match &declaration.kind {
             NodeKind::TaskDefinition { name, .. }
             | NodeKind::TypeDefinition { name, .. }
-            | NodeKind::LetBinding { name, .. }
             | NodeKind::EnumDefinition { name, .. }
             | NodeKind::RoutesDeclaration { name, .. } => name.clone(),
+            NodeKind::LetBinding { name, .. } => name.to_string(),
             _ => {
                 return Err(err_at(
                     "export must wrap a task, type, let, enum, or routes",
@@ -5368,7 +5422,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     let env = self.global_env.borrow();
                     env.bindings.iter()
                         .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
-                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .map(|(k, v)| (k.to_string(), v.clone()))
                         .collect()
                 };
                 // T1: el agente corre EN NOMBRE de quien pidió (la identidad viaja
@@ -6837,7 +6891,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                                 None => SynValue::Nothing,
                             },
                         };
-                        env_set(&call_env, &param.name, v);
+                        env_set_shared(&call_env, &param.name, v);
                     }
                 } else {
                     // Repartición: cada slot de param recibe a lo sumo un valor.
@@ -6863,7 +6917,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                             }
                             Some(n) => {
                                 seen_named = true;
-                                match task.parameters.iter().position(|p| p.name == n) {
+                                match task.parameters.iter().position(|p| *p.name == *n) {
                                     Some(idx) => {
                                         if slots[idx].is_some() {
                                             return Err(err_at(
@@ -6890,7 +6944,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                                 None => SynValue::Nothing,
                             },
                         };
-                        env_set(&call_env, &param.name, v);
+                        env_set_shared(&call_env, &param.name, v);
                     }
                 }
                 // T5 (regla 1.b) — la tinta de continuación del LLAMADOR VIAJA con la llamada.
@@ -9542,7 +9596,7 @@ fn check_call_arity(
                 ));
             }
             for (i, p) in t.parameters.iter().enumerate() {
-                let given = i < positional || args.iter().any(|(n, _)| n.as_deref() == Some(p.name.as_str()));
+                let given = i < positional || args.iter().any(|(n, _)| n.as_deref() == Some(&*p.name));
                 if !given && p.default.is_none() {
                     return Err(err_at(
                         format!(

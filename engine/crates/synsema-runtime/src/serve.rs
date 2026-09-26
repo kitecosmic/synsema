@@ -794,7 +794,7 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
                     .bindings
                     .iter()
                     .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
-                    .map(|(k, v)| (k.clone(), val_to_global_inner(v, state)))
+                    .map(|(k, v)| (k.to_string(), val_to_global_inner(v, state)))
                     .collect();
                 state.in_progress.pop();
                 state.done.insert(key);
@@ -847,7 +847,7 @@ pub(crate) fn snapshot_module_env(module_env: &Rc<RefCell<Environment>>) -> Vec<
         .bindings
         .iter()
         .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
-        .map(|(k, v)| (k.clone(), val_to_global_inner(v, &mut state)))
+        .map(|(k, v)| (k.to_string(), val_to_global_inner(v, &mut state)))
         .collect()
 }
 
@@ -1009,11 +1009,11 @@ pub(crate) fn snapshot_globals(interp: &Interpreter) -> Arc<Vec<(String, GlobalV
     for (k, v) in env.bindings.iter() {
         if let SynValue::Builtin(b) = v {
             if synsema_core::rng::snapshot(b).is_some() {
-                out.push((k.clone(), GlobalVal::SharedRng(b.name.clone())));
+                out.push((k.to_string(), GlobalVal::SharedRng(b.name.clone())));
             }
             continue; // re-registrados por wire_common
         }
-        out.push((k.clone(), val_to_global_inner(v, &mut state)));
+        out.push((k.to_string(), val_to_global_inner(v, &mut state)));
     }
     // Agentes (Batch 6): viven en `agent_definitions`, no en `bindings` → se snapshotean
     // aparte (sólo el body; el closure_env se re-apunta al global del nuevo intérprete).
@@ -1327,7 +1327,7 @@ pub fn registered_serve_builtin_names() -> Vec<String> {
         .bindings
         .iter()
         .filter(|(_, v)| matches!(v, SynValue::Builtin(_)))
-        .map(|(k, _)| k.clone())
+        .map(|(k, _)| k.to_string())
         .collect();
     names.sort();
     names

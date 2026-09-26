@@ -391,8 +391,8 @@ pub fn rename_task(program: &mut Program, old_name: &str, new_name: &str) -> usi
 /// Agrega un parámetro a una definición de task (si no está ya).
 pub fn add_parameter(task: &mut Node, param_name: &str) {
     if let NodeKind::TaskDefinition { parameters, .. } = &mut task.kind {
-        if !parameters.iter().any(|p| p.name == param_name) {
-            parameters.push(Param { name: param_name.to_string(), default: None });
+        if !parameters.iter().any(|p| &*p.name == param_name) {
+            parameters.push(Param { name: param_name.into(), default: None });
         }
     }
 }
@@ -413,7 +413,7 @@ pub fn extract_task(
             name: task_name.to_string(),
             parameters: params
                 .iter()
-                .map(|n| Param { name: n.clone(), default: None })
+                .map(|n| Param { name: n.as_str().into(), default: None })
                 .collect(),
             body: extracted,
             return_type: None,
@@ -487,7 +487,7 @@ pub fn summarize(program: &Program) -> Summary {
         match &stmt.kind {
             NodeKind::TaskDefinition { name, parameters, .. } => s.tasks.push(TaskInfo {
                 name: name.clone(),
-                params: parameters.iter().map(|p| p.name.clone()).collect(),
+                params: parameters.iter().map(|p| p.name.to_string()).collect(),
                 line: stmt.location.line,
             }),
             NodeKind::TypeDefinition { name, fields } => s.types.push(TypeInfo {
@@ -501,7 +501,7 @@ pub fn summarize(program: &Program) -> Summary {
             }
             NodeKind::IntentDeclaration { description } => s.intents.push(description.clone()),
             NodeKind::RequireStatement { capability, .. } => s.capabilities.push(capability.clone()),
-            NodeKind::LetBinding { name, .. } => s.variables.push(name.clone()),
+            NodeKind::LetBinding { name, .. } => s.variables.push(name.to_string()),
             _ => {}
         }
     }
@@ -807,7 +807,7 @@ mod tests {
         let p = prog(SAMPLE);
         let task = find_task_by_name(&p, "add").unwrap();
         if let NodeKind::TaskDefinition { parameters, .. } = &task.kind {
-            let names: Vec<String> = parameters.iter().map(|p| p.name.clone()).collect();
+            let names: Vec<String> = parameters.iter().map(|p| p.name.to_string()).collect();
             assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
         } else {
             panic!("not a task");
@@ -854,7 +854,7 @@ mod tests {
             .unwrap();
         add_parameter(task, "c");
         if let NodeKind::TaskDefinition { parameters, .. } = &task.kind {
-            assert!(parameters.iter().any(|p| p.name == "c"));
+            assert!(parameters.iter().any(|p| &*p.name == "c"));
         }
     }
 

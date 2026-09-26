@@ -91,11 +91,11 @@ fn heap_allocations_per_construct() {
         ("when i < 0", "", "    when i < 0\n        set x to 1\n", 0),
         ("builtin abs(i)", "", "    set x to abs(i)\n", 1),
         ("llamada f()", "task f()\n    give 1\n", "    set x to f()\n", 1),
-        ("llamada f(1)", "task f(p0)\n    give 1\n", "    set x to f(1)\n", 4),
-        ("llamada f(1, 1)", "task f(p0, p1)\n    give 1\n", "    set x to f(1, 1)\n", 5),
-        ("llamada f(1, 1, 1)", "task f(p0, p1, p2)\n    give 1\n", "    set x to f(1, 1, 1)\n", 6),
-        ("llamada f(1, 1, 1, 1)", "task f(p0, p1, p2, p3)\n    give 1\n", "    set x to f(1, 1, 1, 1)\n", 8),
-        ("llamada f(1, 1, 1, 1, 1)", "task f(p0, p1, p2, p3, p4)\n    give 1\n", "    set x to f(1, 1, 1, 1, 1)\n", 9),
+        ("llamada f(1)", "task f(p0)\n    give 1\n", "    set x to f(1)\n", 2),
+        ("llamada f(1, 1)", "task f(p0, p1)\n    give 1\n", "    set x to f(1, 1)\n", 2),
+        ("llamada f(1, 1, 1)", "task f(p0, p1, p2)\n    give 1\n", "    set x to f(1, 1, 1)\n", 2),
+        ("llamada f(1, 1, 1, 1)", "task f(p0, p1, p2, p3)\n    give 1\n", "    set x to f(1, 1, 1, 1)\n", 2),
+        ("llamada f(1, 1, 1, 1, 1)", "task f(p0, p1, p2, p3, p4)\n    give 1\n", "    set x to f(1, 1, 1, 1, 1)\n", 2),
     ];
 
     let mut rows = Vec::new();
@@ -103,7 +103,7 @@ fn heap_allocations_per_construct() {
         rows.push((*name, per_iteration(|n| while_loop(prelude, body, n)), *expected));
     }
     // `each` sobre `range`: la vuelta (entorno nuevo + clave + tabla; el nombre formateado ya no, F1.6).
-    rows.push(("vuelta de each + set x to 1", per_iteration(|n| format!("let x be 0\neach i in range(0, {})\n    set x to 1\n", n)), 3));
+    rows.push(("vuelta de each + set x to 1", per_iteration(|n| format!("let x be 0\neach i in range(0, {})\n    set x to 1\n", n)), 1));
 
     let mut report = String::new();
     let mut bad = 0;
