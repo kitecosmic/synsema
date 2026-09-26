@@ -1205,6 +1205,12 @@ pub struct Interpreter {
     steps: u64,
     /// ¿Se pueden tomar atajos de ejecución? `false` en modo referencia (ver `REFERENCE_MODE`).
     shortcuts: bool,
+    /// Frames reciclados (F2a.3 de specs/compute-rendimiento.md): el entorno de una llamada o de
+    /// una vuelta de `each` que nadie capturó vuelve acá vacío y con su capacidad, y la próxima
+    /// llamada lo reusa en vez de pedir memoria. Ver `acquire_frame` / `release_frame`.
+    free_frames: Vec<Rc<RefCell<Environment>>>,
+    /// Los `Vec` de argumentos de las llamadas, por la misma razón (F2a.3): vacíos, con su capacidad.
+    free_args: Vec<CallArgs>,
     /// v0.6.20 — raíz del proyecto: el directorio del archivo de ENTRADA, límite de contención
     /// de `use "../x.syn"`. La fija el host (`set_project_root`) o, si no, se captura del primer
     /// `use` que se ejecuta (siempre el top-level de la entrada). `None` = criterio v0.6.19
@@ -1350,6 +1356,62 @@ impl Drop for Interpreter {
 }
 
 impl Interpreter {
+    /// Un scope de ejecución (`"call"`, `"each"`) hijo de `parent`: un frame reciclado si hay,
+    /// o uno nuevo. Sólo con atajos: en modo referencia cada scope es un `Rc` nuevo, y el oráculo
+    /// compara los dos caminos.
+    #[inline]
+    fn acquire_frame(&mut self, parent: &Rc<RefCell<Environment>>, kind: &'static str) -> Rc<RefCell<Environment>> {
+        if let Some(frame) = self.free_frames.pop() {
+            {
+                let mut e = frame.borrow_mut();
+                e.parent = Some(parent.clone());
+                e.name = EnvName::Static(kind);
+            }
+            return frame;
+        }
+        Environment::child_scope(parent, kind)
+    }
+
+    /// Fin de una llamada o de una vuelta de `each`. Si nadie más tiene el frame (ni una closure
+    /// que lo capturó, ni un agente, ni un `Weak` de nadie), se vacía AHORA —los valores se
+    /// sueltan en el mismo momento en que se soltaban al destruir el `Rc`, primero el padre y
+    /// después las variables, como el orden de los campos— y queda para la próxima. Si alguien
+    /// lo retiene, se suelta como siempre: la closure sigue viendo sus variables.
+    #[inline]
+    fn release_frame(&mut self, frame: Rc<RefCell<Environment>>) {
+        if !self.shortcuts
+            || Rc::strong_count(&frame) != 1
+            || Rc::weak_count(&frame) != 0
+            || self.free_frames.len() >= MAX_FREE_FRAMES
+        {
+            return;
+        }
+        {
+            let mut e = frame.borrow_mut();
+            drop(e.parent.take());
+            e.bindings.clear();
+        }
+        self.free_frames.push(frame);
+    }
+}
+
+impl Interpreter {
+    /// Fin de una llamada: el `Vec` de argumentos se vacía (lo que quede se suelta ahora, como
+    /// al salir de su scope) y vuelve a la pila. Sólo con atajos, como los frames.
+    #[inline]
+    fn release_args(&mut self, mut args: CallArgs) {
+        if self.shortcuts && self.free_args.len() < MAX_FREE_FRAMES {
+            args.clear();
+            self.free_args.push(args);
+        }
+    }
+}
+
+/// Tope de la pila de frames libres: la profundidad de llamadas vivas que se recicla sin pedir
+/// memoria. Más allá, el frame se suelta como siempre.
+const MAX_FREE_FRAMES: usize = 256;
+
+impl Interpreter {
     pub fn new() -> Self {
         let interp = Interpreter {
             global_env: Environment::root("global"),
@@ -1393,6 +1455,8 @@ impl Interpreter {
             program_args: Vec::new(),
             steps: 0,
             shortcuts: !REFERENCE_MODE.load(std::sync::atomic::Ordering::SeqCst),
+            free_frames: Vec::new(),
+            free_args: Vec::new(),
             project_root: None,
             stdout_hook: None,
             stdout_verdict: None,
@@ -4252,7 +4316,7 @@ impl Interpreter {
                 let mut result = SynValue::Nothing;
                 let mut outcome: Result<(), Control> = Ok(());
                 while let Some(item) = items.next_item() {
-                    let loop_env = Environment::child_scope(env, "each");
+                    let loop_env = self.acquire_frame(env, "each");
                     // El item lleva la etiqueta de DATOS de la colección (no la de PC, que
                     // desde la regla 2 no envuelve contenedores): un mapa dentro de una lista
                     // privada tiene que salir privado, y compartir el `Rc` es correcto acá —
@@ -4279,6 +4343,7 @@ impl Interpreter {
                             break;
                         }
                     }
+                    self.release_frame(loop_env);
                 }
                 if each_label.is_some() {
                     self.pc_pop();
@@ -4407,9 +4472,10 @@ impl Interpreter {
                         check_protected_callee(id, &func, loc)?;
                     }
                 }
-                // Evaluá cada arg preservando su `name` (named vs posicional). Hasta 4 sin
-                // pedir memoria (`CallArgs`).
-                let mut args = CallArgs::with_capacity(arguments.len());
+                // Evaluá cada arg preservando su `name` (named vs posicional), en un `Vec`
+                // reciclado (F2a.3) si hay uno.
+                let mut args = self.free_args.pop().unwrap_or_default();
+                args.reserve(arguments.len());
                 for arg in arguments {
                     let val = self.exec(&arg.value, env)?;
                     args.push((arg.name.clone(), val));
@@ -4430,7 +4496,9 @@ impl Interpreter {
                     self.arg_literals = mask;
                 }
                 check_call_arity(&func, &args, loc)?;
-                self.call_value_named(func, &mut args, loc)
+                let out = self.call_value_named(func, &mut args, loc);
+                self.release_args(args);
+                out
             }
             NodeKind::LambdaExpression { parameters, body } => {
                 // Una lambda es un task anónimo cuyo cuerpo es un `give <expr>`
@@ -6875,7 +6943,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
             }
             SynValue::Task(task) => {
-                let call_env = Environment::child_scope(&task.closure_env, "call");
+                let call_env = self.acquire_frame(&task.closure_env, "call");
                 let nparams = task.parameters.len();
                 if args.iter().all(|(n, _)| n.is_none()) {
                     // Todos posicionales (el caso común): el i-ésimo argumento es el i-ésimo
@@ -6991,6 +7059,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         loc,
                     ));
                 }
+                self.release_frame(call_env);
                 out
             }
             // Un callable etiquetado (p. ej. una lambda ligada dentro de un `when`
