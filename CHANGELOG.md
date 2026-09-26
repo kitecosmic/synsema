@@ -6,6 +6,32 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.32 — 2026-09-26
+
+Speed, second step. The same language — every program gives the same result — only faster: a
+task call, an `each` iteration and a builtin call no longer ask for memory at all, and variables
+are found faster. Nothing to change in your programs.
+
+**Faster.** Measured on the interpreter against v0.6.31 (same machine, best of 9 alternating
+runs, without counting PGO or the Windows allocator, which both still apply on top):
+
+- `each`: **−60 %**; a task call with 4 arguments: **−52 %**, with 1: **−39 %**, without
+  arguments: **−21 %**; recursive `fib(27)`: **−49 %**; a builtin call: **−20 %**.
+- Reading a variable several scopes up: **−43 %** (16 levels); `let`: −14 %; a `while` loop,
+  `<` and `set`: −11 %.
+- Programs that build data: closures −22 %, rows of maps −19 %, text −13 %, lists −9 %,
+  maps −6 %.
+- A call (with any number of arguments), an `each` iteration and a builtin call went from 1–9
+  heap allocations to **none**: the environment of a call or an iteration that nothing captured
+  is reused by the next one, and variables live in a small inline table instead of a hash map.
+  A closure keeps exactly what it captured, and a call never sees the previous call's variables.
+
+**For contributors.** `Bindings` (the variables of a scope) is now two parallel arrays with a
+fast index past 16 names; a binding never changes position (the format a future compiler will
+index). `cargo test` gained `frame_reuse.rs`, which checks captures and isolation in both the
+reference and the fast path, and the allocation counts of `alloc_counts.rs` now expect zero for
+calls and `each`.
+
 ## v0.6.31 — 2026-09-25
 
 Speed. The same language — every program gives the same result — only faster: the interpreter's hot
