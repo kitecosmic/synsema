@@ -896,7 +896,7 @@ fn check_program_static_inner(
                 let mut candidates: Vec<(&'static str, String, usize)> = Vec::new();
                 for stmt in &program.statements {
                     if let NK::LetBinding { name, .. } = &stmt.kind {
-                        candidates.push(("let", name.clone(), stmt.location.line));
+                        candidates.push(("let", name.to_string(), stmt.location.line));
                     }
                     crate::ast_api::walk(stmt, &mut |n| {
                         if let NK::RoutesDeclaration { name, .. } = &n.kind {

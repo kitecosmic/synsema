@@ -663,7 +663,7 @@ impl Parser {
         Ok(Node::new(
             loc,
             NodeKind::LetBinding {
-                name: name_tok.as_str().to_string(),
+                name: name_tok.as_str().into(),
                 value: Box::new(value),
                 type_annotation: None,
             },
@@ -773,7 +773,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         Ok(Node::new(
             loc,
             NodeKind::EachStatement {
-                variable: var_tok.as_str().to_string(),
+                variable: var_tok.as_str().into(),
                 collection: Box::new(collection),
                 body,
             },
@@ -1084,7 +1084,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         } else {
             None
         };
-        Ok(Param { name, default })
+        Ok(Param { name: name.into(), default })
     }
 
     fn parse_give(&mut self) -> Result<Node, ParseError> {
@@ -2597,9 +2597,9 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         self.expect(TokenType::LParen, "")?;
         let mut params = Vec::new();
         if !self.check(TokenType::RParen) {
-            params.push(self.expect_name("lambda parameter")?.as_str().to_string());
+            params.push(self.expect_name("lambda parameter")?.as_str().into());
             while self.match_tok(TokenType::Comma).is_some() {
-                params.push(self.expect_name("lambda parameter")?.as_str().to_string());
+                params.push(self.expect_name("lambda parameter")?.as_str().into());
             }
         }
         self.expect(TokenType::RParen, "")?;
@@ -3431,7 +3431,7 @@ mod tests {
         let lam = lambda_value("let f be (x) => x + 1");
         match &lam.kind {
             NodeKind::LambdaExpression { parameters, body } => {
-                assert_eq!(parameters, &["x"]);
+                assert_eq!(parameters.iter().map(|p| &**p).collect::<Vec<_>>(), ["x"]);
                 assert!(matches!(body.kind, NodeKind::BinaryOp { .. }));
             }
             other => panic!("esperaba LambdaExpression, got {:?}", other),
@@ -3452,7 +3452,7 @@ mod tests {
         let lam = lambda_value("let f be (a, b, c) => a");
         match &lam.kind {
             NodeKind::LambdaExpression { parameters, .. } => {
-                assert_eq!(parameters, &["a", "b", "c"]);
+                assert_eq!(parameters.iter().map(|p| &**p).collect::<Vec<_>>(), ["a", "b", "c"]);
             }
             other => panic!("esperaba LambdaExpression, got {:?}", other),
         }
@@ -3465,7 +3465,7 @@ mod tests {
         let NodeKind::LambdaExpression { parameters, body } = &lam.kind else {
             panic!("esperaba LambdaExpression externa");
         };
-        assert_eq!(parameters, &["m"]);
+        assert_eq!(parameters.iter().map(|p| &**p).collect::<Vec<_>>(), ["m"]);
         assert!(
             matches!(body.kind, NodeKind::LambdaExpression { .. }),
             "el cuerpo de la lambda externa debería ser otra lambda"

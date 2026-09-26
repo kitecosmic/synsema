@@ -126,7 +126,7 @@ fn snapshot_globals(interp: &Interpreter) -> Vec<(String, SynValue)> {
         .borrow()
         .bindings
         .iter()
-        .map(|(k, v)| (k.clone(), deep_clone(v)))
+        .map(|(k, v)| (k.to_string(), deep_clone(v)))
         .collect()
 }
 
@@ -138,10 +138,10 @@ fn restore_after_request(app: &mut App) {
     for (name, (body, env)) in &app.agents {
         app.interp.agent_definitions.insert(name.clone(), (body.clone(), env.clone()));
     }
-    let keep: HashSet<&String> = app.globals.iter().map(|(k, _)| k).collect();
+    let keep: HashSet<&str> = app.globals.iter().map(|(k, _)| k.as_str()).collect();
     {
         let mut g = app.interp.global_env.borrow_mut();
-        let extra: Vec<String> = g.bindings.keys().filter(|k| !keep.contains(k)).cloned().collect();
+        let extra: Vec<String> = g.bindings.keys().filter(|k| !keep.contains(&***k)).map(|k| k.to_string()).collect();
         for k in extra {
             g.bindings.remove(&k);
         }

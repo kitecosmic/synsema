@@ -57,8 +57,11 @@ pub fn used_in(program: &Program) -> Vec<(String, &'static str, usize)> {
     // Un task o variable del programa con ese nombre lo sombrea: no es el builtin.
     for st in &program.statements {
         crate::ast_api::walk(st, &mut |n| match &n.kind {
-            NodeKind::TaskDefinition { name, .. } | NodeKind::LetBinding { name, .. } => {
+            NodeKind::TaskDefinition { name, .. } => {
                 declared.insert(name.clone());
+            }
+            NodeKind::LetBinding { name, .. } => {
+                declared.insert(name.to_string());
             }
             _ => {}
         });

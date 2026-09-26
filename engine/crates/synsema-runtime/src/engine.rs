@@ -551,7 +551,7 @@ pub fn registered_builtin_names() -> Vec<String> {
         .bindings
         .iter()
         .filter(|(_, v)| matches!(v, synsema_core::types::SynValue::Builtin(_)))
-        .map(|(k, _)| k.clone())
+        .map(|(k, _)| k.to_string())
         .collect();
     names.sort();
     names
@@ -584,7 +584,7 @@ pub fn builtin_exists(name: &str) -> bool {
             let mut interp = Interpreter::new();
             let caps = Rc::new(RefCell::new(CapabilitySet::new("probe")));
             wire_common(&mut interp, &caps, false, None, "probe");
-            let set = interp.global_env.borrow().bindings.keys().cloned().collect();
+            let set = interp.global_env.borrow().bindings.keys().map(|k| k.to_string()).collect();
             set
         };
     }
@@ -1553,7 +1553,7 @@ fn run_diag_inner(source: &str, filename: &str, swarm: Option<Arc<Swarm>>, ceili
                 .borrow()
                 .bindings
                 .iter()
-                .map(|(k, v)| (k.clone(), v.to_string()))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
             let diag = reporter.build_diagnostic("RuntimeError", &e.message, e.location.as_ref(), Some(&vars));
             DiagRun {

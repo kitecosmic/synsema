@@ -43,7 +43,7 @@ pub struct EnvironmentSnapshot {
 impl EnvironmentSnapshot {
     pub fn new(env: &Rc<RefCell<Environment>>) -> Self {
         let e = env.borrow();
-        let bindings = e.bindings.iter().map(|(k, v)| (k.clone(), deep_copy(v))).collect();
+        let bindings = e.bindings.iter().map(|(k, v)| (k.to_string(), deep_copy(v))).collect();
         let parent_snapshot = e.parent.as_ref().map(|p| Box::new(EnvironmentSnapshot::new(p)));
         EnvironmentSnapshot { name: e.name.to_string(), bindings, parent_snapshot }
     }

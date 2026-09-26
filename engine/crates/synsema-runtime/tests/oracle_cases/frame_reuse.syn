@@ -1,0 +1,62 @@
+-- Frames reciclados (F2a.3 de specs/compute-rendimiento.md): lo que una closure capturó no se
+-- recicla, y una llamada nunca ve las variables de la anterior. El oráculo lo corre con y sin
+-- reciclado; tests/frame_reuse.rs en core fija la salida.
+
+task make_adder(x)
+    give (y) => x + y
+
+let add1 be make_adder(1)
+let add10 be make_adder(10)
+
+-- Muchas llamadas y vueltas entre medio: si un frame capturado se reciclara, `x` cambiaría.
+task churn(a, b, c)
+    let t be a + b + c
+    give t
+let k be 0
+while k < 50
+    set k to k + churn(k, 1, 2) * 0 + 1
+each j in range(0, 50)
+    let scratch be j * 2
+print(add1(1))
+print(add10(1))
+
+-- Una closure por vuelta: cada una ve SU `i`.
+let fs be []
+each i in range(0, 3)
+    set fs to append(fs, () => i * 100)
+each f in fs
+    print(f())
+
+-- Una task definida dentro del bucle cierra sobre la vuelta.
+let gs be []
+each w in ["a", "b"]
+    task say()
+        give w
+    set gs to append(gs, say)
+each g in gs
+    print(g())
+
+-- `each` adentro de una llamada escribe la variable de la llamada (el padre del frame de la
+-- vuelta tiene que ser el frame de esa llamada, no uno viejo).
+task sq(v)
+    give v * v
+task sum_sq(xs)
+    let total be 0
+    each v in xs
+        set total to total + sq(v)
+    give total
+print(sum_sq([1, 2, 3]))
+print(sum_sq([4]))
+
+task fact(n)
+    when n <= 1
+        give 1
+    give n * fact(n - 1)
+print(fact(10))
+
+-- Argumentos nombrados y defaults siguen ligando bien con los `Vec` reciclados.
+task greet(name, greeting = "hola")
+    give greeting + " " + name
+print(greet("ana"))
+print(greet(greeting = "chau", name = "beto"))
+print(greet("carla"))

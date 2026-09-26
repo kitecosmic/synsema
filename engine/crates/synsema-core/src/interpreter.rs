@@ -429,50 +429,99 @@ impl fmt::Display for EnvName {
 
 /// Las variables de un scope. Es un tipo propio y no un `HashMap` a la vista para que la
 /// representación pueda cambiar sin tocar a quienes lo usan (specs/compute-rendimiento.md §6.0:
-/// esta API es la definitiva; F2a cambia lo de adentro).
+/// esta API es la definitiva; F2a cambió lo de adentro).
+///
+/// Formato de frame (F2a, el que F2b indexa y la VM de F3 usa como registros): dos arreglos en
+/// paralelo, `names[k]` y `slots[k]`. Un binding **nunca cambia de índice**: `remove` deja el hueco
+/// (`None`) con su nombre, y volver a ligar ese nombre reusa el mismo slot. Los primeros
+/// `INLINE_BINDINGS` viven adentro del entorno (una llamada o una vuelta de `each` no piden memoria
+/// para la tabla); la búsqueda es lineal, que en scopes chicos gana al hash. Pasados
+/// `INDEX_AT` bindings (el global, un módulo) se arma un índice nombre → slot. El orden de
+/// iteración es el de inserción (antes era el orden arbitrario del `HashMap`).
 #[derive(Default)]
 pub struct Bindings {
-    map: HashMap<String, SynValue>,
+    names: SmallVec<[Arc<str>; INLINE_BINDINGS]>,
+    slots: SmallVec<[Option<SynValue>; INLINE_BINDINGS]>,
+    index: Option<Box<HashMap<Arc<str>, u32, rustc_hash::FxBuildHasher>>>,
 }
 
+const INLINE_BINDINGS: usize = 8;
+const INDEX_AT: usize = 16;
+
 impl Bindings {
+    #[inline]
+    fn find(&self, name: &str) -> Option<usize> {
+        match &self.index {
+            Some(ix) => ix.get(name).map(|&k| k as usize),
+            None => self.names.iter().position(|n| &**n == name),
+        }
+    }
+    fn push(&mut self, name: Arc<str>, value: SynValue) {
+        let k = self.names.len();
+        if let Some(ix) = &mut self.index {
+            ix.insert(name.clone(), k as u32);
+        } else if k + 1 > INDEX_AT {
+            let mut ix: HashMap<Arc<str>, u32, rustc_hash::FxBuildHasher> = HashMap::with_capacity_and_hasher(k * 2, Default::default());
+            for (i, n) in self.names.iter().enumerate() {
+                ix.insert(n.clone(), i as u32);
+            }
+            ix.insert(name.clone(), k as u32);
+            self.index = Some(Box::new(ix));
+        }
+        self.names.push(name);
+        self.slots.push(Some(value));
+    }
     pub fn get(&self, name: &str) -> Option<&SynValue> {
-        self.map.get(name)
+        self.find(name).and_then(|k| self.slots[k].as_ref())
     }
     pub fn get_mut(&mut self, name: &str) -> Option<&mut SynValue> {
-        self.map.get_mut(name)
+        self.find(name).and_then(|k| self.slots[k].as_mut())
     }
     pub fn contains_key(&self, name: &str) -> bool {
-        self.map.contains_key(name)
+        self.get(name).is_some()
     }
-    /// Agrega o reemplaza con una clave ya armada (devuelve el valor anterior).
-    pub fn insert(&mut self, name: String, value: SynValue) -> Option<SynValue> {
-        self.map.insert(name, value)
+    /// Agrega o reemplaza (devuelve el valor anterior). La clave sólo se convierte si es nueva.
+    pub fn insert<K: AsRef<str> + Into<Arc<str>>>(&mut self, name: K, value: SynValue) -> Option<SynValue> {
+        match self.find(name.as_ref()) {
+            Some(k) => self.slots[k].replace(value),
+            None => {
+                self.push(name.into(), value);
+                None
+            }
+        }
     }
     /// Liga `name`: si ya existe, reemplaza el valor en el lugar sin crear otra clave; si no, la
     /// agrega. Es lo que hace `let` (re-ligar en un bucle no pide memoria).
     pub fn set(&mut self, name: &str, value: SynValue) {
-        match self.map.get_mut(name) {
-            Some(slot) => *slot = value,
-            None => {
-                self.map.insert(name.to_string(), value);
-            }
+        match self.find(name) {
+            Some(k) => self.slots[k] = Some(value),
+            None => self.push(Arc::from(name), value),
+        }
+    }
+    /// `set` con el nombre ya compartido (el del AST): si es nuevo, la clave es ese mismo `Arc`
+    /// y ligar no pide memoria (F2a.2).
+    pub fn set_shared(&mut self, name: &Arc<str>, value: SynValue) {
+        match self.find(name) {
+            Some(k) => self.slots[k] = Some(value),
+            None => self.push(name.clone(), value),
         }
     }
     pub fn remove(&mut self, name: &str) -> Option<SynValue> {
-        self.map.remove(name)
+        self.find(name).and_then(|k| self.slots[k].take())
     }
     pub fn clear(&mut self) {
-        self.map.clear()
+        self.names.clear();
+        self.slots.clear();
+        self.index = None;
     }
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &SynValue)> {
-        self.map.iter()
+    pub fn iter(&self) -> impl Iterator<Item = (&Arc<str>, &SynValue)> {
+        self.names.iter().zip(self.slots.iter()).filter_map(|(n, v)| v.as_ref().map(|v| (n, v)))
     }
-    pub fn keys(&self) -> impl Iterator<Item = &String> {
-        self.map.keys()
+    pub fn keys(&self) -> impl Iterator<Item = &Arc<str>> {
+        self.iter().map(|(n, _)| n)
     }
     pub fn values(&self) -> impl Iterator<Item = &SynValue> {
-        self.map.values()
+        self.slots.iter().flatten()
     }
 }
 
@@ -691,6 +740,11 @@ pub fn env_get(env: &Rc<RefCell<Environment>>, name: &str) -> Option<SynValue> {
 
 pub(crate) fn env_set(env: &Rc<RefCell<Environment>>, name: &str, value: SynValue) {
     env.borrow_mut().bindings.set(name, value);
+}
+
+/// `env_set` con el nombre del AST: no copia el nombre si el binding es nuevo.
+fn env_set_shared(env: &Rc<RefCell<Environment>>, name: &Arc<str>, value: SynValue) {
+    env.borrow_mut().bindings.set_shared(name, value);
 }
 
 /// Actualiza una variable existente en cualquier scope. `Err(())` si no existe. Una búsqueda por
@@ -1151,6 +1205,12 @@ pub struct Interpreter {
     steps: u64,
     /// ¿Se pueden tomar atajos de ejecución? `false` en modo referencia (ver `REFERENCE_MODE`).
     shortcuts: bool,
+    /// Frames reciclados (F2a.3 de specs/compute-rendimiento.md): el entorno de una llamada o de
+    /// una vuelta de `each` que nadie capturó vuelve acá vacío y con su capacidad, y la próxima
+    /// llamada lo reusa en vez de pedir memoria. Ver `acquire_frame` / `release_frame`.
+    free_frames: Vec<Rc<RefCell<Environment>>>,
+    /// Los `Vec` de argumentos de las llamadas, por la misma razón (F2a.3): vacíos, con su capacidad.
+    free_args: Vec<CallArgs>,
     /// v0.6.20 — raíz del proyecto: el directorio del archivo de ENTRADA, límite de contención
     /// de `use "../x.syn"`. La fija el host (`set_project_root`) o, si no, se captura del primer
     /// `use` que se ejecuta (siempre el top-level de la entrada). `None` = criterio v0.6.19
@@ -1296,6 +1356,62 @@ impl Drop for Interpreter {
 }
 
 impl Interpreter {
+    /// Un scope de ejecución (`"call"`, `"each"`) hijo de `parent`: un frame reciclado si hay,
+    /// o uno nuevo. Sólo con atajos: en modo referencia cada scope es un `Rc` nuevo, y el oráculo
+    /// compara los dos caminos.
+    #[inline]
+    fn acquire_frame(&mut self, parent: &Rc<RefCell<Environment>>, kind: &'static str) -> Rc<RefCell<Environment>> {
+        if let Some(frame) = self.free_frames.pop() {
+            {
+                let mut e = frame.borrow_mut();
+                e.parent = Some(parent.clone());
+                e.name = EnvName::Static(kind);
+            }
+            return frame;
+        }
+        Environment::child_scope(parent, kind)
+    }
+
+    /// Fin de una llamada o de una vuelta de `each`. Si nadie más tiene el frame (ni una closure
+    /// que lo capturó, ni un agente, ni un `Weak` de nadie), se vacía AHORA —los valores se
+    /// sueltan en el mismo momento en que se soltaban al destruir el `Rc`, primero el padre y
+    /// después las variables, como el orden de los campos— y queda para la próxima. Si alguien
+    /// lo retiene, se suelta como siempre: la closure sigue viendo sus variables.
+    #[inline]
+    fn release_frame(&mut self, frame: Rc<RefCell<Environment>>) {
+        if !self.shortcuts
+            || Rc::strong_count(&frame) != 1
+            || Rc::weak_count(&frame) != 0
+            || self.free_frames.len() >= MAX_FREE_FRAMES
+        {
+            return;
+        }
+        {
+            let mut e = frame.borrow_mut();
+            drop(e.parent.take());
+            e.bindings.clear();
+        }
+        self.free_frames.push(frame);
+    }
+}
+
+impl Interpreter {
+    /// Fin de una llamada: el `Vec` de argumentos se vacía (lo que quede se suelta ahora, como
+    /// al salir de su scope) y vuelve a la pila. Sólo con atajos, como los frames.
+    #[inline]
+    fn release_args(&mut self, mut args: CallArgs) {
+        if self.shortcuts && self.free_args.len() < MAX_FREE_FRAMES {
+            args.clear();
+            self.free_args.push(args);
+        }
+    }
+}
+
+/// Tope de la pila de frames libres: la profundidad de llamadas vivas que se recicla sin pedir
+/// memoria. Más allá, el frame se suelta como siempre.
+const MAX_FREE_FRAMES: usize = 256;
+
+impl Interpreter {
     pub fn new() -> Self {
         let interp = Interpreter {
             global_env: Environment::root("global"),
@@ -1339,6 +1455,8 @@ impl Interpreter {
             program_args: Vec::new(),
             steps: 0,
             shortcuts: !REFERENCE_MODE.load(std::sync::atomic::Ordering::SeqCst),
+            free_frames: Vec::new(),
+            free_args: Vec::new(),
             project_root: None,
             stdout_hook: None,
             stdout_verdict: None,
@@ -4091,7 +4209,7 @@ impl Interpreter {
                 } else {
                     v
                 };
-                env_set(env, name, v.clone());
+                env_set_shared(env, name, v.clone());
                 Ok(v)
             }
             NodeKind::SetMutation { target, value } => {
@@ -4198,7 +4316,7 @@ impl Interpreter {
                 let mut result = SynValue::Nothing;
                 let mut outcome: Result<(), Control> = Ok(());
                 while let Some(item) = items.next_item() {
-                    let loop_env = Environment::child_scope(env, "each");
+                    let loop_env = self.acquire_frame(env, "each");
                     // El item lleva la etiqueta de DATOS de la colección (no la de PC, que
                     // desde la regla 2 no envuelve contenedores): un mapa dentro de una lista
                     // privada tiene que salir privado, y compartir el `Rc` es correcto acá —
@@ -4214,7 +4332,7 @@ impl Interpreter {
                             break;
                         }
                     };
-                    env_set(&loop_env, variable, item);
+                    env_set_shared(&loop_env, variable, item);
                     // Ver `exec_block`: el valor de la vuelta anterior no debe seguir vivo.
                     drop(std::mem::replace(&mut result, SynValue::Nothing));
                     match self.exec_block(body, &loop_env).and_then(|v| self.pc_mark(v, loc)) {
@@ -4225,6 +4343,7 @@ impl Interpreter {
                             break;
                         }
                     }
+                    self.release_frame(loop_env);
                 }
                 if each_label.is_some() {
                     self.pc_pop();
@@ -4353,9 +4472,10 @@ impl Interpreter {
                         check_protected_callee(id, &func, loc)?;
                     }
                 }
-                // Evaluá cada arg preservando su `name` (named vs posicional). Hasta 4 sin
-                // pedir memoria (`CallArgs`).
-                let mut args = CallArgs::with_capacity(arguments.len());
+                // Evaluá cada arg preservando su `name` (named vs posicional), en un `Vec`
+                // reciclado (F2a.3) si hay uno.
+                let mut args = self.free_args.pop().unwrap_or_default();
+                args.reserve(arguments.len());
                 for arg in arguments {
                     let val = self.exec(&arg.value, env)?;
                     args.push((arg.name.clone(), val));
@@ -4376,7 +4496,9 @@ impl Interpreter {
                     self.arg_literals = mask;
                 }
                 check_call_arity(&func, &args, loc)?;
-                self.call_value_named(func, &mut args, loc)
+                let out = self.call_value_named(func, &mut args, loc);
+                self.release_args(args);
+                out
             }
             NodeKind::LambdaExpression { parameters, body } => {
                 // Una lambda es un task anónimo cuyo cuerpo es un `give <expr>`
@@ -4761,9 +4883,9 @@ impl Interpreter {
         let name = match &declaration.kind {
             NodeKind::TaskDefinition { name, .. }
             | NodeKind::TypeDefinition { name, .. }
-            | NodeKind::LetBinding { name, .. }
             | NodeKind::EnumDefinition { name, .. }
             | NodeKind::RoutesDeclaration { name, .. } => name.clone(),
+            NodeKind::LetBinding { name, .. } => name.to_string(),
             _ => {
                 return Err(err_at(
                     "export must wrap a task, type, let, enum, or routes",
@@ -5368,7 +5490,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     let env = self.global_env.borrow();
                     env.bindings.iter()
                         .filter(|(_, v)| !matches!(v, SynValue::Builtin(_)))
-                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .map(|(k, v)| (k.to_string(), v.clone()))
                         .collect()
                 };
                 // T1: el agente corre EN NOMBRE de quien pidió (la identidad viaja
@@ -6821,7 +6943,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 }
             }
             SynValue::Task(task) => {
-                let call_env = Environment::child_scope(&task.closure_env, "call");
+                let call_env = self.acquire_frame(&task.closure_env, "call");
                 let nparams = task.parameters.len();
                 if args.iter().all(|(n, _)| n.is_none()) {
                     // Todos posicionales (el caso común): el i-ésimo argumento es el i-ésimo
@@ -6837,7 +6959,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                                 None => SynValue::Nothing,
                             },
                         };
-                        env_set(&call_env, &param.name, v);
+                        env_set_shared(&call_env, &param.name, v);
                     }
                 } else {
                     // Repartición: cada slot de param recibe a lo sumo un valor.
@@ -6863,7 +6985,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                             }
                             Some(n) => {
                                 seen_named = true;
-                                match task.parameters.iter().position(|p| p.name == n) {
+                                match task.parameters.iter().position(|p| *p.name == *n) {
                                     Some(idx) => {
                                         if slots[idx].is_some() {
                                             return Err(err_at(
@@ -6890,7 +7012,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                                 None => SynValue::Nothing,
                             },
                         };
-                        env_set(&call_env, &param.name, v);
+                        env_set_shared(&call_env, &param.name, v);
                     }
                 }
                 // T5 (regla 1.b) — la tinta de continuación del LLAMADOR VIAJA con la llamada.
@@ -6937,6 +7059,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         loc,
                     ));
                 }
+                self.release_frame(call_env);
                 out
             }
             // Un callable etiquetado (p. ej. una lambda ligada dentro de un `when`
@@ -9542,7 +9665,7 @@ fn check_call_arity(
                 ));
             }
             for (i, p) in t.parameters.iter().enumerate() {
-                let given = i < positional || args.iter().any(|(n, _)| n.as_deref() == Some(p.name.as_str()));
+                let given = i < positional || args.iter().any(|(n, _)| n.as_deref() == Some(&*p.name));
                 if !given && p.default.is_none() {
                     return Err(err_at(
                         format!(

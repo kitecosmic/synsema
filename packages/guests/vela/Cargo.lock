@@ -2621,6 +2621,7 @@ dependencies = [
  "num-traits",
  "regex",
  "rust_decimal",
+ "rustc-hash",
  "serde_json",
  "sha2",
  "smallvec",

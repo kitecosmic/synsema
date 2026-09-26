@@ -411,7 +411,7 @@ fn top_consts(program: &Program) -> HashMap<String, String> {
             let ctx = ScopeCtx { consts: consts.clone(), params: HashMap::new() };
             let vals = resolve_text(value, &ctx, 0);
             if let [(v, false)] = vals.as_slice() {
-                consts.insert(name.clone(), v.clone());
+                consts.insert(name.to_string(), v.clone());
             }
         }
     }
@@ -428,7 +428,7 @@ fn task_params(sp: &StaticProgram) -> HashMap<String, Vec<String>> {
                 _ => stmt,
             };
             if let NodeKind::TaskDefinition { name, parameters, .. } = &inner.kind {
-                out.insert(format!("{}{}", prefix, name), parameters.iter().map(|p| p.name.clone()).collect());
+                out.insert(format!("{}{}", prefix, name), parameters.iter().map(|p| p.name.to_string()).collect());
             }
         }
     };
@@ -577,7 +577,7 @@ fn sym_of(stmt: &Node, exported: bool, out: &mut Vec<Sym>) {
             line,
             end_line: body_end(line, body),
             extra: vec![
-                ("params", json!(parameters.iter().map(|p| p.name.clone()).collect::<Vec<_>>())),
+                ("params", json!(parameters.iter().map(|p| p.name.to_string()).collect::<Vec<_>>())),
                 ("returns", json!(return_type)),
                 ("exported", json!(exported)),
                 ("calls", json!(direct_calls(body))),
@@ -617,7 +617,7 @@ fn sym_of(stmt: &Node, exported: bool, out: &mut Vec<Sym>) {
         }),
         NodeKind::LetBinding { name, .. } => out.push(Sym {
             kind: "let",
-            name: name.clone(),
+            name: name.to_string(),
             line,
             end_line: max_line(stmt),
             extra: vec![("exported", json!(exported))],
@@ -1185,7 +1185,7 @@ fn infer_value(value: &Node, body: &[Node], lookup: &dyn Fn(&str) -> Option<rout
         NodeKind::Identifier { name } => {
             // `let x be <expr>` en el mismo cuerpo (la última ligadura antes del give).
             let bound = body.iter().rev().find_map(|s| match &s.kind {
-                NodeKind::LetBinding { name: n, value, .. } if n == name => Some(value.as_ref()),
+                NodeKind::LetBinding { name: n, value, .. } if &**n == name => Some(value.as_ref()),
                 _ => None,
             })?;
             infer_value(bound, body, lookup, depth + 1)
@@ -1565,10 +1565,10 @@ fn top_literal_names(program: &Program) -> BTreeSet<String> {
         };
         if let NodeKind::LetBinding { name, value, .. } = &inner.kind {
             if is_literal_node(value) {
-                out.insert(name.clone());
+                out.insert(name.to_string());
             } else {
                 // Re-ligado a algo no literal: deja de ser constante.
-                out.remove(name);
+                out.remove(&**name);
             }
         }
     }
@@ -1593,7 +1593,7 @@ fn declassify_aliases(program: &Program) -> BTreeSet<String> {
                 };
                 if let NodeKind::LetBinding { name, value, .. } = &inner.kind {
                     if value.as_identifier().is_some_and(|id| out.contains(id)) {
-                        out.insert(name.clone());
+                        out.insert(name.to_string());
                     }
                 }
             });
