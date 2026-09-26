@@ -5,6 +5,11 @@
 //! en disco que otro programa cambia) y no dice nada. Se comparan el éxito, la salida, los errores
 //! y `steps()`.
 //!
+//! La segunda corrida de referencia además prende el oráculo del resolver (F3.0): cada variable
+//! que el tree-walker busca por nombre se compara con lo que predijo el resolver (en qué frame
+//! está, qué nombres puede tener cada frame, qué está ligado seguro). Lo informa aparte, en
+//! `resolver`, que no entra en la comparación.
+//!
 //! `conformance/` está en `.gitignore`: en un checkout limpio (CI) el corpus son los `.syn`
 //! versionados; en una máquina de desarrollo, además los ~1.400 de conformance.
 
@@ -67,9 +72,16 @@ enum Outcome {
 }
 
 fn run(runner: &Path, file: &Path, reference: bool) -> Outcome {
+    run_with(runner, file, reference, false)
+}
+
+fn run_with(runner: &Path, file: &Path, reference: bool, resolver_check: bool) -> Outcome {
     let mut cmd = Command::new(runner);
     if reference {
         cmd.arg("--reference");
+    }
+    if resolver_check {
+        cmd.arg("--resolver-check");
     }
     cmd.arg(file)
         .current_dir(file.parent().unwrap_or(Path::new(".")))
@@ -144,6 +156,9 @@ struct Tally {
     nondeterministic: usize,
     timeouts: usize,
     mismatches: Vec<String>,
+    resolver_checked: u64,
+    resolver_unchecked: u64,
+    resolver_violations: Vec<String>,
 }
 
 #[test]
@@ -181,7 +196,19 @@ fn shortcuts_match_the_reference_interpreter() {
                     continue;
                 }
                 let fast = run(&runner, &file, false);
-                let second = run(&runner, &file, true);
+                let mut second = run_with(&runner, &file, true, true);
+                let resolver = match &mut second {
+                    Outcome::Done(v) => v.as_object_mut().and_then(|o| o.remove("resolver")),
+                    _ => None,
+                };
+                if let Some(r) = &resolver {
+                    let mut t = tally.lock().unwrap();
+                    t.resolver_checked += r["checked"].as_u64().unwrap_or(0);
+                    t.resolver_unchecked += r["unchecked"].as_u64().unwrap_or(0);
+                    for v in r["violations"].as_array().into_iter().flatten() {
+                        t.resolver_violations.push(format!("{}: {}", rel, v.as_str().unwrap_or("?")));
+                    }
+                }
                 if first != second {
                     tally.lock().unwrap().nondeterministic += 1;
                     continue;
@@ -197,6 +224,13 @@ fn shortcuts_match_the_reference_interpreter() {
 
     let mut t = tally.into_inner().unwrap();
     t.mismatches.sort();
+    t.resolver_violations.sort();
+    eprintln!(
+        "resolver: {} accesos comparados, {} sin predicción, {} violaciones",
+        t.resolver_checked,
+        t.resolver_unchecked,
+        t.resolver_violations.len()
+    );
     eprintln!(
         "oráculo: {} programas, {} comparados, {} no deterministas, {} sin terminar en {:?}, {} con diferencias",
         files.len(),
@@ -205,6 +239,14 @@ fn shortcuts_match_the_reference_interpreter() {
         t.timeouts,
         TIMEOUT,
         t.mismatches.len()
+    );
+    assert!(
+        t.resolver_violations.is_empty(),
+        "el resolver no coincide con el tree-walker en {} acceso(s):
+{}",
+        t.resolver_violations.len(),
+        t.resolver_violations.join("
+")
     );
     assert!(
         t.mismatches.is_empty(),

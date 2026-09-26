@@ -40,6 +40,9 @@ llm-local = ["dep:synsema-infer", "synsema-infer/gguf", "synsema-infer/rust-back
 judge-laya = ["dep:synsema-infer", "synsema-infer/arch-modernbert", "synsema-infer/rust-backend"]
 
 [dev-dependencies]
+# El oráculo del resolver (F3.0): `oracle_run --resolver-check` compara cada búsqueda por nombre
+# del tree-walker con lo que predijo el resolver. Sólo en tests y ejemplos.
+synsema-core = { workspace = true, features = ["resolver-check"] }
 # E2E del Batch 13: un mini-servidor WS LOCAL para el dogfood del cliente WebSocket
 # (sin red externa). El mismo tungstenite que usa el stdlib, en modo `accept`.
 tungstenite = { workspace = true }

@@ -2987,6 +2987,8 @@ impl Interpreter {
             }
         }
 
+        #[cfg(feature = "resolver-check")]
+        crate::resolve::check::register(&program);
         let module_env = Environment::child(&self.global_env, &format!("module:{}", resolved));
         self.exports_collector.push(Vec::new());
         let exec_res = self.exec_block(&program.statements, &module_env);
@@ -3748,6 +3750,8 @@ impl Interpreter {
         }
         // T5 (ronda 7): el conjunto con el que se redacta sale del AST, antes de correr nada.
         self.set_declared_principals(program);
+        #[cfg(feature = "resolver-check")]
+        crate::resolve::check::register(program);
         let r = self.execute_inner(program);
         // T5 (M1): un error no atrapado sale redactado si la corrida tocó privados.
         self.redact_for_host(r)
@@ -4034,7 +4038,11 @@ impl Interpreter {
             }
 
             // -- Identificadores y acceso --
-            NodeKind::Identifier { name } => match env_get(env, name) {
+            NodeKind::Identifier { name } => match {
+                #[cfg(feature = "resolver-check")]
+                crate::resolve::check::at(loc, name, false, env);
+                env_get(env, name)
+            } {
                 Some(v) => Ok(v),
                 None => {
                     // Batch DX (decisión #6): los bindings que serve inyecta SOLO en el
@@ -4210,6 +4218,8 @@ impl Interpreter {
                     v
                 };
                 env_set_shared(env, name, v.clone());
+                #[cfg(feature = "resolver-check")]
+                crate::resolve::check::at(loc, name, true, env);
                 Ok(v)
             }
             NodeKind::SetMutation { target, value } => {
@@ -4333,6 +4343,8 @@ impl Interpreter {
                         }
                     };
                     env_set_shared(&loop_env, variable, item);
+                    #[cfg(feature = "resolver-check")]
+                    crate::resolve::check::at(loc, variable, true, &loop_env);
                     // Ver `exec_block`: el valor de la vuelta anterior no debe seguir vivo.
                     drop(std::mem::replace(&mut result, SynValue::Nothing));
                     match self.exec_block(body, &loop_env).and_then(|v| self.pc_mark(v, loc)) {
@@ -6181,6 +6193,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         }
                     }
                 }
+                #[cfg(feature = "resolver-check")]
+                crate::resolve::check::at(&target.location, name, false, env);
                 if env_update(env, name, value.clone()).is_err() {
                     return Err(err(format!(
                         "Cannot set undefined variable: '{}'. Use 'let' first.",
