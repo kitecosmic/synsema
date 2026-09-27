@@ -1,0 +1,76 @@
+-- F3.5 contra la referencia: globales por el lugar cacheado (`LoadGlobal`/`SetGlobal`), la vía en
+-- el lugar sin cortar el bloque (`steps()` exacto aun si la referencia lo lee a mitad) y comparar +
+-- saltar (`IntCmpJump`) que se desoptimiza cuando cambian los tipos.
+
+-- Una condición de `while` que ve enteros y después floats: compara y salta, y vuelve atrás.
+let x be 0
+let n be 0
+while x < 10
+    when n < 5
+        set x to x + 1
+    otherwise
+        set x to x + 1.5
+    set n to n + 1
+print([x, n])
+
+task climb(limit)
+    let v be 0
+    let turns be 0
+    while v < limit
+        set v to v + 2
+        set turns to turns + 1
+    give [v, turns]
+print([climb(5), climb(4.5), climb(7), climb(1.5d)])
+
+-- `when` con comparación de enteros que después recibe texto (error de tipo en otro caso).
+task sign(v)
+    when v < 0
+        give "neg"
+    when v == 0
+        give "zero"
+    give "pos"
+print([sign(-3), sign(0), sign(4), sign(-0.5), sign(2.5), sign(-1)])
+
+-- `steps()` leído por la referencia mientras hace la vía en el lugar.
+task probe()
+    give steps()
+let xs be []
+let before be steps()
+let i be 0
+while i < 3
+    set xs to append(xs, probe() - before)
+    set i to i + 1
+print(xs)
+task grow_probe(k)
+    let ys be [0]
+    let j be 0
+    while j < k
+        set ys to append(ys, probe())
+        set ys to ys + [j]
+        set j to j + 1
+    give length(ys)
+let s0 be steps()
+print([grow_probe(2), grow_probe(3), steps() - s0])
+
+-- La vía en el lugar sobre un número (no aplica) y sobre una lista (aplica) en el mismo sitio.
+task mix(v)
+    let acc be v
+    let k be 0
+    while k < 3
+        set acc to acc + [k]
+        set k to k + 1
+    give acc
+print([mix([]), mix([9])])
+
+-- Globales: leer y escribir desde el nivel superior y desde una task definida ahí.
+let counter be 0
+task bump(by)
+    set counter to counter + by
+    give counter
+print([bump(1), bump(2), counter])
+let total be 0
+let t be 0
+while t < 5
+    set total to total + t * t
+    set t to t + 1
+print(total)

@@ -9,6 +9,9 @@ description = "Synsema core: lexer, parser, AST, value model, interpreter"
 # Sólo tests: el oráculo del resolver (src/resolve.rs, `check`). Lo prende synsema-runtime en sus
 # dev-dependencies para `oracle_run --resolver-check`; el binario nunca lo compila.
 resolver-check = []
+# Sólo para elegir superinstrucciones (F3.5 de specs/compute-rendimiento.md): la VM cuenta qué
+# instrucciones corren y qué pares seguidos. El binario nunca lo compila.
+vm-profile = []
 
 [dependencies]
 num-bigint.workspace = true
@@ -48,3 +51,7 @@ getrandom = "0.2"
 smallvec.workspace = true
 # El índice de nombres de un entorno con muchos bindings (F2a). Ya estaba en el árbol.
 rustc-hash.workspace = true
+
+[[example]]
+name = "vmprof"
+required-features = ["vm-profile"]

@@ -38,8 +38,11 @@ fn a_loop_counts_its_steps_once_per_block() {
     assert!(out.contains("Steps(3)"), "{}", out);
     // `set total to total + …` pasa primero por la vía en el lugar, como la referencia.
     assert!(out.contains("TryInPlace"), "{}", out);
-    // Las globales se buscan por nombre.
-    assert!(out.contains("LoadName"), "{}", out);
+    // Las globales del nivel superior se leen y escriben por el lugar cacheado (F3.5).
+    assert!(out.contains("LoadGlobal"), "{}", out);
+    assert!(out.contains("SetGlobal"), "{}", out);
+    // Cada sentencia del cuerpo empieza con sus pasos y el chequeo de cancelación juntos (F3.5).
+    assert!(out.contains("StepsCancel("), "{}", out);
 }
 
 #[test]
@@ -106,7 +109,8 @@ fn operators_specialize_by_the_types_they_see() {
     let before = explain_source(FIB);
     assert!(before.contains("Binary {"), "{}", before);
     let after = explain_after_run(FIB);
-    assert!(after.contains("IntCmp {"), "{}", after);
+    // `when n < 2`: compara y salta en una instrucción (F3.5).
+    assert!(after.contains("IntCmpJump {"), "{}", after);
     assert!(after.contains("op: \"<\""), "{}", after);
     assert!(after.contains("IntArith {"), "{}", after);
     assert!(!after.contains("Binary {"), "{}", after);
@@ -127,6 +131,6 @@ fn float_operators_specialize_too() {
     let after = explain_after_run(src);
     assert!(after.contains("FloatArith {"), "{}", after);
     assert!(after.contains("NumCmp {"), "{}", after);
-    // `i < n` sigue siendo de enteros.
-    assert!(after.contains("IntCmp {"), "{}", after);
+    // `i < n` sigue siendo de enteros (y compara y salta, F3.5).
+    assert!(after.contains("IntCmpJump {"), "{}", after);
 }

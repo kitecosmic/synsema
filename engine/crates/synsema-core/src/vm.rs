@@ -49,6 +49,10 @@ pub(crate) enum Opnd {
 pub(crate) enum Ins {
     /// Entrada a un bloque básico: los pasos de todos sus nodos.
     Steps(u32),
+    /// F3.5 (superinstrucción): `Steps` + `CheckCancel`, el comienzo de cada sentencia de un
+    /// bloque (el par más frecuente del perfil: 10 % de lo que corre). Si el chequeo corta, sobran
+    /// los pasos que habría sobrado el `CheckCancel` (su `rest`).
+    StepsCancel(u32),
     /// Sólo existe mientras se compila (lleva pasos); no queda en el código final.
     Nop,
     CheckCancel,
@@ -62,6 +66,10 @@ pub(crate) enum Ins {
     /// Por nombre, desde el primer frame que no es del resolver (ver `free_start`), con una caché
     /// del slot donde estaba (el índice de un slot no cambia nunca, F2a).
     LoadName { dst: Reg, name: u32, ic: u32 },
+    /// F3.5: `LoadName` cuya búsqueda empieza en el entorno actual (el nivel superior, o una task
+    /// definida ahí que lee una global): el lugar cacheado, sin armar el recorrido (como
+    /// `LOAD_GLOBAL` especializado de CPython). Si la caché falla, el camino de `LoadName`.
+    LoadGlobal { dst: Reg, name: u32, ic: u32 },
     /// Un operador binario tal como lo emite el compilador: adaptativo (F3.4, *quickening*). La
     /// primera vez mira los tipos de los operandos y se reescribe en su forma especializada (si
     /// la hay: `AddInt`, …) o en `BinaryAny`; esa vez calcula por el camino genérico. `fb`: su
@@ -77,6 +85,11 @@ pub(crate) enum Ins {
     IntArith { dst: Reg, op: BinOp, a: Opnd, b: Opnd, fb: u16 },
     /// `< <= > >= == !=`.
     IntCmp { dst: Reg, op: BinOp, a: Opnd, b: Opnd, fb: u16 },
+    /// F3.5 (superinstrucción por quickening): un `IntCmp` cuyo resultado sólo lo usa el
+    /// `JumpIfFalsy` que le sigue (la condición de un `while` o un `when`) compara y salta sin
+    /// armar el Bool. El `JumpIfFalsy` queda en su lugar (su `rest`, su ubicación): si la guarda
+    /// falla, esta instrucción vuelve a `Binary` y el salto corre como siempre.
+    IntCmpJump { dst: Reg, op: BinOp, a: Opnd, b: Opnd, fb: u16 },
     /// `+ - *` con al menos un `Float` (el otro `Int` o `Float`) y `/` con dos números `Int` o
     /// `Float` (en Synsema `/` siempre da float): la cuenta en f64, como `Number`. Un divisor cero
     /// cae al camino genérico (el error de la referencia).
@@ -98,8 +111,13 @@ pub(crate) enum Ins {
     SetLocal { src: Opnd, slot: u16, name: u32, dst: Reg },
     SetOuter { src: Opnd, depth: u16, slot: u16, name: u32, dst: Reg, at: u32 },
     SetName { src: Opnd, name: u32, dst: Reg, ic: u32 },
+    /// F3.5: `SetName` desde el entorno actual (ver `LoadGlobal`).
+    SetGlobal { src: Opnd, name: u32, dst: Reg, ic: u32 },
     /// `set P to append(P, …)` y compañía: la vía en el lugar de la referencia
     /// (`try_update_in_place`) si la variable es una lista o un mapa; si aplica, salta a `done`.
+    /// No termina su bloque (F3.5): el valor y la asignación que siguen son del mismo bloque, y
+    /// si llama a la referencia descuenta antes sus pasos (`rest`), así lo que la referencia mire
+    /// del contador es exacto y, si aplica, esos pasos no se cuentan.
     /// `ic` = `NONE` si la variable es del resolver (se mira por nombre desde el frame propio);
     /// `name` = `NONE` si el destino es un camino (siempre se prueba); `slot` = la variable local
     /// del destino en un cuerpo con frame en registros (`u16::MAX` si no).
@@ -215,6 +233,8 @@ pub(crate) struct Chunk {
     /// una, desde dónde se busca (`hops`).
     ics: Vec<Cell<u32>>,
     ic_hops: Vec<u32>,
+    /// Por caché: si la búsqueda empieza en el entorno actual (sin frames que saltear).
+    ic_here: Vec<bool>,
     /// Los recorridos hacia afuera de este cuerpo (ver `Hops`).
     hops: Vec<Hops>,
     /// Por slot de feedback (F3.4): cuántas veces se desoptimizó su operación.
@@ -716,6 +736,11 @@ impl<'r, 's> Compiler<'r, 's> {
         self.ics - 1
     }
 
+    /// Si la búsqueda de la caché `ic` empieza en el entorno actual.
+    fn ic_here(&self, ic: u32) -> bool {
+        self.hops[self.ic_hops[ic as usize] as usize].from.is_none()
+    }
+
     /// El recorrido hacia afuera desde el scope actual (ver `Hops`). Los scopes de la ventana no
     /// tienen frame: se parte del primero que sí.
     fn hops_here(&mut self) -> u32 {
@@ -843,7 +868,11 @@ impl<'r, 's> Compiler<'r, 's> {
                     }
                     Place::Free => {
                         let ic = self.ic();
-                        self.emit(Ins::SetName { src: v, name: nm, dst, ic })
+                        if self.ic_here(ic) {
+                            self.emit(Ins::SetGlobal { src: v, name: nm, dst, ic })
+                        } else {
+                            self.emit(Ins::SetName { src: v, name: nm, dst, ic })
+                        }
                     }
                 }
                 if let Some(d) = done {
@@ -1345,7 +1374,11 @@ impl<'r, 's> Compiler<'r, 's> {
                     Place::Free => {
                         let dst = self.dst(want);
                         let ic = self.ic();
-                        self.emit(Ins::LoadName { dst, name: nm, ic });
+                        if self.ic_here(ic) {
+                            self.emit(Ins::LoadGlobal { dst, name: nm, ic });
+                        } else {
+                            self.emit(Ins::LoadName { dst, name: nm, ic });
+                        }
                         Opnd::Reg(dst)
                     }
                 }
@@ -1567,9 +1600,10 @@ impl<'r, 's> Compiler<'r, 's> {
                     leader[target(&self.labels, to)] = true;
                     leader[i + 1] = true;
                 }
+                // F3.5: no corta el bloque (lo común es que no aplique y siga en línea); cuando llama
+                // a la referencia descuenta antes lo que el bloque sumó de más (ver el despacho).
                 Ins::TryInPlace { done, .. } => {
                     leader[target(&self.labels, done)] = true;
-                    leader[i + 1] = true;
                 }
                 Ins::SetPath { .. } => leader[i + 1] = true,
                 Ins::EachNext { exit, .. } => {
@@ -1619,7 +1653,16 @@ impl<'r, 's> Compiler<'r, 's> {
             }
             let total: u32 = self.weight[i..j].iter().sum();
             let start = code.len() as u32;
-            if total > 0 {
+            // Un bloque que empieza con el chequeo de cancelación (cada sentencia de un bloque):
+            // los pasos y el chequeo en una instrucción, con el `rest` y la ubicación del chequeo.
+            let first = (i..j).find(|&k| !matches!(self.code[k], Ins::Nop));
+            let fused = first.filter(|&k| total > 0 && matches!(self.code[k], Ins::CheckCancel));
+            if let Some(k) = fused {
+                code.push(Ins::StepsCancel(total));
+                new_rest.push(rest[k]);
+                new_loc.push(self.loc[k]);
+                new_stop.push(self.stop_of[k]);
+            } else if total > 0 {
                 code.push(Ins::Steps(total));
                 new_rest.push(0);
                 new_loc.push(self.loc[i]);
@@ -1628,7 +1671,7 @@ impl<'r, 's> Compiler<'r, 's> {
             for k in i..j {
                 // Un salto al comienzo del bloque cae en su `Steps`.
                 new_index[k] = if k == i { start } else { code.len() as u32 };
-                if matches!(self.code[k], Ins::Nop) {
+                if matches!(self.code[k], Ins::Nop) || fused == Some(k) {
                     continue;
                 }
                 code.push(self.code[k]);
@@ -1682,6 +1725,7 @@ impl<'r, 's> Compiler<'r, 's> {
             spills: self.spills,
             nregs: self.max_reg,
             ics: (0..self.ics).map(|_| Cell::new(0)).collect(),
+            ic_here: self.ic_hops.iter().map(|&h| self.hops[h as usize].from.is_none()).collect(),
             ic_hops: self.ic_hops,
             hops: self.hops,
             deopts: (0..=self.feedback as usize).map(|_| Cell::new(0)).collect(),
@@ -1785,6 +1829,13 @@ impl Interpreter {
     pub(super) fn run_program_chunk(&mut self, stmts: &[Node], env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
         let chunk = compile_program(stmts);
         self.vm_last_program = Some(chunk.clone());
+        #[cfg(feature = "vm-profile")]
+        {
+            let r = self.run_chunk(&chunk, env);
+            profile::flush();
+            r
+        }
+        #[cfg(not(feature = "vm-profile"))]
         self.run_chunk(&chunk, env)
     }
 
@@ -2037,10 +2088,20 @@ impl Interpreter {
             let at = pc;
             let ins = chunk.code[at].get();
             pc += 1;
+            #[cfg(feature = "vm-profile")]
+            profile::hit(&ins);
             let out: Result<(), Control> = match ins {
                 Ins::Steps(w) => {
                     self.steps = self.steps.wrapping_add(w as u64);
                     Ok(())
+                }
+                Ins::StepsCancel(w) => {
+                    self.steps = self.steps.wrapping_add(w as u64);
+                    if self.cancel.flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.check_cancel()
+                    } else {
+                        Ok(())
+                    }
                 }
                 Ins::Nop => Ok(()),
                 Ins::CheckCancel => {
@@ -2140,6 +2201,16 @@ impl Interpreter {
                         None => Err(undefined_variable(nm, loc)),
                     }
                 }
+                Ins::LoadGlobal { dst, name, ic } => {
+                    let v = env.borrow().bindings.get_cached(&chunk.names[name as usize], &chunk.ics[ic as usize]).cloned();
+                    match v {
+                        Some(v) => {
+                            self.put(base, dst, v);
+                            Ok(())
+                        }
+                        None => self.vm_load_name(&chunk, &env, base, dst, name, ic, at),
+                    }
+                }
                 Ins::LoadName { dst, name, ic } => match self.load_free(&chunk, &env, name, ic) {
                     Some(v) => {
                         self.put(base, dst, v);
@@ -2210,6 +2281,25 @@ impl Interpreter {
                             _ => ord_op(x.partial_cmp_num(&y), op),
                         };
                         self.put(base, dst, syn_bool(r));
+                        Ok(())
+                    }
+                    None => self.vm_binary_miss(&chunk, &env, base, at, dst, op, a, b, fb),
+                },
+                Ins::IntCmpJump { dst, op, a, b, fb } => match self.int_pair(&chunk, &env, base, a, b) {
+                    Some((x, y)) => {
+                        let r = match op {
+                            BinOp::Lt => x < y,
+                            BinOp::Le => x <= y,
+                            BinOp::Gt => x > y,
+                            BinOp::Ge => x >= y,
+                            BinOp::Eq => x == y,
+                            _ => x != y,
+                        };
+                        match (r, chunk.code[pc].get()) {
+                            (true, _) => pc += 1,
+                            (false, Ins::JumpIfFalsy { to, .. }) => pc = to as usize,
+                            _ => unreachable!("IntCmpJump sin su JumpIfFalsy"),
+                        }
                         Ok(())
                     }
                     None => self.vm_binary_miss(&chunk, &env, base, at, dst, op, a, b, fb),
@@ -2314,6 +2404,26 @@ impl Interpreter {
                     self.put(base, dst, v);
                     Ok(())
                 })(),
+                Ins::SetGlobal { src, name, dst, ic } => (|| {
+                    let v = self.opnd(&chunk, &env, base, src, at)?;
+                    // Un módulo sincroniza su mapa de exportaciones: por el camino de `SetName`.
+                    let done = {
+                        let mut e = env.borrow_mut();
+                        !e.name.starts_with("module:")
+                            && match e.bindings.get_cached_mut(&chunk.names[name as usize], &chunk.ics[ic as usize]) {
+                                Some(slot) => {
+                                    *slot = v.clone();
+                                    true
+                                }
+                                None => false,
+                            }
+                    };
+                    if !done && !self.set_free(&chunk, &env, name, ic, v.clone()) {
+                        return Err(set_undefined(&chunk.names[name as usize]));
+                    }
+                    self.put(base, dst, v);
+                    Ok(())
+                })(),
                 Ins::SetName { src, name, dst, ic } => (|| {
                     let v = self.opnd(&chunk, &env, base, src, at)?;
                     if !self.set_free(&chunk, &env, name, ic, v.clone()) {
@@ -2322,14 +2432,47 @@ impl Interpreter {
                     self.put(base, dst, v);
                     Ok(())
                 })(),
-                Ins::TryInPlace { dst, node, name, done, ic, slot } => match self.vm_try_in_place(&chunk, &env, base, dst, node, name, ic, slot) {
-                    Ok(true) => {
-                        pc = done as usize;
-                        Ok(())
+                // La vía en el lugar sólo puede aplicar a una lista o un mapa: el tipo de la
+                // variable se mira acá, sin clonarla, y la referencia sólo se llama si puede.
+                Ins::TryInPlace { name, slot, .. }
+                    if name != NONE
+                        && slot != u16::MAX
+                        && !matches!(self.vm_locals[self.vm_lbase + slot as usize], Some(SynValue::List(_) | SynValue::Map(_))) =>
+                {
+                    Ok(())
+                }
+                Ins::TryInPlace { name, ic, .. }
+                    if name != NONE
+                        && ic != NONE
+                        && chunk.ic_here[ic as usize]
+                        && env
+                            .borrow()
+                            .bindings
+                            .get_cached(&chunk.names[name as usize], &chunk.ics[ic as usize])
+                            .is_some_and(|v| !matches!(v, SynValue::List(_) | SynValue::Map(_))) =>
+                {
+                    Ok(())
+                }
+                Ins::TryInPlace { dst, node, name, done, ic, slot } => {
+                    // Los pasos del resto del bloque (el valor y la asignación) no corrieron todavía.
+                    let pending = chunk.rest[at] as u64;
+                    self.steps = self.steps.wrapping_sub(pending);
+                    match self.vm_try_in_place(&chunk, &env, base, dst, node, name, ic, slot) {
+                        Ok(true) => {
+                            pc = done as usize;
+                            Ok(())
+                        }
+                        Ok(false) => {
+                            self.steps = self.steps.wrapping_add(pending);
+                            Ok(())
+                        }
+                        Err(c) => {
+                            // El camino de error vuelve a descontar `rest`.
+                            self.steps = self.steps.wrapping_add(pending);
+                            Err(c)
+                        }
                     }
-                    Ok(false) => Ok(()),
-                    Err(c) => Err(c),
-                },
+                }
                 Ins::Exec { dst, node } => self.exec(&chunk.nodes[node as usize], &env).map(|v| self.put(base, dst, v)),
                 Ins::Call { dst, func, args, n, site } => {
                     match self.vm_call(&chunk, base, at, dst, func, args, n, site) {
@@ -2436,6 +2579,40 @@ impl Interpreter {
                     Err(c) => Err(c),
                 },
                 Ins::Define { dst, node, child } => self.vm_define(&chunk, &env, base, dst, node, child),
+                // Volver de una llamada que corre la VM, sin nada abierto adentro del cuerpo (ni
+                // vuelta ni brazo con frame): directo al llamador, con el mismo epílogo que el camino
+                // de `Control::Give` de abajo (F3.5). `give` y el final del cuerpo terminan su
+                // bloque: no sobran pasos.
+                Ins::Give { src } | Ins::End { src } if depth == 0 && self.vm_frames.len() > entry => {
+                    match self.opnd(&chunk, &env, base, src, at) {
+                        Ok(v) => {
+                            let caller = self.vm_frames.pop().expect("frame de la VM");
+                            if let Some(t) = caller.taint {
+                                self.leave_call(t);
+                            }
+                            self.vm_iters.truncate(iter_base);
+                            let call_env = std::mem::replace(&mut env, caller.env);
+                            if chunk.regframe {
+                                drop(call_env);
+                            } else {
+                                self.release_frame(call_env);
+                            }
+                            self.vm_locals.truncate(self.vm_lbase);
+                            self.vm_lbase = caller.lbase;
+                            drop(caller.task);
+                            self.recursion_depth -= 1;
+                            self.vm_regs.truncate(base);
+                            chunk = caller.chunk;
+                            base = caller.base;
+                            pc = caller.pc;
+                            depth = caller.depth;
+                            iter_base = caller.iter_base;
+                            self.put(base, caller.dst, v);
+                            Ok(())
+                        }
+                        Err(c) => Err(c),
+                    }
+                }
                 Ins::Give { src } => match self.opnd(&chunk, &env, base, src, at) {
                     Ok(v) => Err(Control::Give(v)),
                     Err(c) => Err(c),
@@ -2574,6 +2751,13 @@ impl Interpreter {
     ) -> Result<(), Control> {
         let quick = match self.num_pair(chunk, env, base, a, b) {
             Some((Num::I(_), Num::I(_))) if op == BinOp::Div => Some(Ins::FloatArith { dst, op, a, b, fb }),
+            // Una comparación que sólo usa el salto que le sigue: compara y salta (F3.5).
+            Some((Num::I(_), Num::I(_)))
+                if matches!(int_form(op, dst, a, b, fb), Some(Ins::IntCmp { .. }))
+                    && matches!(chunk.code.get(at + 1).map(Cell::get), Some(Ins::JumpIfFalsy { src: Opnd::Reg(r), .. }) if r == dst) =>
+            {
+                Some(Ins::IntCmpJump { dst, op, a, b, fb })
+            }
             Some((Num::I(_), Num::I(_))) => int_form(op, dst, a, b, fb),
             Some(_) => float_form(op, dst, a, b, fb),
             None => None,
@@ -2730,6 +2914,19 @@ impl Interpreter {
                 }
             }
             self.release_frame(frame);
+        }
+    }
+
+    /// `LoadGlobal` que no encontró el lugar en el entorno actual: la búsqueda de `LoadName`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_load_name(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, dst: Reg, name: u32, ic: u32, at: usize) -> Result<(), Control> {
+        match self.load_free(chunk, env, name, ic) {
+            Some(v) => {
+                self.put(base, dst, v);
+                Ok(())
+            }
+            None => Err(undefined_variable(&chunk.names[name as usize], &chunk.locs[chunk.loc[at] as usize])),
         }
     }
 
@@ -2894,7 +3091,9 @@ impl Interpreter {
         if s.names.is_none() {
             if let SynValue::Task(t) = &f {
                 if let Some(code) = self.vm_code_for(t).cloned() {
-                    if s.checked {
+                    // Con tantos posicionales como parámetros no sobra ni falta ninguno: el chequeo
+                    // no puede fallar y no se recorren los parámetros en cada llamada (F3.5).
+                    if s.checked && n != t.parameters.len() {
                         check_task_arity(t, n, |_| false, loc)?;
                     }
                     self.recursion_depth += 1;
@@ -3147,5 +3346,93 @@ fn explain_chunk(c: &Chunk, title: &str, out: &mut String) {
     }
     for (i, ch) in c.children.iter().enumerate() {
         explain_chunk(ch, &format!("{} / hijo {}", title, i), out);
+    }
+}
+
+/// El perfil de la VM (feature `vm-profile`, sólo para elegir superinstrucciones): cuántas veces
+/// corre cada instrucción y cada par seguido (en el orden en que corren, también a través de una
+/// llamada). Se acumula por hilo y se junta al terminar cada programa.
+#[cfg(feature = "vm-profile")]
+pub mod profile {
+    use super::Ins;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::mem::Discriminant;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Local {
+        tags: HashMap<Discriminant<Ins>, u16>,
+        names: Vec<String>,
+        prev: Option<u16>,
+        single: HashMap<u16, u64>,
+        pairs: HashMap<(u16, u16), u64>,
+    }
+
+    thread_local! {
+        static LOCAL: RefCell<Local> = RefCell::new(Local::default());
+    }
+
+    static TOTAL: Mutex<Option<(HashMap<String, u64>, HashMap<(String, String), u64>)>> = Mutex::new(None);
+
+    pub(crate) fn hit(ins: &Ins) {
+        LOCAL.with(|l| {
+            let mut l = l.borrow_mut();
+            let d = std::mem::discriminant(ins);
+            let t = match l.tags.get(&d) {
+                Some(t) => *t,
+                None => {
+                    let dbg = format!("{:?}", ins);
+                    let name = dbg.split([' ', '(']).next().unwrap_or("?").to_string();
+                    let t = l.names.len() as u16;
+                    l.names.push(name);
+                    l.tags.insert(d, t);
+                    t
+                }
+            };
+            *l.single.entry(t).or_default() += 1;
+            if let Some(p) = l.prev {
+                *l.pairs.entry((p, t)).or_default() += 1;
+            }
+            l.prev = Some(t);
+        });
+    }
+
+    pub(crate) fn flush() {
+        LOCAL.with(|l| {
+            let mut l = l.borrow_mut();
+            let mut g = TOTAL.lock().unwrap();
+            let (single, pairs) = g.get_or_insert_with(Default::default);
+            let drained: Vec<_> = l.single.drain().collect();
+            for (t, n) in drained {
+                *single.entry(l.names[t as usize].clone()).or_default() += n;
+            }
+            let drained: Vec<_> = l.pairs.drain().collect();
+            for ((a, b), n) in drained {
+                *pairs.entry((l.names[a as usize].clone(), l.names[b as usize].clone())).or_default() += n;
+            }
+            l.prev = None;
+        });
+    }
+
+    /// Lo acumulado hasta ahora, de más a menos frecuente, y lo vacía.
+    pub fn take() -> String {
+        use std::fmt::Write;
+        let (single, pairs) = TOTAL.lock().unwrap().take().unwrap_or_default();
+        let total: u64 = single.values().sum();
+        let mut out = String::new();
+        let _ = writeln!(out, "instrucciones: {}", total);
+        let mut s: Vec<_> = single.into_iter().collect();
+        s.sort_by(|a, b| b.1.cmp(&a.1));
+        for (name, n) in s.iter().take(30) {
+            let _ = writeln!(out, "  {:>6.2}%  {:>12}  {}", *n as f64 * 100.0 / total.max(1) as f64, n, name);
+        }
+        let _ = writeln!(out, "pares:");
+        let mut p: Vec<_> = pairs.into_iter().collect();
+        p.sort_by(|a, b| b.1.cmp(&a.1));
+        for ((a, b), n) in p.iter().take(40) {
+            let _ = writeln!(out, "  {:>6.2}%  {:>12}  {} -> {}", *n as f64 * 100.0 / total.max(1) as f64, n, a, b);
+        }
+        out
     }
 }

@@ -389,6 +389,8 @@ mod vm;
 pub use vm::TaskCode;
 #[doc(hidden)]
 pub use vm::{explain_after_run, explain_source};
+#[cfg(feature = "vm-profile")]
+pub use vm::profile as vm_profile;
 
 // =========================================================
 // entorno
