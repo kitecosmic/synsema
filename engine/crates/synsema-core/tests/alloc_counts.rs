@@ -87,7 +87,8 @@ fn heap_allocations_per_construct() {
         ("set x to i ** 1", "", "    set x to i ** 1\n", 3),
         ("set x to xs[1]", "let xs be [1, 2, 3]\n", "    set x to xs[1]\n", 0),
         ("set x to m.a", "let m be {\"a\": 1}\n", "    set x to m.a\n", 0),
-        ("set x to \"hello\"", "", "    set x to \"hello\"\n", 1),
+        // F3.3: el literal sale del pool de constantes de la VM (suma una referencia); antes, 1.
+        ("set x to \"hello\"", "", "    set x to \"hello\"\n", 0),
         ("when i < 0", "", "    when i < 0\n        set x to 1\n", 0),
         ("builtin abs(i)", "", "    set x to abs(i)\n", 0),
         ("llamada f()", "task f()\n    give 1\n", "    set x to f()\n", 0),

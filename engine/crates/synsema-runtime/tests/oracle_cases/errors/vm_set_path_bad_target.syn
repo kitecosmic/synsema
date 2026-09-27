@@ -1,0 +1,8 @@
+-- `set` con un camino sobre algo que no es un contenedor, en código compilado.
+task put(x)
+    let n be x
+    set n.a to 1
+    give n
+print(put({}))
+print(put({"a": 0}))
+print(put(5))

@@ -1,0 +1,67 @@
+-- F3.3 contra la referencia: literales de lista y mapa, propiedades e índices, pipes, `set` con
+-- caminos (y la vía en el lugar sobre caminos) y literales de texto del pool. Todo dentro de
+-- tasks que se llaman más de una vez (corren compiladas) y en `let`/`give`.
+
+task shapes(k)
+    let xs be [k, k + 1, [k * 2, "t"]]
+    let m be {"a": k, "b": [1, 2], "c": {"d": "e"}, "a": k + 100}
+    let first be xs[0] + xs[2][0]
+    let deep be m.c.d + m["c"]["d"]
+    let keys be keys(m)
+    give [first, deep, keys, m.a, length(m.b)]
+let s1 be shapes(1)
+let s2 be shapes(2)
+print(s2)
+
+-- Pipes: con llamada (`f(a)` = `f(valor, a)`) y con una función suelta (sin chequeo de aridad).
+task double(x)
+    give x * 2
+task add(x, y)
+    give x + y
+task only_one(x, extra)
+    give text(x) + "/" + text(extra)
+task piped(k)
+    let a be k |> double |> add(10)
+    let b be [3, 1, 2] |> sort |> length
+    let c be k |> only_one
+    give [a, b, c]
+let p1 be piped(1)
+let p2 be piped(5)
+print(p2)
+
+-- `set` con caminos: mapas y listas anidados, dentro de un bucle, con la vía en el lugar.
+task paths(n)
+    let st be {"items": [], "count": 0, "meta": {"tags": []}}
+    let i be 0
+    while i < n
+        set st.items to append(st.items, i)
+        set st["count"] to st["count"] + 1
+        set st.meta.tags to st.meta.tags + ["t" + text(i)]
+        set i to i + 1
+    let grid be [[0, 0], [0, 0]]
+    set grid[1][0] to 7
+    give [st.count, length(st.items), st.meta.tags, grid]
+let q1 be paths(2)
+let q2 be paths(4)
+print(q2)
+
+-- Semántica de valor: una copia tomada antes no ve los cambios del camino.
+task snapshot()
+    let a be {"xs": [1, 2]}
+    let b be a
+    set a.xs to append(a.xs, 3)
+    set a.xs[0] to 100
+    give [a.xs, b.xs]
+let v1 be snapshot()
+let v2 be snapshot()
+print(v2)
+
+-- Textos del pool: se comparan, se concatenan y se usan como claves.
+task texts(k)
+    let t be "hola"
+    let u be "hola"
+    let m be {"hola": k}
+    give [t == u, t + " " + u, m[t], length(t)]
+let t1 be texts(1)
+let t2 be texts(2)
+print(t2)

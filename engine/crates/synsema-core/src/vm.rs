@@ -49,9 +49,6 @@ pub(crate) enum Ins {
     Nop,
     CheckCancel,
     Const { dst: Reg, k: u32 },
-    /// Un literal de texto: un `Rc<str>` nuevo por evaluación, como la referencia (el pool de F3.3
-    /// lo cambia).
-    Text { dst: Reg, k: u32 },
     Move { dst: Reg, src: Opnd },
     Drop { r: Reg },
     /// Slot del frame propio que puede estar vacío: si lo está, por nombre desde el padre.
@@ -74,10 +71,23 @@ pub(crate) enum Ins {
     SetName { src: Opnd, name: u32, dst: Reg, ic: u32 },
     /// `set P to append(P, …)` y compañía: la vía en el lugar de la referencia
     /// (`try_update_in_place`) si la variable es una lista o un mapa; si aplica, salta a `done`.
-    /// `ic` = `NONE` si la variable es del resolver (se mira por nombre desde el frame propio).
+    /// `ic` = `NONE` si la variable es del resolver (se mira por nombre desde el frame propio);
+    /// `name` = `NONE` si el destino es un camino (siempre se prueba).
     TryInPlace { dst: Reg, node: u32, name: u32, done: u32, ic: u32 },
     /// El nodo lo corre el tree-walker.
     Exec { dst: Reg, node: u32 },
+    /// `[a, b, …]` con los elementos en `n` registros desde `first`.
+    MakeList { dst: Reg, first: Reg, n: u16 },
+    /// `{k: v, …}` con clave y valor alternados en `2n` registros desde `first`.
+    MakeMap { dst: Reg, first: Reg, n: u16 },
+    GetProp { dst: Reg, obj: Opnd, name: u32 },
+    GetIndex { dst: Reg, obj: Opnd, idx: Opnd },
+    /// `set <camino> to v`: el destino lo recorre la referencia (`exec_set`), con el valor ya
+    /// evaluado.
+    SetPath { src: Opnd, node: u32, dst: Reg },
+    /// `private(…)`, `print(…)` y los demás protegidos tienen que resolver al builtin de verdad; la
+    /// referencia lo chequea antes de evaluar los argumentos.
+    CheckProtected { func: Reg, name: u32 },
     /// Una llamada (F3.2): la función en `func`, los argumentos en `n` registros desde `args`. Si
     /// es una task compilada y todos van por posición, la VM entra al cuerpo sin recursión en
     /// Rust; si no, el camino de siempre (`call_value_named`).
@@ -125,7 +135,6 @@ pub(crate) struct Chunk {
     loc: Vec<u32>,
     locs: Vec<SourceLocation>,
     consts: Vec<SynValue>,
-    texts: Vec<String>,
     names: Vec<Arc<str>>,
     nodes: Vec<Node>,
     children: Vec<Rc<Chunk>>,
@@ -168,8 +177,9 @@ struct Hops {
 struct CallSite {
     /// Los nombres de los argumentos, si alguno va por nombre (entonces, camino de siempre).
     names: Option<Box<[Option<String>]>>,
-    /// Si la función es uno de los builtins protegidos por nombre (`PROTECTED_BUILTIN_NAMES`).
-    protected: Option<u32>,
+    /// Si se chequea la aridad: una llamada escrita sí; el paso de un pipe que no es una llamada
+    /// (`xs |> f`) no, como `call_value` en la referencia.
+    checked: bool,
 }
 
 /// El estado del llamador de una llamada que la VM corre sin recursión (F3.2). El frame de la
@@ -261,7 +271,6 @@ struct Compiler<'r, 's> {
     stop_of: Vec<u32>,
     locs: Vec<SourceLocation>,
     consts: Vec<SynValue>,
-    texts: Vec<String>,
     names: Vec<Arc<str>>,
     nodes: Vec<Node>,
     children: Vec<Rc<Chunk>>,
@@ -299,7 +308,6 @@ impl<'r, 's> Compiler<'r, 's> {
             stop_of: Vec::new(),
             locs: Vec::new(),
             consts: Vec::new(),
-            texts: Vec::new(),
             names: Vec::new(),
             nodes: Vec::new(),
             children: Vec::new(),
@@ -510,6 +518,27 @@ impl<'r, 's> Compiler<'r, 's> {
                     self.bind(d);
                 }
             }
+            K::SetMutation { target, value } => {
+                // `set m.a[k] to v`: la vía en el lugar si aplica (siempre se prueba: la variable
+                // de la raíz no dice si el lugar es una lista), el valor compilado y el destino por
+                // la referencia.
+                self.enter();
+                let done = if in_place_shape(target, value) {
+                    let node = self.cold(n);
+                    let done = self.label();
+                    self.emit(Ins::TryInPlace { dst, node, name: NONE, done, ic: NONE });
+                    Some(done)
+                } else {
+                    None
+                };
+                let v = self.expr(value);
+                let node = self.cold(target);
+                self.at(&n.location);
+                self.emit(Ins::SetPath { src: v, node, dst });
+                if let Some(d) = done {
+                    self.bind(d);
+                }
+            }
             K::WhenStatement { .. } => self.when(n, want),
             K::WhileStatement { condition, body } => {
                 self.enter();
@@ -663,8 +692,9 @@ impl<'r, 's> Compiler<'r, 's> {
                 self.call(n, dst);
             }
             _ if is_expression(&n.kind) => {
-                let v = self.expr(n);
+                let v = self.expr_in(n, want);
                 match (want, v) {
+                    (Some(d), v) if v == Opnd::Reg(d) => {}
                     (Some(d), v) => self.emit(Ins::Move { dst: d, src: v }),
                     (None, Opnd::Reg(r)) => self.emit(Ins::Drop { r }),
                     (None, _) => {}
@@ -756,6 +786,18 @@ impl<'r, 's> Compiler<'r, 's> {
     // -- expresiones ----------------------------------------------------------------------------
 
     fn expr(&mut self, n: &Node) -> Opnd {
+        self.expr_in(n, None)
+    }
+
+    /// El registro destino: el pedido (el lugar de un argumento o de un elemento) o uno nuevo.
+    fn dst(&mut self, want: Option<Reg>) -> Reg {
+        want.unwrap_or_else(|| self.reg())
+    }
+
+    /// Compila una expresión dejando su valor, si va a un registro, en `want` (si lo hay): una VM
+    /// de registros escribe cada resultado donde se lo va a usar, sin un `Move` después (L4).
+    /// Constantes y slots ligados seguro siguen siendo operandos.
+    fn expr_in(&mut self, n: &Node, want: Option<Reg>) -> Opnd {
         use NodeKind as K;
         self.at(&n.location);
         match &n.kind {
@@ -772,12 +814,83 @@ impl<'r, 's> Compiler<'r, 's> {
                 Opnd::Const(self.konst(SynValue::Nothing))
             }
             K::TextLiteral { value } => {
+                // Del pool (L7, ex F1.8): evaluarlo suma una referencia. Un texto nunca se modifica
+                // en el lugar, así que compartirlo no se ve.
                 self.enter();
-                self.texts.push(value.clone());
-                let k = (self.texts.len() - 1) as u32;
-                let dst = self.reg();
-                self.emit(Ins::Text { dst, k });
+                Opnd::Const(self.konst(syn_text(value.as_str())))
+            }
+            K::ListLiteral { elements } => {
+                self.enter();
+                let first = self.block_regs(elements.len());
+                for (i, e) in elements.iter().enumerate() {
+                    self.into_reg(e, first + i as Reg, first + elements.len() as Reg);
+                }
+                self.at(&n.location);
+                let dst = self.dst(want);
+                self.emit(Ins::MakeList { dst, first, n: elements.len() as u16 });
                 Opnd::Reg(dst)
+            }
+            K::MapLiteral { pairs } => {
+                self.enter();
+                let first = self.block_regs(2 * pairs.len());
+                let end = first + 2 * pairs.len() as Reg;
+                for (i, (k, v)) in pairs.iter().enumerate() {
+                    self.into_reg(k, first + 2 * i as Reg, end);
+                    self.into_reg(v, first + 2 * i as Reg + 1, end);
+                }
+                self.at(&n.location);
+                let dst = self.dst(want);
+                self.emit(Ins::MakeMap { dst, first, n: pairs.len() as u16 });
+                Opnd::Reg(dst)
+            }
+            // `a of b.c`: si leer `b.c` falla con "Map has no key", la referencia agrega una nota
+            // sobre la precedencia de `of`. Raro: lo corre ella.
+            K::PropertyAccess { object, via_of: true, .. } if matches!(object.kind, K::PropertyAccess { .. }) => {
+                self.exec_expr(n, want)
+            }
+            K::PropertyAccess { property_name, object, .. } => {
+                self.enter();
+                let o = self.expr(object);
+                self.at(&n.location);
+                let name = self.name(property_name);
+                let dst = self.dst(want);
+                self.emit(Ins::GetProp { dst, obj: o, name });
+                Opnd::Reg(dst)
+            }
+            K::IndexAccess { object, index } => {
+                self.enter();
+                let o = self.expr(object);
+                let o = self.keep_until(o, index);
+                let i = self.expr(index);
+                self.at(&n.location);
+                let dst = self.dst(want);
+                self.emit(Ins::GetIndex { dst, obj: o, idx: i });
+                Opnd::Reg(dst)
+            }
+            K::PipeExpression { value, transforms } => {
+                self.enter();
+                let v = self.expr(value);
+                let mut cur = self.to_reg(v);
+                for (ti, t) in transforms.iter().enumerate() {
+                    let dst = if ti + 1 == transforms.len() { self.dst(want) } else { self.reg() };
+                    match &t.kind {
+                        // `xs |> f(a)` = `f(xs, a)`: la referencia no cuenta el nodo de la llamada
+                        // (`exec_call_with_first` evalúa el nombre y los argumentos).
+                        K::TaskCall { name, arguments } => self.call_with(t, name, arguments, Some(cur), dst, true),
+                        _ => {
+                            let f = self.expr(t);
+                            let func = self.to_reg(f);
+                            let first = self.block_regs(1);
+                            self.emit(Ins::Move { dst: first, src: Opnd::Reg(cur) });
+                            self.sites.push(CallSite { names: None, checked: false });
+                            let site = (self.sites.len() - 1) as u32;
+                            self.at(&t.location);
+                            self.emit(Ins::Call { dst, func, args: first, n: 1, site });
+                        }
+                    }
+                    cur = dst;
+                }
+                Opnd::Reg(cur)
             }
             K::Identifier { name } => {
                 self.enter();
@@ -787,18 +900,18 @@ impl<'r, 's> Compiler<'r, 's> {
                         Opnd::Local(slot)
                     }
                     Target::Slot { depth: 0, scope, slot, .. } if self.in_frame(scope, 0) => {
-                        let dst = self.reg();
+                        let dst = self.dst(want);
                         self.emit(Ins::LoadLocal { dst, slot, name: nm });
                         Opnd::Reg(dst)
                     }
                     Target::Slot { depth, scope, slot, .. } if self.in_frame(scope, depth) => {
-                        let dst = self.reg();
+                        let dst = self.dst(want);
                         let at = self.hops_here();
                         self.emit(Ins::LoadOuter { dst, depth, slot, name: nm, at });
                         Opnd::Reg(dst)
                     }
                     _ => {
-                        let dst = self.reg();
+                        let dst = self.dst(want);
                         let ic = self.ic();
                         self.emit(Ins::LoadName { dst, name: nm, ic });
                         Opnd::Reg(dst)
@@ -809,7 +922,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 self.enter();
                 let l = self.expr(left);
                 self.at(&n.location);
-                let dst = self.reg();
+                let dst = self.dst(want);
                 let short = self.label();
                 let end = self.label();
                 if *operator == BinOp::And {
@@ -839,7 +952,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 Opnd::Reg(dst)
             }
             K::BinaryOp { operator, right, .. } if *operator == BinOp::FloorDiv && floor_div_hint(n, right) => {
-                self.exec_expr(n)
+                self.exec_expr(n, want)
             }
             K::BinaryOp { left, operator, right } => {
                 self.enter();
@@ -847,7 +960,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 let a = self.keep_until(a, right);
                 let b = self.expr(right);
                 self.at(&n.location);
-                let dst = self.reg();
+                let dst = self.dst(want);
                 let fb = self.feedback;
                 self.feedback = self.feedback.saturating_add(1);
                 self.emit(Ins::Binary { dst, op: *operator, a, b, fb });
@@ -857,13 +970,13 @@ impl<'r, 's> Compiler<'r, 's> {
                 self.enter();
                 let a = self.expr(operand);
                 self.at(&n.location);
-                let dst = self.reg();
+                let dst = self.dst(want);
                 self.emit(Ins::Unary { dst, op: *operator, a });
                 Opnd::Reg(dst)
             }
             K::CompareChain { operands, operators } => {
                 self.enter();
-                let dst = self.reg();
+                let dst = self.dst(want);
                 let fail = self.label();
                 let end = self.label();
                 let mut prev = self.expr(&operands[0]);
@@ -893,16 +1006,16 @@ impl<'r, 's> Compiler<'r, 's> {
                 Opnd::Reg(dst)
             }
             K::LambdaExpression { .. } => {
-                let dst = self.reg();
+                let dst = self.dst(want);
                 self.define(n, dst);
                 Opnd::Reg(dst)
             }
             K::TaskCall { .. } => {
-                let dst = self.reg();
+                let dst = self.dst(want);
                 self.call(n, dst);
                 Opnd::Reg(dst)
             }
-            _ => self.exec_expr(n),
+            _ => self.exec_expr(n, want),
         }
     }
 
@@ -910,35 +1023,67 @@ impl<'r, 's> Compiler<'r, 's> {
     fn call(&mut self, n: &Node, dst: Reg) {
         let NodeKind::TaskCall { name, arguments } = &n.kind else { unreachable!() };
         self.enter();
+        self.call_with(n, name, arguments, None, dst, true);
+    }
+
+    /// La función, el chequeo de los protegidos (antes de los argumentos, como la referencia), un
+    /// primer argumento ya evaluado si lo hay (un pipe), los argumentos y `Call`.
+    fn call_with(&mut self, n: &Node, name: &Node, arguments: &[crate::ast::Arg], first_arg: Option<Reg>, dst: Reg, checked: bool) {
         let f = self.expr(name);
         let func = self.to_reg(f);
-        let first = self.next_reg;
-        for _ in arguments {
-            self.reg();
+        if let Some(id) = name.as_identifier().filter(|id| PROTECTED_BUILTIN_NAMES.contains(id)) {
+            let nm = self.name(id);
+            self.at(&n.location);
+            self.emit(Ins::CheckProtected { func, name: nm });
         }
-        let after = self.next_reg;
+        let lead = usize::from(first_arg.is_some());
+        let total = lead + arguments.len();
+        let first = self.block_regs(total);
+        let end = first + total as Reg;
+        if let Some(r) = first_arg {
+            self.emit(Ins::Move { dst: first, src: Opnd::Reg(r) });
+        }
         for (i, a) in arguments.iter().enumerate() {
-            let v = self.expr(&a.value);
-            let slot = first + i as Reg;
-            if v != Opnd::Reg(slot) {
-                self.emit(Ins::Move { dst: slot, src: v });
-            }
-            self.next_reg = after;
+            self.into_reg(&a.value, first + (lead + i) as Reg, end);
         }
         let names = if arguments.iter().any(|a| a.name.is_some()) {
-            Some(arguments.iter().map(|a| a.name.clone()).collect::<Vec<_>>().into_boxed_slice())
+            let mut v: Vec<Option<String>> = Vec::with_capacity(total);
+            if lead == 1 {
+                v.push(None);
+            }
+            v.extend(arguments.iter().map(|a| a.name.clone()));
+            Some(v.into_boxed_slice())
         } else {
             None
         };
-        let protected = name.as_identifier().filter(|id| PROTECTED_BUILTIN_NAMES.contains(id)).map(|id| self.name(id));
-        self.sites.push(CallSite { names, protected });
+        self.sites.push(CallSite { names, checked });
         let site = (self.sites.len() - 1) as u32;
         self.at(&n.location);
-        self.emit(Ins::Call { dst, func, args: first, n: arguments.len() as u16, site });
+        self.emit(Ins::Call { dst, func, args: first, n: total as u16, site });
     }
 
-    fn exec_expr(&mut self, n: &Node) -> Opnd {
-        let dst = self.reg();
+    /// `n` registros seguidos (para argumentos o elementos) y los temporales después.
+    fn block_regs(&mut self, n: usize) -> Reg {
+        let first = self.next_reg;
+        for _ in 0..n {
+            self.reg();
+        }
+        first
+    }
+
+    /// Evalúa `e` y deja su valor en el registro `slot`; los temporales se liberan hasta `end`.
+    fn into_reg(&mut self, e: &Node, slot: Reg, end: Reg) {
+        let v = self.expr_in(e, Some(slot));
+        if v != Opnd::Reg(slot) {
+            self.emit(Ins::Move { dst: slot, src: v });
+        }
+        self.next_reg = end;
+    }
+
+
+
+    fn exec_expr(&mut self, n: &Node, want: Option<Reg>) -> Opnd {
+        let dst = self.dst(want);
         let node = self.cold(n);
         self.emit(Ins::Exec { dst, node });
         Opnd::Reg(dst)
@@ -986,6 +1131,7 @@ impl<'r, 's> Compiler<'r, 's> {
                     leader[target(&self.labels, done)] = true;
                     leader[i + 1] = true;
                 }
+                Ins::SetPath { .. } => leader[i + 1] = true,
                 Ins::EachNext { exit, .. } => {
                     leader[target(&self.labels, exit)] = true;
                     leader[i + 1] = true;
@@ -1071,7 +1217,6 @@ impl<'r, 's> Compiler<'r, 's> {
             loc: new_loc,
             locs: self.locs,
             consts: self.consts,
-            texts: self.texts,
             names: self.names,
             nodes: self.nodes,
             children: self.children,
@@ -1104,6 +1249,11 @@ fn is_expression(k: &NodeKind) -> bool {
             | K::UnaryOp { .. }
             | K::CompareChain { .. }
             | K::LambdaExpression { .. }
+            | K::ListLiteral { .. }
+            | K::MapLiteral { .. }
+            | K::PropertyAccess { .. }
+            | K::IndexAccess { .. }
+            | K::PipeExpression { .. }
     )
 }
 
@@ -1117,6 +1267,10 @@ fn is_simple(n: &Node) -> bool {
         }
         K::UnaryOp { operand, .. } => is_simple(operand),
         K::CompareChain { operands, .. } => operands.iter().all(is_simple),
+        K::ListLiteral { elements } => elements.iter().all(is_simple),
+        K::MapLiteral { pairs } => pairs.iter().all(|(k, v)| is_simple(k) && is_simple(v)),
+        K::PropertyAccess { object, via_of, .. } => !*via_of && is_simple(object),
+        K::IndexAccess { object, index } => is_simple(object) && is_simple(index),
         _ => false,
     }
 }
@@ -1353,11 +1507,44 @@ impl Interpreter {
                     self.put(base, dst, v);
                     Ok(())
                 }
-                Ins::Text { dst, k } => {
-                    let v = syn_text(chunk.texts[k as usize].as_str());
-                    self.put(base, dst, v);
+                Ins::MakeList { dst, first, n } => {
+                    let from = base + first as usize;
+                    let items: Vec<SynValue> = (0..n as usize)
+                        .map(|i| std::mem::replace(&mut self.vm_regs[from + i], SynValue::Nothing))
+                        .collect();
+                    self.put(base, dst, syn_list(items));
                     Ok(())
                 }
+                Ins::MakeMap { dst, first, n } => {
+                    let from = base + first as usize;
+                    let mut m = IndexMap::with_capacity(n as usize);
+                    for i in 0..n as usize {
+                        let k = std::mem::replace(&mut self.vm_regs[from + 2 * i], SynValue::Nothing);
+                        let v = std::mem::replace(&mut self.vm_regs[from + 2 * i + 1], SynValue::Nothing);
+                        m.insert(k.to_string(), v);
+                    }
+                    self.put(base, dst, syn_map(m));
+                    Ok(())
+                }
+                Ins::GetProp { dst, obj, name } => (|| {
+                    let o = self.opnd(&chunk, &env, base, obj, at)?;
+                    let v = self.property_read(o, &chunk.names[name as usize], &chunk.locs[chunk.loc[at] as usize])?;
+                    self.put(base, dst, v);
+                    Ok(())
+                })(),
+                Ins::GetIndex { dst, obj, idx } => (|| {
+                    let o = self.opnd(&chunk, &env, base, obj, at)?;
+                    let i = self.opnd(&chunk, &env, base, idx, at)?;
+                    let v = self.index_read(o, i, &chunk.locs[chunk.loc[at] as usize])?;
+                    self.put(base, dst, v);
+                    Ok(())
+                })(),
+                Ins::SetPath { src, node, dst } => self.vm_set_path(&chunk, &env, base, src, node, dst, at),
+                Ins::CheckProtected { func, name } => check_protected_callee(
+                    &chunk.names[name as usize],
+                    &self.vm_regs[base + func as usize],
+                    &chunk.locs[chunk.loc[at] as usize],
+                ),
                 Ins::Move { dst, src } => self.opnd(&chunk, &env, base, src, at).map(|v| self.put(base, dst, v)),
                 Ins::Drop { r } => {
                     drop(std::mem::replace(&mut self.vm_regs[base + r as usize], SynValue::Nothing));
@@ -1485,28 +1672,14 @@ impl Interpreter {
                     self.put(base, dst, v);
                     Ok(())
                 })(),
-                Ins::TryInPlace { dst, node, name, done, ic } => (|| {
-                    // Sólo con una lista o un mapa puede aplicar; con cualquier otra cosa la
-                    // referencia lee la variable, ve que no encaja y deja todo como estaba.
-                    let now = if ic == NONE {
-                        env_get(&env, &chunk.names[name as usize])
-                    } else {
-                        self.load_free(&chunk, &env, name, ic)
-                    };
-                    let fits = matches!(now, Some(SynValue::List(_) | SynValue::Map(_)));
-                    drop(now);
-                    if !fits {
-                        return Ok(());
-                    }
-                    let NodeKind::SetMutation { target, value } = &chunk.nodes[node as usize].kind else {
-                        unreachable!("TryInPlace sobre otro nodo")
-                    };
-                    if let Some(v) = self.try_update_in_place(target, value, &env)? {
-                        self.put(base, dst, v);
+                Ins::TryInPlace { dst, node, name, done, ic } => match self.vm_try_in_place(&chunk, &env, base, dst, node, name, ic) {
+                    Ok(true) => {
                         pc = done as usize;
+                        Ok(())
                     }
-                    Ok(())
-                })(),
+                    Ok(false) => Ok(()),
+                    Err(c) => Err(c),
+                },
                 Ins::Exec { dst, node } => self.exec(&chunk.nodes[node as usize], &env).map(|v| self.put(base, dst, v)),
                 Ins::Call { dst, func, args, n, site } => {
                     match self.vm_call(&chunk, base, at, dst, func, args, n, site) {
@@ -1532,23 +1705,7 @@ impl Interpreter {
                         Err(c) => Err(c),
                     }
                 }
-                Ins::EachInit { node, it } => (|| {
-                    let NodeKind::EachStatement { collection, .. } = &chunk.nodes[node as usize].kind else {
-                        unreachable!("EachInit sobre otro nodo")
-                    };
-                    let loc = &chunk.nodes[node as usize].location;
-                    // Como la referencia con atajos: `range(…)` sin armar la lista.
-                    let items = match self.each_over_range(collection, &env)? {
-                        Some(r) => EachItems::Range(r),
-                        None => {
-                            let coll = self.exec(collection, &env)?;
-                            self.each_items_of(&coll, loc)?
-                        }
-                    };
-                    self.vm_iters.truncate(iter_base + it as usize);
-                    self.vm_iters.push(items);
-                    Ok(())
-                })(),
+                Ins::EachInit { node, it } => self.vm_each_init(&chunk, &env, node, it, iter_base),
                 Ins::EachNext { it, var, scope, exit } => {
                     match self.vm_iters[iter_base + it as usize].next_item() {
                         None => pc = exit as usize,
@@ -1582,36 +1739,19 @@ impl Interpreter {
                     }
                     Ok(())
                 }
-                Ins::MatchArm { subj, node, scope, fail } => (|| {
-                    let NodeKind::MatchArm { pattern, .. } = &chunk.nodes[node as usize].kind else {
-                        unreachable!("MatchArm sobre otro nodo")
-                    };
-                    // El sujeto sale del registro mientras se prueba (sin una referencia de más).
-                    let subject = std::mem::replace(&mut self.vm_regs[base + subj as usize], SynValue::Nothing);
-                    let binds = self.match_pattern_top(pattern, &subject, &env);
-                    self.vm_regs[base + subj as usize] = subject;
-                    match binds? {
-                        None => pc = fail as usize,
-                        Some(binds) => {
-                            // El frame del brazo nace con todos sus nombres (huecos) y los binders se
-                            // ligan por nombre: un patrón que liga de menos deja su hueco.
-                            let arm_env = Environment::child_scope(&env, "match-arm");
-                            arm_env.borrow_mut().bindings.lay_out(&chunk.layouts[scope as usize], chunk.tagged);
-                            for (name, val) in binds {
-                                env_set(&arm_env, &name, val);
-                            }
-                            env = arm_env;
-                            depth += 1;
-                        }
+                Ins::MatchArm { subj, node, scope, fail } => match self.vm_match_arm(&chunk, &env, base, subj, node, scope) {
+                    Ok(Some(arm_env)) => {
+                        env = arm_env;
+                        depth += 1;
+                        Ok(())
                     }
-                    Ok(())
-                })(),
-                Ins::Define { dst, node, child } => self.exec(&chunk.nodes[node as usize], &env).map(|v| {
-                    if let SynValue::Task(t) = &v {
-                        t.code.set(chunk.children[child as usize].clone());
+                    Ok(None) => {
+                        pc = fail as usize;
+                        Ok(())
                     }
-                    self.put(base, dst, v);
-                }),
+                    Err(c) => Err(c),
+                },
+                Ins::Define { dst, node, child } => self.vm_define(&chunk, &env, base, dst, node, child),
                 Ins::Give { src } => match self.opnd(&chunk, &env, base, src, at) {
                     Ok(v) => Err(Control::Give(v)),
                     Err(c) => Err(c),
@@ -1625,21 +1765,7 @@ impl Interpreter {
                     Ok(v) => Err(Control::Give(v)),
                     Err(c) => Err(c),
                 },
-                Ins::WasmTick { ctr } => {
-                    let n = match &self.vm_regs[base + ctr as usize] {
-                        SynValue::Number(Number::Int(i)) => *i + 1,
-                        _ => 1,
-                    };
-                    self.vm_regs[base + ctr as usize] = syn_int(n);
-                    if n > 1_000_000 {
-                        Err(err_at(
-                            "Loop exceeded maximum iterations (1,000,000) — in the wasm build a `while` is capped, since the host cannot interrupt a loop that never ends; the native `synsema` has no cap",
-                            &chunk.locs[chunk.loc[at] as usize],
-                        ))
-                    } else {
-                        Ok(())
-                    }
-                }
+                Ins::WasmTick { ctr } => self.vm_wasm_tick(&chunk, base, ctr, at),
             };
             let Err(mut c) = out else { continue };
             // Los pasos que el bloque sumó por adelantado y la referencia no llegó a contar.
@@ -1712,6 +1838,137 @@ impl Interpreter {
         }
     }
 
+    // Los brazos pesados y poco frecuentes del bucle, fuera de línea (como F1.10 con `exec_node`):
+    // así el despacho de las instrucciones calientes queda chico y el compilador no lo reacomoda
+    // cada vez que cambia uno de estos.
+
+    /// `TryInPlace`: `Ok(true)` si la vía en el lugar hizo la asignación.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_try_in_place(
+        &mut self,
+        chunk: &Chunk,
+        env: &Rc<RefCell<Environment>>,
+        base: usize,
+        dst: Reg,
+        node: u32,
+        name: u32,
+        ic: u32,
+    ) -> Result<bool, Control> {
+        // Sólo con una lista o un mapa puede aplicar; con cualquier otra cosa la referencia lee
+        // la variable, ve que no encaja y deja todo como estaba.
+        if name != NONE {
+            let now = if ic == NONE { env_get(env, &chunk.names[name as usize]) } else { self.load_free(chunk, env, name, ic) };
+            let fits = matches!(now, Some(SynValue::List(_) | SynValue::Map(_)));
+            drop(now);
+            if !fits {
+                return Ok(false);
+            }
+        }
+        let NodeKind::SetMutation { target, value } = &chunk.nodes[node as usize].kind else {
+            unreachable!("TryInPlace sobre otro nodo")
+        };
+        match self.try_update_in_place(target, value, env)? {
+            Some(v) => {
+                self.put(base, dst, v);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    #[inline(never)]
+    fn vm_each_init(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, node: u32, it: u16, iter_base: usize) -> Result<(), Control> {
+        let NodeKind::EachStatement { collection, .. } = &chunk.nodes[node as usize].kind else {
+            unreachable!("EachInit sobre otro nodo")
+        };
+        let loc = &chunk.nodes[node as usize].location;
+        // Como la referencia con atajos: `range(…)` sin armar la lista.
+        let items = match self.each_over_range(collection, env)? {
+            Some(r) => EachItems::Range(r),
+            None => {
+                let coll = self.exec(collection, env)?;
+                self.each_items_of(&coll, loc)?
+            }
+        };
+        self.vm_iters.truncate(iter_base + it as usize);
+        self.vm_iters.push(items);
+        Ok(())
+    }
+
+    /// Un brazo de `match`: `Ok(Some(frame))` si matcheó (el frame del brazo, con sus binders).
+    #[inline(never)]
+    fn vm_match_arm(
+        &mut self,
+        chunk: &Chunk,
+        env: &Rc<RefCell<Environment>>,
+        base: usize,
+        subj: Reg,
+        node: u32,
+        scope: u32,
+    ) -> Result<Option<Rc<RefCell<Environment>>>, Control> {
+        let NodeKind::MatchArm { pattern, .. } = &chunk.nodes[node as usize].kind else {
+            unreachable!("MatchArm sobre otro nodo")
+        };
+        // El sujeto sale del registro mientras se prueba (sin una referencia de más).
+        let subject = std::mem::replace(&mut self.vm_regs[base + subj as usize], SynValue::Nothing);
+        let binds = self.match_pattern_top(pattern, &subject, env);
+        self.vm_regs[base + subj as usize] = subject;
+        let Some(binds) = binds? else { return Ok(None) };
+        // El frame del brazo nace con todos sus nombres (huecos) y los binders se ligan por nombre:
+        // un patrón que liga de menos deja su hueco.
+        let arm_env = Environment::child_scope(env, "match-arm");
+        arm_env.borrow_mut().bindings.lay_out(&chunk.layouts[scope as usize], chunk.tagged);
+        for (name, val) in binds {
+            env_set(&arm_env, &name, val);
+        }
+        Ok(Some(arm_env))
+    }
+
+    #[inline(never)]
+    fn vm_define(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, dst: Reg, node: u32, child: u32) -> Result<(), Control> {
+        let v = self.exec(&chunk.nodes[node as usize], env)?;
+        if let SynValue::Task(t) = &v {
+            t.code.set(chunk.children[child as usize].clone());
+        }
+        self.put(base, dst, v);
+        Ok(())
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_set_path(
+        &mut self,
+        chunk: &Chunk,
+        env: &Rc<RefCell<Environment>>,
+        base: usize,
+        src: Opnd,
+        node: u32,
+        dst: Reg,
+        at: usize,
+    ) -> Result<(), Control> {
+        let v = self.opnd(chunk, env, base, src, at)?;
+        let out = self.exec_set(&chunk.nodes[node as usize], v, env, &chunk.locs[chunk.loc[at] as usize], false)?;
+        self.put(base, dst, out);
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn vm_wasm_tick(&mut self, chunk: &Chunk, base: usize, ctr: Reg, at: usize) -> Result<(), Control> {
+        let n = match &self.vm_regs[base + ctr as usize] {
+            SynValue::Number(Number::Int(i)) => *i + 1,
+            _ => 1,
+        };
+        self.vm_regs[base + ctr as usize] = syn_int(n);
+        if n > 1_000_000 {
+            return Err(err_at(
+                "Loop exceeded maximum iterations (1,000,000) — in the wasm build a `while` is capped, since the host cannot interrupt a loop that never ends; the native `synsema` has no cap",
+                &chunk.locs[chunk.loc[at] as usize],
+            ));
+        }
+        Ok(())
+    }
+
     /// Una llamada desde código compilado. `Ok(Some)` = entrar al cuerpo (task compilada, todo por
     /// posición); `Ok(None)` = ya se hizo por el camino de siempre y el valor está en `dst`.
     #[allow(clippy::too_many_arguments)]
@@ -1729,21 +1986,25 @@ impl Interpreter {
         let loc = &chunk.locs[chunk.loc[at] as usize];
         let f = std::mem::replace(&mut self.vm_regs[base + func as usize], SynValue::Nothing);
         let s = &chunk.sites[site as usize];
-        if let Some(p) = s.protected {
-            check_protected_callee(&chunk.names[p as usize], &f, loc)?;
-        }
         let n = n as usize;
         let first = base + args as usize;
         if s.names.is_none() {
             if let SynValue::Task(t) = &f {
                 if let Some(code) = self.vm_code_for(t).cloned() {
-                    check_task_arity(t, n, |_| false, loc)?;
+                    if s.checked {
+                        check_task_arity(t, n, |_| false, loc)?;
+                    }
                     self.recursion_depth += 1;
                     if self.recursion_depth > MAX_RECURSION {
                         self.recursion_depth -= 1;
                         return Err(err("maximum recursion depth exceeded"));
                     }
                     let call_env = self.acquire_frame(&t.closure_env, "call");
+                    // Aridad permisiva (sin chequeo, un pipe): los de más se sueltan antes de los
+                    // defaults, como en `call_value_named_inner`.
+                    for i in t.parameters.len()..n {
+                        drop(std::mem::replace(&mut self.vm_regs[first + i], SynValue::Nothing));
+                    }
                     for (i, param) in t.parameters.iter().enumerate() {
                         let v = if i < n {
                             std::mem::replace(&mut self.vm_regs[first + i], SynValue::Nothing)
@@ -1785,13 +2046,35 @@ impl Interpreter {
                 }
             }
         }
+        self.vm_call_generic(chunk, base, at, dst, f, first, n, site)
+    }
+
+    /// El camino de siempre (`call_value_named`): builtins, argumentos nombrados, tasks sin
+    /// compilar.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_call_generic(
+        &mut self,
+        chunk: &Chunk,
+        base: usize,
+        at: usize,
+        dst: Reg,
+        f: SynValue,
+        first: usize,
+        n: usize,
+        site: u32,
+    ) -> Result<Option<Enter>, Control> {
+        let loc = &chunk.locs[chunk.loc[at] as usize];
+        let s = &chunk.sites[site as usize];
         let mut cargs = self.free_args.pop().unwrap_or_default();
         cargs.reserve(n);
         for i in 0..n {
             let name = s.names.as_ref().and_then(|v| v[i].clone());
             cargs.push((name, std::mem::replace(&mut self.vm_regs[first + i], SynValue::Nothing)));
         }
-        check_call_arity(&f, &cargs, loc)?;
+        if s.checked {
+            check_call_arity(&f, &cargs, loc)?;
+        }
         let out = self.call_value_named(f, &mut cargs, loc);
         self.release_args(cargs);
         let v = out?;
