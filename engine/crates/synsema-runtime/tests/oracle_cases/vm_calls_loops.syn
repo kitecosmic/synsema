@@ -1,0 +1,186 @@
+-- F3.2 contra la referencia: llamadas dentro de la VM, `each` y `match`. Cada task se llama más de
+-- una vez para que corra compilada (compila en su segunda llamada), y lo que se prueba va en
+-- `let`/`when`/`give`, que es código compilado.
+
+-- Recursión profunda: la VM no usa la pila de Rust por llamada.
+task depth(n)
+    when n == 0
+        give 0
+    give 1 + depth(n - 1)
+let d1 be depth(10)
+let d2 be depth(2500)
+print(d1 + d2)
+
+-- Defaults evaluados en el entorno de la definición, en cada llamada.
+let base be 100
+task add(x, step = base)
+    give x + step
+let a1 be add(1)
+let a2 be add(1, 2)
+set base to 7
+let a3 be add(1)
+print([a1, a2, a3])
+
+-- Argumentos por nombre y builtins (el camino de siempre desde código compilado).
+task point(x, y = 0)
+    give text(x) + "," + text(y)
+let p1 be point(y = 2, x = 1)
+let p2 be point(3)
+let p3 be round_to(2.345, 2)
+print([p1, p2, p3])
+
+-- Un `stop` que sale de una task corta el bucle compilado del que llama.
+task bail(i)
+    when i == 3
+        stop
+    give i
+task collect()
+    let out be []
+    let i be 0
+    while i < 10
+        set out to append(out, bail(i))
+        set i to i + 1
+    give out
+let c1 be collect()
+let c2 be collect()
+print(c2)
+
+-- `each` sobre lista (modificada en el cuerpo: se recorre la foto), rango, mapa, texto y bytes.
+task walk()
+    let xs be [1, 2, 3]
+    let seen be []
+    each x in xs
+        set xs to append(xs, x * 10)
+        set seen to append(seen, x)
+    let total be 0
+    each i in range(0, 5)
+        set total to total + i
+    let keys be []
+    each k in {"b": 1, "a": 2}
+        set keys to append(keys, k)
+    let chars be ""
+    each ch in "hola"
+        set chars to ch + chars
+    let bs be 0
+    each b in bytes([1, 2, 3])
+        set bs to bs + b
+    give [seen, length(xs), total, keys, chars, bs]
+let w1 be walk()
+let w2 be walk()
+print(w2)
+
+-- `each` con `stop`, `give` desde adentro, closures por vuelta y variables que sombrean.
+task first_even(xs)
+    each x in xs
+        when x % 2 == 0
+            give x
+    give nothing
+let e1 be first_even([1, 3, 4, 6])
+let e2 be first_even([1, 3])
+let e3 be first_even([8])
+task until_five()
+    let n be 0
+    each i in range(0, 100)
+        when i == 5
+            stop
+        set n to n + i
+    give n
+let s1 be until_five()
+let s2 be until_five()
+task closures()
+    let fs be []
+    each i in [1, 2, 3]
+        let sq be i * i
+        set fs to append(fs, () => i + sq)
+    give fs[0]() + fs[1]() + fs[2]()
+let f1 be closures()
+let f2 be closures()
+let x be "global x"
+task shadow()
+    let r be []
+    each x in [1, 2]
+        set r to append(r, x)
+    set r to append(r, x)
+    give r
+let h1 be shadow()
+let h2 be shadow()
+print([e1, e2, e3, s2, f2, h2])
+
+-- Bucles anidados con `stop` en el de adentro.
+task grid()
+    let out be []
+    each i in range(0, 3)
+        each j in range(0, 3)
+            when j > i
+                stop
+            set out to append(out, text(i) + text(j))
+    give out
+let g1 be grid()
+let g2 be grid()
+print(g2)
+
+-- `match`: lista, mapa, variante, guard, otherwise, anidado, `stop` y `give` desde un brazo.
+enum Shape
+    circle(r)
+    square(side)
+task describe(v)
+    match v
+        is [a, b] when a > b
+            give "desc " + text(a) + ">" + text(b)
+        is [a, b]
+            give "pair " + text(a + b)
+        is {name, age}
+            give name + " " + text(age)
+        is Shape.circle(r)
+            give "circle " + text(r)
+        is Shape.square(side)
+            match side
+                is 1
+                    give "unit square"
+                otherwise
+                    give "square " + text(side)
+        otherwise
+            give "other"
+let m1 be describe([3, 1])
+let m2 be describe([1, 3])
+let m3 be describe({"name": "ana", "age": 30})
+let m4 be describe(Shape.circle(2))
+let m5 be describe(Shape.square(1))
+let m6 be describe(Shape.square(5))
+let m7 be describe(42)
+print([m1, m2, m3, m4, m5, m6, m7])
+
+task implicit(v)
+    match v
+        is 1
+            "one"
+        is 2
+            "two"
+let i1 be implicit(1)
+let i2 be implicit(2)
+let i3 be implicit(3)
+print([i1, i2, i3])
+
+task count_until_zero(xs)
+    let n be 0
+    each x in xs
+        match x
+            is 0
+                stop
+            otherwise
+                set n to n + 1
+    give n
+let z1 be count_until_zero([5, 4, 0, 3])
+let z2 be count_until_zero([1, 2])
+print([z1, z2])
+
+-- Un binder del brazo sombrea una variable de afuera sólo adentro del brazo.
+task arm_shadow(pair)
+    let a be "outer"
+    match pair
+        is [a, b]
+            let inside be a
+    give a
+let q1 be arm_shadow([1, 2])
+let q2 be arm_shadow([3, 4])
+print(q2)

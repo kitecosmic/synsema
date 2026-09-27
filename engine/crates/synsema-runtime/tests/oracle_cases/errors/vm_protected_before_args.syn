@@ -1,0 +1,11 @@
+-- Un nombre protegido que no resuelve al builtin: la referencia corta ANTES de evaluar los
+-- argumentos (acá `side()` no tiene que correr: se ve en steps()).
+let calls be []
+task side()
+    set calls to append(calls, 1)
+    give 1
+task f(print)
+    give print(side())
+print(f(print))
+print(f(print))
+print(f((x) => x))

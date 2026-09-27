@@ -1,0 +1,4 @@
+-- Comparar texto con número en una cadena de comparación compilada (en un `let`: la VM).
+let n be 4
+let c be 1 < n < "diez"
+print(c)

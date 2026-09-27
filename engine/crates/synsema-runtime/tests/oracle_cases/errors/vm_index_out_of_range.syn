@@ -1,0 +1,7 @@
+-- Un índice fuera de rango, en código compilado.
+task at(xs, i)
+    let v be xs[i]
+    give v
+print(at([1, 2], 0))
+print(at([1, 2], 1))
+print(at([1, 2], 5))

@@ -1,0 +1,8 @@
+-- Leer una clave que no existe, en código compilado.
+task get(m, k)
+    when k > 1
+        give m.nope + 1
+    give m.a
+print(get({"a": 1}, 0))
+print(get({"a": 2}, 1))
+print(get({"a": 3}, 2))

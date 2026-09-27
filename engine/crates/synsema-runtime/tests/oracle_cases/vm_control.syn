@@ -1,0 +1,147 @@
+-- La VM de F3 contra la referencia: control de flujo, valores implícitos, pasos a mitad de una
+-- expresión y variables de afuera. El oráculo compara salida, errores y steps() en los dos modos.
+
+let calls be []
+task seen(tag, v)
+    set calls to append(calls, tag)
+    give v
+
+-- `and`/`or` cortan y dan un booleano. (Dentro de los argumentos de una llamada los evalúa el
+-- tree-walker hasta F3.2: acá van en un `let`, que compila la VM.)
+let r1 be seen("a", false) and seen("b", true)
+let r2 be seen("c", 0) or seen("d", "x")
+let r3 be seen("e", 1) and seen("f", 2)
+let r4 be seen("i", "si") or seen("j", false)
+print([r1, r2, r3, r4])
+print(calls)
+
+-- Cadenas de comparación: cada operando una vez, corte en el primer par falso.
+let k be 5
+let c1 be 1 < k < 10
+let c2 be 1 < k < seen("g", 3) < seen("h", 100)
+let c3 be 10 > k >= 5 == true
+print([c1, c2, c3])
+print(calls)
+
+-- El valor implícito de una task: la última sentencia, también un `when` o un `while`.
+task pick(n)
+    when n < 0
+        "neg"
+    otherwise when n == 0
+        "zero"
+    otherwise
+        "pos"
+print(pick(-1) + pick(0) + pick(3))
+
+task count_to(n)
+    let i be 0
+    while i < n
+        set i to i + 1
+        i * 10
+print(count_to(3))
+print(count_to(0))
+
+task last_let()
+    let z be 7
+print(last_let())
+
+-- `stop` corta el bucle compilado; también cuando sale de un nodo que corre el tree-walker.
+task first_over(xs, limit)
+    let i be 0
+    let found be nothing
+    while i < length(xs)
+        when xs[i] > limit
+            set found to xs[i]
+            stop
+        set i to i + 1
+    give found
+print(first_over([1, 5, 9, 12], 6))
+
+task stop_from_try()
+    let n be 0
+    while true
+        set n to n + 1
+        try
+            when n == 4
+                stop
+        recover e
+            print(e)
+    give n
+print(stop_from_try())
+
+task stop_value()
+    let r be 0
+    while true
+        set r to r + 1
+        when r > 2
+            stop r * 100
+        r
+print(stop_value())
+
+-- `give` dentro de un `while` dentro de un `when`.
+task find(n)
+    let i be 0
+    while true
+        when i * i >= n
+            give i
+        set i to i + 1
+print(find(50))
+
+-- Pasos leídos a mitad de una expresión: el contador tiene que ser exacto en cada llamada.
+let s0 be steps()
+let a be 1 + 2 * steps() - steps()
+print(steps() - s0)
+task probe(x)
+    let before be steps()
+    give x + (steps() - before)
+print(probe(10) + probe(20))
+
+-- Un `let` en una rama que no corre deja ver el global.
+let shade be "global"
+task maybe_shade(flag)
+    when flag
+        let shade be "local"
+    give shade
+print(maybe_shade(false) + " " + maybe_shade(true))
+
+-- Una task anidada escribe una variable de afuera entre dos lecturas.
+task outer_counter()
+    let x be 1
+    task bump()
+        set x to x + 1
+        give 0
+    let r be x + bump()
+    give text(r) + "/" + text(x)
+print(outer_counter())
+
+-- Lambdas: capturan un parámetro y un local; se compilan en su segunda llamada.
+task make_adder(a)
+    let b be 10
+    give (v) => v + a + b
+let add5 be make_adder(5)
+print(add5(1) + add5(2) + add5(3))
+
+-- `set P to append(P, …)` en un bucle (la vía en el lugar) y `set P to P + …` con un número.
+task build(n)
+    let xs be []
+    let total be 0
+    let i be 0
+    while i < n
+        set xs to append(xs, i)
+        set xs to xs + [i]
+        set total to total + i
+        set i to i + 1
+    give text(length(xs)) + " " + text(total)
+print(build(5))
+
+-- Recursión: la task se compila en su segunda llamada y se llama a sí misma por el global.
+task fact(n)
+    when n <= 1
+        give 1
+    give n * fact(n - 1)
+print(fact(20))
+print(fact(25))
+
+-- Texto, unarios, nothing.
+let word be "ho" + "la"
+print(word + " " + text(-k) + " " + text(not false) + " " + text(nothing))

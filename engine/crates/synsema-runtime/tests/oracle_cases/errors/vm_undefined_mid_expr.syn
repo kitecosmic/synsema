@@ -1,0 +1,10 @@
+-- Error a mitad de una expresión en código compilado (la task se compila en su segunda llamada):
+-- el mensaje, la ubicación y steps().
+task f(a)
+    let b be a * 2
+    when a > 2
+        give b + 1 + nope + 3
+    give b
+print(f(1))
+print(f(2))
+print(f(3))

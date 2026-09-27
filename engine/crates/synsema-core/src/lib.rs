@@ -25,6 +25,7 @@ pub mod math;
 pub mod number;
 pub mod parser;
 pub mod reflexes;
+pub mod resolve;
 pub mod rng;
 pub mod rng_ziggurat;
 pub mod stats;

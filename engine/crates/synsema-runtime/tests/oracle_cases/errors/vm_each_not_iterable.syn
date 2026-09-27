@@ -1,0 +1,9 @@
+-- `each` sobre algo que no se recorre, en código compilado.
+task walk(v)
+    let n be 0
+    each x in v
+        set n to n + 1
+    give n
+print(walk([1]))
+print(walk([1, 2]))
+print(walk(5))

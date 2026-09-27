@@ -1,0 +1,121 @@
+-- Las reglas de scope que fija el resolver (F3.0): el oráculo del resolver compara cada búsqueda
+-- de este programa con lo que predijo, y el oráculo diferencial compara la salida en los dos modos.
+
+let x be "global"
+
+-- Un `let` dentro de un `when` liga en el frame de la llamada sólo si la rama corre: si no, el
+-- hueco deja ver el global.
+task maybe(c)
+    when c
+        let x be "local"
+    give x
+
+print(maybe(true))
+print(maybe(false))
+
+-- En las dos ramas: ligado seguro.
+task both(c)
+    when c
+        let y be 1
+    otherwise
+        let y be 2
+    give y
+
+print(both(true) + both(false))
+
+-- Leer antes del `let` del mismo frame ve el de afuera.
+task before()
+    let first be x
+    let x be "shadow"
+    give first + "/" + x
+
+print(before())
+
+-- Una closure por vuelta de `each`, cada una con su variable.
+let fs be []
+each i in [1, 2, 3]
+    let doubled be i * 2
+    set fs to append(fs, () => i + doubled)
+print(fs[0]() + fs[2]())
+
+-- Una task anidada lee un parámetro y un local de afuera, y se llama a sí misma.
+task outer(n)
+    let k be 10
+    task go(m)
+        when m == 0
+            give k + n
+        give go(m - 1)
+    give go(3)
+
+print(outer(5))
+
+-- Un default se evalúa en cada llamada, donde se definió la task.
+task make(base)
+    task add(v, step = base)
+        give v + step
+    give add(1) + add(1, 100)
+
+print(make(7))
+
+-- Brazos de `match`: binders de lista y de mapa, una variante que liga y una comparación.
+enum Shape
+    circle(r)
+    square(side)
+
+task area(s)
+    match s
+        is Shape.circle(r)
+            give r * r * 3
+        is Shape.square(side)
+            give side * side
+        otherwise
+            give 0
+
+print(area(Shape.circle(2)) + area(Shape.square(3)))
+
+task pick(v)
+    match v
+        is [a, b]
+            give a + b
+        is {name, age: years}
+            give name + text(years)
+        is x
+            give "same as global"
+        otherwise
+            give "other"
+
+print(pick([1, 2]))
+print(pick({"name": "ana", "age": 30}))
+print(pick("global"))
+print(pick(false))
+
+-- Un error corta el `try`: lo ligado antes queda, lo de después no; el error vive en su frame.
+task risky(d)
+    try
+        let before_error be "set"
+        let r be 10 / d
+        let after_error be "set too"
+    recover e
+        give before_error + " " + e
+    give after_error
+
+print(risky(2))
+print(risky(0))
+
+-- Un `sandbox` abre su frame: lo que liga adentro no sale.
+task boxed()
+    let inside be "out"
+    sandbox
+        let inside be "in"
+        let only_here be 1
+    give inside
+
+print(boxed())
+
+-- Una lambda que captura un parámetro y un local.
+task adder(a)
+    let b be 1
+    give (v) => v + a + b
+
+let plus3 be adder(2)
+print(plus3(10))

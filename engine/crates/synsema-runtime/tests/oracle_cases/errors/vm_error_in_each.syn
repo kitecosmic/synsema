@@ -1,0 +1,9 @@
+-- Un error a mitad de un `each` compilado, con variables de la vuelta y de afuera.
+task sum_inv(xs)
+    let total be 0
+    each x in xs
+        set total to total + 12 / x
+    give total
+print(sum_inv([1, 2]))
+print(sum_inv([3, 4]))
+print(sum_inv([6, 0, 1]))

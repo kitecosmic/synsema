@@ -1,0 +1,7 @@
+-- División por cero dentro de un `while` compilado del nivel de más afuera.
+let i be 3
+let acc be 0
+while i > -1
+    set acc to acc + 12 / i
+    set i to i - 1
+print(acc)
