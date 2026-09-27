@@ -1,0 +1,7 @@
+-- F3.4c: `/` por cero (y por -0.0) en un sitio ya especializado para floats.
+task dv(a, b)
+    let r be a / b
+    give r
+print(dv(1.5, 2.0))
+print(dv(3, 4))
+print(dv(1.0, -0.0))

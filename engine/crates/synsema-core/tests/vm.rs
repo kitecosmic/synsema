@@ -119,3 +119,14 @@ fn operators_specialize_by_the_types_they_see() {
     let after = explain_after_run("task cat(a)\n    give a + \"!\"\nprint(cat(\"x\"))\nprint(cat(\"y\"))\n");
     assert!(after.contains("BinaryAny {"), "{}", after);
 }
+
+#[test]
+fn float_operators_specialize_too() {
+    // F3.4c: con un float en juego, `+ - * /` y las comparaciones (exactas entre enteros y floats).
+    let src = "task f(n)\n    let s be 0.0\n    let i be 0\n    while i < n\n        set s to s + 1.5 / (i + 1)\n        when s < 2.5\n            set s to s * 1.0\n        set i to i + 1\n    give s\nprint(f(10))\nprint(f(10))\n";
+    let after = explain_after_run(src);
+    assert!(after.contains("FloatArith {"), "{}", after);
+    assert!(after.contains("NumCmp {"), "{}", after);
+    // `i < n` sigue siendo de enteros.
+    assert!(after.contains("IntCmp {"), "{}", after);
+}

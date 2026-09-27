@@ -77,6 +77,13 @@ pub(crate) enum Ins {
     IntArith { dst: Reg, op: BinOp, a: Opnd, b: Opnd, fb: u16 },
     /// `< <= > >= == !=`.
     IntCmp { dst: Reg, op: BinOp, a: Opnd, b: Opnd, fb: u16 },
+    /// `+ - *` con al menos un `Float` (el otro `Int` o `Float`) y `/` con dos números `Int` o
+    /// `Float` (en Synsema `/` siempre da float): la cuenta en f64, como `Number`. Un divisor cero
+    /// cae al camino genérico (el error de la referencia).
+    FloatArith { dst: Reg, op: BinOp, a: Opnd, b: Opnd, fb: u16 },
+    /// Comparaciones entre `Int` y `Float` en cualquier mezcla: exactas, con el mismo
+    /// `partial_cmp_num`/`num_eq` de la referencia (`2**53 + 1` no es igual a `9007199254740992.0`).
+    NumCmp { dst: Reg, op: BinOp, a: Opnd, b: Opnd, fb: u16 },
     Unary { dst: Reg, op: UnOp, a: Opnd },
     ToBool { dst: Reg, src: Opnd },
     Jump { to: u32 },
@@ -1875,6 +1882,27 @@ impl Interpreter {
         Some((self.peek_int(chunk, env, base, a)?, self.peek_int(chunk, env, base, b)?))
     }
 
+    /// Los dos operandos si los dos son `Int` o `Float` (la guarda de `FloatArith`/`NumCmp`).
+    #[inline(always)]
+    fn num_pair(&self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, a: Opnd, b: Opnd) -> Option<(Num, Num)> {
+        Some((self.peek_num(chunk, env, base, a)?, self.peek_num(chunk, env, base, b)?))
+    }
+
+    #[inline(always)]
+    fn peek_num(&self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, o: Opnd) -> Option<Num> {
+        let num = |v: &SynValue| match v {
+            SynValue::Number(Number::Int(x)) => Some(Num::I(*x)),
+            SynValue::Number(Number::Float(x)) => Some(Num::F(*x)),
+            _ => None,
+        };
+        match o {
+            Opnd::Reg(r) | Opnd::Copy(r) => num(&self.vm_regs[base + r as usize]),
+            Opnd::Const(k) => num(&chunk.consts[k as usize]),
+            Opnd::RLocal(k) => num(self.vm_locals[self.vm_lbase + k as usize].as_ref()?),
+            Opnd::Local(k) => num(env.borrow().bindings.slot(k as usize)?),
+        }
+    }
+
     #[inline(always)]
     fn peek_int(&self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, o: Opnd) -> Option<i64> {
         let v = match o {
@@ -2149,6 +2177,40 @@ impl Interpreter {
                             }
                             None => self.vm_binary_generic(&chunk, &env, base, at, dst, op, a, b),
                         }
+                    }
+                    None => self.vm_binary_miss(&chunk, &env, base, at, dst, op, a, b, fb),
+                },
+                Ins::FloatArith { dst, op, a, b, fb } => match self.num_pair(&chunk, &env, base, a, b) {
+                    Some((x, y)) if op == BinOp::Div || x.is_float() || y.is_float() => {
+                        let (x, y) = (x.f64(), y.f64());
+                        let r = match op {
+                            BinOp::Add => Some(x + y),
+                            BinOp::Sub => Some(x - y),
+                            BinOp::Mul => Some(x * y),
+                            // `/` por cero (también -0.0) es error: lo arma la referencia.
+                            _ if y == 0.0 => None,
+                            _ => Some(x / y),
+                        };
+                        match r {
+                            Some(r) => {
+                                self.put(base, dst, SynValue::Number(Number::Float(r)));
+                                Ok(())
+                            }
+                            None => self.vm_binary_generic(&chunk, &env, base, at, dst, op, a, b),
+                        }
+                    }
+                    _ => self.vm_binary_miss(&chunk, &env, base, at, dst, op, a, b, fb),
+                },
+                Ins::NumCmp { dst, op, a, b, fb } => match self.num_pair(&chunk, &env, base, a, b) {
+                    Some((x, y)) => {
+                        let (x, y) = (x.number(), y.number());
+                        let r = match op {
+                            BinOp::Eq => x.num_eq(&y),
+                            BinOp::Ne => !x.num_eq(&y),
+                            _ => ord_op(x.partial_cmp_num(&y), op),
+                        };
+                        self.put(base, dst, syn_bool(r));
+                        Ok(())
                     }
                     None => self.vm_binary_miss(&chunk, &env, base, at, dst, op, a, b, fb),
                 },
@@ -2510,8 +2572,10 @@ impl Interpreter {
         b: Opnd,
         fb: u16,
     ) -> Result<(), Control> {
-        let quick = match self.int_pair(chunk, env, base, a, b) {
-            Some(_) => int_form(op, dst, a, b, fb),
+        let quick = match self.num_pair(chunk, env, base, a, b) {
+            Some((Num::I(_), Num::I(_))) if op == BinOp::Div => Some(Ins::FloatArith { dst, op, a, b, fb }),
+            Some((Num::I(_), Num::I(_))) => int_form(op, dst, a, b, fb),
+            Some(_) => float_form(op, dst, a, b, fb),
             None => None,
         };
         chunk.code[at].set(quick.unwrap_or(Ins::BinaryAny { dst, op, a, b }));
@@ -2983,6 +3047,44 @@ fn int_form(op: BinOp, dst: Reg, a: Opnd, b: Opnd, fb: u16) -> Option<Ins> {
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => Ins::IntCmp { dst, op, a, b, fb },
         _ => return None,
     })
+}
+
+/// La forma especializada de `op` cuando hay un `Float` en juego (o `/` entre enteros), si la hay.
+fn float_form(op: BinOp, dst: Reg, a: Opnd, b: Opnd, fb: u16) -> Option<Ins> {
+    Some(match op {
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => Ins::FloatArith { dst, op, a, b, fb },
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => Ins::NumCmp { dst, op, a, b, fb },
+        _ => return None,
+    })
+}
+
+/// Un operando numérico visto por una guarda (sin moverlo ni clonarlo).
+#[derive(Clone, Copy)]
+enum Num {
+    I(i64),
+    F(f64),
+}
+
+impl Num {
+    #[inline(always)]
+    fn is_float(self) -> bool {
+        matches!(self, Num::F(_))
+    }
+    /// Como `Number::to_f64`.
+    #[inline(always)]
+    fn f64(self) -> f64 {
+        match self {
+            Num::I(x) => x as f64,
+            Num::F(x) => x,
+        }
+    }
+    #[inline(always)]
+    fn number(self) -> Number {
+        match self {
+            Num::I(x) => Number::Int(x),
+            Num::F(x) => Number::Float(x),
+        }
+    }
 }
 
 fn set_undefined(name: &str) -> Control {
