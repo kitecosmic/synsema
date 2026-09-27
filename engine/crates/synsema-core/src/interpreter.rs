@@ -570,6 +570,16 @@ impl Bindings {
         }
         true
     }
+    /// F3.3b: agrega un nombre con su slot tal cual (un hueco si es `None`), en orden.
+    pub(crate) fn push_slot(&mut self, name: Arc<str>, v: Option<SynValue>) {
+        self.push(name, SynValue::Nothing);
+        let k = self.slots.len() - 1;
+        self.slots[k] = v;
+    }
+    /// F3.3b: saca el valor del slot `k` (queda un hueco).
+    pub(crate) fn take_slot(&mut self, k: usize) -> Option<SynValue> {
+        self.slots.get_mut(k).and_then(|s| s.take())
+    }
     pub(crate) fn len_names(&self) -> usize {
         self.names.len()
     }
@@ -1317,6 +1327,10 @@ pub struct Interpreter {
     vm_frames: Vec<vm::VmFrame>,
     /// Los iteradores de los `each` compilados en curso (F3.2).
     vm_iters: Vec<EachItems>,
+    /// Las variables de los cuerpos con frame en registros (F3.3b) y dónde empieza la del que
+    /// corre ahora.
+    vm_locals: Vec<Option<SynValue>>,
+    vm_lbase: usize,
     /// v0.6.20 — raíz del proyecto: el directorio del archivo de ENTRADA, límite de contención
     /// de `use "../x.syn"`. La fija el host (`set_project_root`) o, si no, se captura del primer
     /// `use` que se ejecuta (siempre el top-level de la entrada). `None` = criterio v0.6.19
@@ -1566,6 +1580,8 @@ impl Interpreter {
             vm_regs: Vec::new(),
             vm_frames: Vec::new(),
             vm_iters: Vec::new(),
+            vm_locals: Vec::new(),
+            vm_lbase: 0,
             project_root: None,
             stdout_hook: None,
             stdout_verdict: None,
@@ -7113,6 +7129,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 // La VM (F3) corre el cuerpo si lo tiene compilado y el frame se pudo preparar; si
                 // no, el tree-walker. Los dos devuelven lo mismo (el oráculo los compara).
                 let body = match self.vm_code_for(&task) {
+                    Some(code) if code.regframe => self.run_chunk_regframe(code, &call_env, &task.closure_env),
                     Some(code) if code.frame.as_ref().is_some_and(|l| call_env.borrow_mut().bindings.lay_out(l, code.tagged)) => {
                         self.run_chunk(code, &call_env)
                     }

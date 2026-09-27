@@ -1,0 +1,85 @@
+-- F3.3b contra la referencia: tasks cuyo frame vive en registros (no definen closures, no tienen
+-- nodos fríos ni `each`/`match`). Cada una se llama varias veces (corre compilada).
+
+let shade be "global"
+let counter be 0
+
+-- Un `let` en una rama que no corre deja un hueco: se lee (y se escribe) lo de afuera.
+task holes(flag)
+    when flag
+        let shade be "local"
+        let counter be 100
+    set counter to counter + 1
+    give shade + " " + text(counter)
+let h1 be holes(false)
+let h2 be holes(true)
+let h3 be holes(false)
+print([h1, h2, h3, counter])
+
+-- La vía en el lugar sobre una lista local, con un alias tomado antes (copy-on-write).
+task grow(n)
+    let xs be [0]
+    let alias be xs
+    let i be 1
+    while i < n
+        set xs to append(xs, i)
+        set xs to xs + [i * 10]
+        set i to i + 1
+    give [length(xs), alias, xs[n - 1]]
+let g1 be grow(2)
+let g2 be grow(4)
+print(g2)
+
+-- Mapas locales con `merge` en el lugar.
+task tally(k)
+    let m be {"a": 1}
+    let snap be m
+    set m to merge(m, {"b": k})
+    set m to merge(m, {"a": k * 2})
+    give [m, snap]
+let t1 be tally(1)
+let t2 be tally(3)
+print(t2)
+
+-- Parámetros repetidos, defaults y un pipe que pasa de más o de menos (aridad permisiva).
+task rep(a, a)
+    give a
+task pad(x, y = 7)
+    give [x, y]
+task two(p, q)
+    give text(p) + "/" + text(q)
+let r1 be rep(1, 2)
+let r2 be rep(3, 4)
+let p1 be pad(1)
+let p2 be pad(2, 3)
+let q1 be 5 |> two
+let q2 be 6 |> two
+print([r2, p2, q2])
+
+-- Recursión mutua y profunda, sin frames.
+task is_even(n)
+    when n == 0
+        give true
+    give is_odd(n - 1)
+task is_odd(n)
+    when n == 0
+        give false
+    give is_even(n - 1)
+let e1 be is_even(10)
+let e2 be is_even(1501)
+print([e1, e2])
+
+-- Un error dentro de un cuerpo en registros no deja nada colgado: la siguiente llamada anda.
+task safe_div(a, b)
+    give a / b
+task try_div(a, b)
+    let r be 0
+    try
+        set r to safe_div(a, b)
+    recover e
+        set r to -1
+    give r
+let d1 be try_div(10, 2)
+let d2 be try_div(10, 0)
+let d3 be try_div(9, 3)
+print([d1, d2, d3])

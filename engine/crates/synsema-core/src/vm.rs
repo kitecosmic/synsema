@@ -39,6 +39,8 @@ pub(crate) enum Opnd {
     Copy(Reg),
     Const(u32),
     Local(u16),
+    /// F3.3b: una variable ligada segura de un cuerpo con frame en registros.
+    RLocal(u16),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -65,6 +67,11 @@ pub(crate) enum Ins {
     Jump { to: u32 },
     JumpIfFalsy { src: Opnd, to: u32 },
     LetLocal { src: Opnd, slot: u16, dst: Reg },
+    /// F3.3b: lo mismo sobre la ventana de locales (el compilador sabe el modo: el despacho de
+    /// las demás instrucciones no pregunta por él).
+    LoadRLocal { dst: Reg, slot: u16, name: u32 },
+    LetRLocal { src: Opnd, slot: u16, dst: Reg },
+    SetRLocal { src: Opnd, slot: u16, name: u32, dst: Reg },
     LetName { src: Opnd, name: u32, dst: Reg },
     SetLocal { src: Opnd, slot: u16, name: u32, dst: Reg },
     SetOuter { src: Opnd, depth: u16, slot: u16, name: u32, dst: Reg, at: u32 },
@@ -72,8 +79,9 @@ pub(crate) enum Ins {
     /// `set P to append(P, …)` y compañía: la vía en el lugar de la referencia
     /// (`try_update_in_place`) si la variable es una lista o un mapa; si aplica, salta a `done`.
     /// `ic` = `NONE` si la variable es del resolver (se mira por nombre desde el frame propio);
-    /// `name` = `NONE` si el destino es un camino (siempre se prueba).
-    TryInPlace { dst: Reg, node: u32, name: u32, done: u32, ic: u32 },
+    /// `name` = `NONE` si el destino es un camino (siempre se prueba); `slot` = la variable local
+    /// del destino en un cuerpo con frame en registros (`u16::MAX` si no).
+    TryInPlace { dst: Reg, node: u32, name: u32, done: u32, ic: u32, slot: u16 },
     /// El nodo lo corre el tree-walker.
     Exec { dst: Reg, node: u32 },
     /// `[a, b, …]` con los elementos en `n` registros desde `first`.
@@ -143,6 +151,12 @@ pub(crate) struct Chunk {
     parents: Rc<Vec<Option<ScopeId>>>,
     /// El layout del frame propio (tasks y lambdas).
     pub(crate) frame: Option<Rc<Layout>>,
+    /// F3.3b: el frame de la llamada no existe como `Environment`: sus variables viven en la
+    /// ventana de locales de la VM (`vm_locals`) y el entorno del cuerpo es el `closure_env`. Sólo
+    /// para cuerpos que nadie puede ver desde afuera (ver `regframe_eligible`).
+    pub(crate) regframe: bool,
+    /// En un cuerpo con frame en registros: el slot de cada parámetro (en orden).
+    param_slots: Vec<u16>,
     /// Si el frame lleva su `Layout` como marca: sólo hace falta cuando otro chunk (el de una task
     /// o lambda definida adentro) lo va a recorrer y tiene que verificarlo. Los frames que la VM
     /// preparó para este chunk no se verifican: los armó ella.
@@ -200,6 +214,8 @@ pub(crate) struct VmFrame {
     taint: Option<TaintFrame>,
     /// La task llamada: vive hasta el final de la llamada, como en `call_value_named_inner`.
     task: Rc<SynTaskValue>,
+    /// Dónde empieza la ventana de locales del llamador (F3.3b).
+    lbase: usize,
 }
 
 /// El código compilado de una task, y cuántas veces se llamó antes de compilarla.
@@ -241,9 +257,84 @@ pub(crate) fn compile_program(stmts: &[Node]) -> Rc<Chunk> {
 pub(crate) fn compile_function(params: &[Arc<str>], body: &[Node]) -> Rc<Chunk> {
     let (res, s) = resolve::resolve_function(params, body);
     let shared = Shared::new(&res);
-    let mut c = Compiler::new(&res, &shared, Some(s));
-    c.block(body, Some(0), true);
+    let refs: Vec<&Node> = body.iter().collect();
+    compile_body(&res, &shared, s, params, &refs, false)
+}
+
+/// El cuerpo de una task o lambda: con frame en registros si se puede (F3.3b), y si el código que
+/// sale igual necesita el frame por nombre, otra vez sin.
+fn compile_body<'r>(
+    res: &'r Resolution,
+    shared: &Shared<'r>,
+    scope: ScopeId,
+    params: &[Arc<str>],
+    body: &[&Node],
+    lambda: bool,
+) -> Rc<Chunk> {
+    if regframe_eligible(res, scope) {
+        let c = compile_body_as(res, shared, scope, params, body, lambda, true);
+        if !c.code.iter().any(needs_frame) {
+            return c;
+        }
+    }
+    compile_body_as(res, shared, scope, params, body, lambda, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_body_as<'r>(
+    res: &'r Resolution,
+    shared: &Shared<'r>,
+    scope: ScopeId,
+    params: &[Arc<str>],
+    body: &[&Node],
+    lambda: bool,
+    regframe: bool,
+) -> Rc<Chunk> {
+    let mut c = Compiler::new(res, shared, Some(scope));
+    c.regframe = regframe;
+    if regframe {
+        let names = &res.scopes[scope as usize].names;
+        c.param_slots = params
+            .iter()
+            .map(|p| names.iter().position(|n| **n == **p).expect("parámetro fuera del layout") as u16)
+            .collect();
+    }
+    if lambda {
+        // El cuerpo de una lambda es un bloque de una sentencia, el `give <expr>` que arma el
+        // intérprete: el chequeo de cancelación del bloque y un nodo más.
+        let e = body[0];
+        c.at(&e.location);
+        c.emit(Ins::CheckCancel);
+        c.enter();
+        let v = c.expr(e);
+        c.at(&e.location);
+        c.emit(Ins::Give { src: v });
+        return c.finish(Opnd::Reg(0));
+    }
+    c.block_of(body, Some(0), true);
     c.finish(Opnd::Reg(0))
+}
+
+/// F3.3b: un frame que nadie puede ver desde afuera — ni una closure (no define tasks ni
+/// lambdas), ni un nodo del tree-walker (no tiene nodos fríos: el resolver lo marca `escapes`), ni
+/// un frame propio de una vuelta o un brazo (no tiene otros scopes) — puede vivir en registros.
+fn regframe_eligible(res: &Resolution, scope: ScopeId) -> bool {
+    let sc = &res.scopes[scope as usize];
+    !sc.escapes && !sc.opaque && !sc.dynamic && res.scopes.iter().enumerate().all(|(i, s)| s.unit != sc.unit || i == scope as usize)
+}
+
+/// Instrucciones que le pasan el frame al tree-walker (que busca por nombre): un cuerpo con alguna
+/// no puede tener el frame en registros. (`TryInPlace` sí: arma el frame sólo cuando actúa.)
+fn needs_frame(ins: &Ins) -> bool {
+    matches!(
+        ins,
+        Ins::Exec { .. }
+            | Ins::SetPath { .. }
+            | Ins::MatchArm { .. }
+            | Ins::EachInit { .. }
+            | Ins::EachNext { .. }
+            | Ins::Define { .. }
+    )
 }
 
 /// Lo que comparten un chunk y los de sus tasks anidadas: los layouts de todos los scopes.
@@ -294,6 +385,8 @@ struct Compiler<'r, 's> {
     cur_scope: Option<ScopeId>,
     depth: u16,
     eaches: u16,
+    regframe: bool,
+    param_slots: Vec<u16>,
 }
 
 impl<'r, 's> Compiler<'r, 's> {
@@ -327,6 +420,8 @@ impl<'r, 's> Compiler<'r, 's> {
             cur_scope: frame_scope,
             depth: 0,
             eaches: 0,
+            regframe: false,
+            param_slots: Vec::new(),
         }
     }
 
@@ -416,7 +511,14 @@ impl<'r, 's> Compiler<'r, 's> {
             skip += 1;
             s = self.shared.parents[x as usize];
         }
-        self.hops.push(Hops { from: self.cur_scope, inner, skip });
+        let h = if self.regframe {
+            // El entorno del cuerpo es el `closure_env`: se parte del scope de afuera, sin frames
+            // propios, y el del cuerpo no cuenta.
+            Hops { from: self.cur_scope.and_then(|x| self.shared.parents[x as usize]), inner: 0, skip: skip.saturating_sub(1) }
+        } else {
+            Hops { from: self.cur_scope, inner, skip }
+        };
+        self.hops.push(h);
         (self.hops.len() - 1) as u32
     }
 
@@ -478,6 +580,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 let v = self.expr(value);
                 self.at(&n.location);
                 match self.target_of_bind(n) {
+                    Some(slot) if self.regframe => self.emit(Ins::LetRLocal { src: v, slot, dst }),
                     Some(slot) => self.emit(Ins::LetLocal { src: v, slot, dst }),
                     None => {
                         let name = self.shared_name(name);
@@ -492,8 +595,12 @@ impl<'r, 's> Compiler<'r, 's> {
                     let node = self.cold(n);
                     let nm = self.name(name);
                     let done = self.label();
-                    let ic = if self.target(target) == Target::Free { self.ic() } else { NONE };
-                    self.emit(Ins::TryInPlace { dst, node, name: nm, done, ic });
+                    let (ic, slot) = match self.target(target) {
+                        Target::Free => (self.ic(), u16::MAX),
+                        Target::Slot { depth: 0, scope, slot, .. } if self.regframe && self.in_frame(scope, 0) => (NONE, slot),
+                        _ => (NONE, u16::MAX),
+                    };
+                    self.emit(Ins::TryInPlace { dst, node, name: nm, done, ic, slot });
                     Some(done)
                 } else {
                     None
@@ -503,10 +610,15 @@ impl<'r, 's> Compiler<'r, 's> {
                 let nm = self.name(name);
                 match self.target(target) {
                     Target::Slot { depth: 0, scope, slot, .. } if self.in_frame(scope, 0) => {
-                        self.emit(Ins::SetLocal { src: v, slot, name: nm, dst })
+                        if self.regframe {
+                            self.emit(Ins::SetRLocal { src: v, slot, name: nm, dst })
+                        } else {
+                            self.emit(Ins::SetLocal { src: v, slot, name: nm, dst })
+                        }
                     }
                     Target::Slot { depth, scope, slot, .. } if self.in_frame(scope, depth) => {
                         let at = self.hops_here();
+                        let depth = if self.regframe { depth - 1 } else { depth };
                         self.emit(Ins::SetOuter { src: v, depth, slot, name: nm, dst, at })
                     }
                     _ => {
@@ -526,7 +638,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 let done = if in_place_shape(target, value) {
                     let node = self.cold(n);
                     let done = self.label();
-                    self.emit(Ins::TryInPlace { dst, node, name: NONE, done, ic: NONE });
+                    self.emit(Ins::TryInPlace { dst, node, name: NONE, done, ic: NONE, slot: u16::MAX });
                     Some(done)
                 } else {
                     None
@@ -744,12 +856,13 @@ impl<'r, 's> Compiler<'r, 's> {
     /// Una task o lambda: la define el tree-walker; su cuerpo se compila acá.
     fn define(&mut self, n: &Node, dst: Reg) {
         let child = match (&n.kind, self.res.scope_opened_by(n)) {
-            (NodeKind::TaskDefinition { body, .. }, Some(s)) => {
+            (NodeKind::TaskDefinition { body, parameters, .. }, Some(s)) => {
                 let body: Vec<&Node> =
                     body.iter().filter(|x| !matches!(x.kind, NodeKind::RequireStatement { .. })).collect();
-                Some(self.child(s, &body, false))
+                let params: Vec<Arc<str>> = parameters.iter().map(|p| p.name.clone()).collect();
+                Some(self.child(s, &params, &body, false))
             }
-            (NodeKind::LambdaExpression { body, .. }, Some(s)) => Some(self.child(s, &[&**body], true)),
+            (NodeKind::LambdaExpression { body, parameters }, Some(s)) => Some(self.child(s, parameters, &[&**body], true)),
             _ => None,
         };
         let node = self.cold(n);
@@ -765,22 +878,8 @@ impl<'r, 's> Compiler<'r, 's> {
         }
     }
 
-    fn child(&mut self, scope: ScopeId, body: &[&Node], lambda: bool) -> Rc<Chunk> {
-        let mut c = Compiler::new(self.res, self.shared, Some(scope));
-        if lambda {
-            // El cuerpo de una lambda es un bloque de una sentencia, el `give <expr>` que arma el
-            // intérprete: el chequeo de cancelación del bloque y un nodo más.
-            let e = body[0];
-            c.at(&e.location);
-            c.emit(Ins::CheckCancel);
-            c.enter();
-            let v = c.expr(e);
-            c.at(&e.location);
-            c.emit(Ins::Give { src: v });
-            return c.finish(Opnd::Reg(0));
-        }
-        c.block_of(body, Some(0), true);
-        c.finish(Opnd::Reg(0))
+    fn child(&mut self, scope: ScopeId, params: &[Arc<str>], body: &[&Node], lambda: bool) -> Rc<Chunk> {
+        compile_body(self.res, self.shared, scope, params, body, lambda)
     }
 
     // -- expresiones ----------------------------------------------------------------------------
@@ -897,16 +996,25 @@ impl<'r, 's> Compiler<'r, 's> {
                 let nm = self.name(name);
                 match self.target(n) {
                     Target::Slot { depth: 0, scope, slot, definite: true } if self.in_frame(scope, 0) => {
-                        Opnd::Local(slot)
+                        if self.regframe {
+                            Opnd::RLocal(slot)
+                        } else {
+                            Opnd::Local(slot)
+                        }
                     }
                     Target::Slot { depth: 0, scope, slot, .. } if self.in_frame(scope, 0) => {
                         let dst = self.dst(want);
-                        self.emit(Ins::LoadLocal { dst, slot, name: nm });
+                        if self.regframe {
+                            self.emit(Ins::LoadRLocal { dst, slot, name: nm });
+                        } else {
+                            self.emit(Ins::LoadLocal { dst, slot, name: nm });
+                        }
                         Opnd::Reg(dst)
                     }
                     Target::Slot { depth, scope, slot, .. } if self.in_frame(scope, depth) => {
                         let dst = self.dst(want);
                         let at = self.hops_here();
+                        let depth = if self.regframe { depth - 1 } else { depth };
                         self.emit(Ins::LoadOuter { dst, depth, slot, name: nm, at });
                         Opnd::Reg(dst)
                     }
@@ -1094,7 +1202,7 @@ impl<'r, 's> Compiler<'r, 's> {
     /// un nodo del tree-walker), se copia a un registro en su lugar.
     fn keep_until(&mut self, a: Opnd, later: &Node) -> Opnd {
         match a {
-            Opnd::Local(_) if !is_simple(later) => Opnd::Reg(self.to_reg(a)),
+            Opnd::Local(_) | Opnd::RLocal(_) if !is_simple(later) => Opnd::Reg(self.to_reg(a)),
             _ => a,
         }
     }
@@ -1225,6 +1333,8 @@ impl<'r, 's> Compiler<'r, 's> {
             parents: self.shared.parents.clone(),
             tagged,
             frame,
+            regframe: self.regframe,
+            param_slots: self.param_slots,
             nregs: self.max_reg,
             ics: (0..self.ics).map(|_| Cell::new(0)).collect(),
             ic_hops: self.ic_hops,
@@ -1336,7 +1446,7 @@ impl Interpreter {
     /// Devuelve lo mismo que `exec_block` sobre ese cuerpo.
     pub(super) fn run_chunk(&mut self, chunk: &Rc<Chunk>, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
         // Los slots `Local` sólo valen en el frame que la llamada preparó con el layout del chunk.
-        debug_assert!(chunk.frame.as_ref().is_none_or(|l| {
+        debug_assert!(chunk.regframe || chunk.frame.as_ref().is_none_or(|l| {
             let e = env.borrow();
             e.bindings.len_names() >= l.names.len() && (!chunk.tagged || e.bindings.laid_out_as(l))
         }));
@@ -1344,6 +1454,30 @@ impl Interpreter {
         self.vm_regs.resize(base + chunk.nregs as usize, SynValue::Nothing);
         let r = self.run_chunk_at(chunk, env, base);
         self.vm_regs.truncate(base);
+        r
+    }
+
+    /// Un cuerpo con frame en registros llamado desde el tree-walker: los parámetros que ligó en
+    /// `call_env` pasan a la ventana de locales y el cuerpo corre con el `closure_env`.
+    pub(super) fn run_chunk_regframe(
+        &mut self,
+        chunk: &Rc<Chunk>,
+        call_env: &Rc<RefCell<Environment>>,
+        closure_env: &Rc<RefCell<Environment>>,
+    ) -> Result<SynValue, Control> {
+        let n = chunk.frame.as_ref().map_or(0, |l| l.names.len());
+        let lbase = self.vm_locals.len();
+        self.vm_locals.resize(lbase + n, None);
+        {
+            let mut e = call_env.borrow_mut();
+            for k in 0..e.bindings.len_names().min(n) {
+                self.vm_locals[lbase + k] = e.bindings.take_slot(k);
+            }
+        }
+        let saved = std::mem::replace(&mut self.vm_lbase, lbase);
+        let r = self.run_chunk(chunk, closure_env);
+        self.vm_lbase = saved;
+        self.vm_locals.truncate(lbase);
         r
     }
 
@@ -1360,6 +1494,11 @@ impl Interpreter {
             Opnd::Reg(r) => std::mem::replace(&mut self.vm_regs[base + r as usize], SynValue::Nothing),
             Opnd::Copy(r) => self.vm_regs[base + r as usize].clone(),
             Opnd::Const(k) => chunk.consts[k as usize].clone(),
+            Opnd::RLocal(k) => match &self.vm_locals[self.vm_lbase + k as usize] {
+                Some(v) => v.clone(),
+                // Ligado seguro según el resolver: no pasa. Si pasara, por nombre.
+                None => return self.vm_rlocal_by_name(chunk, env, k, at),
+            },
             Opnd::Local(k) => {
                 let v = env.borrow().bindings.slot(k as usize).cloned();
                 match v {
@@ -1550,6 +1689,13 @@ impl Interpreter {
                     drop(std::mem::replace(&mut self.vm_regs[base + r as usize], SynValue::Nothing));
                     Ok(())
                 }
+                Ins::LoadRLocal { dst, slot, name } => match self.vm_locals[self.vm_lbase + slot as usize].clone() {
+                    Some(v) => {
+                        self.put(base, dst, v);
+                        Ok(())
+                    }
+                    None => self.vm_rlocal_hole(&chunk, &env, base, dst, name, at),
+                },
                 Ins::LoadLocal { dst, slot, name } => {
                     let v = env.borrow().bindings.slot(slot as usize).cloned();
                     match v {
@@ -1615,6 +1761,15 @@ impl Interpreter {
                         pc = to as usize;
                     }
                 }),
+                Ins::LetRLocal { src, slot, dst } => self.opnd(&chunk, &env, base, src, at).map(|v| {
+                    let k = self.vm_lbase + slot as usize;
+                    if dst == DISCARD {
+                        self.vm_locals[k] = Some(v);
+                    } else {
+                        self.vm_locals[k] = Some(v.clone());
+                        self.put(base, dst, v);
+                    }
+                }),
                 Ins::LetLocal { src, slot, dst } => self.opnd(&chunk, &env, base, src, at).map(|v| {
                     if dst == DISCARD {
                         env.borrow_mut().bindings.slot_set(slot as usize, v);
@@ -1627,6 +1782,17 @@ impl Interpreter {
                     env_set_shared(&env, &chunk.names[name as usize], v.clone());
                     self.put(base, dst, v);
                 }),
+                Ins::SetRLocal { src, slot, name, dst } => (|| {
+                    let v = self.opnd(&chunk, &env, base, src, at)?;
+                    let k = self.vm_lbase + slot as usize;
+                    if self.vm_locals[k].is_some() {
+                        self.vm_locals[k] = Some(v.clone());
+                        self.put(base, dst, v);
+                        Ok(())
+                    } else {
+                        self.vm_rlocal_set_hole(&chunk, &env, base, v, name, dst)
+                    }
+                })(),
                 Ins::SetLocal { src, slot, name, dst } => (|| {
                     let v = self.opnd(&chunk, &env, base, src, at)?;
                     let present = env.borrow().bindings.slot(slot as usize).is_some();
@@ -1672,7 +1838,7 @@ impl Interpreter {
                     self.put(base, dst, v);
                     Ok(())
                 })(),
-                Ins::TryInPlace { dst, node, name, done, ic } => match self.vm_try_in_place(&chunk, &env, base, dst, node, name, ic) {
+                Ins::TryInPlace { dst, node, name, done, ic, slot } => match self.vm_try_in_place(&chunk, &env, base, dst, node, name, ic, slot) {
                     Ok(true) => {
                         pc = done as usize;
                         Ok(())
@@ -1696,6 +1862,7 @@ impl Interpreter {
                                 iter_base: std::mem::replace(&mut iter_base, self.vm_iters.len()),
                                 taint: enter.taint,
                                 task: enter.task,
+                                lbase: std::mem::replace(&mut self.vm_lbase, enter.lbase),
                             };
                             self.vm_frames.push(caller);
                             base = enter.base;
@@ -1804,7 +1971,14 @@ impl Interpreter {
                 }
                 self.vm_iters.truncate(iter_base);
                 let call_env = std::mem::replace(&mut env, caller.env);
-                self.release_frame(call_env);
+                if chunk.regframe {
+                    // No hay frame: el `env` era el `closure_env`. Se sueltan las variables.
+                    drop(call_env);
+                    self.vm_locals.truncate(self.vm_lbase);
+                } else {
+                    self.release_frame(call_env);
+                }
+                self.vm_lbase = caller.lbase;
                 drop(caller.task);
                 self.recursion_depth -= 1;
                 self.vm_regs.truncate(base);
@@ -1854,11 +2028,18 @@ impl Interpreter {
         node: u32,
         name: u32,
         ic: u32,
+        slot: u16,
     ) -> Result<bool, Control> {
         // Sólo con una lista o un mapa puede aplicar; con cualquier otra cosa la referencia lee
         // la variable, ve que no encaja y deja todo como estaba.
         if name != NONE {
-            let now = if ic == NONE { env_get(env, &chunk.names[name as usize]) } else { self.load_free(chunk, env, name, ic) };
+            let now = if slot != u16::MAX {
+                self.vm_locals[self.vm_lbase + slot as usize].clone()
+            } else if ic == NONE {
+                env_get(env, &chunk.names[name as usize])
+            } else {
+                self.load_free(chunk, env, name, ic)
+            };
             let fits = matches!(now, Some(SynValue::List(_) | SynValue::Map(_)));
             drop(now);
             if !fits {
@@ -1868,6 +2049,21 @@ impl Interpreter {
         let NodeKind::SetMutation { target, value } = &chunk.nodes[node as usize].kind else {
             unreachable!("TryInPlace sobre otro nodo")
         };
+        if chunk.regframe {
+            // La vía en el lugar es de la referencia y busca por nombre: el frame se arma ahora con
+            // las variables MOVIDAS adentro (las mismas cuentas de referencias que la referencia, y
+            // con ellas el copy-on-write) y después vuelven a la ventana.
+            let frame = self.vm_spill(chunk, env);
+            let r = self.try_update_in_place(target, value, &frame);
+            self.vm_unspill(frame);
+            return match r? {
+                Some(v) => {
+                    self.put(base, dst, v);
+                    Ok(true)
+                }
+                None => Ok(false),
+            };
+        }
         match self.try_update_in_place(target, value, env)? {
             Some(v) => {
                 self.put(base, dst, v);
@@ -1875,6 +2071,64 @@ impl Interpreter {
             }
             None => Ok(false),
         }
+    }
+
+    /// F3.3b: una variable del frame en registros que resultó hueco (una rama que no corrió): por
+    /// nombre desde el `closure_env`, que es lo que sigue al frame.
+    #[inline(never)]
+    fn vm_rlocal_hole(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, dst: Reg, name: u32, at: usize) -> Result<(), Control> {
+        let nm = &chunk.names[name as usize];
+        match env_get(env, nm) {
+            Some(v) => {
+                self.put(base, dst, v);
+                Ok(())
+            }
+            None => Err(undefined_variable(nm, &chunk.locs[chunk.loc[at] as usize])),
+        }
+    }
+
+    #[inline(never)]
+    fn vm_rlocal_by_name(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, k: u16, at: usize) -> Result<SynValue, Control> {
+        let name = chunk.frame.as_ref().expect("frame").names[k as usize].clone();
+        env_get(env, &name).ok_or_else(|| undefined_variable(&name, &chunk.locs[chunk.loc[at] as usize]))
+    }
+
+    /// `set` a una variable del frame en registros que es hueco: la de afuera, como `env_update`.
+    #[inline(never)]
+    fn vm_rlocal_set_hole(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, v: SynValue, name: u32, dst: Reg) -> Result<(), Control> {
+        if env_update(env, &chunk.names[name as usize], v.clone()).is_err() {
+            return Err(set_undefined(&chunk.names[name as usize]));
+        }
+        self.put(base, dst, v);
+        Ok(())
+    }
+
+    /// F3.3b: el frame de un cuerpo en registros, armado para el tree-walker (variables movidas).
+    fn vm_spill(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>) -> Rc<RefCell<Environment>> {
+        let frame = self.acquire_frame(env, "call");
+        if let Some(l) = &chunk.frame {
+            let mut e = frame.borrow_mut();
+            for (k, name) in l.names.iter().enumerate() {
+                let v = self.vm_locals[self.vm_lbase + k].take();
+                e.bindings.push_slot(name.clone(), v);
+            }
+        }
+        frame
+    }
+
+    /// Las variables vuelven a la ventana y el frame a la pila.
+    fn vm_unspill(&mut self, frame: Rc<RefCell<Environment>>) {
+        {
+            let mut e = frame.borrow_mut();
+            let n = e.bindings.len_names();
+            let lbase = self.vm_lbase;
+            for k in 0..n {
+                if lbase + k < self.vm_locals.len() {
+                    self.vm_locals[lbase + k] = e.bindings.take_slot(k);
+                }
+            }
+        }
+        self.release_frame(frame);
     }
 
     #[inline(never)]
@@ -1999,6 +2253,9 @@ impl Interpreter {
                         self.recursion_depth -= 1;
                         return Err(err("maximum recursion depth exceeded"));
                     }
+                    if code.regframe {
+                        return self.vm_enter_regframe(t, code, first, n).map(Some);
+                    }
                     let call_env = self.acquire_frame(&t.closure_env, "call");
                     // Aridad permisiva (sin chequeo, un pipe): los de más se sueltan antes de los
                     // defaults, como en `call_value_named_inner`.
@@ -2042,11 +2299,46 @@ impl Interpreter {
                     let new_base = self.vm_regs.len();
                     self.vm_regs.resize(new_base + code.nregs as usize, SynValue::Nothing);
                     let SynValue::Task(task) = f else { unreachable!() };
-                    return Ok(Some(Enter { code, env: call_env, base: new_base, taint, task }));
+                    return Ok(Some(Enter { code, env: call_env, base: new_base, taint, task, lbase: self.vm_lbase }));
                 }
             }
         }
         self.vm_call_generic(chunk, base, at, dst, f, first, n, site)
+    }
+
+    /// Entrar a un cuerpo con frame en registros (F3.3b): los parámetros van a la ventana de
+    /// locales, sin `Environment`; el cuerpo corre con el `closure_env`. Lo demás como la entrada
+    /// de siempre (profundidad ya contada, defaults en el `closure_env`).
+    fn vm_enter_regframe(&mut self, t: &Rc<SynTaskValue>, code: Rc<Chunk>, first: usize, n: usize) -> Result<Enter, Control> {
+        let nl = code.frame.as_ref().map_or(0, |l| l.names.len());
+        let lbase = self.vm_locals.len();
+        self.vm_locals.resize(lbase + nl, None);
+        // Aridad permisiva (sin chequeo, un pipe): los de más se sueltan antes de los defaults.
+        for i in t.parameters.len()..n {
+            drop(std::mem::replace(&mut self.vm_regs[first + i], SynValue::Nothing));
+        }
+        for (i, param) in t.parameters.iter().enumerate() {
+            let v = if i < n {
+                std::mem::replace(&mut self.vm_regs[first + i], SynValue::Nothing)
+            } else {
+                match &param.default {
+                    Some(d) => match self.exec(d, &t.closure_env) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.vm_locals.truncate(lbase);
+                            self.recursion_depth -= 1;
+                            return Err(e);
+                        }
+                    },
+                    None => SynValue::Nothing,
+                }
+            };
+            self.vm_locals[lbase + code.param_slots[i] as usize] = Some(v);
+        }
+        let taint = if self.labels { Some(self.enter_call()) } else { None };
+        let new_base = self.vm_regs.len();
+        self.vm_regs.resize(new_base + code.nregs as usize, SynValue::Nothing);
+        Ok(Enter { env: t.closure_env.clone(), code, base: new_base, taint, task: t.clone(), lbase })
     }
 
     /// El camino de siempre (`call_value_named`): builtins, argumentos nombrados, tasks sin
@@ -2090,6 +2382,8 @@ struct Enter {
     base: usize,
     taint: Option<TaintFrame>,
     task: Rc<SynTaskValue>,
+    /// La ventana de locales del cuerpo (F3.3b; la del llamador si el cuerpo tiene frame).
+    lbase: usize,
 }
 
 fn set_undefined(name: &str) -> Control {
@@ -2114,7 +2408,7 @@ pub fn explain_source(source: &str) -> String {
 
 fn explain_chunk(c: &Chunk, title: &str, out: &mut String) {
     use std::fmt::Write;
-    let _ = writeln!(out, "== {} ({} registros)", title, c.nregs);
+    let _ = writeln!(out, "== {} ({} registros{})", title, c.nregs, if c.regframe { ", frame en registros" } else { "" });
     if let Some(f) = &c.frame {
         let names: Vec<&str> = f.names.iter().map(|n| &**n).collect();
         let _ = writeln!(out, "   frame: [{}]", names.join(", "));

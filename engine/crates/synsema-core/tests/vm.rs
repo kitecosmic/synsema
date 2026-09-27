@@ -8,9 +8,10 @@ fn a_task_body_is_compiled_with_its_frame() {
     let out = explain_source(include_str!("../../../../specs/compute-bench/fib.syn"));
     assert!(out.contains("Define {"), "{}", out);
     assert!(out.contains("frame: [n]"), "{}", out);
-    // `n` es un parámetro: se lee del slot 0 del frame, sin buscarlo por nombre.
-    assert!(out.contains("a: Local(0)"), "{}", out);
-    assert!(out.contains("Give { src: Local(0) }"), "{}", out);
+    // `n` es un parámetro: se lee del slot 0 (del frame en registros: `fib` no deja ver su frame),
+    // sin buscarlo por nombre.
+    assert!(out.contains("a: RLocal(0)"), "{}", out);
+    assert!(out.contains("Give { src: RLocal(0) }"), "{}", out);
 }
 
 #[test]
@@ -29,8 +30,9 @@ fn locals_live_in_frame_slots_in_resolver_order() {
     let src = "task f(a, b)\n    when a\n        let c be 1\n    let d be b\n    give d\nprint(f(true, 2))\n";
     let out = explain_source(src);
     assert!(out.contains("frame: [a, b, c, d]"), "{}", out);
-    assert!(out.contains("LetLocal { src: Const(0), slot: 2"), "{}", out);
-    assert!(out.contains("LetLocal { src: Local(1), slot: 3"), "{}", out);
+    // (Esta task no deja ver su frame: va en registros, con los mismos slots.)
+    assert!(out.contains("LetRLocal { src: Const(0), slot: 2"), "{}", out);
+    assert!(out.contains("LetRLocal { src: RLocal(1), slot: 3"), "{}", out);
 }
 
 #[test]
@@ -45,4 +47,18 @@ fn calls_each_and_match_run_in_the_vm() {
     assert!(out.contains("SetOuter"), "{}", out);
     // Salir de un brazo o de un bucle vuelve a la profundidad de afuera.
     assert!(out.contains("Unwind"), "{}", out);
+}
+
+#[test]
+fn frames_nobody_can_see_live_in_registers() {
+    // `fib` no define closures, no tiene nodos fríos ni frames propios: su frame va en registros.
+    let out = explain_source(include_str!("../../../../specs/compute-bench/fib.syn"));
+    assert!(out.contains("frame en registros"), "{}", out);
+    // Con un `each` (un frame por vuelta, hijo del de la llamada) no.
+    let out = explain_source("task f(xs)\n    let t be 0\n    each x in xs\n        set t to t + x\n    give t\nprint(f([1]))\n");
+    assert!(!out.contains("frame en registros"), "{}", out);
+    // Si define una lambda, la lambda captura el frame: tampoco (la lambda sí puede).
+    let out = explain_source("task f(k)\n    let g be (x) => x + k\n    give g(1)\nprint(f(1))\n");
+    let task_header = out.lines().find(|l| l.contains("hijo 0 (")).unwrap_or("");
+    assert!(!task_header.contains("frame en registros"), "{}", out);
 }
