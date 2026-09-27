@@ -128,8 +128,14 @@ pub(crate) enum Ins {
     MakeList { dst: Reg, first: Reg, n: u16 },
     /// `{k: v, …}` con clave y valor alternados en `2n` registros desde `first`.
     MakeMap { dst: Reg, first: Reg, n: u16 },
-    GetProp { dst: Reg, obj: Opnd, name: u32 },
-    GetIndex { dst: Reg, obj: Opnd, idx: Opnd },
+    /// `m.k`. F3.6 (L3, *inline cache*): `ic` recuerda en qué posición del mapa estaba la clave la
+    /// última vez; si la clave en esa posición es la misma, no se hashea (se compara la clave, no
+    /// una "forma": la semántica de valor no cambia). Lo demás (otros tipos, clave que falta,
+    /// módulos) por `property_read`, con sus errores.
+    GetProp { dst: Reg, obj: Opnd, name: u32, ic: u32 },
+    /// `x[i]`. F3.6: una lista con un entero, directo; un mapa con una clave de texto, sin armar la
+    /// clave (`to_string`) y con la misma caché que `GetProp`. Lo demás por `index_read`.
+    GetIndex { dst: Reg, obj: Opnd, idx: Opnd, ic: u32 },
     /// `set <camino> to v`: el destino lo recorre la referencia (`exec_set`), con el valor ya
     /// evaluado.
     SetPath { src: Opnd, node: u32, dst: Reg },
@@ -235,6 +241,8 @@ pub(crate) struct Chunk {
     ic_hops: Vec<u32>,
     /// Por caché: si la búsqueda empieza en el entorno actual (sin frames que saltear).
     ic_here: Vec<bool>,
+    /// Las cachés de `GetProp`/`GetIndex` (F3.6): posición + 1 de la clave en el mapa (0 = vacía).
+    key_ics: Box<[Cell<u32>]>,
     /// Los recorridos hacia afuera de este cuerpo (ver `Hops`).
     hops: Vec<Hops>,
     /// Por slot de feedback (F3.4): cuántas veces se desoptimizó su operación.
@@ -534,6 +542,7 @@ struct Compiler<'r, 's> {
     frame_needed: bool,
     node_spill: Vec<u32>,
     spills: Vec<Box<[Spill]>>,
+    key_ics: u32,
 }
 
 impl<'r, 's> Compiler<'r, 's> {
@@ -576,7 +585,14 @@ impl<'r, 's> Compiler<'r, 's> {
             frame_needed: false,
             node_spill: Vec::new(),
             spills: Vec::new(),
+            key_ics: 0,
         }
+    }
+
+    /// Una caché de clave nueva (F3.6).
+    fn key_ic(&mut self) -> u32 {
+        self.key_ics += 1;
+        self.key_ics - 1
     }
 
     /// Los lugares de la ventana: el frame en registros primero (parámetros en su slot) y cada
@@ -1309,7 +1325,8 @@ impl<'r, 's> Compiler<'r, 's> {
                 self.at(&n.location);
                 let name = self.name(property_name);
                 let dst = self.dst(want);
-                self.emit(Ins::GetProp { dst, obj: o, name });
+                let ic = self.key_ic();
+                self.emit(Ins::GetProp { dst, obj: o, name, ic });
                 Opnd::Reg(dst)
             }
             K::IndexAccess { object, index } => {
@@ -1319,7 +1336,8 @@ impl<'r, 's> Compiler<'r, 's> {
                 let i = self.expr(index);
                 self.at(&n.location);
                 let dst = self.dst(want);
-                self.emit(Ins::GetIndex { dst, obj: o, idx: i });
+                let ic = self.key_ic();
+                self.emit(Ins::GetIndex { dst, obj: o, idx: i, ic });
                 Opnd::Reg(dst)
             }
             K::PipeExpression { value, transforms } => {
@@ -1726,6 +1744,7 @@ impl<'r, 's> Compiler<'r, 's> {
             nregs: self.max_reg,
             ics: (0..self.ics).map(|_| Cell::new(0)).collect(),
             ic_here: self.ic_hops.iter().map(|&h| self.hops[h as usize].from.is_none()).collect(),
+            key_ics: (0..self.key_ics).map(|_| Cell::new(0)).collect(),
             ic_hops: self.ic_hops,
             hops: self.hops,
             deopts: (0..=self.feedback as usize).map(|_| Cell::new(0)).collect(),
@@ -2135,16 +2154,34 @@ impl Interpreter {
                     self.put(base, dst, syn_map(m));
                     Ok(())
                 }
-                Ins::GetProp { dst, obj, name } => (|| {
+                Ins::GetProp { dst, obj, name, ic } => (|| {
                     let o = self.opnd(&chunk, &env, base, obj, at)?;
-                    let v = self.property_read(o, &chunk.names[name as usize], &chunk.locs[chunk.loc[at] as usize])?;
+                    let found = match &o {
+                        SynValue::Map(m) => map_get_cached(&m.borrow(), &chunk.names[name as usize], &chunk.key_ics[ic as usize]),
+                        _ => None,
+                    };
+                    let v = match found {
+                        Some(v) => v,
+                        None => self.property_read(o, &chunk.names[name as usize], &chunk.locs[chunk.loc[at] as usize])?,
+                    };
                     self.put(base, dst, v);
                     Ok(())
                 })(),
-                Ins::GetIndex { dst, obj, idx } => (|| {
+                Ins::GetIndex { dst, obj, idx, ic } => (|| {
                     let o = self.opnd(&chunk, &env, base, obj, at)?;
                     let i = self.opnd(&chunk, &env, base, idx, at)?;
-                    let v = self.index_read(o, i, &chunk.locs[chunk.loc[at] as usize])?;
+                    let found = match (&o, &i) {
+                        (SynValue::Map(m), SynValue::Text(k)) => map_get_cached(&m.borrow(), k, &chunk.key_ics[ic as usize]),
+                        (SynValue::List(l), SynValue::Number(Number::Int(k))) => {
+                            let items = l.borrow();
+                            resolve_index(*k, items.len()).map(|j| items[j].clone())
+                        }
+                        _ => None,
+                    };
+                    let v = match found {
+                        Some(v) => v,
+                        None => self.index_read(o, i, &chunk.locs[chunk.loc[at] as usize])?,
+                    };
                     self.put(base, dst, v);
                     Ok(())
                 })(),
@@ -3233,6 +3270,24 @@ struct Enter {
     task: Rc<SynTaskValue>,
     /// La ventana de locales del cuerpo (F3.3b; la del llamador si el cuerpo tiene frame).
     lbase: usize,
+}
+
+/// La clave `key` de un mapa, por la posición que recuerda `ic` (si la clave en esa posición es
+/// la misma, sin hashear); si no, la búsqueda de siempre, y `ic` recuerda dónde estaba. `None` si
+/// no está (el que llama arma el error de la referencia).
+#[inline(always)]
+fn map_get_cached(m: &IndexMap<String, SynValue>, key: &str, ic: &Cell<u32>) -> Option<SynValue> {
+    let c = ic.get() as usize;
+    if c > 0 {
+        if let Some((k, v)) = m.get_index(c - 1) {
+            if k.as_str() == key {
+                return Some(v.clone());
+            }
+        }
+    }
+    let (i, _, v) = m.get_full(key)?;
+    ic.set(i as u32 + 1);
+    Some(v.clone())
 }
 
 /// Cuántas veces puede desoptimizarse una operación antes de quedar genérica para siempre (una que

@@ -1,0 +1,6 @@
+-- F3.6: un índice fuera de rango en un sitio que ya leyó la lista.
+task at(xs, i)
+    give xs[i]
+print(at([1, 2, 3], 0))
+print(at([1, 2, 3], -1))
+print(at([1, 2, 3], 3))

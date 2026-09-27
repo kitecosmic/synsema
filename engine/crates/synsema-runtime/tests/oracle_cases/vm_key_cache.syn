@@ -1,0 +1,48 @@
+-- F3.6 contra la referencia: cachés de clave en `m.k` y `m["k"]` (la posición donde estaba la
+-- clave la última vez) y listas por índice. El mismo sitio ve mapas con otras claves, en otro
+-- orden, sin la clave, y otros tipos; cada task se llama varias veces (corre compilada).
+
+task price(r)
+    give r.price
+task by_key(r, k)
+    give r[k]
+task at(xs, i)
+    give xs[i]
+
+-- La clave en posiciones distintas en cada mapa: la caché tiene que comparar la clave.
+let a be {"price": 1, "qty": 2}
+let b be {"qty": 3, "price": 4}
+let c be {"id": 9, "name": "x", "price": 5}
+print([price(a), price(b), price(c), price(a), price(b)])
+print([by_key(a, "qty"), by_key(b, "qty"), by_key(c, "name"), by_key(a, "price"), by_key(c, "id")])
+
+-- El mapa cambia entre lecturas: se borra una clave anterior y la clave se mueve.
+let m be {"x": 1, "price": 2, "y": 3}
+let p1 be price(m)
+set m to remove(m, "x")
+let p2 be price(m)
+set m to merge({"z": 0}, m)
+let p3 be price(m)
+print([p1, p2, p3, m])
+
+-- Claves que no son texto (`to_string` de la referencia) y texto que parece número.
+let nums be {"1": "uno", "2.5": "dos y medio", "true": "verdad"}
+print([by_key(nums, 1), by_key(nums, 2.5), by_key(nums, true), by_key(nums, "1")])
+
+-- Listas: índices negativos, textos y floats como índice van por la referencia.
+let xs be [10, 20, 30]
+print([at(xs, 0), at(xs, 2), at(xs, -1), at(xs, -3), at("hola", 1), at(xs, 1)])
+
+-- Un registro por vuelta, en una lista de mapas (el caso común).
+task total(rows)
+    let s be 0
+    each r in rows
+        set s to s + r.price * r["qty"]
+    give s
+let rows be [{"price": 2, "qty": 3}, {"qty": 1, "price": 7}, {"price": 1, "qty": 1, "extra": true}]
+print([total(rows), total(rows), total([])])
+
+-- Mapas anidados y el mismo sitio con un mapa vacío después.
+task deep(r)
+    give r.inner.value
+print([deep({"inner": {"value": 1}}), deep({"inner": {"other": 0, "value": 2}}), deep({"inner": {"value": 3}})])
