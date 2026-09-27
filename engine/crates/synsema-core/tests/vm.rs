@@ -3,9 +3,26 @@
 
 use synsema_core::interpreter::explain_source;
 
+/// Los programas del arnés (specs/compute-bench, que no se versiona): `fib` recursivo y el bucle
+/// contador de la comparación con otros lenguajes.
+const FIB: &str = "task fib(n)
+    when n < 2
+        give n
+    give fib(n - 1) + fib(n - 2)
+
+print(fib(27))
+";
+const LOOP: &str = "let total be 0
+let i be 0
+while i < 10000000
+    set total to total + i % 7
+    set i to i + 1
+print(total)
+";
+
 #[test]
 fn a_task_body_is_compiled_with_its_frame() {
-    let out = explain_source(include_str!("../../../../specs/compute-bench/fib.syn"));
+    let out = explain_source(FIB);
     assert!(out.contains("Define {"), "{}", out);
     assert!(out.contains("frame: [n]"), "{}", out);
     // `n` es un parámetro: se lee del slot 0 (del frame en registros: `fib` no deja ver su frame),
@@ -16,7 +33,7 @@ fn a_task_body_is_compiled_with_its_frame() {
 
 #[test]
 fn a_loop_counts_its_steps_once_per_block() {
-    let out = explain_source(include_str!("../../../../specs/compute-bench/langs/loop.syn"));
+    let out = explain_source(LOOP);
     // La condición `i < 10000000` son tres nodos: un solo `Steps(3)` por vuelta.
     assert!(out.contains("Steps(3)"), "{}", out);
     // `set total to total + …` pasa primero por la vía en el lugar, como la referencia.
@@ -52,7 +69,7 @@ fn calls_each_and_match_run_in_the_vm() {
 #[test]
 fn frames_nobody_can_see_live_in_registers() {
     // `fib` no define closures, no tiene nodos fríos ni frames propios: su frame va en registros.
-    let out = explain_source(include_str!("../../../../specs/compute-bench/fib.syn"));
+    let out = explain_source(FIB);
     assert!(out.contains("frame en registros"), "{}", out);
     // Con un `each` (un frame por vuelta, hijo del de la llamada) no.
     let out = explain_source("task f(xs)\n    let t be 0\n    each x in xs\n        set t to t + x\n    give t\nprint(f([1]))\n");
