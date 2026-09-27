@@ -6,6 +6,37 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.33 — 2026-09-27
+
+Speed, third step: a bytecode virtual machine. The same language — every program gives the same
+result, the same errors and the same `steps()` count — only faster. Nothing to change in your
+programs.
+
+**Faster.** Measured on the interpreter against v0.6.32 (same machine, best of 9 alternating
+runs, without counting PGO or the Windows allocator, which both still apply on top):
+
+- Task calls: **−21 % to −25 %**; recursive `fib`: **−15 %**; a builtin call: −7 %.
+- `each`: **−36 %**; reading a variable several scopes up: **−45 %** (16 levels, now independent
+  of the depth).
+- A text literal: **−31 %**, and it no longer asks for memory; `set`: −21 %; `let`, `+`, `==`:
+  −12 % to −15 %; `<` and a `while` loop: −6 % to −11 %.
+- Programs that build data: maps −8 %, text −8 %, closures −3 %; lists and rows of maps unchanged.
+
+**How.** Task bodies and the top level of a program are compiled to a register bytecode and run
+by a small virtual machine; calls between compiled tasks no longer go through the Rust stack, and
+a task whose variables nothing else can see keeps them in registers instead of an environment.
+The tree-walking interpreter is still there and still the reference: it runs every program with
+information-flow labels on, and everything the machine does not compile is handed back to it.
+
+**For contributors.** New `synsema-core/src/resolve.rs` (where each variable lives, what
+escapes, what closures capture) and `synsema-core/src/vm.rs` (compiler and machine). The
+differential oracle (`reference_oracle.rs`) now also checks every by-name lookup of the reference
+run against the resolver (`oracle_run --resolver-check`, a test-only cargo feature), and runs the
+compiled path against the reference over the whole corpus: same output, errors and `steps()`.
+`steps()` is counted per basic block and corrected on the error path, so it stays exact.
+`cargo test` gained `resolver.rs`, `vm.rs` and new oracle cases (`vm_*.syn`, `resolver_scopes.syn`);
+the allocation table now expects zero for a text literal.
+
 ## v0.6.32 — 2026-09-26
 
 Speed, second step. The same language — every program gives the same result — only faster: a
