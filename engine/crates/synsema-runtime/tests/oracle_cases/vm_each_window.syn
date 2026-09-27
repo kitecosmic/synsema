@@ -1,0 +1,153 @@
+-- F3.4 contra la referencia: vueltas de `each` sin frame (sus variables en la ventana de
+-- locales de la VM) y tasks con `each` cuyo frame pasa a registros. Cada task se llama varias
+-- veces (corre compilada).
+
+let shade be "global"
+
+task sum(xs)
+    let t be 0
+    each x in xs
+        set t to t + x
+    give t
+print([sum([1, 2, 3]), sum([4, 5]), sum(range(0, 10)), sum([])])
+
+-- Anidados, con `let` de la vuelta y la vía en el lugar (spill de dos frames).
+task pairs(n)
+    let out be []
+    each i in range(0, n)
+        each j in range(i, n)
+            when j % 2 == 0
+                let k be i * j
+                set out to append(out, [i, j, k])
+    give out
+print([pairs(3), pairs(4)])
+
+-- `stop` corta la vuelta; `give` sale de adentro.
+task first_big(xs)
+    let found be nothing
+    each x in xs
+        when x > 10
+            set found to x
+            stop
+    give found
+task find(xs, v)
+    each x in xs
+        when x == v
+            give "found"
+    give "missing"
+print([first_big([1, 20, 30]), first_big([1]), find([1, 2], 2), find([1, 2], 3), find([], 1)])
+
+-- Un `let` en una rama que no corrió es un hueco: se lee lo de afuera (el global), y en la vuelta
+-- siguiente la referencia suelta el frame de la vuelta (el hueco vuelve).
+task holes(xs)
+    let r be []
+    each x in xs
+        when x > 1
+            let shade be "loop"
+        set r to append(r, shade)
+    give r
+print([holes([1, 2, 1, 3]), holes([2, 1])])
+
+-- `set` con caminos: el índice usa la variable de la vuelta (la referencia la ve en su frame).
+task index_by(rs)
+    let acc be {}
+    each r in rs
+        set acc[r["k"]] to r["v"]
+    give acc
+print([index_by([{"k": "a", "v": 1}, {"k": "b", "v": 2}]), index_by([])])
+
+-- Copy-on-write: un alias tomado antes del bucle no ve los cambios.
+task grow(xs)
+    let out be xs
+    let alias be out
+    each x in xs
+        set out to append(out, x * 10)
+        set out to out + [x]
+    give [out, alias]
+print([grow([1, 2]), grow([3])])
+
+-- Colecciones de todo tipo, y `range` con paso.
+task kinds()
+    let r be []
+    each c in "hey"
+        set r to append(r, c)
+    each k in {"a": 1, "b": 2}
+        set r to append(r, k)
+    each b in bytes("hi")
+        set r to append(r, b)
+    each i in range(10, 0, -3)
+        set r to append(r, i)
+    each i in range(3)
+        set r to append(r, i)
+    give r
+print([kinds(), kinds()])
+
+-- `range` que no es el builtin: la llamada de siempre.
+task strange()
+    let range be (a, b) => [b, a]
+    let s be 0
+    each x in range(1, 2)
+        set s to s + x
+    give s
+print([strange(), strange()])
+
+-- Una lambda adentro de la vuelta captura su frame: esa vuelta sigue con frame.
+task captures(xs)
+    let fs be []
+    each x in xs
+        set fs to append(fs, () => x * 2)
+    let out be []
+    each f in fs
+        set out to append(out, f())
+    give out
+print([captures([1, 2, 3]), captures([4])])
+
+-- `match` adentro de la vuelta: el brazo es un frame hijo, la vuelta sigue con frame.
+task shapes(xs)
+    let out be []
+    each x in xs
+        match x
+            is [a, b]
+                set out to append(out, a + b)
+            otherwise
+                set out to append(out, x)
+    give out
+print([shapes([[1, 2], 3]), shapes([[4, 5]])])
+
+-- Tres niveles, recursión y una vuelta en el nivel superior.
+task deep(n)
+    let s be 0
+    each a in range(0, n)
+        each b in [a, a]
+            each c in [b]
+                set s to s + c
+    give s
+task walk(tree)
+    let s be 0
+    each child in tree
+        when type_of(child) == "list"
+            set s to s + walk(child)
+        otherwise
+            set s to s + child
+    give s
+print([deep(4), deep(5), walk([1, [2, [3, 4]], 5]), walk([[1], [2]])])
+let total be 0
+each i in range(0, 5)
+    let sq be i * i
+    set total to total + sq
+print(total)
+
+-- `steps()` exacto con vueltas sin frame.
+task steps_of(xs)
+    let s0 be steps()
+    let t be 0
+    each x in xs
+        when x > 1
+            let y be x
+        set t to t + x
+    give steps() - s0
+print([steps_of([1, 2, 3]), steps_of([1, 2, 3]), steps_of(range(0, 3)), steps_of([])])
+let before be steps()
+each i in range(0, 3)
+    let z be i
+print(steps() - before)

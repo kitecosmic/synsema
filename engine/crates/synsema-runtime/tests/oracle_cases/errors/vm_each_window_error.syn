@@ -1,0 +1,10 @@
+-- F3.4: un error a mitad de una vuelta sin frame (los pasos que sobran y la ubicación).
+task f(xs)
+    let t be 0
+    each x in xs
+        let y be x * 2
+        set t to t + y / (x - 2)
+    give t
+print(f([1, 3]))
+print(f([1, 3]))
+print(f([1, 2, 3]))

@@ -1,0 +1,11 @@
+-- F3.4: leer un `let` de la vuelta que no se ligó (y no hay nada afuera con ese nombre).
+task f(xs)
+    let t be []
+    each x in xs
+        when x > 1
+            let y be x
+        set t to append(t, y)
+    give t
+print(f([2, 3]))
+print(f([2, 3]))
+print(f([2, 1]))
