@@ -32,3 +32,17 @@ fn locals_live_in_frame_slots_in_resolver_order() {
     assert!(out.contains("LetLocal { src: Const(0), slot: 2"), "{}", out);
     assert!(out.contains("LetLocal { src: Local(1), slot: 3"), "{}", out);
 }
+
+#[test]
+fn calls_each_and_match_run_in_the_vm() {
+    let src = "task f(xs)\n    let t be 0\n    each x in xs\n        match x\n            is [a, b]\n                set t to t + a\n            otherwise\n                set t to t + g(x)\n    give t\ntask g(v)\n    give v\nprint(f([1, [2, 3]]))\n";
+    let out = explain_source(src);
+    assert!(out.contains("EachInit"), "{}", out);
+    assert!(out.contains("EachNext"), "{}", out);
+    assert!(out.contains("MatchArm"), "{}", out);
+    assert!(out.contains("Call {"), "{}", out);
+    // `t` es de la llamada; adentro de la vuelta y del brazo está un frame (o dos) más afuera.
+    assert!(out.contains("SetOuter"), "{}", out);
+    // Salir de un brazo o de un bucle vuelve a la profundidad de afuera.
+    assert!(out.contains("Unwind"), "{}", out);
+}

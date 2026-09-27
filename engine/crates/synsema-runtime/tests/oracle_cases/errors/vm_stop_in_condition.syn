@@ -1,0 +1,12 @@
+-- Un `stop` que sale de una task llamada en la CONDICIÓN de un `while` no corta el bucle: la
+-- referencia no lo atrapa ahí.
+task check(i)
+    when i == 2
+        stop
+    give i < 5
+task run()
+    let i be 0
+    while check(i)
+        set i to i + 1
+    give i
+print(run())

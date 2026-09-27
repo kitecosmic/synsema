@@ -555,7 +555,7 @@ impl Bindings {
     /// Prepara un frame de llamada para la VM: los parámetros ya ligados tienen que ser los
     /// primeros nombres del layout, en su orden; el resto queda como hueco ("no está acá").
     /// `false` (y el frame sin tocar) si no coinciden.
-    pub(crate) fn lay_out(&mut self, layout: &Rc<vm::Layout>) -> bool {
+    pub(crate) fn lay_out(&mut self, layout: &Rc<vm::Layout>, tag: bool) -> bool {
         let n = self.names.len();
         if n > layout.names.len() || self.names.iter().zip(layout.names.iter()).any(|(a, b)| **a != **b) {
             return false;
@@ -565,8 +565,13 @@ impl Bindings {
             let k = self.slots.len() - 1;
             self.slots[k] = None;
         }
-        self.layout = Some(layout.clone());
+        if tag {
+            self.layout = Some(layout.clone());
+        }
         true
+    }
+    pub(crate) fn len_names(&self) -> usize {
+        self.names.len()
     }
     #[inline]
     pub(crate) fn laid_out_as(&self, layout: &Rc<vm::Layout>) -> bool {
@@ -1308,6 +1313,10 @@ pub struct Interpreter {
     free_args: Vec<CallArgs>,
     /// Los registros de la VM (F3): cada chunk en ejecución usa una ventana al final.
     vm_regs: Vec<SynValue>,
+    /// Las llamadas en curso dentro de la VM (F3.2): el estado del llamador de cada una.
+    vm_frames: Vec<vm::VmFrame>,
+    /// Los iteradores de los `each` compilados en curso (F3.2).
+    vm_iters: Vec<EachItems>,
     /// v0.6.20 — raíz del proyecto: el directorio del archivo de ENTRADA, límite de contención
     /// de `use "../x.syn"`. La fija el host (`set_project_root`) o, si no, se captura del primer
     /// `use` que se ejecuta (siempre el top-level de la entrada). `None` = criterio v0.6.19
@@ -1555,6 +1564,8 @@ impl Interpreter {
             free_frames: Vec::new(),
             free_args: Vec::new(),
             vm_regs: Vec::new(),
+            vm_frames: Vec::new(),
+            vm_iters: Vec::new(),
             project_root: None,
             stdout_hook: None,
             stdout_verdict: None,
@@ -4363,33 +4374,7 @@ impl Interpreter {
                         } else {
                             coll
                         };
-                        // v0.6.29: un mapa se recorre por sus claves y un texto por sus caracteres
-                        // (como Python); bytes, por sus valores 0..=255.
-                        match &coll {
-                            // Atajo (F1.11): la lista se recorre por índice en vez de copiarla
-                            // entera. La foto la sigue dando la semántica de valor: si el cuerpo la
-                            // modifica, el copy-on-write ve este `Rc` compartido y copia (una vez).
-                            SynValue::List(l) if self.shortcuts => EachItems::List(l.clone(), 0),
-                            SynValue::List(l) => EachItems::Owned(l.borrow().clone().into_iter()),
-                            SynValue::Map(m) => EachItems::Owned(
-                                m.borrow().keys().map(|k| syn_text(k.as_str())).collect::<Vec<_>>().into_iter(),
-                            ),
-                            SynValue::Text(t) => {
-                                EachItems::Owned(t.chars().map(|c| syn_text(c.to_string())).collect::<Vec<_>>().into_iter())
-                            }
-                            SynValue::Bytes(b) => {
-                                EachItems::Owned(b.iter().map(|x| syn_int(*x as i64)).collect::<Vec<_>>().into_iter())
-                            }
-                            _ => {
-                                return Err(err_at(
-                                    format!(
-                                        "Cannot iterate over {} — each walks a list, the keys of a map, the characters of a text or the values of bytes",
-                                        coll.type_name()
-                                    ),
-                                    loc,
-                                ))
-                            }
-                        }
+                        self.each_items_of(&coll, loc)?
                     }
                 };
                 // T5 (ronda 5): el frame de bucle se abre ANTES de teñir, porque un `stop` del
@@ -7128,7 +7113,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 // La VM (F3) corre el cuerpo si lo tiene compilado y el frame se pudo preparar; si
                 // no, el tree-walker. Los dos devuelven lo mismo (el oráculo los compara).
                 let body = match self.vm_code_for(&task) {
-                    Some(code) if code.frame.as_ref().is_some_and(|l| call_env.borrow_mut().bindings.lay_out(l)) => {
+                    Some(code) if code.frame.as_ref().is_some_and(|l| call_env.borrow_mut().bindings.lay_out(l, code.tagged)) => {
                         self.run_chunk(code, &call_env)
                     }
                     _ => self.exec_block(&task.body, &call_env),
@@ -9133,6 +9118,39 @@ enum EachItems {
     Range(RangeIter),
 }
 
+impl Interpreter {
+    /// Qué recorre un `each` sobre un valor ya evaluado (el tree-walker y la VM).
+    fn each_items_of(&self, coll: &SynValue, loc: &SourceLocation) -> Result<EachItems, Control> {
+        // v0.6.29: un mapa se recorre por sus claves y un texto por sus caracteres
+        // (como Python); bytes, por sus valores 0..=255.
+        Ok(match coll {
+            // Atajo (F1.11): la lista se recorre por índice en vez de copiarla
+            // entera. La foto la sigue dando la semántica de valor: si el cuerpo la
+            // modifica, el copy-on-write ve este `Rc` compartido y copia (una vez).
+            SynValue::List(l) if self.shortcuts => EachItems::List(l.clone(), 0),
+            SynValue::List(l) => EachItems::Owned(l.borrow().clone().into_iter()),
+            SynValue::Map(m) => EachItems::Owned(
+                m.borrow().keys().map(|k| syn_text(k.as_str())).collect::<Vec<_>>().into_iter(),
+            ),
+            SynValue::Text(t) => {
+                EachItems::Owned(t.chars().map(|c| syn_text(c.to_string())).collect::<Vec<_>>().into_iter())
+            }
+            SynValue::Bytes(b) => {
+                EachItems::Owned(b.iter().map(|x| syn_int(*x as i64)).collect::<Vec<_>>().into_iter())
+            }
+            _ => {
+                return Err(err_at(
+                    format!(
+                        "Cannot iterate over {} — each walks a list, the keys of a map, the characters of a text or the values of bytes",
+                        coll.type_name()
+                    ),
+                    loc,
+                ))
+            }
+        })
+    }
+}
+
 impl EachItems {
     fn next_item(&mut self) -> Option<SynValue> {
         match self {
@@ -9746,6 +9764,44 @@ fn sha256_hex(b: &[u8]) -> String {
 /// Sólo para llamadas del fuente: el host (rutas de `serve`, handlers, cron) y los
 /// builtins que invocan callbacks (`apply`, `where`, `reduce`, …) siguen pasando lo que
 /// tienen y el callback declara lo que usa.
+/// La aridad de una llamada a una task: `positional` argumentos por posición y `named(p)` dice
+/// si el parámetro `p` vino por nombre. La usan el tree-walker y la VM (mismos mensajes).
+fn check_task_arity(
+    t: &SynTaskValue,
+    positional: usize,
+    named: impl Fn(&str) -> bool,
+    loc: &SourceLocation,
+) -> Result<(), Control> {
+    let np = t.parameters.len();
+    // Sólo para el mensaje: se arma cuando hay error, no en cada llamada.
+    let who = || if t.name == "<lambda>" { "this lambda".to_string() } else { format!("task '{}'", t.name) };
+    if positional > np {
+        return Err(err_at(
+            format!(
+                "{} takes {} argument{}, got {}",
+                who(),
+                np,
+                if np == 1 { "" } else { "s" },
+                positional
+            ),
+            loc,
+        ));
+    }
+    for (i, p) in t.parameters.iter().enumerate() {
+        let given = i < positional || named(&p.name);
+        if !given && p.default.is_none() {
+            return Err(err_at(
+                format!(
+                    "{} is missing argument '{}' — pass it, or give the parameter a default in the task: {} = …",
+                    who(), p.name, p.name
+                ),
+                loc,
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn check_call_arity(
     func: &SynValue,
     args: &[(Option<String>, SynValue)],
@@ -9753,36 +9809,7 @@ fn check_call_arity(
 ) -> Result<(), Control> {
     let positional = args.iter().filter(|(n, _)| n.is_none()).count();
     match func {
-        SynValue::Task(t) => {
-            let np = t.parameters.len();
-            // Sólo para el mensaje: se arma cuando hay error, no en cada llamada.
-            let who = || if t.name == "<lambda>" { "this lambda".to_string() } else { format!("task '{}'", t.name) };
-            if positional > np {
-                return Err(err_at(
-                    format!(
-                        "{} takes {} argument{}, got {}",
-                        who(),
-                        np,
-                        if np == 1 { "" } else { "s" },
-                        positional
-                    ),
-                    loc,
-                ));
-            }
-            for (i, p) in t.parameters.iter().enumerate() {
-                let given = i < positional || args.iter().any(|(n, _)| n.as_deref() == Some(&*p.name));
-                if !given && p.default.is_none() {
-                    return Err(err_at(
-                        format!(
-                            "{} is missing argument '{}' — pass it, or give the parameter a default in the task: {} = …",
-                            who(), p.name, p.name
-                        ),
-                        loc,
-                    ));
-                }
-            }
-            Ok(())
-        }
+        SynValue::Task(t) => check_task_arity(t, positional, |name| args.iter().any(|(n, _)| n.as_deref() == Some(name)), loc),
         // El constructor de un tipo o de una variante (`Point(…)`, `Order.paid(…)`) cuenta
         // sus campos él mismo, con un mensaje que nombra el tipo.
         SynValue::Builtin(b) if b.meta.constructor => Ok(()),

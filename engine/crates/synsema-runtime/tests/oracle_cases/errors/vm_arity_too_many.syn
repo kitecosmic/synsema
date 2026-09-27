@@ -1,0 +1,10 @@
+-- Aridad desde código compilado: demasiados argumentos.
+task pair(a, b)
+    give a + b
+task run(k)
+    when k > 1
+        give pair(1, 2, 3)
+    give pair(k, k)
+print(run(0))
+print(run(1))
+print(run(2))

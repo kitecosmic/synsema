@@ -1,0 +1,10 @@
+-- Un default que falla al evaluarse (en el entorno de la definición), desde código compilado.
+task f(x, y = x_missing)
+    give x
+task run(k)
+    when k > 1
+        give f(k)
+    give f(k, 0)
+print(run(0))
+print(run(1))
+print(run(2))

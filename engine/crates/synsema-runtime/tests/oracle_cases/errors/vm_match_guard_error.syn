@@ -1,0 +1,10 @@
+-- Un guard que falla dentro de un `match` compilado.
+task pick(v)
+    match v
+        is [a, b] when a / b > 1
+            give "big"
+        otherwise
+            give "other"
+print(pick([4, 1]))
+print(pick(3))
+print(pick([1, 0]))

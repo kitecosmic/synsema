@@ -1,0 +1,4 @@
+-- El tope de recursión con llamadas dentro de la VM: el mismo error y los mismos pasos.
+task down(n)
+    give down(n + 1)
+print(down(0))
