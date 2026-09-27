@@ -1,0 +1,7 @@
+-- F3.4: comparar un entero con texto en un sitio ya especializado para Int.
+task lt(a, b)
+    let r be a < b
+    give r
+print(lt(1, 2))
+print(lt(3, 2))
+print(lt(1, "x"))

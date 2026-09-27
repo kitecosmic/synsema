@@ -1,0 +1,110 @@
+-- F3.4 contra la referencia: operadores que se especializan solos (quickening). Cada sitio ve
+-- primero enteros y después otros tipos; cada task se llama varias veces (corre compilada).
+
+let big be 9223372036854775807
+
+-- Un sitio que ve Int, después Float, Big (desborde), Decimal y texto: la forma genérica nunca
+-- se pierde, y el desborde da Big, no la vuelta.
+task add(a, b)
+    let r be a + b
+    give r
+task sub(a, b)
+    let r be a - b
+    give r
+task mul(a, b)
+    let r be a * b
+    give r
+print([add(1, 2), add(3, 4), add(1.5, 2), add(big, 1), add(2, 3), add(1.5d, 2), add("a", "b"), add(5, 6)])
+print([sub(10, 3), sub(0 - big - 1, 1), sub(2.5, 1), sub(7, 7)])
+print([mul(6, 7), mul(big, 2), mul(3, 3), mul(0.5, 4), mul(big, big), mul(2, 5)])
+
+-- `%` floored como Python, `% -1` es 0 aun con i64::MIN.
+task md(a, b)
+    let r be a % b
+    give r
+print([md(7, 3), md(-7, 3), md(7, -3), md(-7, -3), md(7, -1), md(0 - big - 1, -1), md(7.5, 2), md(9, 4)])
+
+-- Comparaciones Int×Int y contra otros tipos (5 == 5.0, Big que entra en i64).
+task cmp(a, b)
+    let r be [a < b, a <= b, a > b, a >= b, a == b, a != b]
+    give r
+print(cmp(1, 2))
+print(cmp(2, 2))
+print(cmp(3, 2))
+print(cmp(5, 5.0))
+print(cmp(big + 1 - 1, big))
+print(cmp("a", "b"))
+print(cmp(2, 2))
+
+-- Un sitio que alterna tipos en cada vuelta: se desoptimiza hasta quedar genérico.
+task alternate(n)
+    let t be 0
+    let i be 0
+    while i < n
+        when i % 2 == 0
+            let x be i
+        otherwise
+            let x be i + 0.5
+        set t to t + x
+        set i to i + 1
+    give t
+print([alternate(10), alternate(10), alternate(3)])
+
+-- Un acumulador que desborda a mitad de bucle y sigue en Big.
+task overflow(n)
+    let t be big - 3
+    let i be 0
+    while i < n
+        set t to t + 1
+        set i to i + 1
+    give t
+print([overflow(2), overflow(6), overflow(10)])
+
+-- Cadenas de comparación y `and`/`or` sobre sitios especializados.
+task chain(a, b, c)
+    when a < b < c and c != a
+        give "asc"
+    give "no"
+print([chain(1, 2, 3), chain(3, 2, 1), chain(1, 2.5, 3), chain(1, 2, 3)])
+
+-- Operandos de todas las formas: constante, local, parámetro, registro, global.
+let g be 10
+task shapes(p)
+    let l be p * 2
+    let r be (p + 1) * (l - 1)
+    give [p + 1, 1 + p, l + p, g + p, r % 7, p < g, g <= l]
+print([shapes(1), shapes(2), shapes(3)])
+
+-- fib: el caso clásico.
+task fib(n)
+    when n < 2
+        give n
+    give fib(n - 1) + fib(n - 2)
+print(fib(15))
+
+-- F3.4c: floats. `+ - *` con un float (y mezclados con enteros), `/` siempre float, y
+-- comparaciones exactas entre enteros y floats (2**53 + 1 no es 2**53 como float).
+task fops(a, b)
+    give [a + b, a - b, a * b, a / b, a < b, a <= b, a > b, a >= b, a == b, a != b]
+print(fops(1.5, 2.5))
+print(fops(3, 0.5))
+print(fops(0.1, 0.2))
+print(fops(9007199254740993, 9007199254740992.0))
+print(fops(9007199254740992.0, 9007199254740993))
+print(fops(2, 4))
+print(fops(-0.0, 1))
+print(fops(big, 1.0))
+print(fops(1.5d, 2))
+print(fops(2.5, 1.5))
+
+-- Un acumulador float con condición float, y `/` entre enteros.
+task integrate(n)
+    let h be 1.0 / n
+    let s be 0.0
+    let i be 0
+    while i < n
+        let x be (i + 0.5) * h
+        set s to s + 4.0 / (1.0 + x * x)
+        set i to i + 1
+    give s * h
+print([integrate(100), integrate(1000), integrate(7)])

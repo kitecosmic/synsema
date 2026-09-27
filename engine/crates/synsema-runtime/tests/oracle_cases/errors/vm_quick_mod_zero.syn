@@ -1,0 +1,7 @@
+-- F3.4: `%` por cero en un sitio ya especializado para Int: el error de la referencia, con su ubicación.
+task md(a, b)
+    let r be a % b
+    give r
+print(md(7, 3))
+print(md(9, 4))
+print(md(1, 0))

@@ -1,0 +1,9 @@
+-- F3.4: `range` con un argumento que no es un entero, en una vuelta sin frame.
+task f(n)
+    let t be 0
+    each i in range(0, n)
+        set t to t + i
+    give t
+print(f(3))
+print(f(4))
+print(f("x"))

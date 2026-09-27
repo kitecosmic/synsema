@@ -388,7 +388,9 @@ impl BuiltinTask {
 mod vm;
 pub use vm::TaskCode;
 #[doc(hidden)]
-pub use vm::explain_source;
+pub use vm::{explain_after_run, explain_source};
+#[cfg(feature = "vm-profile")]
+pub use vm::profile as vm_profile;
 
 // =========================================================
 // entorno
@@ -1331,6 +1333,9 @@ pub struct Interpreter {
     /// corre ahora.
     vm_locals: Vec<Option<SynValue>>,
     vm_lbase: usize,
+    /// El chunk del último programa que corrió la VM (para `explain_after_run`: su código queda
+    /// como lo dejó el quickening).
+    vm_last_program: Option<Rc<vm::Chunk>>,
     /// v0.6.20 — raíz del proyecto: el directorio del archivo de ENTRADA, límite de contención
     /// de `use "../x.syn"`. La fija el host (`set_project_root`) o, si no, se captura del primer
     /// `use` que se ejecuta (siempre el top-level de la entrada). `None` = criterio v0.6.19
@@ -1582,6 +1587,7 @@ impl Interpreter {
             vm_iters: Vec::new(),
             vm_locals: Vec::new(),
             vm_lbase: 0,
+            vm_last_program: None,
             project_root: None,
             stdout_hook: None,
             stdout_verdict: None,

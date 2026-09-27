@@ -15,7 +15,8 @@
 //!   termina en cada instrucción que puede observar el contador (llamar al tree-walker) o saltar,
 //!   así que en esos puntos el número es exacto.
 //! - Constantes en un pool, ubicaciones en una tabla, un slot de *feedback* por operación
-//!   (reservado: lo usa el quickening de F3.4) y los encabezados de bucle (reservados: calor/OSR).
+//!   (lo usa el quickening de F3.4, ver `Ins::Binary`) y los encabezados de bucle (reservados:
+//!   calor/OSR).
 //!
 //! **Qué se compila** (F3.1): literales, variables, operadores, `and`/`or`, cadenas de comparación,
 //! `let`, `set` a una variable, `when`, `while`, `give`, `stop` y la definición de tasks y lambdas
@@ -24,6 +25,7 @@
 
 use super::*;
 use crate::resolve::{self, Resolution, ScopeId, Target};
+use num_integer::Integer;
 use std::cell::Cell;
 
 pub(crate) type Reg = u16;
@@ -47,6 +49,10 @@ pub(crate) enum Opnd {
 pub(crate) enum Ins {
     /// Entrada a un bloque básico: los pasos de todos sus nodos.
     Steps(u32),
+    /// F3.5 (superinstrucción): `Steps` + `CheckCancel`, el comienzo de cada sentencia de un
+    /// bloque (el par más frecuente del perfil: 10 % de lo que corre). Si el chequeo corta, sobran
+    /// los pasos que habría sobrado el `CheckCancel` (su `rest`).
+    StepsCancel(u32),
     /// Sólo existe mientras se compila (lleva pasos); no queda en el código final.
     Nop,
     CheckCancel,
@@ -60,8 +66,37 @@ pub(crate) enum Ins {
     /// Por nombre, desde el primer frame que no es del resolver (ver `free_start`), con una caché
     /// del slot donde estaba (el índice de un slot no cambia nunca, F2a).
     LoadName { dst: Reg, name: u32, ic: u32 },
-    /// `fb`: su slot de feedback (reservado para el quickening de F3.4).
-    Binary { dst: Reg, op: BinOp, a: Opnd, b: Opnd, #[allow(dead_code)] fb: u16 },
+    /// F3.5: `LoadName` cuya búsqueda empieza en el entorno actual (el nivel superior, o una task
+    /// definida ahí que lee una global): el lugar cacheado, sin armar el recorrido (como
+    /// `LOAD_GLOBAL` especializado de CPython). Si la caché falla, el camino de `LoadName`.
+    LoadGlobal { dst: Reg, name: u32, ic: u32 },
+    /// Un operador binario tal como lo emite el compilador: adaptativo (F3.4, *quickening*). La
+    /// primera vez mira los tipos de los operandos y se reescribe en su forma especializada (si
+    /// la hay: `AddInt`, …) o en `BinaryAny`; esa vez calcula por el camino genérico. `fb`: su
+    /// slot de feedback (cuántas veces se desoptimizó).
+    Binary { dst: Reg, op: BinOp, a: Opnd, b: Opnd, fb: u16 },
+    /// La forma genérica, que nunca se pierde: `exec_binary`, como la referencia.
+    BinaryAny { dst: Reg, op: BinOp, a: Opnd, b: Opnd },
+    /// Formas especializadas para `Int` × `Int` (F3.4). Guarda: los dos operandos son
+    /// `Number::Int` (un `Big` no pasa aunque su valor entre en i64); si no, `vm_binary_miss`
+    /// (camino genérico + desoptimización). Si la cuenta desborda, el camino genérico da el `Big`.
+    /// Nunca dan un error propio: los errores los arma `exec_binary` (`%` por cero cae ahí).
+    /// `+ - * %` (el operador en `op`).
+    IntArith { dst: Reg, op: BinOp, a: Opnd, b: Opnd, fb: u16 },
+    /// `< <= > >= == !=`.
+    IntCmp { dst: Reg, op: BinOp, a: Opnd, b: Opnd, fb: u16 },
+    /// F3.5 (superinstrucción por quickening): un `IntCmp` cuyo resultado sólo lo usa el
+    /// `JumpIfFalsy` que le sigue (la condición de un `while` o un `when`) compara y salta sin
+    /// armar el Bool. El `JumpIfFalsy` queda en su lugar (su `rest`, su ubicación): si la guarda
+    /// falla, esta instrucción vuelve a `Binary` y el salto corre como siempre.
+    IntCmpJump { dst: Reg, op: BinOp, a: Opnd, b: Opnd, fb: u16 },
+    /// `+ - *` con al menos un `Float` (el otro `Int` o `Float`) y `/` con dos números `Int` o
+    /// `Float` (en Synsema `/` siempre da float): la cuenta en f64, como `Number`. Un divisor cero
+    /// cae al camino genérico (el error de la referencia).
+    FloatArith { dst: Reg, op: BinOp, a: Opnd, b: Opnd, fb: u16 },
+    /// Comparaciones entre `Int` y `Float` en cualquier mezcla: exactas, con el mismo
+    /// `partial_cmp_num`/`num_eq` de la referencia (`2**53 + 1` no es igual a `9007199254740992.0`).
+    NumCmp { dst: Reg, op: BinOp, a: Opnd, b: Opnd, fb: u16 },
     Unary { dst: Reg, op: UnOp, a: Opnd },
     ToBool { dst: Reg, src: Opnd },
     Jump { to: u32 },
@@ -76,8 +111,13 @@ pub(crate) enum Ins {
     SetLocal { src: Opnd, slot: u16, name: u32, dst: Reg },
     SetOuter { src: Opnd, depth: u16, slot: u16, name: u32, dst: Reg, at: u32 },
     SetName { src: Opnd, name: u32, dst: Reg, ic: u32 },
+    /// F3.5: `SetName` desde el entorno actual (ver `LoadGlobal`).
+    SetGlobal { src: Opnd, name: u32, dst: Reg, ic: u32 },
     /// `set P to append(P, …)` y compañía: la vía en el lugar de la referencia
     /// (`try_update_in_place`) si la variable es una lista o un mapa; si aplica, salta a `done`.
+    /// No termina su bloque (F3.5): el valor y la asignación que siguen son del mismo bloque, y
+    /// si llama a la referencia descuenta antes sus pasos (`rest`), así lo que la referencia mire
+    /// del contador es exacto y, si aplica, esos pasos no se cuentan.
     /// `ic` = `NONE` si la variable es del resolver (se mira por nombre desde el frame propio);
     /// `name` = `NONE` si el destino es un camino (siempre se prueba); `slot` = la variable local
     /// del destino en un cuerpo con frame en registros (`u16::MAX` si no).
@@ -88,8 +128,14 @@ pub(crate) enum Ins {
     MakeList { dst: Reg, first: Reg, n: u16 },
     /// `{k: v, …}` con clave y valor alternados en `2n` registros desde `first`.
     MakeMap { dst: Reg, first: Reg, n: u16 },
-    GetProp { dst: Reg, obj: Opnd, name: u32 },
-    GetIndex { dst: Reg, obj: Opnd, idx: Opnd },
+    /// `m.k`. F3.6 (L3, *inline cache*): `ic` recuerda en qué posición del mapa estaba la clave la
+    /// última vez; si la clave en esa posición es la misma, no se hashea (se compara la clave, no
+    /// una "forma": la semántica de valor no cambia). Lo demás (otros tipos, clave que falta,
+    /// módulos) por `property_read`, con sus errores.
+    GetProp { dst: Reg, obj: Opnd, name: u32, ic: u32 },
+    /// `x[i]`. F3.6: una lista con un entero, directo; un mapa con una clave de texto, sin armar la
+    /// clave (`to_string`) y con la misma caché que `GetProp`. Lo demás por `index_read`.
+    GetIndex { dst: Reg, obj: Opnd, idx: Opnd, ic: u32 },
     /// `set <camino> to v`: el destino lo recorre la referencia (`exec_set`), con el valor ya
     /// evaluado.
     SetPath { src: Opnd, node: u32, dst: Reg },
@@ -111,6 +157,23 @@ pub(crate) enum Ins {
     EachStep { head: u32 },
     /// Suelta el iterador de un `each` que terminó.
     EachEnd { it: u16 },
+    /// F3.4, `each` sin frame: una vuelta cuyo scope nadie puede ver (el resolver lo prueba: sin
+    /// captura, sin escape, sin nodos fríos en el cuerpo) guarda sus variables en la ventana de
+    /// locales de la VM, como Lua (`FORLOOP`) o V8 cuando nadie captura el contexto. La colección
+    /// ya evaluada (por la VM) en `src`.
+    EachInitV { src: Opnd, node: u32, it: u16 },
+    /// `each i in range(…)` como el atajo de la referencia (`each_over_range`): si `src` es el
+    /// builtin `range`, sigue; si no, salta a `to` (la llamada de siempre).
+    IsRange { src: Reg, to: u32 },
+    /// Los argumentos de `range` en `n` registros desde `first`: el iterador perezoso.
+    EachRange { first: Reg, n: u16, it: u16 },
+    /// La vuelta siguiente: la variable en el lugar `slot` de la ventana; sin más, a `exit`.
+    EachNextV { it: u16, slot: u16, exit: u32 },
+    /// Fin de la vuelta: las variables de la vuelta (`n` lugares desde `first`) se sueltan, como
+    /// cuando la referencia suelta el frame de la vuelta, y a `head`.
+    EachStepV { head: u32, first: u16, n: u16 },
+    /// Fin del bucle (también por `stop`): las variables y el iterador se sueltan.
+    EachEndV { it: u16, first: u16, n: u16 },
     /// Vuelve a `depth` frames de la VM dentro de este cuerpo (salir de un bucle o de un brazo por
     /// un `stop`, o terminar un brazo de `match`).
     Unwind { depth: u16 },
@@ -132,7 +195,10 @@ pub struct Layout {
 }
 
 pub(crate) struct Chunk {
-    code: Vec<Ins>,
+    /// El código. En `Cell`: el quickening (F3.4) reescribe una instrucción en el lugar cuando ve
+    /// qué tipos le llegan (`Ins` es `Copy`: el despacho la copia antes de ejecutarla, así que
+    /// reescribirla mientras corre una recursión es seguro).
+    code: Box<[Cell<Ins>]>,
     /// Por instrucción: los pasos que su bloque sumó de más si ésta falla.
     rest: Vec<u32>,
     /// Por instrucción: la salida del bucle compilado cuyo CUERPO la contiene (`NONE` si no hay).
@@ -157,6 +223,13 @@ pub(crate) struct Chunk {
     pub(crate) regframe: bool,
     /// En un cuerpo con frame en registros: el slot de cada parámetro (en orden).
     param_slots: Vec<u16>,
+    /// El tamaño de la ventana de locales de este cuerpo: el frame en registros (si lo es) y las
+    /// vueltas de `each` sin frame (F3.4).
+    nlocals: u16,
+    /// Para la vía en el lugar y `set` con caminos (que corre la referencia, por nombre): por nodo
+    /// frío, qué frames hay que armar con las variables de la ventana (`NONE` si ninguno).
+    node_spill: Vec<u32>,
+    spills: Vec<Box<[Spill]>>,
     /// Si el frame lleva su `Layout` como marca: sólo hace falta cuando otro chunk (el de una task
     /// o lambda definida adentro) lo va a recorrer y tiene que verificarlo. Los frames que la VM
     /// preparó para este chunk no se verifican: los armó ella.
@@ -166,14 +239,26 @@ pub(crate) struct Chunk {
     /// una, desde dónde se busca (`hops`).
     ics: Vec<Cell<u32>>,
     ic_hops: Vec<u32>,
+    /// Por caché: si la búsqueda empieza en el entorno actual (sin frames que saltear).
+    ic_here: Vec<bool>,
+    /// Las cachés de `GetProp`/`GetIndex` (F3.6): posición + 1 de la clave en el mapa (0 = vacía).
+    key_ics: Box<[Cell<u32>]>,
     /// Los recorridos hacia afuera de este cuerpo (ver `Hops`).
     hops: Vec<Hops>,
-    /// Reservado (F3.4): cuántos slots de feedback hay.
-    #[allow(dead_code)]
-    feedback: u16,
+    /// Por slot de feedback (F3.4): cuántas veces se desoptimizó su operación.
+    deopts: Box<[Cell<u8>]>,
     /// Reservado (calor/OSR): dónde empieza cada bucle.
     #[allow(dead_code)]
     loop_heads: Vec<u32>,
+}
+
+/// Un scope que vive en la ventana de locales: su layout (el del resolver) y dónde empieza.
+#[derive(Clone, Copy, Debug)]
+struct Spill {
+    scope: ScopeId,
+    off: u16,
+    /// El nombre del frame que la referencia le daría (`call`, `each`).
+    name: &'static str,
 }
 
 /// Desde dónde parte una lectura que sale del frame actual: el scope del resolver donde está la
@@ -248,9 +333,7 @@ impl TaskCode {
 pub(crate) fn compile_program(stmts: &[Node]) -> Rc<Chunk> {
     let res = resolve::resolve_block(stmts);
     let shared = Shared::new(&res);
-    let mut c = Compiler::new(&res, &shared, None);
-    c.block(stmts, Some(0), false);
-    c.finish(Opnd::Reg(0))
+    compile_unit(&res, &shared, 0, None, &[], Body::Program(stmts))
 }
 
 /// El cuerpo de una task o lambda que definió el tree-walker, resuelto por sí solo.
@@ -261,8 +344,14 @@ pub(crate) fn compile_function(params: &[Arc<str>], body: &[Node]) -> Rc<Chunk> 
     compile_body(&res, &shared, s, params, &refs, false)
 }
 
-/// El cuerpo de una task o lambda: con frame en registros si se puede (F3.3b), y si el código que
-/// sale igual necesita el frame por nombre, otra vez sin.
+enum Body<'a> {
+    Program(&'a [Node]),
+    Task(&'a [&'a Node]),
+    Lambda(&'a Node),
+}
+
+/// El cuerpo de una task o lambda. Lo compila una vez por scope (lo comparten los intentos de su
+/// padre, ver `compile_unit`).
 fn compile_body<'r>(
     res: &'r Resolution,
     shared: &Shared<'r>,
@@ -271,70 +360,124 @@ fn compile_body<'r>(
     body: &[&Node],
     lambda: bool,
 ) -> Rc<Chunk> {
-    if regframe_eligible(res, scope) {
-        let c = compile_body_as(res, shared, scope, params, body, lambda, true);
-        if !c.code.iter().any(needs_frame) {
-            return c;
-        }
+    if let Some(c) = shared.done.borrow().get(&scope) {
+        return c.clone();
     }
-    compile_body_as(res, shared, scope, params, body, lambda, false)
+    let unit = res.scopes[scope as usize].unit;
+    let c = if lambda {
+        compile_unit(res, shared, unit, Some(scope), params, Body::Lambda(body[0]))
+    } else {
+        compile_unit(res, shared, unit, Some(scope), params, Body::Task(body))
+    };
+    shared.done.borrow_mut().insert(scope, c.clone());
+    c
 }
 
-#[allow(clippy::too_many_arguments)]
-fn compile_body_as<'r>(
+/// Compila una unidad (el programa o un cuerpo) eligiendo qué vive en la ventana de locales:
+/// las vueltas de `each` que el resolver deja (`window_candidates`) y, en un cuerpo, su frame si
+/// todos sus otros scopes quedaron en la ventana (F3.3b). Si al compilar aparece algo que lee un
+/// frame por nombre (un nodo del tree-walker, una task definida adentro, un brazo de `match`, un
+/// `each` con frame), esos scopes vuelven a tener frame y se compila de nuevo: la elección sólo
+/// se achica, así que termina.
+fn compile_unit<'r>(
     res: &'r Resolution,
     shared: &Shared<'r>,
-    scope: ScopeId,
+    unit: UnitIdx,
+    frame_scope: Option<ScopeId>,
     params: &[Arc<str>],
-    body: &[&Node],
-    lambda: bool,
-    regframe: bool,
+    body: Body<'_>,
 ) -> Rc<Chunk> {
-    let mut c = Compiler::new(res, shared, Some(scope));
-    c.regframe = regframe;
-    if regframe {
-        let names = &res.scopes[scope as usize].names;
-        c.param_slots = params
-            .iter()
-            .map(|p| names.iter().position(|n| **n == **p).expect("parámetro fuera del layout") as u16)
-            .collect();
+    let mut win = window_candidates(res, unit, frame_scope);
+    let mut regframe = frame_scope.is_some_and(|s| regframe_eligible(res, s, &win));
+    loop {
+        let mut c = Compiler::new(res, shared, frame_scope);
+        c.window = win.clone();
+        c.regframe = regframe;
+        c.lay_window(params);
+        let chunk = match &body {
+            Body::Program(stmts) => {
+                c.block(stmts, Some(0), false);
+                c.finish_checked()
+            }
+            Body::Task(stmts) => {
+                c.block_of(stmts, Some(0), true);
+                c.finish_checked()
+            }
+            Body::Lambda(e) => {
+                // El cuerpo de una lambda es un bloque de una sentencia, el `give <expr>` que arma
+                // el intérprete: el chequeo de cancelación del bloque y un nodo más.
+                c.at(&e.location);
+                c.emit(Ins::CheckCancel);
+                c.enter();
+                let v = c.expr(e);
+                c.at(&e.location);
+                c.emit(Ins::Give { src: v });
+                c.finish_checked()
+            }
+        };
+        match chunk {
+            Ok(chunk) => return chunk,
+            Err((bad, frame_needed)) => {
+                win.retain(|s| !bad.contains(s));
+                regframe = regframe && !frame_needed && frame_scope.is_some_and(|s| regframe_eligible(res, s, &win));
+            }
+        }
     }
-    if lambda {
-        // El cuerpo de una lambda es un bloque de una sentencia, el `give <expr>` que arma el
-        // intérprete: el chequeo de cancelación del bloque y un nodo más.
-        let e = body[0];
-        c.at(&e.location);
-        c.emit(Ins::CheckCancel);
-        c.enter();
-        let v = c.expr(e);
-        c.at(&e.location);
-        c.emit(Ins::Give { src: v });
-        return c.finish(Opnd::Reg(0));
+}
+
+type UnitIdx = resolve::UnitId;
+
+/// Las vueltas de `each` de esta unidad que pueden vivir en la ventana: el resolver prueba que
+/// nadie ve su frame (ni una closure, ni un nodo frío, ni un hook) y ningún nombre suyo tapa uno
+/// de un scope de afuera en la misma unidad (así un hueco sigue buscando donde la referencia).
+fn window_candidates(res: &Resolution, unit: UnitIdx, frame_scope: Option<ScopeId>) -> Vec<ScopeId> {
+    let mut out = Vec::new();
+    for (i, sc) in res.scopes.iter().enumerate() {
+        if sc.unit != unit || sc.kind != resolve::ScopeKind::Each || sc.escapes || sc.opaque || sc.dynamic {
+            continue;
+        }
+        let mut ok = true;
+        let mut p = sc.parent;
+        while let Some(x) = p {
+            let up = &res.scopes[x as usize];
+            if up.unit != unit && Some(x) != frame_scope {
+                break;
+            }
+            if sc.names.iter().any(|n| up.names.iter().any(|m| m == n)) {
+                ok = false;
+                break;
+            }
+            if Some(x) == frame_scope {
+                break;
+            }
+            p = up.parent;
+        }
+        if ok {
+            out.push(i as ScopeId);
+        }
     }
-    c.block_of(body, Some(0), true);
-    c.finish(Opnd::Reg(0))
+    out
 }
 
 /// F3.3b: un frame que nadie puede ver desde afuera — ni una closure (no define tasks ni
-/// lambdas), ni un nodo del tree-walker (no tiene nodos fríos: el resolver lo marca `escapes`), ni
-/// un frame propio de una vuelta o un brazo (no tiene otros scopes) — puede vivir en registros.
-fn regframe_eligible(res: &Resolution, scope: ScopeId) -> bool {
+/// lambdas), ni un nodo del tree-walker (no tiene nodos fríos: el resolver lo marca `escapes`) —
+/// puede vivir en registros, si todos los otros scopes de su unidad son vueltas de `each` que
+/// también viven en la ventana (F3.4).
+fn regframe_eligible(res: &Resolution, scope: ScopeId, win: &[ScopeId]) -> bool {
     let sc = &res.scopes[scope as usize];
-    !sc.escapes && !sc.opaque && !sc.dynamic && res.scopes.iter().enumerate().all(|(i, s)| s.unit != sc.unit || i == scope as usize)
+    !sc.escapes
+        && !sc.opaque
+        && !sc.dynamic
+        && res.scopes.iter().enumerate().all(|(i, s)| s.unit != sc.unit || i == scope as usize || win.contains(&(i as ScopeId)))
 }
 
-/// Instrucciones que le pasan el frame al tree-walker (que busca por nombre): un cuerpo con alguna
-/// no puede tener el frame en registros. (`TryInPlace` sí: arma el frame sólo cuando actúa.)
-fn needs_frame(ins: &Ins) -> bool {
-    matches!(
-        ins,
-        Ins::Exec { .. }
-            | Ins::SetPath { .. }
-            | Ins::MatchArm { .. }
-            | Ins::EachInit { .. }
-            | Ins::EachNext { .. }
-            | Ins::Define { .. }
-    )
+/// Dónde vive una variable resuelta (ver `Compiler::place`).
+#[derive(Clone, Copy)]
+enum Place {
+    Win(u16),
+    Local(u16),
+    Outer(u16, u16),
+    Free,
 }
 
 /// Lo que comparten un chunk y los de sus tasks anidadas: los layouts de todos los scopes.
@@ -342,13 +485,16 @@ struct Shared<'r> {
     by_node: HashMap<usize, &'r resolve::Access>,
     layouts: Rc<Vec<Rc<Layout>>>,
     parents: Rc<Vec<Option<ScopeId>>>,
+    /// Los cuerpos ya compilados, por scope: no dependen de lo que elija su padre (una task
+    /// definida adentro de una vuelta le deja frame a esa vuelta).
+    done: RefCell<HashMap<ScopeId, Rc<Chunk>>>,
 }
 
 impl<'r> Shared<'r> {
     fn new(res: &'r Resolution) -> Self {
         let layouts = res.scopes.iter().map(|s| Rc::new(Layout { names: s.names.clone() })).collect();
         let parents = res.scopes.iter().map(|s| s.parent).collect();
-        Shared { by_node: res.by_node(), layouts: Rc::new(layouts), parents: Rc::new(parents) }
+        Shared { by_node: res.by_node(), layouts: Rc::new(layouts), parents: Rc::new(parents), done: RefCell::new(HashMap::new()) }
     }
 }
 
@@ -387,6 +533,16 @@ struct Compiler<'r, 's> {
     eaches: u16,
     regframe: bool,
     param_slots: Vec<u16>,
+    /// Los scopes de vueltas de `each` que viven en la ventana (F3.4) y dónde empieza cada uno.
+    window: Vec<ScopeId>,
+    win_off: HashMap<ScopeId, u16>,
+    nlocals: u16,
+    /// Lo que salió al compilar: vueltas que igual necesitan frame, y si el cuerpo lo necesita.
+    bad: Vec<ScopeId>,
+    frame_needed: bool,
+    node_spill: Vec<u32>,
+    spills: Vec<Box<[Spill]>>,
+    key_ics: u32,
 }
 
 impl<'r, 's> Compiler<'r, 's> {
@@ -422,7 +578,102 @@ impl<'r, 's> Compiler<'r, 's> {
             eaches: 0,
             regframe: false,
             param_slots: Vec::new(),
+            window: Vec::new(),
+            win_off: HashMap::new(),
+            nlocals: 0,
+            bad: Vec::new(),
+            frame_needed: false,
+            node_spill: Vec::new(),
+            spills: Vec::new(),
+            key_ics: 0,
         }
+    }
+
+    /// Una caché de clave nueva (F3.6).
+    fn key_ic(&mut self) -> u32 {
+        self.key_ics += 1;
+        self.key_ics - 1
+    }
+
+    /// Los lugares de la ventana: el frame en registros primero (parámetros en su slot) y cada
+    /// vuelta de `each` sin frame a continuación.
+    fn lay_window(&mut self, params: &[Arc<str>]) {
+        let mut n = 0usize;
+        if self.regframe {
+            let s = self.frame_scope.expect("frame en registros sin scope");
+            let names = &self.res.scopes[s as usize].names;
+            self.param_slots = params
+                .iter()
+                .map(|p| names.iter().position(|n| **n == **p).expect("parámetro fuera del layout") as u16)
+                .collect();
+            self.win_off.insert(s, 0);
+            n = names.len();
+        }
+        for &s in &self.window {
+            self.win_off.insert(s, n as u16);
+            n += self.res.scopes[s as usize].names.len();
+        }
+        self.nlocals = u16::try_from(n).expect("ventana de locales de más de 65535 lugares");
+    }
+
+    /// Dónde empieza en la ventana un scope que vive en ella.
+    fn win(&self, scope: ScopeId) -> Option<u16> {
+        self.win_off.get(&scope).copied()
+    }
+
+    /// Cuántos frames de `Environment` preparó este cuerpo en la cadena actual.
+    fn inner(&self) -> u16 {
+        self.depth + u16::from(self.frame_scope.is_some() && !self.regframe)
+    }
+
+    /// Cuántos frames de verdad hay entre el scope actual y el que está `depth` scopes afuera
+    /// según el resolver: los que viven en la ventana no están en la cadena de entornos.
+    fn real_depth(&self, depth: u16) -> u16 {
+        let mut s = self.cur_scope;
+        let mut n = 0;
+        for _ in 0..depth {
+            let x = s.expect("profundidad fuera de la cadena");
+            if self.win(x).is_none() {
+                n += 1;
+            }
+            s = self.shared.parents[x as usize];
+        }
+        n
+    }
+
+    /// Algo va a leer el frame actual por nombre (el tree-walker, una closure, un frame hijo): los
+    /// scopes de la ventana de la cadena tienen que tener frame, y el cuerpo también.
+    fn needs_names(&mut self) {
+        let mut s = self.cur_scope;
+        while let Some(x) = s {
+            if self.window.contains(&x) {
+                self.bad.push(x);
+            }
+            if self.regframe && Some(x) == self.frame_scope {
+                self.frame_needed = true;
+            }
+            s = self.shared.parents[x as usize];
+        }
+    }
+
+    /// Los frames que hay que armar para que la referencia vea las variables de la ventana (de
+    /// afuera hacia adentro); `NONE` si no hay.
+    fn spill_here(&mut self) -> u32 {
+        let mut chain = Vec::new();
+        let mut s = self.cur_scope;
+        while let Some(x) = s {
+            match self.win(x) {
+                Some(off) => chain.push(Spill { scope: x, off, name: self.res.scopes[x as usize].kind.frame_name() }),
+                None => break,
+            }
+            s = self.shared.parents[x as usize];
+        }
+        if chain.is_empty() {
+            return NONE;
+        }
+        chain.reverse();
+        self.spills.push(chain.into_boxed_slice());
+        (self.spills.len() - 1) as u32
     }
 
     // -- emisión --------------------------------------------------------------------------------
@@ -435,6 +686,9 @@ impl<'r, 's> Compiler<'r, 's> {
     }
 
     fn emit(&mut self, ins: Ins) {
+        if matches!(ins, Ins::Exec { .. } | Ins::Define { .. } | Ins::MatchArm { .. } | Ins::EachInit { .. }) {
+            self.needs_names();
+        }
         self.code.push(ins);
         self.weight.push(std::mem::take(&mut self.pending));
         self.loc.push(self.cur_loc);
@@ -498,11 +752,23 @@ impl<'r, 's> Compiler<'r, 's> {
         self.ics - 1
     }
 
-    /// El recorrido hacia afuera desde el scope actual (ver `Hops`).
+    /// Si la búsqueda de la caché `ic` empieza en el entorno actual.
+    fn ic_here(&self, ic: u32) -> bool {
+        self.hops[self.ic_hops[ic as usize] as usize].from.is_none()
+    }
+
+    /// El recorrido hacia afuera desde el scope actual (ver `Hops`). Los scopes de la ventana no
+    /// tienen frame: se parte del primero que sí.
     fn hops_here(&mut self) -> u32 {
-        let inner = self.depth + u16::from(self.frame_scope.is_some());
+        let mut from = self.cur_scope;
+        while let Some(x) = from {
+            if self.win(x).is_none() {
+                break;
+            }
+            from = self.shared.parents[x as usize];
+        }
         let mut skip = 0u16;
-        let mut s = self.cur_scope;
+        let mut s = from;
         while let Some(x) = s {
             if self.res.scopes[x as usize].dynamic {
                 skip = 0;
@@ -511,20 +777,21 @@ impl<'r, 's> Compiler<'r, 's> {
             skip += 1;
             s = self.shared.parents[x as usize];
         }
-        let h = if self.regframe {
-            // El entorno del cuerpo es el `closure_env`: se parte del scope de afuera, sin frames
-            // propios, y el del cuerpo no cuenta.
-            Hops { from: self.cur_scope.and_then(|x| self.shared.parents[x as usize]), inner: 0, skip: skip.saturating_sub(1) }
-        } else {
-            Hops { from: self.cur_scope, inner, skip }
-        };
-        self.hops.push(h);
+        self.hops.push(Hops { from, inner: self.inner(), skip });
         (self.hops.len() - 1) as u32
     }
 
     fn cold(&mut self, n: &Node) -> u32 {
         self.nodes.push(n.clone());
+        self.node_spill.push(NONE);
         (self.nodes.len() - 1) as u32
+    }
+
+    /// Un nodo frío que la referencia corre con las variables de la ventana puestas en frames.
+    fn cold_spilled(&mut self, n: &Node) -> u32 {
+        let k = self.cold(n);
+        self.node_spill[k as usize] = self.spill_here();
+        k
     }
 
     fn target(&self, n: &Node) -> Target {
@@ -580,9 +847,9 @@ impl<'r, 's> Compiler<'r, 's> {
                 let v = self.expr(value);
                 self.at(&n.location);
                 match self.target_of_bind(n) {
-                    Some(slot) if self.regframe => self.emit(Ins::LetRLocal { src: v, slot, dst }),
-                    Some(slot) => self.emit(Ins::LetLocal { src: v, slot, dst }),
-                    None => {
+                    Some(Place::Win(slot)) => self.emit(Ins::LetRLocal { src: v, slot, dst }),
+                    Some(Place::Local(slot)) => self.emit(Ins::LetLocal { src: v, slot, dst }),
+                    _ => {
                         let name = self.shared_name(name);
                         self.emit(Ins::LetName { src: v, name, dst })
                     }
@@ -592,12 +859,12 @@ impl<'r, 's> Compiler<'r, 's> {
                 let K::Identifier { name } = &target.kind else { unreachable!() };
                 self.enter();
                 let done = if in_place_shape(target, value) {
-                    let node = self.cold(n);
+                    let node = self.cold_spilled(n);
                     let nm = self.name(name);
                     let done = self.label();
-                    let (ic, slot) = match self.target(target) {
-                        Target::Free => (self.ic(), u16::MAX),
-                        Target::Slot { depth: 0, scope, slot, .. } if self.regframe && self.in_frame(scope, 0) => (NONE, slot),
+                    let (ic, slot) = match self.place(self.target(target)) {
+                        Place::Free => (self.ic(), u16::MAX),
+                        Place::Win(k) => (NONE, k),
                         _ => (NONE, u16::MAX),
                     };
                     self.emit(Ins::TryInPlace { dst, node, name: nm, done, ic, slot });
@@ -608,22 +875,20 @@ impl<'r, 's> Compiler<'r, 's> {
                 let v = self.expr(value);
                 self.at(&n.location);
                 let nm = self.name(name);
-                match self.target(target) {
-                    Target::Slot { depth: 0, scope, slot, .. } if self.in_frame(scope, 0) => {
-                        if self.regframe {
-                            self.emit(Ins::SetRLocal { src: v, slot, name: nm, dst })
-                        } else {
-                            self.emit(Ins::SetLocal { src: v, slot, name: nm, dst })
-                        }
-                    }
-                    Target::Slot { depth, scope, slot, .. } if self.in_frame(scope, depth) => {
+                match self.place(self.target(target)) {
+                    Place::Win(slot) => self.emit(Ins::SetRLocal { src: v, slot, name: nm, dst }),
+                    Place::Local(slot) => self.emit(Ins::SetLocal { src: v, slot, name: nm, dst }),
+                    Place::Outer(depth, slot) => {
                         let at = self.hops_here();
-                        let depth = if self.regframe { depth - 1 } else { depth };
                         self.emit(Ins::SetOuter { src: v, depth, slot, name: nm, dst, at })
                     }
-                    _ => {
+                    Place::Free => {
                         let ic = self.ic();
-                        self.emit(Ins::SetName { src: v, name: nm, dst, ic })
+                        if self.ic_here(ic) {
+                            self.emit(Ins::SetGlobal { src: v, name: nm, dst, ic })
+                        } else {
+                            self.emit(Ins::SetName { src: v, name: nm, dst, ic })
+                        }
                     }
                 }
                 if let Some(d) = done {
@@ -636,7 +901,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 // la referencia.
                 self.enter();
                 let done = if in_place_shape(target, value) {
-                    let node = self.cold(n);
+                    let node = self.cold_spilled(n);
                     let done = self.label();
                     self.emit(Ins::TryInPlace { dst, node, name: NONE, done, ic: NONE, slot: u16::MAX });
                     Some(done)
@@ -644,7 +909,7 @@ impl<'r, 's> Compiler<'r, 's> {
                     None
                 };
                 let v = self.expr(value);
-                let node = self.cold(target);
+                let node = self.cold_spilled(target);
                 self.at(&n.location);
                 self.emit(Ins::SetPath { src: v, node, dst });
                 if let Some(d) = done {
@@ -688,6 +953,9 @@ impl<'r, 's> Compiler<'r, 's> {
                 self.emit(Ins::Jump { to: head });
                 self.bind(exit);
                 self.emit(Ins::Unwind { depth: self.depth });
+            }
+            K::EachStatement { .. } if self.res.scope_opened_by(n).is_some_and(|sc| self.win(sc).is_some()) => {
+                self.each_windowed(n, want);
             }
             K::EachStatement { variable, body, .. } => {
                 self.enter();
@@ -819,11 +1087,115 @@ impl<'r, 's> Compiler<'r, 's> {
         }
     }
 
-    fn target_of_bind(&self, n: &Node) -> Option<u16> {
+    /// Un `each` sin frame (F3.4): la colección la evalúa la VM (con el atajo de `range` de la
+    /// referencia), la variable y los `let` de la vuelta viven en la ventana.
+    fn each_windowed(&mut self, n: &Node, want: Option<Reg>) {
+        let NodeKind::EachStatement { collection, body, .. } = &n.kind else { unreachable!() };
+        let scope = self.res.scope_opened_by(n).expect("each sin scope");
+        let first = self.win(scope).expect("each fuera de la ventana");
+        let count = self.res.scopes[scope as usize].names.len() as u16;
+        self.enter();
+        let node = self.cold(n);
+        let it = self.eaches;
+        self.eaches += 1;
+        self.collection(collection, node, it);
+        if let Some(d) = want {
+            let k = self.konst(SynValue::Nothing);
+            self.emit(Ins::Const { dst: d, k });
+        }
+        let head = self.label();
+        let exit = self.label();
+        self.bind(head);
+        self.loop_heads.push(head);
+        self.at(&n.location);
+        // La variable del `each` es el primer nombre de su scope.
+        self.emit(Ins::EachNextV { it, slot: first, exit });
+        if let Some(d) = want {
+            let k = self.konst(SynValue::Nothing);
+            self.emit(Ins::Const { dst: d, k });
+        }
+        let outer_scope = self.cur_scope;
+        self.cur_scope = Some(scope);
+        self.loops.push(exit);
+        self.block(body, want, true);
+        self.loops.pop();
+        self.emit(Ins::EachStepV { head, first, n: count });
+        self.cur_scope = outer_scope;
+        self.bind(exit);
+        self.emit(Ins::EachEndV { it, first, n: count });
+        self.eaches -= 1;
+    }
+
+    /// La colección de un `each` sin frame. `range(a, b, paso)` escrito así (1 a 3 posicionales):
+    /// si `range` es el builtin, el iterador perezoso (`each_over_range`: cuenta el nodo de la
+    /// llamada, el nombre y los argumentos, y un nivel de recursión); si no, la llamada de siempre.
+    fn collection(&mut self, c: &Node, node: u32, it: u16) {
+        if let NodeKind::TaskCall { name, arguments } = &c.kind {
+            if name.as_identifier() == Some("range")
+                && !arguments.is_empty()
+                && arguments.len() <= 3
+                && arguments.iter().all(|a| a.name.is_none())
+                && !PROTECTED_BUILTIN_NAMES.contains(&"range")
+            {
+                self.enter();
+                let f = self.expr(name);
+                let func = self.to_reg(f);
+                let general = self.label();
+                let done = self.label();
+                self.emit(Ins::IsRange { src: func, to: general });
+                let first = self.block_regs(arguments.len());
+                let end = first + arguments.len() as Reg;
+                for (i, a) in arguments.iter().enumerate() {
+                    self.into_reg(&a.value, first + i as Reg, end);
+                }
+                self.at(&c.location);
+                self.emit(Ins::Drop { r: func });
+                self.emit(Ins::EachRange { first, n: arguments.len() as u16, it });
+                self.emit(Ins::Jump { to: done });
+                self.bind(general);
+                let first = self.block_regs(arguments.len());
+                let end = first + arguments.len() as Reg;
+                for (i, a) in arguments.iter().enumerate() {
+                    self.into_reg(&a.value, first + i as Reg, end);
+                }
+                self.sites.push(CallSite { names: None, checked: true });
+                let site = (self.sites.len() - 1) as u32;
+                self.at(&c.location);
+                let dst = self.reg();
+                self.emit(Ins::Call { dst, func, args: first, n: arguments.len() as u16, site });
+                self.emit(Ins::EachInitV { src: Opnd::Reg(dst), node, it });
+                self.bind(done);
+                return;
+            }
+        }
+        let v = self.expr(c);
+        self.emit(Ins::EachInitV { src: v, node, it });
+    }
+
+    fn target_of_bind(&self, n: &Node) -> Option<Place> {
         let a = self.shared.by_node.get(&(n as *const Node as usize))?;
         match a.target {
-            Target::Slot { depth: 0, scope, slot, .. } if self.in_frame(scope, 0) => Some(slot),
+            Target::Slot { depth: 0, scope, .. } if self.in_frame(scope, 0) => Some(self.place(a.target)),
             _ => None,
+        }
+    }
+
+    /// Dónde vive una variable resuelta: en la ventana, en el frame propio, en uno de afuera
+    /// (contando sólo frames de verdad) o por nombre.
+    fn place(&self, t: Target) -> Place {
+        match t {
+            Target::Slot { depth, scope, slot, .. } if self.in_frame(scope, depth) => {
+                if let Some(off) = self.win(scope) {
+                    return Place::Win(off + slot);
+                }
+                let rd = self.real_depth(depth);
+                if rd == 0 && self.inner() > 0 {
+                    Place::Local(slot)
+                } else {
+                    Place::Outer(rd, slot)
+                }
+            }
+            _ => Place::Free,
         }
     }
 
@@ -953,7 +1325,8 @@ impl<'r, 's> Compiler<'r, 's> {
                 self.at(&n.location);
                 let name = self.name(property_name);
                 let dst = self.dst(want);
-                self.emit(Ins::GetProp { dst, obj: o, name });
+                let ic = self.key_ic();
+                self.emit(Ins::GetProp { dst, obj: o, name, ic });
                 Opnd::Reg(dst)
             }
             K::IndexAccess { object, index } => {
@@ -963,7 +1336,8 @@ impl<'r, 's> Compiler<'r, 's> {
                 let i = self.expr(index);
                 self.at(&n.location);
                 let dst = self.dst(want);
-                self.emit(Ins::GetIndex { dst, obj: o, idx: i });
+                let ic = self.key_ic();
+                self.emit(Ins::GetIndex { dst, obj: o, idx: i, ic });
                 Opnd::Reg(dst)
             }
             K::PipeExpression { value, transforms } => {
@@ -994,34 +1368,35 @@ impl<'r, 's> Compiler<'r, 's> {
             K::Identifier { name } => {
                 self.enter();
                 let nm = self.name(name);
-                match self.target(n) {
-                    Target::Slot { depth: 0, scope, slot, definite: true } if self.in_frame(scope, 0) => {
-                        if self.regframe {
-                            Opnd::RLocal(slot)
-                        } else {
-                            Opnd::Local(slot)
-                        }
-                    }
-                    Target::Slot { depth: 0, scope, slot, .. } if self.in_frame(scope, 0) => {
+                let t = self.target(n);
+                let definite = matches!(t, Target::Slot { definite: true, .. });
+                match self.place(t) {
+                    Place::Win(slot) if definite => Opnd::RLocal(slot),
+                    Place::Local(slot) if definite => Opnd::Local(slot),
+                    Place::Win(slot) => {
                         let dst = self.dst(want);
-                        if self.regframe {
-                            self.emit(Ins::LoadRLocal { dst, slot, name: nm });
-                        } else {
-                            self.emit(Ins::LoadLocal { dst, slot, name: nm });
-                        }
+                        self.emit(Ins::LoadRLocal { dst, slot, name: nm });
                         Opnd::Reg(dst)
                     }
-                    Target::Slot { depth, scope, slot, .. } if self.in_frame(scope, depth) => {
+                    Place::Local(slot) => {
+                        let dst = self.dst(want);
+                        self.emit(Ins::LoadLocal { dst, slot, name: nm });
+                        Opnd::Reg(dst)
+                    }
+                    Place::Outer(depth, slot) => {
                         let dst = self.dst(want);
                         let at = self.hops_here();
-                        let depth = if self.regframe { depth - 1 } else { depth };
                         self.emit(Ins::LoadOuter { dst, depth, slot, name: nm, at });
                         Opnd::Reg(dst)
                     }
-                    _ => {
+                    Place::Free => {
                         let dst = self.dst(want);
                         let ic = self.ic();
-                        self.emit(Ins::LoadName { dst, name: nm, ic });
+                        if self.ic_here(ic) {
+                            self.emit(Ins::LoadGlobal { dst, name: nm, ic });
+                        } else {
+                            self.emit(Ins::LoadName { dst, name: nm, ic });
+                        }
                         Opnd::Reg(dst)
                     }
                 }
@@ -1220,6 +1595,14 @@ impl<'r, 's> Compiler<'r, 's> {
 
     // -- ensamblado -----------------------------------------------------------------------------
 
+    /// Termina el chunk, o dice qué vueltas (y si el cuerpo) necesitan frame después de todo.
+    fn finish_checked(self) -> Result<Rc<Chunk>, (Vec<ScopeId>, bool)> {
+        if !self.bad.is_empty() || self.frame_needed {
+            return Err((self.bad, self.frame_needed));
+        }
+        Ok(self.finish(Opnd::Reg(0)))
+    }
+
     fn finish(mut self, result: Opnd) -> Rc<Chunk> {
         self.flush();
         self.emit(Ins::End { src: result });
@@ -1235,9 +1618,10 @@ impl<'r, 's> Compiler<'r, 's> {
                     leader[target(&self.labels, to)] = true;
                     leader[i + 1] = true;
                 }
+                // F3.5: no corta el bloque (lo común es que no aplique y siga en línea); cuando llama
+                // a la referencia descuenta antes lo que el bloque sumó de más (ver el despacho).
                 Ins::TryInPlace { done, .. } => {
                     leader[target(&self.labels, done)] = true;
-                    leader[i + 1] = true;
                 }
                 Ins::SetPath { .. } => leader[i + 1] = true,
                 Ins::EachNext { exit, .. } => {
@@ -1248,8 +1632,16 @@ impl<'r, 's> Compiler<'r, 's> {
                     leader[target(&self.labels, fail)] = true;
                     leader[i + 1] = true;
                 }
-                Ins::EachStep { head } => {
+                Ins::EachStep { head } | Ins::EachStepV { head, .. } => {
                     leader[target(&self.labels, head)] = true;
+                    leader[i + 1] = true;
+                }
+                Ins::EachNextV { exit, .. } => {
+                    leader[target(&self.labels, exit)] = true;
+                    leader[i + 1] = true;
+                }
+                Ins::IsRange { to, .. } => {
+                    leader[target(&self.labels, to)] = true;
                     leader[i + 1] = true;
                 }
                 Ins::EachInit { .. } => leader[i + 1] = true,
@@ -1279,7 +1671,16 @@ impl<'r, 's> Compiler<'r, 's> {
             }
             let total: u32 = self.weight[i..j].iter().sum();
             let start = code.len() as u32;
-            if total > 0 {
+            // Un bloque que empieza con el chequeo de cancelación (cada sentencia de un bloque):
+            // los pasos y el chequeo en una instrucción, con el `rest` y la ubicación del chequeo.
+            let first = (i..j).find(|&k| !matches!(self.code[k], Ins::Nop));
+            let fused = first.filter(|&k| total > 0 && matches!(self.code[k], Ins::CheckCancel));
+            if let Some(k) = fused {
+                code.push(Ins::StepsCancel(total));
+                new_rest.push(rest[k]);
+                new_loc.push(self.loc[k]);
+                new_stop.push(self.stop_of[k]);
+            } else if total > 0 {
                 code.push(Ins::Steps(total));
                 new_rest.push(0);
                 new_loc.push(self.loc[i]);
@@ -1288,7 +1689,7 @@ impl<'r, 's> Compiler<'r, 's> {
             for k in i..j {
                 // Un salto al comienzo del bloque cae en su `Steps`.
                 new_index[k] = if k == i { start } else { code.len() as u32 };
-                if matches!(self.code[k], Ins::Nop) {
+                if matches!(self.code[k], Ins::Nop) || fused == Some(k) {
                     continue;
                 }
                 code.push(self.code[k]);
@@ -1306,7 +1707,9 @@ impl<'r, 's> Compiler<'r, 's> {
                 Ins::TryInPlace { done, .. } => *done = map(*done, &self.labels),
                 Ins::EachNext { exit, .. } => *exit = map(*exit, &self.labels),
                 Ins::MatchArm { fail, .. } => *fail = map(*fail, &self.labels),
-                Ins::EachStep { head } => *head = map(*head, &self.labels),
+                Ins::EachStep { head } | Ins::EachStepV { head, .. } => *head = map(*head, &self.labels),
+                Ins::EachNextV { exit, .. } => *exit = map(*exit, &self.labels),
+                Ins::IsRange { to, .. } => *to = map(*to, &self.labels),
                 _ => {}
             }
         }
@@ -1319,7 +1722,7 @@ impl<'r, 's> Compiler<'r, 's> {
         let frame = self.frame_scope.map(|s| self.shared.layouts[s as usize].clone());
         let tagged = !self.children.is_empty();
         Rc::new(Chunk {
-            code,
+            code: code.into_iter().map(Cell::new).collect(),
             rest: new_rest,
             stop_to: new_stop,
             loc: new_loc,
@@ -1335,11 +1738,16 @@ impl<'r, 's> Compiler<'r, 's> {
             frame,
             regframe: self.regframe,
             param_slots: self.param_slots,
+            nlocals: self.nlocals,
+            node_spill: self.node_spill,
+            spills: self.spills,
             nregs: self.max_reg,
             ics: (0..self.ics).map(|_| Cell::new(0)).collect(),
+            ic_here: self.ic_hops.iter().map(|&h| self.hops[h as usize].from.is_none()).collect(),
+            key_ics: (0..self.key_ics).map(|_| Cell::new(0)).collect(),
             ic_hops: self.ic_hops,
             hops: self.hops,
-            feedback: self.feedback,
+            deopts: (0..=self.feedback as usize).map(|_| Cell::new(0)).collect(),
             loop_heads,
         })
     }
@@ -1439,12 +1847,34 @@ impl Interpreter {
     /// El programa por la VM (sentencias después del preámbulo).
     pub(super) fn run_program_chunk(&mut self, stmts: &[Node], env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
         let chunk = compile_program(stmts);
+        self.vm_last_program = Some(chunk.clone());
+        #[cfg(feature = "vm-profile")]
+        {
+            let r = self.run_chunk(&chunk, env);
+            profile::flush();
+            r
+        }
+        #[cfg(not(feature = "vm-profile"))]
         self.run_chunk(&chunk, env)
     }
 
     /// Corre un chunk en `env` (el frame de la llamada, ya preparado, o la raíz del programa).
     /// Devuelve lo mismo que `exec_block` sobre ese cuerpo.
     pub(super) fn run_chunk(&mut self, chunk: &Rc<Chunk>, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        if chunk.nlocals == 0 {
+            return self.run_chunk_regs(chunk, env);
+        }
+        // Las vueltas de `each` sin frame (F3.4): su ventana de locales.
+        let lbase = self.vm_locals.len();
+        self.vm_locals.resize(lbase + chunk.nlocals as usize, None);
+        let saved = std::mem::replace(&mut self.vm_lbase, lbase);
+        let r = self.run_chunk_regs(chunk, env);
+        self.vm_lbase = saved;
+        self.vm_locals.truncate(lbase);
+        r
+    }
+
+    fn run_chunk_regs(&mut self, chunk: &Rc<Chunk>, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
         // Los slots `Local` sólo valen en el frame que la llamada preparó con el layout del chunk.
         debug_assert!(chunk.regframe || chunk.frame.as_ref().is_none_or(|l| {
             let e = env.borrow();
@@ -1467,7 +1897,7 @@ impl Interpreter {
     ) -> Result<SynValue, Control> {
         let n = chunk.frame.as_ref().map_or(0, |l| l.names.len());
         let lbase = self.vm_locals.len();
-        self.vm_locals.resize(lbase + n, None);
+        self.vm_locals.resize(lbase + chunk.nlocals as usize, None);
         {
             let mut e = call_env.borrow_mut();
             for k in 0..e.bindings.len_names().min(n) {
@@ -1475,7 +1905,7 @@ impl Interpreter {
             }
         }
         let saved = std::mem::replace(&mut self.vm_lbase, lbase);
-        let r = self.run_chunk(chunk, closure_env);
+        let r = self.run_chunk_regs(chunk, closure_env);
         self.vm_lbase = saved;
         self.vm_locals.truncate(lbase);
         r
@@ -1511,6 +1941,55 @@ impl Interpreter {
                 }
             }
         })
+    }
+
+    /// Los dos operandos, si los dos son `Number::Int`, leídos sin moverlos ni clonarlos (la guarda
+    /// del quickening). Un registro que se consume queda con su `Int`: no tiene referencias que
+    /// soltar y nadie lo vuelve a leer sin escribirlo antes. Un hueco no pasa la guarda: el camino
+    /// genérico lo busca por nombre, como siempre.
+    #[inline(always)]
+    fn int_pair(&self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, a: Opnd, b: Opnd) -> Option<(i64, i64)> {
+        Some((self.peek_int(chunk, env, base, a)?, self.peek_int(chunk, env, base, b)?))
+    }
+
+    /// Los dos operandos si los dos son `Int` o `Float` (la guarda de `FloatArith`/`NumCmp`).
+    #[inline(always)]
+    fn num_pair(&self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, a: Opnd, b: Opnd) -> Option<(Num, Num)> {
+        Some((self.peek_num(chunk, env, base, a)?, self.peek_num(chunk, env, base, b)?))
+    }
+
+    #[inline(always)]
+    fn peek_num(&self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, o: Opnd) -> Option<Num> {
+        let num = |v: &SynValue| match v {
+            SynValue::Number(Number::Int(x)) => Some(Num::I(*x)),
+            SynValue::Number(Number::Float(x)) => Some(Num::F(*x)),
+            _ => None,
+        };
+        match o {
+            Opnd::Reg(r) | Opnd::Copy(r) => num(&self.vm_regs[base + r as usize]),
+            Opnd::Const(k) => num(&chunk.consts[k as usize]),
+            Opnd::RLocal(k) => num(self.vm_locals[self.vm_lbase + k as usize].as_ref()?),
+            Opnd::Local(k) => num(env.borrow().bindings.slot(k as usize)?),
+        }
+    }
+
+    #[inline(always)]
+    fn peek_int(&self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, o: Opnd) -> Option<i64> {
+        let v = match o {
+            Opnd::Reg(r) | Opnd::Copy(r) => &self.vm_regs[base + r as usize],
+            Opnd::Const(k) => &chunk.consts[k as usize],
+            Opnd::RLocal(k) => self.vm_locals[self.vm_lbase + k as usize].as_ref()?,
+            Opnd::Local(k) => {
+                return match env.borrow().bindings.slot(k as usize) {
+                    Some(SynValue::Number(Number::Int(x))) => Some(*x),
+                    _ => None,
+                }
+            }
+        };
+        match v {
+            SynValue::Number(Number::Int(x)) => Some(*x),
+            _ => None,
+        }
     }
 
     fn load_by_name_from_parent(
@@ -1626,12 +2105,22 @@ impl Interpreter {
         let entry_iters = iter_base;
         loop {
             let at = pc;
-            let ins = chunk.code[at];
+            let ins = chunk.code[at].get();
             pc += 1;
+            #[cfg(feature = "vm-profile")]
+            profile::hit(&ins);
             let out: Result<(), Control> = match ins {
                 Ins::Steps(w) => {
                     self.steps = self.steps.wrapping_add(w as u64);
                     Ok(())
+                }
+                Ins::StepsCancel(w) => {
+                    self.steps = self.steps.wrapping_add(w as u64);
+                    if self.cancel.flag.load(std::sync::atomic::Ordering::Relaxed) {
+                        self.check_cancel()
+                    } else {
+                        Ok(())
+                    }
                 }
                 Ins::Nop => Ok(()),
                 Ins::CheckCancel => {
@@ -1665,16 +2154,34 @@ impl Interpreter {
                     self.put(base, dst, syn_map(m));
                     Ok(())
                 }
-                Ins::GetProp { dst, obj, name } => (|| {
+                Ins::GetProp { dst, obj, name, ic } => (|| {
                     let o = self.opnd(&chunk, &env, base, obj, at)?;
-                    let v = self.property_read(o, &chunk.names[name as usize], &chunk.locs[chunk.loc[at] as usize])?;
+                    let found = match &o {
+                        SynValue::Map(m) => map_get_cached(&m.borrow(), &chunk.names[name as usize], &chunk.key_ics[ic as usize]),
+                        _ => None,
+                    };
+                    let v = match found {
+                        Some(v) => v,
+                        None => self.property_read(o, &chunk.names[name as usize], &chunk.locs[chunk.loc[at] as usize])?,
+                    };
                     self.put(base, dst, v);
                     Ok(())
                 })(),
-                Ins::GetIndex { dst, obj, idx } => (|| {
+                Ins::GetIndex { dst, obj, idx, ic } => (|| {
                     let o = self.opnd(&chunk, &env, base, obj, at)?;
                     let i = self.opnd(&chunk, &env, base, idx, at)?;
-                    let v = self.index_read(o, i, &chunk.locs[chunk.loc[at] as usize])?;
+                    let found = match (&o, &i) {
+                        (SynValue::Map(m), SynValue::Text(k)) => map_get_cached(&m.borrow(), k, &chunk.key_ics[ic as usize]),
+                        (SynValue::List(l), SynValue::Number(Number::Int(k))) => {
+                            let items = l.borrow();
+                            resolve_index(*k, items.len()).map(|j| items[j].clone())
+                        }
+                        _ => None,
+                    };
+                    let v = match found {
+                        Some(v) => v,
+                        None => self.index_read(o, i, &chunk.locs[chunk.loc[at] as usize])?,
+                    };
                     self.put(base, dst, v);
                     Ok(())
                 })(),
@@ -1731,6 +2238,16 @@ impl Interpreter {
                         None => Err(undefined_variable(nm, loc)),
                     }
                 }
+                Ins::LoadGlobal { dst, name, ic } => {
+                    let v = env.borrow().bindings.get_cached(&chunk.names[name as usize], &chunk.ics[ic as usize]).cloned();
+                    match v {
+                        Some(v) => {
+                            self.put(base, dst, v);
+                            Ok(())
+                        }
+                        None => self.vm_load_name(&chunk, &env, base, dst, name, ic, at),
+                    }
+                }
                 Ins::LoadName { dst, name, ic } => match self.load_free(&chunk, &env, name, ic) {
                     Some(v) => {
                         self.put(base, dst, v);
@@ -1738,13 +2255,107 @@ impl Interpreter {
                     }
                     None => Err(undefined_variable(&chunk.names[name as usize], &chunk.locs[chunk.loc[at] as usize])),
                 },
-                Ins::Binary { dst, op, a, b, .. } => (|| {
+                Ins::Binary { dst, op, a, b, fb } => self.vm_binary_adapt(&chunk, &env, base, at, dst, op, a, b, fb),
+                Ins::BinaryAny { dst, op, a, b } => (|| {
                     let a = self.opnd(&chunk, &env, base, a, at)?;
                     let b = self.opnd(&chunk, &env, base, b, at)?;
                     let v = self.exec_binary(a, op, b, &chunk.locs[chunk.loc[at] as usize])?;
                     self.put(base, dst, v);
                     Ok(())
                 })(),
+                // Quickening (F3.4): las formas especializadas, en brazos propios.
+                Ins::IntArith { dst, op, a, b, fb } => match self.int_pair(&chunk, &env, base, a, b) {
+                    Some((x, y)) => {
+                        let r = match op {
+                            BinOp::Add => x.checked_add(y),
+                            BinOp::Sub => x.checked_sub(y),
+                            BinOp::Mul => x.checked_mul(y),
+                            // `Number::modulo` con dos `Int`: floored; `% -1` es 0 (`i64::MIN % -1`
+                            // desborda en la CPU); `% 0` es error y lo arma el camino genérico.
+                            _ => match y {
+                                0 => None,
+                                -1 => Some(0),
+                                _ => Some(x.mod_floor(&y)),
+                            },
+                        };
+                        match r {
+                            Some(r) => {
+                                self.put(base, dst, SynValue::Number(Number::Int(r)));
+                                Ok(())
+                            }
+                            None => self.vm_binary_generic(&chunk, &env, base, at, dst, op, a, b),
+                        }
+                    }
+                    None => self.vm_binary_miss(&chunk, &env, base, at, dst, op, a, b, fb),
+                },
+                Ins::FloatArith { dst, op, a, b, fb } => match self.num_pair(&chunk, &env, base, a, b) {
+                    Some((x, y)) if op == BinOp::Div || x.is_float() || y.is_float() => {
+                        let (x, y) = (x.f64(), y.f64());
+                        let r = match op {
+                            BinOp::Add => Some(x + y),
+                            BinOp::Sub => Some(x - y),
+                            BinOp::Mul => Some(x * y),
+                            // `/` por cero (también -0.0) es error: lo arma la referencia.
+                            _ if y == 0.0 => None,
+                            _ => Some(x / y),
+                        };
+                        match r {
+                            Some(r) => {
+                                self.put(base, dst, SynValue::Number(Number::Float(r)));
+                                Ok(())
+                            }
+                            None => self.vm_binary_generic(&chunk, &env, base, at, dst, op, a, b),
+                        }
+                    }
+                    _ => self.vm_binary_miss(&chunk, &env, base, at, dst, op, a, b, fb),
+                },
+                Ins::NumCmp { dst, op, a, b, fb } => match self.num_pair(&chunk, &env, base, a, b) {
+                    Some((x, y)) => {
+                        let (x, y) = (x.number(), y.number());
+                        let r = match op {
+                            BinOp::Eq => x.num_eq(&y),
+                            BinOp::Ne => !x.num_eq(&y),
+                            _ => ord_op(x.partial_cmp_num(&y), op),
+                        };
+                        self.put(base, dst, syn_bool(r));
+                        Ok(())
+                    }
+                    None => self.vm_binary_miss(&chunk, &env, base, at, dst, op, a, b, fb),
+                },
+                Ins::IntCmpJump { dst, op, a, b, fb } => match self.int_pair(&chunk, &env, base, a, b) {
+                    Some((x, y)) => {
+                        let r = match op {
+                            BinOp::Lt => x < y,
+                            BinOp::Le => x <= y,
+                            BinOp::Gt => x > y,
+                            BinOp::Ge => x >= y,
+                            BinOp::Eq => x == y,
+                            _ => x != y,
+                        };
+                        match (r, chunk.code[pc].get()) {
+                            (true, _) => pc += 1,
+                            (false, Ins::JumpIfFalsy { to, .. }) => pc = to as usize,
+                            _ => unreachable!("IntCmpJump sin su JumpIfFalsy"),
+                        }
+                        Ok(())
+                    }
+                    None => self.vm_binary_miss(&chunk, &env, base, at, dst, op, a, b, fb),
+                },
+                Ins::IntCmp { dst, op, a, b, fb } => match self.int_pair(&chunk, &env, base, a, b) {
+                    Some((x, y)) => {
+                        let r = match op {
+                            BinOp::Lt => x < y,
+                            BinOp::Le => x <= y,
+                            BinOp::Gt => x > y,
+                            BinOp::Ge => x >= y,
+                            BinOp::Eq => x == y,
+                            _ => x != y,
+                        };
+                        self.put(base, dst, syn_bool(r));
+                        Ok(())
+                    }
+                    None => self.vm_binary_miss(&chunk, &env, base, at, dst, op, a, b, fb),
+                },
                 Ins::Unary { dst, op, a } => (|| {
                     let a = self.opnd(&chunk, &env, base, a, at)?;
                     let v = self.exec_unary(op, a, &chunk.locs[chunk.loc[at] as usize])?;
@@ -1830,6 +2441,26 @@ impl Interpreter {
                     self.put(base, dst, v);
                     Ok(())
                 })(),
+                Ins::SetGlobal { src, name, dst, ic } => (|| {
+                    let v = self.opnd(&chunk, &env, base, src, at)?;
+                    // Un módulo sincroniza su mapa de exportaciones: por el camino de `SetName`.
+                    let done = {
+                        let mut e = env.borrow_mut();
+                        !e.name.starts_with("module:")
+                            && match e.bindings.get_cached_mut(&chunk.names[name as usize], &chunk.ics[ic as usize]) {
+                                Some(slot) => {
+                                    *slot = v.clone();
+                                    true
+                                }
+                                None => false,
+                            }
+                    };
+                    if !done && !self.set_free(&chunk, &env, name, ic, v.clone()) {
+                        return Err(set_undefined(&chunk.names[name as usize]));
+                    }
+                    self.put(base, dst, v);
+                    Ok(())
+                })(),
                 Ins::SetName { src, name, dst, ic } => (|| {
                     let v = self.opnd(&chunk, &env, base, src, at)?;
                     if !self.set_free(&chunk, &env, name, ic, v.clone()) {
@@ -1838,14 +2469,47 @@ impl Interpreter {
                     self.put(base, dst, v);
                     Ok(())
                 })(),
-                Ins::TryInPlace { dst, node, name, done, ic, slot } => match self.vm_try_in_place(&chunk, &env, base, dst, node, name, ic, slot) {
-                    Ok(true) => {
-                        pc = done as usize;
-                        Ok(())
+                // La vía en el lugar sólo puede aplicar a una lista o un mapa: el tipo de la
+                // variable se mira acá, sin clonarla, y la referencia sólo se llama si puede.
+                Ins::TryInPlace { name, slot, .. }
+                    if name != NONE
+                        && slot != u16::MAX
+                        && !matches!(self.vm_locals[self.vm_lbase + slot as usize], Some(SynValue::List(_) | SynValue::Map(_))) =>
+                {
+                    Ok(())
+                }
+                Ins::TryInPlace { name, ic, .. }
+                    if name != NONE
+                        && ic != NONE
+                        && chunk.ic_here[ic as usize]
+                        && env
+                            .borrow()
+                            .bindings
+                            .get_cached(&chunk.names[name as usize], &chunk.ics[ic as usize])
+                            .is_some_and(|v| !matches!(v, SynValue::List(_) | SynValue::Map(_))) =>
+                {
+                    Ok(())
+                }
+                Ins::TryInPlace { dst, node, name, done, ic, slot } => {
+                    // Los pasos del resto del bloque (el valor y la asignación) no corrieron todavía.
+                    let pending = chunk.rest[at] as u64;
+                    self.steps = self.steps.wrapping_sub(pending);
+                    match self.vm_try_in_place(&chunk, &env, base, dst, node, name, ic, slot) {
+                        Ok(true) => {
+                            pc = done as usize;
+                            Ok(())
+                        }
+                        Ok(false) => {
+                            self.steps = self.steps.wrapping_add(pending);
+                            Ok(())
+                        }
+                        Err(c) => {
+                            // El camino de error vuelve a descontar `rest`.
+                            self.steps = self.steps.wrapping_add(pending);
+                            Err(c)
+                        }
                     }
-                    Ok(false) => Ok(()),
-                    Err(c) => Err(c),
-                },
+                }
                 Ins::Exec { dst, node } => self.exec(&chunk.nodes[node as usize], &env).map(|v| self.put(base, dst, v)),
                 Ins::Call { dst, func, args, n, site } => {
                     match self.vm_call(&chunk, base, at, dst, func, args, n, site) {
@@ -1898,6 +2562,39 @@ impl Interpreter {
                     self.vm_iters.truncate(iter_base + it as usize);
                     Ok(())
                 }
+                Ins::EachInitV { src, node, it } => self.vm_each_init_v(&chunk, &env, base, src, node, it, iter_base, at),
+                Ins::IsRange { src, to } => {
+                    if !matches!(&self.vm_regs[base + src as usize], SynValue::Builtin(b) if b.name == "range") {
+                        pc = to as usize;
+                    }
+                    Ok(())
+                }
+                Ins::EachRange { first, n, it } => self.vm_each_range(base, first, n, it, iter_base),
+                Ins::EachNextV { it, slot, exit } => {
+                    match self.vm_iters[iter_base + it as usize].next_item() {
+                        None => pc = exit as usize,
+                        Some(item) => self.vm_locals[self.vm_lbase + slot as usize] = Some(item),
+                    }
+                    Ok(())
+                }
+                Ins::EachStepV { head, first, n } => {
+                    // Lo que la vuelta ligó se suelta ahora, como el frame de la vuelta en la
+                    // referencia (y un `let` de una rama que no corre vuelve a ser hueco).
+                    let k = self.vm_lbase + first as usize;
+                    for x in &mut self.vm_locals[k..k + n as usize] {
+                        *x = None;
+                    }
+                    pc = head as usize;
+                    Ok(())
+                }
+                Ins::EachEndV { it, first, n } => {
+                    let k = self.vm_lbase + first as usize;
+                    for x in &mut self.vm_locals[k..k + n as usize] {
+                        *x = None;
+                    }
+                    self.vm_iters.truncate(iter_base + it as usize);
+                    Ok(())
+                }
                 Ins::Unwind { depth: to } => {
                     while depth > to {
                         let parent = env.borrow().parent.clone().expect("frame sin padre");
@@ -1919,6 +2616,40 @@ impl Interpreter {
                     Err(c) => Err(c),
                 },
                 Ins::Define { dst, node, child } => self.vm_define(&chunk, &env, base, dst, node, child),
+                // Volver de una llamada que corre la VM, sin nada abierto adentro del cuerpo (ni
+                // vuelta ni brazo con frame): directo al llamador, con el mismo epílogo que el camino
+                // de `Control::Give` de abajo (F3.5). `give` y el final del cuerpo terminan su
+                // bloque: no sobran pasos.
+                Ins::Give { src } | Ins::End { src } if depth == 0 && self.vm_frames.len() > entry => {
+                    match self.opnd(&chunk, &env, base, src, at) {
+                        Ok(v) => {
+                            let caller = self.vm_frames.pop().expect("frame de la VM");
+                            if let Some(t) = caller.taint {
+                                self.leave_call(t);
+                            }
+                            self.vm_iters.truncate(iter_base);
+                            let call_env = std::mem::replace(&mut env, caller.env);
+                            if chunk.regframe {
+                                drop(call_env);
+                            } else {
+                                self.release_frame(call_env);
+                            }
+                            self.vm_locals.truncate(self.vm_lbase);
+                            self.vm_lbase = caller.lbase;
+                            drop(caller.task);
+                            self.recursion_depth -= 1;
+                            self.vm_regs.truncate(base);
+                            chunk = caller.chunk;
+                            base = caller.base;
+                            pc = caller.pc;
+                            depth = caller.depth;
+                            iter_base = caller.iter_base;
+                            self.put(base, caller.dst, v);
+                            Ok(())
+                        }
+                        Err(c) => Err(c),
+                    }
+                }
                 Ins::Give { src } => match self.opnd(&chunk, &env, base, src, at) {
                     Ok(v) => Err(Control::Give(v)),
                     Err(c) => Err(c),
@@ -1972,12 +2703,13 @@ impl Interpreter {
                 self.vm_iters.truncate(iter_base);
                 let call_env = std::mem::replace(&mut env, caller.env);
                 if chunk.regframe {
-                    // No hay frame: el `env` era el `closure_env`. Se sueltan las variables.
+                    // No hay frame: el `env` era el `closure_env`.
                     drop(call_env);
-                    self.vm_locals.truncate(self.vm_lbase);
                 } else {
                     self.release_frame(call_env);
                 }
+                // La ventana de locales de la llamada (frame en registros, vueltas sin frame).
+                self.vm_locals.truncate(self.vm_lbase);
                 self.vm_lbase = caller.lbase;
                 drop(caller.task);
                 self.recursion_depth -= 1;
@@ -2016,6 +2748,87 @@ impl Interpreter {
     // así el despacho de las instrucciones calientes queda chico y el compilador no lo reacomoda
     // cada vez que cambia uno de estos.
 
+    /// Un operador binario por el camino genérico (el de `BinaryAny`), fuera del despacho: lo usan
+    /// la adaptación, las guardas que fallan y el desborde.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_binary_generic(
+        &mut self,
+        chunk: &Chunk,
+        env: &Rc<RefCell<Environment>>,
+        base: usize,
+        at: usize,
+        dst: Reg,
+        op: BinOp,
+        a: Opnd,
+        b: Opnd,
+    ) -> Result<(), Control> {
+        let a = self.opnd(chunk, env, base, a, at)?;
+        let b = self.opnd(chunk, env, base, b, at)?;
+        let v = self.exec_binary(a, op, b, &chunk.locs[chunk.loc[at] as usize])?;
+        self.put(base, dst, v);
+        Ok(())
+    }
+
+    /// `Binary` (adaptativo): se reescribe según los tipos que ve ahora y calcula por el camino
+    /// genérico. Lo que no tiene forma especializada queda en `BinaryAny`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_binary_adapt(
+        &mut self,
+        chunk: &Chunk,
+        env: &Rc<RefCell<Environment>>,
+        base: usize,
+        at: usize,
+        dst: Reg,
+        op: BinOp,
+        a: Opnd,
+        b: Opnd,
+        fb: u16,
+    ) -> Result<(), Control> {
+        let quick = match self.num_pair(chunk, env, base, a, b) {
+            Some((Num::I(_), Num::I(_))) if op == BinOp::Div => Some(Ins::FloatArith { dst, op, a, b, fb }),
+            // Una comparación que sólo usa el salto que le sigue: compara y salta (F3.5).
+            Some((Num::I(_), Num::I(_)))
+                if matches!(int_form(op, dst, a, b, fb), Some(Ins::IntCmp { .. }))
+                    && matches!(chunk.code.get(at + 1).map(Cell::get), Some(Ins::JumpIfFalsy { src: Opnd::Reg(r), .. }) if r == dst) =>
+            {
+                Some(Ins::IntCmpJump { dst, op, a, b, fb })
+            }
+            Some((Num::I(_), Num::I(_))) => int_form(op, dst, a, b, fb),
+            Some(_) => float_form(op, dst, a, b, fb),
+            None => None,
+        };
+        chunk.code[at].set(quick.unwrap_or(Ins::BinaryAny { dst, op, a, b }));
+        self.vm_binary_generic(chunk, env, base, at, dst, op, a, b)
+    }
+
+    /// Una forma especializada vio otros tipos: vuelve a `Binary` (para especializarse con lo que
+    /// venga) hasta `MAX_DEOPTS` veces, y después queda en `BinaryAny`; esta vez, camino genérico.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_binary_miss(
+        &mut self,
+        chunk: &Chunk,
+        env: &Rc<RefCell<Environment>>,
+        base: usize,
+        at: usize,
+        dst: Reg,
+        op: BinOp,
+        a: Opnd,
+        b: Opnd,
+        fb: u16,
+    ) -> Result<(), Control> {
+        let n = &chunk.deopts[fb as usize];
+        n.set(n.get().saturating_add(1));
+        chunk.code[at].set(if n.get() <= MAX_DEOPTS {
+            Ins::Binary { dst, op, a, b, fb }
+        } else {
+            Ins::BinaryAny { dst, op, a, b }
+        });
+        self.vm_binary_generic(chunk, env, base, at, dst, op, a, b)
+    }
+
     /// `TryInPlace`: `Ok(true)` si la vía en el lugar hizo la asignación.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
@@ -2049,13 +2862,13 @@ impl Interpreter {
         let NodeKind::SetMutation { target, value } = &chunk.nodes[node as usize].kind else {
             unreachable!("TryInPlace sobre otro nodo")
         };
-        if chunk.regframe {
-            // La vía en el lugar es de la referencia y busca por nombre: el frame se arma ahora con
-            // las variables MOVIDAS adentro (las mismas cuentas de referencias que la referencia, y
-            // con ellas el copy-on-write) y después vuelven a la ventana.
-            let frame = self.vm_spill(chunk, env);
-            let r = self.try_update_in_place(target, value, &frame);
-            self.vm_unspill(frame);
+        let spill = chunk.node_spill[node as usize];
+        if spill != NONE {
+            // La vía en el lugar es de la referencia y busca por nombre: las variables de la
+            // ventana van a frames el rato que corre (ver `vm_spill`).
+            let frames = self.vm_spill(chunk, env, spill);
+            let r = self.try_update_in_place(target, value, frames.last().expect("spill vacío"));
+            self.vm_unspill(chunk, spill, frames);
             return match r? {
                 Some(v) => {
                     self.put(base, dst, v);
@@ -2103,32 +2916,93 @@ impl Interpreter {
         Ok(())
     }
 
-    /// F3.3b: el frame de un cuerpo en registros, armado para el tree-walker (variables movidas).
-    fn vm_spill(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>) -> Rc<RefCell<Environment>> {
-        let frame = self.acquire_frame(env, "call");
-        if let Some(l) = &chunk.frame {
-            let mut e = frame.borrow_mut();
-            for (k, name) in l.names.iter().enumerate() {
-                let v = self.vm_locals[self.vm_lbase + k].take();
-                e.bindings.push_slot(name.clone(), v);
-            }
-        }
-        frame
-    }
-
-    /// Las variables vuelven a la ventana y el frame a la pila.
-    fn vm_unspill(&mut self, frame: Rc<RefCell<Environment>>) {
-        {
-            let mut e = frame.borrow_mut();
-            let n = e.bindings.len_names();
-            let lbase = self.vm_lbase;
-            for k in 0..n {
-                if lbase + k < self.vm_locals.len() {
-                    self.vm_locals[lbase + k] = e.bindings.take_slot(k);
+    /// La referencia (vía en el lugar, `set` con caminos) busca por nombre: los scopes de la
+    /// ventana se arman como frames, de afuera hacia adentro, con las variables MOVIDAS adentro
+    /// (las mismas cuentas de referencias que la referencia, y con ellas el copy-on-write).
+    fn vm_spill(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, spill: u32) -> SmallVec<[Rc<RefCell<Environment>>; 4]> {
+        let mut frames: SmallVec<[Rc<RefCell<Environment>>; 4]> = SmallVec::new();
+        for sp in chunk.spills[spill as usize].iter() {
+            let parent = frames.last().cloned().unwrap_or_else(|| env.clone());
+            let frame = self.acquire_frame(&parent, sp.name);
+            drop(parent);
+            {
+                let mut e = frame.borrow_mut();
+                for (k, name) in chunk.layouts[sp.scope as usize].names.iter().enumerate() {
+                    let v = self.vm_locals[self.vm_lbase + sp.off as usize + k].take();
+                    e.bindings.push_slot(name.clone(), v);
                 }
             }
+            frames.push(frame);
         }
-        self.release_frame(frame);
+        frames
+    }
+
+    /// Las variables vuelven a la ventana y los frames a la pila (de adentro hacia afuera: cada
+    /// uno suelta a su padre).
+    fn vm_unspill(&mut self, chunk: &Chunk, spill: u32, mut frames: SmallVec<[Rc<RefCell<Environment>>; 4]>) {
+        let chain = &chunk.spills[spill as usize];
+        while let Some(frame) = frames.pop() {
+            let sp = chain[frames.len()];
+            {
+                let mut e = frame.borrow_mut();
+                let n = e.bindings.len_names().min(chunk.layouts[sp.scope as usize].names.len());
+                for k in 0..n {
+                    self.vm_locals[self.vm_lbase + sp.off as usize + k] = e.bindings.take_slot(k);
+                }
+            }
+            self.release_frame(frame);
+        }
+    }
+
+    /// `LoadGlobal` que no encontró el lugar en el entorno actual: la búsqueda de `LoadName`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_load_name(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, dst: Reg, name: u32, ic: u32, at: usize) -> Result<(), Control> {
+        match self.load_free(chunk, env, name, ic) {
+            Some(v) => {
+                self.put(base, dst, v);
+                Ok(())
+            }
+            None => Err(undefined_variable(&chunk.names[name as usize], &chunk.locs[chunk.loc[at] as usize])),
+        }
+    }
+
+    /// `EachInitV`: el iterador de la colección ya evaluada, como la referencia.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_each_init_v(
+        &mut self,
+        chunk: &Chunk,
+        env: &Rc<RefCell<Environment>>,
+        base: usize,
+        src: Opnd,
+        node: u32,
+        it: u16,
+        iter_base: usize,
+        at: usize,
+    ) -> Result<(), Control> {
+        let coll = self.opnd(chunk, env, base, src, at)?;
+        let items = self.each_items_of(&coll, &chunk.nodes[node as usize].location)?;
+        drop(coll);
+        self.vm_iters.truncate(iter_base + it as usize);
+        self.vm_iters.push(items);
+        Ok(())
+    }
+
+    /// `EachRange`: lo de `each_over_range` después de evaluar los argumentos (un nivel de
+    /// recursión, como una llamada a builtin, y `range_spec`).
+    #[inline(never)]
+    fn vm_each_range(&mut self, base: usize, first: Reg, n: u16, it: u16, iter_base: usize) -> Result<(), Control> {
+        let from = base + first as usize;
+        let vals: SmallVec<[SynValue; 3]> =
+            (0..n as usize).map(|i| std::mem::replace(&mut self.vm_regs[from + i], SynValue::Nothing)).collect();
+        if self.recursion_depth + 1 > MAX_RECURSION {
+            return Err(err("maximum recursion depth exceeded"));
+        }
+        let (lo, hi, step) = range_spec(&vals)?;
+        self.vm_iters.truncate(iter_base + it as usize);
+        self.vm_iters.push(EachItems::Range(RangeIter::new(lo, hi, step)));
+        Ok(())
     }
 
     #[inline(never)]
@@ -2202,7 +3076,16 @@ impl Interpreter {
         at: usize,
     ) -> Result<(), Control> {
         let v = self.opnd(chunk, env, base, src, at)?;
-        let out = self.exec_set(&chunk.nodes[node as usize], v, env, &chunk.locs[chunk.loc[at] as usize], false)?;
+        let loc = &chunk.locs[chunk.loc[at] as usize];
+        let spill = chunk.node_spill[node as usize];
+        let out = if spill != NONE {
+            let frames = self.vm_spill(chunk, env, spill);
+            let r = self.exec_set(&chunk.nodes[node as usize], v, frames.last().expect("spill vacío"), loc, false);
+            self.vm_unspill(chunk, spill, frames);
+            r?
+        } else {
+            self.exec_set(&chunk.nodes[node as usize], v, env, loc, false)?
+        };
         self.put(base, dst, out);
         Ok(())
     }
@@ -2245,7 +3128,9 @@ impl Interpreter {
         if s.names.is_none() {
             if let SynValue::Task(t) = &f {
                 if let Some(code) = self.vm_code_for(t).cloned() {
-                    if s.checked {
+                    // Con tantos posicionales como parámetros no sobra ni falta ninguno: el chequeo
+                    // no puede fallar y no se recorren los parámetros en cada llamada (F3.5).
+                    if s.checked && n != t.parameters.len() {
                         check_task_arity(t, n, |_| false, loc)?;
                     }
                     self.recursion_depth += 1;
@@ -2298,8 +3183,10 @@ impl Interpreter {
                     }
                     let new_base = self.vm_regs.len();
                     self.vm_regs.resize(new_base + code.nregs as usize, SynValue::Nothing);
+                    let lbase = self.vm_locals.len();
+                    self.vm_locals.resize(lbase + code.nlocals as usize, None);
                     let SynValue::Task(task) = f else { unreachable!() };
-                    return Ok(Some(Enter { code, env: call_env, base: new_base, taint, task, lbase: self.vm_lbase }));
+                    return Ok(Some(Enter { code, env: call_env, base: new_base, taint, task, lbase }));
                 }
             }
         }
@@ -2310,9 +3197,8 @@ impl Interpreter {
     /// locales, sin `Environment`; el cuerpo corre con el `closure_env`. Lo demás como la entrada
     /// de siempre (profundidad ya contada, defaults en el `closure_env`).
     fn vm_enter_regframe(&mut self, t: &Rc<SynTaskValue>, code: Rc<Chunk>, first: usize, n: usize) -> Result<Enter, Control> {
-        let nl = code.frame.as_ref().map_or(0, |l| l.names.len());
         let lbase = self.vm_locals.len();
-        self.vm_locals.resize(lbase + nl, None);
+        self.vm_locals.resize(lbase + code.nlocals as usize, None);
         // Aridad permisiva (sin chequeo, un pipe): los de más se sueltan antes de los defaults.
         for i in t.parameters.len()..n {
             drop(std::mem::replace(&mut self.vm_regs[first + i], SynValue::Nothing));
@@ -2386,6 +3272,75 @@ struct Enter {
     lbase: usize,
 }
 
+/// La clave `key` de un mapa, por la posición que recuerda `ic` (si la clave en esa posición es
+/// la misma, sin hashear); si no, la búsqueda de siempre, y `ic` recuerda dónde estaba. `None` si
+/// no está (el que llama arma el error de la referencia).
+#[inline(always)]
+fn map_get_cached(m: &IndexMap<String, SynValue>, key: &str, ic: &Cell<u32>) -> Option<SynValue> {
+    let c = ic.get() as usize;
+    if c > 0 {
+        if let Some((k, v)) = m.get_index(c - 1) {
+            if k.as_str() == key {
+                return Some(v.clone());
+            }
+        }
+    }
+    let (i, _, v) = m.get_full(key)?;
+    ic.set(i as u32 + 1);
+    Some(v.clone())
+}
+
+/// Cuántas veces puede desoptimizarse una operación antes de quedar genérica para siempre (una que
+/// alterna tipos no paga reescribirse en cada vuelta).
+const MAX_DEOPTS: u8 = 2;
+
+/// La forma especializada de `op` para dos `Int`, si la hay.
+fn int_form(op: BinOp, dst: Reg, a: Opnd, b: Opnd, fb: u16) -> Option<Ins> {
+    Some(match op {
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod => Ins::IntArith { dst, op, a, b, fb },
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => Ins::IntCmp { dst, op, a, b, fb },
+        _ => return None,
+    })
+}
+
+/// La forma especializada de `op` cuando hay un `Float` en juego (o `/` entre enteros), si la hay.
+fn float_form(op: BinOp, dst: Reg, a: Opnd, b: Opnd, fb: u16) -> Option<Ins> {
+    Some(match op {
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => Ins::FloatArith { dst, op, a, b, fb },
+        BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => Ins::NumCmp { dst, op, a, b, fb },
+        _ => return None,
+    })
+}
+
+/// Un operando numérico visto por una guarda (sin moverlo ni clonarlo).
+#[derive(Clone, Copy)]
+enum Num {
+    I(i64),
+    F(f64),
+}
+
+impl Num {
+    #[inline(always)]
+    fn is_float(self) -> bool {
+        matches!(self, Num::F(_))
+    }
+    /// Como `Number::to_f64`.
+    #[inline(always)]
+    fn f64(self) -> f64 {
+        match self {
+            Num::I(x) => x as f64,
+            Num::F(x) => x,
+        }
+    }
+    #[inline(always)]
+    fn number(self) -> Number {
+        match self {
+            Num::I(x) => Number::Int(x),
+            Num::F(x) => Number::Float(x),
+        }
+    }
+}
+
 fn set_undefined(name: &str) -> Control {
     err(format!("Cannot set undefined variable: '{}'. Use 'let' first.", name))
 }
@@ -2406,18 +3361,133 @@ pub fn explain_source(source: &str) -> String {
     out
 }
 
+/// Corre el programa y muestra su código como quedó después (el quickening reescribe
+/// instrucciones mientras corre; las tasks definidas por el programa son sus hijos). Oculto: para
+/// los tests de la VM y para elegir superinstrucciones por perfil.
+#[doc(hidden)]
+pub fn explain_after_run(source: &str) -> String {
+    let program = match crate::parser::parse_source(source, "<explain>") {
+        Ok(p) => p,
+        Err(e) => return format!("parse error: {}", e),
+    };
+    let mut interp = Interpreter::new();
+    let _ = interp.execute(&program);
+    let mut out = String::new();
+    match &interp.vm_last_program {
+        Some(c) => explain_chunk(c, "program", &mut out),
+        None => out.push_str("(el programa no corrió por la VM)
+"),
+    }
+    out
+}
+
 fn explain_chunk(c: &Chunk, title: &str, out: &mut String) {
     use std::fmt::Write;
-    let _ = writeln!(out, "== {} ({} registros{})", title, c.nregs, if c.regframe { ", frame en registros" } else { "" });
+    let _ = writeln!(
+        out,
+        "== {} ({} registros{}{})",
+        title,
+        c.nregs,
+        if c.regframe { ", frame en registros" } else { "" },
+        if c.nlocals > 0 { format!(", ventana de {}", c.nlocals) } else { String::new() }
+    );
     if let Some(f) = &c.frame {
         let names: Vec<&str> = f.names.iter().map(|n| &**n).collect();
         let _ = writeln!(out, "   frame: [{}]", names.join(", "));
     }
-    for (i, ins) in c.code.iter().enumerate() {
+    for (i, ins) in c.code.iter().map(Cell::get).enumerate() {
         let l = &c.locs[c.loc[i] as usize];
         let _ = writeln!(out, "{:04} {:<60} rest={} @{}:{}", i, format!("{:?}", ins), c.rest[i], l.line, l.column);
     }
     for (i, ch) in c.children.iter().enumerate() {
         explain_chunk(ch, &format!("{} / hijo {}", title, i), out);
+    }
+}
+
+/// El perfil de la VM (feature `vm-profile`, sólo para elegir superinstrucciones): cuántas veces
+/// corre cada instrucción y cada par seguido (en el orden en que corren, también a través de una
+/// llamada). Se acumula por hilo y se junta al terminar cada programa.
+#[cfg(feature = "vm-profile")]
+pub mod profile {
+    use super::Ins;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::mem::Discriminant;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Local {
+        tags: HashMap<Discriminant<Ins>, u16>,
+        names: Vec<String>,
+        prev: Option<u16>,
+        single: HashMap<u16, u64>,
+        pairs: HashMap<(u16, u16), u64>,
+    }
+
+    thread_local! {
+        static LOCAL: RefCell<Local> = RefCell::new(Local::default());
+    }
+
+    static TOTAL: Mutex<Option<(HashMap<String, u64>, HashMap<(String, String), u64>)>> = Mutex::new(None);
+
+    pub(crate) fn hit(ins: &Ins) {
+        LOCAL.with(|l| {
+            let mut l = l.borrow_mut();
+            let d = std::mem::discriminant(ins);
+            let t = match l.tags.get(&d) {
+                Some(t) => *t,
+                None => {
+                    let dbg = format!("{:?}", ins);
+                    let name = dbg.split([' ', '(']).next().unwrap_or("?").to_string();
+                    let t = l.names.len() as u16;
+                    l.names.push(name);
+                    l.tags.insert(d, t);
+                    t
+                }
+            };
+            *l.single.entry(t).or_default() += 1;
+            if let Some(p) = l.prev {
+                *l.pairs.entry((p, t)).or_default() += 1;
+            }
+            l.prev = Some(t);
+        });
+    }
+
+    pub(crate) fn flush() {
+        LOCAL.with(|l| {
+            let mut l = l.borrow_mut();
+            let mut g = TOTAL.lock().unwrap();
+            let (single, pairs) = g.get_or_insert_with(Default::default);
+            let drained: Vec<_> = l.single.drain().collect();
+            for (t, n) in drained {
+                *single.entry(l.names[t as usize].clone()).or_default() += n;
+            }
+            let drained: Vec<_> = l.pairs.drain().collect();
+            for ((a, b), n) in drained {
+                *pairs.entry((l.names[a as usize].clone(), l.names[b as usize].clone())).or_default() += n;
+            }
+            l.prev = None;
+        });
+    }
+
+    /// Lo acumulado hasta ahora, de más a menos frecuente, y lo vacía.
+    pub fn take() -> String {
+        use std::fmt::Write;
+        let (single, pairs) = TOTAL.lock().unwrap().take().unwrap_or_default();
+        let total: u64 = single.values().sum();
+        let mut out = String::new();
+        let _ = writeln!(out, "instrucciones: {}", total);
+        let mut s: Vec<_> = single.into_iter().collect();
+        s.sort_by(|a, b| b.1.cmp(&a.1));
+        for (name, n) in s.iter().take(30) {
+            let _ = writeln!(out, "  {:>6.2}%  {:>12}  {}", *n as f64 * 100.0 / total.max(1) as f64, n, name);
+        }
+        let _ = writeln!(out, "pares:");
+        let mut p: Vec<_> = pairs.into_iter().collect();
+        p.sort_by(|a, b| b.1.cmp(&a.1));
+        for ((a, b), n) in p.iter().take(40) {
+            let _ = writeln!(out, "  {:>6.2}%  {:>12}  {} -> {}", *n as f64 * 100.0 / total.max(1) as f64, n, a, b);
+        }
+        out
     }
 }

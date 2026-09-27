@@ -1,0 +1,6 @@
+-- F3.6: `m["k"]` con una clave que falta después de encontrarla (el mensaje con la clave).
+task get_k(m)
+    give m["k"]
+print(get_k({"k": 1}))
+print(get_k({"a": 0, "k": 2}))
+print(get_k({"a": 0}))

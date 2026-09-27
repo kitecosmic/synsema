@@ -1,0 +1,6 @@
+-- F3.6: una clave que falta, en un sitio que ya la encontró en otros mapas (el error de la referencia).
+task price(r)
+    give r.price
+print(price({"price": 1}))
+print(price({"qty": 2, "price": 3}))
+print(price({"qty": 4}))

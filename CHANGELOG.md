@@ -6,6 +6,44 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.34 — 2026-09-27
+
+Speed, fourth step: the virtual machine learns from what it runs. The same language — every
+program gives the same result, the same errors and the same `steps()` count — only faster.
+Nothing to change in your programs.
+
+**Faster.** Measured on the interpreter against v0.6.33 (same machine, best of 9 alternating
+runs, without counting PGO or the Windows allocator, which both still apply on top):
+
+- A loop counting to 10 million at the top level of a program: **−61 %**; the same loop inside
+  a task: **−73 %**. Recursive `fib`: **−41 %**.
+- Arithmetic and comparisons on integers: **−50 % to −56 %**; on floats: **−68 % to −78 %**.
+- `each`: **−41 % to −53 %**; reading a variable several scopes up: −60 %.
+- Reading records: `r.price` **−61 %**, `r["price"]` **−71 %**, `xs[i]` −62 %.
+- `set`, `let`, a text literal, a builtin call: −37 % to −54 %; task calls: −22 % to −27 %.
+
+**How.** Each operator starts generic and, the first time it runs, rewrites itself into a
+version for the types it sees (two integers, a float): if other types arrive later it goes back
+to the generic one, and an integer that overflows still becomes a big integer (the technique of
+CPython 3.11, *quickening*). An `each` whose loop variable nothing captures keeps it in a
+register instead of creating an environment per iteration (what Lua, CPython and V8 do). The
+most frequent instruction pairs, measured over real programs, run as one instruction (the start
+of every statement; a comparison and the jump that uses it). Global variables go straight to
+where they are, and a map remembers where it found a key the last time (it still compares the
+key, so nothing changes about how values behave). `m["k"]` no longer asks for memory to build
+the key.
+
+**For contributors.** `vm.rs` gained the adaptive `Binary` with its specialized forms
+(`IntArith`, `IntCmp`, `IntCmpJump`, `FloatArith`, `NumCmp`, `BinaryAny`), `each` turns in the
+VM's locals window (`EachInitV`, `EachNextV`, …; the choice is a fixpoint in `compile_unit`),
+`StepsCancel`, `LoadGlobal`/`SetGlobal` and key caches on `GetProp`/`GetIndex`.
+`explain_after_run` (hidden) shows the code after it specialized. A hidden cargo feature,
+`vm-profile`, counts what the VM runs (`cargo run --release -p synsema-core --features vm-profile
+--example vmprof -- files…`). New oracle cases `vm_quicken`, `vm_each_window`, `vm_superinstr`,
+`vm_key_cache` and ten error cases. Note for measuring on Windows: two byte-identical copies of a
+binary can differ by up to 9 % because of address-space randomization; compare binaries linked
+with `-Wl,--no-dynamicbase`.
+
 ## v0.6.33 — 2026-09-27
 
 Speed, third step: a bytecode virtual machine. The same language — every program gives the same
