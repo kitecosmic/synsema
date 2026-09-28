@@ -21,10 +21,11 @@ Takeaways:
   connection, sync handlers on a blocking pool), no GIL, single static binary. The ceiling
   (raw `axum` on the same stack) is ~2× Go, so the headroom is real.
 - **Honest caveat:** this is web/I/O-bound throughput (the realistic server workload). Raw CPU
-  compute (deep recursive `/compute`) is interpreter-speed: since v0.6.33 a bytecode VM runs it
-  (measured on the released binaries: recursive `fib(30)` 554 ms, a 10M-iteration loop 2.7 s —
-  about 2× behind CPython, ~100×+ behind compiled Go; no JIT). The win is where servers actually
-  spend time, plus the security + agent-native edge Go lacks.
+  compute (deep recursive `/compute`) is interpreter-speed: a bytecode VM that specializes itself
+  (v0.6.34, measured on the released binaries on one Windows laptop: recursive `fib(30)` 326 ms, a
+  10M-iteration loop 1.4 s — the loop about on par with CPython 3.12 (1.2 s), recursion ~2× behind
+  it, and two orders of magnitude behind Node/Go; no JIT). The win is where servers actually spend
+  time, plus the security + agent-native edge Go lacks.
 
 So the usual reason to pick Go over a newer language — raw web performance — **does not apply
 here.** Synsema already beats it.
@@ -110,8 +111,8 @@ security none of the others have.
   stdlib is batteries-included** (HTTP client+server, SQL/SQLite, cron, templates/SSR, TLS,
   auto-HTTPS/ACME, vhosts, reverse proxy, rate limiting), so most services need *no*
   external packages at all. "Few packages" because few are needed, not because it can't.
-- **Young ecosystem / interpreted compute**: it's a single-binary Rust interpreter (a bytecode VM
-  since v0.6.33; the old Python tree is frozen). Top-tier for I/O/web and secure agent backends;
+- **Young ecosystem / interpreted compute**: it's a single-binary Rust interpreter (a self-specializing
+  bytecode VM since v0.6.34; the old Python tree is frozen). Top-tier for I/O/web and secure agent backends;
   for raw number-crunching hot loops a compiled language is still much faster, so keep heavy math
   in the `array`/linear-algebra builtins (they run native via `ndarray`/`faer`) and spread
   independent work with `parallel_map`.
