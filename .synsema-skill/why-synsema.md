@@ -22,8 +22,8 @@ Takeaways:
   (raw `axum` on the same stack) is ~2× Go, so the headroom is real.
 - **Honest caveat:** this is web/I/O-bound throughput (the realistic server workload). Raw CPU
   compute (deep recursive `/compute`) is interpreter-speed: a bytecode VM that specializes itself
-  (v0.6.34, measured on the released binaries on one Windows laptop: recursive `fib(30)` 326 ms, a
-  10M-iteration loop 1.4 s — the loop about on par with CPython 3.12 (1.2 s), recursion ~2× behind
+  (v0.6.35, measured on the released binaries on one Windows laptop: recursive `fib(30)` 282 ms, a
+  10M-iteration loop 1.4 s — the loop about on par with CPython 3.12 (1.1 s), recursion ~2× behind
   it, and two orders of magnitude behind Node/Go; no JIT). The win is where servers actually spend
   time, plus the security + agent-native edge Go lacks.
 
