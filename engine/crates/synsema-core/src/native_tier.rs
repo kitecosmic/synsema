@@ -97,6 +97,21 @@ pub enum NIns {
     /// un escalar no hace nada. El tipo estático lo prueba (si no se sabe, no se compila); una
     /// global vacía sale (la VM la busca afuera).
     Scalar { src: NOpnd },
+    /// F4.2b: `LoadGlobal` del builtin `range` (que siga siéndolo se verifica al entrar).
+    RangeFn { dst: Reg },
+    /// `IsRange`: si `src` no es el builtin `range`, a `to` (la llamada de siempre).
+    IsRange { src: Reg, to: u32 },
+    /// `each … in range(…)`: los argumentos (`n`, de 1 a 3) en registros desde `first`; el
+    /// iterador perezoso en el lugar `it`. La profundidad (un nivel, como la llamada al builtin) y
+    /// el paso cero los chequea la VM: salida antes.
+    EachRange { first: Reg, n: u16, it: u16 },
+    /// La vuelta siguiente del iterador `it` (un `range`): la variable en el lugar `slot`; sin más,
+    /// a `exit`.
+    EachNext { it: u16, slot: u16, exit: u32 },
+    /// Fin de la vuelta: los lugares `first..first + n` vuelven a estar vacíos, y a `head`.
+    EachStep { head: u32, first: u16, n: u16 },
+    /// Fin del bucle: los lugares vacíos y los iteradores desde `it` terminados.
+    EachEnd { it: u16, first: u16, n: u16 },
     /// F4.2: acá termina el código nativo y sigue la VM. `planned`: fuera del bucle (la salida, un
     /// `stop`, un `give`); si no, algo del cuerpo que el nivel nativo todavía no hace.
     Leave { planned: bool },
@@ -119,7 +134,8 @@ pub enum NSeen {
 }
 
 /// Un bucle que se compila a mitad de camino (OSR, F4.2): se entra en `head` con el estado de la
-/// VM. `init`: lo que tenía cada variable (registros, ventana, globales, en ese orden).
+/// VM. `init`: lo que tenía cada variable (registros, ventana, globales y las cuatro de cada
+/// iterador, en ese orden; un iterador que no es un `range` es `Boxed`).
 #[derive(Clone, Debug)]
 pub struct NOsr {
     pub head: u32,
@@ -135,6 +151,8 @@ pub struct NFunc {
     pub nparams: u16,
     /// Las globales de un bucle (0 en una task).
     pub nglobals: u16,
+    /// Cuántos iteradores de `each` usa (cada uno, cuatro variables: `valid`, `next`, `hi`, `step`).
+    pub niters: u16,
     pub osr: Option<NOsr>,
 }
 
@@ -152,6 +170,10 @@ pub enum NVal {
     Nothing,
     /// La task de la función `func` de la unidad.
     Callee(u32),
+    /// Un lugar vacío (un `let` de la vuelta que ya se soltó, un iterador terminado).
+    Hole,
+    /// El builtin `range`.
+    RangeFn,
 }
 
 /// Dónde vive un valor en el frame de la VM.
@@ -160,6 +182,8 @@ pub enum Place {
     Reg(Reg),
     Local(u16),
     Global(u16),
+    /// La parte `k` del iterador `it` (0 `valid`, 1 `next`, 2 `hi`, 3 `step`).
+    Iter(u16, u8),
 }
 
 /// Una llamada en curso: el frame espera su resultado en `dst`; la ventana del llamado empieza en

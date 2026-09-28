@@ -78,6 +78,8 @@ fn nval(k: Kind, bits: i64) -> NVal {
         Kind::Int => NVal::Int(bits),
         Kind::Bool => NVal::Bool(bits != 0),
         Kind::Callee(f) => NVal::Callee(f),
+        Kind::RangeFn => NVal::RangeFn,
+        Kind::Undef => NVal::Hole,
         _ => NVal::Nothing,
     }
 }

@@ -1,0 +1,76 @@
+-- F4.2b: `each` sobre `range` en código nativo: a mitad de camino (OSR) en el nivel superior,
+-- anidados, dentro de tasks, con pasos negativos, en los bordes de i64 y con `stop`/`give`. El
+-- iterador perezoso vive en el código nativo y vuelve a la VM en cada salida.
+
+let total be 0
+each i in range(0, 5000)
+    set total to total + i % 7
+print(total)
+
+-- Anidados: el de adentro se crea y termina en cada vuelta del de afuera.
+let acc be 0
+each a in range(0, 150)
+    each b in range(a, 0, 0 - 3)
+        set acc to acc + b % 5
+print(acc)
+
+-- Dentro de una task (con frame en registros), llamada desde un solo sitio en un bucle.
+task tri(n)
+    let s be 0
+    each j in range(n)
+        each k in range(0, j, 2)
+            set s to s + k
+    give s
+let t be 0
+each q in range(1, 200)
+    let r be tri(q % 30)
+    set t to t + r
+print(t)
+
+-- `give` desde adentro de un `each` en una task, y `stop`.
+task first_square_over(limit)
+    each i in range(1, 100000)
+        when i * i > limit
+            give i
+    give 0 - 1
+let fs be 0
+each w in range(0, 40)
+    let x be first_square_over(w * 1000)
+    set fs to fs + x
+print(fs)
+
+let stopped be 0
+each i in range(0, 100000)
+    when i >= 3333
+        stop
+    set stopped to stopped + 1
+print(stopped)
+
+-- Los bordes: cerca de i64::MAX el siguiente desborda y el rango termina (como en Python); un rango
+-- vacío; pasos negativos hasta el mínimo.
+let edge be 0
+each z in range(9223372036854775800, 9223372036854775807, 3)
+    set edge to edge + 1
+each z in range(0 - 9223372036854775800, 0 - 9223372036854775807, 0 - 4)
+    set edge to edge + 1
+each z in range(10, 10)
+    set edge to edge + 1000
+each z in range(5, 0)
+    set edge to edge + 1000
+print(edge)
+
+-- Un `let` de la vuelta en una rama que no corre queda vacío: se lee la global de afuera.
+let y be 100
+let mix be 0
+each i in range(0, 3000)
+    when i % 3 == 0
+        let y be i
+    set mix to mix + y
+print(mix)
+
+-- Argumentos que no son enteros (un Float entero es válido para `range`): los resuelve la VM.
+let f be 0
+each i in range(0, 3000.0)
+    set f to f + 1
+print(f)
+print(steps())

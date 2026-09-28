@@ -76,14 +76,16 @@ pub(crate) struct NativeUnit {
     nregs0: u16,
     deps: Vec<Dep>,
     deopts: Cell<u32>,
+    /// El builtin `range`, si el código lo tiene en un registro (para devolvérselo a la VM).
+    range_fn: Option<SynValue>,
 }
 
 /// La global `name`, leída desde el `closure_env` de la función `from` (o, si es `None`, desde el
-/// entorno donde corre el bucle), es la task de `to`.
+/// entorno donde corre el bucle), es la task de `to` (o, si es `None`, el builtin `range`).
 struct Dep {
     from: Option<usize>,
     name: Arc<str>,
-    to: usize,
+    to: Option<usize>,
 }
 
 impl NativeUnit {
@@ -91,7 +93,13 @@ impl NativeUnit {
     /// por nombre desde el `closure_env`, o desde `here` para el bucle).
     fn deps_hold(&self, here: Option<&Rc<RefCell<Environment>>>) -> bool {
         self.deps.iter().all(|d| {
-            let Some(to) = self.task(d.to) else { return false };
+            let to = match d.to {
+                Some(t) => match self.task(t) {
+                    Some(t) => Some(t),
+                    None => return false,
+                },
+                None => None,
+            };
             let found = match d.from {
                 Some(f) => match self.task(f) {
                     Some(from) => env_get(&from.closure_env, &d.name),
@@ -102,7 +110,11 @@ impl NativeUnit {
                     None => return false,
                 },
             };
-            matches!(found, Some(SynValue::Task(t)) if Rc::ptr_eq(&t, &to))
+            match (found, to) {
+                (Some(SynValue::Task(t)), Some(to)) => Rc::ptr_eq(&t, &to),
+                (Some(SynValue::Builtin(b)), None) => b.name == "range",
+                _ => false,
+            }
         })
     }
 
@@ -130,6 +142,8 @@ pub(super) struct Resume {
     pub(super) enter: Enter,
     pub(super) pc: usize,
     pub(super) top0: usize,
+    /// Dónde empiezan los iteradores del frame de más adentro.
+    pub(super) iter_base: usize,
 }
 
 /// Qué pasó en un `LoopBack` que llegó a su cuenta (F4.2).
@@ -153,6 +167,7 @@ struct Build {
     funcs: Vec<NFunc>,
     tasks: Vec<Option<Rc<SynTaskValue>>>,
     deps: Vec<Dep>,
+    range_fn: Option<SynValue>,
 }
 
 impl Build {
@@ -185,14 +200,22 @@ impl Build {
                 code.push(view_ins(&chunk, pc, &x.closure_env, Some(i), self)?);
             }
             let nparams = u16::try_from(x.parameters.len()).ok()?;
-            self.funcs.push(NFunc { code, nregs: chunk.nregs, nlocals: chunk.nlocals, nparams, nglobals: 0, osr: None });
+            let niters = chunk_iters(&chunk);
+            self.funcs.push(NFunc { code, nregs: chunk.nregs, nlocals: chunk.nlocals, nparams, nglobals: 0, niters, osr: None });
             i += 1;
         }
         Some(())
     }
 
     fn unit(self, code: Box<dyn NativeCode>, nregs0: u16) -> NativeUnit {
-        NativeUnit { code, tasks: self.tasks.iter().map(|t| t.as_ref().map(Rc::downgrade)).collect(), nregs0, deps: self.deps, deopts: Cell::new(0) }
+        NativeUnit {
+            code,
+            tasks: self.tasks.iter().map(|t| t.as_ref().map(Rc::downgrade)).collect(),
+            nregs0,
+            deps: self.deps,
+            deopts: Cell::new(0),
+            range_fn: self.range_fn,
+        }
     }
 }
 
@@ -264,7 +287,16 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
             NIns::IntCmpJump { op: ncmp(op)?, a: nopnd(c, a)?, b: nopnd(c, y)?, to }
         }
         Ins::JumpIfFalsy { src, to } => NIns::JumpIfFalsy { src: nopnd(c, src)?, to },
-        Ins::Jump { to } | Ins::LoopBack { to, .. } => NIns::Jump { to },
+        Ins::Jump { to } | Ins::LoopBack { to, n: 0, .. } => NIns::Jump { to },
+        // `each` sobre `range` (F4.2b): el iterador perezoso en el código nativo.
+        Ins::LoopBack { to, first, n, .. } | Ins::EachStepV { head: to, first, n } => NIns::EachStep { head: to, first, n },
+        Ins::IsRange { src, to } => NIns::IsRange { src, to },
+        Ins::EachRange { first, n, it } => NIns::EachRange { first, n, it },
+        Ins::EachNextV { it, slot, exit } => NIns::EachNext { it, slot, exit },
+        Ins::EachEndV { it, first, n } => NIns::EachEnd { it, first, n },
+        // El camino general de un `each` (la colección no era el builtin `range`): con `range` no se
+        // llega; si se llega, sigue la VM.
+        Ins::EachInitV { .. } => NIns::Leave { planned: false },
         Ins::LoadRLocal { dst, slot, .. } => NIns::LoadLocal { dst, slot },
         Ins::LetRLocal { src, slot, dst } => NIns::LetLocal { src: nopnd(c, src)?, slot, dst },
         Ins::SetRLocal { src, slot, dst, .. } => NIns::SetLocal { src: nopnd(c, src)?, slot, dst },
@@ -278,10 +310,19 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
         Ins::Unwind { .. } => NIns::Nop,
         Ins::LoadGlobal { dst, name, .. } => {
             let nm = c.names[name as usize].clone();
-            let SynValue::Task(y) = env_get(env, &nm)? else { return None };
-            let to = b.callee(y);
-            b.deps.push(Dep { from: me, name: nm, to });
-            NIns::LoadCallee { dst, func: to as u32 }
+            match env_get(env, &nm)? {
+                SynValue::Task(y) => {
+                    let to = b.callee(y);
+                    b.deps.push(Dep { from: me, name: nm, to: Some(to) });
+                    NIns::LoadCallee { dst, func: to as u32 }
+                }
+                v @ SynValue::Builtin(_) if matches!(&v, SynValue::Builtin(x) if x.name == "range") => {
+                    b.deps.push(Dep { from: me, name: nm, to: None });
+                    b.range_fn = Some(v);
+                    NIns::RangeFn { dst }
+                }
+                _ => return None,
+            }
         }
         Ins::Call { dst, func, args, n, site } | Ins::CallNative { dst, func, args, n, site } => {
             if c.sites[site as usize].names.is_some() {
@@ -293,6 +334,34 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
         Ins::End { src } => NIns::End { src: nopnd(c, src)? },
         _ => return None,
     })
+}
+
+/// Cuántos iteradores de `each` usa el chunk (el mayor `it` + 1).
+fn chunk_iters(c: &Chunk) -> u16 {
+    c.code
+        .iter()
+        .filter_map(|x| match x.get() {
+            Ins::EachRange { it, .. }
+            | Ins::EachNextV { it, .. }
+            | Ins::EachEndV { it, .. }
+            | Ins::EachInitV { it, .. }
+            | Ins::EachInit { it, .. }
+            | Ins::EachNext { it, .. }
+            | Ins::EachEnd { it } => Some(it + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Lo que tiene el lugar `at` de la pila de iteradores, visto por el nivel nativo: las cuatro
+/// partes de un `range` (`valid`, `next`, `hi`, `step`), vacío, o algo que no representa.
+fn iter_parts(v: Option<&EachItems>) -> Result<Option<[i64; 4]>, ()> {
+    match v {
+        None => Ok(None),
+        Some(EachItems::Range(r)) => Ok(Some([i64::from(r.next.is_some()), r.next.unwrap_or(0), r.hi, r.step])),
+        Some(_) => Err(()),
+    }
 }
 
 fn seen(v: Option<&SynValue>) -> NSeen {
@@ -379,7 +448,7 @@ fn view_loop(c: &Chunk, env: &Rc<RefCell<Environment>>, head: usize, back: usize
             Ins::LoadGlobal { dst, name, .. } => {
                 let nm = &c.names[name as usize];
                 match own(nm) {
-                    Some(Some(SynValue::Task(_))) | None => view_ins(c, pc, env, None, b),
+                    Some(Some(SynValue::Task(_) | SynValue::Builtin(_))) | None => view_ins(c, pc, env, None, b),
                     Some(v) if seen(v.as_ref()) != NSeen::Boxed => Some(NIns::Move { dst, src: NOpnd::Global(global(nm)) }),
                     Some(_) => None,
                 }
@@ -469,6 +538,8 @@ impl Interpreter {
             NVal::Bool(b) => syn_bool(b),
             NVal::Nothing => SynValue::Nothing,
             NVal::Callee(f) => SynValue::Task(unit.task(f as usize).expect("task de la unidad viva")),
+            NVal::RangeFn => unit.range_fn.clone().expect("el builtin range de la unidad"),
+            NVal::Hole => SynValue::Nothing,
         }
     }
 
@@ -570,15 +641,8 @@ impl Interpreter {
             }
             let lbase = self.vm_locals.len();
             self.vm_locals.resize(lbase + code.nlocals as usize, None);
-            for (place, v) in fr.values {
-                let v = Self::nval_to_syn(unit, v);
-                match place {
-                    Place::Reg(r) => self.vm_regs[first + r as usize] = v,
-                    Place::Local(s) => self.vm_locals[lbase + s as usize] = Some(v),
-                    // Sólo el bucle (la función 0) tiene globales, y no pasa por acá.
-                    Place::Global(_) => unreachable!("global en el frame de una task"),
-                }
-            }
+            let ib = self.vm_iters.len();
+            self.vm_put_values(unit, fr.values, first, lbase, ib, None);
             match fr.call {
                 Some(c) if k < last => {
                     pending = Some(VmFrame {
@@ -588,7 +652,7 @@ impl Interpreter {
                         pc: fr.pc as usize,
                         dst: c.dst,
                         depth: 0,
-                        iter_base: self.vm_iters.len(),
+                        iter_base: ib,
                         lbase,
                         top: 0,
                     });
@@ -601,6 +665,7 @@ impl Interpreter {
                         enter: Enter { code, env: task.closure_env.clone(), base: first, lbase, top: 0 },
                         pc: fr.pc as usize,
                         top0,
+                        iter_base: ib,
                     })
                 }
             }
@@ -612,13 +677,14 @@ impl Interpreter {
     /// umbral se compila el bucle (una vez) y, desde ahí, cada vuelta que corre en la VM intenta
     /// entrar. Si no se puede compilar o no rinde, la instrucción vuelve a ser `Jump`.
     #[inline(never)]
-    pub(super) fn vm_loop_hot(&mut self, chunk: &Rc<Chunk>, env: &Rc<RefCell<Environment>>, base: usize, at: usize, lp: u16) -> OsrStep {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn vm_loop_hot(&mut self, chunk: &Rc<Chunk>, env: &Rc<RefCell<Environment>>, base: usize, iter_base: usize, at: usize, lp: u16) -> OsrStep {
         let st = &chunk.loops[lp as usize];
-        let Ins::LoopBack { to, .. } = chunk.code[at].get() else { unreachable!("vm_loop_hot sin LoopBack") };
+        let Ins::LoopBack { to, first, n, .. } = chunk.code[at].get() else { unreachable!("vm_loop_hot sin LoopBack") };
         let give_up = || {
             st.never.set(true);
             st.left.set(u32::MAX);
-            chunk.code[at].set(Ins::Jump { to });
+            chunk.code[at].set(if n > 0 { Ins::EachStepV { head: to, first, n } } else { Ins::Jump { to } });
         };
         if st.never.get() {
             give_up();
@@ -629,7 +695,7 @@ impl Interpreter {
             return OsrStep::Stay;
         }
         if st.code.get().is_none() {
-            match self.vm_build_loop(chunk, env, base, to as usize, at) {
+            match self.vm_build_loop(chunk, env, base, iter_base, to as usize, at) {
                 Some(u) => {
                     native_tier::count_unit();
                     let _ = st.code.set(u);
@@ -641,7 +707,7 @@ impl Interpreter {
             }
         }
         let lu = st.code.get().expect("bucle compilado");
-        let Some((args, slots)) = self.vm_osr_args(lu, env, base) else {
+        let Some((args, slots)) = self.vm_osr_args(lu, env, base, iter_base) else {
             // No encaja ahora (otro tipo, una task que cambió): más tarde, y si sigue, nunca.
             st.misses.set(st.misses.get() + 1);
             if st.misses.get() > MAX_NATIVE_DEOPTS {
@@ -672,15 +738,10 @@ impl Interpreter {
         }
         let rest = frames.split_off(1);
         let f0 = frames.pop().expect("frame del bucle");
-        // Lo que el bucle tenía en registros vuelve a la VM (las globales, a su lugar del entorno).
-        for (place, v) in f0.values {
-            let v = Self::nval_to_syn(&lu.unit, v);
-            match place {
-                Place::Reg(r) => self.vm_regs[base + r as usize] = v,
-                Place::Local(k) => self.vm_locals[self.vm_lbase + k as usize] = Some(v),
-                Place::Global(g) => env.borrow_mut().bindings.slot_set(slots[g as usize], v),
-            }
-        }
+        // Lo que el bucle tenía en registros vuelve a la VM (las globales, a su lugar del entorno; los
+        // iteradores, a su lugar de la pila).
+        let lbase = self.vm_lbase;
+        self.vm_put_values(&lu.unit, f0.values, base, lbase, iter_base, Some((env, &slots)));
         match f0.call {
             Some(c) => {
                 let r = self.vm_native_resume(&lu.unit, rest, base + c.args as usize, c.n as usize);
@@ -692,7 +753,8 @@ impl Interpreter {
 
     /// Compila el bucle `[head, back]` con los tipos que tiene ahora (los que la entrada va a
     /// exigir).
-    fn vm_build_loop(&mut self, chunk: &Rc<Chunk>, env: &Rc<RefCell<Environment>>, base: usize, head: usize, back: usize) -> Option<LoopUnit> {
+    #[allow(clippy::too_many_arguments)]
+    fn vm_build_loop(&mut self, chunk: &Rc<Chunk>, env: &Rc<RefCell<Environment>>, base: usize, iter_base: usize, head: usize, back: usize) -> Option<LoopUnit> {
         let tier = native_tier::tier()?;
         let mut b = Build { tasks: vec![None], ..Default::default() };
         let (code, globals, writes) = view_loop(chunk, env, head, back, &mut b)?;
@@ -714,12 +776,22 @@ impl Interpreter {
                 init.push(seen(e.bindings.slot(k)));
             }
         }
+        let niters = chunk_iters(chunk);
+        for it in 0..niters as usize {
+            let s = match iter_parts(self.vm_iters.get(iter_base + it)) {
+                Ok(Some(_)) => NSeen::Int,
+                Ok(None) => NSeen::Hole,
+                Err(()) => NSeen::Boxed,
+            };
+            init.extend([s; 4]);
+        }
         b.funcs.push(NFunc {
             code,
             nregs: chunk.nregs,
             nlocals: chunk.nlocals,
             nparams: 0,
             nglobals,
+            niters,
             osr: Some(NOsr { head: head as u32, init }),
         });
         b.close(1)?;
@@ -735,7 +807,7 @@ impl Interpreter {
     /// tenía al compilar (nunca un valor con caja: sus cuentas de referencias no se tocan), las
     /// globales están en el entorno y las tasks siguen siendo esas. Los valores de entrada y el
     /// slot de cada global.
-    fn vm_osr_args(&self, lu: &LoopUnit, env: &Rc<RefCell<Environment>>, base: usize) -> Option<(SmallVec<[i64; 16]>, SmallVec<[usize; 8]>)> {
+    fn vm_osr_args(&self, lu: &LoopUnit, env: &Rc<RefCell<Environment>>, base: usize, iter_base: usize) -> Option<(SmallVec<[i64; 16]>, SmallVec<[usize; 8]>)> {
         let e = env.borrow();
         if lu.writes && e.name.starts_with("module:") {
             return None;
@@ -746,10 +818,23 @@ impl Interpreter {
         }
         let mut args: SmallVec<[i64; 16]> = SmallVec::new();
         for &(place, want) in lu.unit.code.inputs() {
+            if let Place::Iter(it, k) = place {
+                let (s, x) = match iter_parts(self.vm_iters.get(iter_base + it as usize)) {
+                    Ok(Some(p)) => (NSeen::Int, p[k as usize]),
+                    Ok(None) => (NSeen::Hole, 0),
+                    Err(()) => (NSeen::Boxed, 0),
+                };
+                if s != want {
+                    return None;
+                }
+                args.push(x);
+                continue;
+            }
             let v = match place {
                 Place::Reg(r) => Some(&self.vm_regs[base + r as usize]),
                 Place::Local(k) => self.vm_locals[self.vm_lbase + k as usize].as_ref(),
                 Place::Global(g) => e.bindings.slot(slots[g as usize]),
+                Place::Iter(..) => unreachable!("iterador"),
             };
             if seen(v) != want {
                 return None;
@@ -765,5 +850,61 @@ impl Interpreter {
             return None;
         }
         Some((args, slots))
+    }
+
+    /// Los valores de un frame nativo en la VM: registros desde `rbase`, ventana desde `lbase`,
+    /// iteradores desde `ib` (un iterador terminado se suelta de la pila) y, en un bucle, las
+    /// globales en sus slots del entorno.
+    fn vm_put_values(
+        &mut self,
+        unit: &NativeUnit,
+        values: Vec<(Place, NVal)>,
+        rbase: usize,
+        lbase: usize,
+        ib: usize,
+        globals: Option<(&Rc<RefCell<Environment>>, &[usize])>,
+    ) {
+        let mut iters: SmallVec<[(u16, [i64; 4], bool); 4]> = SmallVec::new();
+        for (place, v) in values {
+            match place {
+                Place::Reg(r) => self.vm_regs[rbase + r as usize] = Self::nval_to_syn(unit, v),
+                Place::Local(k) => self.vm_locals[lbase + k as usize] = (v != NVal::Hole).then(|| Self::nval_to_syn(unit, v)),
+                Place::Global(g) => {
+                    // Una global vacía el código nativo no la escribió (un `set` a un hueco sale antes).
+                    if v != NVal::Hole {
+                        let (env, slots) = globals.expect("global fuera de un bucle");
+                        env.borrow_mut().bindings.slot_set(slots[g as usize], Self::nval_to_syn(unit, v));
+                    }
+                }
+                Place::Iter(it, k) => {
+                    let i = match iters.iter().position(|x| x.0 == it) {
+                        Some(i) => i,
+                        None => {
+                            iters.push((it, [0; 4], false));
+                            iters.len() - 1
+                        }
+                    };
+                    match v {
+                        NVal::Int(x) => iters[i].1[k as usize] = x,
+                        _ => iters[i].2 = true,
+                    }
+                }
+            }
+        }
+        iters.sort_by_key(|x| x.0);
+        for (it, p, gone) in iters {
+            let at = ib + it as usize;
+            if gone {
+                self.vm_iters.truncate(at);
+                continue;
+            }
+            let r = EachItems::Range(RangeIter { next: (p[0] != 0).then_some(p[1]), hi: p[2], step: p[3] });
+            if at < self.vm_iters.len() {
+                self.vm_iters[at] = r;
+            } else {
+                assert_eq!(at, self.vm_iters.len(), "iterador nativo fuera de orden");
+                self.vm_iters.push(r);
+            }
+        }
     }
 }

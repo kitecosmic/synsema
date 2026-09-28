@@ -90,7 +90,18 @@ impl Gen {
         }
         if self.rng.chance(70) {
             let bound = self.rng.below(7);
-            s += &format!("    let k be 0\n    while k < {}\n", bound);
+            // F4.2b: a veces un `each` sobre `range` (con paso negativo o desde un parámetro).
+            let each = self.rng.chance(50);
+            if each {
+                let r = match self.rng.below(3) {
+                    0 => format!("range({})", bound),
+                    1 => format!("range({}, 0, 0 - {})", bound, 1 + self.rng.below(3)),
+                    _ => format!("range(0, {} % 7, 2)", vars[0]),
+                };
+                s += &format!("    each k in {}\n", r);
+            } else {
+                s += &format!("    let k be 0\n    while k < {}\n", bound);
+            }
             let e = self.expr(&vars, 2);
             s += &format!("        set x to {}\n", e);
             if self.rng.chance(50) {
@@ -98,7 +109,9 @@ impl Gen {
                 let e = self.expr(&vars, 2);
                 s += &format!("        when {}\n            set y to {}\n", c, e);
             }
-            s += "        set k to k + 1\n";
+            if !each {
+                s += "        set k to k + 1\n";
+            }
         }
         if let Some((f, n)) = callee {
             let args: Vec<String> = (0..n).map(|_| self.expr(&vars, 1)).collect();
@@ -134,7 +147,13 @@ impl Gen {
         let vars: Vec<String> = ["g0", "g1", "lc"].iter().map(|v| v.to_string()).collect();
         let bound = 2 + self.rng.below(40);
         let mut s = format!("let g0 be {}\nlet g1 be {}\nlet lc be 0\nlet gl be 0\n", self.atom(&[]), self.atom(&[]));
-        s += &format!("while lc < {}\n", bound);
+        // F4.2b: la mitad de las veces un `each` sobre `range` (la variable de la vuelta, `ev`).
+        let each = self.rng.chance(50);
+        if each {
+            s += &format!("each ev in range(0, {}, {})\n    set lc to lc + ev % 2\n", 3 * bound, 1 + self.rng.below(3));
+        } else {
+            s += &format!("while lc < {}\n", bound);
+        }
         let e = self.expr(&vars, 2);
         s += &format!("    set g0 to ({}) % 1000003\n", e);
         if self.rng.chance(50) {
@@ -154,7 +173,9 @@ impl Gen {
             let c = self.cond(&vars);
             s += &format!("    when {}\n        stop\n", c);
         }
-        s += "    set lc to lc + 1\n";
+        if !each {
+            s += "    set lc to lc + 1\n";
+        }
         s += "print([g0, g1, lc, gl])\n";
         s
     }

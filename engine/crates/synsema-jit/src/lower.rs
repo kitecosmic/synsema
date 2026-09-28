@@ -37,6 +37,8 @@ pub(crate) enum Kind {
     Bool,
     /// La task de la función de la unidad.
     Callee(u32),
+    /// El builtin `range` (F4.2b).
+    RangeFn,
     /// Según el camino, distinto: no se puede usar.
     Top,
 }
@@ -138,7 +140,22 @@ struct Func<'u> {
 
 impl<'u> Func<'u> {
     fn new(f: &'u NFunc, unit: &'u NUnit) -> Self {
-        Func { f, unit, nregs: f.nregs as usize, nvars: f.nregs as usize + f.nlocals as usize + f.nglobals as usize }
+        let nvars = f.nregs as usize + f.nlocals as usize + f.nglobals as usize + 4 * f.niters as usize;
+        Func { f, unit, nregs: f.nregs as usize, nvars }
+    }
+
+    /// La parte `k` del iterador `it` (0 `valid`, 1 `next`, 2 `hi`, 3 `step`).
+    fn iter_var(&self, it: u16, k: u8) -> usize {
+        self.nregs + self.f.nlocals as usize + self.f.nglobals as usize + 4 * it as usize + k as usize
+    }
+
+    /// Las variables de los iteradores desde `it` (los que un `each` nuevo o terminado deja vacíos).
+    fn iters_from(&self, it: u16) -> std::ops::Range<usize> {
+        self.iter_var(it.min(self.f.niters), 0)..self.nvars
+    }
+
+    fn locals(&self, first: u16, n: u16) -> std::ops::Range<usize> {
+        self.nregs + first as usize..self.nregs + first as usize + n as usize
     }
 
     fn global_var(&self, g: u16) -> usize {
@@ -150,6 +167,7 @@ impl<'u> Func<'u> {
             Place::Reg(r) => r as usize,
             Place::Local(k) => self.nregs + k as usize,
             Place::Global(g) => self.global_var(g),
+            Place::Iter(it, k) => self.iter_var(it, k),
         }
     }
 
@@ -159,8 +177,11 @@ impl<'u> Func<'u> {
             Place::Reg(v as Reg)
         } else if v < self.nregs + nl {
             Place::Local((v - self.nregs) as u16)
-        } else {
+        } else if v < self.nregs + nl + self.f.nglobals as usize {
             Place::Global((v - self.nregs - nl) as u16)
+        } else {
+            let k = v - self.nregs - nl - self.f.nglobals as usize;
+            Place::Iter((k / 4) as u16, (k % 4) as u8)
         }
     }
 
@@ -377,6 +398,69 @@ impl<'u> Func<'u> {
                 }
                 Next::Fall
             }
+            NIns::RangeFn { dst } => {
+                set(st, dst, Kind::RangeFn);
+                Next::Fall
+            }
+            // Si no es el builtin `range`, la llamada de siempre (que el nivel nativo no hace).
+            NIns::IsRange { src, to } => match st[src as usize] {
+                Kind::RangeFn => Next::Fall,
+                Kind::Top => return Err(()),
+                Kind::Bot => Next::Stop,
+                _ => Next::Jump(to),
+            },
+            NIns::EachRange { first, n, it } => {
+                if n == 0 || n > 3 || it >= self.f.niters {
+                    return Err(());
+                }
+                for i in 0..n as usize {
+                    match st[first as usize + i] {
+                        Kind::Top => return Err(()),
+                        Kind::Int | Kind::Bot => {}
+                        // Otro tipo: lo resuelve la VM (o es el error de `range`).
+                        _ => {
+                            *trap = true;
+                            return Ok(Next::Stop);
+                        }
+                    }
+                }
+                for i in 0..n as usize {
+                    st[first as usize + i] = Kind::Nothing;
+                }
+                for v in self.iters_from(it) {
+                    st[v] = Kind::Undef;
+                }
+                for k in 0..4 {
+                    st[self.iter_var(it, k)] = Kind::Int;
+                }
+                Next::Fall
+            }
+            NIns::EachNext { it, slot, exit } => {
+                match st[self.iter_var(it, 0)] {
+                    Kind::Int => {}
+                    Kind::Top => return Err(()),
+                    _ => {
+                        *trap = true;
+                        return Ok(Next::Stop);
+                    }
+                }
+                // (En la salida el lugar no se escribe, pero lo que sigue es el `EachEndV` que lo
+                // suelta: el tipo de acá no se ve.)
+                st[self.nregs + slot as usize] = Kind::Int;
+                Next::Branch(pc as u32 + 1, exit)
+            }
+            NIns::EachStep { head, first, n } => {
+                for v in self.locals(first, n) {
+                    st[v] = Kind::Undef;
+                }
+                Next::Jump(head)
+            }
+            NIns::EachEnd { it, first, n } => {
+                for v in self.locals(first, n).chain(self.iters_from(it)) {
+                    st[v] = Kind::Undef;
+                }
+                Next::Fall
+            }
             NIns::Trap { .. } | NIns::Leave { .. } => {
                 *trap = true;
                 Next::Stop
@@ -559,6 +643,35 @@ impl<'u> Func<'u> {
                 uses.extend(self.opnd_var(src));
                 fall
             }
+            NIns::RangeFn { dst: d } => {
+                dst(&mut defs, d);
+                fall
+            }
+            NIns::IsRange { src, to } => {
+                uses.push(src as usize);
+                vec![pc + 1, to as usize]
+            }
+            NIns::EachRange { first, n, it } => {
+                let args = first as usize..first as usize + n as usize;
+                uses.extend(args.clone());
+                defs.extend(args);
+                defs.extend(self.iters_from(it));
+                fall
+            }
+            NIns::EachNext { it, slot, exit } => {
+                uses.extend((0..4).map(|k| self.iter_var(it, k)));
+                defs.push(self.nregs + slot as usize);
+                vec![pc + 1, exit as usize]
+            }
+            NIns::EachStep { head, first, n } => {
+                defs.extend(self.locals(first, n));
+                vec![head as usize]
+            }
+            NIns::EachEnd { it, first, n } => {
+                defs.extend(self.locals(first, n));
+                defs.extend(self.iters_from(it));
+                fall
+            }
             // La VM sigue desde acá: puede leer cualquier cosa.
             NIns::Leave { .. } => {
                 uses.extend(0..self.nvars);
@@ -679,7 +792,9 @@ fn frame_values(f: &Func, st: &[Kind], live: &[bool], skip: impl Fn(usize) -> bo
         let place = f.place_of(v);
         match st[v] {
             Kind::Top => return None,
-            Kind::Undef | Kind::Bot => {}
+            Kind::Bot => {}
+            // Un lugar vacío (un `let` de una vuelta que se soltó, un iterador terminado): la VM
+            // también lo tiene que tener vacío.
             k => out.push((place, k)),
         }
     }
@@ -752,6 +867,12 @@ pub(crate) fn build(
             NIns::Jump { to } => vec![to as usize],
             NIns::JumpIfFalsy { to, .. } => vec![pc + 1, to as usize],
             NIns::IntCmpJump { to, .. } => vec![pc + 2, to as usize],
+            NIns::IsRange { src, to } => match plan.state[pc].as_ref().map(|st| st[src as usize]) {
+                Some(Kind::RangeFn) => Vec::new(),
+                _ => vec![to as usize],
+            },
+            NIns::EachNext { exit, .. } => vec![pc + 1, exit as usize],
+            NIns::EachStep { head, .. } => vec![head as usize],
             _ => Vec::new(),
         };
         for t in targets {
@@ -931,7 +1052,7 @@ pub(crate) fn build(
                     Kind::Nothing => {
                         b.ins().jump(no, &[]);
                     }
-                    Kind::Callee(_) => {
+                    Kind::Callee(_) | Kind::RangeFn => {
                         b.ins().jump(yes, &[]);
                     }
                     _ => return None,
@@ -1021,6 +1142,107 @@ pub(crate) fn build(
             }
             // El tipo estático ya probó que no es una lista ni un mapa.
             NIns::Scalar { .. } => {}
+            NIns::RangeFn { dst } => {
+                let z = b.ins().iconst(I64, 0);
+                set(&mut b, dst, z);
+            }
+            NIns::IsRange { src, to } => {
+                if st[src as usize] != Kind::RangeFn {
+                    let t = *blocks.get(&(to as usize))?;
+                    b.ins().jump(t, &[]);
+                    open = false;
+                }
+            }
+            NIns::EachRange { first, n, it } => {
+                // Un nivel de profundidad, como la llamada al builtin (si pasaría el tope, la VM da
+                // el error); el paso cero también es un error de la VM.
+                let ex = exit_before!(pc);
+                let dp = ctx_load(&mut b, ctx, OFF_DEPTH);
+                let d = b.ins().load(I64, flags, dp, 0);
+                let d1 = b.ins().iadd_imm_s(d, 1);
+                let mx = ctx_load(&mut b, ctx, OFF_MAX_DEPTH);
+                let over = b.ins().icmp(IntCC::UnsignedGreaterThan, d1, mx);
+                let ok = b.create_block();
+                b.ins().brif(over, ex, &[], ok, &[]);
+                b.seal_block(ok);
+                b.switch_to_block(ok);
+                let a: Vec<Value> = (0..n).map(|i| b.use_var(vars[first as usize + i as usize])).collect();
+                let zero = b.ins().iconst(I64, 0);
+                let one = b.ins().iconst(I64, 1);
+                let (lo, hi, step) = match n {
+                    1 => (zero, a[0], one),
+                    2 => (a[0], a[1], one),
+                    _ => {
+                        let z = b.ins().icmp_imm_s(IntCC::Equal, a[2], 0);
+                        let ok2 = b.create_block();
+                        b.ins().brif(z, ex, &[], ok2, &[]);
+                        b.seal_block(ok2);
+                        b.switch_to_block(ok2);
+                        (a[0], a[1], a[2])
+                    }
+                };
+                for i in 0..n as usize {
+                    b.def_var(vars[first as usize + i], zero);
+                }
+                for v in f.iters_from(it) {
+                    b.def_var(vars[v], zero);
+                }
+                for (k, x) in [one, lo, hi, step].into_iter().enumerate() {
+                    b.def_var(vars[f.iter_var(it, k as u8)], x);
+                }
+            }
+            NIns::EachNext { it, slot, exit } => {
+                // `RangeIter::next`: sin siguiente, a `exit`; si `i` quedó afuera, terminó; si no,
+                // la vuelta con `i` y el siguiente con `checked_add` (si desborda, terminó después).
+                let (vv, vn) = (vars[f.iter_var(it, 0)], vars[f.iter_var(it, 1)]);
+                let valid = b.use_var(vv);
+                let i = b.use_var(vn);
+                let hi = b.use_var(vars[f.iter_var(it, 2)]);
+                let step = b.use_var(vars[f.iter_var(it, 3)]);
+                let (go, out) = (*blocks.get(&(pc + 1))?, *blocks.get(&(exit as usize))?);
+                let check = b.create_block();
+                let end = b.create_block();
+                let body = b.create_block();
+                b.ins().brif(valid, check, &[], out, &[]);
+                b.seal_block(check);
+                b.switch_to_block(check);
+                let pos = b.ins().icmp_imm_s(IntCC::SignedGreaterThan, step, 0);
+                let lt = b.ins().icmp(IntCC::SignedLessThan, i, hi);
+                let gt = b.ins().icmp(IntCC::SignedGreaterThan, i, hi);
+                let inside = b.ins().select(pos, lt, gt);
+                b.ins().brif(inside, body, &[], end, &[]);
+                b.seal_block(end);
+                b.switch_to_block(end);
+                let zero = b.ins().iconst(I64, 0);
+                b.def_var(vv, zero);
+                b.ins().jump(out, &[]);
+                b.seal_block(body);
+                b.switch_to_block(body);
+                let (nx, of) = b.ins().sadd_overflow(i, step);
+                let zero = b.ins().iconst(I64, 0);
+                let one = b.ins().iconst(I64, 1);
+                let nv = b.ins().select(of, zero, one);
+                b.def_var(vv, nv);
+                b.def_var(vn, nx);
+                b.def_var(vars[f.nregs + slot as usize], i);
+                b.ins().jump(go, &[]);
+                open = false;
+            }
+            NIns::EachStep { head, first, n } => {
+                let z = b.ins().iconst(I64, 0);
+                for v in f.locals(first, n) {
+                    b.def_var(vars[v], z);
+                }
+                let t = *blocks.get(&(head as usize))?;
+                b.ins().jump(t, &[]);
+                open = false;
+            }
+            NIns::EachEnd { it, first, n } => {
+                let z = b.ins().iconst(I64, 0);
+                for v in f.locals(first, n).chain(f.iters_from(it)) {
+                    b.def_var(vars[v], z);
+                }
+            }
             NIns::Trap { .. } | NIns::Leave { .. } => unreachable!("salida sin trap"),
         }
     }

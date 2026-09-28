@@ -110,8 +110,10 @@ pub(crate) enum Ins {
     /// F4.2: el salto hacia atrás de un `while` cuando hay nivel nativo. Cuenta vueltas (la cuenta
     /// regresiva de `chunk.loops[lp]`) y, caliente, entra al bucle compilado a mitad de camino
     /// (OSR). Si el bucle no se compila o no rinde, vuelve a ser `Jump`.
+    /// F4.2b: también el fin de la vuelta de un `each` sin frame (`EachStepV`: los lugares
+    /// `first..first + n` se sueltan antes); `n = 0` en un `while`.
     #[cfg(feature = "native-tier")]
-    LoopBack { to: u32, lp: u16 },
+    LoopBack { to: u32, lp: u16, first: u16, n: u16 },
     JumpIfFalsy { src: Opnd, to: u32 },
     LetLocal { src: Opnd, slot: u16, dst: Reg },
     /// F3.3b: lo mismo sobre la ventana de locales (el compilador sabe el modo: el despacho de
@@ -770,10 +772,23 @@ impl<'r, 's> Compiler<'r, 's> {
         if crate::native_tier::tier().is_some() {
             let lp = self.nloops;
             self.nloops += 1;
-            self.emit(Ins::LoopBack { to: head, lp });
+            self.emit(Ins::LoopBack { to: head, lp, first: 0, n: 0 });
             return;
         }
         self.emit(Ins::Jump { to: head });
+    }
+
+    /// El fin de la vuelta de un `each` sin frame (F4.2b): `LoopBack` con los lugares que suelta si
+    /// hay nivel nativo; si no, el `EachStepV` de siempre.
+    fn each_back(&mut self, head: u32, first: u16, n: u16) {
+        #[cfg(feature = "native-tier")]
+        if crate::native_tier::tier().is_some() {
+            let lp = self.nloops;
+            self.nloops += 1;
+            self.emit(Ins::LoopBack { to: head, lp, first, n });
+            return;
+        }
+        self.emit(Ins::EachStepV { head, first, n });
     }
 
     fn label(&mut self) -> u32 {
@@ -1191,7 +1206,7 @@ impl<'r, 's> Compiler<'r, 's> {
         self.loops.push(exit);
         self.block(body, want, true);
         self.loops.pop();
-        self.emit(Ins::EachStepV { head, first, n: count });
+        self.each_back(head, first, count);
         self.cur_scope = outer_scope;
         self.bind(exit);
         self.emit(Ins::EachEndV { it, first, n: count });
@@ -2494,16 +2509,23 @@ impl Interpreter {
                     Ok(())
                 }
                 #[cfg(feature = "native-tier")]
-                Ins::LoopBack { to, lp } => {
+                Ins::LoopBack { to, lp, first, n } => {
+                    if n > 0 {
+                        // El fin de la vuelta de un `each`: como `EachStepV`.
+                        let k = self.vm_lbase + first as usize;
+                        for x in &mut self.vm_locals[k..k + n as usize] {
+                            *x = None;
+                        }
+                    }
                     pc = to as usize;
                     if chunk.loops[lp as usize].tick() {
-                        match self.vm_loop_hot(&chunk, &env, base, at, lp) {
+                        match self.vm_loop_hot(&chunk, &env, base, iter_base, at, lp) {
                             native::OsrStep::Stay => {}
                             native::OsrStep::Exit(p) => pc = p,
                             native::OsrStep::Resume { r, pc: back, dst: rdst } => {
                                 // Salió a mitad de una llamada: este frame espera su resultado
                                 // (como en `CallNative`) y la VM sigue en el de más adentro.
-                                let native::Resume { frames, enter, pc: at_pc, top0 } = *r;
+                                let native::Resume { frames, enter, pc: at_pc, top0, iter_base: ib } = *r;
                                 let caller = VmFrame {
                                     chunk: std::mem::replace(&mut chunk, enter.code),
                                     env: std::mem::replace(&mut env, enter.env),
@@ -2511,7 +2533,7 @@ impl Interpreter {
                                     pc: back,
                                     dst: rdst,
                                     depth: std::mem::replace(&mut depth, 0),
-                                    iter_base: std::mem::replace(&mut iter_base, self.vm_iters.len()),
+                                    iter_base: std::mem::replace(&mut iter_base, ib),
                                     lbase: std::mem::replace(&mut self.vm_lbase, enter.lbase),
                                     top: top0,
                                 };
@@ -2712,7 +2734,7 @@ impl Interpreter {
                     Ok(native::NativeStep::Resume(r)) => {
                         // Salió a la VM a mitad de camino: el que llamó, los frames nativos de
                         // afuera esperando a su llamado, y la VM sigue en el de más adentro.
-                        let native::Resume { frames, enter, pc: at_pc, top0 } = *r;
+                        let native::Resume { frames, enter, pc: at_pc, top0, iter_base: ib } = *r;
                         let caller = VmFrame {
                             chunk: std::mem::replace(&mut chunk, enter.code),
                             env: std::mem::replace(&mut env, enter.env),
@@ -2720,7 +2742,7 @@ impl Interpreter {
                             pc,
                             dst,
                             depth: std::mem::replace(&mut depth, 0),
-                            iter_base: std::mem::replace(&mut iter_base, self.vm_iters.len()),
+                            iter_base: std::mem::replace(&mut iter_base, ib),
                             lbase: std::mem::replace(&mut self.vm_lbase, enter.lbase),
                             top: top0,
                         };

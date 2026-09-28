@@ -106,3 +106,16 @@ fn cancellation_stops_a_native_top_level_loop() {
     let after = native_tier::stats();
     assert!(after.osr > before.osr, "el bucle no corría en nativo: {:?} → {:?}", before, after);
 }
+
+/// F4.2b: un `each` sobre `range` del nivel superior pasa a nativo a mitad de camino, con el
+/// iterador perezoso en el código nativo.
+#[test]
+fn a_hot_each_over_range_enters_native_midway() {
+    synsema_jit::install();
+    let before = native_tier::stats();
+    let r = run_source("let total be 0\neach i in range(0, 200000)\n    set total to total + i % 7\nprint(total)\n", "each.syn");
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["599994"]);
+    let after = native_tier::stats();
+    assert!(after.osr > before.osr, "el each no entró al código nativo");
+}
