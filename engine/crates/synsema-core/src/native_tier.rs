@@ -28,13 +28,15 @@ pub enum NConst {
 }
 
 /// Un operando: como `Opnd` de la VM. `Reg` se consume (queda `nothing`), `Copy` no; `Local` es un
-/// lugar de la ventana de locales ligado seguro.
+/// lugar de la ventana de locales ligado seguro; `Global` es una global de un bucle nativo (F4.2:
+/// la `g` de la tabla de globales de la región).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NOpnd {
     Reg(Reg),
     Copy(Reg),
     Const(NConst),
     Local(u16),
+    Global(u16),
 }
 
 /// `IntArith`: `+ - * %`.
@@ -87,18 +89,53 @@ pub enum NIns {
     Call { dst: Reg, func: Reg, args: Reg, n: u16 },
     Give { src: NOpnd },
     End { src: NOpnd },
+    /// F4.2: `set g to …` sobre una global de la región (un hueco sale: la VM la busca afuera).
+    SetGlobal { src: NOpnd, g: u16, dst: Reg },
+    /// F4.2: `let g be …` en el nivel del bucle, sobre un nombre que ya está en el entorno.
+    LetGlobal { src: NOpnd, g: u16, dst: Reg },
+    /// `TryInPlace` sobre una variable: la vía en el lugar sólo aplica a listas y mapas, así que con
+    /// un escalar no hace nada. El tipo estático lo prueba (si no se sabe, no se compila); una
+    /// global vacía sale (la VM la busca afuera).
+    Scalar { src: NOpnd },
+    /// F4.2: acá termina el código nativo y sigue la VM. `planned`: fuera del bucle (la salida, un
+    /// `stop`, un `give`); si no, algo del cuerpo que el nivel nativo todavía no hace.
+    Leave { planned: bool },
     /// La VM todavía no especializó esta instrucción (`Binary`: una rama que nunca corrió): se sale
     /// acá. Lleva lo que la VM va a leer y escribir.
     Trap { dst: Reg, a: NOpnd, b: NOpnd },
 }
 
-/// El cuerpo de una task (con frame en registros: parámetros en `r0..`, F3.7).
+/// Lo que tenía un lugar al compilar un bucle (F4.2): el código nativo se especializa en eso y la
+/// entrada lo vuelve a verificar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NSeen {
+    Int,
+    Bool,
+    Nothing,
+    /// Un lugar de la ventana o una global sin valor.
+    Hole,
+    /// Una lista, un mapa, un texto, …: el nivel nativo no lo representa.
+    Boxed,
+}
+
+/// Un bucle que se compila a mitad de camino (OSR, F4.2): se entra en `head` con el estado de la
+/// VM. `init`: lo que tenía cada variable (registros, ventana, globales, en ese orden).
+#[derive(Clone, Debug)]
+pub struct NOsr {
+    pub head: u32,
+    pub init: Vec<NSeen>,
+}
+
+/// El cuerpo de una task (con frame en registros: parámetros en `r0..`, F3.7), o un bucle (`osr`).
 #[derive(Clone, Debug)]
 pub struct NFunc {
     pub code: Vec<NIns>,
     pub nregs: u16,
     pub nlocals: u16,
     pub nparams: u16,
+    /// Las globales de un bucle (0 en una task).
+    pub nglobals: u16,
+    pub osr: Option<NOsr>,
 }
 
 /// Lo que se compila junto: la task caliente (`funcs[0]`) y las que llama.
@@ -122,6 +159,7 @@ pub enum NVal {
 pub enum Place {
     Reg(Reg),
     Local(u16),
+    Global(u16),
 }
 
 /// Una llamada en curso: el frame espera su resultado en `dst`; la ventana del llamado empieza en
@@ -143,6 +181,8 @@ pub struct NFrame {
     pub values: Vec<(Place, NVal)>,
     /// Todos menos el de más adentro esperan a su llamado.
     pub call: Option<NCall>,
+    /// Una salida prevista (el fin de un bucle nativo), no una desoptimización.
+    pub planned: bool,
 }
 
 /// Cómo terminó una llamada nativa.
@@ -163,8 +203,14 @@ pub struct NativeCx<'a> {
 
 /// Una unidad ya compilada (de este hilo).
 pub trait NativeCode {
-    /// Corre `funcs[0]` con estos argumentos (enteros: la entrada lo verifica).
+    /// Corre `funcs[0]` con estos argumentos (enteros: la entrada lo verifica). En un bucle (F4.2),
+    /// los valores de `inputs` en orden.
     fn call(&self, cx: &mut NativeCx<'_>, args: &[i64]) -> NOutcome;
+    /// En un bucle: los lugares que el código nativo lee o escribe, con lo que tienen que tener al
+    /// entrar (la guarda). Vacío en una task.
+    fn inputs(&self) -> &[(Place, NSeen)] {
+        &[]
+    }
 }
 
 /// El nivel nativo instalado.
@@ -184,7 +230,7 @@ pub(crate) fn tier() -> Option<&'static dyn NativeTier> {
     TIER.get().copied()
 }
 
-/// Cuántas llamadas de la VM a una task antes de compilarla.
+/// Cuántas llamadas de la VM a una task (o vueltas de un bucle) antes de compilarla.
 const HOT_CALLS: u32 = 1000;
 static THRESHOLD: AtomicU32 = AtomicU32::new(HOT_CALLS);
 
@@ -210,11 +256,14 @@ pub struct NativeStats {
     pub entries: u64,
     /// Salidas a la VM a mitad de camino.
     pub deopts: u64,
+    /// Entradas a un bucle a mitad de camino (OSR, F4.2).
+    pub osr: u64,
 }
 
 static UNITS: AtomicU64 = AtomicU64::new(0);
 static ENTRIES: AtomicU64 = AtomicU64::new(0);
 static DEOPTS: AtomicU64 = AtomicU64::new(0);
+static OSR: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn count_unit() {
     UNITS.fetch_add(1, Ordering::Relaxed);
@@ -225,8 +274,16 @@ pub(crate) fn count_entry() {
 pub(crate) fn count_deopt() {
     DEOPTS.fetch_add(1, Ordering::Relaxed);
 }
+pub(crate) fn count_osr() {
+    OSR.fetch_add(1, Ordering::Relaxed);
+}
 
 #[doc(hidden)]
 pub fn stats() -> NativeStats {
-    NativeStats { units: UNITS.load(Ordering::Relaxed), entries: ENTRIES.load(Ordering::Relaxed), deopts: DEOPTS.load(Ordering::Relaxed) }
+    NativeStats {
+        units: UNITS.load(Ordering::Relaxed),
+        entries: ENTRIES.load(Ordering::Relaxed),
+        deopts: DEOPTS.load(Ordering::Relaxed),
+        osr: OSR.load(Ordering::Relaxed),
+    }
 }

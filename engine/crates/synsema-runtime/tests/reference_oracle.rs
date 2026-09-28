@@ -171,6 +171,9 @@ struct Tally {
     native_entries: u64,
     native_deopts: u64,
     native_programs: u64,
+    /// F4.2: entradas a bucles a mitad de camino (OSR) y programas donde pasó.
+    native_osr: u64,
+    osr_programs: u64,
 }
 
 #[test]
@@ -217,6 +220,11 @@ fn shortcuts_match_the_reference_interpreter() {
                         t.native_deopts += n["deopts"].as_u64().unwrap_or(0);
                         if n["entries"].as_u64().unwrap_or(0) > 0 {
                             t.native_programs += 1;
+                        }
+                        let osr = n["osr"].as_u64().unwrap_or(0);
+                        t.native_osr += osr;
+                        if osr > 0 {
+                            t.osr_programs += 1;
                         }
                     }
                 }
@@ -268,11 +276,12 @@ fn shortcuts_match_the_reference_interpreter() {
         t.mismatches.len()
     );
     eprintln!(
-        "nativo (ansioso): {} programas entraron, {} unidades, {} entradas, {} salidas a la VM",
-        t.native_programs, t.native_units, t.native_entries, t.native_deopts
+        "nativo (ansioso): {} programas entraron, {} unidades, {} entradas, {} salidas a la VM; bucles (OSR): {} entradas en {} programas",
+        t.native_programs, t.native_units, t.native_entries, t.native_deopts, t.native_osr, t.osr_programs
     );
     // Que el "0 diferencias" del nivel nativo sea de código nativo de verdad.
     assert!(t.native_programs >= 5 && t.native_deopts > 0, "el nivel nativo casi no corrió en el oráculo: {} programas", t.native_programs);
+    assert!(t.osr_programs >= 5, "los bucles nativos (OSR) casi no corrieron en el oráculo: {} programas", t.osr_programs);
     assert!(
         t.resolver_violations.is_empty(),
         "el resolver no coincide con el tree-walker en {} acceso(s):

@@ -74,7 +74,7 @@ fn compile_in(jit: &mut Jit, unit: &NUnit) -> Option<abi::Compiled> {
         // La convención de la plataforma (`make_signature`): la misma con la que se declara, se
         // compila y se llama.
         let mut sig = m.make_signature();
-        lower::signature(&mut sig, f.nparams as usize);
+        lower::signature(&mut sig, plans[i].nargs(f));
         ids.push(m.declare_function(&format!("synsema_f{uid}_{i}"), Linkage::Local, &sig).ok()?);
         sigs.push(sig);
     }
@@ -102,17 +102,20 @@ fn compile_in(jit: &mut Jit, unit: &NUnit) -> Option<abi::Compiled> {
     ctx.clear();
     ctx.func.signature = esig;
     let f0 = m.declare_func_in_func(ids[0], &mut ctx.func);
-    lower::build_entry(&mut ctx.func, &mut fbctx, f0, unit.funcs[0].nparams as usize, m.target_config());
+    let nargs = plans[0].nargs(&unit.funcs[0]);
+    lower::build_entry(&mut ctx.func, &mut fbctx, f0, nargs, m.target_config());
     if !lower::check_memory(&ctx.func, true) {
         return None;
     }
     m.define_function(entry, &mut ctx).ok()?;
     m.finalize_definitions().ok()?;
     jit.bytes += bytes;
+    let inputs = std::mem::take(&mut plans[0].inputs);
     Some(abi::Compiled {
         entry: m.get_finalized_function(entry),
-        nparams: unit.funcs[0].nparams as usize,
+        nparams: nargs,
         ret: plans[0].ret,
+        inputs,
         points: plans.into_iter().map(|p| p.points).collect(),
     })
 }

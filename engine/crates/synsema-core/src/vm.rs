@@ -107,6 +107,11 @@ pub(crate) enum Ins {
     Unary { dst: Reg, op: UnOp, a: Opnd },
     ToBool { dst: Reg, src: Opnd },
     Jump { to: u32 },
+    /// F4.2: el salto hacia atrás de un `while` cuando hay nivel nativo. Cuenta vueltas (la cuenta
+    /// regresiva de `chunk.loops[lp]`) y, caliente, entra al bucle compilado a mitad de camino
+    /// (OSR). Si el bucle no se compila o no rinde, vuelve a ser `Jump`.
+    #[cfg(feature = "native-tier")]
+    LoopBack { to: u32, lp: u16 },
     JumpIfFalsy { src: Opnd, to: u32 },
     LetLocal { src: Opnd, slot: u16, dst: Reg },
     /// F3.3b: lo mismo sobre la ventana de locales (el compilador sabe el modo: el despacho de
@@ -266,6 +271,9 @@ pub(crate) struct Chunk {
     /// Reservado (calor/OSR): dónde empieza cada bucle.
     #[allow(dead_code)]
     loop_heads: Vec<u32>,
+    /// F4.2: el estado de cada `LoopBack` (cuenta de vueltas, código nativo).
+    #[cfg(feature = "native-tier")]
+    loops: Box<[native::LoopState]>,
 }
 
 /// Un scope que vive en la ventana de locales: su layout (el del resolver) y dónde empieza.
@@ -546,6 +554,9 @@ struct Compiler<'r, 's> {
     loops: Vec<u32>,
     feedback: u16,
     loop_heads: Vec<u32>,
+    /// Cuántos `LoopBack` emitió (F4.2).
+    #[cfg_attr(not(feature = "native-tier"), allow(dead_code))]
+    nloops: u16,
     cur_loc: u32,
     ics: u32,
     ic_hops: Vec<u32>,
@@ -597,6 +608,7 @@ impl<'r, 's> Compiler<'r, 's> {
             loops: Vec::new(),
             feedback: 0,
             loop_heads: Vec::new(),
+            nloops: 0,
             cur_loc: 0,
             ics: 0,
             ic_hops: Vec::new(),
@@ -749,6 +761,19 @@ impl<'r, 's> Compiler<'r, 's> {
         if self.pending > 0 {
             self.emit(Ins::Nop);
         }
+    }
+
+    /// El salto hacia atrás de un `while`: `LoopBack` si hay nivel nativo (F4.2), si no el `Jump`
+    /// de siempre (sin nivel nativo el despacho no paga nada por el OSR).
+    fn loop_back(&mut self, head: u32) {
+        #[cfg(feature = "native-tier")]
+        if crate::native_tier::tier().is_some() {
+            let lp = self.nloops;
+            self.nloops += 1;
+            self.emit(Ins::LoopBack { to: head, lp });
+            return;
+        }
+        self.emit(Ins::Jump { to: head });
     }
 
     fn label(&mut self) -> u32 {
@@ -997,7 +1022,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 self.loops.push(exit);
                 self.block(body, want, true);
                 self.loops.pop();
-                self.emit(Ins::Jump { to: head });
+                self.loop_back(head);
                 self.bind(exit);
                 self.emit(Ins::Unwind { depth: self.depth });
             }
@@ -1683,6 +1708,11 @@ impl<'r, 's> Compiler<'r, 's> {
                     leader[target(&self.labels, to)] = true;
                     leader[i + 1] = true;
                 }
+                #[cfg(feature = "native-tier")]
+                Ins::LoopBack { to, .. } => {
+                    leader[target(&self.labels, to)] = true;
+                    leader[i + 1] = true;
+                }
                 // F3.5: no corta el bloque (lo común es que no aplique y siga en línea); cuando llama
                 // a la referencia descuenta antes lo que el bloque sumó de más (ver el despacho).
                 Ins::TryInPlace { done, .. } => {
@@ -1771,6 +1801,8 @@ impl<'r, 's> Compiler<'r, 's> {
         for ins in code.iter_mut() {
             match ins {
                 Ins::Jump { to } | Ins::JumpIfFalsy { to, .. } => *to = map(*to, &self.labels),
+                #[cfg(feature = "native-tier")]
+                Ins::LoopBack { to, .. } => *to = map(*to, &self.labels),
                 Ins::TryInPlace { done, .. } => *done = map(*done, &self.labels),
                 Ins::EachNext { exit, .. } => *exit = map(*exit, &self.labels),
                 Ins::MatchArm { fail, .. } => *fail = map(*fail, &self.labels),
@@ -1816,6 +1848,8 @@ impl<'r, 's> Compiler<'r, 's> {
             hops: self.hops,
             deopts: (0..=self.feedback as usize).map(|_| Cell::new(0)).collect(),
             loop_heads,
+            #[cfg(feature = "native-tier")]
+            loops: (0..self.nloops).map(|_| native::LoopState::default()).collect(),
         })
     }
 }
@@ -2457,6 +2491,37 @@ impl Interpreter {
                 Ins::ToBool { dst, src } => self.opnd(&chunk, &env, base, src, at).map(|v| self.put(base, dst, syn_bool(v.is_truthy()))),
                 Ins::Jump { to } => {
                     pc = to as usize;
+                    Ok(())
+                }
+                #[cfg(feature = "native-tier")]
+                Ins::LoopBack { to, lp } => {
+                    pc = to as usize;
+                    if chunk.loops[lp as usize].tick() {
+                        match self.vm_loop_hot(&chunk, &env, base, at, lp) {
+                            native::OsrStep::Stay => {}
+                            native::OsrStep::Exit(p) => pc = p,
+                            native::OsrStep::Resume { r, pc: back, dst: rdst } => {
+                                // Salió a mitad de una llamada: este frame espera su resultado
+                                // (como en `CallNative`) y la VM sigue en el de más adentro.
+                                let native::Resume { frames, enter, pc: at_pc, top0 } = *r;
+                                let caller = VmFrame {
+                                    chunk: std::mem::replace(&mut chunk, enter.code),
+                                    env: std::mem::replace(&mut env, enter.env),
+                                    base,
+                                    pc: back,
+                                    dst: rdst,
+                                    depth: std::mem::replace(&mut depth, 0),
+                                    iter_base: std::mem::replace(&mut iter_base, self.vm_iters.len()),
+                                    lbase: std::mem::replace(&mut self.vm_lbase, enter.lbase),
+                                    top: top0,
+                                };
+                                self.vm_frames.push(caller);
+                                self.vm_frames.extend(frames);
+                                base = enter.base;
+                                pc = at_pc;
+                            }
+                        }
+                    }
                     Ok(())
                 }
                 Ins::JumpIfFalsy { src, to } => self.opnd(&chunk, &env, base, src, at).map(|v| {

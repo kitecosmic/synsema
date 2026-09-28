@@ -13,7 +13,7 @@
 use std::mem::offset_of;
 use std::sync::atomic::AtomicBool;
 
-use synsema_core::native_tier::{NFrame, NOutcome, NVal, NativeCode, NativeCx};
+use synsema_core::native_tier::{NFrame, NOutcome, NSeen, NVal, NativeCode, NativeCx, Place};
 
 use crate::lower::{Kind, Point};
 
@@ -67,6 +67,8 @@ pub(crate) struct Compiled {
     pub(crate) entry: *const u8,
     pub(crate) nparams: usize,
     pub(crate) ret: Kind,
+    /// Un bucle (F4.2): los lugares que recibe la entrada, en orden, y lo que tienen que tener.
+    pub(crate) inputs: Vec<(Place, NSeen)>,
     /// Las salidas de cada función.
     pub(crate) points: Vec<Vec<Point>>,
 }
@@ -124,9 +126,13 @@ impl NativeCode for Compiled {
                         (place, nval(k, bits))
                     })
                     .collect();
-                NFrame { func: raw.func, pc: p.pc, values, call: p.call }
+                NFrame { func: raw.func, pc: p.pc, values, call: p.call, planned: p.planned }
             })
             .collect();
         NOutcome::Deopt(frames)
+    }
+
+    fn inputs(&self) -> &[(Place, NSeen)] {
+        &self.inputs
     }
 }

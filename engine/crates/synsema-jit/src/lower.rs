@@ -21,7 +21,7 @@ use cranelift_codegen::isa::TargetFrontendConfig;
 use cranelift_codegen::ir::types::I64;
 use cranelift_codegen::ir::{self, AbiParam, Block, InstBuilder, MemFlagsData, Opcode, StackSlotData, StackSlotKind, Value, ValueDef};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-use synsema_core::native_tier::{NArith, NCall, NCmp, NConst, NFunc, NIns, NOpnd, NUnit, Place, Reg, DISCARD};
+use synsema_core::native_tier::{NArith, NCall, NCmp, NConst, NFunc, NIns, NOpnd, NSeen, NUnit, Place, Reg, DISCARD};
 
 use crate::abi::{OFF_CANCEL, OFF_DEPTH, OFF_MAX_DEPTH, OFF_STATUS, OFF_STEPS};
 
@@ -57,6 +57,17 @@ fn const_kind(c: NConst) -> Kind {
     }
 }
 
+/// Lo que tenía un lugar al compilar un bucle (F4.2).
+fn seen_kind(s: NSeen) -> Kind {
+    match s {
+        NSeen::Int => Kind::Int,
+        NSeen::Bool => Kind::Bool,
+        NSeen::Nothing => Kind::Nothing,
+        NSeen::Hole => Kind::Undef,
+        NSeen::Boxed => Kind::Top,
+    }
+}
+
 fn const_bits(c: NConst) -> i64 {
     match c {
         NConst::Int(x) => x,
@@ -72,6 +83,8 @@ pub(crate) struct Point {
     pub pc: u32,
     pub values: Vec<(Place, Kind)>,
     pub call: Option<NCall>,
+    /// El fin de un bucle nativo (F4.2), no una desoptimización.
+    pub planned: bool,
 }
 
 impl Point {
@@ -91,6 +104,20 @@ pub(crate) struct Plan {
     trap: Vec<bool>,
     pub ret: Kind,
     pub points: Vec<Point>,
+    /// Un bucle (F4.2): los lugares que el código toca, en el orden de los parámetros de su
+    /// función, con lo que tienen que tener al entrar.
+    pub inputs: Vec<(Place, NSeen)>,
+}
+
+impl Plan {
+    /// Cuántos parámetros (además del contexto) tiene la función.
+    pub fn nargs(&self, f: &NFunc) -> usize {
+        if f.osr.is_some() {
+            self.inputs.len()
+        } else {
+            f.nparams as usize
+        }
+    }
 }
 
 /// Qué sigue a una instrucción en el código nativo.
@@ -110,11 +137,46 @@ struct Func<'u> {
 }
 
 impl<'u> Func<'u> {
+    fn new(f: &'u NFunc, unit: &'u NUnit) -> Self {
+        Func { f, unit, nregs: f.nregs as usize, nvars: f.nregs as usize + f.nlocals as usize + f.nglobals as usize }
+    }
+
+    fn global_var(&self, g: u16) -> usize {
+        self.nregs + self.f.nlocals as usize + g as usize
+    }
+
     fn var_of(&self, p: Place) -> usize {
         match p {
             Place::Reg(r) => r as usize,
             Place::Local(k) => self.nregs + k as usize,
+            Place::Global(g) => self.global_var(g),
         }
+    }
+
+    fn place_of(&self, v: usize) -> Place {
+        let nl = self.f.nlocals as usize;
+        if v < self.nregs {
+            Place::Reg(v as Reg)
+        } else if v < self.nregs + nl {
+            Place::Local((v - self.nregs) as u16)
+        } else {
+            Place::Global((v - self.nregs - nl) as u16)
+        }
+    }
+
+    /// Un bucle: los lugares que lee o escribe (lo demás pasa sin tocarse).
+    fn touched(&self) -> Vec<bool> {
+        let mut t = vec![false; self.nvars];
+        for pc in 0..self.f.code.len() {
+            if matches!(self.f.code[pc], NIns::Leave { .. }) {
+                continue;
+            }
+            let (uses, defs, _) = self.uses_defs(pc);
+            for v in uses.into_iter().chain(defs) {
+                t[v] = true;
+            }
+        }
+        t
     }
 
     fn opnd_kind(&self, st: &[Kind], o: NOpnd) -> Kind {
@@ -122,6 +184,7 @@ impl<'u> Func<'u> {
             NOpnd::Reg(r) | NOpnd::Copy(r) => st[r as usize],
             NOpnd::Const(c) => const_kind(c),
             NOpnd::Local(k) => st[self.nregs + k as usize],
+            NOpnd::Global(g) => st[self.global_var(g)],
         }
     }
 
@@ -130,6 +193,7 @@ impl<'u> Func<'u> {
         match o {
             NOpnd::Reg(r) | NOpnd::Copy(r) => Some(r as usize),
             NOpnd::Local(k) => Some(self.nregs + k as usize),
+            NOpnd::Global(g) => Some(self.global_var(g)),
             NOpnd::Const(_) => None,
         }
     }
@@ -284,7 +348,36 @@ impl<'u> Func<'u> {
                 }
                 Next::Stop
             }
-            NIns::Trap { .. } => {
+            NIns::SetGlobal { src, g, dst } | NIns::LetGlobal { src, g, dst } => {
+                let v = self.global_var(g);
+                if matches!(self.f.code[pc], NIns::SetGlobal { .. }) {
+                    // `set` a una global vacía: la VM la busca afuera.
+                    read(st[v], trap)?;
+                }
+                let k = read(self.opnd_kind(st, src), trap)?;
+                if *trap {
+                    return Ok(Next::Stop);
+                }
+                if let Some(r) = Self::consumed(src) {
+                    st[r] = Kind::Nothing;
+                }
+                st[v] = k;
+                set(st, dst, k);
+                Next::Fall
+            }
+            NIns::Scalar { src } => {
+                match self.opnd_kind(st, src) {
+                    Kind::Top => return Err(()),
+                    // Una global vacía: la VM la busca afuera (y podría ser una lista).
+                    Kind::Undef if matches!(src, NOpnd::Global(_)) => {
+                        *trap = true;
+                        return Ok(Next::Stop);
+                    }
+                    _ => {}
+                }
+                Next::Fall
+            }
+            NIns::Trap { .. } | NIns::Leave { .. } => {
                 *trap = true;
                 Next::Stop
             }
@@ -296,17 +389,29 @@ impl<'u> Func<'u> {
     fn kinds(&self, rets: &[Kind]) -> Result<(Vec<Option<Vec<Kind>>>, Vec<bool>, Kind), ()> {
         let n = self.f.code.len();
         let mut state: Vec<Option<Vec<Kind>>> = vec![None; n];
-        let mut init = vec![Kind::Nothing; self.nvars];
-        for k in init.iter_mut().take(self.f.nparams as usize) {
-            *k = Kind::Int;
-        }
-        for k in init.iter_mut().skip(self.nregs) {
-            *k = Kind::Undef;
-        }
-        state[0] = Some(init);
+        let start = match &self.f.osr {
+            // Un bucle: lo que tenía cada lugar que toca; lo que no toca, sin información (pasa).
+            Some(o) => {
+                let touched = self.touched();
+                let init = (0..self.nvars).map(|v| if touched[v] { seen_kind(o.init[v]) } else { Kind::Bot }).collect();
+                state[o.head as usize] = Some(init);
+                o.head as usize
+            }
+            None => {
+                let mut init = vec![Kind::Nothing; self.nvars];
+                for k in init.iter_mut().take(self.f.nparams as usize) {
+                    *k = Kind::Int;
+                }
+                for k in init.iter_mut().skip(self.nregs) {
+                    *k = Kind::Undef;
+                }
+                state[0] = Some(init);
+                0
+            }
+        };
         let mut trap = vec![false; n];
         let mut ret = Kind::Bot;
-        let mut work = vec![0usize];
+        let mut work = vec![start];
         while let Some(pc) = work.pop() {
             let mut st = state[pc].clone().expect("estado");
             let mut t = false;
@@ -441,6 +546,24 @@ impl<'u> Func<'u> {
                 uses.extend(self.opnd_var(src));
                 Vec::new()
             }
+            NIns::SetGlobal { src, g, dst: d } | NIns::LetGlobal { src, g, dst: d } => {
+                if matches!(self.f.code[pc], NIns::SetGlobal { .. }) {
+                    uses.push(self.global_var(g));
+                }
+                op(&mut uses, &mut defs, src);
+                defs.push(self.global_var(g));
+                dst(&mut defs, d);
+                fall
+            }
+            NIns::Scalar { src } => {
+                uses.extend(self.opnd_var(src));
+                fall
+            }
+            // La VM sigue desde acá: puede leer cualquier cosa.
+            NIns::Leave { .. } => {
+                uses.extend(0..self.nvars);
+                Vec::new()
+            }
         };
         (uses, defs, succ)
     }
@@ -479,16 +602,21 @@ impl<'u> Func<'u> {
     }
 }
 
+/// Cuántos lugares puede tocar un bucle nativo (son los parámetros de su función).
+const MAX_INPUTS: usize = 96;
+
 /// Los análisis de toda la unidad; `None` si no se puede compilar.
 pub(crate) fn plan(unit: &NUnit) -> Option<Vec<Plan>> {
-    let funcs: Vec<Func> = unit
-        .funcs
-        .iter()
-        .map(|f| Func { f, unit, nregs: f.nregs as usize, nvars: f.nregs as usize + f.nlocals as usize })
-        .collect();
-    for f in &funcs {
+    let funcs: Vec<Func> = unit.funcs.iter().map(|f| Func::new(f, unit)).collect();
+    for (i, f) in funcs.iter().enumerate() {
         if f.f.code.is_empty() || f.f.nparams as usize > f.nregs || f.f.nparams > 8 {
             return None;
+        }
+        // Sólo la función 0 puede ser un bucle (las demás son tasks que se llaman).
+        if let Some(o) = &f.f.osr {
+            if i != 0 || o.init.len() != f.nvars || o.head as usize >= f.f.code.len() {
+                return None;
+            }
         }
     }
     // Punto fijo de lo que devuelve cada función (las llamadas usan el de su destino).
@@ -513,7 +641,25 @@ pub(crate) fn plan(unit: &NUnit) -> Option<Vec<Plan>> {
     let mut plans = Vec::with_capacity(funcs.len());
     for (f, (state, trap, ret)) in funcs.iter().zip(results) {
         let live = f.liveness();
-        plans.push(Plan { state, live, trap, ret, points: Vec::new() });
+        let mut inputs = Vec::new();
+        if let Some(o) = &f.f.osr {
+            let touched = f.touched();
+            for v in 0..f.nvars {
+                if !touched[v] {
+                    continue;
+                }
+                // Nunca con un valor con caja en un lugar que toca el código nativo: sus cuentas de
+                // referencias (y con ellas el copy-on-write) quedan como en la VM.
+                if o.init[v] == NSeen::Boxed {
+                    return None;
+                }
+                inputs.push((f.place_of(v), o.init[v]));
+            }
+            if inputs.len() > MAX_INPUTS {
+                return None;
+            }
+        }
+        plans.push(Plan { state, live, trap, ret, points: Vec::new(), inputs });
     }
     Some(plans)
 }
@@ -530,7 +676,7 @@ fn frame_values(f: &Func, st: &[Kind], live: &[bool], skip: impl Fn(usize) -> bo
         if !live[v] || skip(v) {
             continue;
         }
-        let place = if v < f.nregs { Place::Reg(v as Reg) } else { Place::Local((v - f.nregs) as u16) };
+        let place = f.place_of(v);
         match st[v] {
             Kind::Top => return None,
             Kind::Undef | Kind::Bot => {}
@@ -563,9 +709,9 @@ pub(crate) fn build(
     deopt: ir::FuncRef,
     config: TargetFrontendConfig,
 ) -> Option<()> {
-    let f = Func { f: &unit.funcs[i], unit, nregs: unit.funcs[i].nregs as usize, nvars: unit.funcs[i].nregs as usize + unit.funcs[i].nlocals as usize };
+    let f = Func::new(&unit.funcs[i], unit);
     let n = f.f.code.len();
-    let np = f.f.nparams as usize;
+    let np = plans[i].nargs(f.f);
 
     let mut b = FunctionBuilder::new(func, fbctx);
     let vars: Vec<Variable> = (0..f.nvars).map(|_| b.declare_var(I64)).collect();
@@ -575,14 +721,29 @@ pub(crate) fn build(
     let ctx = b.block_params(entry)[0];
     let params: Vec<Value> = b.block_params(entry)[1..=np].to_vec();
     let zero = b.ins().iconst(I64, 0);
+    // Un bucle: cada parámetro es un lugar que toca (`inputs`); una task: sus parámetros son `r0..`.
+    let mut arg_of: Vec<Option<usize>> = vec![None; f.nvars];
+    if f.f.osr.is_some() {
+        for (k, (place, _)) in plans[i].inputs.iter().enumerate() {
+            arg_of[f.var_of(*place)] = Some(k);
+        }
+    } else {
+        for (v, a) in arg_of.iter_mut().enumerate().take(np) {
+            *a = Some(v);
+        }
+    }
     for (v, var) in vars.iter().enumerate() {
-        let x = if v < np { params[v] } else { zero };
+        let x = arg_of[v].map_or(zero, |k| params[k]);
         b.def_var(*var, x);
     }
 
-    // Un bloque por destino de salto alcanzable.
+    // Un bloque por destino de salto alcanzable (y, en un bucle, su cabecera).
     let mut blocks: HashMap<usize, Block> = HashMap::new();
     let plan = &plans[i];
+    if let Some(o) = &f.f.osr {
+        let bl = b.create_block();
+        blocks.insert(o.head as usize, bl);
+    }
     for pc in 0..n {
         if plan.state[pc].is_none() || plan.trap[pc] {
             continue;
@@ -615,7 +776,8 @@ pub(crate) fn build(
                 None => {
                     let st = plan.state[pc].as_ref()?;
                     let values = frame_values(&f, st, &plan.live[pc], |_| false)?;
-                    points.push(Point { pc: pc as u32, values, call: None });
+                    let planned = matches!(f.f.code[pc], NIns::Leave { planned: true });
+                    points.push(Point { pc: pc as u32, values, call: None, planned });
                     let bl = b.create_block();
                     b.set_cold_block(bl);
                     exits.push(Exit { block: bl, point: (points.len() - 1) as u32 });
@@ -628,6 +790,12 @@ pub(crate) fn build(
 
     let flags = MemFlagsData::trusted();
     let mut open = true;
+    // Un bucle se entra por su cabecera (el estado de la VM ya está en las variables).
+    if let Some(o) = &f.f.osr {
+        let h = blocks[&(o.head as usize)];
+        b.ins().jump(h, &[]);
+        open = false;
+    }
     for pc in 0..n {
         if let Some(bl) = blocks.get(&pc) {
             if open {
@@ -655,6 +823,7 @@ pub(crate) fn build(
                 NOpnd::Reg(r) | NOpnd::Copy(r) => b.use_var(vars[r as usize]),
                 NOpnd::Const(c) => b.ins().iconst(I64, const_bits(c)),
                 NOpnd::Local(k) => b.use_var(vars[f.nregs + k as usize]),
+                NOpnd::Global(g) => b.use_var(vars[f.global_var(g)]),
             }
         };
         let consume = |b: &mut FunctionBuilder, o: NOpnd| {
@@ -819,7 +988,7 @@ pub(crate) fn build(
                         let mut after = st.clone();
                         after[freg as usize] = Kind::Nothing;
                         let values = frame_values(&f, &after, &live_after, |v| v == dst as usize || window.contains(&v) || v == freg as usize)?;
-                        points.push(Point { pc: pc as u32 + 1, values, call: Some(NCall { dst, args, n: na }) });
+                        points.push(Point { pc: pc as u32 + 1, values, call: Some(NCall { dst, args, n: na }), planned: false });
                         let bl = b.create_block();
                         b.set_cold_block(bl);
                         exits.push(Exit { block: bl, point: (points.len() - 1) as u32 });
@@ -844,7 +1013,15 @@ pub(crate) fn build(
                 b.ins().return_(&[x]);
                 open = false;
             }
-            NIns::Trap { .. } => unreachable!("Trap sin trap"),
+            NIns::SetGlobal { src, g, dst } | NIns::LetGlobal { src, g, dst } => {
+                let x = val(&mut b, src);
+                consume(&mut b, src);
+                b.def_var(vars[f.global_var(g)], x);
+                set(&mut b, dst, x);
+            }
+            // El tipo estático ya probó que no es una lista ni un mapa.
+            NIns::Scalar { .. } => {}
+            NIns::Trap { .. } | NIns::Leave { .. } => unreachable!("salida sin trap"),
         }
     }
     if open {

@@ -57,7 +57,7 @@ fn main() {
     });
     if jit_eager {
         let s = synsema_core::native_tier::stats();
-        report["native"] = serde_json::json!({ "units": s.units, "entries": s.entries, "deopts": s.deopts });
+        report["native"] = serde_json::json!({ "units": s.units, "entries": s.entries, "deopts": s.deopts, "osr": s.osr });
     }
     if resolver_check {
         let c = synsema_core::resolve::check::take_report();

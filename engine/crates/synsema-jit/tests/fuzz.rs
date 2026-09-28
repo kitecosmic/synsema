@@ -127,6 +127,38 @@ impl Gen {
         )
     }
 
+    /// F4.2: un bucle del nivel superior sobre globales (pasa a nativo a mitad de camino). Lo que
+    /// asigna va acotado (`% 1000003`) para que no crezca sin fin; a veces llama a una task, a
+    /// veces corta con `stop` y a veces declara con `let` en el nivel del bucle.
+    fn top_loop(&mut self, call: (&str, usize)) -> String {
+        let vars: Vec<String> = ["g0", "g1", "lc"].iter().map(|v| v.to_string()).collect();
+        let bound = 2 + self.rng.below(40);
+        let mut s = format!("let g0 be {}\nlet g1 be {}\nlet lc be 0\nlet gl be 0\n", self.atom(&[]), self.atom(&[]));
+        s += &format!("while lc < {}\n", bound);
+        let e = self.expr(&vars, 2);
+        s += &format!("    set g0 to ({}) % 1000003\n", e);
+        if self.rng.chance(50) {
+            let c = self.cond(&vars);
+            let e = self.expr(&vars, 2);
+            s += &format!("    when {}\n        set g1 to ({}) % 1000003\n", c, e);
+        }
+        if self.rng.chance(40) {
+            let args: Vec<String> = (0..call.1).map(|_| self.expr(&vars, 1)).collect();
+            s += &format!("    set g1 to (g1 + {}({})) % 1000003\n", call.0, args.join(", "));
+        }
+        if self.rng.chance(30) {
+            let e = self.expr(&vars, 1);
+            s += &format!("    let gl be {}\n", e);
+        }
+        if self.rng.chance(25) {
+            let c = self.cond(&vars);
+            s += &format!("    when {}\n        stop\n", c);
+        }
+        s += "    set lc to lc + 1\n";
+        s += "print([g0, g1, lc, gl])\n";
+        s
+    }
+
     fn program(&mut self) -> String {
         let mut s = String::new();
         let n0 = 1 + self.rng.below(3);
@@ -149,7 +181,9 @@ impl Gen {
         s += &format!("    let v be f1({})\n", a1.join(", "));
         s += "    let w be r0(p[3], p[0])\n";
         s += "    set out to append(out, [u, v, w])\n";
-        s += "print(out)\nprint(steps())\n";
+        s += "print(out)\n";
+        s += &self.top_loop(("f0", n0));
+        s += "print(steps())\n";
         s
     }
 }
@@ -183,16 +217,18 @@ fn check(seed: u64, count: usize) {
     }
     let after = native_tier::stats();
     eprintln!(
-        "fuzz: {} programas ({} terminan en error), {} unidades, {} entradas, {} salidas a la VM",
+        "fuzz: {} programas ({} terminan en error), {} unidades, {} entradas, {} salidas a la VM, {} entradas a bucles",
         count,
         errors,
         after.units - before.units,
         after.entries - before.entries,
-        after.deopts - before.deopts
+        after.deopts - before.deopts,
+        after.osr - before.osr
     );
     assert!(failures.is_empty(), "{} programa(s) dan distinto en nativo:\n\n{}", failures.len(), failures.join("\n\n"));
     assert!(after.entries - before.entries > count as u64, "el nivel nativo casi no corrió: {:?} → {:?}", before, after);
     assert!(after.deopts > before.deopts, "ningún programa salió a la VM a mitad de camino");
+    assert!(after.osr - before.osr > count as u64 / 2, "los bucles del nivel superior casi no entraron al código nativo: {:?} → {:?}", before, after);
 }
 
 #[test]

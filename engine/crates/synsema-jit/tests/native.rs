@@ -62,3 +62,47 @@ fn cancellation_stops_a_native_loop() {
     let after = native_tier::stats();
     assert!(after.entries > before.entries && after.deopts > before.deopts, "el bucle no corría en nativo: {:?} → {:?}", before, after);
 }
+
+/// F4.2: un bucle del nivel superior (globales) pasa a nativo a mitad de camino (OSR) y da lo
+/// mismo; las globales vuelven a su lugar al salir.
+#[test]
+fn a_hot_top_level_loop_enters_native_midway() {
+    synsema_jit::install();
+    let before = native_tier::stats();
+    let r = run_source("let total be 0\nlet i be 0\nwhile i < 200000\n    set total to total + i % 7\n    set i to i + 1\nprint(total)\nprint(i)\n", "loop.syn");
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["599994", "200000"]);
+    let after = native_tier::stats();
+    assert!(after.osr > before.osr, "el bucle no entró al código nativo");
+}
+
+/// F4.2: un `while true` del nivel superior corriendo en nativo (OSR): la cancelación lo corta con
+/// el error de la VM (si no lo cortara, el hilo no terminaría: se espera con un tope).
+#[test]
+fn cancellation_stops_a_native_top_level_loop() {
+    synsema_jit::install();
+    let program = parse_source("let n be 0\nwhile true\n    set n to n + 1\nprint(n)\n", "forever.syn").expect("parsea");
+    let before = native_tier::stats();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || {
+            let mut interp = Interpreter::new();
+            let token = interp.cancel_token();
+            let canceller = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                token.cancel("deadline");
+            });
+            let r = interp.execute(&program);
+            canceller.join().unwrap();
+            let _ = tx.send(r.err().map(|c| match c {
+                Control::Error(e) => e.to_string(),
+                _ => "otro control".to_string(),
+            }));
+        })
+        .unwrap();
+    let err = rx.recv_timeout(Duration::from_secs(20)).expect("la cancelación no cortó el bucle nativo en 20 s");
+    assert_eq!(err.as_deref(), Some("cancelled: deadline"));
+    let after = native_tier::stats();
+    assert!(after.osr > before.osr, "el bucle no corría en nativo: {:?} → {:?}", before, after);
+}
