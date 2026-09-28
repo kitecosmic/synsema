@@ -1,8 +1,8 @@
 -- F4.2b: `range` tiene que ser EL builtin: una task del usuario con ese nombre se llama como
 -- cualquier otra (y el `each` recorre la lista que devuelve). El código nativo lo verifica al entrar.
 
-task range(n)
-    give [n, n + 1, n + 2]
+task range(a, b)
+    give [a, b, a + b]
 
 let total be 0
 each i in range(0, 3000)
@@ -11,7 +11,7 @@ print(total)
 
 let c be 0
 each k in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    each j in range(k)
+    each j in range(k, 1)
         set c to c + j
 print(c)
 print(steps())

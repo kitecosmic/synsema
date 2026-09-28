@@ -78,5 +78,5 @@ let w be 0
 while w < 300
     set xs to append(xs, w % 5)
     set w to w + 1
-print(len(xs))
+print(length(xs))
 print(steps())
