@@ -6,6 +6,30 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.35 — 2026-09-28
+
+Speed, fifth step: lighter task calls. The same language — every program gives the same result,
+the same errors and the same `steps()` count — only faster. Nothing to change in your programs.
+
+**Faster.** Measured on the interpreter built like the release (with PGO, same training corpus),
+against v0.6.34, best of 15 alternating runs in both orders:
+
+- A task call with 4 arguments: **−17 % to −18 %**; with 1 argument: **−10 %**; recursive `fib`:
+  **−12 %**. The more arguments a call has, the more it saves.
+- Everything else within the build-to-build variation of a PGO binary (about ±5 %).
+
+**How.** A task whose variables nothing else can see now takes its parameters in the machine's
+registers, and its registers start exactly where the caller left the arguments (the calling
+convention of Lua): nothing is copied on entry. The bookkeeping of a call got smaller too.
+
+**For contributors.** `vm.rs`: parameters as `r0..r(n-1)` of a body with its frame in registers
+(the block value moves to `r(n)`), `VmFrame.top` (the register stack goes back to its length before
+the call: frames can nest inside their caller's window), no labels taint in the VM's frames. New
+oracle cases `vm_frames` and `errors/vm_frames_error`. Measuring: two PGO builds of the same code
+differ by up to ±8 % on some rows (the training profile is not deterministic), and a binary without
+PGO moves ±5 % with any change to the VM's dispatch loop; compare with PGO builds, and trust only
+differences above that band.
+
 ## v0.6.34 — 2026-09-27
 
 Speed, fourth step: the virtual machine learns from what it runs. The same language — every
