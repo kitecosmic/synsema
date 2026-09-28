@@ -12,6 +12,10 @@ resolver-check = []
 # Sólo para elegir superinstrucciones (F3.5 de specs/compute-rendimiento.md): la VM cuenta qué
 # instrucciones corren y qué pares seguidos. El binario nunca lo compila.
 vm-profile = []
+# F4 (specs/compute-rendimiento.md): el enganche seguro del nivel nativo (`native_tier`), sin
+# dependencias. Lo prende synsema-jit (Cranelift, el único crate con `unsafe` del nivel nativo);
+# wasm, wasm-web y el guest de Vela no lo compilan.
+native-tier = []
 
 [dependencies]
 num-bigint.workspace = true

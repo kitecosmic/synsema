@@ -10,6 +10,10 @@
 //! está, qué nombres puede tener cada frame, qué está ligado seguro). Lo informa aparte, en
 //! `resolver`, que no entra en la comparación.
 //!
+//! F4: la corrida con atajos tiene el nivel nativo instalado (como el binario) y hay una más con el
+//! nivel nativo **ansioso** (`--jit-eager`: cada task caliente se compila en su segunda llamada),
+//! así el código nativo corre en todo el corpus y se compara con la referencia igual que la VM.
+//!
 //! `conformance/` está en `.gitignore`: en un checkout limpio (CI) el corpus son los `.syn`
 //! versionados; en una máquina de desarrollo, además los ~1.400 de conformance.
 
@@ -72,16 +76,19 @@ enum Outcome {
 }
 
 fn run(runner: &Path, file: &Path, reference: bool) -> Outcome {
-    run_with(runner, file, reference, false)
+    run_with(runner, file, reference, false, false)
 }
 
-fn run_with(runner: &Path, file: &Path, reference: bool, resolver_check: bool) -> Outcome {
+fn run_with(runner: &Path, file: &Path, reference: bool, resolver_check: bool, jit_eager: bool) -> Outcome {
     let mut cmd = Command::new(runner);
     if reference {
         cmd.arg("--reference");
     }
     if resolver_check {
         cmd.arg("--resolver-check");
+    }
+    if jit_eager {
+        cmd.arg("--jit-eager");
     }
     cmd.arg(file)
         .current_dir(file.parent().unwrap_or(Path::new(".")))
@@ -159,6 +166,11 @@ struct Tally {
     resolver_checked: u64,
     resolver_unchecked: u64,
     resolver_violations: Vec<String>,
+    /// F4: lo que corrió en nativo en la pasada ansiosa.
+    native_units: u64,
+    native_entries: u64,
+    native_deopts: u64,
+    native_programs: u64,
 }
 
 #[test]
@@ -196,7 +208,19 @@ fn shortcuts_match_the_reference_interpreter() {
                     continue;
                 }
                 let fast = run(&runner, &file, false);
-                let mut second = run_with(&runner, &file, true, true);
+                let mut native = run_with(&runner, &file, false, false, true);
+                if let Outcome::Done(v) = &mut native {
+                    if let Some(n) = v.as_object_mut().and_then(|o| o.remove("native")) {
+                        let mut t = tally.lock().unwrap();
+                        t.native_units += n["units"].as_u64().unwrap_or(0);
+                        t.native_entries += n["entries"].as_u64().unwrap_or(0);
+                        t.native_deopts += n["deopts"].as_u64().unwrap_or(0);
+                        if n["entries"].as_u64().unwrap_or(0) > 0 {
+                            t.native_programs += 1;
+                        }
+                    }
+                }
+                let mut second = run_with(&runner, &file, true, true, false);
                 let resolver = match &mut second {
                     Outcome::Done(v) => v.as_object_mut().and_then(|o| o.remove("resolver")),
                     _ => None,
@@ -217,6 +241,9 @@ fn shortcuts_match_the_reference_interpreter() {
                 t.compared += 1;
                 if fast != first {
                     t.mismatches.push(format!("{}: {}", rel, describe(&first, &fast)));
+                }
+                if native != first {
+                    t.mismatches.push(format!("{} (nativo ansioso): {}", rel, describe(&first, &native)));
                 }
             });
         }
@@ -240,6 +267,12 @@ fn shortcuts_match_the_reference_interpreter() {
         TIMEOUT,
         t.mismatches.len()
     );
+    eprintln!(
+        "nativo (ansioso): {} programas entraron, {} unidades, {} entradas, {} salidas a la VM",
+        t.native_programs, t.native_units, t.native_entries, t.native_deopts
+    );
+    // Que el "0 diferencias" del nivel nativo sea de código nativo de verdad.
+    assert!(t.native_programs >= 5 && t.native_deopts > 0, "el nivel nativo casi no corrió en el oráculo: {} programas", t.native_programs);
     assert!(
         t.resolver_violations.is_empty(),
         "el resolver no coincide con el tree-walker en {} acceso(s):

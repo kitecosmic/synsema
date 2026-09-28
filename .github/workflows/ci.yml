@@ -67,6 +67,10 @@ jobs:
           key: ${{ runner.os }}-cargo-desktop-${{ hashFiles('engine/Cargo.lock') }}
       - name: Desktop suites (synthetic donors + the real engine)
         run: cargo test --locked --manifest-path engine/Cargo.toml -p synsema-cli --test build_cli --test desktop_build_cli --test desktop_cli
+      # F4: el nivel nativo en aarch64 (Apple Silicon): fuzzing contra la referencia, salidas a la VM,
+      # cancelación y el invariante de memoria. En Linux x86-64 lo corre `cargo test --workspace`.
+      - name: Native tier on aarch64 (synsema-jit)
+        run: cargo test --locked --manifest-path engine/Cargo.toml -p synsema-jit
       - name: Real .app on Apple Silicon (appended bundle keeps running; open + curl + shutdown)
         run: |
           set -euo pipefail

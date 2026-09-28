@@ -28,6 +28,10 @@ use crate::resolve::{self, Resolution, ScopeId, Target};
 use num_integer::Integer;
 use std::cell::Cell;
 
+#[cfg(feature = "native-tier")]
+#[path = "vm_native.rs"]
+mod native;
+
 pub(crate) type Reg = u16;
 /// Registro destino "no hace falta el valor": se suelta en el acto.
 const DISCARD: Reg = Reg::MAX;
@@ -149,6 +153,10 @@ pub(crate) enum Ins {
     /// es una task compilada y todos van por posición, la VM entra al cuerpo sin recursión en
     /// Rust; si no, el camino de siempre (`call_value_named`).
     Call { dst: Reg, func: Reg, args: Reg, n: u16, site: u32 },
+    /// F4.1: un `Call` a una task que tiene código nativo (lo reescribe la VM cuando la task pasa
+    /// el umbral). Si la task, los argumentos o las globales ya no encajan, vuelve a ser `Call`.
+    #[cfg(feature = "native-tier")]
+    CallNative { dst: Reg, func: Reg, args: Reg, n: u16, site: u32 },
     /// Define una task o lambda (el tree-walker) y le cuelga su cuerpo compilado.
     Define { dst: Reg, node: u32, child: u32 },
     /// `each` (F3.2): evalúa la colección (como la referencia, con el atajo de `range`) y deja su
@@ -313,6 +321,9 @@ pub(crate) struct VmFrame {
 pub struct TaskCode {
     code: std::cell::OnceCell<Rc<Chunk>>,
     calls: Cell<u32>,
+    /// F4: el nivel nativo de esta task (cuántas llamadas lleva, y su código compilado).
+    #[cfg(feature = "native-tier")]
+    native: native::NativeState,
 }
 
 /// Una task definida por el tree-walker se compila recién en su segunda llamada: una lambda que
@@ -1695,6 +1706,8 @@ impl<'r, 's> Compiler<'r, 's> {
                 }
                 Ins::EachInit { .. } => leader[i + 1] = true,
                 Ins::Exec { .. } | Ins::Call { .. } => leader[i + 1] = true,
+                #[cfg(feature = "native-tier")]
+                Ins::CallNative { .. } => leader[i + 1] = true,
                 Ins::Define { .. } | Ins::Give { .. } | Ins::StopOut { .. } | Ins::End { .. } => leader[i + 1] = true,
                 _ => {}
             }
@@ -2617,6 +2630,38 @@ impl Interpreter {
                         Err(c) => Err(c),
                     }
                 }
+                #[cfg(feature = "native-tier")]
+                Ins::CallNative { dst, func, args, n, site } => match self.vm_call_native(&chunk, base, at, dst, func, args, n, site) {
+                    Ok(native::NativeStep::Done) => Ok(()),
+                    // No pudo entrar (y no tocó nada): la instrucción ya volvió a ser `Call` y se
+                    // repite como tal.
+                    Ok(native::NativeStep::Retry) => {
+                        pc = at;
+                        Ok(())
+                    }
+                    Ok(native::NativeStep::Resume(r)) => {
+                        // Salió a la VM a mitad de camino: el que llamó, los frames nativos de
+                        // afuera esperando a su llamado, y la VM sigue en el de más adentro.
+                        let native::Resume { frames, enter, pc: at_pc, top0 } = *r;
+                        let caller = VmFrame {
+                            chunk: std::mem::replace(&mut chunk, enter.code),
+                            env: std::mem::replace(&mut env, enter.env),
+                            base,
+                            pc,
+                            dst,
+                            depth: std::mem::replace(&mut depth, 0),
+                            iter_base: std::mem::replace(&mut iter_base, self.vm_iters.len()),
+                            lbase: std::mem::replace(&mut self.vm_lbase, enter.lbase),
+                            top: top0,
+                        };
+                        self.vm_frames.push(caller);
+                        self.vm_frames.extend(frames);
+                        base = enter.base;
+                        pc = at_pc;
+                        Ok(())
+                    }
+                    Err(c) => Err(c),
+                },
                 Ins::EachInit { node, it } => self.vm_each_init(&chunk, &env, node, it, iter_base),
                 Ins::EachNext { it, var, scope, exit } => {
                     match self.vm_iters[iter_base + it as usize].next_item() {
@@ -3224,6 +3269,11 @@ impl Interpreter {
                         return Err(err("maximum recursion depth exceeded"));
                     }
                     if code.regframe {
+                        // F4.1: una task caliente pasa al nivel nativo (esta llamada, en la VM).
+                        #[cfg(feature = "native-tier")]
+                        if t.code.native.tick() {
+                            self.vm_native_tier_up(chunk, at, t);
+                        }
                         return self.vm_enter_regframe(t, code, first, n).map(Some);
                     }
                     let call_env = self.acquire_frame(&t.closure_env, "call");

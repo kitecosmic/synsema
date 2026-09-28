@@ -9,6 +9,7 @@ members = [
     "crates/synsema-infer",
     "crates/synsema-runtime",
     "crates/synsema-cli",
+    "crates/synsema-jit",
     "crates/synsema-wasm",
     "crates/synsema-wasm-web",
 ]
@@ -327,6 +328,8 @@ synsema-llm = { path = "crates/synsema-llm" }
 # de calculo. Lo consume synsema-runtime bajo la feature `llm-local`.
 synsema-infer = { path = "crates/synsema-infer" }
 synsema-runtime = { path = "crates/synsema-runtime" }
+# F4: el nivel nativo (Cranelift). Sólo lo usan el binario y los tests; core no depende de él.
+synsema-jit = { path = "crates/synsema-jit" }
 
 [profile.release]
 opt-level = 3

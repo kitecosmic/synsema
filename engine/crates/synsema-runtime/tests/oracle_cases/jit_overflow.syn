@@ -1,0 +1,64 @@
+-- F4.1: un Int que desborda dentro de código nativo sale a la VM antes de la cuenta, y la VM da el
+-- Big (nunca la vuelta). Desborde a mitad de una recursión: los frames nativos pasan a ser frames
+-- de la VM y el resultado sube por ellos. Cada task se llama desde un solo sitio, en un bucle.
+
+let big be 9223372036854775807
+let small be 0 - big - 1
+
+task pow2(n)
+    when n == 0
+        give 1
+    give 2 * pow2(n - 1)
+let a be []
+each n in [3, 10, 62, 63, 64, 100, 5, 1]
+    let r be pow2(n)
+    set a to append(a, r)
+print(a)
+
+task inc(x)
+    give x + 1
+task dec(x)
+    give x - 1
+let b be []
+each x in [1, 2, big, big - 1, small, 7, big, 0]
+    let r be inc(x)
+    let s be dec(x)
+    set b to append(b, [r, s])
+print(b)
+
+-- Factorial: desborda en 21! a varios niveles de profundidad, varias veces.
+task fact(n)
+    when n < 2
+        give 1
+    give n * fact(n - 1)
+let c be []
+each n in [5, 20, 21, 25, 10, 30, 3]
+    let r be fact(n)
+    set c to append(c, r)
+print(c)
+
+-- Un acumulador que desborda dentro de un bucle nativo (con sus locales vivos al salir a la VM), y
+-- una resta que baja de i64::MIN. El valor inicial va por parámetro (leer una global que no es una
+-- task deja la unidad en la VM en F4.1).
+task acc(start, n)
+    let t be start
+    let i be 0
+    while i < n
+        set t to t + 1
+        set i to i + 1
+    give t
+task down(start, n)
+    let t be start
+    let i be 0
+    while i < n
+        set t to t - 1
+        set i to i + 1
+    give t
+let d be []
+each n in [3, 5, 6, 10, 2, 1, 4]
+    let r be acc(big - 5, n)
+    let s be down(small + 3, n)
+    set d to append(d, [r, s])
+print(d)
+
+print(steps())

@@ -1,0 +1,9 @@
+-- F4.1: un error (`% 0`) en lo profundo de una recursión nativa: la VM lo arma con su ubicación y
+-- sube por los frames que eran nativos.
+task f(n, d)
+    when n == 0
+        give 10 % d
+    give f(n - 1, d) + 1
+print(f(5, 3))
+print(f(6, 4))
+print(f(50, 0))

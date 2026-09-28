@@ -1,0 +1,110 @@
+-- F4.1 contra la referencia: tasks numéricas que pasan al nivel nativo (el oráculo las compila en su
+-- segunda llamada: `oracle_run --jit-eager`). Recursión, bucles, locales, `%` con piso, comparaciones
+-- que dan bool, y `steps()` al final (el nativo suma los mismos pasos por bloque que la VM). Cada
+-- task se llama desde un solo sitio, en un bucle y en un `let`: ese sitio entra al código nativo.
+
+task fib(n)
+    when n < 2
+        give n
+    give fib(n - 1) + fib(n - 2)
+let fs be []
+each n in [1, 2, 10, 20, 15, 0]
+    let r be fib(n)
+    set fs to append(fs, r)
+print(fs)
+
+-- Un bucle dentro de una task (locales en la ventana, `set` que pasa por la vía en el lugar).
+task sumto(n)
+    let t be 0
+    let i be 0
+    while i < n
+        set t to t + i % 7
+        set i to i + 1
+    give t
+let su be []
+each n in [0, 5, 1000, 7, 3]
+    let r be sumto(n)
+    set su to append(su, r)
+print(su)
+
+-- `%` con piso, como Python; `% -1` es 0 aun con i64::MIN.
+let big be 9223372036854775807
+let small be 0 - big - 1
+task md(a, b)
+    give a % b
+let mo be []
+each p in [[7, 3], [-7, 3], [7, -3], [-7, -3], [7, -1], [small, -1], [small, 3], [big, -2], [0, 5], [small, small], [big, big], [-1, big], [1, small]]
+    let r be md(p[0], p[1])
+    set mo to append(mo, r)
+print(mo)
+
+-- Comparaciones: el resultado es un bool que la task devuelve.
+task lt(a, b)
+    give a < b
+task ge(a, b)
+    give a >= b
+task ne(a, b)
+    give a != b
+let cm be []
+each p in [[1, 2], [2, 1], [3, 3], [small, big], [big, small], [-1, 0]]
+    let x be lt(p[0], p[1])
+    let y be ge(p[0], p[1])
+    let z be ne(p[0], p[1])
+    set cm to append(cm, [x, y, z])
+print(cm)
+
+-- Recursión mutua (dos tasks en la misma unidad) y una task que llama a otra.
+task even(n)
+    when n == 0
+        give true
+    give odd(n - 1)
+task odd(n)
+    when n == 0
+        give false
+    give even(n - 1)
+let eo be []
+each n in [10, 7, 301, 0, 1, 44]
+    let x be even(n)
+    let y be odd(n)
+    set eo to append(eo, [x, y])
+print(eo)
+
+task sq(x)
+    give x * x
+task sumsq(n)
+    let t be 0
+    let i be 1
+    while i <= n
+        set t to t + sq(i)
+        set i to i + 1
+    give t
+let sq2 be []
+each n in [3, 10, 100, 0, 1]
+    let r be sumsq(n)
+    set sq2 to append(sq2, r)
+print(sq2)
+
+-- Una task sin `give` en una rama: devuelve nothing.
+task maybe(n)
+    when n > 0
+        give n
+let mb be []
+each n in [3, -1, 0, 9, 4]
+    let r be maybe(n)
+    set mb to append(mb, r)
+print(mb)
+
+-- Parámetros que se reasignan.
+task countdown(n)
+    let steps_taken be 0
+    while n > 0
+        set n to n - 3
+        set steps_taken to steps_taken + 1
+    give [n, steps_taken]
+let cd be []
+each n in [10, 0, 9, 1, 2]
+    let r be countdown(n)
+    set cd to append(cd, r)
+print(cd)
+
+print(steps())

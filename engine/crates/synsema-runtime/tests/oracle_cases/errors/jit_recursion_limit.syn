@@ -1,0 +1,10 @@
+-- F4.1: el tope de recursión en código nativo: sale a la VM en la llamada que lo pasaría y la VM da
+-- el mismo error. Antes, una recursión profunda que entra.
+task deep(n)
+    when n == 0
+        give 0
+    give 1 + deep(n - 1)
+print(deep(10))
+print(deep(20))
+print(deep(2900))
+print(deep(5000))

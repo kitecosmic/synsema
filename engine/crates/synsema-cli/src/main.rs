@@ -444,6 +444,9 @@ fn run_bundled(bundle: synsema_core::bundle::Bundle, program_args: Vec<String>) 
 fn main() -> ExitCode {
     // Antes del primer print: una salida sin lector nunca es un pánico (stdio.rs).
     stdio::install_broken_pipe_guard();
+    // F4: el nivel nativo para las tasks calientes (no cambia lo observable; ver synsema-jit).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    synsema_jit::install();
     let mut args: Vec<String> = std::env::args().collect();
 
     // `--engine` como primer argumento: el CLI del motor, en cualquier binario (en uno

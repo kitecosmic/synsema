@@ -21,6 +21,9 @@ pub mod interpreter;
 pub mod judge;
 pub mod labels;
 pub mod lexer;
+#[cfg(feature = "native-tier")]
+#[doc(hidden)]
+pub mod native_tier;
 pub mod math;
 pub mod number;
 pub mod parser;
