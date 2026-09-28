@@ -1,0 +1,8 @@
+-- F4.1b: un sitio especializado en `CallBuiltin` que después recibe un builtin al que le sobran
+-- argumentos: vuelve al camino de siempre, que da el error de aridad con su ubicación.
+let fs be [max, max, min, max, abs]
+let out be []
+each f in fs
+    let r be f(3, 7)
+    set out to append(out, r)
+print(out)

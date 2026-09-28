@@ -24,6 +24,7 @@ use num_complex::Complex64;
 use regex::Regex;
 
 use crate::ast::{BinOp, Node, NodeKind, Param, Program, UnOp};
+use crate::inline_vec::InlineVec;
 use crate::labels::{self, label_display_raw, DeclassifyEntry, Label};
 use crate::number::{Number, MIX_DECIMAL_FLOAT};
 use crate::parser::{parse_source, CompileError};
@@ -474,10 +475,14 @@ impl fmt::Display for EnvName {
 /// para la tabla); la búsqueda es lineal, que en scopes chicos gana al hash. Pasados
 /// `INDEX_AT` bindings (el global, un módulo) se arma un índice nombre → slot. El orden de
 /// iteración es el de inserción (antes era el orden arbitrario del `HashMap`).
+///
+/// Los dos arreglos son `InlineVec` (propio, no `SmallVec`): la representación del frame no puede
+/// cambiar según las features que otro crate del binario le prenda a una dependencia (ver
+/// `inline_vec.rs`). Un nombre en línea es `Option` sólo para tener un lugar vacío: siempre es `Some`.
 #[derive(Default)]
 pub struct Bindings {
-    names: SmallVec<[Arc<str>; INLINE_BINDINGS]>,
-    slots: SmallVec<[Option<SynValue>; INLINE_BINDINGS]>,
+    names: InlineVec<Option<Arc<str>>, INLINE_BINDINGS>,
+    slots: InlineVec<Option<SynValue>, INLINE_BINDINGS>,
     index: Option<Box<HashMap<Arc<str>, u32, rustc_hash::FxBuildHasher>>>,
     /// Si la VM preparó este frame (F3): el orden de sus nombres es el del resolver, y el slot `k`
     /// es la variable `k` de ese scope. Se pierde al vaciarlo.
@@ -492,8 +497,12 @@ impl Bindings {
     fn find(&self, name: &str) -> Option<usize> {
         match &self.index {
             Some(ix) => ix.get(name).map(|&k| k as usize),
-            None => self.names.iter().position(|n| &**n == name),
+            None => self.names.iter().position(|n| n.as_deref() == Some(name)),
         }
+    }
+    #[inline]
+    fn name_at(&self, k: usize) -> &Arc<str> {
+        self.names[k].as_ref().expect("nombre del frame")
     }
     fn push(&mut self, name: Arc<str>, value: SynValue) {
         let k = self.names.len();
@@ -502,12 +511,12 @@ impl Bindings {
         } else if k + 1 > INDEX_AT {
             let mut ix: HashMap<Arc<str>, u32, rustc_hash::FxBuildHasher> = HashMap::with_capacity_and_hasher(k * 2, Default::default());
             for (i, n) in self.names.iter().enumerate() {
-                ix.insert(n.clone(), i as u32);
+                ix.insert(n.clone().expect("nombre del frame"), i as u32);
             }
             ix.insert(name.clone(), k as u32);
             self.index = Some(Box::new(ix));
         }
-        self.names.push(name);
+        self.names.push(Some(name));
         self.slots.push(Some(value));
     }
     pub fn get(&self, name: &str) -> Option<&SynValue> {
@@ -559,7 +568,7 @@ impl Bindings {
     /// `false` (y el frame sin tocar) si no coinciden.
     pub(crate) fn lay_out(&mut self, layout: &Rc<vm::Layout>, tag: bool) -> bool {
         let n = self.names.len();
-        if n > layout.names.len() || self.names.iter().zip(layout.names.iter()).any(|(a, b)| **a != **b) {
+        if n > layout.names.len() || self.names.iter().zip(layout.names.iter()).any(|(a, b)| a.as_deref() != Some(&**b)) {
             return false;
         }
         for name in &layout.names[n..] {
@@ -598,7 +607,7 @@ impl Bindings {
         self.slots[k] = Some(v);
     }
     pub(crate) fn slot_name(&self, k: usize) -> Arc<str> {
-        self.names[k].clone()
+        self.name_at(k).clone()
     }
     /// `get` con una caché del índice (el de la última vez; un índice nunca cambia): si en ese
     /// slot está este nombre, no se busca. Un hueco es "no está acá", como en `get`.
@@ -616,7 +625,7 @@ impl Bindings {
     fn cached_index(&self, name: &Arc<str>, ic: &Cell<u32>) -> Option<usize> {
         let c = ic.get() as usize;
         if c > 0 {
-            if let Some(n) = self.names.get(c - 1) {
+            if let Some(Some(n)) = self.names.get(c - 1) {
                 if Arc::ptr_eq(n, name) || **n == **name {
                     return Some(c - 1);
                 }
@@ -627,7 +636,7 @@ impl Bindings {
         Some(k)
     }
     pub fn iter(&self) -> impl Iterator<Item = (&Arc<str>, &SynValue)> {
-        self.names.iter().zip(self.slots.iter()).filter_map(|(n, v)| v.as_ref().map(|v| (n, v)))
+        self.names.iter().zip(self.slots.iter()).filter_map(|(n, v)| Some((n.as_ref()?, v.as_ref()?)))
     }
     pub fn keys(&self) -> impl Iterator<Item = &Arc<str>> {
         self.iter().map(|(n, _)| n)

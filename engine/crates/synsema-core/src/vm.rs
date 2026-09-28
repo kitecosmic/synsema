@@ -153,6 +153,11 @@ pub(crate) enum Ins {
     /// es una task compilada y todos van por posición, la VM entra al cuerpo sin recursión en
     /// Rust; si no, el camino de siempre (`call_value_named`).
     Call { dst: Reg, func: Reg, args: Reg, n: u16, site: u32 },
+    /// F4.1b (quickening, como `CALL_BUILTIN_FAST` de CPython 3.11): un `Call` sin argumentos con
+    /// nombre que vio un builtin sin `param_names`. Los mismos pasos observables que el camino
+    /// genérico (aridad máxima, profundidad, `dispatch_builtin`, `pending_kwargs` vacío), sin armar
+    /// pares nombre/valor ni copiar los argumentos dos veces. Si ya no encaja, vuelve a ser `Call`.
+    CallBuiltin { dst: Reg, func: Reg, args: Reg, n: u16, site: u32 },
     /// F4.1: un `Call` a una task que tiene código nativo (lo reescribe la VM cuando la task pasa
     /// el umbral). Si la task, los argumentos o las globales ya no encajan, vuelve a ser `Call`.
     #[cfg(feature = "native-tier")]
@@ -1705,7 +1710,7 @@ impl<'r, 's> Compiler<'r, 's> {
                     leader[i + 1] = true;
                 }
                 Ins::EachInit { .. } => leader[i + 1] = true,
-                Ins::Exec { .. } | Ins::Call { .. } => leader[i + 1] = true,
+                Ins::Exec { .. } | Ins::Call { .. } | Ins::CallBuiltin { .. } => leader[i + 1] = true,
                 #[cfg(feature = "native-tier")]
                 Ins::CallNative { .. } => leader[i + 1] = true,
                 Ins::Define { .. } | Ins::Give { .. } | Ins::StopOut { .. } | Ins::End { .. } => leader[i + 1] = true,
@@ -2662,6 +2667,15 @@ impl Interpreter {
                     }
                     Err(c) => Err(c),
                 },
+                Ins::CallBuiltin { dst, func, args, n, site } => match self.vm_call_builtin(&chunk, base, at, dst, func, args, n, site) {
+                    Ok(true) => Ok(()),
+                    // Ya no encaja (y no tocó nada): volvió a ser `Call` y se repite como tal.
+                    Ok(false) => {
+                        pc = at;
+                        Ok(())
+                    }
+                    Err(c) => Err(c),
+                },
                 Ins::EachInit { node, it } => self.vm_each_init(&chunk, &env, node, it, iter_base),
                 Ins::EachNext { it, var, scope, exit } => {
                     match self.vm_iters[iter_base + it as usize].next_item() {
@@ -3381,6 +3395,12 @@ impl Interpreter {
     ) -> Result<Option<Enter>, Control> {
         let loc = &chunk.locs[chunk.loc[at] as usize];
         let s = &chunk.sites[site as usize];
+        // F4.1b: un builtin llamado sólo por posición: la próxima vez, `CallBuiltin`.
+        if s.names.is_none() && matches!(&f, SynValue::Builtin(b) if b.param_names.is_none()) {
+            if let Ins::Call { dst, func, args, n, site } = chunk.code[at].get() {
+                chunk.code[at].set(Ins::CallBuiltin { dst, func, args, n, site });
+            }
+        }
         let mut cargs = self.free_args.pop().unwrap_or_default();
         cargs.reserve(n);
         for i in 0..n {
@@ -3395,6 +3415,61 @@ impl Interpreter {
         let v = out?;
         self.put(base, dst, v);
         Ok(None)
+    }
+}
+
+impl Interpreter {
+    /// `CallBuiltin`: `Ok(false)` si ya no encaja (la instrucción volvió a ser `Call`: se repite).
+    /// Lo mismo que `vm_call_generic` + `call_value_named` para un builtin por posición: la función
+    /// sale de su registro, el máximo de argumentos (antes de la profundidad), la profundidad con el
+    /// mismo tope y el mismo error, y `dispatch_builtin` con `pending_kwargs` vacío.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_call_builtin(
+        &mut self,
+        chunk: &Chunk,
+        base: usize,
+        at: usize,
+        dst: Reg,
+        func: Reg,
+        args: Reg,
+        n: u16,
+        site: u32,
+    ) -> Result<bool, Control> {
+        let nn = n as usize;
+        let fits = match &self.vm_regs[base + func as usize] {
+            SynValue::Builtin(b) => {
+                b.param_names.is_none()
+                    && self.pending_kwargs.is_empty()
+                    // Pasarse del máximo es error: lo arma el camino de siempre.
+                    && (!chunk.sites[site as usize].checked || b.meta.constructor || b.meta.arity.1.is_none_or(|max| nn <= max))
+            }
+            _ => false,
+        };
+        if !fits {
+            chunk.code[at].set(Ins::Call { dst, func, args, n, site });
+            return Ok(false);
+        }
+        let f = std::mem::replace(&mut self.vm_regs[base + func as usize], SynValue::Nothing);
+        let first = base + args as usize;
+        let argv: SmallVec<[SynValue; 4]> =
+            (0..nn).map(|i| std::mem::replace(&mut self.vm_regs[first + i], SynValue::Nothing)).collect();
+        self.recursion_depth += 1;
+        if self.recursion_depth > MAX_RECURSION {
+            self.recursion_depth -= 1;
+            return Err(err("maximum recursion depth exceeded"));
+        }
+        let SynValue::Builtin(bt) = &f else { unreachable!("CallBuiltin sin builtin") };
+        let r = self.dispatch_builtin(bt, &argv, &chunk.locs[chunk.loc[at] as usize]);
+        // Como el camino genérico, que vuelve a poner el mapa que había (vacío) al terminar.
+        if !self.pending_kwargs.is_empty() {
+            self.pending_kwargs = IndexMap::new();
+        }
+        drop(argv);
+        self.recursion_depth -= 1;
+        let v = r?;
+        self.put(base, dst, v);
+        Ok(true)
     }
 }
 

@@ -17,6 +17,7 @@ pub mod codeintel;
 pub mod csv;
 pub mod deprecated;
 pub mod flat_syntax;
+mod inline_vec;
 pub mod interpreter;
 pub mod judge;
 pub mod labels;
