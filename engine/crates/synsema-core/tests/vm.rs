@@ -25,10 +25,10 @@ fn a_task_body_is_compiled_with_its_frame() {
     let out = explain_source(FIB);
     assert!(out.contains("Define {"), "{}", out);
     assert!(out.contains("frame: [n]"), "{}", out);
-    // `n` es un parámetro: se lee del slot 0 (del frame en registros: `fib` no deja ver su frame),
-    // sin buscarlo por nombre.
-    assert!(out.contains("a: RLocal(0)"), "{}", out);
-    assert!(out.contains("Give { src: RLocal(0) }"), "{}", out);
+    // `n` es un parámetro: vive en el registro 0 del cuerpo (F3.7: la ventana del llamado empieza
+    // en los argumentos del llamador), sin buscarlo por nombre ni copiarlo al entrar.
+    assert!(out.contains("a: Copy(0)"), "{}", out);
+    assert!(out.contains("Give { src: Copy(0) }"), "{}", out);
 }
 
 #[test]
@@ -52,7 +52,8 @@ fn locals_live_in_frame_slots_in_resolver_order() {
     assert!(out.contains("frame: [a, b, c, d]"), "{}", out);
     // (Esta task no deja ver su frame: va en registros, con los mismos slots.)
     assert!(out.contains("LetRLocal { src: Const(0), slot: 2"), "{}", out);
-    assert!(out.contains("LetRLocal { src: RLocal(1), slot: 3"), "{}", out);
+    // `b` es un parámetro: registro 1 (F3.7); `d`, un `let`, queda en su slot de la ventana.
+    assert!(out.contains("LetRLocal { src: Copy(1), slot: 3"), "{}", out);
 }
 
 #[test]

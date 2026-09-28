@@ -1,0 +1,8 @@
+-- F3.7: un error dentro de un cuerpo con los parámetros en registros, llamado en medio de una expresión.
+task div(a, b)
+    give a / b
+task go(n)
+    give div(n, n - 3) + div(1, 1)
+print(go(5))
+print(go(4))
+print(go(3))

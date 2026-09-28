@@ -1,0 +1,89 @@
+-- F3.7 contra la referencia: los parámetros viven en los registros del llamado y su ventana
+-- empieza en los argumentos del llamador (como Lua). Llamadas anidadas en medio de expresiones
+-- (con registros vivos alrededor), recursión, parámetros repetidos, de más y por defecto, `set` a
+-- un parámetro, la vía en el lugar y `set` con caminos sobre un parámetro, y `give` desde un bucle.
+
+let k be 7
+
+-- Recursión adentro de una expresión del nivel superior, con más registros vivos después.
+task fact(n)
+    when n <= 1
+        give 1
+    give n * fact(n - 1)
+let word be "ho" + "la"
+print(word + " " + text(fact(10)) + " " + text(-k) + " " + text(fact(12)) + " " + text(not false))
+
+-- Llamadas anidadas como argumentos, en varias posiciones.
+task add(a, b)
+    give a + b
+task mix(a, b, c)
+    give [a, b, c]
+print(mix(add(1, 2), add(add(3, 4), 5), add(6, add(7, add(8, 9)))))
+print([add(1, 1), mix(k, add(k, 1), [add(2, 2)]), add(add(add(1, 2), 3), 4)])
+
+-- Un parámetro que se reasigna, en un bucle y con recursión mutua.
+task countdown(n, acc)
+    while n > 0
+        set acc to acc + n
+        set n to n - 1
+    give acc
+task even(n)
+    when n == 0
+        give true
+    give odd(n - 1)
+task odd(n)
+    when n == 0
+        give false
+    give even(n - 1)
+print([countdown(10, 0), countdown(3, 100), even(10), odd(7), even(7)])
+
+-- Parámetros repetidos (gana el último), de más por un pipe y con default.
+task twice(a, a)
+    give a
+task opt(a, b = 10)
+    give a + b
+task two(a, b)
+    give [a, b]
+print([twice(1, 2), twice(3, 4), opt(1), opt(1, 2), opt(5)])
+print([[1, 2] |> two(3), 5 |> opt, 6 |> opt(1)])
+
+-- La vía en el lugar y `set` con caminos sobre un parámetro (arma el frame en el momento).
+task grow(xs, n)
+    let i be 0
+    while i < n
+        set xs to append(xs, i)
+        set i to i + 1
+    give xs
+task tag(m, v)
+    set m["tag"] to v
+    set m.count to 1
+    give m
+let base be [9]
+print([grow(base, 3), grow([], 2), base])
+print([tag({"a": 1}, "x"), tag({}, "y")])
+
+-- `give` desde adentro de un bucle y de un `each` sin frame.
+task find(xs, v)
+    each x in xs
+        when x == v
+            give "found " + text(x)
+    give "missing"
+task first_over(n, limit)
+    let i be 0
+    while true
+        when i * i > limit
+            give i
+        set i to i + 1
+print([find([1, 2, 3], 2), find([], 1), first_over(0, 50), first_over(0, 1000)])
+
+-- Una task que llama el tree-walker la primera vez y la VM después, con recursión profunda.
+task depth(n)
+    when n == 0
+        give 0
+    give 1 + depth(n - 1)
+print([depth(50), depth(200), depth(5)])
+
+-- Lambdas con parámetros.
+let sq be (x) => x * x
+let comb be (a, b) => a * 10 + b
+print([sq(3), sq(4), comb(1, 2), comb(sq(2), sq(1))])

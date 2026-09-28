@@ -31,6 +31,9 @@ use std::cell::Cell;
 pub(crate) type Reg = u16;
 /// Registro destino "no hace falta el valor": se suelta en el acto.
 const DISCARD: Reg = Reg::MAX;
+/// F3.7: en `TryInPlace`, un `slot` con este bit es un parámetro (el registro `slot & !PARAM`)
+/// de un cuerpo con frame en registros, no un lugar de la ventana.
+const PARAM: u16 = 0x8000;
 const NONE: u32 = u32::MAX;
 
 /// Un operando: un registro que se consume, uno que se copia, una constante o un slot del frame
@@ -257,6 +260,9 @@ pub(crate) struct Chunk {
 struct Spill {
     scope: ScopeId,
     off: u16,
+    /// El frame de un cuerpo con frame en registros: sus parámetros están en los registros
+    /// `r0..` (F3.7), no en la ventana.
+    params: bool,
     /// El nombre del frame que la referencia le daría (`call`, `each`).
     name: &'static str,
 }
@@ -294,13 +300,12 @@ pub(crate) struct VmFrame {
     /// sus iteradores.
     depth: u16,
     iter_base: usize,
-    /// `enter_call`/`leave_call` sólo mueven tinta de etiquetas: con etiquetas apagadas (la VM no
-    /// corre con ellas) la tinta está vacía y no cambia, así que no se toca.
-    taint: Option<TaintFrame>,
-    /// La task llamada: vive hasta el final de la llamada, como en `call_value_named_inner`.
-    task: Rc<SynTaskValue>,
     /// Dónde empieza la ventana de locales del llamador (F3.3b).
     lbase: usize,
+    /// El largo de la pila de registros antes de la llamada: al volver, la pila vuelve a ese
+    /// largo (F3.7: la ventana del llamado puede empezar adentro de la de su llamador, y la de
+    /// éste adentro de la de más afuera; el final del llamador no es el tope de la pila).
+    top: usize,
 }
 
 /// El código compilado de una task, y cuántas veces se llamó antes de compilarla.
@@ -400,7 +405,8 @@ fn compile_unit<'r>(
                 c.finish_checked()
             }
             Body::Task(stmts) => {
-                c.block_of(stmts, Some(0), true);
+                let r = c.result_reg;
+                c.block_of(stmts, Some(r), true);
                 c.finish_checked()
             }
             Body::Lambda(e) => {
@@ -474,6 +480,8 @@ fn regframe_eligible(res: &Resolution, scope: ScopeId, win: &[ScopeId]) -> bool 
 /// Dónde vive una variable resuelta (ver `Compiler::place`).
 #[derive(Clone, Copy)]
 enum Place {
+    /// F3.7: un parámetro de un cuerpo con frame en registros (nunca es hueco).
+    Param(Reg),
     Win(u16),
     Local(u16),
     Outer(u16, u16),
@@ -543,6 +551,10 @@ struct Compiler<'r, 's> {
     node_spill: Vec<u32>,
     spills: Vec<Box<[Spill]>>,
     key_ics: u32,
+    /// F3.7: en un cuerpo con frame en registros, el registro de cada slot que es un parámetro
+    /// (el último si se repite, como la referencia) y dónde va el valor del bloque (`r0` si no).
+    param_reg: HashMap<u16, Reg>,
+    result_reg: Reg,
 }
 
 impl<'r, 's> Compiler<'r, 's> {
@@ -586,6 +598,8 @@ impl<'r, 's> Compiler<'r, 's> {
             node_spill: Vec::new(),
             spills: Vec::new(),
             key_ics: 0,
+            param_reg: HashMap::new(),
+            result_reg: 0,
         }
     }
 
@@ -606,6 +620,15 @@ impl<'r, 's> Compiler<'r, 's> {
                 .iter()
                 .map(|p| names.iter().position(|n| **n == **p).expect("parámetro fuera del layout") as u16)
                 .collect();
+            // F3.7: los parámetros son `r0..r(n-1)` (la llamada los deja ahí: la ventana del
+            // cuerpo empieza en los argumentos del llamador) y el valor del bloque va después.
+            for (i, &k) in self.param_slots.iter().enumerate() {
+                self.param_reg.insert(k, i as Reg);
+            }
+            let np = params.len() as Reg;
+            self.result_reg = np;
+            self.next_reg = np + 1;
+            self.max_reg = np + 1;
             self.win_off.insert(s, 0);
             n = names.len();
         }
@@ -663,7 +686,12 @@ impl<'r, 's> Compiler<'r, 's> {
         let mut s = self.cur_scope;
         while let Some(x) = s {
             match self.win(x) {
-                Some(off) => chain.push(Spill { scope: x, off, name: self.res.scopes[x as usize].kind.frame_name() }),
+                Some(off) => chain.push(Spill {
+                    scope: x,
+                    off,
+                    params: self.regframe && Some(x) == self.frame_scope,
+                    name: self.res.scopes[x as usize].kind.frame_name(),
+                }),
                 None => break,
             }
             s = self.shared.parents[x as usize];
@@ -847,6 +875,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 let v = self.expr(value);
                 self.at(&n.location);
                 match self.target_of_bind(n) {
+                    Some(Place::Param(r)) => self.write_param(r, v, dst),
                     Some(Place::Win(slot)) => self.emit(Ins::LetRLocal { src: v, slot, dst }),
                     Some(Place::Local(slot)) => self.emit(Ins::LetLocal { src: v, slot, dst }),
                     _ => {
@@ -864,6 +893,7 @@ impl<'r, 's> Compiler<'r, 's> {
                     let done = self.label();
                     let (ic, slot) = match self.place(self.target(target)) {
                         Place::Free => (self.ic(), u16::MAX),
+                        Place::Param(r) => (NONE, PARAM | r),
                         Place::Win(k) => (NONE, k),
                         _ => (NONE, u16::MAX),
                     };
@@ -876,6 +906,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 self.at(&n.location);
                 let nm = self.name(name);
                 match self.place(self.target(target)) {
+                    Place::Param(r) => self.write_param(r, v, dst),
                     Place::Win(slot) => self.emit(Ins::SetRLocal { src: v, slot, name: nm, dst }),
                     Place::Local(slot) => self.emit(Ins::SetLocal { src: v, slot, name: nm, dst }),
                     Place::Outer(depth, slot) => {
@@ -1172,6 +1203,17 @@ impl<'r, 's> Compiler<'r, 's> {
         self.emit(Ins::EachInitV { src: v, node, it });
     }
 
+    /// `let`/`set` a un parámetro (F3.7): el valor al registro del parámetro y, si el bloque lo
+    /// usa, una copia en `dst`.
+    fn write_param(&mut self, r: Reg, v: Opnd, dst: Reg) {
+        if v != Opnd::Reg(r) {
+            self.emit(Ins::Move { dst: r, src: v });
+        }
+        if dst != DISCARD {
+            self.emit(Ins::Move { dst, src: Opnd::Copy(r) });
+        }
+    }
+
     fn target_of_bind(&self, n: &Node) -> Option<Place> {
         let a = self.shared.by_node.get(&(n as *const Node as usize))?;
         match a.target {
@@ -1185,6 +1227,11 @@ impl<'r, 's> Compiler<'r, 's> {
     fn place(&self, t: Target) -> Place {
         match t {
             Target::Slot { depth, scope, slot, .. } if self.in_frame(scope, depth) => {
+                if self.regframe && Some(scope) == self.frame_scope {
+                    if let Some(&r) = self.param_reg.get(&slot) {
+                        return Place::Param(r);
+                    }
+                }
                 if let Some(off) = self.win(scope) {
                     return Place::Win(off + slot);
                 }
@@ -1371,6 +1418,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 let t = self.target(n);
                 let definite = matches!(t, Target::Slot { definite: true, .. });
                 match self.place(t) {
+                    Place::Param(r) => Opnd::Copy(r),
                     Place::Win(slot) if definite => Opnd::RLocal(slot),
                     Place::Local(slot) if definite => Opnd::Local(slot),
                     Place::Win(slot) => {
@@ -1600,7 +1648,8 @@ impl<'r, 's> Compiler<'r, 's> {
         if !self.bad.is_empty() || self.frame_needed {
             return Err((self.bad, self.frame_needed));
         }
-        Ok(self.finish(Opnd::Reg(0)))
+        let r = self.result_reg;
+        Ok(self.finish(Opnd::Reg(r)))
     }
 
     fn finish(mut self, result: Opnd) -> Rc<Chunk> {
@@ -1898,17 +1947,42 @@ impl Interpreter {
         let n = chunk.frame.as_ref().map_or(0, |l| l.names.len());
         let lbase = self.vm_locals.len();
         self.vm_locals.resize(lbase + chunk.nlocals as usize, None);
+        let base = self.vm_regs.len();
+        self.vm_regs.resize(base + chunk.nregs as usize, SynValue::Nothing);
         {
+            // Los parámetros van a sus registros (F3.7); otro nombre ligado, a la ventana.
             let mut e = call_env.borrow_mut();
             for k in 0..e.bindings.len_names().min(n) {
-                self.vm_locals[lbase + k] = e.bindings.take_slot(k);
+                let v = e.bindings.take_slot(k);
+                match chunk.param_slots.iter().rposition(|&s| s as usize == k) {
+                    Some(i) => self.vm_regs[base + i] = v.unwrap_or(SynValue::Nothing),
+                    None => self.vm_locals[lbase + k] = v,
+                }
             }
         }
         let saved = std::mem::replace(&mut self.vm_lbase, lbase);
-        let r = self.run_chunk_regs(chunk, closure_env);
+        let r = self.run_chunk_at(chunk, closure_env, base);
+        self.vm_regs.truncate(base);
         self.vm_lbase = saved;
         self.vm_locals.truncate(lbase);
         r
+    }
+
+    /// Al volver de una llamada de la VM: los registros del llamado se sueltan (como antes, al
+    /// truncar su ventana) y la pila vuelve al largo que tenía antes de la llamada (`top`). Un
+    /// cuerpo con frame en registros empezó en los argumentos, dentro de la pila de entonces
+    /// (F3.7): esa parte se vacía en el lugar y lo que pasa de `top` se recorta.
+    #[inline(always)]
+    fn vm_pop_regs(&mut self, (cbase, cregs): (usize, u16), top: usize) {
+        if self.vm_regs.len() > top {
+            self.vm_regs.truncate(top);
+        }
+        let cend = (cbase + cregs as usize).min(self.vm_regs.len());
+        if cbase < cend {
+            for r in &mut self.vm_regs[cbase..cend] {
+                *r = SynValue::Nothing;
+            }
+        }
     }
 
     #[inline]
@@ -2473,8 +2547,16 @@ impl Interpreter {
                 // variable se mira acá, sin clonarla, y la referencia sólo se llama si puede.
                 Ins::TryInPlace { name, slot, .. }
                     if name != NONE
-                        && slot != u16::MAX
+                        && slot < PARAM
                         && !matches!(self.vm_locals[self.vm_lbase + slot as usize], Some(SynValue::List(_) | SynValue::Map(_))) =>
+                {
+                    Ok(())
+                }
+                Ins::TryInPlace { name, slot, .. }
+                    if name != NONE
+                        && slot != u16::MAX
+                        && slot >= PARAM
+                        && !matches!(self.vm_regs[base + (slot & !PARAM) as usize], SynValue::List(_) | SynValue::Map(_)) =>
                 {
                     Ok(())
                 }
@@ -2524,9 +2606,8 @@ impl Interpreter {
                                 dst,
                                 depth: std::mem::replace(&mut depth, 0),
                                 iter_base: std::mem::replace(&mut iter_base, self.vm_iters.len()),
-                                taint: enter.taint,
-                                task: enter.task,
                                 lbase: std::mem::replace(&mut self.vm_lbase, enter.lbase),
+                                top: enter.top,
                             };
                             self.vm_frames.push(caller);
                             base = enter.base;
@@ -2624,9 +2705,6 @@ impl Interpreter {
                     match self.opnd(&chunk, &env, base, src, at) {
                         Ok(v) => {
                             let caller = self.vm_frames.pop().expect("frame de la VM");
-                            if let Some(t) = caller.taint {
-                                self.leave_call(t);
-                            }
                             self.vm_iters.truncate(iter_base);
                             let call_env = std::mem::replace(&mut env, caller.env);
                             if chunk.regframe {
@@ -2636,14 +2714,14 @@ impl Interpreter {
                             }
                             self.vm_locals.truncate(self.vm_lbase);
                             self.vm_lbase = caller.lbase;
-                            drop(caller.task);
                             self.recursion_depth -= 1;
-                            self.vm_regs.truncate(base);
+                            let callee = (base, chunk.nregs);
                             chunk = caller.chunk;
                             base = caller.base;
                             pc = caller.pc;
                             depth = caller.depth;
                             iter_base = caller.iter_base;
+                            self.vm_pop_regs(callee, caller.top);
                             self.put(base, caller.dst, v);
                             Ok(())
                         }
@@ -2690,9 +2768,6 @@ impl Interpreter {
                 // `call_value_named_inner` (tinta, frame reciclado) y `call_value_named`
                 // (profundidad), por el camino normal y por el de error.
                 let caller = self.vm_frames.pop().expect("frame de la VM");
-                if let Some(t) = caller.taint {
-                    self.leave_call(t);
-                }
                 // Lo que el cuerpo tenía abierto (una vuelta, un brazo) se suelta sin reciclar,
                 // como cuando un `give` o un error salen de un `each` de la referencia.
                 while depth > 0 {
@@ -2711,14 +2786,14 @@ impl Interpreter {
                 // La ventana de locales de la llamada (frame en registros, vueltas sin frame).
                 self.vm_locals.truncate(self.vm_lbase);
                 self.vm_lbase = caller.lbase;
-                drop(caller.task);
                 self.recursion_depth -= 1;
-                self.vm_regs.truncate(base);
+                let callee = (base, chunk.nregs);
                 chunk = caller.chunk;
                 base = caller.base;
                 pc = caller.pc;
                 depth = caller.depth;
                 iter_base = caller.iter_base;
+                self.vm_pop_regs(callee, caller.top);
                 let result = match c {
                     Control::Give(v) => Ok(v),
                     other => Err(other),
@@ -2846,7 +2921,9 @@ impl Interpreter {
         // Sólo con una lista o un mapa puede aplicar; con cualquier otra cosa la referencia lee
         // la variable, ve que no encaja y deja todo como estaba.
         if name != NONE {
-            let now = if slot != u16::MAX {
+            let now = if slot != u16::MAX && slot >= PARAM {
+                Some(self.vm_regs[base + (slot & !PARAM) as usize].clone())
+            } else if slot != u16::MAX {
                 self.vm_locals[self.vm_lbase + slot as usize].clone()
             } else if ic == NONE {
                 env_get(env, &chunk.names[name as usize])
@@ -2866,9 +2943,9 @@ impl Interpreter {
         if spill != NONE {
             // La vía en el lugar es de la referencia y busca por nombre: las variables de la
             // ventana van a frames el rato que corre (ver `vm_spill`).
-            let frames = self.vm_spill(chunk, env, spill);
+            let frames = self.vm_spill(chunk, env, base, spill);
             let r = self.try_update_in_place(target, value, frames.last().expect("spill vacío"));
-            self.vm_unspill(chunk, spill, frames);
+            self.vm_unspill(chunk, base, spill, frames);
             return match r? {
                 Some(v) => {
                     self.put(base, dst, v);
@@ -2919,7 +2996,7 @@ impl Interpreter {
     /// La referencia (vía en el lugar, `set` con caminos) busca por nombre: los scopes de la
     /// ventana se arman como frames, de afuera hacia adentro, con las variables MOVIDAS adentro
     /// (las mismas cuentas de referencias que la referencia, y con ellas el copy-on-write).
-    fn vm_spill(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, spill: u32) -> SmallVec<[Rc<RefCell<Environment>>; 4]> {
+    fn vm_spill(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, spill: u32) -> SmallVec<[Rc<RefCell<Environment>>; 4]> {
         let mut frames: SmallVec<[Rc<RefCell<Environment>>; 4]> = SmallVec::new();
         for sp in chunk.spills[spill as usize].iter() {
             let parent = frames.last().cloned().unwrap_or_else(|| env.clone());
@@ -2928,7 +3005,10 @@ impl Interpreter {
             {
                 let mut e = frame.borrow_mut();
                 for (k, name) in chunk.layouts[sp.scope as usize].names.iter().enumerate() {
-                    let v = self.vm_locals[self.vm_lbase + sp.off as usize + k].take();
+                    let v = match param_reg_of(chunk, sp, k) {
+                        Some(r) => Some(std::mem::replace(&mut self.vm_regs[base + r], SynValue::Nothing)),
+                        None => self.vm_locals[self.vm_lbase + sp.off as usize + k].take(),
+                    };
                     e.bindings.push_slot(name.clone(), v);
                 }
             }
@@ -2939,7 +3019,7 @@ impl Interpreter {
 
     /// Las variables vuelven a la ventana y los frames a la pila (de adentro hacia afuera: cada
     /// uno suelta a su padre).
-    fn vm_unspill(&mut self, chunk: &Chunk, spill: u32, mut frames: SmallVec<[Rc<RefCell<Environment>>; 4]>) {
+    fn vm_unspill(&mut self, chunk: &Chunk, base: usize, spill: u32, mut frames: SmallVec<[Rc<RefCell<Environment>>; 4]>) {
         let chain = &chunk.spills[spill as usize];
         while let Some(frame) = frames.pop() {
             let sp = chain[frames.len()];
@@ -2947,7 +3027,12 @@ impl Interpreter {
                 let mut e = frame.borrow_mut();
                 let n = e.bindings.len_names().min(chunk.layouts[sp.scope as usize].names.len());
                 for k in 0..n {
-                    self.vm_locals[self.vm_lbase + sp.off as usize + k] = e.bindings.take_slot(k);
+                    let v = e.bindings.take_slot(k);
+                    match param_reg_of(chunk, &sp, k) {
+                        // Un parámetro nunca queda hueco (la referencia no lo puede desligar).
+                        Some(r) => self.vm_regs[base + r] = v.unwrap_or(SynValue::Nothing),
+                        None => self.vm_locals[self.vm_lbase + sp.off as usize + k] = v,
+                    }
                 }
             }
             self.release_frame(frame);
@@ -3079,9 +3164,9 @@ impl Interpreter {
         let loc = &chunk.locs[chunk.loc[at] as usize];
         let spill = chunk.node_spill[node as usize];
         let out = if spill != NONE {
-            let frames = self.vm_spill(chunk, env, spill);
+            let frames = self.vm_spill(chunk, env, base, spill);
             let r = self.exec_set(&chunk.nodes[node as usize], v, frames.last().expect("spill vacío"), loc, false);
-            self.vm_unspill(chunk, spill, frames);
+            self.vm_unspill(chunk, base, spill, frames);
             r?
         } else {
             self.exec_set(&chunk.nodes[node as usize], v, env, loc, false)?
@@ -3165,16 +3250,15 @@ impl Interpreter {
                         env_set_shared(&call_env, &param.name, v);
                     }
                     let laid = code.frame.as_ref().is_some_and(|l| call_env.borrow_mut().bindings.lay_out(l, code.tagged));
-                    let taint = if self.labels { Some(self.enter_call()) } else { None };
+                    // La VM no corre con etiquetas (`vm_code_for`): `enter_call`/`leave_call` sólo
+                    // mueven tinta de etiquetas, vacía y sin cambios acá.
+                    debug_assert!(!self.labels);
                     if !laid {
                         // No se pudo preparar el frame: el cuerpo por el tree-walker, como antes.
                         let out = match self.exec_block(&t.body, &call_env) {
                             Ok(v) | Err(Control::Give(v)) => Ok(v),
                             Err(other) => Err(other),
                         };
-                        if let Some(t) = taint {
-                            self.leave_call(t);
-                        }
                         self.release_frame(call_env);
                         self.recursion_depth -= 1;
                         let v = out?;
@@ -3185,8 +3269,7 @@ impl Interpreter {
                     self.vm_regs.resize(new_base + code.nregs as usize, SynValue::Nothing);
                     let lbase = self.vm_locals.len();
                     self.vm_locals.resize(lbase + code.nlocals as usize, None);
-                    let SynValue::Task(task) = f else { unreachable!() };
-                    return Ok(Some(Enter { code, env: call_env, base: new_base, taint, task, lbase }));
+                    return Ok(Some(Enter { code, env: call_env, base: new_base, lbase, top: new_base }));
                 }
             }
         }
@@ -3197,34 +3280,38 @@ impl Interpreter {
     /// locales, sin `Environment`; el cuerpo corre con el `closure_env`. Lo demás como la entrada
     /// de siempre (profundidad ya contada, defaults en el `closure_env`).
     fn vm_enter_regframe(&mut self, t: &Rc<SynTaskValue>, code: Rc<Chunk>, first: usize, n: usize) -> Result<Enter, Control> {
-        let lbase = self.vm_locals.len();
-        self.vm_locals.resize(lbase + code.nlocals as usize, None);
+        // F3.7: la ventana de registros del cuerpo empieza en los argumentos (como Lua): los
+        // parámetros `r0..` ya están en su lugar, sin copiarlos. Lo que hay del primer argumento
+        // en adelante es del llamado (los argumentos, que la llamada consume, y temporales
+        // muertos del llamador); al volver, el llamador recupera su largo con esos lugares vacíos.
+        let np = t.parameters.len();
+        let top = self.vm_regs.len();
+        let need = first + (code.nregs as usize).max(n);
+        if top < need {
+            self.vm_regs.resize(need, SynValue::Nothing);
+        }
         // Aridad permisiva (sin chequeo, un pipe): los de más se sueltan antes de los defaults.
-        for i in t.parameters.len()..n {
+        for i in np..n {
             drop(std::mem::replace(&mut self.vm_regs[first + i], SynValue::Nothing));
         }
-        for (i, param) in t.parameters.iter().enumerate() {
-            let v = if i < n {
-                std::mem::replace(&mut self.vm_regs[first + i], SynValue::Nothing)
-            } else {
-                match &param.default {
-                    Some(d) => match self.exec(d, &t.closure_env) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            self.vm_locals.truncate(lbase);
-                            self.recursion_depth -= 1;
-                            return Err(e);
-                        }
-                    },
-                    None => SynValue::Nothing,
-                }
+        let lbase = self.vm_locals.len();
+        self.vm_locals.resize(lbase + code.nlocals as usize, None);
+        for i in n.min(np)..np {
+            let v = match &t.parameters[i].default {
+                Some(d) => match self.exec(d, &t.closure_env) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.vm_locals.truncate(lbase);
+                        self.recursion_depth -= 1;
+                        return Err(e);
+                    }
+                },
+                None => SynValue::Nothing,
             };
-            self.vm_locals[lbase + code.param_slots[i] as usize] = Some(v);
+            self.vm_regs[first + i] = v;
         }
-        let taint = if self.labels { Some(self.enter_call()) } else { None };
-        let new_base = self.vm_regs.len();
-        self.vm_regs.resize(new_base + code.nregs as usize, SynValue::Nothing);
-        Ok(Enter { env: t.closure_env.clone(), code, base: new_base, taint, task: t.clone(), lbase })
+        debug_assert!(!self.labels);
+        Ok(Enter { env: t.closure_env.clone(), code, base: first, lbase, top })
     }
 
     /// El camino de siempre (`call_value_named`): builtins, argumentos nombrados, tasks sin
@@ -3266,10 +3353,9 @@ struct Enter {
     code: Rc<Chunk>,
     env: Rc<RefCell<Environment>>,
     base: usize,
-    taint: Option<TaintFrame>,
-    task: Rc<SynTaskValue>,
     /// La ventana de locales del cuerpo (F3.3b; la del llamador si el cuerpo tiene frame).
     lbase: usize,
+    top: usize,
 }
 
 /// La clave `key` de un mapa, por la posición que recuerda `ic` (si la clave en esa posición es
@@ -3288,6 +3374,15 @@ fn map_get_cached(m: &IndexMap<String, SynValue>, key: &str, ic: &Cell<u32>) -> 
     let (i, _, v) = m.get_full(key)?;
     ic.set(i as u32 + 1);
     Some(v.clone())
+}
+
+/// El registro del parámetro que ocupa el slot `k` del scope de `sp` (F3.7), si `sp` es el frame
+/// de un cuerpo con frame en registros; el último si el nombre se repite, como la referencia.
+fn param_reg_of(chunk: &Chunk, sp: &Spill, k: usize) -> Option<usize> {
+    if !sp.params {
+        return None;
+    }
+    chunk.param_slots.iter().rposition(|&s| s as usize == k)
 }
 
 /// Cuántas veces puede desoptimizarse una operación antes de quedar genérica para siempre (una que
