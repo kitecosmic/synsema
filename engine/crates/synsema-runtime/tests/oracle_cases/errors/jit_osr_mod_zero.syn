@@ -1,0 +1,12 @@
+-- F4.2: un error a mitad de un bucle nativo (`% 0`): la VM lo da con su texto y su ubicación, con
+-- las globales escritas de vuelta y los pasos exactos.
+
+let t be 0
+let i be 0
+let d be 5
+while i < 3000
+    when i == 2000
+        set d to 0
+    set t to t + i % d
+    set i to i + 1
+print(t)

@@ -43,6 +43,8 @@ judge-laya = ["dep:synsema-infer", "synsema-infer/arch-modernbert", "synsema-inf
 # El oráculo del resolver (F3.0): `oracle_run --resolver-check` compara cada búsqueda por nombre
 # del tree-walker con lo que predijo el resolver. Sólo en tests y ejemplos.
 synsema-core = { workspace = true, features = ["resolver-check"] }
+# F4: el oráculo compara también el nivel nativo contra la referencia (`oracle_run --jit-eager`).
+synsema-jit.workspace = true
 # E2E del Batch 13: un mini-servidor WS LOCAL para el dogfood del cliente WebSocket
 # (sin red externa). El mismo tungstenite que usa el stdlib, en modo `accept`.
 tungstenite = { workspace = true }

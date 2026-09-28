@@ -1,0 +1,11 @@
+-- F4.2b: un `range` con paso cero dentro de un bucle nativo: la VM da el error de `range`, con su
+-- ubicación, las globales escritas de vuelta y los pasos exactos.
+
+let total be 0
+let step be 3
+each i in range(0, 3000)
+    when i == 2000
+        set step to 0
+    each j in range(0, 9, step)
+        set total to total + j
+print(total)

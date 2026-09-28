@@ -1,0 +1,14 @@
+-- F4.2: el tope de recursión dentro de una llamada que hace un bucle nativo: la VM arma el error
+-- (la llamada que pasaría el tope sale antes), con el bucle esperando en su frame.
+
+task down(n)
+    when n == 0
+        give 0
+    give 1 + down(n - 1)
+
+let total be 0
+let i be 2990
+while i < 3000
+    set total to total + down(i)
+    set i to i + 1
+print(total)

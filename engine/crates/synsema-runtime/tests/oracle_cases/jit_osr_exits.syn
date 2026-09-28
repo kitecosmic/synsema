@@ -1,0 +1,82 @@
+-- F4.2: salidas de un bucle nativo a mitad de camino. Todo lo que el bucle tenía en registros
+-- (globales incluidas) vuelve a la VM antes de la instrucción que no puede hacer, y la VM sigue.
+
+-- Desborde: la global pasa a Big dentro del bucle; la entrada siguiente ya no encaja (un Big no es
+-- un Int) y el resto corre en la VM.
+let x be 1
+let n be 0
+while n < 3000
+    when n < 70
+        set x to x * 2
+    set n to n + 1
+print(x)
+print(n)
+
+-- Un tipo que cambia tarde: una rama que nunca corrió sale (todavía no está especializada) y la
+-- global queda Float.
+let acc be 0
+let j be 0
+while j < 3000
+    when j == 2500
+        set acc to acc + 0.5
+    otherwise
+        set acc to acc + 1
+    set j to j + 1
+print(acc)
+
+-- Llamadas a tasks desde el bucle: las tasks entran en la misma unidad nativa.
+task fib(m)
+    when m < 2
+        give m
+    give fib(m - 1) + fib(m - 2)
+task big(m)
+    give m * 4611686018427387904
+let t be 0
+let q be 0
+while q < 300
+    set t to t + fib(q % 15)
+    set q to q + 1
+print(t)
+
+-- Un llamado que desborda: sale a la VM a mitad de la llamada, con el bucle esperando su
+-- resultado (el frame del bucle pasa a esperar en la VM).
+let t2 be 0
+let r be 0
+while r < 100
+    when r < 90
+        set t2 to t2 + r
+    otherwise
+        set t2 to t2 + big(r)
+    set r to r + 1
+print(t2)
+
+-- Un bucle en una task que se llama una sola vez: el OSR en el cuerpo (registros y ventana).
+task spin(limit)
+    let i be 0
+    let s be 0
+    while true
+        when i >= limit
+            stop
+        set s to s + i
+        set i to i + 1
+    give s
+print(spin(5000))
+
+task find(limit)
+    let i be 0
+    while i < limit
+        when i * i > 5000
+            give i
+        set i to i + 1
+    give 0 - 1
+print(find(100000))
+
+-- Una global que es una lista: el bucle que la toca queda en la VM (nunca un valor con caja en
+-- código nativo) y la vía en el lugar sigue igual.
+let xs be []
+let w be 0
+while w < 300
+    set xs to append(xs, w % 5)
+    set w to w + 1
+print(length(xs))
+print(steps())

@@ -1,0 +1,8 @@
+-- F4.1: una rama que el nativo compiló sin que la VM la hubiera corrido y que falla: sale a la VM
+-- en esa instrucción y la VM da el error de siempre, con su ubicación.
+task g(n)
+    when n > 100
+        give n % (n - n)
+    give n * 2
+each n in [1, 2, 3, 4, 500, 6]
+    print(g(n))

@@ -1,0 +1,49 @@
+-- F4.1: una task compilada para enteros que después recibe otros tipos: la entrada ve que los
+-- argumentos no son enteros y esa llamada sigue en la VM (floats, Big, decimales, texto, bool).
+-- Cada task se llama desde un solo sitio, en un bucle y en un `let` (dentro de `append(…)` la
+-- evaluaría la vía en el lugar, en el tree-walker): ese sitio pasa a entrar al código nativo.
+
+let big be 9223372036854775807
+
+task add(a, b)
+    give a + b
+let pairs be [[1, 2], [3, 4], [5, 6], [1.5, 2], [7, 8], [2, 0.25], [10, 20], [big, big], [1, 2], [1.5d, 2], ["a", "b"], [3, 3], [-4, 4]]
+let out be []
+each p in pairs
+    let r be add(p[0], p[1])
+    set out to append(out, r)
+print(out)
+
+task twice(x)
+    give x * 2
+let tw be []
+each x in [4, 5, 2.5, 6, big * 4, 7, -3, big, 8]
+    let r be twice(x)
+    set tw to append(tw, r)
+print(tw)
+
+-- Un parámetro que no es número pero la task no hace cuentas con él: igual se pide entero para
+-- entrar (lo que no lo es va por la VM).
+task pick(c, a)
+    when c
+        give a
+    give 0
+let pk be []
+each p in [[1, 5], [0, 5], [true, 7], [false, 7], [2, 3], ["x", 1], [0, 9], [3, 1]]
+    let r be pick(p[0], p[1])
+    set pk to append(pk, r)
+print(pk)
+
+-- Una rama que nunca corrió antes de compilar (el `when`): el nativo sale a la VM ahí y la VM la
+-- especializa; después vuelve a entrar.
+task branchy(n)
+    when n > 1000
+        give n / 2
+    give n + 1
+let br be []
+each n in [1, 2, 3, 2000, 5, 4000, 6, 7]
+    let r be branchy(n)
+    set br to append(br, r)
+print(br)
+
+print(steps())

@@ -6,6 +6,48 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.36 — 2026-09-28
+
+Speed, sixth step: hot code runs as machine code. The same language — every program gives the
+same result, the same errors (text and location) and the same `steps()` count; `Int` still becomes
+a big integer instead of wrapping, cancellation and `timeout` still stop any loop — only much
+faster. Nothing to change in your programs.
+
+**Faster.** Measured on the interpreter built like the release (with PGO), against v0.6.35, best of
+15 alternating runs:
+
+- Recursive `fib(30)`: **258 ms → 14.6 ms**.
+- A 10-million-iteration loop over integers: with `each i in range(…)` **691 ms → 28.5 ms**; with
+  `while` **1305 ms → 55 ms**. Loops at the top level of a program (whose variables are globals)
+  count too.
+- Task calls from a loop, and chains of calls 16 deep: **−95 % to −97 %**; a loop calling a builtin
+  (`abs(i)`): **−20 %**.
+- With `--jitless` (the VM alone), no row is slower than v0.6.35.
+- Everything else within the build-to-build variation of a PGO binary (about ±5 %).
+
+**How.** A native tier compiles hot code with Cranelift (a code generator written in Rust):
+tasks that are called often and loops that turn often (entered mid-loop, the way V8 and the JVM do
+on-stack replacement), starting with integer and boolean arithmetic, comparisons, jumps, locals,
+globals, calls between those tasks and `each` over `range`. It compiles the code the VM already
+specialized, and it never produces a result or an error of its own: before anything it does not
+handle (an overflow into a big integer, a division by zero, a cancellation, a value of another
+type), it hands the exact state back to the VM, which carries on from that instruction. On x86-64 and
+aarch64 (Linux, macOS, Windows); the wasm builds and embedded guests keep the VM. Calls to builtins
+from the VM got their own fast path too (`CALL_BUILTIN_FAST` of CPython).
+
+**New flag: `--jitless`** (like `node --jitless`), for every command that runs programs: no native
+tier and no executable memory; everything runs in the VM. It turns no check off. `serve --attested`
+implies it (a smaller surface in what is attested). With labels (`--labels`, `serve --attested`) the
+reference interpreter runs, as before.
+
+**For contributors.** New crate `synsema-jit` (Cranelift 0.136.1; the only `unsafe` of the engine
+lives in its `abi.rs`, and a test fails if it appears anywhere else); core gains a safe hook
+(`native_tier`, feature `native-tier`, no new dependencies). The generated code only touches memory
+through its context at fixed offsets and its own stack slots (checked on every compiled function).
+The differential oracle has an eager native pass (every hot task and loop compiled at once) and
+fuzzing against the reference interpreter. Measuring: instructions executed (`cachegrind`) are now
+the main metric — deterministic; time with PGO is the second one.
+
 ## v0.6.35 — 2026-09-28
 
 Speed, fifth step: lighter task calls. The same language — every program gives the same result,

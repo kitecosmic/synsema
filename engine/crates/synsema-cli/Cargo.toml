@@ -22,6 +22,10 @@ judge-laya = ["synsema-runtime/judge-laya"]
 [target.'cfg(windows)'.dependencies]
 mimalloc.workspace = true
 
+# F4: el nivel nativo (Cranelift), sólo donde genera código (x86-64 y aarch64).
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
+synsema-jit.workspace = true
+
 [dependencies]
 synsema-core.workspace = true
 synsema-capabilities.workspace = true

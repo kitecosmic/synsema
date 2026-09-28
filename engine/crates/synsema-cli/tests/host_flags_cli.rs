@@ -451,3 +451,25 @@ fn test_takes_several_files_and_a_glob() {
     assert!(err.contains("no .syn files in 't/*.nope'"), "{}", err);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// F4.2: `--jitless` (sin el nivel nativo, como `node --jitless`) es un flag del host en todos los
+/// subcomandos que corren programas: da exactamente lo mismo (sólo cambia quién ejecuta lo
+/// caliente) y, después de `--`, es un argumento del programa.
+#[test]
+fn jitless_gives_the_same_result_and_after_double_dash_is_the_programs() {
+    let dir = project("jitless");
+    let src = "task fib(n)\n    when n < 2\n        give n\n    give fib(n - 1) + fib(n - 2)\nlet t be 0\nlet i be 0\nwhile i < 20000\n    set t to t + i % 7\n    set i to i + 1\nprint(fib(22))\nprint(t)\nprint(steps())\n";
+    std::fs::write(dir.join("hot.syn"), src).unwrap();
+    let (code, native, err) = synsema(&dir, &["run", "hot.syn"], None);
+    assert_eq!(code, 0, "{}", err);
+    let (code, jitless, err) = synsema(&dir, &["run", "--jitless", "hot.syn"], None);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(native, jitless);
+    assert!(native.starts_with("17711"), "{}", native);
+    let (code, _, err) = synsema(&dir, &["test", "--jitless", "hot.syn"], None);
+    assert_ne!(code, 2, "test no aceptó --jitless: {}", err);
+    std::fs::write(dir.join("a.syn"), "print(args())\n").unwrap();
+    let (code, out, _) = synsema(&dir, &["run", "a.syn", "--", "--jitless"], None);
+    assert_eq!(code, 0);
+    assert_eq!(out.trim(), "[\"--jitless\"]");
+}

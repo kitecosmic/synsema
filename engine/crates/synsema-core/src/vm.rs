@@ -28,6 +28,10 @@ use crate::resolve::{self, Resolution, ScopeId, Target};
 use num_integer::Integer;
 use std::cell::Cell;
 
+#[cfg(feature = "native-tier")]
+#[path = "vm_native.rs"]
+mod native;
+
 pub(crate) type Reg = u16;
 /// Registro destino "no hace falta el valor": se suelta en el acto.
 const DISCARD: Reg = Reg::MAX;
@@ -103,6 +107,13 @@ pub(crate) enum Ins {
     Unary { dst: Reg, op: UnOp, a: Opnd },
     ToBool { dst: Reg, src: Opnd },
     Jump { to: u32 },
+    /// F4.2: el salto hacia atrás de un `while` cuando hay nivel nativo. Cuenta vueltas (la cuenta
+    /// regresiva de `chunk.loops[lp]`) y, caliente, entra al bucle compilado a mitad de camino
+    /// (OSR). Si el bucle no se compila o no rinde, vuelve a ser `Jump`.
+    /// F4.2b: también el fin de la vuelta de un `each` sin frame (`EachStepV`: los lugares
+    /// `first..first + n` se sueltan antes); `n = 0` en un `while`.
+    #[cfg(feature = "native-tier")]
+    LoopBack { to: u32, lp: u16, first: u16, n: u16 },
     JumpIfFalsy { src: Opnd, to: u32 },
     LetLocal { src: Opnd, slot: u16, dst: Reg },
     /// F3.3b: lo mismo sobre la ventana de locales (el compilador sabe el modo: el despacho de
@@ -149,6 +160,15 @@ pub(crate) enum Ins {
     /// es una task compilada y todos van por posición, la VM entra al cuerpo sin recursión en
     /// Rust; si no, el camino de siempre (`call_value_named`).
     Call { dst: Reg, func: Reg, args: Reg, n: u16, site: u32 },
+    /// F4.1b (quickening, como `CALL_BUILTIN_FAST` de CPython 3.11): un `Call` sin argumentos con
+    /// nombre que vio un builtin sin `param_names`. Los mismos pasos observables que el camino
+    /// genérico (aridad máxima, profundidad, `dispatch_builtin`, `pending_kwargs` vacío), sin armar
+    /// pares nombre/valor ni copiar los argumentos dos veces. Si ya no encaja, vuelve a ser `Call`.
+    CallBuiltin { dst: Reg, func: Reg, args: Reg, n: u16, site: u32 },
+    /// F4.1: un `Call` a una task que tiene código nativo (lo reescribe la VM cuando la task pasa
+    /// el umbral). Si la task, los argumentos o las globales ya no encajan, vuelve a ser `Call`.
+    #[cfg(feature = "native-tier")]
+    CallNative { dst: Reg, func: Reg, args: Reg, n: u16, site: u32 },
     /// Define una task o lambda (el tree-walker) y le cuelga su cuerpo compilado.
     Define { dst: Reg, node: u32, child: u32 },
     /// `each` (F3.2): evalúa la colección (como la referencia, con el atajo de `range`) y deja su
@@ -253,6 +273,9 @@ pub(crate) struct Chunk {
     /// Reservado (calor/OSR): dónde empieza cada bucle.
     #[allow(dead_code)]
     loop_heads: Vec<u32>,
+    /// F4.2: el estado de cada `LoopBack` (cuenta de vueltas, código nativo).
+    #[cfg(feature = "native-tier")]
+    loops: Box<[native::LoopState]>,
 }
 
 /// Un scope que vive en la ventana de locales: su layout (el del resolver) y dónde empieza.
@@ -313,6 +336,9 @@ pub(crate) struct VmFrame {
 pub struct TaskCode {
     code: std::cell::OnceCell<Rc<Chunk>>,
     calls: Cell<u32>,
+    /// F4: el nivel nativo de esta task (cuántas llamadas lleva, y su código compilado).
+    #[cfg(feature = "native-tier")]
+    native: native::NativeState,
 }
 
 /// Una task definida por el tree-walker se compila recién en su segunda llamada: una lambda que
@@ -530,6 +556,9 @@ struct Compiler<'r, 's> {
     loops: Vec<u32>,
     feedback: u16,
     loop_heads: Vec<u32>,
+    /// Cuántos `LoopBack` emitió (F4.2).
+    #[cfg_attr(not(feature = "native-tier"), allow(dead_code))]
+    nloops: u16,
     cur_loc: u32,
     ics: u32,
     ic_hops: Vec<u32>,
@@ -581,6 +610,7 @@ impl<'r, 's> Compiler<'r, 's> {
             loops: Vec::new(),
             feedback: 0,
             loop_heads: Vec::new(),
+            nloops: 0,
             cur_loc: 0,
             ics: 0,
             ic_hops: Vec::new(),
@@ -733,6 +763,32 @@ impl<'r, 's> Compiler<'r, 's> {
         if self.pending > 0 {
             self.emit(Ins::Nop);
         }
+    }
+
+    /// El salto hacia atrás de un `while`: `LoopBack` si hay nivel nativo (F4.2), si no el `Jump`
+    /// de siempre (sin nivel nativo el despacho no paga nada por el OSR).
+    fn loop_back(&mut self, head: u32) {
+        #[cfg(feature = "native-tier")]
+        if crate::native_tier::tier().is_some() {
+            let lp = self.nloops;
+            self.nloops += 1;
+            self.emit(Ins::LoopBack { to: head, lp, first: 0, n: 0 });
+            return;
+        }
+        self.emit(Ins::Jump { to: head });
+    }
+
+    /// El fin de la vuelta de un `each` sin frame (F4.2b): `LoopBack` con los lugares que suelta si
+    /// hay nivel nativo; si no, el `EachStepV` de siempre.
+    fn each_back(&mut self, head: u32, first: u16, n: u16) {
+        #[cfg(feature = "native-tier")]
+        if crate::native_tier::tier().is_some() {
+            let lp = self.nloops;
+            self.nloops += 1;
+            self.emit(Ins::LoopBack { to: head, lp, first, n });
+            return;
+        }
+        self.emit(Ins::EachStepV { head, first, n });
     }
 
     fn label(&mut self) -> u32 {
@@ -981,7 +1037,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 self.loops.push(exit);
                 self.block(body, want, true);
                 self.loops.pop();
-                self.emit(Ins::Jump { to: head });
+                self.loop_back(head);
                 self.bind(exit);
                 self.emit(Ins::Unwind { depth: self.depth });
             }
@@ -1150,7 +1206,7 @@ impl<'r, 's> Compiler<'r, 's> {
         self.loops.push(exit);
         self.block(body, want, true);
         self.loops.pop();
-        self.emit(Ins::EachStepV { head, first, n: count });
+        self.each_back(head, first, count);
         self.cur_scope = outer_scope;
         self.bind(exit);
         self.emit(Ins::EachEndV { it, first, n: count });
@@ -1667,6 +1723,11 @@ impl<'r, 's> Compiler<'r, 's> {
                     leader[target(&self.labels, to)] = true;
                     leader[i + 1] = true;
                 }
+                #[cfg(feature = "native-tier")]
+                Ins::LoopBack { to, .. } => {
+                    leader[target(&self.labels, to)] = true;
+                    leader[i + 1] = true;
+                }
                 // F3.5: no corta el bloque (lo común es que no aplique y siga en línea); cuando llama
                 // a la referencia descuenta antes lo que el bloque sumó de más (ver el despacho).
                 Ins::TryInPlace { done, .. } => {
@@ -1694,7 +1755,9 @@ impl<'r, 's> Compiler<'r, 's> {
                     leader[i + 1] = true;
                 }
                 Ins::EachInit { .. } => leader[i + 1] = true,
-                Ins::Exec { .. } | Ins::Call { .. } => leader[i + 1] = true,
+                Ins::Exec { .. } | Ins::Call { .. } | Ins::CallBuiltin { .. } => leader[i + 1] = true,
+                #[cfg(feature = "native-tier")]
+                Ins::CallNative { .. } => leader[i + 1] = true,
                 Ins::Define { .. } | Ins::Give { .. } | Ins::StopOut { .. } | Ins::End { .. } => leader[i + 1] = true,
                 _ => {}
             }
@@ -1753,6 +1816,8 @@ impl<'r, 's> Compiler<'r, 's> {
         for ins in code.iter_mut() {
             match ins {
                 Ins::Jump { to } | Ins::JumpIfFalsy { to, .. } => *to = map(*to, &self.labels),
+                #[cfg(feature = "native-tier")]
+                Ins::LoopBack { to, .. } => *to = map(*to, &self.labels),
                 Ins::TryInPlace { done, .. } => *done = map(*done, &self.labels),
                 Ins::EachNext { exit, .. } => *exit = map(*exit, &self.labels),
                 Ins::MatchArm { fail, .. } => *fail = map(*fail, &self.labels),
@@ -1798,6 +1863,8 @@ impl<'r, 's> Compiler<'r, 's> {
             hops: self.hops,
             deopts: (0..=self.feedback as usize).map(|_| Cell::new(0)).collect(),
             loop_heads,
+            #[cfg(feature = "native-tier")]
+            loops: (0..self.nloops).map(|_| native::LoopState::default()).collect(),
         })
     }
 }
@@ -2441,6 +2508,44 @@ impl Interpreter {
                     pc = to as usize;
                     Ok(())
                 }
+                #[cfg(feature = "native-tier")]
+                Ins::LoopBack { to, lp, first, n } => {
+                    if n > 0 {
+                        // El fin de la vuelta de un `each`: como `EachStepV`.
+                        let k = self.vm_lbase + first as usize;
+                        for x in &mut self.vm_locals[k..k + n as usize] {
+                            *x = None;
+                        }
+                    }
+                    pc = to as usize;
+                    if chunk.loops[lp as usize].tick() {
+                        match self.vm_loop_hot(&chunk, &env, base, iter_base, at, lp) {
+                            native::OsrStep::Stay => {}
+                            native::OsrStep::Exit(p) => pc = p,
+                            native::OsrStep::Resume { r, pc: back, dst: rdst } => {
+                                // Salió a mitad de una llamada: este frame espera su resultado
+                                // (como en `CallNative`) y la VM sigue en el de más adentro.
+                                let native::Resume { frames, enter, pc: at_pc, top0, iter_base: ib } = *r;
+                                let caller = VmFrame {
+                                    chunk: std::mem::replace(&mut chunk, enter.code),
+                                    env: std::mem::replace(&mut env, enter.env),
+                                    base,
+                                    pc: back,
+                                    dst: rdst,
+                                    depth: std::mem::replace(&mut depth, 0),
+                                    iter_base: std::mem::replace(&mut iter_base, ib),
+                                    lbase: std::mem::replace(&mut self.vm_lbase, enter.lbase),
+                                    top: top0,
+                                };
+                                self.vm_frames.push(caller);
+                                self.vm_frames.extend(frames);
+                                base = enter.base;
+                                pc = at_pc;
+                            }
+                        }
+                    }
+                    Ok(())
+                }
                 Ins::JumpIfFalsy { src, to } => self.opnd(&chunk, &env, base, src, at).map(|v| {
                     if !v.is_truthy() {
                         pc = to as usize;
@@ -2617,6 +2722,47 @@ impl Interpreter {
                         Err(c) => Err(c),
                     }
                 }
+                #[cfg(feature = "native-tier")]
+                Ins::CallNative { dst, func, args, n, site } => match self.vm_call_native(&chunk, base, at, dst, func, args, n, site) {
+                    Ok(native::NativeStep::Done) => Ok(()),
+                    // No pudo entrar (y no tocó nada): la instrucción ya volvió a ser `Call` y se
+                    // repite como tal.
+                    Ok(native::NativeStep::Retry) => {
+                        pc = at;
+                        Ok(())
+                    }
+                    Ok(native::NativeStep::Resume(r)) => {
+                        // Salió a la VM a mitad de camino: el que llamó, los frames nativos de
+                        // afuera esperando a su llamado, y la VM sigue en el de más adentro.
+                        let native::Resume { frames, enter, pc: at_pc, top0, iter_base: ib } = *r;
+                        let caller = VmFrame {
+                            chunk: std::mem::replace(&mut chunk, enter.code),
+                            env: std::mem::replace(&mut env, enter.env),
+                            base,
+                            pc,
+                            dst,
+                            depth: std::mem::replace(&mut depth, 0),
+                            iter_base: std::mem::replace(&mut iter_base, ib),
+                            lbase: std::mem::replace(&mut self.vm_lbase, enter.lbase),
+                            top: top0,
+                        };
+                        self.vm_frames.push(caller);
+                        self.vm_frames.extend(frames);
+                        base = enter.base;
+                        pc = at_pc;
+                        Ok(())
+                    }
+                    Err(c) => Err(c),
+                },
+                Ins::CallBuiltin { dst, func, args, n, site } => match self.vm_call_builtin(&chunk, base, at, dst, func, args, n, site) {
+                    Ok(true) => Ok(()),
+                    // Ya no encaja (y no tocó nada): volvió a ser `Call` y se repite como tal.
+                    Ok(false) => {
+                        pc = at;
+                        Ok(())
+                    }
+                    Err(c) => Err(c),
+                },
                 Ins::EachInit { node, it } => self.vm_each_init(&chunk, &env, node, it, iter_base),
                 Ins::EachNext { it, var, scope, exit } => {
                     match self.vm_iters[iter_base + it as usize].next_item() {
@@ -3224,6 +3370,11 @@ impl Interpreter {
                         return Err(err("maximum recursion depth exceeded"));
                     }
                     if code.regframe {
+                        // F4.1: una task caliente pasa al nivel nativo (esta llamada, en la VM).
+                        #[cfg(feature = "native-tier")]
+                        if t.code.native.tick() {
+                            self.vm_native_tier_up(chunk, at, t);
+                        }
                         return self.vm_enter_regframe(t, code, first, n).map(Some);
                     }
                     let call_env = self.acquire_frame(&t.closure_env, "call");
@@ -3331,6 +3482,12 @@ impl Interpreter {
     ) -> Result<Option<Enter>, Control> {
         let loc = &chunk.locs[chunk.loc[at] as usize];
         let s = &chunk.sites[site as usize];
+        // F4.1b: un builtin llamado sólo por posición: la próxima vez, `CallBuiltin`.
+        if s.names.is_none() && matches!(&f, SynValue::Builtin(b) if b.param_names.is_none()) {
+            if let Ins::Call { dst, func, args, n, site } = chunk.code[at].get() {
+                chunk.code[at].set(Ins::CallBuiltin { dst, func, args, n, site });
+            }
+        }
         let mut cargs = self.free_args.pop().unwrap_or_default();
         cargs.reserve(n);
         for i in 0..n {
@@ -3345,6 +3502,61 @@ impl Interpreter {
         let v = out?;
         self.put(base, dst, v);
         Ok(None)
+    }
+}
+
+impl Interpreter {
+    /// `CallBuiltin`: `Ok(false)` si ya no encaja (la instrucción volvió a ser `Call`: se repite).
+    /// Lo mismo que `vm_call_generic` + `call_value_named` para un builtin por posición: la función
+    /// sale de su registro, el máximo de argumentos (antes de la profundidad), la profundidad con el
+    /// mismo tope y el mismo error, y `dispatch_builtin` con `pending_kwargs` vacío.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_call_builtin(
+        &mut self,
+        chunk: &Chunk,
+        base: usize,
+        at: usize,
+        dst: Reg,
+        func: Reg,
+        args: Reg,
+        n: u16,
+        site: u32,
+    ) -> Result<bool, Control> {
+        let nn = n as usize;
+        let fits = match &self.vm_regs[base + func as usize] {
+            SynValue::Builtin(b) => {
+                b.param_names.is_none()
+                    && self.pending_kwargs.is_empty()
+                    // Pasarse del máximo es error: lo arma el camino de siempre.
+                    && (!chunk.sites[site as usize].checked || b.meta.constructor || b.meta.arity.1.is_none_or(|max| nn <= max))
+            }
+            _ => false,
+        };
+        if !fits {
+            chunk.code[at].set(Ins::Call { dst, func, args, n, site });
+            return Ok(false);
+        }
+        let f = std::mem::replace(&mut self.vm_regs[base + func as usize], SynValue::Nothing);
+        let first = base + args as usize;
+        let argv: SmallVec<[SynValue; 4]> =
+            (0..nn).map(|i| std::mem::replace(&mut self.vm_regs[first + i], SynValue::Nothing)).collect();
+        self.recursion_depth += 1;
+        if self.recursion_depth > MAX_RECURSION {
+            self.recursion_depth -= 1;
+            return Err(err("maximum recursion depth exceeded"));
+        }
+        let SynValue::Builtin(bt) = &f else { unreachable!("CallBuiltin sin builtin") };
+        let r = self.dispatch_builtin(bt, &argv, &chunk.locs[chunk.loc[at] as usize]);
+        // Como el camino genérico, que vuelve a poner el mapa que había (vacío) al terminar.
+        if !self.pending_kwargs.is_empty() {
+            self.pending_kwargs = IndexMap::new();
+        }
+        drop(argv);
+        self.recursion_depth -= 1;
+        let v = r?;
+        self.put(base, dst, v);
+        Ok(true)
     }
 }
 

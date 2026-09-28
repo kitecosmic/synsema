@@ -39,7 +39,7 @@ mod synfide;
 mod update;
 mod code;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--health <path>] [--attested] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] <archivo.syn | -> [-- args...] | test [-v] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--labels] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--health <path>] [--attested] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] <archivo.syn | -> [-- args...] | test [-v] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--labels] [--jitless] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
 
 // `build_ceiling` (--sandbox/--cap-set → techo) vive en synsema-capabilities: lo comparten
 // este binario y `synsema-wasm` (mismas flags, misma semántica en los dos front-ends).
@@ -67,6 +67,9 @@ pub(crate) struct HostFlags {
     /// `--labels`: etiquetas de flujo de información (`private`/`declassify`)
     /// Encendidas en todos los intérpretes del proceso. `serve --attested` las enciende solo.
     pub labels: bool,
+    /// F4.2: `--jitless` (como `node --jitless`): sin el nivel nativo, todo en la VM. No apaga
+    /// ningún chequeo; lo decide `main` antes de instalar el nivel (ver `jitless_requested`).
+    pub jitless: bool,
     pub filename: Option<String>,
     pub program_args: Vec<String>,
     pub rest: Vec<String>,
@@ -157,6 +160,7 @@ pub(crate) fn take_host_flags(cmd: &str, args: &[String]) -> Result<HostFlags, E
             "--sandbox" => h.sandbox = true,
             "--deterministic" => h.deterministic = true,
             "--labels" => h.labels = true,
+            "--jitless" => h.jitless = true,
             "--cap-set" => {
                 h.cap_set = Some(need_value("--cap-set", args.get(i + 1))?);
                 i += 1;
@@ -441,10 +445,25 @@ fn run_bundled(bundle: synsema_core::bundle::Bundle, program_args: Vec<String>) 
     ExitCode::SUCCESS
 }
 
+/// F4.2: `--jitless` entre los flags del CLI (antes de un `--`: lo de después es del programa), o
+/// `serve --attested`, que es el modo endurecido (el nivel nativo no se instala: menos superficie
+/// en lo que se atestigua). Como `node --jitless`: no hay variable de entorno.
+fn jitless_requested(args: &[String]) -> bool {
+    let flags: Vec<&str> = args.iter().skip(1).map(String::as_str).take_while(|a| *a != "--").collect();
+    let sub = flags.iter().copied().find(|a| *a != "--engine");
+    flags.contains(&"--jitless") || (sub == Some("serve") && flags.contains(&"--attested"))
+}
+
 fn main() -> ExitCode {
     // Antes del primer print: una salida sin lector nunca es un pánico (stdio.rs).
     stdio::install_broken_pipe_guard();
     let mut args: Vec<String> = std::env::args().collect();
+    // F4: el nivel nativo para lo caliente (no cambia lo observable; ver synsema-jit), salvo con
+    // `--jitless` o `serve --attested`: ahí no se crea el JIT (ni memoria ejecutable).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if !jitless_requested(&args) {
+        synsema_jit::install();
+    }
 
     // `--engine` como primer argumento: el CLI del motor, en cualquier binario (en uno
     // de `synsema build` es la ÚNICA forma de llegar al motor; en `synsema` es un
@@ -2367,4 +2386,28 @@ fn cmd_daemon(args: &[String]) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod jitless_tests {
+    use super::jitless_requested;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        std::iter::once("synsema").chain(a.iter().copied()).map(String::from).collect()
+    }
+
+    /// F4.2: sin el nivel nativo con `--jitless` en cualquier subcomando y con `serve --attested`
+    /// (el modo endurecido); un `--jitless` del programa (después de `--`) no cuenta.
+    #[test]
+    fn jitless_is_requested_by_the_flag_and_by_attested_serve() {
+        assert!(!jitless_requested(&args(&["run", "a.syn"])));
+        assert!(jitless_requested(&args(&["run", "--jitless", "a.syn"])));
+        assert!(jitless_requested(&args(&["run", "a.syn", "--jitless"])));
+        assert!(jitless_requested(&args(&["--engine", "test", "--jitless", "t.syn"])));
+        assert!(!jitless_requested(&args(&["run", "a.syn", "--", "--jitless"])));
+        assert!(jitless_requested(&args(&["serve", "--attested", "app.syn"])));
+        assert!(jitless_requested(&args(&["--engine", "serve", "app.syn", "--attested"])));
+        assert!(!jitless_requested(&args(&["run", "a.syn", "--attested"])));
+        assert!(!jitless_requested(&args(&["serve", "app.syn", "--", "--attested"])));
+    }
 }

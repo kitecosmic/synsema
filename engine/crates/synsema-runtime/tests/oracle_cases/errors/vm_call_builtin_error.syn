@@ -1,0 +1,6 @@
+-- F4.1b: el error de un builtin dentro de un sitio especializado: el mismo texto y la misma ubicación.
+let xs be ["1", "22", "333", 4, "5"]
+let n be 0
+each x in xs
+    set n to n + length(x)
+print(n)

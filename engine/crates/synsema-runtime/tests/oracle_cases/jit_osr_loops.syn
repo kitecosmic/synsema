@@ -1,0 +1,51 @@
+-- F4.2: bucles del nivel superior que pasan a nativo a mitad de camino (OSR). Las globales viven en
+-- registros mientras corre el bucle y vuelven a su lugar en cada salida: se leen después, se leen
+-- en el bucle siguiente y cuentan los mismos pasos.
+
+let total be 0
+let i be 0
+while i < 5000
+    set total to total + i % 7
+    set i to i + 1
+print(total)
+print(i)
+
+-- Una global que el bucle sólo lee, un `let` en el nivel del bucle y bucles anidados (el de
+-- adentro sube primero; después el de afuera lo compila como un salto más).
+let limit be 120
+let acc be 0
+let a be 0
+while a < limit
+    let b be 0
+    while b < 40
+        set acc to acc + a * b - b % 3
+        set b to b + 1
+    set a to a + 1
+print(acc)
+print(b)
+
+-- Bool en una global, `stop` y comparaciones de todas las formas.
+let flag be false
+let k be 0
+let hits be 0
+while true
+    when k >= 3000
+        stop
+    when k % 11 == 0
+        set flag to not flag
+        set hits to hits + 1
+    when k != 17 and k <= 2999
+        set hits to hits + 0
+    set k to k + 1
+print(flag)
+print(hits)
+print(k)
+
+-- El valor de un `while` que no corre ninguna vuelta y una global que no cambia.
+let untouched be 42
+let z be 10
+while z < 5
+    set z to z + 1
+print(z)
+print(untouched)
+print(steps())

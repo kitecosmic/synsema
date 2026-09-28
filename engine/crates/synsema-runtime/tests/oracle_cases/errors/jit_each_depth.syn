@@ -1,0 +1,16 @@
+-- F4.2b: un `each` sobre `range` cuenta un nivel de recursión (como la llamada al builtin): en el
+-- fondo de una recursión nativa, el que pasaría el tope sale a la VM y la VM da el error.
+
+task deep(n)
+    when n == 0
+        let s be 0
+        each i in range(3)
+            set s to s + i
+        give s
+    give deep(n - 1)
+
+let out be 0
+each k in [5, 10, 2990, 2995, 2997, 2998, 2999, 3000]
+    let r be deep(k)
+    set out to out + r
+print(out)

@@ -1,0 +1,15 @@
+[package]
+name = "synsema-jit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Synsema: el nivel nativo (F4 de specs/compute-rendimiento.md), código de máquina con Cranelift para lo caliente"
+publish = false
+
+[dependencies]
+synsema-core = { workspace = true, features = ["native-tier"] }
+cranelift-codegen = { version = "=0.136.1", default-features = false, features = ["std", "unwind", "x86", "arm64"] }
+cranelift-frontend = "=0.136.1"
+cranelift-jit = "=0.136.1"
+cranelift-module = "=0.136.1"
+cranelift-native = "=0.136.1"

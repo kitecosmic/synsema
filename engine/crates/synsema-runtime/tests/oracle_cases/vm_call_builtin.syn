@@ -1,0 +1,41 @@
+-- F4.1b contra la referencia: un `Call` que ve un builtin llamado por posición se especializa en
+-- `CallBuiltin`. Cada sitio corre muchas veces (en un bucle), así corre especializado.
+
+-- Un sitio que siempre llama al mismo builtin.
+let t be 0
+let i be 0
+while i < 50
+    set t to t + abs(0 - i)
+    set i to i + 1
+print(t)
+
+-- Un sitio cuya función cambia: builtins distintos, una task, una lambda y de vuelta un builtin.
+task twice(x)
+    give x * 2
+let calls be [[abs, -5], [twice, 4], [abs, 7], [length, [1, 2, 3]], [(x) => x + 1, 9], [abs, -2], [twice, 3], [length, "hola"]]
+let out be []
+each c in calls
+    let f be c[0]
+    let r be f(c[1])
+    set out to append(out, r)
+print(out)
+
+-- Builtins que llaman de vuelta a código del programa (`apply`, `where`).
+task sq(x)
+    give x * x
+let ys be []
+each k in range(0, 4)
+    let m be apply([1, 2, 3], sq)
+    let fl be where([1, 2, 3, 4], (x) => x % 2 == k % 2)
+    set ys to append(ys, [m, fl])
+print(ys)
+
+-- Un builtin con argumentos con nombre en otro sitio (ése sigue por el camino de siempre).
+let zs be []
+each k in range(0, 3)
+    let a be round(2.567)
+    let b be round_to(2.567, k)
+    set zs to append(zs, [a, b])
+print(zs)
+
+print(steps())
