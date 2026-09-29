@@ -18,7 +18,6 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use indexmap::IndexMap;
 use smallvec::{smallvec, SmallVec};
 use num_complex::Complex64;
 use regex::Regex;
@@ -660,8 +659,8 @@ impl Bindings {
 /// reutiliza mientras esté registrada).
 #[derive(Default)]
 struct ModuleRegistry {
-    by_map: HashMap<usize, (std::rc::Weak<RefCell<IndexMap<String, SynValue>>>, std::rc::Weak<RefCell<Environment>>)>,
-    by_env: HashMap<usize, std::rc::Weak<RefCell<IndexMap<String, SynValue>>>>,
+    by_map: HashMap<usize, (std::rc::Weak<RefCell<MapObj>>, std::rc::Weak<RefCell<Environment>>)>,
+    by_env: HashMap<usize, std::rc::Weak<RefCell<MapObj>>>,
     prune_at: usize,
 }
 
@@ -671,7 +670,7 @@ thread_local! {
 
 /// Registra el mapa de exportaciones `map` como la vista de `env` (lo llaman `load_module`
 /// y la reconstrucción de módulos de un worker de `serve`/`parallel_map`).
-pub fn register_module(map: &Rc<RefCell<IndexMap<String, SynValue>>>, env: &Rc<RefCell<Environment>>) {
+pub fn register_module(map: &Rc<RefCell<MapObj>>, env: &Rc<RefCell<Environment>>) {
     MODULES.with(|r| {
         let mut r = r.borrow_mut();
         if r.by_map.len() >= r.prune_at.max(64) {
@@ -679,26 +678,26 @@ pub fn register_module(map: &Rc<RefCell<IndexMap<String, SynValue>>>, env: &Rc<R
             r.by_env.retain(|_, m| m.strong_count() > 0);
             r.prune_at = r.by_map.len() * 2;
         }
-        r.by_map.insert(Rc::as_ptr(map) as usize, (Rc::downgrade(map), Rc::downgrade(env)));
+        r.by_map.insert(Rc::as_ptr(map).cast::<()>() as usize, (Rc::downgrade(map), Rc::downgrade(env)));
         r.by_env.insert(Rc::as_ptr(env) as usize, Rc::downgrade(map));
     });
 }
 
 /// El entorno del módulo cuyo mapa de exportaciones es `map`, si lo es.
-pub fn module_env_of_map(map: &Rc<RefCell<IndexMap<String, SynValue>>>) -> Option<Rc<RefCell<Environment>>> {
+pub fn module_env_of_map(map: &Rc<RefCell<MapObj>>) -> Option<Rc<RefCell<Environment>>> {
     MODULES.with(|r| {
         let r = r.borrow();
         if r.by_map.is_empty() {
             return None;
         }
-        let (m, e) = r.by_map.get(&(Rc::as_ptr(map) as usize))?;
+        let (m, e) = r.by_map.get(&(Rc::as_ptr(map).cast::<()>() as usize))?;
         m.upgrade()?;
         e.upgrade()
     })
 }
 
 /// El mapa de exportaciones del módulo cuyo entorno es `env`, si lo es.
-pub fn module_map_of_env(env: &Rc<RefCell<Environment>>) -> Option<Rc<RefCell<IndexMap<String, SynValue>>>> {
+pub fn module_map_of_env(env: &Rc<RefCell<Environment>>) -> Option<Rc<RefCell<MapObj>>> {
     MODULES.with(|r| r.borrow().by_env.get(&(Rc::as_ptr(env) as usize)).and_then(|m| m.upgrade()))
 }
 
@@ -706,7 +705,7 @@ pub fn module_map_of_env(env: &Rc<RefCell<Environment>>) -> Option<Rc<RefCell<In
 /// tasks), como `m.X = v` en Python; sus nombres son sus exportaciones y sus tasks no se
 /// reemplazan desde afuera.
 fn module_rebind(
-    m: &Rc<RefCell<IndexMap<String, SynValue>>>,
+    m: &Rc<RefCell<MapObj>>,
     menv: &Rc<RefCell<Environment>>,
     name: &str,
     value: SynValue,
@@ -1457,7 +1456,7 @@ pub struct Interpreter {
     /// partir de datos privados no puede serlo.
     arg_literals: u32,
     /// Argumentos sólo-por-nombre de la llamada a builtin en curso (`BUILTIN_KWARGS`).
-    pending_kwargs: IndexMap<String, SynValue>,
+    pending_kwargs: SynMap,
     /// Linaje (v0.6.29, DATOS-17): cada dato que el programa LEYÓ, anotado por el motor.
     lineage: Vec<LineageEntry>,
     /// Bytes canónicos de un valor estructurado para el linaje (el stdlib instala
@@ -1487,6 +1486,36 @@ impl Drop for Interpreter {
             env.bindings.clear();
         }
     }
+}
+
+/// Un argumento nombrado de un builtin sin `param_names`: a `kw` si el builtin lo acepta; si no, el
+/// error de siempre. Fuera de línea (F4.4): es el camino raro de `call_value_named_inner`.
+#[cold]
+#[inline(never)]
+fn builtin_named_arg(bt: &BuiltinTask, kw: &mut SynMap, n: String, v: SynValue, loc: &SourceLocation) -> Result<(), Control> {
+    let allowed = bt.meta.kwargs;
+    if allowed.contains(&n.as_str()) {
+        if kw.contains_key(&n) {
+            return Err(err_at(format!("duplicate argument '{}'", n), loc));
+        }
+        kw.insert(n, v);
+        return Ok(());
+    }
+    if !allowed.is_empty() {
+        return Err(err_at(
+            format!(
+                "{}() has no argument named '{}' (named arguments it takes: {})",
+                bt.name,
+                n,
+                allowed.join(", ")
+            ),
+            loc,
+        ));
+    }
+    Err(err_at(
+        format!("{}() does not accept named arguments (got {} = …); pass it by position", bt.name, n),
+        loc,
+    ))
 }
 
 impl Interpreter {
@@ -1622,7 +1651,7 @@ impl Interpreter {
             label_stop: Cell::new(false),
             principals_sealed: Cell::new(false),
             arg_literals: 0,
-            pending_kwargs: IndexMap::new(),
+            pending_kwargs: SynMap::new(),
             lineage: Vec::new(),
             lineage_canonical: None,
         };
@@ -3135,13 +3164,13 @@ impl Interpreter {
         let names = self.exports_collector.pop().unwrap_or_default();
         exec_res?;
 
-        let mut exports = IndexMap::new();
+        let mut exports = SynMap::new();
         for name in names {
             if let Some(v) = env_get(&module_env, &name) {
                 exports.insert(name, v);
             }
         }
-        let map = Rc::new(RefCell::new(exports));
+        let map = exports.into_ref();
         register_module(&map, &module_env);
         Ok(SynValue::Map(map))
     }
@@ -3578,16 +3607,16 @@ impl Interpreter {
                 .lineage()
                 .iter()
                 .map(|e| {
-                    let mut m = IndexMap::new();
-                    m.insert("source".to_string(), syn_text(e.source.as_str()));
-                    m.insert("what".to_string(), syn_text(e.what.as_str()));
-                    m.insert("sha256".to_string(), syn_text(e.sha256.as_str()));
-                    m.insert("bytes".to_string(), syn_int(e.bytes as i64));
-                    m.insert("encoding".to_string(), syn_text(e.encoding.as_str()));
+                    let mut m = SynMap::new();
+                    m.insert("source", syn_text(e.source.as_str()));
+                    m.insert("what", syn_text(e.what.as_str()));
+                    m.insert("sha256", syn_text(e.sha256.as_str()));
+                    m.insert("bytes", syn_int(e.bytes as i64));
+                    m.insert("encoding", syn_text(e.encoding.as_str()));
                     // Local, nunca en el recibo: con la sal el dueño revela una consulta.
                     if let Some((salt, qenc)) = &e.salt {
-                        m.insert("salt".to_string(), syn_text(salt.as_str()));
-                        m.insert("committed_encoding".to_string(), syn_text(*qenc));
+                        m.insert("salt", syn_text(salt.as_str()));
+                        m.insert("committed_encoding", syn_text(*qenc));
                     }
                     syn_map(m)
                 })
@@ -3632,11 +3661,11 @@ impl Interpreter {
         // Constantes matemáticas — VALORES globales (se usan sin llamar): pi/tau/e/inf/nan.
         {
             let mut g = self.global_env.borrow_mut();
-            g.bindings.insert("pi".to_string(), syn_float(std::f64::consts::PI));
-            g.bindings.insert("tau".to_string(), syn_float(std::f64::consts::TAU));
-            g.bindings.insert("e".to_string(), syn_float(std::f64::consts::E));
-            g.bindings.insert("inf".to_string(), syn_float(f64::INFINITY));
-            g.bindings.insert("nan".to_string(), syn_float(f64::NAN));
+            g.bindings.insert("pi", syn_float(std::f64::consts::PI));
+            g.bindings.insert("tau", syn_float(std::f64::consts::TAU));
+            g.bindings.insert("e", syn_float(std::f64::consts::E));
+            g.bindings.insert("inf", syn_float(f64::INFINITY));
+            g.bindings.insert("nan", syn_float(f64::NAN));
         }
     }
 
@@ -3857,7 +3886,7 @@ impl Interpreter {
         env: &Rc<RefCell<Environment>>,
     ) -> Result<Option<Vec<(String, SynValue)>>, Control> {
         let map = match value {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             _ => return Ok(None),
         };
         let mut binds = Vec::new();
@@ -4154,7 +4183,7 @@ impl Interpreter {
                 Ok(syn_list(items))
             }
             NodeKind::MapLiteral { pairs } => {
-                let mut m = IndexMap::new();
+                let mut m = SynMap::with_capacity(pairs.len());
                 // Una clave privada etiqueta el mapa entero (la clave es texto visible).
                 let mut key_label: Option<Label> = None;
                 for (k, v) in pairs {
@@ -4171,10 +4200,10 @@ impl Interpreter {
                                 None => kl,
                             });
                         }
-                        m.insert(labels::unwrap(&key).to_string(), val);
+                        m.insert(Key::of_value(labels::unwrap(&key)), val);
                         continue;
                     }
-                    m.insert(key.to_string(), val);
+                    m.insert(Key::of_value(&key), val);
                 }
                 match key_label {
                     Some(l) => self.rewrap(syn_map(m), l, loc),
@@ -4789,9 +4818,9 @@ impl Interpreter {
         let NodeKind::AgentDefinition { name, body, .. } = &node.kind else { unreachable!("exec_agent_definition: otro nodo") };
         {
         self.agent_definitions.insert(name.clone(), (body.clone(), env.clone()));
-        let mut m = IndexMap::new();
-        m.insert("name".to_string(), syn_text(name.as_str()));
-        m.insert("state".to_string(), syn_text("defined"));
+        let mut m = SynMap::new();
+        m.insert("name", syn_text(name.as_str()));
+        m.insert("state", syn_text("defined"));
         let agent_data = syn_map(m);
         env_set(env, name, agent_data.clone());
         Ok(agent_data)
@@ -4937,14 +4966,14 @@ impl Interpreter {
         // Valor de variante = map etiquetado {"__variant": "Enum.var", <campos>};
         // tipo enum = map namespace {"__enum": "Enum", <var>: valor|ctor}. Sin
         // tipo de runtime nuevo: construcción = property-access + call.
-        let mut namespace = IndexMap::new();
-        namespace.insert("__enum".to_string(), syn_text(name.as_str()));
+        let mut namespace = SynMap::new();
+        namespace.insert("__enum", syn_text(name.as_str()));
         for (variant_name, fields) in variants {
             let qualified = format!("{}.{}", name, variant_name);
             if fields.is_empty() {
                 // Variante nullary → un map etiquetado constante.
-                let mut m = IndexMap::new();
-                m.insert("__variant".to_string(), syn_text(qualified.as_str()));
+                let mut m = SynMap::new();
+                m.insert("__variant", syn_text(qualified.as_str()));
                 namespace.insert(variant_name.clone(), syn_map(m));
             } else {
                 // Variante con payload → constructor builtin de aridad EXACTA.
@@ -4964,8 +4993,8 @@ impl Interpreter {
                             &def_loc,
                         ));
                     }
-                    let mut m = IndexMap::new();
-                    m.insert("__variant".to_string(), syn_text(q.as_str()));
+                    let mut m = SynMap::new();
+                    m.insert("__variant", syn_text(q.as_str()));
                     for (n, val) in field_names.iter().zip(args.iter()) {
                         m.insert(n.clone(), val.clone());
                     }
@@ -5178,7 +5207,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         };
         // Map plano id → respuesta, en el orden del bloque. Sin metadatos mezclados:
         // una pregunta llamada `usage` no colisiona con nada.
-        let mut out: IndexMap<String, SynValue> = IndexMap::new();
+        let mut out: SynMap = SynMap::new();
         for (i, q) in req.questions.iter().enumerate() {
             let a = response.as_ref().and_then(|r| r.answers.get(i));
             out.insert(q.id.clone(), answer_to_value(q, a));
@@ -5303,7 +5332,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     fn exec_routes_declaration(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
         let NodeKind::RoutesDeclaration { name, routes } = &node.kind else { unreachable!("exec_routes_declaration: otro nodo") };
         {
-        let mut map = IndexMap::new();
+        let mut map = SynMap::new();
         let mut meta: Vec<SynValue> = Vec::new();
         for (i, r) in routes.iter().enumerate() {
             if let NodeKind::RouteDefinition {
@@ -5340,10 +5369,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                             },
                             None => 0,
                         };
-                        let mut lm = IndexMap::new();
-                        lm.insert("unlimited".to_string(), syn_bool(*unlimited));
-                        lm.insert("count".to_string(), SynValue::Number(Number::Int(cap)));
-                        lm.insert("window".to_string(), syn_text(window.as_str()));
+                        let mut lm = SynMap::new();
+                        lm.insert("unlimited", syn_bool(*unlimited));
+                        lm.insert("count", SynValue::Number(Number::Int(cap)));
+                        lm.insert("window", syn_text(window.as_str()));
                         route_limit = Some(syn_map(lm));
                     }
                 }
@@ -5380,30 +5409,30 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     code: Default::default(),
                 }));
                 map.insert(format!("_route_handler_{}", i), task);
-                let mut mm = IndexMap::new();
-                mm.insert("method".to_string(), syn_text(method.as_str()));
-                mm.insert("path".to_string(), syn_text(path.as_str()));
-                mm.insert("requires_auth".to_string(), syn_bool(*requires_auth));
+                let mut mm = SynMap::new();
+                mm.insert("method", syn_text(method.as_str()));
+                mm.insert("path", syn_text(path.as_str()));
+                mm.insert("requires_auth", syn_bool(*requires_auth));
                 // v0.6.20 — `private` (fuera de los documentos generados) y la clase de
                 // ruta (`stream`/`socket`) viajan en la meta para que serve las monte
                 // exactamente como una ruta directa.
-                mm.insert("private".to_string(), syn_bool(*private));
-                mm.insert("streaming".to_string(), syn_bool(*streaming));
-                mm.insert("socket".to_string(), syn_bool(*socket));
+                mm.insert("private", syn_bool(*private));
+                mm.insert("streaming", syn_bool(*streaming));
+                mm.insert("socket", syn_bool(*socket));
                 mm.insert(
                     "params".to_string(),
                     syn_list(param_names.iter().map(|p| syn_text(p.as_str())).collect()),
                 );
                 if let Some(l) = route_limit {
-                    mm.insert("rate_limit".to_string(), l);
+                    mm.insert("rate_limit", l);
                 }
                 if let Some(t) = route_timeout {
-                    mm.insert("timeout".to_string(), t);
+                    mm.insert("timeout", t);
                 }
                 meta.push(syn_map(mm));
             }
         }
-        map.insert("_routes_meta".to_string(), syn_list(meta));
+        map.insert("_routes_meta", syn_list(meta));
         let value = syn_map(map);
         env_set(env, name, value.clone());
         Ok(value)
@@ -5747,7 +5776,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     &def_loc,
                 ));
             }
-            let mut m = IndexMap::new();
+            let mut m = SynMap::new();
             for (n, v) in field_names.iter().zip(args.iter()) {
                 m.insert(n.clone(), v.clone());
             }
@@ -6328,7 +6357,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         if let Some(menv) = module_env_of_map(m) {
                             return module_rebind(m, &menv, property_name, value, loc);
                         }
-                        m.borrow_mut().insert(property_name.clone(), value.clone());
+                        m.borrow_mut().set(property_name, value.clone());
                         Ok(value)
                     }
                     _ => Err(err_at(format!("Cannot set property on {}", obj.type_name()), loc)),
@@ -6375,7 +6404,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                         if let Some(menv) = module_env_of_map(m) {
                             return module_rebind(m, &menv, &idx.to_string(), value, loc);
                         }
-                        m.borrow_mut().insert(idx.to_string(), value.clone());
+                        m.borrow_mut().set_value_key(&idx, value.clone());
                         Ok(value)
                     }
                     _ => Err(err_at(format!("Cannot set index on {}", obj.type_name()), loc)),
@@ -7017,34 +7046,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     }
                     None => {
                         let mut pos: SmallVec<[SynValue; 4]> = SmallVec::with_capacity(args.len());
-                        let allowed = bt.meta.kwargs;
-                        let mut kw: IndexMap<String, SynValue> = IndexMap::new();
+                        let mut kw: SynMap = SynMap::new();
                         for (name, v) in args.drain(..) {
                             if let Some(n) = name {
-                                if allowed.contains(&n.as_str()) {
-                                    if kw.insert(n.clone(), v).is_some() {
-                                        return Err(err_at(format!("duplicate argument '{}'", n), loc));
-                                    }
-                                    continue;
-                                }
-                                if !allowed.is_empty() {
-                                    return Err(err_at(
-                                        format!(
-                                            "{}() has no argument named '{}' (named arguments it takes: {})",
-                                            bt.name,
-                                            n,
-                                            allowed.join(", ")
-                                        ),
-                                        loc,
-                                    ));
-                                }
-                                return Err(err_at(
-                                    format!(
-                                        "{}() does not accept named arguments (got {} = …); pass it by position",
-                                        bt.name, n
-                                    ),
-                                    loc,
-                                ));
+                                // Fuera de línea: el camino raro no engorda esta función (F4.4).
+                                builtin_named_arg(&bt, &mut kw, n, v, loc)?;
+                                continue;
                             }
                             pos.push(v);
                         }
@@ -7913,9 +7920,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     fn b_remove(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
         match nth(args, 0)? {
             SynValue::Map(m) => {
-                let mut copy = m.borrow().clone();
+                let mut copy = m.borrow().to_map();
                 copy.shift_remove(&nth(args, 1)?.to_string());
-                Ok(SynValue::Map(Rc::new(RefCell::new(copy))))
+                Ok(SynValue::Map(copy.into_ref()))
             }
             other => Err(err(format!("remove() takes a map, got {} — for a list use where(xs, …) or slice", other.type_name()))),
         }
@@ -7926,7 +7933,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         if args.is_empty() {
             return Err(err_at("merge() needs at least one map", loc));
         }
-        let mut out: IndexMap<String, SynValue> = IndexMap::new();
+        let mut out: SynMap = SynMap::new();
         for (i, a) in args.iter().enumerate() {
             match a {
                 SynValue::Map(m) => {
@@ -7949,9 +7956,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 m.borrow()
                     .iter()
                     .map(|(k, v)| {
-                        let mut e = IndexMap::new();
-                        e.insert("key".to_string(), syn_text(k.as_str()));
-                        e.insert("value".to_string(), v.clone());
+                        let mut e = SynMap::new();
+                        e.insert("key", syn_text(k.as_str()));
+                        e.insert("value", v.clone());
                         syn_map(e)
                     })
                     .collect(),
@@ -7963,7 +7970,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     fn b_keys(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
         match nth(args, 0)? {
             SynValue::Map(m) => {
-                let keys: Vec<SynValue> = m.borrow().keys().map(|k| syn_text(k.as_str())).collect();
+                let keys: Vec<SynValue> = m.borrow().keys().map(|k| SynValue::Text(k.rc().clone())).collect();
                 Ok(syn_list(keys))
             }
             // El resultado de `group_by` (una lista de `{key, items}` desde v0.6.29) es el
@@ -7989,9 +7996,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     .iter()
                     .enumerate()
                     .map(|(i, v)| {
-                        let mut m = IndexMap::new();
-                        m.insert("index".to_string(), syn_int(i as i64));
-                        m.insert("item".to_string(), v.clone());
+                        let mut m = SynMap::new();
+                        m.insert("index", syn_int(i as i64));
+                        m.insert("item", v.clone());
                         syn_map(m)
                     })
                     .collect();
@@ -8331,7 +8338,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let template = raw_str(nth(args, 0)?);
         let values = match args.get(1) {
             None | Some(SynValue::Nothing) => None,
-            Some(SynValue::Map(m)) => Some(m.borrow().clone()),
+            Some(SynValue::Map(m)) => Some(m.borrow().to_map()),
             Some(other) => return Err(err(format!("fmt(template, values): values must be a map, got {}", other.type_name()))),
         };
         let chars: Vec<char> = template.chars().collect();
@@ -8719,7 +8726,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let func = nth(args, 0)?.clone();
         let mut named: CallArgs = match nth(args, 1)? {
             SynValue::Map(m) => {
-                m.borrow().iter().map(|(k, v)| (Some(k.clone()), v.clone())).collect()
+                m.borrow().iter().map(|(k, v)| (Some(k.to_string()), v.clone())).collect()
             }
             SynValue::Nothing => CallArgs::new(),
             other => {
@@ -8742,7 +8749,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let func = nth(args, 0)?.clone();
         let mut named: CallArgs = match nth(args, 1)? {
             SynValue::Map(m) => {
-                m.borrow().iter().map(|(k, v)| (Some(k.clone()), v.clone())).collect()
+                m.borrow().iter().map(|(k, v)| (Some(k.to_string()), v.clone())).collect()
             }
             SynValue::Nothing => CallArgs::new(),
             other => {
@@ -9534,22 +9541,22 @@ fn parse_catalog(arg: Option<&SynValue>) -> Vec<StepCatalogEntry> {
 /// Convierte el `StepResult` del callback al map `{kind, …}` que consume el programa:
 /// `{kind:"final", text, tokens}` | `{kind:"tool", name, args:{…}, tokens}`.
 fn step_result_to_synvalue(result: StepResult) -> SynValue {
-    let mut map = IndexMap::new();
+    let mut map = SynMap::new();
     match result {
         StepResult::Final { text, tokens } => {
-            map.insert("kind".to_string(), syn_text("final"));
-            map.insert("text".to_string(), syn_text(text));
-            map.insert("tokens".to_string(), syn_int(tokens as i64));
+            map.insert("kind", syn_text("final"));
+            map.insert("text", syn_text(text));
+            map.insert("tokens", syn_int(tokens as i64));
         }
         StepResult::Tool { name, args, tokens } => {
-            let mut amap = IndexMap::new();
+            let mut amap = SynMap::new();
             for (k, v) in args {
                 amap.insert(k, syn_text(v));
             }
-            map.insert("kind".to_string(), syn_text("tool"));
-            map.insert("name".to_string(), syn_text(name));
-            map.insert("args".to_string(), syn_map(amap));
-            map.insert("tokens".to_string(), syn_int(tokens as i64));
+            map.insert("kind", syn_text("tool"));
+            map.insert("name", syn_text(name));
+            map.insert("args", syn_map(amap));
+            map.insert("tokens", syn_int(tokens as i64));
         }
     }
     syn_map(map)
@@ -9625,8 +9632,8 @@ fn make_unique_n(slot: &mut SynValue, extra: usize) {
             *slot = SynValue::List(Rc::new(RefCell::new(copy)));
         }
         SynValue::Map(rc) if Rc::strong_count(rc) > owners && module_env_of_map(rc).is_none() => {
-            let copy = rc.borrow().clone();
-            *slot = SynValue::Map(Rc::new(RefCell::new(copy)));
+            let copy = rc.borrow().to_ref();
+            *slot = SynValue::Map(copy);
         }
         SynValue::Private(p) => {
             let shared_inner = match &p.value {
@@ -9639,7 +9646,7 @@ fn make_unique_n(slot: &mut SynValue, extra: usize) {
                 // está compartido: el alias ve el mismo Rc interno.
                 let inner = match &p.value {
                     SynValue::List(rc) => SynValue::List(Rc::new(RefCell::new(rc.borrow().clone()))),
-                    SynValue::Map(rc) => SynValue::Map(Rc::new(RefCell::new(rc.borrow().clone()))),
+                    SynValue::Map(rc) => SynValue::Map(rc.borrow().to_ref()),
                     other => other.clone(),
                 };
                 *slot = SynValue::Private(Rc::new(labels::Labelled { value: inner, label: p.label.clone() }));
@@ -10494,7 +10501,7 @@ mod drop_tests {
                 required_capabilities: vec![],
                 code: Default::default(),
             }));
-            env.borrow_mut().bindings.insert("t".to_string(), task); // child → task (otra mitad)
+            env.borrow_mut().bindings.insert("t", task); // child → task (otra mitad)
             weak = Rc::downgrade(&env);
             assert!(weak.upgrade().is_some(), "scope del request vivo mientras corre");
             // El cierre que hace run_request_block tras exec_block:

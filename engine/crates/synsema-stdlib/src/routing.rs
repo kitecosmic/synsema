@@ -13,6 +13,7 @@
 
 #![allow(unused_imports)]
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -690,7 +691,7 @@ pub fn delegated_spend_of(user: &SynValue) -> Vec<(String, String)> {
     let out: Vec<(String, String)> = sp
         .borrow()
         .iter()
-        .map(|(unit, amount)| (unit.clone(), amount.to_string()))
+        .map(|(unit, amount)| (unit.to_string(), amount.to_string()))
         .collect();
     out
 }
@@ -940,7 +941,7 @@ pub fn parse_cookies(headers: &[(String, String)]) -> Vec<(String, String)> {
 
 // ---- bindings del request del handler (movido verbatim desde synsema-runtime/src/serve.rs) ----
 pub fn str_map(m: &IndexMap<String, String>) -> SynValue {
-    let mut out = IndexMap::new();
+    let mut out = SynMap::new();
     for (k, v) in m {
         out.insert(k.clone(), syn_text(v.as_str()));
     }
@@ -948,7 +949,7 @@ pub fn str_map(m: &IndexMap<String, String>) -> SynValue {
 }
 
 pub fn headers_map(headers: &[(String, String)]) -> SynValue {
-    let mut out = IndexMap::new();
+    let mut out = SynMap::new();
     for (k, v) in headers {
         out.insert(k.clone(), syn_text(v.as_str())); // último gana (como dict de Python)
     }
@@ -957,10 +958,10 @@ pub fn headers_map(headers: &[(String, String)]) -> SynValue {
 
 /// El map `request` que ve el handler (paridad con `_build_request`).
 pub fn build_request_syn(ctx: &Ctx) -> SynValue {
-    let mut m = IndexMap::new();
-    m.insert("method".to_string(), syn_text(ctx.method.as_str()));
-    m.insert("path".to_string(), syn_text(ctx.path.as_str()));
-    m.insert("body".to_string(), syn_text(ctx.body.as_str()));
+    let mut m = SynMap::new();
+    m.insert("method", syn_text(ctx.method.as_str()));
+    m.insert("path", syn_text(ctx.path.as_str()));
+    m.insert("body", syn_text(ctx.body.as_str()));
     m.insert(
         "body_file".to_string(),
         match &ctx.body_file {
@@ -976,25 +977,25 @@ pub fn build_request_syn(ctx: &Ctx) -> SynValue {
             None => syn_nothing(),
         },
     );
-    m.insert("headers".to_string(), headers_map(&ctx.headers));
+    m.insert("headers", headers_map(&ctx.headers));
     // Cookies entrantes (RFC 6265 §5.4), SIN decodificar; nombre duplicado: gana
     // la primera aparición. Sin header `Cookie` → map VACÍO (nunca nothing:
     // `request.cookies.sid` siempre es navegable).
-    let mut cookies = IndexMap::new();
+    let mut cookies = SynMap::new();
     for (k, v) in parse_cookies(&ctx.headers) {
         cookies.insert(k, syn_text(v.as_str()));
     }
-    m.insert("cookies".to_string(), syn_map(cookies));
-    m.insert("query".to_string(), str_map(&ctx.query));
-    m.insert("params".to_string(), str_map(&ctx.params));
+    m.insert("cookies", syn_map(cookies));
+    m.insert("query", str_map(&ctx.query));
+    m.insert("params", str_map(&ctx.params));
     // `form of request` — body de formulario parseado según Content-Type:
     //   application/x-www-form-urlencoded → {campo: texto}
     //   multipart/form-data → campo de texto → texto; archivo → {filename,
     //     content_type, data (bytes exactos)}
     // sin form body → map VACÍO (como cookies: siempre navegable, nunca nothing).
-    m.insert("form".to_string(), build_form_syn(ctx));
-    m.insert("ip".to_string(), syn_text(ctx.client_ip.as_str()));
-    m.insert("user".to_string(), ctx.user.clone().unwrap_or_else(syn_nothing));
+    m.insert("form", build_form_syn(ctx));
+    m.insert("ip", syn_text(ctx.client_ip.as_str()));
+    m.insert("user", ctx.user.clone().unwrap_or_else(syn_nothing));
     syn_map(m)
 }
 
@@ -1007,7 +1008,7 @@ pub fn build_form_syn(ctx: &Ctx) -> SynValue {
         .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
         .map(|(_, v)| v.as_str())
         .unwrap_or("");
-    let mut out = IndexMap::new();
+    let mut out = SynMap::new();
     if ctype.to_ascii_lowercase().contains("application/x-www-form-urlencoded") {
         let body = if let Some(bf) = &ctx.body_file {
             std::fs::read_to_string(bf).unwrap_or_default()
@@ -1027,8 +1028,8 @@ pub fn build_form_syn(ctx: &Ctx) -> SynValue {
             let value = match &part.filename {
                 None => syn_text(String::from_utf8_lossy(&part.data).as_ref()),
                 Some(fname) => {
-                    let mut f = IndexMap::new();
-                    f.insert("filename".to_string(), syn_text(fname.as_str()));
+                    let mut f = SynMap::new();
+                    f.insert("filename", syn_text(fname.as_str()));
                     f.insert(
                         "content_type".to_string(),
                         match &part.content_type {
@@ -1036,7 +1037,7 @@ pub fn build_form_syn(ctx: &Ctx) -> SynValue {
                             None => syn_nothing(),
                         },
                     );
-                    f.insert("data".to_string(), syn_bytes(part.data.clone()));
+                    f.insert("data", syn_bytes(part.data.clone()));
                     syn_map(f)
                 }
             };

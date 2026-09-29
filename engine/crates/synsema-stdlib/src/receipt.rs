@@ -31,10 +31,10 @@
 //! `type` lleva `SynsemaReceipt`) + "lo emitió esta clave" (`issuer` y `verificationMethod`
 //! son el did:key de `public_key`).
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use indexmap::IndexMap;
 use sha2::{Digest, Sha256};
 
 use synsema_capabilities::model::{AuditEntry, Capability, CapabilitySet, CapabilityType, DelegationSource};
@@ -53,12 +53,12 @@ pub const RECEIPT_TYPE: &str = "SynsemaReceipt";
 const VC_CONTEXT: &str = "https://www.w3.org/ns/credentials/v2";
 
 fn audit_to_syn(e: &AuditEntry) -> SynValue {
-    let mut m = IndexMap::new();
-    m.insert("capability".to_string(), syn_text(e.capability.clone()));
-    m.insert("granted".to_string(), SynValue::Bool(e.granted));
-    m.insert("source".to_string(), syn_text(e.source.clone()));
-    m.insert("reason".to_string(), syn_text(e.reason.clone()));
-    m.insert("origin".to_string(), syn_text(e.origin.clone()));
+    let mut m = SynMap::new();
+    m.insert("capability", syn_text(e.capability.clone()));
+    m.insert("granted", SynValue::Bool(e.granted));
+    m.insert("source", syn_text(e.source.clone()));
+    m.insert("reason", syn_text(e.reason.clone()));
+    m.insert("origin", syn_text(e.origin.clone()));
     syn_map(m)
 }
 
@@ -105,9 +105,9 @@ pub fn build_receipt(
     valid_from: Option<&str>,
     result: Option<&SynValue>,
 ) -> Result<SynValue, Control> {
-    let mut subject = IndexMap::new();
+    let mut subject = SynMap::new();
     let identity = interp.request_identity().map(str::to_string).or_else(|| interp.current_agent().map(str::to_string));
-    subject.insert("id".to_string(), identity.clone().map(syn_text).unwrap_or_else(syn_nothing));
+    subject.insert("id", identity.clone().map(syn_text).unwrap_or_else(syn_nothing));
     let (tokens, audit): (Vec<SynValue>, Vec<SynValue>) = {
         let cs = caps.borrow();
         let tokens = cs
@@ -121,37 +121,37 @@ pub fn build_receipt(
         let audit = cs.audit_log.iter().map(|e| audit_to_syn(&AuditEntry::from(e))).collect();
         (tokens, audit)
     };
-    subject.insert("tokens".to_string(), syn_list(tokens));
-    subject.insert("capabilities".to_string(), syn_list(audit));
+    subject.insert("tokens", syn_list(tokens));
+    subject.insert("capabilities", syn_list(audit));
     // El gasto imputado a esta identidad: los acumulados del proceso por unidad (el ledger
     // mide por identidad, no por unidad de trabajo — el nombre lo dice).
     let spend: Vec<SynValue> = match &identity {
         Some(id) => crate::spend::identity_spend_snapshot(id)
             .into_iter()
             .map(|(unit, total)| {
-                let mut m = IndexMap::new();
-                m.insert("unit".to_string(), syn_text(unit));
-                m.insert("total".to_string(), syn_text(total));
+                let mut m = SynMap::new();
+                m.insert("unit", syn_text(unit));
+                m.insert("total", syn_text(total));
                 syn_map(m)
             })
             .collect(),
         None => Vec::new(),
     };
-    subject.insert("identity_spend_totals".to_string(), syn_list(spend));
+    subject.insert("identity_spend_totals", syn_list(spend));
     let declassified: Vec<SynValue> = interp
         .declassify_log()
         .iter()
         .map(|d| {
-            let mut m = IndexMap::new();
-            m.insert("reason".to_string(), syn_text(d.reason.clone()));
-            m.insert("from".to_string(), label_to_syn(&d.from));
-            m.insert("to".to_string(), label_to_syn(&d.to));
-            m.insert("line".to_string(), syn_int(d.loc.line as i64));
+            let mut m = SynMap::new();
+            m.insert("reason", syn_text(d.reason.clone()));
+            m.insert("from", label_to_syn(&d.from));
+            m.insert("to", label_to_syn(&d.to));
+            m.insert("line", syn_int(d.loc.line as i64));
             syn_map(m)
         })
         .collect();
-    subject.insert("declassified".to_string(), syn_list(declassified));
-    subject.insert("steps".to_string(), syn_int(interp.steps() as i64));
+    subject.insert("declassified", syn_list(declassified));
+    subject.insert("steps", syn_int(interp.steps() as i64));
     // v0.6.29 (DATOS-17): el LINAJE — cada dato que el programa leyó (archivo, host, consulta,
     // stdin) con el sha256 de lo que recibió. Lo anota el motor, no el programa: con el
     // `program_sha`, el `engine` y el `declared_result_sha256` el recibo dice qué entradas,
@@ -160,25 +160,25 @@ pub fn build_receipt(
         .lineage()
         .iter()
         .map(|e| {
-            let mut m = IndexMap::new();
-            m.insert("source".to_string(), syn_text(e.source.clone()));
-            m.insert("what".to_string(), syn_text(e.what.clone()));
-            m.insert("sha256".to_string(), syn_text(e.sha256.clone()));
-            m.insert("bytes".to_string(), syn_int(e.bytes as i64));
-            m.insert("encoding".to_string(), syn_text(e.encoding.clone()));
+            let mut m = SynMap::new();
+            m.insert("source", syn_text(e.source.clone()));
+            m.insert("what", syn_text(e.what.clone()));
+            m.insert("sha256", syn_text(e.sha256.clone()));
+            m.insert("bytes", syn_int(e.bytes as i64));
+            m.insert("encoding", syn_text(e.encoding.clone()));
             syn_map(m)
         })
         .collect();
     let truncated = inputs.len() >= synsema_core::interpreter::MAX_LINEAGE;
-    subject.insert("inputs".to_string(), syn_list(inputs));
+    subject.insert("inputs", syn_list(inputs));
     if truncated {
-        subject.insert("inputs_truncated".to_string(), SynValue::Bool(true));
+        subject.insert("inputs_truncated", SynValue::Bool(true));
     }
     subject.insert(
         "program_sha".to_string(),
         crate::attest::current_program_sha().map(|s| syn_text(hex_encode(&s))).unwrap_or_else(syn_nothing),
     );
-    subject.insert("engine".to_string(), syn_text(crate::attest::engine_version()));
+    subject.insert("engine", syn_text(crate::attest::engine_version()));
     if let Some(v) = result {
         if !matches!(v, SynValue::Nothing) {
             subject.insert(
@@ -188,19 +188,19 @@ pub fn build_receipt(
         }
     }
 
-    let mut doc = IndexMap::new();
-    doc.insert("@context".to_string(), syn_list(vec![syn_text(VC_CONTEXT)]));
+    let mut doc = SynMap::new();
+    doc.insert("@context", syn_list(vec![syn_text(VC_CONTEXT)]));
     doc.insert(
         "type".to_string(),
         syn_list(vec![syn_text("VerifiableCredential"), syn_text(RECEIPT_TYPE)]),
     );
     if let Some(i) = issuer {
-        doc.insert("issuer".to_string(), syn_text(i));
+        doc.insert("issuer", syn_text(i));
     }
     if let Some(c) = valid_from {
-        doc.insert("validFrom".to_string(), syn_text(c));
+        doc.insert("validFrom", syn_text(c));
     }
-    doc.insert("credentialSubject".to_string(), syn_map(subject));
+    doc.insert("credentialSubject", syn_map(subject));
     Ok(syn_map(doc))
 }
 
@@ -215,8 +215,8 @@ fn b_receipt(
         return Err(err(format!("{}(opts?) takes at most 1 argument", F)));
     }
     let opts = match args.first() {
-        None | Some(SynValue::Nothing) => IndexMap::new(),
-        Some(SynValue::Map(m)) => m.borrow().clone(),
+        None | Some(SynValue::Nothing) => SynMap::new(),
+        Some(SynValue::Map(m)) => m.borrow().to_map(),
         Some(other) => return Err(err(format!("{}: opts must be a map, got {}", F, other.type_name()))),
     };
     for k in opts.keys() {
@@ -251,14 +251,14 @@ fn b_receipt(
             let signer = signer_from(key, suite.as_deref(), F, loc, caps)?;
             let issuer = signer.did_key().map_err(|e| err(format!("{}: {}", F, e)))?;
             let doc = build_receipt(i, caps, Some(&issuer), valid_from.as_deref(), opts.get("result"))?;
-            let mut sopts = IndexMap::new();
+            let mut sopts = SynMap::new();
             for k in ["verification_method", "cryptosuite", "challenge", "domain"] {
                 if let Some(v) = opts.get(k) {
                     sopts.insert(k.to_string(), v.clone());
                 }
             }
             if let Some(c) = &valid_from {
-                sopts.insert("created".to_string(), syn_text(c.clone()));
+                sopts.insert("created", syn_text(c.clone()));
             }
             sign_document_with(&doc, &signer, &sopts, F)
         }
@@ -271,8 +271,8 @@ fn b_receipt_verify(args: &[SynValue]) -> Result<SynValue, Control> {
         return Err(err(format!("{}(receipt, public_key, opts?) takes 2 or 3 arguments", F)));
     }
     let opts = match args.get(2) {
-        None | Some(SynValue::Nothing) => IndexMap::new(),
-        Some(SynValue::Map(m)) => m.borrow().clone(),
+        None | Some(SynValue::Nothing) => SynMap::new(),
+        Some(SynValue::Map(m)) => m.borrow().to_map(),
         Some(other) => return Err(err(format!("{}: opts must be a map, got {}", F, other.type_name()))),
     };
     let (is_receipt, issuer) = match &args[0] {

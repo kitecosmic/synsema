@@ -17,12 +17,12 @@
 //!   cuenta como "producir aleatoriedad" (mismo precedente que el token interno
 //!   de `redis_lock`).
 
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
-use indexmap::IndexMap;
 use zeroize::Zeroize;
 
 use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
@@ -121,10 +121,10 @@ fn opt_int(v: &SynValue, who: &str, name: &str, min: i64) -> Result<i64, Control
 }
 
 /// El map de opts (o nothing/ausente → vacío). Otro tipo → error claro.
-fn opts_map(v: Option<&SynValue>, who: &str) -> Result<IndexMap<String, SynValue>, Control> {
+fn opts_map(v: Option<&SynValue>, who: &str) -> Result<SynMap, Control> {
     match v {
-        None | Some(SynValue::Nothing) => Ok(IndexMap::new()),
-        Some(SynValue::Map(m)) => Ok(m.borrow().clone()),
+        None | Some(SynValue::Nothing) => Ok(SynMap::new()),
+        Some(SynValue::Map(m)) => Ok(m.borrow().to_map()),
         Some(other) => Err(err(format!(
             "{}: opts must be a map, got {}",
             who,
@@ -259,7 +259,7 @@ fn b_jwt_sign(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>, loc: &synsem
         return Err(err(format!("{}(claims, key, opts?) takes 2 or 3 arguments", F)));
     }
     let claims = match &args[0] {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         other => {
             return Err(err(format!(
                 "{}: claims must be a map, got {}",
@@ -332,7 +332,7 @@ fn b_jwt_sign(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>, loc: &synsem
     }
     let now: Option<i64> = if needs_clock { Some(unix_now()) } else { None };
     if !payload.contains_key("iat") {
-        payload.insert("iat".to_string(), syn_int(now.unwrap_or_default()));
+        payload.insert("iat", syn_int(now.unwrap_or_default()));
     }
     if let Some(ttl) = expires_in {
         // Un `exp` explícito Y `expires_in` a la vez es ambiguo → error claro.
@@ -344,7 +344,7 @@ fn b_jwt_sign(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>, loc: &synsem
                 F
             )));
         }
-        payload.insert("exp".to_string(), syn_int(now.unwrap_or_default().saturating_add(ttl)));
+        payload.insert("exp", syn_int(now.unwrap_or_default().saturating_add(ttl)));
     }
     let payload_json = dumps(&syn_to_json(&syn_map(payload)));
     // EdDSA con un `secret` es firmar con la clave de IDENTIDAD (la misma que da el did:key):
@@ -1030,7 +1030,7 @@ fn check_time_and_claims(claims: &serde_json::Map<String, serde_json::Value>, o:
 /// Las claves públicas del mapa `{"jwks": …}` | `{"pem": …}` en la forma del verificador de
 /// `oidc`. El tipo de la clave FIJA el algoritmo (RSA → RS256, EC P-256 → ES256); una entrada
 /// del JWKS que declare `alg` tiene que coincidir con el del token. Errores = del caller.
-fn inline_public_keys(m: &IndexMap<String, SynValue>, who: &str) -> Result<Vec<KeyEntry>, Control> {
+fn inline_public_keys(m: &MapObj, who: &str) -> Result<Vec<KeyEntry>, Control> {
     let mut jwks: Option<String> = None;
     let mut pem: Option<String> = None;
     let mut did: Option<String> = None;
@@ -1447,7 +1447,7 @@ mod tests {
         };
         assert!(e.contains("sealed") && e.contains("jwt_sign"), "{}", e);
         // HS256 con la misma clave: una MAC, de una vía — sigue permitido y no se nerfea.
-        let signed = js(&[syn_map(IndexMap::new()), sealed]);
+        let signed = js(&[syn_map(SynMap::new()), sealed]);
         assert!(matches!(signed, Ok(SynValue::Text(_))), "HS256 con clave sellada tiene que seguir andando");
     }
 
@@ -1465,7 +1465,7 @@ mod tests {
     }
 
     fn map(pairs: Vec<(&str, SynValue)>) -> SynValue {
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }
@@ -1761,7 +1761,7 @@ mod v0620_tests {
     }
 
     fn map(pairs: &[(&str, SynValue)]) -> SynValue {
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         for (k, v) in pairs {
             m.insert(k.to_string(), v.clone());
         }
@@ -1888,9 +1888,9 @@ mod v0620_tests {
         matches!(v, SynValue::Nothing)
     }
 
-    fn claims_of(v: &SynValue) -> IndexMap<String, SynValue> {
+    fn claims_of(v: &SynValue) -> SynMap {
         match v {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             other => panic!("esperaba map, got {}", other),
         }
     }

@@ -31,7 +31,7 @@
 //!   tal cual, o un map plano con esas claves en camelCase o snake_case. Los binarios se aceptan
 //!   como `bytes` o como texto base64url.
 
-use indexmap::IndexMap;
+use synsema_core::types::{MapObj, SynMap};
 use sha2::{Digest, Sha256};
 
 use synsema_core::bytesutil::{b64url_decode, b64url_encode};
@@ -64,7 +64,7 @@ fn bin(v: &SynValue) -> Option<Vec<u8>> {
 
 /// Busca la primera clave presente entre `keys` en el map, y si no, en su sub-map `response`
 /// (la forma de `PublicKeyCredential.toJSON()`).
-fn field(m: &IndexMap<String, SynValue>, keys: &[&str]) -> Option<SynValue> {
+fn field(m: &MapObj, keys: &[&str]) -> Option<SynValue> {
     for k in keys {
         if let Some(v) = m.get(*k) {
             if !matches!(v, SynValue::Nothing) {
@@ -85,9 +85,9 @@ fn field(m: &IndexMap<String, SynValue>, keys: &[&str]) -> Option<SynValue> {
     None
 }
 
-fn as_map(v: &SynValue, who: &str, what: &str) -> Result<IndexMap<String, SynValue>, Control> {
+fn as_map(v: &SynValue, who: &str, what: &str) -> Result<SynMap, Control> {
     match v {
-        SynValue::Map(m) => Ok(m.borrow().clone()),
+        SynValue::Map(m) => Ok(m.borrow().to_map()),
         other => Err(err(format!("{}: {} must be a map, got {}", who, what, other.type_name()))),
     }
 }
@@ -95,7 +95,7 @@ fn as_map(v: &SynValue, who: &str, what: &str) -> Result<IndexMap<String, SynVal
 /// Un campo binario OBLIGATORIO de la credencial: faltar es error de forma (bug del programa,
 /// con las claves aceptadas en el mensaje); no decodificar es `None` (credencial inválida).
 fn required_bin(
-    m: &IndexMap<String, SynValue>,
+    m: &MapObj,
     keys: &[&str],
     who: &str,
 ) -> Result<Option<Vec<u8>>, Control> {
@@ -125,8 +125,8 @@ struct Opts {
 
 fn parse_opts(v: Option<&SynValue>, who: &str, verifying: bool) -> Result<Opts, Control> {
     let m = match v {
-        Some(SynValue::Map(m)) => m.borrow().clone(),
-        Some(SynValue::Nothing) | None => IndexMap::new(),
+        Some(SynValue::Map(m)) => m.borrow().to_map(),
+        Some(SynValue::Nothing) | None => SynMap::new(),
         Some(other) => return Err(err(format!("{}: opts must be a map, got {}", who, other.type_name()))),
     };
     let rp_id = match m.get("rp_id") {
@@ -386,26 +386,26 @@ impl PubKey {
     /// El JWK que devuelve `webauthn_register` y acepta `webauthn_verify`: portable, JSON,
     /// la misma forma que `oidc_verify` lee de un JWKS.
     fn to_syn(&self) -> SynValue {
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         match self {
             PubKey::P256 { x, y } => {
-                m.insert("kty".to_string(), syn_text("EC"));
-                m.insert("crv".to_string(), syn_text("P-256"));
-                m.insert("alg".to_string(), syn_text("ES256"));
-                m.insert("x".to_string(), syn_text(b64url_encode(x)));
-                m.insert("y".to_string(), syn_text(b64url_encode(y)));
+                m.insert("kty", syn_text("EC"));
+                m.insert("crv", syn_text("P-256"));
+                m.insert("alg", syn_text("ES256"));
+                m.insert("x", syn_text(b64url_encode(x)));
+                m.insert("y", syn_text(b64url_encode(y)));
             }
             PubKey::Rsa { n, e } => {
-                m.insert("kty".to_string(), syn_text("RSA"));
-                m.insert("alg".to_string(), syn_text("RS256"));
-                m.insert("n".to_string(), syn_text(b64url_encode(n)));
-                m.insert("e".to_string(), syn_text(b64url_encode(e)));
+                m.insert("kty", syn_text("RSA"));
+                m.insert("alg", syn_text("RS256"));
+                m.insert("n", syn_text(b64url_encode(n)));
+                m.insert("e", syn_text(b64url_encode(e)));
             }
             PubKey::Ed25519(x) => {
-                m.insert("kty".to_string(), syn_text("OKP"));
-                m.insert("crv".to_string(), syn_text("Ed25519"));
-                m.insert("alg".to_string(), syn_text("EdDSA"));
-                m.insert("x".to_string(), syn_text(b64url_encode(x)));
+                m.insert("kty", syn_text("OKP"));
+                m.insert("crv", syn_text("Ed25519"));
+                m.insert("alg", syn_text("EdDSA"));
+                m.insert("x", syn_text(b64url_encode(x)));
             }
         }
         syn_map(m)
@@ -415,13 +415,13 @@ impl PubKey {
     /// builtin entienda: la clave la guardó el programa al registrar, así que un JWK roto es
     /// un bug del programa, no una credencial inválida.
     fn from_syn(v: &SynValue, who: &str) -> Result<PubKey, Control> {
-        let m: IndexMap<String, SynValue> = match v {
-            SynValue::Map(m) => m.borrow().clone(),
+        let m: SynMap = match v {
+            SynValue::Map(m) => m.borrow().to_map(),
             SynValue::Text(s) => {
                 let j: serde_json::Value = serde_json::from_str(s).map_err(|_| {
                     err(format!("{}: public_key must be the JWK map returned by webauthn_register (or its JSON)", who))
                 })?;
-                let mut m = IndexMap::new();
+                let mut m = SynMap::new();
                 if let Some(o) = j.as_object() {
                     for (k, x) in o {
                         if let Some(s) = x.as_str() {
@@ -522,11 +522,11 @@ impl PubKey {
     }
 }
 
-fn flags_into(m: &mut IndexMap<String, SynValue>, flags: u8) {
-    m.insert("user_present".to_string(), SynValue::Bool(flags & FLAG_UP != 0));
-    m.insert("user_verified".to_string(), SynValue::Bool(flags & FLAG_UV != 0));
-    m.insert("backup_eligible".to_string(), SynValue::Bool(flags & FLAG_BE != 0));
-    m.insert("backup_state".to_string(), SynValue::Bool(flags & FLAG_BS != 0));
+fn flags_into(m: &mut SynMap, flags: u8) {
+    m.insert("user_present", SynValue::Bool(flags & FLAG_UP != 0));
+    m.insert("user_verified", SynValue::Bool(flags & FLAG_UV != 0));
+    m.insert("backup_eligible", SynValue::Bool(flags & FLAG_BE != 0));
+    m.insert("backup_state", SynValue::Bool(flags & FLAG_BS != 0));
 }
 
 // =========================================================
@@ -578,19 +578,19 @@ fn b_webauthn_register(args: &[SynValue]) -> Result<SynValue, Control> {
             _ => return Ok(syn_nothing()),
         }
     }
-    let mut out = IndexMap::new();
-    out.insert("id".to_string(), syn_text(b64url_encode(&cred_id)));
-    out.insert("public_key".to_string(), key.to_syn());
-    out.insert("alg".to_string(), syn_text(key.alg_name()));
-    out.insert("sign_count".to_string(), syn_int(a.sign_count as i64));
-    out.insert("aaguid".to_string(), syn_text(hex(&aaguid)));
-    out.insert("fmt".to_string(), syn_text(fmt));
+    let mut out = SynMap::new();
+    out.insert("id", syn_text(b64url_encode(&cred_id)));
+    out.insert("public_key", key.to_syn());
+    out.insert("alg", syn_text(key.alg_name()));
+    out.insert("sign_count", syn_int(a.sign_count as i64));
+    out.insert("aaguid", syn_text(hex(&aaguid)));
+    out.insert("fmt", syn_text(fmt));
     flags_into(&mut out, a.flags);
     let transports = match field(&cred, &["transports"]) {
         Some(SynValue::List(l)) => SynValue::List(l.clone()),
         _ => syn_nothing(),
     };
-    out.insert("transports".to_string(), transports);
+    out.insert("transports", transports);
     Ok(syn_map(out))
 }
 
@@ -612,14 +612,14 @@ struct StoredCredential {
 }
 
 fn stored_credential(v: &SynValue, who: &str) -> Result<StoredCredential, Control> {
-    let m: IndexMap<String, SynValue> = match v {
-        SynValue::Map(m) => m.borrow().clone(),
+    let m: SynMap = match v {
+        SynValue::Map(m) => m.borrow().to_map(),
         SynValue::Text(s) => {
             let j: serde_json::Value = serde_json::from_str(s).map_err(|_| {
                 err(format!("{}: credential must be the map returned by webauthn_register (or its JSON)", who))
             })?;
             match crate::json::json_to_syn(&j) {
-                SynValue::Map(m) => m.borrow().clone(),
+                SynValue::Map(m) => m.borrow().to_map(),
                 _ => return Err(err(format!("{}: the credential JSON must be an object", who))),
             }
         }
@@ -754,11 +754,11 @@ fn b_webauthn_verify(args: &[SynValue]) -> Result<SynValue, Control> {
         }
         None => None,
     };
-    let mut out = IndexMap::new();
-    out.insert("id".to_string(), syn_text(b64url_encode(&stored.id)));
-    out.insert("user_handle".to_string(), user_handle.map(syn_text).unwrap_or_else(syn_nothing));
-    out.insert("alg".to_string(), syn_text(key.alg_name()));
-    out.insert("sign_count".to_string(), syn_int(a.sign_count as i64));
+    let mut out = SynMap::new();
+    out.insert("id", syn_text(b64url_encode(&stored.id)));
+    out.insert("user_handle", user_handle.map(syn_text).unwrap_or_else(syn_nothing));
+    out.insert("alg", syn_text(key.alg_name()));
+    out.insert("sign_count", syn_int(a.sign_count as i64));
     flags_into(&mut out, a.flags);
     Ok(syn_map(out))
 }
@@ -791,7 +791,7 @@ mod tests {
     }
 
     fn map(pairs: Vec<(&str, SynValue)>) -> SynValue {
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }
@@ -900,9 +900,9 @@ mod tests {
         ])
     }
 
-    fn entries(v: &SynValue) -> IndexMap<String, SynValue> {
+    fn entries(v: &SynValue) -> SynMap {
         match v {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             _ => panic!("map"),
         }
     }
@@ -977,10 +977,10 @@ mod tests {
         // Un userHandle guardado que el assertion contradice → nothing; ausente en el
         // assertion → vale (identificado por la credencial) y sale el guardado.
         let mut with_handle = entries(&attacker_cred);
-        with_handle.insert("user_handle".to_string(), text("alice"));
+        with_handle.insert("user_handle", text("alice"));
         let ok_asr = assertion(&attacker, attacker_id, FLAG_UP, 1, client_data("webauthn.get", CHAL, ORIGIN), RP);
         assert!(matches!(verify(ok_asr, syn_map(with_handle.clone()), opts(vec![])), SynValue::Nothing), "user-42 ≠ alice");
-        with_handle.insert("user_handle".to_string(), text("user-42"));
+        with_handle.insert("user_handle", text("user-42"));
         let v = verify(
             assertion(&attacker, attacker_id, FLAG_UP, 2, client_data("webauthn.get", CHAL, ORIGIN), RP),
             syn_map(with_handle),
@@ -1065,15 +1065,15 @@ mod tests {
         assert!(matches!(verify(forged, pk.clone(), opts(vec![])), SynValue::Nothing));
         // authenticatorData manipulado después de firmar
         let mut tampered = match good() {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             _ => unreachable!(),
         };
         if let Some(SynValue::Map(r)) = tampered.get("response").cloned() {
-            let mut r = r.borrow().clone();
+            let mut r = r.borrow().to_map();
             let mut auth = bin(r.get("authenticatorData").unwrap()).unwrap();
             auth[33] |= FLAG_UV;
-            r.insert("authenticatorData".to_string(), text(&b64url_encode(&auth)));
-            tampered.insert("response".to_string(), syn_map(r));
+            r.insert("authenticatorData", text(&b64url_encode(&auth)));
+            tampered.insert("response", syn_map(r));
         }
         assert!(matches!(verify(syn_map(tampered), pk.clone(), opts(vec![])), SynValue::Nothing));
         // el bueno sigue pasando (los rechazos de arriba no fueron por otra cosa)

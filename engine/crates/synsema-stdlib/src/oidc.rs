@@ -19,12 +19,12 @@
 //! `iss`, falta `aud`, JWKS inalcanzable) sí son errores catchables: no es lo
 //! mismo "el token no vale" que "no pude comprobarlo".
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
 
-use indexmap::IndexMap;
 use rsa::signature::Verifier as _;
 use sha2::Sha256;
 
@@ -284,9 +284,9 @@ pub(crate) fn verify_with(key: &Jwk, alg: &str, signing_input: &[u8], sig: &[u8]
 // oidc_verify
 // =========================================================
 
-fn opts_map(v: Option<&SynValue>, who: &str) -> Result<IndexMap<String, SynValue>, Control> {
+fn opts_map(v: Option<&SynValue>, who: &str) -> Result<SynMap, Control> {
     match v {
-        Some(SynValue::Map(m)) => Ok(m.borrow().clone()),
+        Some(SynValue::Map(m)) => Ok(m.borrow().to_map()),
         Some(other) => Err(err(format!(
             "{}: opts must be a map, got {}",
             who,
@@ -584,7 +584,7 @@ mod tests {
     }
 
     fn map(pairs: Vec<(&str, SynValue)>) -> SynValue {
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }

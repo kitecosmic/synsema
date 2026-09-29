@@ -30,7 +30,7 @@
 //! - `created` es OPCIONAL (así lo permite la spec): sin él no se lee el reloj y el builtin no
 //!   exige `time`; el programa lo pasa si lo quiere (`opts.created`).
 
-use indexmap::IndexMap;
+use synsema_core::types::{MapObj, SynMap};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
@@ -56,14 +56,14 @@ pub const SUITE_EDDSA: &str = "eddsa-jcs-2022";
 pub const SUITE_ECDSA: &str = "ecdsa-jcs-2019";
 const PROOF_TYPE: &str = "DataIntegrityProof";
 
-fn as_map(v: &SynValue, who: &str, what: &str) -> Result<IndexMap<String, SynValue>, Control> {
+fn as_map(v: &SynValue, who: &str, what: &str) -> Result<SynMap, Control> {
     match v {
-        SynValue::Map(m) => Ok(m.borrow().clone()),
+        SynValue::Map(m) => Ok(m.borrow().to_map()),
         other => Err(err(format!("{}: {} must be a map, got {}", who, what, other.type_name()))),
     }
 }
 
-fn text_opt(m: &IndexMap<String, SynValue>, k: &str, who: &str) -> Result<Option<String>, Control> {
+fn text_opt(m: &MapObj, k: &str, who: &str) -> Result<Option<String>, Control> {
     match m.get(k) {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Text(s)) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
@@ -194,7 +194,7 @@ pub(crate) fn signer_from(
 pub fn sign_document(
     doc: &SynValue,
     key: &SynValue,
-    opts: &IndexMap<String, SynValue>,
+    opts: &MapObj,
     who: &str,
     loc: &SourceLocation,
     caps: &Rc<RefCell<CapabilitySet>>,
@@ -205,7 +205,7 @@ pub fn sign_document(
 }
 
 /// `opts.cryptosuite`, validada (o `None`).
-pub(crate) fn validate_suite_opt(opts: &IndexMap<String, SynValue>, who: &str) -> Result<Option<String>, Control> {
+pub(crate) fn validate_suite_opt(opts: &MapObj, who: &str) -> Result<Option<String>, Control> {
     let suite_opt = text_opt(opts, "cryptosuite", who)?;
     if let Some(s) = &suite_opt {
         if s != SUITE_EDDSA && s != SUITE_ECDSA {
@@ -223,7 +223,7 @@ pub(crate) fn validate_suite_opt(opts: &IndexMap<String, SynValue>, who: &str) -
 pub(crate) fn sign_document_with(
     doc: &SynValue,
     signer: &Signer,
-    opts: &IndexMap<String, SynValue>,
+    opts: &MapObj,
     who: &str,
 ) -> Result<SynValue, Control> {
     let doc_map = as_map(doc, who, "document")?;
@@ -262,30 +262,30 @@ pub(crate) fn sign_document_with(
     let purpose = text_opt(opts, "proof_purpose", who)?.unwrap_or_else(|| "assertionMethod".to_string());
 
     // proofConfig (§3.3.3): sin proofValue; con el @context del documento si lo tiene.
-    let mut cfg = IndexMap::new();
+    let mut cfg = SynMap::new();
     if let Some(ctx) = doc_map.get("@context") {
-        cfg.insert("@context".to_string(), ctx.clone());
+        cfg.insert("@context", ctx.clone());
     }
-    cfg.insert("type".to_string(), syn_text(PROOF_TYPE));
-    cfg.insert("cryptosuite".to_string(), syn_text(signer.suite()));
+    cfg.insert("type", syn_text(PROOF_TYPE));
+    cfg.insert("cryptosuite", syn_text(signer.suite()));
     if let Some(c) = text_opt(opts, "created", who)? {
-        cfg.insert("created".to_string(), syn_text(c));
+        cfg.insert("created", syn_text(c));
     }
-    cfg.insert("verificationMethod".to_string(), syn_text(vm));
-    cfg.insert("proofPurpose".to_string(), syn_text(purpose));
+    cfg.insert("verificationMethod", syn_text(vm));
+    cfg.insert("proofPurpose", syn_text(purpose));
     if let Some(c) = text_opt(opts, "challenge", who)? {
-        cfg.insert("challenge".to_string(), syn_text(c));
+        cfg.insert("challenge", syn_text(c));
     }
     if let Some(d) = text_opt(opts, "domain", who)? {
-        cfg.insert("domain".to_string(), syn_text(d));
+        cfg.insert("domain", syn_text(d));
     }
     let cfg_val = syn_map(cfg.clone());
     let data = hash_data(&cfg_val, doc)?;
     let sig = signer.sign(&data);
-    cfg.insert("proofValue".to_string(), syn_text(format!("z{}", base58_encode(&sig))));
+    cfg.insert("proofValue", syn_text(format!("z{}", base58_encode(&sig))));
 
     let mut out = doc_map;
-    out.insert("proof".to_string(), syn_map(cfg));
+    out.insert("proof", syn_map(cfg));
     Ok(syn_map(out))
 }
 
@@ -295,7 +295,7 @@ fn b_document_sign(args: &[SynValue], loc: &SourceLocation, caps: &Rc<RefCell<Ca
         return Err(err(format!("{}(document, key, opts) takes 2 or 3 arguments", F)));
     }
     let opts = match args.get(2) {
-        None | Some(SynValue::Nothing) => IndexMap::new(),
+        None | Some(SynValue::Nothing) => SynMap::new(),
         Some(v) => as_map(v, F, "opts")?,
     };
     sign_document(&args[0], &args[1], &opts, F, loc, caps)
@@ -418,7 +418,7 @@ fn verifier_from(v: &SynValue, who: &str) -> Result<Verifier, Control> {
 pub fn verify_document(
     doc: &SynValue,
     public_key: &SynValue,
-    opts: &IndexMap<String, SynValue>,
+    opts: &MapObj,
     who: &str,
 ) -> Result<Option<SynValue>, Control> {
     let mut doc_map = as_map(doc, who, "document")?;
@@ -437,8 +437,8 @@ pub fn verify_document(
             who
         )));
     };
-    let mut proof = proof.borrow().clone();
-    let t = |m: &IndexMap<String, SynValue>, k: &str| -> Option<String> {
+    let mut proof = proof.borrow().to_map();
+    let t = |m: &MapObj, k: &str| -> Option<String> {
         match m.get(k) {
             Some(SynValue::Text(s)) => Some(s.to_string()),
             _ => None,
@@ -482,9 +482,9 @@ pub fn verify_document(
     if !verifier.verify(&data, &sig) {
         return Ok(None);
     }
-    let mut out = IndexMap::new();
-    out.insert("verified".to_string(), SynValue::Bool(true));
-    out.insert("cryptosuite".to_string(), syn_text(suite));
+    let mut out = SynMap::new();
+    out.insert("verified", SynValue::Bool(true));
+    out.insert("cryptosuite", syn_text(suite));
     for k in ["verificationMethod", "proofPurpose", "created", "challenge", "domain"] {
         let key = match k {
             "verificationMethod" => "verification_method",
@@ -502,7 +502,7 @@ fn b_document_verify(args: &[SynValue]) -> Result<SynValue, Control> {
         return Err(err(format!("{}(document, public_key, opts?) takes 2 or 3 arguments", F)));
     }
     let opts = match args.get(2) {
-        None | Some(SynValue::Nothing) => IndexMap::new(),
+        None | Some(SynValue::Nothing) => SynMap::new(),
         Some(v) => as_map(v, F, "opts")?,
     };
     Ok(verify_document(&args[0], &args[1], &opts, F)?.unwrap_or_else(syn_nothing))
@@ -526,15 +526,15 @@ mod tests {
         syn_text(s)
     }
     fn map(pairs: Vec<(&str, SynValue)>) -> SynValue {
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }
         syn_map(m)
     }
-    fn entries(v: &SynValue) -> IndexMap<String, SynValue> {
+    fn entries(v: &SynValue) -> SynMap {
         match v {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             other => panic!("map, got {}", other),
         }
     }
@@ -598,14 +598,14 @@ mod tests {
 
         // Verifica con bytes, con did:key y con JWK.
         let bytes_key = SynValue::Bytes(Rc::from(pk.clone().into_boxed_slice()));
-        let v = verify_document(&signed, &bytes_key, &IndexMap::new(), "document_verify").map_err(|_| ()).unwrap().expect("verifica");
+        let v = verify_document(&signed, &bytes_key, &SynMap::new(), "document_verify").map_err(|_| ()).unwrap().expect("verifica");
         let v = entries(&v);
         assert!(matches!(v["verified"], SynValue::Bool(true)));
         assert_eq!(v["proof_purpose"].to_string(), "assertionMethod");
         assert_eq!(v["challenge"].to_string(), "nonce-1");
-        assert!(verify_document(&signed, &text(&did), &IndexMap::new(), "document_verify").map_err(|_| ()).unwrap().is_some());
+        assert!(verify_document(&signed, &text(&did), &SynMap::new(), "document_verify").map_err(|_| ()).unwrap().is_some());
         let jwk = map(vec![("kty", text("OKP")), ("crv", text("Ed25519")), ("x", text(&synsema_core::bytesutil::b64url_encode(&pk)))]);
-        assert!(verify_document(&signed, &jwk, &IndexMap::new(), "document_verify").map_err(|_| ()).unwrap().is_some());
+        assert!(verify_document(&signed, &jwk, &SynMap::new(), "document_verify").map_err(|_| ()).unwrap().is_some());
         // Lo exigido tiene que coincidir.
         let want = |k: &str, v: &str| entries(&map(vec![(k, text(v))]));
         assert!(verify_document(&signed, &text(&did), &want("challenge", "nonce-1"), "document_verify").map_err(|_| ()).unwrap().is_some());
@@ -614,12 +614,12 @@ mod tests {
         assert!(verify_document(&signed, &text(&did), &want("proof_purpose", "authentication"), "document_verify").map_err(|_| ()).unwrap().is_none());
         // Un byte cambiado en el documento → nothing.
         let mut tampered = entries(&signed);
-        tampered.insert("issuer".to_string(), text("did:key:zOther"));
-        assert!(verify_document(&syn_map(tampered), &text(&did), &IndexMap::new(), "document_verify").map_err(|_| ()).unwrap().is_none());
+        tampered.insert("issuer", text("did:key:zOther"));
+        assert!(verify_document(&syn_map(tampered), &text(&did), &SynMap::new(), "document_verify").map_err(|_| ()).unwrap().is_none());
         // Otra clave → nothing.
         let other = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]).verifying_key().to_bytes().to_vec();
         let other_did = didkey::encode(KeyAlg::Ed25519, &other).unwrap();
-        assert!(verify_document(&signed, &text(&other_did), &IndexMap::new(), "document_verify").map_err(|_| ()).unwrap().is_none());
+        assert!(verify_document(&signed, &text(&other_did), &SynMap::new(), "document_verify").map_err(|_| ()).unwrap().is_none());
         // Sin `proof` → error de forma.
         let e = err_of(b_document_verify(&[doc(), text(&did)]));
         assert!(e.contains("has no `proof`"), "{}", e);
@@ -633,13 +633,13 @@ mod tests {
         let e = err_of(sign_document(&doc(), &secret("K", seed), &opts, "document_sign", &loc(), &no_caps));
         assert!(e.contains("sign"), "{}", e);
         // Sin `verification_method`: el did:key de la clave que firma, y el documento verifica con él.
-        let signed = sign_document(&doc(), &secret("K", seed), &IndexMap::new(), "document_sign", &loc(), &caps_with_sign("K")).map_err(|_| ()).unwrap();
+        let signed = sign_document(&doc(), &secret("K", seed), &SynMap::new(), "document_sign", &loc(), &caps_with_sign("K")).map_err(|_| ()).unwrap();
         let proof = entries(&entries(&signed)["proof"]);
         let vm = proof["verificationMethod"].to_string();
         let pk = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes();
         let did = didkey::encode(KeyAlg::Ed25519, &pk).unwrap();
         assert_eq!(vm, format!("{}#{}", did, &did[8..]));
-        assert!(verify_document(&signed, &text(&did), &IndexMap::new(), "document_verify").map_err(|_| ()).unwrap().is_some());
+        assert!(verify_document(&signed, &text(&did), &SynMap::new(), "document_verify").map_err(|_| ()).unwrap().is_some());
         // un documento ya firmado no se re-firma encima
         let signed = ok(sign_document(&doc(), &secret("K", seed), &opts, "document_sign", &loc(), &caps_with_sign("K")));
         let e = err_of(sign_document(&signed, &secret("K", seed), &opts, "document_sign", &loc(), &caps_with_sign("K")));
@@ -661,11 +661,11 @@ mod tests {
         let signed = ok(sign_document(&doc(), &secret("ATTESTED", scalar), &opts, "document_sign", &loc(), &caps_with_sign("ATTESTED")));
         let proof = entries(&entries(&signed)["proof"]);
         assert_eq!(proof["cryptosuite"].to_string(), "ecdsa-jcs-2019");
-        let v = verify_document(&signed, &text(&did), &IndexMap::new(), "document_verify").map_err(|_| ()).unwrap().expect("verifica");
+        let v = verify_document(&signed, &text(&did), &SynMap::new(), "document_verify").map_err(|_| ()).unwrap().expect("verifica");
         assert_eq!(entries(&v)["proof_purpose"].to_string(), "authentication");
         // la clave ed25519 equivocada de suite → nothing (la suite la fija la clave)
         let ed = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]).verifying_key().to_bytes().to_vec();
         let ed_did = didkey::encode(KeyAlg::Ed25519, &ed).unwrap();
-        assert!(verify_document(&signed, &text(&ed_did), &IndexMap::new(), "document_verify").map_err(|_| ()).unwrap().is_none());
+        assert!(verify_document(&signed, &text(&ed_did), &SynMap::new(), "document_verify").map_err(|_| ()).unwrap().is_none());
     }
 }

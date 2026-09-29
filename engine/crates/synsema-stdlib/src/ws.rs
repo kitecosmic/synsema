@@ -35,6 +35,7 @@
 //! en el pool. Los handles NO cruzan workers (aislamiento CSP): cada worker es dueño de
 //! los suyos.
 
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -772,18 +773,18 @@ impl WsRegistry {
             };
             match read {
                 Ok(Message::Text(t)) => {
-                    let mut m = indexmap::IndexMap::new();
-                    m.insert("type".to_string(), syn_text("text"));
-                    m.insert("data".to_string(), syn_text(t.as_str()));
+                    let mut m = SynMap::new();
+                    m.insert("type", syn_text("text"));
+                    m.insert("data", syn_text(t.as_str()));
                     if !self.enqueue(handle, syn_map(m)) {
                         self.overflow_fail(handle);
                         return false;
                     }
                 }
                 Ok(Message::Binary(b)) => {
-                    let mut m = indexmap::IndexMap::new();
-                    m.insert("type".to_string(), syn_text("binary"));
-                    m.insert("data".to_string(), syn_bytes(b.to_vec()));
+                    let mut m = SynMap::new();
+                    m.insert("type", syn_text("binary"));
+                    m.insert("data", syn_bytes(b.to_vec()));
                     if !self.enqueue(handle, syn_map(m)) {
                         self.overflow_fail(handle);
                         return false;
@@ -866,9 +867,9 @@ impl WsRegistry {
         }
         // Sin reconexión (o agotada): cierre definitivo.
         if !c.closed_emitted {
-            let mut m = indexmap::IndexMap::new();
-            m.insert("type".to_string(), syn_text("close"));
-            m.insert("data".to_string(), reason);
+            let mut m = SynMap::new();
+            m.insert("type", syn_text("close"));
+            m.insert("data", reason);
             c.inbound.push_back(syn_map(m));
             c.closed_emitted = true;
         }
@@ -962,9 +963,9 @@ impl WsRegistry {
                     if !reschedule {
                         if let Some(c) = self.conns.get_mut(&handle) {
                             if !c.closed_emitted {
-                                let mut m = indexmap::IndexMap::new();
-                                m.insert("type".to_string(), syn_text("close"));
-                                m.insert("data".to_string(), closed_reason);
+                                let mut m = SynMap::new();
+                                m.insert("type", syn_text("close"));
+                                m.insert("data", closed_reason);
                                 c.inbound.push_back(syn_map(m));
                                 c.closed_emitted = true;
                             }
@@ -1281,7 +1282,7 @@ struct ConnectOpts {
     keepalive: Option<KeepaliveCfg>,
 }
 
-fn opt_duration(m: &indexmap::IndexMap<String, SynValue>, key: &str, fname: &str) -> Result<Option<Duration>, Control> {
+fn opt_duration(m: &MapObj, key: &str, fname: &str) -> Result<Option<Duration>, Control> {
     match m.get(key) {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Number(n)) => {
@@ -1297,8 +1298,8 @@ fn opt_duration(m: &indexmap::IndexMap<String, SynValue>, key: &str, fname: &str
 
 fn parse_connect_opts(v: Option<&SynValue>, fname: &str) -> Result<ConnectOpts, Control> {
     let opts = match v {
-        None | Some(SynValue::Nothing) => indexmap::IndexMap::new(),
-        Some(SynValue::Map(m)) => m.borrow().clone(),
+        None | Some(SynValue::Nothing) => SynMap::new(),
+        Some(SynValue::Map(m)) => m.borrow().to_map(),
         Some(other) => return Err(err(format!("{}: opts must be a map, got {}", fname, other.type_name()))),
     };
     const ALLOWED: &[&str] = &[
@@ -1378,7 +1379,7 @@ fn parse_connect_opts(v: Option<&SynValue>, fname: &str) -> Result<ConnectOpts, 
     let reconnect = match opts.get("reconnect") {
         None | Some(SynValue::Nothing) => None,
         Some(SynValue::Map(m)) => {
-            let rm = m.borrow().clone();
+            let rm = m.borrow().to_map();
             for k in rm.keys() {
                 if !matches!(k.as_str(), "max_retries" | "backoff" | "backoff_max" | "on_reconnect") {
                     return Err(err(format!("{}: unknown reconnect option {:?} (allowed: max_retries, backoff, backoff_max, on_reconnect)", fname, k)));
@@ -1408,7 +1409,7 @@ fn parse_connect_opts(v: Option<&SynValue>, fname: &str) -> Result<ConnectOpts, 
     let keepalive = match opts.get("keepalive") {
         None | Some(SynValue::Nothing) => None,
         Some(SynValue::Map(m)) => {
-            let km = m.borrow().clone();
+            let km = m.borrow().to_map();
             for k in km.keys() {
                 if !matches!(k.as_str(), "interval" | "timeout") {
                     return Err(err(format!("{}: unknown keepalive option {:?} (allowed: interval, timeout)", fname, k)));
@@ -1451,7 +1452,7 @@ fn parse_headers(v: Option<&SynValue>, fname: &str) -> Result<Vec<(String, Strin
                     SynValue::Secret(s) => s.expose().into_owned(),
                     other => other.to_string(),
                 };
-                (k.clone(), vs)
+                (k.to_string(), vs)
             })
             .collect()),
         Some(other) => Err(err(format!("{}: headers must be a map, got {}", fname, other.type_name()))),
@@ -1644,13 +1645,13 @@ fn resolve_targets(v: &SynValue, fname: &str) -> Result<(Vec<i64>, TargetNames),
             Ok((handles, None))
         }
         SynValue::Map(m) => {
-            let mm = m.borrow().clone();
+            let mm = m.borrow().to_map();
             let mut handles = Vec::with_capacity(mm.len());
             let mut names = HashMap::new();
             for (name, hv) in &mm {
                 let h = conn_handle(hv, fname)?;
                 handles.push(h);
-                names.insert(h, name.clone());
+                names.insert(h, name.to_string());
             }
             Ok((handles, Some(names)))
         }
@@ -1665,17 +1666,17 @@ fn resolve_targets(v: &SynValue, fname: &str) -> Result<(Vec<i64>, TargetNames),
 /// Empaqueta un mensaje (ya `{type, data}`) agregando `conn` (y `name` si venía de un map).
 fn tag_message(msg: SynValue, handle: i64, names: &TargetNames) -> SynValue {
     let mut m = match msg {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         other => {
-            let mut mm = indexmap::IndexMap::new();
-            mm.insert("data".to_string(), other);
+            let mut mm = SynMap::new();
+            mm.insert("data", other);
             mm
         }
     };
-    m.insert("conn".to_string(), syn_int(handle));
+    m.insert("conn", syn_int(handle));
     if let Some(names) = names {
         if let Some(name) = names.get(&handle) {
-            m.insert("name".to_string(), syn_text(name.clone()));
+            m.insert("name", syn_text(name.clone()));
         }
     }
     syn_map(m)
@@ -1769,12 +1770,12 @@ fn ws_stats(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
     let handle = conn_handle(args.first().ok_or_else(|| err(format!("{}: missing the connection handle", F)))?, F)?;
     let r = reg.borrow();
     let c = r.conns.get(&handle).ok_or_else(|| err(format!("{}: unknown or closed connection handle {}", F, handle)))?;
-    let mut m = indexmap::IndexMap::new();
-    m.insert("sent".to_string(), syn_int(c.stats.sent as i64));
-    m.insert("received".to_string(), syn_int(c.stats.received as i64));
-    m.insert("reconnects".to_string(), syn_int(c.stats.reconnects as i64));
-    m.insert("queued".to_string(), syn_int(c.inbound.len() as i64));
-    m.insert("queued_bytes".to_string(), syn_int(c.queued_bytes as i64));
+    let mut m = SynMap::new();
+    m.insert("sent", syn_int(c.stats.sent as i64));
+    m.insert("received", syn_int(c.stats.received as i64));
+    m.insert("reconnects", syn_int(c.stats.reconnects as i64));
+    m.insert("queued", syn_int(c.inbound.len() as i64));
+    m.insert("queued_bytes", syn_int(c.queued_bytes as i64));
     // Segundos desde el último pong (nothing si nunca llegó uno) — el vital sign
     // del keepalive, visible para un keeper de miles de feeds.
     m.insert(
@@ -1784,12 +1785,12 @@ fn ws_stats(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
             .map(|t| syn_number(synsema_core::number::Number::Float(t.elapsed().as_secs_f64())))
             .unwrap_or(SynValue::Nothing),
     );
-    m.insert("status".to_string(), syn_text(status_str(c.status)));
+    m.insert("status", syn_text(status_str(c.status)));
     m.insert(
         "subprotocol".to_string(),
         c.negotiated_subprotocol.clone().map(syn_text).unwrap_or(SynValue::Nothing),
     );
-    m.insert("role".to_string(), syn_text(if c.server_side { "server" } else { "client" }));
+    m.insert("role", syn_text(if c.server_side { "server" } else { "client" }));
     Ok(syn_map(m))
 }
 
@@ -2132,12 +2133,12 @@ impl WsRegistry {
     /// terminal atrapable del handle.
     fn take_event(&mut self, h: i64, names: &TargetNames) -> Option<Result<SynValue, String>> {
         let kind = self.kind_of(h)?;
-        let tagged = |mut m: indexmap::IndexMap<String, SynValue>, source: &str| {
-            m.insert("source".to_string(), syn_text(source));
-            m.insert("handle".to_string(), syn_int(h));
+        let tagged = |mut m: SynMap, source: &str| {
+            m.insert("source", syn_text(source));
+            m.insert("handle", syn_int(h));
             if let Some(names) = names {
                 if let Some(name) = names.get(&h) {
-                    m.insert("name".to_string(), syn_text(name.clone()));
+                    m.insert("name", syn_text(name.clone()));
                 }
             }
             syn_map(m)
@@ -2147,14 +2148,14 @@ impl WsRegistry {
                 if self.conns.get(&h).map(|c| !c.inbound.is_empty()).unwrap_or(false) {
                     let msg = self.take_message(h)?;
                     let mut m = match msg {
-                        SynValue::Map(m) => m.borrow().clone(),
+                        SynValue::Map(m) => m.borrow().to_map(),
                         other => {
-                            let mut mm = indexmap::IndexMap::new();
-                            mm.insert("data".to_string(), other);
+                            let mut mm = SynMap::new();
+                            mm.insert("data", other);
                             mm
                         }
                     };
-                    m.insert("conn".to_string(), syn_int(h));
+                    m.insert("conn", syn_int(h));
                     return Some(Ok(tagged(m, "ws")));
                 }
                 self.take_error(h).map(|e| Err(format!("connection {}: {}", h, e)))
@@ -2163,19 +2164,19 @@ impl WsRegistry {
                 let p = self.procs.get_mut(&h)?;
                 match p.shared.try_recv() {
                     Ok(Some(ev)) => {
-                        let mut m = indexmap::IndexMap::new();
+                        let mut m = SynMap::new();
                         match ev {
                             ProcEvent::Stdout(b) => {
-                                m.insert("type".to_string(), syn_text("stdout"));
-                                m.insert("data".to_string(), syn_text(String::from_utf8_lossy(&b).into_owned()));
+                                m.insert("type", syn_text("stdout"));
+                                m.insert("data", syn_text(String::from_utf8_lossy(&b).into_owned()));
                             }
                             ProcEvent::Stderr(b) => {
-                                m.insert("type".to_string(), syn_text("stderr"));
-                                m.insert("data".to_string(), syn_text(String::from_utf8_lossy(&b).into_owned()));
+                                m.insert("type", syn_text("stderr"));
+                                m.insert("data", syn_text(String::from_utf8_lossy(&b).into_owned()));
                             }
                             ProcEvent::Exit(code, sig) => {
-                                m.insert("type".to_string(), syn_text("exit"));
-                                m.insert("data".to_string(), exit_map(code, sig));
+                                m.insert("type", syn_text("exit"));
+                                m.insert("data", exit_map(code, sig));
                             }
                         }
                         Some(Ok(tagged(m, "proc")))
@@ -2183,9 +2184,9 @@ impl WsRegistry {
                     Ok(None) => {
                         if p.exit_code.is_some() && !p.exit_emitted && p.shared.readers_done() {
                             p.exit_emitted = true;
-                            let mut m = indexmap::IndexMap::new();
-                            m.insert("type".to_string(), syn_text("exit"));
-                            m.insert("data".to_string(), exit_map(p.exit_code.unwrap_or(-1), p.exit_signal));
+                            let mut m = SynMap::new();
+                            m.insert("type", syn_text("exit"));
+                            m.insert("data", exit_map(p.exit_code.unwrap_or(-1), p.exit_signal));
                             Some(Ok(tagged(m, "proc")))
                         } else {
                             None
@@ -2204,10 +2205,10 @@ impl WsRegistry {
                 let s = self.subs.get(&h)?.clone();
                 match s.try_recv() {
                     Ok(Some(ev)) => {
-                        let mut m = indexmap::IndexMap::new();
-                        m.insert("type".to_string(), syn_text("event"));
-                        m.insert("topic".to_string(), syn_text(ev.topic));
-                        m.insert("data".to_string(), from_send(&ev.data));
+                        let mut m = SynMap::new();
+                        m.insert("type", syn_text("event"));
+                        m.insert("topic", syn_text(ev.topic));
+                        m.insert("data", from_send(&ev.data));
                         m.insert(
                             "timestamp".to_string(),
                             syn_number(synsema_core::number::Number::Float(ev.timestamp)),
@@ -2228,10 +2229,10 @@ impl WsRegistry {
                 let w = self.watches.get(&h)?;
                 match w.shared.try_recv() {
                     Ok(Some(ev)) => {
-                        let mut m = indexmap::IndexMap::new();
-                        m.insert("type".to_string(), syn_text(ev.kind.as_str()));
-                        m.insert("path".to_string(), syn_text(ev.path));
-                        m.insert("is_dir".to_string(), syn_bool(ev.is_dir));
+                        let mut m = SynMap::new();
+                        m.insert("type", syn_text(ev.kind.as_str()));
+                        m.insert("path", syn_text(ev.path));
+                        m.insert("is_dir", syn_bool(ev.is_dir));
                         Some(Ok(tagged(m, "watch")))
                     }
                     Ok(None) => None,
@@ -2244,33 +2245,33 @@ impl WsRegistry {
             }
             HandleKind::Term => {
                 let ev = self.term.as_ref()?.1.shared.try_recv()?;
-                let mut m = indexmap::IndexMap::new();
+                let mut m = SynMap::new();
                 match ev {
                     TermEvent::Key { key, text, ctrl, alt, shift } => {
-                        m.insert("type".to_string(), syn_text("key"));
-                        m.insert("key".to_string(), syn_text(key));
-                        m.insert("text".to_string(), syn_text(text));
-                        m.insert("ctrl".to_string(), syn_bool(ctrl));
-                        m.insert("alt".to_string(), syn_bool(alt));
-                        m.insert("shift".to_string(), syn_bool(shift));
+                        m.insert("type", syn_text("key"));
+                        m.insert("key", syn_text(key));
+                        m.insert("text", syn_text(text));
+                        m.insert("ctrl", syn_bool(ctrl));
+                        m.insert("alt", syn_bool(alt));
+                        m.insert("shift", syn_bool(shift));
                     }
                     TermEvent::Paste(t) => {
-                        m.insert("type".to_string(), syn_text("paste"));
-                        m.insert("text".to_string(), syn_text(t));
+                        m.insert("type", syn_text("paste"));
+                        m.insert("text", syn_text(t));
                     }
                     TermEvent::Resize { cols, rows } => {
-                        m.insert("type".to_string(), syn_text("resize"));
-                        m.insert("cols".to_string(), syn_int(cols as i64));
-                        m.insert("rows".to_string(), syn_int(rows as i64));
+                        m.insert("type", syn_text("resize"));
+                        m.insert("cols", syn_int(cols as i64));
+                        m.insert("rows", syn_int(rows as i64));
                     }
                     TermEvent::Focus(g) => {
-                        m.insert("type".to_string(), syn_text("focus"));
-                        m.insert("gained".to_string(), syn_bool(g));
+                        m.insert("type", syn_text("focus"));
+                        m.insert("gained", syn_bool(g));
                     }
                     TermEvent::Eof => {
                         // Fin de la entrada: no es un error atrapable (como `read_line` →
                         // nothing). Se entrega una vez y el handle se retira (restaura).
-                        m.insert("type".to_string(), syn_text("eof"));
+                        m.insert("type", syn_text("eof"));
                         let tagged_ev = tagged(m, "term");
                         self.term = None;
                         return Some(Ok(tagged_ev));
@@ -2287,9 +2288,9 @@ impl WsRegistry {
 }
 
 fn exit_map(code: i64, sig: Option<i32>) -> SynValue {
-    let mut m = indexmap::IndexMap::new();
-    m.insert("exit_code".to_string(), syn_int(code));
-    m.insert("signal".to_string(), sig.map(|s| syn_int(s as i64)).unwrap_or(SynValue::Nothing));
+    let mut m = SynMap::new();
+    m.insert("exit_code", syn_int(code));
+    m.insert("signal", sig.map(|s| syn_int(s as i64)).unwrap_or(SynValue::Nothing));
     syn_map(m)
 }
 
@@ -2377,7 +2378,7 @@ fn term_handle(reg: &Registry, v: Option<&SynValue>, fname: &str) -> Result<i64,
     }
 }
 
-fn opt_map<'a>(v: Option<&'a SynValue>, fname: &str) -> Result<Option<std::cell::Ref<'a, indexmap::IndexMap<String, SynValue>>>, Control> {
+fn opt_map<'a>(v: Option<&'a SynValue>, fname: &str) -> Result<Option<std::cell::Ref<'a, MapObj>>, Control> {
     match v {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Map(m)) => Ok(Some(m.borrow())),
@@ -2385,7 +2386,7 @@ fn opt_map<'a>(v: Option<&'a SynValue>, fname: &str) -> Result<Option<std::cell:
     }
 }
 
-fn opt_usize(m: &indexmap::IndexMap<String, SynValue>, key: &str, fname: &str) -> Result<Option<usize>, Control> {
+fn opt_usize(m: &MapObj, key: &str, fname: &str) -> Result<Option<usize>, Control> {
     match m.get(key) {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Number(n)) => {
@@ -2450,7 +2451,7 @@ fn proc_spawn(i: &Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynV
                         F, k
                     )));
                 }
-                opts.env.push((k.clone(), v.to_string()));
+                opts.env.push((k.to_string(), v.to_string()));
             }
         }
         if let Some(n) = opt_usize(&m, "max_queue", F)? {
@@ -2662,9 +2663,9 @@ fn proc_stats(_interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> R
     let p = r.procs.get_mut(&h).ok_or_else(|| err(format!("{}: unknown process handle {}", F, h)))?;
     p.poll_exit();
     let (queued, queued_bytes, dropped) = p.shared.stats();
-    let mut m = indexmap::IndexMap::new();
-    m.insert("pid".to_string(), syn_int(p.pid as i64));
-    m.insert("cmd".to_string(), syn_text(p.cmd.clone()));
+    let mut m = SynMap::new();
+    m.insert("pid", syn_int(p.pid as i64));
+    m.insert("cmd", syn_text(p.cmd.clone()));
     m.insert(
         "status".to_string(),
         syn_text(match p.status {
@@ -2673,12 +2674,12 @@ fn proc_stats(_interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> R
             ProcStatus::Killed => "killed",
         }),
     );
-    m.insert("exit_code".to_string(), p.exit_code.map(syn_int).unwrap_or(SynValue::Nothing));
-    m.insert("pty".to_string(), syn_bool(p.pty));
-    m.insert("tree".to_string(), syn_bool(p.tree));
-    m.insert("queued".to_string(), syn_int(queued as i64));
-    m.insert("queued_bytes".to_string(), syn_int(queued_bytes as i64));
-    m.insert("dropped".to_string(), syn_int(dropped as i64));
+    m.insert("exit_code", p.exit_code.map(syn_int).unwrap_or(SynValue::Nothing));
+    m.insert("pty", syn_bool(p.pty));
+    m.insert("tree", syn_bool(p.tree));
+    m.insert("queued", syn_int(queued as i64));
+    m.insert("queued_bytes", syn_int(queued_bytes as i64));
+    m.insert("dropped", syn_int(dropped as i64));
     m.insert(
         "uptime".to_string(),
         syn_number(synsema_core::number::Number::Float(p.started_at.elapsed().as_secs_f64())),
@@ -2712,7 +2713,7 @@ fn to_send_strict(v: &SynValue, fname: &str) -> Result<SendValue, Control> {
         SynValue::Map(m) => Ok(SendValue::Map(
             m.borrow()
                 .iter()
-                .map(|(k, x)| to_send_strict(x, fname).map(|sv| (k.clone(), sv)))
+                .map(|(k, x)| to_send_strict(x, fname).map(|sv| (k.to_string(), sv)))
                 .collect::<Result<Vec<_>, _>>()?,
         )),
         other => Ok(synsema_core::types::to_send(other)),
@@ -2812,9 +2813,9 @@ fn bus_topics(_args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         .topics()
         .into_iter()
         .map(|(topic, n)| {
-            let mut m = indexmap::IndexMap::new();
-            m.insert("topic".to_string(), syn_text(topic));
-            m.insert("subscribers".to_string(), syn_int(n as i64));
+            let mut m = SynMap::new();
+            m.insert("topic", syn_text(topic));
+            m.insert("subscribers", syn_int(n as i64));
             syn_map(m)
         })
         .collect();
@@ -2825,7 +2826,7 @@ fn bus_topics(_args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
 // File-watch
 // ---------------------------------------------------------
 
-fn opt_f64(m: &indexmap::IndexMap<String, SynValue>, key: &str, fname: &str) -> Result<Option<f64>, Control> {
+fn opt_f64(m: &MapObj, key: &str, fname: &str) -> Result<Option<f64>, Control> {
     match m.get(key) {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Number(n)) => {
@@ -2925,14 +2926,14 @@ fn watch_stats(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
     let r = reg.borrow();
     let w = r.watches.get(&h).ok_or_else(|| err(format!("{}: unknown watch handle {}", F, h)))?;
     let (queued, dropped, entries, scans) = w.shared.stats();
-    let mut m = indexmap::IndexMap::new();
-    m.insert("path".to_string(), syn_text(w.shared.root.clone()));
-    m.insert("recursive".to_string(), syn_bool(w.shared.recursive));
-    m.insert("interval".to_string(), syn_number(synsema_core::number::Number::Float(w.shared.interval.as_secs_f64())));
-    m.insert("entries".to_string(), syn_int(entries as i64));
-    m.insert("scans".to_string(), syn_int(scans as i64));
-    m.insert("queued".to_string(), syn_int(queued as i64));
-    m.insert("dropped".to_string(), syn_int(dropped as i64));
+    let mut m = SynMap::new();
+    m.insert("path", syn_text(w.shared.root.clone()));
+    m.insert("recursive", syn_bool(w.shared.recursive));
+    m.insert("interval", syn_number(synsema_core::number::Number::Float(w.shared.interval.as_secs_f64())));
+    m.insert("entries", syn_int(entries as i64));
+    m.insert("scans", syn_int(scans as i64));
+    m.insert("queued", syn_int(queued as i64));
+    m.insert("dropped", syn_int(dropped as i64));
     Ok(syn_map(m))
 }
 
@@ -3017,9 +3018,9 @@ fn term_size(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
     const F: &str = "term_size";
     term_handle(reg, args.first(), F)?;
     let (cols, rows) = Term::size().map_err(|e| err(format!("{}: {}", F, e)))?;
-    let mut m = indexmap::IndexMap::new();
-    m.insert("cols".to_string(), syn_int(cols as i64));
-    m.insert("rows".to_string(), syn_int(rows as i64));
+    let mut m = SynMap::new();
+    m.insert("cols", syn_int(cols as i64));
+    m.insert("rows", syn_int(rows as i64));
     Ok(syn_map(m))
 }
 
@@ -3043,13 +3044,13 @@ fn term_stats(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
     let r = reg.borrow();
     let t = &r.term.as_ref().filter(|(th, _)| *th == h).ok_or_else(|| err(format!("{}: unknown terminal handle {}", F, h)))?.1;
     let (queued, dropped, keys) = t.shared.stats();
-    let mut m = indexmap::IndexMap::new();
-    m.insert("kitty".to_string(), syn_bool(t.shared.kitty));
-    m.insert("paste".to_string(), syn_bool(t.shared.paste));
-    m.insert("ansi".to_string(), syn_bool(t.shared.ansi));
-    m.insert("keys".to_string(), syn_int(keys as i64));
-    m.insert("queued".to_string(), syn_int(queued as i64));
-    m.insert("dropped".to_string(), syn_int(dropped as i64));
+    let mut m = SynMap::new();
+    m.insert("kitty", syn_bool(t.shared.kitty));
+    m.insert("paste", syn_bool(t.shared.paste));
+    m.insert("ansi", syn_bool(t.shared.ansi));
+    m.insert("keys", syn_int(keys as i64));
+    m.insert("queued", syn_int(queued as i64));
+    m.insert("dropped", syn_int(dropped as i64));
     Ok(syn_map(m))
 }
 

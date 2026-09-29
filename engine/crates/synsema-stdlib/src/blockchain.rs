@@ -20,11 +20,11 @@
 //! - **Puro-Rust, sin C (G8).** k256 / ed25519-dalek / sha3 / bech32, cero `*-sys`.
 //! - **Solo defensivo (G12):** firmar/verificar/derivar/codificar. Nada ataca ni evade.
 
+use synsema_core::types::SynMap;
 use std::rc::Rc;
 
 use bech32::{Bech32, Bech32m, Hrp};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey as EdVerifyingKey};
-use indexmap::IndexMap;
 use k256::ecdsa::signature::hazmat::PrehashVerifier;
 use k256::ecdsa::{RecoveryId, Signature as EcSignature, SigningKey as EcSigningKey, VerifyingKey};
 use sha3::{Digest, Keccak256};
@@ -495,10 +495,10 @@ fn bech32_decode(args: &[SynValue]) -> Result<SynValue, Control> {
                 "bech32_decode: invalid checksum (the string is neither valid bech32 nor bech32m)",
             ));
         };
-    let mut m = IndexMap::new();
-    m.insert("hrp".to_string(), syn_text(hrp.as_str()));
-    m.insert("data".to_string(), syn_bytes(data));
-    m.insert("variant".to_string(), syn_text(variant));
+    let mut m = SynMap::new();
+    m.insert("hrp", syn_text(hrp.as_str()));
+    m.insert("data", syn_bytes(data));
+    m.insert("variant", syn_text(variant));
     Ok(syn_map(m))
 }
 

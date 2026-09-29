@@ -15,8 +15,16 @@
 //! - Anidamiento hasta 128 niveles (el límite que tenía `serde_json`); claves repetidas: gana
 //!   la última, en la posición de la primera; `\u` con pares sustitutos, un sustituto suelto
 //!   es error.
+//! - (F4.4) Las claves repetidas se guardan una vez por llamada (el `memo` del decodificador de
+//!   CPython): mil registros `{"id": …}` comparten la clave `"id"`. Un texto sin escapes se lee
+//!   del documento sin armar un `String` intermedio, y un objeto nace con la capacidad del
+//!   anterior del mismo nivel (registros de la misma forma: sin crecer a saltos).
 
-use indexmap::IndexMap;
+use std::borrow::Cow;
+use std::collections::HashSet;
+
+use synsema_core::synmap::map_from_pairs;
+use synsema_core::types::{Key, SynMap};
 use synsema_core::number::Number;
 use synsema_core::types::{syn_bool, syn_int, syn_list, syn_map, syn_nothing, syn_text, SynValue};
 
@@ -31,16 +39,36 @@ pub fn parse(text: &str) -> Result<SynValue, String> {
 
 /// Como `parse`; con `allow_nan` lee también `NaN`, `Infinity` y `-Infinity`.
 pub fn parse_opts(text: &str, allow_nan: bool) -> Result<SynValue, String> {
+    parse_with(text, allow_nan, &mut Memo::default())
+}
+
+/// Lo que varios documentos de una misma llamada comparten (`jsonl_decode`): las claves ya vistas
+/// y la capacidad de los objetos por nivel.
+#[derive(Default)]
+pub struct Memo {
+    keys: HashSet<Key>,
+    cap: Vec<usize>,
+    bufs: Vec<Vec<(Key, SynValue)>>,
+}
+
+/// Como `parse_opts`, compartiendo `memo` con los otros documentos de la llamada.
+pub fn parse_with(text: &str, allow_nan: bool, memo: &mut Memo) -> Result<SynValue, String> {
     // Un BOM de UTF-8 al principio (lo escribe Excel/Notepad) no es parte del documento.
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut p = Parser { s: text.as_bytes(), i: 0, depth: 0, allow_nan };
-    p.ws();
-    let v = p.value()?;
-    p.ws();
-    if p.i < p.s.len() {
-        return Err(p.fail("trailing characters"));
-    }
-    Ok(v)
+    let mut p = Parser {
+        s: text.as_bytes(),
+        i: 0,
+        depth: 0,
+        allow_nan,
+        keys: std::mem::take(&mut memo.keys),
+        cap: std::mem::take(&mut memo.cap),
+        bufs: std::mem::take(&mut memo.bufs),
+    };
+    let r = p.document();
+    memo.keys = std::mem::take(&mut p.keys);
+    memo.cap = std::mem::take(&mut p.cap);
+    memo.bufs = std::mem::take(&mut p.bufs);
+    r
 }
 
 struct Parser<'a> {
@@ -48,9 +76,25 @@ struct Parser<'a> {
     i: usize,
     depth: usize,
     allow_nan: bool,
+    /// Las claves ya vistas en esta llamada (se comparten).
+    keys: HashSet<Key>,
+    /// Por nivel, cuántas claves tuvo el último objeto: la capacidad del siguiente.
+    cap: Vec<usize>,
+    /// Por nivel, el búfer de pares del objeto que se está leyendo (se reusa).
+    bufs: Vec<Vec<(Key, SynValue)>>,
 }
 
 impl<'a> Parser<'a> {
+    fn document(&mut self) -> Result<SynValue, String> {
+        self.ws();
+        let v = self.value()?;
+        self.ws();
+        if self.i < self.s.len() {
+            return Err(self.fail("trailing characters"));
+        }
+        Ok(v)
+    }
+
     fn fail(&self, msg: &str) -> String {
         let upto = &self.s[..self.i.min(self.s.len())];
         let line = upto.iter().filter(|&&c| c == b'\n').count() + 1;
@@ -92,7 +136,10 @@ impl<'a> Parser<'a> {
             Some(b'n') => self.lit(b"null", syn_nothing()),
             Some(b't') => self.lit(b"true", syn_bool(true)),
             Some(b'f') => self.lit(b"false", syn_bool(false)),
-            Some(b'"') => Ok(syn_text(self.string()?)),
+            Some(b'"') => Ok(match self.string()? {
+                Cow::Borrowed(t) => syn_text(t),
+                Cow::Owned(t) => syn_text(t),
+            }),
             Some(b'[') => self.array(),
             Some(b'{') => self.object(),
             // `NaN`, `Infinity`, `-Infinity`: no son JSON estándar, pero son lo que escriben
@@ -154,19 +201,28 @@ impl<'a> Parser<'a> {
     fn object(&mut self) -> Result<SynValue, String> {
         self.enter()?;
         self.i += 1;
-        let mut out = IndexMap::new();
+        let d = self.depth;
+        // Los pares van a un búfer por nivel (se reusa entre objetos) y el mapa se arma al final
+        // con su forma: un malloc por objeto (F4.5).
+        if self.bufs.len() <= d {
+            self.bufs.resize_with(d + 1, Vec::new);
+        }
+        let mut out = std::mem::take(&mut self.bufs[d]);
+        out.clear();
+        out.reserve(self.cap.get(d).copied().unwrap_or(0));
         self.ws();
         if self.peek() == Some(b'}') {
             self.i += 1;
             self.depth -= 1;
-            return Ok(syn_map(out));
+            self.bufs[d] = out;
+            return Ok(syn_map(SynMap::new()));
         }
         loop {
             self.ws();
             if self.peek() != Some(b'"') {
                 return Err(self.fail(if self.peek().is_none() { "EOF while parsing an object" } else { "key must be a string" }));
             }
-            let k = self.string()?;
+            let k = self.key()?;
             self.ws();
             if self.peek() != Some(b':') {
                 return Err(self.fail("expected `:`"));
@@ -174,7 +230,7 @@ impl<'a> Parser<'a> {
             self.i += 1;
             self.ws();
             let v = self.value()?;
-            out.insert(k, v);
+            out.push((k, v));
             self.ws();
             match self.peek() {
                 Some(b',') => self.i += 1,
@@ -186,8 +242,28 @@ impl<'a> Parser<'a> {
                 Some(_) => return Err(self.fail("expected `,` or `}`")),
             }
         }
+        if self.cap.len() <= d {
+            self.cap.resize(d + 1, 0);
+        }
+        let m = map_from_pairs(&mut out);
+        self.cap[d] = m.borrow().len();
+        self.bufs[d] = out;
         self.depth -= 1;
-        Ok(syn_map(out))
+        Ok(SynValue::Map(m))
+    }
+
+    /// Una clave: la misma `Key` para el mismo texto en toda la llamada.
+    fn key(&mut self) -> Result<Key, String> {
+        let t = self.string()?;
+        if let Some(k) = self.keys.get(&*t) {
+            return Ok(k.clone());
+        }
+        let k = match t {
+            Cow::Borrowed(t) => Key::from(t),
+            Cow::Owned(t) => Key::from(t),
+        };
+        self.keys.insert(k.clone());
+        Ok(k)
     }
 
     fn hex4(&mut self) -> Result<u32, String> {
@@ -201,8 +277,24 @@ impl<'a> Parser<'a> {
         Ok(v)
     }
 
-    fn string(&mut self) -> Result<String, String> {
+    /// Un texto JSON: prestado del documento si no tiene escapes, armado si los tiene.
+    fn string(&mut self) -> Result<Cow<'a, str>, String> {
         self.i += 1; // la comilla
+        let start = self.i;
+        while let Some(c) = self.peek() {
+            if c == b'"' || c == b'\\' || c < 0x20 {
+                break;
+            }
+            self.i += 1;
+        }
+        if self.peek() == Some(b'"') {
+            let s: &'a [u8] = self.s;
+            let t = std::str::from_utf8(&s[start..self.i]).map_err(|_| self.fail("invalid UTF-8"))?;
+            self.i += 1;
+            return Ok(Cow::Borrowed(t));
+        }
+        // Con escapes (o un error): el camino de siempre desde el principio del texto.
+        self.i = start;
         let mut out = String::new();
         loop {
             let start = self.i;
@@ -218,7 +310,7 @@ impl<'a> Parser<'a> {
                 None => return Err(self.fail("EOF while parsing a string")),
                 Some(b'"') => {
                     self.i += 1;
-                    return Ok(out);
+                    return Ok(Cow::Owned(out));
                 }
                 Some(b'\\') => {
                     self.i += 1;
@@ -380,5 +472,48 @@ mod tests {
         assert_eq!(ok(r#""\ud83d\ude00 \u00e9 \/ \n""#), "😀 é / \n");
         assert_eq!(ok(r#"{"a": 1, "b": [true, null], "a": 2}"#), "{a: 2, b: [true, nothing]}");
         assert_eq!(ok(" \r\n\t{ } "), "{}");
+    }
+}
+
+#[cfg(test)]
+mod memo_tests {
+    use std::rc::Rc;
+
+    use super::*;
+
+    fn map_keys(v: &SynValue) -> Vec<Key> {
+        match v {
+            SynValue::Map(m) => m.borrow().keys().cloned().collect(),
+            _ => panic!("no es un mapa"),
+        }
+    }
+
+    /// F4.4: las claves repetidas de un documento son la misma `Key` (una sola copia del texto);
+    /// valores, orden y claves con escapes, como siempre.
+    #[test]
+    fn repeated_keys_are_shared() {
+        let v = parse(r#"[{"id": 1, "v": "a"}, {"v": "b", "id": 2}, {"id": 3, "id": 4}, {"a\"b": 1, "é": 2}]"#).unwrap();
+        let rows = match &v {
+            SynValue::List(l) => l.borrow().clone(),
+            _ => panic!(),
+        };
+        let (k0, k1, k2, k3) = (map_keys(&rows[0]), map_keys(&rows[1]), map_keys(&rows[2]), map_keys(&rows[3]));
+        assert_eq!(k0, ["id", "v"].map(Key::from).to_vec());
+        assert_eq!(k1, ["v", "id"].map(Key::from).to_vec());
+        assert!(Rc::ptr_eq(k0[0].rc(), k1[1].rc()), "\"id\" se copió");
+        assert!(Rc::ptr_eq(k0[1].rc(), k1[0].rc()), "\"v\" se copió");
+        assert!(Rc::ptr_eq(k0[0].rc(), k2[0].rc()));
+        assert_eq!(k2.len(), 1);
+        assert_eq!(k3, ["a\"b", "é"].map(Key::from).to_vec());
+        assert_eq!(v.to_string(), r#"[{id: 1, v: "a"}, {v: "b", id: 2}, {id: 4}, {a"b: 1, é: 2}]"#);
+    }
+
+    /// `parse_with` comparte las claves entre documentos (`jsonl_decode`).
+    #[test]
+    fn memo_spans_documents() {
+        let mut memo = Memo::default();
+        let a = parse_with(r#"{"k": 1}"#, false, &mut memo).unwrap();
+        let b = parse_with(r#"{"k": 2}"#, false, &mut memo).unwrap();
+        assert!(Rc::ptr_eq(map_keys(&a)[0].rc(), map_keys(&b)[0].rc()));
     }
 }

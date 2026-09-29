@@ -19,12 +19,12 @@
 //! - `.gitignore` no se interpreta acá: es política del CLI, que arma `entries`.
 //!
 
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use indexmap::IndexMap;
 
 use synsema_capabilities::model::{normalize_path, Capability, CapabilitySet, CapabilityType};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
@@ -136,9 +136,9 @@ fn entries_arg(caps: &Rc<RefCell<CapabilitySet>>, v: Option<&SynValue>, who: &st
     Ok(out)
 }
 
-fn opts_arg(v: Option<&SynValue>, who: &str, valid: &[&str]) -> Result<IndexMap<String, SynValue>, Control> {
+fn opts_arg(v: Option<&SynValue>, who: &str, valid: &[&str]) -> Result<SynMap, Control> {
     match v {
-        None | Some(SynValue::Nothing) => Ok(IndexMap::new()),
+        None | Some(SynValue::Nothing) => Ok(SynMap::new()),
         Some(SynValue::Map(m)) => {
             let m = m.borrow();
             for k in m.keys() {
@@ -151,13 +151,13 @@ fn opts_arg(v: Option<&SynValue>, who: &str, valid: &[&str]) -> Result<IndexMap<
                     )));
                 }
             }
-            Ok(m.clone())
+            Ok(m.to_map())
         }
         Some(other) => Err(err(format!("{}: opts must be a map, got {}", who, other.type_name()))),
     }
 }
 
-fn opt_flag(opts: &IndexMap<String, SynValue>, k: &str, who: &str) -> Result<bool, Control> {
+fn opt_flag(opts: &MapObj, k: &str, who: &str) -> Result<bool, Control> {
     match opts.get(k) {
         None | Some(SynValue::Nothing) => Ok(false),
         Some(SynValue::Bool(b)) => Ok(*b),
@@ -165,7 +165,7 @@ fn opt_flag(opts: &IndexMap<String, SynValue>, k: &str, who: &str) -> Result<boo
     }
 }
 
-fn opt_limit(opts: &IndexMap<String, SynValue>, k: &str, default: u64, who: &str) -> Result<u64, Control> {
+fn opt_limit(opts: &MapObj, k: &str, default: u64, who: &str) -> Result<u64, Control> {
     match opts.get(k) {
         None | Some(SynValue::Nothing) => Ok(default),
         Some(SynValue::Number(n)) => {
@@ -444,9 +444,9 @@ mod tests {
     }
 
     fn entry(path: &str, data: &str) -> SynValue {
-        let mut m = IndexMap::new();
-        m.insert("path".to_string(), syn_text(path));
-        m.insert("bytes".to_string(), syn_bytes(data.as_bytes().to_vec()));
+        let mut m = SynMap::new();
+        m.insert("path", syn_text(path));
+        m.insert("bytes", syn_bytes(data.as_bytes().to_vec()));
         syn_map(m)
     }
 
@@ -487,8 +487,8 @@ mod tests {
         let caps = caps_for(&d);
         let entries = syn_list(vec![entry("x/y.txt", "1"), entry("z.txt", "22")]);
         let plain = bytes_of(ok(tar_create(&caps, &[entries.clone()])));
-        let mut gz_opts = IndexMap::new();
-        gz_opts.insert("gzip".to_string(), SynValue::Bool(true));
+        let mut gz_opts = SynMap::new();
+        gz_opts.insert("gzip", SynValue::Bool(true));
         let gz = bytes_of(ok(tar_create(&caps, &[entries, syn_map(gz_opts)])));
         assert_eq!(&gz[..2], &[0x1f, 0x8b]);
         assert!(gz.len() < plain.len());
@@ -545,8 +545,8 @@ mod tests {
         assert!(z.len() < 10_000, "comprimido: {}", z.len());
         let dest = d.join("out");
         let dest_s = dest.to_string_lossy().replace('\\', "/");
-        let mut opts = IndexMap::new();
-        opts.insert("max_bytes".to_string(), SynValue::Number(synsema_core::number::Number::Int(1000)));
+        let mut opts = SynMap::new();
+        opts.insert("max_bytes", SynValue::Number(synsema_core::number::Number::Int(1000)));
         let e = match zip_extract(&caps, &[syn_bytes(z.clone()), syn_text(dest_s.as_str()), syn_map(opts)]) {
             Err(Control::Error(e)) => e.to_string(),
             _ => panic!("esperaba rechazo por max_bytes"),

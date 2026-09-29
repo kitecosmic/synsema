@@ -18,6 +18,8 @@
 //! AGNÓSTICO de fuente (G2): entrada = texto/valores del lenguaje; salida = valores/
 //! texto. Este módulo no conoce conexiones ni importa nada de `database.rs`.
 
+use crate::synmap::ShapeRef;
+use crate::types::{Key, MapObj, SynMap};
 use indexmap::IndexMap;
 use num_bigint::BigInt;
 
@@ -40,9 +42,9 @@ fn opts_map(
     args: &[SynValue],
     name: &str,
     valid: &[&str],
-) -> Result<IndexMap<String, SynValue>, Control> {
+) -> Result<SynMap, Control> {
     match args.get(1) {
-        None | Some(SynValue::Nothing) => Ok(IndexMap::new()),
+        None | Some(SynValue::Nothing) => Ok(SynMap::new()),
         Some(SynValue::Map(m)) => {
             let m = m.borrow();
             for k in m.keys() {
@@ -55,7 +57,7 @@ fn opts_map(
                     )));
                 }
             }
-            Ok(m.clone())
+            Ok(m.to_map())
         }
         Some(other) => Err(err(format!(
             "{}: options must be a map, got {}",
@@ -65,7 +67,7 @@ fn opts_map(
     }
 }
 
-fn opt_bool(opts: &IndexMap<String, SynValue>, key: &str, default: bool, name: &str) -> Result<bool, Control> {
+fn opt_bool(opts: &MapObj, key: &str, default: bool, name: &str) -> Result<bool, Control> {
     match opts.get(key) {
         None => Ok(default),
         Some(SynValue::Bool(b)) => Ok(*b),
@@ -80,7 +82,7 @@ fn opt_bool(opts: &IndexMap<String, SynValue>, key: &str, default: bool, name: &
 
 /// Delimitador: exactamente UN carácter ASCII (`,`, `;`, `\t`, …) que no sea la comilla ni un
 /// fin de línea (con esos el archivo no se puede leer de vuelta).
-fn opt_delimiter(opts: &IndexMap<String, SynValue>, name: &str) -> Result<u8, Control> {
+fn opt_delimiter(opts: &MapObj, name: &str) -> Result<u8, Control> {
     match opts.get("delimiter") {
         None => Ok(b','),
         Some(SynValue::Text(s)) => {
@@ -308,7 +310,7 @@ fn is_missing_marker(f: &Field, missing: &[String]) -> bool {
     !f.quoted && missing.iter().any(|m| m == &f.text)
 }
 
-fn opt_missing(opts: &IndexMap<String, SynValue>) -> Result<Vec<String>, Control> {
+fn opt_missing(opts: &MapObj) -> Result<Vec<String>, Control> {
     match opts.get("missing") {
         None | Some(SynValue::Nothing) => Ok(Vec::new()),
         Some(SynValue::Text(t)) => Ok(vec![t.to_string()]),
@@ -411,18 +413,28 @@ pub fn csv_parse(args: &[SynValue]) -> Result<SynValue, Control> {
             }
         }
     }
+    // Las cabeceras como claves una vez por llamada: cada fila suma una referencia (F4.4).
+    let header_keys: Vec<Key> = header_row.iter().map(Key::from).collect();
+    // Y la forma de una fila completa, una vez (F4.5): cada fila es un malloc con sus valores.
+    let shape = ShapeRef::of_keys(header_keys.len(), |i| header_keys[i].clone());
     let mut rows = Vec::with_capacity(records.len().saturating_sub(1));
+    let mut vals: Vec<SynValue> = Vec::with_capacity(header_row.len());
     for (ln, rec) in records[1..].iter() {
-        let mut m = IndexMap::with_capacity(header_row.len());
+        vals.clear();
         for (h, f) in header_row.iter().zip(rec.iter()) {
-            let v = match types.as_ref().and_then(|t| t.get(h)) {
+            vals.push(match types.as_ref().and_then(|t| t.get(h)) {
                 Some(_) if is_missing_marker(f, &missing) => SynValue::Nothing,
                 Some(ty) => typed_field(&f.text, f.quoted, ty, h, *ln)?,
                 None => field_value(f, numbers, &missing),
-            };
-            m.insert(h.clone(), v);
+            });
         }
-        rows.push(syn_map(m));
+        match &shape {
+            Some(s) if vals.len() == s.len() => rows.push(SynValue::Map(s.build(vals.drain(..)))),
+            _ => {
+                let m: SynMap = header_keys.iter().cloned().zip(vals.drain(..)).collect();
+                rows.push(syn_map(m));
+            }
+        }
     }
     Ok(syn_list(rows))
 }
@@ -430,7 +442,7 @@ pub fn csv_parse(args: &[SynValue]) -> Result<SynValue, Control> {
 /// `{"types": {"col": "int" | "float" | "decimal" | "text" | "bool"}}` (v0.6.29, DATOS-16):
 /// el tipo de cada columna, en vez de adivinar con `numbers: true` (que convierte `"007"` en 7
 /// en todo el archivo). Un campo que no es de su tipo es error con línea y columna.
-fn opt_types(opts: &IndexMap<String, SynValue>) -> Result<Option<IndexMap<String, String>>, Control> {
+fn opt_types(opts: &MapObj) -> Result<Option<IndexMap<String, String>>, Control> {
     match opts.get("types") {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Map(m)) => {
@@ -445,7 +457,7 @@ fn opt_types(opts: &IndexMap<String, SynValue>) -> Result<Option<IndexMap<String
                         )))
                     }
                 };
-                out.insert(k.clone(), t);
+                out.insert(k.to_string(), t);
             }
             Ok(Some(out))
         }
@@ -508,7 +520,7 @@ fn typed_field(s: &str, quoted: bool, ty: &str, col: &str, line: usize) -> Resul
 // =========================================================
 
 /// Fin de línea: `"\r\n"` (RFC 4180 / Excel, default) o `"\n"`.
-fn opt_eol(opts: &IndexMap<String, SynValue>) -> Result<&'static str, Control> {
+fn opt_eol(opts: &MapObj) -> Result<&'static str, Control> {
     match opts.get("eol") {
         None => Ok("\r\n"),
         Some(SynValue::Text(s)) => match &**s {
@@ -527,7 +539,7 @@ fn opt_eol(opts: &IndexMap<String, SynValue>) -> Result<&'static str, Control> {
 }
 
 /// Cabeceras explícitas del encode: lista de textos (orden + subconjunto de columnas).
-fn opt_headers_list(opts: &IndexMap<String, SynValue>) -> Result<Option<Vec<String>>, Control> {
+fn opt_headers_list(opts: &MapObj) -> Result<Option<Vec<String>>, Control> {
     match opts.get("headers") {
         None => Ok(None),
         Some(SynValue::List(l)) => {
@@ -729,7 +741,7 @@ pub fn csv_encode(args: &[SynValue]) -> Result<SynValue, Control> {
                 // Lista de mapas: cabeceras = opts o claves del 1er mapa en su orden.
                 let headers: Vec<String> = match &explicit_headers {
                     Some(hs) => hs.clone(),
-                    None => first.borrow().keys().cloned().collect(),
+                    None => first.borrow().keys().map(|k| k.to_string()).collect(),
                 };
                 write(&mut wtr, &headers.iter().cloned().map(header_cell).collect::<Vec<_>>())?;
                 for (i, r) in rows.iter().enumerate() {
@@ -880,8 +892,8 @@ mod tests {
             syn_text("multi\nline"),
         ])]);
         let opts = {
-            let mut m = IndexMap::new();
-            m.insert("headers".to_string(), SynValue::Bool(false));
+            let mut m = SynMap::new();
+            m.insert("headers", SynValue::Bool(false));
             syn_map(m)
         };
         let enc = ok(csv_encode(&[rows, SynValue::Nothing]));
@@ -912,8 +924,8 @@ mod tests {
                 _ => panic!(),
             }
         }
-        let mut m = IndexMap::new();
-        m.insert("a".to_string(), SynValue::Nothing);
+        let mut m = SynMap::new();
+        m.insert("a", SynValue::Nothing);
         assert_eq!(encode(syn_list(vec![syn_map(m)])), "a\r\n\"\"\r\n");
     }
 
@@ -926,10 +938,10 @@ mod tests {
 
     #[test]
     fn secret_redacted_and_bytes_b64() {
-        let mut m = IndexMap::new();
-        m.insert("k".to_string(), syn_secret("API_KEY", "hunter2"));
-        m.insert("b".to_string(), syn_bytes(b"foo".to_vec()));
-        m.insert("n".to_string(), syn_int(42));
+        let mut m = SynMap::new();
+        m.insert("k", syn_secret("API_KEY", "hunter2"));
+        m.insert("b", syn_bytes(b"foo".to_vec()));
+        m.insert("n", syn_int(42));
         let out = encode(syn_list(vec![syn_map(m)]));
         assert!(out.contains("[redacted]"), "{}", out);
         assert!(!out.contains("hunter2"), "plaintext leaked: {}", out);

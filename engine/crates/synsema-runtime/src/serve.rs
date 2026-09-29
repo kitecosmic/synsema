@@ -8,6 +8,7 @@
 //! (blackboard) vía `Arc`. Es exactamente el aislamiento documentado: "lo único
 //! compartido es el blackboard y la base de datos".
 
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
@@ -33,7 +34,6 @@ type SharedMemoryStore = Arc<Mutex<AgentMemory>>;
 type SharedProgressStore = Arc<Mutex<ProgressManager>>;
 use std::thread::JoinHandle;
 
-use indexmap::IndexMap;
 
 use synsema_agents::builtins::{register_serve_memory_builtins, register_serve_progress_builtins};
 use synsema_agents::memory::{AgentMemory, OwnerRule};
@@ -747,7 +747,7 @@ fn is_export_of(module_env: &Rc<RefCell<Environment>>, k: &str, v: &SynValue) ->
 /// `is_export` las que son el mismo objeto que el binding homónimo del env (en rebuild
 /// se cosechan del env reconstruido → identidad compartida alias↔env).
 fn snapshot_alias_entries(
-    m: &Rc<RefCell<IndexMap<String, SynValue>>>,
+    m: &Rc<RefCell<MapObj>>,
     module_env: &Rc<RefCell<Environment>>,
     state: &mut SnapState,
 ) -> Vec<(String, GlobalVal, bool)> {
@@ -755,7 +755,7 @@ fn snapshot_alias_entries(
         .iter()
         .map(|(k, v)| {
             let is_export = is_export_of(module_env, k, v);
-            (k.clone(), val_to_global_inner(v, state), is_export)
+            (k.to_string(), val_to_global_inner(v, state), is_export)
         })
         .collect()
 }
@@ -804,7 +804,7 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
             let entries: Vec<(String, GlobalVal)> = m
                 .borrow()
                 .iter()
-                .map(|(k, v)| (k.clone(), val_to_global_inner(v, state)))
+                .map(|(k, v)| (k.to_string(), val_to_global_inner(v, state)))
                 .collect();
             // Map puramente de valores primitivos → viaja barato como SendValue.
             if entries.iter().all(|(_, gv)| matches!(gv, GlobalVal::Value(_))) {
@@ -821,7 +821,7 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
 /// Devuelve el `module_env` de un map que es alias de módulo: el `closure_env` de
 /// cualquiera de sus tasks cuyo env se llame `module:…`. `None` si el map no es un alias
 /// de módulo (sus tasks cierran sobre el global u otro scope → map de datos con callbacks).
-pub(crate) fn module_env_of(map: &IndexMap<String, SynValue>) -> Option<Rc<RefCell<Environment>>> {
+pub(crate) fn module_env_of(map: &MapObj) -> Option<Rc<RefCell<Environment>>> {
     for v in map.values() {
         if let SynValue::Task(t) = v {
             if t.closure_env.borrow().name.starts_with("module:") {
@@ -957,7 +957,7 @@ fn rebuild_global_val(
                     return SynValue::Map(existing);
                 }
             }
-            let mut m = IndexMap::new();
+            let mut m = SynMap::new();
             for (k, gv, is_export) in alias {
                 let harvested = if *is_export {
                     module_env.borrow().bindings.get(k.as_str()).cloned()
@@ -973,7 +973,7 @@ fn rebuild_global_val(
                 };
                 m.insert(k.clone(), v);
             }
-            let map = Rc::new(RefCell::new(m));
+            let map = m.into_ref();
             if *is_alias {
                 synsema_core::interpreter::register_module(&map, &module_env);
             }
@@ -983,11 +983,11 @@ fn rebuild_global_val(
         GlobalVal::MapWithTasks(entries) => {
             // Map de datos con callbacks: las tasks cierran sobre el global (como cualquier
             // task top-level), NO sobre un module_env compartido.
-            let mut m = IndexMap::new();
+            let mut m = SynMap::new();
             for (k, gv) in entries {
                 m.insert(k.clone(), rebuild_global_val(gv, base, base, registry));
             }
-            SynValue::Map(Rc::new(RefCell::new(m)))
+            SynValue::Map(m.into_ref())
         }
         GlobalVal::Agent { .. } => {
             // Los agentes van a `agent_definitions`, nunca a bindings — no debería llegar aquí.
@@ -1291,11 +1291,11 @@ fn register_serve_state_builtins(interp: &Interpreter, state: SharedState) {
         let s = state.clone();
         interp.register_builtin("state_all", 0, Rc::new(move |_i, _args, _l| {
             let guard = s.lock().unwrap();
-            let mut map = IndexMap::new();
+            let mut map = SynMap::new();
             for (k, sv) in guard.iter() {
                 map.insert(k.clone(), from_send(sv));
             }
-            Ok(SynValue::Map(Rc::new(RefCell::new(map))))
+            Ok(SynValue::Map(map.into_ref()))
         }));
     }
 }
@@ -2318,7 +2318,7 @@ fn build_host_table(
             };
             for (i, meta) in metas.iter().enumerate() {
                 let mm = match meta {
-                    SynValue::Map(m) => m.borrow().clone(),
+                    SynValue::Map(m) => m.borrow().to_map(),
                     _ => continue,
                 };
                 let method = mm.get("method").map(|v| v.to_string()).unwrap_or_default();

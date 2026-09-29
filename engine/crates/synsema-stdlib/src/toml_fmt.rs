@@ -8,10 +8,10 @@
 //! `nothing`, `bytes` o `secret`. Puro: sin I/O.
 //!
 
+use synsema_core::types::SynMap;
 use std::rc::Rc;
 use std::str::FromStr;
 
-use indexmap::IndexMap;
 
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::number::Number;
@@ -34,7 +34,7 @@ fn toml_to_syn(v: &::toml::Value) -> SynValue {
 }
 
 fn table_to_syn(t: &::toml::Table) -> SynValue {
-    let mut m: IndexMap<String, SynValue> = IndexMap::new();
+    let mut m: SynMap = SynMap::new();
     for (k, v) in t.iter() {
         m.insert(k.clone(), toml_to_syn(v));
     }
@@ -72,8 +72,8 @@ fn syn_to_toml(v: &SynValue, path: &str, who: &str) -> Result<::toml::Value, Con
         SynValue::Map(m) => {
             let mut t = ::toml::Table::new();
             for (k, item) in m.borrow().iter() {
-                let p = if path.is_empty() { k.clone() } else { format!("{}.{}", path, k) };
-                t.insert(k.clone(), syn_to_toml(item, &p, who)?);
+                let p = if path.is_empty() { k.to_string() } else { format!("{}.{}", path, k) };
+                t.insert(k.to_string(), syn_to_toml(item, &p, who)?);
             }
             ::toml::Value::Table(t)
         }
@@ -171,7 +171,7 @@ built = 2026-09-11T10:00:00Z
         assert_eq!(get(&get(&v, "dates"), "built").to_string(), "2026-09-11T10:00:00Z");
         // El orden del documento se conserva (preserve_order).
         if let SynValue::Map(m) = &v {
-            let keys: Vec<String> = m.borrow().keys().cloned().collect();
+            let keys: Vec<String> = m.borrow().keys().map(|k| k.to_string()).collect();
             assert_eq!(keys, vec!["name", "version", "entry", "tags", "deploy", "routes", "dates"]);
         }
     }
@@ -184,8 +184,8 @@ built = 2026-09-11T10:00:00Z
         let again = ok(toml_parse(&[syn_text(text.as_str())]));
         assert_eq!(get(&get(&again, "a"), "n").to_string(), "1");
         assert_eq!(get(&again, "title").to_string(), "x");
-        let mut m = IndexMap::new();
-        m.insert("k".to_string(), SynValue::Nothing);
+        let mut m = SynMap::new();
+        m.insert("k", SynValue::Nothing);
         let e = match toml_encode(&[syn_map(m)]) {
             Err(Control::Error(e)) => e.to_string(),
             _ => panic!("esperaba error"),

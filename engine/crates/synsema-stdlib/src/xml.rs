@@ -15,9 +15,9 @@
 //! NF-e en Brasil, Facturae en España, AFIP en Argentina); se extrae sin LLM y el LLM sólo
 //! revisa.
 
+use synsema_core::types::SynMap;
 use std::rc::Rc;
 
-use indexmap::IndexMap;
 
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::types::{syn_list, syn_map, syn_text, SynValue};
@@ -36,7 +36,7 @@ fn qname(node: &roxmltree::Node<'_, '_>, local: &str, ns: Option<&str>) -> Strin
 }
 
 fn element_to_syn(node: roxmltree::Node<'_, '_>) -> SynValue {
-    let mut m: IndexMap<String, SynValue> = IndexMap::new();
+    let mut m: SynMap = SynMap::new();
     for a in node.attributes() {
         m.insert(format!("@{}", qname(&node, a.name(), a.namespace())), syn_text(a.value()));
     }
@@ -70,7 +70,7 @@ fn element_to_syn(node: roxmltree::Node<'_, '_>) -> SynValue {
         return if text.is_empty() { SynValue::Nothing } else { syn_text(text) };
     }
     if !text.is_empty() {
-        m.insert("#text".to_string(), syn_text(text));
+        m.insert("#text", syn_text(text));
     }
     syn_map(m)
 }
@@ -94,7 +94,7 @@ pub fn xml_parse(args: &[SynValue]) -> Result<SynValue, Control> {
     })?;
     let root = doc.root_element();
     let key = qname(&root, root.tag_name().name(), root.tag_name().namespace());
-    let mut out = IndexMap::new();
+    let mut out = SynMap::new();
     out.insert(key, element_to_syn(root));
     Ok(syn_map(out))
 }

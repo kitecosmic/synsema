@@ -5,9 +5,9 @@
 //! server.rs los re-exporta (register_serve_builtins) y conserva el transporte y los
 //! renderers HTML/Markdown del arbol de contenido.
 
+use synsema_core::types::SynMap;
 use std::rc::Rc;
 
-use indexmap::IndexMap;
 
 use synsema_core::interpreter::{Control, Interpreter};
 use synsema_core::types::{
@@ -155,7 +155,7 @@ pub(crate) fn parse_cookie_opts(who: &str, opts: Option<&SynValue>, allow_all: b
     };
     let map = match opts {
         None | Some(SynValue::Nothing) => return Ok(out),
-        Some(SynValue::Map(m)) => m.borrow().clone(),
+        Some(SynValue::Map(m)) => m.borrow().to_map(),
         Some(other) => {
             return Err(serve_err(&format!(
                 "{}: opts must be a map, got {}",
@@ -317,13 +317,13 @@ fn n_nodes(v: Option<&SynValue>) -> SynValue {
 fn n_meta(v: Option<&SynValue>) -> SynValue {
     match v {
         Some(SynValue::Map(m)) => {
-            let mut out = IndexMap::new();
+            let mut out = SynMap::new();
             for (k, val) in m.borrow().iter() {
                 out.insert(k.clone(), syn_text(text_arg(Some(val))));
             }
             syn_map(out)
         }
-        _ => syn_map(IndexMap::new()),
+        _ => syn_map(SynMap::new()),
     }
 }
 
@@ -349,9 +349,9 @@ pub fn register_serve_builtins(interp: &Interpreter) {
             let value = if matches!(value, SynValue::Map(_)) {
                 value
             } else {
-                let mut m = IndexMap::new();
-                m.insert("error".to_string(), syn_text(value.to_string()));
-                m.insert("status".to_string(), syn_int(404));
+                let mut m = SynMap::new();
+                m.insert("error", syn_text(value.to_string()));
+                m.insert("status", syn_int(404));
                 syn_map(m)
             };
             Ok(make_envelope(404, value))
@@ -380,9 +380,9 @@ pub fn register_serve_builtins(interp: &Interpreter) {
                     msg = a[0].to_string();
                 }
             }
-            let mut body = IndexMap::new();
-            body.insert("error".to_string(), syn_text(msg));
-            body.insert("status".to_string(), syn_int(code));
+            let mut body = SynMap::new();
+            body.insert("error", syn_text(msg));
+            body.insert("status", syn_int(code));
             Ok(make_envelope(code, syn_map(body)))
         }),
     );
@@ -622,7 +622,7 @@ pub fn register_serve_builtins(interp: &Interpreter) {
             let tree = a
                 .first()
                 .cloned()
-                .unwrap_or_else(|| make_node("page", vec![("nodes", syn_list(Vec::new())), ("meta", syn_map(IndexMap::new()))]));
+                .unwrap_or_else(|| make_node("page", vec![("nodes", syn_list(Vec::new())), ("meta", syn_map(SynMap::new()))]));
             Ok(SynValue::Server(Rc::new(ServerValue::Content(Box::new(tree)))))
         }),
     );

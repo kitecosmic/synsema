@@ -19,6 +19,7 @@
 //!   arrancan cuando el bind del server está listo.
 //! - Estado in-memory: un reinicio re-registra desde cero (sin catch-up).
 
+use synsema_core::types::SynMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -592,17 +593,17 @@ pub fn register_cron_builtins(
                     .list_jobs()
                     .into_iter()
                     .map(|j| {
-                        let mut m = IndexMap::new();
-                        m.insert("name".to_string(), syn_text(j.name.as_str()));
-                        m.insert("schedule".to_string(), syn_text(j.schedule.as_str()));
+                        let mut m = SynMap::new();
+                        m.insert("name", syn_text(j.name.as_str()));
+                        m.insert("schedule", syn_text(j.schedule.as_str()));
                         m.insert(
                             "interval".to_string(),
                             j.interval.map(syn_float).unwrap_or(SynValue::Nothing),
                         );
-                        m.insert("repeating".to_string(), syn_bool(j.repeating));
-                        m.insert("active".to_string(), syn_bool(j.active));
-                        m.insert("run_count".to_string(), syn_int(j.run_count as i64));
-                        m.insert("errors".to_string(), syn_int(j.errors as i64));
+                        m.insert("repeating", syn_bool(j.repeating));
+                        m.insert("active", syn_bool(j.active));
+                        m.insert("run_count", syn_int(j.run_count as i64));
+                        m.insert("errors", syn_int(j.errors as i64));
                         m.insert(
                             "next_run".to_string(),
                             j.next_run.map(syn_float).unwrap_or(SynValue::Nothing),

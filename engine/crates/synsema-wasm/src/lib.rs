@@ -27,12 +27,12 @@
 
 pub mod handler;
 
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use indexmap::IndexMap;
 use synsema_agents::builtins::{
     register_agent_builtins, register_serve_memory_builtins, register_serve_progress_builtins,
     register_shared_rules_builtins, MemoryGate,
@@ -750,9 +750,9 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
 /// este intérprete.
 fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
     const NS: &str = "state";
-    let local: Rc<RefCell<IndexMap<String, SynValue>>> = Rc::new(RefCell::new(IndexMap::new()));
+    let local: Rc<RefCell<MapObj>> = SynMap::new().into_ref();
 
-    fn load(host_kv: bool, local: &Rc<RefCell<IndexMap<String, SynValue>>>, key: &str) -> Option<SynValue> {
+    fn load(host_kv: bool, local: &Rc<RefCell<MapObj>>, key: &str) -> Option<SynValue> {
         if host_kv {
             let raw = hostcap::provider().and_then(|p| p.kv_get(NS, key)).flatten()?;
             let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -761,7 +761,7 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
             local.borrow().get(key).cloned()
         }
     }
-    fn store(host_kv: bool, local: &Rc<RefCell<IndexMap<String, SynValue>>>, key: &str, v: &SynValue) {
+    fn store(host_kv: bool, local: &Rc<RefCell<MapObj>>, key: &str, v: &SynValue) {
         if host_kv {
             kv_write(NS, key, &dumps(&syn_to_json(v)));
         } else {
@@ -831,7 +831,7 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
     {
         let l = local.clone();
         interp.register_builtin("state_all", 0, Rc::new(move |_i, _args, _l| {
-            let mut map = IndexMap::new();
+            let mut map = SynMap::new();
             if host_kv {
                 if let Some(p) = hostcap::provider() {
                     for k in p.kv_list(NS).unwrap_or_default() {

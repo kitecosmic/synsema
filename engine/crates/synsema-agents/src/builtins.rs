@@ -1,12 +1,12 @@
 //! Builtins de progress, memory y reglas. Port de `synsema/agents/builtins.py`.
 //! Comparten un `ProgressManager` y un `AgentMemory` (Rc<RefCell>) con el motor.
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use indexmap::IndexMap;
 use serde_json::Map as JsonMap;
 
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
@@ -206,12 +206,12 @@ pub fn register_agent_builtins(
             let source = recall_source(i, args.get(5));
             let entries = m.borrow().recall_mode(category.as_deref(), tags.as_deref(), search.as_deref(), match_all, limit, source.as_deref());
             let result: Vec<SynValue> = entries.iter().map(|e| {
-                let mut map = IndexMap::new();
-                map.insert("id".to_string(), syn_text(e.id.as_str()));
-                map.insert("category".to_string(), syn_text(e.category.value()));
-                map.insert("content".to_string(), syn_text(e.content.as_str()));
-                map.insert("source".to_string(), syn_text(e.source.as_str()));
-                map.insert("tags".to_string(), syn_list(e.tags.iter().map(|t| syn_text(t.as_str())).collect()));
+                let mut map = SynMap::new();
+                map.insert("id", syn_text(e.id.as_str()));
+                map.insert("category", syn_text(e.category.value()));
+                map.insert("content", syn_text(e.content.as_str()));
+                map.insert("source", syn_text(e.source.as_str()));
+                map.insert("tags", syn_list(e.tags.iter().map(|t| syn_text(t.as_str())).collect()));
                 syn_map(map)
             }).collect();
             Ok(syn_list(result))
@@ -251,16 +251,16 @@ pub fn register_agent_builtins(
             if let Some(SynValue::Map(cm)) = args.get(1) {
                 for (k, v) in cm.borrow().iter() {
                     if let SynValue::Number(n) = v {
-                        context.insert(k.clone(), n.to_f64());
+                        context.insert(k.to_string(), n.to_f64());
                     }
                 }
             }
             let violations = m.borrow_mut().check_rules(category.as_deref(), &context);
             let result: Vec<SynValue> = violations.iter().map(|v| {
-                let mut map = IndexMap::new();
-                map.insert("rule".to_string(), syn_text(v.rule.name.as_str()));
-                map.insert("level".to_string(), syn_text(v.rule.level.value()));
-                map.insert("message".to_string(), syn_text(v.to_string()));
+                let mut map = SynMap::new();
+                map.insert("rule", syn_text(v.rule.name.as_str()));
+                map.insert("level", syn_text(v.rule.level.value()));
+                map.insert("message", syn_text(v.to_string()));
                 syn_map(map)
             }).collect();
             Ok(syn_list(result))
@@ -274,11 +274,11 @@ pub fn register_agent_builtins(
             let category = args.first().map(raw_str);
             let rules = m.borrow().get_rules(category.as_deref(), None);
             let result: Vec<SynValue> = rules.iter().map(|r| {
-                let mut map = IndexMap::new();
-                map.insert("name".to_string(), syn_text(r.name.as_str()));
-                map.insert("level".to_string(), syn_text(r.level.value()));
-                map.insert("description".to_string(), syn_text(r.description.as_str()));
-                map.insert("category".to_string(), syn_text(r.category.as_str()));
+                let mut map = SynMap::new();
+                map.insert("name", syn_text(r.name.as_str()));
+                map.insert("level", syn_text(r.level.value()));
+                map.insert("description", syn_text(r.description.as_str()));
+                map.insert("category", syn_text(r.category.as_str()));
                 syn_map(map)
             }).collect();
             Ok(syn_list(result))
@@ -353,12 +353,12 @@ pub fn register_serve_memory_builtins(
             let mem = s.lock().unwrap();
             let entries = mem.recall_mode(category.as_deref(), tags.as_deref(), search.as_deref(), match_all, limit, source.as_deref());
             let result: Vec<SynValue> = entries.iter().map(|e| {
-                let mut map = IndexMap::new();
-                map.insert("id".to_string(),       syn_text(e.id.as_str()));
-                map.insert("category".to_string(), syn_text(e.category.value()));
-                map.insert("content".to_string(),  syn_text(e.content.as_str()));
-                map.insert("source".to_string(),   syn_text(e.source.as_str()));
-                map.insert("tags".to_string(),
+                let mut map = SynMap::new();
+                map.insert("id",       syn_text(e.id.as_str()));
+                map.insert("category", syn_text(e.category.value()));
+                map.insert("content",  syn_text(e.content.as_str()));
+                map.insert("source",   syn_text(e.source.as_str()));
+                map.insert("tags",
                     syn_list(e.tags.iter().map(|t| syn_text(t.as_str())).collect()));
                 syn_map(map)
             }).collect();
@@ -425,17 +425,17 @@ pub fn register_shared_rules_builtins(
             if let Some(SynValue::Map(cm)) = args.get(1) {
                 for (k, v) in cm.borrow().iter() {
                     if let SynValue::Number(n) = v {
-                        context.insert(k.clone(), n.to_f64());
+                        context.insert(k.to_string(), n.to_f64());
                     }
                 }
             }
             let mut mem = s.lock().unwrap();
             let violations = mem.check_rules(category.as_deref(), &context);
             let result: Vec<SynValue> = violations.iter().map(|v| {
-                let mut map = IndexMap::new();
-                map.insert("rule".to_string(), syn_text(v.rule.name.as_str()));
-                map.insert("level".to_string(), syn_text(v.rule.level.value()));
-                map.insert("message".to_string(), syn_text(v.to_string()));
+                let mut map = SynMap::new();
+                map.insert("rule", syn_text(v.rule.name.as_str()));
+                map.insert("level", syn_text(v.rule.level.value()));
+                map.insert("message", syn_text(v.to_string()));
                 syn_map(map)
             }).collect();
             Ok(syn_list(result))
@@ -450,11 +450,11 @@ pub fn register_shared_rules_builtins(
             let mem = s.lock().unwrap();
             let rules = mem.get_rules(category.as_deref(), None);
             let result: Vec<SynValue> = rules.iter().map(|r| {
-                let mut map = IndexMap::new();
-                map.insert("name".to_string(), syn_text(r.name.as_str()));
-                map.insert("level".to_string(), syn_text(r.level.value()));
-                map.insert("description".to_string(), syn_text(r.description.as_str()));
-                map.insert("category".to_string(), syn_text(r.category.as_str()));
+                let mut map = SynMap::new();
+                map.insert("name", syn_text(r.name.as_str()));
+                map.insert("level", syn_text(r.level.value()));
+                map.insert("description", syn_text(r.description.as_str()));
+                map.insert("category", syn_text(r.category.as_str()));
                 syn_map(map)
             }).collect();
             Ok(syn_list(result))

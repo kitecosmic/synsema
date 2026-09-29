@@ -149,7 +149,7 @@ fn to_mp(
             Ok(if s.is_empty() { None } else { Some(Mp::Str(s.to_string())) })
         }
         SynValue::Map(m) => {
-            let m = m.borrow().clone();
+            let m = m.borrow().to_map();
             let mut entries: Vec<(String, Mp)> = Vec::with_capacity(m.len());
             for (k, val) in m.iter() {
                 let child_path = format!("{}.{}", path, k);
@@ -186,7 +186,7 @@ fn to_mp(
                 let child_addr: &'static [&'static str] =
                     if k == "apar" { APAR_ADDR_KEYS } else { &[] };
                 if let Some(mp) = to_mp(val, &child_path, child_addr, fname, depth + 1)? {
-                    entries.push((k.clone(), mp));
+                    entries.push((k.to_string(), mp));
                 }
             }
             if entries.is_empty() {

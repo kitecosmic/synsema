@@ -3,10 +3,10 @@
 //! módulo compila en el perfil wasm (sin `native`), server.rs no. server.rs
 //! re-exporta los símbolos públicos → los callers externos no cambian.
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use indexmap::IndexMap;
 
 use synsema_core::bytesutil::b64_encode;
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
@@ -97,18 +97,20 @@ pub fn register_json_builtins(interp: &Interpreter) {
             1,
             Rc::new(|i, args, _loc| {
                 let allow_nan = allow_nan_kw(i, "jsonl_decode")?;
-                let text = match args.first() {
-                    Some(SynValue::Text(t)) => t.to_string(),
+                let text: &str = match args.first() {
+                    Some(SynValue::Text(t)) => t,
                     Some(other) => return Err(err(format!("jsonl_decode: expected text, got {}", other.type_name()))),
                     None => return Err(err("jsonl_decode(text)")),
                 };
+                // Las claves se comparten entre todas las líneas de la llamada (F4.4).
+                let mut memo = crate::json_exact::Memo::default();
                 let mut out = Vec::new();
                 for (i, line) in text.lines().enumerate() {
                     let l = line.trim();
                     if l.is_empty() {
                         continue;
                     }
-                    match crate::json_exact::parse_opts(l, allow_nan) {
+                    match crate::json_exact::parse_with(l, allow_nan, &mut memo) {
                         Ok(v) => out.push(v),
                         Err(e) => {
                             return Err(err(format!(
@@ -159,12 +161,17 @@ pub fn register_json_builtins(interp: &Interpreter) {
             if args.is_empty() || args.len() > 2 {
                 return Err(err("json_decode(text, default?) takes 1 or 2 arguments"));
             }
-            let s = match args.first() {
-                Some(SynValue::Text(s)) => s.to_string(),
-                Some(other) => other.to_string(),
+            // El texto se lee prestado: copiar el documento entero era un pico de memoria de más.
+            let owned;
+            let s: &str = match args.first() {
+                Some(SynValue::Text(s)) => s,
+                Some(other) => {
+                    owned = other.to_string();
+                    &owned
+                }
                 None => return Err(err("json_decode: missing argument")),
             };
-            match crate::json_exact::parse_opts(&s, allow_nan) {
+            match crate::json_exact::parse_opts(s, allow_nan) {
                 Ok(v) => Ok(v),
                 Err(e) => match args.get(1) {
                     Some(d) => Ok(d.clone()),
@@ -306,7 +313,7 @@ pub fn syn_to_json(v: &SynValue) -> Json {
         SynValue::Text(s) => Json::Str(s.to_string()),
         SynValue::List(l) => Json::Array(l.borrow().iter().map(syn_to_json).collect()),
         SynValue::Map(m) => {
-            Json::Object(m.borrow().iter().map(|(k, v)| (k.clone(), syn_to_json(v))).collect())
+            Json::Object(m.borrow().iter().map(|(k, v)| (k.to_string(), syn_to_json(v))).collect())
         }
         SynValue::Task(_) | SynValue::Builtin(_) => Json::Str(v.to_string()),
         // Secret en el body de una respuesta / evento SSE (#3/#7): se redacta a
@@ -415,7 +422,7 @@ pub fn json_to_syn(v: &serde_json::Value) -> SynValue {
         V::String(s) => syn_text(s.as_str()),
         V::Array(a) => syn_list(a.iter().map(json_to_syn).collect()),
         V::Object(o) => {
-            let mut m = IndexMap::new();
+            let mut m = SynMap::new();
             for (k, val) in o {
                 m.insert(k.clone(), json_to_syn(val));
             }
@@ -504,7 +511,7 @@ pub(crate) fn meta_get(meta: &SynValue, key: &str) -> Option<String> {
 pub(crate) fn meta_to_json(meta: Option<&SynValue>) -> Json {
     match meta {
         Some(SynValue::Map(m)) => {
-            Json::Object(m.borrow().iter().map(|(k, v)| (k.clone(), syn_to_json(v))).collect())
+            Json::Object(m.borrow().iter().map(|(k, v)| (k.to_string(), syn_to_json(v))).collect())
         }
         _ => Json::Object(Vec::new()),
     }
@@ -579,8 +586,8 @@ pub(crate) fn node_to_json(node: &SynValue) -> Json {
 }
 
 pub(crate) fn make_node(kind: &str, fields: Vec<(&str, SynValue)>) -> SynValue {
-    let mut m: IndexMap<String, SynValue> = IndexMap::new();
-    m.insert("kind".to_string(), syn_text(kind));
+    let mut m: SynMap = SynMap::new();
+    m.insert("kind", syn_text(kind));
     for (k, v) in fields {
         m.insert(k.to_string(), v);
     }

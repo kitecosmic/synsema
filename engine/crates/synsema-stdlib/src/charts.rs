@@ -23,6 +23,7 @@
 //!
 //! PURO (G9): sin capability — funciona en run/test/conform/serve y DENTRO de `sandbox`.
 
+use synsema_core::types::{MapObj, SynMap};
 use std::rc::Rc;
 
 use indexmap::IndexMap;
@@ -296,9 +297,9 @@ fn kinds_supporting(opt: &str) -> String {
     out.join(", ")
 }
 
-fn opts_of(args: &[SynValue], kind: Kind, name: &str) -> Result<IndexMap<String, SynValue>, Control> {
+fn opts_of(args: &[SynValue], kind: Kind, name: &str) -> Result<SynMap, Control> {
     match args.get(2) {
-        None | Some(SynValue::Nothing) => Ok(IndexMap::new()),
+        None | Some(SynValue::Nothing) => Ok(SynMap::new()),
         Some(SynValue::Map(m)) => {
             let m = m.borrow();
             for k in m.keys() {
@@ -322,7 +323,7 @@ fn opts_of(args: &[SynValue], kind: Kind, name: &str) -> Result<IndexMap<String,
                     )));
                 }
             }
-            Ok(m.clone())
+            Ok(m.to_map())
         }
         Some(other) => Err(err(format!(
             "{}: options must be a map, got {}",
@@ -334,7 +335,7 @@ fn opts_of(args: &[SynValue], kind: Kind, name: &str) -> Result<IndexMap<String,
 
 /// `theme`: `"light"` (default, exactamente los bytes del Batch 8) o `"dark"` (§4).
 fn opt_theme(
-    opts: &IndexMap<String, SynValue>,
+    opts: &MapObj,
     name: &str,
 ) -> Result<&'static ThemeColors, Control> {
     match opts.get("theme") {
@@ -356,7 +357,7 @@ fn opt_theme(
 }
 
 fn opt_bool(
-    opts: &IndexMap<String, SynValue>,
+    opts: &MapObj,
     key: &str,
     name: &str,
 ) -> Result<bool, Control> {
@@ -373,7 +374,7 @@ fn opt_bool(
 }
 
 fn opt_text(
-    opts: &IndexMap<String, SynValue>,
+    opts: &MapObj,
     key: &str,
     name: &str,
 ) -> Result<Option<String>, Control> {
@@ -390,7 +391,7 @@ fn opt_text(
 }
 
 fn opt_dim(
-    opts: &IndexMap<String, SynValue>,
+    opts: &MapObj,
     key: &str,
     default: f64,
     name: &str,
@@ -427,7 +428,7 @@ fn is_hex_color(s: &str) -> bool {
 /// tema (la semántica exacta depende del kind: paleta de series, stops de escala,
 /// o `[up, down, total]` del waterfall).
 fn opt_colors(
-    opts: &IndexMap<String, SynValue>,
+    opts: &MapObj,
     name: &str,
 ) -> Result<Option<Vec<String>>, Control> {
     match opts.get("colors") {
@@ -512,7 +513,7 @@ fn x_of(v: &SynValue) -> XValue {
 }
 
 /// Campos `y` de opts: un texto o una lista de textos (multi-serie).
-fn y_fields(opts: &IndexMap<String, SynValue>, name: &str) -> Result<Option<Vec<String>>, Control> {
+fn y_fields(opts: &MapObj, name: &str) -> Result<Option<Vec<String>>, Control> {
     match opts.get("y") {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Text(s)) => Ok(Some(vec![s.to_string()])),
@@ -547,7 +548,7 @@ fn y_fields(opts: &IndexMap<String, SynValue>, name: &str) -> Result<Option<Vec<
 /// Forma 1: lista de mapas (filas de `sql()`/`mongo_find`/`csv_parse`/literal) + opts x/y.
 fn from_rows(
     rows: &[SynValue],
-    opts: &IndexMap<String, SynValue>,
+    opts: &MapObj,
     kind: Kind,
     name: &str,
 ) -> Result<Vec<Series>, Control> {
@@ -872,7 +873,7 @@ fn normalize_series(args: &[SynValue], name: &str) -> Result<ChartSpec, Control>
 /// del Batch 8, sin cambios de semántica para los kinds existentes (G1).
 fn normalize_xy(
     args: &[SynValue],
-    opts: &IndexMap<String, SynValue>,
+    opts: &MapObj,
     kind: Kind,
     name: &str,
 ) -> Result<Vec<Series>, Control> {
@@ -916,7 +917,7 @@ fn normalize_xy(
             let mut points = Vec::with_capacity(m.len());
             for (k, v) in m.iter() {
                 let y = num_of(v, name, &format!("the value of {:?}", k))?;
-                points.push((XValue::Label(k.clone()), y));
+                points.push((XValue::Label(k.to_string()), y));
             }
             vec![Series { name: "value".to_string(), points }]
         }
@@ -1027,7 +1028,7 @@ fn heat_t(scale: HeatScale, mn: f64, mx: f64, v: f64) -> f64 {
 /// leyenda y salidas MD/JSON usan los mismos números.
 fn normalize_heatmap(
     args: &[SynValue],
-    opts: &IndexMap<String, SynValue>,
+    opts: &MapObj,
     user_colors: &Option<Vec<String>>,
     th: &'static ThemeColors,
     name: &str,
@@ -1377,7 +1378,7 @@ fn normalize_heatmap(
 /// `chart("histogram", histogram(datos, 20))`).
 fn normalize_histogram(
     args: &[SynValue],
-    opts: &IndexMap<String, SynValue>,
+    opts: &MapObj,
     name: &str,
 ) -> Result<(Vec<i64>, Vec<f64>), Control> {
     let raw = || -> Result<(Vec<i64>, Vec<f64>), Control> {
@@ -1387,7 +1388,7 @@ fn normalize_histogram(
         }
         let result = synsema_core::math::histogram(&h_args)?;
         let m = match &result {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             _ => {
                 return Err(err(format!(
                     "{}: internal error — histogram() did not return a map",
@@ -1612,7 +1613,7 @@ fn box_group(label: &str, mut vals: Vec<f64>, name: &str) -> Result<BoxGroup, Co
 /// (caja por grupo, orden de inserción), o formato largo (rows + x/y).
 fn normalize_boxplot(
     args: &[SynValue],
-    opts: &IndexMap<String, SynValue>,
+    opts: &MapObj,
     name: &str,
 ) -> Result<Vec<BoxGroup>, Control> {
     match &args[1] {
@@ -1763,7 +1764,7 @@ fn normalize_boxplot(
 /// SVG/MD/JSON). Delta 0 es dato real (barra plana), no error.
 fn normalize_waterfall(
     args: &[SynValue],
-    opts: &IndexMap<String, SynValue>,
+    opts: &MapObj,
     name: &str,
 ) -> Result<(Vec<WfStep>, Option<String>), Control> {
     let total_label = match opts.get("total") {
@@ -1786,7 +1787,7 @@ fn normalize_waterfall(
             }
             let mut out = Vec::with_capacity(m.len());
             for (k, v) in m.iter() {
-                out.push((k.clone(), num_of(v, name, &format!("the delta of {:?}", k))?));
+                out.push((k.to_string(), num_of(v, name, &format!("the delta of {:?}", k))?));
             }
             out
         }
@@ -2985,8 +2986,8 @@ pub fn chart_node(args: &[SynValue]) -> Result<SynValue, Control> {
                 series
                     .iter()
                     .map(|s| {
-                        let mut m = IndexMap::new();
-                        m.insert("name".to_string(), syn_text(s.name.as_str()));
+                        let mut m = SynMap::new();
+                        m.insert("name", syn_text(s.name.as_str()));
                         m.insert(
                             "points".to_string(),
                             syn_list(
@@ -3053,13 +3054,13 @@ pub fn chart_node(args: &[SynValue]) -> Result<SynValue, Control> {
                     groups
                         .iter()
                         .map(|g| {
-                            let mut m = IndexMap::new();
-                            m.insert("name".to_string(), syn_text(g.name.as_str()));
-                            m.insert("min".to_string(), syn_float(g.min));
-                            m.insert("q1".to_string(), syn_float(g.q1));
-                            m.insert("median".to_string(), syn_float(g.median));
-                            m.insert("q3".to_string(), syn_float(g.q3));
-                            m.insert("max".to_string(), syn_float(g.max));
+                            let mut m = SynMap::new();
+                            m.insert("name", syn_text(g.name.as_str()));
+                            m.insert("min", syn_float(g.min));
+                            m.insert("q1", syn_float(g.q1));
+                            m.insert("median", syn_float(g.median));
+                            m.insert("q3", syn_float(g.q3));
+                            m.insert("max", syn_float(g.max));
                             m.insert(
                                 "outliers".to_string(),
                                 syn_list(g.outliers.iter().map(|o| syn_float(*o)).collect()),
@@ -3077,10 +3078,10 @@ pub fn chart_node(args: &[SynValue]) -> Result<SynValue, Control> {
                     steps
                         .iter()
                         .map(|s| {
-                            let mut m = IndexMap::new();
-                            m.insert("label".to_string(), syn_text(s.label.as_str()));
-                            m.insert("delta".to_string(), syn_float(s.delta));
-                            m.insert("running".to_string(), syn_float(s.running));
+                            let mut m = SynMap::new();
+                            m.insert("label", syn_text(s.label.as_str()));
+                            m.insert("delta", syn_float(s.delta));
+                            m.insert("running", syn_float(s.running));
                             syn_map(m)
                         })
                         .collect(),
@@ -3214,7 +3215,7 @@ pub fn render_chart_md(node: &SynValue) -> String {
             );
             for g in field_list(node, "groups") {
                 let m = match &g {
-                    SynValue::Map(m) => m.borrow().clone(),
+                    SynValue::Map(m) => m.borrow().to_map(),
                     _ => continue,
                 };
                 let cell = |k: &str| m.get(k).map(md_num).unwrap_or_default();
@@ -3242,7 +3243,7 @@ pub fn render_chart_md(node: &SynValue) -> String {
             out.push_str("| label | delta | running |\n| --- | --- | --- |");
             for s in field_list(node, "steps") {
                 let m = match &s {
-                    SynValue::Map(m) => m.borrow().clone(),
+                    SynValue::Map(m) => m.borrow().to_map(),
                     _ => continue,
                 };
                 let label = m.get("label").map(|v| v.to_string()).unwrap_or_default();
@@ -3374,7 +3375,7 @@ mod tests {
     use super::*;
 
     fn map1(pairs: &[(&str, f64)]) -> SynValue {
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         for (k, v) in pairs {
             m.insert(k.to_string(), syn_float(*v));
         }
@@ -3421,8 +3422,8 @@ mod tests {
     #[test]
     fn xss_labels_escaped_everywhere() {
         let data = map1(&[("<script>alert(1)</script>", 4.0), ("b", 2.0)]);
-        let mut opts = IndexMap::new();
-        opts.insert("title".to_string(), syn_text("<img onerror=x>"));
+        let mut opts = SynMap::new();
+        opts.insert("title", syn_text("<img onerror=x>"));
         let args = vec![syn_text("pie"), data, syn_map(opts)];
         let svg = svg_of(&args);
         assert!(!svg.contains("<script>"), "label sin escapar:\n{}", svg);
@@ -3447,13 +3448,13 @@ mod tests {
         let e = err_of(&[syn_text("pie"), nine]);
         assert!(e.contains("Other") && e.contains("colors"), "{}", e);
         // campo inexistente en filas
-        let mut row = IndexMap::new();
-        row.insert("mes".to_string(), syn_text("ene"));
-        row.insert("total".to_string(), syn_float(10.0));
+        let mut row = SynMap::new();
+        row.insert("mes", syn_text("ene"));
+        row.insert("total", syn_float(10.0));
         let rows = syn_list(vec![syn_map(row)]);
-        let mut opts = IndexMap::new();
-        opts.insert("x".to_string(), syn_text("mes"));
-        opts.insert("y".to_string(), syn_text("venta"));
+        let mut opts = SynMap::new();
+        opts.insert("x", syn_text("mes"));
+        opts.insert("y", syn_text("venta"));
         let e = err_of(&[syn_text("bar"), rows, syn_map(opts)]);
         assert!(e.contains("\"venta\"") && e.contains("row 1"), "{}", e);
     }
@@ -3480,7 +3481,7 @@ mod tests {
 
     #[test]
     fn custom_colors_replace_palette() {
-        let mut opts = IndexMap::new();
+        let mut opts = SynMap::new();
         opts.insert(
             "colors".to_string(),
             syn_list(vec![syn_text("#111111"), syn_text("#222222")]),
@@ -3511,32 +3512,32 @@ mod tests {
         // (garbage silencioso, G5). Ahora es un error claro con fila y campo.
         let rows = syn_list(vec![
             {
-                let mut m = IndexMap::new();
-                m.insert("t".to_string(), syn_float(1.0));
-                m.insert("v".to_string(), syn_float(2.0));
+                let mut m = SynMap::new();
+                m.insert("t", syn_float(1.0));
+                m.insert("v", syn_float(2.0));
                 syn_map(m)
             },
             {
-                let mut m = IndexMap::new();
-                m.insert("t".to_string(), syn_float(f64::NAN));
-                m.insert("v".to_string(), syn_float(3.0));
+                let mut m = SynMap::new();
+                m.insert("t", syn_float(f64::NAN));
+                m.insert("v", syn_float(3.0));
                 syn_map(m)
             },
         ]);
-        let mut opts = IndexMap::new();
-        opts.insert("x".to_string(), syn_text("t"));
-        opts.insert("y".to_string(), syn_text("v"));
+        let mut opts = SynMap::new();
+        opts.insert("x", syn_text("t"));
+        opts.insert("y", syn_text("v"));
         let e = err_of(&[syn_text("line"), rows.clone(), syn_map(opts.clone())]);
         assert!(e.contains("NaN") && e.contains("row 2"), "{}", e);
         let e = err_of(&[syn_text("scatter"), rows, syn_map(opts)]);
         assert!(e.contains("NaN"), "{}", e);
         // En bar la x es identidad (label), no posición: NaN queda como label "nan".
-        let mut m = IndexMap::new();
-        m.insert("t".to_string(), syn_float(f64::NAN));
-        m.insert("v".to_string(), syn_float(3.0));
-        let mut opts = IndexMap::new();
-        opts.insert("x".to_string(), syn_text("t"));
-        opts.insert("y".to_string(), syn_text("v"));
+        let mut m = SynMap::new();
+        m.insert("t", syn_float(f64::NAN));
+        m.insert("v", syn_float(3.0));
+        let mut opts = SynMap::new();
+        opts.insert("x", syn_text("t"));
+        opts.insert("y", syn_text("v"));
         let svg = svg_of(&[syn_text("bar"), syn_list(vec![syn_map(m)]), syn_map(opts)]);
         assert!(!svg.contains("cx=\"NaN\""), "{}", svg);
     }
@@ -3544,26 +3545,26 @@ mod tests {
     #[test]
     fn secret_label_redacted() {
         let rows = syn_list(vec![{
-            let mut m = IndexMap::new();
-            m.insert("k".to_string(), synsema_core::types::syn_secret("API_KEY", "hunter2"));
-            m.insert("v".to_string(), syn_float(1.0));
+            let mut m = SynMap::new();
+            m.insert("k", synsema_core::types::syn_secret("API_KEY", "hunter2"));
+            m.insert("v", syn_float(1.0));
             syn_map(m)
         }]);
-        let mut opts = IndexMap::new();
-        opts.insert("x".to_string(), syn_text("k"));
-        opts.insert("y".to_string(), syn_text("v"));
+        let mut opts = SynMap::new();
+        opts.insert("x", syn_text("k"));
+        opts.insert("y", syn_text("v"));
         let svg = svg_of(&[syn_text("bar"), rows, syn_map(opts)]);
         assert!(!svg.contains("hunter2"), "plaintext filtrado:\n{}", svg);
         // Y un secret como VALOR numérico → error (G8).
         let rows = syn_list(vec![{
-            let mut m = IndexMap::new();
-            m.insert("k".to_string(), syn_text("a"));
-            m.insert("v".to_string(), synsema_core::types::syn_secret("API_KEY", "hunter2"));
+            let mut m = SynMap::new();
+            m.insert("k", syn_text("a"));
+            m.insert("v", synsema_core::types::syn_secret("API_KEY", "hunter2"));
             syn_map(m)
         }]);
-        let mut opts = IndexMap::new();
-        opts.insert("x".to_string(), syn_text("k"));
-        opts.insert("y".to_string(), syn_text("v"));
+        let mut opts = SynMap::new();
+        opts.insert("x", syn_text("k"));
+        opts.insert("y", syn_text("v"));
         let e = err_of(&[syn_text("bar"), rows, syn_map(opts)]);
         assert!(e.contains("secret"), "{}", e);
     }
@@ -3573,7 +3574,7 @@ mod tests {
     // =====================================================
 
     fn opts_v(pairs: Vec<(&str, SynValue)>) -> SynValue {
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }
@@ -3584,7 +3585,7 @@ mod tests {
         syn_list(
             rows.into_iter()
                 .map(|r| {
-                    let mut m = IndexMap::new();
+                    let mut m = SynMap::new();
                     for (k, v) in r {
                         m.insert(k.to_string(), v);
                     }
@@ -4017,9 +4018,9 @@ mod tests {
     #[test]
     fn histogram_map_form_validation() {
         let mk = |counts: Vec<SynValue>, edges: Vec<SynValue>| {
-            let mut m = IndexMap::new();
-            m.insert("counts".to_string(), syn_list(counts));
-            m.insert("edges".to_string(), syn_list(edges));
+            let mut m = SynMap::new();
+            m.insert("counts", syn_list(counts));
+            m.insert("edges", syn_list(edges));
             syn_map(m)
         };
         // length(edges) != length(counts) + 1 → error claro (§7.2).
@@ -4052,7 +4053,7 @@ mod tests {
             other => panic!("groups no es lista: {}", other.type_name()),
         };
         let g = match &groups[0] {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             _ => panic!("grupo no es mapa"),
         };
         let num = |k: &str| match g.get(k) {
@@ -4088,8 +4089,8 @@ mod tests {
     #[test]
     fn boxplot_errors_and_edge_cases() {
         // Grupo con 1 dato → error (G5).
-        let mut m = IndexMap::new();
-        m.insert("solo".to_string(), nums(&[7.0]));
+        let mut m = SynMap::new();
+        m.insert("solo", nums(&[7.0]));
         let e = err_of(&[syn_text("boxplot"), syn_map(m)]);
         assert!(e.contains("\"solo\"") && e.contains("at least 2"), "{}", e);
         // NaN → error (espeja los builtins).
@@ -4101,8 +4102,8 @@ mod tests {
         assert!(svg.contains("<rect"), "{}", svg);
         // Las 3 formas de data.
         let by_map = {
-            let mut m = IndexMap::new();
-            m.insert("web".to_string(), nums(&[1.0, 2.0, 3.0]));
+            let mut m = SynMap::new();
+            m.insert("web", nums(&[1.0, 2.0, 3.0]));
             svg_of(&[syn_text("boxplot"), syn_map(m)])
         };
         let by_rows = svg_of(&[
@@ -4241,7 +4242,7 @@ mod tests {
         let svg = svg_of(&[syn_text("heatmap"), heat, opts_v(heat_opts_xyv())]);
         assert!(!svg.contains("<script>"), "{}", svg);
         assert!(svg.contains("&lt;script&gt;"), "{}", svg);
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         m.insert(hostile.to_string(), nums(&[1.0, 2.0]));
         let args = vec![syn_text("boxplot"), syn_map(m)];
         let svg = svg_of(&args);
@@ -4274,12 +4275,12 @@ mod tests {
         ]);
         let e = err_of(&[syn_text("heatmap"), rows, opts_v(heat_opts_xyv())]);
         assert!(e.contains("secret") && !e.contains("hunter2"), "{}", e);
-        let mut m = IndexMap::new();
-        m.insert("g".to_string(), syn_list(vec![syn_float(1.0), s()]));
+        let mut m = SynMap::new();
+        m.insert("g", syn_list(vec![syn_float(1.0), s()]));
         let e = err_of(&[syn_text("boxplot"), syn_map(m)]);
         assert!(e.contains("secret") && !e.contains("hunter2"), "{}", e);
-        let mut m = IndexMap::new();
-        m.insert("delta".to_string(), s());
+        let mut m = SynMap::new();
+        m.insert("delta", s());
         let e = err_of(&[syn_text("waterfall"), syn_map(m)]);
         assert!(e.contains("secret") && !e.contains("hunter2"), "{}", e);
     }
@@ -4288,8 +4289,8 @@ mod tests {
     fn unicode_and_emoji_labels_render() {
         let svg = svg_of(&[syn_text("waterfall"), map1(&[("café ☕", 3.0), ("日本語", -1.0)])]);
         assert!(svg.contains("café ☕") && svg.contains("日本語"), "{}", svg);
-        let mut m = IndexMap::new();
-        m.insert("grupo 🚀".to_string(), nums(&[1.0, 2.0]));
+        let mut m = SynMap::new();
+        m.insert("grupo 🚀", nums(&[1.0, 2.0]));
         let svg = svg_of(&[syn_text("boxplot"), syn_map(m)]);
         assert!(svg.contains("grupo 🚀"), "{}", svg);
     }

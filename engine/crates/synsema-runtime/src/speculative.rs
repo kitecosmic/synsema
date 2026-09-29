@@ -6,11 +6,11 @@
 //! snapshot del entorno → ejecutar especulativamente → rollback (restaura) /
 //! commit (descarta) / fork (N branches independientes) + choose_and_apply.
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use indexmap::IndexMap;
 
 use synsema_core::interpreter::Environment;
 use synsema_core::types::SynValue;
@@ -23,11 +23,11 @@ fn deep_copy(v: &SynValue) -> SynValue {
             SynValue::List(Rc::new(RefCell::new(l.borrow().iter().map(deep_copy).collect())))
         }
         SynValue::Map(m) => {
-            let mut nm = IndexMap::new();
+            let mut nm = SynMap::new();
             for (k, val) in m.borrow().iter() {
                 nm.insert(k.clone(), deep_copy(val));
             }
-            SynValue::Map(Rc::new(RefCell::new(nm)))
+            SynValue::Map(nm.into_ref())
         }
         other => other.clone(),
     }
@@ -202,11 +202,11 @@ mod tests {
         let mut spec = SpeculativeEngine::new();
         let branches: Vec<BranchFn> = vec![
             Box::new(|benv: &Rc<RefCell<Environment>>| {
-                benv.borrow_mut().bindings.insert("x".to_string(), syn_int(100));
+                benv.borrow_mut().bindings.insert("x", syn_int(100));
                 syn_text("a")
             }),
             Box::new(|benv: &Rc<RefCell<Environment>>| {
-                benv.borrow_mut().bindings.insert("x".to_string(), syn_int(200));
+                benv.borrow_mut().bindings.insert("x", syn_int(200));
                 syn_text("b")
             }),
         ];

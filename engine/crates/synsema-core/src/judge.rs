@@ -12,7 +12,7 @@
 //! callback (offline, sin presupuesto, error de red) cada respuesta degrada a
 //! `available: false` con confianza 0 — nunca a una probabilidad inventada.
 
-use indexmap::IndexMap;
+use crate::types::SynMap;
 use serde_json::Value as Json;
 
 use crate::number::Number;
@@ -204,7 +204,7 @@ pub fn syn_to_json(v: &SynValue) -> Json {
         SynValue::Map(m) => Json::Object(
             m.borrow()
                 .iter()
-                .map(|(k, v)| (k.clone(), syn_to_json(v)))
+                .map(|(k, v)| (k.to_string(), syn_to_json(v)))
                 .collect(),
         ),
         other => Json::String(other.to_string()),
@@ -254,7 +254,7 @@ pub fn options_from_value(v: &SynValue) -> Result<Vec<JudgeOption>, String> {
             .borrow()
             .iter()
             .map(|(k, v)| JudgeOption {
-                id: k.clone(),
+                id: k.to_string(),
                 description: match v {
                     SynValue::Nothing => None,
                     other => Some(syn_to_json(other)),
@@ -298,46 +298,46 @@ pub fn argmax_id(probs: &[(String, f64)]) -> Option<String> {
 /// compuerta de confianza mande al humano sola y una comparación directa falle fuerte en
 /// vez de tomar la rama equivocada en silencio.
 pub fn answer_to_value(q: &JudgeQuestion, answer: Option<&JudgeAnswer>) -> SynValue {
-    let mut m: IndexMap<String, SynValue> = IndexMap::new();
+    let mut m: SynMap = SynMap::new();
     // `kind` y no `type`: `type` es palabra reservada y `v.refund.type` no parsea.
-    m.insert("kind".into(), syn_text(q.kind.verb()));
+    m.insert("kind", syn_text(q.kind.verb()));
     let available = answer.is_some();
     match (q.kind, answer) {
         (JudgeKind::Whether, Some(JudgeAnswer::Whether { probability })) => {
-            m.insert("probability".into(), float(*probability));
+            m.insert("probability", float(*probability));
         }
         (JudgeKind::Whether, _) => {
-            m.insert("probability".into(), SynValue::Nothing);
+            m.insert("probability", SynValue::Nothing);
         }
         (JudgeKind::Choose, Some(JudgeAnswer::Choose { choice, probabilities, confidence })) => {
             m.insert(
-                "choice".into(),
+                "choice",
                 choice.as_ref().map(|c| syn_text(c.as_str())).unwrap_or(SynValue::Nothing),
             );
-            m.insert("probabilities".into(), probs_map(probabilities));
-            m.insert("confidence".into(), float(*confidence));
+            m.insert("probabilities", probs_map(probabilities));
+            m.insert("confidence", float(*confidence));
         }
         (JudgeKind::Choose, _) => {
-            m.insert("choice".into(), SynValue::Nothing);
-            m.insert("probabilities".into(), syn_map(IndexMap::new()));
-            m.insert("confidence".into(), float(0.0));
+            m.insert("choice", SynValue::Nothing);
+            m.insert("probabilities", syn_map(SynMap::new()));
+            m.insert("confidence", float(0.0));
         }
         (JudgeKind::Rate, Some(JudgeAnswer::Rate { score, level, probabilities, confidence })) => {
-            m.insert("score".into(), float(*score));
-            m.insert("level".into(), syn_text(level.as_str()));
-            m.insert("levels".into(), levels_list(q));
-            m.insert("probabilities".into(), probs_map(probabilities));
-            m.insert("confidence".into(), float(*confidence));
+            m.insert("score", float(*score));
+            m.insert("level", syn_text(level.as_str()));
+            m.insert("levels", levels_list(q));
+            m.insert("probabilities", probs_map(probabilities));
+            m.insert("confidence", float(*confidence));
         }
         (JudgeKind::Rate, _) => {
-            m.insert("score".into(), SynValue::Nothing);
-            m.insert("level".into(), SynValue::Nothing);
-            m.insert("levels".into(), levels_list(q));
-            m.insert("probabilities".into(), syn_map(IndexMap::new()));
-            m.insert("confidence".into(), float(0.0));
+            m.insert("score", SynValue::Nothing);
+            m.insert("level", SynValue::Nothing);
+            m.insert("levels", levels_list(q));
+            m.insert("probabilities", syn_map(SynMap::new()));
+            m.insert("confidence", float(0.0));
         }
     }
-    m.insert("available".into(), syn_bool(available));
+    m.insert("available", syn_bool(available));
     syn_map(m)
 }
 
@@ -346,7 +346,7 @@ fn float(f: f64) -> SynValue {
 }
 
 fn probs_map(probs: &[(String, f64)]) -> SynValue {
-    let mut pm: IndexMap<String, SynValue> = IndexMap::new();
+    let mut pm: SynMap = SynMap::new();
     for (id, p) in probs {
         pm.insert(id.clone(), float(*p));
     }
@@ -621,13 +621,13 @@ mod tests {
 
     #[test]
     fn backtick_paths_are_extracted_and_resolved() {
-        let mut inner = IndexMap::new();
-        inner.insert("text".to_string(), syn_text("hi"));
+        let mut inner = SynMap::new();
+        inner.insert("text", syn_text("hi"));
         let msgs = syn_list(vec![syn_map(inner)]);
-        let mut ticket = IndexMap::new();
-        ticket.insert("messages".to_string(), msgs);
-        let mut state = IndexMap::new();
-        state.insert("ticket".to_string(), syn_map(ticket));
+        let mut ticket = SynMap::new();
+        ticket.insert("messages", msgs);
+        let mut state = SynMap::new();
+        state.insert("ticket", syn_map(ticket));
         let state = syn_map(state);
         let instr = syn_text("Does `ticket.messages[0].text` ask for a refund? Compare with `ticket.priority` and `not a path`.");
         assert_eq!(backtick_paths(&instr), vec!["ticket.messages[0].text", "ticket.priority"]);
@@ -635,9 +635,9 @@ mod tests {
         assert!(!resolve_path(&state, "ticket.messages[1].text"));
         assert_eq!(missing_paths(&state, &instr), vec!["ticket.priority"]);
         // una clave de la propia instrucción (map) cuenta como existente
-        let mut im = IndexMap::new();
-        im.insert("question".to_string(), syn_text("Same person as `record`?"));
-        im.insert("record".to_string(), syn_text("Ana"));
+        let mut im = SynMap::new();
+        im.insert("question", syn_text("Same person as `record`?"));
+        im.insert("record", syn_text("Ana"));
         assert!(missing_paths(&state, &syn_map(im)).is_empty());
     }
 
@@ -727,9 +727,9 @@ mod tests {
         let o = options_from_value(&list).unwrap();
         assert_eq!(o[0].id, "Calm");
         assert!(o[0].description.is_none());
-        let mut m = IndexMap::new();
-        m.insert("calm".to_string(), syn_text("Polite, no complaint"));
-        m.insert("angry".to_string(), SynValue::Nothing);
+        let mut m = SynMap::new();
+        m.insert("calm", syn_text("Polite, no complaint"));
+        m.insert("angry", SynValue::Nothing);
         let o = options_from_value(&syn_map(m)).unwrap();
         assert_eq!(o[0].id, "calm");
         assert_eq!(o[0].description, Some(Json::String("Polite, no complaint".into())));

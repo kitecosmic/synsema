@@ -22,7 +22,7 @@
 //! Vectores: el spec del W3C CCG (did:key Method v0.9, ejemplo
 //! `did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK`).
 
-use indexmap::IndexMap;
+use synsema_core::types::SynMap;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 
 use synsema_core::bytesutil::{base58_decode, base58_encode, hex_decode};
@@ -177,13 +177,13 @@ pub fn document(did: &str) -> Result<SynValue, String> {
     let (alg, key, mb) = decode(did)?;
     let did = format!("did:key:{}", mb);
     let vm_id = format!("{}#{}", did, mb);
-    let mut vm = IndexMap::new();
-    vm.insert("id".to_string(), syn_text(vm_id.clone()));
-    vm.insert("type".to_string(), syn_text("Multikey"));
-    vm.insert("controller".to_string(), syn_text(did.clone()));
-    vm.insert("publicKeyMultibase".to_string(), syn_text(mb.clone()));
+    let mut vm = SynMap::new();
+    vm.insert("id", syn_text(vm_id.clone()));
+    vm.insert("type", syn_text("Multikey"));
+    vm.insert("controller", syn_text(did.clone()));
+    vm.insert("publicKeyMultibase", syn_text(mb.clone()));
 
-    let mut doc = IndexMap::new();
+    let mut doc = SynMap::new();
     doc.insert(
         "@context".to_string(),
         syn_list(vec![
@@ -191,20 +191,20 @@ pub fn document(did: &str) -> Result<SynValue, String> {
             syn_text("https://w3id.org/security/multikey/v1"),
         ]),
     );
-    doc.insert("id".to_string(), syn_text(did.clone()));
+    doc.insert("id", syn_text(did.clone()));
     let refs = || syn_list(vec![syn_text(vm_id.clone())]);
     match alg {
         KeyAlg::X25519 => {
             // Una clave de acuerdo sola: sólo `keyAgreement`.
-            doc.insert("verificationMethod".to_string(), syn_list(vec![syn_map(vm)]));
-            doc.insert("keyAgreement".to_string(), refs());
+            doc.insert("verificationMethod", syn_list(vec![syn_map(vm)]));
+            doc.insert("keyAgreement", refs());
         }
         _ => {
             let mut methods = vec![syn_map(vm)];
-            doc.insert("authentication".to_string(), refs());
-            doc.insert("assertionMethod".to_string(), refs());
-            doc.insert("capabilityInvocation".to_string(), refs());
-            doc.insert("capabilityDelegation".to_string(), refs());
+            doc.insert("authentication", refs());
+            doc.insert("assertionMethod", refs());
+            doc.insert("capabilityInvocation", refs());
+            doc.insert("capabilityDelegation", refs());
             if alg == KeyAlg::Ed25519 {
                 // X25519 derivada (§3.1.2): la clave de acuerdo de la misma identidad.
                 let arr: [u8; 32] = key.as_slice().try_into().expect("32");
@@ -214,15 +214,15 @@ pub fn document(did: &str) -> Result<SynValue, String> {
                 raw.extend_from_slice(&x);
                 let xmb = format!("z{}", base58_encode(&raw));
                 let xid = format!("{}#{}", did, xmb);
-                let mut ka = IndexMap::new();
-                ka.insert("id".to_string(), syn_text(xid.clone()));
-                ka.insert("type".to_string(), syn_text("Multikey"));
-                ka.insert("controller".to_string(), syn_text(did.clone()));
-                ka.insert("publicKeyMultibase".to_string(), syn_text(xmb));
+                let mut ka = SynMap::new();
+                ka.insert("id", syn_text(xid.clone()));
+                ka.insert("type", syn_text("Multikey"));
+                ka.insert("controller", syn_text(did.clone()));
+                ka.insert("publicKeyMultibase", syn_text(xmb));
                 methods.push(syn_map(ka));
-                doc.insert("keyAgreement".to_string(), syn_list(vec![syn_text(xid)]));
+                doc.insert("keyAgreement", syn_list(vec![syn_text(xid)]));
             }
-            doc.insert("verificationMethod".to_string(), syn_list(methods));
+            doc.insert("verificationMethod", syn_list(methods));
         }
     }
     Ok(syn_map(doc))
@@ -274,11 +274,11 @@ fn b_did_key_decode(args: &[SynValue]) -> Result<SynValue, Control> {
     }
     let did = did_arg(&args[0], F)?;
     let (alg, key, mb) = decode(&did).map_err(|e| err(format!("{}: {}", F, e)))?;
-    let mut m = IndexMap::new();
-    m.insert("alg".to_string(), syn_text(alg.name()));
-    m.insert("public_key".to_string(), syn_bytes(key));
-    m.insert("multibase".to_string(), syn_text(mb.clone()));
-    m.insert("did".to_string(), syn_text(format!("did:key:{}", mb)));
+    let mut m = SynMap::new();
+    m.insert("alg", syn_text(alg.name()));
+    m.insert("public_key", syn_bytes(key));
+    m.insert("multibase", syn_text(mb.clone()));
+    m.insert("did", syn_text(format!("did:key:{}", mb)));
     Ok(syn_map(m))
 }
 

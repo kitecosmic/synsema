@@ -28,11 +28,11 @@
 //! que se **muestra o compara** va como `text` (tx hashes `0x…`, direcciones
 //! EIP-55, signature base58, txid base32).
 
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use indexmap::IndexMap;
 use num_bigint::BigInt;
 use sha3::{Digest, Keccak256};
 
@@ -577,11 +577,11 @@ fn syn_to_eth_json(v: &SynValue, path: &str, fname: &str, depth: usize) -> Resul
             Ok(Json::Array(out))
         }
         SynValue::Map(m) => {
-            let m = m.borrow().clone();
+            let m = m.borrow().to_map();
             let mut out = Vec::with_capacity(m.len());
             for (k, val) in m.iter() {
                 out.push((
-                    k.clone(),
+                    k.to_string(),
                     syn_to_eth_json(val, &format!("{}.{}", path, k), fname, depth + 1)?,
                 ));
             }
@@ -631,11 +631,11 @@ pub(crate) fn syn_to_plain_json(v: &SynValue, path: &str, fname: &str, depth: us
             Ok(Json::Array(out))
         }
         SynValue::Map(m) => {
-            let m = m.borrow().clone();
+            let m = m.borrow().to_map();
             let mut out = Vec::with_capacity(m.len());
             for (k, val) in m.iter() {
                 out.push((
-                    k.clone(),
+                    k.to_string(),
                     syn_to_plain_json(val, &format!("{}.{}", path, k), fname, depth + 1)?,
                 ));
             }
@@ -843,7 +843,7 @@ fn evm_logs(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynV
     let url = url_arg(arg(args, 0, F)?, F)?;
     require_net(caps, &url, "evm_logs()")?;
     let m = match arg(args, 1, F)? {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         other => {
             return Err(err(format!(
                 "{}: the filter must be a map ({{address, topics, fromBlock, toBlock}} or {{address, topics, blockHash}}), got {}",
@@ -913,7 +913,7 @@ fn evm_logs(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynV
                 )))
             }
         };
-        filter.push((k.clone(), j));
+        filter.push((k.to_string(), j));
     }
     if m.contains_key("blockHash") && (m.contains_key("fromBlock") || m.contains_key("toBlock")) {
         return Err(err(format!("{}: blockHash excludes fromBlock/toBlock (pick one way to say which blocks)", F)));
@@ -1059,7 +1059,7 @@ fn decode_wire_qty(v: &serde_json::Value, what: &str, fname: &str) -> Result<Syn
 fn decode_log(v: &serde_json::Value, idx: usize, fname: &str) -> Result<SynValue, Control> {
     let what = format!("logs[{}]", idx);
     let obj = as_obj(v, &what, fname)?;
-    let mut out = IndexMap::new();
+    let mut out = SynMap::new();
     for (k, val) in obj {
         let path = format!("{}.{}", what, k);
         let dv = if k == "address" {
@@ -1100,7 +1100,7 @@ fn decode_log(v: &serde_json::Value, idx: usize, fname: &str) -> Result<SynValue
 /// claves desconocidas pasan tal cual.
 fn decode_receipt(v: &serde_json::Value, fname: &str) -> Result<SynValue, Control> {
     let obj = as_obj(v, "the receipt", fname)?;
-    let mut out = IndexMap::new();
+    let mut out = SynMap::new();
     for (k, val) in obj {
         let path = format!("receipt.{}", k);
         let dv = if RECEIPT_QTY_KEYS.contains(&k.as_str()) {
@@ -1367,14 +1367,14 @@ fn evm_fee_history(
     first_col.sort();
     let priority = Number::from_bigint(first_col[first_col.len() / 2].clone());
 
-    let mut m = IndexMap::new();
-    m.insert("base_fee".to_string(), syn_number(base_fee));
-    m.insert("priority".to_string(), syn_number(priority));
+    let mut m = SynMap::new();
+    m.insert("base_fee", syn_number(base_fee));
+    m.insert("priority", syn_number(priority));
     m.insert(
         "base_fees".to_string(),
         syn_list(base_fees.into_iter().map(syn_number).collect()),
     );
-    m.insert("rewards".to_string(), syn_list(rewards));
+    m.insert("rewards", syn_list(rewards));
     Ok(syn_map(m))
 }
 
@@ -1385,7 +1385,7 @@ fn evm_fee_history(
 /// Campo entero requerido de `bits` como máximo. El error de campo faltante nombra
 /// el helper que lo LEE de la cadena — no hay default silencioso (G24).
 fn uint_field(
-    m: &IndexMap<String, SynValue>,
+    m: &MapObj,
     key: &str,
     bits: u64,
     read_hint: &str,
@@ -1446,7 +1446,7 @@ fn access_list_field(v: Option<&SynValue>, fname: &str) -> Result<SynValue, Cont
     for (i, item) in list.iter().enumerate() {
         let what = format!("access_list[{}]", i);
         let m = match item {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             other => {
                 return Err(err(format!(
                     "{}: {} must be a map {{address, storage_keys}}, got {}",
@@ -1531,7 +1531,7 @@ fn build_evm_tx(args: &[SynValue], create: bool) -> Result<SynValue, Control> {
     #[allow(non_snake_case)]
     let F: &str = if create { "evm_tx_create" } else { "evm_tx" };
     let m = match arg(args, 0, F)? {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         other => {
             return Err(err(format!(
                 "{}: params must be a map, got {}",
@@ -1648,27 +1648,27 @@ fn build_evm_tx(args: &[SynValue], create: bool) -> Result<SynValue, Control> {
     unsigned.extend_from_slice(&payload);
     let digest = Keccak256::digest(&unsigned);
 
-    let mut out = IndexMap::new();
-    out.insert("digest".to_string(), syn_bytes(digest.to_vec()));
-    out.insert("fields".to_string(), fields);
+    let mut out = SynMap::new();
+    out.insert("digest", syn_bytes(digest.to_vec()));
+    out.insert("fields", fields);
     // Eco de los números que mueven valor — para el confirm/show PREVIO a la
     // firma (G24): nada queda escondido dentro de un blob.
-    out.insert("chain_id".to_string(), syn_number(chain_id));
+    out.insert("chain_id", syn_number(chain_id));
     match from {
         Some(f) => {
-            out.insert("to".to_string(), SynValue::Nothing);
-            out.insert("from".to_string(), syn_text(eip55(&f)));
-            out.insert("contract_address".to_string(), syn_text(eip55(&create_address(&f, &nonce, F)?)));
+            out.insert("to", SynValue::Nothing);
+            out.insert("from", syn_text(eip55(&f)));
+            out.insert("contract_address", syn_text(eip55(&create_address(&f, &nonce, F)?)));
         }
         None => {
-            out.insert("to".to_string(), syn_text(eip55(&to)));
+            out.insert("to", syn_text(eip55(&to)));
         }
     }
-    out.insert("nonce".to_string(), syn_number(nonce));
-    out.insert("value".to_string(), syn_number(value));
-    out.insert("gas".to_string(), syn_number(gas));
-    out.insert("max_fee".to_string(), syn_number(max_fee));
-    out.insert("max_priority".to_string(), syn_number(max_priority));
+    out.insert("nonce", syn_number(nonce));
+    out.insert("value", syn_number(value));
+    out.insert("gas", syn_number(gas));
+    out.insert("max_fee", syn_number(max_fee));
+    out.insert("max_priority", syn_number(max_priority));
     Ok(syn_map(out))
 }
 
@@ -1723,7 +1723,7 @@ fn evm_create2_address(args: &[SynValue]) -> Result<SynValue, Control> {
 fn evm_tx_raw(args: &[SynValue]) -> Result<SynValue, Control> {
     const F: &str = "evm_tx_raw";
     let m = match arg(args, 0, F)? {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         other => {
             return Err(err(format!(
                 "{}: the first argument must be the map returned by evm_tx, got {}",
@@ -2018,7 +2018,7 @@ fn solana_wait(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<S
             let done = !tx_err.is_null()
                 || matches!(confirmation_status.as_deref(), Some("confirmed") | Some("finalized"));
             if done {
-                let mut m = IndexMap::new();
+                let mut m = SynMap::new();
                 m.insert(
                     "slot".to_string(),
                     obj.get("slot")
@@ -2080,10 +2080,10 @@ fn spl_balance(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<S
     if decimals > 255 {
         return Err(err(format!("{}: the node sent decimals over 255", F)));
     }
-    let mut m = IndexMap::new();
-    m.insert("amount".to_string(), syn_number(Number::from_bigint(amount)));
-    m.insert("decimals".to_string(), syn_int(decimals as i64));
-    m.insert("ata".to_string(), syn_bytes(ata.to_vec()));
+    let mut m = SynMap::new();
+    m.insert("amount", syn_number(Number::from_bigint(amount)));
+    m.insert("decimals", syn_int(decimals as i64));
+    m.insert("ata", syn_bytes(ata.to_vec()));
     Ok(syn_map(m))
 }
 
@@ -2155,13 +2155,13 @@ fn algorand_params(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Resu
             F, last_round
         ))
     })?;
-    let mut m = IndexMap::new();
-    m.insert("fee".to_string(), u64_number(fee));
-    m.insert("min_fee".to_string(), u64_number(min_fee));
-    m.insert("fv".to_string(), u64_number(last_round));
-    m.insert("lv".to_string(), u64_number(lv));
-    m.insert("gh".to_string(), syn_bytes(gh));
-    m.insert("gen".to_string(), syn_text(gen));
+    let mut m = SynMap::new();
+    m.insert("fee", u64_number(fee));
+    m.insert("min_fee", u64_number(min_fee));
+    m.insert("fv", u64_number(last_round));
+    m.insert("lv", u64_number(lv));
+    m.insert("gh", syn_bytes(gh));
+    m.insert("gen", syn_text(gen));
     Ok(syn_map(m))
 }
 
@@ -2375,7 +2375,7 @@ mod tests {
     const VEC2_HASH: &str = "2ab8b14a5a355473033a5675f879e30ef1fccc7210e3d5913a0f37fc0a9d0569";
 
     fn map(pairs: Vec<(&str, SynValue)>) -> SynValue {
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }

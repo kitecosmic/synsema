@@ -11,6 +11,7 @@
 //!
 //! Parsear, formatear, operar y comparar son PUROS; sólo `now()` pide la capability `time`.
 
+use crate::types::SynMap;
 use std::cmp::Ordering;
 use std::fmt;
 use std::rc::Rc;
@@ -587,25 +588,25 @@ pub fn binop(l: &SynValue, op: &str, r: &SynValue) -> Option<Result<SynValue, Co
 
 /// Partes de un `date`/`datetime` (en su zona) o de un timestamp (UTC).
 pub fn parts(t: &Temporal) -> Option<SynValue> {
-    let mut m = indexmap::IndexMap::new();
+    let mut m = SynMap::new();
     match t {
         Temporal::Date(d) => {
-            m.insert("year".to_string(), syn_int(d.year() as i64));
-            m.insert("month".to_string(), syn_int(d.month() as i64));
-            m.insert("day".to_string(), syn_int(d.day() as i64));
-            m.insert("weekday".to_string(), syn_int(d.weekday().number_from_monday() as i64));
-            m.insert("yearday".to_string(), syn_int(d.ordinal() as i64));
+            m.insert("year", syn_int(d.year() as i64));
+            m.insert("month", syn_int(d.month() as i64));
+            m.insert("day", syn_int(d.day() as i64));
+            m.insert("weekday", syn_int(d.weekday().number_from_monday() as i64));
+            m.insert("yearday", syn_int(d.ordinal() as i64));
         }
         Temporal::DateTime(dt) => {
-            m.insert("year".to_string(), syn_int(dt.year() as i64));
-            m.insert("month".to_string(), syn_int(dt.month() as i64));
-            m.insert("day".to_string(), syn_int(dt.day() as i64));
-            m.insert("hour".to_string(), syn_int(dt.hour() as i64));
-            m.insert("minute".to_string(), syn_int(dt.minute() as i64));
-            m.insert("second".to_string(), syn_int(dt.second() as i64));
-            m.insert("weekday".to_string(), syn_int(dt.weekday().number_from_monday() as i64));
-            m.insert("yearday".to_string(), syn_int(dt.ordinal() as i64));
-            m.insert("zone".to_string(), syn_text(dt.timezone().name()));
+            m.insert("year", syn_int(dt.year() as i64));
+            m.insert("month", syn_int(dt.month() as i64));
+            m.insert("day", syn_int(dt.day() as i64));
+            m.insert("hour", syn_int(dt.hour() as i64));
+            m.insert("minute", syn_int(dt.minute() as i64));
+            m.insert("second", syn_int(dt.second() as i64));
+            m.insert("weekday", syn_int(dt.weekday().number_from_monday() as i64));
+            m.insert("yearday", syn_int(dt.ordinal() as i64));
+            m.insert("zone", syn_text(dt.timezone().name()));
         }
         Temporal::Duration(_) => return None,
     }

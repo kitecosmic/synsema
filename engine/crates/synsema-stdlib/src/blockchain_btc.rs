@@ -31,11 +31,11 @@
 //!   aux = 0). El tweak de taproot (BIP-341 key-path, merkle vacío) vive DENTRO
 //!   de `btc_address`/`schnorr_sign(…, "taproot")` — el usuario jamás tweakea.
 
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use bech32::{segwit, Hrp};
-use indexmap::IndexMap;
 use k256::ecdsa::signature::hazmat::PrehashVerifier;
 use k256::ecdsa::{Signature as EcSignature, SigningKey as EcSigningKey, VerifyingKey};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
@@ -661,10 +661,10 @@ fn btc_address_decode(args: &[SynValue]) -> Result<SynValue, Control> {
         }
     };
     let dec = decode_address(&s, F)?;
-    let mut m = IndexMap::new();
-    m.insert("kind".to_string(), syn_text(dec.kind.as_str()));
-    m.insert("network".to_string(), syn_text(dec.net_label));
-    m.insert("program".to_string(), syn_bytes(dec.program));
+    let mut m = SynMap::new();
+    m.insert("kind", syn_text(dec.kind.as_str()));
+    m.insert("network", syn_text(dec.net_label));
+    m.insert("program", syn_bytes(dec.program));
     m.insert(
         "encoding".to_string(),
         syn_text(if dec.base58 {
@@ -1165,9 +1165,9 @@ fn txid_field(v: Option<&SynValue>, what: &str, fname: &str) -> Result<[u8; 32],
     }
 }
 
-fn map_of(v: &SynValue, what: &str, fname: &str) -> Result<IndexMap<String, SynValue>, Control> {
+fn map_of(v: &SynValue, what: &str, fname: &str) -> Result<SynMap, Control> {
     match v {
-        SynValue::Map(m) => Ok(m.borrow().clone()),
+        SynValue::Map(m) => Ok(m.borrow().to_map()),
         other => Err(err(format!(
             "{}: {} must be a map, got {}",
             fname,
@@ -1192,7 +1192,7 @@ fn list_of(v: Option<&SynValue>, what: &str, fname: &str) -> Result<Vec<SynValue
 
 /// Construye y VALIDA el plan completo (G28 + G29). Compartido por `btc_tx`,
 /// `btc_tx_raw` y `psbt_encode` — una única implementación de las guardas.
-fn build_plan(params: &IndexMap<String, SynValue>, fname: &str) -> Result<Plan, Control> {
+fn build_plan(params: &MapObj, fname: &str) -> Result<Plan, Control> {
     for k in params.keys() {
         match k.as_str() {
             "inputs" | "outputs" | "fee" | "network" | "rbf" | "locktime" | "allow_absurd_fee" => {}
@@ -1553,13 +1553,13 @@ impl Plan {
     fn to_map(&self, fname: &str) -> Result<SynValue, Control> {
         let digests = self.digests(fname)?;
         let vsize = self.estimate_vsize();
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         m.insert(
             "digests".to_string(),
             syn_list(digests.into_iter().map(|d| syn_bytes(d.to_vec())).collect()),
         );
-        m.insert("fee".to_string(), syn_int(self.fee as i64));
-        m.insert("vsize".to_string(), syn_int(vsize as i64));
+        m.insert("fee", syn_int(self.fee as i64));
+        m.insert("vsize", syn_int(vsize as i64));
         m.insert(
             "fee_rate".to_string(),
             syn_number(Number::Float(self.fee as f64 / vsize as f64)),
@@ -1572,42 +1572,42 @@ impl Plan {
             "total_out".to_string(),
             syn_int(self.outputs.iter().map(|o| o.amount).sum::<u64>() as i64),
         );
-        m.insert("network".to_string(), syn_text(self.network.as_str()));
-        m.insert("rbf".to_string(), syn_bool(self.rbf));
-        m.insert("locktime".to_string(), syn_int(self.locktime as i64));
-        m.insert("version".to_string(), syn_int(TX_VERSION as i64));
+        m.insert("network", syn_text(self.network.as_str()));
+        m.insert("rbf", syn_bool(self.rbf));
+        m.insert("locktime", syn_int(self.locktime as i64));
+        m.insert("version", syn_int(TX_VERSION as i64));
         if self.allow_absurd_fee {
-            m.insert("allow_absurd_fee".to_string(), syn_bool(true));
+            m.insert("allow_absurd_fee", syn_bool(true));
         }
         let inputs = self
             .inputs
             .iter()
             .map(|i| {
-                let mut im = IndexMap::new();
-                im.insert("txid".to_string(), syn_text(hex_encode(&i.txid_display)));
-                im.insert("vout".to_string(), syn_int(i.vout as i64));
-                im.insert("amount".to_string(), syn_int(i.amount as i64));
-                im.insert("address".to_string(), syn_text(i.address.clone()));
-                im.insert("kind".to_string(), syn_text(i.kind.as_str()));
+                let mut im = SynMap::new();
+                im.insert("txid", syn_text(hex_encode(&i.txid_display)));
+                im.insert("vout", syn_int(i.vout as i64));
+                im.insert("amount", syn_int(i.amount as i64));
+                im.insert("address", syn_text(i.address.clone()));
+                im.insert("kind", syn_text(i.kind.as_str()));
                 if let Some(pk) = &i.pubkey {
-                    im.insert("pubkey".to_string(), syn_bytes(pk.clone()));
+                    im.insert("pubkey", syn_bytes(pk.clone()));
                 }
                 syn_map(im)
             })
             .collect();
-        m.insert("inputs".to_string(), syn_list(inputs));
+        m.insert("inputs", syn_list(inputs));
         let outputs = self
             .outputs
             .iter()
             .map(|o| {
-                let mut om = IndexMap::new();
-                om.insert("address".to_string(), syn_text(o.address.clone()));
-                om.insert("amount".to_string(), syn_int(o.amount as i64));
-                om.insert("kind".to_string(), syn_text(o.kind.as_str()));
+                let mut om = SynMap::new();
+                om.insert("address", syn_text(o.address.clone()));
+                om.insert("amount", syn_int(o.amount as i64));
+                om.insert("kind", syn_text(o.kind.as_str()));
                 syn_map(om)
             })
             .collect();
-        m.insert("outputs".to_string(), syn_list(outputs));
+        m.insert("outputs", syn_list(outputs));
         Ok(syn_map(m))
     }
 }
@@ -1615,8 +1615,8 @@ impl Plan {
 /// Reconstruye los params del eco de `btc_tx` (misma forma) y RE-VALIDA con
 /// `build_plan` — un map manipulado entre `btc_tx` y `btc_tx_raw` vuelve a pasar
 /// por TODAS las guardas (G28 no se puede sortear editando el eco).
-fn plan_from_map(m: &IndexMap<String, SynValue>, fname: &str) -> Result<Plan, Control> {
-    let mut params = IndexMap::new();
+fn plan_from_map(m: &MapObj, fname: &str) -> Result<Plan, Control> {
+    let mut params = SynMap::new();
     for key in ["inputs", "outputs", "fee", "network", "rbf", "locktime", "allow_absurd_fee"] {
         if let Some(v) = m.get(key) {
             params.insert(key.to_string(), v.clone());
@@ -1636,7 +1636,7 @@ fn plan_from_map(m: &IndexMap<String, SynValue>, fname: &str) -> Result<Plan, Co
                 .iter()
                 .map(|item| {
                     if let SynValue::Map(im) = item {
-                        let mut c = im.borrow().clone();
+                        let mut c = im.borrow().to_map();
                         for e in extra {
                             c.shift_remove(*e);
                         }
@@ -1652,10 +1652,10 @@ fn plan_from_map(m: &IndexMap<String, SynValue>, fname: &str) -> Result<Plan, Co
         }
     };
     if let Some(v) = params.get("inputs").cloned() {
-        params.insert("inputs".to_string(), strip(&v, &["kind"]));
+        params.insert("inputs", strip(&v, &["kind"]));
     }
     if let Some(v) = params.get("outputs").cloned() {
-        params.insert("outputs".to_string(), strip(&v, &["kind"]));
+        params.insert("outputs", strip(&v, &["kind"]));
     }
     build_plan(&params, fname)
 }
@@ -2095,10 +2095,10 @@ fn psbt_decode(args: &[SynValue]) -> Result<SynValue, Control> {
     };
     let network = Network::parse(args.get(1), F)?;
     let psbt = parse_psbt(&text, F)?;
-    let mut m = IndexMap::new();
-    m.insert("txid".to_string(), syn_text(txid_of(&psbt.tx)));
-    m.insert("version".to_string(), syn_int(psbt.tx.version as i64));
-    m.insert("locktime".to_string(), syn_int(psbt.tx.locktime as i64));
+    let mut m = SynMap::new();
+    m.insert("txid", syn_text(txid_of(&psbt.tx)));
+    m.insert("version", syn_int(psbt.tx.version as i64));
+    m.insert("locktime", syn_int(psbt.tx.locktime as i64));
     let mut total_in: Option<u64> = Some(0);
     let mut complete = true;
     let inputs: Vec<SynValue> = psbt
@@ -2107,20 +2107,20 @@ fn psbt_decode(args: &[SynValue]) -> Result<SynValue, Control> {
         .iter()
         .zip(&psbt.inputs)
         .map(|(raw, pin)| {
-            let mut im = IndexMap::new();
+            let mut im = SynMap::new();
             let mut display = raw.prev_le;
             display.reverse();
-            im.insert("txid".to_string(), syn_text(hex_encode(&display)));
-            im.insert("vout".to_string(), syn_int(raw.vout as i64));
-            im.insert("sequence".to_string(), syn_int(raw.sequence as i64));
+            im.insert("txid", syn_text(hex_encode(&display)));
+            im.insert("vout", syn_int(raw.vout as i64));
+            im.insert("sequence", syn_int(raw.sequence as i64));
             match &pin.utxo {
                 Some((amount, script)) => {
-                    im.insert("amount".to_string(), syn_int(*amount as i64));
+                    im.insert("amount", syn_int(*amount as i64));
                     total_in = total_in.map(|t| t + amount);
                     if let Some((kind, program)) = classify_script(script) {
-                        im.insert("kind".to_string(), syn_text(kind.as_str()));
+                        im.insert("kind", syn_text(kind.as_str()));
                         if let Ok(a) = address_of(kind, &program, network) {
-                            im.insert("address".to_string(), syn_text(a));
+                            im.insert("address", syn_text(a));
                         }
                     }
                 }
@@ -2135,45 +2135,45 @@ fn psbt_decode(args: &[SynValue]) -> Result<SynValue, Control> {
             if !signed {
                 complete = false;
             }
-            im.insert("signed".to_string(), syn_bool(signed));
+            im.insert("signed", syn_bool(signed));
             if let Some(sh) = pin.sighash_type {
-                im.insert("sighash".to_string(), syn_int(sh as i64));
+                im.insert("sighash", syn_int(sh as i64));
             }
             syn_map(im)
         })
         .collect();
-    m.insert("inputs".to_string(), syn_list(inputs));
+    m.insert("inputs", syn_list(inputs));
     let total_out: u64 = psbt.tx.outputs.iter().map(|o| o.amount).sum();
     let outputs: Vec<SynValue> = psbt
         .tx
         .outputs
         .iter()
         .map(|o| {
-            let mut om = IndexMap::new();
-            om.insert("amount".to_string(), syn_int(o.amount as i64));
+            let mut om = SynMap::new();
+            om.insert("amount", syn_int(o.amount as i64));
             match classify_script(&o.script) {
                 Some((kind, program)) => {
-                    om.insert("kind".to_string(), syn_text(kind.as_str()));
+                    om.insert("kind", syn_text(kind.as_str()));
                     if let Ok(a) = address_of(kind, &program, network) {
-                        om.insert("address".to_string(), syn_text(a));
+                        om.insert("address", syn_text(a));
                     }
                 }
                 None => {
-                    om.insert("script".to_string(), syn_bytes(o.script.clone()));
+                    om.insert("script", syn_bytes(o.script.clone()));
                 }
             }
             syn_map(om)
         })
         .collect();
-    m.insert("outputs".to_string(), syn_list(outputs));
-    m.insert("total_out".to_string(), syn_int(total_out as i64));
+    m.insert("outputs", syn_list(outputs));
+    m.insert("total_out", syn_int(total_out as i64));
     match total_in {
         Some(tin) => {
-            m.insert("total_in".to_string(), syn_int(tin as i64));
+            m.insert("total_in", syn_int(tin as i64));
             // El fee IMPLÍCITO del PSBT — el número que se AUDITA antes de firmar.
             match tin.checked_sub(total_out) {
                 Some(fee) => {
-                    m.insert("fee".to_string(), syn_int(fee as i64));
+                    m.insert("fee", syn_int(fee as i64));
                 }
                 None => {
                     return Err(err(format!(
@@ -2184,11 +2184,11 @@ fn psbt_decode(args: &[SynValue]) -> Result<SynValue, Control> {
             }
         }
         None => {
-            m.insert("total_in".to_string(), SynValue::Nothing);
-            m.insert("fee".to_string(), SynValue::Nothing);
+            m.insert("total_in", SynValue::Nothing);
+            m.insert("fee", SynValue::Nothing);
         }
     }
-    m.insert("complete".to_string(), syn_bool(complete));
+    m.insert("complete", syn_bool(complete));
     Ok(syn_map(m))
 }
 
@@ -2431,7 +2431,7 @@ mod tests {
     }
 
     fn map(pairs: Vec<(&str, SynValue)>) -> SynValue {
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }
@@ -2990,8 +2990,8 @@ mod tests {
         // rbf false → 0xFFFFFFFE; locktime viaja al serializado.
         let params = vec_w_params();
         if let SynValue::Map(m) = &params {
-            m.borrow_mut().insert("rbf".to_string(), syn_bool(false));
-            m.borrow_mut().insert("locktime".to_string(), syn_int(850_000));
+            m.borrow_mut().insert("rbf", syn_bool(false));
+            m.borrow_mut().insert("locktime", syn_int(850_000));
         }
         let tx = ok(btc_tx(&[params]));
         let digests = get_list(&tx, "digests");
@@ -3026,7 +3026,7 @@ mod tests {
                 ("address", syn_text("1JaUQDVNRdhfNsVncGkXedaPSM5Gc54Hso")),
                 ("amount", syn_int(70000)),
             ])]);
-            m.borrow_mut().insert("outputs".to_string(), outs);
+            m.borrow_mut().insert("outputs", outs);
         }
         let e = errmsg(btc_tx(&[params]));
         assert!(e.contains("29500") && e.contains("change output") && e.contains("G28"), "{}", e);
@@ -3036,7 +3036,7 @@ mod tests {
     fn g28_unfunded_names_exact_difference() {
         let params = vec_w_params();
         if let SynValue::Map(m) = &params {
-            m.borrow_mut().insert("fee".to_string(), syn_int(600));
+            m.borrow_mut().insert("fee", syn_int(600));
         }
         let e = errmsg(btc_tx(&[params]));
         assert!(e.contains("100") && e.contains("cannot be funded"), "{}", e);
@@ -3056,7 +3056,7 @@ mod tests {
                     ("amount", syn_int(200)), // bajo el dust de p2wpkh (294)
                 ]),
             ]);
-            m.borrow_mut().insert("outputs".to_string(), outs);
+            m.borrow_mut().insert("outputs", outs);
         }
         let e = errmsg(btc_tx(&[params]));
         assert!(e.contains("dust") && e.contains("294"), "{}", e);
@@ -3097,7 +3097,7 @@ mod tests {
                 ("address", syn_text("1JaUQDVNRdhfNsVncGkXedaPSM5Gc54Hso")),
                 ("amount", syn_number(Number::Float(0.1))),
             ])]);
-            m.borrow_mut().insert("outputs".to_string(), outs);
+            m.borrow_mut().insert("outputs", outs);
         }
         let e = errmsg(btc_tx(&[params]));
         assert!(e.contains("100_000_000") && e.contains("sats"), "{}", e);
@@ -3112,7 +3112,7 @@ mod tests {
                 ("address", syn_text("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx")),
                 ("amount", syn_int(99500)),
             ])]);
-            m.borrow_mut().insert("outputs".to_string(), outs);
+            m.borrow_mut().insert("outputs", outs);
         }
         let e = errmsg(btc_tx(&[params]));
         assert!(e.contains("testnet") && e.contains("mainnet"), "{}", e);
@@ -3122,7 +3122,7 @@ mod tests {
     fn sighash_param_gets_directed_error() {
         let params = vec_w_params();
         if let SynValue::Map(m) = &params {
-            m.borrow_mut().insert("sighash".to_string(), syn_int(2));
+            m.borrow_mut().insert("sighash", syn_int(2));
         }
         let e = errmsg(btc_tx(&[params]));
         assert!(e.contains("SIGHASH_ALL") && e.contains("out of scope"), "{}", e);
@@ -3171,12 +3171,12 @@ mod tests {
         let params = vec_w_params();
         if let SynValue::Map(m) = &params {
             let mut in0 = match &get_list(&params, "inputs")[0] {
-                SynValue::Map(im) => im.borrow().clone(),
+                SynValue::Map(im) => im.borrow().to_map(),
                 _ => panic!(),
             };
             in0.shift_remove("pubkey");
             let in1 = get_list(&params, "inputs")[1].clone();
-            m.borrow_mut().insert("inputs".to_string(), syn_list(vec![syn_map(in0), in1]));
+            m.borrow_mut().insert("inputs", syn_list(vec![syn_map(in0), in1]));
         }
         let e = errmsg(btc_tx(&[params]));
         assert!(e.contains("pubkey"), "{}", e);
@@ -3184,12 +3184,12 @@ mod tests {
         let params = vec_w_params();
         if let SynValue::Map(m) = &params {
             let mut in0 = match &get_list(&params, "inputs")[0] {
-                SynValue::Map(im) => im.borrow().clone(),
+                SynValue::Map(im) => im.borrow().to_map(),
                 _ => panic!(),
             };
-            in0.insert("pubkey".to_string(), syn_bytes(hx(PUB_84_1)));
+            in0.insert("pubkey", syn_bytes(hx(PUB_84_1)));
             let in1 = get_list(&params, "inputs")[1].clone();
-            m.borrow_mut().insert("inputs".to_string(), syn_list(vec![syn_map(in0), in1]));
+            m.borrow_mut().insert("inputs", syn_list(vec![syn_map(in0), in1]));
         }
         let e = errmsg(btc_tx(&[params]));
         assert!(e.contains("does not hash"), "{}", e);

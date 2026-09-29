@@ -29,6 +29,7 @@
 //! Pubkey.find_program_address([...], program); Message.new_with_blockhash(...)
 //! ```
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -457,9 +458,9 @@ fn keystore_export_roundtrip_and_v3_shape() {
     let mut i = interp_full();
     let key = syn_secret_bytes("HOT", hx(KS_KEY));
     // scrypt liviano para que el test vuele; el default (sin opts) es n=262144 (Geth).
-    let mut opts = indexmap::IndexMap::new();
-    opts.insert("kdf".to_string(), syn_text("scrypt"));
-    opts.insert("n".to_string(), syn_int(1024));
+    let mut opts = SynMap::new();
+    opts.insert("kdf", syn_text("scrypt"));
+    opts.insert("n", syn_int(1024));
     let json = ok_text(call(&mut i, "keystore_export",
         vec![key.clone(), syn_secret("PASS", "s3cret"), syn_map(opts)]));
     let doc: serde_json::Value = serde_json::from_str(&json).expect("JSON válido");
@@ -477,9 +478,9 @@ fn keystore_export_roundtrip_and_v3_shape() {
         vec![syn_text(json.as_str()), syn_secret("PASS", "wrong")]));
     assert!(e.contains("wrong passphrase"), "{}", e);
     // pbkdf2 export round-trip.
-    let mut opts2 = indexmap::IndexMap::new();
-    opts2.insert("kdf".to_string(), syn_text("pbkdf2"));
-    opts2.insert("c".to_string(), syn_int(2048));
+    let mut opts2 = SynMap::new();
+    opts2.insert("kdf", syn_text("pbkdf2"));
+    opts2.insert("c", syn_int(2048));
     let json2 = ok_text(call(&mut i, "keystore_export",
         vec![key, syn_secret("PASS", "s3cret"), syn_map(opts2)]));
     let back2 = ok_secret(call(&mut i, "keystore_import",
@@ -639,25 +640,25 @@ fn spl_transfer_full_message_matches_solders() {
     let data = ok(call(&mut i, "spl_transfer_checked_data",
         vec![syn_int(1_000_000), syn_int(6)]));
     let account = |pk: SynValue, signer: bool, writable: bool| {
-        let mut m = indexmap::IndexMap::new();
-        m.insert("pubkey".to_string(), pk);
-        m.insert("signer".to_string(), SynValue::Bool(signer));
-        m.insert("writable".to_string(), SynValue::Bool(writable));
+        let mut m = SynMap::new();
+        m.insert("pubkey", pk);
+        m.insert("signer", SynValue::Bool(signer));
+        m.insert("writable", SynValue::Bool(writable));
         syn_map(m)
     };
-    let mut ix = indexmap::IndexMap::new();
-    ix.insert("program".to_string(), syn_text(TOKEN_PROGRAM));
-    ix.insert("accounts".to_string(), syn_list(vec![
+    let mut ix = SynMap::new();
+    ix.insert("program", syn_text(TOKEN_PROGRAM));
+    ix.insert("accounts", syn_list(vec![
         account(src, false, true),
         account(mint, false, false),
         account(dst, false, true),
         account(owner.clone(), true, false),
     ]));
-    ix.insert("data".to_string(), data);
-    let mut params = indexmap::IndexMap::new();
-    params.insert("fee_payer".to_string(), owner);
-    params.insert("recent_blockhash".to_string(), syn_bytes(vec![7u8; 32]));
-    params.insert("instructions".to_string(), syn_list(vec![syn_map(ix)]));
+    ix.insert("data", data);
+    let mut params = SynMap::new();
+    params.insert("fee_payer", owner);
+    params.insert("recent_blockhash", syn_bytes(vec![7u8; 32]));
+    params.insert("instructions", syn_list(vec![syn_map(ix)]));
     let msg = ok_bytes(call(&mut i, "solana_tx", vec![syn_map(params)]));
     assert_eq!(hex_encode(&msg), SPL_MSG_HEX, "transfer SPL byte a byte contra solders");
 }

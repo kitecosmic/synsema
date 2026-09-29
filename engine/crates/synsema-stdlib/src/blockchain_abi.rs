@@ -16,6 +16,7 @@
 //!   (`"transfer(address,uint256)"`). Los alias `uint`/`int` se normalizan a
 //!   `uint256`/`int256` (una sola forma de selector).
 
+use synsema_core::types::SynMap;
 use num_bigint::{BigInt, Sign};
 use sha3::{Digest, Keccak256};
 use std::fmt;
@@ -1067,7 +1068,7 @@ fn json_abi_type(input: &SynValue, path: &str, fname: &str, depth: usize) -> Res
         return Err(err(format!("{}: the ABI fragment is nested too deep", fname)));
     }
     let m = match input {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         other => return Err(err(format!("{}: {} must be a map, got {}", fname, path, other.type_name()))),
     };
     let ty = match m.get("type") {
@@ -1092,7 +1093,7 @@ fn json_abi_type(input: &SynValue, path: &str, fname: &str, depth: usize) -> Res
 /// `{name, inputs: [{name, type, indexed, components?}], anonymous?}`.
 fn event_from_fragment(v: &SynValue, fname: &str) -> Result<EventDef, Control> {
     let m = match v {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         other => {
             return Err(err(format!(
                 "{}: the event must be its ABI fragment (a map with name and inputs, as in the compiler's ABI JSON), got {}",
@@ -1174,7 +1175,7 @@ fn abi_decode_log(args: &[SynValue]) -> Result<SynValue, Control> {
     const F: &str = "abi_decode_log";
     let ev = event_from_fragment(arg(args, 0, F)?, F)?;
     let log = match arg(args, 1, F)? {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         other => return Err(err(format!("{}: the log must be a map with topics and data, got {}", F, other.type_name()))),
     };
     let topics = match log.get("topics") {
@@ -1223,7 +1224,7 @@ fn abi_decode_log(args: &[SynValue]) -> Result<SynValue, Control> {
         )));
     }
     data_vals.reverse();
-    let mut out = indexmap::IndexMap::new();
+    let mut out = SynMap::new();
     for inp in &ev.inputs {
         let v = if inp.indexed {
             let word = topic_bytes(&topics[ti], ti, F)?;
@@ -1286,7 +1287,7 @@ type StructDefs = indexmap::IndexMap<String, Vec<(String, AbiType)>>;
 fn parse_types(v: &SynValue) -> Result<StructDefs, Control> {
     const F: &str = "eip712_digest";
     let m = match v {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         other => {
             return Err(err(format!(
                 "{}: types must be a map of struct definitions, got {}",
@@ -1324,7 +1325,7 @@ fn parse_types(v: &SynValue) -> Result<StructDefs, Control> {
         let mut parsed = Vec::with_capacity(list.len());
         for (i, f) in list.iter().enumerate() {
             let fm = match f {
-                SynValue::Map(fm) => fm.borrow().clone(),
+                SynValue::Map(fm) => fm.borrow().to_map(),
                 other => {
                     return Err(err(format!(
                         "{}: field {} of type {:?} must be a map with \"name\" and \"type\", got {}",
@@ -1371,7 +1372,7 @@ fn parse_types(v: &SynValue) -> Result<StructDefs, Control> {
             }
             parsed.push((fname_s, ft));
         }
-        defs.insert(tname.clone(), parsed);
+        defs.insert(tname.to_string(), parsed);
     }
     Ok(defs)
 }
@@ -1535,7 +1536,7 @@ fn hash_struct(
         err(format!("{}: undefined type {:?}", F, name))
     })?;
     let m = match v {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         other => {
             return Err(err(format!(
                 "{}: {} must be a map for type {:?}, got {}",
@@ -1574,7 +1575,7 @@ fn hash_struct(
 fn domain_separator(domain: &SynValue, defs: &StructDefs) -> Result<[u8; 32], Control> {
     const F: &str = "eip712_digest";
     let m = match domain {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         other => {
             return Err(err(format!(
                 "{}: domain must be a map, got {}",
@@ -1710,7 +1711,6 @@ pub(crate) fn register(interp: &Interpreter) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indexmap::IndexMap;
     use synsema_core::bytesutil::hex_encode;
     use synsema_core::types::{syn_int, syn_map};
 
@@ -1723,7 +1723,7 @@ mod tests {
     }
 
     fn m(pairs: &[(&str, SynValue)]) -> SynValue {
-        let mut im = IndexMap::new();
+        let mut im = SynMap::new();
         for (k, v) in pairs {
             im.insert(k.to_string(), v.clone());
         }

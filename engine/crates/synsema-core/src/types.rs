@@ -16,7 +16,6 @@ use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 
-use indexmap::IndexMap;
 use ndarray::ArrayD;
 use num_complex::Complex64;
 
@@ -28,7 +27,7 @@ use crate::secret::{constant_time_eq, SecretInner};
 use crate::tokens::SourceLocation;
 
 pub type ListRef = Rc<RefCell<Vec<SynValue>>>;
-pub type MapRef = Rc<RefCell<IndexMap<String, SynValue>>>;
+pub use crate::synmap::{Key, MapObj, MapRef, SynMap};
 
 #[derive(Clone)]
 pub enum SynValue {
@@ -478,8 +477,8 @@ pub fn syn_nothing() -> SynValue {
 pub fn syn_list(items: Vec<SynValue>) -> SynValue {
     SynValue::List(Rc::new(RefCell::new(items)))
 }
-pub fn syn_map(m: IndexMap<String, SynValue>) -> SynValue {
-    SynValue::Map(Rc::new(RefCell::new(m)))
+pub fn syn_map(m: SynMap) -> SynValue {
+    SynValue::Map(m.into_ref())
 }
 /// Construye un `secret` opaco a partir de su nombre de origen y su plaintext.
 pub fn syn_secret(name: impl Into<String>, plaintext: impl Into<String>) -> SynValue {
@@ -553,7 +552,7 @@ pub fn to_send(v: &SynValue) -> SendValue {
         SynValue::Nothing => SendValue::Nothing,
         SynValue::List(l) => SendValue::List(l.borrow().iter().map(to_send).collect()),
         SynValue::Map(m) => {
-            SendValue::Map(m.borrow().iter().map(|(k, v)| (k.clone(), to_send(v))).collect())
+            SendValue::Map(m.borrow().iter().map(|(k, v)| (k.to_string(), to_send(v))).collect())
         }
         SynValue::Builtin(b) => match crate::rng::snapshot(b) {
             // Snapshot de GLOBALES (serve, workers): un generador de nivel superior no cruza como
@@ -581,7 +580,7 @@ pub fn to_send(v: &SynValue) -> SendValue {
                 ("value".to_string(), to_send(value)),
             ]),
             ServerValue::Node(m) => {
-                SendValue::Map(m.borrow().iter().map(|(k, v)| (k.clone(), to_send(v))).collect())
+                SendValue::Map(m.borrow().iter().map(|(k, v)| (k.to_string(), to_send(v))).collect())
             }
             ServerValue::Content(inner) => to_send(inner),
             ServerValue::Paged(_) => SendValue::Text("{paged}".to_string()),
@@ -625,7 +624,7 @@ pub fn from_send(v: &SendValue) -> SynValue {
         SendValue::Nothing => SynValue::Nothing,
         SendValue::List(items) => syn_list(items.iter().map(from_send).collect()),
         SendValue::Map(pairs) => {
-            let mut m = IndexMap::new();
+            let mut m = SynMap::new();
             for (k, v) in pairs {
                 m.insert(k.clone(), from_send(v));
             }

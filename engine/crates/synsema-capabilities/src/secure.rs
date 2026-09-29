@@ -8,6 +8,7 @@
 //! Capa 5: read_file/write_file/run hacen la op real (filesystem/proceso). El HTTP
 //! (fetch/http_*) vive en synsema-stdlib/http.rs, gateado por `net`.
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
@@ -16,7 +17,6 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Datelike, NaiveDateTime, Timelike, Utc};
-use indexmap::IndexMap;
 use regex::RegexBuilder;
 
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
@@ -400,20 +400,20 @@ pub fn register_pure_fs(interp: &Interpreter, hint: &'static str) {
     }));
     interp.register_builtin("file_info", 1, Rc::new(move |_i, args, _loc| {
         let path = normalize_path(&raw_str(arg(args, 0)?));
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         match synsema_core::bundle::get(&path) {
             Some(bytes) => {
-                m.insert("exists".to_string(), syn_bool(true));
-                m.insert("is_dir".to_string(), syn_bool(false));
-                m.insert("size".to_string(), syn_int(bytes.len() as i64));
-                m.insert("modified".to_string(), SynValue::Nothing);
-                m.insert("bundled".to_string(), syn_bool(true));
+                m.insert("exists", syn_bool(true));
+                m.insert("is_dir", syn_bool(false));
+                m.insert("size", syn_int(bytes.len() as i64));
+                m.insert("modified", SynValue::Nothing);
+                m.insert("bundled", syn_bool(true));
             }
             None => {
-                m.insert("exists".to_string(), syn_bool(false));
-                m.insert("is_dir".to_string(), syn_bool(false));
-                m.insert("size".to_string(), syn_int(0));
-                m.insert("modified".to_string(), SynValue::Nothing);
+                m.insert("exists", syn_bool(false));
+                m.insert("is_dir", syn_bool(false));
+                m.insert("size", syn_int(0));
+                m.insert("modified", SynValue::Nothing);
             }
         }
         Ok(syn_map(m))
@@ -449,10 +449,10 @@ pub fn register_pure_fs(interp: &Interpreter, hint: &'static str) {
         }
         seen.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(syn_list(seen.into_iter().map(|(name, is_dir, size)| {
-            let mut m = IndexMap::new();
-            m.insert("name".to_string(), syn_text(name));
-            m.insert("is_dir".to_string(), syn_bool(is_dir));
-            m.insert("size".to_string(), syn_int(size));
+            let mut m = SynMap::new();
+            m.insert("name", syn_text(name));
+            m.insert("is_dir", syn_bool(is_dir));
+            m.insert("size", syn_int(size));
             syn_map(m)
         }).collect()))
     }));
@@ -581,10 +581,10 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                         let items: Vec<SynValue> = seen
                             .into_iter()
                             .map(|(name, is_dir, size)| {
-                                let mut m = IndexMap::new();
-                                m.insert("name".to_string(), syn_text(name));
-                                m.insert("is_dir".to_string(), syn_bool(is_dir));
-                                m.insert("size".to_string(), syn_int(size));
+                                let mut m = SynMap::new();
+                                m.insert("name", syn_text(name));
+                                m.insert("is_dir", syn_bool(is_dir));
+                                m.insert("size", syn_int(size));
                                 syn_map(m)
                             })
                             .collect();
@@ -615,10 +615,10 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 let items = entries
                     .into_iter()
                     .map(|(name, is_dir, size)| {
-                        let mut m = IndexMap::new();
-                        m.insert("name".to_string(), syn_text(name));
-                        m.insert("is_dir".to_string(), syn_bool(is_dir));
-                        m.insert("size".to_string(), syn_int(size));
+                        let mut m = SynMap::new();
+                        m.insert("name", syn_text(name));
+                        m.insert("is_dir", syn_bool(is_dir));
+                        m.insert("size", syn_int(size));
                         syn_map(m)
                     })
                     .collect();
@@ -637,17 +637,17 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
             Rc::new(move |_i, args, _loc| {
                 let path = match locate_for_read(&caps, &raw_str(arg(args, 0)?), "file_info()")? {
                     Located::Bundled(_, bytes) => {
-                        let mut m = IndexMap::new();
-                        m.insert("exists".to_string(), syn_bool(true));
-                        m.insert("is_dir".to_string(), syn_bool(false));
-                        m.insert("size".to_string(), syn_int(bytes.len() as i64));
-                        m.insert("modified".to_string(), SynValue::Nothing);
-                        m.insert("bundled".to_string(), syn_bool(true));
+                        let mut m = SynMap::new();
+                        m.insert("exists", syn_bool(true));
+                        m.insert("is_dir", syn_bool(false));
+                        m.insert("size", syn_int(bytes.len() as i64));
+                        m.insert("modified", SynValue::Nothing);
+                        m.insert("bundled", syn_bool(true));
                         return Ok(syn_map(m));
                     }
                     Located::Disk(p) => p,
                 };
-                let mut m = IndexMap::new();
+                let mut m = SynMap::new();
                 match std::fs::metadata(&path) {
                     Ok(md) => {
                         let modified = md
@@ -657,19 +657,19 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                             .map(|d| syn_int(d.as_secs() as i64))
                             .unwrap_or(SynValue::Nothing);
                         let is_dir = md.is_dir();
-                        m.insert("exists".to_string(), syn_bool(true));
-                        m.insert("is_dir".to_string(), syn_bool(is_dir));
+                        m.insert("exists", syn_bool(true));
+                        m.insert("is_dir", syn_bool(is_dir));
                         m.insert(
                             "size".to_string(),
                             syn_int(if is_dir { 0 } else { md.len() as i64 }),
                         );
-                        m.insert("modified".to_string(), modified);
+                        m.insert("modified", modified);
                     }
                     Err(_) => {
-                        m.insert("exists".to_string(), syn_bool(false));
-                        m.insert("is_dir".to_string(), syn_bool(false));
-                        m.insert("size".to_string(), syn_int(0));
-                        m.insert("modified".to_string(), SynValue::Nothing);
+                        m.insert("exists", syn_bool(false));
+                        m.insert("is_dir", syn_bool(false));
+                        m.insert("size", syn_int(0));
+                        m.insert("modified", SynValue::Nothing);
                     }
                 }
                 Ok(syn_map(m))
@@ -785,11 +785,11 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                                 line.clone()
                             };
                             let col = prefix.get(..b).map(|p| p.chars().count()).unwrap_or(0) + 1;
-                            let mut m = IndexMap::new();
-                            m.insert("file".to_string(), syn_text(f.clone()));
-                            m.insert("line".to_string(), syn_int((i as i64) + 1));
-                            m.insert("col".to_string(), syn_int(col as i64));
-                            m.insert("text".to_string(), syn_text(line.clone()));
+                            let mut m = SynMap::new();
+                            m.insert("file", syn_text(f.clone()));
+                            m.insert("line", syn_int((i as i64) + 1));
+                            m.insert("col", syn_int(col as i64));
+                            m.insert("text", syn_text(line.clone()));
                             out_matches.push(syn_map(m));
                             if let Some(max) = max_results {
                                 if out_matches.len() >= max {
@@ -800,9 +800,9 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                         }
                     }
                 }
-                let mut out = IndexMap::new();
-                out.insert("matches".to_string(), syn_list(out_matches));
-                out.insert("truncated".to_string(), syn_bool(truncated));
+                let mut out = SynMap::new();
+                out.insert("matches", syn_list(out_matches));
+                out.insert("truncated", syn_bool(truncated));
                 Ok(syn_map(out))
             }),
         );
@@ -1049,8 +1049,8 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 atomic_write(&path, updated.as_bytes()).map_err(|e| {
                     Control::Error(RuntimeError::new(format!("Cannot write file {}: {}", path, e)))
                 })?;
-                let mut m = IndexMap::new();
-                m.insert("replaced".to_string(), syn_int(replaced as i64));
+                let mut m = SynMap::new();
+                m.insert("replaced", syn_int(replaced as i64));
                 Ok(syn_map(m))
             }),
         );
@@ -1168,7 +1168,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 }
                 if let Some(SynValue::Map(m)) = opt("env") {
                     for (k, v) in m.borrow().iter() {
-                        c.env(k, raw_str(v)); // override explícito (gana sobre el strip)
+                        c.env(k.as_str(), raw_str(v)); // override explícito (gana sobre el strip)
                     }
                 }
 
@@ -1232,8 +1232,8 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 }
                 let exit_code = status.and_then(|s| s.code()).unwrap_or(-1);
 
-                let mut m = IndexMap::new();
-                m.insert("exit_code".to_string(), syn_int(exit_code as i64));
+                let mut m = SynMap::new();
+                m.insert("exit_code", syn_int(exit_code as i64));
                 m.insert(
                     "stdout".to_string(),
                     syn_text(String::from_utf8_lossy(&out_bytes).into_owned()),
@@ -1242,8 +1242,8 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                     "stderr".to_string(),
                     syn_text(String::from_utf8_lossy(&err_bytes).into_owned()),
                 );
-                m.insert("stdout_truncated".to_string(), syn_bool(out_trunc));
-                m.insert("stderr_truncated".to_string(), syn_bool(err_trunc));
+                m.insert("stdout_truncated", syn_bool(out_trunc));
+                m.insert("stderr_truncated", syn_bool(err_trunc));
                 Ok(syn_map(m))
             }),
         );
@@ -1343,17 +1343,17 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 }
                 let ts = arg_f64(arg(args, 0)?)?;
                 let dt = ts_to_utc(ts)?;
-                let mut m = IndexMap::new();
-                m.insert("year".to_string(), syn_int(dt.year() as i64));
-                m.insert("month".to_string(), syn_int(dt.month() as i64));
-                m.insert("day".to_string(), syn_int(dt.day() as i64));
-                m.insert("hour".to_string(), syn_int(dt.hour() as i64));
-                m.insert("minute".to_string(), syn_int(dt.minute() as i64));
-                m.insert("second".to_string(), syn_int(dt.second() as i64));
+                let mut m = SynMap::new();
+                m.insert("year", syn_int(dt.year() as i64));
+                m.insert("month", syn_int(dt.month() as i64));
+                m.insert("day", syn_int(dt.day() as i64));
+                m.insert("hour", syn_int(dt.hour() as i64));
+                m.insert("minute", syn_int(dt.minute() as i64));
+                m.insert("second", syn_int(dt.second() as i64));
                 // v0.6.29: las mismas claves que con un date/datetime (un timestamp es UTC).
-                m.insert("weekday".to_string(), syn_int(dt.weekday().number_from_monday() as i64));
-                m.insert("yearday".to_string(), syn_int(dt.ordinal() as i64));
-                m.insert("zone".to_string(), syn_text("UTC"));
+                m.insert("weekday", syn_int(dt.weekday().number_from_monday() as i64));
+                m.insert("yearday", syn_int(dt.ordinal() as i64));
+                m.insert("zone", syn_text("UTC"));
                 Ok(syn_map(m))
             }),
         );

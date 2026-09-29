@@ -158,7 +158,7 @@ fn write(v: &SynValue, out: &mut String, depth: usize, path: &str) -> Result<(),
         SynValue::Map(m) => {
             let m = m.borrow();
             // Orden por unidades de código UTF-16 (RFC 8785 §3.2.3).
-            let mut keys: Vec<&String> = m.keys().collect();
+            let mut keys: Vec<&synsema_core::types::Key> = m.keys().collect();
             keys.sort_by(|a, b| {
                 let ua: Vec<u16> = a.encode_utf16().collect();
                 let ub: Vec<u16> = b.encode_utf16().collect();
@@ -227,7 +227,6 @@ pub fn register_canonical_builtins(interp: &Interpreter) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indexmap::IndexMap;
     use synsema_core::types::{syn_int, syn_list, syn_map, syn_nothing};
 
     fn text(s: &str) -> SynValue {
@@ -237,7 +236,7 @@ mod tests {
         SynValue::Number(Number::Float(f))
     }
     fn map(pairs: Vec<(&str, SynValue)>) -> SynValue {
-        let mut m = IndexMap::new();
+        let mut m = synsema_core::types::SynMap::new();
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }

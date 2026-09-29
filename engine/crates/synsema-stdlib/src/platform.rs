@@ -7,9 +7,9 @@
 //! Valores de `os`: `"windows"`, `"macos"`, `"linux"`, otros tal como los nombra Rust
 //! (`"freebsd"`, …); bajo wasm `"wasm"`. `arch`: `"x86_64"`, `"aarch64"`, …; bajo wasm `"wasm32"`.
 
+use synsema_core::types::SynMap;
 use std::rc::Rc;
 
-use indexmap::IndexMap;
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::types::{syn_map, syn_text};
 
@@ -36,9 +36,9 @@ pub fn register_platform_builtin(interp: &Interpreter, os: &'static str, arch: &
                     args.len()
                 ))));
             }
-            let mut m = IndexMap::new();
-            m.insert("os".to_string(), syn_text(os_name(os)));
-            m.insert("arch".to_string(), syn_text(arch));
+            let mut m = SynMap::new();
+            m.insert("os", syn_text(os_name(os)));
+            m.insert("arch", syn_text(arch));
             Ok(syn_map(m))
         }),
     );

@@ -6,9 +6,9 @@
 //! Faltantes (DATOS-2/6): `nothing` es un dato FALTANTE y las agregaciones lo saltean (como
 //! los null de polars/SQL); NaN es un resultado inválido y se PROPAGA.
 
+use crate::types::{Key, MapObj, SynMap};
 use std::rc::Rc;
 
-use indexmap::IndexMap;
 
 use crate::interpreter::{BuiltinTask, Control, Interpreter, RuntimeError};
 use crate::number::Number;
@@ -40,8 +40,8 @@ pub(crate) fn check_column(rows: &[SynValue], col: &str, who: &str) -> Result<()
                 return Ok(());
             }
             for k in m.keys() {
-                if seen.len() < 12 && !seen.contains(k) {
-                    seen.push(k.clone());
+                if seen.len() < 12 && !seen.iter().any(|s| s.as_str() == k.as_str()) {
+                    seen.push(k.to_string());
                 }
             }
         }
@@ -97,7 +97,7 @@ pub fn key_of(interp: &mut Interpreter, spec: &KeySpec, row: &SynValue, who: &st
     match spec {
         KeySpec::Column(c) => row_get(row, c, who),
         KeySpec::Columns(cs) => {
-            let mut m = IndexMap::new();
+            let mut m = SynMap::new();
             for c in cs {
                 m.insert(c.clone(), row_get(row, c, who)?);
             }
@@ -285,7 +285,7 @@ fn canon_key(v: &SynValue, out: &mut String) {
         }
         SynValue::Map(m) => {
             let m = m.borrow();
-            let mut keys: Vec<&String> = m.keys().collect();
+            let mut keys: Vec<&Key> = m.keys().collect();
             keys.sort();
             out.push('{');
             for k in keys {
@@ -378,9 +378,9 @@ pub fn group_by(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue,
     Ok(syn_list(
         gs.into_iter()
             .map(|(k, items)| {
-                let mut m = IndexMap::new();
-                m.insert("key".to_string(), k);
-                m.insert("items".to_string(), syn_list(items));
+                let mut m = SynMap::new();
+                m.insert("key", k);
+                m.insert("items", syn_list(items));
                 syn_map(m)
             })
             .collect(),
@@ -395,7 +395,7 @@ pub fn summarize(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue
     let rows = rows_arg(args.first().ok_or_else(|| err("summarize(rows, by, aggs)"))?, W)?;
     let spec = key_spec(args.get(1).ok_or_else(|| err("summarize(rows, by, aggs): missing by"))?, W)?;
     let aggs = match args.get(2) {
-        Some(SynValue::Map(m)) => m.borrow().clone(),
+        Some(SynValue::Map(m)) => m.borrow().to_map(),
         Some(other) => return Err(err(format!("{}: aggs must be a map name → function, got {}", W, other.type_name()))),
         None => return Err(err("summarize(rows, by, aggs): missing aggs")),
     };
@@ -407,13 +407,13 @@ pub fn summarize(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue
 fn summarize_groups(
     interp: &mut Interpreter,
     spec: &KeySpec,
-    aggs: &IndexMap<String, SynValue>,
+    aggs: &MapObj,
     gs: Vec<(SynValue, Vec<SynValue>)>,
 ) -> Result<SynValue, Control> {
     const W: &str = "summarize";
     let mut out = Vec::with_capacity(gs.len());
     for (k, items) in gs {
-        let mut row = IndexMap::new();
+        let mut row = SynMap::new();
         match (spec, &k) {
             (KeySpec::Column(c), _) => {
                 row.insert(c.clone(), k.clone());
@@ -424,7 +424,7 @@ fn summarize_groups(
                 }
             }
             _ => {
-                row.insert("key".to_string(), k.clone());
+                row.insert("key", k.clone());
             }
         }
         let group = syn_list(items);
@@ -643,9 +643,9 @@ pub fn count_by(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue,
         counted
             .into_iter()
             .map(|(k, n)| {
-                let mut m = IndexMap::new();
-                m.insert("key".to_string(), k);
-                m.insert("count".to_string(), syn_int(n as i64));
+                let mut m = SynMap::new();
+                m.insert("key", k);
+                m.insert("count", syn_int(n as i64));
                 syn_map(m)
             })
             .collect(),
@@ -725,8 +725,8 @@ pub fn join(args: &[SynValue]) -> Result<SynValue, Control> {
         for r in rows {
             if let SynValue::Map(m) = r {
                 for k in m.borrow().keys() {
-                    if seen.insert(k.clone()) {
-                        cols.push(k.clone());
+                    if seen.insert(k.to_string()) {
+                        cols.push(k.to_string());
                     }
                 }
             }
@@ -773,7 +773,7 @@ pub fn join(args: &[SynValue]) -> Result<SynValue, Control> {
         }
     }
     let row_of = |l: Option<&SynValue>, r: Option<&SynValue>| -> Result<SynValue, Control> {
-        let mut out: IndexMap<String, SynValue> = IndexMap::new();
+        let mut out: SynMap = SynMap::new();
         for c in &left_cols {
             let v = match (l, r) {
                 (Some(l), _) => row_get(l, c, W)?,
@@ -892,7 +892,7 @@ pub fn pivot(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue, Co
     }
     let mut out = Vec::with_capacity(by_index.len());
     for (k, items) in by_index {
-        let mut row = IndexMap::new();
+        let mut row = SynMap::new();
         row.insert(index.clone(), k);
         let cells = groups(interp, &items, &KeySpec::Column(columns.clone()), W)?;
         for c in &col_order {
@@ -939,7 +939,7 @@ pub fn fill_missing(args: &[SynValue]) -> Result<SynValue, Control> {
         .map(|it| match it {
             SynValue::Nothing => fill.clone(),
             SynValue::Map(m) => {
-                let mut copy = m.borrow().clone();
+                let mut copy = m.borrow().to_map();
                 for (k, v) in copy.iter_mut() {
                     if matches!(v, SynValue::Nothing) {
                         match fill {

@@ -17,11 +17,11 @@
 //!   tx que aún no está en el mempool — eso es "todavía no", NO un error: el
 //!   waiter sigue hasta su deadline.
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use indexmap::IndexMap;
 
 use synsema_capabilities::model::CapabilitySet;
 use zeroize::Zeroize;
@@ -237,12 +237,12 @@ fn btc_utxos(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<Syn
         } else {
             0
         };
-        let mut m = IndexMap::new();
-        m.insert("txid".to_string(), syn_text(txid));
-        m.insert("vout".to_string(), syn_int(vout as i64));
-        m.insert("amount".to_string(), syn_int(amount));
-        m.insert("confirmations".to_string(), syn_int(confirmations));
-        m.insert("confirmed".to_string(), syn_bool(confirmed));
+        let mut m = SynMap::new();
+        m.insert("txid", syn_text(txid));
+        m.insert("vout", syn_int(vout as i64));
+        m.insert("amount", syn_int(amount));
+        m.insert("confirmations", syn_int(confirmations));
+        m.insert("confirmed", syn_bool(confirmed));
         out.push(syn_map(m));
     }
     Ok(syn_list(out))
@@ -287,10 +287,10 @@ fn btc_balance(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<S
             F
         )));
     }
-    let mut m = IndexMap::new();
-    m.insert("confirmed".to_string(), syn_int(confirmed));
-    m.insert("mempool".to_string(), syn_int(mempool));
-    m.insert("total".to_string(), syn_int(total));
+    let mut m = SynMap::new();
+    m.insert("confirmed", syn_int(confirmed));
+    m.insert("mempool", syn_int(mempool));
+    m.insert("total", syn_int(total));
     Ok(syn_map(m))
 }
 
@@ -316,7 +316,7 @@ fn btc_fee_estimates(
         entries.push((target, rate));
     }
     entries.sort_by_key(|(t, _)| *t);
-    let mut m = IndexMap::new();
+    let mut m = SynMap::new();
     for (t, r) in entries {
         m.insert(t.to_string(), syn_number(Number::Float(r)));
     }
@@ -441,16 +441,16 @@ fn btc_wait(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynV
                 }
             };
             if confs >= confirmations {
-                let mut m = IndexMap::new();
-                m.insert("confirmed".to_string(), syn_bool(true));
-                m.insert("block_height".to_string(), syn_int(height));
+                let mut m = SynMap::new();
+                m.insert("confirmed", syn_bool(true));
+                m.insert("block_height", syn_int(height));
                 if let Some(bh) = obj.get("block_hash").and_then(serde_json::Value::as_str) {
-                    m.insert("block_hash".to_string(), syn_text(bh));
+                    m.insert("block_hash", syn_text(bh));
                 }
                 if let Some(bt) = obj.get("block_time").and_then(serde_json::Value::as_u64) {
-                    m.insert("block_time".to_string(), syn_int(bt as i64));
+                    m.insert("block_time", syn_int(bt as i64));
                 }
-                m.insert("confirmations".to_string(), syn_int(confs));
+                m.insert("confirmations", syn_int(confs));
                 return Ok(syn_map(m));
             }
         }
@@ -469,7 +469,7 @@ fn btc_wait(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynV
 fn basic_auth_header(v: Option<&SynValue>, fname: &str) -> Result<Vec<(String, String)>, Control> {
     let m = match v {
         None | Some(SynValue::Nothing) => return Ok(Vec::new()),
-        Some(SynValue::Map(m)) => m.borrow().clone(),
+        Some(SynValue::Map(m)) => m.borrow().to_map(),
         Some(other) => {
             return Err(err(format!(
                 "{}: auth must be a map {{user, pass}}, got {}",

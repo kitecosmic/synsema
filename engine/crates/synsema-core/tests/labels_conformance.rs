@@ -4,6 +4,7 @@
 //! etiquetas apagadas todo es idéntico (mismos `steps`, `private` → error, `declassify`
 //! identidad).
 
+use synsema_core::types::SynMap;
 use synsema_core::interpreter::{env_get, Control, Interpreter};
 use synsema_core::labels::{self, check_flow, label_deep, label_display_raw, mark, strip_deep};
 use synsema_core::parser::parse_source;
@@ -708,8 +709,8 @@ fn strip_deep_removes_every_label_and_shares_clean_containers() {
     let src_v = mark(syn_list(vec![syn_int(1)]), labels::label_from(&["app"]));
     assert_eq!(label_display_raw(&labels::label(&src_v)), "app");
     assert!(matches!(mark(syn_text("x"), labels::empty()), SynValue::Text(_)));
-    let mut mm = indexmap::IndexMap::new();
-    mm.insert("k".to_string(), syn_int(1));
+    let mut mm = SynMap::new();
+    mm.insert("k", syn_int(1));
     let mv = mark(syn_map(mm), labels::label_from(&["b", "a"]));
     assert_eq!(label_display_raw(&label_deep(&mv)), "a,b");
 }
@@ -1880,8 +1881,8 @@ raise \"balance is \" + text(v)
 ", "<labels>").unwrap();
     let mut interp = Interpreter::new();
     interp.set_labels(true);
-    let mut m = indexmap::IndexMap::new();
-    m.insert("balance".to_string(), syn_int(500));
+    let mut m = SynMap::new();
+    m.insert("balance", syn_int(500));
     // Exactamente lo que hace el host: marcar la fuente desde Rust e inyectarla.
     interp.set_global("ctx", mark(syn_map(m), labels::label_from(&["app"])));
     match interp.execute(&program) {
@@ -1900,8 +1901,8 @@ when ctx[\"balance\"] > 1
 ", "<labels>").unwrap();
     let mut i2 = Interpreter::new();
     i2.set_labels(true);
-    let mut m2 = indexmap::IndexMap::new();
-    m2.insert("balance".to_string(), syn_int(500));
+    let mut m2 = SynMap::new();
+    m2.insert("balance", syn_int(500));
     i2.set_global("ctx", mark(syn_map(m2), labels::label_from(&["app"])));
     let msg = match i2.execute(&program2) {
         Err(Control::Error(e)) => e.into_message(),

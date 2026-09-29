@@ -25,6 +25,7 @@
 //! MySQL/Mongo scope = `canon_url` (scheme://host/db, sin credenciales). Acceso serializado (un
 //! op por vez: `Rc<RefCell>` en run, `Arc<Mutex>` en serve) → una conexión por `db_open`.
 
+use synsema_core::types::{Key, MapObj, SynMap};
 use std::cell::RefCell;
 use std::error::Error as StdError;
 use std::rc::Rc;
@@ -91,7 +92,7 @@ fn syn_to_i64(v: &SynValue) -> i64 {
 }
 
 /// Una fila: columnas (en orden) → `SynValue` ya mapeado (común a ambos backends).
-pub type Row = IndexMap<String, SynValue>;
+pub type Row = SynMap;
 
 /// Motor concreto de una conexión.
 enum Backend {
@@ -495,13 +496,14 @@ impl DatabaseManager {
 fn sqlite_query(conn: &Connection, sql: &str, params: &[SynValue]) -> Result<Vec<Row>, String> {
     let pv: Vec<Value> = params.iter().map(syn_to_value).collect();
     let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-    let cols: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    // Las columnas como claves una vez por consulta: cada fila suma una referencia (F4.4).
+    let cols: Vec<Key> = stmt.column_names().iter().map(|s| Key::from(*s)).collect();
     let mut rows = stmt
         .query(params_from_iter(pv.iter()))
         .map_err(|e| e.to_string())?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let mut m = IndexMap::new();
+        let mut m = SynMap::with_capacity(cols.len());
         for (i, col) in cols.iter().enumerate() {
             let v: Value = row.get(i).map_err(|e| e.to_string())?;
             m.insert(col.clone(), value_to_syn(&v));
@@ -793,13 +795,18 @@ fn pg_query(client: &mut Client, sql: &str, params: &[SynValue]) -> Result<Vec<R
     let rows = client
         .query(rewritten.as_str(), &refs)
         .map_err(pg_err)?;
-    Ok(rows.iter().map(pg_row_to_syn).collect())
+    // Todas las filas de una consulta tienen las mismas columnas: claves una vez (F4.4).
+    let keys: Vec<Key> = match rows.first() {
+        Some(r) => r.columns().iter().map(|c| Key::from(c.name())).collect(),
+        None => Vec::new(),
+    };
+    Ok(rows.iter().map(|r| pg_row_to_syn(r, &keys)).collect())
 }
 
-fn pg_row_to_syn(row: &postgres::Row) -> Row {
-    let mut m = IndexMap::new();
-    for (i, col) in row.columns().iter().enumerate() {
-        m.insert(col.name().to_string(), pg_cell_to_syn(row, i, col.type_()));
+fn pg_row_to_syn(row: &postgres::Row, keys: &[Key]) -> Row {
+    let mut m = SynMap::with_capacity(keys.len());
+    for ((i, col), k) in row.columns().iter().enumerate().zip(keys) {
+        m.insert(k.clone(), pg_cell_to_syn(row, i, col.type_()));
     }
     m
 }
@@ -1043,14 +1050,19 @@ fn syn_to_mysql(v: &SynValue) -> mysql::Value {
 fn mysql_query(conn: &mut mysql::Conn, sql: &str, params: &[SynValue]) -> Result<Vec<Row>, String> {
     let result = conn.exec_iter(sql, mysql_params(params)).map_err(mysql_err)?;
     let mut out = Vec::new();
+    // Las columnas como claves una vez por consulta (F4.4); se rehacen si cambian.
+    let mut keys: Vec<Key> = Vec::new();
     for row_res in result {
         let row = row_res.map_err(mysql_err)?;
         let cols = row.columns(); // Arc<[Column]> (mismo orden que los valores)
         let values = row.unwrap(); // Vec<Value>, consume la fila
-        let mut m = IndexMap::new();
+        if keys.len() != cols.len() || keys.iter().zip(cols.iter()).any(|(k, c)| k.as_str() != c.name_str()) {
+            keys = cols.iter().map(|c| Key::from(c.name_str().as_ref())).collect();
+        }
+        let mut m = SynMap::with_capacity(cols.len());
         for (i, val) in values.into_iter().enumerate() {
             let col = &cols[i];
-            m.insert(col.name_str().to_string(), mysql_cell_to_syn(val, col));
+            m.insert(keys[i].clone(), mysql_cell_to_syn(val, col));
         }
         out.push(m);
     }
@@ -1258,7 +1270,7 @@ fn syn_to_bson(v: &SynValue) -> Bson {
 
 /// Map de Synsema → BSON `Document`. Para la clave `_id` aplica `coerce_id` (string hex-24 →
 /// ObjectId) así `mongo_find("c", {"_id": id_text})` matchea el documento real.
-fn syn_map_to_doc(m: &IndexMap<String, SynValue>) -> Document {
+fn syn_map_to_doc(m: &MapObj) -> Document {
     let mut doc = Document::new();
     for (k, v) in m {
         let bson = if k == "_id" { coerce_id(v) } else { syn_to_bson(v) };
@@ -1306,7 +1318,7 @@ fn bson_to_syn(b: &Bson) -> SynValue {
         Bson::Binary(bin) => syn_bytes(bin.bytes.clone()),
         Bson::Array(a) => syn_list(a.iter().map(bson_to_syn).collect()),
         Bson::Document(d) => {
-            let mut m = IndexMap::new();
+            let mut m = SynMap::new();
             for (k, v) in d.iter() {
                 m.insert(k.clone(), bson_to_syn(v));
             }
@@ -1403,7 +1415,7 @@ fn redis_value_to_syn(v: &redis::Value) -> SynValue {
         RV::Okay => syn_text("OK"),
         RV::Array(items) | RV::Set(items) => syn_list(items.iter().map(redis_value_to_syn).collect()),
         RV::Map(pairs) => {
-            let mut m = IndexMap::new();
+            let mut m = SynMap::new();
             for (k, val) in pairs {
                 m.insert(redis_key_string(k), redis_value_to_syn(val));
             }
@@ -1431,9 +1443,9 @@ fn redis_key_string(v: &redis::Value) -> String {
 
 /// Reply de `HGETALL` → `IndexMap` (field→valor). En RESP3 viene como `Map`; en RESP2 (default)
 /// como `Array` plano de pares → se agrupa de a dos. Clave ausente → array vacío → map vacío.
-fn redis_value_to_map(v: redis::Value) -> IndexMap<String, SynValue> {
+fn redis_value_to_map(v: redis::Value) -> SynMap {
     use redis::Value as RV;
-    let mut m = IndexMap::new();
+    let mut m = SynMap::new();
     match v {
         RV::Map(pairs) => {
             for (k, val) in pairs {
@@ -1716,9 +1728,9 @@ pub fn register_database_builtins<H: DbHandle>(
                     return Err(err("sql_exec: this statement returns rows (RETURNING) — run it with sql(statement, params) to get them (nothing was executed)"));
                 }
                 let (affected, last_id) = db.write(|m| m.execute(&stmt, &params)).map_err(|e| sql_driver_error("sql_exec", e))?;
-                let mut m = IndexMap::new();
-                m.insert("rows_affected".to_string(), syn_int(affected));
-                m.insert("last_id".to_string(), syn_int(last_id));
+                let mut m = SynMap::new();
+                m.insert("rows_affected", syn_int(affected));
+                m.insert("last_id", syn_int(last_id));
                 Ok(syn_map(m))
             }),
         );
@@ -1767,8 +1779,8 @@ pub fn register_database_builtins<H: DbHandle>(
                     return Err(err("sql_batch: this statement returns rows (RETURNING) — run it with sql(statement, params) for each row to get them (nothing was executed)"));
                 }
                 let affected = db.write(|m| m.execute_many(&stmt, &params_list)).map_err(|e| sql_driver_error("sql_batch", e))?;
-                let mut m = IndexMap::new();
-                m.insert("rows_affected".to_string(), syn_int(affected));
+                let mut m = SynMap::new();
+                m.insert("rows_affected", syn_int(affected));
                 Ok(syn_map(m))
             }),
         );
@@ -1912,9 +1924,9 @@ pub fn register_database_builtins<H: DbHandle>(
                 }
                 let (matched, modified) =
                     db.write(|m| m.mongo_update(&coll, filter, update)).map_err(err)?;
-                let mut map = IndexMap::new();
-                map.insert("matched".to_string(), syn_int(matched));
-                map.insert("modified".to_string(), syn_int(modified));
+                let mut map = SynMap::new();
+                map.insert("matched", syn_int(matched));
+                map.insert("modified", syn_int(modified));
                 Ok(syn_map(map))
             }),
         );
@@ -1934,8 +1946,8 @@ pub fn register_database_builtins<H: DbHandle>(
                     require_db(&caps, &p, "mongo_delete()")?;
                 }
                 let deleted = db.write(|m| m.mongo_delete(&coll, filter)).map_err(err)?;
-                let mut map = IndexMap::new();
-                map.insert("deleted".to_string(), syn_int(deleted));
+                let mut map = SynMap::new();
+                map.insert("deleted", syn_int(deleted));
                 Ok(syn_map(map))
             }),
         );
@@ -2583,8 +2595,8 @@ mod tests {
 
     // -- MongoDB (M3): conversión SynValue ↔ BSON + _id, sin servidor --
 
-    fn imap(pairs: Vec<(&str, SynValue)>) -> IndexMap<String, SynValue> {
-        let mut m = IndexMap::new();
+    fn imap(pairs: Vec<(&str, SynValue)>) -> SynMap {
+        let mut m = SynMap::new();
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }
