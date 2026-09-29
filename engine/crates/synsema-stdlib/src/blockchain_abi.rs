@@ -16,6 +16,7 @@
 //!   (`"transfer(address,uint256)"`). Los alias `uint`/`int` se normalizan a
 //!   `uint256`/`int256` (una sola forma de selector).
 
+use synsema_core::types::SynMap;
 use num_bigint::{BigInt, Sign};
 use sha3::{Digest, Keccak256};
 use std::fmt;
@@ -1223,7 +1224,7 @@ fn abi_decode_log(args: &[SynValue]) -> Result<SynValue, Control> {
         )));
     }
     data_vals.reverse();
-    let mut out = indexmap::IndexMap::new();
+    let mut out = SynMap::new();
     for inp in &ev.inputs {
         let v = if inp.indexed {
             let word = topic_bytes(&topics[ti], ti, F)?;
@@ -1371,7 +1372,7 @@ fn parse_types(v: &SynValue) -> Result<StructDefs, Control> {
             }
             parsed.push((fname_s, ft));
         }
-        defs.insert(tname.clone(), parsed);
+        defs.insert(tname.to_string(), parsed);
     }
     Ok(defs)
 }
@@ -1710,7 +1711,6 @@ pub(crate) fn register(interp: &Interpreter) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indexmap::IndexMap;
     use synsema_core::bytesutil::hex_encode;
     use synsema_core::types::{syn_int, syn_map};
 
@@ -1723,7 +1723,7 @@ mod tests {
     }
 
     fn m(pairs: &[(&str, SynValue)]) -> SynValue {
-        let mut im = IndexMap::new();
+        let mut im = SynMap::new();
         for (k, v) in pairs {
             im.insert(k.to_string(), v.clone());
         }

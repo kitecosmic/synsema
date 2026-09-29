@@ -23,6 +23,7 @@
 //! (su cuerpo se compila también). Todo lo demás es `Exec`: el nodo lo corre el tree-walker con el
 //! frame de la VM como entorno (§6.0 punto 4), y cuenta sus propios pasos.
 
+use crate::types::{Key, SynMap};
 use super::*;
 use crate::resolve::{self, Resolution, ScopeId, Target};
 use num_integer::Integer;
@@ -2286,11 +2287,11 @@ impl Interpreter {
                 }
                 Ins::MakeMap { dst, first, n } => {
                     let from = base + first as usize;
-                    let mut m = IndexMap::with_capacity(n as usize);
+                    let mut m = SynMap::with_capacity(n as usize);
                     for i in 0..n as usize {
                         let k = std::mem::replace(&mut self.vm_regs[from + 2 * i], SynValue::Nothing);
                         let v = std::mem::replace(&mut self.vm_regs[from + 2 * i + 1], SynValue::Nothing);
-                        m.insert(k.to_string(), v);
+                        m.insert(Key::of_value(&k), v);
                     }
                     self.put(base, dst, syn_map(m));
                     Ok(())
@@ -3550,7 +3551,7 @@ impl Interpreter {
         let r = self.dispatch_builtin(bt, &argv, &chunk.locs[chunk.loc[at] as usize]);
         // Como el camino genérico, que vuelve a poner el mapa que había (vacío) al terminar.
         if !self.pending_kwargs.is_empty() {
-            self.pending_kwargs = IndexMap::new();
+            self.pending_kwargs = SynMap::new();
         }
         drop(argv);
         self.recursion_depth -= 1;
@@ -3574,7 +3575,7 @@ struct Enter {
 /// la misma, sin hashear); si no, la búsqueda de siempre, y `ic` recuerda dónde estaba. `None` si
 /// no está (el que llama arma el error de la referencia).
 #[inline(always)]
-fn map_get_cached(m: &IndexMap<String, SynValue>, key: &str, ic: &Cell<u32>) -> Option<SynValue> {
+fn map_get_cached(m: &SynMap, key: &str, ic: &Cell<u32>) -> Option<SynValue> {
     let c = ic.get() as usize;
     if c > 0 {
         if let Some((k, v)) = m.get_index(c - 1) {

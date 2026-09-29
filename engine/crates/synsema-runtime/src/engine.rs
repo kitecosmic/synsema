@@ -9,6 +9,7 @@
 //!
 //! Todo corre en hilos con stack grande (intérprete tree-walking + recursión).
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -1864,14 +1865,14 @@ pub(crate) fn wire_swarm_hooks(
                     .agents_info()
                     .into_iter()
                     .map(|(id, a)| {
-                        let mut m = indexmap::IndexMap::new();
-                        m.insert("id".to_string(), syn_text(id.clone()));
+                        let mut m = SynMap::new();
+                        m.insert("id", syn_text(id.clone()));
                         // `name` = el agente declarado (sin el sufijo de instancia `_N`).
                         let base = id.rsplit_once('_').map(|(b, n)| if n.bytes().all(|c| c.is_ascii_digit()) { b.to_string() } else { id.clone() }).unwrap_or(id.clone());
-                        m.insert("name".to_string(), syn_text(base));
-                        m.insert("state".to_string(), syn_text(agent_state_str(a.state)));
-                        m.insert("error".to_string(), a.error.clone().map(syn_text).unwrap_or(SynValue::Nothing));
-                        m.insert("started_at".to_string(), syn_number(synsema_core::number::Number::Float(a.started_at)));
+                        m.insert("name", syn_text(base));
+                        m.insert("state", syn_text(agent_state_str(a.state)));
+                        m.insert("error", a.error.clone().map(syn_text).unwrap_or(SynValue::Nothing));
+                        m.insert("started_at", syn_number(synsema_core::number::Number::Float(a.started_at)));
                         m.insert(
                             "finished_at".to_string(),
                             if a.finished_at > 0.0 { syn_number(synsema_core::number::Number::Float(a.finished_at)) } else { SynValue::Nothing },

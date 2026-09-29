@@ -85,7 +85,7 @@ fn syn_to_value(v: &SynValue, what: &str) -> Result<J, Control> {
         SynValue::Map(m) => {
             let mut out = serde_json::Map::new();
             for (k, x) in m.borrow().iter() {
-                out.insert(k.clone(), syn_to_value(x, what)?);
+                out.insert(k.to_string(), syn_to_value(x, what)?);
             }
             J::Object(out)
         }

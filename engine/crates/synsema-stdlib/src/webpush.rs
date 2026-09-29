@@ -30,11 +30,11 @@
 //! - **Proveedor externo:** quien ya tiene OneSignal/FCM/Pusher los llama con `http_post`
 //!   bajo `require net(...)`; nada de esto lo obliga a cambiar.
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use hmac::{Hmac, Mac};
-use indexmap::IndexMap;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use sha2::Sha256;
 use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
@@ -286,11 +286,11 @@ fn text_of<'a>(v: Option<&'a SynValue>, what: &str) -> Result<&'a str, Control> 
     }
 }
 
-fn map_field(m: &IndexMap<String, SynValue>, k: &str) -> Option<SynValue> {
+fn map_field(m: &SynMap, k: &str) -> Option<SynValue> {
     m.get(k).cloned()
 }
 
-fn as_map(v: Option<&SynValue>, what: &str) -> Result<IndexMap<String, SynValue>, Control> {
+fn as_map(v: Option<&SynValue>, what: &str) -> Result<SynMap, Control> {
     match v {
         Some(SynValue::Map(m)) => Ok(m.borrow().clone()),
         Some(other) => Err(err(format!(
@@ -575,11 +575,11 @@ fn push_send(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<Syn
                 res.error.unwrap_or_else(|| "request failed".to_string())
             )));
         }
-        let mut m = IndexMap::new();
-        m.insert("status".to_string(), syn_int(res.status));
-        m.insert("ok".to_string(), syn_bool(res.ok));
+        let mut m = SynMap::new();
+        m.insert("status", syn_int(res.status));
+        m.insert("ok", syn_bool(res.ok));
         // 404/410: la suscripción ya no existe (RFC 8030 §7.2) — la app debe borrarla.
-        m.insert("gone".to_string(), syn_bool(res.status == 404 || res.status == 410));
+        m.insert("gone", syn_bool(res.status == 404 || res.status == 410));
         let retry_after = res
             .headers
             .iter()
@@ -592,7 +592,7 @@ fn push_send(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<Syn
                 None => SynValue::Nothing,
             },
         );
-        m.insert("body".to_string(), syn_text(res.body));
+        m.insert("body", syn_text(res.body));
         Ok(syn_map(m))
     }
 }
@@ -626,11 +626,11 @@ fn push_vapid_keys(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Resu
     let sk = keygen();
     let public = public_b64(&sk);
     let private = private_b64(&sk);
-    let mut m = IndexMap::new();
-    m.insert("public".to_string(), syn_text(public));
+    let mut m = SynMap::new();
+    m.insert("public", syn_text(public));
     // La privada nace SELLADA: se persiste con reveal() una vez (a .env) y se carga con
     // secret(); jamás viaja por print/log/JSON sin decirlo.
-    m.insert("private".to_string(), syn_secret("vapid_private", private));
+    m.insert("private", syn_secret("vapid_private", private));
     Ok(syn_map(m))
 }
 
@@ -828,28 +828,28 @@ mod tests {
         let ua = p256::SecretKey::random(&mut rand::rngs::OsRng);
         let vapid = p256::SecretKey::random(&mut rand::rngs::OsRng);
         let sub = || {
-            let mut keys = IndexMap::new();
-            keys.insert("p256dh".to_string(), syn_text(b64url_encode(&uncompressed(&ua.public_key()))));
-            keys.insert("auth".to_string(), syn_text(b64url_encode(&[9u8; 16])));
-            let mut m = IndexMap::new();
-            m.insert("endpoint".to_string(), syn_text("https://push.example.com/v1/abc"));
-            m.insert("keys".to_string(), syn_map(keys));
+            let mut keys = SynMap::new();
+            keys.insert("p256dh", syn_text(b64url_encode(&uncompressed(&ua.public_key()))));
+            keys.insert("auth", syn_text(b64url_encode(&[9u8; 16])));
+            let mut m = SynMap::new();
+            m.insert("endpoint", syn_text("https://push.example.com/v1/abc"));
+            m.insert("keys", syn_map(keys));
             syn_map(m)
         };
         let opts = |extra: Vec<(&str, SynValue)>| {
-            let mut v = IndexMap::new();
-            v.insert("public".to_string(), syn_text(b64url_encode(&uncompressed(&vapid.public_key()))));
-            v.insert("private".to_string(), syn_secret("k", b64url_encode(&vapid.to_bytes())));
-            v.insert("subject".to_string(), syn_text("mailto:a@b.c"));
-            let mut m = IndexMap::new();
-            m.insert("vapid".to_string(), syn_map(v));
+            let mut v = SynMap::new();
+            v.insert("public", syn_text(b64url_encode(&uncompressed(&vapid.public_key()))));
+            v.insert("private", syn_secret("k", b64url_encode(&vapid.to_bytes())));
+            v.insert("subject", syn_text("mailto:a@b.c"));
+            let mut m = SynMap::new();
+            m.insert("vapid", syn_map(v));
             for (k, val) in extra {
                 m.insert(k.to_string(), val);
             }
             syn_map(m)
         };
-        let mut payload = IndexMap::new();
-        payload.insert("title".to_string(), syn_text("hi"));
+        let mut payload = SynMap::new();
+        payload.insert("title", syn_text("hi"));
         let req = ok(build_push_request(
             &[sub(), syn_map(payload), opts(vec![("ttl", syn_int(60)), ("urgency", syn_text("high")), ("topic", syn_text("news"))])],
             1_800_000_000,
@@ -874,19 +874,19 @@ mod tests {
 
         // Errores claros: pública cruzada, urgency inválida, opción desconocida, sin vapid.
         let other = p256::SecretKey::random(&mut rand::rngs::OsRng);
-        let mut bad_vapid = IndexMap::new();
-        bad_vapid.insert("public".to_string(), syn_text(b64url_encode(&uncompressed(&other.public_key()))));
-        bad_vapid.insert("private".to_string(), syn_secret("k", b64url_encode(&vapid.to_bytes())));
-        bad_vapid.insert("subject".to_string(), syn_text("mailto:a@b.c"));
-        let mut o = IndexMap::new();
-        o.insert("vapid".to_string(), syn_map(bad_vapid));
+        let mut bad_vapid = SynMap::new();
+        bad_vapid.insert("public", syn_text(b64url_encode(&uncompressed(&other.public_key()))));
+        bad_vapid.insert("private", syn_secret("k", b64url_encode(&vapid.to_bytes())));
+        bad_vapid.insert("subject", syn_text("mailto:a@b.c"));
+        let mut o = SynMap::new();
+        o.insert("vapid", syn_map(bad_vapid));
         let e = errmsg(build_push_request(&[sub(), syn_text("x"), syn_map(o)], 0));
         assert!(e.contains("does not match"), "{}", e);
         let e = errmsg(build_push_request(&[sub(), syn_text("x"), opts(vec![("urgency", syn_text("asap"))])], 0));
         assert!(e.contains("urgency"), "{}", e);
         let e = errmsg(build_push_request(&[sub(), syn_text("x"), opts(vec![("colour", syn_text("red"))])], 0));
         assert!(e.contains("unknown option"), "{}", e);
-        let e = errmsg(build_push_request(&[sub(), syn_text("x"), syn_map(IndexMap::new())], 0));
+        let e = errmsg(build_push_request(&[sub(), syn_text("x"), syn_map(SynMap::new())], 0));
         assert!(e.contains("opts.vapid is required"), "{}", e);
         let e = errmsg(build_push_request(&[sub(), syn_list(vec![]), opts(vec![("topic", syn_text("has space"))])], 0));
         assert!(e.contains("topic"), "{}", e);

@@ -23,10 +23,10 @@
 //! PNG es el estado estático); font-family desconocida cae a la embebida; glifos no
 //! cubiertos (CJK completo, emoji color) → tofu. Fuentes del sistema/custom = futuro.
 
+use synsema_core::types::SynMap;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
-use indexmap::IndexMap;
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::number::py_float_str;
 use synsema_core::types::{syn_bytes, SynValue};
@@ -114,7 +114,7 @@ fn fontdb_with(fonts: &[Vec<u8>]) -> Arc<fontdb::Database> {
 type FontLoader<'a> = &'a dyn Fn(&str) -> Result<Vec<u8>, Control>;
 
 fn fonts_opt(
-    opts: &IndexMap<String, SynValue>,
+    opts: &SynMap,
     name: &str,
     loader: Option<FontLoader<'_>>,
 ) -> Result<Vec<Vec<u8>>, Control> {
@@ -209,9 +209,9 @@ fn opts_of(
     args: &[SynValue],
     name: &str,
     valid: &[&str],
-) -> Result<IndexMap<String, SynValue>, Control> {
+) -> Result<SynMap, Control> {
     match args.get(1) {
-        None | Some(SynValue::Nothing) => Ok(IndexMap::new()),
+        None | Some(SynValue::Nothing) => Ok(SynMap::new()),
         Some(SynValue::Map(m)) => {
             let m = m.borrow();
             for k in m.keys() {
@@ -236,7 +236,7 @@ fn opts_of(
 
 /// Número positivo finito de una opt (dimensiones, scale, max_pixels).
 fn opt_pos_number(
-    opts: &IndexMap<String, SynValue>,
+    opts: &SynMap,
     key: &str,
     name: &str,
 ) -> Result<Option<f64>, Control> {
@@ -538,14 +538,14 @@ mod tests {
 
     #[test]
     fn png_scale_width_background() {
-        let mut m = IndexMap::new();
-        m.insert("scale".to_string(), synsema_core::types::syn_int(2));
+        let mut m = SynMap::new();
+        m.insert("scale", synsema_core::types::syn_int(2));
         let png = ok(svg_to_png(&[syn_text(RED_RECT), syn_map(m)]));
         assert_eq!(png_dims(&png), (20, 20));
 
         // width solo → mantiene aspecto (SVG 10x10 → 40x40).
-        let mut m = IndexMap::new();
-        m.insert("width".to_string(), synsema_core::types::syn_int(40));
+        let mut m = SynMap::new();
+        m.insert("width", synsema_core::types::syn_int(40));
         let png = ok(svg_to_png(&[syn_text(RED_RECT), syn_map(m)]));
         assert_eq!(png_dims(&png), (40, 40));
 
@@ -554,8 +554,8 @@ mod tests {
         let png = ok(svg_to_png(&[syn_text(tiny)]));
         let pm = tiny_skia::Pixmap::decode_png(&png).unwrap();
         assert_eq!(pm.pixel(0, 0).unwrap().alpha(), 0, "default transparente");
-        let mut m = IndexMap::new();
-        m.insert("background".to_string(), syn_text("#ffffff"));
+        let mut m = SynMap::new();
+        m.insert("background", syn_text("#ffffff"));
         let png = ok(svg_to_png(&[syn_text(tiny), syn_map(m)]));
         let pm = tiny_skia::Pixmap::decode_png(&png).unwrap();
         let px = pm.pixel(0, 0).unwrap();
@@ -586,23 +586,23 @@ mod tests {
         assert!(msg(svg_to_png(&[syn_text("<not-svg")])).contains("invalid SVG"));
         assert!(msg(svg_to_png(&[syn_secret("K", "x")])).contains("secret"));
         // scale + width = conflicto explícito.
-        let mut m = IndexMap::new();
-        m.insert("scale".to_string(), synsema_core::types::syn_int(2));
-        m.insert("width".to_string(), synsema_core::types::syn_int(40));
+        let mut m = SynMap::new();
+        m.insert("scale", synsema_core::types::syn_int(2));
+        m.insert("width", synsema_core::types::syn_int(40));
         assert!(msg(svg_to_png(&[syn_text(RED_RECT), syn_map(m)])).contains("conflicts"));
         // Techo anti-DoS con aviso que menciona la opt (G6)…
-        let mut m = IndexMap::new();
-        m.insert("width".to_string(), synsema_core::types::syn_int(10_000_000));
+        let mut m = SynMap::new();
+        m.insert("width", synsema_core::types::syn_int(10_000_000));
         assert!(msg(svg_to_png(&[syn_text(RED_RECT), syn_map(m)])).contains("max_pixels"));
         // …y sobreescribible: el mismo tamaño pasa subiendo el techo (9 Mpx > default no,
         // acá usamos uno chico para no rasterizar de verdad 100 Mpx en el test).
-        let mut m = IndexMap::new();
-        m.insert("width".to_string(), synsema_core::types::syn_int(200));
-        m.insert("max_pixels".to_string(), synsema_core::types::syn_int(100));
+        let mut m = SynMap::new();
+        m.insert("width", synsema_core::types::syn_int(200));
+        m.insert("max_pixels", synsema_core::types::syn_int(100));
         assert!(msg(svg_to_png(&[syn_text(RED_RECT), syn_map(m)])).contains("max_pixels"));
-        let mut m = IndexMap::new();
-        m.insert("width".to_string(), synsema_core::types::syn_int(200));
-        m.insert("max_pixels".to_string(), synsema_core::types::syn_int(100_000));
+        let mut m = SynMap::new();
+        m.insert("width", synsema_core::types::syn_int(200));
+        m.insert("max_pixels", synsema_core::types::syn_int(100_000));
         ok(svg_to_png(&[syn_text(RED_RECT), syn_map(m)]));
     }
 
@@ -643,13 +643,13 @@ mod tests {
     #[test]
     fn pdf_size_override_and_aspect_guard() {
         // width solo → escala proporcional (vectorial, sin pérdida).
-        let mut m = IndexMap::new();
-        m.insert("width".to_string(), synsema_core::types::syn_int(100));
+        let mut m = SynMap::new();
+        m.insert("width", synsema_core::types::syn_int(100));
         ok(svg_to_pdf(&[syn_text(RED_RECT), syn_map(m)]));
         // width+height con aspecto distinto al del SVG → error claro.
-        let mut m = IndexMap::new();
-        m.insert("width".to_string(), synsema_core::types::syn_int(100));
-        m.insert("height".to_string(), synsema_core::types::syn_int(300));
+        let mut m = SynMap::new();
+        m.insert("width", synsema_core::types::syn_int(100));
+        m.insert("height", synsema_core::types::syn_int(300));
         assert!(msg(svg_to_pdf(&[syn_text(RED_RECT), syn_map(m)])).contains("aspect ratio"));
     }
 

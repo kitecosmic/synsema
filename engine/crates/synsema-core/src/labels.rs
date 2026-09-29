@@ -150,10 +150,10 @@
 //! Los sumideros de I/O que el host no registre tampoco se comprueban: el host tiene
 //! `check_flow`, `strip_deep` e `Interpreter::pc_label` para hacerlo en su borde.
 
+use crate::types::SynMap;
 use std::fmt;
 use std::rc::Rc;
 
-use indexmap::IndexMap;
 
 use crate::tokens::SourceLocation;
 use crate::types::{syn_list, syn_map, ServerValue, SynValue};
@@ -515,7 +515,7 @@ pub fn deep_copy(v: &SynValue) -> SynValue {
     match v {
         SynValue::List(l) => syn_list(l.borrow().iter().map(deep_copy).collect()),
         SynValue::Map(m) => {
-            let mut out = IndexMap::with_capacity(m.borrow().len());
+            let mut out = SynMap::with_capacity(m.borrow().len());
             for (k, x) in m.borrow().iter() {
                 out.insert(k.clone(), deep_copy(x));
             }
@@ -529,7 +529,7 @@ pub fn deep_copy(v: &SynValue) -> SynValue {
                 SynValue::Server(Rc::new(ServerValue::Envelope { status: *status, value: deep_copy(value) }))
             }
             ServerValue::Node(m) => {
-                let mut out = IndexMap::with_capacity(m.borrow().len());
+                let mut out = SynMap::with_capacity(m.borrow().len());
                 for (k, x) in m.borrow().iter() {
                     out.insert(k.clone(), deep_copy(x));
                 }
@@ -568,7 +568,7 @@ pub fn strip_deep(v: &SynValue) -> SynValue {
         SynValue::Private(p) => strip_deep(&p.value),
         SynValue::List(l) => syn_list(l.borrow().iter().map(strip_deep).collect()),
         SynValue::Map(m) => {
-            let mut out = IndexMap::with_capacity(m.borrow().len());
+            let mut out = SynMap::with_capacity(m.borrow().len());
             for (k, x) in m.borrow().iter() {
                 out.insert(k.clone(), strip_deep(x));
             }
@@ -580,7 +580,7 @@ pub fn strip_deep(v: &SynValue) -> SynValue {
                 value: strip_deep(value),
             })),
             ServerValue::Node(m) => {
-                let mut out = IndexMap::with_capacity(m.borrow().len());
+                let mut out = SynMap::with_capacity(m.borrow().len());
                 for (k, x) in m.borrow().iter() {
                     out.insert(k.clone(), strip_deep(x));
                 }
@@ -650,7 +650,7 @@ fn check_into(v: &SynValue, accepted: &Label, path: &mut String, ctx: &Label) ->
 }
 
 fn check_map(
-    m: &IndexMap<String, SynValue>,
+    m: &SynMap,
     accepted: &Label,
     path: &mut String,
     ctx: &Label,
@@ -728,10 +728,10 @@ mod tests {
 
     #[test]
     fn check_flow_paths() {
-        let mut data = IndexMap::new();
-        data.insert("amount".to_string(), mark(syn_int(5), l(&["app"])));
-        let mut ev = IndexMap::new();
-        ev.insert("data".to_string(), syn_map(data));
+        let mut data = SynMap::new();
+        data.insert("amount", mark(syn_int(5), l(&["app"])));
+        let mut ev = SynMap::new();
+        ev.insert("data", syn_map(data));
         let events = syn_list(vec![syn_map(ev)]);
         let err = check_flow(&events, &[], "events").unwrap_err();
         assert_eq!(err.path, "events[0].data.amount");

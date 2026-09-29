@@ -4,6 +4,7 @@
 //! custom, límite anti-DoS de tamaño de mensaje, y el gate G21 (`net(host)`
 //! deny-by-default, mismo scope que http_*).
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::net::TcpListener;
 use std::rc::Rc;
@@ -179,8 +180,8 @@ fn ws_custom_headers_reach_the_server() {
         let _ = ws.send(tungstenite::Message::text(got.borrow().clone()));
     });
     let mut i = interp_with_net(Some("127.0.0.1"));
-    let mut headers = indexmap::IndexMap::new();
-    headers.insert("X-Api-Key".to_string(), syn_text("s3cr3t-key"));
+    let mut headers = SynMap::new();
+    headers.insert("X-Api-Key", syn_text("s3cr3t-key"));
     let conn = ok(call(&mut i, "ws_connect", vec![
         syn_text(format!("ws://127.0.0.1:{}/", port).as_str()),
         syn_map(headers),
@@ -204,8 +205,8 @@ fn ws_max_message_size_is_enforced() {
         let _ = ws.read();
     });
     let mut i = interp_with_net(Some("127.0.0.1"));
-    let mut opts = indexmap::IndexMap::new();
-    opts.insert("max_message_size".to_string(), syn_int(64));
+    let mut opts = SynMap::new();
+    opts.insert("max_message_size", syn_int(64));
     let conn = ok(call(&mut i, "ws_connect", vec![
         syn_text(format!("ws://127.0.0.1:{}/", port).as_str()),
         SynValue::Nothing,

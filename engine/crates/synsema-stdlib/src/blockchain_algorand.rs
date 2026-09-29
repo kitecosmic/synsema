@@ -186,7 +186,7 @@ fn to_mp(
                 let child_addr: &'static [&'static str] =
                     if k == "apar" { APAR_ADDR_KEYS } else { &[] };
                 if let Some(mp) = to_mp(val, &child_path, child_addr, fname, depth + 1)? {
-                    entries.push((k.clone(), mp));
+                    entries.push((k.to_string(), mp));
                 }
             }
             if entries.is_empty() {

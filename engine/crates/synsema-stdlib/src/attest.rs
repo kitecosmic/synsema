@@ -47,11 +47,11 @@
 //! `SYNSEMA_ATTEST=dstack` explícito; parser HTTP sobre bytes con tope; `generation`
 //! de configfs-tsm antes y después de leer.
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
-use indexmap::IndexMap;
 use sha2::{Digest, Sha256};
 
 use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
@@ -1318,7 +1318,7 @@ fn require_attest(caps: &Rc<RefCell<CapabilitySet>>, source: &str) -> Result<(),
         .map_err(|v| Control::Error(v.into_error()))
 }
 
-fn opt_bytes(m: &IndexMap<String, SynValue>, key: &str, who: &str) -> Result<Option<Vec<u8>>, Control> {
+fn opt_bytes(m: &SynMap, key: &str, who: &str) -> Result<Option<Vec<u8>>, Control> {
     match m.get(key) {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Bytes(b)) => Ok(Some(b.to_vec())),
@@ -1328,23 +1328,23 @@ fn opt_bytes(m: &IndexMap<String, SynValue>, key: &str, who: &str) -> Result<Opt
 }
 
 fn result_to_map(res: &AttestResult) -> SynValue {
-    let mut out = IndexMap::new();
-    out.insert("format".to_string(), syn_text(res.format));
-    out.insert("document".to_string(), syn_bytes(res.document.clone()));
-    out.insert("driver".to_string(), syn_text(res.driver));
-    out.insert("report_data".to_string(), syn_bytes(res.report_data.clone()));
+    let mut out = SynMap::new();
+    out.insert("format", syn_text(res.format));
+    out.insert("document", syn_bytes(res.document.clone()));
+    out.insert("driver", syn_text(res.driver));
+    out.insert("report_data", syn_bytes(res.report_data.clone()));
     if let Some(aux) = &res.aux {
-        out.insert("aux".to_string(), syn_bytes(aux.clone()));
+        out.insert("aux", syn_bytes(aux.clone()));
     }
     if let Some(log) = &res.event_log {
-        out.insert("event_log".to_string(), syn_text(log.clone()));
+        out.insert("event_log", syn_text(log.clone()));
     }
     if let Some(root) = &res.root {
-        out.insert("root".to_string(), syn_bytes(root.clone()));
+        out.insert("root", syn_bytes(root.clone()));
     }
     // Auditoría externa: que nadie confunda un documento del mock con uno de plataforma.
     if res.driver == "mock" {
-        out.insert("mock".to_string(), syn_bool(true));
+        out.insert("mock", syn_bool(true));
     }
     syn_map(out)
 }
@@ -1354,7 +1354,7 @@ fn json_to_syn(v: &serde_json::Value) -> SynValue {
     match v {
         serde_json::Value::String(s) => syn_text(s.clone()),
         serde_json::Value::Object(o) => {
-            let mut m = IndexMap::new();
+            let mut m = SynMap::new();
             for (k, val) in o {
                 m.insert(k.clone(), json_to_syn(val));
             }

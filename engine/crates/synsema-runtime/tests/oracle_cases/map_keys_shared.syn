@@ -1,0 +1,79 @@
+-- F4.4 contra la referencia: claves de mapa compartidas (literales del chunk, `set m[k]` con un
+-- texto, `keys`, `json_decode`/`jsonl_decode` con memo, cabeceras de `csv_parse`). La semántica no
+-- cambia: orden de inserción, copy-on-write, `==` por valor. Cada task corre varias veces.
+
+task rec(i)
+    give {"id": i, "valor": i * i, "tag": "t" + text(i % 3)}
+
+-- Registros del mismo literal: comparten las claves, no los valores.
+let rows be apply(range(0, 6), rec)
+set rows[2].valor to -1
+set rows[3]["tag"] to "cambiado"
+print(rows)
+print([rows[1] == rec(1), rows[2] == rec(2), keys(rows[0]) == keys(rows[5])])
+
+-- Una copia y su original: escribir una no toca la otra (copy-on-write con claves compartidas).
+let a be rec(7)
+let b be a
+set b.id to 70
+set b["nuevo"] to true
+print([a, b, keys(a), keys(b)])
+
+-- Orden: reemplazar deja la clave en su lugar; borrar y volver a poner la manda al final.
+task churn(m, k)
+    set m[k] to 0
+    give m
+let m be {"x": 1, "y": 2, "z": 3}
+set m to churn(m, "y")
+print(m)
+set m to remove(m, "x")
+set m["x"] to 9
+print([m, keys(m)])
+
+-- Claves que no son texto usan su texto; el mismo texto por otro camino es la misma clave.
+let nk be {}
+set nk[1] to "int"
+set nk[2.5] to "float"
+set nk[true] to "bool"
+set nk["1"] to "texto"
+print([nk, length(keys(nk)), nk["1"], nk[1]])
+
+-- Un texto armado en la vuelta como clave (conteo de palabras chico).
+let counts be {}
+each w in split("uno dos tres dos uno uno cuatro", " ")
+    set counts[w] to get(counts, w, 0) + 1
+print([counts, sort(keys(counts))])
+
+-- keys() da textos: se pueden usar, concatenar y comparar.
+let ks be keys(rec(3))
+print([ks, join(ks, "|"), ks[0] + "!", ks == ["id", "valor", "tag"]])
+
+-- JSON: claves repetidas entre objetos (memo), clave duplicada en un objeto (gana la última, en la
+-- posición de la primera), claves con escapes, anidados de formas distintas, vacíos.
+let j be json_decode("[{\"id\": 1, \"v\": \"a\"}, {\"v\": \"b\", \"id\": 2}, {\"id\": 3, \"id\": 4, \"v\": \"c\"}, {\"a\\\"b\": 1, \"\\u00e9\": 2, \"x\\ny\": 3}, {\"n\": {\"id\": 5, \"deep\": {\"id\": 6}}}, {}, {\"id\": 7}]")
+print(j)
+print([keys(j[0]) == keys(j[2]), j[1] == {"id": 2, "v": "b"}, j[4].n.deep.id])
+set j[0].id to 100
+print([j[0], j[2]])
+
+-- JSON Lines: las claves se comparten entre líneas; cada línea es su propio mapa.
+let jl be jsonl_decode("{\"k\": 1, \"s\": \"x\"}\n{\"s\": \"y\", \"k\": 2}\n\n{\"k\": 3}\n")
+set jl[1].k to 20
+print([jl, keys(jl[0]), keys(jl[1])])
+
+-- CSV: las cabeceras se comparten entre filas; tipadas y no tipadas.
+let c be csv_parse("id,name,score\n1,ana,10\n2,bo,\n3,\"c,d\",30\n", {"types": {"id": "int", "score": "int"}})
+set c[0].name to "ANA"
+print([c, keys(c[1]), c[2]["name"]])
+let c2 be csv_parse("x,y\n1,2\n3,4\n")
+print([c2, c2[0] == {"x": "1", "y": "2"}])
+
+-- Un mapa en una lista de salida y lectura por el mismo sitio con otras formas.
+task pick(r, k)
+    give get(r, k, "falta")
+print([pick(j[0], "v"), pick(c[0], "name"), pick(jl[0], "k"), pick(counts, "uno"), pick(nk, "2.5"), pick({}, "id")])
+
+-- Literales con claves que no son texto, compilados (`MakeMap`): la clave es su texto.
+task lit(i)
+    give {1: i, true: "b", 2.5: "c", "x": i, i: "dinámica"}
+print([lit(1), lit(2), keys(lit(3)), lit(4)["1"], lit(5)[5]])

@@ -21,6 +21,7 @@
 //! tabla de rutas) y se cachea por (fuente, opciones): el handler se llama muchas
 //! veces por isolate; sólo el request cambia.
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -109,7 +110,7 @@ fn deep_clone(v: &SynValue) -> SynValue {
     match v {
         SynValue::List(l) => SynValue::List(Rc::new(RefCell::new(l.borrow().iter().map(deep_clone).collect()))),
         SynValue::Map(m) => {
-            let mut out = IndexMap::new();
+            let mut out = SynMap::new();
             for (k, x) in m.borrow().iter() {
                 out.insert(k.clone(), deep_clone(x));
             }

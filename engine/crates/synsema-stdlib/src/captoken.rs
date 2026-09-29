@@ -44,10 +44,10 @@
 //! (`opts.revoked`, típicamente leída de redis/sql). Sin esto, el primer incidente
 //! lo improvisa mal.
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use indexmap::IndexMap;
 
 use synsema_capabilities::model::{capability_type_from_name, is_process_local, Capability, CapabilitySet, Delegation};
 use synsema_core::bytesutil::{b64url_decode, b64url_encode};
@@ -522,7 +522,7 @@ fn key_material(v: &SynValue, who: &str) -> Result<Vec<u8>, Control> {
     }
 }
 
-fn as_map(v: &SynValue, who: &str, what: &str) -> Result<IndexMap<String, SynValue>, Control> {
+fn as_map(v: &SynValue, who: &str, what: &str) -> Result<SynMap, Control> {
     match v {
         SynValue::Map(m) => Ok(m.borrow().clone()),
         other => Err(err(format!(
@@ -536,7 +536,7 @@ fn as_map(v: &SynValue, who: &str, what: &str) -> Result<IndexMap<String, SynVal
 
 /// `{"net": "api.example.com", "db": ["a", "b"], "reveal": nothing}` → caps.
 /// `nothing` (o lista vacía) = la capability SIN scope (poder máximo del tipo).
-fn parse_caps(m: &IndexMap<String, SynValue>, who: &str) -> Result<Vec<(String, Vec<String>)>, Control> {
+fn parse_caps(m: &SynMap, who: &str) -> Result<Vec<(String, Vec<String>)>, Control> {
     let mut out: Vec<(String, Vec<String>)> = Vec::new();
     for (name, v) in m {
         // Valida el nombre contra el vocabulario del lenguaje (falla en el typo).
@@ -580,7 +580,7 @@ fn parse_caps(m: &IndexMap<String, SynValue>, who: &str) -> Result<Vec<(String, 
                 )))
             }
         };
-        out.push((name.clone(), scopes));
+        out.push((name.to_string(), scopes));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
@@ -588,7 +588,7 @@ fn parse_caps(m: &IndexMap<String, SynValue>, who: &str) -> Result<Vec<(String, 
 
 /// Opciones de caveats compartidas por mint y attenuate.
 fn parse_caveats(
-    m: &IndexMap<String, SynValue>,
+    m: &SynMap,
     who: &str,
     default_ttl: Option<i64>,
     caps: &Rc<RefCell<CapabilitySet>>,
@@ -644,7 +644,7 @@ fn parse_caveats(
                             who, unit
                         )));
                     }
-                    sp.push((unit.clone(), dec.normalize().to_string()));
+                    sp.push((unit.to_string(), dec.normalize().to_string()));
                 }
                 sp.sort();
                 c.spend = sp;
@@ -731,12 +731,12 @@ fn b_captoken_mint(args: &[SynValue], time_caps: &Rc<RefCell<CapabilitySet>>) ->
     let key = key_material(&args[1], F)?;
 
     let opts = match args.get(2) {
-        None | Some(SynValue::Nothing) => IndexMap::new(),
+        None | Some(SynValue::Nothing) => SynMap::new(),
         Some(v) => as_map(v, F, "opts")?,
     };
     // `id` es lo que se revoca: explícito o aleatorio (OsRng, como `token()`).
     let mut id: Option<String> = None;
-    let mut caveat_opts = IndexMap::new();
+    let mut caveat_opts = SynMap::new();
     for (k, v) in &opts {
         match k.as_str() {
             "id" => id = Some(v.to_string()),
@@ -798,7 +798,7 @@ fn b_captoken_attenuate(args: &[SynValue], time_caps: &Rc<RefCell<CapabilitySet>
     }
     let caps = parse_caps(&as_map(&args[1], F, "caps")?, F)?;
     let opts = match args.get(2) {
-        None | Some(SynValue::Nothing) => IndexMap::new(),
+        None | Some(SynValue::Nothing) => SynMap::new(),
         Some(v) => as_map(v, F, "opts")?,
     };
     // Sin TTL propio, el bloque hereda el `exp` del padre (no lo extiende).
@@ -860,7 +860,7 @@ fn b_captoken_attenuate(args: &[SynValue], time_caps: &Rc<RefCell<CapabilitySet>
 // =========================================================
 
 fn caps_to_syn(caps: &[(String, Vec<String>)]) -> SynValue {
-    let mut m = IndexMap::new();
+    let mut m = SynMap::new();
     for (name, scopes) in caps {
         m.insert(
             name.clone(),
@@ -883,7 +883,7 @@ fn b_captoken_verify(args: &[SynValue], time_caps: &Rc<RefCell<CapabilitySet>>) 
     let key = key_material(&args[1], F)?;
 
     let opts = match args.get(2) {
-        None | Some(SynValue::Nothing) => IndexMap::new(),
+        None | Some(SynValue::Nothing) => SynMap::new(),
         Some(v) => as_map(v, F, "opts")?,
     };
     let mut ctx_aud: Option<String> = None;
@@ -1046,11 +1046,11 @@ fn verify_inner(
     // Los caps efectivos son los del último bloque (ya validado como el más
     // restrictivo de la cadena).
     let last = t.blocks.last().expect("decode garantiza >= 1 bloque");
-    let mut out = IndexMap::new();
-    out.insert("id".to_string(), syn_text(t.id.as_str()));
-    out.insert("caps".to_string(), caps_to_syn(&last.caps));
-    out.insert("depth".to_string(), syn_int(t.blocks.len() as i64));
-    let mut cav = IndexMap::new();
+    let mut out = SynMap::new();
+    out.insert("id", syn_text(t.id.as_str()));
+    out.insert("caps", caps_to_syn(&last.caps));
+    out.insert("depth", syn_int(t.blocks.len() as i64));
+    let mut cav = SynMap::new();
     cav.insert(
         "exp".to_string(),
         eff.exp.map(syn_int).unwrap_or_else(syn_nothing),
@@ -1061,17 +1061,17 @@ fn verify_inner(
             v.as_ref().map(|s| syn_text(s.as_str())).unwrap_or_else(syn_nothing),
         );
     }
-    let mut sp = IndexMap::new();
+    let mut sp = SynMap::new();
     for (unit, amount) in &eff.spend {
         sp.insert(unit.clone(), syn_text(amount.as_str()));
     }
-    cav.insert("spend".to_string(), syn_map(sp));
-    cav.insert("deterministic".to_string(), SynValue::Bool(eff.deterministic));
+    cav.insert("spend", syn_map(sp));
+    cav.insert("deterministic", SynValue::Bool(eff.deterministic));
     cav.insert(
         "llm_tokens".to_string(),
         eff.llm_tokens.map(|n| syn_int(n as i64)).unwrap_or_else(syn_nothing),
     );
-    out.insert("caveats".to_string(), syn_map(cav));
+    out.insert("caveats", syn_map(cav));
     Ok(Some(syn_map(out)))
 }
 
@@ -1189,7 +1189,7 @@ pub fn register_captoken_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabil
 /// `delegation_of` (serve, por request), `run_program {ceiling: caps}` (por proceso) y
 /// `sandbox under caps` (por bloque). Mismos nombres que `require`; un scope vacío o
 /// `nothing` = la capability sin scope; las locales al proceso se rechazan como al acuñar.
-pub fn ceiling_from_caps_map(m: &IndexMap<String, SynValue>) -> Result<Vec<Capability>, String> {
+pub fn ceiling_from_caps_map(m: &SynMap) -> Result<Vec<Capability>, String> {
     let mut out = Vec::new();
     for (name, v) in m {
         let ty = capability_type_from_name(name).ok_or_else(|| {
@@ -1234,7 +1234,7 @@ pub fn ceiling_from_caps_map(m: &IndexMap<String, SynValue>) -> Result<Vec<Capab
 /// Un nombre desconocido o un scope mal formado CIERRA: techo vacío (el caller no delega
 /// nada reconocible: todo lo transferible se deniega) y un aviso por stderr, una vez por
 /// proceso. Antes, un token inconvertible corría SIN techo (auditoría T1–T4, ronda 1).
-pub fn delegated_ceiling_from_caps_map(m: &IndexMap<String, SynValue>) -> Vec<Capability> {
+pub fn delegated_ceiling_from_caps_map(m: &SynMap) -> Vec<Capability> {
     let mut out = Vec::new();
     for (name, v) in m {
         let Some(ty) = capability_type_from_name(name) else {
@@ -1323,7 +1323,7 @@ mod tests {
     }
 
     fn map(pairs: Vec<(&str, SynValue)>) -> SynValue {
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }
@@ -1373,7 +1373,7 @@ mod tests {
         b_captoken_verify(args, &caps_with_time())
     }
 
-    fn verified_map(v: &SynValue) -> IndexMap<String, SynValue> {
+    fn verified_map(v: &SynValue) -> SynMap {
         match v {
             SynValue::Map(m) => m.borrow().clone(),
             other => panic!("expected a verification map, got {}", other),
@@ -1807,7 +1807,7 @@ mod t1_tests {
     #[test]
     fn a_verified_tokens_ceiling_never_opens() {
         let m = |pairs: Vec<(&str, SynValue)>| {
-            let mut mm = IndexMap::new();
+            let mut mm = SynMap::new();
             for (k, v) in pairs {
                 mm.insert(k.to_string(), v);
             }
@@ -1833,7 +1833,7 @@ mod t1_tests {
     }
 
     fn map(pairs: Vec<(&str, SynValue)>) -> SynValue {
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }
@@ -1860,14 +1860,14 @@ mod t1_tests {
         }
     }
 
-    fn verified(v: SynValue) -> IndexMap<String, SynValue> {
+    fn verified(v: SynValue) -> SynMap {
         match v {
             SynValue::Map(m) => m.borrow().clone(),
             other => panic!("esperaba map, got {}", other),
         }
     }
 
-    fn entries(v: SynValue) -> IndexMap<String, SynValue> {
+    fn entries(v: SynValue) -> SynMap {
         verified(v)
     }
 

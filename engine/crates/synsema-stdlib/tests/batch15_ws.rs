@@ -7,6 +7,7 @@
 //! Foco de G25 (no busy-spin) medido con el contador `POLL_ITERS`: una espera ociosa
 //! de `ws_select` hace UNA sola iteración de `mio::Poll` (duerme en el kernel, CPU ~0).
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::net::TcpListener;
 use std::rc::Rc;
@@ -134,8 +135,8 @@ fn ws_select_by_name_map_tags_name() {
     let mut i = interp_net();
     let c = as_i64(&ok(call(&mut i, "ws_connect", vec![syn_text(format!("ws://127.0.0.1:{}/", p).as_str())])));
     ok(call(&mut i, "ws_send", vec![syn_int(c), syn_text("ping")]));
-    let mut names = indexmap::IndexMap::new();
-    names.insert("trades".to_string(), syn_int(c));
+    let mut names = SynMap::new();
+    names.insert("trades", syn_int(c));
     let sel = ok(call(&mut i, "ws_select", vec![syn_map(names), syn_int(5)]));
     assert_eq!(map_get(&sel, "name").to_string(), "trades", "un map nombre→handle etiqueta el nombre");
     assert_eq!(as_i64(&map_get(&sel, "conn")), c);
@@ -287,8 +288,8 @@ fn ws_backpressure_bounds_the_inbound_queue() {
         }
     });
     let mut i = interp_net();
-    let mut opts = indexmap::IndexMap::new();
-    opts.insert("max_queue".to_string(), syn_int(16));
+    let mut opts = SynMap::new();
+    opts.insert("max_queue", syn_int(16));
     // política por default = block (backpressure TCP): jamás supera max_queue.
     let c = as_i64(&ok(call(
         &mut i,
@@ -330,9 +331,9 @@ fn ws_backpressure_bounds_bytes_not_just_count() {
         }
     });
     let mut i = interp_net();
-    let mut opts = indexmap::IndexMap::new();
-    opts.insert("max_queue".to_string(), syn_int(1000));
-    opts.insert("max_queue_bytes".to_string(), syn_int(300 * 1024));
+    let mut opts = SynMap::new();
+    opts.insert("max_queue", syn_int(1000));
+    opts.insert("max_queue_bytes", syn_int(300 * 1024));
     let c = as_i64(&ok(call(
         &mut i,
         "ws_connect",
@@ -375,9 +376,9 @@ fn ws_on_full_error_surfaces_catchable_never_silent_drop() {
         }
     });
     let mut i = interp_net();
-    let mut opts = indexmap::IndexMap::new();
-    opts.insert("max_queue".to_string(), syn_int(4));
-    opts.insert("on_full".to_string(), syn_text("error"));
+    let mut opts = SynMap::new();
+    opts.insert("max_queue", syn_int(4));
+    opts.insert("on_full", syn_text("error"));
     let c = as_i64(&ok(call(
         &mut i,
         "ws_connect",
@@ -422,9 +423,9 @@ fn ws_on_full_drop_oldest_keeps_newest() {
         }
     });
     let mut i = interp_net();
-    let mut opts = indexmap::IndexMap::new();
-    opts.insert("max_queue".to_string(), syn_int(8));
-    opts.insert("on_full".to_string(), syn_text("drop_oldest"));
+    let mut opts = SynMap::new();
+    opts.insert("max_queue", syn_int(8));
+    opts.insert("on_full", syn_text("drop_oldest"));
     let c = as_i64(&ok(call(
         &mut i,
         "ws_connect",
@@ -595,7 +596,7 @@ fn ws_subprotocol_is_negotiated_and_exposed() {
         }
     });
     let mut i = interp_net();
-    let mut opts = indexmap::IndexMap::new();
+    let mut opts = SynMap::new();
     opts.insert(
         "subprotocols".to_string(),
         SynValue::List(Rc::new(RefCell::new(vec![syn_text("json"), syn_text("cbor")]))),

@@ -8,9 +8,9 @@
 //! Regenerar (sólo para kinds NUEVOS o cambios de spec aprobados):
 //!   SYNSEMA_BLESS=1 cargo test -p synsema-stdlib --test charts_golden
 
+use synsema_core::types::SynMap;
 use std::path::PathBuf;
 
-use indexmap::IndexMap;
 use synsema_core::types::{syn_bool, syn_float, syn_int, syn_list, syn_map, syn_text, SynValue};
 use synsema_stdlib::charts::chart_svg;
 
@@ -39,7 +39,7 @@ fn check(name: &str, svg: &str) {
 }
 
 fn map_data(pairs: &[(&str, f64)]) -> SynValue {
-    let mut m = IndexMap::new();
+    let mut m = SynMap::new();
     for (k, v) in pairs {
         m.insert(k.to_string(), syn_float(*v));
     }
@@ -48,17 +48,17 @@ fn map_data(pairs: &[(&str, f64)]) -> SynValue {
 
 fn rows_mes_a_b() -> SynValue {
     let mk = |mes: &str, a: f64, b: f64| {
-        let mut m = IndexMap::new();
-        m.insert("mes".to_string(), syn_text(mes));
-        m.insert("a".to_string(), syn_float(a));
-        m.insert("b".to_string(), syn_float(b));
+        let mut m = SynMap::new();
+        m.insert("mes", syn_text(mes));
+        m.insert("a", syn_float(a));
+        m.insert("b", syn_float(b));
         syn_map(m)
     };
     syn_list(vec![mk("ene", 10.0, 4.0), mk("feb", 25.0, 9.0), mk("mar", 17.0, 12.0)])
 }
 
 fn opts(pairs: Vec<(&str, SynValue)>) -> SynValue {
-    let mut m = IndexMap::new();
+    let mut m = SynMap::new();
     for (k, v) in pairs {
         m.insert(k.to_string(), v);
     }
@@ -165,10 +165,10 @@ fn golden_bar_stacked() {
 #[test]
 fn golden_heatmap_tidy() {
     let mk = |d: &str, h: &str, v: f64| {
-        let mut m = IndexMap::new();
-        m.insert("d".to_string(), syn_text(d));
-        m.insert("h".to_string(), syn_text(h));
-        m.insert("v".to_string(), syn_float(v));
+        let mut m = SynMap::new();
+        m.insert("d", syn_text(d));
+        m.insert("h", syn_text(h));
+        m.insert("v", syn_float(v));
         syn_map(m)
     };
     let rows = syn_list(vec![
@@ -209,7 +209,7 @@ fn golden_histogram_bins() {
 
 #[test]
 fn golden_boxplot_groups() {
-    let mut m = IndexMap::new();
+    let mut m = SynMap::new();
     m.insert(
         "web".to_string(),
         syn_list([1.0, 2.0, 3.0, 4.0, 5.0, 100.0].iter().map(|v| syn_float(*v)).collect()),

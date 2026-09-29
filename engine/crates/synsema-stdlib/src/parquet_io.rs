@@ -17,6 +17,7 @@
 //!   con el nombre de la columna. `opts.compression` = "snappy" (default), "zstd", "gzip",
 //!   "lz4" o "none".
 
+use synsema_core::types::{Key, SynMap};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -87,7 +88,7 @@ fn field_to_syn(f: &Field) -> SynValue {
             None => SynValue::Nothing,
         },
         Field::Group(row) => {
-            let mut m = IndexMap::new();
+            let mut m = SynMap::new();
             for (k, v) in row.get_column_iter() {
                 m.insert(k.clone(), field_to_syn(v));
             }
@@ -95,7 +96,7 @@ fn field_to_syn(f: &Field) -> SynValue {
         }
         Field::ListInternal(list) => syn_list(list.elements().iter().map(field_to_syn).collect()),
         Field::MapInternal(map) => {
-            let mut m = IndexMap::new();
+            let mut m = SynMap::new();
             for (k, v) in map.entries() {
                 let key = match field_to_syn(k) {
                     SynValue::Text(t) => t.to_string(),
@@ -520,10 +521,12 @@ fn parquet_read(args: &[SynValue]) -> Result<SynValue, Control> {
     }
     let rows = reader.get_row_iter(None).map_err(|e| err(format!("{}: {}", F, e)))?;
     let mut out = Vec::new();
+    // Las columnas como claves una vez por lectura: cada fila suma una referencia (F4.4).
+    let mut keys: Vec<Key> = Vec::new();
     for row in rows {
         let row = row.map_err(|e| err(format!("{}: {}", F, e)))?;
-        let mut m = IndexMap::new();
-        for (k, v) in row.get_column_iter() {
+        let mut m = SynMap::with_capacity(keys.len());
+        for (ci, (k, v)) in row.get_column_iter().enumerate() {
             let mut val = match (v, nanos.contains(k)) {
                 (Field::Long(ns), true) => {
                     let (secs, sub) = (ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000) as u32);
@@ -543,7 +546,12 @@ fn parquet_read(args: &[SynValue]) -> Result<SynValue, Control> {
                     val = SynValue::Time(Rc::new(Temporal::DateTime(dt.with_timezone(tz))));
                 }
             }
-            m.insert(k.clone(), val);
+            if keys.len() <= ci {
+                keys.push(Key::from(k));
+            } else if keys[ci].as_str() != k.as_str() {
+                keys[ci] = Key::from(k);
+            }
+            m.insert(keys[ci].clone(), val);
         }
         out.push(syn_map(m));
     }
@@ -849,7 +857,7 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
         };
         for (k, v) in &m {
             let k2 = kind_of(v, k)?;
-            let entry = cols.entry(k.clone()).or_insert(None);
+            let entry = cols.entry(k.to_string()).or_insert(None);
             *entry = match (*entry, k2) {
                 (None, x) => x,
                 (Some(a), None) => Some(a),

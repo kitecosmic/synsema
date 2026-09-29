@@ -666,13 +666,13 @@ impl LiveProc {
             Io::Pipe { child, .. } => match child.try_wait() {
                 Ok(Some(st)) => {
                     let code = st.code().map(|c| c as i64).unwrap_or(-1);
-                    #[allow(unused_mut)]
-                    let mut sig = None;
                     #[cfg(unix)]
-                    {
+                    let sig = {
                         use std::os::unix::process::ExitStatusExt;
-                        sig = st.signal();
-                    }
+                        st.signal()
+                    };
+                    #[cfg(not(unix))]
+                    let sig = None;
                     Ok(Some((code, sig)))
                 }
                 Ok(None) => Ok(None),

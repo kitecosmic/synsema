@@ -9,6 +9,7 @@
 //! Las FIRMAS gateadas se prueban acá a nivel de builtin CON la capability concedida
 //! (el gate/sandbox/audit se prueban por el runtime en batch11_e2e.rs).
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -506,13 +507,12 @@ fn rlp_rejects_unsupported_and_bad_input() {
 // py-algorand-sdk 2.x (Algorand). Prohibido "el vector es lo que produjo
 // nuestro binario".
 
-use indexmap::IndexMap;
 use synsema_core::number::Number;
 use synsema_core::types::syn_map;
 
 /// Map Synsema de pares (para params/typed-data de los tests).
 fn m(pairs: &[(&str, SynValue)]) -> SynValue {
-    let mut im = IndexMap::new();
+    let mut im = SynMap::new();
     for (k, v) in pairs {
         im.insert(k.to_string(), v.clone());
     }
@@ -1301,7 +1301,7 @@ fn solana_v0_matches_versioned_message_and_multi_instruction_ordering() {
         SynValue::Map(mp) => mp.borrow().clone(),
         _ => unreachable!(),
     };
-    params.insert("version".to_string(), syn_int(0));
+    params.insert("version", syn_int(0));
     let msg0 = ok_bytes(call(&mut i, "solana_tx", vec![syn_map(params.clone())]));
     assert_eq!(
         hex_encode(&msg0),
@@ -1322,7 +1322,7 @@ fn solana_v0_matches_versioned_message_and_multi_instruction_ordering() {
     );
 
     // lookup_tables presente → error claro (etapa 3), no silencio.
-    params.insert("lookup_tables".to_string(), syn_list(vec![]));
+    params.insert("lookup_tables", syn_list(vec![]));
     let e = ok_err(call(&mut i, "solana_tx", vec![syn_map(params)]));
     assert!(e.contains("not supported yet"), "{}", e);
 
@@ -1670,7 +1670,7 @@ fn deep_nesting_errors_instead_of_crashing() {
             // -- EIP-712: cadena acíclica larguísima A0→A1→…→An → error. El guard
             //    de ciclos NO la cubre (es acíclica); sólo la cota de profundidad. --
             let n = 5_000usize;
-            let mut im = IndexMap::new();
+            let mut im = SynMap::new();
             for k in 0..n {
                 let field_type =
                     if k + 1 < n { format!("A{}", k + 1) } else { "uint256".to_string() };

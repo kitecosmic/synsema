@@ -14,6 +14,7 @@
 //! builtins en `interpreter.rs::register_builtins`). Las constantes `pi/tau/e/
 //! inf/nan` se registran allí como VALORES globales (no funciones).
 
+use crate::types::SynMap;
 use std::cmp::Ordering;
 
 use num_bigint::{BigInt, Sign};
@@ -727,7 +728,7 @@ pub fn histogram(args: &[SynValue]) -> Result<SynValue, Control> {
         };
         counts[bin] += 1;
     }
-    let mut out = indexmap::IndexMap::new();
+    let mut out = SynMap::new();
     out.insert(
         "counts".to_string(),
         crate::types::syn_list(counts.into_iter().map(syn_int).collect()),

@@ -48,9 +48,9 @@
 //! el fork `HorizenOfficial/NitroProver` trae los mismos bytes), embebidos como golden. Están
 //! expirados, así que los tests fijan `now` dentro de la ventana de la hoja.
 
+use synsema_core::types::SynMap;
 use std::rc::Rc;
 
-use indexmap::IndexMap;
 use p384::ecdsa::signature::Verifier as _;
 use sha2::{Digest, Sha256};
 use x509_parser::oid_registry::{OID_KEY_TYPE_EC_PUBLIC_KEY, OID_NIST_EC_P384, OID_SIG_ECDSA_WITH_SHA384};
@@ -476,7 +476,7 @@ fn verify_nitro(doc: &[u8], opts: &Opts, format: Format) -> Result<SynValue, Con
     // Medidas normalizadas: "pcrN" → hex, por índice.
     let mut pcrs = payload.pcrs.clone();
     pcrs.sort_by_key(|(i, _)| *i);
-    let mut measurements: IndexMap<String, SynValue> = IndexMap::new();
+    let mut measurements: SynMap = SynMap::new();
     let mut measurements_hex: Vec<(String, String)> = Vec::new();
     for (i, v) in &pcrs {
         let h = hex_encode(v);
@@ -502,28 +502,28 @@ fn verify_nitro(doc: &[u8], opts: &Opts, format: Format) -> Result<SynValue, Con
         Some(b) => syn_bytes(b.clone()),
         None => syn_nothing(),
     };
-    let mut out: IndexMap<String, SynValue> = IndexMap::new();
-    out.insert("format".into(), syn_text(format.name()));
-    out.insert("measurements".into(), syn_map(measurements));
-    out.insert("report_data".into(), syn_bytes(payload.user_data.clone().unwrap_or_default()));
-    out.insert("user_data".into(), opt_bytes_val(&payload.user_data));
-    out.insert("public_key".into(), opt_bytes_val(&payload.public_key));
-    out.insert("nonce".into(), opt_bytes_val(&payload.nonce));
-    out.insert("timestamp".into(), syn_int((payload.timestamp_ms / 1000) as i64));
-    out.insert("module_id".into(), syn_text(payload.module_id.as_str()));
-    out.insert("digest".into(), syn_text(payload.digest.as_str()));
+    let mut out: SynMap = SynMap::new();
+    out.insert("format", syn_text(format.name()));
+    out.insert("measurements", syn_map(measurements));
+    out.insert("report_data", syn_bytes(payload.user_data.clone().unwrap_or_default()));
+    out.insert("user_data", opt_bytes_val(&payload.user_data));
+    out.insert("public_key", opt_bytes_val(&payload.public_key));
+    out.insert("nonce", opt_bytes_val(&payload.nonce));
+    out.insert("timestamp", syn_int((payload.timestamp_ms / 1000) as i64));
+    out.insert("module_id", syn_text(payload.module_id.as_str()));
+    out.insert("digest", syn_text(payload.digest.as_str()));
     let chain_vals: Vec<SynValue> = chain
         .iter()
         .map(|e| {
-            let mut m = IndexMap::new();
-            m.insert("subject".to_string(), syn_text(e.subject.as_str()));
-            m.insert("not_before".to_string(), syn_int(e.not_before));
-            m.insert("not_after".to_string(), syn_int(e.not_after));
+            let mut m = SynMap::new();
+            m.insert("subject", syn_text(e.subject.as_str()));
+            m.insert("not_before", syn_int(e.not_before));
+            m.insert("not_after", syn_int(e.not_after));
             syn_map(m)
         })
         .collect();
-    out.insert("chain".into(), syn_list(chain_vals));
-    out.insert("tcb".into(), syn_nothing());
+    out.insert("chain", syn_list(chain_vals));
+    out.insert("tcb", syn_nothing());
     Ok(syn_map(out))
 }
 
@@ -580,7 +580,7 @@ mod tests {
     /// otra instancia, 2024-04-03.
     const REAL_2: &[u8] = include_bytes!("fixtures/attestation/nitro_marlin_sample_attestation2.bin");
 
-    fn ok(r: Result<SynValue, Control>) -> IndexMap<String, SynValue> {
+    fn ok(r: Result<SynValue, Control>) -> SynMap {
         match r {
             Ok(SynValue::Map(m)) => m.borrow().clone(),
             Ok(other) => panic!("esperaba map, got {}", other),
@@ -598,7 +598,7 @@ mod tests {
     }
 
     fn map(pairs: Vec<(&str, SynValue)>) -> SynValue {
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }
@@ -626,7 +626,7 @@ mod tests {
         }
     }
 
-    fn map_of(v: &SynValue) -> IndexMap<String, SynValue> {
+    fn map_of(v: &SynValue) -> SynMap {
         match v {
             SynValue::Map(m) => m.borrow().clone(),
             other => panic!("esperaba map, got {}", other),

@@ -9,10 +9,10 @@
 //! embebedor puede ofrecer `http`, pero el programa sigue teniendo que declarar
 //! `require net("host")` y el techo del embebedor sigue mandando.
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use indexmap::IndexMap;
 use synsema_capabilities::model::{Capability, CapabilitySet, CapabilityType};
 use synsema_capabilities::secure::url_hostname;
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
@@ -127,7 +127,7 @@ pub fn map_pairs(v: Option<&SynValue>) -> Option<Vec<(String, String)>> {
         Some(SynValue::Map(m)) => Some(
             m.borrow()
                 .iter()
-                .map(|(k, val)| (k.clone(), val.to_string()))
+                .map(|(k, val)| (k.to_string(), val.to_string()))
                 .collect(),
         ),
         _ => None,
@@ -142,8 +142,8 @@ pub fn header_pairs(v: Option<&SynValue>) -> Option<Vec<(String, String)>> {
             m.borrow()
                 .iter()
                 .map(|(k, val)| match val {
-                    SynValue::Secret(s) => (k.clone(), s.expose().to_string()),
-                    other => (k.clone(), other.to_string()),
+                    SynValue::Secret(s) => (k.to_string(), s.expose().to_string()),
+                    other => (k.to_string(), other.to_string()),
                 })
                 .collect(),
         ),
@@ -213,39 +213,39 @@ fn parsed_json(headers: &[(String, String)], body: &str) -> SynValue {
 
 /// v0.6.20 — la respuesta de `http_bytes`: `bytes` exactos en vez de `body` texto.
 pub fn response_to_syn_bytes(r: HttpResult) -> SynValue {
-    let mut m = IndexMap::new();
-    m.insert("status".to_string(), syn_int(r.status));
-    m.insert("ok".to_string(), syn_bool(r.ok));
-    m.insert("bytes".to_string(), syn_bytes(r.body_bytes));
+    let mut m = SynMap::new();
+    m.insert("status", syn_int(r.status));
+    m.insert("ok", syn_bool(r.ok));
+    m.insert("bytes", syn_bytes(r.body_bytes));
     if !r.headers.is_empty() {
-        let mut hm = IndexMap::new();
+        let mut hm = SynMap::new();
         for (k, v) in r.headers {
             hm.insert(k, syn_text(v));
         }
-        m.insert("headers".to_string(), syn_map(hm));
+        m.insert("headers", syn_map(hm));
     }
     if let Some(e) = r.error {
-        m.insert("error".to_string(), syn_text(e));
+        m.insert("error", syn_text(e));
     }
     syn_map(m)
 }
 
 pub fn response_to_syn(r: HttpResult) -> SynValue {
-    let mut m = IndexMap::new();
-    m.insert("status".to_string(), syn_int(r.status));
-    m.insert("ok".to_string(), syn_bool(r.ok));
+    let mut m = SynMap::new();
+    m.insert("status", syn_int(r.status));
+    m.insert("ok", syn_bool(r.ok));
     let json = parsed_json(&r.headers, &r.body);
-    m.insert("body".to_string(), syn_text(r.body));
-    m.insert("json".to_string(), json);
+    m.insert("body", syn_text(r.body));
+    m.insert("json", json);
     if !r.headers.is_empty() {
-        let mut hm = IndexMap::new();
+        let mut hm = SynMap::new();
         for (k, v) in r.headers {
             hm.insert(k, syn_text(v));
         }
-        m.insert("headers".to_string(), syn_map(hm));
+        m.insert("headers", syn_map(hm));
     }
     if let Some(e) = r.error {
-        m.insert("error".to_string(), syn_text(e));
+        m.insert("error", syn_text(e));
     }
     syn_map(m)
 }
@@ -552,8 +552,8 @@ pub fn multipart_encode(args: &[SynValue]) -> Result<SynValue, Control> {
         body.extend_from_slice(b"\r\n");
     }
     body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
-    let mut out = IndexMap::new();
-    out.insert("body".to_string(), syn_bytes(body));
+    let mut out = SynMap::new();
+    out.insert("body", syn_bytes(body));
     out.insert(
         "content_type".to_string(),
         syn_text(format!("multipart/form-data; boundary={}", boundary)),
@@ -567,7 +567,7 @@ mod v0620_tests {
     use synsema_core::types::syn_list;
 
     fn map(pairs: &[(&str, SynValue)]) -> SynValue {
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         for (k, v) in pairs {
             m.insert(k.to_string(), v.clone());
         }
@@ -609,7 +609,7 @@ mod v0620_tests {
         };
         let v = response_to_syn(r);
         let SynValue::Map(m) = &v else { panic!() };
-        let keys: Vec<String> = m.borrow().keys().cloned().collect();
+        let keys: Vec<String> = m.borrow().keys().map(|k| k.to_string()).collect();
         assert_eq!(keys, vec!["status", "ok", "body", "json", "headers"]);
         assert_eq!(m.borrow().get("json").unwrap().to_string(), "{a: [1, 2]}");
         let r = HttpResult {

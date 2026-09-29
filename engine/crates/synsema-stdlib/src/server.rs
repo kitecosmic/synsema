@@ -4240,11 +4240,11 @@ mod tests {
         // Defaults seguros: Path=/; Secure; HttpOnly; SameSite=Lax.
         assert_eq!(c, "sid=abc123; Path=/; Secure; HttpOnly; SameSite=Lax");
         // max_age + overrides.
-        let mut m = IndexMap::new();
-        m.insert("max_age".to_string(), syn_int(86400));
-        m.insert("path".to_string(), syn_text("/app"));
-        m.insert("same_site".to_string(), syn_text("Strict"));
-        m.insert("http_only".to_string(), syn_bool(false));
+        let mut m = synsema_core::types::SynMap::new();
+        m.insert("max_age", syn_int(86400));
+        m.insert("path", syn_text("/app"));
+        m.insert("same_site", syn_text("Strict"));
+        m.insert("http_only", syn_bool(false));
         let o = parse_cookie_opts("set_cookie", Some(&syn_map(m)), true).ok().unwrap();
         let c = build_set_cookie("set_cookie", "sid", "v", &o).ok().unwrap();
         assert_eq!(c, "sid=v; Max-Age=86400; Path=/app; Secure; SameSite=Strict");
@@ -4267,28 +4267,28 @@ mod tests {
         assert!(build_set_cookie("set_cookie", "sid", "a;b", &o).is_err());
         assert!(build_set_cookie("set_cookie", "sid", "a\"b", &o).is_err());
         // same_site None sin Secure → error (el browser la rechazaría).
-        let mut m = IndexMap::new();
-        m.insert("same_site".to_string(), syn_text("None"));
-        m.insert("secure".to_string(), syn_bool(false));
+        let mut m = synsema_core::types::SynMap::new();
+        m.insert("same_site", syn_text("None"));
+        m.insert("secure", syn_bool(false));
         let o = parse_cookie_opts("set_cookie", Some(&syn_map(m)), true).ok().unwrap();
         assert!(build_set_cookie("set_cookie", "sid", "v", &o).is_err());
         // …con Secure sí vale.
-        let mut m = IndexMap::new();
-        m.insert("same_site".to_string(), syn_text("None"));
+        let mut m = synsema_core::types::SynMap::new();
+        m.insert("same_site", syn_text("None"));
         let o = parse_cookie_opts("set_cookie", Some(&syn_map(m)), true).ok().unwrap();
         let c = build_set_cookie("set_cookie", "sid", "v", &o).ok().unwrap();
         assert!(c.ends_with("SameSite=None") && c.contains("Secure"));
         // Opt desconocida → error con las válidas.
-        let mut m = IndexMap::new();
-        m.insert("httponly".to_string(), syn_bool(true));
+        let mut m = synsema_core::types::SynMap::new();
+        m.insert("httponly", syn_bool(true));
         assert!(parse_cookie_opts("set_cookie", Some(&syn_map(m)), true).is_err());
         // max_age negativo o no-entero → error.
-        let mut m = IndexMap::new();
-        m.insert("max_age".to_string(), syn_int(-1));
+        let mut m = synsema_core::types::SynMap::new();
+        m.insert("max_age", syn_int(-1));
         assert!(parse_cookie_opts("set_cookie", Some(&syn_map(m)), true).is_err());
         // clear_cookie sólo acepta path/domain.
-        let mut m = IndexMap::new();
-        m.insert("max_age".to_string(), syn_int(5));
+        let mut m = synsema_core::types::SynMap::new();
+        m.insert("max_age", syn_int(5));
         assert!(parse_cookie_opts("clear_cookie", Some(&syn_map(m)), false).is_err());
     }
 
@@ -4331,7 +4331,7 @@ mod tests {
         // El dispatch pela el wrapper ANTES de build_response; este test fija que
         // el valor envuelto (inner) responde idéntico a como respondería solo.
         let inner = make_raw_val("hola".to_string(), "text/plain", 201);
-        let q = IndexMap::new();
+        let q = indexmap::IndexMap::new();
         let (st_direct, _) = build_response(Some(&inner), &q).unwrap();
         assert_eq!(st_direct, 201);
     }

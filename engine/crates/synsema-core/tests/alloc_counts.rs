@@ -68,6 +68,18 @@ fn per_iteration(make: impl Fn(u64) -> String) -> Result<u64, String> {
     Ok(d / 1000)
 }
 
+/// Como `per_iteration`, para lo que arma una lista que crece al doble: entre N = 1000 y 2000 hay
+/// a lo sumo un puñado de `realloc` que no son por fila (menos de 16 en total).
+fn per_row_amortized(make: impl Fn(u64) -> String) -> Result<u64, String> {
+    let a = allocs_for(&make(1000));
+    let b = allocs_for(&make(2000));
+    let d = b.checked_sub(a).ok_or_else(|| format!("N=2000 pidió menos que N=1000 ({} < {})", b, a))?;
+    if d % 1000 >= 16 {
+        return Err(format!("no es un número entero por fila: {} / 1000", d));
+    }
+    Ok(d / 1000)
+}
+
 #[test]
 fn heap_allocations_per_construct() {
     // (nombre, preludio, cuerpo del bucle, mallocs por vuelta HOY con el bucle incluido).
@@ -97,6 +109,15 @@ fn heap_allocations_per_construct() {
         ("llamada f(1, 1, 1)", "task f(p0, p1, p2)\n    give 1\n", "    set x to f(1, 1, 1)\n", 0),
         ("llamada f(1, 1, 1, 1)", "task f(p0, p1, p2, p3)\n    give 1\n", "    set x to f(1, 1, 1, 1)\n", 0),
         ("llamada f(1, 1, 1, 1, 1)", "task f(p0, p1, p2, p3, p4)\n    give 1\n", "    set x to f(1, 1, 1, 1, 1)\n", 0),
+        // F4.4: las claves de un literal salen del chunk (compartidas); el mapa: la caja, las
+        // entradas y la tabla. Antes: 5 (cada clave, un `String` propio).
+        ("registro {\"id\": i, \"valor\": i}", "", "    set x to {\"id\": i, \"valor\": i}\n", 3),
+        // F4.4: una clave de texto que ya está no asigna (antes: 1, un `String` que se tiraba).
+        ("set m[k] (clave que ya está)", "let m be {\"a\": 1}\nlet k be \"a\"\n", "    set m[k] to i\n", 0),
+        // F4.4: `set m.a` sobre una clave que ya está sólo cambia el valor (antes: 1).
+        ("set m.a (clave que ya está)", "let m be {\"a\": 1}\n", "    set m.a to i\n", 0),
+        // F4.4: `keys` comparte el texto de cada clave (antes: 4, uno por clave).
+        ("keys(m) de 2 claves", "let m be {\"a\": 1, \"b\": 2}\n", "    set x to keys(m)\n", 2),
     ];
 
     let mut rows = Vec::new();
@@ -105,6 +126,16 @@ fn heap_allocations_per_construct() {
     }
     // `each` sobre `range`: la vuelta (entorno nuevo + clave + tabla; el nombre formateado ya no, F1.6).
     rows.push(("vuelta de each + set x to 1", per_iteration(|n| format!("let x be 0\neach i in range(0, {})\n    set x to 1\n", n)), 0));
+    // F4.4: `csv_parse` por fila de 2 columnas: las cabeceras, claves una vez por llamada. Las
+    // listas que crecen al doble suman unos pocos `realloc` por llamada (no por fila): se descuentan.
+    rows.push((
+        "csv_parse por fila",
+        per_row_amortized(|n| {
+            let body: String = (0..n).map(|i| format!("{},{}\\n", i, i)).collect();
+            format!("let d be csv_parse(\"id,v\\n{}\", {{\"numbers\": true}})\n", body)
+        }),
+        6, // antes: 8 (las dos cabeceras, un `String` por fila)
+    ));
 
     let mut report = String::new();
     let mut bad = 0;

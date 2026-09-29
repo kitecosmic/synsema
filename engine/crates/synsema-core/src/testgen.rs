@@ -6,12 +6,12 @@
 //! relleno aleatorio (los counts del gate ≤ casos borde → determinista) ni el timeout
 //! por caso (los programas del gate no recursan).
 
+use crate::types::SynMap;
 use crate::ast::{NodeKind, Program};
 use crate::ast_api::{find_invariants, find_tasks, find_types};
 use crate::interpreter::{Control, Interpreter};
 use crate::parser::parse_source;
 use crate::types::{syn_bool, syn_int, syn_list, syn_map, syn_nothing, syn_text, SynValue};
-use indexmap::IndexMap;
 
 // -- Generadores de valores (casos borde, sin aleatoriedad) --
 
@@ -60,13 +60,13 @@ fn gen_lists(count: usize) -> Vec<SynValue> {
 }
 
 fn gen_maps(count: usize) -> Vec<SynValue> {
-    let mut single = IndexMap::new();
-    single.insert("key".to_string(), syn_text("value"));
-    let mut triple = IndexMap::new();
-    triple.insert("a".to_string(), syn_int(1));
-    triple.insert("b".to_string(), syn_int(2));
-    triple.insert("c".to_string(), syn_int(3));
-    let edge = vec![syn_map(IndexMap::new()), syn_map(single), syn_map(triple)];
+    let mut single = SynMap::new();
+    single.insert("key", syn_text("value"));
+    let mut triple = SynMap::new();
+    triple.insert("a", syn_int(1));
+    triple.insert("b", syn_int(2));
+    triple.insert("c", syn_int(3));
+    let edge = vec![syn_map(SynMap::new()), syn_map(single), syn_map(triple)];
     edge.into_iter().take(count).collect()
 }
 

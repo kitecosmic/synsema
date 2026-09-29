@@ -215,6 +215,7 @@ pub(crate) fn take_host_flags(cmd: &str, args: &[String]) -> Result<HostFlags, E
 mod audit {
     /// Knobs del HOST que lee el CLI (espejo de `LLM_ENV_VARS`/`SERVE_ENV_VARS`…): el test
     /// anti-rot `env_example_in_sync_with_engine_knobs` los cruza con el `.env.example` de `init`.
+    #[cfg(test)]
     pub const HOST_ENV_VARS: &[&str] = &["SYNSEMA_AUDIT"];
 
     use std::io::Write;

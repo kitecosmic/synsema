@@ -24,6 +24,7 @@
 //!   pero la MISMA wordlist inglesa), keystore V3 de Ethereum (scrypt/pbkdf2 +
 //!   AES-128-CTR + MAC keccak256 — Geth/MyEtherWallet).
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -876,7 +877,7 @@ fn keystore_export(
     };
     let result = (|| {
         let opts = match args.get(2) {
-            None | Some(SynValue::Nothing) => indexmap::IndexMap::new(),
+            None | Some(SynValue::Nothing) => SynMap::new(),
             Some(SynValue::Map(m)) => m.borrow().clone(),
             Some(other) => {
                 return Err(err(format!(

@@ -19,12 +19,12 @@
 //! - el hijo nunca es más nativo que el padre (`pure` padre → `pure` hijo).
 //! - `timeout` (default 30 s) mata el ÁRBOL del hijo; la cancelación del padre también.
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use indexmap::IndexMap;
 use synsema_capabilities::model::{
     build_ceiling, Capability, CapabilityAuditEntry, CapabilitySet, CapabilityType,
 };
@@ -195,7 +195,7 @@ pub fn register_run_program_builtin(interp: &Interpreter, caps: Rc<RefCell<Capab
                 None | Some(SynValue::Nothing) => {}
                 Some(SynValue::Map(m)) => {
                     for (k, v) in m.borrow().iter() {
-                        env.push((k.clone(), text_of(v, &format!("env \"{}\"", k))?));
+                        env.push((k.to_string(), text_of(v, &format!("env \"{}\"", k))?));
                     }
                 }
                 Some(_) => return Err(rt("run_program: env must be a map of text")),
@@ -300,7 +300,7 @@ pub fn register_run_program_builtin(interp: &Interpreter, caps: Rc<RefCell<Capab
             let exit_code = status.and_then(|s| s.code());
 
             // 7) El informe del hijo → valor.
-            let mut r: IndexMap<String, SynValue> = IndexMap::new();
+            let mut r: SynMap = SynMap::new();
             let parsed: Option<serde_json::Value> = if timed_out {
                 None
             } else {
@@ -309,24 +309,24 @@ pub fn register_run_program_builtin(interp: &Interpreter, caps: Rc<RefCell<Capab
             match parsed {
                 Some(v) => {
                     let ok = v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
-                    r.insert("ok".into(), syn_bool(ok));
-                    r.insert("output".into(), json_to_syn(v.get("output").unwrap_or(&serde_json::Value::Array(vec![]))));
-                    r.insert("errors".into(), json_to_syn(v.get("errors").unwrap_or(&serde_json::Value::Array(vec![]))));
-                    r.insert("audit".into(), json_to_syn(v.get("audit").unwrap_or(&serde_json::Value::Array(vec![]))));
+                    r.insert("ok", syn_bool(ok));
+                    r.insert("output", json_to_syn(v.get("output").unwrap_or(&serde_json::Value::Array(vec![]))));
+                    r.insert("errors", json_to_syn(v.get("errors").unwrap_or(&serde_json::Value::Array(vec![]))));
+                    r.insert("audit", json_to_syn(v.get("audit").unwrap_or(&serde_json::Value::Array(vec![]))));
                     r.insert(
-                        "exit".into(),
+                        "exit",
                         match exit_code {
                             Some(c) => syn_int(c as i64),
                             None => SynValue::Nothing,
                         },
                     );
-                    r.insert("timed_out".into(), syn_bool(false));
+                    r.insert("timed_out", syn_bool(false));
                     r.insert(
-                        "llm_tokens".into(),
+                        "llm_tokens",
                         syn_int(v.get("llm_tokens").and_then(|x| x.as_i64()).unwrap_or(0)),
                     );
                     // v0.6.20 — pasos del intérprete hijo (contador determinista; ver `steps()`).
-                    r.insert("steps".into(), syn_int(v.get("steps").and_then(|x| x.as_i64()).unwrap_or(0)));
+                    r.insert("steps", syn_int(v.get("steps").and_then(|x| x.as_i64()).unwrap_or(0)));
                 }
                 None => {
                     let msg = if timed_out {
@@ -339,20 +339,20 @@ pub fn register_run_program_builtin(interp: &Interpreter, caps: Rc<RefCell<Capab
                             tail.trim()
                         )
                     };
-                    r.insert("ok".into(), syn_bool(false));
-                    r.insert("output".into(), syn_list(Vec::new()));
-                    r.insert("errors".into(), syn_list(vec![syn_text(msg)]));
-                    r.insert("audit".into(), syn_list(Vec::new()));
+                    r.insert("ok", syn_bool(false));
+                    r.insert("output", syn_list(Vec::new()));
+                    r.insert("errors", syn_list(vec![syn_text(msg)]));
+                    r.insert("audit", syn_list(Vec::new()));
                     r.insert(
-                        "exit".into(),
+                        "exit",
                         match exit_code {
                             Some(c) if !timed_out => syn_int(c as i64),
                             _ => SynValue::Nothing,
                         },
                     );
-                    r.insert("timed_out".into(), syn_bool(timed_out));
-                    r.insert("llm_tokens".into(), syn_int(0));
-                    r.insert("steps".into(), syn_int(0));
+                    r.insert("timed_out", syn_bool(timed_out));
+                    r.insert("llm_tokens", syn_int(0));
+                    r.insert("steps", syn_int(0));
                 }
             }
             Ok(syn_map(r))

@@ -17,11 +17,11 @@
 //!
 //! Todo RustCrypto puro-Rust, ya en el árbol salvo `p521` (0.13, misma pila que `p256`).
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use hkdf::Hkdf;
-use indexmap::IndexMap;
 use p256::elliptic_curve::sec1::ToEncodedPoint;
 use sha2::Sha256;
 use zeroize::Zeroize;
@@ -162,9 +162,9 @@ fn b_ecdh_keypair(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Resul
     require_random(caps, "ecdh_keypair()")?;
     let mut private = random_scalar(curve, F)?;
     let public = public_of(curve, &private, F)?;
-    let mut out = IndexMap::new();
-    out.insert("private".to_string(), syn_secret_bytes("ecdh_keypair.private", private.clone()));
-    out.insert("public".to_string(), syn_bytes(public));
+    let mut out = SynMap::new();
+    out.insert("private", syn_secret_bytes("ecdh_keypair.private", private.clone()));
+    out.insert("public", syn_bytes(public));
     private.zeroize();
     Ok(syn_map(out))
 }

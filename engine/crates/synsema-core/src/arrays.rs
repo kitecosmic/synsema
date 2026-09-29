@@ -8,13 +8,13 @@
 //! Builtins puros (sin capability). Errores claros, nunca NaN/panic silencioso por shapes
 //! incompatibles, no-2D en LA, o matriz singular (G3).
 
+use crate::types::SynMap;
 use ndarray::{ArrayD, Axis, IxDyn};
 
 use faer::linalg::matmul::matmul as faer_matmul_into;
 use faer::linalg::solvers::{DenseSolveCore, Solve};
 use faer::{Accum, Mat, Par};
 
-use indexmap::IndexMap;
 
 use crate::interpreter::{Control, RuntimeError};
 use crate::number::Number;
@@ -766,9 +766,9 @@ pub fn eig(args: &[SynValue]) -> Result<SynValue, Control> {
             syn_list(col)
         })
         .collect();
-    let mut m = IndexMap::new();
-    m.insert("values".to_string(), syn_list(values));
-    m.insert("vectors".to_string(), syn_list(vectors));
+    let mut m = SynMap::new();
+    m.insert("values", syn_list(values));
+    m.insert("vectors", syn_list(vectors));
     Ok(syn_map(m))
 }
 
@@ -786,10 +786,10 @@ pub fn svd(args: &[SynValue]) -> Result<SynValue, Control> {
     let s_diag = decomp.S();
     let k = s_diag.dim();
     let s: Vec<f64> = (0..k).map(|i| s_diag[i]).collect();
-    let mut m = IndexMap::new();
-    m.insert("u".to_string(), syn_array(u));
-    m.insert("s".to_string(), syn_array(ArrayD::from_shape_vec(IxDyn(&[k]), s).unwrap()));
-    m.insert("vt".to_string(), syn_array(vt));
+    let mut m = SynMap::new();
+    m.insert("u", syn_array(u));
+    m.insert("s", syn_array(ArrayD::from_shape_vec(IxDyn(&[k]), s).unwrap()));
+    m.insert("vt", syn_array(vt));
     Ok(syn_map(m))
 }
 

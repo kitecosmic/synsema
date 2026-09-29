@@ -26,10 +26,10 @@
 //! CLAVE PÚBLICA ed25519 (que es pública) como clave HMAC: falsificación total. Es
 //! el mismo ataque que RS256→HS256 en JWT.
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use indexmap::IndexMap;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
@@ -88,9 +88,9 @@ fn unix_now() -> i64 {
     synsema_core::clock::now_secs()
 }
 
-fn opts_map(v: Option<&SynValue>, who: &str) -> Result<IndexMap<String, SynValue>, Control> {
+fn opts_map(v: Option<&SynValue>, who: &str) -> Result<SynMap, Control> {
     match v {
-        None | Some(SynValue::Nothing) => Ok(IndexMap::new()),
+        None | Some(SynValue::Nothing) => Ok(SynMap::new()),
         Some(SynValue::Map(m)) => Ok(m.borrow().clone()),
         Some(other) => Err(err(format!(
             "{}: opts must be a map, got {}",
@@ -100,7 +100,7 @@ fn opts_map(v: Option<&SynValue>, who: &str) -> Result<IndexMap<String, SynValue
     }
 }
 
-fn req_map(v: &SynValue, who: &str) -> Result<IndexMap<String, SynValue>, Control> {
+fn req_map(v: &SynValue, who: &str) -> Result<SynMap, Control> {
     match v {
         SynValue::Map(m) => Ok(m.borrow().clone()),
         other => Err(err(format!(
@@ -112,7 +112,7 @@ fn req_map(v: &SynValue, who: &str) -> Result<IndexMap<String, SynValue>, Contro
 }
 
 /// Campo de texto requerido del map de request.
-fn req_text(m: &IndexMap<String, SynValue>, key: &str, who: &str) -> Result<String, Control> {
+fn req_text(m: &SynMap, key: &str, who: &str) -> Result<String, Control> {
     match m.get(key) {
         Some(SynValue::Text(s)) => {
             let s = s.trim().to_string();
@@ -137,7 +137,7 @@ fn req_text(m: &IndexMap<String, SynValue>, key: &str, who: &str) -> Result<Stri
 /// Bytes del body (ausente/nothing → vacío). Text o bytes; otro tipo → error claro
 /// (un map NO se serializa solo: el body firmado tiene que ser byte a byte el que
 /// viaja, y la serialización la elige el programa con `json_encode`).
-fn body_bytes(m: &IndexMap<String, SynValue>, who: &str) -> Result<Vec<u8>, Control> {
+fn body_bytes(m: &SynMap, who: &str) -> Result<Vec<u8>, Control> {
     match m.get("body") {
         None | Some(SynValue::Nothing) => Ok(Vec::new()),
         Some(SynValue::Text(s)) => Ok(s.as_bytes().to_vec()),
@@ -326,8 +326,8 @@ fn b_http_sign(
     };
 
     // Los headers listos para mandar (`http_post(url, body, {"headers": h})`).
-    let mut out = IndexMap::new();
-    out.insert("Content-Digest".to_string(), syn_text(digest.as_str()));
+    let mut out = SynMap::new();
+    out.insert("Content-Digest", syn_text(digest.as_str()));
     out.insert(
         "Signature-Input".to_string(),
         syn_text(format!("{}={}", label, params)),
@@ -345,7 +345,7 @@ fn b_http_sign(
 
 /// Un header del map `headers` de la request, case-insensitive (los headers HTTP no
 /// distinguen mayúsculas y el map viene del server tal cual llegó al socket).
-fn header_of(headers: &IndexMap<String, SynValue>, name: &str) -> Option<String> {
+fn header_of(headers: &SynMap, name: &str) -> Option<String> {
     headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -474,7 +474,7 @@ fn b_http_signature_verify(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>)
 }
 
 fn verify_inner(
-    req: &IndexMap<String, SynValue>,
+    req: &SynMap,
     key: &[u8],
     alg: SigAlg,
     max_age: i64,
@@ -563,10 +563,10 @@ fn verify_inner(
 
     // El resultado identifica QUIÉN firmó (keyid) y trae el nonce para que el
     // llamador lo cheque contra su store de replay en rutas de mutación.
-    let mut out = IndexMap::new();
-    out.insert("keyid".to_string(), syn_text(keyid.as_str()));
-    out.insert("alg".to_string(), syn_text(alg.name()));
-    out.insert("created".to_string(), syn_int(created));
+    let mut out = SynMap::new();
+    out.insert("keyid", syn_text(keyid.as_str()));
+    out.insert("alg", syn_text(alg.name()));
+    out.insert("created", syn_int(created));
     out.insert(
         "nonce".to_string(),
         match nonce {
@@ -610,15 +610,15 @@ mod tests {
     }
 
     fn map(pairs: Vec<(&str, SynValue)>) -> SynValue {
-        let mut m = IndexMap::new();
+        let mut m = SynMap::new();
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }
         syn_map(m)
     }
 
-    fn imap(pairs: Vec<(&str, SynValue)>) -> IndexMap<String, SynValue> {
-        let mut m = IndexMap::new();
+    fn imap(pairs: Vec<(&str, SynValue)>) -> SynMap {
+        let mut m = SynMap::new();
         for (k, v) in pairs {
             m.insert(k.to_string(), v);
         }
@@ -720,7 +720,7 @@ mod tests {
         key: &[u8],
         created: i64,
         nonce: Option<&str>,
-    ) -> IndexMap<String, SynValue> {
+    ) -> SynMap {
         let digest = content_digest(body);
         let params = signature_params(SigAlg::HmacSha256, created, "agent-1", nonce);
         let base = signature_base(method, url, &digest, &params);
@@ -732,7 +732,7 @@ mod tests {
         ])
     }
 
-    fn request_with(headers: IndexMap<String, SynValue>, body: &str) -> SynValue {
+    fn request_with(headers: SynMap, body: &str) -> SynValue {
         map(vec![
             ("method", text("POST")),
             ("url", text("https://api.example.com/orders")),
@@ -830,7 +830,7 @@ mod tests {
 
         // (5) Firma truncada / basura.
         let mut bad = good.clone();
-        bad.insert("Signature".to_string(), text("sig1=:AAAA:"));
+        bad.insert("Signature", text("sig1=:AAAA:"));
         let req = request_with(bad, "{\"n\":1}");
         assert!(matches!(
             ok(hsv(&[req, text("shared-secret"), alg()])),

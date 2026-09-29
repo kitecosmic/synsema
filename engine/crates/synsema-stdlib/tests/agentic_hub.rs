@@ -16,6 +16,7 @@
 //! - file-watch: create/modify/delete honestos, `ignore`/`recursive`, gate `file_read`,
 //!   tope de entradas en voz alta, y el handle entra en `select` etiquetado.
 
+use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -240,9 +241,9 @@ fn proc_on_full_error_is_terminal_and_kills() {
         "i=0; while [ $i -lt 200 ]; do echo line$i; i=$((i+1)); done",
         "for /L %i in (1,1,200) do @echo line%i",
     );
-    let mut opts = indexmap::IndexMap::new();
-    opts.insert("max_queue".to_string(), num(2.0));
-    opts.insert("on_full".to_string(), syn_text("error"));
+    let mut opts = SynMap::new();
+    opts.insert("max_queue", num(2.0));
+    opts.insert("on_full", syn_text("error"));
     let h = int(&ok(call(&mut i, "proc_spawn", vec![cmd, args, syn_map(opts)])));
     // Darle tiempo a que se llene.
     thread::sleep(Duration::from_millis(400));
@@ -294,8 +295,8 @@ fn proc_denied_without_exec_capability() {
 // =========================================================
 
 fn pty_opts(extra: &[(&str, SynValue)]) -> SynValue {
-    let mut m = indexmap::IndexMap::new();
-    m.insert("pty".to_string(), SynValue::Bool(true));
+    let mut m = SynMap::new();
+    m.insert("pty", SynValue::Bool(true));
     for (k, v) in extra {
         m.insert(k.to_string(), v.clone());
     }
@@ -398,8 +399,8 @@ fn pty_resize_and_pipe_rejects_it() {
     ok(call(&mut i, "proc_close", vec![syn_int(h2)]));
 
     // cols/rows sin pty: error de uso.
-    let mut m = indexmap::IndexMap::new();
-    m.insert("cols".to_string(), num(80.0));
+    let mut m = SynMap::new();
+    m.insert("cols", num(80.0));
     let e = err_msg(call(&mut i, "proc_spawn", vec![cmd, args, syn_map(m)]));
     assert!(e.contains("only apply with pty"), "{}", e);
 }
@@ -452,14 +453,14 @@ fn bus_fan_out_reaches_every_subscriber_and_select_tags_source() {
     let s1 = int(&ok(call(&mut i, "bus_subscribe", vec![syn_text("agent.*")])));
     let s2 = int(&ok(call(&mut i, "bus_subscribe", vec![list(vec![syn_text("agent.done"), syn_text("other")])])));
     let s3 = int(&ok(call(&mut i, "bus_subscribe", vec![syn_text("nothing.here")])));
-    let mut payload = indexmap::IndexMap::new();
-    payload.insert("ok".to_string(), SynValue::Bool(true));
+    let mut payload = SynMap::new();
+    payload.insert("ok", SynValue::Bool(true));
     let n = int(&ok(call(&mut i, "bus_publish", vec![syn_text("agent.done"), syn_map(payload)])));
     assert_eq!(n, 2, "dos suscriptores matchean");
-    let mut names = indexmap::IndexMap::new();
-    names.insert("a".to_string(), syn_int(s1));
-    names.insert("b".to_string(), syn_int(s2));
-    names.insert("c".to_string(), syn_int(s3));
+    let mut names = SynMap::new();
+    names.insert("a", syn_int(s1));
+    names.insert("b", syn_int(s2));
+    names.insert("c", syn_int(s3));
     let e1 = ok(call(&mut i, "select", vec![syn_map(names.clone()), num(2.0)]));
     let e2 = ok(call(&mut i, "select", vec![syn_map(names.clone()), num(2.0)]));
     for e in [&e1, &e2] {
@@ -512,8 +513,8 @@ fn bus_queue_policies_drop_oldest_and_error() {
     let _g = serial();
     let bus = Arc::new(Bus::new());
     let mut i = interp_with_bus(bus.clone());
-    let mut o = indexmap::IndexMap::new();
-    o.insert("max_queue".to_string(), num(2.0));
+    let mut o = SynMap::new();
+    o.insert("max_queue", num(2.0));
     let s = int(&ok(call(&mut i, "bus_subscribe", vec![syn_text("t"), syn_map(o)])));
     for k in 0..5 {
         ok(call(&mut i, "bus_publish", vec![syn_text("t"), syn_int(k)]));
@@ -522,9 +523,9 @@ fn bus_queue_policies_drop_oldest_and_error() {
     let b = ok(call(&mut i, "bus_recv", vec![syn_int(s), num(1.0)]));
     assert_eq!((int(&get(&a, "data")), int(&get(&b, "data"))), (3, 4), "drop_oldest conserva los últimos");
 
-    let mut o = indexmap::IndexMap::new();
-    o.insert("max_queue".to_string(), num(1.0));
-    o.insert("on_full".to_string(), syn_text("error"));
+    let mut o = SynMap::new();
+    o.insert("max_queue", num(1.0));
+    o.insert("on_full", syn_text("error"));
     let s2 = int(&ok(call(&mut i, "bus_subscribe", vec![syn_text("u"), syn_map(o)])));
     ok(call(&mut i, "bus_publish", vec![syn_text("u"), syn_int(1)]));
     ok(call(&mut i, "bus_publish", vec![syn_text("u"), syn_int(2)]));
@@ -587,9 +588,9 @@ fn select_mixes_process_and_bus_events() {
         thread::sleep(Duration::from_millis(100));
         b2.publish("ui", synsema_core::types::SendValue::Text("click".into()));
     });
-    let mut targets = indexmap::IndexMap::new();
-    targets.insert("sock".to_string(), syn_int(s));
-    targets.insert("child".to_string(), syn_int(p));
+    let mut targets = SynMap::new();
+    targets.insert("sock", syn_int(s));
+    targets.insert("child", syn_int(p));
     let mut sources = Vec::new();
     for _ in 0..4 {
         let ev = ok(call(&mut i, "select", vec![syn_map(targets.clone()), num(10.0)]));
@@ -777,8 +778,8 @@ fn tree_kill_proc_kill_reaches_the_grandchild() {
 fn process_group_false_detaches_on_purpose() {
     let _g = serial();
     let mut i = interp();
-    let mut o = indexmap::IndexMap::new();
-    o.insert("process_group".to_string(), SynValue::Bool(false));
+    let mut o = SynMap::new();
+    o.insert("process_group", SynValue::Bool(false));
     let (h, gc) = spawn_with_grandchild(&mut i, Some(syn_map(o)));
     let stats = ok(call(&mut i, "proc_stats", vec![syn_int(h)]));
     assert!(matches!(get(&stats, "tree"), SynValue::Bool(false)), "tree: false cuando se pidió");
@@ -841,8 +842,8 @@ fn interp_fs(dir: &TempDir) -> Interpreter {
 }
 
 fn fast_opts(extra: &[(&str, SynValue)]) -> SynValue {
-    let mut m = indexmap::IndexMap::new();
-    m.insert("interval".to_string(), num(0.05));
+    let mut m = SynMap::new();
+    m.insert("interval", num(0.05));
     for (k, v) in extra {
         m.insert(k.to_string(), v.clone());
     }
@@ -940,9 +941,9 @@ fn watch_joins_select_with_processes_and_is_tagged() {
     let w = int(&ok(call(&mut i, "watch", vec![syn_text(d.path()), fast_opts(&[])])));
     let (cmd, args) = script("sleep 2", "ping -n 3 127.0.0.1 > nul");
     let p = int(&ok(call(&mut i, "proc_spawn", vec![cmd, args])));
-    let mut targets = indexmap::IndexMap::new();
-    targets.insert("files".to_string(), syn_int(w));
-    targets.insert("build".to_string(), syn_int(p));
+    let mut targets = SynMap::new();
+    targets.insert("files", syn_int(w));
+    targets.insert("build", syn_int(p));
     std::fs::write(d.file("c.txt"), "x").unwrap();
     let ev = ok(call(&mut i, "select", vec![syn_map(targets), num(3.0)]));
     assert_eq!(text(&get(&ev, "source")), "watch");
@@ -1063,12 +1064,12 @@ fn term_open_validates_its_options_first() {
     let _g = serial();
     let mut i = interp_stdin();
     i.live_output = true;
-    let mut m = indexmap::IndexMap::new();
-    m.insert("ctrl_c".to_string(), syn_text("nope"));
+    let mut m = SynMap::new();
+    m.insert("ctrl_c", syn_text("nope"));
     let e = err_msg(call(&mut i, "term_open", vec![syn_map(m)]));
     assert!(e.contains("ctrl_c must be"), "{}", e);
-    let mut m = indexmap::IndexMap::new();
-    m.insert("mouse".to_string(), SynValue::Bool(true));
+    let mut m = SynMap::new();
+    m.insert("mouse", SynValue::Bool(true));
     let e = err_msg(call(&mut i, "term_open", vec![syn_map(m)]));
     assert!(e.contains("mouse capture is not implemented"), "{}", e);
 }
