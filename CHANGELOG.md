@@ -6,6 +6,45 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.37 — 2026-09-29
+
+Memory, first step: maps take a fraction of the memory they used to. The same language — every
+program gives the same result, the same errors and the same `steps()` count; maps keep their
+insertion order, copy-on-write and `==` by value — only lighter and faster. Nothing to change in
+your programs.
+
+**Lighter.** A list of 2 million records `{"id": i, "valor": i * i}` (built with `apply`, then
+read): peak memory of the whole process **664 MB → 327 MB** against the previous build, and
+**787 MB → 327 MB** against v0.6.36. A 500,000-row `csv_parse`: **560 MB → 284 MB** against v0.6.36.
+A record literal is now **one** allocation (it was 5 in v0.6.36); a `csv_parse` row, 4 (was 8).
+
+**Faster.** Instructions executed (release build without PGO, deterministic), against v0.6.36:
+building and reading records **−30 %**, `csv_parse` **−25 %**, the n-body simulation (records of
+floats) **−4 %**, word counting with a map of thousands of keys **−2.6 %**. Wall time on Windows:
+the 2 million records **−35 %**, the 500,000-row CSV **−26 %**. Everything else within ±0.5 %,
+native tier and `--jitless`.
+
+**How.** The way V8 and JavaScriptCore represent objects:
+
+- **Shared keys.** A key is stored once and shared by every map that has it: the keys of a literal,
+  of `set m.k`, the columns of a CSV or of an SQL result, the repeated keys of a JSON document
+  (`json_decode` and `jsonl_decode` no longer copy the document either).
+- **Shapes with inline values.** Maps built with the same keys in the same order share a *shape*
+  (the keys and where each one is); the map itself is a single block with its values inline, sized
+  when it is built. Reading `r.valor` in a loop checks the shape and loads the value, without
+  looking at the key. A map that grows keeps its shape and stores the extra values apart; past 32
+  keys, or with keys that rarely repeat (a map used as a dictionary, like word counts), it switches
+  to a hash table, as before.
+- The hash seed is per process (like CPython and V8), not per map.
+
+**For contributors.** `MapRef` is `Rc<RefCell<MapObj>>`; `SynMap` (the map you build before it
+becomes a value) is the same type without inline slots and has the same API as before
+(`IndexMap`-like: `insert`, `get`, `shift_remove`, `swap_remove`, `iter`, `get_index`, …). To turn a
+`SynMap` into a value, `syn_map(m)` or `m.into_ref()` (not `Rc::new(RefCell::new(m))`); to copy a
+map out of a value, `m.borrow().to_map()`. Still no `unsafe` in core. The differential oracle, a
+fuzz of the map against `IndexMap` in every mode and a comparison of 467 programs against v0.6.36
+cover it.
+
 ## v0.6.36 — 2026-09-28
 
 Speed, sixth step: hot code runs as machine code. The same language — every program gives the
