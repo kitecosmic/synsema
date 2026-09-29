@@ -26,8 +26,10 @@ Takeaways:
   `fib(30)` 13 ms (CPython 3.12 142 ms, Node 8 ms, Go 4 ms); a 10M-iteration loop 30 ms with
   `each … in range` / 56 ms with `while` (CPython 1.1 s, Node 10 ms, Go 5 ms). Floats, lists, maps and
   text in hot loops still run in the VM (interpreter-speed) — for heavy numeric work use `array`
-  builtins. The win is where servers actually spend time, plus the security + agent-native edge Go
-  lacks.
+  builtins. Memory for data: since v0.6.37 a map is one block with shared keys (V8-style shapes) — 2M
+  records `{"id", "valor"}` take 330 MB for the whole process (CPython 516, Node 278, Go 37), and
+  `csv_parse`/`json_decode` of 500k rows use less memory than CPython and run faster. The win is where
+  servers actually spend time, plus the security + agent-native edge Go lacks.
 
 So the usual reason to pick Go over a newer language — raw web performance — **does not apply
 here.** Synsema already beats it.
