@@ -114,7 +114,7 @@ fn deep_clone(v: &SynValue) -> SynValue {
             for (k, x) in m.borrow().iter() {
                 out.insert(k.clone(), deep_clone(x));
             }
-            SynValue::Map(Rc::new(RefCell::new(out)))
+            SynValue::Map(out.into_ref())
         }
         other => other.clone(),
     }

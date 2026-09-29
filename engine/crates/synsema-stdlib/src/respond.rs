@@ -155,7 +155,7 @@ pub(crate) fn parse_cookie_opts(who: &str, opts: Option<&SynValue>, allow_all: b
     };
     let map = match opts {
         None | Some(SynValue::Nothing) => return Ok(out),
-        Some(SynValue::Map(m)) => m.borrow().clone(),
+        Some(SynValue::Map(m)) => m.borrow().to_map(),
         Some(other) => {
             return Err(serve_err(&format!(
                 "{}: opts must be a map, got {}",

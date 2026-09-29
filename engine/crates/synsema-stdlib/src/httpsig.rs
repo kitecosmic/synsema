@@ -26,7 +26,7 @@
 //! CLAVE PÚBLICA ed25519 (que es pública) como clave HMAC: falsificación total. Es
 //! el mismo ataque que RS256→HS256 en JWT.
 
-use synsema_core::types::SynMap;
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -91,7 +91,7 @@ fn unix_now() -> i64 {
 fn opts_map(v: Option<&SynValue>, who: &str) -> Result<SynMap, Control> {
     match v {
         None | Some(SynValue::Nothing) => Ok(SynMap::new()),
-        Some(SynValue::Map(m)) => Ok(m.borrow().clone()),
+        Some(SynValue::Map(m)) => Ok(m.borrow().to_map()),
         Some(other) => Err(err(format!(
             "{}: opts must be a map, got {}",
             who,
@@ -102,7 +102,7 @@ fn opts_map(v: Option<&SynValue>, who: &str) -> Result<SynMap, Control> {
 
 fn req_map(v: &SynValue, who: &str) -> Result<SynMap, Control> {
     match v {
-        SynValue::Map(m) => Ok(m.borrow().clone()),
+        SynValue::Map(m) => Ok(m.borrow().to_map()),
         other => Err(err(format!(
             "{}: the request must be a map with method, url and (optionally) body/headers, got {}",
             who,
@@ -112,7 +112,7 @@ fn req_map(v: &SynValue, who: &str) -> Result<SynMap, Control> {
 }
 
 /// Campo de texto requerido del map de request.
-fn req_text(m: &SynMap, key: &str, who: &str) -> Result<String, Control> {
+fn req_text(m: &MapObj, key: &str, who: &str) -> Result<String, Control> {
     match m.get(key) {
         Some(SynValue::Text(s)) => {
             let s = s.trim().to_string();
@@ -137,7 +137,7 @@ fn req_text(m: &SynMap, key: &str, who: &str) -> Result<String, Control> {
 /// Bytes del body (ausente/nothing → vacío). Text o bytes; otro tipo → error claro
 /// (un map NO se serializa solo: el body firmado tiene que ser byte a byte el que
 /// viaja, y la serialización la elige el programa con `json_encode`).
-fn body_bytes(m: &SynMap, who: &str) -> Result<Vec<u8>, Control> {
+fn body_bytes(m: &MapObj, who: &str) -> Result<Vec<u8>, Control> {
     match m.get("body") {
         None | Some(SynValue::Nothing) => Ok(Vec::new()),
         Some(SynValue::Text(s)) => Ok(s.as_bytes().to_vec()),
@@ -345,7 +345,7 @@ fn b_http_sign(
 
 /// Un header del map `headers` de la request, case-insensitive (los headers HTTP no
 /// distinguen mayúsculas y el map viene del server tal cual llegó al socket).
-fn header_of(headers: &SynMap, name: &str) -> Option<String> {
+fn header_of(headers: &MapObj, name: &str) -> Option<String> {
     headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -474,7 +474,7 @@ fn b_http_signature_verify(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>)
 }
 
 fn verify_inner(
-    req: &SynMap,
+    req: &MapObj,
     key: &[u8],
     alg: SigAlg,
     max_age: i64,
@@ -489,7 +489,7 @@ fn verify_inner(
         _ => return None,
     };
     let headers = match req.get("headers")? {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         _ => return None,
     };
     let body = match req.get("body") {
@@ -736,7 +736,7 @@ mod tests {
         map(vec![
             ("method", text("POST")),
             ("url", text("https://api.example.com/orders")),
-            ("headers", SynValue::Map(Rc::new(RefCell::new(headers)))),
+            ("headers", SynValue::Map(headers.into_ref())),
             ("body", text(body)),
         ])
     }
@@ -799,10 +799,10 @@ mod tests {
         let mut m = imap(vec![
             ("method", text("DELETE")),
             ("url", text("https://api.example.com/orders")),
-            ("headers", SynValue::Map(Rc::new(RefCell::new(good.clone())))),
+            ("headers", SynValue::Map(good.clone().into_ref())),
             ("body", text("{\"n\":1}")),
         ]);
-        let req = SynValue::Map(Rc::new(RefCell::new(std::mem::take(&mut m))));
+        let req = SynValue::Map(std::mem::take(&mut m).into_ref());
         assert!(matches!(
             ok(hsv(&[req, text("shared-secret"), alg()])),
             SynValue::Nothing
@@ -812,10 +812,10 @@ mod tests {
         let mut m = imap(vec![
             ("method", text("POST")),
             ("url", text("https://api.example.com/admin")),
-            ("headers", SynValue::Map(Rc::new(RefCell::new(good.clone())))),
+            ("headers", SynValue::Map(good.clone().into_ref())),
             ("body", text("{\"n\":1}")),
         ]);
-        let req = SynValue::Map(Rc::new(RefCell::new(std::mem::take(&mut m))));
+        let req = SynValue::Map(std::mem::take(&mut m).into_ref());
         assert!(matches!(
             ok(hsv(&[req, text("shared-secret"), alg()])),
             SynValue::Nothing

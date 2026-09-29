@@ -27,8 +27,7 @@ use crate::secret::{constant_time_eq, SecretInner};
 use crate::tokens::SourceLocation;
 
 pub type ListRef = Rc<RefCell<Vec<SynValue>>>;
-pub use crate::synmap::{Key, SynMap};
-pub type MapRef = Rc<RefCell<SynMap>>;
+pub use crate::synmap::{Key, MapObj, MapRef, SynMap};
 
 #[derive(Clone)]
 pub enum SynValue {
@@ -479,7 +478,7 @@ pub fn syn_list(items: Vec<SynValue>) -> SynValue {
     SynValue::List(Rc::new(RefCell::new(items)))
 }
 pub fn syn_map(m: SynMap) -> SynValue {
-    SynValue::Map(Rc::new(RefCell::new(m)))
+    SynValue::Map(m.into_ref())
 }
 /// Construye un `secret` opaco a partir de su nombre de origen y su plaintext.
 pub fn syn_secret(name: impl Into<String>, plaintext: impl Into<String>) -> SynValue {

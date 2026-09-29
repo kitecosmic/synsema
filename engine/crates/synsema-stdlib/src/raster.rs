@@ -23,7 +23,7 @@
 //! PNG es el estado estático); font-family desconocida cae a la embebida; glifos no
 //! cubiertos (CJK completo, emoji color) → tofu. Fuentes del sistema/custom = futuro.
 
-use synsema_core::types::SynMap;
+use synsema_core::types::{MapObj, SynMap};
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
@@ -114,7 +114,7 @@ fn fontdb_with(fonts: &[Vec<u8>]) -> Arc<fontdb::Database> {
 type FontLoader<'a> = &'a dyn Fn(&str) -> Result<Vec<u8>, Control>;
 
 fn fonts_opt(
-    opts: &SynMap,
+    opts: &MapObj,
     name: &str,
     loader: Option<FontLoader<'_>>,
 ) -> Result<Vec<Vec<u8>>, Control> {
@@ -224,7 +224,7 @@ fn opts_of(
                     )));
                 }
             }
-            Ok(m.clone())
+            Ok(m.to_map())
         }
         Some(other) => Err(err(format!(
             "{}: options must be a map, got {}",
@@ -236,7 +236,7 @@ fn opts_of(
 
 /// Número positivo finito de una opt (dimensiones, scale, max_pixels).
 fn opt_pos_number(
-    opts: &SynMap,
+    opts: &MapObj,
     key: &str,
     name: &str,
 ) -> Result<Option<f64>, Control> {

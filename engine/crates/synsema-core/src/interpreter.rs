@@ -659,8 +659,8 @@ impl Bindings {
 /// reutiliza mientras esté registrada).
 #[derive(Default)]
 struct ModuleRegistry {
-    by_map: HashMap<usize, (std::rc::Weak<RefCell<SynMap>>, std::rc::Weak<RefCell<Environment>>)>,
-    by_env: HashMap<usize, std::rc::Weak<RefCell<SynMap>>>,
+    by_map: HashMap<usize, (std::rc::Weak<RefCell<MapObj>>, std::rc::Weak<RefCell<Environment>>)>,
+    by_env: HashMap<usize, std::rc::Weak<RefCell<MapObj>>>,
     prune_at: usize,
 }
 
@@ -670,7 +670,7 @@ thread_local! {
 
 /// Registra el mapa de exportaciones `map` como la vista de `env` (lo llaman `load_module`
 /// y la reconstrucción de módulos de un worker de `serve`/`parallel_map`).
-pub fn register_module(map: &Rc<RefCell<SynMap>>, env: &Rc<RefCell<Environment>>) {
+pub fn register_module(map: &Rc<RefCell<MapObj>>, env: &Rc<RefCell<Environment>>) {
     MODULES.with(|r| {
         let mut r = r.borrow_mut();
         if r.by_map.len() >= r.prune_at.max(64) {
@@ -678,26 +678,26 @@ pub fn register_module(map: &Rc<RefCell<SynMap>>, env: &Rc<RefCell<Environment>>
             r.by_env.retain(|_, m| m.strong_count() > 0);
             r.prune_at = r.by_map.len() * 2;
         }
-        r.by_map.insert(Rc::as_ptr(map) as usize, (Rc::downgrade(map), Rc::downgrade(env)));
+        r.by_map.insert(Rc::as_ptr(map).cast::<()>() as usize, (Rc::downgrade(map), Rc::downgrade(env)));
         r.by_env.insert(Rc::as_ptr(env) as usize, Rc::downgrade(map));
     });
 }
 
 /// El entorno del módulo cuyo mapa de exportaciones es `map`, si lo es.
-pub fn module_env_of_map(map: &Rc<RefCell<SynMap>>) -> Option<Rc<RefCell<Environment>>> {
+pub fn module_env_of_map(map: &Rc<RefCell<MapObj>>) -> Option<Rc<RefCell<Environment>>> {
     MODULES.with(|r| {
         let r = r.borrow();
         if r.by_map.is_empty() {
             return None;
         }
-        let (m, e) = r.by_map.get(&(Rc::as_ptr(map) as usize))?;
+        let (m, e) = r.by_map.get(&(Rc::as_ptr(map).cast::<()>() as usize))?;
         m.upgrade()?;
         e.upgrade()
     })
 }
 
 /// El mapa de exportaciones del módulo cuyo entorno es `env`, si lo es.
-pub fn module_map_of_env(env: &Rc<RefCell<Environment>>) -> Option<Rc<RefCell<SynMap>>> {
+pub fn module_map_of_env(env: &Rc<RefCell<Environment>>) -> Option<Rc<RefCell<MapObj>>> {
     MODULES.with(|r| r.borrow().by_env.get(&(Rc::as_ptr(env) as usize)).and_then(|m| m.upgrade()))
 }
 
@@ -705,7 +705,7 @@ pub fn module_map_of_env(env: &Rc<RefCell<Environment>>) -> Option<Rc<RefCell<Sy
 /// tasks), como `m.X = v` en Python; sus nombres son sus exportaciones y sus tasks no se
 /// reemplazan desde afuera.
 fn module_rebind(
-    m: &Rc<RefCell<SynMap>>,
+    m: &Rc<RefCell<MapObj>>,
     menv: &Rc<RefCell<Environment>>,
     name: &str,
     value: SynValue,
@@ -3170,7 +3170,7 @@ impl Interpreter {
                 exports.insert(name, v);
             }
         }
-        let map = Rc::new(RefCell::new(exports));
+        let map = exports.into_ref();
         register_module(&map, &module_env);
         Ok(SynValue::Map(map))
     }
@@ -3886,7 +3886,7 @@ impl Interpreter {
         env: &Rc<RefCell<Environment>>,
     ) -> Result<Option<Vec<(String, SynValue)>>, Control> {
         let map = match value {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             _ => return Ok(None),
         };
         let mut binds = Vec::new();
@@ -4183,7 +4183,7 @@ impl Interpreter {
                 Ok(syn_list(items))
             }
             NodeKind::MapLiteral { pairs } => {
-                let mut m = SynMap::new();
+                let mut m = SynMap::with_capacity(pairs.len());
                 // Una clave privada etiqueta el mapa entero (la clave es texto visible).
                 let mut key_label: Option<Label> = None;
                 for (k, v) in pairs {
@@ -7920,9 +7920,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     fn b_remove(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
         match nth(args, 0)? {
             SynValue::Map(m) => {
-                let mut copy = m.borrow().clone();
+                let mut copy = m.borrow().to_map();
                 copy.shift_remove(&nth(args, 1)?.to_string());
-                Ok(SynValue::Map(Rc::new(RefCell::new(copy))))
+                Ok(SynValue::Map(copy.into_ref()))
             }
             other => Err(err(format!("remove() takes a map, got {} — for a list use where(xs, …) or slice", other.type_name()))),
         }
@@ -8338,7 +8338,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let template = raw_str(nth(args, 0)?);
         let values = match args.get(1) {
             None | Some(SynValue::Nothing) => None,
-            Some(SynValue::Map(m)) => Some(m.borrow().clone()),
+            Some(SynValue::Map(m)) => Some(m.borrow().to_map()),
             Some(other) => return Err(err(format!("fmt(template, values): values must be a map, got {}", other.type_name()))),
         };
         let chars: Vec<char> = template.chars().collect();
@@ -9632,8 +9632,8 @@ fn make_unique_n(slot: &mut SynValue, extra: usize) {
             *slot = SynValue::List(Rc::new(RefCell::new(copy)));
         }
         SynValue::Map(rc) if Rc::strong_count(rc) > owners && module_env_of_map(rc).is_none() => {
-            let copy = rc.borrow().clone();
-            *slot = SynValue::Map(Rc::new(RefCell::new(copy)));
+            let copy = rc.borrow().to_ref();
+            *slot = SynValue::Map(copy);
         }
         SynValue::Private(p) => {
             let shared_inner = match &p.value {
@@ -9646,7 +9646,7 @@ fn make_unique_n(slot: &mut SynValue, extra: usize) {
                 // está compartido: el alias ve el mismo Rc interno.
                 let inner = match &p.value {
                     SynValue::List(rc) => SynValue::List(Rc::new(RefCell::new(rc.borrow().clone()))),
-                    SynValue::Map(rc) => SynValue::Map(Rc::new(RefCell::new(rc.borrow().clone()))),
+                    SynValue::Map(rc) => SynValue::Map(rc.borrow().to_ref()),
                     other => other.clone(),
                 };
                 *slot = SynValue::Private(Rc::new(labels::Labelled { value: inner, label: p.label.clone() }));

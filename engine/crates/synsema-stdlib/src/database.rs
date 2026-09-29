@@ -25,7 +25,7 @@
 //! MySQL/Mongo scope = `canon_url` (scheme://host/db, sin credenciales). Acceso serializado (un
 //! op por vez: `Rc<RefCell>` en run, `Arc<Mutex>` en serve) → una conexión por `db_open`.
 
-use synsema_core::types::{Key, SynMap};
+use synsema_core::types::{Key, MapObj, SynMap};
 use std::cell::RefCell;
 use std::error::Error as StdError;
 use std::rc::Rc;
@@ -1270,7 +1270,7 @@ fn syn_to_bson(v: &SynValue) -> Bson {
 
 /// Map de Synsema → BSON `Document`. Para la clave `_id` aplica `coerce_id` (string hex-24 →
 /// ObjectId) así `mongo_find("c", {"_id": id_text})` matchea el documento real.
-fn syn_map_to_doc(m: &SynMap) -> Document {
+fn syn_map_to_doc(m: &MapObj) -> Document {
     let mut doc = Document::new();
     for (k, v) in m {
         let bson = if k == "_id" { coerce_id(v) } else { syn_to_bson(v) };

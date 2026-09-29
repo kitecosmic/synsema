@@ -286,7 +286,7 @@ pub(crate) fn verify_with(key: &Jwk, alg: &str, signing_input: &[u8], sig: &[u8]
 
 fn opts_map(v: Option<&SynValue>, who: &str) -> Result<SynMap, Control> {
     match v {
-        Some(SynValue::Map(m)) => Ok(m.borrow().clone()),
+        Some(SynValue::Map(m)) => Ok(m.borrow().to_map()),
         Some(other) => Err(err(format!(
             "{}: opts must be a map, got {}",
             who,

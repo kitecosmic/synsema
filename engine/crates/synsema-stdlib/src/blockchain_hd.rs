@@ -878,7 +878,7 @@ fn keystore_export(
     let result = (|| {
         let opts = match args.get(2) {
             None | Some(SynValue::Nothing) => SynMap::new(),
-            Some(SynValue::Map(m)) => m.borrow().clone(),
+            Some(SynValue::Map(m)) => m.borrow().to_map(),
             Some(other) => {
                 return Err(err(format!(
                     "{}: opts must be a map, got {}",

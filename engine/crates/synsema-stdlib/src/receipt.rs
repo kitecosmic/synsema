@@ -216,7 +216,7 @@ fn b_receipt(
     }
     let opts = match args.first() {
         None | Some(SynValue::Nothing) => SynMap::new(),
-        Some(SynValue::Map(m)) => m.borrow().clone(),
+        Some(SynValue::Map(m)) => m.borrow().to_map(),
         Some(other) => return Err(err(format!("{}: opts must be a map, got {}", F, other.type_name()))),
     };
     for k in opts.keys() {
@@ -272,7 +272,7 @@ fn b_receipt_verify(args: &[SynValue]) -> Result<SynValue, Control> {
     }
     let opts = match args.get(2) {
         None | Some(SynValue::Nothing) => SynMap::new(),
-        Some(SynValue::Map(m)) => m.borrow().clone(),
+        Some(SynValue::Map(m)) => m.borrow().to_map(),
         Some(other) => return Err(err(format!("{}: opts must be a map, got {}", F, other.type_name()))),
     };
     let (is_receipt, issuer) = match &args[0] {

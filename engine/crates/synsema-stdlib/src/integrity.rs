@@ -30,7 +30,7 @@
 //! - `created` es OPCIONAL (así lo permite la spec): sin él no se lee el reloj y el builtin no
 //!   exige `time`; el programa lo pasa si lo quiere (`opts.created`).
 
-use synsema_core::types::SynMap;
+use synsema_core::types::{MapObj, SynMap};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
@@ -58,12 +58,12 @@ const PROOF_TYPE: &str = "DataIntegrityProof";
 
 fn as_map(v: &SynValue, who: &str, what: &str) -> Result<SynMap, Control> {
     match v {
-        SynValue::Map(m) => Ok(m.borrow().clone()),
+        SynValue::Map(m) => Ok(m.borrow().to_map()),
         other => Err(err(format!("{}: {} must be a map, got {}", who, what, other.type_name()))),
     }
 }
 
-fn text_opt(m: &SynMap, k: &str, who: &str) -> Result<Option<String>, Control> {
+fn text_opt(m: &MapObj, k: &str, who: &str) -> Result<Option<String>, Control> {
     match m.get(k) {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Text(s)) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
@@ -194,7 +194,7 @@ pub(crate) fn signer_from(
 pub fn sign_document(
     doc: &SynValue,
     key: &SynValue,
-    opts: &SynMap,
+    opts: &MapObj,
     who: &str,
     loc: &SourceLocation,
     caps: &Rc<RefCell<CapabilitySet>>,
@@ -205,7 +205,7 @@ pub fn sign_document(
 }
 
 /// `opts.cryptosuite`, validada (o `None`).
-pub(crate) fn validate_suite_opt(opts: &SynMap, who: &str) -> Result<Option<String>, Control> {
+pub(crate) fn validate_suite_opt(opts: &MapObj, who: &str) -> Result<Option<String>, Control> {
     let suite_opt = text_opt(opts, "cryptosuite", who)?;
     if let Some(s) = &suite_opt {
         if s != SUITE_EDDSA && s != SUITE_ECDSA {
@@ -223,7 +223,7 @@ pub(crate) fn validate_suite_opt(opts: &SynMap, who: &str) -> Result<Option<Stri
 pub(crate) fn sign_document_with(
     doc: &SynValue,
     signer: &Signer,
-    opts: &SynMap,
+    opts: &MapObj,
     who: &str,
 ) -> Result<SynValue, Control> {
     let doc_map = as_map(doc, who, "document")?;
@@ -418,7 +418,7 @@ fn verifier_from(v: &SynValue, who: &str) -> Result<Verifier, Control> {
 pub fn verify_document(
     doc: &SynValue,
     public_key: &SynValue,
-    opts: &SynMap,
+    opts: &MapObj,
     who: &str,
 ) -> Result<Option<SynValue>, Control> {
     let mut doc_map = as_map(doc, who, "document")?;
@@ -437,8 +437,8 @@ pub fn verify_document(
             who
         )));
     };
-    let mut proof = proof.borrow().clone();
-    let t = |m: &SynMap, k: &str| -> Option<String> {
+    let mut proof = proof.borrow().to_map();
+    let t = |m: &MapObj, k: &str| -> Option<String> {
         match m.get(k) {
             Some(SynValue::Text(s)) => Some(s.to_string()),
             _ => None,
@@ -534,7 +534,7 @@ mod tests {
     }
     fn entries(v: &SynValue) -> SynMap {
         match v {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             other => panic!("map, got {}", other),
         }
     }

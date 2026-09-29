@@ -109,9 +109,9 @@ fn heap_allocations_per_construct() {
         ("llamada f(1, 1, 1)", "task f(p0, p1, p2)\n    give 1\n", "    set x to f(1, 1, 1)\n", 0),
         ("llamada f(1, 1, 1, 1)", "task f(p0, p1, p2, p3)\n    give 1\n", "    set x to f(1, 1, 1, 1)\n", 0),
         ("llamada f(1, 1, 1, 1, 1)", "task f(p0, p1, p2, p3, p4)\n    give 1\n", "    set x to f(1, 1, 1, 1, 1)\n", 0),
-        // F4.4: las claves de un literal salen del chunk (compartidas); el mapa: la caja, las
-        // entradas y la tabla. Antes: 5 (cada clave, un `String` propio).
-        ("registro {\"id\": i, \"valor\": i}", "", "    set x to {\"id\": i, \"valor\": i}\n", 3),
+        // F4.5: un malloc, el cuerpo con la forma compartida y los dos valores en línea. Antes: 3
+        // (F4.4: la caja, las entradas y la tabla) y 5 (cada clave, un `String` propio).
+        ("registro {\"id\": i, \"valor\": i}", "", "    set x to {\"id\": i, \"valor\": i}\n", 1),
         // F4.4: una clave de texto que ya está no asigna (antes: 1, un `String` que se tiraba).
         ("set m[k] (clave que ya está)", "let m be {\"a\": 1}\nlet k be \"a\"\n", "    set m[k] to i\n", 0),
         // F4.4: `set m.a` sobre una clave que ya está sólo cambia el valor (antes: 1).
@@ -134,7 +134,7 @@ fn heap_allocations_per_construct() {
             let body: String = (0..n).map(|i| format!("{},{}\\n", i, i)).collect();
             format!("let d be csv_parse(\"id,v\\n{}\", {{\"numbers\": true}})\n", body)
         }),
-        6, // antes: 8 (las dos cabeceras, un `String` por fila)
+        4, // F4.5: la fila es un malloc con su forma (F4.4: 6; antes: 8, las cabeceras por fila)
     ));
 
     let mut report = String::new();

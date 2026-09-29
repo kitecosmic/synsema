@@ -142,10 +142,10 @@ pub fn register_run_program_builtin(interp: &Interpreter, caps: Rc<RefCell<Capab
                     let m = m.borrow();
                     let (caps_map, deterministic) = match m.get("caps") {
                         Some(SynValue::Map(c)) => (
-                            c.borrow().clone(),
+                            c.borrow().to_map(),
                             matches!(m.get("caveats"), Some(SynValue::Map(cv)) if matches!(cv.borrow().get("deterministic"), Some(SynValue::Bool(true)))),
                         ),
-                        _ => (m.clone(), false),
+                        _ => (m.to_map(), false),
                     };
                     let mut caps_list = synsema_stdlib::captoken::ceiling_from_caps_map(&caps_map)
                         .map_err(|e| rt(format!("run_program: ceiling: {}", e)))?;

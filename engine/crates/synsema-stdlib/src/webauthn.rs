@@ -31,7 +31,7 @@
 //!   tal cual, o un map plano con esas claves en camelCase o snake_case. Los binarios se aceptan
 //!   como `bytes` o como texto base64url.
 
-use synsema_core::types::SynMap;
+use synsema_core::types::{MapObj, SynMap};
 use sha2::{Digest, Sha256};
 
 use synsema_core::bytesutil::{b64url_decode, b64url_encode};
@@ -64,7 +64,7 @@ fn bin(v: &SynValue) -> Option<Vec<u8>> {
 
 /// Busca la primera clave presente entre `keys` en el map, y si no, en su sub-map `response`
 /// (la forma de `PublicKeyCredential.toJSON()`).
-fn field(m: &SynMap, keys: &[&str]) -> Option<SynValue> {
+fn field(m: &MapObj, keys: &[&str]) -> Option<SynValue> {
     for k in keys {
         if let Some(v) = m.get(*k) {
             if !matches!(v, SynValue::Nothing) {
@@ -87,7 +87,7 @@ fn field(m: &SynMap, keys: &[&str]) -> Option<SynValue> {
 
 fn as_map(v: &SynValue, who: &str, what: &str) -> Result<SynMap, Control> {
     match v {
-        SynValue::Map(m) => Ok(m.borrow().clone()),
+        SynValue::Map(m) => Ok(m.borrow().to_map()),
         other => Err(err(format!("{}: {} must be a map, got {}", who, what, other.type_name()))),
     }
 }
@@ -95,7 +95,7 @@ fn as_map(v: &SynValue, who: &str, what: &str) -> Result<SynMap, Control> {
 /// Un campo binario OBLIGATORIO de la credencial: faltar es error de forma (bug del programa,
 /// con las claves aceptadas en el mensaje); no decodificar es `None` (credencial inválida).
 fn required_bin(
-    m: &SynMap,
+    m: &MapObj,
     keys: &[&str],
     who: &str,
 ) -> Result<Option<Vec<u8>>, Control> {
@@ -125,7 +125,7 @@ struct Opts {
 
 fn parse_opts(v: Option<&SynValue>, who: &str, verifying: bool) -> Result<Opts, Control> {
     let m = match v {
-        Some(SynValue::Map(m)) => m.borrow().clone(),
+        Some(SynValue::Map(m)) => m.borrow().to_map(),
         Some(SynValue::Nothing) | None => SynMap::new(),
         Some(other) => return Err(err(format!("{}: opts must be a map, got {}", who, other.type_name()))),
     };
@@ -416,7 +416,7 @@ impl PubKey {
     /// un bug del programa, no una credencial inválida.
     fn from_syn(v: &SynValue, who: &str) -> Result<PubKey, Control> {
         let m: SynMap = match v {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             SynValue::Text(s) => {
                 let j: serde_json::Value = serde_json::from_str(s).map_err(|_| {
                     err(format!("{}: public_key must be the JWK map returned by webauthn_register (or its JSON)", who))
@@ -613,13 +613,13 @@ struct StoredCredential {
 
 fn stored_credential(v: &SynValue, who: &str) -> Result<StoredCredential, Control> {
     let m: SynMap = match v {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         SynValue::Text(s) => {
             let j: serde_json::Value = serde_json::from_str(s).map_err(|_| {
                 err(format!("{}: credential must be the map returned by webauthn_register (or its JSON)", who))
             })?;
             match crate::json::json_to_syn(&j) {
-                SynValue::Map(m) => m.borrow().clone(),
+                SynValue::Map(m) => m.borrow().to_map(),
                 _ => return Err(err(format!("{}: the credential JSON must be an object", who))),
             }
         }
@@ -902,7 +902,7 @@ mod tests {
 
     fn entries(v: &SynValue) -> SynMap {
         match v {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             _ => panic!("map"),
         }
     }
@@ -1065,11 +1065,11 @@ mod tests {
         assert!(matches!(verify(forged, pk.clone(), opts(vec![])), SynValue::Nothing));
         // authenticatorData manipulado después de firmar
         let mut tampered = match good() {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             _ => unreachable!(),
         };
         if let Some(SynValue::Map(r)) = tampered.get("response").cloned() {
-            let mut r = r.borrow().clone();
+            let mut r = r.borrow().to_map();
             let mut auth = bin(r.get("authenticatorData").unwrap()).unwrap();
             auth[33] |= FLAG_UV;
             r.insert("authenticatorData", text(&b64url_encode(&auth)));

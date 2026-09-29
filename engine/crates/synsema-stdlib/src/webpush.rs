@@ -30,7 +30,7 @@
 //! - **Proveedor externo:** quien ya tiene OneSignal/FCM/Pusher los llama con `http_post`
 //!   bajo `require net(...)`; nada de esto lo obliga a cambiar.
 
-use synsema_core::types::SynMap;
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -286,13 +286,13 @@ fn text_of<'a>(v: Option<&'a SynValue>, what: &str) -> Result<&'a str, Control> 
     }
 }
 
-fn map_field(m: &SynMap, k: &str) -> Option<SynValue> {
+fn map_field(m: &MapObj, k: &str) -> Option<SynValue> {
     m.get(k).cloned()
 }
 
 fn as_map(v: Option<&SynValue>, what: &str) -> Result<SynMap, Control> {
     match v {
-        Some(SynValue::Map(m)) => Ok(m.borrow().clone()),
+        Some(SynValue::Map(m)) => Ok(m.borrow().to_map()),
         Some(other) => Err(err(format!(
             "push_send: {} must be a map, got {}",
             what,

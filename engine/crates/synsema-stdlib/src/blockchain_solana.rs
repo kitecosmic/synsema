@@ -14,7 +14,7 @@
 //!   serializa `VersionedMessage`) y el shortvec vacío de address-table-lookups.
 //!   Pasar `lookup_tables` es un error claro: etapa 3, no silencio.
 
-use synsema_core::types::SynMap;
+use synsema_core::types::{MapObj, SynMap};
 use std::rc::Rc;
 
 use curve25519_dalek::edwards::CompressedEdwardsY;
@@ -87,7 +87,7 @@ struct ParsedInstruction {
 
 fn get_map(v: &SynValue, what: &str, fname: &str) -> Result<SynMap, Control> {
     match v {
-        SynValue::Map(m) => Ok(m.borrow().clone()),
+        SynValue::Map(m) => Ok(m.borrow().to_map()),
         other => Err(err(format!(
             "{}: {} must be a map, got {}",
             fname,
@@ -97,7 +97,7 @@ fn get_map(v: &SynValue, what: &str, fname: &str) -> Result<SynMap, Control> {
     }
 }
 
-fn get_bool(m: &SynMap, key: &str, what: &str, fname: &str) -> Result<bool, Control> {
+fn get_bool(m: &MapObj, key: &str, what: &str, fname: &str) -> Result<bool, Control> {
     match m.get(key) {
         None | Some(SynValue::Nothing) => Ok(false),
         Some(SynValue::Bool(b)) => Ok(*b),

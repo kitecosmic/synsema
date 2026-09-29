@@ -23,7 +23,8 @@
 //! (su cuerpo se compila también). Todo lo demás es `Exec`: el nodo lo corre el tree-walker con el
 //! frame de la VM como entorno (§6.0 punto 4), y cuenta sus propios pasos.
 
-use crate::types::{Key, SynMap};
+use crate::synmap::{map_from_pair_slots, MapIc};
+use crate::types::SynMap;
 use super::*;
 use crate::resolve::{self, Resolution, ScopeId, Target};
 use num_integer::Integer;
@@ -265,8 +266,8 @@ pub(crate) struct Chunk {
     ic_hops: Vec<u32>,
     /// Por caché: si la búsqueda empieza en el entorno actual (sin frames que saltear).
     ic_here: Vec<bool>,
-    /// Las cachés de `GetProp`/`GetIndex` (F3.6): posición + 1 de la clave en el mapa (0 = vacía).
-    key_ics: Box<[Cell<u32>]>,
+    /// Las cachés de `GetProp`/`GetIndex` (F3.6, por forma desde F4.5).
+    key_ics: Box<[MapIc]>,
     /// Los recorridos hacia afuera de este cuerpo (ver `Hops`).
     hops: Vec<Hops>,
     /// Por slot de feedback (F3.4): cuántas veces se desoptimizó su operación.
@@ -1859,7 +1860,7 @@ impl<'r, 's> Compiler<'r, 's> {
             nregs: self.max_reg,
             ics: (0..self.ics).map(|_| Cell::new(0)).collect(),
             ic_here: self.ic_hops.iter().map(|&h| self.hops[h as usize].from.is_none()).collect(),
-            key_ics: (0..self.key_ics).map(|_| Cell::new(0)).collect(),
+            key_ics: (0..self.key_ics).map(|_| MapIc::default()).collect(),
             ic_hops: self.ic_hops,
             hops: self.hops,
             deopts: (0..=self.feedback as usize).map(|_| Cell::new(0)).collect(),
@@ -2287,19 +2288,14 @@ impl Interpreter {
                 }
                 Ins::MakeMap { dst, first, n } => {
                     let from = base + first as usize;
-                    let mut m = SynMap::with_capacity(n as usize);
-                    for i in 0..n as usize {
-                        let k = std::mem::replace(&mut self.vm_regs[from + 2 * i], SynValue::Nothing);
-                        let v = std::mem::replace(&mut self.vm_regs[from + 2 * i + 1], SynValue::Nothing);
-                        m.insert(Key::of_value(&k), v);
-                    }
-                    self.put(base, dst, syn_map(m));
+                    let m = map_from_pair_slots(&mut self.vm_regs[from..from + 2 * n as usize]);
+                    self.put(base, dst, SynValue::Map(m));
                     Ok(())
                 }
                 Ins::GetProp { dst, obj, name, ic } => (|| {
                     let o = self.opnd(&chunk, &env, base, obj, at)?;
                     let found = match &o {
-                        SynValue::Map(m) => map_get_cached(&m.borrow(), &chunk.names[name as usize], &chunk.key_ics[ic as usize]),
+                        SynValue::Map(m) => m.borrow().get_cached(&chunk.names[name as usize], &chunk.key_ics[ic as usize]).cloned(),
                         _ => None,
                     };
                     let v = match found {
@@ -2313,7 +2309,7 @@ impl Interpreter {
                     let o = self.opnd(&chunk, &env, base, obj, at)?;
                     let i = self.opnd(&chunk, &env, base, idx, at)?;
                     let found = match (&o, &i) {
-                        (SynValue::Map(m), SynValue::Text(k)) => map_get_cached(&m.borrow(), k, &chunk.key_ics[ic as usize]),
+                        (SynValue::Map(m), SynValue::Text(k)) => m.borrow().get_cached_key(k, &chunk.key_ics[ic as usize]).cloned(),
                         (SynValue::List(l), SynValue::Number(Number::Int(k))) => {
                             let items = l.borrow();
                             resolve_index(*k, items.len()).map(|j| items[j].clone())
@@ -3569,24 +3565,6 @@ struct Enter {
     /// La ventana de locales del cuerpo (F3.3b; la del llamador si el cuerpo tiene frame).
     lbase: usize,
     top: usize,
-}
-
-/// La clave `key` de un mapa, por la posición que recuerda `ic` (si la clave en esa posición es
-/// la misma, sin hashear); si no, la búsqueda de siempre, y `ic` recuerda dónde estaba. `None` si
-/// no está (el que llama arma el error de la referencia).
-#[inline(always)]
-fn map_get_cached(m: &SynMap, key: &str, ic: &Cell<u32>) -> Option<SynValue> {
-    let c = ic.get() as usize;
-    if c > 0 {
-        if let Some((k, v)) = m.get_index(c - 1) {
-            if k.as_str() == key {
-                return Some(v.clone());
-            }
-        }
-    }
-    let (i, _, v) = m.get_full(key)?;
-    ic.set(i as u32 + 1);
-    Some(v.clone())
 }
 
 /// El registro del parámetro que ocupa el slot `k` del scope de `sp` (F3.7), si `sp` es el frame

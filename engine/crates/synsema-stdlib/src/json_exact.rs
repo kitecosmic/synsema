@@ -23,6 +23,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
+use synsema_core::synmap::map_from_pairs;
 use synsema_core::types::{Key, SynMap};
 use synsema_core::number::Number;
 use synsema_core::types::{syn_bool, syn_int, syn_list, syn_map, syn_nothing, syn_text, SynValue};
@@ -47,6 +48,7 @@ pub fn parse_opts(text: &str, allow_nan: bool) -> Result<SynValue, String> {
 pub struct Memo {
     keys: HashSet<Key>,
     cap: Vec<usize>,
+    bufs: Vec<Vec<(Key, SynValue)>>,
 }
 
 /// Como `parse_opts`, compartiendo `memo` con los otros documentos de la llamada.
@@ -60,10 +62,12 @@ pub fn parse_with(text: &str, allow_nan: bool, memo: &mut Memo) -> Result<SynVal
         allow_nan,
         keys: std::mem::take(&mut memo.keys),
         cap: std::mem::take(&mut memo.cap),
+        bufs: std::mem::take(&mut memo.bufs),
     };
     let r = p.document();
     memo.keys = std::mem::take(&mut p.keys);
     memo.cap = std::mem::take(&mut p.cap);
+    memo.bufs = std::mem::take(&mut p.bufs);
     r
 }
 
@@ -76,6 +80,8 @@ struct Parser<'a> {
     keys: HashSet<Key>,
     /// Por nivel, cuántas claves tuvo el último objeto: la capacidad del siguiente.
     cap: Vec<usize>,
+    /// Por nivel, el búfer de pares del objeto que se está leyendo (se reusa).
+    bufs: Vec<Vec<(Key, SynValue)>>,
 }
 
 impl<'a> Parser<'a> {
@@ -196,12 +202,20 @@ impl<'a> Parser<'a> {
         self.enter()?;
         self.i += 1;
         let d = self.depth;
-        let mut out = SynMap::with_capacity(self.cap.get(d).copied().unwrap_or(0));
+        // Los pares van a un búfer por nivel (se reusa entre objetos) y el mapa se arma al final
+        // con su forma: un malloc por objeto (F4.5).
+        if self.bufs.len() <= d {
+            self.bufs.resize_with(d + 1, Vec::new);
+        }
+        let mut out = std::mem::take(&mut self.bufs[d]);
+        out.clear();
+        out.reserve(self.cap.get(d).copied().unwrap_or(0));
         self.ws();
         if self.peek() == Some(b'}') {
             self.i += 1;
             self.depth -= 1;
-            return Ok(syn_map(out));
+            self.bufs[d] = out;
+            return Ok(syn_map(SynMap::new()));
         }
         loop {
             self.ws();
@@ -216,7 +230,7 @@ impl<'a> Parser<'a> {
             self.i += 1;
             self.ws();
             let v = self.value()?;
-            out.insert(k, v);
+            out.push((k, v));
             self.ws();
             match self.peek() {
                 Some(b',') => self.i += 1,
@@ -231,9 +245,11 @@ impl<'a> Parser<'a> {
         if self.cap.len() <= d {
             self.cap.resize(d + 1, 0);
         }
-        self.cap[d] = out.len();
+        let m = map_from_pairs(&mut out);
+        self.cap[d] = m.borrow().len();
+        self.bufs[d] = out;
         self.depth -= 1;
-        Ok(syn_map(out))
+        Ok(SynValue::Map(m))
     }
 
     /// Una clave: la misma `Key` para el mismo texto en toda la llamada.

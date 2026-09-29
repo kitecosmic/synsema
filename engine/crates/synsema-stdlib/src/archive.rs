@@ -19,7 +19,7 @@
 //! - `.gitignore` no se interpreta acá: es política del CLI, que arma `entries`.
 //!
 
-use synsema_core::types::SynMap;
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -151,13 +151,13 @@ fn opts_arg(v: Option<&SynValue>, who: &str, valid: &[&str]) -> Result<SynMap, C
                     )));
                 }
             }
-            Ok(m.clone())
+            Ok(m.to_map())
         }
         Some(other) => Err(err(format!("{}: opts must be a map, got {}", who, other.type_name()))),
     }
 }
 
-fn opt_flag(opts: &SynMap, k: &str, who: &str) -> Result<bool, Control> {
+fn opt_flag(opts: &MapObj, k: &str, who: &str) -> Result<bool, Control> {
     match opts.get(k) {
         None | Some(SynValue::Nothing) => Ok(false),
         Some(SynValue::Bool(b)) => Ok(*b),
@@ -165,7 +165,7 @@ fn opt_flag(opts: &SynMap, k: &str, who: &str) -> Result<bool, Control> {
     }
 }
 
-fn opt_limit(opts: &SynMap, k: &str, default: u64, who: &str) -> Result<u64, Control> {
+fn opt_limit(opts: &MapObj, k: &str, default: u64, who: &str) -> Result<u64, Control> {
     match opts.get(k) {
         None | Some(SynValue::Nothing) => Ok(default),
         Some(SynValue::Number(n)) => {

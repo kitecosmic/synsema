@@ -852,7 +852,7 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
     let mut maps = Vec::with_capacity(rows.len());
     for (i, r) in rows.iter().enumerate() {
         let m = match r {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             other => return Err(err(format!("{}: row {} is a {}, every row must be a map", F, i + 1, other.type_name()))),
         };
         for (k, v) in &m {

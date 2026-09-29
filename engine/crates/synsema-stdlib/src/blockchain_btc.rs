@@ -31,7 +31,7 @@
 //!   aux = 0). El tweak de taproot (BIP-341 key-path, merkle vacío) vive DENTRO
 //!   de `btc_address`/`schnorr_sign(…, "taproot")` — el usuario jamás tweakea.
 
-use synsema_core::types::SynMap;
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -1167,7 +1167,7 @@ fn txid_field(v: Option<&SynValue>, what: &str, fname: &str) -> Result<[u8; 32],
 
 fn map_of(v: &SynValue, what: &str, fname: &str) -> Result<SynMap, Control> {
     match v {
-        SynValue::Map(m) => Ok(m.borrow().clone()),
+        SynValue::Map(m) => Ok(m.borrow().to_map()),
         other => Err(err(format!(
             "{}: {} must be a map, got {}",
             fname,
@@ -1192,7 +1192,7 @@ fn list_of(v: Option<&SynValue>, what: &str, fname: &str) -> Result<Vec<SynValue
 
 /// Construye y VALIDA el plan completo (G28 + G29). Compartido por `btc_tx`,
 /// `btc_tx_raw` y `psbt_encode` — una única implementación de las guardas.
-fn build_plan(params: &SynMap, fname: &str) -> Result<Plan, Control> {
+fn build_plan(params: &MapObj, fname: &str) -> Result<Plan, Control> {
     for k in params.keys() {
         match k.as_str() {
             "inputs" | "outputs" | "fee" | "network" | "rbf" | "locktime" | "allow_absurd_fee" => {}
@@ -1615,7 +1615,7 @@ impl Plan {
 /// Reconstruye los params del eco de `btc_tx` (misma forma) y RE-VALIDA con
 /// `build_plan` — un map manipulado entre `btc_tx` y `btc_tx_raw` vuelve a pasar
 /// por TODAS las guardas (G28 no se puede sortear editando el eco).
-fn plan_from_map(m: &SynMap, fname: &str) -> Result<Plan, Control> {
+fn plan_from_map(m: &MapObj, fname: &str) -> Result<Plan, Control> {
     let mut params = SynMap::new();
     for key in ["inputs", "outputs", "fee", "network", "rbf", "locktime", "allow_absurd_fee"] {
         if let Some(v) = m.get(key) {
@@ -1636,7 +1636,7 @@ fn plan_from_map(m: &SynMap, fname: &str) -> Result<Plan, Control> {
                 .iter()
                 .map(|item| {
                     if let SynValue::Map(im) = item {
-                        let mut c = im.borrow().clone();
+                        let mut c = im.borrow().to_map();
                         for e in extra {
                             c.shift_remove(*e);
                         }
@@ -3171,7 +3171,7 @@ mod tests {
         let params = vec_w_params();
         if let SynValue::Map(m) = &params {
             let mut in0 = match &get_list(&params, "inputs")[0] {
-                SynValue::Map(im) => im.borrow().clone(),
+                SynValue::Map(im) => im.borrow().to_map(),
                 _ => panic!(),
             };
             in0.shift_remove("pubkey");
@@ -3184,7 +3184,7 @@ mod tests {
         let params = vec_w_params();
         if let SynValue::Map(m) = &params {
             let mut in0 = match &get_list(&params, "inputs")[0] {
-                SynValue::Map(im) => im.borrow().clone(),
+                SynValue::Map(im) => im.borrow().to_map(),
                 _ => panic!(),
             };
             in0.insert("pubkey", syn_bytes(hx(PUB_84_1)));

@@ -469,7 +469,7 @@ fn btc_wait(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynV
 fn basic_auth_header(v: Option<&SynValue>, fname: &str) -> Result<Vec<(String, String)>, Control> {
     let m = match v {
         None | Some(SynValue::Nothing) => return Ok(Vec::new()),
-        Some(SynValue::Map(m)) => m.borrow().clone(),
+        Some(SynValue::Map(m)) => m.borrow().to_map(),
         Some(other) => {
             return Err(err(format!(
                 "{}: auth must be a map {{user, pass}}, got {}",

@@ -27,7 +27,7 @@
 
 pub mod handler;
 
-use synsema_core::types::SynMap;
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -750,9 +750,9 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
 /// este intérprete.
 fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
     const NS: &str = "state";
-    let local: Rc<RefCell<SynMap>> = Rc::new(RefCell::new(SynMap::new()));
+    let local: Rc<RefCell<MapObj>> = SynMap::new().into_ref();
 
-    fn load(host_kv: bool, local: &Rc<RefCell<SynMap>>, key: &str) -> Option<SynValue> {
+    fn load(host_kv: bool, local: &Rc<RefCell<MapObj>>, key: &str) -> Option<SynValue> {
         if host_kv {
             let raw = hostcap::provider().and_then(|p| p.kv_get(NS, key)).flatten()?;
             let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -761,7 +761,7 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
             local.borrow().get(key).cloned()
         }
     }
-    fn store(host_kv: bool, local: &Rc<RefCell<SynMap>>, key: &str, v: &SynValue) {
+    fn store(host_kv: bool, local: &Rc<RefCell<MapObj>>, key: &str, v: &SynValue) {
         if host_kv {
             kv_write(NS, key, &dumps(&syn_to_json(v)));
         } else {

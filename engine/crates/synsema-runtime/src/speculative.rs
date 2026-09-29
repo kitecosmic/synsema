@@ -27,7 +27,7 @@ fn deep_copy(v: &SynValue) -> SynValue {
             for (k, val) in m.borrow().iter() {
                 nm.insert(k.clone(), deep_copy(val));
             }
-            SynValue::Map(Rc::new(RefCell::new(nm)))
+            SynValue::Map(nm.into_ref())
         }
         other => other.clone(),
     }

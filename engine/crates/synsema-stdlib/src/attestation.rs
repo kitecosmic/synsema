@@ -106,7 +106,7 @@ struct Opts {
 
 fn parse_opts(v: Option<&SynValue>) -> Result<Opts, Control> {
     let opts = match v {
-        Some(SynValue::Map(m)) => m.borrow().clone(),
+        Some(SynValue::Map(m)) => m.borrow().to_map(),
         None | Some(SynValue::Nothing) => return Err(err("opts is required ({\"format\": ..., \"now\": ...})")),
         Some(other) => return Err(err(format!("opts must be a map, got {}", other.type_name()))),
     };
@@ -146,14 +146,14 @@ fn parse_opts(v: Option<&SynValue>) -> Result<Opts, Control> {
             }
             "expect" => {
                 let m = match v {
-                    SynValue::Map(m) => m.borrow().clone(),
+                    SynValue::Map(m) => m.borrow().to_map(),
                     other => return Err(err(format!("opts.expect must be a map, got {}", other.type_name()))),
                 };
                 for (ek, ev) in &m {
                     match ek.as_str() {
                         "measurements" => {
                             let mm = match ev {
-                                SynValue::Map(mm) => mm.borrow().clone(),
+                                SynValue::Map(mm) => mm.borrow().to_map(),
                                 other => return Err(err(format!("opts.expect.measurements must be a map of name → hex, got {}", other.type_name()))),
                             };
                             for (name, val) in &mm {
@@ -582,7 +582,7 @@ mod tests {
 
     fn ok(r: Result<SynValue, Control>) -> SynMap {
         match r {
-            Ok(SynValue::Map(m)) => m.borrow().clone(),
+            Ok(SynValue::Map(m)) => m.borrow().to_map(),
             Ok(other) => panic!("esperaba map, got {}", other),
             Err(Control::Error(e)) => panic!("{}", e),
             Err(_) => panic!("control"),
@@ -628,7 +628,7 @@ mod tests {
 
     fn map_of(v: &SynValue) -> SynMap {
         match v {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             other => panic!("esperaba map, got {}", other),
         }
     }

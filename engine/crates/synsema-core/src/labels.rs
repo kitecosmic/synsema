@@ -150,7 +150,7 @@
 //! Los sumideros de I/O que el host no registre tampoco se comprueban: el host tiene
 //! `check_flow`, `strip_deep` e `Interpreter::pc_label` para hacerlo en su borde.
 
-use crate::types::SynMap;
+use crate::types::{MapObj, SynMap};
 use std::fmt;
 use std::rc::Rc;
 
@@ -650,7 +650,7 @@ fn check_into(v: &SynValue, accepted: &Label, path: &mut String, ctx: &Label) ->
 }
 
 fn check_map(
-    m: &SynMap,
+    m: &MapObj,
     accepted: &Label,
     path: &mut String,
     ctx: &Label,

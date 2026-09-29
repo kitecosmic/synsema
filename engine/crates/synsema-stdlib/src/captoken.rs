@@ -44,7 +44,7 @@
 //! (`opts.revoked`, típicamente leída de redis/sql). Sin esto, el primer incidente
 //! lo improvisa mal.
 
-use synsema_core::types::SynMap;
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -524,7 +524,7 @@ fn key_material(v: &SynValue, who: &str) -> Result<Vec<u8>, Control> {
 
 fn as_map(v: &SynValue, who: &str, what: &str) -> Result<SynMap, Control> {
     match v {
-        SynValue::Map(m) => Ok(m.borrow().clone()),
+        SynValue::Map(m) => Ok(m.borrow().to_map()),
         other => Err(err(format!(
             "{}: {} must be a map, got {}",
             who,
@@ -536,7 +536,7 @@ fn as_map(v: &SynValue, who: &str, what: &str) -> Result<SynMap, Control> {
 
 /// `{"net": "api.example.com", "db": ["a", "b"], "reveal": nothing}` → caps.
 /// `nothing` (o lista vacía) = la capability SIN scope (poder máximo del tipo).
-fn parse_caps(m: &SynMap, who: &str) -> Result<Vec<(String, Vec<String>)>, Control> {
+fn parse_caps(m: &MapObj, who: &str) -> Result<Vec<(String, Vec<String>)>, Control> {
     let mut out: Vec<(String, Vec<String>)> = Vec::new();
     for (name, v) in m {
         // Valida el nombre contra el vocabulario del lenguaje (falla en el typo).
@@ -588,7 +588,7 @@ fn parse_caps(m: &SynMap, who: &str) -> Result<Vec<(String, Vec<String>)>, Contr
 
 /// Opciones de caveats compartidas por mint y attenuate.
 fn parse_caveats(
-    m: &SynMap,
+    m: &MapObj,
     who: &str,
     default_ttl: Option<i64>,
     caps: &Rc<RefCell<CapabilitySet>>,
@@ -1090,7 +1090,7 @@ fn b_captoken_allows(args: &[SynValue]) -> Result<SynValue, Control> {
     // Toma la SALIDA de captoken_verify (ya verificada): así es imposible
     // preguntar por permisos de un token sin haberlo validado antes.
     let verified = match &args[0] {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         SynValue::Nothing => return Ok(SynValue::Bool(false)),
         other => {
             return Err(err(format!(
@@ -1110,7 +1110,7 @@ fn b_captoken_allows(args: &[SynValue]) -> Result<SynValue, Control> {
         }
     };
     let caps_map = match verified.get("caps") {
-        Some(SynValue::Map(m)) => m.borrow().clone(),
+        Some(SynValue::Map(m)) => m.borrow().to_map(),
         _ => unreachable!("chequeado arriba"),
     };
     let scope = match args.get(2) {
@@ -1189,7 +1189,7 @@ pub fn register_captoken_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabil
 /// `delegation_of` (serve, por request), `run_program {ceiling: caps}` (por proceso) y
 /// `sandbox under caps` (por bloque). Mismos nombres que `require`; un scope vacío o
 /// `nothing` = la capability sin scope; las locales al proceso se rechazan como al acuñar.
-pub fn ceiling_from_caps_map(m: &SynMap) -> Result<Vec<Capability>, String> {
+pub fn ceiling_from_caps_map(m: &MapObj) -> Result<Vec<Capability>, String> {
     let mut out = Vec::new();
     for (name, v) in m {
         let ty = capability_type_from_name(name).ok_or_else(|| {
@@ -1234,7 +1234,7 @@ pub fn ceiling_from_caps_map(m: &SynMap) -> Result<Vec<Capability>, String> {
 /// Un nombre desconocido o un scope mal formado CIERRA: techo vacío (el caller no delega
 /// nada reconocible: todo lo transferible se deniega) y un aviso por stderr, una vez por
 /// proceso. Antes, un token inconvertible corría SIN techo (auditoría T1–T4, ronda 1).
-pub fn delegated_ceiling_from_caps_map(m: &SynMap) -> Vec<Capability> {
+pub fn delegated_ceiling_from_caps_map(m: &MapObj) -> Vec<Capability> {
     let mut out = Vec::new();
     for (name, v) in m {
         let Some(ty) = capability_type_from_name(name) else {
@@ -1375,7 +1375,7 @@ mod tests {
 
     fn verified_map(v: &SynValue) -> SynMap {
         match v {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             other => panic!("expected a verification map, got {}", other),
         }
     }
@@ -1862,7 +1862,7 @@ mod t1_tests {
 
     fn verified(v: SynValue) -> SynMap {
         match v {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             other => panic!("esperaba map, got {}", other),
         }
     }

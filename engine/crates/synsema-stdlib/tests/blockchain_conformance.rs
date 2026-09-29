@@ -159,7 +159,7 @@ fn bech32_roundtrip_and_variant() {
     // decode → hrp/data/variant.
     let dec = call(&mut i, "bech32_decode", vec![syn_text(enc.as_str())]);
     let m = match dec {
-        Ok(SynValue::Map(m)) => m.borrow().clone(),
+        Ok(SynValue::Map(m)) => m.borrow().to_map(),
         other => panic!("esperaba map: {:?}", other.is_ok()),
     };
     assert_eq!(m.get("hrp").map(|v| v.to_string()).as_deref(), Some("avax"));
@@ -177,7 +177,7 @@ fn bech32_roundtrip_and_variant() {
     assert_ne!(enc, encm, "bech32 y bech32m difieren en el checksum");
     let decm = call(&mut i, "bech32_decode", vec![syn_text(encm.as_str())]);
     let mm = match decm {
-        Ok(SynValue::Map(m)) => m.borrow().clone(),
+        Ok(SynValue::Map(m)) => m.borrow().to_map(),
         other => panic!("esperaba map: {:?}", other.is_ok()),
     };
     assert_eq!(mm.get("variant").map(|v| v.to_string()).as_deref(), Some("bech32m"));
@@ -1298,7 +1298,7 @@ fn solana_v0_matches_versioned_message_and_multi_instruction_ordering() {
         syn_bytes(vec![0u8; 32]),
         syn_bytes(vec![0x03; 32]),
     ) {
-        SynValue::Map(mp) => mp.borrow().clone(),
+        SynValue::Map(mp) => mp.borrow().to_map(),
         _ => unreachable!(),
     };
     params.insert("version", syn_int(0));

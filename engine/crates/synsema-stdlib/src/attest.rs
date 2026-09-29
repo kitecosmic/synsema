@@ -47,7 +47,7 @@
 //! `SYNSEMA_ATTEST=dstack` explícito; parser HTTP sobre bytes con tope; `generation`
 //! de configfs-tsm antes y después de leer.
 
-use synsema_core::types::SynMap;
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
@@ -1318,7 +1318,7 @@ fn require_attest(caps: &Rc<RefCell<CapabilitySet>>, source: &str) -> Result<(),
         .map_err(|v| Control::Error(v.into_error()))
 }
 
-fn opt_bytes(m: &SynMap, key: &str, who: &str) -> Result<Option<Vec<u8>>, Control> {
+fn opt_bytes(m: &MapObj, key: &str, who: &str) -> Result<Option<Vec<u8>>, Control> {
     match m.get(key) {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Bytes(b)) => Ok(Some(b.to_vec())),

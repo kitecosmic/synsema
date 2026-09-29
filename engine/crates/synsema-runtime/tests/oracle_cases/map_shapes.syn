@@ -1,0 +1,84 @@
+-- F4.5 contra la referencia: mapas con forma y valores en línea, valores afuera al crecer, modo
+-- diccionario. Nada de eso se ve desde el lenguaje: orden de inserción, copy-on-write, `==` por
+-- valor, borrar y reinsertar, iterar. Cada task corre varias veces (las formas se reusan).
+
+task rec(i)
+    give {"id": i, "valor": i * i}
+
+-- Registros iguales comparten la forma; formas que divergen (otra clave, otro orden).
+let rs be apply(range(0, 5), rec)
+let otro be {"valor": 1, "id": 1}
+let tres be {"id": 1, "valor": 1, "extra": 0}
+print([rs, rs[1] == otro, rs[1] == tres, keys(otro), keys(tres)])
+
+-- Crecer: `set` de una clave nueva sobre un mapa de un dueño (valores afuera) y sobre uno
+-- compartido (la copia con lugar); el original no cambia.
+task grow(n)
+    let m be rec(n)
+    let alias be m
+    set m.extra to n + 1
+    set m["otra"] to "o" + text(n)
+    set alias.solo to true
+    give [m, alias, keys(m), keys(alias), length(m)]
+each i in range(0, 3)
+    print(grow(i))
+
+-- Borrar y reinsertar: el resto conserva el orden; la clave vuelve al final.
+task churn(k)
+    let m be {"a": 1, "b": 2, "c": 3, "d": 4}
+    set m to remove(m, k)
+    set m[k] to 9
+    set m to remove(m, "a")
+    give [m, keys(m)]
+each k in ["a", "b", "d"]
+    print(churn(k))
+
+-- Muchas claves: el mapa pasa a diccionario (más de 32) y sigue igual por fuera.
+task wide(n)
+    let m be {}
+    each i in range(0, n)
+        set m["c" + text(i)] to i
+    set m to remove(m, "c1")
+    set m["c1"] to -1
+    give [length(m), keys(m)[0], keys(m)[length(m) - 1], m["c0"], m["c1"], get(m, "c" + text(n - 1), "no")]
+each n in [3, 31, 32, 33, 40, 100]
+    print(wide(n))
+
+-- Un diccionario compartido: escribir en la copia no toca el original.
+let big be {}
+each i in range(0, 50)
+    set big["k" + text(i)] to i
+let big2 be big
+set big2.k3 to "cambió"
+set big2.nueva to 1
+print([big.k3, big2.k3, length(big), length(big2), big == big2])
+
+-- Claves que no se repiten entre mapas (una clave distinta por mapa).
+task solo(i)
+    let m be {}
+    set m["id" + text(i)] to i
+    give m
+let ms be apply(range(0, 200), solo)
+print([ms[0], ms[199], keys(ms[150]), ms[42]["id42"]])
+
+-- Leer por el mismo sitio mapas de formas distintas y de los tres modos.
+task pick(m, k)
+    give get(m, k, "falta")
+print([pick(rs[2], "valor"), pick(tres, "extra"), pick(big, "k49"), pick(ms[7], "id7"), pick({}, "id"), pick(otro, "id")])
+
+-- Recorrer en orden, dentro de un mapa que crece y dentro de uno que es diccionario.
+let g be rec(5)
+set g.z to 1
+set g.a to 2
+let pares be []
+each k in keys(g)
+    set pares to append(pares, k + "=" + text(g[k]))
+print(pares)
+-- `m[k]` con la clave que cambia en el mismo sitio, sobre mapas de la misma forma.
+task todos(m)
+    let out be []
+    each k in keys(m)
+        set out to append(out, m[k])
+    give out
+print([todos(rec(3)), todos(rec(4)), todos(otro), todos(tres), todos(ms[3])])
+print([json_encode(g), slice(json_encode(remove(big, "k0")), 0, 30)])

@@ -17,7 +17,7 @@
 //!   cuenta como "producir aleatoriedad" (mismo precedente que el token interno
 //!   de `redis_lock`).
 
-use synsema_core::types::SynMap;
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -124,7 +124,7 @@ fn opt_int(v: &SynValue, who: &str, name: &str, min: i64) -> Result<i64, Control
 fn opts_map(v: Option<&SynValue>, who: &str) -> Result<SynMap, Control> {
     match v {
         None | Some(SynValue::Nothing) => Ok(SynMap::new()),
-        Some(SynValue::Map(m)) => Ok(m.borrow().clone()),
+        Some(SynValue::Map(m)) => Ok(m.borrow().to_map()),
         Some(other) => Err(err(format!(
             "{}: opts must be a map, got {}",
             who,
@@ -259,7 +259,7 @@ fn b_jwt_sign(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>, loc: &synsem
         return Err(err(format!("{}(claims, key, opts?) takes 2 or 3 arguments", F)));
     }
     let claims = match &args[0] {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         other => {
             return Err(err(format!(
                 "{}: claims must be a map, got {}",
@@ -1030,7 +1030,7 @@ fn check_time_and_claims(claims: &serde_json::Map<String, serde_json::Value>, o:
 /// Las claves públicas del mapa `{"jwks": …}` | `{"pem": …}` en la forma del verificador de
 /// `oidc`. El tipo de la clave FIJA el algoritmo (RSA → RS256, EC P-256 → ES256); una entrada
 /// del JWKS que declare `alg` tiene que coincidir con el del token. Errores = del caller.
-fn inline_public_keys(m: &SynMap, who: &str) -> Result<Vec<KeyEntry>, Control> {
+fn inline_public_keys(m: &MapObj, who: &str) -> Result<Vec<KeyEntry>, Control> {
     let mut jwks: Option<String> = None;
     let mut pem: Option<String> = None;
     let mut did: Option<String> = None;
@@ -1890,7 +1890,7 @@ mod v0620_tests {
 
     fn claims_of(v: &SynValue) -> SynMap {
         match v {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             other => panic!("esperaba map, got {}", other),
         }
     }

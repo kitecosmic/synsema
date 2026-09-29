@@ -35,7 +35,7 @@
 //! en el pool. Los handles NO cruzan workers (aislamiento CSP): cada worker es dueño de
 //! los suyos.
 
-use synsema_core::types::SynMap;
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -1282,7 +1282,7 @@ struct ConnectOpts {
     keepalive: Option<KeepaliveCfg>,
 }
 
-fn opt_duration(m: &SynMap, key: &str, fname: &str) -> Result<Option<Duration>, Control> {
+fn opt_duration(m: &MapObj, key: &str, fname: &str) -> Result<Option<Duration>, Control> {
     match m.get(key) {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Number(n)) => {
@@ -1299,7 +1299,7 @@ fn opt_duration(m: &SynMap, key: &str, fname: &str) -> Result<Option<Duration>, 
 fn parse_connect_opts(v: Option<&SynValue>, fname: &str) -> Result<ConnectOpts, Control> {
     let opts = match v {
         None | Some(SynValue::Nothing) => SynMap::new(),
-        Some(SynValue::Map(m)) => m.borrow().clone(),
+        Some(SynValue::Map(m)) => m.borrow().to_map(),
         Some(other) => return Err(err(format!("{}: opts must be a map, got {}", fname, other.type_name()))),
     };
     const ALLOWED: &[&str] = &[
@@ -1379,7 +1379,7 @@ fn parse_connect_opts(v: Option<&SynValue>, fname: &str) -> Result<ConnectOpts, 
     let reconnect = match opts.get("reconnect") {
         None | Some(SynValue::Nothing) => None,
         Some(SynValue::Map(m)) => {
-            let rm = m.borrow().clone();
+            let rm = m.borrow().to_map();
             for k in rm.keys() {
                 if !matches!(k.as_str(), "max_retries" | "backoff" | "backoff_max" | "on_reconnect") {
                     return Err(err(format!("{}: unknown reconnect option {:?} (allowed: max_retries, backoff, backoff_max, on_reconnect)", fname, k)));
@@ -1409,7 +1409,7 @@ fn parse_connect_opts(v: Option<&SynValue>, fname: &str) -> Result<ConnectOpts, 
     let keepalive = match opts.get("keepalive") {
         None | Some(SynValue::Nothing) => None,
         Some(SynValue::Map(m)) => {
-            let km = m.borrow().clone();
+            let km = m.borrow().to_map();
             for k in km.keys() {
                 if !matches!(k.as_str(), "interval" | "timeout") {
                     return Err(err(format!("{}: unknown keepalive option {:?} (allowed: interval, timeout)", fname, k)));
@@ -1645,7 +1645,7 @@ fn resolve_targets(v: &SynValue, fname: &str) -> Result<(Vec<i64>, TargetNames),
             Ok((handles, None))
         }
         SynValue::Map(m) => {
-            let mm = m.borrow().clone();
+            let mm = m.borrow().to_map();
             let mut handles = Vec::with_capacity(mm.len());
             let mut names = HashMap::new();
             for (name, hv) in &mm {
@@ -1666,7 +1666,7 @@ fn resolve_targets(v: &SynValue, fname: &str) -> Result<(Vec<i64>, TargetNames),
 /// Empaqueta un mensaje (ya `{type, data}`) agregando `conn` (y `name` si venía de un map).
 fn tag_message(msg: SynValue, handle: i64, names: &TargetNames) -> SynValue {
     let mut m = match msg {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         other => {
             let mut mm = SynMap::new();
             mm.insert("data", other);
@@ -2148,7 +2148,7 @@ impl WsRegistry {
                 if self.conns.get(&h).map(|c| !c.inbound.is_empty()).unwrap_or(false) {
                     let msg = self.take_message(h)?;
                     let mut m = match msg {
-                        SynValue::Map(m) => m.borrow().clone(),
+                        SynValue::Map(m) => m.borrow().to_map(),
                         other => {
                             let mut mm = SynMap::new();
                             mm.insert("data", other);
@@ -2378,7 +2378,7 @@ fn term_handle(reg: &Registry, v: Option<&SynValue>, fname: &str) -> Result<i64,
     }
 }
 
-fn opt_map<'a>(v: Option<&'a SynValue>, fname: &str) -> Result<Option<std::cell::Ref<'a, SynMap>>, Control> {
+fn opt_map<'a>(v: Option<&'a SynValue>, fname: &str) -> Result<Option<std::cell::Ref<'a, MapObj>>, Control> {
     match v {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Map(m)) => Ok(Some(m.borrow())),
@@ -2386,7 +2386,7 @@ fn opt_map<'a>(v: Option<&'a SynValue>, fname: &str) -> Result<Option<std::cell:
     }
 }
 
-fn opt_usize(m: &SynMap, key: &str, fname: &str) -> Result<Option<usize>, Control> {
+fn opt_usize(m: &MapObj, key: &str, fname: &str) -> Result<Option<usize>, Control> {
     match m.get(key) {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Number(n)) => {
@@ -2826,7 +2826,7 @@ fn bus_topics(_args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
 // File-watch
 // ---------------------------------------------------------
 
-fn opt_f64(m: &SynMap, key: &str, fname: &str) -> Result<Option<f64>, Control> {
+fn opt_f64(m: &MapObj, key: &str, fname: &str) -> Result<Option<f64>, Control> {
     match m.get(key) {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Number(n)) => {

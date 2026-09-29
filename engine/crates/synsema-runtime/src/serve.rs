@@ -8,7 +8,7 @@
 //! (blackboard) vía `Arc`. Es exactamente el aislamiento documentado: "lo único
 //! compartido es el blackboard y la base de datos".
 
-use synsema_core::types::SynMap;
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
@@ -747,7 +747,7 @@ fn is_export_of(module_env: &Rc<RefCell<Environment>>, k: &str, v: &SynValue) ->
 /// `is_export` las que son el mismo objeto que el binding homónimo del env (en rebuild
 /// se cosechan del env reconstruido → identidad compartida alias↔env).
 fn snapshot_alias_entries(
-    m: &Rc<RefCell<SynMap>>,
+    m: &Rc<RefCell<MapObj>>,
     module_env: &Rc<RefCell<Environment>>,
     state: &mut SnapState,
 ) -> Vec<(String, GlobalVal, bool)> {
@@ -821,7 +821,7 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
 /// Devuelve el `module_env` de un map que es alias de módulo: el `closure_env` de
 /// cualquiera de sus tasks cuyo env se llame `module:…`. `None` si el map no es un alias
 /// de módulo (sus tasks cierran sobre el global u otro scope → map de datos con callbacks).
-pub(crate) fn module_env_of(map: &SynMap) -> Option<Rc<RefCell<Environment>>> {
+pub(crate) fn module_env_of(map: &MapObj) -> Option<Rc<RefCell<Environment>>> {
     for v in map.values() {
         if let SynValue::Task(t) = v {
             if t.closure_env.borrow().name.starts_with("module:") {
@@ -973,7 +973,7 @@ fn rebuild_global_val(
                 };
                 m.insert(k.clone(), v);
             }
-            let map = Rc::new(RefCell::new(m));
+            let map = m.into_ref();
             if *is_alias {
                 synsema_core::interpreter::register_module(&map, &module_env);
             }
@@ -987,7 +987,7 @@ fn rebuild_global_val(
             for (k, gv) in entries {
                 m.insert(k.clone(), rebuild_global_val(gv, base, base, registry));
             }
-            SynValue::Map(Rc::new(RefCell::new(m)))
+            SynValue::Map(m.into_ref())
         }
         GlobalVal::Agent { .. } => {
             // Los agentes van a `agent_definitions`, nunca a bindings — no debería llegar aquí.
@@ -1295,7 +1295,7 @@ fn register_serve_state_builtins(interp: &Interpreter, state: SharedState) {
             for (k, sv) in guard.iter() {
                 map.insert(k.clone(), from_send(sv));
             }
-            Ok(SynValue::Map(Rc::new(RefCell::new(map))))
+            Ok(SynValue::Map(map.into_ref()))
         }));
     }
 }
@@ -2318,7 +2318,7 @@ fn build_host_table(
             };
             for (i, meta) in metas.iter().enumerate() {
                 let mm = match meta {
-                    SynValue::Map(m) => m.borrow().clone(),
+                    SynValue::Map(m) => m.borrow().to_map(),
                     _ => continue,
                 };
                 let method = mm.get("method").map(|v| v.to_string()).unwrap_or_default();

@@ -28,7 +28,7 @@
 //! que se **muestra o compara** va como `text` (tx hashes `0x…`, direcciones
 //! EIP-55, signature base58, txid base32).
 
-use synsema_core::types::SynMap;
+use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
@@ -577,7 +577,7 @@ fn syn_to_eth_json(v: &SynValue, path: &str, fname: &str, depth: usize) -> Resul
             Ok(Json::Array(out))
         }
         SynValue::Map(m) => {
-            let m = m.borrow().clone();
+            let m = m.borrow().to_map();
             let mut out = Vec::with_capacity(m.len());
             for (k, val) in m.iter() {
                 out.push((
@@ -631,7 +631,7 @@ pub(crate) fn syn_to_plain_json(v: &SynValue, path: &str, fname: &str, depth: us
             Ok(Json::Array(out))
         }
         SynValue::Map(m) => {
-            let m = m.borrow().clone();
+            let m = m.borrow().to_map();
             let mut out = Vec::with_capacity(m.len());
             for (k, val) in m.iter() {
                 out.push((
@@ -843,7 +843,7 @@ fn evm_logs(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynV
     let url = url_arg(arg(args, 0, F)?, F)?;
     require_net(caps, &url, "evm_logs()")?;
     let m = match arg(args, 1, F)? {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         other => {
             return Err(err(format!(
                 "{}: the filter must be a map ({{address, topics, fromBlock, toBlock}} or {{address, topics, blockHash}}), got {}",
@@ -1385,7 +1385,7 @@ fn evm_fee_history(
 /// Campo entero requerido de `bits` como máximo. El error de campo faltante nombra
 /// el helper que lo LEE de la cadena — no hay default silencioso (G24).
 fn uint_field(
-    m: &SynMap,
+    m: &MapObj,
     key: &str,
     bits: u64,
     read_hint: &str,
@@ -1446,7 +1446,7 @@ fn access_list_field(v: Option<&SynValue>, fname: &str) -> Result<SynValue, Cont
     for (i, item) in list.iter().enumerate() {
         let what = format!("access_list[{}]", i);
         let m = match item {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             other => {
                 return Err(err(format!(
                     "{}: {} must be a map {{address, storage_keys}}, got {}",
@@ -1531,7 +1531,7 @@ fn build_evm_tx(args: &[SynValue], create: bool) -> Result<SynValue, Control> {
     #[allow(non_snake_case)]
     let F: &str = if create { "evm_tx_create" } else { "evm_tx" };
     let m = match arg(args, 0, F)? {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         other => {
             return Err(err(format!(
                 "{}: params must be a map, got {}",
@@ -1723,7 +1723,7 @@ fn evm_create2_address(args: &[SynValue]) -> Result<SynValue, Control> {
 fn evm_tx_raw(args: &[SynValue]) -> Result<SynValue, Control> {
     const F: &str = "evm_tx_raw";
     let m = match arg(args, 0, F)? {
-        SynValue::Map(m) => m.borrow().clone(),
+        SynValue::Map(m) => m.borrow().to_map(),
         other => {
             return Err(err(format!(
                 "{}: the first argument must be the map returned by evm_tx, got {}",

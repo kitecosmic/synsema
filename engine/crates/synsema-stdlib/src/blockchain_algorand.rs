@@ -149,7 +149,7 @@ fn to_mp(
             Ok(if s.is_empty() { None } else { Some(Mp::Str(s.to_string())) })
         }
         SynValue::Map(m) => {
-            let m = m.borrow().clone();
+            let m = m.borrow().to_map();
             let mut entries: Vec<(String, Mp)> = Vec::with_capacity(m.len());
             for (k, val) in m.iter() {
                 let child_path = format!("{}.{}", path, k);

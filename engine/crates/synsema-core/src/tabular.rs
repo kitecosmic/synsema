@@ -6,7 +6,7 @@
 //! Faltantes (DATOS-2/6): `nothing` es un dato FALTANTE y las agregaciones lo saltean (como
 //! los null de polars/SQL); NaN es un resultado inválido y se PROPAGA.
 
-use crate::types::{Key, SynMap};
+use crate::types::{Key, MapObj, SynMap};
 use std::rc::Rc;
 
 
@@ -395,7 +395,7 @@ pub fn summarize(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue
     let rows = rows_arg(args.first().ok_or_else(|| err("summarize(rows, by, aggs)"))?, W)?;
     let spec = key_spec(args.get(1).ok_or_else(|| err("summarize(rows, by, aggs): missing by"))?, W)?;
     let aggs = match args.get(2) {
-        Some(SynValue::Map(m)) => m.borrow().clone(),
+        Some(SynValue::Map(m)) => m.borrow().to_map(),
         Some(other) => return Err(err(format!("{}: aggs must be a map name → function, got {}", W, other.type_name()))),
         None => return Err(err("summarize(rows, by, aggs): missing aggs")),
     };
@@ -407,7 +407,7 @@ pub fn summarize(interp: &mut Interpreter, args: &[SynValue]) -> Result<SynValue
 fn summarize_groups(
     interp: &mut Interpreter,
     spec: &KeySpec,
-    aggs: &SynMap,
+    aggs: &MapObj,
     gs: Vec<(SynValue, Vec<SynValue>)>,
 ) -> Result<SynValue, Control> {
     const W: &str = "summarize";
@@ -939,7 +939,7 @@ pub fn fill_missing(args: &[SynValue]) -> Result<SynValue, Control> {
         .map(|it| match it {
             SynValue::Nothing => fill.clone(),
             SynValue::Map(m) => {
-                let mut copy = m.borrow().clone();
+                let mut copy = m.borrow().to_map();
                 for (k, v) in copy.iter_mut() {
                     if matches!(v, SynValue::Nothing) {
                         match fill {

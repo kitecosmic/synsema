@@ -23,7 +23,7 @@
 //!
 //! PURO (G9): sin capability — funciona en run/test/conform/serve y DENTRO de `sandbox`.
 
-use synsema_core::types::SynMap;
+use synsema_core::types::{MapObj, SynMap};
 use std::rc::Rc;
 
 use indexmap::IndexMap;
@@ -323,7 +323,7 @@ fn opts_of(args: &[SynValue], kind: Kind, name: &str) -> Result<SynMap, Control>
                     )));
                 }
             }
-            Ok(m.clone())
+            Ok(m.to_map())
         }
         Some(other) => Err(err(format!(
             "{}: options must be a map, got {}",
@@ -335,7 +335,7 @@ fn opts_of(args: &[SynValue], kind: Kind, name: &str) -> Result<SynMap, Control>
 
 /// `theme`: `"light"` (default, exactamente los bytes del Batch 8) o `"dark"` (§4).
 fn opt_theme(
-    opts: &SynMap,
+    opts: &MapObj,
     name: &str,
 ) -> Result<&'static ThemeColors, Control> {
     match opts.get("theme") {
@@ -357,7 +357,7 @@ fn opt_theme(
 }
 
 fn opt_bool(
-    opts: &SynMap,
+    opts: &MapObj,
     key: &str,
     name: &str,
 ) -> Result<bool, Control> {
@@ -374,7 +374,7 @@ fn opt_bool(
 }
 
 fn opt_text(
-    opts: &SynMap,
+    opts: &MapObj,
     key: &str,
     name: &str,
 ) -> Result<Option<String>, Control> {
@@ -391,7 +391,7 @@ fn opt_text(
 }
 
 fn opt_dim(
-    opts: &SynMap,
+    opts: &MapObj,
     key: &str,
     default: f64,
     name: &str,
@@ -428,7 +428,7 @@ fn is_hex_color(s: &str) -> bool {
 /// tema (la semántica exacta depende del kind: paleta de series, stops de escala,
 /// o `[up, down, total]` del waterfall).
 fn opt_colors(
-    opts: &SynMap,
+    opts: &MapObj,
     name: &str,
 ) -> Result<Option<Vec<String>>, Control> {
     match opts.get("colors") {
@@ -513,7 +513,7 @@ fn x_of(v: &SynValue) -> XValue {
 }
 
 /// Campos `y` de opts: un texto o una lista de textos (multi-serie).
-fn y_fields(opts: &SynMap, name: &str) -> Result<Option<Vec<String>>, Control> {
+fn y_fields(opts: &MapObj, name: &str) -> Result<Option<Vec<String>>, Control> {
     match opts.get("y") {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Text(s)) => Ok(Some(vec![s.to_string()])),
@@ -548,7 +548,7 @@ fn y_fields(opts: &SynMap, name: &str) -> Result<Option<Vec<String>>, Control> {
 /// Forma 1: lista de mapas (filas de `sql()`/`mongo_find`/`csv_parse`/literal) + opts x/y.
 fn from_rows(
     rows: &[SynValue],
-    opts: &SynMap,
+    opts: &MapObj,
     kind: Kind,
     name: &str,
 ) -> Result<Vec<Series>, Control> {
@@ -873,7 +873,7 @@ fn normalize_series(args: &[SynValue], name: &str) -> Result<ChartSpec, Control>
 /// del Batch 8, sin cambios de semántica para los kinds existentes (G1).
 fn normalize_xy(
     args: &[SynValue],
-    opts: &SynMap,
+    opts: &MapObj,
     kind: Kind,
     name: &str,
 ) -> Result<Vec<Series>, Control> {
@@ -1028,7 +1028,7 @@ fn heat_t(scale: HeatScale, mn: f64, mx: f64, v: f64) -> f64 {
 /// leyenda y salidas MD/JSON usan los mismos números.
 fn normalize_heatmap(
     args: &[SynValue],
-    opts: &SynMap,
+    opts: &MapObj,
     user_colors: &Option<Vec<String>>,
     th: &'static ThemeColors,
     name: &str,
@@ -1378,7 +1378,7 @@ fn normalize_heatmap(
 /// `chart("histogram", histogram(datos, 20))`).
 fn normalize_histogram(
     args: &[SynValue],
-    opts: &SynMap,
+    opts: &MapObj,
     name: &str,
 ) -> Result<(Vec<i64>, Vec<f64>), Control> {
     let raw = || -> Result<(Vec<i64>, Vec<f64>), Control> {
@@ -1388,7 +1388,7 @@ fn normalize_histogram(
         }
         let result = synsema_core::math::histogram(&h_args)?;
         let m = match &result {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             _ => {
                 return Err(err(format!(
                     "{}: internal error — histogram() did not return a map",
@@ -1613,7 +1613,7 @@ fn box_group(label: &str, mut vals: Vec<f64>, name: &str) -> Result<BoxGroup, Co
 /// (caja por grupo, orden de inserción), o formato largo (rows + x/y).
 fn normalize_boxplot(
     args: &[SynValue],
-    opts: &SynMap,
+    opts: &MapObj,
     name: &str,
 ) -> Result<Vec<BoxGroup>, Control> {
     match &args[1] {
@@ -1764,7 +1764,7 @@ fn normalize_boxplot(
 /// SVG/MD/JSON). Delta 0 es dato real (barra plana), no error.
 fn normalize_waterfall(
     args: &[SynValue],
-    opts: &SynMap,
+    opts: &MapObj,
     name: &str,
 ) -> Result<(Vec<WfStep>, Option<String>), Control> {
     let total_label = match opts.get("total") {
@@ -3215,7 +3215,7 @@ pub fn render_chart_md(node: &SynValue) -> String {
             );
             for g in field_list(node, "groups") {
                 let m = match &g {
-                    SynValue::Map(m) => m.borrow().clone(),
+                    SynValue::Map(m) => m.borrow().to_map(),
                     _ => continue,
                 };
                 let cell = |k: &str| m.get(k).map(md_num).unwrap_or_default();
@@ -3243,7 +3243,7 @@ pub fn render_chart_md(node: &SynValue) -> String {
             out.push_str("| label | delta | running |\n| --- | --- | --- |");
             for s in field_list(node, "steps") {
                 let m = match &s {
-                    SynValue::Map(m) => m.borrow().clone(),
+                    SynValue::Map(m) => m.borrow().to_map(),
                     _ => continue,
                 };
                 let label = m.get("label").map(|v| v.to_string()).unwrap_or_default();
@@ -4053,7 +4053,7 @@ mod tests {
             other => panic!("groups no es lista: {}", other.type_name()),
         };
         let g = match &groups[0] {
-            SynValue::Map(m) => m.borrow().clone(),
+            SynValue::Map(m) => m.borrow().to_map(),
             _ => panic!("grupo no es mapa"),
         };
         let num = |k: &str| match g.get(k) {
