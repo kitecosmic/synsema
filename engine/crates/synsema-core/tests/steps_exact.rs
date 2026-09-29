@@ -43,6 +43,21 @@ fn shortcuts_count_the_same_steps_as_the_reference() {
         ("let f be 1.5", "set f to f + 1", None),
         ("let xs be [1]\nlet ys be [2]", "set xs to append(ys, 3)", None),
         ("let m be {\"a\": 1}", "set m.a to m.a + 1", None),
+        // F4.6a: `set` con camino en la VM (los nodos del destino no cuentan; los índices, sí).
+        ("let bs be [{\"x\": 1}]", "set bs[0].x to 2", Some(3)),
+        ("let m be {\"a\": {\"b\": [1, 2]}}
+let i be 1", "set m.a.b[i] to i + 1", None),
+        ("let m be {\"a\": {\"b\": [1, 2]}}
+let i be 1", "set m[\"a\"][\"b\"][i - 2] to 5", None),
+        ("let xs be [0, 1]", "set xs[0] to xs", None),
+        ("let xs be [0, 1]
+task z()
+    give 1", "set xs[z()] to 7", None),
+        // La raíz en un hueco de la ventana: la referencia hace el `set` entero.
+        ("let h be {\"n\": 1}", "each e in range(0, 2)
+    when e == 9
+        let h be {\"n\": 0}
+    set h.n to e", None),
     ];
     let mut bad = Vec::new();
     for (prelude, stmt, fixed) in cases {

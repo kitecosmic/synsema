@@ -1,0 +1,5 @@
+-- F4.6a: fuera de rango en la hoja, a mitad de un bucle de la VM
+let xs be [[1, 2], [3]]
+each i in range(0, 3)
+    print(steps())
+    set xs[i][1] to i

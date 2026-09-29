@@ -1,0 +1,5 @@
+-- F4.6a: el índice falla después de que la raíz se copió
+let xs be [[1]]
+let ys be xs
+print(steps())
+set xs[0][undefined_name] to 1

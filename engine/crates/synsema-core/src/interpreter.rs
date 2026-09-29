@@ -602,6 +602,10 @@ impl Bindings {
         self.slots[k].as_ref()
     }
     #[inline]
+    pub(crate) fn slot_mut(&mut self, k: usize) -> Option<&mut SynValue> {
+        self.slots[k].as_mut()
+    }
+    #[inline]
     pub(crate) fn slot_set(&mut self, k: usize, v: SynValue) {
         self.slots[k] = Some(v);
     }
@@ -722,6 +726,64 @@ fn module_rebind(
             let _ = env_update(menv, name, value.clone());
             Ok(value)
         }
+    }
+}
+
+/// La hoja de `set <camino>.campo to v` (sin etiquetas: ya se resolvieron), con el contenedor ya
+/// evaluado: lo mismo para el tree-walker y para la VM (F4.6a). Devuelve el valor escrito.
+pub(crate) fn set_leaf_prop(obj: &SynValue, property_name: &str, value: SynValue, loc: &SourceLocation) -> Result<SynValue, Control> {
+    match obj {
+        SynValue::Map(m) => {
+            // `set m.X to v` sobre un módulo religa SU variable (la que leen sus tasks), como
+            // `m.X = v` en Python; sus nombres son sus exportaciones y sus tasks no se reemplazan
+            // desde afuera.
+            if let Some(menv) = module_env_of_map(m) {
+                return module_rebind(m, &menv, property_name, value, loc);
+            }
+            m.borrow_mut().set(property_name, value.clone());
+            Ok(value)
+        }
+        _ => Err(err_at(format!("Cannot set property on {}", obj.type_name()), loc)),
+    }
+}
+
+/// La hoja de `set <camino>[idx] to v` (ver `set_leaf_prop`). `target_loc`: la del destino (el
+/// error de fuera de rango, como la lectura `xs[i]`); `loc`: la de la sentencia.
+pub(crate) fn set_leaf_index(
+    obj: &SynValue,
+    idx: &SynValue,
+    value: SynValue,
+    target_loc: &SourceLocation,
+    loc: &SourceLocation,
+) -> Result<SynValue, Control> {
+    match obj {
+        SynValue::List(l) => {
+            let mut b = l.borrow_mut();
+            let len = b.len() as i64;
+            let given = num_to_i64(idx)?;
+            let mut i = given;
+            if i < 0 {
+                i += len;
+            }
+            // El mismo mensaje y lugar que la lectura `xs[i]`.
+            if i < 0 || i >= len {
+                return Err(err_at(
+                    format!("Index {} out of bounds (list length {}) — to add an item: set xs to append(xs, x)", given, len),
+                    target_loc,
+                ));
+            }
+            b[i as usize] = value.clone();
+            Ok(value)
+        }
+        SynValue::Map(m) => {
+            // `set lib["X"] to v`: las mismas reglas que `set lib.X to v`.
+            if let Some(menv) = module_env_of_map(m) {
+                return module_rebind(m, &menv, &idx.to_string(), value, loc);
+            }
+            m.borrow_mut().set_value_key(idx, value.clone());
+            Ok(value)
+        }
+        _ => Err(err_at(format!("Cannot set index on {}", obj.type_name()), loc)),
     }
 }
 
@@ -6349,19 +6411,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 } else {
                     (obj, value)
                 };
-                match &obj {
-                    SynValue::Map(m) => {
-                        // `set m.X to v` sobre un módulo religa SU variable (la que leen sus
-                        // tasks), como `m.X = v` en Python; sus nombres son sus exportaciones y
-                        // sus tasks no se reemplazan desde afuera.
-                        if let Some(menv) = module_env_of_map(m) {
-                            return module_rebind(m, &menv, property_name, value, loc);
-                        }
-                        m.borrow_mut().set(property_name, value.clone());
-                        Ok(value)
-                    }
-                    _ => Err(err_at(format!("Cannot set property on {}", obj.type_name()), loc)),
-                }
+                set_leaf_prop(&obj, property_name, value, loc)
             }
             NodeKind::IndexAccess { object, index } => {
                 let obj = self.exec_place(object, env)?;
@@ -6380,35 +6430,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                     } else {
                         (obj, idx, value)
                     };
-                match &obj {
-                    SynValue::List(l) => {
-                        let mut b = l.borrow_mut();
-                        let len = b.len() as i64;
-                        let given = num_to_i64(&idx)?;
-                        let mut i = given;
-                        if i < 0 {
-                            i += len;
-                        }
-                        // El mismo mensaje y lugar que la lectura `xs[i]`.
-                        if i < 0 || i >= len {
-                            return Err(err_at(
-                                format!("Index {} out of bounds (list length {}) — to add an item: set xs to append(xs, x)", given, len),
-                                &target.location,
-                            ));
-                        }
-                        b[i as usize] = value.clone();
-                        Ok(value)
-                    }
-                    SynValue::Map(m) => {
-                        // `set lib["X"] to v`: las mismas reglas que `set lib.X to v`.
-                        if let Some(menv) = module_env_of_map(m) {
-                            return module_rebind(m, &menv, &idx.to_string(), value, loc);
-                        }
-                        m.borrow_mut().set_value_key(&idx, value.clone());
-                        Ok(value)
-                    }
-                    _ => Err(err_at(format!("Cannot set index on {}", obj.type_name()), loc)),
-                }
+                set_leaf_index(&obj, &idx, value, &target.location, loc)
             }
             _ => Err(err_at("Invalid set target", loc)),
         }
@@ -6622,47 +6644,61 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             NodeKind::IndexAccess { object, index } => {
                 let parent = self.exec_place(object, env)?;
                 let idx = self.exec(index, env)?;
-                // `set d["STATE"][k]`, `set h.l.STATE[k]`: la VARIABLE del módulo, como `d.STATE`.
-                if let Some(v) = module_var_unique(&parent, &labels::unwrap(&idx).to_string()) {
-                    return Ok(v);
-                }
-                match labels::unwrap(&parent) {
-                    SynValue::List(l) => {
-                        if let Ok(i) = num_to_i64(labels::unwrap(&idx)) {
-                            let mut items = l.borrow_mut();
-                            let n = items.len();
-                            if let Some(j) = resolve_index(i, n) {
-                                make_unique(&mut items[j]);
-                            }
-                        }
-                    }
-                    SynValue::Map(m) => {
-                        let key = labels::unwrap(&idx).to_string();
-                        if let Some(slot) = m.borrow_mut().get_mut(&key) {
-                            make_unique(slot);
-                        }
-                    }
-                    _ => {}
-                }
-                self.index_read(parent, idx, loc)
+                self.place_index_step(parent, idx, loc)
             }
             NodeKind::PropertyAccess { property_name, object, .. } => {
                 let parent = self.exec_place(object, env)?;
-                // `set d.STATE[k] to v`: se escribe la VARIABLE del módulo (la misma que ven sus
-                // tasks), copiándola antes sólo si alguien más guardó una foto (`let s be d.STATE`),
-                // venga el mapa del módulo de una variable, de un re-export o de un campo.
-                if let Some(v) = module_var_unique(&parent, property_name) {
-                    return Ok(v);
-                }
-                if let SynValue::Map(m) = labels::unwrap(&parent) {
-                    if let Some(slot) = m.borrow_mut().get_mut(property_name) {
-                        make_unique(slot);
-                    }
-                }
-                self.property_read(parent, property_name, loc)
+                self.place_prop_step(parent, property_name, loc)
             }
             _ => self.exec(node, env),
         }
+    }
+
+    /// Un paso `[idx]` del camino de un `set` (ver `exec_place`), con el lugar de arriba y el
+    /// índice ya evaluados: lo mismo para el tree-walker y para la VM (F4.6a).
+    pub(crate) fn place_index_step(&mut self, parent: SynValue, idx: SynValue, loc: &SourceLocation) -> Result<SynValue, Control> {
+        // `set d["STATE"][k]`, `set h.l.STATE[k]`: la VARIABLE del módulo, como `d.STATE`. (Sólo
+        // un mapa puede ser un módulo: la clave como texto, sólo entonces.)
+        if matches!(parent, SynValue::Map(_)) {
+            if let Some(v) = module_var_unique(&parent, &labels::unwrap(&idx).to_string()) {
+                return Ok(v);
+            }
+        }
+        match labels::unwrap(&parent) {
+            SynValue::List(l) => {
+                if let Ok(i) = num_to_i64(labels::unwrap(&idx)) {
+                    let mut items = l.borrow_mut();
+                    let n = items.len();
+                    if let Some(j) = resolve_index(i, n) {
+                        make_unique(&mut items[j]);
+                    }
+                }
+            }
+            SynValue::Map(m) => {
+                let key = labels::unwrap(&idx).to_string();
+                if let Some(slot) = m.borrow_mut().get_mut(&key) {
+                    make_unique(slot);
+                }
+            }
+            _ => {}
+        }
+        self.index_read(parent, idx, loc)
+    }
+
+    /// Un paso `.campo` del camino de un `set` (ver `exec_place`).
+    pub(crate) fn place_prop_step(&mut self, parent: SynValue, property_name: &str, loc: &SourceLocation) -> Result<SynValue, Control> {
+        // `set d.STATE[k] to v`: se escribe la VARIABLE del módulo (la misma que ven sus
+        // tasks), copiándola antes sólo si alguien más guardó una foto (`let s be d.STATE`),
+        // venga el mapa del módulo de una variable, de un re-export o de un campo.
+        if let Some(v) = module_var_unique(&parent, property_name) {
+            return Ok(v);
+        }
+        if let SynValue::Map(m) = labels::unwrap(&parent) {
+            if let Some(slot) = m.borrow_mut().get_mut(property_name) {
+                make_unique(slot);
+            }
+        }
+        self.property_read(parent, property_name, loc)
     }
 
     /// ¿Es `v` el mapa de exportaciones de un módulo cargado?

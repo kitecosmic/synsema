@@ -1,0 +1,6 @@
+-- F4.6a: un índice que no es entero, en una task ya compilada
+task put(xs, i)
+    set xs[i][0] to 7
+    give xs
+print(put([[1]], 0), put([[1]], 0), steps())
+print(put([[1]], 0.5))

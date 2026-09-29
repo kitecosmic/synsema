@@ -116,6 +116,17 @@ fn heap_allocations_per_construct() {
         ("set m[k] (clave que ya está)", "let m be {\"a\": 1}\nlet k be \"a\"\n", "    set m[k] to i\n", 0),
         // F4.4: `set m.a` sobre una clave que ya está sólo cambia el valor (antes: 1).
         ("set m.a (clave que ya está)", "let m be {\"a\": 1}\n", "    set m.a to i\n", 0),
+        // F4.6a: `set` con camino en la VM (sin armar el índice como texto en cada nivel).
+        ("set xs[1] (camino)", "let xs be [1, 2, 3]
+", "    set xs[1] to i
+", 0),
+        ("set bs[0].x (camino)", "let bs be [{\"x\": 1}]
+", "    set bs[0].x to i
+", 0),
+        ("set m.a.b[j] (camino)", "let m be {\"a\": {\"b\": [1, 2]}}
+let j be 1
+", "    set m.a.b[j] to i
+", 0),
         // F4.4: `keys` comparte el texto de cada clave (antes: 4, uno por clave).
         ("keys(m) de 2 claves", "let m be {\"a\": 1, \"b\": 2}\n", "    set x to keys(m)\n", 2),
     ];

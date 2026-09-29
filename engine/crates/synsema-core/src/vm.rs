@@ -155,6 +155,16 @@ pub(crate) enum Ins {
     /// `set <camino> to v`: el destino lo recorre la referencia (`exec_set`), con el valor ya
     /// evaluado.
     SetPath { src: Opnd, node: u32, dst: Reg },
+    /// F4.6a: la raíz de `set <camino> to v` (ver `PathDesc`): el contenedor de la variable, único
+    /// como en `with_unique_binding`, a `c`. Si la raíz no es de las que la VM resuelve, corre el
+    /// `SetPath` de antes (la referencia, con el valor ya evaluado) y salta al `done` de la
+    /// descripción; como `TryInPlace`, no termina su bloque y descuenta antes su `rest`.
+    PathRoot { c: Reg, desc: u32 },
+    /// Un paso intermedio del camino: `[idx]` (`key == NONE`) o `.campo` (`key` = el nombre): `c`
+    /// pasa a ser el lugar de adentro, único (`place_index_step`/`place_prop_step`).
+    PathStep { c: Reg, idx: Opnd, key: u32, ic: u32 },
+    /// La hoja: escribe el valor de la descripción en `c[idx]` o `c.campo` (`set_leaf_*`).
+    PathSet { c: Reg, idx: Opnd, desc: u32 },
     /// `private(…)`, `print(…)` y los demás protegidos tienen que resolver al builtin de verdad; la
     /// referencia lo chequea antes de evaluar los argumentos.
     CheckProtected { func: Reg, name: u32 },
@@ -255,6 +265,8 @@ pub(crate) struct Chunk {
     /// frío, qué frames hay que armar con las variables de la ventana (`NONE` si ninguno).
     node_spill: Vec<u32>,
     spills: Vec<Box<[Spill]>>,
+    /// F4.6a: los `set` con camino.
+    paths: Vec<PathDesc>,
     /// Si el frame lleva su `Layout` como marca: sólo hace falta cuando otro chunk (el de una task
     /// o lambda definida adentro) lo va a recorrer y tiene que verificarlo. Los frames que la VM
     /// preparó para este chunk no se verifican: los armó ella.
@@ -278,6 +290,38 @@ pub(crate) struct Chunk {
     /// F4.2: el estado de cada `LoopBack` (cuenta de vueltas, código nativo).
     #[cfg(feature = "native-tier")]
     loops: Box<[native::LoopState]>,
+}
+
+/// F4.6a: un `set` con camino que corre la VM (`PathRoot`/`PathStep`/`PathSet`).
+#[derive(Clone, Copy, Debug)]
+struct PathDesc {
+    root: Root,
+    /// El destino como nodo frío (con su spill): lo que corre la referencia si la raíz no es de
+    /// las que resuelve la VM.
+    node: u32,
+    /// El valor, ya evaluado (en un registro o una constante: la referencia lo evalúa antes que
+    /// el camino, así que no puede ser una lectura diferida).
+    src: Opnd,
+    dst: Reg,
+    /// Al compilar, un label; en el chunk, la instrucción que sigue al `set`.
+    done: u32,
+    /// La hoja: `.campo` (el nombre) o `NONE` (`[idx]`), y su caché.
+    key: u32,
+    ic: u32,
+    /// La ubicación del destino (el error de fuera de rango).
+    target_loc: u32,
+}
+
+/// Dónde está la variable raíz de un camino (ver `Place`).
+#[derive(Clone, Copy, Debug)]
+enum Root {
+    Param(Reg),
+    Win(u16),
+    Local(u16),
+    /// Por nombre con la caché del slot (`ic`, la de `LoadName`).
+    Free { name: u32, ic: u32 },
+    /// La referencia (un frame de afuera: raro en código caliente).
+    Slow,
 }
 
 /// Un scope que vive en la ventana de locales: su layout (el del resolver) y dónde empieza.
@@ -581,6 +625,7 @@ struct Compiler<'r, 's> {
     frame_needed: bool,
     node_spill: Vec<u32>,
     spills: Vec<Box<[Spill]>>,
+    paths: Vec<PathDesc>,
     key_ics: u32,
     /// F3.7: en un cuerpo con frame en registros, el registro de cada slot que es un parámetro
     /// (el último si se repite, como la referencia) y dónde va el valor del bloque (`r0` si no).
@@ -629,6 +674,7 @@ impl<'r, 's> Compiler<'r, 's> {
             frame_needed: false,
             node_spill: Vec::new(),
             spills: Vec::new(),
+            paths: Vec::new(),
             key_ics: 0,
             param_reg: HashMap::new(),
             result_reg: 0,
@@ -998,9 +1044,13 @@ impl<'r, 's> Compiler<'r, 's> {
                     None
                 };
                 let v = self.expr(value);
-                let node = self.cold_spilled(target);
-                self.at(&n.location);
-                self.emit(Ins::SetPath { src: v, node, dst });
+                if set_root_identifier(target).is_some() {
+                    self.set_path(n, target, v, dst);
+                } else {
+                    let node = self.cold_spilled(target);
+                    self.at(&n.location);
+                    self.emit(Ins::SetPath { src: v, node, dst });
+                }
                 if let Some(d) = done {
                     self.bind(d);
                 }
@@ -1302,6 +1352,73 @@ impl<'r, 's> Compiler<'r, 's> {
             }
             _ => Place::Free,
         }
+    }
+
+    /// F4.6a: `set <raíz><pasos> to v` con la raíz una variable, en el orden de la referencia
+    /// (`exec_set` → `exec_place`): el valor ya evaluado, la raíz, y por cada paso su índice y el
+    /// paso; la hoja escribe. Los nodos del destino no cuentan pasos (la referencia tampoco); los
+    /// índices, sí, por su código.
+    fn set_path(&mut self, n: &Node, target: &Node, v: Opnd, dst: Reg) {
+        // La referencia tiene el valor en la mano antes de recorrer el camino (con él, su cuenta
+        // de referencias, que decide los `make_unique`): una lectura de variable se toma ya.
+        let src = match v {
+            Opnd::Reg(_) | Opnd::Const(_) => v,
+            other => Opnd::Reg(self.to_reg(other)),
+        };
+        // Los pasos, de la raíz a la hoja.
+        let mut steps: Vec<&Node> = Vec::new();
+        let mut cur = target;
+        let root_name = loop {
+            match &cur.kind {
+                NodeKind::Identifier { name } => break name,
+                NodeKind::IndexAccess { object, .. } | NodeKind::PropertyAccess { object, .. } => {
+                    steps.push(cur);
+                    cur = object;
+                }
+                _ => unreachable!("raíz sin variable"),
+            }
+        };
+        steps.reverse();
+        let root = match self.place(self.target(cur)) {
+            Place::Param(r) => Root::Param(r),
+            Place::Win(k) => Root::Win(k),
+            Place::Local(k) => Root::Local(k),
+            Place::Free => {
+                let name = self.name(root_name);
+                Root::Free { name, ic: self.ic() }
+            }
+            Place::Outer(..) => Root::Slow,
+        };
+        let node = self.cold_spilled(target);
+        let done = self.label();
+        let c = self.reg();
+        self.at(&target.location);
+        let target_loc = self.cur_loc;
+        let desc = self.paths.len() as u32;
+        self.paths.push(PathDesc { root, node, src, dst, done, key: NONE, ic: NONE, target_loc });
+        self.at(&n.location);
+        self.emit(Ins::PathRoot { c, desc });
+        let last = steps.len() - 1;
+        for (i, st) in steps.iter().enumerate() {
+            let (idx, key) = match &st.kind {
+                NodeKind::IndexAccess { index, .. } => (self.expr(index), NONE),
+                NodeKind::PropertyAccess { property_name, .. } => (Opnd::Const(0), self.name(property_name)),
+                _ => unreachable!(),
+            };
+            let ic = self.key_ic();
+            if i == last {
+                let d = &mut self.paths[desc as usize];
+                d.key = key;
+                d.ic = ic;
+                self.at(&n.location);
+                self.emit(Ins::PathSet { c, idx, desc });
+            } else {
+                // La ubicación del paso (sus errores, como en `exec_place`).
+                self.at(&st.location);
+                self.emit(Ins::PathStep { c, idx, key, ic });
+            }
+        }
+        self.bind(done);
     }
 
     fn when(&mut self, n: &Node, want: Option<Reg>) {
@@ -1736,6 +1853,10 @@ impl<'r, 's> Compiler<'r, 's> {
                     leader[target(&self.labels, done)] = true;
                 }
                 Ins::SetPath { .. } => leader[i + 1] = true,
+                // Como `TryInPlace`: no corta el bloque; su salida (la referencia) va a `done`.
+                Ins::PathRoot { desc, .. } => {
+                    leader[target(&self.labels, self.paths[desc as usize].done)] = true;
+                }
                 Ins::EachNext { exit, .. } => {
                     leader[target(&self.labels, exit)] = true;
                     leader[i + 1] = true;
@@ -1834,6 +1955,9 @@ impl<'r, 's> Compiler<'r, 's> {
                 *t = map(*t, &self.labels);
             }
         }
+        for p in self.paths.iter_mut() {
+            p.done = map(p.done, &self.labels);
+        }
         let loop_heads = self.loop_heads.iter().map(|&l| map(l, &self.labels)).collect();
         let frame = self.frame_scope.map(|s| self.shared.layouts[s as usize].clone());
         let tagged = !self.children.is_empty();
@@ -1857,6 +1981,7 @@ impl<'r, 's> Compiler<'r, 's> {
             nlocals: self.nlocals,
             node_spill: self.node_spill,
             spills: self.spills,
+            paths: self.paths,
             nregs: self.max_reg,
             ics: (0..self.ics).map(|_| Cell::new(0)).collect(),
             ic_here: self.ic_hops.iter().map(|&h| self.hops[h as usize].from.is_none()).collect(),
@@ -2324,6 +2449,16 @@ impl Interpreter {
                     Ok(())
                 })(),
                 Ins::SetPath { src, node, dst } => self.vm_set_path(&chunk, &env, base, src, node, dst, at),
+                Ins::PathRoot { c, desc } => match self.vm_path_root(&chunk, &env, base, c, desc, at) {
+                    Ok(Some(j)) => {
+                        pc = j;
+                        Ok(())
+                    }
+                    Ok(None) => Ok(()),
+                    Err(c) => Err(c),
+                },
+                Ins::PathStep { c, idx, key, ic } => self.vm_path_step(&chunk, &env, base, c, idx, key, ic, at),
+                Ins::PathSet { c, idx, desc } => self.vm_path_set(&chunk, &env, base, c, idx, desc, at),
                 Ins::CheckProtected { func, name } => check_protected_callee(
                     &chunk.names[name as usize],
                     &self.vm_regs[base + func as usize],
@@ -3315,6 +3450,199 @@ impl Interpreter {
             self.exec_set(&chunk.nodes[node as usize], v, env, loc, false)?
         };
         self.put(base, dst, out);
+        Ok(())
+    }
+
+    /// `PathRoot` (F4.6a): la raíz la resuelve la VM (lo común: `Ok(None)`, sigue el camino) o corre
+    /// la referencia entera y `Ok(Some(done))`; entonces los pasos que el bloque sumó para el código
+    /// del camino no corren (ver `TryInPlace`).
+    #[inline(never)]
+    fn vm_path_root(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, c: Reg, desc: u32, at: usize) -> Result<Option<usize>, Control> {
+        if self.vm_path_root_fast(chunk, env, base, c, desc).is_some() {
+            return Ok(None);
+        }
+        let pending = chunk.rest[at] as u64;
+        self.steps = self.steps.wrapping_sub(pending);
+        let d = chunk.paths[desc as usize];
+        match self.vm_set_path(chunk, env, base, d.src, d.node, d.dst, at) {
+            Ok(()) => Ok(Some(d.done as usize)),
+            Err(c) => {
+                // El camino de error vuelve a descontar `rest`.
+                self.steps = self.steps.wrapping_add(pending);
+                Err(c)
+            }
+        }
+    }
+
+    /// El contenedor de la variable raíz a `c`, como `exec_place` sobre un identificador: el mapa
+    /// de un módulo tal cual; si no, único (`make_unique`) y una copia de la referencia. `None` si
+    /// la raíz no está donde la VM la busca (un hueco, un frame de módulo o de afuera).
+    #[inline(always)]
+    fn vm_path_root_fast(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, c: Reg, desc: u32) -> Option<()> {
+        fn take(slot: &mut SynValue) -> SynValue {
+            if !matches!(slot, SynValue::Map(m) if module_env_of_map(m).is_some()) {
+                make_unique(slot);
+            }
+            slot.clone()
+        }
+        let v = match chunk.paths[desc as usize].root {
+            Root::Param(r) => take(&mut self.vm_regs[base + r as usize]),
+            Root::Win(k) => take(self.vm_locals[self.vm_lbase + k as usize].as_mut()?),
+            Root::Local(k) => {
+                let mut e = env.borrow_mut();
+                if e.name.starts_with("module:") {
+                    return None;
+                }
+                take(e.bindings.slot_mut(k as usize)?)
+            }
+            Root::Free { name, ic } => {
+                let start = self.free_start(chunk, env, chunk.hops[chunk.ic_hops[ic as usize] as usize]);
+                let mut e = start.borrow_mut();
+                if e.name.starts_with("module:") {
+                    return None;
+                }
+                take(e.bindings.get_cached_mut(&chunk.names[name as usize], &chunk.ics[ic as usize])?)
+            }
+            Root::Slow => return None,
+        };
+        self.put(base, c, v);
+        Some(())
+    }
+
+    /// `PathStep` (F4.6a): `c` pasa a ser el lugar de adentro, único. Una lista con un entero y un
+    /// mapa que no es de un módulo, directo (con la caché por forma); lo demás, el paso de la
+    /// referencia (`place_index_step`/`place_prop_step`), con sus errores.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_path_step(
+        &mut self,
+        chunk: &Chunk,
+        env: &Rc<RefCell<Environment>>,
+        base: usize,
+        c: Reg,
+        idx: Opnd,
+        key: u32,
+        ic: u32,
+        at: usize,
+    ) -> Result<(), Control> {
+        let parent = std::mem::replace(&mut self.vm_regs[base + c as usize], SynValue::Nothing);
+        let loc = &chunk.locs[chunk.loc[at] as usize];
+        let next = if key != NONE {
+            let name = &chunk.names[key as usize];
+            let fast = match &parent {
+                SynValue::Map(m) if module_env_of_map(m).is_none() => {
+                    m.borrow_mut().get_cached_mut(name, &chunk.key_ics[ic as usize]).map(|slot| {
+                        make_unique(slot);
+                        slot.clone()
+                    })
+                }
+                _ => None,
+            };
+            match fast {
+                Some(v) => v,
+                None => self.place_prop_step(parent, name, loc)?,
+            }
+        } else {
+            let i = self.opnd(chunk, env, base, idx, at)?;
+            let fast = match (&parent, &i) {
+                (SynValue::List(l), SynValue::Number(Number::Int(k))) => {
+                    let mut items = l.borrow_mut();
+                    let n = items.len();
+                    resolve_index(*k, n).map(|j| {
+                        make_unique(&mut items[j]);
+                        items[j].clone()
+                    })
+                }
+                (SynValue::Map(m), SynValue::Text(k)) if module_env_of_map(m).is_none() => {
+                    m.borrow_mut().get_cached_key_mut(k, &chunk.key_ics[ic as usize]).map(|slot| {
+                        make_unique(slot);
+                        slot.clone()
+                    })
+                }
+                _ => None,
+            };
+            match fast {
+                Some(v) => v,
+                None => self.place_index_step(parent, i, loc)?,
+            }
+        };
+        self.put(base, c, next);
+        Ok(())
+    }
+
+    /// `PathSet` (F4.6a): la hoja. Una lista con un entero en rango y un mapa que no es de un
+    /// módulo con la clave ya puesta, directo; lo demás, `set_leaf_*` (los mismos errores).
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_path_set(
+        &mut self,
+        chunk: &Chunk,
+        env: &Rc<RefCell<Environment>>,
+        base: usize,
+        c: Reg,
+        idx: Opnd,
+        desc: u32,
+        at: usize,
+    ) -> Result<(), Control> {
+        let d = chunk.paths[desc as usize];
+        let obj = std::mem::replace(&mut self.vm_regs[base + c as usize], SynValue::Nothing);
+        let out = if d.key != NONE {
+            let v = self.opnd(chunk, env, base, d.src, at)?;
+            let name = &chunk.names[d.key as usize];
+            let done = match &obj {
+                SynValue::Map(m) if module_env_of_map(m).is_none() => {
+                    let mut b = m.borrow_mut();
+                    match b.get_cached_mut(name, &chunk.key_ics[d.ic as usize]) {
+                        Some(slot) => {
+                            *slot = v.clone();
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                _ => false,
+            };
+            if done {
+                v
+            } else {
+                set_leaf_prop(&obj, name, v, &chunk.locs[chunk.loc[at] as usize])?
+            }
+        } else {
+            // El índice, después el valor: en la referencia los dos ya están evaluados (el valor
+            // antes que todo el camino), así que leerlos en este orden no se ve.
+            let i = self.opnd(chunk, env, base, idx, at)?;
+            let v = self.opnd(chunk, env, base, d.src, at)?;
+            let done = match (&obj, &i) {
+                (SynValue::List(l), SynValue::Number(Number::Int(k))) => {
+                    let mut items = l.borrow_mut();
+                    let n = items.len();
+                    match resolve_index(*k, n) {
+                        Some(j) => {
+                            items[j] = v.clone();
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                (SynValue::Map(m), SynValue::Text(k)) if module_env_of_map(m).is_none() => {
+                    let mut b = m.borrow_mut();
+                    match b.get_cached_key_mut(k, &chunk.key_ics[d.ic as usize]) {
+                        Some(slot) => {
+                            *slot = v.clone();
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                _ => false,
+            };
+            if done {
+                v
+            } else {
+                set_leaf_index(&obj, &i, v, &chunk.locs[d.target_loc as usize], &chunk.locs[chunk.loc[at] as usize])?
+            }
+        };
+        self.put(base, d.dst, out);
         Ok(())
     }
 

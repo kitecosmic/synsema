@@ -1,0 +1,98 @@
+-- F4.6a: `set` con camino en la VM contra la referencia (alias y copy-on-write por nivel,
+-- raíces en la ventana, parámetros, globales, frames vistos por closures y huecos)
+let bodies be [{"x": 1.0, "v": [1, 2]}, {"x": 2.0, "v": [3]}]
+let snap be bodies
+let inner be bodies[0]
+each i in range(0, 2)
+    set bodies[i].x to bodies[i].x + 0.5
+    set bodies[i].v[0] to i * 10
+print(bodies, snap, inner, steps())
+
+-- un alias de un nivel de adentro queda como foto
+let m be {"a": {"b": [1, 2, 3]}, "k": "b"}
+let keep be m.a.b
+set m.a.b[1] to 99
+set m["a"][m.k][2] to 7
+print(m, keep)
+
+-- claves nuevas en la hoja, índices negativos, clave de texto en una variable
+let key be "nueva"
+set m.a[key] to 1
+set m.a.b[-1] to -1
+set m["z"] to {"w": 0}
+set m.z.w to m.z.w + 1
+print(m, steps())
+
+-- el valor es la raíz misma: la referencia lo tiene en la mano, así que copia
+let xs be [1, 2]
+set xs[0] to xs
+print(xs)
+
+-- parámetro (frame en registros), llamado varias veces para que compile
+task bump(rows, k)
+    each r in range(0, length(rows))
+        set rows[r].n to rows[r].n + k
+    give rows
+let base be [{"n": 1}, {"n": 2}]
+let a1 be bump(base, 1)
+let a2 be bump(a1, 1)
+let a3 be bump(a2, 1)
+print(base, a1, a2, a3, steps())
+
+-- una global escrita desde una task
+let STATE be {"count": {"hits": 0}, "log": []}
+task hit(n)
+    set STATE.count.hits to STATE.count.hits + n
+    set STATE["log"] to append(STATE["log"], n)
+    give STATE.count.hits
+each q in range(0, 4)
+    hit(q)
+print(STATE, steps())
+
+-- el frame de la task lo ve una closure (vive como entorno)
+task maker()
+    let box be {"v": [0]}
+    let f be () => box.v[0]
+    set box.v[0] to 5
+    give [box, f()]
+print(maker(), maker(), maker())
+
+-- una variable de afuera escrita desde una task anidada
+task outer_w()
+    let acc be {"n": [0]}
+    task add(d)
+        set acc.n[0] to acc.n[0] + d
+    add(1)
+    add(2)
+    add(3)
+    give acc
+print(outer_w(), outer_w(), outer_w())
+
+-- el índice llama a algo que cambia la variable del valor
+let t be [0, 0, 0]
+let w be 1
+task side()
+    set w to 2
+    give 0
+set t[side()] to w
+print(t, w)
+
+-- el valor de la sentencia cuando es la última de un cuerpo
+task last(z)
+    set z.p to 4
+let q be {"p": 1}
+print(last(q), last(q), last(q), q)
+
+-- raíz hueca en la ventana (el `let` de la rama no corrió): por nombre, como la referencia
+let hole be {"h": 1}
+each e in range(0, 2)
+    when e == 5
+        let hole be {"h": 100}
+    set hole.h to hole.h + e
+print(hole, steps())
+
+-- el mismo sitio con mapas de distinta forma (la caché por forma)
+let shapes be [{"a": 1, "b": 2}, {"b": 3}, {"c": 0, "b": 4}]
+each s in range(0, 3)
+    set shapes[s].b to shapes[s].b * 10
+print(shapes, steps())

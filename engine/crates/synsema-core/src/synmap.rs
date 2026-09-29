@@ -1000,6 +1000,43 @@ impl MapObj {
         self.get_cached_slow(key, ic)
     }
 
+    /// El lugar de `key` para escribirlo (`set m.k`, el camino de un `set`, F4.6a), con la caché
+    /// del sitio como [`MapObj::get_cached`]: la clave tiene que ser la misma en cada ejecución.
+    #[inline(always)]
+    pub fn get_cached_mut(&mut self, key: &str, ic: &MapIc) -> Option<&mut SynValue> {
+        if let Some(l) = &self.layout {
+            if addr(l) == ic.shape.get() {
+                return self.vals.get_mut(ic.slot.get() as usize);
+            }
+        }
+        self.get_cached_mut_slow(key, ic)
+    }
+
+    /// Como [`MapObj::get_cached_mut`] para una clave que puede cambiar (`m[k]`).
+    #[inline(always)]
+    pub fn get_cached_key_mut(&mut self, key: &str, ic: &MapIc) -> Option<&mut SynValue> {
+        if let Some(l) = &self.layout {
+            if addr(l) == ic.shape.get() {
+                let i = ic.slot.get() as usize;
+                if shape_of(l).keys[i].as_str() == key {
+                    return Some(&mut self.vals[i]);
+                }
+            }
+        }
+        self.get_cached_mut_slow(key, ic)
+    }
+
+    /// Llena la caché como la lectura y da el lugar por el camino de siempre (una forma: su
+    /// posición en línea; lo demás, `get_mut`).
+    #[inline(never)]
+    fn get_cached_mut_slow(&mut self, key: &str, ic: &MapIc) -> Option<&mut SynValue> {
+        self.get_cached_slow(key, ic)?;
+        if matches!(self.layout.as_deref(), Some(Node::Shape(_))) {
+            return self.vals.get_mut(ic.slot.get() as usize);
+        }
+        self.get_mut(key)
+    }
+
     #[inline(never)]
     fn get_cached_slow(&self, key: &str, ic: &MapIc) -> Option<&SynValue> {
         let l = self.layout.as_ref()?;
