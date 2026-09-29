@@ -21,11 +21,13 @@ Takeaways:
   connection, sync handlers on a blocking pool), no GIL, single static binary. The ceiling
   (raw `axum` on the same stack) is ~2× Go, so the headroom is real.
 - **Honest caveat:** this is web/I/O-bound throughput (the realistic server workload). Raw CPU
-  compute (deep recursive `/compute`) is interpreter-speed: a bytecode VM that specializes itself
-  (v0.6.35, measured on the released binaries on one Windows laptop: recursive `fib(30)` 282 ms, a
-  10M-iteration loop 1.4 s — the loop about on par with CPython 3.12 (1.1 s), recursion ~2× behind
-  it, and two orders of magnitude behind Node/Go; no JIT). The win is where servers actually spend
-  time, plus the security + agent-native edge Go lacks.
+  compute: since v0.6.36 hot integer code runs as machine code (a Cranelift native tier on top of a
+  self-specializing bytecode VM). Measured on the released binaries on one Windows laptop: recursive
+  `fib(30)` 13 ms (CPython 3.12 142 ms, Node 8 ms, Go 4 ms); a 10M-iteration loop 30 ms with
+  `each … in range` / 56 ms with `while` (CPython 1.1 s, Node 10 ms, Go 5 ms). Floats, lists, maps and
+  text in hot loops still run in the VM (interpreter-speed) — for heavy numeric work use `array`
+  builtins. The win is where servers actually spend time, plus the security + agent-native edge Go
+  lacks.
 
 So the usual reason to pick Go over a newer language — raw web performance — **does not apply
 here.** Synsema already beats it.

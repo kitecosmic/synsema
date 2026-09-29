@@ -119,6 +119,11 @@ see [secrets.md](secrets.md). Resolution: **process environment → `.env` file 
   `run`/`test`/`conform`/`build` for a second wall where filesystem/exec/socket/db/cron builtins
   don't exist (regardless of the ceiling; `serve --profile pure` is a usage error — a server binds a
   socket). See [capabilities.md](capabilities.md).
+- **`--jitless`** (v0.6.36+, every command that runs programs; like `node --jitless`): no native
+  tier — nothing is compiled to machine code and no executable memory is mapped; everything runs in
+  the bytecode VM. Same results, errors and `steps()`, only slower on hot numeric code; it turns no
+  check off, and there is no environment variable. `serve --attested` implies it (a smaller surface
+  in what is attested). After `--` it is an argument of the program.
 - **Stopping:** `systemctl stop` / `docker stop` send SIGTERM → ordered shutdown (drain,
   exit 0). Set the unit's `TimeoutStopSec` above `SYNSEMA_SHUTDOWN_GRACE`.
 
