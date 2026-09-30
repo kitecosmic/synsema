@@ -1,0 +1,12 @@
+-- F4.7a: `/` por `-0.0` a mitad de un bucle nativo: el nativo sale antes de la instrucción y la VM
+-- da el error de siempre, con su ubicación (y `steps()` idéntico hasta ahí).
+let d be 1.0
+let s be 0.0
+each i in range(0, 300)
+    set s to s + 1.0 / d
+    when i == 250
+        print(steps())
+        set d to -0.0
+    when i < 250
+        set d to d + 0.5
+print(s)

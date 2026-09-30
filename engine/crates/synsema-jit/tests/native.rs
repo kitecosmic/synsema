@@ -119,3 +119,34 @@ fn a_hot_each_over_range_enters_native_midway() {
     let after = native_tier::stats();
     assert!(after.osr > before.osr, "el each no entró al código nativo");
 }
+
+/// F4.7a: un bucle del nivel superior con floats pasa a nativo a mitad de camino (antes el `Float`
+/// lo dejaba en la VM) y da lo mismo, `-0.0` incluido.
+#[test]
+fn a_hot_float_loop_enters_native_midway() {
+    synsema_jit::install();
+    let before = native_tier::stats();
+    let r = run_source(
+        "let s be 0.0\nlet z be 0.0\neach i in range(0, 200000)\n    set s to s + i / 4 - 0.5\n    set z to -(z * 1.0)\nprint(s)\nprint(z)\n",
+        "floats.syn",
+    );
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["4999875000.0", "0.0"]);
+    let after = native_tier::stats();
+    assert!(after.osr > before.osr, "el bucle con floats no entró al código nativo");
+}
+
+/// F4.7a: una task con parámetros `Float` entra al código nativo por `CallNative`.
+#[test]
+fn a_hot_float_task_runs_native() {
+    synsema_jit::install();
+    let before = native_tier::stats();
+    let r = run_source(
+        "task area(w, h)\n    give w * h * 0.5\nlet t be 0.0\neach i in range(0, 5000)\n    set t to t + area(i * 1.0, 2.0)\nprint(t)\n",
+        "area.syn",
+    );
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["12497500.0"]);
+    let after = native_tier::stats();
+    assert!(after.units > before.units, "la task con floats no se compiló");
+}

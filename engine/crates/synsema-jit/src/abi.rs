@@ -15,7 +15,7 @@ use std::sync::atomic::AtomicBool;
 
 use synsema_core::native_tier::{NFrame, NOutcome, NSeen, NVal, NativeCode, NativeCx, Place};
 
-use crate::lower::{Kind, Point};
+use crate::lower::{words, Kind, Point, TAG_BOOL, TAG_FLOAT, TAG_HOLE, TAG_INT};
 
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("synsema-jit sólo en 64 bits (la profundidad de la VM es un usize que el código nativo lee como i64)");
@@ -45,8 +45,8 @@ pub(crate) struct Raw {
     vals: Vec<i64>,
 }
 
-/// La llama el código generado al salir a la VM: `vals` apunta a `n` valores que guardó en su pila
-/// (los `Int`/`Bool` del punto `point` de la función `func`, en orden).
+/// La llama el código generado al salir a la VM: `vals` apunta a `n` palabras que guardó en su pila
+/// (las de los valores del punto `point` de la función `func`, en orden: ver `lower::words`).
 pub(crate) extern "C" fn synsema_jit_deopt(ctx: *mut Ctx, func: i64, point: i64, vals: *const i64, n: i64) {
     // SAFETY: `ctx` es el `Ctx` que `Compiled::call` armó en su pila y pasó a la entrada; el código
     // generado lo pasa sin cambios a sus llamados y a esta función, y la llamada nativa termina antes
@@ -73,10 +73,20 @@ pub(crate) struct Compiled {
     pub(crate) points: Vec<Vec<Point>>,
 }
 
-fn nval(k: Kind, bits: i64) -> NVal {
+/// Un valor de tipo `k` a partir de sus palabras (ver `lower::words`).
+fn nval(k: Kind, w: &[i64]) -> NVal {
     match k {
-        Kind::Int => NVal::Int(bits),
-        Kind::Bool => NVal::Bool(bits != 0),
+        Kind::Int => NVal::Int(w[0]),
+        Kind::Bool => NVal::Bool(w[0] != 0),
+        Kind::Float => NVal::Float(f64::from_bits(w[0] as u64)),
+        // F4.7: la etiqueta dice qué es (etiqueta, bits, `f64`).
+        Kind::Any(_) => match w[0] {
+            TAG_INT => NVal::Int(w[1]),
+            TAG_BOOL => NVal::Bool(w[1] != 0),
+            TAG_FLOAT => NVal::Float(f64::from_bits(w[2] as u64)),
+            TAG_HOLE => NVal::Hole,
+            _ => NVal::Nothing,
+        },
         Kind::Callee(f) => NVal::Callee(f),
         Kind::RangeFn => NVal::RangeFn,
         Kind::Undef => NVal::Hole,
@@ -111,7 +121,7 @@ impl NativeCode for Compiled {
             f(&mut ctx, args.as_ptr())
         };
         if ctx.status == 0 {
-            return NOutcome::Done(nval(self.ret, r));
+            return NOutcome::Done(nval(self.ret, &[r]));
         }
         // Del frame de más afuera al de más adentro.
         let frames = sink
@@ -119,13 +129,15 @@ impl NativeCode for Compiled {
             .rev()
             .map(|raw| {
                 let p = &self.points[raw.func as usize][raw.point as usize];
-                let mut it = raw.vals.into_iter();
+                let mut at = 0;
                 let values = p
                     .values
                     .iter()
                     .map(|&(place, k)| {
-                        let bits = if matches!(k, Kind::Int | Kind::Bool) { it.next().expect("valor guardado") } else { 0 };
-                        (place, nval(k, bits))
+                        let n = words(k);
+                        let w = &raw.vals[at..at + n];
+                        at += n;
+                        (place, if n == 0 { nval(k, &[0, 0, 0]) } else { nval(k, w) })
                     })
                     .collect();
                 NFrame { func: raw.func, pc: p.pc, values, call: p.call, planned: p.planned }

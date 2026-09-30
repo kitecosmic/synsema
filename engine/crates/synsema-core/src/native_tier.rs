@@ -25,6 +25,8 @@ pub enum NConst {
     Int(i64),
     Bool(bool),
     Nothing,
+    /// F4.7: un `Float` (sus bits, para que la constante siga siendo `Eq`).
+    Float(u64),
 }
 
 /// Un operando: como `Opnd` de la VM. `Reg` se consume (queda `nothing`), `Copy` no; `Local` es un
@@ -46,6 +48,22 @@ pub enum NArith {
     Sub,
     Mul,
     Mod,
+}
+
+/// `FloatArith` (F4.7): `+ - * /` en f64 (con al menos un `Float`, o `/` entre dos números).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NFArith {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// `Unary` (F4.7): `-x` y `not x`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NUnary {
+    Neg,
+    Not,
 }
 
 /// `IntCmp`: `< <= > >= == !=`.
@@ -74,6 +92,16 @@ pub enum NIns {
     /// La guarda de la VM (dos `Int`) la da el tipo estático; desborde y `% 0` salen a la VM.
     IntArith { dst: Reg, op: NArith, a: NOpnd, b: NOpnd },
     IntCmp { dst: Reg, op: NCmp, a: NOpnd, b: NOpnd },
+    /// F4.7: la guarda de la VM (dos números `Int`/`Float`; con `+ - *`, al menos un `Float`) la
+    /// da el tipo estático o se chequea; si no pasa, o el divisor de `/` es cero, sale a la VM.
+    FloatArith { dst: Reg, op: NFArith, a: NOpnd, b: NOpnd },
+    /// F4.7: comparación entre `Int` y `Float` en cualquier mezcla, EXACTA (`partial_cmp_num`).
+    NumCmp { dst: Reg, op: NCmp, a: NOpnd, b: NOpnd },
+    /// F4.7: `Unary` (consume su operando como la VM). `-` de un `Int` que desborda, o de algo que
+    /// no es un número, sale a la VM.
+    Unary { dst: Reg, op: NUnary, a: NOpnd },
+    /// F4.7: `ToBool` (si es verdadero, como `is_truthy`).
+    ToBool { dst: Reg, src: NOpnd },
     /// Compara y salta (`IntCmpJump` + el `JumpIfFalsy` que le sigue, cuyo destino es `to`): si da
     /// verdadero sigue en `pc + 2`.
     IntCmpJump { op: NCmp, a: NOpnd, b: NOpnd, to: u32 },
@@ -126,6 +154,8 @@ pub enum NIns {
 pub enum NSeen {
     Int,
     Bool,
+    /// F4.7.
+    Float,
     Nothing,
     /// Un lugar de la ventana o una global sin valor.
     Hole,
@@ -154,6 +184,10 @@ pub struct NFunc {
     /// Cuántos iteradores de `each` usa (cada uno, cuatro variables: `valid`, `next`, `hi`, `step`).
     pub niters: u16,
     pub osr: Option<NOsr>,
+    /// F4.7: lo que tienen los parámetros al entrar desde la VM (`Int`, `Float` o `Bool`), en la
+    /// función 0 de una task. Vacío en las demás (sus tipos salen de las llamadas de la unidad) y
+    /// en un bucle.
+    pub params: Vec<NSeen>,
 }
 
 /// Lo que se compila junto: la task caliente (`funcs[0]`) y las que llama.
@@ -163,11 +197,13 @@ pub struct NUnit {
 }
 
 /// Un valor de un frame nativo.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum NVal {
     Int(i64),
     Bool(bool),
     Nothing,
+    /// F4.7.
+    Float(f64),
     /// La task de la función `func` de la unidad.
     Callee(u32),
     /// Un lugar vacío (un `let` de la vuelta que ya se soltó, un iterador terminado).
@@ -227,7 +263,8 @@ pub struct NativeCx<'a> {
 
 /// Una unidad ya compilada (de este hilo).
 pub trait NativeCode {
-    /// Corre `funcs[0]` con estos argumentos (enteros: la entrada lo verifica). En un bucle (F4.2),
+    /// Corre `funcs[0]` con estos argumentos (los bits de cada uno: un `Float` con `to_bits`; la
+    /// entrada verifica que tengan lo que pide `params`). En un bucle (F4.2),
     /// los valores de `inputs` en orden.
     fn call(&self, cx: &mut NativeCx<'_>, args: &[i64]) -> NOutcome;
     /// En un bucle: los lugares que el código nativo lee o escribe, con lo que tienen que tener al

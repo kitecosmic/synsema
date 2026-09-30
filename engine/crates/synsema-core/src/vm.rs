@@ -4029,7 +4029,7 @@ impl Interpreter {
                         // F4.1: una task caliente pasa al nivel nativo (esta llamada, en la VM).
                         #[cfg(feature = "native-tier")]
                         if t.code.native.tick() {
-                            self.vm_native_tier_up(chunk, at, t);
+                            self.vm_native_tier_up(chunk, at, t, first, n);
                         }
                         return self.vm_enter_regframe(t, code, first, n).map(Some);
                     }

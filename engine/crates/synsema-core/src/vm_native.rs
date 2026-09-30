@@ -7,6 +7,8 @@
 //! numérico (`Int`/`Bool`): pasos, cancelación, aritmética y comparaciones enteras, saltos, locales,
 //! `give` y llamadas posicionales a tasks de la misma unidad (la recursión incluida). Cualquier otra
 //! instrucción deja la unidad en la VM.
+//! F4.7a suma los floats (`FloatArith`, `NumCmp` exacto, `Unary`, `ToBool`, tasks con parámetros
+//! `Float`) y los lugares que según el camino tienen un tipo u otro (con guardas en el código nativo).
 //!
 //! **Entrada:** una llamada de la VM a una task caliente reescribe su `Call` en `CallNative`; ahí
 //! se verifica que los argumentos sean enteros y que las globales que la unidad lee sigan siendo las
@@ -18,7 +20,7 @@
 //! Rust. Desde ahí todo es la VM.
 
 use super::*;
-use crate::native_tier::{self, NArith, NCmp, NConst, NFrame, NFunc, NIns, NOpnd, NOsr, NOutcome, NSeen, NUnit, NVal, NativeCode, NativeCx, Place};
+use crate::native_tier::{self, NArith, NCmp, NConst, NFArith, NFrame, NFunc, NIns, NOpnd, NOsr, NOutcome, NSeen, NUnary, NUnit, NVal, NativeCode, NativeCx, Place};
 use std::rc::Weak;
 
 /// Cuántas llamadas a otras tasks puede sumar una unidad.
@@ -78,6 +80,8 @@ pub(crate) struct NativeUnit {
     deopts: Cell<u32>,
     /// El builtin `range`, si el código lo tiene en un registro (para devolvérselo a la VM).
     range_fn: Option<SynValue>,
+    /// Lo que tienen que tener los argumentos al entrar (F4.7: `Int`, `Float` o `Bool`).
+    params: Vec<NSeen>,
 }
 
 /// La global `name`, leída desde el `closure_env` de la función `from` (o, si es `None`, desde el
@@ -201,14 +205,15 @@ impl Build {
             }
             let nparams = u16::try_from(x.parameters.len()).ok()?;
             let niters = chunk_iters(&chunk);
-            self.funcs.push(NFunc { code, nregs: chunk.nregs, nlocals: chunk.nlocals, nparams, nglobals: 0, niters, osr: None });
+            self.funcs.push(NFunc { code, nregs: chunk.nregs, nlocals: chunk.nlocals, nparams, nglobals: 0, niters, osr: None, params: Vec::new() });
             i += 1;
         }
         Some(())
     }
 
-    fn unit(self, code: Box<dyn NativeCode>, nregs0: u16) -> NativeUnit {
+    fn unit(self, code: Box<dyn NativeCode>, nregs0: u16, params: Vec<NSeen>) -> NativeUnit {
         NativeUnit {
+            params,
             code,
             tasks: self.tasks.iter().map(|t| t.as_ref().map(Rc::downgrade)).collect(),
             nregs0,
@@ -219,10 +224,12 @@ impl Build {
     }
 }
 
-/// La task y las que llama (por `LoadGlobal`), si todo su código es lo que F4.1 compila.
-fn build_unit(t: &Rc<SynTaskValue>) -> Option<Build> {
+/// La task y las que llama (por `LoadGlobal`), si todo su código es lo que el nivel nativo
+/// compila. `params`: lo que tienen los argumentos de esta llamada (la entrada lo va a exigir).
+fn build_unit(t: &Rc<SynTaskValue>, params: Vec<NSeen>) -> Option<Build> {
     let mut b = Build { tasks: vec![Some(t.clone())], ..Default::default() };
     b.close(0)?;
+    b.funcs[0].params = params;
     Some(b)
 }
 
@@ -231,6 +238,17 @@ fn nconst(v: &SynValue) -> Option<NConst> {
         SynValue::Number(Number::Int(x)) => NConst::Int(*x),
         SynValue::Bool(b) => NConst::Bool(*b),
         SynValue::Nothing => NConst::Nothing,
+        SynValue::Number(Number::Float(x)) => NConst::Float(x.to_bits()),
+        _ => return None,
+    })
+}
+
+fn nfarith(op: BinOp) -> Option<NFArith> {
+    Some(match op {
+        BinOp::Add => NFArith::Add,
+        BinOp::Sub => NFArith::Sub,
+        BinOp::Mul => NFArith::Mul,
+        BinOp::Div => NFArith::Div,
         _ => return None,
     })
 }
@@ -282,6 +300,17 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
         Ins::Binary { dst, a, b: y, .. } => NIns::Trap { dst, a: nopnd(c, a)?, b: nopnd(c, y)? },
         Ins::IntArith { dst, op, a, b: y, .. } => NIns::IntArith { dst, op: narith(op)?, a: nopnd(c, a)?, b: nopnd(c, y)? },
         Ins::IntCmp { dst, op, a, b: y, .. } => NIns::IntCmp { dst, op: ncmp(op)?, a: nopnd(c, a)?, b: nopnd(c, y)? },
+        Ins::FloatArith { dst, op, a, b: y, .. } => NIns::FloatArith { dst, op: nfarith(op)?, a: nopnd(c, a)?, b: nopnd(c, y)? },
+        Ins::NumCmp { dst, op, a, b: y, .. } => NIns::NumCmp { dst, op: ncmp(op)?, a: nopnd(c, a)?, b: nopnd(c, y)? },
+        Ins::Unary { dst, op, a } => NIns::Unary {
+            dst,
+            op: match op {
+                UnOp::Neg => NUnary::Neg,
+                UnOp::Not => NUnary::Not,
+            },
+            a: nopnd(c, a)?,
+        },
+        Ins::ToBool { dst, src } => NIns::ToBool { dst, src: nopnd(c, src)? },
         Ins::IntCmpJump { op, a, b: y, .. } => {
             let Some(Ins::JumpIfFalsy { to, .. }) = c.code.get(pc + 1).map(Cell::get) else { return None };
             NIns::IntCmpJump { op: ncmp(op)?, a: nopnd(c, a)?, b: nopnd(c, y)?, to }
@@ -370,6 +399,7 @@ fn seen(v: Option<&SynValue>) -> NSeen {
         Some(SynValue::Number(Number::Int(_))) => NSeen::Int,
         Some(SynValue::Bool(_)) => NSeen::Bool,
         Some(SynValue::Nothing) => NSeen::Nothing,
+        Some(SynValue::Number(Number::Float(_))) => NSeen::Float,
         Some(_) => NSeen::Boxed,
     }
 }
@@ -497,7 +527,7 @@ impl Interpreter {
     /// al pasar el umbral se compila (una vez) y el sitio de esta llamada pasa a ser `CallNative`.
     /// Esta vez sigue en la VM.
     #[inline(never)]
-    pub(super) fn vm_native_tier_up(&mut self, chunk: &Chunk, at: usize, t: &Rc<SynTaskValue>) {
+    pub(super) fn vm_native_tier_up(&mut self, chunk: &Chunk, at: usize, t: &Rc<SynTaskValue>, first: usize, n: usize) {
         let st = &t.code.native;
         if st.never.get() {
             st.left.set(u32::MAX);
@@ -510,11 +540,18 @@ impl Interpreter {
             return;
         }
         if st.unit.get().is_none() {
+            // Se compila con lo que tienen los argumentos de esta llamada (F4.7: `Int`, `Float` o
+            // `Bool`); con otra cosa, todavía no (se vuelve a mirar dentro de otro umbral).
+            let params: Vec<NSeen> = self.vm_regs[first..first + n].iter().map(|v| seen(Some(v))).collect();
+            if params.iter().any(|p| !matches!(p, NSeen::Int | NSeen::Float | NSeen::Bool)) {
+                st.left.set(native_tier::threshold().max(2));
+                return;
+            }
             let compiled = native_tier::tier().and_then(|tier| {
-                let b = build_unit(t)?;
+                let b = build_unit(t, params.clone())?;
                 let code = tier.compile(&NUnit { funcs: b.funcs.clone() })?;
                 let nregs0 = b.funcs[0].nregs;
-                Some(b.unit(code, nregs0))
+                Some(b.unit(code, nregs0, params))
             });
             match compiled {
                 Some(u) => {
@@ -537,6 +574,7 @@ impl Interpreter {
             NVal::Int(x) => SynValue::Number(Number::Int(x)),
             NVal::Bool(b) => syn_bool(b),
             NVal::Nothing => SynValue::Nothing,
+            NVal::Float(x) => SynValue::Number(Number::Float(x)),
             NVal::Callee(f) => SynValue::Task(unit.task(f as usize).expect("task de la unidad viva")),
             NVal::RangeFn => unit.range_fn.clone().expect("el builtin range de la unidad"),
             NVal::Hole => SynValue::Nothing,
@@ -563,7 +601,8 @@ impl Interpreter {
         let fits = match &self.vm_regs[base + func as usize] {
             SynValue::Task(t) => t.code.native.unit().is_some_and(|u| {
                 nn == t.parameters.len()
-                    && self.vm_regs[first..first + nn].iter().all(|v| matches!(v, SynValue::Number(Number::Int(_))))
+                    && nn == u.params.len()
+                    && self.vm_regs[first..first + nn].iter().zip(&u.params).all(|(v, p)| seen(Some(v)) == *p)
                     && u.deps_hold(None)
             }),
             _ => false,
@@ -586,7 +625,9 @@ impl Interpreter {
             .iter()
             .map(|v| match v {
                 SynValue::Number(Number::Int(x)) => *x,
-                _ => unreachable!("argumento no entero"),
+                SynValue::Number(Number::Float(x)) => x.to_bits() as i64,
+                SynValue::Bool(b) => i64::from(*b),
+                _ => unreachable!("argumento que no es escalar"),
             })
             .collect();
         native_tier::count_entry();
@@ -793,6 +834,7 @@ impl Interpreter {
             nglobals,
             niters,
             osr: Some(NOsr { head: head as u32, init }),
+            params: Vec::new(),
         });
         b.close(1)?;
         // El código de las tasks que llama no puede ser este chunk (el bucle vive en él: un ciclo).
@@ -800,7 +842,7 @@ impl Interpreter {
             return None;
         }
         let code = tier.compile(&NUnit { funcs: std::mem::take(&mut b.funcs) })?;
-        Some(LoopUnit { unit: b.unit(code, chunk.nregs), globals, writes })
+        Some(LoopUnit { unit: b.unit(code, chunk.nregs, Vec::new()), globals, writes })
     }
 
     /// La guarda de entrada a un bucle nativo: cada lugar que el código lee o escribe tiene lo que
@@ -842,6 +884,7 @@ impl Interpreter {
             args.push(match v {
                 Some(SynValue::Number(Number::Int(x))) => *x,
                 Some(SynValue::Bool(b)) => i64::from(*b),
+                Some(SynValue::Number(Number::Float(x))) => x.to_bits() as i64,
                 _ => 0,
             });
         }

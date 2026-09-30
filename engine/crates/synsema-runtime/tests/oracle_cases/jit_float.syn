@@ -1,0 +1,130 @@
+-- F4.7a: floats en el nivel nativo. `FloatArith` (con `/` que siempre da float), `NumCmp` EXACTO
+-- entre enteros y floats (`2**53 + 1` no es `9007199254740992.0`), `-0.0`, NaN, infinitos, `-` y
+-- `not`, tasks con parámetros `Float`, y tipos que cambian a mitad de un bucle nativo.
+
+let inf be 1.0e308 * 10.0
+let nan be inf - inf
+let big be 9223372036854775807
+let min be 0 - big - 1
+
+-- Tasks con parámetros `Float` (el sitio de la llamada, en un bucle, pasa a `CallNative`); una fila
+-- con un entero sale por la guarda de la entrada y va por la VM.
+task mix(a, b)
+    let s be a * 0.5 + b
+    let k be 0
+    while k < 4
+        set s to s * 1.5 - a / (b * b + 0.25)
+        set k to k + 1
+    give s
+let out be []
+each p in [[1.0, 2.0], [3.5, -0.5], [0.1, 0.2], [2, 3.0], [-0.0, 1.0], [inf, 1.0], [nan, 2.0], [4.0, 4], [1.0e300, 1.0e-300]]
+    let r be mix(p[0], p[1])
+    set out to append(out, r)
+print(out)
+
+-- La comparación exacta en los bordes, de las dos formas (Int×Float y Float×Int). Cada task da un
+-- código entero (una lista no se arma en nativo) y las primeras filas calientan el sitio: las de
+-- borde ya corren en nativo.
+task cmpi(i, f)
+    let c be 0
+    when i < f
+        set c to c + 1
+    when i <= f
+        set c to c + 2
+    when i > f
+        set c to c + 4
+    when i >= f
+        set c to c + 8
+    when i == f
+        set c to c + 16
+    when i != f
+        set c to c + 32
+    give c
+task cmpf(f, i)
+    let c be 0
+    when f < i
+        set c to c + 1
+    when f <= i
+        set c to c + 2
+    when f > i
+        set c to c + 4
+    when f >= i
+        set c to c + 8
+    when f == i
+        set c to c + 16
+    when f != i
+        set c to c + 32
+    give c
+let rows be [[1, 1.5], [2, 1.5], [3, 3.0], [1, 0.5], [9007199254740993, 9007199254740992.0], [9007199254740992, 9007199254740992.0], [big, 9223372036854775807.0], [min, -9223372036854775807.0], [-3, -2.5], [-2, -2.5], [0, -0.0], [5, nan], [big, inf], [min, 0.0 - inf], [3, 3.0], [-9007199254740993, -9007199254740992.0], [9007199254740991, 9007199254740992.0], [big - 1023, 9223372036854774784.0]]
+let cmps be []
+each r in rows
+    let c be cmpi(r[0], r[1])
+    set cmps to append(cmps, c)
+print(cmps)
+let cmps2 be []
+each r in rows
+    let c be cmpf(r[1], r[0])
+    set cmps2 to append(cmps2, c)
+print(cmps2)
+
+-- Un bucle del nivel superior (OSR) con floats: `-0.0` y NaN en la veracidad y en `==`, `-` de un
+-- float, `not`, y `/` entre enteros (da float).
+let acc be 0.0
+let zs be 0
+let nans be 0
+let q be 0.0
+each i in range(0, 200)
+    set q to (i - 100) / 7
+    set acc to acc + q * 0.5 - (-q)
+    when not (q * 0.0)
+        set zs to zs + 1
+    when q * 0.0 == -0.0
+        set zs to zs + 1
+    when (nan + q) != (nan + q)
+        set nans to nans + 1
+    when q
+        set acc to acc - 0.25
+print([acc, zs, nans, q])
+
+-- `-` de un entero en el borde: `-min` es un `Big` (lo da la VM), el nativo sale antes.
+let negs be []
+each x in [5, -7, big, min, 0, 3]
+    let n be -x
+    set negs to append(negs, n)
+print(negs)
+
+-- Tipos que cambian a mitad de un bucle nativo: Int → Float → Int, un sumando que la VM especializó
+-- con un float y después recibe dos enteros (la guarda de `FloatArith` sale), y `nothing`.
+let g be 0.5
+let hits be 0
+let t be 1
+each i in range(0, 120)
+    when g + 9007199254740993 == 9007199254740995
+        set hits to hits + 1
+    when i % 2 == 0 and i > 10
+        set g to 2
+    when i % 2 == 1
+        set g to 0.5
+    when i == 60
+        set t to 2.5
+    when i == 90
+        set t to 7
+    set t to t * 1
+print([g, hits, t])
+
+-- Un `let` dentro de un `when` que se lee después: el lugar, según el camino, está vacío (antes
+-- dejaba el bucle en la VM). Acá siempre está ligado cuando se lee.
+task holes(n)
+    let s be 0.0
+    each i in range(0, n)
+        when i % 3 != 5
+            let t be i * 0.5
+        set s to s + t
+    give s
+let hs be []
+each n in [3, 10, 50, 7, 100]
+    let h be holes(n)
+    set hs to append(hs, h)
+print(hs)
+
+print(steps())

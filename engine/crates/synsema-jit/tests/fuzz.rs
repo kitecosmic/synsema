@@ -209,19 +209,238 @@ impl Gen {
     }
 }
 
+/// F4.7: constantes con floats: bordes de la comparación exacta (2^53 ± 1, 2^63, fracciones
+/// negativas), `-0.0`, infinitos y NaN, y enteros que se mezclan con ellos.
+const FCONSTS: &[&str] = &[
+    "0.0", "-0.0", "0.5", "1.5", "-2.5", "3.0", "0.1", "1.0e308", "(1.0e308 * 10.0)", "(-(1.0e308 * 10.0))",
+    "(1.0e308 * 10.0 - 1.0e308 * 10.0)", "9007199254740992.0", "9007199254740993", "9007199254740992",
+    "9223372036854775807.0", "(-9223372036854775807.0)", "9223372036854775807", "4611686018427387904.0", "2", "7", "0",
+    "(0 - 3)", "(0 - 9223372036854775807 - 1)",
+];
+
+struct FGen {
+    rng: Rng,
+}
+
+impl FGen {
+    fn atom(&mut self, vars: &[String]) -> String {
+        if !vars.is_empty() && self.rng.chance(60) {
+            vars[self.rng.below(vars.len())].clone()
+        } else {
+            FCONSTS[self.rng.below(FCONSTS.len())].to_string()
+        }
+    }
+
+    fn expr(&mut self, vars: &[String], depth: usize) -> String {
+        if depth == 0 || self.rng.chance(30) {
+            return self.atom(vars);
+        }
+        let a = self.expr(vars, depth - 1);
+        let b = self.expr(vars, depth - 1);
+        match self.rng.below(7) {
+            0 => format!("({} + {})", a, b),
+            1 => format!("({} - {})", a, b),
+            2 => format!("({} * {})", a, b),
+            // A veces un divisor cero (también `-0.0`): el error de la VM, con su ubicación.
+            3 if self.rng.chance(15) => format!("({} / {})", a, b),
+            3 | 4 => format!("({} / ({} * {} + 0.5))", a, b, b),
+            // `-(…)`: `--` es un comentario.
+            5 => format!("(-({}))", a),
+            _ => format!("({} * 0.5)", a),
+        }
+    }
+
+    fn cond(&mut self, vars: &[String]) -> String {
+        let ops = ["<", "<=", ">", ">=", "==", "!="];
+        let a = self.expr(vars, 1);
+        let b = self.expr(vars, 1);
+        let c = format!("{} {} {}", a, ops[self.rng.below(ops.len())], b);
+        match self.rng.below(10) {
+            0 => format!("not ({})", c),
+            // Un entero y un float en el borde de la comparación exacta (uno de los dos, a veces,
+            // una variable que puede tenerlo).
+            8 | 9 => {
+                let ib = ["9007199254740993", "9007199254740992", "9223372036854775807", "(0 - 9223372036854775807 - 1)", "(0 - 3)", "2"];
+                let fb = ["9007199254740992.0", "9223372036854775807.0", "(-9223372036854775807.0)", "-2.5", "2.0", "(1.0e308 * 10.0)", "(1.0e308 * 10.0 - 1.0e308 * 10.0)"];
+                let i = if !vars.is_empty() && self.rng.chance(30) { vars[self.rng.below(vars.len())].clone() } else { ib[self.rng.below(ib.len())].to_string() };
+                let f = fb[self.rng.below(fb.len())];
+                let op = ops[self.rng.below(ops.len())];
+                if self.rng.chance(50) { format!("{} {} {}", i, op, f) } else { format!("{} {} {}", f, op, i) }
+            }
+            // La veracidad de un número (`-0.0` y `0.0` son falsos, NaN verdadero).
+            6 => self.expr(vars, 1),
+            7 => format!("not ({})", self.expr(vars, 1)),
+            1 => {
+                let d = self.expr(vars, 0);
+                format!("({}) and {} != 0", c, d)
+            }
+            _ => c,
+        }
+    }
+
+    /// Lo que se asigna en un bucle: acotado para que los enteros no crezcan sin fin (un `Big` de
+    /// millones de dígitos); a veces un entero, un decimal o `nothing` (el tipo cambia a mitad).
+    fn value(&mut self, vars: &[String]) -> String {
+        match self.rng.below(100) {
+            0..=9 => "7".to_string(),
+            10..=14 => "(0 - 3)".to_string(),
+            5 => "1.5d".to_string(),
+            _ => {
+                let e = self.expr(vars, 2);
+                format!("({}) * 0.5 + {}", e, FCONSTS[self.rng.below(7)])
+            }
+        }
+    }
+
+    fn task(&mut self, name: &str, nparams: usize, callee: Option<(&str, usize)>) -> String {
+        let params: Vec<String> = (0..nparams).map(|i| format!("p{}", i)).collect();
+        let mut vars = params.clone();
+        let mut s = format!("task {}({})\n", name, params.join(", "));
+        for l in ["x", "y"] {
+            let e = self.value(&vars);
+            s += &format!("    let {} be {}\n", l, e);
+            vars.push(l.to_string());
+        }
+        if self.rng.chance(40) {
+            let c = self.cond(&vars);
+            let e = self.expr(&vars, 2);
+            s += &format!("    when {}\n        give {}\n", c, e);
+        }
+        if self.rng.chance(70) {
+            let bound = self.rng.below(7);
+            let each = self.rng.chance(50);
+            if each {
+                s += &format!("    each k in range({})\n", bound);
+            } else {
+                s += &format!("    let k be 0\n    while k < {}\n", bound);
+            }
+            let e = self.value(&vars);
+            s += &format!("        set x to {}\n", e);
+            if self.rng.chance(50) {
+                let c = self.cond(&vars);
+                let e = self.value(&vars);
+                s += &format!("        when {}\n            set y to {}\n", c, e);
+            }
+            if !each {
+                s += "        set k to k + 1\n";
+            }
+        }
+        if let Some((f, n)) = callee {
+            let args: Vec<String> = (0..n).map(|_| self.expr(&vars, 1)).collect();
+            s += &format!("    let z be {}({})\n", f, args.join(", "));
+            vars.push("z".to_string());
+        }
+        if self.rng.chance(8) {
+            let c = self.cond(&vars);
+            s += &format!("    give {}\n", c);
+        } else {
+            let e = self.expr(&vars, 2);
+            s += &format!("    give {}\n", e);
+        }
+        s
+    }
+
+    /// Un bucle del nivel superior sobre globales con floats: tipos que cambian (un entero, un
+    /// decimal, `nothing`), `stop`, llamadas a una task.
+    fn top_loop(&mut self, call: (&str, usize)) -> String {
+        let vars: Vec<String> = ["g0", "g1", "lc"].iter().map(|v| v.to_string()).collect();
+        let bound = 2 + self.rng.below(40);
+        let a0 = self.atom(&[]);
+        let a1 = self.atom(&[]);
+        let mut s = format!("let g0 be {}\nlet g1 be {}\nlet lc be 0\nlet g2 be 0.5\nlet cnt be 0\n", a0, a1);
+        if self.rng.chance(50) {
+            s += &format!("each ev in range(0, {})\n    set lc to lc + 1\n", bound);
+        } else {
+            s += &format!("while lc < {}\n    set lc to lc + 1\n", bound);
+        }
+        // Un `+` que la VM especializó con un `Float` y después recibe dos enteros: la guarda de
+        // `FloatArith` tiene que salir (con enteros, `2**53 + 1 + 2` es exacto; en f64, no).
+        if self.rng.chance(50) {
+            s += "    when g2 + 9007199254740993 == 9007199254740995\n        set cnt to cnt + 1\n";
+            s += "    when lc % 2 == 0 and lc > 4\n        set g2 to 2\n    when lc % 2 == 1\n        set g2 to 0.5\n";
+        }
+        let e = self.value(&vars);
+        s += &format!("    set g0 to {}\n", e);
+        if self.rng.chance(50) {
+            let c = self.cond(&vars);
+            let e = self.value(&vars);
+            s += &format!("    when {}\n        set g1 to {}\n", c, e);
+        }
+        if self.rng.chance(40) {
+            let args: Vec<String> = (0..call.1).map(|_| self.expr(&vars, 1)).collect();
+            s += &format!("    set g1 to g1 + {}({})\n", call.0, args.join(", "));
+        }
+        if self.rng.chance(25) {
+            let c = self.cond(&vars);
+            s += &format!("    when {}\n        stop\n", c);
+        }
+        s += "print([g0, g1, lc, g2, cnt])\n";
+        s
+    }
+
+    fn program(&mut self) -> String {
+        let mut s = String::new();
+        let n0 = 1 + self.rng.below(3);
+        s += &self.task("f0", n0, None);
+        let n1 = 1 + self.rng.below(3);
+        s += &self.task("f1", n1, Some(("f0", n0)));
+        // Un `let` en un `when` que se lee después: un lugar de la ventana que según el camino
+        // está vacío (vacío, la VM lo busca por nombre y da su error).
+        let q = ["q".to_string()];
+        let c = if self.rng.chance(20) { self.cond(&q) } else { "i != 5".to_string() };
+        let e = self.expr(&q, 1);
+        s += &format!(
+            "task h(q)\n    let acc be 0.0\n    each i in range(3)\n        when {}\n            let t be {}\n        when i == 1\n            set acc to acc + t\n    give acc\n",
+            c, e
+        );
+        // Cada columna casi siempre del mismo tipo (así la task entra por `CallNative` con
+        // parámetros `Float`); a veces una fila distinta (la guarda de la entrada).
+        let floats = ["0.5", "1.5", "-2.5", "3.0", "0.1", "-0.0", "9007199254740992.0", "(1.0e308 * 10.0)"];
+        let ints = ["2", "7", "0", "(0 - 3)", "9007199254740993"];
+        let kinds: Vec<bool> = (0..3).map(|_| self.rng.chance(75)).collect();
+        let rows: Vec<String> = (0..8)
+            .map(|_| {
+                let vals: Vec<String> = (0..3)
+                    .map(|c| {
+                        let fl = if self.rng.chance(10) { !kinds[c] } else { kinds[c] };
+                        if fl { floats[self.rng.below(floats.len())] } else { ints[self.rng.below(ints.len())] }.to_string()
+                    })
+                    .collect();
+                format!("[{}]", vals.join(", "))
+            })
+            .collect();
+        s += &format!("let out be []\neach p in [{}]\n", rows.join(", "));
+        let a0: Vec<String> = (0..n0).map(|i| format!("p[{}]", i % 3)).collect();
+        let a1: Vec<String> = (0..n1).map(|i| format!("p[{}]", (i + 1) % 3)).collect();
+        s += &format!("    let u be f0({})\n", a0.join(", "));
+        s += &format!("    let v be f1({})\n", a1.join(", "));
+        s += "    let w be h(p[2])\n";
+        s += "    set out to append(out, [u, v, w])\n";
+        s += "print(out)\n";
+        s += &self.top_loop(("f0", n0));
+        s += "print(steps())\n";
+        s
+    }
+}
+
 /// El modo referencia es global al proceso: un solo `check` a la vez.
 static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn check(seed: u64, count: usize) {
+    let mut g = Gen { rng: Rng(seed) };
+    check_with(seed, count, move || g.program());
+}
+
+fn check_with(seed: u64, count: usize, mut program: impl FnMut() -> String) {
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     synsema_jit::install();
     native_tier::set_eager(true);
     let before = native_tier::stats();
-    let mut g = Gen { rng: Rng(seed) };
     let mut failures = Vec::new();
     let mut errors = 0;
     for i in 0..count {
-        let src = g.program();
+        let src = program();
+        if let Ok(d) = std::env::var("FUZZ_DUMP_TMP") { if i < 12 { std::fs::write(format!("{}/p{}.syn", d, i), &src).unwrap(); } }
         set_reference_mode(true);
         let reference = run_source(&src, "fuzz.syn");
         set_reference_mode(false);
@@ -261,4 +480,20 @@ fn native_matches_the_reference_on_generated_programs() {
 #[ignore]
 fn native_matches_the_reference_on_many_generated_programs() {
     check(0xf4_1_0000_0001, 3000);
+}
+
+/// F4.7: programas con floats (`FloatArith`, `NumCmp` exacto, `-0.0`, NaN, infinitos, `/` por
+/// cero, decimal⊕float a mitad de un bucle, tipos que cambian, lugares que según el camino están
+/// vacíos, tasks con parámetros `Float`).
+#[test]
+fn native_matches_the_reference_on_float_programs() {
+    let mut g = FGen { rng: Rng(0x5eed_f4_07) };
+    check_with(0x5eed_f4_07, 150, move || g.program());
+}
+
+#[test]
+#[ignore]
+fn native_matches_the_reference_on_many_float_programs() {
+    let mut g = FGen { rng: Rng(0xf4_7_0000_0001) };
+    check_with(0xf4_7_0000_0001, 3000, move || g.program());
 }
