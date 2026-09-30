@@ -25,6 +25,7 @@ const ALLOWED: &[&str] = &[
     "packages/guests/vela/src/lib.rs",
     // Tests: un allocator que cuenta, y un handle de prueba.
     "engine/crates/synsema-core/tests/alloc_counts.rs",
+    "engine/crates/synsema-jit/tests/alloc_native.rs",
     "engine/crates/synsema-stdlib/tests/agentic_hub.rs",
 ];
 

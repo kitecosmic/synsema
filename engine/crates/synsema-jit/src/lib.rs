@@ -31,6 +31,8 @@ const MAX_CODE_BYTES: usize = 64 << 20;
 struct Jit {
     module: JITModule,
     deopt: FuncId,
+    /// F4.7b: las lecturas de valores con caja (`index`, `prop`, `list_body`, `list_elem`, `truthy`).
+    reads: [FuncId; 5],
     bytes: usize,
 }
 
@@ -52,13 +54,33 @@ fn new_jit() -> Option<Jit> {
     let isa = cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()?;
     let mut jb = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
     jb.symbol("synsema_jit_deopt", abi::synsema_jit_deopt as *const u8);
+    jb.symbol("synsema_jit_index", abi::synsema_jit_index as *const u8);
+    jb.symbol("synsema_jit_prop", abi::synsema_jit_prop as *const u8);
+    jb.symbol("synsema_jit_list_body", abi::synsema_jit_list_body as *const u8);
+    jb.symbol("synsema_jit_list_elem", abi::synsema_jit_list_elem as *const u8);
+    jb.symbol("synsema_jit_truthy", abi::synsema_jit_truthy as *const u8);
     let mut module = JITModule::new(jb);
-    let mut sig = module.make_signature();
-    for _ in 0..5 {
-        sig.params.push(AbiParam::new(I64));
-    }
-    let deopt = module.declare_function("synsema_jit_deopt", Linkage::Import, &sig).ok()?;
-    Some(Jit { module, deopt, bytes: 0 })
+    // Todo es una palabra (`i64`): el contexto, los punteros, los valores.
+    let sig_of = |n: usize, ret: bool| {
+        let mut sig = module.make_signature();
+        for _ in 0..n {
+            sig.params.push(AbiParam::new(I64));
+        }
+        if ret {
+            sig.returns.push(AbiParam::new(I64));
+        }
+        sig
+    };
+    let (s_deopt, s_index, s_prop, s_1, s_2) = (sig_of(7, false), sig_of(6, true), sig_of(3, true), sig_of(2, true), sig_of(3, true));
+    let deopt = module.declare_function("synsema_jit_deopt", Linkage::Import, &s_deopt).ok()?;
+    let reads = [
+        module.declare_function("synsema_jit_index", Linkage::Import, &s_index).ok()?,
+        module.declare_function("synsema_jit_prop", Linkage::Import, &s_prop).ok()?,
+        module.declare_function("synsema_jit_list_body", Linkage::Import, &s_1).ok()?,
+        module.declare_function("synsema_jit_list_elem", Linkage::Import, &s_2).ok()?,
+        module.declare_function("synsema_jit_truthy", Linkage::Import, &s_1).ok()?,
+    ];
+    Some(Jit { module, deopt, reads, bytes: 0 })
 }
 
 fn compile_in(jit: &mut Jit, unit: &NUnit) -> Option<abi::Compiled> {
@@ -91,9 +113,13 @@ fn compile_in(jit: &mut Jit, unit: &NUnit) -> Option<abi::Compiled> {
         ctx.clear();
         ctx.func.signature = sigs[i].clone();
         let callees: Vec<_> = ids.iter().map(|id| m.declare_func_in_func(*id, &mut ctx.func)).collect();
-        let deopt = m.declare_func_in_func(jit.deopt, &mut ctx.func);
-        lower::build(unit, i, &mut plans, &mut ctx.func, &mut fbctx, &callees, deopt, m.target_config())?;
-        if !lower::check_memory(&ctx.func, false) {
+        let reads = lower::has_boxed(unit, i, &plans[i]).then(|| {
+            let r = jit.reads.map(|id| m.declare_func_in_func(id, &mut ctx.func));
+            lower::Reads { index: r[0], prop: r[1], list_body: r[2], list_elem: r[3], truthy: r[4] }
+        });
+        let h = lower::Helpers { deopt: m.declare_func_in_func(jit.deopt, &mut ctx.func), reads };
+        lower::build(unit, i, &mut plans, &mut ctx.func, &mut fbctx, &callees, h, m.target_config())?;
+        if !lower::check_memory(&ctx.func, false) || !lower::check_pointers(&ctx.func, &h, &plans[i].ptr_params, &plans[i].ptr_slots) {
             return None;
         }
         m.define_function(ids[i], &mut ctx).ok()?;
@@ -117,6 +143,7 @@ fn compile_in(jit: &mut Jit, unit: &NUnit) -> Option<abi::Compiled> {
         ret: plans[0].ret,
         inputs,
         points: plans.into_iter().map(|p| p.points).collect(),
+        sites: unit.sites.iter().map(native_tier::SiteIc::new).collect(),
     })
 }
 

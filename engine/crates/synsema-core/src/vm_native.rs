@@ -9,6 +9,9 @@
 //! instrucción deja la unidad en la VM.
 //! F4.7a suma los floats (`FloatArith`, `NumCmp` exacto, `Unary`, `ToBool`, tasks con parámetros
 //! `Float`) y los lugares que según el camino tienen un tipo u otro (con guardas en el código nativo).
+//! F4.7b suma las lecturas de datos: los valores con caja entran prestados (la dirección de donde
+//! viven en la VM, sin tocar sus cuentas; al salir se clonan los que quedan vivos), `GetIndex`/`GetProp`
+//! con la caché por forma de su sitio, `each` sobre listas y globales con caja en los bucles.
 //!
 //! **Entrada:** una llamada de la VM a una task caliente reescribe su `Call` en `CallNative`; ahí
 //! se verifica que los argumentos sean enteros y que las globales que la unidad lee sigan siendo las
@@ -20,7 +23,7 @@
 //! Rust. Desde ahí todo es la VM.
 
 use super::*;
-use crate::native_tier::{self, NArith, NCmp, NConst, NFArith, NFrame, NFunc, NIns, NOpnd, NOsr, NOutcome, NSeen, NUnary, NUnit, NVal, NativeCode, NativeCx, Place};
+use crate::native_tier::{self, NArith, NCmp, NConst, NFArith, NFrame, NFunc, NIns, NOpnd, NOsr, NOutcome, NSeen, NSite, NUnary, NUnit, NVal, NativeCode, NativeCx, Place};
 use std::rc::Weak;
 
 /// Cuántas llamadas a otras tasks puede sumar una unidad.
@@ -172,6 +175,15 @@ struct Build {
     tasks: Vec<Option<Rc<SynTaskValue>>>,
     deps: Vec<Dep>,
     range_fn: Option<SynValue>,
+    /// F4.7b: los sitios de `GetIndex`/`GetProp` de la unidad.
+    sites: Vec<NSite>,
+}
+
+impl Build {
+    fn site(&mut self, key: Option<Arc<str>>) -> u32 {
+        self.sites.push(NSite { key });
+        (self.sites.len() - 1) as u32
+    }
 }
 
 impl Build {
@@ -323,9 +335,22 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
         Ins::EachRange { first, n, it } => NIns::EachRange { first, n, it },
         Ins::EachNextV { it, slot, exit } => NIns::EachNext { it, slot, exit },
         Ins::EachEndV { it, first, n } => NIns::EachEnd { it, first, n },
-        // El camino general de un `each` (la colección no era el builtin `range`): con `range` no se
-        // llega; si se llega, sigue la VM.
-        Ins::EachInitV { .. } => NIns::Leave { planned: false },
+        // El camino general de un `each` (la colección no era el builtin `range`): una lista la
+        // recorre el nivel nativo (F4.7b); otra colección sale.
+        Ins::EachInitV { src, it, .. } => NIns::EachList { src: nopnd(c, src)?, it },
+        // F4.7b: lecturas, con un sitio propio (su caché por forma).
+        Ins::GetProp { dst, obj, name, .. } => NIns::GetProp { dst, obj: nopnd(c, obj)?, site: b.site(Some(c.names[name as usize].clone())) },
+        Ins::GetIndex { dst, obj, idx, .. } => {
+            let obj = nopnd(c, obj)?;
+            match idx {
+                // Una clave de texto constante: la del sitio.
+                Opnd::Const(k) => match &c.consts[k as usize] {
+                    SynValue::Text(t) => NIns::GetIndex { dst, obj, idx: None, site: b.site(Some(Arc::from(&**t))) },
+                    _ => NIns::GetIndex { dst, obj, idx: Some(nopnd(c, idx)?), site: b.site(None) },
+                },
+                _ => NIns::GetIndex { dst, obj, idx: Some(nopnd(c, idx)?), site: b.site(None) },
+            }
+        }
         Ins::LoadRLocal { dst, slot, .. } => NIns::LoadLocal { dst, slot },
         Ins::LetRLocal { src, slot, dst } => NIns::LetLocal { src: nopnd(c, src)?, slot, dst },
         Ins::SetRLocal { src, slot, dst, .. } => NIns::SetLocal { src: nopnd(c, src)?, slot, dst },
@@ -384,12 +409,18 @@ fn chunk_iters(c: &Chunk) -> u16 {
 }
 
 /// Lo que tiene el lugar `at` de la pila de iteradores, visto por el nivel nativo: las cuatro
-/// partes de un `range` (`valid`, `next`, `hi`, `step`), vacío, o algo que no representa.
-fn iter_parts(v: Option<&EachItems>) -> Result<Option<[i64; 4]>, ()> {
+/// partes de un `range` (`valid`, `next`, `hi`, `step`) o de una lista (F4.7b: dónde está su
+/// `Rc`, la posición, el largo y 0), con lo que es cada parte; vacío (`Hole`), o algo que no
+/// representa (`Opaque`).
+fn iter_parts(v: Option<&EachItems>) -> ([NSeen; 4], [i64; 4]) {
     match v {
-        None => Ok(None),
-        Some(EachItems::Range(r)) => Ok(Some([i64::from(r.next.is_some()), r.next.unwrap_or(0), r.hi, r.step])),
-        Some(_) => Err(()),
+        None => ([NSeen::Hole; 4], [0; 4]),
+        Some(EachItems::Range(r)) => ([NSeen::Int; 4], [i64::from(r.next.is_some()), r.next.unwrap_or(0), r.hi, r.step]),
+        Some(EachItems::List(l, i)) => (
+            [NSeen::ListIter, NSeen::Int, NSeen::Int, NSeen::Int],
+            [std::ptr::from_ref(l) as usize as i64, *i as i64, l.borrow().len() as i64, 0],
+        ),
+        Some(_) => ([NSeen::Opaque; 4], [0; 4]),
     }
 }
 
@@ -400,6 +431,8 @@ fn seen(v: Option<&SynValue>) -> NSeen {
         Some(SynValue::Bool(_)) => NSeen::Bool,
         Some(SynValue::Nothing) => NSeen::Nothing,
         Some(SynValue::Number(Number::Float(_))) => NSeen::Float,
+        Some(SynValue::List(_)) => NSeen::List,
+        Some(SynValue::Map(_)) => NSeen::Map,
         Some(_) => NSeen::Boxed,
     }
 }
@@ -479,8 +512,8 @@ fn view_loop(c: &Chunk, env: &Rc<RefCell<Environment>>, head: usize, back: usize
                 let nm = &c.names[name as usize];
                 match own(nm) {
                     Some(Some(SynValue::Task(_) | SynValue::Builtin(_))) | None => view_ins(c, pc, env, None, b),
-                    Some(v) if seen(v.as_ref()) != NSeen::Boxed => Some(NIns::Move { dst, src: NOpnd::Global(global(nm)) }),
-                    Some(_) => None,
+                    // F4.7b: también una global con caja (prestada: el código nativo no la cambia).
+                    Some(_) => Some(NIns::Move { dst, src: NOpnd::Global(global(nm)) }),
                 }
             }
             Ins::SetGlobal { src, name, dst, .. } | Ins::LetName { src, name, dst } if !module => {
@@ -549,7 +582,7 @@ impl Interpreter {
             }
             let compiled = native_tier::tier().and_then(|tier| {
                 let b = build_unit(t, params.clone())?;
-                let code = tier.compile(&NUnit { funcs: b.funcs.clone() })?;
+                let code = tier.compile(&NUnit { funcs: b.funcs.clone(), sites: b.sites.clone() })?;
                 let nregs0 = b.funcs[0].nregs;
                 Some(b.unit(code, nregs0, params))
             });
@@ -578,6 +611,8 @@ impl Interpreter {
             NVal::Callee(f) => SynValue::Task(unit.task(f as usize).expect("task de la unidad viva")),
             NVal::RangeFn => unit.range_fn.clone().expect("el builtin range de la unidad"),
             NVal::Hole => SynValue::Nothing,
+            NVal::Value(v) => v,
+            NVal::List(l) => SynValue::List(l),
         }
     }
 
@@ -819,12 +854,7 @@ impl Interpreter {
         }
         let niters = chunk_iters(chunk);
         for it in 0..niters as usize {
-            let s = match iter_parts(self.vm_iters.get(iter_base + it)) {
-                Ok(Some(_)) => NSeen::Int,
-                Ok(None) => NSeen::Hole,
-                Err(()) => NSeen::Boxed,
-            };
-            init.extend([s; 4]);
+            init.extend(iter_parts(self.vm_iters.get(iter_base + it)).0);
         }
         b.funcs.push(NFunc {
             code,
@@ -841,7 +871,7 @@ impl Interpreter {
         if b.tasks.iter().flatten().any(|t| t.code.get().is_some_and(|c| Rc::ptr_eq(c, chunk))) {
             return None;
         }
-        let code = tier.compile(&NUnit { funcs: std::mem::take(&mut b.funcs) })?;
+        let code = tier.compile(&NUnit { funcs: std::mem::take(&mut b.funcs), sites: std::mem::take(&mut b.sites) })?;
         Some(LoopUnit { unit: b.unit(code, chunk.nregs, Vec::new()), globals, writes })
     }
 
@@ -861,15 +891,11 @@ impl Interpreter {
         let mut args: SmallVec<[i64; 16]> = SmallVec::new();
         for &(place, want) in lu.unit.code.inputs() {
             if let Place::Iter(it, k) = place {
-                let (s, x) = match iter_parts(self.vm_iters.get(iter_base + it as usize)) {
-                    Ok(Some(p)) => (NSeen::Int, p[k as usize]),
-                    Ok(None) => (NSeen::Hole, 0),
-                    Err(()) => (NSeen::Boxed, 0),
-                };
-                if s != want {
+                let (s, x) = iter_parts(self.vm_iters.get(iter_base + it as usize));
+                if s[k as usize] != want {
                     return None;
                 }
-                args.push(x);
+                args.push(x[k as usize]);
                 continue;
             }
             let v = match place {
@@ -885,7 +911,10 @@ impl Interpreter {
                 Some(SynValue::Number(Number::Int(x))) => *x,
                 Some(SynValue::Bool(b)) => i64::from(*b),
                 Some(SynValue::Number(Number::Float(x))) => x.to_bits() as i64,
-                _ => 0,
+                Some(SynValue::Nothing) | None => 0,
+                // F4.7b: un valor con caja entra prestado: dónde vive (su lugar en la VM). El código
+                // nativo no escribe la VM hasta volver, así que ahí sigue.
+                Some(v) => std::ptr::from_ref(v) as usize as i64,
             });
         }
         drop(e);
@@ -907,14 +936,14 @@ impl Interpreter {
         ib: usize,
         globals: Option<(&Rc<RefCell<Environment>>, &[usize])>,
     ) {
-        let mut iters: SmallVec<[(u16, [i64; 4], bool); 4]> = SmallVec::new();
+        let mut iters: SmallVec<[(u16, [i64; 4], bool, Option<ListRef>); 4]> = SmallVec::new();
         for (place, v) in values {
             match place {
                 Place::Reg(r) => self.vm_regs[rbase + r as usize] = Self::nval_to_syn(unit, v),
-                Place::Local(k) => self.vm_locals[lbase + k as usize] = (v != NVal::Hole).then(|| Self::nval_to_syn(unit, v)),
+                Place::Local(k) => self.vm_locals[lbase + k as usize] = (!matches!(v, NVal::Hole)).then(|| Self::nval_to_syn(unit, v)),
                 Place::Global(g) => {
                     // Una global vacía el código nativo no la escribió (un `set` a un hueco sale antes).
-                    if v != NVal::Hole {
+                    if !matches!(v, NVal::Hole) {
                         let (env, slots) = globals.expect("global fuera de un bucle");
                         env.borrow_mut().bindings.slot_set(slots[g as usize], Self::nval_to_syn(unit, v));
                     }
@@ -923,25 +952,30 @@ impl Interpreter {
                     let i = match iters.iter().position(|x| x.0 == it) {
                         Some(i) => i,
                         None => {
-                            iters.push((it, [0; 4], false));
+                            iters.push((it, [0; 4], false, None));
                             iters.len() - 1
                         }
                     };
                     match v {
                         NVal::Int(x) => iters[i].1[k as usize] = x,
+                        // F4.7b: un iterador de una lista (su lista, ya clonada; la posición en la parte 1).
+                        NVal::List(l) => iters[i].3 = Some(l),
                         _ => iters[i].2 = true,
                     }
                 }
             }
         }
         iters.sort_by_key(|x| x.0);
-        for (it, p, gone) in iters {
+        for (it, p, gone, list) in iters {
             let at = ib + it as usize;
             if gone {
                 self.vm_iters.truncate(at);
                 continue;
             }
-            let r = EachItems::Range(RangeIter { next: (p[0] != 0).then_some(p[1]), hi: p[2], step: p[3] });
+            let r = match list {
+                Some(l) => EachItems::List(l, p[1] as usize),
+                None => EachItems::Range(RangeIter { next: (p[0] != 0).then_some(p[1]), hi: p[2], step: p[3] }),
+            };
             if at < self.vm_iters.len() {
                 self.vm_iters[at] = r;
             } else {

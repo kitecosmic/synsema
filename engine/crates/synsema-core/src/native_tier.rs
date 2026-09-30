@@ -12,7 +12,11 @@
 //! instrucción, sin haber hecho nada de ella, y la VM la corre como siempre.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+
+use crate::number::Number;
+use crate::synmap::MapIc;
+use crate::types::{ListRef, SynValue};
 
 /// Un registro de la ventana de la VM (el de `vm.rs`).
 pub type Reg = u16;
@@ -28,6 +32,22 @@ pub enum NConst {
     /// F4.7: un `Float` (sus bits, para que la constante siga siendo `Eq`).
     Float(u64),
 }
+
+/// Las etiquetas de un valor en el código nativo (F4.7): lo que dice qué hay en sus bits, su `f64` o
+/// su puntero. Las comparten el nivel nativo y las lecturas de abajo.
+pub const TAG_HOLE: i64 = 0;
+pub const TAG_NOTHING: i64 = 1;
+pub const TAG_INT: i64 = 2;
+pub const TAG_FLOAT: i64 = 3;
+pub const TAG_BOOL: i64 = 4;
+/// F4.7b: un valor con caja, prestado de la VM (el puntero es a donde vive: un registro, un lugar de
+/// la ventana, una global, un elemento de una lista o un valor de un mapa).
+pub const TAG_LIST: i64 = 5;
+pub const TAG_MAP: i64 = 6;
+/// Otro valor con caja (texto, `Big`, decimal, …), o una task o el builtin `range` (tipo estático).
+pub const TAG_OTHER: i64 = 7;
+/// Una lectura que el camino rápido no hace: sale a la VM antes de la instrucción.
+pub const TAG_MISS: i64 = 0xff;
 
 /// Un operando: como `Opnd` de la VM. `Reg` se consume (queda `nothing`), `Copy` no; `Local` es un
 /// lugar de la ventana de locales ligado seguro; `Global` es una global de un bucle nativo (F4.2:
@@ -102,6 +122,14 @@ pub enum NIns {
     Unary { dst: Reg, op: NUnary, a: NOpnd },
     /// F4.7: `ToBool` (si es verdadero, como `is_truthy`).
     ToBool { dst: Reg, src: NOpnd },
+    /// F4.7b: `x[i]` (lo que hace el camino rápido de la VM: una lista con un `Int`, un mapa con una
+    /// clave de texto; lo demás sale). `idx: None`: la clave es la constante de su sitio.
+    GetIndex { dst: Reg, obj: NOpnd, idx: Option<NOpnd>, site: u32 },
+    /// F4.7b: `m.k` (un mapa, con la caché por forma de su sitio; lo demás sale).
+    GetProp { dst: Reg, obj: NOpnd, site: u32 },
+    /// F4.7b: `EachInitV` sobre una lista (el iterador recorre la lista que había al empezar, como la
+    /// VM); otra colección sale.
+    EachList { src: NOpnd, it: u16 },
     /// Compara y salta (`IntCmpJump` + el `JumpIfFalsy` que le sigue, cuyo destino es `to`): si da
     /// verdadero sigue en `pc + 2`.
     IntCmpJump { op: NCmp, a: NOpnd, b: NOpnd, to: u32 },
@@ -159,8 +187,15 @@ pub enum NSeen {
     Nothing,
     /// Un lugar de la ventana o una global sin valor.
     Hole,
-    /// Una lista, un mapa, un texto, …: el nivel nativo no lo representa.
+    /// F4.7b: valores con caja (el código nativo los lee prestados, sin tocar sus cuentas): una
+    /// lista, un mapa, otro (texto, `Big`, …).
+    List,
+    Map,
     Boxed,
+    /// F4.7b: la primera parte de un iterador de una lista (las otras: posición y largo, `Int`).
+    ListIter,
+    /// Lo que el nivel nativo no representa (un iterador de claves o de caracteres).
+    Opaque,
 }
 
 /// Un bucle que se compila a mitad de camino (OSR, F4.2): se entra en `head` con el estado de la
@@ -190,14 +225,22 @@ pub struct NFunc {
     pub params: Vec<NSeen>,
 }
 
+/// Un sitio de `GetIndex`/`GetProp` (F4.7b): la clave, si es fija.
+#[derive(Clone, Debug)]
+pub struct NSite {
+    pub key: Option<Arc<str>>,
+}
+
 /// Lo que se compila junto: la task caliente (`funcs[0]`) y las que llama.
 #[derive(Clone, Debug)]
 pub struct NUnit {
     pub funcs: Vec<NFunc>,
+    /// F4.7b: los sitios de lectura de todas sus funciones.
+    pub sites: Vec<NSite>,
 }
 
 /// Un valor de un frame nativo.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum NVal {
     Int(i64),
     Bool(bool),
@@ -210,6 +253,117 @@ pub enum NVal {
     Hole,
     /// El builtin `range`.
     RangeFn,
+    /// F4.7b: un valor con caja (ya clonado: la cuenta es la de la VM).
+    Value(SynValue),
+    /// F4.7b: la lista de un iterador (ya clonada).
+    List(ListRef),
+}
+
+// =============================================================================================
+// Lecturas (F4.7b): lo que el nivel nativo lee de los valores con caja, sin `unsafe` (lo que
+// devuelve un puntero es su dirección, para que el nivel nativo la guarde; leerlo es de él).
+// =============================================================================================
+
+/// Un valor visto por el código nativo: su etiqueta, sus bits (un `Int`, un `Bool`, los de un
+/// `Float`) y, si tiene caja, dónde está.
+#[derive(Clone, Copy, Debug)]
+pub struct NPeek {
+    pub tag: i64,
+    pub bits: i64,
+    pub ptr: *const SynValue,
+}
+
+impl NPeek {
+    pub const MISS: NPeek = NPeek { tag: TAG_MISS, bits: 0, ptr: std::ptr::null() };
+}
+
+/// Cómo ve el código nativo a `v` (que vive donde está: su dirección queda en `ptr`).
+pub fn peek(v: &SynValue) -> NPeek {
+    let (tag, bits) = match v {
+        SynValue::Number(Number::Int(x)) => (TAG_INT, *x),
+        SynValue::Number(Number::Float(x)) => (TAG_FLOAT, x.to_bits() as i64),
+        SynValue::Bool(b) => (TAG_BOOL, i64::from(*b)),
+        SynValue::Nothing => (TAG_NOTHING, 0),
+        SynValue::List(_) => (TAG_LIST, 0),
+        SynValue::Map(_) => (TAG_MAP, 0),
+        _ => (TAG_OTHER, 0),
+    };
+    let ptr = if tag >= TAG_LIST { std::ptr::from_ref(v) } else { std::ptr::null() };
+    NPeek { tag, bits, ptr }
+}
+
+/// Un sitio de lectura con su caché por forma (la del nivel nativo, aparte de la de la VM: una
+/// caché no cambia qué da una lectura).
+pub struct SiteIc {
+    key: Option<Arc<str>>,
+    ic: MapIc,
+}
+
+impl SiteIc {
+    pub fn new(s: &NSite) -> SiteIc {
+        SiteIc { key: s.key.clone(), ic: MapIc::default() }
+    }
+
+    /// `obj[idx]` como el camino rápido de `GetIndex` en la VM: una lista con un `Int` (índices
+    /// negativos como siempre), un mapa con una clave de texto (la del sitio, o `idx`). Lo demás
+    /// (fuera de rango, clave que falta, otro tipo) no lo hace: `MISS`.
+    pub fn index(&self, obj: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&SynValue>) -> NPeek {
+        match obj {
+            SynValue::List(l) if idx_tag == TAG_INT => {
+                let items = l.borrow();
+                match crate::interpreter::resolve_index(idx_bits, items.len()) {
+                    Some(j) => peek(&items[j]),
+                    None => NPeek::MISS,
+                }
+            }
+            SynValue::Map(m) => {
+                let key: &str = match (&self.key, idx) {
+                    (Some(k), _) => k,
+                    (None, Some(SynValue::Text(t))) => t,
+                    _ => return NPeek::MISS,
+                };
+                match m.borrow().get_cached_key(key, &self.ic) {
+                    Some(v) => peek(v),
+                    None => NPeek::MISS,
+                }
+            }
+            _ => NPeek::MISS,
+        }
+    }
+
+    /// `obj.k` como el camino rápido de `GetProp` en la VM: un mapa con la caché por forma.
+    pub fn prop(&self, obj: &SynValue) -> NPeek {
+        match (obj, &self.key) {
+            (SynValue::Map(m), Some(k)) => match m.borrow().get_cached(k, &self.ic) {
+                Some(v) => peek(v),
+                None => NPeek::MISS,
+            },
+            _ => NPeek::MISS,
+        }
+    }
+}
+
+/// La lista de `v` (dónde está su `Rc`: el iterador de un `each` la guarda así, como
+/// `EachItems::List`) y su largo; `None` si no es una lista.
+pub fn list_body(v: &SynValue) -> Option<(*const ListRef, usize)> {
+    match v {
+        SynValue::List(l) => Some((std::ptr::from_ref(l), l.borrow().len())),
+        _ => None,
+    }
+}
+
+/// El elemento `i` de una lista (la vuelta de un `each`); `MISS` si ya no está.
+pub fn list_elem(l: &ListRef, i: i64) -> NPeek {
+    let items = l.borrow();
+    match usize::try_from(i).ok().and_then(|j| items.get(j)) {
+        Some(v) => peek(v),
+        None => NPeek::MISS,
+    }
+}
+
+/// Si `v` es verdadero (`is_truthy`).
+pub fn truthy(v: &SynValue) -> bool {
+    v.is_truthy()
 }
 
 /// Dónde vive un valor en el frame de la VM.

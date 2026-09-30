@@ -10089,7 +10089,7 @@ fn num_to_i64(v: &SynValue) -> Result<i64, Control> {
 
 /// Posición real de un índice que puede ser negativo (`-1` = el último), o `None` si
 /// queda fuera de `0..len`.
-fn resolve_index(i: i64, len: usize) -> Option<usize> {
+pub(crate) fn resolve_index(i: i64, len: usize) -> Option<usize> {
     let len = len as i64;
     let j = if i < 0 { i + len } else { i };
     if (0..len).contains(&j) {

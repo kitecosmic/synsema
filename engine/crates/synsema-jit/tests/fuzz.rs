@@ -423,15 +423,160 @@ impl FGen {
     }
 }
 
+/// F4.7b: generador de programas que LEEN datos en bucles nativos: listas (de enteros, floats,
+/// mezcladas, anidadas), mapas con forma y en modo diccionario, registros con la misma forma o con
+/// formas distintas, alias, escrituras a mitad del bucle (salen a la VM: el copy-on-write lo ve),
+/// `each` sobre una lista que el cuerpo modifica (la referencia recorre una foto), índices fuera de
+/// rango, negativos o que no son enteros, claves que faltan, `stop`.
+struct DGen {
+    rng: Rng,
+}
+
+impl DGen {
+    fn elem(&mut self) -> String {
+        let pool = ["0", "1", "2", "-3", "7", "2.5", "-0.5", "0.0", "9007199254740993", "\"t\"", "\"\"", "nothing", "true", "[1, 2]", "[]", "{\"a\": 1}"];
+        // Casi siempre números (lo que el bucle suma); a veces otra cosa (el error de la VM).
+        if self.rng.chance(85) {
+            pool[self.rng.below(9)].to_string()
+        } else {
+            pool[self.rng.below(pool.len())].to_string()
+        }
+    }
+
+    fn list(&mut self, n: usize) -> String {
+        let v: Vec<String> = (0..n).map(|_| self.elem()).collect();
+        format!("[{}]", v.join(", "))
+    }
+
+    fn record(&mut self, shape: usize) -> String {
+        let keys: &[&str] = match shape {
+            0 => &["x", "y", "m"],
+            1 => &["y", "x", "m"],
+            2 => &["x", "m"],
+            _ => &["x", "y", "m", "z"],
+        };
+        let v: Vec<String> = keys.iter().map(|k| format!("\"{}\": {}", k, self.elem())).collect();
+        format!("{{{}}}", v.join(", "))
+    }
+
+    /// Una lectura (lo que el bucle suma o compara).
+    fn read(&mut self) -> String {
+        match self.rng.below(12) {
+            0 | 1 => "xs[i % n]".to_string(),
+            2 => format!("xs[i % n - {}]", self.rng.below(4)),
+            // Fuera de rango, a veces.
+            3 if self.rng.chance(20) => "xs[i + 2]".to_string(),
+            3 => "xs[(i * 7) % n]".to_string(),
+            4 => "grid[i % 3][(i + 1) % 4]".to_string(),
+            5 => "recs[i % 4].x".to_string(),
+            6 => "recs[i % 4].m".to_string(),
+            7 => "m[\"a\"]".to_string(),
+            8 => "m[keys[i % 4]]".to_string(),
+            9 => "big[bigkeys[i % 40]]".to_string(),
+            10 => "alias[i % n]".to_string(),
+            // Una clave que no es texto en un mapa (lo resuelve la VM).
+            11 if self.rng.chance(15) => "m[i % 2]".to_string(),
+            _ => "m.b".to_string(),
+        }
+    }
+
+    fn program(&mut self) -> String {
+        let n = 3 + self.rng.below(5);
+        let mut s = String::new();
+        s += &format!("let xs be {}\nlet n be length(xs)\n", self.list(n));
+        let rows: Vec<String> = (0..3).map(|_| self.list(4)).collect();
+        s += &format!("let grid be [{}]\n", rows.join(", "));
+        // Registros: la misma forma, o formas distintas (la caché por forma ve varias).
+        let poly = self.rng.chance(40);
+        let recs: Vec<String> = (0..4).map(|k| { let sh = if poly { k % 4 } else { 0 }; self.record(sh) }).collect();
+        s += &format!("let recs be [{}]\n", recs.join(", "));
+        s += &format!("let m be {{\"a\": {}, \"b\": {}, \"c\": 3}}\n", self.elem(), self.elem());
+        // A veces falta una clave (el error de la VM).
+        // A veces falta una clave, o una no es texto (el error de la VM; en la cuarta posición: el
+        // bucle ya está en nativo cuando llega).
+        let keys = match self.rng.below(10) {
+            0 | 1 => "[\"a\", \"b\", \"c\", \"zz\"]",
+            2 => "[\"a\", \"b\", \"c\", 1]",
+            _ => "[\"a\", \"b\", \"c\", \"a\"]",
+        };
+        s += &format!("let keys be {}\n", keys);
+        // Un mapa de 40 claves: modo diccionario.
+        s += "let big be {}\nlet bigkeys be []\neach k in range(0, 40)\n    set big[\"k\" + text(k)] to k * 2\n    set bigkeys to append(bigkeys, \"k\" + text(k))\n";
+        s += "let alias be xs\n";
+        s += "let acc be 0\nlet facc be 0.0\nlet cnt be 0\n";
+        let bound = 3 + self.rng.below(30);
+        let over_list = self.rng.chance(35);
+        // El bucle (sus líneas, sin la sangría de un bucle de afuera).
+        let mut lp = String::new();
+        if over_list {
+            // Casi siempre una lista; a veces un mapa o un texto (sus claves, sus caracteres: el
+            // `each` sobre ellos lo hace la VM), o algo que no se recorre (su error).
+            let coll = match self.rng.below(10) {
+                0 => "m",
+                1 => "\"abc\"",
+                2 if self.rng.chance(30) => "n",
+                _ => "xs",
+            };
+            lp += &format!("let i be 0\neach v in {}\n    set i to i + 1\n", coll);
+            lp += "    when v\n        set cnt to cnt + 1\n";
+            if self.rng.chance(60) {
+                lp += "    set facc to facc + v * 1.0\n";
+            }
+            if self.rng.chance(30) {
+                // El cuerpo cambia la lista que recorre: la referencia sigue con la foto.
+                lp += "    when i == 2\n        set xs to append(xs, 5)\n";
+            }
+        } else {
+            lp += &format!("each i in range(0, {})\n", bound);
+        }
+        for _ in 0..1 + self.rng.below(3) {
+            let r = self.read();
+            match self.rng.below(4) {
+                0 => lp += &format!("    set facc to facc + {} * 0.5\n", r),
+                1 => lp += &format!("    when {} > 1\n        set cnt to cnt + 1\n", r),
+                2 => lp += &format!("    let t be {}\n    when t\n        set cnt to cnt + 1\n", r),
+                _ => lp += &format!("    set acc to acc + {}\n", r),
+            }
+        }
+        // Escrituras a mitad del bucle (salen a la VM): el alias no cambia (copy-on-write).
+        if self.rng.chance(35) {
+            lp += "    when i % 5 == 1\n        set xs[0] to xs[0] + 1\n";
+        }
+        if self.rng.chance(25) {
+            lp += "    when i % 7 == 3\n        set recs[1].x to i\n";
+        }
+        if self.rng.chance(20) {
+            lp += "    when i == 4\n        set m.a to 2.5\n";
+        }
+        if self.rng.chance(15) {
+            lp += "    when acc > 20\n        stop\n";
+        }
+        // A veces dentro de otro bucle: así el comienzo del `each` (sobre una lista o sobre otra
+        // cosa) también corre en nativo.
+        if self.rng.chance(40) {
+            s += "each rep in range(0, 3)\n";
+            for l in lp.lines() {
+                s += &format!("    {}\n", l);
+            }
+        } else {
+            s += &lp;
+        }
+        s += "print([acc, facc, cnt, xs, alias, recs[1], m])\n";
+        s += "print(steps())\n";
+        s
+    }
+}
+
 /// El modo referencia es global al proceso: un solo `check` a la vez.
 static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn check(seed: u64, count: usize) {
     let mut g = Gen { rng: Rng(seed) };
-    check_with(seed, count, move || g.program());
+    check_with(seed, count, true, move || g.program());
 }
 
-fn check_with(seed: u64, count: usize, mut program: impl FnMut() -> String) {
+/// `tasks`: los programas llaman tasks desde un sitio caliente (se exige que entren al código nativo).
+fn check_with(seed: u64, count: usize, tasks: bool, mut program: impl FnMut() -> String) {
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     synsema_jit::install();
     native_tier::set_eager(true);
@@ -440,7 +585,6 @@ fn check_with(seed: u64, count: usize, mut program: impl FnMut() -> String) {
     let mut errors = 0;
     for i in 0..count {
         let src = program();
-        if let Ok(d) = std::env::var("FUZZ_DUMP_TMP") { if i < 12 { std::fs::write(format!("{}/p{}.syn", d, i), &src).unwrap(); } }
         set_reference_mode(true);
         let reference = run_source(&src, "fuzz.syn");
         set_reference_mode(false);
@@ -466,7 +610,10 @@ fn check_with(seed: u64, count: usize, mut program: impl FnMut() -> String) {
         after.osr - before.osr
     );
     assert!(failures.is_empty(), "{} programa(s) dan distinto en nativo:\n\n{}", failures.len(), failures.join("\n\n"));
-    assert!(after.entries - before.entries > count as u64, "el nivel nativo casi no corrió: {:?} → {:?}", before, after);
+    // Un generador que arma programas que fallan todos no prueba nada (pasó: un builtin que no está
+    // en core).
+    assert!(errors * 4 < count * 3, "{} de {} programas terminan en error: el generador está roto", errors, count);
+    assert!(!tasks || after.entries - before.entries > count as u64, "el nivel nativo casi no corrió: {:?} → {:?}", before, after);
     assert!(after.deopts > before.deopts, "ningún programa salió a la VM a mitad de camino");
     assert!(after.osr - before.osr > count as u64 / 2, "los bucles del nivel superior casi no entraron al código nativo: {:?} → {:?}", before, after);
 }
@@ -488,12 +635,28 @@ fn native_matches_the_reference_on_many_generated_programs() {
 #[test]
 fn native_matches_the_reference_on_float_programs() {
     let mut g = FGen { rng: Rng(0x5eed_f4_07) };
-    check_with(0x5eed_f4_07, 150, move || g.program());
+    check_with(0x5eed_f4_07, 150, true, move || g.program());
 }
 
 #[test]
 #[ignore]
 fn native_matches_the_reference_on_many_float_programs() {
     let mut g = FGen { rng: Rng(0xf4_7_0000_0001) };
-    check_with(0xf4_7_0000_0001, 3000, move || g.program());
+    check_with(0xf4_7_0000_0001, 3000, true, move || g.program());
+}
+
+/// F4.7b: programas que leen datos en bucles nativos (listas, anidadas, mapas con forma y en modo
+/// diccionario, registros de varias formas, alias, escrituras que salen a la VM, `each` sobre una
+/// lista que el cuerpo cambia, índices y claves que fallan).
+#[test]
+fn native_matches_the_reference_on_data_programs() {
+    let mut g = DGen { rng: Rng(0x5eed_f4_7b) };
+    check_with(0x5eed_f4_7b, 200, false, move || g.program());
+}
+
+#[test]
+#[ignore]
+fn native_matches_the_reference_on_many_data_programs() {
+    let mut g = DGen { rng: Rng(0xf4_7b_0000_0001) };
+    check_with(0xf4_7b_0000_0001, 3000, false, move || g.program());
 }
