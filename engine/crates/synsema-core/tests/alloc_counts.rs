@@ -140,6 +140,9 @@ let j be 1
         ("a + b + c (el intermedio en el lugar)", "let t be \"un texto que no entra en línea\"
 ", "    set x to t + \"!\" + \"?\"
 ", 2),
+        // F4.6c: `text(x)` escribe en el texto (en línea hasta 15 B), sin un `String` (antes: 1).
+        ("text(i)", "", "    set x to text(i)
+", 0),
         // F4.4: `keys` comparte el texto de cada clave (antes: 4, uno por clave).
         ("keys(m) de 2 claves", "let m be {\"a\": 1, \"b\": 2}\n", "    set x to keys(m)\n", 2),
     ];
@@ -148,6 +151,18 @@ let j be 1
     for (name, prelude, body, expected) in while_cases {
         rows.push((*name, per_iteration(|n| while_loop(prelude, body, n)), *expected));
     }
+    // F4.6c: `set s to s + …` sobre un texto de un solo dueño agrega en el lugar (crece al doble:
+    // unos pocos `realloc` por corrida, no por vuelta). Antes: una copia de todo `s` por vuelta.
+    rows.push(("set s to s + \"x\" (en el lugar)", per_row_amortized(|n| while_loop("let s be \"\"
+", "    set s to s + \"x\"
+", n)), 0));
+    rows.push((
+        "set s to s + text(i) + \",\"",
+        per_row_amortized(|n| while_loop("let s be \"\"
+", "    set s to s + text(i) + \",\"
+", n)),
+        0,
+    ));
     // `each` sobre `range`: la vuelta (entorno nuevo + clave + tabla; el nombre formateado ya no, F1.6).
     rows.push(("vuelta de each + set x to 1", per_iteration(|n| format!("let x be 0\neach i in range(0, {})\n    set x to 1\n", n)), 0));
     // F4.4: `csv_parse` por fila de 2 columnas: las cabeceras, claves una vez por llamada. Las

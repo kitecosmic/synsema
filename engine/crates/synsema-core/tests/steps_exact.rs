@@ -53,6 +53,17 @@ let i be 1", "set m[\"a\"][\"b\"][i - 2] to 5", None),
         ("let xs be [0, 1]
 task z()
     give 1", "set xs[z()] to 7", None),
+        // F4.6c: cadenas `set P to P + …` en una vuelta (desde la segunda, en modo texto), con una
+        // pieza que no se suma en la última (el error sale por la referencia y no cuenta acá).
+        ("let s be \"\"", "each i in range(0, 5)
+    set s to s + text(i) + \",\"", None),
+        ("let s be \"x\"", "each i in range(0, 5)
+    set s to s + i + (i > 2) + s", None),
+        ("let s be \"x\"
+task f(p)
+    each i in range(0, 3)
+        set p to p + \"a\" + text(i)
+    give p", "set s to f(s) + f(s)", None),
         // La raíz en un hueco de la ventana: la referencia hace el `set` entero.
         ("let h be {\"n\": 1}", "each e in range(0, 2)
     when e == 9

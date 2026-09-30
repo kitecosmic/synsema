@@ -1,0 +1,6 @@
+-- F4.6c: una lista en la cabeza de una cadena ya en modo texto (P + [..]), en una task compilada.
+task add(p, x)
+    set p to p + x + "!"
+    give p
+print(add("a", "b"), add("c", "d"), add("e", 1), steps())
+print(add("f", [1]))

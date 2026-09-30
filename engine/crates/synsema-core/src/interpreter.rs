@@ -6182,15 +6182,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         if op == BinOp::Add {
             if matches!(left, SynValue::Text(_)) != matches!(right, SynValue::Text(_)) {
                 let other = if matches!(left, SynValue::Text(_)) { &right } else { &left };
-                if matches!(
-                    other,
-                    SynValue::Nothing
-                        | SynValue::List(_)
-                        | SynValue::Map(_)
-                        | SynValue::Bytes(_)
-                        | SynValue::Task(_)
-                        | SynValue::Builtin(_)
-                ) {
+                // Los tipos que no se suman a un texto (la lista vive en `text_addable`, que usa
+                // también la VM); un `secret` sí se suma (sigue abajo).
+                if !other.is_secret() && !text_addable(other) {
                     return Err(err_at(
                         format!(
                             "Cannot add text and {} — convert it on purpose: text(x), or interpolate it: `...{{x}}`{}",
@@ -6212,13 +6206,8 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             // (el intermedio de `a + b + c`, como `s += x` con refcount 1 en CPython); si no, una
             // copia del largo justo. El resultado es el mismo texto en los dos casos.
             if let SynValue::Text(mut l) = left {
-                match &right {
-                    SynValue::Text(r) => l.push_str(r),
-                    other => {
-                        use std::fmt::Write;
-                        let _ = write!(l, "{}", other);
-                    }
-                }
+                let added = text_add_piece(&mut l, &right);
+                debug_assert!(added, "texto + {}: los errores y `secret` ya salieron arriba", right.type_name());
                 return Ok(SynValue::Text(l));
             }
             if let SynValue::Text(r) = &right {
@@ -7356,7 +7345,17 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_to_text(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
-        Ok(syn_text(nth(args, 0)?.to_string()))
+        // F4.6c: el `Display` directo en un texto (en línea hasta 15 B: sin pedir memoria), sin un
+        // `String` en el medio; un texto es él mismo.
+        match nth(args, 0)? {
+            SynValue::Text(t) => Ok(SynValue::Text(t.clone())),
+            v => {
+                use std::fmt::Write;
+                let mut t = SynText::new();
+                let _ = write!(t, "{}", v);
+                Ok(SynValue::Text(t))
+            }
+        }
     }
 
     /// floor/ceil/round/trunc → entero. Los enteros (Int/Big) ya lo son y pasan tal cual;
@@ -9627,6 +9626,40 @@ fn bytes_encoding_arg(args: &[SynValue]) -> Result<Option<String>, Control> {
         Some(SynValue::Text(s)) => Ok(Some(s.to_string())),
         Some(other) => Err(err(format!("encoding must be text, got {}", other.type_name()))),
     }
+}
+
+/// `texto + x` (sin etiquetas): lo que `x` le agrega al texto. La regla vive sólo acá (la usan
+/// `exec_binary` y las cadenas `set P to P + …` de la VM, F4.6c): un texto tal cual, cualquier otro
+/// valor que se suma a un texto por su `Display`. `false`, sin tocar `t`, si `texto + x` no es
+/// agregar: un `secret` (el resultado es secret) o un tipo que no se suma a un texto (el error de
+/// `exec_binary`).
+pub(crate) fn text_add_piece(t: &mut SynText, x: &SynValue) -> bool {
+    if !text_addable(x) {
+        return false;
+    }
+    match x {
+        SynValue::Text(r) => t.push_str(r),
+        other => {
+            use std::fmt::Write;
+            let _ = write!(t, "{}", other);
+        }
+    }
+    true
+}
+
+/// Si `texto + x` es agregar `x` al texto (ver `text_add_piece`).
+#[inline]
+pub(crate) fn text_addable(x: &SynValue) -> bool {
+    !matches!(
+        x,
+        SynValue::Secret(_)
+            | SynValue::Nothing
+            | SynValue::List(_)
+            | SynValue::Map(_)
+            | SynValue::Bytes(_)
+            | SynValue::Task(_)
+            | SynValue::Builtin(_)
+    )
 }
 
 /// Concatenación que **propaga el taint** (#10): el resultado es un `secret` cuyo

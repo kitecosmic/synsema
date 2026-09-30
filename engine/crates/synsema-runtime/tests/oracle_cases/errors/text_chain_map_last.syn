@@ -1,0 +1,10 @@
+-- F4.6c: un mapa en la última pieza, en una vuelta ya en modo texto; las de antes, evaluadas.
+let m be {"k": 1}
+task pick(i)
+    when i < 3
+        give "x"
+    give m
+let s be ""
+each i in range(0, 5)
+    print(i, s, steps())
+    set s to s + text(i) + pick(i)

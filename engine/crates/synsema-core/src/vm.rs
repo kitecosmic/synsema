@@ -86,6 +86,9 @@ pub(crate) enum Ins {
     Binary { dst: Reg, op: BinOp, a: Opnd, b: Opnd, fb: u16 },
     /// La forma genérica, que nunca se pierde: `exec_binary`, como la referencia.
     BinaryAny { dst: Reg, op: BinOp, a: Opnd, b: Opnd },
+    /// F4.6c: un `+` de una cadena `set P to P + e1 + … + ek` que vio texto (ver `TextChainDesc`).
+    /// El miembro `m` de la tabla; `dst`, `a`, `b` los del `Binary` que reemplaza.
+    TextChain { dst: Reg, a: Opnd, b: Opnd, m: u16 },
     /// Formas especializadas para `Int` × `Int` (F3.4). Guarda: los dos operandos son
     /// `Number::Int` (un `Big` no pasa aunque su valor entre en i64); si no, `vm_binary_miss`
     /// (camino genérico + desoptimización). Si la cuenta desborda, el camino genérico da el `Big`.
@@ -267,6 +270,9 @@ pub(crate) struct Chunk {
     spills: Vec<Box<[Spill]>>,
     /// F4.6a: los `set` con camino.
     paths: Vec<PathDesc>,
+    /// F4.6c: las cadenas `set P to P + …` y sus `+`.
+    text_chains: Box<[TextChainDesc]>,
+    text_members: Box<[TextMember]>,
     /// Si el frame lleva su `Layout` como marca: sólo hace falta cuando otro chunk (el de una task
     /// o lambda definida adentro) lo va a recorrer y tiene que verificarlo. Los frames que la VM
     /// preparó para este chunk no se verifican: los armó ella.
@@ -310,6 +316,40 @@ struct PathDesc {
     ic: u32,
     /// La ubicación del destino (el error de fuera de rango).
     target_loc: u32,
+}
+
+/// F4.6c: `set P to P + e1 + … + ek` con P una variable (`Root`, nunca `Slow`). Se compila como
+/// siempre (los `+` son `Binary`, cada uno con su registro, vivo hasta el final de la sentencia);
+/// la primera vez que la cabeza (`P + e1`) ve un texto con una pieza que se le suma, la cadena pasa
+/// a `TextChain` (una vez, para siempre, como `BinaryAny`). Entonces el valor de P queda donde está
+/// mientras se evalúan las piezas (una pieza que lo lee ve el viejo), la cabeza guarda un clon en
+/// `old` y cada pieza queda en el registro de su `+`; el último agrega todas: en el
+/// lugar si P sigue siendo el mismo texto y, soltado el clon, tiene un solo dueño; si no, el viejo
+/// más las piezas, nuevo. Una pieza que no se suma a un texto (`text_add_piece`) arma en ese
+/// momento el intermedio de la referencia y sigue `exec_binary`.
+#[derive(Clone, Copy, Debug)]
+struct TextChainDesc {
+    root: Root,
+    /// Con más de un `+`: el registro del valor viejo de P mientras la cadena corre en modo texto
+    /// (vacío si no). Uno por cadena, reservado al comienzo del cuerpo (ninguna otra instrucción lo
+    /// usa y ninguna llamada de adentro de una pieza lo pisa). Por eso nunca queda un valor de otra
+    /// cadena: si tiene uno viejo (un `stop` cortó la cadena), la cadena ya es `TextChain` y su
+    /// cabeza lo reescribe antes que nadie lo mire. `DISCARD` con un solo `+`.
+    old: Reg,
+    /// Sus miembros en `Chunk::text_members`, de la cabeza al último.
+    first: u16,
+    n: u16,
+}
+
+/// Un `+` de una cadena de texto: dónde está y el `Binary` que era.
+#[derive(Clone, Copy, Debug)]
+struct TextMember {
+    pc: u32,
+    chain: u16,
+    dst: Reg,
+    a: Opnd,
+    b: Opnd,
+    fb: u16,
 }
 
 /// Dónde está la variable raíz de un camino (ver `Place`).
@@ -471,6 +511,18 @@ fn compile_unit<'r>(
         c.window = win.clone();
         c.regframe = regframe;
         c.lay_window(params);
+        // F4.6c: un registro por cadena de texto de más de un `+`, antes que cualquier otro (así
+        // ninguna llamada de adentro de una pieza lo pisa: su ventana empieza más arriba).
+        let long_chains: usize = match &body {
+            Body::Program(stmts) => stmts.iter().map(long_text_chains).sum(),
+            Body::Task(stmts) => stmts.iter().map(|s| long_text_chains(s)).sum(),
+            Body::Lambda(_) => 0,
+        };
+        let long_chains = u16::try_from(long_chains).unwrap_or(0);
+        c.text_regs = (c.next_reg, long_chains);
+        for _ in 0..long_chains {
+            c.reg();
+        }
         let chunk = match &body {
             Body::Program(stmts) => {
                 c.block(stmts, Some(0), false);
@@ -626,6 +678,10 @@ struct Compiler<'r, 's> {
     node_spill: Vec<u32>,
     spills: Vec<Box<[Spill]>>,
     paths: Vec<PathDesc>,
+    text_chains: Vec<TextChainDesc>,
+    text_members: Vec<TextMember>,
+    /// Los registros reservados para las cadenas de más de un `+` (el primero y cuántos quedan).
+    text_regs: (Reg, u16),
     key_ics: u32,
     /// F3.7: en un cuerpo con frame en registros, el registro de cada slot que es un parámetro
     /// (el último si se repite, como la referencia) y dónde va el valor del bloque (`r0` si no).
@@ -675,6 +731,9 @@ impl<'r, 's> Compiler<'r, 's> {
             node_spill: Vec::new(),
             spills: Vec::new(),
             paths: Vec::new(),
+            text_chains: Vec::new(),
+            text_members: Vec::new(),
+            text_regs: (0, 0),
             key_ics: 0,
             param_reg: HashMap::new(),
             result_reg: 0,
@@ -1006,7 +1065,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 } else {
                     None
                 };
-                let v = self.expr(value);
+                let v = self.set_value(target, name, value);
                 self.at(&n.location);
                 let nm = self.name(name);
                 match self.place(self.target(target)) {
@@ -1352,6 +1411,54 @@ impl<'r, 's> Compiler<'r, 's> {
             }
             _ => Place::Free,
         }
+    }
+
+    /// El valor de `set P to value` con P una variable: una cadena de texto (F4.6c) si `value` es
+    /// `P + e1 + … + ek` y P está donde la VM la escribe; si no, la expresión de siempre.
+    fn set_value(&mut self, target: &Node, name: &str, value: &Node) -> Opnd {
+        let k = text_chain_len(value, name);
+        if k == 0 || (k > 1 && self.text_regs.1 == 0) {
+            return self.expr(value);
+        }
+        let root = match self.place(self.target(target)) {
+            Place::Param(r) => Root::Param(r),
+            Place::Win(s) => Root::Win(s),
+            Place::Local(s) => Root::Local(s),
+            Place::Free => {
+                let name = self.name(name);
+                Root::Free { name, ic: self.ic() }
+            }
+            Place::Outer(..) => return self.expr(value),
+        };
+        let old = if k > 1 {
+            let (r, left) = self.text_regs;
+            self.text_regs = (r + 1, left - 1);
+            r
+        } else {
+            DISCARD
+        };
+        let chain = u16::try_from(self.text_chains.len()).expect("demasiadas cadenas de texto");
+        let first = u16::try_from(self.text_members.len()).expect("demasiadas cadenas de texto");
+        self.text_chains.push(TextChainDesc { root, old, first, n: k as u16 });
+        self.text_link(value, chain, k)
+    }
+
+    /// Un `+` de la cadena (`k` = cuántos quedan hasta P, éste incluido): exactamente lo que
+    /// compila `expr_in` para un `BinaryOp` (mismos pasos, registros y orden), anotado.
+    fn text_link(&mut self, n: &Node, chain: u16, k: usize) -> Opnd {
+        let NodeKind::BinaryOp { left, operator, right } = &n.kind else { unreachable!("cadena sin +") };
+        self.at(&n.location);
+        self.enter();
+        let a = if k > 1 { self.text_link(left, chain, k - 1) } else { self.expr(left) };
+        let a = self.keep_until(a, right);
+        let b = self.expr(right);
+        self.at(&n.location);
+        let dst = self.reg();
+        let fb = self.feedback;
+        self.feedback = self.feedback.saturating_add(1);
+        self.text_members.push(TextMember { pc: self.code.len() as u32, chain, dst, a, b, fb });
+        self.emit(Ins::Binary { dst, op: *operator, a, b, fb });
+        Opnd::Reg(dst)
     }
 
     /// F4.6a: `set <raíz><pasos> to v` con la raíz una variable, en el orden de la referencia
@@ -1897,6 +2004,8 @@ impl<'r, 's> Compiler<'r, 's> {
         let mut new_rest = Vec::with_capacity(n);
         let mut new_loc = Vec::with_capacity(n);
         let mut new_stop = Vec::with_capacity(n);
+        // Dónde quedó cada instrucción (no su bloque: un salto al comienzo cae en el `Steps`).
+        let mut placed = vec![NONE; n];
         let mut i = 0;
         while i < n {
             // Un bloque: suma sus pesos en su primera instrucción.
@@ -1927,6 +2036,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 if matches!(self.code[k], Ins::Nop) || fused == Some(k) {
                     continue;
                 }
+                placed[k] = code.len() as u32;
                 code.push(self.code[k]);
                 new_rest.push(rest[k]);
                 new_loc.push(self.loc[k]);
@@ -1958,6 +2068,9 @@ impl<'r, 's> Compiler<'r, 's> {
         for p in self.paths.iter_mut() {
             p.done = map(p.done, &self.labels);
         }
+        for m in self.text_members.iter_mut() {
+            m.pc = placed[m.pc as usize];
+        }
         let loop_heads = self.loop_heads.iter().map(|&l| map(l, &self.labels)).collect();
         let frame = self.frame_scope.map(|s| self.shared.layouts[s as usize].clone());
         let tagged = !self.children.is_empty();
@@ -1982,6 +2095,8 @@ impl<'r, 's> Compiler<'r, 's> {
             node_spill: self.node_spill,
             spills: self.spills,
             paths: self.paths,
+            text_chains: self.text_chains.into_boxed_slice(),
+            text_members: self.text_members.into_boxed_slice(),
             nregs: self.max_reg,
             ics: (0..self.ics).map(|_| Cell::new(0)).collect(),
             ic_here: self.ic_hops.iter().map(|&h| self.hops[h as usize].from.is_none()).collect(),
@@ -2054,6 +2169,49 @@ fn in_place_shape(target: &Node, value: &Node) -> bool {
         }
         NodeKind::BinaryOp { left, operator, .. } => *operator == BinOp::Add && same_place(left, target),
         _ => false,
+    }
+}
+
+/// F4.6c: cuántos `+` tiene `value` si es `P + e1 + … + ek` (asociativo a izquierda, P abajo de
+/// todo); 0 si no.
+fn text_chain_len(value: &Node, p: &str) -> usize {
+    let mut k = 0;
+    let mut cur = value;
+    loop {
+        match &cur.kind {
+            NodeKind::BinaryOp { left, operator, .. } if *operator == BinOp::Add => {
+                k += 1;
+                cur = left;
+            }
+            NodeKind::Identifier { name } if k > 0 && **name == *p => return k,
+            _ => return 0,
+        }
+    }
+}
+
+/// Cuántas sentencias de este cuerpo (sin entrar a tasks ni lambdas: son otros chunks) son cadenas
+/// de texto de más de un `+` (las que el compilador visita: si contara de menos, esas cadenas quedan
+/// como `Binary`).
+fn long_text_chains(n: &Node) -> usize {
+    use NodeKind as K;
+    let block = |b: &[Node]| b.iter().map(long_text_chains).sum::<usize>();
+    match &n.kind {
+        K::SetMutation { target, value } => match &target.kind {
+            K::Identifier { name } => usize::from(text_chain_len(value, name) > 1),
+            _ => 0,
+        },
+        K::WhenStatement { body, otherwise, otherwise_when, .. } => {
+            block(body) + otherwise.as_deref().map_or(0, block) + otherwise_when.as_deref().map_or(0, long_text_chains)
+        }
+        K::WhileStatement { body, .. } | K::EachStatement { body, .. } => block(body),
+        K::MatchStatement { arms, otherwise, .. } => {
+            arms.iter().map(|a| match &a.kind {
+                K::MatchArm { body, .. } => block(body),
+                _ => 0,
+            }).sum::<usize>()
+                + otherwise.as_deref().map_or(0, block)
+        }
+        _ => 0,
     }
 }
 
@@ -2536,6 +2694,7 @@ impl Interpreter {
                     self.put(base, dst, v);
                     Ok(())
                 })(),
+                Ins::TextChain { dst, a, b, m } => self.vm_text_chain(&chunk, &env, base, at, dst, a, b, m),
                 // Quickening (F3.4): las formas especializadas, en brazos propios.
                 Ins::IntArith { dst, op, a, b, fb } => match self.int_pair(&chunk, &env, base, a, b) {
                     Some((x, y)) => {
@@ -3150,10 +3309,182 @@ impl Interpreter {
             }
             Some((Num::I(_), Num::I(_))) => int_form(op, dst, a, b, fb),
             Some(_) => float_form(op, dst, a, b, fb),
+            None if op == BinOp::Add && !chunk.text_members.is_empty() => {
+                if self.vm_text_quicken(chunk, env, base, at, a, b, fb) {
+                    // Esta vez, el camino genérico (la cadena corre en modo texto desde la próxima).
+                    return self.vm_binary_generic(chunk, env, base, at, dst, op, a, b);
+                }
+                None
+            }
             None => None,
         };
         chunk.code[at].set(quick.unwrap_or(Ins::BinaryAny { dst, op, a, b }));
         self.vm_binary_generic(chunk, env, base, at, dst, op, a, b)
+    }
+
+    /// F4.6c: si el `+` de `at` es la cabeza de una cadena de texto que ve un texto y una pieza que
+    /// se le suma, la cadena entera pasa a `TextChain` (para siempre, como `BinaryAny`).
+    #[allow(clippy::too_many_arguments)]
+    fn vm_text_quicken(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, at: usize, a: Opnd, b: Opnd, fb: u16) -> bool {
+        let Some(m) = chunk.text_members.iter().position(|x| x.pc as usize == at) else { return false };
+        let ch = chunk.text_chains[chunk.text_members[m].chain as usize];
+        if m != ch.first as usize || chunk.deopts[fb as usize].get() > MAX_DEOPTS {
+            return false;
+        }
+        let fits = self.peek_with(chunk, env, base, a, |v| matches!(v, Some(SynValue::Text(_))))
+            && self.peek_with(chunk, env, base, b, |v| v.is_some_and(text_addable));
+        if !fits {
+            return false;
+        }
+        for j in ch.first..ch.first + ch.n {
+            let x = chunk.text_members[j as usize];
+            chunk.code[x.pc as usize].set(Ins::TextChain { dst: x.dst, a: x.a, b: x.b, m: j });
+        }
+        true
+    }
+
+    /// Mira un operando sin moverlo ni clonarlo (`None`: un hueco).
+    fn peek_with<R>(&self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, o: Opnd, f: impl FnOnce(Option<&SynValue>) -> R) -> R {
+        match o {
+            Opnd::Reg(r) | Opnd::Copy(r) => f(Some(&self.vm_regs[base + r as usize])),
+            Opnd::Const(k) => f(Some(&chunk.consts[k as usize])),
+            Opnd::RLocal(k) => f(self.vm_locals[self.vm_lbase + k as usize].as_ref()),
+            Opnd::Local(k) => f(env.borrow().bindings.slot(k as usize)),
+        }
+    }
+
+    /// `TextChain` (F4.6c, ver `TextChainDesc`).
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_text_chain(
+        &mut self,
+        chunk: &Chunk,
+        env: &Rc<RefCell<Environment>>,
+        base: usize,
+        at: usize,
+        dst: Reg,
+        a: Opnd,
+        b: Opnd,
+        m: u16,
+    ) -> Result<(), Control> {
+        let mem = chunk.text_members[m as usize];
+        let ch = chunk.text_chains[mem.chain as usize];
+        let i = m - ch.first;
+        let last = i + 1 == ch.n;
+        let loc = &chunk.locs[chunk.loc[at] as usize];
+        if i == 0 {
+            // La cabeza: P y la primera pieza, en el orden de la referencia.
+            let p = self.opnd(chunk, env, base, a, at)?;
+            let x = self.opnd(chunk, env, base, b, at)?;
+            if ch.old != DISCARD {
+                self.vm_regs[base + ch.old as usize] = SynValue::Nothing;
+            }
+            let head_fb = mem.fb as usize;
+            match p {
+                SynValue::Text(old) if text_addable(&x) && chunk.deopts[head_fb].get() <= MAX_DEOPTS => {
+                    if last {
+                        self.vm_text_finish(chunk, env, base, ch, m, dst, old, x);
+                    } else {
+                        self.vm_regs[base + ch.old as usize] = SynValue::Text(old);
+                        self.put(base, dst, x);
+                    }
+                    Ok(())
+                }
+                p => {
+                    // P no es texto, o la pieza no se le suma: el `+` de siempre (y la cadena
+                    // entera, genérica esta vez). Cuenta como desoptimización.
+                    let n = &chunk.deopts[head_fb];
+                    n.set(n.get().saturating_add(1));
+                    let v = self.exec_binary(p, BinOp::Add, x, loc)?;
+                    self.put(base, dst, v);
+                    Ok(())
+                }
+            }
+        } else {
+            let old_at = base + ch.old as usize;
+            if !matches!(self.vm_regs[old_at], SynValue::Text(_)) {
+                // La cabeza corrió genérica: éste también.
+                return self.vm_binary_generic(chunk, env, base, at, dst, BinOp::Add, a, b);
+            }
+            let x = self.opnd(chunk, env, base, b, at)?;
+            if text_addable(&x) {
+                if last {
+                    let SynValue::Text(old) = std::mem::replace(&mut self.vm_regs[old_at], SynValue::Nothing) else { unreachable!() };
+                    self.vm_text_finish(chunk, env, base, ch, m, dst, old, x);
+                } else {
+                    self.put(base, dst, x);
+                }
+                return Ok(());
+            }
+            // Una pieza que no se suma a un texto: en este momento, el intermedio de la referencia
+            // (P vieja + las piezas hasta acá) y su `+`, con su resultado o su error.
+            let SynValue::Text(mut t) = std::mem::replace(&mut self.vm_regs[old_at], SynValue::Nothing) else { unreachable!() };
+            for j in ch.first..m {
+                let r = base + chunk.text_members[j as usize].dst as usize;
+                let piece = std::mem::replace(&mut self.vm_regs[r], SynValue::Nothing);
+                let added = text_add_piece(&mut t, &piece);
+                debug_assert!(added);
+            }
+            let n = &chunk.deopts[chunk.text_members[ch.first as usize].fb as usize];
+            n.set(n.get().saturating_add(1));
+            let v = self.exec_binary(SynValue::Text(t), BinOp::Add, x, loc)?;
+            self.put(base, dst, v);
+            Ok(())
+        }
+    }
+
+    /// El último `+` de una cadena en modo texto: las piezas (las de los registros de los `+`
+    /// anteriores y `x`) se agregan al texto de P si sigue siendo el viejo (en el lugar si, soltado
+    /// el clon `old`, tiene un solo dueño: `push_str`); si no, a `old`. El resultado va a `dst` y el
+    /// `set` que sigue lo escribe como siempre.
+    #[allow(clippy::too_many_arguments)]
+    fn vm_text_finish(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, ch: TextChainDesc, m: u16, dst: Reg, old: SynText, x: SynValue) {
+        let mut pieces: SmallVec<[SynValue; 4]> = SmallVec::new();
+        for j in ch.first..m {
+            let r = base + chunk.text_members[j as usize].dst as usize;
+            pieces.push(std::mem::replace(&mut self.vm_regs[r], SynValue::Nothing));
+        }
+        pieces.push(x);
+        let mut old = Some(old);
+        let add = |t: &mut SynText, pieces: &[SynValue]| {
+            for p in pieces {
+                let added = text_add_piece(t, p);
+                debug_assert!(added);
+            }
+        };
+        let in_place = self.vm_text_slot(chunk, env, base, ch.root, |slot| match slot {
+            SynValue::Text(t) if SynText::same(t, old.as_ref().expect("viejo")) => {
+                drop(old.take());
+                add(t, &pieces);
+                Some(slot.clone())
+            }
+            _ => None,
+        });
+        let v = match in_place.flatten() {
+            Some(v) => v,
+            None => {
+                let mut t = old.take().expect("viejo");
+                add(&mut t, &pieces);
+                SynValue::Text(t)
+            }
+        };
+        self.put(base, dst, v);
+    }
+
+    /// El lugar de P, si está donde lo escribe la VM (un hueco o una global que no está en el
+    /// primer frame de su búsqueda: `None`, y el `set` resuelve como siempre).
+    fn vm_text_slot<R>(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, root: Root, f: impl FnOnce(&mut SynValue) -> R) -> Option<R> {
+        match root {
+            Root::Param(r) => Some(f(&mut self.vm_regs[base + r as usize])),
+            Root::Win(k) => self.vm_locals[self.vm_lbase + k as usize].as_mut().map(f),
+            Root::Local(k) => env.borrow_mut().bindings.slot_mut(k as usize).map(f),
+            Root::Free { name, ic } => {
+                let start = self.free_start(chunk, env, chunk.hops[chunk.ic_hops[ic as usize] as usize]);
+                let mut e = start.borrow_mut();
+                e.bindings.get_cached_mut(&chunk.names[name as usize], &chunk.ics[ic as usize]).map(f)
+            }
+            Root::Slow => None,
+        }
     }
 
     /// Una forma especializada vio otros tipos: vuelve a `Binary` (para especializarse con lo que
