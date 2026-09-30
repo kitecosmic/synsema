@@ -5140,6 +5140,7 @@ dependencies = [
  "sha2 0.10.9",
  "smallvec",
  "subtle",
+ "synsema-text",
  "zeroize",
 ]
 
@@ -5286,6 +5287,10 @@ dependencies = [
  "zeroize",
  "zip",
 ]
+
+[[package]]
+name = "synsema-text"
+version = "0.1.0"
 
 [[package]]
 name = "synsema-wasm"

@@ -6208,8 +6208,18 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             if left.is_secret() || right.is_secret() {
                 return Ok(secret_concat(&left, &right));
             }
-            if let SynValue::Text(l) = &left {
-                return Ok(syn_text(format!("{}{}", l, right)));
+            // F4.6b: el texto de la izquierda se agrega en el lugar si este valor es su único dueño
+            // (el intermedio de `a + b + c`, como `s += x` con refcount 1 en CPython); si no, una
+            // copia del largo justo. El resultado es el mismo texto en los dos casos.
+            if let SynValue::Text(mut l) = left {
+                match &right {
+                    SynValue::Text(r) => l.push_str(r),
+                    other => {
+                        use std::fmt::Write;
+                        let _ = write!(l, "{}", other);
+                    }
+                }
+                return Ok(SynValue::Text(l));
             }
             if let SynValue::Text(r) = &right {
                 return Ok(syn_text(format!("{}{}", left, r)));
@@ -8006,7 +8016,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     fn b_keys(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
         match nth(args, 0)? {
             SynValue::Map(m) => {
-                let keys: Vec<SynValue> = m.borrow().keys().map(|k| SynValue::Text(k.rc().clone())).collect();
+                let keys: Vec<SynValue> = m.borrow().keys().map(|k| SynValue::Text(k.text().clone())).collect();
                 Ok(syn_list(keys))
             }
             // El resultado de `group_by` (una lista de `{key, items}` desde v0.6.29) es el
@@ -8318,7 +8328,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // Los elementos (texto) llevan la etiqueta: `label_deep` de la lista la ve, y la lista
         // En si queda sin envolver (regla 2: el PC no asciende contenedores).
         Ok(syn_list(
-            l.iter().map(|p| labels::mark(SynValue::Text(p.clone()), meta.clone())).collect(),
+            l.iter().map(|p| labels::mark(SynValue::Text(SynText::from(&**p)), meta.clone())).collect(),
         ))
     }
 

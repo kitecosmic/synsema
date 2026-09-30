@@ -12,6 +12,7 @@
 //! (lo intuitivo). Si el corpus exige el quirk del origen, se ajusta — pendiente de
 //! confirmar con el agente de testing.
 
+pub use synsema_text::SynText;
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
@@ -32,7 +33,8 @@ pub use crate::synmap::{Key, MapObj, MapRef, SynMap};
 #[derive(Clone)]
 pub enum SynValue {
     Number(Number),
-    Text(Rc<str>),
+    /// F4.6b: `SynText` (en línea hasta 15 B, compartido, agregar en el lugar con un solo dueño).
+    Text(SynText),
     Bool(bool),
     Nothing,
     List(ListRef),
@@ -49,7 +51,7 @@ pub enum SynValue {
     /// toda salida (Display/JSON/blackboard/logs); el plaintext sólo se materializa
     /// en los puntos bordeados del runtime (reveal/socket/DB). Ver `secret.rs`.
     Secret(Rc<SecretInner>),
-    /// Datos binarios inmutables (feature `bytes`, Batch 1). Espeja `Text(Rc<str>)`
+    /// Datos binarios inmutables (feature `bytes`, Batch 1). Espeja `Text`
     /// pero sin garantía de UTF-8. Constructor-only (`bytes(...)`); no hay literal.
     /// Toda operación devuelve bytes nuevos (sin mutación in-place → sin aliasing).
     Bytes(Rc<[u8]>),
@@ -465,7 +467,7 @@ pub fn syn_int(n: i64) -> SynValue {
 pub fn syn_float(x: f64) -> SynValue {
     SynValue::Number(Number::Float(x))
 }
-pub fn syn_text(s: impl Into<Rc<str>>) -> SynValue {
+pub fn syn_text(s: impl Into<SynText>) -> SynValue {
     SynValue::Text(s.into())
 }
 pub fn syn_bool(b: bool) -> SynValue {

@@ -2626,6 +2626,7 @@ dependencies = [
  "sha2",
  "smallvec",
  "subtle",
+ "synsema-text",
  "zeroize",
 ]
 
@@ -2685,6 +2686,10 @@ dependencies = [
  "x509-parser",
  "zeroize",
 ]
+
+[[package]]
+name = "synsema-text"
+version = "0.1.0"
 
 [[package]]
 name = "synsema-vela-guest"

@@ -1,0 +1,39 @@
+-- F4.6b: el texto en línea (hasta 15 B) y en el montón da lo mismo en todo: el borde 15/16,
+-- Unicode, `+` sobre un texto compartido y sobre uno de un solo dueño, claves cortas y largas.
+let base be "abcdefghijklmn"
+let a be base + "o"
+let b be base + "op"
+let c be a + "p"
+print(length(a), length(b), a, b, b == c, a < b, c > a)
+let snap be b
+let grown be b + "q"
+print(snap, grown, snap == "abcdefghijklmnop")
+
+-- UTF-8 cruzando el borde (ñ son 2 B, el cangrejo 4)
+let u be "ñññññññ"
+let v be u + "ñ"
+let w be v + "🦀"
+print(length(u), length(v), length(w), w, w[8], upper(w))
+
+-- `a + b + c`: el intermedio se agrega en el lugar; los de afuera no cambian
+let p1 be "una parte que no entra en línea"
+let p2 be p1 + " / " + text(42) + " / " + text(true)
+print(p1, p2)
+
+-- claves cortas y largas, repetidas y nuevas
+let m be {"id": 1, "una clave bastante larga": 2}
+set m["otra clave bastante larga"] to 3
+set m.id to m.id + 1
+let k be "una clave bastante" + " larga"
+print(m, m[k], keys(m), contains(m, k), contains(m, "id"))
+
+-- orden y agrupado por texto
+let words be ["pera", "manzana", "una palabra bastante larga", "a", "", "manzana", "una palabra bastante larga"]
+print(sort(words), unique(words))
+let counts be {}
+each x in words
+    when contains(counts, x)
+        set counts[x] to counts[x] + 1
+    otherwise
+        set counts[x] to 1
+print(counts, steps())

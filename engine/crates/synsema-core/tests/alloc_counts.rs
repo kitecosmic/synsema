@@ -127,6 +127,19 @@ fn heap_allocations_per_construct() {
 let j be 1
 ", "    set m.a.b[j] to i
 ", 0),
+        // F4.6b: un texto de hasta 15 B vive en línea (sin malloc); `+` agrega en el lugar si el
+        // de la izquierda es de un solo dueño y, si no, copia una vez (antes: `format!` + la copia).
+        ("texto corto \"ab\" + \"cd\"", "", "    set x to \"ab\" + \"cd\"
+", 0),
+        ("texto corto + número", "", "    set x to \"n=\" + i
+", 0),
+        ("texto largo + corto", "let t be \"un texto que no entra en línea\"
+", "    set x to t + \"!\"
+", 1),
+        // La copia del largo justo y un `realloc` cuando el intermedio (único) crece.
+        ("a + b + c (el intermedio en el lugar)", "let t be \"un texto que no entra en línea\"
+", "    set x to t + \"!\" + \"?\"
+", 2),
         // F4.4: `keys` comparte el texto de cada clave (antes: 4, uno por clave).
         ("keys(m) de 2 claves", "let m be {\"a\": 1, \"b\": 2}\n", "    set x to keys(m)\n", 2),
     ];

@@ -18,6 +18,9 @@ vm-profile = []
 native-tier = []
 
 [dependencies]
+# El texto (F4.6b de specs/compute-rendimiento.md): en línea hasta 15 B, compartido, y agregar en el
+# lugar con un solo dueño. El `unsafe` del texto vive ahí, no en core.
+synsema-text = { path = "../synsema-text" }
 num-bigint.workspace = true
 num-traits.workspace = true
 num-integer.workspace = true

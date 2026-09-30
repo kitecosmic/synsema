@@ -1,6 +1,6 @@
 //! El mapa de Synsema (F4.4 y F4.5 de specs/compute-rendimiento.md).
 //!
-//! - [`Key`]: la clave, un `Rc<str>` compartido. Un literal del chunk, el nombre de un `set m.k`,
+//! - [`Key`]: la clave, un texto compartido (`SynText`: en línea hasta 15 B). Un literal del chunk, el nombre de un `set m.k`,
 //!   el texto de un `set m[k]`, las columnas de un CSV o las claves repetidas de un JSON se guardan
 //!   una vez y cada mapa suma una referencia (como los strings internados de CPython/V8/Lua), en vez
 //!   de copiar el texto en cada registro. Hashea y compara igual que `str` (`Borrow<str>`), así que
@@ -34,11 +34,11 @@ use std::sync::OnceLock;
 
 use indexmap::IndexMap;
 
-use crate::types::SynValue;
+use crate::types::{SynText, SynValue};
 
-/// La clave de un mapa: texto compartido (`Rc<str>`). Ver el módulo.
+/// La clave de un mapa: texto compartido (`SynText`, F4.6b). Ver el módulo.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Key(Rc<str>);
+pub struct Key(SynText);
 
 impl Key {
     #[inline]
@@ -56,7 +56,7 @@ impl Key {
     }
     /// El texto compartido: armar un `SynValue::Text` con él no copia (`keys(m)`).
     #[inline]
-    pub fn rc(&self) -> &Rc<str> {
+    pub fn text(&self) -> &SynText {
         &self.0
     }
 }
@@ -106,34 +106,34 @@ impl fmt::Debug for Key {
 impl From<&str> for Key {
     #[inline]
     fn from(s: &str) -> Key {
-        Key(Rc::from(s))
+        Key(SynText::from(s))
     }
 }
 
 impl From<String> for Key {
     #[inline]
     fn from(s: String) -> Key {
-        Key(Rc::from(s))
+        Key(SynText::from(s))
     }
 }
 
 impl From<&String> for Key {
     #[inline]
     fn from(s: &String) -> Key {
-        Key(Rc::from(s.as_str()))
+        Key(SynText::from(s.as_str()))
     }
 }
 
-impl From<Rc<str>> for Key {
+impl From<SynText> for Key {
     #[inline]
-    fn from(s: Rc<str>) -> Key {
+    fn from(s: SynText) -> Key {
         Key(s)
     }
 }
 
-impl From<&Rc<str>> for Key {
+impl From<&SynText> for Key {
     #[inline]
-    fn from(s: &Rc<str>) -> Key {
+    fn from(s: &SynText) -> Key {
         Key(s.clone())
     }
 }
@@ -286,7 +286,7 @@ fn transition(parent: &Rc<Node>, k: &Key) -> Option<Rc<Node>> {
     let mut ch = s.children.borrow_mut();
     let mut dead = None;
     for (i, (ck, w)) in ch.iter().enumerate() {
-        if Rc::ptr_eq(&ck.0, &k.0) || ck.as_str() == k.as_str() {
+        if SynText::same(&ck.0, &k.0) || ck.as_str() == k.as_str() {
             match w.upgrade() {
                 Some(n) => return Some(n),
                 None => {
@@ -1345,7 +1345,7 @@ mod tests {
             0..=2 => assert_eq!(a.insert(k.as_str(), syn_int(n)).map(|x| int(&x)), b.insert(k.clone(), n)),
             3 => assert_eq!(a.set(&k, syn_int(n)).map(|x| int(&x)), b.insert(k.clone(), n)),
             4 => {
-                let t = SynValue::Text(Rc::from(k.as_str()));
+                let t = SynValue::Text(SynText::from(k.as_str()));
                 assert_eq!(a.set_value_key(&t, syn_int(n)).map(|x| int(&x)), b.insert(k.clone(), n))
             }
             5 => assert_eq!(a.shift_remove(&k).map(|x| int(&x)), b.shift_remove(&k)),
@@ -1518,7 +1518,7 @@ mod tests {
             let keys = 1 + next() % 50;
             let ps: Vec<(SynValue, i64)> = (0..n)
                 .map(|i| {
-                    let k = if next() % 7 == 0 { syn_int((next() % keys) as i64) } else { SynValue::Text(Rc::from(format!("k{}", next() % keys))) };
+                    let k = if next() % 7 == 0 { syn_int((next() % keys) as i64) } else { SynValue::Text(SynText::from(format!("k{}", next() % keys))) };
                     (k, i as i64)
                 })
                 .collect();
@@ -1584,12 +1584,14 @@ mod tests {
         assert_eq!(std::mem::size_of::<KeyHasher>(), 0);
     }
 
-    /// Un texto como clave comparte su `Rc` (no copia); otro valor usa su texto.
+    /// Un texto como clave comparte su memoria (no copia); otro valor usa su texto. (Uno de
+    /// hasta 15 B vive en línea: no hay memoria que compartir.)
     #[test]
     fn of_value_shares_text() {
-        let t: Rc<str> = Rc::from("clave");
+        let t = SynText::from("una clave que no entra en línea");
         let k = Key::of_value(&SynValue::Text(t.clone()));
-        assert!(Rc::ptr_eq(k.rc(), &t));
+        assert!(SynText::ptr_eq(k.text(), &t));
+        assert_eq!(Key::of_value(&SynValue::Text(SynText::from("id"))).as_str(), "id");
         assert_eq!(Key::of_value(&syn_int(7)).as_str(), "7");
     }
 }
