@@ -48,6 +48,8 @@ pub const TAG_MAP: i64 = 6;
 pub const TAG_OTHER: i64 = 7;
 /// Una lectura que el camino rápido no hace: sale a la VM antes de la instrucción.
 pub const TAG_MISS: i64 = 0xff;
+/// F4.8d2: `get(c, k, d)` sin la clave o el índice (el código nativo usa el default).
+pub const TAG_ABSENT: i64 = 0xfe;
 
 /// Un operando: como `Opnd` de la VM. `Reg` se consume (queda `nothing`), `Copy` no; `Local` es un
 /// lugar de la ventana de locales ligado seguro; `Global` es una global de un bucle nativo (F4.2:
@@ -98,10 +100,13 @@ pub enum NBuiltin {
     /// F4.8d: `append`, sólo en `set P to append(P, e)` de un bucle (`NIns::AppendPush`); en una
     /// llamada común sale a la VM.
     Append,
+    /// F4.8d2: `get(c, k)`/`get(c, k, d)` sobre un mapa con una clave de texto o una lista con un
+    /// `Int` (lo demás, en la VM).
+    Get,
 }
 
 impl NBuiltin {
-    pub const ALL: [NBuiltin; 5] = [NBuiltin::Length, NBuiltin::Sqrt, NBuiltin::Abs, NBuiltin::Float, NBuiltin::Append];
+    pub const ALL: [NBuiltin; 6] = [NBuiltin::Length, NBuiltin::Sqrt, NBuiltin::Abs, NBuiltin::Float, NBuiltin::Append, NBuiltin::Get];
 
     /// El nombre del builtin (el que se verifica al entrar: la global sigue siendo ese builtin).
     pub fn name(self) -> &'static str {
@@ -111,6 +116,7 @@ impl NBuiltin {
             NBuiltin::Abs => "abs",
             NBuiltin::Float => "float",
             NBuiltin::Append => "append",
+            NBuiltin::Get => "get",
         }
     }
 
@@ -219,6 +225,12 @@ pub enum NIns {
     /// F4.8d: `AppendInPlace` sobre la variable `root` del bucle: la función en `func` (el builtin
     /// `append`, verificado al entrar), P y el elemento desde `args`.
     AppendPush { dst: Reg, func: Reg, args: Reg, root: NOpnd },
+    /// F4.8d2 (sólo en un bucle): `LoadGlobal` de un valor que el código nativo no representa (un
+    /// builtin que no es intrínseco): la VM lo deja en el registro `dst` (lo corre el host). Una
+    /// `Call` cuya función es uno de éstos es una llamada ajena: la corre la VM entera.
+    LoadForeign { dst: Reg },
+    /// F4.8d2: `CheckProtected` sobre una función así (lo corre el host).
+    CheckForeign { func: Reg },
 }
 
 /// Lo que tenía un lugar al compilar un bucle (F4.2): el código nativo se especializa en eso y la
@@ -402,6 +414,27 @@ impl SiteIc {
     }
 }
 
+/// F4.8d2: `get(obj, idx, …)` como `b_get` en lo que hace sin errores: un mapa con una clave de texto
+/// (`to_string` de un texto es el texto) o una lista con un `Int` (negativos desde el final); si no
+/// está, `ABSENT`. Lo demás (otra clave, otra colección: la VM da el resultado o el error), `MISS`.
+pub fn get_item(obj: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&SynValue>) -> NPeek {
+    let absent = NPeek { tag: TAG_ABSENT, bits: 0, ptr: std::ptr::null() };
+    match (obj, idx) {
+        (SynValue::List(l), _) if idx_tag == TAG_INT => {
+            let items = l.borrow();
+            match crate::interpreter::resolve_index(idx_bits, items.len()) {
+                Some(j) => peek(&items[j]),
+                None => absent,
+            }
+        }
+        (SynValue::Map(m), Some(SynValue::Text(t))) => match m.borrow().get(t) {
+            Some(v) => peek(v),
+            None => absent,
+        },
+        _ => NPeek::MISS,
+    }
+}
+
 /// La lista de `v` (dónde está su `Rc`: el iterador de un `each` la guarda así, como
 /// `EachItems::List`) y su largo; `None` si no es una lista.
 pub fn list_body(v: &SynValue) -> Option<(*const ListRef, usize)> {
@@ -521,12 +554,19 @@ pub fn path_set(parent: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&Syn
             let mut b = m.borrow_mut();
             let s = if site.prop { b.get_cached_mut(key, &site.ic) } else { b.get_cached_key_mut(key, &site.ic) };
             match s {
-                Some(s) => {
-                    *s = v;
-                    true
-                }
-                None => false,
+                Some(s) => *s = v,
+                // Una clave nueva: lo que hace la hoja de la VM (`set_leaf_prop`/`set_leaf_index`) con un
+                // mapa que no es de un módulo (la forma cambia, o pasa a diccionario, como siempre).
+                None => match (site.key.is_some(), idx) {
+                    (false, Some(i)) => {
+                        b.set_value_key(i, v);
+                    }
+                    _ => {
+                        b.set(key, v);
+                    }
+                },
             }
+            true
         }
         _ => false,
     }
@@ -608,6 +648,46 @@ pub struct NativeCx<'a> {
     pub depth: &'a mut usize,
     pub max_depth: usize,
     pub cancel: &'a AtomicBool,
+    /// F4.8d2: en un bucle con llamadas ajenas, quien corre las instrucciones de la VM.
+    pub host: Option<&'a mut dyn NativeHost>,
+}
+
+/// F4.8d2: cómo terminó una instrucción que corrió el host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostOut {
+    /// Corrió: el código nativo sigue.
+    Ok,
+    /// Un `stop` que corta el bucle del cuerpo: el código sale después de la instrucción y la VM
+    /// sigue en la salida del bucle (el host la guardó).
+    Stop,
+    /// Un error (el host lo guardó): sale a la VM, que lo trata como el de su `LoopBack`.
+    Fail,
+}
+
+/// F4.8d2: lo del intérprete que el código nativo de un bucle usa para sus llamadas ajenas: corre
+/// instrucciones de la VM sobre el frame del bucle, y le dice dónde quedaron los valores (la memoria de
+/// la VM se puede mover durante una llamada: los punteros se vuelven a pedir después).
+pub trait NativeHost {
+    /// Corre la instrucción `pc` del bucle (una llamada, un `LoadGlobal`, un `CheckProtected`) con sus
+    /// argumentos (`None`: ya está en su registro) y, antes, las globales del bucle en su lugar
+    /// (`None`: ya está). `steps` entra y sale.
+    fn exec(&mut self, pc: u32, args: &[Option<SynValue>], globals: &[Option<SynValue>], steps: &mut u64) -> HostOut;
+    /// Lo que tiene ahora el lugar `p` del frame del bucle (con caja: su dirección).
+    fn peek_place(&mut self, p: Place) -> NPeek;
+    /// Dónde está la lista del iterador `it` (su `Rc`), o nulo.
+    fn iter_body(&mut self, it: u16) -> *const ListRef;
+    /// `v` pasa al lugar `p` (suelta lo que había); su dirección.
+    fn home(&mut self, p: Place, v: SynValue) -> *const SynValue;
+}
+
+/// F4.8d2: como `peek` pero con la dirección de un lugar que el código nativo puede escribir.
+pub fn peek_mut(v: &mut SynValue) -> NPeek {
+    let p = peek(v);
+    if p.tag >= TAG_LIST {
+        NPeek { ptr: std::ptr::from_mut(v).cast_const(), ..p }
+    } else {
+        p
+    }
 }
 
 /// Una unidad ya compilada (de este hilo).
@@ -674,12 +754,15 @@ pub struct NativeStats {
     pub deopts: u64,
     /// Entradas a un bucle a mitad de camino (OSR, F4.2).
     pub osr: u64,
+    /// De esas, a bucles con llamadas ajenas (F4.8d2: corren con un host).
+    pub foreign: u64,
 }
 
 static UNITS: AtomicU64 = AtomicU64::new(0);
 static ENTRIES: AtomicU64 = AtomicU64::new(0);
 static DEOPTS: AtomicU64 = AtomicU64::new(0);
 static OSR: AtomicU64 = AtomicU64::new(0);
+static FOREIGN: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn count_unit() {
     UNITS.fetch_add(1, Ordering::Relaxed);
@@ -693,6 +776,9 @@ pub(crate) fn count_deopt() {
 pub(crate) fn count_osr() {
     OSR.fetch_add(1, Ordering::Relaxed);
 }
+pub(crate) fn count_foreign() {
+    FOREIGN.fetch_add(1, Ordering::Relaxed);
+}
 
 #[doc(hidden)]
 pub fn stats() -> NativeStats {
@@ -701,5 +787,6 @@ pub fn stats() -> NativeStats {
         entries: ENTRIES.load(Ordering::Relaxed),
         deopts: DEOPTS.load(Ordering::Relaxed),
         osr: OSR.load(Ordering::Relaxed),
+        foreign: FOREIGN.load(Ordering::Relaxed),
     }
 }

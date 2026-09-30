@@ -33,9 +33,11 @@ struct Jit {
     deopt: FuncId,
     /// F4.7b: las lecturas de valores con caja (`index`, `prop`, `list_body`, `list_elem`, `truthy`,
     /// y `length` de F4.7c).
-    reads: [FuncId; 6],
+    reads: [FuncId; 7],
     /// F4.8d: las escrituras (`home`, `home_local`, `path_root`, `path_step`, `path_set`, `append`).
     writes: [FuncId; 6],
+    /// F4.8d2: el host (`exec`, `host_home`).
+    host: [FuncId; 2],
     bytes: usize,
 }
 
@@ -63,12 +65,15 @@ fn new_jit() -> Option<Jit> {
     jb.symbol("synsema_jit_list_elem", abi::synsema_jit_list_elem as *const u8);
     jb.symbol("synsema_jit_truthy", abi::synsema_jit_truthy as *const u8);
     jb.symbol("synsema_jit_length", abi::synsema_jit_length as *const u8);
+    jb.symbol("synsema_jit_get", abi::synsema_jit_get as *const u8);
     jb.symbol("synsema_jit_home", abi::synsema_jit_home as *const u8);
     jb.symbol("synsema_jit_home_local", abi::synsema_jit_home_local as *const u8);
     jb.symbol("synsema_jit_path_root", abi::synsema_jit_path_root as *const u8);
     jb.symbol("synsema_jit_path_step", abi::synsema_jit_path_step as *const u8);
     jb.symbol("synsema_jit_path_set", abi::synsema_jit_path_set as *const u8);
     jb.symbol("synsema_jit_append", abi::synsema_jit_append as *const u8);
+    jb.symbol("synsema_jit_exec", abi::synsema_jit_exec as *const u8);
+    jb.symbol("synsema_jit_host_home", abi::synsema_jit_host_home as *const u8);
     let mut module = JITModule::new(jb);
     // Todo es una palabra (`i64`): el contexto, los punteros, los valores.
     let sig_of = |n: usize, ret: bool| {
@@ -82,7 +87,7 @@ fn new_jit() -> Option<Jit> {
         sig
     };
     let (s_deopt, s_index, s_prop, s_1, s_2) = (sig_of(7, false), sig_of(6, true), sig_of(3, true), sig_of(2, true), sig_of(3, true));
-    let (s_w2, s_w3, s_w6, s_w9) = (sig_of(2, true), sig_of(3, true), sig_of(6, true), sig_of(9, true));
+    let (s_w2, s_w3, s_w6, s_w9, s_w5) = (sig_of(2, true), sig_of(3, true), sig_of(6, true), sig_of(9, true), sig_of(5, true));
     let deopt = module.declare_function("synsema_jit_deopt", Linkage::Import, &s_deopt).ok()?;
     let reads = [
         module.declare_function("synsema_jit_index", Linkage::Import, &s_index).ok()?,
@@ -91,6 +96,7 @@ fn new_jit() -> Option<Jit> {
         module.declare_function("synsema_jit_list_elem", Linkage::Import, &s_2).ok()?,
         module.declare_function("synsema_jit_truthy", Linkage::Import, &s_1).ok()?,
         module.declare_function("synsema_jit_length", Linkage::Import, &s_1).ok()?,
+        module.declare_function("synsema_jit_get", Linkage::Import, &s_w5).ok()?,
     ];
     let writes = [
         module.declare_function("synsema_jit_home", Linkage::Import, &s_w3).ok()?,
@@ -100,7 +106,11 @@ fn new_jit() -> Option<Jit> {
         module.declare_function("synsema_jit_path_set", Linkage::Import, &s_w9).ok()?,
         module.declare_function("synsema_jit_append", Linkage::Import, &s_w6).ok()?,
     ];
-    Some(Jit { module, deopt, reads, writes, bytes: 0 })
+    let host = [
+        module.declare_function("synsema_jit_exec", Linkage::Import, &s_w5).ok()?,
+        module.declare_function("synsema_jit_host_home", Linkage::Import, &s_w3).ok()?,
+    ];
+    Some(Jit { module, deopt, reads, writes, host, bytes: 0 })
 }
 
 fn compile_in(jit: &mut Jit, unit: &NUnit) -> Option<abi::Compiled> {
@@ -135,15 +145,19 @@ fn compile_in(jit: &mut Jit, unit: &NUnit) -> Option<abi::Compiled> {
         let callees: Vec<_> = ids.iter().map(|id| m.declare_func_in_func(*id, &mut ctx.func)).collect();
         let reads = lower::has_boxed(unit, i, &plans[i]).then(|| {
             let r = jit.reads.map(|id| m.declare_func_in_func(id, &mut ctx.func));
-            lower::Reads { index: r[0], prop: r[1], list_body: r[2], list_elem: r[3], truthy: r[4], length: r[5] }
+            lower::Reads { index: r[0], prop: r[1], list_body: r[2], list_elem: r[3], truthy: r[4], length: r[5], get: r[6] }
         });
         let writes = lower::has_writes(unit, i).then(|| {
             let w = jit.writes.map(|id| m.declare_func_in_func(id, &mut ctx.func));
             lower::Writes { home: w[0], home_local: w[1], path_root: w[2], path_step: w[3], path_set: w[4], append: w[5] }
         });
-        let h = lower::Helpers { deopt: m.declare_func_in_func(jit.deopt, &mut ctx.func), reads, writes };
+        let host = lower::has_foreign(unit, i).then(|| {
+            let x = jit.host.map(|id| m.declare_func_in_func(id, &mut ctx.func));
+            lower::HostFns { exec: x[0], home: x[1] }
+        });
+        let h = lower::Helpers { deopt: m.declare_func_in_func(jit.deopt, &mut ctx.func), reads, writes, host };
         lower::build(unit, i, &mut plans, &mut ctx.func, &mut fbctx, &callees, h, m.target_config())?;
-        if !lower::check_memory(&ctx.func, false) || !lower::check_pointers(&ctx.func, &h, &plans[i].ptr_params, &plans[i].ptr_slots) {
+        if !lower::check_memory(&ctx.func, false) || !lower::check_pointers(&ctx.func, &h, &plans[i].ptr_params, &plans[i].ptr_slots, &plans[i].exec_ptr_slots) {
             return None;
         }
         m.define_function(ids[i], &mut ctx).ok()?;
@@ -162,6 +176,7 @@ fn compile_in(jit: &mut Jit, unit: &NUnit) -> Option<abi::Compiled> {
     jit.bytes += bytes;
     let inputs = std::mem::take(&mut plans[0].inputs);
     let homes = std::mem::take(&mut plans[0].homes);
+    let exec_sites = std::mem::take(&mut plans[0].exec_sites);
     Some(abi::Compiled {
         entry: m.get_finalized_function(entry),
         nparams: nargs,
@@ -170,6 +185,7 @@ fn compile_in(jit: &mut Jit, unit: &NUnit) -> Option<abi::Compiled> {
         points: plans.into_iter().map(|p| p.points).collect(),
         sites: unit.sites.iter().map(native_tier::SiteIc::new).collect(),
         homes,
+        exec_sites,
     })
 }
 

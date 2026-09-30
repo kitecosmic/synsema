@@ -288,7 +288,7 @@ impl FGen {
         match self.rng.below(100) {
             0..=9 => "7".to_string(),
             10..=14 => "(0 - 3)".to_string(),
-            5 => "1.5d".to_string(),
+            15 => "1.5d".to_string(),
             _ => {
                 let e = self.expr(vars, 2);
                 format!("({}) * 0.5 + {}", e, FCONSTS[self.rng.below(7)])
@@ -510,6 +510,8 @@ impl DGen {
         // Un mapa de 40 claves: modo diccionario.
         s += "let big be {}\nlet bigkeys be []\neach k in range(0, 40)\n    set big[\"k\" + text(k)] to k * 2\n    set bigkeys to append(bigkeys, \"k\" + text(k))\n";
         s += "let alias be xs\nlet out be []\nlet guard be out\n";
+        s += "let hits be 0\ntask bump(x)\n    set hits to hits + 1\n    give (x + cnt) % 3\n";
+        s += "task corta(x)\n    when x == 7\n        stop\n    give 1\n";
         s += "let acc be 0\nlet facc be 0.0\nlet cnt be 0\n";
         let bound = 3 + self.rng.below(30);
         let over_list = self.rng.chance(35);
@@ -559,7 +561,14 @@ impl DGen {
         // escribir (copy-on-write), anidadas, con claves de texto y en un mapa en modo diccionario,
         // índices negativos o fuera de rango, claves que faltan, y `append` en el lugar.
         if self.rng.chance(40) {
-            let w = match self.rng.below(11) {
+            let w = match self.rng.below(16) {
+                // F4.8d2: llamadas ajenas en cada vuelta: builtins, una task que escribe una global que el
+                // bucle tiene en un registro, un `stop` desde una task, un error dentro de un builtin.
+                11 => "    set out to append(out, text(i))\n".to_string(),
+                12 => "    set cnt to cnt + get(m, keys[i % 4], 0)\n".to_string(),
+                13 => "    set acc to acc + bump(i)\n    set cnt to cnt + hits\n".to_string(),
+                14 => "    set acc to acc + corta(i)\n".to_string(),
+                15 => "    when i == 5\n        set facc to facc + min(xs)\n".to_string(),
                 0 => "    set xs[i % n] to xs[i % n] + 1\n".to_string(),
                 1 => format!("    set xs[{}] to i\n", ["0", "-1", "i % n - n", "i + 3"][self.rng.below(4)]),
                 2 => "    let snap be recs[i % 4]\n    set recs[i % 4].x to i\n    set facc to facc + snap.x * 1.0\n".to_string(),
@@ -575,6 +584,18 @@ impl DGen {
             };
             lp += &w;
         }
+        // F4.8d2: una llamada ajena en cada vuelta, aparte de las escrituras (`get` es un intrínseco:
+        // no lo es con una clave que no es texto ni un `Int`).
+        if self.rng.chance(50) {
+            lp += match self.rng.below(6) {
+                0 => "    set out to append(out, text(i))\n",
+                1 => "    set acc to acc + bump(i)\n    set cnt to cnt + hits\n",
+                2 => "    set acc to acc + corta(i)\n",
+                3 => "    when i == 5\n        set facc to facc + min(xs)\n",
+                4 => "    set cnt to cnt + length(join([text(i), \"x\"], \"-\"))\n",
+                _ => "    set cnt to cnt + get(m, 1.5, 2)\n",
+            };
+        }
         if self.rng.chance(15) {
             lp += "    when acc > 20\n        stop\n";
         }
@@ -588,7 +609,7 @@ impl DGen {
         } else {
             s += &lp;
         }
-        s += "print([acc, facc, cnt, xs, alias, recs, m, grid, length(out), guard, big[\"k3\"]])\n";
+        s += "print([acc, facc, cnt, xs, alias, recs, m, grid, length(out), guard, big[\"k3\"], hits])\n";
         s += "print(steps())\n";
         s
     }
@@ -719,13 +740,14 @@ fn check_with_osr(seed: u64, count: usize, tasks: bool, osr: bool, mut program: 
     }
     let after = native_tier::stats();
     eprintln!(
-        "fuzz: {} programas ({} terminan en error), {} unidades, {} entradas, {} salidas a la VM, {} entradas a bucles",
+        "fuzz: {} programas ({} terminan en error), {} unidades, {} entradas, {} salidas a la VM, {} entradas a bucles ({} con llamadas ajenas)",
         count,
         errors,
         after.units - before.units,
         after.entries - before.entries,
         after.deopts - before.deopts,
-        after.osr - before.osr
+        after.osr - before.osr,
+        after.foreign - before.foreign
     );
     assert!(failures.is_empty(), "{} programa(s) dan distinto en nativo:\n\n{}", failures.len(), failures.join("\n\n"));
     // Un generador que arma programas que fallan todos no prueba nada (pasó: un builtin que no está
@@ -769,14 +791,23 @@ fn native_matches_the_reference_on_many_float_programs() {
 #[test]
 fn native_matches_the_reference_on_data_programs() {
     let mut g = DGen { rng: Rng(0x5eed_f4_7b) };
-    check_with(0x5eed_f4_7b, 200, false, move || g.program());
+    check_data(0x5eed_f4_7b, 200, move || g.program());
+}
+
+/// Como `check_with`, y los bucles con llamadas ajenas (F4.8d2) entran de verdad al código nativo: uno
+/// que no compila corre en la VM y da lo mismo (pasó: sin las lecturas declaradas no compilaba ninguno).
+fn check_data(seed: u64, count: usize, program: impl FnMut() -> String) {
+    let before = native_tier::stats().foreign;
+    check_with(seed, count, false, program);
+    let entered = native_tier::stats().foreign - before;
+    assert!(entered > count as u64 / 4, "los bucles con llamadas ajenas casi no entraron al código nativo: {} de {} programas", entered, count);
 }
 
 #[test]
 #[ignore]
 fn native_matches_the_reference_on_many_data_programs() {
     let mut g = DGen { rng: Rng(0xf4_7b_0000_0001) };
-    check_with(0xf4_7b_0000_0001, 3000, false, move || g.program());
+    check_data(0xf4_7b_0000_0001, 3000, move || g.program());
 }
 
 /// F4.8b: programas cuyos builtins llaman funciones (lambdas y tasks, a la VM o al código nativo desde

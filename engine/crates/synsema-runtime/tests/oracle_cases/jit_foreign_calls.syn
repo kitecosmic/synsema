@@ -1,0 +1,116 @@
+-- F4.8d2: llamadas ajenas desde un bucle en nativo (builtins que no son intrínsecos, tasks que
+-- escriben globales, lambdas): el nivel nativo deja en la VM las globales que tiene en registros, la
+-- VM corre la instrucción y el bucle recarga lo que pudo cambiar. Un `stop` desde la llamada, un
+-- error (dentro de `try`: lo que ya se escribió queda) y los pasos siguen siendo los de la VM.
+
+let total be 0
+let hits be 0
+task bump(x)
+    set hits to hits + 1
+    set total to total + x
+    give (x + hits) % 5
+
+let acc be 0
+each i in range(0, 2000)
+    set acc to acc + bump(i) + length(text(i))
+print(acc, total, hits, steps())
+
+-- Una task que cambia la lista que el bucle también escribe.
+let xs be range(0, 10)
+task tocar(k)
+    set xs[k % 10] to xs[k % 10] * 2
+    give xs[k % 10]
+let s be 0
+each i in range(0, 300)
+    set xs[i % 10] to xs[i % 10] + 1
+    set s to s + tocar(i) % 7
+print(xs, s)
+
+-- Lambdas y builtins con listas: el bucle sigue con los valores prestados que recargó.
+let words be ["uno", "dos", "tres", "cuatro"]
+let cuenta be {}
+each i in range(0, 400)
+    let w be words[i % 4]
+    let n be count_where(split(w, ""), (c) => c == "o")
+    set cuenta[w] to get(cuenta, w, 0) + n
+print(cuenta)
+
+-- Un `stop` que sale de la task corta sólo la task; uno en el cuerpo, el bucle.
+task hasta(n)
+    let k be 0
+    while true
+        set k to k + 1
+        when k >= n
+            stop
+    give k
+let t be 0
+each i in range(0, 500)
+    set t to t + hasta(i % 4 + 1)
+    when t > 1500
+        stop
+print(t, steps())
+
+-- Un error en la task a mitad del bucle, dentro de `try`: lo que ya se escribió queda.
+let visto be 0
+task frag(x)
+    set visto to visto + 1
+    give 100 % (x - 377)
+let r be 0
+try
+    each i in range(0, 1000)
+        set r to r + frag(i)
+recover e
+    print(e)
+print(r, visto, steps())
+
+-- Un error de un builtin (una clave que falta).
+let m be {"a": 1}
+let q be 0
+try
+    each i in range(0, 50)
+        set q to q + get(m, "a", 0)
+        when i == 31
+            set q to q + m.zz
+recover e
+    print(e)
+print(q)
+
+-- Recursión desde el bucle.
+task fib(n)
+    when n < 2
+        give n
+    give fib(n - 1) + fib(n - 2)
+let f be 0
+each i in range(0, 60)
+    set f to f + fib(i % 15)
+print(f, steps())
+
+-- El error dentro de una task con `try` alrededor del bucle: los locales que el bucle cambió quedan.
+task con_locales()
+    let acc be 0
+    let n be 0
+    let ys be [0, 0, 0]
+    try
+        each i in range(0, 1000)
+            set acc to acc + i * 2
+            set ys[i % 3] to ys[i % 3] + 1
+            set n to n + frag(i)
+    recover e
+        print(e)
+    give [acc, n, ys]
+print(con_locales(), steps())
+
+-- Un `stop` que viene de la llamada ajena dentro de un `while` de una task.
+task corta(k)
+    when k == 40
+        stop
+    give k
+task bucle()
+    let s be 0
+    let k be 0
+    while k < 100
+        set s to s + k
+        set k to k + 1
+        set s to s + corta(k)
+    give [s, k]
+print(bucle(), steps())

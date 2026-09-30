@@ -2875,10 +2875,12 @@ impl Interpreter {
                         }
                     }
                     pc = to as usize;
+                    let mut r = Ok(());
                     if chunk.loops[lp as usize].tick() {
                         match self.vm_loop_hot(&chunk, &env, base, iter_base, at, lp) {
                             native::OsrStep::Stay => {}
                             native::OsrStep::Exit(p) => pc = p,
+                            native::OsrStep::Fail(c) => r = Err(c),
                             native::OsrStep::Resume { r, pc: back, dst: rdst } => {
                                 // Salió a mitad de una llamada: este frame espera su resultado
                                 // (como en `CallNative`) y la VM sigue en el de más adentro.
@@ -2901,7 +2903,7 @@ impl Interpreter {
                             }
                         }
                     }
-                    Ok(())
+                    r
                 }
                 Ins::JumpIfFalsy { src, to } => self.opnd(&chunk, &env, base, src, at).map(|v| {
                     if !v.is_truthy() {
@@ -4471,6 +4473,68 @@ impl Interpreter {
             }
             Root::Slow => return None,
         })
+    }
+}
+
+impl Interpreter {
+    /// F4.8d2: una instrucción de un bucle, corrida por el host de su código nativo sobre el frame del
+    /// bucle (los argumentos ya en sus registros): una llamada (hasta que vuelve: el cuerpo de una
+    /// task corre en un despacho propio, con el mismo epílogo que el `give` de la VM), un `LoadGlobal`
+    /// o un `CheckProtected`.
+    #[cfg(feature = "native-tier")]
+    #[inline(never)]
+    pub(super) fn vm_exec_one(&mut self, chunk: &Rc<Chunk>, env: &Rc<RefCell<Environment>>, base: usize, at: usize) -> Result<(), Control> {
+        match chunk.code[at].get() {
+            Ins::LoadGlobal { dst, name, ic } => {
+                let v = env.borrow().bindings.get_cached(&chunk.names[name as usize], &chunk.ics[ic as usize]).cloned();
+                match v {
+                    Some(v) => {
+                        self.put(base, dst, v);
+                        Ok(())
+                    }
+                    None => self.vm_load_name(chunk, env, base, dst, name, ic, at),
+                }
+            }
+            Ins::CheckProtected { func, name } => {
+                check_protected_callee(&chunk.names[name as usize], &self.vm_regs[base + func as usize], &chunk.locs[chunk.loc[at] as usize])
+            }
+            Ins::CallBuiltin { dst, func, args, n, site } => match self.vm_call_builtin(chunk, base, at, dst, func, args, n, site)? {
+                true => Ok(()),
+                // Ya no es un builtin (volvió a ser `Call`): la llamada de siempre.
+                false => self.vm_exec_call(chunk, base, at, dst, func, args, n, site),
+            },
+            Ins::Call { dst, func, args, n, site } | Ins::CallNative { dst, func, args, n, site } => {
+                self.vm_exec_call(chunk, base, at, dst, func, args, n, site)
+            }
+            other => unreachable!("el host no corre {:?}", other),
+        }
+    }
+
+    /// Una llamada de la VM hasta que vuelve (ver `vm_exec_one`).
+    #[cfg(feature = "native-tier")]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_exec_call(&mut self, chunk: &Rc<Chunk>, base: usize, at: usize, dst: Reg, func: Reg, args: Reg, n: u16, site: u32) -> Result<(), Control> {
+        let Some(enter) = self.vm_call(chunk, base, at, dst, func, args, n, site)? else { return Ok(()) };
+        let Enter { code, env: call_env, base: cbase, lbase, top } = enter;
+        let saved = std::mem::replace(&mut self.vm_lbase, lbase);
+        let r = self.run_chunk_at(&code, &call_env, cbase);
+        // El epílogo de una llamada de la VM (el `give` del despacho, también por el camino de error).
+        if code.regframe {
+            drop(call_env);
+        } else {
+            self.release_frame(call_env);
+        }
+        self.vm_locals.truncate(lbase);
+        self.vm_lbase = saved;
+        self.recursion_depth -= 1;
+        self.vm_pop_regs((cbase, code.nregs), top);
+        match r {
+            Ok(v) | Err(Control::Give(v)) => {
+                self.put(base, dst, v);
+                Ok(())
+            }
+            Err(c) => Err(c),
+        }
     }
 }
 

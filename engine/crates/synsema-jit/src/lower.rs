@@ -31,7 +31,7 @@ use cranelift_codegen::isa::TargetFrontendConfig;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use synsema_core::native_tier::{NArith, NBuiltin, NCall, NCmp, NConst, NFArith, NFunc, NIns, NOpnd, NSeen, NUnary, NUnit, Place, Reg, DISCARD};
 // Las etiquetas (las comparte core: sus lecturas las devuelven).
-pub(crate) use synsema_core::native_tier::{TAG_BOOL, TAG_FLOAT, TAG_HOLE, TAG_INT, TAG_LIST, TAG_MAP, TAG_MISS, TAG_NOTHING, TAG_OTHER};
+pub(crate) use synsema_core::native_tier::{TAG_ABSENT, TAG_BOOL, TAG_FLOAT, TAG_HOLE, TAG_INT, TAG_LIST, TAG_MAP, TAG_MISS, TAG_NOTHING, TAG_OTHER};
 
 use crate::abi::{OFF_CANCEL, OFF_DEPTH, OFF_MAX_DEPTH, OFF_OUT_BITS, OFF_OUT_PTR, OFF_STATUS, OFF_STEPS};
 
@@ -45,7 +45,54 @@ pub(crate) struct Helpers {
     pub reads: Option<Reads>,
     /// F4.8d: las escrituras, sólo en un bucle que escribe (`has_writes`).
     pub writes: Option<Writes>,
+    /// F4.8d2: el host, sólo en un bucle con llamadas ajenas (`has_foreign`).
+    pub host: Option<HostFns>,
 }
+
+/// Lo que el código generado le pide al host (F4.8d2).
+#[derive(Clone, Copy)]
+pub(crate) struct HostFns {
+    /// `(ctx, sitio, etiquetas, bits, punteros) -> 0/1/2`: corre la instrucción del sitio (ver
+    /// `ExecSite`); 0 siguió, 1 un `stop` cortó el bucle, 2 un error.
+    pub exec: ir::FuncRef,
+    /// `(ctx, lugar, v) -> dirección`: un valor prestado pasa a su lugar (por el host: después de una
+    /// llamada ajena las direcciones de la entrada ya no valen).
+    pub home: ir::FuncRef,
+}
+
+/// F4.8d2: una instrucción que corre el host: dónde está, cuántos argumentos le pasa el código (en los
+/// búferes, antes de las globales, si las pasa) y qué lugares le devuelve después, en orden.
+#[derive(Clone, Debug)]
+pub(crate) struct ExecSite {
+    pub pc: u32,
+    pub nargs: u16,
+    pub globals: u16,
+    pub reload: Vec<Place>,
+}
+
+/// Cómo vuelve un lugar después de una llamada ajena.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reload {
+    /// Entero (el resultado, una global: el código ajeno puede haberla cambiado).
+    Full,
+    /// Sólo su dirección, si tiene caja (un valor en su lugar que no cambió, pero la memoria se movió).
+    Ptr,
+    /// La lista de un iterador.
+    Iter,
+}
+
+/// Un lugar como número para el host (`(clase << 32) | índice`: registro 0, ventana 1, global 2).
+pub(crate) fn place_code(p: Place) -> i64 {
+    match p {
+        Place::Reg(r) => i64::from(r),
+        Place::Local(k) => (1i64 << 32) | i64::from(k),
+        Place::Global(g) => (2i64 << 32) | i64::from(g),
+        Place::Iter(it, _) => (3i64 << 32) | i64::from(it),
+    }
+}
+
+/// La etiqueta de un argumento que ya está en su registro (una función que cargó la VM).
+pub(crate) const TAG_KEEP: i64 = -1;
 
 /// Las escrituras de `abi` (F4.8d). Cada una devuelve 0 si no la hace (el código sale a la VM antes
 /// de la instrucción).
@@ -65,6 +112,7 @@ pub(crate) struct Writes {
     pub append: ir::FuncRef,
 }
 
+
 /// Las lecturas de valores con caja de `abi` (F4.7b).
 #[derive(Clone, Copy)]
 pub(crate) struct Reads {
@@ -80,11 +128,22 @@ pub(crate) struct Reads {
     pub truthy: ir::FuncRef,
     /// `(ctx, v) -> largo` (-1 si no tiene: sale): `length(v)` (F4.7c).
     pub length: ir::FuncRef,
+    /// `(ctx, obj, idx_tag, idx_bits, idx_ptr) -> tag`: `get(obj, idx, …)` (F4.8d2; `TAG_ABSENT`: el
+    /// default).
+    pub get: ir::FuncRef,
 }
 
 impl Helpers {
     /// Qué argumentos de cada función son punteros (para `check_pointers`), y si devuelve uno.
     fn pointer_args(&self, f: ir::FuncRef) -> Option<(&'static [usize], bool)> {
+        if let Some(hf) = self.host {
+            if f == hf.home {
+                return Some((&[2], true));
+            } else if f == hf.exec {
+                // Los búferes son ranuras propias (se verifican aparte: ver `check_pointers`).
+                return Some((&[], false));
+            }
+        }
         if let Some(w) = self.writes {
             if f == w.home || f == w.home_local {
                 return Some((&[1, 2], true));
@@ -120,12 +179,19 @@ pub(crate) fn has_boxed(unit: &NUnit, i: usize, plan: &Plan) -> bool {
         || plan.inputs.iter().any(|(_, s)| boxed_seen(*s))
         || unit.funcs[i].params.iter().any(|s| boxed_seen(*s))
         || unit.funcs[i].globals.iter().any(|s| boxed_seen(*s))
+        // F4.8d2: lo que devuelve una llamada ajena puede tener caja.
+        || has_foreign(unit, i)
 }
 
 /// F4.8d: si la función es un bucle que escribe (un `set` con camino, `append` en el lugar): entonces
 /// declara las escrituras y lo prestado que cruza una escritura pasa antes a su lugar.
 pub(crate) fn has_writes(unit: &NUnit, i: usize) -> bool {
     unit.funcs[i].code.iter().any(|ins| matches!(ins, NIns::PathRoot { .. } | NIns::PathStep { .. } | NIns::PathSet { .. } | NIns::AppendPush { .. }))
+}
+
+/// F4.8d2: si la función es un bucle con llamadas ajenas (entonces corre con un host).
+pub(crate) fn has_foreign(unit: &NUnit, i: usize) -> bool {
+    unit.funcs[i].code.iter().any(|ins| matches!(ins, NIns::LoadForeign { .. } | NIns::CheckForeign { .. }))
 }
 
 /// Un valor con caja que entra prestado (la dirección de donde vive).
@@ -161,6 +227,9 @@ pub(crate) enum Kind {
     /// adentro de un contenedor) que el paso siguiente abre o la hoja escribe. Al salir, se clona (la
     /// VM tiene ahí una copia del contenedor).
     Cursor,
+    /// F4.8d2: un valor que tiene la VM en el registro (una función que cargó el host para una
+    /// llamada ajena); el código nativo no lo lee.
+    Foreign,
     /// Según el camino, distinto: no se puede usar.
     Top,
 }
@@ -237,7 +306,7 @@ fn static_tag(k: Kind) -> Option<i64> {
         Kind::Int => TAG_INT,
         Kind::Float => TAG_FLOAT,
         Kind::Bool => TAG_BOOL,
-        Kind::Callee(_) | Kind::RangeFn | Kind::Builtin(_) => TAG_OTHER,
+        Kind::Callee(_) | Kind::RangeFn | Kind::Builtin(_) | Kind::Foreign => TAG_OTHER,
         _ => return None,
     })
 }
@@ -310,6 +379,10 @@ pub(crate) struct Plan {
     pub homes_at: Vec<Vec<usize>>,
     pub homes: Vec<Place>,
     pub prov: Vec<Option<Vec<Option<usize>>>>,
+    /// F4.8d2: las instrucciones que corre el host (en el orden de los sitios del código).
+    pub exec_sites: Vec<ExecSite>,
+    /// F4.8d2: los búferes de esos sitios (las ranuras de punteros se verifican en `check_pointers`).
+    pub exec_ptr_slots: Vec<StackSlot>,
 }
 
 impl Plan {
@@ -608,6 +681,56 @@ impl<'u> Func<'u> {
                 Next::Fall
             }
             // F4.7c: un builtin intrínseco (un argumento; si no, el error lo arma la VM).
+            // F4.8d2: una llamada ajena (la corre la VM entera, por el host): los argumentos, valores o una
+            // función que cargó la VM; después, lo que devuelve es cualquier cosa, los registros desde
+            // los argumentos quedan vacíos (la ventana del llamado) y las globales del bucle pueden haber
+            // cambiado (el código ajeno las ve): pasan a `Any`.
+            NIns::Call { dst, func, args, n } if st[func as usize] == Kind::Foreign => {
+                for k in 0..n as usize {
+                    let a = st[args as usize + k];
+                    if value_kind(a).is_none() && !matches!(a, Kind::Foreign | Kind::Bot) {
+                        return Err(());
+                    }
+                }
+                st[func as usize] = Kind::Nothing;
+                for r in args as usize..self.nregs {
+                    st[r] = Kind::Nothing;
+                }
+                for g in 0..self.f.nglobals {
+                    let v = self.global_var(g);
+                    if st[v] != Kind::Bot {
+                        st[v] = join(st[v], Kind::Any(false));
+                    }
+                }
+                set(st, dst, Kind::Any(false));
+                Next::Fall
+            }
+            NIns::Call { dst, func, args, n } if st[func as usize] == Kind::Builtin(NBuiltin::Get) => {
+                // F4.8d2: `get(c, k)`/`get(c, k, d)`: una colección que puede ser un mapa o una lista y
+                // una clave que puede ser un texto o un `Int` (lo demás lo hace la VM: sale siempre).
+                // El default es un valor que el código representa.
+                let mut ks = Vec::with_capacity(n as usize);
+                for k in 0..n as usize {
+                    ks.push(read(st[args as usize + k], trap)?);
+                }
+                if *trap {
+                    return Ok(Next::Stop);
+                }
+                let bad = !(2..=3).contains(&n)
+                    || !matches!(ks[0], Kind::Any(_) | Kind::Bot)
+                    || !matches!(ks[1], Kind::Any(_) | Kind::Int | Kind::Bot)
+                    || ks.get(2).is_some_and(|k| value_kind(*k).is_none() || *k == Kind::Undef);
+                if bad {
+                    *trap = true;
+                    return Ok(Next::Stop);
+                }
+                st[func as usize] = Kind::Nothing;
+                for k in 0..n as usize {
+                    st[args as usize + k] = Kind::Nothing;
+                }
+                set(st, dst, if ks.contains(&Kind::Bot) { Kind::Bot } else { Kind::Any(false) });
+                Next::Fall
+            }
             NIns::Call { dst, func, args, n } if matches!(st[func as usize], Kind::Builtin(_)) => {
                 let Kind::Builtin(w) = st[func as usize] else { unreachable!("intrínseco") };
                 let k = if n == 1 { st[args as usize] } else { Kind::Undef };
@@ -880,6 +1003,18 @@ impl<'u> Func<'u> {
                     }
                     st[c as usize] = Kind::Nothing;
                     set(st, dst, read_kind(k));
+                }
+                Next::Fall
+            }
+            NIns::LoadForeign { dst } => {
+                set(st, dst, Kind::Foreign);
+                Next::Fall
+            }
+            NIns::CheckForeign { func } => {
+                match st[func as usize] {
+                    Kind::Foreign => {}
+                    Kind::Bot => return Ok(Next::Stop),
+                    _ => return Err(()),
                 }
                 Next::Fall
             }
@@ -1162,6 +1297,14 @@ impl<'u> Func<'u> {
                 dst(&mut defs, d);
                 fall
             }
+            NIns::LoadForeign { dst: d } => {
+                dst(&mut defs, d);
+                fall
+            }
+            NIns::CheckForeign { func } => {
+                uses.push(func as usize);
+                fall
+            }
             NIns::AppendPush { dst: d, func, args, root } => {
                 uses.extend([func as usize, args as usize, args as usize + 1]);
                 uses.extend(self.opnd_var(root));
@@ -1213,14 +1356,38 @@ impl<'u> Func<'u> {
 type Prov = Vec<Option<usize>>;
 
 impl Func<'_> {
-    /// Si la instrucción escribe: lo prestado que la cruza tiene que tener dueño antes.
-    fn clobbers(&self, pc: usize) -> bool {
-        matches!(self.f.code[pc], NIns::PathRoot { .. } | NIns::PathStep { .. } | NIns::PathSet { .. } | NIns::AppendPush { .. })
+    /// Si la instrucción escribe (F4.8d) o es una llamada ajena (F4.8d2): lo prestado que la cruza tiene
+    /// que tener dueño antes.
+    fn clobbers(&self, pc: usize, st: &[Kind]) -> bool {
+        matches!(self.f.code[pc], NIns::PathRoot { .. } | NIns::PathStep { .. } | NIns::PathSet { .. } | NIns::AppendPush { .. }) || self.foreign_call(pc, st)
+    }
+
+    /// F4.8d2: una llamada ajena.
+    fn foreign_call(&self, pc: usize, st: &[Kind]) -> bool {
+        matches!(self.f.code[pc], NIns::Call { func, .. } if st[func as usize] == Kind::Foreign)
     }
 
     /// La procedencia después de la instrucción `pc` (sin lo que pasa a su lugar antes de ella).
-    fn prov_step(&self, pc: usize, cur: &mut Prov) {
+    fn prov_step(&self, pc: usize, st: &[Kind], cur: &mut Prov) {
         let (_, defs, _) = self.uses_defs(pc);
+        // F4.8d2: después de una llamada ajena el resultado está en su registro y las globales en su
+        // lugar (el host las devuelve con sus direcciones nuevas).
+        if let (true, NIns::Call { dst, args, .. }) = (self.foreign_call(pc, st), self.f.code[pc]) {
+            for d in defs {
+                cur[d] = None;
+            }
+            for r in args as usize..self.nregs {
+                cur[r] = None;
+            }
+            for g in 0..self.f.nglobals {
+                let v = self.global_var(g);
+                cur[v] = Some(v);
+            }
+            if dst != DISCARD {
+                cur[dst as usize] = Some(dst as usize);
+            }
+            return;
+        }
         let of = |cur: &Prov, o: NOpnd| self.opnd_var(o).and_then(|v| cur[v]);
         let (target, p): (Vec<usize>, Option<usize>) = match self.f.code[pc] {
             NIns::Move { dst, src } => (if dst != DISCARD { vec![dst as usize] } else { Vec::new() }, of(cur, src)),
@@ -1267,7 +1434,7 @@ impl Func<'_> {
         );
         let homed = |pc: usize, cur: &Prov| -> Vec<usize> {
             let Some(st) = &state[pc] else { return Vec::new() };
-            if trap[pc] || !self.clobbers(pc) {
+            if trap[pc] || !self.clobbers(pc, st) {
                 return Vec::new();
             }
             // Lo que la escritura misma consume (el primer argumento de `append`, el valor y el índice
@@ -1287,7 +1454,7 @@ impl Func<'_> {
             for v in homed(pc, &cur) {
                 cur[v] = Some(v);
             }
-            self.prov_step(pc, &mut cur);
+            self.prov_step(pc, state[pc].as_ref().expect("estado"), &mut cur);
             for s in self.uses_defs(pc).2 {
                 if s >= n || state[s].is_none() {
                     continue;
@@ -1318,8 +1485,13 @@ impl Func<'_> {
             let Some(cur) = &prov[pc] else { continue };
             homes_at[pc] = homed(pc, cur);
             // Un iterador de una lista armado en el bucle, vivo al escribir: no tiene su propia cuenta.
-            if let (Some(st), true) = (&state[pc], self.clobbers(pc) && !trap[pc]) {
-                if (0..self.nvars).any(|v| live[pc][v] && st[v] == Kind::ListBody && cur[v] != Some(v)) {
+            if let Some(st) = &state[pc] {
+                if self.clobbers(pc, st) && !trap[pc] && (0..self.nvars).any(|v| live[pc][v] && st[v] == Kind::ListBody && cur[v] != Some(v)) {
+                    return None;
+                }
+                // F4.8d2: el cursor de un `set` con camino que cruza una llamada ajena (la memoria se
+                // puede mover): no.
+                if self.foreign_call(pc, st) && !trap[pc] && pc + 1 < n && (0..self.nvars).any(|v| live[pc + 1][v] && st[v] == Kind::Cursor) {
                     return None;
                 }
             }
@@ -1458,7 +1630,7 @@ pub(crate) fn plan(unit: &NUnit) -> Option<Vec<Plan>> {
         }
         // F4.8d: un bucle que escribe: qué pasa a su lugar antes de cada escritura.
         let (mut homes_at, mut homes, mut prov) = (vec![Vec::new(); f.f.code.len()], Vec::new(), vec![None; f.f.code.len()]);
-        if f.f.osr.is_some() && (0..f.f.code.len()).any(|pc| f.clobbers(pc) && state[pc].is_some() && !trap[pc]) {
+        if f.f.osr.is_some() && (0..f.f.code.len()).any(|pc| state[pc].as_ref().is_some_and(|st| f.clobbers(pc, st)) && !trap[pc]) {
             let (h, p) = f.provenance(&state, &trap, &live)?;
             let mut hv: Vec<usize> = h.iter().flatten().copied().collect();
             hv.sort_unstable();
@@ -1467,14 +1639,33 @@ pub(crate) fn plan(unit: &NUnit) -> Option<Vec<Plan>> {
             if hv.iter().any(|v| matches!(f.place_of(*v), Place::Iter(..))) {
                 return None;
             }
-            homes = hv.into_iter().map(|v| f.place_of(v)).collect();
+            // F4.8d2: con llamadas ajenas, el host pone lo prestado en su lugar (sin direcciones de la
+            // entrada, que una llamada invalida).
+            if !f.f.code.iter().any(|i| matches!(i, NIns::LoadForeign { .. } | NIns::CheckForeign { .. })) {
+                homes = hv.into_iter().map(|v| f.place_of(v)).collect();
+            }
             homes_at = h;
             prov = p;
             if inputs.len() + homes.len() > MAX_INPUTS {
                 return None;
             }
         }
-        plans.push(Plan { state, live, trap, ret, params, points: Vec::new(), inputs, ptr_params: Vec::new(), ptr_slots: Vec::new(), homes_at, homes, prov });
+        plans.push(Plan {
+            state,
+            live,
+            trap,
+            ret,
+            params,
+            points: Vec::new(),
+            inputs,
+            ptr_params: Vec::new(),
+            ptr_slots: Vec::new(),
+            homes_at,
+            homes,
+            prov,
+            exec_sites: Vec::new(),
+            exec_ptr_slots: Vec::new(),
+        });
     }
     Some(plans)
 }
@@ -1622,10 +1813,17 @@ impl Vars<'_> {
         }
     }
 
+    /// Un valor sin caja: si la variable también tiene punteros, el suyo pasa a 0 (las lecturas de un
+    /// `Any` —`length`, índices, propiedades— miran el puntero, no la etiqueta: uno viejo sería el de
+    /// un valor que quizás ya no existe).
     fn put_tag(&self, b: &mut FunctionBuilder, v: usize, t: i64) {
         if self.need[v].tag {
             let x = b.ins().iconst(I64, t);
             b.def_var(self.p[v].tag, x);
+        }
+        if self.need[v].ptr {
+            let z = b.ins().iconst(I64, 0);
+            b.def_var(self.p[v].ptr, z);
         }
     }
 
@@ -2144,6 +2342,11 @@ pub(crate) fn build(
 
     let mut points: Vec<Point> = Vec::new();
     let mut exits: Vec<Exit> = Vec::new();
+    // F4.8d2: las instrucciones que corre el host, sus ranuras de punteros y la salida de un error de una
+    // llamada ajena (sin valores: el entorno ya tiene lo suyo y el frame se desarma con el error).
+    let mut exec_sites: Vec<ExecSite> = Vec::new();
+    let mut exec_ptr_slots: Vec<StackSlot> = Vec::new();
+    let mut fail_block: Option<Block> = None;
     // Salida "antes de pc" (una por instrucción) y "después de la llamada en pc".
     let mut before: HashMap<usize, Block> = HashMap::new();
     let mut after_call: HashMap<usize, Block> = HashMap::new();
@@ -2211,7 +2414,7 @@ pub(crate) fn build(
         }
         // F4.8d: antes de una escritura, lo prestado que la cruza pasa a su lugar en la VM (su propia
         // cuenta, como en la VM): si tiene caja, una copia en su lugar, y su puntero pasa a ser ése.
-        if let Some(w) = h.writes {
+        if h.writes.is_some() || h.host.is_some() {
             for &v in &plan.homes_at[pc] {
                 let t = b.use_var(vs.p[v].tag);
                 let boxed = b.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, t, TAG_LIST);
@@ -2221,9 +2424,20 @@ pub(crate) fn build(
                 b.seal_block(call);
                 b.switch_to_block(call);
                 let src = b.use_var(vs.p[v].ptr);
-                let slot = *home_param.get(&v)?;
-                let hf = if matches!(f.place_of(v), Place::Local(_)) { w.home_local } else { w.home };
-                let r = b.ins().call(hf, &[ctx, slot, src]);
+                let r = match h.host {
+                    // F4.8d2: con llamadas ajenas, por el host (las direcciones de la entrada no valen
+                    // después de una llamada).
+                    Some(hf) => {
+                        let pc_ = b.ins().iconst(I64, place_code(f.place_of(v)));
+                        b.ins().call(hf.home, &[ctx, pc_, src])
+                    }
+                    None => {
+                        let w = h.writes?;
+                        let slot = *home_param.get(&v)?;
+                        let hf = if matches!(f.place_of(v), Place::Local(_)) { w.home_local } else { w.home };
+                        b.ins().call(hf, &[ctx, slot, src])
+                    }
+                };
                 let r = b.inst_results(r)[0];
                 b.def_var(vs.p[v].ptr, r);
                 b.ins().jump(join, &[]);
@@ -2529,7 +2743,125 @@ pub(crate) fn build(
                     vs.put_other(&mut b, dst as usize);
                 }
             }
-            NIns::Call { dst, func: freg, args, .. } if matches!(st[freg as usize], Kind::Builtin(_)) => {
+            NIns::LoadForeign { .. } | NIns::CheckForeign { .. } => {
+                // F4.8d2: la corre el host (sin argumentos ni globales, no devuelve nada al código).
+                let hf = h.host?;
+                let si = b.ins().iconst(I64, exec_sites.len() as i64);
+                exec_sites.push(ExecSite { pc: pc as u32, nargs: 0, globals: 0, reload: Vec::new() });
+                let z = b.ins().iconst(I64, 0);
+                let r = b.ins().call(hf.exec, &[ctx, si, z, z, z]);
+                let r = b.inst_results(r)[0];
+                let fb = fail_exit(&mut b, &mut fail_block, &mut points, &mut exits, pc);
+                let bad = b.ins().icmp_imm_s(IntCC::Equal, r, 2);
+                exit_if(&mut b, bad, fb);
+            }
+            NIns::Call { dst, func: freg, args, n: na } if st[freg as usize] == Kind::Foreign => {
+                // F4.8d2: una llamada ajena. Lo prestado vivo ya tiene dueño (arriba); los argumentos y
+                // las globales van al host en los búferes; lo corre la VM entera; vuelven el resultado,
+                // las globales y las direcciones nuevas de lo que sigue vivo (la memoria se pudo mover).
+                let hf = h.host?;
+                let ng = f.f.nglobals;
+                let after = plan.state.get(pc + 1).and_then(|x| x.as_ref())?;
+                let live_after = &plan.live[pc + 1];
+                let mut reload: Vec<(usize, Reload)> = Vec::new();
+                if dst != DISCARD {
+                    reload.push((dst as usize, Reload::Full));
+                }
+                for g in 0..ng {
+                    reload.push((f.global_var(g), Reload::Full));
+                }
+                for v in 0..f.nvars {
+                    if v == dst as usize || (v >= args as usize && v < f.nregs) || matches!(f.place_of(v), Place::Global(_)) || !live_after[v] {
+                        continue;
+                    }
+                    match (st[v], after[v]) {
+                        (Kind::Any(_), Kind::Any(_)) => reload.push((v, Reload::Ptr)),
+                        (Kind::ListBody, Kind::ListBody) => reload.push((v, Reload::Iter)),
+                        _ => {}
+                    }
+                }
+                let nflush = na as usize + ng as usize;
+                let size = nflush.max(reload.len()).max(1) as u32;
+                let mk = |b: &mut FunctionBuilder| b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8 * size, 3));
+                let (ts, bs, ps) = (mk(&mut b), mk(&mut b), mk(&mut b));
+                exec_ptr_slots.push(ps);
+                let put = |b: &mut FunctionBuilder, k: usize, (t, x, p): (Value, Value, Value)| {
+                    b.ins().stack_store(I64, t, ts, 8 * k as i32);
+                    b.ins().stack_store(I64, x, bs, 8 * k as i32);
+                    b.ins().stack_store(I64, p, ps, 8 * k as i32);
+                };
+                for k in 0..na as usize {
+                    let a = NOpnd::Copy(args + k as u16);
+                    let parts = if st[args as usize + k] == Kind::Foreign {
+                        let z = b.ins().iconst(I64, 0);
+                        (b.ins().iconst(I64, TAG_KEEP), z, z)
+                    } else {
+                        vs.value_parts(&mut b, &st, a)
+                    };
+                    put(&mut b, k, parts);
+                }
+                for g in 0..ng {
+                    let o = NOpnd::Global(g);
+                    let parts = match f.opnd_kind(&st, o) {
+                        // Con caja: ya está en su lugar (dueño, arriba): puntero 0, el host no la toca.
+                        Kind::Any(_) => {
+                            let (t, x, _) = vs.value_parts(&mut b, &st, o);
+                            (t, x, b.ins().iconst(I64, 0))
+                        }
+                        k if value_kind(k).is_some() && k != Kind::Undef => vs.value_parts(&mut b, &st, o),
+                        _ => {
+                            let z = b.ins().iconst(I64, 0);
+                            (b.ins().iconst(I64, TAG_HOLE), z, z)
+                        }
+                    };
+                    put(&mut b, na as usize + g as usize, parts);
+                }
+                let si = b.ins().iconst(I64, exec_sites.len() as i64);
+                exec_sites.push(ExecSite { pc: pc as u32, nargs: na, globals: ng, reload: reload.iter().map(|(v, _)| f.place_of(*v)).collect() });
+                let (ta, ba, pa) = (b.ins().stack_addr(I64, ts, 0), b.ins().stack_addr(I64, bs, 0), b.ins().stack_addr(I64, ps, 0));
+                let r = b.ins().call(hf.exec, &[ctx, si, ta, ba, pa]);
+                let r = b.inst_results(r)[0];
+                let fb = fail_exit(&mut b, &mut fail_block, &mut points, &mut exits, pc);
+                let bad = b.ins().icmp_imm_s(IntCC::Equal, r, 2);
+                exit_if(&mut b, bad, fb);
+                // Lo que consumió la llamada (la función, la ventana del llamado).
+                vs.put_nothing(&mut b, freg as usize);
+                for v in args as usize..f.nregs {
+                    if v != dst as usize {
+                        vs.put_nothing(&mut b, v);
+                    }
+                }
+                let (ta, ba, pa) = (b.ins().stack_addr(I64, ts, 0), b.ins().stack_addr(I64, bs, 0), b.ins().stack_addr(I64, ps, 0));
+                for (k, (v, mode)) in reload.iter().enumerate() {
+                    let off = 8 * k as i32;
+                    let t = b.ins().load(I64, MemFlagsData::trusted(), ta, off);
+                    let x = b.ins().load(I64, MemFlagsData::trusted(), ba, off);
+                    let p = b.ins().load(I64, MemFlagsData::trusted(), pa, off);
+                    let pv = vs.p[*v];
+                    match mode {
+                        Reload::Full => {
+                            b.def_var(pv.tag, t);
+                            b.def_var(pv.bits, x);
+                            let fl = b.ins().bitcast(F64, MemFlagsData::new(), x);
+                            b.def_var(pv.f, fl);
+                            b.def_var(pv.ptr, p);
+                        }
+                        Reload::Ptr => {
+                            let old_t = b.use_var(pv.tag);
+                            let old_p = b.use_var(pv.ptr);
+                            let boxed = b.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, old_t, TAG_LIST);
+                            let np = b.ins().select(boxed, p, old_p);
+                            b.def_var(pv.ptr, np);
+                        }
+                        Reload::Iter => b.def_var(pv.ptr, p),
+                    }
+                }
+                // Un `stop` cortó el bucle (el host guardó adónde sigue la VM): sale después de la llamada.
+                let stop = b.ins().icmp_imm_s(IntCC::Equal, r, 1);
+                let ex = exit_before!(pc + 1);
+                exit_if(&mut b, stop, ex);
+            }
+            NIns::Call { dst, func: freg, args, n } if matches!(st[freg as usize], Kind::Builtin(_)) => {
                 // F4.7c: el builtin lo hace el código nativo. Lo observable de la llamada de la VM: la
                 // profundidad (un nivel, con el mismo tope: si lo pasaría, la VM da el error), y la
                 // función y el argumento salen de sus registros.
@@ -2593,6 +2925,62 @@ pub(crate) fn build(
                     }
                     // (En una llamada común sale a la VM: el análisis de tipos la marca.)
                     NBuiltin::Append => unreachable!("append fuera de AppendPush"),
+                    NBuiltin::Get => {
+                        // La lectura da el valor (prestado, como `x[i]`), `ABSENT` (el default, sin
+                        // ramas: `select` de sus cuatro partes) o `MISS` (sale antes: la VM lo hace).
+                        let (o, i) = (NOpnd::Copy(args), NOpnd::Copy(args + 1));
+                        let q = vs.ptr(&mut b, &st, o);
+                        let (it, ib, ip) = (vs.tag(&mut b, &st, i), vs.bits(&mut b, i), vs.ptr(&mut b, &st, i));
+                        let call = b.ins().call(h.reads?.get, &[ctx, q, it, ib, ip]);
+                        let rt = b.inst_results(call)[0];
+                        let miss = b.ins().icmp_imm_s(IntCC::Equal, rt, TAG_MISS);
+                        exit_if(&mut b, miss, ex);
+                        if dst != DISCARD {
+                            let (dt, dbits, df, dp) = if n == 3 {
+                                let dop = NOpnd::Copy(args + 2);
+                                match f.opnd_kind(&st, dop) {
+                                    Kind::Any(_) => {
+                                        let p = vs.var(dop).expect("un Any es una variable");
+                                        (b.use_var(p.tag), b.use_var(p.bits), b.use_var(p.f), b.use_var(p.ptr))
+                                    }
+                                    Kind::Float => {
+                                        let x = vs.float(&mut b, dop);
+                                        let t = b.ins().iconst(I64, TAG_FLOAT);
+                                        let xb = b.ins().bitcast(I64, MemFlagsData::new(), x);
+                                        let z = b.ins().iconst(I64, 0);
+                                        (t, xb, x, z)
+                                    }
+                                    _ => {
+                                        let (t, x, p) = vs.value_parts(&mut b, &st, dop);
+                                        let fl = b.ins().bitcast(F64, MemFlagsData::new(), x);
+                                        (t, x, fl, p)
+                                    }
+                                }
+                            } else {
+                                let t = b.ins().iconst(I64, TAG_NOTHING);
+                                let z = b.ins().iconst(I64, 0);
+                                let fl = b.ins().f64const(0.0);
+                                (t, z, fl, z)
+                            };
+                            let rbits = ctx_load(&mut b, ctx, OFF_OUT_BITS);
+                            let rptr = ctx_load(&mut b, ctx, OFF_OUT_PTR);
+                            let rf = b.ins().bitcast(F64, MemFlagsData::new(), rbits);
+                            let absent = b.ins().icmp_imm_s(IntCC::Equal, rt, TAG_ABSENT);
+                            let t = b.ins().select(absent, dt, rt);
+                            let x = b.ins().select(absent, dbits, rbits);
+                            let fl = b.ins().select(absent, df, rf);
+                            let p = b.ins().select(absent, dp, rptr);
+                            let d = dst as usize;
+                            b.def_var(vs.p[d].tag, t);
+                            b.def_var(vs.p[d].bits, x);
+                            b.def_var(vs.p[d].f, fl);
+                            b.def_var(vs.p[d].ptr, p);
+                        }
+                        vs.put_nothing(&mut b, freg as usize);
+                        for k in 0..n as usize {
+                            vs.put_nothing(&mut b, args as usize + k);
+                        }
+                    }
                     NBuiltin::Float => {
                         // `float(x)`: un número a f64, un `Bool` a 1.0/0.0 (sus bits son 1/0: la
                         // misma conversión que un entero).
@@ -2914,7 +3302,22 @@ pub(crate) fn build(
     plans[i].points = points;
     plans[i].ptr_params = ptr_params;
     plans[i].ptr_slots = ptr_slots;
+    plans[i].exec_sites = exec_sites;
+    plans[i].exec_ptr_slots = exec_ptr_slots;
     Some(())
+}
+
+/// F4.8d2: la salida de un error de una llamada ajena (una por función: sin valores; ver `build`).
+fn fail_exit(b: &mut FunctionBuilder, fail_block: &mut Option<Block>, points: &mut Vec<Point>, exits: &mut Vec<Exit>, pc: usize) -> Block {
+    if let Some(bl) = fail_block {
+        return *bl;
+    }
+    points.push(Point { pc: pc as u32, values: Vec::new(), call: None, planned: true });
+    let bl = b.create_block();
+    b.set_cold_block(bl);
+    exits.push(Exit { block: bl, point: (points.len() - 1) as u32 });
+    *fail_block = Some(bl);
+    bl
 }
 
 /// `Move`: el valor de `src` a `dst` (leído antes de consumir `src`: pueden ser el mismo registro).
@@ -3034,7 +3437,8 @@ pub(crate) fn check_memory(func: &ir::Function, entry_fn: bool) -> bool {
             let op = func.dfg.insts[inst].opcode();
             let args = func.dfg.inst_args(inst);
             let ok = match op {
-                Opcode::Load | Opcode::Uload8 | Opcode::AtomicLoad => is_param(args[0]) || is_ctx_ptr(args[0]),
+                // F4.8d2: también de una ranura propia (lo que dejó el host en los búferes de una llamada).
+                Opcode::Load | Opcode::Uload8 | Opcode::AtomicLoad => is_param(args[0]) || is_ctx_ptr(args[0]) || is_stack(args[0]),
                 // F4.8a: también en el contexto mismo (los contadores, a desplazamientos fijos).
                 Opcode::Store => args[1] == params[0] || is_ctx_ptr(args[1]) || is_stack(args[1]),
                 // Reinterpretar los bits de un valor (un `Float` en una palabra): no toca memoria.
@@ -3055,7 +3459,7 @@ pub(crate) fn check_memory(func: &ir::Function, entry_fn: bool) -> bool {
 /// parámetro de la entrada que es un lugar con caja (`ptr_params`), lo que dejó una lectura en el
 /// contexto (`OFF_OUT_PTR`), lo que devuelve `list_body`, el 0, o la unión de esos por los bloques;
 /// nunca de una cuenta con un valor. Si no, la unidad no se compila.
-pub(crate) fn check_pointers(func: &ir::Function, h: &Helpers, ptr_params: &[usize], ptr_slots: &[StackSlot]) -> bool {
+pub(crate) fn check_pointers(func: &ir::Function, h: &Helpers, ptr_params: &[usize], ptr_slots: &[StackSlot], exec_ptr_slots: &[StackSlot]) -> bool {
     let Some(entry) = func.layout.entry_block() else { return false };
     // Sin punteros que verificar (ninguna lectura, ninguna ranura de punteros: lo numérico), nada que
     // hacer.
@@ -3065,13 +3469,21 @@ pub(crate) fn check_pointers(func: &ir::Function, h: &Helpers, ptr_params: &[usi
             _ => false,
         })
     });
-    if !reads && ptr_slots.is_empty() && ptr_params.is_empty() {
+    if !reads && ptr_slots.is_empty() && ptr_params.is_empty() && exec_ptr_slots.is_empty() {
         return true;
     }
     // El frontend deja alias (`v96 -> v19`): se compara lo que resuelven.
     let res = |v: Value| func.dfg.resolve_aliases(v);
     let bparams = func.dfg.block_params(entry);
     let ctx = bparams[0];
+    // F4.8d2: la dirección de un búfer de punteros de una llamada ajena.
+    let is_exec_ptr_slot = |v: Value| match func.dfg.value_def(v) {
+        ValueDef::Result(inst, _) => match &func.dfg.insts[inst] {
+            d @ ir::InstructionData::StackAddr { .. } => d.stack_slot().is_some_and(|s| exec_ptr_slots.contains(&s)),
+            _ => false,
+        },
+        _ => false,
+    };
     let mut ok_vals: std::collections::HashSet<Value> = ptr_params.iter().filter_map(|k| bparams.get(*k).copied()).collect();
     // Las definiciones que son punteros por sí mismas.
     for block in func.layout.blocks() {
@@ -3087,7 +3499,8 @@ pub(crate) fn check_pointers(func: &ir::Function, h: &Helpers, ptr_params: &[usi
                 }
                 Opcode::Load => {
                     if let ir::InstructionData::Load { arg, offset, .. } = data {
-                        if res(*arg) == ctx && i32::from(*offset) == OFF_OUT_PTR {
+                        // Lo que dejó una lectura en el contexto, o el host en un búfer de punteros.
+                        if (res(*arg) == ctx && i32::from(*offset) == OFF_OUT_PTR) || is_exec_ptr_slot(res(*arg)) {
                             ok_vals.insert(func.dfg.first_result(inst));
                         }
                     }
@@ -3118,6 +3531,15 @@ pub(crate) fn check_pointers(func: &ir::Function, h: &Helpers, ptr_params: &[usi
             }
         }
     }
+    // F4.8d2: un `select` entre dos punteros (la dirección nueva o la vieja de un valor) es uno.
+    for block in func.layout.blocks() {
+        for inst in func.layout.block_insts(block) {
+            if func.dfg.insts[inst].opcode() == Opcode::Select {
+                let a = func.dfg.inst_args(inst);
+                incoming.insert(func.dfg.first_result(inst), vec![res(a[1]), res(a[2])]);
+            }
+        }
+    }
     let mut cand: std::collections::HashSet<Value> = incoming.keys().copied().collect();
     loop {
         let keep: std::collections::HashSet<Value> =
@@ -3130,7 +3552,7 @@ pub(crate) fn check_pointers(func: &ir::Function, h: &Helpers, ptr_params: &[usi
     ok_vals.extend(cand);
     let is_ptr_slot = |v: Value| match func.dfg.value_def(v) {
         ValueDef::Result(inst, _) => match &func.dfg.insts[inst] {
-            d @ ir::InstructionData::StackAddr { .. } => d.stack_slot().is_some_and(|s| ptr_slots.contains(&s)),
+            d @ ir::InstructionData::StackAddr { .. } => d.stack_slot().is_some_and(|s| ptr_slots.contains(&s) || exec_ptr_slots.contains(&s)),
             _ => false,
         },
         _ => false,

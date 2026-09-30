@@ -29,10 +29,10 @@ use std::mem::offset_of;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::AtomicBool;
 
-use synsema_core::native_tier::{self, NFrame, NOutcome, NPeek, NSeen, NVal, NativeCode, NativeCx, Place, SiteIc, TAG_LIST, TAG_MAP, TAG_MISS, TAG_OTHER};
+use synsema_core::native_tier::{self, HostOut, NFrame, NOutcome, NPeek, NSeen, NVal, NativeCode, NativeCx, NativeHost, Place, SiteIc, TAG_LIST, TAG_MAP, TAG_MISS, TAG_OTHER};
 use synsema_core::types::{ListRef, SynValue};
 
-use crate::lower::{ptr_words, words, Kind, Point, TAG_BOOL, TAG_FLOAT, TAG_HOLE, TAG_INT};
+use crate::lower::{ptr_words, words, ExecSite, Kind, Point, TAG_BOOL, TAG_FLOAT, TAG_HOLE, TAG_INT, TAG_KEEP};
 
 #[cfg(not(target_pointer_width = "64"))]
 compile_error!("synsema-jit sólo en 64 bits (la profundidad de la VM es un usize que el código nativo lee como i64)");
@@ -58,6 +58,10 @@ pub(crate) struct Ctx {
     nsites: usize,
     /// F4.7b: un pánico dentro de una lectura (se relanza al volver del código nativo).
     panic: *mut Option<Box<dyn Any + Send>>,
+    /// F4.8d2: el host de un bucle con llamadas ajenas (nulo si no hay) y los sitios de sus instrucciones.
+    host: Option<*mut (dyn NativeHost + 'static)>,
+    exec_sites: *const ExecSite,
+    nexec: usize,
 }
 
 pub(crate) const OFF_STEPS: i32 = offset_of!(Ctx, steps) as i32;
@@ -206,6 +210,18 @@ pub(crate) extern "C" fn synsema_jit_length(ctx: *mut Ctx, v: *const SynValue) -
     len
 }
 
+/// `get(obj, idx, …)` (F4.8d2): el valor, `TAG_ABSENT` (el default) o `TAG_MISS` (sale).
+pub(crate) extern "C" fn synsema_jit_get(ctx: *mut Ctx, obj: *const SynValue, tag: i64, bits: i64, idx: *const SynValue) -> i64 {
+    read(ctx, |_| {
+        // SAFETY: como en `synsema_jit_index`.
+        let (obj, idx) = unsafe { (obj.as_ref(), idx.as_ref()) };
+        match obj {
+            Some(o) => native_tier::get_item(o, tag, bits, idx),
+            None => NPeek::MISS,
+        }
+    })
+}
+
 /// Corre una escritura (F4.8d): devuelve lo que devuelve `f` (0: no la hizo, el código sale a la VM).
 /// Un pánico no cruza el código generado: queda guardado, da 0 y `call` lo relanza al volver.
 fn write(ctx: *mut Ctx, f: impl FnOnce() -> i64) -> i64 {
@@ -325,6 +341,88 @@ pub(crate) extern "C" fn synsema_jit_append(ctx: *mut Ctx, root: *mut SynValue, 
     })
 }
 
+/// Como `write`, con el valor de un fallo aparte (un pánico da `fail`).
+fn guarded(ctx: *mut Ctx, fail: i64, f: impl FnOnce() -> i64) -> i64 {
+    // SAFETY: como en `read`.
+    let c = unsafe { &mut *ctx };
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(e) => {
+            // SAFETY: como en `read`.
+            unsafe { *c.panic = Some(e) };
+            fail
+        }
+    }
+}
+
+/// Un lugar tal como lo manda el código generado (`lower::place_code`).
+fn place_of(code: i64) -> Option<Place> {
+    let idx = u16::try_from(code & 0xffff_ffff).ok()?;
+    Some(match code >> 32 {
+        0 => Place::Reg(idx),
+        1 => Place::Local(idx),
+        2 => Place::Global(idx),
+        _ => return None,
+    })
+}
+
+/// F4.8d2: corre la instrucción del sitio `site` en el host: los argumentos y las globales que dejó el
+/// código en los búferes (etiqueta, bits, puntero: los con caja se clonan antes de que corra nada) y,
+/// después, en los mismos búferes, lo que tienen los lugares que el sitio pide de vuelta. 0: siguió; 1:
+/// un `stop` cortó el bucle; 2: un error (el host lo guardó), o no se pudo.
+pub(crate) extern "C" fn synsema_jit_exec(ctx: *mut Ctx, site: i64, tags: *mut i64, bits: *mut i64, ptrs: *mut i64) -> i64 {
+    guarded(ctx, 2, || {
+        // SAFETY: `ctx` como en `read`; `exec_sites`/`nexec` son los sitios de `Compiled` (vivos mientras
+        // vive la unidad); `host`, el `NativeHost` que recibió `call` (vivo durante la llamada, y el
+        // código generado no lo usa de otra forma: sólo por acá y `synsema_jit_host_home`, que no
+        // corren a la vez). Los búferes son ranuras de la pila del que llama con `max(nargs + globals,
+        // reload)` palabras cada una (`lower::build`). Los punteros que dejó el código son de valores
+        // vivos y quietos hasta acá: se clonan antes de que el host corra nada.
+        let c = unsafe { &mut *ctx };
+        let Some(host) = c.host else { return 2 };
+        let sites = unsafe { std::slice::from_raw_parts(c.exec_sites, c.nexec) };
+        let Some(site) = usize::try_from(site).ok().and_then(|k| sites.get(k)) else { return 2 };
+        let (na, ng) = (site.nargs as usize, site.globals as usize);
+        let mut vals: Vec<Option<SynValue>> = Vec::with_capacity(na + ng);
+        for k in 0..na + ng {
+            let (t, x, p) = unsafe { (*tags.add(k), *bits.add(k), (*ptrs.add(k)) as usize as *const SynValue) };
+            let keep = t == TAG_KEEP || t == TAG_HOLE || (k >= na && t >= TAG_LIST && p.is_null());
+            vals.push(if keep { None } else { native_tier::nvalue(t, x, unsafe { p.as_ref() }) });
+        }
+        let host = unsafe { &mut *host };
+        let out = host.exec(site.pc, &vals[..na], &vals[na..], &mut c.steps);
+        drop(vals);
+        if out == HostOut::Fail {
+            return 2;
+        }
+        for (k, place) in site.reload.iter().enumerate() {
+            let pk = match *place {
+                Place::Iter(it, _) => NPeek { tag: TAG_LIST, bits: 0, ptr: host.iter_body(it).cast() },
+                p => host.peek_place(p),
+            };
+            // SAFETY: como arriba (los búferes tienen lugar para `reload`).
+            unsafe {
+                *tags.add(k) = pk.tag;
+                *bits.add(k) = pk.bits;
+                *ptrs.add(k) = pk.ptr as usize as i64;
+            }
+        }
+        i64::from(out == HostOut::Stop)
+    })
+}
+
+/// F4.8d2: un valor prestado (`src`) pasa a su lugar por el host (con llamadas ajenas las direcciones
+/// de la entrada ya no valen); devuelve la dirección del lugar.
+pub(crate) extern "C" fn synsema_jit_host_home(ctx: *mut Ctx, place: i64, src: *const SynValue) -> i64 {
+    guarded(ctx, 0, || {
+        // SAFETY: como en `synsema_jit_exec`; `src` es un valor vivo (se clona antes de tocar nada).
+        let c = unsafe { &mut *ctx };
+        let (Some(host), Some(p)) = (c.host, place_of(place)) else { return 0 };
+        let Some(v) = (unsafe { src.as_ref() }).cloned() else { return 0 };
+        unsafe { &mut *host }.home(p, v) as usize as i64
+    })
+}
+
 /// Una unidad compilada.
 pub(crate) struct Compiled {
     /// La entrada `(ctx, *const i64) -> i64` (ya en memoria ejecutable, de sólo lectura).
@@ -339,6 +437,8 @@ pub(crate) struct Compiled {
     pub(crate) sites: Vec<SiteIc>,
     /// F4.8d: los lugares cuya dirección entra después de `inputs` (un bucle que escribe).
     pub(crate) homes: Vec<Place>,
+    /// F4.8d2: las instrucciones que corre el host.
+    pub(crate) exec_sites: Vec<ExecSite>,
 }
 
 /// Un valor de tipo `k` a partir de sus palabras (ver `lower::words`) y su puntero (si tiene).
@@ -377,6 +477,8 @@ fn nval(k: Kind, w: &[i64], p: Option<i64>) -> NVal {
             // SAFETY: como el caso anterior (la dirección de un `Rc` de una lista).
             NVal::List(unsafe { (*ptr).clone() })
         }
+        // F4.8d2: lo tiene la VM en el registro.
+        Kind::Foreign => NVal::Keep,
         Kind::Callee(f) => NVal::Callee(f),
         Kind::RangeFn => NVal::RangeFn,
         Kind::Builtin(w) => NVal::Builtin(w),
@@ -403,6 +505,12 @@ impl NativeCode for Compiled {
             sites: self.sites.as_ptr(),
             nsites: self.sites.len(),
             panic: &mut panic,
+            // SAFETY: sólo se alarga el tiempo de vida del puntero: el host vive durante toda la llamada
+            // (lo presta `cx`) y el código generado lo usa sólo mientras corre (`synsema_jit_exec`,
+            // `synsema_jit_host_home`), antes de que `call` vuelva.
+            host: cx.host.as_deref_mut().map(|h| unsafe { std::mem::transmute::<*mut (dyn NativeHost + '_), *mut (dyn NativeHost + 'static)>(h) }),
+            exec_sites: self.exec_sites.as_ptr(),
+            nexec: self.exec_sites.len(),
         };
         // SAFETY: `entry` es la dirección de una función que compiló este crate con la firma
         // `(i64, i64) -> i64` en la convención por defecto de la plataforma (la de `extern "C"`),

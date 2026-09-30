@@ -23,7 +23,7 @@
 //! Rust. Desde ahí todo es la VM.
 
 use super::*;
-use crate::native_tier::{self, NArith, NCmp, NConst, NBuiltin, NFArith, NFrame, NFunc, NIns, NOpnd, NOsr, NOutcome, NSeen, NSite, NUnary, NUnit, NVal, NativeCode, NativeCx, Place};
+use crate::native_tier::{self, HostOut, NArith, NCmp, NConst, NBuiltin, NFArith, NFrame, NFunc, NIns, NOpnd, NOsr, NOutcome, NPeek, NSeen, NSite, NUnary, NUnit, NVal, NativeCode, NativeCx, NativeHost, Place};
 use std::rc::Weak;
 
 /// Cuántas llamadas a otras tasks puede sumar una unidad.
@@ -175,6 +175,9 @@ pub(super) enum OsrStep {
     /// Salió a mitad de una llamada de la unidad: el frame actual espera su resultado (vuelve en
     /// `pc`, lo deja en `dst`) y la VM sigue en los frames de `Resume`.
     Resume { r: Box<Resume>, pc: usize, dst: Reg },
+    /// F4.8d2: una llamada ajena del bucle falló (su `rest` y su `stop_to` ya los aplicó el host): el
+    /// error sigue como el del `LoopBack` (mismo `rest` 0 y mismo `stop_to` que la condición del bucle).
+    Fail(Control),
 }
 
 // =============================================================================================
@@ -398,6 +401,9 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
         Ins::LoadGlobal { dst, name, .. } => {
             let nm = c.names[name as usize].clone();
             match env_get(env, &nm)? {
+                // F4.8d2: en un bucle, una task que no se puede compilar (escribe una global, lee algo que
+                // el código nativo no representa, …) es una llamada ajena: la corre la VM.
+                SynValue::Task(y) if me.is_none() && !task_closes(&y) => NIns::LoadForeign { dst },
                 SynValue::Task(y) => {
                     let to = b.callee(y);
                     b.deps.push(Dep { from: me, name: nm, to: Some(to), builtin: "" });
@@ -418,6 +424,8 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
                     }
                     NIns::LoadBuiltin { dst, which }
                 }
+                // F4.8d2: en un bucle, otro builtin lo carga la VM (una llamada ajena).
+                SynValue::Builtin(_) if me.is_none() => NIns::LoadForeign { dst },
                 // F4.8b: otra global (no una task ni un builtin), leída por la task de la entrada: un
                 // parámetro oculto, leído al entrar (sólo de su propio `closure_env`).
                 SynValue::Builtin(_) => return None,
@@ -445,6 +453,8 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
         }
         Ins::Give { src } => NIns::Give { src: nopnd(c, src)? },
         Ins::End { src } => NIns::End { src: nopnd(c, src)? },
+        // F4.8d2: en un bucle, el chequeo de un builtin protegido lo corre la VM.
+        Ins::CheckProtected { func, .. } if me.is_none() => NIns::CheckForeign { func },
         _ => return None,
     })
 }
@@ -578,6 +588,118 @@ fn path_index(c: &Chunk, idx: Opnd, b: &mut Build) -> Option<(Option<NOpnd>, u32
     })
 }
 
+/// F4.8d2: si una task (y las que llama) se puede compilar como parte de una unidad.
+fn task_closes(t: &Rc<SynTaskValue>) -> bool {
+    // Como la verá la unidad del bucle: una función llamada (la 0 es el bucle).
+    let mut b = Build { tasks: vec![None, Some(t.clone())], ..Default::default() };
+    b.close(1).is_some()
+}
+
+/// F4.8d2: si el código de un bucle tiene llamadas ajenas (entonces corre con un host).
+fn code_has_foreign(code: &[NIns]) -> bool {
+    code.iter().any(|i| matches!(i, NIns::LoadForeign { .. } | NIns::CheckForeign { .. }))
+}
+
+/// F4.8d2: el host de un bucle con llamadas ajenas: el intérprete y el frame del bucle.
+struct LoopHost<'a> {
+    interp: &'a mut Interpreter,
+    chunk: &'a Rc<Chunk>,
+    env: &'a Rc<RefCell<Environment>>,
+    base: usize,
+    lbase: usize,
+    iter_base: usize,
+    slots: &'a [usize],
+    /// El error de una llamada ajena (el código nativo sale sin valores).
+    fail: Option<Control>,
+    /// La salida del bucle, si un `stop` la cortó.
+    jump: Option<usize>,
+}
+
+impl NativeHost for LoopHost<'_> {
+    fn exec(&mut self, pc: u32, args: &[Option<SynValue>], globals: &[Option<SynValue>], steps: &mut u64) -> HostOut {
+        let at = pc as usize;
+        {
+            let mut e = self.env.borrow_mut();
+            for (g, v) in globals.iter().enumerate() {
+                if let (Some(v), Some(k)) = (v, self.slots.get(g)) {
+                    e.bindings.slot_set(*k, v.clone());
+                }
+            }
+        }
+        if let Ins::Call { args: a, .. } | Ins::CallNative { args: a, .. } | Ins::CallBuiltin { args: a, .. } = self.chunk.code[at].get() {
+            for (i, v) in args.iter().enumerate() {
+                if let Some(v) = v {
+                    self.interp.vm_regs[self.base + a as usize + i] = v.clone();
+                }
+            }
+        }
+        self.interp.steps = *steps;
+        let saved = std::mem::replace(&mut self.interp.vm_lbase, self.lbase);
+        let r = self.interp.vm_exec_one(self.chunk, self.env, self.base, at);
+        self.interp.vm_lbase = saved;
+        let out = match r {
+            Ok(()) => HostOut::Ok,
+            Err(c) => {
+                // Lo que haría el despacho con el error de esta instrucción: los pasos que su bloque
+                // sumó de más y, un `stop` en el cuerpo de un bucle, la salida de ese bucle.
+                self.interp.steps = self.interp.steps.wrapping_sub(self.chunk.rest[at] as u64);
+                if matches!(c, Control::Stop(_)) && self.chunk.stop_to[at] != NONE {
+                    self.jump = Some(self.chunk.stop_to[at] as usize);
+                    HostOut::Stop
+                } else {
+                    self.fail = Some(c);
+                    HostOut::Fail
+                }
+            }
+        };
+        *steps = self.interp.steps;
+        out
+    }
+
+    fn peek_place(&mut self, p: Place) -> NPeek {
+        match p {
+            Place::Reg(r) => native_tier::peek_mut(&mut self.interp.vm_regs[self.base + r as usize]),
+            Place::Local(k) => match self.interp.vm_locals[self.lbase + k as usize].as_mut() {
+                Some(v) => native_tier::peek_mut(v),
+                None => NPeek { tag: native_tier::TAG_HOLE, bits: 0, ptr: std::ptr::null() },
+            },
+            Place::Global(g) => {
+                let mut e = self.env.borrow_mut();
+                match self.slots.get(g as usize).and_then(|k| e.bindings.slot_mut(*k)) {
+                    Some(v) => native_tier::peek_mut(v),
+                    None => NPeek { tag: native_tier::TAG_HOLE, bits: 0, ptr: std::ptr::null() },
+                }
+            }
+            Place::Iter(..) => NPeek::MISS,
+        }
+    }
+
+    fn iter_body(&mut self, it: u16) -> *const ListRef {
+        match self.interp.vm_iters.get(self.iter_base + it as usize) {
+            Some(EachItems::List(l, _)) => std::ptr::from_ref(l),
+            _ => std::ptr::null(),
+        }
+    }
+
+    fn home(&mut self, p: Place, v: SynValue) -> *const SynValue {
+        match p {
+            Place::Reg(r) => {
+                let s = &mut self.interp.vm_regs[self.base + r as usize];
+                *s = v;
+                std::ptr::from_mut(s).cast_const()
+            }
+            Place::Local(k) => std::ptr::from_mut(self.interp.vm_locals[self.lbase + k as usize].insert(v)).cast_const(),
+            Place::Global(g) => {
+                let mut e = self.env.borrow_mut();
+                let k = self.slots[g as usize];
+                e.bindings.slot_set(k, v);
+                e.bindings.slot_mut(k).map_or(std::ptr::null(), |s| std::ptr::from_mut(s).cast_const())
+            }
+            Place::Iter(..) => std::ptr::null(),
+        }
+    }
+}
+
 /// Un bucle compilado (F4.2): la unidad y los nombres de sus globales.
 pub(crate) struct LoopUnit {
     unit: NativeUnit,
@@ -585,6 +707,8 @@ pub(crate) struct LoopUnit {
     /// Si el código escribe alguna global (entonces el entorno no puede ser un módulo, que
     /// sincroniza su mapa de exportaciones).
     writes: bool,
+    /// F4.8d2: si tiene llamadas ajenas (corre con un host).
+    foreign: bool,
 }
 
 /// El estado de un bucle en su chunk (F4.2): la cuenta regresiva de vueltas (como `NativeState`)
@@ -840,7 +964,7 @@ impl Interpreter {
         }
         native_tier::count_entry();
         let out = {
-            let mut cx = NativeCx { steps: &mut self.steps, depth: &mut self.recursion_depth, max_depth: MAX_RECURSION, cancel: &self.cancel.flag };
+            let mut cx = NativeCx { steps: &mut self.steps, depth: &mut self.recursion_depth, max_depth: MAX_RECURSION, cancel: &self.cancel.flag, host: None };
             unit.code.call(&mut cx, &argv)
         };
         match out {
@@ -879,7 +1003,7 @@ impl Interpreter {
         let (first, n) = (self.vm_regs.len(), args.len());
         native_tier::count_entry();
         let out = {
-            let mut cx = NativeCx { steps: &mut self.steps, depth: &mut self.recursion_depth, max_depth: MAX_RECURSION, cancel: &self.cancel.flag };
+            let mut cx = NativeCx { steps: &mut self.steps, depth: &mut self.recursion_depth, max_depth: MAX_RECURSION, cancel: &self.cancel.flag, host: None };
             unit.code.call(&mut cx, &argv)
         };
         for a in args.iter_mut() {
@@ -1015,10 +1139,37 @@ impl Interpreter {
         st.left.set(1);
         native_tier::count_osr();
         let s0 = self.steps;
-        let out = {
-            let mut cx = NativeCx { steps: &mut self.steps, depth: &mut self.recursion_depth, max_depth: MAX_RECURSION, cancel: &self.cancel.flag };
-            lu.unit.code.call(&mut cx, &args)
+        let (out, fail, jump) = if lu.foreign {
+            // F4.8d2: con llamadas ajenas el código nativo corre con un host (el intérprete entero:
+            // los contadores y el flag van aparte, copiados).
+            native_tier::count_foreign();
+            let flag = self.cancel.flag.clone();
+            let (mut steps, mut depth) = (self.steps, self.recursion_depth);
+            let lbase = self.vm_lbase;
+            let (out, fail, jump) = {
+                let mut host = LoopHost { interp: self, chunk, env, base, lbase, iter_base, slots: &slots, fail: None, jump: None };
+                let out = {
+                    let mut cx = NativeCx { steps: &mut steps, depth: &mut depth, max_depth: MAX_RECURSION, cancel: &flag, host: Some(&mut host) };
+                    lu.unit.code.call(&mut cx, &args)
+                };
+                (out, host.fail.take(), host.jump.take())
+            };
+            self.steps = steps;
+            self.recursion_depth = depth;
+            (out, fail, jump)
+        } else {
+            let out = {
+                let mut cx = NativeCx { steps: &mut self.steps, depth: &mut self.recursion_depth, max_depth: MAX_RECURSION, cancel: &self.cancel.flag, host: None };
+                lu.unit.code.call(&mut cx, &args)
+            };
+            (out, None, None)
         };
+        // Una llamada ajena falló: nada vuelve (las globales ya están en el entorno; el frame se
+        // desarma con el error: un `try` es un `Ins::Exec`, así que ningún `recover` del mismo frame
+        // ve los locales que el código nativo tenía en registros).
+        if let Some(c) = fail {
+            return OsrStep::Fail(c);
+        }
         let NOutcome::Deopt(mut frames) = out else { unreachable!("un bucle nativo sólo sale a la VM") };
         let planned = frames.last().is_some_and(|f| f.planned);
         if !planned {
@@ -1041,7 +1192,8 @@ impl Interpreter {
                 let r = self.vm_native_resume(&lu.unit, rest, base + c.args as usize, c.n as usize);
                 OsrStep::Resume { r, pc: f0.pc as usize, dst: c.dst }
             }
-            None => OsrStep::Exit(f0.pc as usize),
+            // F4.8d2: un `stop` de una llamada ajena: la VM sigue en la salida del bucle.
+            None => OsrStep::Exit(jump.unwrap_or(f0.pc as usize)),
         }
     }
 
@@ -1090,8 +1242,10 @@ impl Interpreter {
         if b.tasks.iter().flatten().any(|t| t.code.get().is_some_and(|c| Rc::ptr_eq(c, chunk))) {
             return None;
         }
+        let loop_code = b.funcs[0].code.clone();
         let code = tier.compile(&NUnit { funcs: std::mem::take(&mut b.funcs), sites: std::mem::take(&mut b.sites) })?;
-        Some(LoopUnit { unit: b.unit(code, chunk.nregs, Vec::new()), globals, writes })
+        let foreign = code_has_foreign(&loop_code);
+        Some(LoopUnit { unit: b.unit(code, chunk.nregs, Vec::new()), globals, writes, foreign })
     }
 
     /// La guarda de entrada a un bucle nativo: cada lugar que el código lee o escribe tiene lo que

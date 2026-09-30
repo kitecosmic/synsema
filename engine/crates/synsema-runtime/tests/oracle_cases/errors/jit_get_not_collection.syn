@@ -1,0 +1,10 @@
+-- F4.8d2: `get` sobre algo que no es un mapa ni una lista, a mitad de un bucle nativo: la VM da el
+-- error del builtin con su ubicación.
+let c be {"a": 1}
+let t be 0
+each i in range(0, 300)
+    when i == 200
+        print(steps())
+        set c to 5
+    set t to t + get(c, "a", 0)
+print(t)
