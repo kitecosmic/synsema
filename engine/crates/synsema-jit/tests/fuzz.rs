@@ -237,7 +237,7 @@ impl FGen {
         }
         let a = self.expr(vars, depth - 1);
         let b = self.expr(vars, depth - 1);
-        match self.rng.below(7) {
+        match self.rng.below(10) {
             0 => format!("({} + {})", a, b),
             1 => format!("({} - {})", a, b),
             2 => format!("({} * {})", a, b),
@@ -246,6 +246,10 @@ impl FGen {
             3 | 4 => format!("({} / ({} * {} + 0.5))", a, b, b),
             // `-(…)`: `--` es un comentario.
             5 => format!("(-({}))", a),
+            // F4.7c: los intrínsecos (un negativo a `sqrt` da NaN; `abs` de `i64::MIN` es un `Big`).
+            6 => format!("sqrt({})", a),
+            7 => format!("abs({})", a),
+            8 => format!("float({})", a),
             _ => format!("({} * 0.5)", a),
         }
     }
@@ -476,6 +480,9 @@ impl DGen {
             10 => "alias[i % n]".to_string(),
             // Una clave que no es texto en un mapa (lo resuelve la VM).
             11 if self.rng.chance(15) => "m[i % 2]".to_string(),
+            // F4.7c: `length` de una lista, de un mapa, de un registro, de un elemento (a veces no
+            // tiene largo: el error de la VM).
+            11 if self.rng.chance(40) => ["length(xs)", "length(m)", "length(recs[i % 4])", "length(grid[i % 3])", "length(xs[i % n])"][self.rng.below(5)].to_string(),
             _ => "m.b".to_string(),
         }
     }

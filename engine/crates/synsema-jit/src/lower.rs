@@ -29,7 +29,7 @@ use cranelift_codegen::ir::types::{F64, I64, I8};
 use cranelift_codegen::ir::{self, AbiParam, Block, BlockArg, InstBuilder, MemFlagsData, Opcode, StackSlot, StackSlotData, StackSlotKind, Value, ValueDef};
 use cranelift_codegen::isa::TargetFrontendConfig;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
-use synsema_core::native_tier::{NArith, NCall, NCmp, NConst, NFArith, NFunc, NIns, NOpnd, NSeen, NUnary, NUnit, Place, Reg, DISCARD};
+use synsema_core::native_tier::{NArith, NBuiltin, NCall, NCmp, NConst, NFArith, NFunc, NIns, NOpnd, NSeen, NUnary, NUnit, Place, Reg, DISCARD};
 // Las etiquetas (las comparte core: sus lecturas las devuelven).
 pub(crate) use synsema_core::native_tier::{TAG_BOOL, TAG_FLOAT, TAG_HOLE, TAG_INT, TAG_LIST, TAG_MAP, TAG_MISS, TAG_NOTHING, TAG_OTHER};
 
@@ -58,6 +58,8 @@ pub(crate) struct Reads {
     pub list_elem: ir::FuncRef,
     /// `(ctx, v) -> 0/1`: si un valor con caja es verdadero.
     pub truthy: ir::FuncRef,
+    /// `(ctx, v) -> largo` (-1 si no tiene: sale): `length(v)` (F4.7c).
+    pub length: ir::FuncRef,
 }
 
 impl Helpers {
@@ -66,7 +68,7 @@ impl Helpers {
         let r = self.reads?;
         if f == r.index {
             Some((&[1, 4], false))
-        } else if f == r.prop || f == r.truthy {
+        } else if f == r.prop || f == r.truthy || f == r.length {
             Some((&[1], false))
         } else if f == r.list_body {
             Some((&[1], true))
@@ -107,6 +109,8 @@ pub(crate) enum Kind {
     Callee(u32),
     /// El builtin `range` (F4.2b).
     RangeFn,
+    /// F4.7c: un builtin intrínseco.
+    Builtin(NBuiltin),
     /// Según el camino, distinto: no se puede usar.
     Top,
 }
@@ -183,7 +187,7 @@ fn static_tag(k: Kind) -> Option<i64> {
         Kind::Int => TAG_INT,
         Kind::Float => TAG_FLOAT,
         Kind::Bool => TAG_BOOL,
-        Kind::Callee(_) | Kind::RangeFn => TAG_OTHER,
+        Kind::Callee(_) | Kind::RangeFn | Kind::Builtin(_) => TAG_OTHER,
         _ => return None,
     })
 }
@@ -546,6 +550,32 @@ impl<'u> Func<'u> {
                 set(st, dst, Kind::Callee(func));
                 Next::Fall
             }
+            // F4.7c: un builtin intrínseco (un argumento; si no, el error lo arma la VM).
+            NIns::Call { dst, func, args, n } if matches!(st[func as usize], Kind::Builtin(_)) => {
+                let Kind::Builtin(w) = st[func as usize] else { unreachable!("intrínseco") };
+                let k = if n == 1 { st[args as usize] } else { Kind::Undef };
+                if k == Kind::Top {
+                    return Err(());
+                }
+                let out = match (w, k) {
+                    (_, Kind::Bot) => Kind::Bot,
+                    (NBuiltin::Length, Kind::Any(_)) => Kind::Int,
+                    (NBuiltin::Sqrt, Kind::Int | Kind::Float | Kind::Any(_)) => Kind::Float,
+                    (NBuiltin::Abs, Kind::Int | Kind::Float) => k,
+                    (NBuiltin::Abs, Kind::Any(_)) => Kind::Any(false),
+                    (NBuiltin::Float, Kind::Int | Kind::Float | Kind::Bool | Kind::Any(_)) => Kind::Float,
+                    // Otra cosa (un texto a `sqrt`, un número a `length`, …): el builtin la resuelve
+                    // o da su error, en la VM.
+                    _ => {
+                        *trap = true;
+                        return Ok(Next::Stop);
+                    }
+                };
+                st[func as usize] = Kind::Nothing;
+                st[args as usize] = Kind::Nothing;
+                set(st, dst, out);
+                Next::Fall
+            }
             NIns::Call { dst, func, args, n } => {
                 let Kind::Callee(target) = st[func as usize] else {
                     return if st[func as usize] == Kind::Bot { Ok(Next::Stop) } else { Err(()) };
@@ -609,6 +639,10 @@ impl<'u> Func<'u> {
             }
             NIns::RangeFn { dst } => {
                 set(st, dst, Kind::RangeFn);
+                Next::Fall
+            }
+            NIns::LoadBuiltin { dst, which } => {
+                set(st, dst, Kind::Builtin(which));
                 Next::Fall
             }
             // Si no es el builtin `range`, la llamada de siempre (que el nivel nativo no hace).
@@ -936,7 +970,7 @@ impl<'u> Func<'u> {
                 uses.extend(self.opnd_var(src));
                 fall
             }
-            NIns::RangeFn { dst: d } => {
+            NIns::RangeFn { dst: d } | NIns::LoadBuiltin { dst: d, .. } => {
                 dst(&mut defs, d);
                 fall
             }
@@ -2086,9 +2120,99 @@ pub(crate) fn build(
                     vs.copy(&mut b, &after, NOpnd::Local(slot), dst as usize);
                 }
             }
-            NIns::LoadCallee { dst, .. } | NIns::RangeFn { dst } => {
+            NIns::LoadCallee { dst, .. } | NIns::RangeFn { dst } | NIns::LoadBuiltin { dst, .. } => {
                 if dst != DISCARD {
                     vs.put_other(&mut b, dst as usize);
+                }
+            }
+            NIns::Call { dst, func: freg, args, .. } if matches!(st[freg as usize], Kind::Builtin(_)) => {
+                // F4.7c: el builtin lo hace el código nativo. Lo observable de la llamada de la VM: la
+                // profundidad (un nivel, con el mismo tope: si lo pasaría, la VM da el error), y la
+                // función y el argumento salen de sus registros.
+                let Kind::Builtin(w) = st[freg as usize] else { unreachable!("intrínseco") };
+                let ex = exit_before!(pc);
+                let dp = ctx_load(&mut b, ctx, OFF_DEPTH);
+                let d = b.ins().load(I64, flags, dp, 0);
+                let d1 = b.ins().iadd_imm_s(d, 1);
+                let mx = ctx_load(&mut b, ctx, OFF_MAX_DEPTH);
+                let over = b.ins().icmp(IntCC::UnsignedGreaterThan, d1, mx);
+                exit_if(&mut b, over, ex);
+                let a = NOpnd::Copy(args);
+                let k = f.opnd_kind(&st, a);
+                let d = dst as usize;
+                match w {
+                    NBuiltin::Length => {
+                        let q = vs.ptr(&mut b, &st, a);
+                        let call = b.ins().call(h.reads?.length, &[ctx, q]);
+                        let r = b.inst_results(call)[0];
+                        let bad = b.ins().icmp_imm_s(IntCC::SignedLessThan, r, 0);
+                        exit_if(&mut b, bad, ex);
+                        vs.put_nothing(&mut b, freg as usize);
+                        vs.put_nothing(&mut b, args as usize);
+                        if dst != DISCARD {
+                            vs.put_int(&mut b, d, r);
+                        }
+                    }
+                    NBuiltin::Sqrt => {
+                        // `sqrt(x)` es `f64::sqrt(x.to_f64())`: un negativo da NaN, no un error.
+                        let x = num_opnd(&mut b, &vs, &st, a, Some(ex));
+                        let r = b.ins().sqrt(x.f);
+                        vs.put_nothing(&mut b, freg as usize);
+                        vs.put_nothing(&mut b, args as usize);
+                        if dst != DISCARD {
+                            vs.put_float(&mut b, d, r);
+                        }
+                    }
+                    NBuiltin::Abs => {
+                        // Preserva el tipo; `abs(i64::MIN)` es un `Big` (lo da la VM).
+                        let x = num_opnd(&mut b, &vs, &st, a, Some(ex));
+                        let min = b.ins().icmp_imm_s(IntCC::Equal, x.int, i64::MIN);
+                        let isi = b.ins().bxor_imm_u(x.isf, 1);
+                        let bad = b.ins().band(min, isi);
+                        exit_if(&mut b, bad, ex);
+                        let ni = b.ins().iabs(x.int);
+                        let nf = b.ins().fabs(x.f);
+                        vs.put_nothing(&mut b, freg as usize);
+                        vs.put_nothing(&mut b, args as usize);
+                        if dst != DISCARD {
+                            match k {
+                                Kind::Int => vs.put_int(&mut b, d, ni),
+                                Kind::Float => vs.put_float(&mut b, d, nf),
+                                _ => {
+                                    let (tf, ti) = (b.ins().iconst(I64, TAG_FLOAT), b.ins().iconst(I64, TAG_INT));
+                                    let t = b.ins().select(x.isf, tf, ti);
+                                    b.def_var(vs.p[d].tag, t);
+                                    b.def_var(vs.p[d].bits, ni);
+                                    b.def_var(vs.p[d].f, nf);
+                                }
+                            }
+                        }
+                    }
+                    NBuiltin::Float => {
+                        // `float(x)`: un número a f64, un `Bool` a 1.0/0.0 (sus bits son 1/0: la
+                        // misma conversión que un entero).
+                        let fv = match k {
+                            Kind::Int | Kind::Bool => {
+                                let x = vs.bits(&mut b, a);
+                                b.ins().fcvt_from_sint(F64, x)
+                            }
+                            Kind::Float => vs.float(&mut b, a),
+                            _ => {
+                                let t = vs.tag(&mut b, &st, a);
+                                guard_tags(&mut b, t, &[TAG_INT, TAG_FLOAT, TAG_BOOL], ex);
+                                let x = vs.bits(&mut b, a);
+                                let fx = vs.float(&mut b, a);
+                                let fi = b.ins().fcvt_from_sint(F64, x);
+                                let isf = b.ins().icmp_imm_s(IntCC::Equal, t, TAG_FLOAT);
+                                b.ins().select(isf, fx, fi)
+                            }
+                        };
+                        vs.put_nothing(&mut b, freg as usize);
+                        vs.put_nothing(&mut b, args as usize);
+                        if dst != DISCARD {
+                            vs.put_float(&mut b, d, fv);
+                        }
+                    }
                 }
             }
             NIns::Call { dst, func: freg, args, n: na } => {

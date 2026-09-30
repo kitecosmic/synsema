@@ -23,7 +23,7 @@
 //! Rust. Desde ahí todo es la VM.
 
 use super::*;
-use crate::native_tier::{self, NArith, NCmp, NConst, NFArith, NFrame, NFunc, NIns, NOpnd, NOsr, NOutcome, NSeen, NSite, NUnary, NUnit, NVal, NativeCode, NativeCx, Place};
+use crate::native_tier::{self, NArith, NCmp, NConst, NBuiltin, NFArith, NFrame, NFunc, NIns, NOpnd, NOsr, NOutcome, NSeen, NSite, NUnary, NUnit, NVal, NativeCode, NativeCx, Place};
 use std::rc::Weak;
 
 /// Cuántas llamadas a otras tasks puede sumar una unidad.
@@ -83,6 +83,8 @@ pub(crate) struct NativeUnit {
     deopts: Cell<u32>,
     /// El builtin `range`, si el código lo tiene en un registro (para devolvérselo a la VM).
     range_fn: Option<SynValue>,
+    /// F4.7c: los builtins intrínsecos que el código tiene en un registro.
+    builtins: Vec<(NBuiltin, SynValue)>,
     /// Lo que tienen que tener los argumentos al entrar (F4.7: `Int`, `Float` o `Bool`).
     params: Vec<NSeen>,
 }
@@ -93,6 +95,8 @@ struct Dep {
     from: Option<usize>,
     name: Arc<str>,
     to: Option<usize>,
+    /// Con `to: None`: el builtin que tiene que ser (`range`, o un intrínseco de F4.7c).
+    builtin: &'static str,
 }
 
 impl NativeUnit {
@@ -119,7 +123,7 @@ impl NativeUnit {
             };
             match (found, to) {
                 (Some(SynValue::Task(t)), Some(to)) => Rc::ptr_eq(&t, &to),
-                (Some(SynValue::Builtin(b)), None) => b.name == "range",
+                (Some(SynValue::Builtin(b)), None) => b.name == d.builtin,
                 _ => false,
             }
         })
@@ -175,6 +179,7 @@ struct Build {
     tasks: Vec<Option<Rc<SynTaskValue>>>,
     deps: Vec<Dep>,
     range_fn: Option<SynValue>,
+    builtins: Vec<(NBuiltin, SynValue)>,
     /// F4.7b: los sitios de `GetIndex`/`GetProp` de la unidad.
     sites: Vec<NSite>,
 }
@@ -232,6 +237,7 @@ impl Build {
             deps: self.deps,
             deopts: Cell::new(0),
             range_fn: self.range_fn,
+            builtins: self.builtins,
         }
     }
 }
@@ -367,18 +373,29 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
             match env_get(env, &nm)? {
                 SynValue::Task(y) => {
                     let to = b.callee(y);
-                    b.deps.push(Dep { from: me, name: nm, to: Some(to) });
+                    b.deps.push(Dep { from: me, name: nm, to: Some(to), builtin: "" });
                     NIns::LoadCallee { dst, func: to as u32 }
                 }
                 v @ SynValue::Builtin(_) if matches!(&v, SynValue::Builtin(x) if x.name == "range") => {
-                    b.deps.push(Dep { from: me, name: nm, to: None });
+                    b.deps.push(Dep { from: me, name: nm, to: None, builtin: "range" });
                     b.range_fn = Some(v);
                     NIns::RangeFn { dst }
+                }
+                // F4.7c: un builtin intrínseco (que la global siga siéndolo se verifica al entrar).
+                SynValue::Builtin(x) if NBuiltin::from_name(&x.name).is_some() => {
+                    let which = NBuiltin::from_name(&x.name).expect("intrínseco");
+                    b.deps.push(Dep { from: me, name: nm, to: None, builtin: which.name() });
+                    if !b.builtins.iter().any(|(w, _)| *w == which) {
+                        b.builtins.push((which, SynValue::Builtin(x)));
+                    }
+                    NIns::LoadBuiltin { dst, which }
                 }
                 _ => return None,
             }
         }
-        Ins::Call { dst, func, args, n, site } | Ins::CallNative { dst, func, args, n, site } => {
+        // F4.7c: también una llamada que la VM ya especializó para un builtin (el nivel nativo la
+        // hace si el builtin es un intrínseco; si no, sale).
+        Ins::Call { dst, func, args, n, site } | Ins::CallNative { dst, func, args, n, site } | Ins::CallBuiltin { dst, func, args, n, site } => {
             if c.sites[site as usize].names.is_some() {
                 return None;
             }
@@ -610,6 +627,7 @@ impl Interpreter {
             NVal::Float(x) => SynValue::Number(Number::Float(x)),
             NVal::Callee(f) => SynValue::Task(unit.task(f as usize).expect("task de la unidad viva")),
             NVal::RangeFn => unit.range_fn.clone().expect("el builtin range de la unidad"),
+            NVal::Builtin(w) => unit.builtins.iter().find(|(x, _)| *x == w).map(|(_, v)| v.clone()).expect("un builtin de la unidad"),
             NVal::Hole => SynValue::Nothing,
             NVal::Value(v) => v,
             NVal::List(l) => SynValue::List(l),

@@ -31,8 +31,9 @@ const MAX_CODE_BYTES: usize = 64 << 20;
 struct Jit {
     module: JITModule,
     deopt: FuncId,
-    /// F4.7b: las lecturas de valores con caja (`index`, `prop`, `list_body`, `list_elem`, `truthy`).
-    reads: [FuncId; 5],
+    /// F4.7b: las lecturas de valores con caja (`index`, `prop`, `list_body`, `list_elem`, `truthy`,
+    /// y `length` de F4.7c).
+    reads: [FuncId; 6],
     bytes: usize,
 }
 
@@ -59,6 +60,7 @@ fn new_jit() -> Option<Jit> {
     jb.symbol("synsema_jit_list_body", abi::synsema_jit_list_body as *const u8);
     jb.symbol("synsema_jit_list_elem", abi::synsema_jit_list_elem as *const u8);
     jb.symbol("synsema_jit_truthy", abi::synsema_jit_truthy as *const u8);
+    jb.symbol("synsema_jit_length", abi::synsema_jit_length as *const u8);
     let mut module = JITModule::new(jb);
     // Todo es una palabra (`i64`): el contexto, los punteros, los valores.
     let sig_of = |n: usize, ret: bool| {
@@ -79,6 +81,7 @@ fn new_jit() -> Option<Jit> {
         module.declare_function("synsema_jit_list_body", Linkage::Import, &s_1).ok()?,
         module.declare_function("synsema_jit_list_elem", Linkage::Import, &s_2).ok()?,
         module.declare_function("synsema_jit_truthy", Linkage::Import, &s_1).ok()?,
+        module.declare_function("synsema_jit_length", Linkage::Import, &s_1).ok()?,
     ];
     Some(Jit { module, deopt, reads, bytes: 0 })
 }
@@ -115,7 +118,7 @@ fn compile_in(jit: &mut Jit, unit: &NUnit) -> Option<abi::Compiled> {
         let callees: Vec<_> = ids.iter().map(|id| m.declare_func_in_func(*id, &mut ctx.func)).collect();
         let reads = lower::has_boxed(unit, i, &plans[i]).then(|| {
             let r = jit.reads.map(|id| m.declare_func_in_func(id, &mut ctx.func));
-            lower::Reads { index: r[0], prop: r[1], list_body: r[2], list_elem: r[3], truthy: r[4] }
+            lower::Reads { index: r[0], prop: r[1], list_body: r[2], list_elem: r[3], truthy: r[4], length: r[5] }
         });
         let h = lower::Helpers { deopt: m.declare_func_in_func(jit.deopt, &mut ctx.func), reads };
         lower::build(unit, i, &mut plans, &mut ctx.func, &mut fbctx, &callees, h, m.target_config())?;

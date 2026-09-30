@@ -1,0 +1,42 @@
+-- F4.7c: builtins intrínsecos en el nivel nativo (`length`, `sqrt`, `abs`, `float`): el mismo
+-- resultado que el builtin (un negativo a `sqrt` da NaN, `abs` preserva el tipo y `abs(i64::MIN)`
+-- es un `Big`, `float(true)` es 1.0, `length` de un texto cuenta caracteres), y la global verificada
+-- al entrar: si `abs` pasa a ser otra cosa, lo nativo no la da por sabida.
+
+let xs be apply(range(0, 300), (i) => i * 0.5 - 70)
+let words be ["año", "", "ñandú", "abc", "日本"]
+let recs be [{"a": 1}, {"a": 1, "b": 2}, {}]
+let min be 0 - 9223372036854775807 - 1
+let s be 0.0
+let t be 0
+let i be 0
+let nn be 0
+let ab be 0
+while i < length(xs)
+    set s to s + sqrt(abs(xs[i])) + float(i % 3) + float(i % 2 == 0)
+    when sqrt(xs[i]) != sqrt(xs[i])
+        set nn to nn + 1
+    set t to t + length(words[i % 5]) + length(recs[i % 3]) + abs(i - 150)
+    set ab to abs(min + (i + 1) % 2)
+    set i to i + 1
+print([s, t, nn, ab])
+
+-- `abs` en el borde de i64 (da un `Big`: sale a la VM) y de floats.
+let absed be []
+each v in [5, -7, min, 0, -0.0, -2.5, 9223372036854775807]
+    let a be abs(v)
+    set absed to append(absed, a)
+print(absed)
+
+-- La global re-ligada entre dos entradas al mismo bucle.
+task spin(n)
+    let acc be 0.0
+    each k in range(0, n)
+        set acc to acc + abs(k - 50) + sqrt(k)
+    give acc
+print(spin(3000))
+let abs be sqrt
+print(spin(3000))
+set abs to (x) => x * 2
+print(spin(3000))
+print(steps())

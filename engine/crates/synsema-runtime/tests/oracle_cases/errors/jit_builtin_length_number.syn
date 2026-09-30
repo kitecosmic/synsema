@@ -1,0 +1,11 @@
+-- F4.7c: `length` de algo que no tiene largo a mitad de un bucle nativo: sale a la VM, que da el
+-- error del builtin con su ubicación.
+let xs be range(0, 10)
+let c be xs
+let t be 0
+each i in range(0, 300)
+    when i == 200
+        print(steps())
+        set c to 5
+    set t to t + length(c)
+print(t)

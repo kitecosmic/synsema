@@ -6,7 +6,7 @@
 //! 3. `Compiled::call`: convertir la dirección de la entrada compilada en una función y llamarla, y
 //!    al volver (F4.7b) clonar los valores con caja que quedaron vivos.
 //! 4. (F4.7b) Las lecturas de valores con caja (`synsema_jit_index`, `_prop`, `_list_body`,
-//!    `_list_elem`, `_truthy`): convierten los punteros que les pasa el código generado en
+//!    `_list_elem`, `_truthy`, y `_length` de F4.7c): convierten los punteros que les pasa el código generado en
 //!    referencias y llaman a las funciones seguras de `synsema_core::native_tier`.
 //!
 //! Lo que hace falta para que sea seguro lo garantiza `lower`: el código generado sólo toca la
@@ -190,6 +190,19 @@ pub(crate) extern "C" fn synsema_jit_truthy(ctx: *mut Ctx, v: *const SynValue) -
     t
 }
 
+/// `length(v)` (F4.7c): el largo, o -1 si `v` no tiene (el código sale y la VM da el error).
+pub(crate) extern "C" fn synsema_jit_length(ctx: *mut Ctx, v: *const SynValue) -> i64 {
+    let mut len = -1i64;
+    read(ctx, |_| {
+        // SAFETY: como en `synsema_jit_index`.
+        if let Some(n) = unsafe { v.as_ref() }.and_then(native_tier::length) {
+            len = n;
+        }
+        NPeek { tag: TAG_OTHER, bits: 0, ptr: std::ptr::null() }
+    });
+    len
+}
+
 /// Una unidad compilada.
 pub(crate) struct Compiled {
     /// La entrada `(ctx, *const i64) -> i64` (ya en memoria ejecutable, de sólo lectura).
@@ -234,6 +247,7 @@ fn nval(k: Kind, w: &[i64], p: Option<i64>) -> NVal {
         }
         Kind::Callee(f) => NVal::Callee(f),
         Kind::RangeFn => NVal::RangeFn,
+        Kind::Builtin(w) => NVal::Builtin(w),
         Kind::Undef => NVal::Hole,
         _ => NVal::Nothing,
     }

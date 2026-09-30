@@ -86,6 +86,35 @@ pub enum NUnary {
     Not,
 }
 
+/// F4.7c: los builtins puros que el nivel nativo hace él mismo (intrínsecos), como V8 con
+/// `Math.sqrt` o LuaJIT con `math.*`. Mismo resultado y mismos errores que el builtin (lo que no hace,
+/// sale a la VM antes de la llamada).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NBuiltin {
+    Length,
+    Sqrt,
+    Abs,
+    Float,
+}
+
+impl NBuiltin {
+    pub const ALL: [NBuiltin; 4] = [NBuiltin::Length, NBuiltin::Sqrt, NBuiltin::Abs, NBuiltin::Float];
+
+    /// El nombre del builtin (el que se verifica al entrar: la global sigue siendo ese builtin).
+    pub fn name(self) -> &'static str {
+        match self {
+            NBuiltin::Length => "length",
+            NBuiltin::Sqrt => "sqrt",
+            NBuiltin::Abs => "abs",
+            NBuiltin::Float => "float",
+        }
+    }
+
+    pub fn from_name(n: &str) -> Option<NBuiltin> {
+        NBuiltin::ALL.into_iter().find(|b| b.name() == n)
+    }
+}
+
 /// `IntCmp`: `< <= > >= == !=`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NCmp {
@@ -155,6 +184,8 @@ pub enum NIns {
     Scalar { src: NOpnd },
     /// F4.2b: `LoadGlobal` del builtin `range` (que siga siéndolo se verifica al entrar).
     RangeFn { dst: Reg },
+    /// F4.7c: `LoadGlobal` de un builtin que el nivel nativo hace él mismo (verificado al entrar).
+    LoadBuiltin { dst: Reg, which: NBuiltin },
     /// `IsRange`: si `src` no es el builtin `range`, a `to` (la llamada de siempre).
     IsRange { src: Reg, to: u32 },
     /// `each … in range(…)`: los argumentos (`n`, de 1 a 3) en registros desde `first`; el
@@ -253,6 +284,8 @@ pub enum NVal {
     Hole,
     /// El builtin `range`.
     RangeFn,
+    /// F4.7c: uno de los builtins intrínsecos.
+    Builtin(NBuiltin),
     /// F4.7b: un valor con caja (ya clonado: la cuenta es la de la VM).
     Value(SynValue),
     /// F4.7b: la lista de un iterador (ya clonada).
@@ -364,6 +397,18 @@ pub fn list_elem(l: &ListRef, i: i64) -> NPeek {
 /// Si `v` es verdadero (`is_truthy`).
 pub fn truthy(v: &SynValue) -> bool {
     v.is_truthy()
+}
+
+/// F4.7c: `length(v)` como el builtin (texto en caracteres, lista, mapa, bytes); `None` con lo demás
+/// (un `Array`, algo sin largo: lo resuelve la VM, con su error).
+pub fn length(v: &SynValue) -> Option<i64> {
+    Some(match v {
+        SynValue::Text(s) => s.chars().count() as i64,
+        SynValue::List(l) => l.borrow().len() as i64,
+        SynValue::Map(m) => m.borrow().len() as i64,
+        SynValue::Bytes(b) => b.len() as i64,
+        _ => return None,
+    })
 }
 
 /// Dónde vive un valor en el frame de la VM.
