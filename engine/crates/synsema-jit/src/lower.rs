@@ -131,6 +131,8 @@ pub(crate) struct Reads {
     /// `(ctx, obj, idx_tag, idx_bits, idx_ptr) -> tag`: `get(obj, idx, …)` (F4.8d2; `TAG_ABSENT`: el
     /// default).
     pub get: ir::FuncRef,
+    /// `(ctx, sitio) -> tag`: el texto constante del sitio (F4.8d2).
+    pub konst: ir::FuncRef,
 }
 
 impl Helpers {
@@ -166,6 +168,10 @@ impl Helpers {
             Some((&[1], true))
         } else if f == r.list_elem {
             Some((&[1], false))
+        } else if f == r.get {
+            Some((&[1, 4], false))
+        } else if f == r.konst {
+            Some((&[], false))
         } else {
             None
         }
@@ -175,7 +181,7 @@ impl Helpers {
 /// Si la función `i` puede tener valores con caja: los lee (`GetIndex`, `GetProp`, `each` sobre una
 /// lista) o le entran (un bucle con un lugar con caja). Si no, ningún `Any` tiene caja.
 pub(crate) fn has_boxed(unit: &NUnit, i: usize, plan: &Plan) -> bool {
-    unit.funcs[i].code.iter().any(|ins| matches!(ins, NIns::GetIndex { .. } | NIns::GetProp { .. } | NIns::EachList { .. }))
+    unit.funcs[i].code.iter().any(|ins| matches!(ins, NIns::GetIndex { .. } | NIns::GetProp { .. } | NIns::EachList { .. } | NIns::LoadConst { .. }))
         || plan.inputs.iter().any(|(_, s)| boxed_seen(*s))
         || unit.funcs[i].params.iter().any(|s| boxed_seen(*s))
         || unit.funcs[i].globals.iter().any(|s| boxed_seen(*s))
@@ -1010,6 +1016,10 @@ impl<'u> Func<'u> {
                 set(st, dst, Kind::Foreign);
                 Next::Fall
             }
+            NIns::LoadConst { dst, .. } => {
+                set(st, dst, Kind::Any(false));
+                Next::Fall
+            }
             NIns::CheckForeign { func } => {
                 match st[func as usize] {
                     Kind::Foreign => {}
@@ -1297,7 +1307,7 @@ impl<'u> Func<'u> {
                 dst(&mut defs, d);
                 fall
             }
-            NIns::LoadForeign { dst: d } => {
+            NIns::LoadForeign { dst: d } | NIns::LoadConst { dst: d, .. } => {
                 dst(&mut defs, d);
                 fall
             }
@@ -2741,6 +2751,19 @@ pub(crate) fn build(
             NIns::LoadCallee { dst, .. } | NIns::RangeFn { dst } | NIns::LoadBuiltin { dst, .. } => {
                 if dst != DISCARD {
                     vs.put_other(&mut b, dst as usize);
+                }
+            }
+            NIns::LoadConst { dst, site } => {
+                // F4.8d2: el texto del sitio, prestado como una lectura (nunca `MISS`; por las dudas,
+                // sale).
+                if dst != DISCARD {
+                    let ex = exit_before!(pc);
+                    let sv = b.ins().iconst(I64, i64::from(site));
+                    let call = b.ins().call(h.reads?.konst, &[ctx, sv]);
+                    let tag = b.inst_results(call)[0];
+                    let miss = b.ins().icmp_imm_s(IntCC::Equal, tag, TAG_MISS);
+                    exit_if(&mut b, miss, ex);
+                    vs.put_read(&mut b, dst as usize, tag);
                 }
             }
             NIns::LoadForeign { .. } | NIns::CheckForeign { .. } => {

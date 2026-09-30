@@ -16,7 +16,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::number::Number;
 use crate::synmap::MapIc;
-use crate::types::{ListRef, SynValue};
+use crate::types::{ListRef, SynText, SynValue};
 
 /// Un registro de la ventana de la VM (el de `vm.rs`).
 pub type Reg = u16;
@@ -231,6 +231,8 @@ pub enum NIns {
     LoadForeign { dst: Reg },
     /// F4.8d2: `CheckProtected` sobre una función así (lo corre el host).
     CheckForeign { func: Reg },
+    /// F4.8d2: un texto constante a `dst` (prestado del sitio `site`, que lo guarda).
+    LoadConst { dst: Reg, site: u32 },
 }
 
 /// Lo que tenía un lugar al compilar un bucle (F4.2): el código nativo se especializa en eso y la
@@ -294,6 +296,8 @@ pub struct NSite {
     pub key: Option<Arc<str>>,
     /// F4.8d: `.campo` (la caché sin mirar la clave: siempre es la misma), no un índice.
     pub prop: bool,
+    /// F4.8d2: un texto constante (`NIns::LoadConst`): el código lo tiene prestado de su sitio.
+    pub text: Option<Arc<str>>,
 }
 
 /// Lo que se compila junto: la task caliente (`funcs[0]`) y las que llama.
@@ -368,11 +372,22 @@ pub struct SiteIc {
     key: Option<Arc<str>>,
     prop: bool,
     ic: MapIc,
+    /// F4.8d2: el texto constante del sitio (vive lo que vive el código compilado).
+    konst: Option<SynValue>,
 }
 
 impl SiteIc {
     pub fn new(s: &NSite) -> SiteIc {
-        SiteIc { key: s.key.clone(), prop: s.prop, ic: MapIc::default() }
+        let konst = s.text.as_deref().map(|t| SynValue::Text(SynText::from(t)));
+        SiteIc { key: s.key.clone(), prop: s.prop, ic: MapIc::default(), konst }
+    }
+
+    /// F4.8d2: el texto constante del sitio (`MISS` si no tiene).
+    pub fn konst(&self) -> NPeek {
+        match &self.konst {
+            Some(v) => peek(v),
+            None => NPeek::MISS,
+        }
     }
 
     /// `obj[idx]` como el camino rápido de `GetIndex` en la VM: una lista con un `Int` (índices

@@ -587,7 +587,10 @@ impl DGen {
         // F4.8d2: una llamada ajena en cada vuelta, aparte de las escrituras (`get` es un intrínseco:
         // no lo es con una clave que no es texto ni un `Int`).
         if self.rng.chance(50) {
-            lp += match self.rng.below(6) {
+            lp += match self.rng.below(8) {
+                // Textos constantes (prestados de la unidad).
+                6 => "    set cnt to cnt + get(m, \"a\", 1) + length(\"xy\")\n",
+                7 => "    let tx be get(m, \"zz\", \"def\")\n    when i == 2\n        set out to append(out, tx)\n",
                 0 => "    set out to append(out, text(i))\n",
                 1 => "    set acc to acc + bump(i)\n    set cnt to cnt + hits\n",
                 2 => "    set acc to acc + corta(i)\n",

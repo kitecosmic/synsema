@@ -210,6 +210,11 @@ pub(crate) extern "C" fn synsema_jit_length(ctx: *mut Ctx, v: *const SynValue) -
     len
 }
 
+/// Un texto constante (F4.8d2): el de su sitio.
+pub(crate) extern "C" fn synsema_jit_const(ctx: *mut Ctx, site: i64) -> i64 {
+    read(ctx, |c| c.site(site).map_or(NPeek::MISS, |s| s.konst()))
+}
+
 /// `get(obj, idx, …)` (F4.8d2): el valor, `TAG_ABSENT` (el default) o `TAG_MISS` (sale).
 pub(crate) extern "C" fn synsema_jit_get(ctx: *mut Ctx, obj: *const SynValue, tag: i64, bits: i64, idx: *const SynValue) -> i64 {
     read(ctx, |_| {

@@ -1,0 +1,26 @@
+-- F4.8d2: textos constantes en un bucle nativo (prestados de la unidad): como argumento de un
+-- intrínseco o de una llamada ajena, como default de `get`, guardados en una variable o en una lista.
+let m be {"a": 1, "b": 2}
+let acc be 0
+let out be []
+each i in range(0, 500)
+    set acc to acc + get(m, "a", 0) + length("abc") + get(m, "zz", 5)
+    let nombre be get(m, "c", "sin c")
+    when i % 100 == 0
+        set out to append(out, "x")
+        set out to append(out, nombre)
+    set acc to acc + length(nombre)
+    set m.b to m.b + 1
+print(acc, out, m)
+
+-- Lo que el nativo todavía no hace con un texto (asignarlo directo, compararlo, sumarlo): la VM.
+let ult be "nada"
+let tags be {}
+let s be ""
+each i in range(0, 300)
+    set ult to "vuelta"
+    set tags["t"] to "listo"
+    when ult == "vuelta"
+        set acc to acc + 1
+    set s to s + "ab"
+print(acc, ult, tags, length(s), upper("fin"))

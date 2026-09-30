@@ -33,7 +33,7 @@ struct Jit {
     deopt: FuncId,
     /// F4.7b: las lecturas de valores con caja (`index`, `prop`, `list_body`, `list_elem`, `truthy`,
     /// y `length` de F4.7c).
-    reads: [FuncId; 7],
+    reads: [FuncId; 8],
     /// F4.8d: las escrituras (`home`, `home_local`, `path_root`, `path_step`, `path_set`, `append`).
     writes: [FuncId; 6],
     /// F4.8d2: el host (`exec`, `host_home`).
@@ -66,6 +66,7 @@ fn new_jit() -> Option<Jit> {
     jb.symbol("synsema_jit_truthy", abi::synsema_jit_truthy as *const u8);
     jb.symbol("synsema_jit_length", abi::synsema_jit_length as *const u8);
     jb.symbol("synsema_jit_get", abi::synsema_jit_get as *const u8);
+    jb.symbol("synsema_jit_const", abi::synsema_jit_const as *const u8);
     jb.symbol("synsema_jit_home", abi::synsema_jit_home as *const u8);
     jb.symbol("synsema_jit_home_local", abi::synsema_jit_home_local as *const u8);
     jb.symbol("synsema_jit_path_root", abi::synsema_jit_path_root as *const u8);
@@ -97,6 +98,7 @@ fn new_jit() -> Option<Jit> {
         module.declare_function("synsema_jit_truthy", Linkage::Import, &s_1).ok()?,
         module.declare_function("synsema_jit_length", Linkage::Import, &s_1).ok()?,
         module.declare_function("synsema_jit_get", Linkage::Import, &s_w5).ok()?,
+        module.declare_function("synsema_jit_const", Linkage::Import, &s_1).ok()?,
     ];
     let writes = [
         module.declare_function("synsema_jit_home", Linkage::Import, &s_w3).ok()?,
@@ -145,7 +147,7 @@ fn compile_in(jit: &mut Jit, unit: &NUnit) -> Option<abi::Compiled> {
         let callees: Vec<_> = ids.iter().map(|id| m.declare_func_in_func(*id, &mut ctx.func)).collect();
         let reads = lower::has_boxed(unit, i, &plans[i]).then(|| {
             let r = jit.reads.map(|id| m.declare_func_in_func(id, &mut ctx.func));
-            lower::Reads { index: r[0], prop: r[1], list_body: r[2], list_elem: r[3], truthy: r[4], length: r[5], get: r[6] }
+            lower::Reads { index: r[0], prop: r[1], list_body: r[2], list_elem: r[3], truthy: r[4], length: r[5], get: r[6], konst: r[7] }
         });
         let writes = lower::has_writes(unit, i).then(|| {
             let w = jit.writes.map(|id| m.declare_func_in_func(id, &mut ctx.func));

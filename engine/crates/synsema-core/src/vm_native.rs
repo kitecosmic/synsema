@@ -201,7 +201,13 @@ struct Build {
 
 impl Build {
     fn site(&mut self, key: Option<Arc<str>>, prop: bool) -> u32 {
-        self.sites.push(NSite { key, prop });
+        self.sites.push(NSite { key, prop, text: None });
+        (self.sites.len() - 1) as u32
+    }
+
+    /// F4.8d2: un sitio que guarda un texto constante.
+    fn text_site(&mut self, t: &str) -> u32 {
+        self.sites.push(NSite { key: None, prop: false, text: Some(Arc::from(t)) });
         (self.sites.len() - 1) as u32
     }
 }
@@ -341,6 +347,11 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
         Ins::CheckCancel => NIns::CheckCancel,
         // F4.8d: un `TryInPlace` de camino que la VM dejó de probar (ver `vm_try_in_place`).
         Ins::Nop => NIns::Nop,
+        // F4.8d2: un texto constante (un literal): prestado de un sitio de la unidad.
+        Ins::Const { dst, k } | Ins::Move { dst, src: Opnd::Const(k) } if matches!(c.consts[k as usize], SynValue::Text(_)) => {
+            let SynValue::Text(t) = &c.consts[k as usize] else { unreachable!("texto") };
+            NIns::LoadConst { dst, site: b.text_site(t) }
+        }
         Ins::Const { dst, k } => NIns::Const { dst, v: nconst(&c.consts[k as usize])? },
         Ins::Move { dst, src } => NIns::Move { dst, src: nopnd(c, src)? },
         Ins::Drop { r } => NIns::Drop { r },
