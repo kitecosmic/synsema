@@ -180,6 +180,12 @@ pub(crate) enum Ins {
     /// genérico (aridad máxima, profundidad, `dispatch_builtin`, `pending_kwargs` vacío), sin armar
     /// pares nombre/valor ni copiar los argumentos dos veces. Si ya no encaja, vuelve a ser `Call`.
     CallBuiltin { dst: Reg, func: Reg, args: Reg, n: u16, site: u32 },
+    /// F4.8c (quickening, como `CallBuiltin`): el `Call` de `set P to append(P, e)` (P una variable,
+    /// la raíz en su `CallSite`) que vio el builtin `append`. Si el primer argumento es la lista que
+    /// P sigue teniendo, se agrega en el lugar (`make_unique` de P y `push`: lo que hace la vía en el
+    /// lugar de la referencia); si no, el builtin de siempre. Si ya no es `append`, vuelve a ser
+    /// `Call`.
+    AppendInPlace { dst: Reg, func: Reg, args: Reg, site: u32 },
     /// F4.1: un `Call` a una task que tiene código nativo (lo reescribe la VM cuando la task pasa
     /// el umbral). Si la task, los argumentos o las globales ya no encajan, vuelve a ser `Call`.
     #[cfg(feature = "native-tier")]
@@ -394,6 +400,8 @@ struct CallSite {
     /// Si se chequea la aridad: una llamada escrita sí; el paso de un pipe que no es una llamada
     /// (`xs |> f`) no, como `call_value` en la referencia.
     checked: bool,
+    /// F4.8c: la variable P de `set P to append(P, e)` (ver `Ins::AppendInPlace`).
+    append: Option<Root>,
 }
 
 /// El estado del llamador de una llamada que la VM corre sin recursión (F3.2). El frame de la
@@ -1050,7 +1058,23 @@ impl<'r, 's> Compiler<'r, 's> {
             K::SetMutation { target, value } if matches!(target.kind, K::Identifier { .. }) => {
                 let K::Identifier { name } = &target.kind else { unreachable!() };
                 self.enter();
-                let done = if in_place_shape(target, value) {
+                // F4.8c: `set P to append(P, e)` con P de las que la VM encuentra: el camino normal,
+                // y su `Call` agrega en el lugar (`AppendInPlace`). Si no, la vía de la referencia.
+                let append = if append_shape(target, value) {
+                    match self.place(self.target(target)) {
+                        Place::Param(r) => Some(Root::Param(r)),
+                        Place::Win(k) => Some(Root::Win(k)),
+                        Place::Local(k) => Some(Root::Local(k)),
+                        Place::Free => {
+                            let nm = self.name(name);
+                            Some(Root::Free { name: nm, ic: self.ic() })
+                        }
+                        Place::Outer(..) => None,
+                    }
+                } else {
+                    None
+                };
+                let done = if append.is_none() && in_place_shape(target, value) {
                     let node = self.cold_spilled(n);
                     let nm = self.name(name);
                     let done = self.label();
@@ -1066,6 +1090,12 @@ impl<'r, 's> Compiler<'r, 's> {
                     None
                 };
                 let v = self.set_value(target, name, value);
+                if let Some(root) = append {
+                    // La última instrucción del valor es el `Call` de `append`.
+                    if let Some(Ins::Call { site, .. }) = self.code.last() {
+                        self.sites[*site as usize].append = Some(root);
+                    }
+                }
                 self.at(&n.location);
                 let nm = self.name(name);
                 match self.place(self.target(target)) {
@@ -1356,7 +1386,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 for (i, a) in arguments.iter().enumerate() {
                     self.into_reg(&a.value, first + i as Reg, end);
                 }
-                self.sites.push(CallSite { names: None, checked: true });
+                self.sites.push(CallSite { names: None, checked: true, append: None });
                 let site = (self.sites.len() - 1) as u32;
                 self.at(&c.location);
                 let dst = self.reg();
@@ -1684,7 +1714,7 @@ impl<'r, 's> Compiler<'r, 's> {
                             let func = self.to_reg(f);
                             let first = self.block_regs(1);
                             self.emit(Ins::Move { dst: first, src: Opnd::Reg(cur) });
-                            self.sites.push(CallSite { names: None, checked: false });
+                            self.sites.push(CallSite { names: None, checked: false, append: None });
                             let site = (self.sites.len() - 1) as u32;
                             self.at(&t.location);
                             self.emit(Ins::Call { dst, func, args: first, n: 1, site });
@@ -1869,7 +1899,7 @@ impl<'r, 's> Compiler<'r, 's> {
         } else {
             None
         };
-        self.sites.push(CallSite { names, checked });
+        self.sites.push(CallSite { names, checked, append: None });
         let site = (self.sites.len() - 1) as u32;
         self.at(&n.location);
         self.emit(Ins::Call { dst, func, args: first, n: total as u16, site });
@@ -2156,6 +2186,16 @@ fn floor_div_hint(n: &Node, right: &Node) -> bool {
     matches!(right.kind, NodeKind::Identifier { .. })
         && right.location.line == n.location.line
         && right.location.column > n.location.column + 2
+}
+
+/// F4.8c: `append(P, e)` sobre la variable P (dos argumentos por posición, la función por nombre).
+fn append_shape(target: &Node, value: &Node) -> bool {
+    match &value.kind {
+        NodeKind::TaskCall { name, arguments } => {
+            name.as_identifier() == Some("append") && arguments.len() == 2 && arguments.iter().all(|a| a.name.is_none()) && same_place(&arguments[0].value, target)
+        }
+        _ => false,
+    }
 }
 
 /// Las formas que `try_update_in_place` puede hacer en el lugar (la función vuelve a chequear
@@ -3074,6 +3114,14 @@ impl Interpreter {
                 Ins::CallBuiltin { dst, func, args, n, site } => match self.vm_call_builtin(&chunk, base, at, dst, func, args, n, site) {
                     Ok(true) => Ok(()),
                     // Ya no encaja (y no tocó nada): volvió a ser `Call` y se repite como tal.
+                    Ok(false) => {
+                        pc = at;
+                        Ok(())
+                    }
+                    Err(c) => Err(c),
+                },
+                Ins::AppendInPlace { dst, func, args, site } => match self.vm_append_in_place(&chunk, &env, base, at, dst, func, args, site) {
+                    Ok(true) => Ok(()),
                     Ok(false) => {
                         pc = at;
                         Ok(())
@@ -4243,10 +4291,12 @@ impl Interpreter {
     ) -> Result<Option<Enter>, Control> {
         let loc = &chunk.locs[chunk.loc[at] as usize];
         let s = &chunk.sites[site as usize];
-        // F4.1b: un builtin llamado sólo por posición: la próxima vez, `CallBuiltin`.
+        // F4.1b: un builtin llamado sólo por posición: la próxima vez, `CallBuiltin` (F4.8c: o, en el
+        // `append` de `set P to append(P, e)`, `AppendInPlace`).
         if s.names.is_none() && matches!(&f, SynValue::Builtin(b) if b.param_names.is_none()) {
             if let Ins::Call { dst, func, args, n, site } = chunk.code[at].get() {
-                chunk.code[at].set(Ins::CallBuiltin { dst, func, args, n, site });
+                let append = s.append.is_some() && n == 2 && matches!(&f, SynValue::Builtin(b) if b.name == "append");
+                chunk.code[at].set(if append { Ins::AppendInPlace { dst, func, args, site } } else { Ins::CallBuiltin { dst, func, args, n, site } });
             }
         }
         let mut cargs = self.free_args.pop().unwrap_or_default();
@@ -4318,6 +4368,101 @@ impl Interpreter {
         let v = r?;
         self.put(base, dst, v);
         Ok(true)
+    }
+}
+
+impl Interpreter {
+    /// `AppendInPlace` (F4.8c): `Ok(false)` si ya no es el builtin `append` (volvió a ser `Call`: se
+    /// repite). Lo observable es lo de `CallBuiltin` con el builtin: la función sale de su registro,
+    /// la profundidad con el mismo tope y el mismo error, y el resultado es la lista de antes más el
+    /// elemento; sólo que, si P sigue teniendo esa misma lista, se agrega en ella (copiándola antes si
+    /// alguien más la comparte), como la vía en el lugar de la referencia.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_append_in_place(
+        &mut self,
+        chunk: &Chunk,
+        env: &Rc<RefCell<Environment>>,
+        base: usize,
+        at: usize,
+        dst: Reg,
+        func: Reg,
+        args: Reg,
+        site: u32,
+    ) -> Result<bool, Control> {
+        let first = base + args as usize;
+        let root = chunk.sites[site as usize].append;
+        let fits = matches!(&self.vm_regs[base + func as usize], SynValue::Builtin(b) if b.name == "append" && b.param_names.is_none())
+            && self.pending_kwargs.is_empty()
+            && root.is_some()
+            && matches!(&self.vm_regs[first], SynValue::List(_));
+        if fits {
+            // La profundidad, como la llamada al builtin (antes de hacer nada).
+            if self.recursion_depth + 1 > MAX_RECURSION {
+                drop(std::mem::replace(&mut self.vm_regs[base + func as usize], SynValue::Nothing));
+                return Err(err("maximum recursion depth exceeded"));
+            }
+            let mut a0 = Some(std::mem::replace(&mut self.vm_regs[first], SynValue::Nothing));
+            let mut item = Some(std::mem::replace(&mut self.vm_regs[first + 1], SynValue::Nothing));
+            let p = match &a0 {
+                Some(SynValue::List(l)) => Rc::as_ptr(l),
+                _ => unreachable!("lista"),
+            };
+            // Si P sigue teniendo esa lista: el clon del primer argumento se suelta antes (si P es la
+            // única dueña, se agrega sin copiar), `make_unique` y `push`.
+            let out = self
+                .vm_root_slot_mut(chunk, env, base, root.expect("raíz"), |slot| {
+                    if !matches!(slot, SynValue::List(r) if Rc::as_ptr(r) == p) {
+                        return None;
+                    }
+                    drop(a0.take());
+                    make_unique(slot);
+                    if let SynValue::List(l) = slot {
+                        l.borrow_mut().push(item.take().expect("elemento"));
+                    }
+                    Some(slot.clone())
+                })
+                .flatten();
+            if let Some(v) = out {
+                drop(std::mem::replace(&mut self.vm_regs[base + func as usize], SynValue::Nothing));
+                self.put(base, dst, v);
+                return Ok(true);
+            }
+            // P ya no la tiene (un argumento la religó): los argumentos vuelven a su lugar y el builtin.
+            self.vm_regs[first] = a0.expect("primer argumento");
+            self.vm_regs[first + 1] = item.expect("elemento");
+        }
+        // El builtin de siempre (y si ya no es un builtin, vuelve a ser `Call`).
+        let r = self.vm_call_builtin(chunk, base, at, dst, func, args, 2, site);
+        if matches!(r, Ok(false)) {
+            chunk.code[at].set(Ins::Call { dst, func, args, n: 2, site });
+        }
+        r
+    }
+
+    /// La variable raíz de `root` (como `vm_path_root_fast`: nunca la de un módulo), con `f`; `None` si
+    /// no está donde la VM la busca.
+    fn vm_root_slot_mut<R>(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, root: Root, f: impl FnOnce(&mut SynValue) -> R) -> Option<R> {
+        Some(match root {
+            Root::Param(r) => f(&mut self.vm_regs[base + r as usize]),
+            Root::Win(k) => f(self.vm_locals[self.vm_lbase + k as usize].as_mut()?),
+            Root::Local(k) => {
+                let mut e = env.borrow_mut();
+                if e.name.starts_with("module:") {
+                    return None;
+                }
+                f(e.bindings.slot_mut(k as usize)?)
+            }
+            Root::Free { name, ic } => {
+                let start = self.free_start(chunk, env, chunk.hops[chunk.ic_hops[ic as usize] as usize]);
+                let mut e = start.borrow_mut();
+                if e.name.starts_with("module:") {
+                    return None;
+                }
+                f(e.bindings.get_cached_mut(&chunk.names[name as usize], &chunk.ics[ic as usize])?)
+            }
+            Root::Slow => return None,
+        })
     }
 }
 

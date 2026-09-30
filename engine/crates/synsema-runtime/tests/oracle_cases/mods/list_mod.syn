@@ -1,0 +1,10 @@
+-- El módulo de `append_in_place.syn`: una lista exportada y otra no, que agregan sus tasks.
+export let ITEMS be []
+let hidden be []
+export task push(x, n)
+    each i in range(0, n)
+        set ITEMS to append(ITEMS, x + i)
+        set hidden to append(hidden, i)
+    give length(hidden)
+export task read_items()
+    give ITEMS
