@@ -1665,7 +1665,15 @@ pub(crate) fn build(
     b.append_block_params_for_function_params(entry);
     b.switch_to_block(entry);
     let ctx = b.block_params(entry)[0];
-    let params: Vec<Value> = b.block_params(entry)[1..=np].to_vec();
+    // F4.8a: la profundidad de este frame, en una variable (la entrada la trae del contexto; una
+    // llamada de la unidad, como parámetro). Va al contexto sólo al salir a la VM. (`steps` vive en el
+    // contexto: una suma en memoria por bloque; ver `emit_steps`.)
+    let dv = b.declare_var(I64);
+    {
+        let d0 = b.block_params(entry)[1];
+        b.def_var(dv, d0);
+    }
+    let params: Vec<Value> = b.block_params(entry)[HEAD_PARAMS..HEAD_PARAMS + np].to_vec();
     let vs = Vars { p: parts, need: needs(f.nvars, &plans[i].state), f: &f, ctx, h };
     let mut ptr_params = Vec::new();
     let mut ptr_slots = Vec::new();
@@ -1680,8 +1688,8 @@ pub(crate) fn build(
             let v = f.var_of(*place);
             if matches!(seen, NSeen::List | NSeen::Map | NSeen::Boxed | NSeen::ListIter) {
                 boxed_in.push((v, *seen, params[k]));
-                // El parámetro `k` del bloque de entrada (el 0 es el contexto).
-                ptr_params.push(k + 1);
+                // El parámetro `k` del bloque de entrada (antes: el contexto y la profundidad).
+                ptr_params.push(k + HEAD_PARAMS);
             } else {
                 init[f.var_of(*place)] = (seen_kind(*seen), Some(params[k]));
             }
@@ -2131,10 +2139,9 @@ pub(crate) fn build(
                 // función y el argumento salen de sus registros.
                 let Kind::Builtin(w) = st[freg as usize] else { unreachable!("intrínseco") };
                 let ex = exit_before!(pc);
-                let dp = ctx_load(&mut b, ctx, OFF_DEPTH);
-                let d = b.ins().load(I64, flags, dp, 0);
+                let d = b.use_var(dv);
                 let d1 = b.ins().iadd_imm_s(d, 1);
-                let mx = ctx_load(&mut b, ctx, OFF_MAX_DEPTH);
+                let mx = ctx_fixed(&mut b, ctx, OFF_MAX_DEPTH);
                 let over = b.ins().icmp(IntCC::UnsignedGreaterThan, d1, mx);
                 exit_if(&mut b, over, ex);
                 let a = NOpnd::Copy(args);
@@ -2220,14 +2227,13 @@ pub(crate) fn build(
                 // La profundidad de la VM, con el mismo tope: si lo pasaría, la VM hace la llamada
                 // (y da el error).
                 let ex = exit_before!(pc);
-                let dp = ctx_load(&mut b, ctx, OFF_DEPTH);
-                let d = b.ins().load(I64, flags, dp, 0);
+                let d = b.use_var(dv);
                 let d1 = b.ins().iadd_imm_s(d, 1);
-                let mx = ctx_load(&mut b, ctx, OFF_MAX_DEPTH);
+                let mx = ctx_fixed(&mut b, ctx, OFF_MAX_DEPTH);
                 let over = b.ins().icmp(IntCC::UnsignedGreaterThan, d1, mx);
                 exit_if(&mut b, over, ex);
-                b.ins().store(flags, d1, dp, 0);
-                let mut argv = vec![ctx];
+                // F4.8a: la profundidad de adentro como parámetro.
+                let mut argv = vec![ctx, d1];
                 for k in 0..na as usize {
                     argv.push(vs.word(&mut b, &st, NOpnd::Copy(args + k as u16)));
                 }
@@ -2252,7 +2258,6 @@ pub(crate) fn build(
                     }
                 };
                 exit_if(&mut b, status, ex2);
-                b.ins().store(flags, d, dp, 0);
                 vs.put_nothing(&mut b, freg as usize);
                 for v in f.call_window(target as usize, args, na) {
                     vs.put_nothing(&mut b, v);
@@ -2287,10 +2292,9 @@ pub(crate) fn build(
                 // Un nivel de profundidad, como la llamada al builtin (si pasaría el tope, la VM da
                 // el error); el paso cero también es un error de la VM.
                 let ex = exit_before!(pc);
-                let dp = ctx_load(&mut b, ctx, OFF_DEPTH);
-                let d = b.ins().load(I64, flags, dp, 0);
+                let d = b.use_var(dv);
                 let d1 = b.ins().iadd_imm_s(d, 1);
-                let mx = ctx_load(&mut b, ctx, OFF_MAX_DEPTH);
+                let mx = ctx_fixed(&mut b, ctx, OFF_MAX_DEPTH);
                 let over = b.ins().icmp(IntCC::UnsignedGreaterThan, d1, mx);
                 exit_if(&mut b, over, ex);
                 let a: Vec<Value> = (0..n).map(|k| int_opnd(&mut b, &vs, &st, NOpnd::Copy(first + k), Some(ex))).collect();
@@ -2411,6 +2415,12 @@ pub(crate) fn build(
         let pi = b.ins().iconst(I64, ex.point as i64);
         let cnt = b.ins().iconst(I64, stored as i64);
         let pcnt = b.ins().iconst(I64, nptr as i64);
+        // F4.8a: la profundidad de este frame, si es el de más adentro (después de una llamada que
+        // salió, ya la escribió el llamado).
+        if p.call.is_none() {
+            let d = b.use_var(dv);
+            b.ins().store(flags, d, ctx, OFF_DEPTH);
+        }
         b.ins().call(h.deopt, &[ctx, fi, pi, addr, cnt, paddr, pcnt]);
         let z = b.ins().iconst(I64, 0);
         b.ins().return_(&[z]);
@@ -2449,35 +2459,51 @@ fn cc(op: NCmp) -> IntCC {
     }
 }
 
-/// `steps += w` (como la VM: da la vuelta, no satura).
+/// `steps += w` (como la VM: da la vuelta, no satura), en el contexto mismo (F4.8a: una suma en
+/// memoria, `add $w, off(ctx)`, sin cargar un puntero). En una variable salía peor: el asignador de
+/// registros agregaba movimientos en cada salto hacia atrás (medido: `each` +6 %, bucle vacío +11 %).
 fn emit_steps(b: &mut FunctionBuilder, ctx: Value, w: u32) {
-    let p = ctx_load(b, ctx, OFF_STEPS);
-    let s = b.ins().load(I64, MemFlagsData::trusted(), p, 0);
+    let s = b.ins().load(I64, MemFlagsData::trusted(), ctx, OFF_STEPS);
     let s2 = b.ins().iadd_imm_s(s, w as i64);
-    b.ins().store(MemFlagsData::trusted(), s2, p, 0);
+    b.ins().store(MemFlagsData::trusted(), s2, ctx, OFF_STEPS);
 }
 
-/// El flag de cancelación puesto: sale a la VM (que suma los pasos y arma el error).
+/// Un campo del contexto que no cambia durante la llamada (el puntero al flag de cancelación, el
+/// tope de profundidad): `readonly` + `can_move` hacen que Cranelift la trate como pura (la saca de
+/// los bucles y junta las repetidas).
+fn ctx_fixed(b: &mut FunctionBuilder, ctx: Value, off: i32) -> Value {
+    b.ins().load(I64, MemFlagsData::trusted().with_readonly().with_can_move(), ctx, off)
+}
+
+/// El flag de cancelación puesto: sale a la VM (que suma los pasos y arma el error). El flag se lee
+/// cada vez con una carga atómica (el `load(Relaxed)` de la VM: lo escribe otro hilo). Con una carga
+/// común, un bucle sin escrituras a memoria (F4.8a: `steps` en una variable) dejaba que el análisis de
+/// alias de Cranelift juntara todas las lecturas en una y la cancelación nunca cortaba. Sólo la
+/// dirección sale del bucle.
 fn emit_cancel(b: &mut FunctionBuilder, ctx: Value, ex: Block) {
-    let c = ctx_load(b, ctx, OFF_CANCEL);
-    let flag = b.ins().uload8(I64, MemFlagsData::trusted(), c, 0);
+    let c = ctx_fixed(b, ctx, OFF_CANCEL);
+    let flag = b.ins().atomic_load(I8, MemFlagsData::trusted(), c);
     let ok = b.create_block();
     b.ins().brif(flag, ex, &[], ok, &[]);
     b.seal_block(ok);
     b.switch_to_block(ok);
 }
 
-/// La firma de una función de la unidad: el contexto y los parámetros, devuelve el valor (cada
-/// uno una palabra: un `Float` en sus bits).
+/// Los parámetros de una función de la unidad antes de los suyos: el contexto y la profundidad
+/// (F4.8a: en un registro; ver `build`).
+const HEAD_PARAMS: usize = 2;
+
+/// La firma de una función de la unidad: el contexto, la profundidad y los parámetros; devuelve el
+/// valor (cada uno una palabra: un `Float` en sus bits).
 pub(crate) fn signature(sig: &mut ir::Signature, nparams: usize) {
-    sig.params.push(AbiParam::new(I64));
-    for _ in 0..nparams {
+    for _ in 0..HEAD_PARAMS + nparams {
         sig.params.push(AbiParam::new(I64));
     }
     sig.returns.push(AbiParam::new(I64));
 }
 
-/// La entrada desde Rust: `(ctx, *const i64) -> i64`, carga los argumentos y llama a `f0`.
+/// La entrada desde Rust: `(ctx, *const i64) -> i64`, carga los argumentos y la profundidad y llama
+/// a `f0`.
 pub(crate) fn build_entry(func: &mut ir::Function, fbctx: &mut FunctionBuilderContext, f0: ir::FuncRef, nparams: usize, config: TargetFrontendConfig) {
     let mut b = FunctionBuilder::new(func, fbctx);
     let entry = b.create_block();
@@ -2485,7 +2511,8 @@ pub(crate) fn build_entry(func: &mut ir::Function, fbctx: &mut FunctionBuilderCo
     b.switch_to_block(entry);
     let ctx = b.block_params(entry)[0];
     let argp = b.block_params(entry)[1];
-    let mut argv = vec![ctx];
+    let depth = ctx_load(&mut b, ctx, OFF_DEPTH);
+    let mut argv = vec![ctx, depth];
     for k in 0..nparams {
         argv.push(b.ins().load(I64, MemFlagsData::trusted(), argp, (8 * k) as i32));
     }
@@ -2523,8 +2550,9 @@ pub(crate) fn check_memory(func: &ir::Function, entry_fn: bool) -> bool {
             let op = func.dfg.insts[inst].opcode();
             let args = func.dfg.inst_args(inst);
             let ok = match op {
-                Opcode::Load | Opcode::Uload8 => is_param(args[0]) || is_ctx_ptr(args[0]),
-                Opcode::Store => is_ctx_ptr(args[1]) || is_stack(args[1]),
+                Opcode::Load | Opcode::Uload8 | Opcode::AtomicLoad => is_param(args[0]) || is_ctx_ptr(args[0]),
+                // F4.8a: también en el contexto mismo (los contadores, a desplazamientos fijos).
+                Opcode::Store => args[1] == params[0] || is_ctx_ptr(args[1]) || is_stack(args[1]),
                 // Reinterpretar los bits de un valor (un `Float` en una palabra): no toca memoria.
                 Opcode::StackAddr | Opcode::Call | Opcode::Bitcast => true,
                 _ => !(op.can_load() || op.can_store() || op.is_call()),
@@ -2664,7 +2692,7 @@ mod tests {
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
-        let (ctx, x) = (b.block_params(entry)[0], b.block_params(entry)[1]);
+        let (ctx, x) = (b.block_params(entry)[0], b.block_params(entry)[HEAD_PARAMS]);
         body(&mut b, ctx, x);
         b.seal_all_blocks();
         f
@@ -2673,9 +2701,11 @@ mod tests {
     #[test]
     fn memory_through_the_context_is_allowed() {
         let f = func(|b, ctx, x| {
-            emit_steps(b, ctx, 3);
-            let p = ctx_load(b, ctx, OFF_DEPTH);
-            b.ins().store(MemFlagsData::trusted(), x, p, 0);
+            b.ins().store(MemFlagsData::trusted(), x, ctx, OFF_DEPTH);
+            let p = ctx_fixed(b, ctx, OFF_CANCEL);
+            let c = b.ins().atomic_load(I8, MemFlagsData::trusted(), p);
+            let c = b.ins().uextend(I64, c);
+            let _ = c;
             b.ins().return_(&[x]);
         });
         assert!(check_memory(&f, false));
@@ -2698,7 +2728,8 @@ mod tests {
             b.ins().return_(&[v]);
         });
         assert!(!check_memory(&g, false));
-        assert!(check_memory(&g, true));
+        // (La entrada sí carga de su segundo parámetro, el puntero a los argumentos: lo ejercita cada
+        // unidad que se compila, `build_entry` + `check_memory(…, true)`.)
     }
 
     #[test]

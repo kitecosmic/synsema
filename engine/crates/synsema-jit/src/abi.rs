@@ -1,6 +1,6 @@
 //! **El único módulo con `unsafe` del nivel nativo** (spec §F4.2). Cuatro cosas y nada más:
 //!
-//! 1. `Ctx`: lo que el código generado lee y escribe, con punteros a los contadores del intérprete.
+//! 1. `Ctx`: lo que el código generado lee y escribe (los contadores del intérprete, copiados).
 //! 2. `synsema_jit_deopt`: la función que el código generado llama al salir a la VM (copia los
 //!    valores que dejó en su pila).
 //! 3. `Compiled::call`: convertir la dirección de la entrada compilada en una función y llamarla, y
@@ -10,7 +10,7 @@
 //!    referencias y llaman a las funciones seguras de `synsema_core::native_tier`.
 //!
 //! Lo que hace falta para que sea seguro lo garantiza `lower`: el código generado sólo toca la
-//! memoria del `Ctx`, de los contadores a los que apunta, de los argumentos de la entrada y de sus
+//! memoria del `Ctx`, del flag de cancelación al que apunta, de los argumentos de la entrada y de sus
 //! propias ranuras de pila (`lower::check_memory` lo verifica en cada función antes de compilarla),
 //! sólo llama a funciones de su unidad y a las de acá, y los punteros que les pasa (y que guarda en
 //! las salidas) vienen de la entrada o de una lectura, nunca de una cuenta (`lower::check_pointers`).
@@ -40,8 +40,11 @@ compile_error!("synsema-jit sólo en 64 bits (la profundidad de la VM es un usiz
 /// El contexto de una llamada nativa. `#[repr(C)]`: el código generado lo lee a desplazamientos fijos.
 #[repr(C)]
 pub(crate) struct Ctx {
-    steps: *mut u64,
-    depth: *mut u64,
+    /// F4.8a: los contadores de la VM como valores (`call` los copia de la VM al empezar y de vuelta
+    /// al volver). El código generado suma `steps` acá mismo y lleva la profundidad en un registro,
+    /// que escribe acá al salir a la VM.
+    steps: u64,
+    depth: u64,
     cancel: *const u8,
     max_depth: u64,
     /// 0 mientras todo corre en nativo; 1 cuando algún frame salió a la VM.
@@ -259,8 +262,8 @@ impl NativeCode for Compiled {
         let mut sink: Vec<Raw> = Vec::new();
         let mut panic: Option<Box<dyn Any + Send>> = None;
         let mut ctx = Ctx {
-            steps: std::ptr::from_mut::<u64>(cx.steps),
-            depth: std::ptr::from_mut::<usize>(cx.depth).cast::<u64>(),
+            steps: *cx.steps,
+            depth: *cx.depth as u64,
             // Un `AtomicBool` tiene la representación de un `u8` (documentado en `std`).
             cancel: std::ptr::from_ref::<AtomicBool>(cx.cancel).cast::<u8>(),
             max_depth: cx.max_depth as u64,
@@ -276,8 +279,7 @@ impl NativeCode for Compiled {
         // `(i64, i64) -> i64` en la convención por defecto de la plataforma (la de `extern "C"`),
         // en memoria que `cranelift-jit` pasó a lectura+ejecución y que no se libera mientras vive
         // el hilo (el módulo es del hilo, como este valor: `Compiled` no es `Send`). Los punteros de
-        // `ctx` apuntan a datos vivos durante toda la llamada: los contadores del intérprete
-        // (préstamos exclusivos de `cx`, que no se usan mientras tanto), el flag de cancelación
+        // `ctx` apuntan a datos vivos durante toda la llamada: el flag de cancelación
         // (que otro hilo puede escribir de a un byte: el código lo lee con una carga de un byte,
         // como el `load(Relaxed)` de la VM), `args` (con `nparams` palabras, recién verificado),
         // `sink`, los sitios y `panic`. Qué memoria toca el código generado lo acota
@@ -286,6 +288,10 @@ impl NativeCode for Compiled {
             let f: extern "C" fn(*mut Ctx, *const i64) -> i64 = std::mem::transmute(self.entry);
             f(&mut ctx, args.as_ptr())
         };
+        // Lo que el código dejó en los contadores (al terminar, la profundidad volvió a la de antes; al
+        // salir, la del frame de más adentro).
+        *cx.steps = ctx.steps;
+        *cx.depth = ctx.depth as usize;
         if let Some(p) = panic {
             resume_unwind(p);
         }
