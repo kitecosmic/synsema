@@ -9694,7 +9694,7 @@ fn raw_str(v: &SynValue) -> String {
 /// `slot` pasa a apuntar a una copia propia (los elementos se comparten; cada nivel se
 /// copia recién cuando alguien escribe en él). Un valor privado se copia por dentro y
 /// conserva su etiqueta.
-fn make_unique(slot: &mut SynValue) {
+pub(crate) fn make_unique(slot: &mut SynValue) {
     make_unique_n(slot, 0)
 }
 

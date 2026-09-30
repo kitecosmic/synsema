@@ -43,6 +43,26 @@ pub(crate) struct Helpers {
     /// Las lecturas: sólo en una función con valores con caja (`has_boxed`); en una numérica no se
     /// declaran (cada declaración le cuesta a Cranelift al compilar) y un `Any` es sólo un escalar.
     pub reads: Option<Reads>,
+    /// F4.8d: las escrituras, sólo en un bucle que escribe (`has_writes`).
+    pub writes: Option<Writes>,
+}
+
+/// Las escrituras de `abi` (F4.8d). Cada una devuelve 0 si no la hace (el código sale a la VM antes
+/// de la instrucción).
+#[derive(Clone, Copy)]
+pub(crate) struct Writes {
+    /// `(ctx, lugar, v) -> dirección`: un valor prestado pasa a su lugar (un registro o una global).
+    pub home: ir::FuncRef,
+    /// `(ctx, lugar, v) -> dirección`: lo mismo en un lugar de la ventana.
+    pub home_local: ir::FuncRef,
+    /// `(ctx, raíz) -> 0/1`: `PathRoot`.
+    pub path_root: ir::FuncRef,
+    /// `(ctx, cursor, idx_tag, idx_bits, idx_ptr, site) -> dirección`: `PathStep`.
+    pub path_step: ir::FuncRef,
+    /// `(ctx, cursor, idx_tag, idx_bits, idx_ptr, site, v_tag, v_bits, v_ptr) -> 0/1`: `PathSet`.
+    pub path_set: ir::FuncRef,
+    /// `(ctx, raíz, primer argumento, tag, bits, ptr) -> 0/1`: `AppendInPlace`.
+    pub append: ir::FuncRef,
 }
 
 /// Las lecturas de valores con caja de `abi` (F4.7b).
@@ -65,6 +85,19 @@ pub(crate) struct Reads {
 impl Helpers {
     /// Qué argumentos de cada función son punteros (para `check_pointers`), y si devuelve uno.
     fn pointer_args(&self, f: ir::FuncRef) -> Option<(&'static [usize], bool)> {
+        if let Some(w) = self.writes {
+            if f == w.home || f == w.home_local {
+                return Some((&[1, 2], true));
+            } else if f == w.path_root {
+                return Some((&[1], false));
+            } else if f == w.path_step {
+                return Some((&[1, 4], true));
+            } else if f == w.path_set {
+                return Some((&[1, 4, 8], false));
+            } else if f == w.append {
+                return Some((&[1, 2, 5], false));
+            }
+        }
         let r = self.reads?;
         if f == r.index {
             Some((&[1, 4], false))
@@ -87,6 +120,12 @@ pub(crate) fn has_boxed(unit: &NUnit, i: usize, plan: &Plan) -> bool {
         || plan.inputs.iter().any(|(_, s)| boxed_seen(*s))
         || unit.funcs[i].params.iter().any(|s| boxed_seen(*s))
         || unit.funcs[i].globals.iter().any(|s| boxed_seen(*s))
+}
+
+/// F4.8d: si la función es un bucle que escribe (un `set` con camino, `append` en el lugar): entonces
+/// declara las escrituras y lo prestado que cruza una escritura pasa antes a su lugar.
+pub(crate) fn has_writes(unit: &NUnit, i: usize) -> bool {
+    unit.funcs[i].code.iter().any(|ins| matches!(ins, NIns::PathRoot { .. } | NIns::PathStep { .. } | NIns::PathSet { .. } | NIns::AppendPush { .. }))
 }
 
 /// Un valor con caja que entra prestado (la dirección de donde vive).
@@ -118,6 +157,10 @@ pub(crate) enum Kind {
     RangeFn,
     /// F4.7c: un builtin intrínseco.
     Builtin(NBuiltin),
+    /// F4.8d: el cursor de un `set` con camino: la dirección del lugar (la variable raíz, o uno de
+    /// adentro de un contenedor) que el paso siguiente abre o la hoja escribe. Al salir, se clona (la
+    /// VM tiene ahí una copia del contenedor).
+    Cursor,
     /// Según el camino, distinto: no se puede usar.
     Top,
 }
@@ -214,7 +257,7 @@ pub(crate) fn words(k: Kind) -> usize {
 /// Los punteros que guarda una salida para un valor de este tipo.
 pub(crate) fn ptr_words(k: Kind) -> usize {
     match k {
-        Kind::Any(_) | Kind::ListBody => 1,
+        Kind::Any(_) | Kind::ListBody | Kind::Cursor => 1,
         _ => 0,
     }
 }
@@ -261,13 +304,19 @@ pub(crate) struct Plan {
     /// los parámetros del bloque de entrada) y las ranuras de punteros de las salidas.
     pub ptr_params: Vec<usize>,
     pub ptr_slots: Vec<StackSlot>,
+    /// F4.8d (un bucle que escribe): antes de cada instrucción, lo que pasa a su lugar (lo prestado
+    /// que cruza una escritura); los lugares cuya dirección entra (después de `inputs`), y la
+    /// procedencia de cada lugar antes de cada instrucción (`Some(q)`: su puntero es el lugar de `q`).
+    pub homes_at: Vec<Vec<usize>>,
+    pub homes: Vec<Place>,
+    pub prov: Vec<Option<Vec<Option<usize>>>>,
 }
 
 impl Plan {
     /// Cuántos parámetros (además del contexto) tiene la función.
     pub fn nargs(&self, f: &NFunc) -> usize {
         if f.osr.is_some() {
-            self.inputs.len()
+            self.inputs.len() + self.homes.len()
         } else {
             // F4.8b: las globales que lee una task, después de sus parámetros.
             f.nparams as usize + f.globals.len()
@@ -781,6 +830,80 @@ impl<'u> Func<'u> {
                 *trap = true;
                 Next::Stop
             }
+            // F4.8d: las escrituras (en un bucle). Lo que el camino rápido de la VM no hace (una raíz
+            // que no es una lista o un mapa, un paso o una hoja de otro tipo) sale a la VM.
+            NIns::PathRoot { c, root } => {
+                let k = read(self.opnd_kind(st, root), trap)?;
+                if *trap {
+                    return Ok(Next::Stop);
+                }
+                match k {
+                    Kind::Any(_) => set(st, c, Kind::Cursor),
+                    Kind::Bot => set(st, c, Kind::Bot),
+                    _ => {
+                        *trap = true;
+                        return Ok(Next::Stop);
+                    }
+                }
+                Next::Fall
+            }
+            NIns::PathStep { c, idx, .. } | NIns::PathSet { c, idx, .. } => {
+                match st[c as usize] {
+                    Kind::Cursor => {}
+                    Kind::Bot => return Ok(Next::Stop),
+                    _ => return Err(()),
+                }
+                if let Some(i) = idx {
+                    let ki = read(self.opnd_kind(st, i), trap)?;
+                    if *trap {
+                        return Ok(Next::Stop);
+                    }
+                    if !matches!(ki, Kind::Int | Kind::Any(_) | Kind::Nothing | Kind::Bot) {
+                        *trap = true;
+                        return Ok(Next::Stop);
+                    }
+                    if let Some(r) = Self::consumed(i) {
+                        st[r] = Kind::Nothing;
+                    }
+                }
+                if let NIns::PathSet { src, dst, .. } = self.f.code[pc] {
+                    let k = read(self.opnd_kind(st, src), trap)?;
+                    if *trap {
+                        return Ok(Next::Stop);
+                    }
+                    if value_kind(k).is_none() && k != Kind::Bot {
+                        *trap = true;
+                        return Ok(Next::Stop);
+                    }
+                    if let Some(r) = Self::consumed(src) {
+                        st[r] = Kind::Nothing;
+                    }
+                    st[c as usize] = Kind::Nothing;
+                    set(st, dst, read_kind(k));
+                }
+                Next::Fall
+            }
+            NIns::AppendPush { dst, func, args, root } => {
+                match st[func as usize] {
+                    Kind::Builtin(NBuiltin::Append) => {}
+                    Kind::Bot => return Ok(Next::Stop),
+                    _ => return Err(()),
+                }
+                let kr = read(self.opnd_kind(st, root), trap)?;
+                let (k0, k1) = (read(st[args as usize], trap)?, read(st[args as usize + 1], trap)?);
+                if *trap {
+                    return Ok(Next::Stop);
+                }
+                if !matches!(kr, Kind::Any(_)) || !matches!(k0, Kind::Any(_)) || (value_kind(k1).is_none() && k1 != Kind::Bot) {
+                    *trap = true;
+                    return Ok(Next::Stop);
+                }
+                st[func as usize] = Kind::Nothing;
+                st[args as usize] = Kind::Nothing;
+                st[args as usize + 1] = Kind::Nothing;
+                set(st, dst, Kind::Any(false));
+                Next::Fall
+            }
         })
     }
 
@@ -1016,6 +1139,36 @@ impl<'u> Func<'u> {
                 uses.extend(0..self.nvars);
                 Vec::new()
             }
+            NIns::PathRoot { c, root } => {
+                uses.extend(self.opnd_var(root));
+                defs.push(c as usize);
+                fall
+            }
+            NIns::PathStep { c, idx, .. } => {
+                uses.push(c as usize);
+                if let Some(i) = idx {
+                    op(&mut uses, &mut defs, i);
+                }
+                defs.push(c as usize);
+                fall
+            }
+            NIns::PathSet { c, idx, src, dst: d, .. } => {
+                uses.push(c as usize);
+                if let Some(i) = idx {
+                    op(&mut uses, &mut defs, i);
+                }
+                op(&mut uses, &mut defs, src);
+                defs.push(c as usize);
+                dst(&mut defs, d);
+                fall
+            }
+            NIns::AppendPush { dst: d, func, args, root } => {
+                uses.extend([func as usize, args as usize, args as usize + 1]);
+                uses.extend(self.opnd_var(root));
+                defs.extend([func as usize, args as usize, args as usize + 1]);
+                dst(&mut defs, d);
+                fall
+            }
         };
         (uses, defs, succ)
     }
@@ -1051,6 +1204,127 @@ impl<'u> Func<'u> {
             }
         }
         live
+    }
+}
+
+/// La procedencia de cada lugar (F4.8d): `Some(q)`, su puntero es el lugar de `q` en la VM (`q` mismo:
+/// el valor está en su lugar, con su cuenta; otro: prestado de ahí); `None`, otra cosa (prestado de
+/// adentro de un contenedor, o un escalar).
+type Prov = Vec<Option<usize>>;
+
+impl Func<'_> {
+    /// Si la instrucción escribe: lo prestado que la cruza tiene que tener dueño antes.
+    fn clobbers(&self, pc: usize) -> bool {
+        matches!(self.f.code[pc], NIns::PathRoot { .. } | NIns::PathStep { .. } | NIns::PathSet { .. } | NIns::AppendPush { .. })
+    }
+
+    /// La procedencia después de la instrucción `pc` (sin lo que pasa a su lugar antes de ella).
+    fn prov_step(&self, pc: usize, cur: &mut Prov) {
+        let (_, defs, _) = self.uses_defs(pc);
+        let of = |cur: &Prov, o: NOpnd| self.opnd_var(o).and_then(|v| cur[v]);
+        let (target, p): (Vec<usize>, Option<usize>) = match self.f.code[pc] {
+            NIns::Move { dst, src } => (if dst != DISCARD { vec![dst as usize] } else { Vec::new() }, of(cur, src)),
+            NIns::LetLocal { src, slot, dst } | NIns::SetLocal { src, slot, dst } => {
+                let mut t = vec![self.nregs + slot as usize];
+                if dst != DISCARD {
+                    t.push(dst as usize);
+                }
+                (t, of(cur, src))
+            }
+            NIns::SetGlobal { src, g, dst } | NIns::LetGlobal { src, g, dst } => {
+                let mut t = vec![self.global_var(g)];
+                if dst != DISCARD {
+                    t.push(dst as usize);
+                }
+                (t, of(cur, src))
+            }
+            NIns::PathSet { src, dst, .. } => (if dst != DISCARD { vec![dst as usize] } else { Vec::new() }, of(cur, src)),
+            // El resultado es la raíz (su lugar).
+            NIns::AppendPush { dst, root, .. } => (if dst != DISCARD { vec![dst as usize] } else { Vec::new() }, self.opnd_var(root)),
+            _ => (Vec::new(), None),
+        };
+        for d in defs {
+            cur[d] = None;
+        }
+        for t in target {
+            cur[t] = p;
+        }
+    }
+
+    /// F4.8d: en un bucle que escribe, qué pasa a su lugar antes de cada instrucción (lo prestado que
+    /// está vivo al llegar a una escritura) y la procedencia antes de cada una. `None` si no se puede:
+    /// un iterador de una lista armado en el bucle (prestado) que cruza una escritura.
+    #[allow(clippy::type_complexity)]
+    fn provenance(&self, state: &[Option<Vec<Kind>>], trap: &[bool], live: &[Vec<bool>]) -> Option<(Vec<Vec<usize>>, Vec<Option<Prov>>)> {
+        let n = self.f.code.len();
+        let o = self.f.osr.as_ref()?;
+        let touched = self.touched();
+        let mut prov: Vec<Option<Prov>> = vec![None; n];
+        prov[o.head as usize] = Some(
+            (0..self.nvars)
+                .map(|v| (touched[v] && matches!(o.init[v], NSeen::List | NSeen::Map | NSeen::Boxed | NSeen::ListIter)).then_some(v))
+                .collect(),
+        );
+        let homed = |pc: usize, cur: &Prov| -> Vec<usize> {
+            let Some(st) = &state[pc] else { return Vec::new() };
+            if trap[pc] || !self.clobbers(pc) {
+                return Vec::new();
+            }
+            // Lo que la escritura misma consume (el primer argumento de `append`, el valor y el índice
+            // de la hoja) muere ahí: la VM lo suelta antes de escribir (si no, `append` copiaría la lista
+            // en cada vuelta) y lo que se guarda, se clona.
+            let (uses, defs, _) = self.uses_defs(pc);
+            (0..self.nvars)
+                .filter(|&v| live[pc][v] && matches!(st[v], Kind::Any(_)) && cur[v] != Some(v) && !(uses.contains(&v) && defs.contains(&v)))
+                .collect()
+        };
+        let mut work = vec![o.head as usize];
+        while let Some(pc) = work.pop() {
+            if state[pc].is_none() || trap[pc] {
+                continue;
+            }
+            let mut cur = prov[pc].clone().expect("procedencia");
+            for v in homed(pc, &cur) {
+                cur[v] = Some(v);
+            }
+            self.prov_step(pc, &mut cur);
+            for s in self.uses_defs(pc).2 {
+                if s >= n || state[s].is_none() {
+                    continue;
+                }
+                let changed = match &mut prov[s] {
+                    Some(old) => {
+                        let mut ch = false;
+                        for (a, b) in old.iter_mut().zip(&cur) {
+                            if *a != *b && a.is_some() {
+                                *a = None;
+                                ch = true;
+                            }
+                        }
+                        ch
+                    }
+                    slot @ None => {
+                        *slot = Some(cur.clone());
+                        true
+                    }
+                };
+                if changed {
+                    work.push(s);
+                }
+            }
+        }
+        let mut homes_at = vec![Vec::new(); n];
+        for pc in 0..n {
+            let Some(cur) = &prov[pc] else { continue };
+            homes_at[pc] = homed(pc, cur);
+            // Un iterador de una lista armado en el bucle, vivo al escribir: no tiene su propia cuenta.
+            if let (Some(st), true) = (&state[pc], self.clobbers(pc) && !trap[pc]) {
+                if (0..self.nvars).any(|v| live[pc][v] && st[v] == Kind::ListBody && cur[v] != Some(v)) {
+                    return None;
+                }
+            }
+        }
+        Some((homes_at, prov))
     }
 }
 
@@ -1182,7 +1456,25 @@ pub(crate) fn plan(unit: &NUnit) -> Option<Vec<Plan>> {
                 return None;
             }
         }
-        plans.push(Plan { state, live, trap, ret, params, points: Vec::new(), inputs, ptr_params: Vec::new(), ptr_slots: Vec::new() });
+        // F4.8d: un bucle que escribe: qué pasa a su lugar antes de cada escritura.
+        let (mut homes_at, mut homes, mut prov) = (vec![Vec::new(); f.f.code.len()], Vec::new(), vec![None; f.f.code.len()]);
+        if f.f.osr.is_some() && (0..f.f.code.len()).any(|pc| f.clobbers(pc) && state[pc].is_some() && !trap[pc]) {
+            let (h, p) = f.provenance(&state, &trap, &live)?;
+            let mut hv: Vec<usize> = h.iter().flatten().copied().collect();
+            hv.sort_unstable();
+            hv.dedup();
+            // Un iterador no pasa a su lugar (ver `provenance`).
+            if hv.iter().any(|v| matches!(f.place_of(*v), Place::Iter(..))) {
+                return None;
+            }
+            homes = hv.into_iter().map(|v| f.place_of(v)).collect();
+            homes_at = h;
+            prov = p;
+            if inputs.len() + homes.len() > MAX_INPUTS {
+                return None;
+            }
+        }
+        plans.push(Plan { state, live, trap, ret, params, points: Vec::new(), inputs, ptr_params: Vec::new(), ptr_slots: Vec::new(), homes_at, homes, prov });
     }
     Some(plans)
 }
@@ -1253,7 +1545,7 @@ fn needs(nvars: usize, state: &[Option<Vec<Kind>>]) -> Vec<Need> {
         for (n, k) in out.iter_mut().zip(st) {
             match k {
                 Kind::Any(_) => *n = Need { tag: true, bits: true, f: true, ptr: true },
-                Kind::ListBody => n.ptr = true,
+                Kind::ListBody | Kind::Cursor => n.ptr = true,
                 Kind::Float => n.f = true,
                 Kind::Int | Kind::Bool | Kind::Nothing => n.bits = true,
                 _ => {}
@@ -1304,7 +1596,7 @@ impl Vars<'_> {
     /// Su puntero (sólo con caja; si no, 0).
     fn ptr(&self, b: &mut FunctionBuilder, st: &[Kind], o: NOpnd) -> Value {
         match self.f.opnd_kind(st, o) {
-            Kind::Any(_) | Kind::ListBody => b.use_var(self.var(o).expect("variable").ptr),
+            Kind::Any(_) | Kind::ListBody | Kind::Cursor => b.use_var(self.var(o).expect("variable").ptr),
             _ => b.ins().iconst(I64, 0),
         }
     }
@@ -1438,6 +1730,38 @@ impl Vars<'_> {
                 b.def_var(self.p[dst].ptr, q);
             }
             _ => self.put_other(b, dst),
+        }
+    }
+
+    /// F4.8d: un valor para una escritura de `abi`: su etiqueta, sus bits (un `Float`, los de su `f64`)
+    /// y su puntero (con caja; si no, 0).
+    fn value_parts(&self, b: &mut FunctionBuilder, st: &[Kind], o: NOpnd) -> (Value, Value, Value) {
+        let k = self.f.opnd_kind(st, o);
+        let t = self.tag(b, st, o);
+        let bits = match k {
+            Kind::Float => {
+                let x = self.float(b, o);
+                b.ins().bitcast(I64, MemFlagsData::new(), x)
+            }
+            Kind::Any(_) => {
+                let x = self.float(b, o);
+                let fb = b.ins().bitcast(I64, MemFlagsData::new(), x);
+                let ib = self.bits(b, o);
+                let isf = b.ins().icmp_imm_s(IntCC::Equal, t, TAG_FLOAT);
+                b.ins().select(isf, fb, ib)
+            }
+            Kind::Int | Kind::Bool => self.bits(b, o),
+            _ => b.ins().iconst(I64, 0),
+        };
+        let p = self.ptr(b, st, o);
+        (t, bits, p)
+    }
+
+    /// F4.8d: el índice de un paso o de la hoja (`None`: la clave del sitio).
+    fn index_parts(&self, b: &mut FunctionBuilder, st: &[Kind], idx: Option<NOpnd>) -> (Value, Value, Value) {
+        match idx {
+            Some(o) => (self.tag(b, st, o), self.bits(b, o), self.ptr(b, st, o)),
+            None => (b.ins().iconst(I64, TAG_NOTHING), b.ins().iconst(I64, 0), b.ins().iconst(I64, 0)),
         }
     }
 
@@ -1709,6 +2033,7 @@ pub(crate) fn build(
     let mut init: Vec<(Kind, Option<Value>)> = vec![(Kind::Bot, None); f.nvars];
     // F4.7b: los lugares con caja entran como su dirección (y su clase como etiqueta).
     let mut boxed_in: Vec<(usize, NSeen, Value)> = Vec::new();
+    let mut home_param: HashMap<usize, Value> = HashMap::new();
     if f.f.osr.is_some() {
         for (k, (place, seen)) in plans[i].inputs.iter().enumerate() {
             let v = f.var_of(*place);
@@ -1719,6 +2044,12 @@ pub(crate) fn build(
             } else {
                 init[f.var_of(*place)] = (seen_kind(*seen), Some(params[k]));
             }
+        }
+        // F4.8d: las direcciones de los lugares donde el código deja un valor antes de una escritura.
+        let nin = plans[i].inputs.len();
+        for (hk, place) in plans[i].homes.iter().enumerate() {
+            home_param.insert(f.var_of(*place), params[nin + hk]);
+            ptr_params.push(nin + hk + HEAD_PARAMS);
         }
     } else {
         let npar = f.f.nparams as usize;
@@ -1876,6 +2207,28 @@ pub(crate) fn build(
                 let t = b.use_var(vs.p[v].tag);
                 let hole = b.ins().icmp_imm_s(IntCC::Equal, t, TAG_HOLE);
                 exit_if(&mut b, hole, ex);
+            }
+        }
+        // F4.8d: antes de una escritura, lo prestado que la cruza pasa a su lugar en la VM (su propia
+        // cuenta, como en la VM): si tiene caja, una copia en su lugar, y su puntero pasa a ser ése.
+        if let Some(w) = h.writes {
+            for &v in &plan.homes_at[pc] {
+                let t = b.use_var(vs.p[v].tag);
+                let boxed = b.ins().icmp_imm_s(IntCC::SignedGreaterThanOrEqual, t, TAG_LIST);
+                let call = b.create_block();
+                let join = b.create_block();
+                b.ins().brif(boxed, call, &[], join, &[]);
+                b.seal_block(call);
+                b.switch_to_block(call);
+                let src = b.use_var(vs.p[v].ptr);
+                let slot = *home_param.get(&v)?;
+                let hf = if matches!(f.place_of(v), Place::Local(_)) { w.home_local } else { w.home };
+                let r = b.ins().call(hf, &[ctx, slot, src]);
+                let r = b.inst_results(r)[0];
+                b.def_var(vs.p[v].ptr, r);
+                b.ins().jump(join, &[]);
+                b.seal_block(join);
+                b.switch_to_block(join);
             }
         }
         match f.f.code[pc] {
@@ -2238,6 +2591,8 @@ pub(crate) fn build(
                             }
                         }
                     }
+                    // (En una llamada común sale a la VM: el análisis de tipos la marca.)
+                    NBuiltin::Append => unreachable!("append fuera de AppendPush"),
                     NBuiltin::Float => {
                         // `float(x)`: un número a f64, un `Bool` a 1.0/0.0 (sus bits son 1/0: la
                         // misma conversión que un entero).
@@ -2413,6 +2768,88 @@ pub(crate) fn build(
                 }
             }
             NIns::Trap { .. } | NIns::Leave { .. } => unreachable!("salida sin trap"),
+            // F4.8d: las escrituras, por `abi` (lo que no hacen sale a la VM antes de la instrucción).
+            NIns::PathRoot { c, root } => {
+                let ex = exit_before!(pc);
+                let t = vs.tag(&mut b, &st, root);
+                guard_tags(&mut b, t, &[TAG_LIST, TAG_MAP], ex);
+                let p = vs.ptr(&mut b, &st, root);
+                let r = b.ins().call(h.writes?.path_root, &[ctx, p]);
+                let r = b.inst_results(r)[0];
+                let bad = b.ins().icmp_imm_s(IntCC::Equal, r, 0);
+                exit_if(&mut b, bad, ex);
+                if c != DISCARD {
+                    b.def_var(vs.p[c as usize].ptr, p);
+                }
+            }
+            NIns::PathStep { c, idx, site } => {
+                let ex = exit_before!(pc);
+                let cp = b.use_var(vs.p[c as usize].ptr);
+                let (it, ib, ip) = vs.index_parts(&mut b, &st, idx);
+                let sv = b.ins().iconst(I64, i64::from(site));
+                let r = b.ins().call(h.writes?.path_step, &[ctx, cp, it, ib, ip, sv]);
+                let r = b.inst_results(r)[0];
+                let bad = b.ins().icmp_imm_s(IntCC::Equal, r, 0);
+                exit_if(&mut b, bad, ex);
+                if let Some(o) = idx {
+                    vs.consume(&mut b, o);
+                }
+                b.def_var(vs.p[c as usize].ptr, r);
+            }
+            NIns::PathSet { c, idx, site, src, dst } => {
+                let ex = exit_before!(pc);
+                let cp = b.use_var(vs.p[c as usize].ptr);
+                let (it, ib, ip) = vs.index_parts(&mut b, &st, idx);
+                let sv = b.ins().iconst(I64, i64::from(site));
+                let (vt, vb, vp) = vs.value_parts(&mut b, &st, src);
+                let r = b.ins().call(h.writes?.path_set, &[ctx, cp, it, ib, ip, sv, vt, vb, vp]);
+                let r = b.inst_results(r)[0];
+                let bad = b.ins().icmp_imm_s(IntCC::Equal, r, 0);
+                exit_if(&mut b, bad, ex);
+                // El valor, a `dst` (como la VM), antes de consumir los operandos.
+                if dst != DISCARD {
+                    vs.copy(&mut b, &st, src, dst as usize);
+                }
+                if let Some(o) = idx {
+                    vs.consume(&mut b, o);
+                }
+                if Some(dst as usize) != Func::consumed(src) {
+                    vs.consume(&mut b, src);
+                }
+                vs.put_nothing(&mut b, c as usize);
+            }
+            NIns::AppendPush { dst, func, args, root } => {
+                let ex = exit_before!(pc);
+                // Un nivel de profundidad, como la llamada al builtin.
+                let d = b.use_var(dv);
+                let d1 = b.ins().iadd_imm_s(d, 1);
+                let mx = ctx_fixed(&mut b, ctx, OFF_MAX_DEPTH);
+                let over = b.ins().icmp(IntCC::UnsignedGreaterThan, d1, mx);
+                exit_if(&mut b, over, ex);
+                let a0 = NOpnd::Copy(args);
+                let tr = vs.tag(&mut b, &st, root);
+                guard_tags(&mut b, tr, &[TAG_LIST], ex);
+                let ta = vs.tag(&mut b, &st, a0);
+                guard_tags(&mut b, ta, &[TAG_LIST], ex);
+                let rp = vs.ptr(&mut b, &st, root);
+                let ap = vs.ptr(&mut b, &st, a0);
+                let (it, ib, ip) = vs.value_parts(&mut b, &st, NOpnd::Copy(args + 1));
+                let r = b.ins().call(h.writes?.append, &[ctx, rp, ap, it, ib, ip]);
+                let r = b.inst_results(r)[0];
+                let bad = b.ins().icmp_imm_s(IntCC::Equal, r, 0);
+                exit_if(&mut b, bad, ex);
+                vs.put_nothing(&mut b, func as usize);
+                vs.put_nothing(&mut b, args as usize);
+                vs.put_nothing(&mut b, args as usize + 1);
+                if dst != DISCARD {
+                    // El resultado es la lista de la raíz (en su lugar).
+                    let d = dst as usize;
+                    vs.put_tag(&mut b, d, TAG_LIST);
+                    let z = b.ins().iconst(I64, 0);
+                    vs.put_bits(&mut b, d, z);
+                    b.def_var(vs.p[d].ptr, rp);
+                }
+            }
         }
     }
     if open {
@@ -2444,7 +2881,11 @@ pub(crate) fn build(
                 k += 1;
             }
             if let (1, Some(ps)) = (ptr_words(*kind), pslot) {
-                let x = b.use_var(pv.ptr);
+                // F4.8d: un valor con caja que ya está en su lugar de la VM (su procedencia es su propio
+                // lugar): 0, y la VM lo deja ahí (`NVal::Keep`).
+                let v = f.var_of(*place);
+                let keep = matches!(kind, Kind::Any(_)) && plan.prov.get(p.pc as usize).and_then(|x| x.as_ref()).is_some_and(|pv| pv[v] == Some(v));
+                let x = if keep { b.ins().iconst(I64, 0) } else { b.use_var(pv.ptr) };
                 b.ins().stack_store(I64, x, ps, 8 * kp);
                 kp += 1;
             }

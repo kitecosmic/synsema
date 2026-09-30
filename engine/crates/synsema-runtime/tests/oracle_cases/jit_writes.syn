@@ -1,0 +1,90 @@
+-- F4.8d: escrituras desde el nivel nativo (`set <camino> to v` y `set P to append(P, e)` en un bucle
+-- que corre en nativo). Lo prestado que cruza una escritura tiene su propia cuenta, como en la VM: un
+-- alias o un elemento que alguien guardó no cambian (copy-on-write); la raíz global y la de la
+-- ventana; formas que cambian al escribir (una clave nueva: la hace la VM), un mapa en modo
+-- diccionario, índices negativos, el contenedor como valor de sí mismo, y un `each` sobre la lista
+-- que el cuerpo agranda.
+
+let bodies be [{"x": 1.0, "vx": 0.5, "m": 2.0}, {"x": 2.0, "vx": 0.25, "m": 1.0}, {"x": 3.0, "vx": 0.0, "m": 4.0}]
+let foto be bodies
+let guardado be bodies[1]
+let dt be 0.01
+each s in range(0, 400)
+    each i in range(0, 3)
+        set bodies[i].vx to bodies[i].vx - bodies[i].x * dt
+        set bodies[i].x to bodies[i].x + dt * bodies[i].vx
+print(bodies, foto[0], guardado)
+
+-- Un alias que se toma a mitad del bucle nativo: la escritura siguiente copia (la raíz única).
+let fotos2 be []
+each s in range(0, 300)
+    when s % 50 == 7
+        set fotos2 to append(fotos2, bodies)
+    set bodies[s % 3].vx to bodies[s % 3].vx + 1.0
+print(fotos2[0][0].vx, fotos2[5][1].vx, bodies[2].vx)
+
+-- Un elemento guardado en el bucle antes de escribirlo: sigue siendo la foto.
+let fotos be []
+each s in range(0, 300)
+    let b be bodies[s % 3]
+    set bodies[s % 3].m to bodies[s % 3].m + 1.0
+    when s % 100 == 0
+        set fotos to append(fotos, b)
+print(fotos, bodies[0].m)
+
+-- Listas de números: índices, negativos, anidadas; una clave nueva a mitad del bucle (la VM).
+let xs be range(0, 20)
+let grid be [[0, 0, 0], [1, 1, 1]]
+let m be {"a": 0, "b": 0}
+each i in range(0, 500)
+    set xs[i % 20] to xs[i % 20] + i
+    set xs[-1] to xs[-1] + 1
+    set grid[i % 2][i % 3] to grid[i % 2][i % 3] + i
+    set m.a to m.a + 1
+    set m["b"] to m["b"] + 2
+    when i == 250
+        set m.c to 7
+print(xs, grid, m)
+
+-- Un mapa de 40 claves (diccionario), con claves de texto que cambian.
+let big be {}
+let keys be []
+each k in range(0, 40)
+    set big["k" + text(k)] to k
+    set keys to append(keys, "k" + text(k))
+each i in range(0, 2000)
+    set big[keys[i % 40]] to big[keys[i % 40]] + 1
+print(big["k0"], big["k39"], length(big))
+
+-- `append` en el lugar con un solo dueño y con un alias que sigue vivo.
+let ys be []
+let zs be []
+let alias be zs
+each i in range(0, 3000)
+    set ys to append(ys, i * i)
+    set zs to append(zs, i)
+    when i == 1500
+        set alias to zs
+print(length(ys), ys[2999], length(zs), length(alias))
+
+-- El contenedor como valor de sí mismo, y un `each` sobre la lista que el cuerpo agranda (la foto).
+let ws be [1, 2, 3]
+each i in range(0, 50)
+    set ws[0] to ws[1] + i
+set ws[2] to ws
+print(ws)
+let vs be [1, 2, 3]
+let suma be 0
+each v in vs
+    set suma to suma + v
+    set vs to append(vs, v)
+print(suma, length(vs))
+
+-- Una task del programa que lee la global que el bucle escribe.
+let total be [0]
+task leer()
+    give total[0]
+each i in range(0, 2000)
+    set total[0] to total[0] + i
+print(leer(), total)
+print(steps())

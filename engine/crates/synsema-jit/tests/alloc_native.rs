@@ -64,6 +64,11 @@ fn native_reads_do_not_allocate() {
         ("grid[i][j]", "    set t to t + grid[i % 2][(i + 1) % 2]\n"),
         ("m.a y m[\"b\"]", "    set s to s + m.a + m[\"b\"]\n"),
         ("recs[i].x", "    set t to t + recs[i % 2].x + recs[i % 2].y\n"),
+        // F4.8d: escrituras en el bucle nativo con un solo dueño: en el lugar, sin copiar.
+        ("set xs[i] (escritura)", "    set xs[i % 4] to xs[i % 4] + 1.0\n"),
+        ("set m.a / m[\"b\"] (escritura)", "    set m.a to m.a + 1\n    set m[\"b\"] to 0.5\n"),
+        ("set recs[i].x (escritura)", "    set recs[i % 2].x to recs[i % 2].x + i\n"),
+        ("set grid[i][j] (escritura)", "    set grid[i % 2][(i + 1) % 2] to i\n"),
     ];
     let before = native_tier::stats();
     let mut bad = Vec::new();

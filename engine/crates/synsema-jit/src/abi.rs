@@ -206,6 +206,125 @@ pub(crate) extern "C" fn synsema_jit_length(ctx: *mut Ctx, v: *const SynValue) -
     len
 }
 
+/// Corre una escritura (F4.8d): devuelve lo que devuelve `f` (0: no la hizo, el código sale a la VM).
+/// Un pánico no cruza el código generado: queda guardado, da 0 y `call` lo relanza al volver.
+fn write(ctx: *mut Ctx, f: impl FnOnce() -> i64) -> i64 {
+    // SAFETY: como en `read`.
+    let c = unsafe { &mut *ctx };
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(e) => {
+            // SAFETY: como en `read`.
+            unsafe { *c.panic = Some(e) };
+            0
+        }
+    }
+}
+
+/// F4.8d: un valor prestado (`src`) pasa a su lugar (`slot`, un registro o una global de la VM): una
+/// copia, que suelta lo que había. Devuelve la dirección del lugar.
+pub(crate) extern "C" fn synsema_jit_home(ctx: *mut Ctx, slot: *mut SynValue, src: *const SynValue) -> i64 {
+    write(ctx, || {
+        if std::ptr::eq(slot.cast_const(), src) {
+            return slot as usize as i64;
+        }
+        // SAFETY: `slot` es la dirección de un lugar de la VM que la entrada tomó por `&mut` (ver
+        // `vm_osr_args`); `src`, la de un valor vivo (un lugar de la VM o de adentro de un contenedor):
+        // los dos siguen ahí porque nada mueve la memoria de la VM mientras corre el código nativo (las
+        // escrituras de acá sólo cambian el contenido de listas y mapas). Se clona antes de tomar el
+        // lugar por `&mut` (distinto de `src`, recién visto), y no quedan otras referencias vivas.
+        unsafe {
+            let v = (*src).clone();
+            native_tier::home(&mut *slot, v);
+        }
+        slot as usize as i64
+    })
+}
+
+/// F4.8d: lo mismo en un lugar de la ventana (`Option`: puede estar vacío).
+pub(crate) extern "C" fn synsema_jit_home_local(ctx: *mut Ctx, slot: *mut Option<SynValue>, src: *const SynValue) -> i64 {
+    write(ctx, || {
+        // SAFETY: como en `synsema_jit_home`. Si `src` ya es el valor del lugar, no se copia.
+        unsafe {
+            if let Some(v) = (*slot).as_ref() {
+                if std::ptr::eq(v, src) {
+                    return src as usize as i64;
+                }
+            }
+            let v = (*src).clone();
+            native_tier::home_local(&mut *slot, v) as usize as i64
+        }
+    })
+}
+
+/// F4.8d: `PathRoot` sobre la variable de la dirección `root` (su lugar en la VM).
+pub(crate) extern "C" fn synsema_jit_path_root(ctx: *mut Ctx, root: *mut SynValue) -> i64 {
+    write(ctx, || {
+        // SAFETY: `root` es el lugar de la variable raíz en la VM (el código generado lo dejó ahí
+        // antes: ver `lower::Func::provenance`), vivo y sin otras referencias mientras corre esto.
+        i64::from(native_tier::path_root(unsafe { &mut *root }))
+    })
+}
+
+/// F4.8d: `PathStep`: la dirección del lugar de adentro del cursor, o 0.
+pub(crate) extern "C" fn synsema_jit_path_step(ctx: *mut Ctx, parent: *const SynValue, tag: i64, bits: i64, idx: *const SynValue, site: i64) -> i64 {
+    write(ctx, || {
+        // SAFETY: `parent` es el cursor (el lugar de la raíz, o uno de adentro que devolvió el paso
+        // anterior, sin escrituras en el medio); `idx`, nulo o un valor vivo. Sólo referencias
+        // compartidas: lo que se escribe está detrás del `RefCell` del contenedor.
+        let c = unsafe { &*ctx };
+        let (parent, idx) = unsafe { (parent.as_ref(), idx.as_ref()) };
+        match (parent, c.site(site)) {
+            (Some(p), Some(s)) => native_tier::path_step(p, tag, bits, idx, s).map_or(0, |x| x as usize as i64),
+            _ => 0,
+        }
+    })
+}
+
+/// F4.8d: `PathSet`: escribe el valor (`v_*`) en la hoja; 1 si lo hizo.
+#[allow(clippy::too_many_arguments)]
+pub(crate) extern "C" fn synsema_jit_path_set(
+    ctx: *mut Ctx,
+    parent: *const SynValue,
+    tag: i64,
+    bits: i64,
+    idx: *const SynValue,
+    site: i64,
+    v_tag: i64,
+    v_bits: i64,
+    v_ptr: *const SynValue,
+) -> i64 {
+    write(ctx, || {
+        // SAFETY: como en `synsema_jit_path_step`; el valor se arma (se clona) antes de escribir.
+        let c = unsafe { &*ctx };
+        let (parent, idx, vp) = unsafe { (parent.as_ref(), idx.as_ref(), v_ptr.as_ref()) };
+        let Some(v) = native_tier::nvalue(v_tag, v_bits, vp) else { return 0 };
+        match (parent, c.site(site)) {
+            (Some(p), Some(s)) => i64::from(native_tier::path_set(p, tag, bits, idx, s, v)),
+            _ => 0,
+        }
+    })
+}
+
+/// F4.8d: `AppendInPlace`: si `arg0` es la lista de la raíz (el lugar de la variable), agrega el
+/// elemento en ella; 1 si lo hizo.
+pub(crate) extern "C" fn synsema_jit_append(ctx: *mut Ctx, root: *mut SynValue, arg0: *const SynValue, tag: i64, bits: i64, ptr: *const SynValue) -> i64 {
+    write(ctx, || {
+        // SAFETY: `root` es el lugar de la variable en la VM (ver `synsema_jit_path_root`); `arg0` y
+        // `ptr`, nulos o valores vivos. Primero, con referencias compartidas: el elemento se clona y se
+        // compara la lista; después, sin ninguna otra viva, la raíz por `&mut`.
+        let (item, same) = unsafe {
+            let Some(item) = native_tier::nvalue(tag, bits, ptr.as_ref()) else { return 0 };
+            let same = std::ptr::eq(arg0, root.cast_const()) || arg0.as_ref().is_some_and(|a| native_tier::same_list(a, &*root));
+            (item, same)
+        };
+        if !same {
+            return 0;
+        }
+        i64::from(native_tier::append_push(unsafe { &mut *root }, item))
+    })
+}
+
 /// Una unidad compilada.
 pub(crate) struct Compiled {
     /// La entrada `(ctx, *const i64) -> i64` (ya en memoria ejecutable, de sólo lectura).
@@ -218,6 +337,8 @@ pub(crate) struct Compiled {
     pub(crate) points: Vec<Vec<Point>>,
     /// F4.7b: los sitios de lectura (con sus cachés).
     pub(crate) sites: Vec<SiteIc>,
+    /// F4.8d: los lugares cuya dirección entra después de `inputs` (un bucle que escribe).
+    pub(crate) homes: Vec<Place>,
 }
 
 /// Un valor de tipo `k` a partir de sus palabras (ver `lower::words`) y su puntero (si tiene).
@@ -235,6 +356,8 @@ fn nval(k: Kind, w: &[i64], p: Option<i64>) -> NVal {
             TAG_BOOL => NVal::Bool(w[1] != 0),
             TAG_FLOAT => NVal::Float(f64::from_bits(w[2] as u64)),
             TAG_HOLE => NVal::Hole,
+            // F4.8d: un valor que el código dejó en su lugar de la VM (puntero 0): ya está ahí.
+            TAG_LIST | TAG_MAP | TAG_OTHER if p == Some(0) => NVal::Keep,
             TAG_LIST | TAG_MAP | TAG_OTHER => {
                 let ptr = p.expect("puntero de un valor con caja") as usize as *const SynValue;
                 // SAFETY: ver arriba; `check_pointers` verificó que el código generado sólo guarda
@@ -243,6 +366,12 @@ fn nval(k: Kind, w: &[i64], p: Option<i64>) -> NVal {
             }
             _ => NVal::Nothing,
         },
+        // F4.8d: el cursor de un `set` con camino: la VM tiene ahí una copia del contenedor.
+        Kind::Cursor => {
+            let ptr = p.expect("puntero del cursor") as usize as *const SynValue;
+            // SAFETY: como el caso de un valor con caja (el cursor viene de la raíz o de un paso).
+            NVal::Value(unsafe { (*ptr).clone() })
+        }
         Kind::ListBody => {
             let ptr = p.expect("puntero de un iterador") as usize as *const ListRef;
             // SAFETY: como el caso anterior (la dirección de un `Rc` de una lista).
@@ -329,6 +458,10 @@ impl NativeCode for Compiled {
 
     fn inputs(&self) -> &[(Place, NSeen)] {
         &self.inputs
+    }
+
+    fn homes(&self) -> &[Place] {
+        &self.homes
     }
 }
 

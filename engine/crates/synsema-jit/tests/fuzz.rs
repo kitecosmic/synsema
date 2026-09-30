@@ -509,7 +509,7 @@ impl DGen {
         s += &format!("let keys be {}\n", keys);
         // Un mapa de 40 claves: modo diccionario.
         s += "let big be {}\nlet bigkeys be []\neach k in range(0, 40)\n    set big[\"k\" + text(k)] to k * 2\n    set bigkeys to append(bigkeys, \"k\" + text(k))\n";
-        s += "let alias be xs\n";
+        s += "let alias be xs\nlet out be []\nlet guard be out\n";
         s += "let acc be 0\nlet facc be 0.0\nlet cnt be 0\n";
         let bound = 3 + self.rng.below(30);
         let over_list = self.rng.chance(35);
@@ -555,6 +555,26 @@ impl DGen {
         if self.rng.chance(20) {
             lp += "    when i == 4\n        set m.a to 2.5\n";
         }
+        // F4.8d: escrituras en cada vuelta (corren en nativo): con alias y fotos guardadas antes de
+        // escribir (copy-on-write), anidadas, con claves de texto y en un mapa en modo diccionario,
+        // índices negativos o fuera de rango, claves que faltan, y `append` en el lugar.
+        if self.rng.chance(40) {
+            let w = match self.rng.below(11) {
+                0 => "    set xs[i % n] to xs[i % n] + 1\n".to_string(),
+                1 => format!("    set xs[{}] to i\n", ["0", "-1", "i % n - n", "i + 3"][self.rng.below(4)]),
+                2 => "    let snap be recs[i % 4]\n    set recs[i % 4].x to i\n    set facc to facc + snap.x * 1.0\n".to_string(),
+                3 => "    set grid[i % 3][(i + 2) % 4] to grid[i % 3][(i + 2) % 4] * 2\n".to_string(),
+                4 => "    set m[keys[i % 4]] to i\n".to_string(),
+                5 => "    set big[bigkeys[i % 40]] to big[bigkeys[i % 40]] + 1\n".to_string(),
+                6 => "    set recs[i % 4].m to 0.5\n".to_string(),
+                7 => format!("    set out to append(out, {})\n", ["i", "xs[i % n]", "recs[i % 4]", "out"][self.rng.below(4)]),
+                // Un alias que se toma a mitad del bucle (la escritura siguiente tiene que copiar).
+                9 => "    when i % 3 == 1\n        set alias to xs\n    set xs[i % n] to i\n".to_string(),
+                10 => "    when i % 4 == 2\n        set guard to out\n    set out to append(out, i)\n".to_string(),
+                _ => "    set alias[0] to i\n".to_string(),
+            };
+            lp += &w;
+        }
         if self.rng.chance(15) {
             lp += "    when acc > 20\n        stop\n";
         }
@@ -568,7 +588,7 @@ impl DGen {
         } else {
             s += &lp;
         }
-        s += "print([acc, facc, cnt, xs, alias, recs[1], m])\n";
+        s += "print([acc, facc, cnt, xs, alias, recs, m, grid, length(out), guard, big[\"k3\"]])\n";
         s += "print(steps())\n";
         s
     }

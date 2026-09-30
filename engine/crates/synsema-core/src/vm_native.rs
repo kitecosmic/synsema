@@ -197,8 +197,8 @@ struct Build {
 }
 
 impl Build {
-    fn site(&mut self, key: Option<Arc<str>>) -> u32 {
-        self.sites.push(NSite { key });
+    fn site(&mut self, key: Option<Arc<str>>, prop: bool) -> u32 {
+        self.sites.push(NSite { key, prop });
         (self.sites.len() - 1) as u32
     }
 }
@@ -336,6 +336,8 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
         Ins::Steps(w) => NIns::Steps(w),
         Ins::StepsCancel(w) => NIns::StepsCancel(w),
         Ins::CheckCancel => NIns::CheckCancel,
+        // F4.8d: un `TryInPlace` de camino que la VM dejó de probar (ver `vm_try_in_place`).
+        Ins::Nop => NIns::Nop,
         Ins::Const { dst, k } => NIns::Const { dst, v: nconst(&c.consts[k as usize])? },
         Ins::Move { dst, src } => NIns::Move { dst, src: nopnd(c, src)? },
         Ins::Drop { r } => NIns::Drop { r },
@@ -370,16 +372,16 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
         // recorre el nivel nativo (F4.7b); otra colección sale.
         Ins::EachInitV { src, it, .. } => NIns::EachList { src: nopnd(c, src)?, it },
         // F4.7b: lecturas, con un sitio propio (su caché por forma).
-        Ins::GetProp { dst, obj, name, .. } => NIns::GetProp { dst, obj: nopnd(c, obj)?, site: b.site(Some(c.names[name as usize].clone())) },
+        Ins::GetProp { dst, obj, name, .. } => NIns::GetProp { dst, obj: nopnd(c, obj)?, site: b.site(Some(c.names[name as usize].clone()), true) },
         Ins::GetIndex { dst, obj, idx, .. } => {
             let obj = nopnd(c, obj)?;
             match idx {
                 // Una clave de texto constante: la del sitio.
                 Opnd::Const(k) => match &c.consts[k as usize] {
-                    SynValue::Text(t) => NIns::GetIndex { dst, obj, idx: None, site: b.site(Some(Arc::from(&**t))) },
-                    _ => NIns::GetIndex { dst, obj, idx: Some(nopnd(c, idx)?), site: b.site(None) },
+                    SynValue::Text(t) => NIns::GetIndex { dst, obj, idx: None, site: b.site(Some(Arc::from(&**t)), false) },
+                    _ => NIns::GetIndex { dst, obj, idx: Some(nopnd(c, idx)?), site: b.site(None, false) },
                 },
-                _ => NIns::GetIndex { dst, obj, idx: Some(nopnd(c, idx)?), site: b.site(None) },
+                _ => NIns::GetIndex { dst, obj, idx: Some(nopnd(c, idx)?), site: b.site(None, false) },
             }
         }
         Ins::LoadRLocal { dst, slot, .. } => NIns::LoadLocal { dst, slot },
@@ -407,7 +409,8 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
                     NIns::RangeFn { dst }
                 }
                 // F4.7c: un builtin intrínseco (que la global siga siéndolo se verifica al entrar).
-                SynValue::Builtin(x) if NBuiltin::from_name(&x.name).is_some() => {
+                // (`append` sólo en un bucle: ver `NIns::AppendPush`.)
+                SynValue::Builtin(x) if NBuiltin::from_name(&x.name).is_some_and(|w| w != NBuiltin::Append || me.is_none()) => {
                     let which = NBuiltin::from_name(&x.name).expect("intrínseco");
                     b.deps.push(Dep { from: me, name: nm, to: None, builtin: which.name() });
                     if !b.builtins.iter().any(|(w, _)| *w == which) {
@@ -546,6 +549,35 @@ fn seen(v: Option<&SynValue>) -> NSeen {
     }
 }
 
+/// F4.8d: la variable raíz de una escritura de un bucle: una global del entorno del bucle (`Ok`, su
+/// nombre: con valor, que no sea una task ni un builtin; el entorno no puede ser un módulo, que
+/// sincroniza sus exportaciones) o un lugar de la ventana (`Err`). `None`: no se baja.
+fn loop_root(c: &Chunk, root: Root, own: &impl Fn(&str) -> Option<Option<SynValue>>, module: bool) -> Option<Result<Arc<str>, u16>> {
+    match root {
+        Root::Win(k) => Some(Err(k)),
+        Root::Free { name, .. } if !module => {
+            let nm = &c.names[name as usize];
+            match own(nm) {
+                Some(Some(SynValue::Task(_) | SynValue::Builtin(_))) | Some(None) | None => None,
+                Some(Some(_)) => Some(Ok(nm.clone())),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// F4.8d: el índice de un paso o de la hoja de un `set` con camino: un texto constante va como la
+/// clave del sitio; otro índice, como operando.
+fn path_index(c: &Chunk, idx: Opnd, b: &mut Build) -> Option<(Option<NOpnd>, u32)> {
+    Some(match idx {
+        Opnd::Const(k) => match &c.consts[k as usize] {
+            SynValue::Text(t) => (None, b.site(Some(Arc::from(&**t)), false)),
+            _ => (Some(nopnd(c, idx)?), b.site(None, false)),
+        },
+        _ => (Some(nopnd(c, idx)?), b.site(None, false)),
+    })
+}
+
 /// Un bucle compilado (F4.2): la unidad y los nombres de sus globales.
 pub(crate) struct LoopUnit {
     unit: NativeUnit,
@@ -637,6 +669,39 @@ fn view_loop(c: &Chunk, env: &Rc<RefCell<Environment>>, head: usize, back: usize
                             NIns::SetGlobal { src, g, dst }
                         })
                     }
+                    _ => None,
+                }
+            }
+            // F4.8d: `set <camino> to v` y `set P to append(P, e)` sobre una variable del bucle (una
+            // global de su entorno, que no sea de un módulo, o una de la ventana).
+            Ins::PathRoot { c: cr, desc } => match loop_root(c, c.paths[desc as usize].root, &own, module) {
+                Some(Ok(nm)) => {
+                    written.push(nm.clone());
+                    Some(NIns::PathRoot { c: cr, root: NOpnd::Global(global(&nm)) })
+                }
+                Some(Err(k)) => Some(NIns::PathRoot { c: cr, root: NOpnd::Local(k) }),
+                None => None,
+            },
+            Ins::AppendInPlace { dst, func, args, site } => match c.sites[site as usize].append.and_then(|r| loop_root(c, r, &own, module)) {
+                Some(Ok(nm)) => {
+                    written.push(nm.clone());
+                    Some(NIns::AppendPush { dst, func, args, root: NOpnd::Global(global(&nm)) })
+                }
+                Some(Err(k)) => Some(NIns::AppendPush { dst, func, args, root: NOpnd::Local(k) }),
+                None => None,
+            },
+            Ins::PathStep { c: cr, idx, key, .. } => {
+                if key != NONE {
+                    Some(NIns::PathStep { c: cr, idx: None, site: b.site(Some(c.names[key as usize].clone()), true) })
+                } else {
+                    path_index(c, idx, b).map(|(idx, site)| NIns::PathStep { c: cr, idx, site })
+                }
+            }
+            Ins::PathSet { c: cr, idx, desc } => {
+                let d = c.paths[desc as usize];
+                let leaf = if d.key != NONE { Some((None, b.site(Some(c.names[d.key as usize].clone()), true))) } else { path_index(c, idx, b) };
+                match (leaf, nopnd(c, d.src)) {
+                    (Some((idx, site)), Some(src)) => Some(NIns::PathSet { c: cr, idx, site, src, dst: d.dst }),
                     _ => None,
                 }
             }
@@ -734,6 +799,7 @@ impl Interpreter {
             NVal::Hole => SynValue::Nothing,
             NVal::Value(v) => v,
             NVal::List(l) => SynValue::List(l),
+            NVal::Keep => unreachable!("un valor en su lugar no se escribe (`vm_put_values`)"),
         }
     }
 
@@ -1032,8 +1098,8 @@ impl Interpreter {
     /// tenía al compilar (nunca un valor con caja: sus cuentas de referencias no se tocan), las
     /// globales están en el entorno y las tasks siguen siendo esas. Los valores de entrada y el
     /// slot de cada global.
-    fn vm_osr_args(&self, lu: &LoopUnit, env: &Rc<RefCell<Environment>>, base: usize, iter_base: usize) -> Option<(SmallVec<[i64; 16]>, SmallVec<[usize; 8]>)> {
-        let e = env.borrow();
+    fn vm_osr_args(&mut self, lu: &LoopUnit, env: &Rc<RefCell<Environment>>, base: usize, iter_base: usize) -> Option<(SmallVec<[i64; 16]>, SmallVec<[usize; 8]>)> {
+        let mut e = env.borrow_mut();
         if lu.writes && e.name.starts_with("module:") {
             return None;
         }
@@ -1051,13 +1117,14 @@ impl Interpreter {
                 args.push(x[k as usize]);
                 continue;
             }
+            // (Por `&mut`: en un bucle con escrituras (F4.8d) el código escribe por esta dirección.)
             let v = match place {
-                Place::Reg(r) => Some(&self.vm_regs[base + r as usize]),
-                Place::Local(k) => self.vm_locals[self.vm_lbase + k as usize].as_ref(),
-                Place::Global(g) => e.bindings.slot(slots[g as usize]),
+                Place::Reg(r) => Some(&mut self.vm_regs[base + r as usize]),
+                Place::Local(k) => self.vm_locals[self.vm_lbase + k as usize].as_mut(),
+                Place::Global(g) => e.bindings.slot_mut(slots[g as usize]),
                 Place::Iter(..) => unreachable!("iterador"),
             };
-            if seen(v) != want {
+            if seen(v.as_deref()) != want {
                 return None;
             }
             args.push(match v {
@@ -1065,10 +1132,20 @@ impl Interpreter {
                 Some(SynValue::Bool(b)) => i64::from(*b),
                 Some(SynValue::Number(Number::Float(x))) => x.to_bits() as i64,
                 Some(SynValue::Nothing) | None => 0,
-                // F4.7b: un valor con caja entra prestado: dónde vive (su lugar en la VM). El código
-                // nativo no escribe la VM hasta volver, así que ahí sigue.
-                Some(v) => std::ptr::from_ref(v) as usize as i64,
+                // F4.7b: un valor con caja entra prestado: dónde vive (su lugar en la VM). Ahí sigue
+                // hasta que vuelve el código nativo: nada mueve la memoria de la VM mientras tanto.
+                Some(v) => std::ptr::from_mut(v) as usize as i64,
             });
+        }
+        // F4.8d: los lugares donde el código puede dejar un valor con caja (antes de una escritura).
+        for &place in lu.unit.code.homes() {
+            let p = match place {
+                Place::Reg(r) => std::ptr::from_mut(&mut self.vm_regs[base + r as usize]) as usize as i64,
+                Place::Local(k) => std::ptr::from_mut(&mut self.vm_locals[self.vm_lbase + k as usize]) as usize as i64,
+                Place::Global(g) => std::ptr::from_mut(e.bindings.slot_mut(slots[g as usize])?) as usize as i64,
+                Place::Iter(..) => return None,
+            };
+            args.push(p);
         }
         drop(e);
         if !lu.unit.deps_hold(Some(env)) {
@@ -1091,6 +1168,10 @@ impl Interpreter {
     ) {
         let mut iters: SmallVec<[(u16, [i64; 4], bool, Option<ListRef>); 4]> = SmallVec::new();
         for (place, v) in values {
+            // F4.8d: lo que el código nativo dejó en su lugar ya está ahí.
+            if matches!(v, NVal::Keep) {
+                continue;
+            }
             match place {
                 Place::Reg(r) => self.vm_regs[rbase + r as usize] = Self::nval_to_syn(unit, v),
                 Place::Local(k) => self.vm_locals[lbase + k as usize] = (!matches!(v, NVal::Hole)).then(|| Self::nval_to_syn(unit, v)),

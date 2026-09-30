@@ -95,10 +95,13 @@ pub enum NBuiltin {
     Sqrt,
     Abs,
     Float,
+    /// F4.8d: `append`, sólo en `set P to append(P, e)` de un bucle (`NIns::AppendPush`); en una
+    /// llamada común sale a la VM.
+    Append,
 }
 
 impl NBuiltin {
-    pub const ALL: [NBuiltin; 4] = [NBuiltin::Length, NBuiltin::Sqrt, NBuiltin::Abs, NBuiltin::Float];
+    pub const ALL: [NBuiltin; 5] = [NBuiltin::Length, NBuiltin::Sqrt, NBuiltin::Abs, NBuiltin::Float, NBuiltin::Append];
 
     /// El nombre del builtin (el que se verifica al entrar: la global sigue siendo ese builtin).
     pub fn name(self) -> &'static str {
@@ -107,6 +110,7 @@ impl NBuiltin {
             NBuiltin::Sqrt => "sqrt",
             NBuiltin::Abs => "abs",
             NBuiltin::Float => "float",
+            NBuiltin::Append => "append",
         }
     }
 
@@ -205,6 +209,16 @@ pub enum NIns {
     /// La VM todavía no especializó esta instrucción (`Binary`: una rama que nunca corrió): se sale
     /// acá. Lleva lo que la VM va a leer y escribir.
     Trap { dst: Reg, a: NOpnd, b: NOpnd },
+    /// F4.8d (sólo en un bucle): `PathRoot` sobre una variable del bucle (`root`: su lugar, una global
+    /// o de la ventana): la variable única, y `c` es el cursor del camino (su dirección).
+    PathRoot { c: Reg, root: NOpnd },
+    /// F4.8d: `PathStep`: el cursor pasa al lugar de adentro, único (`idx: None`: la clave del sitio).
+    PathStep { c: Reg, idx: Option<NOpnd>, site: u32 },
+    /// F4.8d: `PathSet`, la hoja: `src` reemplaza lo que había (y va a `dst`, como en la VM).
+    PathSet { c: Reg, idx: Option<NOpnd>, site: u32, src: NOpnd, dst: Reg },
+    /// F4.8d: `AppendInPlace` sobre la variable `root` del bucle: la función en `func` (el builtin
+    /// `append`, verificado al entrar), P y el elemento desde `args`.
+    AppendPush { dst: Reg, func: Reg, args: Reg, root: NOpnd },
 }
 
 /// Lo que tenía un lugar al compilar un bucle (F4.2): el código nativo se especializa en eso y la
@@ -261,10 +275,13 @@ pub struct NFunc {
     pub globals: Vec<NSeen>,
 }
 
-/// Un sitio de `GetIndex`/`GetProp` (F4.7b): la clave, si es fija.
+/// Un sitio de `GetIndex`/`GetProp` (F4.7b), o de un paso o la hoja de un `set` con camino (F4.8d): la
+/// clave, si es fija.
 #[derive(Clone, Debug)]
 pub struct NSite {
     pub key: Option<Arc<str>>,
+    /// F4.8d: `.campo` (la caché sin mirar la clave: siempre es la misma), no un índice.
+    pub prop: bool,
 }
 
 /// Lo que se compila junto: la task caliente (`funcs[0]`) y las que llama.
@@ -295,6 +312,9 @@ pub enum NVal {
     Value(SynValue),
     /// F4.7b: la lista de un iterador (ya clonada).
     List(ListRef),
+    /// F4.8d: un valor con caja que ya está en su lugar de la VM (el código nativo lo puso ahí antes
+    /// de una escritura, o nunca lo movió): no se toca.
+    Keep,
 }
 
 // =============================================================================================
@@ -334,12 +354,13 @@ pub fn peek(v: &SynValue) -> NPeek {
 /// caché no cambia qué da una lectura).
 pub struct SiteIc {
     key: Option<Arc<str>>,
+    prop: bool,
     ic: MapIc,
 }
 
 impl SiteIc {
     pub fn new(s: &NSite) -> SiteIc {
-        SiteIc { key: s.key.clone(), ic: MapIc::default() }
+        SiteIc { key: s.key.clone(), prop: s.prop, ic: MapIc::default() }
     }
 
     /// `obj[idx]` como el camino rápido de `GetIndex` en la VM: una lista con un `Int` (índices
@@ -416,6 +437,130 @@ pub fn length(v: &SynValue) -> Option<i64> {
     })
 }
 
+// =============================================================================================
+// Escrituras (F4.8d): lo que hacen los caminos rápidos de `PathRoot`/`PathStep`/`PathSet` y de
+// `AppendInPlace` en la VM, sobre lugares que el código nativo tiene por su dirección. Lo que no
+// hacen (un mapa de un módulo, un índice fuera de rango, una clave nueva, otro tipo) no lo tocan:
+// `false`/`None`, y el código nativo sale a la VM ANTES de la instrucción, que la hace con sus
+// errores. Ninguna de estas mueve la memoria de la VM (registros, ventana, entorno): sólo cambian
+// el contenido de una lista o un mapa, o el valor de un lugar.
+// =============================================================================================
+
+/// Un valor del código nativo como valor de la VM: su etiqueta y sus bits (un `Float`, los de su
+/// `f64`) o, con caja, dónde vive (se clona). `None`: un hueco o una lectura que no hubo.
+pub fn nvalue(tag: i64, bits: i64, ptr: Option<&SynValue>) -> Option<SynValue> {
+    Some(match tag {
+        TAG_INT => SynValue::Number(Number::Int(bits)),
+        TAG_FLOAT => SynValue::Number(Number::Float(f64::from_bits(bits as u64))),
+        TAG_BOOL => SynValue::Bool(bits != 0),
+        TAG_NOTHING => SynValue::Nothing,
+        TAG_LIST | TAG_MAP | TAG_OTHER => ptr?.clone(),
+        _ => return None,
+    })
+}
+
+/// `PathRoot`: la variable raíz de un `set` con camino, única (`make_unique`: si otro la comparte,
+/// pasa a ser una copia propia). El mapa de un módulo no (lo hace la VM).
+pub fn path_root(slot: &mut SynValue) -> bool {
+    if matches!(slot, SynValue::Map(m) if crate::interpreter::module_env_of_map(m).is_some()) {
+        return false;
+    }
+    crate::interpreter::make_unique(slot);
+    true
+}
+
+/// La clave de un paso o de la hoja sobre un mapa: la del sitio (`.campo`, o un índice de texto
+/// constante) o el texto del índice.
+fn path_key<'a>(site: &'a SiteIc, idx: Option<&'a SynValue>) -> Option<&'a str> {
+    match (&site.key, idx) {
+        (Some(k), _) => Some(k),
+        (None, Some(SynValue::Text(t))) => Some(t),
+        _ => None,
+    }
+}
+
+/// `PathStep`: el lugar de adentro de `parent` (una lista con un `Int` en rango, o un mapa que no es
+/// de un módulo con la clave puesta), único (`make_unique`); su dirección. Vale hasta la próxima
+/// escritura del mismo contenedor.
+pub fn path_step(parent: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&SynValue>, site: &SiteIc) -> Option<*mut SynValue> {
+    match parent {
+        SynValue::List(l) if idx_tag == TAG_INT => {
+            let mut items = l.borrow_mut();
+            let j = crate::interpreter::resolve_index(idx_bits, items.len())?;
+            let s = &mut items[j];
+            crate::interpreter::make_unique(s);
+            Some(std::ptr::from_mut(s))
+        }
+        SynValue::Map(m) if idx_tag != TAG_INT && crate::interpreter::module_env_of_map(m).is_none() => {
+            let key = path_key(site, idx)?;
+            let mut b = m.borrow_mut();
+            let s = if site.prop { b.get_cached_mut(key, &site.ic) } else { b.get_cached_key_mut(key, &site.ic) }?;
+            crate::interpreter::make_unique(s);
+            Some(std::ptr::from_mut(s))
+        }
+        _ => None,
+    }
+}
+
+/// `PathSet` (la hoja): en una lista con un `Int` en rango, o en un mapa que no es de un módulo con
+/// la clave ya puesta, `v` reemplaza lo que había.
+pub fn path_set(parent: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&SynValue>, site: &SiteIc, v: SynValue) -> bool {
+    match parent {
+        SynValue::List(l) if idx_tag == TAG_INT => {
+            let mut items = l.borrow_mut();
+            match crate::interpreter::resolve_index(idx_bits, items.len()) {
+                Some(j) => {
+                    items[j] = v;
+                    true
+                }
+                None => false,
+            }
+        }
+        SynValue::Map(m) if idx_tag != TAG_INT && crate::interpreter::module_env_of_map(m).is_none() => {
+            let Some(key) = path_key(site, idx) else { return false };
+            let mut b = m.borrow_mut();
+            let s = if site.prop { b.get_cached_mut(key, &site.ic) } else { b.get_cached_key_mut(key, &site.ic) };
+            match s {
+                Some(s) => {
+                    *s = v;
+                    true
+                }
+                None => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// `AppendInPlace`: si el primer argumento es la lista que tiene la raíz (la misma lista: se compara
+/// antes, con los dos prestados), la raíz única (`make_unique`) y `push(item)`.
+pub fn same_list(a: &SynValue, b: &SynValue) -> bool {
+    matches!((a, b), (SynValue::List(x), SynValue::List(y)) if std::rc::Rc::ptr_eq(x, y))
+}
+
+/// Ver `same_list`: la raíz es una lista.
+pub fn append_push(root: &mut SynValue, item: SynValue) -> bool {
+    if !matches!(root, SynValue::List(_)) {
+        return false;
+    }
+    crate::interpreter::make_unique(root);
+    if let SynValue::List(l) = root {
+        l.borrow_mut().push(item);
+    }
+    true
+}
+
+/// Un valor prestado pasa a su lugar en la VM (F4.8d: lo que cruza una escritura, con dueño, como
+/// en la VM): una copia, que suelta lo que había ahí.
+pub fn home(slot: &mut SynValue, v: SynValue) {
+    *slot = v;
+}
+
+/// Lo mismo en un lugar de la ventana (que puede estar vacío); la dirección del valor.
+pub fn home_local(slot: &mut Option<SynValue>, v: SynValue) -> *const SynValue {
+    std::ptr::from_ref(slot.insert(v))
+}
+
 /// Dónde vive un valor en el frame de la VM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Place {
@@ -474,6 +619,12 @@ pub trait NativeCode {
     /// En un bucle: los lugares que el código nativo lee o escribe, con lo que tienen que tener al
     /// entrar (la guarda). Vacío en una task.
     fn inputs(&self) -> &[(Place, NSeen)] {
+        &[]
+    }
+    /// F4.8d: en un bucle con escrituras, los lugares donde el código puede tener que dejar un valor
+    /// con caja (su dirección entra después de `inputs`: un registro o una global, la del valor; un
+    /// lugar de la ventana, la del `Option`).
+    fn homes(&self) -> &[Place] {
         &[]
     }
 }

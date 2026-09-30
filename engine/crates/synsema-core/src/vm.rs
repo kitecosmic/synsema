@@ -3038,7 +3038,7 @@ impl Interpreter {
                     // Los pasos del resto del bloque (el valor y la asignación) no corrieron todavía.
                     let pending = chunk.rest[at] as u64;
                     self.steps = self.steps.wrapping_sub(pending);
-                    match self.vm_try_in_place(&chunk, &env, base, dst, node, name, ic, slot) {
+                    match self.vm_try_in_place(&chunk, &env, base, at, dst, node, name, ic, slot) {
                         Ok(true) => {
                             pc = done as usize;
                             Ok(())
@@ -3595,6 +3595,7 @@ impl Interpreter {
         chunk: &Chunk,
         env: &Rc<RefCell<Environment>>,
         base: usize,
+        at: usize,
         dst: Reg,
         node: u32,
         name: u32,
@@ -3623,26 +3624,33 @@ impl Interpreter {
             unreachable!("TryInPlace sobre otro nodo")
         };
         let spill = chunk.node_spill[node as usize];
-        if spill != NONE {
+        let r = if spill != NONE {
             // La vía en el lugar es de la referencia y busca por nombre: las variables de la
             // ventana van a frames el rato que corre (ver `vm_spill`).
             let frames = self.vm_spill(chunk, env, base, spill);
             let r = self.try_update_in_place(target, value, frames.last().expect("spill vacío"));
             self.vm_unspill(chunk, base, spill, frames);
-            return match r? {
-                Some(v) => {
-                    self.put(base, dst, v);
-                    Ok(true)
-                }
-                None => Ok(false),
-            };
-        }
-        match self.try_update_in_place(target, value, env)? {
+            r
+        } else {
+            self.try_update_in_place(target, value, env)
+        };
+        match r? {
             Some(v) => {
                 self.put(base, dst, v);
                 Ok(true)
             }
-            None => Ok(false),
+            None => {
+                // F4.8d: `set <camino> to <camino> + e` que no aplicó (el valor no era una lista): la
+                // vía en el lugar no se vuelve a probar (una vez y para siempre, como `BinaryAny`). Es
+                // sólo un atajo (su resultado y sus pasos son los del camino normal, que es lo que
+                // corre el modo referencia): si más adelante ese lugar tuviera una lista, se copia en
+                // vez de agregar en el lugar. Así un `set p.x to p.x + d` con números no llama al
+                // tree-walker en cada vuelta, y el bucle puede pasar al nivel nativo.
+                if name == NONE && matches!(value.kind, NodeKind::BinaryOp { .. }) {
+                    chunk.code[at].set(Ins::Nop);
+                }
+                Ok(false)
+            }
         }
     }
 
