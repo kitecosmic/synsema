@@ -245,7 +245,7 @@ pub struct NFunc {
     pub nregs: u16,
     pub nlocals: u16,
     pub nparams: u16,
-    /// Las globales de un bucle (0 en una task).
+    /// Las globales de un bucle, o (F4.8b) las que lee la función 0 de una task (`globals`).
     pub nglobals: u16,
     /// Cuántos iteradores de `each` usa (cada uno, cuatro variables: `valid`, `next`, `hi`, `step`).
     pub niters: u16,
@@ -254,6 +254,11 @@ pub struct NFunc {
     /// función 0 de una task. Vacío en las demás (sus tipos salen de las llamadas de la unidad) y
     /// en un bucle.
     pub params: Vec<NSeen>,
+    /// F4.8b: en la función 0 de una task, lo que tenían al compilar las globales que lee (que no
+    /// son tasks ni builtins): entran como parámetros después de los suyos, leídas al entrar (el
+    /// código nativo de una task no escribe globales ni corre código ajeno, así que leerlas al entrar
+    /// es leerlas cuando las lee el cuerpo). Vacío en las demás y en un bucle.
+    pub globals: Vec<NSeen>,
 }
 
 /// Un sitio de `GetIndex`/`GetProp` (F4.7b): la clave, si es fija.

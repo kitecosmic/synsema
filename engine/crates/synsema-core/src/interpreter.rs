@@ -8668,6 +8668,14 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
     }
 
+    /// F4.8b: `call_fast` con un argumento, el elemento `i` de `l` (clonado ahora: la lista no se
+    /// tiene prestada mientras corre la función).
+    fn call_on_item(&mut self, f: &SynValue, l: &ListRef, i: usize, loc: &SourceLocation) -> Result<(SynValue, SynValue), Control> {
+        let item = l.borrow()[i].clone();
+        let r = self.call_fast(f, &mut [item.clone()], loc)?;
+        Ok((item, r))
+    }
+
     /// Dual-order de la familia intencional (batch DX, decisión #16 del diseño madre):
     /// los ops con callable aceptan `(fn, lista, …)` Y `(lista, fn, …)` — task/lambda
     /// y lista son tipos distinguibles en runtime, así que no hay ambigüedad y ambas
@@ -8678,36 +8686,14 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     ///     adivinar).
     /// Los args extra (pred de `transform`, init de `reduce`) NO se reordenan: la
     /// detección mira SOLO las posiciones 0-1.
-    fn dual_fn_list(
-        &self,
-        args: &[SynValue],
-        op: &str,
-    ) -> Result<(SynValue, Vec<SynValue>), Control> {
-        let a0 = nth(args, 0)?;
-        let a1 = nth(args, 1)?;
-        match (is_callable(a0), is_callable(a1)) {
-            (true, true) => Err(err(format!(
-                "{op}: expected one task and one list (either order: {op}(fn, list, ...) or {op}(list, fn, ...)), got two tasks"
-            ))),
-            (true, false) => Ok((a0.clone(), self.list_arg(a1, op)?)),
-            (false, true) => Ok((a1.clone(), self.list_arg(a0, op)?)),
-            (false, false) => {
-                let l0 = matches!(a0, SynValue::List(_));
-                let l1 = matches!(a1, SynValue::List(_));
-                if l0 && l1 {
-                    return Err(err(format!(
-                        "{op}: expected one task and one list (either order: {op}(fn, list, ...) or {op}(list, fn, ...)), got two lists"
-                    )));
-                }
-                // Uno (a lo sumo) es lista y el otro no es callable: se conserva el
-                // camino del orden que corresponde — el error de tipo lo produce
-                // `list_arg` o el intento de llamada, como hoy (mensajes ya claros).
-                if l0 {
-                    Ok((a1.clone(), self.list_arg(a0, op)?))
-                } else {
-                    Ok((a0.clone(), self.list_arg(a1, op)?))
-                }
-            }
+    /// F4.8b: la función y la lista, sin copiarla: su `Rc`, que se recorre por índice (la foto de la
+    /// lista al llamar: mientras lo tenemos, una escritura del cuerpo de la función copia, como con
+    /// el iterador de un `each`). Mismos errores, en el mismo orden.
+    fn dual_fn_rc(&self, args: &[SynValue], op: &str) -> Result<(SynValue, ListRef), Control> {
+        let (f, l) = dual_fn_pick(args, op)?;
+        match l {
+            SynValue::List(l) => Ok((f, l.clone())),
+            other => Err(err(format!("{} expects a list, got {}", op, other.type_name()))),
         }
     }
 
@@ -8756,10 +8742,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 ndarray::ArrayD::from_shape_vec(a.raw_dim(), out).map_err(|e| err(e.to_string()))?,
             ));
         }
-        let (func, items) = self.dual_fn_list(args, "apply")?;
-        let mut out = Vec::with_capacity(items.len());
-        for item in items {
-            out.push(self.call_value(func.clone(), vec![item], loc)?);
+        let (func, l) = self.dual_fn_rc(args, "apply")?;
+        let n = l.borrow().len();
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let item = l.borrow()[i].clone();
+            out.push(self.call_fast(&func, &mut [item], loc)?);
         }
         Ok(syn_list(out))
     }
@@ -8909,10 +8897,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[n]), out).map_err(|e| err(e.to_string()))?,
             ));
         }
-        let (pred, items) = self.dual_fn_list(args, "where")?;
+        let (pred, l) = self.dual_fn_rc(args, "where")?;
         let mut out = Vec::new();
-        for item in items {
-            if self.call_value(pred.clone(), vec![item.clone()], loc)?.is_truthy() {
+        for i in 0..l.borrow().len() {
+            let (item, r) = self.call_on_item(&pred, &l, i, loc)?;
+            if r.is_truthy() {
                 out.push(item);
             }
         }
@@ -8937,16 +8926,18 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 
     fn b_transform(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         // Dual-order sólo en las posiciones 0-1; el `pred` opcional queda al final.
-        let (func, items) = self.dual_fn_list(args, "transform")?;
+        let (func, l) = self.dual_fn_rc(args, "transform")?;
         let pred = args.get(2).cloned();
-        let mut out = Vec::with_capacity(items.len());
-        for item in items {
+        let n = l.borrow().len();
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let item = l.borrow()[i].clone();
             let should = match &pred {
-                Some(p) => self.call_value(p.clone(), vec![item.clone()], loc)?.is_truthy(),
+                Some(p) => self.call_fast(p, &mut [item.clone()], loc)?.is_truthy(),
                 None => true,
             };
             if should {
-                out.push(self.call_value(func.clone(), vec![item], loc)?);
+                out.push(self.call_fast(&func, &mut [item], loc)?);
             } else {
                 out.push(item);
             }
@@ -8957,20 +8948,22 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     fn b_reduce(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         // Dual-order sólo en las posiciones 0-1; `init` (aunque sea callable) queda al
         // final y NO participa de la detección.
-        let (func, items) = self.dual_fn_list(args, "reduce")?;
+        let (func, l) = self.dual_fn_rc(args, "reduce")?;
         let mut acc = args.get(2).cloned().unwrap_or_else(|| syn_int(0));
-        for item in items {
-            acc = self.call_value(func.clone(), vec![acc, item], loc)?;
+        for i in 0..l.borrow().len() {
+            let item = l.borrow()[i].clone();
+            acc = self.call_fast(&func, &mut [acc, item], loc)?;
         }
         Ok(acc)
     }
 
     fn b_sort_by(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let (key_func, items) = self.dual_fn_list(args, "sort_by")?;
+        let (key_func, l) = self.dual_fn_rc(args, "sort_by")?;
         let desc = desc_flag(args.get(2), "sort_by")?;
-        let mut keyed: Vec<(SynValue, SynValue)> = Vec::with_capacity(items.len());
-        for it in items {
-            let k = self.call_value(key_func.clone(), vec![it.clone()], loc)?;
+        let n = l.borrow().len();
+        let mut keyed: Vec<(SynValue, SynValue)> = Vec::with_capacity(n);
+        for i in 0..n {
+            let (it, k) = self.call_on_item(&key_func, &l, i, loc)?;
             keyed.push((k, it));
         }
         let keys: Vec<SynValue> = keyed.iter().map(|(k, _)| k.clone()).collect();
@@ -8989,9 +8982,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_find_first(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let (pred, items) = self.dual_fn_list(args, "find_first")?;
-        for item in items {
-            if self.call_value(pred.clone(), vec![item.clone()], loc)?.is_truthy() {
+        let (pred, l) = self.dual_fn_rc(args, "find_first")?;
+        for i in 0..l.borrow().len() {
+            let (item, r) = self.call_on_item(&pred, &l, i, loc)?;
+            if r.is_truthy() {
                 return Ok(item);
             }
         }
@@ -8999,9 +8993,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_every(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let (pred, items) = self.dual_fn_list(args, "every")?;
-        for item in items {
-            if !self.call_value(pred.clone(), vec![item], loc)?.is_truthy() {
+        let (pred, l) = self.dual_fn_rc(args, "every")?;
+        for i in 0..l.borrow().len() {
+            let item = l.borrow()[i].clone();
+            if !self.call_fast(&pred, &mut [item], loc)?.is_truthy() {
                 return Ok(syn_bool(false));
             }
         }
@@ -9009,9 +9004,10 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_some(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let (pred, items) = self.dual_fn_list(args, "some")?;
-        for item in items {
-            if self.call_value(pred.clone(), vec![item], loc)?.is_truthy() {
+        let (pred, l) = self.dual_fn_rc(args, "some")?;
+        for i in 0..l.borrow().len() {
+            let item = l.borrow()[i].clone();
+            if self.call_fast(&pred, &mut [item], loc)?.is_truthy() {
                 return Ok(syn_bool(true));
             }
         }
@@ -9019,10 +9015,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     }
 
     fn b_count_where(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
-        let (pred, items) = self.dual_fn_list(args, "count_where")?;
+        let (pred, l) = self.dual_fn_rc(args, "count_where")?;
         let mut count: i64 = 0;
-        for item in items {
-            if self.call_value(pred.clone(), vec![item], loc)?.is_truthy() {
+        for i in 0..l.borrow().len() {
+            let item = l.borrow()[i].clone();
+            if self.call_fast(&pred, &mut [item], loc)?.is_truthy() {
                 count += 1;
             }
         }
@@ -11712,5 +11709,36 @@ mod strip_ansi_tests {
         assert_eq!(strip_ansi("10%\r50%\r100%\r\nend"), "100%\nend");
         assert_eq!(strip_ansi("line\r\n"), "line\n");
         assert_eq!(strip_ansi("ñandú \x1b[31mé\x1b[0m"), "ñandú é");
+    }
+}
+
+/// El orden doble de los builtins con una función y una lista (ver `dual_fn_rc`): cuál es la
+/// función y cuál debería ser la lista (todavía sin mirar si lo es).
+fn dual_fn_pick<'a>(args: &'a [SynValue], op: &str) -> Result<(SynValue, &'a SynValue), Control> {
+    let a0 = nth(args, 0)?;
+    let a1 = nth(args, 1)?;
+    match (is_callable(a0), is_callable(a1)) {
+        (true, true) => Err(err(format!(
+            "{op}: expected one task and one list (either order: {op}(fn, list, ...) or {op}(list, fn, ...)), got two tasks"
+        ))),
+        (true, false) => Ok((a0.clone(), a1)),
+        (false, true) => Ok((a1.clone(), a0)),
+        (false, false) => {
+            let l0 = matches!(a0, SynValue::List(_));
+            let l1 = matches!(a1, SynValue::List(_));
+            if l0 && l1 {
+                return Err(err(format!(
+                    "{op}: expected one task and one list (either order: {op}(fn, list, ...) or {op}(list, fn, ...)), got two lists"
+                )));
+            }
+            // Uno (a lo sumo) es lista y el otro no es callable: se conserva el
+            // camino del orden que corresponde — el error de tipo lo produce
+            // `list_arg` o el intento de llamada, como hoy (mensajes ya claros).
+            if l0 {
+                Ok((a1.clone(), a0))
+            } else {
+                Ok((a0.clone(), a1))
+            }
+        }
     }
 }

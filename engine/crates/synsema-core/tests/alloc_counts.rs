@@ -165,6 +165,19 @@ let j be 1
     ));
     // `each` sobre `range`: la vuelta (entorno nuevo + clave + tabla; el nombre formateado ya no, F1.6).
     rows.push(("vuelta de each + set x to 1", per_iteration(|n| format!("let x be 0\neach i in range(0, {})\n    set x to 1\n", n)), 0));
+    // F4.8b: un builtin que llama una función por elemento, sin copiar la lista, sin `Vec` de
+    // argumentos ni frame por llamada (antes: 2 por elemento, el `vec![item]` y los `CallArgs`, y
+    // la copia de la lista entera).
+    rows.push((
+        "count_where con lambda, por elemento",
+        per_row_amortized(|n| format!("let xs be range(0, {})\nlet c be count_where(xs, (x) => x % 3 == 0)\n", n)),
+        0,
+    ));
+    rows.push((
+        "reduce con lambda, por elemento",
+        per_row_amortized(|n| format!("let xs be range(0, {})\nlet c be reduce(xs, (a, x) => a + x, 0)\n", n)),
+        0,
+    ));
     // F4.4: `csv_parse` por fila de 2 columnas: las cabeceras, claves una vez por llamada. Las
     // listas que crecen al doble suman unos pocos `realloc` por llamada (no por fila): se descuentan.
     rows.push((

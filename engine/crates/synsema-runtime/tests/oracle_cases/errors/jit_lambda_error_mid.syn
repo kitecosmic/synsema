@@ -1,0 +1,6 @@
+-- F4.8b: un error a mitad de las llamadas de un builtin a una función ya en nativo (`% 0`): sale a la
+-- VM, que da el error con su ubicación y sus pasos.
+let xs be range(0, 400)
+print(count_where(xs, (x) => x % 7 == 0))
+print(steps())
+print(count_where(xs, (x) => 10 % (x - 300) == 0))

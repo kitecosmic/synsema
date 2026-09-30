@@ -2516,19 +2516,45 @@ impl Interpreter {
         Some(f)
     }
 
+    #[inline(always)]
     fn run_chunk_at(&mut self, chunk: &Rc<Chunk>, env: &Rc<RefCell<Environment>>, base: usize) -> Result<SynValue, Control> {
+        self.run_chunk_from(chunk, env, base, 0, None)
+    }
+
+    /// Los frames de un cuerpo que vuelve del código nativo (ver `run_chunk_from`), fuera de línea:
+    /// el despacho no cambia. Dónde empiezan los iteradores del de más adentro y los del de más afuera.
+    #[inline(never)]
+    fn vm_resume_frames(&mut self, (frames, ib, outer): (Vec<VmFrame>, usize, usize)) -> (usize, usize) {
+        self.vm_frames.extend(frames);
+        (ib, outer)
+    }
+
+    /// `run_chunk_at` desde la instrucción `pc0` (F4.8b). `resume`: un cuerpo que salió del código
+    /// nativo a mitad de camino (ver `vm_call_rust`): los frames que esperan a su llamado, arriba de
+    /// los de quien llama, y dónde empiezan los iteradores del de más adentro y los del de más afuera.
+    fn run_chunk_from(
+        &mut self,
+        chunk: &Rc<Chunk>,
+        env: &Rc<RefCell<Environment>>,
+        base: usize,
+        pc0: usize,
+        resume: Option<(Vec<VmFrame>, usize, usize)>,
+    ) -> Result<SynValue, Control> {
         // El chunk, el frame y la ventana de registros cambian al entrar a una llamada y al volver
         // (F3.2); `entry` es cuántas llamadas de la VM había al empezar: las de arriba son nuestras.
         let mut chunk = chunk.clone();
         let mut env = env.clone();
         let mut base = base;
         let entry = self.vm_frames.len();
-        let mut pc = 0usize;
+        let mut pc = pc0;
         // Frames de la VM abiertos dentro de este cuerpo (vueltas de `each`, brazos de `match`) y
         // dónde empiezan sus iteradores.
         let mut depth: u16 = 0;
         let mut iter_base = self.vm_iters.len();
-        let entry_iters = iter_base;
+        let mut entry_iters = iter_base;
+        if let Some(r) = resume {
+            (iter_base, entry_iters) = self.vm_resume_frames(r);
+        }
         loop {
             let at = pc;
             let ins = chunk.code[at].get();
@@ -4119,6 +4145,85 @@ impl Interpreter {
         }
         debug_assert!(!self.labels);
         Ok(Enter { env: t.closure_env.clone(), code, base: first, lbase, top })
+    }
+
+    /// F4.8b: una llamada por posición desde un builtin (`apply`, `where`, `reduce`, …), como el
+    /// vectorcall de CPython. A una task cuyo cuerpo es un frame en registros, los argumentos van
+    /// directo a su ventana (lo de `vm_call` + `vm_enter_regframe`, sin `Environment` ni `Vec` por
+    /// llamada) y, si tiene código nativo, entra ahí. Si no, `call_value` como siempre. Lo observable
+    /// es lo de `call_value_named` (la VM no corre con etiquetas: `vm_code_for`): la profundidad con
+    /// el mismo tope, aridad permisiva (los de más se sueltan antes de los defaults, que se evalúan
+    /// en el `closure_env`) y el `give` es el valor. Deja `args` vacíos.
+    pub(super) fn call_fast(&mut self, f: &SynValue, args: &mut [SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        if let SynValue::Task(t) = f {
+            if let Some(code) = self.vm_code_for(t) {
+                if code.regframe {
+                    return self.vm_call_rust(t, code, args);
+                }
+            }
+        }
+        let v: Vec<SynValue> = args.iter_mut().map(|a| std::mem::replace(a, SynValue::Nothing)).collect();
+        self.call_value(f.clone(), v, loc)
+    }
+
+    /// `call_fast` a un cuerpo con frame en registros.
+    fn vm_call_rust(&mut self, t: &Rc<SynTaskValue>, code: &Rc<Chunk>, args: &mut [SynValue]) -> Result<SynValue, Control> {
+        self.recursion_depth += 1;
+        if self.recursion_depth > MAX_RECURSION {
+            self.recursion_depth -= 1;
+            return Err(err("maximum recursion depth exceeded"));
+        }
+        // Con código nativo, los argumentos van directo de acá al código nativo (la ventana de
+        // registros se arma sólo si vuelve a la VM).
+        #[cfg(feature = "native-tier")]
+        {
+            // (Con la unidad ya compilada no hay nada que decidir: sin sitio que reescribir.)
+            if t.code.native.tick() && !t.code.native.ready() {
+                self.vm_native_prepare(t, args.iter().map(native::seen_of).collect());
+            }
+            if let Some(r) = self.vm_native_from_rust(t, args) {
+                self.recursion_depth -= 1;
+                return r;
+            }
+        }
+        let (n, np) = (args.len(), t.parameters.len());
+        let base = self.vm_regs.len();
+        self.vm_regs.resize(base + (code.nregs as usize).max(np), SynValue::Nothing);
+        // Los parámetros en `r0..` (F3.7); los de más se sueltan acá, antes de los defaults.
+        for (i, a) in args.iter_mut().enumerate() {
+            let v = std::mem::replace(a, SynValue::Nothing);
+            if i < np {
+                self.vm_regs[base + i] = v;
+            }
+        }
+        let lbase = self.vm_locals.len();
+        self.vm_locals.resize(lbase + code.nlocals as usize, None);
+        for i in n.min(np)..np {
+            let v = match &t.parameters[i].default {
+                Some(d) => match self.exec(d, &t.closure_env) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.vm_regs.truncate(base);
+                        self.vm_locals.truncate(lbase);
+                        self.recursion_depth -= 1;
+                        return Err(e);
+                    }
+                },
+                None => SynValue::Nothing,
+            };
+            self.vm_regs[base + i] = v;
+        }
+        debug_assert!(!self.labels);
+        let saved = std::mem::replace(&mut self.vm_lbase, lbase);
+        let r = self.run_chunk_at(code, &t.closure_env, base);
+        self.vm_lbase = saved;
+        self.vm_regs.truncate(base);
+        self.vm_locals.truncate(lbase);
+        self.recursion_depth -= 1;
+        match r {
+            Ok(v) | Err(Control::Give(v)) => Ok(v),
+            Err(c) => Err(c),
+        }
     }
 
     /// El camino de siempre (`call_value_named`): builtins, argumentos nombrados, tasks sin

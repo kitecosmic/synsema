@@ -84,7 +84,14 @@ impl Helpers {
 /// lista) o le entran (un bucle con un lugar con caja). Si no, ningún `Any` tiene caja.
 pub(crate) fn has_boxed(unit: &NUnit, i: usize, plan: &Plan) -> bool {
     unit.funcs[i].code.iter().any(|ins| matches!(ins, NIns::GetIndex { .. } | NIns::GetProp { .. } | NIns::EachList { .. }))
-        || plan.inputs.iter().any(|(_, s)| matches!(s, NSeen::List | NSeen::Map | NSeen::Boxed | NSeen::ListIter))
+        || plan.inputs.iter().any(|(_, s)| boxed_seen(*s))
+        || unit.funcs[i].params.iter().any(|s| boxed_seen(*s))
+        || unit.funcs[i].globals.iter().any(|s| boxed_seen(*s))
+}
+
+/// Un valor con caja que entra prestado (la dirección de donde vive).
+fn boxed_seen(s: NSeen) -> bool {
+    matches!(s, NSeen::List | NSeen::Map | NSeen::Boxed | NSeen::ListIter)
 }
 
 /// El tipo estático de un registro o lugar de la ventana.
@@ -262,7 +269,8 @@ impl Plan {
         if f.osr.is_some() {
             self.inputs.len()
         } else {
-            f.nparams as usize
+            // F4.8b: las globales que lee una task, después de sus parámetros.
+            f.nparams as usize + f.globals.len()
         }
     }
 }
@@ -798,6 +806,10 @@ impl<'u> Func<'u> {
                 for k in init.iter_mut().skip(self.nregs) {
                     *k = Kind::Undef;
                 }
+                // F4.8b: las globales que lee la task (leídas al entrar, con lo que tenían al compilar).
+                for (g, s) in self.f.globals.iter().enumerate() {
+                    init[self.global_var(g as u16)] = seen_kind(*s);
+                }
                 state[0] = Some(init);
                 0
             }
@@ -1054,7 +1066,11 @@ fn param_ok(k: Kind) -> bool {
 pub(crate) fn plan(unit: &NUnit) -> Option<Vec<Plan>> {
     let funcs: Vec<Func> = unit.funcs.iter().map(|f| Func::new(f, unit)).collect();
     for (i, f) in funcs.iter().enumerate() {
-        if f.f.code.is_empty() || f.f.nparams as usize > f.nregs || f.f.nparams > 8 {
+        if f.f.code.is_empty() || f.f.nparams as usize > f.nregs || f.f.nparams > 8 || f.f.globals.len() > 8 {
+            return None;
+        }
+        // Las globales de una task: sólo la de la entrada, y tantas como dice `nglobals`.
+        if f.f.osr.is_none() && (f.f.globals.len() != f.f.nglobals as usize || (i != 0 && !f.f.globals.is_empty())) {
             return None;
         }
         // Sólo la función 0 puede ser un bucle (las demás son tasks que se llaman).
@@ -1131,13 +1147,18 @@ pub(crate) fn plan(unit: &NUnit) -> Option<Vec<Plan>> {
     if rets.iter().any(|r| matches!(r, Kind::Top | Kind::Any(_))) {
         return None;
     }
-    for p in params.iter_mut().flatten() {
-        // Una task que no se llama desde ningún lugar al que se llegue: no importa.
-        if *p == Kind::Bot {
-            *p = Kind::Int;
-        }
-        if !param_ok(*p) {
-            return None;
+    for (i, ps) in params.iter_mut().enumerate() {
+        for (k, p) in ps.iter_mut().enumerate() {
+            // Una task que no se llama desde ningún lugar al que se llegue: no importa.
+            if *p == Kind::Bot {
+                *p = Kind::Int;
+            }
+            // F4.8b: la task de la entrada puede recibir un valor con caja, prestado (la dirección del
+            // argumento, que vive en la VM o en el builtin que llama mientras corre el código).
+            let boxed = i == 0 && fixed0 && funcs[0].f.params.get(k).is_some_and(|s| boxed_seen(*s));
+            if !param_ok(*p) && !boxed {
+                return None;
+            }
         }
     }
     let mut plans = Vec::with_capacity(funcs.len());
@@ -1179,6 +1200,11 @@ fn frame_values(f: &Func, st: &[Kind], live: &[bool], skip: impl Fn(usize) -> bo
             continue;
         }
         let place = f.place_of(v);
+        // F4.8b: una global que lee una task no vuelve a la VM (no la escribió; la VM la lee de su
+        // entorno).
+        if f.f.osr.is_none() && matches!(place, Place::Global(_)) {
+            continue;
+        }
         match st[v] {
             Kind::Top => return None,
             Kind::Bot => {}
@@ -1686,7 +1712,7 @@ pub(crate) fn build(
     if f.f.osr.is_some() {
         for (k, (place, seen)) in plans[i].inputs.iter().enumerate() {
             let v = f.var_of(*place);
-            if matches!(seen, NSeen::List | NSeen::Map | NSeen::Boxed | NSeen::ListIter) {
+            if boxed_seen(*seen) {
                 boxed_in.push((v, *seen, params[k]));
                 // El parámetro `k` del bloque de entrada (antes: el contexto y la profundidad).
                 ptr_params.push(k + HEAD_PARAMS);
@@ -1695,14 +1721,31 @@ pub(crate) fn build(
             }
         }
     } else {
+        let npar = f.f.nparams as usize;
         for (v, x) in init.iter_mut().enumerate() {
-            *x = if v < np {
+            *x = if v < npar && f.f.params.get(v).is_some_and(|s| boxed_seen(*s)) {
+                // F4.8b: un parámetro con caja (su dirección).
+                boxed_in.push((v, f.f.params[v], params[v]));
+                ptr_params.push(v + HEAD_PARAMS);
+                (Kind::Bot, None)
+            } else if v < npar {
                 (plans[i].params[v], Some(params[v]))
             } else if v < f.nregs {
                 (Kind::Nothing, None)
             } else {
                 (Kind::Undef, None)
             };
+        }
+        // F4.8b: las globales que lee la task, después de los parámetros.
+        for (g, s) in f.f.globals.iter().enumerate() {
+            let v = f.global_var(g as u16);
+            let x = params[npar + g];
+            if boxed_seen(*s) {
+                boxed_in.push((v, *s, x));
+                ptr_params.push(npar + g + HEAD_PARAMS);
+            } else {
+                init[v] = (seen_kind(*s), Some(x));
+            }
         }
     }
     {

@@ -1,0 +1,9 @@
+-- F4.8b: la recursión pasando por un builtin que llama a una función (`reduce`): la profundidad cuenta
+-- cada llamada como en la referencia y el tope da el mismo error.
+task deep(n)
+    when n == 0
+        give 0
+    give reduce([n], (acc, x) => acc + deep(x - 1), 0)
+print(deep(50))
+print(steps())
+print(deep(5000))

@@ -574,6 +574,92 @@ impl DGen {
     }
 }
 
+/// F4.8b: generador de programas cuyos builtins (`apply`, `where`, `reduce`, `count_where`, `every`,
+/// `some`, `find_first`, `transform`) llaman funciones: lambdas con parámetros enteros, floats y
+/// registros (prestados), que leen globales que cambian entre llamadas, tasks con defaults, argumentos
+/// de más, errores a mitad de las llamadas (un elemento que no es número, `% 0`, una clave que falta),
+/// y los builtins llamados desde tasks.
+struct LGen {
+    rng: Rng,
+}
+
+impl LGen {
+    fn c(&mut self) -> String {
+        ["0", "1", "2", "3", "5", "7", "10", "0.5", "2.5", "(0 - 3)", "9223372036854775807"][self.rng.below(11)].to_string()
+    }
+
+    /// Una expresión sobre `x` (un número) y las globales.
+    fn num(&mut self, depth: usize) -> String {
+        if depth == 0 || self.rng.chance(30) {
+            return match self.rng.below(7) {
+                0 | 1 => "x".to_string(),
+                2 => "umbral".to_string(),
+                3 => "tabla[x % 3]".to_string(),
+                4 => "paso".to_string(),
+                _ => self.c(),
+            };
+        }
+        let a = self.num(depth - 1);
+        let b = self.num(depth - 1);
+        match self.rng.below(6) {
+            0 => format!("({} + {})", a, b),
+            1 => format!("({} - {})", a, b),
+            2 => format!("({} * {})", a, b),
+            // A veces por cero (el error de la VM, a mitad de las llamadas).
+            3 => format!("({} % {})", a, if self.rng.chance(85) { "7".to_string() } else { b }),
+            4 => format!("({} / 2)", a),
+            _ => format!("abs({})", a),
+        }
+    }
+
+    fn cond(&mut self) -> String {
+        let a = self.num(2);
+        let op = ["<", ">", "==", "!=", ">=", "<="][self.rng.below(6)];
+        format!("{} {} {}", a, op, self.c())
+    }
+
+    fn stmt(&mut self) -> String {
+        match self.rng.below(12) {
+            0 => format!("print(count_where(xs, (x) => {}))\n", self.cond()),
+            1 => format!("print(length(where(xs, (x) => {})))\n", self.cond()),
+            2 => format!("print(reduce(xs, (acc, x) => acc + {}, 0))\n", self.num(2)),
+            3 => format!("print(apply(xs, (x) => {}))\n", self.num(2)),
+            4 => format!("print(reduce(recs, (acc, r) => acc + r.x * {}, 0))\n", self.c()),
+            5 => format!("print(length(where(recs, (r) => r.y > {})))\n", self.c()),
+            6 => format!("print(every(xs, (x) => {}), some(xs, (x) => {}), find_first(xs, (x) => {}))\n", self.cond(), self.cond(), self.cond()),
+            7 => format!("print(transform(xs, (x) => {}, (x) => {}))\n", self.num(1), self.cond()),
+            8 => format!("set umbral to {}\n", self.c()),
+            9 => "set tabla to [umbral, 1, 2]\n".to_string(),
+            10 => "print(apply(xs, con_default), reduce(xs, tres, 0))\n".to_string(),
+            _ => "print(desde_task(xs), desde_task(xs))\n".to_string(),
+        }
+    }
+
+    fn program(&mut self) -> String {
+        let n = 4 + self.rng.below(20);
+        let mut s = String::new();
+        s += &format!("let xs be apply(range(0, {}), (i) => i{})\n", n, if self.rng.chance(30) { " * 0.5" } else { "" });
+        // A veces un elemento que no es número al final (el error, con la función ya en nativo).
+        if self.rng.chance(12) {
+            s += "set xs to append(xs, \"t\")\n";
+        }
+        s += &format!("let recs be apply(range(0, {}), (i) => {{\"x\": i % 5, \"y\": i * 0.5}})\n", n);
+        if self.rng.chance(10) {
+            s += "set recs to append(recs, {\"y\": 1.0})\n";
+        }
+        // Dos globales del mismo tipo seguidas (leer el lugar de al lado daría otro valor).
+        s += &format!("let umbral be {}\nlet paso be {}\nlet tabla be [1, 2, 3]\n", self.c(), self.c());
+        s += "task con_default(x, y = 10)\n    give x + y\n";
+        s += "task tres(a, b, c = 100)\n    give a + b + c\n";
+        s += "task desde_task(ys)\n    give reduce(ys, (a, y) => a + y * 2, 0)\n";
+        for _ in 0..2 + self.rng.below(5) {
+            s += &self.stmt();
+        }
+        s += "print(steps())\n";
+        s
+    }
+}
+
 /// El modo referencia es global al proceso: un solo `check` a la vez.
 static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -583,7 +669,12 @@ fn check(seed: u64, count: usize) {
 }
 
 /// `tasks`: los programas llaman tasks desde un sitio caliente (se exige que entren al código nativo).
-fn check_with(seed: u64, count: usize, tasks: bool, mut program: impl FnMut() -> String) {
+fn check_with(seed: u64, count: usize, tasks: bool, program: impl FnMut() -> String) {
+    check_with_osr(seed, count, tasks, true, program);
+}
+
+/// `osr`: los programas tienen bucles del nivel superior (se exige que entren al código nativo).
+fn check_with_osr(seed: u64, count: usize, tasks: bool, osr: bool, mut program: impl FnMut() -> String) {
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     synsema_jit::install();
     native_tier::set_eager(true);
@@ -622,7 +713,7 @@ fn check_with(seed: u64, count: usize, tasks: bool, mut program: impl FnMut() ->
     assert!(errors * 4 < count * 3, "{} de {} programas terminan en error: el generador está roto", errors, count);
     assert!(!tasks || after.entries - before.entries > count as u64, "el nivel nativo casi no corrió: {:?} → {:?}", before, after);
     assert!(after.deopts > before.deopts, "ningún programa salió a la VM a mitad de camino");
-    assert!(after.osr - before.osr > count as u64 / 2, "los bucles del nivel superior casi no entraron al código nativo: {:?} → {:?}", before, after);
+    assert!(!osr || after.osr - before.osr > count as u64 / 2, "los bucles del nivel superior casi no entraron al código nativo: {:?} → {:?}", before, after);
 }
 
 #[test]
@@ -666,4 +757,19 @@ fn native_matches_the_reference_on_data_programs() {
 fn native_matches_the_reference_on_many_data_programs() {
     let mut g = DGen { rng: Rng(0xf4_7b_0000_0001) };
     check_with(0xf4_7b_0000_0001, 3000, false, move || g.program());
+}
+
+/// F4.8b: programas cuyos builtins llaman funciones (lambdas y tasks, a la VM o al código nativo desde
+/// Rust, con parámetros con caja prestados y globales leídas al llamar).
+#[test]
+fn native_matches_the_reference_on_call_programs() {
+    let mut g = LGen { rng: Rng(0x5eed_f4_8b) };
+    check_with_osr(0x5eed_f4_8b, 200, true, false, move || g.program());
+}
+
+#[test]
+#[ignore]
+fn native_matches_the_reference_on_many_call_programs() {
+    let mut g = LGen { rng: Rng(0xf4_8b_0000_0001) };
+    check_with_osr(0xf4_8b_0000_0001, 3000, true, false, move || g.program());
 }
