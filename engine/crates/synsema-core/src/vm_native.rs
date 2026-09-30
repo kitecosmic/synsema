@@ -1066,7 +1066,7 @@ impl Interpreter {
             }
             let need = first + (code.nregs as usize).max(n);
             if top < need {
-                self.vm_regs.resize(need, SynValue::Nothing);
+                grow_regs(&mut self.vm_regs, need);
             }
             let lbase = self.vm_locals.len();
             self.vm_locals.resize(lbase + code.nlocals as usize, None);

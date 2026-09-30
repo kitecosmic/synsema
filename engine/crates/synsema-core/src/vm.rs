@@ -2259,6 +2259,16 @@ fn long_text_chains(n: &Node) -> usize {
 // Ejecución
 // =============================================================================================
 
+
+/// Agranda la ventana de registros a `len` con `Nothing` construidos en el lugar: `resize` clona el
+/// relleno (el `match` entero de `SynValue::clone` por registro, en cada llamada de la VM).
+#[inline]
+fn grow_regs(regs: &mut Vec<SynValue>, len: usize) {
+    if let Some(k) = len.checked_sub(regs.len()) {
+        regs.extend(std::iter::repeat_with(|| SynValue::Nothing).take(k));
+    }
+}
+
 impl Interpreter {
     /// El código de una task para esta llamada, si la VM la corre: compilado al definirla desde
     /// código compilado, o acá en su segunda llamada.
@@ -2322,7 +2332,7 @@ impl Interpreter {
             e.bindings.len_names() >= l.names.len() && (!chunk.tagged || e.bindings.laid_out_as(l))
         }));
         let base = self.vm_regs.len();
-        self.vm_regs.resize(base + chunk.nregs as usize, SynValue::Nothing);
+        grow_regs(&mut self.vm_regs, base + chunk.nregs as usize);
         let r = self.run_chunk_at(chunk, env, base);
         self.vm_regs.truncate(base);
         r
@@ -2340,7 +2350,7 @@ impl Interpreter {
         let lbase = self.vm_locals.len();
         self.vm_locals.resize(lbase + chunk.nlocals as usize, None);
         let base = self.vm_regs.len();
-        self.vm_regs.resize(base + chunk.nregs as usize, SynValue::Nothing);
+        grow_regs(&mut self.vm_regs, base + chunk.nregs as usize);
         {
             // Los parámetros van a sus registros (F3.7); otro nombre ligado, a la ventana.
             let mut e = call_env.borrow_mut();
@@ -4157,7 +4167,7 @@ impl Interpreter {
                         return Ok(None);
                     }
                     let new_base = self.vm_regs.len();
-                    self.vm_regs.resize(new_base + code.nregs as usize, SynValue::Nothing);
+                    grow_regs(&mut self.vm_regs, new_base + code.nregs as usize);
                     let lbase = self.vm_locals.len();
                     self.vm_locals.resize(lbase + code.nlocals as usize, None);
                     return Ok(Some(Enter { code, env: call_env, base: new_base, lbase, top: new_base }));
@@ -4179,7 +4189,7 @@ impl Interpreter {
         let top = self.vm_regs.len();
         let need = first + (code.nregs as usize).max(n);
         if top < need {
-            self.vm_regs.resize(need, SynValue::Nothing);
+            grow_regs(&mut self.vm_regs, need);
         }
         // Aridad permisiva (sin chequeo, un pipe): los de más se sueltan antes de los defaults.
         for i in np..n {
@@ -4246,7 +4256,7 @@ impl Interpreter {
         }
         let (n, np) = (args.len(), t.parameters.len());
         let base = self.vm_regs.len();
-        self.vm_regs.resize(base + (code.nregs as usize).max(np), SynValue::Nothing);
+        grow_regs(&mut self.vm_regs, base + (code.nregs as usize).max(np));
         // Los parámetros en `r0..` (F3.7); los de más se sueltan acá, antes de los defaults.
         for (i, a) in args.iter_mut().enumerate() {
             let v = std::mem::replace(a, SynValue::Nothing);
