@@ -206,6 +206,18 @@ fn builtin_contains() {
 fn builtin_split_join() {
     assert_output("print(text(length(split(\"a,b,c\", \",\"))))", &["3"]);
     assert_output("print(join([\"a\", \"b\", \"c\"], \"-\"))", &["a-b-c"]);
+    // F4.8g: `join` escribe cada parte directo (los enteros sin `fmt`): lo mismo que su `Display`.
+    assert_output(
+        "print(join([1, -22, 9223372036854775807, -9223372036854775807 - 1, 10 ** 30], \",\"))\nprint(join([1.5, 0.1 + 0.2, 2.0, 1.50d, true, false], \" | \"))\nprint(join([\"ñandú\", \"日本\", \"a\"], \"→\"))\nprint(join([], \"-\"))\nprint(join([7], \"-\"))\nprint(join([\"a\", 1, \"b\"], \"\"))",
+        &[
+            "1,-22,9223372036854775807,-9223372036854775808,1000000000000000000000000000000",
+            "1.5 | 0.30000000000000004 | 2.0 | 1.50 | true | false",
+            "ñandú→日本→a",
+            "",
+            "7",
+            "a1b",
+        ],
+    );
 }
 
 #[test]

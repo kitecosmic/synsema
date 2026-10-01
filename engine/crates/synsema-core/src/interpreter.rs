@@ -8126,7 +8126,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             // listas, mapas y bytes son error (pegarlos daba "a,nothing").
             SynValue::List(l) => {
                 let items = l.borrow();
-                let mut parts: Vec<String> = Vec::with_capacity(items.len());
+                // F4.8g: primero los errores (en orden: el primero que falla) y el largo de los
+                // textos; después un solo `String`, cada parte escrita directo (lo de su `Display`).
+                let mut cap = sep.len() * items.len().saturating_sub(1);
                 for (i, v) in items.iter().enumerate() {
                     if matches!(
                         v,
@@ -8138,9 +8140,25 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                             v.type_name()
                         )));
                     }
-                    parts.push(v.to_string());
+                    if let SynValue::Text(t) = v {
+                        cap += t.as_str().len();
+                    }
                 }
-                Ok(syn_text(parts.join(&sep)))
+                let mut out = String::with_capacity(cap);
+                for (i, v) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(&sep);
+                    }
+                    match v {
+                        SynValue::Text(t) => out.push_str(t.as_str()),
+                        SynValue::Number(Number::Int(x)) => out.push_str(int_digits(*x, &mut [0u8; 20])),
+                        other => {
+                            use std::fmt::Write;
+                            let _ = write!(out, "{}", other);
+                        }
+                    }
+                }
+                Ok(syn_text(out))
             }
             _ => Err(err("First argument to join must be a list")),
         }
@@ -9657,7 +9675,11 @@ pub(crate) fn text_add_piece(t: &mut SynText, x: &SynValue) -> bool {
 
 /// F4.8g: los dígitos de `x` en decimal (con `-` si es negativo), como su `Display`, sin `fmt`.
 pub(crate) fn push_int(t: &mut SynText, x: i64) {
-    let mut buf = [0u8; 20];
+    t.push_str(int_digits(x, &mut [0u8; 20]));
+}
+
+/// Los dígitos de `x` (ver `push_int`), escritos al final de `buf`.
+pub(crate) fn int_digits(x: i64, buf: &mut [u8; 20]) -> &str {
     let mut i = buf.len();
     let mut u = x.unsigned_abs();
     loop {
@@ -9673,7 +9695,7 @@ pub(crate) fn push_int(t: &mut SynText, x: i64) {
         buf[i] = b'-';
     }
     // Sólo dígitos ASCII y `-`.
-    t.push_str(std::str::from_utf8(&buf[i..]).unwrap_or_default());
+    std::str::from_utf8(&buf[i..]).unwrap_or_default()
 }
 
 #[cfg(test)]
