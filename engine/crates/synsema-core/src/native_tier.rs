@@ -722,6 +722,18 @@ pub trait NativeCode {
     fn homes(&self) -> &[Place] {
         &[]
     }
+    /// F4.8g: una sesión de llamadas seguidas a la task de la entrada (un builtin que la llama por
+    /// elemento): el contexto se arma una vez. `None` si el nivel no la tiene (o en un bucle).
+    fn session<'a>(&'a self, _max_depth: usize, _cancel: &'a AtomicBool) -> Option<Box<dyn NativeSession + 'a>> {
+        None
+    }
+}
+
+/// F4.8g: llamadas seguidas a una entrada nativa (ver `NativeCode::session`). Cada una como `call`,
+/// con los contadores de la VM: los toma al empezar y los deja al volver (al salir a la VM, la
+/// profundidad del frame de más adentro).
+pub trait NativeSession {
+    fn call(&mut self, steps: &mut u64, depth: &mut usize, args: &[i64]) -> NOutcome;
 }
 
 /// El nivel nativo instalado.

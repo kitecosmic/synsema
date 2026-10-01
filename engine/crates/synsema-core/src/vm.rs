@@ -2315,6 +2315,83 @@ fn long_text_chains(n: &Node) -> usize {
 // =============================================================================================
 
 
+/// F4.8g: las llamadas de un builtin a una función por elemento (`apply`, `where`, `reduce`, …), de a
+/// una como `call_fast`. Con código nativo, una sesión (`native::LambdaFast`): el contexto se arma una
+/// vez y el elemento entra prestado de la lista. Lo que no encaja va por `call_fast`.
+pub(crate) struct LambdaCall<'a> {
+    f: &'a SynValue,
+    /// La task (si la VM puede correrla: ni la referencia ni etiquetas) y el flag de cancelación.
+    #[cfg(feature = "native-tier")]
+    task: Option<&'a Rc<SynTaskValue>>,
+    #[cfg(feature = "native-tier")]
+    flag: &'a std::sync::atomic::AtomicBool,
+    /// La sesión: se arma cuando la task ya tiene código nativo (lo compila una de las primeras
+    /// llamadas, por `call_fast`); `off` si no se puede o se terminó (no se vuelve a intentar).
+    #[cfg(feature = "native-tier")]
+    fast: Option<native::LambdaFast<'a>>,
+    #[cfg(feature = "native-tier")]
+    off: bool,
+}
+
+impl<'a> LambdaCall<'a> {
+    /// Por la sesión, si la hay (o si ya se puede armar); `None`: por `call_fast`.
+    #[cfg(feature = "native-tier")]
+    #[inline]
+    fn native(&mut self, it: &mut Interpreter, pre: Option<&SynValue>, l: &ListRef, i: usize) -> Option<Result<SynValue, Control>> {
+        if self.fast.is_none() {
+            if self.off {
+                return None;
+            }
+            let t: &'a Rc<SynTaskValue> = self.task?;
+            if !t.code.native.ready() {
+                return None;
+            }
+            self.fast = it.vm_lambda_session(t, self.flag);
+            if self.fast.is_none() {
+                self.off = true;
+                return None;
+            }
+        }
+        let r = native::LambdaFast::call(&mut self.fast, it, pre, l, i);
+        if self.fast.is_none() {
+            self.off = true;
+        }
+        r
+    }
+
+    /// `f(l[i])`.
+    pub(crate) fn item(&mut self, it: &mut Interpreter, l: &ListRef, i: usize, loc: &SourceLocation) -> Result<SynValue, Control> {
+        #[cfg(feature = "native-tier")]
+        if let Some(r) = self.native(it, None, l, i) {
+            return r;
+        }
+        let item = l.borrow()[i].clone();
+        it.call_fast(self.f, &mut [item], loc)
+    }
+
+    /// `f(l[i])` y el elemento (`where`, `find_first`, `sort_by`). La lista es la que tiene el builtin
+    /// (una escritura del cuerpo copia): el elemento es el mismo antes o después de la llamada.
+    pub(crate) fn item_keep(&mut self, it: &mut Interpreter, l: &ListRef, i: usize, loc: &SourceLocation) -> Result<(SynValue, SynValue), Control> {
+        #[cfg(feature = "native-tier")]
+        if let Some(r) = self.native(it, None, l, i) {
+            return r.map(|r| (l.borrow()[i].clone(), r));
+        }
+        let item = l.borrow()[i].clone();
+        let r = it.call_fast(self.f, &mut [item.clone()], loc)?;
+        Ok((item, r))
+    }
+
+    /// `f(acc, l[i])` (`reduce`).
+    pub(crate) fn acc_item(&mut self, it: &mut Interpreter, acc: SynValue, l: &ListRef, i: usize, loc: &SourceLocation) -> Result<SynValue, Control> {
+        #[cfg(feature = "native-tier")]
+        if let Some(r) = self.native(it, Some(&acc), l, i) {
+            return r;
+        }
+        let item = l.borrow()[i].clone();
+        it.call_fast(self.f, &mut [acc, item], loc)
+    }
+}
+
 /// Agranda la ventana de registros a `len` con `Nothing` construidos en el lugar: `resize` clona el
 /// relleno (el `match` entero de `SynValue::clone` por registro, en cada llamada de la VM).
 #[inline]
@@ -4298,6 +4375,25 @@ impl Interpreter {
             chunk.map_sites[site as usize].build(&mut self.vm_regs[from..from + n as usize])
         };
         self.put(base, dst, SynValue::Map(m));
+    }
+
+    /// F4.8g: `body` con las llamadas de un builtin a `f` por elemento (ver `LambdaCall`).
+    pub(super) fn with_lambda<R>(&mut self, f: &SynValue, body: impl FnOnce(&mut Self, &mut LambdaCall<'_>) -> R) -> R {
+        #[cfg(feature = "native-tier")]
+        {
+            let flag = self.cancel.flag.clone();
+            let task = match f {
+                SynValue::Task(t) if self.shortcuts && !self.labels => Some(t.clone()),
+                _ => None,
+            };
+            let mut lc = LambdaCall { f, task: task.as_ref(), flag: &flag, fast: None, off: task.is_none() };
+            body(self, &mut lc)
+        }
+        #[cfg(not(feature = "native-tier"))]
+        {
+            let mut lc = LambdaCall { f };
+            body(self, &mut lc)
+        }
     }
 
     /// `call_fast` a un cuerpo con frame en registros.

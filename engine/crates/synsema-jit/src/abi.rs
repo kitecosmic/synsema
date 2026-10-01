@@ -29,7 +29,7 @@ use std::mem::offset_of;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::AtomicBool;
 
-use synsema_core::native_tier::{self, HostOut, NFrame, NOutcome, NPeek, NSeen, NVal, NativeCode, NativeCx, NativeHost, Place, SiteIc, TAG_LIST, TAG_MAP, TAG_MISS, TAG_OTHER};
+use synsema_core::native_tier::{self, HostOut, NFrame, NOutcome, NPeek, NSeen, NVal, NativeCode, NativeCx, NativeHost, NativeSession, Place, SiteIc, TAG_LIST, TAG_MAP, TAG_MISS, TAG_OTHER};
 use synsema_core::types::{ListRef, SynValue};
 
 use crate::lower::{ptr_words, words, ExecSite, Kind, Point, TAG_BOOL, TAG_FLOAT, TAG_HOLE, TAG_INT, TAG_KEEP};
@@ -540,8 +540,85 @@ impl NativeCode for Compiled {
         if ctx.status == 0 {
             return NOutcome::Done(nval(self.ret, &[r], None));
         }
-        // Del frame de más afuera al de más adentro.
-        let frames = sink
+        NOutcome::Deopt(self.frames(sink))
+    }
+
+    fn inputs(&self) -> &[(Place, NSeen)] {
+        &self.inputs
+    }
+
+    fn homes(&self) -> &[Place] {
+        &self.homes
+    }
+
+    fn session<'a>(&'a self, max_depth: usize, cancel: &'a AtomicBool) -> Option<Box<dyn NativeSession + 'a>> {
+        // Sólo una task (un bucle tiene sus entradas y sus lugares).
+        if !self.inputs.is_empty() || !self.homes.is_empty() {
+            return None;
+        }
+        let mut sink: Box<Vec<Raw>> = Box::default();
+        let mut panic: Box<Option<Box<dyn Any + Send>>> = Box::default();
+        let ctx = Ctx {
+            steps: 0,
+            depth: 0,
+            cancel: std::ptr::from_ref::<AtomicBool>(cancel).cast::<u8>(),
+            max_depth: max_depth as u64,
+            status: 0,
+            out_bits: 0,
+            out_ptr: 0,
+            sink: &mut *sink,
+            sites: self.sites.as_ptr(),
+            nsites: self.sites.len(),
+            panic: &mut *panic,
+            host: None,
+            exec_sites: self.exec_sites.as_ptr(),
+            nexec: self.exec_sites.len(),
+        };
+        Some(Box::new(Session { code: self, ctx, sink, panic, _cancel: cancel }))
+    }
+}
+
+/// F4.8g: el contexto de una entrada para muchas llamadas (ver `NativeCode::session`). El búfer de
+/// salidas y el del pánico están en cajas: el contexto apunta a ellas y no se mueven.
+struct Session<'a> {
+    code: &'a Compiled,
+    ctx: Ctx,
+    sink: Box<Vec<Raw>>,
+    panic: Box<Option<Box<dyn Any + Send>>>,
+    /// El flag de cancelación al que apunta `ctx` (prestado mientras vive la sesión).
+    _cancel: &'a AtomicBool,
+}
+
+impl NativeSession for Session<'_> {
+    fn call(&mut self, steps: &mut u64, depth: &mut usize, args: &[i64]) -> NOutcome {
+        assert_eq!(args.len(), self.code.nparams, "aridad de la entrada nativa");
+        self.ctx.steps = *steps;
+        self.ctx.depth = *depth as u64;
+        self.ctx.status = 0;
+        // SAFETY: como en `Compiled::call`: `entry` es una función de este módulo con esa firma; los
+        // punteros de `ctx` apuntan a datos que viven lo que vive la sesión (el flag, prestado por
+        // `'a`; los sitios de `code`; `sink` y `panic`, en cajas de la sesión) y `args` tiene
+        // `nparams` palabras (recién verificado).
+        let r = unsafe {
+            let f: extern "C" fn(*mut Ctx, *const i64) -> i64 = std::mem::transmute(self.code.entry);
+            f(&mut self.ctx, args.as_ptr())
+        };
+        *steps = self.ctx.steps;
+        *depth = self.ctx.depth as usize;
+        if let Some(p) = self.panic.take() {
+            resume_unwind(p);
+        }
+        if self.ctx.status == 0 {
+            return NOutcome::Done(nval(self.code.ret, &[r], None));
+        }
+        NOutcome::Deopt(self.code.frames(std::mem::take(&mut *self.sink)))
+    }
+}
+
+impl Compiled {
+    /// Las salidas que dejó el código, como frames de la VM (del de más afuera al de más adentro).
+    fn frames(&self, sink: Vec<Raw>) -> Vec<NFrame> {
+        sink
             .into_iter()
             .rev()
             .map(|raw| {
@@ -565,16 +642,7 @@ impl NativeCode for Compiled {
                     .collect();
                 NFrame { func: raw.func, pc: p.pc, values, call: p.call, planned: p.planned }
             })
-            .collect();
-        NOutcome::Deopt(frames)
-    }
-
-    fn inputs(&self) -> &[(Place, NSeen)] {
-        &self.inputs
-    }
-
-    fn homes(&self) -> &[Place] {
-        &self.homes
+            .collect()
     }
 }
 

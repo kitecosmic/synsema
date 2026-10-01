@@ -23,7 +23,7 @@
 //! Rust. Desde ahí todo es la VM.
 
 use super::*;
-use crate::native_tier::{self, HostOut, NArith, NCmp, NConst, NBuiltin, NFArith, NFrame, NFunc, NIns, NOpnd, NOsr, NOutcome, NPeek, NSeen, NSite, NUnary, NUnit, NVal, NativeCode, NativeCx, NativeHost, Place};
+use crate::native_tier::{self, HostOut, NArith, NCmp, NConst, NBuiltin, NFArith, NFrame, NFunc, NIns, NOpnd, NOsr, NOutcome, NPeek, NSeen, NSite, NUnary, NUnit, NVal, NativeCode, NativeCx, NativeHost, NativeSession, Place};
 use std::rc::Weak;
 
 /// Cuántas llamadas a otras tasks puede sumar una unidad.
@@ -540,6 +540,67 @@ fn arg_word(v: &SynValue, p: NSeen) -> Option<i64> {
     })
 }
 
+/// F4.8g: una sesión de llamadas a una task con código nativo desde un builtin (ver `LambdaCall`).
+pub(crate) struct LambdaFast<'a> {
+    t: &'a Rc<SynTaskValue>,
+    unit: &'a NativeUnit,
+    sess: Box<dyn NativeSession + 'a>,
+    /// Los parámetros (los escribe cada llamada) y después las globales (leídas al empezar).
+    words: [i64; 16],
+    n: usize,
+}
+
+impl LambdaFast<'_> {
+    /// `f(pre, l[i])` (o `f(l[i])`) por la sesión, como la haría `call_fast` (`vm_call_rust` con la
+    /// entrada nativa): la profundidad +1 con el mismo tope, los pasos del código. `None` si no encaja
+    /// (otros tipos, otra aridad, el tope): la llamada va por `call_fast`; si la función puede leer
+    /// algo que una llamada de la VM cambia (globales, tasks que llama), la sesión se termina.
+    pub(crate) fn call(fast: &mut Option<Self>, it: &mut Interpreter, pre: Option<&SynValue>, l: &ListRef, i: usize) -> Option<Result<SynValue, Control>> {
+        let f = fast.as_mut()?;
+        let pre_n = usize::from(pre.is_some());
+        let depth = it.recursion_depth + 1;
+        let items = l.borrow();
+        let fits = f.unit.params.len() == pre_n + 1 && depth <= MAX_RECURSION && {
+            let mut ok = true;
+            if let Some(p) = pre {
+                match arg_word(p, f.unit.params[0]) {
+                    Some(w) => f.words[0] = w,
+                    None => ok = false,
+                }
+            }
+            ok && match items.get(i).and_then(|v| arg_word(v, f.unit.params[pre_n])) {
+                Some(w) => {
+                    f.words[pre_n] = w;
+                    true
+                }
+                None => false,
+            }
+        };
+        if !fits {
+            if !f.unit.globals.is_empty() || !f.unit.deps.is_empty() {
+                *fast = None;
+            }
+            return None;
+        }
+        native_tier::count_entry();
+        let mut d = depth;
+        let out = f.sess.call(&mut it.steps, &mut d, &f.words[..f.n]);
+        // (Lo prestado ya se clonó en `out`: la lista se suelta antes de volver a la VM.)
+        drop(items);
+        Some(match out {
+            NOutcome::Done(v) => Ok(Interpreter::nval_to_syn(f.unit, v)),
+            NOutcome::Deopt(frames) => {
+                let LambdaFast { t, unit, .. } = fast.take().expect("sesión");
+                let first = it.vm_regs.len();
+                it.recursion_depth = d;
+                let r = it.vm_native_deopt(t, unit, frames, first, pre_n + 1);
+                it.recursion_depth -= 1;
+                r
+            }
+        })
+    }
+}
+
 /// Las palabras de los argumentos de una entrada nativa (y de las globales que lee).
 struct NativeArgs {
     w: [i64; 16],
@@ -1022,28 +1083,57 @@ impl Interpreter {
         }
         Some(match out {
             NOutcome::Done(v) => Ok(Self::nval_to_syn(unit, v)),
-            NOutcome::Deopt(frames) => {
-                native_tier::count_deopt();
-                let d = unit.deopts.get() + 1;
-                unit.deopts.set(d);
-                let outer_iters = self.vm_iters.len();
-                let lb0 = self.vm_locals.len();
-                let r = self.vm_native_resume(unit, frames, first, n);
-                if d > MAX_NATIVE_DEOPTS {
-                    t.code.native.give_up();
-                }
-                let Resume { frames, enter, pc, iter_base, .. } = *r;
-                let saved = std::mem::replace(&mut self.vm_lbase, enter.lbase);
-                let out = self.run_chunk_from(&enter.code, &enter.env, enter.base, pc, Some((frames, iter_base, outer_iters)));
-                self.vm_lbase = saved;
-                self.vm_regs.truncate(first);
-                self.vm_locals.truncate(lb0);
-                match out {
-                    Ok(v) | Err(Control::Give(v)) => Ok(v),
-                    Err(c) => Err(c),
-                }
-            }
+            NOutcome::Deopt(frames) => self.vm_native_deopt(t, unit, frames, first, n),
         })
+    }
+
+    /// La salida a la VM de una entrada desde Rust (`vm_native_from_rust`, `LambdaFast`): sigue en la
+    /// VM desde los frames que dejó el código nativo, armados desde el tope de la pila de registros.
+    #[inline(never)]
+    fn vm_native_deopt(&mut self, t: &Rc<SynTaskValue>, unit: &NativeUnit, frames: Vec<NFrame>, first: usize, n: usize) -> Result<SynValue, Control> {
+        native_tier::count_deopt();
+        let d = unit.deopts.get() + 1;
+        unit.deopts.set(d);
+        let outer_iters = self.vm_iters.len();
+        let lb0 = self.vm_locals.len();
+        let r = self.vm_native_resume(unit, frames, first, n);
+        if d > MAX_NATIVE_DEOPTS {
+            t.code.native.give_up();
+        }
+        let Resume { frames, enter, pc, iter_base, .. } = *r;
+        let saved = std::mem::replace(&mut self.vm_lbase, enter.lbase);
+        let out = self.run_chunk_from(&enter.code, &enter.env, enter.base, pc, Some((frames, iter_base, outer_iters)));
+        self.vm_lbase = saved;
+        self.vm_regs.truncate(first);
+        self.vm_locals.truncate(lb0);
+        match out {
+            Ok(v) | Err(Control::Give(v)) => Ok(v),
+            Err(c) => Err(c),
+        }
+    }
+
+    /// F4.8g: la sesión de `t` para un builtin que la llama por elemento, si tiene código nativo y
+    /// puede: lo que `call_fast` verificaría en cada llamada (cuerpo con frame en registros, la
+    /// unidad, sus dependencias, las globales que lee) se verifica acá una vez; las globales se leen
+    /// ahora (el código nativo no escribe nada: no cambian mientras la sesión sólo corre en nativo).
+    pub(super) fn vm_lambda_session<'a>(&mut self, t: &'a Rc<SynTaskValue>, flag: &'a AtomicBool) -> Option<LambdaFast<'a>> {
+        if !self.vm_code_for(t)?.regframe {
+            return None;
+        }
+        let unit = t.code.native.unit()?;
+        let np = unit.params.len();
+        if np != t.parameters.len() || np > 8 || unit.globals.len() > 8 || (!unit.deps.is_empty() && !unit.deps_hold(None)) {
+            return None;
+        }
+        let mut words = [0i64; 16];
+        if !unit.globals.is_empty() {
+            let e = t.closure_env.borrow();
+            for (g, (k, p)) in unit.globals.iter().enumerate() {
+                words[np + g] = arg_word(e.bindings.slot(*k)?, *p)?;
+            }
+        }
+        let sess = unit.code.session(MAX_RECURSION, flag)?;
+        Some(LambdaFast { t, unit, sess, words, n: np + unit.globals.len() })
     }
 
     /// Los frames nativos como frames de la VM: para cada uno, lo que `vm_enter_regframe` habría

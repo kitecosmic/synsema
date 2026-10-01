@@ -8668,14 +8668,6 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
     }
 
-    /// F4.8b: `call_fast` con un argumento, el elemento `i` de `l` (clonado ahora: la lista no se
-    /// tiene prestada mientras corre la función).
-    fn call_on_item(&mut self, f: &SynValue, l: &ListRef, i: usize, loc: &SourceLocation) -> Result<(SynValue, SynValue), Control> {
-        let item = l.borrow()[i].clone();
-        let r = self.call_fast(f, &mut [item.clone()], loc)?;
-        Ok((item, r))
-    }
-
     /// Dual-order de la familia intencional (batch DX, decisión #16 del diseño madre):
     /// los ops con callable aceptan `(fn, lista, …)` Y `(lista, fn, …)` — task/lambda
     /// y lista son tipos distinguibles en runtime, así que no hay ambigüedad y ambas
@@ -8744,12 +8736,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
         let (func, l) = self.dual_fn_rc(args, "apply")?;
         let n = l.borrow().len();
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let item = l.borrow()[i].clone();
-            out.push(self.call_fast(&func, &mut [item], loc)?);
-        }
-        Ok(syn_list(out))
+        self.with_lambda(&func, |it, lc| {
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                out.push(lc.item(it, &l, i, loc)?);
+            }
+            Ok(syn_list(out))
+        })
     }
 
     /// `call(task, args_map)` — despacha `task` con args nombrados tomados del map
@@ -8898,14 +8891,16 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             ));
         }
         let (pred, l) = self.dual_fn_rc(args, "where")?;
-        let mut out = Vec::new();
-        for i in 0..l.borrow().len() {
-            let (item, r) = self.call_on_item(&pred, &l, i, loc)?;
-            if r.is_truthy() {
-                out.push(item);
+        self.with_lambda(&pred, |it, lc| {
+            let mut out = Vec::new();
+            for i in 0..l.borrow().len() {
+                let (item, r) = lc.item_keep(it, &l, i, loc)?;
+                if r.is_truthy() {
+                    out.push(item);
+                }
             }
-        }
-        Ok(syn_list(out))
+            Ok(syn_list(out))
+        })
     }
 
     fn b_collect(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -8950,11 +8945,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // final y NO participa de la detección.
         let (func, l) = self.dual_fn_rc(args, "reduce")?;
         let mut acc = args.get(2).cloned().unwrap_or_else(|| syn_int(0));
-        for i in 0..l.borrow().len() {
-            let item = l.borrow()[i].clone();
-            acc = self.call_fast(&func, &mut [acc, item], loc)?;
-        }
-        Ok(acc)
+        self.with_lambda(&func, |it, lc| {
+            for i in 0..l.borrow().len() {
+                acc = lc.acc_item(it, std::mem::replace(&mut acc, SynValue::Nothing), &l, i, loc)?;
+            }
+            Ok(acc)
+        })
     }
 
     fn b_sort_by(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
@@ -8962,10 +8958,13 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let desc = desc_flag(args.get(2), "sort_by")?;
         let n = l.borrow().len();
         let mut keyed: Vec<(SynValue, SynValue)> = Vec::with_capacity(n);
-        for i in 0..n {
-            let (it, k) = self.call_on_item(&key_func, &l, i, loc)?;
-            keyed.push((k, it));
-        }
+        self.with_lambda(&key_func, |me, lc| {
+            for i in 0..n {
+                let (it, k) = lc.item_keep(me, &l, i, loc)?;
+                keyed.push((k, it));
+            }
+            Ok::<(), Control>(())
+        })?;
         let keys: Vec<SynValue> = keyed.iter().map(|(k, _)| k.clone()).collect();
         check_orderable(&keys, "sort_by")?;
         sort_checked(&mut keyed, |(k, _)| k, desc, "sort_by")?;
@@ -8983,47 +8982,52 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 
     fn b_find_first(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         let (pred, l) = self.dual_fn_rc(args, "find_first")?;
-        for i in 0..l.borrow().len() {
-            let (item, r) = self.call_on_item(&pred, &l, i, loc)?;
-            if r.is_truthy() {
-                return Ok(item);
+        self.with_lambda(&pred, |it, lc| {
+            for i in 0..l.borrow().len() {
+                let (item, r) = lc.item_keep(it, &l, i, loc)?;
+                if r.is_truthy() {
+                    return Ok(item);
+                }
             }
-        }
-        Ok(SynValue::Nothing)
+            Ok(SynValue::Nothing)
+        })
     }
 
     fn b_every(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         let (pred, l) = self.dual_fn_rc(args, "every")?;
-        for i in 0..l.borrow().len() {
-            let item = l.borrow()[i].clone();
-            if !self.call_fast(&pred, &mut [item], loc)?.is_truthy() {
-                return Ok(syn_bool(false));
+        self.with_lambda(&pred, |it, lc| {
+            for i in 0..l.borrow().len() {
+                if !lc.item(it, &l, i, loc)?.is_truthy() {
+                    return Ok(syn_bool(false));
+                }
             }
-        }
-        Ok(syn_bool(true))
+            Ok(syn_bool(true))
+        })
     }
 
     fn b_some(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         let (pred, l) = self.dual_fn_rc(args, "some")?;
-        for i in 0..l.borrow().len() {
-            let item = l.borrow()[i].clone();
-            if self.call_fast(&pred, &mut [item], loc)?.is_truthy() {
-                return Ok(syn_bool(true));
+        self.with_lambda(&pred, |it, lc| {
+            for i in 0..l.borrow().len() {
+                if lc.item(it, &l, i, loc)?.is_truthy() {
+                    return Ok(syn_bool(true));
+                }
             }
-        }
-        Ok(syn_bool(false))
+            Ok(syn_bool(false))
+        })
     }
 
     fn b_count_where(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         let (pred, l) = self.dual_fn_rc(args, "count_where")?;
-        let mut count: i64 = 0;
-        for i in 0..l.borrow().len() {
-            let item = l.borrow()[i].clone();
-            if self.call_fast(&pred, &mut [item], loc)?.is_truthy() {
-                count += 1;
+        self.with_lambda(&pred, |it, lc| {
+            let mut count: i64 = 0;
+            for i in 0..l.borrow().len() {
+                if lc.item(it, &l, i, loc)?.is_truthy() {
+                    count += 1;
+                }
             }
-        }
-        Ok(syn_int(count))
+            Ok(syn_int(count))
+        })
     }
 
     fn b_flatten(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
