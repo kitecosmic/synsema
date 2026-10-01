@@ -117,3 +117,126 @@ fn many_sequential_requests_stay_correct() {
         check(&resp, &tag).unwrap_or_else(|e| panic!("request secuencial #{}: {}", i, e));
     }
 }
+
+/// Lo que un handler escribe en una GLOBAL vale durante esa request y no en la siguiente
+/// (serve.md: "A `set globalVar to ...` inside a route handler does NOT persist"). Hasta
+/// v0.6.37 el worker reusado conservaba la escritura: la misma GET daba respuestas distintas
+/// según qué worker la atendía, y lo que guardaba una request lo veía otra.
+#[test]
+fn writes_to_globals_do_not_outlive_the_request() {
+    let port = free_port();
+    let prog = format!(
+        r#"require serve({p})
+let rows be [{{"id": 1, "name": "orig"}}]
+let counter be 0
+let tags be ["a"]
+let cfg be {{"mode": "base", "limits": [1, 2]}}
+let trail be "t"
+let nums be [0]
+task bump()
+    set counter to counter + 100
+    set cfg.limits[0] to 99
+    give counter
+serve on {p}
+    route "GET /mutpath"
+        set rows[0].name to "cambiado"
+        give rows[0].name
+    route "GET /mutappend"
+        set tags to append(tags, "b")
+        set tags to append(tags, "c")
+        give length(tags)
+    route "GET /mutset"
+        set counter to counter + 1
+        set cfg.mode to "otro"
+        give {{"c": counter, "m": cfg.mode}}
+    route "GET /muttask"
+        give {{"b": bump(), "l": cfg.limits[0]}}
+    route "GET /hot"
+        each i in range(0, 5000)
+            set tags to append(tags, "x")
+            set nums to append(nums, i)
+            set rows[0].name to "hot"
+            set cfg.limits[1] to i
+            set trail to trail + "."
+            set counter to counter + 1
+        give {{"t": length(tags), "n": length(nums), "c": counter, "l": length(trail), "k": cfg.limits[1]}}
+    route "GET /get"
+        give {{"name": rows[0].name, "tags": length(tags), "counter": counter, "mode": cfg.mode, "limit": cfg.limits[0], "trail": length(trail), "nums": length(nums), "k": cfg.limits[1]}}
+"#,
+        p = port
+    );
+    thread::spawn(move || {
+        let _ = run_serve_program(&prog, "serve_isolation_globals.syn", false);
+    });
+    let mut up = false;
+    for _ in 0..80 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            thread::sleep(Duration::from_millis(150));
+            up = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(up, "el server no quedó listo en :{}", port);
+    let body = |resp: &str| resp.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    // Dentro de la request la escritura se ve; después, en ningún worker.
+    let original = r#"{"name": "orig", "tags": 1, "counter": 0, "mode": "base", "limit": 1, "trail": 1, "nums": 1, "k": 2}"#;
+    for round in 0..12 {
+        assert_eq!(body(&get(port, "/mutpath")), r#""cambiado""#, "ronda {}", round);
+        assert_eq!(body(&get(port, "/mutappend")), "3", "ronda {}", round);
+        assert_eq!(body(&get(port, "/mutset")), r#"{"c": 1, "m": "otro"}"#, "ronda {}", round);
+        assert_eq!(body(&get(port, "/muttask")), r#"{"b": 100, "l": 99}"#, "ronda {}", round);
+        assert_eq!(body(&get(port, "/get")), original, "ronda {}", round);
+        // Bucles calientes (código nativo, vías en el lugar de la VM y del JIT): lo mismo.
+        assert_eq!(body(&get(port, "/hot")), r#"{"t": 5001, "n": 5001, "c": 5000, "l": 5001, "k": 4999}"#, "ronda {}", round);
+        assert_eq!(body(&get(port, "/get")), original, "ronda {} tras /hot", round);
+    }
+    // Concurrentes: cada worker del pool tiene que dar lo mismo.
+    let mut hs = Vec::new();
+    for _ in 0..32 {
+        hs.push(thread::spawn(move || {
+            let _ = get(port, "/mutset");
+            get(port, "/get")
+        }));
+    }
+    for h in hs {
+        assert_eq!(body(&h.join().unwrap()), original);
+    }
+}
+
+/// Lo mismo para el estado de un MÓDULO importado: una task del módulo que escribe sus variables
+/// (`hits`, `seen`) no deja nada para la request siguiente (hasta v0.6.37 se acumulaba: 2, 3, 4…).
+#[test]
+fn module_state_does_not_outlive_the_request() {
+    let port = free_port();
+    let prog = format!(
+        r#"require serve({p})
+use "./serve_isolation_mod.syn" as m
+serve on {p}
+    route "GET /bump"
+        let a be m.bump("a")
+        give m.bump("b")
+"#,
+        p = port
+    );
+    let importer = format!("{}/tests/fixtures/serve_isolation_main.syn", env!("CARGO_MANIFEST_DIR"));
+    thread::spawn(move || {
+        let _ = run_serve_program(&prog, &importer, false);
+    });
+    let mut up = false;
+    for _ in 0..80 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            thread::sleep(Duration::from_millis(150));
+            up = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(up, "el server no quedó listo en :{}", port);
+    for round in 0..16 {
+        let resp = get(port, "/bump");
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        // Dentro de la request las dos llamadas se ven (2); entre requests, nada.
+        assert_eq!(body, r#"{"hits": 2, "seen": 2}"#, "ronda {}", round);
+    }
+}

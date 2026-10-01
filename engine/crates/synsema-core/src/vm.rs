@@ -2442,6 +2442,36 @@ impl Interpreter {
         self.run_chunk(&chunk, env)
     }
 
+    /// El cuerpo de una ruta de `serve` por la VM, en el scope de la request (`env`, hijo del
+    /// global o del módulo que la montó). Compila como el programa: las variables del cuerpo van a
+    /// ese scope, los nombres de afuera se buscan subiendo, `give` sale como `Control::Give` y el
+    /// final del cuerpo como `Ok` — lo mismo que `exec_block`, que es lo que `serve` distingue
+    /// (respuesta con cuerpo o sin cuerpo).
+    pub(super) fn run_request_chunk(&mut self, stmts: &[Node], env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let chunk = self.request_chunk(stmts);
+        self.run_chunk(&chunk, env)
+    }
+
+    /// El chunk del cuerpo de una ruta, compilado la primera vez que este intérprete lo corre.
+    /// La clave es la dirección y el largo del cuerpo; como un cuerpo temporal (el de un socket se
+    /// arma en cada conexión) puede dejar otro distinto en la misma dirección, se reusa sólo si el
+    /// cuerpo guardado es IGUAL al de ahora. Con muchos cuerpos distintos (temporales), se vacía.
+    fn request_chunk(&mut self, stmts: &[Node]) -> Rc<Chunk> {
+        const MAX: usize = 512;
+        let key = (stmts.as_ptr() as usize, stmts.len());
+        if let Some((body, chunk)) = self.vm_request_chunks.get(&key) {
+            if body.as_slice() == stmts {
+                return chunk.clone();
+            }
+        }
+        let chunk = compile_program(stmts);
+        if self.vm_request_chunks.len() >= MAX {
+            self.vm_request_chunks.clear();
+        }
+        self.vm_request_chunks.insert(key, (stmts.to_vec(), chunk.clone()));
+        chunk
+    }
+
     /// Corre un chunk en `env` (el frame de la llamada, ya preparado, o la raíz del programa).
     /// Devuelve lo mismo que `exec_block` sobre ese cuerpo.
     pub(super) fn run_chunk(&mut self, chunk: &Rc<Chunk>, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {

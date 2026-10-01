@@ -8,11 +8,15 @@
 //!
 //! Es un proceso aparte a propósito: un programa que no termina (un `serve`, una espera) se
 //! mata desde afuera sin llevarse puesto al test.
+//!
+//! Con `--request` el programa entero corre como el cuerpo de una ruta de `serve`
+//! (`run_request_block`): así el oráculo compara también ese camino (VM y nativo en los handlers).
 
 fn main() {
     let mut reference = false;
     let mut resolver_check = false;
     let mut jit_eager = false;
+    let mut request = false;
     let mut path = None;
     for a in std::env::args().skip(1) {
         if a == "--reference" {
@@ -21,12 +25,14 @@ fn main() {
             resolver_check = true;
         } else if a == "--jit-eager" {
             jit_eager = true;
+        } else if a == "--request" {
+            request = true;
         } else {
             path = Some(a);
         }
     }
     let Some(path) = path else {
-        eprintln!("uso: oracle_run [--reference] [--resolver-check] [--jit-eager] <archivo.syn>");
+        eprintln!("uso: oracle_run [--reference] [--resolver-check] [--jit-eager] [--request] <archivo.syn>");
         std::process::exit(2);
     };
     let source = match std::fs::read_to_string(&path) {
@@ -42,6 +48,7 @@ fn main() {
         synsema_core::native_tier::set_eager(jit_eager);
     }
     synsema_core::resolve::check::set_enabled(resolver_check);
+    synsema_runtime::engine::set_request_mode(request);
     let r = synsema_runtime::engine::run_program_ceiled_opts(&source, &path, None, false);
     // Si la corrida tocó datos privados, `steps` no se publica (igual que `run --format json`).
     let steps = if synsema_runtime::engine::last_run_touched_private() {

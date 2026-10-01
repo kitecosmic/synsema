@@ -1382,7 +1382,7 @@ fn build_base_interp(
     secure: bool,
     mem_name: &Option<String>,
     agent_builder: Option<crate::engine::InterpBuilder>,
-) -> (Interpreter, Rc<RefCell<CapabilitySet>>) {
+) -> (Interpreter, Rc<RefCell<CapabilitySet>>, Originals) {
     let mut interp = Interpreter::new();
     // DE-034: bajo `serve`, los `log`/`print`/`show` de DENTRO de un handler se
     // descartaban (el buffer `output` se limpia por request sin volcarse). Cableamos el
@@ -1474,14 +1474,66 @@ fn build_base_interp(
     // (state_*, DB compartida, approvals, cron, bus, memoria) — no en una isla.
     wire_swarm_hooks(&mut interp, swarm, "request", host_ceiling, mem_ctx, agent_builder, &caps);
     register_database_builtins(&interp, shared_db, caps.clone());
-    rebuild_globals(&mut interp, snapshot);
-    (interp, caps)
+    let registry = rebuild_globals(&mut interp, snapshot);
+    let originals = Originals::capture(&interp, snapshot, &registry);
+    (interp, caps, originals)
+}
+
+/// Los valores con que arrancan las globales del programa (y las variables de los módulos que
+/// importa) en este worker. Cada request empieza con ellos: como el worker los sigue teniendo,
+/// toda lista o mapa global tiene un dueño más, así que una escritura durante la request copia
+/// primero (`make_unique`) y los originales no cambian. Al terminar, `restore` vuelve a atar cada
+/// nombre a su original. Es lo que promete `serve.md`: un `set` de una global dentro de un handler
+/// no llega a la request siguiente (hasta v0.6.37 quedaba en el worker que la atendió).
+/// Clones de `Rc`: ningún dato se copia para guardarlos.
+pub(crate) struct Originals {
+    globals: Vec<(String, SynValue)>,
+    modules: Vec<(Rc<RefCell<Environment>>, Vec<(Arc<str>, SynValue)>)>,
+}
+
+impl Originals {
+    fn capture(interp: &Interpreter, snapshot: &[(String, GlobalVal)], registry: &ModuleRegistry) -> Originals {
+        let genv = interp.global_env.borrow();
+        let globals = snapshot
+            .iter()
+            .filter(|(_, gv)| !matches!(gv, GlobalVal::Agent { .. }))
+            .filter_map(|(k, _)| genv.bindings.get(k).map(|v| (k.clone(), v.clone())))
+            .collect();
+        let modules = registry
+            .values()
+            .map(|env| {
+                let vals = env.borrow().bindings.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                (env.clone(), vals)
+            })
+            .collect();
+        Originals { globals, modules }
+    }
+
+    /// Vuelve a atar cada nombre a su original. Directo en los bindings, sin `set_global`: los
+    /// principales de las etiquetas ya se cosecharon al construir el worker, y cosecharlos de nuevo
+    /// recorrería todos los datos en cada request.
+    fn restore(&self, interp: &Interpreter) {
+        {
+            let mut genv = interp.global_env.borrow_mut();
+            for (k, v) in &self.globals {
+                genv.bindings.set(k, v.clone());
+            }
+        }
+        for (env, vals) in &self.modules {
+            let mut e = env.borrow_mut();
+            for (k, v) in vals {
+                e.bindings.set_shared(k, v.clone());
+            }
+        }
+    }
 }
 
 /// Intérprete base + sus capabilities, cacheado por-worker y reusado entre requests.
 struct BaseInterp {
     interp: Interpreter,
     caps: Rc<RefCell<CapabilitySet>>,
+    /// Ver `Originals`: con qué valores empieza cada request.
+    originals: Originals,
     /// Pinnea el snapshot mientras la entrada viva en el cache: la clave del cache es
     /// la DIRECCIÓN del Arc — si el snapshot se liberara, otro Arc podría alocarse en
     /// la misma dirección y colisionar con este intérprete (construido de otro mundo).
@@ -1546,7 +1598,7 @@ fn with_serve_interp<R>(
                 mem_name.clone(),
             );
             let b: crate::engine::InterpBuilder = Arc::new(move || {
-                build_base_interp(
+                let (interp, caps, _) = build_base_interp(
                     sw.clone(),
                     &sn,
                     &cs,
@@ -1562,12 +1614,13 @@ fn with_serve_interp<R>(
                     secure,
                     &mn,
                     cell2.get().cloned(),
-                )
+                );
+                (interp, caps)
             });
             let _ = cell.set(b.clone());
             b
         };
-        let (interp, caps) = build_base_interp(
+        let (interp, caps, originals) = build_base_interp(
             swarm.clone(),
             snapshot,
             caps_snap,
@@ -1584,7 +1637,7 @@ fn with_serve_interp<R>(
             mem_name,
             Some(builder),
         );
-        BaseInterp { interp, caps, _snapshot: snapshot.clone() }
+        BaseInterp { interp, caps, originals, _snapshot: snapshot.clone() }
     });
 
     // T5 (ronda 7): el diario del almacén compartido cubre exactamente este request.
@@ -1598,6 +1651,9 @@ fn with_serve_interp<R>(
     // retiradas — nada de lo que abrió este request sobrevive al siguiente.
     synsema_stdlib::ws::reset_hub(&base.interp);
     base.interp.reset_for_request();
+    // Las globales (y las variables de los módulos) vuelven a sus originales: lo que la request
+    // escribió en ellas no llega a la siguiente.
+    base.originals.restore(&base.interp);
     // El reset borra `agent_definitions`; los agentes top-level vuelven del snapshot —
     // si no, el próximo request de este worker vería "No agent defined" (bug pocos-cores).
     restore_agents(&mut base.interp, snapshot);

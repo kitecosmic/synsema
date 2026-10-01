@@ -16,7 +16,7 @@ single static binary.
 > Serving web pages (HTML, static files with cache/fallback, CORS) ·
 > Web for agents (SSR, negotiation & discoverability) ·
 > Pagination · Streaming responses (SSE) · Rate limiting · Auth (incoming) · Agent identity ·
-> Input validation · Request body limits · Isolation · Full example ·
+> Input validation · Request body limits · Performance and memory of a server · Isolation · Full example ·
 > Production web stack (TLS / auto-HTTPS / vhosts / reverse proxy / HTTP-2) · Template composition
 
 ## Capability
@@ -195,6 +195,12 @@ level would restart the same sequence in every request, so using it in a handler
 (`the generator rng(1) was created at the top level; here it would restart the same sequence in every request/worker …`); build it per request
 (`rng(int(params.seed))`) or use `random()` + `require random` — [builtins.md](builtins.md) §
 Seeded randomness.
+
+Engine **v0.6.39+** enforces this for every kind of write — a path (`set rows[0].name to …`), an
+in-place `append`, a scalar, from a task the handler calls, and a module's own variables: each
+request starts from the values the program set up. Up to v0.6.38 such a write could stay in the
+worker that served the request (the same `GET` answered differently depending on the worker) —
+never rely on it; what must outlive a request goes in `state_*`, a database or the memory.
 ```
 route "POST /visit"
     state_incr("visits")            -- shared counter across all requests
@@ -1297,6 +1303,20 @@ serve on 8080
 
 This is why raising the limit is safe: the cap is on the in-memory buffer, not
 on what can be served — large uploads stream to disk rather than being buffered.
+
+## Performance and memory of a server
+
+- **Where a route body runs.** Engine **v0.6.39+**: route bodies run on the bytecode VM and their
+  hot loops on the native tier, like `synsema run` (measured: a 1M-iteration loop written in a
+  handler, ~0.3 s → ~5 ms per request; reading a top-level global inside it is still native).
+  With `--labels` / `serve --attested` they run on the reference interpreter, like any program.
+  Up to v0.6.38 the route body itself ran on the reference interpreter: move a heavy loop into a
+  `task` the route calls (it reaches native code from its second call).
+- **Memory per worker.** Each worker (`SYNSEMA_SERVE_WORKERS`, default one per core) builds its
+  own copy of the top-level globals on its first request, so RAM ≈ size of the globals × workers
+  (measured: 1 M small records in a global ≈ 160–190 MB per worker; 12 workers ≈ 2.6 GB). With
+  large data in globals, keep the worker count low or keep the data in a database (`sql`) and
+  fetch the page you need. Workers mostly pay off for handlers that wait on I/O or compute.
 
 ## Isolation
 

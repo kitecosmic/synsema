@@ -1407,6 +1407,11 @@ pub struct Interpreter {
     /// El chunk del último programa que corrió la VM (para `explain_after_run`: su código queda
     /// como lo dejó el quickening).
     vm_last_program: Option<Rc<vm::Chunk>>,
+    /// Los cuerpos de las rutas de `serve` ya compilados por la VM, en este intérprete (uno por
+    /// worker): cada request de una ruta corre el mismo chunk, así que lo especializado y lo
+    /// nativo de una request sirve para las siguientes. Clave: dirección y largo del cuerpo; el
+    /// valor guarda una copia del cuerpo y sólo se reusa si es igual (ver `vm::request_chunk`).
+    vm_request_chunks: HashMap<(usize, usize), (Vec<Node>, Rc<vm::Chunk>)>,
     /// v0.6.20 — raíz del proyecto: el directorio del archivo de ENTRADA, límite de contención
     /// de `use "../x.syn"`. La fija el host (`set_project_root`) o, si no, se captura del primer
     /// `use` que se ejecuta (siempre el top-level de la entrada). `None` = criterio v0.6.19
@@ -1689,6 +1694,7 @@ impl Interpreter {
             vm_locals: Vec::new(),
             vm_lbase: 0,
             vm_last_program: None,
+            vm_request_chunks: HashMap::new(),
             project_root: None,
             stdout_hook: None,
             stdout_verdict: None,
@@ -3080,7 +3086,14 @@ impl Interpreter {
             }
         }
         let saved_taint = self.take_taint();
-        let result = self.exec_block(stmts, &env);
+        // El cuerpo de la ruta por la VM (y el nivel nativo), con la misma condición que el
+        // programa: atajos y sin etiquetas. Con etiquetas (`--labels`, `serve --attested`), el
+        // tree-walker. Hasta v0.6.38 los handlers corrían siempre en el tree-walker.
+        let result = if self.shortcuts && !self.labels && !stmts.is_empty() {
+            self.run_request_chunk(stmts, &env)
+        } else {
+            self.exec_block(stmts, &env)
+        };
         self.restore_taint(saved_taint);
         // Rompe cualquier ciclo Rc creado en el scope del request: si el handler hace
         // `define task` dentro del body, la task cierra sobre `env` (`closure_env`) y el
