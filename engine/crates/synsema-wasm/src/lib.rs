@@ -27,6 +27,7 @@
 
 pub mod handler;
 
+use synsema_core::synlist::{list_values};
 use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -202,7 +203,7 @@ pub fn labelled_json(v: &SynValue) -> serde_json::Value {
         SynValue::Bool(b) => Value::Bool(*b),
         SynValue::Text(t) => Value::String(t.to_string()),
         SynValue::Bytes(b) => json!({"$bytes": base64_std(b)}),
-        SynValue::List(l) => Value::Array(l.borrow().iter().map(labelled_json).collect()),
+        SynValue::List(l) => Value::Array(list_values(&l).iter().map(labelled_json).collect()),
         SynValue::Map(m) => Value::Object(m.borrow().iter().map(|(k, v)| (escape_marker_key(k), labelled_json(v))).collect()),
         // Redactado por `Display`: un secret jamás cruza esta frontera en claro.
         SynValue::Secret(_) => Value::String(v.to_string()),
@@ -515,7 +516,7 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
         2,
         Rc::new(|_i, args, _loc| {
             let list = match args.first() {
-                Some(SynValue::List(l)) => l.borrow().clone(),
+                Some(SynValue::List(l)) => l.borrow().to_vec(),
                 _ => return Err(rt_err("chunk: first argument must be a list")),
             };
             let size = match args.get(1) {
@@ -540,7 +541,7 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
                 _ => return Err(rt_err("parallel_map: first argument must be a task")),
             };
             let list = match args.get(1) {
-                Some(SynValue::List(l)) => l.borrow().clone(),
+                Some(SynValue::List(l)) => l.borrow().to_vec(),
                 _ => return Err(rt_err("parallel_map: second argument must be a list")),
             };
             let mut out = Vec::with_capacity(list.len());

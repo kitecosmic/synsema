@@ -6,6 +6,7 @@
 //! Faltantes (DATOS-2/6): `nothing` es un dato FALTANTE y las agregaciones lo saltean (como
 //! los null de polars/SQL); NaN es un resultado inválido y se PROPAGA.
 
+use crate::synlist::{list_values};
 use crate::types::{Key, MapObj, SynMap};
 use std::rc::Rc;
 
@@ -73,7 +74,7 @@ pub fn key_spec(v: &SynValue, who: &str) -> Result<KeySpec, Control> {
         SynValue::Text(t) => Ok(KeySpec::Column(t.to_string())),
         SynValue::List(l) => {
             let mut cols = Vec::new();
-            for c in l.borrow().iter() {
+            for c in list_values(&l).iter() {
                 match c {
                     SynValue::Text(t) => cols.push(t.to_string()),
                     other => return Err(err(format!("{}: column names must be text, got {}", who, other.type_name()))),
@@ -131,7 +132,7 @@ impl NumMix {
             SynValue::Number(n) if n.is_decimal() => (true, false, n.to_f64()),
             SynValue::Number(Number::Float(x)) if !x.is_nan() => (false, true, *x),
             SynValue::List(l) => {
-                let items = l.borrow();
+                let items = list_values(&l);
                 return items.iter().enumerate().any(|(i, x)| self.walk(x, format!("{}[{}]", path, i)));
             }
             SynValue::Map(m) => {
@@ -157,7 +158,7 @@ pub(crate) fn dec_float_clash(a: &SynValue, b: &SynValue) -> bool {
     let (a, b) = (crate::labels::unwrap(a), crate::labels::unwrap(b));
     match (a, b) {
         (SynValue::List(x), SynValue::List(y)) => {
-            let (x, y) = (x.borrow(), y.borrow());
+            let (x, y) = (list_values(x), list_values(y));
             x.len() == y.len() && x.iter().zip(y.iter()).any(|(p, q)| dec_float_clash(p, q))
         }
         (SynValue::Map(x), SynValue::Map(y)) => {
@@ -194,7 +195,7 @@ fn equals_walk(a: &SynValue, b: &SynValue, clash: &mut bool) -> bool {
     let (a, b) = (crate::labels::unwrap(a), crate::labels::unwrap(b));
     match (a, b) {
         (SynValue::List(x), SynValue::List(y)) => {
-            let (x, y) = (x.borrow(), y.borrow());
+            let (x, y) = (list_values(x), list_values(y));
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(p, q)| equals_walk(p, q, clash))
         }
         (SynValue::Map(x), SynValue::Map(y)) => {
@@ -278,7 +279,7 @@ fn canon_key(v: &SynValue, out: &mut String) {
         }
         SynValue::List(l) => {
             out.push('[');
-            for x in l.borrow().iter() {
+            for x in list_values(&l).iter() {
                 canon_key(x, out);
             }
             out.push(']');
@@ -665,8 +666,7 @@ pub fn join(args: &[SynValue]) -> Result<SynValue, Control> {
     let right = rows_arg(args.get(1).ok_or_else(|| err("join(left, right, on, how?): missing right"))?, W)?;
     let on: Vec<String> = match args.get(2) {
         Some(SynValue::Text(t)) => vec![t.to_string()],
-        Some(SynValue::List(l)) => l
-            .borrow()
+        Some(SynValue::List(l)) => list_values(&l)
             .iter()
             .map(|v| match v {
                 SynValue::Text(t) => Ok(t.to_string()),
@@ -969,7 +969,7 @@ pub fn drop_missing(args: &[SynValue]) -> Result<SynValue, Control> {
     let cols: Option<Vec<String>> = match args.get(1) {
         None | Some(SynValue::Nothing) => None,
         Some(SynValue::Text(t)) => Some(vec![t.to_string()]),
-        Some(SynValue::List(l)) => Some(l.borrow().iter().map(|v| v.to_string()).collect()),
+        Some(SynValue::List(l)) => Some(list_values(&l).iter().map(|v| v.to_string()).collect()),
         Some(other) => return Err(err(format!("{}: columns must be a name or a list of names, got {}", W, other.type_name()))),
     };
     let keep = |it: &SynValue| -> bool {
@@ -996,7 +996,7 @@ pub fn fill_nan(args: &[SynValue]) -> Result<SynValue, Control> {
     };
     match args.first() {
         Some(SynValue::List(l)) => Ok(syn_list(
-            l.borrow()
+            list_values(&l)
                 .iter()
                 .map(|v| match v {
                     SynValue::Number(Number::Float(x)) if x.is_nan() => syn_number(fill.clone()),

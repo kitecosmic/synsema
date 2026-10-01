@@ -3,6 +3,7 @@
 //! módulo compila en el perfil wasm (sin `native`), server.rs no. server.rs
 //! re-exporta los símbolos públicos → los callers externos no cambian.
 
+use synsema_core::synlist::{list_values};
 use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -32,7 +33,7 @@ fn reject_code(v: &SynValue, who: &str, path: &str) -> Result<(), Control> {
             synsema_core::rng::code_noun(v)
         ))),
         SynValue::List(l) => {
-            for (i, x) in l.borrow().iter().enumerate() {
+            for (i, x) in list_values(&l).iter().enumerate() {
                 if matches!(x, SynValue::Task(_) | SynValue::Builtin(_) | SynValue::List(_) | SynValue::Map(_)) {
                     reject_code(x, who, &format!("{}[{}]", path, i))?;
                 }
@@ -77,7 +78,7 @@ pub fn register_json_builtins(interp: &Interpreter) {
         1,
         Rc::new(|_i, args, _loc| {
             let items = match args.first() {
-                Some(SynValue::List(l)) => l.borrow().clone(),
+                Some(SynValue::List(l)) => l.borrow().to_vec(),
                 Some(other) => return Err(err(format!("jsonl_encode: expected a list, got {}", other.type_name()))),
                 None => return Err(err("jsonl_encode(items)")),
             };
@@ -311,7 +312,7 @@ pub fn syn_to_json(v: &SynValue) -> Json {
         // Evita el drift de convertir a float; reusa el camino "número crudo".
         SynValue::Number(n @ (Number::Decimal(_) | Number::BigDec(_))) => Json::BigInt(n.to_string()),
         SynValue::Text(s) => Json::Str(s.to_string()),
-        SynValue::List(l) => Json::Array(l.borrow().iter().map(syn_to_json).collect()),
+        SynValue::List(l) => Json::Array(list_values(&l).iter().map(syn_to_json).collect()),
         SynValue::Map(m) => {
             Json::Object(m.borrow().iter().map(|(k, v)| (k.to_string(), syn_to_json(v))).collect())
         }

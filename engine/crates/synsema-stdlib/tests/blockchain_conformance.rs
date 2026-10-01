@@ -9,6 +9,7 @@
 //! Las FIRMAS gateadas se prueban acá a nivel de builtin CON la capability concedida
 //! (el gate/sandbox/audit se prueban por el runtime en batch11_e2e.rs).
 
+use synsema_core::synlist::{list_values};
 use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -689,7 +690,7 @@ fn abi_transfer_uint256_needs_big_and_tuple_int_vectors() {
     ));
     match &dec {
         SynValue::List(l) => {
-            let l = l.borrow();
+            let l = list_values(&l);
             assert_eq!(l[0].to_string(), "0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf");
             assert_eq!(l[1].to_string(), "1000000000000000000000000", "uint256 exacto, sin float");
         }

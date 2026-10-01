@@ -692,7 +692,7 @@ fn types_arg(v: &SynValue, fname: &str) -> Result<Vec<AbiType>, Control> {
             })
         }
         SynValue::List(l) => {
-            let items = l.borrow().clone();
+            let items = l.borrow().to_vec();
             let mut ts = Vec::with_capacity(items.len());
             for (i, it) in items.iter().enumerate() {
                 match it {
@@ -747,7 +747,7 @@ fn abi_encode(args: &[SynValue]) -> Result<SynValue, Control> {
         (c, ts, true)
     };
     let vals = match arg(args, 1, "abi_encode")? {
-        SynValue::List(l) => l.borrow().clone(),
+        SynValue::List(l) => l.borrow().to_vec(),
         other => {
             return Err(err(format!(
                 "abi_encode: the second argument must be a list of values, got {}",
@@ -1077,7 +1077,7 @@ fn json_abi_type(input: &SynValue, path: &str, fname: &str, depth: usize) -> Res
     };
     if let Some(rest) = ty.strip_prefix("tuple") {
         let comps = match m.get("components") {
-            Some(SynValue::List(l)) => l.borrow().clone(),
+            Some(SynValue::List(l)) => l.borrow().to_vec(),
             _ => return Err(err(format!("{}: {} is a tuple without \"components\"", fname, path))),
         };
         let mut parts = Vec::with_capacity(comps.len());
@@ -1179,7 +1179,7 @@ fn abi_decode_log(args: &[SynValue]) -> Result<SynValue, Control> {
         other => return Err(err(format!("{}: the log must be a map with topics and data, got {}", F, other.type_name()))),
     };
     let topics = match log.get("topics") {
-        Some(SynValue::List(l)) => l.borrow().clone(),
+        Some(SynValue::List(l)) => l.borrow().to_vec(),
         _ => return Err(err(format!("{}: the log has no \"topics\" list", F))),
     };
     let data: Vec<u8> = match log.get("data") {
@@ -1312,7 +1312,7 @@ fn parse_types(v: &SynValue) -> Result<StructDefs, Control> {
             }
         }
         let list = match fields {
-            SynValue::List(l) => l.borrow().clone(),
+            SynValue::List(l) => l.borrow().to_vec(),
             other => {
                 return Err(err(format!(
                     "{}: type {:?} must map to a list of fields, got {}",

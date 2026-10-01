@@ -4,6 +4,7 @@
 //! etiquetas apagadas todo es idéntico (mismos `steps`, `private` → error, `declassify`
 //! identidad).
 
+use synsema_core::synlist::list_values;
 use synsema_core::types::SynMap;
 use synsema_core::interpreter::{env_get, Control, Interpreter};
 use synsema_core::labels::{self, check_flow, label_deep, label_display_raw, mark, strip_deep};
@@ -909,7 +910,7 @@ fn audit_b3_match_guard_pattern_and_container_push_the_pc() {
     // El binder público `n` también sale con el PC del sujeto.
     let r = env_get(&i.global_env, "r").unwrap();
     if let SynValue::List(l) = labels::unwrap(&r) {
-        assert_eq!(label_display_raw(&label_deep(&l.borrow()[1])), "a");
+        assert_eq!(label_display_raw(&label_deep(&list_values(&l)[1])), "a");
     } else {
         panic!("list");
     }

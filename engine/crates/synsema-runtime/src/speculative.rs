@@ -6,6 +6,7 @@
 //! snapshot del entorno → ejecutar especulativamente → rollback (restaura) /
 //! commit (descarta) / fork (N branches independientes) + choose_and_apply.
 
+use synsema_core::synlist::{list_values};
 use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -20,7 +21,7 @@ use synsema_core::types::SynValue;
 fn deep_copy(v: &SynValue) -> SynValue {
     match v {
         SynValue::List(l) => {
-            SynValue::List(Rc::new(RefCell::new(l.borrow().iter().map(deep_copy).collect())))
+            SynValue::List(Rc::new(RefCell::new(list_values(&l).iter().map(deep_copy).collect())))
         }
         SynValue::Map(m) => {
             let mut nm = SynMap::new();

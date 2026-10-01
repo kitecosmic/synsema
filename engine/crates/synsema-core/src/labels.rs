@@ -150,6 +150,7 @@
 //! Los sumideros de I/O que el host no registre tampoco se comprueban: el host tiene
 //! `check_flow`, `strip_deep` e `Interpreter::pc_label` para hacerlo en su borde.
 
+use crate::synlist::{list_values};
 use crate::types::{MapObj, SynMap};
 use std::fmt;
 use std::rc::Rc;
@@ -410,7 +411,7 @@ fn deep_into(v: &SynValue, acc: &mut Label) {
             deep_into(&p.value, acc);
         }
         SynValue::List(l) => {
-            for x in l.borrow().iter() {
+            for x in list_values(&l).iter() {
                 deep_into(x, acc);
             }
         }
@@ -500,7 +501,7 @@ pub fn mark_owned(v: &SynValue, label: Label) -> SynValue {
 /// un alias escribible y la copia de `mark_owned` se saltea (M5: era ~4,5× más lento).
 fn is_aliased(v: &SynValue) -> bool {
     match v {
-        SynValue::List(l) => Rc::strong_count(l) > 1 || l.borrow().iter().any(is_aliased),
+        SynValue::List(l) => Rc::strong_count(l) > 1 || list_values(&l).iter().any(is_aliased),
         SynValue::Map(m) => Rc::strong_count(m) > 1 || m.borrow().values().any(is_aliased),
         SynValue::Private(p) => is_aliased(&p.value),
         // Los valores del servidor llevan `Rc`/`Box` opacos: conservador.
@@ -513,7 +514,7 @@ fn is_aliased(v: &SynValue) -> bool {
 /// escalares y los `Rc` inmutables se comparten). Corta todo aliasing con el original.
 pub fn deep_copy(v: &SynValue) -> SynValue {
     match v {
-        SynValue::List(l) => syn_list(l.borrow().iter().map(deep_copy).collect()),
+        SynValue::List(l) => syn_list(list_values(&l).iter().map(deep_copy).collect()),
         SynValue::Map(m) => {
             let mut out = SynMap::with_capacity(m.borrow().len());
             for (k, x) in m.borrow().iter() {
@@ -566,7 +567,7 @@ pub fn strip_deep(v: &SynValue) -> SynValue {
     }
     match v {
         SynValue::Private(p) => strip_deep(&p.value),
-        SynValue::List(l) => syn_list(l.borrow().iter().map(strip_deep).collect()),
+        SynValue::List(l) => syn_list(list_values(&l).iter().map(strip_deep).collect()),
         SynValue::Map(m) => {
             let mut out = SynMap::with_capacity(m.borrow().len());
             for (k, x) in m.borrow().iter() {
@@ -621,7 +622,7 @@ fn check_into(v: &SynValue, accepted: &Label, path: &mut String, ctx: &Label) ->
             check_into(&p.value, accepted, path, &eff)
         }
         SynValue::List(l) => {
-            for (i, x) in l.borrow().iter().enumerate() {
+            for (i, x) in list_values(&l).iter().enumerate() {
                 let n = path.len();
                 path.push_str(&format!("[{}]", i));
                 let r = check_into(x, accepted, path, ctx);

@@ -651,7 +651,7 @@ fn render_nodes(
             TNode::Each { var, coll, body, els, line } => {
                 let c = interp.eval(coll, env)?;
                 let items = match &c {
-                    SynValue::List(l) => l.borrow().clone(),
+                    SynValue::List(l) => l.borrow().to_vec(),
                     // v0.6.29: como `each` del lenguaje — un mapa se recorre por sus claves.
                     SynValue::Map(m) => m.borrow().keys().map(|k| crate::types::syn_text(k.as_str())).collect(),
                     other => {

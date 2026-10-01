@@ -20,6 +20,7 @@
 //! - **Puro-Rust, sin C (G8).** k256 / ed25519-dalek / sha3 / bech32, cero `*-sys`.
 //! - **Solo defensivo (G12):** firmar/verificar/derivar/codificar. Nada ataca ni evade.
 
+use synsema_core::synlist::{list_values};
 use synsema_core::types::SynMap;
 use std::rc::Rc;
 
@@ -669,7 +670,7 @@ pub(crate) fn rlp_encode_val(v: &SynValue, depth: usize, out: &mut Vec<u8>) -> R
         }
         SynValue::List(l) => {
             let mut payload = Vec::new();
-            for item in l.borrow().iter() {
+            for item in list_values(&l).iter() {
                 rlp_encode_val(item, depth + 1, &mut payload)?;
             }
             rlp_list_frame(&payload, out);

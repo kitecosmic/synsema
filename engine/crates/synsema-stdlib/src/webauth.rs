@@ -17,6 +17,7 @@
 //!   cuenta como "producir aleatoriedad" (mismo precedente que el token interno
 //!   de `redis_lock`).
 
+use synsema_core::synlist::list_values;
 use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -857,8 +858,7 @@ fn parse_jwt_verify_opts(v: Option<&SynValue>, who: &str) -> Result<JwtVerifyOpt
             "aud" => {
                 let list: Vec<String> = match v {
                     SynValue::Text(s) => vec![s.to_string()],
-                    SynValue::List(l) => l
-                        .borrow()
+                    SynValue::List(l) => list_values(&l)
                         .iter()
                         .map(|x| match x {
                             SynValue::Text(s) => Ok(s.to_string()),

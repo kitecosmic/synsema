@@ -12,6 +12,7 @@
 //! callback (offline, sin presupuesto, error de red) cada respuesta degrada a
 //! `available: false` con confianza 0 — nunca a una probabilidad inventada.
 
+use crate::synlist::{list_values};
 use crate::types::SynMap;
 use serde_json::Value as Json;
 
@@ -200,7 +201,7 @@ pub fn syn_to_json(v: &SynValue) -> Json {
         SynValue::Bool(b) => Json::Bool(*b),
         SynValue::Text(t) => Json::String(t.to_string()),
         SynValue::Number(n) => number_to_json(n),
-        SynValue::List(l) => Json::Array(l.borrow().iter().map(syn_to_json).collect()),
+        SynValue::List(l) => Json::Array(list_values(&l).iter().map(syn_to_json).collect()),
         SynValue::Map(m) => Json::Object(
             m.borrow()
                 .iter()
@@ -238,8 +239,7 @@ pub fn is_valid_state(v: &SynValue) -> bool {
 /// es el id y el valor la descripción que ve el modelo.
 pub fn options_from_value(v: &SynValue) -> Result<Vec<JudgeOption>, String> {
     match v {
-        SynValue::List(l) => l
-            .borrow()
+        SynValue::List(l) => list_values(&l)
             .iter()
             .map(|item| match item {
                 SynValue::Text(t) => Ok(JudgeOption { id: t.to_string(), description: None }),
@@ -385,7 +385,7 @@ fn collect_paths(v: &SynValue, out: &mut Vec<String>) {
                 rest = &after[end + 1..];
             }
         }
-        SynValue::List(l) => l.borrow().iter().for_each(|x| collect_paths(x, out)),
+        SynValue::List(l) => list_values(&l).iter().for_each(|x| collect_paths(x, out)),
         SynValue::Map(m) => m.borrow().values().for_each(|x| collect_paths(x, out)),
         _ => {}
     }

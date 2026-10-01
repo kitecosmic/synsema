@@ -23,6 +23,7 @@
 //! (su cuerpo se compila también). Todo lo demás es `Exec`: el nodo lo corre el tree-walker con el
 //! frame de la VM como entorno (§6.0 punto 4), y cuenta sus propios pasos.
 
+use crate::synlist::list_values_mut;
 use crate::synmap::{map_from_pair_slots, Key, MapIc, ShapeRef, MAX_SHAPED};
 use crate::types::SynMap;
 use super::*;
@@ -2365,7 +2366,7 @@ impl<'a> LambdaCall<'a> {
         if let Some(r) = self.native(it, None, l, i) {
             return r;
         }
-        let item = l.borrow()[i].clone();
+        let item = l.borrow().get(i).expect("dentro del largo");
         it.call_fast(self.f, &mut [item], loc)
     }
 
@@ -2374,9 +2375,9 @@ impl<'a> LambdaCall<'a> {
     pub(crate) fn item_keep(&mut self, it: &mut Interpreter, l: &ListRef, i: usize, loc: &SourceLocation) -> Result<(SynValue, SynValue), Control> {
         #[cfg(feature = "native-tier")]
         if let Some(r) = self.native(it, None, l, i) {
-            return r.map(|r| (l.borrow()[i].clone(), r));
+            return r.map(|r| (l.borrow().get(i).expect("dentro del largo"), r));
         }
-        let item = l.borrow()[i].clone();
+        let item = l.borrow().get(i).expect("dentro del largo");
         let r = it.call_fast(self.f, &mut [item.clone()], loc)?;
         Ok((item, r))
     }
@@ -2387,7 +2388,7 @@ impl<'a> LambdaCall<'a> {
         if let Some(r) = self.native(it, Some(&acc), l, i) {
             return r;
         }
-        let item = l.borrow()[i].clone();
+        let item = l.borrow().get(i).expect("dentro del largo");
         it.call_fast(self.f, &mut [acc, item], loc)
     }
 }
@@ -2801,7 +2802,7 @@ impl Interpreter {
                         (SynValue::Map(m), SynValue::Text(k)) => m.borrow().get_cached_key(k, &chunk.key_ics[ic as usize]).cloned(),
                         (SynValue::List(l), SynValue::Number(Number::Int(k))) => {
                             let items = l.borrow();
-                            resolve_index(*k, items.len()).map(|j| items[j].clone())
+                            resolve_index(*k, items.len()).and_then(|j| items.get(j))
                         }
                         _ => None,
                     };
@@ -4100,8 +4101,10 @@ impl Interpreter {
         } else {
             let i = self.opnd(chunk, env, base, idx, at)?;
             let fast = match (&parent, &i) {
+                // (Un paso a un elemento para escribir adentro: una lista sin caja tiene números, que
+                // no tienen adentro; pasa a valores y el camino da el error de siempre.)
                 (SynValue::List(l), SynValue::Number(Number::Int(k))) => {
-                    let mut items = l.borrow_mut();
+                    let mut items = list_values_mut(l);
                     let n = items.len();
                     resolve_index(*k, n).map(|j| {
                         make_unique(&mut items[j]);
@@ -4173,7 +4176,7 @@ impl Interpreter {
                     let n = items.len();
                     match resolve_index(*k, n) {
                         Some(j) => {
-                            items[j] = v.clone();
+                            items.set(j, v.clone());
                             true
                         }
                         None => false,

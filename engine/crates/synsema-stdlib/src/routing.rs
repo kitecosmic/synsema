@@ -273,7 +273,7 @@ pub fn shape(value: Option<&SynValue>, query: &IndexMap<String, String>) -> Resu
                 unreachable!()
             }
         }
-        Some(SynValue::List(l)) => Ok(paginate(&l.borrow(), query)),
+        Some(SynValue::List(l)) => Ok(paginate(&l.borrow().to_vec(), query)),
         Some(v) => Ok(syn_to_json(v)),
     }
 }

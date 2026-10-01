@@ -31,6 +31,7 @@
 //!   aux = 0). El tweak de taproot (BIP-341 key-path, merkle vacío) vive DENTRO
 //!   de `btc_address`/`schnorr_sign(…, "taproot")` — el usuario jamás tweakea.
 
+use synsema_core::synlist::list_values;
 use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -1631,8 +1632,7 @@ fn plan_from_map(m: &MapObj, fname: &str) -> Result<Plan, Control> {
     // El eco de inputs/outputs lleva "kind" (informativo) — se filtra acá.
     let strip = |v: &SynValue, extra: &[&str]| -> SynValue {
         if let SynValue::List(l) = v {
-            let items = l
-                .borrow()
+            let items = list_values(&l)
                 .iter()
                 .map(|item| {
                     if let SynValue::Map(im) = item {

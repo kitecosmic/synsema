@@ -14,6 +14,7 @@
 //! builtins en `interpreter.rs::register_builtins`). Las constantes `pi/tau/e/
 //! inf/nan` se registran allí como VALORES globales (no funciones).
 
+use crate::synlist::{list_values};
 use crate::types::SynMap;
 use std::cmp::Ordering;
 
@@ -483,7 +484,7 @@ pub fn round_to(args: &[SynValue]) -> Result<SynValue, Control> {
 fn list_numbers(args: &[SynValue], name: &str) -> Result<Vec<Number>, Control> {
     arity(args, 1, name)?;
     let items = match &args[0] {
-        SynValue::List(l) => l.borrow().clone(),
+        SynValue::List(l) => l.borrow().to_vec(),
         other => return Err(err(format!("{} expects a list, got {}", name, other.type_name()))),
     };
     let mut nums = Vec::with_capacity(items.len());
@@ -553,7 +554,7 @@ pub fn mean(args: &[SynValue]) -> Result<SynValue, Control> {
 fn data_f64(args: &[SynValue], name: &str) -> Result<Vec<f64>, Control> {
     let vals: Vec<f64> = match arg(args, 0)? {
         SynValue::List(l) => {
-            let items = l.borrow();
+            let items = list_values(&l);
             let mut out = Vec::with_capacity(items.len());
             for (i, it) in items.iter().enumerate() {
                 match it {
@@ -643,7 +644,7 @@ fn histogram_edges(args: &[SynValue], vals: &[f64]) -> Result<Vec<f64>, Control>
             equispaced_edges(vals, k as usize)
         }
         Some(SynValue::List(l)) => {
-            let items = l.borrow();
+            let items = list_values(&l);
             if items.len() < 2 {
                 return Err(err(format!(
                     "histogram: an edge list needs at least 2 edges, got {}",

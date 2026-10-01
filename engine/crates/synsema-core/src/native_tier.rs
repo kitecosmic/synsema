@@ -398,7 +398,7 @@ impl SiteIc {
             SynValue::List(l) if idx_tag == TAG_INT => {
                 let items = l.borrow();
                 match crate::interpreter::resolve_index(idx_bits, items.len()) {
-                    Some(j) => peek(&items[j]),
+                    Some(j) => peek_elem(&items, j),
                     None => NPeek::MISS,
                 }
             }
@@ -438,7 +438,7 @@ pub fn get_item(obj: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&SynVal
         (SynValue::List(l), _) if idx_tag == TAG_INT => {
             let items = l.borrow();
             match crate::interpreter::resolve_index(idx_bits, items.len()) {
-                Some(j) => peek(&items[j]),
+                Some(j) => peek_elem(&items, j),
                 None => absent,
             }
         }
@@ -462,8 +462,21 @@ pub fn list_body(v: &SynValue) -> Option<(*const ListRef, usize)> {
 /// El elemento `i` de una lista (la vuelta de un `each`); `MISS` si ya no está.
 pub fn list_elem(l: &ListRef, i: i64) -> NPeek {
     let items = l.borrow();
-    match usize::try_from(i).ok().and_then(|j| items.get(j)) {
-        Some(v) => peek(v),
+    match usize::try_from(i).ok().filter(|j| *j < items.len()) {
+        Some(j) => peek_elem(&items, j),
+        None => NPeek::MISS,
+    }
+}
+
+/// F4.8e: el elemento `j` (que existe) como lo ve el código nativo: un número sin caja, sus bits; un
+/// valor, `peek` (con caja, la dirección donde vive en la lista).
+#[inline]
+fn peek_elem(items: &crate::synlist::SynList, j: usize) -> NPeek {
+    use crate::synlist::Elem;
+    match items.elem(j) {
+        Some(Elem::Value(v)) => peek(v),
+        Some(Elem::Int(x)) => NPeek { tag: TAG_INT, bits: x, ptr: std::ptr::null() },
+        Some(Elem::Float(f)) => NPeek { tag: TAG_FLOAT, bits: f.to_bits() as i64, ptr: std::ptr::null() },
         None => NPeek::MISS,
     }
 }
@@ -533,7 +546,13 @@ fn path_key<'a>(site: &'a SiteIc, idx: Option<&'a SynValue>) -> Option<&'a str> 
 pub fn path_step(parent: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&SynValue>, site: &SiteIc) -> Option<*mut SynValue> {
     match parent {
         SynValue::List(l) if idx_tag == TAG_INT => {
-            let mut items = l.borrow_mut();
+            // (Entrar a un elemento para escribir adentro: sólo en una lista de valores; una sin caja
+            // tiene números: sale a la VM.)
+            let mut b = l.borrow_mut();
+            if !b.is_values() {
+                return None;
+            }
+            let items = b.values_mut();
             let j = crate::interpreter::resolve_index(idx_bits, items.len())?;
             let s = &mut items[j];
             crate::interpreter::make_unique(s);
@@ -558,7 +577,7 @@ pub fn path_set(parent: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&Syn
             let mut items = l.borrow_mut();
             match crate::interpreter::resolve_index(idx_bits, items.len()) {
                 Some(j) => {
-                    items[j] = v;
+                    items.set(j, v);
                     true
                 }
                 None => false,

@@ -568,7 +568,14 @@ impl LambdaFast<'_> {
                     None => ok = false,
                 }
             }
-            ok && match items.get(i).and_then(|v| arg_word(v, f.unit.params[pre_n])) {
+            // Un valor con caja entra prestado desde donde vive en la lista (una lista sin caja tiene
+            // números: su palabra, sin dirección).
+            let p = f.unit.params[pre_n];
+            let w = match items.as_values() {
+                Some(v) => v.get(i).and_then(|x| arg_word(x, p)),
+                None => items.get(i).and_then(|x| arg_word(&x, p).filter(|_| !matches!(p, NSeen::List | NSeen::Map | NSeen::Boxed))),
+            };
+            ok && match w {
                 Some(w) => {
                     f.words[pre_n] = w;
                     true

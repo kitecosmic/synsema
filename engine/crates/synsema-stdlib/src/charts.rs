@@ -23,6 +23,7 @@
 //!
 //! PURO (G9): sin capability — funciona en run/test/conform/serve y DENTRO de `sandbox`.
 
+use synsema_core::synlist::{list_values};
 use synsema_core::types::{MapObj, SynMap};
 use std::rc::Rc;
 
@@ -434,7 +435,7 @@ fn opt_colors(
     match opts.get("colors") {
         None => Ok(None),
         Some(SynValue::List(l)) => {
-            let items = l.borrow();
+            let items = list_values(&l);
             if items.is_empty() {
                 return Err(err(format!("{}: option \"colors\" cannot be an empty list", name)));
             }
@@ -518,7 +519,7 @@ fn y_fields(opts: &MapObj, name: &str) -> Result<Option<Vec<String>>, Control> {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Text(s)) => Ok(Some(vec![s.to_string()])),
         Some(SynValue::List(l)) => {
-            let items = l.borrow();
+            let items = list_values(&l);
             if items.is_empty() {
                 return Err(err(format!("{}: option \"y\" cannot be an empty list", name)));
             }
@@ -642,7 +643,7 @@ fn from_pairs(rows: &[SynValue], kind: Kind, name: &str) -> Result<Vec<Series>, 
     let mut points = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
         let pair = match row {
-            SynValue::List(l) => l.borrow().clone(),
+            SynValue::List(l) => l.borrow().to_vec(),
             other => {
                 return Err(err(format!(
                     "{}: item {} is a {}, but the first item is a list; all items must be [x, y] pairs",
@@ -717,7 +718,7 @@ fn normalize_series(args: &[SynValue], name: &str) -> Result<ChartSpec, Control>
 
     // x/y sólo aplican a la forma lista-de-mapas; en otra forma serían ignorados en
     // silencio (G5: nunca silencioso).
-    let is_rows = matches!(&args[1], SynValue::List(l) if matches!(l.borrow().first(), Some(SynValue::Map(_))));
+    let is_rows = matches!(&args[1], SynValue::List(l) if matches!(list_values(&l).first(), Some(SynValue::Map(_))));
     if !is_rows && (opts.contains_key("x") || opts.contains_key("y")) {
         return Err(err(format!(
             "{}: options \"x\"/\"y\" only apply when data is a list of maps (rows)",
@@ -879,7 +880,7 @@ fn normalize_xy(
 ) -> Result<Vec<Series>, Control> {
     let series = match &args[1] {
         SynValue::List(l) => {
-            let items = l.borrow().clone();
+            let items = l.borrow().to_vec();
             if items.is_empty() {
                 return Err(err(format!("{}: data is empty; nothing to plot", name)));
             }
@@ -1037,7 +1038,7 @@ fn normalize_heatmap(
         match opts.get(key) {
             None | Some(SynValue::Nothing) => Ok(None),
             Some(SynValue::List(l)) => {
-                let items = l.borrow();
+                let items = list_values(&l);
                 let mut out = Vec::with_capacity(items.len());
                 for it in items.iter() {
                     match it {
@@ -1065,7 +1066,7 @@ fn normalize_heatmap(
         }
     };
 
-    let is_rows = matches!(&args[1], SynValue::List(l) if matches!(l.borrow().first(), Some(SynValue::Map(_))));
+    let is_rows = matches!(&args[1], SynValue::List(l) if matches!(list_values(&l).first(), Some(SynValue::Map(_))));
     let (x_labels, y_labels, values) = if is_rows {
         // Formato largo/tidy (natural de sql() con GROUP BY).
         if opts.contains_key("x_labels") || opts.contains_key("y_labels") {
@@ -1163,7 +1164,7 @@ fn normalize_heatmap(
         }
         let cells: Vec<Vec<Option<f64>>> = match &args[1] {
             SynValue::List(l) => {
-                let items = l.borrow().clone();
+                let items = l.borrow().to_vec();
                 if items.is_empty() {
                     return Err(err(format!("{}: data is empty; nothing to plot", name)));
                 }
@@ -1171,7 +1172,7 @@ fn normalize_heatmap(
                 let mut width: Option<usize> = None;
                 for (i, row) in items.iter().enumerate() {
                     let vals = match row {
-                        SynValue::List(r) => r.borrow().clone(),
+                        SynValue::List(r) => r.borrow().to_vec(),
                         other => {
                             return Err(err(format!(
                                 "{}: heatmap data must be rows with {{\"x\", \"y\", \"value\"}}, a matrix (list of number lists), or a 2-D array; got a list of {}",
@@ -1397,8 +1398,7 @@ fn normalize_histogram(
             }
         };
         let counts = match m.get("counts") {
-            Some(SynValue::List(l)) => l
-                .borrow()
+            Some(SynValue::List(l)) => list_values(&l)
                 .iter()
                 .map(|v| match v {
                     SynValue::Number(n) => n.to_i64_trunc().unwrap_or(0),
@@ -1408,8 +1408,7 @@ fn normalize_histogram(
             _ => Vec::new(),
         };
         let edges = match m.get("edges") {
-            Some(SynValue::List(l)) => l
-                .borrow()
+            Some(SynValue::List(l)) => list_values(&l)
                 .iter()
                 .map(|v| match v {
                     SynValue::Number(n) => n.to_f64(),
@@ -1422,7 +1421,7 @@ fn normalize_histogram(
     };
     match &args[1] {
         SynValue::List(l) => {
-            let items = l.borrow();
+            let items = list_values(&l);
             if items.is_empty() {
                 return Err(err(format!("{}: data is empty; nothing to plot", name)));
             }
@@ -1618,7 +1617,7 @@ fn normalize_boxplot(
 ) -> Result<Vec<BoxGroup>, Control> {
     match &args[1] {
         SynValue::List(l) => {
-            let items = l.borrow().clone();
+            let items = l.borrow().to_vec();
             if items.is_empty() {
                 return Err(err(format!("{}: data is empty; nothing to plot", name)));
             }
@@ -1697,7 +1696,7 @@ fn normalize_boxplot(
             for (k, v) in m.iter() {
                 let vals: Vec<f64> = match v {
                     SynValue::List(l) => {
-                        let items = l.borrow();
+                        let items = list_values(&l);
                         let mut vals = Vec::with_capacity(items.len());
                         for (i, it) in items.iter().enumerate() {
                             vals.push(num_of(
@@ -1792,7 +1791,7 @@ fn normalize_waterfall(
             out
         }
         SynValue::List(l) => {
-            let items = l.borrow().clone();
+            let items = l.borrow().to_vec();
             if items.is_empty() {
                 return Err(err(format!("{}: data is empty; nothing to plot", name)));
             }
@@ -3222,7 +3221,7 @@ pub fn render_chart_md(node: &SynValue) -> String {
                 let name = m.get("name").map(|v| v.to_string()).unwrap_or_default();
                 let outliers = match m.get("outliers") {
                     Some(SynValue::List(l)) => {
-                        l.borrow().iter().map(md_num).collect::<Vec<_>>().join(", ")
+                        list_values(&l).iter().map(md_num).collect::<Vec<_>>().join(", ")
                     }
                     _ => String::new(),
                 };
@@ -3347,7 +3346,7 @@ fn md_series_table(node: &SynValue) -> String {
         out.push_str("\n|");
         // La x de la fila sale de la primera serie que la tenga (todas comparten x).
         let x = cols.iter().find_map(|(_, p)| p.get(i)).and_then(|pt| match pt {
-            SynValue::List(l) => l.borrow().first().map(|v| v.to_string()),
+            SynValue::List(l) => list_values(&l).first().map(|v| v.to_string()),
             _ => None,
         });
         out.push_str(&format!(" {} |", md_cell(&x.unwrap_or_default())));
@@ -4049,7 +4048,7 @@ mod tests {
         let args = vec![syn_text("boxplot"), nums(&[1.0, 2.0, 3.0, 4.0, 5.0, 100.0])];
         let node = ok(chart_node(&args));
         let groups = match node_field_of(&node, "groups") {
-            SynValue::List(l) => l.borrow().clone(),
+            SynValue::List(l) => l.borrow().to_vec(),
             other => panic!("groups no es lista: {}", other.type_name()),
         };
         let g = match &groups[0] {
@@ -4159,7 +4158,7 @@ mod tests {
         ];
         let node = ok(chart_node(&args));
         let steps = match node_field_of(&node, "steps") {
-            SynValue::List(l) => l.borrow().clone(),
+            SynValue::List(l) => l.borrow().to_vec(),
             other => panic!("steps no es lista: {}", other.type_name()),
         };
         let running = |i: usize| match &steps[i] {

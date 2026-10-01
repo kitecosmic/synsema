@@ -44,6 +44,7 @@
 //! (`opts.revoked`, típicamente leída de redis/sql). Sin esto, el primer incidente
 //! lo improvisa mal.
 
+use synsema_core::synlist::{list_values};
 use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -556,7 +557,7 @@ fn parse_caps(m: &MapObj, who: &str) -> Result<Vec<(String, Vec<String>)>, Contr
             SynValue::Text(s) => vec![s.to_string()],
             SynValue::List(l) => {
                 let mut ss = Vec::new();
-                for item in l.borrow().iter() {
+                for item in list_values(&l).iter() {
                     match item {
                         SynValue::Text(s) => ss.push(s.to_string()),
                         other => {
@@ -912,7 +913,7 @@ fn b_captoken_verify(args: &[SynValue], time_caps: &Rc<RefCell<CapabilitySet>>) 
                 }
             },
             "revoked" => match v {
-                SynValue::List(l) => revoked = l.borrow().iter().map(|x| x.to_string()).collect(),
+                SynValue::List(l) => revoked = list_values(&l).iter().map(|x| x.to_string()).collect(),
                 other => {
                     return Err(err(format!(
                         "{}: revoked must be a list of token ids, got {}",
@@ -1132,7 +1133,7 @@ fn b_captoken_allows(args: &[SynValue]) -> Result<SynValue, Control> {
         return Ok(SynValue::Bool(false));
     };
     let scopes: Vec<String> = match entry {
-        SynValue::List(l) => l.borrow().iter().map(|s| s.to_string()).collect(),
+        SynValue::List(l) => list_values(&l).iter().map(|s| s.to_string()).collect(),
         other => vec![other.to_string()],
     };
     // Sin scopes = la capability sin scope (wildcard): cubre cualquier pedido.
@@ -1207,7 +1208,7 @@ pub fn ceiling_from_caps_map(m: &MapObj) -> Result<Vec<Capability>, String> {
         let scopes: Vec<String> = match v {
             SynValue::Nothing => Vec::new(),
             SynValue::Text(s) => vec![s.to_string()],
-            SynValue::List(l) => l.borrow().iter().map(|s| s.to_string()).collect(),
+            SynValue::List(l) => list_values(&l).iter().map(|s| s.to_string()).collect(),
             other => {
                 return Err(format!(
                     "the scope of {:?} must be text, a list of text, or nothing (no scope), got {}",
@@ -1247,7 +1248,7 @@ pub fn delegated_ceiling_from_caps_map(m: &MapObj) -> Vec<Capability> {
         let scopes: Vec<String> = match v {
             SynValue::Nothing => Vec::new(),
             SynValue::Text(s) => vec![s.to_string()],
-            SynValue::List(l) => l.borrow().iter().map(|s| s.to_string()).collect(),
+            SynValue::List(l) => list_values(&l).iter().map(|s| s.to_string()).collect(),
             _ => {
                 warn_unknown_delegated_once(name);
                 return Vec::new();

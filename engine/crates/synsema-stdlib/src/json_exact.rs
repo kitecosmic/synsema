@@ -495,7 +495,7 @@ mod memo_tests {
     fn repeated_keys_are_shared() {
         let v = parse(r#"[{"identificador_largo": 1, "valor_bastante_largo": "a"}, {"valor_bastante_largo": "b", "identificador_largo": 2}, {"identificador_largo": 3, "identificador_largo": 4}, {"a\"b": 1, "é": 2}]"#).unwrap();
         let rows = match &v {
-            SynValue::List(l) => l.borrow().clone(),
+            SynValue::List(l) => l.borrow().to_vec(),
             _ => panic!(),
         };
         let (k0, k1, k2, k3) = (map_keys(&rows[0]), map_keys(&rows[1]), map_keys(&rows[2]), map_keys(&rows[3]));

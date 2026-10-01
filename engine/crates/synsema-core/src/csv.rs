@@ -18,6 +18,7 @@
 //! AGNÓSTICO de fuente (G2): entrada = texto/valores del lenguaje; salida = valores/
 //! texto. Este módulo no conoce conexiones ni importa nada de `database.rs`.
 
+use crate::synlist::{list_values};
 use crate::synmap::ShapeRef;
 use crate::types::{Key, MapObj, SynMap};
 use indexmap::IndexMap;
@@ -314,8 +315,7 @@ fn opt_missing(opts: &MapObj) -> Result<Vec<String>, Control> {
     match opts.get("missing") {
         None | Some(SynValue::Nothing) => Ok(Vec::new()),
         Some(SynValue::Text(t)) => Ok(vec![t.to_string()]),
-        Some(SynValue::List(l)) => l
-            .borrow()
+        Some(SynValue::List(l)) => list_values(&l)
             .iter()
             .map(|v| match v {
                 SynValue::Text(t) => Ok(t.to_string()),
@@ -544,7 +544,7 @@ fn opt_headers_list(opts: &MapObj) -> Result<Option<Vec<String>>, Control> {
         None => Ok(None),
         Some(SynValue::List(l)) => {
             let mut out = Vec::with_capacity(l.borrow().len());
-            for v in l.borrow().iter() {
+            for v in list_values(&l).iter() {
                 match v {
                     SynValue::Text(s) => out.push(s.to_string()),
                     other => {
@@ -643,7 +643,7 @@ pub fn csv_encode(args: &[SynValue]) -> Result<SynValue, Control> {
         )));
     }
     let rows = match &args[0] {
-        SynValue::List(l) => l.borrow().clone(),
+        SynValue::List(l) => l.borrow().to_vec(),
         other => {
             return Err(err(format!(
                 "csv_encode expects a list of maps or a list of lists, got {}",
@@ -798,7 +798,7 @@ pub fn csv_encode(args: &[SynValue]) -> Result<SynValue, Control> {
                 }
                 for (i, r) in rows.iter().enumerate() {
                     let items = match r {
-                        SynValue::List(l) => l.borrow().clone(),
+                        SynValue::List(l) => l.borrow().to_vec(),
                         other => {
                             return Err(err(format!(
                                 "csv_encode: row {} is a {}, but the first row is a list; all rows must have the same shape",
@@ -871,7 +871,7 @@ mod tests {
     fn parse_headers_default() {
         let v = parse("a,b\r\n1,x\r\n2,y\r\n");
         let l = match v {
-            SynValue::List(l) => l.borrow().clone(),
+            SynValue::List(l) => l.borrow().to_vec(),
             _ => panic!(),
         };
         assert_eq!(l.len(), 2);
@@ -901,12 +901,12 @@ mod tests {
         assert_eq!(enc_s, "\"a,b\",\"with \"\"quotes\"\"\",\"multi\nline\"\r\n");
         let back = ok(csv_parse(&[syn_text(enc_s.as_str()), opts]));
         let l = match back {
-            SynValue::List(l) => l.borrow().clone(),
+            SynValue::List(l) => l.borrow().to_vec(),
             _ => panic!(),
         };
         match &l[0] {
             SynValue::List(fields) => {
-                let f = fields.borrow();
+                let f = fields.borrow().to_vec();
                 assert_eq!(f[0].to_string(), "a,b");
                 assert_eq!(f[1].to_string(), "with \"quotes\"");
                 assert_eq!(f[2].to_string(), "multi\nline");

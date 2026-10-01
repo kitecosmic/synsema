@@ -105,6 +105,7 @@ pub fn register_xml_builtins(interp: &Interpreter) {
 
 #[cfg(test)]
 mod tests {
+    use synsema_core::synlist::list_values;
     use super::*;
 
     fn parse(s: &str) -> SynValue {
@@ -141,7 +142,7 @@ mod tests {
         match &conceptos {
             SynValue::List(l) => {
                 assert_eq!(l.borrow().len(), 2);
-                assert_eq!(get(&l.borrow()[1], "@Cantidad").to_string(), "2");
+                assert_eq!(get(&list_values(&l)[1], "@Cantidad").to_string(), "2");
             }
             other => panic!("esperaba lista de repetidos, got {}", other),
         }

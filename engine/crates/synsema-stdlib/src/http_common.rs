@@ -455,7 +455,7 @@ fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
 pub fn multipart_encode(args: &[SynValue]) -> Result<SynValue, Control> {
     const F: &str = "multipart_encode";
     let parts = match args.first() {
-        Some(SynValue::List(l)) => l.borrow().clone(),
+        Some(SynValue::List(l)) => l.borrow().to_vec(),
         Some(other) => {
             return Err(merr(format!(
                 "{}: parts must be a list of {{name, value}} or {{name, filename, bytes, content_type?}}, got {}",
