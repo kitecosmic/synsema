@@ -23,7 +23,7 @@
 //! (su cuerpo se compila también). Todo lo demás es `Exec`: el nodo lo corre el tree-walker con el
 //! frame de la VM como entorno (§6.0 punto 4), y cuenta sus propios pasos.
 
-use crate::synmap::{map_from_pair_slots, MapIc};
+use crate::synmap::{map_from_pair_slots, Key, MapIc, ShapeRef, MAX_SHAPED};
 use crate::types::SynMap;
 use super::*;
 use crate::resolve::{self, Resolution, ScopeId, Target};
@@ -146,7 +146,10 @@ pub(crate) enum Ins {
     /// `[a, b, …]` con los elementos en `n` registros desde `first`.
     MakeList { dst: Reg, first: Reg, n: u16 },
     /// `{k: v, …}` con clave y valor alternados en `2n` registros desde `first`.
-    MakeMap { dst: Reg, first: Reg, n: u16 },
+    /// F4.8g: con `site` (no `NONE`), las claves son textos constantes: sólo los valores van en
+    /// `first..` y las claves y su forma (calculada al compilar) están en `map_sites[site]`. Sin una
+    /// variante aparte: una más en el `enum` movía el despacho entero +1,5 % (medido).
+    MakeMap { dst: Reg, first: Reg, n: u16, site: u32 },
     /// `m.k`. F3.6 (L3, *inline cache*): `ic` recuerda en qué posición del mapa estaba la clave la
     /// última vez; si la clave en esa posición es la misma, no se hashea (se compara la clave, no
     /// una "forma": la semántica de valor no cambia). Lo demás (otros tipos, clave que falta,
@@ -276,6 +279,8 @@ pub(crate) struct Chunk {
     spills: Vec<Box<[Spill]>>,
     /// F4.6a: los `set` con camino.
     paths: Vec<PathDesc>,
+    /// F4.8g: los mapas literales con claves constantes (`MakeMap` con sitio).
+    map_sites: Box<[MapSite]>,
     /// F4.6c: las cadenas `set P to P + …` y sus `+`.
     text_chains: Box<[TextChainDesc]>,
     text_members: Box<[TextMember]>,
@@ -302,6 +307,30 @@ pub(crate) struct Chunk {
     /// F4.2: el estado de cada `LoopBack` (cuenta de vueltas, código nativo).
     #[cfg(feature = "native-tier")]
     loops: Box<[native::LoopState]>,
+}
+
+/// F4.8g: un mapa literal con claves de texto constantes: las claves en orden y su forma (`None` si
+/// se repite alguna o una transición es megamórfica: el camino general, como `map_from_pair_slots`).
+pub(crate) struct MapSite {
+    keys: Box<[Key]>,
+    shape: Option<ShapeRef>,
+}
+
+impl MapSite {
+    /// El mapa con los valores de `vals` (los saca: quedan en `Nothing`).
+    fn build(&self, vals: &mut [SynValue]) -> crate::types::MapRef {
+        match &self.shape {
+            Some(sh) => sh.build(vals.iter_mut().map(|v| std::mem::replace(v, SynValue::Nothing))),
+            None => {
+                // Con claves repetidas pueden quedar pocas: la capacidad no decide el modo.
+                let mut m = SynMap::with_capacity(self.keys.len().min(MAX_SHAPED));
+                for (k, v) in self.keys.iter().zip(vals.iter_mut()) {
+                    m.insert(k, std::mem::replace(v, SynValue::Nothing));
+                }
+                m.into_ref()
+            }
+        }
+    }
 }
 
 /// F4.6a: un `set` con camino que corre la VM (`PathRoot`/`PathStep`/`PathSet`).
@@ -686,6 +715,7 @@ struct Compiler<'r, 's> {
     node_spill: Vec<u32>,
     spills: Vec<Box<[Spill]>>,
     paths: Vec<PathDesc>,
+    map_sites: Vec<MapSite>,
     text_chains: Vec<TextChainDesc>,
     text_members: Vec<TextMember>,
     /// Los registros reservados para las cadenas de más de un `+` (el primero y cuántos quedan).
@@ -739,6 +769,7 @@ impl<'r, 's> Compiler<'r, 's> {
             node_spill: Vec::new(),
             spills: Vec::new(),
             paths: Vec::new(),
+            map_sites: Vec::new(),
             text_chains: Vec::new(),
             text_members: Vec::new(),
             text_regs: (0, 0),
@@ -1660,6 +1691,29 @@ impl<'r, 's> Compiler<'r, 's> {
                 self.emit(Ins::MakeList { dst, first, n: elements.len() as u16 });
                 Opnd::Reg(dst)
             }
+            // F4.8g: con claves de texto constantes, sólo los valores van a registros; las claves y su
+            // forma quedan en el sitio (evaluar un literal no hace nada más que su paso: se cuenta
+            // igual, en el mismo orden).
+            K::MapLiteral { pairs } if !pairs.is_empty() && pairs.len() <= MAX_SHAPED && pairs.iter().all(|(k, _)| matches!(k.kind, K::TextLiteral { .. })) => {
+                self.enter();
+                let first = self.block_regs(pairs.len());
+                let end = first + pairs.len() as Reg;
+                let mut keys = Vec::with_capacity(pairs.len());
+                for (i, (k, v)) in pairs.iter().enumerate() {
+                    let K::TextLiteral { value } = &k.kind else { unreachable!("clave de texto") };
+                    self.enter();
+                    keys.push(Key::from(value.as_str()));
+                    self.into_reg(v, first + i as Reg, end);
+                }
+                self.at(&n.location);
+                let dst = self.dst(want);
+                let site = self.map_sites.len() as u32;
+                let keys_len = keys.len() as u16;
+                let shape = ShapeRef::of_keys(keys.len(), |i| keys[i].clone());
+                self.map_sites.push(MapSite { keys: keys.into_boxed_slice(), shape });
+                self.emit(Ins::MakeMap { dst, first, n: keys_len, site });
+                Opnd::Reg(dst)
+            }
             K::MapLiteral { pairs } => {
                 self.enter();
                 let first = self.block_regs(2 * pairs.len());
@@ -1670,7 +1724,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 }
                 self.at(&n.location);
                 let dst = self.dst(want);
-                self.emit(Ins::MakeMap { dst, first, n: pairs.len() as u16 });
+                self.emit(Ins::MakeMap { dst, first, n: pairs.len() as u16, site: NONE });
                 Opnd::Reg(dst)
             }
             // `a of b.c`: si leer `b.c` falla con "Map has no key", la referencia agrega una nota
@@ -2125,6 +2179,7 @@ impl<'r, 's> Compiler<'r, 's> {
             node_spill: self.node_spill,
             spills: self.spills,
             paths: self.paths,
+            map_sites: self.map_sites.into_boxed_slice(),
             text_chains: self.text_chains.into_boxed_slice(),
             text_members: self.text_members.into_boxed_slice(),
             nregs: self.max_reg,
@@ -2645,10 +2700,8 @@ impl Interpreter {
                     self.put(base, dst, syn_list(items));
                     Ok(())
                 }
-                Ins::MakeMap { dst, first, n } => {
-                    let from = base + first as usize;
-                    let m = map_from_pair_slots(&mut self.vm_regs[from..from + 2 * n as usize]);
-                    self.put(base, dst, SynValue::Map(m));
+                Ins::MakeMap { dst, first, n, site } => {
+                    self.vm_make_map(&chunk, base, dst, first, n, site);
                     Ok(())
                 }
                 Ins::GetProp { dst, obj, name, ic } => (|| {
@@ -4232,6 +4285,19 @@ impl Interpreter {
         }
         let v: Vec<SynValue> = args.iter_mut().map(|a| std::mem::replace(a, SynValue::Nothing)).collect();
         self.call_value(f.clone(), v, loc)
+    }
+
+    /// `MakeMap`, fuera de línea (F4.8g): con sitio, las claves constantes y su forma.
+    #[cold]
+    #[inline(never)]
+    fn vm_make_map(&mut self, chunk: &Chunk, base: usize, dst: Reg, first: Reg, n: u16, site: u32) {
+        let from = base + first as usize;
+        let m = if site == NONE {
+            map_from_pair_slots(&mut self.vm_regs[from..from + 2 * n as usize])
+        } else {
+            chunk.map_sites[site as usize].build(&mut self.vm_regs[from..from + n as usize])
+        };
+        self.put(base, dst, SynValue::Map(m));
     }
 
     /// `call_fast` a un cuerpo con frame en registros.
