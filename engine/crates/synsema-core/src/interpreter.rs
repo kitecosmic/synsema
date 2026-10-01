@@ -7349,6 +7349,12 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // `String` en el medio; un texto es él mismo.
         match nth(args, 0)? {
             SynValue::Text(t) => Ok(SynValue::Text(t.clone())),
+            // F4.8g: un entero sin la maquinaria de `fmt` (lo mismo que su `Display`).
+            SynValue::Number(Number::Int(x)) => {
+                let mut t = SynText::new();
+                push_int(&mut t, *x);
+                Ok(SynValue::Text(t))
+            }
             v => {
                 use std::fmt::Write;
                 let mut t = SynText::new();
@@ -9640,12 +9646,56 @@ pub(crate) fn text_add_piece(t: &mut SynText, x: &SynValue) -> bool {
     }
     match x {
         SynValue::Text(r) => t.push_str(r),
+        SynValue::Number(Number::Int(n)) => push_int(t, *n),
         other => {
             use std::fmt::Write;
             let _ = write!(t, "{}", other);
         }
     }
     true
+}
+
+/// F4.8g: los dígitos de `x` en decimal (con `-` si es negativo), como su `Display`, sin `fmt`.
+pub(crate) fn push_int(t: &mut SynText, x: i64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let mut u = x.unsigned_abs();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 {
+            break;
+        }
+    }
+    if x < 0 {
+        i -= 1;
+        buf[i] = b'-';
+    }
+    // Sólo dígitos ASCII y `-`.
+    t.push_str(std::str::from_utf8(&buf[i..]).unwrap_or_default());
+}
+
+#[cfg(test)]
+mod push_int_tests {
+    use super::*;
+
+    #[test]
+    fn push_int_is_display() {
+        let mut xs = vec![0, 1, -1, 9, 10, -10, 99, 100, i64::MAX, i64::MIN, i64::MIN + 1, 1_000_000_007, -123_456_789_012];
+        let mut r: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..10_000 {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            xs.push(r as i64 >> (r % 60));
+        }
+        for x in xs {
+            let mut t = SynText::from("p");
+            push_int(&mut t, x);
+            assert_eq!(t.as_str(), format!("p{}", SynValue::Number(Number::Int(x))));
+        }
+    }
 }
 
 /// Si `texto + x` es agregar `x` al texto (ver `text_add_piece`).
