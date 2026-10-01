@@ -1,0 +1,6 @@
+-- F4.6a: un paso intermedio que no está
+let m be {"a": {"b": 1}}
+each i in range(0, 2)
+    print(steps())
+    set m.a.b to i
+    set m.x.b to i

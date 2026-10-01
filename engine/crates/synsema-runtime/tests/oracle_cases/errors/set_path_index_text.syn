@@ -1,0 +1,4 @@
+-- F4.6a: índice sobre un texto
+let m be {"s": "hola"}
+print(steps())
+set m.s[0] to "x"

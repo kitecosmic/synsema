@@ -31,6 +31,7 @@
 //! `type` lleva `SynsemaReceipt`) + "lo emitió esta clave" (`issuer` y `verificationMethod`
 //! son el did:key de `public_key`).
 
+use synsema_core::synlist::{list_values};
 use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -279,7 +280,7 @@ fn b_receipt_verify(args: &[SynValue]) -> Result<SynValue, Control> {
         SynValue::Map(m) => {
             let m = m.borrow();
             let is_receipt = match m.get("type") {
-                Some(SynValue::List(l)) => l.borrow().iter().any(|t| t.to_string() == RECEIPT_TYPE),
+                Some(SynValue::List(l)) => list_values(&l).iter().any(|t| t.to_string() == RECEIPT_TYPE),
                 _ => false,
             };
             let issuer = match m.get("issuer") {

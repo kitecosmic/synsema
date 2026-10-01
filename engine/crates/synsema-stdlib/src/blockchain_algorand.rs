@@ -197,7 +197,7 @@ fn to_mp(
             Ok(Some(Mp::Map(entries)))
         }
         SynValue::List(l) => {
-            let items = l.borrow().clone();
+            let items = l.borrow().to_vec();
             if items.is_empty() {
                 return Ok(None);
             }

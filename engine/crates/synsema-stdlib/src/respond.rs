@@ -309,7 +309,7 @@ fn serve_err(msg: &str) -> synsema_core::interpreter::Control {
 
 fn n_nodes(v: Option<&SynValue>) -> SynValue {
     match v {
-        Some(SynValue::List(l)) => syn_list(l.borrow().clone()),
+        Some(SynValue::List(l)) => syn_list(l.borrow().to_vec()),
         _ => syn_list(Vec::new()),
     }
 }

@@ -1,0 +1,88 @@
+-- F4.7b: lecturas de datos en el nivel nativo. `xs[i]` (índices negativos), listas anidadas,
+-- `m.k` y `m["k"]` por forma (registros de una forma y de varias, un mapa de más de 32 claves en
+-- modo diccionario), `each` sobre una lista (y sobre una que el cuerpo cambia: la referencia sigue
+-- con la foto), alias y copy-on-write con escrituras a mitad del bucle (salen a la VM), la veracidad
+-- de valores con caja, `stop` y `give`.
+
+let n be 64
+let xs be apply(range(0, n), (i) => i * 1.5)
+let ints be range(0, n)
+let grid be apply(range(0, 8), (i) => apply(range(0, 8), (j) => i * 8 + j))
+
+-- Suma con índices positivos y negativos, y una lista anidada.
+let s be 0.0
+let g be 0
+each i in range(0, 400)
+    set s to s + xs[i % n] - xs[0 - 1 - i % n] * 0.5
+    set g to g + grid[i % 8][(i * 3) % 8]
+print([s, g])
+
+-- Registros de una forma, y de varias (la caché por forma ve más de una).
+let recs be apply(range(0, 16), (i) => {"x": i, "y": i * 0.5, "m": 2.0})
+let mixed be [{"x": 1, "y": 2.0}, {"y": 3.0, "x": 4}, {"x": 5, "z": 0, "y": 6.0}, {"a": 1, "x": 7, "y": 8.0}]
+let sx be 0.0
+each i in range(0, 300)
+    let r be recs[i % 16]
+    set sx to sx + r.x * r.m - r.y
+    set sx to sx + mixed[i % 4].x + mixed[i % 4]["y"]
+print(sx)
+
+-- Un mapa en modo diccionario (40 claves) leído por clave variable y constante.
+let big be {}
+each k in range(0, 40)
+    set big["k" + text(k)] to k * 3
+let bk be keys(big)
+let sb be 0
+each i in range(0, 200)
+    set sb to sb + big[bk[i % 40]] + big["k7"]
+print(sb)
+
+-- `each` sobre una lista (enteros, floats, otras cosas), con la veracidad de lo que tiene caja.
+let stuff be [1, 2.5, "", "t", [], [0], {}, {"a": 1}, nothing, 0, -0.0, true, false]
+let tr be 0
+each rep in range(0, 30)
+    each v in stuff
+        when v
+            set tr to tr + 1
+print(tr)
+
+-- Alias y copy-on-write: una lista leída en nativo y escrita a mitad del bucle (la escritura sale
+-- a la VM); el alias no cambia.
+let a be range(0, 10)
+let alias be a
+let acc be 0
+each i in range(0, 100)
+    set acc to acc + a[i % 10] + alias[(i + 1) % 10]
+    when i % 25 == 3
+        set a[0] to a[0] + 100
+print([acc, a[0], alias[0]])
+
+-- `each` sobre una lista que el cuerpo cambia: se recorre la foto.
+let ys be [1, 2, 3, 4, 5]
+let seen be 0
+each rep in range(0, 10)
+    each y in ys
+        set seen to seen + y
+        when y == 3 and rep == 4
+            set ys to append(ys, 100)
+print([seen, length(ys)])
+
+-- `stop` y `give` desde un bucle que lee datos.
+task first_over(limit)
+    each v in ints
+        when v * 2 > limit
+            give v
+    give 0 - 1
+let fo be []
+each l in [10, 50, 100, 1000]
+    let f be first_over(l)
+    set fo to append(fo, f)
+print(fo)
+let st be 0
+each i in range(0, 1000)
+    set st to st + ints[i % n]
+    when st > 5000
+        stop
+print(st)
+
+print(steps())

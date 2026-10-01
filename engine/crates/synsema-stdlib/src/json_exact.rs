@@ -477,7 +477,7 @@ mod tests {
 
 #[cfg(test)]
 mod memo_tests {
-    use std::rc::Rc;
+    use synsema_core::types::SynText;
 
     use super::*;
 
@@ -489,31 +489,36 @@ mod memo_tests {
     }
 
     /// F4.4: las claves repetidas de un documento son la misma `Key` (una sola copia del texto);
-    /// valores, orden y claves con escapes, como siempre.
+    /// valores, orden y claves con escapes, como siempre. (F4.6b: una clave de hasta 15 B vive en
+    /// línea y no ocupa memoria aparte; las de acá son más largas, para ver que se comparten.)
     #[test]
     fn repeated_keys_are_shared() {
-        let v = parse(r#"[{"id": 1, "v": "a"}, {"v": "b", "id": 2}, {"id": 3, "id": 4}, {"a\"b": 1, "é": 2}]"#).unwrap();
+        let v = parse(r#"[{"identificador_largo": 1, "valor_bastante_largo": "a"}, {"valor_bastante_largo": "b", "identificador_largo": 2}, {"identificador_largo": 3, "identificador_largo": 4}, {"a\"b": 1, "é": 2}]"#).unwrap();
         let rows = match &v {
-            SynValue::List(l) => l.borrow().clone(),
+            SynValue::List(l) => l.borrow().to_vec(),
             _ => panic!(),
         };
         let (k0, k1, k2, k3) = (map_keys(&rows[0]), map_keys(&rows[1]), map_keys(&rows[2]), map_keys(&rows[3]));
-        assert_eq!(k0, ["id", "v"].map(Key::from).to_vec());
-        assert_eq!(k1, ["v", "id"].map(Key::from).to_vec());
-        assert!(Rc::ptr_eq(k0[0].rc(), k1[1].rc()), "\"id\" se copió");
-        assert!(Rc::ptr_eq(k0[1].rc(), k1[0].rc()), "\"v\" se copió");
-        assert!(Rc::ptr_eq(k0[0].rc(), k2[0].rc()));
+        assert_eq!(k0, ["identificador_largo", "valor_bastante_largo"].map(Key::from).to_vec());
+        assert_eq!(k1, ["valor_bastante_largo", "identificador_largo"].map(Key::from).to_vec());
+        assert!(SynText::ptr_eq(k0[0].text(), k1[1].text()), "la primera clave se copió");
+        assert!(SynText::ptr_eq(k0[1].text(), k1[0].text()), "la segunda clave se copió");
+        assert!(SynText::ptr_eq(k0[0].text(), k2[0].text()));
         assert_eq!(k2.len(), 1);
         assert_eq!(k3, ["a\"b", "é"].map(Key::from).to_vec());
-        assert_eq!(v.to_string(), r#"[{id: 1, v: "a"}, {v: "b", id: 2}, {id: 4}, {a"b: 1, é: 2}]"#);
+        assert!(k3[0].text().is_inline(), "una clave corta vive en línea");
+        assert_eq!(
+            v.to_string(),
+            r#"[{identificador_largo: 1, valor_bastante_largo: "a"}, {valor_bastante_largo: "b", identificador_largo: 2}, {identificador_largo: 4}, {a"b: 1, é: 2}]"#
+        );
     }
 
     /// `parse_with` comparte las claves entre documentos (`jsonl_decode`).
     #[test]
     fn memo_spans_documents() {
         let mut memo = Memo::default();
-        let a = parse_with(r#"{"k": 1}"#, false, &mut memo).unwrap();
-        let b = parse_with(r#"{"k": 2}"#, false, &mut memo).unwrap();
-        assert!(Rc::ptr_eq(map_keys(&a)[0].rc(), map_keys(&b)[0].rc()));
+        let a = parse_with(r#"{"una_clave_bastante_larga": 1}"#, false, &mut memo).unwrap();
+        let b = parse_with(r#"{"una_clave_bastante_larga": 2}"#, false, &mut memo).unwrap();
+        assert!(SynText::ptr_eq(map_keys(&a)[0].text(), map_keys(&b)[0].text()));
     }
 }

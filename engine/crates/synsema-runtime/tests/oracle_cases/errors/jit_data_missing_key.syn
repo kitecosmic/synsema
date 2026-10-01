@@ -1,0 +1,10 @@
+-- F4.7b: una clave que falta a mitad de un bucle nativo que lee un mapa por forma: sale a la VM, que
+-- da el error de siempre.
+let recs be [{"x": 1, "y": 2}, {"x": 3, "y": 4}, {"x": 5, "y": 6}]
+let s be 0
+each i in range(0, 300)
+    when i == 200
+        print(steps())
+        set recs to [{"x": 1}, {"x": 3, "y": 4}, {"x": 5, "y": 6}]
+    set s to s + recs[i % 3].y
+print(s)

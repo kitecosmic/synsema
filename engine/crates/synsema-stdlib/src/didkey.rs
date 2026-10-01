@@ -300,6 +300,7 @@ pub fn register_didkey_builtins(interp: &Interpreter) {
 
 #[cfg(test)]
 mod tests {
+    use synsema_core::synlist::list_values;
     use super::*;
 
     /// El vector del spec: la clave ed25519 de ejemplo y su DID.
@@ -352,7 +353,7 @@ mod tests {
         assert_eq!(vms.borrow().len(), 2);
         // el keyAgreement es una clave x25519 (multicodec 0xec) derivada de la ed25519
         let SynValue::List(ka) = m.get("keyAgreement").unwrap() else { panic!("list") };
-        let ka_id = ka.borrow()[0].to_string();
+        let ka_id = list_values(&ka)[0].to_string();
         // `did:key:<ed25519>#<x25519>`: el fragmento es la clave X25519 (el DID sigue siendo el ed25519).
         let (did_part, frag) = ka_id.split_once('#').expect("fragmento");
         assert_eq!(did_part, SPEC_DID);

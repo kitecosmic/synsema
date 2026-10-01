@@ -21,6 +21,7 @@
 //! tabla de rutas) y se cachea por (fuente, opciones): el handler se llama muchas
 //! veces por isolate; sólo el request cambia.
 
+use synsema_core::synlist::{list_values};
 use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -108,7 +109,7 @@ struct App {
 /// del top-level debe seguir siendo un secret en el request siguiente.
 fn deep_clone(v: &SynValue) -> SynValue {
     match v {
-        SynValue::List(l) => SynValue::List(Rc::new(RefCell::new(l.borrow().iter().map(deep_clone).collect()))),
+        SynValue::List(l) => SynValue::List(Rc::new(RefCell::new(list_values(&l).iter().map(deep_clone).collect()))),
         SynValue::Map(m) => {
             let mut out = SynMap::new();
             for (k, x) in m.borrow().iter() {
@@ -357,6 +358,7 @@ fn custom_error(
 fn finalize(status: u16, body: ResponseBody, mut headers: Vec<(String, String)>) -> HttpResponseOut {
     let (content_type, bytes) = match body {
         ResponseBody::Json(j) => ("application/json".to_string(), dumps(&j).into_bytes()),
+        ResponseBody::JsonText(t) => ("application/json".to_string(), t.into_bytes()),
         ResponseBody::Raw(r) => (r.content_type, r.body),
         ResponseBody::Redirect { location, .. } => {
             headers.push(("Location".to_string(), location));

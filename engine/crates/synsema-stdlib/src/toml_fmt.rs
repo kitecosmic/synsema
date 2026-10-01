@@ -8,6 +8,7 @@
 //! `nothing`, `bytes` o `secret`. Puro: sin I/O.
 //!
 
+use synsema_core::synlist::{list_values};
 use synsema_core::types::SynMap;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -64,7 +65,7 @@ fn syn_to_toml(v: &SynValue, path: &str, who: &str) -> Result<::toml::Value, Con
         SynValue::Number(Number::Float(f)) => ::toml::Value::Float(*f),
         SynValue::List(l) => {
             let mut out = Vec::new();
-            for (i, item) in l.borrow().iter().enumerate() {
+            for (i, item) in list_values(&l).iter().enumerate() {
                 out.push(syn_to_toml(item, &format!("{}[{}]", path, i), who)?);
             }
             ::toml::Value::Array(out)

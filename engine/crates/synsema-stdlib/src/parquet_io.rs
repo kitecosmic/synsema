@@ -819,7 +819,7 @@ fn parquet_write(args: &[SynValue]) -> Result<SynValue, Control> {
     use parquet::column::writer::ColumnWriter;
     const F: &str = "parquet_write";
     let rows = match args.first() {
-        Some(SynValue::List(l)) => l.borrow().clone(),
+        Some(SynValue::List(l)) => l.borrow().to_vec(),
         Some(other) => return Err(err(format!("{}: expected a list of rows (maps), got {}", F, other.type_name()))),
         None => return Err(err("parquet_write(rows, opts?)")),
     };

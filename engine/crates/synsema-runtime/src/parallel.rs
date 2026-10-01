@@ -34,6 +34,7 @@
 //! Los otros caminos que cruzan a un intérprete nuevo ya fallan cerrado por la misma vía:
 //! `run_program` y `spawn`/`share`/`signal` son sumideros, y `cron_every`/`cron_after` también.
 
+use synsema_core::synlist::{list_values};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -173,7 +174,7 @@ fn reconstruct_task(
 fn generators_in(v: &SynValue, out: &mut Vec<Rc<synsema_core::interpreter::BuiltinTask>>) {
     match v {
         SynValue::Builtin(b) if synsema_core::rng::snapshot(b).is_some() => out.push(b.clone()),
-        SynValue::List(l) => l.borrow().iter().for_each(|x| generators_in(x, out)),
+        SynValue::List(l) => list_values(&l).iter().for_each(|x| generators_in(x, out)),
         SynValue::Map(m) => m.borrow().values().for_each(|x| generators_in(x, out)),
         _ => {}
     }
@@ -298,7 +299,7 @@ pub(crate) fn register_parallel_builtins(
         2,
         Rc::new(|_i, args, _loc| {
             let list = match args.first() {
-                Some(SynValue::List(l)) => l.borrow().clone(),
+                Some(SynValue::List(l)) => l.borrow().to_vec(),
                 _ => return Err(err("chunk: first argument must be a list")),
             };
             let size = match args.get(1) {
@@ -329,7 +330,7 @@ pub(crate) fn register_parallel_builtins(
                 _ => return Err(err("parallel_map: first argument must be a task")),
             };
             let list = match args.get(1) {
-                Some(SynValue::List(l)) => l.borrow().clone(),
+                Some(SynValue::List(l)) => l.borrow().to_vec(),
                 _ => return Err(err("parallel_map: second argument must be a list")),
             };
             // Un generador cruza a un worker como COPIA de su estado: el mismo generador en dos
@@ -342,7 +343,7 @@ pub(crate) fn register_parallel_builtins(
                         SynValue::Builtin(b) if synsema_core::rng::snapshot(b).is_some() => {
                             !seen.insert(Rc::as_ptr(b) as usize)
                         }
-                        SynValue::List(l) => l.borrow().iter().any(|x| walk(x, seen)),
+                        SynValue::List(l) => list_values(&l).iter().any(|x| walk(x, seen)),
                         SynValue::Map(m) => m.borrow().values().any(|x| walk(x, seen)),
                         _ => false,
                     }

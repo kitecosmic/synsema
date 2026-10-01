@@ -8,6 +8,7 @@
 //! Builtins puros (sin capability). Errores claros, nunca NaN/panic silencioso por shapes
 //! incompatibles, no-2D en LA, o matriz singular (G3).
 
+use crate::synlist::{list_values};
 use crate::types::SynMap;
 use ndarray::{ArrayD, Axis, IxDyn};
 
@@ -70,7 +71,7 @@ fn shape_from(v: &SynValue, name: &str) -> Result<Vec<usize>, Control> {
         SynValue::Number(n) => Ok(vec![dim(n)?]),
         SynValue::List(l) => {
             let mut out = Vec::new();
-            for it in l.borrow().iter() {
+            for it in list_values(&l).iter() {
                 match it {
                     SynValue::Number(n) => out.push(dim(n)?),
                     other => {
@@ -107,7 +108,7 @@ fn build_nested(v: &SynValue) -> Result<(Vec<usize>, Vec<f64>), Control> {
     match v {
         SynValue::Number(n) => Ok((vec![], vec![n.to_f64()])),
         SynValue::List(l) => {
-            let items = l.borrow();
+            let items = list_values(&l);
             if items.is_empty() {
                 return Ok((vec![0], vec![]));
             }
@@ -314,7 +315,7 @@ pub fn at(args: &[SynValue]) -> Result<SynValue, Control> {
     arity(args, 2, "at")?;
     let a = array_arg(args, 0, "at")?;
     let idx_list = match arg(args, 1)? {
-        SynValue::List(l) => l.borrow().clone(),
+        SynValue::List(l) => l.borrow().to_vec(),
         other => return Err(err(format!("at expects a list of indices, got {}", other.type_name()))),
     };
     if idx_list.len() != a.ndim() {
@@ -527,7 +528,7 @@ fn variance(it: impl Iterator<Item = f64> + Clone) -> f64 {
 /// `std`/`var` sobre una LISTA de números (ergonomía; complementa el camino array).
 fn list_variance(args: &[SynValue], name: &str) -> Result<f64, Control> {
     let items = match arg(args, 0)? {
-        SynValue::List(l) => l.borrow().clone(),
+        SynValue::List(l) => l.borrow().to_vec(),
         other => return Err(err(format!("{} expects an array or list, got {}", name, other.type_name()))),
     };
     if items.is_empty() {
@@ -808,7 +809,7 @@ pub fn nd_value(a: ArrayD<f64>) -> SynValue {
 /// `vector_with_gaps` y los mira en la lista original.
 fn vector(v: &SynValue, name: &str) -> Result<Vec<f64>, Control> {
     if let SynValue::List(l) = v {
-        if let Some(i) = l.borrow().iter().position(|x| matches!(x, SynValue::Nothing)) {
+        if let Some(i) = list_values(&l).iter().position(|x| matches!(x, SynValue::Nothing)) {
             return Err(err(format!(
                 "{}: position {} is nothing (a missing value), and there is no number to compute with — drop the missing values first: drop_missing(xs)",
                 name, i
@@ -828,8 +829,7 @@ fn vector_with_gaps(v: &SynValue, name: &str) -> Result<Vec<f64>, Control> {
             }
             Ok(a.iter().copied().collect())
         }
-        SynValue::List(l) => l
-            .borrow()
+        SynValue::List(l) => list_values(&l)
             .iter()
             .map(|x| match x {
                 SynValue::Number(n) => Ok(n.to_f64()),
@@ -862,7 +862,7 @@ fn int_value(v: &SynValue, what: &str, name: &str) -> Result<i64, Control> {
 pub fn concat_or_stack(args: &[SynValue], axis: Option<SynValue>, stack: bool) -> Result<SynValue, Control> {
     let name = if stack { "stack" } else { "concat" };
     let items = match arg(args, 0)? {
-        SynValue::List(l) => l.borrow().clone(),
+        SynValue::List(l) => l.borrow().to_vec(),
         other => return Err(err(format!("{}: expected a list of arrays, got {}", name, other.type_name()))),
     };
     if items.is_empty() {
@@ -911,7 +911,7 @@ pub fn arg_extreme(args: &[SynValue], axis: Option<SynValue>, max: bool) -> Resu
         // Una lista: `nothing` es un dato faltante y se saltea (como `min`/`max` y el
         // `idxmin` de pandas); NaN sí cuenta y gana (como numpy: "el mínimo no está definido").
         (SynValue::List(l), _) => {
-            let items = l.borrow();
+            let items = list_values(&l);
             let mut idx: Vec<usize> = Vec::with_capacity(items.len());
             let mut data: Vec<f64> = Vec::with_capacity(items.len());
             for (i, x) in items.iter().enumerate() {
@@ -953,7 +953,7 @@ pub fn cumsum(args: &[SynValue], axis: Option<SynValue>) -> Result<SynValue, Con
         SynValue::List(l) => {
             let mut acc = Number::Int(0);
             let mut out = Vec::new();
-            for x in l.borrow().iter() {
+            for x in list_values(&l).iter() {
                 match x {
                     SynValue::Number(n) => {
                         acc = acc.checked_add(n).map_err(err)?;
@@ -990,7 +990,7 @@ pub fn cumsum(args: &[SynValue], axis: Option<SynValue>) -> Result<SynValue, Con
 pub fn diff(args: &[SynValue], axis: Option<SynValue>) -> Result<SynValue, Control> {
     match arg(args, 0)? {
         SynValue::List(l) => {
-            let items = l.borrow();
+            let items = list_values(&l);
             let mut out = Vec::new();
             for w in items.windows(2) {
                 match (&w[0], &w[1]) {

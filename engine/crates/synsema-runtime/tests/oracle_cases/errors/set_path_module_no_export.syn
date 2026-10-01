@@ -1,0 +1,4 @@
+-- F4.6a: un nombre que el módulo no exporta
+use "mods/state_mod.syn" as sm
+print(steps())
+set sm["nada"] to 1

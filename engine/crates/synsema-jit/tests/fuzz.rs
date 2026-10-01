@@ -209,19 +209,524 @@ impl Gen {
     }
 }
 
+/// F4.7: constantes con floats: bordes de la comparación exacta (2^53 ± 1, 2^63, fracciones
+/// negativas), `-0.0`, infinitos y NaN, y enteros que se mezclan con ellos.
+const FCONSTS: &[&str] = &[
+    "0.0", "-0.0", "0.5", "1.5", "-2.5", "3.0", "0.1", "1.0e308", "(1.0e308 * 10.0)", "(-(1.0e308 * 10.0))",
+    "(1.0e308 * 10.0 - 1.0e308 * 10.0)", "9007199254740992.0", "9007199254740993", "9007199254740992",
+    "9223372036854775807.0", "(-9223372036854775807.0)", "9223372036854775807", "4611686018427387904.0", "2", "7", "0",
+    "(0 - 3)", "(0 - 9223372036854775807 - 1)",
+];
+
+struct FGen {
+    rng: Rng,
+}
+
+impl FGen {
+    fn atom(&mut self, vars: &[String]) -> String {
+        if !vars.is_empty() && self.rng.chance(60) {
+            vars[self.rng.below(vars.len())].clone()
+        } else {
+            FCONSTS[self.rng.below(FCONSTS.len())].to_string()
+        }
+    }
+
+    fn expr(&mut self, vars: &[String], depth: usize) -> String {
+        if depth == 0 || self.rng.chance(30) {
+            return self.atom(vars);
+        }
+        let a = self.expr(vars, depth - 1);
+        let b = self.expr(vars, depth - 1);
+        match self.rng.below(10) {
+            0 => format!("({} + {})", a, b),
+            1 => format!("({} - {})", a, b),
+            2 => format!("({} * {})", a, b),
+            // A veces un divisor cero (también `-0.0`): el error de la VM, con su ubicación.
+            3 if self.rng.chance(15) => format!("({} / {})", a, b),
+            3 | 4 => format!("({} / ({} * {} + 0.5))", a, b, b),
+            // `-(…)`: `--` es un comentario.
+            5 => format!("(-({}))", a),
+            // F4.7c: los intrínsecos (un negativo a `sqrt` da NaN; `abs` de `i64::MIN` es un `Big`).
+            6 => format!("sqrt({})", a),
+            7 => format!("abs({})", a),
+            8 => format!("float({})", a),
+            _ => format!("({} * 0.5)", a),
+        }
+    }
+
+    fn cond(&mut self, vars: &[String]) -> String {
+        let ops = ["<", "<=", ">", ">=", "==", "!="];
+        let a = self.expr(vars, 1);
+        let b = self.expr(vars, 1);
+        let c = format!("{} {} {}", a, ops[self.rng.below(ops.len())], b);
+        match self.rng.below(10) {
+            0 => format!("not ({})", c),
+            // Un entero y un float en el borde de la comparación exacta (uno de los dos, a veces,
+            // una variable que puede tenerlo).
+            8 | 9 => {
+                let ib = ["9007199254740993", "9007199254740992", "9223372036854775807", "(0 - 9223372036854775807 - 1)", "(0 - 3)", "2"];
+                let fb = ["9007199254740992.0", "9223372036854775807.0", "(-9223372036854775807.0)", "-2.5", "2.0", "(1.0e308 * 10.0)", "(1.0e308 * 10.0 - 1.0e308 * 10.0)"];
+                let i = if !vars.is_empty() && self.rng.chance(30) { vars[self.rng.below(vars.len())].clone() } else { ib[self.rng.below(ib.len())].to_string() };
+                let f = fb[self.rng.below(fb.len())];
+                let op = ops[self.rng.below(ops.len())];
+                if self.rng.chance(50) { format!("{} {} {}", i, op, f) } else { format!("{} {} {}", f, op, i) }
+            }
+            // La veracidad de un número (`-0.0` y `0.0` son falsos, NaN verdadero).
+            6 => self.expr(vars, 1),
+            7 => format!("not ({})", self.expr(vars, 1)),
+            1 => {
+                let d = self.expr(vars, 0);
+                format!("({}) and {} != 0", c, d)
+            }
+            _ => c,
+        }
+    }
+
+    /// Lo que se asigna en un bucle: acotado para que los enteros no crezcan sin fin (un `Big` de
+    /// millones de dígitos); a veces un entero, un decimal o `nothing` (el tipo cambia a mitad).
+    fn value(&mut self, vars: &[String]) -> String {
+        match self.rng.below(100) {
+            0..=9 => "7".to_string(),
+            10..=14 => "(0 - 3)".to_string(),
+            15 => "1.5d".to_string(),
+            _ => {
+                let e = self.expr(vars, 2);
+                format!("({}) * 0.5 + {}", e, FCONSTS[self.rng.below(7)])
+            }
+        }
+    }
+
+    fn task(&mut self, name: &str, nparams: usize, callee: Option<(&str, usize)>) -> String {
+        let params: Vec<String> = (0..nparams).map(|i| format!("p{}", i)).collect();
+        let mut vars = params.clone();
+        let mut s = format!("task {}({})\n", name, params.join(", "));
+        for l in ["x", "y"] {
+            let e = self.value(&vars);
+            s += &format!("    let {} be {}\n", l, e);
+            vars.push(l.to_string());
+        }
+        if self.rng.chance(40) {
+            let c = self.cond(&vars);
+            let e = self.expr(&vars, 2);
+            s += &format!("    when {}\n        give {}\n", c, e);
+        }
+        if self.rng.chance(70) {
+            let bound = self.rng.below(7);
+            let each = self.rng.chance(50);
+            if each {
+                s += &format!("    each k in range({})\n", bound);
+            } else {
+                s += &format!("    let k be 0\n    while k < {}\n", bound);
+            }
+            let e = self.value(&vars);
+            s += &format!("        set x to {}\n", e);
+            if self.rng.chance(50) {
+                let c = self.cond(&vars);
+                let e = self.value(&vars);
+                s += &format!("        when {}\n            set y to {}\n", c, e);
+            }
+            if !each {
+                s += "        set k to k + 1\n";
+            }
+        }
+        if let Some((f, n)) = callee {
+            let args: Vec<String> = (0..n).map(|_| self.expr(&vars, 1)).collect();
+            s += &format!("    let z be {}({})\n", f, args.join(", "));
+            vars.push("z".to_string());
+        }
+        if self.rng.chance(8) {
+            let c = self.cond(&vars);
+            s += &format!("    give {}\n", c);
+        } else {
+            let e = self.expr(&vars, 2);
+            s += &format!("    give {}\n", e);
+        }
+        s
+    }
+
+    /// Un bucle del nivel superior sobre globales con floats: tipos que cambian (un entero, un
+    /// decimal, `nothing`), `stop`, llamadas a una task.
+    fn top_loop(&mut self, call: (&str, usize)) -> String {
+        let vars: Vec<String> = ["g0", "g1", "lc"].iter().map(|v| v.to_string()).collect();
+        let bound = 2 + self.rng.below(40);
+        let a0 = self.atom(&[]);
+        let a1 = self.atom(&[]);
+        let mut s = format!("let g0 be {}\nlet g1 be {}\nlet lc be 0\nlet g2 be 0.5\nlet cnt be 0\n", a0, a1);
+        if self.rng.chance(50) {
+            s += &format!("each ev in range(0, {})\n    set lc to lc + 1\n", bound);
+        } else {
+            s += &format!("while lc < {}\n    set lc to lc + 1\n", bound);
+        }
+        // Un `+` que la VM especializó con un `Float` y después recibe dos enteros: la guarda de
+        // `FloatArith` tiene que salir (con enteros, `2**53 + 1 + 2` es exacto; en f64, no).
+        if self.rng.chance(50) {
+            s += "    when g2 + 9007199254740993 == 9007199254740995\n        set cnt to cnt + 1\n";
+            s += "    when lc % 2 == 0 and lc > 4\n        set g2 to 2\n    when lc % 2 == 1\n        set g2 to 0.5\n";
+        }
+        let e = self.value(&vars);
+        s += &format!("    set g0 to {}\n", e);
+        if self.rng.chance(50) {
+            let c = self.cond(&vars);
+            let e = self.value(&vars);
+            s += &format!("    when {}\n        set g1 to {}\n", c, e);
+        }
+        if self.rng.chance(40) {
+            let args: Vec<String> = (0..call.1).map(|_| self.expr(&vars, 1)).collect();
+            s += &format!("    set g1 to g1 + {}({})\n", call.0, args.join(", "));
+        }
+        if self.rng.chance(25) {
+            let c = self.cond(&vars);
+            s += &format!("    when {}\n        stop\n", c);
+        }
+        s += "print([g0, g1, lc, g2, cnt])\n";
+        s
+    }
+
+    fn program(&mut self) -> String {
+        let mut s = String::new();
+        let n0 = 1 + self.rng.below(3);
+        s += &self.task("f0", n0, None);
+        let n1 = 1 + self.rng.below(3);
+        s += &self.task("f1", n1, Some(("f0", n0)));
+        // Un `let` en un `when` que se lee después: un lugar de la ventana que según el camino
+        // está vacío (vacío, la VM lo busca por nombre y da su error).
+        let q = ["q".to_string()];
+        let c = if self.rng.chance(20) { self.cond(&q) } else { "i != 5".to_string() };
+        let e = self.expr(&q, 1);
+        s += &format!(
+            "task h(q)\n    let acc be 0.0\n    each i in range(3)\n        when {}\n            let t be {}\n        when i == 1\n            set acc to acc + t\n    give acc\n",
+            c, e
+        );
+        // Cada columna casi siempre del mismo tipo (así la task entra por `CallNative` con
+        // parámetros `Float`); a veces una fila distinta (la guarda de la entrada).
+        let floats = ["0.5", "1.5", "-2.5", "3.0", "0.1", "-0.0", "9007199254740992.0", "(1.0e308 * 10.0)"];
+        let ints = ["2", "7", "0", "(0 - 3)", "9007199254740993"];
+        let kinds: Vec<bool> = (0..3).map(|_| self.rng.chance(75)).collect();
+        let rows: Vec<String> = (0..8)
+            .map(|_| {
+                let vals: Vec<String> = (0..3)
+                    .map(|c| {
+                        let fl = if self.rng.chance(10) { !kinds[c] } else { kinds[c] };
+                        if fl { floats[self.rng.below(floats.len())] } else { ints[self.rng.below(ints.len())] }.to_string()
+                    })
+                    .collect();
+                format!("[{}]", vals.join(", "))
+            })
+            .collect();
+        s += &format!("let out be []\neach p in [{}]\n", rows.join(", "));
+        let a0: Vec<String> = (0..n0).map(|i| format!("p[{}]", i % 3)).collect();
+        let a1: Vec<String> = (0..n1).map(|i| format!("p[{}]", (i + 1) % 3)).collect();
+        s += &format!("    let u be f0({})\n", a0.join(", "));
+        s += &format!("    let v be f1({})\n", a1.join(", "));
+        s += "    let w be h(p[2])\n";
+        s += "    set out to append(out, [u, v, w])\n";
+        s += "print(out)\n";
+        s += &self.top_loop(("f0", n0));
+        s += "print(steps())\n";
+        s
+    }
+}
+
+/// F4.7b: generador de programas que LEEN datos en bucles nativos: listas (de enteros, floats,
+/// mezcladas, anidadas), mapas con forma y en modo diccionario, registros con la misma forma o con
+/// formas distintas, alias, escrituras a mitad del bucle (salen a la VM: el copy-on-write lo ve),
+/// `each` sobre una lista que el cuerpo modifica (la referencia recorre una foto), índices fuera de
+/// rango, negativos o que no son enteros, claves que faltan, `stop`.
+struct DGen {
+    rng: Rng,
+}
+
+impl DGen {
+    fn elem(&mut self) -> String {
+        let pool = ["0", "1", "2", "-3", "7", "2.5", "-0.5", "0.0", "9007199254740993", "\"t\"", "\"\"", "nothing", "true", "[1, 2]", "[]", "{\"a\": 1}"];
+        // Casi siempre números (lo que el bucle suma); a veces otra cosa (el error de la VM).
+        if self.rng.chance(85) {
+            pool[self.rng.below(9)].to_string()
+        } else {
+            pool[self.rng.below(pool.len())].to_string()
+        }
+    }
+
+    fn list(&mut self, n: usize) -> String {
+        let v: Vec<String> = (0..n).map(|_| self.elem()).collect();
+        format!("[{}]", v.join(", "))
+    }
+
+    fn record(&mut self, shape: usize) -> String {
+        let keys: &[&str] = match shape {
+            0 => &["x", "y", "m"],
+            1 => &["y", "x", "m"],
+            2 => &["x", "m"],
+            _ => &["x", "y", "m", "z"],
+        };
+        let v: Vec<String> = keys.iter().map(|k| format!("\"{}\": {}", k, self.elem())).collect();
+        format!("{{{}}}", v.join(", "))
+    }
+
+    /// Una lectura (lo que el bucle suma o compara).
+    fn read(&mut self) -> String {
+        match self.rng.below(12) {
+            0 | 1 => "xs[i % n]".to_string(),
+            2 => format!("xs[i % n - {}]", self.rng.below(4)),
+            // Fuera de rango, a veces.
+            3 if self.rng.chance(20) => "xs[i + 2]".to_string(),
+            3 => "xs[(i * 7) % n]".to_string(),
+            4 => "grid[i % 3][(i + 1) % 4]".to_string(),
+            5 => "recs[i % 4].x".to_string(),
+            6 => "recs[i % 4].m".to_string(),
+            7 => "m[\"a\"]".to_string(),
+            8 => "m[keys[i % 4]]".to_string(),
+            9 => "big[bigkeys[i % 40]]".to_string(),
+            10 => "alias[i % n]".to_string(),
+            // Una clave que no es texto en un mapa (lo resuelve la VM).
+            11 if self.rng.chance(15) => "m[i % 2]".to_string(),
+            // F4.7c: `length` de una lista, de un mapa, de un registro, de un elemento (a veces no
+            // tiene largo: el error de la VM).
+            11 if self.rng.chance(40) => ["length(xs)", "length(m)", "length(recs[i % 4])", "length(grid[i % 3])", "length(xs[i % n])"][self.rng.below(5)].to_string(),
+            _ => "m.b".to_string(),
+        }
+    }
+
+    fn program(&mut self) -> String {
+        let n = 3 + self.rng.below(5);
+        let mut s = String::new();
+        s += &format!("let xs be {}\nlet n be length(xs)\n", self.list(n));
+        let rows: Vec<String> = (0..3).map(|_| self.list(4)).collect();
+        s += &format!("let grid be [{}]\n", rows.join(", "));
+        // Registros: la misma forma, o formas distintas (la caché por forma ve varias).
+        let poly = self.rng.chance(40);
+        let recs: Vec<String> = (0..4).map(|k| { let sh = if poly { k % 4 } else { 0 }; self.record(sh) }).collect();
+        s += &format!("let recs be [{}]\n", recs.join(", "));
+        s += &format!("let m be {{\"a\": {}, \"b\": {}, \"c\": 3}}\n", self.elem(), self.elem());
+        // A veces falta una clave (el error de la VM).
+        // A veces falta una clave, o una no es texto (el error de la VM; en la cuarta posición: el
+        // bucle ya está en nativo cuando llega).
+        let keys = match self.rng.below(10) {
+            0 | 1 => "[\"a\", \"b\", \"c\", \"zz\"]",
+            2 => "[\"a\", \"b\", \"c\", 1]",
+            _ => "[\"a\", \"b\", \"c\", \"a\"]",
+        };
+        s += &format!("let keys be {}\n", keys);
+        // Un mapa de 40 claves: modo diccionario.
+        s += "let big be {}\nlet bigkeys be []\neach k in range(0, 40)\n    set big[\"k\" + text(k)] to k * 2\n    set bigkeys to append(bigkeys, \"k\" + text(k))\n";
+        s += "let alias be xs\nlet out be []\nlet guard be out\n";
+        s += "let hits be 0\ntask bump(x)\n    set hits to hits + 1\n    give (x + cnt) % 3\n";
+        s += "task corta(x)\n    when x == 7\n        stop\n    give 1\n";
+        s += "let acc be 0\nlet facc be 0.0\nlet cnt be 0\n";
+        let bound = 3 + self.rng.below(30);
+        let over_list = self.rng.chance(35);
+        // El bucle (sus líneas, sin la sangría de un bucle de afuera).
+        let mut lp = String::new();
+        if over_list {
+            // Casi siempre una lista; a veces un mapa o un texto (sus claves, sus caracteres: el
+            // `each` sobre ellos lo hace la VM), o algo que no se recorre (su error).
+            let coll = match self.rng.below(10) {
+                0 => "m",
+                1 => "\"abc\"",
+                2 if self.rng.chance(30) => "n",
+                _ => "xs",
+            };
+            lp += &format!("let i be 0\neach v in {}\n    set i to i + 1\n", coll);
+            lp += "    when v\n        set cnt to cnt + 1\n";
+            if self.rng.chance(60) {
+                lp += "    set facc to facc + v * 1.0\n";
+            }
+            if self.rng.chance(30) {
+                // El cuerpo cambia la lista que recorre: la referencia sigue con la foto.
+                lp += "    when i == 2\n        set xs to append(xs, 5)\n";
+            }
+        } else {
+            lp += &format!("each i in range(0, {})\n", bound);
+        }
+        for _ in 0..1 + self.rng.below(3) {
+            let r = self.read();
+            match self.rng.below(4) {
+                0 => lp += &format!("    set facc to facc + {} * 0.5\n", r),
+                1 => lp += &format!("    when {} > 1\n        set cnt to cnt + 1\n", r),
+                2 => lp += &format!("    let t be {}\n    when t\n        set cnt to cnt + 1\n", r),
+                _ => lp += &format!("    set acc to acc + {}\n", r),
+            }
+        }
+        // Escrituras a mitad del bucle (salen a la VM): el alias no cambia (copy-on-write).
+        if self.rng.chance(35) {
+            lp += "    when i % 5 == 1\n        set xs[0] to xs[0] + 1\n";
+        }
+        if self.rng.chance(25) {
+            lp += "    when i % 7 == 3\n        set recs[1].x to i\n";
+        }
+        if self.rng.chance(20) {
+            lp += "    when i == 4\n        set m.a to 2.5\n";
+        }
+        // F4.8d: escrituras en cada vuelta (corren en nativo): con alias y fotos guardadas antes de
+        // escribir (copy-on-write), anidadas, con claves de texto y en un mapa en modo diccionario,
+        // índices negativos o fuera de rango, claves que faltan, y `append` en el lugar.
+        if self.rng.chance(40) {
+            let w = match self.rng.below(16) {
+                // F4.8d2: llamadas ajenas en cada vuelta: builtins, una task que escribe una global que el
+                // bucle tiene en un registro, un `stop` desde una task, un error dentro de un builtin.
+                11 => "    set out to append(out, text(i))\n".to_string(),
+                12 => "    set cnt to cnt + get(m, keys[i % 4], 0)\n".to_string(),
+                13 => "    set acc to acc + bump(i)\n    set cnt to cnt + hits\n".to_string(),
+                14 => "    set acc to acc + corta(i)\n".to_string(),
+                15 => "    when i == 5\n        set facc to facc + min(xs)\n".to_string(),
+                0 => "    set xs[i % n] to xs[i % n] + 1\n".to_string(),
+                1 => format!("    set xs[{}] to i\n", ["0", "-1", "i % n - n", "i + 3"][self.rng.below(4)]),
+                2 => "    let snap be recs[i % 4]\n    set recs[i % 4].x to i\n    set facc to facc + snap.x * 1.0\n".to_string(),
+                3 => "    set grid[i % 3][(i + 2) % 4] to grid[i % 3][(i + 2) % 4] * 2\n".to_string(),
+                4 => "    set m[keys[i % 4]] to i\n".to_string(),
+                5 => "    set big[bigkeys[i % 40]] to big[bigkeys[i % 40]] + 1\n".to_string(),
+                6 => "    set recs[i % 4].m to 0.5\n".to_string(),
+                7 => format!("    set out to append(out, {})\n", ["i", "xs[i % n]", "recs[i % 4]", "out"][self.rng.below(4)]),
+                // Un alias que se toma a mitad del bucle (la escritura siguiente tiene que copiar).
+                9 => "    when i % 3 == 1\n        set alias to xs\n    set xs[i % n] to i\n".to_string(),
+                10 => "    when i % 4 == 2\n        set guard to out\n    set out to append(out, i)\n".to_string(),
+                _ => "    set alias[0] to i\n".to_string(),
+            };
+            lp += &w;
+        }
+        // F4.8d2: una llamada ajena en cada vuelta, aparte de las escrituras (`get` es un intrínseco:
+        // no lo es con una clave que no es texto ni un `Int`).
+        if self.rng.chance(50) {
+            lp += match self.rng.below(8) {
+                // Textos constantes (prestados de la unidad).
+                6 => "    set cnt to cnt + get(m, \"a\", 1) + length(\"xy\")\n",
+                7 => "    let tx be get(m, \"zz\", \"def\")\n    when i == 2\n        set out to append(out, tx)\n",
+                0 => "    set out to append(out, text(i))\n",
+                1 => "    set acc to acc + bump(i)\n    set cnt to cnt + hits\n",
+                2 => "    set acc to acc + corta(i)\n",
+                3 => "    when i == 5\n        set facc to facc + min(xs)\n",
+                4 => "    set cnt to cnt + length(join([text(i), \"x\"], \"-\"))\n",
+                _ => "    set cnt to cnt + get(m, 1.5, 2)\n",
+            };
+        }
+        if self.rng.chance(15) {
+            lp += "    when acc > 20\n        stop\n";
+        }
+        // A veces dentro de otro bucle: así el comienzo del `each` (sobre una lista o sobre otra
+        // cosa) también corre en nativo.
+        if self.rng.chance(40) {
+            s += "each rep in range(0, 3)\n";
+            for l in lp.lines() {
+                s += &format!("    {}\n", l);
+            }
+        } else {
+            s += &lp;
+        }
+        s += "print([acc, facc, cnt, xs, alias, recs, m, grid, length(out), guard, big[\"k3\"], hits])\n";
+        s += "print(steps())\n";
+        s
+    }
+}
+
+/// F4.8b: generador de programas cuyos builtins (`apply`, `where`, `reduce`, `count_where`, `every`,
+/// `some`, `find_first`, `transform`) llaman funciones: lambdas con parámetros enteros, floats y
+/// registros (prestados), que leen globales que cambian entre llamadas, tasks con defaults, argumentos
+/// de más, errores a mitad de las llamadas (un elemento que no es número, `% 0`, una clave que falta),
+/// y los builtins llamados desde tasks.
+struct LGen {
+    rng: Rng,
+}
+
+impl LGen {
+    fn c(&mut self) -> String {
+        ["0", "1", "2", "3", "5", "7", "10", "0.5", "2.5", "(0 - 3)", "9223372036854775807"][self.rng.below(11)].to_string()
+    }
+
+    /// Una expresión sobre `x` (un número) y las globales.
+    fn num(&mut self, depth: usize) -> String {
+        if depth == 0 || self.rng.chance(30) {
+            return match self.rng.below(7) {
+                0 | 1 => "x".to_string(),
+                2 => "umbral".to_string(),
+                3 => "tabla[x % 3]".to_string(),
+                4 => "paso".to_string(),
+                _ => self.c(),
+            };
+        }
+        let a = self.num(depth - 1);
+        let b = self.num(depth - 1);
+        match self.rng.below(6) {
+            0 => format!("({} + {})", a, b),
+            1 => format!("({} - {})", a, b),
+            2 => format!("({} * {})", a, b),
+            // A veces por cero (el error de la VM, a mitad de las llamadas).
+            3 => format!("({} % {})", a, if self.rng.chance(85) { "7".to_string() } else { b }),
+            4 => format!("({} / 2)", a),
+            _ => format!("abs({})", a),
+        }
+    }
+
+    fn cond(&mut self) -> String {
+        let a = self.num(2);
+        let op = ["<", ">", "==", "!=", ">=", "<="][self.rng.below(6)];
+        format!("{} {} {}", a, op, self.c())
+    }
+
+    fn stmt(&mut self) -> String {
+        match self.rng.below(12) {
+            0 => format!("print(count_where(xs, (x) => {}))\n", self.cond()),
+            1 => format!("print(length(where(xs, (x) => {})))\n", self.cond()),
+            2 => format!("print(reduce(xs, (acc, x) => acc + {}, 0))\n", self.num(2)),
+            3 => format!("print(apply(xs, (x) => {}))\n", self.num(2)),
+            4 => format!("print(reduce(recs, (acc, r) => acc + r.x * {}, 0))\n", self.c()),
+            5 => format!("print(length(where(recs, (r) => r.y > {})))\n", self.c()),
+            6 => format!("print(every(xs, (x) => {}), some(xs, (x) => {}), find_first(xs, (x) => {}))\n", self.cond(), self.cond(), self.cond()),
+            7 => format!("print(transform(xs, (x) => {}, (x) => {}))\n", self.num(1), self.cond()),
+            8 => format!("set umbral to {}\n", self.c()),
+            9 => "set tabla to [umbral, 1, 2]\n".to_string(),
+            10 => "print(apply(xs, con_default), reduce(xs, tres, 0))\n".to_string(),
+            _ => "print(desde_task(xs), desde_task(xs))\n".to_string(),
+        }
+    }
+
+    fn program(&mut self) -> String {
+        let n = 4 + self.rng.below(20);
+        let mut s = String::new();
+        s += &format!("let xs be apply(range(0, {}), (i) => i{})\n", n, if self.rng.chance(30) { " * 0.5" } else { "" });
+        // A veces un elemento que no es número al final (el error, con la función ya en nativo).
+        if self.rng.chance(12) {
+            s += "set xs to append(xs, \"t\")\n";
+        }
+        s += &format!("let recs be apply(range(0, {}), (i) => {{\"x\": i % 5, \"y\": i * 0.5}})\n", n);
+        if self.rng.chance(10) {
+            s += "set recs to append(recs, {\"y\": 1.0})\n";
+        }
+        // Dos globales del mismo tipo seguidas (leer el lugar de al lado daría otro valor).
+        s += &format!("let umbral be {}\nlet paso be {}\nlet tabla be [1, 2, 3]\n", self.c(), self.c());
+        s += "task con_default(x, y = 10)\n    give x + y\n";
+        s += "task tres(a, b, c = 100)\n    give a + b + c\n";
+        s += "task desde_task(ys)\n    give reduce(ys, (a, y) => a + y * 2, 0)\n";
+        for _ in 0..2 + self.rng.below(5) {
+            s += &self.stmt();
+        }
+        s += "print(steps())\n";
+        s
+    }
+}
+
 /// El modo referencia es global al proceso: un solo `check` a la vez.
 static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn check(seed: u64, count: usize) {
+    let mut g = Gen { rng: Rng(seed) };
+    check_with(seed, count, true, move || g.program());
+}
+
+/// `tasks`: los programas llaman tasks desde un sitio caliente (se exige que entren al código nativo).
+fn check_with(seed: u64, count: usize, tasks: bool, program: impl FnMut() -> String) {
+    check_with_osr(seed, count, tasks, true, program);
+}
+
+/// `osr`: los programas tienen bucles del nivel superior (se exige que entren al código nativo).
+fn check_with_osr(seed: u64, count: usize, tasks: bool, osr: bool, mut program: impl FnMut() -> String) {
     let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
     synsema_jit::install();
     native_tier::set_eager(true);
     let before = native_tier::stats();
-    let mut g = Gen { rng: Rng(seed) };
     let mut failures = Vec::new();
     let mut errors = 0;
     for i in 0..count {
-        let src = g.program();
+        let src = program();
         set_reference_mode(true);
         let reference = run_source(&src, "fuzz.syn");
         set_reference_mode(false);
@@ -238,18 +743,22 @@ fn check(seed: u64, count: usize) {
     }
     let after = native_tier::stats();
     eprintln!(
-        "fuzz: {} programas ({} terminan en error), {} unidades, {} entradas, {} salidas a la VM, {} entradas a bucles",
+        "fuzz: {} programas ({} terminan en error), {} unidades, {} entradas, {} salidas a la VM, {} entradas a bucles ({} con llamadas ajenas)",
         count,
         errors,
         after.units - before.units,
         after.entries - before.entries,
         after.deopts - before.deopts,
-        after.osr - before.osr
+        after.osr - before.osr,
+        after.foreign - before.foreign
     );
     assert!(failures.is_empty(), "{} programa(s) dan distinto en nativo:\n\n{}", failures.len(), failures.join("\n\n"));
-    assert!(after.entries - before.entries > count as u64, "el nivel nativo casi no corrió: {:?} → {:?}", before, after);
+    // Un generador que arma programas que fallan todos no prueba nada (pasó: un builtin que no está
+    // en core).
+    assert!(errors * 4 < count * 3, "{} de {} programas terminan en error: el generador está roto", errors, count);
+    assert!(!tasks || after.entries - before.entries > count as u64, "el nivel nativo casi no corrió: {:?} → {:?}", before, after);
     assert!(after.deopts > before.deopts, "ningún programa salió a la VM a mitad de camino");
-    assert!(after.osr - before.osr > count as u64 / 2, "los bucles del nivel superior casi no entraron al código nativo: {:?} → {:?}", before, after);
+    assert!(!osr || after.osr - before.osr > count as u64 / 2, "los bucles del nivel superior casi no entraron al código nativo: {:?} → {:?}", before, after);
 }
 
 #[test]
@@ -261,4 +770,60 @@ fn native_matches_the_reference_on_generated_programs() {
 #[ignore]
 fn native_matches_the_reference_on_many_generated_programs() {
     check(0xf4_1_0000_0001, 3000);
+}
+
+/// F4.7: programas con floats (`FloatArith`, `NumCmp` exacto, `-0.0`, NaN, infinitos, `/` por
+/// cero, decimal⊕float a mitad de un bucle, tipos que cambian, lugares que según el camino están
+/// vacíos, tasks con parámetros `Float`).
+#[test]
+fn native_matches_the_reference_on_float_programs() {
+    let mut g = FGen { rng: Rng(0x5eed_f4_07) };
+    check_with(0x5eed_f4_07, 150, true, move || g.program());
+}
+
+#[test]
+#[ignore]
+fn native_matches_the_reference_on_many_float_programs() {
+    let mut g = FGen { rng: Rng(0xf4_7_0000_0001) };
+    check_with(0xf4_7_0000_0001, 3000, true, move || g.program());
+}
+
+/// F4.7b: programas que leen datos en bucles nativos (listas, anidadas, mapas con forma y en modo
+/// diccionario, registros de varias formas, alias, escrituras que salen a la VM, `each` sobre una
+/// lista que el cuerpo cambia, índices y claves que fallan).
+#[test]
+fn native_matches_the_reference_on_data_programs() {
+    let mut g = DGen { rng: Rng(0x5eed_f4_7b) };
+    check_data(0x5eed_f4_7b, 200, move || g.program());
+}
+
+/// Como `check_with`, y los bucles con llamadas ajenas (F4.8d2) entran de verdad al código nativo: uno
+/// que no compila corre en la VM y da lo mismo (pasó: sin las lecturas declaradas no compilaba ninguno).
+fn check_data(seed: u64, count: usize, program: impl FnMut() -> String) {
+    let before = native_tier::stats().foreign;
+    check_with(seed, count, false, program);
+    let entered = native_tier::stats().foreign - before;
+    assert!(entered > count as u64 / 4, "los bucles con llamadas ajenas casi no entraron al código nativo: {} de {} programas", entered, count);
+}
+
+#[test]
+#[ignore]
+fn native_matches_the_reference_on_many_data_programs() {
+    let mut g = DGen { rng: Rng(0xf4_7b_0000_0001) };
+    check_data(0xf4_7b_0000_0001, 3000, move || g.program());
+}
+
+/// F4.8b: programas cuyos builtins llaman funciones (lambdas y tasks, a la VM o al código nativo desde
+/// Rust, con parámetros con caja prestados y globales leídas al llamar).
+#[test]
+fn native_matches_the_reference_on_call_programs() {
+    let mut g = LGen { rng: Rng(0x5eed_f4_8b) };
+    check_with_osr(0x5eed_f4_8b, 200, true, false, move || g.program());
+}
+
+#[test]
+#[ignore]
+fn native_matches_the_reference_on_many_call_programs() {
+    let mut g = LGen { rng: Rng(0xf4_8b_0000_0001) };
+    check_with_osr(0xf4_8b_0000_0001, 3000, true, false, move || g.program());
 }

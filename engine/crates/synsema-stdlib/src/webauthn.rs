@@ -31,6 +31,7 @@
 //!   tal cual, o un map plano con esas claves en camelCase o snake_case. Los binarios se aceptan
 //!   como `bytes` o como texto base64url.
 
+use synsema_core::synlist::{list_values};
 use synsema_core::types::{MapObj, SynMap};
 use sha2::{Digest, Sha256};
 
@@ -141,7 +142,7 @@ fn parse_opts(v: Option<&SynValue>, who: &str, verifying: bool) -> Result<Opts, 
     let origins: Vec<String> = match m.get("origin") {
         Some(SynValue::Text(s)) if !s.trim().is_empty() => vec![s.trim().to_string()],
         Some(SynValue::List(l)) => {
-            let out: Vec<String> = l.borrow().iter().map(|x| x.to_string().trim().to_string()).collect();
+            let out: Vec<String> = list_values(&l).iter().map(|x| x.to_string().trim().to_string()).collect();
             if out.is_empty() || out.iter().any(|s| s.is_empty()) {
                 return Err(err(format!("{}: opts.origin must be a non-empty text or a list of texts", who)));
             }

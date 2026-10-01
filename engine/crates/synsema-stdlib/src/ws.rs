@@ -35,6 +35,7 @@
 //! en el pool. Los handles NO cruzan workers (aislamiento CSP): cada worker es dueño de
 //! los suyos.
 
+use synsema_core::synlist::{list_values};
 use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -1363,7 +1364,7 @@ fn parse_connect_opts(v: Option<&SynValue>, fname: &str) -> Result<ConnectOpts, 
     let subprotocols = match opts.get("subprotocols") {
         None | Some(SynValue::Nothing) => Vec::new(),
         Some(SynValue::List(l)) => {
-            let items = l.borrow().clone();
+            let items = l.borrow().to_vec();
             let mut out = Vec::with_capacity(items.len());
             for it in &items {
                 match it {
@@ -1637,7 +1638,7 @@ type TargetNames = Option<HashMap<i64, String>>;
 fn resolve_targets(v: &SynValue, fname: &str) -> Result<(Vec<i64>, TargetNames), Control> {
     match v {
         SynValue::List(l) => {
-            let items = l.borrow().clone();
+            let items = l.borrow().to_vec();
             let mut handles = Vec::with_capacity(items.len());
             for it in &items {
                 handles.push(conn_handle(it, fname)?);
@@ -1693,7 +1694,7 @@ fn ws_select_all(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) ->
     let (targets, names) = resolve_targets(args.first().ok_or_else(|| err(format!("{}: missing the connections", F)))?, F)?;
     let timeout = timeout_arg(args.get(1), F)?;
     if targets.is_empty() {
-        return Ok(SynValue::List(Rc::new(RefCell::new(Vec::new()))));
+        return Ok(SynValue::List(Rc::new(RefCell::new(Default::default()))));
     }
     let deadline = Instant::now() + timeout;
     watch_cancel(reg, interp);
@@ -1722,7 +1723,7 @@ fn ws_select_all(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) ->
             }
         }
     }
-    Ok(SynValue::List(Rc::new(RefCell::new(out))))
+    Ok(SynValue::List(Rc::new(RefCell::new(out.into()))))
 }
 
 fn ws_broadcast(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
@@ -2409,8 +2410,7 @@ fn proc_spawn(i: &Interpreter, args: &[SynValue], reg: &Registry) -> Result<SynV
     };
     let arg_list: Vec<String> = match args.get(1) {
         None | Some(SynValue::Nothing) => Vec::new(),
-        Some(SynValue::List(l)) => l
-            .borrow()
+        Some(SynValue::List(l)) => list_values(&l)
             .iter()
             .map(|v| match v {
                 SynValue::Secret(_) => Err(err(format!("{}: cannot pass a secret as a process argument (reveal() it explicitly if you truly must)", F))),
@@ -2708,7 +2708,7 @@ fn to_send_strict(v: &SynValue, fname: &str) -> Result<SendValue, Control> {
         }
         SynValue::Secret(_) => Err(err(format!("{}: cannot publish a secret on the bus", fname))),
         SynValue::List(l) => Ok(SendValue::List(
-            l.borrow().iter().map(|x| to_send_strict(x, fname)).collect::<Result<Vec<_>, _>>()?,
+            list_values(&l).iter().map(|x| to_send_strict(x, fname)).collect::<Result<Vec<_>, _>>()?,
         )),
         SynValue::Map(m) => Ok(SendValue::Map(
             m.borrow()
@@ -2743,8 +2743,7 @@ fn bus_publish(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
 fn bus_subscribe(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
     const F: &str = "bus_subscribe";
     let patterns: Vec<String> = match args.first() {
-        Some(SynValue::List(l)) => l
-            .borrow()
+        Some(SynValue::List(l)) => list_values(&l)
             .iter()
             .map(|v| topic_arg(Some(v), F))
             .collect::<Result<Vec<_>, _>>()?,
@@ -2819,7 +2818,7 @@ fn bus_topics(_args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
             syn_map(m)
         })
         .collect();
-    Ok(SynValue::List(Rc::new(RefCell::new(items))))
+    Ok(SynValue::List(Rc::new(RefCell::new(items.into()))))
 }
 
 // ---------------------------------------------------------
@@ -2883,7 +2882,7 @@ fn watch_open(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
             None | Some(SynValue::Nothing) => {}
             Some(SynValue::List(l)) => {
                 let mut pats = Vec::new();
-                for it in l.borrow().iter() {
+                for it in list_values(&l).iter() {
                     match it {
                         SynValue::Text(s) if !s.is_empty() => pats.push(s.to_string()),
                         SynValue::Text(_) => {}

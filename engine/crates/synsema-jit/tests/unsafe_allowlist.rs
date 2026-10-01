@@ -1,11 +1,15 @@
 //! Dónde hay `unsafe` en el motor (spec §F4.2): el nivel nativo lo tiene sólo en
-//! `synsema-jit/src/abi.rs`, core no tiene nada, y cualquier `unsafe` nuevo en otro archivo rompe
-//! este test (para agregarlo hay que sumarlo acá, a la vista del que revisa).
+//! `synsema-jit/src/abi.rs`, el texto sólo en `synsema-text/src/lib.rs` (F4.6b), core no tiene
+//! nada, y cualquier `unsafe` nuevo en otro archivo rompe este test (para agregarlo hay que sumarlo
+//! acá, a la vista del que revisa).
 
 use std::path::{Path, PathBuf};
 
 /// Los archivos que pueden tener `unsafe`, y por qué.
 const ALLOWED: &[&str] = &[
+    // El texto (F4.6b): en línea hasta 15 B, cuenta no atómica, capacidad y `realloc`. Revisado
+    // con Miri (64 y 32 bits, little y big endian) y un fuzz contra `String`.
+    "engine/crates/synsema-text/src/lib.rs",
     // El nivel nativo: el contexto, la salida a la VM y la llamada al código generado.
     "engine/crates/synsema-jit/src/abi.rs",
     // Handles del sistema (descriptores heredados, consola de Windows, Job Objects, ioctl de Nitro).
@@ -21,6 +25,7 @@ const ALLOWED: &[&str] = &[
     "packages/guests/vela/src/lib.rs",
     // Tests: un allocator que cuenta, y un handle de prueba.
     "engine/crates/synsema-core/tests/alloc_counts.rs",
+    "engine/crates/synsema-jit/tests/alloc_native.rs",
     "engine/crates/synsema-stdlib/tests/agentic_hub.rs",
 ];
 

@@ -19,6 +19,7 @@
 //! `iss`, falta `aud`, JWKS inalcanzable) sí son errores catchables: no es lo
 //! mismo "el token no vale" que "no pude comprobarlo".
 
+use synsema_core::synlist::{list_values};
 use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -331,7 +332,7 @@ fn b_oidc_verify(
         match k.as_str() {
             "iss" => iss = Some(v.to_string()),
             "aud" => match v {
-                SynValue::List(l) => aud = l.borrow().iter().map(|x| x.to_string()).collect(),
+                SynValue::List(l) => aud = list_values(&l).iter().map(|x| x.to_string()).collect(),
                 other => aud = vec![other.to_string()],
             },
             "jwks_url" => jwks_url = Some(v.to_string()),
@@ -340,7 +341,7 @@ fn b_oidc_verify(
             "jwks" => {
                 jwks_inline = Some(match v {
                     SynValue::Text(s) => s.to_string(),
-                    SynValue::Map(_) => crate::json::dumps(&crate::json::syn_to_json(v)),
+                    SynValue::Map(_) => crate::json::dumps_syn(v),
                     other => {
                         return Err(err(format!(
                             "{}: jwks must be the JWKS document as text or a map, got {}",
@@ -381,7 +382,7 @@ fn b_oidc_verify(
             },
             "alg" => {
                 let list: Vec<String> = match v {
-                    SynValue::List(l) => l.borrow().iter().map(|x| x.to_string()).collect(),
+                    SynValue::List(l) => list_values(&l).iter().map(|x| x.to_string()).collect(),
                     other => vec![other.to_string()],
                 };
                 for a in &list {

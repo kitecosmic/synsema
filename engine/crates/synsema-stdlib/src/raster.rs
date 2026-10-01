@@ -120,7 +120,7 @@ fn fonts_opt(
 ) -> Result<Vec<Vec<u8>>, Control> {
     let list = match opts.get("fonts") {
         None | Some(SynValue::Nothing) => return Ok(Vec::new()),
-        Some(SynValue::List(l)) => l.borrow().clone(),
+        Some(SynValue::List(l)) => l.borrow().to_vec(),
         Some(other) => {
             return Err(err(format!(
                 "{}: option \"fonts\" must be a list of font file paths, got {}",

@@ -1822,9 +1822,13 @@ mod tests {
     use super::*;
 
     fn tmp_root(files: &[(&str, &str)]) -> Root {
+        // Un contador además de la hora: en Windows el reloj avanza a saltos y dos tests en paralelo
+        // sacaban el mismo directorio (mezclaban sus archivos: fallos intermitentes).
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "syn_codeintel_{}_{}",
+            "syn_codeintel_{}_{}_{}",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
         ));
         std::fs::create_dir_all(&dir).unwrap();

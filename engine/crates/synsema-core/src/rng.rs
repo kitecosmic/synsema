@@ -593,7 +593,7 @@ pub fn shuffle(
 
 fn list_items(v: &SynValue, who: &str) -> Result<Vec<SynValue>, Control> {
     match v {
-        SynValue::List(l) => Ok(l.borrow().clone()),
+        SynValue::List(l) => Ok(l.borrow().to_vec()),
         other => Err(err(format!("{}: expected a list, got {}", who, other.type_name()))),
     }
 }

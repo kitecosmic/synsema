@@ -1,0 +1,82 @@
+-- F4.8b: las funciones que llaman los builtins (`apply`, `where`, `reduce`, …) entran directo a la VM o
+-- al código nativo (sin frame por llamada). Lo mismo que la referencia: parámetros de cada tipo,
+-- valores con caja prestados, globales leídas al llamar (y que cambian entre llamadas), defaults,
+-- argumentos de más, closures que re-ligan, la lista como foto aunque la función la cambie, y `stop`.
+
+let xs be range(0, 400)
+let fs be apply(xs, (i) => i * 0.25 - 30)
+print(length(where(xs, (x) => x % 3 == 0)))
+print(count_where(fs, (f) => f > 0))
+print(every(xs, (x) => x >= 0), some(fs, (f) => f == 12.5), find_first(xs, (x) => x * x > 1000))
+print(reduce(xs, (acc, x) => acc + x * x, 0))
+print(reduce(fs, (acc, f) => acc + f, 0.0))
+print(transform(xs, (x) => x * 2, (x) => x % 50 == 0)[100])
+print(sort_by([5, 3, 9, 1, 7], (x) => 0 - x))
+print(apply([true, false, true], (b) => not b))
+
+-- Valores con caja como parámetros (prestados) y como resultado.
+let recs be apply(range(0, 300), (i) => {"id": i, "v": i % 7})
+print(reduce(recs, (acc, r) => acc + r.v * r.id, 0))
+print(length(where(recs, (r) => r.v > 4)))
+print(apply(recs, (r) => r.v)[299])
+let words be ["uno", "dos", "tres", "cuatro"]
+print(apply(range(0, 8), (i) => length(words[i % 4])))
+
+-- Globales que lee la función: se leen en cada llamada al builtin.
+let umbral be 100
+let tabla be [3, 5, 7]
+print(count_where(xs, (x) => x > umbral))
+set umbral to 350
+print(count_where(xs, (x) => x > umbral))
+print(reduce(xs, (acc, x) => acc + tabla[x % 3], 0))
+set tabla to [1, 1, 1]
+print(reduce(xs, (acc, x) => acc + tabla[x % 3], 0))
+let k be 1
+let addk be (x) => x + k
+set k to 5
+print(apply([1, 2, 3], addk))
+print(apply([1, 2, 3], addk))
+
+-- Defaults y argumentos de más (aridad permisiva).
+task con_default(x, y = 10)
+    give x + y
+task tres(a, b, c = 100)
+    give a + b + c
+print(apply([1, 2, 3], con_default))
+print(apply([1, 2, 3], () => 7))
+print(reduce([1, 2, 3], tres, 0))
+
+-- Una closure sobre el frame de una task (y que re-liga su variable después).
+task hacer(n)
+    let base be n
+    let f be (x) => x + base
+    let r1 be apply(range(0, 5), f)
+    set base to 1000
+    give [r1, apply(range(0, 5), f)]
+print(hacer(10))
+print(hacer(20))
+
+-- La lista es una foto: la función la cambia (por una global) y el builtin sigue con la de antes.
+let ys be [1, 2, 3, 4]
+task crece(x)
+    set ys to append(ys, x * 10)
+    give x
+print(apply(ys, crece), ys)
+print(apply(ys, (x) => x + length(ys)), length(ys))
+
+-- `stop` desde una función llamada por un builtin corta el bucle de afuera.
+task corta(x)
+    when x == 3
+        stop
+    give x
+let vistos be 0
+each r in range(0, 10)
+    set vistos to vistos + 1
+    let z be apply([1, 2, 3, 4], corta)
+    print(z)
+print(vistos)
+
+-- Muchas llamadas: la función pasa al nivel nativo a mitad de camino y sigue igual.
+let grande be range(0, 5000)
+print(reduce(grande, (acc, x) => acc + x % 13, 0), count_where(grande, (x) => x % 7 == 1))
+print(steps())

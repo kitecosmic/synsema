@@ -1,0 +1,13 @@
+-- F4.6c: una pieza `nothing` a mitad de una cadena ya en modo texto: el error de `+` en ese
+-- momento, con la pieza de después sin evaluar (no imprime "c" en la última vuelta).
+task side(x)
+    print("side", x)
+    give x
+task pick(i)
+    when i == 3
+        give nothing
+    give "b"
+let s be "a"
+each i in range(0, 4)
+    print(i, length(s), steps())
+    set s to s + side("-") + pick(i) + side("c")

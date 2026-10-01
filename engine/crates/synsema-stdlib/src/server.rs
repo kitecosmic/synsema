@@ -2989,6 +2989,7 @@ impl Drop for ProxyBody {
 fn response_body_bytes(body: ResponseBody) -> (String, Bytes) {
     match body {
         ResponseBody::Json(j) => ("application/json".to_string(), Bytes::from(dumps(&j))),
+        ResponseBody::JsonText(t) => ("application/json".to_string(), Bytes::from(t)),
         ResponseBody::Raw(r) => (r.content_type, Bytes::from(r.body)),
         // El destino va como header `Location` (inyectado en el dispatch); sin body.
         ResponseBody::Redirect { .. } => ("text/plain; charset=utf-8".to_string(), Bytes::new()),
@@ -3005,7 +3006,7 @@ fn channel_emitter(tx: tokio::sync::mpsc::Sender<Bytes>) -> Emitter {
             payload.push('\n');
         }
         payload.push_str("data: ");
-        payload.push_str(&dumps(&syn_to_json(value)));
+        crate::json::dumps_syn_into(value, &mut payload);
         payload.push_str("\n\n");
         tx.blocking_send(Bytes::from(payload)).map_err(|_| StreamGone)
     })

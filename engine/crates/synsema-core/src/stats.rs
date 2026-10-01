@@ -259,7 +259,7 @@ fn reduce_array(a: &Rc<ArrayD<f64>>, kind: Kind, axis: Option<i64>, lvl: f64, dd
 /// Lista (o valores de una columna): `nothing` se saltea; lo demás tiene que ser número.
 fn present_numbers(v: &SynValue, who: &str) -> Result<(Vec<Number>, usize), Control> {
     let items = match v {
-        SynValue::List(l) => l.borrow().clone(),
+        SynValue::List(l) => l.borrow().to_vec(),
         other => return Err(err(format!("{} expects a list of numbers or an array, got {}", who, other.type_name()))),
     };
     let total = items.len();

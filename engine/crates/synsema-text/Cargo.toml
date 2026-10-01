@@ -1,0 +1,9 @@
+[package]
+name = "synsema-text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Synsema text: a shared UTF-8 text with inline storage for short texts and in-place append for a single owner"
+
+# Sin dependencias: es el único lugar con `unsafe` del texto (ver src/lib.rs).
+[dependencies]

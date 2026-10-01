@@ -8,6 +8,7 @@
 //! (blackboard) vía `Arc`. Es exactamente el aislamiento documentado: "lo único
 //! compartido es el blackboard y la base de datos".
 
+use synsema_core::synlist::{list_values};
 use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -2277,7 +2278,7 @@ fn build_host_table(
             let group = interp.eval(source, env)?;
             let metas: Vec<SynValue> = match &group {
                 SynValue::Map(m) => match m.borrow().get("_routes_meta") {
-                    Some(SynValue::List(l)) => l.borrow().clone(),
+                    Some(SynValue::List(l)) => l.borrow().to_vec(),
                     _ => {
                         return Err(Control::Error(RuntimeError::new(
                             "mount expects a routes group (a module's `export routes ...`) — the value has no routes"
@@ -2329,7 +2330,7 @@ fn build_host_table(
                 let socket = matches!(mm.get("socket"), Some(SynValue::Bool(true)));
                 let private = matches!(mm.get("private"), Some(SynValue::Bool(true)));
                 let params: Vec<String> = match mm.get("params") {
-                    Some(SynValue::List(l)) => l.borrow().iter().map(|x| x.to_string()).collect(),
+                    Some(SynValue::List(l)) => list_values(&l).iter().map(|x| x.to_string()).collect(),
                     _ => Vec::new(),
                 };
                 if requires_auth && auth_handler.is_none() {
@@ -2917,7 +2918,7 @@ fn make_serve_hook(
                     };
                     let api_v = match api {
                         Some(a) => match interp.eval(a, env)? {
-                            SynValue::List(l) => l.borrow().iter().map(|x| x.to_string()).collect(),
+                            SynValue::List(l) => list_values(&l).iter().map(|x| x.to_string()).collect(),
                             _ => Vec::new(),
                         },
                         None => Vec::new(),
@@ -3199,7 +3200,7 @@ fn make_serve_hook(
             Some(ds) => ds.clone(),
             None => match domain_n {
                 Some(d) => match interp.eval(d, env)? {
-                    SynValue::List(l) => l.borrow().iter().map(|x| x.to_string()).collect(),
+                    SynValue::List(l) => list_values(&l).iter().map(|x| x.to_string()).collect(),
                     other => vec![other.to_string()],
                 },
                 None => Vec::new(),

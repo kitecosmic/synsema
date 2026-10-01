@@ -1,0 +1,126 @@
+-- F4.6c: `set P to P + e1 + … + ek` agrega en el lugar en la VM. Mismo resultado y mismos pasos
+-- que la referencia: texto único y compartido, P leída o religada por una pieza, piezas que no son
+-- texto, P en cada lugar (global, ventana, parámetro, local, hueco, de afuera, módulo), números por
+-- el mismo sitio y el borde en línea ↔ montón.
+use "./mods/text_mod.syn" as tm
+
+-- único (global), con fotos en el camino
+let s be ""
+let snaps be []
+each i in range(0, 40)
+    set s to s + text(i) + ","
+    when i % 10 == 0
+        set snaps to append(snaps, s)
+print(length(s), s, snaps)
+
+-- compartido: un alias por vuelta no cambia
+let t be "x"
+each i in range(0, 5)
+    let alias be t
+    set t to t + "ab" + "cd"
+    print(alias, t)
+
+-- un solo `+`, sobre un texto de un solo dueño
+let one be ""
+each i in range(0, 30)
+    set one to one + "z"
+print(one, length(one))
+
+-- una pieza que lee P ve el viejo
+let r be "r"
+each i in range(0, 6)
+    set r to r + text(length(r)) + r
+print(length(r), r)
+
+-- una pieza que religa P: el resultado es el viejo más las piezas
+let g be "g"
+task rebind()
+    set g to "zzz"
+    give "!"
+each i in range(0, 4)
+    set g to g + rebind() + text(i)
+print(g)
+
+-- una pieza que agrega a P (otra cadena sobre la misma variable, desde una task)
+let h be "h"
+task grow()
+    set h to h + "+"
+    give "."
+each i in range(0, 4)
+    set h to h + grow() + grow()
+print(h)
+
+-- piezas que no son texto y se suman: números, floats, decimales, grandes, bools
+let q be ""
+each i in range(0, 5)
+    set q to q + i + " " + (i / 2) + " " + (i > 2) + " " + 2 ** (60 + i) + " " + 1.5d + ";"
+print(q)
+
+-- P en la ventana de una vuelta (each sin frame), anidada
+each j in range(0, 3)
+    let w be "w" + text(j)
+    each i in range(0, 5)
+        set w to w + text(i) + "-"
+    print(w)
+
+-- P parámetro y local de tasks compiladas (cada una llamada varias veces)
+task build(p, n)
+    let acc be ""
+    each i in range(0, n)
+        set p to p + "<" + text(i) + ">"
+        set acc to acc + p + "|"
+    give [p, length(acc)]
+print(build("a", 3), build("b", 5), build("una base bastante larga", 4))
+
+-- P local de un frame que ve una closure, y P de afuera escrita desde la closure
+task with_closure(n)
+    let c be ""
+    let f be (x) => c + x
+    each i in range(0, n)
+        set c to c + text(i) + f("?")
+    give c
+print(with_closure(3), with_closure(4))
+let outer be "o"
+task outer_writer(n)
+    each i in range(0, n)
+        set outer to outer + text(i) + "/"
+    give outer
+print(outer_writer(3), outer_writer(2), outer)
+
+-- P hueco: un `let` en una rama que no corrió (se escribe la de afuera)
+let shade be "global"
+task holes(flag)
+    when flag
+        let shade be "local"
+    each i in range(0, 3)
+        set shade to shade + "." + text(i)
+    give shade
+print(holes(false), holes(true), holes(false), shade)
+
+-- módulo: la exportada queda sincronizada con `tm.LOG`
+print(tm.log("a", 3), tm.log("b", 2), tm.read_log(), tm.LOG)
+
+-- números por el mismo sitio (y vuelta a texto)
+task mix(v, n)
+    each i in range(0, n)
+        set v to v + 1 + i
+    give v
+print(mix(0, 5), mix("t", 3), mix(10, 3), mix("u", 2), mix(1.5, 2), mix("w", 4))
+
+-- el borde en línea (15 B) ↔ montón, con UTF-8
+let e be "abcdefghijklm"
+each i in range(0, 4)
+    set e to e + "ñ" + ""
+    print(length(e), e)
+let crab be ""
+each i in range(0, 6)
+    set crab to crab + "🦀" + "a"
+print(crab, length(crab))
+
+-- el valor de la sentencia como valor del bloque
+task last_value(n)
+    let z be ""
+    each i in range(0, n)
+        set z to z + "k" + text(i)
+    give z
+print(last_value(3), last_value(4), steps())

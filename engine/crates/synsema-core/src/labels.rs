@@ -150,9 +150,11 @@
 //! Los sumideros de I/O que el host no registre tampoco se comprueban: el host tiene
 //! `check_flow`, `strip_deep` e `Interpreter::pc_label` para hacerlo en su borde.
 
+use crate::synlist::{list_values};
 use crate::types::{MapObj, SynMap};
 use std::fmt;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 
 use crate::tokens::SourceLocation;
@@ -166,6 +168,18 @@ pub type Label = Rc<[Rc<str>]>;
 pub struct Labelled {
     pub value: SynValue,
     pub label: Label,
+}
+
+/// ¿Se creó alguna vez un valor privado en este proceso? Todos nacen en `labelled` (el test
+/// `labelled_is_built_only_here` lo fija), así que mientras sea `false` no existe ninguno y
+/// recorrer un valor buscándolos no puede encontrar nada. Los valores no cruzan hilos (`Rc`):
+/// uno que un hilo ve lo creó ese mismo hilo, después de marcar esto.
+static ANY_PRIVATE: AtomicBool = AtomicBool::new(false);
+
+/// El único constructor de `SynValue::Private`.
+pub(crate) fn labelled(value: SynValue, label: Label) -> SynValue {
+    ANY_PRIVATE.store(true, Ordering::Relaxed);
+    SynValue::Private(Rc::new(Labelled { value, label }))
 }
 
 /// Entrada del registro de `declassify` (una por llamada ejecutada): motivo, etiqueta de
@@ -410,7 +424,7 @@ fn deep_into(v: &SynValue, acc: &mut Label) {
             deep_into(&p.value, acc);
         }
         SynValue::List(l) => {
-            for x in l.borrow().iter() {
+            for x in list_values(&l).iter() {
                 deep_into(x, acc);
             }
         }
@@ -456,10 +470,10 @@ pub fn mark(v: SynValue, label: Label) -> SynValue {
             if Rc::ptr_eq(&joined, &p.label) || joined.len() == p.label.len() {
                 return SynValue::Private(p);
             }
-            SynValue::Private(Rc::new(Labelled { value: p.value.clone(), label: joined }))
+            labelled(p.value.clone(), joined)
         }
         SynValue::Secret(_) => v,
-        other => SynValue::Private(Rc::new(Labelled { value: other, label })),
+        other => labelled(other, label),
     }
 }
 
@@ -500,7 +514,7 @@ pub fn mark_owned(v: &SynValue, label: Label) -> SynValue {
 /// un alias escribible y la copia de `mark_owned` se saltea (M5: era ~4,5× más lento).
 fn is_aliased(v: &SynValue) -> bool {
     match v {
-        SynValue::List(l) => Rc::strong_count(l) > 1 || l.borrow().iter().any(is_aliased),
+        SynValue::List(l) => Rc::strong_count(l) > 1 || list_values(&l).iter().any(is_aliased),
         SynValue::Map(m) => Rc::strong_count(m) > 1 || m.borrow().values().any(is_aliased),
         SynValue::Private(p) => is_aliased(&p.value),
         // Los valores del servidor llevan `Rc`/`Box` opacos: conservador.
@@ -513,7 +527,7 @@ fn is_aliased(v: &SynValue) -> bool {
 /// escalares y los `Rc` inmutables se comparten). Corta todo aliasing con el original.
 pub fn deep_copy(v: &SynValue) -> SynValue {
     match v {
-        SynValue::List(l) => syn_list(l.borrow().iter().map(deep_copy).collect()),
+        SynValue::List(l) => syn_list(list_values(&l).iter().map(deep_copy).collect()),
         SynValue::Map(m) => {
             let mut out = SynMap::with_capacity(m.borrow().len());
             for (k, x) in m.borrow().iter() {
@@ -522,7 +536,7 @@ pub fn deep_copy(v: &SynValue) -> SynValue {
             syn_map(out)
         }
         SynValue::Private(p) => {
-            SynValue::Private(Rc::new(Labelled { value: deep_copy(&p.value), label: p.label.clone() }))
+            labelled(deep_copy(&p.value), p.label.clone())
         }
         SynValue::Server(s) => match &**s {
             ServerValue::Envelope { status, value } => {
@@ -566,7 +580,7 @@ pub fn strip_deep(v: &SynValue) -> SynValue {
     }
     match v {
         SynValue::Private(p) => strip_deep(&p.value),
-        SynValue::List(l) => syn_list(l.borrow().iter().map(strip_deep).collect()),
+        SynValue::List(l) => syn_list(list_values(&l).iter().map(strip_deep).collect()),
         SynValue::Map(m) => {
             let mut out = SynMap::with_capacity(m.borrow().len());
             for (k, x) in m.borrow().iter() {
@@ -606,6 +620,13 @@ pub fn strip_deep(v: &SynValue) -> SynValue {
 /// `[i]` / `.campo`). La etiqueta efectiva de un valor anidado es la unión de las que lo
 /// envuelven.
 pub fn check_flow(v: &SynValue, accepted: &[&str], path: &str) -> Result<(), LabelViolation> {
+    // Lo común es que no haya nada privado: sin ningún valor privado en el proceso, o sin
+    // ninguno dentro de `v`, no hay violación posible. Así una respuesta que da una página de
+    // una colección grande no la recorre entera armando caminos en cada request; el recorrido
+    // con caminos corre sólo si hay algo que reportar.
+    if !ANY_PRIVATE.load(Ordering::Relaxed) || !holds_private(v) {
+        return Ok(());
+    }
     let acc = label_from(accepted);
     let mut p = String::from(path);
     check_into(v, &acc, &mut p, &empty())
@@ -621,7 +642,11 @@ fn check_into(v: &SynValue, accepted: &Label, path: &mut String, ctx: &Label) ->
             check_into(&p.value, accepted, path, &eff)
         }
         SynValue::List(l) => {
-            for (i, x) in l.borrow().iter().enumerate() {
+            // Una lista sin caja (enteros/floats) no tiene nada privado; leerla con
+            // `list_values` la pasaba a valores para siempre.
+            let b = l.borrow();
+            let Some(xs) = b.as_values() else { return Ok(()) };
+            for (i, x) in xs.iter().enumerate() {
                 let n = path.len();
                 path.push_str(&format!("[{}]", i));
                 let r = check_into(x, accepted, path, ctx);
@@ -649,6 +674,22 @@ fn check_into(v: &SynValue, accepted: &Label, path: &mut String, ctx: &Label) ->
     }
 }
 
+/// ¿Hay algún valor privado en lo que `check_into` recorre? Sin caminos ni reservas.
+fn holds_private(v: &SynValue) -> bool {
+    match v {
+        SynValue::Private(_) => true,
+        SynValue::List(l) => l.borrow().as_values().is_some_and(|xs| xs.iter().any(holds_private)),
+        SynValue::Map(m) => m.borrow().iter().any(|(_, x)| holds_private(x)),
+        SynValue::Server(s) => match &**s {
+            ServerValue::Envelope { value, .. } => holds_private(value),
+            ServerValue::Node(m) => m.borrow().iter().any(|(_, x)| holds_private(x)),
+            ServerValue::Content(inner) | ServerValue::WithHeaders { inner, .. } => holds_private(inner),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn check_map(
     m: &MapObj,
     accepted: &Label,
@@ -673,6 +714,47 @@ mod tests {
 
     fn l(names: &[&str]) -> Label {
         label_from(names)
+    }
+
+    /// `check_flow` se saltea el recorrido mientras no se haya creado ningún valor privado: eso
+    /// sólo es cierto si todos nacen en `labelled`. Un `Labelled { … }` armado en otro lado (en
+    /// cualquier crate del motor o en los guests) se lo saltearía en silencio.
+    #[test]
+    fn labelled_is_built_only_here() {
+        fn walk(dir: &std::path::Path, found: &mut Vec<String>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if p.is_dir() {
+                    if name != "target" && !name.starts_with('.') {
+                        walk(&p, found);
+                    }
+                } else if name.ends_with(".rs") {
+                    let text = std::fs::read_to_string(&p).unwrap_or_default();
+                    // Armado acá para que este test no se encuentre a sí mismo.
+                    let pat = ["Labelled", " {"].concat();
+                    for (i, line) in text.lines().enumerate() {
+                        let t = line.trim();
+                        if t.contains(&pat) && !t.starts_with("//") {
+                            found.push(format!("{}:{}: {}", p.display(), i + 1, t));
+                        }
+                    }
+                }
+            }
+        }
+        let pat = ["Labelled", " {"].concat();
+        let core = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut found = Vec::new();
+        walk(&core.join(".."), &mut found);
+        walk(&core.join("../../../packages"), &mut found);
+        let allowed = [
+            [": pub struct ", &pat[..8], " {"].concat(),
+            [": SynValue::Private(Rc::new(", &pat, " value, label }))"].concat(),
+        ];
+        let bad: Vec<_> = found.iter().filter(|f| !allowed.iter().any(|a| f.ends_with(a))).collect();
+        assert!(bad.is_empty(), "valores privados construidos fuera de `labels::labelled`: {:#?}", bad);
+        assert_eq!(found.len(), 2, "{:#?}", found);
     }
 
     #[test]

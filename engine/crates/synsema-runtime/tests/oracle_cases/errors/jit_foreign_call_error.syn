@@ -1,0 +1,11 @@
+-- F4.8d2: un error dentro de una task que llama un bucle en nativo (sin `try`): la VM da el error con
+-- su ubicación y sus pasos, y lo impreso antes queda.
+let visto be 0
+task frag(x)
+    set visto to visto + 1
+    give 100 % (x - 377)
+let r be 0
+each i in range(0, 1000)
+    set r to r + frag(i)
+    when i % 100 == 0
+        print(r, visto)

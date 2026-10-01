@@ -1112,7 +1112,7 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 // args_list (opcional; si está, debe ser lista).
                 let arg_list: Vec<String> = match args.get(1) {
                     None | Some(SynValue::Nothing) => Vec::new(),
-                    Some(SynValue::List(l)) => l.borrow().iter().map(raw_str).collect(),
+                    Some(SynValue::List(l)) => l.borrow().to_vec().iter().map(raw_str).collect(),
                     Some(_) => {
                         return Err(Control::Error(RuntimeError::new("run: args must be a list")))
                     }

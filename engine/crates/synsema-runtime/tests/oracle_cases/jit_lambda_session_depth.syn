@@ -1,0 +1,25 @@
+-- F4.8g: una lambda nativa llamada por elemento desde un builtin (la sesión): la profundidad de cada
+-- llamada es la de la VM (un nivel más, con el mismo tope), también después de una salida a la VM
+-- desde la sesión (un entero que se pasa a `Big`). Se barre el tope de recursión (3000) para ver en
+-- qué valor aparece el error, con `reduce` y con `apply`.
+task prof(n)
+    when n == 0
+        give 0
+    give 1 + prof(n - 1)
+
+let grande be apply([1, 2, 4611686018427387904, 3], (x) => x * 4)
+print(grande, steps())
+
+let res be []
+each k in range(2985, 3005)
+    try
+        set res to append(res, reduce([k], (acc, x) => acc + prof(x), 0))
+    recover e
+        set res to append(res, "error")
+each k in range(2990, 3002)
+    try
+        set res to append(res, apply([k], (x) => prof(x))[0])
+    recover e
+        set res to append(res, "error")
+print(res)
+print(steps())

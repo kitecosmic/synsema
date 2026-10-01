@@ -1,0 +1,4 @@
+-- F4.6a: la hoja no es un mapa
+let m be {"a": 5}
+print(steps())
+set m.a.x to 1

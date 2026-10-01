@@ -1,0 +1,10 @@
+-- El módulo de `text_append.syn`: una global de texto exportada y otra no, que escriben sus tasks.
+export let LOG be ""
+let quiet be ""
+export task log(x, n)
+    each i in range(0, n)
+        set LOG to LOG + x + text(i) + ";"
+        set quiet to quiet + x + "."
+    give length(quiet)
+export task read_log()
+    give LOG

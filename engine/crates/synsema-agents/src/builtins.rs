@@ -1,6 +1,7 @@
 //! Builtins de progress, memory y reglas. Port de `synsema/agents/builtins.py`.
 //! Comparten un `ProgressManager` y un `AgentMemory` (Rc<RefCell>) con el motor.
 
+use synsema_core::synlist::{list_values};
 use synsema_core::types::SynMap;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -36,7 +37,7 @@ fn nth(args: &[SynValue], i: usize) -> Result<&SynValue, Control> {
 /// 2º arg lista → Vec<String> (cada elemento por su Display).
 fn str_list(v: Option<&SynValue>) -> Vec<String> {
     match v {
-        Some(SynValue::List(l)) => l.borrow().iter().map(|x| x.to_string()).collect(),
+        Some(SynValue::List(l)) => list_values(&l).iter().map(|x| x.to_string()).collect(),
         _ => Vec::new(),
     }
 }

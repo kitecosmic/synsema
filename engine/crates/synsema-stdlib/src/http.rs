@@ -8,6 +8,7 @@
 //! es deny-by-default — gateado por `net(host)` (egress real, como file/db). El host es
 //! el hostname del URL (minúsculas, sin puerto), no el URL completo.
 
+use synsema_core::synlist::{list_values};
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -735,7 +736,7 @@ pub fn register_http_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilityS
                             }
                             match v {
                                 SynValue::List(l) => {
-                                    for h in l.borrow().iter() {
+                                    for h in list_values(&l).iter() {
                                         let h = raw_str(h).trim().to_string();
                                         if h.is_empty() {
                                             return Err(Control::Error(RuntimeError::new(

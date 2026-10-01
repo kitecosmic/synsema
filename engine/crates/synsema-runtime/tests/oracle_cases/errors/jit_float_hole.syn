@@ -1,0 +1,12 @@
+-- F4.7a: un `let` dentro de un `when` que se lee después, y en una vuelta el `when` no corre: el
+-- lugar está vacío, el nativo sale (la guarda de hueco) y la VM lo busca por nombre y da su error.
+task f(n)
+    let s be 0.0
+    each i in range(0, n)
+        when i != 40
+            let t be i * 0.5
+        set s to s + t
+    give s
+each n in [10, 20, 30, 60]
+    print(steps())
+    print(f(n))

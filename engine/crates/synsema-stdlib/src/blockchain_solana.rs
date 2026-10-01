@@ -169,7 +169,7 @@ fn solana_tx(args: &[SynValue]) -> Result<SynValue, Control> {
         None => return Err(err(format!("{}: missing \"recent_blockhash\"", F))),
     };
     let instr_list = match params.get("instructions") {
-        Some(SynValue::List(l)) => l.borrow().clone(),
+        Some(SynValue::List(l)) => l.borrow().to_vec(),
         Some(other) => {
             return Err(err(format!(
                 "{}: instructions must be a list, got {}",
@@ -204,7 +204,7 @@ fn solana_tx(args: &[SynValue]) -> Result<SynValue, Control> {
         let mut accounts = Vec::new();
         if let Some(av) = im.get("accounts") {
             let alist = match av {
-                SynValue::List(l) => l.borrow().clone(),
+                SynValue::List(l) => l.borrow().to_vec(),
                 other => {
                     return Err(err(format!(
                         "{}: {}.accounts must be a list, got {}",
@@ -364,7 +364,7 @@ fn solana_tx_raw(args: &[SynValue]) -> Result<SynValue, Control> {
     let sigs: Vec<Vec<u8>> = match arg(args, 1, F)? {
         SynValue::Bytes(b) => vec![b[..].to_vec()],
         SynValue::List(l) => {
-            let items = l.borrow().clone();
+            let items = l.borrow().to_vec();
             let mut out = Vec::with_capacity(items.len());
             for (i, s) in items.iter().enumerate() {
                 out.push(
@@ -428,7 +428,7 @@ fn is_on_curve(bytes: &[u8; 32]) -> bool {
 /// (el bump ocupa el 16º slot que permite el protocolo).
 fn parse_seeds(v: &SynValue, fname: &str) -> Result<Vec<Vec<u8>>, Control> {
     let list = match v {
-        SynValue::List(l) => l.borrow().clone(),
+        SynValue::List(l) => l.borrow().to_vec(),
         other => {
             return Err(err(format!(
                 "{}: seeds must be a list of bytes/text, got {}",

@@ -406,7 +406,7 @@ fn payload_bytes(v: Option<&SynValue>) -> Result<Option<Vec<u8>>, Control> {
         Some(SynValue::Text(s)) => Ok(Some(s.as_bytes().to_vec())),
         Some(SynValue::Bytes(b)) => Ok(Some(b.to_vec())),
         Some(v @ SynValue::Map(_)) | Some(v @ SynValue::List(_)) => {
-            Ok(Some(crate::json::dumps(&crate::json::syn_to_json(v)).into_bytes()))
+            Ok(Some(crate::json::dumps_syn(v).into_bytes()))
         }
         Some(SynValue::Secret(_)) => Err(err("push_send: the payload cannot be a secret (it would leave the process)")),
         Some(other) => Err(err(format!(

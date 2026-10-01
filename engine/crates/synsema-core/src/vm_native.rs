@@ -7,6 +7,11 @@
 //! numérico (`Int`/`Bool`): pasos, cancelación, aritmética y comparaciones enteras, saltos, locales,
 //! `give` y llamadas posicionales a tasks de la misma unidad (la recursión incluida). Cualquier otra
 //! instrucción deja la unidad en la VM.
+//! F4.7a suma los floats (`FloatArith`, `NumCmp` exacto, `Unary`, `ToBool`, tasks con parámetros
+//! `Float`) y los lugares que según el camino tienen un tipo u otro (con guardas en el código nativo).
+//! F4.7b suma las lecturas de datos: los valores con caja entran prestados (la dirección de donde
+//! viven en la VM, sin tocar sus cuentas; al salir se clonan los que quedan vivos), `GetIndex`/`GetProp`
+//! con la caché por forma de su sitio, `each` sobre listas y globales con caja en los bucles.
 //!
 //! **Entrada:** una llamada de la VM a una task caliente reescribe su `Call` en `CallNative`; ahí
 //! se verifica que los argumentos sean enteros y que las globales que la unidad lee sigan siendo las
@@ -18,7 +23,7 @@
 //! Rust. Desde ahí todo es la VM.
 
 use super::*;
-use crate::native_tier::{self, NArith, NCmp, NConst, NFrame, NFunc, NIns, NOpnd, NOsr, NOutcome, NSeen, NUnit, NVal, NativeCode, NativeCx, Place};
+use crate::native_tier::{self, HostOut, NArith, NCmp, NConst, NBuiltin, NFArith, NFrame, NFunc, NIns, NOpnd, NOsr, NOutcome, NPeek, NSeen, NSite, NUnary, NUnit, NVal, NativeCode, NativeCx, NativeHost, NativeSession, Place};
 use std::rc::Weak;
 
 /// Cuántas llamadas a otras tasks puede sumar una unidad.
@@ -57,6 +62,11 @@ impl NativeState {
         self.left.set(u32::MAX);
     }
 
+    /// Si la unidad ya está compilada (o no se va a compilar nunca).
+    pub(super) fn ready(&self) -> bool {
+        self.never.get() || self.unit.get().is_some()
+    }
+
     /// La unidad compilada, si se puede usar.
     fn unit(&self) -> Option<&NativeUnit> {
         if self.never.get() {
@@ -78,6 +88,14 @@ pub(crate) struct NativeUnit {
     deopts: Cell<u32>,
     /// El builtin `range`, si el código lo tiene en un registro (para devolvérselo a la VM).
     range_fn: Option<SynValue>,
+    /// F4.7c: los builtins intrínsecos que el código tiene en un registro.
+    builtins: Vec<(NBuiltin, SynValue)>,
+    /// Lo que tienen que tener los argumentos al entrar (F4.7: `Int`, `Float` o `Bool`; F4.8b: o un
+    /// valor con caja, prestado).
+    params: Vec<NSeen>,
+    /// F4.8b: las globales que lee la task de la entrada: su lugar en el `closure_env` y lo que tienen
+    /// que tener al entrar.
+    globals: Vec<(usize, NSeen)>,
 }
 
 /// La global `name`, leída desde el `closure_env` de la función `from` (o, si es `None`, desde el
@@ -86,6 +104,8 @@ struct Dep {
     from: Option<usize>,
     name: Arc<str>,
     to: Option<usize>,
+    /// Con `to: None`: el builtin que tiene que ser (`range`, o un intrínseco de F4.7c).
+    builtin: &'static str,
 }
 
 impl NativeUnit {
@@ -112,7 +132,7 @@ impl NativeUnit {
             };
             match (found, to) {
                 (Some(SynValue::Task(t)), Some(to)) => Rc::ptr_eq(&t, &to),
-                (Some(SynValue::Builtin(b)), None) => b.name == "range",
+                (Some(SynValue::Builtin(b)), None) => b.name == d.builtin,
                 _ => false,
             }
         })
@@ -155,6 +175,9 @@ pub(super) enum OsrStep {
     /// Salió a mitad de una llamada de la unidad: el frame actual espera su resultado (vuelve en
     /// `pc`, lo deja en `dst`) y la VM sigue en los frames de `Resume`.
     Resume { r: Box<Resume>, pc: usize, dst: Reg },
+    /// F4.8d2: una llamada ajena del bucle falló (su `rest` y su `stop_to` ya los aplicó el host): el
+    /// error sigue como el del `LoopBack` (mismo `rest` 0 y mismo `stop_to` que la condición del bucle).
+    Fail(Control),
 }
 
 // =============================================================================================
@@ -168,6 +191,25 @@ struct Build {
     tasks: Vec<Option<Rc<SynTaskValue>>>,
     deps: Vec<Dep>,
     range_fn: Option<SynValue>,
+    builtins: Vec<(NBuiltin, SynValue)>,
+    /// F4.7b: los sitios de `GetIndex`/`GetProp` de la unidad.
+    sites: Vec<NSite>,
+    /// F4.8b: las globales (no tasks) que lee la función 0 de una task: nombre y lugar en su
+    /// `closure_env`.
+    tglobals: Vec<(Arc<str>, usize)>,
+}
+
+impl Build {
+    fn site(&mut self, key: Option<Arc<str>>, prop: bool) -> u32 {
+        self.sites.push(NSite { key, prop, text: None });
+        (self.sites.len() - 1) as u32
+    }
+
+    /// F4.8d2: un sitio que guarda un texto constante.
+    fn text_site(&mut self, t: &str) -> u32 {
+        self.sites.push(NSite { key: None, prop: false, text: Some(Arc::from(t)) });
+        (self.sites.len() - 1) as u32
+    }
 }
 
 impl Build {
@@ -201,28 +243,45 @@ impl Build {
             }
             let nparams = u16::try_from(x.parameters.len()).ok()?;
             let niters = chunk_iters(&chunk);
-            self.funcs.push(NFunc { code, nregs: chunk.nregs, nlocals: chunk.nlocals, nparams, nglobals: 0, niters, osr: None });
+            // F4.8b: las globales que lee la task de la entrada (sólo la 0: `view_ins`).
+            let (nglobals, globals) = if i == 0 && from == 0 {
+                let e = x.closure_env.borrow();
+                let g: Vec<NSeen> = self.tglobals.iter().map(|(_, k)| seen(e.bindings.slot(*k))).collect();
+                (u16::try_from(g.len()).ok()?, g)
+            } else {
+                (0, Vec::new())
+            };
+            self.funcs.push(NFunc { code, nregs: chunk.nregs, nlocals: chunk.nlocals, nparams, nglobals, niters, osr: None, params: Vec::new(), globals });
             i += 1;
         }
         Some(())
     }
 
-    fn unit(self, code: Box<dyn NativeCode>, nregs0: u16) -> NativeUnit {
+    fn unit(self, code: Box<dyn NativeCode>, nregs0: u16, params: Vec<NSeen>) -> NativeUnit {
+        let globals = match self.funcs.first() {
+            Some(f) if f.osr.is_none() => self.tglobals.iter().map(|(_, k)| *k).zip(f.globals.iter().copied()).collect(),
+            _ => Vec::new(),
+        };
         NativeUnit {
+            globals,
+            params,
             code,
             tasks: self.tasks.iter().map(|t| t.as_ref().map(Rc::downgrade)).collect(),
             nregs0,
             deps: self.deps,
             deopts: Cell::new(0),
             range_fn: self.range_fn,
+            builtins: self.builtins,
         }
     }
 }
 
-/// La task y las que llama (por `LoadGlobal`), si todo su código es lo que F4.1 compila.
-fn build_unit(t: &Rc<SynTaskValue>) -> Option<Build> {
+/// La task y las que llama (por `LoadGlobal`), si todo su código es lo que el nivel nativo
+/// compila. `params`: lo que tienen los argumentos de esta llamada (la entrada lo va a exigir).
+fn build_unit(t: &Rc<SynTaskValue>, params: Vec<NSeen>) -> Option<Build> {
     let mut b = Build { tasks: vec![Some(t.clone())], ..Default::default() };
     b.close(0)?;
+    b.funcs[0].params = params;
     Some(b)
 }
 
@@ -231,6 +290,17 @@ fn nconst(v: &SynValue) -> Option<NConst> {
         SynValue::Number(Number::Int(x)) => NConst::Int(*x),
         SynValue::Bool(b) => NConst::Bool(*b),
         SynValue::Nothing => NConst::Nothing,
+        SynValue::Number(Number::Float(x)) => NConst::Float(x.to_bits()),
+        _ => return None,
+    })
+}
+
+fn nfarith(op: BinOp) -> Option<NFArith> {
+    Some(match op {
+        BinOp::Add => NFArith::Add,
+        BinOp::Sub => NFArith::Sub,
+        BinOp::Mul => NFArith::Mul,
+        BinOp::Div => NFArith::Div,
         _ => return None,
     })
 }
@@ -275,6 +345,13 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
         Ins::Steps(w) => NIns::Steps(w),
         Ins::StepsCancel(w) => NIns::StepsCancel(w),
         Ins::CheckCancel => NIns::CheckCancel,
+        // F4.8d: un `TryInPlace` de camino que la VM dejó de probar (ver `vm_try_in_place`).
+        Ins::Nop => NIns::Nop,
+        // F4.8d2: un texto constante (un literal): prestado de un sitio de la unidad.
+        Ins::Const { dst, k } | Ins::Move { dst, src: Opnd::Const(k) } if matches!(c.consts[k as usize], SynValue::Text(_)) => {
+            let SynValue::Text(t) = &c.consts[k as usize] else { unreachable!("texto") };
+            NIns::LoadConst { dst, site: b.text_site(t) }
+        }
         Ins::Const { dst, k } => NIns::Const { dst, v: nconst(&c.consts[k as usize])? },
         Ins::Move { dst, src } => NIns::Move { dst, src: nopnd(c, src)? },
         Ins::Drop { r } => NIns::Drop { r },
@@ -282,6 +359,17 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
         Ins::Binary { dst, a, b: y, .. } => NIns::Trap { dst, a: nopnd(c, a)?, b: nopnd(c, y)? },
         Ins::IntArith { dst, op, a, b: y, .. } => NIns::IntArith { dst, op: narith(op)?, a: nopnd(c, a)?, b: nopnd(c, y)? },
         Ins::IntCmp { dst, op, a, b: y, .. } => NIns::IntCmp { dst, op: ncmp(op)?, a: nopnd(c, a)?, b: nopnd(c, y)? },
+        Ins::FloatArith { dst, op, a, b: y, .. } => NIns::FloatArith { dst, op: nfarith(op)?, a: nopnd(c, a)?, b: nopnd(c, y)? },
+        Ins::NumCmp { dst, op, a, b: y, .. } => NIns::NumCmp { dst, op: ncmp(op)?, a: nopnd(c, a)?, b: nopnd(c, y)? },
+        Ins::Unary { dst, op, a } => NIns::Unary {
+            dst,
+            op: match op {
+                UnOp::Neg => NUnary::Neg,
+                UnOp::Not => NUnary::Not,
+            },
+            a: nopnd(c, a)?,
+        },
+        Ins::ToBool { dst, src } => NIns::ToBool { dst, src: nopnd(c, src)? },
         Ins::IntCmpJump { op, a, b: y, .. } => {
             let Some(Ins::JumpIfFalsy { to, .. }) = c.code.get(pc + 1).map(Cell::get) else { return None };
             NIns::IntCmpJump { op: ncmp(op)?, a: nopnd(c, a)?, b: nopnd(c, y)?, to }
@@ -294,9 +382,22 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
         Ins::EachRange { first, n, it } => NIns::EachRange { first, n, it },
         Ins::EachNextV { it, slot, exit } => NIns::EachNext { it, slot, exit },
         Ins::EachEndV { it, first, n } => NIns::EachEnd { it, first, n },
-        // El camino general de un `each` (la colección no era el builtin `range`): con `range` no se
-        // llega; si se llega, sigue la VM.
-        Ins::EachInitV { .. } => NIns::Leave { planned: false },
+        // El camino general de un `each` (la colección no era el builtin `range`): una lista la
+        // recorre el nivel nativo (F4.7b); otra colección sale.
+        Ins::EachInitV { src, it, .. } => NIns::EachList { src: nopnd(c, src)?, it },
+        // F4.7b: lecturas, con un sitio propio (su caché por forma).
+        Ins::GetProp { dst, obj, name, .. } => NIns::GetProp { dst, obj: nopnd(c, obj)?, site: b.site(Some(c.names[name as usize].clone()), true) },
+        Ins::GetIndex { dst, obj, idx, .. } => {
+            let obj = nopnd(c, obj)?;
+            match idx {
+                // Una clave de texto constante: la del sitio.
+                Opnd::Const(k) => match &c.consts[k as usize] {
+                    SynValue::Text(t) => NIns::GetIndex { dst, obj, idx: None, site: b.site(Some(Arc::from(&**t)), false) },
+                    _ => NIns::GetIndex { dst, obj, idx: Some(nopnd(c, idx)?), site: b.site(None, false) },
+                },
+                _ => NIns::GetIndex { dst, obj, idx: Some(nopnd(c, idx)?), site: b.site(None, false) },
+            }
+        }
         Ins::LoadRLocal { dst, slot, .. } => NIns::LoadLocal { dst, slot },
         Ins::LetRLocal { src, slot, dst } => NIns::LetLocal { src: nopnd(c, src)?, slot, dst },
         Ins::SetRLocal { src, slot, dst, .. } => NIns::SetLocal { src: nopnd(c, src)?, slot, dst },
@@ -311,20 +412,51 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
         Ins::LoadGlobal { dst, name, .. } => {
             let nm = c.names[name as usize].clone();
             match env_get(env, &nm)? {
+                // F4.8d2: en un bucle, una task que no se puede compilar (escribe una global, lee algo que
+                // el código nativo no representa, …) es una llamada ajena: la corre la VM.
+                SynValue::Task(y) if me.is_none() && !task_closes(&y) => NIns::LoadForeign { dst },
                 SynValue::Task(y) => {
                     let to = b.callee(y);
-                    b.deps.push(Dep { from: me, name: nm, to: Some(to) });
+                    b.deps.push(Dep { from: me, name: nm, to: Some(to), builtin: "" });
                     NIns::LoadCallee { dst, func: to as u32 }
                 }
                 v @ SynValue::Builtin(_) if matches!(&v, SynValue::Builtin(x) if x.name == "range") => {
-                    b.deps.push(Dep { from: me, name: nm, to: None });
+                    b.deps.push(Dep { from: me, name: nm, to: None, builtin: "range" });
                     b.range_fn = Some(v);
                     NIns::RangeFn { dst }
+                }
+                // F4.7c: un builtin intrínseco (que la global siga siéndolo se verifica al entrar).
+                // (`append` sólo en un bucle: ver `NIns::AppendPush`.)
+                SynValue::Builtin(x) if NBuiltin::from_name(&x.name).is_some_and(|w| w != NBuiltin::Append || me.is_none()) => {
+                    let which = NBuiltin::from_name(&x.name).expect("intrínseco");
+                    b.deps.push(Dep { from: me, name: nm, to: None, builtin: which.name() });
+                    if !b.builtins.iter().any(|(w, _)| *w == which) {
+                        b.builtins.push((which, SynValue::Builtin(x)));
+                    }
+                    NIns::LoadBuiltin { dst, which }
+                }
+                // F4.8d2: en un bucle, otro builtin lo carga la VM (una llamada ajena).
+                SynValue::Builtin(_) if me.is_none() => NIns::LoadForeign { dst },
+                // F4.8b: otra global (no una task ni un builtin), leída por la task de la entrada: un
+                // parámetro oculto, leído al entrar (sólo de su propio `closure_env`).
+                SynValue::Builtin(_) => return None,
+                _ if me == Some(0) => {
+                    let k = env.borrow().bindings.find(&nm)?;
+                    let g = match b.tglobals.iter().position(|(n, _)| **n == *nm) {
+                        Some(g) => g,
+                        None => {
+                            b.tglobals.push((nm, k));
+                            b.tglobals.len() - 1
+                        }
+                    };
+                    NIns::Move { dst, src: NOpnd::Global(g as u16) }
                 }
                 _ => return None,
             }
         }
-        Ins::Call { dst, func, args, n, site } | Ins::CallNative { dst, func, args, n, site } => {
+        // F4.7c: también una llamada que la VM ya especializó para un builtin (el nivel nativo la
+        // hace si el builtin es un intrínseco; si no, sale).
+        Ins::Call { dst, func, args, n, site } | Ins::CallNative { dst, func, args, n, site } | Ins::CallBuiltin { dst, func, args, n, site } => {
             if c.sites[site as usize].names.is_some() {
                 return None;
             }
@@ -332,6 +464,8 @@ fn view_ins(c: &Chunk, pc: usize, env: &Rc<RefCell<Environment>>, me: Option<usi
         }
         Ins::Give { src } => NIns::Give { src: nopnd(c, src)? },
         Ins::End { src } => NIns::End { src: nopnd(c, src)? },
+        // F4.8d2: en un bucle, el chequeo de un builtin protegido lo corre la VM.
+        Ins::CheckProtected { func, .. } if me.is_none() => NIns::CheckForeign { func },
         _ => return None,
     })
 }
@@ -355,13 +489,140 @@ fn chunk_iters(c: &Chunk) -> u16 {
 }
 
 /// Lo que tiene el lugar `at` de la pila de iteradores, visto por el nivel nativo: las cuatro
-/// partes de un `range` (`valid`, `next`, `hi`, `step`), vacío, o algo que no representa.
-fn iter_parts(v: Option<&EachItems>) -> Result<Option<[i64; 4]>, ()> {
+/// partes de un `range` (`valid`, `next`, `hi`, `step`) o de una lista (F4.7b: dónde está su
+/// `Rc`, la posición, el largo y 0), con lo que es cada parte; vacío (`Hole`), o algo que no
+/// representa (`Opaque`).
+fn iter_parts(v: Option<&EachItems>) -> ([NSeen; 4], [i64; 4]) {
     match v {
-        None => Ok(None),
-        Some(EachItems::Range(r)) => Ok(Some([i64::from(r.next.is_some()), r.next.unwrap_or(0), r.hi, r.step])),
-        Some(_) => Err(()),
+        None => ([NSeen::Hole; 4], [0; 4]),
+        Some(EachItems::Range(r)) => ([NSeen::Int; 4], [i64::from(r.next.is_some()), r.next.unwrap_or(0), r.hi, r.step]),
+        Some(EachItems::List(l, i)) => (
+            [NSeen::ListIter, NSeen::Int, NSeen::Int, NSeen::Int],
+            [std::ptr::from_ref(l) as usize as i64, *i as i64, l.borrow().len() as i64, 0],
+        ),
+        Some(_) => ([NSeen::Opaque; 4], [0; 4]),
     }
+}
+
+/// Los argumentos de una entrada nativa a una task (las palabras de cada uno), si la task tiene
+/// código nativo y todo encaja (los de `CallNative`: aridad, lo que tiene cada argumento, las
+/// globales que el código da por sabidas).
+fn native_args(t: &SynTaskValue, args: &[SynValue]) -> Option<NativeArgs> {
+    let u = t.code.native.unit()?;
+    // (Una task con código nativo tiene a lo sumo 8 parámetros y 8 globales: `lower::plan`.)
+    if args.len() != u.params.len() || args.len() != t.parameters.len() || args.len() > 8 || u.globals.len() > 8 || (!u.deps.is_empty() && !u.deps_hold(None)) {
+        return None;
+    }
+    let mut out = NativeArgs { w: [0; 16], n: args.len() + u.globals.len() };
+    for (k, (v, p)) in args.iter().zip(&u.params).enumerate() {
+        out.w[k] = arg_word(v, *p)?;
+    }
+    if !u.globals.is_empty() {
+        let e = t.closure_env.borrow();
+        for (g, (k, p)) in u.globals.iter().enumerate() {
+            out.w[args.len() + g] = arg_word(e.bindings.slot(*k)?, *p)?;
+        }
+    }
+    Some(out)
+}
+
+/// Un argumento (o una global leída al entrar) como la palabra de una entrada nativa, si tiene lo que
+/// pide `p`. F4.8b: un valor con caja entra prestado: dónde vive (el registro de la VM, el lugar del
+/// argumento en el builtin, el slot de la global), que no se toca hasta que vuelve el código nativo.
+fn arg_word(v: &SynValue, p: NSeen) -> Option<i64> {
+    Some(match (v, p) {
+        (SynValue::Number(Number::Int(x)), NSeen::Int) => *x,
+        (SynValue::Number(Number::Float(x)), NSeen::Float) => x.to_bits() as i64,
+        (SynValue::Bool(b), NSeen::Bool) => i64::from(*b),
+        (SynValue::Nothing, NSeen::Nothing) => 0,
+        (v, NSeen::List | NSeen::Map | NSeen::Boxed) if seen_of(v) == p => std::ptr::from_ref(v) as usize as i64,
+        _ => return None,
+    })
+}
+
+/// F4.8g: una sesión de llamadas a una task con código nativo desde un builtin (ver `LambdaCall`).
+pub(crate) struct LambdaFast<'a> {
+    t: &'a Rc<SynTaskValue>,
+    unit: &'a NativeUnit,
+    sess: Box<dyn NativeSession + 'a>,
+    /// Los parámetros (los escribe cada llamada) y después las globales (leídas al empezar).
+    words: [i64; 16],
+    n: usize,
+}
+
+impl LambdaFast<'_> {
+    /// `f(pre, l[i])` (o `f(l[i])`) por la sesión, como la haría `call_fast` (`vm_call_rust` con la
+    /// entrada nativa): la profundidad +1 con el mismo tope, los pasos del código. `None` si no encaja
+    /// (otros tipos, otra aridad, el tope): la llamada va por `call_fast`; si la función puede leer
+    /// algo que una llamada de la VM cambia (globales, tasks que llama), la sesión se termina.
+    pub(crate) fn call(fast: &mut Option<Self>, it: &mut Interpreter, pre: Option<&SynValue>, l: &ListRef, i: usize) -> Option<Result<SynValue, Control>> {
+        let f = fast.as_mut()?;
+        let pre_n = usize::from(pre.is_some());
+        let depth = it.recursion_depth + 1;
+        let items = l.borrow();
+        let fits = f.unit.params.len() == pre_n + 1 && depth <= MAX_RECURSION && {
+            let mut ok = true;
+            if let Some(p) = pre {
+                match arg_word(p, f.unit.params[0]) {
+                    Some(w) => f.words[0] = w,
+                    None => ok = false,
+                }
+            }
+            // Un valor con caja entra prestado desde donde vive en la lista (una lista sin caja tiene
+            // números: su palabra, sin dirección).
+            let p = f.unit.params[pre_n];
+            let w = match items.as_values() {
+                Some(v) => v.get(i).and_then(|x| arg_word(x, p)),
+                None => items.get(i).and_then(|x| arg_word(&x, p).filter(|_| !matches!(p, NSeen::List | NSeen::Map | NSeen::Boxed))),
+            };
+            ok && match w {
+                Some(w) => {
+                    f.words[pre_n] = w;
+                    true
+                }
+                None => false,
+            }
+        };
+        if !fits {
+            if !f.unit.globals.is_empty() || !f.unit.deps.is_empty() {
+                *fast = None;
+            }
+            return None;
+        }
+        native_tier::count_entry();
+        let mut d = depth;
+        let out = f.sess.call(&mut it.steps, &mut d, &f.words[..f.n]);
+        // (Lo prestado ya se clonó en `out`: la lista se suelta antes de volver a la VM.)
+        drop(items);
+        Some(match out {
+            NOutcome::Done(v) => Ok(Interpreter::nval_to_syn(f.unit, v)),
+            NOutcome::Deopt(frames) => {
+                let LambdaFast { t, unit, .. } = fast.take().expect("sesión");
+                let first = it.vm_regs.len();
+                it.recursion_depth = d;
+                let r = it.vm_native_deopt(t, unit, frames, first, pre_n + 1);
+                it.recursion_depth -= 1;
+                r
+            }
+        })
+    }
+}
+
+/// Las palabras de los argumentos de una entrada nativa (y de las globales que lee).
+struct NativeArgs {
+    w: [i64; 16],
+    n: usize,
+}
+
+impl std::ops::Deref for NativeArgs {
+    type Target = [i64];
+    fn deref(&self) -> &[i64] {
+        &self.w[..self.n]
+    }
+}
+
+pub(super) fn seen_of(v: &SynValue) -> NSeen {
+    seen(Some(v))
 }
 
 fn seen(v: Option<&SynValue>) -> NSeen {
@@ -370,7 +631,151 @@ fn seen(v: Option<&SynValue>) -> NSeen {
         Some(SynValue::Number(Number::Int(_))) => NSeen::Int,
         Some(SynValue::Bool(_)) => NSeen::Bool,
         Some(SynValue::Nothing) => NSeen::Nothing,
+        Some(SynValue::Number(Number::Float(_))) => NSeen::Float,
+        Some(SynValue::List(_)) => NSeen::List,
+        Some(SynValue::Map(_)) => NSeen::Map,
         Some(_) => NSeen::Boxed,
+    }
+}
+
+/// F4.8d: la variable raíz de una escritura de un bucle: una global del entorno del bucle (`Ok`, su
+/// nombre: con valor, que no sea una task ni un builtin; el entorno no puede ser un módulo, que
+/// sincroniza sus exportaciones) o un lugar de la ventana (`Err`). `None`: no se baja.
+fn loop_root(c: &Chunk, root: Root, own: &impl Fn(&str) -> Option<Option<SynValue>>, module: bool) -> Option<Result<Arc<str>, u16>> {
+    match root {
+        Root::Win(k) => Some(Err(k)),
+        Root::Free { name, .. } if !module => {
+            let nm = &c.names[name as usize];
+            match own(nm) {
+                Some(Some(SynValue::Task(_) | SynValue::Builtin(_))) | Some(None) | None => None,
+                Some(Some(_)) => Some(Ok(nm.clone())),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// F4.8d: el índice de un paso o de la hoja de un `set` con camino: un texto constante va como la
+/// clave del sitio; otro índice, como operando.
+fn path_index(c: &Chunk, idx: Opnd, b: &mut Build) -> Option<(Option<NOpnd>, u32)> {
+    Some(match idx {
+        Opnd::Const(k) => match &c.consts[k as usize] {
+            SynValue::Text(t) => (None, b.site(Some(Arc::from(&**t)), false)),
+            _ => (Some(nopnd(c, idx)?), b.site(None, false)),
+        },
+        _ => (Some(nopnd(c, idx)?), b.site(None, false)),
+    })
+}
+
+/// F4.8d2: si una task (y las que llama) se puede compilar como parte de una unidad.
+fn task_closes(t: &Rc<SynTaskValue>) -> bool {
+    // Como la verá la unidad del bucle: una función llamada (la 0 es el bucle).
+    let mut b = Build { tasks: vec![None, Some(t.clone())], ..Default::default() };
+    b.close(1).is_some()
+}
+
+/// F4.8d2: si el código de un bucle tiene llamadas ajenas (entonces corre con un host).
+fn code_has_foreign(code: &[NIns]) -> bool {
+    code.iter().any(|i| matches!(i, NIns::LoadForeign { .. } | NIns::CheckForeign { .. }))
+}
+
+/// F4.8d2: el host de un bucle con llamadas ajenas: el intérprete y el frame del bucle.
+struct LoopHost<'a> {
+    interp: &'a mut Interpreter,
+    chunk: &'a Rc<Chunk>,
+    env: &'a Rc<RefCell<Environment>>,
+    base: usize,
+    lbase: usize,
+    iter_base: usize,
+    slots: &'a [usize],
+    /// El error de una llamada ajena (el código nativo sale sin valores).
+    fail: Option<Control>,
+    /// La salida del bucle, si un `stop` la cortó.
+    jump: Option<usize>,
+}
+
+impl NativeHost for LoopHost<'_> {
+    fn exec(&mut self, pc: u32, args: &[Option<SynValue>], globals: &[Option<SynValue>], steps: &mut u64) -> HostOut {
+        let at = pc as usize;
+        {
+            let mut e = self.env.borrow_mut();
+            for (g, v) in globals.iter().enumerate() {
+                if let (Some(v), Some(k)) = (v, self.slots.get(g)) {
+                    e.bindings.slot_set(*k, v.clone());
+                }
+            }
+        }
+        if let Ins::Call { args: a, .. } | Ins::CallNative { args: a, .. } | Ins::CallBuiltin { args: a, .. } = self.chunk.code[at].get() {
+            for (i, v) in args.iter().enumerate() {
+                if let Some(v) = v {
+                    self.interp.vm_regs[self.base + a as usize + i] = v.clone();
+                }
+            }
+        }
+        self.interp.steps = *steps;
+        let saved = std::mem::replace(&mut self.interp.vm_lbase, self.lbase);
+        let r = self.interp.vm_exec_one(self.chunk, self.env, self.base, at);
+        self.interp.vm_lbase = saved;
+        let out = match r {
+            Ok(()) => HostOut::Ok,
+            Err(c) => {
+                // Lo que haría el despacho con el error de esta instrucción: los pasos que su bloque
+                // sumó de más y, un `stop` en el cuerpo de un bucle, la salida de ese bucle.
+                self.interp.steps = self.interp.steps.wrapping_sub(self.chunk.rest[at] as u64);
+                if matches!(c, Control::Stop(_)) && self.chunk.stop_to[at] != NONE {
+                    self.jump = Some(self.chunk.stop_to[at] as usize);
+                    HostOut::Stop
+                } else {
+                    self.fail = Some(c);
+                    HostOut::Fail
+                }
+            }
+        };
+        *steps = self.interp.steps;
+        out
+    }
+
+    fn peek_place(&mut self, p: Place) -> NPeek {
+        match p {
+            Place::Reg(r) => native_tier::peek_mut(&mut self.interp.vm_regs[self.base + r as usize]),
+            Place::Local(k) => match self.interp.vm_locals[self.lbase + k as usize].as_mut() {
+                Some(v) => native_tier::peek_mut(v),
+                None => NPeek { tag: native_tier::TAG_HOLE, bits: 0, ptr: std::ptr::null() },
+            },
+            Place::Global(g) => {
+                let mut e = self.env.borrow_mut();
+                match self.slots.get(g as usize).and_then(|k| e.bindings.slot_mut(*k)) {
+                    Some(v) => native_tier::peek_mut(v),
+                    None => NPeek { tag: native_tier::TAG_HOLE, bits: 0, ptr: std::ptr::null() },
+                }
+            }
+            Place::Iter(..) => NPeek::MISS,
+        }
+    }
+
+    fn iter_body(&mut self, it: u16) -> *const ListRef {
+        match self.interp.vm_iters.get(self.iter_base + it as usize) {
+            Some(EachItems::List(l, _)) => std::ptr::from_ref(l),
+            _ => std::ptr::null(),
+        }
+    }
+
+    fn home(&mut self, p: Place, v: SynValue) -> *const SynValue {
+        match p {
+            Place::Reg(r) => {
+                let s = &mut self.interp.vm_regs[self.base + r as usize];
+                *s = v;
+                std::ptr::from_mut(s).cast_const()
+            }
+            Place::Local(k) => std::ptr::from_mut(self.interp.vm_locals[self.lbase + k as usize].insert(v)).cast_const(),
+            Place::Global(g) => {
+                let mut e = self.env.borrow_mut();
+                let k = self.slots[g as usize];
+                e.bindings.slot_set(k, v);
+                e.bindings.slot_mut(k).map_or(std::ptr::null(), |s| std::ptr::from_mut(s).cast_const())
+            }
+            Place::Iter(..) => std::ptr::null(),
+        }
     }
 }
 
@@ -381,6 +786,8 @@ pub(crate) struct LoopUnit {
     /// Si el código escribe alguna global (entonces el entorno no puede ser un módulo, que
     /// sincroniza su mapa de exportaciones).
     writes: bool,
+    /// F4.8d2: si tiene llamadas ajenas (corre con un host).
+    foreign: bool,
 }
 
 /// El estado de un bucle en su chunk (F4.2): la cuenta regresiva de vueltas (como `NativeState`)
@@ -449,8 +856,8 @@ fn view_loop(c: &Chunk, env: &Rc<RefCell<Environment>>, head: usize, back: usize
                 let nm = &c.names[name as usize];
                 match own(nm) {
                     Some(Some(SynValue::Task(_) | SynValue::Builtin(_))) | None => view_ins(c, pc, env, None, b),
-                    Some(v) if seen(v.as_ref()) != NSeen::Boxed => Some(NIns::Move { dst, src: NOpnd::Global(global(nm)) }),
-                    Some(_) => None,
+                    // F4.7b: también una global con caja (prestada: el código nativo no la cambia).
+                    Some(_) => Some(NIns::Move { dst, src: NOpnd::Global(global(nm)) }),
                 }
             }
             Ins::SetGlobal { src, name, dst, .. } | Ins::LetName { src, name, dst } if !module => {
@@ -465,6 +872,39 @@ fn view_loop(c: &Chunk, env: &Rc<RefCell<Environment>>, head: usize, back: usize
                             NIns::SetGlobal { src, g, dst }
                         })
                     }
+                    _ => None,
+                }
+            }
+            // F4.8d: `set <camino> to v` y `set P to append(P, e)` sobre una variable del bucle (una
+            // global de su entorno, que no sea de un módulo, o una de la ventana).
+            Ins::PathRoot { c: cr, desc } => match loop_root(c, c.paths[desc as usize].root, &own, module) {
+                Some(Ok(nm)) => {
+                    written.push(nm.clone());
+                    Some(NIns::PathRoot { c: cr, root: NOpnd::Global(global(&nm)) })
+                }
+                Some(Err(k)) => Some(NIns::PathRoot { c: cr, root: NOpnd::Local(k) }),
+                None => None,
+            },
+            Ins::AppendInPlace { dst, func, args, site } => match c.sites[site as usize].append.and_then(|r| loop_root(c, r, &own, module)) {
+                Some(Ok(nm)) => {
+                    written.push(nm.clone());
+                    Some(NIns::AppendPush { dst, func, args, root: NOpnd::Global(global(&nm)) })
+                }
+                Some(Err(k)) => Some(NIns::AppendPush { dst, func, args, root: NOpnd::Local(k) }),
+                None => None,
+            },
+            Ins::PathStep { c: cr, idx, key, .. } => {
+                if key != NONE {
+                    Some(NIns::PathStep { c: cr, idx: None, site: b.site(Some(c.names[key as usize].clone()), true) })
+                } else {
+                    path_index(c, idx, b).map(|(idx, site)| NIns::PathStep { c: cr, idx, site })
+                }
+            }
+            Ins::PathSet { c: cr, idx, desc } => {
+                let d = c.paths[desc as usize];
+                let leaf = if d.key != NONE { Some((None, b.site(Some(c.names[d.key as usize].clone()), true))) } else { path_index(c, idx, b) };
+                match (leaf, nopnd(c, d.src)) {
+                    (Some((idx, site)), Some(src)) => Some(NIns::PathSet { c: cr, idx, site, src, dst: d.dst }),
                     _ => None,
                 }
             }
@@ -497,24 +937,44 @@ impl Interpreter {
     /// al pasar el umbral se compila (una vez) y el sitio de esta llamada pasa a ser `CallNative`.
     /// Esta vez sigue en la VM.
     #[inline(never)]
-    pub(super) fn vm_native_tier_up(&mut self, chunk: &Chunk, at: usize, t: &Rc<SynTaskValue>) {
+    pub(super) fn vm_native_tier_up(&mut self, chunk: &Chunk, at: usize, t: &Rc<SynTaskValue>, first: usize, n: usize) {
+        let params = self.vm_regs[first..first + n].iter().map(seen_of).collect();
+        if !self.vm_native_prepare(t, params) {
+            return;
+        }
+        if let Ins::Call { dst, func, args, n, site } = chunk.code[at].get() {
+            chunk.code[at].set(Ins::CallNative { dst, func, args, n, site });
+        }
+    }
+
+    /// Lo de `vm_native_tier_up` menos reescribir el sitio (F4.8b: también desde `call_fast`, que no
+    /// tiene uno): `true` si la task ya tiene código nativo. `params`: lo que tienen los argumentos de
+    /// esta llamada.
+    #[inline(never)]
+    pub(super) fn vm_native_prepare(&mut self, t: &Rc<SynTaskValue>, params: SmallVec<[NSeen; 8]>) -> bool {
         let st = &t.code.native;
         if st.never.get() {
             st.left.set(u32::MAX);
-            return;
+            return false;
         }
         if st.left.get() == 0 {
             // La primera llamada sólo empieza la cuenta (el cuerpo todavía no corrió en la VM:
             // nada está especializado); se compila en la llamada número `umbral`.
             st.left.set(native_tier::threshold().saturating_sub(1).max(1));
-            return;
+            return false;
         }
         if st.unit.get().is_none() {
+            // Se compila con lo que tienen los argumentos de esta llamada (F4.7: `Int`, `Float` o
+            // `Bool`); con otra cosa, todavía no (se vuelve a mirar dentro de otro umbral).
+            if params.iter().any(|p| !matches!(p, NSeen::Int | NSeen::Float | NSeen::Bool | NSeen::List | NSeen::Map | NSeen::Boxed)) {
+                st.left.set(native_tier::threshold().max(2));
+                return false;
+            }
             let compiled = native_tier::tier().and_then(|tier| {
-                let b = build_unit(t)?;
-                let code = tier.compile(&NUnit { funcs: b.funcs.clone() })?;
+                let b = build_unit(t, params.to_vec())?;
+                let code = tier.compile(&NUnit { funcs: b.funcs.clone(), sites: b.sites.clone() })?;
                 let nregs0 = b.funcs[0].nregs;
-                Some(b.unit(code, nregs0))
+                Some(b.unit(code, nregs0, params.to_vec()))
             });
             match compiled {
                 Some(u) => {
@@ -523,13 +983,11 @@ impl Interpreter {
                 }
                 None => {
                     st.give_up();
-                    return;
+                    return false;
                 }
             }
         }
-        if let Ins::Call { dst, func, args, n, site } = chunk.code[at].get() {
-            chunk.code[at].set(Ins::CallNative { dst, func, args, n, site });
-        }
+        true
     }
 
     fn nval_to_syn(unit: &NativeUnit, v: NVal) -> SynValue {
@@ -537,9 +995,14 @@ impl Interpreter {
             NVal::Int(x) => SynValue::Number(Number::Int(x)),
             NVal::Bool(b) => syn_bool(b),
             NVal::Nothing => SynValue::Nothing,
+            NVal::Float(x) => SynValue::Number(Number::Float(x)),
             NVal::Callee(f) => SynValue::Task(unit.task(f as usize).expect("task de la unidad viva")),
             NVal::RangeFn => unit.range_fn.clone().expect("el builtin range de la unidad"),
+            NVal::Builtin(w) => unit.builtins.iter().find(|(x, _)| *x == w).map(|(_, v)| v.clone()).expect("un builtin de la unidad"),
             NVal::Hole => SynValue::Nothing,
+            NVal::Value(v) => v,
+            NVal::List(l) => SynValue::List(l),
+            NVal::Keep => unreachable!("un valor en su lugar no se escribe (`vm_put_values`)"),
         }
     }
 
@@ -560,18 +1023,14 @@ impl Interpreter {
     ) -> Result<NativeStep, Control> {
         let first = base + args as usize;
         let nn = n as usize;
-        let fits = match &self.vm_regs[base + func as usize] {
-            SynValue::Task(t) => t.code.native.unit().is_some_and(|u| {
-                nn == t.parameters.len()
-                    && self.vm_regs[first..first + nn].iter().all(|v| matches!(v, SynValue::Number(Number::Int(_))))
-                    && u.deps_hold(None)
-            }),
-            _ => false,
+        let argv = match &self.vm_regs[base + func as usize] {
+            SynValue::Task(t) => native_args(t, &self.vm_regs[first..first + nn]),
+            _ => None,
         };
-        if !fits {
+        let Some(argv) = argv else {
             chunk.code[at].set(Ins::Call { dst, func, args, n, site });
             return Ok(NativeStep::Retry);
-        }
+        };
         // Lo mismo que `vm_call` hasta entrar: la función sale de su registro, la aridad ya encaja
         // (tantos argumentos como parámetros) y la profundidad con el mismo tope y el mismo error.
         let f = std::mem::replace(&mut self.vm_regs[base + func as usize], SynValue::Nothing);
@@ -582,16 +1041,9 @@ impl Interpreter {
             self.recursion_depth -= 1;
             return Err(err("maximum recursion depth exceeded"));
         }
-        let argv: SmallVec<[i64; 8]> = self.vm_regs[first..first + nn]
-            .iter()
-            .map(|v| match v {
-                SynValue::Number(Number::Int(x)) => *x,
-                _ => unreachable!("argumento no entero"),
-            })
-            .collect();
         native_tier::count_entry();
         let out = {
-            let mut cx = NativeCx { steps: &mut self.steps, depth: &mut self.recursion_depth, max_depth: MAX_RECURSION, cancel: &self.cancel.flag };
+            let mut cx = NativeCx { steps: &mut self.steps, depth: &mut self.recursion_depth, max_depth: MAX_RECURSION, cancel: &self.cancel.flag, host: None };
             unit.code.call(&mut cx, &argv)
         };
         match out {
@@ -617,6 +1069,80 @@ impl Interpreter {
         }
     }
 
+    /// F4.8b: `call_fast` a una task con código nativo: con los argumentos ya en `r0..` desde `first`
+    /// (la profundidad ya contada, la ventana de locales vacía desde `lbase`), entra al código nativo;
+    /// si sale a la VM, sus frames siguen en la VM hasta que la task da su valor. `None` si no se
+    /// puede entrar (todavía no se tocó nada). El que llama suelta la ventana y la profundidad.
+    pub(super) fn vm_native_from_rust(&mut self, t: &Rc<SynTaskValue>, args: &mut [SynValue]) -> Option<Result<SynValue, Control>> {
+        let argv = native_args(t, args)?;
+        let unit = t.code.native.unit().expect("unidad nativa");
+        // Los argumentos ya están en `argv` (los con caja, prestados: siguen en `args` hasta que vuelve
+        // el código nativo); si sale a la VM, los frames se arman desde el tope de la pila de
+        // registros (la ventana de la task, sus parámetros incluidos).
+        let (first, n) = (self.vm_regs.len(), args.len());
+        native_tier::count_entry();
+        let out = {
+            let mut cx = NativeCx { steps: &mut self.steps, depth: &mut self.recursion_depth, max_depth: MAX_RECURSION, cancel: &self.cancel.flag, host: None };
+            unit.code.call(&mut cx, &argv)
+        };
+        for a in args.iter_mut() {
+            *a = SynValue::Nothing;
+        }
+        Some(match out {
+            NOutcome::Done(v) => Ok(Self::nval_to_syn(unit, v)),
+            NOutcome::Deopt(frames) => self.vm_native_deopt(t, unit, frames, first, n),
+        })
+    }
+
+    /// La salida a la VM de una entrada desde Rust (`vm_native_from_rust`, `LambdaFast`): sigue en la
+    /// VM desde los frames que dejó el código nativo, armados desde el tope de la pila de registros.
+    #[inline(never)]
+    fn vm_native_deopt(&mut self, t: &Rc<SynTaskValue>, unit: &NativeUnit, frames: Vec<NFrame>, first: usize, n: usize) -> Result<SynValue, Control> {
+        native_tier::count_deopt();
+        let d = unit.deopts.get() + 1;
+        unit.deopts.set(d);
+        let outer_iters = self.vm_iters.len();
+        let lb0 = self.vm_locals.len();
+        let r = self.vm_native_resume(unit, frames, first, n);
+        if d > MAX_NATIVE_DEOPTS {
+            t.code.native.give_up();
+        }
+        let Resume { frames, enter, pc, iter_base, .. } = *r;
+        let saved = std::mem::replace(&mut self.vm_lbase, enter.lbase);
+        let out = self.run_chunk_from(&enter.code, &enter.env, enter.base, pc, Some((frames, iter_base, outer_iters)));
+        self.vm_lbase = saved;
+        self.vm_regs.truncate(first);
+        self.vm_locals.truncate(lb0);
+        match out {
+            Ok(v) | Err(Control::Give(v)) => Ok(v),
+            Err(c) => Err(c),
+        }
+    }
+
+    /// F4.8g: la sesión de `t` para un builtin que la llama por elemento, si tiene código nativo y
+    /// puede: lo que `call_fast` verificaría en cada llamada (cuerpo con frame en registros, la
+    /// unidad, sus dependencias, las globales que lee) se verifica acá una vez; las globales se leen
+    /// ahora (el código nativo no escribe nada: no cambian mientras la sesión sólo corre en nativo).
+    pub(super) fn vm_lambda_session<'a>(&mut self, t: &'a Rc<SynTaskValue>, flag: &'a AtomicBool) -> Option<LambdaFast<'a>> {
+        if !self.vm_code_for(t)?.regframe {
+            return None;
+        }
+        let unit = t.code.native.unit()?;
+        let np = unit.params.len();
+        if np != t.parameters.len() || np > 8 || unit.globals.len() > 8 || (!unit.deps.is_empty() && !unit.deps_hold(None)) {
+            return None;
+        }
+        let mut words = [0i64; 16];
+        if !unit.globals.is_empty() {
+            let e = t.closure_env.borrow();
+            for (g, (k, p)) in unit.globals.iter().enumerate() {
+                words[np + g] = arg_word(e.bindings.slot(*k)?, *p)?;
+            }
+        }
+        let sess = unit.code.session(MAX_RECURSION, flag)?;
+        Some(LambdaFast { t, unit, sess, words, n: np + unit.globals.len() })
+    }
+
     /// Los frames nativos como frames de la VM: para cada uno, lo que `vm_enter_regframe` habría
     /// hecho al entrar (ventana de registros desde los argumentos, ventana de locales) y sus valores
     /// vivos; los de afuera quedan esperando a su llamado (`VmFrame`, como en `Call`).
@@ -637,7 +1163,7 @@ impl Interpreter {
             }
             let need = first + (code.nregs as usize).max(n);
             if top < need {
-                self.vm_regs.resize(need, SynValue::Nothing);
+                grow_regs(&mut self.vm_regs, need);
             }
             let lbase = self.vm_locals.len();
             self.vm_locals.resize(lbase + code.nlocals as usize, None);
@@ -721,10 +1247,37 @@ impl Interpreter {
         st.left.set(1);
         native_tier::count_osr();
         let s0 = self.steps;
-        let out = {
-            let mut cx = NativeCx { steps: &mut self.steps, depth: &mut self.recursion_depth, max_depth: MAX_RECURSION, cancel: &self.cancel.flag };
-            lu.unit.code.call(&mut cx, &args)
+        let (out, fail, jump) = if lu.foreign {
+            // F4.8d2: con llamadas ajenas el código nativo corre con un host (el intérprete entero:
+            // los contadores y el flag van aparte, copiados).
+            native_tier::count_foreign();
+            let flag = self.cancel.flag.clone();
+            let (mut steps, mut depth) = (self.steps, self.recursion_depth);
+            let lbase = self.vm_lbase;
+            let (out, fail, jump) = {
+                let mut host = LoopHost { interp: self, chunk, env, base, lbase, iter_base, slots: &slots, fail: None, jump: None };
+                let out = {
+                    let mut cx = NativeCx { steps: &mut steps, depth: &mut depth, max_depth: MAX_RECURSION, cancel: &flag, host: Some(&mut host) };
+                    lu.unit.code.call(&mut cx, &args)
+                };
+                (out, host.fail.take(), host.jump.take())
+            };
+            self.steps = steps;
+            self.recursion_depth = depth;
+            (out, fail, jump)
+        } else {
+            let out = {
+                let mut cx = NativeCx { steps: &mut self.steps, depth: &mut self.recursion_depth, max_depth: MAX_RECURSION, cancel: &self.cancel.flag, host: None };
+                lu.unit.code.call(&mut cx, &args)
+            };
+            (out, None, None)
         };
+        // Una llamada ajena falló: nada vuelve (las globales ya están en el entorno; el frame se
+        // desarma con el error: un `try` es un `Ins::Exec`, así que ningún `recover` del mismo frame
+        // ve los locales que el código nativo tenía en registros).
+        if let Some(c) = fail {
+            return OsrStep::Fail(c);
+        }
         let NOutcome::Deopt(mut frames) = out else { unreachable!("un bucle nativo sólo sale a la VM") };
         let planned = frames.last().is_some_and(|f| f.planned);
         if !planned {
@@ -747,7 +1300,8 @@ impl Interpreter {
                 let r = self.vm_native_resume(&lu.unit, rest, base + c.args as usize, c.n as usize);
                 OsrStep::Resume { r, pc: f0.pc as usize, dst: c.dst }
             }
-            None => OsrStep::Exit(f0.pc as usize),
+            // F4.8d2: un `stop` de una llamada ajena: la VM sigue en la salida del bucle.
+            None => OsrStep::Exit(jump.unwrap_or(f0.pc as usize)),
         }
     }
 
@@ -778,12 +1332,7 @@ impl Interpreter {
         }
         let niters = chunk_iters(chunk);
         for it in 0..niters as usize {
-            let s = match iter_parts(self.vm_iters.get(iter_base + it)) {
-                Ok(Some(_)) => NSeen::Int,
-                Ok(None) => NSeen::Hole,
-                Err(()) => NSeen::Boxed,
-            };
-            init.extend([s; 4]);
+            init.extend(iter_parts(self.vm_iters.get(iter_base + it)).0);
         }
         b.funcs.push(NFunc {
             code,
@@ -793,22 +1342,26 @@ impl Interpreter {
             nglobals,
             niters,
             osr: Some(NOsr { head: head as u32, init }),
+            params: Vec::new(),
+            globals: Vec::new(),
         });
         b.close(1)?;
         // El código de las tasks que llama no puede ser este chunk (el bucle vive en él: un ciclo).
         if b.tasks.iter().flatten().any(|t| t.code.get().is_some_and(|c| Rc::ptr_eq(c, chunk))) {
             return None;
         }
-        let code = tier.compile(&NUnit { funcs: std::mem::take(&mut b.funcs) })?;
-        Some(LoopUnit { unit: b.unit(code, chunk.nregs), globals, writes })
+        let loop_code = b.funcs[0].code.clone();
+        let code = tier.compile(&NUnit { funcs: std::mem::take(&mut b.funcs), sites: std::mem::take(&mut b.sites) })?;
+        let foreign = code_has_foreign(&loop_code);
+        Some(LoopUnit { unit: b.unit(code, chunk.nregs, Vec::new()), globals, writes, foreign })
     }
 
     /// La guarda de entrada a un bucle nativo: cada lugar que el código lee o escribe tiene lo que
     /// tenía al compilar (nunca un valor con caja: sus cuentas de referencias no se tocan), las
     /// globales están en el entorno y las tasks siguen siendo esas. Los valores de entrada y el
     /// slot de cada global.
-    fn vm_osr_args(&self, lu: &LoopUnit, env: &Rc<RefCell<Environment>>, base: usize, iter_base: usize) -> Option<(SmallVec<[i64; 16]>, SmallVec<[usize; 8]>)> {
-        let e = env.borrow();
+    fn vm_osr_args(&mut self, lu: &LoopUnit, env: &Rc<RefCell<Environment>>, base: usize, iter_base: usize) -> Option<(SmallVec<[i64; 16]>, SmallVec<[usize; 8]>)> {
+        let mut e = env.borrow_mut();
         if lu.writes && e.name.starts_with("module:") {
             return None;
         }
@@ -819,31 +1372,42 @@ impl Interpreter {
         let mut args: SmallVec<[i64; 16]> = SmallVec::new();
         for &(place, want) in lu.unit.code.inputs() {
             if let Place::Iter(it, k) = place {
-                let (s, x) = match iter_parts(self.vm_iters.get(iter_base + it as usize)) {
-                    Ok(Some(p)) => (NSeen::Int, p[k as usize]),
-                    Ok(None) => (NSeen::Hole, 0),
-                    Err(()) => (NSeen::Boxed, 0),
-                };
-                if s != want {
+                let (s, x) = iter_parts(self.vm_iters.get(iter_base + it as usize));
+                if s[k as usize] != want {
                     return None;
                 }
-                args.push(x);
+                args.push(x[k as usize]);
                 continue;
             }
+            // (Por `&mut`: en un bucle con escrituras (F4.8d) el código escribe por esta dirección.)
             let v = match place {
-                Place::Reg(r) => Some(&self.vm_regs[base + r as usize]),
-                Place::Local(k) => self.vm_locals[self.vm_lbase + k as usize].as_ref(),
-                Place::Global(g) => e.bindings.slot(slots[g as usize]),
+                Place::Reg(r) => Some(&mut self.vm_regs[base + r as usize]),
+                Place::Local(k) => self.vm_locals[self.vm_lbase + k as usize].as_mut(),
+                Place::Global(g) => e.bindings.slot_mut(slots[g as usize]),
                 Place::Iter(..) => unreachable!("iterador"),
             };
-            if seen(v) != want {
+            if seen(v.as_deref()) != want {
                 return None;
             }
             args.push(match v {
                 Some(SynValue::Number(Number::Int(x))) => *x,
                 Some(SynValue::Bool(b)) => i64::from(*b),
-                _ => 0,
+                Some(SynValue::Number(Number::Float(x))) => x.to_bits() as i64,
+                Some(SynValue::Nothing) | None => 0,
+                // F4.7b: un valor con caja entra prestado: dónde vive (su lugar en la VM). Ahí sigue
+                // hasta que vuelve el código nativo: nada mueve la memoria de la VM mientras tanto.
+                Some(v) => std::ptr::from_mut(v) as usize as i64,
             });
+        }
+        // F4.8d: los lugares donde el código puede dejar un valor con caja (antes de una escritura).
+        for &place in lu.unit.code.homes() {
+            let p = match place {
+                Place::Reg(r) => std::ptr::from_mut(&mut self.vm_regs[base + r as usize]) as usize as i64,
+                Place::Local(k) => std::ptr::from_mut(&mut self.vm_locals[self.vm_lbase + k as usize]) as usize as i64,
+                Place::Global(g) => std::ptr::from_mut(e.bindings.slot_mut(slots[g as usize])?) as usize as i64,
+                Place::Iter(..) => return None,
+            };
+            args.push(p);
         }
         drop(e);
         if !lu.unit.deps_hold(Some(env)) {
@@ -864,14 +1428,18 @@ impl Interpreter {
         ib: usize,
         globals: Option<(&Rc<RefCell<Environment>>, &[usize])>,
     ) {
-        let mut iters: SmallVec<[(u16, [i64; 4], bool); 4]> = SmallVec::new();
+        let mut iters: SmallVec<[(u16, [i64; 4], bool, Option<ListRef>); 4]> = SmallVec::new();
         for (place, v) in values {
+            // F4.8d: lo que el código nativo dejó en su lugar ya está ahí.
+            if matches!(v, NVal::Keep) {
+                continue;
+            }
             match place {
                 Place::Reg(r) => self.vm_regs[rbase + r as usize] = Self::nval_to_syn(unit, v),
-                Place::Local(k) => self.vm_locals[lbase + k as usize] = (v != NVal::Hole).then(|| Self::nval_to_syn(unit, v)),
+                Place::Local(k) => self.vm_locals[lbase + k as usize] = (!matches!(v, NVal::Hole)).then(|| Self::nval_to_syn(unit, v)),
                 Place::Global(g) => {
                     // Una global vacía el código nativo no la escribió (un `set` a un hueco sale antes).
-                    if v != NVal::Hole {
+                    if !matches!(v, NVal::Hole) {
                         let (env, slots) = globals.expect("global fuera de un bucle");
                         env.borrow_mut().bindings.slot_set(slots[g as usize], Self::nval_to_syn(unit, v));
                     }
@@ -880,25 +1448,30 @@ impl Interpreter {
                     let i = match iters.iter().position(|x| x.0 == it) {
                         Some(i) => i,
                         None => {
-                            iters.push((it, [0; 4], false));
+                            iters.push((it, [0; 4], false, None));
                             iters.len() - 1
                         }
                     };
                     match v {
                         NVal::Int(x) => iters[i].1[k as usize] = x,
+                        // F4.7b: un iterador de una lista (su lista, ya clonada; la posición en la parte 1).
+                        NVal::List(l) => iters[i].3 = Some(l),
                         _ => iters[i].2 = true,
                     }
                 }
             }
         }
         iters.sort_by_key(|x| x.0);
-        for (it, p, gone) in iters {
+        for (it, p, gone, list) in iters {
             let at = ib + it as usize;
             if gone {
                 self.vm_iters.truncate(at);
                 continue;
             }
-            let r = EachItems::Range(RangeIter { next: (p[0] != 0).then_some(p[1]), hi: p[2], step: p[3] });
+            let r = match list {
+                Some(l) => EachItems::List(l, p[1] as usize),
+                None => EachItems::Range(RangeIter { next: (p[0] != 0).then_some(p[1]), hi: p[2], step: p[3] }),
+            };
             if at < self.vm_iters.len() {
                 self.vm_iters[at] = r;
             } else {

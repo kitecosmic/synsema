@@ -116,6 +116,33 @@ fn heap_allocations_per_construct() {
         ("set m[k] (clave que ya está)", "let m be {\"a\": 1}\nlet k be \"a\"\n", "    set m[k] to i\n", 0),
         // F4.4: `set m.a` sobre una clave que ya está sólo cambia el valor (antes: 1).
         ("set m.a (clave que ya está)", "let m be {\"a\": 1}\n", "    set m.a to i\n", 0),
+        // F4.6a: `set` con camino en la VM (sin armar el índice como texto en cada nivel).
+        ("set xs[1] (camino)", "let xs be [1, 2, 3]
+", "    set xs[1] to i
+", 0),
+        ("set bs[0].x (camino)", "let bs be [{\"x\": 1}]
+", "    set bs[0].x to i
+", 0),
+        ("set m.a.b[j] (camino)", "let m be {\"a\": {\"b\": [1, 2]}}
+let j be 1
+", "    set m.a.b[j] to i
+", 0),
+        // F4.6b: un texto de hasta 15 B vive en línea (sin malloc); `+` agrega en el lugar si el
+        // de la izquierda es de un solo dueño y, si no, copia una vez (antes: `format!` + la copia).
+        ("texto corto \"ab\" + \"cd\"", "", "    set x to \"ab\" + \"cd\"
+", 0),
+        ("texto corto + número", "", "    set x to \"n=\" + i
+", 0),
+        ("texto largo + corto", "let t be \"un texto que no entra en línea\"
+", "    set x to t + \"!\"
+", 1),
+        // La copia del largo justo y un `realloc` cuando el intermedio (único) crece.
+        ("a + b + c (el intermedio en el lugar)", "let t be \"un texto que no entra en línea\"
+", "    set x to t + \"!\" + \"?\"
+", 2),
+        // F4.6c: `text(x)` escribe en el texto (en línea hasta 15 B), sin un `String` (antes: 1).
+        ("text(i)", "", "    set x to text(i)
+", 0),
         // F4.4: `keys` comparte el texto de cada clave (antes: 4, uno por clave).
         ("keys(m) de 2 claves", "let m be {\"a\": 1, \"b\": 2}\n", "    set x to keys(m)\n", 2),
     ];
@@ -124,8 +151,33 @@ fn heap_allocations_per_construct() {
     for (name, prelude, body, expected) in while_cases {
         rows.push((*name, per_iteration(|n| while_loop(prelude, body, n)), *expected));
     }
+    // F4.6c: `set s to s + …` sobre un texto de un solo dueño agrega en el lugar (crece al doble:
+    // unos pocos `realloc` por corrida, no por vuelta). Antes: una copia de todo `s` por vuelta.
+    rows.push(("set s to s + \"x\" (en el lugar)", per_row_amortized(|n| while_loop("let s be \"\"
+", "    set s to s + \"x\"
+", n)), 0));
+    rows.push((
+        "set s to s + text(i) + \",\"",
+        per_row_amortized(|n| while_loop("let s be \"\"
+", "    set s to s + text(i) + \",\"
+", n)),
+        0,
+    ));
     // `each` sobre `range`: la vuelta (entorno nuevo + clave + tabla; el nombre formateado ya no, F1.6).
     rows.push(("vuelta de each + set x to 1", per_iteration(|n| format!("let x be 0\neach i in range(0, {})\n    set x to 1\n", n)), 0));
+    // F4.8b: un builtin que llama una función por elemento, sin copiar la lista, sin `Vec` de
+    // argumentos ni frame por llamada (antes: 2 por elemento, el `vec![item]` y los `CallArgs`, y
+    // la copia de la lista entera).
+    rows.push((
+        "count_where con lambda, por elemento",
+        per_row_amortized(|n| format!("let xs be range(0, {})\nlet c be count_where(xs, (x) => x % 3 == 0)\n", n)),
+        0,
+    ));
+    rows.push((
+        "reduce con lambda, por elemento",
+        per_row_amortized(|n| format!("let xs be range(0, {})\nlet c be reduce(xs, (a, x) => a + x, 0)\n", n)),
+        0,
+    ));
     // F4.4: `csv_parse` por fila de 2 columnas: las cabeceras, claves una vez por llamada. Las
     // listas que crecen al doble suman unos pocos `realloc` por llamada (no por fila): se descuentan.
     rows.push((

@@ -1,0 +1,9 @@
+-- F4.8c: `set P to append(P, e)` ya especializado cuando P deja de ser una lista: el error del
+-- builtin, con su ubicación.
+let xs be []
+each i in range(0, 5)
+    set xs to append(xs, i)
+print(xs, steps())
+set xs to "texto"
+each i in range(0, 2)
+    set xs to append(xs, i)

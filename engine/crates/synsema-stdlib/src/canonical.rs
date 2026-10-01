@@ -21,6 +21,7 @@
 //! modos). `bytes` tampoco existe en JSON: codificalos vos (`decode(b, "base64url")`), explícito
 //! antes que magia. Un `secret` jamás se serializa.
 
+use synsema_core::synlist::{list_values};
 use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use synsema_core::number::Number;
 use synsema_core::types::{syn_text, SynValue};
@@ -147,7 +148,7 @@ fn write(v: &SynValue, out: &mut String, depth: usize, path: &str) -> Result<(),
         SynValue::Text(s) => es_string(s, out),
         SynValue::List(l) => {
             out.push('[');
-            for (i, item) in l.borrow().iter().enumerate() {
+            for (i, item) in list_values(&l).iter().enumerate() {
                 if i > 0 {
                     out.push(',');
                 }

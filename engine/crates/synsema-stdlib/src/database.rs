@@ -25,6 +25,7 @@
 //! MySQL/Mongo scope = `canon_url` (scheme://host/db, sin credenciales). Acceso serializado (un
 //! op por vez: `Rc<RefCell>` en run, `Arc<Mutex>` en serve) → una conexión por `db_open`.
 
+use synsema_core::synlist::{list_values};
 use synsema_core::types::{Key, MapObj, SynMap};
 use std::cell::RefCell;
 use std::error::Error as StdError;
@@ -739,7 +740,7 @@ fn syn_to_pg(v: &SynValue) -> PgParam {
         SynValue::Secret(s) => PgParam::Text(s.expose().to_string()),
         SynValue::Text(s) => PgParam::Text(s.to_string()),
         // list/array (p.ej. un embedding) → texto pgvector "[a,b,c]"; en la query: `?::vector`.
-        SynValue::List(l) => PgParam::Text(list_to_vector_text(&l.borrow())),
+        SynValue::List(l) => PgParam::Text(list_to_vector_text(&l.borrow().to_vec())),
         SynValue::Array(a) => PgParam::Text(array_to_vector_text(a)),
         other => PgParam::Text(other.to_string()),
     }
@@ -1262,7 +1263,7 @@ fn syn_to_bson(v: &SynValue) -> Bson {
             subtype: BinarySubtype::Generic,
             bytes: b[..].to_vec(),
         }),
-        SynValue::List(l) => Bson::Array(l.borrow().iter().map(syn_to_bson).collect()),
+        SynValue::List(l) => Bson::Array(list_values(&l).iter().map(syn_to_bson).collect()),
         SynValue::Map(m) => Bson::Document(syn_map_to_doc(&m.borrow())),
         other => Bson::String(other.to_string()),
     }
@@ -1289,7 +1290,7 @@ fn coerce_id(v: &SynValue) -> Bson {
             Ok(oid) => Bson::ObjectId(oid),
             Err(_) => Bson::String(s.to_string()),
         },
-        SynValue::List(l) => Bson::Array(l.borrow().iter().map(coerce_id).collect()),
+        SynValue::List(l) => Bson::Array(list_values(&l).iter().map(coerce_id).collect()),
         SynValue::Map(m) => {
             let mut doc = Document::new();
             for (k, val) in m.borrow().iter() {
@@ -1512,7 +1513,7 @@ fn raw_str(v: &SynValue) -> String {
 /// Params de un 2º arg lista → Vec<SynValue> (cada backend los convierte a lo suyo).
 fn params_arg(v: Option<&SynValue>) -> Vec<SynValue> {
     match v {
-        Some(SynValue::List(l)) => l.borrow().iter().cloned().collect(),
+        Some(SynValue::List(l)) => list_values(&l).iter().cloned().collect(),
         _ => Vec::new(),
     }
 }
@@ -1563,7 +1564,7 @@ fn docs_list_arg(v: Option<&SynValue>, ctx: &str) -> Result<Vec<Document>, Contr
     match v {
         Some(SynValue::List(l)) => {
             let mut out = Vec::new();
-            for item in l.borrow().iter() {
+            for item in list_values(&l).iter() {
                 match item {
                     SynValue::Map(m) => out.push(syn_map_to_doc(&m.borrow())),
                     other => {
@@ -1767,7 +1768,7 @@ pub fn register_database_builtins<H: DbHandle>(
                 }
                 let params_list: Vec<Vec<SynValue>> = match args.get(1) {
                     Some(SynValue::List(l)) => {
-                        l.borrow().iter().map(|p| params_arg(Some(p))).collect()
+                        list_values(&l).iter().map(|p| params_arg(Some(p))).collect()
                     }
                     _ => Vec::new(),
                 };
@@ -2094,7 +2095,7 @@ pub fn register_database_builtins<H: DbHandle>(
             1,
             Rc::new(move |_i, args, _loc| {
                 let items: Vec<SynValue> = match args.first() {
-                    Some(SynValue::List(l)) => l.borrow().iter().cloned().collect(),
+                    Some(SynValue::List(l)) => list_values(&l).iter().cloned().collect(),
                     _ => return Err(err("redis_mget: expected a list of keys")),
                 };
                 if items.is_empty() {

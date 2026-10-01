@@ -1,0 +1,62 @@
+-- F4.8c: `set P to append(P, e)` agrega en el lugar en la VM (`AppendInPlace`, por quickening del
+-- `Call`): P global, parámetro, local de una task, variable de una vuelta y de un módulo; con un solo
+-- dueño y compartida (la foto no cambia), un argumento que religa P (el resultado sale de la P leída),
+-- `append` tapado por una task del usuario, y lo que se agrega de cada tipo.
+use "./mods/list_mod.syn" as lm
+
+let xs be []
+let foto be xs
+each i in range(0, 6)
+    set xs to append(xs, i)
+    when i == 2
+        set foto to xs
+print(xs, foto)
+
+-- Compartida por un alias que sigue vivo: se copia una vez y el alias queda igual.
+let a be [1, 2]
+let b be a
+each i in range(0, 4)
+    set a to append(a, i * 10)
+print(a, b)
+
+-- Un argumento que religa P: el resultado es la P que se leyó más el elemento.
+let ys be [0]
+task religa()
+    set ys to ["otra"]
+    give 99
+each i in range(0, 3)
+    set ys to append(ys, religa())
+print(ys)
+
+-- P parámetro, local y variable de la vuelta de una task (frame en registros).
+task junta(p, n)
+    let acc be []
+    each i in range(0, n)
+        set p to append(p, i)
+        set acc to append(acc, p)
+        let t be [i]
+        set t to append(t, i + 1)
+        set acc to append(acc, t)
+    give [p, length(acc), acc[length(acc) - 1]]
+print(junta([], 5), junta([7], 3))
+
+-- Lo que se agrega: de todo tipo (también la lista misma).
+let zs be []
+each v in [1, 2.5, "t", true, nothing, [1], {"k": 1}]
+    set zs to append(zs, v)
+set zs to append(zs, zs)
+print(zs)
+
+-- Un módulo: su variable exportada la ven sus tasks; la no exportada también crece.
+print(lm.push(100, 3), lm.read_items(), lm.ITEMS)
+print(lm.push(200, 2), lm.read_items())
+
+-- `append` tapado por una task del usuario: la llamada de siempre.
+task usa_otro(n)
+    let append be (l, x) => [x]
+    let r be [5]
+    each i in range(0, n)
+        set r to append(r, i)
+    give r
+print(usa_otro(4))
+print(steps())

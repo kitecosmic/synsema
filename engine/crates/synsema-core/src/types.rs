@@ -12,6 +12,7 @@
 //! (lo intuitivo). Si el corpus exige el quirk del origen, se ajusta — pendiente de
 //! confirmar con el agente de testing.
 
+pub use synsema_text::SynText;
 use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
@@ -26,13 +27,16 @@ use crate::number::{py_float_str, Number};
 use crate::secret::{constant_time_eq, SecretInner};
 use crate::tokens::SourceLocation;
 
-pub type ListRef = Rc<RefCell<Vec<SynValue>>>;
+pub type ListRef = Rc<RefCell<SynList>>;
+pub use crate::synlist::SynList;
+use crate::synlist::{list_read, list_values};
 pub use crate::synmap::{Key, MapObj, MapRef, SynMap};
 
 #[derive(Clone)]
 pub enum SynValue {
     Number(Number),
-    Text(Rc<str>),
+    /// F4.6b: `SynText` (en línea hasta 15 B, compartido, agregar en el lugar con un solo dueño).
+    Text(SynText),
     Bool(bool),
     Nothing,
     List(ListRef),
@@ -49,7 +53,7 @@ pub enum SynValue {
     /// toda salida (Display/JSON/blackboard/logs); el plaintext sólo se materializa
     /// en los puntos bordeados del runtime (reveal/socket/DB). Ver `secret.rs`.
     Secret(Rc<SecretInner>),
-    /// Datos binarios inmutables (feature `bytes`, Batch 1). Espeja `Text(Rc<str>)`
+    /// Datos binarios inmutables (feature `bytes`, Batch 1). Espeja `Text`
     /// pero sin garantía de UTF-8. Constructor-only (`bytes(...)`); no hay literal.
     /// Toda operación devuelve bytes nuevos (sin mutación in-place → sin aliasing).
     Bytes(Rc<[u8]>),
@@ -251,7 +255,7 @@ impl SynValue {
             (SynValue::Text(a), SynValue::Text(b)) => a == b,
             (SynValue::Nothing, SynValue::Nothing) => true,
             (SynValue::List(a), SynValue::List(b)) => {
-                let (a, b) = (a.borrow(), b.borrow());
+                let (a, b) = (list_read(a), list_read(b));
                 a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.syn_equals(y))
             }
             (SynValue::Map(a), SynValue::Map(b)) => {
@@ -334,7 +338,7 @@ impl fmt::Display for SynValue {
             // ya no se muestra igual que `[1, 1]`. Arriba de todo, `print("x")` sigue
             // mostrando el texto tal cual.
             SynValue::List(l) => {
-                let parts: Vec<String> = l.borrow().iter().map(|v| v.nested_repr()).collect();
+                let parts: Vec<String> = list_read(l).iter().map(|v| v.nested_repr()).collect();
                 write!(f, "[{}]", parts.join(", "))
             }
             SynValue::Map(m) => {
@@ -465,7 +469,7 @@ pub fn syn_int(n: i64) -> SynValue {
 pub fn syn_float(x: f64) -> SynValue {
     SynValue::Number(Number::Float(x))
 }
-pub fn syn_text(s: impl Into<Rc<str>>) -> SynValue {
+pub fn syn_text(s: impl Into<SynText>) -> SynValue {
     SynValue::Text(s.into())
 }
 pub fn syn_bool(b: bool) -> SynValue {
@@ -475,6 +479,10 @@ pub fn syn_nothing() -> SynValue {
     SynValue::Nothing
 }
 pub fn syn_list(items: Vec<SynValue>) -> SynValue {
+    SynValue::List(Rc::new(RefCell::new(SynList::from(items))))
+}
+/// F4.8e: una lista con este cuerpo (sin caja si lo es).
+pub fn syn_list_of(items: SynList) -> SynValue {
     SynValue::List(Rc::new(RefCell::new(items)))
 }
 pub fn syn_map(m: SynMap) -> SynValue {
@@ -550,7 +558,7 @@ pub fn to_send(v: &SynValue) -> SendValue {
         SynValue::Text(s) => SendValue::Text(s.to_string()),
         SynValue::Bool(b) => SendValue::Bool(*b),
         SynValue::Nothing => SendValue::Nothing,
-        SynValue::List(l) => SendValue::List(l.borrow().iter().map(to_send).collect()),
+        SynValue::List(l) => SendValue::List(list_values(&l).iter().map(to_send).collect()),
         SynValue::Map(m) => {
             SendValue::Map(m.borrow().iter().map(|(k, v)| (k.to_string(), to_send(v))).collect())
         }

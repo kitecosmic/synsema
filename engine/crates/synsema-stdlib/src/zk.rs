@@ -30,6 +30,7 @@
 //! pruebas generadas acá) y el `Multiplier(1000)` de iden3/snarkjs `test/groth16` (ptau + setup +
 //! prueba generados acá). Deps: `ark-bn254` + `ark-groth16` (puras, `no_std`, sin `parallel`).
 
+use synsema_core::synlist::{list_values};
 use std::rc::Rc;
 
 use ark_bn254::{Bn254, Fq, Fq2, Fr, G1Affine, G2Affine};
@@ -80,7 +81,7 @@ fn syn_to_value(v: &SynValue, what: &str) -> Result<J, Control> {
             )))
         }
         SynValue::List(l) => {
-            J::Array(l.borrow().iter().map(|x| syn_to_value(x, what)).collect::<Result<_, _>>()?)
+            J::Array(list_values(&l).iter().map(|x| syn_to_value(x, what)).collect::<Result<_, _>>()?)
         }
         SynValue::Map(m) => {
             let mut out = serde_json::Map::new();

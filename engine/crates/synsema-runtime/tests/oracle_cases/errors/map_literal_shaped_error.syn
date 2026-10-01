@@ -1,0 +1,6 @@
+-- F4.8g: un valor que falla a mitad de un mapa literal con claves constantes: el error y los pasos de
+-- siempre (las claves anteriores cuentan su paso aunque no se evalúen como instrucciones).
+let d be 0
+print(steps())
+let m be {"a": 1, "b": 2 + 3, "c": 10 % d, "e": 4}
+print(m)

@@ -12,7 +12,11 @@
 //! instrucción, sin haber hecho nada de ella, y la VM la corre como siempre.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+
+use crate::number::Number;
+use crate::synmap::MapIc;
+use crate::types::{ListRef, SynText, SynValue};
 
 /// Un registro de la ventana de la VM (el de `vm.rs`).
 pub type Reg = u16;
@@ -25,7 +29,27 @@ pub enum NConst {
     Int(i64),
     Bool(bool),
     Nothing,
+    /// F4.7: un `Float` (sus bits, para que la constante siga siendo `Eq`).
+    Float(u64),
 }
+
+/// Las etiquetas de un valor en el código nativo (F4.7): lo que dice qué hay en sus bits, su `f64` o
+/// su puntero. Las comparten el nivel nativo y las lecturas de abajo.
+pub const TAG_HOLE: i64 = 0;
+pub const TAG_NOTHING: i64 = 1;
+pub const TAG_INT: i64 = 2;
+pub const TAG_FLOAT: i64 = 3;
+pub const TAG_BOOL: i64 = 4;
+/// F4.7b: un valor con caja, prestado de la VM (el puntero es a donde vive: un registro, un lugar de
+/// la ventana, una global, un elemento de una lista o un valor de un mapa).
+pub const TAG_LIST: i64 = 5;
+pub const TAG_MAP: i64 = 6;
+/// Otro valor con caja (texto, `Big`, decimal, …), o una task o el builtin `range` (tipo estático).
+pub const TAG_OTHER: i64 = 7;
+/// Una lectura que el camino rápido no hace: sale a la VM antes de la instrucción.
+pub const TAG_MISS: i64 = 0xff;
+/// F4.8d2: `get(c, k, d)` sin la clave o el índice (el código nativo usa el default).
+pub const TAG_ABSENT: i64 = 0xfe;
 
 /// Un operando: como `Opnd` de la VM. `Reg` se consume (queda `nothing`), `Copy` no; `Local` es un
 /// lugar de la ventana de locales ligado seguro; `Global` es una global de un bucle nativo (F4.2:
@@ -46,6 +70,59 @@ pub enum NArith {
     Sub,
     Mul,
     Mod,
+}
+
+/// `FloatArith` (F4.7): `+ - * /` en f64 (con al menos un `Float`, o `/` entre dos números).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NFArith {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// `Unary` (F4.7): `-x` y `not x`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NUnary {
+    Neg,
+    Not,
+}
+
+/// F4.7c: los builtins puros que el nivel nativo hace él mismo (intrínsecos), como V8 con
+/// `Math.sqrt` o LuaJIT con `math.*`. Mismo resultado y mismos errores que el builtin (lo que no hace,
+/// sale a la VM antes de la llamada).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NBuiltin {
+    Length,
+    Sqrt,
+    Abs,
+    Float,
+    /// F4.8d: `append`, sólo en `set P to append(P, e)` de un bucle (`NIns::AppendPush`); en una
+    /// llamada común sale a la VM.
+    Append,
+    /// F4.8d2: `get(c, k)`/`get(c, k, d)` sobre un mapa con una clave de texto o una lista con un
+    /// `Int` (lo demás, en la VM).
+    Get,
+}
+
+impl NBuiltin {
+    pub const ALL: [NBuiltin; 6] = [NBuiltin::Length, NBuiltin::Sqrt, NBuiltin::Abs, NBuiltin::Float, NBuiltin::Append, NBuiltin::Get];
+
+    /// El nombre del builtin (el que se verifica al entrar: la global sigue siendo ese builtin).
+    pub fn name(self) -> &'static str {
+        match self {
+            NBuiltin::Length => "length",
+            NBuiltin::Sqrt => "sqrt",
+            NBuiltin::Abs => "abs",
+            NBuiltin::Float => "float",
+            NBuiltin::Append => "append",
+            NBuiltin::Get => "get",
+        }
+    }
+
+    pub fn from_name(n: &str) -> Option<NBuiltin> {
+        NBuiltin::ALL.into_iter().find(|b| b.name() == n)
+    }
 }
 
 /// `IntCmp`: `< <= > >= == !=`.
@@ -74,6 +151,24 @@ pub enum NIns {
     /// La guarda de la VM (dos `Int`) la da el tipo estático; desborde y `% 0` salen a la VM.
     IntArith { dst: Reg, op: NArith, a: NOpnd, b: NOpnd },
     IntCmp { dst: Reg, op: NCmp, a: NOpnd, b: NOpnd },
+    /// F4.7: la guarda de la VM (dos números `Int`/`Float`; con `+ - *`, al menos un `Float`) la
+    /// da el tipo estático o se chequea; si no pasa, o el divisor de `/` es cero, sale a la VM.
+    FloatArith { dst: Reg, op: NFArith, a: NOpnd, b: NOpnd },
+    /// F4.7: comparación entre `Int` y `Float` en cualquier mezcla, EXACTA (`partial_cmp_num`).
+    NumCmp { dst: Reg, op: NCmp, a: NOpnd, b: NOpnd },
+    /// F4.7: `Unary` (consume su operando como la VM). `-` de un `Int` que desborda, o de algo que
+    /// no es un número, sale a la VM.
+    Unary { dst: Reg, op: NUnary, a: NOpnd },
+    /// F4.7: `ToBool` (si es verdadero, como `is_truthy`).
+    ToBool { dst: Reg, src: NOpnd },
+    /// F4.7b: `x[i]` (lo que hace el camino rápido de la VM: una lista con un `Int`, un mapa con una
+    /// clave de texto; lo demás sale). `idx: None`: la clave es la constante de su sitio.
+    GetIndex { dst: Reg, obj: NOpnd, idx: Option<NOpnd>, site: u32 },
+    /// F4.7b: `m.k` (un mapa, con la caché por forma de su sitio; lo demás sale).
+    GetProp { dst: Reg, obj: NOpnd, site: u32 },
+    /// F4.7b: `EachInitV` sobre una lista (el iterador recorre la lista que había al empezar, como la
+    /// VM); otra colección sale.
+    EachList { src: NOpnd, it: u16 },
     /// Compara y salta (`IntCmpJump` + el `JumpIfFalsy` que le sigue, cuyo destino es `to`): si da
     /// verdadero sigue en `pc + 2`.
     IntCmpJump { op: NCmp, a: NOpnd, b: NOpnd, to: u32 },
@@ -99,6 +194,8 @@ pub enum NIns {
     Scalar { src: NOpnd },
     /// F4.2b: `LoadGlobal` del builtin `range` (que siga siéndolo se verifica al entrar).
     RangeFn { dst: Reg },
+    /// F4.7c: `LoadGlobal` de un builtin que el nivel nativo hace él mismo (verificado al entrar).
+    LoadBuiltin { dst: Reg, which: NBuiltin },
     /// `IsRange`: si `src` no es el builtin `range`, a `to` (la llamada de siempre).
     IsRange { src: Reg, to: u32 },
     /// `each … in range(…)`: los argumentos (`n`, de 1 a 3) en registros desde `first`; el
@@ -118,6 +215,24 @@ pub enum NIns {
     /// La VM todavía no especializó esta instrucción (`Binary`: una rama que nunca corrió): se sale
     /// acá. Lleva lo que la VM va a leer y escribir.
     Trap { dst: Reg, a: NOpnd, b: NOpnd },
+    /// F4.8d (sólo en un bucle): `PathRoot` sobre una variable del bucle (`root`: su lugar, una global
+    /// o de la ventana): la variable única, y `c` es el cursor del camino (su dirección).
+    PathRoot { c: Reg, root: NOpnd },
+    /// F4.8d: `PathStep`: el cursor pasa al lugar de adentro, único (`idx: None`: la clave del sitio).
+    PathStep { c: Reg, idx: Option<NOpnd>, site: u32 },
+    /// F4.8d: `PathSet`, la hoja: `src` reemplaza lo que había (y va a `dst`, como en la VM).
+    PathSet { c: Reg, idx: Option<NOpnd>, site: u32, src: NOpnd, dst: Reg },
+    /// F4.8d: `AppendInPlace` sobre la variable `root` del bucle: la función en `func` (el builtin
+    /// `append`, verificado al entrar), P y el elemento desde `args`.
+    AppendPush { dst: Reg, func: Reg, args: Reg, root: NOpnd },
+    /// F4.8d2 (sólo en un bucle): `LoadGlobal` de un valor que el código nativo no representa (un
+    /// builtin que no es intrínseco): la VM lo deja en el registro `dst` (lo corre el host). Una
+    /// `Call` cuya función es uno de éstos es una llamada ajena: la corre la VM entera.
+    LoadForeign { dst: Reg },
+    /// F4.8d2: `CheckProtected` sobre una función así (lo corre el host).
+    CheckForeign { func: Reg },
+    /// F4.8d2: un texto constante a `dst` (prestado del sitio `site`, que lo guarda).
+    LoadConst { dst: Reg, site: u32 },
 }
 
 /// Lo que tenía un lugar al compilar un bucle (F4.2): el código nativo se especializa en eso y la
@@ -126,11 +241,20 @@ pub enum NIns {
 pub enum NSeen {
     Int,
     Bool,
+    /// F4.7.
+    Float,
     Nothing,
     /// Un lugar de la ventana o una global sin valor.
     Hole,
-    /// Una lista, un mapa, un texto, …: el nivel nativo no lo representa.
+    /// F4.7b: valores con caja (el código nativo los lee prestados, sin tocar sus cuentas): una
+    /// lista, un mapa, otro (texto, `Big`, …).
+    List,
+    Map,
     Boxed,
+    /// F4.7b: la primera parte de un iterador de una lista (las otras: posición y largo, `Int`).
+    ListIter,
+    /// Lo que el nivel nativo no representa (un iterador de claves o de caracteres).
+    Opaque,
 }
 
 /// Un bucle que se compila a mitad de camino (OSR, F4.2): se entra en `head` con el estado de la
@@ -149,31 +273,366 @@ pub struct NFunc {
     pub nregs: u16,
     pub nlocals: u16,
     pub nparams: u16,
-    /// Las globales de un bucle (0 en una task).
+    /// Las globales de un bucle, o (F4.8b) las que lee la función 0 de una task (`globals`).
     pub nglobals: u16,
     /// Cuántos iteradores de `each` usa (cada uno, cuatro variables: `valid`, `next`, `hi`, `step`).
     pub niters: u16,
     pub osr: Option<NOsr>,
+    /// F4.7: lo que tienen los parámetros al entrar desde la VM (`Int`, `Float` o `Bool`), en la
+    /// función 0 de una task. Vacío en las demás (sus tipos salen de las llamadas de la unidad) y
+    /// en un bucle.
+    pub params: Vec<NSeen>,
+    /// F4.8b: en la función 0 de una task, lo que tenían al compilar las globales que lee (que no
+    /// son tasks ni builtins): entran como parámetros después de los suyos, leídas al entrar (el
+    /// código nativo de una task no escribe globales ni corre código ajeno, así que leerlas al entrar
+    /// es leerlas cuando las lee el cuerpo). Vacío en las demás y en un bucle.
+    pub globals: Vec<NSeen>,
+}
+
+/// Un sitio de `GetIndex`/`GetProp` (F4.7b), o de un paso o la hoja de un `set` con camino (F4.8d): la
+/// clave, si es fija.
+#[derive(Clone, Debug)]
+pub struct NSite {
+    pub key: Option<Arc<str>>,
+    /// F4.8d: `.campo` (la caché sin mirar la clave: siempre es la misma), no un índice.
+    pub prop: bool,
+    /// F4.8d2: un texto constante (`NIns::LoadConst`): el código lo tiene prestado de su sitio.
+    pub text: Option<Arc<str>>,
 }
 
 /// Lo que se compila junto: la task caliente (`funcs[0]`) y las que llama.
 #[derive(Clone, Debug)]
 pub struct NUnit {
     pub funcs: Vec<NFunc>,
+    /// F4.7b: los sitios de lectura de todas sus funciones.
+    pub sites: Vec<NSite>,
 }
 
 /// Un valor de un frame nativo.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum NVal {
     Int(i64),
     Bool(bool),
     Nothing,
+    /// F4.7.
+    Float(f64),
     /// La task de la función `func` de la unidad.
     Callee(u32),
     /// Un lugar vacío (un `let` de la vuelta que ya se soltó, un iterador terminado).
     Hole,
     /// El builtin `range`.
     RangeFn,
+    /// F4.7c: uno de los builtins intrínsecos.
+    Builtin(NBuiltin),
+    /// F4.7b: un valor con caja (ya clonado: la cuenta es la de la VM).
+    Value(SynValue),
+    /// F4.7b: la lista de un iterador (ya clonada).
+    List(ListRef),
+    /// F4.8d: un valor con caja que ya está en su lugar de la VM (el código nativo lo puso ahí antes
+    /// de una escritura, o nunca lo movió): no se toca.
+    Keep,
+}
+
+// =============================================================================================
+// Lecturas (F4.7b): lo que el nivel nativo lee de los valores con caja, sin `unsafe` (lo que
+// devuelve un puntero es su dirección, para que el nivel nativo la guarde; leerlo es de él).
+// =============================================================================================
+
+/// Un valor visto por el código nativo: su etiqueta, sus bits (un `Int`, un `Bool`, los de un
+/// `Float`) y, si tiene caja, dónde está.
+#[derive(Clone, Copy, Debug)]
+pub struct NPeek {
+    pub tag: i64,
+    pub bits: i64,
+    pub ptr: *const SynValue,
+}
+
+impl NPeek {
+    pub const MISS: NPeek = NPeek { tag: TAG_MISS, bits: 0, ptr: std::ptr::null() };
+}
+
+/// Cómo ve el código nativo a `v` (que vive donde está: su dirección queda en `ptr`).
+pub fn peek(v: &SynValue) -> NPeek {
+    let (tag, bits) = match v {
+        SynValue::Number(Number::Int(x)) => (TAG_INT, *x),
+        SynValue::Number(Number::Float(x)) => (TAG_FLOAT, x.to_bits() as i64),
+        SynValue::Bool(b) => (TAG_BOOL, i64::from(*b)),
+        SynValue::Nothing => (TAG_NOTHING, 0),
+        SynValue::List(_) => (TAG_LIST, 0),
+        SynValue::Map(_) => (TAG_MAP, 0),
+        _ => (TAG_OTHER, 0),
+    };
+    let ptr = if tag >= TAG_LIST { std::ptr::from_ref(v) } else { std::ptr::null() };
+    NPeek { tag, bits, ptr }
+}
+
+/// Un sitio de lectura con su caché por forma (la del nivel nativo, aparte de la de la VM: una
+/// caché no cambia qué da una lectura).
+pub struct SiteIc {
+    key: Option<Arc<str>>,
+    prop: bool,
+    ic: MapIc,
+    /// F4.8d2: el texto constante del sitio (vive lo que vive el código compilado).
+    konst: Option<SynValue>,
+}
+
+impl SiteIc {
+    pub fn new(s: &NSite) -> SiteIc {
+        let konst = s.text.as_deref().map(|t| SynValue::Text(SynText::from(t)));
+        SiteIc { key: s.key.clone(), prop: s.prop, ic: MapIc::default(), konst }
+    }
+
+    /// F4.8d2: el texto constante del sitio (`MISS` si no tiene).
+    pub fn konst(&self) -> NPeek {
+        match &self.konst {
+            Some(v) => peek(v),
+            None => NPeek::MISS,
+        }
+    }
+
+    /// `obj[idx]` como el camino rápido de `GetIndex` en la VM: una lista con un `Int` (índices
+    /// negativos como siempre), un mapa con una clave de texto (la del sitio, o `idx`). Lo demás
+    /// (fuera de rango, clave que falta, otro tipo) no lo hace: `MISS`.
+    pub fn index(&self, obj: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&SynValue>) -> NPeek {
+        match obj {
+            SynValue::List(l) if idx_tag == TAG_INT => {
+                let items = l.borrow();
+                match crate::interpreter::resolve_index(idx_bits, items.len()) {
+                    Some(j) => peek_elem(&items, j),
+                    None => NPeek::MISS,
+                }
+            }
+            SynValue::Map(m) => {
+                let key: &str = match (&self.key, idx) {
+                    (Some(k), _) => k,
+                    (None, Some(SynValue::Text(t))) => t,
+                    _ => return NPeek::MISS,
+                };
+                match m.borrow().get_cached_key(key, &self.ic) {
+                    Some(v) => peek(v),
+                    None => NPeek::MISS,
+                }
+            }
+            _ => NPeek::MISS,
+        }
+    }
+
+    /// `obj.k` como el camino rápido de `GetProp` en la VM: un mapa con la caché por forma.
+    pub fn prop(&self, obj: &SynValue) -> NPeek {
+        match (obj, &self.key) {
+            (SynValue::Map(m), Some(k)) => match m.borrow().get_cached(k, &self.ic) {
+                Some(v) => peek(v),
+                None => NPeek::MISS,
+            },
+            _ => NPeek::MISS,
+        }
+    }
+}
+
+/// F4.8d2: `get(obj, idx, …)` como `b_get` en lo que hace sin errores: un mapa con una clave de texto
+/// (`to_string` de un texto es el texto) o una lista con un `Int` (negativos desde el final); si no
+/// está, `ABSENT`. Lo demás (otra clave, otra colección: la VM da el resultado o el error), `MISS`.
+pub fn get_item(obj: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&SynValue>) -> NPeek {
+    let absent = NPeek { tag: TAG_ABSENT, bits: 0, ptr: std::ptr::null() };
+    match (obj, idx) {
+        (SynValue::List(l), _) if idx_tag == TAG_INT => {
+            let items = l.borrow();
+            match crate::interpreter::resolve_index(idx_bits, items.len()) {
+                Some(j) => peek_elem(&items, j),
+                None => absent,
+            }
+        }
+        (SynValue::Map(m), Some(SynValue::Text(t))) => match m.borrow().get(t) {
+            Some(v) => peek(v),
+            None => absent,
+        },
+        _ => NPeek::MISS,
+    }
+}
+
+/// La lista de `v` (dónde está su `Rc`: el iterador de un `each` la guarda así, como
+/// `EachItems::List`) y su largo; `None` si no es una lista.
+pub fn list_body(v: &SynValue) -> Option<(*const ListRef, usize)> {
+    match v {
+        SynValue::List(l) => Some((std::ptr::from_ref(l), l.borrow().len())),
+        _ => None,
+    }
+}
+
+/// El elemento `i` de una lista (la vuelta de un `each`); `MISS` si ya no está.
+pub fn list_elem(l: &ListRef, i: i64) -> NPeek {
+    let items = l.borrow();
+    match usize::try_from(i).ok().filter(|j| *j < items.len()) {
+        Some(j) => peek_elem(&items, j),
+        None => NPeek::MISS,
+    }
+}
+
+/// F4.8e: el elemento `j` (que existe) como lo ve el código nativo: un número sin caja, sus bits; un
+/// valor, `peek` (con caja, la dirección donde vive en la lista).
+#[inline]
+fn peek_elem(items: &crate::synlist::SynList, j: usize) -> NPeek {
+    use crate::synlist::Elem;
+    match items.elem(j) {
+        Some(Elem::Value(v)) => peek(v),
+        Some(Elem::Int(x)) => NPeek { tag: TAG_INT, bits: x, ptr: std::ptr::null() },
+        Some(Elem::Float(f)) => NPeek { tag: TAG_FLOAT, bits: f.to_bits() as i64, ptr: std::ptr::null() },
+        None => NPeek::MISS,
+    }
+}
+
+/// Si `v` es verdadero (`is_truthy`).
+pub fn truthy(v: &SynValue) -> bool {
+    v.is_truthy()
+}
+
+/// F4.7c: `length(v)` como el builtin (texto en caracteres, lista, mapa, bytes); `None` con lo demás
+/// (un `Array`, algo sin largo: lo resuelve la VM, con su error).
+pub fn length(v: &SynValue) -> Option<i64> {
+    Some(match v {
+        SynValue::Text(s) => s.chars().count() as i64,
+        SynValue::List(l) => l.borrow().len() as i64,
+        SynValue::Map(m) => m.borrow().len() as i64,
+        SynValue::Bytes(b) => b.len() as i64,
+        _ => return None,
+    })
+}
+
+// =============================================================================================
+// Escrituras (F4.8d): lo que hacen los caminos rápidos de `PathRoot`/`PathStep`/`PathSet` y de
+// `AppendInPlace` en la VM, sobre lugares que el código nativo tiene por su dirección. Lo que no
+// hacen (un mapa de un módulo, un índice fuera de rango, una clave nueva, otro tipo) no lo tocan:
+// `false`/`None`, y el código nativo sale a la VM ANTES de la instrucción, que la hace con sus
+// errores. Ninguna de estas mueve la memoria de la VM (registros, ventana, entorno): sólo cambian
+// el contenido de una lista o un mapa, o el valor de un lugar.
+// =============================================================================================
+
+/// Un valor del código nativo como valor de la VM: su etiqueta y sus bits (un `Float`, los de su
+/// `f64`) o, con caja, dónde vive (se clona). `None`: un hueco o una lectura que no hubo.
+pub fn nvalue(tag: i64, bits: i64, ptr: Option<&SynValue>) -> Option<SynValue> {
+    Some(match tag {
+        TAG_INT => SynValue::Number(Number::Int(bits)),
+        TAG_FLOAT => SynValue::Number(Number::Float(f64::from_bits(bits as u64))),
+        TAG_BOOL => SynValue::Bool(bits != 0),
+        TAG_NOTHING => SynValue::Nothing,
+        TAG_LIST | TAG_MAP | TAG_OTHER => ptr?.clone(),
+        _ => return None,
+    })
+}
+
+/// `PathRoot`: la variable raíz de un `set` con camino, única (`make_unique`: si otro la comparte,
+/// pasa a ser una copia propia). El mapa de un módulo no (lo hace la VM).
+pub fn path_root(slot: &mut SynValue) -> bool {
+    if matches!(slot, SynValue::Map(m) if crate::interpreter::module_env_of_map(m).is_some()) {
+        return false;
+    }
+    crate::interpreter::make_unique(slot);
+    true
+}
+
+/// La clave de un paso o de la hoja sobre un mapa: la del sitio (`.campo`, o un índice de texto
+/// constante) o el texto del índice.
+fn path_key<'a>(site: &'a SiteIc, idx: Option<&'a SynValue>) -> Option<&'a str> {
+    match (&site.key, idx) {
+        (Some(k), _) => Some(k),
+        (None, Some(SynValue::Text(t))) => Some(t),
+        _ => None,
+    }
+}
+
+/// `PathStep`: el lugar de adentro de `parent` (una lista con un `Int` en rango, o un mapa que no es
+/// de un módulo con la clave puesta), único (`make_unique`); su dirección. Vale hasta la próxima
+/// escritura del mismo contenedor.
+pub fn path_step(parent: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&SynValue>, site: &SiteIc) -> Option<*mut SynValue> {
+    match parent {
+        SynValue::List(l) if idx_tag == TAG_INT => {
+            // (Entrar a un elemento para escribir adentro: sólo en una lista de valores; una sin caja
+            // tiene números: sale a la VM.)
+            let mut b = l.borrow_mut();
+            if !b.is_values() {
+                return None;
+            }
+            let items = b.values_mut();
+            let j = crate::interpreter::resolve_index(idx_bits, items.len())?;
+            let s = &mut items[j];
+            crate::interpreter::make_unique(s);
+            Some(std::ptr::from_mut(s))
+        }
+        SynValue::Map(m) if idx_tag != TAG_INT && crate::interpreter::module_env_of_map(m).is_none() => {
+            let key = path_key(site, idx)?;
+            let mut b = m.borrow_mut();
+            let s = if site.prop { b.get_cached_mut(key, &site.ic) } else { b.get_cached_key_mut(key, &site.ic) }?;
+            crate::interpreter::make_unique(s);
+            Some(std::ptr::from_mut(s))
+        }
+        _ => None,
+    }
+}
+
+/// `PathSet` (la hoja): en una lista con un `Int` en rango, o en un mapa que no es de un módulo con
+/// la clave ya puesta, `v` reemplaza lo que había.
+pub fn path_set(parent: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&SynValue>, site: &SiteIc, v: SynValue) -> bool {
+    match parent {
+        SynValue::List(l) if idx_tag == TAG_INT => {
+            let mut items = l.borrow_mut();
+            match crate::interpreter::resolve_index(idx_bits, items.len()) {
+                Some(j) => {
+                    items.set(j, v);
+                    true
+                }
+                None => false,
+            }
+        }
+        SynValue::Map(m) if idx_tag != TAG_INT && crate::interpreter::module_env_of_map(m).is_none() => {
+            let Some(key) = path_key(site, idx) else { return false };
+            let mut b = m.borrow_mut();
+            let s = if site.prop { b.get_cached_mut(key, &site.ic) } else { b.get_cached_key_mut(key, &site.ic) };
+            match s {
+                Some(s) => *s = v,
+                // Una clave nueva: lo que hace la hoja de la VM (`set_leaf_prop`/`set_leaf_index`) con un
+                // mapa que no es de un módulo (la forma cambia, o pasa a diccionario, como siempre).
+                None => match (site.key.is_some(), idx) {
+                    (false, Some(i)) => {
+                        b.set_value_key(i, v);
+                    }
+                    _ => {
+                        b.set(key, v);
+                    }
+                },
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `AppendInPlace`: si el primer argumento es la lista que tiene la raíz (la misma lista: se compara
+/// antes, con los dos prestados), la raíz única (`make_unique`) y `push(item)`.
+pub fn same_list(a: &SynValue, b: &SynValue) -> bool {
+    matches!((a, b), (SynValue::List(x), SynValue::List(y)) if std::rc::Rc::ptr_eq(x, y))
+}
+
+/// Ver `same_list`: la raíz es una lista.
+pub fn append_push(root: &mut SynValue, item: SynValue) -> bool {
+    if !matches!(root, SynValue::List(_)) {
+        return false;
+    }
+    crate::interpreter::make_unique(root);
+    if let SynValue::List(l) = root {
+        l.borrow_mut().push(item);
+    }
+    true
+}
+
+/// Un valor prestado pasa a su lugar en la VM (F4.8d: lo que cruza una escritura, con dueño, como
+/// en la VM): una copia, que suelta lo que había ahí.
+pub fn home(slot: &mut SynValue, v: SynValue) {
+    *slot = v;
+}
+
+/// Lo mismo en un lugar de la ventana (que puede estar vacío); la dirección del valor.
+pub fn home_local(slot: &mut Option<SynValue>, v: SynValue) -> *const SynValue {
+    std::ptr::from_ref(slot.insert(v))
 }
 
 /// Dónde vive un valor en el frame de la VM.
@@ -223,11 +682,52 @@ pub struct NativeCx<'a> {
     pub depth: &'a mut usize,
     pub max_depth: usize,
     pub cancel: &'a AtomicBool,
+    /// F4.8d2: en un bucle con llamadas ajenas, quien corre las instrucciones de la VM.
+    pub host: Option<&'a mut dyn NativeHost>,
+}
+
+/// F4.8d2: cómo terminó una instrucción que corrió el host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostOut {
+    /// Corrió: el código nativo sigue.
+    Ok,
+    /// Un `stop` que corta el bucle del cuerpo: el código sale después de la instrucción y la VM
+    /// sigue en la salida del bucle (el host la guardó).
+    Stop,
+    /// Un error (el host lo guardó): sale a la VM, que lo trata como el de su `LoopBack`.
+    Fail,
+}
+
+/// F4.8d2: lo del intérprete que el código nativo de un bucle usa para sus llamadas ajenas: corre
+/// instrucciones de la VM sobre el frame del bucle, y le dice dónde quedaron los valores (la memoria de
+/// la VM se puede mover durante una llamada: los punteros se vuelven a pedir después).
+pub trait NativeHost {
+    /// Corre la instrucción `pc` del bucle (una llamada, un `LoadGlobal`, un `CheckProtected`) con sus
+    /// argumentos (`None`: ya está en su registro) y, antes, las globales del bucle en su lugar
+    /// (`None`: ya está). `steps` entra y sale.
+    fn exec(&mut self, pc: u32, args: &[Option<SynValue>], globals: &[Option<SynValue>], steps: &mut u64) -> HostOut;
+    /// Lo que tiene ahora el lugar `p` del frame del bucle (con caja: su dirección).
+    fn peek_place(&mut self, p: Place) -> NPeek;
+    /// Dónde está la lista del iterador `it` (su `Rc`), o nulo.
+    fn iter_body(&mut self, it: u16) -> *const ListRef;
+    /// `v` pasa al lugar `p` (suelta lo que había); su dirección.
+    fn home(&mut self, p: Place, v: SynValue) -> *const SynValue;
+}
+
+/// F4.8d2: como `peek` pero con la dirección de un lugar que el código nativo puede escribir.
+pub fn peek_mut(v: &mut SynValue) -> NPeek {
+    let p = peek(v);
+    if p.tag >= TAG_LIST {
+        NPeek { ptr: std::ptr::from_mut(v).cast_const(), ..p }
+    } else {
+        p
+    }
 }
 
 /// Una unidad ya compilada (de este hilo).
 pub trait NativeCode {
-    /// Corre `funcs[0]` con estos argumentos (enteros: la entrada lo verifica). En un bucle (F4.2),
+    /// Corre `funcs[0]` con estos argumentos (los bits de cada uno: un `Float` con `to_bits`; la
+    /// entrada verifica que tengan lo que pide `params`). En un bucle (F4.2),
     /// los valores de `inputs` en orden.
     fn call(&self, cx: &mut NativeCx<'_>, args: &[i64]) -> NOutcome;
     /// En un bucle: los lugares que el código nativo lee o escribe, con lo que tienen que tener al
@@ -235,6 +735,24 @@ pub trait NativeCode {
     fn inputs(&self) -> &[(Place, NSeen)] {
         &[]
     }
+    /// F4.8d: en un bucle con escrituras, los lugares donde el código puede tener que dejar un valor
+    /// con caja (su dirección entra después de `inputs`: un registro o una global, la del valor; un
+    /// lugar de la ventana, la del `Option`).
+    fn homes(&self) -> &[Place] {
+        &[]
+    }
+    /// F4.8g: una sesión de llamadas seguidas a la task de la entrada (un builtin que la llama por
+    /// elemento): el contexto se arma una vez. `None` si el nivel no la tiene (o en un bucle).
+    fn session<'a>(&'a self, _max_depth: usize, _cancel: &'a AtomicBool) -> Option<Box<dyn NativeSession + 'a>> {
+        None
+    }
+}
+
+/// F4.8g: llamadas seguidas a una entrada nativa (ver `NativeCode::session`). Cada una como `call`,
+/// con los contadores de la VM: los toma al empezar y los deja al volver (al salir a la VM, la
+/// profundidad del frame de más adentro).
+pub trait NativeSession {
+    fn call(&mut self, steps: &mut u64, depth: &mut usize, args: &[i64]) -> NOutcome;
 }
 
 /// El nivel nativo instalado.
@@ -282,12 +800,15 @@ pub struct NativeStats {
     pub deopts: u64,
     /// Entradas a un bucle a mitad de camino (OSR, F4.2).
     pub osr: u64,
+    /// De esas, a bucles con llamadas ajenas (F4.8d2: corren con un host).
+    pub foreign: u64,
 }
 
 static UNITS: AtomicU64 = AtomicU64::new(0);
 static ENTRIES: AtomicU64 = AtomicU64::new(0);
 static DEOPTS: AtomicU64 = AtomicU64::new(0);
 static OSR: AtomicU64 = AtomicU64::new(0);
+static FOREIGN: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn count_unit() {
     UNITS.fetch_add(1, Ordering::Relaxed);
@@ -301,6 +822,9 @@ pub(crate) fn count_deopt() {
 pub(crate) fn count_osr() {
     OSR.fetch_add(1, Ordering::Relaxed);
 }
+pub(crate) fn count_foreign() {
+    FOREIGN.fetch_add(1, Ordering::Relaxed);
+}
 
 #[doc(hidden)]
 pub fn stats() -> NativeStats {
@@ -309,5 +833,6 @@ pub fn stats() -> NativeStats {
         entries: ENTRIES.load(Ordering::Relaxed),
         deopts: DEOPTS.load(Ordering::Relaxed),
         osr: OSR.load(Ordering::Relaxed),
+        foreign: FOREIGN.load(Ordering::Relaxed),
     }
 }

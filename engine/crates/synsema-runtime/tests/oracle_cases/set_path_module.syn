@@ -1,0 +1,10 @@
+-- F4.6a: `set` con camino sobre un módulo (religa su variable; la foto no cambia)
+use "./mods/state_mod.syn" as sm
+let snap be sm.STATE
+each i in range(0, 3)
+    set sm.STATE.v.n to sm.STATE.v.n + 1
+    set sm["STATE"]["v"]["n"] to sm.read_n() + 10
+set sm.fixed to 4
+print(sm.read_fixed(), sm.fixed)
+set sm["fixed"] to sm.fixed + 1
+print(sm.read_n(), sm.read_fixed(), snap, sm.STATE, sm.fixed, steps())

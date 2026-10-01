@@ -32,7 +32,11 @@ fn reject_code(v: &SynValue, who: &str, path: &str) -> Result<(), Control> {
             synsema_core::rng::code_noun(v)
         ))),
         SynValue::List(l) => {
-            for (i, x) in l.borrow().iter().enumerate() {
+            // Una lista sin caja tiene números, no código: leerla con `list_values` la pasaba a
+            // valores para siempre (×3 de memoria) antes de escribir nada.
+            let b = l.borrow();
+            let Some(xs) = b.as_values() else { return Ok(()) };
+            for (i, x) in xs.iter().enumerate() {
                 if matches!(x, SynValue::Task(_) | SynValue::Builtin(_) | SynValue::List(_) | SynValue::Map(_)) {
                     reject_code(x, who, &format!("{}[{}]", path, i))?;
                 }
@@ -64,7 +68,7 @@ pub fn register_json_builtins(interp: &Interpreter) {
         Rc::new(|_i, args, _loc| {
             let v = args.first().ok_or_else(|| err("json_encode: missing argument"))?;
             reject_code(v, "json_encode", "the value")?;
-            Ok(syn_text(dumps(&syn_to_json(v))))
+            Ok(syn_text(dumps_syn(v)))
         }),
     );
 
@@ -77,14 +81,14 @@ pub fn register_json_builtins(interp: &Interpreter) {
         1,
         Rc::new(|_i, args, _loc| {
             let items = match args.first() {
-                Some(SynValue::List(l)) => l.borrow().clone(),
+                Some(SynValue::List(l)) => l.borrow().to_vec(),
                 Some(other) => return Err(err(format!("jsonl_encode: expected a list, got {}", other.type_name()))),
                 None => return Err(err("jsonl_encode(items)")),
             };
             let mut out = String::new();
             for (i, it) in items.iter().enumerate() {
                 reject_code(it, "jsonl_encode", &format!("item {}", i))?;
-                out.push_str(&dumps(&syn_to_json(it)));
+                dumps_syn_into(it, &mut out);
                 out.push('\n');
             }
             Ok(syn_text(out))
@@ -136,7 +140,7 @@ pub fn register_json_builtins(interp: &Interpreter) {
         Rc::new(|_i, args, _loc| {
             let v = args.first().ok_or_else(|| err("missing argument"))?;
             reject_code(v, "json_for_script", "the value")?;
-            let json = dumps(&syn_to_json(v))
+            let json = dumps_syn(v)
                 .replace('<', "\\u003c")
                 .replace('>', "\\u003e")
                 .replace('&', "\\u0026");
@@ -212,6 +216,14 @@ pub fn obj(pairs: Vec<(&str, Json)>) -> Json {
 /// Escapa un string como el encoder ascii de Python json: `"` `\` controles y
 /// todo lo no-ASCII (≥0x7f) → `\uXXXX` (pares subrogados para >0xFFFF).
 fn json_escape_str(s: &str, out: &mut String) {
+    // Lo común (claves, nombres): ASCII imprimible sin `"` ni `\` sale tal cual, de una vez.
+    if s.bytes().all(|b| (0x20..0x7f).contains(&b) && b != b'"' && b != b'\\') {
+        out.reserve(s.len() + 2);
+        out.push('"');
+        out.push_str(s);
+        out.push('"');
+        return;
+    }
     out.push('"');
     for c in s.chars() {
         match c {
@@ -244,17 +256,9 @@ fn dumps_into(j: &Json, out: &mut String) {
     match j {
         Json::Null => out.push_str("null"),
         Json::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Json::Int(i) => out.push_str(&i.to_string()),
+        Json::Int(i) => push_int(*i, out),
         Json::BigInt(s) => out.push_str(s),
-        Json::Float(f) => {
-            if f.is_nan() {
-                out.push_str("NaN");
-            } else if f.is_infinite() {
-                out.push_str(if *f > 0.0 { "Infinity" } else { "-Infinity" });
-            } else {
-                out.push_str(&py_float_str(*f));
-            }
-        }
+        Json::Float(f) => push_float(*f, out),
         Json::Str(s) => json_escape_str(s, out),
         Json::Array(items) => {
             out.push('[');
@@ -281,11 +285,101 @@ fn dumps_into(j: &Json, out: &mut String) {
     }
 }
 
+/// Un entero como lo escribe `i.to_string()`, sin pedir un `String` aparte.
+fn push_int(x: i64, out: &mut String) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let mut u = x.unsigned_abs();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (u % 10) as u8;
+        u /= 10;
+        if u == 0 {
+            break;
+        }
+    }
+    if x < 0 {
+        out.push('-');
+    }
+    // Sólo dígitos ASCII.
+    out.push_str(std::str::from_utf8(&buf[i..]).unwrap_or_default());
+}
+
+fn push_float(f: f64, out: &mut String) {
+    if f.is_nan() {
+        out.push_str("NaN");
+    } else if f.is_infinite() {
+        out.push_str(if f > 0.0 { "Infinity" } else { "-Infinity" });
+    } else {
+        out.push_str(&py_float_str(f));
+    }
+}
+
 /// Serializa como `json.dumps(obj)` (separadores con espacio, ensure_ascii).
 pub fn dumps(j: &Json) -> String {
     let mut out = String::new();
     dumps_into(j, &mut out);
     out
+}
+
+/// `dumps(&syn_to_json(v))` sin armar el árbol intermedio (un `String` por clave y por texto):
+/// nada, booleanos, enteros, floats, texto, listas y mapas se escriben directo; cualquier otro
+/// valor pasa por `syn_to_json` sólo para ese sub-valor. Mismo recorrido y mismos bytes.
+pub fn dumps_syn(v: &SynValue) -> String {
+    let mut out = String::new();
+    dumps_syn_into(v, &mut out);
+    out
+}
+
+pub fn dumps_syn_into(v: &SynValue, out: &mut String) {
+    match v {
+        SynValue::Nothing => out.push_str("null"),
+        SynValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        SynValue::Number(Number::Int(i)) => push_int(*i, out),
+        SynValue::Number(Number::Float(f)) => push_float(*f, out),
+        SynValue::Text(s) => json_escape_str(s, out),
+        SynValue::List(l) => {
+            // Una lista sin caja se escribe desde sus números: sin copiarla ni pasarla a valores.
+            out.push('[');
+            let b = l.borrow();
+            if let Some(xs) = b.as_ints() {
+                for (i, x) in xs.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    push_int(*x, out);
+                }
+            } else if let Some(xs) = b.as_floats() {
+                for (i, x) in xs.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    push_float(*x, out);
+                }
+            } else {
+                for (i, it) in b.as_values().into_iter().flatten().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    dumps_syn_into(it, out);
+                }
+            }
+            out.push(']');
+        }
+        SynValue::Map(m) => {
+            out.push('{');
+            for (i, (k, x)) in m.borrow().iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                json_escape_str(k.as_str(), out);
+                out.push_str(": ");
+                dumps_syn_into(x, out);
+            }
+            out.push('}');
+        }
+        _ => dumps_into(&syn_to_json(v), out),
+    }
 }
 
 /// `array` (Batch 5) → lista JSON anidada (row-major); el caso 0-D es un número.
@@ -311,7 +405,8 @@ pub fn syn_to_json(v: &SynValue) -> Json {
         // Evita el drift de convertir a float; reusa el camino "número crudo".
         SynValue::Number(n @ (Number::Decimal(_) | Number::BigDec(_))) => Json::BigInt(n.to_string()),
         SynValue::Text(s) => Json::Str(s.to_string()),
-        SynValue::List(l) => Json::Array(l.borrow().iter().map(syn_to_json).collect()),
+        // (Leer sin convertir: una lista sin caja sigue sin caja.)
+        SynValue::List(l) => Json::Array(synsema_core::synlist::list_read(l).iter().map(syn_to_json).collect()),
         SynValue::Map(m) => {
             Json::Object(m.borrow().iter().map(|(k, v)| (k.to_string(), syn_to_json(v))).collect())
         }
@@ -492,7 +587,7 @@ pub(crate) fn node_int(v: &SynValue, key: &str, default: i64) -> i64 {
 
 pub(crate) fn list_field(v: &SynValue, key: &str) -> Vec<SynValue> {
     match node_field(v, key) {
-        Some(SynValue::List(l)) => l.borrow().clone(),
+        Some(SynValue::List(l)) => l.borrow().to_vec(),
         _ => Vec::new(),
     }
 }
@@ -619,6 +714,47 @@ mod tests {
         };
         let loc = SourceLocation { file: "<test>".into(), line: 1, column: 1, offset: 0 };
         f(&mut interp, args, &loc)
+    }
+
+    /// `dumps_syn` escribe sin el árbol intermedio: tiene que dar los mismos bytes que
+    /// `dumps(&syn_to_json(v))` en todo lo que escribe directo y en lo que delega.
+    #[test]
+    fn dumps_syn_matches_the_tree() {
+        let texts = [
+            "", "plain", "with \"quotes\"", "back\\slash", "tab\tnl\ncr\r", "\u{08}\u{0c}\u{01}\u{1f}",
+            "del\u{7f}", "ñandú", "emoji 😀", "\u{2028}", "</script>",
+        ];
+        let mut inner = SynMap::new();
+        for (i, t) in texts.iter().enumerate() {
+            inner.insert(*t, syn_text(*t));
+            inner.insert(format!("k{}", i), syn_int(i as i64));
+        }
+        let ints = [0, 1, -1, 9, 10, -10, 99, 100, 1_000_000_007, -123_456_789_012, i64::MAX, i64::MIN, i64::MIN + 1];
+        let floats = [0.0, -0.0, 0.5, -2.75, 1e16, 1e-7, 3.141592653589793, 1e300, f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        let mut row = SynMap::new();
+        row.insert("id", syn_int(7));
+        row.insert("name", syn_text("n7"));
+        row.insert("score", synsema_core::types::syn_float(3.5));
+        row.insert("none", syn_nothing());
+        row.insert("flag", syn_bool(true));
+        row.insert("dec", SynValue::Number(Number::parse_decimal("1.50").expect("decimal")));
+        row.insert("big", SynValue::Number(Number::from_bigint(num_bigint::BigInt::from(u64::MAX) * 3)));
+        row.insert("bytes", synsema_core::types::syn_bytes(vec![0u8, 255, 10]));
+        row.insert("inner", syn_map(inner));
+        row.insert("ints", syn_list(ints.iter().map(|x| syn_int(*x)).collect()));
+        row.insert("floats", syn_list(floats.iter().map(|x| synsema_core::types::syn_float(*x)).collect()));
+        row.insert("unboxed", synsema_core::types::syn_list_of(synsema_core::synlist::SynList::from_ints(ints.to_vec())));
+        row.insert("unboxed_floats", synsema_core::types::syn_list_of(synsema_core::synlist::SynList::from_floats(floats.to_vec())));
+        row.insert("empty_list", syn_list(vec![]));
+        row.insert("empty_map", syn_map(SynMap::new()));
+        let v = syn_list(vec![syn_map(row), syn_text("top"), syn_int(-5), syn_nothing()]);
+        assert_eq!(dumps_syn(&v), dumps(&syn_to_json(&v)));
+        for t in texts {
+            assert_eq!(dumps_syn(&syn_text(t)), dumps(&syn_to_json(&syn_text(t))), "{:?}", t);
+        }
+        for x in ints {
+            assert_eq!(dumps_syn(&syn_int(x)), x.to_string());
+        }
     }
 
     /// Auditoría ronda 7: sin una variante TOTAL no quedaba forma de validar una carga

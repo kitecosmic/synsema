@@ -23,7 +23,8 @@
 //! (su cuerpo se compila también). Todo lo demás es `Exec`: el nodo lo corre el tree-walker con el
 //! frame de la VM como entorno (§6.0 punto 4), y cuenta sus propios pasos.
 
-use crate::synmap::{map_from_pair_slots, MapIc};
+use crate::synlist::list_values_mut;
+use crate::synmap::{map_from_pair_slots, Key, MapIc, ShapeRef, MAX_SHAPED};
 use crate::types::SynMap;
 use super::*;
 use crate::resolve::{self, Resolution, ScopeId, Target};
@@ -86,6 +87,9 @@ pub(crate) enum Ins {
     Binary { dst: Reg, op: BinOp, a: Opnd, b: Opnd, fb: u16 },
     /// La forma genérica, que nunca se pierde: `exec_binary`, como la referencia.
     BinaryAny { dst: Reg, op: BinOp, a: Opnd, b: Opnd },
+    /// F4.6c: un `+` de una cadena `set P to P + e1 + … + ek` que vio texto (ver `TextChainDesc`).
+    /// El miembro `m` de la tabla; `dst`, `a`, `b` los del `Binary` que reemplaza.
+    TextChain { dst: Reg, a: Opnd, b: Opnd, m: u16 },
     /// Formas especializadas para `Int` × `Int` (F3.4). Guarda: los dos operandos son
     /// `Number::Int` (un `Big` no pasa aunque su valor entre en i64); si no, `vm_binary_miss`
     /// (camino genérico + desoptimización). Si la cuenta desborda, el camino genérico da el `Big`.
@@ -143,7 +147,10 @@ pub(crate) enum Ins {
     /// `[a, b, …]` con los elementos en `n` registros desde `first`.
     MakeList { dst: Reg, first: Reg, n: u16 },
     /// `{k: v, …}` con clave y valor alternados en `2n` registros desde `first`.
-    MakeMap { dst: Reg, first: Reg, n: u16 },
+    /// F4.8g: con `site` (no `NONE`), las claves son textos constantes: sólo los valores van en
+    /// `first..` y las claves y su forma (calculada al compilar) están en `map_sites[site]`. Sin una
+    /// variante aparte: una más en el `enum` movía el despacho entero +1,5 % (medido).
+    MakeMap { dst: Reg, first: Reg, n: u16, site: u32 },
     /// `m.k`. F3.6 (L3, *inline cache*): `ic` recuerda en qué posición del mapa estaba la clave la
     /// última vez; si la clave en esa posición es la misma, no se hashea (se compara la clave, no
     /// una "forma": la semántica de valor no cambia). Lo demás (otros tipos, clave que falta,
@@ -155,6 +162,16 @@ pub(crate) enum Ins {
     /// `set <camino> to v`: el destino lo recorre la referencia (`exec_set`), con el valor ya
     /// evaluado.
     SetPath { src: Opnd, node: u32, dst: Reg },
+    /// F4.6a: la raíz de `set <camino> to v` (ver `PathDesc`): el contenedor de la variable, único
+    /// como en `with_unique_binding`, a `c`. Si la raíz no es de las que la VM resuelve, corre el
+    /// `SetPath` de antes (la referencia, con el valor ya evaluado) y salta al `done` de la
+    /// descripción; como `TryInPlace`, no termina su bloque y descuenta antes su `rest`.
+    PathRoot { c: Reg, desc: u32 },
+    /// Un paso intermedio del camino: `[idx]` (`key == NONE`) o `.campo` (`key` = el nombre): `c`
+    /// pasa a ser el lugar de adentro, único (`place_index_step`/`place_prop_step`).
+    PathStep { c: Reg, idx: Opnd, key: u32, ic: u32 },
+    /// La hoja: escribe el valor de la descripción en `c[idx]` o `c.campo` (`set_leaf_*`).
+    PathSet { c: Reg, idx: Opnd, desc: u32 },
     /// `private(…)`, `print(…)` y los demás protegidos tienen que resolver al builtin de verdad; la
     /// referencia lo chequea antes de evaluar los argumentos.
     CheckProtected { func: Reg, name: u32 },
@@ -167,6 +184,12 @@ pub(crate) enum Ins {
     /// genérico (aridad máxima, profundidad, `dispatch_builtin`, `pending_kwargs` vacío), sin armar
     /// pares nombre/valor ni copiar los argumentos dos veces. Si ya no encaja, vuelve a ser `Call`.
     CallBuiltin { dst: Reg, func: Reg, args: Reg, n: u16, site: u32 },
+    /// F4.8c (quickening, como `CallBuiltin`): el `Call` de `set P to append(P, e)` (P una variable,
+    /// la raíz en su `CallSite`) que vio el builtin `append`. Si el primer argumento es la lista que
+    /// P sigue teniendo, se agrega en el lugar (`make_unique` de P y `push`: lo que hace la vía en el
+    /// lugar de la referencia); si no, el builtin de siempre. Si ya no es `append`, vuelve a ser
+    /// `Call`.
+    AppendInPlace { dst: Reg, func: Reg, args: Reg, site: u32 },
     /// F4.1: un `Call` a una task que tiene código nativo (lo reescribe la VM cuando la task pasa
     /// el umbral). Si la task, los argumentos o las globales ya no encajan, vuelve a ser `Call`.
     #[cfg(feature = "native-tier")]
@@ -255,6 +278,13 @@ pub(crate) struct Chunk {
     /// frío, qué frames hay que armar con las variables de la ventana (`NONE` si ninguno).
     node_spill: Vec<u32>,
     spills: Vec<Box<[Spill]>>,
+    /// F4.6a: los `set` con camino.
+    paths: Vec<PathDesc>,
+    /// F4.8g: los mapas literales con claves constantes (`MakeMap` con sitio).
+    map_sites: Box<[MapSite]>,
+    /// F4.6c: las cadenas `set P to P + …` y sus `+`.
+    text_chains: Box<[TextChainDesc]>,
+    text_members: Box<[TextMember]>,
     /// Si el frame lleva su `Layout` como marca: sólo hace falta cuando otro chunk (el de una task
     /// o lambda definida adentro) lo va a recorrer y tiene que verificarlo. Los frames que la VM
     /// preparó para este chunk no se verifican: los armó ella.
@@ -278,6 +308,96 @@ pub(crate) struct Chunk {
     /// F4.2: el estado de cada `LoopBack` (cuenta de vueltas, código nativo).
     #[cfg(feature = "native-tier")]
     loops: Box<[native::LoopState]>,
+}
+
+/// F4.8g: un mapa literal con claves de texto constantes: las claves en orden y su forma (`None` si
+/// se repite alguna o una transición es megamórfica: el camino general, como `map_from_pair_slots`).
+pub(crate) struct MapSite {
+    keys: Box<[Key]>,
+    shape: Option<ShapeRef>,
+}
+
+impl MapSite {
+    /// El mapa con los valores de `vals` (los saca: quedan en `Nothing`).
+    fn build(&self, vals: &mut [SynValue]) -> crate::types::MapRef {
+        match &self.shape {
+            Some(sh) => sh.build(vals.iter_mut().map(|v| std::mem::replace(v, SynValue::Nothing))),
+            None => {
+                // Con claves repetidas pueden quedar pocas: la capacidad no decide el modo.
+                let mut m = SynMap::with_capacity(self.keys.len().min(MAX_SHAPED));
+                for (k, v) in self.keys.iter().zip(vals.iter_mut()) {
+                    m.insert(k, std::mem::replace(v, SynValue::Nothing));
+                }
+                m.into_ref()
+            }
+        }
+    }
+}
+
+/// F4.6a: un `set` con camino que corre la VM (`PathRoot`/`PathStep`/`PathSet`).
+#[derive(Clone, Copy, Debug)]
+struct PathDesc {
+    root: Root,
+    /// El destino como nodo frío (con su spill): lo que corre la referencia si la raíz no es de
+    /// las que resuelve la VM.
+    node: u32,
+    /// El valor, ya evaluado (en un registro o una constante: la referencia lo evalúa antes que
+    /// el camino, así que no puede ser una lectura diferida).
+    src: Opnd,
+    dst: Reg,
+    /// Al compilar, un label; en el chunk, la instrucción que sigue al `set`.
+    done: u32,
+    /// La hoja: `.campo` (el nombre) o `NONE` (`[idx]`), y su caché.
+    key: u32,
+    ic: u32,
+    /// La ubicación del destino (el error de fuera de rango).
+    target_loc: u32,
+}
+
+/// F4.6c: `set P to P + e1 + … + ek` con P una variable (`Root`, nunca `Slow`). Se compila como
+/// siempre (los `+` son `Binary`, cada uno con su registro, vivo hasta el final de la sentencia);
+/// la primera vez que la cabeza (`P + e1`) ve un texto con una pieza que se le suma, la cadena pasa
+/// a `TextChain` (una vez, para siempre, como `BinaryAny`). Entonces el valor de P queda donde está
+/// mientras se evalúan las piezas (una pieza que lo lee ve el viejo), la cabeza guarda un clon en
+/// `old` y cada pieza queda en el registro de su `+`; el último agrega todas: en el
+/// lugar si P sigue siendo el mismo texto y, soltado el clon, tiene un solo dueño; si no, el viejo
+/// más las piezas, nuevo. Una pieza que no se suma a un texto (`text_add_piece`) arma en ese
+/// momento el intermedio de la referencia y sigue `exec_binary`.
+#[derive(Clone, Copy, Debug)]
+struct TextChainDesc {
+    root: Root,
+    /// Con más de un `+`: el registro del valor viejo de P mientras la cadena corre en modo texto
+    /// (vacío si no). Uno por cadena, reservado al comienzo del cuerpo (ninguna otra instrucción lo
+    /// usa y ninguna llamada de adentro de una pieza lo pisa). Por eso nunca queda un valor de otra
+    /// cadena: si tiene uno viejo (un `stop` cortó la cadena), la cadena ya es `TextChain` y su
+    /// cabeza lo reescribe antes que nadie lo mire. `DISCARD` con un solo `+`.
+    old: Reg,
+    /// Sus miembros en `Chunk::text_members`, de la cabeza al último.
+    first: u16,
+    n: u16,
+}
+
+/// Un `+` de una cadena de texto: dónde está y el `Binary` que era.
+#[derive(Clone, Copy, Debug)]
+struct TextMember {
+    pc: u32,
+    chain: u16,
+    dst: Reg,
+    a: Opnd,
+    b: Opnd,
+    fb: u16,
+}
+
+/// Dónde está la variable raíz de un camino (ver `Place`).
+#[derive(Clone, Copy, Debug)]
+enum Root {
+    Param(Reg),
+    Win(u16),
+    Local(u16),
+    /// Por nombre con la caché del slot (`ic`, la de `LoadName`).
+    Free { name: u32, ic: u32 },
+    /// La referencia (un frame de afuera: raro en código caliente).
+    Slow,
 }
 
 /// Un scope que vive en la ventana de locales: su layout (el del resolver) y dónde empieza.
@@ -310,6 +430,8 @@ struct CallSite {
     /// Si se chequea la aridad: una llamada escrita sí; el paso de un pipe que no es una llamada
     /// (`xs |> f`) no, como `call_value` en la referencia.
     checked: bool,
+    /// F4.8c: la variable P de `set P to append(P, e)` (ver `Ins::AppendInPlace`).
+    append: Option<Root>,
 }
 
 /// El estado del llamador de una llamada que la VM corre sin recursión (F3.2). El frame de la
@@ -427,6 +549,18 @@ fn compile_unit<'r>(
         c.window = win.clone();
         c.regframe = regframe;
         c.lay_window(params);
+        // F4.6c: un registro por cadena de texto de más de un `+`, antes que cualquier otro (así
+        // ninguna llamada de adentro de una pieza lo pisa: su ventana empieza más arriba).
+        let long_chains: usize = match &body {
+            Body::Program(stmts) => stmts.iter().map(long_text_chains).sum(),
+            Body::Task(stmts) => stmts.iter().map(|s| long_text_chains(s)).sum(),
+            Body::Lambda(_) => 0,
+        };
+        let long_chains = u16::try_from(long_chains).unwrap_or(0);
+        c.text_regs = (c.next_reg, long_chains);
+        for _ in 0..long_chains {
+            c.reg();
+        }
         let chunk = match &body {
             Body::Program(stmts) => {
                 c.block(stmts, Some(0), false);
@@ -581,6 +715,12 @@ struct Compiler<'r, 's> {
     frame_needed: bool,
     node_spill: Vec<u32>,
     spills: Vec<Box<[Spill]>>,
+    paths: Vec<PathDesc>,
+    map_sites: Vec<MapSite>,
+    text_chains: Vec<TextChainDesc>,
+    text_members: Vec<TextMember>,
+    /// Los registros reservados para las cadenas de más de un `+` (el primero y cuántos quedan).
+    text_regs: (Reg, u16),
     key_ics: u32,
     /// F3.7: en un cuerpo con frame en registros, el registro de cada slot que es un parámetro
     /// (el último si se repite, como la referencia) y dónde va el valor del bloque (`r0` si no).
@@ -629,6 +769,11 @@ impl<'r, 's> Compiler<'r, 's> {
             frame_needed: false,
             node_spill: Vec::new(),
             spills: Vec::new(),
+            paths: Vec::new(),
+            map_sites: Vec::new(),
+            text_chains: Vec::new(),
+            text_members: Vec::new(),
+            text_regs: (0, 0),
             key_ics: 0,
             param_reg: HashMap::new(),
             result_reg: 0,
@@ -945,7 +1090,23 @@ impl<'r, 's> Compiler<'r, 's> {
             K::SetMutation { target, value } if matches!(target.kind, K::Identifier { .. }) => {
                 let K::Identifier { name } = &target.kind else { unreachable!() };
                 self.enter();
-                let done = if in_place_shape(target, value) {
+                // F4.8c: `set P to append(P, e)` con P de las que la VM encuentra: el camino normal,
+                // y su `Call` agrega en el lugar (`AppendInPlace`). Si no, la vía de la referencia.
+                let append = if append_shape(target, value) {
+                    match self.place(self.target(target)) {
+                        Place::Param(r) => Some(Root::Param(r)),
+                        Place::Win(k) => Some(Root::Win(k)),
+                        Place::Local(k) => Some(Root::Local(k)),
+                        Place::Free => {
+                            let nm = self.name(name);
+                            Some(Root::Free { name: nm, ic: self.ic() })
+                        }
+                        Place::Outer(..) => None,
+                    }
+                } else {
+                    None
+                };
+                let done = if append.is_none() && in_place_shape(target, value) {
                     let node = self.cold_spilled(n);
                     let nm = self.name(name);
                     let done = self.label();
@@ -960,7 +1121,13 @@ impl<'r, 's> Compiler<'r, 's> {
                 } else {
                     None
                 };
-                let v = self.expr(value);
+                let v = self.set_value(target, name, value);
+                if let Some(root) = append {
+                    // La última instrucción del valor es el `Call` de `append`.
+                    if let Some(Ins::Call { site, .. }) = self.code.last() {
+                        self.sites[*site as usize].append = Some(root);
+                    }
+                }
                 self.at(&n.location);
                 let nm = self.name(name);
                 match self.place(self.target(target)) {
@@ -998,9 +1165,13 @@ impl<'r, 's> Compiler<'r, 's> {
                     None
                 };
                 let v = self.expr(value);
-                let node = self.cold_spilled(target);
-                self.at(&n.location);
-                self.emit(Ins::SetPath { src: v, node, dst });
+                if set_root_identifier(target).is_some() {
+                    self.set_path(n, target, v, dst);
+                } else {
+                    let node = self.cold_spilled(target);
+                    self.at(&n.location);
+                    self.emit(Ins::SetPath { src: v, node, dst });
+                }
                 if let Some(d) = done {
                     self.bind(d);
                 }
@@ -1247,7 +1418,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 for (i, a) in arguments.iter().enumerate() {
                     self.into_reg(&a.value, first + i as Reg, end);
                 }
-                self.sites.push(CallSite { names: None, checked: true });
+                self.sites.push(CallSite { names: None, checked: true, append: None });
                 let site = (self.sites.len() - 1) as u32;
                 self.at(&c.location);
                 let dst = self.reg();
@@ -1302,6 +1473,121 @@ impl<'r, 's> Compiler<'r, 's> {
             }
             _ => Place::Free,
         }
+    }
+
+    /// El valor de `set P to value` con P una variable: una cadena de texto (F4.6c) si `value` es
+    /// `P + e1 + … + ek` y P está donde la VM la escribe; si no, la expresión de siempre.
+    fn set_value(&mut self, target: &Node, name: &str, value: &Node) -> Opnd {
+        let k = text_chain_len(value, name);
+        if k == 0 || (k > 1 && self.text_regs.1 == 0) {
+            return self.expr(value);
+        }
+        let root = match self.place(self.target(target)) {
+            Place::Param(r) => Root::Param(r),
+            Place::Win(s) => Root::Win(s),
+            Place::Local(s) => Root::Local(s),
+            Place::Free => {
+                let name = self.name(name);
+                Root::Free { name, ic: self.ic() }
+            }
+            Place::Outer(..) => return self.expr(value),
+        };
+        let old = if k > 1 {
+            let (r, left) = self.text_regs;
+            self.text_regs = (r + 1, left - 1);
+            r
+        } else {
+            DISCARD
+        };
+        let chain = u16::try_from(self.text_chains.len()).expect("demasiadas cadenas de texto");
+        let first = u16::try_from(self.text_members.len()).expect("demasiadas cadenas de texto");
+        self.text_chains.push(TextChainDesc { root, old, first, n: k as u16 });
+        self.text_link(value, chain, k)
+    }
+
+    /// Un `+` de la cadena (`k` = cuántos quedan hasta P, éste incluido): exactamente lo que
+    /// compila `expr_in` para un `BinaryOp` (mismos pasos, registros y orden), anotado.
+    fn text_link(&mut self, n: &Node, chain: u16, k: usize) -> Opnd {
+        let NodeKind::BinaryOp { left, operator, right } = &n.kind else { unreachable!("cadena sin +") };
+        self.at(&n.location);
+        self.enter();
+        let a = if k > 1 { self.text_link(left, chain, k - 1) } else { self.expr(left) };
+        let a = self.keep_until(a, right);
+        let b = self.expr(right);
+        self.at(&n.location);
+        let dst = self.reg();
+        let fb = self.feedback;
+        self.feedback = self.feedback.saturating_add(1);
+        self.text_members.push(TextMember { pc: self.code.len() as u32, chain, dst, a, b, fb });
+        self.emit(Ins::Binary { dst, op: *operator, a, b, fb });
+        Opnd::Reg(dst)
+    }
+
+    /// F4.6a: `set <raíz><pasos> to v` con la raíz una variable, en el orden de la referencia
+    /// (`exec_set` → `exec_place`): el valor ya evaluado, la raíz, y por cada paso su índice y el
+    /// paso; la hoja escribe. Los nodos del destino no cuentan pasos (la referencia tampoco); los
+    /// índices, sí, por su código.
+    fn set_path(&mut self, n: &Node, target: &Node, v: Opnd, dst: Reg) {
+        // La referencia tiene el valor en la mano antes de recorrer el camino (con él, su cuenta
+        // de referencias, que decide los `make_unique`): una lectura de variable se toma ya.
+        let src = match v {
+            Opnd::Reg(_) | Opnd::Const(_) => v,
+            other => Opnd::Reg(self.to_reg(other)),
+        };
+        // Los pasos, de la raíz a la hoja.
+        let mut steps: Vec<&Node> = Vec::new();
+        let mut cur = target;
+        let root_name = loop {
+            match &cur.kind {
+                NodeKind::Identifier { name } => break name,
+                NodeKind::IndexAccess { object, .. } | NodeKind::PropertyAccess { object, .. } => {
+                    steps.push(cur);
+                    cur = object;
+                }
+                _ => unreachable!("raíz sin variable"),
+            }
+        };
+        steps.reverse();
+        let root = match self.place(self.target(cur)) {
+            Place::Param(r) => Root::Param(r),
+            Place::Win(k) => Root::Win(k),
+            Place::Local(k) => Root::Local(k),
+            Place::Free => {
+                let name = self.name(root_name);
+                Root::Free { name, ic: self.ic() }
+            }
+            Place::Outer(..) => Root::Slow,
+        };
+        let node = self.cold_spilled(target);
+        let done = self.label();
+        let c = self.reg();
+        self.at(&target.location);
+        let target_loc = self.cur_loc;
+        let desc = self.paths.len() as u32;
+        self.paths.push(PathDesc { root, node, src, dst, done, key: NONE, ic: NONE, target_loc });
+        self.at(&n.location);
+        self.emit(Ins::PathRoot { c, desc });
+        let last = steps.len() - 1;
+        for (i, st) in steps.iter().enumerate() {
+            let (idx, key) = match &st.kind {
+                NodeKind::IndexAccess { index, .. } => (self.expr(index), NONE),
+                NodeKind::PropertyAccess { property_name, .. } => (Opnd::Const(0), self.name(property_name)),
+                _ => unreachable!(),
+            };
+            let ic = self.key_ic();
+            if i == last {
+                let d = &mut self.paths[desc as usize];
+                d.key = key;
+                d.ic = ic;
+                self.at(&n.location);
+                self.emit(Ins::PathSet { c, idx, desc });
+            } else {
+                // La ubicación del paso (sus errores, como en `exec_place`).
+                self.at(&st.location);
+                self.emit(Ins::PathStep { c, idx, key, ic });
+            }
+        }
+        self.bind(done);
     }
 
     fn when(&mut self, n: &Node, want: Option<Reg>) {
@@ -1406,6 +1692,29 @@ impl<'r, 's> Compiler<'r, 's> {
                 self.emit(Ins::MakeList { dst, first, n: elements.len() as u16 });
                 Opnd::Reg(dst)
             }
+            // F4.8g: con claves de texto constantes, sólo los valores van a registros; las claves y su
+            // forma quedan en el sitio (evaluar un literal no hace nada más que su paso: se cuenta
+            // igual, en el mismo orden).
+            K::MapLiteral { pairs } if !pairs.is_empty() && pairs.len() <= MAX_SHAPED && pairs.iter().all(|(k, _)| matches!(k.kind, K::TextLiteral { .. })) => {
+                self.enter();
+                let first = self.block_regs(pairs.len());
+                let end = first + pairs.len() as Reg;
+                let mut keys = Vec::with_capacity(pairs.len());
+                for (i, (k, v)) in pairs.iter().enumerate() {
+                    let K::TextLiteral { value } = &k.kind else { unreachable!("clave de texto") };
+                    self.enter();
+                    keys.push(Key::from(value.as_str()));
+                    self.into_reg(v, first + i as Reg, end);
+                }
+                self.at(&n.location);
+                let dst = self.dst(want);
+                let site = self.map_sites.len() as u32;
+                let keys_len = keys.len() as u16;
+                let shape = ShapeRef::of_keys(keys.len(), |i| keys[i].clone());
+                self.map_sites.push(MapSite { keys: keys.into_boxed_slice(), shape });
+                self.emit(Ins::MakeMap { dst, first, n: keys_len, site });
+                Opnd::Reg(dst)
+            }
             K::MapLiteral { pairs } => {
                 self.enter();
                 let first = self.block_regs(2 * pairs.len());
@@ -1416,7 +1725,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 }
                 self.at(&n.location);
                 let dst = self.dst(want);
-                self.emit(Ins::MakeMap { dst, first, n: pairs.len() as u16 });
+                self.emit(Ins::MakeMap { dst, first, n: pairs.len() as u16, site: NONE });
                 Opnd::Reg(dst)
             }
             // `a of b.c`: si leer `b.c` falla con "Map has no key", la referencia agrega una nota
@@ -1460,7 +1769,7 @@ impl<'r, 's> Compiler<'r, 's> {
                             let func = self.to_reg(f);
                             let first = self.block_regs(1);
                             self.emit(Ins::Move { dst: first, src: Opnd::Reg(cur) });
-                            self.sites.push(CallSite { names: None, checked: false });
+                            self.sites.push(CallSite { names: None, checked: false, append: None });
                             let site = (self.sites.len() - 1) as u32;
                             self.at(&t.location);
                             self.emit(Ins::Call { dst, func, args: first, n: 1, site });
@@ -1645,7 +1954,7 @@ impl<'r, 's> Compiler<'r, 's> {
         } else {
             None
         };
-        self.sites.push(CallSite { names, checked });
+        self.sites.push(CallSite { names, checked, append: None });
         let site = (self.sites.len() - 1) as u32;
         self.at(&n.location);
         self.emit(Ins::Call { dst, func, args: first, n: total as u16, site });
@@ -1736,6 +2045,10 @@ impl<'r, 's> Compiler<'r, 's> {
                     leader[target(&self.labels, done)] = true;
                 }
                 Ins::SetPath { .. } => leader[i + 1] = true,
+                // Como `TryInPlace`: no corta el bloque; su salida (la referencia) va a `done`.
+                Ins::PathRoot { desc, .. } => {
+                    leader[target(&self.labels, self.paths[desc as usize].done)] = true;
+                }
                 Ins::EachNext { exit, .. } => {
                     leader[target(&self.labels, exit)] = true;
                     leader[i + 1] = true;
@@ -1776,6 +2089,8 @@ impl<'r, 's> Compiler<'r, 's> {
         let mut new_rest = Vec::with_capacity(n);
         let mut new_loc = Vec::with_capacity(n);
         let mut new_stop = Vec::with_capacity(n);
+        // Dónde quedó cada instrucción (no su bloque: un salto al comienzo cae en el `Steps`).
+        let mut placed = vec![NONE; n];
         let mut i = 0;
         while i < n {
             // Un bloque: suma sus pesos en su primera instrucción.
@@ -1806,6 +2121,7 @@ impl<'r, 's> Compiler<'r, 's> {
                 if matches!(self.code[k], Ins::Nop) || fused == Some(k) {
                     continue;
                 }
+                placed[k] = code.len() as u32;
                 code.push(self.code[k]);
                 new_rest.push(rest[k]);
                 new_loc.push(self.loc[k]);
@@ -1834,6 +2150,12 @@ impl<'r, 's> Compiler<'r, 's> {
                 *t = map(*t, &self.labels);
             }
         }
+        for p in self.paths.iter_mut() {
+            p.done = map(p.done, &self.labels);
+        }
+        for m in self.text_members.iter_mut() {
+            m.pc = placed[m.pc as usize];
+        }
         let loop_heads = self.loop_heads.iter().map(|&l| map(l, &self.labels)).collect();
         let frame = self.frame_scope.map(|s| self.shared.layouts[s as usize].clone());
         let tagged = !self.children.is_empty();
@@ -1857,6 +2179,10 @@ impl<'r, 's> Compiler<'r, 's> {
             nlocals: self.nlocals,
             node_spill: self.node_spill,
             spills: self.spills,
+            paths: self.paths,
+            map_sites: self.map_sites.into_boxed_slice(),
+            text_chains: self.text_chains.into_boxed_slice(),
+            text_members: self.text_members.into_boxed_slice(),
             nregs: self.max_reg,
             ics: (0..self.ics).map(|_| Cell::new(0)).collect(),
             ic_here: self.ic_hops.iter().map(|&h| self.hops[h as usize].from.is_none()).collect(),
@@ -1918,6 +2244,16 @@ fn floor_div_hint(n: &Node, right: &Node) -> bool {
         && right.location.column > n.location.column + 2
 }
 
+/// F4.8c: `append(P, e)` sobre la variable P (dos argumentos por posición, la función por nombre).
+fn append_shape(target: &Node, value: &Node) -> bool {
+    match &value.kind {
+        NodeKind::TaskCall { name, arguments } => {
+            name.as_identifier() == Some("append") && arguments.len() == 2 && arguments.iter().all(|a| a.name.is_none()) && same_place(&arguments[0].value, target)
+        }
+        _ => false,
+    }
+}
+
 /// Las formas que `try_update_in_place` puede hacer en el lugar (la función vuelve a chequear
 /// todo; esto sólo evita llamarla cuando no puede aplicar).
 fn in_place_shape(target: &Node, value: &Node) -> bool {
@@ -1932,9 +2268,139 @@ fn in_place_shape(target: &Node, value: &Node) -> bool {
     }
 }
 
+/// F4.6c: cuántos `+` tiene `value` si es `P + e1 + … + ek` (asociativo a izquierda, P abajo de
+/// todo); 0 si no.
+fn text_chain_len(value: &Node, p: &str) -> usize {
+    let mut k = 0;
+    let mut cur = value;
+    loop {
+        match &cur.kind {
+            NodeKind::BinaryOp { left, operator, .. } if *operator == BinOp::Add => {
+                k += 1;
+                cur = left;
+            }
+            NodeKind::Identifier { name } if k > 0 && **name == *p => return k,
+            _ => return 0,
+        }
+    }
+}
+
+/// Cuántas sentencias de este cuerpo (sin entrar a tasks ni lambdas: son otros chunks) son cadenas
+/// de texto de más de un `+` (las que el compilador visita: si contara de menos, esas cadenas quedan
+/// como `Binary`).
+fn long_text_chains(n: &Node) -> usize {
+    use NodeKind as K;
+    let block = |b: &[Node]| b.iter().map(long_text_chains).sum::<usize>();
+    match &n.kind {
+        K::SetMutation { target, value } => match &target.kind {
+            K::Identifier { name } => usize::from(text_chain_len(value, name) > 1),
+            _ => 0,
+        },
+        K::WhenStatement { body, otherwise, otherwise_when, .. } => {
+            block(body) + otherwise.as_deref().map_or(0, block) + otherwise_when.as_deref().map_or(0, long_text_chains)
+        }
+        K::WhileStatement { body, .. } | K::EachStatement { body, .. } => block(body),
+        K::MatchStatement { arms, otherwise, .. } => {
+            arms.iter().map(|a| match &a.kind {
+                K::MatchArm { body, .. } => block(body),
+                _ => 0,
+            }).sum::<usize>()
+                + otherwise.as_deref().map_or(0, block)
+        }
+        _ => 0,
+    }
+}
+
 // =============================================================================================
 // Ejecución
 // =============================================================================================
+
+
+/// F4.8g: las llamadas de un builtin a una función por elemento (`apply`, `where`, `reduce`, …), de a
+/// una como `call_fast`. Con código nativo, una sesión (`native::LambdaFast`): el contexto se arma una
+/// vez y el elemento entra prestado de la lista. Lo que no encaja va por `call_fast`.
+pub(crate) struct LambdaCall<'a> {
+    f: &'a SynValue,
+    /// La task (si la VM puede correrla: ni la referencia ni etiquetas) y el flag de cancelación.
+    #[cfg(feature = "native-tier")]
+    task: Option<&'a Rc<SynTaskValue>>,
+    #[cfg(feature = "native-tier")]
+    flag: &'a std::sync::atomic::AtomicBool,
+    /// La sesión: se arma cuando la task ya tiene código nativo (lo compila una de las primeras
+    /// llamadas, por `call_fast`); `off` si no se puede o se terminó (no se vuelve a intentar).
+    #[cfg(feature = "native-tier")]
+    fast: Option<native::LambdaFast<'a>>,
+    #[cfg(feature = "native-tier")]
+    off: bool,
+}
+
+impl<'a> LambdaCall<'a> {
+    /// Por la sesión, si la hay (o si ya se puede armar); `None`: por `call_fast`.
+    #[cfg(feature = "native-tier")]
+    #[inline]
+    fn native(&mut self, it: &mut Interpreter, pre: Option<&SynValue>, l: &ListRef, i: usize) -> Option<Result<SynValue, Control>> {
+        if self.fast.is_none() {
+            if self.off {
+                return None;
+            }
+            let t: &'a Rc<SynTaskValue> = self.task?;
+            if !t.code.native.ready() {
+                return None;
+            }
+            self.fast = it.vm_lambda_session(t, self.flag);
+            if self.fast.is_none() {
+                self.off = true;
+                return None;
+            }
+        }
+        let r = native::LambdaFast::call(&mut self.fast, it, pre, l, i);
+        if self.fast.is_none() {
+            self.off = true;
+        }
+        r
+    }
+
+    /// `f(l[i])`.
+    pub(crate) fn item(&mut self, it: &mut Interpreter, l: &ListRef, i: usize, loc: &SourceLocation) -> Result<SynValue, Control> {
+        #[cfg(feature = "native-tier")]
+        if let Some(r) = self.native(it, None, l, i) {
+            return r;
+        }
+        let item = l.borrow().get(i).expect("dentro del largo");
+        it.call_fast(self.f, &mut [item], loc)
+    }
+
+    /// `f(l[i])` y el elemento (`where`, `find_first`, `sort_by`). La lista es la que tiene el builtin
+    /// (una escritura del cuerpo copia): el elemento es el mismo antes o después de la llamada.
+    pub(crate) fn item_keep(&mut self, it: &mut Interpreter, l: &ListRef, i: usize, loc: &SourceLocation) -> Result<(SynValue, SynValue), Control> {
+        #[cfg(feature = "native-tier")]
+        if let Some(r) = self.native(it, None, l, i) {
+            return r.map(|r| (l.borrow().get(i).expect("dentro del largo"), r));
+        }
+        let item = l.borrow().get(i).expect("dentro del largo");
+        let r = it.call_fast(self.f, &mut [item.clone()], loc)?;
+        Ok((item, r))
+    }
+
+    /// `f(acc, l[i])` (`reduce`).
+    pub(crate) fn acc_item(&mut self, it: &mut Interpreter, acc: SynValue, l: &ListRef, i: usize, loc: &SourceLocation) -> Result<SynValue, Control> {
+        #[cfg(feature = "native-tier")]
+        if let Some(r) = self.native(it, Some(&acc), l, i) {
+            return r;
+        }
+        let item = l.borrow().get(i).expect("dentro del largo");
+        it.call_fast(self.f, &mut [acc, item], loc)
+    }
+}
+
+/// Agranda la ventana de registros a `len` con `Nothing` construidos en el lugar: `resize` clona el
+/// relleno (el `match` entero de `SynValue::clone` por registro, en cada llamada de la VM).
+#[inline]
+fn grow_regs(regs: &mut Vec<SynValue>, len: usize) {
+    if let Some(k) = len.checked_sub(regs.len()) {
+        regs.extend(std::iter::repeat_with(|| SynValue::Nothing).take(k));
+    }
+}
 
 impl Interpreter {
     /// El código de una task para esta llamada, si la VM la corre: compilado al definirla desde
@@ -1999,7 +2465,7 @@ impl Interpreter {
             e.bindings.len_names() >= l.names.len() && (!chunk.tagged || e.bindings.laid_out_as(l))
         }));
         let base = self.vm_regs.len();
-        self.vm_regs.resize(base + chunk.nregs as usize, SynValue::Nothing);
+        grow_regs(&mut self.vm_regs, base + chunk.nregs as usize);
         let r = self.run_chunk_at(chunk, env, base);
         self.vm_regs.truncate(base);
         r
@@ -2017,7 +2483,7 @@ impl Interpreter {
         let lbase = self.vm_locals.len();
         self.vm_locals.resize(lbase + chunk.nlocals as usize, None);
         let base = self.vm_regs.len();
-        self.vm_regs.resize(base + chunk.nregs as usize, SynValue::Nothing);
+        grow_regs(&mut self.vm_regs, base + chunk.nregs as usize);
         {
             // Los parámetros van a sus registros (F3.7); otro nombre ligado, a la ventana.
             let mut e = call_env.borrow_mut();
@@ -2233,19 +2699,45 @@ impl Interpreter {
         Some(f)
     }
 
+    #[inline(always)]
     fn run_chunk_at(&mut self, chunk: &Rc<Chunk>, env: &Rc<RefCell<Environment>>, base: usize) -> Result<SynValue, Control> {
+        self.run_chunk_from(chunk, env, base, 0, None)
+    }
+
+    /// Los frames de un cuerpo que vuelve del código nativo (ver `run_chunk_from`), fuera de línea:
+    /// el despacho no cambia. Dónde empiezan los iteradores del de más adentro y los del de más afuera.
+    #[inline(never)]
+    fn vm_resume_frames(&mut self, (frames, ib, outer): (Vec<VmFrame>, usize, usize)) -> (usize, usize) {
+        self.vm_frames.extend(frames);
+        (ib, outer)
+    }
+
+    /// `run_chunk_at` desde la instrucción `pc0` (F4.8b). `resume`: un cuerpo que salió del código
+    /// nativo a mitad de camino (ver `vm_call_rust`): los frames que esperan a su llamado, arriba de
+    /// los de quien llama, y dónde empiezan los iteradores del de más adentro y los del de más afuera.
+    fn run_chunk_from(
+        &mut self,
+        chunk: &Rc<Chunk>,
+        env: &Rc<RefCell<Environment>>,
+        base: usize,
+        pc0: usize,
+        resume: Option<(Vec<VmFrame>, usize, usize)>,
+    ) -> Result<SynValue, Control> {
         // El chunk, el frame y la ventana de registros cambian al entrar a una llamada y al volver
         // (F3.2); `entry` es cuántas llamadas de la VM había al empezar: las de arriba son nuestras.
         let mut chunk = chunk.clone();
         let mut env = env.clone();
         let mut base = base;
         let entry = self.vm_frames.len();
-        let mut pc = 0usize;
+        let mut pc = pc0;
         // Frames de la VM abiertos dentro de este cuerpo (vueltas de `each`, brazos de `match`) y
         // dónde empiezan sus iteradores.
         let mut depth: u16 = 0;
         let mut iter_base = self.vm_iters.len();
-        let entry_iters = iter_base;
+        let mut entry_iters = iter_base;
+        if let Some(r) = resume {
+            (iter_base, entry_iters) = self.vm_resume_frames(r);
+        }
         loop {
             let at = pc;
             let ins = chunk.code[at].get();
@@ -2286,10 +2778,8 @@ impl Interpreter {
                     self.put(base, dst, syn_list(items));
                     Ok(())
                 }
-                Ins::MakeMap { dst, first, n } => {
-                    let from = base + first as usize;
-                    let m = map_from_pair_slots(&mut self.vm_regs[from..from + 2 * n as usize]);
-                    self.put(base, dst, SynValue::Map(m));
+                Ins::MakeMap { dst, first, n, site } => {
+                    self.vm_make_map(&chunk, base, dst, first, n, site);
                     Ok(())
                 }
                 Ins::GetProp { dst, obj, name, ic } => (|| {
@@ -2312,7 +2802,7 @@ impl Interpreter {
                         (SynValue::Map(m), SynValue::Text(k)) => m.borrow().get_cached_key(k, &chunk.key_ics[ic as usize]).cloned(),
                         (SynValue::List(l), SynValue::Number(Number::Int(k))) => {
                             let items = l.borrow();
-                            resolve_index(*k, items.len()).map(|j| items[j].clone())
+                            resolve_index(*k, items.len()).and_then(|j| items.get(j))
                         }
                         _ => None,
                     };
@@ -2324,6 +2814,16 @@ impl Interpreter {
                     Ok(())
                 })(),
                 Ins::SetPath { src, node, dst } => self.vm_set_path(&chunk, &env, base, src, node, dst, at),
+                Ins::PathRoot { c, desc } => match self.vm_path_root(&chunk, &env, base, c, desc, at) {
+                    Ok(Some(j)) => {
+                        pc = j;
+                        Ok(())
+                    }
+                    Ok(None) => Ok(()),
+                    Err(c) => Err(c),
+                },
+                Ins::PathStep { c, idx, key, ic } => self.vm_path_step(&chunk, &env, base, c, idx, key, ic, at),
+                Ins::PathSet { c, idx, desc } => self.vm_path_set(&chunk, &env, base, c, idx, desc, at),
                 Ins::CheckProtected { func, name } => check_protected_callee(
                     &chunk.names[name as usize],
                     &self.vm_regs[base + func as usize],
@@ -2401,6 +2901,7 @@ impl Interpreter {
                     self.put(base, dst, v);
                     Ok(())
                 })(),
+                Ins::TextChain { dst, a, b, m } => self.vm_text_chain(&chunk, &env, base, at, dst, a, b, m),
                 // Quickening (F3.4): las formas especializadas, en brazos propios.
                 Ins::IntArith { dst, op, a, b, fb } => match self.int_pair(&chunk, &env, base, a, b) {
                     Some((x, y)) => {
@@ -2515,10 +3016,12 @@ impl Interpreter {
                         }
                     }
                     pc = to as usize;
+                    let mut r = Ok(());
                     if chunk.loops[lp as usize].tick() {
                         match self.vm_loop_hot(&chunk, &env, base, iter_base, at, lp) {
                             native::OsrStep::Stay => {}
                             native::OsrStep::Exit(p) => pc = p,
+                            native::OsrStep::Fail(c) => r = Err(c),
                             native::OsrStep::Resume { r, pc: back, dst: rdst } => {
                                 // Salió a mitad de una llamada: este frame espera su resultado
                                 // (como en `CallNative`) y la VM sigue en el de más adentro.
@@ -2541,7 +3044,7 @@ impl Interpreter {
                             }
                         }
                     }
-                    Ok(())
+                    r
                 }
                 Ins::JumpIfFalsy { src, to } => self.opnd(&chunk, &env, base, src, at).map(|v| {
                     if !v.is_truthy() {
@@ -2678,7 +3181,7 @@ impl Interpreter {
                     // Los pasos del resto del bloque (el valor y la asignación) no corrieron todavía.
                     let pending = chunk.rest[at] as u64;
                     self.steps = self.steps.wrapping_sub(pending);
-                    match self.vm_try_in_place(&chunk, &env, base, dst, node, name, ic, slot) {
+                    match self.vm_try_in_place(&chunk, &env, base, at, dst, node, name, ic, slot) {
                         Ok(true) => {
                             pc = done as usize;
                             Ok(())
@@ -2754,6 +3257,14 @@ impl Interpreter {
                 Ins::CallBuiltin { dst, func, args, n, site } => match self.vm_call_builtin(&chunk, base, at, dst, func, args, n, site) {
                     Ok(true) => Ok(()),
                     // Ya no encaja (y no tocó nada): volvió a ser `Call` y se repite como tal.
+                    Ok(false) => {
+                        pc = at;
+                        Ok(())
+                    }
+                    Err(c) => Err(c),
+                },
+                Ins::AppendInPlace { dst, func, args, site } => match self.vm_append_in_place(&chunk, &env, base, at, dst, func, args, site) {
+                    Ok(true) => Ok(()),
                     Ok(false) => {
                         pc = at;
                         Ok(())
@@ -3015,10 +3526,182 @@ impl Interpreter {
             }
             Some((Num::I(_), Num::I(_))) => int_form(op, dst, a, b, fb),
             Some(_) => float_form(op, dst, a, b, fb),
+            None if op == BinOp::Add && !chunk.text_members.is_empty() => {
+                if self.vm_text_quicken(chunk, env, base, at, a, b, fb) {
+                    // Esta vez, el camino genérico (la cadena corre en modo texto desde la próxima).
+                    return self.vm_binary_generic(chunk, env, base, at, dst, op, a, b);
+                }
+                None
+            }
             None => None,
         };
         chunk.code[at].set(quick.unwrap_or(Ins::BinaryAny { dst, op, a, b }));
         self.vm_binary_generic(chunk, env, base, at, dst, op, a, b)
+    }
+
+    /// F4.6c: si el `+` de `at` es la cabeza de una cadena de texto que ve un texto y una pieza que
+    /// se le suma, la cadena entera pasa a `TextChain` (para siempre, como `BinaryAny`).
+    #[allow(clippy::too_many_arguments)]
+    fn vm_text_quicken(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, at: usize, a: Opnd, b: Opnd, fb: u16) -> bool {
+        let Some(m) = chunk.text_members.iter().position(|x| x.pc as usize == at) else { return false };
+        let ch = chunk.text_chains[chunk.text_members[m].chain as usize];
+        if m != ch.first as usize || chunk.deopts[fb as usize].get() > MAX_DEOPTS {
+            return false;
+        }
+        let fits = self.peek_with(chunk, env, base, a, |v| matches!(v, Some(SynValue::Text(_))))
+            && self.peek_with(chunk, env, base, b, |v| v.is_some_and(text_addable));
+        if !fits {
+            return false;
+        }
+        for j in ch.first..ch.first + ch.n {
+            let x = chunk.text_members[j as usize];
+            chunk.code[x.pc as usize].set(Ins::TextChain { dst: x.dst, a: x.a, b: x.b, m: j });
+        }
+        true
+    }
+
+    /// Mira un operando sin moverlo ni clonarlo (`None`: un hueco).
+    fn peek_with<R>(&self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, o: Opnd, f: impl FnOnce(Option<&SynValue>) -> R) -> R {
+        match o {
+            Opnd::Reg(r) | Opnd::Copy(r) => f(Some(&self.vm_regs[base + r as usize])),
+            Opnd::Const(k) => f(Some(&chunk.consts[k as usize])),
+            Opnd::RLocal(k) => f(self.vm_locals[self.vm_lbase + k as usize].as_ref()),
+            Opnd::Local(k) => f(env.borrow().bindings.slot(k as usize)),
+        }
+    }
+
+    /// `TextChain` (F4.6c, ver `TextChainDesc`).
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_text_chain(
+        &mut self,
+        chunk: &Chunk,
+        env: &Rc<RefCell<Environment>>,
+        base: usize,
+        at: usize,
+        dst: Reg,
+        a: Opnd,
+        b: Opnd,
+        m: u16,
+    ) -> Result<(), Control> {
+        let mem = chunk.text_members[m as usize];
+        let ch = chunk.text_chains[mem.chain as usize];
+        let i = m - ch.first;
+        let last = i + 1 == ch.n;
+        let loc = &chunk.locs[chunk.loc[at] as usize];
+        if i == 0 {
+            // La cabeza: P y la primera pieza, en el orden de la referencia.
+            let p = self.opnd(chunk, env, base, a, at)?;
+            let x = self.opnd(chunk, env, base, b, at)?;
+            if ch.old != DISCARD {
+                self.vm_regs[base + ch.old as usize] = SynValue::Nothing;
+            }
+            let head_fb = mem.fb as usize;
+            match p {
+                SynValue::Text(old) if text_addable(&x) && chunk.deopts[head_fb].get() <= MAX_DEOPTS => {
+                    if last {
+                        self.vm_text_finish(chunk, env, base, ch, m, dst, old, x);
+                    } else {
+                        self.vm_regs[base + ch.old as usize] = SynValue::Text(old);
+                        self.put(base, dst, x);
+                    }
+                    Ok(())
+                }
+                p => {
+                    // P no es texto, o la pieza no se le suma: el `+` de siempre (y la cadena
+                    // entera, genérica esta vez). Cuenta como desoptimización.
+                    let n = &chunk.deopts[head_fb];
+                    n.set(n.get().saturating_add(1));
+                    let v = self.exec_binary(p, BinOp::Add, x, loc)?;
+                    self.put(base, dst, v);
+                    Ok(())
+                }
+            }
+        } else {
+            let old_at = base + ch.old as usize;
+            if !matches!(self.vm_regs[old_at], SynValue::Text(_)) {
+                // La cabeza corrió genérica: éste también.
+                return self.vm_binary_generic(chunk, env, base, at, dst, BinOp::Add, a, b);
+            }
+            let x = self.opnd(chunk, env, base, b, at)?;
+            if text_addable(&x) {
+                if last {
+                    let SynValue::Text(old) = std::mem::replace(&mut self.vm_regs[old_at], SynValue::Nothing) else { unreachable!() };
+                    self.vm_text_finish(chunk, env, base, ch, m, dst, old, x);
+                } else {
+                    self.put(base, dst, x);
+                }
+                return Ok(());
+            }
+            // Una pieza que no se suma a un texto: en este momento, el intermedio de la referencia
+            // (P vieja + las piezas hasta acá) y su `+`, con su resultado o su error.
+            let SynValue::Text(mut t) = std::mem::replace(&mut self.vm_regs[old_at], SynValue::Nothing) else { unreachable!() };
+            for j in ch.first..m {
+                let r = base + chunk.text_members[j as usize].dst as usize;
+                let piece = std::mem::replace(&mut self.vm_regs[r], SynValue::Nothing);
+                let added = text_add_piece(&mut t, &piece);
+                debug_assert!(added);
+            }
+            let n = &chunk.deopts[chunk.text_members[ch.first as usize].fb as usize];
+            n.set(n.get().saturating_add(1));
+            let v = self.exec_binary(SynValue::Text(t), BinOp::Add, x, loc)?;
+            self.put(base, dst, v);
+            Ok(())
+        }
+    }
+
+    /// El último `+` de una cadena en modo texto: las piezas (las de los registros de los `+`
+    /// anteriores y `x`) se agregan al texto de P si sigue siendo el viejo (en el lugar si, soltado
+    /// el clon `old`, tiene un solo dueño: `push_str`); si no, a `old`. El resultado va a `dst` y el
+    /// `set` que sigue lo escribe como siempre.
+    #[allow(clippy::too_many_arguments)]
+    fn vm_text_finish(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, ch: TextChainDesc, m: u16, dst: Reg, old: SynText, x: SynValue) {
+        let mut pieces: SmallVec<[SynValue; 4]> = SmallVec::new();
+        for j in ch.first..m {
+            let r = base + chunk.text_members[j as usize].dst as usize;
+            pieces.push(std::mem::replace(&mut self.vm_regs[r], SynValue::Nothing));
+        }
+        pieces.push(x);
+        let mut old = Some(old);
+        let add = |t: &mut SynText, pieces: &[SynValue]| {
+            for p in pieces {
+                let added = text_add_piece(t, p);
+                debug_assert!(added);
+            }
+        };
+        let in_place = self.vm_text_slot(chunk, env, base, ch.root, |slot| match slot {
+            SynValue::Text(t) if SynText::same(t, old.as_ref().expect("viejo")) => {
+                drop(old.take());
+                add(t, &pieces);
+                Some(slot.clone())
+            }
+            _ => None,
+        });
+        let v = match in_place.flatten() {
+            Some(v) => v,
+            None => {
+                let mut t = old.take().expect("viejo");
+                add(&mut t, &pieces);
+                SynValue::Text(t)
+            }
+        };
+        self.put(base, dst, v);
+    }
+
+    /// El lugar de P, si está donde lo escribe la VM (un hueco o una global que no está en el
+    /// primer frame de su búsqueda: `None`, y el `set` resuelve como siempre).
+    fn vm_text_slot<R>(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, root: Root, f: impl FnOnce(&mut SynValue) -> R) -> Option<R> {
+        match root {
+            Root::Param(r) => Some(f(&mut self.vm_regs[base + r as usize])),
+            Root::Win(k) => self.vm_locals[self.vm_lbase + k as usize].as_mut().map(f),
+            Root::Local(k) => env.borrow_mut().bindings.slot_mut(k as usize).map(f),
+            Root::Free { name, ic } => {
+                let start = self.free_start(chunk, env, chunk.hops[chunk.ic_hops[ic as usize] as usize]);
+                let mut e = start.borrow_mut();
+                e.bindings.get_cached_mut(&chunk.names[name as usize], &chunk.ics[ic as usize]).map(f)
+            }
+            Root::Slow => None,
+        }
     }
 
     /// Una forma especializada vio otros tipos: vuelve a `Binary` (para especializarse con lo que
@@ -3055,6 +3738,7 @@ impl Interpreter {
         chunk: &Chunk,
         env: &Rc<RefCell<Environment>>,
         base: usize,
+        at: usize,
         dst: Reg,
         node: u32,
         name: u32,
@@ -3083,26 +3767,33 @@ impl Interpreter {
             unreachable!("TryInPlace sobre otro nodo")
         };
         let spill = chunk.node_spill[node as usize];
-        if spill != NONE {
+        let r = if spill != NONE {
             // La vía en el lugar es de la referencia y busca por nombre: las variables de la
             // ventana van a frames el rato que corre (ver `vm_spill`).
             let frames = self.vm_spill(chunk, env, base, spill);
             let r = self.try_update_in_place(target, value, frames.last().expect("spill vacío"));
             self.vm_unspill(chunk, base, spill, frames);
-            return match r? {
-                Some(v) => {
-                    self.put(base, dst, v);
-                    Ok(true)
-                }
-                None => Ok(false),
-            };
-        }
-        match self.try_update_in_place(target, value, env)? {
+            r
+        } else {
+            self.try_update_in_place(target, value, env)
+        };
+        match r? {
             Some(v) => {
                 self.put(base, dst, v);
                 Ok(true)
             }
-            None => Ok(false),
+            None => {
+                // F4.8d: `set <camino> to <camino> + e` que no aplicó (el valor no era una lista): la
+                // vía en el lugar no se vuelve a probar (una vez y para siempre, como `BinaryAny`). Es
+                // sólo un atajo (su resultado y sus pasos son los del camino normal, que es lo que
+                // corre el modo referencia): si más adelante ese lugar tuviera una lista, se copia en
+                // vez de agregar en el lugar. Así un `set p.x to p.x + d` con números no llama al
+                // tree-walker en cada vuelta, y el bucle puede pasar al nivel nativo.
+                if name == NONE && matches!(value.kind, NodeKind::BinaryOp { .. }) {
+                    chunk.code[at].set(Ins::Nop);
+                }
+                Ok(false)
+            }
         }
     }
 
@@ -3318,6 +4009,201 @@ impl Interpreter {
         Ok(())
     }
 
+    /// `PathRoot` (F4.6a): la raíz la resuelve la VM (lo común: `Ok(None)`, sigue el camino) o corre
+    /// la referencia entera y `Ok(Some(done))`; entonces los pasos que el bloque sumó para el código
+    /// del camino no corren (ver `TryInPlace`).
+    #[inline(never)]
+    fn vm_path_root(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, c: Reg, desc: u32, at: usize) -> Result<Option<usize>, Control> {
+        if self.vm_path_root_fast(chunk, env, base, c, desc).is_some() {
+            return Ok(None);
+        }
+        let pending = chunk.rest[at] as u64;
+        self.steps = self.steps.wrapping_sub(pending);
+        let d = chunk.paths[desc as usize];
+        match self.vm_set_path(chunk, env, base, d.src, d.node, d.dst, at) {
+            Ok(()) => Ok(Some(d.done as usize)),
+            Err(c) => {
+                // El camino de error vuelve a descontar `rest`.
+                self.steps = self.steps.wrapping_add(pending);
+                Err(c)
+            }
+        }
+    }
+
+    /// El contenedor de la variable raíz a `c`, como `exec_place` sobre un identificador: el mapa
+    /// de un módulo tal cual; si no, único (`make_unique`) y una copia de la referencia. `None` si
+    /// la raíz no está donde la VM la busca (un hueco, un frame de módulo o de afuera).
+    #[inline(always)]
+    fn vm_path_root_fast(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, c: Reg, desc: u32) -> Option<()> {
+        fn take(slot: &mut SynValue) -> SynValue {
+            if !matches!(slot, SynValue::Map(m) if module_env_of_map(m).is_some()) {
+                make_unique(slot);
+            }
+            slot.clone()
+        }
+        let v = match chunk.paths[desc as usize].root {
+            Root::Param(r) => take(&mut self.vm_regs[base + r as usize]),
+            Root::Win(k) => take(self.vm_locals[self.vm_lbase + k as usize].as_mut()?),
+            Root::Local(k) => {
+                let mut e = env.borrow_mut();
+                if e.name.starts_with("module:") {
+                    return None;
+                }
+                take(e.bindings.slot_mut(k as usize)?)
+            }
+            Root::Free { name, ic } => {
+                let start = self.free_start(chunk, env, chunk.hops[chunk.ic_hops[ic as usize] as usize]);
+                let mut e = start.borrow_mut();
+                if e.name.starts_with("module:") {
+                    return None;
+                }
+                take(e.bindings.get_cached_mut(&chunk.names[name as usize], &chunk.ics[ic as usize])?)
+            }
+            Root::Slow => return None,
+        };
+        self.put(base, c, v);
+        Some(())
+    }
+
+    /// `PathStep` (F4.6a): `c` pasa a ser el lugar de adentro, único. Una lista con un entero y un
+    /// mapa que no es de un módulo, directo (con la caché por forma); lo demás, el paso de la
+    /// referencia (`place_index_step`/`place_prop_step`), con sus errores.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_path_step(
+        &mut self,
+        chunk: &Chunk,
+        env: &Rc<RefCell<Environment>>,
+        base: usize,
+        c: Reg,
+        idx: Opnd,
+        key: u32,
+        ic: u32,
+        at: usize,
+    ) -> Result<(), Control> {
+        let parent = std::mem::replace(&mut self.vm_regs[base + c as usize], SynValue::Nothing);
+        let loc = &chunk.locs[chunk.loc[at] as usize];
+        let next = if key != NONE {
+            let name = &chunk.names[key as usize];
+            let fast = match &parent {
+                SynValue::Map(m) if module_env_of_map(m).is_none() => {
+                    m.borrow_mut().get_cached_mut(name, &chunk.key_ics[ic as usize]).map(|slot| {
+                        make_unique(slot);
+                        slot.clone()
+                    })
+                }
+                _ => None,
+            };
+            match fast {
+                Some(v) => v,
+                None => self.place_prop_step(parent, name, loc)?,
+            }
+        } else {
+            let i = self.opnd(chunk, env, base, idx, at)?;
+            let fast = match (&parent, &i) {
+                // (Un paso a un elemento para escribir adentro: una lista sin caja tiene números, que
+                // no tienen adentro; pasa a valores y el camino da el error de siempre.)
+                (SynValue::List(l), SynValue::Number(Number::Int(k))) => {
+                    let mut items = list_values_mut(l);
+                    let n = items.len();
+                    resolve_index(*k, n).map(|j| {
+                        make_unique(&mut items[j]);
+                        items[j].clone()
+                    })
+                }
+                (SynValue::Map(m), SynValue::Text(k)) if module_env_of_map(m).is_none() => {
+                    m.borrow_mut().get_cached_key_mut(k, &chunk.key_ics[ic as usize]).map(|slot| {
+                        make_unique(slot);
+                        slot.clone()
+                    })
+                }
+                _ => None,
+            };
+            match fast {
+                Some(v) => v,
+                None => self.place_index_step(parent, i, loc)?,
+            }
+        };
+        self.put(base, c, next);
+        Ok(())
+    }
+
+    /// `PathSet` (F4.6a): la hoja. Una lista con un entero en rango y un mapa que no es de un
+    /// módulo con la clave ya puesta, directo; lo demás, `set_leaf_*` (los mismos errores).
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_path_set(
+        &mut self,
+        chunk: &Chunk,
+        env: &Rc<RefCell<Environment>>,
+        base: usize,
+        c: Reg,
+        idx: Opnd,
+        desc: u32,
+        at: usize,
+    ) -> Result<(), Control> {
+        let d = chunk.paths[desc as usize];
+        let obj = std::mem::replace(&mut self.vm_regs[base + c as usize], SynValue::Nothing);
+        let out = if d.key != NONE {
+            let v = self.opnd(chunk, env, base, d.src, at)?;
+            let name = &chunk.names[d.key as usize];
+            let done = match &obj {
+                SynValue::Map(m) if module_env_of_map(m).is_none() => {
+                    let mut b = m.borrow_mut();
+                    match b.get_cached_mut(name, &chunk.key_ics[d.ic as usize]) {
+                        Some(slot) => {
+                            *slot = v.clone();
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                _ => false,
+            };
+            if done {
+                v
+            } else {
+                set_leaf_prop(&obj, name, v, &chunk.locs[chunk.loc[at] as usize])?
+            }
+        } else {
+            // El índice, después el valor: en la referencia los dos ya están evaluados (el valor
+            // antes que todo el camino), así que leerlos en este orden no se ve.
+            let i = self.opnd(chunk, env, base, idx, at)?;
+            let v = self.opnd(chunk, env, base, d.src, at)?;
+            let done = match (&obj, &i) {
+                (SynValue::List(l), SynValue::Number(Number::Int(k))) => {
+                    let mut items = l.borrow_mut();
+                    let n = items.len();
+                    match resolve_index(*k, n) {
+                        Some(j) => {
+                            items.set(j, v.clone());
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                (SynValue::Map(m), SynValue::Text(k)) if module_env_of_map(m).is_none() => {
+                    let mut b = m.borrow_mut();
+                    match b.get_cached_key_mut(k, &chunk.key_ics[d.ic as usize]) {
+                        Some(slot) => {
+                            *slot = v.clone();
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                _ => false,
+            };
+            if done {
+                v
+            } else {
+                set_leaf_index(&obj, &i, v, &chunk.locs[d.target_loc as usize], &chunk.locs[chunk.loc[at] as usize])?
+            }
+        };
+        self.put(base, d.dst, out);
+        Ok(())
+    }
+
     #[inline(never)]
     fn vm_wasm_tick(&mut self, chunk: &Chunk, base: usize, ctr: Reg, at: usize) -> Result<(), Control> {
         let n = match &self.vm_regs[base + ctr as usize] {
@@ -3370,7 +4256,7 @@ impl Interpreter {
                         // F4.1: una task caliente pasa al nivel nativo (esta llamada, en la VM).
                         #[cfg(feature = "native-tier")]
                         if t.code.native.tick() {
-                            self.vm_native_tier_up(chunk, at, t);
+                            self.vm_native_tier_up(chunk, at, t, first, n);
                         }
                         return self.vm_enter_regframe(t, code, first, n).map(Some);
                     }
@@ -3414,7 +4300,7 @@ impl Interpreter {
                         return Ok(None);
                     }
                     let new_base = self.vm_regs.len();
-                    self.vm_regs.resize(new_base + code.nregs as usize, SynValue::Nothing);
+                    grow_regs(&mut self.vm_regs, new_base + code.nregs as usize);
                     let lbase = self.vm_locals.len();
                     self.vm_locals.resize(lbase + code.nlocals as usize, None);
                     return Ok(Some(Enter { code, env: call_env, base: new_base, lbase, top: new_base }));
@@ -3436,7 +4322,7 @@ impl Interpreter {
         let top = self.vm_regs.len();
         let need = first + (code.nregs as usize).max(n);
         if top < need {
-            self.vm_regs.resize(need, SynValue::Nothing);
+            grow_regs(&mut self.vm_regs, need);
         }
         // Aridad permisiva (sin chequeo, un pipe): los de más se sueltan antes de los defaults.
         for i in np..n {
@@ -3462,6 +4348,117 @@ impl Interpreter {
         Ok(Enter { env: t.closure_env.clone(), code, base: first, lbase, top })
     }
 
+    /// F4.8b: una llamada por posición desde un builtin (`apply`, `where`, `reduce`, …), como el
+    /// vectorcall de CPython. A una task cuyo cuerpo es un frame en registros, los argumentos van
+    /// directo a su ventana (lo de `vm_call` + `vm_enter_regframe`, sin `Environment` ni `Vec` por
+    /// llamada) y, si tiene código nativo, entra ahí. Si no, `call_value` como siempre. Lo observable
+    /// es lo de `call_value_named` (la VM no corre con etiquetas: `vm_code_for`): la profundidad con
+    /// el mismo tope, aridad permisiva (los de más se sueltan antes de los defaults, que se evalúan
+    /// en el `closure_env`) y el `give` es el valor. Deja `args` vacíos.
+    pub(super) fn call_fast(&mut self, f: &SynValue, args: &mut [SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        if let SynValue::Task(t) = f {
+            if let Some(code) = self.vm_code_for(t) {
+                if code.regframe {
+                    return self.vm_call_rust(t, code, args);
+                }
+            }
+        }
+        let v: Vec<SynValue> = args.iter_mut().map(|a| std::mem::replace(a, SynValue::Nothing)).collect();
+        self.call_value(f.clone(), v, loc)
+    }
+
+    /// `MakeMap`, fuera de línea (F4.8g): con sitio, las claves constantes y su forma.
+    #[cold]
+    #[inline(never)]
+    fn vm_make_map(&mut self, chunk: &Chunk, base: usize, dst: Reg, first: Reg, n: u16, site: u32) {
+        let from = base + first as usize;
+        let m = if site == NONE {
+            map_from_pair_slots(&mut self.vm_regs[from..from + 2 * n as usize])
+        } else {
+            chunk.map_sites[site as usize].build(&mut self.vm_regs[from..from + n as usize])
+        };
+        self.put(base, dst, SynValue::Map(m));
+    }
+
+    /// F4.8g: `body` con las llamadas de un builtin a `f` por elemento (ver `LambdaCall`).
+    pub(super) fn with_lambda<R>(&mut self, f: &SynValue, body: impl FnOnce(&mut Self, &mut LambdaCall<'_>) -> R) -> R {
+        #[cfg(feature = "native-tier")]
+        {
+            let flag = self.cancel.flag.clone();
+            let task = match f {
+                SynValue::Task(t) if self.shortcuts && !self.labels => Some(t.clone()),
+                _ => None,
+            };
+            let mut lc = LambdaCall { f, task: task.as_ref(), flag: &flag, fast: None, off: task.is_none() };
+            body(self, &mut lc)
+        }
+        #[cfg(not(feature = "native-tier"))]
+        {
+            let mut lc = LambdaCall { f };
+            body(self, &mut lc)
+        }
+    }
+
+    /// `call_fast` a un cuerpo con frame en registros.
+    fn vm_call_rust(&mut self, t: &Rc<SynTaskValue>, code: &Rc<Chunk>, args: &mut [SynValue]) -> Result<SynValue, Control> {
+        self.recursion_depth += 1;
+        if self.recursion_depth > MAX_RECURSION {
+            self.recursion_depth -= 1;
+            return Err(err("maximum recursion depth exceeded"));
+        }
+        // Con código nativo, los argumentos van directo de acá al código nativo (la ventana de
+        // registros se arma sólo si vuelve a la VM).
+        #[cfg(feature = "native-tier")]
+        {
+            // (Con la unidad ya compilada no hay nada que decidir: sin sitio que reescribir.)
+            if t.code.native.tick() && !t.code.native.ready() {
+                self.vm_native_prepare(t, args.iter().map(native::seen_of).collect());
+            }
+            if let Some(r) = self.vm_native_from_rust(t, args) {
+                self.recursion_depth -= 1;
+                return r;
+            }
+        }
+        let (n, np) = (args.len(), t.parameters.len());
+        let base = self.vm_regs.len();
+        grow_regs(&mut self.vm_regs, base + (code.nregs as usize).max(np));
+        // Los parámetros en `r0..` (F3.7); los de más se sueltan acá, antes de los defaults.
+        for (i, a) in args.iter_mut().enumerate() {
+            let v = std::mem::replace(a, SynValue::Nothing);
+            if i < np {
+                self.vm_regs[base + i] = v;
+            }
+        }
+        let lbase = self.vm_locals.len();
+        self.vm_locals.resize(lbase + code.nlocals as usize, None);
+        for i in n.min(np)..np {
+            let v = match &t.parameters[i].default {
+                Some(d) => match self.exec(d, &t.closure_env) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.vm_regs.truncate(base);
+                        self.vm_locals.truncate(lbase);
+                        self.recursion_depth -= 1;
+                        return Err(e);
+                    }
+                },
+                None => SynValue::Nothing,
+            };
+            self.vm_regs[base + i] = v;
+        }
+        debug_assert!(!self.labels);
+        let saved = std::mem::replace(&mut self.vm_lbase, lbase);
+        let r = self.run_chunk_at(code, &t.closure_env, base);
+        self.vm_lbase = saved;
+        self.vm_regs.truncate(base);
+        self.vm_locals.truncate(lbase);
+        self.recursion_depth -= 1;
+        match r {
+            Ok(v) | Err(Control::Give(v)) => Ok(v),
+            Err(c) => Err(c),
+        }
+    }
+
     /// El camino de siempre (`call_value_named`): builtins, argumentos nombrados, tasks sin
     /// compilar.
     #[inline(never)]
@@ -3479,10 +4476,12 @@ impl Interpreter {
     ) -> Result<Option<Enter>, Control> {
         let loc = &chunk.locs[chunk.loc[at] as usize];
         let s = &chunk.sites[site as usize];
-        // F4.1b: un builtin llamado sólo por posición: la próxima vez, `CallBuiltin`.
+        // F4.1b: un builtin llamado sólo por posición: la próxima vez, `CallBuiltin` (F4.8c: o, en el
+        // `append` de `set P to append(P, e)`, `AppendInPlace`).
         if s.names.is_none() && matches!(&f, SynValue::Builtin(b) if b.param_names.is_none()) {
             if let Ins::Call { dst, func, args, n, site } = chunk.code[at].get() {
-                chunk.code[at].set(Ins::CallBuiltin { dst, func, args, n, site });
+                let append = s.append.is_some() && n == 2 && matches!(&f, SynValue::Builtin(b) if b.name == "append");
+                chunk.code[at].set(if append { Ins::AppendInPlace { dst, func, args, site } } else { Ins::CallBuiltin { dst, func, args, n, site } });
             }
         }
         let mut cargs = self.free_args.pop().unwrap_or_default();
@@ -3554,6 +4553,163 @@ impl Interpreter {
         let v = r?;
         self.put(base, dst, v);
         Ok(true)
+    }
+}
+
+impl Interpreter {
+    /// `AppendInPlace` (F4.8c): `Ok(false)` si ya no es el builtin `append` (volvió a ser `Call`: se
+    /// repite). Lo observable es lo de `CallBuiltin` con el builtin: la función sale de su registro,
+    /// la profundidad con el mismo tope y el mismo error, y el resultado es la lista de antes más el
+    /// elemento; sólo que, si P sigue teniendo esa misma lista, se agrega en ella (copiándola antes si
+    /// alguien más la comparte), como la vía en el lugar de la referencia.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_append_in_place(
+        &mut self,
+        chunk: &Chunk,
+        env: &Rc<RefCell<Environment>>,
+        base: usize,
+        at: usize,
+        dst: Reg,
+        func: Reg,
+        args: Reg,
+        site: u32,
+    ) -> Result<bool, Control> {
+        let first = base + args as usize;
+        let root = chunk.sites[site as usize].append;
+        let fits = matches!(&self.vm_regs[base + func as usize], SynValue::Builtin(b) if b.name == "append" && b.param_names.is_none())
+            && self.pending_kwargs.is_empty()
+            && root.is_some()
+            && matches!(&self.vm_regs[first], SynValue::List(_));
+        if fits {
+            // La profundidad, como la llamada al builtin (antes de hacer nada).
+            if self.recursion_depth + 1 > MAX_RECURSION {
+                drop(std::mem::replace(&mut self.vm_regs[base + func as usize], SynValue::Nothing));
+                return Err(err("maximum recursion depth exceeded"));
+            }
+            let mut a0 = Some(std::mem::replace(&mut self.vm_regs[first], SynValue::Nothing));
+            let mut item = Some(std::mem::replace(&mut self.vm_regs[first + 1], SynValue::Nothing));
+            let p = match &a0 {
+                Some(SynValue::List(l)) => Rc::as_ptr(l),
+                _ => unreachable!("lista"),
+            };
+            // Si P sigue teniendo esa lista: el clon del primer argumento se suelta antes (si P es la
+            // única dueña, se agrega sin copiar), `make_unique` y `push`.
+            let out = self
+                .vm_root_slot_mut(chunk, env, base, root.expect("raíz"), |slot| {
+                    if !matches!(slot, SynValue::List(r) if Rc::as_ptr(r) == p) {
+                        return None;
+                    }
+                    drop(a0.take());
+                    make_unique(slot);
+                    if let SynValue::List(l) = slot {
+                        l.borrow_mut().push(item.take().expect("elemento"));
+                    }
+                    Some(slot.clone())
+                })
+                .flatten();
+            if let Some(v) = out {
+                drop(std::mem::replace(&mut self.vm_regs[base + func as usize], SynValue::Nothing));
+                self.put(base, dst, v);
+                return Ok(true);
+            }
+            // P ya no la tiene (un argumento la religó): los argumentos vuelven a su lugar y el builtin.
+            self.vm_regs[first] = a0.expect("primer argumento");
+            self.vm_regs[first + 1] = item.expect("elemento");
+        }
+        // El builtin de siempre (y si ya no es un builtin, vuelve a ser `Call`).
+        let r = self.vm_call_builtin(chunk, base, at, dst, func, args, 2, site);
+        if matches!(r, Ok(false)) {
+            chunk.code[at].set(Ins::Call { dst, func, args, n: 2, site });
+        }
+        r
+    }
+
+    /// La variable raíz de `root` (como `vm_path_root_fast`: nunca la de un módulo), con `f`; `None` si
+    /// no está donde la VM la busca.
+    fn vm_root_slot_mut<R>(&mut self, chunk: &Chunk, env: &Rc<RefCell<Environment>>, base: usize, root: Root, f: impl FnOnce(&mut SynValue) -> R) -> Option<R> {
+        Some(match root {
+            Root::Param(r) => f(&mut self.vm_regs[base + r as usize]),
+            Root::Win(k) => f(self.vm_locals[self.vm_lbase + k as usize].as_mut()?),
+            Root::Local(k) => {
+                let mut e = env.borrow_mut();
+                if e.name.starts_with("module:") {
+                    return None;
+                }
+                f(e.bindings.slot_mut(k as usize)?)
+            }
+            Root::Free { name, ic } => {
+                let start = self.free_start(chunk, env, chunk.hops[chunk.ic_hops[ic as usize] as usize]);
+                let mut e = start.borrow_mut();
+                if e.name.starts_with("module:") {
+                    return None;
+                }
+                f(e.bindings.get_cached_mut(&chunk.names[name as usize], &chunk.ics[ic as usize])?)
+            }
+            Root::Slow => return None,
+        })
+    }
+}
+
+impl Interpreter {
+    /// F4.8d2: una instrucción de un bucle, corrida por el host de su código nativo sobre el frame del
+    /// bucle (los argumentos ya en sus registros): una llamada (hasta que vuelve: el cuerpo de una
+    /// task corre en un despacho propio, con el mismo epílogo que el `give` de la VM), un `LoadGlobal`
+    /// o un `CheckProtected`.
+    #[cfg(feature = "native-tier")]
+    #[inline(never)]
+    pub(super) fn vm_exec_one(&mut self, chunk: &Rc<Chunk>, env: &Rc<RefCell<Environment>>, base: usize, at: usize) -> Result<(), Control> {
+        match chunk.code[at].get() {
+            Ins::LoadGlobal { dst, name, ic } => {
+                let v = env.borrow().bindings.get_cached(&chunk.names[name as usize], &chunk.ics[ic as usize]).cloned();
+                match v {
+                    Some(v) => {
+                        self.put(base, dst, v);
+                        Ok(())
+                    }
+                    None => self.vm_load_name(chunk, env, base, dst, name, ic, at),
+                }
+            }
+            Ins::CheckProtected { func, name } => {
+                check_protected_callee(&chunk.names[name as usize], &self.vm_regs[base + func as usize], &chunk.locs[chunk.loc[at] as usize])
+            }
+            Ins::CallBuiltin { dst, func, args, n, site } => match self.vm_call_builtin(chunk, base, at, dst, func, args, n, site)? {
+                true => Ok(()),
+                // Ya no es un builtin (volvió a ser `Call`): la llamada de siempre.
+                false => self.vm_exec_call(chunk, base, at, dst, func, args, n, site),
+            },
+            Ins::Call { dst, func, args, n, site } | Ins::CallNative { dst, func, args, n, site } => {
+                self.vm_exec_call(chunk, base, at, dst, func, args, n, site)
+            }
+            other => unreachable!("el host no corre {:?}", other),
+        }
+    }
+
+    /// Una llamada de la VM hasta que vuelve (ver `vm_exec_one`).
+    #[cfg(feature = "native-tier")]
+    #[allow(clippy::too_many_arguments)]
+    fn vm_exec_call(&mut self, chunk: &Rc<Chunk>, base: usize, at: usize, dst: Reg, func: Reg, args: Reg, n: u16, site: u32) -> Result<(), Control> {
+        let Some(enter) = self.vm_call(chunk, base, at, dst, func, args, n, site)? else { return Ok(()) };
+        let Enter { code, env: call_env, base: cbase, lbase, top } = enter;
+        let saved = std::mem::replace(&mut self.vm_lbase, lbase);
+        let r = self.run_chunk_at(&code, &call_env, cbase);
+        // El epílogo de una llamada de la VM (el `give` del despacho, también por el camino de error).
+        if code.regframe {
+            drop(call_env);
+        } else {
+            self.release_frame(call_env);
+        }
+        self.vm_locals.truncate(lbase);
+        self.vm_lbase = saved;
+        self.recursion_depth -= 1;
+        self.vm_pop_regs((cbase, code.nregs), top);
+        match r {
+            Ok(v) | Err(Control::Give(v)) => {
+                self.put(base, dst, v);
+                Ok(())
+            }
+            Err(c) => Err(c),
+        }
     }
 }
 

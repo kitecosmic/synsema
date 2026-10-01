@@ -635,7 +635,7 @@ mod tests {
 
     fn list_of(v: &SynValue) -> Vec<SynValue> {
         match v {
-            SynValue::List(l) => l.borrow().clone(),
+            SynValue::List(l) => l.borrow().to_vec(),
             other => panic!("esperaba list, got {}", other),
         }
     }

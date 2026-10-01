@@ -1,0 +1,10 @@
+-- F4.7a: un decimal que entra a mitad de un bucle nativo con floats: decimal⊕float es error, lo
+-- arma la VM (el nativo sale antes de la instrucción, por la guarda de tipo).
+let x be 0.5
+let s be 0.0
+each i in range(0, 300)
+    set s to s + x * 2.0
+    when i == 200
+        print(steps())
+        set x to 1.5d
+print(s)

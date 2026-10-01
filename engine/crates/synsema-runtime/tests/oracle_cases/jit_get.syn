@@ -1,0 +1,35 @@
+-- F4.8d2: `get` como intrínseco del nivel nativo: un mapa con una clave de texto, una lista con un
+-- `Int` (negativos desde el final, fuera de rango el default), el default de cada tipo (con caja,
+-- decimal, `nothing` si falta) y lo que hace la VM (una clave que no es texto, un índice decimal).
+let words be ["uno", "dos", "tres", "uno", "cuatro", "dos", "uno"]
+let counts be {}
+each r in range(0, 300)
+    let w be words[r % 7]
+    set counts[w] to get(counts, w, 0) + 1
+print(counts)
+
+let xs be [10, 20, 30]
+let vacio be []
+let t be 0
+let f be 0.0
+let ult be nothing
+let chico be {"a": vacio}
+let otro be {"b": xs}
+let k be words[0]
+each i in range(0, 400)
+    set t to t + get(xs, i % 7 - 3, 1000)
+    set f to f + get(xs, 9, 0.5)
+    set ult to get(xs, i % 5)
+print(t, f, ult)
+each i in range(0, 400)
+    let l be get(chico, k, xs)
+    set t to t + length(get(otro, k, l)) + length(get(chico, words[i % 7], xs))
+print(t)
+
+-- Claves que no son texto (la VM: `to_string`), un índice decimal y un default con caja.
+let m be {"1": "uno", "2.5": "dos y medio"}
+let out be []
+each i in range(0, 200)
+    when i % 50 == 0
+        set out to append(out, [get(m, 1), get(m, 2.5, "no"), get(m, true, "b"), get(xs, 1.0, "d"), get(m, "x", xs)])
+print(out)

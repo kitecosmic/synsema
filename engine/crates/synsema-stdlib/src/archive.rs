@@ -70,7 +70,7 @@ struct Entry {
 
 fn entries_arg(caps: &Rc<RefCell<CapabilitySet>>, v: Option<&SynValue>, who: &str) -> Result<Vec<Entry>, Control> {
     let list = match v {
-        Some(SynValue::List(l)) => l.borrow().clone(),
+        Some(SynValue::List(l)) => l.borrow().to_vec(),
         Some(other) => {
             return Err(err(format!(
                 "{}: entries must be a list of {{path, bytes}} or {{path, from}}, got {}",

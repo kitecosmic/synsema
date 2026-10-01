@@ -28,6 +28,7 @@
 //! que se **muestra o compara** va como `text` (tx hashes `0x…`, direcciones
 //! EIP-55, signature base58, txid base32).
 
+use synsema_core::synlist::{list_values};
 use synsema_core::types::{MapObj, SynMap};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -569,7 +570,7 @@ fn syn_to_eth_json(v: &SynValue, path: &str, fname: &str, depth: usize) -> Resul
         SynValue::Bool(b) => Ok(Json::Bool(*b)),
         SynValue::Nothing => Ok(Json::Null),
         SynValue::List(l) => {
-            let items = l.borrow().clone();
+            let items = l.borrow().to_vec();
             let mut out = Vec::with_capacity(items.len());
             for (i, it) in items.iter().enumerate() {
                 out.push(syn_to_eth_json(it, &format!("{}[{}]", path, i), fname, depth + 1)?);
@@ -623,7 +624,7 @@ pub(crate) fn syn_to_plain_json(v: &SynValue, path: &str, fname: &str, depth: us
             fname, path
         ))),
         SynValue::List(l) => {
-            let items = l.borrow().clone();
+            let items = l.borrow().to_vec();
             let mut out = Vec::with_capacity(items.len());
             for (i, it) in items.iter().enumerate() {
                 out.push(syn_to_plain_json(it, &format!("{}[{}]", path, i), fname, depth + 1)?);
@@ -663,7 +664,7 @@ pub(crate) fn params_arg(
     match v {
         None | Some(SynValue::Nothing) => Ok(Json::Array(Vec::new())),
         Some(SynValue::List(l)) => {
-            let items = l.borrow().clone();
+            let items = l.borrow().to_vec();
             let mut out = Vec::with_capacity(items.len());
             for (i, it) in items.iter().enumerate() {
                 out.push(convert(it, &format!("params[{}]", i), fname, 0)?);
@@ -872,7 +873,7 @@ fn evm_logs(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynV
             "address" => match v {
                 SynValue::List(l) => {
                     let mut out = Vec::new();
-                    for (i, a) in l.borrow().iter().enumerate() {
+                    for (i, a) in list_values(&l).iter().enumerate() {
                         out.push(Json::Str(eth_addr_hex(a, &format!("address[{}]", i), F)?));
                     }
                     Json::Array(out)
@@ -881,7 +882,7 @@ fn evm_logs(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynV
             },
             "topics" => {
                 let items = match v {
-                    SynValue::List(l) => l.borrow().clone(),
+                    SynValue::List(l) => l.borrow().to_vec(),
                     other => return Err(err(format!("{}: topics must be a list, got {}", F, other.type_name()))),
                 };
                 // Un log tiene a lo sumo 4 topics (LOG0..LOG4): un filtro con más no encuentra nada.
@@ -894,7 +895,7 @@ fn evm_logs(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result<SynV
                     out.push(match t {
                         SynValue::List(alts) => {
                             let mut a = Vec::new();
-                            for (j, x) in alts.borrow().iter().enumerate() {
+                            for (j, x) in list_values(&alts).iter().enumerate() {
                                 a.push(topic_json(x, &format!("{}[{}]", path, j))?);
                             }
                             Json::Array(a)
@@ -1265,7 +1266,7 @@ fn evm_fee_history(
     let percentiles: Vec<Json> = match args.get(2) {
         None | Some(SynValue::Nothing) => vec![Json::Int(50)],
         Some(SynValue::List(l)) => {
-            let items = l.borrow().clone();
+            let items = l.borrow().to_vec();
             if items.is_empty() {
                 return Err(err(format!("{}: percentiles cannot be empty", F)));
             }
@@ -1433,7 +1434,7 @@ fn uint_field(
 fn access_list_field(v: Option<&SynValue>, fname: &str) -> Result<SynValue, Control> {
     let list = match v {
         None | Some(SynValue::Nothing) => return Ok(syn_list(Vec::new())),
-        Some(SynValue::List(l)) => l.borrow().clone(),
+        Some(SynValue::List(l)) => l.borrow().to_vec(),
         Some(other) => {
             return Err(err(format!(
                 "{}: \"access_list\" must be a list, got {}",
@@ -1473,7 +1474,7 @@ fn access_list_field(v: Option<&SynValue>, fname: &str) -> Result<SynValue, Cont
         let keys = match m.get("storage_keys") {
             None | Some(SynValue::Nothing) => Vec::new(),
             Some(SynValue::List(l)) => {
-                let items = l.borrow().clone();
+                let items = l.borrow().to_vec();
                 let mut ks = Vec::with_capacity(items.len());
                 for (j, k) in items.iter().enumerate() {
                     let kb = arg_bytes_len(
@@ -1733,7 +1734,7 @@ fn evm_tx_raw(args: &[SynValue]) -> Result<SynValue, Control> {
         }
     };
     let fields = match m.get("fields") {
-        Some(SynValue::List(l)) => l.borrow().clone(),
+        Some(SynValue::List(l)) => l.borrow().to_vec(),
         _ => {
             return Err(err(format!(
                 "{}: the map has no \"fields\" list — pass the map returned by evm_tx",
@@ -2581,7 +2582,7 @@ mod tests {
         assert_eq!(get(&r, "from").to_string(), "0x9858EfFD232B4033E47d90003D41EC34EcaEda94");
         assert!(matches!(get(&r, "to"), SynValue::Nothing));
         let log0 = match get(&r, "logs") {
-            SynValue::List(l) => l.borrow()[0].clone(),
+            SynValue::List(l) => list_values(&l)[0].clone(),
             _ => panic!("logs"),
         };
         assert!(matches!(get(&log0, "data"), SynValue::Bytes(b) if b.len() == 2));

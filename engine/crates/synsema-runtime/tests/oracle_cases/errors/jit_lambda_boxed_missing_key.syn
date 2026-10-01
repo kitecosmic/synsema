@@ -1,0 +1,11 @@
+-- F4.8b: un parámetro con caja (prestado) al que le falta la clave a mitad de un `reduce`: la lectura
+-- sale a la VM, que da el error de la referencia.
+task con_v(i)
+    when i == 250
+        give {"id": i}
+    give {"id": i, "v": 1}
+let recs be apply(range(0, 300), (i) => {"id": i, "v": i % 7})
+print(reduce(recs, (acc, r) => acc + r.v, 0))
+set recs to apply(range(0, 300), con_v)
+print(steps())
+print(reduce(recs, (acc, r) => acc + r.v, 0))

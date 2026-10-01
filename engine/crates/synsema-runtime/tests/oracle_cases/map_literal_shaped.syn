@@ -1,0 +1,19 @@
+-- F4.8g: mapas literales con claves de texto constantes (la forma se arma una vez por sitio): el mismo
+-- mapa, el mismo orden y los mismos pasos que armándolo clave por clave; claves repetidas (gana el
+-- último valor en la posición de la primera), más de 32 claves (el camino general), anidados, en una
+-- lambda, y claves mezcladas (una que no es constante: el camino de siempre).
+let rows be apply(range(0, 5), (i) => {"id": i, "name": "n" + text(i), "score": i * 0.5})
+print(rows, steps())
+let rep be {"a": 1, "b": 2, "a": 3}
+print(rep, keys(rep), steps())
+let i be 7
+let grande be {"k0": i + 0, "k1": i + 1, "k2": i + 2, "k3": i + 3, "k4": i + 4, "k5": i + 5, "k6": i + 6, "k7": i + 7, "k8": i + 8, "k9": i + 9, "k10": i + 10, "k11": i + 11, "k12": i + 12, "k13": i + 13, "k14": i + 14, "k15": i + 15, "k16": i + 16, "k17": i + 17, "k18": i + 18, "k19": i + 19, "k20": i + 20, "k21": i + 21, "k22": i + 22, "k23": i + 23, "k24": i + 24, "k25": i + 25, "k26": i + 26, "k27": i + 27, "k28": i + 28, "k29": i + 29, "k30": i + 30, "k31": i + 31, "k32": i + 32}
+print(length(grande), grande["k0"], grande["k32"], keys(grande)[31], steps())
+let anid be {"x": {"y": {"z": i}}, "w": [{"q": 1}, {"q": 2}]}
+print(anid, anid.x.y.z, steps())
+let k be "din"
+let mezcla be {"a": 1, k: 2, "c": 3}
+print(mezcla, steps())
+let iguales be apply(range(0, 3), (j) => {"p": j, "q": j})
+set iguales[1].r to 9
+print(iguales, iguales[0] == {"p": 0, "q": 0}, steps())
