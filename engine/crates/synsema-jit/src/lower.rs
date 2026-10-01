@@ -3268,17 +3268,56 @@ pub(crate) fn build(
     }
 
     // Las salidas: guardan los valores vivos (las palabras de cada tipo, ver `words`, y aparte los
-    // punteros, ver `ptr_words`), avisan (`synsema_jit_deopt`) y vuelven.
-    for ex in exits {
-        b.switch_to_block(ex.block);
+    // punteros, ver `ptr_words`), avisan (`synsema_jit_deopt`) y vuelven. F4.8f: las que guardan lo
+    // mismo (los mismos lugares con los mismos tipos, lo mismo ya en su lugar, la misma profundidad)
+    // comparten ese código: la salida de cada instrucción sólo pasa su punto (eran el 80 % de una
+    // función grande, y la memoria y el tiempo de compilarla).
+    struct Group {
+        values: Vec<(Place, Kind)>,
+        keeps: Vec<bool>,
+        depth: bool,
+        point: u32,
+        block: Block,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    for ex in &exits {
         let p = &points[ex.point as usize];
+        // F4.8d: un valor con caja que ya está en su lugar de la VM (su procedencia es su propio
+        // lugar): 0, y la VM lo deja ahí (`NVal::Keep`).
+        let keeps: Vec<bool> = p
+            .values
+            .iter()
+            .map(|(place, kind)| {
+                let v = f.var_of(*place);
+                matches!(kind, Kind::Any(_)) && plan.prov.get(p.pc as usize).and_then(|x| x.as_ref()).is_some_and(|pv| pv[v] == Some(v))
+            })
+            .collect();
+        let depth = p.call.is_none();
+        let g = match groups.iter().position(|g| g.depth == depth && g.values == p.values && g.keeps == keeps) {
+            Some(g) => g,
+            None => {
+                let block = b.create_block();
+                b.set_cold_block(block);
+                b.append_block_param(block, I64);
+                groups.push(Group { values: p.values.clone(), keeps, depth, point: ex.point, block });
+                groups.len() - 1
+            }
+        };
+        b.switch_to_block(ex.block);
+        let pi = b.ins().iconst(I64, i64::from(ex.point));
+        b.ins().jump(groups[g].block, &[BlockArg::Value(pi)]);
+    }
+    for g in &groups {
+        b.switch_to_block(g.block);
+        let pi = b.block_params(g.block)[0];
+        let p = &points[g.point as usize];
         let (stored, nptr) = (p.stored(), p.ptrs());
         let slot = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, (8 * stored.max(1)) as u32, 3));
         // La ranura de punteros, sólo si hay (si no, la dirección es 0 y la cuenta también).
         let pslot = (nptr > 0).then(|| b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, (8 * nptr) as u32, 3)));
         ptr_slots.extend(pslot);
         let (mut k, mut kp) = (0i32, 0i32);
-        for (place, kind) in &p.values {
+        for ((place, kind), keep) in g.values.iter().zip(&g.keeps) {
             let pv = vs.p[f.var_of(*place)];
             let ws: Vec<Value> = match kind {
                 Kind::Int | Kind::Bool => vec![b.use_var(pv.bits)],
@@ -3292,11 +3331,7 @@ pub(crate) fn build(
                 k += 1;
             }
             if let (1, Some(ps)) = (ptr_words(*kind), pslot) {
-                // F4.8d: un valor con caja que ya está en su lugar de la VM (su procedencia es su propio
-                // lugar): 0, y la VM lo deja ahí (`NVal::Keep`).
-                let v = f.var_of(*place);
-                let keep = matches!(kind, Kind::Any(_)) && plan.prov.get(p.pc as usize).and_then(|x| x.as_ref()).is_some_and(|pv| pv[v] == Some(v));
-                let x = if keep { b.ins().iconst(I64, 0) } else { b.use_var(pv.ptr) };
+                let x = if *keep { b.ins().iconst(I64, 0) } else { b.use_var(pv.ptr) };
                 b.ins().stack_store(I64, x, ps, 8 * kp);
                 kp += 1;
             }
@@ -3307,12 +3342,11 @@ pub(crate) fn build(
             None => b.ins().iconst(I64, 0),
         };
         let fi = b.ins().iconst(I64, i as i64);
-        let pi = b.ins().iconst(I64, ex.point as i64);
         let cnt = b.ins().iconst(I64, stored as i64);
         let pcnt = b.ins().iconst(I64, nptr as i64);
         // F4.8a: la profundidad de este frame, si es el de más adentro (después de una llamada que
         // salió, ya la escribió el llamado).
-        if p.call.is_none() {
+        if g.depth {
             let d = b.use_var(dv);
             b.ins().store(flags, d, ctx, OFF_DEPTH);
         }
