@@ -33,6 +33,7 @@ pub mod resolve;
 pub mod rng;
 pub mod rng_ziggurat;
 pub mod stats;
+pub mod synlist;
 pub mod synmap;
 pub mod tabular;
 pub mod temporal;

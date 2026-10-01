@@ -1179,7 +1179,7 @@ fn map_of(v: &SynValue, what: &str, fname: &str) -> Result<SynMap, Control> {
 
 fn list_of(v: Option<&SynValue>, what: &str, fname: &str) -> Result<Vec<SynValue>, Control> {
     match v {
-        Some(SynValue::List(l)) => Ok(l.borrow().clone()),
+        Some(SynValue::List(l)) => Ok(l.borrow().to_vec()),
         Some(other) => Err(err(format!(
             "{}: {} must be a list, got {}",
             fname,
@@ -2451,7 +2451,7 @@ mod tests {
 
     fn get_list(m: &SynValue, key: &str) -> Vec<SynValue> {
         match get(m, key) {
-            SynValue::List(l) => l.borrow().clone(),
+            SynValue::List(l) => l.borrow().to_vec(),
             _ => panic!("{} no es lista", key),
         }
     }

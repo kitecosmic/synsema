@@ -27,7 +27,8 @@ use crate::number::{py_float_str, Number};
 use crate::secret::{constant_time_eq, SecretInner};
 use crate::tokens::SourceLocation;
 
-pub type ListRef = Rc<RefCell<Vec<SynValue>>>;
+pub type ListRef = Rc<RefCell<SynList>>;
+pub use crate::synlist::SynList;
 pub use crate::synmap::{Key, MapObj, MapRef, SynMap};
 
 #[derive(Clone)]
@@ -477,7 +478,7 @@ pub fn syn_nothing() -> SynValue {
     SynValue::Nothing
 }
 pub fn syn_list(items: Vec<SynValue>) -> SynValue {
-    SynValue::List(Rc::new(RefCell::new(items)))
+    SynValue::List(Rc::new(RefCell::new(SynList::from(items))))
 }
 pub fn syn_map(m: SynMap) -> SynValue {
     SynValue::Map(m.into_ref())

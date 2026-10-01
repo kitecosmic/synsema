@@ -20,7 +20,7 @@ fn err(msg: impl Into<String>) -> Control {
 
 fn rows_arg(v: &SynValue, who: &str) -> Result<Vec<SynValue>, Control> {
     match v {
-        SynValue::List(l) => Ok(l.borrow().clone()),
+        SynValue::List(l) => Ok(l.borrow().to_vec()),
         other => Err(err(format!("{}: expected a list of rows (maps), got {}", who, other.type_name()))),
     }
 }

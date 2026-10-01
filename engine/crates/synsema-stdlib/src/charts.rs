@@ -1084,7 +1084,7 @@ fn normalize_heatmap(
         };
         let (xf, yf, vf) = (need("x")?, need("y")?, need("value")?);
         let rows = match &args[1] {
-            SynValue::List(l) => l.borrow().clone(),
+            SynValue::List(l) => l.borrow().to_vec(),
             _ => Vec::new(),
         };
         let mut xs: Vec<String> = Vec::new();
@@ -1467,7 +1467,7 @@ fn normalize_histogram(
             }
             let get_list = |key: &str| -> Result<Vec<SynValue>, Control> {
                 match m.get(key) {
-                    Some(SynValue::List(l)) => Ok(l.borrow().clone()),
+                    Some(SynValue::List(l)) => Ok(l.borrow().to_vec()),
                     Some(other) => Err(err(format!(
                         "{}: histogram {:?} must be a list of numbers, got {}",
                         name,
@@ -3133,7 +3133,7 @@ fn field_val(node: &SynValue, key: &str) -> Option<SynValue> {
 
 fn field_list(node: &SynValue, key: &str) -> Vec<SynValue> {
     match field_val(node, key) {
-        Some(SynValue::List(l)) => l.borrow().clone(),
+        Some(SynValue::List(l)) => l.borrow().to_vec(),
         _ => Vec::new(),
     }
 }
@@ -3179,7 +3179,7 @@ pub fn render_chart_md(node: &SynValue) -> String {
             for (yi, y) in ys.iter().enumerate() {
                 out.push_str(&format!("\n| {} |", md_cell(&y.to_string())));
                 let row = match values.get(yi) {
-                    Some(SynValue::List(l)) => l.borrow().clone(),
+                    Some(SynValue::List(l)) => l.borrow().to_vec(),
                     _ => Vec::new(),
                 };
                 for xi in 0..xs.len() {
@@ -3306,7 +3306,7 @@ pub(crate) fn chart_data_fields(node: &SynValue) -> Vec<(&'static str, SynValue)
 fn md_series_table(node: &SynValue) -> String {
     let series = match node {
         SynValue::Server(s) => match s.get_field("series") {
-            Some(SynValue::List(l)) => l.borrow().clone(),
+            Some(SynValue::List(l)) => l.borrow().to_vec(),
             _ => Vec::new(),
         },
         _ => Vec::new(),
@@ -3318,7 +3318,7 @@ fn md_series_table(node: &SynValue) -> String {
             let m = m.borrow();
             let name = m.get("name").map(|v| v.to_string()).unwrap_or_default();
             let points = match m.get("points") {
-                Some(SynValue::List(l)) => l.borrow().clone(),
+                Some(SynValue::List(l)) => l.borrow().to_vec(),
                 _ => Vec::new(),
             };
             cols.push((name, points));

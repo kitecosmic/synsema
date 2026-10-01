@@ -2697,7 +2697,7 @@ impl Interpreter {
                 // nueva por entrada. El recibo publica sólo el compromiso (un sha256 a secas de
                 // `run("id", "-u")` se revertía probando un diccionario de consultas); la sal
                 // queda en `lineage()`, así el dueño puede probar después qué consulta fue.
-                let q = bytes_of(&SynValue::List(Rc::new(RefCell::new(args.to_vec()))));
+                let q = bytes_of(&SynValue::List(Rc::new(RefCell::new(args.to_vec().into()))));
                 let q_enc = enc_cell.get();
                 let (sal, commit) = salted_commitment(&q);
                 salt = Some((sal, q_enc));
@@ -3894,7 +3894,7 @@ impl Interpreter {
         // Clonamos los items (Rc-clones baratos) para no sostener el borrow del RefCell
         // mientras recursamos (match_pattern toma &mut self).
         let items: Vec<SynValue> = match value {
-            SynValue::List(l) => l.borrow().clone(),
+            SynValue::List(l) => l.borrow().to_vec(),
             _ => return Ok(None),
         };
         let n = items.len();
@@ -6223,7 +6223,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
                 return Ok(syn_bytes(v));
             }
             if let (SynValue::List(l), SynValue::List(r)) = (&left, &right) {
-                let mut v = l.borrow().clone();
+                let mut v = l.borrow().to_vec();
                 v.extend(r.borrow().iter().cloned());
                 return Ok(syn_list(v));
             }
@@ -7926,7 +7926,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         let item = nth(args, 1)?.clone();
         match lst {
             SynValue::List(l) => {
-                let mut v = l.borrow().clone();
+                let mut v = l.borrow().to_vec();
                 v.push(item);
                 Ok(syn_list(v))
             }
@@ -7939,7 +7939,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
     fn b_insert(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
         match nth(args, 0)? {
             SynValue::List(l) => {
-                let mut v = l.borrow().clone();
+                let mut v = l.borrow().to_vec();
                 let j = insert_position(nth(args, 1)?, v.len()).map_err(|e| err_at(e, loc))?;
                 v.insert(j, nth(args, 2)?.clone());
                 Ok(syn_list(v))
@@ -8687,7 +8687,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
 
     fn list_arg(&self, v: &SynValue, who: &str) -> Result<Vec<SynValue>, Control> {
         match v {
-            SynValue::List(l) => Ok(l.borrow().clone()),
+            SynValue::List(l) => Ok(l.borrow().to_vec()),
             _ => Err(err(format!("{} expects a list, got {}", who, v.type_name()))),
         }
     }

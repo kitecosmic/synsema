@@ -1880,7 +1880,7 @@ pub(crate) fn wire_swarm_hooks(
                         syn_map(m)
                     })
                     .collect();
-                Ok(SynValue::List(Rc::new(RefCell::new(items))))
+                Ok(SynValue::List(Rc::new(RefCell::new(items.into()))))
             }),
         );
         let sw = swarm.clone();

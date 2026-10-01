@@ -204,7 +204,7 @@ pub fn max(args: &[SynValue]) -> Result<SynValue, Control> {
 /// - números o textos, todos de una clase (el texto se compara como con `<`).
 fn extreme(args: &[SynValue], name: &str, want: Ordering) -> Result<SynValue, Control> {
     let items: Vec<SynValue> = match args {
-        [SynValue::List(l)] => l.borrow().clone(),
+        [SynValue::List(l)] => l.borrow().to_vec(),
         _ => args.to_vec(),
     };
     let present: Vec<&SynValue> = items.iter().filter(|v| !matches!(v, SynValue::Nothing)).collect();

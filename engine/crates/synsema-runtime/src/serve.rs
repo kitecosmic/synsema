@@ -2277,7 +2277,7 @@ fn build_host_table(
             let group = interp.eval(source, env)?;
             let metas: Vec<SynValue> = match &group {
                 SynValue::Map(m) => match m.borrow().get("_routes_meta") {
-                    Some(SynValue::List(l)) => l.borrow().clone(),
+                    Some(SynValue::List(l)) => l.borrow().to_vec(),
                     _ => {
                         return Err(Control::Error(RuntimeError::new(
                             "mount expects a routes group (a module's `export routes ...`) — the value has no routes"

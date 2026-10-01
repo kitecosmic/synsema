@@ -492,7 +492,7 @@ pub(crate) fn node_int(v: &SynValue, key: &str, default: i64) -> i64 {
 
 pub(crate) fn list_field(v: &SynValue, key: &str) -> Vec<SynValue> {
     match node_field(v, key) {
-        Some(SynValue::List(l)) => l.borrow().clone(),
+        Some(SynValue::List(l)) => l.borrow().to_vec(),
         _ => Vec::new(),
     }
 }

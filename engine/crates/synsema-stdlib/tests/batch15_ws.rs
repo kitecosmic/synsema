@@ -111,7 +111,7 @@ fn ws_select_reports_which_conn_fired() {
     let c2 = as_i64(&ok(call(&mut i, "ws_connect", vec![syn_text(format!("ws://127.0.0.1:{}/", p2).as_str())])));
     // Mandar sólo por c2 → ws_select debe devolver c2.
     ok(call(&mut i, "ws_send", vec![syn_int(c2), syn_text("hola")]));
-    let conns = SynValue::List(Rc::new(RefCell::new(vec![syn_int(c1), syn_int(c2)])));
+    let conns = SynValue::List(Rc::new(RefCell::new(vec![syn_int(c1), syn_int(c2)].into())));
     let sel = ok(call(&mut i, "ws_select", vec![conns, syn_int(5)]));
     assert_eq!(as_i64(&map_get(&sel, "conn")), c2, "ws_select devuelve CUÁL disparó");
     assert_eq!(map_get(&sel, "type").to_string(), "text");
@@ -163,7 +163,7 @@ fn ws_select_idle_sleeps_no_busy_spin() {
     let c = as_i64(&ok(call(&mut i, "ws_connect", vec![syn_text(format!("ws://127.0.0.1:{}/", p).as_str())])));
     let before = POLL_ITERS.with(|x| x.get());
     let start = Instant::now();
-    let conns = SynValue::List(Rc::new(RefCell::new(vec![syn_int(c)])));
+    let conns = SynValue::List(Rc::new(RefCell::new(vec![syn_int(c)].into())));
     let sel = ok(call(&mut i, "ws_select", vec![conns, syn_int(1)]));
     let elapsed = start.elapsed();
     let iters = POLL_ITERS.with(|x| x.get()) - before;
@@ -213,7 +213,7 @@ fn ws_select_round_robin_no_starvation() {
         }
         thread::sleep(Duration::from_millis(10));
     }
-    let conns = SynValue::List(Rc::new(RefCell::new(vec![syn_int(c1), syn_int(c2)])));
+    let conns = SynValue::List(Rc::new(RefCell::new(vec![syn_int(c1), syn_int(c2)].into())));
     let s1 = as_i64(&map_get(&ok(call(&mut i, "ws_select", vec![conns.clone(), syn_int(5)])), "conn"));
     let s2 = as_i64(&map_get(&ok(call(&mut i, "ws_select", vec![conns.clone(), syn_int(5)])), "conn"));
     let seen: std::collections::HashSet<i64> = [s1, s2].into_iter().collect();
@@ -561,7 +561,7 @@ fn ws_select_reassembles_tcp_fragmented_frames() {
     });
     let mut i = interp_net();
     let c = as_i64(&ok(call(&mut i, "ws_connect", vec![syn_text(format!("ws://127.0.0.1:{}/", port).as_str())])));
-    let conns = SynValue::List(Rc::new(RefCell::new(vec![syn_int(c)])));
+    let conns = SynValue::List(Rc::new(RefCell::new(vec![syn_int(c)].into())));
     let sel = ok(call(&mut i, "ws_select", vec![conns, syn_int(5)]));
     assert_eq!(map_get(&sel, "type").to_string(), "text");
     assert_eq!(map_get(&sel, "data").to_string().len(), 1000, "el frame fragmentado llegó COMPLETO");
@@ -599,7 +599,7 @@ fn ws_subprotocol_is_negotiated_and_exposed() {
     let mut opts = SynMap::new();
     opts.insert(
         "subprotocols".to_string(),
-        SynValue::List(Rc::new(RefCell::new(vec![syn_text("json"), syn_text("cbor")]))),
+        SynValue::List(Rc::new(RefCell::new(vec![syn_text("json"), syn_text("cbor")].into()))),
     );
     let c = as_i64(&ok(call(
         &mut i,

@@ -1733,7 +1733,7 @@ fn evm_tx_raw(args: &[SynValue]) -> Result<SynValue, Control> {
         }
     };
     let fields = match m.get("fields") {
-        Some(SynValue::List(l)) => l.borrow().clone(),
+        Some(SynValue::List(l)) => l.borrow().to_vec(),
         _ => {
             return Err(err(format!(
                 "{}: the map has no \"fields\" list — pass the map returned by evm_tx",

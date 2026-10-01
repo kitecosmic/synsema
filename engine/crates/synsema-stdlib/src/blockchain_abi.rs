@@ -565,7 +565,7 @@ fn encode_atomic(t: &AbiType, v: &SynValue, path: &str, fname: &str) -> Result<[
 /// Lista Synsema del valor (para arrays/tuples), con chequeo de tipo.
 fn list_items(v: &SynValue, path: &str, fname: &str) -> Result<Vec<SynValue>, Control> {
     match v {
-        SynValue::List(l) => Ok(l.borrow().clone()),
+        SynValue::List(l) => Ok(l.borrow().to_vec()),
         other => Err(err(format!(
             "{}: {} must be a list, got {}",
             fname,
@@ -1113,7 +1113,7 @@ fn event_from_fragment(v: &SynValue, fname: &str) -> Result<EventDef, Control> {
     };
     let anonymous = matches!(m.get("anonymous"), Some(SynValue::Bool(true)));
     let raw_inputs = match m.get("inputs") {
-        Some(SynValue::List(l)) => l.borrow().clone(),
+        Some(SynValue::List(l)) => l.borrow().to_vec(),
         None => Vec::new(),
         Some(other) => return Err(err(format!("{}: \"inputs\" must be a list, got {}", fname, other.type_name()))),
     };

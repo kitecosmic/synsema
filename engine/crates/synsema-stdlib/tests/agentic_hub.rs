@@ -49,7 +49,7 @@ fn script(unix: &str, win: &str) -> (SynValue, SynValue) {
 }
 
 fn list(items: Vec<SynValue>) -> SynValue {
-    SynValue::List(Rc::new(RefCell::new(items)))
+    SynValue::List(Rc::new(RefCell::new(items.into())))
 }
 
 fn interp_with_bus(bus: Arc<Bus>) -> Interpreter {

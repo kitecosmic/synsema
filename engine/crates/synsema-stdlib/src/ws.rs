@@ -1693,7 +1693,7 @@ fn ws_select_all(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) ->
     let (targets, names) = resolve_targets(args.first().ok_or_else(|| err(format!("{}: missing the connections", F)))?, F)?;
     let timeout = timeout_arg(args.get(1), F)?;
     if targets.is_empty() {
-        return Ok(SynValue::List(Rc::new(RefCell::new(Vec::new()))));
+        return Ok(SynValue::List(Rc::new(RefCell::new(Default::default()))));
     }
     let deadline = Instant::now() + timeout;
     watch_cancel(reg, interp);
@@ -1722,7 +1722,7 @@ fn ws_select_all(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) ->
             }
         }
     }
-    Ok(SynValue::List(Rc::new(RefCell::new(out))))
+    Ok(SynValue::List(Rc::new(RefCell::new(out.into()))))
 }
 
 fn ws_broadcast(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
@@ -2819,7 +2819,7 @@ fn bus_topics(_args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
             syn_map(m)
         })
         .collect();
-    Ok(SynValue::List(Rc::new(RefCell::new(items))))
+    Ok(SynValue::List(Rc::new(RefCell::new(items.into()))))
 }
 
 // ---------------------------------------------------------
