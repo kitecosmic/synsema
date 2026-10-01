@@ -1,4 +1,4 @@
 -- F4.6a: una task de un módulo no se reemplaza desde afuera
-use "../mods/state_mod.syn" as sm
+use "mods/state_mod.syn" as sm
 print(steps())
 set sm.read_n to 1

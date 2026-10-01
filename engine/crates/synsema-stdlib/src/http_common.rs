@@ -19,7 +19,7 @@ use synsema_core::interpreter::{Control, Interpreter, RuntimeError};
 use sha2::{Digest, Sha256};
 use synsema_core::types::{syn_bool, syn_bytes, syn_int, syn_map, syn_nothing, syn_text, SynValue};
 
-use crate::json::{dumps, syn_to_json};
+use crate::json::dumps_syn;
 
 /// Chequea la capability `net(host)` del URL; convierte la violación en `Control::Error`
 /// SIN ubicación (como secure.rs/database.rs). Scope = hostname (minúsculas, sin puerto);
@@ -175,7 +175,7 @@ pub fn body_arg(v: Option<&SynValue>) -> (Option<Vec<u8>>, Option<&'static str>)
         Some(SynValue::Text(s)) => (Some(s.as_bytes().to_vec()), None),
         Some(SynValue::Bytes(b)) => (Some(b.to_vec()), None),
         Some(v @ SynValue::Map(_)) | Some(v @ SynValue::List(_)) => {
-            (Some(dumps(&syn_to_json(v)).into_bytes()), Some("application/json"))
+            (Some(dumps_syn(v).into_bytes()), Some("application/json"))
         }
         Some(other) => (Some(raw_str(other).into_bytes()), None),
     }

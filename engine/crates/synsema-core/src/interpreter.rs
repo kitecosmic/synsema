@@ -9835,7 +9835,7 @@ fn make_unique_n(slot: &mut SynValue, extra: usize) {
                     SynValue::Map(rc) => SynValue::Map(rc.borrow().to_ref()),
                     other => other.clone(),
                 };
-                *slot = SynValue::Private(Rc::new(labels::Labelled { value: inner, label: p.label.clone() }));
+                *slot = labels::labelled(inner, p.label.clone());
             }
         }
         _ => {}

@@ -683,7 +683,7 @@ pub(crate) fn wire_common_with_state(
             Ok(s) => Some((s.into_bytes(), "jcs")),
             // JCS no lleva enteros de más de 2^53: el JSON exacto de `json_encode`.
             Err(_) => Some((
-                synsema_stdlib::json::dumps(&synsema_stdlib::json::syn_to_json(v)).into_bytes(),
+                synsema_stdlib::json::dumps_syn(v).into_bytes(),
                 "json",
             )),
         }

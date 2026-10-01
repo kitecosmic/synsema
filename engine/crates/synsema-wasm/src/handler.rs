@@ -358,6 +358,7 @@ fn custom_error(
 fn finalize(status: u16, body: ResponseBody, mut headers: Vec<(String, String)>) -> HttpResponseOut {
     let (content_type, bytes) = match body {
         ResponseBody::Json(j) => ("application/json".to_string(), dumps(&j).into_bytes()),
+        ResponseBody::JsonText(t) => ("application/json".to_string(), t.into_bytes()),
         ResponseBody::Raw(r) => (r.content_type, r.body),
         ResponseBody::Redirect { location, .. } => {
             headers.push(("Location".to_string(), location));

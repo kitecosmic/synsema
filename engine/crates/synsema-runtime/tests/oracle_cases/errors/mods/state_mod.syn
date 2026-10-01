@@ -1,0 +1,7 @@
+-- El módulo de `set_path_module.syn`: estado exportado que leen sus tasks.
+export let STATE be {"v": {"n": 0}}
+export let fixed be 3
+export task read_n()
+    give STATE.v.n
+export task read_fixed()
+    give fixed

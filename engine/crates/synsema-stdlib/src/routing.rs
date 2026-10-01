@@ -27,8 +27,9 @@ use synsema_core::types::{
 
 use crate::json::{
     dumps, esc, is_node, json_to_syn, list_field, meta_get, node_field, node_int, node_str,
-    node_to_json, obj, syn_to_json, Json,
+    node_to_json, obj, syn_to_json, dumps_syn_into, Json,
 };
+use synsema_core::synlist::list_read_range;
 
 // ---- constantes (movido verbatim desde server.rs) ----
 pub const DEFAULT_LIMIT: i64 = 100;
@@ -239,43 +240,57 @@ pub fn envelope_from_page(items: Vec<Json>, count: i64, total: i64, limit: i64, 
     ])
 }
 
-pub fn paginate(items: &[SynValue], query: &IndexMap<String, String>) -> Json {
-    let total = items.len() as i64;
-    let (limit, offset) = page_window(query);
-    let start = offset.min(total).max(0) as usize;
-    let end = (offset + limit).min(total).max(0) as usize;
-    let page = &items[start..end];
-    let page_json: Vec<Json> = page.iter().map(syn_to_json).collect();
-    envelope_from_page(page_json, page.len() as i64, total, limit, offset)
+/// Escribe `dumps(&envelope_from_page(…))` de una página sin armar el árbol.
+fn write_page(items: &[SynValue], total: i64, limit: i64, offset: i64, out: &mut String) {
+    out.push_str("{\"items\": [");
+    for (i, it) in items.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        dumps_syn_into(it, out);
+    }
+    out.push_str("], \"count\": ");
+    out.push_str(&(items.len() as i64).to_string());
+    out.push_str(", \"total\": ");
+    out.push_str(&total.to_string());
+    out.push_str(", \"cursor\": ");
+    let next = offset.saturating_add(limit);
+    if next < total {
+        out.push_str(&next.to_string());
+    } else {
+        out.push_str("null");
+    }
+    out.push('}');
 }
 
-/// Paginación lazy de `paged()`: sólo se trae la página (LIMIT/OFFSET) y `total`
-/// viene de un COUNT(*), sin materializar la colección entera.
-pub fn paginate_lazy(
-    fetch: &synsema_core::types::PagedFetch,
-    query: &IndexMap<String, String>,
-) -> Result<Json, String> {
-    let (limit, offset) = page_window(query);
-    let (rows, total) = fetch(Some(limit), offset)?;
-    let count = rows.len() as i64;
-    let items: Vec<Json> = rows.iter().map(syn_to_json).collect();
-    Ok(envelope_from_page(items, count, total, limit, offset))
-}
-
-/// Da forma a un give-value según el contrato (`_shape` del oráculo).
-pub fn shape(value: Option<&SynValue>, query: &IndexMap<String, String>) -> Result<Json, String> {
+/// Da forma a un give-value según el contrato (`_shape` del oráculo) y lo devuelve ya escrito
+/// como JSON. Una lista se pagina leyendo sólo la página: el costo de una respuesta es el de la
+/// página, no el de la colección (antes se copiaba la lista entera en cada request). `paged()`
+/// trae sólo la página (LIMIT/OFFSET) y `total` viene de un COUNT(*).
+pub fn shape(value: Option<&SynValue>, query: &IndexMap<String, String>) -> Result<String, String> {
+    let mut out = String::new();
     match value {
-        None | Some(SynValue::Nothing) => Ok(Json::Null),
+        None | Some(SynValue::Nothing) => out.push_str("null"),
         Some(SynValue::Server(s)) if matches!(&**s, ServerValue::Paged(_)) => {
             if let ServerValue::Paged(fetch) = &**s {
-                paginate_lazy(&**fetch, query)
+                let (limit, offset) = page_window(query);
+                let (rows, total) = fetch(Some(limit), offset)?;
+                write_page(&rows, total, limit, offset, &mut out);
             } else {
                 unreachable!()
             }
         }
-        Some(SynValue::List(l)) => Ok(paginate(&l.borrow().to_vec(), query)),
-        Some(v) => Ok(syn_to_json(v)),
+        Some(SynValue::List(l)) => {
+            let total = l.borrow().len() as i64;
+            let (limit, offset) = page_window(query);
+            let start = offset.min(total).max(0) as usize;
+            let end = offset.saturating_add(limit).min(total).max(0) as usize;
+            let page = list_read_range(l, start, end);
+            write_page(&page, total, limit, offset, &mut out);
+        }
+        Some(v) => dumps_syn_into(v, &mut out),
     }
+    Ok(out)
 }
 
 /// Convierte un give-value en (status, cuerpo) según el contrato. `_RAW` (html/
@@ -317,7 +332,7 @@ pub fn build_response(
                 ));
             }
             ServerValue::Envelope { status, value } => {
-                return Ok((*status as u16, ResponseBody::Json(shape(Some(value), query)?)));
+                return Ok((*status as u16, ResponseBody::JsonText(shape(Some(value), query)?)));
             }
             ServerValue::Redirect { location, status } => {
                 return Ok((
@@ -340,7 +355,7 @@ pub fn build_response(
             }),
         ));
     }
-    Ok((200, ResponseBody::Json(shape(give, query)?)))
+    Ok((200, ResponseBody::JsonText(shape(give, query)?)))
 }
 
 // =========================================================
@@ -583,6 +598,9 @@ pub struct RouteSpec {
 /// Cuerpo de una respuesta HTTP.
 pub enum ResponseBody {
     Json(Json),
+    /// El cuerpo de `give` ya escrito como JSON (`shape`): sin árbol intermedio, y se serializa
+    /// en el hilo del intérprete, que es el que tiene los valores.
+    JsonText(String),
     Raw(RawResponse),
     /// `redirect()` — 3xx + header `Location` (sin body). El `Location` lo inyecta
     /// el dispatch en los headers extra; acá viaja solo el destino + status.
@@ -1086,3 +1104,106 @@ pub fn request_bindings(ctx: &Ctx) -> Vec<(String, SynValue)> {
     ]
 }
 
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+    use synsema_core::synlist::SynList;
+    use synsema_core::types::{syn_float, syn_list, syn_list_of};
+
+    fn query(pairs: &[(&str, &str)]) -> IndexMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// La paginación de antes: copiar la lista, árbol de la página, `dumps`.
+    fn reference(items: &[SynValue], q: &IndexMap<String, String>) -> String {
+        let total = items.len() as i64;
+        let (limit, offset) = page_window(q);
+        let start = offset.min(total).max(0) as usize;
+        let end = (offset + limit).min(total).max(0) as usize;
+        let page: Vec<Json> = items[start..end].iter().map(syn_to_json).collect();
+        dumps(&envelope_from_page(page, (end - start) as i64, total, limit, offset))
+    }
+
+    fn queries() -> Vec<IndexMap<String, String>> {
+        let mut qs = vec![query(&[])];
+        for l in ["1", "7", "100", "0", "-5", "5000", "abc"] {
+            for c in ["0", "3", "95", "99", "100", "101", "250", "-2", "x"] {
+                qs.push(query(&[("limit", l), ("cursor", c)]));
+                qs.push(query(&[("limit", l), ("offset", c)]));
+            }
+        }
+        qs
+    }
+
+    #[test]
+    fn list_pages_match_the_old_contract() {
+        let mut row = |i: i64| {
+            let mut m = SynMap::new();
+            m.insert("id", syn_int(i));
+            m.insert("name", syn_text(format!("n\"{}ñ", i)));
+            m.insert("score", syn_float(i as f64 * 0.5));
+            m.insert("tags", syn_list(vec![syn_text("a"), syn_bool(i % 2 == 0), syn_nothing()]));
+            syn_map(m)
+        };
+        for n in [0usize, 1, 99, 100, 101, 250] {
+            let values: Vec<SynValue> = (0..n as i64).map(&mut row).collect();
+            let ints: Vec<i64> = (0..n as i64).map(|i| i * 3 - 7).collect();
+            let floats: Vec<f64> = (0..n).map(|i| i as f64 / 3.0).collect();
+            let lists = [
+                syn_list(values.clone()),
+                syn_list_of(SynList::from_ints(ints.clone())),
+                syn_list_of(SynList::from_floats(floats.clone())),
+            ];
+            for v in &lists {
+                let items: Vec<SynValue> = match v {
+                    SynValue::List(l) => l.borrow().to_vec(),
+                    _ => unreachable!(),
+                };
+                for q in queries() {
+                    assert_eq!(shape(Some(v), &q).unwrap(), reference(&items, &q), "n={} q={:?}", n, q);
+                }
+            }
+            // Leer una página no le cambia la forma a una lista sin caja.
+            if let SynValue::List(l) = &lists[1] {
+                assert!(n == 0 || !l.borrow().is_values(), "la lista de enteros pasó a valores");
+            }
+        }
+    }
+
+    #[test]
+    fn other_values_match_the_tree() {
+        let mut m = SynMap::new();
+        m.insert("ok", syn_bool(true));
+        m.insert("items", syn_list(vec![syn_int(1), syn_text("dos")]));
+        for v in [syn_map(m), syn_text("hola"), syn_int(-3), syn_float(2.5), syn_nothing()] {
+            assert_eq!(shape(Some(&v), &query(&[])).unwrap(), dumps(&syn_to_json(&v)));
+        }
+        assert_eq!(shape(None, &query(&[])).unwrap(), "null");
+    }
+
+    #[test]
+    fn paged_matches_the_old_contract() {
+        let fetch: Rc<synsema_core::types::PagedFetch> = Rc::new(|limit, offset| {
+            let limit = limit.unwrap_or(1000);
+            let rows = (offset..(offset + limit).min(250)).map(syn_int).collect();
+            Ok((rows, 250))
+        });
+        let v = SynValue::Server(Rc::new(ServerValue::Paged(fetch.clone())));
+        for q in queries() {
+            let (limit, offset) = page_window(&q);
+            let (rows, total) = fetch(Some(limit), offset).unwrap();
+            let page: Vec<Json> = rows.iter().map(syn_to_json).collect();
+            let want = dumps(&envelope_from_page(page, rows.len() as i64, total, limit, offset));
+            assert_eq!(shape(Some(&v), &q).unwrap(), want, "q={:?}", q);
+        }
+    }
+
+    /// Un cursor enorme no desborda (antes `offset + limit` se pasaba de i64).
+    #[test]
+    fn huge_cursor_gives_an_empty_last_page() {
+        let v = syn_list(vec![syn_int(1), syn_int(2)]);
+        let out = shape(Some(&v), &query(&[("cursor", "9223372036854775807")])).unwrap();
+        assert_eq!(out, "{\"items\": [], \"count\": 0, \"total\": 2, \"cursor\": null}");
+    }
+}

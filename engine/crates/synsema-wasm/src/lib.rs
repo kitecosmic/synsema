@@ -49,7 +49,7 @@ use synsema_core::interpreter::{Control, Interpreter, RunResult, RuntimeError};
 use synsema_core::parser::{parse_source, CompileError};
 use synsema_core::types::{syn_bool, syn_list, syn_map, SynValue};
 use synsema_stdlib::hostcap::{self, HostProvider};
-use synsema_stdlib::json::{dumps, json_to_syn, syn_to_json};
+use synsema_stdlib::json::{dumps_syn, json_to_syn};
 use synsema_stdlib::secrets::{register_secret_builtins, EnvStore};
 
 pub use synsema_capabilities::model::build_ceiling;
@@ -213,7 +213,7 @@ pub fn labelled_json(v: &SynValue) -> serde_json::Value {
         // El JSON ya producido — si no, un `ok({"$private": ["x"], "value": …})` armado por el
         // sender vuelve a ser un marcador falso del lado del host.
         other => {
-            let text = synsema_stdlib::json::dumps(&synsema_stdlib::json::syn_to_json(other));
+            let text = synsema_stdlib::json::dumps_syn(other);
             let parsed = serde_json::from_str(&text).unwrap_or_else(|_| Value::String(other.to_string()));
             escape_marker_keys_deep(parsed)
         }
@@ -764,7 +764,7 @@ fn register_state_builtins(interp: &Interpreter, host_kv: bool) {
     }
     fn store(host_kv: bool, local: &Rc<RefCell<MapObj>>, key: &str, v: &SynValue) {
         if host_kv {
-            kv_write(NS, key, &dumps(&syn_to_json(v)));
+            kv_write(NS, key, &dumps_syn(v));
         } else {
             local.borrow_mut().insert(key.to_string(), v.clone());
         }

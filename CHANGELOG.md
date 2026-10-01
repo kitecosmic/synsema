@@ -6,6 +6,59 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.38 — 2026-10-01
+
+Speed and memory, second step: the native tier runs code over data, lists of numbers take a third of
+the memory, and text is built in place. The same language — every program gives the same result,
+the same errors (text and location) and the same `steps()` count; copy-on-write, insertion order
+and `==` by value are unchanged — only faster and lighter. Nothing to change in your programs.
+
+**Faster and lighter.** Whole process on Windows, best of 5, this build *without* PGO (the release
+is built with PGO, usually 20–35 % faster) against v0.6.37 as released:
+
+| | v0.6.37 | v0.6.38 | CPython 3.12 |
+|---|---:|---:|---:|
+| sort 2 M integers | 1187 ms / 148 MB | **135 ms / 44.5 MB** | 1642 ms / 111 MB |
+| n-body (records of floats) | 13.6 s | **1.53 s** | 2.87 s |
+| 2 M records built and summed | 1113 ms / 330 MB | **603 ms / 254 MB** | 753 ms / 517 MB |
+| `where` over 2 M integers | 516 ms / 145 MB | **192 ms / 37 MB** | 344 ms / 103 MB |
+| `json_encode` + `json_decode`, 500 k rows | 883 ms / 322 MB | **737 ms / 168 MB** | 1070 ms / 337 MB |
+| word count (map of thousands of keys) | 1679 ms / 282 MB | **1030 ms / 127 MB** | 1001 ms / 247 MB |
+| `join` of 2 M texts | 842 ms / 223 MB | **577 ms / 84 MB** | 471 ms / 147 MB |
+| `set s to s + x`, 100 k times | 3897 ms | **61 ms** | 703 ms |
+| spectral norm (floats) | 461 ms | **97 ms** | 506 ms |
+| matrix multiply on lists | 399 ms | **126 ms** | 275 ms |
+| `while` loop, 10 M | 84 ms | **56 ms** | 1192 ms |
+
+Small programs that compile native code use 1–3 MB more than v0.6.37 at peak (compiling with
+Cranelift); that is the next thing to work on.
+
+**How.**
+
+- **The native tier runs loops over data**: reading and writing list elements and map fields
+  (`set bodies[i].vx to …`), floats, `length`, `sqrt`, `abs`, `float` and `get` as instructions,
+  text constants, and calls to any builtin or task from inside a native loop. Anything it does not do
+  still runs in the VM, exactly as before.
+- **Builtins that take a function** (`apply`, `where`, `reduce`, `count_where`, `every`, `some`,
+  `find_first`, `sort_by`) call it without per-element overhead, straight into its native code when
+  it has some.
+- **Lists of integers or of floats are stored unboxed** (8 bytes per element instead of 24) and
+  `sort` orders them as numbers. A list becomes a regular one the first time something needs it to
+  (a mixed element, most builtins); the result is always the same.
+- **Text**: up to 15 bytes inline (no allocation), `set s to s + x` appends in place when nothing
+  else shares `s`, `text(n)` and `join` write digits and parts directly; `json_encode` and `serve`
+  responses are written without an intermediate tree, and a paginated response reads only its page.
+- **In place**: `set P to append(P, e)` appends without copying when `P` is the only owner; a map
+  literal with constant keys builds its shape once per site.
+
+**For contributors.** `ListRef` is `Rc<RefCell<SynList>>`. Read elements with `l.borrow().get(i)` /
+`.len()`; for code that needs `&[SynValue]`, `synlist::list_values(&l)` (turns an unboxed list into
+values for good) or `synlist::list_read(&l)` (reads a copy without changing it); build lists with
+`syn_list(vec)` or `syn_list_of(SynList::from_ints(…))`. Every private value is built by
+`labels::labelled` (a test checks it), which lets responses skip the label walk when there is none.
+Still no `unsafe` in core. The differential oracle (508 programs), the native fuzzers (data, writes,
+foreign calls, calls from builtins) and a new test that builds every list both ways cover it.
+
 ## v0.6.37 — 2026-09-29
 
 Memory, first step: maps take a fraction of the memory they used to. The same language — every

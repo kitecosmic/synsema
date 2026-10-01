@@ -341,7 +341,7 @@ fn b_oidc_verify(
             "jwks" => {
                 jwks_inline = Some(match v {
                     SynValue::Text(s) => s.to_string(),
-                    SynValue::Map(_) => crate::json::dumps(&crate::json::syn_to_json(v)),
+                    SynValue::Map(_) => crate::json::dumps_syn(v),
                     other => {
                         return Err(err(format!(
                             "{}: jwks must be the JWKS document as text or a map, got {}",

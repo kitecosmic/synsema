@@ -216,6 +216,20 @@ pub fn list_read(l: &ListRef) -> ListRead<'_> {
     }
 }
 
+/// Los elementos `[start, end)` de `l` para LEER (una página): prestados si es de valores; si es
+/// sin caja, una copia de ese tramo solo. No toca el resto de la lista ni cambia su forma. Los
+/// bordes se recortan al largo.
+pub fn list_read_range(l: &ListRef, start: usize, end: usize) -> ListRead<'_> {
+    let b = l.borrow();
+    let end = end.min(b.len());
+    let start = start.min(end);
+    if b.is_values() {
+        ListRead::Values(Ref::map(b, |s| &s.as_values().expect("de valores")[start..end]))
+    } else {
+        ListRead::Copy((start..end).filter_map(|i| b.get(i)).collect())
+    }
+}
+
 /// Ver `list_read`.
 pub enum ListRead<'a> {
     Values(Ref<'a, [SynValue]>),
