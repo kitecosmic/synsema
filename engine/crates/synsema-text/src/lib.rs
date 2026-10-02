@@ -190,6 +190,12 @@ impl SynText {
         !self.is_inline() && self.header().strong.get() >= SCOPED
     }
 
+    /// Si es inmortal para siempre (`make_immortal`).
+    #[inline]
+    pub fn is_permanent(&self) -> bool {
+        !self.is_inline() && self.header().strong.get() == IMMORTAL
+    }
+
     /// Si es inmortal con alcance (`make_immortal_logged`): se va a descongelar.
     #[inline]
     pub fn is_scoped(&self) -> bool {
@@ -480,7 +486,7 @@ mod tests {
         let t = e.make_immortal_logged().expect("en el montón");
         assert!(e.is_immortal() && e.is_scoped() && e.make_immortal_logged().is_none());
         e.make_immortal();
-        assert!(e.is_scoped(), "con alcance no pasa a permanente");
+        assert!(e.is_scoped() && !e.is_permanent(), "con alcance no pasa a permanente");
         drop(e.clone());
         // SAFETY (del test): los clones de la ventana se soltaron; un hilo.
         unsafe { t.thaw() };

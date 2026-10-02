@@ -125,6 +125,13 @@ impl<T> Shared<T> {
         scoped_h(this.header())
     }
 
+    /// ¿Inmortal para siempre (`make_immortal`)? No el de alcance ni el de cuenta llena (que sigue
+    /// siendo de un solo hilo).
+    #[inline]
+    pub fn is_permanent(this: &Self) -> bool {
+        permanent_h(this.header())
+    }
+
     /// Cuántos `Shared` lo tienen. `usize::MAX` si es inmortal (siempre "compartido").
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
@@ -647,6 +654,13 @@ impl<T: ?Sized + TailObject> SharedTail<T> {
     pub fn is_scoped(this: &Self) -> bool {
         scoped_h(this.header())
     }
+
+    /// ¿Inmortal para siempre (`make_immortal`)? No el de alcance ni el de cuenta llena (que sigue
+    /// siendo de un solo hilo).
+    #[inline]
+    pub fn is_permanent(this: &Self) -> bool {
+        permanent_h(this.header())
+    }
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
         strong_count_h(this.header())
@@ -845,6 +859,13 @@ impl<T> Obj<T> {
     #[inline]
     pub fn is_scoped(this: &Self) -> bool {
         scoped_h(this.header())
+    }
+
+    /// ¿Inmortal para siempre (`make_immortal`)? No el de alcance ni el de cuenta llena (que sigue
+    /// siendo de un solo hilo).
+    #[inline]
+    pub fn is_permanent(this: &Self) -> bool {
+        permanent_h(this.header())
     }
 
     /// `usize::MAX` si es inmortal.
@@ -1131,6 +1152,13 @@ impl<E: Copy> ObjSlice<E> {
         scoped_h(this.header())
     }
 
+    /// ¿Inmortal para siempre (`make_immortal`)? No el de alcance ni el de cuenta llena (que sigue
+    /// siendo de un solo hilo).
+    #[inline]
+    pub fn is_permanent(this: &Self) -> bool {
+        permanent_h(this.header())
+    }
+
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
         strong_count_h(this.header())
@@ -1372,6 +1400,10 @@ impl FreezeLog {
     }
 }
 
+fn permanent_h(h: &Header) -> bool {
+    h.strong.get() == IMMORTAL && h.borrow.get() == IMMORTAL_BORROW
+}
+
 fn scoped_h(h: &Header) -> bool {
     h.strong.get() == IMMORTAL && h.borrow.get() == SCOPED_BORROW
 }
@@ -1524,6 +1556,7 @@ mod tests {
         Obj::make_immortal_logged(&already, &mut log);
         assert_eq!(log.len(), 2, "lo ya inmortal no se anota");
         assert!(Shared::is_scoped(&a) && Obj::is_scoped(&o) && !Obj::is_scoped(&already));
+        assert!(!Shared::is_permanent(&a) && Obj::is_permanent(&already));
         assert_eq!(Shared::strong_count(&a), usize::MAX);
         {
             // Mientras está congelado: clonar y soltar no cuentan, leer no toma préstamo.

@@ -41,7 +41,7 @@ use synsema_core::interpreter::{
 };
 use synsema_core::parser::{parse_source, CompileError};
 use synsema_core::types::{from_send, to_send, SendValue, SynValue};
-use crate::serve::{val_to_global, rebuild_globals, GlobalVal};
+use crate::serve::{val_to_global_shared, rebuild_globals, GlobalVal};
 use synsema_stdlib::cron::{register_cron_builtins, CronScheduler};
 use synsema_stdlib::database::{register_database_builtins, DatabaseManager};
 use synsema_stdlib::http::register_http_builtins;
@@ -1966,7 +1966,9 @@ pub(crate) fn wire_swarm_hooks(
                 args.iter().map(|(k, v)| (k.clone(), to_send(v))).collect();
             // Convertir el snapshot de globales del llamador a GlobalVal (preserva tasks).
             let global_snap: Arc<Vec<(String, GlobalVal)>> = Arc::new(
-                globals.iter().map(|(k, v)| (k.clone(), val_to_global(v))).collect(),
+                // Lo ya congelado para siempre (las globales de `serve`) se comparte sin copia; lo
+                // demás se copia: el agente vive libre (R2.4).
+                globals.iter().map(|(k, v)| (k.clone(), val_to_global_shared(v))).collect(),
             );
             // El techo del host se propaga al agente (Arc → Send cruza el hilo): un agente
             // spawneado jamás excede el techo, aunque su cuerpo declare `require exec(...)`.

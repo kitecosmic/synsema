@@ -57,10 +57,40 @@ impl FrozenValue {
         Ok(FrozenValue(v))
     }
 
+    /// `v` si YA está congelado para siempre (sin congelar nada nuevo): `Err(v)` si no. Para lo que
+    /// cruza a un hilo de vida libre (un agente de `spawn`, un job de `cron`) desde un intérprete que
+    /// sigue corriendo: congelarlo ahí sería una fuga por cada `spawn` con datos nuevos, y con alcance
+    /// no se puede (nadie espera a ese hilo). Lo que ya es permanente (las globales del preámbulo de
+    /// `serve`) se comparte gratis; lo demás se copia como siempre (R2.4).
+    pub fn share(v: SynValue) -> Result<FrozenValue, SynValue> {
+        if permanent(&v) {
+            Ok(FrozenValue(v))
+        } else {
+            Err(v)
+        }
+    }
+
     /// El valor, para atarlo en el hilo que lo pide: un clon que no escribe nada compartido.
     #[inline]
     pub fn get(&self) -> SynValue {
         self.0.clone()
+    }
+}
+
+/// ¿`v` está congelado para siempre? Alcanza con mirar el objeto de afuera: `mark` congela lo de
+/// adentro antes que lo de afuera, y sólo después de que `freezable` aprobó todo el valor.
+fn permanent(v: &SynValue) -> bool {
+    match v {
+        SynValue::Number(_) | SynValue::Bool(_) | SynValue::Nothing | SynValue::Complex(_) => true,
+        SynValue::Text(t) => t.is_inline() || t.is_permanent(),
+        SynValue::Bytes(b) => BytesRef::is_permanent(b),
+        SynValue::Array(a) => Obj::is_permanent(a),
+        SynValue::Time(t) => Obj::is_permanent(t),
+        SynValue::Secret(s) => Obj::is_permanent(s),
+        SynValue::List(l) => ListRef::is_permanent(l),
+        SynValue::Map(m) => MapRef::is_permanent(m),
+        SynValue::Server(s) => Obj::is_permanent(s),
+        SynValue::Task(_) | SynValue::Builtin(_) | SynValue::Private(_) => false,
     }
 }
 

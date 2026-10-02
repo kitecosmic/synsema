@@ -211,3 +211,25 @@ fn a_panicking_thread_still_thaws() {
         _ => panic!("l"),
     }
 }
+
+/// R2.4: `share` sólo toma lo que ya es permanente; ni lo mortal ni lo congelado con alcance.
+#[test]
+fn share_takes_only_what_is_already_permanent() {
+    use synsema_core::frozen::ScopedFreeze;
+    let mut i = Interpreter::new();
+    assert!(i.execute(&parse_source("let a be [[1], \"un texto largo que vive en el montón\"]
+let b be [[2]]
+", "<s>").expect("parse")).is_ok());
+    let a = global(&i, "a");
+    let b = global(&i, "b");
+    assert!(FrozenValue::share(a.clone()).is_err(), "mortal: no");
+    let _keep = FrozenValue::new(a.clone()).ok().expect("se congela");
+    assert!(FrozenValue::share(a.clone()).is_ok(), "permanente: sí");
+    let mut scope = ScopedFreeze::new();
+    let k = scope.add(b.clone()).expect("se congela con alcance");
+    let shared = scope
+        .run(1, 64 << 20, |ctx, _| FrozenValue::share(ctx.get(k)).is_ok())
+        .expect("hilo");
+    assert_eq!(shared, vec![false], "con alcance: no");
+    assert!(FrozenValue::share(SynValue::Number(synsema_core::number::Number::Int(1))).is_ok());
+}
