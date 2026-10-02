@@ -35,6 +35,8 @@ pub mod rng_ziggurat;
 pub mod stats;
 pub mod synlist;
 pub mod synmap;
+/// R2: valores congelados que se leen desde varios hilos (specs/modelo-memoria-regiones.md).
+pub mod frozen;
 /// El montón propio (`Ref`/`RefMut` de listas y mapas, R1 de specs/modelo-memoria-regiones.md).
 pub use synsema_heap as heap;
 pub mod tabular;

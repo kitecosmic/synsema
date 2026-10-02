@@ -46,6 +46,11 @@ impl Key {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Ver `SynText::make_immortal` (R2: `frozen.rs`).
+    pub(crate) fn make_immortal(&self) {
+        self.0.make_immortal();
+    }
     /// La clave de un valor (`m[k]`, un literal `{k: …}`): un texto comparte su `Rc` (sin copiar);
     /// cualquier otro valor, su texto (`{1: "a"}` → la clave `"1"`, como siempre).
     #[inline]
@@ -286,6 +291,9 @@ fn root() -> Obj<Node> {
 /// La forma de `parent` más la clave `k` al final: la transición guardada si la hay (por puntero
 /// primero, por texto después), o una nueva. `None` si `parent` ya tiene demasiadas hijas.
 fn transition(parent: &Obj<Node>, k: &Key) -> Option<Obj<Node>> {
+    if Obj::is_immortal(parent) {
+        return frozen_transition(parent, k);
+    }
     let s = shape_of(parent);
     let mut ch = s.children.borrow_mut();
     let mut dead = None;
@@ -312,17 +320,88 @@ fn transition(parent: &Obj<Node>, k: &Key) -> Option<Obj<Node>> {
     if ch.len() >= MAX_CHILDREN || s.position(k).is_some() {
         return None;
     }
+    let n = new_child(parent, s, k);
+    ch.push((k.clone(), Obj::downgrade(&n)));
+    Some(n)
+}
+
+/// La forma hija de `parent` (cuya forma es `s`) con la clave `k` al final.
+fn new_child(parent: &Obj<Node>, s: &Shape, k: &Key) -> Obj<Node> {
     let mut keys = Vec::with_capacity(s.keys.len() + 1);
     keys.extend_from_slice(&s.keys);
     keys.push(k.clone());
-    let n = Obj::new(Node::Shape(Shape {
+    Obj::new(Node::Shape(Shape {
         _parent: Some(parent.clone()),
         keys: keys.into_boxed_slice(),
         children: RefCell::new(Vec::new()),
         index: OnceCell::new(),
-    }));
-    ch.push((k.clone(), Obj::downgrade(&n)));
-    Some(n)
+    }))
+}
+
+thread_local! {
+    /// Las transiciones que salen de una forma inmortal (R2, `frozen.rs`): una forma congelada la
+    /// leen varios hilos y no se escribe, así que sus hijas no se guardan en ella (`children`) sino
+    /// acá, una tabla por hilo. La dirección de la madre no se reusa: un inmortal no se libera.
+    static FROZEN_KIDS: RefCell<HashMap<(usize, Key), WeakObj<Node>>> = RefCell::new(HashMap::new());
+}
+
+/// `transition` desde una forma inmortal: sin tocar la forma (ni su `children`), por la tabla del hilo.
+fn frozen_transition(parent: &Obj<Node>, k: &Key) -> Option<Obj<Node>> {
+    let s = shape_of(parent);
+    FROZEN_KIDS.with(|t| {
+        let mut t = t.borrow_mut();
+        let at = (addr(parent), k.clone());
+        if let Some(n) = t.get(&at).and_then(WeakObj::upgrade) {
+            return Some(n);
+        }
+        if s.position(k).is_some() {
+            return None;
+        }
+        if t.len() >= 1024 && t.len().is_power_of_two() {
+            t.retain(|_, w| w.strong_count() > 0);
+        }
+        let n = new_child(parent, s, k);
+        t.insert(at, Obj::downgrade(&n));
+        Some(n)
+    })
+}
+
+/// R2 (`frozen.rs`): vuelve inmortal lo que es del mapa fuera de sus valores — la forma y su cadena
+/// de madres (con sus claves y su índice ya armado, para que leerla no escriba), el nodo
+/// `Grown`/`Dict` y las claves del diccionario. Los valores (y las claves en línea) los congela
+/// quien llama.
+pub(crate) fn freeze_layout(m: &MapObj) {
+    if let Some(n) = &m.layout {
+        freeze_node(n);
+    }
+}
+
+fn freeze_node(n: &Obj<Node>) {
+    let mut cur = n.clone();
+    loop {
+        if Obj::is_immortal(&cur) {
+            return;
+        }
+        let next = match &*cur {
+            Node::Shape(s) => {
+                s.keys.iter().for_each(Key::make_immortal);
+                if s.keys.len() >= INDEX_FROM {
+                    let _ = s.position(s.keys[0].as_str());
+                }
+                s._parent.clone()
+            }
+            Node::Grown { shape, .. } => Some(shape.clone()),
+            Node::Dict(d) => {
+                d.keys().for_each(Key::make_immortal);
+                None
+            }
+        };
+        Obj::make_immortal(&cur);
+        match next {
+            Some(p) => cur = p,
+            None => return,
+        }
+    }
 }
 
 /// Una copia propia de lo que es de un solo mapa (la forma se comparte).

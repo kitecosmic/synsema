@@ -165,6 +165,8 @@ struct Tally {
     compared: usize,
     nondeterministic: usize,
     timeouts: usize,
+    /// Cuáles no terminaron (para saber si es la carga de la máquina o un programa que se cuelga).
+    timed_out: Vec<String>,
     mismatches: Vec<String>,
     resolver_checked: u64,
     resolver_unchecked: u64,
@@ -213,7 +215,9 @@ fn shortcuts_match_the_reference_interpreter() {
                 // Si las dos referencias coinciden y la de atajos no, la diferencia es real.
                 let first = run(&runner, &file, true);
                 if first == Outcome::Timeout {
-                    tally.lock().unwrap().timeouts += 1;
+                    let mut t = tally.lock().unwrap();
+                    t.timeouts += 1;
+                    t.timed_out.push(rel.clone());
                     continue;
                 }
                 let fast = run(&runner, &file, false);
@@ -300,6 +304,9 @@ fn shortcuts_match_the_reference_interpreter() {
         TIMEOUT,
         t.mismatches.len()
     );
+    if !t.timed_out.is_empty() {
+        eprintln!("sin terminar: {}", t.timed_out.join(", "));
+    }
     eprintln!(
         "nativo (ansioso): {} programas entraron, {} unidades, {} entradas, {} salidas a la VM; bucles (OSR): {} entradas en {} programas",
         t.native_programs, t.native_units, t.native_entries, t.native_deopts, t.native_osr, t.osr_programs

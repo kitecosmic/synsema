@@ -1,6 +1,6 @@
 //! Dónde hay `unsafe` en el motor (spec §F4.2): el nivel nativo lo tiene sólo en
-//! `synsema-jit/src/abi.rs`, el texto sólo en `synsema-text/src/lib.rs` (F4.6b), core no tiene
-//! nada, y cualquier `unsafe` nuevo en otro archivo rompe este test (para agregarlo hay que sumarlo
+//! `synsema-jit/src/abi.rs`, el texto sólo en `synsema-text/src/lib.rs` (F4.6b), core sólo en
+//! `frozen.rs` (R2), y cualquier `unsafe` nuevo en otro archivo rompe este test (para agregarlo hay que sumarlo
 //! acá, a la vista del que revisa).
 
 use std::path::{Path, PathBuf};
@@ -13,6 +13,9 @@ const ALLOWED: &[&str] = &[
     // Los objetos del montón (R1 de specs/modelo-memoria-regiones.md): cabecera de 8 B, cuenta propia,
     // préstamos como RefCell, inmortales. Revisado con Miri en x86_64, i686 y s390x.
     "engine/crates/synsema-heap/src/lib.rs",
+    // La región compartida (R2): el `unsafe impl Send/Sync` de `FrozenValue`, que sólo arma el
+    // recorrido que congela todo lo alcanzable (la invariante depende de la forma de `SynValue`).
+    "engine/crates/synsema-core/src/frozen.rs",
     // El nivel nativo: el contexto, la salida a la VM y la llamada al código generado.
     "engine/crates/synsema-jit/src/abi.rs",
     // Handles del sistema (descriptores heredados, consola de Windows, Job Objects, ioctl de Nitro).
@@ -81,5 +84,10 @@ fn unsafe_only_where_allowed() {
     let extra: Vec<&String> = found.iter().filter(|f| !ALLOWED.contains(&f.as_str())).collect();
     assert!(extra.is_empty(), "`unsafe` fuera de la lista permitida: {:?}", extra);
     assert!(found.iter().any(|f| f.ends_with("synsema-jit/src/abi.rs")), "el test no ve abi.rs: ¿cambió la ruta?");
-    assert!(!found.iter().any(|f| f.contains("synsema-core/src/")), "core tiene `unsafe`");
+    // Core no tiene `unsafe` salvo la región compartida (R2, aprobado por Joel el 2026-10-02):
+    // `frozen.rs`, el `Send/Sync` de los valores congelados junto al recorrido que los congela.
+    assert!(
+        !found.iter().any(|f| f.contains("synsema-core/src/") && !f.ends_with("synsema-core/src/frozen.rs")),
+        "core tiene `unsafe` fuera de frozen.rs"
+    );
 }
