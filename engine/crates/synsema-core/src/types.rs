@@ -30,6 +30,10 @@ use crate::tokens::SourceLocation;
 /// R1.3a (specs/modelo-memoria-regiones.md): un objeto propio del montón (cabecera de 8 B, puede ser
 /// inmortal), con la misma forma de uso que `Rc<RefCell<SynList>>`.
 pub type ListRef = synsema_heap::Shared<SynList>;
+/// R1.3c: los valores de sólo lectura (antes `Rc<T>` y `Rc<[u8]>`) son objetos propios con la misma
+/// cabecera; `BytesRef` tiene puntero fino (el largo vive en el objeto).
+pub use synsema_heap::{Obj, ObjSlice};
+pub type BytesRef = synsema_heap::ObjSlice<u8>;
 pub use crate::synlist::SynList;
 use crate::synlist::{list_read, list_values};
 pub use crate::synmap::{Key, MapObj, MapRef, SynMap};
@@ -49,16 +53,16 @@ pub enum SynValue {
     /// Python: `_RAW`/`_ENVELOPE`/`_NODE`/`_CONTENT`/`_PAGED`). En el lenguaje se
     /// comporta como un map (type "map", property access, etc.); el tag sólo lo
     /// lee la lógica de `serve` (contrato de respuesta + negociación).
-    Server(Rc<ServerValue>),
+    Server(Obj<ServerValue>),
     /// Valor sensible y opaco (feature `secret`). Variante **aislada** (§8): no es
     /// un bit de taint en los otros valores — es un tag más del enum. Se redacta en
     /// toda salida (Display/JSON/blackboard/logs); el plaintext sólo se materializa
     /// en los puntos bordeados del runtime (reveal/socket/DB). Ver `secret.rs`.
-    Secret(Rc<SecretInner>),
+    Secret(Obj<SecretInner>),
     /// Datos binarios inmutables (feature `bytes`, Batch 1). Espeja `Text`
     /// pero sin garantía de UTF-8. Constructor-only (`bytes(...)`); no hay literal.
     /// Toda operación devuelve bytes nuevos (sin mutación in-place → sin aliasing).
-    Bytes(Rc<[u8]>),
+    Bytes(BytesRef),
     /// Número complejo (feature math, Batch 4). Variante **aislada** (como `bytes`): NO
     /// vive en el tower `Number` (Int/Big/Float/Decimal queda intacto, G1/G2). La
     /// aritmética se resuelve en `exec_binary` (promoción real→complex). Constructor-only
@@ -69,17 +73,17 @@ pub enum SynValue {
     /// devuelven arrays nuevos). La aritmética vectorizada (elementwise + broadcasting) se
     /// resuelve en `exec_binary`; el álgebra lineal (faer) opera sobre el caso 2D.
     /// `*` es ELEMENTWISE (Hadamard); el producto matricial es `matmul`/`dot`.
-    Array(Rc<ArrayD<f64>>),
+    Array(Obj<ArrayD<f64>>),
     /// Valor etiquetado con un conjunto de principales (`private`/`declassify`).
     /// Variante **aislada** (como `secret`): se computa normalmente (el intérprete
     /// desenvuelve, opera y re-envuelve con la unión de etiquetas) pero se redacta en
     /// toda salida (`private(A,B)`) y sólo fluye a un sumidero que acepte a todos sus
     /// principales. Sólo existe en runtime con `Interpreter::set_labels(true)`; nunca
     /// envuelve a otro `Private` ni a un `Secret`, ni lleva etiqueta vacía. Ver `labels.rs`.
-    Private(Rc<Labelled>),
+    Private(Obj<Labelled>),
     /// Fecha, instante con zona o duración (v0.6.29, DATOS-13): `date`, `datetime`,
     /// `duration`. Variante aislada, inmutable; la aritmética vive en `temporal::binop`.
-    Time(Rc<crate::temporal::Temporal>),
+    Time(Obj<crate::temporal::Temporal>),
 }
 
 /// Closure de paginación lazy de `paged()`: `fetch(limit, offset) → (filas, total)`.
@@ -492,14 +496,14 @@ pub fn syn_map(m: SynMap) -> SynValue {
 }
 /// Construye un `secret` opaco a partir de su nombre de origen y su plaintext.
 pub fn syn_secret(name: impl Into<String>, plaintext: impl Into<String>) -> SynValue {
-    SynValue::Secret(Rc::new(SecretInner::new(name, plaintext)))
+    SynValue::Secret(crate::types::Obj::new(SecretInner::new(name, plaintext)))
 }
 /// Construye un `secret` opaco de BYTES (blob binario sellado con `as_secret`).
 pub fn syn_secret_bytes(name: impl Into<String>, bytes: Vec<u8>) -> SynValue {
-    SynValue::Secret(Rc::new(SecretInner::new_bytes(name, bytes)))
+    SynValue::Secret(crate::types::Obj::new(SecretInner::new_bytes(name, bytes)))
 }
-/// Construye un valor `bytes` (inmutable). Acepta `Vec<u8>` → `Rc<[u8]>` vía `Into`.
-pub fn syn_bytes(b: impl Into<Rc<[u8]>>) -> SynValue {
+/// Construye un valor `bytes` (inmutable). Acepta `Vec<u8>`, `&[u8]`… → `BytesRef` vía `Into`.
+pub fn syn_bytes(b: impl Into<BytesRef>) -> SynValue {
     SynValue::Bytes(b.into())
 }
 /// Construye un `complex` a partir de sus partes real e imaginaria.
@@ -508,7 +512,7 @@ pub fn syn_complex(re: f64, im: f64) -> SynValue {
 }
 /// Construye un `array` (envuelve el `ArrayD<f64>` en `Rc`, inmutable compartido).
 pub fn syn_array(a: ArrayD<f64>) -> SynValue {
-    SynValue::Array(Rc::new(a))
+    SynValue::Array(crate::types::Obj::new(a))
 }
 
 // =========================================================
@@ -656,7 +660,7 @@ pub fn from_send(v: &SendValue) -> SynValue {
         SendValue::Private(principals, inner) => {
             crate::labels::mark(from_send(inner), crate::labels::label_from(principals))
         }
-        SendValue::Time(t) => SynValue::Time(Rc::new(t.clone())),
+        SendValue::Time(t) => SynValue::Time(crate::types::Obj::new(t.clone())),
         SendValue::Rng(Some(g), name) => crate::rng::restore((**g).clone(), name.clone()),
         SendValue::Rng(None, name) => crate::rng::top_level_stub(name),
     }

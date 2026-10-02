@@ -330,7 +330,7 @@ mod tests {
         assert!(e.contains("the value.amount") && e.contains("15 significant digits"), "{}", e);
         let e = fails(&float(f64::INFINITY));
         assert!(e.contains("JSON has no such number"), "{}", e);
-        let e = fails(&SynValue::Bytes(std::rc::Rc::from(vec![1u8, 2].into_boxed_slice())));
+        let e = fails(&SynValue::Bytes(synsema_core::types::BytesRef::from(vec![1u8, 2].into_boxed_slice())));
         assert!(e.contains("bytes") && e.contains("base64url"), "{}", e);
     }
 

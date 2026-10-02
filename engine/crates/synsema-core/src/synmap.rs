@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::ops::{Deref, DerefMut};
-use std::rc::{Rc, Weak};
+use synsema_heap::{Obj, WeakObj};
 use std::sync::OnceLock;
 
 use indexmap::IndexMap;
@@ -226,11 +226,11 @@ type Dict = IndexMap<Key, SynValue, KeyHasher>;
 pub struct Shape {
     /// La madre, con puntero fuerte (el *back pointer* de V8): la cadena vive mientras viva una
     /// hija. Sin esto, armar `{"id", "valor"}` recreaba la forma de `{"id"}` en cada registro.
-    _parent: Option<Rc<Node>>,
+    _parent: Option<Obj<Node>>,
     keys: Box<[Key]>,
     /// Las transiciones: la forma hija por cada clave agregada. `Weak`: una forma que ningún mapa
     /// usa se libera (y su entrada se poda).
-    children: RefCell<Vec<(Key, Weak<Node>)>>,
+    children: RefCell<Vec<(Key, WeakObj<Node>)>>,
     index: OnceCell<HashMap<Key, u32, KeyHasher>>,
 }
 
@@ -257,7 +257,7 @@ pub enum Node {
     Shape(Shape),
     /// La forma y los valores que no entraron en línea (el *backing store* de V8): el valor `i` es
     /// `vals[i]` si hay lugar en línea, si no `extra[i - lugares]`.
-    Grown { shape: Rc<Node>, extra: Vec<SynValue> },
+    Grown { shape: Obj<Node>, extra: Vec<SynValue> },
     /// Modo diccionario: todo acá, los lugares en línea quedan vacíos.
     Dict(Dict),
 }
@@ -271,7 +271,7 @@ fn shape_of(n: &Node) -> &Shape {
 }
 
 thread_local! {
-    static ROOT: Rc<Node> = Rc::new(Node::Shape(Shape {
+    static ROOT: Obj<Node> = Obj::new(Node::Shape(Shape {
         _parent: None,
         keys: Box::new([]),
         children: RefCell::new(Vec::new()),
@@ -279,13 +279,13 @@ thread_local! {
     }));
 }
 
-fn root() -> Rc<Node> {
-    ROOT.with(Rc::clone)
+fn root() -> Obj<Node> {
+    ROOT.with(Obj::clone)
 }
 
 /// La forma de `parent` más la clave `k` al final: la transición guardada si la hay (por puntero
 /// primero, por texto después), o una nueva. `None` si `parent` ya tiene demasiadas hijas.
-fn transition(parent: &Rc<Node>, k: &Key) -> Option<Rc<Node>> {
+fn transition(parent: &Obj<Node>, k: &Key) -> Option<Obj<Node>> {
     let s = shape_of(parent);
     let mut ch = s.children.borrow_mut();
     let mut dead = None;
@@ -315,33 +315,33 @@ fn transition(parent: &Rc<Node>, k: &Key) -> Option<Rc<Node>> {
     let mut keys = Vec::with_capacity(s.keys.len() + 1);
     keys.extend_from_slice(&s.keys);
     keys.push(k.clone());
-    let n = Rc::new(Node::Shape(Shape {
+    let n = Obj::new(Node::Shape(Shape {
         _parent: Some(parent.clone()),
         keys: keys.into_boxed_slice(),
         children: RefCell::new(Vec::new()),
         index: OnceCell::new(),
     }));
-    ch.push((k.clone(), Rc::downgrade(&n)));
+    ch.push((k.clone(), Obj::downgrade(&n)));
     Some(n)
 }
 
 /// Una copia propia de lo que es de un solo mapa (la forma se comparte).
-fn clone_layout(n: &Rc<Node>) -> Rc<Node> {
+fn clone_layout(n: &Obj<Node>) -> Obj<Node> {
     match &**n {
         Node::Shape(_) => n.clone(),
-        Node::Grown { shape, extra } => Rc::new(Node::Grown { shape: shape.clone(), extra: extra.clone() }),
-        Node::Dict(d) => Rc::new(Node::Dict(d.clone())),
+        Node::Grown { shape, extra } => Obj::new(Node::Grown { shape: shape.clone(), extra: extra.clone() }),
+        Node::Dict(d) => Obj::new(Node::Dict(d.clone())),
     }
 }
 
 /// Para escribir en lo que es de un solo mapa (`Grown`/`Dict`). Siempre es único (una copia del
 /// mapa lo copia); si no lo fuera, se copia antes de escribir.
-fn own(n: &mut Rc<Node>) -> &mut Node {
-    if Rc::get_mut(n).is_none() {
+fn own(n: &mut Obj<Node>) -> &mut Node {
+    if Obj::get_mut(n).is_none() {
         assert!(!matches!(**n, Node::Shape(_)), "una forma compartida no se escribe");
         *n = clone_layout(n);
     }
-    Rc::get_mut(n).expect("recién copiado")
+    Obj::get_mut(n).expect("recién copiado")
 }
 
 /// El cuerpo de un mapa: cómo leerlo y los valores en línea. `S` es `[SynValue]` en un mapa que es
@@ -350,7 +350,7 @@ fn own(n: &mut Rc<Node>) -> &mut Node {
 #[repr(C)]
 pub struct MapBody<S: ?Sized> {
     /// `None`: vacío.
-    layout: Option<Rc<Node>>,
+    layout: Option<Obj<Node>>,
     vals: S,
 }
 
@@ -361,7 +361,7 @@ pub type SynMap = MapBody<[SynValue; 0]>;
 /// Un mapa como valor: un objeto del montón con el cuerpo y sus valores en línea (R1.3b de
 /// specs/modelo-memoria-regiones.md): la misma forma de uso que `Rc<RefCell<MapObj>>`.
 pub type MapRef = synsema_heap::SharedTail<MapObj>;
-synsema_heap::tail_object!(MapBody, layout: Option<Rc<Node>>, vals: [SynValue]);
+synsema_heap::tail_object!(MapBody, layout: Option<Obj<Node>>, vals: [SynValue]);
 
 // El que se arma: un puntero, a lo sumo 8 bytes (en wasm32 el puntero es de 4, pero la alineación
 // de `SynValue` lo lleva a 8). El valor: un puntero FINO (el largo vive en el objeto; antes, gordo).
@@ -378,7 +378,7 @@ enum Kind {
 
 /// Un cuerpo con `n` lugares en línea (el malloc del mapa), llenos con `vals` (lo que falte,
 /// `Nothing`).
-fn new_body(layout: Option<Rc<Node>>, mut vals: impl Iterator<Item = SynValue>, n: usize) -> MapRef {
+fn new_body(layout: Option<Obj<Node>>, mut vals: impl Iterator<Item = SynValue>, n: usize) -> MapRef {
     debug_assert!(n <= MAX_SHAPED, "más de MAX_SHAPED lugares en línea");
     MapRef::new(layout, n, |_| vals.next().unwrap_or(SynValue::Nothing))
 }
@@ -386,7 +386,7 @@ fn new_body(layout: Option<Rc<Node>>, mut vals: impl Iterator<Item = SynValue>, 
 /// Una forma armada una vez para muchos mapas con las mismas claves en el mismo orden (las
 /// columnas de un CSV, las claves de un literal): cada mapa es un malloc con sus valores en línea.
 #[derive(Clone)]
-pub struct ShapeRef(Rc<Node>);
+pub struct ShapeRef(Obj<Node>);
 
 impl ShapeRef {
     /// La forma de las `n` claves de `key_at` en orden. `None` si alguna se repite, si son más de
@@ -465,9 +465,9 @@ impl SynMap {
         let layout = if n == 0 {
             None
         } else if n > MAX_SHAPED {
-            Some(Rc::new(Node::Dict(Dict::with_capacity_and_hasher(n, KeyHasher))))
+            Some(Obj::new(Node::Dict(Dict::with_capacity_and_hasher(n, KeyHasher))))
         } else {
-            Some(Rc::new(Node::Grown { shape: root(), extra: Vec::with_capacity(n) }))
+            Some(Obj::new(Node::Grown { shape: root(), extra: Vec::with_capacity(n) }))
         };
         MapBody { layout, vals: [] }
     }
@@ -476,7 +476,7 @@ impl SynMap {
         let Some(n) = self.layout.take() else {
             return new_body(None, std::iter::empty(), 0);
         };
-        match Rc::try_unwrap(n) {
+        match Obj::try_unwrap(n) {
             Ok(Node::Grown { shape, extra }) => {
                 if extra.is_empty() {
                     return new_body(None, std::iter::empty(), 0);
@@ -484,7 +484,7 @@ impl SynMap {
                 let len = extra.len();
                 new_body(Some(shape), extra.into_iter(), len)
             }
-            Ok(d @ Node::Dict(_)) => new_body(Some(Rc::new(d)), std::iter::empty(), 0),
+            Ok(d @ Node::Dict(_)) => new_body(Some(Obj::new(d)), std::iter::empty(), 0),
             // Sin lugares en línea, una forma sola es la vacía.
             Ok(Node::Shape(_)) => new_body(None, std::iter::empty(), 0),
             // Lo de un solo mapa es único; si no lo fuera, se copia.
@@ -557,15 +557,15 @@ impl MapObj {
             None => None,
             Some(Node::Shape(s)) => {
                 let shape = self.layout.clone().expect("forma");
-                Some(Rc::new(Node::Grown { shape, extra: self.vals[..s.keys.len()].to_vec() }))
+                Some(Obj::new(Node::Grown { shape, extra: self.vals[..s.keys.len()].to_vec() }))
             }
             Some(Node::Grown { shape, extra }) => {
                 let mut all = Vec::with_capacity(self.vals.len() + extra.len());
                 all.extend(self.vals.iter().cloned());
                 all.extend(extra.iter().cloned());
-                Some(Rc::new(Node::Grown { shape: shape.clone(), extra: all }))
+                Some(Obj::new(Node::Grown { shape: shape.clone(), extra: all }))
             }
-            Some(Node::Dict(d)) => Some(Rc::new(Node::Dict(d.clone()))),
+            Some(Node::Dict(d)) => Some(Obj::new(Node::Dict(d.clone()))),
         };
         MapBody { layout, vals: [] }
     }
@@ -740,7 +740,7 @@ impl MapObj {
                             extra.push(v);
                         }
                     } else {
-                        self.layout = Some(Rc::new(Node::Grown { shape: next, extra: vec![v] }));
+                        self.layout = Some(Obj::new(Node::Grown { shape: next, extra: vec![v] }));
                     }
                     return len;
                 }
@@ -748,7 +748,7 @@ impl MapObj {
             let pairs = self.take_pairs();
             let mut d = Dict::with_capacity_and_hasher(pairs.len() + 1, KeyHasher);
             d.extend(pairs);
-            self.layout = Some(Rc::new(Node::Dict(d)));
+            self.layout = Some(Obj::new(Node::Dict(d)));
         }
         if let Some(d) = self.dict_mut() {
             d.insert(k, v);
@@ -776,9 +776,9 @@ impl MapObj {
             let len = s.keys.len();
             return s.keys.iter().cloned().zip(self.vals[..len].iter_mut().map(take)).collect();
         }
-        let node = match Rc::try_unwrap(n) {
+        let node = match Obj::try_unwrap(n) {
             Ok(node) => node,
-            Err(n) => Rc::try_unwrap(clone_layout(&n)).ok().expect("copia propia"),
+            Err(n) => Obj::try_unwrap(clone_layout(&n)).ok().expect("copia propia"),
         };
         match node {
             Node::Grown { shape, extra } => {
@@ -813,13 +813,13 @@ impl MapObj {
                         extra.push(v);
                     }
                 }
-                self.layout = Some(if len <= cap { s } else { Rc::new(Node::Grown { shape: s, extra }) });
+                self.layout = Some(if len <= cap { s } else { Obj::new(Node::Grown { shape: s, extra }) });
                 return;
             }
         }
         let mut d = Dict::with_capacity_and_hasher(pairs.len(), KeyHasher);
         d.extend(pairs);
-        self.layout = Some(Rc::new(Node::Dict(d)));
+        self.layout = Some(Obj::new(Node::Dict(d)));
     }
 
     pub fn shift_remove_full(&mut self, k: &str) -> Option<(usize, Key, SynValue)> {
@@ -961,12 +961,12 @@ impl MapObj {
 pub struct MapIc {
     shape: Cell<usize>,
     slot: Cell<u32>,
-    pin: Cell<Option<Rc<Node>>>,
+    pin: Cell<Option<Obj<Node>>>,
 }
 
 #[inline(always)]
-fn addr(n: &Rc<Node>) -> usize {
-    Rc::as_ptr(n) as usize
+fn addr(n: &Obj<Node>) -> usize {
+    Obj::as_ptr(n) as usize
 }
 
 impl MapObj {
@@ -1223,7 +1223,7 @@ impl IntoIterator for SynMap {
     fn into_iter(mut self) -> IntoIter {
         if self.kind() == Kind::Dict {
             if let Some(n) = self.layout.take() {
-                return match Rc::try_unwrap(n) {
+                return match Obj::try_unwrap(n) {
                     Ok(Node::Dict(d)) => IntoIter::Dict(d.into_iter()),
                     Ok(_) => unreachable!(),
                     Err(n) => match &*n {
@@ -1467,7 +1467,7 @@ mod tests {
         };
         let (a, b) = (rec(1), rec(2));
         assert!(a.borrow().kind() == Kind::Shape && a.borrow().vals.len() == 2);
-        let same = Rc::ptr_eq(a.borrow().layout.as_ref().unwrap(), b.borrow().layout.as_ref().unwrap());
+        let same = Obj::ptr_eq(a.borrow().layout.as_ref().unwrap(), b.borrow().layout.as_ref().unwrap());
         assert!(same, "dos registros iguales no comparten la forma");
         a.borrow_mut().insert("extra", syn_int(7));
         assert!(a.borrow().kind() == Kind::Grown);

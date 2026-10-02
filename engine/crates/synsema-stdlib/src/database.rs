@@ -1827,7 +1827,7 @@ pub fn register_database_builtins<H: DbHandle>(
                         }
                     })
                 };
-                Ok(SynValue::Server(Rc::new(ServerValue::Paged(Rc::new(fetch)))))
+                Ok(SynValue::Server(synsema_core::types::Obj::new(ServerValue::Paged(Rc::new(fetch)))))
             }),
         );
     }

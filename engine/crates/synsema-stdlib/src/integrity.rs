@@ -544,7 +544,7 @@ mod tests {
         Rc::new(RefCell::new(cs))
     }
     fn secret(name: &str, seed: [u8; 32]) -> SynValue {
-        SynValue::Secret(Rc::new(SecretInner::new(name.to_string(), hex(&seed))))
+        SynValue::Secret(synsema_core::types::Obj::new(SecretInner::new(name.to_string(), hex(&seed))))
     }
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{:02x}", x)).collect()
@@ -597,7 +597,7 @@ mod tests {
         assert!(proof.contains_key("@context"), "el @context del documento viaja en el proofConfig");
 
         // Verifica con bytes, con did:key y con JWK.
-        let bytes_key = SynValue::Bytes(Rc::from(pk.clone().into_boxed_slice()));
+        let bytes_key = SynValue::Bytes(synsema_core::types::BytesRef::from(pk.clone().into_boxed_slice()));
         let v = verify_document(&signed, &bytes_key, &SynMap::new(), "document_verify").map_err(|_| ()).unwrap().expect("verifica");
         let v = entries(&v);
         assert!(matches!(v["verified"], SynValue::Bool(true)));

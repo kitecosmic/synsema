@@ -9,7 +9,7 @@
 //! ofrece la API de este módulo para marcar (`mark`) y comprobar (`check_flow`,
 //! `strip_deep`).
 //!
-//! Representación: `SynValue::Private(Rc<Labelled>)`, una **variante aislada** del enum
+//! Representación: `SynValue::Private(Obj<Labelled>)`, una **variante aislada** del enum
 //! (mismo argumento que `secret`, ver `secret.rs`): no es un bit de taint en todos los
 //! valores. Con las etiquetas apagadas (`Interpreter::set_labels(false)`, el default) la
 //! variante no se construye nunca y el intérprete no ejecuta ningún camino nuevo más allá
@@ -179,7 +179,7 @@ static ANY_PRIVATE: AtomicBool = AtomicBool::new(false);
 /// El único constructor de `SynValue::Private`.
 pub(crate) fn labelled(value: SynValue, label: Label) -> SynValue {
     ANY_PRIVATE.store(true, Ordering::Relaxed);
-    SynValue::Private(Rc::new(Labelled { value, label }))
+    SynValue::Private(crate::types::Obj::new(Labelled { value, label }))
 }
 
 /// Entrada del registro de `declassify` (una por llamada ejecutada): motivo, etiqueta de
@@ -540,19 +540,19 @@ pub fn deep_copy(v: &SynValue) -> SynValue {
         }
         SynValue::Server(s) => match &**s {
             ServerValue::Envelope { status, value } => {
-                SynValue::Server(Rc::new(ServerValue::Envelope { status: *status, value: deep_copy(value) }))
+                SynValue::Server(crate::types::Obj::new(ServerValue::Envelope { status: *status, value: deep_copy(value) }))
             }
             ServerValue::Node(m) => {
                 let mut out = SynMap::with_capacity(m.borrow().len());
                 for (k, x) in m.borrow().iter() {
                     out.insert(k.clone(), deep_copy(x));
                 }
-                SynValue::Server(Rc::new(ServerValue::Node(out.into_ref())))
+                SynValue::Server(crate::types::Obj::new(ServerValue::Node(out.into_ref())))
             }
             ServerValue::Content(inner) => {
-                SynValue::Server(Rc::new(ServerValue::Content(Box::new(deep_copy(inner)))))
+                SynValue::Server(crate::types::Obj::new(ServerValue::Content(Box::new(deep_copy(inner)))))
             }
-            ServerValue::WithHeaders { inner, headers } => SynValue::Server(Rc::new(ServerValue::WithHeaders {
+            ServerValue::WithHeaders { inner, headers } => SynValue::Server(crate::types::Obj::new(ServerValue::WithHeaders {
                 inner: Box::new(deep_copy(inner)),
                 headers: headers.clone(),
             })),
@@ -589,7 +589,7 @@ pub fn strip_deep(v: &SynValue) -> SynValue {
             syn_map(out)
         }
         SynValue::Server(s) => match &**s {
-            ServerValue::Envelope { status, value } => SynValue::Server(Rc::new(ServerValue::Envelope {
+            ServerValue::Envelope { status, value } => SynValue::Server(crate::types::Obj::new(ServerValue::Envelope {
                 status: *status,
                 value: strip_deep(value),
             })),
@@ -598,12 +598,12 @@ pub fn strip_deep(v: &SynValue) -> SynValue {
                 for (k, x) in m.borrow().iter() {
                     out.insert(k.clone(), strip_deep(x));
                 }
-                SynValue::Server(Rc::new(ServerValue::Node(out.into_ref())))
+                SynValue::Server(crate::types::Obj::new(ServerValue::Node(out.into_ref())))
             }
             ServerValue::Content(inner) => {
-                SynValue::Server(Rc::new(ServerValue::Content(Box::new(strip_deep(inner)))))
+                SynValue::Server(crate::types::Obj::new(ServerValue::Content(Box::new(strip_deep(inner)))))
             }
-            ServerValue::WithHeaders { inner, headers } => SynValue::Server(Rc::new(ServerValue::WithHeaders {
+            ServerValue::WithHeaders { inner, headers } => SynValue::Server(crate::types::Obj::new(ServerValue::WithHeaders {
                 inner: Box::new(strip_deep(inner)),
                 headers: headers.clone(),
             })),
@@ -750,7 +750,7 @@ mod tests {
         walk(&core.join("../../../packages"), &mut found);
         let allowed = [
             [": pub struct ", &pat[..8], " {"].concat(),
-            [": SynValue::Private(Rc::new(", &pat, " value, label }))"].concat(),
+            [": SynValue::Private(crate::types::Obj::new(", &pat, " value, label }))"].concat(),
         ];
         let bad: Vec<_> = found.iter().filter(|f| !allowed.iter().any(|a| f.ends_with(a))).collect();
         assert!(bad.is_empty(), "valores privados construidos fuera de `labels::labelled`: {:#?}", bad);

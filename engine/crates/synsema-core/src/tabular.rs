@@ -1006,7 +1006,7 @@ pub fn fill_nan(args: &[SynValue]) -> Result<SynValue, Control> {
         )),
         Some(SynValue::Array(a)) => {
             let f = fill.to_f64();
-            Ok(SynValue::Array(Rc::new(a.mapv(|x| if x.is_nan() { f } else { x }))))
+            Ok(SynValue::Array(crate::types::Obj::new(a.mapv(|x| if x.is_nan() { f } else { x }))))
         }
         Some(other) => Err(err(format!("fill_nan: expected a list or an array, got {}", other.type_name()))),
         None => Err(err("fill_nan(values, number)")),

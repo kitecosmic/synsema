@@ -858,7 +858,7 @@ fn same_container(a: &SynValue, b: &SynValue) -> bool {
     match (a, b) {
         (SynValue::List(x), SynValue::List(y)) => crate::types::ListRef::ptr_eq(x, y),
         (SynValue::Map(x), SynValue::Map(y)) => crate::types::MapRef::ptr_eq(x, y),
-        (SynValue::Private(x), SynValue::Private(y)) => Rc::ptr_eq(x, y),
+        (SynValue::Private(x), SynValue::Private(y)) => crate::types::Obj::ptr_eq(x, y),
         _ => false,
     }
 }
@@ -9639,7 +9639,7 @@ fn principals_arg(
 /// ¿El valor es invocable? (task de usuario, lambda o builtin). La base de la regla
 /// de detección del dual-order (batch DX) y del 2º arg de `index_of`.
 /// `(función, array)` en cualquier orden, si la llamada es sobre un array.
-fn fn_and_array(args: &[SynValue]) -> Option<(SynValue, Rc<ndarray::ArrayD<f64>>)> {
+fn fn_and_array(args: &[SynValue]) -> Option<(SynValue, crate::types::Obj<ndarray::ArrayD<f64>>)> {
     match (args.first(), args.get(1)) {
         (Some(SynValue::Array(a)), Some(f)) if is_callable(f) => Some((f.clone(), a.clone())),
         (Some(f), Some(SynValue::Array(a))) if is_callable(f) => Some((f.clone(), a.clone())),
@@ -9874,7 +9874,7 @@ fn make_unique_n(slot: &mut SynValue, extra: usize) {
                 SynValue::Map(rc) => crate::types::MapRef::strong_count(rc) > 1,
                 _ => false,
             };
-            if shared_inner || (Rc::strong_count(p) > owners && matches!(p.value, SynValue::List(_) | SynValue::Map(_))) {
+            if shared_inner || (crate::types::Obj::strong_count(p) > owners && matches!(p.value, SynValue::List(_) | SynValue::Map(_))) {
                 // Copia del contenedor interno aunque su cuenta sea 1 cuando el envoltorio
                 // está compartido: el alias ve el mismo Rc interno.
                 let inner = match &p.value {

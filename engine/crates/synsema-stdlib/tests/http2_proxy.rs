@@ -204,7 +204,6 @@ fn http2_alpn_handshake_and_get() {
 /// o todo cliente h2 (los navegadores) cae al host por defecto.
 #[test]
 fn vhost_selected_by_authority_over_http2() {
-    use std::rc::Rc;
     use synsema_core::types::{ServerValue, SynValue};
 
     // Host por defecto: solo "GET /" → "/foo" no matchea (sería 404 sin elegir el vhost).
@@ -228,7 +227,7 @@ fn vhost_selected_by_authority_over_http2() {
     };
     // vhost www.example.com: catch-all que redirige 301.
     let redir: Handler = Arc::new(|_ctx| {
-        let v = SynValue::Server(Rc::new(ServerValue::Redirect {
+        let v = SynValue::Server(synsema_core::types::Obj::new(ServerValue::Redirect {
             location: "https://example.com/moved".to_string(),
             status: 301,
         }));

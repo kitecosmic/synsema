@@ -685,7 +685,7 @@ pub(crate) fn make_node(kind: &str, fields: Vec<(&str, SynValue)>) -> SynValue {
     for (k, v) in fields {
         m.insert(k.to_string(), v);
     }
-    SynValue::Server(Rc::new(ServerValue::Node(m.into_ref())))
+    SynValue::Server(synsema_core::types::Obj::new(ServerValue::Node(m.into_ref())))
 }
 
 #[cfg(test)]

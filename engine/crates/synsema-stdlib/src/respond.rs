@@ -29,19 +29,19 @@ fn text_arg(v: Option<&SynValue>) -> String {
 }
 
 pub(crate) fn make_raw_val(body: String, ct: &str, status: i64) -> SynValue {
-    SynValue::Server(Rc::new(ServerValue::Raw { body, content_type: ct.to_string(), status }))
+    SynValue::Server(synsema_core::types::Obj::new(ServerValue::Raw { body, content_type: ct.to_string(), status }))
 }
 
 fn make_rawbytes_val(body: Vec<u8>, ct: &str, status: i64) -> SynValue {
-    SynValue::Server(Rc::new(ServerValue::RawBytes { body, content_type: ct.to_string(), status }))
+    SynValue::Server(synsema_core::types::Obj::new(ServerValue::RawBytes { body, content_type: ct.to_string(), status }))
 }
 
 fn make_envelope(status: i64, value: SynValue) -> SynValue {
-    SynValue::Server(Rc::new(ServerValue::Envelope { status, value }))
+    SynValue::Server(synsema_core::types::Obj::new(ServerValue::Envelope { status, value }))
 }
 
 fn make_redirect_val(location: String, status: i64) -> SynValue {
-    SynValue::Server(Rc::new(ServerValue::Redirect { location, status }))
+    SynValue::Server(synsema_core::types::Obj::new(ServerValue::Redirect { location, status }))
 }
 
 // =========================================================
@@ -113,13 +113,13 @@ pub(crate) fn append_header_val(resp: &SynValue, name: String, value: String) ->
         if let ServerValue::WithHeaders { inner, headers } = &**s {
             let mut hs = headers.clone();
             hs.push((name, value));
-            return SynValue::Server(Rc::new(ServerValue::WithHeaders {
+            return SynValue::Server(synsema_core::types::Obj::new(ServerValue::WithHeaders {
                 inner: inner.clone(),
                 headers: hs,
             }));
         }
     }
-    SynValue::Server(Rc::new(ServerValue::WithHeaders {
+    SynValue::Server(synsema_core::types::Obj::new(ServerValue::WithHeaders {
         inner: Box::new(resp.clone()),
         headers: vec![(name, value)],
     }))
@@ -623,7 +623,7 @@ pub fn register_serve_builtins(interp: &Interpreter) {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| make_node("page", vec![("nodes", syn_list(Vec::new())), ("meta", syn_map(SynMap::new()))]));
-            Ok(SynValue::Server(Rc::new(ServerValue::Content(Box::new(tree)))))
+            Ok(SynValue::Server(synsema_core::types::Obj::new(ServerValue::Content(Box::new(tree)))))
         }),
     );
 }

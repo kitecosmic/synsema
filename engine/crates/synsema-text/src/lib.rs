@@ -50,6 +50,8 @@ const DATA: usize = 1;
 const LEN_W: usize = 0;
 const PTR_W: usize = 1 - LEN_W;
 const INLINE_BIT: u8 = 0x80;
+/// La cuenta de un texto inmortal (ver `make_immortal`).
+const IMMORTAL: usize = usize::MAX;
 
 #[repr(C)]
 struct Header {
@@ -163,10 +165,26 @@ impl SynText {
         unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(p, n)) }
     }
 
-    /// Si este valor es el único dueño de su texto en el montón (uno en línea no se comparte).
+    /// Si este valor es el único dueño de su texto en el montón (uno en línea no se comparte; uno
+    /// inmortal, tampoco: nunca se escribe).
     #[inline]
     pub fn is_unique(&self) -> bool {
         !self.is_inline() && self.header().strong.get() == 1
+    }
+
+    /// Lo vuelve inmortal (R2 de specs/modelo-memoria-regiones.md): la cuenta queda en el tope, clonar
+    /// y soltar ya no la escriben y la memoria no se libera nunca. Uno en línea no tiene nada que
+    /// marcar. Idempotente.
+    pub fn make_immortal(&self) {
+        if !self.is_inline() {
+            self.header().strong.set(IMMORTAL);
+        }
+    }
+
+    /// Si está en el montón y es inmortal.
+    #[inline]
+    pub fn is_immortal(&self) -> bool {
+        !self.is_inline() && self.header().strong.get() == IMMORTAL
     }
 
     /// Seguro el mismo texto, sin mirar los bytes: los dos valores son idénticos (en línea, los
@@ -234,8 +252,13 @@ impl Clone for SynText {
     #[inline]
     fn clone(&self) -> SynText {
         if !self.is_inline() {
+            // Sin llamadas (ni la del pánico por desborde): la cuenta llena queda inmortal, una fuga y
+            // nunca un uso después de liberar (como `synsema_heap::inc_strong`).
             let h = self.header();
-            h.strong.set(h.strong.get().checked_add(1).expect("demasiadas referencias"));
+            let s = h.strong.get();
+            if s != IMMORTAL {
+                h.strong.set(s + 1);
+            }
         }
         SynText { w: self.w, _not_send: std::marker::PhantomData }
     }
@@ -250,9 +273,11 @@ impl Drop for SynText {
             return;
         }
         let h = self.header();
-        let n = h.strong.get() - 1;
-        h.strong.set(n);
-        if n == 0 {
+        let s = h.strong.get();
+        // 2 ≤ cuenta < inmortal en una comparación sin signo; el último dueño y el inmortal, aparte.
+        if s.wrapping_sub(2) < IMMORTAL - 2 {
+            h.strong.set(s - 1);
+        } else if s == 1 {
             self.dealloc_last();
         }
     }
@@ -263,7 +288,7 @@ impl SynText {
     #[inline(never)]
     fn dealloc_last(&mut self) {
         let cap = self.header().cap;
-        // SAFETY: era la última referencia (la cuenta llegó a 0); la asignación se hizo con
+        // SAFETY: era la última referencia (la cuenta estaba en 1); la asignación se hizo con
         // `layout(cap)`.
         unsafe { alloc::dealloc(self.w[PTR_W] as *mut u8, Self::layout(cap)) }
     }
@@ -389,3 +414,32 @@ impl fmt::Display for SynText {
 }
 
 const _: () = assert!(std::mem::size_of::<SynText>() == 2 * WORD);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_immortal_text_is_never_written_nor_freed() {
+        let mut a = SynText::from("un texto largo que vive en el montón");
+        a.make_immortal();
+        assert!(a.is_immortal() && !a.is_unique());
+        let b = a.clone();
+        drop(b);
+        // Agregar a un inmortal copia: el original no se escribe.
+        let c = a.clone();
+        a.push_str("!");
+        assert_eq!(c.as_str(), "un texto largo que vive en el montón");
+        assert!(!a.is_immortal() && a.is_unique());
+        // Uno en línea no tiene nada que marcar.
+        let d = SynText::from("corto");
+        d.make_immortal();
+        assert!(!d.is_immortal());
+        // El test devuelve la memoria del inmortal a mano (en el motor vive lo que el proceso).
+        let cap = c.header().cap;
+        let ptr = c.w[PTR_W] as *mut u8;
+        std::mem::forget(c);
+        // SAFETY (del test): nadie más tiene el texto; se reservó con `layout(cap)`.
+        unsafe { alloc::dealloc(ptr, SynText::layout(cap)) };
+    }
+}

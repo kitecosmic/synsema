@@ -260,12 +260,11 @@ mod tests {
     #[test]
     fn sealed_secret_is_not_a_valid_seed() {
         use synsema_core::secret::SecretInner;
-        use std::rc::Rc;
-        let normal = SynValue::Secret(Rc::new(SecretInner::new_bytes("REPORT_KEY", b"seed-1".to_vec())));
+        let normal = SynValue::Secret(synsema_core::types::Obj::new(SecretInner::new_bytes("REPORT_KEY", b"seed-1".to_vec())));
         // Un secret normal da EXACTAMENTE el mismo ruido que sus bytes: es la semilla del patrón.
         assert_eq!(ok(b_laplace_noise(&[normal.clone(), syn_int(1)])), LAPLACE_SEED_1);
         assert_eq!(ok(b_gaussian_noise(&[normal, syn_int(1)])), GAUSS_SEED_1);
-        let sealed = SynValue::Secret(Rc::new(SecretInner::new_bytes_sealed("attestation_key", b"seed-1".to_vec())));
+        let sealed = SynValue::Secret(synsema_core::types::Obj::new(SecretInner::new_bytes_sealed("attestation_key", b"seed-1".to_vec())));
         for (r, who) in [
             (b_laplace_noise(&[sealed.clone(), syn_int(1)]), "laplace_noise"),
             (b_gaussian_noise(&[sealed, syn_int(1)]), "gaussian_noise"),

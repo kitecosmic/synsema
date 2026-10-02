@@ -13,6 +13,10 @@
 //! - Un objeto inmortal no se libera nunca (vive lo que vive el proceso), como los inmortales de
 //!   CPython 3.12 (PEP 683).
 //!
+//! `Obj<T>` y `ObjSlice<E>` son la versión de sólo lectura (reemplazan a `Rc<T>` y `Rc<[E]>`): la
+//! misma cabecera y el mismo inmortal, leídos con `Deref` sin bandera de préstamo; `ObjSlice` con
+//! puntero fino.
+//!
 //! `Shared<T>` no es `Send` ni `Sync` (cuentas no atómicas, como `Rc`). Compartir entre hilos lo
 //! hará R2 con un tipo aparte que sólo se puede armar con objetos inmortales.
 //!
@@ -236,9 +240,17 @@ impl<T> Shared<T> {
     /// strong acaba de llegar a 0.
     #[inline(never)]
     unsafe fn drop_slow(&mut self) {
+        // El débil implícito de `Rc`: mientras se suelta el valor, su `Drop` puede soltar el último
+        // débil a este mismo objeto (una forma suelta a su madre, que suelta el débil a la hija) y,
+        // con strong = 0 y weak = 0, liberar la reserva a mitad del soltado (doble liberación).
+        let h: *const Header = self.header();
+        // SAFETY: la reserva está viva (recién bajó strong a 0 y nadie la libera sin este débil).
+        unsafe { hold_weak(&*h) };
         // SAFETY: el valor se suelta una vez. Nadie lo tiene prestado (un préstamo vive menos que el
         // `Shared` del que salió).
         unsafe { std::ptr::drop_in_place(self.ptr.as_ref().value.get()) };
+        // SAFETY: la reserva sigue viva gracias al débil implícito, que se devuelve acá.
+        unsafe { (*h).weak.set((*h).weak.get() - 1) };
         // SAFETY: strong = 0 y el valor ya se soltó.
         unsafe { release_if_unreferenced(self.ptr) };
     }
@@ -703,9 +715,17 @@ impl<T: ?Sized + TailObject> SharedTail<T> {
     /// strong acaba de llegar a 0.
     #[inline(never)]
     unsafe fn drop_slow(&mut self) {
+        // El débil implícito de `Rc`: mientras se suelta el valor, su `Drop` puede soltar el último
+        // débil a este mismo objeto (una forma suelta a su madre, que suelta el débil a la hija) y,
+        // con strong = 0 y weak = 0, liberar la reserva a mitad del soltado (doble liberación).
+        let h: *const Header = self.header();
+        // SAFETY: la reserva está viva (recién bajó strong a 0 y nadie la libera sin este débil).
+        unsafe { hold_weak(&*h) };
         // SAFETY: el objeto se suelta una vez (nadie lo tiene prestado: un préstamo vive menos que el
         // `SharedTail` del que salió).
         unsafe { std::ptr::drop_in_place(self.obj_ptr()) };
+        // SAFETY: la reserva sigue viva gracias al débil implícito, que se devuelve acá.
+        unsafe { (*h).weak.set((*h).weak.get() - 1) };
         // SAFETY: el objeto ya se soltó.
         unsafe { Self::release_if_unreferenced(self.ptr) };
     }
@@ -743,7 +763,436 @@ impl<T: ?Sized + TailObject> Drop for WeakTail<T> {
     }
 }
 
-// --- operaciones de cabecera (de `Shared` y `SharedTail`) ---
+// --- `Obj<T>`: objeto inmutable (el reemplazo de `Rc<T>`) ---
+
+/// Un objeto del montón de sólo lectura: la cabecera común de 8 bytes y el valor, como `Rc<T>` (lo
+/// lee `Deref`, sin bandera de préstamo). Se escribe sólo con un único dueño (`get_mut`,
+/// `make_mut`, como `Rc`). Puede volverse inmortal (`make_immortal`): ya no escribe su cuenta.
+pub struct Obj<T> {
+    ptr: NonNull<Inner<T>>,
+    _owns: PhantomData<Inner<T>>,
+}
+
+/// Una referencia débil a un `Obj` (como `rc::Weak`).
+pub struct WeakObj<T> {
+    ptr: NonNull<Inner<T>>,
+    _owns: PhantomData<Inner<T>>,
+}
+
+impl<T> Obj<T> {
+    pub fn new(value: T) -> Obj<T> {
+        let b = Box::new(Inner {
+            h: Header { strong: Cell::new(1), weak: Cell::new(0), borrow: Cell::new(0) },
+            value: UnsafeCell::new(value),
+        });
+        Obj { ptr: NonNull::from(Box::leak(b)), _owns: PhantomData }
+    }
+
+    #[inline]
+    fn header(&self) -> &Header {
+        // SAFETY: mientras haya un `Obj`, la reserva está viva (strong ≥ 1).
+        unsafe { &self.ptr.as_ref().h }
+    }
+
+    #[inline]
+    pub fn is_immortal(this: &Self) -> bool {
+        this.header().strong.get() == IMMORTAL
+    }
+
+    /// Ver `Shared::make_immortal` (un `Obj` nunca está prestado: no falla). Idempotente.
+    pub fn make_immortal(this: &Self) {
+        make_immortal_h(this.header());
+    }
+
+    /// `usize::MAX` si es inmortal.
+    #[inline]
+    pub fn strong_count(this: &Self) -> usize {
+        strong_count_h(this.header())
+    }
+
+    #[inline]
+    pub fn weak_count(this: &Self) -> usize {
+        this.header().weak.get() as usize
+    }
+
+    #[inline]
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        a.ptr == b.ptr
+    }
+
+    #[inline]
+    pub fn as_ptr(this: &Self) -> *const T {
+        // SAFETY: la reserva está viva; sólo se calcula una dirección.
+        unsafe { this.ptr.as_ref().value.get() }
+    }
+
+    /// `&mut` si es el único dueño, sin débiles y no es inmortal (como `Rc::get_mut`).
+    pub fn get_mut(this: &mut Self) -> Option<&mut T> {
+        let h = this.header();
+        if h.strong.get() == 1 && h.weak.get() == 0 {
+            // SAFETY: único dueño y sin débiles: nadie más puede ver el valor.
+            Some(unsafe { &mut *this.ptr.as_ref().value.get() })
+        } else {
+            None
+        }
+    }
+
+    /// `&mut` copiando antes si no es el único dueño (como `Rc::make_mut`).
+    pub fn make_mut(this: &mut Self) -> &mut T
+    where
+        T: Clone,
+    {
+        if Obj::get_mut(this).is_none() {
+            *this = Obj::new((**this).clone());
+        }
+        Obj::get_mut(this).expect("recién copiado")
+    }
+
+    /// Saca el valor si es el único dueño (como `Rc::try_unwrap`).
+    pub fn try_unwrap(this: Self) -> Result<T, Self> {
+        if this.header().strong.get() != 1 {
+            return Err(this);
+        }
+        this.header().strong.set(0);
+        let ptr = this.ptr;
+        std::mem::forget(this);
+        // SAFETY: era el único dueño; el valor sale una vez (strong pasó a 0).
+        let value = unsafe { std::ptr::read(ptr.as_ref().value.get()) };
+        // SAFETY: strong = 0 y el valor ya salió.
+        unsafe { release_if_unreferenced(ptr) };
+        Ok(value)
+    }
+
+    /// El valor: sacado si es el único dueño, si no una copia (como `Rc::unwrap_or_clone`).
+    pub fn unwrap_or_clone(this: Self) -> T
+    where
+        T: Clone,
+    {
+        Obj::try_unwrap(this).unwrap_or_else(|o| (*o).clone())
+    }
+
+    pub fn downgrade(this: &Self) -> WeakObj<T> {
+        inc_weak(this.header());
+        WeakObj { ptr: this.ptr, _owns: PhantomData }
+    }
+
+    /// Ver `SharedTail::drop_slow`.
+    ///
+    /// # Safety
+    /// strong acaba de llegar a 0.
+    #[inline(never)]
+    unsafe fn drop_slow(&mut self) {
+        // El débil implícito de `Rc`: mientras se suelta el valor, su `Drop` puede soltar el último
+        // débil a este mismo objeto (una forma suelta a su madre, que suelta el débil a la hija) y,
+        // con strong = 0 y weak = 0, liberar la reserva a mitad del soltado (doble liberación).
+        let h: *const Header = self.header();
+        // SAFETY: la reserva está viva (recién bajó strong a 0 y nadie la libera sin este débil).
+        unsafe { hold_weak(&*h) };
+        // SAFETY: el valor se suelta una vez (strong llegó a 0: nadie más lo ve).
+        unsafe { std::ptr::drop_in_place(self.ptr.as_ref().value.get()) };
+        // SAFETY: la reserva sigue viva gracias al débil implícito, que se devuelve acá.
+        unsafe { (*h).weak.set((*h).weak.get() - 1) };
+        // SAFETY: strong = 0 y el valor ya se soltó.
+        unsafe { release_if_unreferenced(self.ptr) };
+    }
+}
+
+impl<T> Deref for Obj<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        // SAFETY: el valor vive mientras haya un `Obj`; sólo se escribe con un único dueño
+        // (`get_mut`, que pide `&mut self`: no convive con este préstamo).
+        unsafe { &*self.ptr.as_ref().value.get() }
+    }
+}
+
+impl<T> Clone for Obj<T> {
+    #[inline]
+    fn clone(&self) -> Obj<T> {
+        inc_strong(self.header());
+        Obj { ptr: self.ptr, _owns: PhantomData }
+    }
+}
+
+impl<T> Drop for Obj<T> {
+    #[inline]
+    fn drop(&mut self) {
+        if dec_strong(self.header()) {
+            // SAFETY: era el último dueño.
+            unsafe { self.drop_slow() };
+        }
+    }
+}
+
+impl<T> WeakObj<T> {
+    #[inline]
+    fn header(&self) -> &Header {
+        // SAFETY: mientras haya un débil, la reserva está viva.
+        unsafe { &self.ptr.as_ref().h }
+    }
+
+    pub fn upgrade(&self) -> Option<Obj<T>> {
+        upgrade_h(self.header()).then(|| Obj { ptr: self.ptr, _owns: PhantomData })
+    }
+
+    pub fn strong_count(&self) -> usize {
+        strong_count_h(self.header())
+    }
+}
+
+impl<T> Clone for WeakObj<T> {
+    fn clone(&self) -> WeakObj<T> {
+        inc_weak(self.header());
+        WeakObj { ptr: self.ptr, _owns: PhantomData }
+    }
+}
+
+impl<T> Drop for WeakObj<T> {
+    fn drop(&mut self) {
+        if dec_weak(self.header()) {
+            // SAFETY: strong = 0 (el valor ya se soltó) y era el último débil.
+            unsafe { release_if_unreferenced(self.ptr) };
+        }
+    }
+}
+
+impl<T> From<T> for Obj<T> {
+    fn from(value: T) -> Obj<T> {
+        Obj::new(value)
+    }
+}
+
+impl<T: Default> Default for Obj<T> {
+    fn default() -> Obj<T> {
+        Obj::new(T::default())
+    }
+}
+
+impl<T> AsRef<T> for Obj<T> {
+    fn as_ref(&self) -> &T {
+        self
+    }
+}
+
+impl<T> std::borrow::Borrow<T> for Obj<T> {
+    fn borrow(&self) -> &T {
+        self
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for Obj<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<T: fmt::Display> fmt::Display for Obj<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&**self, f)
+    }
+}
+
+impl<T: PartialEq> PartialEq for Obj<T> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+impl<T: Eq> Eq for Obj<T> {}
+
+impl<T: PartialOrd> PartialOrd for Obj<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        (**self).partial_cmp(&**other)
+    }
+}
+impl<T: Ord> Ord for Obj<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (**self).cmp(&**other)
+    }
+}
+
+impl<T: std::hash::Hash> std::hash::Hash for Obj<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (**self).hash(state)
+    }
+}
+
+// --- `ObjSlice<E>`: lista inmutable con puntero fino (el reemplazo de `Rc<[E]>`) ---
+
+/// Cabecera + largo, antes de los elementos de un `ObjSlice`.
+#[repr(C, align(8))]
+struct SlicePrefix {
+    h: Header,
+    len: usize,
+}
+
+/// Una lista de sólo lectura de elementos `Copy` (bytes) con puntero FINO: el largo vive en el
+/// objeto (`Rc<[u8]>` es gordo: 16 B). Ver `Obj` (cuenta, inmortal).
+pub struct ObjSlice<E: Copy> {
+    ptr: NonNull<SlicePrefix>,
+    _owns: PhantomData<E>,
+}
+
+impl<E: Copy> ObjSlice<E> {
+    const OFF: usize = {
+        assert!(std::mem::align_of::<E>() <= std::mem::align_of::<SlicePrefix>(), "ObjSlice: element alignment above 8");
+        std::mem::size_of::<SlicePrefix>()
+    };
+
+    fn layout(len: usize) -> Layout {
+        let bytes = std::mem::size_of::<E>().checked_mul(len).and_then(|b| b.checked_add(Self::OFF)).expect("slice object too large");
+        Layout::from_size_align(bytes, std::mem::align_of::<SlicePrefix>()).expect("slice object layout")
+    }
+
+    pub fn from_slice(items: &[E]) -> ObjSlice<E> {
+        let layout = Self::layout(items.len());
+        // SAFETY: el layout no es de tamaño cero (el prefijo ocupa 16 B).
+        let p = unsafe { alloc::alloc(layout) };
+        let Some(p) = NonNull::new(p) else { alloc::handle_alloc_error(layout) };
+        // SAFETY: reserva nueva del tamaño del prefijo + los elementos, alineada a 8 (≥ la de `E`).
+        unsafe {
+            p.as_ptr().cast::<SlicePrefix>().write(SlicePrefix {
+                h: Header { strong: Cell::new(1), weak: Cell::new(0), borrow: Cell::new(0) },
+                len: items.len(),
+            });
+            std::ptr::copy_nonoverlapping(items.as_ptr(), p.as_ptr().add(Self::OFF).cast::<E>(), items.len());
+        }
+        ObjSlice { ptr: p.cast(), _owns: PhantomData }
+    }
+
+    #[inline]
+    fn header(&self) -> &Header {
+        // SAFETY: la reserva está viva mientras haya un `ObjSlice`.
+        unsafe { &self.ptr.as_ref().h }
+    }
+
+    #[inline]
+    pub fn is_immortal(this: &Self) -> bool {
+        this.header().strong.get() == IMMORTAL
+    }
+
+    pub fn make_immortal(this: &Self) {
+        make_immortal_h(this.header());
+    }
+
+    #[inline]
+    pub fn strong_count(this: &Self) -> usize {
+        strong_count_h(this.header())
+    }
+
+    #[inline]
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        a.ptr == b.ptr
+    }
+
+    #[inline]
+    pub fn as_ptr(this: &Self) -> *const E {
+        // SAFETY: los elementos van justo después del prefijo, en la misma reserva.
+        unsafe { this.ptr.as_ptr().cast::<u8>().add(Self::OFF).cast::<E>() }
+    }
+
+    /// Ver `Obj::drop_slow` (los elementos son `Copy`: sólo se devuelve la memoria).
+    ///
+    /// # Safety
+    /// strong acaba de llegar a 0.
+    #[inline(never)]
+    unsafe fn drop_slow(&mut self) {
+        // SAFETY: la reserva sigue viva; sin débiles (este tipo no los da), se devuelve.
+        let len = unsafe { self.ptr.as_ref().len };
+        // SAFETY: se reservó con este mismo layout.
+        unsafe { alloc::dealloc(self.ptr.as_ptr().cast(), Self::layout(len)) };
+    }
+}
+
+impl<E: Copy> Deref for ObjSlice<E> {
+    type Target = [E];
+    #[inline]
+    fn deref(&self) -> &[E] {
+        // SAFETY: `len` elementos inicializados después del prefijo; nunca se escriben.
+        unsafe { std::slice::from_raw_parts(ObjSlice::as_ptr(self), self.ptr.as_ref().len) }
+    }
+}
+
+impl<E: Copy> Clone for ObjSlice<E> {
+    #[inline]
+    fn clone(&self) -> ObjSlice<E> {
+        inc_strong(self.header());
+        ObjSlice { ptr: self.ptr, _owns: PhantomData }
+    }
+}
+
+impl<E: Copy> Drop for ObjSlice<E> {
+    #[inline]
+    fn drop(&mut self) {
+        if dec_strong(self.header()) {
+            // SAFETY: era el último dueño.
+            unsafe { self.drop_slow() };
+        }
+    }
+}
+
+impl<E: Copy> From<&[E]> for ObjSlice<E> {
+    fn from(items: &[E]) -> ObjSlice<E> {
+        ObjSlice::from_slice(items)
+    }
+}
+
+impl<E: Copy> From<Vec<E>> for ObjSlice<E> {
+    fn from(items: Vec<E>) -> ObjSlice<E> {
+        ObjSlice::from_slice(&items)
+    }
+}
+
+impl<E: Copy> From<Box<[E]>> for ObjSlice<E> {
+    fn from(items: Box<[E]>) -> ObjSlice<E> {
+        ObjSlice::from_slice(&items)
+    }
+}
+
+impl<E: Copy, const N: usize> From<[E; N]> for ObjSlice<E> {
+    fn from(items: [E; N]) -> ObjSlice<E> {
+        ObjSlice::from_slice(&items)
+    }
+}
+
+impl<E: Copy> FromIterator<E> for ObjSlice<E> {
+    fn from_iter<I: IntoIterator<Item = E>>(it: I) -> ObjSlice<E> {
+        ObjSlice::from_slice(&it.into_iter().collect::<Vec<E>>())
+    }
+}
+
+impl<E: Copy> AsRef<[E]> for ObjSlice<E> {
+    fn as_ref(&self) -> &[E] {
+        self
+    }
+}
+
+impl<E: Copy> std::borrow::Borrow<[E]> for ObjSlice<E> {
+    fn borrow(&self) -> &[E] {
+        self
+    }
+}
+
+impl<E: Copy + fmt::Debug> fmt::Debug for ObjSlice<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<E: Copy + PartialEq> PartialEq for ObjSlice<E> {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+impl<E: Copy + Eq> Eq for ObjSlice<E> {}
+
+impl<E: Copy + std::hash::Hash> std::hash::Hash for ObjSlice<E> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (**self).hash(state)
+    }
+}
+
+// --- operaciones de cabecera (de `Shared`, `SharedTail`, `Obj` y `ObjSlice`) ---
 //
 // Cada una tiene un camino rápido de UNA comparación, como `Rc`/`RefCell`, y un camino lento aparte
 // (`#[cold]`) donde caen el inmortal, el desborde y los errores. Así el inmortal no cuesta nada en
@@ -776,6 +1225,14 @@ fn dec_strong(h: &Header) -> bool {
     } else {
         false // inmortal
     }
+}
+/// El débil implícito de `drop_slow` (strong ya es 0: nunca inmortal).
+fn hold_weak(h: &Header) {
+    let w = h.weak.get();
+    if w == u16::MAX {
+        overflow();
+    }
+    h.weak.set(w + 1);
 }
 fn inc_weak(h: &Header) {
     if h.strong.get() != IMMORTAL {
@@ -864,6 +1321,120 @@ fn take_write_slow(h: &Header) -> BorrowError {
 mod tests {
     use super::*;
     use std::rc::Rc;
+
+    #[test]
+    fn obj_counts_drops_once_and_copies_on_write() {
+        let n = Rc::new(Cell::new(0));
+        let a = Obj::new(Probe(n.clone()));
+        let b = a.clone();
+        assert_eq!(Obj::strong_count(&a), 2);
+        assert!(Obj::ptr_eq(&a, &b));
+        drop(a);
+        assert_eq!(n.get(), 0);
+        drop(b);
+        assert_eq!(n.get(), 1);
+
+        let mut x = Obj::new(vec![1, 2]);
+        let y = x.clone();
+        Obj::make_mut(&mut x).push(3);
+        assert_eq!(*x, vec![1, 2, 3]);
+        assert_eq!(*y, vec![1, 2]);
+        assert!(!Obj::ptr_eq(&x, &y));
+        assert_eq!(Obj::try_unwrap(y), Ok(vec![1, 2]));
+    }
+
+    #[test]
+    fn obj_immortal_is_never_freed_nor_written() {
+        let n = Rc::new(Cell::new(0));
+        let mut a = Obj::new(Probe(n.clone()));
+        Obj::make_immortal(&a);
+        assert!(Obj::is_immortal(&a));
+        assert_eq!(Obj::strong_count(&a), usize::MAX);
+        assert!(Obj::get_mut(&mut a).is_none());
+        let ptr = a.ptr;
+        let b = a.clone();
+        drop(a);
+        drop(b);
+        assert_eq!(n.get(), 0, "un inmortal no se suelta");
+        let mut v = Obj::new(1);
+        Obj::make_immortal(&v);
+        let vptr = v.ptr;
+        let before = Obj::as_ptr(&v);
+        *Obj::make_mut(&mut v) += 1; // copia: el inmortal no se escribe
+        assert_eq!(*v, 2);
+        assert_ne!(Obj::as_ptr(&v), before);
+        // El test devuelve la memoria de los inmortales a mano (en el motor viven lo que el proceso).
+        // SAFETY (del test): las reservas siguen vivas y nadie más las usa.
+        unsafe {
+            std::ptr::drop_in_place(ptr.as_ref().value.get());
+            alloc::dealloc(ptr.as_ptr().cast(), Layout::new::<Inner<Probe>>());
+            alloc::dealloc(vptr.as_ptr().cast(), Layout::new::<Inner<i32>>());
+        }
+        assert_eq!(n.get(), 1);
+    }
+
+    /// La doble liberación que encontró la puerta de R1.3c (`words`, formas de mapas): soltar la
+    /// hija suelta a la madre, que suelta el último débil a la hija mientras la hija se suelta.
+    #[test]
+    fn dropping_a_child_that_frees_the_last_weak_to_itself() {
+        struct Node {
+            _parent: Option<Obj<Node>>,
+            children: std::cell::RefCell<Vec<WeakObj<Node>>>,
+        }
+        let parent = Obj::new(Node { _parent: None, children: Default::default() });
+        let child = Obj::new(Node { _parent: Some(parent.clone()), children: Default::default() });
+        parent.children.borrow_mut().push(Obj::downgrade(&child));
+        drop(parent);
+        drop(child);
+
+        struct SNode {
+            _parent: Option<Shared<SNode>>,
+            children: Vec<WeakShared<SNode>>,
+        }
+        let parent = Shared::new(SNode { _parent: None, children: Vec::new() });
+        let child = Shared::new(SNode { _parent: Some(parent.clone()), children: Vec::new() });
+        parent.borrow_mut().children.push(Shared::downgrade(&child));
+        drop(parent);
+        drop(child);
+    }
+
+    #[test]
+    fn obj_weak_upgrades_while_alive() {
+        let a = Obj::new(String::from("x"));
+        let w = Obj::downgrade(&a);
+        assert_eq!(w.upgrade().as_deref().map(String::as_str), Some("x"));
+        drop(a);
+        assert!(w.upgrade().is_none());
+        let w2 = w.clone();
+        drop(w);
+        assert!(w2.upgrade().is_none());
+    }
+
+    #[test]
+    fn obj_slice_thin_and_counted() {
+        assert_eq!(std::mem::size_of::<ObjSlice<u8>>(), std::mem::size_of::<usize>());
+        assert_eq!(std::mem::size_of::<Option<ObjSlice<u8>>>(), std::mem::size_of::<usize>());
+        let a: ObjSlice<u8> = ObjSlice::from(&b"hola"[..]);
+        let b = a.clone();
+        assert_eq!(&*b, b"hola");
+        assert_eq!(ObjSlice::strong_count(&a), 2);
+        assert_eq!(a, ObjSlice::from(vec![b'h', b'o', b'l', b'a']));
+        drop(a);
+        assert_eq!(b.len(), 4);
+        let e: ObjSlice<u8> = ObjSlice::from(Vec::new());
+        assert!(e.is_empty());
+        ObjSlice::make_immortal(&e);
+        assert!(ObjSlice::is_immortal(&e));
+        let eptr = e.ptr;
+        let e2 = e.clone();
+        drop(e);
+        drop(e2);
+        // SAFETY (del test): el inmortal no se liberó; se devuelve a mano.
+        unsafe { alloc::dealloc(eptr.as_ptr().cast(), ObjSlice::<u8>::layout(0)) };
+        let w: ObjSlice<u64> = (0..5u64).collect();
+        assert_eq!(&*w, &[0, 1, 2, 3, 4]);
+        assert_eq!(ObjSlice::as_ptr(&w) as usize % 8, 0);
+    }
 
     /// Cuenta cuántas veces se soltó (para ver que el valor se suelta una vez, en el momento justo).
     struct Probe(Rc<Cell<u32>>);

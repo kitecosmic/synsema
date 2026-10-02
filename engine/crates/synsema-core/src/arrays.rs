@@ -1,6 +1,6 @@
 //! Arrays numéricos n-dimensionales + álgebra lineal (Batch 5).
 //!
-//! Tipo `SynValue::Array(Rc<ArrayD<f64>>)` (dtype f64, inmutable). `ndarray` da el modelo
+//! Tipo `SynValue::Array(Obj<ArrayD<f64>>)` (dtype f64, inmutable). `ndarray` da el modelo
 //! n-dimensional + vectorización/broadcasting/reducciones; `faer` (puro-Rust, SIMD) el
 //! álgebra lineal densa 2D (matmul/solve/det/inv/eig/svd). **`*` es ELEMENTWISE**; el
 //! producto matricial es `matmul`/`dot`.

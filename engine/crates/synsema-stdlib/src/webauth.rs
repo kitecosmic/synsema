@@ -48,7 +48,7 @@ fn syn_bool(b: bool) -> SynValue {
 }
 
 fn syn_bytes(b: Vec<u8>) -> SynValue {
-    SynValue::Bytes(Rc::from(b.into_boxed_slice()))
+    SynValue::Bytes(synsema_core::types::BytesRef::from(b.into_boxed_slice()))
 }
 
 // =========================================================
@@ -1440,7 +1440,7 @@ mod tests {
     #[test]
     fn a_sealed_identity_key_cannot_sign_an_asymmetric_jwt() {
         use synsema_core::secret::SecretInner;
-        let sealed = SynValue::Secret(Rc::new(SecretInner::new_bytes_sealed("attestation_key", vec![7u8; 32])));
+        let sealed = SynValue::Secret(synsema_core::types::Obj::new(SecretInner::new_bytes_sealed("attestation_key", vec![7u8; 32])));
         let e = match pem_text(&sealed, "jwt_sign", "the key") {
             Err(Control::Error(e)) => e.to_string(),
             _ => panic!("un secret sellado no puede pasar por el camino asimétrico"),
@@ -2192,7 +2192,7 @@ mod v0620_tests {
     fn jwt_sign_eddsa_with_a_secret_goes_through_the_sign_gate() {
         use synsema_core::secret::SecretInner;
         let seed_hex = synsema_core::bytesutil::hex_encode(&[3u8; 32]);
-        let k = SynValue::Secret(Rc::new(SecretInner::new("ID_SEED", seed_hex.clone())));
+        let k = SynValue::Secret(synsema_core::types::Obj::new(SecretInner::new("ID_SEED", seed_hex.clone())));
         // Sin `require sign("ID_SEED")`: denegado, con el require exacto en el mensaje.
         let e = match b_jwt_sign(&[std_claims(), k.clone(), map(&[("alg", syn_text("EdDSA"))])], &caps_with_time(), &tloc()) {
             Err(Control::Error(e)) => e.to_string(),
@@ -2213,7 +2213,7 @@ mod v0620_tests {
         // document_sign con un PEM en texto.
         assert!(b_jwt_sign(&[std_claims(), syn_text(seed_hex.as_str()), map(&[("alg", syn_text("EdDSA"))])], &caps_with_time(), &tloc()).is_ok());
         // HS256 con un secret sigue sin puerta: una MAC no es la clave de identidad.
-        assert!(b_jwt_sign(&[std_claims(), SynValue::Secret(Rc::new(SecretInner::new("MAC", "shared".to_string())))], &caps_with_time(), &tloc()).is_ok());
+        assert!(b_jwt_sign(&[std_claims(), SynValue::Secret(synsema_core::types::Obj::new(SecretInner::new("MAC", "shared".to_string())))], &caps_with_time(), &tloc()).is_ok());
     }
 
     #[test]

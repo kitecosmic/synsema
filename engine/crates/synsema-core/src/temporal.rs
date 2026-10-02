@@ -14,7 +14,6 @@
 use crate::types::SynMap;
 use std::cmp::Ordering;
 use std::fmt;
-use std::rc::Rc;
 
 use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, FixedOffset, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, Offset,
@@ -143,7 +142,7 @@ fn err(msg: impl Into<String>) -> Control {
 }
 
 pub fn value(t: Temporal) -> SynValue {
-    SynValue::Time(Rc::new(t))
+    SynValue::Time(crate::types::Obj::new(t))
 }
 
 /// ISO 8601 de una duración: `P1DT2H30M5.5S`, `PT0S`, `-PT1H`.
