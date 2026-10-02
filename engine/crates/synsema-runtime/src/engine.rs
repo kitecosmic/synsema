@@ -2080,7 +2080,9 @@ fn spawn_agent(
             interp.set_agent_context(&agent_name);
             // Restaurar tareas y valores del top-level para que el agente
             // los pueda llamar directamente sin necesitar HTTP.
-            rebuild_globals(&mut interp, &globals);
+            let registry = rebuild_globals(&mut interp, &globals);
+            // A cargo del intérprete del agente: se vacían cuando termina (ver `adopt_module_envs`).
+            interp.adopt_module_envs(registry.into_values());
             // Los spawn_args sobreescriben cualquier global con el mismo nombre.
             for (k, v) in &send_args {
                 interp.set_global(k, from_send(v));

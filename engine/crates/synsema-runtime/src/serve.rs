@@ -1476,6 +1476,9 @@ fn build_base_interp(
     register_database_builtins(&interp, shared_db, caps.clone());
     let registry = rebuild_globals(&mut interp, snapshot);
     let originals = Originals::capture(&interp, snapshot, &registry);
+    // A cargo del intérprete (un worker que se descarta tras un pánico, un agente de un handler):
+    // se vacían cuando muere (ver `adopt_module_envs`).
+    interp.adopt_module_envs(registry.into_values());
     (interp, caps, originals)
 }
 

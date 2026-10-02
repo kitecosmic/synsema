@@ -33,6 +33,15 @@ first request, so RAM is about the size of the globals × the workers (1 M small
 ≈ 160–190 MB per worker). With large data in globals keep `SYNSEMA_SERVE_WORKERS` low or keep the
 data in a database (`deploy.md`, `serve.md` § Performance and memory of a server).
 
+**Memory leak in `parallel_map` and `spawn`, fixed.** Each `parallel_map` item and each spawned
+agent runs on an interpreter rebuilt from the program, imported modules included. A task of a module
+and the module's environment point at each other, and nothing broke that cycle when the interpreter
+ended: every item and every agent left the program's modules alive. A long-running program that
+calls `parallel_map` (from a `cron_every`, a handler, an agent) grew without bound — measured: a
+module with 20 000 records, ~22 MB more per call, never released. Now the modules an interpreter
+rebuilt are released with it: the same program stays flat (33 MB with 5 calls or with 20, nothing
+left alive at the end). Nothing to change in your programs.
+
 Also: a CLI test that writes an executable and runs it right away retries when Linux reports
 "Text file busy" (a race between tests running in parallel, not a bug in the binary).
 
