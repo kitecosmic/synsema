@@ -1,0 +1,9 @@
+[package]
+name = "synsema-heap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Synsema heap objects: a shared, interior-mutable pointer with an 8-byte header that can be made immortal (readable from any thread without writing)"
+
+# Sin dependencias: es el único lugar con `unsafe` de los objetos del montón (ver src/lib.rs).
+[dependencies]

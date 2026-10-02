@@ -10,6 +10,9 @@ const ALLOWED: &[&str] = &[
     // El texto (F4.6b): en línea hasta 15 B, cuenta no atómica, capacidad y `realloc`. Revisado
     // con Miri (64 y 32 bits, little y big endian) y un fuzz contra `String`.
     "engine/crates/synsema-text/src/lib.rs",
+    // Los objetos del montón (R1 de specs/modelo-memoria-regiones.md): cabecera de 8 B, cuenta propia,
+    // préstamos como RefCell, inmortales. Revisado con Miri en x86_64, i686 y s390x.
+    "engine/crates/synsema-heap/src/lib.rs",
     // El nivel nativo: el contexto, la salida a la VM y la llamada al código generado.
     "engine/crates/synsema-jit/src/abi.rs",
     // Handles del sistema (descriptores heredados, consola de Windows, Job Objects, ioctl de Nitro).

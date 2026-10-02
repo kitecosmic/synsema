@@ -5145,6 +5145,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "synsema-heap"
+version = "0.1.0"
+
+[[package]]
 name = "synsema-infer"
 version = "0.1.0"
 dependencies = [

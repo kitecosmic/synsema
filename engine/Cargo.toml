@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/synsema-core",
     "crates/synsema-text",
+    "crates/synsema-heap",
     "crates/synsema-capabilities",
     "crates/synsema-stdlib",
     "crates/synsema-agents",
