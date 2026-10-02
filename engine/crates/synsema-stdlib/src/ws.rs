@@ -2379,7 +2379,7 @@ fn term_handle(reg: &Registry, v: Option<&SynValue>, fname: &str) -> Result<i64,
     }
 }
 
-fn opt_map<'a>(v: Option<&'a SynValue>, fname: &str) -> Result<Option<std::cell::Ref<'a, MapObj>>, Control> {
+fn opt_map<'a>(v: Option<&'a SynValue>, fname: &str) -> Result<Option<synsema_core::heap::Ref<'a, MapObj>>, Control> {
     match v {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Map(m)) => Ok(Some(m.borrow())),

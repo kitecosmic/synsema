@@ -1018,7 +1018,7 @@ mod tests {
         let mut m = synsema_core::types::SynMap::new();
         m.insert("Authorization", syn_secret("STRIPE_KEY", "Bearer sk_live_LEAKCANARY"));
         m.insert("X-Trace", syn_text("plain"));
-        let map = SynValue::Map(std::rc::Rc::new(std::cell::RefCell::new(m)));
+        let map = SynValue::Map(m.into_ref());
 
         // headers: el secret se MATERIALIZA (borde del socket) → plaintext real.
         let hp = header_pairs(Some(&map)).unwrap();

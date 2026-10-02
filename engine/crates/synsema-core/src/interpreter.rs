@@ -664,8 +664,8 @@ impl Bindings {
 /// reutiliza mientras esté registrada).
 #[derive(Default)]
 struct ModuleRegistry {
-    by_map: HashMap<usize, (std::rc::Weak<RefCell<MapObj>>, std::rc::Weak<RefCell<Environment>>)>,
-    by_env: HashMap<usize, std::rc::Weak<RefCell<MapObj>>>,
+    by_map: HashMap<usize, (synsema_heap::WeakTail<MapObj>, std::rc::Weak<RefCell<Environment>>)>,
+    by_env: HashMap<usize, synsema_heap::WeakTail<MapObj>>,
     prune_at: usize,
 }
 
@@ -675,7 +675,7 @@ thread_local! {
 
 /// Registra el mapa de exportaciones `map` como la vista de `env` (lo llaman `load_module`
 /// y la reconstrucción de módulos de un worker de `serve`/`parallel_map`).
-pub fn register_module(map: &Rc<RefCell<MapObj>>, env: &Rc<RefCell<Environment>>) {
+pub fn register_module(map: &crate::types::MapRef, env: &Rc<RefCell<Environment>>) {
     MODULES.with(|r| {
         let mut r = r.borrow_mut();
         if r.by_map.len() >= r.prune_at.max(64) {
@@ -683,26 +683,26 @@ pub fn register_module(map: &Rc<RefCell<MapObj>>, env: &Rc<RefCell<Environment>>
             r.by_env.retain(|_, m| m.strong_count() > 0);
             r.prune_at = r.by_map.len() * 2;
         }
-        r.by_map.insert(Rc::as_ptr(map).cast::<()>() as usize, (Rc::downgrade(map), Rc::downgrade(env)));
-        r.by_env.insert(Rc::as_ptr(env) as usize, Rc::downgrade(map));
+        r.by_map.insert(crate::types::MapRef::as_ptr(map).cast::<()>() as usize, (crate::types::MapRef::downgrade(map), Rc::downgrade(env)));
+        r.by_env.insert(Rc::as_ptr(env) as usize, crate::types::MapRef::downgrade(map));
     });
 }
 
 /// El entorno del módulo cuyo mapa de exportaciones es `map`, si lo es.
-pub fn module_env_of_map(map: &Rc<RefCell<MapObj>>) -> Option<Rc<RefCell<Environment>>> {
+pub fn module_env_of_map(map: &crate::types::MapRef) -> Option<Rc<RefCell<Environment>>> {
     MODULES.with(|r| {
         let r = r.borrow();
         if r.by_map.is_empty() {
             return None;
         }
-        let (m, e) = r.by_map.get(&(Rc::as_ptr(map).cast::<()>() as usize))?;
+        let (m, e) = r.by_map.get(&(crate::types::MapRef::as_ptr(map).cast::<()>() as usize))?;
         m.upgrade()?;
         e.upgrade()
     })
 }
 
 /// El mapa de exportaciones del módulo cuyo entorno es `env`, si lo es.
-pub fn module_map_of_env(env: &Rc<RefCell<Environment>>) -> Option<Rc<RefCell<MapObj>>> {
+pub fn module_map_of_env(env: &Rc<RefCell<Environment>>) -> Option<crate::types::MapRef> {
     MODULES.with(|r| r.borrow().by_env.get(&(Rc::as_ptr(env) as usize)).and_then(|m| m.upgrade()))
 }
 
@@ -710,7 +710,7 @@ pub fn module_map_of_env(env: &Rc<RefCell<Environment>>) -> Option<Rc<RefCell<Ma
 /// tasks), como `m.X = v` en Python; sus nombres son sus exportaciones y sus tasks no se
 /// reemplazan desde afuera.
 fn module_rebind(
-    m: &Rc<RefCell<MapObj>>,
+    m: &crate::types::MapRef,
     menv: &Rc<RefCell<Environment>>,
     name: &str,
     value: SynValue,
@@ -857,7 +857,7 @@ fn insert_position(i: &SynValue, len: usize) -> Result<usize, String> {
 fn same_container(a: &SynValue, b: &SynValue) -> bool {
     match (a, b) {
         (SynValue::List(x), SynValue::List(y)) => crate::types::ListRef::ptr_eq(x, y),
-        (SynValue::Map(x), SynValue::Map(y)) => Rc::ptr_eq(x, y),
+        (SynValue::Map(x), SynValue::Map(y)) => crate::types::MapRef::ptr_eq(x, y),
         (SynValue::Private(x), SynValue::Private(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
@@ -9864,14 +9864,14 @@ fn make_unique_n(slot: &mut SynValue, extra: usize) {
             let copy = rc.borrow().clone();
             *slot = SynValue::List(synsema_heap::Shared::new(copy));
         }
-        SynValue::Map(rc) if Rc::strong_count(rc) > owners && module_env_of_map(rc).is_none() => {
+        SynValue::Map(rc) if crate::types::MapRef::strong_count(rc) > owners && module_env_of_map(rc).is_none() => {
             let copy = rc.borrow().to_ref();
             *slot = SynValue::Map(copy);
         }
         SynValue::Private(p) => {
             let shared_inner = match &p.value {
                 SynValue::List(rc) => crate::types::ListRef::strong_count(rc) > 1,
-                SynValue::Map(rc) => Rc::strong_count(rc) > 1,
+                SynValue::Map(rc) => crate::types::MapRef::strong_count(rc) > 1,
                 _ => false,
             };
             if shared_inner || (Rc::strong_count(p) > owners && matches!(p.value, SynValue::List(_) | SynValue::Map(_))) {

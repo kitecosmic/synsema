@@ -738,7 +738,7 @@ fn is_export_of(module_env: &Rc<RefCell<Environment>>, k: &str, v: &SynValue) ->
     let env = module_env.borrow();
     match (env.bindings.get(k), v) {
         (Some(SynValue::Task(a)), SynValue::Task(b)) => Rc::ptr_eq(a, b),
-        (Some(SynValue::Map(a)), SynValue::Map(b)) => Rc::ptr_eq(a, b),
+        (Some(SynValue::Map(a)), SynValue::Map(b)) => synsema_core::types::MapRef::ptr_eq(a, b),
         (Some(SynValue::List(a)), SynValue::List(b)) => synsema_core::types::ListRef::ptr_eq(a, b),
         _ => false,
     }
@@ -748,7 +748,7 @@ fn is_export_of(module_env: &Rc<RefCell<Environment>>, k: &str, v: &SynValue) ->
 /// `is_export` las que son el mismo objeto que el binding homónimo del env (en rebuild
 /// se cosechan del env reconstruido → identidad compartida alias↔env).
 fn snapshot_alias_entries(
-    m: &Rc<RefCell<MapObj>>,
+    m: &synsema_core::types::MapRef,
     module_env: &Rc<RefCell<Environment>>,
     state: &mut SnapState,
 ) -> Vec<(String, GlobalVal, bool)> {

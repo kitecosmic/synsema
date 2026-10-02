@@ -11,7 +11,8 @@
 //!   de 80 bytes. Si el mapa crece más allá de sus lugares, los valores de más van afuera (el
 //!   *backing store* de V8); con más de [`MAX_SHAPED`] claves, o cuando una forma tiene demasiadas
 //!   hijas (claves que no se repiten), pasa a **modo diccionario**: la tabla hash de siempre.
-//!   `MapRef = Rc<RefCell<MapObj>>`.
+//!   `MapRef = synsema_heap::SharedTail<MapObj>` (R1.3b: cabecera propia de 8 B, puntero fino, puede ser
+//!   inmortal; el largo vive en el objeto).
 //! - [`SynMap`]: el mismo tipo sin lugares en línea (8 bytes, `new()` sin malloc), el mapa que arman
 //!   los llamadores antes de volverlo un valor ([`SynMap::into_ref`]). Se usa como un `MapObj`
 //!   (`Deref`): una sola implementación.
@@ -221,7 +222,8 @@ type Dict = IndexMap<Key, SynValue, KeyHasher>;
 
 /// Las claves de un mapa, en orden, compartidas por todos los mapas que las tienen (las *hidden
 /// classes* de V8, las *structures* de JSC). Inmutable: agregar una clave es pasar a la forma hija.
-struct Shape {
+#[doc(hidden)]
+pub struct Shape {
     /// La madre, con puntero fuerte (el *back pointer* de V8): la cadena vive mientras viva una
     /// hija. Sin esto, armar `{"id", "valor"}` recreaba la forma de `{"id"}` en cada registro.
     _parent: Option<Rc<Node>>,
@@ -247,8 +249,10 @@ impl Shape {
 }
 
 /// Lo que dice cómo leer los valores de un cuerpo. Una forma se comparte; los otros dos son de un
-/// solo mapa (una copia del mapa los copia).
-enum Node {
+/// solo mapa (una copia del mapa los copia). Público (y oculto) sólo porque `tail_object!` lo nombra
+/// como cabecera de `MapRef`; afuera no se puede armar uno (`Shape` tiene los campos privados).
+#[doc(hidden)]
+pub enum Node {
     /// Todas las claves de la forma tienen su valor en línea.
     Shape(Shape),
     /// La forma y los valores que no entraron en línea (el *backing store* de V8): el valor `i` es
@@ -342,6 +346,8 @@ fn own(n: &mut Rc<Node>) -> &mut Node {
 
 /// El cuerpo de un mapa: cómo leerlo y los valores en línea. `S` es `[SynValue]` en un mapa que es
 /// un valor ([`MapObj`]) y `[SynValue; 0]` en uno que se está armando ([`SynMap`]).
+/// `repr(C)` con sólo estos dos campos: lo pide `tail_object!` (y lo verifica al compilar).
+#[repr(C)]
 pub struct MapBody<S: ?Sized> {
     /// `None`: vacío.
     layout: Option<Rc<Node>>,
@@ -352,13 +358,15 @@ pub struct MapBody<S: ?Sized> {
 pub type MapObj = MapBody<[SynValue]>;
 /// Un mapa que se está armando: sin lugares en línea (ver el módulo).
 pub type SynMap = MapBody<[SynValue; 0]>;
-/// Un mapa como valor: un malloc con el cuerpo y sus valores en línea.
-pub type MapRef = Rc<RefCell<MapObj>>;
+/// Un mapa como valor: un objeto del montón con el cuerpo y sus valores en línea (R1.3b de
+/// specs/modelo-memoria-regiones.md): la misma forma de uso que `Rc<RefCell<MapObj>>`.
+pub type MapRef = synsema_heap::SharedTail<MapObj>;
+synsema_heap::tail_object!(MapBody, layout: Option<Rc<Node>>, vals: [SynValue]);
 
 // El que se arma: un puntero, a lo sumo 8 bytes (en wasm32 el puntero es de 4, pero la alineación
-// de `SynValue` lo lleva a 8). El valor: un puntero gordo (puntero + largo).
+// de `SynValue` lo lleva a 8). El valor: un puntero FINO (el largo vive en el objeto; antes, gordo).
 const _: () = assert!(std::mem::size_of::<SynMap>() <= 8);
-const _: () = assert!(std::mem::size_of::<MapRef>() == 2 * std::mem::size_of::<usize>());
+const _: () = assert!(std::mem::size_of::<MapRef>() == std::mem::size_of::<usize>());
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
@@ -368,21 +376,11 @@ enum Kind {
     Dict,
 }
 
-macro_rules! new_body {
-    ($layout:ident, $it:ident, $n:expr; $($k:literal)*) => {
-        match $n {
-            $($k => Rc::new(RefCell::new(MapBody {
-                layout: $layout,
-                vals: std::array::from_fn::<SynValue, $k, _>(|_| $it.next().unwrap_or(SynValue::Nothing)),
-            })) as MapRef,)*
-            _ => unreachable!("más de MAX_SHAPED lugares en línea"),
-        }
-    };
-}
-
-/// Un cuerpo con `n` lugares en línea (el malloc del mapa), llenos con `vals`.
+/// Un cuerpo con `n` lugares en línea (el malloc del mapa), llenos con `vals` (lo que falte,
+/// `Nothing`).
 fn new_body(layout: Option<Rc<Node>>, mut vals: impl Iterator<Item = SynValue>, n: usize) -> MapRef {
-    new_body!(layout, vals, n; 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32)
+    debug_assert!(n <= MAX_SHAPED, "más de MAX_SHAPED lugares en línea");
+    MapRef::new(layout, n, |_| vals.next().unwrap_or(SynValue::Nothing))
 }
 
 /// Una forma armada una vez para muchos mapas con las mismas claves en el mismo orden (las

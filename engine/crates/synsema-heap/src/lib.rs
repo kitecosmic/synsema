@@ -223,12 +223,24 @@ impl<T> Drop for Shared<T> {
     #[inline]
     fn drop(&mut self) {
         if dec_strong(self.header()) {
-            // SAFETY: era el último dueño: el valor se suelta una vez. Nadie lo tiene prestado (un
-            // préstamo vive menos que el `Shared` del que salió).
-            unsafe { std::ptr::drop_in_place(self.ptr.as_ref().value.get()) };
-            // SAFETY: strong = 0 y el valor ya se soltó.
-            unsafe { release_if_unreferenced(self.ptr) };
+            // SAFETY: era el último dueño.
+            unsafe { self.drop_slow() };
         }
+    }
+}
+
+impl<T> Shared<T> {
+    /// Ver `SharedTail::drop_slow`.
+    ///
+    /// # Safety
+    /// strong acaba de llegar a 0.
+    #[inline(never)]
+    unsafe fn drop_slow(&mut self) {
+        // SAFETY: el valor se suelta una vez. Nadie lo tiene prestado (un préstamo vive menos que el
+        // `Shared` del que salió).
+        unsafe { std::ptr::drop_in_place(self.ptr.as_ref().value.get()) };
+        // SAFETY: strong = 0 y el valor ya se soltó.
+        unsafe { release_if_unreferenced(self.ptr) };
     }
 }
 
@@ -493,10 +505,16 @@ pub struct WeakTail<T: ?Sized + TailObject> {
     _owns: PhantomData<T>,
 }
 
+/// Dónde empieza el objeto (constante por tipo).
+#[inline(always)]
+const fn tail_obj_off<T: ?Sized + TailObject>() -> usize {
+    std::mem::size_of::<TailPrefix>().div_ceil(T::ALIGN) * T::ALIGN
+}
+
 /// Dónde empieza el objeto y la reserva entera, para `len` elementos.
 fn tail_layout<T: ?Sized + TailObject>(len: usize) -> (usize, Layout) {
     let align = T::ALIGN.max(std::mem::align_of::<TailPrefix>());
-    let obj_off = std::mem::size_of::<TailPrefix>().div_ceil(T::ALIGN) * T::ALIGN;
+    let obj_off = tail_obj_off::<T>();
     let tail_bytes = std::mem::size_of::<T::Elem>().checked_mul(len).expect("tail object too large");
     let obj_size = (T::TAIL_OFFSET + tail_bytes).div_ceil(T::ALIGN) * T::ALIGN;
     let total = obj_off.checked_add(obj_size).expect("tail object too large");
@@ -570,8 +588,7 @@ impl<T: ?Sized + TailObject> SharedTail<T> {
     fn obj_ptr(&self) -> *mut T {
         // SAFETY: la reserva está viva; sólo se calcula la dirección del objeto.
         let len = unsafe { self.ptr.as_ref().len };
-        let (obj_off, _) = tail_layout::<T>(len);
-        T::from_raw_parts(unsafe { self.ptr.as_ptr().cast::<u8>().add(obj_off) }, len)
+        T::from_raw_parts(unsafe { self.ptr.as_ptr().cast::<u8>().add(tail_obj_off::<T>()) }, len)
     }
 
     /// Cuántos elementos tiene la lista en línea.
@@ -672,12 +689,25 @@ impl<T: ?Sized + TailObject> Drop for SharedTail<T> {
     #[inline]
     fn drop(&mut self) {
         if dec_strong(self.header()) {
-            // SAFETY: era el último dueño: el objeto se suelta una vez (nadie lo tiene prestado: un
-            // préstamo vive menos que el `SharedTail` del que salió).
-            unsafe { std::ptr::drop_in_place(self.obj_ptr()) };
-            // SAFETY: el objeto ya se soltó.
-            unsafe { Self::release_if_unreferenced(self.ptr) };
+            // SAFETY: era el último dueño.
+            unsafe { self.drop_slow() };
         }
+    }
+}
+
+impl<T: ?Sized + TailObject> SharedTail<T> {
+    /// El último dueño suelta el objeto y, si no quedan débiles, la reserva. Fuera de línea (como
+    /// `Rc::drop_slow`): inlineado, engordaba el drop de todo valor que pueda tener un mapa.
+    ///
+    /// # Safety
+    /// strong acaba de llegar a 0.
+    #[inline(never)]
+    unsafe fn drop_slow(&mut self) {
+        // SAFETY: el objeto se suelta una vez (nadie lo tiene prestado: un préstamo vive menos que el
+        // `SharedTail` del que salió).
+        unsafe { std::ptr::drop_in_place(self.obj_ptr()) };
+        // SAFETY: el objeto ya se soltó.
+        unsafe { Self::release_if_unreferenced(self.ptr) };
     }
 }
 
@@ -686,6 +716,11 @@ impl<T: ?Sized + TailObject> WeakTail<T> {
         // SAFETY: la reserva vive mientras haya un débil.
         let h = unsafe { &self.ptr.as_ref().h };
         upgrade_h(h).then(|| SharedTail { ptr: self.ptr, _owns: PhantomData })
+    }
+
+    pub fn strong_count(&self) -> usize {
+        // SAFETY: la reserva vive mientras haya un débil.
+        strong_count_h(unsafe { &self.ptr.as_ref().h })
     }
 }
 

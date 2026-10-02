@@ -4,7 +4,6 @@
 //! re-exporta los símbolos públicos → los callers externos no cambian.
 
 use synsema_core::types::SynMap;
-use std::cell::RefCell;
 use std::rc::Rc;
 
 
@@ -686,7 +685,7 @@ pub(crate) fn make_node(kind: &str, fields: Vec<(&str, SynValue)>) -> SynValue {
     for (k, v) in fields {
         m.insert(k.to_string(), v);
     }
-    SynValue::Server(Rc::new(ServerValue::Node(Rc::new(RefCell::new(m)))))
+    SynValue::Server(Rc::new(ServerValue::Node(m.into_ref())))
 }
 
 #[cfg(test)]

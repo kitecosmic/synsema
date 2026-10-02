@@ -515,7 +515,7 @@ pub fn mark_owned(v: &SynValue, label: Label) -> SynValue {
 fn is_aliased(v: &SynValue) -> bool {
     match v {
         SynValue::List(l) => crate::types::ListRef::strong_count(l) > 1 || list_values(&l).iter().any(is_aliased),
-        SynValue::Map(m) => Rc::strong_count(m) > 1 || m.borrow().values().any(is_aliased),
+        SynValue::Map(m) => crate::types::MapRef::strong_count(m) > 1 || m.borrow().values().any(is_aliased),
         SynValue::Private(p) => is_aliased(&p.value),
         // Los valores del servidor llevan `Rc`/`Box` opacos: conservador.
         SynValue::Server(_) => true,
@@ -547,7 +547,7 @@ pub fn deep_copy(v: &SynValue) -> SynValue {
                 for (k, x) in m.borrow().iter() {
                     out.insert(k.clone(), deep_copy(x));
                 }
-                SynValue::Server(Rc::new(ServerValue::Node(Rc::new(std::cell::RefCell::new(out)))))
+                SynValue::Server(Rc::new(ServerValue::Node(out.into_ref())))
             }
             ServerValue::Content(inner) => {
                 SynValue::Server(Rc::new(ServerValue::Content(Box::new(deep_copy(inner)))))
@@ -598,7 +598,7 @@ pub fn strip_deep(v: &SynValue) -> SynValue {
                 for (k, x) in m.borrow().iter() {
                     out.insert(k.clone(), strip_deep(x));
                 }
-                SynValue::Server(Rc::new(ServerValue::Node(Rc::new(std::cell::RefCell::new(out)))))
+                SynValue::Server(Rc::new(ServerValue::Node(out.into_ref())))
             }
             ServerValue::Content(inner) => {
                 SynValue::Server(Rc::new(ServerValue::Content(Box::new(strip_deep(inner)))))
