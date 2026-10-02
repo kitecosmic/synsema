@@ -47,10 +47,6 @@ impl Key {
         &self.0
     }
 
-    /// Ver `SynText::make_immortal` (R2: `frozen.rs`).
-    pub(crate) fn make_immortal(&self) {
-        self.0.make_immortal();
-    }
     /// La clave de un valor (`m[k]`, un literal `{k: …}`): un texto comparte su `Rc` (sin copiar);
     /// cualquier otro valor, su texto (`{1: "a"}` → la clave `"1"`, como siempre).
     #[inline]
@@ -370,13 +366,13 @@ fn frozen_transition(parent: &Obj<Node>, k: &Key) -> Option<Obj<Node>> {
 /// de madres (con sus claves y su índice ya armado, para que leerla no escriba), el nodo
 /// `Grown`/`Dict` y las claves del diccionario. Los valores (y las claves en línea) los congela
 /// quien llama.
-pub(crate) fn freeze_layout(m: &MapObj) {
+pub(crate) fn freeze_layout(m: &MapObj, mk: &mut crate::frozen::Marker) {
     if let Some(n) = &m.layout {
-        freeze_node(n);
+        freeze_node(n, mk);
     }
 }
 
-fn freeze_node(n: &Obj<Node>) {
+fn freeze_node(n: &Obj<Node>, mk: &mut crate::frozen::Marker) {
     let mut cur = n.clone();
     loop {
         if Obj::is_immortal(&cur) {
@@ -384,7 +380,7 @@ fn freeze_node(n: &Obj<Node>) {
         }
         let next = match &*cur {
             Node::Shape(s) => {
-                s.keys.iter().for_each(Key::make_immortal);
+                s.keys.iter().for_each(|k| mk.text(k.text()));
                 if s.keys.len() >= INDEX_FROM {
                     let _ = s.position(s.keys[0].as_str());
                 }
@@ -392,11 +388,11 @@ fn freeze_node(n: &Obj<Node>) {
             }
             Node::Grown { shape, .. } => Some(shape.clone()),
             Node::Dict(d) => {
-                d.keys().for_each(Key::make_immortal);
+                d.keys().for_each(|k| mk.text(k.text()));
                 None
             }
         };
-        Obj::make_immortal(&cur);
+        mk.obj(&cur);
         match next {
             Some(p) => cur = p,
             None => return,

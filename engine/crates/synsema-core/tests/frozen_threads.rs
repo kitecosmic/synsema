@@ -123,3 +123,91 @@ fn what_cannot_be_frozen_is_returned_untouched() {
         other => panic!("{}", other.type_name()),
     }
 }
+
+/// R2.3: congelado con alcance. Los hilos de `run` leen, copian y escriben (copia); al volver, cada
+/// objeto tiene la cuenta de antes y deja de ser inmortal.
+#[test]
+fn a_scoped_freeze_thaws_after_its_threads() {
+    use synsema_core::frozen::ScopedFreeze;
+    let mut main = Interpreter::new();
+    assert!(main.execute(&parse_source(&data_source(), "<datos>").expect("parse")).is_ok(), "datos");
+    let datos = global(&main, "datos");
+    let (want, _) = run_with(synsema_core::labels::deep_copy(&datos));
+    let before = datos.to_string();
+    let (map_count, list_count) = match &datos {
+        SynValue::Map(m) => match m.borrow().get("filas") {
+            Some(SynValue::List(l)) => (MapRef::strong_count(m), ListRef::strong_count(l)),
+            _ => panic!("filas"),
+        },
+        _ => panic!("datos"),
+    };
+
+    let mut scope = ScopedFreeze::new();
+    let i = scope.add(datos.clone()).expect("se congela");
+    let results = scope
+        .run(HILOS, 64 << 20, |ctx, _t| {
+            let mut last = String::new();
+            for _ in 0..VUELTAS {
+                let v = ctx.get(i);
+                assert!(matches!(&v, SynValue::Map(m) if MapRef::strong_count(m) == usize::MAX), "congelado adentro");
+                // Lo congelado con alcance no puede pasar a una región permanente.
+                assert!(FrozenValue::new(v.clone()).is_err());
+                // Un `run` anidado lo comparte tal cual (termina antes que éste).
+                let mut inner = ScopedFreeze::new();
+                let j = inner.add(v.clone()).expect("lo de afuera sirve adentro");
+                let n = inner.run(2, 64 << 20, |c, _| c.get(j).to_string().len()).expect("anidado");
+                assert_eq!(n[0], n[1]);
+                last = run_with(v).0;
+            }
+            last
+        })
+        .expect("hilos");
+    assert!(results.iter().all(|r| *r == want), "{:?} vs {}", results, want);
+
+    // Descongelado: las cuentas de antes (más el clon que guardó `add`, ya soltado), mortal.
+    assert_eq!(datos.to_string(), before);
+    match &datos {
+        SynValue::Map(m) => {
+            assert_eq!(MapRef::strong_count(m), map_count);
+            match m.borrow().get("filas") {
+                Some(SynValue::List(l)) => assert_eq!(ListRef::strong_count(l), list_count),
+                _ => panic!("filas"),
+            }
+        }
+        _ => panic!("datos"),
+    }
+    // Y se puede escribir en el lugar otra vez (único dueño de la lista de adentro: no copia).
+    let program = parse_source("set datos[\"nums\"] to append(datos[\"nums\"], 1)\n", "<w>").expect("parse");
+    main.set_global("datos", datos);
+    assert!(main.execute(&program).is_ok());
+}
+
+#[test]
+fn a_panicking_thread_still_thaws() {
+    use synsema_core::frozen::ScopedFreeze;
+    let mut i = Interpreter::new();
+    assert!(i.execute(&parse_source("let l be [[1, 2], \"un texto largo que vive en el montón\"]\n", "<p>").expect("parse")).is_ok());
+    let l = global(&i, "l");
+    let before = match &l {
+        SynValue::List(x) => ListRef::strong_count(x),
+        _ => panic!("l"),
+    };
+    let mut scope = ScopedFreeze::new();
+    let k = scope.add(l.clone()).expect("se congela");
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        scope.run(2, 64 << 20, |ctx, t| {
+            let _v = ctx.get(k);
+            if t == 1 {
+                panic!("a propósito");
+            }
+        })
+    }));
+    assert!(r.is_err(), "el pánico sigue");
+    match &l {
+        SynValue::List(x) => {
+            assert_eq!(ListRef::strong_count(x), before);
+            assert!(!ListRef::is_immortal(x));
+        }
+        _ => panic!("l"),
+    }
+}

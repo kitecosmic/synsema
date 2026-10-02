@@ -43,6 +43,10 @@ use std::ptr::NonNull;
 const IMMORTAL: u32 = u32::MAX;
 /// La bandera de préstamo de un objeto inmortal: el tope de lectores. Ver el módulo.
 const IMMORTAL_BORROW: i16 = i16::MAX;
+/// La bandera de préstamo de un inmortal CON ALCANCE (R2.3, `FreezeLog`): se descongela al terminar,
+/// así que no puede pasar a una región permanente (`is_scoped`). Los caminos rápidos la rechazan
+/// igual que al inmortal: los lectores cuentan hasta antes de ella.
+const SCOPED_BORROW: i16 = i16::MAX - 1;
 
 /// La cabecera común (8 bytes).
 #[repr(C)]
@@ -106,6 +110,19 @@ impl<T> Shared<T> {
     /// tiene prestado (congelar ocurre en un punto quieto). Idempotente.
     pub fn make_immortal(this: &Self) {
         make_immortal_h(this.header());
+    }
+
+    /// `make_immortal` anotando la cuenta que tenía en `log`, para devolvérsela con `FreezeLog::thaw`
+    /// (R2.3: un congelado con alcance). Lo que ya era inmortal no se anota: no se descongela.
+    pub fn make_immortal_logged(this: &Self, log: &mut FreezeLog) {
+        log.freeze(this.header());
+    }
+
+    /// ¿Inmortal con alcance (`make_immortal_logged`)? Se va a descongelar: no se puede compartir
+    /// más allá de ese alcance.
+    #[inline]
+    pub fn is_scoped(this: &Self) -> bool {
+        scoped_h(this.header())
     }
 
     /// Cuántos `Shared` lo tienen. `usize::MAX` si es inmortal (siempre "compartido").
@@ -336,7 +353,7 @@ impl<'b, T: ?Sized> Ref<'b, T> {
     pub fn clone(orig: &Ref<'b, T>) -> Ref<'b, T> {
         if let Some(b) = orig.release {
             let n = b.get();
-            if n + 1 >= IMMORTAL_BORROW {
+            if n + 1 >= SCOPED_BORROW {
                 panic!("{}", BorrowError::TooManyReaders);
             }
             b.set(n + 1);
@@ -617,6 +634,19 @@ impl<T: ?Sized + TailObject> SharedTail<T> {
     pub fn make_immortal(this: &Self) {
         make_immortal_h(this.header());
     }
+
+    /// `make_immortal` anotando la cuenta que tenía en `log`, para devolvérsela con `FreezeLog::thaw`
+    /// (R2.3: un congelado con alcance). Lo que ya era inmortal no se anota: no se descongela.
+    pub fn make_immortal_logged(this: &Self, log: &mut FreezeLog) {
+        log.freeze(this.header());
+    }
+
+    /// ¿Inmortal con alcance (`make_immortal_logged`)? Se va a descongelar: no se puede compartir
+    /// más allá de ese alcance.
+    #[inline]
+    pub fn is_scoped(this: &Self) -> bool {
+        scoped_h(this.header())
+    }
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
         strong_count_h(this.header())
@@ -802,6 +832,19 @@ impl<T> Obj<T> {
     /// Ver `Shared::make_immortal` (un `Obj` nunca está prestado: no falla). Idempotente.
     pub fn make_immortal(this: &Self) {
         make_immortal_h(this.header());
+    }
+
+    /// `make_immortal` anotando la cuenta que tenía en `log`, para devolvérsela con `FreezeLog::thaw`
+    /// (R2.3: un congelado con alcance). Lo que ya era inmortal no se anota: no se descongela.
+    pub fn make_immortal_logged(this: &Self, log: &mut FreezeLog) {
+        log.freeze(this.header());
+    }
+
+    /// ¿Inmortal con alcance (`make_immortal_logged`)? Se va a descongelar: no se puede compartir
+    /// más allá de ese alcance.
+    #[inline]
+    pub fn is_scoped(this: &Self) -> bool {
+        scoped_h(this.header())
     }
 
     /// `usize::MAX` si es inmortal.
@@ -1075,6 +1118,19 @@ impl<E: Copy> ObjSlice<E> {
         make_immortal_h(this.header());
     }
 
+    /// `make_immortal` anotando la cuenta que tenía en `log`, para devolvérsela con `FreezeLog::thaw`
+    /// (R2.3: un congelado con alcance). Lo que ya era inmortal no se anota: no se descongela.
+    pub fn make_immortal_logged(this: &Self, log: &mut FreezeLog) {
+        log.freeze(this.header());
+    }
+
+    /// ¿Inmortal con alcance (`make_immortal_logged`)? Se va a descongelar: no se puede compartir
+    /// más allá de ese alcance.
+    #[inline]
+    pub fn is_scoped(this: &Self) -> bool {
+        scoped_h(this.header())
+    }
+
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
         strong_count_h(this.header())
@@ -1265,6 +1321,61 @@ fn strong_count_h(h: &Header) -> usize {
         n => n as usize,
     }
 }
+/// Lo que un congelado con alcance (R2.3) volvió inmortal, con la cuenta que tenía cada uno, para
+/// devolvérsela (`thaw`). Si no se descongela, todo queda inmortal (una fuga, nunca un error).
+#[derive(Default)]
+pub struct FreezeLog {
+    frozen: Vec<(NonNull<Header>, u32)>,
+}
+
+impl FreezeLog {
+    pub fn new() -> FreezeLog {
+        FreezeLog::default()
+    }
+
+    /// Cuántos objetos volvió inmortales.
+    pub fn len(&self) -> usize {
+        self.frozen.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.frozen.is_empty()
+    }
+
+    fn freeze(&mut self, h: &Header) {
+        let s = h.strong.get();
+        if s == IMMORTAL {
+            return;
+        }
+        assert!(h.borrow.get() == 0, "make_immortal: the value is borrowed");
+        self.frozen.push((NonNull::from(h), s));
+        h.strong.set(IMMORTAL);
+        h.borrow.set(SCOPED_BORROW);
+    }
+
+    /// Les devuelve a todos la cuenta que tenían y la bandera de préstamo libre: vuelven a ser
+    /// objetos comunes del hilo que los congeló.
+    ///
+    /// # Safety
+    /// Desde que se congelaron: (1) todo clon hecho de ellos ya se soltó (mientras eran inmortales,
+    /// clonar y soltar no contaron, así que la cuenta anotada es la de los dueños que quedan); (2)
+    /// ningún otro hilo los puede ver más (los que los leyeron terminaron y se esperaron, con sus
+    /// `thread_local`); (3) los objetos siguen vivos (un inmortal no se libera, y los dueños
+    /// anotados los sostienen).
+    pub unsafe fn thaw(self) {
+        for (h, s) in self.frozen {
+            // SAFETY: (3) la reserva vive; (2) nadie más la lee mientras se escribe.
+            let h = unsafe { h.as_ref() };
+            h.strong.set(s);
+            h.borrow.set(0);
+        }
+    }
+}
+
+fn scoped_h(h: &Header) -> bool {
+    h.strong.get() == IMMORTAL && h.borrow.get() == SCOPED_BORROW
+}
+
 fn make_immortal_h(h: &Header) {
     if h.strong.get() == IMMORTAL {
         return;
@@ -1277,8 +1388,9 @@ fn make_immortal_h(h: &Header) {
 #[inline]
 fn take_read(h: &Header) -> Result<bool, BorrowError> {
     let b = h.borrow.get();
-    // 0 ≤ b < tope, en una comparación sin signo (un escritor es -1: queda arriba).
-    if (b as u16) < (IMMORTAL_BORROW as u16) - 1 {
+    // 0 ≤ b < tope, en una comparación sin signo (un escritor es -1: queda arriba). El tope deja
+    // afuera las dos banderas de inmortal (`SCOPED_BORROW` e `IMMORTAL_BORROW`).
+    if (b as u16) < (SCOPED_BORROW as u16) - 1 {
         h.borrow.set(b + 1);
         Ok(true)
     } else {
@@ -1396,6 +1508,44 @@ mod tests {
         parent.borrow_mut().children.push(Shared::downgrade(&child));
         drop(parent);
         drop(child);
+    }
+
+    #[test]
+    fn a_scoped_freeze_gives_the_counts_back() {
+        let n = Rc::new(Cell::new(0));
+        let a = Shared::new(Probe(n.clone()));
+        let a2 = a.clone();
+        let o = Obj::new(7);
+        let already = Obj::new(1);
+        Obj::make_immortal(&already);
+        let mut log = FreezeLog::new();
+        Shared::make_immortal_logged(&a, &mut log);
+        Obj::make_immortal_logged(&o, &mut log);
+        Obj::make_immortal_logged(&already, &mut log);
+        assert_eq!(log.len(), 2, "lo ya inmortal no se anota");
+        assert!(Shared::is_scoped(&a) && Obj::is_scoped(&o) && !Obj::is_scoped(&already));
+        assert_eq!(Shared::strong_count(&a), usize::MAX);
+        {
+            // Mientras está congelado: clonar y soltar no cuentan, leer no toma préstamo.
+            let c = a.clone();
+            let _r = c.borrow();
+            assert!(a.try_borrow_mut().is_err());
+        }
+        // SAFETY (del test): los clones de la ventana ya se soltaron; un solo hilo.
+        unsafe { log.thaw() };
+        assert_eq!(Shared::strong_count(&a), 2);
+        assert_eq!(Obj::strong_count(&o), 1);
+        assert!(Obj::is_immortal(&already));
+        a.borrow_mut().0.set(0);
+        drop(a);
+        assert_eq!(n.get(), 0);
+        drop(a2);
+        assert_eq!(n.get(), 1, "descongelado se suelta una vez, como siempre");
+        // El inmortal de antes no se descongeló: el test devuelve su memoria a mano.
+        let p = already.ptr;
+        drop(already);
+        // SAFETY (del test): la reserva sigue (inmortal) y nadie más la usa.
+        unsafe { alloc::dealloc(p.as_ptr().cast(), Layout::new::<Inner<i32>>()) };
     }
 
     #[test]

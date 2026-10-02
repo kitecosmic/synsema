@@ -52,6 +52,9 @@ const PTR_W: usize = 1 - LEN_W;
 const INLINE_BIT: u8 = 0x80;
 /// La cuenta de un texto inmortal (ver `make_immortal`).
 const IMMORTAL: usize = usize::MAX;
+/// La cuenta de un texto inmortal CON ALCANCE (`make_immortal_logged`): se descongela al terminar,
+/// así que no pasa a una región permanente (`is_scoped`). Todo lo ≥ esto es inmortal.
+const SCOPED: usize = usize::MAX - 1;
 
 #[repr(C)]
 struct Header {
@@ -176,7 +179,7 @@ impl SynText {
     /// y soltar ya no la escriben y la memoria no se libera nunca. Uno en línea no tiene nada que
     /// marcar. Idempotente.
     pub fn make_immortal(&self) {
-        if !self.is_inline() {
+        if !self.is_inline() && self.header().strong.get() < SCOPED {
             self.header().strong.set(IMMORTAL);
         }
     }
@@ -184,7 +187,28 @@ impl SynText {
     /// Si está en el montón y es inmortal.
     #[inline]
     pub fn is_immortal(&self) -> bool {
-        !self.is_inline() && self.header().strong.get() == IMMORTAL
+        !self.is_inline() && self.header().strong.get() >= SCOPED
+    }
+
+    /// Si es inmortal con alcance (`make_immortal_logged`): se va a descongelar.
+    #[inline]
+    pub fn is_scoped(&self) -> bool {
+        !self.is_inline() && self.header().strong.get() == SCOPED
+    }
+
+    /// `make_immortal` anotando la cuenta que tenía, para devolvérsela (`TextThaw::thaw`, R2.3: un
+    /// congelado con alcance). `None` si no había nada que congelar (en línea o ya inmortal).
+    pub fn make_immortal_logged(&self) -> Option<TextThaw> {
+        if self.is_inline() {
+            return None;
+        }
+        let h = self.header();
+        let s = h.strong.get();
+        if s >= SCOPED {
+            return None;
+        }
+        h.strong.set(SCOPED);
+        Some(TextThaw { header: self.w[PTR_W] as *const Header, strong: s })
     }
 
     /// Seguro el mismo texto, sin mirar los bytes: los dos valores son idénticos (en línea, los
@@ -248,6 +272,25 @@ impl Default for SynText {
     }
 }
 
+/// Un texto que un congelado con alcance volvió inmortal, con la cuenta que tenía (ver
+/// `SynText::make_immortal_logged`). Si no se descongela, el texto queda inmortal (una fuga).
+pub struct TextThaw {
+    header: *const Header,
+    strong: usize,
+}
+
+impl TextThaw {
+    /// Le devuelve la cuenta que tenía.
+    ///
+    /// # Safety
+    /// Lo mismo que `synsema_heap::FreezeLog::thaw`: los clones hechos mientras era inmortal ya se
+    /// soltaron, ningún otro hilo lo ve más y el texto sigue vivo (lo sostienen sus dueños).
+    pub unsafe fn thaw(self) {
+        // SAFETY: lo garantiza quien llama (el texto vive y nadie más lo lee).
+        unsafe { (*self.header).strong.set(self.strong) };
+    }
+}
+
 impl Clone for SynText {
     #[inline]
     fn clone(&self) -> SynText {
@@ -256,7 +299,7 @@ impl Clone for SynText {
             // nunca un uso después de liberar (como `synsema_heap::inc_strong`).
             let h = self.header();
             let s = h.strong.get();
-            if s != IMMORTAL {
+            if s < SCOPED {
                 h.strong.set(s + 1);
             }
         }
@@ -275,7 +318,7 @@ impl Drop for SynText {
         let h = self.header();
         let s = h.strong.get();
         // 2 ≤ cuenta < inmortal en una comparación sin signo; el último dueño y el inmortal, aparte.
-        if s.wrapping_sub(2) < IMMORTAL - 2 {
+        if s.wrapping_sub(2) < SCOPED - 2 {
             h.strong.set(s - 1);
         } else if s == 1 {
             self.dealloc_last();
@@ -431,6 +474,19 @@ mod tests {
         a.push_str("!");
         assert_eq!(c.as_str(), "un texto largo que vive en el montón");
         assert!(!a.is_immortal() && a.is_unique());
+        // Congelado con alcance: la cuenta vuelve.
+        let e = SynText::from("otro texto largo que vive en el montón");
+        let e2 = e.clone();
+        let t = e.make_immortal_logged().expect("en el montón");
+        assert!(e.is_immortal() && e.is_scoped() && e.make_immortal_logged().is_none());
+        e.make_immortal();
+        assert!(e.is_scoped(), "con alcance no pasa a permanente");
+        drop(e.clone());
+        // SAFETY (del test): los clones de la ventana se soltaron; un hilo.
+        unsafe { t.thaw() };
+        assert!(!e.is_immortal());
+        drop(e2);
+        assert!(e.is_unique());
         // Uno en línea no tiene nada que marcar.
         let d = SynText::from("corto");
         d.make_immortal();
