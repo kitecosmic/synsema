@@ -21,6 +21,9 @@ native-tier = []
 # El texto (F4.6b de specs/compute-rendimiento.md): en línea hasta 15 B, compartido, y agregar en el
 # lugar con un solo dueño. El `unsafe` del texto vive ahí, no en core.
 synsema-text = { path = "../synsema-text" }
+# Los objetos del montón (R1 de specs/modelo-memoria-regiones.md): cabecera de 8 B, cuenta propia,
+# inmortales. El `unsafe` vive ahí, no en core.
+synsema-heap = { path = "../synsema-heap" }
 num-bigint.workspace = true
 num-traits.workspace = true
 num-integer.workspace = true

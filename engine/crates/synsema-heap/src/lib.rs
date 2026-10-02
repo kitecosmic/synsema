@@ -18,10 +18,13 @@
 //!
 //! Todo el `unsafe` de los objetos del montón vive en este crate (ver
 //! `engine/crates/synsema-jit/tests/unsafe_allowlist.rs`). Invariantes:
-//! - `strong` es ≥ 1 mientras exista un `Shared`; `IMMORTAL` = `u32::MAX` no cambia nunca más.
+//! - `strong` es ≥ 1 mientras exista un `Shared`; `IMMORTAL` = `u32::MAX` no cambia nunca más (se
+//!   llega por `make_immortal` o porque la cuenta se llenó: ver `inc_strong`).
 //! - El valor está vivo mientras `strong > 0`; la reserva, mientras `strong > 0` o `weak > 0`.
-//! - `borrow` > 0: lectores; `-1`: un escritor; nunca las dos cosas. Un inmortal nunca tiene escritor
-//!   y no lleva la cuenta de lectores (siempre 0).
+//! - `borrow` > 0: lectores; `-1`: un escritor; nunca las dos cosas. Un inmortal tiene la bandera fija
+//!   en `IMMORTAL_BORROW` (el tope): los caminos rápidos de leer y escribir la rechazan con la misma
+//!   comparación que ya hacen, así que el inmortal no cuesta nada en el camino normal.
+//! - Sólo se vuelve inmortal un objeto que nadie tiene prestado (`make_immortal`).
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -34,6 +37,8 @@ use std::ptr::NonNull;
 
 /// La cuenta de un objeto inmortal.
 const IMMORTAL: u32 = u32::MAX;
+/// La bandera de préstamo de un objeto inmortal: el tope de lectores. Ver el módulo.
+const IMMORTAL_BORROW: i16 = i16::MAX;
 
 /// La cabecera común (8 bytes).
 #[repr(C)]
@@ -93,23 +98,16 @@ impl<T> Shared<T> {
         this.header().strong.get() == IMMORTAL
     }
 
-    /// Lo vuelve inmortal: ya no se libera y nada lo puede escribir. Falla (pánico) si está prestado
-    /// para escribir. Idempotente.
+    /// Lo vuelve inmortal: ya no se libera y nada lo puede escribir. Falla (pánico) si alguien lo
+    /// tiene prestado (congelar ocurre en un punto quieto). Idempotente.
     pub fn make_immortal(this: &Self) {
-        let h = this.header();
-        assert!(h.borrow.get() >= 0, "make_immortal: the value is borrowed for writing");
-        h.strong.set(IMMORTAL);
-        // Los lectores que hubiera siguen leyendo; sus guardas ya no descuentan (ver `Ref`).
-        h.borrow.set(0);
+        make_immortal_h(this.header());
     }
 
     /// Cuántos `Shared` lo tienen. `usize::MAX` si es inmortal (siempre "compartido").
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
-        match this.header().strong.get() {
-            IMMORTAL => usize::MAX,
-            n => n as usize,
-        }
+        strong_count_h(this.header())
     }
 
     #[inline]
@@ -138,22 +136,13 @@ impl<T> Shared<T> {
         }
     }
 
+    #[inline]
     pub fn try_borrow(&self) -> Result<Ref<'_, T>, BorrowError> {
         let h = self.header();
-        let counted = h.strong.get() != IMMORTAL;
-        if counted {
-            let b = h.borrow.get();
-            if b < 0 {
-                return Err(BorrowError::Writing);
-            }
-            if b == i16::MAX {
-                return Err(BorrowError::TooManyReaders);
-            }
-            h.borrow.set(b + 1);
-        }
-        // SAFETY: no hay escritor (b ≥ 0, o es inmortal y nunca lo tiene); el valor está vivo.
+        let counted = take_read(h)?;
+        // SAFETY: no hay escritor (o es inmortal y nunca lo tiene); el valor está vivo.
         let value = unsafe { NonNull::new_unchecked(self.ptr.as_ref().value.get()) };
-        Ok(Ref { value, release: if counted { Some(h) } else { None }, _life: PhantomData })
+        Ok(Ref { value, release: if counted { Some(&h.borrow) } else { None }, _life: PhantomData })
     }
 
     /// Prestado para escribir. Un inmortal no se escribe: pánico (nunca una carrera de datos).
@@ -165,17 +154,10 @@ impl<T> Shared<T> {
         }
     }
 
+    #[inline]
     pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, BorrowError> {
         let h = self.header();
-        if h.strong.get() == IMMORTAL {
-            return Err(BorrowError::Immortal);
-        }
-        match h.borrow.get() {
-            0 => {}
-            b if b < 0 => return Err(BorrowError::Writing),
-            _ => return Err(BorrowError::Reading),
-        }
-        h.borrow.set(-1);
+        take_write(h)?;
         // SAFETY: nadie más lo tiene prestado; el valor está vivo.
         let value = unsafe { NonNull::new_unchecked(self.ptr.as_ref().value.get()) };
         Ok(RefMut { value, borrow: &h.borrow, _life: PhantomData })
@@ -210,14 +192,7 @@ impl<T> Shared<T> {
     }
 
     pub fn downgrade(this: &Self) -> WeakShared<T> {
-        let h = this.header();
-        if h.strong.get() != IMMORTAL {
-            let w = h.weak.get();
-            if w == u16::MAX {
-                overflow();
-            }
-            h.weak.set(w + 1);
-        }
+        inc_weak(this.header());
         WeakShared { ptr: this.ptr, _owns: PhantomData }
     }
 }
@@ -239,14 +214,7 @@ unsafe fn release_if_unreferenced<T>(ptr: NonNull<Inner<T>>) {
 impl<T> Clone for Shared<T> {
     #[inline]
     fn clone(&self) -> Shared<T> {
-        let h = self.header();
-        let s = h.strong.get();
-        if s != IMMORTAL {
-            if s == IMMORTAL - 1 {
-                overflow();
-            }
-            h.strong.set(s + 1);
-        }
+        inc_strong(self.header());
         Shared { ptr: self.ptr, _owns: PhantomData }
     }
 }
@@ -254,13 +222,7 @@ impl<T> Clone for Shared<T> {
 impl<T> Drop for Shared<T> {
     #[inline]
     fn drop(&mut self) {
-        let h = self.header();
-        let s = h.strong.get();
-        if s == IMMORTAL {
-            return;
-        }
-        h.strong.set(s - 1);
-        if s == 1 {
+        if dec_strong(self.header()) {
             // SAFETY: era el último dueño: el valor se suelta una vez. Nadie lo tiene prestado (un
             // préstamo vive menos que el `Shared` del que salió).
             unsafe { std::ptr::drop_in_place(self.ptr.as_ref().value.get()) };
@@ -279,51 +241,27 @@ impl<T> WeakShared<T> {
 
     /// Un `Shared` si el valor sigue vivo.
     pub fn upgrade(&self) -> Option<Shared<T>> {
-        let h = self.header();
-        match h.strong.get() {
-            0 => None,
-            IMMORTAL => Some(Shared { ptr: self.ptr, _owns: PhantomData }),
-            s => {
-                if s == IMMORTAL - 1 {
-                    overflow();
-                }
-                h.strong.set(s + 1);
-                Some(Shared { ptr: self.ptr, _owns: PhantomData })
-            }
-        }
+        upgrade_h(self.header()).then(|| Shared { ptr: self.ptr, _owns: PhantomData })
     }
 
     pub fn strong_count(&self) -> usize {
-        match self.header().strong.get() {
-            IMMORTAL => usize::MAX,
-            n => n as usize,
-        }
+        strong_count_h(self.header())
     }
 }
 
 impl<T> Clone for WeakShared<T> {
     fn clone(&self) -> WeakShared<T> {
-        let h = self.header();
-        if h.strong.get() != IMMORTAL {
-            let w = h.weak.get();
-            if w == u16::MAX {
-                overflow();
-            }
-            h.weak.set(w + 1);
-        }
+        inc_weak(self.header());
         WeakShared { ptr: self.ptr, _owns: PhantomData }
     }
 }
 
 impl<T> Drop for WeakShared<T> {
     fn drop(&mut self) {
-        let h = self.header();
-        if h.strong.get() == IMMORTAL {
-            return;
+        if dec_weak(self.header()) {
+            // SAFETY: strong = 0 (el valor ya se soltó) y era el último débil.
+            unsafe { release_if_unreferenced(self.ptr) };
         }
-        h.weak.set(h.weak.get() - 1);
-        // SAFETY: si strong = 0 el valor ya se soltó; libera si también era el último débil.
-        unsafe { release_if_unreferenced(self.ptr) };
     }
 }
 
@@ -354,9 +292,9 @@ impl fmt::Display for BorrowError {
 /// Préstamo para leer (como `cell::Ref`).
 pub struct Ref<'b, T: ?Sized> {
     value: NonNull<T>,
-    /// La cabecera, para descontar al soltar; `None` si era inmortal al prestarse. Si se vuelve
-    /// inmortal mientras tanto, la guarda lo ve en la cabecera y no descuenta.
-    release: Option<&'b Header>,
+    /// La bandera de préstamo, para descontar al soltar; `None` si el objeto es inmortal (no se
+    /// vuelve inmortal mientras alguien lo tiene prestado: ver `make_immortal`).
+    release: Option<&'b Cell<i16>>,
     _life: PhantomData<&'b T>,
 }
 
@@ -372,14 +310,12 @@ impl<'b, T: ?Sized> Ref<'b, T> {
 
     /// Como `cell::Ref::clone`: otro lector del mismo préstamo.
     pub fn clone(orig: &Ref<'b, T>) -> Ref<'b, T> {
-        if let Some(h) = orig.release {
-            if h.strong.get() != IMMORTAL {
-                let n = h.borrow.get();
-                if n == i16::MAX {
-                    panic!("{}", BorrowError::TooManyReaders);
-                }
-                h.borrow.set(n + 1);
+        if let Some(b) = orig.release {
+            let n = b.get();
+            if n + 1 >= IMMORTAL_BORROW {
+                panic!("{}", BorrowError::TooManyReaders);
             }
+            b.set(n + 1);
         }
         Ref { value: orig.value, release: orig.release, _life: PhantomData }
     }
@@ -397,10 +333,8 @@ impl<T: ?Sized> Deref for Ref<'_, T> {
 impl<T: ?Sized> Drop for Ref<'_, T> {
     #[inline]
     fn drop(&mut self) {
-        if let Some(h) = self.release {
-            if h.strong.get() != IMMORTAL {
-                h.borrow.set(h.borrow.get() - 1);
-            }
+        if let Some(b) = self.release {
+            b.set(b.get() - 1);
         }
     }
 }
@@ -683,7 +617,7 @@ impl<T: ?Sized + TailObject> SharedTail<T> {
         let counted = take_read(h)?;
         // SAFETY: no hay escritor; el objeto está vivo.
         let value = unsafe { NonNull::new_unchecked(self.obj_ptr()) };
-        Ok(Ref { value, release: if counted { Some(h) } else { None }, _life: PhantomData })
+        Ok(Ref { value, release: if counted { Some(&h.borrow) } else { None }, _life: PhantomData })
     }
     #[inline]
     pub fn borrow_mut(&self) -> RefMut<'_, T> {
@@ -774,27 +708,39 @@ impl<T: ?Sized + TailObject> Drop for WeakTail<T> {
     }
 }
 
-// --- operaciones de cabecera de `SharedTail` ---
+// --- operaciones de cabecera (de `Shared` y `SharedTail`) ---
+//
+// Cada una tiene un camino rápido de UNA comparación, como `Rc`/`RefCell`, y un camino lento aparte
+// (`#[cold]`) donde caen el inmortal, el desborde y los errores. Así el inmortal no cuesta nada en
+// el camino normal (medido por instrucciones en la VM: R1.3a).
 
+/// Una comparación y sin llamadas: una llamada (aunque sea al camino raro) obligaría a armar marco de
+/// pila en cada clon de un valor (`SynValue::clone`), medido: ~10 instrucciones más por clon en la VM.
+/// Si la cuenta llega al tope, el objeto queda **inmortal por cuenta llena**: no se libera nunca (una
+/// fuga, nunca un uso después de liberar; hacen falta 4.000 millones de referencias al mismo objeto).
+/// Ese inmortal sigue siendo de un solo hilo: la región compartida (R2) sólo toma objetos de
+/// `make_immortal`, que además fija la bandera de préstamo.
 #[inline]
 fn inc_strong(h: &Header) {
     let s = h.strong.get();
     if s != IMMORTAL {
-        if s == IMMORTAL - 1 {
-            overflow();
-        }
         h.strong.set(s + 1);
     }
 }
-/// `true` si era el último dueño (y no es inmortal).
+/// `true` si era el último dueño (y no es inmortal). El caso común (2 ≤ cuenta < inmortal) en UNA
+/// comparación sin signo, como `Rc`; el último dueño y el inmortal, aparte.
 #[inline]
 fn dec_strong(h: &Header) -> bool {
     let s = h.strong.get();
-    if s == IMMORTAL {
-        return false;
+    if s.wrapping_sub(2) < IMMORTAL - 2 {
+        h.strong.set(s - 1);
+        false
+    } else if s == 1 {
+        h.strong.set(0);
+        true
+    } else {
+        false // inmortal
     }
-    h.strong.set(s - 1);
-    s == 1
 }
 fn inc_weak(h: &Header) {
     if h.strong.get() != IMMORTAL {
@@ -820,6 +766,7 @@ fn upgrade_h(h: &Header) -> bool {
     inc_strong(h);
     true
 }
+#[inline]
 fn strong_count_h(h: &Header) -> usize {
     match h.strong.get() {
         IMMORTAL => usize::MAX,
@@ -827,38 +774,54 @@ fn strong_count_h(h: &Header) -> usize {
     }
 }
 fn make_immortal_h(h: &Header) {
-    assert!(h.borrow.get() >= 0, "make_immortal: the value is borrowed for writing");
+    if h.strong.get() == IMMORTAL {
+        return;
+    }
+    assert!(h.borrow.get() == 0, "make_immortal: the value is borrowed");
     h.strong.set(IMMORTAL);
-    h.borrow.set(0);
+    h.borrow.set(IMMORTAL_BORROW);
 }
-/// Toma un lector; `Ok(true)` si se cuenta (no inmortal).
+/// Toma un lector; `Ok(true)` si se cuenta (`Ok(false)`: inmortal, no se escribe nada).
 #[inline]
 fn take_read(h: &Header) -> Result<bool, BorrowError> {
-    if h.strong.get() == IMMORTAL {
-        return Ok(false);
-    }
     let b = h.borrow.get();
-    if b < 0 {
-        return Err(BorrowError::Writing);
+    // 0 ≤ b < tope, en una comparación sin signo (un escritor es -1: queda arriba).
+    if (b as u16) < (IMMORTAL_BORROW as u16) - 1 {
+        h.borrow.set(b + 1);
+        Ok(true)
+    } else {
+        take_read_slow(h, b)
     }
-    if b == i16::MAX {
-        return Err(BorrowError::TooManyReaders);
+}
+#[cold]
+#[inline(never)]
+fn take_read_slow(h: &Header, b: i16) -> Result<bool, BorrowError> {
+    if h.strong.get() == IMMORTAL {
+        Ok(false)
+    } else if b < 0 {
+        Err(BorrowError::Writing)
+    } else {
+        Err(BorrowError::TooManyReaders)
     }
-    h.borrow.set(b + 1);
-    Ok(true)
 }
 #[inline]
 fn take_write(h: &Header) -> Result<(), BorrowError> {
-    if h.strong.get() == IMMORTAL {
-        return Err(BorrowError::Immortal);
+    if h.borrow.get() == 0 {
+        h.borrow.set(-1);
+        Ok(())
+    } else {
+        Err(take_write_slow(h))
     }
-    match h.borrow.get() {
-        0 => {
-            h.borrow.set(-1);
-            Ok(())
-        }
-        b if b < 0 => Err(BorrowError::Writing),
-        _ => Err(BorrowError::Reading),
+}
+#[cold]
+#[inline(never)]
+fn take_write_slow(h: &Header) -> BorrowError {
+    if h.strong.get() == IMMORTAL {
+        BorrowError::Immortal
+    } else if h.borrow.get() < 0 {
+        BorrowError::Writing
+    } else {
+        BorrowError::Reading
     }
 }
 
@@ -942,12 +905,14 @@ mod tests {
         let c = b.clone();
         // Ni la cuenta ni la bandera de préstamo cambian al clonar o leer.
         let read = |s: &Shared<Probe>| (s.header().strong.get(), s.header().borrow.get());
-        assert_eq!(read(&a), (IMMORTAL, 0));
+        assert_eq!(read(&a), (IMMORTAL, IMMORTAL_BORROW));
         {
             let _r1 = a.borrow();
             let _r2 = c.borrow();
-            assert_eq!(read(&a), (IMMORTAL, 0));
+            let _r3 = Ref::clone(&_r1);
+            assert_eq!(read(&a), (IMMORTAL, IMMORTAL_BORROW));
         }
+        assert_eq!(read(&a), (IMMORTAL, IMMORTAL_BORROW));
         assert_eq!(a.try_borrow_mut().err(), Some(BorrowError::Immortal));
         let w = Shared::downgrade(&a);
         assert!(w.upgrade().is_some());
@@ -966,21 +931,15 @@ mod tests {
     }
 
     #[test]
-    fn readers_alive_when_made_immortal_do_not_underflow() {
+    #[should_panic(expected = "the value is borrowed")]
+    fn cannot_make_immortal_while_read() {
         let a = Shared::new(5u32);
-        let r = a.borrow();
+        let _r = a.borrow();
         Shared::make_immortal(&a);
-        drop(r); // su guarda ya no descuenta: la bandera queda en 0
-        assert_eq!(a.header().borrow.get(), 0);
-        assert_eq!(*a.borrow(), 5);
-        // la reserva del test
-        let ptr = a.ptr;
-        drop(a);
-        unsafe { alloc::dealloc(ptr.as_ptr().cast(), Layout::new::<Inner<u32>>()) };
     }
 
     #[test]
-    #[should_panic(expected = "borrowed for writing")]
+    #[should_panic(expected = "the value is borrowed")]
     fn cannot_make_immortal_while_written() {
         let a = Shared::new(1u8);
         let _w = a.borrow_mut();

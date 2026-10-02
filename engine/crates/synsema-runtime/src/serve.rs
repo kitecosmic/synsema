@@ -739,7 +739,7 @@ fn is_export_of(module_env: &Rc<RefCell<Environment>>, k: &str, v: &SynValue) ->
     match (env.bindings.get(k), v) {
         (Some(SynValue::Task(a)), SynValue::Task(b)) => Rc::ptr_eq(a, b),
         (Some(SynValue::Map(a)), SynValue::Map(b)) => Rc::ptr_eq(a, b),
-        (Some(SynValue::List(a)), SynValue::List(b)) => Rc::ptr_eq(a, b),
+        (Some(SynValue::List(a)), SynValue::List(b)) => synsema_core::types::ListRef::ptr_eq(a, b),
         _ => false,
     }
 }

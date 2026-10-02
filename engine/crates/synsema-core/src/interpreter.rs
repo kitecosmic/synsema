@@ -856,7 +856,7 @@ fn insert_position(i: &SynValue, len: usize) -> Result<usize, String> {
 /// ¿`a` y `b` son el MISMO contenedor (misma lista, mapa o valor privado)?
 fn same_container(a: &SynValue, b: &SynValue) -> bool {
     match (a, b) {
-        (SynValue::List(x), SynValue::List(y)) => Rc::ptr_eq(x, y),
+        (SynValue::List(x), SynValue::List(y)) => crate::types::ListRef::ptr_eq(x, y),
         (SynValue::Map(x), SynValue::Map(y)) => Rc::ptr_eq(x, y),
         (SynValue::Private(x), SynValue::Private(y)) => Rc::ptr_eq(x, y),
         _ => false,
@@ -2726,7 +2726,7 @@ impl Interpreter {
                 // nueva por entrada. El recibo publica sólo el compromiso (un sha256 a secas de
                 // `run("id", "-u")` se revertía probando un diccionario de consultas); la sal
                 // queda en `lineage()`, así el dueño puede probar después qué consulta fue.
-                let q = bytes_of(&SynValue::List(Rc::new(RefCell::new(args.to_vec().into()))));
+                let q = bytes_of(&SynValue::List(crate::types::ListRef::new(args.to_vec().into())));
                 let q_enc = enc_cell.get();
                 let (sal, commit) = salted_commitment(&q);
                 salt = Some((sal, q_enc));
@@ -9860,9 +9860,9 @@ pub(crate) fn make_unique(slot: &mut SynValue) {
 fn make_unique_n(slot: &mut SynValue, extra: usize) {
     let owners = 1 + extra;
     match slot {
-        SynValue::List(rc) if Rc::strong_count(rc) > owners => {
+        SynValue::List(rc) if crate::types::ListRef::strong_count(rc) > owners => {
             let copy = rc.borrow().clone();
-            *slot = SynValue::List(Rc::new(RefCell::new(copy)));
+            *slot = SynValue::List(synsema_heap::Shared::new(copy));
         }
         SynValue::Map(rc) if Rc::strong_count(rc) > owners && module_env_of_map(rc).is_none() => {
             let copy = rc.borrow().to_ref();
@@ -9870,7 +9870,7 @@ fn make_unique_n(slot: &mut SynValue, extra: usize) {
         }
         SynValue::Private(p) => {
             let shared_inner = match &p.value {
-                SynValue::List(rc) => Rc::strong_count(rc) > 1,
+                SynValue::List(rc) => crate::types::ListRef::strong_count(rc) > 1,
                 SynValue::Map(rc) => Rc::strong_count(rc) > 1,
                 _ => false,
             };
@@ -9878,7 +9878,7 @@ fn make_unique_n(slot: &mut SynValue, extra: usize) {
                 // Copia del contenedor interno aunque su cuenta sea 1 cuando el envoltorio
                 // está compartido: el alias ve el mismo Rc interno.
                 let inner = match &p.value {
-                    SynValue::List(rc) => SynValue::List(Rc::new(RefCell::new(rc.borrow().clone()))),
+                    SynValue::List(rc) => SynValue::List(crate::types::ListRef::new(rc.borrow().clone())),
                     SynValue::Map(rc) => SynValue::Map(rc.borrow().to_ref()),
                     other => other.clone(),
                 };

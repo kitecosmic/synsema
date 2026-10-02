@@ -27,7 +27,9 @@ use crate::number::{py_float_str, Number};
 use crate::secret::{constant_time_eq, SecretInner};
 use crate::tokens::SourceLocation;
 
-pub type ListRef = Rc<RefCell<SynList>>;
+/// R1.3a (specs/modelo-memoria-regiones.md): un objeto propio del montón (cabecera de 8 B, puede ser
+/// inmortal), con la misma forma de uso que `Rc<RefCell<SynList>>`.
+pub type ListRef = synsema_heap::Shared<SynList>;
 pub use crate::synlist::SynList;
 use crate::synlist::{list_read, list_values};
 pub use crate::synmap::{Key, MapObj, MapRef, SynMap};
@@ -479,11 +481,11 @@ pub fn syn_nothing() -> SynValue {
     SynValue::Nothing
 }
 pub fn syn_list(items: Vec<SynValue>) -> SynValue {
-    SynValue::List(Rc::new(RefCell::new(SynList::from(items))))
+    SynValue::List(synsema_heap::Shared::new(SynList::from(items)))
 }
 /// F4.8e: una lista con este cuerpo (sin caja si lo es).
 pub fn syn_list_of(items: SynList) -> SynValue {
-    SynValue::List(Rc::new(RefCell::new(items)))
+    SynValue::List(synsema_heap::Shared::new(items))
 }
 pub fn syn_map(m: SynMap) -> SynValue {
     SynValue::Map(m.into_ref())

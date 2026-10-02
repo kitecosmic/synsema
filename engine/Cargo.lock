@@ -5140,6 +5140,7 @@ dependencies = [
  "sha2 0.10.9",
  "smallvec",
  "subtle",
+ "synsema-heap",
  "synsema-text",
  "zeroize",
 ]

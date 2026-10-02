@@ -609,7 +609,7 @@ pub fn path_set(parent: &SynValue, idx_tag: i64, idx_bits: i64, idx: Option<&Syn
 /// `AppendInPlace`: si el primer argumento es la lista que tiene la raíz (la misma lista: se compara
 /// antes, con los dos prestados), la raíz única (`make_unique`) y `push(item)`.
 pub fn same_list(a: &SynValue, b: &SynValue) -> bool {
-    matches!((a, b), (SynValue::List(x), SynValue::List(y)) if std::rc::Rc::ptr_eq(x, y))
+    matches!((a, b), (SynValue::List(x), SynValue::List(y)) if crate::types::ListRef::ptr_eq(x, y))
 }
 
 /// Ver `same_list`: la raíz es una lista.

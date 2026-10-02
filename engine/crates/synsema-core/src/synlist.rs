@@ -5,7 +5,7 @@
 //! el código genérico) pide `list_values`, que la pasa a valores para siempre. Lo observable es lo
 //! mismo en las tres: el orden, la igualdad, el texto, el copy-on-write (lo hace el `Rc`).
 
-use std::cell::{Ref, RefMut};
+use synsema_heap::{Ref, RefMut};
 use std::fmt;
 
 use crate::number::Number;

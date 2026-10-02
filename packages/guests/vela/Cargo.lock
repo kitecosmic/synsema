@@ -2626,9 +2626,14 @@ dependencies = [
  "sha2",
  "smallvec",
  "subtle",
+ "synsema-heap",
  "synsema-text",
  "zeroize",
 ]
+
+[[package]]
+name = "synsema-heap"
+version = "0.1.0"
 
 [[package]]
 name = "synsema-stdlib"

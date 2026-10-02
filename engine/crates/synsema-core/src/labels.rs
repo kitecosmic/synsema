@@ -514,7 +514,7 @@ pub fn mark_owned(v: &SynValue, label: Label) -> SynValue {
 /// un alias escribible y la copia de `mark_owned` se saltea (M5: era ~4,5× más lento).
 fn is_aliased(v: &SynValue) -> bool {
     match v {
-        SynValue::List(l) => Rc::strong_count(l) > 1 || list_values(&l).iter().any(is_aliased),
+        SynValue::List(l) => crate::types::ListRef::strong_count(l) > 1 || list_values(&l).iter().any(is_aliased),
         SynValue::Map(m) => Rc::strong_count(m) > 1 || m.borrow().values().any(is_aliased),
         SynValue::Private(p) => is_aliased(&p.value),
         // Los valores del servidor llevan `Rc`/`Box` opacos: conservador.
@@ -803,7 +803,7 @@ mod tests {
         // Un contenedor limpio se comparte, no se copia.
         let clean = syn_list(vec![syn_int(1)]);
         match (&clean, &strip_deep(&clean)) {
-            (SynValue::List(a), SynValue::List(b)) => assert!(Rc::ptr_eq(a, b)),
+            (SynValue::List(a), SynValue::List(b)) => assert!(crate::types::ListRef::ptr_eq(a, b)),
             _ => panic!(),
         }
     }
