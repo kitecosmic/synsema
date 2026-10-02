@@ -27,6 +27,7 @@ const ALLOWED: &[&str] = &[
     "engine/crates/synsema-core/tests/alloc_counts.rs",
     "engine/crates/synsema-jit/tests/alloc_native.rs",
     "engine/crates/synsema-stdlib/tests/agentic_hub.rs",
+    "engine/crates/synsema-runtime/tests/module_envs_freed.rs",
 ];
 
 fn repo_root() -> PathBuf {

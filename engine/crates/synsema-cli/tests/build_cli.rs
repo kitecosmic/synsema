@@ -79,12 +79,20 @@ fn exe_name(base: &str) -> String {
 }
 
 fn run(cmd: &PathBuf, dir: &PathBuf, args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(cmd)
-        .args(args)
-        .current_dir(dir)
-        .env("SYNSEMA_NO_UPDATE_CHECK", "1")
-        .output()
-        .expect("spawn");
+    // Linux: un ejecutable recién escrito puede dar "Text file busy" (ETXTBSY) si otro test, en
+    // otro hilo, lanzó un proceso justo mientras el archivo estaba abierto para escribir (el hijo
+    // hereda ese descriptor un instante). Es una carrera de los tests en paralelo, no del binario:
+    // se reintenta.
+    let mut tries = 0;
+    let out = loop {
+        match Command::new(cmd).args(args).current_dir(dir).env("SYNSEMA_NO_UPDATE_CHECK", "1").output() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 50 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            r => break r.expect("spawn"),
+        }
+    };
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).into_owned(),

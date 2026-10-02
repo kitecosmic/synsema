@@ -76,11 +76,14 @@ enum Outcome {
 }
 
 fn run(runner: &Path, file: &Path, reference: bool) -> Outcome {
-    run_with(runner, file, reference, false, false)
+    run_with(runner, file, reference, false, false, false)
 }
 
-fn run_with(runner: &Path, file: &Path, reference: bool, resolver_check: bool, jit_eager: bool) -> Outcome {
+fn run_with(runner: &Path, file: &Path, reference: bool, resolver_check: bool, jit_eager: bool, request: bool) -> Outcome {
     let mut cmd = Command::new(runner);
+    if request {
+        cmd.arg("--request");
+    }
     if reference {
         cmd.arg("--reference");
     }
@@ -174,6 +177,9 @@ struct Tally {
     /// F4.2: entradas a bucles a mitad de camino (OSR) y programas donde pasó.
     native_osr: u64,
     osr_programs: u64,
+    /// v0.6.39: el corpus como cuerpos de rutas de `serve` (referencia contra VM/nativo).
+    request_compared: u64,
+    request_osr_programs: u64,
 }
 
 #[test]
@@ -211,7 +217,7 @@ fn shortcuts_match_the_reference_interpreter() {
                     continue;
                 }
                 let fast = run(&runner, &file, false);
-                let mut native = run_with(&runner, &file, false, false, true);
+                let mut native = run_with(&runner, &file, false, false, true, false);
                 if let Outcome::Done(v) = &mut native {
                     if let Some(n) = v.as_object_mut().and_then(|o| o.remove("native")) {
                         let mut t = tally.lock().unwrap();
@@ -228,7 +234,7 @@ fn shortcuts_match_the_reference_interpreter() {
                         }
                     }
                 }
-                let mut second = run_with(&runner, &file, true, true, false);
+                let mut second = run_with(&runner, &file, true, true, false, false);
                 let resolver = match &mut second {
                     Outcome::Done(v) => v.as_object_mut().and_then(|o| o.remove("resolver")),
                     _ => None,
@@ -252,6 +258,25 @@ fn shortcuts_match_the_reference_interpreter() {
                 }
                 if native != first {
                     t.mismatches.push(format!("{} (nativo ansioso): {}", rel, describe(&first, &native)));
+                }
+                drop(t);
+                // El mismo programa como el cuerpo de una ruta de `serve`: referencia contra VM con
+                // el nivel nativo ansioso (desde v0.6.39 los handlers corren en la VM).
+                let req_ref = run_with(&runner, &file, true, false, false, true);
+                let mut req_native = run_with(&runner, &file, false, false, true, true);
+                if let Outcome::Done(v) = &mut req_native {
+                    if let Some(n) = v.as_object_mut().and_then(|o| o.remove("native")) {
+                        if n["osr"].as_u64().unwrap_or(0) > 0 {
+                            tally.lock().unwrap().request_osr_programs += 1;
+                        }
+                    }
+                }
+                if req_ref != Outcome::Timeout {
+                    let mut t = tally.lock().unwrap();
+                    t.request_compared += 1;
+                    if req_native != req_ref {
+                        t.mismatches.push(format!("{} (como ruta de serve): {}", rel, describe(&req_ref, &req_native)));
+                    }
                 }
             });
         }
@@ -279,7 +304,12 @@ fn shortcuts_match_the_reference_interpreter() {
         "nativo (ansioso): {} programas entraron, {} unidades, {} entradas, {} salidas a la VM; bucles (OSR): {} entradas en {} programas",
         t.native_programs, t.native_units, t.native_entries, t.native_deopts, t.native_osr, t.osr_programs
     );
+    eprintln!(
+        "como ruta de serve: {} programas comparados, bucles nativos (OSR) en {}",
+        t.request_compared, t.request_osr_programs
+    );
     // Que el "0 diferencias" del nivel nativo sea de código nativo de verdad.
+    assert!(t.request_osr_programs >= 5, "los bucles de los handlers casi no corrieron en nativo: {} programas", t.request_osr_programs);
     assert!(t.native_programs >= 5 && t.native_deopts > 0, "el nivel nativo casi no corrió en el oráculo: {} programas", t.native_programs);
     assert!(t.osr_programs >= 5, "los bucles nativos (OSR) casi no corrieron en el oráculo: {} programas", t.osr_programs);
     assert!(

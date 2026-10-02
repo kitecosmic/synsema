@@ -687,7 +687,7 @@ struct LoopHost<'a> {
     base: usize,
     lbase: usize,
     iter_base: usize,
-    slots: &'a [usize],
+    slots: &'a [GSlot],
     /// El error de una llamada ajena (el código nativo sale sin valores).
     fail: Option<Control>,
     /// La salida del bucle, si un `stop` la cortó.
@@ -697,12 +697,9 @@ struct LoopHost<'a> {
 impl NativeHost for LoopHost<'_> {
     fn exec(&mut self, pc: u32, args: &[Option<SynValue>], globals: &[Option<SynValue>], steps: &mut u64) -> HostOut {
         let at = pc as usize;
-        {
-            let mut e = self.env.borrow_mut();
-            for (g, v) in globals.iter().enumerate() {
-                if let (Some(v), Some(k)) = (v, self.slots.get(g)) {
-                    e.bindings.slot_set(*k, v.clone());
-                }
+        for (g, v) in globals.iter().enumerate() {
+            if let (Some(v), Some(s)) = (v, self.slots.get(g)) {
+                s.env.borrow_mut().bindings.slot_set(s.k, v.clone());
             }
         }
         if let Ins::Call { args: a, .. } | Ins::CallNative { args: a, .. } | Ins::CallBuiltin { args: a, .. } = self.chunk.code[at].get() {
@@ -743,8 +740,11 @@ impl NativeHost for LoopHost<'_> {
                 None => NPeek { tag: native_tier::TAG_HOLE, bits: 0, ptr: std::ptr::null() },
             },
             Place::Global(g) => {
-                let mut e = self.env.borrow_mut();
-                match self.slots.get(g as usize).and_then(|k| e.bindings.slot_mut(*k)) {
+                let Some(s) = self.slots.get(g as usize) else {
+                    return NPeek { tag: native_tier::TAG_HOLE, bits: 0, ptr: std::ptr::null() };
+                };
+                let mut e = s.env.borrow_mut();
+                match e.bindings.slot_mut(s.k) {
                     Some(v) => native_tier::peek_mut(v),
                     None => NPeek { tag: native_tier::TAG_HOLE, bits: 0, ptr: std::ptr::null() },
                 }
@@ -769,20 +769,46 @@ impl NativeHost for LoopHost<'_> {
             }
             Place::Local(k) => std::ptr::from_mut(self.interp.vm_locals[self.lbase + k as usize].insert(v)).cast_const(),
             Place::Global(g) => {
-                let mut e = self.env.borrow_mut();
-                let k = self.slots[g as usize];
-                e.bindings.slot_set(k, v);
-                e.bindings.slot_mut(k).map_or(std::ptr::null(), |s| std::ptr::from_mut(s).cast_const())
+                let s = &self.slots[g as usize];
+                let mut e = s.env.borrow_mut();
+                e.bindings.slot_set(s.k, v);
+                e.bindings.slot_mut(s.k).map_or(std::ptr::null(), |p| std::ptr::from_mut(p).cast_const())
             }
             Place::Iter(..) => std::ptr::null(),
         }
     }
 }
 
+/// Dónde vive una global de un bucle nativo: el entorno que tiene el nombre (el del bucle o uno de
+/// afuera: en el cuerpo de una ruta de `serve`, el global) y su slot ahí.
+pub(crate) struct GSlot {
+    env: Rc<RefCell<Environment>>,
+    k: usize,
+}
+
+/// La global `nm` que el bucle se compiló encontrando `depth` entornos arriba: tiene que seguir ahí
+/// y ningún entorno más cercano puede haber ganado ese nombre (la VM lo encontraría antes).
+fn gslot(env: &Rc<RefCell<Environment>>, nm: &str, depth: u16) -> Option<GSlot> {
+    let mut cur = env.clone();
+    for _ in 0..depth {
+        let next = {
+            let e = cur.borrow();
+            if e.bindings.find(nm).is_some() {
+                return None;
+            }
+            e.parent.clone()
+        };
+        cur = next?;
+    }
+    let k = cur.borrow().bindings.find(nm)?;
+    Some(GSlot { env: cur, k })
+}
+
 /// Un bucle compilado (F4.2): la unidad y los nombres de sus globales.
 pub(crate) struct LoopUnit {
     unit: NativeUnit,
-    globals: Vec<Arc<str>>,
+    /// Sus globales: el nombre y cuántos entornos arriba del bucle vive (ver `GSlot`).
+    globals: Vec<(Arc<str>, u16)>,
     /// Si el código escribe alguna global (entonces el entorno no puede ser un módulo, que
     /// sincroniza su mapa de exportaciones).
     writes: bool,
@@ -825,11 +851,35 @@ const MIN_WORK: u64 = 1000;
 /// salida prevista; lo de adentro que todavía no se compila, una salida del cuerpo. `None` si no
 /// se puede armar.
 #[allow(clippy::type_complexity)]
-fn view_loop(c: &Chunk, env: &Rc<RefCell<Environment>>, head: usize, back: usize, b: &mut Build) -> Option<(Vec<NIns>, Vec<Arc<str>>, bool)> {
-    let mut globals: Vec<Arc<str>> = Vec::new();
+fn view_loop(c: &Chunk, env: &Rc<RefCell<Environment>>, head: usize, back: usize, b: &mut Build) -> Option<(Vec<NIns>, Vec<(Arc<str>, u16)>, bool)> {
+    let mut globals: Vec<(Arc<str>, u16)> = Vec::new();
     let mut written: Vec<Arc<str>> = Vec::new();
-    // Lo que tiene el entorno del bucle, sin mirar afuera: `Some(None)` = el nombre, con un hueco.
-    let own = |nm: &str| -> Option<Option<SynValue>> {
+    // Dónde encuentra la VM un nombre: el primer entorno que lo tiene, subiendo desde el del bucle
+    // (`LoadGlobal`/`SetGlobal` miran el propio y después `load_free`/`set_free`). En el cuerpo de una
+    // ruta de `serve` las globales del programa están un nivel arriba del bucle. Cuántos niveles, si
+    // es un módulo, y su valor (`None` = el nombre, con un hueco).
+    let home = |nm: &str| -> Option<(u16, bool, Option<SynValue>)> {
+        let mut cur = env.clone();
+        let mut d: u16 = 0;
+        loop {
+            let next = {
+                let e = cur.borrow();
+                if let Some(k) = e.bindings.find(nm) {
+                    return Some((d, e.name.starts_with("module:"), e.bindings.slot(k).cloned()));
+                }
+                e.parent.clone()
+            };
+            cur = next?;
+            d = d.checked_add(1)?;
+        }
+    };
+    // Lo que se lee, donde esté; lo que se escribe, no en un módulo (sincroniza su mapa de
+    // exportaciones por el camino de `SetName`).
+    let own = |nm: &str| home(nm).map(|(_, _, v)| v);
+    let own_w = |nm: &str| home(nm).and_then(|(_, m, v)| (!m).then_some(v));
+    let depth = |nm: &str| home(nm).map_or(0, |(d, _, _)| d);
+    // `let` crea la variable en el entorno del bucle: sólo ése.
+    let here = |nm: &str| -> Option<Option<SynValue>> {
         let e = env.borrow();
         let k = e.bindings.find(nm)?;
         Some(e.bindings.slot(k).cloned())
@@ -842,10 +892,10 @@ fn view_loop(c: &Chunk, env: &Rc<RefCell<Environment>>, head: usize, back: usize
             continue;
         }
         let mut global = |nm: &Arc<str>| -> u16 {
-            match globals.iter().position(|g| **g == **nm) {
+            match globals.iter().position(|(g, _)| **g == **nm) {
                 Some(i) => i as u16,
                 None => {
-                    globals.push(nm.clone());
+                    globals.push((nm.clone(), depth(nm)));
                     (globals.len() - 1) as u16
                 }
             }
@@ -860,9 +910,14 @@ fn view_loop(c: &Chunk, env: &Rc<RefCell<Environment>>, head: usize, back: usize
                     Some(_) => Some(NIns::Move { dst, src: NOpnd::Global(global(nm)) }),
                 }
             }
-            Ins::SetGlobal { src, name, dst, .. } | Ins::LetName { src, name, dst } if !module => {
+            Ins::SetGlobal { src, name, dst, .. } | Ins::LetName { src, name, dst } => {
                 let nm = &c.names[name as usize];
-                match (own(nm), nopnd(c, src)) {
+                let place = match c.code[pc].get() {
+                    Ins::LetName { .. } if !module => here(nm),
+                    Ins::LetName { .. } => None,
+                    _ => own_w(nm),
+                };
+                match (place, nopnd(c, src)) {
                     (Some(v), Some(src)) if !matches!(v, Some(SynValue::Task(_))) => {
                         written.push(nm.clone());
                         let g = global(nm);
@@ -877,7 +932,7 @@ fn view_loop(c: &Chunk, env: &Rc<RefCell<Environment>>, head: usize, back: usize
             }
             // F4.8d: `set <camino> to v` y `set P to append(P, e)` sobre una variable del bucle (una
             // global de su entorno, que no sea de un módulo, o una de la ventana).
-            Ins::PathRoot { c: cr, desc } => match loop_root(c, c.paths[desc as usize].root, &own, module) {
+            Ins::PathRoot { c: cr, desc } => match loop_root(c, c.paths[desc as usize].root, &own_w, module) {
                 Some(Ok(nm)) => {
                     written.push(nm.clone());
                     Some(NIns::PathRoot { c: cr, root: NOpnd::Global(global(&nm)) })
@@ -885,7 +940,7 @@ fn view_loop(c: &Chunk, env: &Rc<RefCell<Environment>>, head: usize, back: usize
                 Some(Err(k)) => Some(NIns::PathRoot { c: cr, root: NOpnd::Local(k) }),
                 None => None,
             },
-            Ins::AppendInPlace { dst, func, args, site } => match c.sites[site as usize].append.and_then(|r| loop_root(c, r, &own, module)) {
+            Ins::AppendInPlace { dst, func, args, site } => match c.sites[site as usize].append.and_then(|r| loop_root(c, r, &own_w, module)) {
                 Some(Ok(nm)) => {
                     written.push(nm.clone());
                     Some(NIns::AppendPush { dst, func, args, root: NOpnd::Global(global(&nm)) })
@@ -1294,7 +1349,7 @@ impl Interpreter {
         // Lo que el bucle tenía en registros vuelve a la VM (las globales, a su lugar del entorno; los
         // iteradores, a su lugar de la pila).
         let lbase = self.vm_lbase;
-        self.vm_put_values(&lu.unit, f0.values, base, lbase, iter_base, Some((env, &slots)));
+        self.vm_put_values(&lu.unit, f0.values, base, lbase, iter_base, Some(&slots));
         match f0.call {
             Some(c) => {
                 let r = self.vm_native_resume(&lu.unit, rest, base + c.args as usize, c.n as usize);
@@ -1323,12 +1378,10 @@ impl Interpreter {
         for k in 0..chunk.nlocals as usize {
             init.push(seen(self.vm_locals[self.vm_lbase + k].as_ref()));
         }
-        {
-            let e = env.borrow();
-            for g in &globals {
-                let k = e.bindings.find(g)?;
-                init.push(seen(e.bindings.slot(k)));
-            }
+        for (g, d) in &globals {
+            let s = gslot(env, g, *d)?;
+            let e = s.env.borrow();
+            init.push(seen(e.bindings.slot(s.k)));
         }
         let niters = chunk_iters(chunk);
         for it in 0..niters as usize {
@@ -1360,15 +1413,28 @@ impl Interpreter {
     /// tenía al compilar (nunca un valor con caja: sus cuentas de referencias no se tocan), las
     /// globales están en el entorno y las tasks siguen siendo esas. Los valores de entrada y el
     /// slot de cada global.
-    fn vm_osr_args(&mut self, lu: &LoopUnit, env: &Rc<RefCell<Environment>>, base: usize, iter_base: usize) -> Option<(SmallVec<[i64; 16]>, SmallVec<[usize; 8]>)> {
-        let mut e = env.borrow_mut();
-        if lu.writes && e.name.starts_with("module:") {
+    fn vm_osr_args(&mut self, lu: &LoopUnit, env: &Rc<RefCell<Environment>>, base: usize, iter_base: usize) -> Option<(SmallVec<[i64; 16]>, SmallVec<[GSlot; 8]>)> {
+        if lu.writes && env.borrow().name.starts_with("module:") {
             return None;
         }
-        let mut slots: SmallVec<[usize; 8]> = SmallVec::new();
-        for g in &lu.globals {
-            slots.push(e.bindings.find(g)?);
+        let mut slots: SmallVec<[GSlot; 8]> = SmallVec::new();
+        for (g, d) in &lu.globals {
+            slots.push(gslot(env, g, *d)?);
         }
+        // Los entornos de esas globales, prestados a la vez (el del bucle y los de afuera).
+        let mut envs: SmallVec<[Rc<RefCell<Environment>>; 2]> = SmallVec::new();
+        let mut which: SmallVec<[usize; 8]> = SmallVec::new();
+        for s in &slots {
+            let i = match envs.iter().position(|e| Rc::ptr_eq(e, &s.env)) {
+                Some(i) => i,
+                None => {
+                    envs.push(s.env.clone());
+                    envs.len() - 1
+                }
+            };
+            which.push(i);
+        }
+        let mut guards: SmallVec<[std::cell::RefMut<'_, Environment>; 2]> = envs.iter().map(|e| e.borrow_mut()).collect();
         let mut args: SmallVec<[i64; 16]> = SmallVec::new();
         for &(place, want) in lu.unit.code.inputs() {
             if let Place::Iter(it, k) = place {
@@ -1383,7 +1449,7 @@ impl Interpreter {
             let v = match place {
                 Place::Reg(r) => Some(&mut self.vm_regs[base + r as usize]),
                 Place::Local(k) => self.vm_locals[self.vm_lbase + k as usize].as_mut(),
-                Place::Global(g) => e.bindings.slot_mut(slots[g as usize]),
+                Place::Global(g) => guards[which[g as usize]].bindings.slot_mut(slots[g as usize].k),
                 Place::Iter(..) => unreachable!("iterador"),
             };
             if seen(v.as_deref()) != want {
@@ -1404,12 +1470,12 @@ impl Interpreter {
             let p = match place {
                 Place::Reg(r) => std::ptr::from_mut(&mut self.vm_regs[base + r as usize]) as usize as i64,
                 Place::Local(k) => std::ptr::from_mut(&mut self.vm_locals[self.vm_lbase + k as usize]) as usize as i64,
-                Place::Global(g) => std::ptr::from_mut(e.bindings.slot_mut(slots[g as usize])?) as usize as i64,
+                Place::Global(g) => std::ptr::from_mut(guards[which[g as usize]].bindings.slot_mut(slots[g as usize].k)?) as usize as i64,
                 Place::Iter(..) => return None,
             };
             args.push(p);
         }
-        drop(e);
+        drop(guards);
         if !lu.unit.deps_hold(Some(env)) {
             return None;
         }
@@ -1426,7 +1492,7 @@ impl Interpreter {
         rbase: usize,
         lbase: usize,
         ib: usize,
-        globals: Option<(&Rc<RefCell<Environment>>, &[usize])>,
+        globals: Option<&[GSlot]>,
     ) {
         let mut iters: SmallVec<[(u16, [i64; 4], bool, Option<ListRef>); 4]> = SmallVec::new();
         for (place, v) in values {
@@ -1440,8 +1506,8 @@ impl Interpreter {
                 Place::Global(g) => {
                     // Una global vacía el código nativo no la escribió (un `set` a un hueco sale antes).
                     if !matches!(v, NVal::Hole) {
-                        let (env, slots) = globals.expect("global fuera de un bucle");
-                        env.borrow_mut().bindings.slot_set(slots[g as usize], Self::nval_to_syn(unit, v));
+                        let s = &globals.expect("global fuera de un bucle")[g as usize];
+                        s.env.borrow_mut().bindings.slot_set(s.k, Self::nval_to_syn(unit, v));
                     }
                 }
                 Place::Iter(it, k) => {

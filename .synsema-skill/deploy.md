@@ -88,7 +88,9 @@ see [secrets.md](secrets.md). Resolution: **process environment → `.env` file 
   `#cores`, min 2). Raise it for I/O-bound handlers (more concurrent requests, more
   RAM); it is read **once, from the process environment** (systemd `Environment=`,
   `docker -e`, shell export — **not** `.env`, which only feeds `env()`/`secret()`)
-  before the first server starts.
+  before the first server starts. Each worker holds its own copy of the top-level globals
+  (built on its first request), so RAM ≈ globals × workers: with large in-memory data keep N
+  low or move the data to a database (serve.md § Performance and memory of a server).
 - **Server runtime knobs (all process environment, not `.env`; `synsema init` lists
   them commented in `.env.example` with that warning):**
 

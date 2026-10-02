@@ -1,0 +1,6 @@
+-- Fixture de module_envs_freed.rs: un módulo con datos y tasks (como un lib/ de una app grande).
+let tabla be apply(range(0, 3000), (i) => {"id": i, "name": "n" + text(i), "tags": ["a", "b"]})
+export task todos()
+    give range(0, 4)
+export task salud(w)
+    give {"w": w, "n": length(tabla)}

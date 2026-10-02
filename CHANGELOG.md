@@ -6,6 +6,45 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.39 — 2026-10-01
+
+`serve`: route bodies run on the VM and the native tier, and every request starts from the program's
+own globals. Programs give the same results, errors and `steps()`; the one behaviour that changes is
+a bug fix (below).
+
+**Faster handlers.** A route body used to run on the reference interpreter; now it runs like
+`synsema run`: on the bytecode VM, with its hot loops in native code (reading the program's globals
+from inside the loop stays native). A 1-million-iteration loop written in a handler: **~0.3 s →
+~5 ms per request**. With `--labels` or `serve --attested`, route bodies still run on the reference
+interpreter, like any program under labels.
+
+**Each request starts from the program's globals (behaviour change).** `serve.md` always said that a
+`set` of a global inside a handler does not reach the next request, but up to v0.6.38 such a write
+could stay in the worker that served the request — the same `GET` answered differently depending
+on which worker took it. From v0.6.39 every request starts from the values the program set up, for
+every kind of write: a path (`set rows[0].name to …`), an in-place `append`, a scalar, a write from a
+task the handler calls, and a module's own variables. **What to write instead**, if a program relied
+on it: what must outlive a request goes in `state_*`, a database or the memory. The originals are
+kept as shared references (nothing is copied); a write during a request copies first
+(copy-on-write), so the next request still sees the originals.
+
+**Memory per worker, documented.** Each worker builds its own copy of the top-level globals on its
+first request, so RAM is about the size of the globals × the workers (1 M small records in a global
+≈ 160–190 MB per worker). With large data in globals keep `SYNSEMA_SERVE_WORKERS` low or keep the
+data in a database (`deploy.md`, `serve.md` § Performance and memory of a server).
+
+**Memory leak in `parallel_map` and `spawn`, fixed.** Each `parallel_map` item and each spawned
+agent runs on an interpreter rebuilt from the program, imported modules included. A task of a module
+and the module's environment point at each other, and nothing broke that cycle when the interpreter
+ended: every item and every agent left the program's modules alive. A long-running program that
+calls `parallel_map` (from a `cron_every`, a handler, an agent) grew without bound — measured: a
+module with 20 000 records, ~22 MB more per call, never released. Now the modules an interpreter
+rebuilt are released with it: the same program stays flat (33 MB with 5 calls or with 20, nothing
+left alive at the end). Nothing to change in your programs.
+
+Also: a CLI test that writes an executable and runs it right away retries when Linux reports
+"Text file busy" (a race between tests running in parallel, not a bug in the binary).
+
 ## v0.6.38 — 2026-10-01
 
 Speed and memory, second step: the native tier runs code over data, lists of numbers take a third of

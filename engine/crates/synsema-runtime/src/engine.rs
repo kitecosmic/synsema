@@ -1174,7 +1174,11 @@ fn run_inner(
 
             // La persistencia es on-write (el ctx guarda tras cada mutación, como serve):
             // no hay save final que pueda perderse si el programa crashea a mitad.
-            let r = interp.execute(&program);
+            let r = if REQUEST_MODE.load(std::sync::atomic::Ordering::SeqCst) {
+                interp.run_request_block(&program.statements, Vec::new())
+            } else {
+                interp.execute(&program)
+            };
             note_run_steps(&interp);
             finish(interp, r)
         }
@@ -1210,6 +1214,16 @@ fn spawn_run_ceiled(source: &str, filename: &str, secure: bool, ceiling: Option<
             output: Vec::new(),
             errors: vec![abort_message(&p)],
         })
+}
+
+/// Sólo el oráculo diferencial (`oracle_run --request`): corre el programa entero como el cuerpo
+/// de una ruta de `serve` (`run_request_block`, en un scope hijo del global) en vez de como
+/// programa, para comparar ese camino entre la referencia y la VM/nativo. No es un knob de usuario.
+static REQUEST_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[doc(hidden)]
+pub fn set_request_mode(on: bool) {
+    REQUEST_MODE.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Modo no-secure (default real): auto-concede STDOUT y TIME. Lo que usa `conform`.
@@ -2066,7 +2080,9 @@ fn spawn_agent(
             interp.set_agent_context(&agent_name);
             // Restaurar tareas y valores del top-level para que el agente
             // los pueda llamar directamente sin necesitar HTTP.
-            rebuild_globals(&mut interp, &globals);
+            let registry = rebuild_globals(&mut interp, &globals);
+            // A cargo del intérprete del agente: se vacían cuando termina (ver `adopt_module_envs`).
+            interp.adopt_module_envs(registry.into_values());
             // Los spawn_args sobreescriben cualquier global con el mismo nombre.
             for (k, v) in &send_args {
                 interp.set_global(k, from_send(v));

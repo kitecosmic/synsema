@@ -1376,6 +1376,9 @@ pub struct Interpreter {
     /// exportados (un frame por módulo en carga; el frame base es el del
     /// entrypoint y nunca se cosecha → un `export` top-level del entrypoint se ignora).
     module_cache: HashMap<String, SynValue>,
+    /// Los entornos de módulo que el host reconstruyó para este intérprete (`parallel_map`, un
+    /// agente, un worker de `serve`: `adopt_module_envs`). Son suyos: el `Drop` los vacía.
+    owned_module_envs: Vec<Rc<RefCell<Environment>>>,
     loading_modules: HashSet<String>,
     exports_collector: Vec<Vec<String>>,
     /// Argumentos del programa (`args()`): lo que siguió al `--` en `synsema run`, o
@@ -1407,6 +1410,11 @@ pub struct Interpreter {
     /// El chunk del último programa que corrió la VM (para `explain_after_run`: su código queda
     /// como lo dejó el quickening).
     vm_last_program: Option<Rc<vm::Chunk>>,
+    /// Los cuerpos de las rutas de `serve` ya compilados por la VM, en este intérprete (uno por
+    /// worker): cada request de una ruta corre el mismo chunk, así que lo especializado y lo
+    /// nativo de una request sirve para las siguientes. Clave: dirección y largo del cuerpo; el
+    /// valor guarda una copia del cuerpo y sólo se reusa si es igual (ver `vm::request_chunk`).
+    vm_request_chunks: HashMap<(usize, usize), (Vec<Node>, Rc<vm::Chunk>)>,
     /// v0.6.20 — raíz del proyecto: el directorio del archivo de ENTRADA, límite de contención
     /// de `use "../x.syn"`. La fija el host (`set_project_root`) o, si no, se captura del primer
     /// `use` que se ejecuta (siempre el top-level de la entrada). `None` = criterio v0.6.19
@@ -1548,6 +1556,24 @@ impl Drop for Interpreter {
         if let Ok(mut env) = self.global_env.try_borrow_mut() {
             env.bindings.clear();
         }
+        // El mismo ciclo en cada entorno de módulo: sus tasks cierran sobre él y él las tiene en
+        // sus bindings. Los que cargó `use` (en `module_cache`) y los que el host reconstruyó desde
+        // una foto (`adopt_module_envs`): sin esto, cada item de `parallel_map` y cada agente
+        // dejaban vivo el programa entero (lampson: ~26 MB por llamada, v0.6.38).
+        let mut envs: Vec<Rc<RefCell<Environment>>> = self
+            .module_cache
+            .values()
+            .filter_map(|v| match v {
+                SynValue::Map(m) => module_env_of_map(m),
+                _ => None,
+            })
+            .collect();
+        envs.append(&mut self.owned_module_envs);
+        for env in envs {
+            if let Ok(mut e) = env.try_borrow_mut() {
+                e.bindings.clear();
+            }
+        }
     }
 }
 
@@ -1675,6 +1701,7 @@ impl Interpreter {
             stream_emit: None,
             log_hook: None,
             module_cache: HashMap::new(),
+            owned_module_envs: Vec::new(),
             loading_modules: HashSet::new(),
             exports_collector: vec![Vec::new()],
             live_output: false,
@@ -1689,6 +1716,7 @@ impl Interpreter {
             vm_locals: Vec::new(),
             vm_lbase: 0,
             vm_last_program: None,
+            vm_request_chunks: HashMap::new(),
             project_root: None,
             stdout_hook: None,
             stdout_verdict: None,
@@ -2993,6 +3021,18 @@ impl Interpreter {
         self.intent.as_deref()
     }
 
+    /// El host le entrega a este intérprete los entornos de módulo que reconstruyó para él (desde
+    /// la foto de un `parallel_map`, un agente o un worker de `serve`). Quedan a su cargo: al morir
+    /// el intérprete se vacían, como el global, para cortar el ciclo entre cada task del módulo y su
+    /// entorno. Sólo los que no comparte con nadie que lo sobreviva.
+    pub fn adopt_module_envs(&mut self, envs: impl IntoIterator<Item = Rc<RefCell<Environment>>>) {
+        for e in envs {
+            if !self.owned_module_envs.iter().any(|x| Rc::ptr_eq(x, &e)) {
+                self.owned_module_envs.push(e);
+            }
+        }
+    }
+
     /// Bindea una variable en el entorno global (para los spawn_args de un agente).
     pub fn set_global(&self, name: &str, value: SynValue) {
         self.harvest_principals(&value);
@@ -3080,7 +3120,14 @@ impl Interpreter {
             }
         }
         let saved_taint = self.take_taint();
-        let result = self.exec_block(stmts, &env);
+        // El cuerpo de la ruta por la VM (y el nivel nativo), con la misma condición que el
+        // programa: atajos y sin etiquetas. Con etiquetas (`--labels`, `serve --attested`), el
+        // tree-walker. Hasta v0.6.38 los handlers corrían siempre en el tree-walker.
+        let result = if self.shortcuts && !self.labels && !stmts.is_empty() {
+            self.run_request_chunk(stmts, &env)
+        } else {
+            self.exec_block(stmts, &env)
+        };
         self.restore_taint(saved_taint);
         // Rompe cualquier ciclo Rc creado en el scope del request: si el handler hace
         // `define task` dentro del body, la task cierra sobre `env` (`closure_env`) y el

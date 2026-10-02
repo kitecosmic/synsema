@@ -1,0 +1,7 @@
+-- Fixture de serve_isolation.rs: un módulo con estado propio que una task del módulo modifica.
+let hits be 0
+let seen be []
+export task bump(x)
+    set hits to hits + 1
+    set seen to append(seen, x)
+    give {"hits": hits, "seen": length(seen)}

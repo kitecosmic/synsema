@@ -249,6 +249,9 @@ fn run_parallel(
                 let (mut interp, mut registry, _subject_scope) =
                     build_worker_interp(&globals, &granted, &denied, secure, &ceiling, &mem, &bus, &subject);
                 let task_value = reconstruct_task(&interp, &task_snap, &mut registry);
+                // Los entornos de módulo de este item quedan a cargo de su intérprete: se vacían
+                // cuando muere (si no, cada item dejaba vivo el programa entero: la fuga de lampson).
+                interp.adopt_module_envs(registry.values().cloned());
                 let item = from_send(&items[i]);
                 let keep = item.clone();
                 match interp.call_task(task_value, vec![item]) {
