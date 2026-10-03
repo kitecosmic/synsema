@@ -360,8 +360,11 @@ pub fn csv_parse(args: &[SynValue]) -> Result<SynValue, Control> {
             // Lista de mapas: primera fila = cabeceras (misma forma que devuelve sql()).
             seen_header = true;
             header_row = rec.iter().map(|f| f.text.to_string()).collect();
-            for (i, h) in header_row.iter().enumerate() {
-                if header_row[..i].contains(h) {
+            // Con un conjunto (antes, cada cabecera contra las anteriores: cuadrático en la cantidad
+            // de columnas, y la cabecera viene del archivo). Sale la misma: la primera que se repite.
+            let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::with_capacity(header_row.len());
+            for h in header_row.iter() {
+                if !seen_names.insert(h.as_str()) {
                     other_err = Some(err(format!(
                         "csv_parse: duplicate header {:?} on line 1; headers must be unique to build maps (use {{\"headers\": false}} for positional rows)",
                         h
@@ -537,8 +540,6 @@ fn opt_headers_list(opts: &MapObj) -> Result<Option<Vec<String>>, Control> {
     }
 }
 
-/// Un campo a escribir: su texto, si es un texto vacío (que va entre comillas) y si vino de un
-/// texto (sólo el texto puede ser una fórmula: un número negativo `-5` no se toca).
 /// El aviso de `csv_encode` para una tabla de UNA columna con algún `nothing` y sin `missing`: ahí
 /// `nothing` se escribe `""` (una línea en blanco se ignoraría al leer) y vuelve como texto vacío.
 pub const ONE_COLUMN_NOTHING_WARNING: &str = "csv_encode: a one-column table writes nothing as \"\" (it reads back as empty text); pass {\"missing\": \"NA\"} and read it with {\"missing\": [\"NA\"]} for an exact round trip";

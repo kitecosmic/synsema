@@ -191,3 +191,39 @@ print(parquet_read(parquet_write(mine, {{"compression": "gzip"}})))"#,
     assert!(fails(r#"print(parquet_write([{"a": [1]}]))"#).contains("json_encode"));
     assert!(fails(r#"print(parquet_read(bytes("nope")))"#).contains("not a Parquet file"));
 }
+
+// La caché por forma de un sitio (`r.g`, las columnas de `group_by`/`summarize`/`join`, `csv_encode`)
+// con una tabla que alterna filas con forma y una fila en modo diccionario (más de 32 claves): cada
+// lectura y cada escritura es la de su clave. Antes, la posición del diccionario quedaba con la
+// forma anterior y la fila siguiente leía `v` en lugar de `g` (y `set r.g` escribía en `v`).
+#[test]
+fn shape_cache_with_a_dictionary_row_in_between() {
+    let src = r#"let big be {"v": 100, "g": "D"}
+let i be 0
+while i < 40
+    set big["k" + text(i)] to i
+    set i to i + 1
+let t1 be [{"g": "a", "v": 1}, big, {"g": "b", "v": 2}, {"g": "c", "v": 3}]
+let t be t1 + t1 + t1
+task marca(r)
+    set r.g to "X" + text(r.v)
+    give r.g + "/" + text(r.v)
+print(apply(t, (r) => r.g))
+print(apply(t, marca))
+print(group_by(t, "g") |> apply((x) => x.key))
+print(summarize(t, "g", {"s": sum_of("v")}) |> apply((x) => [x.g, x.s]))
+print(join(t1, [{"g": "b", "w": 1}, {"g": "c", "w": 2}], "g", "inner") |> apply((x) => [x.g, x.v, x.w]))
+print(apply(csv_parse(csv_encode(t, {"headers": ["g", "v"]})), (r) => r.g))"#;
+    let rep = |s: &str| format!("[{}, {}, {}]", s, s, s).replace("], [", ", ").replace("[[", "[").replace("]]", "]");
+    assert_eq!(
+        out(src),
+        vec![
+            rep(r#"["a", "D", "b", "c"]"#),
+            rep(r#"["X1/1", "X100/100", "X2/2", "X3/3"]"#),
+            r#"["a", "D", "b", "c"]"#.to_string(),
+            r#"[["a", 3], ["D", 300], ["b", 6], ["c", 9]]"#.to_string(),
+            r#"[["b", 2, 1], ["c", 3, 2]]"#.to_string(),
+            rep(r#"["a", "D", "b", "c"]"#),
+        ]
+    );
+}
