@@ -101,11 +101,46 @@ impl Column {
 /// (dos valores que `==` iguala caen juntos: `1`, `1.0`, `1d` y `true`; NaN con NaN) sin armar un
 /// texto en el caso común (texto, entero). Lo demás va por la clave canónica, con los enteros
 /// normalizados a `Int` para que un `1d` y un `1` no queden separados.
-#[derive(Hash, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(crate) enum GroupKey {
     Text(SynText),
     Int(i64),
     Canon(String),
+}
+
+/// El hash de una clave en UNA escritura al hasher (con `derive`: la variante, los bytes y el
+/// separador de `str`, tres pasadas por el búfer de SipHash por fila). Sigue siendo SipHash con la
+/// semilla aleatoria de `RandomState`: un servidor agrupa datos de terceros y un hash rápido sin esa
+/// garantía deja fabricar colisiones. La codificación es inyectiva y sin prefijos (etiqueta; un
+/// entero en 8 bytes; un texto con `0xff` al final, que no aparece en UTF-8), así que tampoco las
+/// claves de varias partes de un `join` se confunden sin importar la semilla. La igualdad la
+/// decide `Eq`.
+impl std::hash::Hash for GroupKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        let (tag, bytes): (u8, &[u8]) = match self {
+            GroupKey::Int(i) => {
+                let mut b = [1u8; 9];
+                b[1..].copy_from_slice(&i.to_le_bytes());
+                h.write(&b);
+                return;
+            }
+            GroupKey::Text(t) => (2, t.as_str().as_bytes()),
+            GroupKey::Canon(s) => (3, s.as_bytes()),
+        };
+        let mut b = [0u8; 32];
+        let n = bytes.len();
+        if n + 2 <= b.len() {
+            b[0] = tag;
+            b[1..=n].copy_from_slice(bytes);
+            b[n + 1] = 0xff;
+            h.write(&b[..n + 2]);
+        } else {
+            h.write_u8(tag);
+            h.write(bytes);
+            h.write_u8(0xff);
+        }
+    }
 }
 
 pub(crate) fn group_key(v: &SynValue) -> GroupKey {
@@ -128,10 +163,22 @@ pub(crate) fn group_key(v: &SynValue) -> GroupKey {
 }
 
 /// La clave de un `join`: una parte por columna de `on` (casi siempre una: sin vector).
-#[derive(Hash, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 enum JoinKey {
     One(GroupKey),
     Many(Vec<GroupKey>),
+}
+
+/// Las partes una tras otra: su codificación no tiene prefijos, así que la concatenación ya es
+/// inyectiva (y en una tabla todas las claves tienen la misma cantidad de partes).
+impl std::hash::Hash for JoinKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        match self {
+            JoinKey::One(k) => k.hash(h),
+            JoinKey::Many(ks) => ks.iter().for_each(|k| k.hash(h)),
+        }
+    }
 }
 
 /// ¿Puede `v` mezclar decimal y float (lo que revisa `NumMix`)? Un texto no: no hace falta revisarlo.
@@ -1225,6 +1272,81 @@ pub fn mode(args: &[SynValue]) -> Result<SynValue, Control> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Los bytes que una clave le da al hasher.
+    fn hashed_bytes(k: &JoinKey) -> Vec<u8> {
+        struct Rec(Vec<u8>);
+        impl std::hash::Hasher for Rec {
+            fn write(&mut self, b: &[u8]) {
+                self.0.extend_from_slice(b);
+            }
+            fn finish(&self) -> u64 {
+                0
+            }
+        }
+        let mut r = Rec(Vec::new());
+        std::hash::Hash::hash(k, &mut r);
+        r.0
+    }
+
+    /// Dos claves distintas nunca le dan los mismos bytes al hasher: si no, chocarían con
+    /// cualquier semilla y se podría fabricar una tabla con todas las filas en un balde. Con
+    /// textos que imitan etiquetas, enteros y separadores, en claves de una y de varias partes.
+    #[test]
+    fn key_hash_encoding_is_injective() {
+        let parts: Vec<GroupKey> = vec![
+            GroupKey::Text(SynText::from("")),
+            GroupKey::Text(SynText::from("a")),
+            GroupKey::Text(SynText::from("ab")),
+            GroupKey::Text(SynText::from("b")),
+            GroupKey::Text(SynText::from("\u{1}")),
+            GroupKey::Text(SynText::from("\u{2}a")),
+            GroupKey::Text(SynText::from("a\u{2}b")),
+            // ("a\u{2}b", "c") y ("a", "b\u{2}c") chocarían sin separador; con `\0` en su lugar,
+            // ("a\0\u{2}b", "c") y ("a", "b\0\u{2}c").
+            GroupKey::Text(SynText::from("c")),
+            GroupKey::Text(SynText::from("b\u{2}c")),
+            GroupKey::Text(SynText::from("a\u{0}\u{2}b")),
+            GroupKey::Text(SynText::from("b\u{0}\u{2}c")),
+            GroupKey::Text(SynText::from("\u{1}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}\u{0}")),
+            GroupKey::Text(SynText::from("x".repeat(29).as_str())),
+            GroupKey::Text(SynText::from("x".repeat(30).as_str())),
+            GroupKey::Text(SynText::from("x".repeat(31).as_str())),
+            GroupKey::Text(SynText::from("ñandú 😀")),
+            GroupKey::Int(0),
+            GroupKey::Int(1),
+            GroupKey::Int(-1),
+            GroupKey::Int(i64::MAX),
+            GroupKey::Int(0x6261),
+            GroupKey::Canon(String::new()),
+            GroupKey::Canon("a".to_string()),
+            GroupKey::Canon("n:1;".to_string()),
+        ];
+        let mut keys: Vec<(String, JoinKey)> = Vec::new();
+        for (i, p) in parts.iter().enumerate() {
+            keys.push((format!("one {}", i), JoinKey::One(clone_key(p))));
+            for (j, q) in parts.iter().enumerate() {
+                keys.push((format!("two {} {}", i, j), JoinKey::Many(vec![clone_key(p), clone_key(q)])));
+            }
+        }
+        let mut seen: std::collections::HashMap<Vec<u8>, &str> = std::collections::HashMap::new();
+        for (name, k) in &keys {
+            // Una y dos partes no conviven en una tabla (la cantidad la fija `on`): se comparan por separado.
+            let mut b = hashed_bytes(k);
+            b.insert(0, matches!(k, JoinKey::One(_)) as u8);
+            if let Some(prev) = seen.insert(b, name) {
+                panic!("{} y {} le dan los mismos bytes al hasher", prev, name);
+            }
+        }
+    }
+
+    fn clone_key(k: &GroupKey) -> GroupKey {
+        match k {
+            GroupKey::Text(t) => GroupKey::Text(t.clone()),
+            GroupKey::Int(i) => GroupKey::Int(*i),
+            GroupKey::Canon(s) => GroupKey::Canon(s.clone()),
+        }
+    }
 
     /// `group_key` iguala EXACTAMENTE lo que iguala `probe_key` (la clave de siempre): agrupar y
     /// emparejar no cambian, sólo dejan de armar un texto por fila.
