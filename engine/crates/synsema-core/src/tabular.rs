@@ -7,8 +7,10 @@
 //! los null de polars/SQL); NaN es un resultado inválido y se PROPAGA.
 
 use crate::synlist::{list_values};
+use crate::synmap::{MapIc, ShapeRef};
 use crate::types::{Key, MapObj, SynMap};
 use std::rc::Rc;
+use synsema_text::SynText;
 
 
 use crate::interpreter::{BuiltinTask, Control, Interpreter, RuntimeError};
@@ -60,6 +62,68 @@ fn row_get(row: &SynValue, col: &str, who: &str) -> Result<SynValue, Control> {
         SynValue::Map(m) => Ok(m.borrow().get(col).cloned().unwrap_or(SynValue::Nothing)),
         other => Err(err(format!("{}: every row must be a map, got {}", who, other.type_name()))),
     }
+}
+
+/// Una columna leída fila por fila: con la caché de forma de la VM (`MapIc`), las filas con la misma
+/// forma (las de un CSV, un `apply`, un `sql()`) se leen por posición, sin buscar la clave.
+struct Column {
+    name: String,
+    ic: MapIc,
+}
+
+impl Column {
+    fn new(name: &str) -> Column {
+        Column { name: name.to_string(), ic: MapIc::default() }
+    }
+
+    fn get(&self, row: &SynValue, who: &str) -> Result<SynValue, Control> {
+        match row {
+            SynValue::Map(m) => Ok(m.borrow().get_cached(&self.name, &self.ic).cloned().unwrap_or(SynValue::Nothing)),
+            other => Err(err(format!("{}: every row must be a map, got {}", who, other.type_name()))),
+        }
+    }
+}
+
+/// La clave de un grupo o de un emparejamiento para el hash: la misma igualdad que `probe_key`
+/// (dos valores que `==` iguala caen juntos: `1`, `1.0`, `1d` y `true`; NaN con NaN) sin armar un
+/// texto en el caso común (texto, entero). Lo demás va por la clave canónica, con los enteros
+/// normalizados a `Int` para que un `1d` y un `1` no queden separados.
+#[derive(Hash, PartialEq, Eq)]
+pub(crate) enum GroupKey {
+    Text(SynText),
+    Int(i64),
+    Canon(String),
+}
+
+pub(crate) fn group_key(v: &SynValue) -> GroupKey {
+    match crate::labels::unwrap(v) {
+        SynValue::Text(t) => GroupKey::Text(t.clone()),
+        SynValue::Number(Number::Int(i)) => GroupKey::Int(*i),
+        SynValue::Bool(b) => GroupKey::Int(*b as i64),
+        // Un float entero dentro de i64 es ese entero (`canon_number` lo escribe como `n:<entero>`).
+        SynValue::Number(Number::Float(x)) if x.fract() == 0.0 && *x >= -9223372036854775808.0 && *x < 9223372036854775808.0 => {
+            GroupKey::Int(*x as i64)
+        }
+        other => {
+            let s = probe_key(other);
+            match s.strip_prefix("n:").and_then(|r| r.strip_suffix(';')).and_then(|r| r.parse::<i64>().ok()) {
+                Some(i) => GroupKey::Int(i),
+                None => GroupKey::Canon(s),
+            }
+        }
+    }
+}
+
+/// La clave de un `join`: una parte por columna de `on` (casi siempre una: sin vector).
+#[derive(Hash, PartialEq, Eq)]
+enum JoinKey {
+    One(GroupKey),
+    Many(Vec<GroupKey>),
+}
+
+/// ¿Puede `v` mezclar decimal y float (lo que revisa `NumMix`)? Un texto no: no hace falta revisarlo.
+fn may_mix_numbers(v: &SynValue) -> bool {
+    !matches!(crate::labels::unwrap(v), SynValue::Text(_) | SynValue::Nothing)
 }
 
 /// Cómo se calcula la clave de agrupación: una columna, varias, o una función.
@@ -230,14 +294,23 @@ pub fn groups(
         KeySpec::Func(_) => {}
     }
     let mut out: Vec<(SynValue, Vec<SynValue>)> = Vec::new();
-    // La clave canónica (`probe_key`) ya iguala exactamente lo que iguala `==` (y junta los
-    // NaN en un grupo, como polars): un hash, sin comparar de a pares.
-    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // `GroupKey` iguala exactamente lo que iguala `==` (y junta los NaN en un grupo, como polars):
+    // un hash, sin comparar de a pares y sin armar un texto por fila en el caso común.
+    let mut index: std::collections::HashMap<GroupKey, usize> = std::collections::HashMap::new();
     let mut mix = NumMix::default();
+    let col = match spec {
+        KeySpec::Column(c) => Some(Column::new(c)),
+        _ => None,
+    };
     for row in rows {
-        let k = key_of(interp, spec, row, who)?;
-        mix.check(&k, who)?;
-        let probe = probe_key(crate::labels::unwrap(&k));
+        let k = match &col {
+            Some(c) => c.get(row, who)?,
+            None => key_of(interp, spec, row, who)?,
+        };
+        if may_mix_numbers(&k) {
+            mix.check(&k, who)?;
+        }
+        let probe = group_key(&k);
         match index.get(&probe) {
             Some(&i) => out[i].1.push(row.clone()),
             None => {
@@ -449,10 +522,15 @@ fn summarize_groups(
 /// Números presentes de una columna del grupo: `nothing` se saltea; lo que no es número es
 /// error (una columna de texto no se suma).
 fn column_numbers(group: &SynValue, col: &str, who: &str) -> Result<Vec<Number>, Control> {
-    let rows = rows_arg(group, who)?;
+    let SynValue::List(l) = group else {
+        return Err(err(format!("{}: expected a list of rows (maps), got {}", who, group.type_name())));
+    };
+    // En el lugar (sin copiar el grupo) y por posición si las filas comparten forma.
+    let rows = list_values(l);
+    let c = Column::new(col);
     let mut out = Vec::with_capacity(rows.len());
-    for r in &rows {
-        match row_get(r, col, who)? {
+    for r in rows.iter() {
+        match c.get(r, who)? {
             SynValue::Nothing => {}
             SynValue::Number(n) => out.push(n),
             other => {
@@ -553,7 +631,11 @@ pub fn aggregator(kind: &'static str, args: &[SynValue]) -> Result<SynValue, Con
             check_column(&rows_arg(group, who)?, &col, &format!("{}_of", kind))?;
         }
         match kind {
-            "count" => Ok(syn_int(rows_arg(group, who)?.len() as i64)),
+            // Cuántas filas: el largo del grupo, sin copiarlo.
+            "count" => match group {
+                SynValue::List(l) => Ok(syn_int(l.borrow().len() as i64)),
+                other => Err(err(format!("{}: expected a list of rows (maps), got {}", who, other.type_name()))),
+            },
             "first" => Ok(rows_arg(group, who)?.first().map(|r| row_get(r, &col, who)).transpose()?.unwrap_or(SynValue::Nothing)),
             "n_unique" => {
                 let rows = rows_arg(group, who)?;
@@ -595,14 +677,16 @@ pub fn aggregator(kind: &'static str, args: &[SynValue]) -> Result<SynValue, Con
                 if ns.is_empty() {
                     return Ok(if kind == "sum" { syn_int(0) } else { SynValue::Nothing });
                 }
-                let list = syn_list(ns.into_iter().map(syn_number).collect());
-                match kind {
-                    "sum" => crate::stats::reduce_values(&list, crate::stats::Kind::Sum, 0.0),
-                    "mean" => crate::stats::reduce_values(&list, crate::stats::Kind::Mean, 0.0),
-                    "median" => crate::stats::reduce_values(&list, crate::stats::Kind::Median, 0.0),
-                    "quantile" => crate::stats::reduce_values(&list, crate::stats::Kind::Quantile, q),
+                // Lo mismo que `reduce_values` sobre la lista de estos números, sin armarla.
+                let n = ns.len();
+                let (k, lvl) = match kind {
+                    "sum" => (crate::stats::Kind::Sum, 0.0),
+                    "mean" => (crate::stats::Kind::Mean, 0.0),
+                    "median" => (crate::stats::Kind::Median, 0.0),
+                    "quantile" => (crate::stats::Kind::Quantile, q),
                     _ => unreachable!(),
-                }
+                };
+                crate::stats::reduce_numbers(ns, n, k, lvl, 1.0)
             }
         }
     });
@@ -694,8 +778,10 @@ pub fn join(args: &[SynValue]) -> Result<SynValue, Control> {
         // que las deja sin pareja en silencio. Error, como en `==` y en `group_by`.
         let mut mix = NumMix::default();
         let mut mixed = false;
+        let col = Column::new(c);
         for r in left.iter().chain(right.iter()) {
-            if mix.check(&row_get(r, c, W)?, W).is_err() {
+            let v = col.get(r, W)?;
+            if may_mix_numbers(&v) && mix.check(&v, W).is_err() {
                 mixed = true;
                 break;
             }
@@ -707,25 +793,42 @@ pub fn join(args: &[SynValue]) -> Result<SynValue, Control> {
             )));
         }
     }
-    // Clave de emparejamiento; `None` si alguna parte es `nothing`.
-    let key = |row: &SynValue| -> Result<Option<String>, Control> {
-        let mut parts = Vec::with_capacity(on.len());
-        for c in &on {
-            let v = row_get(row, c, W)?;
+    // Clave de emparejamiento (una parte por columna de `on`); `None` si alguna parte es `nothing`.
+    // Las columnas se leen por posición cuando las filas comparten forma (una caché por lado).
+    let on_left: Vec<Column> = on.iter().map(|c| Column::new(c)).collect();
+    let on_right: Vec<Column> = on.iter().map(|c| Column::new(c)).collect();
+    let key = |row: &SynValue, cols: &[Column]| -> Result<Option<JoinKey>, Control> {
+        if let [c] = cols {
+            let v = c.get(row, W)?;
+            return Ok(if matches!(v, SynValue::Nothing) { None } else { Some(JoinKey::One(group_key(&v))) });
+        }
+        let mut parts = Vec::with_capacity(cols.len());
+        for c in cols {
+            let v = c.get(row, W)?;
             if matches!(v, SynValue::Nothing) {
                 return Ok(None);
             }
-            parts.push(v);
+            parts.push(group_key(&v));
         }
-        Ok(Some(probe_key(&syn_list(parts))))
+        Ok(Some(JoinKey::Many(parts)))
     };
+    // Las columnas de una tabla, en orden de primera aparición. Las filas que comparten forma tienen
+    // las mismas claves: cada forma se mira una vez (antes, cada clave de cada fila).
     let cols_of = |rows: &[SynValue]| -> Vec<String> {
         let mut cols: Vec<String> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut shapes: std::collections::HashSet<usize> = std::collections::HashSet::new();
         for r in rows {
             if let SynValue::Map(m) = r {
-                for k in m.borrow().keys() {
-                    if seen.insert(k.to_string()) {
+                let m = m.borrow();
+                if let Some(id) = m.shape_id() {
+                    if !shapes.insert(id) {
+                        continue;
+                    }
+                }
+                for k in m.keys() {
+                    if !seen.contains(k.as_str()) {
+                        seen.insert(k.to_string());
                         cols.push(k.to_string());
                     }
                 }
@@ -766,36 +869,56 @@ pub fn join(args: &[SynValue]) -> Result<SynValue, Control> {
             )));
         }
     }
-    let mut index: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    let mut index: std::collections::HashMap<JoinKey, Vec<usize>> = std::collections::HashMap::new();
     for (j, r) in right.iter().enumerate() {
-        if let Some(k) = key(r)? {
+        if let Some(k) = key(r, &on_right)? {
             index.entry(k).or_default().push(j);
         }
     }
+    // Las filas de salida tienen todas las mismas claves en el mismo orden: la forma se arma una vez
+    // y cada fila es un malloc con sus valores (antes, un `insert` con un `String` nuevo por campo).
+    // Si no hay forma (más de `MAX_SHAPED` columnas), el camino general con las claves ya hechas.
+    let out_keys: Vec<Key> = left_cols
+        .iter()
+        .map(|c| Key::from(c.as_str()))
+        .chain(right_out.iter().map(|(_, name)| Key::from(name.as_str())))
+        .collect();
+    let shape = ShapeRef::of_keys(out_keys.len(), |i| out_keys[i].clone());
+    let left_read: Vec<Column> = left_cols.iter().map(|c| Column::new(c)).collect();
+    let right_key_read: Vec<Option<Column>> =
+        left_cols.iter().map(|c| on.contains(c).then(|| Column::new(c))).collect();
+    let right_read: Vec<Column> = right_out.iter().map(|(c, _)| Column::new(c)).collect();
     let row_of = |l: Option<&SynValue>, r: Option<&SynValue>| -> Result<SynValue, Control> {
-        let mut out: SynMap = SynMap::new();
-        for c in &left_cols {
-            let v = match (l, r) {
-                (Some(l), _) => row_get(l, c, W)?,
+        let mut vals: Vec<SynValue> = Vec::with_capacity(out_keys.len());
+        for (i, c) in left_read.iter().enumerate() {
+            vals.push(match (l, r, &right_key_read[i]) {
+                (Some(l), _, _) => c.get(l, W)?,
                 // Fila sólo de la derecha: la clave viene de la derecha.
-                (None, Some(r)) if on.contains(c) => row_get(r, c, W)?,
+                (None, Some(r), Some(rc)) => rc.get(r, W)?,
                 _ => SynValue::Nothing,
-            };
-            out.insert(c.clone(), v);
+            });
         }
-        for (c, name) in &right_out {
-            let v = match r {
-                Some(r) => row_get(r, c, W)?,
+        for c in &right_read {
+            vals.push(match r {
+                Some(r) => c.get(r, W)?,
                 None => SynValue::Nothing,
-            };
-            out.insert(name.clone(), v);
+            });
         }
-        Ok(syn_map(out))
+        Ok(match &shape {
+            Some(s) => SynValue::Map(s.build(vals.into_iter())),
+            None => {
+                let mut out = SynMap::with_capacity(out_keys.len());
+                for (k, v) in out_keys.iter().zip(vals) {
+                    out.insert(k.clone(), v);
+                }
+                syn_map(out)
+            }
+        })
     };
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(left.len());
     let mut right_used = vec![false; right.len()];
     for l in &left {
-        let matches: &[usize] = match key(l)? {
+        let matches: &[usize] = match key(l, &on_left)? {
             Some(k) => index.get(&k).map(|v| v.as_slice()).unwrap_or(&[]),
             None => &[],
         };
@@ -1041,4 +1164,34 @@ pub fn mode(args: &[SynValue]) -> Result<SynValue, Control> {
     }
     let best = counts.iter().map(|(_, c)| *c).max().ok_or_else(|| err("mode of an empty list"))?;
     Ok(counts.into_iter().find(|(_, c)| *c == best).map(|(k, _)| k).unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `group_key` iguala EXACTAMENTE lo que iguala `probe_key` (la clave de siempre): agrupar y
+    /// emparejar no cambian, sólo dejan de armar un texto por fila.
+    #[test]
+    fn group_key_matches_probe_key() {
+        let mut i = Interpreter::new();
+        let src = "let vs be [1, 1.0, true, false, 0, -0.0, 0.0, 2.5, \"1\", \"a\", \"\", nothing, 9007199254740993, 1e20, 100000000000000000000, -9223372036854775808, 9223372036854775807, 1.5, [1, 2], [1.0, 2], {\"a\": 1}, {\"a\": 1.0}]\n";
+        let prog = crate::parser::parse_source(src, "<k>").expect("parse");
+        assert!(i.execute(&prog).is_ok());
+        let SynValue::List(l) = crate::interpreter::env_get(&i.global_env, "vs").expect("vs") else { panic!("lista") };
+        let mut vs: Vec<SynValue> = list_values(&l).to_vec();
+        // Decimales (enteros y no) y NaN, que el literal de arriba no arma.
+        vs.push(SynValue::Number(Number::Decimal(rust_decimal::Decimal::from(1))));
+        vs.push(SynValue::Number(Number::Decimal(rust_decimal::Decimal::new(25, 1))));
+        vs.push(SynValue::Number(Number::Decimal(rust_decimal::Decimal::new(100, 2))));
+        vs.push(syn_float(f64::NAN));
+        vs.push(syn_float(f64::NAN));
+        for a in &vs {
+            for b in &vs {
+                let old = probe_key(a) == probe_key(b);
+                let new = group_key(a) == group_key(b);
+                assert_eq!(old, new, "{} vs {}: probe_key {} / group_key {}", a, b, old, new);
+            }
+        }
+    }
 }

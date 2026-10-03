@@ -1073,6 +1073,19 @@ fn addr(n: &Obj<Node>) -> usize {
 }
 
 impl MapObj {
+    /// La identidad de la forma del mapa si sus claves (y su orden) son las de una forma compartida:
+    /// dos mapas con el mismo `shape_id` tienen las mismas claves. `None` en modo diccionario o sin
+    /// claves (cada uno, las suyas). Para quien recorre las claves de muchas filas (`join`).
+    pub fn shape_id(&self) -> Option<usize> {
+        let n = self.layout.as_ref()?;
+        match &**n {
+            Node::Shape(_) => Some(addr(n)),
+            // Un `Grown` tiene las claves de su forma (lo que no entró en línea va aparte).
+            Node::Grown { shape, .. } => Some(addr(shape)),
+            Node::Dict(_) => None,
+        }
+    }
+
     /// El valor de `key` usando (y actualizando) la caché del sitio. **La clave tiene que ser la
     /// misma en cada ejecución del sitio** (`m.k`): con la forma que recuerda la caché, la posición
     /// alcanza. Para una clave que cambia, [`MapObj::get_cached_key`].

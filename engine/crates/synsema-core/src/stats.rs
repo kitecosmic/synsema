@@ -277,9 +277,7 @@ fn present_numbers(v: &SynValue, who: &str) -> Result<(Vec<Number>, usize), Cont
             }
         }
     }
-    if out.iter().any(|n| n.is_decimal()) && out.iter().any(|n| matches!(n, Number::Float(_))) {
-        return Err(err(MIX_DECIMAL_FLOAT));
-    }
+    // La mezcla decimal/float la revisa `reduce_numbers` (un solo lugar para los dos caminos).
     Ok((out, total))
 }
 
@@ -289,8 +287,18 @@ pub fn reduce_values(v: &SynValue, kind: Kind, lvl: f64) -> Result<SynValue, Con
 }
 
 fn reduce_list(v: &SynValue, kind: Kind, lvl: f64, ddof: f64) -> Result<SynValue, Control> {
+    let (nums, total) = present_numbers(v, kind.name())?;
+    reduce_numbers(nums, total, kind, lvl, ddof)
+}
+
+/// `reduce_values` sobre números ya extraídos (`total` = cuántos había contando los faltantes): los
+/// agregados de `summarize` leen la columna del grupo en el lugar y llaman acá, sin armar una lista
+/// de valores para que `present_numbers` la vuelva a recorrer.
+pub(crate) fn reduce_numbers(nums: Vec<Number>, total: usize, kind: Kind, lvl: f64, ddof: f64) -> Result<SynValue, Control> {
     let who = kind.name();
-    let (nums, total) = present_numbers(v, who)?;
+    if nums.iter().any(|n| n.is_decimal()) && nums.iter().any(|n| matches!(n, Number::Float(_))) {
+        return Err(err(MIX_DECIMAL_FLOAT));
+    }
     let nan = nums.iter().any(|n| matches!(n, Number::Float(x) if x.is_nan()));
     match kind {
         Kind::Sum | Kind::Product => {
