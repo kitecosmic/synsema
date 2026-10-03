@@ -1076,6 +1076,16 @@ impl MapObj {
     /// La identidad de la forma del mapa si sus claves (y su orden) son las de una forma compartida:
     /// dos mapas con el mismo `shape_id` tienen las mismas claves. `None` en modo diccionario o sin
     /// claves (cada uno, las suyas). Para quien recorre las claves de muchas filas (`join`).
+    /// Los valores en orden de sus claves como un slice, si están todos en línea (una forma, sin
+    /// valores afuera): para copiar una fila entera de una vez. `None` en los otros modos.
+    #[inline]
+    pub fn inline_values(&self) -> Option<&[SynValue]> {
+        match self.layout.as_deref() {
+            Some(Node::Shape(s)) => self.vals.get(..s.keys.len()),
+            _ => None,
+        }
+    }
+
     pub fn shape_id(&self) -> Option<usize> {
         let n = self.layout.as_ref()?;
         match &**n {

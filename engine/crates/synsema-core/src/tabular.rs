@@ -77,8 +77,21 @@ impl Column {
     }
 
     fn get(&self, row: &SynValue, who: &str) -> Result<SynValue, Control> {
+        self.read(row, who, SynValue::clone)
+    }
+
+    /// El valor de la columna prestado a `f`, sin clonarlo (`nothing` si la fila no la tiene): para
+    /// quien sólo lo mira (una clave, un número que se suma).
+    #[inline]
+    fn read<R>(&self, row: &SynValue, who: &str, f: impl FnOnce(&SynValue) -> R) -> Result<R, Control> {
         match row {
-            SynValue::Map(m) => Ok(m.borrow().get_cached(&self.name, &self.ic).cloned().unwrap_or(SynValue::Nothing)),
+            SynValue::Map(m) => {
+                let m = m.borrow();
+                match m.get_cached(&self.name, &self.ic) {
+                    Some(v) => Ok(f(v)),
+                    None => Ok(f(&SynValue::Nothing)),
+                }
+            }
             other => Err(err(format!("{}: every row must be a map, got {}", who, other.type_name()))),
         }
     }
@@ -303,17 +316,33 @@ pub fn groups(
         _ => None,
     };
     for row in rows {
-        let k = match &col {
-            Some(c) => c.get(row, who)?,
-            None => key_of(interp, spec, row, who)?,
+        // Una columna se lee prestada: el valor se clona sólo si abre un grupo.
+        let (probe, k) = match &col {
+            Some(c) => {
+                let probe = c.read(row, who, |v| {
+                    if may_mix_numbers(v) {
+                        mix.check(v, who)?;
+                    }
+                    Ok::<_, Control>(group_key(v))
+                })??;
+                (probe, None)
+            }
+            None => {
+                let k = key_of(interp, spec, row, who)?;
+                if may_mix_numbers(&k) {
+                    mix.check(&k, who)?;
+                }
+                (group_key(&k), Some(k))
+            }
         };
-        if may_mix_numbers(&k) {
-            mix.check(&k, who)?;
-        }
-        let probe = group_key(&k);
         match index.get(&probe) {
             Some(&i) => out[i].1.push(row.clone()),
             None => {
+                let k = match (k, &col) {
+                    (Some(k), _) => k,
+                    (None, Some(c)) => c.get(row, who)?,
+                    (None, None) => unreachable!("sin columna, la clave ya está"),
+                };
                 index.insert(probe, out.len());
                 out.push((k, vec![row.clone()]));
             }
@@ -530,13 +559,14 @@ fn column_numbers(group: &SynValue, col: &str, who: &str) -> Result<Vec<Number>,
     let c = Column::new(col);
     let mut out = Vec::with_capacity(rows.len());
     for r in rows.iter() {
-        match c.get(r, who)? {
-            SynValue::Nothing => {}
-            SynValue::Number(n) => out.push(n),
-            other => {
-                return Err(err(format!("{}: column {:?} has a {}, expected numbers", who, col, other.type_name())))
+        c.read(r, who, |v| match v {
+            SynValue::Nothing => Ok(()),
+            SynValue::Number(n) => {
+                out.push(n.clone());
+                Ok(())
             }
-        }
+            other => Err(err(format!("{}: column {:?} has a {}, expected numbers", who, col, other.type_name()))),
+        })??;
     }
     Ok(out)
 }
@@ -780,8 +810,7 @@ pub fn join(args: &[SynValue]) -> Result<SynValue, Control> {
         let mut mixed = false;
         let col = Column::new(c);
         for r in left.iter().chain(right.iter()) {
-            let v = col.get(r, W)?;
-            if may_mix_numbers(&v) && mix.check(&v, W).is_err() {
+            if col.read(r, W, |v| may_mix_numbers(v) && mix.check(v, W).is_err())? {
                 mixed = true;
                 break;
             }
@@ -798,17 +827,16 @@ pub fn join(args: &[SynValue]) -> Result<SynValue, Control> {
     let on_left: Vec<Column> = on.iter().map(|c| Column::new(c)).collect();
     let on_right: Vec<Column> = on.iter().map(|c| Column::new(c)).collect();
     let key = |row: &SynValue, cols: &[Column]| -> Result<Option<JoinKey>, Control> {
+        let part = |c: &Column| c.read(row, W, |v| (!matches!(v, SynValue::Nothing)).then(|| group_key(v)));
         if let [c] = cols {
-            let v = c.get(row, W)?;
-            return Ok(if matches!(v, SynValue::Nothing) { None } else { Some(JoinKey::One(group_key(&v))) });
+            return Ok(part(c)?.map(JoinKey::One));
         }
         let mut parts = Vec::with_capacity(cols.len());
         for c in cols {
-            let v = c.get(row, W)?;
-            if matches!(v, SynValue::Nothing) {
-                return Ok(None);
+            match part(c)? {
+                Some(k) => parts.push(k),
+                None => return Ok(None),
             }
-            parts.push(group_key(&v));
         }
         Ok(Some(JoinKey::Many(parts)))
     };
@@ -888,9 +916,35 @@ pub fn join(args: &[SynValue]) -> Result<SynValue, Control> {
     let right_key_read: Vec<Option<Column>> =
         left_cols.iter().map(|c| on.contains(c).then(|| Column::new(c))).collect();
     let right_read: Vec<Column> = right_out.iter().map(|(c, _)| Column::new(c)).collect();
+    // La forma de la última fila izquierda y si sus claves son `left_cols` en ese orden: entonces sus
+    // valores se copian de una vez, en orden, sin buscar columna por columna (las filas de una tabla
+    // suelen compartir forma: se mira una vez).
+    let left_shape: std::cell::Cell<Option<(usize, bool)>> = std::cell::Cell::new(None);
+    // Los valores de una fila antes de armarla: un búfer que se reusa (no un malloc por fila).
+    let scratch: std::cell::Cell<Vec<SynValue>> = std::cell::Cell::new(Vec::with_capacity(out_keys.len()));
     let row_of = |l: Option<&SynValue>, r: Option<&SynValue>| -> Result<SynValue, Control> {
-        let mut vals: Vec<SynValue> = Vec::with_capacity(out_keys.len());
-        for (i, c) in left_read.iter().enumerate() {
+        let mut vals = scratch.take();
+        if let Some(SynValue::Map(m)) = l {
+            let m = m.borrow();
+            if let Some(id) = m.shape_id() {
+                let same = match left_shape.get() {
+                    Some((sid, same)) if sid == id => same,
+                    _ => {
+                        let same = m.len() == left_cols.len() && m.keys().zip(&left_cols).all(|(k, c)| k.as_str() == c);
+                        left_shape.set(Some((id, same)));
+                        same
+                    }
+                };
+                if same {
+                    match m.inline_values() {
+                        Some(s) => vals.extend_from_slice(s),
+                        None => vals.extend(m.values().cloned()),
+                    }
+                }
+            }
+        }
+        // (Si la copia en bloque no se hizo, columna por columna.)
+        for (i, c) in left_read.iter().enumerate().skip(vals.len()) {
             vals.push(match (l, r, &right_key_read[i]) {
                 (Some(l), _, _) => c.get(l, W)?,
                 // Fila sólo de la derecha: la clave viene de la derecha.
@@ -904,16 +958,18 @@ pub fn join(args: &[SynValue]) -> Result<SynValue, Control> {
                 None => SynValue::Nothing,
             });
         }
-        Ok(match &shape {
-            Some(s) => SynValue::Map(s.build(vals.into_iter())),
+        let row = match &shape {
+            Some(s) => SynValue::Map(s.build(vals.drain(..))),
             None => {
                 let mut out = SynMap::with_capacity(out_keys.len());
-                for (k, v) in out_keys.iter().zip(vals) {
+                for (k, v) in out_keys.iter().zip(vals.drain(..)) {
                     out.insert(k.clone(), v);
                 }
                 syn_map(out)
             }
-        })
+        };
+        scratch.set(vals);
+        Ok(row)
     };
     let mut out = Vec::with_capacity(left.len());
     let mut right_used = vec![false; right.len()];
