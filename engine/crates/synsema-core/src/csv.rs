@@ -18,6 +18,8 @@
 //! AGNÓSTICO de fuente (G2): entrada = texto/valores del lenguaje; salida = valores/
 //! texto. Este módulo no conoce conexiones ni importa nada de `database.rs`.
 
+use std::borrow::Cow;
+
 use crate::synlist::{list_values};
 use crate::synmap::ShapeRef;
 use crate::types::{Key, MapObj, SynMap};
@@ -112,146 +114,105 @@ fn opt_delimiter(opts: &MapObj, name: &str) -> Result<u8, Control> {
 // csv_parse(text, opts?) → list
 // =========================================================
 
-/// Pre-validación RFC 4180 que el crate `csv` no hace: una comilla de apertura sin
-/// su cierre consume hasta EOF en silencio — acá se detecta y se reporta con la
-/// línea donde empezó el campo entrecomillado (G5, "nunca silencioso").
-fn check_unclosed_quote(src: &str, delim: u8) -> Result<(), Control> {
-    let delim = delim as char;
-    let mut line = 1usize;
-    let mut in_quotes = false;
-    let mut quote_line = 0usize;
-    let mut at_field_start = true;
-    let mut it = src.chars().peekable();
-    while let Some(c) = it.next() {
-        if in_quotes {
-            match c {
-                '"' => {
-                    if it.peek() == Some(&'"') {
-                        it.next(); // "" = comilla escapada, sigue dentro del campo
-                    } else {
-                        in_quotes = false;
-                        at_field_start = false;
-                    }
-                }
-                // Como `tokenize`: `\r\n`, `\n` y `\r` solo son UN fin de línea.
-                '\n' => line += 1,
-                '\r' if it.peek() != Some(&'\n') => line += 1,
-                _ => {}
-            }
-        } else if c == '"' && at_field_start {
-            in_quotes = true;
-            quote_line = line;
-        } else if c == delim {
-            at_field_start = true;
-        } else if c == '\n' || c == '\r' {
-            // Un `\r` solo también termina el registro (el tokenizador lo lee así).
-            if !(c == '\r' && it.peek() == Some(&'\n')) {
-                line += 1;
-            }
-            at_field_start = true;
-        } else {
-            at_field_start = false;
-        }
-    }
-    if in_quotes {
-        return Err(err(format!(
-            "csv_parse: unclosed quote in the field that starts on line {}",
-            quote_line
-        )));
-    }
-    Ok(())
-}
-
 /// Un campo leído: su texto y si vino entre comillas (`""` es texto vacío; un campo vacío
-/// sin comillas es un dato faltante).
-struct Field {
-    text: String,
+/// sin comillas es un dato faltante). El texto es una porción del CSV salvo que haya que armarlo
+/// (`""` adentro, o texto después de la comilla de cierre).
+struct Field<'a> {
+    text: Cow<'a, str>,
     quoted: bool,
 }
 
-/// Una fila: su línea (1-based, donde empieza) y sus campos; `None` = línea en blanco.
-type Record = (usize, Option<Vec<Field>>);
-
-/// RFC 4180 (v0.6.29): el lector propio para saber qué campos vinieron entre comillas, cosa
-/// que el crate `csv` no expone. Fin de fila: `\n`, `\r\n` o `\r`. Una comilla sólo abre un
-/// campo al principio; `""` adentro es una comilla; lo que sigue a la comilla de cierre se
-/// agrega tal cual (`"x"y` → `xy`, como el crate `csv`). `check_unclosed_quote` ya corrió.
-fn tokenize(src: &str, delim: u8) -> Vec<Record> {
-    let delim = delim as char;
-    let mut out: Vec<Record> = Vec::new();
+/// RFC 4180 (v0.6.29), en una sola pasada por bytes y sin copiar (perf/tabular): `on_record(línea,
+/// campos)` por cada fila, apenas termina (las líneas en blanco se saltean). Fin de fila: `\n`,
+/// `\r\n` o `\r`. Una comilla sólo abre un campo al principio; `""` adentro es una comilla; lo que
+/// sigue a la comilla de cierre se agrega tal cual (`"x"y` → `xy`, como el crate `csv`). Una comilla
+/// sin cerrar es error con la línea donde empezó el campo (G5, "nunca silencioso").
+///
+/// El delimitador, la comilla y los fines de línea son ASCII: en UTF-8 nunca aparecen dentro de un
+/// carácter de varios bytes, así que se buscan por byte y los cortes caen siempre en el borde de un
+/// carácter. Antes: una pasada para las comillas sin cerrar y otra carácter por carácter con un
+/// `String` por campo, todas las filas guardadas antes de convertir la primera (el lector viejo es
+/// el oráculo de `tests::the_scanner_reads_like_the_reference`).
+fn scan<'a>(src: &'a str, delim: u8, mut on_record: impl FnMut(usize, &[Field<'a>])) -> Result<(), Control> {
+    let b = src.as_bytes();
+    let n = b.len();
+    let mut i = 0usize;
     let mut line = 1usize;
-    let mut it = src.chars().peekable();
-    let mut fields: Vec<Field> = Vec::new();
-    let mut cur = String::new();
-    let mut quoted = false;
-    let mut in_quotes = false;
-    let mut field_started = false; // hubo algo (texto o comillas) en la fila
-    let mut rec_line = 1usize;
-    loop {
-        let c = it.next();
-        if in_quotes {
-            match c {
-                Some('"') => {
-                    if it.peek() == Some(&'"') {
-                        it.next();
-                        cur.push('"');
-                    } else {
-                        in_quotes = false;
+    let mut fields: Vec<Field<'a>> = Vec::new();
+    // `\n`, o `\r` que no viene antes de un `\n`: una línea más (dentro y fuera de comillas).
+    let eol_at = |i: usize| b[i] == b'\n' || (b[i] == b'\r' && b.get(i + 1) != Some(&b'\n'));
+    while i < n {
+        let rec_line = line;
+        // Línea en blanco: se saltea.
+        if b[i] == b'\n' || b[i] == b'\r' {
+            i += if b[i] == b'\r' && b.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+            line += 1;
+            continue;
+        }
+        fields.clear();
+        loop {
+            if i < n && b[i] == b'"' {
+                // Entre comillas: hasta la comilla de cierre (`""` es una comilla).
+                let quote_line = line;
+                i += 1;
+                let start = i;
+                let mut has_escape = false;
+                loop {
+                    if i >= n {
+                        return Err(err(format!(
+                            "csv_parse: unclosed quote in the field that starts on line {}",
+                            quote_line
+                        )));
                     }
-                }
-                Some(ch) => {
-                    // `\r\n`, `\n` y `\r` solo son UN fin de línea, dentro y fuera de comillas.
-                    if ch == '\n' || (ch == '\r' && it.peek() != Some(&'\n')) {
+                    if b[i] == b'"' {
+                        if b.get(i + 1) == Some(&b'"') {
+                            has_escape = true;
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    if eol_at(i) {
                         line += 1;
                     }
-                    cur.push(ch);
+                    i += 1;
                 }
-                None => {}
+                // Con `""` adentro el campo se arma (cada par es una comilla); si no, es la porción.
+                let body = &src[start..i];
+                let mut text: Cow<'a, str> = if has_escape { Cow::Owned(body.replace("\"\"", "\"")) } else { Cow::Borrowed(body) };
+                i += 1; // la comilla de cierre
+                // Lo que siga hasta el delimitador o el fin de fila se agrega tal cual.
+                let tail = i;
+                while i < n && b[i] != delim && b[i] != b'\n' && b[i] != b'\r' {
+                    i += 1;
+                }
+                if i > tail {
+                    let mut o = text.into_owned();
+                    o.push_str(&src[tail..i]);
+                    text = Cow::Owned(o);
+                }
+                fields.push(Field { text, quoted: true });
+            } else {
+                // Sin comillas: hasta el delimitador o el fin de fila (una comilla en el medio es texto).
+                let start = i;
+                while i < n && b[i] != delim && b[i] != b'\n' && b[i] != b'\r' {
+                    i += 1;
+                }
+                fields.push(Field { text: Cow::Borrowed(&src[start..i]), quoted: false });
             }
-            if c.is_some() {
+            if i < n && b[i] == delim {
+                i += 1;
                 continue;
             }
+            break;
         }
-        match c {
-            Some(ch) if ch == delim => {
-                fields.push(Field { text: std::mem::take(&mut cur), quoted });
-                quoted = false;
-                field_started = true;
-            }
-            Some('"') if cur.is_empty() && !quoted => {
-                quoted = true;
-                in_quotes = true;
-                field_started = true;
-            }
-            Some(ch @ ('\n' | '\r')) => {
-                if ch == '\r' && it.peek() == Some(&'\n') {
-                    it.next();
-                }
-                if field_started || !cur.is_empty() {
-                    fields.push(Field { text: std::mem::take(&mut cur), quoted });
-                    out.push((rec_line, Some(std::mem::take(&mut fields))));
-                } else {
-                    out.push((rec_line, None));
-                }
-                quoted = false;
-                field_started = false;
-                line += 1;
-                rec_line = line;
-            }
-            Some(ch) => {
-                cur.push(ch);
-                field_started = true;
-            }
-            None => {
-                if field_started || !cur.is_empty() {
-                    fields.push(Field { text: std::mem::take(&mut cur), quoted });
-                    out.push((rec_line, Some(fields)));
-                }
-                break;
-            }
+        if i < n {
+            i += if b[i] == b'\r' && b.get(i + 1) == Some(&b'\n') { 2 } else { 1 };
+            line += 1;
         }
+        on_record(rec_line, &fields);
     }
-    out
+    Ok(())
 }
 
 /// Con `{"numbers": true}`: intenta leer el campo como número. Enteros preservan
@@ -289,7 +250,7 @@ fn field_value(f: &Field, numbers: bool, missing: &[String]) -> SynValue {
     // v0.6.29 (DATOS-6): un campo vacío es un dato FALTANTE → `nothing`; `""` entre comillas es
     // texto vacío (y `csv_encode` escribe `nothing` vacío y `""` entre comillas: la ida y
     // vuelta es exacta).
-    let s = f.text.as_str();
+    let s: &str = &f.text;
     if s.is_empty() {
         return if f.quoted { syn_text("") } else { SynValue::Nothing };
     }
@@ -308,7 +269,7 @@ fn field_value(f: &Field, numbers: bool, missing: &[String]) -> SynValue {
 /// esos textos, SIN comillas, son un dato faltante. Entre comillas (`"NA"`) siguen siendo texto:
 /// alguien lo escribió a propósito.
 fn is_missing_marker(f: &Field, missing: &[String]) -> bool {
-    !f.quoted && missing.iter().any(|m| m == &f.text)
+    !f.quoted && missing.iter().any(|m| *m == *f.text)
 }
 
 fn opt_missing(opts: &MapObj) -> Result<Vec<String>, Control> {
@@ -357,74 +318,83 @@ pub fn csv_parse(args: &[SynValue]) -> Result<SynValue, Control> {
     if src.is_empty() {
         return Ok(syn_list(Vec::new()));
     }
-    check_unclosed_quote(src, delim)?;
-
-    let raw = tokenize(src, delim);
-    // El ancho lo fija la primera fila. Una línea en blanco se saltea SIEMPRE, también en un CSV
-    // de una columna (Python `csv`, pandas): por eso `csv_encode` escribe `""` una fila de un solo
-    // campo `nothing`. Una línea en blanco dentro de un campo entre comillas es parte del campo.
-    let width = raw.iter().find_map(|(_, r)| r.as_ref().map(|f| f.len())).unwrap_or(0);
-    let mut records: Vec<(usize, Vec<Field>)> = Vec::new();
-    for (ln, r) in raw.into_iter() {
-        match r {
-            Some(f) => {
-                if f.len() != width {
-                    let source = if headers { " (the header row)" } else { " (the first row)" };
-                    return Err(err(format!(
-                        "csv_parse: line {}: record has {} field(s), but {} were expected from the first record{}",
-                        ln,
-                        f.len(),
-                        width,
-                        source
+    // Fila por fila, sin guardar el CSV tokenizado. Los errores salen en el orden de antes: una
+    // comilla sin cerrar (la ve `scan` y gana siempre), después una fila de otro ancho (cualquiera,
+    // aunque venga más abajo), después cabeceras repetidas, `types` y los campos de un tipo.
+    let mut width: Option<usize> = None;
+    let mut width_err: Option<Control> = None;
+    let mut other_err: Option<Control> = None;
+    let mut header_row: Vec<String> = Vec::new();
+    let mut header_keys: Vec<Key> = Vec::new();
+    let mut shape: Option<ShapeRef> = None;
+    let mut seen_header = false;
+    let mut rows: Vec<SynValue> = Vec::new();
+    let mut vals: Vec<SynValue> = Vec::new();
+    scan(src, delim, |ln, rec| {
+        // El ancho lo fija la primera fila. Una línea en blanco ya se salteó (también en un CSV de una
+        // columna, como Python `csv` y pandas: por eso `csv_encode` escribe `""` en una fila de un
+        // solo campo `nothing`).
+        let w = *width.get_or_insert(rec.len());
+        if rec.len() != w {
+            if width_err.is_none() {
+                let source = if headers { " (the header row)" } else { " (the first row)" };
+                width_err = Some(err(format!(
+                    "csv_parse: line {}: record has {} field(s), but {} were expected from the first record{}",
+                    ln,
+                    rec.len(),
+                    w,
+                    source
+                )));
+            }
+            return;
+        }
+        if width_err.is_some() || other_err.is_some() {
+            return; // ya hay un error: sólo se sigue buscando uno que gane (ancho)
+        }
+        if !headers {
+            // Lista de listas: todas las filas son datos.
+            rows.push(syn_list(rec.iter().map(|f| field_value(f, numbers, &missing)).collect()));
+            return;
+        }
+        if !seen_header {
+            // Lista de mapas: primera fila = cabeceras (misma forma que devuelve sql()).
+            seen_header = true;
+            header_row = rec.iter().map(|f| f.text.to_string()).collect();
+            for (i, h) in header_row.iter().enumerate() {
+                if header_row[..i].contains(h) {
+                    other_err = Some(err(format!(
+                        "csv_parse: duplicate header {:?} on line 1; headers must be unique to build maps (use {{\"headers\": false}} for positional rows)",
+                        h
                     )));
+                    return;
                 }
-                records.push((ln, f));
             }
-            None => {}
-        }
-    }
-    if records.is_empty() {
-        return Ok(syn_list(Vec::new()));
-    }
-
-    if !headers {
-        // Lista de listas: todas las filas son datos.
-        let rows = records
-            .iter()
-            .map(|(_, rec)| syn_list(rec.iter().map(|f| field_value(f, numbers, &missing)).collect()))
-            .collect();
-        return Ok(syn_list(rows));
-    }
-
-    // Lista de mapas: primera fila = cabeceras (misma forma que devuelve sql()).
-    let header_row: Vec<String> = records[0].1.iter().map(|f| f.text.clone()).collect();
-    for (i, h) in header_row.iter().enumerate() {
-        if header_row[..i].contains(h) {
-            return Err(err(format!(
-                "csv_parse: duplicate header {:?} on line 1; headers must be unique to build maps (use {{\"headers\": false}} for positional rows)",
-                h
-            )));
-        }
-    }
-    if let Some(ts) = &types {
-        for c in ts.keys() {
-            if !header_row.contains(c) {
-                return Err(err(format!("csv_parse: \"types\" names column {:?}, which is not in the header", c)));
+            if let Some(ts) = &types {
+                for c in ts.keys() {
+                    if !header_row.contains(c) {
+                        other_err = Some(err(format!("csv_parse: \"types\" names column {:?}, which is not in the header", c)));
+                        return;
+                    }
+                }
             }
+            // Las cabeceras como claves una vez por llamada: cada fila suma una referencia (F4.4).
+            header_keys = header_row.iter().map(Key::from).collect();
+            // Y la forma de una fila completa, una vez (F4.5): cada fila es un malloc con sus valores.
+            shape = ShapeRef::of_keys(header_keys.len(), |i| header_keys[i].clone());
+            vals.reserve(header_row.len());
+            return;
         }
-    }
-    // Las cabeceras como claves una vez por llamada: cada fila suma una referencia (F4.4).
-    let header_keys: Vec<Key> = header_row.iter().map(Key::from).collect();
-    // Y la forma de una fila completa, una vez (F4.5): cada fila es un malloc con sus valores.
-    let shape = ShapeRef::of_keys(header_keys.len(), |i| header_keys[i].clone());
-    let mut rows = Vec::with_capacity(records.len().saturating_sub(1));
-    let mut vals: Vec<SynValue> = Vec::with_capacity(header_row.len());
-    for (ln, rec) in records[1..].iter() {
         vals.clear();
         for (h, f) in header_row.iter().zip(rec.iter()) {
             vals.push(match types.as_ref().and_then(|t| t.get(h)) {
                 Some(_) if is_missing_marker(f, &missing) => SynValue::Nothing,
-                Some(ty) => typed_field(&f.text, f.quoted, ty, h, *ln)?,
+                Some(ty) => match typed_field(&f.text, f.quoted, ty, h, ln) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        other_err = Some(e);
+                        return;
+                    }
+                },
                 None => field_value(f, numbers, &missing),
             });
         }
@@ -435,6 +405,9 @@ pub fn csv_parse(args: &[SynValue]) -> Result<SynValue, Control> {
                 rows.push(syn_map(m));
             }
         }
+    })?;
+    if let Some(e) = width_err.or(other_err) {
+        return Err(e);
     }
     Ok(syn_list(rows))
 }
@@ -566,25 +539,6 @@ fn opt_headers_list(opts: &MapObj) -> Result<Option<Vec<String>>, Control> {
 
 /// Un campo a escribir: su texto, si es un texto vacío (que va entre comillas) y si vino de un
 /// texto (sólo el texto puede ser una fórmula: un número negativo `-5` no se toca).
-struct Cell {
-    text: String,
-    empty_text: bool,
-    is_text: bool,
-    /// Viene de `nothing` (con `{"missing": marca}` se escribe la marca).
-    is_missing: bool,
-}
-
-impl From<String> for Cell {
-    fn from(text: String) -> Cell {
-        Cell { text, empty_text: false, is_text: false, is_missing: false }
-    }
-}
-
-/// Una cabecera es texto (también puede ser una fórmula).
-fn header_cell(text: String) -> Cell {
-    Cell { text, empty_text: false, is_text: true, is_missing: false }
-}
-
 /// El aviso de `csv_encode` para una tabla de UNA columna con algún `nothing` y sin `missing`: ahí
 /// `nothing` se escribe `""` (una línea en blanco se ignoraría al leer) y vuelve como texto vacío.
 pub const ONE_COLUMN_NOTHING_WARNING: &str = "csv_encode: a one-column table writes nothing as \"\" (it reads back as empty text); pass {\"missing\": \"NA\"} and read it with {\"missing\": [\"NA\"]} for an exact round trip";
@@ -600,39 +554,42 @@ fn t_starts_formula(t: &str) -> bool {
     matches!(t.chars().next(), Some('=' | '+' | '-' | '@' | '\t' | '\r'))
 }
 
-/// Un valor escalar → su campo CSV. `row` es 1-based (para el mensaje de error).
-fn encode_field(v: &SynValue, row: usize, col: &str) -> Result<Cell, Control> {
-    if let SynValue::Text(s) = v {
-        return Ok(Cell { text: s.to_string(), empty_text: s.is_empty(), is_text: true, is_missing: false });
-    }
-    let is_missing = matches!(v, SynValue::Nothing);
-    encode_scalar(v, row, col).map(|text| Cell { is_missing, ..Cell::from(text) })
-}
-
-fn encode_scalar(v: &SynValue, row: usize, col: &str) -> Result<String, Control> {
+/// Un valor escalar que no es texto → su campo CSV, escrito en `out`. `row` es 1-based y `col` arma el
+/// nombre de la columna sólo para el mensaje de error (antes se formateaba en cada campo).
+fn write_scalar(v: &SynValue, out: &mut String, row: usize, col: &dyn Fn() -> String) -> Result<(), Control> {
+    use std::fmt::Write;
     match v {
-        SynValue::Text(s) => Ok(s.to_string()),
+        SynValue::Text(s) => out.push_str(s),
         // Espeja text(): enteros sin decimales ("42"), Float estilo Python, Decimal exacto.
-        SynValue::Number(n) => Ok(n.to_string()),
-        SynValue::Bool(b) => Ok(if *b { "true" } else { "false" }.to_string()),
-        SynValue::Nothing => Ok(String::new()),
-        SynValue::Time(t) => Ok(t.to_string()),
-        SynValue::Bytes(b) => Ok(b64_encode(b)),
+        SynValue::Number(n) => {
+            let _ = write!(out, "{}", n);
+        }
+        SynValue::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        SynValue::Nothing => {}
+        SynValue::Time(t) => {
+            let _ = write!(out, "{}", t);
+        }
+        SynValue::Bytes(b) => out.push_str(&b64_encode(b)),
         // G8: un secret JAMÁS se filtra a un CSV (espeja json_encode).
-        SynValue::Secret(_) => Ok("[redacted]".to_string()),
-        SynValue::List(_) | SynValue::Map(_) => Err(err(format!(
-            "csv_encode: row {}, column {}: nested {} values cannot be a CSV field; encode the field first with json_encode(...)",
-            row,
-            col,
-            v.type_name()
-        ))),
-        other => Err(err(format!(
-            "csv_encode: row {}, column {}: cannot encode a {} as a CSV field; convert it with text(...) first",
-            row,
-            col,
-            other.type_name()
-        ))),
+        SynValue::Secret(_) => out.push_str("[redacted]"),
+        SynValue::List(_) | SynValue::Map(_) => {
+            return Err(err(format!(
+                "csv_encode: row {}, column {}: nested {} values cannot be a CSV field; encode the field first with json_encode(...)",
+                row,
+                col(),
+                v.type_name()
+            )))
+        }
+        other => {
+            return Err(err(format!(
+                "csv_encode: row {}, column {}: cannot encode a {} as a CSV field; convert it with text(...) first",
+                row,
+                col(),
+                other.type_name()
+            )))
+        }
     }
+    Ok(())
 }
 
 pub fn csv_encode(args: &[SynValue]) -> Result<SynValue, Control> {
@@ -691,49 +648,69 @@ pub fn csv_encode(args: &[SynValue]) -> Result<SynValue, Control> {
 
     // Escritor RFC 4180 propio (v0.6.29): comillas sólo donde hacen falta —separador,
     // comilla, fin de línea— y SIEMPRE en un texto vacío (`""`), que así se distingue de
-    // `nothing` (campo vacío sin comillas). Lo que escribe, `csv_parse` lo lee igual.
+    // `nothing` (campo vacío sin comillas). Lo que escribe, `csv_parse` lo lee igual. Cada campo va
+    // directo a la salida (perf/tabular): un texto sin copiarlo, un número formateado en `scratch`.
     let mut wtr = String::new();
+    let mut scratch = String::new();
     let d = delim as char;
-    let write = |wtr: &mut String, rec: &[Cell]| -> Result<(), Control> {
-        for (i, c) in rec.iter().enumerate() {
-            if i > 0 {
-                wtr.push(d);
-            }
-            if let (true, Some(mark)) = (c.is_missing, &missing) {
-                wtr.push_str(mark);
-                continue;
-            }
-            let escaped;
-            let t = if escape_formulas && c.is_text && t_starts_formula(&c.text) {
-                escaped = format!("'{}", c.text);
-                escaped.as_str()
-            } else {
-                c.text.as_str()
-            };
-            // Una fila de un solo campo vacío sería una línea en blanco, que al leer se ignora:
-            // se escribe `""`, como el writer de Python (un `nothing` ahí vuelve como `""`).
-            let lone_empty = rec.len() == 1 && t.is_empty();
-            if lone_empty && c.is_missing {
-                warn_one_column_nothing();
-            }
-            // Un texto igual a la marca de `missing` va entre comillas, para no leerse como faltante.
-            let is_mark = c.is_text && missing.as_deref() == Some(t);
-            if c.empty_text || lone_empty || is_mark || t.contains(d) || t.contains('"') || t.contains('\n') || t.contains('\r') {
-                wtr.push('"');
-                wtr.push_str(&t.replace('"', "\"\""));
-                wtr.push('"');
-            } else {
-                wtr.push_str(t);
+    // `t` es el texto del campo; `is_text`: venía de un texto (o es una cabecera); `is_missing`: de
+    // `nothing`; `quote_empty`: un texto vacío (no una cabecera vacía) va entre comillas; `width`: los
+    // campos de la fila; `j`: su posición.
+    let put = |wtr: &mut String, j: usize, width: usize, t: &str, is_text: bool, is_missing: bool, quote_empty: bool| {
+        if j > 0 {
+            wtr.push(d);
+        }
+        if let (true, Some(mark)) = (is_missing, &missing) {
+            wtr.push_str(mark);
+            return;
+        }
+        let empty_text = quote_empty && t.is_empty();
+        let escaped;
+        let t = if escape_formulas && is_text && t_starts_formula(t) {
+            escaped = format!("'{}", t);
+            escaped.as_str()
+        } else {
+            t
+        };
+        // Una fila de un solo campo vacío sería una línea en blanco, que al leer se ignora:
+        // se escribe `""`, como el writer de Python (un `nothing` ahí vuelve como `""`).
+        let lone_empty = width == 1 && t.is_empty();
+        if lone_empty && is_missing {
+            warn_one_column_nothing();
+        }
+        // Un texto igual a la marca de `missing` va entre comillas, para no leerse como faltante.
+        let is_mark = is_text && missing.as_deref() == Some(t);
+        if empty_text || lone_empty || is_mark || t.bytes().any(|c| c == delim || c == b'"' || c == b'\n' || c == b'\r') {
+            wtr.push('"');
+            wtr.push_str(&t.replace('"', "\"\""));
+            wtr.push('"');
+        } else {
+            wtr.push_str(t);
+        }
+    };
+    // Un valor: un texto se escribe tal cual; lo demás, formateado en `scratch`.
+    let put_value = |wtr: &mut String, scratch: &mut String, j: usize, width: usize, v: &SynValue, row: usize, col: &dyn Fn() -> String| -> Result<(), Control> {
+        match v {
+            SynValue::Text(t) => put(wtr, j, width, t, true, false, true),
+            _ => {
+                scratch.clear();
+                write_scalar(v, scratch, row, col)?;
+                put(wtr, j, width, scratch, false, matches!(v, SynValue::Nothing), false);
             }
         }
-        wtr.push_str(eol);
         Ok(())
+    };
+    let put_headers = |wtr: &mut String, hs: &[String]| {
+        for (j, h) in hs.iter().enumerate() {
+            put(wtr, j, hs.len(), h, true, false, false);
+        }
+        wtr.push_str(eol);
     };
 
     if rows.is_empty() {
         // Sin filas: con cabeceras explícitas se emite solo esa fila; si no, texto vacío.
         if let Some(hs) = &explicit_headers {
-            write(&mut wtr, &hs.iter().cloned().map(header_cell).collect::<Vec<_>>())?;
+            put_headers(&mut wtr, hs);
         }
     } else {
         match &rows[0] {
@@ -743,7 +720,9 @@ pub fn csv_encode(args: &[SynValue]) -> Result<SynValue, Control> {
                     Some(hs) => hs.clone(),
                     None => first.borrow().keys().map(|k| k.to_string()).collect(),
                 };
-                write(&mut wtr, &headers.iter().cloned().map(header_cell).collect::<Vec<_>>())?;
+                put_headers(&mut wtr, &headers);
+                // Una caché de forma por columna: las filas que comparten forma se leen por posición.
+                let ics: Vec<crate::synmap::MapIc> = headers.iter().map(|_| Default::default()).collect();
                 for (i, r) in rows.iter().enumerate() {
                     let m = match r {
                         SynValue::Map(m) => m.borrow(),
@@ -767,10 +746,9 @@ pub fn csv_encode(args: &[SynValue]) -> Result<SynValue, Control> {
                             headers.join(", ")
                         )));
                     }
-                    let mut rec = Vec::with_capacity(headers.len());
-                    for h in &headers {
-                        match m.get(h) {
-                            Some(v) => rec.push(encode_field(v, i + 1, &format!("{:?}", h))?),
+                    for (j, h) in headers.iter().enumerate() {
+                        match m.get_cached(h, &ics[j]) {
+                            Some(v) => put_value(&mut wtr, &mut scratch, j, headers.len(), v, i + 1, &|| format!("{:?}", h))?,
                             None => {
                                 return Err(err(format!(
                                     "csv_encode: row {} is missing the column {:?} (present in the header row)",
@@ -780,7 +758,7 @@ pub fn csv_encode(args: &[SynValue]) -> Result<SynValue, Control> {
                             }
                         }
                     }
-                    write(&mut wtr, &rec)?;
+                    wtr.push_str(eol);
                 }
             }
             SynValue::List(first) => {
@@ -794,11 +772,11 @@ pub fn csv_encode(args: &[SynValue]) -> Result<SynValue, Control> {
                             width
                         )));
                     }
-                    write(&mut wtr, &hs.iter().cloned().map(header_cell).collect::<Vec<_>>())?;
+                    put_headers(&mut wtr, hs);
                 }
                 for (i, r) in rows.iter().enumerate() {
                     let items = match r {
-                        SynValue::List(l) => l.borrow().to_vec(),
+                        SynValue::List(l) => list_values(l),
                         other => {
                             return Err(err(format!(
                                 "csv_encode: row {} is a {}, but the first row is a list; all rows must have the same shape",
@@ -815,11 +793,10 @@ pub fn csv_encode(args: &[SynValue]) -> Result<SynValue, Control> {
                             width
                         )));
                     }
-                    let mut rec = Vec::with_capacity(items.len());
                     for (j, v) in items.iter().enumerate() {
-                        rec.push(encode_field(v, i + 1, &(j + 1).to_string())?);
+                        put_value(&mut wtr, &mut scratch, j, width, v, i + 1, &|| (j + 1).to_string())?;
                     }
-                    write(&mut wtr, &rec)?;
+                    wtr.push_str(eol);
                 }
             }
             other => {
@@ -947,5 +924,197 @@ mod tests {
         assert!(!out.contains("hunter2"), "plaintext leaked: {}", out);
         assert!(out.contains("Zm9v"), "{}", out);
         assert!(out.contains("42"), "{}", out);
+    }
+}
+
+#[cfg(test)]
+mod reference {
+    //! El lector de antes de perf/tabular (dos pasadas por caracteres, un `String` por campo): el
+    //! oráculo de `scan`.
+    use super::err;
+    use crate::interpreter::Control;
+
+    /// Pre-validación RFC 4180 que el crate `csv` no hace: una comilla de apertura sin
+    /// su cierre consume hasta EOF en silencio — acá se detecta y se reporta con la
+    /// línea donde empezó el campo entrecomillado (G5, "nunca silencioso").
+    pub(super) fn check_unclosed_quote(src: &str, delim: u8) -> Result<(), Control> {
+        let delim = delim as char;
+        let mut line = 1usize;
+        let mut in_quotes = false;
+        let mut quote_line = 0usize;
+        let mut at_field_start = true;
+        let mut it = src.chars().peekable();
+        while let Some(c) = it.next() {
+            if in_quotes {
+                match c {
+                    '"' => {
+                        if it.peek() == Some(&'"') {
+                            it.next(); // "" = comilla escapada, sigue dentro del campo
+                        } else {
+                            in_quotes = false;
+                            at_field_start = false;
+                        }
+                    }
+                    // Como `tokenize`: `\r\n`, `\n` y `\r` solo son UN fin de línea.
+                    '\n' => line += 1,
+                    '\r' if it.peek() != Some(&'\n') => line += 1,
+                    _ => {}
+                }
+            } else if c == '"' && at_field_start {
+                in_quotes = true;
+                quote_line = line;
+            } else if c == delim {
+                at_field_start = true;
+            } else if c == '\n' || c == '\r' {
+                // Un `\r` solo también termina el registro (el tokenizador lo lee así).
+                if !(c == '\r' && it.peek() == Some(&'\n')) {
+                    line += 1;
+                }
+                at_field_start = true;
+            } else {
+                at_field_start = false;
+            }
+        }
+        if in_quotes {
+            return Err(err(format!(
+                "csv_parse: unclosed quote in the field that starts on line {}",
+                quote_line
+            )));
+        }
+        Ok(())
+    }
+
+    /// Un campo leído: su texto y si vino entre comillas (`""` es texto vacío; un campo vacío
+    /// sin comillas es un dato faltante).
+    pub(super) struct Field {
+        pub(super) text: String,
+        pub(super) quoted: bool,
+    }
+
+    /// Una fila: su línea (1-based, donde empieza) y sus campos; `None` = línea en blanco.
+    pub(super) type Record = (usize, Option<Vec<Field>>);
+
+    /// RFC 4180 (v0.6.29): el lector propio para saber qué campos vinieron entre comillas, cosa
+    /// que el crate `csv` no expone. Fin de fila: `\n`, `\r\n` o `\r`. Una comilla sólo abre un
+    /// campo al principio; `""` adentro es una comilla; lo que sigue a la comilla de cierre se
+    /// agrega tal cual (`"x"y` → `xy`, como el crate `csv`). `check_unclosed_quote` ya corrió.
+    pub(super) fn tokenize(src: &str, delim: u8) -> Vec<Record> {
+        let delim = delim as char;
+        let mut out: Vec<Record> = Vec::new();
+        let mut line = 1usize;
+        let mut it = src.chars().peekable();
+        let mut fields: Vec<Field> = Vec::new();
+        let mut cur = String::new();
+        let mut quoted = false;
+        let mut in_quotes = false;
+        let mut field_started = false; // hubo algo (texto o comillas) en la fila
+        let mut rec_line = 1usize;
+        loop {
+            let c = it.next();
+            if in_quotes {
+                match c {
+                    Some('"') => {
+                        if it.peek() == Some(&'"') {
+                            it.next();
+                            cur.push('"');
+                        } else {
+                            in_quotes = false;
+                        }
+                    }
+                    Some(ch) => {
+                        // `\r\n`, `\n` y `\r` solo son UN fin de línea, dentro y fuera de comillas.
+                        if ch == '\n' || (ch == '\r' && it.peek() != Some(&'\n')) {
+                            line += 1;
+                        }
+                        cur.push(ch);
+                    }
+                    None => {}
+                }
+                if c.is_some() {
+                    continue;
+                }
+            }
+            match c {
+                Some(ch) if ch == delim => {
+                    fields.push(Field { text: std::mem::take(&mut cur), quoted });
+                    quoted = false;
+                    field_started = true;
+                }
+                Some('"') if cur.is_empty() && !quoted => {
+                    quoted = true;
+                    in_quotes = true;
+                    field_started = true;
+                }
+                Some(ch @ ('\n' | '\r')) => {
+                    if ch == '\r' && it.peek() == Some(&'\n') {
+                        it.next();
+                    }
+                    if field_started || !cur.is_empty() {
+                        fields.push(Field { text: std::mem::take(&mut cur), quoted });
+                        out.push((rec_line, Some(std::mem::take(&mut fields))));
+                    } else {
+                        out.push((rec_line, None));
+                    }
+                    quoted = false;
+                    field_started = false;
+                    line += 1;
+                    rec_line = line;
+                }
+                Some(ch) => {
+                    cur.push(ch);
+                    field_started = true;
+                }
+                None => {
+                    if field_started || !cur.is_empty() {
+                        fields.push(Field { text: std::mem::take(&mut cur), quoted });
+                        out.push((rec_line, Some(fields)));
+                    }
+                    break;
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    /// Lo que lee `scan` contra lo que leía el lector viejo: las mismas filas (línea, campos, si
+    /// venían entre comillas) y el mismo error de comilla sin cerrar, en miles de CSV aleatorios con
+    /// comillas, `""`, `\r`, `\r\n`, líneas en blanco, delimitadores al final y UTF-8.
+    #[test]
+    fn the_scanner_reads_like_the_reference() {
+        let alphabet: Vec<char> = vec!['a', 'b', ',', ';', '"', '"', '\n', '\r', ' ', 'é', '1'];
+        let mut seed: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..20000 {
+            let len = (next() % 40) as usize;
+            let src: String = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+            for delim in [b',', b';'] {
+                let want: Result<Vec<(usize, Vec<(String, bool)>)>, String> = match reference::check_unclosed_quote(&src, delim) {
+                    Err(Control::Error(e)) => Err(e.message.clone()),
+                    Err(_) => unreachable!(),
+                    Ok(()) => Ok(reference::tokenize(&src, delim)
+                        .into_iter()
+                        .filter_map(|(ln, r)| r.map(|fs| (ln, fs.into_iter().map(|f| (f.text, f.quoted)).collect())))
+                        .collect()),
+                };
+                let mut got_rows: Vec<(usize, Vec<(String, bool)>)> = Vec::new();
+                let got = scan(&src, delim, |ln, fs| got_rows.push((ln, fs.iter().map(|f| (f.text.to_string(), f.quoted)).collect())))
+                    .map(|()| got_rows)
+                    .map_err(|c| match c {
+                        Control::Error(e) => e.message.clone(),
+                        _ => unreachable!(),
+                    });
+                assert_eq!(got, want, "caso {} delim {:?}: {:?}", case, delim as char, src);
+            }
+        }
     }
 }

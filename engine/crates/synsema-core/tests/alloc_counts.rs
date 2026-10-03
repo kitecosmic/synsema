@@ -186,7 +186,7 @@ let j be 1
             let body: String = (0..n).map(|i| format!("{},{}\\n", i, i)).collect();
             format!("let d be csv_parse(\"id,v\\n{}\", {{\"numbers\": true}})\n", body)
         }),
-        4, // F4.5: la fila es un malloc con su forma (F4.4: 6; antes: 8, las cabeceras por fila)
+        1, // perf/tabular: sólo el malloc de la fila (el lector ya no arma un String por campo ni un Vec por fila; F4.5: 4, F4.4: 6, antes: 8)
     ));
 
     let mut report = String::new();
