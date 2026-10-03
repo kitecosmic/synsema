@@ -1312,11 +1312,12 @@ on what can be served — large uploads stream to disk rather than being buffere
   With `--labels` / `serve --attested` they run on the reference interpreter, like any program.
   Up to v0.6.38 the route body itself ran on the reference interpreter: move a heavy loop into a
   `task` the route calls (it reaches native code from its second call).
-- **Memory per worker.** Each worker (`SYNSEMA_SERVE_WORKERS`, default one per core) builds its
-  own copy of the top-level globals on its first request, so RAM ≈ size of the globals × workers
-  (measured: 1 M small records in a global ≈ 160–190 MB per worker; 12 workers ≈ 2.6 GB). With
-  large data in globals, keep the worker count low or keep the data in a database (`sql`) and
-  fetch the page you need. Workers mostly pay off for handlers that wait on I/O or compute.
+- **Memory per worker.** Since engine v0.6.40 the top-level globals (and the modules' code) are
+  frozen once and shared by every worker (`SYNSEMA_SERVE_WORKERS`, default one per core): a write in
+  a handler copies first, so RAM is about one copy of the data plus a few MB per worker (measured:
+  1 M records + 1 M integers in globals, 176 MB with 1 worker, 225 MB with 12; a worker's first
+  request ~8–25 ms). Choose the worker count by CPU. Up to v0.6.39 each worker built its own copy
+  (≈ 160–190 MB per worker for 1 M small records): there, keep N low with large globals.
 
 ## Isolation
 
