@@ -2043,7 +2043,7 @@ pub static AGENT_ECHO_TO_STDERR: std::sync::atomic::AtomicBool =
 fn spawn_agent(
     swarm: Arc<Swarm>,
     agent_name: String,
-    body: Vec<Node>,
+    body: std::sync::Arc<[Node]>,
     send_args: Vec<(String, SendValue)>,
     globals: Arc<Vec<(String, GlobalVal)>>,
     ceiling: Option<Arc<Vec<Capability>>>,

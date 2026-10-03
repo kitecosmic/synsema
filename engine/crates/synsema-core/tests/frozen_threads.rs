@@ -233,3 +233,33 @@ let b be [[2]]
     assert_eq!(shared, vec![false], "con alcance: no");
     assert!(FrozenValue::share(SynValue::Number(synsema_core::number::Number::Int(1))).is_ok());
 }
+
+/// R2.5: el registro de módulos une mapa y entorno por DIRECCIÓN. Si un entorno muere mientras su
+/// mapa sigue vivo (por ejemplo, congelado en una foto) y un entorno nuevo cae en la misma
+/// dirección, el nuevo no puede heredar el mapa ajeno (antes: un worker escribía sus exportaciones
+/// en el mapa de otro módulo, o entraba en pánico si estaba congelado).
+#[test]
+fn a_new_environment_never_inherits_a_dead_modules_map() {
+    use synsema_core::interpreter::{module_map_of_env, register_module, Environment};
+    let i = Interpreter::new();
+    let genv = i.global_env.clone();
+    let mut maps = Vec::new();
+    // Muchos módulos (para que el registro se limpie) cuyos entornos mueren y cuyos mapas quedan.
+    for k in 0..200 {
+        let env = Environment::child(&genv, &format!("module:m{}", k));
+        let map = synsema_core::types::SynMap::new().into_ref();
+        register_module(&map, &env);
+        if k % 2 == 0 {
+            MapRef::make_immortal(&map);
+        }
+        maps.push(map);
+        drop(env);
+    }
+    // Entornos nuevos: el allocator reusa direcciones de los muertos.
+    let mut fresh = Vec::new();
+    for k in 0..400 {
+        let env = Environment::child(&genv, &format!("module:nuevo{}", k));
+        assert!(module_map_of_env(&env).is_none(), "un entorno nuevo heredó el mapa de un módulo muerto");
+        fresh.push(env);
+    }
+}

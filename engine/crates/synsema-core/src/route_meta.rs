@@ -96,7 +96,7 @@ pub struct ServeInfoStatic {
 
 /// Fuente de una task para el cierre transitivo: su cuerpo y sus `require`.
 pub struct TaskSrc {
-    pub body: Vec<Node>,
+    pub body: std::sync::Arc<[Node]>,
     pub requires: Vec<(String, Option<String>)>,
 }
 

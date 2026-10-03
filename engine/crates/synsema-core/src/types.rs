@@ -160,7 +160,8 @@ pub struct SynTaskValue {
     pub name: String,
     /// Parámetros (nombre + default opcional). El default se evalúa en call time (G5).
     pub parameters: Vec<Param>,
-    pub body: Vec<Node>,
+    /// El cuerpo, compartido con el AST y con toda copia de la task (R2.5): nunca se clona.
+    pub body: std::sync::Arc<[Node]>,
     pub closure_env: Rc<RefCell<Environment>>,
     pub origin: Option<SourceLocation>,
     /// (capability, scope) declaradas con `require` dentro del task.

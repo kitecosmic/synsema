@@ -671,7 +671,7 @@ pub(crate) enum GlobalVal {
     Task {
         name: String,
         parameters: Vec<Param>,
-        body: Vec<Node>,
+        body: std::sync::Arc<[Node]>,
         required_capabilities: Vec<(String, Option<String>)>,
     },
     /// Definición de agente (Batch 6): las defs de agentes viven en
@@ -679,7 +679,7 @@ pub(crate) enum GlobalVal {
     /// snapshotean/restauran aparte para que un `spawn` desde una route las encuentre. El
     /// nombre va en la clave de la tupla; el `body` (Vec<Node>) es `Send` y clonable.
     Agent {
-        body: Vec<Node>,
+        body: std::sync::Arc<[Node]>,
     },
     /// Un map que cierra sobre un `module_env` (el alias de un `use "…" as name`, o un
     /// map interno estilo `TOOL_ALLOW` — DE-032). El módulo se identifica por su **ID
@@ -4008,6 +4008,36 @@ pub fn run_serve_program_with_overrides(
 mod tests {
     use super::*;
     use synsema_stdlib::secrets::EnvStore;
+
+    /// R2.5: el código no se copia por worker. Una task (y una lambda guardada en una global)
+    /// reconstruida desde la foto usa EL MISMO cuerpo que la del proceso que la definió.
+    #[test]
+    fn a_rebuilt_task_shares_its_body() {
+        let mut interp = Interpreter::new();
+        let program = synsema_core::parser::parse_source(
+            "task doble(x)
+    let y be x * 2
+    give y
+let f be (x) => x + 1
+",
+            "<r25>",
+        )
+        .expect("parse");
+        assert!(interp.execute(&program).is_ok());
+        let body_of = |i: &Interpreter, name: &str| match synsema_core::interpreter::env_get(&i.global_env, name) {
+            Some(SynValue::Task(t)) => t.body.clone(),
+            other => panic!("{}: {:?}", name, other.map(|v| v.type_name())),
+        };
+        let snap = snapshot_globals_frozen(&interp);
+        let mut worker = Interpreter::new();
+        let _reg = rebuild_globals(&mut worker, &snap, None);
+        for name in ["doble", "f"] {
+            assert!(std::sync::Arc::ptr_eq(&body_of(&interp, name), &body_of(&worker, name)), "{} se copió", name);
+        }
+        // Y la task del AST es la misma que la definida: definir no copia.
+        let synsema_core::ast::NodeKind::TaskDefinition { body, .. } = &program.statements[0].kind else { panic!("task") };
+        assert!(std::sync::Arc::ptr_eq(body, &body_of(&interp, "doble")));
+    }
 
     /// R2.4: la foto de un agente o de `cron` comparte lo que ya está congelado para siempre (las
     /// globales de `serve`) y copia el resto, sin congelar nada nuevo.

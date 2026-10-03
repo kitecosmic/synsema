@@ -84,7 +84,7 @@ enum TaskSnapshot {
     User {
         name: String,
         parameters: Vec<Param>,
-        body: Vec<Node>,
+        body: std::sync::Arc<[Node]>,
         required_capabilities: Vec<(String, Option<String>)>,
         /// Si la task aplicada venía de un módulo (su `closure_env` era el `module_env`),
         /// el ID estable de ese módulo (`"module:<resolved>"`) + el snapshot COMPLETO de

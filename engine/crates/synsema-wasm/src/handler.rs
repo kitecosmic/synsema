@@ -75,7 +75,7 @@ struct RouteEntry {
     requires_auth: bool,
     streaming: bool,
     proxy: bool,
-    body: Vec<Node>,
+    body: std::sync::Arc<[Node]>,
 }
 
 struct Captured {
@@ -100,7 +100,7 @@ struct App {
     /// estado entre requests.
     globals: Vec<(String, SynValue)>,
     /// Agentes definidos en el top-level (`reset_for_request` los borra; vuelven de acá).
-    agents: HashMap<String, (Vec<Node>, Rc<RefCell<Environment>>)>,
+    agents: HashMap<String, (std::sync::Arc<[Node]>, Rc<RefCell<Environment>>)>,
 }
 
 /// Copia profunda de los contenedores mutables (List/Map); el resto (números, texto,

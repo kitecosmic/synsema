@@ -35,7 +35,7 @@ pub(crate) fn children(n: &Node) -> Vec<&Node> {
         SetMutation { target, value } => vec![target, value],
         // Una lambda es un cuerpo de una expresión: se desciende (L2: `declassify` dentro de
         // `(x) => declassify(x, …)` tiene que verse en `codeintel`).
-        LambdaExpression { body, .. } => vec![body.as_ref()],
+        LambdaExpression { body, .. } => body.iter().collect(),
         WhenStatement { condition, body, otherwise, otherwise_when } => {
             let mut v = vec![condition.as_ref()];
             v.extend(body.iter());
@@ -339,7 +339,7 @@ pub fn get_task_dependencies(program: &Program, task_name: &str) -> Vec<String> 
         _ => return Vec::new(),
     };
     let mut calls: Vec<String> = Vec::new();
-    for stmt in body {
+    for stmt in body.iter() {
         walk(stmt, &mut |n| {
             if let NodeKind::TaskCall { name, .. } = &n.kind {
                 if let NodeKind::Identifier { name: id } = &name.kind {
@@ -415,7 +415,7 @@ pub fn extract_task(
                 .iter()
                 .map(|n| Param { name: n.as_str().into(), default: None })
                 .collect(),
-            body: extracted,
+            body: extracted.into(),
             return_type: None,
             capabilities: Vec::new(),
         },
@@ -546,7 +546,8 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
         }
         LetBinding { value, .. } => vec![value.as_mut()],
         SetMutation { target, value } => vec![target.as_mut(), value.as_mut()],
-        LambdaExpression { body, .. } => vec![body.as_mut()],
+        // El cuerpo es compartido (R2.5): reescribirlo copia primero si alguien más lo tiene.
+        LambdaExpression { body, .. } => std::sync::Arc::make_mut(body).iter_mut().collect(),
         WhenStatement { condition, body, otherwise, otherwise_when } => {
             let mut v = vec![condition.as_mut()];
             v.extend(body.iter_mut());
@@ -596,7 +597,7 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
         TaskDefinition { parameters, body, .. } => {
             let mut v: Vec<&mut Node> =
                 parameters.iter_mut().filter_map(|p| p.default.as_mut()).collect();
-            v.extend(body.iter_mut());
+            v.extend(std::sync::Arc::make_mut(body).iter_mut());
             v
         }
         TaskCall { name, arguments } => {
@@ -607,7 +608,7 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
         GiveStatement { value } => value.iter_mut().map(|b| b.as_mut()).collect(),
         AgentDefinition { capabilities, body, .. } => {
             let mut v: Vec<&mut Node> = capabilities.iter_mut().collect();
-            v.extend(body.iter_mut());
+            v.extend(std::sync::Arc::make_mut(body).iter_mut());
             v
         }
         SpawnStatement { arguments, .. } => arguments.iter_mut().map(|(_, node)| node).collect(),
@@ -692,7 +693,7 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
         RouteDefinition { rate_limit, timeout, body, .. } => {
             let mut v: Vec<&mut Node> = rate_limit.iter_mut().map(|b| b.as_mut()).collect();
             v.extend(timeout.iter_mut().map(|b| b.as_mut()));
-            v.extend(body.iter_mut());
+            v.extend(std::sync::Arc::make_mut(body).iter_mut());
             v
         }
         ServeBlock {

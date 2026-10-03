@@ -1625,7 +1625,9 @@ impl<'r, 's> Compiler<'r, 's> {
                 let params: Vec<Arc<str>> = parameters.iter().map(|p| p.name.clone()).collect();
                 Some(self.child(s, &params, &body, false))
             }
-            (NodeKind::LambdaExpression { body, parameters }, Some(s)) => Some(self.child(s, parameters, &[&**body], true)),
+            (NodeKind::LambdaExpression { body, parameters }, Some(s)) => {
+                Some(self.child(s, parameters, &[crate::ast::lambda_expr(body)], true))
+            }
             _ => None,
         };
         let node = self.cold(n);

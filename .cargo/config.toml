@@ -7,3 +7,13 @@ rustflags = ["-C", "link-args=-zstack-size=67108864"]
 
 [target.wasm32-unknown-unknown]
 rustflags = ["-C", "link-args=-zstack-size=67108864"]
+
+# mimalloc en windows-gnu (el toolchain de desarrollo, ver rust-toolchain.toml): por defecto avisa
+# que un hilo terminó con callbacks TLS registrados por `#pragma data_seg(".CRT$XLB")`, que sólo
+# entiende MSVC; GCC lo ignora sin error, `_mi_thread_done` no corre nunca y la memoria de cada hilo
+# que termina queda abandonada (medido: 1600 hilos que reservan y sueltan 4 MB → +114 MB; `serve`
+# crecía ~4 MB por agente lanzado y `parallel_map` ~11 MB/s en lampson). `MI_WIN_INIT_USE_FLS` usa
+# la API de fibras (`FlsAlloc` con destructor por hilo), que funciona con GCC: queda plano. La
+# release de Windows es MSVC (no le afecta); el CLI usa mimalloc sólo en Windows.
+[env]
+CFLAGS_x86_64_pc_windows_gnu = "-DMI_WIN_INIT_USE_FLS=1"
