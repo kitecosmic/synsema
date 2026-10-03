@@ -846,7 +846,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
             loc,
             NodeKind::MatchStatement {
                 value: Box::new(value),
-                arms,
+                arms: tight(arms),
                 otherwise,
             },
         ))
@@ -1069,7 +1069,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
             loc,
             NodeKind::TaskDefinition {
                 name: name_tok.as_str().to_string(),
-                parameters: params,
+                parameters: tight(params),
                 body: crate::ast::seal_body(body),
                 return_type: None,
                 capabilities: Vec::new(),
@@ -1256,7 +1256,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
             loc,
             NodeKind::SpawnStatement {
                 agent_name: name_tok.as_str().to_string(),
-                arguments: args,
+                arguments: tight(args),
             },
         ))
     }
@@ -2482,7 +2482,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                     loc,
                     NodeKind::TaskCall {
                         name: Box::new(node),
-                        arguments: args,
+                        arguments: tight(args),
                     },
                 );
             } else if self.check(TokenType::Dot) {
@@ -2611,7 +2611,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         Ok(Node::new(
             loc,
             NodeKind::LambdaExpression {
-                parameters: params,
+                parameters: tight(params),
                 // Listo para correr como task (`[give <expresión>]`), una vez acá y no en cada
                 // lambda que se crea (R2.5).
                 body: crate::ast::seal_body(vec![give]),
@@ -2766,7 +2766,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                     }
                 }
                 self.expect(TokenType::RBracket, "")?;
-                Ok(Node::new(loc, NodeKind::ListLiteral { elements }))
+                Ok(Node::new(loc, NodeKind::ListLiteral { elements: tight(elements) }))
             }
             TokenType::LBrace => {
                 self.advance();
@@ -2787,7 +2787,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                     }
                 }
                 self.expect(TokenType::RBrace, "")?;
-                Ok(Node::new(loc, NodeKind::MapLiteral { pairs }))
+                Ok(Node::new(loc, NodeKind::MapLiteral { pairs: tight(pairs) }))
             }
             TokenType::LParen => {
                 // Lambda `(params) => expr` o expresión agrupada `(expr)`.
@@ -2858,7 +2858,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         if self.check(TokenType::Newline) && self.peek(1).ty == TokenType::Indent {
             body = self.parse_block()?;
         }
-        Ok(Node::new(loc, NodeKind::ReasonExpression { subject, context, body }))
+        Ok(Node::new(loc, NodeKind::ReasonExpression { subject, context: tight(context), body: tight(body) }))
     }
 
     fn parse_decide_expr(&mut self) -> Result<Node, ParseError> {
@@ -3120,7 +3120,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
             NodeKind::GenerateExpression {
                 target: target_tok.as_str().to_string(),
                 given,
-                parameters: params,
+                parameters: tight(params),
             },
         ))
     }
@@ -3856,4 +3856,11 @@ fn has_unicode_escape(raw: &str, braces: bool) -> bool {
         i += 1;
     }
     false
+}
+
+/// El AST vive lo que el programa y se comparte (R2.5): cada lista que arma el parser con `push` se
+/// guarda sin la capacidad de sobra (hasta el doble), en vez de compactarla después copiándola.
+fn tight<T>(mut v: Vec<T>) -> Vec<T> {
+    v.shrink_to_fit();
+    v
 }

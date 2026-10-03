@@ -636,13 +636,13 @@ pub enum NodeKind {
     },
 }
 
-/// Un cuerpo de task, lambda, agente o ruta listo para compartir (R2.5): una copia profunda, que deja
-/// cada `Vec` y cada `String` de adentro con la capacidad justa (el parser los arma con `push`, que
-/// deja hasta el doble). Se hace UNA vez, al parsear; después el cuerpo se comparte sin copiarse
-/// (antes se copiaba en cada definición, en cada worker y en cada item de `parallel_map`). Un cuerpo
-/// de adentro que ya está sellado se comparte, no se copia otra vez.
+/// Un cuerpo de task, lambda, agente o ruta listo para compartir (R2.5): se arma UNA vez, al
+/// parsear, y después se comparte sin copiarse (antes se copiaba en cada definición, en cada worker
+/// y en cada item de `parallel_map`). Las listas de adentro ya vienen sin capacidad de sobra (el
+/// parser las ajusta al armarlas: `parse_block`, `tight`), así que acá no se copia nada: compactar
+/// copiando el árbol entero duplicaba lo que se reserva al parsear y subía el pico del proceso.
 pub fn seal_body(body: Vec<Node>) -> Arc<[Node]> {
-    body.iter().cloned().collect()
+    body.into()
 }
 
 /// La expresión de una lambda: su cuerpo es `[give <expresión>]` (ver `NodeKind::LambdaExpression`).
