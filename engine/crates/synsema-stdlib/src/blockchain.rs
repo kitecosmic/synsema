@@ -789,7 +789,7 @@ fn rlp_decode_list(
         items.push(v);
         p = np;
     }
-    Ok((SynValue::List(Rc::new(RefCell::new(items.into()))), end))
+    Ok((SynValue::List(synsema_core::types::ListRef::new(items.into())), end))
 }
 
 fn rlp_decode(args: &[SynValue]) -> Result<SynValue, Control> {

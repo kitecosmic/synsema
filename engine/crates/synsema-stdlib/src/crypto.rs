@@ -326,7 +326,7 @@ mod tests {
     fn a_sealed_secret_is_rejected_by_every_generic_crypto_border() {
         use synsema_core::secret::SecretInner;
         let scalar = vec![7u8; 32];
-        let sealed = SynValue::Secret(std::rc::Rc::new(SecretInner::new_bytes_sealed("attestation_key", scalar.clone())));
+        let sealed = SynValue::Secret(synsema_core::types::Obj::new(SecretInner::new_bytes_sealed("attestation_key", scalar.clone())));
         let msg = |r: Result<SynValue, Control>| -> String {
             match r {
                 Err(Control::Error(e)) => e.into_message(),

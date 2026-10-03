@@ -466,7 +466,9 @@ pub(crate) fn run_mode_cron_executor(
             .clone();
         let env = CronExecEnv {
             swarm: swarm.clone(),
-            snapshot: snapshot_globals(interp),
+            // Lo ya congelado para siempre (las globales de `serve`) se comparte; lo demás se copia:
+            // esta foto se repite en cada registración (R2.4).
+            snapshot: snapshot_globals_shared(interp),
             caps_snap: Arc::new(caps.borrow().granted.iter().cloned().collect()),
             shared_db: shared_db.clone(),
             rules_snap: Arc::new(Vec::new()),
@@ -655,6 +657,13 @@ impl ServeOverrides {
 
 pub(crate) enum GlobalVal {
     Value(SendValue),
+    /// Un dato congelado en el lugar (R2 de specs/modelo-memoria-regiones.md): todos los workers
+    /// leen EL MISMO, sin copiarlo (`Value` es una copia que cada worker vuelve a armar). Sólo en
+    /// las fotos que viven lo que el proceso (`snapshot_globals_frozen`): congelar es para siempre.
+    Frozen(synsema_core::frozen::FrozenValue),
+    /// Un dato congelado sólo mientras corren los hilos de un `ScopedFreeze` (R2.3, `parallel_map`):
+    /// el índice del valor en su `ScopeCtx`, que el rebuild recibe (`scope`).
+    Scoped(usize),
     /// Un generador de `rng()` que vive en un global: del otro lado (cada request de `serve`,
     /// cada worker) sería una copia que REPITE la misma secuencia, así que llega como un valor
     /// que al usarse explica qué hacer. El `String` es su nombre (`rng(42)`).
@@ -662,7 +671,7 @@ pub(crate) enum GlobalVal {
     Task {
         name: String,
         parameters: Vec<Param>,
-        body: Vec<Node>,
+        body: std::sync::Arc<[Node]>,
         required_capabilities: Vec<(String, Option<String>)>,
     },
     /// Definición de agente (Batch 6): las defs de agentes viven en
@@ -670,7 +679,7 @@ pub(crate) enum GlobalVal {
     /// snapshotean/restauran aparte para que un `spawn` desde una route las encuentre. El
     /// nombre va en la clave de la tupla; el `body` (Vec<Node>) es `Send` y clonable.
     Agent {
-        body: Vec<Node>,
+        body: std::sync::Arc<[Node]>,
     },
     /// Un map que cierra sobre un `module_env` (el alias de un `use "…" as name`, o un
     /// map interno estilo `TOOL_ALLOW` — DE-032). El módulo se identifica por su **ID
@@ -708,10 +717,10 @@ pub(crate) enum GlobalVal {
 }
 
 /// Estado del ÁRBOL COMPLETO de un snapshot. Se comparte entre TODOS los bindings de
-/// `snapshot_globals` para que el diamante entre bindings top-level (b y c importan d)
+/// `snapshot_globals_*` para que el diamante entre bindings top-level (b y c importan d)
 /// también dedupee: d viaja UNA vez, las demás apariciones son referencias por id.
 #[derive(Default)]
-struct SnapState {
+struct SnapState<'a> {
     /// `module_env`s EN CURSO de snapshot (stack, por identidad de `Rc`): corta la
     /// recursión de un map interno auto-referencial (TOOL_ALLOW — DE-032) y de
     /// cualquier ciclo hipotético.
@@ -719,16 +728,46 @@ struct SnapState {
     /// `module_env`s YA snapshoteados en este árbol: una segunda aparición (el otro
     /// brazo del diamante B→D←C — DE-033) viaja como referencia por id, no como copia.
     done: HashSet<usize>,
+    /// Los datos se congelan en el lugar (`GlobalVal::Frozen`) en vez de copiarse: sólo para una
+    /// foto que vive lo que el proceso (las globales del preámbulo de `serve`).
+    freeze: bool,
+    /// Los datos se congelan sólo mientras corren los hilos de este alcance (`GlobalVal::Scoped`).
+    scoped: Option<&'a mut synsema_core::frozen::ScopedFreeze>,
+    /// Lo que YA está congelado para siempre se comparte (`GlobalVal::Frozen`) sin congelar nada
+    /// nuevo; lo demás se copia (agentes y `cron`, R2.4).
+    share: bool,
+}
+
+/// Un dato (sin tareas): congelado si la foto congela y se puede; si no, la copia de siempre (un
+/// generador adentro cruza como stub).
+fn data_global(v: &SynValue, state: &mut SnapState) -> GlobalVal {
+    if state.freeze {
+        if let Ok(f) = synsema_core::frozen::FrozenValue::new(v.clone()) {
+            return GlobalVal::Frozen(f);
+        }
+    }
+    if state.share {
+        if let Ok(f) = synsema_core::frozen::FrozenValue::share(v.clone()) {
+            return GlobalVal::Frozen(f);
+        }
+    }
+    if let Some(scope) = state.scoped.as_deref_mut() {
+        if let Ok(i) = scope.add(v.clone()) {
+            return GlobalVal::Scoped(i);
+        }
+    }
+    GlobalVal::Value(synsema_core::rng::with_stubbed_globals(|| to_send(v)))
 }
 
 /// Convierte un `SynValue` a `GlobalVal` de forma recursiva, con un árbol de snapshot
-/// propio (para snapshots de UN valor suelto, p.ej. los globales que viajan a un agente
+/// propio (para snapshots de UN valor suelto: los globales que viajan a un agente
 /// spawneado). Un Map que cierra sobre un `module_env` se snapshotea como
 /// `GlobalVal::Module` (env inline la primera vez, referencia por id después); un Map
-/// de datos con tasks se preserva como `MapWithTasks`; un Map puramente de valores viaja
-/// barato como SendValue.
-pub(crate) fn val_to_global(v: &SynValue) -> GlobalVal {
-    val_to_global_inner(v, &mut SnapState::default())
+/// de datos con tasks se preserva como `MapWithTasks`. Los datos: lo que ya está congelado
+/// para siempre se comparte (sin congelar nada nuevo) y el resto se copia como SendValue — el
+/// agente vive libre (R2.4). Bajo `serve`, las globales del preámbulo llegan sin copia.
+pub(crate) fn val_to_global_shared(v: &SynValue) -> GlobalVal {
+    val_to_global_inner(v, &mut SnapState { share: true, ..SnapState::default() })
 }
 
 /// ¿La entry `(k, v)` del map alias es EL MISMO objeto que el binding `k` del
@@ -738,8 +777,8 @@ fn is_export_of(module_env: &Rc<RefCell<Environment>>, k: &str, v: &SynValue) ->
     let env = module_env.borrow();
     match (env.bindings.get(k), v) {
         (Some(SynValue::Task(a)), SynValue::Task(b)) => Rc::ptr_eq(a, b),
-        (Some(SynValue::Map(a)), SynValue::Map(b)) => Rc::ptr_eq(a, b),
-        (Some(SynValue::List(a)), SynValue::List(b)) => Rc::ptr_eq(a, b),
+        (Some(SynValue::Map(a)), SynValue::Map(b)) => synsema_core::types::MapRef::ptr_eq(a, b),
+        (Some(SynValue::List(a)), SynValue::List(b)) => synsema_core::types::ListRef::ptr_eq(a, b),
         _ => false,
     }
 }
@@ -748,7 +787,7 @@ fn is_export_of(module_env: &Rc<RefCell<Environment>>, k: &str, v: &SynValue) ->
 /// `is_export` las que son el mismo objeto que el binding homónimo del env (en rebuild
 /// se cosechan del env reconstruido → identidad compartida alias↔env).
 fn snapshot_alias_entries(
-    m: &Rc<RefCell<MapObj>>,
+    m: &synsema_core::types::MapRef,
     module_env: &Rc<RefCell<Environment>>,
     state: &mut SnapState,
 ) -> Vec<(String, GlobalVal, bool)> {
@@ -761,7 +800,7 @@ fn snapshot_alias_entries(
         .collect()
 }
 
-/// Núcleo recursivo de `val_to_global`/`snapshot_globals`/`snapshot_module_env`.
+/// Núcleo recursivo de `val_to_global_shared`/`snapshot_globals_*`/`snapshot_module_env`.
 fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
     match v {
         SynValue::Task(t) => GlobalVal::Task {
@@ -807,15 +846,15 @@ fn val_to_global_inner(v: &SynValue, state: &mut SnapState) -> GlobalVal {
                 .iter()
                 .map(|(k, v)| (k.to_string(), val_to_global_inner(v, state)))
                 .collect();
-            // Map puramente de valores primitivos → viaja barato como SendValue.
-            if entries.iter().all(|(_, gv)| matches!(gv, GlobalVal::Value(_))) {
-                return GlobalVal::Value(synsema_core::rng::with_stubbed_globals(|| to_send(&SynValue::Map(m.clone()))));
+            // Map puramente de datos → un solo dato (congelado, o la copia de siempre).
+            if entries.iter().all(|(_, gv)| matches!(gv, GlobalVal::Value(_) | GlobalVal::Frozen(_))) {
+                return data_global(v, state);
             }
             // Map de datos con callbacks (tasks que NO cierran sobre un módulo).
             GlobalVal::MapWithTasks(entries)
         }
         // Una lista (o lo que sea) con un generador adentro: el generador cruza como stub.
-        other => GlobalVal::Value(synsema_core::rng::with_stubbed_globals(|| to_send(other))),
+        other => data_global(other, state),
     }
 }
 
@@ -838,10 +877,16 @@ pub(crate) fn module_env_of(map: &MapObj) -> Option<Rc<RefCell<Environment>>> {
 /// referencia interna a él — map auto-referencial — viaja por id, no re-snapshotea).
 /// Reusa el mismo camino que la rama Module de `val_to_global_inner` — usado por
 /// `parallel_map` para capturar el módulo de la task aplicada (DE-030).
-pub(crate) fn snapshot_module_env(module_env: &Rc<RefCell<Environment>>) -> Vec<(String, GlobalVal)> {
+pub(crate) fn snapshot_module_env(
+    module_env: &Rc<RefCell<Environment>>,
+    scoped: Option<&mut synsema_core::frozen::ScopedFreeze>,
+) -> Vec<(String, GlobalVal)> {
     let mut state = SnapState {
         in_progress: vec![Rc::as_ptr(module_env) as usize],
         done: HashSet::new(),
+        freeze: false,
+        scoped,
+        share: false,
     };
     module_env
         .borrow()
@@ -869,6 +914,7 @@ pub(crate) fn rebuild_module_env(
     env: &[(String, GlobalVal)],
     base: &Rc<RefCell<Environment>>,
     registry: &mut ModuleRegistry,
+    scope: Option<&synsema_core::frozen::ScopeCtx>,
 ) -> Rc<RefCell<Environment>> {
     // Identidad primero: si ESTE rebuild ya reconstruyó el módulo (p.ej. llegó por otro
     // brazo del diamante, o la task aplicada es de un módulo también global), reusar ese
@@ -885,7 +931,7 @@ pub(crate) fn rebuild_module_env(
     // que aparezca durante la población resuelve a ESTE env en construcción.
     registry.insert(id.to_string(), module_env.clone());
     for (k, gv) in env {
-        let v = rebuild_global_val(gv, &module_env, base, registry);
+        let v = rebuild_global_val(gv, &module_env, base, registry, scope);
         module_env.borrow_mut().bindings.insert(k.clone(), v);
     }
     module_env
@@ -903,9 +949,12 @@ fn rebuild_global_val(
     closure_target: &Rc<RefCell<Environment>>,
     base: &Rc<RefCell<Environment>>,
     registry: &mut ModuleRegistry,
+    scope: Option<&synsema_core::frozen::ScopeCtx>,
 ) -> SynValue {
     match gv {
         GlobalVal::Value(sv) => from_send(sv),
+        GlobalVal::Frozen(f) => f.get(),
+        GlobalVal::Scoped(i) => scope.expect("un valor con alcance se reconstruye dentro de su alcance").get(*i),
         GlobalVal::Task { name, parameters, body, required_capabilities } => {
             SynValue::Task(Rc::new(SynTaskValue {
                 name: name.clone(),
@@ -921,7 +970,7 @@ fn rebuild_global_val(
             // Resolver el `module_env` compartido: el primer encuentro (env inline) lo
             // construye y registra; una referencia (env: None) lo toma del registro.
             let module_env = match env {
-                Some(entries) => rebuild_module_env(id, entries, base, registry),
+                Some(entries) => rebuild_module_env(id, entries, base, registry, scope),
                 None => match registry.get(id) {
                     Some(e) => e.clone(),
                     None => {
@@ -970,7 +1019,7 @@ fn rebuild_global_val(
                     // `is_export` sin binding aún: referencia dentro de un env en plena
                     // población (orden arbitrario del HashMap de bindings) → materializar
                     // desde el GlobalVal como fallback.
-                    None => rebuild_global_val(gv, &module_env, base, registry),
+                    None => rebuild_global_val(gv, &module_env, base, registry, scope),
                 };
                 m.insert(k.clone(), v);
             }
@@ -986,7 +1035,7 @@ fn rebuild_global_val(
             // task top-level), NO sobre un module_env compartido.
             let mut m = SynMap::new();
             for (k, gv) in entries {
-                m.insert(k.clone(), rebuild_global_val(gv, base, base, registry));
+                m.insert(k.clone(), rebuild_global_val(gv, base, base, registry, scope));
             }
             SynValue::Map(m.into_ref())
         }
@@ -999,15 +1048,58 @@ fn rebuild_global_val(
 
 /// Snapshot de las bindings globales (tras correr el top-level). Los builtins se
 /// re-registran por intérprete (no se copian); las tasks se copian con su AST;
-/// los módulos importados (maps con tasks) se snapshotean recursivamente.
-pub(crate) fn snapshot_globals(interp: &Interpreter) -> Arc<Vec<(String, GlobalVal)>> {
+/// los módulos importados (maps con tasks) se snapshotean recursivamente. Los datos según
+/// cuánto vive la foto (R2): congelados para siempre (`snapshot_globals_frozen`), compartiendo lo
+/// ya permanente y copiando el resto (`snapshot_globals_shared`), o congelados mientras corre un
+/// alcance (`snapshot_globals_scoped`).
+///
+/// Congelando los datos en el lugar (R2): todos los workers leen las mismas
+/// globales, sin una copia por worker. **Sólo para una foto que vive lo que el proceso** (las
+/// globales del preámbulo de `serve`, el proceso de sólo `cron`): un inmortal no se libera nunca, así
+/// que congelar en una foto que se repite (`parallel_map`, `cron_every` desde una ruta) sería una
+/// fuga. Después de esto el programa sigue andando igual: escribir una global congelada copia.
+pub(crate) fn snapshot_globals_frozen(interp: &Interpreter) -> Arc<Vec<(String, GlobalVal)>> {
+    snapshot_globals_with(interp, true, None)
+}
+
+/// Las globales compartiendo lo que ya está congelado para siempre y copiando el resto (R2.4):
+/// para una foto que se puede repetir y cuyos hilos viven libres (`cron_every`, también desde una
+/// ruta). Congelar ahí sería una fuga por foto; compartir lo permanente, no.
+pub(crate) fn snapshot_globals_shared(interp: &Interpreter) -> Arc<Vec<(String, GlobalVal)>> {
+    snapshot_globals_mode(interp, false, None, true)
+}
+
+/// Las globales congelando los datos SÓLO mientras corren los hilos de `scope` (R2.3,
+/// `parallel_map`): los hilos los leen sin una copia por item, y al terminar vuelven a ser objetos
+/// comunes (`ScopedFreeze::run`). Reconstruir esta foto pide el `ScopeCtx` (`rebuild_globals`).
+pub(crate) fn snapshot_globals_scoped(
+    interp: &Interpreter,
+    scope: &mut synsema_core::frozen::ScopedFreeze,
+) -> Arc<Vec<(String, GlobalVal)>> {
+    snapshot_globals_with(interp, false, Some(scope))
+}
+
+fn snapshot_globals_with(
+    interp: &Interpreter,
+    freeze: bool,
+    scoped: Option<&mut synsema_core::frozen::ScopedFreeze>,
+) -> Arc<Vec<(String, GlobalVal)>> {
+    snapshot_globals_mode(interp, freeze, scoped, false)
+}
+
+fn snapshot_globals_mode(
+    interp: &Interpreter,
+    freeze: bool,
+    scoped: Option<&mut synsema_core::frozen::ScopedFreeze>,
+    share: bool,
+) -> Arc<Vec<(String, GlobalVal)>> {
     let env = interp.global_env.borrow();
     let mut out: Vec<(String, GlobalVal)> = Vec::new();
     // UN SnapState para TODOS los bindings: el diamante entre bindings top-level (b y c
     // importan d) dedupea — el env de d viaja UNA vez y la otra aparición es referencia
     // por id. El orden del Vec se conserva → en rebuild el primer encuentro (que lleva
     // el env inline) siempre se procesa antes que sus referencias.
-    let mut state = SnapState::default();
+    let mut state = SnapState { freeze, scoped, share, ..SnapState::default() };
     for (k, v) in env.bindings.iter() {
         if let SynValue::Builtin(b) = v {
             if synsema_core::rng::snapshot(b).is_some() {
@@ -1034,6 +1126,7 @@ pub(crate) fn snapshot_globals(interp: &Interpreter) -> Arc<Vec<(String, GlobalV
 pub(crate) fn rebuild_globals(
     interp: &mut Interpreter,
     snapshot: &[(String, GlobalVal)],
+    scope: Option<&synsema_core::frozen::ScopeCtx>,
 ) -> ModuleRegistry {
     let mut registry = ModuleRegistry::new();
     // Agentes (Batch 6): van al mapa separado `agent_definitions` (NO a bindings). Se
@@ -1048,7 +1141,7 @@ pub(crate) fn rebuild_globals(
                 // Top-level: las tasks cierran sobre el global (closure_target) y los
                 // nuevos module_env también cuelgan del global (base).
                 let genv = interp.global_env.clone();
-                let v = rebuild_global_val(other, &genv, &genv, &mut registry);
+                let v = rebuild_global_val(other, &genv, &genv, &mut registry, scope);
                 interp.set_global(k, v);
             }
         }
@@ -1474,7 +1567,7 @@ fn build_base_interp(
     // (state_*, DB compartida, approvals, cron, bus, memoria) — no en una isla.
     wire_swarm_hooks(&mut interp, swarm, "request", host_ceiling, mem_ctx, agent_builder, &caps);
     register_database_builtins(&interp, shared_db, caps.clone());
-    let registry = rebuild_globals(&mut interp, snapshot);
+    let registry = rebuild_globals(&mut interp, snapshot, None);
     let originals = Originals::capture(&interp, snapshot, &registry);
     // A cargo del intérprete (un worker que se descarta tras un pánico, un agente de un handler):
     // se vacían cuando muere (ver `adopt_module_envs`).
@@ -2991,8 +3084,9 @@ fn make_serve_hook(
         };
 
         // Snapshot de globales (una vez, ya corrió el top-level): cada request lo
-        // reconstruye en su intérprete fresco. Intent enriquece /llms.txt.
-        let snapshot = snapshot_globals(interp);
+        // reconstruye en su intérprete fresco. Intent enriquece /llms.txt. Los datos se
+        // congelan en el lugar (R2): todos los workers leen los mismos, sin copiarlos.
+        let snapshot = snapshot_globals_frozen(interp);
         // Snapshot `Send` de las capabilities concedidas por el preámbulo `require`
         // (ya corrió, porque `serve on` viene después). Cada request las re-aplica en
         // su intérprete fresco (los grants no cruzan hilos vía `Rc`).
@@ -3803,7 +3897,8 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
                 Arc::new(top_level_memory.borrow().rules.values().cloned().collect());
             let env = CronExecEnv {
                 swarm,
-                snapshot: snapshot_globals(&interp),
+                // Una sola foto para lo que dura el proceso: congelada (R2).
+                snapshot: snapshot_globals_frozen(&interp),
                 caps_snap: Arc::new(caps.borrow().granted.iter().cloned().collect()),
                 shared_db,
                 rules_snap,
@@ -3913,6 +4008,70 @@ pub fn run_serve_program_with_overrides(
 mod tests {
     use super::*;
     use synsema_stdlib::secrets::EnvStore;
+
+    /// R2.5: el código no se copia por worker. Una task (y una lambda guardada en una global)
+    /// reconstruida desde la foto usa EL MISMO cuerpo que la del proceso que la definió.
+    #[test]
+    fn a_rebuilt_task_shares_its_body() {
+        let mut interp = Interpreter::new();
+        let program = synsema_core::parser::parse_source(
+            "task doble(x)
+    let y be x * 2
+    give y
+let f be (x) => x + 1
+",
+            "<r25>",
+        )
+        .expect("parse");
+        assert!(interp.execute(&program).is_ok());
+        let body_of = |i: &Interpreter, name: &str| match synsema_core::interpreter::env_get(&i.global_env, name) {
+            Some(SynValue::Task(t)) => t.body.clone(),
+            other => panic!("{}: {:?}", name, other.map(|v| v.type_name())),
+        };
+        let snap = snapshot_globals_frozen(&interp);
+        let mut worker = Interpreter::new();
+        let _reg = rebuild_globals(&mut worker, &snap, None);
+        for name in ["doble", "f"] {
+            assert!(std::sync::Arc::ptr_eq(&body_of(&interp, name), &body_of(&worker, name)), "{} se copió", name);
+        }
+        // Y la task del AST es la misma que la definida: definir no copia.
+        let synsema_core::ast::NodeKind::TaskDefinition { body, .. } = &program.statements[0].kind else { panic!("task") };
+        assert!(std::sync::Arc::ptr_eq(body, &body_of(&interp, "doble")));
+    }
+
+    /// R2.4: la foto de un agente o de `cron` comparte lo que ya está congelado para siempre (las
+    /// globales de `serve`) y copia el resto, sin congelar nada nuevo.
+    #[test]
+    fn a_shared_snapshot_shares_only_what_is_already_permanent() {
+        let mut interp = Interpreter::new();
+        let program = synsema_core::parser::parse_source(
+            "let fijo be [\"un texto largo que no entra en línea\", {\"a\": 1}]
+let nuevo be {\"b\": [2, 3]}
+",
+            "<r24>",
+        )
+        .expect("parse");
+        assert!(interp.execute(&program).is_ok());
+        let fijo = synsema_core::interpreter::env_get(&interp.global_env, "fijo").expect("fijo");
+        let nuevo = synsema_core::interpreter::env_get(&interp.global_env, "nuevo").expect("nuevo");
+        // `fijo` como las globales de `serve`: congelado para siempre.
+        let _f = synsema_core::frozen::FrozenValue::new(fijo.clone()).ok().expect("se congela");
+        let snap = snapshot_globals_shared(&interp);
+        let kind = |name: &str| match snap.iter().find(|(k, _)| k == name).map(|(_, g)| g) {
+            Some(GlobalVal::Frozen(_)) => "compartido",
+            Some(GlobalVal::Value(_)) => "copia",
+            _ => "otro",
+        };
+        assert_eq!(kind("fijo"), "compartido");
+        assert_eq!(kind("nuevo"), "copia");
+        // Y no congeló lo que no lo estaba.
+        match &nuevo {
+            SynValue::Map(m) => assert!(!synsema_core::types::MapRef::is_immortal(m)),
+            other => panic!("{}", other.type_name()),
+        }
+        assert!(matches!(val_to_global_shared(&fijo), GlobalVal::Frozen(_)));
+        assert!(matches!(val_to_global_shared(&nuevo), GlobalVal::Value(_)));
+    }
 
     fn enqueued(id: &str, token: &str) -> synsema_llm::human::EnqueuedApproval {
         synsema_llm::human::EnqueuedApproval {

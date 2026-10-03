@@ -1189,7 +1189,7 @@ mod shape_tests {
             let rows = (offset..(offset + limit).min(250)).map(syn_int).collect();
             Ok((rows, 250))
         });
-        let v = SynValue::Server(Rc::new(ServerValue::Paged(fetch.clone())));
+        let v = SynValue::Server(synsema_core::types::Obj::new(ServerValue::Paged(fetch.clone())));
         for q in queries() {
             let (limit, offset) = page_window(&q);
             let (rows, total) = fetch(Some(limit), offset).unwrap();

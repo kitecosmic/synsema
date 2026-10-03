@@ -1416,7 +1416,7 @@ fn b_attestation_key(caps: &Rc<RefCell<CapabilitySet>>, _args: &[SynValue]) -> R
         // Auditoría externa: secret SELLADO — `reveal()` lo rechaza siempre; sólo lo consumen
         // `ecdh_shared_secret`/firma vía `expose_bytes`. Es la clave que ancla TLS y el
         // documento: exportarla anularía la attestation.
-        Some(id) => Ok(SynValue::Secret(Rc::new(SecretInner::new_bytes_sealed("attestation_key", id.private_scalar.clone())))),
+        Some(id) => Ok(SynValue::Secret(synsema_core::types::Obj::new(SecretInner::new_bytes_sealed("attestation_key", id.private_scalar.clone())))),
         None => Err(err(format!("attestation_key: {}", NOT_ATTESTED))),
     }
 }
@@ -1639,7 +1639,7 @@ mod tests {
     /// el embudo de toda la familia —firma incluida—, así que cerrarlo cierra los cinco caminos.
     #[test]
     fn the_custody_family_refuses_a_sealed_key() {
-        let sealed = SynValue::Secret(Rc::new(SecretInner::new_bytes_sealed("attestation_key", vec![7u8; 32])));
+        let sealed = SynValue::Secret(synsema_core::types::Obj::new(SecretInner::new_bytes_sealed("attestation_key", vec![7u8; 32])));
         for who in ["keystore_export", "mnemonic_from_entropy", "hd_derive", "secp256k1_sign", "ed25519_sign"] {
             let e = match crate::blockchain::key_material(&sealed, who) {
                 Err(Control::Error(e)) => e.into_message(),
@@ -1649,7 +1649,7 @@ mod tests {
             assert!(e.contains("sealed") && e.contains(who), "{}: {}", who, e);
         }
         // Un secret de clave normal sigue funcionando (no se nerfea la custodia legítima).
-        let normal = SynValue::Secret(Rc::new(SecretInner::new_bytes("HOT_KEY", vec![3u8; 32])));
+        let normal = SynValue::Secret(synsema_core::types::Obj::new(SecretInner::new_bytes("HOT_KEY", vec![3u8; 32])));
         let (name, key) = match crate::blockchain::key_material(&normal, "secp256k1_sign") {
             Ok(v) => v,
             Err(Control::Error(e)) => panic!("clave normal rechazada: {}", e.message),

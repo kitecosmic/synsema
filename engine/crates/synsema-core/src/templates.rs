@@ -30,7 +30,7 @@ use crate::types::{ServerValue, SynValue};
 /// servidor con tag `_RAW` ({body, content_type, status}). El corpus lo observa
 /// con `body of …` (property access sobre el Server value).
 pub fn make_raw(body: String, content_type: &str, status: i64) -> SynValue {
-    SynValue::Server(Rc::new(ServerValue::Raw {
+    SynValue::Server(crate::types::Obj::new(ServerValue::Raw {
         body,
         content_type: content_type.to_string(),
         status,

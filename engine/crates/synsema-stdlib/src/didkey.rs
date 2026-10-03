@@ -34,7 +34,7 @@ fn err(msg: impl Into<String>) -> Control {
 }
 
 fn syn_bytes(b: Vec<u8>) -> SynValue {
-    SynValue::Bytes(std::rc::Rc::from(b.into_boxed_slice()))
+    SynValue::Bytes(synsema_core::types::BytesRef::from(b.into_boxed_slice()))
 }
 
 /// Prefijos multicodec (varint) de las claves públicas que el motor conoce.

@@ -1625,7 +1625,9 @@ impl<'r, 's> Compiler<'r, 's> {
                 let params: Vec<Arc<str>> = parameters.iter().map(|p| p.name.clone()).collect();
                 Some(self.child(s, &params, &body, false))
             }
-            (NodeKind::LambdaExpression { body, parameters }, Some(s)) => Some(self.child(s, parameters, &[&**body], true)),
+            (NodeKind::LambdaExpression { body, parameters }, Some(s)) => {
+                Some(self.child(s, parameters, &[crate::ast::lambda_expr(body)], true))
+            }
             _ => None,
         };
         let node = self.cold(n);
@@ -4620,14 +4622,14 @@ impl Interpreter {
             let mut a0 = Some(std::mem::replace(&mut self.vm_regs[first], SynValue::Nothing));
             let mut item = Some(std::mem::replace(&mut self.vm_regs[first + 1], SynValue::Nothing));
             let p = match &a0 {
-                Some(SynValue::List(l)) => Rc::as_ptr(l),
+                Some(SynValue::List(l)) => crate::types::ListRef::as_ptr(l),
                 _ => unreachable!("lista"),
             };
             // Si P sigue teniendo esa lista: el clon del primer argumento se suelta antes (si P es la
             // única dueña, se agrega sin copiar), `make_unique` y `push`.
             let out = self
                 .vm_root_slot_mut(chunk, env, base, root.expect("raíz"), |slot| {
-                    if !matches!(slot, SynValue::List(r) if Rc::as_ptr(r) == p) {
+                    if !matches!(slot, SynValue::List(r) if crate::types::ListRef::as_ptr(r) == p) {
                         return None;
                     }
                     drop(a0.take());

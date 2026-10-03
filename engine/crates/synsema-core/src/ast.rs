@@ -319,7 +319,10 @@ pub enum NodeKind {
     TaskDefinition {
         name: String,
         parameters: Vec<Param>,
-        body: Vec<Node>,
+        /// Compartido (R2.5 de specs/modelo-memoria-regiones.md): la task que define y cada copia
+        /// de ella (otro worker, otro item de `parallel_map`, un agente) usan ESTE cuerpo, sin
+        /// copiarlo. El código es inmutable.
+        body: Arc<[Node]>,
         return_type: Option<String>,
         capabilities: Vec<String>,
     },
@@ -331,7 +334,9 @@ pub enum NodeKind {
     /// Evalúa a un valor función (tipo "task") que captura el entorno actual.
     LambdaExpression {
         parameters: Vec<Arc<str>>,
-        body: Box<Node>,
+        /// El cuerpo listo para correr como task: `[give <expresión>]`, armado una vez por el
+        /// parser y compartido por cada lambda que se crea (R2.5). La expresión: `lambda_expr`.
+        body: Arc<[Node]>,
     },
     GiveStatement {
         value: Option<Box<Node>>,
@@ -368,7 +373,8 @@ pub enum NodeKind {
         name: String,
         initial_state: Option<String>,
         capabilities: Vec<Node>,
-        body: Vec<Node>,
+        /// Compartido (R2.5): cada agente lanzado corre este cuerpo, sin copiarlo.
+        body: Arc<[Node]>,
     },
     SpawnStatement {
         agent_name: String,
@@ -519,7 +525,8 @@ pub enum NodeKind {
         /// ruta se sirve pero NO se publica en `/llms.txt`, `/openapi.json`, `/sitemap.xml` ni
         /// `/docs`. Misma palabra que el `private` del serve block, menor alcance.
         private: bool,
-        body: Vec<Node>,
+        /// Compartido (R2.5): la task de la ruta en cada worker usa este cuerpo, sin copiarlo.
+        body: Arc<[Node]>,
     },
     StreamBlock {
         body: Vec<Node>,
@@ -627,4 +634,21 @@ pub enum NodeKind {
         target: String,
         shape: Vec<(String, String)>, // (campo, tipo)
     },
+}
+
+/// Un cuerpo de task, lambda, agente o ruta listo para compartir (R2.5): se arma UNA vez, al
+/// parsear, y después se comparte sin copiarse (antes se copiaba en cada definición, en cada worker
+/// y en cada item de `parallel_map`). Las listas de adentro ya vienen sin capacidad de sobra (el
+/// parser las ajusta al armarlas: `parse_block`, `tight`), así que acá no se copia nada: compactar
+/// copiando el árbol entero duplicaba lo que se reserva al parsear y subía el pico del proceso.
+pub fn seal_body(body: Vec<Node>) -> Arc<[Node]> {
+    body.into()
+}
+
+/// La expresión de una lambda: su cuerpo es `[give <expresión>]` (ver `NodeKind::LambdaExpression`).
+pub fn lambda_expr(body: &[Node]) -> &Node {
+    match body.first().map(|n| &n.kind) {
+        Some(NodeKind::GiveStatement { value: Some(e) }) => e,
+        _ => unreachable!("el cuerpo de una lambda es [give <expresión>]"),
+    }
 }

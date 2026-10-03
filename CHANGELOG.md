@@ -6,6 +6,64 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.40 — 2026-10-03
+
+Memory, third step: the program's data is shared between threads instead of copied. A server's
+workers, the items of a `parallel_map`, agents and `cron` read the same globals in place, so memory
+no longer grows with the number of workers. The same language — every program gives the same
+results, errors and `steps()`; a write to shared data copies first (copy-on-write), exactly as
+before. Nothing to change in your programs.
+
+**`serve`: memory decided by the data, not by the workers.** The top-level globals are frozen in
+place once, when the program finishes setting them up, and every worker reads them (a write inside a
+handler copies first, so v0.6.39's rule still holds: each request starts from the program's
+globals). Before, each worker built its own copy on its first request. Measured on Windows with the
+release builds (v0.6.39 as released → v0.6.40), a global of 1 M records plus 1 M integers:
+
+| workers | memory with every worker warm | first request of a worker |
+|---:|---:|---:|
+| 1 | 839 → **176 MB** | 479 → **25 ms** |
+| 4 | 1315 → **190 MB** | 302 → **8 ms** |
+| 12 | 2575 → **225 MB** | 309 → **9 ms** |
+
+Startup memory also drops (700 → 232 MB): the copy every worker was built from is gone. (Node 24,
+the same service: 195 MB.) `SYNSEMA_SERVE_WORKERS` is again a CPU decision: more workers cost a few
+MB each.
+
+**Modules are shared too.** The bodies of tasks, lambdas, agents and routes are shared between
+interpreters instead of copied (local build): a worker that rebuilt an app with 26 `use` (41 modules) reserved
+13.1 MB, now 0.8 MB; that app with 12 workers 301 → 109 MB, first request 79 → 5 ms.
+
+**`parallel_map`** reads the globals and its items frozen for the duration of the call (they are
+thawed when every item has finished), instead of copying them for each item. Release builds on Windows,
+v0.6.39 → v0.6.40: a global of 200 k records read from 10 calls of 16 items, 3.1 s / 291 MB →
+**0.36 s / 44 MB**; a module with 20 k records and 200 calls of 5 items, 6.0 s / 142 MB → **1.2 s /
+33 MB**. Same order of results and the same fail-fast as before.
+
+**Agents and `cron`** started under `serve` share what is already frozen (the program's globals) and
+copy the rest (local build): a handler that spawns an agent reading a global of 300 k records, ~200 ms → 4–5 ms
+per request. Outside `serve`, an agent still gets its own copy.
+
+**Fixed:** a module environment could inherit another module's variables when it was created at the
+address of one that had been released (the module registry now checks the environment it recorded).
+
+**How.** A new crate, `synsema-heap`, holds the engine's own heap objects: lists, maps, map shapes
+and read-only values are objects with an 8-byte header and their own count, and can be made
+*immortal* — readable from any thread, never written, never freed while shared. Every write decides
+by the count, so a frozen value is always copied before it changes. All of its `unsafe` lives in that
+crate (and the `Send`/`Sync` of a frozen value in `synsema-core/src/frozen.rs`), checked with Miri on
+x86_64, i686 and s390x and with Miri's data-race detector over the frozen-value tests. The parser
+builds the syntax tree without spare capacity, so sharing it costs nothing extra.
+
+**For contributors.** `ListRef` and `MapRef` are `synsema-heap` objects (`ListRef::new(..)`,
+`ListRef::ptr_eq`, `ListRef::strong_count` instead of the `Rc` functions). `synlist::list_values(&l)`
+returns a `ListRead` (borrowed, or a copy when the list is frozen and unboxed): it never writes a
+frozen list. `FrozenValue::new(v)` freezes for good or gives `v` back untouched; `ScopedFreeze` freezes
+for one call and thaws after joining its threads. On `x86_64-pc-windows-gnu`, `.cargo/config.toml`
+builds mimalloc with `MI_WIN_INIT_USE_FLS=1` (GCC ignores the TLS callbacks mimalloc uses to notice a
+thread ending, so the memory of every finished thread was abandoned); the released Windows binary is
+MSVC and was not affected.
+
 ## v0.6.39 — 2026-10-01
 
 `serve`: route bodies run on the VM and the native tier, and every request starts from the program's

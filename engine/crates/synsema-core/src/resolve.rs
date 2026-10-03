@@ -426,7 +426,7 @@ impl Collector {
                 }
             }
             K::LambdaExpression { parameters, body } => {
-                self.function(n, UnitKind::Lambda, parameters, std::slice::from_ref(&**body), cur, unit);
+                self.function(n, UnitKind::Lambda, parameters, std::slice::from_ref(crate::ast::lambda_expr(body)), cur, unit);
             }
             K::GiveStatement { value } => self.opt(value, cur, unit),
             K::UseImport { alias, .. } => self.bind(cur, alias),
@@ -969,7 +969,7 @@ impl Resolver<'_> {
             }
             K::LambdaExpression { parameters, body } => {
                 let nparams = distinct(parameters.iter().map(|p| &**p));
-                self.function(n, nparams, std::slice::from_ref(&**body), cur, false);
+                self.function(n, nparams, std::slice::from_ref(crate::ast::lambda_expr(body)), cur, false);
             }
             K::GiveStatement { value } => self.opt(value, cur),
             K::UseImport { alias, .. } => self.mark_bound(cur, alias),

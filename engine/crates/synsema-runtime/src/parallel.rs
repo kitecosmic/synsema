@@ -37,7 +37,7 @@
 use synsema_core::synlist::{list_values};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use synsema_capabilities::model::{Capability, CapabilitySet};
@@ -48,9 +48,17 @@ use synsema_core::types::{from_send, syn_list, to_send, SendValue, SynTaskValue,
 
 use crate::engine::{wire_common, MemoryCtx, INTERP_STACK_SIZE};
 use crate::serve::{
-    rebuild_globals, rebuild_module_env, snapshot_globals, snapshot_module_env, GlobalVal,
+    rebuild_globals, rebuild_module_env, snapshot_globals_scoped, snapshot_module_env, GlobalVal,
     ModuleRegistry,
 };
+use synsema_core::frozen::{ScopeCtx, ScopedFreeze};
+
+/// Un item de `parallel_map`: congelado con alcance (los hilos lo leen sin copiarlo) o, si no se
+/// puede congelar (un generador, una tarea adentro), la copia de siempre.
+enum ItemVal {
+    Scoped(usize),
+    Send(SendValue),
+}
 
 fn err(msg: &str) -> Control {
     Control::Error(RuntimeError::new(msg.to_string()))
@@ -76,7 +84,7 @@ enum TaskSnapshot {
     User {
         name: String,
         parameters: Vec<Param>,
-        body: Vec<Node>,
+        body: std::sync::Arc<[Node]>,
         required_capabilities: Vec<(String, Option<String>)>,
         /// Si la task aplicada venía de un módulo (su `closure_env` era el `module_env`),
         /// el ID estable de ese módulo (`"module:<resolved>"`) + el snapshot COMPLETO de
@@ -101,6 +109,7 @@ fn build_worker_interp(
     mem: &Option<MemoryCtx>,
     bus: &Option<Arc<synsema_agents::bus::Bus>>,
     subject: &crate::subject::Subject,
+    scope: &ScopeCtx,
 ) -> (Interpreter, ModuleRegistry, crate::llm_providers::LlmIdentityScope) {
     let mut interp = Interpreter::new();
     let caps = Rc::new(RefCell::new(CapabilitySet::new("parallel")));
@@ -128,7 +137,7 @@ fn build_worker_interp(
     if let Some(b) = bus {
         synsema_stdlib::ws::attach_bus(&interp, b.clone());
     }
-    let registry = rebuild_globals(&mut interp, globals);
+    let registry = rebuild_globals(&mut interp, globals, Some(scope));
     interp.freeze_intent(); // corre bajo el intent congelado
     // T1: el worker corre EN NOMBRE del mismo sujeto que el llamador (identidad, techo de
     // gasto, techo delegado del token, presupuesto LLM): la identidad viaja con el techo.
@@ -140,6 +149,7 @@ fn reconstruct_task(
     interp: &Interpreter,
     snap: &TaskSnapshot,
     registry: &mut ModuleRegistry,
+    scope: &ScopeCtx,
 ) -> SynValue {
     match snap {
         TaskSnapshot::User { name, parameters, body, required_capabilities, module } => {
@@ -151,7 +161,7 @@ fn reconstruct_task(
             // devuelve ESE env (la misma instancia — estado compartido); solo reconstruye
             // uno nuevo si no (p.ej. el binding global fue pisado con `set`).
             let closure_env = match module {
-                Some((id, env)) => rebuild_module_env(id, env, &interp.global_env, registry),
+                Some((id, env)) => rebuild_module_env(id, env, &interp.global_env, registry, Some(scope)),
                 None => interp.global_env.clone(),
             };
             SynValue::Task(Rc::new(SynTaskValue {
@@ -180,18 +190,24 @@ fn generators_in(v: &SynValue, out: &mut Vec<Rc<synsema_core::interpreter::Built
     }
 }
 
-/// A1 Fase 2 — Corre `task` sobre `items` con concurrencia `limit` sobre **tokio**
-/// (runtime multi-thread + `spawn_blocking` por item, acotado por un semáforo). Cada
-/// item corre en un intérprete sync fresco (modelo CSP). Resultados **en orden de
-/// entrada**; **fail-fast** con el error de menor índice. Semántica idéntica a `apply`
-/// secuencial; tokio sólo cambia el scheduling (M:N, escala a muchas tareas).
+/// Corre `task` sobre `items` con concurrencia `limit`: `min(limit, items)` hilos que toman los
+/// items en orden (un contador), cada item en un intérprete sync fresco (modelo CSP). Resultados
+/// **en orden de entrada**; **fail-fast** con el error de menor índice. Semántica idéntica a `apply`
+/// secuencial.
+///
+/// Las globales y los items congelables llegan congelados con alcance (R2.3 de
+/// specs/modelo-memoria-regiones.md): cada item los lee sin una copia propia, y `ScopedFreeze::run`
+/// los descongela cuando todos los hilos terminaron (con sus `thread_local`). Antes cada item
+/// rearmaba su copia de las globales (`from_send`) y corría en el pool de tokio, que no espera a
+/// los `thread_local` de sus hilos.
 #[allow(clippy::too_many_arguments)]
 fn run_parallel(
+    scope: ScopedFreeze,
     globals: Arc<Vec<(String, GlobalVal)>>,
     granted: Arc<Vec<Capability>>,
     denied: Arc<Vec<Capability>>,
     task_snap: Arc<TaskSnapshot>,
-    items: Vec<SendValue>,
+    items: Vec<ItemVal>,
     limit: usize,
     secure: bool,
     ceiling: Option<Arc<Vec<Capability>>>,
@@ -203,89 +219,66 @@ fn run_parallel(
     if n == 0 {
         return Ok(Vec::new());
     }
-    let limit = limit.max(1);
-    // Runtime acotado: el pool de blocking se topea al `limit` (concurrencia real de
-    // los intérpretes sync). El stack grande cubre la recursión del intérprete.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .max_blocking_threads(limit)
-        .thread_stack_size(INTERP_STACK_SIZE)
-        .build()
-        .map_err(|e| RuntimeError::new(format!("parallel_map: no se pudo crear el runtime: {}", e)))?;
+    let threads = limit.max(1).min(n);
+    let next = AtomicUsize::new(0);
+    let aborted = AtomicBool::new(false);
+    let error: Mutex<Option<(usize, RuntimeError)>> = Mutex::new(None);
+    let slots: Vec<Mutex<Option<(SendValue, Vec<synsema_core::rng::Generator>)>>> =
+        (0..n).map(|_| Mutex::new(None)).collect();
+    // Lo que no es `Sync` (el contexto de memoria, el sujeto) se clona por hilo bajo un candado.
+    let shared = Mutex::new((mem, subject));
 
-    let items = Arc::new(items);
-    let aborted = Arc::new(AtomicBool::new(false));
-    let error: Arc<Mutex<Option<(usize, RuntimeError)>>> = Arc::new(Mutex::new(None));
-
-    runtime.block_on(async move {
-        let sem = Arc::new(tokio::sync::Semaphore::new(limit));
-        let mut handles = Vec::with_capacity(n);
-        for i in 0..n {
-            // Acquire bloquea hasta que haya un slot libre → concurrencia ≤ limit.
-            let permit = match sem.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => break,
-            };
-            if aborted.load(Ordering::Relaxed) {
-                drop(permit);
+    let ran = scope.run(threads, INTERP_STACK_SIZE, |ctx, _t| {
+        let (mem, subject) = {
+            let g = shared.lock().unwrap();
+            (g.0.clone(), g.1.clone())
+        };
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n || aborted.load(Ordering::Relaxed) {
                 break;
             }
-            let globals = globals.clone();
-            let granted = granted.clone();
-            let denied = denied.clone();
-            let ceiling = ceiling.clone();
-            let mem = mem.clone();
-            let bus = bus.clone();
-            let task_snap = task_snap.clone();
-            let items = items.clone();
-            let aborted = aborted.clone();
-            let error = error.clone();
-            let subject = subject.clone();
-            let h = tokio::task::spawn_blocking(move || -> Option<(SendValue, Vec<synsema_core::rng::Generator>)> {
-                let _permit = permit; // libera el slot al terminar
-                if aborted.load(Ordering::Relaxed) {
-                    return None;
+            let (mut interp, mut registry, _subject_scope) =
+                build_worker_interp(&globals, &granted, &denied, secure, &ceiling, &mem, &bus, &subject, ctx);
+            let task_value = reconstruct_task(&interp, &task_snap, &mut registry, ctx);
+            // Los entornos de módulo de este item quedan a cargo de su intérprete: se vacían
+            // cuando muere (si no, cada item dejaba vivo el programa entero: la fuga de lampson).
+            interp.adopt_module_envs(registry.values().cloned());
+            let item = match &items[i] {
+                ItemVal::Scoped(k) => ctx.get(*k),
+                ItemVal::Send(sv) => from_send(sv),
+            };
+            let keep = item.clone();
+            match interp.call_task(task_value, vec![item]) {
+                Ok(v) => {
+                    // El estado final de los generadores del item, en orden de recorrido.
+                    let mut gens = Vec::new();
+                    generators_in(&keep, &mut gens);
+                    let states = gens.iter().filter_map(synsema_core::rng::snapshot).collect();
+                    // El resultado vuelve como copia: nada de lo congelado sale del hilo.
+                    *slots[i].lock().unwrap() = Some((to_send(&v), states));
                 }
-                let (mut interp, mut registry, _subject_scope) =
-                    build_worker_interp(&globals, &granted, &denied, secure, &ceiling, &mem, &bus, &subject);
-                let task_value = reconstruct_task(&interp, &task_snap, &mut registry);
-                // Los entornos de módulo de este item quedan a cargo de su intérprete: se vacían
-                // cuando muere (si no, cada item dejaba vivo el programa entero: la fuga de lampson).
-                interp.adopt_module_envs(registry.values().cloned());
-                let item = from_send(&items[i]);
-                let keep = item.clone();
-                match interp.call_task(task_value, vec![item]) {
-                    Ok(v) => {
-                        // El estado final de los generadores del item, en orden de recorrido.
-                        let mut gens = Vec::new();
-                        generators_in(&keep, &mut gens);
-                        let states = gens.iter().filter_map(synsema_core::rng::snapshot).collect();
-                        Some((to_send(&v), states))
+                Err(c) => {
+                    let re = control_to_error(c);
+                    let mut e = error.lock().unwrap();
+                    if e.as_ref().is_none_or(|(idx, _)| i < *idx) {
+                        *e = Some((i, re));
                     }
-                    Err(c) => {
-                        let re = control_to_error(c);
-                        let mut e = error.lock().unwrap();
-                        if e.as_ref().is_none_or(|(idx, _)| i < *idx) {
-                            *e = Some((i, re));
-                        }
-                        aborted.store(true, Ordering::Relaxed);
-                        None
-                    }
+                    aborted.store(true, Ordering::Relaxed);
                 }
-            });
-            handles.push(h);
+            }
         }
-
-        // Resultados en orden de entrada (handles en orden 0..n).
-        let mut out: Vec<(SendValue, Vec<synsema_core::rng::Generator>)> = Vec::with_capacity(handles.len());
-        for h in handles {
-            out.push(h.await.ok().flatten().unwrap_or((SendValue::Nothing, Vec::new())));
-        }
-        if let Some((_, re)) = error.lock().unwrap().take() {
-            return Err(re);
-        }
-        Ok(out)
-    })
+    });
+    if let Err(e) = ran {
+        return Err(RuntimeError::new(format!("parallel_map: no se pudo crear un hilo: {}", e)));
+    }
+    if let Some((_, re)) = error.into_inner().unwrap() {
+        return Err(re);
+    }
+    Ok(slots
+        .into_iter()
+        .map(|m| m.into_inner().unwrap().unwrap_or((SendValue::Nothing, Vec::new())))
+        .collect())
 }
 
 /// Registra `parallel_map` y `chunk` (lo llama `wire_common`). `mem` = contexto de
@@ -369,6 +362,9 @@ pub(crate) fn register_parallel_builtins(
                 }
                 _ => 64,
             };
+            // Las globales, el módulo de la task y los items se congelan con alcance (R2.3): los
+            // hilos los leen sin copiarlos y vuelven a ser objetos comunes al terminar.
+            let mut scope = ScopedFreeze::new();
             let task_snap = match task {
                 SynValue::Task(t) => {
                     // DE-030: si el mapper es una task de módulo (cierra sobre un env
@@ -380,7 +376,7 @@ pub(crate) fn register_parallel_builtins(
                     let module = {
                         let env_name = t.closure_env.borrow().name.to_string();
                         if env_name.starts_with("module:") {
-                            Some((env_name, snapshot_module_env(&t.closure_env)))
+                            Some((env_name, snapshot_module_env(&t.closure_env, Some(&mut scope))))
                         } else {
                             None
                         }
@@ -396,7 +392,7 @@ pub(crate) fn register_parallel_builtins(
                 SynValue::Builtin(b) => TaskSnapshot::Builtin(b.name.clone()),
                 _ => unreachable!(),
             };
-            let globals = snapshot_globals(i);
+            let globals = snapshot_globals_scoped(i, &mut scope);
             let granted: Vec<Capability> = caps.borrow().granted.iter().cloned().collect();
             let denied: Vec<Capability> = caps.borrow().denied.iter().cloned().collect();
             // Techo del host: se snapshotea del set del padre y se propaga a cada worker
@@ -406,8 +402,15 @@ pub(crate) fn register_parallel_builtins(
             // T1: el sujeto del llamador (identidad + techo delegado + presupuestos) viaja a
             // cada worker junto con el techo del host.
             let subject = crate::subject::Subject::capture(i, &caps);
-            let items: Vec<SendValue> = list.iter().map(to_send).collect();
+            let items: Vec<ItemVal> = list
+                .iter()
+                .map(|v| match scope.add(v.clone()) {
+                    Ok(k) => ItemVal::Scoped(k),
+                    Err(v) => ItemVal::Send(to_send(&v)),
+                })
+                .collect();
             match run_parallel(
+                scope,
                 globals,
                 Arc::new(granted),
                 Arc::new(denied),

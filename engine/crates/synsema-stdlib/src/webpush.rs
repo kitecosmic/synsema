@@ -684,13 +684,12 @@ mod tests {
     /// cargada con `secret()`) sigue funcionando: no se nerfea el uso legítimo.
     #[test]
     fn a_sealed_identity_key_cannot_sign_a_vapid_token() {
-        use std::rc::Rc;
         use synsema_core::secret::SecretInner;
-        let sealed = SynValue::Secret(Rc::new(SecretInner::new_bytes_sealed("attestation_key", vec![7u8; 32])));
+        let sealed = SynValue::Secret(synsema_core::types::Obj::new(SecretInner::new_bytes_sealed("attestation_key", vec![7u8; 32])));
         let e = errmsg(vapid_private_key(Some(&sealed)));
         assert!(e.contains("sealed") && e.contains("push_send"), "{}", e);
         // La misma clave, NO sellada, es material VAPID perfectamente válido.
-        let normal = SynValue::Secret(Rc::new(SecretInner::new_bytes("VAPID_PRIVATE_KEY", vec![7u8; 32])));
+        let normal = SynValue::Secret(synsema_core::types::Obj::new(SecretInner::new_bytes("VAPID_PRIVATE_KEY", vec![7u8; 32])));
         ok(vapid_private_key(Some(&normal)));
     }
 

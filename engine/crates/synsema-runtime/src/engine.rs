@@ -41,7 +41,7 @@ use synsema_core::interpreter::{
 };
 use synsema_core::parser::{parse_source, CompileError};
 use synsema_core::types::{from_send, to_send, SendValue, SynValue};
-use crate::serve::{val_to_global, rebuild_globals, GlobalVal};
+use crate::serve::{val_to_global_shared, rebuild_globals, GlobalVal};
 use synsema_stdlib::cron::{register_cron_builtins, CronScheduler};
 use synsema_stdlib::database::{register_database_builtins, DatabaseManager};
 use synsema_stdlib::http::register_http_builtins;
@@ -1894,7 +1894,7 @@ pub(crate) fn wire_swarm_hooks(
                         syn_map(m)
                     })
                     .collect();
-                Ok(SynValue::List(Rc::new(RefCell::new(items.into()))))
+                Ok(SynValue::List(synsema_core::types::ListRef::new(items.into())))
             }),
         );
         let sw = swarm.clone();
@@ -1966,7 +1966,9 @@ pub(crate) fn wire_swarm_hooks(
                 args.iter().map(|(k, v)| (k.clone(), to_send(v))).collect();
             // Convertir el snapshot de globales del llamador a GlobalVal (preserva tasks).
             let global_snap: Arc<Vec<(String, GlobalVal)>> = Arc::new(
-                globals.iter().map(|(k, v)| (k.clone(), val_to_global(v))).collect(),
+                // Lo ya congelado para siempre (las globales de `serve`) se comparte sin copia; lo
+                // demás se copia: el agente vive libre (R2.4).
+                globals.iter().map(|(k, v)| (k.clone(), val_to_global_shared(v))).collect(),
             );
             // El techo del host se propaga al agente (Arc → Send cruza el hilo): un agente
             // spawneado jamás excede el techo, aunque su cuerpo declare `require exec(...)`.
@@ -2041,7 +2043,7 @@ pub static AGENT_ECHO_TO_STDERR: std::sync::atomic::AtomicBool =
 fn spawn_agent(
     swarm: Arc<Swarm>,
     agent_name: String,
-    body: Vec<Node>,
+    body: std::sync::Arc<[Node]>,
     send_args: Vec<(String, SendValue)>,
     globals: Arc<Vec<(String, GlobalVal)>>,
     ceiling: Option<Arc<Vec<Capability>>>,
@@ -2080,7 +2082,7 @@ fn spawn_agent(
             interp.set_agent_context(&agent_name);
             // Restaurar tareas y valores del top-level para que el agente
             // los pueda llamar directamente sin necesitar HTTP.
-            let registry = rebuild_globals(&mut interp, &globals);
+            let registry = rebuild_globals(&mut interp, &globals, None);
             // A cargo del intérprete del agente: se vacían cuando termina (ver `adopt_module_envs`).
             interp.adopt_module_envs(registry.into_values());
             // Los spawn_args sobreescriben cualquier global con el mismo nombre.

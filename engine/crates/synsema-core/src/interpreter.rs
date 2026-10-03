@@ -661,11 +661,15 @@ impl Bindings {
 /// escritura a una exportación, desde adentro (`set STATE[k]` en un task) o desde afuera
 /// (`set m.STATE[k]`), deje las dos vistas apuntando al mismo valor. Por hilo, como el
 /// intérprete; los `Weak` no retienen el módulo y mantienen viva la dirección (no se
-/// reutiliza mientras esté registrada).
+/// reutiliza mientras esté registrada). Las DOS tablas guardan los dos `Weak`: una clave es una
+/// dirección, y sólo es de ese objeto mientras su `Weak` la reserve. Hasta R2.5 `by_env` guardaba
+/// sólo el mapa: muerto el entorno, su dirección quedaba libre y un entorno nuevo en la misma
+/// dirección heredaba el mapa ajeno (un worker de `serve` escribía las exportaciones en el mapa de
+/// otro módulo; con el mapa congelado, era un pánico).
 #[derive(Default)]
 struct ModuleRegistry {
-    by_map: HashMap<usize, (std::rc::Weak<RefCell<MapObj>>, std::rc::Weak<RefCell<Environment>>)>,
-    by_env: HashMap<usize, std::rc::Weak<RefCell<MapObj>>>,
+    by_map: HashMap<usize, (synsema_heap::WeakTail<MapObj>, std::rc::Weak<RefCell<Environment>>)>,
+    by_env: HashMap<usize, (synsema_heap::WeakTail<MapObj>, std::rc::Weak<RefCell<Environment>>)>,
     prune_at: usize,
 }
 
@@ -675,42 +679,49 @@ thread_local! {
 
 /// Registra el mapa de exportaciones `map` como la vista de `env` (lo llaman `load_module`
 /// y la reconstrucción de módulos de un worker de `serve`/`parallel_map`).
-pub fn register_module(map: &Rc<RefCell<MapObj>>, env: &Rc<RefCell<Environment>>) {
+pub fn register_module(map: &crate::types::MapRef, env: &Rc<RefCell<Environment>>) {
     MODULES.with(|r| {
         let mut r = r.borrow_mut();
         if r.by_map.len() >= r.prune_at.max(64) {
             r.by_map.retain(|_, (m, e)| m.strong_count() > 0 && e.strong_count() > 0);
-            r.by_env.retain(|_, m| m.strong_count() > 0);
+            r.by_env.retain(|_, (m, e)| m.strong_count() > 0 && e.strong_count() > 0);
             r.prune_at = r.by_map.len() * 2;
         }
-        r.by_map.insert(Rc::as_ptr(map).cast::<()>() as usize, (Rc::downgrade(map), Rc::downgrade(env)));
-        r.by_env.insert(Rc::as_ptr(env) as usize, Rc::downgrade(map));
+        r.by_map.insert(crate::types::MapRef::as_ptr(map).cast::<()>() as usize, (crate::types::MapRef::downgrade(map), Rc::downgrade(env)));
+        r.by_env.insert(Rc::as_ptr(env) as usize, (crate::types::MapRef::downgrade(map), Rc::downgrade(env)));
     });
 }
 
 /// El entorno del módulo cuyo mapa de exportaciones es `map`, si lo es.
-pub fn module_env_of_map(map: &Rc<RefCell<MapObj>>) -> Option<Rc<RefCell<Environment>>> {
+pub fn module_env_of_map(map: &crate::types::MapRef) -> Option<Rc<RefCell<Environment>>> {
     MODULES.with(|r| {
         let r = r.borrow();
         if r.by_map.is_empty() {
             return None;
         }
-        let (m, e) = r.by_map.get(&(Rc::as_ptr(map).cast::<()>() as usize))?;
+        let (m, e) = r.by_map.get(&(crate::types::MapRef::as_ptr(map).cast::<()>() as usize))?;
         m.upgrade()?;
         e.upgrade()
     })
 }
 
 /// El mapa de exportaciones del módulo cuyo entorno es `env`, si lo es.
-pub fn module_map_of_env(env: &Rc<RefCell<Environment>>) -> Option<Rc<RefCell<MapObj>>> {
-    MODULES.with(|r| r.borrow().by_env.get(&(Rc::as_ptr(env) as usize)).and_then(|m| m.upgrade()))
+pub fn module_map_of_env(env: &Rc<RefCell<Environment>>) -> Option<crate::types::MapRef> {
+    MODULES.with(|r| {
+        let r = r.borrow();
+        let (m, e) = r.by_env.get(&(Rc::as_ptr(env) as usize))?;
+        // La entrada es de `env` sólo si su entorno sigue vivo (si no, es de uno muerto que ocupaba
+        // esta dirección; su `Weak` la reservaba, así que acá no puede pasar, pero no se asume).
+        e.upgrade().filter(|x| Rc::ptr_eq(x, env))?;
+        m.upgrade()
+    })
 }
 
 /// `set m.X to v` / `set m["X"] to v` sobre un módulo: religa SU variable (la que leen sus
 /// tasks), como `m.X = v` en Python; sus nombres son sus exportaciones y sus tasks no se
 /// reemplazan desde afuera.
 fn module_rebind(
-    m: &Rc<RefCell<MapObj>>,
+    m: &crate::types::MapRef,
     menv: &Rc<RefCell<Environment>>,
     name: &str,
     value: SynValue,
@@ -856,9 +867,9 @@ fn insert_position(i: &SynValue, len: usize) -> Result<usize, String> {
 /// ¿`a` y `b` son el MISMO contenedor (misma lista, mapa o valor privado)?
 fn same_container(a: &SynValue, b: &SynValue) -> bool {
     match (a, b) {
-        (SynValue::List(x), SynValue::List(y)) => Rc::ptr_eq(x, y),
-        (SynValue::Map(x), SynValue::Map(y)) => Rc::ptr_eq(x, y),
-        (SynValue::Private(x), SynValue::Private(y)) => Rc::ptr_eq(x, y),
+        (SynValue::List(x), SynValue::List(y)) => crate::types::ListRef::ptr_eq(x, y),
+        (SynValue::Map(x), SynValue::Map(y)) => crate::types::MapRef::ptr_eq(x, y),
+        (SynValue::Private(x), SynValue::Private(y)) => crate::types::Obj::ptr_eq(x, y),
         _ => false,
     }
 }
@@ -1160,7 +1171,7 @@ impl Default for CancelToken {
 }
 /// Hook de `spawn`: (agente, body, args, snapshot de globals) → instance_id.
 pub type SpawnHook = Rc<
-    dyn Fn(&str, Vec<Node>, Vec<(String, SynValue)>, Vec<(String, SynValue)>, SpawnSubject) -> Result<String, Control>,
+    dyn Fn(&str, std::sync::Arc<[Node]>, Vec<(String, SynValue)>, Vec<(String, SynValue)>, SpawnSubject) -> Result<String, Control>,
 >;
 
 /// T1 (identidad): lo que el intérprete sabe del SUJETO de la unidad de trabajo en curso y
@@ -1269,7 +1280,8 @@ pub struct Interpreter {
     /// stdout crudo (no rompe el contrato del oráculo).
     pub live_output: bool,
     pub blackboard: HashMap<String, SynValue>,
-    pub agent_definitions: HashMap<String, (Vec<Node>, Rc<RefCell<Environment>>)>,
+    /// El cuerpo de cada agente, compartido con el AST (R2.5).
+    pub agent_definitions: HashMap<String, (std::sync::Arc<[Node]>, Rc<RefCell<Environment>>)>,
     /// Contexto de agente para los namespaces de memoria (DB-M1, decisión #4):
     /// stack de nombres de agente en ejecución. Vacío = top-level (`source = "main"`).
     /// El fallback in-process de `spawn` pushea/popea acá; el camino swarm (hilo
@@ -2726,7 +2738,7 @@ impl Interpreter {
                 // nueva por entrada. El recibo publica sólo el compromiso (un sha256 a secas de
                 // `run("id", "-u")` se revertía probando un diccionario de consultas); la sal
                 // queda en `lineage()`, así el dueño puede probar después qué consulta fue.
-                let q = bytes_of(&SynValue::List(Rc::new(RefCell::new(args.to_vec().into()))));
+                let q = bytes_of(&SynValue::List(crate::types::ListRef::new(args.to_vec().into())));
                 let q_enc = enc_cell.get();
                 let (sal, commit) = salted_commitment(&q);
                 salt = Some((sal, q_enc));
@@ -4762,10 +4774,9 @@ impl Interpreter {
                 let task = Rc::new(SynTaskValue {
                     name: "<lambda>".to_string(),
                     parameters: lambda_params,
-                    body: vec![Node::new(
-                        loc.clone(),
-                        NodeKind::GiveStatement { value: Some(body.clone()) },
-                    )],
+                    // `[give <expresión>]`, armado por el parser y compartido (R2.5): crear una
+                    // lambda ya no copia su expresión.
+                    body: body.clone(),
                     closure_env: env.clone(),
                     origin: Some(loc.clone()),
                     required_capabilities: Vec::new(),
@@ -5777,21 +5788,24 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         {
         let mut required_caps = Vec::new();
         let mut clean_body = Vec::new();
-        for stmt in body {
+        // Sin `require` adentro (casi siempre), el cuerpo de la task ES el del AST, compartido
+        // (R2.5); con `require`, el cuerpo limpio se arma acá.
+        let has_requires = body.iter().any(|s| matches!(s.kind, NodeKind::RequireStatement { .. }));
+        for stmt in body.iter() {
             if let NodeKind::RequireStatement { capability, scope } = &stmt.kind {
                 let scope_val = match scope {
                     Some(s) => Some(self.exec(s, env)?.to_string()),
                     None => None,
                 };
                 required_caps.push((capability.clone(), scope_val));
-            } else {
+            } else if has_requires {
                 clean_body.push(stmt.clone());
             }
         }
         let task = Rc::new(SynTaskValue {
             name: name.clone(),
             parameters: parameters.clone(),
-            body: clean_body,
+            body: if has_requires { clean_body.into() } else { body.clone() },
             closure_env: env.clone(),
             origin: Some(loc.clone()),
             required_capabilities: required_caps,
@@ -9639,7 +9653,7 @@ fn principals_arg(
 /// ¿El valor es invocable? (task de usuario, lambda o builtin). La base de la regla
 /// de detección del dual-order (batch DX) y del 2º arg de `index_of`.
 /// `(función, array)` en cualquier orden, si la llamada es sobre un array.
-fn fn_and_array(args: &[SynValue]) -> Option<(SynValue, Rc<ndarray::ArrayD<f64>>)> {
+fn fn_and_array(args: &[SynValue]) -> Option<(SynValue, crate::types::Obj<ndarray::ArrayD<f64>>)> {
     match (args.first(), args.get(1)) {
         (Some(SynValue::Array(a)), Some(f)) if is_callable(f) => Some((f.clone(), a.clone())),
         (Some(f), Some(SynValue::Array(a))) if is_callable(f) => Some((f.clone(), a.clone())),
@@ -9860,25 +9874,25 @@ pub(crate) fn make_unique(slot: &mut SynValue) {
 fn make_unique_n(slot: &mut SynValue, extra: usize) {
     let owners = 1 + extra;
     match slot {
-        SynValue::List(rc) if Rc::strong_count(rc) > owners => {
+        SynValue::List(rc) if crate::types::ListRef::strong_count(rc) > owners => {
             let copy = rc.borrow().clone();
-            *slot = SynValue::List(Rc::new(RefCell::new(copy)));
+            *slot = SynValue::List(synsema_heap::Shared::new(copy));
         }
-        SynValue::Map(rc) if Rc::strong_count(rc) > owners && module_env_of_map(rc).is_none() => {
+        SynValue::Map(rc) if crate::types::MapRef::strong_count(rc) > owners && module_env_of_map(rc).is_none() => {
             let copy = rc.borrow().to_ref();
             *slot = SynValue::Map(copy);
         }
         SynValue::Private(p) => {
             let shared_inner = match &p.value {
-                SynValue::List(rc) => Rc::strong_count(rc) > 1,
-                SynValue::Map(rc) => Rc::strong_count(rc) > 1,
+                SynValue::List(rc) => crate::types::ListRef::strong_count(rc) > 1,
+                SynValue::Map(rc) => crate::types::MapRef::strong_count(rc) > 1,
                 _ => false,
             };
-            if shared_inner || (Rc::strong_count(p) > owners && matches!(p.value, SynValue::List(_) | SynValue::Map(_))) {
+            if shared_inner || (crate::types::Obj::strong_count(p) > owners && matches!(p.value, SynValue::List(_) | SynValue::Map(_))) {
                 // Copia del contenedor interno aunque su cuenta sea 1 cuando el envoltorio
                 // está compartido: el alias ve el mismo Rc interno.
                 let inner = match &p.value {
-                    SynValue::List(rc) => SynValue::List(Rc::new(RefCell::new(rc.borrow().clone()))),
+                    SynValue::List(rc) => SynValue::List(crate::types::ListRef::new(rc.borrow().clone())),
                     SynValue::Map(rc) => SynValue::Map(rc.borrow().to_ref()),
                     other => other.clone(),
                 };
@@ -10695,7 +10709,7 @@ mod drop_tests {
             let task = SynValue::Task(Rc::new(SynTaskValue {
                 name: "f".to_string(),
                 parameters: vec![],
-                body: vec![],
+                body: Vec::new().into(),
                 closure_env: interp.global_env.clone(), // task → global_env (la mitad del ciclo)
                 origin: None,
                 required_capabilities: vec![],
@@ -10728,7 +10742,7 @@ mod drop_tests {
             let task = SynValue::Task(Rc::new(SynTaskValue {
                 name: "t".to_string(),
                 parameters: vec![],
-                body: vec![],
+                body: Vec::new().into(),
                 closure_env: env.clone(), // task → child (mitad del ciclo)
                 origin: None,
                 required_capabilities: vec![],

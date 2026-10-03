@@ -1241,7 +1241,7 @@ pub fn routes(root: &Root, path: Option<&str>) -> Value {
                 serve_line = s.location.line;
                 for r in rs {
                     if let NodeKind::RouteDefinition { method, path, body, .. } = &r.kind {
-                        lines.push((method.clone(), path.clone(), r.location.line, body.clone()));
+                        lines.push((method.clone(), path.clone(), r.location.line, body.to_vec()));
                     }
                 }
                 for h in hosts {

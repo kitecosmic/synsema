@@ -188,7 +188,7 @@ pub fn check_warnings(program: &Program, file_path: &str, warnings: &mut Vec<Str
             let NodeKind::TaskDefinition { name, parameters, body, .. } = &n.kind else { return };
             for p in parameters {
                 let mut u = LoopUses::default();
-                for b in body {
+                for b in body.iter() {
                     u.scan(b, &p.name, false);
                 }
                 let read_written = u.reads.iter().any(|k| match k {

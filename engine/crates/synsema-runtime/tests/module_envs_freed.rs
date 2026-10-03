@@ -46,6 +46,22 @@ fn parallel_map_program(n: usize) -> String {
     )
 }
 
+/// R2.3: datos globales que cambian en cada vuelta, leídos por `parallel_map` como globales y como
+/// items. Se congelan sólo mientras corre cada llamada; si quedaran inmortales, cada vuelta dejaría
+/// vivos sus 5000 registros (~1 MB).
+fn frozen_scope_program(n: usize) -> String {
+    format!(
+        "let data be apply(range(0, 5000), (i) => {{\"id\": i, \"nombre\": \"un registro bastante largo \" + text(i)}})
+let total be 0
+each k in range(0, {n})
+    set data to apply(data, (r) => {{\"id\": r.id + 1, \"nombre\": r.nombre + \"!\"}})
+    let r be parallel_map((w) => w.id + length(data) + length(w.nombre), data, 4)
+    set total to total + length(r)
+print(total)
+"
+    )
+}
+
 fn spawn_program(n: usize) -> String {
     format!(
         "use \"./leak_mod.syn\" as m\nagent Worker\n    signal \"done\"\neach k in range(0, {n})\n    spawn Worker\n    wait_for \"done\" timeout 10\nprint(\"ok\")\n"
@@ -57,10 +73,12 @@ fn rebuilt_module_envs_are_freed() {
     // Calentar: lo que el proceso arma una sola vez (pools, tablas) no cuenta.
     let _ = left_alive(&parallel_map_program(1));
     let _ = left_alive(&spawn_program(1));
+    let _ = left_alive(&frozen_scope_program(1));
     const MB: isize = 1 << 20;
     for (what, few, many) in [
         ("parallel_map", left_alive(&parallel_map_program(2)), left_alive(&parallel_map_program(12))),
         ("spawn", left_alive(&spawn_program(2)), left_alive(&spawn_program(12))),
+        ("parallel_map con datos que cambian", left_alive(&frozen_scope_program(2)), left_alive(&frozen_scope_program(12))),
     ] {
         // Sin el arreglo: ~1 MB por item reconstruido (12 llamadas × 4 items, o 12 agentes).
         assert!(

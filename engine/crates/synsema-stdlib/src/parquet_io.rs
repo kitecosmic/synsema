@@ -76,15 +76,15 @@ fn field_to_syn(f: &Field) -> SynValue {
         Field::Str(s) => syn_text(s.as_str()),
         Field::Bytes(b) => syn_bytes(b.data().to_vec()),
         Field::Date(days) => match NaiveDate::from_ymd_opt(1970, 1, 1).and_then(|e| e.checked_add_signed(chrono::Duration::days(*days as i64))) {
-            Some(d) => SynValue::Time(Rc::new(Temporal::Date(d))),
+            Some(d) => SynValue::Time(synsema_core::types::Obj::new(Temporal::Date(d))),
             None => SynValue::Nothing,
         },
         Field::TimestampMillis(ms) => match DateTime::from_timestamp_millis(*ms) {
-            Some(dt) => SynValue::Time(Rc::new(Temporal::DateTime(dt.with_timezone(&synsema_core::temporal::UTC)))),
+            Some(dt) => SynValue::Time(synsema_core::types::Obj::new(Temporal::DateTime(dt.with_timezone(&synsema_core::temporal::UTC)))),
             None => SynValue::Nothing,
         },
         Field::TimestampMicros(us) => match DateTime::from_timestamp_micros(*us) {
-            Some(dt) => SynValue::Time(Rc::new(Temporal::DateTime(dt.with_timezone(&synsema_core::temporal::UTC)))),
+            Some(dt) => SynValue::Time(synsema_core::types::Obj::new(Temporal::DateTime(dt.with_timezone(&synsema_core::temporal::UTC)))),
             None => SynValue::Nothing,
         },
         Field::Group(row) => {
@@ -238,7 +238,7 @@ fn duration_of(n: i64, per: i64) -> Option<SynValue> {
         1_000_000 => chrono::Duration::try_milliseconds(n)?,
         _ => chrono::Duration::try_seconds(n)?,
     };
-    Some(SynValue::Time(Rc::new(Temporal::Duration(d))))
+    Some(SynValue::Time(synsema_core::types::Obj::new(Temporal::Duration(d))))
 }
 
 /// La zona de un esquema Arrow como zona de Synsema: un nombre IANA (`Europe/Madrid`), `UTC`/`Z`
@@ -250,7 +250,7 @@ fn arrow_zone(tz: &str) -> Option<synsema_core::temporal::Zone> {
 
 /// Una hora del día (`TIME` de Parquet) como `duration` desde medianoche.
 fn time_of_day(d: chrono::Duration) -> SynValue {
-    SynValue::Time(Rc::new(Temporal::Duration(d)))
+    SynValue::Time(synsema_core::types::Obj::new(Temporal::Duration(d)))
 }
 
 // =========================================================
@@ -531,7 +531,7 @@ fn parquet_read(args: &[SynValue]) -> Result<SynValue, Control> {
                 (Field::Long(ns), true) => {
                     let (secs, sub) = (ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000) as u32);
                     match chrono::DateTime::from_timestamp(secs, sub) {
-                        Some(dt) => SynValue::Time(Rc::new(Temporal::DateTime(dt.with_timezone(&synsema_core::temporal::UTC)))),
+                        Some(dt) => SynValue::Time(synsema_core::types::Obj::new(Temporal::DateTime(dt.with_timezone(&synsema_core::temporal::UTC)))),
                         None => SynValue::Nothing,
                     }
                 }
@@ -543,7 +543,7 @@ fn parquet_read(args: &[SynValue]) -> Result<SynValue, Control> {
             };
             if let (Some(tz), SynValue::Time(t)) = (zones.get(k), &val) {
                 if let Temporal::DateTime(dt) = &**t {
-                    val = SynValue::Time(Rc::new(Temporal::DateTime(dt.with_timezone(tz))));
+                    val = SynValue::Time(synsema_core::types::Obj::new(Temporal::DateTime(dt.with_timezone(tz))));
                 }
             }
             if keys.len() <= ci {

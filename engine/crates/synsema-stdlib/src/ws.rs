@@ -1694,7 +1694,7 @@ fn ws_select_all(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) ->
     let (targets, names) = resolve_targets(args.first().ok_or_else(|| err(format!("{}: missing the connections", F)))?, F)?;
     let timeout = timeout_arg(args.get(1), F)?;
     if targets.is_empty() {
-        return Ok(SynValue::List(Rc::new(RefCell::new(Default::default()))));
+        return Ok(SynValue::List(synsema_core::types::ListRef::new(Default::default())));
     }
     let deadline = Instant::now() + timeout;
     watch_cancel(reg, interp);
@@ -1723,7 +1723,7 @@ fn ws_select_all(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) ->
             }
         }
     }
-    Ok(SynValue::List(Rc::new(RefCell::new(out.into()))))
+    Ok(SynValue::List(synsema_core::types::ListRef::new(out.into())))
 }
 
 fn ws_broadcast(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
@@ -2379,7 +2379,7 @@ fn term_handle(reg: &Registry, v: Option<&SynValue>, fname: &str) -> Result<i64,
     }
 }
 
-fn opt_map<'a>(v: Option<&'a SynValue>, fname: &str) -> Result<Option<std::cell::Ref<'a, MapObj>>, Control> {
+fn opt_map<'a>(v: Option<&'a SynValue>, fname: &str) -> Result<Option<synsema_core::heap::Ref<'a, MapObj>>, Control> {
     match v {
         None | Some(SynValue::Nothing) => Ok(None),
         Some(SynValue::Map(m)) => Ok(Some(m.borrow())),
@@ -2818,7 +2818,7 @@ fn bus_topics(_args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
             syn_map(m)
         })
         .collect();
-    Ok(SynValue::List(Rc::new(RefCell::new(items.into()))))
+    Ok(SynValue::List(synsema_core::types::ListRef::new(items.into())))
 }
 
 // ---------------------------------------------------------

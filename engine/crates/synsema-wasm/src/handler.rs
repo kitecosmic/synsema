@@ -75,7 +75,7 @@ struct RouteEntry {
     requires_auth: bool,
     streaming: bool,
     proxy: bool,
-    body: Vec<Node>,
+    body: std::sync::Arc<[Node]>,
 }
 
 struct Captured {
@@ -100,7 +100,7 @@ struct App {
     /// estado entre requests.
     globals: Vec<(String, SynValue)>,
     /// Agentes definidos en el top-level (`reset_for_request` los borra; vuelven de acá).
-    agents: HashMap<String, (Vec<Node>, Rc<RefCell<Environment>>)>,
+    agents: HashMap<String, (std::sync::Arc<[Node]>, Rc<RefCell<Environment>>)>,
 }
 
 /// Copia profunda de los contenedores mutables (List/Map); el resto (números, texto,
@@ -109,7 +109,7 @@ struct App {
 /// del top-level debe seguir siendo un secret en el request siguiente.
 fn deep_clone(v: &SynValue) -> SynValue {
     match v {
-        SynValue::List(l) => SynValue::List(Rc::new(RefCell::new(list_values(&l).iter().map(deep_clone).collect()))),
+        SynValue::List(l) => SynValue::List(synsema_core::types::ListRef::new(list_values(&l).iter().map(deep_clone).collect())),
         SynValue::Map(m) => {
             let mut out = SynMap::new();
             for (k, x) in m.borrow().iter() {
