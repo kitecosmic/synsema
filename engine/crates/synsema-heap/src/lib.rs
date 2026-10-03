@@ -132,6 +132,14 @@ impl<T> Shared<T> {
         permanent_h(this.header())
     }
 
+    /// ¿Congelado (`make_immortal` o `make_immortal_logged`)? Lo que se lee desde otros hilos y no se
+    /// escribe. NO lo es el de cuenta llena (`inc_strong` saturado): ése sigue siendo de un hilo, con
+    /// préstamos normales; decidir "congelado" por la cuenta sola lo confundía (auditoría de R2).
+    #[inline]
+    pub fn is_frozen(this: &Self) -> bool {
+        frozen_h(this.header())
+    }
+
     /// Cuántos `Shared` lo tienen. `usize::MAX` si es inmortal (siempre "compartido").
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
@@ -274,7 +282,7 @@ impl<T> Shared<T> {
         // `Shared` del que salió).
         unsafe { std::ptr::drop_in_place(self.ptr.as_ref().value.get()) };
         // SAFETY: la reserva sigue viva gracias al débil implícito, que se devuelve acá.
-        unsafe { (*h).weak.set((*h).weak.get() - 1) };
+        unsafe { (*h).weak.set((*h).weak.get().checked_sub(1).unwrap_or_else(|| overflow())) };
         // SAFETY: strong = 0 y el valor ya se soltó.
         unsafe { release_if_unreferenced(self.ptr) };
     }
@@ -532,13 +540,14 @@ struct TailPrefix {
 /// forma de uso que `Shared<T>`.
 pub struct SharedTail<T: ?Sized + TailObject> {
     ptr: NonNull<TailPrefix>,
-    _owns: PhantomData<T>,
+    /// Invariante en `T` (como `Cell`): `borrow_mut` da `&mut T`.
+    _owns: PhantomData<std::cell::UnsafeCell<T>>,
 }
 
 /// Una referencia débil a un `SharedTail`.
 pub struct WeakTail<T: ?Sized + TailObject> {
     ptr: NonNull<TailPrefix>,
-    _owns: PhantomData<T>,
+    _owns: PhantomData<std::cell::UnsafeCell<T>>,
 }
 
 /// Dónde empieza el objeto (constante por tipo).
@@ -552,7 +561,7 @@ fn tail_layout<T: ?Sized + TailObject>(len: usize) -> (usize, Layout) {
     let align = T::ALIGN.max(std::mem::align_of::<TailPrefix>());
     let obj_off = tail_obj_off::<T>();
     let tail_bytes = std::mem::size_of::<T::Elem>().checked_mul(len).expect("tail object too large");
-    let obj_size = (T::TAIL_OFFSET + tail_bytes).div_ceil(T::ALIGN) * T::ALIGN;
+    let obj_size = T::TAIL_OFFSET.checked_add(tail_bytes).expect("tail object too large").div_ceil(T::ALIGN) * T::ALIGN;
     let total = obj_off.checked_add(obj_size).expect("tail object too large");
     (obj_off, Layout::from_size_align(total, align).expect("tail object layout"))
 }
@@ -660,6 +669,14 @@ impl<T: ?Sized + TailObject> SharedTail<T> {
     #[inline]
     pub fn is_permanent(this: &Self) -> bool {
         permanent_h(this.header())
+    }
+
+    /// ¿Congelado (`make_immortal` o `make_immortal_logged`)? Lo que se lee desde otros hilos y no se
+    /// escribe. NO lo es el de cuenta llena (`inc_strong` saturado): ése sigue siendo de un hilo, con
+    /// préstamos normales; decidir "congelado" por la cuenta sola lo confundía (auditoría de R2).
+    #[inline]
+    pub fn is_frozen(this: &Self) -> bool {
+        frozen_h(this.header())
     }
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
@@ -769,7 +786,7 @@ impl<T: ?Sized + TailObject> SharedTail<T> {
         // `SharedTail` del que salió).
         unsafe { std::ptr::drop_in_place(self.obj_ptr()) };
         // SAFETY: la reserva sigue viva gracias al débil implícito, que se devuelve acá.
-        unsafe { (*h).weak.set((*h).weak.get() - 1) };
+        unsafe { (*h).weak.set((*h).weak.get().checked_sub(1).unwrap_or_else(|| overflow())) };
         // SAFETY: el objeto ya se soltó.
         unsafe { Self::release_if_unreferenced(self.ptr) };
     }
@@ -868,6 +885,14 @@ impl<T> Obj<T> {
         permanent_h(this.header())
     }
 
+    /// ¿Congelado (`make_immortal` o `make_immortal_logged`)? Lo que se lee desde otros hilos y no se
+    /// escribe. NO lo es el de cuenta llena (`inc_strong` saturado): ése sigue siendo de un hilo, con
+    /// préstamos normales; decidir "congelado" por la cuenta sola lo confundía (auditoría de R2).
+    #[inline]
+    pub fn is_frozen(this: &Self) -> bool {
+        frozen_h(this.header())
+    }
+
     /// `usize::MAX` si es inmortal.
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
@@ -955,7 +980,7 @@ impl<T> Obj<T> {
         // SAFETY: el valor se suelta una vez (strong llegó a 0: nadie más lo ve).
         unsafe { std::ptr::drop_in_place(self.ptr.as_ref().value.get()) };
         // SAFETY: la reserva sigue viva gracias al débil implícito, que se devuelve acá.
-        unsafe { (*h).weak.set((*h).weak.get() - 1) };
+        unsafe { (*h).weak.set((*h).weak.get().checked_sub(1).unwrap_or_else(|| overflow())) };
         // SAFETY: strong = 0 y el valor ya se soltó.
         unsafe { release_if_unreferenced(self.ptr) };
     }
@@ -1159,6 +1184,14 @@ impl<E: Copy> ObjSlice<E> {
         permanent_h(this.header())
     }
 
+    /// ¿Congelado (`make_immortal` o `make_immortal_logged`)? Lo que se lee desde otros hilos y no se
+    /// escribe. NO lo es el de cuenta llena (`inc_strong` saturado): ése sigue siendo de un hilo, con
+    /// préstamos normales; decidir "congelado" por la cuenta sola lo confundía (auditoría de R2).
+    #[inline]
+    pub fn is_frozen(this: &Self) -> bool {
+        frozen_h(this.header())
+    }
+
     #[inline]
     pub fn strong_count(this: &Self) -> usize {
         strong_count_h(this.header())
@@ -1332,7 +1365,10 @@ fn dec_weak(h: &Header) -> bool {
     if h.strong.get() == IMMORTAL {
         return false;
     }
-    h.weak.set(h.weak.get() - 1);
+    match h.weak.get().checked_sub(1) {
+        Some(w) => h.weak.set(w),
+        None => overflow(),
+    }
     h.strong.get() == 0 && h.weak.get() == 0
 }
 fn upgrade_h(h: &Header) -> bool {
@@ -1371,10 +1407,10 @@ impl FreezeLog {
     }
 
     fn freeze(&mut self, h: &Header) {
-        let s = h.strong.get();
-        if s == IMMORTAL {
+        if frozen_h(h) {
             return;
         }
+        let s = h.strong.get();
         assert!(h.borrow.get() == 0, "make_immortal: the value is borrowed");
         self.frozen.push((NonNull::from(h), s));
         h.strong.set(IMMORTAL);
@@ -1389,7 +1425,9 @@ impl FreezeLog {
     /// clonar y soltar no contaron, así que la cuenta anotada es la de los dueños que quedan); (2)
     /// ningún otro hilo los puede ver más (los que los leyeron terminaron y se esperaron, con sus
     /// `thread_local`); (3) los objetos siguen vivos (un inmortal no se libera, y los dueños
-    /// anotados los sostienen).
+    /// anotados los sostienen); (4) no sobrevive ningún débil (`downgrade`) ni préstamo (`Ref`)
+    /// creado mientras eran inmortales: tampoco contaron, y soltarlos después descontaría lo que no
+    /// sumaron (un débil de más aborta, ver `dec_weak`).
     pub unsafe fn thaw(self) {
         for (h, s) in self.frozen {
             // SAFETY: (3) la reserva vive; (2) nadie más la lee mientras se escribe.
@@ -1398,6 +1436,10 @@ impl FreezeLog {
             h.borrow.set(0);
         }
     }
+}
+
+fn frozen_h(h: &Header) -> bool {
+    h.strong.get() == IMMORTAL && matches!(h.borrow.get(), IMMORTAL_BORROW | SCOPED_BORROW)
 }
 
 fn permanent_h(h: &Header) -> bool {
@@ -1409,7 +1451,7 @@ fn scoped_h(h: &Header) -> bool {
 }
 
 fn make_immortal_h(h: &Header) {
-    if h.strong.get() == IMMORTAL {
+    if frozen_h(h) {
         return;
     }
     assert!(h.borrow.get() == 0, "make_immortal: the value is borrowed");
@@ -1432,7 +1474,9 @@ fn take_read(h: &Header) -> Result<bool, BorrowError> {
 #[cold]
 #[inline(never)]
 fn take_read_slow(h: &Header, b: i16) -> Result<bool, BorrowError> {
-    if h.strong.get() == IMMORTAL {
+    // Por la bandera, no por la cuenta: un objeto con la cuenta llena (no congelado) puede tener un
+    // escritor vivo, y leerlo ahí sería alias de un `&mut` (auditoría de R2).
+    if frozen_h(h) {
         Ok(false)
     } else if b < 0 {
         Err(BorrowError::Writing)
@@ -1579,6 +1623,31 @@ mod tests {
         drop(already);
         // SAFETY (del test): la reserva sigue (inmortal) y nadie más la usa.
         unsafe { alloc::dealloc(p.as_ptr().cast(), Layout::new::<Inner<i32>>()) };
+    }
+
+    /// Auditoría de R2, hallazgo 2: un objeto con la cuenta llena NO está congelado (sigue siendo de un
+    /// hilo, con préstamos normales). Con un escritor vivo, leerlo es un error, no un préstamo que
+    /// conviva con el `&mut`; y `make_immortal` lo congela de verdad.
+    #[test]
+    fn a_full_count_is_not_frozen() {
+        let a = Shared::new(5u32);
+        {
+            let mut w = a.borrow_mut();
+            // Simula la saturación (4.000 millones de referencias): la cuenta en el tope.
+            a.header().strong.set(IMMORTAL);
+            assert!(!Shared::is_frozen(&a));
+            assert_eq!(a.try_borrow().err(), Some(BorrowError::Writing));
+            *w = 6;
+        }
+        assert_eq!(*a.borrow(), 6);
+        Shared::make_immortal(&a);
+        assert!(Shared::is_frozen(&a) && Shared::is_permanent(&a));
+        assert!(a.try_borrow_mut().is_err());
+        // Inmortal: el test devuelve la memoria a mano.
+        let p = a.ptr;
+        drop(a);
+        // SAFETY (del test): la reserva sigue (inmortal) y nadie más la usa.
+        unsafe { alloc::dealloc(p.as_ptr().cast(), Layout::new::<Inner<u32>>()) };
     }
 
     #[test]

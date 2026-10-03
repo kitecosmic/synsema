@@ -196,11 +196,22 @@ fn boxed(r: Repr) -> Vec<SynValue> {
 
 /// Los elementos de `l` como valores, para leerlos: una lista sin caja pasa a valores (para siempre).
 /// No hay que tenerla prestada (`borrow`) mientras tanto si no es de valores: se cambia.
-pub fn list_values(l: &ListRef) -> Ref<'_, Vec<SynValue>> {
-    if !l.borrow().is_values() {
-        l.borrow_mut().values_mut();
+///
+/// Una lista CONGELADA (R2, `frozen.rs`) no se cambia nunca —la leen otros hilos—: si es sin caja, se
+/// devuelve una copia en valores y la lista sigue en 8 B por elemento. Leer nunca escribe un objeto
+/// congelado (hasta la auditoría de R2, esto entraba en pánico: `count(IDS)` con `IDS` un `range`
+/// global leído desde `serve` o `parallel_map`).
+pub fn list_values(l: &ListRef) -> ListRead<'_> {
+    let b = l.borrow();
+    if b.is_values() {
+        return ListRead::Values(Ref::map(b, |s| s.as_values().expect("de valores").as_slice()));
     }
-    Ref::map(l.borrow(), |s| s.as_values().expect("de valores"))
+    if ListRef::is_frozen(l) {
+        return ListRead::Copy(b.to_vec());
+    }
+    drop(b);
+    l.borrow_mut().values_mut();
+    ListRead::Values(Ref::map(l.borrow(), |s| s.as_values().expect("de valores").as_slice()))
 }
 
 /// Los elementos de `l` como valores para LEER sin cambiar su forma: los de una lista de valores,

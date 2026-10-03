@@ -287,7 +287,7 @@ fn root() -> Obj<Node> {
 /// La forma de `parent` más la clave `k` al final: la transición guardada si la hay (por puntero
 /// primero, por texto después), o una nueva. `None` si `parent` ya tiene demasiadas hijas.
 fn transition(parent: &Obj<Node>, k: &Key) -> Option<Obj<Node>> {
-    if Obj::is_immortal(parent) {
+    if Obj::is_frozen(parent) {
         return frozen_transition(parent, k);
     }
     let s = shape_of(parent);
@@ -366,6 +366,34 @@ fn frozen_transition(parent: &Obj<Node>, k: &Key) -> Option<Obj<Node>> {
 /// de madres (con sus claves y su índice ya armado, para que leerla no escriba), el nodo
 /// `Grown`/`Dict` y las claves del diccionario. Los valores (y las claves en línea) los congela
 /// quien llama.
+/// ¿Algo de la forma del mapa (nodos o claves) está congelado CON ALCANCE? Entonces el mapa no puede
+/// pasar a la región permanente (`frozen.rs`).
+pub(crate) fn layout_scoped(m: &MapObj) -> bool {
+    let mut cur = match &m.layout {
+        Some(n) => n.clone(),
+        None => return false,
+    };
+    loop {
+        if Obj::is_scoped(&cur) {
+            return true;
+        }
+        let next = match &*cur {
+            Node::Shape(s) => {
+                if s.keys.iter().any(|k| k.text().is_scoped()) {
+                    return true;
+                }
+                s._parent.clone()
+            }
+            Node::Grown { shape, .. } => Some(shape.clone()),
+            Node::Dict(d) => return d.keys().any(|k| k.text().is_scoped()),
+        };
+        match next {
+            Some(p) => cur = p,
+            None => return false,
+        }
+    }
+}
+
 pub(crate) fn freeze_layout(m: &MapObj, mk: &mut crate::frozen::Marker) {
     if let Some(n) = &m.layout {
         freeze_node(n, mk);
@@ -375,7 +403,7 @@ pub(crate) fn freeze_layout(m: &MapObj, mk: &mut crate::frozen::Marker) {
 fn freeze_node(n: &Obj<Node>, mk: &mut crate::frozen::Marker) {
     let mut cur = n.clone();
     loop {
-        if Obj::is_immortal(&cur) {
+        if Obj::is_frozen(&cur) {
             return;
         }
         let next = match &*cur {

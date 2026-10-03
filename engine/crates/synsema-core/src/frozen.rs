@@ -112,8 +112,13 @@ fn can(v: &SynValue, seen: &mut HashSet<usize>, scoped_ok: bool) -> bool {
             if !scoped_ok && ListRef::is_scoped(l) {
                 return false;
             }
-            if ListRef::is_immortal(l) || !seen.insert(ListRef::as_ptr(l) as usize) {
+            if ListRef::is_frozen(l) || !seen.insert(ListRef::as_ptr(l) as usize) {
                 return true;
+            }
+            // Prestada ahora (alguien la está leyendo o escribiendo): no se congela. Mejor la copia de
+            // siempre que un pánico a mitad del congelado (auditoría de R2).
+            if l.try_borrow_mut().is_err() {
+                return false;
             }
             let b = l.borrow();
             b.as_values().is_none_or(|vs| vs.iter().all(|x| can(x, seen, scoped_ok)))
@@ -140,14 +145,23 @@ fn can_map(m: &MapRef, seen: &mut HashSet<usize>, scoped_ok: bool) -> bool {
     if !scoped_ok && MapRef::is_scoped(m) {
         return false;
     }
-    if MapRef::is_immortal(m) || !seen.insert(MapRef::as_ptr(m).cast::<()>() as usize) {
+    if MapRef::is_frozen(m) || !seen.insert(MapRef::as_ptr(m).cast::<()>() as usize) {
         return true;
     }
     // La vista de un módulo (`use … as m`) se escribe en el lugar (`set m.X[k]`): no se congela.
     if crate::interpreter::module_env_of_map(m).is_some() {
         return false;
     }
+    if m.try_borrow_mut().is_err() {
+        return false;
+    }
     let b = m.borrow();
+    // Un mapa propio puede compartir la forma y las claves con mapas congelados CON ALCANCE (los de un
+    // `parallel_map` de afuera): esas partes se descongelan al terminar, así que el mapa no puede
+    // pasar a la región permanente (auditoría de R2).
+    if !scoped_ok && (b.keys().any(|k| k.text().is_scoped()) || crate::synmap::layout_scoped(&b)) {
+        return false;
+    }
     b.values().all(|x| can(x, seen, scoped_ok))
 }
 
@@ -157,6 +171,20 @@ fn can_map(m: &MapRef, seen: &mut HashSet<usize>, scoped_ok: bool) -> bool {
 struct ThawLog {
     heap: FreezeLog,
     texts: Vec<TextThaw>,
+}
+
+impl ThawLog {
+    /// # Safety
+    /// El de `FreezeLog::thaw` y `TextThaw::thaw`.
+    unsafe fn thaw(self) {
+        // SAFETY: lo garantiza quien llama.
+        unsafe {
+            self.heap.thaw();
+            for t in self.texts {
+                t.thaw();
+            }
+        }
+    }
 }
 
 /// Cómo se vuelve inmortal cada objeto: para siempre (`log: None`) o anotándolo para descongelar.
@@ -207,7 +235,7 @@ fn mark(v: &SynValue, mk: &mut Marker) {
         SynValue::Time(t) => mk.obj(t),
         SynValue::Secret(s) => mk.obj(s),
         SynValue::List(l) => {
-            if ListRef::is_immortal(l) {
+            if ListRef::is_frozen(l) {
                 return;
             }
             if let Some(vs) = l.borrow().as_values() {
@@ -217,7 +245,7 @@ fn mark(v: &SynValue, mk: &mut Marker) {
         }
         SynValue::Map(m) => mark_map(m, mk),
         SynValue::Server(s) => {
-            if Obj::is_immortal(s) {
+            if Obj::is_frozen(s) {
                 return;
             }
             match &**s {
@@ -236,7 +264,7 @@ fn mark(v: &SynValue, mk: &mut Marker) {
 }
 
 fn mark_map(m: &MapRef, mk: &mut Marker) {
-    if MapRef::is_immortal(m) {
+    if MapRef::is_frozen(m) {
         return;
     }
     {
@@ -309,13 +337,19 @@ impl ScopedFreeze {
     ) -> std::io::Result<Vec<T>> {
         let ctx = ScopeCtx { values: self.values };
         let mut log = ThawLog::default();
-        {
+        // Dos valores pueden compartir partes: lo ya congelado (de esta vuelta, de un `run` de afuera o
+        // para siempre) se salta y no se anota. Si el marcado se interrumpe (no debería: `add` ya
+        // rechazó lo prestado), lo anotado se descongela antes de seguir con el pánico.
+        let marked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut mk = Marker { log: Some(&mut log) };
             for v in &ctx.values {
-                // Dos valores pueden compartir partes: lo ya inmortal (de esta vuelta o de antes) se
-                // salta. Uno ya congelado con alcance no llega acá (`add` lo rechaza).
                 mark(v, &mut mk);
             }
+        }));
+        if let Err(p) = marked {
+            // SAFETY: ningún hilo empezó; nadie clonó nada desde que se congeló.
+            unsafe { log.thaw() };
+            std::panic::resume_unwind(p);
         }
         let joined: Vec<std::thread::Result<T>>;
         let spawn_error: Option<std::io::Error>;
@@ -342,15 +376,11 @@ impl ScopedFreeze {
             spawn_error = err;
         }
         // SAFETY: los hilos que vieron lo congelado terminaron (esperados arriba, con sus
-        // `thread_local`); un clon que hicieron no salió de ellos (`SynValue` no es `Send`), así que ya
-        // se soltó (o se olvidó, y entonces no se suelta nunca: no cuenta). El hilo que llamó no clonó
-        // nada desde que se congeló. Los objetos siguen vivos: `ctx` los sostiene.
-        unsafe {
-            log.heap.thaw();
-            for t in log.texts {
-                t.thaw();
-            }
-        }
+        // `thread_local`); un clon, un débil o un préstamo que hicieron no salió de ellos (`SynValue`,
+        // los débiles y los `Ref` no son `Send`), así que ya se soltó (o se olvidó, y entonces no se
+        // suelta nunca: no cuenta). El hilo que llamó no clonó nada desde que se congeló. Los objetos
+        // siguen vivos: `ctx` los sostiene.
+        unsafe { log.thaw() };
         drop(ctx);
         if let Some(e) = spawn_error {
             return Err(e);
