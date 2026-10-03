@@ -6,6 +6,53 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.41 — 2026-10-03
+
+Data work, faster: reading and writing CSV, `join`, `summarize`/`group_by` and record lambdas do
+less work per row. The same language — every program gives the same results, errors and
+`steps()`. Nothing to change in your programs. One fix you may notice (below).
+
+**A data-science pipeline** — 1 M sales rows: `csv_parse`, `where`, `join` with a category
+table, `apply` building a derived column, `summarize`, `sort_by`, `mean`/`std`/`median` —
+takes **2.65 → 1.46 s** on Windows with the release builds (best of 5; v0.6.40 as released →
+v0.6.41). The same program, same machine: pandas 1.61 s, Node 2.07 s, CPython without
+libraries 4.31 s, polars 0.66 s, Go 0.67 s.
+
+| step (1 M rows) | v0.6.40 | v0.6.41 |
+|---|---:|---:|
+| `csv_parse` | 0.49 s | **0.26 s** |
+| `join` | 0.99 s | **0.29 s** |
+| `summarize` | 0.53 s | **0.26 s** |
+| `apply` (derived column) | 0.22 s | 0.20 s |
+| `mean` + `std` + `median` | 0.12 s | 0.10 s |
+
+Memory is unchanged: a table is still a list of maps (a columnar layout is the next step).
+
+**What changed.**
+- `csv_parse` reads the text in one pass and builds each row with one allocation (it was four);
+  fields without escaped quotes are not copied before they become values. `csv_encode` writes
+  every field straight into the output and formats numbers without intermediate text.
+- `join`, `summarize`, `group_by` and `pivot` hash a key by its value (the same equality as `==`)
+  instead of building a text form for every row, read columns by position when rows share a
+  shape, read keys and numbers without copying them, and copy a left row's values in one go when
+  its shape is the output's. The hash stays the standard library's keyed SipHash: tables often hold
+  data a server received from third parties, and a faster unkeyed hash would let them build
+  collisions.
+- `r.field` on the VM reads the record where it is, without a copy per read.
+- `sum` of only floats or only integers adds them directly; a float is formatted (`text`,
+  `csv_encode`, `json_encode`) without intermediate strings.
+- `csv_parse` checks for duplicate headers with a set: a header row with a huge number of columns
+  no longer takes quadratic time.
+
+**Fixed: reading a field after a row with more than 32 keys.** A read site on the VM or in native
+code (`r.g`, `r["g"]`) that met a row in dictionary mode — a map with more than 32 keys —
+remembered that row's position together with the previous row's shape. The next row with that
+shape could then read another key: in v0.6.40, `apply(rows, (r) => r.g)` over
+`[{"g": "a", "v": 1}, <a row with 40 keys and "g": "D">, {"g": "b", "v": 2}]` gave
+`["a", "D", 2]`, and `set r.g to …` inside a task could write into `v`. The cache now forgets the shape when it
+remembers a dictionary position (the new column readers of `group_by`, `summarize`, `join` and
+`csv_encode` use the same cache, and are covered by the same fix).
+
 ## v0.6.40 — 2026-10-03
 
 Memory, third step: the program's data is shared between threads instead of copied. A server's

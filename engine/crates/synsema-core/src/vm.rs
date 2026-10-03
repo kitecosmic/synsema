@@ -2815,6 +2815,22 @@ impl Interpreter {
                     Ok(())
                 }
                 Ins::GetProp { dst, obj, name, ic } => (|| {
+                    // Un mapa en un registro se lee en el lugar, sin clonarlo (subir y bajar su
+                    // cuenta, y el `drop` de un `SynValue` entero, por cada `r.campo`). Si se
+                    // consume (`Reg`), el registro queda vacío como con `opnd`.
+                    if let Opnd::Copy(r) | Opnd::Reg(r) = obj {
+                        let found = match &self.vm_regs[base + r as usize] {
+                            SynValue::Map(m) => m.borrow().get_cached(&chunk.names[name as usize], &chunk.key_ics[ic as usize]).cloned(),
+                            _ => None,
+                        };
+                        if let Some(v) = found {
+                            if let Opnd::Reg(r) = obj {
+                                self.vm_regs[base + r as usize] = SynValue::Nothing;
+                            }
+                            self.put(base, dst, v);
+                            return Ok(());
+                        }
+                    }
                     let o = self.opnd(&chunk, &env, base, obj, at)?;
                     let found = match &o {
                         SynValue::Map(m) => m.borrow().get_cached(&chunk.names[name as usize], &chunk.key_ics[ic as usize]).cloned(),

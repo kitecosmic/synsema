@@ -890,47 +890,97 @@ fn fmt_scaled(m: &BigInt, s: u32) -> String {
 /// si no fija (los enteros muestran `.0`). En científica el exponente lleva signo
 /// y mínimo 2 dígitos. nan/inf/-inf y el signo se preservan.
 pub fn py_float_str(x: f64) -> String {
+    let mut s = String::new();
+    let _ = write_py_float(x, &mut s);
+    s
+}
+
+/// Un búfer en la pila para el `{:e}` de un f64 (el más largo: `-2.2250738585072014e-308`, 24 B).
+struct EBuf {
+    b: [u8; 32],
+    n: usize,
+}
+
+impl fmt::Write for EBuf {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.n + s.len();
+        if end > self.b.len() {
+            return Err(fmt::Error);
+        }
+        self.b[self.n..end].copy_from_slice(s.as_bytes());
+        self.n = end;
+        Ok(())
+    }
+}
+
+/// [`py_float_str`] escrito en `out`, sin armar textos intermedios (antes: el `{:e}`, los dígitos,
+/// el cuerpo y el signo, cada uno un `String`; `csv_encode`, `json_encode` y `text()` formatean
+/// muchos floats).
+pub fn write_py_float<W: fmt::Write + ?Sized>(x: f64, out: &mut W) -> fmt::Result {
     if x.is_nan() {
-        return "nan".to_string();
+        return out.write_str("nan");
     }
     if x.is_infinite() {
-        return if x < 0.0 { "-inf".to_string() } else { "inf".to_string() };
+        return out.write_str(if x < 0.0 { "-inf" } else { "inf" });
     }
-
     // `{:e}` de Rust da la mantisa shortest en forma `d.ddd` y el exponente decimal.
-    let e = format!("{:e}", x); // p.ej. "3.0000000000000004e-1", "1e2", "-5e-1", "0e0"
+    let mut e = EBuf { b: [0; 32], n: 0 };
+    fmt::write(&mut e, format_args!("{:e}", x)).expect("un f64 en {:e} entra en 32 bytes");
+    let e = std::str::from_utf8(&e.b[..e.n]).expect("{:e} es ASCII");
     let (mant, exp_str) = e.split_once('e').expect("{:e} siempre incluye 'e'");
     let exp10: i32 = exp_str.parse().expect("exponente decimal válido");
     let negative = mant.starts_with('-');
-    let digits: String = mant.trim_start_matches('-').chars().filter(|c| *c != '.').collect();
-    let n = digits.len() as i32;
+    let mant = mant.trim_start_matches('-');
+    // Los dígitos son `d0` seguido de `rest` (la mantisa sin el punto).
+    let (d0, rest) = mant.split_at(1);
+    let rest = rest.strip_prefix('.').unwrap_or(rest);
+    let n = 1 + rest.len() as i32;
+    let digits = |out: &mut W, a: i32, b: i32| -> fmt::Result {
+        // Los dígitos [a, b) de `d0 + rest`.
+        let (a, b) = (a as usize, b as usize);
+        if a == 0 && b > 0 {
+            out.write_str(d0)?;
+        }
+        if b > 1 {
+            out.write_str(&rest[a.max(1) - 1..b - 1])?;
+        }
+        Ok(())
+    };
+    let zeros = |out: &mut W, k: i32| -> fmt::Result {
+        for _ in 0..k {
+            out.write_char('0')?;
+        }
+        Ok(())
+    };
     let decpt = exp10 + 1;
-
-    let body = if decpt <= -4 || decpt > 16 {
+    if negative {
+        out.write_char('-')?;
+    }
+    if decpt <= -4 || decpt > 16 {
         // Científica: <mantisa>e<signo><exp>, exp con signo y ≥2 dígitos.
-        let mantissa = if n == 1 {
-            digits.clone()
-        } else {
-            format!("{}.{}", &digits[..1], &digits[1..])
-        };
+        out.write_str(d0)?;
+        if n > 1 {
+            out.write_char('.')?;
+            out.write_str(rest)?;
+        }
         let exp = decpt - 1;
         let sign = if exp < 0 { '-' } else { '+' };
-        format!("{}e{}{:02}", mantissa, sign, exp.abs())
+        out.write_fmt(format_args!("e{}{:02}", sign, exp.abs()))
     } else if decpt <= 0 {
         // 0.000ddd
-        format!("0.{}{}", "0".repeat((-decpt) as usize), digits)
+        out.write_str("0.")?;
+        zeros(out, -decpt)?;
+        digits(out, 0, n)
     } else if decpt >= n {
         // Entero (ceros de relleno) + ".0"
-        format!("{}{}.0", digits, "0".repeat((decpt - n) as usize))
+        digits(out, 0, n)?;
+        zeros(out, decpt - n)?;
+        out.write_str(".0")
     } else {
         // Punto intercalado entre los dígitos
-        format!("{}.{}", &digits[..decpt as usize], &digits[decpt as usize..])
-    };
-
-    if negative {
-        format!("-{}", body)
-    } else {
-        body
+        digits(out, 0, decpt)?;
+        out.write_char('.')?;
+        digits(out, decpt, n)
     }
 }
 
@@ -957,10 +1007,88 @@ impl fmt::Display for Number {
         match self {
             Number::Int(n) => write!(f, "{}", n),
             Number::Big(b) => write!(f, "{}", b),
-            Number::Float(x) => write!(f, "{}", py_float_str(*x)),
+            Number::Float(x) => write_py_float(*x, f),
             // rust_decimal preserva la escala: 1.50d → "1.50", 100d → "100".
             Number::Decimal(d) => write!(f, "{}", d),
             Number::BigDec(b) => write!(f, "{}", fmt_scaled(&b.m, b.s)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod py_float_tests {
+    use super::*;
+
+    /// La versión anterior (con un `String` por paso): el oráculo de [`write_py_float`].
+    fn reference(x: f64) -> String {
+        if x.is_nan() {
+            return "nan".to_string();
+        }
+        if x.is_infinite() {
+            return if x < 0.0 { "-inf".to_string() } else { "inf".to_string() };
+        }
+    
+        // `{:e}` de Rust da la mantisa shortest en forma `d.ddd` y el exponente decimal.
+        let e = format!("{:e}", x); // p.ej. "3.0000000000000004e-1", "1e2", "-5e-1", "0e0"
+        let (mant, exp_str) = e.split_once('e').expect("{:e} siempre incluye 'e'");
+        let exp10: i32 = exp_str.parse().expect("exponente decimal válido");
+        let negative = mant.starts_with('-');
+        let digits: String = mant.trim_start_matches('-').chars().filter(|c| *c != '.').collect();
+        let n = digits.len() as i32;
+        let decpt = exp10 + 1;
+    
+        let body = if decpt <= -4 || decpt > 16 {
+            // Científica: <mantisa>e<signo><exp>, exp con signo y ≥2 dígitos.
+            let mantissa = if n == 1 {
+                digits.clone()
+            } else {
+                format!("{}.{}", &digits[..1], &digits[1..])
+            };
+            let exp = decpt - 1;
+            let sign = if exp < 0 { '-' } else { '+' };
+            format!("{}e{}{:02}", mantissa, sign, exp.abs())
+        } else if decpt <= 0 {
+            // 0.000ddd
+            format!("0.{}{}", "0".repeat((-decpt) as usize), digits)
+        } else if decpt >= n {
+            // Entero (ceros de relleno) + ".0"
+            format!("{}{}.0", digits, "0".repeat((decpt - n) as usize))
+        } else {
+            // Punto intercalado entre los dígitos
+            format!("{}.{}", &digits[..decpt as usize], &digits[decpt as usize..])
+        };
+    
+        if negative {
+            format!("-{}", body)
+        } else {
+            body
+        }
+    }
+
+    #[test]
+    fn writes_like_the_reference() {
+        let mut specials: Vec<f64> = vec![
+            0.0, -0.0, 1.0, -1.0, 0.1, 0.2, 0.3, 1.5, 100.0, 1e16, 1e17, 1e15, 9999999999999998.0,
+            12345678901234567.0, 0.0001, 0.00001, 0.001, 1e-4, 1e-5, 9.999e-5, 123.456, 1e22, 1e23,
+            f64::MAX, f64::MIN, f64::MIN_POSITIVE, f64::EPSILON, 5e-324, -5e-324, f64::NAN, f64::INFINITY,
+            f64::NEG_INFINITY, 2.5, 0.5, 3.0000000000000004, 1.0 / 3.0, 2.0 / 3.0, 123456789.0, 0.1 + 0.2,
+        ];
+        for p in -330..310 {
+            let x = 10f64.powi(p);
+            specials.extend([x, -x, x * 1.5, x * 9.87654321, x - x * 1e-15]);
+        }
+        let mut seed: u64 = 0x9e3779b97f4a7c15;
+        for _ in 0..400_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            specials.push(f64::from_bits(seed));
+            // También números "de datos": pocos decimales.
+            specials.push((seed % 10_000_000) as f64 / 100.0);
+        }
+        for x in specials {
+            assert_eq!(py_float_str(x), reference(x), "bits {:#x}", x.to_bits());
+            assert_eq!(Number::Float(x).to_string(), reference(x));
         }
     }
 }

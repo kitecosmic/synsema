@@ -277,9 +277,7 @@ fn present_numbers(v: &SynValue, who: &str) -> Result<(Vec<Number>, usize), Cont
             }
         }
     }
-    if out.iter().any(|n| n.is_decimal()) && out.iter().any(|n| matches!(n, Number::Float(_))) {
-        return Err(err(MIX_DECIMAL_FLOAT));
-    }
+    // La mezcla decimal/float la revisa `reduce_numbers` (un solo lugar para los dos caminos).
     Ok((out, total))
 }
 
@@ -289,9 +287,63 @@ pub fn reduce_values(v: &SynValue, kind: Kind, lvl: f64) -> Result<SynValue, Con
 }
 
 fn reduce_list(v: &SynValue, kind: Kind, lvl: f64, ddof: f64) -> Result<SynValue, Control> {
+    let (nums, total) = present_numbers(v, kind.name())?;
+    reduce_numbers(nums, total, kind, lvl, ddof)
+}
+
+/// `reduce_values` sobre números ya extraídos (`total` = cuántos había contando los faltantes): los
+/// agregados de `summarize` leen la columna del grupo en el lugar y llaman acá, sin armar una lista
+/// de valores para que `present_numbers` la vuelva a recorrer.
+pub(crate) fn reduce_numbers(nums: Vec<Number>, total: usize, kind: Kind, lvl: f64, ddof: f64) -> Result<SynValue, Control> {
     let who = kind.name();
-    let (nums, total) = present_numbers(v, who)?;
-    let nan = nums.iter().any(|n| matches!(n, Number::Float(x) if x.is_nan()));
+    // Qué hay en la lista, en una pasada (antes, una por pregunta).
+    let (mut floats, mut decimals, mut others, mut nan) = (0usize, false, false, false);
+    for n in &nums {
+        match n {
+            Number::Float(x) => {
+                floats += 1;
+                nan |= x.is_nan();
+            }
+            Number::Int(_) => {}
+            n if n.is_decimal() => decimals = true,
+            _ => others = true,
+        }
+    }
+    if decimals && floats > 0 {
+        return Err(err(MIX_DECIMAL_FLOAT));
+    }
+    // La suma de sólo floats o de sólo enteros, sin el `Number` genérico por elemento: el mismo
+    // resultado (`0 + x` es `0.0 + x` y un float más otro es `+`, en el mismo orden); si los
+    // enteros desbordan, el camino de siempre (que pasa a entero grande).
+    if kind == Kind::Sum && !decimals && !others {
+        if floats > 0 && floats == nums.len() {
+            let mut acc = 0.0f64;
+            for n in &nums {
+                if let Number::Float(x) = n {
+                    acc += x;
+                }
+            }
+            return Ok(syn_number(Number::Float(acc)));
+        }
+        if floats == 0 {
+            let mut acc = 0i64;
+            let mut ok = true;
+            for n in &nums {
+                if let Number::Int(i) = n {
+                    match acc.checked_add(*i) {
+                        Some(s) => acc = s,
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if ok {
+                return Ok(syn_number(Number::Int(acc)));
+            }
+        }
+    }
     match kind {
         Kind::Sum | Kind::Product => {
             let mut acc = Number::Int(if kind == Kind::Sum { 0 } else { 1 });
@@ -312,7 +364,7 @@ fn reduce_list(v: &SynValue, kind: Kind, lvl: f64, ddof: f64) -> Result<SynValue
     if nan {
         return Ok(syn_float(f64::NAN));
     }
-    let all_exact_decimal = nums.iter().any(|n| n.is_decimal()) && nums.iter().all(|n| !matches!(n, Number::Float(_)));
+    let all_exact_decimal = decimals && floats == 0;
     match kind {
         Kind::Mean if all_exact_decimal => {
             // La suma es exacta a cualquier tamaño; la división sigue la regla de `/` decimal.
