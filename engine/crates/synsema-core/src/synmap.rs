@@ -1073,6 +1073,29 @@ fn addr(n: &Obj<Node>) -> usize {
 }
 
 impl MapObj {
+    /// Los valores en orden de sus claves como un slice, si están todos en línea (una forma, sin
+    /// valores afuera): para copiar una fila entera de una vez. `None` en los otros modos.
+    #[inline]
+    pub fn inline_values(&self) -> Option<&[SynValue]> {
+        match self.layout.as_deref() {
+            Some(Node::Shape(s)) => self.vals.get(..s.keys.len()),
+            _ => None,
+        }
+    }
+
+    /// La identidad de la forma del mapa si sus claves (y su orden) son las de una forma compartida:
+    /// dos mapas con el mismo `shape_id` tienen las mismas claves. `None` en modo diccionario o sin
+    /// nodo (cada uno, las suyas). Para quien recorre las claves de muchas filas (`join`).
+    pub fn shape_id(&self) -> Option<usize> {
+        let n = self.layout.as_ref()?;
+        match &**n {
+            Node::Shape(_) => Some(addr(n)),
+            // Un `Grown` tiene las claves de su forma (lo que no entró en línea va aparte).
+            Node::Grown { shape, .. } => Some(addr(shape)),
+            Node::Dict(_) => None,
+        }
+    }
+
     /// El valor de `key` usando (y actualizando) la caché del sitio. **La clave tiene que ser la
     /// misma en cada ejecución del sitio** (`m.k`): con la forma que recuerda la caché, la posición
     /// alcanza. Para una clave que cambia, [`MapObj::get_cached_key`].
@@ -1157,6 +1180,11 @@ impl MapObj {
                     }
                 }
                 let (i, _, v) = d.get_full(key)?;
+                // La posición es la del diccionario: la caché deja de recordar una forma. Si no, un
+                // mapa con la forma de antes (una tabla que alterna filas con forma y en diccionario)
+                // pasaría el camino rápido con esta posición y leería —o escribiría— otra clave.
+                ic.shape.set(0);
+                drop(ic.pin.take());
                 ic.slot.set(i as u32);
                 Some(v)
             }
@@ -1694,5 +1722,68 @@ mod tests {
         assert!(SynText::ptr_eq(k.text(), &t));
         assert_eq!(Key::of_value(&SynValue::Text(SynText::from("id"))).as_str(), "id");
         assert_eq!(Key::of_value(&syn_int(7)).as_str(), "7");
+    }
+
+    /// Un sitio (una `MapIc` por clave, compartida como la de `r.g` en un `apply`) que ve mapas con
+    /// forma, crecidos y en diccionario, con las claves en distinto orden, lee y escribe SIEMPRE la
+    /// clave pedida. Antes, una posición de diccionario quedaba con la forma anterior en la caché y
+    /// la fila siguiente con esa forma leía (o escribía) otra columna.
+    #[test]
+    fn a_shared_cache_reads_and_writes_the_right_key_across_modes() {
+        let mut next = rng(11);
+        let names = ["g", "v", "w", "k3", "k20"];
+        let mut maps: Vec<MapRef> = Vec::new();
+        let mut refs: Vec<IndexMap<String, i64>> = Vec::new();
+        for m in 0..48 {
+            // Pocas claves (con forma, en algunos de dos órdenes) o más de MAX_SHAPED (diccionario).
+            let mut keys: Vec<String> = match m % 4 {
+                0 => vec!["g".into(), "v".into()],
+                1 => vec!["v".into(), "g".into(), "w".into()],
+                2 => (0..MAX_SHAPED + 4).map(|i| format!("k{}", i)).chain(["v".into(), "g".into()]).collect(),
+                _ => vec!["g".into(), "v".into(), "w".into(), "k3".into()],
+            };
+            if m % 8 == 3 {
+                keys.reverse();
+            }
+            let mut s = SynMap::new();
+            let mut b = IndexMap::new();
+            for (i, k) in keys.iter().enumerate() {
+                let n = (m * 100 + i) as i64;
+                s.insert(k.as_str(), syn_int(n));
+                b.insert(k.clone(), n);
+            }
+            let r = s.into_ref();
+            // Algunos crecen después de armados (`Grown` o pasan a diccionario).
+            if m % 6 == 5 {
+                for i in 0..(MAX_SHAPED + 2) {
+                    let k = format!("x{}", i);
+                    r.borrow_mut().insert(k.as_str(), syn_int(-(i as i64)));
+                    b.insert(k, -(i as i64));
+                }
+            }
+            maps.push(r);
+            refs.push(b);
+        }
+        let ics: Vec<MapIc> = names.iter().map(|_| MapIc::default()).collect();
+        for step in 0..20_000i64 {
+            let m = next() % maps.len();
+            let j = next() % names.len();
+            let k = names[j];
+            if next() % 3 == 0 {
+                let got = maps[m].borrow_mut().get_cached_mut(k, &ics[j]).map(|v| {
+                    *v = syn_int(1_000_000 + step);
+                });
+                if got.is_some() {
+                    refs[m].insert(k.to_string(), 1_000_000 + step);
+                }
+                assert_eq!(got.is_some(), refs[m].contains_key(k), "escritura de {} en el mapa {}", k, m);
+            } else {
+                let got = maps[m].borrow().get_cached(k, &ics[j]).map(int);
+                assert_eq!(got, refs[m].get(k).copied(), "lectura de {} en el mapa {} (paso {})", k, m, step);
+            }
+        }
+        for (m, b) in refs.iter().enumerate() {
+            assert_eq!(pairs(&maps[m].borrow()), want(b), "mapa {}", m);
+        }
     }
 }
