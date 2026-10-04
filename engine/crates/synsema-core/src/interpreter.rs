@@ -4334,6 +4334,14 @@ impl Interpreter {
         if !self.labels {
             return self.exec_node(node, env);
         }
+        self.exec_labelled(node, env)
+    }
+
+    /// La rama de `exec` con etiquetas encendidas. Aparte y sin inline a propósito (v0.6.42): así
+    /// `exec`, que envuelve a TODO nodo, queda de dos líneas y un cambio en la lógica de etiquetas
+    /// no mueve el camino caliente de los programas sin etiquetas.
+    #[inline(never)]
+    fn exec_labelled(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
         // `seen` se scopea al nodo: lo de afuera se guarda, el nodo arranca limpio, y al
         // salir se funden. Así se sabe exactamente qué privados tocó ESTE nodo.
         let outer = std::mem::replace(&mut self.seen, self.no_label.clone());
