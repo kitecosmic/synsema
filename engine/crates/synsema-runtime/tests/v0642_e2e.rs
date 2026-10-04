@@ -483,3 +483,11 @@ fn two_host_headers_are_a_bad_request() {
     let (status, _, _) = get(port, "/", "Host: other.example\r\n");
     assert_eq!(status, 400);
 }
+
+#[test]
+fn a_pipe_half_close_still_lets_the_other_side_answer() {
+    let _g = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let r = run("let p be pipe()\npipe_send(p[\"a\"], \"req\")\npipe_close(p[\"a\"], \"write\")\nprint(decode(pipe_recv(p[\"b\"], 1)[\"data\"]))\nprint(pipe_recv(p[\"b\"], 1)[\"type\"])\npipe_send(p[\"b\"], \"resp\")\nprint(decode(pipe_recv(p[\"a\"], 1)[\"data\"]))\n");
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["req", "close", "resp"]);
+}

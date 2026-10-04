@@ -32,6 +32,9 @@ pub const MAX_BUFFER_CEILING: usize = 64 * 1024 * 1024;
 const MAX_UNADOPTED: usize = 65_536;
 /// Los handles de pipe viven en su propio rango, lejos de los ids por-hub (que empiezan en 1).
 const FIRST_PIPE_ID: u64 = 1 << 40;
+/// Un extremo que nadie adoptó en este tiempo se cierra (el túnel se cayó, el puente no
+/// arrancó): un pipe abandonado no retiene memoria ni un lugar de la tabla para siempre.
+const UNADOPTED_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Despertador de un extremo (lo llama el otro lado).
 pub type WakeFn = Arc<dyn Fn() + Send + Sync>;
@@ -202,6 +205,16 @@ impl PipeEnd {
         self.shared.wake(1 - self.side);
     }
 
+    /// ¿Ya no queda nada por leer y el otro lado dejó de escribir? (EOF).
+    pub fn at_eof(&self) -> bool {
+        self.shared.dirs[1 - self.side].lock().map(|d| d.len == 0 && d.writer_closed).unwrap_or(true)
+    }
+
+    /// ¿Hay bytes esperando a que este extremo los lea?
+    fn has_unread(&self) -> bool {
+        self.shared.dirs[1 - self.side].lock().map(|d| d.len > 0).unwrap_or(false)
+    }
+
     /// ¿El otro extremo ya cerró del todo (ni lee ni escribe)?
     fn peer_gone(&self) -> bool {
         let peer_reader = self.shared.dirs[self.side].lock().map(|d| d.reader_closed).unwrap_or(true);
@@ -220,12 +233,31 @@ impl Drop for PipeEnd {
 // La tabla del proceso: extremos sin adoptar
 // =========================================================
 
-fn table() -> &'static Mutex<HashMap<u64, PipeEnd>> {
-    static T: OnceLock<Mutex<HashMap<u64, PipeEnd>>> = OnceLock::new();
+fn table() -> &'static Mutex<HashMap<u64, (PipeEnd, std::time::Instant)>> {
+    static T: OnceLock<Mutex<HashMap<u64, (PipeEnd, std::time::Instant)>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-static NEXT_ID: AtomicU64 = AtomicU64::new(FIRST_PIPE_ID);
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Un id nuevo, aleatorio (≥ 2^40, < 2^62): un extremo no se adopta adivinando su número.
+fn fresh_id(t: &HashMap<u64, (PipeEnd, std::time::Instant)>) -> u64 {
+    use std::hash::BuildHasher;
+    loop {
+        let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let r = std::collections::hash_map::RandomState::new().hash_one(n);
+        let id = (r >> 2) | FIRST_PIPE_ID;
+        if !t.contains_key(&id) {
+            return id;
+        }
+    }
+}
+
+/// Saca de la tabla los extremos que ya no va a usar nadie: los que nadie adoptó en
+/// `UNADOPTED_TTL`, y los que tienen el par cerrado y nada por leer. Soltarlos los cierra.
+fn sweep(t: &mut HashMap<u64, (PipeEnd, std::time::Instant)>) {
+    t.retain(|_, (e, at)| at.elapsed() < UNADOPTED_TTL && !(e.peer_gone() && !e.has_unread()));
+}
 
 /// ¿Este número es un handle de pipe (por su rango)?
 pub fn is_pipe_id(h: i64) -> bool {
@@ -236,20 +268,18 @@ pub fn is_pipe_id(h: i64) -> bool {
 pub fn create(cap: usize) -> Result<(i64, i64), String> {
     let (a, b) = pair(cap);
     let mut t = table().lock().map_err(|_| "pipe(): internal lock poisoned".to_string())?;
+    sweep(&mut t);
     if t.len() + 2 > MAX_UNADOPTED {
-        // Antes de negarse, soltar los extremos cuyo par ya no existe (nadie los va a usar).
-        t.retain(|_, e| !e.peer_gone() || e.readable());
-        if t.len() + 2 > MAX_UNADOPTED {
-            return Err(format!(
-                "pipe(): {} pipe ends are waiting to be used; use or close them (pipe_close) before creating more",
-                t.len()
-            ));
-        }
+        return Err(format!(
+            "pipe(): {} pipe ends are waiting to be used; use or close them (pipe_close) before creating more",
+            t.len()
+        ));
     }
-    let ia = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let ib = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    t.insert(ia, a);
-    t.insert(ib, b);
+    let now = std::time::Instant::now();
+    let ia = fresh_id(&t);
+    t.insert(ia, (a, now));
+    let ib = fresh_id(&t);
+    t.insert(ib, (b, now));
     Ok((ia as i64, ib as i64))
 }
 
@@ -258,7 +288,10 @@ pub fn adopt(h: i64) -> Option<PipeEnd> {
     if !is_pipe_id(h) {
         return None;
     }
-    table().lock().ok()?.remove(&(h as u64))
+    let mut t = table().lock().ok()?;
+    let end = t.remove(&(h as u64)).map(|(e, _)| e);
+    sweep(&mut t);
+    end
 }
 
 /// Cierra un extremo que nadie adoptó todavía (`pipe_close` sobre un handle que este hub no tiene).
@@ -408,10 +441,23 @@ mod tests {
     fn ends_are_adopted_once_from_the_process_table() {
         let (ha, hb) = create(16).unwrap();
         assert!(is_pipe_id(ha) && is_pipe_id(hb) && ha != hb);
+        assert!(hb != ha + 1, "ids aleatorios, no consecutivos");
         let a = adopt(ha).expect("primera adopción");
         assert!(adopt(ha).is_none(), "un extremo adoptado no se adopta de nuevo");
         assert!(close_unadopted(hb));
         assert_eq!(a.try_write(b"x"), Err(WriteError::Closed), "el otro extremo cerró");
         assert!(!is_pipe_id(7));
+    }
+
+    /// Auditoría B3: un extremo que nadie adoptó y cuyo par ya cerró se suelta al crear otro
+    /// pipe (antes el predicado del barrido era siempre verdadero y la tabla sólo crecía).
+    #[test]
+    fn an_abandoned_end_is_swept() {
+        let (ha, hb) = create(16).unwrap();
+        let mut a = adopt(ha).unwrap();
+        a.close();
+        drop(a);
+        let _ = create(16).unwrap();
+        assert!(adopt(hb).is_none(), "el extremo abandonado quedó en la tabla");
     }
 }

@@ -111,6 +111,7 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     ("http_bytes", "net"),
     ("http_put", "net"), ("http_delete", "net"), ("mtls_identity", "net"),
     ("ws_connect", "net"),
+    ("tcp_connect", "net"),
     ("push_send", "net"), // Web Push: el push service es un host más (tanda PWA)
     ("evm_rpc", "net"), ("evm_call", "net"), ("evm_send", "net"), ("solana_rpc", "net"),
     ("evm_logs", "net"), ("evm_block_number", "net"),

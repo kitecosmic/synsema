@@ -415,8 +415,8 @@ struct WsRegistry {
     cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// v0.6.42 — conexiones TCP salientes (`tcp_connect`).
     tcps: HashMap<i64, ws_net::TcpConn>,
-    /// v0.6.42 — extremos de pipe adoptados por este hub.
-    pipes: HashMap<i64, crate::pipe::PipeEnd>,
+    /// v0.6.42 — extremos de pipe adoptados por este hub (con si ya entregaron su `close`).
+    pipes: HashMap<i64, ws_net::PipeSlot>,
 }
 
 impl Drop for WsRegistry {

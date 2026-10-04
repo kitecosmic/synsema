@@ -23,6 +23,13 @@ const TCP_BUFFER_CEILING: usize = 64 * 1024 * 1024;
 /// Lectura por pasada (se repite hasta `WouldBlock` o hasta llenar el tope).
 const READ_CHUNK: usize = 64 * 1024;
 
+/// Un extremo de pipe adoptado. Como en TCP, entregar el `close` del otro lado NO lo saca del
+/// hub: el medio cierre (`pipe_close(x, "write")`) deja escribir la respuesta.
+pub(super) struct PipeSlot {
+    end: PipeEnd,
+    eof_emitted: bool,
+}
+
 /// Una conexión TCP saliente en el hub.
 pub(super) struct TcpConn {
     stream: mio::net::TcpStream,
@@ -165,8 +172,14 @@ impl WsRegistry {
         }
         if c.eof && !c.eof_emitted {
             c.eof_emitted = true;
+            let done = c.outbound.is_empty();
             let mut m = SynMap::new();
             m.insert("type", syn_text("close"));
+            // Cerrado del otro lado y sin nada por mandar: deja de ocupar el hub (y el tope de
+            // conexiones). Un `tcp_send` posterior dice que la conexión está cerrada.
+            if done {
+                self.tcp_retire(h);
+            }
             return Some(Ok(m));
         }
         None
@@ -194,30 +207,34 @@ impl WsRegistry {
                     end.set_waker(Some(Arc::new(move || {
                         let _ = w.wake();
                     })));
-                    self.pipes.insert(h, end);
+                    self.pipes.insert(h, PipeSlot { end, eof_emitted: false });
                 }
             }
         }
     }
 
     pub(super) fn pipe_actionable(&self, h: i64) -> bool {
-        self.pipes.get(&h).map(|p| p.readable()).unwrap_or(false)
+        self.pipes
+            .get(&h)
+            .map(|p| p.end.readable() && !(p.eof_emitted && p.end.at_eof()))
+            .unwrap_or(false)
     }
 
     pub(super) fn pipe_take(&mut self, h: i64, max: usize) -> Option<SynMap> {
-        let p = self.pipes.get(&h)?;
+        let p = self.pipes.get_mut(&h)?;
         let mut m = SynMap::new();
-        match p.try_read(max) {
+        match p.end.try_read(max) {
             ReadOutcome::Data(b) => {
                 m.insert("type", syn_text("data"));
                 m.insert("data", syn_bytes(b.to_vec()));
             }
-            ReadOutcome::Eof => {
-                // El otro lado cerró y no queda nada: se entrega una vez y el extremo se retira.
+            ReadOutcome::Eof if !p.eof_emitted => {
+                // El otro lado dejó de escribir: se entrega una vez. El extremo SIGUE (se puede
+                // seguir escribiendo la respuesta); se retira con `pipe_close` o al cerrar el hub.
+                p.eof_emitted = true;
                 m.insert("type", syn_text("close"));
-                self.pipes.remove(&h);
             }
-            ReadOutcome::Empty => return None,
+            ReadOutcome::Eof | ReadOutcome::Empty => return None,
         }
         Some(m)
     }
@@ -226,9 +243,9 @@ impl WsRegistry {
     /// adoptó, se adopta de la tabla del proceso.
     pub(super) fn take_pipe_for_proxy(&mut self, h: i64) -> Option<PipeEnd> {
         match self.pipes.remove(&h) {
-            Some(e) => {
-                e.set_waker(None);
-                Some(e)
+            Some(slot) => {
+                slot.end.set_waker(None);
+                Some(slot.end)
             }
             None => pipe::adopt(h),
         }
@@ -305,7 +322,7 @@ pub(super) fn tcp_connect(i: &mut Interpreter, args: &[SynValue], reg: &Registry
         Some(other) => return Err(err(format!("{}: the port must be a number, got {}", F, other.type_name()))),
         None => return Err(err(format!("{}: missing the port", F))),
     };
-    let bare = host.trim_start_matches('[').trim_end_matches(']').to_string();
+    let bare = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
     // El scope lleva SIEMPRE el puerto: un grant con puerto cubre sólo ese puerto.
     let scope = if bare.contains(':') { format!("[{}]:{}", bare, port) } else { format!("{}:{}", bare, port) };
     reg.borrow()
@@ -324,10 +341,18 @@ pub(super) fn tcp_connect(i: &mut Interpreter, args: &[SynValue], reg: &Registry
     i.check_cancel()?;
     let std_stream = {
         let _w = synsema_core::waiting::waiting();
-        let addrs: Vec<std::net::SocketAddr> = (bare.as_str(), port)
-            .to_socket_addrs()
-            .map_err(|e| err(format!("{}: cannot resolve {}: {}", F, bare, e)))?
-            .collect();
+        // La resolución de nombres de la std no tiene timeout: corre en un hilo y se espera con
+        // el mismo plazo que la conexión (un DNS colgado no cuelga el programa).
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (b2, p2) = (bare.clone(), port);
+        std::thread::spawn(move || {
+            let _ = tx.send((b2.as_str(), p2).to_socket_addrs().map(|a| a.collect::<Vec<_>>()));
+        });
+        let addrs: Vec<std::net::SocketAddr> = match rx.recv_timeout(timeout.max(Duration::from_millis(1))) {
+            Ok(Ok(a)) => a,
+            Ok(Err(e)) => return Err(err(format!("{}: cannot resolve {}: {}", F, bare, e))),
+            Err(_) => return Err(err(format!("{}: resolving {} timed out", F, bare))),
+        };
         let mut last = None;
         let mut found = None;
         for a in addrs {
@@ -486,7 +511,7 @@ pub(super) fn pipe_send(i: &mut Interpreter, args: &[SynValue], reg: &Registry) 
         let res = {
             let r = reg.borrow();
             let p = r.pipes.get(&h).ok_or_else(|| err(format!("{}: pipe end {} closed", F, h)))?;
-            p.try_write(&data[off..])
+            p.end.try_write(&data[off..])
         };
         match res {
             Ok(n) => off += n,
@@ -532,7 +557,7 @@ pub(super) fn pipe_close(args: &[SynValue], reg: &Registry) -> Result<SynValue, 
     r.adopt_pipes(&[h]);
     if write_only {
         if let Some(p) = r.pipes.get(&h) {
-            p.close_write();
+            p.end.close_write();
         }
     } else if r.pipes.remove(&h).is_none() {
         pipe::close_unadopted(h);
