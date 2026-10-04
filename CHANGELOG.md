@@ -19,13 +19,20 @@ Synsema on top of them.
   listed in `trust proxy` (or `--trust-proxy`); from anyone else they are removed before the
   program, the generated URLs or a `proxy to` see them. Behind nginx/Caddy/a load balancer, add
   `trust proxy ["127.0.0.1"]` (or its address/CIDR) to the `serve` block; `ip of request` is then
-  the real client.
+  the real client. The trusted proxy must set (not pass through) `X-Forwarded-Proto`/`-Host`;
+  `Forwarded` is dropped, not parsed. A request with more than one `Host` header is a 400.
 - **`log` writes to stderr under `synsema run`** (like Go's `log`, Python's `logging` and the MCP
   stdio rule): stdout is the program's result, so `synsema run x.syn | jq` and stdio servers stay
-  clean. Under `test`, `serve` and `run --format json` it is collected as before.
-- **In a route that runs `proxy to`, the request body is not read first**: it streams to the
-  destination (with `max_body` still counting bytes, and a declared `Content-Length` above it
-  answered with 413 right away). `read_body` in such a route sees an empty body.
+  clean. Under `test`, `serve`, `run --format json`, `--explain` and `--attest` it is collected as
+  before; inside an agent it keeps the agent's prefix.
+- **`eprint` is a reserved builtin name** (like `print`, it is checked for private data): a program
+  that defined its own `task eprint` must rename it.
+- **In a route that runs `proxy to`, the request body streams to the destination** without being
+  read first (with `max_body` still counting bytes, and a declared `Content-Length` above it
+  answered with 413 right away) — unless the route reads it (`read_body`, `read_body_bytes`, or the
+  request's `body`/`form`/`json`): then it is read whole, up to `max_body`, and forwarded as is.
+- **`tls auto` starts even if the CA cannot be reached**: names without a certificate are logged
+  and retried in the background (hourly, with backoff) instead of stopping the server.
 - **`tls auto` keeps one certificate per name** (it was one certificate for every `domain`):
   adding a domain no longer re-issues the others. On the first start after upgrading, names that
   were only in the old shared certificate get their own.
@@ -47,13 +54,19 @@ Synsema on top of them.
 
 **Programs over stdio, and waiting without holding the server.**
 - `eprint(…)` writes to stderr (a public sink, like `print`). `exit(code?)` ends a `synsema run`
-  with that code (0–255); `try` does not catch it; under `serve` it points to `shutdown(reason)`.
+  with that code (0–255); `try` does not catch it; agents still running are stopped; under `serve`
+  it points to `shutdown(reason)`; inside a `test` block it fails that test. `run --format json`
+  and `run()` of `@synsema/wasm` report it as `exit`.
 - `serve` no longer lets a waiting handler hold a worker: `sleep`, `wait_for`, `select`, HTTP and
   LLM calls, databases, approvals and child processes release their CPU permit while they wait,
   and the pool adds threads (up to `SYNSEMA_SERVE_MAX_WAITING`, default 256) while others wait.
   CPU work is still capped at `SYNSEMA_SERVE_WORKERS`. With 2 permits, six routes sleeping 2 s
   now finish together in ~2.7 s and a fast route answers meanwhile; before, they ran two at a
-  time and the fast route waited behind them. No new keyword: code stays straight-line.
+  time and the fast route waited behind them. No new keyword: code stays straight-line. A thread
+  coming back from a wait never blocks (it takes its permit back on credit), so a wait with a
+  lock held cannot deadlock the server; extra threads leave as soon as the queue is empty. With a
+  token budget (`SYNSEMA_LLM_BUDGET` and friends), LLM calls in flight are still capped at the
+  workers, so the budget is not overshot by the extra threads.
 
 **Certificates (`tls auto`).**
 - The ACME account is stored and reused (`SYNSEMA_CERT_DIR`); certificates renew by their real
@@ -62,9 +75,14 @@ Synsema on top of them.
   `(name, value, "set" | "clear")` publishes the TXT record with your DNS provider over HTTP. The
   engine knows no provider.
 - `domain ask <task>`: on-demand certificates. A new name in a handshake is offered to the task
-  (`true` issues; an error or a timeout counts as no) and issued with TLS-ALPN-01. There is no
-  on-demand issuance without `ask`. `SYNSEMA_ACME_MAX_PER_HOUR` (20) caps issuance, failures back
-  off per name, and `SYNSEMA_ACME_DNS_WAIT` (20 s) is the TXT propagation wait.
+  (`true` issues) and issued with HTTP-01 (or TLS-ALPN-01 without the `:80` listener). There is no
+  on-demand issuance without `ask`. One issuance per name at a time (parallel connections share
+  it), a certificate on disk is reused after a restart, `ask` runs at most 8 at a time and 20 new
+  names per second (the rest is refused at once, not remembered), `SYNSEMA_ACME_MAX_PER_HOUR`
+  (20) caps on-demand issuance, failures back off per name, and `SYNSEMA_ACME_DNS_WAIT` (20 s) is
+  the TXT propagation wait. Keys are written atomically, 0600 in Unix, and checked against their
+  certificate. `SYNSEMA_CERT_DIR`, `SYNSEMA_ACME_DIRECTORY`, `SYNSEMA_ACME_CA` and
+  `SYNSEMA_ACME_HTTP_PORT` are now in the `.env.example` of `synsema init`.
 
 **Also.**
 - A comment (or several) before the first statement of a `socket`, `stream` or `reason` block

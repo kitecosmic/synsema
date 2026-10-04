@@ -205,3 +205,15 @@ fn check_warns_on_a_wildcard_domain_without_tls_dns() {
     let w = check_warnings(&t, "b.syn");
     assert!(!w.iter().any(|x| x.contains("is a wildcard")), "{:?}", w);
 }
+
+#[test]
+fn exit_after_touching_private_data_keeps_the_output_under_labels() {
+    let (mut interp, r) = run_labels(
+        "let s be private(5, \"a\")\nprint(\"before\")\ntask f()\n    let y be s + 1\n    exit(2)\nf()\n",
+    );
+    let Err(Control::Error(e)) = &r else { panic!("se esperaba exit") };
+    assert_eq!(e.exit_code, Some(2));
+    assert!(!e.is_fatal_for_labels(), "exit no es un corte del flujo");
+    interp.redact_output_for_host(&r);
+    assert_eq!(interp.output, vec!["before".to_string()], "la salida no se retiene");
+}

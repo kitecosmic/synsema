@@ -1344,11 +1344,17 @@ pub fn run_program_ceiled_opts(
             errors: vec![abort_message(&p)],
         });
 
+    // v0.6.42 (auditoría) — `exit(code)` termina el programa: los agentes vivos se detienen (si
+    // no, `wait_all` esperaba a uno en bucle para siempre) y el código lo decide `exit`.
+    let exited = last_run_exit_code().is_some();
+    if exited {
+        swarm.stop_all_agents("exit()");
+    }
     // Joinea los agentes lanzados por el main; ya no hay nadie más que pueda spawnear.
     swarm.wait_all();
 
     // Refleja los agentes en ERROR (exit ≠0 + línea de error), sin tocar la salida del main.
-    let agent_errors = collect_agent_errors(&swarm);
+    let agent_errors = if exited { Vec::new() } else { collect_agent_errors(&swarm) };
     if !agent_errors.is_empty() {
         result.success = false;
         result.errors.extend(agent_errors);

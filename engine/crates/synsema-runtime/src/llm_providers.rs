@@ -1621,8 +1621,66 @@ impl LLMProvider for ReloadingProvider {
     }
 }
 
+/// v0.6.42 (auditoría) — con un techo de tokens, las llamadas LLM en vuelo a la vez se acotan a
+/// los workers de `serve` (lo que había antes del pool elástico). El techo se chequea ANTES de
+/// llamar y los tokens se descuentan DESPUÉS: con 256 hilos extra esperando al proveedor, el
+/// exceso posible se multiplicaba. Sin techo no se acota nada.
+struct BudgetSlots {
+    used: std::sync::Mutex<usize>,
+    cv: std::sync::Condvar,
+    max: usize,
+}
+
+fn budget_slots() -> &'static BudgetSlots {
+    static S: std::sync::OnceLock<BudgetSlots> = std::sync::OnceLock::new();
+    S.get_or_init(|| BudgetSlots {
+        used: std::sync::Mutex::new(0),
+        cv: std::sync::Condvar::new(),
+        max: std::env::var("SYNSEMA_SERVE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).max(2)),
+    })
+}
+
+struct BudgetSlot;
+
+impl BudgetSlot {
+    fn acquire() -> BudgetSlot {
+        let slots = budget_slots();
+        // Esperar un lugar es esperar: bajo `serve` el hilo suelta su permiso de CPU.
+        let _w = synsema_core::waiting::waiting();
+        let mut used = slots.used.lock().unwrap_or_else(|e| e.into_inner());
+        while *used >= slots.max {
+            used = slots.cv.wait(used).unwrap_or_else(|e| e.into_inner());
+        }
+        *used += 1;
+        BudgetSlot
+    }
+}
+
+impl Drop for BudgetSlot {
+    fn drop(&mut self) {
+        let slots = budget_slots();
+        let mut used = slots.used.lock().unwrap_or_else(|e| e.into_inner());
+        *used = used.saturating_sub(1);
+        slots.cv.notify_one();
+    }
+}
+
+impl MeteredProvider {
+    /// Un lugar de llamada si hay algún techo que proteger (del proceso, por identidad o
+    /// delegado); `None` si no hay techo.
+    fn budget_slot(&self) -> Option<BudgetSlot> {
+        let capped = self.budget.is_some() || !self.per_identity.is_empty() || current_delegated_llm_budget().is_some();
+        capped.then(BudgetSlot::acquire)
+    }
+}
+
 impl LLMProvider for MeteredProvider {
     fn call(&self, request: &LLMRequest) -> LLMResponse {
+        let _slot = self.budget_slot();
         if let Some(cut) = self.over_budget() {
             cut.note();
             return LLMResponse {
@@ -1643,6 +1701,7 @@ impl LLMProvider for MeteredProvider {
     }
 
     fn call_step(&self, request: &LLMRequest) -> LlmStepResponse {
+        let _slot = self.budget_slot();
         if let Some(cut) = self.over_budget() {
             cut.note();
             return LlmStepResponse {
@@ -1660,6 +1719,7 @@ impl LLMProvider for MeteredProvider {
         request: &LLMRequest,
         on_chunk: &mut dyn FnMut(&str) -> bool,
     ) -> LLMResponse {
+        let _slot = self.budget_slot();
         if let Some(cut) = self.over_budget() {
             cut.note();
             let marker = cut.marker();

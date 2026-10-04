@@ -491,3 +491,18 @@ fn a_pipe_half_close_still_lets_the_other_side_answer() {
     assert!(r.success, "{:?}", r.errors);
     assert_eq!(r.output, vec!["req", "close", "resp"]);
 }
+
+#[test]
+fn exit_stops_live_agents_instead_of_hanging() {
+    let _g = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let src = "require time\nagent Forever\n    while true\n        sleep(0.05)\nspawn Forever\nprint(\"main\")\nexit(3)\n";
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let r = run(src);
+        let _ = tx.send((r, synsema_runtime::engine::last_run_exit_code()));
+    });
+    let (r, code) = rx.recv_timeout(Duration::from_secs(20)).expect("exit con un agente vivo se colgó");
+    assert_eq!(r.output, vec!["main"]);
+    assert!(r.errors.is_empty(), "{:?}", r.errors);
+    assert_eq!(code, Some(3));
+}

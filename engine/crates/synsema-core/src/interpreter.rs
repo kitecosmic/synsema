@@ -4354,7 +4354,9 @@ impl Interpreter {
             // operación falló es exactamente el bit que la regla 1.a prohíbe. De paso cierra el
             // veredicto por bloque del runner de tests, que sólo cortaba con `is_fatal_for_labels`.
             let pc_empty = self.pc_is_empty();
-            if !pc_empty || !inner.is_empty() {
+            // v0.6.42 (auditoría) — `exit`/`proxy to` no son fallas: su llamada ya pasó el chequeo
+            // de sumidero (PC vacío, valor público). Marcarlos como corte del flujo retenía stdout.
+            if (!pc_empty || !inner.is_empty()) && !e.is_halt() {
                 let l = labels::union(&self.pc_label(), &inner);
                 if !l.is_empty() {
                     e.from_private_pc = true;
@@ -5479,7 +5481,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // v0.6.42 — bajo `synsema run`, `log` es diagnóstico y va a stderr (Go `log`, Python
         // `logging`, Rust `env_logger`, MCP por stdio): stdout queda para el resultado. Bajo
         // `test`/`serve`/`conform`/JSON se sigue colectando con la salida, como siempre.
-        if LIVE_STDOUT.load(std::sync::atomic::Ordering::Relaxed) {
+        // Con un `log_hook` (agentes, el sink de serve) va por el hook: conserva el prefijo del
+        // agente y el destino del host.
+        if self.log_hook.is_none() && LIVE_STDOUT.load(std::sync::atomic::Ordering::Relaxed) {
             self.emit_err_line(line);
         } else {
             self.emit_line(line);

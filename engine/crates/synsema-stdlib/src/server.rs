@@ -2357,6 +2357,11 @@ pub const SERVE_ENV_VARS: &[&str] = &[
     // v0.6.42 — certificados administrados (`acme_manager`).
     "SYNSEMA_ACME_MAX_PER_HOUR",
     "SYNSEMA_ACME_DNS_WAIT",
+    // Los de ACME anteriores, que no estaban en ninguna lista (auditoría de v0.6.42).
+    "SYNSEMA_CERT_DIR",
+    "SYNSEMA_ACME_DIRECTORY",
+    "SYNSEMA_ACME_CA",
+    "SYNSEMA_ACME_HTTP_PORT",
 ];
 
 /// Servidores (`run_async`) vivos en el proceso: con varios `serve on` en un programa,
