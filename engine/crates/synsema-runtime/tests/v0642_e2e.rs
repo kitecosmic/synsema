@@ -332,3 +332,90 @@ fn exit_sets_the_code_of_the_run() {
     assert!(r.success);
     assert_eq!(synsema_runtime::engine::last_run_exit_code(), None);
 }
+
+/// Upstream que lee el body por `Content-Length` y contesta cuántos bytes recibió.
+fn spawn_counting_upstream() -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut len = 0usize;
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                        len = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut got = 0usize;
+                while got < len {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got += n,
+                    }
+                }
+                let body = format!("got {}", got);
+                let mut s = stream;
+                let _ = s.write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes(),
+                );
+            });
+        }
+    });
+    port
+}
+
+fn post(port: u16, path: &str, size: usize) -> (u16, String) {
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    sock.write_all(format!("POST {} HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", path, size).as_bytes())
+        .unwrap();
+    let chunk = vec![b'x'; 64 * 1024];
+    let mut sent = 0;
+    while sent < size {
+        let n = chunk.len().min(size - sent);
+        if sock.write_all(&chunk[..n]).is_err() {
+            break; // el server cortó (413): leer la respuesta
+        }
+        sent += n;
+    }
+    // `read_to_end` conserva lo leído aunque el server cierre con datos sin leer (RST).
+    let mut raw = Vec::new();
+    let _ = sock.read_to_end(&mut raw);
+    let resp = String::from_utf8_lossy(&raw).to_string();
+    let status = resp.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    (status, resp)
+}
+
+#[test]
+fn a_proxied_body_streams_and_max_body_still_holds() {
+    let up = spawn_counting_upstream();
+    let port = free_port();
+    let prog = format!(
+        "require serve({p})\nrequire net(\"127.0.0.1:{up}\")\nserve on {p}\n    max_body \"16mb\"\n    route \"POST /up\"\n        proxy to \"http://127.0.0.1:{up}\"\n",
+        p = port,
+        up = up
+    );
+    start(prog, port);
+    // 8 MB pasan sin que el edge los junte en memoria (el upstream los cuenta).
+    let (status, resp) = post(port, "/up", 8 * 1024 * 1024);
+    assert_eq!(status, 200, "{}", resp);
+    assert!(resp.ends_with(&format!("got {}", 8 * 1024 * 1024)), "{}", resp);
+    // Un `Content-Length` por encima de `max_body`: 413 apenas llegan los headers, sin esperar
+    // (ni leer) el body.
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    sock.write_all(format!("POST /up HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\r\n", 20 * 1024 * 1024).as_bytes())
+        .unwrap();
+    let mut raw = Vec::new();
+    let _ = sock.read_to_end(&mut raw);
+    let resp = String::from_utf8_lossy(&raw).to_string();
+    assert!(resp.starts_with("HTTP/1.1 413"), "{}", &resp[..resp.len().min(300)]);
+}

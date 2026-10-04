@@ -2691,6 +2691,8 @@ fn proc_wait(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Res
     let h = proc_handle(reg, args.first(), F)?;
     let timeout = timeout_arg(args.get(1), F)?;
     let deadline = Instant::now() + timeout;
+    // v0.6.42 — esperar a un hijo no usa CPU: bajo `serve` el hilo suelta su permiso.
+    let _w = synsema_core::waiting::waiting();
     loop {
         interp.check_cancel()?;
         {

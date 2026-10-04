@@ -376,6 +376,8 @@ impl DatabaseManager {
         filter: Document,
         opts: MongoFindOpts,
     ) -> Result<Vec<SynValue>, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let c = self.mongo_coll(coll)?;
         let mut action = c.find(filter);
         if let Some(l) = opts.limit {
@@ -400,6 +402,8 @@ impl DatabaseManager {
 
     /// `mongo_find_one`: primer documento que matchea, o `nothing`.
     pub fn mongo_find_one(&mut self, coll: &str, filter: Document) -> Result<SynValue, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let c = self.mongo_coll(coll)?;
         match c.find_one(filter).run().map_err(mongo_err)? {
             Some(doc) => Ok(bson_to_syn(&Bson::Document(doc))),
@@ -409,6 +413,8 @@ impl DatabaseManager {
 
     /// `mongo_insert`: inserta un documento, devuelve el `_id` (text hex si es ObjectId).
     pub fn mongo_insert(&mut self, coll: &str, doc: Document) -> Result<SynValue, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let c = self.mongo_coll(coll)?;
         let res = c.insert_one(doc).run().map_err(mongo_err)?;
         Ok(bson_to_syn(&res.inserted_id))
@@ -416,6 +422,8 @@ impl DatabaseManager {
 
     /// `mongo_insert_many`: inserta varios, devuelve la lista de `_id` en orden de inserción.
     pub fn mongo_insert_many(&mut self, coll: &str, docs: Vec<Document>) -> Result<Vec<SynValue>, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let n = docs.len();
         let c = self.mongo_coll(coll)?;
         let res = c.insert_many(docs).run().map_err(mongo_err)?;
@@ -428,6 +436,8 @@ impl DatabaseManager {
     /// `mongo_update` (update_many): `update` debe traer operadores (`$set`/`$inc`/…).
     /// Devuelve `(matched, modified)`.
     pub fn mongo_update(&mut self, coll: &str, filter: Document, update: Document) -> Result<(i64, i64), String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let c = self.mongo_coll(coll)?;
         let res = c.update_many(filter, update).run().map_err(mongo_err)?;
         Ok((res.matched_count as i64, res.modified_count as i64))
@@ -435,6 +445,8 @@ impl DatabaseManager {
 
     /// `mongo_delete` (delete_many): devuelve cuántos borró.
     pub fn mongo_delete(&mut self, coll: &str, filter: Document) -> Result<i64, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let c = self.mongo_coll(coll)?;
         let res = c.delete_many(filter).run().map_err(mongo_err)?;
         Ok(res.deleted_count as i64)
@@ -442,12 +454,16 @@ impl DatabaseManager {
 
     /// `mongo_count`: documentos que matchean `filter`.
     pub fn mongo_count(&mut self, coll: &str, filter: Document) -> Result<i64, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let c = self.mongo_coll(coll)?;
         Ok(c.count_documents(filter).run().map_err(mongo_err)? as i64)
     }
 
     /// `mongo_aggregate`: pipeline de agregación (lista de stages-documento) → lista de maps.
     pub fn mongo_aggregate(&mut self, coll: &str, pipeline: Vec<Document>) -> Result<Vec<SynValue>, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let c = self.mongo_coll(coll)?;
         let cursor = c.aggregate(pipeline).run().map_err(mongo_err)?;
         let mut out = Vec::new();
@@ -459,6 +475,8 @@ impl DatabaseManager {
 
     /// `mongo_collections`: nombres de las colecciones del db.
     pub fn mongo_collections(&mut self) -> Result<Vec<String>, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         match self.conn_mut(None)? {
             Backend::Mongo(db) => db.list_collection_names().run().map_err(mongo_err),
             Backend::Sqlite(_) | Backend::Postgres(_) | Backend::Mysql(_) => Err(mongo_wrong_backend()),
@@ -483,6 +501,8 @@ impl DatabaseManager {
     /// trata `&[u8]` como un solo argumento vía `write_args_from_slice`/`is_single_vec_arg`,
     /// NO uno por byte). La respuesta cruda (`redis::Value`) la mapea el llamador.
     pub fn redis_command(&mut self, parts: &[Vec<u8>]) -> Result<redis::Value, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let conn = self.redis_conn()?;
         let mut cmd = redis::Cmd::new();
         for p in parts {
@@ -1385,6 +1405,8 @@ fn redis_wrong_backend_mongo() -> String {
 /// = db 0. TLS: `rediss://…` activa rustls (provider ring por unificación de features). El dev es
 /// `redis://` plaintext.
 fn redis_connect(url: &str) -> Result<redis::Connection, String> {
+    // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+    let _w = synsema_core::waiting::waiting();
     let client = redis::Client::open(url).map_err(redis_err)?;
     let mut conn = client
         .get_connection_with_timeout(Duration::from_secs(10))

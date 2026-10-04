@@ -150,6 +150,6 @@ fn main() {
         for e in &r.errors {
             eprintln!("{}", e);
         }
-        std::process::exit(if r.ok { 0 } else { 1 });
+        std::process::exit(r.exit_code.unwrap_or(if r.ok { 0 } else { 1 }));
     }
 }

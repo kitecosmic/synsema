@@ -166,6 +166,8 @@ pub struct Report {
     /// La corrida desenvolvió algún valor privado: el host debe
     /// tratar los mensajes de error como sensibles (redactarlos fuera del enclave).
     pub private_seen: bool,
+    /// v0.6.42 — el código que pidió `exit(code)`, si lo llamó (`ok` = código 0, sin errores).
+    pub exit_code: Option<i32>,
 }
 
 /// Un `declassify` ejecutado, en forma plana (`Send`, serializable).
@@ -972,6 +974,7 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
                 result: None,
                 declassify: Vec::new(),
                 private_seen: false,
+                exit_code: None,
             }
         }
         Ok(p) => p,
@@ -988,6 +991,7 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
             result: None,
             declassify: Vec::new(),
             private_seen: false,
+            exit_code: None,
         };
     }
     let result = interp.execute(&program);
@@ -1013,11 +1017,17 @@ pub fn run(source: &str, opts: &RunOptions) -> Report {
             column: e.loc.column,
         })
         .collect();
+    let exit_code = match &result {
+        Err(Control::Error(e)) => e.exit_code,
+        _ => None,
+    };
     let r = finish(interp, result);
     Report {
-        ok: r.success,
+        ok: exit_code.map_or(r.success, |c| c == 0),
         output: r.output,
-        errors: r.errors,
+        // `exit` no es un error: el programa pidió terminar.
+        errors: if exit_code.is_some() { Vec::new() } else { r.errors },
+        exit_code,
         audit: export_audit(&caps),
         llm_tokens: llm_tokens_total(),
         steps,

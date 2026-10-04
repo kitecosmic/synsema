@@ -1196,6 +1196,9 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 let out_h = std::thread::spawn(move || read_capped(out, max_output));
                 let err_h = std::thread::spawn(move || read_capped(err, max_output));
 
+                // v0.6.42 — mientras el hijo corre, este hilo sólo espera: bajo `serve` suelta su
+                // permiso de ejecución.
+                let _w = synsema_core::waiting::waiting();
                 // esperar con timeout (polling try_wait + kill); sin crate externa.
                 let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs.max(0.0));
                 let mut timed_out = false;

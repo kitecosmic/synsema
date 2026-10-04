@@ -3051,7 +3051,7 @@ async fn proxy_request(
     method: String,
     target_pq: String,
     headers: Vec<(String, String)>,
-    body: Bytes,
+    body: Option<Incoming>,
     client_ip: String,
     upgrade: Option<hyper::upgrade::OnUpgrade>,
     timeout: Option<f64>,
@@ -3065,7 +3065,8 @@ async fn proxy_request(
     // v0.6.42 — el destino es una URL (TCP al upstream) o un extremo de `pipe()` que el programa
     // lleva por su propio transporte (un túnel). El cliente HTTP/1.1 es el mismo: `SendRequest`
     // no depende del IO, sólo la conexión que se deja corriendo.
-    type ProxySender = hyper::client::conn::http1::SendRequest<Full<Bytes>>;
+    type ProxyReqBody = http_body_util::combinators::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+    type ProxySender = hyper::client::conn::http1::SendRequest<ProxyReqBody>;
     let wait = Duration::from_secs_f64(timeout.filter(|t| t.is_finite() && *t > 0.0).unwrap_or(30.0));
     let (mut sender, authority, base): (ProxySender, String, String) = match plan.target {
         crate::routing::ProxyDest::Url(url) => {
@@ -3182,12 +3183,25 @@ async fn proxy_request(
             rb = rb.header("X-Forwarded-Host", val);
         }
     }
-    let req = match rb.body(Full::new(body)) {
+    // El body del cliente en streaming, con el tope de `max_body` (el `size_hint` exacto viaja:
+    // si el cliente mandó `Content-Length`, el upstream lo recibe igual).
+    let up_body: ProxyReqBody = match body {
+        Some(b) => match rt.max_body {
+            Some(m) => Limited::new(b, m.max(0) as usize).boxed_unsync(),
+            None => b.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>).boxed_unsync(),
+        },
+        None => Full::new(Bytes::new()).map_err(|never| match never {}).boxed_unsync(),
+    };
+    let req = match rb.body(up_body) {
         Ok(r) => r,
         Err(e) => return proxy_error_response(502, format!("proxy error: bad request for upstream: {}", e), &extra, cors.as_deref(), hsts),
     };
     let resp = match tokio::time::timeout(wait, sender.send_request(req)).await {
         Ok(Ok(r)) => r,
+        // El body pasó `max_body` a mitad de camino: 413, como si se hubiera leído entero.
+        Ok(Err(e)) if format!("{:?}", e).contains("LengthLimitError") => {
+            return proxy_error_response(413, "payload too large".to_string(), &extra, cors.as_deref(), hsts)
+        }
         Ok(Err(e)) => return proxy_error_response(502, format!("proxy error: {}", e), &extra, cors.as_deref(), hsts),
         Err(_) => {
             return proxy_error_response(
@@ -3571,15 +3585,34 @@ async fn handle_request(
         }
     }
 
-    // Body con tope; excedido → 413 + cerrar.
-    let body_bytes = match read_req_body(req.into_body(), rt.max_body).await {
-        Ok(b) => b,
-        Err(()) => {
-            let body = obj(vec![
-                ("error", Json::Str("payload too large".into())),
-                ("status", Json::Int(413)),
-            ]);
-            return Ok(json_full(413, dumps(&body), &[], cors.as_deref(), hsts, true));
+    // v0.6.42 — en una ruta que hace `proxy to`, el body NO se lee: viaja en streaming al
+    // destino (con el tope de `max_body` contando bytes), como un reverse proxy. Memoria
+    // acotada aunque se suba un archivo grande por un túnel; el handler lo ve vacío.
+    let mut proxy_body: Option<Incoming> = None;
+    let body_bytes = if plan.proxy {
+        // Un `Content-Length` declarado por encima del tope se rechaza ya, sin esperar el body.
+        if let (Some(m), Ok(n)) = (rt.max_body, header_value(&headers, "content-length").trim().parse::<i64>()) {
+            if n > m.max(0) {
+                let body = obj(vec![
+                    ("error", Json::Str("payload too large".into())),
+                    ("status", Json::Int(413)),
+                ]);
+                return Ok(json_full(413, dumps(&body), &[], cors.as_deref(), hsts, true));
+            }
+        }
+        proxy_body = Some(req.into_body());
+        Bytes::new()
+    } else {
+        // Body con tope; excedido → 413 + cerrar.
+        match read_req_body(req.into_body(), rt.max_body).await {
+            Ok(b) => b,
+            Err(()) => {
+                let body = obj(vec![
+                    ("error", Json::Str("payload too large".into())),
+                    ("status", Json::Int(413)),
+                ]);
+                return Ok(json_full(413, dumps(&body), &[], cors.as_deref(), hsts, true));
+            }
         }
     };
     // Spill a disco igual que el oráculo: bodies > MEM_SPILL no van en memoria (el
@@ -3596,7 +3629,7 @@ async fn handle_request(
         };
     // Lo que el forward de un `proxy to` necesita (el job sync consume el resto).
     let proxy_req = if plan.proxy {
-        Some((method.clone(), target.clone(), headers.clone(), body_bytes.clone(), peer_ip.clone()))
+        Some((method.clone(), target.clone(), headers.clone(), peer_ip.clone()))
     } else {
         None
     };
@@ -3886,7 +3919,7 @@ async fn handle_request(
         // v0.6.42 — el transporte guarda lo que el reenvío necesita sólo en rutas que hacen
         // proxy (no en todas). Un `proxy to` escondido en una task que la ruta llama no se ve al
         // arrancar: error claro en vez de reenviar sin headers ni body.
-        let Some((m, pq, hs, body, ip)) = proxy_req else {
+        let Some((m, pq, hs, ip)) = proxy_req else {
             return Ok(proxy_error_response(
                 500,
                 "proxy to ran inside a task the route calls; put the `proxy to` statement in the route body itself".to_string(),
@@ -3895,7 +3928,7 @@ async fn handle_request(
                 hsts,
             ));
         };
-        return Ok(proxy_request(rt.clone(), pp, m, pq, hs, body, ip, proxy_upgrade, plan.timeout, cors, hsts).await);
+        return Ok(proxy_request(rt.clone(), pp, m, pq, hs, proxy_body, ip, proxy_upgrade, plan.timeout, cors, hsts).await);
     }
 
     // 101 Switching Protocols: responder y, cuando hyper entregue el socket crudo,
