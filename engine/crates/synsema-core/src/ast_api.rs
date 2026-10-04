@@ -199,15 +199,20 @@ pub(crate) fn children(n: &Node) -> Vec<&Node> {
             routes,
             tls_cert,
             tls_key,
-            tls_auto_email,
-            domain,
+            acme,
+            trust_proxy,
             hosts,
             mounts,
             ..
         } => {
             let mut v = vec![port.as_ref()];
-            for b in [auth_handler, error_handler, max_body, max_streams, rate_limit, timeout, cors, describe, tls_cert, tls_key, tls_auto_email, domain].into_iter().flatten() {
+            for b in [auth_handler, error_handler, max_body, max_streams, rate_limit, timeout, cors, describe, tls_cert, tls_key, trust_proxy].into_iter().flatten() {
                 v.push(b);
+            }
+            if let Some(a) = acme {
+                for b in [&a.email, &a.domain, &a.domain_ask, &a.tls_dns].into_iter().flatten() {
+                    v.push(b);
+                }
             }
             v.extend(static_mounts.iter());
             v.extend(routes.iter());
@@ -710,15 +715,21 @@ fn children_mut(n: &mut Node) -> Vec<&mut Node> {
             routes,
             tls_cert,
             tls_key,
-            tls_auto_email,
-            domain,
+            acme,
+            trust_proxy,
             hosts,
             mounts,
             ..
         } => {
             let mut v = vec![port.as_mut()];
-            for b in [auth_handler, error_handler, max_body, max_streams, rate_limit, timeout, cors, describe, tls_cert, tls_key, tls_auto_email, domain].into_iter().flatten() {
+            for b in [auth_handler, error_handler, max_body, max_streams, rate_limit, timeout, cors, describe, tls_cert, tls_key, trust_proxy].into_iter().flatten() {
                 v.push(b.as_mut());
+            }
+            if let Some(a) = acme {
+                let a = a.as_mut();
+                for b in [&mut a.email, &mut a.domain, &mut a.domain_ask, &mut a.tls_dns].into_iter().flatten() {
+                    v.push(b.as_mut());
+                }
             }
             v.extend(static_mounts.iter_mut());
             v.extend(routes.iter_mut());

@@ -57,3 +57,21 @@ tests/*.py
 
 # Artefacto wasm copiado al paquete npm para uso local (lo genera el build, no se versiona).
 packages/synsema-wasm/synsema.wasm
+
+# Medición y perfiles locales (rendimiento): NO van al repo público.
+# Ejemplos temporales para medir (no commitear; los ejemplos que usan los scripts, `run.rs` y
+# `vmprof.rs`, sí se versionan). Para uno nuevo, nombrarlo `tmp_*.rs` o `local_*.rs`.
+engine/crates/synsema-core/examples/explain.rs
+engine/crates/synsema-jit/examples/stats.rs
+**/examples/tmp_*.rs
+**/examples/local_*.rs
+# Salidas de valgrind/perf/PGO y binarios copiados para comparar.
+callgrind.out.*
+cachegrind.out.*
+massif.out.*
+dhat*.json
+perf.data*
+*.profraw
+*.profdata
+*.exe
+*.log

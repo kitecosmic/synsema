@@ -495,6 +495,9 @@ fn dispatch(req: &Map<String, Value>) -> Value {
                     out.insert("audit".into(), audit_json(&r.audit));
                     out.insert("llm_tokens".into(), json!(r.llm_tokens));
                     out.insert("steps".into(), json!(r.steps));
+                    // v0.6.42 — el código de salida, con el mismo nombre que `run --format json`:
+                    // el de `exit(code)` si lo pidió, si no 0/1 según `ok`.
+                    out.insert("exit".into(), json!(r.exit_code.unwrap_or(if r.ok { 0 } else { 1 })));
                     // Sólo cuando el host lo pidió (`"result"`), y `null` si la
                     // variable no quedó ligada o la corrida falló.
                     if opts.result.is_some() {

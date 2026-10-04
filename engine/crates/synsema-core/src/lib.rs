@@ -48,3 +48,4 @@ pub mod term_guard;
 pub mod testgen;
 pub mod tokens;
 pub mod types;
+pub mod waiting;

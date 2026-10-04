@@ -76,10 +76,25 @@ impl DbHandle for Rc<RefCell<DatabaseManager>> {
 
 impl DbHandle for Arc<Mutex<DatabaseManager>> {
     fn read<R>(&self, f: impl FnOnce(&DatabaseManager) -> R) -> R {
-        f(&self.lock().unwrap())
+        f(&lock_shared_db(self))
     }
     fn write<R>(&self, f: impl FnOnce(&mut DatabaseManager) -> R) -> R {
-        f(&mut self.lock().unwrap())
+        f(&mut lock_shared_db(self))
+    }
+}
+
+/// v0.6.42 (auditoría ronda 2) — el lock de la base compartida de `serve`. Si está tomado (otro
+/// hilo tiene la conexión mientras espera a la red), esperarlo es una espera: el hilo suelta su
+/// permiso de CPU. Si no, los hilos en fila por la conexión retenían los permisos y una ruta que
+/// ni toca la base esperaba detrás del N+1 de las demás. Libre, no cuesta nada.
+fn lock_shared_db(m: &Mutex<DatabaseManager>) -> std::sync::MutexGuard<'_, DatabaseManager> {
+    match m.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let _w = synsema_core::waiting::waiting();
+            m.lock().unwrap()
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => m.lock().unwrap(),
     }
 }
 
@@ -376,6 +391,8 @@ impl DatabaseManager {
         filter: Document,
         opts: MongoFindOpts,
     ) -> Result<Vec<SynValue>, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let c = self.mongo_coll(coll)?;
         let mut action = c.find(filter);
         if let Some(l) = opts.limit {
@@ -400,6 +417,8 @@ impl DatabaseManager {
 
     /// `mongo_find_one`: primer documento que matchea, o `nothing`.
     pub fn mongo_find_one(&mut self, coll: &str, filter: Document) -> Result<SynValue, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let c = self.mongo_coll(coll)?;
         match c.find_one(filter).run().map_err(mongo_err)? {
             Some(doc) => Ok(bson_to_syn(&Bson::Document(doc))),
@@ -409,6 +428,8 @@ impl DatabaseManager {
 
     /// `mongo_insert`: inserta un documento, devuelve el `_id` (text hex si es ObjectId).
     pub fn mongo_insert(&mut self, coll: &str, doc: Document) -> Result<SynValue, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let c = self.mongo_coll(coll)?;
         let res = c.insert_one(doc).run().map_err(mongo_err)?;
         Ok(bson_to_syn(&res.inserted_id))
@@ -416,6 +437,8 @@ impl DatabaseManager {
 
     /// `mongo_insert_many`: inserta varios, devuelve la lista de `_id` en orden de inserción.
     pub fn mongo_insert_many(&mut self, coll: &str, docs: Vec<Document>) -> Result<Vec<SynValue>, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let n = docs.len();
         let c = self.mongo_coll(coll)?;
         let res = c.insert_many(docs).run().map_err(mongo_err)?;
@@ -428,6 +451,8 @@ impl DatabaseManager {
     /// `mongo_update` (update_many): `update` debe traer operadores (`$set`/`$inc`/…).
     /// Devuelve `(matched, modified)`.
     pub fn mongo_update(&mut self, coll: &str, filter: Document, update: Document) -> Result<(i64, i64), String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let c = self.mongo_coll(coll)?;
         let res = c.update_many(filter, update).run().map_err(mongo_err)?;
         Ok((res.matched_count as i64, res.modified_count as i64))
@@ -435,6 +460,8 @@ impl DatabaseManager {
 
     /// `mongo_delete` (delete_many): devuelve cuántos borró.
     pub fn mongo_delete(&mut self, coll: &str, filter: Document) -> Result<i64, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let c = self.mongo_coll(coll)?;
         let res = c.delete_many(filter).run().map_err(mongo_err)?;
         Ok(res.deleted_count as i64)
@@ -442,12 +469,16 @@ impl DatabaseManager {
 
     /// `mongo_count`: documentos que matchean `filter`.
     pub fn mongo_count(&mut self, coll: &str, filter: Document) -> Result<i64, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let c = self.mongo_coll(coll)?;
         Ok(c.count_documents(filter).run().map_err(mongo_err)? as i64)
     }
 
     /// `mongo_aggregate`: pipeline de agregación (lista de stages-documento) → lista de maps.
     pub fn mongo_aggregate(&mut self, coll: &str, pipeline: Vec<Document>) -> Result<Vec<SynValue>, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let c = self.mongo_coll(coll)?;
         let cursor = c.aggregate(pipeline).run().map_err(mongo_err)?;
         let mut out = Vec::new();
@@ -459,6 +490,8 @@ impl DatabaseManager {
 
     /// `mongo_collections`: nombres de las colecciones del db.
     pub fn mongo_collections(&mut self) -> Result<Vec<String>, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         match self.conn_mut(None)? {
             Backend::Mongo(db) => db.list_collection_names().run().map_err(mongo_err),
             Backend::Sqlite(_) | Backend::Postgres(_) | Backend::Mysql(_) => Err(mongo_wrong_backend()),
@@ -483,6 +516,8 @@ impl DatabaseManager {
     /// trata `&[u8]` como un solo argumento vía `write_args_from_slice`/`is_single_vec_arg`,
     /// NO uno por byte). La respuesta cruda (`redis::Value`) la mapea el llamador.
     pub fn redis_command(&mut self, parts: &[Vec<u8>]) -> Result<redis::Value, String> {
+        // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+        let _w = synsema_core::waiting::waiting();
         let conn = self.redis_conn()?;
         let mut cmd = redis::Cmd::new();
         for p in parts {
@@ -567,6 +602,8 @@ fn pg_err(e: postgres::Error) -> String {
 /// `connect_timeout` por defecto (10s) si el connstring no lo trae, para que apuntar a un
 /// host caído falle rápido en vez de colgarse.
 fn pg_connect(connstring: &str) -> Result<Client, String> {
+    // v0.6.42 — bajo `serve`, el hilo que espera la red suelta su permiso de ejecución.
+    let _w = synsema_core::waiting::waiting();
     let mut config: postgres::Config = connstring.parse().map_err(pg_err)?;
     if config.get_connect_timeout().is_none() {
         config.connect_timeout(Duration::from_secs(10));
@@ -790,6 +827,8 @@ impl<'a> FromSql<'a> for PgVector {
 }
 
 fn pg_query(client: &mut Client, sql: &str, params: &[SynValue]) -> Result<Vec<Row>, String> {
+    // v0.6.42 — bajo `serve`, el hilo que espera la red suelta su permiso de ejecución.
+    let _w = synsema_core::waiting::waiting();
     let rewritten = rewrite_placeholders(sql);
     let pg: Vec<PgParam> = params.iter().map(syn_to_pg).collect();
     let refs: Vec<&(dyn ToSql + Sync)> = pg.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
@@ -1009,6 +1048,8 @@ fn split_tls_hint(url: &str) -> (String, bool) {
 /// webpki-roots): si el url lo pide, verifica el cert del server contra los root CAs
 /// embebidos. El contenedor dev es plaintext → por defecto sin SSL.
 fn mysql_connect(url: &str) -> Result<mysql::Conn, String> {
+    // v0.6.42 — bajo `serve`, el hilo que espera la red suelta su permiso de ejecución.
+    let _w = synsema_core::waiting::waiting();
     let (clean_url, wants_tls) = split_tls_hint(url);
     let opts = mysql::Opts::from_url(&clean_url).map_err(|e| e.to_string())?;
     let mut builder = mysql::OptsBuilder::from_opts(opts)
@@ -1049,6 +1090,8 @@ fn syn_to_mysql(v: &SynValue) -> mysql::Value {
 }
 
 fn mysql_query(conn: &mut mysql::Conn, sql: &str, params: &[SynValue]) -> Result<Vec<Row>, String> {
+    // v0.6.42 — bajo `serve`, el hilo que espera la red suelta su permiso de ejecución.
+    let _w = synsema_core::waiting::waiting();
     let result = conn.exec_iter(sql, mysql_params(params)).map_err(mysql_err)?;
     let mut out = Vec::new();
     // Las columnas como claves una vez por consulta (F4.4); se rehacen si cambian.
@@ -1210,6 +1253,8 @@ fn mongo_wrong_backend() -> String {
 /// host caído o credenciales malas fallan acá, no recién en el primer `mongo_*`.
 /// TLS lo controla el connstring (`?tls=true`); rustls (backend ring). El dev es plaintext.
 fn mongo_connect(url: &str) -> Result<mongodb::sync::Database, String> {
+    // v0.6.42 — bajo `serve`, el hilo que espera la red suelta su permiso de ejecución.
+    let _w = synsema_core::waiting::waiting();
     let mut opts = mongodb::options::ClientOptions::parse(url).run().map_err(mongo_err)?;
     if opts.connect_timeout.is_none() {
         opts.connect_timeout = Some(Duration::from_secs(10));
@@ -1375,6 +1420,8 @@ fn redis_wrong_backend_mongo() -> String {
 /// = db 0. TLS: `rediss://…` activa rustls (provider ring por unificación de features). El dev es
 /// `redis://` plaintext.
 fn redis_connect(url: &str) -> Result<redis::Connection, String> {
+    // v0.6.42 — bajo `serve`, el hilo que espera la base suelta su permiso de ejecución.
+    let _w = synsema_core::waiting::waiting();
     let client = redis::Client::open(url).map_err(redis_err)?;
     let mut conn = client
         .get_connection_with_timeout(Duration::from_secs(10))

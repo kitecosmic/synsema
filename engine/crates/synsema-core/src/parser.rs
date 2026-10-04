@@ -404,18 +404,14 @@ impl Parser {
         if self.stream_depth > 0 && self.check_word("send") {
             return Ok(Some(self.parse_send()?));
         }
-        if self.check_word("stream")
-            && self.peek(1).ty == TokenType::Newline
-            && self.peek(2).ty == TokenType::Indent
+        if self.check_word("stream") && self.block_starts_at(1)
         {
             return Ok(Some(self.parse_stream()?));
         }
         // `socket` + bloque indentado → ruta WebSocket entrante (soft keyword: como
         // identificador suelto sigue siendo una variable — dentro del bloque, `socket`
         // ES el handle de la conexión).
-        if self.check_word("socket")
-            && self.peek(1).ty == TokenType::Newline
-            && self.peek(2).ty == TokenType::Indent
+        if self.check_word("socket") && self.block_starts_at(1)
         {
             return Ok(Some(self.parse_socket()?));
         }
@@ -569,9 +565,7 @@ impl Parser {
         // sentencia sólo tapaba en un caso.
         // `if (x > 0)` / `while (…)` con un cuerpo indentado debajo: se lee como la llamada
         // `if(…)` y el error saldría en la línea siguiente ("Unexpected token: INDENT").
-        if first_tok.ty == TokenType::Identifier
-            && self.check(TokenType::Newline)
-            && self.peek(1).ty == TokenType::Indent
+        if first_tok.ty == TokenType::Identifier && self.block_starts_at(0)
         {
             if let Some(h) = crate::reflexes::statement_hint(&first_tok.raw) {
                 return Err(ParseError::new(
@@ -620,6 +614,21 @@ impl Parser {
     /// Se mira sin consumir: es como se distingue un bloque de una forma inline.
     fn indent_after_newlines(&self) -> bool {
         let mut i = 1;
+        while self.peek(i).ty == TokenType::Newline {
+            i += 1;
+        }
+        self.peek(i).ty == TokenType::Indent
+    }
+
+    /// ¿Empieza un bloque indentado en `offset`? Uno o más NEWLINE y después un INDENT. Cada
+    /// línea de comentario deja su propio NEWLINE (el comentario se filtra, el salto no), así
+    /// que un lookahead fijo `peek(offset + 1) == Indent` fallaba con dos comentarios seguidos
+    /// o con un comentario a otra indentación ("Unexpected token: INDENT").
+    fn block_starts_at(&self, offset: usize) -> bool {
+        if self.peek(offset).ty != TokenType::Newline {
+            return false;
+        }
+        let mut i = offset + 1;
         while self.peek(i).ty == TokenType::Newline {
             i += 1;
         }
@@ -1637,9 +1646,8 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
         let mut tls_cert: Option<Box<Node>> = None;
         let mut tls_key: Option<Box<Node>> = None;
         let mut redirect_https = false;
-        let mut tls_auto = false;
-        let mut tls_auto_email: Option<Box<Node>> = None;
-        let mut domain: Option<Box<Node>> = None;
+        let mut acme = crate::ast::ServeAcme::default();
+        let mut trust_proxy: Option<Box<Node>> = None;
         let mut bind: Option<Box<Node>> = None;
         let mut hosts: Vec<Node> = Vec::new();
         let mut mounts: Vec<Node> = Vec::new();
@@ -1695,22 +1703,41 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                 if self.check_word("auto") {
                     // tls auto [<email>]  → ACME/auto-HTTPS (Let's Encrypt)
                     self.advance();
-                    tls_auto = true;
+                    acme.tls_auto = true;
                     // Email opcional para la cuenta ACME (en la misma línea).
                     if !self.check_any(&[TokenType::Newline, TokenType::Dedent, TokenType::Eof]) {
-                        tls_auto_email = Some(Box::new(self.parse_expression()?));
+                        acme.email = Some(Box::new(self.parse_expression()?));
                     }
+                } else if self.check_word("dns") {
+                    // v0.6.42 — tls dns <task>  → reto DNS-01: el motor llama a la task del
+                    // programa con (name, value, "set"|"clear") y ella publica el TXT.
+                    self.advance();
+                    acme.tls_dns = Some(Box::new(self.parse_expression()?));
                 } else {
                     // tls cert <expr> key <expr>  → TLS manual
-                    self.expect_word("cert", "Expected 'cert' or 'auto' after 'tls' (tls cert <path> key <path> | tls auto [<email>])")?;
+                    self.expect_word("cert", "Expected 'cert', 'auto' or 'dns' after 'tls' (tls cert <path> key <path> | tls auto [<email>] | tls dns <task>)")?;
                     tls_cert = Some(Box::new(self.parse_expression()?));
                     self.expect_word("key", "Expected 'key' after 'tls cert <path>'")?;
                     tls_key = Some(Box::new(self.parse_expression()?));
                 }
             } else if self.check_word("domain") {
                 // domain <expr>  → dominio para el cert ACME (auto-HTTPS)
+                // v0.6.42 — domain ask <task>  → emisión bajo demanda; la task aprueba cada nombre.
                 self.advance();
-                domain = Some(Box::new(self.parse_expression()?));
+                if self.check_word("ask") {
+                    self.advance();
+                    acme.domain_ask = Some(Box::new(self.parse_expression()?));
+                } else {
+                    acme.domain = Some(Box::new(self.parse_expression()?));
+                }
+            } else if self.check_word("trust") {
+                // v0.6.42 — trust proxy <expr>  → IPs/CIDRs de los proxys de confianza.
+                self.advance();
+                self.expect_word("proxy", "Expected 'proxy' after 'trust' (trust proxy <ip or cidr, or a list of them>)")?;
+                if trust_proxy.is_some() {
+                    return Err(ParseError::new("duplicate 'trust proxy' clause in the serve block".to_string(), self.location()));
+                }
+                trust_proxy = Some(Box::new(self.parse_expression()?));
             } else if self.check_word("bind") {
                 // bind <expr>  → dirección del listener (el programa declara su exposición;
                 // `--bind` de la CLI le gana; default 0.0.0.0). Es del serve, no de un `host`.
@@ -1806,9 +1833,8 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
                 tls_cert,
                 tls_key,
                 redirect_https,
-                tls_auto,
-                tls_auto_email,
-                domain,
+                acme: (acme != crate::ast::ServeAcme::default()).then(|| Box::new(acme)),
+                trust_proxy,
                 bind,
                 hosts,
                 mounts,
@@ -2855,7 +2881,7 @@ The inline form belongs where a value is used: let x be when c then a otherwise 
             context.push((key, val));
         }
         let mut body = Vec::new();
-        if self.check(TokenType::Newline) && self.peek(1).ty == TokenType::Indent {
+        if self.block_starts_at(0) {
             body = self.parse_block()?;
         }
         Ok(Node::new(loc, NodeKind::ReasonExpression { subject, context: tight(context), body: tight(body) }))
@@ -3257,6 +3283,63 @@ mod tests {
             matches!(body[0].kind, NodeKind::ProxyStatement { .. }),
             "el body de la route no es ProxyStatement"
         );
+    }
+
+    /// Comentarios (dos seguidos, o a otra indentación) y líneas en blanco antes del primer
+    /// statement de un bloque `socket`/`stream`/`reason`: cada línea de comentario deja un
+    /// NEWLINE y el lookahead fijo daba "Unexpected token: INDENT" (faltantes, 2026-09-27).
+    #[test]
+    fn comments_before_the_first_statement_of_a_soft_block() {
+        let route = |kw: &str, gap: &str| {
+            format!(
+                "serve on 8080\n    route \"GET /s\"\n        {}\n{}            let x be 1\n",
+                kw, gap
+            )
+        };
+        for kw in ["socket", "stream"] {
+            for gap in [
+                "            -- a\n",
+                "            -- a\n            -- b\n",
+                "        -- a otra indentación\n",
+                "  -- columna 2\n",
+                "\n            -- a\n\n",
+            ] {
+                let src = route(kw, gap);
+                let prog = parse_ok(&src);
+                let NodeKind::ServeBlock { routes, .. } = &prog.statements[0].kind else {
+                    panic!("no es ServeBlock: {}", src)
+                };
+                let NodeKind::RouteDefinition { body, .. } = &routes[0].kind else { unreachable!() };
+                assert!(
+                    matches!(body[0].kind, NodeKind::SocketBlock { .. } | NodeKind::StreamBlock { .. }),
+                    "{} no se leyó como bloque con {:?}",
+                    kw,
+                    gap
+                );
+            }
+        }
+        let grouped = "export routes api\n    route \"GET /s\"\n        stream\n            -- a\n            send \"x\"\n";
+        parse_ok(grouped);
+        let reason = parse_ok("let r be reason \"x\"\n    -- a\n    -- b\n    let y be 1\nprint(r)\n");
+        assert_eq!(reason.statements.len(), 2);
+    }
+
+    /// v0.6.42 — `tls dns`, `domain ask` y `trust proxy` en el bloque `serve`; la config ACME va en
+    /// su `Box` (`ServeAcme`) y un serve sin TLS no la reserva.
+    #[test]
+    fn serve_acme_and_trust_proxy_clauses() {
+        let prog = parse_ok(
+            "serve on 443\n    tls auto \"a@b.c\"\n    domain [\"x.app\", \"*.x.app\"]\n    domain ask allow_host\n    tls dns publish_txt\n    trust proxy [\"127.0.0.1\", \"10.0.0.0/8\"]\n    route \"GET /\"\n        give 1\n",
+        );
+        let NodeKind::ServeBlock { acme, trust_proxy, .. } = &prog.statements[0].kind else { panic!("serve") };
+        let a = acme.as_ref().expect("acme");
+        assert!(a.tls_auto && a.email.is_some() && a.domain.is_some() && a.domain_ask.is_some() && a.tls_dns.is_some());
+        assert!(trust_proxy.is_some());
+        let plain = parse_ok("serve on 8080\n    route \"GET /\"\n        give 1\n");
+        let NodeKind::ServeBlock { acme, trust_proxy, .. } = &plain.statements[0].kind else { panic!("serve") };
+        assert!(acme.is_none() && trust_proxy.is_none());
+        let dup = parse_source("serve on 1\n    trust proxy \"a\"\n    trust proxy \"b\"\n", "<t>").unwrap_err();
+        assert!(dup.to_string().contains("duplicate 'trust proxy'"), "{}", dup);
     }
 
     #[test]

@@ -12,6 +12,18 @@ Read this FIRST if something fails. Each row is a real mistake that costs hours 
 > Coming from Python? The traps that LOOK like Python but aren't are also collected in
 > [python-diff.md](python-diff.md).
 
+## Upgrading to v0.6.42 — what behaves differently
+
+| You see | What changed | What to write |
+|---|---|---|
+| `ip of request` is your proxy's address; rate limits hit every user together | `X-Forwarded-*` are kept only from a peer listed in `trust proxy` (any client could forge them) | `trust proxy ["127.0.0.1"]` (your proxy's address/CIDR) in the `serve` block, or `--trust-proxy`; the proxy must **set** `X-Forwarded-Proto`/`-Host` |
+| `[LOG] …` lines vanished from `synsema run x.syn > out.txt` | `log` writes to **stderr** under `synsema run` (stdout is the result) | read stderr (`2>&1`), or `print` what is part of the result; under `test`/`serve`/`--format json` nothing changed |
+| `task eprint(...)` does not load | `eprint` is a reserved builtin (stderr, checked like `print`) | rename your task |
+| a filter or HMAC on the body sees nothing in a route with `proxy to` | the body streams to the destination unless the route reads it **itself** | check it in the route (`read_body()`, `body of request`…), not in a task the route calls |
+| `secret or exit(1)` / `secret and print(x)` is a `label_violation` under `--labels` | the right side of `and`/`or` runs under the left side's label, like a `when` | the same rule as `when secret`: `declassify` first, or keep the effect out of the private branch |
+| a `tls auto` server issues one certificate per name | it used to be one SAN cert for the whole `domain` list | nothing; on the first start each name gets its own (watch the CA's rate limits with many names) |
+| `parallel_map` over LLM prompts runs N at a time with a token budget | with `SYNSEMA_LLM_BUDGET`, LLM calls in flight are capped at `SYNSEMA_SERVE_WORKERS` (default: CPU count), also under `run` | raise `SYNSEMA_SERVE_WORKERS` if you need more in flight |
+
 ## Upgrading to v0.6.29 — what stops working and what to write instead
 
 v0.6.29 fixes the language before v1.0. Old builtin names keep working as **deprecated aliases**

@@ -14,5 +14,23 @@ fn log_show_print_are_live_and_in_order() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let text = String::from_utf8_lossy(&o.stdout).replace("\r\n", "\n");
-    assert_eq!(text, "[LOG] one\ntwo\nthree\nfour\n[LOG] five\n");
+    // v0.6.42 — `log` es diagnóstico: bajo `run` va a stderr (stdout queda para el resultado).
+    assert_eq!(text, "two\nthree\nfour\n");
+    let err = String::from_utf8_lossy(&o.stderr).replace("\r\n", "\n");
+    assert_eq!(err, "[LOG] one\n[LOG] five\n");
+}
+
+/// v0.6.42 — también con `--labels`: el hook que saca los `declassify` a stderr sólo observa,
+/// no es un destino; `log` no vuelve a stdout por tenerlo instalado.
+#[test]
+fn log_goes_to_stderr_under_labels_too() {
+    let dir = std::env::temp_dir().join(format!("synsema-live-labels-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("log.syn");
+    std::fs::write(&p, "log \"diag\"\nprint(\"result\")\n").unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_synsema")).arg("run").arg("--labels").arg(&p).output().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(String::from_utf8_lossy(&o.stdout).replace("\r\n", "\n"), "result\n");
+    assert_eq!(String::from_utf8_lossy(&o.stderr).replace("\r\n", "\n"), "[LOG] diag\n");
 }

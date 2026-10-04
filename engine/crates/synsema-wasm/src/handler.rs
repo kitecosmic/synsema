@@ -430,6 +430,7 @@ fn dispatch(app: &mut App, req: &HttpRequestIn) -> (HttpResponseOut, Vec<String>
         client_ip: req.client_ip.clone(),
         user: None,
         cancel: synsema_core::interpreter::CancelToken::new(),
+        body_streamed: false,
     };
 
     let idx = match route_idx {
@@ -539,6 +540,10 @@ fn dispatch(app: &mut App, req: &HttpRequestIn) -> (HttpResponseOut, Vec<String>
             GiveOutcome::Validation { message: e.message.clone(), field: e.field.clone() }
         }
         Err(Control::Error(e)) if e.denied_by_token => GiveOutcome::Forbidden(e.to_string()),
+        // v0.6.42 — `proxy to` necesita el transporte del server nativo.
+        Err(Control::Error(e)) if e.proxy.is_some() => {
+            GiveOutcome::Error("proxy to is not available in an embedded handler (it needs the native serve)".to_string())
+        }
         Err(Control::Error(e)) => GiveOutcome::Error(e.to_string()),
         Err(Control::Stop(_)) => GiveOutcome::Error("'give'/'stop' used outside of a task or loop".to_string()),
     };
@@ -590,6 +595,7 @@ fn dispatch(app: &mut App, req: &HttpRequestIn) -> (HttpResponseOut, Vec<String>
             ])),
         ),
         GiveOutcome::Error(msg) => shape_500(&mut app.interp, &msg, &ctx, &mut custom_headers),
+        GiveOutcome::Proxy(_) => json_err(500, "proxy to is not available in an embedded handler"),
         // T1: denegada por el token del caller → 403 con cuerpo fijo (el detalle queda en el
         // log del host, jamás en la respuesta). Mismo criterio que el serve nativo.
         GiveOutcome::Forbidden(detail) => {

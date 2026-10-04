@@ -397,6 +397,8 @@ pub const LABEL_SINK_BUILTINS: &[&str] = &[
     "http", "http_get", "http_post", "http_put", "http_delete", "http_bytes", "fetch",
     "mtls_identity",
     "ws_connect", "ws_send", "ws_broadcast", "ws_close", "push_send", "oidc_verify",
+    // v0.6.42: TCP crudo y pipes (un pipe cruza a otro intérprete: escribir y cerrar son salidas).
+    "tcp_connect", "tcp_send", "tcp_close", "pipe_send", "pipe_close",
     "eth_rpc", "eth_call", "eth_send_raw", "eth_balance", "eth_nonce", "eth_receipt", "eth_wait_receipt",
     "eth_estimate_gas", "eth_gas_price", "eth_fee_history", "eth_chain_id",
     "solana_rpc", "solana_send", "solana_confirm", "solana_balance", "solana_latest_blockhash", "spl_balance",
@@ -442,6 +444,7 @@ pub const LABEL_SINKS_SERVE_ONLY: &[&str] =
 /// para que el anti-rot pueda exigir que toda familia que hable con el SO esté clasificada a mano: o
 /// sumidero, o lectura declarada acá. Todas están además en `LABEL_PURE_BUILTINS`.
 pub const LABEL_OS_READ_BUILTINS: &[&str] = &[
+    "pipe", "pipe_recv", "tcp_recv", "tcp_stats",
     "agents", "bus_recv", "bus_topics", "cron_list", "cron_status", "cwd", "proc_recv", "proc_select",
     "proc_stats", "proc_status", "read_line", "select", "self_path", "term_recv", "term_size", "term_stats",
     "watch_recv", "watch_stats", "ws_recv", "ws_select", "ws_select_all", "ws_stats", "ws_status",
@@ -461,6 +464,8 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     // `agents` (swarm-only, como `agent_stop`) sólo aparece en el wiring de serve/swarm: lo destapó
     // el anti-rot al extenderse a ese wiring (auditoría ronda 3, M3).
     "agents",
+    // v0.6.42: leer de un TCP o de un pipe, y crear un pipe (memoria del proceso, nada sale).
+    "pipe", "pipe_recv", "tcp_recv", "tcp_stats",
     "bus_recv", "bus_topics", "cron_list", "cron_status", "cwd", "proc_recv", "proc_select", "proc_stats",
     "proc_status", "read_line", "select", "self_path", "term_recv", "term_size", "term_stats", "watch_recv",
     "watch_stats", "ws_recv", "ws_select", "ws_select_all", "ws_stats", "ws_status",
@@ -502,7 +507,7 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     "btc_tx_raw", "btc_txid", "bytes", "bytes_to_int", "captoken_allows", "captoken_attenuate",
     "canonical_json", "captoken_mint", "captoken_verify", "capture", "cbrt", "ceil", "clamp", "complex", "conj",
     "constant_time_eq", "contains", "cos", "cosh", "csv_encode", "csv_parse", "decimal", "decode", "degrees",
-    "det", "dot", "ecdh_keypair", "ecdh_shared_secret", "ecdsa_p256_verify", "ed25519_verify", "eig",
+    "det", "dot", "ecdh_keypair", "ecdh_public", "ecdh_shared_secret", "ecdsa_p256_verify", "ed25519_verify", "eig",
     "eip191_digest", "eip712_digest", "ends_with", "enumerate", "erf", "erfc", "eth_address", "exp", "eye",
     "factorial", "fail", "flatten", "float", "floor", "fmt", "full", "gamma", "gaussian_noise", "gcd",
     "groth16_verify", "hash160", "histogram", "hkdf_sha256", "hmac_sha256", "http_signature_verify", "hypot",
@@ -626,6 +631,8 @@ pub(crate) fn wire_common_with_state(
                     eprintln!("{}", line);
                 }
             }));
+            // Sólo observa: `log` sigue yendo a stderr bajo `synsema run`.
+            interp.log_hook_observes_only = true;
         }
     }
     if !secure {
@@ -1045,6 +1052,16 @@ fn finish(mut interp: Interpreter, result: Result<SynValue, Control>) -> RunResu
     // T5 (ronda 6, B2): la salida de una corrida cortada por el chequeo de flujo no se entrega
     // — la cantidad de líneas antes del corte depende del dato privado. Ver `redact_output_for_host`.
     interp.redact_output_for_host(&result);
+    // v0.6.42 — `exit(code)`: el fin pedido, no una falla. Sin "Runtime error"; el código lo
+    // lee el CLI con `last_run_exit_code()` (se pisa en cada corrida, nunca queda uno viejo).
+    let exit = match &result {
+        Err(Control::Error(e)) => e.exit_code,
+        _ => None,
+    };
+    LAST_RUN_EXIT.store(exit.unwrap_or(-1), std::sync::atomic::Ordering::SeqCst);
+    if let Some(code) = exit {
+        return RunResult { success: code == 0, output: std::mem::take(&mut interp.output), errors: Vec::new() };
+    }
     match result {
         Ok(_) => RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() },
         Err(Control::Error(e)) => RunResult {
@@ -1237,6 +1254,17 @@ static LAST_RUN_STEPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// que es justo el artefacto que un tercero verifica. Con esto el host puede omitirlo.
 static LAST_RUN_PRIVATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// v0.6.42 — el código que pidió `exit(code)` en la última corrida (-1 = no llamó a `exit`).
+static LAST_RUN_EXIT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// El código de `exit(code)` de la última corrida, si el programa lo llamó.
+pub fn last_run_exit_code() -> Option<i32> {
+    match LAST_RUN_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
+        c if c >= 0 => Some(c),
+        _ => None,
+    }
+}
+
 fn note_run_steps(interp: &Interpreter) {
     LAST_RUN_STEPS.store(interp.steps(), std::sync::atomic::Ordering::SeqCst);
     LAST_RUN_PRIVATE.store(interp.private_seen(), std::sync::atomic::Ordering::SeqCst);
@@ -1318,11 +1346,22 @@ pub fn run_program_ceiled_opts(
             errors: vec![abort_message(&p)],
         });
 
+    // v0.6.42 (auditoría) — `exit(code)` termina el programa: los agentes vivos se detienen (si
+    // no, `wait_all` esperaba a uno en bucle para siempre) y el código lo decide `exit`.
+    let exited = last_run_exit_code().is_some();
+    // Los que `exit` detuvo: su error es la cancelación y no se informa. Un agente que ya había
+    // fallado antes del `exit` sí (auditoría ronda 2: se descartaban todos).
+    let stopped: std::collections::HashSet<String> = if exited {
+        swarm.agents_info().into_iter().map(|(id, _)| id).filter(|id| swarm.stop_agent(id, "exit()")).collect()
+    } else {
+        Default::default()
+    };
     // Joinea los agentes lanzados por el main; ya no hay nadie más que pueda spawnear.
     swarm.wait_all();
 
     // Refleja los agentes en ERROR (exit ≠0 + línea de error), sin tocar la salida del main.
-    let agent_errors = collect_agent_errors(&swarm);
+    let mut agent_errors = collect_agent_errors(&swarm);
+    agent_errors.retain(|line| !stopped.iter().any(|id| line.starts_with(&format!("Agent error [{}]:", id))));
     if !agent_errors.is_empty() {
         result.success = false;
         result.errors.extend(agent_errors);
@@ -2019,6 +2058,8 @@ fn setup_swarm_interpreter(
     // Propaga el techo (y el ctx de memoria) a los sub-agentes que este agente spawnee.
     wire_swarm_hooks(&mut interp, swarm, agent_name, ceiling, mem, None, &caps);
     let name = agent_name.to_string();
+    // El hook del agente es un destino (lleva su prefijo), no un observador como el de `run --labels`.
+    interp.log_hook_observes_only = false;
     interp.log_hook = Some(Arc::new(move |line: &str| {
         // `conform` exige stdout = SOLO el JSON final: bajo ese modo el eco vivo
         // ([main]/[agente]) va a stderr (sigue siendo visible, no rompe el parse).

@@ -96,6 +96,8 @@ fn reverse_proxy_forwards_to_upstream() {
         socket_handler: None,
         timeout: None,
         proxy_target: Some(format!("http://127.0.0.1:{}", up)),
+        proxy_dynamic: false,
+        proxy_reads_body: false,
         rate_unlimited: false,
         meta: Default::default(),
     };
@@ -222,6 +224,8 @@ fn vhost_selected_by_authority_over_http2() {
         socket_handler: None,
         timeout: None,
         proxy_target: None,
+        proxy_dynamic: false,
+        proxy_reads_body: false,
         rate_unlimited: false,
         meta: Default::default(),
     };
@@ -248,6 +252,8 @@ fn vhost_selected_by_authority_over_http2() {
         socket_handler: None,
         timeout: None,
         proxy_target: None,
+        proxy_dynamic: false,
+        proxy_reads_body: false,
         rate_unlimited: false,
         meta: Default::default(),
     };

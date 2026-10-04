@@ -1621,8 +1621,112 @@ impl LLMProvider for ReloadingProvider {
     }
 }
 
+/// v0.6.42 (auditoría) — con un techo de tokens, las llamadas LLM en vuelo a la vez se acotan a
+/// los workers de `serve` (lo que había antes del pool elástico). El techo se chequea ANTES de
+/// llamar y los tokens se descuentan DESPUÉS: con 256 hilos extra esperando al proveedor, el
+/// exceso posible se multiplicaba. Sin techo no se acota nada. Rige en todo el proceso, también
+/// en `synsema run` (un `parallel_map` de 100 prompts con techo va de a W).
+///
+/// Un lugar es reentrante en el hilo (auditoría ronda 2, R1): un `reason` dentro del `on_chunk`
+/// de un `llm_stream` corre con el lugar del stream; si pidiera otro, W streams así se colgaban
+/// para siempre. La espera tiene plazo (`SYNSEMA_LLM_TIMEOUT`) y mira la cancelación de la
+/// request: una llamada desde OTRO hilo (un `parallel_map` dentro del callback) que no consigue
+/// lugar devuelve un marcador en vez de colgar.
+struct BudgetSlots {
+    used: std::sync::Mutex<usize>,
+    cv: std::sync::Condvar,
+    max: usize,
+    wait_max: std::time::Duration,
+}
+
+fn budget_slots() -> &'static BudgetSlots {
+    static S: std::sync::OnceLock<BudgetSlots> = std::sync::OnceLock::new();
+    S.get_or_init(|| BudgetSlots {
+        used: std::sync::Mutex::new(0),
+        cv: std::sync::Condvar::new(),
+        max: std::env::var("SYNSEMA_SERVE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).max(2)),
+        wait_max: std::time::Duration::from_secs(resolve_timeout_secs(&EnvStore::load_default())),
+    })
+}
+
+thread_local! {
+    /// Lugares tomados por este hilo (anidados: el de afuera es el único que cuenta).
+    static BUDGET_HELD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct BudgetSlot {
+    /// `true` sólo en el de más afuera del hilo: es el que ocupa un lugar del proceso.
+    outer: bool,
+}
+
+impl BudgetSlot {
+    fn acquire() -> Result<BudgetSlot, String> {
+        if BUDGET_HELD.with(|h| h.get()) > 0 {
+            BUDGET_HELD.with(|h| h.set(h.get() + 1));
+            return Ok(BudgetSlot { outer: false });
+        }
+        let slots = budget_slots();
+        // Esperar un lugar es esperar: bajo `serve` el hilo suelta su permiso de CPU.
+        let _w = synsema_core::waiting::waiting();
+        let deadline = std::time::Instant::now() + slots.wait_max;
+        let mut used = slots.used.lock().unwrap_or_else(|e| e.into_inner());
+        while *used >= slots.max {
+            if synsema_core::waiting::thread_cancelled() {
+                return Err("[llm call cancelled while waiting for a free call slot]".to_string());
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(format!(
+                    "[llm busy: no free call slot in {} s ({} calls in flight, the cap with an LLM budget)]",
+                    slots.wait_max.as_secs(),
+                    slots.max
+                ));
+            }
+            // Despertar seguido para ver la cancelación: la condvar no la conoce.
+            let step = (deadline - now).min(std::time::Duration::from_millis(200));
+            used = slots.cv.wait_timeout(used, step).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        *used += 1;
+        BUDGET_HELD.with(|h| h.set(1));
+        Ok(BudgetSlot { outer: true })
+    }
+}
+
+impl Drop for BudgetSlot {
+    fn drop(&mut self) {
+        BUDGET_HELD.with(|h| h.set(h.get().saturating_sub(1)));
+        if self.outer {
+            let slots = budget_slots();
+            let mut used = slots.used.lock().unwrap_or_else(|e| e.into_inner());
+            *used = used.saturating_sub(1);
+            slots.cv.notify_one();
+        }
+    }
+}
+
+impl MeteredProvider {
+    /// Un lugar de llamada si hay algún techo que proteger (del proceso, por identidad o
+    /// delegado); `Ok(None)` si no hay techo; `Err(marcador)` si no hubo lugar a tiempo.
+    fn budget_slot(&self) -> Result<Option<BudgetSlot>, String> {
+        let capped = self.budget.is_some() || !self.per_identity.is_empty() || current_delegated_llm_budget().is_some();
+        if capped {
+            BudgetSlot::acquire().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 impl LLMProvider for MeteredProvider {
     fn call(&self, request: &LLMRequest) -> LLMResponse {
+        let _slot = match self.budget_slot() {
+            Ok(s) => s,
+            Err(marker) => return LLMResponse { content: marker, model: self.inner.name(), tokens_used: 0 },
+        };
         if let Some(cut) = self.over_budget() {
             cut.note();
             return LLMResponse {
@@ -1643,6 +1747,10 @@ impl LLMProvider for MeteredProvider {
     }
 
     fn call_step(&self, request: &LLMRequest) -> LlmStepResponse {
+        let _slot = match self.budget_slot() {
+            Ok(s) => s,
+            Err(marker) => return LlmStepResponse { step: LlmStep::Final(marker), tokens_used: 0 },
+        };
         if let Some(cut) = self.over_budget() {
             cut.note();
             return LlmStepResponse {
@@ -1660,6 +1768,13 @@ impl LLMProvider for MeteredProvider {
         request: &LLMRequest,
         on_chunk: &mut dyn FnMut(&str) -> bool,
     ) -> LLMResponse {
+        let _slot = match self.budget_slot() {
+            Ok(s) => s,
+            Err(marker) => {
+                on_chunk(&marker);
+                return LLMResponse { content: marker, model: self.inner.name(), tokens_used: 0 };
+            }
+        };
         if let Some(cut) = self.over_budget() {
             cut.note();
             let marker = cut.marker();

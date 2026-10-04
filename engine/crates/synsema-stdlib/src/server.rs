@@ -588,6 +588,10 @@ pub struct ServeRuntime {
     private: bool,
     /// `domain` del serve block → base URL absoluta de sitemap/openapi (si no, `Host`).
     pub domain: Option<String>,
+    /// v0.6.42 — `trust proxy …` / `--trust-proxy`: los proxys de confianza delante del server.
+    /// Sólo un par TCP de esta lista puede traer `X-Forwarded-*`/`Forwarded`; de cualquier otro
+    /// se descartan antes de que los vea nadie (el programa, `base_url`, `proxy to`). Vacía = nadie.
+    pub trusted_proxies: Vec<TrustedNet>,
     /// `describe version: "…"` → `info.version` de `/openapi.json` (default "0.0.0").
     pub describe_version: Option<String>,
     /// `docs off` apaga la página `/docs` (el `/openapi.json` sigue publicado).
@@ -631,7 +635,7 @@ pub enum Dispatched {
     Socket { socket_handler: Option<SocketHandler>, ctx: Box<Ctx> },
     /// Ruta `proxy to`: auth/rate-limit ya pasaron; el lado async forwardea al
     /// upstream en streaming (SSE, WebSocket, bodies grandes). `headers` = rate-limit.
-    Proxy { target: String, headers: Vec<(String, String)> },
+    Proxy { target: crate::routing::ProxyDest, headers: Vec<(String, String)> },
 }
 
 /// Cómo atender una request, resuelto ANTES de correr el intérprete (vhost + match).
@@ -643,6 +647,9 @@ pub struct RoutePlan {
     pub socket: bool,
     /// La ruta es un `proxy to` (el transporte la atiende en streaming).
     pub proxy: bool,
+    /// v0.6.42 — el body de la request viaja en streaming al destino (sin leerse antes): una ruta
+    /// de proxy cuyo cuerpo no lo nombra.
+    pub stream_body: bool,
     /// Techo de vida del handler (route > serve); `None` = sin límite.
     pub timeout: Option<f64>,
 }
@@ -696,6 +703,7 @@ impl ServeRuntime {
             describe_api,
             private,
             domain: None,
+            trusted_proxies: Vec::new(),
             describe_version: None,
             docs_enabled: true,
             health_path,
@@ -844,6 +852,19 @@ impl ServeRuntime {
         self.default_host.methods_for_path(path)
     }
 
+    /// v0.6.42 — los métodos del path en el vhost de ESTA request (antes miraba sólo el host
+    /// por defecto: un `OPTIONS` a un vhost respondía con las rutas de otro sitio).
+    pub fn methods_for_request(&self, path: &str, headers: &[(String, String)]) -> Vec<String> {
+        self.select_host(&header_value(headers, "host")).methods_for_path(path)
+    }
+
+    /// v0.6.42 — ¿hay una ruta DECLARADA para este método y path en el vhost de la request? Una
+    /// `route "OPTIONS /x"` (p.ej. con `proxy to`, para que el preflight de CORS lo conteste el
+    /// servicio de atrás) gana sobre la respuesta automática.
+    pub fn has_route(&self, method: &str, path: &str, headers: &[(String, String)]) -> bool {
+        self.select_host(&header_value(headers, "host")).match_route(method, path).is_some()
+    }
+
     // -- discoverability --
 
     /// Base URL absoluta (spec discovery §1.3): `domain` del serve block si está; si
@@ -892,7 +913,7 @@ impl ServeRuntime {
                 private: r.private,
                 rate_limit: r.rate_limit,
                 rate_unlimited: r.rate_unlimited,
-                proxy: r.proxy_target.is_some(),
+                proxy: r.proxy_target.is_some() || r.proxy_dynamic,
                 meta: r.meta.clone(),
             })
             .collect()
@@ -1220,7 +1241,8 @@ impl ServeRuntime {
                 RoutePlan {
                     dedicated: r.streaming || r.socket,
                     socket: r.socket,
-                    proxy: r.proxy_target.is_some(),
+                    proxy: r.proxy_target.is_some() || r.proxy_dynamic,
+                    stream_body: r.proxy_target.is_some() || (r.proxy_dynamic && !r.proxy_reads_body),
                     timeout: r.timeout.or(self.default_timeout).filter(|t| t.is_finite() && *t > 0.0),
                 }
             }
@@ -1400,6 +1422,7 @@ impl ServeRuntime {
         body_file: Option<&str>,
         client_ip: &str,
         cancel: CancelToken,
+        body_streamed: bool,
     ) -> Dispatched {
         let resp = |status, body| Dispatched::Response { status, body, headers: vec![] };
         // v0.6.20 — este hilo atiende a ESTE servidor (para `openapi_json()`).
@@ -1612,6 +1635,7 @@ impl ServeRuntime {
             client_ip: client_ip.to_string(),
             user: None,
             cancel,
+            body_streamed,
         };
 
         // Auth. El `ctx` ya existe (user aún nothing) — el hook lo recibe entero
@@ -1685,7 +1709,7 @@ impl ServeRuntime {
         // en sí lo hace el lado async (`proxy_request`) en streaming: SSE, upgrade
         // webSocket (túnel) y bodies grandes pasan a medida que llegan.
         if let Some(target) = &host.routes[idx].proxy_target {
-            return Dispatched::Proxy { target: target.clone(), headers: rate_headers };
+            return Dispatched::Proxy { target: crate::routing::ProxyDest::Url(target.clone()), headers: rate_headers };
         }
 
         // Socket entrante (ruta `socket`): ocupa un slot de stream (conexión larga con
@@ -1774,6 +1798,8 @@ impl ServeRuntime {
             ),
             GiveOutcome::Error(msg) => self.shape_500(&msg, &ctx, &mut custom_headers),
             GiveOutcome::Forbidden(detail) => self.shape_403(&detail, &ctx, &mut custom_headers),
+            // v0.6.42 — la ruta decidió reenviar: el lado async lo hace en streaming.
+            GiveOutcome::Proxy(dest) => return Dispatched::Proxy { target: dest, headers: rate_headers },
         };
         let mut headers = rate_headers;
         headers.append(&mut custom_headers);
@@ -1942,61 +1968,406 @@ const SERVE_STACK_SIZE: usize = 64 * 1024 * 1024;
 ///
 /// Reemplaza el `spawn_blocking` por-request, que crecía contra el blocking pool de tokio
 /// (hasta 512 hilos) heredando el stack de 64 MB → bajo keep-alive, N requests en vuelo =
-/// N × 64 MB → OOM. Acá el tope es fijo: `#workers × 64 MB`, sin importar la concurrencia.
-/// El exceso de requests **espera en la cola** (no se rechaza). El intérprete sigue sync.
+/// N × 64 MB → OOM. Acá el tope son `#workers` permisos de CPU más los hilos extra acotados
+/// que se crean sólo mientras otros esperan I/O (ver `InterpreterPool`, v0.6.42). El exceso de
+/// requests **espera en la cola** (no se rechaza). El intérprete sigue sync.
 ///
 /// Streams (SSE) NO usan este pool: corren en un hilo dedicado (acotado por `max_streams`)
 /// para no agotar los workers — si no, unos pocos streams taparían el pool entero.
 type InterpJob = Box<dyn FnOnce() + Send + 'static>;
 
+/// v0.6.42 (M4) — el pool como **permisos de ejecución + hilos elásticos** (el `handoff` del
+/// planificador de Go ante una syscall bloqueante; los hilos virtuales de Java 21 resuelven lo
+/// mismo). `workers` permisos acotan la CPU; un hilo que ESPERA (un `sleep`, un `wait_for`, una
+/// llamada HTTP o al LLM, un `select`, una base de red: `synsema_core::waiting`) suelta su permiso
+/// mientras espera, y si hay jobs en cola, ningún hilo libre y CPU libre, el pool crea un hilo
+/// EXTRA (hasta `SYNSEMA_SERVE_MAX_WAITING`).
+///
+/// Reglas que salen de la auditoría de v0.6.42:
+/// - **Volver de una espera nunca bloquea.** El hilo retoma su permiso "a crédito" (`permits` puede
+///   quedar negativo) y los jobs NUEVOS esperan a que se salde. Así no hay deadlock con un lock
+///   tomado durante la espera (el mutex de una base: B1), y el que vuelve no compite con los
+///   jobs nuevos (no termina en 504 bajo carga). La CPU queda acotada en régimen.
+/// - **Crecer sólo con CPU libre** (`permits > 0`): una ruta esperando no infla el pool (B7).
+/// - **Los hilos extra son efímeros**: toman jobs mientras haya cola y terminan apenas no hay; no
+///   cachean su intérprete (`on_extra_pool_thread`). En reposo el pool es el de antes.
 struct InterpreterPool {
     tx: std::sync::mpsc::Sender<InterpJob>,
+    shared: Arc<PoolShared>,
+}
+
+/// Lo que comparten el pool y sus hilos (y el gancho de espera de cada hilo).
+struct PoolShared {
+    rx: Mutex<std::sync::mpsc::Receiver<InterpJob>>,
+    state: Mutex<PoolState>,
+    cv: std::sync::Condvar,
+    max_threads: usize,
+}
+
+#[derive(Default)]
+struct PoolState {
+    /// Permisos de ejecución libres (empieza en `workers`; negativo = deuda de hilos que volvieron
+    /// de una espera sin permiso libre).
+    permits: isize,
+    /// Hilos vivos del pool (fijos + extra).
+    threads: usize,
+    /// Hilos fijos esperando un job en la cola.
+    idle: usize,
+    /// Hilos extra creados que todavía no miraron la cola (cuentan como libres: sin esto, cada
+    /// `submit` mientras arrancan creaba otro).
+    starting: usize,
+    /// Hilos dentro de una sección de espera (sin permiso).
+    waiting: usize,
+    /// Jobs encolados que nadie tomó todavía.
+    queued: usize,
+}
+
+/// Default del techo de hilos extra (`SYNSEMA_SERVE_MAX_WAITING`).
+const DEFAULT_MAX_WAITING: usize = 256;
+
+thread_local! {
+    static EXTRA_POOL_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// El pool al que pertenece este hilo (lo usa el gancho de espera).
+    static THREAD_POOL: std::cell::RefCell<Option<Arc<PoolShared>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// ¿Este hilo es un hilo EXTRA del pool? El runtime no cachea su intérprete (se va con el hilo).
+pub fn on_extra_pool_thread() -> bool {
+    EXTRA_POOL_THREAD.with(|c| c.get())
+}
+
+/// Gancho de espera de los hilos del pool (lo instala cada worker; ver `synsema_core::waiting`).
+fn pool_wait_hook(waiting: bool) {
+    let pool = THREAD_POOL.with(|p| p.borrow().clone());
+    if let Some(p) = pool {
+        PoolShared::on_wait(&p, waiting);
+    }
+}
+
+impl PoolShared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PoolState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// ¿Hace falta otro hilo? Hay jobs que ningún hilo libre va a tomar, algún hilo está
+    /// esperando I/O y por eso hay CPU libre (su permiso), y no se llegó al techo. Sin esperas los
+    /// fijos alcanzan; con la CPU toda ocupada, más hilos no ayudan: la cola espera, como siempre.
+    fn needs_thread(&self, st: &PoolState) -> bool {
+        st.queued > st.idle + st.starting && st.waiting > 0 && st.permits > 0 && st.threads < self.max_threads
+    }
+
+    /// Decide y reserva bajo el MISMO lock (auditoría ronda 2: entre `needs_thread` y
+    /// `threads += 1` otro hilo podía decidir lo mismo y pasar el techo).
+    fn reserve_extra(&self, st: &mut PoolState) -> bool {
+        if self.needs_thread(st) {
+            st.threads += 1;
+            st.starting += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Arranca un hilo ya reservado (`threads` ya lo cuenta; un extra, también `starting`).
+    fn spawn_worker(me: &Arc<PoolShared>, extra: bool) {
+        let n = me.lock().threads;
+        let shared = me.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("synsema-interp-{}{}", n, if extra { "x" } else { "" }))
+            .stack_size(SERVE_STACK_SIZE)
+            .spawn(move || {
+                synsema_core::waiting::set_thread_hook(Some(pool_wait_hook));
+                EXTRA_POOL_THREAD.with(|c| c.set(extra));
+                THREAD_POOL.with(|p| *p.borrow_mut() = Some(shared.clone()));
+                let mut first = extra;
+                loop {
+                    // Un fijo espera en la cola; un extra toma lo que haya y si no hay, termina.
+                    let job = if extra {
+                        let job = PoolShared::extra_take(&shared, first);
+                        first = false;
+                        match job {
+                            Some(j) => j,
+                            None => return,
+                        }
+                    } else {
+                        shared.lock().idle += 1;
+                        let got = match shared.rx.lock() {
+                            Ok(g) => g.recv().ok(),
+                            Err(_) => None,
+                        };
+                        let mut st = shared.lock();
+                        st.idle -= 1;
+                        match got {
+                            Some(j) => j,
+                            None => {
+                                st.threads -= 1;
+                                return; // canal cerrado: el proceso termina
+                            }
+                        }
+                    };
+                    // Un permiso por job: los nuevos esperan a que se salde la deuda.
+                    {
+                        let mut st = shared.lock();
+                        st.queued = st.queued.saturating_sub(1);
+                        while st.permits <= 0 {
+                            st = shared.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                        }
+                        st.permits -= 1;
+                    }
+                    // Un panic del handler NO debe matar al worker: se traga acá; los
+                    // canales del job se dropean y el lado async responde 500. Seguimos.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                    {
+                        let mut st = shared.lock();
+                        st.permits += 1;
+                        shared.cv.notify_one();
+                    }
+                }
+            });
+        if spawned.is_err() {
+            let mut st = me.lock();
+            st.threads -= 1;
+            if extra {
+                st.starting = st.starting.saturating_sub(1);
+            }
+        }
+    }
+
+    /// El próximo job de un hilo extra, o `None` si se retira. No se bloquea en el canal (un fijo
+    /// lo tiene tomado en `recv` mientras espera: con el servidor quieto el extra quedaba colgado
+    /// ahí) y se retira sólo bajo el lock de estado y sin cola: un `submit` que llega después ya
+    /// no lo cuenta y crea otro si hace falta (el job no queda sin hilo).
+    fn extra_take(me: &Arc<PoolShared>, first: bool) -> Option<InterpJob> {
+        if first {
+            let mut st = me.lock();
+            st.starting = st.starting.saturating_sub(1);
+        }
+        loop {
+            let got = match me.rx.try_lock() {
+                Ok(g) => g.try_recv().ok(),
+                Err(_) => None,
+            };
+            if got.is_some() {
+                return got;
+            }
+            {
+                let mut st = me.lock();
+                if st.queued == 0 {
+                    st.threads -= 1;
+                    return None;
+                }
+            }
+            // Hay cola pero el canal está tomado (un fijo a punto de recibir) o el job todavía
+            // no llegó al canal (`submit` cuenta antes de mandar): reintentar enseguida.
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+
+    /// El gancho: `true` = este hilo empieza a esperar (suelta su permiso); `false` = terminó
+    /// (lo retoma a crédito, sin bloquear nunca).
+    fn on_wait(me: &Arc<PoolShared>, waiting: bool) {
+        let grow = {
+            let mut st = me.lock();
+            if waiting {
+                st.waiting += 1;
+                st.permits += 1;
+                me.cv.notify_one();
+                me.reserve_extra(&mut st)
+            } else {
+                st.waiting = st.waiting.saturating_sub(1);
+                st.permits -= 1;
+                false
+            }
+        };
+        if grow {
+            PoolShared::spawn_worker(me, true);
+        }
+    }
 }
 
 impl InterpreterPool {
-    fn new(workers: usize) -> Self {
+    fn new(workers: usize, max_waiting: usize) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<InterpJob>();
-        let rx = Arc::new(Mutex::new(rx));
-        for i in 0..workers {
-            let rx = rx.clone();
-            let _ = std::thread::Builder::new()
-                .name(format!("synsema-interp-{}", i))
-                .stack_size(SERVE_STACK_SIZE)
-                .spawn(move || loop {
-                    // El lock se sostiene solo durante el `recv` (handoff instantáneo);
-                    // el job corre fuera del lock → los workers ejecutan en paralelo.
-                    let job = {
-                        let guard = match rx.lock() {
-                            Ok(g) => g,
-                            Err(_) => return,
-                        };
-                        guard.recv()
-                    };
-                    match job {
-                        // Un panic del handler NO debe matar al worker: se traga acá; los
-                        // canales del job se dropean y el lado async responde 500. Seguimos.
-                        Ok(job) => {
-                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-                        }
-                        Err(_) => return, // canal cerrado: el proceso termina
-                    }
-                });
+        let shared = Arc::new(PoolShared {
+            rx: Mutex::new(rx),
+            state: Mutex::new(PoolState { permits: workers as isize, ..Default::default() }),
+            cv: std::sync::Condvar::new(),
+            max_threads: workers + max_waiting,
+        });
+        for _ in 0..workers {
+            shared.lock().threads += 1;
+            PoolShared::spawn_worker(&shared, false);
         }
-        InterpreterPool { tx }
+        InterpreterPool { tx, shared }
     }
 
     fn submit(&self, job: InterpJob) {
+        let grow = {
+            let mut st = self.shared.lock();
+            st.queued += 1;
+            self.shared.reserve_extra(&mut st)
+        };
         let _ = self.tx.send(job);
+        if grow {
+            PoolShared::spawn_worker(&self.shared, true);
+        }
+    }
+
+    #[cfg(test)]
+    fn threads(&self) -> usize {
+        self.shared.lock().threads
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn wait_all(rx: &std::sync::mpsc::Receiver<()>, n: usize, secs: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        for _ in 0..n {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if rx.recv_timeout(left).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// B1 de la auditoría: con 2 permisos, 3 jobs que esperan I/O CON un lock compartido tomado
+    /// (el mutex de una base de red). Antes, el que volvía de esperar bloqueaba pidiendo permiso
+    /// con el lock en la mano y los demás esperaban el lock con su permiso: deadlock.
+    #[test]
+    fn waiting_with_a_shared_lock_held_never_deadlocks() {
+        let pool = InterpreterPool::new(2, 16);
+        let db = Arc::new(Mutex::new(0u32));
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..5 {
+            let (db, tx) = (db.clone(), tx.clone());
+            pool.submit(Box::new(move || {
+                let mut g = db.lock().unwrap();
+                {
+                    let _w = synsema_core::waiting::waiting();
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                *g += 1;
+                let _ = tx.send(());
+            }));
+        }
+        assert!(wait_all(&rx, 5, 10), "deadlock: los jobs no terminaron");
+        assert_eq!(*db.lock().unwrap(), 5);
+    }
+
+    /// La CPU queda acotada a los permisos: 8 jobs de CPU pura, nunca más de 2 a la vez.
+    #[test]
+    fn cpu_work_stays_within_the_permits() {
+        let pool = InterpreterPool::new(2, 16);
+        let (now, max) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..8 {
+            let (now, max, tx) = (now.clone(), max.clone(), tx.clone());
+            pool.submit(Box::new(move || {
+                let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+                max.fetch_max(n, Ordering::SeqCst);
+                let t = Instant::now();
+                while t.elapsed() < Duration::from_millis(30) {
+                    std::hint::spin_loop();
+                }
+                now.fetch_sub(1, Ordering::SeqCst);
+                let _ = tx.send(());
+            }));
+        }
+        assert!(wait_all(&rx, 8, 10));
+        assert!(max.load(Ordering::SeqCst) <= 2, "corrieron {} a la vez", max.load(Ordering::SeqCst));
+        assert_eq!(pool.threads(), 2, "sin esperas no se crean hilos extra");
+    }
+
+    /// Una espera larga con jobs nuevos detrás: crecen los hilos justos, y al vaciarse la cola
+    /// los extra se van (en reposo el pool vuelve a su tamaño).
+    #[test]
+    fn extra_threads_appear_while_others_wait_and_then_retire() {
+        let pool = InterpreterPool::new(1, 16);
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let tx = tx.clone();
+            pool.submit(Box::new(move || {
+                let _w = synsema_core::waiting::waiting();
+                std::thread::sleep(Duration::from_millis(400));
+                let _ = tx.send(());
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let t = Instant::now();
+        for _ in 0..3 {
+            let tx = tx.clone();
+            pool.submit(Box::new(move || {
+                let _ = tx.send(());
+            }));
+        }
+        assert!(wait_all(&rx, 3, 5), "los jobs nuevos no corrieron");
+        assert!(t.elapsed() < Duration::from_millis(300), "esperaron a la espera larga: {:?}", t.elapsed());
+        assert!(wait_all(&rx, 1, 5));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while pool.threads() > 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(pool.threads(), 1, "los hilos extra no se retiraron");
+    }
+
+    /// Auditoría ronda 2: con W=2, un fijo ocioso (bloqueado en `recv`, con el canal tomado) y el
+    /// otro esperando I/O, los extras que corren la ráfaga se retiran igual al vaciarse la cola
+    /// (antes quedaban bloqueados en `rx.lock()` hasta el próximo job), y nunca pasan el techo
+    /// aunque muchos `submit` lleguen juntos.
+    #[test]
+    fn extras_retire_with_an_idle_fixed_worker_and_never_pass_the_cap() {
+        let pool = Arc::new(InterpreterPool::new(2, 3));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let peak = Arc::new(AtomicUsize::new(0));
+        {
+            let tx = tx.clone();
+            pool.submit(Box::new(move || {
+                let _w = synsema_core::waiting::waiting();
+                std::thread::sleep(Duration::from_millis(600));
+                let _ = tx.send(());
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        // Ráfaga desde varios hilos a la vez: cada job espera un poco (así crecen los extras).
+        let senders: Vec<_> = (0..4)
+            .map(|_| {
+                let (pool, tx, peak) = (pool.clone(), tx.clone(), peak.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..5 {
+                        let (tx, peak, p2) = (tx.clone(), peak.clone(), pool.clone());
+                        pool.submit(Box::new(move || {
+                            peak.fetch_max(p2.threads(), Ordering::SeqCst);
+                            let _w = synsema_core::waiting::waiting();
+                            std::thread::sleep(Duration::from_millis(20));
+                            let _ = tx.send(());
+                        }));
+                    }
+                })
+            })
+            .collect();
+        for s in senders {
+            s.join().unwrap();
+        }
+        assert!(wait_all(&rx, 21, 10), "no corrieron todos los jobs");
+        assert!(peak.load(Ordering::SeqCst) <= 5, "pasó el techo (2 + 3): {}", peak.load(Ordering::SeqCst));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while pool.threads() > 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(pool.threads(), 2, "los extras no se retiraron con el servidor quieto");
     }
 }
 
 static INTERP_POOL: std::sync::OnceLock<InterpreterPool> = std::sync::OnceLock::new();
 
-/// El pool del intérprete, inicializado una vez. Tamaño: `SYNSEMA_SERVE_WORKERS` si está
-/// seteado (>=1), si no `#cores` (mín. 2). El env es el escape hatch para deploys con
-/// handlers I/O-bound (más workers = más concurrencia de I/O, a costa de más RAM); el
-/// default acota la memoria. La concurrencia real de I/O sin tope la dará el intérprete
-/// async (diferido), no subir esto sin límite.
+/// El pool del intérprete, inicializado una vez. Permisos: `SYNSEMA_SERVE_WORKERS` si está
+/// seteado (>=1), si no `#cores` (mín. 2). Hilos extra mientras otros esperan I/O:
+/// `SYNSEMA_SERVE_MAX_WAITING` (default 256; 0 = el pool de antes, sin hilos extra).
 fn interp_pool() -> &'static InterpreterPool {
     INTERP_POOL.get_or_init(|| {
         let workers = std::env::var("SYNSEMA_SERVE_WORKERS")
@@ -2009,7 +2380,12 @@ fn interp_pool() -> &'static InterpreterPool {
                     .unwrap_or(2)
                     .max(2)
             });
-        InterpreterPool::new(workers)
+        let max_waiting = std::env::var("SYNSEMA_SERVE_MAX_WAITING")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_MAX_WAITING)
+            .min(4096);
+        InterpreterPool::new(workers, max_waiting)
     })
 }
 
@@ -2018,6 +2394,9 @@ enum TlsMode {
     Plain,
     Fixed(Arc<rustls::ServerConfig>),
     Swap(SharedServerConfig),
+    /// v0.6.42 — certificados administrados (`acme_manager`): el handshake se acepta en dos
+    /// pasos para poder emitir bajo demanda el certificado del SNI antes de completarlo.
+    Managed(Arc<crate::acme_manager::CertManager>, Arc<rustls::ServerConfig>),
 }
 
 /// Loop de accept async. Bloquea para siempre (arma su propio runtime tokio).
@@ -2035,6 +2414,18 @@ pub fn serve_forever_tls_auto(rt: Arc<ServeRuntime>, listener: TcpListener, conf
     run_async(rt, listener, TlsMode::Swap(config));
 }
 
+/// v0.6.42 — HTTPS con certificados administrados (uno por nombre, wildcard, bajo demanda).
+pub fn serve_forever_tls_managed(rt: Arc<ServeRuntime>, listener: TcpListener, mgr: Arc<crate::acme_manager::CertManager>) {
+    let cfg = match crate::acme_manager::managed_server_config(mgr.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ACME: {}", e);
+            return;
+        }
+    };
+    run_async(rt, listener, TlsMode::Managed(mgr, cfg));
+}
+
 /// Knobs del servidor que el runtime reconoce — del ENTORNO DEL PROCESO (export /
 /// systemd / Docker), no del `.env` (que alimenta `env()`/`secret()` y la config de
 /// LLM/humanos). Lista CANÓNICA (espejo de `LLM_ENV_VARS`/`HUMAN_ENV_VARS`/
@@ -2043,6 +2434,8 @@ pub fn serve_forever_tls_auto(rt: Arc<ServeRuntime>, listener: TcpListener, conf
 /// template rompe el build a propósito.
 pub const SERVE_ENV_VARS: &[&str] = &[
     "SYNSEMA_SERVE_WORKERS",
+    // v0.6.42 — hilos extra del pool mientras otros handlers esperan I/O.
+    "SYNSEMA_SERVE_MAX_WAITING",
     "SYNSEMA_SHUTDOWN_GRACE",
     "SYNSEMA_SSE_KEEPALIVE",
     "SYNSEMA_WS_SERVER_PING",
@@ -2053,6 +2446,14 @@ pub const SERVE_ENV_VARS: &[&str] = &[
     "SYNSEMA_WATCH_MAX",
     // v0.6.20 — salud opt-in del host (= `serve --health`).
     "SYNSEMA_HEALTH_PATH",
+    // v0.6.42 — certificados administrados (`acme_manager`).
+    "SYNSEMA_ACME_MAX_PER_HOUR",
+    "SYNSEMA_ACME_DNS_WAIT",
+    // Los de ACME anteriores, que no estaban en ninguna lista (auditoría de v0.6.42).
+    "SYNSEMA_CERT_DIR",
+    "SYNSEMA_ACME_DIRECTORY",
+    "SYNSEMA_ACME_CA",
+    "SYNSEMA_ACME_HTTP_PORT",
 ];
 
 /// Servidores (`run_async`) vivos en el proceso: con varios `serve on` en un programa,
@@ -2279,7 +2680,7 @@ pub fn register_shutdown_builtin(interp: &synsema_core::interpreter::Interpreter
             };
             if !under_serve() {
                 return Err(Control::Error(RuntimeError::new(
-                    "shutdown() is only available under serve — a run program ends when its top level ends (use `stop` to leave a loop or a task)",
+                    "shutdown() is only available under serve — a run program ends when its top level ends, or with exit(code) (use `stop` to leave a loop or a task)",
                 )));
             }
             if servers_live() == 0 && !cron_only_live() {
@@ -2289,6 +2690,24 @@ pub fn register_shutdown_builtin(interp: &synsema_core::interpreter::Interpreter
             }
             request_shutdown(&reason);
             Ok(SynValue::Nothing)
+        }),
+    );}
+
+/// v0.6.42 — `exit(code)` es de `synsema run`. En un intérprete de `serve` (handlers, cron,
+/// agentes) terminar el proceso cortaría los requests en vuelo: el camino es `shutdown(reason)`,
+/// que drena. Se registra POR INTÉRPRETE (lo llama el armado de serve), no por una marca global
+/// del proceso.
+pub fn register_serve_exit_builtin(interp: &synsema_core::interpreter::Interpreter) {
+    use std::rc::Rc;
+    use synsema_core::interpreter::{Control, RuntimeError};
+    interp.register_builtin(
+        "exit",
+        -1,
+        Rc::new(|_i, _args, loc| {
+            Err(Control::Error(RuntimeError::at(
+                "exit() ends a `synsema run` program; under serve use shutdown(reason), which drains the requests in flight",
+                loc.clone(),
+            )))
         }),
     );
 }
@@ -2458,6 +2877,49 @@ async fn serve_conn(
                 let _ = watcher.watch(builder.serve_connection_with_upgrades(io, svc)).await;
             }
         }
+        TlsMode::Managed(mgr, cfg) => {
+            let start = match tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), tcp).await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let (sni, challenge) = {
+                let hello = start.client_hello();
+                let sni = hello.server_name().map(|s| s.to_string());
+                let challenge = hello
+                    .alpn()
+                    .map(|mut a| a.any(|p| p == crate::acme_manager::ACME_TLS_ALPN))
+                    .unwrap_or(false);
+                (sni, challenge)
+            };
+            // Un nombre sin certificado: `domain ask` decide y se emite antes de seguir (con
+            // tope). Si no hay certificado igual, el resolver no entrega ninguno: falla el
+            // handshake, nunca se sirve el certificado de otro nombre.
+            if !challenge {
+                if let Some(name) = &sni {
+                    if mgr.on_demand() && mgr.cert_for(name).is_none() {
+                        // En una tarea aparte: si tarda más que el tope, la emisión sigue y el
+                        // próximo handshake ya encuentra el certificado (no se cancela a medias).
+                        let (m2, n2) = (mgr.clone(), name.clone());
+                        let job = tokio::spawn(async move { m2.ensure(&n2).await });
+                        match tokio::time::timeout(crate::acme_manager::ISSUE_TIMEOUT, job).await {
+                            Ok(Ok(Err(e))) => eprintln!("ACME: {}", e),
+                            Err(_) => eprintln!("ACME: {}: issuance still running after {}s", name, crate::acme_manager::ISSUE_TIMEOUT.as_secs()),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let stream = match start.into_stream(cfg).await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            // El validador del reto TLS-ALPN-01 sólo mira el certificado: no hay HTTP detrás.
+            if challenge {
+                return;
+            }
+            let io = TokioIo::new(stream);
+            let _ = watcher.watch(builder.serve_connection_with_upgrades(io, svc)).await;
+        }
     }
 }
 
@@ -2478,7 +2940,7 @@ struct HeadInfo {
 
 /// Lo que el dispatch resolvió para una ruta `proxy to`: upstream + headers (rate-limit).
 struct ProxyPlan {
-    target: String,
+    target: crate::routing::ProxyDest,
     headers: Vec<(String, String)>,
 }
 
@@ -2663,6 +3125,16 @@ pub fn parse_proxy_target(target: &str) -> Result<(String, String, String), Stri
     if authority.is_empty() || authority.starts_with(':') {
         return Err(format!("the target needs a host (got \"{}\")", t));
     }
+    // v0.6.42 (auditoría B2) — el authority es SÓLO host[:puerto]. El chequeo de `net` y esta
+    // conexión tienen que ver el mismo host: con `a.ok?.x.attacker:6379` el chequeo leía
+    // `a.ok` (corta en `?`) y la conexión iba al host del atacante. Credenciales (`@`), query,
+    // fragmento, `\`, `%` y espacios en el authority se rechazan.
+    if !authority.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']')) {
+        return Err(format!(
+            "the target's host has characters that are not part of a host[:port] (got \"{}\")",
+            t
+        ));
+    }
     let addr = if authority.rsplit(':').next().map(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty()).unwrap_or(false)
         && authority.contains(':')
     {
@@ -2673,13 +3145,168 @@ pub fn parse_proxy_target(target: &str) -> Result<(String, String, String), Stri
     Ok((addr, authority.to_string(), base.trim_end_matches('/').to_string()))
 }
 
+/// v0.6.42 — un body que anota cuándo avanzó (ms desde `t0`): el timeout del proxy es de inactividad.
+struct ProgressBody<B> {
+    inner: B,
+    last: Arc<std::sync::atomic::AtomicU64>,
+    t0: Instant,
+}
+
+impl<B: hyper::body::Body + Unpin> hyper::body::Body for ProgressBody<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        if let std::task::Poll::Ready(Some(Ok(_))) = &r {
+            let ms = self.t0.elapsed().as_millis() as u64;
+            self.last.store(ms, std::sync::atomic::Ordering::Relaxed);
+        }
+        r
+    }
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// v0.6.42 — el body que se reenvía: en streaming desde el cliente, o ya leído (la ruta lo usó).
+enum ProxyBodySrc {
+    Stream(Incoming),
+    Bytes(Bytes),
+}
+
 /// Hop-by-hop (RFC 7230 §6.1): no cruzan el proxy en ninguna dirección.
 fn is_hop_by_hop(lower_name: &str) -> bool {
     matches!(
         lower_name,
         "connection" | "keep-alive" | "proxy-authenticate" | "proxy-authorization" | "te" | "trailer"
-            | "transfer-encoding" | "upgrade"
+            | "transfer-encoding" | "upgrade" | "proxy-connection"
     )
+}
+
+/// v0.6.42 — una red de confianza de `trust proxy`: una IP (`10.0.0.5`, `::1`) o un CIDR
+/// (`10.0.0.0/8`, `fd00::/8`). Sin crate: el parseo es el de la std más el prefijo.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrustedNet {
+    addr: std::net::IpAddr,
+    prefix: u8,
+}
+
+impl TrustedNet {
+    pub fn parse(spec: &str) -> Result<TrustedNet, String> {
+        let spec = spec.trim();
+        let (ip, prefix) = match spec.split_once('/') {
+            Some((ip, p)) => (ip, Some(p)),
+            None => (spec, None),
+        };
+        let addr: std::net::IpAddr = ip
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse()
+            .map_err(|_| format!("trust proxy: '{}' is not an IP address or a CIDR (10.0.0.0/8, ::1)", spec))?;
+        // `::ffff:a.b.c.d` (y su `/96+n`) es una IPv4: se guarda como tal, que es como se compara.
+        let (addr, mapped) = match addr {
+            std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => (std::net::IpAddr::V4(v4), true),
+                None => (addr, false),
+            },
+            v4 => (v4, false),
+        };
+        let max = if addr.is_ipv4() { 32 } else { 128 };
+        let prefix = match prefix {
+            None => max,
+            Some(p) => match p.parse::<u8>() {
+                Ok(n) if mapped && (96..=128).contains(&n) => n - 96,
+                Ok(n) if !mapped && n <= max => n,
+                _ => return Err(format!("trust proxy: '{}' has an invalid prefix (0..={})", spec, if mapped { 128 } else { max })),
+            },
+        };
+        Ok(TrustedNet { addr, prefix })
+    }
+
+    pub fn contains(&self, ip: std::net::IpAddr) -> bool {
+        // Una IPv4 mapeada (::ffff:a.b.c.d) se compara como IPv4.
+        let ip = match ip {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip),
+            v4 => v4,
+        };
+        match (self.addr, ip) {
+            (std::net::IpAddr::V4(a), std::net::IpAddr::V4(b)) => {
+                let mask = if self.prefix == 0 { 0 } else { u32::MAX << (32 - self.prefix) };
+                (u32::from(a) & mask) == (u32::from(b) & mask)
+            }
+            (std::net::IpAddr::V6(a), std::net::IpAddr::V6(b)) => {
+                let mask = if self.prefix == 0 { 0 } else { u128::MAX << (128 - self.prefix) };
+                (u128::from(a) & mask) == (u128::from(b) & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+const FORWARDED_HEADERS: [&str; 4] = ["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "forwarded"];
+
+/// La IP de un salto de `X-Forwarded-For`: `ip`, `ipv4:puerto`, `[ipv6]` o `[ipv6]:puerto`.
+fn hop_ip(hop: &str) -> Option<std::net::IpAddr> {
+    let h = hop.trim();
+    if let Ok(ip) = h.parse() {
+        return Some(ip);
+    }
+    if let Some(rest) = h.strip_prefix('[') {
+        return rest.split(']').next()?.parse().ok();
+    }
+    match h.rsplit_once(':') {
+        Some((ip, port)) if port.chars().all(|c| c.is_ascii_digit()) => ip.parse().ok(),
+        _ => None,
+    }
+}
+
+impl ServeRuntime {
+    fn is_trusted(&self, ip: &str) -> bool {
+        match ip.trim().trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>() {
+            Ok(a) => self.trusted_proxies.iter().any(|n| n.contains(a)),
+            Err(_) => false,
+        }
+    }
+
+    /// v0.6.42 — la IP real del cliente y los headers que pueden seguir. De un par que no es un
+    /// proxy de confianza, los `X-Forwarded-*`/`Forwarded` se descartan (los puede inventar
+    /// cualquiera) y el cliente es el par. De un proxy de confianza se recorre `X-Forwarded-For`
+    /// de derecha a izquierda saltando proxys de confianza (`real_ip_recursive` de nginx): el
+    /// primero que no lo es, es el cliente.
+    pub fn resolve_forwarded(&self, peer: &str, headers: Vec<(String, String)>) -> (String, Vec<(String, String)>) {
+        if !self.is_trusted(peer) {
+            let kept = headers
+                .into_iter()
+                .filter(|(k, _)| !FORWARDED_HEADERS.iter().any(|f| k.eq_ignore_ascii_case(f)))
+                .collect();
+            return (peer.to_string(), kept);
+        }
+        let chain: Vec<String> = headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"))
+            .flat_map(|(_, v)| v.split(',').map(|x| x.trim().to_string()).collect::<Vec<_>>())
+            .filter(|x| !x.is_empty())
+            .collect();
+        let mut client = peer.to_string();
+        for hop in chain.iter().rev() {
+            // `1.2.3.4:5678` o `[2001:db8::1]:443` también son un salto (con puerto).
+            let Some(ip) = hop_ip(hop) else {
+                // Un salto que no es una IP corta la cadena: no se le cree nada a la izquierda.
+                break;
+            };
+            client = ip.to_string();
+            if !self.trusted_proxies.iter().any(|n| n.contains(ip)) {
+                break;
+            }
+        }
+        (client, headers)
+    }
 }
 
 fn proxy_error_response(
@@ -2707,7 +3334,7 @@ async fn proxy_request(
     method: String,
     target_pq: String,
     headers: Vec<(String, String)>,
-    body: Bytes,
+    body: Option<ProxyBodySrc>,
     client_ip: String,
     upgrade: Option<hyper::upgrade::OnUpgrade>,
     timeout: Option<f64>,
@@ -2718,41 +3345,83 @@ async fn proxy_request(
     use hyper::http::header::{HeaderName, HeaderValue};
 
     let extra = plan.headers;
-    let (addr, authority, base) = match parse_proxy_target(&plan.target) {
-        Ok(x) => x,
-        Err(e) => return proxy_error_response(502, format!("proxy error: {}", e), &extra, cors.as_deref(), hsts),
-    };
+    // v0.6.42 — el destino es una URL (TCP al upstream) o un extremo de `pipe()` que el programa
+    // lleva por su propio transporte (un túnel). El cliente HTTP/1.1 es el mismo: `SendRequest`
+    // no depende del IO, sólo la conexión que se deja corriendo.
+    type ProxyReqBody = http_body_util::combinators::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+    type ProxySender = hyper::client::conn::http1::SendRequest<ProxyReqBody>;
     let wait = Duration::from_secs_f64(timeout.filter(|t| t.is_finite() && *t > 0.0).unwrap_or(30.0));
-    let tcp = match tokio::time::timeout(wait, tokio::net::TcpStream::connect(&addr)).await {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            return proxy_error_response(502, format!("proxy error: connect {}: {}", addr, e), &extra, cors.as_deref(), hsts)
+    let (mut sender, authority, base): (ProxySender, String, String) = match plan.target {
+        crate::routing::ProxyDest::Url(url) => {
+            let (addr, authority, base) = match parse_proxy_target(&url) {
+                Ok(x) => x,
+                Err(e) => return proxy_error_response(502, format!("proxy error: {}", e), &extra, cors.as_deref(), hsts),
+            };
+            let tcp = match tokio::time::timeout(wait, tokio::net::TcpStream::connect(&addr)).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    return proxy_error_response(502, format!("proxy error: connect {}: {}", addr, e), &extra, cors.as_deref(), hsts)
+                }
+                Err(_) => {
+                    return proxy_error_response(
+                        504,
+                        format!("gateway timeout: the upstream {} did not accept the connection within {}s", addr, wait.as_secs_f64()),
+                        &extra,
+                        cors.as_deref(),
+                        hsts,
+                    )
+                }
+            };
+            let _ = tcp.set_nodelay(true);
+            let (sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await {
+                Ok(x) => x,
+                Err(e) => return proxy_error_response(502, format!("proxy error: {}", e), &extra, cors.as_deref(), hsts),
+            };
+            tokio::spawn(async move {
+                let _ = conn.with_upgrades().await;
+            });
+            (sender, authority, base)
         }
-        Err(_) => {
-            return proxy_error_response(
-                504,
-                format!("gateway timeout: the upstream {} did not accept the connection within {}s", addr, wait.as_secs_f64()),
-                &extra,
-                cors.as_deref(),
-                hsts,
-            )
+        crate::routing::ProxyDest::Conn(any) => {
+            let end = match any.downcast::<crate::pipe::PipeEnd>() {
+                Ok(e) => *e,
+                Err(_) => {
+                    return proxy_error_response(502, "proxy error: the destination is not a pipe end".to_string(), &extra, cors.as_deref(), hsts)
+                }
+            };
+            let (sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(crate::pipe::PipeIo::new(end))).await {
+                Ok(x) => x,
+                Err(e) => return proxy_error_response(502, format!("proxy error: {}", e), &extra, cors.as_deref(), hsts),
+            };
+            tokio::spawn(async move {
+                let _ = conn.with_upgrades().await;
+            });
+            // Por un pipe no hay upstream con nombre: el servicio del otro lado ve el `Host`
+            // público (y `X-Forwarded-Host`), la URI sin base.
+            let host = headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
+            (sender, host, String::new())
         }
     };
-    let _ = tcp.set_nodelay(true);
-    let (mut sender, conn) = match hyper::client::conn::http1::handshake(TokioIo::new(tcp)).await {
-        Ok(x) => x,
-        Err(e) => return proxy_error_response(502, format!("proxy error: {}", e), &extra, cors.as_deref(), hsts),
-    };
-    tokio::spawn(async move {
-        let _ = conn.with_upgrades().await;
-    });
 
     let is_ws = upgrade.is_some();
     let pq = if target_pq.starts_with('/') { target_pq } else { format!("/{}", target_pq) };
     let uri = format!("{}{}", base, pq);
     let mut rb = Request::builder().method(method.as_str()).uri(uri.as_str());
     rb = rb.header("Host", authority.as_str());
+    // RFC 7230 §6.1: los headers que el cliente nombra en `Connection:` son hop-by-hop.
+    let conn_named: Vec<String> = headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, v)| v.split(',').map(|t| t.trim().to_ascii_lowercase()).collect::<Vec<_>>())
+        .filter(|t| !t.is_empty() && t != "upgrade")
+        .collect();
     let mut fwd_for: Option<String> = None;
+    let mut fwd_proto: Option<String> = None;
+    let mut fwd_host: Option<String> = None;
     let mut orig_host: Option<String> = None;
     for (k, v) in &headers {
         let lk = k.to_ascii_lowercase();
@@ -2761,14 +3430,31 @@ async fn proxy_request(
                 orig_host = Some(v.clone());
                 continue;
             }
-            "content-length" | "x-forwarded-proto" | "x-forwarded-host" => continue,
+            "content-length" | "forwarded" => continue,
+            // v0.6.42 — sólo sobreviven si los trajo un proxy de confianza (`resolve_forwarded`).
+            // Repetidos: el esquema y el host, el PRIMERO (como `base_url` y el resto del
+            // server); la cadena de `X-Forwarded-For`, todos unidos (como `resolve_forwarded`).
+            "x-forwarded-proto" => {
+                fwd_proto.get_or_insert_with(|| v.clone());
+                continue;
+            }
+            "x-forwarded-host" => {
+                fwd_host.get_or_insert_with(|| v.clone());
+                continue;
+            }
             "x-forwarded-for" => {
-                fwd_for = Some(v.clone());
+                let v = v.trim();
+                if !v.is_empty() {
+                    fwd_for = Some(match fwd_for.take() {
+                        Some(prev) => format!("{}, {}", prev, v),
+                        None => v.to_string(),
+                    });
+                }
                 continue;
             }
             // En un upgrade WebSocket, `Upgrade` y `Sec-WebSocket-*` cruzan tal cual.
             "upgrade" if is_ws => {}
-            _ if is_hop_by_hop(&lk) => continue,
+            _ if is_hop_by_hop(&lk) || conn_named.contains(&lk) => continue,
             _ => {}
         }
         if let (Ok(n), Ok(val)) = (HeaderName::try_from(k.as_str()), HeaderValue::try_from(v.as_str())) {
@@ -2783,18 +3469,61 @@ async fn proxy_request(
         _ => client_ip.clone(),
     };
     rb = rb.header("X-Forwarded-For", xff.as_str());
-    rb = rb.header("X-Forwarded-Proto", if rt.tls_enabled { "https" } else { "http" });
-    if let Some(h) = orig_host {
+    // v0.6.42 — el esquema y el host públicos: los del proxy de confianza de adelante si los
+    // mandó (un Caddy con TLS delante de este server), si no los propios.
+    let own_proto = if rt.tls_enabled { "https" } else { "http" };
+    let proto = fwd_proto.as_deref().map(|p| p.split(',').next().unwrap_or(p).trim()).filter(|p| !p.is_empty()).unwrap_or(own_proto);
+    if let Ok(val) = HeaderValue::try_from(proto) {
+        rb = rb.header("X-Forwarded-Proto", val);
+    }
+    if let Some(h) = fwd_host.filter(|h| !h.trim().is_empty()).or(orig_host) {
         if let Ok(val) = HeaderValue::try_from(h.as_str()) {
             rb = rb.header("X-Forwarded-Host", val);
         }
     }
-    let req = match rb.body(Full::new(body)) {
+    // El body del cliente en streaming, con el tope de `max_body` (el `size_hint` exacto viaja:
+    // si el cliente mandó `Content-Length`, el upstream lo recibe igual).
+    // v0.6.42 (auditoría) — el timeout es de INACTIVIDAD: cada tramo del body que sube corre el
+    // plazo; 50 MB a 1 MB/s no son un 504, un upstream mudo sí.
+    let started = Instant::now();
+    let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let up_body: ProxyReqBody = match body {
+        Some(ProxyBodySrc::Bytes(b)) => Full::new(b).map_err(|never| match never {}).boxed_unsync(),
+        Some(ProxyBodySrc::Stream(b)) => match rt.max_body {
+            Some(m) => ProgressBody { inner: Limited::new(b, m.max(0) as usize), last: progress.clone(), t0: started }
+                .boxed_unsync(),
+            None => ProgressBody {
+                inner: b.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+                last: progress.clone(),
+                t0: started,
+            }
+            .boxed_unsync(),
+        },
+        None => Full::new(Bytes::new()).map_err(|never| match never {}).boxed_unsync(),
+    };
+    let req = match rb.body(up_body) {
         Ok(r) => r,
         Err(e) => return proxy_error_response(502, format!("proxy error: bad request for upstream: {}", e), &extra, cors.as_deref(), hsts),
     };
-    let resp = match tokio::time::timeout(wait, sender.send_request(req)).await {
+    let resp_fut = sender.send_request(req);
+    tokio::pin!(resp_fut);
+    let resp_r = loop {
+        let last = Duration::from_millis(progress.load(std::sync::atomic::Ordering::Relaxed));
+        let idle = started.elapsed().saturating_sub(last);
+        if idle >= wait {
+            break Err(());
+        }
+        match tokio::time::timeout(wait - idle, &mut resp_fut).await {
+            Ok(r) => break Ok(r),
+            Err(_) => continue, // venció el plazo: mirar si hubo progreso en el medio
+        }
+    };
+    let resp = match resp_r {
         Ok(Ok(r)) => r,
+        // El body pasó `max_body` a mitad de camino: 413, como si se hubiera leído entero.
+        Ok(Err(e)) if format!("{:?}", e).contains("LengthLimitError") => {
+            return proxy_error_response(413, "payload too large".to_string(), &extra, cors.as_deref(), hsts)
+        }
         Ok(Err(e)) => return proxy_error_response(502, format!("proxy error: {}", e), &extra, cors.as_deref(), hsts),
         Err(_) => {
             return proxy_error_response(
@@ -2869,10 +3598,19 @@ async fn proxy_request(
         });
     }
 
-    // Respuesta normal: status + headers end-to-end + body en streaming.
+    // Respuesta normal: status + headers end-to-end + body en streaming. Los que el upstream
+    // nombra en su `Connection:` también son hop-by-hop (RFC 9110 §7.6.1), como en la request.
+    let resp_conn_named: Vec<String> = resp
+        .headers()
+        .get_all(hyper::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(',').map(|t| t.trim().to_ascii_lowercase()).collect::<Vec<_>>())
+        .filter(|t| !t.is_empty())
+        .collect();
     let mut builder = Response::builder().status(status);
     for (k, v) in resp.headers() {
-        if is_hop_by_hop(k.as_str()) {
+        if is_hop_by_hop(k.as_str()) || resp_conn_named.iter().any(|n| n == k.as_str()) {
             continue;
         }
         builder = builder.header(k.clone(), v.clone());
@@ -3038,8 +3776,8 @@ fn json_full(
 }
 
 /// OPTIONS: 204 + Allow (+ CORS si está). Espeja `handle_options` del path viejo.
-fn build_options_response(rt: &ServeRuntime, path: &str) -> Response<RespBody> {
-    let allowed = rt.methods_for_path(path);
+fn build_options_response(rt: &ServeRuntime, path: &str, headers: &[(String, String)]) -> Response<RespBody> {
+    let allowed = rt.methods_for_request(path, headers);
     if allowed.is_empty() {
         let body = obj(vec![
             ("error", Json::Str(format!("no route for {}", path))),
@@ -3121,8 +3859,22 @@ async fn handle_request(
         }
     }
 
-    if method == "OPTIONS" {
-        return Ok(build_options_response(&rt, &path));
+    // v0.6.42 (auditoría) — más de un `Host`: 400. Con dos, cada capa podía leer uno distinto (el
+    // proxy el último, el resto el primero) y pasar un `X-Forwarded-Host` controlado.
+    if headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("host")).count() > 1 {
+        let body = obj(vec![
+            ("error", Json::Str("more than one Host header".into())),
+            ("status", Json::Int(400)),
+        ]);
+        return Ok(json_full(400, dumps(&body), &[], rt.cors_origin(), rt.tls_enabled, true));
+    }
+    // v0.6.42 — `trust proxy`: el cliente real y los `X-Forwarded-*` que pueden seguir. El par
+    // TCP queda aparte: es el salto que se agrega al `X-Forwarded-For` de un `proxy to`.
+    let peer_ip = client_ip;
+    let (client_ip, headers) = rt.resolve_forwarded(&peer_ip, headers);
+
+    if method == "OPTIONS" && !rt.has_route("OPTIONS", &path, &headers) {
+        return Ok(build_options_response(&rt, &path, &headers));
     }
     let is_head = method == "HEAD";
     let eff_method = if is_head { "GET".to_string() } else { method.clone() };
@@ -3173,15 +3925,34 @@ async fn handle_request(
         }
     }
 
-    // Body con tope; excedido → 413 + cerrar.
-    let body_bytes = match read_req_body(req.into_body(), rt.max_body).await {
-        Ok(b) => b,
-        Err(()) => {
-            let body = obj(vec![
-                ("error", Json::Str("payload too large".into())),
-                ("status", Json::Int(413)),
-            ]);
-            return Ok(json_full(413, dumps(&body), &[], cors.as_deref(), hsts, true));
+    // v0.6.42 — en una ruta que hace `proxy to`, el body NO se lee: viaja en streaming al
+    // destino (con el tope de `max_body` contando bytes), como un reverse proxy. Memoria
+    // acotada aunque se suba un archivo grande por un túnel; el handler lo ve vacío.
+    let mut proxy_body: Option<ProxyBodySrc> = None;
+    let body_bytes = if plan.proxy && plan.stream_body {
+        // Un `Content-Length` declarado por encima del tope se rechaza ya, sin esperar el body.
+        if let (Some(m), Ok(n)) = (rt.max_body, header_value(&headers, "content-length").trim().parse::<i64>()) {
+            if n > m.max(0) {
+                let body = obj(vec![
+                    ("error", Json::Str("payload too large".into())),
+                    ("status", Json::Int(413)),
+                ]);
+                return Ok(json_full(413, dumps(&body), &[], cors.as_deref(), hsts, true));
+            }
+        }
+        proxy_body = Some(ProxyBodySrc::Stream(req.into_body()));
+        Bytes::new()
+    } else {
+        // Body con tope; excedido → 413 + cerrar.
+        match read_req_body(req.into_body(), rt.max_body).await {
+            Ok(b) => b,
+            Err(()) => {
+                let body = obj(vec![
+                    ("error", Json::Str("payload too large".into())),
+                    ("status", Json::Int(413)),
+                ]);
+                return Ok(json_full(413, dumps(&body), &[], cors.as_deref(), hsts, true));
+            }
         }
     };
     // Spill a disco igual que el oráculo: bodies > MEM_SPILL no van en memoria (el
@@ -3196,9 +3967,15 @@ async fn handle_request(
         } else {
             (String::from_utf8_lossy(&body_bytes).into_owned(), body_bytes.to_vec(), None)
         };
+    // Una ruta de proxy que lee el body: ya se leyó entero (con `max_body`) y se reenvía igual.
+    if plan.proxy && proxy_body.is_none() {
+        proxy_body = Some(ProxyBodySrc::Bytes(body_bytes.clone()));
+    }
+    // El body no se leyó: el handler no lo ve (`Ctx::body_streamed`).
+    let body_streamed = matches!(proxy_body, Some(ProxyBodySrc::Stream(_)));
     // Lo que el forward de un `proxy to` necesita (el job sync consume el resto).
     let proxy_req = if plan.proxy {
-        Some((method.clone(), target.clone(), headers.clone(), body_bytes.clone(), client_ip.clone()))
+        Some((method.clone(), target.clone(), headers.clone(), peer_ip.clone()))
     } else {
         None
     };
@@ -3277,6 +4054,7 @@ async fn handle_request(
             bf.as_deref(),
             &client_ip,
             cancel_job.clone(),
+            body_streamed,
         );
         match dispatched {
             Dispatched::Response { status, body, headers: extra } => {
@@ -3485,9 +4263,19 @@ async fn handle_request(
 
     // Ruta `proxy to`: forward en streaming (SSE / túnel WebSocket / bodies grandes).
     if let Some(pp) = head.proxy {
-        let (m, pq, hs, body, ip) =
-            proxy_req.unwrap_or_else(|| (method.clone(), target.clone(), Vec::new(), Bytes::new(), String::new()));
-        return Ok(proxy_request(rt.clone(), pp, m, pq, hs, body, ip, proxy_upgrade, plan.timeout, cors, hsts).await);
+        // v0.6.42 — el transporte guarda lo que el reenvío necesita sólo en rutas que hacen
+        // proxy (no en todas). Un `proxy to` escondido en una task que la ruta llama no se ve al
+        // arrancar: error claro en vez de reenviar sin headers ni body.
+        let Some((m, pq, hs, ip)) = proxy_req else {
+            return Ok(proxy_error_response(
+                500,
+                "proxy to ran inside a task the route calls; put the `proxy to` statement in the route body itself".to_string(),
+                &pp.headers,
+                cors.as_deref(),
+                hsts,
+            ));
+        };
+        return Ok(proxy_request(rt.clone(), pp, m, pq, hs, proxy_body, ip, proxy_upgrade, plan.timeout, cors, hsts).await);
     }
 
     // 101 Switching Protocols: responder y, cuando hyper entregue el socket crudo,

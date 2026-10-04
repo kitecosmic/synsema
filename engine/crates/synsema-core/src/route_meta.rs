@@ -111,6 +111,7 @@ pub const BUILTIN_CAPS: &[(&str, &str)] = &[
     ("http_bytes", "net"),
     ("http_put", "net"), ("http_delete", "net"), ("mtls_identity", "net"),
     ("ws_connect", "net"),
+    ("tcp_connect", "net"),
     ("push_send", "net"), // Web Push: el push service es un host más (tanda PWA)
     ("evm_rpc", "net"), ("evm_call", "net"), ("evm_send", "net"), ("solana_rpc", "net"),
     ("evm_logs", "net"), ("evm_block_number", "net"),
@@ -597,7 +598,7 @@ pub fn api_routes_static(sp: &StaticProgram) -> Result<Option<(ServeInfoStatic, 
     let serve = sp.main.statements.iter().find(|s| matches!(s.kind, NodeKind::ServeBlock { .. }));
     let Some(serve) = serve else { return Ok(None) };
     let NodeKind::ServeBlock {
-        auth_handler, rate_limit, describe, private, docs_off, routes, domain, bind, mounts, ..
+        auth_handler, rate_limit, describe, private, docs_off, routes, acme, bind, mounts, ..
     } = &serve.kind
     else {
         return Ok(None);
@@ -607,7 +608,7 @@ pub fn api_routes_static(sp: &StaticProgram) -> Result<Option<(ServeInfoStatic, 
         private: *private,
         docs_off: *docs_off,
         has_auth_handler: auth_handler.is_some(),
-        domain: text_of(domain.as_deref()),
+        domain: text_of(acme.as_ref().and_then(|a| a.domain.as_deref())),
         bind: text_of(bind.as_deref()),
         ..Default::default()
     };

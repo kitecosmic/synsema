@@ -5208,6 +5208,7 @@ dependencies = [
  "synsema-stdlib",
  "tokio",
  "tungstenite",
+ "x509-parser",
 ]
 
 [[package]]

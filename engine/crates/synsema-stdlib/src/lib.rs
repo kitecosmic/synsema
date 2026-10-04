@@ -11,6 +11,10 @@
 
 #[cfg(feature = "native")]
 pub mod acme;
+/// v0.6.42 — certificados administrados: cuenta reusada, uno por nombre, wildcard por DNS-01
+/// con una task del programa, bajo demanda con `domain ask`.
+#[cfg(feature = "native")]
+pub mod acme_manager;
 pub mod blockchain;
 pub mod blockchain_abi;
 pub mod blockchain_algorand;
@@ -93,3 +97,6 @@ pub mod term;
 pub mod watch;
 #[cfg(feature = "native")]
 pub mod ws;
+/// v0.6.42 — `pipe()`: dos extremos de bytes en memoria (túneles, proxys, tests).
+#[cfg(feature = "native")]
+pub mod pipe;

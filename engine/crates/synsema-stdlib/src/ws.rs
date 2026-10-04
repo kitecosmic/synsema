@@ -61,6 +61,11 @@ use crate::proc::{LiveProc, OnFull as ProcOnFull, ProcEvent, ProcStatus, SpawnOp
 use crate::term::{Term, TermError, TermEvent, TermOpts};
 use crate::watch::{Watch, WatchOpts};
 
+/// v0.6.42 — `tcp_*` y `pipe_*`: handles del hub en su propio archivo.
+#[path = "ws_net.rs"]
+mod ws_net;
+pub use ws_net::take_pipe_for_proxy;
+
 /// Token reservado del `mio::Waker` del hub (los sockets arrancan en 1).
 const WAKER_TOKEN: Token = Token(0);
 /// Ping del servidor a un `socket` entrante (segundos); `SYNSEMA_WS_SERVER_PING` lo
@@ -408,6 +413,10 @@ struct WsRegistry {
     cancel_seen: usize,
     /// Flag del token vigente: el `pump` sale apenas se enciende (el waker lo despierta).
     cancel_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// v0.6.42 — conexiones TCP salientes (`tcp_connect`).
+    tcps: HashMap<i64, ws_net::TcpConn>,
+    /// v0.6.42 — extremos de pipe adoptados por este hub (con si ya entregaron su `close`).
+    pipes: HashMap<i64, ws_net::PipeSlot>,
 }
 
 impl Drop for WsRegistry {
@@ -418,6 +427,8 @@ impl Drop for WsRegistry {
         self.procs.clear();
         self.watches.clear();
         self.term = None;
+        self.tcps.clear();
+        self.pipes.clear();
         if let Some(bus) = &self.bus {
             for (_, s) in self.subs.drain() {
                 bus.unsubscribe(s.id);
@@ -1112,6 +1123,10 @@ impl WsRegistry {
             })
             .collect();
         for (handle, readable, writable) in ready {
+            if self.tcps.contains_key(&handle) {
+                self.tcp_on_ready(handle, readable, writable);
+                continue;
+            }
             if writable {
                 self.try_flush(handle);
             }
@@ -1593,6 +1608,8 @@ fn run_pending(interp: &mut Interpreter, reg: &Registry, pending: Vec<PendingRec
     for p in pending {
         // Sólo si la conexión sigue existiendo (no la cerró el usuario en el ínterin).
         if reg.borrow().conns.contains_key(&p.handle) {
+            // La task del usuario corre con permiso de CPU aunque estemos dentro de una espera.
+            let _r = synsema_core::waiting::resumed();
             interp.call_task(p.task, vec![syn_int(p.handle)])?;
         }
     }
@@ -1608,6 +1625,8 @@ fn ws_recv(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Resul
     }
     let deadline = Instant::now() + timeout;
     watch_cancel(reg, interp);
+    // Bajo `serve`, mientras duerme suelta su permiso de ejecución (como `select`).
+    let mut waiting = None;
     loop {
         interp.check_cancel()?;
         // ¿Ya hay algo? entregarlo.
@@ -1623,6 +1642,9 @@ fn ws_recv(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Resul
         }
         if Instant::now() >= deadline {
             return Ok(SynValue::Nothing);
+        }
+        if waiting.is_none() {
+            waiting = Some(synsema_core::waiting::waiting());
         }
         let mut pending = Vec::new();
         reg.borrow_mut().pump(&[handle], deadline, &mut pending);
@@ -1871,6 +1893,13 @@ pub fn reset_hub(interp: &Interpreter) {
     r.procs.clear();
     r.watches.clear();
     r.term = None;
+    // v0.6.42 — un handle no cruza requests: las conexiones TCP se cierran y los extremos de
+    // pipe adoptados también (el otro lado ve `close`).
+    let tcps: Vec<i64> = r.tcps.keys().copied().collect();
+    for h in tcps {
+        r.tcp_retire(h);
+    }
+    r.pipes.clear();
     let subs: Vec<Arc<Subscriber>> = r.subs.drain().map(|(_, s)| s).collect();
     if let Some(bus) = r.bus.clone() {
         for s in subs {
@@ -2044,6 +2073,23 @@ enum HandleKind {
     Sub,
     Watch,
     Term,
+    Tcp,
+    Pipe,
+}
+
+impl HandleKind {
+    /// Cómo se nombra en un error ("handle 7 is a process, not …").
+    fn noun(self) -> &'static str {
+        match self {
+            HandleKind::Ws => "a WebSocket connection",
+            HandleKind::Proc => "a process",
+            HandleKind::Sub => "a bus subscription",
+            HandleKind::Watch => "a file watch",
+            HandleKind::Term => "the terminal",
+            HandleKind::Tcp => "a TCP connection",
+            HandleKind::Pipe => "a pipe end",
+        }
+    }
 }
 
 impl WsRegistry {
@@ -2058,6 +2104,10 @@ impl WsRegistry {
             Some(HandleKind::Watch)
         } else if matches!(&self.term, Some((th, _)) if *th == h) {
             Some(HandleKind::Term)
+        } else if self.tcps.contains_key(&h) {
+            Some(HandleKind::Tcp)
+        } else if self.pipes.contains_key(&h) {
+            Some(HandleKind::Pipe)
         } else {
             None
         }
@@ -2089,6 +2139,12 @@ impl WsRegistry {
             if *th == h {
                 return t.shared.is_ready();
             }
+        }
+        if self.tcps.contains_key(&h) {
+            return self.tcp_actionable(h);
+        }
+        if self.pipes.contains_key(&h) {
+            return self.pipe_actionable(h);
         }
         false
     }
@@ -2244,6 +2300,11 @@ impl WsRegistry {
                     }
                 }
             }
+            HandleKind::Tcp => match self.tcp_take(h, 64 * 1024)? {
+                Ok(m) => Some(Ok(tagged(m, "tcp"))),
+                Err(e) => Some(Err(format!("connection {}: {}", h, e))),
+            },
+            HandleKind::Pipe => self.pipe_take(h, 64 * 1024).map(|m| Ok(tagged(m, "pipe"))),
             HandleKind::Term => {
                 let ev = self.term.as_ref()?.1.shared.try_recv()?;
                 let mut m = SynMap::new();
@@ -2317,6 +2378,11 @@ fn select_on(
     }
     let deadline = Instant::now() + timeout;
     watch_cancel(reg, interp);
+    // v0.6.42 — el primer uso de un extremo de pipe lo adopta en este hub.
+    reg.borrow_mut().adopt_pipes(targets);
+    // v0.6.42 — bajo `serve`, mientras espera el hilo suelta su permiso de ejecución (M4). Se
+    // abre recién al tener que dormir: un evento ya listo no paga nada.
+    let mut waiting = None;
     loop {
         interp.check_cancel()?;
         let ready = reg.borrow().first_actionable(targets);
@@ -2331,6 +2397,9 @@ fn select_on(
         let all_gone = reg.borrow().all_gone(targets);
         if all_gone || Instant::now() >= deadline {
             return Ok(SynValue::Nothing);
+        }
+        if waiting.is_none() {
+            waiting = Some(synsema_core::waiting::waiting());
         }
         let mut pending = Vec::new();
         reg.borrow_mut().pump(targets, deadline, &mut pending);
@@ -2354,6 +2423,7 @@ fn proc_handle(reg: &Registry, v: Option<&SynValue>, fname: &str) -> Result<i64,
         Some(HandleKind::Sub) => Err(err(format!("{}: handle {} is a bus subscription, not a process", fname, h))),
         Some(HandleKind::Watch) => Err(err(format!("{}: handle {} is a file watch, not a process", fname, h))),
         Some(HandleKind::Term) => Err(err(format!("{}: handle {} is the terminal, not a process", fname, h))),
+        Some(k @ (HandleKind::Tcp | HandleKind::Pipe)) => Err(err(format!("{}: handle {} is {}, not a process", fname, h, k.noun()))),
         None => Err(err(format!("{}: unknown or closed process handle {}", fname, h))),
     }
 }
@@ -2366,6 +2436,7 @@ fn watch_handle(reg: &Registry, v: Option<&SynValue>, fname: &str) -> Result<i64
         Some(HandleKind::Proc) => Err(err(format!("{}: handle {} is a process, not a file watch", fname, h))),
         Some(HandleKind::Sub) => Err(err(format!("{}: handle {} is a bus subscription, not a file watch", fname, h))),
         Some(HandleKind::Term) => Err(err(format!("{}: handle {} is the terminal, not a file watch", fname, h))),
+        Some(k @ (HandleKind::Tcp | HandleKind::Pipe)) => Err(err(format!("{}: handle {} is {}, not a file watch", fname, h, k.noun()))),
         None => Err(err(format!("{}: unknown or closed watch handle {}", fname, h))),
     }
 }
@@ -2627,6 +2698,8 @@ fn proc_wait(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Res
     let h = proc_handle(reg, args.first(), F)?;
     let timeout = timeout_arg(args.get(1), F)?;
     let deadline = Instant::now() + timeout;
+    // v0.6.42 — esperar a un hijo no usa CPU: bajo `serve` el hilo suelta su permiso.
+    let _w = synsema_core::waiting::waiting();
     loop {
         interp.check_cancel()?;
         {
@@ -3111,6 +3184,8 @@ pub fn register_ws_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet
         bus: None,
         cancel_seen: 0,
         cancel_flag: None,
+        tcps: HashMap::new(),
+        pipes: HashMap::new(),
     }));
     // El hub queda alcanzable desde el intérprete (slot opaco): el motor adjunta el
     // bus (`attach_bus`) y el serve adopta sockets entrantes (`adopt_server_socket`).
@@ -3168,6 +3243,44 @@ pub fn register_ws_builtins(interp: &Interpreter, caps: Rc<RefCell<CapabilitySet
     reg_fn!("term_write", 2, term_write);
     reg_fn!("term_stats", 1, term_stats);
     reg_fn!("term_close", 1, term_close);
+
+    // -- v0.6.42: TCP saliente y pipes (entran en `select`) --
+    {
+        let reg = reg.clone();
+        interp.register_builtin("tcp_connect", -1, Rc::new(move |i, a, _l| ws_net::tcp_connect(i, a, &reg)));
+    }
+    {
+        let reg = reg.clone();
+        interp.register_builtin("tcp_send", -1, Rc::new(move |i, a, _l| ws_net::tcp_send(i, a, &reg)));
+    }
+    {
+        let reg = reg.clone();
+        interp.register_builtin("tcp_recv", -1, Rc::new(move |i, a, _l| ws_net::tcp_recv(i, a, &reg)));
+    }
+    {
+        let reg = reg.clone();
+        interp.register_builtin("tcp_close", 1, Rc::new(move |_i, a, _l| ws_net::tcp_close(a, &reg)));
+    }
+    {
+        let reg = reg.clone();
+        interp.register_builtin("tcp_stats", 1, Rc::new(move |_i, a, _l| ws_net::tcp_stats(a, &reg)));
+    }
+    {
+        let reg = reg.clone();
+        interp.register_builtin("pipe", -1, Rc::new(move |_i, a, _l| ws_net::pipe_create(a, &reg)));
+    }
+    {
+        let reg = reg.clone();
+        interp.register_builtin("pipe_send", -1, Rc::new(move |i, a, _l| ws_net::pipe_send(i, a, &reg)));
+    }
+    {
+        let reg = reg.clone();
+        interp.register_builtin("pipe_recv", -1, Rc::new(move |i, a, _l| ws_net::pipe_recv(i, a, &reg)));
+    }
+    {
+        let reg = reg.clone();
+        interp.register_builtin("pipe_close", -1, Rc::new(move |_i, a, _l| ws_net::pipe_close(a, &reg)));
+    }
 
     // -- bus de eventos (pub/sub in-process) --
     reg_fn!("bus_publish", 2, bus_publish);
