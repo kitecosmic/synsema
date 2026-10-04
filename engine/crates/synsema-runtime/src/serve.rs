@@ -1771,7 +1771,11 @@ fn with_serve_interp<R>(
     // Devolvelo al cache para el próximo request de este worker. (Si `f` paniquea, el
     // base se dropea acá sin re-insertarse → se evita reusar un intérprete corrupto; su
     // `Drop` corta el ciclo Rc del global_env. El pool atrapa el panic.)
-    SERVE_INTERPS.with(|c| c.borrow_mut().insert(key, base));
+    // v0.6.42 (auditoría B7) — un hilo EXTRA del pool es efímero: su intérprete se va con él (no
+    // se cachea; si no, 256 hilos extra serían ~5 GB de intérpretes guardados).
+    if !synsema_stdlib::server::on_extra_pool_thread() {
+        SERVE_INTERPS.with(|c| c.borrow_mut().insert(key, base));
+    }
     out
 }
 

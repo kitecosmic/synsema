@@ -29,7 +29,7 @@ fn a_route_that_waits_does_not_hold_the_pool() {
     std::env::set_var("SYNSEMA_SERVE_WORKERS", "2");
     let port = free_port();
     let prog = format!(
-        "require serve({p})\nrequire time\nserve on {p}\n    route \"GET /slow\"\n        sleep(2)\n        give \"slow\"\n    route \"GET /fast\"\n        give \"fast\"\n",
+        "require serve({p})\nrequire time\nserve on {p}\n    route \"GET /slow\"\n        sleep(2)\n        give \"slow\"\n    route \"GET /fast\"\n        give \"fast\"\n    route \"GET /cut\"\n        timeout 1\n        sleep(5)\n        give \"never\"\n",
         p = port
     );
     thread::spawn(move || {
@@ -60,4 +60,10 @@ fn a_route_that_waits_does_not_hold_the_pool() {
     }
     let all = t0.elapsed();
     assert!(all < Duration::from_millis(4500), "las rutas que esperan no corrieron a la vez: {:?}", all);
+
+    // Un `timeout` de ruta sigue cortando una ruta que espera (aunque haya soltado su permiso).
+    let t = Instant::now();
+    let (status, _) = get(port, "/cut");
+    assert_eq!(status, 504);
+    assert!(t.elapsed() < Duration::from_millis(3000), "el timeout no cortó la espera: {:?}", t.elapsed());
 }

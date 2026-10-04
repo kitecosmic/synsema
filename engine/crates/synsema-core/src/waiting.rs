@@ -64,6 +64,37 @@ impl Drop for Waiting {
     }
 }
 
+/// Guard de una sección que vuelve a USAR CPU dentro de una espera (el callback de un stream
+/// HTTP que corre código del usuario, una task de `on_reconnect`): retoma el permiso mientras
+/// corre y lo vuelve a soltar al terminar. Fuera de una espera no hace nada.
+#[must_use = "la sección dura lo que vive el guard: `let _r = resumed();`"]
+pub struct Resumed {
+    hook: Option<WaitHook>,
+}
+
+/// Abre una sección que usa CPU dentro de una espera (ver `Resumed`).
+#[inline]
+pub fn resumed() -> Resumed {
+    let hook = HOOK.with(|h| h.get());
+    let inside = DEPTH.with(|d| d.get() > 0);
+    match hook {
+        Some(f) if inside => {
+            f(false);
+            Resumed { hook: Some(f) }
+        }
+        _ => Resumed { hook: None },
+    }
+}
+
+impl Drop for Resumed {
+    #[inline]
+    fn drop(&mut self) {
+        if let Some(f) = self.hook {
+            f(true);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

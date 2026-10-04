@@ -458,7 +458,12 @@ pub fn http_request_stream(
     let mut decoder = ChunkDecoder::new();
     let mut push = |raw: &[u8], on_data: &mut dyn FnMut(&[u8]) -> bool| -> bool {
         let bytes = if chunked { decoder.feed(raw) } else { raw.to_vec() };
-        bytes.is_empty() || on_data(&bytes)
+        // El callback puede correr código del usuario (un `llm_stream` con su task): mientras
+        // corre, vuelve a contar contra la CPU del pool (sección inversa de la espera).
+        bytes.is_empty() || {
+            let _r = synsema_core::waiting::resumed();
+            on_data(&bytes)
+        }
     };
     if !push(&leftover, on_data) {
         return Ok((status, resp_headers));

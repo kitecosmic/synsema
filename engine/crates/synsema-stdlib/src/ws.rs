@@ -1608,6 +1608,8 @@ fn run_pending(interp: &mut Interpreter, reg: &Registry, pending: Vec<PendingRec
     for p in pending {
         // Sólo si la conexión sigue existiendo (no la cerró el usuario en el ínterin).
         if reg.borrow().conns.contains_key(&p.handle) {
+            // La task del usuario corre con permiso de CPU aunque estemos dentro de una espera.
+            let _r = synsema_core::waiting::resumed();
             interp.call_task(p.task, vec![syn_int(p.handle)])?;
         }
     }

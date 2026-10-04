@@ -1972,27 +1972,40 @@ type InterpJob = Box<dyn FnOnce() + Send + 'static>;
 
 /// v0.6.42 (M4) — el pool como **permisos de ejecución + hilos elásticos** (el `handoff` del
 /// planificador de Go ante una syscall bloqueante; los hilos virtuales de Java 21 resuelven lo
-/// mismo). `workers` permisos acotan la CPU como siempre; un hilo que ESPERA (un `sleep`, un
-/// `wait_for`, una llamada HTTP o al LLM, un `select`: `synsema_core::waiting`) suelta su permiso
-/// mientras espera, y si hay requests en cola, ningún hilo libre y alguno esperando, el pool crea
-/// otro hilo hasta `SYNSEMA_SERVE_MAX_WAITING` extra. Al volver, el hilo recupera un permiso (la
-/// CPU sigue acotada). Los hilos extra que quedan ociosos 60 s terminan: en reposo el pool es
-/// exactamente el de antes, y una ruta con long polling ya no deja al resto en cola.
+/// mismo). `workers` permisos acotan la CPU; un hilo que ESPERA (un `sleep`, un `wait_for`, una
+/// llamada HTTP o al LLM, un `select`, una base de red: `synsema_core::waiting`) suelta su permiso
+/// mientras espera, y si hay jobs en cola, ningún hilo libre y CPU libre, el pool crea un hilo
+/// EXTRA (hasta `SYNSEMA_SERVE_MAX_WAITING`).
+///
+/// Reglas que salen de la auditoría de v0.6.42:
+/// - **Volver de una espera nunca bloquea.** El hilo retoma su permiso "a crédito" (`permits` puede
+///   quedar negativo) y los jobs NUEVOS esperan a que se salde. Así no hay deadlock con un lock
+///   tomado durante la espera (el mutex de una base: B1), y el que vuelve no compite con los
+///   jobs nuevos (no termina en 504 bajo carga). La CPU queda acotada en régimen.
+/// - **Crecer sólo con CPU libre** (`permits > 0`): una ruta esperando no infla el pool (B7).
+/// - **Los hilos extra son efímeros**: toman jobs mientras haya cola y terminan apenas no hay; no
+///   cachean su intérprete (`on_extra_pool_thread`). En reposo el pool es el de antes.
 struct InterpreterPool {
     tx: std::sync::mpsc::Sender<InterpJob>,
-    rx: Arc<Mutex<std::sync::mpsc::Receiver<InterpJob>>>,
-    state: Arc<(Mutex<PoolState>, std::sync::Condvar)>,
-    base: usize,
+    shared: Arc<PoolShared>,
+}
+
+/// Lo que comparten el pool y sus hilos (y el gancho de espera de cada hilo).
+struct PoolShared {
+    rx: Mutex<std::sync::mpsc::Receiver<InterpJob>>,
+    state: Mutex<PoolState>,
+    cv: std::sync::Condvar,
     max_threads: usize,
 }
 
 #[derive(Default)]
 struct PoolState {
-    /// Permisos de ejecución libres (empieza en `base`).
-    permits: usize,
-    /// Hilos vivos del pool.
+    /// Permisos de ejecución libres (empieza en `workers`; negativo = deuda de hilos que volvieron
+    /// de una espera sin permiso libre).
+    permits: isize,
+    /// Hilos vivos del pool (fijos + extra).
     threads: usize,
-    /// Hilos esperando un job (bloqueados en la cola).
+    /// Hilos fijos esperando un job en la cola.
     idle: usize,
     /// Hilos dentro de una sección de espera (sin permiso).
     waiting: usize,
@@ -2002,94 +2015,88 @@ struct PoolState {
 
 /// Default del techo de hilos extra (`SYNSEMA_SERVE_MAX_WAITING`).
 const DEFAULT_MAX_WAITING: usize = 256;
-/// Un hilo extra ocioso más que esto termina.
-const EXTRA_IDLE: Duration = Duration::from_secs(60);
+
+thread_local! {
+    static EXTRA_POOL_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// El pool al que pertenece este hilo (lo usa el gancho de espera).
+    static THREAD_POOL: std::cell::RefCell<Option<Arc<PoolShared>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// ¿Este hilo es un hilo EXTRA del pool? El runtime no cachea su intérprete (se va con el hilo).
+pub fn on_extra_pool_thread() -> bool {
+    EXTRA_POOL_THREAD.with(|c| c.get())
+}
 
 /// Gancho de espera de los hilos del pool (lo instala cada worker; ver `synsema_core::waiting`).
 fn pool_wait_hook(waiting: bool) {
-    if let Some(p) = INTERP_POOL.get() {
-        p.on_wait(waiting);
+    let pool = THREAD_POOL.with(|p| p.borrow().clone());
+    if let Some(p) = pool {
+        PoolShared::on_wait(&p, waiting);
     }
 }
 
-impl InterpreterPool {
-    fn new(workers: usize, max_waiting: usize) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<InterpJob>();
-        let pool = InterpreterPool {
-            tx,
-            rx: Arc::new(Mutex::new(rx)),
-            state: Arc::new((
-                Mutex::new(PoolState { permits: workers, ..Default::default() }),
-                std::sync::Condvar::new(),
-            )),
-            base: workers,
-            max_threads: workers + max_waiting,
-        };
-        for _ in 0..workers {
-            pool.spawn_worker();
-        }
-        pool
+impl PoolShared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, PoolState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn spawn_worker(&self) {
-        let (rx, state, base) = (self.rx.clone(), self.state.clone(), self.base);
-        {
-            let mut st = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    /// ¿Hace falta otro hilo? Hay jobs que ningún hilo libre va a tomar, algún hilo está
+    /// esperando I/O y por eso hay CPU libre (su permiso), y no se llegó al techo. Sin esperas los
+    /// fijos alcanzan; con la CPU toda ocupada, más hilos no ayudan: la cola espera, como siempre.
+    fn needs_thread(&self, st: &PoolState) -> bool {
+        st.queued > st.idle && st.waiting > 0 && st.permits > 0 && st.threads < self.max_threads
+    }
+
+    fn spawn_worker(me: &Arc<PoolShared>, extra: bool) {
+        let n = {
+            let mut st = me.lock();
             st.threads += 1;
-        }
-        let n = state.0.lock().map(|s| s.threads).unwrap_or(0);
+            st.threads
+        };
+        let shared = me.clone();
         let spawned = std::thread::Builder::new()
-            .name(format!("synsema-interp-{}", n))
+            .name(format!("synsema-interp-{}{}", n, if extra { "x" } else { "" }))
             .stack_size(SERVE_STACK_SIZE)
             .spawn(move || {
                 synsema_core::waiting::set_thread_hook(Some(pool_wait_hook));
+                EXTRA_POOL_THREAD.with(|c| c.set(extra));
+                THREAD_POOL.with(|p| *p.borrow_mut() = Some(shared.clone()));
                 loop {
-                    {
-                        let mut st = state.0.lock().unwrap_or_else(|e| e.into_inner());
-                        st.idle += 1;
-                    }
-                    // El lock de la cola se sostiene sólo durante el `recv` (handoff instantáneo);
-                    // el job corre fuera del lock → los workers ejecutan en paralelo. Un hilo extra
-                    // (más allá de `base`) espera con plazo y se retira si no llega trabajo.
-                    let job = {
-                        let guard = match rx.lock() {
-                            Ok(g) => g,
-                            Err(_) => return,
+                    // Un fijo espera en la cola; un extra toma lo que haya y si no hay, termina.
+                    let job = if extra {
+                        let got = match shared.rx.lock() {
+                            Ok(g) => g.try_recv().ok(),
+                            Err(_) => None,
                         };
-                        let extra = state.0.lock().map(|s| s.threads > base).unwrap_or(false);
-                        if extra {
-                            guard.recv_timeout(EXTRA_IDLE).map_err(|e| matches!(e, std::sync::mpsc::RecvTimeoutError::Timeout))
-                        } else {
-                            guard.recv().map_err(|_| false)
+                        match got {
+                            Some(j) => j,
+                            None => {
+                                shared.lock().threads -= 1;
+                                return;
+                            }
                         }
-                    };
-                    let job = {
-                        let mut st = state.0.lock().unwrap_or_else(|e| e.into_inner());
+                    } else {
+                        shared.lock().idle += 1;
+                        let got = match shared.rx.lock() {
+                            Ok(g) => g.recv().ok(),
+                            Err(_) => None,
+                        };
+                        let mut st = shared.lock();
                         st.idle -= 1;
-                        match job {
-                            Ok(j) => {
-                                st.queued = st.queued.saturating_sub(1);
-                                j
-                            }
-                            Err(timed_out) => {
-                                if timed_out && st.threads > base {
-                                    st.threads -= 1;
-                                    return; // hilo extra ocioso: el pool vuelve a su tamaño
-                                }
-                                if !timed_out {
-                                    st.threads -= 1;
-                                    return; // canal cerrado: el proceso termina
-                                }
-                                continue;
+                        match got {
+                            Some(j) => j,
+                            None => {
+                                st.threads -= 1;
+                                return; // canal cerrado: el proceso termina
                             }
                         }
                     };
-                    // Un permiso de ejecución por job (la CPU queda acotada a `base`).
+                    // Un permiso por job: los nuevos esperan a que se salde la deuda.
                     {
-                        let (lock, cv) = &*state;
-                        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
-                        while st.permits == 0 {
-                            st = cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                        let mut st = shared.lock();
+                        st.queued = st.queued.saturating_sub(1);
+                        while st.permits <= 0 {
+                            st = shared.cv.wait(st).unwrap_or_else(|e| e.into_inner());
                         }
                         st.permits -= 1;
                     }
@@ -2097,61 +2104,166 @@ impl InterpreterPool {
                     // canales del job se dropean y el lado async responde 500. Seguimos.
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
                     {
-                        let (lock, cv) = &*state;
-                        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut st = shared.lock();
                         st.permits += 1;
-                        cv.notify_one();
+                        shared.cv.notify_one();
                     }
                 }
             });
         if spawned.is_err() {
-            let mut st = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
-            st.threads -= 1;
-        }
-    }
-
-    /// ¿Hace falta otro hilo? Sí si hay jobs que ningún hilo libre va a tomar y algún hilo está
-    /// esperando I/O (su permiso quedó libre). Si todos corren CPU, más hilos no ayudan: la cola
-    /// espera, como siempre.
-    fn needs_thread(&self, st: &PoolState) -> bool {
-        st.queued > st.idle && st.waiting > 0 && st.threads < self.max_threads
-    }
-
-    fn submit(&self, job: InterpJob) {
-        let grow = {
-            let mut st = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
-            st.queued += 1;
-            self.needs_thread(&st)
-        };
-        let _ = self.tx.send(job);
-        if grow {
-            self.spawn_worker();
+            me.lock().threads -= 1;
         }
     }
 
     /// El gancho: `true` = este hilo empieza a esperar (suelta su permiso); `false` = terminó
-    /// (recupera uno; puede esperar un instante si la CPU está toda ocupada).
-    fn on_wait(&self, waiting: bool) {
-        let (lock, cv) = &*self.state;
-        if waiting {
-            let grow = {
-                let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+    /// (lo retoma a crédito, sin bloquear nunca).
+    fn on_wait(me: &Arc<PoolShared>, waiting: bool) {
+        let grow = {
+            let mut st = me.lock();
+            if waiting {
                 st.waiting += 1;
                 st.permits += 1;
-                cv.notify_one();
-                self.needs_thread(&st)
-            };
-            if grow {
-                self.spawn_worker();
+                me.cv.notify_one();
+                me.needs_thread(&st)
+            } else {
+                st.waiting = st.waiting.saturating_sub(1);
+                st.permits -= 1;
+                false
             }
-        } else {
-            let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
-            st.waiting = st.waiting.saturating_sub(1);
-            while st.permits == 0 {
-                st = cv.wait(st).unwrap_or_else(|e| e.into_inner());
-            }
-            st.permits -= 1;
+        };
+        if grow {
+            PoolShared::spawn_worker(me, true);
         }
+    }
+}
+
+impl InterpreterPool {
+    fn new(workers: usize, max_waiting: usize) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<InterpJob>();
+        let shared = Arc::new(PoolShared {
+            rx: Mutex::new(rx),
+            state: Mutex::new(PoolState { permits: workers as isize, ..Default::default() }),
+            cv: std::sync::Condvar::new(),
+            max_threads: workers + max_waiting,
+        });
+        for _ in 0..workers {
+            PoolShared::spawn_worker(&shared, false);
+        }
+        InterpreterPool { tx, shared }
+    }
+
+    fn submit(&self, job: InterpJob) {
+        let grow = {
+            let mut st = self.shared.lock();
+            st.queued += 1;
+            self.shared.needs_thread(&st)
+        };
+        let _ = self.tx.send(job);
+        if grow {
+            PoolShared::spawn_worker(&self.shared, true);
+        }
+    }
+
+    #[cfg(test)]
+    fn threads(&self) -> usize {
+        self.shared.lock().threads
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn wait_all(rx: &std::sync::mpsc::Receiver<()>, n: usize, secs: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        for _ in 0..n {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if rx.recv_timeout(left).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// B1 de la auditoría: con 2 permisos, 3 jobs que esperan I/O CON un lock compartido tomado
+    /// (el mutex de una base de red). Antes, el que volvía de esperar bloqueaba pidiendo permiso
+    /// con el lock en la mano y los demás esperaban el lock con su permiso: deadlock.
+    #[test]
+    fn waiting_with_a_shared_lock_held_never_deadlocks() {
+        let pool = InterpreterPool::new(2, 16);
+        let db = Arc::new(Mutex::new(0u32));
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..5 {
+            let (db, tx) = (db.clone(), tx.clone());
+            pool.submit(Box::new(move || {
+                let mut g = db.lock().unwrap();
+                {
+                    let _w = synsema_core::waiting::waiting();
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                *g += 1;
+                let _ = tx.send(());
+            }));
+        }
+        assert!(wait_all(&rx, 5, 10), "deadlock: los jobs no terminaron");
+        assert_eq!(*db.lock().unwrap(), 5);
+    }
+
+    /// La CPU queda acotada a los permisos: 8 jobs de CPU pura, nunca más de 2 a la vez.
+    #[test]
+    fn cpu_work_stays_within_the_permits() {
+        let pool = InterpreterPool::new(2, 16);
+        let (now, max) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..8 {
+            let (now, max, tx) = (now.clone(), max.clone(), tx.clone());
+            pool.submit(Box::new(move || {
+                let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+                max.fetch_max(n, Ordering::SeqCst);
+                let t = Instant::now();
+                while t.elapsed() < Duration::from_millis(30) {
+                    std::hint::spin_loop();
+                }
+                now.fetch_sub(1, Ordering::SeqCst);
+                let _ = tx.send(());
+            }));
+        }
+        assert!(wait_all(&rx, 8, 10));
+        assert!(max.load(Ordering::SeqCst) <= 2, "corrieron {} a la vez", max.load(Ordering::SeqCst));
+        assert_eq!(pool.threads(), 2, "sin esperas no se crean hilos extra");
+    }
+
+    /// Una espera larga con jobs nuevos detrás: crecen los hilos justos, y al vaciarse la cola
+    /// los extra se van (en reposo el pool vuelve a su tamaño).
+    #[test]
+    fn extra_threads_appear_while_others_wait_and_then_retire() {
+        let pool = InterpreterPool::new(1, 16);
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let tx = tx.clone();
+            pool.submit(Box::new(move || {
+                let _w = synsema_core::waiting::waiting();
+                std::thread::sleep(Duration::from_millis(400));
+                let _ = tx.send(());
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let t = Instant::now();
+        for _ in 0..3 {
+            let tx = tx.clone();
+            pool.submit(Box::new(move || {
+                let _ = tx.send(());
+            }));
+        }
+        assert!(wait_all(&rx, 3, 5), "los jobs nuevos no corrieron");
+        assert!(t.elapsed() < Duration::from_millis(300), "esperaron a la espera larga: {:?}", t.elapsed());
+        assert!(wait_all(&rx, 1, 5));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while pool.threads() > 1 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(pool.threads(), 1, "los hilos extra no se retiraron");
     }
 }
 
