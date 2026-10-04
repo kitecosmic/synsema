@@ -325,29 +325,31 @@ impl CertManager {
                     ch.set_ready().await.map_err(|e| format!("ACME set challenge ready failed: {}", e))?;
                     continue;
                 }
-                // TLS-ALPN-01 (no depende del :80); si la CA no lo ofrece, HTTP-01 con el :80.
-                if authz.challenges.iter().any(|c| c.r#type == ChallengeType::TlsAlpn01) {
-                    let mut ch = authz.challenge(ChallengeType::TlsAlpn01).expect("ofrecido");
-                    let digest = ch.key_authorization().digest().as_ref().to_vec();
-                    let ck = alpn_challenge_cert(&base, &digest)?;
-                    if let Ok(mut a) = self.alpn.write() {
-                        a.insert(base.to_ascii_lowercase(), Arc::new(ck));
+                // HTTP-01 si está el listener de :80 (en `serve` siempre: también vale al arrancar,
+                // antes de que el HTTPS acepte conexiones); si no, TLS-ALPN-01 desde el mismo
+                // resolver (necesita el HTTPS ya sirviendo: la emisión bajo demanda).
+                let offers = |t: ChallengeType| authz.challenges.iter().any(|c| c.r#type == t);
+                if let (Some(store), true) = (self.opts.http_store.clone(), offers(ChallengeType::Http01)) {
+                    let mut ch = authz.challenge(ChallengeType::Http01).expect("ofrecido");
+                    if let Ok(mut s) = store.lock() {
+                        s.insert(ch.token.clone(), ch.key_authorization().as_str().to_string());
                     }
-                    alpn_names.push(base.to_ascii_lowercase());
                     ch.set_ready().await.map_err(|e| format!("ACME set challenge ready failed: {}", e))?;
                     continue;
                 }
-                let store = self
-                    .opts
-                    .http_store
-                    .clone()
-                    .ok_or_else(|| format!("{}: the CA offered neither TLS-ALPN-01 nor DNS-01 and there is no :80 listener for HTTP-01", ident))?;
-                let mut ch = authz
-                    .challenge(ChallengeType::Http01)
-                    .ok_or_else(|| format!("{}: the CA offered no usable challenge", ident))?;
-                if let Ok(mut s) = store.lock() {
-                    s.insert(ch.token.clone(), ch.key_authorization().as_str().to_string());
+                if !offers(ChallengeType::TlsAlpn01) {
+                    return Err(format!(
+                        "{}: no usable challenge (no :80 listener for HTTP-01 and the CA offered no TLS-ALPN-01)",
+                        ident
+                    ));
                 }
+                let mut ch = authz.challenge(ChallengeType::TlsAlpn01).expect("ofrecido");
+                let digest = ch.key_authorization().digest().as_ref().to_vec();
+                let ck = alpn_challenge_cert(&base, &digest)?;
+                if let Ok(mut a) = self.alpn.write() {
+                    a.insert(base.to_ascii_lowercase(), Arc::new(ck));
+                }
+                alpn_names.push(base.to_ascii_lowercase());
                 ch.set_ready().await.map_err(|e| format!("ACME set challenge ready failed: {}", e))?;
             }
             let status = order
