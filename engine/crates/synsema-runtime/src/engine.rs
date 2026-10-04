@@ -1347,14 +1347,19 @@ pub fn run_program_ceiled_opts(
     // v0.6.42 (auditoría) — `exit(code)` termina el programa: los agentes vivos se detienen (si
     // no, `wait_all` esperaba a uno en bucle para siempre) y el código lo decide `exit`.
     let exited = last_run_exit_code().is_some();
-    if exited {
-        swarm.stop_all_agents("exit()");
-    }
+    // Los que `exit` detuvo: su error es la cancelación y no se informa. Un agente que ya había
+    // fallado antes del `exit` sí (auditoría ronda 2: se descartaban todos).
+    let stopped: std::collections::HashSet<String> = if exited {
+        swarm.agents_info().into_iter().map(|(id, _)| id).filter(|id| swarm.stop_agent(id, "exit()")).collect()
+    } else {
+        Default::default()
+    };
     // Joinea los agentes lanzados por el main; ya no hay nadie más que pueda spawnear.
     swarm.wait_all();
 
     // Refleja los agentes en ERROR (exit ≠0 + línea de error), sin tocar la salida del main.
-    let agent_errors = if exited { Vec::new() } else { collect_agent_errors(&swarm) };
+    let mut agent_errors = collect_agent_errors(&swarm);
+    agent_errors.retain(|line| !stopped.iter().any(|id| line.starts_with(&format!("Agent error [{}]:", id))));
     if !agent_errors.is_empty() {
         result.success = false;
         result.errors.extend(agent_errors);

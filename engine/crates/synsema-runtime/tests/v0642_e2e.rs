@@ -534,6 +534,76 @@ Connection: close
     assert!(resp.ends_with(&format!("got {}", 1024 * 1024)), "{}", resp);
 }
 
+/// Un upstream de una sola respuesta fija (y uno que nunca contesta, con `None`).
+fn fixed_upstream(answer: Option<&'static str>) -> u16 {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut h = String::new();
+                    if reader.read_line(&mut h).unwrap_or(0) == 0 || h.trim().is_empty() {
+                        break;
+                    }
+                }
+                let mut s = stream;
+                match answer {
+                    Some(a) => {
+                        let _ = s.write_all(a.as_bytes());
+                    }
+                    None => thread::sleep(Duration::from_secs(30)),
+                }
+            });
+        }
+    });
+    port
+}
+
+/// Auditoría ronda 2: las cabeceras que el upstream nombra en su `Connection:` no llegan al
+/// cliente (hop-by-hop, como en la request); y un upstream mudo da 504 al vencer el plazo de
+/// inactividad de la ruta, no cuelga.
+#[test]
+fn the_proxy_drops_connection_named_response_headers_and_times_out_a_mute_upstream() {
+    let hop = fixed_upstream(Some(
+        "HTTP/1.1 200 OK
+Connection: close, X-Hop-Secret
+X-Hop-Secret: 1
+X-Keep: 1
+Content-Length: 2
+
+ok",
+    ));
+    let mute = fixed_upstream(None);
+    let port = free_port();
+    let prog = format!(
+        "require serve({p})
+require net(\"127.0.0.1:{hop}\")
+require net(\"127.0.0.1:{mute}\")
+serve on {p}
+    route \"GET /hop\"
+        proxy to \"http://127.0.0.1:{hop}\" + \"\"
+    route \"GET /mute\"
+        timeout 1
+        proxy to \"http://127.0.0.1:{mute}\" + \"\"
+",
+        p = port,
+        hop = hop,
+        mute = mute
+    );
+    start(prog, port);
+    let (status, head, body) = get(port, "/hop", "");
+    assert_eq!(status, 200, "{}", body);
+    let head = head.to_ascii_lowercase();
+    assert!(head.contains("x-keep: 1"), "{}", head);
+    assert!(!head.contains("x-hop-secret"), "una cabecera hop-by-hop llegó al cliente: {}", head);
+    let t0 = Instant::now();
+    let (status, _, body) = get(port, "/mute", "");
+    assert_eq!(status, 504, "{}", body);
+    assert!(t0.elapsed() < Duration::from_secs(8), "{:?}", t0.elapsed());
+}
+
 #[test]
 fn two_host_headers_are_a_bad_request() {
     let port = free_port();
@@ -617,4 +687,31 @@ fn exit_stops_live_agents_instead_of_hanging() {
     assert_eq!(r.output, vec!["main"]);
     assert!(r.errors.is_empty(), "{:?}", r.errors);
     assert_eq!(code, Some(3));
+}
+
+/// Auditoría ronda 2: `exit` no informa la cancelación de los agentes que detiene, pero sí el
+/// error de uno que ya había fallado antes.
+#[test]
+fn exit_keeps_the_error_of_an_agent_that_failed_before_it() {
+    let _g = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let src = "require time
+agent Broken
+    let x be [1][5]
+agent Forever
+    while true
+        sleep(0.05)
+spawn Broken
+spawn Forever
+sleep(0.5)
+exit(3)
+";
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let r = run(src);
+        let _ = tx.send((r, synsema_runtime::engine::last_run_exit_code()));
+    });
+    let (r, code) = rx.recv_timeout(Duration::from_secs(20)).expect("exit se colgó");
+    assert_eq!(code, Some(3));
+    assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+    assert!(r.errors[0].contains("Broken"), "{:?}", r.errors);
 }

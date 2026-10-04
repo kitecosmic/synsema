@@ -2013,6 +2013,9 @@ struct PoolState {
     threads: usize,
     /// Hilos fijos esperando un job en la cola.
     idle: usize,
+    /// Hilos extra creados que todavía no miraron la cola (cuentan como libres: sin esto, cada
+    /// `submit` mientras arrancan creaba otro).
+    starting: usize,
     /// Hilos dentro de una sección de espera (sin permiso).
     waiting: usize,
     /// Jobs encolados que nadie tomó todavía.
@@ -2050,15 +2053,24 @@ impl PoolShared {
     /// esperando I/O y por eso hay CPU libre (su permiso), y no se llegó al techo. Sin esperas los
     /// fijos alcanzan; con la CPU toda ocupada, más hilos no ayudan: la cola espera, como siempre.
     fn needs_thread(&self, st: &PoolState) -> bool {
-        st.queued > st.idle && st.waiting > 0 && st.permits > 0 && st.threads < self.max_threads
+        st.queued > st.idle + st.starting && st.waiting > 0 && st.permits > 0 && st.threads < self.max_threads
     }
 
-    fn spawn_worker(me: &Arc<PoolShared>, extra: bool) {
-        let n = {
-            let mut st = me.lock();
+    /// Decide y reserva bajo el MISMO lock (auditoría ronda 2: entre `needs_thread` y
+    /// `threads += 1` otro hilo podía decidir lo mismo y pasar el techo).
+    fn reserve_extra(&self, st: &mut PoolState) -> bool {
+        if self.needs_thread(st) {
             st.threads += 1;
-            st.threads
-        };
+            st.starting += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Arranca un hilo ya reservado (`threads` ya lo cuenta; un extra, también `starting`).
+    fn spawn_worker(me: &Arc<PoolShared>, extra: bool) {
+        let n = me.lock().threads;
         let shared = me.clone();
         let spawned = std::thread::Builder::new()
             .name(format!("synsema-interp-{}{}", n, if extra { "x" } else { "" }))
@@ -2067,19 +2079,15 @@ impl PoolShared {
                 synsema_core::waiting::set_thread_hook(Some(pool_wait_hook));
                 EXTRA_POOL_THREAD.with(|c| c.set(extra));
                 THREAD_POOL.with(|p| *p.borrow_mut() = Some(shared.clone()));
+                let mut first = extra;
                 loop {
                     // Un fijo espera en la cola; un extra toma lo que haya y si no hay, termina.
                     let job = if extra {
-                        let got = match shared.rx.lock() {
-                            Ok(g) => g.try_recv().ok(),
-                            Err(_) => None,
-                        };
-                        match got {
+                        let job = PoolShared::extra_take(&shared, first);
+                        first = false;
+                        match job {
                             Some(j) => j,
-                            None => {
-                                shared.lock().threads -= 1;
-                                return;
-                            }
+                            None => return,
                         }
                     } else {
                         shared.lock().idle += 1;
@@ -2117,7 +2125,41 @@ impl PoolShared {
                 }
             });
         if spawned.is_err() {
-            me.lock().threads -= 1;
+            let mut st = me.lock();
+            st.threads -= 1;
+            if extra {
+                st.starting = st.starting.saturating_sub(1);
+            }
+        }
+    }
+
+    /// El próximo job de un hilo extra, o `None` si se retira. No se bloquea en el canal (un fijo
+    /// lo tiene tomado en `recv` mientras espera: con el servidor quieto el extra quedaba colgado
+    /// ahí) y se retira sólo bajo el lock de estado y sin cola: un `submit` que llega después ya
+    /// no lo cuenta y crea otro si hace falta (el job no queda sin hilo).
+    fn extra_take(me: &Arc<PoolShared>, first: bool) -> Option<InterpJob> {
+        if first {
+            let mut st = me.lock();
+            st.starting = st.starting.saturating_sub(1);
+        }
+        loop {
+            let got = match me.rx.try_lock() {
+                Ok(g) => g.try_recv().ok(),
+                Err(_) => None,
+            };
+            if got.is_some() {
+                return got;
+            }
+            {
+                let mut st = me.lock();
+                if st.queued == 0 {
+                    st.threads -= 1;
+                    return None;
+                }
+            }
+            // Hay cola pero el canal está tomado (un fijo a punto de recibir) o el job todavía
+            // no llegó al canal (`submit` cuenta antes de mandar): reintentar enseguida.
+            std::thread::sleep(Duration::from_micros(200));
         }
     }
 
@@ -2130,7 +2172,7 @@ impl PoolShared {
                 st.waiting += 1;
                 st.permits += 1;
                 me.cv.notify_one();
-                me.needs_thread(&st)
+                me.reserve_extra(&mut st)
             } else {
                 st.waiting = st.waiting.saturating_sub(1);
                 st.permits -= 1;
@@ -2153,6 +2195,7 @@ impl InterpreterPool {
             max_threads: workers + max_waiting,
         });
         for _ in 0..workers {
+            shared.lock().threads += 1;
             PoolShared::spawn_worker(&shared, false);
         }
         InterpreterPool { tx, shared }
@@ -2162,7 +2205,7 @@ impl InterpreterPool {
         let grow = {
             let mut st = self.shared.lock();
             st.queued += 1;
-            self.shared.needs_thread(&st)
+            self.shared.reserve_extra(&mut st)
         };
         let _ = self.tx.send(job);
         if grow {
@@ -2270,6 +2313,53 @@ mod pool_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(pool.threads(), 1, "los hilos extra no se retiraron");
+    }
+
+    /// Auditoría ronda 2: con W=2, un fijo ocioso (bloqueado en `recv`, con el canal tomado) y el
+    /// otro esperando I/O, los extras que corren la ráfaga se retiran igual al vaciarse la cola
+    /// (antes quedaban bloqueados en `rx.lock()` hasta el próximo job), y nunca pasan el techo
+    /// aunque muchos `submit` lleguen juntos.
+    #[test]
+    fn extras_retire_with_an_idle_fixed_worker_and_never_pass_the_cap() {
+        let pool = Arc::new(InterpreterPool::new(2, 3));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let peak = Arc::new(AtomicUsize::new(0));
+        {
+            let tx = tx.clone();
+            pool.submit(Box::new(move || {
+                let _w = synsema_core::waiting::waiting();
+                std::thread::sleep(Duration::from_millis(600));
+                let _ = tx.send(());
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        // Ráfaga desde varios hilos a la vez: cada job espera un poco (así crecen los extras).
+        let senders: Vec<_> = (0..4)
+            .map(|_| {
+                let (pool, tx, peak) = (pool.clone(), tx.clone(), peak.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..5 {
+                        let (tx, peak, p2) = (tx.clone(), peak.clone(), pool.clone());
+                        pool.submit(Box::new(move || {
+                            peak.fetch_max(p2.threads(), Ordering::SeqCst);
+                            let _w = synsema_core::waiting::waiting();
+                            std::thread::sleep(Duration::from_millis(20));
+                            let _ = tx.send(());
+                        }));
+                    }
+                })
+            })
+            .collect();
+        for s in senders {
+            s.join().unwrap();
+        }
+        assert!(wait_all(&rx, 21, 10), "no corrieron todos los jobs");
+        assert!(peak.load(Ordering::SeqCst) <= 5, "pasó el techo (2 + 3): {}", peak.load(Ordering::SeqCst));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while pool.threads() > 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(pool.threads(), 2, "los extras no se retiraron con el servidor quieto");
     }
 }
 
@@ -3342,16 +3432,24 @@ async fn proxy_request(
             }
             "content-length" | "forwarded" => continue,
             // v0.6.42 — sólo sobreviven si los trajo un proxy de confianza (`resolve_forwarded`).
+            // Repetidos: el esquema y el host, el PRIMERO (como `base_url` y el resto del
+            // server); la cadena de `X-Forwarded-For`, todos unidos (como `resolve_forwarded`).
             "x-forwarded-proto" => {
-                fwd_proto = Some(v.clone());
+                fwd_proto.get_or_insert_with(|| v.clone());
                 continue;
             }
             "x-forwarded-host" => {
-                fwd_host = Some(v.clone());
+                fwd_host.get_or_insert_with(|| v.clone());
                 continue;
             }
             "x-forwarded-for" => {
-                fwd_for = Some(v.clone());
+                let v = v.trim();
+                if !v.is_empty() {
+                    fwd_for = Some(match fwd_for.take() {
+                        Some(prev) => format!("{}, {}", prev, v),
+                        None => v.to_string(),
+                    });
+                }
                 continue;
             }
             // En un upgrade WebSocket, `Upgrade` y `Sec-WebSocket-*` cruzan tal cual.
@@ -3500,10 +3598,19 @@ async fn proxy_request(
         });
     }
 
-    // Respuesta normal: status + headers end-to-end + body en streaming.
+    // Respuesta normal: status + headers end-to-end + body en streaming. Los que el upstream
+    // nombra en su `Connection:` también son hop-by-hop (RFC 9110 §7.6.1), como en la request.
+    let resp_conn_named: Vec<String> = resp
+        .headers()
+        .get_all(hyper::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(',').map(|t| t.trim().to_ascii_lowercase()).collect::<Vec<_>>())
+        .filter(|t| !t.is_empty())
+        .collect();
     let mut builder = Response::builder().status(status);
     for (k, v) in resp.headers() {
-        if is_hop_by_hop(k.as_str()) {
+        if is_hop_by_hop(k.as_str()) || resp_conn_named.iter().any(|n| n == k.as_str()) {
             continue;
         }
         builder = builder.header(k.clone(), v.clone());

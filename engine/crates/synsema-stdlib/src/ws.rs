@@ -1625,6 +1625,8 @@ fn ws_recv(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Resul
     }
     let deadline = Instant::now() + timeout;
     watch_cancel(reg, interp);
+    // Bajo `serve`, mientras duerme suelta su permiso de ejecución (como `select`).
+    let mut waiting = None;
     loop {
         interp.check_cancel()?;
         // ¿Ya hay algo? entregarlo.
@@ -1640,6 +1642,9 @@ fn ws_recv(interp: &mut Interpreter, args: &[SynValue], reg: &Registry) -> Resul
         }
         if Instant::now() >= deadline {
             return Ok(SynValue::Nothing);
+        }
+        if waiting.is_none() {
+            waiting = Some(synsema_core::waiting::waiting());
         }
         let mut pending = Vec::new();
         reg.borrow_mut().pump(&[handle], deadline, &mut pending);

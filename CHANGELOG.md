@@ -74,7 +74,8 @@ Synsema on top of them.
   it points to `shutdown(reason)`; inside a `test` block it fails that test. `run --format json`
   and `run()` of `@synsema/wasm` report it as `exit`.
 - `serve` no longer lets a waiting handler hold a worker: `sleep`, `wait_for`, `select`, HTTP and
-  LLM calls, databases, approvals and child processes release their CPU permit while they wait,
+  LLM calls, databases (also while waiting for the shared connection another route is using),
+  approvals and child processes release their CPU permit while they wait,
   and the pool adds threads (up to `SYNSEMA_SERVE_MAX_WAITING`, default 256) while others wait.
   CPU work is still capped at `SYNSEMA_SERVE_WORKERS`. With 2 permits, six routes sleeping 2 s
   now finish together in ~2.7 s and a fast route answers meanwhile; before, they ran two at a
@@ -118,6 +119,12 @@ Synsema on top of them.
   variable, parameter, `each` or `recover` variable that shadows a module alias, and about a
   wildcard `domain` without `tls dns`.
 - `ecdh_public(private, curve)`, and `"X25519"` for `ecdh_keypair`/`ecdh_shared_secret` (RFC 7748).
+- A `net` grant or `deny` written without a scheme ignores case, like a URL: `net("API.x.com")`
+  covers `api.x.com` (a `deny` in capitals used to miss it).
+- `proxy to` drops the response headers the upstream names in its `Connection` header, and reads
+  repeated `X-Forwarded-*` the same way everywhere (the first `-Proto`/`-Host`, every `-For`).
+- After `exit`, an agent that had already failed is still reported; the ones `exit` stopped are not.
+- `select` results count as external input for lineage, like `tcp_recv` and `pipe_recv`.
 
 ## v0.6.41 — 2026-10-03
 

@@ -244,6 +244,9 @@ impl Capability {
             (CapabilityType::Net, Some(s)) if s.contains("://") => Some(net_host_of(&s)),
             (CapabilityType::Net, Some(s)) if s.starts_with('[') && s.ends_with(']') => Some(s[1..s.len() - 1].to_lowercase()),
             (CapabilityType::Net, Some(s)) if s.starts_with('[') => Some(s.to_lowercase()),
+            // Un nombre de host no distingue mayúsculas (como en el URL): `net("API.x.com")`
+            // cubre `api.x.com` y al revés.
+            (CapabilityType::Net, Some(s)) => Some(s.to_lowercase()),
             (_, s) => s,
         };
         Self { ty, scope }
@@ -1146,6 +1149,15 @@ mod tests {
     }
 
     #[test]
+    fn a_net_grant_without_a_scheme_ignores_case() {
+        let g = Capability::new(CapabilityType::Net, Some("API.Example.com:8080".into()));
+        assert!(g.covers(&Capability::new(CapabilityType::Net, Some("api.example.com:8080".into()))));
+        let g = Capability::new(CapabilityType::Net, Some("*.Example.COM".into()));
+        assert!(g.covers(&Capability::new(CapabilityType::Net, Some("https://Api.example.com".into()))));
+        assert!(!g.covers(&Capability::new(CapabilityType::Net, Some("api.other.com".into()))));
+    }
+
+    #[test]
     fn covers_closes_traversal_bypass() {
         // El caso estrella del fix #5: scope acotado ya NO se escapa con `..`.
         let grant = cap(CapabilityType::FileRead, Some("./data/*"));
@@ -1521,9 +1533,10 @@ mod tanda_motor_tests {
         assert!(grant.covers(&Capability::new(CapabilityType::FileRead, Some("data/x.txt".into()))));
         let glob = Capability::new(CapabilityType::FileRead, Some("data/*".into()));
         assert!(glob.covers(&Capability::new(CapabilityType::FileRead, Some("DATA/secret.txt".into()))));
-        // net (no-path) sigue case-sensitive (los hostnames ya se bajan a minúscula aparte).
+        // net: un host no distingue mayúsculas en ningún sistema (v0.6.42, auditoría ronda 2:
+        // un grant o un `deny` escrito sin esquema y con mayúsculas no cubría el host pedido).
         let net = Capability::new(CapabilityType::Net, Some("api.x".into()));
-        assert!(!net.covers(&Capability::new(CapabilityType::Net, Some("API.X".into()))));
+        assert!(net.covers(&Capability::new(CapabilityType::Net, Some("API.X".into()))));
     }
 
     #[test]

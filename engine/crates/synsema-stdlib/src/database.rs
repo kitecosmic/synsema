@@ -76,10 +76,25 @@ impl DbHandle for Rc<RefCell<DatabaseManager>> {
 
 impl DbHandle for Arc<Mutex<DatabaseManager>> {
     fn read<R>(&self, f: impl FnOnce(&DatabaseManager) -> R) -> R {
-        f(&self.lock().unwrap())
+        f(&lock_shared_db(self))
     }
     fn write<R>(&self, f: impl FnOnce(&mut DatabaseManager) -> R) -> R {
-        f(&mut self.lock().unwrap())
+        f(&mut lock_shared_db(self))
+    }
+}
+
+/// v0.6.42 (auditoría ronda 2) — el lock de la base compartida de `serve`. Si está tomado (otro
+/// hilo tiene la conexión mientras espera a la red), esperarlo es una espera: el hilo suelta su
+/// permiso de CPU. Si no, los hilos en fila por la conexión retenían los permisos y una ruta que
+/// ni toca la base esperaba detrás del N+1 de las demás. Libre, no cuesta nada.
+fn lock_shared_db(m: &Mutex<DatabaseManager>) -> std::sync::MutexGuard<'_, DatabaseManager> {
+    match m.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let _w = synsema_core::waiting::waiting();
+            m.lock().unwrap()
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => m.lock().unwrap(),
     }
 }
 

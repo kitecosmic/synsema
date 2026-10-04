@@ -10137,7 +10137,7 @@ pub const LINEAGE_SOURCES: &[&str] = &[
     "algorand_account", "algorand_params", "algorand_wait", "btc_rpc", "btc_balance", "btc_utxos",
     "btc_fee_estimates", "btc_wait",
     // sockets y procesos (lo que devuelve un comando externo también es una entrada)
-    "ws_recv", "ws_select", "ws_select_all", "tcp_recv", "pipe_recv", "proc_recv", "proc_select", "proc_wait", "run", "run_program",
+    "ws_recv", "ws_select", "ws_select_all", "select", "tcp_recv", "pipe_recv", "proc_recv", "proc_select", "proc_wait", "run", "run_program",
 ];
 
 /// Compromiso con sal de `data` (como los "disclosures" de SD-JWT): `(sal, sha256(sal ‖ data))`
