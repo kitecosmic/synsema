@@ -14,5 +14,8 @@ fn log_show_print_are_live_and_in_order() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let text = String::from_utf8_lossy(&o.stdout).replace("\r\n", "\n");
-    assert_eq!(text, "[LOG] one\ntwo\nthree\nfour\n[LOG] five\n");
+    // v0.6.42 — `log` es diagnóstico: bajo `run` va a stderr (stdout queda para el resultado).
+    assert_eq!(text, "two\nthree\nfour\n");
+    let err = String::from_utf8_lossy(&o.stderr).replace("\r\n", "\n");
+    assert_eq!(err, "[LOG] one\n[LOG] five\n");
 }

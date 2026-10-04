@@ -6,6 +6,74 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.42 — unreleased
+
+Tunnels, programs that speak over stdio, and certificates that do not run into the CA's limits.
+Everything is language primitives: a tunnel product (accounts, pages, quotas) is written in
+Synsema on top of them.
+
+**Behavior changes (read these first).**
+- **`X-Forwarded-*` from an untrusted peer are dropped.** `proxy to` used to append the client's
+  own `X-Forwarded-For`, so any client could tell the service behind it which IP it came from.
+  Now `X-Forwarded-For`, `-Proto`, `-Host` and `Forwarded` are kept only when the TCP peer is
+  listed in `trust proxy` (or `--trust-proxy`); from anyone else they are removed before the
+  program, the generated URLs or a `proxy to` see them. Behind nginx/Caddy/a load balancer, add
+  `trust proxy ["127.0.0.1"]` (or its address/CIDR) to the `serve` block; `ip of request` is then
+  the real client.
+- **`log` writes to stderr under `synsema run`** (like Go's `log`, Python's `logging` and the MCP
+  stdio rule): stdout is the program's result, so `synsema run x.syn | jq` and stdio servers stay
+  clean. Under `test`, `serve` and `run --format json` it is collected as before.
+- **In a route that runs `proxy to`, the request body is not read first**: it streams to the
+  destination (with `max_body` still counting bytes, and a declared `Content-Length` above it
+  answered with 413 right away). `read_body` in such a route sees an empty body.
+- **`tls auto` keeps one certificate per name** (it was one certificate for every `domain`):
+  adding a domain no longer re-issues the others. On the first start after upgrading, names that
+  were only in the old shared certificate get their own.
+
+**Tunnels.**
+- `tcp_connect(host, port, opts?)`, `tcp_send`, `tcp_recv`, `tcp_close`, `tcp_stats`: outbound TCP,
+  gated by `net("host:port")` with the exact port (a grant for `:8080` does not reach `:8081`).
+  Bounded buffers both ways; `tcp_recv` gives `{type: "data", data}` or `{type: "close"}`, `nothing`
+  on timeout; handles mix with the rest in `select`.
+- `pipe(opts?)` → `{a, b}`: two connected byte ends with a bound per direction (`pipe_send`,
+  `pipe_recv`, `pipe_close`, in `select`). An end can be handed to another interpreter (a route to
+  an agent, a request to a `socket` route): the first one that uses it owns it.
+- `proxy to <expr>` can run anywhere in a route body — after checking a token, or instead of an
+  "offline" page — and its destination can depend on the request: a URL (its `net` grant is
+  checked per request) or a pipe end, over which the engine speaks HTTP/1.1, SSE and WebSocket
+  upgrades included. A literal, a constant or `env(...)` is still checked once at startup.
+- A declared `route "OPTIONS …"` wins over the automatic answer, so a CORS preflight reaches the
+  service behind a proxy. The automatic answer now lists the methods of the request's own vhost.
+
+**Programs over stdio, and waiting without holding the server.**
+- `eprint(…)` writes to stderr (a public sink, like `print`). `exit(code?)` ends a `synsema run`
+  with that code (0–255); `try` does not catch it; under `serve` it points to `shutdown(reason)`.
+- `serve` no longer lets a waiting handler hold a worker: `sleep`, `wait_for`, `select`, HTTP and
+  LLM calls, databases, approvals and child processes release their CPU permit while they wait,
+  and the pool adds threads (up to `SYNSEMA_SERVE_MAX_WAITING`, default 256) while others wait.
+  CPU work is still capped at `SYNSEMA_SERVE_WORKERS`. With 2 permits, six routes sleeping 2 s
+  now finish together in ~2.7 s and a fast route answers meanwhile; before, they ran two at a
+  time and the fast route waited behind them. No new keyword: code stays straight-line.
+
+**Certificates (`tls auto`).**
+- The ACME account is stored and reused (`SYNSEMA_CERT_DIR`); certificates renew by their real
+  expiry.
+- `domain ["x.app", "*.x.app"]` with `tls dns <task>`: wildcards through DNS-01, where the task
+  `(name, value, "set" | "clear")` publishes the TXT record with your DNS provider over HTTP. The
+  engine knows no provider.
+- `domain ask <task>`: on-demand certificates. A new name in a handshake is offered to the task
+  (`true` issues; an error or a timeout counts as no) and issued with TLS-ALPN-01. There is no
+  on-demand issuance without `ask`. `SYNSEMA_ACME_MAX_PER_HOUR` (20) caps issuance, failures back
+  off per name, and `SYNSEMA_ACME_DNS_WAIT` (20 s) is the TXT propagation wait.
+
+**Also.**
+- A comment (or several) before the first statement of a `socket`, `stream` or `reason` block
+  parses; it gave `Unexpected token: INDENT`.
+- `synsema check` warns about `alias.name` when the module does not export `name`, about a local
+  variable, parameter, `each` or `recover` variable that shadows a module alias, and about a
+  wildcard `domain` without `tls dns`.
+- `ecdh_public(private, curve)`, and `"X25519"` for `ecdh_keypair`/`ecdh_shared_secret` (RFC 7748).
+
 ## v0.6.41 — 2026-10-03
 
 Data work, faster: reading and writing CSV, `join`, `summarize`/`group_by` and record lambdas do

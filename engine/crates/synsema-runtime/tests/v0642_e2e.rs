@@ -419,3 +419,19 @@ fn a_proxied_body_streams_and_max_body_still_holds() {
     let resp = String::from_utf8_lossy(&raw).to_string();
     assert!(resp.starts_with("HTTP/1.1 413"), "{}", &resp[..resp.len().min(300)]);
 }
+
+#[test]
+fn behind_a_trusted_proxy_x_forwarded_proto_sets_the_scheme() {
+    let port = free_port();
+    let prog = format!(
+        "require serve({p})\nserve on {p}\n    trust proxy \"127.0.0.1\"\n    route \"GET /health\"\n        give \"ok\"\n    route \"GET /ip\"\n        give ip of request\n",
+        p = port
+    );
+    start(prog, port);
+    let (status, _, body) = get(port, "/sitemap.xml", "X-Forwarded-Proto: https\r\n");
+    assert_eq!(status, 200, "{}", body);
+    assert!(body.contains("https://t.example/health"), "{}", body);
+    // Y `ip of request` es el cliente real de la cadena (el par es un proxy de confianza).
+    let (_, _, body) = get(port, "/ip", "X-Forwarded-For: 203.0.113.7\r\n");
+    assert!(body.contains("203.0.113.7"), "{}", body);
+}
