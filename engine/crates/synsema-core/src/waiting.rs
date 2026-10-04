@@ -10,6 +10,8 @@
 //! ve la entrada a la primera y la salida de la última.
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Gancho del pool: `true` al empezar a esperar, `false` al terminar (puede bloquear un instante
 /// hasta recuperar un permiso de ejecución). Un puntero a función: sin asignación ni `Rc`.
@@ -18,6 +20,19 @@ pub type WaitHook = fn(bool);
 thread_local! {
     static HOOK: Cell<Option<WaitHook>> = const { Cell::new(None) };
     static DEPTH: Cell<u32> = const { Cell::new(0) };
+    static CANCEL: std::cell::RefCell<Option<Arc<AtomicBool>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// La cancelación de lo que corre en ESTE hilo (la request de `serve`, el agente), para las
+/// esperas que no tienen el intérprete a mano (el lugar de presupuesto LLM). La fija el
+/// intérprete al adoptar un token (`set_cancel_token`).
+pub fn set_thread_cancel(flag: Option<Arc<AtomicBool>>) {
+    CANCEL.with(|c| *c.borrow_mut() = flag);
+}
+
+/// ¿Se canceló lo que corre en este hilo? `false` si nadie fijó un token (`run`, tests).
+pub fn thread_cancelled() -> bool {
+    CANCEL.with(|c| c.borrow().as_ref().is_some_and(|f| f.load(Ordering::Relaxed)))
 }
 
 /// Instala (o quita, con `None`) el gancho de ESTE hilo. Lo llama el pool al crear un worker.
@@ -70,19 +85,23 @@ impl Drop for Waiting {
 #[must_use = "la sección dura lo que vive el guard: `let _r = resumed();`"]
 pub struct Resumed {
     hook: Option<WaitHook>,
+    /// La profundidad de espera de afuera: adentro del callback vale 0 (una espera ahí suelta el
+    /// permiso de nuevo) y se restaura al salir.
+    depth: u32,
 }
 
 /// Abre una sección que usa CPU dentro de una espera (ver `Resumed`).
 #[inline]
 pub fn resumed() -> Resumed {
     let hook = HOOK.with(|h| h.get());
-    let inside = DEPTH.with(|d| d.get() > 0);
+    let depth = DEPTH.with(|d| d.get());
     match hook {
-        Some(f) if inside => {
+        Some(f) if depth > 0 => {
             f(false);
-            Resumed { hook: Some(f) }
+            DEPTH.with(|d| d.set(0));
+            Resumed { hook: Some(f), depth }
         }
-        _ => Resumed { hook: None },
+        _ => Resumed { hook: None, depth: 0 },
     }
 }
 
@@ -90,6 +109,7 @@ impl Drop for Resumed {
     #[inline]
     fn drop(&mut self) {
         if let Some(f) = self.hook {
+            DEPTH.with(|d| d.set(self.depth));
             f(true);
         }
     }
@@ -124,6 +144,25 @@ mod tests {
             EVENTS.with(|e| assert_eq!(*e.borrow(), vec![true]));
         }
         EVENTS.with(|e| assert_eq!(*e.borrow(), vec![true, false]));
+        set_thread_hook(None);
+    }
+
+    /// Auditoría ronda 2 (R5): una espera DENTRO de un callback (que corre con permiso) vuelve a
+    /// soltar el permiso; al salir del callback se sigue esperando como antes.
+    #[test]
+    fn a_wait_inside_a_resumed_callback_releases_again() {
+        EVENTS.with(|e| e.borrow_mut().clear());
+        set_thread_hook(Some(record));
+        {
+            let _w = waiting(); // true
+            {
+                let _r = resumed(); // false (corre el callback)
+                {
+                    let _w2 = waiting(); // true (espera adentro del callback)
+                } // false
+            } // true (vuelve a la espera de afuera)
+        } // false
+        EVENTS.with(|e| assert_eq!(*e.borrow(), vec![true, false, true, false, true, false]));
         set_thread_hook(None);
     }
 }

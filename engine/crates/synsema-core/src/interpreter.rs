@@ -2413,6 +2413,23 @@ impl Interpreter {
         Ok(v)
     }
 
+    /// v0.6.42 (auditoría, ronda 2) — el lado derecho de `and`/`or` corre SÓLO si el izquierdo lo
+    /// permite: es una rama, y con un izquierdo privado corre bajo su PC, igual que el cuerpo de un
+    /// `when`. Sin esto `s or exit(1)`, `s and http_post(…)` o `s and print("x")` ejecutaban un
+    /// efecto decidido por el secreto con el PC vacío, y el chequeo de sumidero pasaba. Aparte y
+    /// sin inline: el camino sin etiquetas no paga nada.
+    #[inline(never)]
+    fn exec_right_under(&mut self, left: &SynValue, right: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let l = labels::label_deep(left);
+        if l.is_empty() {
+            return self.exec(right, env);
+        }
+        self.pc_push(&l);
+        let r = self.exec(right, env);
+        self.pc_pop();
+        r
+    }
+
     /// Empuja `l` al stack de PC (acumulada con la de abajo). Sólo se llama con etiquetas
     /// encendidas y `l` no vacía. Siempre se aparea con `pc_pop`, también en error.
     fn pc_push(&mut self, l: &Label) {
@@ -3075,6 +3092,7 @@ impl Interpreter {
     /// Adopta un token externo (el server crea uno por request ANTES de correr el
     /// handler, para poder cancelarlo desde el lado async aunque el head no salió).
     pub fn set_cancel_token(&mut self, token: CancelToken) {
+        crate::waiting::set_thread_cancel(Some(token.flag.clone()));
         self.cancel = token;
     }
 
@@ -4481,7 +4499,7 @@ impl Interpreter {
                         let res = syn_bool(false);
                         return if self.labels { self.join_operands(res, &l, None, loc) } else { Ok(res) };
                     }
-                    let r = self.exec(right, env)?;
+                    let r = if self.labels { self.exec_right_under(&l, right, env)? } else { self.exec(right, env)? };
                     let res = syn_bool(r.is_truthy());
                     return if self.labels { self.join_operands(res, &l, Some(&r), loc) } else { Ok(res) };
                 }
@@ -4490,7 +4508,7 @@ impl Interpreter {
                         let res = syn_bool(true);
                         return if self.labels { self.join_operands(res, &l, None, loc) } else { Ok(res) };
                     }
-                    let r = self.exec(right, env)?;
+                    let r = if self.labels { self.exec_right_under(&l, right, env)? } else { self.exec(right, env)? };
                     let res = syn_bool(r.is_truthy());
                     return if self.labels { self.join_operands(res, &l, Some(&r), loc) } else { Ok(res) };
                 }

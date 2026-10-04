@@ -90,6 +90,31 @@ fn exit_is_a_public_sink_under_labels() {
     assert!(e.exit_code.is_none() && e.to_string().contains("label_violation"), "{}", e);
 }
 
+/// Auditoría ronda 2 (R3): el lado derecho de `and`/`or` corre sólo si el izquierdo lo permite,
+/// así que sus efectos están condicionados al izquierdo: corren bajo el PC con su etiqueta.
+#[test]
+fn and_or_right_side_runs_under_the_left_label() {
+    for src in [
+        "let s be private(false, \"a\")\ns or exit(1)\n",
+        "let s be private(true, \"a\")\ns and exit(1)\n",
+        "let s be private(true, \"a\")\ns and print(\"x\")\n",
+        "let s be private(false, \"a\")\ns or eprint(\"x\")\n",
+        "let s be private(true, \"a\")\nwhen s and print(\"x\")\n    print(\"y\")\n",
+    ] {
+        let (i, r) = run_labels(src);
+        let Err(Control::Error(e)) = r else { panic!("se esperaba label_violation en:\n{}", src) };
+        assert!(e.exit_code.is_none() && e.to_string().contains("label_violation"), "{}\n{}", src, e);
+        assert!(i.output.is_empty(), "{}: salió {:?}", src, i.output);
+    }
+    // Con el izquierdo público nada cambia, y el lado derecho no corre si no hace falta.
+    let (i, r) = run_labels("let p be true\np and print(\"x\")\nlet q be false\nq and print(\"no\")\n");
+    assert!(r.is_ok());
+    assert_eq!(i.output, vec!["x".to_string()]);
+    // El resultado sigue llevando la etiqueta de los dos lados.
+    let (_i, r) = run_labels("let s be private(true, \"a\")\nlet b be s and true\nprint(b)\n");
+    assert!(r.is_ok());
+}
+
 // ---------------------------------------------------------------------------------
 // check: nombres locales que tapan un alias, y `alias.x` no exportado
 // ---------------------------------------------------------------------------------

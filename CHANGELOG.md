@@ -25,6 +25,10 @@ Synsema on top of them.
   stdio rule): stdout is the program's result, so `synsema run x.syn | jq` and stdio servers stay
   clean. Under `test`, `serve`, `run --format json`, `--explain` and `--attest` it is collected as
   before; inside an agent it keeps the agent's prefix.
+- **Under `--labels`, the right side of `and`/`or` runs under the left side's label.** It only
+  runs when the left side lets it, so `secret or exit(1)`, `secret and print("x")` or
+  `when secret and notify()` reveal the secret; they are now a `label_violation`, like the same
+  code written with `when`. The label of the result is unchanged.
 - **`eprint` is a reserved builtin name** (like `print`, it is checked for private data): a program
   that defined its own `task eprint` must rename it.
 - **In a route that runs `proxy to`, the request body streams to the destination** without being
@@ -64,9 +68,16 @@ Synsema on top of them.
   now finish together in ~2.7 s and a fast route answers meanwhile; before, they ran two at a
   time and the fast route waited behind them. No new keyword: code stays straight-line. A thread
   coming back from a wait never blocks (it takes its permit back on credit), so a wait with a
-  lock held cannot deadlock the server; extra threads leave as soon as the queue is empty. With a
-  token budget (`SYNSEMA_LLM_BUDGET` and friends), LLM calls in flight are still capped at the
-  workers, so the budget is not overshot by the extra threads.
+  lock held cannot deadlock the server; extra threads leave as soon as the queue is empty. While a
+  callback runs inside a wait (the `on_chunk` of an `llm_stream`), it holds a permit again, so CPU
+  work can briefly exceed `SYNSEMA_SERVE_WORKERS` by the threads coming back from a wait.
+- **With a token budget (`SYNSEMA_LLM_BUDGET` and friends), LLM calls in flight are capped** at
+  `SYNSEMA_SERVE_WORKERS` (default: the CPU count), so the budget is not overshot by the extra
+  threads. The cap is process-wide and also applies under `synsema run`: a `parallel_map` over 100
+  prompts with a budget runs that many at a time. A call made from inside another one on the same
+  thread (a `reason` in the `on_chunk` of an `llm_stream`) uses its slot; a call that gets no slot
+  within `SYNSEMA_LLM_TIMEOUT`, or whose request was cancelled, returns a `[llm busy: …]` marker
+  instead of waiting forever.
 
 **Certificates (`tls auto`).**
 - The ACME account is stored and reused (`SYNSEMA_CERT_DIR`); certificates renew by their real
