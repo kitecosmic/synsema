@@ -96,7 +96,13 @@ see [secrets.md](secrets.md). Resolution: **process environment → `.env` file 
 
   | Variable | Default | What |
   |---|---|---|
-  | `SYNSEMA_SERVE_WORKERS` | #cores (min 2) | interpreter pool for sized handlers (streams/sockets use their own thread) |
+  | `SYNSEMA_SERVE_WORKERS` | #cores (min 2) | interpreter pool for sized handlers (streams/sockets use their own thread); since v0.6.42 it caps CPU work, not open requests |
+  | `SYNSEMA_SERVE_MAX_WAITING` | `256` | v0.6.42+: extra threads while handlers wait (sleep, HTTP, LLM, DB, `select`…) so a waiting route does not hold the rest; they leave as soon as the queue is empty; `0` = none (serve.md § Performance and memory) |
+  | `SYNSEMA_CERT_DIR` | `~/.synsema/certs` | `tls auto` certificates, keys and ACME account (keep it in the service user's profile or a private dir: keys are `0600` in Unix; on Windows the folder's ACL applies) |
+  | `SYNSEMA_ACME_MAX_PER_HOUR` | `20` | v0.6.42+: cap on on-demand (`domain ask`) issuance per hour |
+  | `SYNSEMA_ACME_DNS_WAIT` | `20` | v0.6.42+: seconds to wait for the DNS-01 TXT record (`tls dns`) to propagate |
+  | `SYNSEMA_ACME_DIRECTORY` / `SYNSEMA_ACME_CA` | Let's Encrypt | another ACME directory (staging, your own CA) and the PEM of the CA that serves it |
+  | `SYNSEMA_ACME_HTTP_PORT` | `80` | port of the HTTP-01 challenge listener (change it only if you forward external :80 to it) |
   | `SYNSEMA_SHUTDOWN_GRACE` | `10` | seconds to drain in-flight requests on SIGINT/SIGTERM; `0` = immediate |
   | `SYNSEMA_SSE_KEEPALIVE` | `15` | idle seconds before a `: keepalive` SSE comment; `0` off |
   | `SYNSEMA_WS_SERVER_PING` | `30` | server ping interval on `socket` routes; no pong in 2 intervals → `close`; `0` off |
@@ -335,8 +341,8 @@ systemctl start synsema-agent
 ## Multiple sites on one host (Synsema is its own edge proxy)
 
 Two processes can't both bind `:443`, and you **don't need nginx/Caddy**. One Synsema process is the
-**edge**: it terminates TLS for every domain (one SAN cert) and routes by `Host` to each backend, which
-runs plain-HTTP on a private port.
+**edge**: it terminates TLS for every domain (one certificate per name since v0.6.42) and routes by
+`Host` to each backend, which runs plain-HTTP on a private port.
 
 ```
 -- edge.syn — TLS + Host routing for every site on the box
@@ -360,7 +366,7 @@ serve on 443
             proxy to "http://127.0.0.1:8791"
 ```
 
-Run the edge with a SAN cert for all domains; each backend runs plain-HTTP, localhost-only, with its own
+Run the edge with a certificate for each domain; each backend runs plain-HTTP, localhost-only, with its own
 repo/version/systemd unit:
 
 ```bash
@@ -374,7 +380,11 @@ synsema serve docs.syn --port 8791 --bind 127.0.0.1     # backend 2
 - **Per method:** `route` binds method+path — declare each method you forward (GET, POST, …).
 - `proxy to` forwards status + content-type + body **and** the upstream's end-to-end headers (`Location`,
   `Set-Cookie`, `Cache-Control`, `ETag`, …), so redirects/cookies/caching work through the edge; hop-by-hop
-  are dropped; `X-Forwarded-For/Proto/Host` are added for the backend.
+  are dropped; `X-Forwarded-For/Proto/Host` are set for the backend (the client's own `X-Forwarded-*`
+  only count when it is a `trust proxy` peer — serve.md § Behind nginx).
+- **Behind nginx/Caddy/a load balancer instead** (v0.6.42+): add `trust proxy ["127.0.0.1"]` (its
+  address or CIDR) to the `serve` block, or `--trust-proxy`, so `ip of request` and the rate limit see
+  the real client; without it every request comes from the proxy.
 - **Streams cross the edge:** a backend's `stream` (SSE) arrives event by event, a backend `socket`
   (WebSocket) is tunnelled after the `101`, big downloads stream with their `Content-Length`. So a chat
   backend and a plain API can each be their own process — own `require` contract, own port, own deploy —

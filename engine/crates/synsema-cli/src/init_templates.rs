@@ -261,7 +261,7 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 
 # Hilos extra mientras otros handlers ESPERAN (sleep, wait_for, HTTP, LLM, select): la
 # CPU sigue acotada a SYNSEMA_SERVE_WORKERS y una ruta que espera no deja al resto en
-# cola. Los extra ociosos se retiran a los 60 s. 0 = sin hilos extra (default 256):
+# cola. Los extra se retiran apenas se vacia la cola. 0 = sin hilos extra (default 256):
 # SYNSEMA_SERVE_MAX_WAITING=256
 
 # Certificados automaticos (tls auto): tope de emisiones por hora (un `domain ask`
@@ -415,6 +415,9 @@ const HELLO_SYN_PAST: &[&str] = &[
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
 const ENV_EXAMPLE_PAST: &[&str] = &[
+    // v0.6.42 (rama, tras la auditoria): decia que los hilos extra se retiran a los 60 s (se
+    // retiran apenas se vacia la cola) — con los knobs de ACME previos ya listados.
+    "930eb46150e8008c938edc5dd9587c032fbe14709a84c4bf6402953367075407",
     // v0.6.42 (rama, antes de la auditoria): con SYNSEMA_SERVE_MAX_WAITING y los dos knobs de
     // ACME nuevos, sin los de ACME previos (SYNSEMA_CERT_DIR, _DIRECTORY, _CA, _HTTP_PORT).
     "ec8f9370fcfb0be5f9e32f1d7067c1fc3ba42543e7ee6f78b578d2d0507e4cc7",

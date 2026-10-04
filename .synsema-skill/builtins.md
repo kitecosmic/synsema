@@ -50,6 +50,8 @@
 - `args()` → list of text (v0.6.14+) — the program's own argv: what follows `--` in `synsema run prog.syn -- a b` (→ `["a","b"]`), positionals after the path, or the whole argv of a `synsema build` binary. **No capability** (input the caller typed, not a host resource). Empty under `synsema test` and in the browser wasm.
 - `self_path()` → text (v0.6.14+) — this executable's path, exactly as the OS gives it (`\` on Windows). Pass it verbatim to `run`/`proc_spawn` — the `exec` scope matches byte-for-byte. **No capability** (identity, not access). Under `--profile pure`/wasm: errors (`no process`).
 - `platform()` → `{os, arch}` (v0.6.18+) — `"windows"` / `"macos"` / `"linux"` (other OSes as Rust names them), `"x86_64"` / `"aarch64"`; `"wasm"` / `"wasm32"` in the browser build. **No capability**; the same answer under `--sandbox` and `--profile pure` (a fact of the binary, like `args()`). Use it to pick `cmd` / `open` / `xdg-open` at run time — never `env("OS")` or a `self_path()` suffix.
+- `eprint(values...)` (v0.6.42+) — like `print`, to **stderr**: diagnostics that must not mix with the result on stdout (`synsema run x.syn | jq`, an MCP/LSP server over stdio). A public sink like `print` (refused for private data under `--labels`); `eprint` is a reserved name. Since v0.6.42 `log` also goes to stderr under `synsema run` (under `test`/`serve`/`--format json`/`--explain`/`--attest` it is collected as before; in an agent it keeps the agent's prefix).
+- `exit(code?)` (v0.6.42+) — ends a `synsema run` right there with that exit code (integer 0–255, default 0; anything else is a catchable error). `try` does **not** catch it; agents still running are stopped; inside a `test` block it fails that test; under `serve` it errors and points to `shutdown(reason)`. `run --format json` and `@synsema/wasm`'s `run()` report it as `exit`. A public sink under `--labels` (a private code, or `exit` under a private branch, is a label violation).
 - `shutdown(reason?)` → nothing (v0.6.18+) — asks the running server for its **ordered drain** (listener closed, in-flight work drained, cron/agents stopped, exit 0) from a route, a `socket` block, a cron job or an agent. Log: `[serve] shutdown requested by the program: <reason>`. Idempotent. **Errors** under `synsema run` (a run program ends with its top level — `stop` leaves a loop or a task) and before anything listens (`nothing is running yet`); a `secret` reason is refused (it goes to the log). **No capability** (quitting is not a host resource). Under wasm: `not available in the pure profile`.
 - `run_program(source, opts)` → map (v0.6.14+) — **requires `sandbox_run`**. Runs another Synsema program in a **child process of the same binary** under a ceiling = `opts.ceiling ∩` the parent's — the child can never exceed the parent. `opts` (all optional): `ceiling` (`--cap-set` syntax, or `"sandbox"`/`"none"`; default `"sandbox"`; v0.6.28+ also the **map returned by `captoken_verify`** or a `{capability: scopes}` map — the child then runs under that token's authority, with `stdout`+`time` kept unless the token says `deterministic`), `profile` (`"native"`/`"pure"`, default `"pure"`, never above the parent), `env` (map — **replaces** the child's environment; a `secret` value is an error), `timeout` (seconds, default 30; on expiry kills the child tree), `cwd`, `filename`. Returns `{ok, output:[lines], errors:[text], audit:[entries], exit:n|nothing, timed_out:bool, llm_tokens:n}` — the audit is a **value**, not a log to parse. Asking for more than the parent lends is trimmed (parent audit: `above parent ceiling`), not fatal. Recursion allowed if the child holds `sandbox_run` (depth `SYNSEMA_RUN_PROGRAM_MAX_DEPTH`, default 4). See [processes.md](processes.md).
 
@@ -170,8 +172,9 @@ Blockchain — sign/verify/derive (all pure-Rust; see stdlib.md for the security
 
 ## ECDH / HKDF / AES-GCM (pure except key generation — v0.6.20+)
 WebCrypto names and shapes. Secrets stay `secret` (a derived key is USED — as the AES key — never printed).
-- `ecdh_keypair(curve)` → `{private: secret, public: bytes}` — `curve` = `"P-256"` | `"P-521"` (anything else: clear error); public = SEC1 uncompressed point (65 / 133 bytes). **Requires `random`** (it creates a key — the gate of `random_bytes`).
-- `ecdh_shared_secret(private, peer_public, curve)` → secret (the raw X coordinate, like WebCrypto `deriveBits`). Pure.
+- `ecdh_keypair(curve)` → `{private: secret, public: bytes}` — `curve` = `"P-256"` | `"P-521"` | `"X25519"` (v0.6.42+, RFC 7748) (anything else: clear error); public = SEC1 uncompressed point (65 / 133 bytes), or the 32-byte X25519 key. **Requires `random`** (it creates a key — the gate of `random_bytes`).
+- `ecdh_shared_secret(private, peer_public, curve)` → secret (the raw X coordinate, like WebCrypto `deriveBits`; for X25519 the 32-byte shared value, and an all-zero result — a low-order peer key — is an error). Pure.
+- `ecdh_public(private, curve)` → bytes (v0.6.42+) — the public key of a private key you already have (stored, or restored from a secret). Pure.
 - `hkdf_sha256(ikm, salt, info, length)` → bytes (RFC 5869; a `secret` when `ikm` is one). Pure.
 - `aes_gcm_encrypt(key, nonce, plaintext, aad?)` → bytes (ciphertext ‖ 16-byte tag) / `aes_gcm_decrypt(key, nonce, ciphertext, aad?)` → bytes. Key 16 bytes = AES-128-GCM, 32 = AES-256-GCM (else: `the key must be 16 bytes … or 32 bytes`); nonce 12 bytes, never reused with a key; auth failure → `authentication failed (wrong key, nonce, aad, or tampered data)`, never partial bytes — or the fallback, with the total form `aes_gcm_decrypt(key, nonce, ct, aad, default)` (below). Pure.
 
@@ -792,8 +795,32 @@ Response helpers (set the HTTP status; body follows the response contract):
 
 ## Agentic apps — `select`, live processes, event bus, agent control (engine v0.6.7+)
 
-One wait for everything (no capability; handles from `ws_connect`, a `socket` route, `proc_spawn`, `bus_subscribe`):
-- `select(targets, timeout?)` → first ready event tagged `source` (`"ws"`/`"proc"`/`"bus"`/`"watch"`/`"term"`), `handle`, `name` (map form); `nothing` at timeout / all gone. `targets` = list of handles or map name → handle. See [concurrency.md](concurrency.md).
+One wait for everything (no capability; handles from `ws_connect`, a `socket` route, `proc_spawn`, `bus_subscribe`, `tcp_connect`, `pipe`):
+- `select(targets, timeout?)` → first ready event tagged `source` (`"ws"`/`"proc"`/`"bus"`/`"watch"`/`"term"`/`"tcp"`/`"pipe"`), `handle`, `name` (map form); `nothing` at timeout / all gone. `targets` = list of handles or map name → handle. See [concurrency.md](concurrency.md).
+
+### Tunnels — raw TCP and in-memory pipes (v0.6.42+)
+
+A whole tunnel is in [serve.md](serve.md) § A tunnel in Synsema.
+- `tcp_connect(host, port, opts?)` → handle — outbound TCP, gated by **`net("host:port")` with the exact port** (a grant for `:8080` does not reach `:8081`). `opts`: `timeout` (seconds, connect), `max_buffer` (bytes queued per direction). Name resolution runs in its own thread (at most 64 at a time per process).
+- `tcp_send(h, text|bytes)`; `tcp_recv(h, timeout?)` → `{type: "data", data: bytes}`, `{type: "close"}` (the peer stopped sending — **sticky**: every later `tcp_recv`/`select` gives `close` again at once, like a closed channel; the connection stays open for your answer until `tcp_close`) or `nothing` at timeout. `decode(m["data"])` for text.
+- `tcp_stats(h)` → `{peer, sent, received, queued_in, queued_out, status}`; `tcp_close(h)`.
+- `pipe(opts?)` → `{a, b}` — two connected byte ends, bounded per direction (`opts.max_buffer`). `pipe_send(end, text|bytes)`, `pipe_recv(end, timeout?)` (same events as `tcp_recv`, `source: "pipe"`), `pipe_close(end)` / `pipe_close(end, "write")` (half close: the other side reads `close` and can still answer). An end is a number you can hand to another interpreter (`spawn Agent with peer = p["b"]`, a request to a `socket` route); the first interpreter that uses it owns it. `proxy to <end>` makes the server speak HTTP over it. An end nobody took is closed after 60 s without activity on its pair; at most 4096 ends waiting to be taken per program.
+
+```
+require net("127.0.0.1:8080")
+let c be tcp_connect("127.0.0.1", 8080, {"timeout": 5})
+tcp_send(c, "GET / HTTP/1.0\r\nHost: x\r\n\r\n")
+let reply be ""
+let live be true
+while live
+    let m be tcp_recv(c, 5)
+    when m == nothing or m["type"] == "close"
+        set live to false
+    otherwise
+        set reply to reply + decode(m["data"])
+tcp_close(c)
+print(reply)
+```
 
 Live processes (gated by `exec(cmd)` like `run`; see [processes.md](processes.md)):
 - `proc_spawn(cmd, args?, opts?)` → handle. `opts`: `cwd`, `env`, `line_mode` (true), `stderr` (`"separate"`|`"merge"`), `max_queue` (4096), `max_queue_bytes` (64 MiB), `on_full` (`"block"`|`"drop_oldest"`|`"error"`), **`pty`** (false; v0.6.8+ — real pseudo-terminal for y/N prompts, passwords, TUIs; then one `stdout` stream, raw text chunks with ANSI (`data` is always text, never `bytes`), `line_mode` false, echo on), `cols` (80), `rows` (24), `term` (`"xterm-256color"`) — the last three only with `pty: true`; **`process_group`** (true; v0.6.9+ — own process group / Windows Job Object, so `proc_kill`/`proc_close` kill the whole tree incl. grandchildren; `false` detaches a daemon on purpose)

@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.42 — unreleased
+## v0.6.42 — 2026-10-04
 
 Tunnels, programs that speak over stdio, and certificates that do not run into the CA's limits.
 Everything is language primitives: a tunnel product (accounts, pages, quotas) is written in

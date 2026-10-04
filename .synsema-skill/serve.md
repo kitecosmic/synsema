@@ -147,7 +147,7 @@ body of request  -- raw body text (in-memory bodies; "" when spilled to disk)
 headers of request
 cookies of request -- incoming cookies as a map (RFC 6265, undecoded; no header → empty map)
 user of request  -- set after auth (see below)
-ip of request    -- the client's real peer IP (used for rate limiting)
+ip of request    -- the client's real IP (the TCP peer; behind a `trust proxy`, the client it reports)
 body_file of request  -- temp file path when a large body spilled to disk, else nothing
 read_body()      -- read the full body TEXT (lossy for non-UTF-8)
 read_body_bytes() -- read the full body as `bytes` (byte-exact, for binary uploads)
@@ -682,7 +682,8 @@ and what can't be derived truthfully (a response schema) is omitted, not invente
 
 Base URL for absolute links (`Sitemap:`, `<loc>`, OpenAPI `servers`): `domain "…"` of
 the serve block if declared, else the request `Host`; scheme `https` when TLS is on
-or the proxy in front sends `X-Forwarded-Proto: https`.
+or a proxy listed in `trust proxy` sends `X-Forwarded-Proto: https` (v0.6.42+: from any
+other peer that header is dropped before anything reads it).
 
 **Behind a proxy, declare `domain`.** Proxies rewrite `Host` to the backend authority
 (nginx's default `$proxy_host`, the built-in `proxy to` too), so without `domain` the
@@ -998,9 +999,10 @@ serve on 8080
   `unlimited`) disables an inherited default on one route.
 - **Algorithm:** token bucket — up to `N` per window sustained, with bursts up
   to `N`. Tokens refill continuously.
-- **Keyed by the real peer IP.** `X-Forwarded-For` is **not** trusted (a client
-  could forge it to evade the limit or flood the table). Per-user keying and
-  trusted-proxy `X-Forwarded-For` are future work.
+- **Keyed by the client IP** (`ip of request`): the TCP peer, or — when that peer is listed in
+  `trust proxy` — the client it reports in `X-Forwarded-For` (read right to left, skipping the
+  trusted hops). From any other peer `X-Forwarded-For` is dropped (a client could forge it to
+  evade the limit or flood the table). Per-user keying is future work.
 - **Order:** the limit is checked after route matching but **before** auth and
   the handler — so it also throttles the auth task (e.g. 5 login attempts/min
   even with invalid tokens).
@@ -1318,6 +1320,18 @@ on what can be served — large uploads stream to disk rather than being buffere
   1 M records + 1 M integers in globals, 176 MB with 1 worker, 225 MB with 12; a worker's first
   request ~8–25 ms). Choose the worker count by CPU. Up to v0.6.39 each worker built its own copy
   (≈ 160–190 MB per worker for 1 M small records): there, keep N low with large globals.
+- **Waiting does not hold a worker** (v0.6.42+). `SYNSEMA_SERVE_WORKERS` caps CPU work, not open
+  requests: a handler that waits — `sleep`, `wait_for`, `select`, HTTP and LLM calls, databases,
+  approvals, child processes, `tcp_*`/`pipe_*` — releases its CPU permit while it waits, and the
+  pool adds threads (up to `SYNSEMA_SERVE_MAX_WAITING`, default 256) so other requests keep
+  running. Measured with 2 permits: six routes sleeping 2 s finish together in ~2.7 s and a fast
+  route answers meanwhile (before: two at a time, the fast one behind them). Write straight-line
+  code — no `async`. Extra threads leave as soon as the queue is empty. A thread coming back from
+  a wait takes its permit on credit, so CPU work can briefly exceed `SYNSEMA_SERVE_WORKERS`.
+- **LLM token budgets** (`SYNSEMA_LLM_BUDGET` and friends) also cap LLM calls in flight at
+  `SYNSEMA_SERVE_WORKERS` (process-wide, `synsema run` included), so the budget is not overshot;
+  a call that gets no slot within `SYNSEMA_LLM_TIMEOUT` (or whose request was cancelled) returns a
+  `[llm busy: …]` marker.
 
 ## Isolation
 
@@ -1388,21 +1402,65 @@ serve on 443
 ```
 
 - `tls cert <expr> key <expr>` — manual certificate.
-- `tls auto "email"` — **automatic HTTPS** via ACME (Let's Encrypt): issues the cert,
-  serves the HTTP-01 challenge on :80, stores it in `~/.synsema/certs/`, and a
-  background thread renews it (< 30 days). `domain` is **required** with `tls auto`.
-- `domain` accepts **one domain or a list** — pass a list for a single **SAN certificate**
-  covering several names (e.g. apex + `www`):
+- `tls auto "email"` — **automatic HTTPS** via ACME (Let's Encrypt): issues the certs,
+  serves the HTTP-01 challenge on :80, stores them in `~/.synsema/certs/` (or
+  `SYNSEMA_CERT_DIR`), and a background thread renews each one by its real expiry (< 30 days).
+  The ACME account is stored and reused. `domain` (or `domain ask`) is **required** with `tls auto`.
+- `domain` accepts **one domain or a list**. Since v0.6.42 there is **one certificate per name**
+  (it used to be one SAN cert for the whole list): adding a name issues only that one.
 
   ```
   serve on 443
       tls auto "admin@example.com"
-      domain ["example.com", "www.example.com"]   -- one SAN cert for both
+      domain ["example.com", "www.example.com"]   -- one cert each
       route "GET /" ...
   ```
 
-  Every name in the list must resolve (DNS A/AAAA) to this server and be reachable on
-  `:80`, or the whole order fails. The cert is stored under the first (primary) domain.
+  Each name must resolve (DNS A/AAAA) to this server and be reachable on `:80`.
+- **The server starts even if the CA cannot be reached** (v0.6.42+): a name without a
+  certificate is logged and retried in the background — every minute while a `domain` name is
+  missing, each name backing off after a failure (1 min, doubling up to 1 h). Each issuance has
+  a 2-minute limit. A certificate already on disk is reused after a restart (only if it names the
+  domain and has not expired); keys are written atomically, `0600` in Unix, and checked against
+  their certificate.
+- **Wildcards — `tls dns <task>`** (v0.6.42+). `*.example.com` can only be proven over DNS-01: the
+  engine calls your task `(name, value, action)` with `action` = `"set"` (publish a TXT record
+  `name` = `value` at your DNS provider) and later `"clear"` (remove it). The engine knows no
+  provider — the task talks to its API over HTTP, so it needs its own `require net(...)`. A wildcard
+  `domain` without `tls dns` is refused (`synsema check` warns). `SYNSEMA_ACME_DNS_WAIT` (20 s) is
+  the propagation wait before the CA checks.
+
+  ```
+  require net("api.cloudflare.com")
+  task publish_txt(name, value, action)
+      -- call your DNS provider's API here: create ("set") or delete ("clear") the TXT record
+      give true
+
+  serve on 443
+      tls auto "admin@example.com"
+      domain ["example.com", "*.example.com"]
+      tls dns publish_txt
+  ```
+- **On-demand certificates — `domain ask <task>`** (v0.6.42+), for names you do not know in
+  advance (your customers' own domains). When a handshake arrives for a name with no
+  certificate, the engine calls the task with the name; `true` issues it right there (HTTP-01 on
+  the `:80` listener, `SYNSEMA_ACME_HTTP_PORT`; TLS-ALPN-01 if the CA does not offer HTTP-01),
+  anything else — or an error, or no answer within 10 s — refuses it. **There is no on-demand
+  issuance without `ask`**: approve only names you know are yours (look them up in your
+  database), or anyone can make you request certificates. Limits: one issuance per name at a time
+  (parallel connections share it), `ask` runs at most 8 at a time and 20 new names per second (the
+  rest is refused at once), and `SYNSEMA_ACME_MAX_PER_HOUR` (20) caps on-demand issuance. A name
+  is asked again before it is renewed.
+
+  ```
+  task allow_host(host)
+      give ends_with(host, ".customers.example")   -- or: is it in your table of custom domains?
+
+  serve on 443
+      tls auto "admin@example.com"
+      domain ["example.com"]
+      domain ask allow_host
+  ```
 - TLS 1.2+ enforced, **HSTS** automatic, **SNI** (per-host cert with vhosts).
 - **HTTP/2** is negotiated automatically via ALPN over TLS; HTTP/1.1 is kept.
 
@@ -1520,6 +1578,40 @@ The target is the base; the incoming path + query is appended (like nginx `proxy
 (deny-by-default — the edge only reaches the hosts it declares). Auth, rate limit, vhost and CORS run on the edge BEFORE the
 upstream is contacted.
 
+**`proxy to` anywhere in the route, to a destination decided per request** (v0.6.42+). It is a
+statement like `give`: the route can check something first, answer by itself, or pick where to go.
+The destination is an expression — a URL (`host:port` only: `@ ? # \ %` and spaces are refused),
+whose `net` grant is then checked **per request** on the same host the edge connects to, or a
+**pipe end** (below), over which the engine speaks HTTP/1.1, SSE and WebSocket upgrades included.
+A literal, a constant or `env(...)` is still checked once at startup.
+
+```
+require net("127.0.0.1:9000")
+require net("127.0.0.1:9001")
+
+task backend_for(r)
+    when get(r["query"], "v") == "2"
+        give "http://127.0.0.1:9001"
+    give "http://127.0.0.1:9000"
+
+route "GET /api/*path"
+    when get(headers of request, "x-token") != "ok"
+        give fail(401, "unauthorized")       -- answered by the edge; nothing is forwarded
+    proxy to backend_for(request)            -- a destination without its `net` grant → error, never a connection
+```
+
+`proxy to` must be written in the route body (inside a task it is an error). A declared
+`route "OPTIONS …"` wins over the automatic `OPTIONS` answer, so a CORS preflight can be proxied
+to the service behind.
+
+**The request body** of a route that runs `proxy to` streams to the destination without being read
+first (`max_body` still counts the bytes; a declared `Content-Length` above it gets a 413 at once).
+If the route reads the body itself — `read_body()`, `read_body_bytes()`, `expect`, or
+`body`/`form`/`json of request` written in the route — it is read whole (up to `max_body`) and
+forwarded byte for byte. Read any other way (inside a task the route calls, `get(request, "body")`,
+`request[k]`) the streamed body is **not** there: that `request` has no `body`/`json`/`form`, and
+`read_body` explains how to read it. So check a body (a filter, an HMAC) **in the route itself**.
+
 **It streams** (v0.6.12+; before that `proxy to` buffered the whole response and dropped upgrades). The edge is a real edge for agentic apps, not a buffered forwarder:
 - **SSE / `stream` routes** of the backend pass through in real time (chunks forwarded as they
   arrive; the edge adds no keepalive — the backend's `stream` already does).
@@ -1527,21 +1619,82 @@ upstream is contacted.
   the connection becomes a byte tunnel in both directions until either side closes — a backend
   `socket` route works behind the edge (`ws_connect("ws://edge/…")` from any program).
 - **Large bodies** stream to the client; `Content-Length` is preserved when the upstream sent
-  one (chunked/close-delimited upstreams stay unsized). The **request** body is still read whole
-  (up to `max_body`) before forwarding — auth and validation need it.
+  one (chunked/close-delimited upstreams stay unsized). The **request** body streams too
+  (v0.6.42+; before, it was read whole first) — see "The request body" above.
 - Tunnels and unsized responses count against `max_streams` (503 + `Retry-After: 5` when full)
   and are cancelled by the ordered shutdown, exactly like native `stream`/`socket` routes.
-- A route/serve `timeout` bounds connect + upstream head (504 past it); a body/tunnel has no
-  ceiling, like `stream`.
+- A route/serve `timeout` bounds connecting and each wait for the next bytes while the request is
+  sent and the head comes back (an idle timeout since v0.6.42: a slow but steady upload is not cut;
+  504 past it); a body/tunnel has no ceiling, like `stream`.
 
 Headers: status + content-type + the upstream's end-to-end response headers (`Location`,
 `Set-Cookie` ×N, `Cache-Control`, `ETag`, `Content-Encoding`, …) cross, so redirects, cookies
 and caching work through it; hop-by-hop (`Connection`, `Keep-Alive`, `Transfer-Encoding`, `TE`,
 `Trailer`, `Proxy-*`) are dropped. Request side: end-to-end headers cross (incl. `Accept-Encoding`
 — the upstream may compress and the bytes pass untouched), `Host` becomes the upstream's, and the
-edge adds `X-Forwarded-For` (appended), `X-Forwarded-Proto` and `X-Forwarded-Host`. A malformed
+edge sets `X-Forwarded-For` (the client's own chain only if it came from a `trust proxy` peer,
+plus that peer), `X-Forwarded-Proto` and `X-Forwarded-Host`. Response headers the upstream names
+in its `Connection` header are dropped. A request with more than one `Host` is a 400. A malformed
 upstream response (control byte in a header) is a `502 proxy error: …` — never a panic, the edge
 stays up. WebSocket over HTTP/2 (RFC 8441) does not tunnel (h2 clients don't send `Upgrade`).
+
+### Behind nginx, Caddy or a load balancer — `trust proxy` (v0.6.42+)
+
+The client's IP, scheme and host travel in `X-Forwarded-For`/`-Proto`/`-Host` — headers any
+client can also send. Synsema keeps them **only when the TCP peer is listed in `trust proxy`**;
+from anyone else they (and `Forwarded`) are removed before the program, `ip of request`, the
+rate limit, the generated URLs or a `proxy to` see them.
+
+```
+serve on 8080
+    trust proxy ["127.0.0.1", "10.0.0.0/8"]   -- addresses or CIDRs of YOUR proxies (or --trust-proxy)
+    route "GET /whoami"
+        give {"ip": ip of request}            -- the real client, not the proxy
+```
+
+The trusted proxy must **set** (not pass through) `X-Forwarded-Proto` and `-Host`, or a client
+can still inject them through it (nginx: `proxy_set_header X-Forwarded-Proto $scheme;`).
+`Forwarded` (RFC 7239) is dropped, not parsed. Without `trust proxy`, behind a proxy every
+request looks like it comes from the proxy (one rate-limit bucket for everyone).
+
+### A tunnel in Synsema — `proxy to` a pipe end (v0.6.42+)
+
+`pipe()` gives two connected byte ends; `proxy to` one of them makes the engine speak HTTP over
+it, and whatever holds the other end carries the bytes anywhere — here an agent copies them to a
+local service over TCP (a tunnel product with accounts and quotas is written the same way, in
+Synsema, on these primitives):
+
+```
+require serve(8080)
+require net("127.0.0.1:3000")
+
+agent Bridge
+    require net("127.0.0.1:3000")
+    let svc be tcp_connect("127.0.0.1", 3000)
+    let live be true
+    while live
+        let m be select({"pipe": peer, "svc": svc}, 20)
+        when m == nothing
+            set live to false
+        otherwise when m["type"] == "close"
+            set live to false
+        otherwise when m["name"] == "pipe"
+            tcp_send(svc, m["data"])
+        otherwise
+            pipe_send(peer, m["data"])
+    tcp_close(svc)
+    pipe_close(peer)
+
+serve on 8080
+    route "GET /*path"
+        let p be pipe()                       -- one pipe per request
+        spawn Bridge with peer = p["b"]       -- the agent takes one end…
+        proxy to p["a"]                       -- …the engine speaks HTTP (SSE, WebSocket too) over the other
+```
+
+An end can be handed to another interpreter (a route → an agent, a request → a `socket` route);
+the first one that uses it owns it. An end nobody takes is closed after 60 s without activity on
+its pair; a program can have at most 4096 ends waiting to be taken. See builtins.md § Tunnels.
 
 **Proxying a whole site?** `route "GET /*path"` does **not** match the root `/` (the wildcard
 needs ≥1 segment) — declare `route "GET /"` as well, and one route per method you forward
