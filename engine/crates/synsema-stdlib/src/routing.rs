@@ -604,6 +604,11 @@ pub struct RouteSpec {
     /// o un `proxy to` después de otras sentencias): la ruta es de proxy para el transporte
     /// (reserva el upgrade de WebSocket), pero corre su handler.
     pub proxy_dynamic: bool,
+    /// v0.6.42 (auditoría) — el cuerpo de una ruta `proxy_dynamic` LEE el body (`read_body`,
+    /// `read_body_bytes`, el `body`/`form`/`json` del request): entonces se lee entero (con
+    /// `max_body`) antes de correr la ruta y se reenvía desde memoria. Si no lo nombra, viaja en
+    /// streaming. Nunca un body vacío en silencio para un filtro que lo mira.
+    pub proxy_reads_body: bool,
     /// `rate_limit unlimited` explícito (para `/openapi.json`; el limiter ya lo trata como None).
     pub rate_unlimited: bool,
     /// Metadatos estáticos (expect/respuesta/capabilities) para `/openapi.json` y `/docs`.

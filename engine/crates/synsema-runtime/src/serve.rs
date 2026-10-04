@@ -1897,6 +1897,29 @@ fn body_has_proxy(body: &[Node]) -> bool {
     found
 }
 
+/// v0.6.42 (auditoría) — ¿el cuerpo de la ruta lee el body de la request? `read_body`,
+/// `read_body_bytes`, o `body`/`form`/`json` del request (`body of request`, `request.form`,
+/// `request["json"]`). Conservador: ante la duda, lo lee (bufferiza) en vez de dejarlo vacío.
+fn body_reads_request_body(body: &[Node]) -> bool {
+    const FIELDS: [&str; 3] = ["body", "form", "json"];
+    let mut reads = false;
+    for st in body {
+        synsema_core::ast_api::walk(st, &mut |n| match &n.kind {
+            NodeKind::Identifier { name } if name == "read_body" || name == "read_body_bytes" => reads = true,
+            NodeKind::PropertyAccess { property_name, .. } if FIELDS.contains(&property_name.as_str()) => reads = true,
+            NodeKind::IndexAccess { index, .. } => {
+                if let NodeKind::TextLiteral { value } = &index.kind {
+                    if FIELDS.contains(&value.as_str()) {
+                        reads = true;
+                    }
+                }
+            }
+            _ => {}
+        });
+    }
+    reads
+}
+
 /// v0.6.42 — la ruta ejecutó `proxy to <destino>`: una URL pasa por el mismo gate `net` que al
 /// arrancar, pero ahora por request y con las capabilities del worker; un extremo de `pipe` se
 /// saca del hub del worker (el lado async habla HTTP sobre él).
@@ -1908,11 +1931,12 @@ fn proxy_outcome(
     use synsema_core::interpreter::ProxyTo;
     match dest {
         ProxyTo::Url(url) => {
-            if let Err(m) = synsema_stdlib::server::parse_proxy_target(&url) {
-                return GiveOutcome::Error(format!("proxy to: {}", m));
-            }
-            let host = synsema_capabilities::secure::url_hostname(&url).unwrap_or_default();
-            let scope = synsema_capabilities::model::net_request_scope(&url).unwrap_or(host);
+            // El permiso se pide sobre el MISMO host[:puerto] al que se va a conectar (auditoría
+            // B2: dos parsers distintos dejaban chequear un host y conectar a otro).
+            let scope = match synsema_stdlib::server::parse_proxy_target(&url) {
+                Ok((_, authority, _)) => authority.to_ascii_lowercase(),
+                Err(m) => return GiveOutcome::Error(format!("proxy to: {}", m)),
+            };
             if let Err(v) = caps
                 .borrow_mut()
                 .require(&Capability::new(CapabilityType::Net, Some(scope)), &format!("proxy to \"{}\"", url))
@@ -2469,6 +2493,7 @@ fn build_host_table(
                 None
             };
             let proxy_dynamic = proxy_target.is_none() && body_has_proxy(body);
+            let proxy_reads_body = proxy_dynamic && body_reads_request_body(body);
 
             let body_c = body.clone();
             let swarm_c = swarm.clone();
@@ -2552,6 +2577,7 @@ fn build_host_table(
                 timeout: route_timeout,
                 proxy_target,
                 proxy_dynamic,
+                proxy_reads_body,
                 rate_unlimited,
                 meta,
             });
@@ -2669,12 +2695,12 @@ fn build_host_table(
                 let key = format!("_route_handler_{}", i);
                 // v0.6.42 — ¿el cuerpo (en la task del grupo) ejecuta `proxy to`? Entonces el
                 // transporte prepara el reenvío (headers, body, upgrade) como en una ruta directa.
-                let mounted_proxy = match &group {
+                let (mounted_proxy, mounted_reads_body) = match &group {
                     SynValue::Map(m) => match m.borrow().get(&key) {
-                        Some(SynValue::Task(t)) => body_has_proxy(&t.body),
-                        _ => false,
+                        Some(SynValue::Task(t)) => (body_has_proxy(&t.body), body_reads_request_body(&t.body)),
+                        _ => (false, false),
                     },
-                    _ => false,
+                    _ => (false, false),
                 };
                 // El cuerpo de una ruta montada vive en su handler-task (cierra sobre el
                 // env del módulo): de ahí salen expect/respuesta/capabilities.
@@ -2775,6 +2801,7 @@ fn build_host_table(
                     timeout: route_timeout,
                     proxy_target: None,
                     proxy_dynamic: mounted_proxy,
+                    proxy_reads_body: mounted_proxy && mounted_reads_body,
                     rate_unlimited,
                     meta,
                 });

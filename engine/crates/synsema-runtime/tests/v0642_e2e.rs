@@ -435,3 +435,51 @@ fn behind_a_trusted_proxy_x_forwarded_proto_sets_the_scheme() {
     let (_, _, body) = get(port, "/ip", "X-Forwarded-For: 203.0.113.7\r\n");
     assert!(body.contains("203.0.113.7"), "{}", body);
 }
+
+#[test]
+fn a_destination_built_from_the_request_cannot_smuggle_another_host() {
+    let up = spawn_upstream();
+    let port = free_port();
+    let prog = format!(
+        "require serve({p})\nrequire net(\"127.0.0.1:{up}\")\nserve on {p}\n    route \"GET /go\"\n        proxy to \"http://\" + query[\"svc\"]\n",
+        p = port,
+        up = up
+    );
+    start(prog, port);
+    let (status, _, body) = get(port, &format!("/go?svc=127.0.0.1:{}", up), "");
+    assert_eq!(status, 200, "{}", body);
+    // `127.0.0.1:UP?.x.attacker:6379`: antes se chequeaba 127.0.0.1:UP y se conectaba a otro host.
+    let (status, _, body) = get(port, &format!("/go?svc=127.0.0.1:{}%3F.x.attacker.example:6379", up), "");
+    assert_eq!(status, 500, "{}", body);
+    assert!(body.contains("not part of a host"), "{}", body);
+}
+
+#[test]
+fn a_proxy_route_that_reads_the_body_sees_it_and_still_forwards_it() {
+    let up = spawn_counting_upstream();
+    let port = free_port();
+    let prog = format!(
+        "require serve({p})\nrequire net(\"127.0.0.1:{up}\")\nserve on {p}\n    route \"POST /filter\"\n        when contains(read_body(), \"<script\")\n            give respond(\"blocked\", \"text/plain\", 400)\n        proxy to \"http://127.0.0.1:{up}\" + \"\"\n",
+        p = port,
+        up = up
+    );
+    start(prog, port);
+    let (status, resp) = post(port, "/filter", 5);
+    assert_eq!(status, 200, "{}", resp);
+    assert!(resp.ends_with("got 5"), "el upstream recibe el body que la ruta ya leyó: {}", resp);
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    sock.write_all(b"POST /filter HTTP/1.1\r\nHost: t\r\nContent-Length: 8\r\nConnection: close\r\n\r\n<script>").unwrap();
+    let mut raw = Vec::new();
+    let _ = sock.read_to_end(&mut raw);
+    let resp = String::from_utf8_lossy(&raw).to_string();
+    assert!(resp.starts_with("HTTP/1.1 400"), "el filtro ve el body (no un vacío en silencio): {}", resp);
+}
+
+#[test]
+fn two_host_headers_are_a_bad_request() {
+    let port = free_port();
+    start(format!("require serve({p})\nserve on {p}\n    route \"GET /\"\n        give 1\n", p = port), port);
+    let (status, _, _) = get(port, "/", "Host: other.example\r\n");
+    assert_eq!(status, 400);
+}

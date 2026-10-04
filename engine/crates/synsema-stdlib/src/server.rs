@@ -647,6 +647,9 @@ pub struct RoutePlan {
     pub socket: bool,
     /// La ruta es un `proxy to` (el transporte la atiende en streaming).
     pub proxy: bool,
+    /// v0.6.42 — el body de la request viaja en streaming al destino (sin leerse antes): una ruta
+    /// de proxy cuyo cuerpo no lo nombra.
+    pub stream_body: bool,
     /// Techo de vida del handler (route > serve); `None` = sin límite.
     pub timeout: Option<f64>,
 }
@@ -1239,6 +1242,7 @@ impl ServeRuntime {
                     dedicated: r.streaming || r.socket,
                     socket: r.socket,
                     proxy: r.proxy_target.is_some() || r.proxy_dynamic,
+                    stream_body: r.proxy_target.is_some() || (r.proxy_dynamic && !r.proxy_reads_body),
                     timeout: r.timeout.or(self.default_timeout).filter(|t| t.is_finite() && *t > 0.0),
                 }
             }
@@ -3024,6 +3028,16 @@ pub fn parse_proxy_target(target: &str) -> Result<(String, String, String), Stri
     if authority.is_empty() || authority.starts_with(':') {
         return Err(format!("the target needs a host (got \"{}\")", t));
     }
+    // v0.6.42 (auditoría B2) — el authority es SÓLO host[:puerto]. El chequeo de `net` y esta
+    // conexión tienen que ver el mismo host: con `a.ok?.x.attacker:6379` el chequeo leía
+    // `a.ok` (corta en `?`) y la conexión iba al host del atacante. Credenciales (`@`), query,
+    // fragmento, `\`, `%` y espacios en el authority se rechazan.
+    if !authority.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']')) {
+        return Err(format!(
+            "the target's host has characters that are not part of a host[:port] (got \"{}\")",
+            t
+        ));
+    }
     let addr = if authority.rsplit(':').next().map(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty()).unwrap_or(false)
         && authority.contains(':')
     {
@@ -3034,12 +3048,47 @@ pub fn parse_proxy_target(target: &str) -> Result<(String, String, String), Stri
     Ok((addr, authority.to_string(), base.trim_end_matches('/').to_string()))
 }
 
+/// v0.6.42 — un body que anota cuándo avanzó (ms desde `t0`): el timeout del proxy es de inactividad.
+struct ProgressBody<B> {
+    inner: B,
+    last: Arc<std::sync::atomic::AtomicU64>,
+    t0: Instant,
+}
+
+impl<B: hyper::body::Body + Unpin> hyper::body::Body for ProgressBody<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        if let std::task::Poll::Ready(Some(Ok(_))) = &r {
+            let ms = self.t0.elapsed().as_millis() as u64;
+            self.last.store(ms, std::sync::atomic::Ordering::Relaxed);
+        }
+        r
+    }
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// v0.6.42 — el body que se reenvía: en streaming desde el cliente, o ya leído (la ruta lo usó).
+enum ProxyBodySrc {
+    Stream(Incoming),
+    Bytes(Bytes),
+}
+
 /// Hop-by-hop (RFC 7230 §6.1): no cruzan el proxy en ninguna dirección.
 fn is_hop_by_hop(lower_name: &str) -> bool {
     matches!(
         lower_name,
         "connection" | "keep-alive" | "proxy-authenticate" | "proxy-authorization" | "te" | "trailer"
-            | "transfer-encoding" | "upgrade"
+            | "transfer-encoding" | "upgrade" | "proxy-connection"
     )
 }
 
@@ -3063,12 +3112,21 @@ impl TrustedNet {
             .trim_end_matches(']')
             .parse()
             .map_err(|_| format!("trust proxy: '{}' is not an IP address or a CIDR (10.0.0.0/8, ::1)", spec))?;
+        // `::ffff:a.b.c.d` (y su `/96+n`) es una IPv4: se guarda como tal, que es como se compara.
+        let (addr, mapped) = match addr {
+            std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => (std::net::IpAddr::V4(v4), true),
+                None => (addr, false),
+            },
+            v4 => (v4, false),
+        };
         let max = if addr.is_ipv4() { 32 } else { 128 };
         let prefix = match prefix {
             None => max,
             Some(p) => match p.parse::<u8>() {
-                Ok(n) if n <= max => n,
-                _ => return Err(format!("trust proxy: '{}' has an invalid prefix (0..={})", spec, max)),
+                Ok(n) if mapped && (96..=128).contains(&n) => n - 96,
+                Ok(n) if !mapped && n <= max => n,
+                _ => return Err(format!("trust proxy: '{}' has an invalid prefix (0..={})", spec, if mapped { 128 } else { max })),
             },
         };
         Ok(TrustedNet { addr, prefix })
@@ -3095,6 +3153,21 @@ impl TrustedNet {
 }
 
 const FORWARDED_HEADERS: [&str; 4] = ["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "forwarded"];
+
+/// La IP de un salto de `X-Forwarded-For`: `ip`, `ipv4:puerto`, `[ipv6]` o `[ipv6]:puerto`.
+fn hop_ip(hop: &str) -> Option<std::net::IpAddr> {
+    let h = hop.trim();
+    if let Ok(ip) = h.parse() {
+        return Some(ip);
+    }
+    if let Some(rest) = h.strip_prefix('[') {
+        return rest.split(']').next()?.parse().ok();
+    }
+    match h.rsplit_once(':') {
+        Some((ip, port)) if port.chars().all(|c| c.is_ascii_digit()) => ip.parse().ok(),
+        _ => None,
+    }
+}
 
 impl ServeRuntime {
     fn is_trusted(&self, ip: &str) -> bool {
@@ -3125,12 +3198,13 @@ impl ServeRuntime {
             .collect();
         let mut client = peer.to_string();
         for hop in chain.iter().rev() {
-            if hop.parse::<std::net::IpAddr>().is_err() {
+            // `1.2.3.4:5678` o `[2001:db8::1]:443` también son un salto (con puerto).
+            let Some(ip) = hop_ip(hop) else {
                 // Un salto que no es una IP corta la cadena: no se le cree nada a la izquierda.
                 break;
-            }
-            client = hop.clone();
-            if !self.is_trusted(hop) {
+            };
+            client = ip.to_string();
+            if !self.trusted_proxies.iter().any(|n| n.contains(ip)) {
                 break;
             }
         }
@@ -3163,7 +3237,7 @@ async fn proxy_request(
     method: String,
     target_pq: String,
     headers: Vec<(String, String)>,
-    body: Option<Incoming>,
+    body: Option<ProxyBodySrc>,
     client_ip: String,
     upgrade: Option<hyper::upgrade::OnUpgrade>,
     timeout: Option<f64>,
@@ -3241,6 +3315,13 @@ async fn proxy_request(
     let uri = format!("{}{}", base, pq);
     let mut rb = Request::builder().method(method.as_str()).uri(uri.as_str());
     rb = rb.header("Host", authority.as_str());
+    // RFC 7230 §6.1: los headers que el cliente nombra en `Connection:` son hop-by-hop.
+    let conn_named: Vec<String> = headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("connection"))
+        .flat_map(|(_, v)| v.split(',').map(|t| t.trim().to_ascii_lowercase()).collect::<Vec<_>>())
+        .filter(|t| !t.is_empty() && t != "upgrade")
+        .collect();
     let mut fwd_for: Option<String> = None;
     let mut fwd_proto: Option<String> = None;
     let mut fwd_host: Option<String> = None;
@@ -3268,7 +3349,7 @@ async fn proxy_request(
             }
             // En un upgrade WebSocket, `Upgrade` y `Sec-WebSocket-*` cruzan tal cual.
             "upgrade" if is_ws => {}
-            _ if is_hop_by_hop(&lk) => continue,
+            _ if is_hop_by_hop(&lk) || conn_named.contains(&lk) => continue,
             _ => {}
         }
         if let (Ok(n), Ok(val)) = (HeaderName::try_from(k.as_str()), HeaderValue::try_from(v.as_str())) {
@@ -3297,10 +3378,21 @@ async fn proxy_request(
     }
     // El body del cliente en streaming, con el tope de `max_body` (el `size_hint` exacto viaja:
     // si el cliente mandó `Content-Length`, el upstream lo recibe igual).
+    // v0.6.42 (auditoría) — el timeout es de INACTIVIDAD: cada tramo del body que sube corre el
+    // plazo; 50 MB a 1 MB/s no son un 504, un upstream mudo sí.
+    let started = Instant::now();
+    let progress = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let up_body: ProxyReqBody = match body {
-        Some(b) => match rt.max_body {
-            Some(m) => Limited::new(b, m.max(0) as usize).boxed_unsync(),
-            None => b.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>).boxed_unsync(),
+        Some(ProxyBodySrc::Bytes(b)) => Full::new(b).map_err(|never| match never {}).boxed_unsync(),
+        Some(ProxyBodySrc::Stream(b)) => match rt.max_body {
+            Some(m) => ProgressBody { inner: Limited::new(b, m.max(0) as usize), last: progress.clone(), t0: started }
+                .boxed_unsync(),
+            None => ProgressBody {
+                inner: b.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+                last: progress.clone(),
+                t0: started,
+            }
+            .boxed_unsync(),
         },
         None => Full::new(Bytes::new()).map_err(|never| match never {}).boxed_unsync(),
     };
@@ -3308,7 +3400,20 @@ async fn proxy_request(
         Ok(r) => r,
         Err(e) => return proxy_error_response(502, format!("proxy error: bad request for upstream: {}", e), &extra, cors.as_deref(), hsts),
     };
-    let resp = match tokio::time::timeout(wait, sender.send_request(req)).await {
+    let resp_fut = sender.send_request(req);
+    tokio::pin!(resp_fut);
+    let resp_r = loop {
+        let last = Duration::from_millis(progress.load(std::sync::atomic::Ordering::Relaxed));
+        let idle = started.elapsed().saturating_sub(last);
+        if idle >= wait {
+            break Err(());
+        }
+        match tokio::time::timeout(wait - idle, &mut resp_fut).await {
+            Ok(r) => break Ok(r),
+            Err(_) => continue, // venció el plazo: mirar si hubo progreso en el medio
+        }
+    };
+    let resp = match resp_r {
         Ok(Ok(r)) => r,
         // El body pasó `max_body` a mitad de camino: 413, como si se hubiera leído entero.
         Ok(Err(e)) if format!("{:?}", e).contains("LengthLimitError") => {
@@ -3640,6 +3745,15 @@ async fn handle_request(
         }
     }
 
+    // v0.6.42 (auditoría) — más de un `Host`: 400. Con dos, cada capa podía leer uno distinto (el
+    // proxy el último, el resto el primero) y pasar un `X-Forwarded-Host` controlado.
+    if headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("host")).count() > 1 {
+        let body = obj(vec![
+            ("error", Json::Str("more than one Host header".into())),
+            ("status", Json::Int(400)),
+        ]);
+        return Ok(json_full(400, dumps(&body), &[], rt.cors_origin(), rt.tls_enabled, true));
+    }
     // v0.6.42 — `trust proxy`: el cliente real y los `X-Forwarded-*` que pueden seguir. El par
     // TCP queda aparte: es el salto que se agrega al `X-Forwarded-For` de un `proxy to`.
     let peer_ip = client_ip;
@@ -3700,8 +3814,8 @@ async fn handle_request(
     // v0.6.42 — en una ruta que hace `proxy to`, el body NO se lee: viaja en streaming al
     // destino (con el tope de `max_body` contando bytes), como un reverse proxy. Memoria
     // acotada aunque se suba un archivo grande por un túnel; el handler lo ve vacío.
-    let mut proxy_body: Option<Incoming> = None;
-    let body_bytes = if plan.proxy {
+    let mut proxy_body: Option<ProxyBodySrc> = None;
+    let body_bytes = if plan.proxy && plan.stream_body {
         // Un `Content-Length` declarado por encima del tope se rechaza ya, sin esperar el body.
         if let (Some(m), Ok(n)) = (rt.max_body, header_value(&headers, "content-length").trim().parse::<i64>()) {
             if n > m.max(0) {
@@ -3712,7 +3826,7 @@ async fn handle_request(
                 return Ok(json_full(413, dumps(&body), &[], cors.as_deref(), hsts, true));
             }
         }
-        proxy_body = Some(req.into_body());
+        proxy_body = Some(ProxyBodySrc::Stream(req.into_body()));
         Bytes::new()
     } else {
         // Body con tope; excedido → 413 + cerrar.
@@ -3739,6 +3853,10 @@ async fn handle_request(
         } else {
             (String::from_utf8_lossy(&body_bytes).into_owned(), body_bytes.to_vec(), None)
         };
+    // Una ruta de proxy que lee el body: ya se leyó entero (con `max_body`) y se reenvía igual.
+    if plan.proxy && proxy_body.is_none() {
+        proxy_body = Some(ProxyBodySrc::Bytes(body_bytes.clone()));
+    }
     // Lo que el forward de un `proxy to` necesita (el job sync consume el resto).
     let proxy_req = if plan.proxy {
         Some((method.clone(), target.clone(), headers.clone(), peer_ip.clone()))
