@@ -111,6 +111,30 @@ fn wildcard_by_dns01_and_on_demand_by_tls_alpn_against_pebble() {
     let (dir_port, mgmt_port, dns_port, chal_mgmt, https_port) =
         (free_port(), free_port(), free_port(), free_port(), free_port());
 
+    std::env::set_var("SYNSEMA_ACME_DIRECTORY", format!("https://127.0.0.1:{}/dir", dir_port));
+    std::env::set_var("SYNSEMA_ACME_CA", &dir_cert_path);
+    std::env::set_var("SYNSEMA_CERT_DIR", &certdir);
+    std::env::set_var("SYNSEMA_ACME_DNS_WAIT", "0");
+
+    // La "task" de `tls dns`: publica y retira el TXT (acá contra challtestsrv; en un programa,
+    // contra la API del proveedor de DNS).
+    let dns: DnsFn = Arc::new(move |name: &str, value: &str, action: &str| match action {
+        "set" => chal_post(chal_mgmt, "/set-txt", &format!(r#"{{"host":"{}.","value":"{}"}}"#, name, value)),
+        _ => chal_post(chal_mgmt, "/clear-txt", &format!(r#"{{"host":"{}."}}"#, name)),
+    });
+
+    // (0) Auditoría ronda 2 (R2): un nombre fijo con la CA todavía caída. El arranque no lo
+    //     consigue (y no se cuelga); la pasada de renovación lo consigue cuando la CA aparece.
+    let late = CertManager::new_for_test(
+        AcmeOptions { email: None, domains: vec!["late.test".to_string()], ask: None, dns: Some(dns.clone()), http_store: None },
+        Duration::ZERO,
+        Duration::from_secs(60),
+    );
+    let t0 = Instant::now();
+    assert_eq!(late.bootstrap().unwrap(), vec!["late.test".to_string()]);
+    assert!(t0.elapsed() < Duration::from_secs(30), "el arranque no se cuelga: {:?}", t0.elapsed());
+    assert!(late.cert_for("late.test").is_none());
+
     // DNS de prueba: todo nombre resuelve a 127.0.0.1; el TXT lo publica la "task".
     let _chal = Killer(
         Command::new(&chal)
@@ -154,17 +178,11 @@ fn wildcard_by_dns01_and_on_demand_by_tls_alpn_against_pebble() {
     );
     assert!(wait_tcp(dir_port, 20), "Pebble no quedó listo");
 
-    std::env::set_var("SYNSEMA_ACME_DIRECTORY", format!("https://127.0.0.1:{}/dir", dir_port));
-    std::env::set_var("SYNSEMA_ACME_CA", &dir_cert_path);
-    std::env::set_var("SYNSEMA_CERT_DIR", &certdir);
-    std::env::set_var("SYNSEMA_ACME_DNS_WAIT", "0");
-
-    // La "task" de `tls dns`: publica y retira el TXT (acá contra challtestsrv; en un programa,
-    // contra la API del proveedor de DNS).
-    let dns: DnsFn = Arc::new(move |name: &str, value: &str, action: &str| match action {
-        "set" => chal_post(chal_mgmt, "/set-txt", &format!(r#"{{"host":"{}.","value":"{}"}}"#, name, value)),
-        _ => chal_post(chal_mgmt, "/clear-txt", &format!(r#"{{"host":"{}."}}"#, name)),
-    });
+    // (0, sigue) La CA ya está: la renovación consigue el nombre que faltaba.
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let still = rt.block_on(late.renew_due());
+    assert!(still.is_empty(), "sigue faltando: {:?}", still);
+    assert!(late.cert_for("late.test").is_some(), "el nombre fijo se reintentó y se emitió");
     let ask: AskFn = Arc::new(|host: &str| host == "ok.test");
     let mgr = CertManager::new(AcmeOptions {
         email: Some("admin@example.test".to_string()),

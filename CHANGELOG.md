@@ -36,7 +36,10 @@ Synsema on top of them.
   answered with 413 right away) — unless the route reads it (`read_body`, `read_body_bytes`, or the
   request's `body`/`form`/`json`): then it is read whole, up to `max_body`, and forwarded as is.
 - **`tls auto` starts even if the CA cannot be reached**: names without a certificate are logged
-  and retried in the background (hourly, with backoff) instead of stopping the server.
+  and retried in the background instead of stopping the server — every minute while a `domain`
+  name is missing, each name waiting 1 min after a failure, doubling up to 1 h. Each issuance has
+  a 2-minute limit (plus `SYNSEMA_ACME_DNS_WAIT`), so a CA that does not answer does not hold the
+  start; the fixed names are requested in parallel.
 - **`tls auto` keeps one certificate per name** (it was one certificate for every `domain`):
   adding a domain no longer re-issues the others. On the first start after upgrading, names that
   were only in the old shared certificate get their own.
@@ -86,13 +89,17 @@ Synsema on top of them.
   `(name, value, "set" | "clear")` publishes the TXT record with your DNS provider over HTTP. The
   engine knows no provider.
 - `domain ask <task>`: on-demand certificates. A new name in a handshake is offered to the task
-  (`true` issues) and issued with HTTP-01 (or TLS-ALPN-01 without the `:80` listener). There is no
+  (`true` issues) and issued with HTTP-01 on the `:80` listener (`SYNSEMA_ACME_HTTP_PORT`), or
+  TLS-ALPN-01 if the CA does not offer HTTP-01. There is no
   on-demand issuance without `ask`. One issuance per name at a time (parallel connections share
   it), a certificate on disk is reused after a restart, `ask` runs at most 8 at a time and 20 new
   names per second (the rest is refused at once, not remembered), `SYNSEMA_ACME_MAX_PER_HOUR`
   (20) caps on-demand issuance, failures back off per name, and `SYNSEMA_ACME_DNS_WAIT` (20 s) is
-  the TXT propagation wait. Keys are written atomically, 0600 in Unix, and checked against their
-  certificate. `SYNSEMA_CERT_DIR`, `SYNSEMA_ACME_DIRECTORY`, `SYNSEMA_ACME_CA` and
+  the TXT propagation wait. Keys are written atomically, 0600 in Unix (also an older key found
+  on disk), and checked against their certificate; the previous key is kept until the new
+  certificate is in place, so an interrupted renewal still starts with the old pair. A
+  certificate on disk is used only if it names the domain, and an expired one is not served (an
+  on-demand name is issued again). `SYNSEMA_CERT_DIR`, `SYNSEMA_ACME_DIRECTORY`, `SYNSEMA_ACME_CA` and
   `SYNSEMA_ACME_HTTP_PORT` are now in the `.env.example` of `synsema init`.
 
 **Also.**

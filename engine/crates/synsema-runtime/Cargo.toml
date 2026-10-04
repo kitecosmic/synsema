@@ -61,3 +61,5 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # Ídem: comprobar que el escalar de `attestation_key()` es la clave P-256 anunciada (ECDH
 # desde ambos lados). El mismo p256 que compila synsema-stdlib.
 p256 = { workspace = true }
+# v0.6.42: el e2e de `tls auto` contra Pebble mira a qué nombre se emitió cada certificado.
+x509-parser.workspace = true

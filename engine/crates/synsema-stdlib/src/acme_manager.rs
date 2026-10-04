@@ -76,6 +76,15 @@ const TASK_STACK: usize = 64 * 1024 * 1024;
 pub const ISSUE_TIMEOUT: Duration = Duration::from_secs(10);
 /// ALPN del reto TLS-ALPN-01 (RFC 8737).
 pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
+/// Lo que puede tardar UNA emisión entera (cuenta, orden, retos, certificado), además de la
+/// espera de propagación del TXT. El cliente ACME no fija plazos: con la CA en un agujero negro
+/// el arranque de `serve` no terminaba.
+const ORDER_TIMEOUT: Duration = Duration::from_secs(120);
+/// La primera espera tras un fallo (después se duplica por intento, hasta una hora).
+const RETRY_BASE: Duration = Duration::from_secs(60);
+/// Cada cuánto mira la renovación si falta el certificado de algún nombre fijo (cada nombre
+/// respeta su backoff); sin faltantes, cada hora.
+const RETRY_MISSING_EVERY: Duration = Duration::from_secs(60);
 
 fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
@@ -120,7 +129,8 @@ pub struct CertManager {
     /// Un lock por nombre: las emisiones del mismo nombre se esperan entre sí; las de nombres
     /// distintos no (un `tls dns` lento no frena a los demás).
     name_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    certs: RwLock<HashMap<String, Arc<CertifiedKey>>>,
+    /// El certificado de cada nombre y su `notAfter` (uno vencido no se sirve).
+    certs: RwLock<HashMap<String, (Arc<CertifiedKey>, i64)>>,
     not_after: Mutex<HashMap<String, i64>>,
     /// Certificados de reto TLS-ALPN-01 vigentes, por nombre.
     alpn: RwLock<HashMap<String, Arc<CertifiedKey>>>,
@@ -131,6 +141,8 @@ pub struct CertManager {
     new_names: Mutex<(Instant, u32)>,
     max_per_hour: usize,
     dns_wait: Duration,
+    retry_base: Duration,
+    order_timeout: Duration,
 }
 
 impl CertManager {
@@ -160,7 +172,19 @@ impl CertManager {
             new_names: Mutex::new((Instant::now(), 0)),
             max_per_hour,
             dns_wait: Duration::from_secs(env_u64("SYNSEMA_ACME_DNS_WAIT", 20)),
+            retry_base: RETRY_BASE,
+            order_timeout: ORDER_TIMEOUT,
         }
+    }
+
+    /// Para tests de punta a punta: el manager con la espera tras un fallo y el plazo por
+    /// emisión dados (con la CA de prueba levantándose después del arranque).
+    #[doc(hidden)]
+    pub fn new_for_test(opts: AcmeOptions, retry_base: Duration, order_timeout: Duration) -> Arc<CertManager> {
+        let mut m = Self::build(opts, crate::acme::certs_dir(), env_u64("SYNSEMA_ACME_MAX_PER_HOUR", 20) as usize);
+        m.retry_base = retry_base;
+        m.order_timeout = order_timeout;
+        Arc::new(m)
     }
 
     /// ¿Hay un `ask`? (sin él, un nombre desconocido nunca se emite).
@@ -176,17 +200,30 @@ impl CertManager {
     pub fn cert_for(&self, sni: &str) -> Option<Arc<CertifiedKey>> {
         let sni = sni.trim_end_matches('.').to_ascii_lowercase();
         let certs = self.certs.read().ok()?;
-        if let Some(c) = certs.get(&sni) {
-            return Some(c.clone());
+        let now = now_unix();
+        // Uno vencido no se sirve: para un nombre bajo demanda eso dispara la emisión otra vez.
+        let live = |c: Option<&(Arc<CertifiedKey>, i64)>| c.filter(|(_, t)| *t > now).map(|(c, _)| c.clone());
+        if let Some(c) = live(certs.get(&sni)) {
+            return Some(c);
         }
         let parent = sni.split_once('.').map(|(_, p)| p)?;
-        certs.get(&format!("*.{}", parent)).cloned()
+        live(certs.get(&format!("*.{}", parent)))
     }
 
     /// Sin SNI (acceso por IP): el primer nombre fijo que tenga certificado.
     fn default_cert(&self) -> Option<Arc<CertifiedKey>> {
         let certs = self.certs.read().ok()?;
-        self.opts.domains.iter().find_map(|d| certs.get(&d.to_ascii_lowercase()).cloned())
+        let now = now_unix();
+        self.opts
+            .domains
+            .iter()
+            .find_map(|d| certs.get(&d.to_ascii_lowercase()).filter(|(_, t)| *t > now).map(|(c, _)| c.clone()))
+    }
+
+    /// ¿Tiene este nombre (exacto) un certificado vigente instalado?
+    fn has_cert(&self, name: &str) -> bool {
+        let now = now_unix();
+        self.certs.read().map(|c| c.get(name).is_some_and(|(_, t)| *t > now)).unwrap_or(false)
     }
 
     fn alpn_cert(&self, sni: &str) -> Option<Arc<CertifiedKey>> {
@@ -207,6 +244,12 @@ impl CertManager {
         (self.dir.join(format!("{}.pem", base)), self.dir.join(format!("{}.key.pem", base)))
     }
 
+    /// La clave del par anterior: si una escritura se corta entre la clave nueva y el
+    /// certificado nuevo, el certificado viejo sigue teniendo con qué firmar.
+    fn prev_key_path(&self, name: &str) -> PathBuf {
+        self.dir.join(format!("{}.key.prev.pem", file_base(name)))
+    }
+
     fn account_path(&self) -> PathBuf {
         let host = self
             .directory_url
@@ -218,11 +261,27 @@ impl CertManager {
     }
 
     /// Carga un certificado del disco: la clave firmante y su `notAfter`.
+    /// Con la clave actual o, si no corresponde (una escritura cortada a mitad), la anterior; y
+    /// sólo si el certificado cubre el nombre (un archivo de otro nombre no se sirve).
     fn load(&self, name: &str) -> Option<(Arc<CertifiedKey>, i64)> {
         let (cert, key) = self.paths(name);
         let cert_pem = std::fs::read(&cert).ok()?;
-        let key_pem = std::fs::read(&key).ok()?;
-        certified_from_pem(&cert_pem, &key_pem).ok()
+        if !leaf_covers(&cert_pem, name) {
+            return None;
+        }
+        for k in [key, self.prev_key_path(name)] {
+            let Ok(key_pem) = std::fs::read(&k) else { continue };
+            if let Ok(r) = certified_from_pem(&cert_pem, &key_pem) {
+                // Una clave de una versión anterior pudo quedar legible por otros.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&k, std::fs::Permissions::from_mode(0o600));
+                }
+                return Some(r);
+            }
+        }
+        None
     }
 
     /// Instala lo que haya en disco para `name` si todavía no venció. `true` si quedó instalado.
@@ -238,7 +297,7 @@ impl CertManager {
 
     fn install(&self, name: &str, ck: Arc<CertifiedKey>, not_after: i64) {
         if let Ok(mut c) = self.certs.write() {
-            c.insert(name.to_ascii_lowercase(), ck);
+            c.insert(name.to_ascii_lowercase(), (ck, not_after));
         }
         if let Ok(mut n) = self.not_after.lock() {
             n.insert(name.to_ascii_lowercase(), not_after);
@@ -305,17 +364,8 @@ impl CertManager {
     /// ¿Se puede pedir esta emisión? El backoff del nombre vale siempre; el tope por hora sólo
     /// para la emisión bajo demanda (la inicial y las renovaciones no lo gastan).
     fn admit(&self, name: &str, counts: bool) -> Result<(), String> {
-        if let Ok(f) = self.failures.lock() {
-            if let Some((at, n)) = f.get(name) {
-                let wait = Duration::from_secs(60u64.saturating_mul(1 << (*n).min(6))).min(Duration::from_secs(3600));
-                if at.elapsed() < wait {
-                    return Err(format!(
-                        "{}: issuance failed recently; retrying in {}s",
-                        name,
-                        wait.saturating_sub(at.elapsed()).as_secs()
-                    ));
-                }
-            }
+        if let Some(left) = self.backoff_left(name) {
+            return Err(format!("{}: issuance failed recently; retrying in {}s", name, left.as_secs()));
         }
         if !counts {
             return Ok(());
@@ -332,6 +382,15 @@ impl CertManager {
         }
         q.push_back(Instant::now());
         Ok(())
+    }
+
+    /// Lo que falta para volver a intentar un nombre que falló (`None`: se puede ya).
+    fn backoff_left(&self, name: &str) -> Option<Duration> {
+        let f = self.failures.lock().ok()?;
+        let (at, n) = f.get(name)?;
+        let wait = self.retry_base.saturating_mul(1 << (*n).min(6)).min(Duration::from_secs(3600));
+        let left = wait.saturating_sub(at.elapsed());
+        (!left.is_zero()).then_some(left)
     }
 
     fn note_failure(&self, name: &str) {
@@ -381,19 +440,22 @@ impl CertManager {
         if wildcard && self.opts.dns.is_none() {
             return Err(format!("{}: a wildcard certificate needs the DNS-01 challenge — add `tls dns <task>` to the serve block", name));
         }
-        let account = self.account().await?;
+        // Un plazo para la emisión entera (B: la CA en un agujero negro colgaba el arranque). Cada
+        // paso de red corre dentro de él; la limpieza de abajo corre igual si venció.
+        let deadline = tokio::time::Instant::now() + self.order_timeout + self.dns_wait;
+        let account = within(deadline, name, "account", self.account()).await?;
         let identifier = match name.parse::<std::net::IpAddr>() {
             Ok(ip) => Identifier::Ip(ip),
             Err(_) => Identifier::Dns(name.to_string()),
         };
-        let mut order = account
-            .new_order(&NewOrder::new(&[identifier]))
-            .await
-            .map_err(|e| format!("ACME new order failed for {}: {}", name, e))?;
+        let mut order = within(deadline, name, "new order", async {
+            account.new_order(&NewOrder::new(&[identifier])).await.map_err(|e| format!("ACME new order failed for {}: {}", name, e))
+        })
+        .await?;
         let mut dns_published: Vec<(String, String)> = Vec::new();
         let mut alpn_names: Vec<String> = Vec::new();
         let mut http_tokens: Vec<String> = Vec::new();
-        let result: Result<(), String> = async {
+        let result: Result<(), String> = within(deadline, name, "challenge", async {
             let mut authorizations = order.authorizations();
             while let Some(r) = authorizations.next().await {
                 let mut authz = r.map_err(|e| format!("ACME authorization failed: {}", e))?;
@@ -461,7 +523,7 @@ impl CertManager {
                 return Err(format!("ACME order for {} did not become ready (status: {:?})", name, status));
             }
             Ok(())
-        }
+        })
         .await;
         // Limpieza SIEMPRE (también si falló): el TXT se retira, el cert de reto se suelta y los
         // tokens de HTTP-01 se borran.
@@ -484,17 +546,25 @@ impl CertManager {
             }
         }
         result?;
-        let key_pem = order.finalize().await.map_err(|e| format!("ACME finalize failed: {}", e))?;
-        let cert_pem = order
-            .poll_certificate(&RetryPolicy::default())
-            .await
-            .map_err(|e| format!("ACME certificate retrieval failed: {}", e))?;
+        let (key_pem, cert_pem) = within(deadline, name, "certificate", async {
+            let key_pem = order.finalize().await.map_err(|e| format!("ACME finalize failed: {}", e))?;
+            let cert_pem = order
+                .poll_certificate(&RetryPolicy::default())
+                .await
+                .map_err(|e| format!("ACME certificate retrieval failed: {}", e))?;
+            Ok((key_pem, cert_pem))
+        })
+        .await?;
         // Validados ANTES de tocar el disco: la clave tiene que corresponder al certificado.
         let (ck, not_after) = certified_from_pem(cert_pem.as_bytes(), key_pem.as_bytes())?;
         self.ensure_dir()?;
         let (cp, kp) = self.paths(name);
-        // La clave primero y el certificado después, cada uno atómico: un disco lleno a mitad de
-        // camino deja el par anterior entero (o ninguno), nunca uno roto.
+        // La clave primero y el certificado después, cada uno atómico. Antes, una copia de la clave
+        // actual: si se corta entre los dos `rename`, el certificado viejo carga con ella (`load`).
+        if let Ok(old) = std::fs::read(&kp) {
+            let prev = self.prev_key_path(name);
+            write_private(&prev, &old).map_err(|e| format!("could not keep the previous key {}: {}", prev.display(), e))?;
+        }
         write_private(&kp, key_pem.as_bytes()).map_err(|e| format!("could not write key {}: {}", kp.display(), e))?;
         write_atomic(&cp, cert_pem.as_bytes(), false).map_err(|e| format!("could not write cert {}: {}", cp.display(), e))?;
         self.install(name, ck, not_after);
@@ -556,11 +626,16 @@ impl CertManager {
                 if let Ok(mut c) = self.ask_cache.lock() {
                     if c.len() >= CACHE_CAP {
                         c.retain(|_, (yes, at)| at.elapsed() < if *yes { ASK_YES_TTL } else { ASK_NO_TTL });
-                        if c.len() >= CACHE_CAP {
-                            c.clear();
-                        }
                     }
-                    c.insert(sni.clone(), (v, Instant::now()));
+                    if c.len() >= CACHE_CAP {
+                        // Lleno de respuestas vigentes: se descartan los "no" (baratos de volver a
+                        // preguntar), nunca los "sí"; si ni así hay lugar, esta respuesta no se
+                        // guarda.
+                        c.retain(|_, (yes, _)| *yes);
+                    }
+                    if c.len() < CACHE_CAP {
+                        c.insert(sni.clone(), (v, Instant::now()));
+                    }
                 }
                 v
             }
@@ -576,16 +651,16 @@ impl CertManager {
     // -------------------------------------------------------------------------
 
     /// Al arrancar: todo nombre fijo con un certificado vigente en disco se instala (aunque esté
-    /// por vencer: la renovación sigue en segundo plano); los que faltan se emiten. Un nombre que
-    /// falla va al log y NO aborta el arranque (B6). Devuelve los nombres que quedaron sin
-    /// certificado.
+    /// por vencer: la renovación sigue en segundo plano); los que faltan se emiten, en paralelo y
+    /// cada uno con su plazo. Un nombre que falla va al log y NO aborta el arranque (B6): la
+    /// renovación lo reintenta (ver `spawn_renewal`). Devuelve los nombres sin certificado.
     pub fn bootstrap(self: &Arc<Self>) -> Result<Vec<String>, String> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .map_err(|e| format!("could not start ACME runtime: {}", e))?;
-        let mut missing = Vec::new();
+        let mut jobs = tokio::task::JoinSet::new();
         for name in self.opts.domains.clone() {
             let name = name.to_ascii_lowercase();
             let have = self.load_installed(&name);
@@ -593,19 +668,62 @@ impl CertManager {
                 continue;
             }
             let me = self.clone();
-            let n = name.clone();
-            if let Err(e) = rt.block_on(async move { me.issue_for(&n, Why::Fixed).await }) {
-                eprintln!("ACME: {}", e);
-                if !have {
-                    missing.push(name);
-                }
-            }
+            jobs.spawn_on(
+                async move {
+                    if let Err(e) = me.issue_for(&name, Why::Fixed).await {
+                        eprintln!("ACME: {}", e);
+                    }
+                },
+                rt.handle(),
+            );
         }
-        Ok(missing)
+        rt.block_on(async { while jobs.join_next().await.is_some() {} });
+        Ok(self.missing_fixed())
     }
 
-    /// Cada hora mira qué vence en menos de 30 días y lo renueva (con el backoff de cada nombre).
-    /// Un nombre bajo demanda se le vuelve a preguntar a `ask` antes de renovarlo.
+    /// Los nombres fijos sin certificado vigente.
+    fn missing_fixed(&self) -> Vec<String> {
+        self.opts.domains.iter().map(|d| d.to_ascii_lowercase()).filter(|d| !self.has_cert(d)).collect()
+    }
+
+    /// Una pasada de renovación: lo que vence en menos de 30 días (o ya venció) y los nombres
+    /// fijos sin certificado (un arranque con la CA caída), cada uno con su backoff. Un nombre
+    /// bajo demanda se le vuelve a preguntar a `ask` antes de renovarlo. Devuelve los fijos que
+    /// siguen sin certificado.
+    pub async fn renew_due(self: &Arc<Self>) -> Vec<String> {
+        let mut due: Vec<String> = self
+            .not_after
+            .lock()
+            .map(|n| n.iter().filter(|(_, t)| **t - now_unix() < RENEW_BEFORE).map(|(k, _)| k.clone()).collect())
+            .unwrap_or_default();
+        for name in self.missing_fixed() {
+            if !due.contains(&name) {
+                due.push(name);
+            }
+        }
+        for name in due {
+            if self.backoff_left(&name).is_some() {
+                continue;
+            }
+            let fixed = self.opts.domains.iter().any(|d| d.eq_ignore_ascii_case(&name));
+            if !fixed {
+                if let Some(ask) = self.opts.ask.clone() {
+                    let n = name.clone();
+                    if run_task(move || ask(&n), ASK_TIMEOUT).await != Some(true) {
+                        continue; // `ask` ya no lo aprueba: se deja vencer.
+                    }
+                }
+            }
+            let why = if fixed && !self.has_cert(&name) { Why::Fixed } else { Why::Renewal };
+            if let Err(e) = self.issue_for(&name, why).await {
+                eprintln!("ACME: renewal failed for {}: {}", name, e);
+            }
+        }
+        self.missing_fixed()
+    }
+
+    /// En segundo plano: una pasada de `renew_due` cada hora, o cada minuto mientras falte el
+    /// certificado de algún nombre fijo.
     pub fn spawn_renewal(self: &Arc<Self>) {
         let me = self.clone();
         let _ = std::thread::Builder::new().name("acme-renew".to_string()).spawn(move || {
@@ -616,30 +734,43 @@ impl CertManager {
                     return;
                 }
             };
+            let mut missing = !me.missing_fixed().is_empty();
             loop {
-                std::thread::sleep(Duration::from_secs(3600));
-                let due: Vec<String> = me
-                    .not_after
-                    .lock()
-                    .map(|n| n.iter().filter(|(_, t)| **t - now_unix() < RENEW_BEFORE).map(|(k, _)| k.clone()).collect())
-                    .unwrap_or_default();
-                for name in due {
-                    let fixed = me.opts.domains.iter().any(|d| d.eq_ignore_ascii_case(&name));
-                    if !fixed {
-                        if let Some(ask) = me.opts.ask.clone() {
-                            let n = name.clone();
-                            if rt.block_on(run_task(move || ask(&n), ASK_TIMEOUT)) != Some(true) {
-                                continue; // `ask` ya no lo aprueba: se deja vencer.
-                            }
-                        }
-                    }
-                    if let Err(e) = rt.block_on(me.issue_for(&name, Why::Renewal)) {
-                        eprintln!("ACME: renewal failed for {}: {}", name, e);
-                    }
-                }
+                std::thread::sleep(if missing { RETRY_MISSING_EVERY } else { Duration::from_secs(3600) });
+                missing = !rt.block_on(me.renew_due()).is_empty();
             }
         });
     }
+}
+
+/// Corre un paso de la emisión con el plazo de la emisión entera.
+async fn within<T>(
+    deadline: tokio::time::Instant,
+    name: &str,
+    what: &str,
+    f: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    match tokio::time::timeout_at(deadline, f).await {
+        Ok(r) => r,
+        Err(_) => Err(format!("{}: the ACME {} step did not finish in time", name, what)),
+    }
+}
+
+/// ¿El certificado (la hoja) nombra a `name` entre sus SAN DNS? Exacto, sin distinguir
+/// mayúsculas (`*.x` se compara como texto: es el nombre del archivo de un wildcard).
+fn leaf_covers(cert_pem: &[u8], name: &str) -> bool {
+    let Some(Ok(leaf)) = rustls_pemfile::certs(&mut &cert_pem[..]).next() else { return false };
+    let Ok((_, x)) = x509_parser::parse_x509_certificate(leaf.as_ref()) else { return false };
+    let Ok(Some(san)) = x.subject_alternative_name() else { return false };
+    san.value.general_names.iter().any(|g| match g {
+        x509_parser::extensions::GeneralName::DNSName(d) => d.eq_ignore_ascii_case(name),
+        x509_parser::extensions::GeneralName::IPAddress(b) => match name.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(v4)) => *b == v4.octets(),
+            Ok(std::net::IpAddr::V6(v6)) => *b == v6.octets(),
+            Err(_) => false,
+        },
+        _ => false,
+    })
 }
 
 /// El resolver de rustls: el reto TLS-ALPN-01 primero, después el certificado del nombre, y sin
@@ -714,10 +845,12 @@ fn alpn_challenge_cert(name: &str, digest: &[u8]) -> Result<CertifiedKey, String
 /// El directorio de certificados: en Unix sólo del dueño (0700), también si ya existía.
 fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
+    // Best-effort: un `SYNSEMA_CERT_DIR` de otro dueño (montado, compartido) no puede cambiar de
+    // permisos, y eso no tiene que impedir escribir los archivos (que van 0600 igual).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
     Ok(())
 }
@@ -726,7 +859,11 @@ fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
 /// en Unix 0600 (también si el archivo ya existía con otros permisos).
 fn write_atomic(path: &std::path::Path, data: &[u8], private: bool) -> std::io::Result<()> {
     use std::io::Write;
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    // El nombre entero + sufijo: con `with_extension`, `foo.key.pem` y el certificado de un
+    // dominio `foo.key` compartían temporal.
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp-{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
     {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
@@ -874,6 +1011,96 @@ mod tests {
         assert!(e.contains("busy"), "{}", e);
         assert!(m.ask_cache.lock().unwrap().get("busy.example").is_none(), "lo rechazado por carga no queda en caché");
         drop(all);
+    }
+
+    /// Auditoría ronda 2 (R8): la clave nueva quedó escrita pero el certificado no (se cortó entre
+    /// los dos `rename`): el certificado viejo carga con la clave anterior.
+    #[test]
+    fn a_pair_cut_between_the_two_renames_loads_with_the_previous_key() {
+        let dir = std::env::temp_dir().join(format!("syn_acme_pair_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let opts = AcmeOptions { email: None, domains: vec![], ask: None, dns: None, http_store: None };
+        let m = CertManager::build(opts, dir.clone(), 20);
+        create_private_dir(&dir).unwrap();
+        let (c_old, k_old) = self_signed("pair.example");
+        let (_c_new, k_new) = self_signed("pair.example");
+        let (cp, kp) = m.paths("pair.example");
+        write_atomic(&cp, c_old.as_bytes(), false).unwrap();
+        // Lo que hace `issue_inner` antes de los `rename`, y después sólo el primero.
+        write_private(&m.prev_key_path("pair.example"), k_old.as_bytes()).unwrap();
+        write_private(&kp, k_new.as_bytes()).unwrap();
+        assert!(m.load("pair.example").is_some(), "el certificado viejo con la clave anterior");
+        // Un certificado de OTRO nombre en el archivo no se sirve.
+        let (c_other, k_other) = self_signed("other.example");
+        write_atomic(&cp, c_other.as_bytes(), false).unwrap();
+        write_private(&kp, k_other.as_bytes()).unwrap();
+        assert!(m.load("pair.example").is_none(), "no cubre el nombre");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn temporaries_do_not_collide_between_a_key_and_a_dotted_name() {
+        let dir = std::env::temp_dir().join(format!("syn_acme_tmp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        create_private_dir(&dir).unwrap();
+        // `foo.key.pem` es la clave de `foo` y el certificado de un dominio `foo.key`.
+        let p = dir.join("foo.key.pem");
+        write_atomic(&p, b"x", false).unwrap();
+        assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().contains("tmp")));
+        assert_eq!(std::fs::read(&p).unwrap(), b"x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_expired_certificate_is_not_served() {
+        let m = manager(&["old.example"]);
+        let (c, k) = self_signed("old.example");
+        let (ck, _) = certified_from_pem(c.as_bytes(), k.as_bytes()).unwrap();
+        m.install("old.example", ck.clone(), now_unix() - 10);
+        m.install("*.w.example", ck, now_unix() - 10);
+        assert!(m.cert_for("old.example").is_none());
+        assert!(m.cert_for("a.w.example").is_none());
+        assert!(m.default_cert().is_none());
+        assert_eq!(m.missing_fixed(), vec!["old.example".to_string()], "la renovación lo vuelve a pedir");
+    }
+
+    /// Auditoría ronda 2 (R2): un nombre fijo que no se pudo emitir al arrancar entra en la
+    /// pasada de renovación (antes sólo se miraban los que ya tenían certificado), y la CA que no
+    /// contesta no cuelga: vence el plazo de la emisión.
+    #[test]
+    fn a_fixed_name_missing_at_boot_is_retried_and_a_silent_ca_times_out() {
+        // Una "CA" que acepta la conexión y nunca contesta.
+        let hole = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = hole.local_addr().unwrap().port();
+        let held = std::sync::Arc::new(Mutex::new(Vec::new()));
+        {
+            let held = held.clone();
+            std::thread::spawn(move || {
+                for c in hole.incoming().flatten() {
+                    held.lock().unwrap().push(c);
+                }
+            });
+        }
+        let dir = std::env::temp_dir().join(format!("syn_acme_retry_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let opts = AcmeOptions { email: None, domains: vec!["late.example".to_string()], ask: None, dns: None, http_store: None };
+        let mut m = CertManager::build(opts, dir.clone(), 20);
+        m.directory_url = format!("https://127.0.0.1:{}/dir", port);
+        m.order_timeout = Duration::from_millis(800);
+        m.dns_wait = Duration::ZERO;
+        m.retry_base = Duration::ZERO;
+        let m = Arc::new(m);
+        let t0 = Instant::now();
+        let missing = m.bootstrap().unwrap();
+        assert_eq!(missing, vec!["late.example".to_string()]);
+        assert!(t0.elapsed() < Duration::from_secs(5), "el arranque no espera a la CA: {:?}", t0.elapsed());
+        // La pasada de renovación lo intenta otra vez (vuelve a vencer el plazo: la CA sigue muda).
+        let before = held.lock().unwrap().len();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let still = rt.block_on(m.renew_due());
+        assert_eq!(still, vec!["late.example".to_string()]);
+        assert!(held.lock().unwrap().len() > before, "la renovación volvió a pedir el certificado");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

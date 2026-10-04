@@ -47,6 +47,31 @@ fn http_get(addr: &str, port: u16, path: &str) -> String {
     resp.to_ascii_lowercase()
 }
 
+/// Un handshake TLS con SNI `example.test` contra un puerto en modo `tls auto` SIN certificado
+/// (la CA está caída): un servidor TLS de verdad contesta el ClientHello con un alerta. Devuelve
+/// el error del cliente. (Antes el test aceptaba cualquier cosa que no fuera un 200 en claro, y
+/// pasaba también con una respuesta vacía.)
+fn tls_handshake_error(port: u16) -> String {
+    use std::sync::Arc;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+    let sn = rustls::pki_types::ServerName::try_from("example.test".to_string()).unwrap();
+    let mut conn = rustls::ClientConnection::new(Arc::new(cfg), sn).unwrap();
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    loop {
+        match conn.complete_io(&mut sock) {
+            Ok(_) if !conn.is_handshaking() => return "handshake completed".to_string(),
+            Ok(_) => continue,
+            Err(e) => return format!("{:?}", e),
+        }
+    }
+}
+
 /// Corre el serve hasta que retorna (para casos de ERROR; nunca debería bloquear).
 /// Devuelve (success, errors_unidos). Si bloquea más de `secs`, el test falla.
 fn run_to_completion(prog: String, ov: ServeOverrides, secs: u64) -> (bool, String) {
@@ -126,14 +151,18 @@ fn flag_tls_auto_is_the_toggle() {
     // v0.6.42 (auditoría B6): con la CA caída el servidor ARRANCA igual (reintenta en segundo
     // plano) en modo TLS: un GET en claro a ese puerto no es un 200.
     start_bg(PROG_8080.to_string(), "127.0.0.1", p2, ov2);
-    let resp = http_get("127.0.0.1", p2, "/ping");
+    // El puerto se abre antes de intentar la emisión: se le da tiempo a fallar contra la CA.
+    thread::sleep(Duration::from_millis(500));
+    let alert = tls_handshake_error(p2);
 
     std::env::remove_var("SYNSEMA_ACME_DIRECTORY");
     std::env::remove_var("SYNSEMA_ACME_HTTP_PORT");
     std::env::remove_var("SYNSEMA_CERT_DIR");
     let _ = std::fs::remove_dir_all(&cert_dir);
 
-    assert!(!resp.starts_with("http/1.1 200"), "con --tls-auto el puerto habla TLS, no HTTP plano: {}", resp);
+    // Un alerta TLS del servidor (no tiene certificado para ese nombre todavía): el puerto habla
+    // TLS administrado. Un HTTP plano o un socket mudo darían otro error.
+    assert!(alert.contains("AlertReceived"), "con --tls-auto el puerto habla TLS: {}", alert);
 }
 
 // ── Test 4: precedencia — el flag pisa la cláusula del archivo ───────────────────
@@ -232,14 +261,15 @@ serve on 8080
     };
     // Arranca (sin el error espurio "per-host … requires a default tls cert") y en modo TLS.
     start_bg(src.to_string(), "127.0.0.1", p, ov);
-    let resp = http_get("127.0.0.1", p, "/");
+    thread::sleep(Duration::from_millis(500));
+    let alert = tls_handshake_error(p);
 
     std::env::remove_var("SYNSEMA_ACME_DIRECTORY");
     std::env::remove_var("SYNSEMA_ACME_HTTP_PORT");
     std::env::remove_var("SYNSEMA_CERT_DIR");
     let _ = std::fs::remove_dir_all(&cert_dir);
 
-    assert!(!resp.starts_with("http/1.1 200"), "el puerto habla TLS: {}", resp);
+    assert!(alert.contains("AlertReceived"), "el puerto habla TLS: {}", alert);
 }
 
 // ── Bonus: política de múltiples bloques serve con flags → rechazo claro ─────────
