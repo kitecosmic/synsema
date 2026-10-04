@@ -41,6 +41,19 @@ impl Node {
     }
 }
 
+/// v0.6.42 — certificados automáticos (ACME) del bloque `serve`, aparte del nodo para no
+/// agrandar `NodeKind` (lo mide `tests/type_sizes.rs`): `tls auto [<email>]`, `domain <expr>`,
+/// `domain ask <task>` (emisión bajo demanda: la task aprueba cada nombre nuevo) y
+/// `tls dns <task>` (reto DNS-01 publicado por el programa; lo exige un `*.` en `domain`).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ServeAcme {
+    pub tls_auto: bool,
+    pub email: Option<Box<Node>>,
+    pub domain: Option<Box<Node>>,
+    pub domain_ask: Option<Box<Node>>,
+    pub tls_dns: Option<Box<Node>>,
+}
+
 /// Parámetro de un `task`: nombre + default opcional (Batch 2). El default es un
 /// `Node` (AST) que se evalúa en CALL TIME, en el `closure_env` del task (G5).
 #[derive(Clone, Debug, PartialEq)]
@@ -608,10 +621,12 @@ pub enum NodeKind {
         tls_cert: Option<Box<Node>>,
         tls_key: Option<Box<Node>>,
         redirect_https: bool,
-        // A2 batch 2 — ACME/auto-HTTPS: `tls auto [<email>]` + `domain <expr>`.
-        tls_auto: bool,
-        tls_auto_email: Option<Box<Node>>,
-        domain: Option<Box<Node>>,
+        // A2 batch 2 — ACME/auto-HTTPS: `tls auto [<email>]` + `domain <expr>`; v0.6.42 suma
+        // `domain ask <task>` y `tls dns <task>`. En un `Box` aparte: ver `ServeAcme`.
+        acme: Option<Box<ServeAcme>>,
+        /// v0.6.42 — `trust proxy <expr>`: IPs o CIDRs (texto o lista) de los proxys de confianza
+        /// delante del servidor. Sólo de ellos se aceptan `X-Forwarded-*`; default: de nadie.
+        trust_proxy: Option<Box<Node>>,
         /// `bind <expr>` — dirección en la que escucha el listener (tanda escritorio): el
         /// programa declara su exposición (`bind "127.0.0.1"` = sólo local). Precedencia:
         /// `--bind` > esta cláusula > `0.0.0.0`.

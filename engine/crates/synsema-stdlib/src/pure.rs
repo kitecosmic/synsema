@@ -50,6 +50,8 @@ pub const SOCKETS: &[&str] = &[
     "mtls_identity",
     "ws_connect", "ws_send", "ws_recv", "ws_close", "ws_status", "ws_stats",
     "ws_select", "ws_select_all", "ws_broadcast",
+    // v0.6.42
+    "tcp_connect", "tcp_send", "tcp_recv", "tcp_close", "tcp_stats",
 ];
 pub const DB: &[&str] = &[
     "db_open", "db_close", "sql", "sql_exec", "sql_tables", "sql_batch", "paged",
@@ -71,6 +73,8 @@ pub const HUB: &[&str] = &[
     "proc_select", "proc_status", "proc_kill", "proc_wait", "proc_close", "proc_stats",
     "watch", "watch_recv", "watch_stats", "watch_close",
     "term_recv", "term_size", "term_write", "term_stats", "term_close",
+    // v0.6.42 — un pipe vive en el hub (sus extremos entran en `select`).
+    "pipe", "pipe_send", "pipe_recv", "pipe_close",
 ];
 /// Sólo wasm (un intérprete embebido no tiene hilos): el nativo puro los conserva.
 pub const BUS: &[&str] = &["bus_publish", "bus_subscribe", "bus_recv", "bus_unsubscribe", "bus_topics"];

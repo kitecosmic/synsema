@@ -1280,6 +1280,8 @@ pub fn register_secure_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
                 // Dormir en tramos: una cancelación cooperativa (timeout de handler,
                 // shutdown, agent_stop) corta el sleep en ≤100 ms, no al vencer.
                 let deadline = Instant::now() + std::time::Duration::from_secs_f64(secs);
+                // v0.6.42 — bajo `serve`, el hilo que duerme suelta su permiso de ejecución.
+                let _w = synsema_core::waiting::waiting();
                 loop {
                     i.check_cancel()?;
                     let now = Instant::now();

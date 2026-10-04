@@ -296,6 +296,8 @@ fn serve_settings_from_flags(flags: &[(String, String)], secure: bool) -> Result
         tls_cert: s.tls_cert.clone(),
         tls_key: s.tls_key.clone(),
         bind: Some(s.bind.clone()),
+        // v0.6.42 — no se hornea: el binario usa la cláusula `trust proxy` de su programa.
+        trust_proxy: None,
         ceiling: None,
         // `--attested` no se hornea en el binario: se decide donde corre (como el techo).
         attested: false,

@@ -39,7 +39,7 @@ mod synfide;
 mod update;
 mod code;
 
-const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--health <path>] [--attested] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] <archivo.syn | -> [-- args...] | test [-v] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--labels] [--jitless] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
+const USAGE: &str = "uso: synsema <conform [--swarm] [--flat] | serve [--secure] [--watch] [--port N] [--domain d1,d2] [--tls-auto <email> | --tls-cert <p> --tls-key <p>] [--bind addr] [--trust-proxy ip,cidr] [--health <path>] [--attested] | run [--flat] [--explain] [--format human|json] [--provider <name>] [--attest] <archivo.syn | -> [-- args...] | test [-v] <archivo|dir> | build <main.syn> -o <salida> [--include <p>]... [--engine-binary <ruta>] [--serve [--bind addr] ...] [--no-console] [--icon <svg|png|ico>] [--bundle [--name <n>] [--id <id>]] | check | code <outline|symbol|refs|routes|caps|check|search|deps> [--json] | code --mcp | openapi [--out f] [--base-url URL] | tokens | ast | repl | daemon | init [dir] [--synfide | --pwa | --desktop] | llm status [--json] | version | update> [--sandbox | --cap-set <list> | --deterministic] [--labels] [--jitless] [--profile native|pure] [--audit json|<ruta>|fd:N|unix:<ruta>] [--env-file <path> | --no-env-file] <archivo.syn>";
 
 // `build_ceiling` (--sandbox/--cap-set → techo) vive en synsema-capabilities: lo comparten
 // este binario y `synsema-wasm` (mismas flags, misma semántica en los dos front-ends).
@@ -412,6 +412,7 @@ fn run_bundled(bundle: synsema_core::bundle::Bundle, program_args: Vec<String>) 
             tls_cert: s.tls_cert,
             tls_key: s.tls_key,
             bind: Some(s.bind),
+            trust_proxy: None,
             ceiling: None,
             attested: false,
         };
@@ -437,13 +438,20 @@ fn run_bundled(bundle: synsema_core::bundle::Bundle, program_args: Vec<String>) 
     for line in &result.output {
         println!("{}", line);
     }
-    if !result.success {
-        for e in &result.errors {
-            eprintln!("{}", e);
-        }
-        return ExitCode::from(1);
+    for e in &result.errors {
+        eprintln!("{}", e);
     }
-    ExitCode::SUCCESS
+    ExitCode::from(run_exit_code(&result))
+}
+
+/// v0.6.42 — el código de salida de una corrida: el de `exit(code)` si el programa lo pidió,
+/// si no 0 / 1 como siempre.
+fn run_exit_code(result: &synsema_core::interpreter::RunResult) -> u8 {
+    match synsema_runtime::engine::last_run_exit_code() {
+        Some(c) => c as u8,
+        None if result.success => 0,
+        None => 1,
+    }
 }
 
 /// F4.2: `--jitless` entre los flags del CLI (antes de un `--`: lo de después es del programa), o
@@ -1363,6 +1371,17 @@ fn cmd_serve(args: &[String]) -> ExitCode {
             "--tls-cert" => ov.tls_cert = Some(next_val!("--tls-cert")),
             "--tls-key" => ov.tls_key = Some(next_val!("--tls-key")),
             "--bind" => ov.bind = Some(next_val!("--bind")),
+            // v0.6.42 — proxys de confianza (IPs o CIDRs separados por coma).
+            "--trust-proxy" => {
+                let v = next_val!("--trust-proxy");
+                let ts: Vec<String> =
+                    v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                if ts.is_empty() {
+                    eprintln!("synsema serve: --trust-proxy requires at least one IP or CIDR");
+                    return ExitCode::from(2);
+                }
+                ov.trust_proxy = Some(ts);
+            }
             // v0.6.20 — salud opt-in del HOST (la misma variable que lee el runtime).
             "--health" => {
                 let v = next_val!("--health");
@@ -1650,7 +1669,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     // `run_program` y una API para cualquier runner.
     if report_mode {
         let result = run_program_ceiled_opts(&source, &filename, ceiling, false);
-        let exit = if result.success { 0 } else { 1 };
+        let exit = run_exit_code(&result) as i32;
         let mut report = serde_json::json!({
             "ok": result.success,
             "output": result.output,
@@ -1698,8 +1717,9 @@ fn cmd_run(args: &[String]) -> ExitCode {
             for e in &result.errors {
                 eprintln!("{}", e);
             }
-            audit::summary(1);
-            return ExitCode::from(1);
+            let code = run_exit_code(&result);
+            audit::summary(code as i32);
+            return ExitCode::from(code);
         }
         match attest_run(&source, &filename, input, &result.output) {
             Ok(fields) => println!("{}", fields),
@@ -1721,15 +1741,12 @@ fn cmd_run(args: &[String]) -> ExitCode {
     for line in &result.output {
         println!("{}", line);
     }
-    if !result.success {
-        for e in &result.errors {
-            eprintln!("{}", e);
-        }
-        audit::summary(1);
-        return ExitCode::from(1);
+    for e in &result.errors {
+        eprintln!("{}", e);
     }
-    audit::summary(0);
-    ExitCode::SUCCESS
+    let code = run_exit_code(&result);
+    audit::summary(code as i32);
+    ExitCode::from(code)
 }
 
 /// El campo `steps` de un informe JSON: el contador, o `null` si la corrida tocó datos privados.

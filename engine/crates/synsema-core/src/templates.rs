@@ -914,6 +914,119 @@ fn check_program_static_inner(
                 }
             }
         }
+        // v0.6.42 — (c) un nombre LOCAL (`let` dentro de un bloque, parámetro de task o de lambda,
+        //     variable de `each`, la del `recover`) que repite un alias de `use`: en su ámbito
+        //     `alias.x` lee la variable, no el módulo ("Cannot access property 'x' of text").
+        //     (d) `alias.nombre` donde el módulo no exporta `nombre`: falla recién al ejecutar
+        //     esa rama ("Map has no key"). Los dos son avisos (no cambian el exit code) y no dan
+        //     falsos positivos: un alias sombreado o un módulo que no se pudo leer no se juzga.
+        {
+            let mut aliases: Vec<(String, String, usize)> = Vec::new();
+            for stmt in &program.statements {
+                if let NK::UseImport { alias, path } = &stmt.kind {
+                    aliases.push((alias.clone(), path.clone(), stmt.location.line));
+                }
+            }
+            if !aliases.is_empty() {
+                let mut locals: Vec<(&'static str, String, usize)> = Vec::new();
+                for stmt in &program.statements {
+                    let top = match &stmt.kind {
+                        NK::ExportDeclaration { declaration } => declaration.as_ref(),
+                        _ => stmt,
+                    };
+                    // Una pasada por la sentencia entera; el `let` de nivel superior (la
+                    // sentencia misma) no es local: lo cubre el aviso (a).
+                    crate::ast_api::walk(top, &mut |n| match &n.kind {
+                        NK::LetBinding { name, .. } if !std::ptr::eq(n, top) => {
+                            locals.push(("variable", name.to_string(), n.location.line))
+                        }
+                        NK::EachStatement { variable, .. } => {
+                            locals.push(("`each` variable", variable.to_string(), n.location.line))
+                        }
+                        NK::TryRecover { error_variable, .. } => {
+                            locals.push(("`recover` variable", error_variable.clone(), n.location.line))
+                        }
+                        NK::LambdaExpression { parameters, .. } => {
+                            for p in parameters {
+                                locals.push(("lambda parameter", p.to_string(), n.location.line));
+                            }
+                        }
+                        NK::TaskDefinition { parameters, .. } => {
+                            for p in parameters {
+                                locals.push(("task parameter", p.name.to_string(), n.location.line));
+                            }
+                        }
+                        _ => {}
+                    });
+                }
+                // Un `let`/grupo de nivel superior con el nombre del alias ya lo avisa (a), y ahí
+                // `alias.x` lee el `let`: tampoco se juzga contra los exports del módulo.
+                let mut shadowed: Vec<String> = Vec::new();
+                for stmt in &program.statements {
+                    crate::ast_api::walk(stmt, &mut |n| match &n.kind {
+                        NK::RoutesDeclaration { name, .. } => shadowed.push(name.clone()),
+                        _ => {}
+                    });
+                    let top = match &stmt.kind {
+                        NK::ExportDeclaration { declaration } => declaration.as_ref(),
+                        _ => stmt,
+                    };
+                    if let NK::LetBinding { name, .. } = &top.kind {
+                        shadowed.push(name.to_string());
+                    }
+                }
+                for (kind, name, line) in &locals {
+                    if let Some((_, _, use_line)) = aliases.iter().find(|(a, _, _)| a == name) {
+                        if !shadowed.contains(name) {
+                            shadowed.push(name.clone());
+                        }
+                        warnings.push(format!(
+                            "{}:{}: warning: {} '{}' shadows the module alias `use ... as {}` (line {}) — in its scope `{}.x` reads the variable, not the module; rename one of them",
+                            file_path, line, kind, name, name, use_line, name
+                        ));
+                    }
+                }
+                let base_dir = Path::new(file_path).parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                let project_root = project_root_of(stack.first().map(String::as_str).unwrap_or(file_path));
+                for (alias, raw, use_line) in &aliases {
+                    if shadowed.contains(alias) {
+                        continue;
+                    }
+                    let Ok(resolved) = resolve_module_path(raw, &base_dir, project_root.as_deref()) else { continue };
+                    let Ok(module) = load(&resolved, raw) else { continue };
+                    let mut exports: Vec<String> = Vec::new();
+                    for st in &module.statements {
+                        if let NK::ExportDeclaration { declaration } = &st.kind {
+                            match &declaration.kind {
+                                NK::TaskDefinition { name, .. }
+                                | NK::TypeDefinition { name, .. }
+                                | NK::EnumDefinition { name, .. }
+                                | NK::RoutesDeclaration { name, .. } => exports.push(name.clone()),
+                                NK::LetBinding { name, .. } => exports.push(name.to_string()),
+                                _ => {}
+                            }
+                        }
+                    }
+                    let mut reported: Vec<String> = Vec::new();
+                    for stmt in &program.statements {
+                        crate::ast_api::walk(stmt, &mut |n| {
+                            if let NK::PropertyAccess { property_name, object, .. } = &n.kind {
+                                if matches!(&object.kind, NK::Identifier { name } if name == alias)
+                                    && !exports.contains(property_name)
+                                    && !reported.contains(property_name)
+                                {
+                                    reported.push(property_name.clone());
+                                    warnings.push(format!(
+                                        "{}:{}: warning: `{}.{}` — the module `{}` (use on line {}) does not export '{}'; it fails when that line runs. Add `export` to it in the module, or check the name",
+                                        file_path, n.location.line, alias, property_name, raw, use_line, property_name
+                                    ));
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        }
         // (b) una ruta `GET /:x` de un segmento tapa las URLs reservadas del runtime; desde
         //     v0.6.20 el runtime las sirve primero, y acá se dice para que el autor lo sepa.
         if !is_module {
@@ -926,6 +1039,30 @@ fn check_program_static_inner(
                 "/.well-known/agent-card.json",
                 "/.well-known/agent.json",
             ];
+            // v0.6.42 — un `*.` literal en `domain` sólo se puede emitir por DNS-01: sin `tls dns`
+            // falla al arrancar; acá se avisa antes.
+            for stmt in &program.statements {
+                if let NK::ServeBlock { acme: Some(a), .. } = &stmt.kind {
+                    if a.tls_dns.is_none() {
+                        let mut wild: Vec<String> = Vec::new();
+                        if let Some(d) = &a.domain {
+                            crate::ast_api::walk(d, &mut |n| {
+                                if let NK::TextLiteral { value } = &n.kind {
+                                    if value.starts_with("*.") {
+                                        wild.push(value.clone());
+                                    }
+                                }
+                            });
+                        }
+                        for w in wild {
+                            warnings.push(format!(
+                                "{}:{}: warning: `domain \"{}\"` is a wildcard: it can only be issued with the DNS-01 challenge — add `tls dns <task>` (a task that publishes the TXT record with your DNS provider)",
+                                file_path, stmt.location.line, w
+                            ));
+                        }
+                    }
+                }
+            }
             for stmt in &program.statements {
                 if let NK::ServeBlock { routes, .. } = &stmt.kind {
                     let literal_get: Vec<&str> = routes

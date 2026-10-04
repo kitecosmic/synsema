@@ -567,6 +567,8 @@ fn pg_err(e: postgres::Error) -> String {
 /// `connect_timeout` por defecto (10s) si el connstring no lo trae, para que apuntar a un
 /// host caído falle rápido en vez de colgarse.
 fn pg_connect(connstring: &str) -> Result<Client, String> {
+    // v0.6.42 — bajo `serve`, el hilo que espera la red suelta su permiso de ejecución.
+    let _w = synsema_core::waiting::waiting();
     let mut config: postgres::Config = connstring.parse().map_err(pg_err)?;
     if config.get_connect_timeout().is_none() {
         config.connect_timeout(Duration::from_secs(10));
@@ -790,6 +792,8 @@ impl<'a> FromSql<'a> for PgVector {
 }
 
 fn pg_query(client: &mut Client, sql: &str, params: &[SynValue]) -> Result<Vec<Row>, String> {
+    // v0.6.42 — bajo `serve`, el hilo que espera la red suelta su permiso de ejecución.
+    let _w = synsema_core::waiting::waiting();
     let rewritten = rewrite_placeholders(sql);
     let pg: Vec<PgParam> = params.iter().map(syn_to_pg).collect();
     let refs: Vec<&(dyn ToSql + Sync)> = pg.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
@@ -1009,6 +1013,8 @@ fn split_tls_hint(url: &str) -> (String, bool) {
 /// webpki-roots): si el url lo pide, verifica el cert del server contra los root CAs
 /// embebidos. El contenedor dev es plaintext → por defecto sin SSL.
 fn mysql_connect(url: &str) -> Result<mysql::Conn, String> {
+    // v0.6.42 — bajo `serve`, el hilo que espera la red suelta su permiso de ejecución.
+    let _w = synsema_core::waiting::waiting();
     let (clean_url, wants_tls) = split_tls_hint(url);
     let opts = mysql::Opts::from_url(&clean_url).map_err(|e| e.to_string())?;
     let mut builder = mysql::OptsBuilder::from_opts(opts)
@@ -1049,6 +1055,8 @@ fn syn_to_mysql(v: &SynValue) -> mysql::Value {
 }
 
 fn mysql_query(conn: &mut mysql::Conn, sql: &str, params: &[SynValue]) -> Result<Vec<Row>, String> {
+    // v0.6.42 — bajo `serve`, el hilo que espera la red suelta su permiso de ejecución.
+    let _w = synsema_core::waiting::waiting();
     let result = conn.exec_iter(sql, mysql_params(params)).map_err(mysql_err)?;
     let mut out = Vec::new();
     // Las columnas como claves una vez por consulta (F4.4); se rehacen si cambian.
@@ -1210,6 +1218,8 @@ fn mongo_wrong_backend() -> String {
 /// host caído o credenciales malas fallan acá, no recién en el primer `mongo_*`.
 /// TLS lo controla el connstring (`?tls=true`); rustls (backend ring). El dev es plaintext.
 fn mongo_connect(url: &str) -> Result<mongodb::sync::Database, String> {
+    // v0.6.42 — bajo `serve`, el hilo que espera la red suelta su permiso de ejecución.
+    let _w = synsema_core::waiting::waiting();
     let mut opts = mongodb::options::ClientOptions::parse(url).run().map_err(mongo_err)?;
     if opts.connect_timeout.is_none() {
         opts.connect_timeout = Some(Duration::from_secs(10));

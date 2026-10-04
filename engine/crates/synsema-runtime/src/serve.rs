@@ -51,7 +51,6 @@ use synsema_core::types::{
     from_send, syn_bool, syn_int, syn_text, to_send, SendValue,
     ServerValue, SynTaskValue, SynValue,
 };
-use synsema_stdlib::acme;
 use synsema_stdlib::cron::{
     register_cron_builtins, CronScheduler, ExecutorFactory as CronExecutorFactory, SchedRef,
     Task as CronTask,
@@ -612,6 +611,8 @@ pub struct ServeOverrides {
     pub tls_key: Option<String>,
     /// `--bind <addr>`: dirección de bind (default `0.0.0.0`).
     pub bind: Option<String>,
+    /// v0.6.42 — `--trust-proxy ip,cidr,…`: proxys de confianza (pisa `trust proxy` del archivo).
+    pub trust_proxy: Option<Vec<String>>,
     /// `--sandbox` | `--cap-set <list>`: techo de capabilities del host para TODO el
     /// serve (requests, cron, agentes). `None` = sin techo (comportamiento histórico).
     pub ceiling: Option<Vec<Capability>>,
@@ -632,6 +633,7 @@ impl ServeOverrides {
             && self.tls_cert.is_none()
             && self.tls_key.is_none()
             && self.bind.is_none()
+            && self.trust_proxy.is_none()
             && !self.attested
     }
 
@@ -1311,6 +1313,9 @@ fn send_eq(a: Option<&SendValue>, b: Option<&SendValue>) -> bool {
 }
 
 fn register_serve_state_builtins(interp: &Interpreter, state: SharedState) {
+    // v0.6.42 — todo intérprete de serve (handlers, cron, agentes) pasa por acá: `exit` es de
+    // `run`; bajo serve remite a `shutdown`.
+    synsema_stdlib::server::register_serve_exit_builtin(interp);
     {
         let s = state.clone();
         interp.register_builtin("state_set", 2, Rc::new(move |_i, args, _l| {
@@ -1849,6 +1854,128 @@ fn run_socket(
 // MOVIDOS a synsema_stdlib::routing (puros; el handler-mode wasm arma el mismo
 // `request`). Importados arriba.
 
+/// v0.6.42 — el destino de un `proxy to` como única sentencia de la ruta, si no depende de la
+/// request: no nombra `request`/`params`/`query`/`read_body*` ni un parámetro del path, y no
+/// llama a una task del programa (un builtin como `env(...)` sí vale, como hasta ahora).
+fn static_proxy_target<'a>(stmt: &'a Node, param_names: &[String], env: &Rc<RefCell<Environment>>) -> Option<&'a Node> {
+    const REQUEST_NAMES: [&str; 5] = ["request", "params", "query", "read_body", "read_body_bytes"];
+    let NodeKind::ProxyStatement { target } = &stmt.kind else { return None };
+    let mut dynamic = false;
+    synsema_core::ast_api::walk(target, &mut |n| match &n.kind {
+        NodeKind::Identifier { name } => {
+            if REQUEST_NAMES.contains(&name.as_str()) || param_names.iter().any(|p| p == name) {
+                dynamic = true;
+            }
+        }
+        NodeKind::TaskCall { name, .. } => match &name.kind {
+            NodeKind::Identifier { name } => {
+                if matches!(synsema_core::interpreter::env_get(env, name), Some(SynValue::Task(_))) {
+                    dynamic = true;
+                }
+            }
+            _ => dynamic = true,
+        },
+        _ => {}
+    });
+    (!dynamic).then_some(target.as_ref())
+}
+
+/// ¿El cuerpo de la ruta ejecuta `proxy to` en algún punto (no como única sentencia estática)?
+fn body_has_proxy(body: &[Node]) -> bool {
+    let mut found = false;
+    for st in body {
+        synsema_core::ast_api::walk(st, &mut |n| {
+            if matches!(n.kind, NodeKind::ProxyStatement { .. }) {
+                found = true;
+            }
+        });
+    }
+    found
+}
+
+/// v0.6.42 — la ruta ejecutó `proxy to <destino>`: una URL pasa por el mismo gate `net` que al
+/// arrancar, pero ahora por request y con las capabilities del worker; un extremo de `pipe` se
+/// saca del hub del worker (el lado async habla HTTP sobre él).
+fn proxy_outcome(
+    interp: &mut Interpreter,
+    caps: &Rc<RefCell<CapabilitySet>>,
+    dest: synsema_core::interpreter::ProxyTo,
+) -> GiveOutcome {
+    use synsema_core::interpreter::ProxyTo;
+    match dest {
+        ProxyTo::Url(url) => {
+            if let Err(m) = synsema_stdlib::server::parse_proxy_target(&url) {
+                return GiveOutcome::Error(format!("proxy to: {}", m));
+            }
+            let host = synsema_capabilities::secure::url_hostname(&url).unwrap_or_default();
+            let scope = synsema_capabilities::model::net_request_scope(&url).unwrap_or(host);
+            if let Err(v) = caps
+                .borrow_mut()
+                .require(&Capability::new(CapabilityType::Net, Some(scope)), &format!("proxy to \"{}\"", url))
+            {
+                let e = v.into_error();
+                return if e.denied_by_token {
+                    GiveOutcome::Forbidden(e.to_string_for_client())
+                } else {
+                    GiveOutcome::Error(e.to_string_for_client())
+                };
+            }
+            GiveOutcome::Proxy(synsema_stdlib::routing::ProxyDest::Url(url))
+        }
+        ProxyTo::Handle(h) => match synsema_stdlib::ws::take_pipe_for_proxy(interp, h) {
+            Some(end) => GiveOutcome::Proxy(synsema_stdlib::routing::ProxyDest::Conn(Box::new(end))),
+            None => GiveOutcome::Error(format!(
+                "proxy to: {} is not a pipe end this request can use (closed, or already taken by another interpreter)",
+                h
+            )),
+        },
+    }
+}
+
+/// v0.6.42 — corre una task del programa FUERA de una request (las de `domain ask` y `tls dns`),
+/// en un intérprete de serve con las capabilities del programa, como `auth with`. Devuelve si
+/// el resultado es exactamente `true` (para `ask`), o el error de la task.
+#[allow(clippy::too_many_arguments)]
+fn serve_task_runner(
+    swarm: &Arc<Swarm>,
+    snapshot: &Arc<Vec<(String, GlobalVal)>>,
+    caps_snap: &Arc<Vec<Capability>>,
+    shared_db: &SharedDb,
+    rules_snap: &Arc<Vec<OwnerRule>>,
+    shared_memory: &SharedMemoryStore,
+    on_write: &OnWriteFn,
+    shared_progress: &SharedProgressStore,
+    on_write_progress: &OnWriteProgressFn,
+    shared_state: &SharedState,
+    approvals: &ServeApprovals,
+    cron: &CronWiring,
+    secure: bool,
+    mem_name: &Option<String>,
+    node: Node,
+) -> Arc<dyn Fn(&[&str]) -> Result<bool, String> + Send + Sync> {
+    let (swarm, snapshot, caps_snap, shared_db, rules_snap) =
+        (swarm.clone(), snapshot.clone(), caps_snap.clone(), shared_db.clone(), rules_snap.clone());
+    let (shared_memory, on_write, shared_progress, on_write_progress) =
+        (shared_memory.clone(), on_write.clone(), shared_progress.clone(), on_write_progress.clone());
+    let (shared_state, approvals, cron, mem_name) = (shared_state.clone(), approvals.clone(), cron.clone(), mem_name.clone());
+    Arc::new(move |args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        with_serve_interp(&swarm, &snapshot, &caps_snap, &shared_db, &rules_snap, &shared_memory, &on_write, &shared_progress, &on_write_progress, &shared_state, &approvals, &cron, secure, &mem_name, |interp, _caps| {
+            let genv = interp.global_env.clone();
+            let task = interp.eval(&node, &genv).map_err(|e| match e {
+                Control::Error(e) => e.message.clone(),
+                _ => "the task did not evaluate".to_string(),
+            })?;
+            match interp.call_task(task, args.iter().map(|a| syn_text(a.as_str())).collect()) {
+                Ok(SynValue::Bool(b)) => Ok(b),
+                Ok(_) => Ok(false),
+                Err(Control::Error(e)) => Err(e.message.clone()),
+                Err(_) => Ok(false),
+            }
+        })
+    })
+}
+
 /// Corre el cuerpo de una ruta normal; captura el `give`-value.
 #[allow(clippy::too_many_arguments)]
 fn run_route(
@@ -1883,6 +2010,7 @@ fn run_route(
         match interp.run_request_block(body, request_bindings(ctx)) {
             Ok(_) => GiveOutcome::Give(None),
             Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
+            Err(Control::Error(e)) if e.proxy.is_some() => proxy_outcome(interp, caps, e.proxy.clone().unwrap()),
             // Falla de validación (`expect`) → 400 + `field`; cualquier otro error → 500.
             Err(Control::Error(e)) if e.is_validation => {
                 GiveOutcome::Validation { message: e.message.clone(), field: e.field.clone() }
@@ -2292,8 +2420,11 @@ fn build_host_table(
             };
 
             // Reverse proxy (Lote 2): body == `proxy to <url>` → forwardea al upstream.
+            // v0.6.42 — un `proxy to` cuyo destino no depende de la request (un literal, una
+            // constante, `env(...)`) se evalúa y se chequea UNA vez al arrancar, como siempre; si
+            // depende de la request o hay sentencias antes, corre como handler (`proxy_dynamic`).
             let proxy_target: Option<String> = if body.len() == 1 {
-                if let NodeKind::ProxyStatement { target } = &body[0].kind {
+                if let Some(target) = static_proxy_target(&body[0], param_names, env) {
                     let url = interp.eval(target, env)?.to_string();
                     // Validar al arrancar (la URL se evalúa una vez): un target https://
                     // o sin host no puede ser un 502 por request.
@@ -2333,6 +2464,7 @@ fn build_host_table(
             } else {
                 None
             };
+            let proxy_dynamic = proxy_target.is_none() && body_has_proxy(body);
 
             let body_c = body.clone();
             let swarm_c = swarm.clone();
@@ -2415,6 +2547,7 @@ fn build_host_table(
                 socket_handler,
                 timeout: route_timeout,
                 proxy_target,
+                proxy_dynamic,
                 rate_unlimited,
                 meta,
             });
@@ -2530,6 +2663,15 @@ fn build_host_table(
                 };
                 let source_c = source.as_ref().clone();
                 let key = format!("_route_handler_{}", i);
+                // v0.6.42 — ¿el cuerpo (en la task del grupo) ejecuta `proxy to`? Entonces el
+                // transporte prepara el reenvío (headers, body, upgrade) como en una ruta directa.
+                let mounted_proxy = match &group {
+                    SynValue::Map(m) => match m.borrow().get(&key) {
+                        Some(SynValue::Task(t)) => body_has_proxy(&t.body),
+                        _ => false,
+                    },
+                    _ => false,
+                };
                 // El cuerpo de una ruta montada vive en su handler-task (cierra sobre el
                 // env del módulo): de ahí salen expect/respuesta/capabilities.
                 let meta = match &group {
@@ -2628,6 +2770,7 @@ fn build_host_table(
                     socket_handler,
                     timeout: route_timeout,
                     proxy_target: None,
+                    proxy_dynamic: mounted_proxy,
                     rate_unlimited,
                     meta,
                 });
@@ -2696,6 +2839,7 @@ fn run_mounted_route(
         match interp.run_request_block_in(&task.body, request_bindings(ctx), &parent) {
             Ok(_) => GiveOutcome::Give(None),
             Err(Control::Give(v)) => GiveOutcome::Give(Some(v)),
+            Err(Control::Error(e)) if e.proxy.is_some() => proxy_outcome(interp, caps, e.proxy.clone().unwrap()),
             Err(Control::Error(e)) if e.is_validation => {
                 GiveOutcome::Validation { message: e.message.clone(), field: e.field.clone() }
             }
@@ -2909,9 +3053,8 @@ fn make_serve_hook(
             tls_cert_n,
             tls_key_n,
             redirect_https,
-            tls_auto,
-            tls_auto_email_n,
-            domain_n,
+            acme_n,
+            trust_proxy_n,
             bind_n,
             hosts_n,
             mounts_n,
@@ -2933,9 +3076,8 @@ fn make_serve_hook(
                 tls_cert,
                 tls_key,
                 redirect_https,
-                tls_auto,
-                tls_auto_email,
-                domain,
+                acme,
+                trust_proxy,
                 bind,
                 hosts,
                 mounts,
@@ -2956,15 +3098,19 @@ fn make_serve_hook(
                 tls_cert.as_deref(),
                 tls_key.as_deref(),
                 *redirect_https,
-                *tls_auto,
-                tls_auto_email.as_deref(),
-                domain.as_deref(),
+                acme.as_deref(),
+                trust_proxy.as_deref(),
                 bind.as_deref(),
                 hosts,
                 mounts,
             ),
             _ => return Err(Control::Error(RuntimeError::new("internal: serve_hook on non-serve node"))),
         };
+        // v0.6.42 — la config ACME vive en `ServeAcme` (fuera del nodo); `domain ask`, `tls dns`
+        // y `trust proxy` los consume la tanda de stdlib/runtime.
+        let tls_auto = acme_n.map_or(false, |a| a.tls_auto);
+        let tls_auto_email_n = acme_n.and_then(|a| a.email.as_deref());
+        let domain_n = acme_n.and_then(|a| a.domain.as_deref());
         // -- puerto + capability (precedencia: --port > `serve on N`) --
         let port_num = match overrides.port {
             // El operador que pasa `--port` es la autoridad: se concede `serve(N)`, así
@@ -3371,7 +3517,9 @@ fn make_serve_hook(
                 None => None,
             },
         };
-        if tls_auto_eff && acme_domains.is_empty() {
+        let domain_ask_n = acme_n.and_then(|a| a.domain_ask.as_deref());
+        let tls_dns_n = acme_n.and_then(|a| a.tls_dns.as_deref());
+        if tls_auto_eff && acme_domains.is_empty() && domain_ask_n.is_none() {
             return Err(Control::Error(RuntimeError::new(
                 "tls auto (auto-HTTPS) requires a domain — pass `--domain example.com` or add `domain \"example.com\"` to the serve block".to_string(),
             )));
@@ -3470,7 +3618,27 @@ fn make_serve_hook(
         }
         // Discovery: base URL absoluta (sitemap/openapi/robots), versión del API y
         // si la página /docs está encendida.
-        runtime.domain = acme_domains.first().cloned();
+        runtime.domain = acme_domains.iter().find(|d| !d.starts_with("*.")).cloned();
+        // v0.6.42 — `trust proxy` (o `--trust-proxy`): texto o lista de IPs/CIDRs. Un valor que
+        // no es una IP ni un CIDR no arranca el servidor (fail-loud, como un puerto inválido).
+        let trust_specs: Vec<String> = match &overrides.trust_proxy {
+            Some(v) => v.clone(),
+            None => match trust_proxy_n {
+                Some(n) => match interp.eval(n, env)? {
+                    SynValue::List(l) => list_values(&l).iter().map(|x| x.to_string()).collect(),
+                    SynValue::Nothing => Vec::new(),
+                    other => vec![other.to_string()],
+                },
+                None => Vec::new(),
+            },
+        };
+        let mut trusted = Vec::with_capacity(trust_specs.len());
+        for spec in &trust_specs {
+            trusted.push(
+                synsema_stdlib::server::TrustedNet::parse(spec).map_err(|m| Control::Error(RuntimeError::new(m)))?,
+            );
+        }
+        runtime.trusted_proxies = trusted;
         runtime.describe_version = describe_version;
         runtime.docs_enabled = !docs_off;
         // `errors with <task>`: páginas de error propias (401/404/405/500).
@@ -3556,22 +3724,45 @@ fn make_serve_hook(
                     .expect("hilo de challenge ACME");
                 servers.lock().unwrap().push(h);
             }
-            // Obtiene (o reusa) el cert SAN (cubre todos los `acme_domains`).
-            // Bloqueante: no se puede servir HTTPS sin él.
-            let cfg = match acme::load_or_obtain_config(&acme_domains, acme_email.as_deref(), store.clone())
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    return Err(Control::Error(RuntimeError::new(format!("ACME error: {}", e))))
-                }
+            // v0.6.42 — certificados administrados: la cuenta se reusa, uno por nombre (los
+            // `*.` por DNS-01 con `tls dns`), y bajo demanda con `domain ask`. Los fijos se
+            // obtienen (o se cargan del disco) antes de servir: sin ellos no hay HTTPS.
+            let runner = |n: &Node| {
+                serve_task_runner(&swarm, &snapshot, &caps_snap, &shared_db, &rules_snap, &shared_memory, &on_write, &shared_progress, &on_write_progress, &shared_state, &approvals, &cron, secure, &mem_name, n.clone())
             };
-            println!("ACME: certificate ready for {}", acme_domains.join(", "));
-            let cell: server::SharedServerConfig = Arc::new(std::sync::RwLock::new(cfg));
-            acme::spawn_renewal_thread(acme_domains, acme_email, store, cell.clone());
+            let ask: Option<synsema_stdlib::acme_manager::AskFn> = domain_ask_n.map(|n| {
+                let run = runner(n);
+                Arc::new(move |host: &str| {
+                    match run(&[host]) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // Un error de la task cuenta como NO (y queda en el log).
+                            eprintln!("[serve] domain ask failed for {}: {}", host, e);
+                            false
+                        }
+                    }
+                }) as synsema_stdlib::acme_manager::AskFn
+            });
+            let dns: Option<synsema_stdlib::acme_manager::DnsFn> = tls_dns_n.map(|n| {
+                let run = runner(n);
+                Arc::new(move |name: &str, value: &str, action: &str| run(&[name, value, action]).map(|_| ()))
+                    as synsema_stdlib::acme_manager::DnsFn
+            });
+            let mgr = synsema_stdlib::acme_manager::CertManager::new(synsema_stdlib::acme_manager::AcmeOptions {
+                email: acme_email.clone(),
+                domains: acme_domains.clone(),
+                ask,
+                dns,
+                http_store: Some(store.clone()),
+            });
+            if let Err(e) = mgr.bootstrap() {
+                return Err(Control::Error(RuntimeError::new(format!("ACME error: {}", e))));
+            }
+            mgr.spawn_renewal();
             let rt2 = rt.clone();
             let h = std::thread::Builder::new()
                 .name(format!("serve:{}", port_str))
-                .spawn(move || server::serve_forever_tls_auto(rt2, listener, cell))
+                .spawn(move || server::serve_forever_tls_managed(rt2, listener, mgr))
                 .expect("hilo de accept del server");
             servers.lock().unwrap().push(h);
             return Ok(syn_text(format!("serving:{}", port_str)));
@@ -3705,7 +3896,7 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
         // anunciada NO es la del cert TLS; sirve para cifrar bodies); si no, "attested" (el cert
         // autofirmado se emite con la clave anunciada). El hook re-verifica la coherencia.
         let file_tls = program.statements.iter().any(|st| {
-            matches!(&st.kind, NodeKind::ServeBlock { tls_cert, tls_auto, .. } if tls_cert.is_some() || *tls_auto)
+            matches!(&st.kind, NodeKind::ServeBlock { tls_cert, acme, .. } if tls_cert.is_some() || acme.as_ref().map_or(false, |a| a.tls_auto))
         });
         let operator_tls = overrides.tls_cert.is_some() || overrides.tls_auto_email.is_some() || file_tls;
         let config = synsema_stdlib::attest::AttestConfig {

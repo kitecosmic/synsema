@@ -85,6 +85,7 @@ pub fn sleep_secs(secs: f64) {
     if !(secs > 0.0) || !secs.is_finite() {
         return;
     }
+    let _w = crate::waiting::waiting();
     if let Ok(g) = sleep_slot().lock() {
         if let Some(f) = g.as_ref() {
             f(secs);

@@ -38,6 +38,8 @@ fn err(msg: impl Into<String>) -> Control {
 enum Curve {
     P256,
     P521,
+    /// v0.6.42 — X25519 (RFC 7748): 32 bytes de clave privada y pública.
+    X25519,
 }
 
 impl Curve {
@@ -46,22 +48,23 @@ impl Curve {
             Some(SynValue::Text(s)) => match s.to_ascii_uppercase().as_str() {
                 "P-256" | "P256" | "SECP256R1" | "PRIME256V1" => Ok(Curve::P256),
                 "P-521" | "P521" | "SECP521R1" => Ok(Curve::P521),
+                "X25519" | "CURVE25519" => Ok(Curve::X25519),
                 other => Err(err(format!(
-                    "{}: unknown curve {:?} (supported: \"P-256\", \"P-521\")",
+                    "{}: unknown curve {:?} (supported: \"P-256\", \"P-521\", \"X25519\")",
                     who, other
                 ))),
             },
             Some(other) => Err(err(format!(
-                "{}: curve must be text (\"P-256\" | \"P-521\"), got {}",
+                "{}: curve must be text (\"P-256\" | \"P-521\" | \"X25519\"), got {}",
                 who,
                 other.type_name()
             ))),
-            None => Err(err(format!("{}: the curve is required (\"P-256\" | \"P-521\")", who))),
+            None => Err(err(format!("{}: the curve is required (\"P-256\" | \"P-521\" | \"X25519\")", who))),
         }
     }
     fn scalar_len(self) -> usize {
         match self {
-            Curve::P256 => 32,
+            Curve::P256 | Curve::X25519 => 32,
             Curve::P521 => 66,
         }
     }
@@ -109,6 +112,8 @@ fn random_scalar(curve: Curve, who: &str) -> Result<Vec<u8>, Control> {
         let valid = match curve {
             Curve::P256 => p256::SecretKey::from_slice(&bytes).is_ok(),
             Curve::P521 => p521::SecretKey::from_slice(&bytes).is_ok(),
+            // Cualquier cadena de 32 bytes es una clave X25519 (el clamping va al usarla).
+            Curve::X25519 => true,
         };
         if valid {
             return Ok(bytes);
@@ -129,7 +134,16 @@ fn public_of(curve: Curve, private: &[u8], who: &str) -> Result<Vec<u8>, Control
                 .map_err(|_| err(format!("{}: the private key is not a valid P-521 scalar (66 bytes)", who)))?;
             sk.public_key().to_encoded_point(false).as_bytes().to_vec()
         }
+        Curve::X25519 => {
+            let k = x25519_key(private, who, "the private key")?;
+            curve25519_dalek::montgomery::MontgomeryPoint::mul_base_clamped(k).to_bytes().to_vec()
+        }
     })
+}
+
+/// 32 bytes exactos para X25519.
+fn x25519_key(b: &[u8], who: &str, what: &str) -> Result<[u8; 32], Control> {
+    <[u8; 32]>::try_from(b).map_err(|_| err(format!("{}: {} must be 32 bytes for X25519, got {}", who, what, b.len())))
 }
 
 fn shared_secret(curve: Curve, private: &[u8], peer: &[u8], who: &str) -> Result<Vec<u8>, Control> {
@@ -150,13 +164,24 @@ fn shared_secret(curve: Curve, private: &[u8], peer: &[u8], who: &str) -> Result
             let shared = p521::ecdh::diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine());
             shared.raw_secret_bytes().to_vec()
         }
+        Curve::X25519 => {
+            let k = x25519_key(private, who, "the private key")?;
+            let p = x25519_key(peer, who, "the peer public key")?;
+            let out = curve25519_dalek::montgomery::MontgomeryPoint(p).mul_clamped(k).to_bytes();
+            // RFC 7748 §6.1: un resultado todo en cero es un punto de orden bajo del par —
+            // aceptarlo daría el mismo "secreto" para cualquier clave propia.
+            if out.iter().all(|b| *b == 0) {
+                return Err(err(format!("{}: the peer public key is a low-order point (the shared secret would be all zeros)", who)));
+            }
+            out.to_vec()
+        }
     })
 }
 
 fn b_ecdh_keypair(caps: &Rc<RefCell<CapabilitySet>>, args: &[SynValue]) -> Result<SynValue, Control> {
     const F: &str = "ecdh_keypair";
     if args.len() != 1 {
-        return Err(err(format!("{}(curve) takes exactly 1 argument (\"P-256\" | \"P-521\")", F)));
+        return Err(err(format!("{}(curve) takes exactly 1 argument (\"P-256\" | \"P-521\" | \"X25519\")", F)));
     }
     let curve = Curve::parse(args.first(), F)?;
     require_random(caps, "ecdh_keypair()")?;
@@ -190,6 +215,21 @@ fn b_ecdh_shared_secret(args: &[SynValue]) -> Result<SynValue, Control> {
     let r = shared_secret(curve, &private, &peer, F);
     private.zeroize();
     Ok(syn_secret_bytes("ecdh_shared_secret", r?))
+}
+
+/// v0.6.42 — `ecdh_public(private, curve)`: la clave pública de una privada guardada (la
+/// máquina que persiste su clave de cifrado entre corridas ya no tiene que guardar el par
+/// entero ni pasar la privada por `reveal`). Pura.
+fn b_ecdh_public(args: &[SynValue]) -> Result<SynValue, Control> {
+    const F: &str = "ecdh_public";
+    if args.len() != 2 {
+        return Err(err(format!("{}(private, curve) takes exactly 2 arguments", F)));
+    }
+    let mut private = private_key_arg(args.first(), F)?;
+    let curve = Curve::parse(args.get(1), F)?;
+    let r = public_of(curve, &private, F);
+    private.zeroize();
+    Ok(syn_bytes(r?))
 }
 
 fn b_hkdf_sha256(args: &[SynValue]) -> Result<SynValue, Control> {
@@ -295,6 +335,7 @@ pub fn register_crypto_builtins(interp: &Interpreter, caps: Rc<RefCell<Capabilit
         interp.register_builtin("ecdh_keypair", -1, Rc::new(move |_i, a, _l| b_ecdh_keypair(&caps, a)));
     }
     interp.register_builtin("ecdh_shared_secret", -1, Rc::new(|_i, a, _l| b_ecdh_shared_secret(a)));
+    interp.register_builtin("ecdh_public", -1, Rc::new(|_i, a, _l| b_ecdh_public(a)));
     interp.register_builtin("hkdf_sha256", -1, Rc::new(|_i, a, _l| b_hkdf_sha256(a)));
     interp.register_builtin("aes_gcm_encrypt", -1, Rc::new(|_i, a, _l| b_aes_gcm_encrypt(a)));
     // `aes_gcm_decrypt(key, nonce, ct, aad, default)` — la variante TOTAL de la operación
@@ -446,6 +487,25 @@ mod tests {
             to_hex(&pk),
             "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"
         );
+    }
+
+    /// v0.6.42 — X25519 contra los vectores de RFC 7748 §6.1 (Alice y Bob).
+    #[test]
+    fn x25519_matches_rfc7748() {
+        let h = |s: &str| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect::<Vec<u8>>();
+        let a = h("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        let b = h("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+        let pa = public_of(Curve::X25519, &a, "t").map_err(|_| ()).unwrap();
+        let pb = public_of(Curve::X25519, &b, "t").map_err(|_| ()).unwrap();
+        assert_eq!(to_hex(&pa), "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+        assert_eq!(to_hex(&pb), "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+        let k1 = shared_secret(Curve::X25519, &a, &pb, "t").map_err(|_| ()).unwrap();
+        let k2 = shared_secret(Curve::X25519, &b, &pa, "t").map_err(|_| ()).unwrap();
+        assert_eq!(to_hex(&k1), "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+        assert_eq!(k1, k2);
+        // Un punto de orden bajo (el cero) se rechaza en vez de dar un secreto todo en cero.
+        assert!(shared_secret(Curve::X25519, &a, &[0u8; 32], "t").is_err());
+        assert!(public_of(Curve::X25519, &a[..31], "t").is_err(), "31 bytes no es una clave X25519");
     }
 
     #[test]

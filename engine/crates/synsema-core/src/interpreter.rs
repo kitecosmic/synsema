@@ -111,6 +111,22 @@ pub struct RuntimeErrorData {
     /// queda sólo en el log y el audit del server. Se distingue por este flag y NUNCA por el
     /// texto (lo pone `CapabilityViolation::into_error`, el único conversor).
     pub denied_by_token: bool,
+    /// v0.6.42 — `exit(code)`: no es una falla sino el fin pedido del programa. No se atrapa
+    /// (`try/recover`, `assert_error`, los fallbacks lo re-propagan) y el host lo traduce a
+    /// código de salida sin imprimir "Runtime error". Va en el `Box`: no agranda nada.
+    pub exit_code: Option<i32>,
+    /// v0.6.42 — `proxy to <destino>` ejecutado dentro de una ruta: corta el handler (no se
+    /// atrapa, como `exit`) y el runtime de `serve` reenvía la request a ese destino.
+    pub proxy: Option<ProxyTo>,
+}
+
+/// v0.6.42 — el destino de un `proxy to` evaluado por request.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ProxyTo {
+    /// `http://host[:puerto][/base]`.
+    Url(String),
+    /// Un extremo de `pipe()`: el motor habla HTTP/1.1 sobre él.
+    Handle(i64),
 }
 
 impl RuntimeError {
@@ -119,10 +135,10 @@ impl RuntimeError {
         self.0.message
     }
     pub fn new(message: impl Into<String>) -> Self {
-        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: None, is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false }))
+        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: None, is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false, exit_code: None, proxy: None }))
     }
     pub fn at(message: impl Into<String>, location: SourceLocation) -> Self {
-        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false }))
+        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false, exit_code: None, proxy: None }))
     }
     /// El texto de este error **hacia un cliente REMOTO** (el cuerpo de una respuesta HTTP, el
     /// evento final de un stream): igual que `Display`, pero la ubicación viaja con el NOMBRE del
@@ -149,15 +165,32 @@ impl RuntimeError {
     /// Error de validación de cliente (input que no cumple `expect`): se mapea a HTTP 400
     /// con el nombre del campo ofensor, en vez de a un 500 genérico.
     pub fn validation(message: impl Into<String>, field: Option<String>) -> Self {
-        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: None, is_validation: true, field, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false }))
+        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: None, is_validation: true, field, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false, exit_code: None, proxy: None }))
     }
     /// Falla de aserción (`assert*`): marca `is_assertion` para el reporte de tests.
     pub fn assertion(message: impl Into<String>) -> Self {
-        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: None, is_validation: false, field: None, is_assertion: true, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false }))
+        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: None, is_validation: false, field: None, is_assertion: true, from_private_pc: false, redact_label: String::new(), from_labels: false, denied_by_token: false, exit_code: None, proxy: None }))
     }
     /// Diagnóstico del sistema de etiquetas (`from_labels`), con ubicación.
     pub fn labels(message: impl Into<String>, location: SourceLocation) -> Self {
-        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: true, denied_by_token: false }))
+        RuntimeError(Box::new(RuntimeErrorData { message: message.into(), location: Some(location), is_validation: false, field: None, is_assertion: false, from_private_pc: false, redact_label: String::new(), from_labels: true, denied_by_token: false, exit_code: None, proxy: None }))
+    }
+    /// v0.6.42 — el fin pedido por `exit(code)` (ver `exit_code`).
+    pub fn exit(code: i32) -> Self {
+        let mut e = RuntimeError::new(format!("exit({})", code));
+        e.exit_code = Some(code);
+        e
+    }
+    /// ¿Es el fin pedido por `exit`? No se atrapa, como los cortes de etiquetas, pero tampoco
+    /// redacta la salida: no es un veredicto del enforcement.
+    #[inline]
+    pub fn is_exit(&self) -> bool {
+        self.exit_code.is_some()
+    }
+    /// ¿Es un corte pedido por el programa (`exit` o `proxy to`)? Ninguno de los dos se atrapa.
+    #[inline]
+    pub fn is_halt(&self) -> bool {
+        self.exit_code.is_some() || self.proxy.is_some()
     }
     /// ¿Este error NO se puede atrapar con `try/recover` ? Un salto de control desde PC
     /// privado sería un bit observable por iteración, y el veredicto del enforcement no se
@@ -254,6 +287,41 @@ fn err_labels(msg: impl Into<String>, loc: &SourceLocation) -> Control {
 }
 
 /// Nombre de archivo de una ruta (sin directorios), para los diagnósticos que salen al cliente.
+/// v0.6.42 — escribe líneas en stderr, sin buffer (un lock, un flush). Con la terminal en raw
+/// mode (`term_open`) un `\n` solo no vuelve al margen: `\r\n`, como `drain_output`.
+fn write_stderr_lines(lines: &[String]) {
+    use std::io::Write;
+    let raw = crate::term_guard::is_raw();
+    let err = std::io::stderr();
+    let mut lock = err.lock();
+    for line in lines {
+        let _ = if raw {
+            write!(lock, "{}\r\n", line.replace('\n', "\r\n"))
+        } else {
+            writeln!(lock, "{}", line)
+        };
+    }
+    let _ = lock.flush();
+}
+
+/// v0.6.42 — `exit(code?)`: termina el programa con ese código (0 por defecto, 0–255). Lo hace
+/// el host al recibir el error (`engine::finish` → `synsema run`), después de vaciar la salida,
+/// el audit y los agentes: nunca un `process::exit` desde acá. Pública para que `serve` la
+/// envuelva (bajo un servidor, `exit` remite a `shutdown`).
+pub fn exit_builtin(args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+    let code = match args.first() {
+        None => 0,
+        Some(SynValue::Number(n)) => match n.is_integer().then(|| n.to_i64_trunc()).flatten() {
+            Some(c) if (0..=255).contains(&c) => c as i32,
+            _ => return Err(err_at(format!("exit: the code must be an integer from 0 to 255, got {}", n), loc)),
+        },
+        Some(v) => return Err(err_at(format!("exit: the code must be an integer from 0 to 255, got {}", v.type_name()), loc)),
+    };
+    let mut e = RuntimeError::exit(code);
+    e.location = Some(loc.clone());
+    Err(Control::Error(e))
+}
+
 fn basename_of(path: &str) -> &str {
     match path.rfind(['/', '\\']) {
         Some(i) => &path[i + 1..],
@@ -305,7 +373,7 @@ pub fn with_fallback(base: usize, f: BuiltinFn) -> BuiltinFn {
         }
         match f(i, &args[..base], loc) {
             Ok(v) => Ok(v),
-            Err(Control::Error(e)) if !e.is_fatal_for_labels() => Ok(args[base].clone()),
+            Err(Control::Error(e)) if !e.is_fatal_for_labels() && !e.is_halt() => Ok(args[base].clone()),
             Err(other) => Err(other),
         }
     })
@@ -992,7 +1060,7 @@ const MAX_RECURSION: usize = 600;
 /// PC privado: la cuenta de líneas es un canal que la redacción del valor no tapa — ronda 4).
 /// `type_of` NO está: pasa por la regla genérica y por eso reporta el tipo del valor interno,
 /// envuelto.
-const CORE_LABEL_AWARE: &[&str] = &["private", "declassify", "label_of", "is_private", "print"];
+const CORE_LABEL_AWARE: &[&str] = &["private", "declassify", "label_of", "is_private", "print", "eprint"];
 
 /// Nombres PROTEGIDOS (B8): definir una task, variable, parámetro o alias con uno de
 /// estos nombres es error de carga SIEMPRE (con etiquetas apagadas también): sombrear el
@@ -1004,7 +1072,9 @@ pub const PROTECTED_BUILTIN_NAMES: &[&str] = CORE_LABEL_AWARE;
 /// exec/blackboard/webpush/run/proc) viven en el stdlib/agents y los registra el host con
 /// `register_label_sink`. Las SENTENCIAS con efecto (`share`/`signal`/`send`/`spawn`/
 /// `approve`/`confirm`/`ask`/`reason`/`decide`/`analyze`/`generate`) se comprueban en `exec`.
-pub const CORE_SINK_BUILTINS: &[&str] = &["llm_step", "llm_stream"];
+/// v0.6.42 — `exit`: el código de salida es un canal público (8 bits) y la llamada misma también;
+/// bajo una rama privada o con un código privado, `label_violation` antes de salir.
+pub const CORE_SINK_BUILTINS: &[&str] = &["llm_step", "llm_stream", "exit"];
 
 /// Hook que el host (motor) cablea para que `require <tipo>(<scope>)` conceda en
 /// el `CapabilitySet` real (que vive fuera de core, para evitar el ciclo de deps).
@@ -1274,6 +1344,11 @@ fn note_llm_offline() {
 pub struct Interpreter {
     pub global_env: Rc<RefCell<Environment>>,
     pub output: Vec<String>,
+    /// v0.6.42 — líneas de `eprint`/`log` retenidas para stderr. Sólo se usa con etiquetas
+    /// encendidas (el mismo motivo que `output`: si la corrida muere por un flujo privado,
+    /// cuántas líneas salieron depende del dato); sin etiquetas van a stderr al momento.
+    /// Se sueltan (o se retienen) en `redact_for_host`, el embudo de cada entrada del host.
+    err_output: Vec<String>,
     /// Salida en vivo (DE-018/019): sólo `true` en el camino de `synsema run` interactivo.
     /// Gatea el drenado de `flush()`/`read_line` a stdout. En `conform`/`test`/`serve`
     /// queda `false` → la salida se COLECTA en `output` (JSON `out`/respuesta), nunca a
@@ -1680,6 +1755,7 @@ impl Interpreter {
         let interp = Interpreter {
             global_env: Environment::root("global"),
             output: Vec::new(),
+            err_output: Vec::new(),
             blackboard: HashMap::new(),
             agent_definitions: HashMap::new(),
             agent_context: Vec::new(),
@@ -2012,10 +2088,20 @@ impl Interpreter {
     /// sumideros (un `write_file` por vuelta) sí ocurrieron; eso no lo puede deshacer el motor
     /// y está declarado como límite en la spec.
     pub fn redact_output_for_host(&mut self, r: &Result<SynValue, Control>) {
-        if !self.labels || self.output.is_empty() {
+        if !self.labels {
             return;
         }
         let fatal = matches!(r, Err(Control::Error(e)) if e.is_fatal_for_labels());
+        // stderr: la misma regla que stdout. Si la corrida se cortó, nada; si no, se escribe.
+        if fatal {
+            self.err_output.clear();
+        } else if !self.err_output.is_empty() {
+            let lines = std::mem::take(&mut self.err_output);
+            write_stderr_lines(&lines);
+        }
+        if self.output.is_empty() {
+            return;
+        }
         if fatal {
             self.output.clear();
             self.output.push(
@@ -3300,6 +3386,8 @@ impl Interpreter {
     fn register_builtins(&self) {
         // Núcleo
         self.register("print", -1, Rc::new(|i, a, l| i.b_print(a, l)));
+        self.register("eprint", -1, Rc::new(|i, a, l| i.b_eprint(a, l)));
+        self.register("exit", -1, Rc::new(|_i, a, l| exit_builtin(a, l)));
         // args(): los argumentos del programa (`synsema run prog.syn -- a b`, o el argv
         // de un binario `synsema build`). Sin capability: es input escrito por quien
         // invocó ESTE programa, no un recurso del host.
@@ -4886,8 +4974,31 @@ impl Interpreter {
                 "'private' is a clause of the serve block, of a route body or of a 'routes' group (a line with just `private`), not a statement",
                 loc,
             )),
-            NodeKind::ProxyStatement { .. } => {
-                Err(err_at("proxy is only available inside a serve route", loc))
+            NodeKind::ProxyStatement { target } => {
+                // v0.6.42 — dentro de una ruta de `serve`, `proxy to <destino>` corta el handler y
+                // el runtime reenvía la request (también desde una task que la ruta llamó). Fuera
+                // de una ruta nadie lo convierte: el host lo informa con este mismo mensaje.
+                let v = self.exec(target, env)?;
+                if self.labels {
+                    // El destino es una salida a la red: ni elegido bajo una rama privada ni privado.
+                    self.sink_check("proxy to", &[&v], loc)?;
+                }
+                let dest = match &v {
+                    SynValue::Text(t) => ProxyTo::Url(t.to_string()),
+                    SynValue::Number(n) if n.is_integer() => match n.to_i64_trunc() {
+                        Some(h) => ProxyTo::Handle(h),
+                        None => return Err(err_at("proxy to: the handle is out of range", loc)),
+                    },
+                    other => {
+                        return Err(err_at(
+                            format!("proxy to: expected an http:// URL or a pipe end, got {}", other.type_name()),
+                            loc,
+                        ))
+                    }
+                };
+                let mut e = RuntimeError::at("proxy is only available inside a serve route", loc.clone());
+                e.proxy = Some(dest);
+                Err(Control::Error(e))
             }
             NodeKind::StreamBlock { body } => self.exec_block(body, env),
             // El cuerpo de un `socket` lo corre el runtime de serve con el binding `socket`
@@ -4982,7 +5093,11 @@ impl Interpreter {
             self.sink_check("approve", &[&m], loc)?;
         }
         match self.human_callback.clone() {
-            Some(cb) => Ok(cb("approve", &m.to_string(), *timeout)),
+            Some(cb) => {
+                // v0.6.42 — una persona tarda: bajo `serve` el hilo suelta su permiso mientras espera.
+                let _w = crate::waiting::waiting();
+                Ok(cb("approve", &m.to_string(), *timeout))
+            }
             None => Ok(syn_bool(true)),
         }
     }
@@ -4998,7 +5113,10 @@ impl Interpreter {
             self.sink_check("ask", &[&p], loc)?;
         }
         if let Some(cb) = self.human_callback.clone() {
-            let r = cb("ask", &p.to_string(), *timeout);
+            let r = {
+                let _w = crate::waiting::waiting();
+                cb("ask", &p.to_string(), *timeout)
+            };
             if r.is_truthy() {
                 return Ok(syn_text(r.to_string()));
             }
@@ -5026,7 +5144,10 @@ impl Interpreter {
             self.sink_check("confirm", &[&m], loc)?;
         }
         match self.human_callback.clone() {
-            Some(cb) => Ok(cb("confirm", &m.to_string(), *timeout)),
+            Some(cb) => {
+                let _w = crate::waiting::waiting();
+                Ok(cb("confirm", &m.to_string(), *timeout))
+            }
             None => Ok(syn_bool(true)),
         }
     }
@@ -5347,7 +5468,14 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // T5 (ronda 4): la misma boca pública que `print` — ver `stdout_flow_check`.
         self.stdout_flow_check("log", loc)?;
         let line = format!("[LOG] {}", self.pc_redact(m.to_string()));
-        self.emit_line(line);
+        // v0.6.42 — bajo `synsema run`, `log` es diagnóstico y va a stderr (Go `log`, Python
+        // `logging`, Rust `env_logger`, MCP por stdio): stdout queda para el resultado. Bajo
+        // `test`/`serve`/`conform`/JSON se sigue colectando con la salida, como siempre.
+        if LIVE_STDOUT.load(std::sync::atomic::Ordering::Relaxed) {
+            self.emit_err_line(line);
+        } else {
+            self.emit_line(line);
+        }
         Ok(SynValue::Nothing)
     }
     }
@@ -5849,6 +5977,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             Err(Control::Error(e)) if self.labels && e.is_fatal_for_labels() => {
                 Err(Control::Error(e))
             }
+            // v0.6.42 — `exit(code)` termina el programa y `proxy to` el handler: no son errores
+            // que se recuperan.
+            Err(Control::Error(e)) if e.is_halt() => Err(Control::Error(e)),
             Err(Control::Error(e)) => {
                 let msg = strip_loc_prefix(&e.to_string());
                 let recover_env = Environment::child_scope(env, "recover");
@@ -5948,7 +6079,11 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         };
         let cancel = self.cancel.flag.clone();
         let result = match self.swarm_hooks.as_ref().map(|s| s.wait_for.clone()) {
-            Some(h) => h(&n, secs, &cancel),
+            Some(h) => {
+                // v0.6.42 — bajo `serve`, el hilo que espera la señal suelta su permiso.
+                let _w = crate::waiting::waiting();
+                h(&n, secs, &cancel)
+            }
             None => None,
         };
         self.check_cancel()?;
@@ -7390,6 +7525,27 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         self.output.push(line);
     }
 
+    /// v0.6.42 — la boca de stderr (`eprint`, y `log` bajo `run`). Sin etiquetas, al momento y
+    /// sin buffer en cualquier modo: un servidor MCP/LSP por stdio, un filtro de pipes o un
+    /// informe `--format json` necesitan su diagnóstico afuera de stdout. Con etiquetas se
+    /// retiene hasta el embudo del host (`redact_output_for_host`), igual que stdout.
+    fn emit_err_line(&mut self, line: String) {
+        if self.labels {
+            self.err_output.push(line);
+        } else {
+            write_stderr_lines(std::slice::from_ref(&line));
+        }
+    }
+
+    fn b_eprint(&mut self, args: &[SynValue], loc: &SourceLocation) -> Result<SynValue, Control> {
+        self.ensure_stdout()?;
+        self.stdout_flow_check("eprint", loc)?;
+        let s = args.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(" ");
+        let s = self.pc_redact(s);
+        self.emit_err_line(s);
+        Ok(SynValue::Nothing)
+    }
+
     fn b_length(&mut self, args: &[SynValue], _loc: &SourceLocation) -> Result<SynValue, Control> {
         let v = nth(args, 0)?;
         match v {
@@ -7960,6 +8116,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             Err(Control::Error(e)) if self.labels && e.is_fatal_for_labels() => {
                 Err(Control::Error(e))
             }
+            Err(Control::Error(e)) if e.is_halt() => Err(Control::Error(e)),
             // Lanzó un error → la aserción pasa.
             Err(Control::Error(_)) => Ok(SynValue::Nothing),
             // Retornó normal (incl. un `give`, que `call_value` materializa como Ok) → falla.

@@ -383,21 +383,43 @@ fn head_is_forwarded_as_head() {
 
 #[test]
 fn x_forwarded_headers_reach_upstream() {
+    // v0.6.42 — sin `trust proxy`, los `X-Forwarded-*` que manda el cliente se descartan: el
+    // upstream ve sólo la IP del par (antes la concatenaba y cualquiera falsificaba su IP).
     let up = spawn_upstream();
     let port = spawn_edge(up, "");
     let mut sock = send_raw(
         port,
-        "GET /xff HTTP/1.1\r\nHost: edge.example:8080\r\nX-Forwarded-For: 10.0.0.9\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+        "GET /xff HTTP/1.1\r\nHost: edge.example:8080\r\nX-Forwarded-For: 10.0.0.9\r\nX-Forwarded-Proto: https\r\nX-Forwarded-Host: evil.example\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+    );
+    let (head, mut body) = read_head(&mut sock);
+    let _ = sock.read_to_end(&mut body);
+    assert!(head.starts_with("HTTP/1.1 200"), "status: {}", head);
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert!(text.contains("x-forwarded-for=127.0.0.1"), "{}", text);
+    assert!(!text.contains("10.0.0.9") && !text.contains("evil.example"), "headers falsificados: {}", text);
+    assert!(text.contains("x-forwarded-proto=http"), "{}", text);
+    assert!(text.contains("x-forwarded-host=edge.example:8080"), "{}", text);
+    assert!(text.contains(&format!("host=127.0.0.1:{}", up)), "Host = authority del upstream: {}", text);
+    assert!(text.contains("accept-encoding=gzip"), "Accept-Encoding cruza al upstream: {}", text);
+}
+
+#[test]
+fn x_forwarded_chain_is_kept_only_from_a_trusted_proxy() {
+    // v0.6.42 — con el par en `trust proxy`, su cadena sigue y se le agrega el par; su esquema y
+    // su host públicos también (un Caddy con TLS delante de este server).
+    let up = spawn_upstream();
+    let port = spawn_edge(up, "    trust proxy [\"127.0.0.1\"]\n");
+    let mut sock = send_raw(
+        port,
+        "GET /xff HTTP/1.1\r\nHost: edge.example:8080\r\nX-Forwarded-For: 10.0.0.9\r\nX-Forwarded-Proto: https\r\nX-Forwarded-Host: app.example\r\nConnection: close\r\n\r\n",
     );
     let (head, mut body) = read_head(&mut sock);
     let _ = sock.read_to_end(&mut body);
     assert!(head.starts_with("HTTP/1.1 200"), "status: {}", head);
     let text = String::from_utf8_lossy(&body).to_string();
     assert!(text.contains("x-forwarded-for=10.0.0.9, 127.0.0.1"), "{}", text);
-    assert!(text.contains("x-forwarded-proto=http"), "{}", text);
-    assert!(text.contains("x-forwarded-host=edge.example:8080"), "{}", text);
-    assert!(text.contains(&format!("host=127.0.0.1:{}", up)), "Host = authority del upstream: {}", text);
-    assert!(text.contains("accept-encoding=gzip"), "Accept-Encoding cruza al upstream: {}", text);
+    assert!(text.contains("x-forwarded-proto=https"), "{}", text);
+    assert!(text.contains("x-forwarded-host=app.example"), "{}", text);
 }
 
 // -- Errores: upstream caído, target inválido, tope de streams --

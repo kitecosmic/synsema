@@ -259,6 +259,17 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 # socket usan hilo propio y no consumen pool):
 # SYNSEMA_SERVE_WORKERS=4
 
+# Hilos extra mientras otros handlers ESPERAN (sleep, wait_for, HTTP, LLM, select): la
+# CPU sigue acotada a SYNSEMA_SERVE_WORKERS y una ruta que espera no deja al resto en
+# cola. Los extra ociosos se retiran a los 60 s. 0 = sin hilos extra (default 256):
+# SYNSEMA_SERVE_MAX_WAITING=256
+
+# Certificados automaticos (tls auto): tope de emisiones por hora (un `domain ask`
+# permisivo no puede quemar la cuota de la CA) y segundos de espera a que el TXT de
+# DNS-01 (`tls dns <task>`) se propague antes de pedir la validacion:
+# SYNSEMA_ACME_MAX_PER_HOUR=20
+# SYNSEMA_ACME_DNS_WAIT=20
+
 # Gracia (segundos) del shutdown ordenado ante SIGINT/SIGTERM: se dejan de aceptar
 # requests (503 + Retry-After), se drenan las que estan en vuelo y al vencer se
 # cancelan. 0 = inmediato. Un segundo Ctrl-C durante el drain sale ya (codigo 130):
@@ -394,6 +405,8 @@ const HELLO_SYN_PAST: &[&str] = &[
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
 const ENV_EXAMPLE_PAST: &[&str] = &[
+    // v0.6.42 (2026-10-03): antes de SYNSEMA_SERVE_MAX_WAITING (el pool elastico de serve).
+    "9be5fadd45bcece73dc74a4958301105cb1755fc65091014f96179900c489fc8",
     // T1 identidad (2026-09-22, post v0.6.27): antes de SYNSEMA_IDENTITY (el sujeto de `run`)
     // en la seccion de techos por identidad.
     "dce31ea48a800f7c9e0f0279a6e3ab7a3aea5a18341bdfdae64e29efdab5dec1",

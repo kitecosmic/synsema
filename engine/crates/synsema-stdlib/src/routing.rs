@@ -527,6 +527,15 @@ pub fn parse_multipart(boundary: &str, body: &[u8]) -> Vec<FormPart> {
     parts
 }
 
+/// v0.6.42 — destino de un `proxy to` que la ruta decidió al correr.
+pub enum ProxyDest {
+    /// `http://host[:puerto][/base]` (el `net` ya se chequeó por request).
+    Url(String),
+    /// Un extremo de `pipe()`, ya sacado del hub del worker (en el server nativo es un
+    /// `synsema_stdlib::pipe::PipeEnd`; type-erased para que este módulo siga siendo puro).
+    Conn(Box<dyn std::any::Any + Send>),
+}
+
 /// Resultado de correr el cuerpo de una ruta.
 pub enum GiveOutcome {
     /// `give <valor>` (o None si el handler no dio nada → nothing).
@@ -538,6 +547,8 @@ pub enum GiveOutcome {
     /// Capability denegada por el TOKEN del caller (techo delegado, T1) → 403 con cuerpo
     /// fijo `insufficient permissions`; el texto (detalle) va sólo al log del server.
     Forbidden(String),
+    /// v0.6.42 — la ruta ejecutó `proxy to <destino>`: el transporte reenvía la request.
+    Proxy(ProxyDest),
 }
 
 pub type Handler = Arc<dyn Fn(&Ctx) -> GiveOutcome + Send + Sync>;
@@ -589,6 +600,10 @@ pub struct RouteSpec {
     pub timeout: Option<f64>,
     /// Lote 2 — reverse proxy: si está, la route forwardea al upstream (URL base).
     pub proxy_target: Option<String>,
+    /// v0.6.42 — el cuerpo tiene un `proxy to` que se decide al correr (destino por request,
+    /// o un `proxy to` después de otras sentencias): la ruta es de proxy para el transporte
+    /// (reserva el upgrade de WebSocket), pero corre su handler.
+    pub proxy_dynamic: bool,
     /// `rate_limit unlimited` explícito (para `/openapi.json`; el limiter ya lo trata como None).
     pub rate_unlimited: bool,
     /// Metadatos estáticos (expect/respuesta/capabilities) para `/openapi.json` y `/docs`.
