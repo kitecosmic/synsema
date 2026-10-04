@@ -1621,6 +1621,10 @@ pub struct Interpreter {
     /// cuántas líneas salieron depende del dato); sin etiquetas van a stderr al momento.
     /// Se sueltan (o se retienen) en `redact_for_host`, el embudo de cada entrada del host.
     err_output: Vec<String>,
+    /// v0.6.42 — el `log_hook` sólo observa (el de `run --labels`, que saca los `declassify` a
+    /// stderr) y no es un destino de la salida como el de un agente o el de serve: `log` lo trata
+    /// como si no hubiera hook y, bajo `synsema run`, va a stderr.
+    pub log_hook_observes_only: bool,
 }
 
 impl Default for Interpreter {
@@ -1757,6 +1761,7 @@ impl Interpreter {
             global_env: Environment::root("global"),
             output: Vec::new(),
             err_output: Vec::new(),
+            log_hook_observes_only: false,
             blackboard: HashMap::new(),
             agent_definitions: HashMap::new(),
             agent_context: Vec::new(),
@@ -5508,8 +5513,9 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // `logging`, Rust `env_logger`, MCP por stdio): stdout queda para el resultado. Bajo
         // `test`/`serve`/`conform`/JSON se sigue colectando con la salida, como siempre.
         // Con un `log_hook` (agentes, el sink de serve) va por el hook: conserva el prefijo del
-        // agente y el destino del host.
-        if self.log_hook.is_none() && LIVE_STDOUT.load(std::sync::atomic::Ordering::Relaxed) {
+        // agente y el destino del host. Un hook que sólo observa (`run --labels`) no es un destino.
+        let to_hook = self.log_hook.is_some() && !self.log_hook_observes_only;
+        if !to_hook && LIVE_STDOUT.load(std::sync::atomic::Ordering::Relaxed) {
             self.emit_err_line(line);
         } else {
             self.emit_line(line);

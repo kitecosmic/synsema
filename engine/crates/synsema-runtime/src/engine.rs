@@ -631,6 +631,8 @@ pub(crate) fn wire_common_with_state(
                     eprintln!("{}", line);
                 }
             }));
+            // Sólo observa: `log` sigue yendo a stderr bajo `synsema run`.
+            interp.log_hook_observes_only = true;
         }
     }
     if !secure {
@@ -2056,6 +2058,8 @@ fn setup_swarm_interpreter(
     // Propaga el techo (y el ctx de memoria) a los sub-agentes que este agente spawnee.
     wire_swarm_hooks(&mut interp, swarm, agent_name, ceiling, mem, None, &caps);
     let name = agent_name.to_string();
+    // El hook del agente es un destino (lleva su prefijo), no un observador como el de `run --labels`.
+    interp.log_hook_observes_only = false;
     interp.log_hook = Some(Arc::new(move |line: &str| {
         // `conform` exige stdout = SOLO el JSON final: bajo ese modo el eco vivo
         // ([main]/[agente]) va a stderr (sigue siendo visible, no rompe el parse).
