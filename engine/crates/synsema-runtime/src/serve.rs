@@ -1899,13 +1899,16 @@ fn body_has_proxy(body: &[Node]) -> bool {
 
 /// v0.6.42 (auditoría) — ¿el cuerpo de la ruta lee el body de la request? `read_body`,
 /// `read_body_bytes`, o `body`/`form`/`json` del request (`body of request`, `request.form`,
-/// `request["json"]`). Conservador: ante la duda, lo lee (bufferiza) en vez de dejarlo vacío.
+/// `request["json"]`), o `expect` (valida `request.json`). Lo que se le escapa (una task que lee
+/// `r.body`, `get(request, "body")`, `request[k]`) falla en runtime: el `request` de una ruta en
+/// streaming no tiene esas claves (ver `Ctx::body_streamed`).
 fn body_reads_request_body(body: &[Node]) -> bool {
-    const FIELDS: [&str; 3] = ["body", "form", "json"];
+    const FIELDS: [&str; 4] = ["body", "form", "json", "body_file"];
     let mut reads = false;
     for st in body {
         synsema_core::ast_api::walk(st, &mut |n| match &n.kind {
             NodeKind::Identifier { name } if name == "read_body" || name == "read_body_bytes" => reads = true,
+            NodeKind::ExpectStatement { .. } => reads = true,
             NodeKind::PropertyAccess { property_name, .. } if FIELDS.contains(&property_name.as_str()) => reads = true,
             NodeKind::IndexAccess { index, .. } => {
                 if let NodeKind::TextLiteral { value } = &index.kind {

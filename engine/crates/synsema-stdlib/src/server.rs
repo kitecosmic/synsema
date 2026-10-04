@@ -1422,6 +1422,7 @@ impl ServeRuntime {
         body_file: Option<&str>,
         client_ip: &str,
         cancel: CancelToken,
+        body_streamed: bool,
     ) -> Dispatched {
         let resp = |status, body| Dispatched::Response { status, body, headers: vec![] };
         // v0.6.20 — este hilo atiende a ESTE servidor (para `openapi_json()`).
@@ -1634,6 +1635,7 @@ impl ServeRuntime {
             client_ip: client_ip.to_string(),
             user: None,
             cancel,
+            body_streamed,
         };
 
         // Auth. El `ctx` ya existe (user aún nothing) — el hook lo recibe entero
@@ -3862,6 +3864,8 @@ async fn handle_request(
     if plan.proxy && proxy_body.is_none() {
         proxy_body = Some(ProxyBodySrc::Bytes(body_bytes.clone()));
     }
+    // El body no se leyó: el handler no lo ve (`Ctx::body_streamed`).
+    let body_streamed = matches!(proxy_body, Some(ProxyBodySrc::Stream(_)));
     // Lo que el forward de un `proxy to` necesita (el job sync consume el resto).
     let proxy_req = if plan.proxy {
         Some((method.clone(), target.clone(), headers.clone(), peer_ip.clone()))
@@ -3943,6 +3947,7 @@ async fn handle_request(
             bf.as_deref(),
             &client_ip,
             cancel_job.clone(),
+            body_streamed,
         );
         match dispatched {
             Dispatched::Response { status, body, headers: extra } => {

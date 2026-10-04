@@ -32,9 +32,16 @@ pub const MAX_BUFFER_CEILING: usize = 64 * 1024 * 1024;
 const MAX_UNADOPTED: usize = 65_536;
 /// Los handles de pipe viven en su propio rango, lejos de los ids por-hub (que empiezan en 1).
 const FIRST_PIPE_ID: u64 = 1 << 40;
-/// Un extremo que nadie adoptó en este tiempo se cierra (el túnel se cayó, el puente no
-/// arrancó): un pipe abandonado no retiene memoria ni un lugar de la tabla para siempre.
+/// Un extremo que nadie adoptó y que lleva este tiempo sin actividad (ni del otro extremo) se
+/// cierra (el túnel se cayó, el puente no arrancó): un pipe abandonado no retiene memoria ni un
+/// lugar de la tabla para siempre. Cuenta desde la última lectura/escritura del par, no desde la
+/// creación: un extremo que espera a su dueño mientras el otro trabaja no se barre.
 const UNADOPTED_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Extremos sin adoptar que creó UN intérprete (un hub): un programa (o un ataque a sus rutas)
+/// no llena la tabla del proceso por su cuenta.
+const MAX_UNADOPTED_PER_HUB: usize = 4096;
+/// Cada cuánto se barre la tabla en segundo plano (sin esperar a que alguien cree o adopte).
+const SWEEP_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Despertador de un extremo (lo llama el otro lado).
 pub type WakeFn = Arc<dyn Fn() + Send + Sync>;
@@ -54,6 +61,18 @@ struct Shared {
     dirs: [Mutex<Dir>; 2],
     /// Despertador de cada lado (`wakers[0]` = el de a).
     wakers: [Mutex<Option<WakeFn>>; 2],
+    /// Última actividad del par (ms desde `epoch()`): la creación, una lectura, una escritura
+    /// o un cierre de cualquiera de los dos extremos.
+    last: AtomicU64,
+}
+
+fn epoch() -> std::time::Instant {
+    static E: OnceLock<std::time::Instant> = OnceLock::new();
+    *E.get_or_init(std::time::Instant::now)
+}
+
+fn now_ms() -> u64 {
+    epoch().elapsed().as_millis() as u64
 }
 
 /// Un extremo. `side` 0 = a, 1 = b: escribe en `dirs[side]` y lee de `dirs[1 - side]`.
@@ -83,6 +102,10 @@ pub enum WriteError {
 }
 
 impl Shared {
+    fn touch(&self) {
+        self.last.store(now_ms(), Ordering::Relaxed);
+    }
+
     fn wake(&self, side: usize) {
         let w = self.wakers[side].lock().ok().and_then(|g| g.clone());
         if let Some(f) = w {
@@ -98,6 +121,7 @@ pub fn pair(cap: usize) -> (PipeEnd, PipeEnd) {
         cap: cap.clamp(1, MAX_BUFFER_CEILING),
         dirs: [dir(), dir()],
         wakers: [Mutex::new(None), Mutex::new(None)],
+        last: AtomicU64::new(now_ms()),
     });
     (
         PipeEnd { shared: shared.clone(), side: 0, closed: false },
@@ -132,6 +156,7 @@ impl PipeEnd {
             d.len += n;
             n
         };
+        self.shared.touch();
         self.shared.wake(1 - self.side);
         Ok(n)
     }
@@ -158,6 +183,7 @@ impl PipeEnd {
             Bytes::from(out)
         };
         // Se liberó lugar: el escritor del otro lado puede seguir.
+        self.shared.touch();
         self.shared.wake(1 - self.side);
         ReadOutcome::Data(out)
     }
@@ -183,6 +209,7 @@ impl PipeEnd {
         if let Ok(mut d) = self.shared.dirs[self.side].lock() {
             d.writer_closed = true;
         }
+        self.shared.touch();
         self.shared.wake(1 - self.side);
     }
 
@@ -202,7 +229,13 @@ impl PipeEnd {
             d.chunks.clear();
             d.len = 0;
         }
+        self.shared.touch();
         self.shared.wake(1 - self.side);
+    }
+
+    /// ¿Pasó `ttl` sin actividad en el par?
+    fn idle_for(&self, ttl: std::time::Duration) -> bool {
+        now_ms().saturating_sub(self.shared.last.load(Ordering::Relaxed)) >= ttl.as_millis() as u64
     }
 
     /// ¿Ya no queda nada por leer y el otro lado dejó de escribir? (EOF).
@@ -233,30 +266,80 @@ impl Drop for PipeEnd {
 // La tabla del proceso: extremos sin adoptar
 // =========================================================
 
-fn table() -> &'static Mutex<HashMap<u64, (PipeEnd, std::time::Instant)>> {
-    static T: OnceLock<Mutex<HashMap<u64, (PipeEnd, std::time::Instant)>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
+/// Los extremos sin adoptar (con el hub que los creó) y cuántos tiene cada hub.
+#[derive(Default)]
+struct Table {
+    ends: HashMap<u64, (PipeEnd, usize)>,
+    per_hub: HashMap<usize, usize>,
+}
+
+impl Table {
+    fn take(&mut self, id: u64) -> Option<PipeEnd> {
+        let (end, hub) = self.ends.remove(&id)?;
+        if let Some(n) = self.per_hub.get_mut(&hub) {
+            *n -= 1;
+            if *n == 0 {
+                self.per_hub.remove(&hub);
+            }
+        }
+        Some(end)
+    }
+
+    /// Saca los extremos que ya no va a usar nadie: los que llevan `ttl` sin actividad en el
+    /// par, y los que tienen el par cerrado y nada por leer. Soltarlos los cierra.
+    fn sweep(&mut self, ttl: std::time::Duration) {
+        let dead: Vec<u64> = self
+            .ends
+            .iter()
+            .filter(|(_, (e, _))| e.idle_for(ttl) || (e.peer_gone() && !e.has_unread()))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in dead {
+            self.take(id);
+        }
+    }
+}
+
+fn table() -> &'static Mutex<Table> {
+    static T: OnceLock<Mutex<Table>> = OnceLock::new();
+    T.get_or_init(|| {
+        // Barrido periódico: sin él, sólo se barría al crear o adoptar, y sin actividad ajena la
+        // tabla no soltaba nada.
+        let _ = std::thread::Builder::new().name("pipe-sweep".to_string()).spawn(|| loop {
+            std::thread::sleep(SWEEP_EVERY);
+            if let Some(t) = TABLE_READY.get() {
+                if let Ok(mut t) = t.lock() {
+                    t.sweep(UNADOPTED_TTL);
+                }
+            }
+        });
+        Mutex::new(Table::default())
+    })
+}
+
+/// La tabla, para el hilo de barrido (que arranca dentro de `get_or_init` y no puede volver a
+/// entrar ahí).
+static TABLE_READY: OnceLock<&'static Mutex<Table>> = OnceLock::new();
+
+fn the_table() -> &'static Mutex<Table> {
+    let t = table();
+    let _ = TABLE_READY.set(t);
+    t
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Un id nuevo, aleatorio (≥ 2^40, < 2^62): un extremo no se adopta adivinando su número.
-fn fresh_id(t: &HashMap<u64, (PipeEnd, std::time::Instant)>) -> u64 {
+fn fresh_id(t: &Table) -> u64 {
     use std::hash::BuildHasher;
     loop {
         let n = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let r = std::collections::hash_map::RandomState::new().hash_one(n);
         let id = (r >> 2) | FIRST_PIPE_ID;
-        if !t.contains_key(&id) {
+        if !t.ends.contains_key(&id) {
             return id;
         }
     }
-}
-
-/// Saca de la tabla los extremos que ya no va a usar nadie: los que nadie adoptó en
-/// `UNADOPTED_TTL`, y los que tienen el par cerrado y nada por leer. Soltarlos los cierra.
-fn sweep(t: &mut HashMap<u64, (PipeEnd, std::time::Instant)>) {
-    t.retain(|_, (e, at)| at.elapsed() < UNADOPTED_TTL && !(e.peer_gone() && !e.has_unread()));
 }
 
 /// ¿Este número es un handle de pipe (por su rango)?
@@ -264,22 +347,30 @@ pub fn is_pipe_id(h: i64) -> bool {
     h >= FIRST_PIPE_ID as i64
 }
 
-/// Crea un pipe y deja los dos extremos sin adoptar. Devuelve sus handles.
-pub fn create(cap: usize) -> Result<(i64, i64), String> {
+/// Crea un pipe y deja los dos extremos sin adoptar, a cuenta del hub `hub` (un número que
+/// identifica al intérprete que lo crea). Devuelve sus handles.
+pub fn create(cap: usize, hub: usize) -> Result<(i64, i64), String> {
     let (a, b) = pair(cap);
-    let mut t = table().lock().map_err(|_| "pipe(): internal lock poisoned".to_string())?;
-    sweep(&mut t);
-    if t.len() + 2 > MAX_UNADOPTED {
+    let mut t = the_table().lock().map_err(|_| "pipe(): internal lock poisoned".to_string())?;
+    t.sweep(UNADOPTED_TTL);
+    let mine = t.per_hub.get(&hub).copied().unwrap_or(0);
+    if mine + 2 > MAX_UNADOPTED_PER_HUB {
         return Err(format!(
-            "pipe(): {} pipe ends are waiting to be used; use or close them (pipe_close) before creating more",
-            t.len()
+            "pipe(): this program has {} pipe ends waiting to be used; use or close them (pipe_close) before creating more",
+            mine
         ));
     }
-    let now = std::time::Instant::now();
+    if t.ends.len() + 2 > MAX_UNADOPTED {
+        return Err(format!(
+            "pipe(): {} pipe ends are waiting to be used; use or close them (pipe_close) before creating more",
+            t.ends.len()
+        ));
+    }
     let ia = fresh_id(&t);
-    t.insert(ia, (a, now));
+    t.ends.insert(ia, (a, hub));
     let ib = fresh_id(&t);
-    t.insert(ib, (b, now));
+    t.ends.insert(ib, (b, hub));
+    *t.per_hub.entry(hub).or_insert(0) += 2;
     Ok((ia as i64, ib as i64))
 }
 
@@ -288,9 +379,9 @@ pub fn adopt(h: i64) -> Option<PipeEnd> {
     if !is_pipe_id(h) {
         return None;
     }
-    let mut t = table().lock().ok()?;
-    let end = t.remove(&(h as u64)).map(|(e, _)| e);
-    sweep(&mut t);
+    let mut t = the_table().lock().ok()?;
+    let end = t.take(h as u64);
+    t.sweep(UNADOPTED_TTL);
     end
 }
 
@@ -439,7 +530,7 @@ mod tests {
 
     #[test]
     fn ends_are_adopted_once_from_the_process_table() {
-        let (ha, hb) = create(16).unwrap();
+        let (ha, hb) = create(16, 1).unwrap();
         assert!(is_pipe_id(ha) && is_pipe_id(hb) && ha != hb);
         assert!(hb != ha + 1, "ids aleatorios, no consecutivos");
         let a = adopt(ha).expect("primera adopción");
@@ -453,11 +544,70 @@ mod tests {
     /// pipe (antes el predicado del barrido era siempre verdadero y la tabla sólo crecía).
     #[test]
     fn an_abandoned_end_is_swept() {
-        let (ha, hb) = create(16).unwrap();
+        let (ha, hb) = create(16, 1).unwrap();
         let mut a = adopt(ha).unwrap();
         a.close();
         drop(a);
-        let _ = create(16).unwrap();
+        let _ = create(16, 1).unwrap();
         assert!(adopt(hb).is_none(), "el extremo abandonado quedó en la tabla");
+    }
+
+    /// Auditoría ronda 2 (R6): el TTL cuenta desde la última actividad del par. Un extremo sin
+    /// adoptar cuyo par sigue escribiendo no se barre; uno quieto, sí. Y uno con datos sin leer
+    /// cuyo par ya cerró sobrevive (el dueño puede llegar y leerlos).
+    #[test]
+    fn the_ttl_counts_from_the_last_activity_and_unread_data_survives() {
+        let mut t = Table::default();
+        let ttl = std::time::Duration::from_millis(150);
+        let (busy_a, busy_b) = pair(64);
+        let (idle_a, _idle_b) = pair(64);
+        let (mut gone_a, data_b) = pair(64);
+        gone_a.try_write(b"para despues").unwrap();
+        gone_a.close();
+        t.ends.insert(1, (busy_b, 7));
+        t.ends.insert(2, (idle_a, 7));
+        t.ends.insert(3, (data_b, 7));
+        t.per_hub.insert(7, 3);
+        for _ in 0..4 {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            busy_a.try_write(b"x").unwrap(); // el par trabaja: el extremo sin adoptar sigue vivo
+            t.sweep(ttl);
+        }
+        assert!(t.ends.contains_key(&1), "el par tuvo actividad");
+        assert!(!t.ends.contains_key(&2), "sin actividad en el TTL se barre");
+        assert!(!t.ends.contains_key(&3), "con datos y sin actividad en el TTL también");
+        assert_eq!(t.per_hub.get(&7), Some(&1));
+        // Dentro del TTL, el extremo con datos de un par cerrado sigue y se lee entero.
+        let (mut w, r) = pair(64);
+        w.try_write(b"hola").unwrap();
+        w.close();
+        t.ends.insert(4, (r, 8));
+        t.sweep(ttl);
+        let r = t.take(4).expect("los datos sin leer lo mantienen");
+        assert_eq!(r.try_read(10), ReadOutcome::Data(Bytes::from_static(b"hola")));
+        assert_eq!(r.try_read(10), ReadOutcome::Eof);
+    }
+
+    #[test]
+    fn one_hub_cannot_fill_the_process_table() {
+        let hub = 0xDEAD_0000usize;
+        let mut made = Vec::new();
+        let e = loop {
+            match create(16, hub) {
+                Ok(p) => made.push(p),
+                Err(e) => break e,
+            }
+        };
+        assert!(e.contains("this program"), "{}", e);
+        assert_eq!(made.len() * 2, MAX_UNADOPTED_PER_HUB);
+        // Otro hub sigue pudiendo.
+        let (x, y) = create(16, hub + 1).unwrap();
+        for (a, b) in made {
+            close_unadopted(a);
+            close_unadopted(b);
+        }
+        close_unadopted(x);
+        close_unadopted(y);
+        assert!(create(16, hub).is_ok(), "al usarlos o cerrarlos se libera el lugar");
     }
 }

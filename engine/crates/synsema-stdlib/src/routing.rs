@@ -383,6 +383,10 @@ pub struct Ctx {
     /// Token de cancelación cooperativa de la request (timeout de handler / shutdown):
     /// el intérprete del handler lo adopta antes de correr el cuerpo.
     pub cancel: synsema_core::interpreter::CancelToken,
+    /// v0.6.42 — el body viaja en streaming al destino de un `proxy to` y NO se leyó. El
+    /// `request` no tiene `body`/`json`/`form`/`body_file` (leerlos falla en vez de dar `""`)
+    /// y `read_body`/`read_body_bytes` dan un error que dice cómo leerlo.
+    pub body_streamed: bool,
 }
 
 /// Ctx mínimo para el `errors with` de 404/405 (el error ocurre ANTES de armar el
@@ -411,6 +415,7 @@ pub fn min_ctx(
         client_ip: client_ip.to_string(),
         user: None,
         cancel: synsema_core::interpreter::CancelToken::new(),
+        body_streamed: false,
     }
 }
 
@@ -999,22 +1004,26 @@ pub fn build_request_syn(ctx: &Ctx) -> SynValue {
     let mut m = SynMap::new();
     m.insert("method", syn_text(ctx.method.as_str()));
     m.insert("path", syn_text(ctx.path.as_str()));
-    m.insert("body", syn_text(ctx.body.as_str()));
-    m.insert(
-        "body_file".to_string(),
-        match &ctx.body_file {
-            Some(p) => syn_text(p.as_str()),
-            None => syn_nothing(),
-        },
-    );
-    m.insert(
-        "json".to_string(),
-        match &ctx.json {
-            // Copy-on-write: compartir el valor es seguro (una escritura del handler copia).
-            Some(v) => v.clone(),
-            None => syn_nothing(),
-        },
-    );
+    // Un body que viaja en streaming al `proxy to` no está: `request.body` falla ("no key") en
+    // vez de valer `""` (un filtro o un HMAC sobre `""` pasaban en silencio).
+    if !ctx.body_streamed {
+        m.insert("body", syn_text(ctx.body.as_str()));
+        m.insert(
+            "body_file".to_string(),
+            match &ctx.body_file {
+                Some(p) => syn_text(p.as_str()),
+                None => syn_nothing(),
+            },
+        );
+        m.insert(
+            "json".to_string(),
+            match &ctx.json {
+                // Copy-on-write: compartir el valor es seguro (una escritura del handler copia).
+                Some(v) => v.clone(),
+                None => syn_nothing(),
+            },
+        );
+    }
     m.insert("headers", headers_map(&ctx.headers));
     // Cookies entrantes (RFC 6265 §5.4), SIN decodificar; nombre duplicado: gana
     // la primera aparición. Sin header `Cookie` → map VACÍO (nunca nothing:
@@ -1031,7 +1040,9 @@ pub fn build_request_syn(ctx: &Ctx) -> SynValue {
     //   multipart/form-data → campo de texto → texto; archivo → {filename,
     //     content_type, data (bytes exactos)}
     // sin form body → map VACÍO (como cookies: siempre navegable, nunca nothing).
-    m.insert("form", build_form_syn(ctx));
+    if !ctx.body_streamed {
+        m.insert("form", build_form_syn(ctx));
+    }
     m.insert("ip", syn_text(ctx.client_ip.as_str()));
     m.insert("user", ctx.user.clone().unwrap_or_else(syn_nothing));
     syn_map(m)
@@ -1085,19 +1096,35 @@ pub fn build_form_syn(ctx: &Ctx) -> SynValue {
     syn_map(out)
 }
 
+/// El error de leer un body que viaja en streaming al `proxy to` (ver `Ctx::body_streamed`).
+fn body_streamed_error(what: &str) -> synsema_core::interpreter::RuntimeError {
+    synsema_core::interpreter::RuntimeError::new(format!(
+        "{}: the body of this request streams to `proxy to` and was not read; read it in the route \
+         itself (`read_body()`, `request.body`, `request.json` or `request.form` written in the route, \
+         not in a task it calls) so the engine reads it first, up to `max_body`",
+        what
+    ))
+}
+
 /// Las bindings que ve un handler, LOCALES al scope hijo del request (no globales →
 /// no se filtran al siguiente request al reusar el intérprete): `request`, `query`,
 /// `params` y el builtin `read_body` (lee el cuerpo, en memoria o del temp file spilled).
 pub fn request_bindings(ctx: &Ctx) -> Vec<(String, SynValue)> {
     let body_text = ctx.body.clone();
     let body_file = ctx.body_file.clone();
+    let streamed = ctx.body_streamed;
     let read_body = SynValue::Builtin(Rc::new(BuiltinTask::new(
         "read_body",
         0,
         None,
-        Rc::new(move |_i, _a, _l| match &body_file {
-            Some(bf) => Ok(syn_text(std::fs::read_to_string(bf).unwrap_or_default())),
-            None => Ok(syn_text(body_text.as_str())),
+        Rc::new(move |_i, _a, _l| {
+            if streamed {
+                return Err(synsema_core::interpreter::Control::Error(body_streamed_error("read_body")));
+            }
+            match &body_file {
+                Some(bf) => Ok(syn_text(std::fs::read_to_string(bf).unwrap_or_default())),
+                None => Ok(syn_text(body_text.as_str())),
+            }
         }),
     )));
     // read_body_bytes() → bytes crudos (NO lossy). Prefiere el temp file spilled
@@ -1110,9 +1137,14 @@ pub fn request_bindings(ctx: &Ctx) -> Vec<(String, SynValue)> {
         "read_body_bytes",
         0,
         None,
-        Rc::new(move |_i, _a, _l| match &body_file_b {
-            Some(bf) => Ok(syn_bytes(std::fs::read(bf).unwrap_or_default())),
-            None => Ok(syn_bytes(body_raw.clone())),
+        Rc::new(move |_i, _a, _l| {
+            if streamed {
+                return Err(synsema_core::interpreter::Control::Error(body_streamed_error("read_body_bytes")));
+            }
+            match &body_file_b {
+                Some(bf) => Ok(syn_bytes(std::fs::read(bf).unwrap_or_default())),
+                None => Ok(syn_bytes(body_raw.clone())),
+            }
         }),
     )));
     vec![

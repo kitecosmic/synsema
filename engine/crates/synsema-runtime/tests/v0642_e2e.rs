@@ -476,6 +476,64 @@ fn a_proxy_route_that_reads_the_body_sees_it_and_still_forwards_it() {
     assert!(resp.starts_with("HTTP/1.1 400"), "el filtro ve el body (no un vacío en silencio): {}", resp);
 }
 
+/// Auditoría ronda 2 (R4): lo que la detección estática no ve (una task que lee `r.body`,
+/// `get(request, "body")`, `request[k]`) ya no evalúa el filtro sobre `""` y deja pasar el body:
+/// el `request` de una ruta en streaming no tiene esas claves, así que el filtro falla (500) y
+/// nada llega al destino.
+#[test]
+fn a_streamed_body_cannot_be_read_around_the_static_check() {
+    let up = spawn_counting_upstream();
+    let port = free_port();
+    let prog = format!(
+        r#"require serve({p})
+require net("127.0.0.1:{up}")
+
+task looks_bad(r)
+    give contains(r.body, "<script")
+
+serve on {p}
+    route "POST /task"
+        when looks_bad(request)
+            give respond("blocked", "text/plain", 400)
+        proxy to "http://127.0.0.1:{up}" + ""
+    route "POST /get"
+        when contains(get(request, "body"), "<script")
+            give respond("blocked", "text/plain", 400)
+        proxy to "http://127.0.0.1:{up}" + ""
+    route "POST /idx"
+        let k be "body"
+        when contains(request[k], "<script")
+            give respond("blocked", "text/plain", 400)
+        proxy to "http://127.0.0.1:{up}" + ""
+    route "POST /plain"
+        proxy to "http://127.0.0.1:{up}" + ""
+"#,
+        p = port,
+        up = up
+    );
+    start(prog, port);
+    for path in ["/task", "/get", "/idx"] {
+        let mut sock = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        sock.write_all(format!("POST {} HTTP/1.1
+Host: t
+Content-Length: 8
+Connection: close
+
+<script>", path).as_bytes())
+            .unwrap();
+        let mut raw = Vec::new();
+        let _ = sock.read_to_end(&mut raw);
+        let resp = String::from_utf8_lossy(&raw).to_string();
+        assert!(resp.starts_with("HTTP/1.1 500"), "{}: el filtro no corre sobre un body vacío: {}", path, resp);
+        assert!(!resp.contains("got "), "{}: el body no llegó al destino: {}", path, resp);
+    }
+    // Sin leerlo, sigue en streaming y llega entero.
+    let (status, resp) = post(port, "/plain", 1024 * 1024);
+    assert_eq!(status, 200, "{}", resp);
+    assert!(resp.ends_with(&format!("got {}", 1024 * 1024)), "{}", resp);
+}
+
 #[test]
 fn two_host_headers_are_a_bad_request() {
     let port = free_port();
@@ -490,6 +548,60 @@ fn a_pipe_half_close_still_lets_the_other_side_answer() {
     let r = run("let p be pipe()\npipe_send(p[\"a\"], \"req\")\npipe_close(p[\"a\"], \"write\")\nprint(decode(pipe_recv(p[\"b\"], 1)[\"data\"]))\nprint(pipe_recv(p[\"b\"], 1)[\"type\"])\npipe_send(p[\"b\"], \"resp\")\nprint(decode(pipe_recv(p[\"a\"], 1)[\"data\"]))\n");
     assert!(r.success, "{:?}", r.errors);
     assert_eq!(r.output, vec!["req", "close", "resp"]);
+}
+
+/// Auditoría ronda 2 (R7): un par que hace `SHUT_WR` y espera la respuesta la recibe (al
+/// entregar el `close` se hacía `shutdown(Both)`). Y el `close` queda pegado: otro `tcp_recv`
+/// después lo devuelve enseguida, no al vencer su timeout.
+#[test]
+fn a_tcp_peer_that_half_closes_still_gets_the_answer() {
+    let _g = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        s.write_all(b"pregunta").unwrap();
+        s.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut got = Vec::new();
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let _ = s.read_to_end(&mut got);
+        let _ = tx.send(got);
+    });
+    let src = format!(
+        r#"require net("127.0.0.1:{port}")
+let c be tcp_connect("127.0.0.1", {port})
+print(decode(tcp_recv(c, 10)["data"]))
+print(tcp_recv(c, 10)["type"])
+print(tcp_recv(c, 10)["type"])
+tcp_send(c, "respuesta")
+tcp_close(c)
+"#,
+        port = port
+    );
+    let t0 = std::time::Instant::now();
+    let r = run(&src);
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["pregunta", "close", "close"]);
+    assert!(t0.elapsed() < Duration::from_secs(5), "el segundo close no esperó el timeout: {:?}", t0.elapsed());
+    let got = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+    assert_eq!(got, b"respuesta", "el par que hizo SHUT_WR recibe la respuesta");
+}
+
+/// Auditoría ronda 2 (R6): después del EOF, `pipe_recv` devuelve `close` enseguida.
+#[test]
+fn a_pipe_close_is_sticky() {
+    let _g = RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let t0 = std::time::Instant::now();
+    let r = run("let p be pipe()
+pipe_close(p[\"a\"])
+print(pipe_recv(p[\"b\"], 10)[\"type\"])
+print(pipe_recv(p[\"b\"], 10)[\"type\"])
+print(select([p[\"b\"]], 10)[\"type\"])
+");
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output, vec!["close", "close", "close"]);
+    assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
 }
 
 #[test]

@@ -33,8 +33,11 @@ Synsema on top of them.
   that defined its own `task eprint` must rename it.
 - **In a route that runs `proxy to`, the request body streams to the destination** without being
   read first (with `max_body` still counting bytes, and a declared `Content-Length` above it
-  answered with 413 right away) — unless the route reads it (`read_body`, `read_body_bytes`, or the
-  request's `body`/`form`/`json`): then it is read whole, up to `max_body`, and forwarded as is.
+  answered with 413 right away) — unless the route reads it (`read_body`, `read_body_bytes`,
+  `expect`, or the request's `body`/`form`/`json` written in the route): then it is read whole, up
+  to `max_body`, and forwarded as is. Read any other way (in a task the route calls,
+  `get(request, "body")`, `request[k]`), a streamed body fails instead of looking empty: that
+  `request` has no `body`, `json`, `form` or `body_file`, and `read_body` says how to read it.
 - **`tls auto` starts even if the CA cannot be reached**: names without a certificate are logged
   and retried in the background instead of stopping the server — every minute while a `domain`
   name is missing, each name waiting 1 min after a failure, doubling up to 1 h. Each issuance has
@@ -48,10 +51,16 @@ Synsema on top of them.
 - `tcp_connect(host, port, opts?)`, `tcp_send`, `tcp_recv`, `tcp_close`, `tcp_stats`: outbound TCP,
   gated by `net("host:port")` with the exact port (a grant for `:8080` does not reach `:8081`).
   Bounded buffers both ways; `tcp_recv` gives `{type: "data", data}` or `{type: "close"}`, `nothing`
-  on timeout; handles mix with the rest in `select`.
+  on timeout; handles mix with the rest in `select`. `close` means the peer stopped sending: the
+  connection stays open for an answer until `tcp_close`, and every later `tcp_recv` (or `select`)
+  gives `close` again at once, like a closed channel in Go — drop the handle from a `select` you
+  keep running. Name resolution runs in its own thread, at most 64 at a time in the process.
 - `pipe(opts?)` → `{a, b}`: two connected byte ends with a bound per direction (`pipe_send`,
   `pipe_recv`, `pipe_close`, in `select`). An end can be handed to another interpreter (a route to
-  an agent, a request to a `socket` route): the first one that uses it owns it.
+  an agent, a request to a `socket` route): the first one that uses it owns it. `close` is sticky
+  as in TCP, and `pipe_close(x, "write")` is a half close. An end nobody took is closed after 60 s
+  without activity on its pair (checked every 5 s); a program can have at most 4096 ends waiting
+  to be taken.
 - `proxy to <expr>` can run anywhere in a route body — after checking a token, or instead of an
   "offline" page — and its destination can depend on the request: a URL (its `net` grant is
   checked per request) or a pipe end, over which the engine speaks HTTP/1.1, SSE and WebSocket
