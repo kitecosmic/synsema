@@ -430,6 +430,7 @@ fn dispatch(app: &mut App, req: &HttpRequestIn) -> (HttpResponseOut, Vec<String>
         client_ip: req.client_ip.clone(),
         user: None,
         cancel: synsema_core::interpreter::CancelToken::new(),
+        body_streamed: false,
     };
 
     let idx = match route_idx {
