@@ -135,10 +135,16 @@ pub struct CertManager {
 
 impl CertManager {
     pub fn new(opts: AcmeOptions) -> Arc<CertManager> {
+        Arc::new(Self::build(opts, crate::acme::certs_dir(), env_u64("SYNSEMA_ACME_MAX_PER_HOUR", 20) as usize))
+    }
+
+    /// El manager con su directorio y su tope explícitos (los tests no tocan variables de entorno
+    /// del proceso: corren en paralelo).
+    fn build(opts: AcmeOptions, dir: PathBuf, max_per_hour: usize) -> CertManager {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        Arc::new(CertManager {
+        CertManager {
             opts,
-            dir: crate::acme::certs_dir(),
+            dir,
             directory_url: std::env::var("SYNSEMA_ACME_DIRECTORY")
                 .unwrap_or_else(|_| instant_acme::LetsEncrypt::Production.url().to_owned()),
             ca_root: std::env::var("SYNSEMA_ACME_CA").ok(),
@@ -152,9 +158,9 @@ impl CertManager {
             ask_cache: Mutex::new(HashMap::new()),
             ask_slots: Arc::new(tokio::sync::Semaphore::new(ASK_CONCURRENCY)),
             new_names: Mutex::new((Instant::now(), 0)),
-            max_per_hour: env_u64("SYNSEMA_ACME_MAX_PER_HOUR", 20) as usize,
+            max_per_hour,
             dns_wait: Duration::from_secs(env_u64("SYNSEMA_ACME_DNS_WAIT", 20)),
-        })
+        }
     }
 
     /// ¿Hay un `ask`? (sin él, un nombre desconocido nunca se emite).
@@ -814,9 +820,8 @@ mod tests {
 
     #[test]
     fn the_hourly_cap_is_for_on_demand_and_backoff_holds() {
-        std::env::set_var("SYNSEMA_ACME_MAX_PER_HOUR", "2");
-        let m = manager(&[]);
-        std::env::remove_var("SYNSEMA_ACME_MAX_PER_HOUR");
+        let opts = AcmeOptions { email: None, domains: vec![], ask: None, dns: None, http_store: None };
+        let m = CertManager::build(opts, std::env::temp_dir(), 2);
         assert!(m.admit("a", true).is_ok());
         assert!(m.admit("b", true).is_ok());
         assert!(m.admit("c", true).unwrap_err().contains("SYNSEMA_ACME_MAX_PER_HOUR"));
@@ -830,9 +835,8 @@ mod tests {
     fn a_certificate_on_disk_is_used_instead_of_issuing_again() {
         let dir = std::env::temp_dir().join(format!("syn_acme_disk_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::env::set_var("SYNSEMA_CERT_DIR", &dir);
-        let m = manager(&[]);
-        std::env::remove_var("SYNSEMA_CERT_DIR");
+        let opts = AcmeOptions { email: None, domains: vec![], ask: None, dns: None, http_store: None };
+        let m = CertManager::build(opts, dir.clone(), 20);
         let (c, k) = self_signed("ondemand.example");
         create_private_dir(&dir).unwrap();
         let (cp, kp) = m.paths("ondemand.example");
