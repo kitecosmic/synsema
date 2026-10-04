@@ -123,15 +123,17 @@ fn flag_tls_auto_is_the_toggle() {
         tls_auto_email: Some("admin@example.test".to_string()),
         ..Default::default()
     };
-    let (ok, err) = run_to_completion(PROG_8080.to_string(), ov2, 30);
+    // v0.6.42 (auditoría B6): con la CA caída el servidor ARRANCA igual (reintenta en segundo
+    // plano) en modo TLS: un GET en claro a ese puerto no es un 200.
+    start_bg(PROG_8080.to_string(), "127.0.0.1", p2, ov2);
+    let resp = http_get("127.0.0.1", p2, "/ping");
 
     std::env::remove_var("SYNSEMA_ACME_DIRECTORY");
     std::env::remove_var("SYNSEMA_ACME_HTTP_PORT");
     std::env::remove_var("SYNSEMA_CERT_DIR");
     let _ = std::fs::remove_dir_all(&cert_dir);
 
-    assert!(!ok, "con --tls-auto debió entrar en ACME y fallar, no servir HTTP plano");
-    assert!(err.to_ascii_lowercase().contains("acme"), "esperaba error ACME, got: {}", err);
+    assert!(!resp.starts_with("http/1.1 200"), "con --tls-auto el puerto habla TLS, no HTTP plano: {}", resp);
 }
 
 // ── Test 4: precedencia — el flag pisa la cláusula del archivo ───────────────────
@@ -221,23 +223,23 @@ serve on 8080
     std::env::set_var("SYNSEMA_ACME_HTTP_PORT", acme_http.to_string());
     std::env::set_var("SYNSEMA_CERT_DIR", &cert_dir);
 
+    let p = free_port();
     let ov = ServeOverrides {
-        port: Some(free_port()),
+        port: Some(p),
         domains: Some(vec!["example.test".to_string()]),
         tls_auto_email: Some("admin@example.test".to_string()),
         ..Default::default()
     };
-    let (ok, err) = run_to_completion(src.to_string(), ov, 30);
+    // Arranca (sin el error espurio "per-host … requires a default tls cert") y en modo TLS.
+    start_bg(src.to_string(), "127.0.0.1", p, ov);
+    let resp = http_get("127.0.0.1", p, "/");
 
     std::env::remove_var("SYNSEMA_ACME_DIRECTORY");
     std::env::remove_var("SYNSEMA_ACME_HTTP_PORT");
     std::env::remove_var("SYNSEMA_CERT_DIR");
     let _ = std::fs::remove_dir_all(&cert_dir);
 
-    assert!(!ok);
-    let e = err.to_ascii_lowercase();
-    assert!(e.contains("acme"), "esperaba modo ACME, got: {}", err);
-    assert!(!e.contains("per-host"), "el cert por-host del archivo NO debe interferir: {}", err);
+    assert!(!resp.starts_with("http/1.1 200"), "el puerto habla TLS: {}", resp);
 }
 
 // ── Bonus: política de múltiples bloques serve con flags → rechazo claro ─────────

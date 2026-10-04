@@ -3786,8 +3786,14 @@ fn make_serve_hook(
                 dns,
                 http_store: Some(store.clone()),
             });
-            if let Err(e) = mgr.bootstrap() {
-                return Err(Control::Error(RuntimeError::new(format!("ACME error: {}", e))));
+            // Un nombre que falla va al log y NO aborta el arranque (auditoría B6): sus handshakes
+            // fallan hasta que la renovación en segundo plano lo consiga.
+            match mgr.bootstrap() {
+                Ok(missing) if !missing.is_empty() => {
+                    eprintln!("ACME: serving without a certificate for {} (retrying in the background)", missing.join(", "));
+                }
+                Ok(_) => {}
+                Err(e) => return Err(Control::Error(RuntimeError::new(format!("ACME error: {}", e)))),
             }
             mgr.spawn_renewal();
             let rt2 = rt.clone();
