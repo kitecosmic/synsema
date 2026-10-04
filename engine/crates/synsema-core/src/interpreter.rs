@@ -1344,11 +1344,6 @@ fn note_llm_offline() {
 pub struct Interpreter {
     pub global_env: Rc<RefCell<Environment>>,
     pub output: Vec<String>,
-    /// v0.6.42 — líneas de `eprint`/`log` retenidas para stderr. Sólo se usa con etiquetas
-    /// encendidas (el mismo motivo que `output`: si la corrida muere por un flujo privado,
-    /// cuántas líneas salieron depende del dato); sin etiquetas van a stderr al momento.
-    /// Se sueltan (o se retienen) en `redact_for_host`, el embudo de cada entrada del host.
-    err_output: Vec<String>,
     /// Salida en vivo (DE-018/019): sólo `true` en el camino de `synsema run` interactivo.
     /// Gatea el drenado de `flush()`/`read_line` a stdout. En `conform`/`test`/`serve`
     /// queda `false` → la salida se COLECTA en `output` (JSON `out`/respuesta), nunca a
@@ -1620,6 +1615,12 @@ pub struct Interpreter {
     /// Bytes canónicos de un valor estructurado para el linaje (el stdlib instala
     /// `canonical_json`, RFC 8785): así cualquiera recalcula el hash de un resultado de SQL.
     pub lineage_canonical: Option<Rc<dyn Fn(&SynValue) -> Option<(Vec<u8>, &'static str)>>>,
+    /// v0.6.42 (al final del struct a propósito: no corre los offsets de los campos calientes)
+    /// — líneas de `eprint`/`log` retenidas para stderr. Sólo se usa con etiquetas
+    /// encendidas (el mismo motivo que `output`: si la corrida muere por un flujo privado,
+    /// cuántas líneas salieron depende del dato); sin etiquetas van a stderr al momento.
+    /// Se sueltan (o se retienen) en `redact_for_host`, el embudo de cada entrada del host.
+    err_output: Vec<String>,
 }
 
 impl Default for Interpreter {
@@ -4974,32 +4975,7 @@ impl Interpreter {
                 "'private' is a clause of the serve block, of a route body or of a 'routes' group (a line with just `private`), not a statement",
                 loc,
             )),
-            NodeKind::ProxyStatement { target } => {
-                // v0.6.42 — dentro de una ruta de `serve`, `proxy to <destino>` corta el handler y
-                // el runtime reenvía la request (también desde una task que la ruta llamó). Fuera
-                // de una ruta nadie lo convierte: el host lo informa con este mismo mensaje.
-                let v = self.exec(target, env)?;
-                if self.labels {
-                    // El destino es una salida a la red: ni elegido bajo una rama privada ni privado.
-                    self.sink_check("proxy to", &[&v], loc)?;
-                }
-                let dest = match &v {
-                    SynValue::Text(t) => ProxyTo::Url(t.to_string()),
-                    SynValue::Number(n) if n.is_integer() => match n.to_i64_trunc() {
-                        Some(h) => ProxyTo::Handle(h),
-                        None => return Err(err_at("proxy to: the handle is out of range", loc)),
-                    },
-                    other => {
-                        return Err(err_at(
-                            format!("proxy to: expected an http:// URL or a pipe end, got {}", other.type_name()),
-                            loc,
-                        ))
-                    }
-                };
-                let mut e = RuntimeError::at("proxy is only available inside a serve route", loc.clone());
-                e.proxy = Some(dest);
-                Err(Control::Error(e))
-            }
+            NodeKind::ProxyStatement { .. } => self.exec_proxy_statement(node, env),
             NodeKind::StreamBlock { body } => self.exec_block(body, env),
             // El cuerpo de un `socket` lo corre el runtime de serve con el binding `socket`
             // ya adoptado; llegar acá es ejecutarlo fuera de una ruta.
@@ -5456,6 +5432,38 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         }
         Ok(syn_map(out))
     }
+    }
+
+    /// v0.6.42 — `proxy to <destino>` dentro de una ruta. Fuera de `exec_node` a propósito: ese
+    /// `match` es el camino caliente del intérprete y un brazo grande lo engorda para todos.
+    #[inline(never)]
+    fn exec_proxy_statement(&mut self, node: &Node, env: &Rc<RefCell<Environment>>) -> Result<SynValue, Control> {
+        let loc = &node.location;
+        let NodeKind::ProxyStatement { target } = &node.kind else { unreachable!("exec_proxy_statement: otro nodo") };
+        // v0.6.42 — dentro de una ruta de `serve`, `proxy to <destino>` corta el handler y
+        // el runtime reenvía la request (también desde una task que la ruta llamó). Fuera
+        // de una ruta nadie lo convierte: el host lo informa con este mismo mensaje.
+        let v = self.exec(target, env)?;
+        if self.labels {
+            // El destino es una salida a la red: ni elegido bajo una rama privada ni privado.
+            self.sink_check("proxy to", &[&v], loc)?;
+        }
+        let dest = match &v {
+            SynValue::Text(t) => ProxyTo::Url(t.to_string()),
+            SynValue::Number(n) if n.is_integer() => match n.to_i64_trunc() {
+                Some(h) => ProxyTo::Handle(h),
+                None => return Err(err_at("proxy to: the handle is out of range", loc)),
+            },
+            other => {
+                return Err(err_at(
+                    format!("proxy to: expected an http:// URL or a pipe end, got {}", other.type_name()),
+                    loc,
+                ))
+            }
+        };
+        let mut e = RuntimeError::at("proxy is only available inside a serve route", loc.clone());
+        e.proxy = Some(dest);
+        Err(Control::Error(e))
     }
 
     #[inline(never)]
