@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.43 — UNRELEASED
+## v0.6.43 — 2026-10-08
 
 Confidential VMs: AMD SEV-SNP reports verify, NitroTPM documents are produced and verified, one
 attested server can publish both, and a Synsema client can pin the attested key. All of it is
