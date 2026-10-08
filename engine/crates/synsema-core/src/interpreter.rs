@@ -3732,14 +3732,6 @@ impl Interpreter {
         // teoría de números (enteros)
         self.register("gcd", 2, Rc::new(|_i, a, _l| crate::math::gcd(a)));
         self.register("lcm", 2, Rc::new(|_i, a, _l| crate::math::lcm(a)));
-        // bits (HB2): enteros de 64 bits con signo; desbordes y corrimientos fuera de 0..=63 → error
-        self.register("bit_and", 2, Rc::new(|_i, a, _l| crate::math::bit_and(a)));
-        self.register("bit_or", 2, Rc::new(|_i, a, _l| crate::math::bit_or(a)));
-        self.register("bit_xor", 2, Rc::new(|_i, a, _l| crate::math::bit_xor(a)));
-        self.register("bit_not", 1, Rc::new(|_i, a, _l| crate::math::bit_not(a)));
-        self.register("shl", 2, Rc::new(|_i, a, _l| crate::math::shl(a)));
-        self.register("shr", 2, Rc::new(|_i, a, _l| crate::math::shr(a)));
-        self.register("xor_bytes", 2, Rc::new(|_i, a, _l| crate::math::xor_bytes(a)));
         self.register("factorial", 1, Rc::new(|_i, a, _l| crate::math::factorial(a)));
         // introspección
         self.register("is_nan", 1, Rc::new(|_i, a, _l| crate::math::is_nan(a)));

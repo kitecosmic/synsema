@@ -669,6 +669,8 @@ pub(crate) fn wire_common_with_state(
     register_http_builtins(interp, caps.clone());
     // Hashing SHA + Keccak (puro, sin capability): sha256/sha512/keccak256/sha512_256 → bytes.
     synsema_stdlib::hashing::register_hash_builtins(interp);
+    // Bits sobre enteros de 64 bits y `xor_bytes` (puro, v0.6.44).
+    synsema_stdlib::bits::register_bit_builtins(interp);
     // JSON del lenguaje (puro, sin capability): json_encode/json_for_script/json_decode.
     // Vivían dentro de register_database_builtins; ahora en json.rs para que existan
     // también en el perfil wasm (sin `native`).

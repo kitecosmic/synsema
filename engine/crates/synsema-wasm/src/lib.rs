@@ -446,6 +446,7 @@ pub fn wire_pure(interp: &mut Interpreter, caps: &Rc<RefCell<CapabilitySet>>, ct
     }
     register_secret_builtins(interp, caps.clone(), ctx.env.clone());
     synsema_stdlib::hashing::register_hash_builtins(interp);
+    synsema_stdlib::bits::register_bit_builtins(interp);
     // Groth16_verify (puro; arkworks no_std sin parallel/asm). Medido en wasip1 --profile
     // wasm: 7 144 498 → 7 288 665 bytes (+141 KB; el spec presupuestaba +1–1,5 MB).
     synsema_stdlib::zk::register_zk_builtins(interp);
