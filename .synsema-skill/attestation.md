@@ -296,6 +296,17 @@ not a NitroTPM → `NitroTPM NSM request failed: TPM response code 0x143`. The N
 replicates AWS's `nitro-tpm-attest` (EK, an NV message buffer, a salted HMAC session, the vendor
 command); `user_data`/`nonce`/`public_key` are capped at 1024 bytes each.
 
+**How the `nitro-tpm` driver uses the TPM** (tested against a simulated TPM, not yet on a NitroTPM):
+one request at a time per process; it opens `/dev/tpm0` (exclusive in Linux), waits up to 10 s if
+another process holds it, and only then uses `/dev/tpmrm0`. With `/dev/tpm0` it first releases what
+a process killed mid-request left (loaded objects and sessions, and 8 KiB NV buffers of exactly its
+own shape — other owners' NV indices are never touched); otherwise a few SIGKILL/OOM kills fill the
+TPM. Consequences, rare and failing closed: (1) two Synsema processes attesting at once, one on
+`/dev/tpmrm0` → the other's cleanup can remove its buffer mid-request; that request errors and
+`serve --attested` retries; (2) objects/sessions another app loaded through `/dev/tpm0` directly are
+released — apps on `/dev/tpmrm0` (most TPM tools) are unaffected; do not run a raw-`/dev/tpm0` app
+alongside the `nitro-tpm` driver.
+
 The hardware drivers are written against the vendors' own SDKs and tools (numbers and wire shapes
 confirmed against `aws-nitro-enclaves-nsm-api`, `aws/NitroTPM-Tools`, configfs-tsm, and the dstack Go
 SDK) but this repo does not claim what it has not probed. The `mock` driver warns once on stderr and
