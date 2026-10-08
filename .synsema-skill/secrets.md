@@ -141,7 +141,7 @@ let b be http_get("https://api.provider.com/v1/items",
 | Builtin | Returns |
 |---|---|
 | `bearer(s)` | a tainted `Bearer <secret>` auth header value |
-| `hmac(data, s, algo?)` | the MAC as **bytes** (not secret; `hex(mac)` to show it). v0.6.29+ — the old `hmac_sha256` (hex text) is a deprecated alias |
+| `hmac(data, s, algo?)` | the MAC as **bytes** (not secret; `hex(mac)` to show it). `data`/`s`: text, bytes (raw, v0.6.44+) or secret; other types → error. v0.6.29+ — the old `hmac_sha256` (hex text) is a deprecated alias |
 | `verify_hmac(data, sig, s, algo?)` | bool, **constant-time** (HMAC-SHA256/512; SHA-1 rejected) |
 | `constant_time_eq(a, b)` | bool, constant-time (accepts a `secret` on either side) |
 

@@ -283,6 +283,7 @@ Constants (bare values): `pi`, `tau`, `e`, `inf`, `nan`.
 - trig (radians): `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `radians`, `degrees`.
 - hyperbolic: `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`.
 - number theory (integers): `gcd`, `lcm`, `factorial`.
+- bits (v0.6.44+), on **64-bit signed integers**: `bit_and(a, b)`, `bit_or(a, b)`, `bit_xor(a, b)`, `bit_not(a)`, `shl(x, n)`, `shr(x, n)` (arithmetic, keeps the sign). `n` in 0..63; out of 64 bits / float / `shl` overflow → **error**, never wraps. There is no `^`/`&`/`|` operator: use these. `xor_bytes(a, b)` → bytes, same length only (text → error: `bytes(text)` first).
 - introspection: `is_nan`, `is_infinite`, `is_finite`.
 - `round_to(x, n)` → `x` rounded to `n` decimal places (v0.6.29+ semantics). A **float** rounds its REAL binary value, like Python's `round(x, n)`: `round_to(2.675, 2)` → `2.67`, `round_to(0.125, 2)` → `0.12` (2.675 is stored as 2.67499…; the old version multiplied by 10ⁿ and got these wrong the other way). A **decimal** rounds in decimal, half to even, and stays decimal: `round_to(1.005d, 2)` → `1.00`. An integer comes back unchanged. For money, use decimals.
 - aggregates over a list or `array`: `sum`, `product`, `mean`, `median`, `percentile`, `quantile`, `std`, `var`, `min`, `max` — all follow **the common rules** below.
@@ -330,8 +331,8 @@ Resolution for `env`/`secret`: process environ → `.env` → default → else e
 - `as_secret(value, label?)` → seal a **runtime** value (text/bytes) as an opaque `secret`. **No `require`** (pure; only strengthens). Idempotent. For a key that arrives at runtime (e.g. a user's request header), not from config.
 - `reveal(secret)` → plaintext (a bytes-secret reveals as `bytes`) — requires `require reveal("NAME")` **scoped to the secret's name/label**; audits every attempt (granted/denied); fails if it can't audit; bare `require reveal` = any (compat, warns). Use sparingly.
 - `bearer(secret)` → a tainted `Bearer <secret>` header value (materialized only at the socket)
-- `hmac(data, key, algo?)` → the MAC as **bytes** (v0.6.29+; was `hmac_sha256`, which returned hex text and is a deprecated alias). `key` may be a `secret` or text; show it with `hex(mac)` (`"0x…"`) or `decode(mac, "hex")` (bare hex, what `hmac_sha256` returned). `algo` = `"sha256"` (default) or `"sha512"` (SHA-1 is rejected). Not secret
-- `verify_hmac(data, signature, secret, algo?)` → bool, constant-time. `algo` = `"sha256"` (default) or `"sha512"`; decodes hex/base64 signatures (Stripe/GitHub/Shopify). SHA-1 is rejected.
+- `hmac(data, key, algo?)` → the MAC as **bytes** (v0.6.29+; was `hmac_sha256`, which returned hex text and is a deprecated alias). `data` and `key` may be text (UTF-8), **bytes (raw — v0.6.44+; before, bytes were hashed as their printed form `bytes(6b65…)`, a silently different MAC)** or a `secret`; any other type is an error. Chain binary keys freely (AWS SigV4: `hmac(region, hmac(date, bytes("AWS4" + key)))`). Show it with `hex(mac)` (`"0x…"`) or `decode(mac, "hex")` (bare hex, what `hmac_sha256` returned). `algo` = `"sha256"` (default) or `"sha512"` (SHA-1 is rejected). Not secret
+- `verify_hmac(data, signature, secret, algo?)` → bool, constant-time. `algo` = `"sha256"` (default) or `"sha512"`; the signature may also be the raw MAC as bytes (v0.6.44+); decodes hex/base64 signatures (Stripe/GitHub/Shopify). SHA-1 is rejected.
 - `constant_time_eq(a, b)` → bool, constant-time; accepts a `secret` on either side
 
 ## Web auth (passwords, JWT, TOTP, CSPRNG)

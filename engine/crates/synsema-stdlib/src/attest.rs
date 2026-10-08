@@ -1845,6 +1845,21 @@ pub fn spawn_renewal() -> Result<(), String> {
     Ok(())
 }
 
+/// El aviso de arranque de `serve --attested`: TODOS los drivers y formatos activos, en el orden
+/// de `config.drivers` (HB3: con `tsm,nitro-tpm` nombraba sólo el primero).
+#[cfg(feature = "native")]
+pub fn attested_notice(id: &AttestedIdentity) -> String {
+    let drivers: Vec<&str> = id.attestations.iter().map(|a| a.driver).collect();
+    let formats: Vec<&str> = id.attestations.iter().map(|a| a.format).collect();
+    format!(
+        "Attested: drivers={} formats={} program_sha={} — GET {}",
+        drivers.join(","),
+        formats.join(","),
+        hex_encode(&id.program_sha),
+        crate::server::ATTESTATION_PATH
+    )
+}
+
 /// Cierra `serve --attested` con error (la primera razón gana; el `serve` sale con 1).
 fn close_on_expiry(reason: String) {
     if RENEWAL_FAILURE.set(reason.clone()).is_ok() {
@@ -2429,6 +2444,28 @@ mod tests {
         let id = with_env(MOCK_ON, || build_attested_identity("print(1)\n", "p.syn", test_config()).unwrap());
         assert!(!id.expired_at(1_800_000_000), "el mock vence en 2099");
         assert!(id.expired_at(5_000_000_000));
+    }
+
+    /// HB3: el aviso de arranque nombra todos los drivers y formatos, en orden.
+    #[cfg(feature = "native")]
+    #[test]
+    fn the_startup_notice_names_every_driver_and_format() {
+        let fake = |format: &'static str, driver: &'static str| {
+            move |r: &AttestRequest| -> Result<AttestResult, String> {
+                Ok(AttestResult { format, document: vec![1], driver, report_data: r.report_data.clone(), aux: None, event_log: None, root: None })
+            }
+        };
+        let (a, b) = (fake("sev-snp", "tsm"), fake("nitro-tpm", "nitro-tpm"));
+        let drivers: Vec<DriverFn<'_>> = vec![("tsm", &a), ("nitro-tpm", &b)];
+        let id = build_attested_identity_with("print(1)
+", "p.syn", test_config(), &drivers).unwrap();
+        let notice = attested_notice(&id);
+        assert!(notice.starts_with("Attested: drivers=tsm,nitro-tpm formats=sev-snp,nitro-tpm program_sha="), "{}", notice);
+        assert!(notice.contains(&hex_encode(&id.program_sha)) && notice.ends_with("— GET /.well-known/attestation"), "{}", notice);
+        let one: Vec<DriverFn<'_>> = vec![("tsm", &a)];
+        let id1 = build_attested_identity_with("print(1)
+", "p.syn", test_config(), &one).unwrap();
+        assert!(attested_notice(&id1).starts_with("Attested: drivers=tsm formats=sev-snp program_sha="));
     }
 
     /// T10: con drivers falsos de hojas de vida corta (4 s), la renovación reemplaza los

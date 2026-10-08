@@ -249,18 +249,26 @@ fn raw_str(v: &SynValue) -> String {
 }
 
 /// Bytes para crypto: un secret aporta su plaintext (uso interno; la salida es una
-/// MAC/bool, no filtra). Texto → sus bytes; resto → su Display.
+/// MAC/bool, no filtra). Texto → su UTF-8; bytes → los bytes crudos. Cualquier otro tipo es
+/// ERROR (HB1, v0.6.44): antes caía en su forma impresa — `bytes("key")` se hasheaba como el
+/// texto `bytes(6b6579)` — y el MAC salía distinto sin avisar.
 ///
 /// BORDE CRUDO DECLARADO (auditoría ronda 4/V2): acepta un secret SELLADO. Sus tres
 /// consumidores son `hmac_sha256`, `verify_hmac` y `constant_time_eq` — HMAC y comparación en
 /// tiempo constante, simétricos y de una vía: nada de lo que producen se verifica contra la
 /// clave pública que publica `/.well-known/attestation`, así que no hay suplantación del
 /// enclave. Ver el inventario completo en `synsema_core::secret::SecretInner::expose_bytes`.
-fn crypto_bytes(v: &SynValue) -> Vec<u8> {
+fn crypto_bytes(v: &SynValue, fname: &str, what: &str) -> Result<Vec<u8>, Control> {
     match v {
-        SynValue::Secret(s) => s.expose_bytes().to_vec(),
-        SynValue::Text(s) => s.as_bytes().to_vec(),
-        other => other.to_string().into_bytes(),
+        SynValue::Secret(s) => Ok(s.expose_bytes().to_vec()),
+        SynValue::Text(s) => Ok(s.as_bytes().to_vec()),
+        SynValue::Bytes(b) => Ok(b.to_vec()),
+        other => Err(Control::Error(RuntimeError::new(format!(
+            "{}: {} must be text, bytes or a secret, got {}",
+            fname,
+            what,
+            other.type_name()
+        )))),
     }
 }
 
@@ -341,17 +349,30 @@ impl Algo {
     }
 }
 
-/// Algoritmo soportado. SHA-1 se rechaza a propósito (débil, §4).
-fn parse_algo(s: &str) -> Result<Algo, Control> {
+/// Algoritmo soportado. SHA-1 se rechaza a propósito (débil, §4). `algo` es texto; otro tipo
+/// es error (no se adivina un algoritmo desde su forma impresa).
+fn parse_algo(v: Option<&SynValue>, fname: &str) -> Result<Algo, Control> {
+    let s = match v {
+        None => return Ok(Algo::Sha256),
+        Some(SynValue::Text(t)) => t.to_string(),
+        Some(other) => {
+            return Err(Control::Error(RuntimeError::new(format!(
+                "{}: algo must be text (\"sha256\" or \"sha512\"), got {}",
+                fname,
+                other.type_name()
+            ))))
+        }
+    };
     match s.trim().to_lowercase().as_str() {
         "" | "sha256" => Ok(Algo::Sha256),
         "sha512" => Ok(Algo::Sha512),
-        "sha1" => Err(Control::Error(RuntimeError::new(
-            "verify_hmac: SHA-1 is not supported (weak); use sha256 or sha512",
-        ))),
+        "sha1" => Err(Control::Error(RuntimeError::new(format!(
+            "{}: SHA-1 is not supported (weak); use sha256 or sha512",
+            fname
+        )))),
         other => Err(Control::Error(RuntimeError::new(format!(
-            "verify_hmac: unknown algorithm '{}' (use sha256 or sha512)",
-            other
+            "{}: unknown algorithm '{}' (use sha256 or sha512)",
+            fname, other
         )))),
     }
 }
@@ -818,8 +839,8 @@ pub fn register_secret_builtins(
         "hmac_sha256",
         2,
         Rc::new(move |_i, args, _loc| {
-            let data = crypto_bytes(arg(args, 0)?);
-            let key = crypto_bytes(arg(args, 1)?);
+            let data = crypto_bytes(arg(args, 0)?, "hmac_sha256", "data")?;
+            let key = crypto_bytes(arg(args, 1)?, "hmac_sha256", "key")?;
             Ok(syn_text(to_hex(&hmac_compute(Algo::Sha256, &key, &data))))
         }),
     );
@@ -836,12 +857,9 @@ pub fn register_secret_builtins(
                     "hmac(data, key, algo?) takes 2 or 3 arguments",
                 )));
             }
-            let data = crypto_bytes(arg(args, 0)?);
-            let key = crypto_bytes(arg(args, 1)?);
-            let algo = match args.get(2) {
-                Some(v) => parse_algo(&raw_str(v))?,
-                None => Algo::Sha256,
-            };
+            let data = crypto_bytes(arg(args, 0)?, "hmac", "data")?;
+            let key = crypto_bytes(arg(args, 1)?, "hmac", "key")?;
+            let algo = parse_algo(args.get(2), "hmac")?;
             Ok(syn_bytes(hmac_compute(algo, &key, &data)))
         }),
     );
@@ -851,17 +869,25 @@ pub fn register_secret_builtins(
         "verify_hmac",
         -1,
         Rc::new(move |_i, args, _loc| {
-            let data = crypto_bytes(arg(args, 0)?);
-            let signature = raw_str(arg(args, 1)?);
-            let key = crypto_bytes(arg(args, 2)?);
-            let algo = match args.get(3) {
-                Some(v) => parse_algo(&raw_str(v))?,
-                None => Algo::Sha256,
-            };
+            let data = crypto_bytes(arg(args, 0)?, "verify_hmac", "data")?;
+            let key = crypto_bytes(arg(args, 2)?, "verify_hmac", "key")?;
+            let algo = parse_algo(args.get(3), "verify_hmac")?;
             let mac = hmac_compute(algo, &key, &data);
-            let provided = match decode_signature(&signature, algo.mac_len()) {
-                Some(b) => b,
-                None => return Ok(syn_bool(false)),
+            // La firma: texto en hex o base64 (lo que manda un webhook, con o sin `sha256=`), o
+            // los bytes crudos del MAC (lo que devuelve `hmac`). Una firma de texto que no decodifica
+            // es `false` (viene de afuera); un tipo que no es firma es error.
+            let provided = match arg(args, 1)? {
+                SynValue::Bytes(b) => b.to_vec(),
+                SynValue::Text(t) => match decode_signature(t, algo.mac_len()) {
+                    Some(b) => b,
+                    None => return Ok(syn_bool(false)),
+                },
+                other => {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "verify_hmac: signature must be text (hex or base64) or bytes, got {}",
+                        other.type_name()
+                    ))))
+                }
             };
             Ok(syn_bool(constant_time_eq(&mac, &provided)))
         }),
@@ -872,8 +898,8 @@ pub fn register_secret_builtins(
         "constant_time_eq",
         2,
         Rc::new(move |_i, args, _loc| {
-            let a = crypto_bytes(arg(args, 0)?);
-            let b = crypto_bytes(arg(args, 1)?);
+            let a = crypto_bytes(arg(args, 0)?, "constant_time_eq", "a")?;
+            let b = crypto_bytes(arg(args, 1)?, "constant_time_eq", "b")?;
             Ok(syn_bool(constant_time_eq(&a, &b)))
         }),
     );
@@ -974,11 +1000,14 @@ mod tests {
         // sha512 produce 64 bytes.
         let mac = hmac_compute(Algo::Sha512, b"key", b"data");
         assert_eq!(mac.len(), 64);
-        assert!(parse_algo("sha512").is_ok());
-        assert!(parse_algo("sha256").is_ok());
-        assert!(parse_algo("").is_ok());
-        assert!(parse_algo("sha1").is_err()); // débil, rechazado a propósito (§4)
-        assert!(parse_algo("md5").is_err());
+        let t = |s: &str| syn_text(s);
+        assert!(parse_algo(Some(&t("sha512")), "hmac").is_ok());
+        assert!(parse_algo(Some(&t("sha256")), "hmac").is_ok());
+        assert!(parse_algo(Some(&t("")), "hmac").is_ok());
+        assert!(parse_algo(None, "hmac").is_ok());
+        assert!(parse_algo(Some(&t("sha1")), "hmac").is_err()); // débil, rechazado a propósito (§4)
+        assert!(parse_algo(Some(&t("md5")), "hmac").is_err());
+        assert!(parse_algo(Some(&syn_bytes(b"sha256".to_vec())), "hmac").is_err(), "otro tipo: error, no su forma impresa");
     }
 
     #[test]

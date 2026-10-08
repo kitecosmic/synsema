@@ -6,6 +6,31 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.44 — UNRELEASED
+
+`hmac` with bytes, bit operations, and the full list of drivers in the `serve --attested` notice.
+
+**Behavior changes (read these first).**
+- **`hmac`, `verify_hmac`, `hmac_sha256` and `constant_time_eq` use the raw bytes of a `bytes`
+  argument.** Before, a `bytes` value was turned into its printed form (`bytes(6b6579)`) and that
+  text was hashed: `hmac(bytes("data"), bytes("key"))` gave another MAC than `hmac("data", "key")`,
+  with no warning. Now both give `0x5031fe3d…1bd0`, and binary keys can be chained (AWS SigV4,
+  HKDF by hand). **Text gives exactly the same MAC as before**, so existing webhook signatures do
+  not change. Any argument that is not text, bytes or a secret (a number, a list, `nothing`) is
+  now an error naming the argument and its type, instead of being hashed as its printed form; the
+  `algo` argument must be text. `verify_hmac` also accepts the signature as the raw MAC in bytes; a
+  text signature that does not decode is still `false`.
+
+**New builtins.**
+- Bits on 64-bit signed integers: `bit_and(a, b)`, `bit_or(a, b)`, `bit_xor(a, b)`, `bit_not(a)`,
+  `shl(x, n)`, `shr(x, n)` (arithmetic, keeps the sign). `n` is 0..63; a value outside 64 bits, a
+  float, or a `shl` that overflows is an error — nothing wraps around silently.
+- `xor_bytes(a, b)`: XOR of two `bytes` of the same length (different lengths or text → error).
+
+**`serve --attested`.** The startup line names every driver and format, in order:
+`Attested: drivers=tsm,nitro-tpm formats=sev-snp,nitro-tpm program_sha=… — GET
+/.well-known/attestation` (it said `driver=`/`format=` with only the first one).
+
 ## v0.6.43 — 2026-10-08
 
 Confidential VMs: AMD SEV-SNP reports verify, NitroTPM documents are produced and verified, one

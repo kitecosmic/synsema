@@ -148,7 +148,9 @@ synsema serve --attested app.syn
 
 At startup the server generates a P-256 keypair, asks the platform for a document binding
 `sha256(spki ‖ program_sha ‖ config_sha)`, and publishes it at `GET /.well-known/attestation`.
-**If the platform does not answer, the server does not start** — there is no degraded mode. With
+**If the platform does not answer, the server does not start** — there is no degraded mode. On
+start it prints `Attested: drivers=tsm,nitro-tpm formats=sev-snp,nitro-tpm program_sha=… — GET
+/.well-known/attestation` (all drivers and formats in order; v0.6.44+, before only the first). With
 several drivers (`SYNSEMA_ATTEST=tsm,nitro-tpm`, or both auto-detected) **every** driver signs the
 same binding, and one failing driver stops the start (the error names it: `serve --attested: driver
 nitro-tpm: …`).
