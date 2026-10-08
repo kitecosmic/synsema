@@ -130,6 +130,29 @@ fn bearer_headers_and_query_refuse_printed_forms() {
     assert_eq!(out, vec!["secret(bearer)", "secret(sealed)"], "sigue redactado al imprimir");
 }
 
+/// `basic(user, secret)` (v0.6.44): RFC 7617 §2 — "Aladdin" / "open sesame" →
+/// "QWxhZGRpbjpvcGVuIHNlc2FtZQ==". Queda secret (redactado al imprimirlo); se materializa en el socket.
+#[test]
+fn basic_builds_the_rfc_7617_header_from_a_secret() {
+    let out = lines(
+        r#"let b be basic("Aladdin", as_secret("open sesame", "PASS"))
+print(text(b))
+print(b == as_secret("Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="))
+print(basic("Aladdin", "open sesame") == as_secret("Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="))
+"#,
+    );
+    assert_eq!(out, vec!["secret(PASS)", "true", "true"]);
+    for (src, needle) in [
+        ("basic(\"a:b\", \"p\")", "basic: the user cannot contain ':'"),
+        ("basic(\"u\", nothing)", "basic: the password is nothing"),
+        ("basic(\"u\", bytes(\"p\"))", "basic: the password must be text or a secret, got bytes"),
+        ("basic(nothing, \"p\")", "basic: the user is nothing"),
+    ] {
+        let r = run(&format!("{}\n", src));
+        assert!(!r.success && r.errors.join(" ").contains(needle), "{}: {:?}", src, r.errors);
+    }
+}
+
 #[test]
 fn bits_from_a_program() {
     let out = lines(

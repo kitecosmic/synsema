@@ -502,7 +502,7 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     // blockchain y helpers de test. Cero efecto fuera del intérprete
     "abi_decode", "abi_encode", "abi_selector", "abs", "acos", "acosh", "aes_gcm_decrypt", "aes_gcm_encrypt",
     "algo_address", "algorand_tx", "algorand_tx_encode", "append", "arange", "array", "as_secret", "asin",
-    "asinh", "assert", "assert_eq", "assert_error", "assert_ne", "at", "atan", "atan2", "atanh", "bearer",
+    "asinh", "assert", "assert_eq", "assert_error", "assert_ne", "at", "atan", "atan2", "atanh", "basic", "bearer",
     "bech32_decode", "bech32_encode", "beta", "btc_address", "btc_address_decode", "btc_script", "btc_tx",
     "btc_tx_raw", "btc_txid", "bytes", "bytes_to_int", "captoken_allows", "captoken_attenuate",
     "canonical_json", "captoken_mint", "captoken_verify", "capture", "cbrt", "ceil", "clamp", "complex", "conj",

@@ -129,7 +129,16 @@ impl SecretInner {
     ///
     /// Comprobados (rechazan lo sellado): `blockchain.rs::key_material` — toda la familia de
     /// custodia, firma secp256k1/ed25519 incluida —, `webauth.rs::pem_text` (RS256/ES256),
-    /// `webpush.rs::vapid_private_key` (ES256), `crypto.rs` genérico, `privacy.rs`, `reveal`.
+    /// `webpush.rs::vapid_private_key` (ES256), `crypto.rs` genérico, `privacy.rs`, `reveal`,
+    /// `secrets.rs::secret_text`/`edge_text` (headers, query, body, `bearer`, `basic`, auth de
+    /// `btc_rpc`, mnemónico/passphrase de `blockchain_hd.rs`), `database.rs::reject_sealed` (entradas
+    /// de `sql`/`execute*`/`mongo_*`) y `database.rs::syn_to_redis_arg` (v0.6.44, HB4).
+    ///
+    /// Crudo SÓLO si no está sellado (el brazo lo comprueba con `!is_sealed()`; un sellado cae a
+    /// `expose()`, el marcador): `database.rs::syn_to_value`/`syn_to_pg`/`syn_to_mysql`/`syn_to_bson`
+    /// — un secret de bytes como parámetro de DB va con sus bytes (v0.6.44). La comprobación va en
+    /// el brazo y no sólo en la entrada: así la conversión es segura aunque una entrada nueva
+    /// olvide el guardia (auditoría v0.6.44, A1: `mongo_find` sort/fields no lo tenía).
     pub fn expose_bytes(&self) -> &[u8] {
         match &self.value {
             SecretPayload::Text(s) => s.as_bytes(),

@@ -140,6 +140,7 @@ let b be http_get("https://api.provider.com/v1/items",
 
 | Builtin | Returns |
 |---|---|
+| `basic(user, s)` | a tainted `Basic base64(user:password)` header value (RFC 7617, v0.6.44+): OAuth client credentials, Basic-auth APIs. `user` without `:` |
 | `bearer(s)` | a tainted `Bearer <secret>` auth header value. `s`: text or secret (v0.6.44+: `nothing`/bytes/numbers → error, not `Bearer None`) |
 | `hmac(data, s, algo?)` | the MAC as **bytes** (not secret; `hex(mac)` to show it). `data`/`s`: text, bytes (raw, v0.6.44+) or secret; other types → error. v0.6.29+ — the old `hmac_sha256` (hex text) is a deprecated alias |
 | `verify_hmac(data, sig, s, algo?)` | bool, **constant-time** (HMAC-SHA256/512; SHA-1 rejected). `sig` hex/base64 text or raw bytes; undecodable or missing (`nothing`) → `false`; other type → error |
@@ -154,7 +155,11 @@ let b be http_get("https://api.provider.com/v1/items",
   a credential only travels inside a header. Header/query/`bearer` values are text,
   number, bool or secret — `nothing`, bytes, lists, maps → error naming the header (was
   their printed form, e.g. `Bearer None`); a sealed secret or non-UTF-8 bytes secret →
-  error, never `secret(NAME)`.
+  error, never `secret(NAME)`. **No outlet yet** for an API that only takes the key in
+  the URL or only in the body (it never worked: it used to send `secret(NAME)`); prefer a
+  header / `basic()` / `bearer()` when the API offers one.
+- `as_secret(v)` without a label is NAMED `sealed` (`secret(sealed)`, scope of
+  `reveal("sealed")`) — a name, not a sealed secret like `attestation_key()`. Pass a label.
 - **As a DB parameter** (`sql`, `mongo_*`, `redis_*`) a secret materializes at the DB edge:
   text as text, a bytes secret as its bytes (BLOB/`bytea`/binary, v0.6.44+; was lossy
   UTF-8); a sealed secret → error, also nested in a list/document.

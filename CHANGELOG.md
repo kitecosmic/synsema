@@ -37,6 +37,10 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   document.
 
 **New builtins.**
+- `basic(user, secret)`: the `Authorization: Basic base64(user:password)` header value (RFC 7617)
+  as a secret, materialized only at the socket — the pair of `bearer`. OAuth client credentials
+  (RFC 6749 §2.3.1) and Basic-auth APIs could not be called with the password as a secret before
+  without `reveal()`. The user cannot contain `:`.
 - Bits on 64-bit signed integers: `bit_and(a, b)`, `bit_or(a, b)`, `bit_xor(a, b)`, `bit_not(a)`,
   `shl(x, n)`, `shr(x, n)` (arithmetic, keeps the sign). `n` is 0..63; a value outside 64 bits, a
   float, or a `shl` that overflows is an error — nothing wraps around silently.

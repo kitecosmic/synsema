@@ -886,6 +886,56 @@ pub fn register_secret_builtins(
         }),
     );
 
+    // basic(user, password) → secret "Basic base64(user:password)" (RFC 7617). El par de `bearer`
+    // (v0.6.44, auditoría ronda 2): las credenciales de cliente de OAuth (RFC 6749 §2.3.1, que todo
+    // servidor tiene que aceptar) y las APIs con Basic (Twilio, Mailgun, Jira, Stripe…). Sin esto, con
+    // la contraseña como secret, el header no se podía armar sin `reveal()`. Se materializa sólo en
+    // el socket, como todo header; `user` sin ':' (RFC 7617 §2); un secret sellado o de bytes no
+    // UTF-8 es error.
+    interp.register_builtin(
+        "basic",
+        2,
+        Rc::new(move |_i, args, _loc| {
+            let user = match arg(args, 0)? {
+                SynValue::Text(t) => t.to_string(),
+                SynValue::Secret(s) => secret_text(s, "basic", "the user")?,
+                SynValue::Nothing => {
+                    return Err(Control::Error(RuntimeError::new(
+                        "basic: the user is nothing (a missing env var or map key?); pass text or a secret",
+                    )))
+                }
+                other => {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "basic: the user must be text or a secret, got {}",
+                        other.type_name()
+                    ))))
+                }
+            };
+            if user.contains(':') {
+                return Err(Control::Error(RuntimeError::new(
+                    "basic: the user cannot contain ':' (RFC 7617: it separates the user from the password)",
+                )));
+            }
+            let (name, password) = match arg(args, 1)? {
+                SynValue::Secret(s) => (s.name().to_string(), secret_text(s, "basic", "the password")?),
+                SynValue::Text(t) => ("basic".to_string(), t.to_string()),
+                SynValue::Nothing => {
+                    return Err(Control::Error(RuntimeError::new(
+                        "basic: the password is nothing (a missing env var or map key?); pass text or a secret",
+                    )))
+                }
+                other => {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "basic: the password must be text or a secret, got {}",
+                        other.type_name()
+                    ))))
+                }
+            };
+            let token = synsema_core::bytesutil::b64_encode(format!("{}:{}", user, password).as_bytes());
+            Ok(syn_secret(name, format!("Basic {}", token)))
+        }),
+    );
+
     // hmac_sha256(data, s) → hex (la MAC, no es secreta).
     interp.register_builtin(
         "hmac_sha256",

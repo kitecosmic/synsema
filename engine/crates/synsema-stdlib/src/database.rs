@@ -593,9 +593,11 @@ fn syn_to_value(v: &SynValue) -> Value {
         // Secret (#8): se permite persistirlo — el plaintext se **revela en el borde
         // de la DB** (SQL parametrizado). No hay query-log que redactar (este crate no
         // loguea queries ni params); si se agregara uno en el futuro, DEBE redactar.
-        // HB4: un secret de bytes va como BLOB (antes: `from_utf8_lossy`, otros bytes). El sellado
-        // lo cortó `reject_sealed` antes de llegar acá.
-        SynValue::Secret(s) if s.is_bytes() => Value::Blob(s.expose_bytes().to_vec()),
+        // HB4: un secret de bytes va como BLOB (antes: `from_utf8_lossy`, otros bytes). Sólo si NO
+        // está sellado: la conversión es segura por sí misma, sin depender de que cada entrada
+        // haya llamado a `reject_sealed` (auditoría v0.6.44, A1). Un sellado cae al brazo de
+        // abajo: `expose()` da el marcador `secret(NAME)`, nunca el material.
+        SynValue::Secret(s) if s.is_bytes() && !s.is_sealed() => Value::Blob(s.expose_bytes().to_vec()),
         SynValue::Secret(s) => Value::Text(s.expose().to_string()),
         // bytes → BLOB byte-exacto (round-trip con value_to_syn; MF-010).
         SynValue::Bytes(b) => Value::Blob(b[..].to_vec()),
@@ -797,7 +799,7 @@ fn syn_to_pg(v: &SynValue) -> PgParam {
             None => PgParam::Text(n.to_string()),
         },
         SynValue::Bytes(b) => PgParam::Bytes(b[..].to_vec()),
-        SynValue::Secret(s) if s.is_bytes() => PgParam::Bytes(s.expose_bytes().to_vec()),
+        SynValue::Secret(s) if s.is_bytes() && !s.is_sealed() => PgParam::Bytes(s.expose_bytes().to_vec()),
         SynValue::Secret(s) => PgParam::Text(s.expose().to_string()),
         SynValue::Text(s) => PgParam::Text(s.to_string()),
         // list/array (p.ej. un embedding) → texto pgvector "[a,b,c]"; en la query: `?::vector`.
@@ -1108,7 +1110,8 @@ fn syn_to_mysql(v: &SynValue) -> mysql::Value {
         SynValue::Number(n) => MyV::Bytes(n.to_string().into_bytes()),
         SynValue::Bytes(b) => MyV::Bytes(b[..].to_vec()),
         SynValue::Text(s) => MyV::Bytes(s.as_bytes().to_vec()),
-        SynValue::Secret(s) => MyV::Bytes(s.expose_bytes().to_vec()),
+        SynValue::Secret(s) if !s.is_sealed() => MyV::Bytes(s.expose_bytes().to_vec()),
+        SynValue::Secret(s) => MyV::Bytes(s.expose().into_owned().into_bytes()),
         other => MyV::Bytes(other.to_string().into_bytes()),
     }
 }
@@ -1327,7 +1330,7 @@ fn syn_to_bson(v: &SynValue) -> Bson {
             Err(_) => Bson::String(n.to_string()),
         },
         SynValue::Text(s) => Bson::String(s.to_string()),
-        SynValue::Secret(s) if s.is_bytes() => Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: s.expose_bytes().to_vec() }),
+        SynValue::Secret(s) if s.is_bytes() && !s.is_sealed() => Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: s.expose_bytes().to_vec() }),
         SynValue::Secret(s) => Bson::String(s.expose().to_string()),
         SynValue::Bytes(b) => Bson::Binary(Binary {
             subtype: BinarySubtype::Generic,
@@ -1926,6 +1929,10 @@ pub fn register_database_builtins<H: DbHandle>(
             Rc::new(move |_i, args, _loc| {
                 let coll = raw_str(args.first().ok_or_else(|| err("mongo_find: missing collection"))?);
                 let filter = filter_arg(args.get(1), "mongo_find")?;
+                // sort/fields también pasan por la conversión a BSON (auditoría v0.6.44, A1).
+                if let Some(o) = args.get(2) {
+                    reject_sealed(o, "mongo_find").map_err(err)?;
+                }
                 let opts = parse_find_opts(args.get(2));
                 if let Some(p) = db.read(|m| m.default_path()) {
                     require_db(&caps, &p, "mongo_find()")?;
@@ -2472,6 +2479,22 @@ mod tests {
         }
         assert_eq!(db.query("SELECT COUNT(*) AS n FROM k", &[]).unwrap().len(), 1);
         assert!(syn_to_redis_arg(&sealed()).unwrap_err().contains("is sealed"));
+        // A1: ninguna conversión entrega el material sellado, aunque falte un guardia en alguna
+        // entrada (antes `expose()` cerraba todos los bordes; las conversiones nuevas tienen que
+        // seguir haciéndolo por sí mismas).
+        let key = [7u8; 32];
+        assert!(!matches!(syn_to_value(&sealed()), Value::Blob(ref b) if b[..] == key[..]));
+        assert!(!matches!(syn_to_pg(&sealed()), PgParam::Bytes(ref b) if b[..] == key[..]));
+        assert_eq!(syn_to_mysql(&sealed()), mysql::Value::Bytes(b"secret(attestation_key)".to_vec()));
+        assert!(matches!(syn_to_bson(&sealed()), Bson::String(ref t) if t == "secret(attestation_key)"));
+        let opts = synsema_core::types::syn_map({
+            let mut sort = SynMap::new();
+            sort.insert("k", sealed());
+            let mut m = SynMap::new();
+            m.insert("sort", synsema_core::types::syn_map(sort));
+            m
+        });
+        assert!(reject_sealed(&opts, "mongo_find").unwrap_err().contains("is sealed"), "sort/fields de mongo_find");
         assert_eq!(syn_to_redis_arg(&synsema_core::types::syn_secret_bytes("K", raw.clone())).unwrap(), raw);
         assert_eq!(syn_to_mysql(&synsema_core::types::syn_secret_bytes("K", raw.clone())), mysql::Value::Bytes(raw.clone()));
     }

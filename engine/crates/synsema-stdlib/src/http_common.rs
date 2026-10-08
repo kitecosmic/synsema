@@ -238,7 +238,7 @@ pub fn map_pairs(v: Option<&SynValue>, who: &str) -> Result<Option<Vec<(String, 
             for (k, val) in m.borrow().iter() {
                 if let SynValue::Secret(s) = val {
                     return Err(perr(format!(
-                        "{}: query parameter {:?} is secret({}); a secret cannot go into the URL (it ends up in logs) — send it in a header",
+                        "{}: query parameter {:?} is secret({}); a secret cannot go into the URL (it ends up in logs and proxies). If the API takes the key in a header, send it there (a secret in a header materializes at the socket); an API that only takes it in the URL has no way to receive a secret yet",
                         who,
                         k.to_string(),
                         s.name()
@@ -293,7 +293,7 @@ pub fn body_arg(v: Option<&SynValue>, who: &str) -> Result<(Option<Vec<u8>>, Opt
     // su forma redactada `secret(NAME)` como si fuera el valor: el servidor recibía esa cadena.
     if let Some(name) = v.and_then(secret_inside) {
         return Err(perr(format!(
-            "{}: the body contains secret({}); a secret goes out only inside a header (in a body it would travel as the text \"secret({})\", not its value)",
+            "{}: the body contains secret({}); in a body it would travel as the text \"secret({})\", not its value. Send the credential in a header: basic(user, secret) for HTTP Basic (OAuth client credentials accept it), bearer(secret), or the raw secret as a header value; an API that only takes it in the body has no way to receive a secret yet",
             who, name, name
         )));
     }
