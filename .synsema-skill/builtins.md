@@ -166,7 +166,7 @@ Blockchain — sign/verify/derive (all pure-Rust; see stdlib.md for the security
   - `ws_send(conn, text_or_bytes)` → true (a `secret` is refused); `ws_recv(conn, timeout?)` → `{type: "text"|"binary"|"close", data}` or **`nothing`** on timeout (never blocks); `ws_close(conn)` (idempotent).
   - `ws_select(conns, timeout?)` → `{conn, type, data, name?}` of the FIRST ready connection (round-robin fair), or `nothing` on timeout/empty set. `conns` = list of handles or name→handle map (adds `name`). A dropped conn surfaces as `{type: "close", conn}` and is retired; a fatal protocol error → catchable error naming `conn`.
   - `ws_select_all(conns, timeout?)` → list of every message ready this tick (≤1 per connection); `ws_broadcast(conns, data)` → count sent (dead handles skipped).
-  - `ws_status(conn)` → `"open"|"reconnecting"|"closed"` (unknown handle → `"closed"`, never errors); `ws_stats(conn)` → `{sent, received, reconnects, queued, queued_bytes, last_pong_ago (secs or nothing), status, subprotocol}`.
+  - `ws_status(conn)` → `"open"|"reconnecting"|"closed"` (unknown handle → `"closed"`, never errors); `ws_stats(conn)` → `{sent, received, reconnects, queued, queued_bytes, last_pong_ago (secs or nothing), status, subprotocol, attested?}` (`attested`: with `opts.attested`, what the last (re)connection verified).
   - Sync-engine boundary: keepalive/reconnect tick INSIDE `ws_select`/`ws_recv`/`ws_status`. Per-interpreter connection cap via `SYNSEMA_WS_MAX_CONNS` (default 4096). See stdlib.md § WebSocket.
 - Note: `text(b)` / `print(b)` show a hex repr like `bytes(48656c6c6f)`, **not** a decode. `bytes != text` always.
 

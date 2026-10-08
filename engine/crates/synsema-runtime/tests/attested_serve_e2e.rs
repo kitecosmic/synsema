@@ -570,8 +570,8 @@ fn attested_fetch_verifies_the_server_on_the_same_connection_before_sending_anyt
     let bad_sha = format!("{}{}", &psha[..63], if psha.ends_with('0') { "1" } else { "0" });
     for (attested, needle) in [
         (format!("{{\"program_sha\": \"{}\", \"formats\": [\"mock\"]}}", bad_sha), "attested: the server runs program_sha".to_string()),
-        (format!("{{\"program_sha\": \"{}\", \"formats\": [\"mock\", \"sev-snp\"]}}", psha), "asks for \"sev-snp\" but the server published no such document".to_string()),
-        (format!("{{\"program_sha\": \"{}\", \"formats\": [\"sev-snp\"]}}", psha), "mock driver".to_string()),
+        (format!("{{\"program_sha\": \"{}\", \"formats\": [\"mock\", \"sev-snp\"], \"measurements\": {{\"sev-snp\": \"any\"}}}}", psha), "asks for \"sev-snp\" but the server published no such document".to_string()),
+        (format!("{{\"program_sha\": \"{}\", \"formats\": [\"sev-snp\"], \"measurements\": {{\"sev-snp\": \"any\"}}}}", psha), "mock driver".to_string()),
         (format!("{{\"program_sha\": \"{}\", \"formats\": [\"mock\"], \"measurements\": {{\"mock\": {{\"pcr0\": \"{}\"}}}}}}", psha, "ab".repeat(48)), "measurement pcr0 mismatch".to_string()),
     ] {
         let before = hits(port, &spki);
@@ -596,6 +596,7 @@ fn attested_fetch_verifies_the_server_on_the_same_connection_before_sending_anyt
     // Errores de uso: sin program_sha, formats vacío, junto con tls_pin, sobre http://.
     for (opts, needle) in [
         ("{\"attested\": {\"formats\": [\"mock\"]}}".to_string(), "attested.program_sha is required"),
+        (format!("{{\"attested\": {{\"program_sha\": \"{}\", \"formats\": [\"nitro-tpm\"]}}}}", psha), "attested.measurements has no entry for \"nitro-tpm\""),
         (format!("{{\"attested\": {{\"program_sha\": \"{}\", \"formats\": []}}}}", psha), "attested.formats is required and cannot be empty"),
         (format!("{{\"attested\": {{\"program_sha\": \"{}\", \"formats\": [\"mock\"]}}, \"tls_pin\": \"{}\"}}", psha, hex(&spki)), "tls_pin and attested are two ways"),
     ] {

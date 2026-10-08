@@ -171,7 +171,8 @@ while live
   libraries skip.
 - `ws_status(conn)` → `"open" | "reconnecting" | "closed"`; `ws_stats(conn)` →
   `{sent, received, reconnects, queued, queued_bytes, last_pong_ago (seconds since the
-  last pong, nothing if none yet), status, subprotocol}`. Stats never lie: `sent` counts
+  last pong, nothing if none yet), status, subprotocol, attested? (with `opts.attested`: what the
+  last (re)connection verified)}`. Stats never lie: `sent` counts
   only messages that went out (or got queued for flush), never failed sends.
 - `on_full` (what happens when the inbound queue hits max_queue/max_queue_bytes):
   `"block"` (default — real TCP backpressure: stop reading the socket, the TCP window

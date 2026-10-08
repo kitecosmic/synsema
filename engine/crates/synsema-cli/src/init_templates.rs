@@ -324,11 +324,13 @@ pub const ENV_EXAMPLE: &str = r#"# Config del proyecto — Synsema auto-carga el
 
 # ══ Attestation (TEEs) — `synsema serve --attested` / `synsema run --attest` / attest() ══
 
-# Driver de attestation. Sin la variable se AUTODETECTA en Linux por el dispositivo o socket
-# presente (/dev/nsm → nitro; /sys/kernel/config/tsm/report → tsm [TDX o SEV-SNP];
-# /var/run/dstack.sock o tappd.sock → dstack) y si no hay ninguno, error claro. `mock` es el
-# driver de desarrollo y CI (Windows/macOS incluidos): documento con forma Nitro firmado por
-# una cadena de prueba determinista; JAMAS se elige solo, hay que pedirlo:
+# Driver de attestation: uno o una lista separada por comas (p. ej. `tsm,nitro-tpm`: un documento
+# por driver, todos atando la misma clave). Sin la variable se AUTODETECTA en Linux por el
+# dispositivo o socket presente (/dev/nsm → nitro; si no, /sys/kernel/config/tsm/report → tsm
+# [TDX o SEV-SNP] Y un TPM que responde al comando NitroTPM de AWS → nitro-tpm, los dos si
+# estan los dos; si no, /var/run/dstack.sock o tappd.sock → dstack) y si no hay ninguno, error
+# claro. `mock` es el driver de desarrollo y CI (Windows/macOS incluidos): documento con forma
+# Nitro firmado por una cadena de prueba determinista; JAMAS se elige solo ni se mezcla:
 # SYNSEMA_ATTEST=mock
 
 # Semilla del driver mock (default "synsema-mock"): fija la clave, la cadena y por lo tanto
@@ -415,6 +417,8 @@ const HELLO_SYN_PAST: &[&str] = &[
 
 /// sha256 de cada contenido histórico de `.env.example` (ver `InitFile::past`).
 const ENV_EXAMPLE_PAST: &[&str] = &[
+    // v0.6.43 (rama, tras la auditoria): SYNSEMA_ATTEST sin `nitro-tpm` ni la lista de drivers.
+    "777291778c99d83e532e1b6ba08d0f5fbf9851b62652ab0904d9facc374952c5",
     // v0.6.42 (rama, tras la auditoria): decia que los hilos extra se retiran a los 60 s (se
     // retiran apenas se vacia la cola) — con los knobs de ACME previos ya listados.
     "930eb46150e8008c938edc5dd9587c032fbe14709a84c4bf6402953367075407",

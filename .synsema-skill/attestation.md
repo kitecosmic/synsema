@@ -130,7 +130,8 @@ Output: `measurements: {measurement, host_data}` (hex), `report_data` (64 bytes)
 migrate_ma, debug, single_socket, cxl_allow, mem_aes_256_xts, rapl_dis, ciphertext_hiding,
 page_swap_disable}`, `version`, and `nothing` for `timestamp` (the report has no time — none is
 invented), `module_id`, `user_data`, `public_key`, `nonce`. Only **Milan** is exercised with a real
-report (AWS `c6a`, VLEK). Genoa, Turin, the VCEK path (`hwID` = `CHIP_ID`) and the policy, TCB and
+report (AWS `c6a`, VLEK). **Turin + VCEK is not supported** (its `hwID` may not be 64 bytes; such a
+report is refused). AMD CRLs are not consulted. Genoa, Turin, the VCEK path (`hwID` = `CHIP_ID`) and the policy, TCB and
 reserved-field rejections are tested with synthetic chains built to AMD's spec and `virtee/sev`, with
 no real report behind them yet.
 
@@ -436,9 +437,10 @@ property the project enforces.
 require net("203.0.113.7")
 
 let r be fetch("https://203.0.113.7:8443/hola", {"attested": {
-    "program_sha": "95cb46a49494998c831ba7bb87ec2005525658868257e547f0d14c5df3afa91c",
+    "program_sha": args()[0],                       -- `synsema code sha app.syn` of the audited source
     "formats": ["sev-snp", "nitro-tpm"],
-    "measurements": {"nitro-tpm": {"pcr4": "40811f47…"}}
+    "measurements": {"sev-snp": "any",              -- on purpose: SEV-SNP only for "memory is private"
+                     "nitro-tpm": {"pcr4": args()[1], "pcr12": args()[2]}}   -- from the AMI builder
 }})
 print(r["attested"])        -- {program_sha, public_key_hex, formats, config}
 ```
@@ -451,7 +453,12 @@ must equal `sha256(canonical config)` and `program_sha` must equal `attested.pro
 (**mandatory**); (5) every document (`documents`, or the top-level one) passes `attestation_verify`
 with its `aux`, `now` and `expect.report_data = sha256(spki ‖ program_sha ‖ config_sha)`; every
 format in `attested.formats` (**mandatory**, non-empty) must be present and verify, and an extra
-document that does not verify is an error too; `attested.measurements` is per format and optional;
+document that does not verify is an error too; `attested.measurements` **must name every format
+except `mock`** with a non-empty map, or `"any"` to accept any measurement of that format on purpose
+(otherwise: `attested.measurements has no entry for "nitro-tpm": without the expected measurements
+the document proves only that some nitro-tpm machine answered, not which code runs` — `program_sha`
+alone is declared by the very binary being checked; on EC2 the SEV-SNP `measurement` covers only
+OVMF, so NitroTPM PCR4/PCR12 are what pin the code; never PCR16/PCR23, root resets them);
 a `mock` document is accepted only if `formats` names `"mock"`; (6) only then your request goes out
 on the same connection. Any failure → `error of r` (status 0) and **the server never receives your
 request**. Errors you will see: `attested: the identity's public_key_hex is not the key of this TLS
@@ -465,7 +472,8 @@ the key out), unknown keys. The identity must come with `Content-Length` (`attes
 response must carry Content-Length, not Transfer-Encoding`), so the connection can carry your
 request after it; `the identity has two <format> documents` is an error too. Over `http://`/`ws://` → error. `now` (unix seconds) is optional: the system
 clock by default, like any TLS check (`attestation_verify` itself still requires it). In
-`ws_connect` the upgrade leaves after step 5, on every reconnect too. The wasm profile (the host's
+`ws_connect` the upgrade leaves after step 5, on every reconnect too (an explicit `now` advances by
+the time since the first connection); `ws_stats(c)["attested"]` holds what the last one verified. The wasm profile (the host's
 `http`) cannot do it and fails closed.
 
 **By hand** — for an identity you already hold (a copy, an artefact), then `tls_pin`:

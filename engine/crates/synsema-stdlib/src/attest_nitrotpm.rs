@@ -39,7 +39,26 @@ pub const NOT_AVAILABLE: &str = "attest: NitroTPM is not available: the AMI need
 
 /// Dispositivos que se prueban, en orden: el TPM crudo (lo que usa `nitro-tpm-attest`) y el del
 /// gestor de recursos del kernel.
+///
+/// `/dev/tpm0` va primero a propósito: Linux lo abre en exclusiva, así que mientras lo tenemos nadie
+/// más está a mitad de una operación sobre el TPM y se puede barrer lo que dejó un proceso muerto
+/// (ver [`sweep_orphans`]). Si está ocupado se espera ([`TPM0_WAIT`]) para que dos procesos se
+/// turnen en vez de pisarse; sólo si sigue ocupado (un daemon que lo tiene tomado) se usa
+/// `/dev/tpmrm0`, sin barrido.
 pub const DEVICES: &[&str] = &["/dev/tpm0", "/dev/tpmrm0"];
+
+/// Cuánto se espera a que `/dev/tpm0` se libere antes de usar `/dev/tpmrm0`.
+pub const TPM0_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Un solo uso del TPM a la vez por proceso: la renovación de `serve --attested` y un `attest()` de
+/// un worker no pueden pisarse el índice NV ni la limpieza del otro.
+#[cfg(target_os = "linux")]
+static TPM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(target_os = "linux")]
+fn tpm_lock() -> std::sync::MutexGuard<'static, ()> {
+    TPM_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 /// Topes del pedido NSM (los mismos que el NSM de un enclave).
 pub const MAX_FIELD: usize = 1024;
@@ -74,6 +93,8 @@ const TPM_CAP_COMMANDS: u32 = 0x0000_0002;
 pub const TPM_RC_COMMAND_CODE: u32 = 0x0143;
 const NV_INDEX_FIRST: u32 = 0x0100_0000;
 const NV_INDEX_LAST: u32 = 0x01FF_FFFF;
+const TRANSIENT_FIRST: u32 = 0x8000_0000;
+const LOADED_SESSION_FIRST: u32 = 0x0200_0000;
 /// `TPMA_NV_AUTHWRITE | TPMA_NV_AUTHREAD` (índice ordinario).
 pub const NV_ATTRIBUTES: u32 = (1 << 2) | (1 << 18);
 /// `TPMA_NV_WRITTEN`.
@@ -323,10 +344,11 @@ pub fn probe_with(t: &mut dyn Transport) -> bool {
     }
 }
 
-/// Primer índice NV libre desde `NV_INDEX_FIRST` (como `find_free_handle` de la referencia).
-fn free_nv_index(t: &mut dyn Transport) -> Result<u32, String> {
+/// Los handles desde `first` hasta el fin de su rango (el byte alto de `first`).
+fn handles_from(t: &mut dyn Transport, first: u32) -> Result<Vec<u32>, String> {
+    let top = first | 0x00FF_FFFF;
     let mut used: Vec<u32> = Vec::new();
-    let mut from = NV_INDEX_FIRST;
+    let mut from = first;
     for _ in 0..64 {
         let raw = call(t, Cmd::new(TPM_ST_NO_SESSIONS, TPM_CC_GET_CAPABILITY).u32(TPM_CAP_HANDLES).u32(from).u32(256).build(), "GetCapability(handles)")?;
         let mut r = Resp::parse(&raw, "GetCapability(handles)")?;
@@ -338,15 +360,68 @@ fn free_nv_index(t: &mut dyn Transport) -> Result<u32, String> {
         let mut last = from;
         for _ in 0..n {
             let h = r.u32()?;
-            used.push(h);
+            if h & 0xFF00_0000 == first & 0xFF00_0000 {
+                used.push(h);
+            }
             last = last.max(h);
         }
-        if !more || n == 0 || last >= NV_INDEX_LAST {
+        if !more || n == 0 || last >= top {
             break;
         }
         from = last + 1;
     }
+    Ok(used)
+}
+
+/// Primer índice NV libre desde `NV_INDEX_FIRST` (como `find_free_handle` de la referencia).
+fn free_nv_index(t: &mut dyn Transport) -> Result<u32, String> {
+    let used = handles_from(t, NV_INDEX_FIRST)?;
     (NV_INDEX_FIRST..=NV_INDEX_LAST).find(|h| !used.contains(h)).ok_or_else(|| "attest: NitroTPM has no free NV index".to_string())
+}
+
+/// ¿Es un buffer de mensaje como los nuestros (o los de `nitro-tpm-attest`)? SHA-512,
+/// AUTHREAD|AUTHWRITE (más los bits que pone el TPM al usarlo), sin policy, 8192 bytes.
+fn is_message_buffer(t: &mut dyn Transport, nv: u32) -> Result<bool, String> {
+    let raw = call(t, Cmd::new(TPM_ST_NO_SESSIONS, TPM_CC_NV_READ_PUBLIC).u32(nv).build(), "NV_ReadPublic")?;
+    let Ok(mut r) = Resp::parse(&raw, "NV_ReadPublic") else { return Ok(false) };
+    let public = r.tpm2b()?;
+    let mut wrapped = vec![0u8; 10];
+    wrapped.extend_from_slice(public);
+    let mut p = Resp { data: &wrapped, pos: 10 };
+    let index = p.u32()?;
+    let name_alg = p.u16()?;
+    let attributes = p.u32()?;
+    let policy = p.tpm2b()?;
+    let size = p.u16()?;
+    Ok(index == nv && name_alg == TPM_ALG_SHA512 && attributes & !TPMA_NV_WRITTEN == NV_ATTRIBUTES && policy.is_empty() && size == NV_SIZE)
+}
+
+/// Lo que dejó un proceso que murió a mitad de un pedido (SIGKILL, OOM): la EK y la sesión
+/// cargadas y el buffer NV de 8 KiB, que el TPM guarda para siempre. Sin esto, unos pocos cortes
+/// agotan los slots y el driver queda roto hasta limpiarlo a mano.
+///
+/// SÓLO con `/dev/tpm0` abierto en exclusiva: ningún otro proceso puede estar a mitad de una
+/// operación con él, y el gestor del kernel (`/dev/tpmrm0`) guarda y descarga sus objetos después
+/// de cada comando, así que lo cargado y los buffers con nuestra forma son restos. Un error del
+/// barrido no frena el pedido (que dirá lo suyo si falta lugar).
+pub fn sweep_orphans(t: &mut dyn Transport) -> usize {
+    let mut swept = 0;
+    for first in [TRANSIENT_FIRST, LOADED_SESSION_FIRST] {
+        for h in handles_from(t, first).unwrap_or_default() {
+            if call(t, Cmd::new(TPM_ST_NO_SESSIONS, TPM_CC_FLUSH_CONTEXT).u32(h).build(), "FlushContext").and_then(|raw| Resp::parse(&raw, "FlushContext").map(|_| ())).is_ok() {
+                swept += 1;
+            }
+        }
+    }
+    for nv in handles_from(t, NV_INDEX_FIRST).unwrap_or_default() {
+        if is_message_buffer(t, nv).unwrap_or(false) {
+            let cmd = Cmd::new(TPM_ST_SESSIONS, TPM_CC_NV_UNDEFINE_SPACE).u32(TPM_RH_OWNER).u32(nv).auth(&pw_session(&[])).build();
+            if call(t, cmd, "NV_UndefineSpace").and_then(|raw| Resp::parse(&raw, "NV_UndefineSpace").map(|_| ())).is_ok() {
+                swept += 1;
+            }
+        }
+    }
+    swept
 }
 
 /// RSA-OAEP (SHA-256, MGF1-SHA-256, etiqueta `"SECRET\0"`) de la sal con la EK (Part 1, B.10.2).
@@ -560,7 +635,13 @@ impl Transport for Device {
         let mut buf = vec![0u8; 8192];
         let mut n = 0usize;
         loop {
-            let k = self.0.read(&mut buf[n..]).map_err(|e| format!("read from the TPM: {}", e))?;
+            // Una señal en medio de la lectura (EINTR) no es un error del TPM: se reintenta. Cortar
+            // acá dejaría el índice NV definido.
+            let k = match self.0.read(&mut buf[n..]) {
+                Ok(k) => k,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("read from the TPM: {}", e)),
+            };
             if k == 0 {
                 break;
             }
@@ -577,16 +658,31 @@ impl Transport for Device {
     }
 }
 
-/// El primer dispositivo TPM que abre.
+/// El primer dispositivo TPM que abre, y si es `/dev/tpm0` (exclusivo: se puede barrer).
+/// `/dev/tpm0` ocupado (EBUSY) se reintenta hasta [`TPM0_WAIT`] antes de pasar a `/dev/tpmrm0`.
 #[cfg(target_os = "linux")]
-fn open_device() -> Result<Device, String> {
+fn open_device() -> Result<(Device, bool), String> {
+    let open = |path: &str| std::fs::OpenOptions::new().read(true).write(true).open(path);
     let mut last = None;
-    for path in DEVICES {
+    if std::path::Path::new(DEVICES[0]).exists() {
+        let deadline = std::time::Instant::now() + TPM0_WAIT;
+        loop {
+            match open(DEVICES[0]) {
+                Ok(f) => return Ok((Device(f), true)),
+                Err(e) if e.raw_os_error() == Some(16) && std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(100)),
+                Err(e) => {
+                    last = Some(format!("attest: cannot open {} ({}); another TPM user may hold it", DEVICES[0], e));
+                    break;
+                }
+            }
+        }
+    }
+    for path in &DEVICES[1..] {
         if !std::path::Path::new(path).exists() {
             continue;
         }
-        match std::fs::OpenOptions::new().read(true).write(true).open(path) {
-            Ok(f) => return Ok(Device(f)),
+        match open(path) {
+            Ok(f) => return Ok((Device(f), false)),
             Err(e) => last = Some(format!("attest: cannot open {} ({}); another TPM user may hold it", path, e)),
         }
     }
@@ -611,8 +707,9 @@ fn probe_device() -> bool {
         if !device_present() {
             return false;
         }
+        let _guard = tpm_lock();
         match open_device() {
-            Ok(mut d) => probe_with(&mut d),
+            Ok((mut d, _)) => probe_with(&mut d),
             Err(_) => false,
         }
     }
@@ -629,7 +726,11 @@ pub fn attest(req: &AttestRequest) -> Result<AttestResult, String> {
         if !device_present() {
             return Err(NOT_AVAILABLE.to_string());
         }
-        let mut dev = open_device()?;
+        let _guard = tpm_lock();
+        let (mut dev, exclusive) = open_device()?;
+        if exclusive {
+            sweep_orphans(&mut dev);
+        }
         let document = attest_with(&mut dev, req)?;
         Ok(AttestResult {
             format: "nitro-tpm",
@@ -959,6 +1060,73 @@ mod tests {
         let e = attest_with(&mut tpm, &AttestRequest { report_data: vec![], nonce: Some(vec![0; 1025]), public_key: None }).unwrap_err();
         assert!(e.contains("nonce must be at most 1024 bytes"), "{}", e);
         assert!(tpm.commands.is_empty(), "no toca el TPM");
+    }
+
+    /// Lo que dejó un proceso muerto se barre: objetos transitorios, sesiones cargadas y SÓLO los
+    /// índices NV con la forma exacta de nuestro buffer (no los de otros dueños).
+    #[test]
+    fn the_sweep_releases_only_what_a_dead_attest_left_behind() {
+        struct Leftovers {
+            flushed: Vec<u32>,
+            undefined: Vec<u32>,
+        }
+        const OURS: u32 = NV_INDEX_FIRST + 3;
+        const OURS_WRITTEN: u32 = NV_INDEX_FIRST + 4;
+        const FOREIGN_SIZE: u32 = NV_INDEX_FIRST + 5;
+        const FOREIGN_POLICY: u32 = NV_INDEX_FIRST + 6;
+        impl Transport for Leftovers {
+            fn transact(&mut self, cmd: &[u8]) -> Result<Vec<u8>, String> {
+                let mut r = Rd(cmd, 0);
+                let tag = r.u16();
+                r.u32();
+                let handles = |hs: &[u32]| {
+                    let mut body = vec![0u8];
+                    body.extend_from_slice(&TPM_CAP_HANDLES.to_be_bytes());
+                    body.extend_from_slice(&(hs.len() as u32).to_be_bytes());
+                    for h in hs {
+                        body.extend_from_slice(&h.to_be_bytes());
+                    }
+                    ok_resp(tag, &body)
+                };
+                match r.u32() {
+                    TPM_CC_GET_CAPABILITY => {
+                        assert_eq!(r.u32(), TPM_CAP_HANDLES);
+                        Ok(match r.u32() {
+                            TRANSIENT_FIRST => handles(&[0x8000_0000, 0x8000_0001]),
+                            LOADED_SESSION_FIRST => handles(&[0x0200_0000]),
+                            NV_INDEX_FIRST => handles(&[OURS, OURS_WRITTEN, FOREIGN_SIZE, FOREIGN_POLICY]),
+                            other => panic!("rango 0x{:x}", other),
+                        })
+                    }
+                    TPM_CC_FLUSH_CONTEXT => {
+                        self.flushed.push(r.u32());
+                        Ok(ok_resp(tag, &[]))
+                    }
+                    TPM_CC_NV_READ_PUBLIC => {
+                        let idx = r.u32();
+                        let mut public = idx.to_be_bytes().to_vec();
+                        public.extend_from_slice(&TPM_ALG_SHA512.to_be_bytes());
+                        let attrs = if idx == OURS_WRITTEN { NV_ATTRIBUTES | TPMA_NV_WRITTEN } else { NV_ATTRIBUTES };
+                        public.extend_from_slice(&attrs.to_be_bytes());
+                        public.extend_from_slice(&b2(if idx == FOREIGN_POLICY { &[1; 32] } else { &[] }));
+                        public.extend_from_slice(&(if idx == FOREIGN_SIZE { 100u16 } else { NV_SIZE }).to_be_bytes());
+                        let mut body = b2(&public);
+                        body.extend_from_slice(&b2(&[0; 66]));
+                        Ok(ok_resp(tag, &body))
+                    }
+                    TPM_CC_NV_UNDEFINE_SPACE => {
+                        assert_eq!(r.u32(), TPM_RH_OWNER);
+                        self.undefined.push(r.u32());
+                        Ok(ok_resp(tag, &0u32.to_be_bytes()))
+                    }
+                    other => panic!("comando inesperado 0x{:x}", other),
+                }
+            }
+        }
+        let mut t = Leftovers { flushed: Vec::new(), undefined: Vec::new() };
+        assert_eq!(sweep_orphans(&mut t), 5);
+        assert_eq!(t.flushed, vec![0x8000_0000, 0x8000_0001, 0x0200_0000]);
+        assert_eq!(t.undefined, vec![OURS, OURS_WRITTEN], "los índices de otros dueños no se tocan");
     }
 
     #[test]

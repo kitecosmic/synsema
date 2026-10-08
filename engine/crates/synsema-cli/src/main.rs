@@ -1613,9 +1613,14 @@ fn cmd_run(args: &[String]) -> ExitCode {
     });
     // El driver y su plataforma se validan ANTES de ejecutar el programa (sin
     // plataforma no se corre nada, y el aviso del mock sale antes de la salida del programa).
+    // Una sola selección: la misma lista va al artefacto (`config.drivers`) y a los documentos.
+    let mut attest_drivers: Vec<synsema_stdlib::attest::Driver> = Vec::new();
     if attest_input.is_some() {
         match synsema_stdlib::attest::preflight() {
-            Ok(ds) => ds.into_iter().for_each(synsema_stdlib::attest::warn_if_mock),
+            Ok(ds) => {
+                ds.iter().copied().for_each(synsema_stdlib::attest::warn_if_mock);
+                attest_drivers = ds;
+            }
             Err(e) => {
                 eprintln!("synsema run --attest: {}", e);
                 return ExitCode::from(1);
@@ -1687,7 +1692,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         // `--attest --format json`: la attestation va DENTRO del informe (sólo si el run
         // fue bien; no se atesta una salida fallida).
         if let (Some(input), true) = (&attest_input, result.success) {
-            match attest_run(&source, &filename, input, &result.output) {
+            match attest_run(&source, &filename, input, &result.output, &attest_drivers) {
                 Ok(fields) => {
                     for (k, v) in fields.as_object().into_iter().flatten() {
                         report[k] = v.clone();
@@ -1721,7 +1726,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
             audit::summary(code as i32);
             return ExitCode::from(code);
         }
-        match attest_run(&source, &filename, input, &result.output) {
+        match attest_run(&source, &filename, input, &result.output, &attest_drivers) {
             Ok(fields) => println!("{}", fields),
             Err(e) => {
                 eprintln!("synsema run --attest: {}", e);
@@ -1777,9 +1782,9 @@ fn steps_field() -> serde_json::Value {
 /// bajo qué modo corrió el programa, no sólo cuál. Con varios drivers (`SYNSEMA_ATTEST=tsm,nitro-tpm`)
 /// cada uno firma el MISMO `report_data`; `attestation` es el del primero y `attestations` los trae
 /// todos. Si uno falla, no hay artefacto.
-fn attest_run(source: &str, filename: &str, input: &[u8], output: &[String]) -> Result<serde_json::Value, String> {
+fn attest_run(source: &str, filename: &str, input: &[u8], output: &[String], drivers: &[synsema_stdlib::attest::Driver]) -> Result<serde_json::Value, String> {
     use synsema_core::bytesutil::{b64_encode, hex_encode};
-    use synsema_stdlib::attest::{attest_documents_with, current_program_sha, document_json, keccak256, program_sha, select_drivers, sha256, AttestConfig, AttestRequest};
+    use synsema_stdlib::attest::{attest_documents_with, current_program_sha, document_json, keccak256, program_sha, sha256, AttestConfig, AttestRequest};
     let joined = output.join("\n");
     let program_sha = program_sha(source, filename)?;
     // Lo que se atesta tiene que ser lo que corrió: los bytes que leyó el cargador de módulos.
@@ -1788,7 +1793,6 @@ fn attest_run(source: &str, filename: &str, input: &[u8], output: &[String]) -> 
             return Err("a module changed on disk while the program ran; refusing to attest a program_sha that is not the one that ran".to_string());
         }
     }
-    let drivers = select_drivers()?;
     let input_sha = sha256(input);
     let output_sha = sha256(joined.as_bytes());
     let state_root = keccak256(joined.as_bytes());

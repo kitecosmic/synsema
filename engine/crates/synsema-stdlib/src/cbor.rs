@@ -220,7 +220,7 @@ pub fn decode_prefix(bytes: &[u8]) -> Result<(Cbor, usize), CborError> {
 
 /// Como [`decode`], pero acepta además ítems de longitud INDEFINIDA. Devuelve `(ítem, vio_indefinido)`
 /// para que quien llama decida si esa codificación es aceptable en su formato (p. ej. `nitro`
-/// la rechaza y `nitro-tpm` la exige).
+/// la rechaza y `nitro-tpm` la permite: el hipervisor la usa, pero no es obligatoria).
 pub fn decode_allow_indefinite(bytes: &[u8]) -> Result<(Cbor, bool), CborError> {
     let mut d = Decoder { buf: bytes, pos: 0, allow_indefinite: true, saw_indefinite: false };
     let item = d.item(0)?;

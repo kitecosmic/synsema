@@ -46,7 +46,9 @@ hardware formats and pure primitives.
 
 **Attestation drivers.**
 - `nitro-tpm`: produces the EC2 instance attestation document by talking to the TPM directly (no
-  external tool). Auto-detected only when the TPM answers AWS's vendor command; forced with
+  external tool). One request at a time per process; with `/dev/tpm0` (opened exclusively, waited
+  for up to 10 s) it first releases what a killed process left in the TPM (loaded objects and
+  sessions, and message buffers of exactly its own shape). Auto-detected only when the TPM answers AWS's vendor command; forced with
   `SYNSEMA_ATTEST=nitro-tpm`.
 - `SYNSEMA_ATTEST` takes a list, e.g. `tsm,nitro-tpm`. `serve --attested` and `run --attest` ask
   every driver for a document binding the same `report_data`, and do not start if one fails.
@@ -73,7 +75,11 @@ hardware formats and pure primitives.
   read over that same connection, its key must be the handshake's, `config_sha` and `program_sha`
   must match, every document must verify with its binding and every requested format must be there;
   only then is your request sent. If anything fails it is never sent and `error of r` says why. The
-  answer carries `attested`. Not together with `tls_pin`. It fails against a server with an
+  answer carries `attested`. Not together with `tls_pin`. `attested.measurements` must name every
+  format but `mock` (a non-empty map, or `"any"` to accept any measurement of that format on
+  purpose): without expected measurements a platform document proves only that some machine of
+  that platform answered, and `program_sha` alone is declared by the binary being checked. In
+  `ws_connect`, `ws_stats(c)` gains `attested`, and an explicit `now` advances on reconnects. It fails against a server with an
   operator certificate (the channel's key is not the attested one). In the WebAssembly embedding
   (`synsema-wasm-web`), `tls_pin` and `attested` fail closed: the host's transport cannot do them.
 

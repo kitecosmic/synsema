@@ -307,7 +307,9 @@ const TAPPD_SOCKET: &str = "/var/run/tappd.sock";
 /// repetidos; `mock` sólo solo); sin él, autodetección en Linux por la presencia del
 /// dispositivo/socket. El `mock` sólo entra por la variable, jamás por detección.
 pub fn select_drivers() -> Result<Vec<Driver>, String> {
-    if let Ok(v) = std::env::var("SYNSEMA_ATTEST") {
+    // Una variable que no es texto no se ignora (caería en la autodetección): es error.
+    if let Some(raw) = std::env::var_os("SYNSEMA_ATTEST") {
+        let v = raw.into_string().map_err(|_| "attest: SYNSEMA_ATTEST is not valid UTF-8".to_string())?;
         let v = v.trim().to_ascii_lowercase();
         if !v.is_empty() {
             let mut out: Vec<Driver> = Vec::new();
@@ -471,6 +473,23 @@ fn check_document_binding(res: &AttestResult, want: &[u8]) -> Result<(), String>
             padded.resize(MAX_REPORT_DATA, 0);
             if res.document.len() != crate::attestation_snp::REPORT_LEN || res.document[0x50..0x90] != padded[..] {
                 return Err("attest: the sev-snp report does not carry the requested report_data".to_string());
+            }
+        }
+        "tdx" => {
+            // Quote DCAP de TDX: cabecera de 48 bytes (v4) o 48 + tipo y tamaño del cuerpo (v5);
+            // en el cuerpo, REPORTDATA va después de 520 bytes de medidas y atributos.
+            let mut padded = want.to_vec();
+            padded.resize(MAX_REPORT_DATA, 0);
+            let q = &res.document;
+            let version = q.get(..2).map(|v| u16::from_le_bytes([v[0], v[1]]));
+            let body = match version {
+                Some(4) => 48,
+                Some(5) => 54,
+                Some(v) => return Err(format!("attest: the tdx quote has version {}; the engine reads versions 4 and 5", v)),
+                None => return Err("attest: the tdx quote is empty".to_string()),
+            };
+            if q.get(body + 520..body + 584) != Some(&padded[..]) {
+                return Err("attest: the tdx quote does not carry the requested report_data".to_string());
             }
         }
         _ => {}
@@ -707,7 +726,14 @@ mod tsm {
         if outblob.is_empty() {
             return Err("attest: configfs-tsm returned an empty outblob".to_string());
         }
-        let aux = std::fs::read(dir.join("auxblob")).ok().filter(|b| !b.is_empty());
+        // Sin `auxblob` (o vacío) la plataforma no da la tabla; uno que existe y no se puede leer es
+        // error: perderla en silencio haría un documento SEV-SNP sin vencimiento conocido.
+        let aux = match std::fs::read(dir.join("auxblob")) {
+            Ok(b) if b.is_empty() => None,
+            Ok(b) => Some(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("attest: cannot read configfs-tsm auxblob: {}", e)),
+        };
         let gen_after = generation()?;
         if gen_before != gen_after {
             return Err(format!(
@@ -1582,6 +1608,11 @@ fn replace_attestations(attestations: Vec<AttestResult>, expires_at: Option<i64>
         if !new.report_data.starts_with(&cur.report_data) {
             return Err(format!("renewal of {} does not carry the attested binding", new.driver));
         }
+        // La tabla `aux` dice cuándo vence un documento SEV-SNP: una renovación que la perdió no
+        // reemplaza a uno que la tenía.
+        if old.aux.is_some() && new.aux.is_none() {
+            return Err(format!("renewal of {} lost the certificate table (aux) the attested document had", new.driver));
+        }
     }
     let next = AttestedIdentity {
         private_scalar: cur.private_scalar.clone(),
@@ -1609,7 +1640,8 @@ pub const RENEW_LONG_LIVED_SECS: i64 = 24 * 3600;
 /// La ventana de validez `(not_before, not_after)` de lo que vence en un documento:
 /// - `nitro`, `nitro-tpm`, `mock`: el certificado HOJA del COSE (~3 h en AWS). Si no se puede
 ///   leer es ERROR: no se puede programar la renovación de algo cuyo vencimiento no se conoce.
-/// - `sev-snp`: la VCEK/VLEK de la tabla `aux` (la de AWS vive un año); sin `aux`, `None`.
+/// - `sev-snp`: la VCEK/VLEK de la tabla `aux` (la de AWS vive un año); sin `aux`, `None`; con
+///   un `aux` sin VEK legible, ERROR (no "no vence").
 /// - `tdx`: `None` (sin vencimiento corto que el motor conozca).
 pub fn document_window(r: &AttestResult) -> Result<Option<(i64, i64)>, String> {
     use x509_parser::prelude::FromDer;
@@ -1630,7 +1662,13 @@ pub fn document_window(r: &AttestResult) -> Result<Option<(i64, i64)>, String> {
                 None => Err(format!("cannot read the validity of the {} document's leaf certificate", r.format)),
             }
         }
-        "sev-snp" => Ok(r.aux.as_deref().and_then(crate::attestation_snp::vek_in_aux).as_deref().and_then(validity)),
+        "sev-snp" => match r.aux.as_deref() {
+            None => Ok(None),
+            Some(aux) => match crate::attestation_snp::vek_in_aux(aux).as_deref().and_then(validity) {
+                Some(w) => Ok(Some(w)),
+                None => Err("cannot read the validity of the sev-snp document's VLEK/VCEK in its certificate table (aux)".to_string()),
+            },
+        },
         _ => Ok(None),
     }
 }
@@ -1776,16 +1814,44 @@ pub fn spawn_renewal() -> Result<(), String> {
         .name("attest-renewal".to_string())
         .spawn(move || {
             let stop = std::sync::atomic::AtomicBool::new(false);
-            renewal_loop(&list, &document_window, &synsema_core::clock::now_secs, &stop, &|reason| {
-                eprintln!("{}", reason);
-                let _ = RENEWAL_FAILURE.set(reason.clone());
-                #[cfg(feature = "native")]
-                crate::server::request_shutdown(&reason);
-            });
+            renewal_loop(&list, &document_window, &synsema_core::clock::now_secs, &stop, &close_on_expiry);
         })
         .map_err(|e| format!("cannot start the attestation renewal thread: {}", e))?;
+    // Vigía aparte: si un driver se cuelga (un TPM o configfs que no contesta), el bucle de
+    // renovación queda adentro de esa llamada y no llega a mirar el vencimiento. Éste sí.
+    std::thread::Builder::new()
+        .name("attest-expiry".to_string())
+        .spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            match attested_identity() {
+                Some(id) => {
+                    let now = synsema_core::clock::now_secs();
+                    if id.expired_at(now) {
+                        close_on_expiry(format!(
+                            "serve --attested: the attestation documents expired at {} and were not renewed in time; refusing to serve an expired document",
+                            id.expires_at.unwrap_or(now)
+                        ));
+                        return;
+                    }
+                }
+                None => {
+                    close_on_expiry("serve --attested: the attested identity is gone; refusing to serve".to_string());
+                    return;
+                }
+            }
+        })
+        .map_err(|e| format!("cannot start the attestation expiry watch: {}", e))?;
     *started = true;
     Ok(())
+}
+
+/// Cierra `serve --attested` con error (la primera razón gana; el `serve` sale con 1).
+fn close_on_expiry(reason: String) {
+    if RENEWAL_FAILURE.set(reason.clone()).is_ok() {
+        eprintln!("{}", reason);
+    }
+    #[cfg(feature = "native")]
+    crate::server::request_shutdown(&reason);
 }
 
 // =========================================================
@@ -2330,6 +2396,9 @@ mod tests {
         let mock = with_env(MOCK_ON, || attest_document(&AttestRequest::default()).unwrap());
         let (nb, na) = document_window(&mock).unwrap().unwrap();
         assert!(nb < 1_700_000_000 && na > 4_000_000_000, "{} {}", nb, na);
+        // Un `aux` que está pero no trae una VEK legible: error, no "no vence".
+        let snp_bad_aux = AttestResult { aux: Some(vec![0; 24]), ..snp.clone() };
+        assert!(document_window(&snp_bad_aux).unwrap_err().contains("VLEK/VCEK in its certificate table"));
         // Un documento COSE ilegible no se puede programar: error (no "vida larga").
         let broken = AttestResult { document: b"not cose".to_vec(), ..tpm.clone() };
         assert!(document_window(&broken).unwrap_err().contains("cannot read the validity of the nitro-tpm document"));
@@ -2345,6 +2414,17 @@ mod tests {
         let binding = snp.document[0x50..0x90].to_vec();
         assert!(check_document_binding(&snp, &binding).is_ok(), "el reporte real lleva su REPORT_DATA");
         assert!(check_document_binding(&snp, &[0; 32]).is_err());
+        // tdx: REPORTDATA dentro del cuerpo del quote, v4 y v5.
+        for (version, body) in [(4u16, 48usize), (5, 54)] {
+            let mut quote = vec![0u8; body + 584 + 100];
+            quote[..2].copy_from_slice(&version.to_le_bytes());
+            quote[body + 520..body + 552].copy_from_slice(&[7; 32]);
+            let tdx = AttestResult { format: "tdx", document: quote, driver: "dstack", ..res.clone() };
+            assert!(check_document_binding(&tdx, &[7; 32]).is_ok(), "v{}", version);
+            assert!(check_document_binding(&tdx, &[8; 32]).unwrap_err().contains("tdx quote does not carry"));
+        }
+        let odd = AttestResult { format: "tdx", document: vec![3, 0, 0, 0], driver: "tsm", ..res.clone() };
+        assert!(check_document_binding(&odd, &[7; 32]).unwrap_err().contains("versions 4 and 5"));
         // Vencimiento de la identidad.
         let id = with_env(MOCK_ON, || build_attested_identity("print(1)\n", "p.syn", test_config()).unwrap());
         assert!(!id.expired_at(1_800_000_000), "el mock vence en 2099");
@@ -2367,7 +2447,8 @@ mod tests {
             let n = CALLS.fetch_add(1, Ordering::SeqCst);
             let nb = synsema_core::clock::now_secs();
             let document = format!("{}:{}:{}:{}", name, n, nb, nb + LIFE).into_bytes();
-            Ok(AttestResult { format: if name == "tsm" { "sev-snp" } else { "nitro-tpm" }, document, driver: name, report_data: r.report_data.clone(), aux: None, event_log: None, root: None })
+            let aux = (name == "tsm").then(|| vec![1u8]);
+            Ok(AttestResult { format: if name == "tsm" { "sev-snp" } else { "nitro-tpm" }, document, driver: name, report_data: r.report_data.clone(), aux, event_log: None, root: None })
         }
         // La ventana sale del documento falso; el de `tsm` no vence pronto (como sev-snp).
         fn window(r: &AttestResult) -> Result<Option<(i64, i64)>, String> {
@@ -2382,6 +2463,21 @@ mod tests {
         if install_attested_identity(id).is_err() {
             return; // otra prueba del proceso ya instaló una identidad: no se pisa.
         }
+        // Al salir (aun con panic) la identidad global se saca: otros tests del proceso
+        // (`current_program_sha`) no dependen del orden.
+        struct Uninstall;
+        impl Drop for Uninstall {
+            fn drop(&mut self) {
+                if let Ok(mut slot) = identity_slot().write() {
+                    *slot = None;
+                }
+            }
+        }
+        let _uninstall = Uninstall;
+        // Una renovación que perdió la tabla `aux` que tenía el documento SEV-SNP no lo reemplaza.
+        let mut lost = attested_identity().unwrap().attestations.clone();
+        lost[0].aux = None;
+        assert!(replace_attestations(lost, None).unwrap_err().contains("lost the certificate table (aux)"));
         let first = attested_identity().unwrap().attestations[1].document.clone();
         let (nb0, na0) = window(&attested_identity().unwrap().attestations[1]).unwrap().unwrap();
         assert_eq!(renewal_schedule(&attested_identity().unwrap().attestations, nb0, &window).unwrap(), (nb0 + LIFE / 2, Some(na0)));

@@ -23,8 +23,10 @@ pub struct AttestedSpec {
     pub program_sha: String,
     /// Los formatos que tienen que estar y verificar (`sev-snp`, `nitro-tpm`, …).
     pub formats: Vec<String>,
-    /// `expect.measurements` por formato.
-    pub measurements: Vec<(String, SynValue)>,
+    /// `expect.measurements` por formato; `None` = `"any"`, la renuncia explícita a comparar.
+    /// Todo formato pedido salvo `mock` tiene su entrada (sin medidas el documento sólo prueba
+    /// "una VM de esa plataforma", no qué código corre).
+    pub measurements: Vec<(String, Option<SynValue>)>,
     /// La hora de la verificación (segundos unix); `None` = el reloj del sistema.
     pub now: Option<i64>,
 }
@@ -103,10 +105,15 @@ pub fn parse_attested_spec(v: &SynValue, who: &str) -> Result<AttestedSpec, Cont
                     other => return Err(cerr(format!("{}: attested.measurements must be a map format → {{name: hex}}, got {}", who, other.type_name()))),
                 };
                 for (f, exp) in mm {
-                    if !matches!(exp, SynValue::Map(_)) {
-                        return Err(cerr(format!("{}: attested.measurements.{} must be a map name → hex", who, f)));
-                    }
-                    measurements.push((f.to_string(), exp.clone()));
+                    let expect = match &exp {
+                        SynValue::Map(m) if m.borrow().len() == 0 => {
+                            return Err(cerr(format!("{}: attested.measurements.{} is an empty map: it would compare nothing; name the measurements, or write \"any\" to accept any on purpose", who, f)))
+                        }
+                        SynValue::Map(_) => Some(exp.clone()),
+                        SynValue::Text(t) if &**t == "any" => None,
+                        _ => return Err(cerr(format!("{}: attested.measurements.{} must be a map name → hex, or \"any\"", who, f))),
+                    };
+                    measurements.push((f.to_string(), expect));
                 }
             }
             "now" => {
@@ -123,6 +130,16 @@ pub fn parse_attested_spec(v: &SynValue, who: &str) -> Result<AttestedSpec, Cont
     for (f, _) in &measurements {
         if !formats.contains(f) {
             return Err(cerr(format!("{}: attested.measurements names {:?}, which is not in attested.formats", who, f)));
+        }
+    }
+    // Sin medidas, un documento de plataforma prueba que hay UNA VM o enclave de esa plataforma,
+    // no qué código corre: cualquiera que alquile una declara el program_sha esperado y pasa.
+    for f in &formats {
+        if f != "mock" && !measurements.iter().any(|(m, _)| m == f) {
+            return Err(cerr(format!(
+                "{}: attested.measurements has no entry for {:?}: without the expected measurements the document proves only that some {} machine answered, not which code runs; pass them (e.g. {{\"{}\": {{...}}}}), or {{\"{}\": \"any\"}} to accept any on purpose",
+                who, f, f, f, f
+            )));
         }
     }
     Ok(AttestedSpec { program_sha, formats, measurements, now })
@@ -197,7 +214,7 @@ pub fn verify_identity(body: &[u8], handshake_spki: &[u8], spec: &AttestedSpec) 
         let document = b64_decode(field(d, "document")?).map_err(|_| format!("the {} document is not base64", format))?;
         let mut expect = SynMap::new();
         expect.insert("report_data", syn_bytes(binding.clone()));
-        if let Some((_, m)) = spec.measurements.iter().find(|(f, _)| *f == format) {
+        if let Some((_, Some(m))) = spec.measurements.iter().find(|(f, _)| *f == format) {
             expect.insert("measurements", m.clone());
         }
         let mut opts = SynMap::new();
@@ -231,6 +248,43 @@ pub fn verify_identity(body: &[u8], handshake_spki: &[u8], spec: &AttestedSpec) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn m(pairs: Vec<(&str, SynValue)>) -> SynValue {
+        let mut out = SynMap::new();
+        for (k, v) in pairs {
+            out.insert(k, v);
+        }
+        syn_map(out)
+    }
+
+    fn parse(formats: &[&str], measurements: Option<SynValue>) -> Result<AttestedSpec, String> {
+        let mut pairs = vec![
+            ("program_sha", syn_text("ab".repeat(32))),
+            ("formats", synsema_core::types::syn_list(formats.iter().map(|f| syn_text(*f)).collect())),
+        ];
+        if let Some(ms) = measurements {
+            pairs.push(("measurements", ms));
+        }
+        parse_attested_spec(&m(pairs), "fetch").map_err(|c| match c {
+            Control::Error(e) => e.into_message(),
+            _ => "?".to_string(),
+        })
+    }
+
+    #[test]
+    fn a_platform_format_needs_its_measurements_or_an_explicit_any() {
+        let e = parse(&["sev-snp"], None).unwrap_err();
+        assert!(e.contains("attested.measurements has no entry for \"sev-snp\"") && e.contains("\"any\""), "{}", e);
+        let e = parse(&["nitro-tpm"], Some(m(vec![("nitro-tpm", m(vec![]))]))).unwrap_err();
+        assert!(e.contains("is an empty map"), "{}", e);
+        let e = parse(&["nitro-tpm"], Some(m(vec![("nitro-tpm", syn_text("anything"))]))).unwrap_err();
+        assert!(e.contains("must be a map name → hex, or \"any\""), "{}", e);
+        // Con medidas, con la renuncia explícita, y `mock` sin nada (no es una plataforma).
+        let s = parse(&["sev-snp", "nitro-tpm", "mock"], Some(m(vec![("sev-snp", syn_text("any")), ("nitro-tpm", m(vec![("pcr4", syn_text("00"))]))]))).unwrap();
+        assert!(s.measurements.iter().any(|(f, x)| f == "sev-snp" && x.is_none()));
+        assert!(s.measurements.iter().any(|(f, x)| f == "nitro-tpm" && x.is_some()));
+        assert!(parse(&["mock"], None).is_ok());
+    }
 
     fn spec() -> AttestedSpec {
         AttestedSpec { program_sha: "ab".repeat(32), formats: vec!["mock".into()], measurements: Vec::new(), now: Some(1) }

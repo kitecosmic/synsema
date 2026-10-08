@@ -310,6 +310,9 @@ struct DialParams {
     /// T5/T9: `opts.tls_pin` (SPKI fijada) u `opts.attested` (el servidor prueba qué corre antes
     /// del upgrade); vale también para cada reconexión.
     tls_check: Option<crate::http_common::TlsCheck>,
+    /// Cuándo se abrió la primera conexión: un `attested.now` explícito avanza con el tiempo en
+    /// cada reconexión (no se re-verifica días después con la hora de entonces).
+    dialed_at: Instant,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -332,6 +335,8 @@ struct Conn {
     token: Token,
     dial: DialParams,
     negotiated_subprotocol: Option<String>,
+    /// T9: lo que verificó `opts.attested` en la última (re)conexión (`ws_stats(c)["attested"]`).
+    attested: Option<crate::attested_client::AttestedInfo>,
     inbound: VecDeque<SynValue>,
     /// Bytes de payload encolados (la cota G26 tiene DOS dimensiones: cantidad Y bytes).
     queued_bytes: usize,
@@ -581,7 +586,7 @@ fn is_would_block(e: &tungstenite::Error) -> bool {
 fn establish(
     dial: &DialParams,
     caps: &Rc<RefCell<CapabilitySet>>,
-) -> Result<(WebSocket<WsStream>, Option<String>), Control> {
+) -> Result<(WebSocket<WsStream>, Option<String>, Option<crate::attested_client::AttestedInfo>), Control> {
     // G21: la MISMA capability net(host) en CADA (re)connect — nunca escala scope.
     require_net(caps, &dial.url)?;
 
@@ -597,6 +602,7 @@ fn establish(
     let _ = tcp.set_write_timeout(Some(dial.connect_timeout));
     let _ = tcp.set_nodelay(true);
 
+    let mut attested = None;
     let stream = if dial.tls {
         // T5: con `tls_pin`, la SPKI del servidor reemplaza raíces + nombre (ver `PinnedSpki`).
         // T9: con `attested`, el handshake registra la SPKI y el identity se verifica por esta
@@ -630,7 +636,11 @@ fn establish(
         if let (Some(TlsCheck::Attested(spec)), Some(r)) = (&dial.tls_check, &recorder) {
             let h = if dial.host.contains(':') { format!("[{}]", dial.host) } else { dial.host.clone() };
             let host_hdr = if dial.port == 443 { h } else { format!("{}:{}", h, dial.port) };
-            crate::http::attest_over(&mut tls_stream, &host_hdr, r, spec).map_err(|e| err(format!("ws_connect: {}", e)))?;
+            let mut spec = spec.clone();
+            if let Some(n) = spec.now {
+                spec.now = Some(n.saturating_add(dial.dialed_at.elapsed().as_secs() as i64));
+            }
+            attested = Some(crate::http::attest_over(&mut tls_stream, &host_hdr, r, &spec).map_err(|e| err(format!("ws_connect: {}", e)))?);
         }
         WsStream::tls_std(tls_stream)
     } else {
@@ -681,7 +691,7 @@ fn establish(
 
     // Handshake completo sobre el socket bloqueante → ahora a mio (no-bloqueante).
     socket.get_mut().promote_to_mio()?;
-    Ok((socket, negotiated))
+    Ok((socket, negotiated, attested))
 }
 
 // =========================================================
@@ -955,11 +965,12 @@ impl WsRegistry {
             let dial = self.conns.get(&handle).map(|c| c.dial.clone());
             let Some(dial) = dial else { continue };
             match establish(&dial, &self.caps) {
-                Ok((ws, sub)) => {
+                Ok((ws, sub, attested)) => {
                     let task = {
                         let Some(c) = self.conns.get_mut(&handle) else { continue };
                         c.ws = ws;
                         c.negotiated_subprotocol = sub;
+                        c.attested = attested;
                         c.status = Status::Open;
                         c.reconnect_at = None;
                         c.read_paused = false;
@@ -1553,6 +1564,7 @@ fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         max_msg: opts.max_msg,
         connect_timeout: opts.timeout,
         tls_check: opts.tls_check,
+        dialed_at: Instant::now(),
     };
     match (&dial.tls_check, dial.tls) {
         (Some(crate::http_common::TlsCheck::Pin(_)), false) => {
@@ -1565,7 +1577,7 @@ fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
     }
     // establish() re-chequea net(host) (G21) y hace el handshake.
     let caps = reg.borrow().caps.clone();
-    let (ws, negotiated) = establish(&dial, &caps)?;
+    let (ws, negotiated, attested) = establish(&dial, &caps)?;
 
     let mut r = reg.borrow_mut();
     r.next_id += 1;
@@ -1579,6 +1591,7 @@ fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         token,
         dial,
         negotiated_subprotocol: negotiated,
+        attested,
         inbound: VecDeque::new(),
         queued_bytes: 0,
         max_queue: opts.max_queue,
@@ -1869,6 +1882,10 @@ fn ws_stats(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         c.negotiated_subprotocol.clone().map(syn_text).unwrap_or(SynValue::Nothing),
     );
     m.insert("role", syn_text(if c.server_side { "server" } else { "client" }));
+    // T9: con `opts.attested`, lo verificado en la última (re)conexión (como `attested` de fetch).
+    if let Some(a) = &c.attested {
+        m.insert("attested", a.to_syn());
+    }
     Ok(syn_map(m))
 }
 
@@ -2052,8 +2069,10 @@ pub fn adopt_server_socket(interp: &Interpreter, link: ServerSocketLink) -> Resu
             max_msg,
             connect_timeout: Duration::from_secs(0),
             tls_check: None,
+            dialed_at: Instant::now(),
         },
         negotiated_subprotocol: subprotocol,
+        attested: None,
         inbound: VecDeque::new(),
         queued_bytes: 0,
         max_queue: DEFAULT_MAX_QUEUE,

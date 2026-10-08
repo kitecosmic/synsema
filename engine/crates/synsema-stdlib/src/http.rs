@@ -518,6 +518,15 @@ fn connect_and_send(
     if scheme != "http" && scheme != "https" {
         return Err(format!("unsupported scheme '{}': only http and https are supported", scheme));
     }
+    // Un pin o una atestación sobre http:// no fijan nada: fallar cerrado ANTES de resolver o
+    // conectar (ni DNS ni TCP hacia un destino que no se puede verificar).
+    if scheme == "http" {
+        match tls {
+            Some(crate::http_common::TlsCheck::Pin(_)) => return Err("tls_pin needs an https:// URL (there is no server key to pin over plain http)".to_string()),
+            Some(crate::http_common::TlsCheck::Attested(_)) => return Err("attested needs an https:// URL (there is no server key to check over plain http)".to_string()),
+            None => {}
+        }
+    }
     // `user:pass@` → `Authorization: Basic …`, salvo que el programa ya mande uno.
     let with_auth: Option<Vec<(String, String)>> = match &userinfo {
         Some(ui) if !headers.unwrap_or(&[]).iter().any(|(k, _)| k.eq_ignore_ascii_case("authorization")) => {
@@ -582,12 +591,6 @@ fn connect_and_send(
         stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
         Ok((Box::new(stream), info))
     } else {
-        // Un pin o una atestación sobre http:// no fijan nada: fallar cerrado en vez de mandar en claro.
-        match tls {
-            Some(crate::http_common::TlsCheck::Pin(_)) => return Err("tls_pin needs an https:// URL (there is no server key to pin over plain http)".to_string()),
-            Some(crate::http_common::TlsCheck::Attested(_)) => return Err("attested needs an https:// URL (there is no server key to check over plain http)".to_string()),
-            None => {}
-        }
         let mut stream = tcp;
         stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
         Ok((Box::new(stream), None))
