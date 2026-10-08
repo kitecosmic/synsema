@@ -404,6 +404,15 @@ fn is_message_buffer(t: &mut dyn Transport, nv: u32) -> Result<bool, String> {
 /// operación con él, y el gestor del kernel (`/dev/tpmrm0`) guarda y descarga sus objetos después
 /// de cada comando, así que lo cargado y los buffers con nuestra forma son restos. Un error del
 /// barrido no frena el pedido (que dirá lo suyo si falta lugar).
+///
+/// Límites conocidos (riesgo bajo, fallan cerrado, anotados en la auditoría de v0.6.43):
+/// - un proceso que cayó a `/dev/tpmrm0` (porque `tpm0` estuvo ocupado más de [`TPM0_WAIT`]) y
+///   está a mitad de un pedido puede perder su buffer con el barrido del siguiente que abra
+///   `tpm0`: ese pedido falla y la renovación lo reintenta;
+/// - se liberan TODOS los objetos y sesiones cargados por `tpm0` directo, también los de otra
+///   aplicación que esperara que sobrevivan entre aperturas (raro; a los usuarios de `tpmrm0` no
+///   les pasa). Barrer sólo ante `TPM_RC_OBJECT_MEMORY`/`SESSION_MEMORY` queda para cuando el
+///   driver se pruebe en un NitroTPM real.
 pub fn sweep_orphans(t: &mut dyn Transport) -> usize {
     let mut swept = 0;
     for first in [TRANSIENT_FIRST, LOADED_SESSION_FIRST] {
