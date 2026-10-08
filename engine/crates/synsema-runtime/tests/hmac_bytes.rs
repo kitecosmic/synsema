@@ -84,6 +84,52 @@ fn a_type_that_is_not_text_bytes_or_secret_is_an_error() {
     }
 }
 
+/// M1 (auditoría): una firma AUSENTE (`nothing`: el header no vino) es `false`, no un error.
+#[test]
+fn verify_hmac_with_a_missing_signature_is_false() {
+    let out = lines("print(verify_hmac(\"data\", nothing, \"key\"))\nlet h be {}\nprint(verify_hmac(\"data\", get(h, \"x-signature\"), as_secret(\"key\")))\n");
+    assert_eq!(out, vec!["false", "false"]);
+}
+
+/// M2 (auditoría): SigV4 con la clave como `secret`, sin `bytes(...)` ni `reveal`: el secret entra
+/// como clave y cada MAC (bytes) es la clave siguiente. Mismo resultado que con la clave en texto.
+#[test]
+fn sigv4_chain_from_a_secret_key() {
+    let out = lines(
+        r#"let key be as_secret("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
+let k_date be hmac("20150830", "AWS4" + key)
+let k_signing be hmac("aws4_request", hmac("iam", hmac("us-east-1", k_date)))
+let plain be hmac("aws4_request", hmac("iam", hmac("us-east-1", hmac("20150830", "AWS4wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"))))
+print(hex(k_signing) == hex(plain))
+print(hex(k_signing))
+"#,
+    );
+    assert_eq!(out[0], "true");
+    // Clave de firma del ejemplo de la guía de AWS SigV4 (20150830 / us-east-1 / iam).
+    assert_eq!(out[1], "0xc4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9");
+}
+
+/// HB4: lo que sale por un borde de texto nunca es una forma impresa.
+#[test]
+fn bearer_headers_and_query_refuse_printed_forms() {
+    for (src, needle) in [
+        ("bearer(nothing)", "bearer: the token is nothing"),
+        ("bearer(bytes(\"t\"))", "bearer: the token must be text or a secret, got bytes"),
+        ("bearer(123)", "bearer: the token must be text or a secret, got number"),
+        ("bearer(as_secret(bytes(\"ffff\", \"hex\")))", "holds bytes that are not UTF-8"),
+        ("require net(\"127.0.0.1\")\nfetch(\"http://127.0.0.1:9/\", {\"headers\": {\"X-Key\": nothing}})", "fetch: header \"X-Key\" is nothing"),
+        ("require net(\"127.0.0.1\")\nhttp_get(\"http://127.0.0.1:9/\", {\"X-Raw\": bytes(\"a\")})", "http_get: header \"X-Raw\" must be text, a number or a secret, got bytes"),
+        ("require net(\"127.0.0.1\")\nhttp_get(\"http://127.0.0.1:9/\", nothing, {\"token\": as_secret(\"s\")})", "query parameter \"token\" is secret("),
+        ("require net(\"127.0.0.1\")\nhttp_post(\"http://127.0.0.1:9/\", {\"client_secret\": as_secret(\"s\")})", "http_post: the body contains secret(sealed)"),
+        ("require net(\"127.0.0.1\")\nfetch(\"http://127.0.0.1:9/\", {\"method\": \"POST\", \"body\": [1, {\"k\": as_secret(\"s\")}]})", "fetch: the body contains secret(sealed)"),
+    ] {
+        let r = run(&format!("{}\n", src));
+        assert!(!r.success && r.errors.join(" ").contains(needle), "{}: {:?}", src, r.errors);
+    }
+    let out = lines("print(text(bearer(\"abc\")))\nprint(text(bearer(as_secret(\"abc\"))))\n");
+    assert_eq!(out, vec!["secret(bearer)", "secret(sealed)"], "sigue redactado al imprimir");
+}
+
 #[test]
 fn bits_from_a_program() {
     let out = lines(

@@ -143,8 +143,8 @@ fn fetch_opts(args: &[SynValue]) -> Result<FetchOpts, Control> {
         // Forma posicional (corta): fetch(url, method?, headers?, body?, timeout?).
         return Ok(FetchOpts {
             method: args.get(1).map(raw_str).unwrap_or_else(|| "GET".to_string()),
-            headers: header_pairs(args.get(2)),
-            body: body_arg(args.get(3)),
+            headers: header_pairs(args.get(2), "fetch")?,
+            body: body_arg(args.get(3), "fetch")?,
             timeout: timeout_arg(args.get(4)),
             tls: None,
         });
@@ -169,8 +169,8 @@ fn fetch_opts(args: &[SynValue]) -> Result<FetchOpts, Control> {
         }
         match k.as_str() {
             "method" => out.method = raw_str(v),
-            "headers" => out.headers = header_pairs(Some(v)),
-            "body" => out.body = body_arg(Some(v)),
+            "headers" => out.headers = header_pairs(Some(v), "fetch")?,
+            "body" => out.body = body_arg(Some(v), "fetch")?,
             "timeout" => out.timeout = timeout_arg(Some(v)),
             "tls_pin" | "attested" => {
                 if out.tls.is_some() {
@@ -228,32 +228,45 @@ pub fn raw_str(v: &SynValue) -> String {
     }
 }
 
-pub fn map_pairs(v: Option<&SynValue>) -> Option<Vec<(String, String)>> {
+/// Query params → pares. HB4 (v0.6.44): texto, número o bool; un `secret` es ERROR (iría en la URL,
+/// que termina en logs y proxies: va en un header) — antes salía la cadena `secret(NAME)` como si
+/// fuera el valor; `nothing`, bytes, listas y mapas también son error (antes, su forma impresa).
+pub fn map_pairs(v: Option<&SynValue>, who: &str) -> Result<Option<Vec<(String, String)>>, Control> {
     match v {
-        Some(SynValue::Map(m)) => Some(
-            m.borrow()
-                .iter()
-                .map(|(k, val)| (k.to_string(), val.to_string()))
-                .collect(),
-        ),
-        _ => None,
+        Some(SynValue::Map(m)) => {
+            let mut out = Vec::new();
+            for (k, val) in m.borrow().iter() {
+                if let SynValue::Secret(s) = val {
+                    return Err(perr(format!(
+                        "{}: query parameter {:?} is secret({}); a secret cannot go into the URL (it ends up in logs) — send it in a header",
+                        who,
+                        k.to_string(),
+                        s.name()
+                    )));
+                }
+                out.push((k.to_string(), crate::secrets::edge_text(val, who, &format!("query parameter {:?}", k.to_string()))?));
+            }
+            Ok(Some(out))
+        }
+        _ => Ok(None),
     }
 }
 
 /// Mapa de headers → pares, MATERIALIZANDO secrets (el borde del socket es donde el
 /// secret se expone: `{"Authorization": bearer(secret("KEY"))}`).
-pub fn header_pairs(v: Option<&SynValue>) -> Option<Vec<(String, String)>> {
+///
+/// HB4 (v0.6.44): cada valor pasa por [`crate::secrets::edge_text`] — un secret sellado o de bytes
+/// no UTF-8, `nothing`, bytes, listas o mapas son error en vez de su forma impresa.
+pub fn header_pairs(v: Option<&SynValue>, who: &str) -> Result<Option<Vec<(String, String)>>, Control> {
     match v {
-        Some(SynValue::Map(m)) => Some(
-            m.borrow()
-                .iter()
-                .map(|(k, val)| match val {
-                    SynValue::Secret(s) => (k.to_string(), s.expose().to_string()),
-                    other => (k.to_string(), other.to_string()),
-                })
-                .collect(),
-        ),
-        _ => None,
+        Some(SynValue::Map(m)) => {
+            let mut out = Vec::new();
+            for (k, val) in m.borrow().iter() {
+                out.push((k.to_string(), crate::secrets::edge_text(val, who, &format!("header {:?}", k.to_string()))?));
+            }
+            Ok(Some(out))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -275,8 +288,16 @@ pub fn timeout_arg(v: Option<&SynValue>) -> u64 {
 /// una lista → JSON, con `Content-Type: application/json` si el caller no puso uno. Antes
 /// un map viajaba como su texto de display (`{name: Alice}`) y sin Content-Type: ninguna API
 /// lo aceptaba. Un `secret` sigue redactado (fail-closed: el body no es canal de secretos).
-pub fn body_arg(v: Option<&SynValue>) -> (Option<Vec<u8>>, Option<&'static str>) {
-    match v {
+pub fn body_arg(v: Option<&SynValue>, who: &str) -> Result<(Option<Vec<u8>>, Option<&'static str>), Control> {
+    // HB4 (v0.6.44): un secret en el body (directo o dentro de un map/lista) es ERROR. Antes salía
+    // su forma redactada `secret(NAME)` como si fuera el valor: el servidor recibía esa cadena.
+    if let Some(name) = v.and_then(secret_inside) {
+        return Err(perr(format!(
+            "{}: the body contains secret({}); a secret goes out only inside a header (in a body it would travel as the text \"secret({})\", not its value)",
+            who, name, name
+        )));
+    }
+    Ok(match v {
         None | Some(SynValue::Nothing) => (None, None),
         Some(SynValue::Text(s)) => (Some(s.as_bytes().to_vec()), None),
         Some(SynValue::Bytes(b)) => (Some(b.to_vec()), None),
@@ -284,6 +305,16 @@ pub fn body_arg(v: Option<&SynValue>) -> (Option<Vec<u8>>, Option<&'static str>)
             (Some(dumps_syn(v).into_bytes()), Some("application/json"))
         }
         Some(other) => (Some(raw_str(other).into_bytes()), None),
+    })
+}
+
+/// El nombre del primer `secret` dentro de un valor (recorre listas y mapas).
+fn secret_inside(v: &SynValue) -> Option<String> {
+    match v {
+        SynValue::Secret(s) => Some(s.name().to_string()),
+        SynValue::List(l) => l.borrow().to_vec().iter().find_map(secret_inside),
+        SynValue::Map(m) => m.borrow().iter().find_map(|(_, x)| secret_inside(x)),
+        _ => None,
     }
 }
 
@@ -376,9 +407,9 @@ pub fn register_http_client_builtins(
                 let method = raw_str(args.first().unwrap_or(&SynValue::Nothing));
                 let url = raw_str(args.get(1).unwrap_or(&SynValue::Nothing));
                 require_net(&caps, &url, "http()")?;
-                let query = map_pairs(args.get(3));
-                let (body, default_ct) = body_arg(args.get(4));
-                let headers = with_default_content_type(header_pairs(args.get(2)), default_ct);
+                let query = map_pairs(args.get(3), "http")?;
+                let (body, default_ct) = body_arg(args.get(4), "http")?;
+                let headers = with_default_content_type(header_pairs(args.get(2), "http")?, default_ct);
                 let r = transport(
                     &method,
                     &url,
@@ -402,8 +433,8 @@ pub fn register_http_client_builtins(
             Rc::new(move |_i, args, _loc| {
                 let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
                 require_net(&caps, &url, "http_get()")?;
-                let headers = header_pairs(args.get(1));
-                let query = map_pairs(args.get(2));
+                let headers = header_pairs(args.get(1), "http_get")?;
+                let query = map_pairs(args.get(2), "http_get")?;
                 let r = transport(
                     "GET",
                     &url,
@@ -427,8 +458,8 @@ pub fn register_http_client_builtins(
             Rc::new(move |_i, args, _loc| {
                 let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
                 require_net(&caps, &url, "http_post()")?;
-                let (body, default_ct) = body_arg(args.get(1));
-                let headers = with_default_content_type(header_pairs(args.get(2)), default_ct);
+                let (body, default_ct) = body_arg(args.get(1), "http_post")?;
+                let headers = with_default_content_type(header_pairs(args.get(2), "http_post")?, default_ct);
                 let r = transport(
                     "POST",
                     &url,
@@ -452,8 +483,8 @@ pub fn register_http_client_builtins(
             Rc::new(move |_i, args, _loc| {
                 let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
                 require_net(&caps, &url, "http_put()")?;
-                let (body, default_ct) = body_arg(args.get(1));
-                let headers = with_default_content_type(header_pairs(args.get(2)), default_ct);
+                let (body, default_ct) = body_arg(args.get(1), "http_put")?;
+                let headers = with_default_content_type(header_pairs(args.get(2), "http_put")?, default_ct);
                 let r = transport(
                     "PUT",
                     &url,
@@ -477,7 +508,7 @@ pub fn register_http_client_builtins(
             Rc::new(move |_i, args, _loc| {
                 let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
                 require_net(&caps, &url, "http_delete()")?;
-                let headers = header_pairs(args.get(1));
+                let headers = header_pairs(args.get(1), "http_delete")?;
                 let r = transport(
                     "DELETE",
                     &url,
@@ -525,9 +556,9 @@ pub fn register_http_client_builtins(
                 let method = raw_str(args.first().unwrap_or(&SynValue::Nothing));
                 let url = raw_str(args.get(1).unwrap_or(&SynValue::Nothing));
                 require_net(&caps, &url, "http_bytes()")?;
-                let query = map_pairs(args.get(3));
-                let (body, default_ct) = body_arg(args.get(4));
-                let headers = with_default_content_type(header_pairs(args.get(2)), default_ct);
+                let query = map_pairs(args.get(3), "http_bytes")?;
+                let (body, default_ct) = body_arg(args.get(4), "http_bytes")?;
+                let headers = with_default_content_type(header_pairs(args.get(2), "http_bytes")?, default_ct);
                 let r = transport(
                     &method,
                     &url,
@@ -689,17 +720,17 @@ mod v0620_tests {
     /// bytes crudos; un Content-Type del caller gana.
     #[test]
     fn body_by_type_and_default_content_type() {
-        let (b, ct) = body_arg(Some(&syn_text("hola")));
+        let (b, ct) = body_arg(Some(&syn_text("hola")), "t").ok().unwrap();
         assert_eq!(b.as_deref(), Some(&b"hola"[..]));
         assert_eq!(ct, None);
         let m = map(&[("email", syn_text("a@b.c")), ("n", syn_int(1))]);
-        let (b, ct) = body_arg(Some(&m));
+        let (b, ct) = body_arg(Some(&m), "t").ok().unwrap();
         assert_eq!(String::from_utf8(b.unwrap()).unwrap(), "{\"email\": \"a@b.c\", \"n\": 1}");
         assert_eq!(ct, Some("application/json"));
-        let (b, ct) = body_arg(Some(&syn_bytes(vec![0, 255])));
+        let (b, ct) = body_arg(Some(&syn_bytes(vec![0, 255])), "t").ok().unwrap();
         assert_eq!(b, Some(vec![0, 255]));
         assert_eq!(ct, None);
-        assert_eq!(body_arg(None), (None, None));
+        assert_eq!(body_arg(None, "t").ok().unwrap(), (None, None));
         let h = with_default_content_type(None, Some("application/json")).unwrap();
         assert_eq!(h, vec![("Content-Type".to_string(), "application/json".to_string())]);
         let mine = vec![("content-type".to_string(), "text/plain".to_string())];

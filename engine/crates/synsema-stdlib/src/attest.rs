@@ -2457,14 +2457,12 @@ mod tests {
         };
         let (a, b) = (fake("sev-snp", "tsm"), fake("nitro-tpm", "nitro-tpm"));
         let drivers: Vec<DriverFn<'_>> = vec![("tsm", &a), ("nitro-tpm", &b)];
-        let id = build_attested_identity_with("print(1)
-", "p.syn", test_config(), &drivers).unwrap();
+        let id = build_attested_identity_with("print(1)\n", "p.syn", test_config(), &drivers).unwrap();
         let notice = attested_notice(&id);
         assert!(notice.starts_with("Attested: drivers=tsm,nitro-tpm formats=sev-snp,nitro-tpm program_sha="), "{}", notice);
         assert!(notice.contains(&hex_encode(&id.program_sha)) && notice.ends_with("— GET /.well-known/attestation"), "{}", notice);
         let one: Vec<DriverFn<'_>> = vec![("tsm", &a)];
-        let id1 = build_attested_identity_with("print(1)
-", "p.syn", test_config(), &one).unwrap();
+        let id1 = build_attested_identity_with("print(1)\n", "p.syn", test_config(), &one).unwrap();
         assert!(attested_notice(&id1).starts_with("Attested: drivers=tsm formats=sev-snp program_sha="));
     }
 

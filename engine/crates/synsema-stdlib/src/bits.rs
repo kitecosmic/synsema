@@ -51,13 +51,6 @@ pub fn register_bit_builtins(interp: &Interpreter) {
     interp.register_builtin("xor_bytes", 2, Rc::new(|_i, a, _l| xor_bytes(a)));
 }
 
-//
-// Los enteros de Synsema son de precisión arbitraria, pero un operador de bits sobre un entero
-// infinito no tiene un ancho que respetar (¿cuántos unos tiene `bit_not(0)`?). Se fija el de i64,
-// complemento a dos: lo que esperan los protocolos binarios (CRC, rotaciones, máscaras). Lo que no
-// entra en 64 bits, un corrimiento fuera de 0..=63 o un `shl` que desborda es ERROR, nunca un
-// resultado truncado.
-
 fn i64_arg(args: &[SynValue], i: usize, name: &str) -> Result<i64, Control> {
     let n = num(args, i, name)?;
     let bi = n.as_bigint().ok_or_else(|| err(format!("{} works on integers, got a float", name)))?;

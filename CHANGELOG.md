@@ -8,7 +8,7 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
 
 ## v0.6.44 — UNRELEASED
 
-`hmac` with bytes, bit operations, and the full list of drivers in the `serve --attested` notice.
+`hmac` with bytes, bit operations, values that leave as text are never their printed form, and the full list of drivers in the `serve --attested` notice.
 
 **Behavior changes (read these first).**
 - **`hmac`, `verify_hmac`, `hmac_sha256` and `constant_time_eq` use the raw bytes of a `bytes`
@@ -18,8 +18,23 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   HKDF by hand). **Text gives exactly the same MAC as before**, so existing webhook signatures do
   not change. Any argument that is not text, bytes or a secret (a number, a list, `nothing`) is
   now an error naming the argument and its type, instead of being hashed as its printed form; the
-  `algo` argument must be text. `verify_hmac` also accepts the signature as the raw MAC in bytes; a
-  text signature that does not decode is still `false`.
+  `algo` argument must be text. A `nothing` key used to be hashed as the text `"nothing"`, a key
+  anyone can guess: it is an error now. `verify_hmac` also accepts the signature as the raw MAC in
+  bytes; a text signature that does not decode is still `false`, and so is a missing one (`nothing`,
+  the header did not come), so a webhook handler answers 401 and not 500.
+- **Values that leave as text are never their printed form.** A header, a query parameter or
+  `bearer(...)` takes text, a number, a bool or a secret. `nothing` (a missing env var or map key),
+  `bytes`, lists and maps are an error naming the header or parameter: before, they went out as
+  their printed form (`bearer(nothing)` sent `Authorization: Bearer None`). A secret in a query
+  parameter or in a body (directly or inside a map or list) is an error: it used to go out as the
+  text `secret(NAME)`, which the server took as the value. A sealed secret
+  (`attestation_key()`) or a secret holding bytes that are not UTF-8 is an error wherever it would
+  leave as text (headers, `bearer`, `btc_rpc` auth, a mnemonic or passphrase for the HD wallet
+  builtins), never the placeholder `secret(NAME)`.
+- **A bytes secret as a database parameter keeps its bytes** (SQLite BLOB, Postgres `bytea`, MySQL
+  bytes, Mongo binary, Redis): it used to be converted to text, and bytes that are not UTF-8
+  changed. A sealed secret as a database parameter is an error, also nested in a list or a
+  document.
 
 **New builtins.**
 - Bits on 64-bit signed integers: `bit_and(a, b)`, `bit_or(a, b)`, `bit_xor(a, b)`, `bit_not(a)`,

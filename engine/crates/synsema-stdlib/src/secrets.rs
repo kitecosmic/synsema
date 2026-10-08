@@ -272,6 +272,44 @@ fn crypto_bytes(v: &SynValue, fname: &str, what: &str) -> Result<Vec<u8>, Contro
     }
 }
 
+/// El texto de un secret que sale por un borde de TEXTO (header, query, `bearer`, auth de RPC, un
+/// parámetro de DB de texto). HB4 (v0.6.44): un secret SELLADO es error (antes salía la cadena
+/// `secret(NAME)` como si fuera el valor) y uno de bytes que no son UTF-8 también (antes llegaba
+/// con `from_utf8_lossy`, otros bytes).
+pub(crate) fn secret_text(s: &synsema_core::secret::SecretInner, who: &str, what: &str) -> Result<String, Control> {
+    let raw = s.expose_bytes_checked(who).map_err(|e| Control::Error(RuntimeError::new(e)))?;
+    String::from_utf8(raw.to_vec()).map_err(|_| {
+        Control::Error(RuntimeError::new(format!(
+            "{}: {} is secret({}), which holds bytes that are not UTF-8 text; it cannot go out as text",
+            who,
+            what,
+            s.name()
+        )))
+    })
+}
+
+/// Un valor que sale por un borde de texto (header, `bearer`, auth de RPC): texto tal cual,
+/// número o bool en su forma de siempre, `secret` por [`secret_text`]. `nothing`, bytes, listas y
+/// mapas son ERROR (HB4): antes salían como su forma impresa (`None`, `bytes(…)`, `[…]`) sin aviso
+/// — `bearer(nothing)` mandaba `Authorization: Bearer None`.
+pub(crate) fn edge_text(v: &SynValue, who: &str, what: &str) -> Result<String, Control> {
+    match v {
+        SynValue::Text(s) => Ok(s.to_string()),
+        SynValue::Number(_) | SynValue::Bool(_) => Ok(v.to_string()),
+        SynValue::Secret(s) => secret_text(s, who, what),
+        SynValue::Nothing => Err(Control::Error(RuntimeError::new(format!(
+            "{}: {} is nothing; pass a value (a missing env var or map key?), or leave it out",
+            who, what
+        )))),
+        other => Err(Control::Error(RuntimeError::new(format!(
+            "{}: {} must be text, a number or a secret, got {}",
+            who,
+            what,
+            other.type_name()
+        )))),
+    }
+}
+
 /// Resuelve una variable: environ del proceso > `.env` > default (§2). `None` si
 /// ninguna fuente la define.
 fn resolve(env: &EnvStore, name: &str, default: Option<&SynValue>) -> Option<String> {
@@ -826,9 +864,23 @@ pub fn register_secret_builtins(
         "bearer",
         1,
         Rc::new(move |_i, args, _loc| {
+            // HB4 (v0.6.44): texto o secret. `nothing` (un env que falta), bytes, números… son
+            // error: antes salía `Bearer None` / `Bearer bytes(…)` sin aviso. Un secret sellado o
+            // de bytes que no son UTF-8 también es error, no `Bearer secret(NAME)`.
             let (name, plaintext) = match arg(args, 0)? {
-                SynValue::Secret(s) => (s.name().to_string(), format!("Bearer {}", s.expose())),
-                other => ("bearer".to_string(), format!("Bearer {}", raw_str(other))),
+                SynValue::Secret(s) => (s.name().to_string(), format!("Bearer {}", secret_text(s, "bearer", "the token")?)),
+                SynValue::Text(t) => ("bearer".to_string(), format!("Bearer {}", t)),
+                SynValue::Nothing => {
+                    return Err(Control::Error(RuntimeError::new(
+                        "bearer: the token is nothing (a missing env var or map key?); pass text or a secret",
+                    )))
+                }
+                other => {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "bearer: the token must be text or a secret, got {}",
+                        other.type_name()
+                    ))))
+                }
             };
             Ok(syn_secret(name, plaintext))
         }),
@@ -874,9 +926,11 @@ pub fn register_secret_builtins(
             let algo = parse_algo(args.get(3), "verify_hmac")?;
             let mac = hmac_compute(algo, &key, &data);
             // La firma: texto en hex o base64 (lo que manda un webhook, con o sin `sha256=`), o
-            // los bytes crudos del MAC (lo que devuelve `hmac`). Una firma de texto que no decodifica
-            // es `false` (viene de afuera); un tipo que no es firma es error.
+            // los bytes crudos del MAC (lo que devuelve `hmac`). Viene de afuera: una firma de texto
+            // que no decodifica, o AUSENTE (`nothing`: el header no vino), es `false`, no un error
+            // (que haría 500 en vez de 400/401). Otro tipo es un error del programa.
             let provided = match arg(args, 1)? {
+                SynValue::Nothing => return Ok(syn_bool(false)),
                 SynValue::Bytes(b) => b.to_vec(),
                 SynValue::Text(t) => match decode_signature(t, algo.mac_len()) {
                     Some(b) => b,
@@ -1008,6 +1062,24 @@ mod tests {
         assert!(parse_algo(Some(&t("sha1")), "hmac").is_err()); // débil, rechazado a propósito (§4)
         assert!(parse_algo(Some(&t("md5")), "hmac").is_err());
         assert!(parse_algo(Some(&syn_bytes(b"sha256".to_vec())), "hmac").is_err(), "otro tipo: error, no su forma impresa");
+    }
+
+    /// HB4: lo que sale por un borde de texto nunca es una forma impresa ni un sellado disfrazado.
+    #[test]
+    fn edge_text_refuses_what_would_go_out_as_a_printed_form() {
+        let msg = |r: Result<String, Control>| match r {
+            Err(Control::Error(e)) => e.into_message(),
+            _ => panic!("expected an error"),
+        };
+        assert_eq!(edge_text(&syn_text("abc"), "t", "x").ok().unwrap(), "abc");
+        assert_eq!(edge_text(&synsema_core::types::syn_int(42), "t", "x").ok().unwrap(), "42");
+        assert_eq!(edge_text(&syn_secret("K", "s3cret".to_string()), "t", "x").ok().unwrap(), "s3cret");
+        assert!(msg(edge_text(&SynValue::Nothing, "fetch", "header \"X\"")).contains("fetch: header \"X\" is nothing"));
+        assert!(msg(edge_text(&syn_bytes(vec![1u8]), "t", "x")).contains("must be text, a number or a secret, got bytes"));
+        assert!(msg(edge_text(&syn_secret_bytes("B", vec![0xff, 0xfe]), "t", "x")).contains("secret(B), which holds bytes that are not UTF-8"));
+        assert_eq!(edge_text(&syn_secret_bytes("U", b"utf8 ok".to_vec()), "t", "x").ok().unwrap(), "utf8 ok");
+        let sealed = SynValue::Secret(synsema_core::types::Obj::new(synsema_core::secret::SecretInner::new_bytes_sealed("attestation_key", vec![7u8; 32])));
+        assert!(msg(edge_text(&sealed, "bearer", "the token")).contains("bearer: secret(attestation_key) is sealed"));
     }
 
     #[test]
