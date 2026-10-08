@@ -29,6 +29,7 @@ touching a server; `refs` before renaming or changing a task; `check` after ever
 | `check [path]` | what `synsema check` does (parse + every `use` + `render("literal")` templates), over one or all files, as JSON: `errors` block (exit 1), `warnings` = the `missing` capabilities the runtime would deny (exit 0) |
 | `search <pattern> [path]` | case-insensitive literal (or `--regex`) over `.syn .fsyn .html .css .js .ts .md .json .toml .txt` (`--kinds syn,html` restricts); skips `.git`, `node_modules`, `target`, `dist`, `build`, hidden dirs, binaries, files > 2 MiB; each match carries `in` (the enclosing Synsema symbol) — `--limit N` (default 200, `truncated: true` when hit) |
 | `deps [path]` | task → tasks-it-calls graph per file (builtins excluded) + `use` imports |
+| `sha <file>` (v0.6.43+) | the `program_sha` that `serve --attested` / `run --attest` (and `receipt()`) bind for that entry file: `sha256(source ‖ 0x00 ‖ sha256(module_1) ‖ … ‖ sha256(module_n))`, each `use`d module once, depth first in the order the `use` lines appear. Human output is the hex alone (for scripts); `--json` → `{program_sha, modules: [{path, sha256}]}`. See attestation.md |
 
 Exit codes: `0` ok · `1` `check` found errors · `2` usage / unknown tool / path not found.
 `--root <dir>` changes the root (default: cwd). Output paths are root-relative with `/`.
@@ -53,7 +54,7 @@ synsema code search "proxy to" --kinds syn
 
 Or: `claude mcp add synsema-code -- synsema code --mcp`. The server speaks JSON-RPC 2.0 over
 stdio (one JSON line per message; stdout is protocol only, diagnostics go to stderr), advertises
-the eight tools with typed `inputSchema`, returns each result as `content[0].text` (the same JSON
+the nine tools with typed `inputSchema`, returns each result as `content[0].text` (the same JSON
 as `--json`), and flags tool errors with `isError: true` (bad arguments, missing path). It keeps
 no index on disk: parsed files are cached in-process by mtime. Measured on a 58-file / 15k-line
 project with the release binary, cold process: `outline` 0.3 s, `routes` 0.2 s, `refs`/`search`/`deps`

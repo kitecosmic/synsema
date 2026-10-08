@@ -1449,9 +1449,20 @@ impl ServeRuntime {
         // barras repetidas; `/.well-known/attestation/` es la misma URL reservada).
         if method == "GET" && normalize_route_path(path) == ATTESTATION_PATH {
             if let Some(json) = &self.attestation_json {
+                // T10: la identidad VIGENTE (la renovación reemplaza los documentos con la misma
+                // clave); la del arranque sólo si no hay identidad instalada (no pasa bajo serve).
+                let _ = json;
+                let (status, json) = match crate::attest::attested_identity() {
+                    // Vencida (la renovación no llegó): no se sirve, nunca.
+                    Some(id) if id.expired_at(synsema_core::clock::now_secs()) => {
+                        (503, "{\"error\": \"the attestation documents expired and were not renewed\"}".to_string())
+                    }
+                    Some(id) => (200, id.json_text()),
+                    None => (503, "{\"error\": \"the attested identity is not available\"}".to_string()),
+                };
                 return Dispatched::Response {
-                    status: 200,
-                    body: ResponseBody::Raw(RawResponse::text(json.clone(), "application/json; charset=utf-8", 200)),
+                    status,
+                    body: ResponseBody::Raw(RawResponse::text(json, "application/json; charset=utf-8", status)),
                     headers: vec![("Cache-Control".to_string(), "no-store".to_string())],
                 };
             }
@@ -2829,6 +2840,11 @@ fn run_async(rt: Arc<ServeRuntime>, listener: TcpListener, tls: TlsMode) {
         }
         eprintln!("[serve] stopped");
         if LIVE_SERVERS.fetch_sub(1, AtomicOrd::SeqCst) == 1 {
+            // T10: un `serve --attested` que se cerró porque sus documentos vencieron sin
+            // renovación termina con error, no como un apagado pedido.
+            if crate::attest::renewal_failure().is_some() {
+                std::process::exit(1);
+            }
             std::process::exit(0);
         }
     });

@@ -30,11 +30,19 @@ pub mod cbor;
 // `attest` — drivers de plataforma (nitro/tsm/dstack detrás de `cfg`, mock
 // En todo SO) + la identidad de `serve --attested`. Compila al perfil puro.
 pub mod attest;
+// Driver `nitro-tpm` de `attest`: EC2 instance attestation hablando con el TPM (sin binarios
+// externos). El dispositivo es Linux-only; el protocolo es puro y se prueba con un TPM simulado.
+pub mod attest_nitrotpm;
 // `groth16_verify` sobre BN254 (JSON de snarkjs tal cual). Puro, sin deps del SO.
 pub mod zk;
 // `attestation_verify` (nitro/mock con raíz pineada) y ruido determinista
 // (laplace_noise/gaussian_noise). Puros, compilan al perfil wasm.
 pub mod attestation;
+// `attestation_verify` con `format: "sev-snp"`: reporte AMD + cadena VEK ← ASK/ASVK ← ARK con las
+// raíces de AMD embebidas y pineadas. Puro, compila al perfil wasm.
+pub mod attestation_snp;
+// T9: `fetch`/`ws_connect` con `attested` — verificar el identity contra la clave del handshake.
+pub mod attested_client;
 pub mod privacy;
 // V0.6.20 — archivos comprimidos: SÓLO native (extraer toca disco; en puro son stubs).
 #[cfg(feature = "native")]

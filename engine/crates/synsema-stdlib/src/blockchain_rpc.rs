@@ -2619,6 +2619,7 @@ mod tests {
             body_bytes: body.as_bytes().to_vec(),
             headers: Vec::new(),
             error: error.map(str::to_string),
+            attested: None,
         };
         // Transporte caído → transitorio (un blip no dice nada sobre la cadena).
         assert!(matches!(

@@ -4,9 +4,12 @@
 //! `attest.rs` (producir): un solo codec, un solo `Sig_structure`.
 //!
 //! Alcance deliberado: enteros (mayores 0/1), bytes (2), texto (3), arrays (4), mapas (5), tags
-//! (6), `false`/`true`/`null`/`undefined` y floats (7). Sólo longitudes DEFINIDAS: NSM, COSE y
-//! los quotes de plataforma usan codificación determinista; un `0x?f` (indefinido) se rechaza
-//! con error claro en vez de adivinar. Profundidad acotada (64) y toda longitud se valida
+//! (6), `false`/`true`/`null`/`undefined` y floats (7). [`decode`] acepta sólo longitudes
+//! DEFINIDAS: NSM, COSE y los quotes de plataforma usan codificación determinista; un `0x?f`
+//! (indefinido) se rechaza con error claro en vez de adivinar. [`decode_allow_indefinite`] además
+//! acepta bytes/texto/arrays/mapas de longitud indefinida (RFC 8949 §3.2) y dice si los vio: el
+//! payload de EC2 instance attestation (NitroTPM) es un mapa indefinido (`0xbf … 0xff`). No
+//! relaja nada más (duplicados y claves desconocidas los decide quien lee el mapa). Profundidad acotada (64) y toda longitud se valida
 //! contra lo que queda del buffer antes de reservar memoria (un documento hostil no puede pedir
 //! 4 GB). Sin dependencias: es un módulo de ~300 líneas, puro, compila a wasm.
 
@@ -210,14 +213,39 @@ pub fn decode(bytes: &[u8]) -> Result<Cbor, CborError> {
 
 /// Decodifica UN ítem al inicio del buffer; devuelve (ítem, bytes consumidos).
 pub fn decode_prefix(bytes: &[u8]) -> Result<(Cbor, usize), CborError> {
-    let mut d = Decoder { buf: bytes, pos: 0 };
+    let mut d = Decoder { buf: bytes, pos: 0, allow_indefinite: false, saw_indefinite: false };
     let item = d.item(0)?;
     Ok((item, d.pos))
 }
 
+/// Como [`decode`], pero acepta además ítems de longitud INDEFINIDA. Devuelve `(ítem, vio_indefinido)`
+/// para que quien llama decida si esa codificación es aceptable en su formato (p. ej. `nitro`
+/// la rechaza y `nitro-tpm` la permite: el hipervisor la usa, pero no es obligatoria).
+pub fn decode_allow_indefinite(bytes: &[u8]) -> Result<(Cbor, bool), CborError> {
+    let mut d = Decoder { buf: bytes, pos: 0, allow_indefinite: true, saw_indefinite: false };
+    let item = d.item(0)?;
+    if d.pos != bytes.len() {
+        return Err(CborError { offset: d.pos, message: format!("{} trailing byte(s) after the item", bytes.len() - d.pos) });
+    }
+    Ok((item, d.saw_indefinite))
+}
+
+/// Como [`decode_prefix`] pero aceptando longitud indefinida (la respuesta NSM que el hipervisor
+/// deja en el buffer NV de NitroTPM ocupa el principio de un buffer de tamaño fijo).
+pub fn decode_prefix_allow_indefinite(bytes: &[u8]) -> Result<(Cbor, usize), CborError> {
+    let mut d = Decoder { buf: bytes, pos: 0, allow_indefinite: true, saw_indefinite: false };
+    let item = d.item(0)?;
+    Ok((item, d.pos))
+}
+
+/// Byte de corte (`break`) que cierra un ítem de longitud indefinida.
+const BREAK: u8 = 0xff;
+
 struct Decoder<'a> {
     buf: &'a [u8],
     pos: usize,
+    allow_indefinite: bool,
+    saw_indefinite: bool,
 }
 
 impl<'a> Decoder<'a> {
@@ -267,12 +295,76 @@ impl<'a> Decoder<'a> {
         }
     }
 
+    /// ¿El próximo byte es el `break`? (sin consumirlo; fin de buffer = error de truncado)
+    fn at_break(&self) -> Result<bool, CborError> {
+        match self.buf.get(self.pos) {
+            Some(b) => Ok(*b == BREAK),
+            None => Err(self.err("unexpected end of input inside an indefinite-length item")),
+        }
+    }
+
+    /// Bytes o texto de longitud indefinida: trozos DEFINIDOS del mismo tipo mayor hasta el
+    /// `break` (RFC 8949 §3.2.3: un trozo indefinido dentro de otro es inválido).
+    fn indefinite_string(&mut self, major: u8) -> Result<Vec<u8>, CborError> {
+        let what = if major == 2 { "byte string" } else { "text string" };
+        let mut out = Vec::new();
+        while !self.at_break()? {
+            let initial = self.byte()?;
+            if initial >> 5 != major {
+                return Err(self.err(format!("indefinite-length {} has a chunk of another major type", what)));
+            }
+            if initial & 0x1f == 31 {
+                return Err(self.err(format!("indefinite-length {} has a nested indefinite chunk", what)));
+            }
+            let n = self.len(initial & 0x1f, what)?;
+            let chunk = self.take(n)?;
+            // RFC 8949 §3.2.3: cada trozo de un texto indefinido es UTF-8 válido por sí solo.
+            if major == 3 && std::str::from_utf8(chunk).is_err() {
+                return Err(self.err("text string chunk is not UTF-8"));
+            }
+            out.extend_from_slice(chunk);
+        }
+        self.pos += 1;
+        Ok(out)
+    }
+
     fn item(&mut self, depth: usize) -> Result<Cbor, CborError> {
         if depth > MAX_DEPTH {
             return Err(self.err(format!("nesting deeper than {}", MAX_DEPTH)));
         }
         let initial = self.byte()?;
         let (major, ai) = (initial >> 5, initial & 0x1f);
+        if ai == 31 && (2..=5).contains(&major) && self.allow_indefinite {
+            self.saw_indefinite = true;
+            return match major {
+                2 => Ok(Cbor::Bytes(self.indefinite_string(2)?)),
+                3 => {
+                    let raw = self.indefinite_string(3)?;
+                    String::from_utf8(raw).map(Cbor::Text).map_err(|_| self.err("text string is not UTF-8"))
+                }
+                4 => {
+                    let mut items = Vec::new();
+                    while !self.at_break()? {
+                        items.push(self.item(depth + 1)?);
+                    }
+                    self.pos += 1;
+                    Ok(Cbor::Array(items))
+                }
+                _ => {
+                    let mut pairs = Vec::new();
+                    while !self.at_break()? {
+                        let k = self.item(depth + 1)?;
+                        if self.at_break()? {
+                            return Err(self.err("indefinite-length map has a key without a value"));
+                        }
+                        let v = self.item(depth + 1)?;
+                        pairs.push((k, v));
+                    }
+                    self.pos += 1;
+                    Ok(Cbor::Map(pairs))
+                }
+            };
+        }
         match major {
             0 => {
                 let n = self.arg(ai)?.ok_or_else(|| self.err("indefinite integer"))?;
@@ -551,6 +643,46 @@ mod tests {
         assert!(decode(&deep).unwrap_err().message.contains("nesting"));
         // Vacío.
         assert!(decode(&[]).is_err());
+    }
+
+    #[test]
+    fn indefinite_lengths_only_when_asked_rfc8949_appendix_a() {
+        let ok = |h: &str| {
+            let (item, seen) = decode_allow_indefinite(&hex(h)).unwrap();
+            assert!(seen, "{} usa longitud indefinida", h);
+            // La forma estricta los sigue rechazando.
+            assert!(decode(&hex(h)).unwrap_err().message.contains("indefinite"), "{}", h);
+            item
+        };
+        assert_eq!(ok("5f42010243030405ff"), Cbor::Bytes(vec![1, 2, 3, 4, 5]));
+        assert_eq!(ok("7f657374726561646d696e67ff"), Cbor::text("streaming"));
+        assert_eq!(ok("9fff"), Cbor::Array(vec![]));
+        assert_eq!(
+            ok("9f018202039f0405ffff"),
+            Cbor::Array(vec![Cbor::Int(1), Cbor::Array(vec![Cbor::Int(2), Cbor::Int(3)]), Cbor::Array(vec![Cbor::Int(4), Cbor::Int(5)])])
+        );
+        assert_eq!(ok("bf61610161629f0203ffff"), Cbor::map_text(vec![("a", Cbor::Int(1)), ("b", Cbor::Array(vec![Cbor::Int(2), Cbor::Int(3)]))]));
+        assert_eq!(ok("bf6346756ef563416d7421ff"), Cbor::map_text(vec![("Fun", Cbor::Bool(true)), ("Amt", Cbor::Int(-2))]));
+        // Definido: lo mismo que `decode`, sin la marca.
+        assert_eq!(decode_allow_indefinite(&hex("a201020304")).unwrap(), (decode(&hex("a201020304")).unwrap(), false));
+        // Rechazos: trozo indefinido anidado, trozo de otro tipo, truncado, clave sin valor,
+        // break suelto, trailing.
+        let bad = |h: &str, needle: &str| {
+            let e = decode_allow_indefinite(&hex(h)).unwrap_err();
+            assert!(e.message.contains(needle), "{}: {}", h, e);
+        };
+        bad("5f5f4101ffff", "nested indefinite");
+        bad("5f6161ff", "another major type");
+        bad("bf6161", "end of input");
+        bad("bf616101", "end of input");
+        bad("bf6161ff", "key without a value");
+        bad("ff", "unexpected break");
+        bad("9fff00", "trailing");
+        bad("7f62ffffff", "not UTF-8");
+        // Cada trozo es UTF-8 por sí solo: "é" (c3 a9) partido en dos trozos es inválido aunque la
+        // concatenación sea válida (RFC 8949 §3.2.3).
+        bad("7f61c361a9ff", "chunk is not UTF-8");
+        assert_eq!(ok("7f62c3a9ff"), Cbor::text("é"));
     }
 
     #[test]

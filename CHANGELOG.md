@@ -6,6 +6,95 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.43 — 2026-10-08
+
+Confidential VMs: AMD SEV-SNP reports verify, NitroTPM documents are produced and verified, one
+attested server can publish both, and a Synsema client can pin the attested key. All of it is
+hardware formats and pure primitives.
+
+**Behavior changes (read these first).**
+- **`program_sha` counts each module once.** The static check loads a `use`d module more than
+  once, and up to v0.6.42 its hash went into `program_sha` once per load. Now each module enters
+  once (by resolved path), depth first in the order the `use` lines appear in the source, a `use`
+  inside a task that never runs included:
+  `sha256(source ‖ 0x00 ‖ sha256(module_1) ‖ … ‖ sha256(module_n))`. A program with `use` gets a different `program_sha` than under v0.6.42; one
+  without modules gets the same. `synsema code sha <file>` prints it.
+- **`run`, `test` and `serve` no longer hash the program at startup.** The `program_sha` of
+  `receipt()` is computed the first time a receipt asks for it, from the same bytes the module
+  loader read to run (nothing is read or parsed again). Measured on `synsema run` (median of 40):
+  a program with eight 1100-line modules started in 146.6 ms and now in 65.1 ms; one with eight
+  small modules 22.9 → 18.9 ms; a program without modules is unchanged (~17 ms).
+- **`config` in `/.well-known/attestation` and in `run --attest` gains `drivers`** (the attestation
+  drivers, in order), so `config_sha` changes. Recompute it from the published `config`, as before.
+
+**`attestation_verify`.**
+- `format: "sev-snp"`: the 1184-byte report (`attest()["document"]`, configfs-tsm's `outblob`),
+  with the VCEK or VLEK from `opts.aux` (the host's certificate table, `attest()["aux"]`) or
+  `opts.vek` (DER or PEM). The chain uses AMD's ARK/ASK/ASVK for Milan, Genoa and Turin embedded
+  in the engine and pinned by SHA-256 (the ones in `aux` are ignored); RSASSA-PSS with SHA-384 and
+  a 48-byte salt and nothing else; validity of every certificate against `opts.now`; the report's
+  ECDSA P-384 signature; the VEK's TCB against `REPORTED_TCB`; and `POLICY.DEBUG` set is an error
+  with no option. Returns `measurements: {measurement, host_data}`, `tcb` and `policy`;
+  `timestamp` is `nothing` (the report carries no time). `opts.root` is rejected.
+- `format: "nitro-tpm"`: EC2 instance attestation (NitroTPM in a VM) under the same pinned AWS
+  root as `nitro`, with `nitrotpm_pcrs` (`pcr0`..`pcr23`). It is a different format on purpose: a
+  VM's document never verifies as `nitro` and an enclave's never as `nitro-tpm`.
+- `opts.expect.report_data` (bytes or hex) for every format. In `sev-snp` a shorter value is
+  padded with zeros to 64 bytes, so `sha256(spki ‖ program_sha ‖ config_sha)` is enough; in
+  `nitro`/`nitro-tpm`/`mock` it must match exactly. A mismatch says how many bytes match, not the
+  values.
+
+**Attestation drivers.**
+- `nitro-tpm`: produces the EC2 instance attestation document by talking to the TPM directly (no
+  external tool). One request at a time per process; with `/dev/tpm0` (opened exclusively, waited
+  for up to 10 s) it first releases what a killed process left in the TPM (loaded objects and
+  sessions, and message buffers of exactly its own shape). Auto-detected only when the TPM answers AWS's vendor command; forced with
+  `SYNSEMA_ATTEST=nitro-tpm`.
+- `SYNSEMA_ATTEST` takes a list, e.g. `tsm,nitro-tpm`. `serve --attested` and `run --attest` ask
+  every driver for a document binding the same `report_data`, and do not start if one fails.
+  Auto-detection uses both when SEV-SNP and NitroTPM are present (`tsm` first). The identity's
+  top-level fields stay those of the first driver and a new `documents` list carries all of
+  them; `run --attest` keeps `attestation` and adds `attestations`. `attest()` and `attest_key()`
+  use the first driver.
+
+**Clients.**
+- `fetch(url, {method, headers, body, timeout, tls_pin, attested})`: the options map is the main form of
+  `fetch` (the positional `fetch(url, method?, headers?, body?, timeout?)` stays as the short
+  form). With a map, no argument may follow it; an unknown key is an error that lists the valid
+  ones.
+- `tls_pin` in `fetch` and in `ws_connect`'s options: the server's SubjectPublicKeyInfo (hex, bytes
+  or a `PUBLIC KEY` PEM — the `public_key_hex` of `/.well-known/attestation`). It replaces the
+  check against the system roots and the host name with byte equality of the presented key; the
+  handshake signature is still verified with it. It needs `https://`/`wss://` and `require net`
+  as always. Without it nothing changes. `tls_pin: nothing` (and `attested: nothing`) is an error:
+  a missing value never turns the check off.
+
+- `attested` in `fetch`'s map and in `ws_connect`'s options: `{program_sha, formats, measurements?,
+  now?}` connects to a `serve --attested` without knowing its key. On one TLS connection the
+  handshake records the server's key without trusting any certificate authority, the identity is
+  read over that same connection, its key must be the handshake's, `config_sha` and `program_sha`
+  must match, every document must verify with its binding and every requested format must be there;
+  only then is your request sent. If anything fails it is never sent and `error of r` says why. The
+  answer carries `attested`. Not together with `tls_pin`. `attested.measurements` must name every
+  format but `mock` (a non-empty map, or `"any"` to accept any measurement of that format on
+  purpose): without expected measurements a platform document proves only that some machine of
+  that platform answered, and `program_sha` alone is declared by the binary being checked. In
+  `ws_connect`, `ws_stats(c)` gains `attested`, and an explicit `now` advances on reconnects. It fails against a server with an
+  operator certificate (the channel's key is not the attested one). In the WebAssembly embedding
+  (`synsema-wasm-web`), `tls_pin` and `attested` fail closed: the host's transport cannot do them.
+
+**`serve --attested` renews its documents.** A Nitro/NitroTPM leaf lives about three hours: the
+server asks every driver for fresh documents (same key, same binding) at half the life of the
+shortest one, at least once a day, and swaps them all at once. A SEV-SNP report expires with the
+VLEK/VCEK in its `aux` (about a year on AWS). If the current documents expire without a renewal,
+the server shuts down with an error instead of serving an expired document, and
+`/.well-known/attestation` answers `503` rather than an expired one.
+
+**Tooling.**
+- `synsema code sha <file>` (and the `sha` tool of `synsema code --mcp`): the `program_sha` that
+  `serve --attested` and `run --attest` would bind; it runs the static check first, and `--json`
+  adds each module with its sha256 and its path relative to the program's folder, written with `/`.
+
 ## v0.6.42 — 2026-10-04
 
 Tunnels, programs that speak over stdio, and certificates that do not run into the CA's limits.

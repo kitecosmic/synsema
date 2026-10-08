@@ -65,8 +65,14 @@ fn run_attest_prints_output_then_one_json_line_bound_to_program_input_output() {
     assert_eq!(j["config"]["ceiling"], serde_json::json!(["stdout"]));
     assert_eq!(j["config"]["tls_key"], "none");
     assert_eq!(j["config"]["profile"], "pure");
-    let cfg = AttestConfig { labels: false, ceiling: Some(synsema_capabilities::model::build_ceiling_deterministic()), tls_key: "none", profile: "pure" };
+    assert_eq!(j["config"]["drivers"], serde_json::json!(["mock"]), "T4: config nombra los drivers");
+    let cfg = AttestConfig { labels: false, ceiling: Some(synsema_capabilities::model::build_ceiling_deterministic()), tls_key: "none", profile: "pure", drivers: vec!["mock"] };
     assert_eq!(j["config_sha"], hex(&cfg.sha()));
+    // T4: `attestations` trae todos los documentos (acá uno); `attestation` queda como estaba.
+    let all = j["attestations"].as_array().expect("attestations");
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0]["document"], j["attestation"]["document"]);
+    assert_eq!(all[0]["driver"], "mock");
     // El documento verifica contra la raíz mock (la misma semilla por defecto) y ata
     // sha256(program_sha ‖ input_sha ‖ output_sha ‖ config_sha).
     let doc = synsema_core::bytesutil::b64_decode(j["attestation"]["document"].as_str().unwrap()).unwrap();
@@ -110,6 +116,28 @@ fn run_attest_format_json_embeds_the_attestation_in_the_report() {
     assert_eq!(j["output_sha"], hex(&sha256(b"42")));
     assert_eq!(j["attestation"]["format"], "mock");
     assert!(j["steps"].as_u64().unwrap() > 0);
+}
+
+/// T4: una lista de drivers dudosa no arranca nada y el error nombra el driver.
+#[test]
+fn run_attest_with_a_bad_driver_list_fails_before_running() {
+    let dir = project("list");
+    std::fs::write(dir.join("p.syn"), "print(1)\n").unwrap();
+    for (v, needle) in [
+        ("tsm,tsm", "driver 'tsm' appears twice in SYNSEMA_ATTEST"),
+        ("tsm,banana", "unknown driver 'banana'"),
+        ("mock,nitro", "mock driver cannot be combined"),
+    ] {
+        let (code, out, err) = synsema(&dir, &["run", "--attest", "p.syn"], &[("SYNSEMA_ATTEST", Some(v))]);
+        assert_ne!(code, 0, "{}", v);
+        assert!(err.contains(needle), "{}: {}", v, err);
+        assert!(out.trim().is_empty(), "{}: el programa no corre: {:?}", v, out);
+    }
+    // Uno de los dos no está: no corre (sin modo degradado).
+    let (code, out, err) = synsema(&dir, &["run", "--attest", "p.syn"], &[("SYNSEMA_ATTEST", Some("nitro-tpm,nitro"))]);
+    assert_ne!(code, 0);
+    assert!(err.contains("run --attest"), "{}", err);
+    assert!(out.trim().is_empty(), "{:?}", out);
 }
 
 #[test]

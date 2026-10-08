@@ -1202,6 +1202,49 @@ pub fn program_closure_with(
     Ok(out)
 }
 
+/// Cómo obtener un módulo para [`module_walk`]: `(ruta resuelta, ruta cruda del use)` →
+/// `(fuente, rutas de sus use)`.
+pub type SourceLoader<'a> = &'a dyn Fn(&str, &str) -> Result<(std::sync::Arc<str>, Vec<String>), String>;
+
+/// El recorrido CANÓNICO de los módulos de un programa, el que define `program_sha`: en
+/// profundidad, en el orden en que aparecen los `use` (el orden en que el runtime los carga al
+/// ejecutarlos), cada ruta resuelta una sola vez. Mismas reglas de resolución que el chequeo
+/// estático (relativo al importador, contenido en la raíz del proyecto); un ciclo es error.
+/// `uses` son los `use` del archivo de entrada `file_path`.
+pub fn module_walk(uses: Vec<String>, file_path: &str, load: SourceLoader<'_>) -> Result<Vec<(String, std::sync::Arc<str>)>, String> {
+    fn go(
+        uses: Vec<String>,
+        importer: &str,
+        root: Option<&Path>,
+        stack: &mut Vec<String>,
+        out: &mut Vec<(String, std::sync::Arc<str>)>,
+        load: SourceLoader<'_>,
+    ) -> Result<(), String> {
+        let base_dir = Path::new(importer).parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        for raw in uses {
+            let resolved = resolve_module_path(&raw, &base_dir, root).map_err(|e| format!("{}: {}", importer, e))?;
+            if stack.contains(&resolved) {
+                return Err(format!("circular import: module '{}' is already being loaded", raw));
+            }
+            if out.iter().any(|(p, _)| *p == resolved) {
+                continue;
+            }
+            let (src, sub) = load(&resolved, &raw)?;
+            out.push((resolved.clone(), src));
+            stack.push(resolved.clone());
+            let r = go(sub, &resolved, root, stack, out, load);
+            stack.pop();
+            r?;
+        }
+        Ok(())
+    }
+    let root = project_root_of(file_path);
+    let mut out = Vec::new();
+    let mut stack = vec![file_path.to_string()];
+    go(uses, file_path, root.as_deref(), &mut stack, &mut out, load)?;
+    Ok(out)
+}
+
 /// Cierre de un template: él y, recursivamente, sus `include`/`layout` literales (paths
 /// crudos, relativos al working dir — las claves del bundle).
 pub fn template_closure(path: &str) -> Result<Vec<String>, String> {

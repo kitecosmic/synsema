@@ -22,6 +22,8 @@ pub mod interpreter;
 pub mod judge;
 pub mod labels;
 pub mod lexer;
+// Los módulos que el cargador ya leyó (fuente + sus `use`), para `program_sha` del recibo.
+pub mod loaded_modules;
 #[cfg(feature = "native-tier")]
 #[doc(hidden)]
 pub mod native_tier;

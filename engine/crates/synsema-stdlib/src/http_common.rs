@@ -57,6 +57,8 @@ pub struct HttpResult {
     pub body_bytes: Vec<u8>,
     pub headers: Vec<(String, String)>,
     pub error: Option<String>,
+    /// T9: lo que se verificó del servidor atestado (sólo con `fetch(url, {"attested": …})`).
+    pub attested: Option<crate::attested_client::AttestedInfo>,
 }
 
 pub fn err_result(error: String) -> HttpResult {
@@ -67,12 +69,24 @@ pub fn err_result(error: String) -> HttpResult {
         body_bytes: Vec::new(),
         headers: Vec::new(),
         error: Some(error),
+        attested: None,
     }
 }
 
-/// Transporte de una request: (method, url, headers, query, body, timeout_secs).
+/// Cómo se valida el servidor TLS de un pedido además de (o en lugar de) las raíces del SO.
+#[derive(Clone, Debug)]
+pub enum TlsCheck {
+    /// T5: la SPKI DER exacta del servidor.
+    Pin(Vec<u8>),
+    /// T9: un `serve --attested` que tiene que probar, en la misma conexión, qué corre.
+    Attested(crate::attested_client::AttestedSpec),
+}
+
+/// Transporte de una request: (method, url, headers, query, body, timeout_secs, tls).
 /// Nativo = sockets; wasm = el `http` del host (o el stub "sin transporte").
 /// v0.6.20 — el body va en BYTES: texto, binario o el JSON que `body_arg` ya serializó.
+/// `tls` (sólo `fetch` con mapa de opciones): `tls_pin` o `attested`; un transporte que no puede
+/// cumplirlo falla cerrado.
 pub type Transport = fn(
     &str,
     &str,
@@ -80,7 +94,99 @@ pub type Transport = fn(
     Option<&[(String, String)]>,
     Option<&[u8]>,
     u64,
+    Option<&TlsCheck>,
 ) -> HttpResult;
+
+/// `tls_pin`: la SubjectPublicKeyInfo DER del servidor, como hex (el `public_key_hex` de
+/// `/.well-known/attestation`), bytes o PEM `PUBLIC KEY`. Tiene que parsear como SPKI: un pin que
+/// no es una clave se rechaza acá, no en el handshake.
+pub fn parse_tls_pin(v: &SynValue, who: &str) -> Result<Vec<u8>, Control> {
+    let der = match v {
+        SynValue::Bytes(b) => b.to_vec(),
+        SynValue::Text(t) if t.contains("-----BEGIN") => {
+            let (label, der) = crate::webauth::pem_decode(t).map_err(|e| perr(format!("{}: tls_pin: {}", who, e)))?;
+            if label != "PUBLIC KEY" {
+                return Err(perr(format!("{}: tls_pin must be a PUBLIC KEY PEM, got {:?}", who, label)));
+            }
+            der
+        }
+        SynValue::Text(t) => {
+            let h: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+            let h = h.trim_start_matches("0x").trim_start_matches("0X");
+            synsema_core::bytesutil::hex_decode(h).map_err(|_| perr(format!("{}: tls_pin is not hex (pass the server's SubjectPublicKeyInfo as hex, bytes or a PUBLIC KEY PEM)", who)))?
+        }
+        other => return Err(perr(format!("{}: tls_pin must be hex text, bytes or a PUBLIC KEY PEM, got {}", who, other.type_name()))),
+    };
+    use x509_parser::prelude::FromDer;
+    match x509_parser::x509::SubjectPublicKeyInfo::from_der(&der) {
+        Ok((rest, _)) if rest.is_empty() => Ok(der),
+        _ => Err(perr(format!("{}: tls_pin is not a DER SubjectPublicKeyInfo", who))),
+    }
+}
+
+fn perr(msg: String) -> Control {
+    Control::Error(RuntimeError::new(msg))
+}
+
+/// La forma de mapa de `fetch(url, {method, headers, body, timeout, tls_pin})`: mismos tipos y
+/// defaults que la posicional; una clave en `nothing` cuenta como ausente.
+struct FetchOpts {
+    method: String,
+    headers: Option<Vec<(String, String)>>,
+    body: (Option<Vec<u8>>, Option<&'static str>),
+    timeout: u64,
+    tls: Option<TlsCheck>,
+}
+
+fn fetch_opts(args: &[SynValue]) -> Result<FetchOpts, Control> {
+    let Some(SynValue::Map(m)) = args.get(1) else {
+        // Forma posicional (corta): fetch(url, method?, headers?, body?, timeout?).
+        return Ok(FetchOpts {
+            method: args.get(1).map(raw_str).unwrap_or_else(|| "GET".to_string()),
+            headers: header_pairs(args.get(2)),
+            body: body_arg(args.get(3)),
+            timeout: timeout_arg(args.get(4)),
+            tls: None,
+        });
+    };
+    if args.len() > 2 {
+        return Err(perr(format!(
+            "fetch(url, opts): the options map is the last argument ({} more given); put method, headers, body and timeout inside it",
+            args.len() - 2
+        )));
+    }
+    let m = m.borrow().to_map();
+    const VALID: &str = "method, headers, body, timeout, tls_pin, attested";
+    let mut out = FetchOpts { method: "GET".to_string(), headers: None, body: (None, None), timeout: timeout_arg(None), tls: None };
+    for (k, v) in &m {
+        if matches!(v, SynValue::Nothing) {
+            // `tls_pin`/`attested` en `nothing` (p. ej. `id["public_key_hex"]` que no estaba) NO
+            // cuenta como ausente: sería volver en silencio a la validación normal.
+            if k == "tls_pin" || k == "attested" {
+                return Err(perr(format!("fetch: {} is nothing; pass the value, or leave the key out to use the usual certificate check", k)));
+            }
+            continue;
+        }
+        match k.as_str() {
+            "method" => out.method = raw_str(v),
+            "headers" => out.headers = header_pairs(Some(v)),
+            "body" => out.body = body_arg(Some(v)),
+            "timeout" => out.timeout = timeout_arg(Some(v)),
+            "tls_pin" | "attested" => {
+                if out.tls.is_some() {
+                    return Err(perr("fetch: tls_pin and attested are two ways of fixing the server key; pass one".to_string()));
+                }
+                out.tls = Some(if k == "tls_pin" {
+                    TlsCheck::Pin(parse_tls_pin(v, "fetch")?)
+                } else {
+                    TlsCheck::Attested(crate::attested_client::parse_attested_spec(v, "fetch")?)
+                });
+            }
+            other => return Err(perr(format!("fetch: unknown option {:?} (valid options: {})", other, VALID))),
+        }
+    }
+    Ok(out)
+}
 
 pub fn urlencode(q: &[(String, String)]) -> String {
     q.iter()
@@ -247,6 +353,9 @@ pub fn response_to_syn(r: HttpResult) -> SynValue {
     if let Some(e) = r.error {
         m.insert("error", syn_text(e));
     }
+    if let Some(a) = r.attested {
+        m.insert("attested", a.to_syn());
+    }
     syn_map(m)
 }
 
@@ -277,6 +386,7 @@ pub fn register_http_client_builtins(
                     query.as_deref(),
                     body.as_deref(),
                     timeout_arg(args.get(5)),
+                    None,
                 );
                 Ok(response_to_syn(r))
             }),
@@ -301,6 +411,7 @@ pub fn register_http_client_builtins(
                     query.as_deref(),
                     None,
                     timeout_arg(args.get(3)),
+                    None,
                 );
                 Ok(response_to_syn(r))
             }),
@@ -325,6 +436,7 @@ pub fn register_http_client_builtins(
                     None,
                     body.as_deref(),
                     timeout_arg(args.get(3)),
+                    None,
                 );
                 Ok(response_to_syn(r))
             }),
@@ -349,6 +461,7 @@ pub fn register_http_client_builtins(
                     None,
                     body.as_deref(),
                     timeout_arg(args.get(3)),
+                    None,
                 );
                 Ok(response_to_syn(r))
             }),
@@ -372,14 +485,18 @@ pub fn register_http_client_builtins(
                     None,
                     None,
                     timeout_arg(args.get(2)),
+                    None,
                 );
                 Ok(response_to_syn(r))
             }),
         );
     }
 
-    // fetch(url, method?, headers?, body?, timeout?) — cliente HTTP real, gateado por net.
-    // Default GET; mismo retorno que http_* (response_to_syn).
+    // fetch(url, {method, headers, body, timeout, tls_pin}) — o la forma corta posicional
+    // fetch(url, method?, headers?, body?, timeout?). Cliente HTTP real, gateado por net.
+    // Default GET; mismo retorno que http_* (response_to_syn). `tls_pin` reemplaza la validación
+    // contra las raíces del SO y el nombre por la igualdad exacta de la SPKI del servidor; sin él,
+    // nada cambia.
     {
         let caps = caps.clone();
         interp.register_builtin(
@@ -388,17 +505,10 @@ pub fn register_http_client_builtins(
             Rc::new(move |_i, args, _loc| {
                 let url = raw_str(args.first().unwrap_or(&SynValue::Nothing));
                 require_net(&caps, &url, "fetch()")?;
-                let method = args.get(1).map(raw_str).unwrap_or_else(|| "GET".to_string());
-                let (body, default_ct) = body_arg(args.get(3));
-                let headers = with_default_content_type(header_pairs(args.get(2)), default_ct);
-                let r = transport(
-                    &method,
-                    &url,
-                    headers.as_deref(),
-                    None,
-                    body.as_deref(),
-                    timeout_arg(args.get(4)),
-                );
+                let o = fetch_opts(args)?;
+                let (body, default_ct) = o.body;
+                let headers = with_default_content_type(o.headers, default_ct);
+                let r = transport(&o.method, &url, headers.as_deref(), None, body.as_deref(), o.timeout, o.tls.as_ref());
                 Ok(response_to_syn(r))
             }),
         );
@@ -425,6 +535,7 @@ pub fn register_http_client_builtins(
                     query.as_deref(),
                     body.as_deref(),
                     timeout_arg(args.get(5)),
+                    None,
                 );
                 Ok(response_to_syn_bytes(r))
             }),
@@ -606,6 +717,7 @@ mod v0620_tests {
             body_bytes: b"{\"a\": [1, 2]}".to_vec(),
             headers: vec![("Content-Type".to_string(), "application/json; charset=utf-8".to_string())],
             error: None,
+            attested: None,
         };
         let v = response_to_syn(r);
         let SynValue::Map(m) = &v else { panic!() };
@@ -619,6 +731,7 @@ mod v0620_tests {
             body_bytes: b"plain".to_vec(),
             headers: vec![("content-type".to_string(), "text/plain".to_string())],
             error: None,
+            attested: None,
         };
         let SynValue::Map(m) = response_to_syn(r) else { panic!() };
         assert!(matches!(m.borrow().get("json"), Some(SynValue::Nothing)));
@@ -637,6 +750,7 @@ mod v0620_tests {
             body_bytes: vec![0xff, 0x00, 0x89],
             headers: Vec::new(),
             error: None,
+            attested: None,
         };
         let SynValue::Map(m) = response_to_syn_bytes(r) else { panic!() };
         assert!(matches!(m.borrow().get("bytes"), Some(SynValue::Bytes(b)) if b.to_vec() == vec![0xff, 0x00, 0x89]));

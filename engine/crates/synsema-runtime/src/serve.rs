@@ -3627,6 +3627,9 @@ fn make_serve_hook(
         runtime.tls_enabled = use_tls;
         if let Some(id) = &attested_identity {
             runtime.attestation_json = Some(id.json().to_string());
+            // T10: los documentos se renuevan antes de vencer (misma clave); si al vencer no se
+            // pudo, el servidor se cierra con error en vez de servir un documento vencido.
+            synsema_stdlib::attest::spawn_renewal().map_err(|e| Control::Error(RuntimeError::new(format!("serve --attested: {}", e))))?;
         }
         // T3: la identidad que firma la Agent Card. Bajo `--attested` ES la clave atestada
         // (la tarjeta y el documento de attestation hablan de la misma clave); si no,
@@ -3947,6 +3950,8 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
                 crate::host::Profile::Pure => "pure",
                 crate::host::Profile::Native => "native",
             },
+            // Los llena `build_attested_identity` con los drivers elegidos (T4).
+            drivers: Vec::new(),
         };
         match synsema_stdlib::attest::build_attested_identity(source, filename, config)
             .and_then(synsema_stdlib::attest::install_attested_identity)
@@ -4165,6 +4170,11 @@ fn serve_inner(source: &str, filename: &str, secure: bool, overrides: ServeOverr
     println!("\n{} HTTP server(s) running. Press Ctrl+C to stop.", handles.len());
     for h in handles {
         let _ = h.join(); // bloquea para siempre (el accept loop nunca termina)
+    }
+    // T10: un `serve --attested` que se cerró porque sus documentos vencieron sin renovación
+    // termina con error, no con un apagado normal.
+    if let Some(reason) = synsema_stdlib::attest::renewal_failure() {
+        return RunResult { success: false, output: std::mem::take(&mut interp.output), errors: vec![format!("Runtime error: {}", reason)] };
     }
     RunResult { success: true, output: std::mem::take(&mut interp.output), errors: Vec::new() }
 }

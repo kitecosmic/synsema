@@ -74,7 +74,13 @@ fn host_transport(
     query: Option<&[(String, String)]>,
     body: Option<&[u8]>,
     timeout_secs: u64,
+    tls: Option<&crate::http_common::TlsCheck>,
 ) -> HttpResult {
+    // El `http` del embebedor no expone el certificado ni la conexión: no puede fijar la clave
+    // ni atestar el servidor. Falla cerrado en vez de mandar el pedido sin eso.
+    if tls.is_some() {
+        return err_result("tls_pin and attested are not supported by the host transport of this profile (the embedder's http cannot see the server key)".to_string());
+    }
     let full = url_with_query(url, query);
     via_host(method, &full, headers, body, timeout_secs)
 }
