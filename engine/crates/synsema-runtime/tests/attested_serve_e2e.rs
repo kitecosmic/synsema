@@ -45,6 +45,11 @@ let vault be {"balance": private(500, "app"), "name": "alice"}
 serve on 8080
     route "GET /ping"
         give {"ok": true}
+    route "GET /hit"
+        state_incr("hits")
+        give {"hit": true}
+    route "GET /hits"
+        give {"hits": state_get("hits", 0)}
     route "GET /identity"
         give attestation_document()
     route "GET /global-raw"
@@ -213,8 +218,15 @@ fn well_known_attestation_binds_the_tls_key_to_the_program() {
         ceiling: None,
         tls_key: "attested",
         profile: "native",
+        drivers: vec!["mock"],
     };
+    assert_eq!(cfg["drivers"], serde_json::json!(["mock"]), "T4: config nombra los drivers");
     assert_eq!(j["config_sha"], hex(&expected_cfg.sha()), "config_sha = sha256(json canónico del config publicado)");
+    // T4: `documents` (uno por driver); los campos de arriba siguen siendo los del primero.
+    let docs = j["documents"].as_array().expect("documents");
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["document"], j["document"]);
+    assert_eq!((docs[0]["format"].as_str(), docs[0]["driver"].as_str()), (Some("mock"), Some("mock")));
 
     // Paso 2: el documento verifica (COSE ES384 + cadena) contra la raíz del mock, y su
     // user_data es EXACTAMENTE sha256(spki ‖ program_sha ‖ config_sha).
@@ -392,4 +404,219 @@ fn attested_serve_refuses_to_start_without_a_platform() {
     assert!(!success, "no debe arrancar: {}", errors);
     assert!(errors.contains("serve --attested") && errors.contains("attest"), "{}", errors);
     assert!(TcpStream::connect(("127.0.0.1", port)).is_err(), "no bindeó el puerto");
+}
+
+/// T5 — el paso 5 del checklist desde un cliente ESCRITO EN SYNSEMA: `fetch` y `ws_connect` con
+/// `tls_pin` (la SPKI que publica `/.well-known/attestation`) contra el `serve --attested` local
+/// con el driver `mock`. El pin correcto habla; otro pin falla en el handshake con un error que lo
+/// dice; sin pin, como siempre: el certificado autofirmado no tiene raíz conocida.
+#[test]
+fn tls_pin_lets_a_synsema_client_talk_to_the_attested_key_only() {
+    let port = attested_server();
+    let (_, body, _) = https_get(port, "/.well-known/attestation", None).unwrap();
+    let j: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let pin_hex = j["public_key_hex"].as_str().unwrap().to_string();
+    let pin_pem = j["public_key"].as_str().unwrap().replace('\n', "\\n");
+    let mut wrong = unhex(&pin_hex);
+    let last = wrong.len() - 1;
+    wrong[last] ^= 0x01;
+    let wrong_hex = hex(&wrong);
+    let base = format!("https://127.0.0.1:{}", port);
+    let run = |body: &str| {
+        let src = format!("require net(\"127.0.0.1\")\n{}", body);
+        synsema_runtime::engine::run_source(&src, "pin_client.syn")
+    };
+
+    // Pin correcto (hex y PEM): la ruta contesta.
+    for pin in [format!("\"{}\"", pin_hex), format!("\"{}\"", pin_pem)] {
+        let r = run(&format!("let r be fetch(\"{}/ping\", {{\"tls_pin\": {}}})\nprint(r[\"status\"])\nprint(r[\"json\"][\"ok\"])\n", base, pin));
+        assert!(r.success, "{:?}", r.errors);
+        assert_eq!(r.output, vec!["200".to_string(), "true".to_string()], "{:?}", r.output);
+    }
+    // Con el resto de las opciones en el mismo mapa.
+    let r = run(&format!("let r be fetch(\"{}/ping\", {{\"method\": \"GET\", \"headers\": {{\"X-A\": \"1\"}}, \"timeout\": 10, \"tls_pin\": \"{}\"}})\nprint(r[\"status\"])\n", base, pin_hex));
+    assert_eq!(r.output, vec!["200".to_string()], "{:?}", r.errors);
+
+    // Otro pin: error de TLS que nombra el pin; ni status ni cuerpo.
+    let r = run(&format!("let r be fetch(\"{}/ping\", {{\"tls_pin\": \"{}\"}})\nprint(r[\"status\"])\nprint(r[\"error\"])\n", base, wrong_hex));
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output[0], "0");
+    assert!(r.output[1].contains("tls_pin: the server public key (SPKI) does not match the pinned key"), "{:?}", r.output);
+
+    // Sin pin: exactamente como hoy (raíz desconocida).
+    let r = run(&format!("let r be fetch(\"{}/ping\")\nprint(r[\"status\"])\nprint(r[\"error\"])\n", base));
+    assert_eq!(r.output[0], "0");
+    assert!(r.output[1].contains("UnknownIssuer") || r.output[1].contains("certificate"), "{:?}", r.output);
+    assert!(!r.output[1].contains("tls_pin"), "{:?}", r.output);
+
+    // Errores de uso: clave desconocida, argumentos después del mapa, pin que no es una clave,
+    // pin sobre http://.
+    let r = run(&format!("fetch(\"{}/ping\", {{\"pin\": \"00\"}})\n", base));
+    assert!(r.errors.join(" ").contains("fetch: unknown option \"pin\" (valid options: method, headers, body, timeout, tls_pin, attested)"), "{:?}", r.errors);
+    let r = run(&format!("fetch(\"{}/ping\", {{\"tls_pin\": \"{}\"}}, 30)\n", base, pin_hex));
+    assert!(r.errors.join(" ").contains("the options map is the last argument"), "{:?}", r.errors);
+    let r = run(&format!("fetch(\"{}/ping\", {{\"tls_pin\": \"abcd\"}})\n", base));
+    assert!(r.errors.join(" ").contains("tls_pin is not a DER SubjectPublicKeyInfo"), "{:?}", r.errors);
+    let r = run(&format!("let r be fetch(\"http://127.0.0.1:{}/ping\", {{\"tls_pin\": \"{}\"}})\nprint(r[\"error\"])\n", port, pin_hex));
+    assert!(r.output.join(" ").contains("tls_pin needs an https:// URL"), "{:?} {:?}", r.output, r.errors);
+    // `nothing` no apaga el chequeo en silencio: es error (para el chequeo de siempre se omite la clave).
+    let r = run(&format!("fetch(\"{}/ping\", {{\"tls_pin\": nothing}})\n", base));
+    assert!(r.errors.join(" ").contains("fetch: tls_pin is nothing; pass the value, or leave the key out"), "{:?}", r.errors);
+    let r = run(&format!("fetch(\"{}/ping\", {{\"attested\": nothing}})\n", base));
+    assert!(r.errors.join(" ").contains("fetch: attested is nothing"), "{:?}", r.errors);
+    let r = run(&format!("ws_connect(\"wss://127.0.0.1:{}/ping\", {{}}, {{\"tls_pin\": nothing}})\n", port));
+    assert!(r.errors.join(" ").contains("tls_pin is nothing"), "{:?}", r.errors);
+    // Sin `require net` el pin no abre nada.
+    let r = synsema_runtime::engine::run_source(&format!("fetch(\"{}/ping\", {{\"tls_pin\": \"{}\"}})\n", base, pin_hex), "no_net.syn");
+    assert!(!r.success && r.errors.join(" ").contains("net"), "{:?}", r.errors);
+
+    // ws_connect: el pin va en el opts que ya existe. Con el pin correcto el TLS cierra y lo que
+    // falla después es el upgrade (la ruta no es WebSocket); con otro pin falla el handshake TLS.
+    let ws = |pin: &str| {
+        let r = run(&format!("let c be ws_connect(\"wss://127.0.0.1:{}/ping\", {{}}, {{\"tls_pin\": \"{}\", \"timeout\": 10}})\n", port, pin));
+        r.errors.join(" ")
+    };
+    let e = ws(&wrong_hex);
+    assert!(e.contains("tls_pin"), "{}", e);
+    let e = ws(&pin_hex);
+    assert!(!e.contains("tls_pin") && !e.contains("UnknownIssuer"), "con el pin correcto el TLS cierra: {}", e);
+    let r = run(&format!("ws_connect(\"ws://127.0.0.1:{}/ping\", {{}}, {{\"tls_pin\": \"{}\"}})\n", port, pin_hex));
+    assert!(r.errors.join(" ").contains("tls_pin needs a wss:// URL"), "{:?}", r.errors);
+}
+
+/// Cuántas veces llegó un request de usuario a `/hit` (por TLS fijado: no cuenta como `/hit`).
+fn hits(port: u16, spki: &[u8]) -> i64 {
+    let (_, body, _) = https_get(port, "/hits", Some(spki.to_vec())).expect("GET /hits");
+    let j: serde_json::Value = serde_json::from_str(&body).unwrap();
+    j["hits"].as_i64().unwrap()
+}
+
+/// Un "intermediario": TLS con OTRA clave que sirve el identity REAL del servidor atestado y
+/// cuenta cualquier otro request que le llegue por la misma conexión.
+fn fake_mitm(identity: String) -> (u16, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap().self_signed(&key).unwrap();
+    let cfg = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()))
+        .unwrap();
+    let cfg = Arc::new(cfg);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (ids, others) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (ids2, others2) = (ids.clone(), others.clone());
+    thread::spawn(move || {
+        for tcp in listener.incoming().flatten() {
+            let conn = rustls::ServerConnection::new(cfg.clone()).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            let _ = tls.sock.set_read_timeout(Some(Duration::from_secs(5)));
+            loop {
+                let mut head = Vec::new();
+                let mut b = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match tls.read(&mut b) {
+                        Ok(1) => head.push(b[0]),
+                        _ => break,
+                    }
+                }
+                if head.is_empty() || !head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+                if String::from_utf8_lossy(&head).starts_with("GET /.well-known/attestation ") {
+                    ids2.fetch_add(1, Ordering::SeqCst);
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", identity.len(), identity);
+                    let _ = tls.write_all(resp.as_bytes());
+                } else {
+                    others2.fetch_add(1, Ordering::SeqCst);
+                    let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nno");
+                    break;
+                }
+            }
+        }
+    });
+    (port, ids, others)
+}
+
+/// T9 — `fetch(url, {"attested": …})`: una sola conexión TLS sin validar la cadena, el identity por
+/// ESA conexión, su clave == la del handshake, cada documento verificado con su binding y el
+/// `program_sha` esperado, y recién ahí el request del usuario. Si algo falla, el request no sale.
+#[test]
+fn attested_fetch_verifies_the_server_on_the_same_connection_before_sending_anything() {
+    let port = attested_server();
+    let (_, body, _) = https_get(port, "/.well-known/attestation", None).unwrap();
+    let identity = body.clone();
+    let j: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let spki = unhex(j["public_key_hex"].as_str().unwrap());
+    let psha = j["program_sha"].as_str().unwrap().to_string();
+    let base = format!("https://127.0.0.1:{}", port);
+    let run = |body: &str| synsema_runtime::engine::run_source(&format!("require net(\"127.0.0.1\")\n{}", body), "attested_client.syn");
+    let fetch_hit = |attested: &str| {
+        run(&format!("let r be fetch(\"{}/hit\", {{\"attested\": {}}})\nprint(r[\"status\"])\nprint(get(r, \"error\"))\nprint(get(r, \"attested\"))\n", base, attested))
+    };
+
+    // Bien: el request llega, y la respuesta dice qué se verificó.
+    let before = hits(port, &spki);
+    let r = fetch_hit(&format!("{{\"program_sha\": \"{}\", \"formats\": [\"mock\"]}}", psha));
+    assert!(r.success, "{:?}", r.errors);
+    assert_eq!(r.output[0], "200", "{:?}", r.output);
+    assert!(r.output[2].contains(&psha) && r.output[2].contains("mock") && r.output[2].contains(&hex(&spki)), "{:?}", r.output);
+    assert_eq!(hits(port, &spki), before + 1);
+
+    // Mal: otro programa, un formato que falta, mock sin nombrarlo, un `now` fuera de la hoja…
+    // ninguno manda el request del usuario.
+    let bad_sha = format!("{}{}", &psha[..63], if psha.ends_with('0') { "1" } else { "0" });
+    for (attested, needle) in [
+        (format!("{{\"program_sha\": \"{}\", \"formats\": [\"mock\"]}}", bad_sha), "attested: the server runs program_sha".to_string()),
+        (format!("{{\"program_sha\": \"{}\", \"formats\": [\"mock\", \"sev-snp\"]}}", psha), "asks for \"sev-snp\" but the server published no such document".to_string()),
+        (format!("{{\"program_sha\": \"{}\", \"formats\": [\"sev-snp\"]}}", psha), "mock driver".to_string()),
+        (format!("{{\"program_sha\": \"{}\", \"formats\": [\"mock\"], \"measurements\": {{\"mock\": {{\"pcr0\": \"{}\"}}}}}}", psha, "ab".repeat(48)), "measurement pcr0 mismatch".to_string()),
+    ] {
+        let before = hits(port, &spki);
+        let r = fetch_hit(&attested);
+        assert!(r.success, "{:?}", r.errors);
+        assert_eq!(r.output[0], "0", "{}: {:?}", attested, r.output);
+        assert!(r.output[1].contains(&needle), "{}: {:?}", needle, r.output);
+        assert_eq!(hits(port, &spki), before, "{}: el request del usuario NO salió", needle);
+    }
+
+    // Un intermediario con OTRA clave que muestra el identity real: el handshake no es el de la
+    // clave del documento → error, y no le llega nada más que el pedido del identity.
+    let (mitm, ids, others) = fake_mitm(identity);
+    let r = run(&format!(
+        "let r be fetch(\"https://127.0.0.1:{}/hit\", {{\"attested\": {{\"program_sha\": \"{}\", \"formats\": [\"mock\"]}}}})\nprint(r[\"error\"])\n",
+        mitm, psha
+    ));
+    assert!(r.output.join(" ").contains("the identity's public_key_hex is not the key of this TLS connection"), "{:?} {:?}", r.output, r.errors);
+    assert_eq!(ids.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(others.load(std::sync::atomic::Ordering::SeqCst), 0, "el request del usuario no salió hacia el intermediario");
+
+    // Errores de uso: sin program_sha, formats vacío, junto con tls_pin, sobre http://.
+    for (opts, needle) in [
+        ("{\"attested\": {\"formats\": [\"mock\"]}}".to_string(), "attested.program_sha is required"),
+        (format!("{{\"attested\": {{\"program_sha\": \"{}\", \"formats\": []}}}}", psha), "attested.formats is required and cannot be empty"),
+        (format!("{{\"attested\": {{\"program_sha\": \"{}\", \"formats\": [\"mock\"]}}, \"tls_pin\": \"{}\"}}", psha, hex(&spki)), "tls_pin and attested are two ways"),
+    ] {
+        let r = run(&format!("fetch(\"{}/hit\", {})\n", base, opts));
+        assert!(r.errors.join(" ").contains(needle), "{}: {:?}", needle, r.errors);
+    }
+    let r = run(&format!("let r be fetch(\"http://127.0.0.1:{}/hit\", {{\"attested\": {{\"program_sha\": \"{}\", \"formats\": [\"mock\"]}}}})\nprint(r[\"error\"])\n", port, psha));
+    assert!(r.output.join(" ").contains("attested needs an https:// URL"), "{:?}", r.output);
+
+    // ws_connect: el upgrade sale recién después de verificar. Con el programa correcto el TLS y el
+    // identity pasan y lo que falla es el upgrade (la ruta no es WebSocket); con otro, falla la
+    // atestación.
+    let ws = |sha: &str| {
+        let r = run(&format!(
+            "ws_connect(\"wss://127.0.0.1:{}/ping\", {{}}, {{\"attested\": {{\"program_sha\": \"{}\", \"formats\": [\"mock\"]}}, \"timeout\": 10}})\n",
+            port, sha
+        ));
+        r.errors.join(" ")
+    };
+    let e = ws(&psha);
+    assert!(!e.contains("attested"), "con el programa correcto la atestación pasa: {}", e);
+    let e = ws(&bad_sha);
+    assert!(e.contains("attested: the server runs program_sha"), "{}", e);
 }

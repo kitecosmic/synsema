@@ -42,9 +42,10 @@ fn http_transport(
     query: Option<&[(String, String)]>,
     body: Option<&[u8]>,
     timeout_secs: u64,
+    tls: Option<&crate::http_common::TlsCheck>,
 ) -> HttpResult {
     let full_url = url_with_query(url, query);
-    match do_request(method, &full_url, headers, body, timeout_secs) {
+    match do_request_pinned(method, &full_url, headers, body, timeout_secs, tls) {
         Ok(r) => r,
         Err(e) => err_result(e),
     }
@@ -205,14 +206,16 @@ fn identity_applies_to(host: &str, scopes: &[String]) -> bool {
 /// "yo soy este agente". Por eso el alcance es por host y no global — un servidor
 /// cualquiera que pida cert de cliente no debería poder cosechar la identidad sólo
 /// por pedirla. Sin `hosts` el alcance son los hosts que `require net` ya permite.
-fn tls_client_config(host: &str) -> Result<rustls::ClientConfig, String> {
-    let roots = root_cert_store()?;
-    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+fn tls_client_config(host: &str, verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>, client_auth: bool) -> Result<rustls::ClientConfig, String> {
+    let builder = match verifier {
+        Some(v) => rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(v),
+        None => rustls::ClientConfig::builder().with_root_certificates(root_cert_store()?),
+    };
     let guard = client_identity().lock().map_err(|_| "TLS identity lock poisoned".to_string())?;
     let scopes =
         client_identity_hosts().lock().map_err(|_| "TLS identity lock poisoned".to_string())?;
     match guard.as_ref() {
-        Some((certs, key)) if identity_applies_to(host, &scopes) => builder
+        Some((certs, key)) if client_auth && identity_applies_to(host, &scopes) => builder
             .with_client_auth_cert(certs.clone(), key.clone_key())
             .map_err(|e| format!("the client certificate/key pair was rejected by TLS: {}", e)),
         _ => Ok(builder.with_no_client_auth()),
@@ -269,6 +272,187 @@ fn load_client_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'stati
                 path
             )))
         })
+}
+
+/// T5 — `tls_pin`: verificador de certificado del servidor que REEMPLAZA la validación contra las
+/// raíces del SO y el nombre del host por una igualdad exacta: la SubjectPublicKeyInfo del
+/// certificado hoja presentado tiene que ser, byte a byte, la fijada. No apaga nada más: la firma
+/// del handshake (TLS 1.2/1.3) la sigue verificando rustls con esa misma clave, con los algoritmos
+/// del proveedor por defecto. Es lo que necesita un cliente de `serve --attested`, cuyo
+/// certificado es autofirmado con la clave atestada (`public_key_hex`).
+#[derive(Debug)]
+pub(crate) struct PinnedSpki {
+    spki: Vec<u8>,
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl PinnedSpki {
+    pub(crate) fn new(spki: &[u8]) -> PinnedSpki {
+        PinnedSpki { spki: spki.to_vec(), algs: rustls::crypto::ring::default_provider().signature_verification_algorithms }
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedSpki {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use x509_parser::prelude::FromDer;
+        let (_, cert) = x509_parser::certificate::X509Certificate::from_der(end_entity.as_ref())
+            .map_err(|_| rustls::Error::General("tls_pin: the server certificate does not parse".to_string()))?;
+        if cert.tbs_certificate.subject_pki.raw != self.spki.as_slice() {
+            return Err(rustls::Error::General("tls_pin: the server public key (SPKI) does not match the pinned key".to_string()));
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+}
+
+/// T9 — verificador del handshake de `attested`: NO valida la cadena ni el nombre, pero GUARDA la
+/// SPKI de la hoja; la firma del handshake se sigue verificando con esa clave. Por sí solo no
+/// confía en nada: la conexión no lleva el request del usuario hasta que el identity de esa misma
+/// conexión verifica y nombra ESA clave (`attest_over`).
+#[derive(Debug)]
+pub(crate) struct RecordingSpki {
+    seen: std::sync::Mutex<Option<Vec<u8>>>,
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl RecordingSpki {
+    pub(crate) fn new() -> RecordingSpki {
+        RecordingSpki { seen: std::sync::Mutex::new(None), algs: rustls::crypto::ring::default_provider().signature_verification_algorithms }
+    }
+    pub(crate) fn seen(&self) -> Option<Vec<u8>> {
+        self.seen.lock().ok()?.clone()
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for RecordingSpki {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        use x509_parser::prelude::FromDer;
+        let (_, cert) = x509_parser::certificate::X509Certificate::from_der(end_entity.as_ref())
+            .map_err(|_| rustls::Error::General("attested: the server certificate does not parse".to_string()))?;
+        if let Ok(mut g) = self.seen.lock() {
+            *g = Some(cert.tbs_certificate.subject_pki.raw.to_vec());
+        }
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algs.supported_schemes()
+    }
+}
+
+/// Tope del identity leído por la conexión atestada.
+const MAX_IDENTITY: usize = 1 << 20;
+
+/// Lee UNA respuesta HTTP/1.1 completa (sólo con `Content-Length`) sin consumir de más: la
+/// conexión sigue abierta para el request del usuario. → `(status, body)`.
+fn read_one_response<S: Read>(stream: &mut S) -> Result<(i64, Vec<u8>), String> {
+    let mut acc: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+    // Cabecera de a un byte (es corta): así no se lee nada más allá de la respuesta.
+    let split = loop {
+        let n = stream.read(&mut byte).map_err(|e| format!("attested: reading the identity: {}", e))?;
+        if n == 0 {
+            return Err("attested: the server closed the connection before answering the identity".to_string());
+        }
+        acc.push(byte[0]);
+        if acc.ends_with(b"\r\n\r\n") {
+            break acc.len();
+        }
+        if acc.len() > 64 * 1024 {
+            return Err("attested: the identity response head is too large".to_string());
+        }
+    };
+    let (status, headers) = parse_head(&String::from_utf8_lossy(&acc[..split - 4]));
+    let header = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.trim().to_string());
+    // Sólo `Content-Length` exacto: con `chunked` el fin se adivina por patrón y la respuesta
+    // del usuario podría quedar desalineada. `serve --attested` siempre manda el largo.
+    if header("transfer-encoding").is_some() {
+        return Err("attested: the identity response must carry Content-Length, not Transfer-Encoding".to_string());
+    }
+    let len: usize = header("content-length")
+        .and_then(|v| v.parse().ok())
+        .ok_or("attested: the identity response has no Content-Length (the connection cannot carry the request after it)")?;
+    if len > MAX_IDENTITY {
+        return Err("attested: the identity is larger than 1 MiB".to_string());
+    }
+    let mut body = vec![0u8; len];
+    stream.read_exact(&mut body).map_err(|e| format!("attested: reading the identity: {}", e))?;
+    Ok((status, body))
+}
+
+/// T9: por una conexión TLS ya abierta con [`RecordingSpki`], pide `/.well-known/attestation`,
+/// exige que su clave sea la del handshake y lo verifica entero. Sólo si todo pasa la conexión
+/// puede llevar el request del usuario.
+pub(crate) fn attest_over<S: Read + Write>(
+    stream: &mut S,
+    host_hdr: &str,
+    recorder: &RecordingSpki,
+    spec: &crate::attested_client::AttestedSpec,
+) -> Result<crate::attested_client::AttestedInfo, String> {
+    let req = format!(
+        "GET /.well-known/attestation HTTP/1.1\r\nHost: {}\r\nAccept: application/json\r\nConnection: keep-alive\r\nUser-Agent: synsema\r\n\r\n",
+        host_hdr
+    );
+    stream.write_all(req.as_bytes()).map_err(|e| format!("attested: {}", e))?;
+    let (status, body) = read_one_response(stream)?;
+    if status != 200 {
+        return Err(format!("attested: GET /.well-known/attestation answered {} (is this a serve --attested?)", status));
+    }
+    let spki = recorder.seen().ok_or("attested: the TLS handshake presented no certificate")?;
+    crate::attested_client::verify_identity(&body, &spki, spec).map_err(|e| format!("attested: {}", e))
 }
 
 /// Carga los root CAs del SO una vez y los devuelve como `RootCertStore`.
@@ -328,7 +512,8 @@ fn connect_and_send(
     headers: Option<&[(String, String)]>,
     body: Option<&[u8]>,
     timeout_secs: u64,
-) -> Result<Box<dyn Read>, String> {
+    tls: Option<&crate::http_common::TlsCheck>,
+) -> Result<(Box<dyn Read>, Option<crate::attested_client::AttestedInfo>), String> {
     let (scheme, host, port, path, userinfo) = parse_url(url)?;
     if scheme != "http" && scheme != "https" {
         return Err(format!("unsupported scheme '{}': only http and https are supported", scheme));
@@ -371,7 +556,16 @@ fn connect_and_send(
     if scheme == "https" {
         // Con identidad mTLS declarada (`mtls_identity`), el handshake presenta el
         // certificado del workload; sin ella, exactamente como antes.
-        let config = tls_client_config(&host)?;
+        use crate::http_common::TlsCheck;
+        let recorder = matches!(tls, Some(TlsCheck::Attested(_))).then(|| Arc::new(RecordingSpki::new()));
+        let verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>> = match (tls, &recorder) {
+            (Some(TlsCheck::Pin(pin)), _) => Some(Arc::new(PinnedSpki::new(pin))),
+            (Some(TlsCheck::Attested(_)), Some(r)) => Some(r.clone()),
+            _ => None,
+        };
+        // T9: con `attested` el servidor todavía no se verificó durante el handshake: no se le
+        // presenta la identidad mTLS del workload (TLS 1.3 la manda antes de poder atestar nada).
+        let config = tls_client_config(&host, verifier, !matches!(tls, Some(TlsCheck::Attested(_))))?;
         let server_name: rustls::pki_types::ServerName<'static> = host
             .as_str()
             .try_into()
@@ -380,12 +574,23 @@ fn connect_and_send(
         let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
             .map_err(|e| e.to_string())?;
         let mut stream = rustls::StreamOwned::new(conn, tcp);
+        // T9: primero el identity por ESTA conexión; el request del usuario sale sólo si verifica.
+        let info = match (tls, &recorder) {
+            (Some(TlsCheck::Attested(spec)), Some(r)) => Some(attest_over(&mut stream, &host_hdr, r, spec)?),
+            _ => None,
+        };
         stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
-        Ok(Box::new(stream))
+        Ok((Box::new(stream), info))
     } else {
+        // Un pin o una atestación sobre http:// no fijan nada: fallar cerrado en vez de mandar en claro.
+        match tls {
+            Some(crate::http_common::TlsCheck::Pin(_)) => return Err("tls_pin needs an https:// URL (there is no server key to pin over plain http)".to_string()),
+            Some(crate::http_common::TlsCheck::Attested(_)) => return Err("attested needs an https:// URL (there is no server key to check over plain http)".to_string()),
+            None => {}
+        }
         let mut stream = tcp;
         stream.write_all(&req_bytes).map_err(|e| e.to_string())?;
-        Ok(Box::new(stream))
+        Ok((Box::new(stream), None))
     }
 }
 
@@ -398,13 +603,14 @@ fn fetch_raw(
     headers: Option<&[(String, String)]>,
     body: Option<&[u8]>,
     timeout_secs: u64,
-) -> Result<Vec<u8>, String> {
+    tls: Option<&crate::http_common::TlsCheck>,
+) -> Result<(Vec<u8>, Option<crate::attested_client::AttestedInfo>), String> {
     // v0.6.42 — bajo `serve`, el hilo que espera la red suelta su permiso de ejecución.
     let _w = synsema_core::waiting::waiting();
-    let mut stream = connect_and_send(method, url, headers, body, timeout_secs)?;
+    let (mut stream, info) = connect_and_send(method, url, headers, body, timeout_secs, tls)?;
     let mut buf = Vec::new();
     read_to_end_tolerant(&mut stream, &mut buf)?;
-    Ok(buf)
+    Ok((buf, info))
 }
 
 /// Como `http_request` pero entrega el BODY incrementalmente: parsea el head, y va
@@ -427,7 +633,7 @@ pub fn http_request_stream(
 ) -> Result<(i64, Vec<(String, String)>), String> {
     // v0.6.42 — bajo `serve`, el hilo que espera la red suelta su permiso de ejecución.
     let _w = synsema_core::waiting::waiting();
-    let mut stream = connect_and_send(method, url, headers, body.map(str::as_bytes), timeout_secs)?;
+    let (mut stream, _) = connect_and_send(method, url, headers, body.map(str::as_bytes), timeout_secs, None)?;
     let mut read_buf = [0u8; 8192];
 
     // Fase 1: acumular hasta el fin del head (`\r\n\r\n`) y parsearlo. Un EOF antes
@@ -491,8 +697,21 @@ fn do_request(
     body: Option<&[u8]>,
     timeout_secs: u64,
 ) -> Result<HttpResult, String> {
-    let buf = fetch_raw(method, url, headers, body, timeout_secs)?;
-    parse_response(&buf)
+    do_request_pinned(method, url, headers, body, timeout_secs, None)
+}
+
+fn do_request_pinned(
+    method: &str,
+    url: &str,
+    headers: Option<&[(String, String)]>,
+    body: Option<&[u8]>,
+    timeout_secs: u64,
+    tls: Option<&crate::http_common::TlsCheck>,
+) -> Result<HttpResult, String> {
+    let (buf, info) = fetch_raw(method, url, headers, body, timeout_secs, tls)?;
+    let mut r = parse_response(&buf)?;
+    r.attested = info;
+    Ok(r)
 }
 
 /// Como `http_request` pero con el body como **bytes crudos** (para POSTear
@@ -524,7 +743,7 @@ pub fn http_request_bytes(
     headers: Option<&[(String, String)]>,
     timeout_secs: u64,
 ) -> Result<BytesResponse, String> {
-    let buf = fetch_raw(method, url, headers, None, timeout_secs)?;
+    let (buf, _) = fetch_raw(method, url, headers, None, timeout_secs, None)?;
     parse_response_bytes(&buf)
 }
 
@@ -597,6 +816,7 @@ fn parse_response(buf: &[u8]) -> Result<HttpResult, String> {
         body_bytes,
         headers,
         error: None,
+        attested: None,
     })
 }
 
@@ -826,6 +1046,23 @@ mod tests {
         let r = parse_response(raw).unwrap();
         assert_eq!(r.status, 200);
         assert_eq!(r.body, "{\"a\":\"bc\"}");
+    }
+
+    /// La respuesta del identity se lee con su `Content-Length` exacto y sin pasarse: lo que sigue
+    /// en la conexión queda para el request del usuario. `chunked` o sin largo: error.
+    #[test]
+    fn the_identity_response_needs_an_exact_content_length() {
+        let mut c = std::io::Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}NEXT".to_vec());
+        assert_eq!(read_one_response(&mut c).unwrap(), (200, b"{}".to_vec()));
+        assert_eq!(c.position(), 40, "no se consumió nada de lo que sigue");
+        let mut c = std::io::Cursor::new(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n".to_vec());
+        assert_eq!(read_one_response(&mut c).unwrap_err(), "attested: the identity response must carry Content-Length, not Transfer-Encoding");
+        let mut c = std::io::Cursor::new(b"HTTP/1.1 200 OK\r\n\r\n{}".to_vec());
+        assert!(read_one_response(&mut c).unwrap_err().contains("has no Content-Length"));
+        let mut c = std::io::Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n{}".to_vec());
+        assert!(read_one_response(&mut c).unwrap_err().starts_with("attested: reading the identity"));
+        let mut c = std::io::Cursor::new(b"HTTP/1.1 200 OK\r\nContent".to_vec());
+        assert!(read_one_response(&mut c).unwrap_err().contains("closed the connection"));
     }
 
     #[test]

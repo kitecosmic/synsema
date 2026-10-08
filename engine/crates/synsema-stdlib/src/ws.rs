@@ -307,6 +307,9 @@ struct DialParams {
     subprotocols: Vec<String>,
     max_msg: usize,
     connect_timeout: Duration,
+    /// T5/T9: `opts.tls_pin` (SPKI fijada) u `opts.attested` (el servidor prueba qué corre antes
+    /// del upgrade); vale también para cada reconexión.
+    tls_check: Option<crate::http_common::TlsCheck>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -595,10 +598,25 @@ fn establish(
     let _ = tcp.set_nodelay(true);
 
     let stream = if dial.tls {
-        let roots = crate::http::root_cert_store().map_err(|e| err(format!("ws_connect: {}", e)))?;
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        // T5: con `tls_pin`, la SPKI del servidor reemplaza raíces + nombre (ver `PinnedSpki`).
+        // T9: con `attested`, el handshake registra la SPKI y el identity se verifica por esta
+        // misma conexión ANTES del upgrade.
+        use crate::http_common::TlsCheck;
+        let recorder = matches!(dial.tls_check, Some(TlsCheck::Attested(_))).then(|| Arc::new(crate::http::RecordingSpki::new()));
+        let config = match (&dial.tls_check, &recorder) {
+            (Some(TlsCheck::Pin(pin)), _) => rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(crate::http::PinnedSpki::new(pin)))
+                .with_no_client_auth(),
+            (Some(TlsCheck::Attested(_)), Some(r)) => rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(r.clone())
+                .with_no_client_auth(),
+            _ => {
+                let roots = crate::http::root_cert_store().map_err(|e| err(format!("ws_connect: {}", e)))?;
+                rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()
+            }
+        };
         let server_name: rustls::pki_types::ServerName<'static> = dial
             .host
             .as_str()
@@ -607,7 +625,14 @@ fn establish(
             .map_err(|_| err(format!("ws_connect: invalid server name: {}", dial.host)))?;
         let conn = rustls::ClientConnection::new(Arc::new(config), server_name)
             .map_err(|e| err(format!("ws_connect: TLS setup failed: {}", e)))?;
-        WsStream::tls_std(rustls::StreamOwned::new(conn, tcp))
+        let mut tls_stream = rustls::StreamOwned::new(conn, tcp);
+        // T9: el identity, por esta conexión, antes del upgrade (y en cada reconexión).
+        if let (Some(TlsCheck::Attested(spec)), Some(r)) = (&dial.tls_check, &recorder) {
+            let h = if dial.host.contains(':') { format!("[{}]", dial.host) } else { dial.host.clone() };
+            let host_hdr = if dial.port == 443 { h } else { format!("{}:{}", h, dial.port) };
+            crate::http::attest_over(&mut tls_stream, &host_hdr, r, spec).map_err(|e| err(format!("ws_connect: {}", e)))?;
+        }
+        WsStream::tls_std(tls_stream)
     } else {
         WsStream::plain_std(tcp)
     };
@@ -1296,6 +1321,7 @@ struct ConnectOpts {
     on_full: OnFull,
     reconnect: Option<ReconnectCfg>,
     keepalive: Option<KeepaliveCfg>,
+    tls_check: Option<crate::http_common::TlsCheck>,
 }
 
 fn opt_duration(m: &MapObj, key: &str, fname: &str) -> Result<Option<Duration>, Control> {
@@ -1320,7 +1346,7 @@ fn parse_connect_opts(v: Option<&SynValue>, fname: &str) -> Result<ConnectOpts, 
     };
     const ALLOWED: &[&str] = &[
         "max_message_size", "timeout", "subprotocols", "max_queue", "max_queue_bytes", "on_full",
-        "reconnect", "keepalive",
+        "reconnect", "keepalive", "tls_pin", "attested",
     ];
     for k in opts.keys() {
         if !ALLOWED.contains(&k.as_str()) {
@@ -1439,6 +1465,24 @@ fn parse_connect_opts(v: Option<&SynValue>, fname: &str) -> Result<ConnectOpts, 
         Some(other) => return Err(err(format!("{}: keepalive must be a map, got {}", fname, other.type_name()))),
     };
 
+    // `nothing` en tls_pin/attested NO es ausente: sería volver en silencio a la validación normal.
+    for k in ["tls_pin", "attested"] {
+        if matches!(opts.get(k), Some(SynValue::Nothing)) {
+            return Err(err(format!("{}: {} is nothing; pass the value, or leave the key out to use the usual certificate check", fname, k)));
+        }
+    }
+    let pin = match opts.get("tls_pin") {
+        None | Some(SynValue::Nothing) => None,
+        Some(v) => Some(crate::http_common::TlsCheck::Pin(crate::http_common::parse_tls_pin(v, fname)?)),
+    };
+    let attested = match opts.get("attested") {
+        None | Some(SynValue::Nothing) => None,
+        Some(v) => Some(crate::http_common::TlsCheck::Attested(crate::attested_client::parse_attested_spec(v, fname)?)),
+    };
+    if pin.is_some() && attested.is_some() {
+        return Err(err(format!("{}: tls_pin and attested are two ways of fixing the server key; pass one", fname)));
+    }
+    let tls = pin.or(attested);
     Ok(ConnectOpts {
         max_msg,
         timeout,
@@ -1448,6 +1492,7 @@ fn parse_connect_opts(v: Option<&SynValue>, fname: &str) -> Result<ConnectOpts, 
         on_full,
         reconnect,
         keepalive,
+        tls_check: tls,
     })
 }
 
@@ -1507,7 +1552,17 @@ fn ws_connect(args: &[SynValue], reg: &Registry) -> Result<SynValue, Control> {
         subprotocols: opts.subprotocols,
         max_msg: opts.max_msg,
         connect_timeout: opts.timeout,
+        tls_check: opts.tls_check,
     };
+    match (&dial.tls_check, dial.tls) {
+        (Some(crate::http_common::TlsCheck::Pin(_)), false) => {
+            return Err(err(format!("{}: tls_pin needs a wss:// URL (there is no server key to pin over plain ws://)", F)))
+        }
+        (Some(crate::http_common::TlsCheck::Attested(_)), false) => {
+            return Err(err(format!("{}: attested needs a wss:// URL (there is no server key to check over plain ws://)", F)))
+        }
+        _ => {}
+    }
     // establish() re-chequea net(host) (G21) y hace el handshake.
     let caps = reg.borrow().caps.clone();
     let (ws, negotiated) = establish(&dial, &caps)?;
@@ -1996,6 +2051,7 @@ pub fn adopt_server_socket(interp: &Interpreter, link: ServerSocketLink) -> Resu
             subprotocols: Vec::new(),
             max_msg,
             connect_timeout: Duration::from_secs(0),
+            tls_check: None,
         },
         negotiated_subprotocol: subprotocol,
         inbound: VecDeque::new(),

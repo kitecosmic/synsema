@@ -1615,7 +1615,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
     // plataforma no se corre nada, y el aviso del mock sale antes de la salida del programa).
     if attest_input.is_some() {
         match synsema_stdlib::attest::preflight() {
-            Ok(d) => synsema_stdlib::attest::warn_if_mock(d),
+            Ok(ds) => ds.into_iter().for_each(synsema_stdlib::attest::warn_if_mock),
             Err(e) => {
                 eprintln!("synsema run --attest: {}", e);
                 return ExitCode::from(1);
@@ -1773,13 +1773,22 @@ fn steps_field() -> serde_json::Value {
 /// líneas de `print` **y las de `log`/`show`** (van al mismo buffer) — unida con `\n` sin `\n`
 /// Final; `steps` va en el JSON como dato informativo pero NO entra en `report_data` (depende
 /// del contador del intérprete, no del resultado). `config`  = `{labels, ceiling
-/// (el determinista, "stdout"), tls_key: "none", engine, profile: "pure"}`: el cliente sabe bajo
-/// qué modo corrió el programa, no sólo cuál.
+/// (el determinista, "stdout"), tls_key: "none", engine, profile: "pure", drivers}`: el cliente sabe
+/// bajo qué modo corrió el programa, no sólo cuál. Con varios drivers (`SYNSEMA_ATTEST=tsm,nitro-tpm`)
+/// cada uno firma el MISMO `report_data`; `attestation` es el del primero y `attestations` los trae
+/// todos. Si uno falla, no hay artefacto.
 fn attest_run(source: &str, filename: &str, input: &[u8], output: &[String]) -> Result<serde_json::Value, String> {
     use synsema_core::bytesutil::{b64_encode, hex_encode};
-    use synsema_stdlib::attest::{attest_document, keccak256, program_sha, sha256, AttestConfig, AttestRequest};
+    use synsema_stdlib::attest::{attest_documents_with, current_program_sha, document_json, keccak256, program_sha, select_drivers, sha256, AttestConfig, AttestRequest};
     let joined = output.join("\n");
     let program_sha = program_sha(source, filename)?;
+    // Lo que se atesta tiene que ser lo que corrió: los bytes que leyó el cargador de módulos.
+    if let Some(ran) = current_program_sha() {
+        if ran != program_sha {
+            return Err("a module changed on disk while the program ran; refusing to attest a program_sha that is not the one that ran".to_string());
+        }
+    }
+    let drivers = select_drivers()?;
     let input_sha = sha256(input);
     let output_sha = sha256(joined.as_bytes());
     let state_root = keccak256(joined.as_bytes());
@@ -1788,6 +1797,7 @@ fn attest_run(source: &str, filename: &str, input: &[u8], output: &[String]) -> 
         ceiling: Some(synsema_capabilities::model::build_ceiling_deterministic()),
         tls_key: "none",
         profile: "pure",
+        drivers: drivers.iter().map(|d| d.name()).collect(),
     };
     let config_sha = config.sha();
     let mut bound = Vec::with_capacity(128);
@@ -1796,7 +1806,8 @@ fn attest_run(source: &str, filename: &str, input: &[u8], output: &[String]) -> 
     bound.extend_from_slice(&output_sha);
     bound.extend_from_slice(&config_sha);
     let report_data = sha256(&bound);
-    let res = attest_document(&AttestRequest { report_data: report_data.to_vec(), nonce: None, public_key: None })?;
+    let all = attest_documents_with(&drivers, &AttestRequest { report_data: report_data.to_vec(), nonce: None, public_key: None })?;
+    let res = &all[0];
     let mut attestation = serde_json::json!({
         "format": res.format,
         "document": b64_encode(&res.document),
@@ -1827,6 +1838,7 @@ fn attest_run(source: &str, filename: &str, input: &[u8], output: &[String]) -> 
         "config": config.json(),
         "config_sha": hex_encode(&config_sha),
         "attestation": attestation,
+        "attestations": all.iter().map(document_json).collect::<Vec<_>>(),
     }))
 }
 

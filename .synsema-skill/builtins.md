@@ -214,18 +214,23 @@ and the `run --attest` artefact are in [attestation.md](attestation.md); the dat
 - `attest(opts?)` → map. **`require attest`.** Asks the platform (AWS Nitro / TDX / SEV-SNP /
   dstack, plus a `mock` driver for CI that is never auto-detected) for a document binding
   `opts.report_data` (bytes, ≤ 64 — yours to choose) to the measurement of the running code.
-  → `{format, document: bytes, driver, report_data, aux?, event_log?, root?}`.
+  → `{format, document: bytes, driver, report_data, aux?, event_log?, root?}`. With a driver list
+  (`SYNSEMA_ATTEST=tsm,nitro-tpm`) it uses the first.
 - `attest_key(purpose)` → secret. **`require attest`.** A key the platform derives from the
-  measurement, so another build cannot read what this one sealed. Raw Nitro/TDX/SEV-SNP do not seal
-  keys and say so with an explicit error.
+  measurement, so another build cannot read what this one sealed. Only dstack (and `mock`) derive
+  one; `nitro`/`nitro-tpm`/`tsm` say so with an explicit error.
 - `attestation_document()` → map (no capability) and `attestation_key()` → secret
   (**`require attest`**): the identity of the `serve --attested` you are running inside; outside
   that mode, a clear error. The key is **sealed** — `reveal()` refuses it even with `reveal`.
 - `attestation_verify(doc, opts)` → map. Pure, no capability, no network. **`opts.now` (unix
   seconds) is mandatory**: an enclave has no trustworthy clock and a verdict must be reproducible.
-  `opts.format` names the format, `opts.expect.measurements` compares PCRs. Verifies the COSE ES384
-  signature and the whole X.509 chain against the **pinned** AWS Nitro root. `tdx`/`sgx`/`sev-snp`
-  return an **explicit error** in this release, never an optimistic `true`.
+  `opts.format` = `nitro` | `nitro-tpm` | `sev-snp` | `mock`; `opts.expect = {measurements?,
+  report_data?}` compares (`report_data`: bytes or hex; zero-padded to 64 in `sev-snp`, exact
+  elsewhere). `nitro`/`nitro-tpm`: COSE ES384 + the whole X.509 chain against the **pinned** AWS
+  root. `sev-snp` (v0.6.43+): the report with `opts.aux` (the host's certificate table) or `opts.vek`,
+  AMD's roots embedded and pinned, TCB and policy (`DEBUG` set = error). `tdx`/`sgx` return an
+  **explicit error** in this release, never an optimistic `true`. Full order in
+  [attestation.md](attestation.md).
 - `groth16_verify(vk, proof, public_inputs)` → bool. Pure. A Groth16 proof over BN254, taking
   snarkjs's `verification_key.json` / `proof.json` / `public.json` as they are. An invalid proof is
   `false`; a dubious format is an error.
@@ -670,7 +675,7 @@ let workers be rng_spawn(g, 4)                    -- 4 independent generators (n
 ```
 
 ## I/O (require capabilities)
-- `fetch(url, method?, headers?, body?)` → map with status, headers, body
+- `fetch(url, {method?, headers?, body?, timeout?, tls_pin?, attested?})` → map with status, headers, body (v0.6.43+: the options map is the main form; the positional `fetch(url, method?, headers?, body?, timeout?)` is the short form — see below)
 - `read_file(path, offset?, limit?)` → text — requires `file.read`. No extra args = whole file (lossy for non-UTF-8; use the bytes variant for binary). With `offset` (1-based line) and optional `limit` (max lines), reads a **line range**, preserving EOLs: `read_file(f, 1, 100)` = lines 1–100; `read_file(f, 500)` = from line 500 to EOF. Fewer lines than `limit` ⇒ end of file. `offset < 1` or `limit < 0` → error. `read_file(path, nothing)` is NOT a fallback form — it errors saying so (for a file that may not exist: `file_exists(path)` first, or `try`/`recover`).
 - `read_file_bytes(path)` → `bytes` — requires `file.read` (byte-exact; no range)
 - `write_file(path, content)` → bool — requires `file.write`. **Atomic** (temp + rename); creates parent dirs. If `content` is `bytes`, writes raw bytes; else text.
@@ -699,7 +704,10 @@ let workers be rng_spawn(g, 4)                    -- 4 independent generators (n
 Both `http://` and **`https://` (TLS)** are supported (rustls + OS root CAs, real cert validation). **All HTTP (`http*` and `fetch`) is gated by `net(host)`** — `require net("host")` (deny-by-default, even in `run`; `require net` / `net("*")` = any). See capabilities.md and [stdlib.md](stdlib.md) § HTTP.
 - **URLs** (v0.6.29+): `user:pass@` in the URL sends `Authorization: Basic …` (percent-decoded to raw bytes, like curl/requests: `al%C3%ADce:p%C3%A9@` sends `alíce:pé`) unless you pass your own `Authorization` header; `http://h?x=1` (query, no path) and IPv6 hosts (`http://[::1]:8080/`) work; the `Host` header carries the port when it is not the scheme's default (RFC 9110: `[::1]:18778`); the `#fragment` is not sent; a stray `%` in the path is sent as-is. A URL with no host — `http://alice:pw@/rpc`, or two ports `http://h:1:2/` — is an error that does **not** echo the URL (the credential never reaches the error, the capability check or the audit): `http_get(): the URL has no host (expected scheme://host/…)`.
 - `http(method, url, headers?, query?, body?, timeout?)` → response map `{status, ok, body, json, headers}` (+ `error` ONLY when the transport failed)
-- `http_get(url, headers?, query?, timeout?)` / `http_post(url, body, headers?, timeout?)` / `http_put(url, body, headers?, timeout?)` / `http_delete(url, headers?, timeout?)` / `fetch(url, method?, headers?, body?, timeout?)` → response map
+- `http_get(url, headers?, query?, timeout?)` / `http_post(url, body, headers?, timeout?)` / `http_put(url, body, headers?, timeout?)` / `http_delete(url, headers?, timeout?)` / `fetch(url, opts)` → response map
+- **`fetch(url, {method, headers, body, timeout, tls_pin, attested})`** (v0.6.43+): every key optional, same types and defaults as the positional form (`method` `"GET"`, `timeout` 30); a key set to `nothing` counts as absent — except `tls_pin` and `attested`, where `nothing` is an error (leave the key out for the usual certificate check). **Nothing may follow the map** (`fetch(url, {…}, 30)` → error) and an unknown key is an error listing the valid ones. The positional `fetch(url, method?, headers?, body?, timeout?)` keeps working.
+- **`tls_pin`** (in `fetch`'s map and in `ws_connect`'s opts, v0.6.43+): the server's SubjectPublicKeyInfo as hex, bytes or a `PUBLIC KEY` PEM — the `public_key_hex` of a `serve --attested`. It **replaces** the check against the OS roots and the host name by byte equality of the presented key; the handshake signature is still verified with it. Another key → the transport error `tls_pin: the server public key (SPKI) does not match the pinned key` (in `error of r`); a pin that is not a key → `tls_pin is not a DER SubjectPublicKeyInfo` (raised); over `http://`/`ws://` → error (nothing to pin). Without `tls_pin`, nothing changes. Still needs `require net(host)`. In the wasm profile (the host's `http`) a pinned request fails closed: the embedder cannot pin.
+- **`attested`** (in `fetch`'s map and `ws_connect`'s opts, v0.6.43+): `{program_sha, formats, measurements?, now?}` — connect to a `serve --attested` without knowing its key: one TLS connection, the identity read over it, its key == the handshake's, every document and the `program_sha` verified, and only then your request (never sent on any failure; `error of r` says why). The answer carries `attested: {program_sha, public_key_hex, formats, config}`. Not together with `tls_pin`. Full steps and errors: attestation.md § Talking to the attested key.
 - **Body by type (v0.6.20+):** a **map or list** is sent as JSON with `Content-Type: application/json` (your own `Content-Type` header wins); **text** goes out as-is (no content type added); **bytes** raw. (≤ v0.6.19 a map went out as display text with no header — `json_encode(map)` + the header still works.)
 - **`json of r`** (v0.6.20+): the parsed body when the response content type says JSON and it parses; otherwise `nothing` (never an error). `body of r` stays the raw text.
 - `http_bytes(method, url, headers?, query?, body?, timeout?)` → `{status, ok, bytes, headers}` (v0.6.20+) — the exact bytes the server sent (PDF, image, protobuf); no `body` key. Same `net` gate.

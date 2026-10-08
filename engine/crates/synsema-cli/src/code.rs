@@ -40,6 +40,7 @@ const TOOLS: &[ToolSpec] = &[
     ToolSpec { name: "check", description: "Parse + resolve `use` imports + validate render(\"literal\") templates over one or all .syn files. `errors` (file, line, column, message) block; `warnings` are missing capabilities the runtime would deny.", params: &[P_PATH] },
     ToolSpec { name: "search", description: "Text search over project files (.syn .fsyn .html .css .js .ts .md .json .toml .txt by default; `kinds` restricts). Case-insensitive literal, or `regex: true`. Skips .git/node_modules/target/dist/build, hidden dirs, binaries and files > 2 MiB. Each match carries the enclosing Synsema symbol.", params: &[("pattern", "string", "Literal text (case-insensitive) or a regex when `regex` is true.", true), P_PATH, ("kinds", "array", "File extensions to include, e.g. [\"syn\", \"html\"].", false), ("regex", "boolean", "Treat `pattern` as a regular expression.", false), ("limit", "integer", "Maximum matches (default 200); `truncated` tells if it was hit.", false)] },
     ToolSpec { name: "deps", description: "Task → tasks-it-calls graph per file (builtins excluded) plus the `use` imports between files.", params: &[P_PATH] },
+    ToolSpec { name: "sha", description: "The `program_sha` that `serve --attested` and `run --attest` would bind for this entry file: sha256(source ‖ 0x00 ‖ sha256(module_1) ‖ … ‖ sha256(module_n)), modules in the order `use` resolves them. Returns program_sha (hex) and every module with its sha256.", params: &[("path", "string", "The entry .syn file.", true)] },
 ];
 
 fn tool_schema(t: &ToolSpec) -> Value {
@@ -97,6 +98,7 @@ fn run_tool(root: &Root, name: &str, args: &Value) -> Result<Value, String> {
         "caps" => codeintel::caps(root, path),
         "check" => codeintel::check(root, path),
         "deps" => codeintel::deps(root, path),
+        "sha" => program_sha_json(root, path.ok_or_else(|| "missing required argument `path`".to_string())?)?,
         "search" => {
             let pattern = args.get("pattern").and_then(Value::as_str).filter(|s| !s.is_empty()).ok_or_else(|| "missing required argument `pattern`".to_string())?;
             let kinds = args.get("kinds").and_then(as_str_list);
@@ -111,6 +113,29 @@ fn run_tool(root: &Root, name: &str, args: &Value) -> Result<Value, String> {
         }
         other => return Err(format!("unknown tool `{}` (available: {})", other, TOOLS.iter().map(|t| t.name).collect::<Vec<_>>().join(", "))),
     })
+}
+
+/// `sha`: el `program_sha` del archivo de entrada (el mismo cálculo que `serve`/`run`).
+fn program_sha_json(root: &Root, path: &str) -> Result<Value, String> {
+    let file = if std::path::Path::new(path).is_absolute() || !root.dir.join(path).exists() { std::path::PathBuf::from(path) } else { root.dir.join(path) };
+    let mut source = std::fs::read_to_string(&file).map_err(|e| format!("cannot read {}: {}", file.display(), e))?;
+    let filename = file.to_string_lossy().to_string();
+    // Como `run`: un `.fsyn` se hashea traducido (es lo que corre y lo que se atesta).
+    if filename.ends_with(".fsyn") {
+        source = synsema_core::flat_syntax::translate_flat(&source);
+    }
+    let (sha, modules) = synsema_stdlib::attest::program_sha_detail(&source, &filename)?;
+    let hex = synsema_core::bytesutil::hex_encode;
+    // Rutas relativas a la raíz y con `/`, como el resto de `synsema code`.
+    let rel = |p: &str| -> String {
+        let path = std::path::Path::new(p);
+        let shown = path.strip_prefix(&root.dir).unwrap_or(path);
+        shown.to_string_lossy().replace('\\', "/").trim_start_matches("./").to_string()
+    };
+    Ok(json!({
+        "program_sha": hex(&sha),
+        "modules": modules.iter().map(|(p, h)| json!({"path": rel(p), "sha256": hex(h)})).collect::<Vec<_>>(),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +242,8 @@ fn s(v: &Value) -> String {
 fn render_human(tool: &str, v: &Value) -> String {
     let mut out = String::new();
     match tool {
+        // Sólo el hex: es lo que un script compara contra `program_sha` del documento.
+        "sha" => out = format!("{}\n", s(&v["program_sha"])),
         "outline" if v["brief"] == json!(true) => {
             for f in v["files"].as_array().unwrap_or(&vec![]) {
                 let counts: Vec<String> = f["symbols"].as_object().map(|m| m.iter().map(|(k, n)| format!("{} {}", s(n), k)).collect()).unwrap_or_default();

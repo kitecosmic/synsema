@@ -36,12 +36,14 @@ let r be http_delete(url, {"x-api-key": secret("STORE_API_KEY")})  -- any header
 > (`{name: Alice}`) with no header — `json_encode(map)` + the header still works on every version.
 > Verified against a local `serve` echo route (engine v0.6.20).
 
-**Timeout (optional, trailing arg on every HTTP builtin):** seconds as a positive number; absent
-or invalid → **30** (the historical default). Signatures: `http(method, url, headers?, query?,
-body?, timeout?)`, `http_get(url, headers?, query?, timeout?)`, `http_post(url, body, headers?,
-timeout?)`, `http_put(url, body, headers?, timeout?)`, `http_delete(url, headers?, timeout?)`,
-`fetch(url, method?, headers?, body?, timeout?)`. Use it for slow APIs (>30s) or to fail fast:
-`http("GET", url, nothing, nothing, nothing, 120)`.
+**Timeout (optional, trailing arg on every HTTP builtin; a key in `fetch`'s map):** seconds as a
+positive number; absent or invalid → **30** (the historical default). Signatures: `fetch(url,
+{method, headers, body, timeout, tls_pin, attested})` (v0.6.43+ main form; positional `fetch(url, method?,
+headers?, body?, timeout?)` still works), `http(method, url, headers?, query?, body?, timeout?)`,
+`http_get(url, headers?, query?, timeout?)`, `http_post(url, body, headers?, timeout?)`,
+`http_put(url, body, headers?, timeout?)`, `http_delete(url, headers?, timeout?)`. Use it for slow
+APIs (>30s) or to fail fast: `fetch(url, {"timeout": 120})`. `tls_pin` fixes the server's key
+(builtins.md § I/O; attestation.md § Talking to the attested key).
 
 > **Credentials go in headers:** pass a `secret` directly as a header value —
 > `{"x-api-key": secret("KEY")}` or any custom header; it's materialized only at the
@@ -119,7 +121,10 @@ ws_close(conn)                      -- clean close frame (idempotent)
   (16 MiB default, 64 MiB ceiling), "subprotocols" (list → negotiate Sec-WebSocket-Protocol),
   "max_queue" (inbound cap in MESSAGES, default 1024), "max_queue_bytes" (inbound cap in
   BYTES, default 64 MiB, ceiling 1 GiB — the queue is bounded in BOTH dimensions),
-  "on_full", "reconnect", "keepalive"}`.
+  "on_full", "reconnect", "keepalive", "tls_pin", "attested"}`. `tls_pin` (v0.6.43+, `wss://` only):
+  the server's SubjectPublicKeyInfo (hex/bytes/PEM) replaces the root + host-name check, also on
+  every reconnect; `attested` (v0.6.43+) checks a `serve --attested` on the same connection before
+  the upgrade — see builtins.md § I/O and attestation.md.
 - `ws_recv(conn, timeout?)` → the message map, or **`nothing`** on timeout (default 30s).
   NEVER blocks forever; ping/pong handled transparently.
 - `ws_send(conn, data)` / `ws_close(conn)`. A dead connection errors on send/recv (the

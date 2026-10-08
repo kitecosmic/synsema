@@ -18,7 +18,10 @@
 //!   modo fallan con error claro.
 //!
 //! Drivers (elegidos por `SYNSEMA_ATTEST` o autodetectados en Linux; el `mock` JAMÁS se elige
-//! solo):
+//! solo). `SYNSEMA_ATTEST` acepta una LISTA (`tsm,nitro-tpm`): `serve --attested` y
+//! `run --attest` piden un documento a cada driver con el MISMO `report_data` y no arrancan si
+//! falta uno; `attest()` y `attest_key()` usan el primero. Con autodetección y SEV-SNP + NitroTPM
+//! presentes se usan los dos (`tsm` primero):
 //! - `nitro` (Linux): NSM por `/dev/nsm`, ioctl `_IOWR(0x0A, 0, sizeof(NsmMessage))` con
 //!   request/response CBOR — números y forma confirmados contra `aws-nitro-enclaves-nsm-api`
 //!   (`src/driver/mod.rs`: `NSM_IOCTL_MAGIC = 0x0A`, request ≤ 0x1000, response 0x3000). SIN
@@ -26,6 +29,9 @@
 //! - `tsm` (Linux ≥ 6.7): configfs-tsm (`/sys/kernel/config/tsm/report/<n>/{inblob,outblob,
 //!   provider,auxblob}`). `provider` decide el formato (`tdx_guest` → `tdx`, `sev_guest` →
 //!   `sev-snp`). Sin fallback a `/dev/tdx_guest`/`/dev/sev-guest` por ahora. SIN PROBAR.
+//! - `nitro-tpm` (Linux): EC2 instance attestation por el TPM de la VM (`attest_nitrotpm.rs`, sin
+//!   binarios externos). Autodetectado sólo si el TPM responde al comando de proveedor de Nitro.
+//!   SIN PROBAR en hardware.
 //! - `dstack` (Unix): HTTP/1.1 mínimo sobre el socket unix del guest agent. Rutas y JSON
 //!   confirmados contra el SDK Go de `Dstack-TEE/dstack` (`sdk/go/dstack/client_v0.go`,
 //!   `transport.go`) y `sdk/curl/api-tappd.md` (el `tappd.sock` viejo). SIN PROBAR contra el
@@ -118,48 +124,96 @@ pub fn keccak256(data: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// SHA-256 del PROGRAMA: el fuente principal más cada módulo `use` (recursivo, en el orden
-/// en que el check estático los resuelve, mismas reglas que el runtime). Es lo que va en
+/// SHA-256 del PROGRAMA: el fuente principal más cada módulo `use`. Es lo que va en
 /// `report_data` de `serve --attested` y `run --attest`: la imagen es genérica y la medida de
 /// la plataforma cubre la imagen; este hash dice QUÉ `.syn` corre. No cubre templates ni
-/// estáticos (van en la imagen). Forma: `sha256(main ‖ 0x00 ‖ sha256(mod_1) ‖ … ‖ sha256(mod_n))`.
-/// El sha del programa que corre en ESTE proceso (T4: el recibo lo lleva). Lo fija `run`,
-/// `test` y `serve` al arrancar; sin él (REPL, embebido sin fuente) el recibo lo omite.
-static PROGRAM_SHA: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+/// estáticos (van en la imagen). Forma: `sha256(main ‖ 0x00 ‖ sha256(mod_1) ‖ … ‖ sha256(mod_n))`
+/// con los módulos del recorrido canónico (`templates::module_walk`): en profundidad, en el orden
+/// en que aparecen los `use` (el orden en que el runtime los carga), cada ruta resuelta UNA vez
+/// (hasta v0.6.42 el chequeo estático cargaba cada `use` dos veces y entraba repetido).
+///
+/// El del programa que corre en ESTE proceso lo pide `receipt()`. `run`, `test` y `serve` sólo
+/// ANOTAN el fuente al arrancar ([`note_program_sha`], sin trabajo: medido, recorrer y parsear
+/// los módulos ahí sumaba +83 ms al arranque con ocho módulos de 1100 líneas); el hash se calcula
+/// la primera vez que se pide, con los MISMOS bytes que el cargador ya leyó para ejecutar
+/// (`loaded_modules`), sin releer ni reparsear. Un módulo que no llegó a cargarse (un `use` en una
+/// rama que no corrió) se lee entonces del bundle o del disco. Sin fuente anotado (REPL,
+/// embebido) el recibo lo omite.
+static NOTED_PROGRAM: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+static PROGRAM_SHA: std::sync::OnceLock<Option<[u8; 32]>> = std::sync::OnceLock::new();
 
-/// Anota el sha del programa principal (+ módulos) de este proceso. Best-effort: si el
-/// hash falla (un `use` que no resuelve) no se anota y el recibo lo omite.
+/// Anota el fuente principal de este proceso (no calcula nada; la primera anotación gana).
 pub fn note_program_sha(source: &str, filename: &str) {
-    if let Ok(sha) = program_sha(source, filename) {
-        let _ = PROGRAM_SHA.set(sha);
+    if NOTED_PROGRAM.get().is_none() {
+        let _ = NOTED_PROGRAM.set((source.to_string(), filename.to_string()));
     }
 }
 
+/// El `program_sha` del programa de este proceso (best-effort: un `use` que no resuelve → `None`).
+/// Bajo `serve --attested` es el de la identidad: una sola verdad por proceso.
 pub fn current_program_sha() -> Option<[u8; 32]> {
-    PROGRAM_SHA.get().copied()
+    if let Some(id) = attested_identity() {
+        return Some(id.program_sha);
+    }
+    *PROGRAM_SHA.get_or_init(|| {
+        let (source, filename) = NOTED_PROGRAM.get()?;
+        let program = synsema_core::parser::parse_source(source, filename).ok()?;
+        let loaded = |resolved: &str, raw: &str| match synsema_core::loaded_modules::get(resolved) {
+            Some(entry) => Ok(entry),
+            None => read_module(resolved, raw),
+        };
+        let modules = synsema_core::templates::module_walk(synsema_core::loaded_modules::use_paths(&program), filename, &loaded).ok()?;
+        Some(fold_program_sha(source, &modules).0)
+    })
 }
 
-pub fn program_sha(source: &str, filename: &str) -> Result<[u8; 32], String> {
-    let program = synsema_core::parser::parse_source(source, filename).map_err(|e| e.to_string())?;
-    let modules: RefCell<Vec<[u8; 32]>> = RefCell::new(Vec::new());
-    let load = |resolved: &str, raw: &str| -> Result<synsema_core::ast::Program, String> {
-        // Overlay del bundle (`synsema build`) primero, disco después — como `load_module_inner`.
-        let src = match synsema_core::bundle::get(resolved) {
-            Some(bytes) => String::from_utf8(bytes.to_vec()).map_err(|_| format!("module is not UTF-8: {}", raw))?,
-            None => std::fs::read_to_string(resolved).map_err(|_| format!("module not found: {}", raw))?,
-        };
-        let prog = synsema_core::parser::parse_source(&src, resolved).map_err(|e| e.to_string())?;
-        modules.borrow_mut().push(sha256(src.as_bytes()));
-        Ok(prog)
+/// Un módulo del bundle (`synsema build`) o del disco, como `load_module_inner`: su fuente y sus `use`.
+fn read_module(resolved: &str, raw: &str) -> Result<(std::sync::Arc<str>, Vec<String>), String> {
+    let src = match synsema_core::bundle::get(resolved) {
+        Some(bytes) => String::from_utf8(bytes.to_vec()).map_err(|_| format!("module is not UTF-8: {}", raw))?,
+        None => std::fs::read_to_string(resolved).map_err(|_| format!("module not found: {}", raw))?,
     };
-    synsema_core::templates::check_program_static_with(&program, filename, &load)?;
+    let prog = synsema_core::parser::parse_source(&src, resolved).map_err(|e| e.to_string())?;
+    Ok((std::sync::Arc::from(src.as_str()), synsema_core::loaded_modules::use_paths(&prog)))
+}
+
+fn fold_program_sha(source: &str, modules: &[(String, std::sync::Arc<str>)]) -> ([u8; 32], Vec<(String, [u8; 32])>) {
+    let detail: Vec<(String, [u8; 32])> = modules.iter().map(|(p, src)| (p.clone(), sha256(src.as_bytes()))).collect();
     let mut h = Sha256::new();
     h.update(source.as_bytes());
     h.update([0u8]);
-    for m in modules.borrow().iter() {
+    for (_, m) in &detail {
         h.update(m);
     }
-    Ok(h.finalize().into())
+    (h.finalize().into(), detail)
+}
+
+pub fn program_sha(source: &str, filename: &str) -> Result<[u8; 32], String> {
+    program_sha_detail(source, filename).map(|(sha, _)| sha)
+}
+
+/// [`program_sha`] más los módulos que entraron, en orden: `(ruta resuelta, sha256 del fuente)`.
+/// Es lo que imprime `synsema code sha` y lo que atan `serve --attested`/`run --attest`, que
+/// además exigen que el programa pase el chequeo estático (como hasta ahora).
+pub fn program_sha_detail(source: &str, filename: &str) -> Result<([u8; 32], Vec<(String, [u8; 32])>), String> {
+    let program = synsema_core::parser::parse_source(source, filename).map_err(|e| e.to_string())?;
+    // Cada módulo se lee UNA vez: lo que valida el chequeo es exactamente lo que se hashea.
+    let cache: RefCell<std::collections::HashMap<String, (std::sync::Arc<str>, Vec<String>)>> = RefCell::new(std::collections::HashMap::new());
+    let read_once = |resolved: &str, raw: &str| -> Result<(std::sync::Arc<str>, Vec<String>), String> {
+        if let Some(hit) = cache.borrow().get(resolved) {
+            return Ok(hit.clone());
+        }
+        let entry = read_module(resolved, raw)?;
+        cache.borrow_mut().insert(resolved.to_string(), entry.clone());
+        Ok(entry)
+    };
+    let parse = |resolved: &str, raw: &str| -> Result<synsema_core::ast::Program, String> {
+        let (src, _) = read_once(resolved, raw)?;
+        synsema_core::parser::parse_source(&src, resolved).map_err(|e| e.to_string())
+    };
+    synsema_core::templates::check_program_static_with(&program, filename, &parse)?;
+    let modules = synsema_core::templates::module_walk(synsema_core::loaded_modules::use_paths(&program), filename, &read_once)?;
+    Ok(fold_program_sha(source, &modules))
 }
 
 // =========================================================
@@ -203,6 +257,7 @@ pub struct AttestResult {
 pub enum Driver {
     Nitro,
     Tsm,
+    NitroTpm,
     Dstack,
     Mock,
 }
@@ -212,14 +267,29 @@ impl Driver {
         match self {
             Driver::Nitro => "nitro",
             Driver::Tsm => "tsm",
+            Driver::NitroTpm => "nitro-tpm",
             Driver::Dstack => "dstack",
             Driver::Mock => "mock",
+        }
+    }
+
+    fn parse(v: &str) -> Result<Driver, String> {
+        match v {
+            "nitro" | "nsm" => Ok(Driver::Nitro),
+            "tsm" | "tdx" | "sev-snp" | "sev_snp" | "snp" => Ok(Driver::Tsm),
+            "nitro-tpm" => Ok(Driver::NitroTpm),
+            "dstack" | "tappd" => Ok(Driver::Dstack),
+            "mock" => Ok(Driver::Mock),
+            other => Err(format!(
+                "attest: unknown driver '{}' in SYNSEMA_ATTEST (expected nitro|tsm|nitro-tpm|dstack, or mock for development)",
+                other
+            )),
         }
     }
 }
 
 /// Error canónico cuando no hay plataforma.
-pub const NO_PLATFORM: &str = "attest: no attestation platform detected (set SYNSEMA_ATTEST=nitro|tsm|dstack, or SYNSEMA_ATTEST=mock for development)";
+pub const NO_PLATFORM: &str = "attest: no attestation platform detected (set SYNSEMA_ATTEST=nitro|tsm|nitro-tpm|dstack, a list such as tsm,nitro-tpm, or SYNSEMA_ATTEST=mock for development)";
 
 /// Rutas donde puede vivir el socket del guest agent de dstack (las mismas que prueba su SDK
 /// Go, más el `tappd.sock` de las versiones < 0.3).
@@ -233,31 +303,45 @@ const DSTACK_SOCKETS: &[&str] = &[
 #[allow(dead_code)]
 const TAPPD_SOCKET: &str = "/var/run/tappd.sock";
 
-/// Elige el driver: `SYNSEMA_ATTEST` manda; sin él, autodetección en Linux por la presencia
-/// del dispositivo/socket. El `mock` sólo entra por la variable, jamás por detección.
-pub fn select_driver() -> Result<Driver, String> {
+/// Elige los drivers: `SYNSEMA_ATTEST` manda (uno o una lista separada por comas, sin
+/// repetidos; `mock` sólo solo); sin él, autodetección en Linux por la presencia del
+/// dispositivo/socket. El `mock` sólo entra por la variable, jamás por detección.
+pub fn select_drivers() -> Result<Vec<Driver>, String> {
     if let Ok(v) = std::env::var("SYNSEMA_ATTEST") {
         let v = v.trim().to_ascii_lowercase();
         if !v.is_empty() {
-            return match v.as_str() {
-                "nitro" | "nsm" => Ok(Driver::Nitro),
-                "tsm" | "tdx" | "sev-snp" | "sev_snp" | "snp" => Ok(Driver::Tsm),
-                "dstack" | "tappd" => Ok(Driver::Dstack),
-                "mock" => Ok(Driver::Mock),
-                other => Err(format!(
-                    "attest: unknown driver '{}' in SYNSEMA_ATTEST (expected nitro|tsm|dstack, or mock for development)",
-                    other
-                )),
-            };
+            let mut out: Vec<Driver> = Vec::new();
+            for item in v.split(',') {
+                let item = item.trim();
+                if item.is_empty() {
+                    return Err(format!("attest: SYNSEMA_ATTEST has an empty driver name in the list {:?}", v));
+                }
+                let d = Driver::parse(item)?;
+                if out.contains(&d) {
+                    return Err(format!("attest: driver '{}' appears twice in SYNSEMA_ATTEST", d.name()));
+                }
+                out.push(d);
+            }
+            if out.len() > 1 && out.contains(&Driver::Mock) {
+                return Err("attest: the mock driver cannot be combined with other drivers in SYNSEMA_ATTEST (its documents are forgeable)".to_string());
+            }
+            return Ok(out);
         }
     }
     #[cfg(target_os = "linux")]
     {
         if std::path::Path::new("/dev/nsm").exists() {
-            return Ok(Driver::Nitro);
+            return Ok(vec![Driver::Nitro]);
         }
+        let mut found = Vec::new();
         if std::path::Path::new(TSM_REPORT_DIR).is_dir() {
-            return Ok(Driver::Tsm);
+            found.push(Driver::Tsm);
+        }
+        if crate::attest_nitrotpm::probe() {
+            found.push(Driver::NitroTpm);
+        }
+        if !found.is_empty() {
+            return Ok(found);
         }
     }
     #[cfg(unix)]
@@ -265,17 +349,29 @@ pub fn select_driver() -> Result<Driver, String> {
         // Sólo los sockets REALES del guest agent autodetectan dstack; el simulador
         // (`DSTACK_SIMULATOR_ENDPOINT`) exige `SYNSEMA_ATTEST=dstack` explícito (auditoría externa).
         if DSTACK_SOCKETS.iter().chain(std::iter::once(&TAPPD_SOCKET)).any(|p| std::path::Path::new(p).exists()) {
-            return Ok(Driver::Dstack);
+            return Ok(vec![Driver::Dstack]);
         }
     }
     Err(NO_PLATFORM.to_string())
 }
 
-/// Auditoría externa: elige el driver Y comprueba que su plataforma está al alcance (dispositivo,
-/// directorio o socket presentes; SO correcto) SIN pedir un documento. Es lo que `run --attest`
-/// corre ANTES de ejecutar el programa: sin plataforma no se ejecuta nada.
-pub fn preflight() -> Result<Driver, String> {
-    let driver = select_driver()?;
+/// El primer driver de [`select_drivers`]: el que usan `attest()` y `attest_key()`.
+pub fn select_driver() -> Result<Driver, String> {
+    select_drivers().map(|d| d[0])
+}
+
+/// Auditoría externa: elige los drivers Y comprueba que la plataforma de cada uno está al alcance
+/// (dispositivo, directorio o socket presentes; SO correcto) SIN pedir un documento. Es lo que
+/// `run --attest` corre ANTES de ejecutar el programa: sin plataforma no se ejecuta nada.
+pub fn preflight() -> Result<Vec<Driver>, String> {
+    let drivers = select_drivers()?;
+    for d in &drivers {
+        preflight_one(*d)?;
+    }
+    Ok(drivers)
+}
+
+fn preflight_one(driver: Driver) -> Result<(), String> {
     match driver {
         Driver::Mock => {}
         Driver::Nitro => {
@@ -298,6 +394,14 @@ pub fn preflight() -> Result<Driver, String> {
                 return Err("attest: the tsm driver is Linux-only (configfs-tsm, Linux >= 6.7 in a TDX or SEV-SNP guest)".to_string());
             }
         }
+        Driver::NitroTpm => {
+            if !cfg!(target_os = "linux") {
+                return Err("attest: the nitro-tpm driver is Linux-only (it talks to the TPM of an EC2 instance)".to_string());
+            }
+            if !crate::attest_nitrotpm::device_present() {
+                return Err(crate::attest_nitrotpm::NOT_AVAILABLE.to_string());
+            }
+        }
         Driver::Dstack => {
             #[cfg(unix)]
             {
@@ -315,12 +419,10 @@ pub fn preflight() -> Result<Driver, String> {
             }
         }
     }
-    Ok(driver)
+    Ok(())
 }
 
-/// Pide el documento al driver elegido. Es la API que usan `serve --attested` y
-/// `run --attest` sin pasar por el intérprete (la capability la gatea el builtin).
-pub fn attest_document(req: &AttestRequest) -> Result<AttestResult, String> {
+fn check_report_data_len(req: &AttestRequest) -> Result<(), String> {
     if req.report_data.len() > MAX_REPORT_DATA {
         return Err(format!(
             "attest: report_data must be at most {} bytes, got {} (hash it first: sha256(...) is 32)",
@@ -328,12 +430,75 @@ pub fn attest_document(req: &AttestRequest) -> Result<AttestResult, String> {
             req.report_data.len()
         ));
     }
-    match select_driver()? {
+    Ok(())
+}
+
+/// Pide el documento a UN driver y comprueba, en los formatos que el motor sabe leer, que el
+/// documento lleve de verdad el `report_data` pedido (no sólo que el driver lo diga).
+pub fn attest_with_driver(driver: Driver, req: &AttestRequest) -> Result<AttestResult, String> {
+    check_report_data_len(req)?;
+    let res = match driver {
         Driver::Mock => mock::attest(req),
         Driver::Nitro => nitro::attest(req),
         Driver::Tsm => tsm::attest(req),
+        Driver::NitroTpm => crate::attest_nitrotpm::attest(req),
         Driver::Dstack => dstack::attest(req),
+    }?;
+    check_document_binding(&res, &req.report_data)?;
+    Ok(res)
+}
+
+/// El `report_data` que lleva el documento: `user_data` del COSE (`nitro`, `nitro-tpm`, `mock`) o
+/// `REPORT_DATA` del reporte SEV-SNP (64 bytes, el pedido con relleno de ceros).
+fn check_document_binding(res: &AttestResult, want: &[u8]) -> Result<(), String> {
+    match res.format {
+        "nitro" | "nitro-tpm" | "mock" => {
+            let got = (|| -> Option<Vec<u8>> {
+                let cose = CoseSign1::parse(&res.document).ok()?;
+                let (payload, _) = crate::cbor::decode_allow_indefinite(cose.payload.as_deref()?).ok()?;
+                Some(match payload.get("user_data") {
+                    None | Some(Cbor::Null) => Vec::new(),
+                    Some(c) => c.as_bytes()?.to_vec(),
+                })
+            })()
+            .ok_or_else(|| format!("attest: the {} document does not parse", res.format))?;
+            if got != want {
+                return Err(format!("attest: the {} document does not carry the requested report_data", res.format));
+            }
+        }
+        "sev-snp" => {
+            let mut padded = want.to_vec();
+            padded.resize(MAX_REPORT_DATA, 0);
+            if res.document.len() != crate::attestation_snp::REPORT_LEN || res.document[0x50..0x90] != padded[..] {
+                return Err("attest: the sev-snp report does not carry the requested report_data".to_string());
+            }
+        }
+        _ => {}
     }
+    Ok(())
+}
+
+/// Pide el documento al PRIMER driver elegido (lo que usa el builtin `attest()`).
+pub fn attest_document(req: &AttestRequest) -> Result<AttestResult, String> {
+    check_report_data_len(req)?;
+    attest_with_driver(select_driver()?, req)
+}
+
+/// Pide un documento a CADA driver elegido, con el mismo `req`. Si uno falla, error que lo nombra:
+/// sin todos los documentos no hay identidad (es lo que usan `serve --attested` y `run --attest`).
+pub fn attest_documents(req: &AttestRequest) -> Result<Vec<AttestResult>, String> {
+    attest_documents_with(&select_drivers()?, req)
+}
+
+/// [`attest_documents`] con una lista ya elegida (así `config.drivers` y los documentos salen de
+/// UNA sola selección).
+pub fn attest_documents_with(drivers: &[Driver], req: &AttestRequest) -> Result<Vec<AttestResult>, String> {
+    check_report_data_len(req)?;
+    let mut out = Vec::with_capacity(drivers.len());
+    for d in drivers {
+        out.push(attest_with_driver(*d, req).map_err(|e| format!("driver {}: {}", d.name(), e))?);
+    }
+    Ok(out)
 }
 
 /// Clave sellada a la medida, como bytes (el builtin la envuelve en `secret`).
@@ -344,7 +509,7 @@ pub fn attest_key_bytes(purpose: &str) -> Result<Vec<u8>, String> {
     match select_driver()? {
         Driver::Mock => Ok(mock::derive_key(purpose)),
         Driver::Dstack => dstack::get_key(purpose),
-        Driver::Nitro | Driver::Tsm => Err(
+        Driver::Nitro | Driver::Tsm | Driver::NitroTpm => Err(
             "attest_key: this platform does not derive sealed keys; release the key from a KMS against the attestation (see the attested serve recipe)"
                 .to_string(),
         ),
@@ -1141,10 +1306,13 @@ pub struct AttestConfig {
     pub tls_key: &'static str,
     /// `"native"` | `"pure"`.
     pub profile: &'static str,
+    /// Los drivers que atestan este proceso, en orden (T4: `["tsm", "nitro-tpm"]`). Entra en
+    /// `config_sha`: un cliente sabe cuántos documentos tiene que encontrar.
+    pub drivers: Vec<&'static str>,
 }
 
 impl AttestConfig {
-    /// JSON canónico: `{"ceiling":…,"engine":"…","labels":bool,"profile":"…","tls_key":"…"}`.
+    /// JSON canónico: `{"ceiling":…,"drivers":[…],"engine":"…","labels":bool,"profile":"…","tls_key":"…"}`.
     pub fn canonical_json(&self) -> String {
         let q = |s: &str| serde_json::Value::String(s.to_string()).to_string();
         let ceiling = match &self.ceiling {
@@ -1157,9 +1325,11 @@ impl AttestConfig {
                 format!("[{}]", items.iter().map(|i| q(i)).collect::<Vec<_>>().join(","))
             }
         };
+        let drivers = format!("[{}]", self.drivers.iter().map(|d| q(d)).collect::<Vec<_>>().join(","));
         format!(
-            "{{\"ceiling\":{},\"engine\":{},\"labels\":{},\"profile\":{},\"tls_key\":{}}}",
+            "{{\"ceiling\":{},\"drivers\":{},\"engine\":{},\"labels\":{},\"profile\":{},\"tls_key\":{}}}",
             ceiling,
+            drivers,
             q(engine_version()),
             self.labels,
             q(self.profile),
@@ -1192,10 +1362,37 @@ pub struct AttestedIdentity {
     pub config: AttestConfig,
     pub config_sha: [u8; 32],
     pub report_data: [u8; 32],
+    /// El documento del PRIMER driver (los campos de arriba del JSON, para no romper clientes).
     pub attestation: AttestResult,
+    /// Todos los documentos, uno por driver y en orden (el primero es `attestation`).
+    pub attestations: Vec<AttestResult>,
+    /// T10: cuándo vence lo publicado (la hoja más corta; la VLEK en SEV-SNP). Pasado este momento
+    /// la identidad no se sirve más (`/.well-known/attestation` 503, `attestation_document()` error).
+    pub expires_at: Option<i64>,
+}
+
+impl Drop for AttestedIdentity {
+    /// Cada renovación suelta la copia anterior: la clave no queda en el heap.
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.private_scalar.zeroize();
+        self.pkcs8_der.zeroize();
+    }
 }
 
 impl AttestedIdentity {
+    /// ¿Venció lo que publica? (`now` en segundos unix)
+    pub fn expired_at(&self, now: i64) -> bool {
+        self.expires_at.map_or(false, |e| now > e)
+    }
+}
+
+impl AttestedIdentity {
+    /// El JSON publicado, como texto (lo sirve `GET /.well-known/attestation`).
+    pub fn json_text(&self) -> String {
+        self.json().to_string()
+    }
+
     pub fn public_key_pem(&self) -> String {
         pem("PUBLIC KEY", &self.spki_der)
     }
@@ -1221,6 +1418,7 @@ impl AttestedIdentity {
         if let Some(log) = &self.attestation.event_log {
             v["event_log"] = serde_json::Value::String(log.clone());
         }
+        v["documents"] = serde_json::Value::Array(self.attestations.iter().map(document_json).collect());
         if self.attestation.driver == "mock" {
             v["mock"] = serde_json::Value::Bool(true);
             // Auditoría MEDIO 2: el cliente de CI necesita la raíz del mock para poder llamar
@@ -1233,6 +1431,28 @@ impl AttestedIdentity {
         }
         v
     }
+}
+
+/// Un documento en `documents` (identidad) y en `attestations` (`run --attest`).
+pub fn document_json(r: &AttestResult) -> serde_json::Value {
+    let mut d = serde_json::json!({
+        "format": r.format,
+        "driver": r.driver,
+        "document": b64_encode(&r.document),
+    });
+    if let Some(aux) = &r.aux {
+        d["aux"] = serde_json::Value::String(b64_encode(aux));
+    }
+    if let Some(log) = &r.event_log {
+        d["event_log"] = serde_json::Value::String(log.clone());
+    }
+    if r.driver == "mock" {
+        d["mock"] = serde_json::Value::Bool(true);
+        if let Some(root) = &r.root {
+            d["root"] = serde_json::Value::String(b64_encode(root));
+        }
+    }
+    d
 }
 
 fn pem(label: &str, der: &[u8]) -> String {
@@ -1251,10 +1471,27 @@ pub fn engine_version() -> &'static str {
     option_env!("SYNSEMA_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
 }
 
-/// Genera el par P-256 desde OsRng y pide la attestation con
-/// `report_data = sha256(spki ‖ program_sha ‖ config_sha)`. Falla → el servidor no arranca.
+/// Un driver tal como lo ve la construcción de la identidad: nombre + cómo pedirle el documento.
+pub type DriverFn<'a> = (&'static str, &'a dyn Fn(&AttestRequest) -> Result<AttestResult, String>);
+
+/// Genera el par P-256 desde OsRng y pide la attestation a CADA driver elegido con
+/// `report_data = sha256(spki ‖ program_sha ‖ config_sha)`. Falla uno → el servidor no arranca.
 pub fn build_attested_identity(source: &str, filename: &str, config: AttestConfig) -> Result<AttestedIdentity, String> {
+    let drivers = select_drivers().map_err(|e| format!("serve --attested: {}", e))?;
+    let calls: Vec<Box<dyn Fn(&AttestRequest) -> Result<AttestResult, String>>> =
+        drivers.iter().map(|d| -> Box<dyn Fn(&AttestRequest) -> Result<AttestResult, String>> { let d = *d; Box::new(move |r| attest_with_driver(d, r)) }).collect();
+    let list: Vec<DriverFn<'_>> = drivers.iter().zip(calls.iter()).map(|(d, c)| (d.name(), c.as_ref())).collect();
+    build_attested_identity_with(source, filename, config, &list)
+}
+
+/// [`build_attested_identity`] con los drivers dados (los tests inyectan drivers falsos).
+/// `config.drivers` se reemplaza por sus nombres, así entra en `config_sha`.
+pub fn build_attested_identity_with(source: &str, filename: &str, mut config: AttestConfig, drivers: &[DriverFn<'_>]) -> Result<AttestedIdentity, String> {
     use p256::elliptic_curve::sec1::ToEncodedPoint;
+    if drivers.is_empty() {
+        return Err("serve --attested: no attestation driver".to_string());
+    }
+    config.drivers = drivers.iter().map(|(n, _)| *n).collect();
     let program_sha = program_sha(source, filename).map_err(|e| format!("serve --attested: cannot hash the program: {}", e))?;
     let mut scalar = None;
     for _ in 0..16 {
@@ -1278,9 +1515,19 @@ pub fn build_attested_identity(source: &str, filename: &str, config: AttestConfi
     h.update(program_sha);
     h.update(config_sha);
     let report_data: [u8; 32] = h.finalize().into();
-    let attestation = attest_document(&AttestRequest { report_data: report_data.to_vec(), nonce: None, public_key: None })
-        .map_err(|e| format!("serve --attested: {}", e))?;
-    Ok(AttestedIdentity { private_scalar, pkcs8_der, spki_der, program_sha, config, config_sha, report_data, attestation })
+    let req = AttestRequest { report_data: report_data.to_vec(), nonce: None, public_key: None };
+    let mut attestations = Vec::with_capacity(drivers.len());
+    for (name, call) in drivers {
+        let res = call(&req).map_err(|e| format!("serve --attested: driver {}: {}", name, e))?;
+        if res.driver != *name {
+            return Err(format!("serve --attested: driver {} answered as {}", name, res.driver));
+        }
+        attestations.push(res);
+    }
+    let attestation = attestations[0].clone();
+    // El vencimiento con lo que se pueda leer; `spawn_renewal` exige después que se lea todo.
+    let expires_at = attestations.iter().filter_map(|r| document_window(r).ok().flatten()).map(|(_, na)| na).min();
+    Ok(AttestedIdentity { private_scalar, pkcs8_der, spki_der, program_sha, config, config_sha, report_data, attestation, attestations, expires_at })
 }
 
 /// Certificado TLS autofirmado (DER) emitido con LA MISMA clave P-256 de la identidad: el
@@ -1297,15 +1544,248 @@ pub fn self_signed_cert_der(id: &AttestedIdentity, sans: &[String]) -> Result<Ve
     Ok(cert.der().to_vec())
 }
 
-static IDENTITY: OnceLock<Arc<AttestedIdentity>> = OnceLock::new();
+/// La identidad del proceso. Se instala una vez y la RENUEVA [`spawn_renewal`] (T10): misma
+/// clave, mismo binding, documentos nuevos. Los lectores toman un `Arc` (sin lock largo).
+static IDENTITY: OnceLock<std::sync::RwLock<Option<Arc<AttestedIdentity>>>> = OnceLock::new();
+
+fn identity_slot() -> &'static std::sync::RwLock<Option<Arc<AttestedIdentity>>> {
+    IDENTITY.get_or_init(|| std::sync::RwLock::new(None))
+}
 
 /// Publica la identidad del proceso (una sola vez; la lee todo intérprete del serve).
 pub fn install_attested_identity(id: AttestedIdentity) -> Result<(), String> {
-    IDENTITY.set(Arc::new(id)).map_err(|_| "serve --attested: the attested identity was already installed".to_string())
+    let mut slot = identity_slot().write().map_err(|_| "serve --attested: the identity lock is poisoned".to_string())?;
+    if slot.is_some() {
+        return Err("serve --attested: the attested identity was already installed".to_string());
+    }
+    *slot = Some(Arc::new(id));
+    Ok(())
 }
 
+/// La identidad VIGENTE (la última renovación).
 pub fn attested_identity() -> Option<Arc<AttestedIdentity>> {
-    IDENTITY.get().cloned()
+    identity_slot().read().ok()?.clone()
+}
+
+/// Reemplaza los documentos de la identidad instalada de una vez. Exige la MISMA clave y el
+/// mismo binding: una renovación no puede cambiar qué se atesta.
+fn replace_attestations(attestations: Vec<AttestResult>, expires_at: Option<i64>) -> Result<(), String> {
+    let mut slot = identity_slot().write().map_err(|_| "the identity lock is poisoned".to_string())?;
+    let cur = slot.as_ref().ok_or("no attested identity installed")?;
+    if attestations.len() != cur.attestations.len() {
+        return Err("renewal returned another number of documents".to_string());
+    }
+    for (old, new) in cur.attestations.iter().zip(&attestations) {
+        if old.driver != new.driver || old.format != new.format {
+            return Err(format!("renewal answered {}/{} where {}/{} was attested", new.driver, new.format, old.driver, old.format));
+        }
+        if !new.report_data.starts_with(&cur.report_data) {
+            return Err(format!("renewal of {} does not carry the attested binding", new.driver));
+        }
+    }
+    let next = AttestedIdentity {
+        private_scalar: cur.private_scalar.clone(),
+        pkcs8_der: cur.pkcs8_der.clone(),
+        spki_der: cur.spki_der.clone(),
+        program_sha: cur.program_sha,
+        config: cur.config.clone(),
+        config_sha: cur.config_sha,
+        report_data: cur.report_data,
+        attestation: attestations[0].clone(),
+        attestations,
+        expires_at,
+    };
+    *slot = Some(Arc::new(next));
+    Ok(())
+}
+
+// =========================================================
+// T10 — renovación de los documentos de `serve --attested`
+// =========================================================
+
+/// Una renovación, por día, para los documentos sin vencimiento corto (`sev-snp`, `tdx`).
+pub const RENEW_LONG_LIVED_SECS: i64 = 24 * 3600;
+
+/// La ventana de validez `(not_before, not_after)` de lo que vence en un documento:
+/// - `nitro`, `nitro-tpm`, `mock`: el certificado HOJA del COSE (~3 h en AWS). Si no se puede
+///   leer es ERROR: no se puede programar la renovación de algo cuyo vencimiento no se conoce.
+/// - `sev-snp`: la VCEK/VLEK de la tabla `aux` (la de AWS vive un año); sin `aux`, `None`.
+/// - `tdx`: `None` (sin vencimiento corto que el motor conozca).
+pub fn document_window(r: &AttestResult) -> Result<Option<(i64, i64)>, String> {
+    use x509_parser::prelude::FromDer;
+    let validity = |der: &[u8]| -> Option<(i64, i64)> {
+        let (_, cert) = x509_parser::certificate::X509Certificate::from_der(der).ok()?;
+        let v = cert.validity();
+        Some((v.not_before.timestamp(), v.not_after.timestamp()))
+    };
+    match r.format {
+        "nitro" | "nitro-tpm" | "mock" => {
+            let leaf = (|| -> Option<Vec<u8>> {
+                let cose = CoseSign1::parse(&r.document).ok()?;
+                let (payload, _) = crate::cbor::decode_allow_indefinite(cose.payload.as_deref()?).ok()?;
+                Some(payload.get("certificate")?.as_bytes()?.to_vec())
+            })();
+            match leaf.as_deref().and_then(validity) {
+                Some(w) => Ok(Some(w)),
+                None => Err(format!("cannot read the validity of the {} document's leaf certificate", r.format)),
+            }
+        }
+        "sev-snp" => Ok(r.aux.as_deref().and_then(crate::attestation_snp::vek_in_aux).as_deref().and_then(validity)),
+        _ => Ok(None),
+    }
+}
+
+/// Cuándo renovar y cuándo vence lo vigente: a la mitad de la vida de lo que vence primero (y como
+/// mucho en un día); `deadline` = el vencimiento más próximo (`None` si nada vence).
+///
+/// Si la mitad ya pasó (una VLEK de un año que la renovación NO refresca: el documento nuevo trae
+/// la misma), se renueva a la mitad de lo que queda — si no, pasada la mitad se renovaría cada
+/// segundo. Con meses por delante eso es el tope de un día; cerca del vencimiento los intentos se
+/// acercan sin girar en vacío.
+pub fn renewal_schedule(docs: &[AttestResult], now: i64, window_of: &dyn Fn(&AttestResult) -> Result<Option<(i64, i64)>, String>) -> Result<(i64, Option<i64>), String> {
+    let mut next = now + RENEW_LONG_LIVED_SECS;
+    let mut deadline: Option<i64> = None;
+    for d in docs {
+        if let Some((nb, na)) = window_of(d)? {
+            let half = nb + (na - nb) / 2;
+            next = next.min(if half > now { half } else { now + (na - now) / 2 });
+            deadline = Some(deadline.map_or(na, |x: i64| x.min(na)));
+        }
+    }
+    Ok((next.max(now + 1), deadline))
+}
+
+/// Lo que hace la renovación al terminar mal: el motivo, para cerrar el servidor con error.
+static RENEWAL_FAILURE: OnceLock<String> = OnceLock::new();
+
+/// Si la renovación cerró el servidor, por qué (el `serve` sale con error).
+pub fn renewal_failure() -> Option<String> {
+    RENEWAL_FAILURE.get().cloned()
+}
+
+/// Un driver de la renovación: nombre + cómo pedirle el documento.
+pub type RenewalDriver = (&'static str, Box<dyn Fn(&AttestRequest) -> Result<AttestResult, String> + Send>);
+
+/// El bucle de renovación, con todo inyectable para los tests: los drivers (mismo `req` que el
+/// arranque), la ventana de cada documento, el reloj y qué hacer al vencer. Termina sólo al
+/// vencer sin renovación (llama `on_expired`) o cuando `stop` se prende. Una renovación que
+/// devuelve un documento ilegible, ya vencido o sin el binding cuenta como fallida.
+pub fn renewal_loop(
+    drivers: &[RenewalDriver],
+    window_of: &dyn Fn(&AttestResult) -> Result<Option<(i64, i64)>, String>,
+    clock: &dyn Fn() -> i64,
+    stop: &std::sync::atomic::AtomicBool,
+    on_expired: &dyn Fn(String),
+) {
+    use std::sync::atomic::Ordering;
+    let sleep_until = |t: i64| {
+        // De a un segundo como mucho: `stop` y el vencimiento se miran seguido.
+        while clock() < t && !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(((t - clock()).clamp(0, 1) * 1000).max(100) as u64));
+        }
+    };
+    let expired = |d: i64, e: &str| {
+        on_expired(format!(
+            "serve --attested: the attestation documents expired at {} and could not be renewed ({}); refusing to serve an expired document",
+            d, e
+        ))
+    };
+    loop {
+        let Some(cur) = attested_identity() else {
+            on_expired("serve --attested: the attested identity is gone (poisoned lock); refusing to serve".to_string());
+            return;
+        };
+        let (next, deadline) = match renewal_schedule(&cur.attestations, clock(), window_of) {
+            Ok(x) => x,
+            Err(e) => {
+                on_expired(format!("serve --attested: {}; cannot schedule the renewal", e));
+                return;
+            }
+        };
+        sleep_until(next);
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let req = AttestRequest { report_data: cur.report_data.to_vec(), nonce: None, public_key: None };
+        let mut backoff = 5i64;
+        loop {
+            // Antes de cada intento: si lo vigente ya venció, no se sigue sirviendo.
+            if let Some(d) = deadline {
+                if clock() > d {
+                    expired(d, "no renewal in time");
+                    return;
+                }
+            }
+            let attempt = (|| -> Result<(), String> {
+                let docs: Vec<AttestResult> = drivers.iter().map(|(name, call)| call(&req).map_err(|e| format!("driver {}: {}", name, e))).collect::<Result<_, _>>()?;
+                let now = clock();
+                let mut exp: Option<i64> = None;
+                for d in &docs {
+                    if let Some((_, na)) = window_of(d)? {
+                        if na <= now {
+                            return Err(format!("driver {} returned a document that already expired at {}", d.driver, na));
+                        }
+                        exp = Some(exp.map_or(na, |x: i64| x.min(na)));
+                    }
+                }
+                replace_attestations(docs, exp)
+            })();
+            match attempt {
+                Ok(()) => break,
+                Err(e) => {
+                    let now = clock();
+                    if let Some(d) = deadline {
+                        if now >= d {
+                            expired(d, &e);
+                            return;
+                        }
+                    }
+                    let wait = match deadline {
+                        Some(d) => backoff.min((d - now).max(1)),
+                        None => backoff,
+                    };
+                    eprintln!("[serve] attestation renewal failed ({}); retrying in {}s{}", e, wait, deadline.map(|d| format!(" (the current documents expire at {})", d)).unwrap_or_default());
+                    sleep_until(now + wait);
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    backoff = (backoff * 2).min(300);
+                }
+            }
+        }
+    }
+}
+
+/// Arranca la renovación del `serve --attested` de este proceso (una vez), con los MISMOS drivers
+/// de la identidad (no se vuelve a autodetectar). Falla —y el servidor no arranca— si no se puede
+/// leer el vencimiento de algún documento o si el hilo no arranca. Al vencer sin renovación, el
+/// servidor se cierra con error.
+pub fn spawn_renewal() -> Result<(), String> {
+    static STARTED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    let id = attested_identity().ok_or("no attested identity installed")?;
+    for r in &id.attestations {
+        document_window(r)?;
+    }
+    let drivers: Vec<Driver> = id.config.drivers.iter().map(|n| Driver::parse(n)).collect::<Result<_, _>>()?;
+    let mut started = STARTED.lock().map_err(|_| "the renewal lock is poisoned".to_string())?;
+    if *started {
+        return Ok(());
+    }
+    let list: Vec<RenewalDriver> = drivers.into_iter().map(|d| -> RenewalDriver { (d.name(), Box::new(move |r| attest_with_driver(d, r))) }).collect();
+    std::thread::Builder::new()
+        .name("attest-renewal".to_string())
+        .spawn(move || {
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            renewal_loop(&list, &document_window, &synsema_core::clock::now_secs, &stop, &|reason| {
+                eprintln!("{}", reason);
+                let _ = RENEWAL_FAILURE.set(reason.clone());
+                #[cfg(feature = "native")]
+                crate::server::request_shutdown(&reason);
+            });
+        })
+        .map_err(|e| format!("cannot start the attestation renewal thread: {}", e))?;
+    *started = true;
+    Ok(())
 }
 
 // =========================================================
@@ -1405,6 +1885,7 @@ const NOT_ATTESTED: &str = "this server is not attested (start it with `synsema 
 
 fn b_attestation_document(_args: &[SynValue]) -> Result<SynValue, Control> {
     match attested_identity() {
+        Some(id) if id.expired_at(synsema_core::clock::now_secs()) => Err(err("attestation_document: the attestation documents expired and were not renewed")),
         Some(id) => Ok(json_to_syn(&id.json())),
         None => Err(err(format!("attestation_document: {}", NOT_ATTESTED))),
     }
@@ -1565,7 +2046,7 @@ mod tests {
         if !std::path::Path::new("/dev/nsm").exists() {
             assert!(with_env(&[("SYNSEMA_ATTEST", Some("nitro"))], preflight).unwrap_err().contains("nsm"));
         }
-        assert_eq!(with_env(MOCK_ON, preflight).unwrap(), Driver::Mock);
+        assert_eq!(with_env(MOCK_ON, preflight).unwrap(), vec![Driver::Mock]);
     }
 
     #[test]
@@ -1687,7 +2168,7 @@ mod tests {
     }
 
     fn test_config() -> AttestConfig {
-        AttestConfig { labels: true, ceiling: None, tls_key: "attested", profile: "native" }
+        AttestConfig { labels: true, ceiling: None, tls_key: "attested", profile: "native", drivers: vec!["mock"] }
     }
 
     #[test]
@@ -1708,7 +2189,7 @@ mod tests {
         assert_ne!(other.sha(), id.config_sha);
         assert_eq!(
             test_config().canonical_json(),
-            format!("{{\"ceiling\":\"unbounded\",\"engine\":\"{}\",\"labels\":true,\"profile\":\"native\",\"tls_key\":\"attested\"}}", engine_version())
+            format!("{{\"ceiling\":\"unbounded\",\"drivers\":[\"mock\"],\"engine\":\"{}\",\"labels\":true,\"profile\":\"native\",\"tls_key\":\"attested\"}}", engine_version())
         );
         let ceiled = AttestConfig {
             ceiling: Some(vec![Capability::new(CapabilityType::Time, None), Capability::new(CapabilityType::Net, Some("b.x".into())), Capability::new(CapabilityType::Net, Some("a.x".into()))]),
@@ -1724,6 +2205,9 @@ mod tests {
         assert_eq!(id.private_scalar.len(), 32);
         assert!(id.public_key_pem().starts_with("-----BEGIN PUBLIC KEY-----\n"));
         let j = id.json();
+        assert_eq!(j["documents"].as_array().unwrap().len(), 1, "un driver, un documento");
+        assert_eq!(j["documents"][0]["document"], j["document"]);
+        assert_eq!(j["config"]["drivers"], serde_json::json!(["mock"]));
         assert_eq!(j["format"], "mock");
         assert_eq!(j["driver"], "mock");
         assert_eq!(j["mock"], true, "L6: el mock se declara");
@@ -1747,6 +2231,191 @@ mod tests {
         assert_ne!(h1, h2, "el hash cubre los módulos");
         assert_ne!(h1, sha256(main_src.as_bytes()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn synsema_attest_takes_a_list_and_rejects_doubtful_ones() {
+        let sel = |v: &str| with_env(&[("SYNSEMA_ATTEST", Some(v))], select_drivers);
+        assert_eq!(sel("tsm,nitro-tpm").unwrap(), vec![Driver::Tsm, Driver::NitroTpm]);
+        assert_eq!(sel(" TSM , Nitro-TPM ").unwrap(), vec![Driver::Tsm, Driver::NitroTpm]);
+        assert_eq!(sel("nitro-tpm").unwrap(), vec![Driver::NitroTpm]);
+        // El primero manda en attest()/attest_key().
+        assert_eq!(with_env(&[("SYNSEMA_ATTEST", Some("nitro-tpm,tsm"))], select_driver).unwrap(), Driver::NitroTpm);
+        // Repetidos (también por alias), vacíos, desconocidos y mock mezclado: errores que nombran.
+        assert_eq!(sel("tsm,tsm").unwrap_err(), "attest: driver 'tsm' appears twice in SYNSEMA_ATTEST");
+        assert!(sel("tsm,snp").unwrap_err().contains("driver 'tsm' appears twice"));
+        assert!(sel("tsm,,nitro-tpm").unwrap_err().contains("empty driver name"));
+        assert!(sel("tsm,").unwrap_err().contains("empty driver name"));
+        assert!(sel("tsm,banana").unwrap_err().contains("unknown driver 'banana'"));
+        assert!(sel("mock,tsm").unwrap_err().contains("mock driver cannot be combined"));
+        // preflight de nitro-tpm fuera de una VM con NitroTPM: el error del spec.
+        if !crate::attest_nitrotpm::device_present() {
+            let e = with_env(&[("SYNSEMA_ATTEST", Some("nitro-tpm"))], preflight).unwrap_err();
+            assert!(e.contains("NitroTPM is not available: the AMI needs TpmSupport=v2.0 and UEFI") || e.contains("Linux-only"), "{}", e);
+            // Y uno de la lista que falla tumba la lista entera.
+            assert!(with_env(&[("SYNSEMA_ATTEST", Some("mock"))], preflight).is_ok());
+        }
+    }
+
+    fn fake(name: &'static str, format: &'static str) -> impl Fn(&AttestRequest) -> Result<AttestResult, String> {
+        move |r: &AttestRequest| {
+            Ok(AttestResult { format, document: [name.as_bytes(), &r.report_data].concat(), driver: name, report_data: r.report_data.clone(), aux: Some(vec![1, 2]).filter(|_| name == "tsm"), event_log: None, root: None })
+        }
+    }
+
+    #[test]
+    fn two_injected_drivers_get_the_same_binding_and_both_documents_are_published() {
+        let (a, b) = (fake("tsm", "sev-snp"), fake("nitro-tpm", "nitro-tpm"));
+        let drivers: Vec<DriverFn<'_>> = vec![("tsm", &a), ("nitro-tpm", &b)];
+        let id = build_attested_identity_with("print(1)\n", "p.syn", test_config(), &drivers).unwrap();
+        assert_eq!(id.config.drivers, vec!["tsm", "nitro-tpm"]);
+        assert_eq!(id.config_sha, AttestConfig { drivers: vec!["tsm", "nitro-tpm"], ..test_config() }.sha(), "config.drivers entra en config_sha");
+        assert_eq!(id.attestations.len(), 2);
+        for res in &id.attestations {
+            assert_eq!(res.report_data, id.report_data.to_vec(), "el mismo binding en los dos");
+        }
+        let j = id.json();
+        // Los campos de arriba son los del primer driver (no se rompe ningún cliente).
+        assert_eq!(j["format"], "sev-snp");
+        assert_eq!(j["driver"], "tsm");
+        assert_eq!(j["aux"], b64_encode(&[1, 2]));
+        let docs = j["documents"].as_array().unwrap();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0], serde_json::json!({"format": "sev-snp", "driver": "tsm", "document": b64_encode(&id.attestations[0].document), "aux": b64_encode(&[1, 2])}));
+        assert_eq!(docs[1], serde_json::json!({"format": "nitro-tpm", "driver": "nitro-tpm", "document": b64_encode(&id.attestations[1].document)}));
+        assert_eq!(j["config"]["drivers"], serde_json::json!(["tsm", "nitro-tpm"]));
+        // Uno de los dos falla: no hay identidad (sin modo degradado), y el error lo nombra.
+        let broken = |_r: &AttestRequest| -> Result<AttestResult, String> { Err("attest: NitroTPM is not available: the AMI needs TpmSupport=v2.0 and UEFI".to_string()) };
+        let drivers: Vec<DriverFn<'_>> = vec![("tsm", &a), ("nitro-tpm", &broken)];
+        let e = build_attested_identity_with("print(1)\n", "p.syn", test_config(), &drivers).err().unwrap();
+        assert_eq!(e, "serve --attested: driver nitro-tpm: attest: NitroTPM is not available: the AMI needs TpmSupport=v2.0 and UEFI");
+        // Un driver que contesta con otro nombre: error.
+        let liar = fake("tsm", "sev-snp");
+        let drivers: Vec<DriverFn<'_>> = vec![("nitro-tpm", &liar)];
+        assert!(build_attested_identity_with("print(1)\n", "p.syn", test_config(), &drivers).err().unwrap().contains("driver nitro-tpm answered as tsm"));
+        // Por variable de entorno: errores al arrancar que nombran el driver.
+        for (v, needle) in [("tsm,tsm", "driver 'tsm' appears twice"), ("tsm,banana", "unknown driver 'banana'")] {
+            let e = with_env(&[("SYNSEMA_ATTEST", Some(v))], || build_attested_identity("print(1)\n", "p.syn", test_config())).err().unwrap();
+            assert!(e.starts_with("serve --attested: ") && e.contains(needle), "{}", e);
+        }
+    }
+
+    #[test]
+    fn document_window_reads_the_leaf_of_real_documents() {
+        let tpm = AttestResult {
+            format: "nitro-tpm",
+            document: include_bytes!("fixtures/attestation/aws_nitrotpm_c6a_doc.bin").to_vec(),
+            driver: "nitro-tpm",
+            report_data: vec![],
+            aux: None,
+            event_log: None,
+            root: None,
+        };
+        assert_eq!(document_window(&tpm), Ok(Some((1_791_400_274, 1_791_411_077))), "la hoja de ~3 h del fixture");
+        let (next, deadline) = renewal_schedule(std::slice::from_ref(&tpm), 1_791_400_300, &document_window).unwrap();
+        assert_eq!((next, deadline), (1_791_400_274 + (1_791_411_077 - 1_791_400_274) / 2, Some(1_791_411_077)));
+        // SEV-SNP sin aux: nada que vence que el motor conozca → una vez por día, sin deadline.
+        let snp = AttestResult { format: "sev-snp", document: include_bytes!("fixtures/attestation/aws_snp_c6a_report.bin").to_vec(), driver: "tsm", ..tpm.clone() };
+        assert_eq!(document_window(&snp), Ok(None));
+        assert_eq!(renewal_schedule(std::slice::from_ref(&snp), 100, &document_window).unwrap(), (100 + RENEW_LONG_LIVED_SECS, None), "una vez por día");
+        // Con aux: vence cuando vence la VLEK (un año) — el deadline existe también para SEV-SNP.
+        let snp_aux = AttestResult { aux: Some(include_bytes!("fixtures/attestation/aws_snp_c6a_auxblob.bin").to_vec()), ..snp.clone() };
+        assert_eq!(document_window(&snp_aux), Ok(Some((1_773_084_605, 1_804_620_605))));
+        // Pasada la mitad de la vida de la VLEK (la renovación no la refresca): no se renueva cada
+        // segundo, sino una vez por día…
+        assert_eq!(renewal_schedule(std::slice::from_ref(&snp_aux), 1_791_400_000, &document_window).unwrap(), (1_791_400_000 + RENEW_LONG_LIVED_SECS, Some(1_804_620_605)));
+        // …y cerca del vencimiento, a la mitad de lo que queda.
+        assert_eq!(renewal_schedule(std::slice::from_ref(&snp_aux), 1_804_620_605 - 1000, &document_window).unwrap(), (1_804_620_605 - 500, Some(1_804_620_605)));
+        assert_eq!(renewal_schedule(std::slice::from_ref(&snp_aux), 1_804_620_605, &document_window).unwrap().0, 1_804_620_606, "al vencer: el próximo segundo, nunca el pasado");
+        let mock = with_env(MOCK_ON, || attest_document(&AttestRequest::default()).unwrap());
+        let (nb, na) = document_window(&mock).unwrap().unwrap();
+        assert!(nb < 1_700_000_000 && na > 4_000_000_000, "{} {}", nb, na);
+        // Un documento COSE ilegible no se puede programar: error (no "vida larga").
+        let broken = AttestResult { document: b"not cose".to_vec(), ..tpm.clone() };
+        assert!(document_window(&broken).unwrap_err().contains("cannot read the validity of the nitro-tpm document"));
+    }
+
+    /// Lo que devuelve un driver tiene que llevar de verdad el `report_data` pedido.
+    #[test]
+    fn a_document_without_the_requested_binding_is_refused() {
+        let res = with_env(MOCK_ON, || attest_document(&AttestRequest { report_data: vec![1; 32], ..Default::default() }).unwrap());
+        assert!(check_document_binding(&res, &[1; 32]).is_ok());
+        assert!(check_document_binding(&res, &[2; 32]).unwrap_err().contains("does not carry the requested report_data"));
+        let snp = AttestResult { format: "sev-snp", document: include_bytes!("fixtures/attestation/aws_snp_c6a_report.bin").to_vec(), driver: "tsm", ..res.clone() };
+        let binding = snp.document[0x50..0x90].to_vec();
+        assert!(check_document_binding(&snp, &binding).is_ok(), "el reporte real lleva su REPORT_DATA");
+        assert!(check_document_binding(&snp, &[0; 32]).is_err());
+        // Vencimiento de la identidad.
+        let id = with_env(MOCK_ON, || build_attested_identity("print(1)\n", "p.syn", test_config()).unwrap());
+        assert!(!id.expired_at(1_800_000_000), "el mock vence en 2099");
+        assert!(id.expired_at(5_000_000_000));
+    }
+
+    /// T10: con drivers falsos de hojas de vida corta (4 s), la renovación reemplaza los
+    /// documentos antes de vencer sin cambiar la clave ni el binding; y cuando un driver empieza a
+    /// fallar, el cierre llega DESPUÉS del vencimiento de lo vigente, no antes.
+    #[test]
+    fn renewal_replaces_documents_before_they_expire_and_closes_only_after_expiry() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        const LIFE: i64 = 4;
+        static FAIL: AtomicBool = AtomicBool::new(false);
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        fn doc(name: &'static str, r: &AttestRequest) -> Result<AttestResult, String> {
+            if FAIL.load(Ordering::SeqCst) {
+                return Err("the platform did not answer".to_string());
+            }
+            let n = CALLS.fetch_add(1, Ordering::SeqCst);
+            let nb = synsema_core::clock::now_secs();
+            let document = format!("{}:{}:{}:{}", name, n, nb, nb + LIFE).into_bytes();
+            Ok(AttestResult { format: if name == "tsm" { "sev-snp" } else { "nitro-tpm" }, document, driver: name, report_data: r.report_data.clone(), aux: None, event_log: None, root: None })
+        }
+        // La ventana sale del documento falso; el de `tsm` no vence pronto (como sev-snp).
+        fn window(r: &AttestResult) -> Result<Option<(i64, i64)>, String> {
+            let t = String::from_utf8(r.document.clone()).map_err(|_| "fake doc".to_string())?;
+            let f: Vec<&str> = t.split(':').collect();
+            Ok((f[0] == "nitro-tpm").then(|| (f[2].parse().unwrap(), f[3].parse().unwrap())))
+        }
+        let (a, b) = (|r: &AttestRequest| doc("tsm", r), |r: &AttestRequest| doc("nitro-tpm", r));
+        let drivers: Vec<DriverFn<'_>> = vec![("tsm", &a), ("nitro-tpm", &b)];
+        let id = build_attested_identity_with("print(1)\n", "p.syn", test_config(), &drivers).unwrap();
+        let (spki, binding) = (id.spki_der.clone(), id.report_data);
+        if install_attested_identity(id).is_err() {
+            return; // otra prueba del proceso ya instaló una identidad: no se pisa.
+        }
+        let first = attested_identity().unwrap().attestations[1].document.clone();
+        let (nb0, na0) = window(&attested_identity().unwrap().attestations[1]).unwrap().unwrap();
+        assert_eq!(renewal_schedule(&attested_identity().unwrap().attestations, nb0, &window).unwrap(), (nb0 + LIFE / 2, Some(na0)));
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let expired_at = std::sync::Arc::new(std::sync::Mutex::new(None::<(i64, String)>));
+        let (stop2, exp2) = (stop.clone(), expired_at.clone());
+        let t = std::thread::spawn(move || {
+            let list: Vec<(&'static str, Box<dyn Fn(&AttestRequest) -> Result<AttestResult, String> + Send>)> =
+                vec![("tsm", Box::new(|r: &AttestRequest| doc("tsm", r))), ("nitro-tpm", Box::new(|r: &AttestRequest| doc("nitro-tpm", r)))];
+            renewal_loop(&list, &window, &synsema_core::clock::now_secs, &stop2, &|reason| {
+                *exp2.lock().unwrap() = Some((synsema_core::clock::now_secs(), reason));
+            });
+        });
+        // Antes de vencer (a la mitad de la vida) ya hay documentos nuevos, misma clave.
+        while synsema_core::clock::now_secs() < na0 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let cur = attested_identity().unwrap();
+        assert_ne!(cur.attestations[1].document, first, "renovado antes de vencer");
+        assert_eq!(cur.spki_der, spki, "misma clave");
+        assert_eq!(cur.report_data, binding, "mismo binding");
+        assert!(cur.attestations.iter().all(|r| r.report_data == binding.to_vec()));
+        assert_eq!(cur.json()["documents"][1]["document"], b64_encode(&cur.attestations[1].document), "el JSON publicado es el vigente");
+        // El driver empieza a fallar: se cierra recién cuando vence lo vigente.
+        let (_, na1) = window(&cur.attestations[1]).unwrap().unwrap();
+        assert_eq!(cur.expires_at, Some(na1), "la identidad sabe cuándo vence");
+        FAIL.store(true, Ordering::SeqCst);
+        t.join().unwrap();
+        let (when, reason) = expired_at.lock().unwrap().clone().expect("se cerró");
+        assert!(when >= na1, "no antes del vencimiento: cerró en {} y vencía en {}", when, na1);
+        assert!(when <= na1 + 2, "y no mucho después: {} vs {}", when, na1);
+        assert!(reason.contains("expired") && reason.contains("could not be renewed") && reason.contains("the platform did not answer"), "{}", reason);
+        stop.store(true, Ordering::SeqCst);
     }
 
     #[test]

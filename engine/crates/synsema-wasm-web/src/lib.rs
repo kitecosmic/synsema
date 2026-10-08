@@ -267,6 +267,7 @@ impl HostProvider for WebHost {
             body_bytes,
             headers: json_to_pairs(r.get("headers")),
             error: None,
+            attested: None,
         }))
     }
 

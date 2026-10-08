@@ -73,6 +73,79 @@ fn outline_routes_and_search_json() {
     assert!(out.contains("task") && out.contains("price") && !out.trim_start().starts_with('{'));
 }
 
+/// T7: `synsema code sha` da el `program_sha` que publicó el `serve --attested` real de AWS
+/// (fixture `aws_snp_c6a_app.syn`, identity v0.6.42) y, con módulos, la fórmula
+/// `sha256(fuente ‖ 0x00 ‖ sha256(mod_1) ‖ …)`.
+#[test]
+fn sha_matches_the_program_sha_published_by_a_real_attested_serve() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../synsema-stdlib/src/fixtures/attestation/aws_snp_c6a_app.syn");
+    let dir = project("sha");
+    std::fs::copy(&fixture, dir.join("tee_app.syn")).unwrap();
+    let want = "95cb46a49494998c831ba7bb87ec2005525658868257e547f0d14c5df3afa91c";
+    let (code, out, err) = run_code(&dir, &["sha", "tee_app.syn"]);
+    assert_eq!(code, 0, "{}", err);
+    assert_eq!(out, format!("{}\n", want));
+    let (code, out, _) = run_code(&dir, &["sha", "tee_app.syn", "--json"]);
+    assert_eq!(code, 0);
+    let j: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(j["program_sha"], want);
+    assert_eq!(j["modules"], serde_json::json!([]));
+    // Con un módulo: la fórmula, recomputada acá.
+    std::fs::write(dir.join("lib.syn"), "let x be 1\n").unwrap();
+    let main = "use \"lib.syn\" as lib\nprint(lib.x)\n";
+    std::fs::write(dir.join("main.syn"), main).unwrap();
+    let (code, out, err) = run_code(&dir, &["sha", "main.syn", "--json"]);
+    assert_eq!(code, 0, "{}", err);
+    let j: serde_json::Value = serde_json::from_str(&out).unwrap();
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(main.as_bytes());
+    h.update([0u8]);
+    h.update(Sha256::digest(b"let x be 1\n"));
+    assert_eq!(j["program_sha"], synsema_core::bytesutil::hex_encode(&h.finalize()));
+    assert_eq!(j["modules"].as_array().unwrap().len(), 1);
+    assert!(j["modules"][0]["path"].as_str().unwrap().ends_with("lib.syn"));
+    // Sin archivo: error de uso.
+    let (code, _, err) = run_code(&dir, &["sha"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("missing required argument `path`"), "{}", err);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// El `program_sha` del recibo (calculado tarde, con los bytes que el cargador ya leyó para
+/// ejecutar) es idéntico al de `synsema code sha`: módulos anidados, un diamante (`c.syn` desde
+/// dos lados) y un `use` en una rama que nunca corre (ése se lee del disco).
+#[test]
+fn receipt_program_sha_equals_code_sha() {
+    let dir = project("receipt-sha");
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    std::fs::write(dir.join("lib").join("c.syn"), "export let C be 3\n").unwrap();
+    std::fs::write(dir.join("lib").join("a.syn"), "use \"c.syn\" as c\nexport let A be c.C + 1\n").unwrap();
+    std::fs::write(dir.join("lib").join("b.syn"), "use \"c.syn\" as c\nexport let B be c.C + 2\n").unwrap();
+    std::fs::write(dir.join("lib").join("never.syn"), "export let N be 9\n").unwrap();
+    let main = "use \"lib/a.syn\" as a\nuse \"lib/b.syn\" as b\n\ntask unused()\n    use \"lib/never.syn\" as n\n    give n.N\n\nprint(a.A + b.B)\nprint(receipt()[\"credentialSubject\"][\"program_sha\"])\n";
+    std::fs::write(dir.join("main.syn"), main).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_synsema"))
+        .args(["run", "main.syn"])
+        .current_dir(&dir)
+        .env("SYNSEMA_NO_UPDATE_CHECK", "1")
+        .output()
+        .expect("spawn synsema run");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{}\n{}", stdout, String::from_utf8_lossy(&out.stderr));
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines[0], "9");
+    let (code, sha_out, err) = run_code(&dir, &["sha", "main.syn", "--json"]);
+    assert_eq!(code, 0, "{}", err);
+    let j: serde_json::Value = serde_json::from_str(&sha_out).unwrap();
+    assert_eq!(lines[1], j["program_sha"].as_str().unwrap(), "recibo == synsema code sha");
+    // En profundidad, en el orden de los `use`, cada uno una vez: a, c, b, never. Las rutas son
+    // relativas a la carpeta del programa y con `/` (la salida no depende de la máquina).
+    let order: Vec<&str> = j["modules"].as_array().unwrap().iter().map(|m| m["path"].as_str().unwrap()).collect();
+    assert_eq!(order, vec!["lib/a.syn", "lib/c.syn", "lib/b.syn", "lib/never.syn"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn check_exit_code_and_missing_caps_warning() {
     let dir = project("check");
@@ -126,7 +199,7 @@ fn mcp_stdio_round_trip() {
     assert_eq!(list["id"], 2);
     let tools = list["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["outline", "symbol", "refs", "routes", "caps", "check", "search", "deps"]);
+    assert_eq!(names, vec!["outline", "symbol", "refs", "routes", "caps", "check", "search", "deps", "sha"]);
     assert!(tools.iter().all(|t| t["description"].as_str().unwrap().ends_with("never from running the program.")));
     let call = ask(r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"outline","arguments":{"path":"app.syn"}}}"#);
     assert_eq!(call["result"]["isError"], false);

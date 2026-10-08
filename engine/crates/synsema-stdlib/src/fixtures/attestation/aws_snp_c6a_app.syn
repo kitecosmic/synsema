@@ -1,0 +1,6 @@
+require serve(8443)
+require attest
+
+serve on 8443
+    route "GET /hola"
+        give {"hola": "desde un TEE"}

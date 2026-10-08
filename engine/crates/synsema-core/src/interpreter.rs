@@ -3360,6 +3360,10 @@ impl Interpreter {
         // Un error de compilación del módulo se reporta como runtime (la operación
         // de import falló), igual que en el oráculo Python.
         let program = parse_source(&source, resolved).map_err(|e| err(e.to_string()))?;
+        // `program_sha` del recibo se calcula con ESTOS bytes, sin releer ni reparsear. Fuera de
+        // línea y fría: dentro de esta función movía el acomodo del intérprete (+8 % en Windows sin
+        // PGO, con las mismas instrucciones).
+        note_loaded_module(resolved, &source, &program);
         // T5 (B8): un módulo tampoco puede redefinir los nombres protegidos.
         check_protected_names(&program)?;
         // Un nombre deprecado en un módulo avisa igual que en el archivo principal (una vez
@@ -12113,4 +12117,13 @@ fn dual_fn_pick<'a>(args: &'a [SynValue], op: &str) -> Result<(SynValue, &'a Syn
             }
         }
     }
+}
+
+/// Anota un módulo cargado para `program_sha` del recibo (`loaded_modules`). Fría y fuera de línea:
+/// llamada desde `load_module_inner`, que no es caliente, pero el código en línea ahí cambiaba el
+/// acomodo del binario entero (medido: +8 % de tiempo en Windows sin PGO, mismas instrucciones).
+#[cold]
+#[inline(never)]
+fn note_loaded_module(resolved: &str, source: &str, program: &crate::ast::Program) {
+    crate::loaded_modules::record(resolved, source, program);
 }
