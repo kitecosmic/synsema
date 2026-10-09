@@ -35,7 +35,10 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   bytes, lists and maps are an error, as they are with text (before, with a secret they joined as
   their printed form: `secret + nothing` gave "…nothing"). A sealed secret is an error (it gave an
   unsealed secret holding the text `secret(NAME)`), and so is a secret holding bytes that are not
-  UTF-8 (it changed silently, so a chained HMAC key came out different).
+  UTF-8 (it changed silently, so a chained HMAC key came out different). A backtick template
+  is unchanged: every hole shows its text (`token={tok} scopes={xs}` with `tok` a secret gives a
+  secret holding the list as text, as without a secret); only a sealed secret or a non-UTF-8 bytes
+  secret in a template is an error.
 - **A bytes secret as a database parameter keeps its bytes** (SQLite BLOB, Postgres `bytea`, MySQL
   bytes, Mongo binary, Redis): it used to be converted to text, and bytes that are not UTF-8
   changed. A sealed secret as a database parameter is an error, also nested in a list or a

@@ -6412,9 +6412,14 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // Hueco de un template con backticks: el texto de cualquier valor, como el f-string de
         // Python (`xs={xs}` → "xs=[1, 2]"). Un secret sigue por `+` (queda secret y redactado).
         let op = if op == BinOp::InterpConcat {
-            if let SynValue::Text(l) = &left {
-                if !matches!(right, SynValue::Text(_) | SynValue::Secret(_)) {
-                    return Ok(syn_text(format!("{}{}", l, right)));
+            if !matches!(right, SynValue::Text(_) | SynValue::Secret(_)) {
+                match &left {
+                    SynValue::Text(l) => return Ok(syn_text(format!("{}{}", l, right))),
+                    // v0.6.44 (auditoría A2): después de un hueco con un secret lo acumulado es un
+                    // secret, y el hueco siguiente es igual de template: su texto, como sin secret.
+                    // Lo demás (sellado, bytes no UTF-8) lo decide `secret_concat`.
+                    SynValue::Secret(_) => return secret_concat(&left, &syn_text(right.to_string()), loc),
+                    _ => {}
                 }
             }
             BinOp::Add

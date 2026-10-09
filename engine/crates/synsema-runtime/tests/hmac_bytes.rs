@@ -165,9 +165,38 @@ print(basic("my app", "a+b/c=") == as_secret("Basic bXkgYXBwOmErYi9jPQ=="))
 "#,
     );
     assert_eq!(out, vec!["secret(CLIENT_SECRET)", "true", "true"]);
-    let r = run("oauth_basic(\"id\", nothing)
-");
+    let r = run("oauth_basic(\"id\", nothing)\n");
     assert!(!r.success && r.errors.join(" ").contains("oauth_basic: the client_secret is nothing"), "{:?}", r.errors);
+}
+
+/// Auditoría A2: en un template con backticks, un hueco DESPUÉS de un secret sigue siendo hueco de
+/// template (su texto, como sin secret), no un `+` que rechaza listas o `nothing`. Arriba (tree-walker)
+/// y dentro de una task (VM). El resultado sigue siendo un secret, con el mismo contenido.
+#[test]
+fn a_template_hole_after_a_secret_is_still_a_template_hole() {
+    let out = lines(
+        r#"let tok be as_secret("abc", "TOK")
+let scopes be [1, 2]
+let t be `token={tok} scopes={scopes} none={nothing} n={3}`
+print(text(t))
+print(t == as_secret(`token=abc scopes={scopes} none={nothing} n={3}`))
+task build(k, xs)
+    give `k={k} xs={xs} tail`
+let u be build(tok, scopes)
+print(u == as_secret("k=abc xs=[1, 2] tail"))
+print(text(`plain {scopes}`))
+"#,
+    );
+    assert_eq!(out, vec!["secret(TOK)", "true", "true", "plain [1, 2]"]);
+    // Lo que sí sigue siendo error: el `+` común con una lista, y un secret de bytes no UTF-8 en
+    // el template.
+    for (src, needle) in [
+        ("as_secret(\"k\") + [1]", "Cannot add secret("),
+        ("let b be as_secret(bytes(\"ff\", \"hex\"), \"B\")\nprint(`x={b}`)", "secret(B): it holds bytes that are not UTF-8"),
+    ] {
+        let r = run(&format!("{}\n", src));
+        assert!(!r.success && r.errors.join(" ").contains(needle), "{}: {:?}", src, r.errors);
+    }
 }
 
 #[test]
