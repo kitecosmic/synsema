@@ -6,7 +6,7 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
-## v0.6.44 — UNRELEASED
+## v0.6.44 — 2026-10-08
 
 `hmac` with bytes, bit operations, values that leave as text are never their printed form, and the full list of drivers in the `serve --attested` notice.
 
