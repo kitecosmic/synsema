@@ -153,6 +153,23 @@ print(basic("Aladdin", "open sesame") == as_secret("Basic QWxhZGRpbjpvcGVuIHNlc2
     }
 }
 
+/// `oauth_basic` (B4): RFC 6749 §2.3.1 — client_id y client_secret codificados como formulario
+/// antes del Basic. "a+b/c=" → "a%2Bb%2Fc%3D"; espacio → "+".
+#[test]
+fn oauth_basic_form_encodes_before_base64() {
+    let out = lines(
+        r#"let b be oauth_basic("my app", as_secret("a+b/c=", "CLIENT_SECRET"))
+print(text(b))
+print(b == as_secret("Basic " + "bXkrYXBwOmElMkJiJTJGYyUzRA=="))
+print(basic("my app", "a+b/c=") == as_secret("Basic bXkgYXBwOmErYi9jPQ=="))
+"#,
+    );
+    assert_eq!(out, vec!["secret(CLIENT_SECRET)", "true", "true"]);
+    let r = run("oauth_basic(\"id\", nothing)
+");
+    assert!(!r.success && r.errors.join(" ").contains("oauth_basic: the client_secret is nothing"), "{:?}", r.errors);
+}
+
 #[test]
 fn bits_from_a_program() {
     let out = lines(

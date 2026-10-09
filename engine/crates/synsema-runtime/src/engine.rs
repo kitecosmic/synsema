@@ -531,6 +531,8 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     // v0.6.29: mapas, orden, texto y regex con sus nombres nuevos; la MAC en bytes.
     "get", "remove", "merge", "items", "sort", "replace", "regex_find_all", "regex_capture",
     "regex_replace", "fold_text", "hmac",
+    // v0.6.44: HTTP Basic como secret (y su variante con form-encoding de OAuth).
+    "oauth_basic",
     // v0.6.44 (HB2): bits sobre enteros de 64 bits y XOR de bytes.
     "bit_and", "bit_or", "bit_xor", "bit_not", "shl", "shr", "xor_bytes",
     // v0.6.29: blockchain `<familia>_<acción>` (puros: construir, derivar, decodificar).

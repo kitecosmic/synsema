@@ -31,6 +31,11 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   (`attestation_key()`) or a secret holding bytes that are not UTF-8 is an error wherever it would
   leave as text (headers, `bearer`, `btc_rpc` auth, a mnemonic or passphrase for the HD wallet
   builtins), never the placeholder `secret(NAME)`.
+- **`+` with a secret follows the text rules.** Numbers and bools join as before; `nothing`,
+  bytes, lists and maps are an error, as they are with text (before, with a secret they joined as
+  their printed form: `secret + nothing` gave "…nothing"). A sealed secret is an error (it gave an
+  unsealed secret holding the text `secret(NAME)`), and so is a secret holding bytes that are not
+  UTF-8 (it changed silently, so a chained HMAC key came out different).
 - **A bytes secret as a database parameter keeps its bytes** (SQLite BLOB, Postgres `bytea`, MySQL
   bytes, Mongo binary, Redis): it used to be converted to text, and bytes that are not UTF-8
   changed. A sealed secret as a database parameter is an error, also nested in a list or a
@@ -41,6 +46,9 @@ Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the rele
   as a secret, materialized only at the socket — the pair of `bearer`. OAuth client credentials
   (RFC 6749 §2.3.1) and Basic-auth APIs could not be called with the password as a secret before
   without `reveal()`. The user cannot contain `:`.
+- `oauth_basic(client_id, secret)`: the same for OAuth client credentials, with both parts
+  form-encoded first as RFC 6749 §2.3.1 asks (a secret with `+`, `/` or `=` is rejected by strict
+  servers otherwise).
 - Bits on 64-bit signed integers: `bit_and(a, b)`, `bit_or(a, b)`, `bit_xor(a, b)`, `bit_not(a)`,
   `shl(x, n)`, `shr(x, n)` (arithmetic, keeps the sign). `n` is 0..63; a value outside 64 bits, a
   float, or a `shl` that overflows is an error — nothing wraps around silently.

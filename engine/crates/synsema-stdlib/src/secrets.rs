@@ -310,6 +310,57 @@ pub(crate) fn edge_text(v: &SynValue, who: &str, what: &str) -> Result<String, C
     }
 }
 
+/// `application/x-www-form-urlencoded` de un texto (RFC 6749 apéndice B / HTML): alfanuméricos y
+/// `*-._` tal cual, espacio → `+`, el resto `%XX` en mayúsculas sobre sus bytes UTF-8.
+fn form_urlencode(t: &str) -> String {
+    let mut out = String::with_capacity(t.len());
+    for b in t.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// `basic(user, password)` / `oauth_basic(client_id, client_secret)`: el valor del header
+/// `Authorization: Basic base64(user:password)` (RFC 7617) como secret, el par de `bearer`. Se
+/// materializa sólo en el socket. `user` sin ':' (separa usuario y contraseña); `nothing`, bytes o
+/// un secret sellado son error. Con `oauth`, cada parte va codificada como formulario antes.
+fn basic_header(args: &[SynValue], who: &str, oauth: bool) -> Result<SynValue, Control> {
+    let part = |v: &SynValue, what: &str| -> Result<(String, Option<String>), Control> {
+        match v {
+            SynValue::Text(t) => Ok((t.to_string(), None)),
+            SynValue::Secret(s) => Ok((secret_text(s, who, what)?, Some(s.name().to_string()))),
+            SynValue::Nothing => Err(Control::Error(RuntimeError::new(format!(
+                "{}: {} is nothing (a missing env var or map key?); pass text or a secret",
+                who, what
+            )))),
+            other => Err(Control::Error(RuntimeError::new(format!(
+                "{}: {} must be text or a secret, got {}",
+                who,
+                what,
+                other.type_name()
+            )))),
+        }
+    };
+    let (user_what, pass_what) = if oauth { ("the client_id", "the client_secret") } else { ("the user", "the password") };
+    let (mut user, _) = part(arg(args, 0)?, user_what)?;
+    let (mut password, name) = part(arg(args, 1)?, pass_what)?;
+    if oauth {
+        user = form_urlencode(&user);
+        password = form_urlencode(&password);
+    } else if user.contains(':') {
+        return Err(Control::Error(RuntimeError::new(format!(
+            "{}: the user cannot contain ':' (RFC 7617: it separates the user from the password)",
+            who
+        ))));
+    }
+    let token = synsema_core::bytesutil::b64_encode(format!("{}:{}", user, password).as_bytes());
+    Ok(syn_secret(name.unwrap_or_else(|| who.to_string()), format!("Basic {}", token)))
+}
+
 /// Resuelve una variable: environ del proceso > `.env` > default (§2). `None` si
 /// ninguna fuente la define.
 fn resolve(env: &EnvStore, name: &str, default: Option<&SynValue>) -> Option<String> {
@@ -892,49 +943,11 @@ pub fn register_secret_builtins(
     // la contraseña como secret, el header no se podía armar sin `reveal()`. Se materializa sólo en
     // el socket, como todo header; `user` sin ':' (RFC 7617 §2); un secret sellado o de bytes no
     // UTF-8 es error.
-    interp.register_builtin(
-        "basic",
-        2,
-        Rc::new(move |_i, args, _loc| {
-            let user = match arg(args, 0)? {
-                SynValue::Text(t) => t.to_string(),
-                SynValue::Secret(s) => secret_text(s, "basic", "the user")?,
-                SynValue::Nothing => {
-                    return Err(Control::Error(RuntimeError::new(
-                        "basic: the user is nothing (a missing env var or map key?); pass text or a secret",
-                    )))
-                }
-                other => {
-                    return Err(Control::Error(RuntimeError::new(format!(
-                        "basic: the user must be text or a secret, got {}",
-                        other.type_name()
-                    ))))
-                }
-            };
-            if user.contains(':') {
-                return Err(Control::Error(RuntimeError::new(
-                    "basic: the user cannot contain ':' (RFC 7617: it separates the user from the password)",
-                )));
-            }
-            let (name, password) = match arg(args, 1)? {
-                SynValue::Secret(s) => (s.name().to_string(), secret_text(s, "basic", "the password")?),
-                SynValue::Text(t) => ("basic".to_string(), t.to_string()),
-                SynValue::Nothing => {
-                    return Err(Control::Error(RuntimeError::new(
-                        "basic: the password is nothing (a missing env var or map key?); pass text or a secret",
-                    )))
-                }
-                other => {
-                    return Err(Control::Error(RuntimeError::new(format!(
-                        "basic: the password must be text or a secret, got {}",
-                        other.type_name()
-                    ))))
-                }
-            };
-            let token = synsema_core::bytesutil::b64_encode(format!("{}:{}", user, password).as_bytes());
-            Ok(syn_secret(name, format!("Basic {}", token)))
-        }),
-    );
+    interp.register_builtin("basic", 2, Rc::new(move |_i, args, _loc| basic_header(args, "basic", false)));
+    // oauth_basic(client_id, client_secret) → lo mismo, pero con cada parte codificada como
+    // formulario ANTES de armar el Basic, como pide el RFC 6749 §2.3.1 (apéndice B): un secret con
+    // `+`, `/` o `=` (los de Azure, por ejemplo) un servidor OAuth estricto lo rechaza sin esto.
+    interp.register_builtin("oauth_basic", 2, Rc::new(move |_i, args, _loc| basic_header(args, "oauth_basic", true)));
 
     // hmac_sha256(data, s) → hex (la MAC, no es secreta).
     interp.register_builtin(

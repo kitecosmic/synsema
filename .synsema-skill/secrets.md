@@ -140,7 +140,8 @@ let b be http_get("https://api.provider.com/v1/items",
 
 | Builtin | Returns |
 |---|---|
-| `basic(user, s)` | a tainted `Basic base64(user:password)` header value (RFC 7617, v0.6.44+): OAuth client credentials, Basic-auth APIs. `user` without `:` |
+| `basic(user, s)` | a tainted `Basic base64(user:password)` header value (RFC 7617, v0.6.44+): Basic-auth APIs. `user` without `:` |
+| `oauth_basic(client_id, s)` | the same for OAuth client credentials: both parts form-encoded first (RFC 6749 §2.3.1), v0.6.44+ |
 | `bearer(s)` | a tainted `Bearer <secret>` auth header value. `s`: text or secret (v0.6.44+: `nothing`/bytes/numbers → error, not `Bearer None`) |
 | `hmac(data, s, algo?)` | the MAC as **bytes** (not secret; `hex(mac)` to show it). `data`/`s`: text, bytes (raw, v0.6.44+) or secret; other types → error. v0.6.29+ — the old `hmac_sha256` (hex text) is a deprecated alias |
 | `verify_hmac(data, sig, s, algo?)` | bool, **constant-time** (HMAC-SHA256/512; SHA-1 rejected). `sig` hex/base64 text or raw bytes; undecodable or missing (`nothing`) → `false`; other type → error |
