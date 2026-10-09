@@ -1270,16 +1270,18 @@ mod tests {
         let map = SynValue::Map(m.into_ref());
 
         // headers: el secret se MATERIALIZA (borde del socket) → plaintext real.
-        let hp = header_pairs(Some(&map)).unwrap();
+        let hp = header_pairs(Some(&map), "t").ok().unwrap().unwrap();
         let auth = hp.iter().find(|(k, _)| k == "Authorization").unwrap();
         assert_eq!(auth.1, "Bearer sk_live_LEAKCANARY");
         assert!(hp.iter().any(|(k, v)| k == "X-Trace" && v == "plain"));
 
-        // query params (map_pairs): el secret se REDACTA (fail-closed; va a la URL).
-        let qp = map_pairs(Some(&map)).unwrap();
-        let auth = qp.iter().find(|(k, _)| k == "Authorization").unwrap();
-        assert_eq!(auth.1, "secret(STRIPE_KEY)");
-        assert!(!auth.1.contains("LEAKCANARY"));
+        // query params (map_pairs): un secret es ERROR (iría en la URL) — HB4: antes salía la
+        // cadena `secret(STRIPE_KEY)` como si fuera el valor.
+        let e = match map_pairs(Some(&map), "http_get") {
+            Err(synsema_core::interpreter::Control::Error(e)) => e.into_message(),
+            _ => panic!("expected an error"),
+        };
+        assert!(e.contains("query parameter \"Authorization\" is secret(STRIPE_KEY)") && !e.contains("LEAKCANARY"), "{}", e);
     }
 
     /// El certificado de cliente es la identidad del workload: sólo se presenta a

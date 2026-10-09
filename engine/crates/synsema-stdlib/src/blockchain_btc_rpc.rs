@@ -491,7 +491,7 @@ fn basic_auth_header(v: Option<&SynValue>, fname: &str) -> Result<Vec<(String, S
         _ => return Err(err(format!("{}: auth needs a text \"user\"", fname))),
     };
     let pass = match m.get("pass") {
-        Some(SynValue::Secret(inner)) => inner.expose().into_owned(),
+        Some(SynValue::Secret(inner)) => crate::secrets::secret_text(inner, fname, "auth.pass")?,
         Some(SynValue::Text(s)) => s.to_string(),
         _ => {
             return Err(err(format!(

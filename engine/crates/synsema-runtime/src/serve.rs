@@ -3703,13 +3703,7 @@ fn make_serve_hook(
         let scheme = if use_tls { "HTTPS" } else { "HTTP" };
         println!("Serving {} on port {} ({} route(s))", scheme, port_str, n_routes);
         if let Some(id) = &attested_identity {
-            println!(
-                "Attested: driver={} format={} program_sha={} — GET {}",
-                id.attestation.driver,
-                id.attestation.format,
-                synsema_core::bytesutil::hex_encode(&id.program_sha),
-                server::ATTESTATION_PATH
-            );
+            println!("{}", synsema_stdlib::attest::attested_notice(id));
         }
         let rt = Arc::new(runtime);
 

@@ -235,6 +235,7 @@ impl DatabaseManager {
 
     /// Ejecuta un SELECT, devuelve filas como mapas columna→valor (ya en `SynValue`).
     pub fn query(&mut self, sql: &str, params: &[SynValue]) -> Result<Vec<Row>, String> {
+        reject_sealed_all(params, "sql")?;
         match self.conn_mut(None)? {
             Backend::Sqlite(c) => sqlite_query(c, sql, params),
             Backend::Postgres(c) => pg_query(c, sql, params),
@@ -248,6 +249,7 @@ impl DatabaseManager {
     /// Postgres no tiene `last_insert_rowid` → `last_id = 0` (usar `INSERT … RETURNING id`).
     /// MySQL sí: `last_id = last_insert_id()` (a diferencia de PG).
     pub fn execute(&mut self, sql: &str, params: &[SynValue]) -> Result<(i64, i64), String> {
+        reject_sealed_all(params, "sql")?;
         match self.conn_mut(None)? {
             Backend::Sqlite(c) => {
                 let pv: Vec<Value> = params.iter().map(syn_to_value).collect();
@@ -284,6 +286,7 @@ impl DatabaseManager {
 
     /// Ejecuta una sentencia con múltiples sets de parámetros (batch).
     pub fn execute_many(&mut self, sql: &str, params_list: &[Vec<SynValue>]) -> Result<i64, String> {
+        params_list.iter().try_for_each(|p| reject_sealed_all(p, "sql"))?;
         match self.conn_mut(None)? {
             Backend::Sqlite(c) => {
                 let mut stmt = c.prepare(sql).map_err(|e| e.to_string())?;
@@ -527,6 +530,23 @@ impl DatabaseManager {
     }
 }
 
+/// HB4 (v0.6.44): ningún secret SELLADO entra a un parámetro de DB. Las conversiones de abajo no
+/// pueden fallar y mandan los bytes de un secret de bytes tal cual; un sellado tiene que cortarse
+/// ANTES, con un error que lo diga (antes viajaba la cadena `secret(NAME)` como si fuera el valor).
+/// Recorre listas y mapas (un documento de Mongo, un vector).
+fn reject_sealed(v: &SynValue, who: &str) -> Result<(), String> {
+    match v {
+        SynValue::Secret(s) => s.expose_bytes_checked(who).map(|_| ()),
+        SynValue::List(l) => list_values(l).iter().try_for_each(|x| reject_sealed(x, who)),
+        SynValue::Map(m) => m.borrow().iter().try_for_each(|(_, x)| reject_sealed(x, who)),
+        _ => Ok(()),
+    }
+}
+
+fn reject_sealed_all(params: &[SynValue], who: &str) -> Result<(), String> {
+    params.iter().try_for_each(|p| reject_sealed(p, who))
+}
+
 // -- SQLite: ejecución + conversión SynValue <-> rusqlite Value --
 
 fn sqlite_query(conn: &Connection, sql: &str, params: &[SynValue]) -> Result<Vec<Row>, String> {
@@ -573,6 +593,11 @@ fn syn_to_value(v: &SynValue) -> Value {
         // Secret (#8): se permite persistirlo — el plaintext se **revela en el borde
         // de la DB** (SQL parametrizado). No hay query-log que redactar (este crate no
         // loguea queries ni params); si se agregara uno en el futuro, DEBE redactar.
+        // HB4: un secret de bytes va como BLOB (antes: `from_utf8_lossy`, otros bytes). Sólo si NO
+        // está sellado: la conversión es segura por sí misma, sin depender de que cada entrada
+        // haya llamado a `reject_sealed` (auditoría v0.6.44, A1). Un sellado cae al brazo de
+        // abajo: `expose()` da el marcador `secret(NAME)`, nunca el material.
+        SynValue::Secret(s) if s.is_bytes() && !s.is_sealed() => Value::Blob(s.expose_bytes().to_vec()),
         SynValue::Secret(s) => Value::Text(s.expose().to_string()),
         // bytes → BLOB byte-exacto (round-trip con value_to_syn; MF-010).
         SynValue::Bytes(b) => Value::Blob(b[..].to_vec()),
@@ -774,6 +799,7 @@ fn syn_to_pg(v: &SynValue) -> PgParam {
             None => PgParam::Text(n.to_string()),
         },
         SynValue::Bytes(b) => PgParam::Bytes(b[..].to_vec()),
+        SynValue::Secret(s) if s.is_bytes() && !s.is_sealed() => PgParam::Bytes(s.expose_bytes().to_vec()),
         SynValue::Secret(s) => PgParam::Text(s.expose().to_string()),
         SynValue::Text(s) => PgParam::Text(s.to_string()),
         // list/array (p.ej. un embedding) → texto pgvector "[a,b,c]"; en la query: `?::vector`.
@@ -1084,7 +1110,8 @@ fn syn_to_mysql(v: &SynValue) -> mysql::Value {
         SynValue::Number(n) => MyV::Bytes(n.to_string().into_bytes()),
         SynValue::Bytes(b) => MyV::Bytes(b[..].to_vec()),
         SynValue::Text(s) => MyV::Bytes(s.as_bytes().to_vec()),
-        SynValue::Secret(s) => MyV::Bytes(s.expose().to_string().into_bytes()),
+        SynValue::Secret(s) if !s.is_sealed() => MyV::Bytes(s.expose_bytes().to_vec()),
+        SynValue::Secret(s) => MyV::Bytes(s.expose().into_owned().into_bytes()),
         other => MyV::Bytes(other.to_string().into_bytes()),
     }
 }
@@ -1303,6 +1330,7 @@ fn syn_to_bson(v: &SynValue) -> Bson {
             Err(_) => Bson::String(n.to_string()),
         },
         SynValue::Text(s) => Bson::String(s.to_string()),
+        SynValue::Secret(s) if s.is_bytes() && !s.is_sealed() => Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: s.expose_bytes().to_vec() }),
         SynValue::Secret(s) => Bson::String(s.expose().to_string()),
         SynValue::Bytes(b) => Bson::Binary(Binary {
             subtype: BinarySubtype::Generic,
@@ -1441,7 +1469,8 @@ fn syn_to_redis_arg(v: &SynValue) -> Result<Vec<u8>, String> {
         SynValue::Text(s) => Ok(s.as_bytes().to_vec()),
         SynValue::Bytes(b) => Ok(b[..].to_vec()),
         SynValue::Number(n) => Ok(n.to_string().into_bytes()),
-        SynValue::Secret(s) => Ok(s.expose().to_string().into_bytes()),
+        // HB4: los bytes tal cual; un sellado es error (antes: la cadena `secret(NAME)`).
+        SynValue::Secret(s) => Ok(s.expose_bytes_checked("redis")?.to_vec()),
         other => Err(format!(
             "redis values must be text, bytes or number (got {}); use json_encode(...) for structured data",
             other.type_name()
@@ -1589,17 +1618,23 @@ fn require_db(caps: &Rc<RefCell<CapabilitySet>>, scope: &str, source: &str) -> R
 // -- Helpers de args para los builtins `mongo_*` (map de Synsema ↔ BSON Document) --
 
 /// Arg de filtro opcional (map) → BSON `Document`. None / no-map → Document vacío (match all).
-fn filter_arg(v: Option<&SynValue>) -> Document {
+fn filter_arg(v: Option<&SynValue>, ctx: &str) -> Result<Document, Control> {
     match v {
-        Some(SynValue::Map(m)) => syn_map_to_doc(&m.borrow()),
-        _ => Document::new(),
+        Some(SynValue::Map(m)) => {
+            reject_sealed(v.expect("Some"), ctx).map_err(err)?;
+            Ok(syn_map_to_doc(&m.borrow()))
+        }
+        _ => Ok(Document::new()),
     }
 }
 
 /// Arg map REQUERIDO (doc de insert / update) → `Document`; error claro si no es map.
 fn required_doc_arg(v: Option<&SynValue>, ctx: &str) -> Result<Document, Control> {
     match v {
-        Some(SynValue::Map(m)) => Ok(syn_map_to_doc(&m.borrow())),
+        Some(SynValue::Map(m)) => {
+            reject_sealed(v.expect("Some"), ctx).map_err(err)?;
+            Ok(syn_map_to_doc(&m.borrow()))
+        }
         Some(other) => Err(err(format!("{}: expected a map, got {}", ctx, other.type_name()))),
         None => Err(err(format!("{}: missing the document argument", ctx))),
     }
@@ -1613,7 +1648,10 @@ fn docs_list_arg(v: Option<&SynValue>, ctx: &str) -> Result<Vec<Document>, Contr
             let mut out = Vec::new();
             for item in list_values(&l).iter() {
                 match item {
-                    SynValue::Map(m) => out.push(syn_map_to_doc(&m.borrow())),
+                    SynValue::Map(m) => {
+                        reject_sealed(item, ctx).map_err(err)?;
+                        out.push(syn_map_to_doc(&m.borrow()))
+                    }
                     other => {
                         return Err(err(format!(
                             "{}: each element must be a map, got {}",
@@ -1890,7 +1928,11 @@ pub fn register_database_builtins<H: DbHandle>(
             -1,
             Rc::new(move |_i, args, _loc| {
                 let coll = raw_str(args.first().ok_or_else(|| err("mongo_find: missing collection"))?);
-                let filter = filter_arg(args.get(1));
+                let filter = filter_arg(args.get(1), "mongo_find")?;
+                // sort/fields también pasan por la conversión a BSON (auditoría v0.6.44, A1).
+                if let Some(o) = args.get(2) {
+                    reject_sealed(o, "mongo_find").map_err(err)?;
+                }
                 let opts = parse_find_opts(args.get(2));
                 if let Some(p) = db.read(|m| m.default_path()) {
                     require_db(&caps, &p, "mongo_find()")?;
@@ -1910,7 +1952,7 @@ pub fn register_database_builtins<H: DbHandle>(
             -1,
             Rc::new(move |_i, args, _loc| {
                 let coll = raw_str(args.first().ok_or_else(|| err("mongo_find_one: missing collection"))?);
-                let filter = filter_arg(args.get(1));
+                let filter = filter_arg(args.get(1), "mongo_find_one")?;
                 if let Some(p) = db.read(|m| m.default_path()) {
                     require_db(&caps, &p, "mongo_find_one()")?;
                 }
@@ -1965,7 +2007,7 @@ pub fn register_database_builtins<H: DbHandle>(
             3,
             Rc::new(move |_i, args, _loc| {
                 let coll = raw_str(args.first().ok_or_else(|| err("mongo_update: missing collection"))?);
-                let filter = filter_arg(args.get(1));
+                let filter = filter_arg(args.get(1), "mongo_update")?;
                 let update = required_doc_arg(args.get(2), "mongo_update")?;
                 if let Some(p) = db.read(|m| m.default_path()) {
                     require_db(&caps, &p, "mongo_update()")?;
@@ -1989,7 +2031,7 @@ pub fn register_database_builtins<H: DbHandle>(
             2,
             Rc::new(move |_i, args, _loc| {
                 let coll = raw_str(args.first().ok_or_else(|| err("mongo_delete: missing collection"))?);
-                let filter = filter_arg(args.get(1));
+                let filter = filter_arg(args.get(1), "mongo_delete")?;
                 if let Some(p) = db.read(|m| m.default_path()) {
                     require_db(&caps, &p, "mongo_delete()")?;
                 }
@@ -2010,7 +2052,7 @@ pub fn register_database_builtins<H: DbHandle>(
             -1,
             Rc::new(move |_i, args, _loc| {
                 let coll = raw_str(args.first().ok_or_else(|| err("mongo_count: missing collection"))?);
-                let filter = filter_arg(args.get(1));
+                let filter = filter_arg(args.get(1), "mongo_count")?;
                 if let Some(p) = db.read(|m| m.default_path()) {
                     require_db(&caps, &p, "mongo_count()")?;
                 }
@@ -2413,6 +2455,48 @@ mod tests {
         assert!(tables.contains(&"users".to_string()));
         assert!(tables.contains(&"orders".to_string()));
         db.close(None);
+    }
+
+    /// HB4: un secret de bytes llega a la DB con SUS bytes (antes `from_utf8_lossy`); uno sellado es
+    /// error en query/execute/execute_many, también anidado (antes viajaba `secret(NAME)`).
+    #[test]
+    fn secrets_as_db_params_keep_their_bytes_and_sealed_ones_are_refused() {
+        let mut db = DatabaseManager::new();
+        db.open(":memory:", "memory").unwrap();
+        db.execute("CREATE TABLE k (v BLOB)", &[]).unwrap();
+        let raw = vec![0xffu8, 0x00, 0xfe, 0x80];
+        db.execute("INSERT INTO k VALUES (?)", &[synsema_core::types::syn_secret_bytes("K", raw.clone())]).unwrap();
+        let rows = db.query("SELECT v FROM k", &[]).unwrap();
+        assert!(matches!(rows[0].get("v"), Some(SynValue::Bytes(b)) if b.to_vec() == raw), "los bytes del secret, no U+FFFD");
+        let sealed = || -> SynValue { SynValue::Secret(synsema_core::types::Obj::new(synsema_core::secret::SecretInner::new_bytes_sealed("attestation_key", vec![7u8; 32]))) };
+        for e in [
+            db.execute("INSERT INTO k VALUES (?)", &[sealed()]).unwrap_err(),
+            db.query("SELECT * FROM k WHERE v = ?", &[sealed()]).unwrap_err(),
+            db.execute_many("INSERT INTO k VALUES (?)", &[vec![syn_int(1)], vec![sealed()]]).unwrap_err(),
+            db.query("SELECT ?", &[syn_list(vec![syn_int(1), sealed()])]).unwrap_err(),
+        ] {
+            assert!(e.contains("secret(attestation_key) is sealed"), "{}", e);
+        }
+        assert_eq!(db.query("SELECT COUNT(*) AS n FROM k", &[]).unwrap().len(), 1);
+        assert!(syn_to_redis_arg(&sealed()).unwrap_err().contains("is sealed"));
+        // A1: ninguna conversión entrega el material sellado, aunque falte un guardia en alguna
+        // entrada (antes `expose()` cerraba todos los bordes; las conversiones nuevas tienen que
+        // seguir haciéndolo por sí mismas).
+        let key = [7u8; 32];
+        assert!(!matches!(syn_to_value(&sealed()), Value::Blob(ref b) if b[..] == key[..]));
+        assert!(!matches!(syn_to_pg(&sealed()), PgParam::Bytes(ref b) if b[..] == key[..]));
+        assert_eq!(syn_to_mysql(&sealed()), mysql::Value::Bytes(b"secret(attestation_key)".to_vec()));
+        assert!(matches!(syn_to_bson(&sealed()), Bson::String(ref t) if t == "secret(attestation_key)"));
+        let opts = synsema_core::types::syn_map({
+            let mut sort = SynMap::new();
+            sort.insert("k", sealed());
+            let mut m = SynMap::new();
+            m.insert("sort", synsema_core::types::syn_map(sort));
+            m
+        });
+        assert!(reject_sealed(&opts, "mongo_find").unwrap_err().contains("is sealed"), "sort/fields de mongo_find");
+        assert_eq!(syn_to_redis_arg(&synsema_core::types::syn_secret_bytes("K", raw.clone())).unwrap(), raw);
+        assert_eq!(syn_to_mysql(&synsema_core::types::syn_secret_bytes("K", raw.clone())), mysql::Value::Bytes(raw.clone()));
     }
 
     #[test]

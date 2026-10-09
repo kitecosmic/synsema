@@ -502,7 +502,7 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     // blockchain y helpers de test. Cero efecto fuera del intérprete
     "abi_decode", "abi_encode", "abi_selector", "abs", "acos", "acosh", "aes_gcm_decrypt", "aes_gcm_encrypt",
     "algo_address", "algorand_tx", "algorand_tx_encode", "append", "arange", "array", "as_secret", "asin",
-    "asinh", "assert", "assert_eq", "assert_error", "assert_ne", "at", "atan", "atan2", "atanh", "bearer",
+    "asinh", "assert", "assert_eq", "assert_error", "assert_ne", "at", "atan", "atan2", "atanh", "basic", "bearer",
     "bech32_decode", "bech32_encode", "beta", "btc_address", "btc_address_decode", "btc_script", "btc_tx",
     "btc_tx_raw", "btc_txid", "bytes", "bytes_to_int", "captoken_allows", "captoken_attenuate",
     "canonical_json", "captoken_mint", "captoken_verify", "capture", "cbrt", "ceil", "clamp", "complex", "conj",
@@ -531,6 +531,10 @@ pub const LABEL_PURE_BUILTINS: &[&str] = &[
     // v0.6.29: mapas, orden, texto y regex con sus nombres nuevos; la MAC en bytes.
     "get", "remove", "merge", "items", "sort", "replace", "regex_find_all", "regex_capture",
     "regex_replace", "fold_text", "hmac",
+    // v0.6.44: HTTP Basic como secret (y su variante con form-encoding de OAuth).
+    "oauth_basic",
+    // v0.6.44 (HB2): bits sobre enteros de 64 bits y XOR de bytes.
+    "bit_and", "bit_or", "bit_xor", "bit_not", "shl", "shr", "xor_bytes",
     // v0.6.29: blockchain `<familia>_<acción>` (puros: construir, derivar, decodificar).
     "evm_address", "evm_signature", "evm_tx", "evm_tx_raw", "evm_tx_create", "evm_create_address",
     "evm_create2_address", "abi_event_topic", "abi_decode_log", "algorand_address", "algorand_tx_raw",
@@ -667,6 +671,8 @@ pub(crate) fn wire_common_with_state(
     register_http_builtins(interp, caps.clone());
     // Hashing SHA + Keccak (puro, sin capability): sha256/sha512/keccak256/sha512_256 → bytes.
     synsema_stdlib::hashing::register_hash_builtins(interp);
+    // Bits sobre enteros de 64 bits y `xor_bytes` (puro, v0.6.44).
+    synsema_stdlib::bits::register_bit_builtins(interp);
     // JSON del lenguaje (puro, sin capability): json_encode/json_for_script/json_decode.
     // Vivían dentro de register_database_builtins; ahora en json.rs para que existan
     // también en el perfil wasm (sin `native`).

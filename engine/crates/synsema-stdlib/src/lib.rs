@@ -57,6 +57,8 @@ pub mod cronexpr;
 pub mod database;
 pub mod discovery;
 pub mod hashing;
+// Bits sobre enteros de 64 bits y `xor_bytes` (HB2, v0.6.44). Puro.
+pub mod bits;
 /// Protocolo host↔intérprete (F2): capabilities que un embebedor OFRECE (http/kv/llm/log).
 pub mod hostcap;
 /// Lo puro del cliente HTTP, compartido por los dos transportes.

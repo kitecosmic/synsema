@@ -2107,7 +2107,7 @@ fn algod_get_classified(
     timeout_secs: u64,
 ) -> Result<serde_json::Value, PollError> {
     let url = algod_url(base, path);
-    let hs = header_pairs(headers);
+    let hs = header_pairs(headers, fname).map_err(PollError::Definitive)?;
     let r = http_request("GET", &url, hs.as_deref(), None, None, timeout_secs);
     http_result_to_json_classified(r, &url, fname)
 }
@@ -2185,7 +2185,7 @@ fn algorand_send(args: &[SynValue], caps: &Rc<RefCell<CapabilitySet>>) -> Result
     let full = algod_url(&url, "/v2/transactions");
     // El Content-Type del protocolo SIEMPRE gana: un caller que puso el suyo en
     // los headers duplicaría el header (un algod estricto rechaza el request).
-    let mut hs = header_pairs(args.get(2)).unwrap_or_default();
+    let mut hs = header_pairs(args.get(2), F)?.unwrap_or_default();
     hs.retain(|(k, _)| !k.eq_ignore_ascii_case("content-type"));
     hs.push(("Content-Type".to_string(), "application/x-binary".to_string()));
     // Body BINARIO (el SignedTxn msgpack) — por eso no alcanza http_post.

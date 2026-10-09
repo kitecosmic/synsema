@@ -140,18 +140,37 @@ let b be http_get("https://api.provider.com/v1/items",
 
 | Builtin | Returns |
 |---|---|
-| `bearer(s)` | a tainted `Bearer <secret>` auth header value |
-| `hmac(data, s, algo?)` | the MAC as **bytes** (not secret; `hex(mac)` to show it). v0.6.29+ — the old `hmac_sha256` (hex text) is a deprecated alias |
-| `verify_hmac(data, sig, s, algo?)` | bool, **constant-time** (HMAC-SHA256/512; SHA-1 rejected) |
+| `basic(user, s)` | a tainted `Basic base64(user:password)` header value (RFC 7617, v0.6.44+): Basic-auth APIs. `user` without `:` |
+| `oauth_basic(client_id, s)` | the same for OAuth client credentials: both parts form-encoded first (RFC 6749 §2.3.1), v0.6.44+ |
+| `bearer(s)` | a tainted `Bearer <secret>` auth header value. `s`: text or secret (v0.6.44+: `nothing`/bytes/numbers → error, not `Bearer None`) |
+| `hmac(data, s, algo?)` | the MAC as **bytes** (not secret; `hex(mac)` to show it). `data`/`s`: text, bytes (raw, v0.6.44+) or secret; other types → error. v0.6.29+ — the old `hmac_sha256` (hex text) is a deprecated alias |
+| `verify_hmac(data, sig, s, algo?)` | bool, **constant-time** (HMAC-SHA256/512; SHA-1 rejected). `sig` hex/base64 text or raw bytes; undecodable or missing (`nothing`) → `false`; other type → error |
 | `constant_time_eq(a, b)` | bool, constant-time (accepts a `secret` on either side) |
 
 - **Any** outgoing **header** whose value is a `secret` (a raw `secret(...)` /
   `as_secret(...)`, or the result of `bearer()`) is materialized to its real value
   **only at the socket** — never in your program's value space. Credentials are **not
   Bearer-only**: `{"x-api-key": secret("KEY")}` or any custom header works; `bearer(s)`
-  is just sugar for the `Authorization: Bearer <token>` format. In **query params and
-  bodies a `secret` is redacted** (fail-closed) — a credential only survives over the
-  wire inside a header.
+  is just sugar for the `Authorization: Bearer <token>` format. A `secret` in **query
+  params or a body is an error** (v0.6.44+; it used to go out as the text `secret(NAME)`):
+  a credential only travels inside a header. Header/query/`bearer` values are text,
+  number, bool or secret — `nothing`, bytes, lists, maps → error naming the header (was
+  their printed form, e.g. `Bearer None`); a sealed secret or non-UTF-8 bytes secret →
+  error, never `secret(NAME)`. **No outlet yet** for an API that only takes the key in
+  the URL or only in the body (it never worked: it used to send `secret(NAME)`); prefer a
+  header / `basic()` / `bearer()` when the API offers one.
+- **Known limit:** a secret nested in a list/map inside a template hole (`` `Bearer {creds}` ``
+  with `creds = {"k": secret("K")}`) renders the whole container redacted, `Bearer {k: secret(K)}`
+  (like `print`), as plain text — **no error**, a header built from it goes out like that. Never the
+  value, but not the credential. Put the secret itself in the hole (`` `Bearer {creds["k"]}` `` is a
+  secret with the real value) or use `bearer`/`basic`.
+- `as_secret(v)` without a label is NAMED `sealed` (`secret(sealed)`, scope of
+  `reveal("sealed")`) — a name, not a sealed secret like `attestation_key()`. Pass a label.
+- **As a DB parameter** (`sql`, `mongo_*`, `redis_*`) a secret materializes at the DB edge:
+  text as text, a bytes secret as its bytes (BLOB/`bytea`/binary, v0.6.44+; was lossy
+  UTF-8); a sealed secret → error, also nested in a list/document.
+- **AWS SigV4 / chained HMAC with a stored key:** `hmac(date, "AWS4" + secret("AWS_SECRET_ACCESS_KEY"))`
+  — never `bytes(secret)` (does not convert) nor `reveal`.
 - `verify_hmac` decodes the incoming signature as hex or base64 (covers Stripe,
   GitHub `sha256=…`, Shopify) and compares in constant time.
 - `==` on a `secret` is already constant-time; prefer `constant_time_eq`/`verify_hmac`

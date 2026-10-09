@@ -1514,19 +1514,15 @@ fn parse_connect_opts(v: Option<&SynValue>, fname: &str) -> Result<ConnectOpts, 
 fn parse_headers(v: Option<&SynValue>, fname: &str) -> Result<Vec<(String, String)>, Control> {
     match v {
         None | Some(SynValue::Nothing) => Ok(Vec::new()),
-        Some(SynValue::Map(m)) => Ok(m
-            .borrow()
-            .iter()
-            .map(|(k, v)| {
-                let vs = match v {
-                    SynValue::Text(s) => s.to_string(),
-                    // Un secret (p.ej. bearer()) se materializa SÓLO en el borde del socket.
-                    SynValue::Secret(s) => s.expose().into_owned(),
-                    other => other.to_string(),
-                };
-                (k.to_string(), vs)
-            })
-            .collect()),
+        Some(SynValue::Map(m)) => {
+            // Un secret (p.ej. bearer()) se materializa SÓLO en el borde del socket. HB4: sellado,
+            // bytes no UTF-8, `nothing`, bytes, listas y mapas → error (no su forma impresa).
+            let mut out = Vec::new();
+            for (k, v) in m.borrow().iter() {
+                out.push((k.to_string(), crate::secrets::edge_text(v, fname, &format!("header {:?}", k.to_string()))?));
+            }
+            Ok(out)
+        }
         Some(other) => Err(err(format!("{}: headers must be a map, got {}", fname, other.type_name()))),
     }
 }

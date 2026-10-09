@@ -105,9 +105,9 @@ pub(crate) fn gate_wallet(
 /// el material sensible ENTRA como secret; `as_secret(...)` sella un valor en mano).
 fn text_secret_material(v: &SynValue, fname: &str, what: &str) -> Result<(String, String), Control> {
     match v {
-        SynValue::Secret(inner) => {
-            Ok((inner.name().to_string(), inner.expose().into_owned()))
-        }
+        // HB4 (v0.6.44): un secret sellado o de bytes no UTF-8 es error — antes se derivaba la
+        // wallet de la cadena literal `secret(NAME)` sin aviso.
+        SynValue::Secret(inner) => Ok((inner.name().to_string(), crate::secrets::secret_text(inner, fname, what)?)),
         other => Err(err(format!(
             "{}: {} must be a secret (it is custody material) — load it with secret(\"NAME\") \
              or seal it with as_secret(x, \"LABEL\"), got {}. Never pass it as a plain string.",

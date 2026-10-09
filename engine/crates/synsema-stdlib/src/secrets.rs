@@ -249,19 +249,116 @@ fn raw_str(v: &SynValue) -> String {
 }
 
 /// Bytes para crypto: un secret aporta su plaintext (uso interno; la salida es una
-/// MAC/bool, no filtra). Texto → sus bytes; resto → su Display.
+/// MAC/bool, no filtra). Texto → su UTF-8; bytes → los bytes crudos. Cualquier otro tipo es
+/// ERROR (HB1, v0.6.44): antes caía en su forma impresa — `bytes("key")` se hasheaba como el
+/// texto `bytes(6b6579)` — y el MAC salía distinto sin avisar.
 ///
 /// BORDE CRUDO DECLARADO (auditoría ronda 4/V2): acepta un secret SELLADO. Sus tres
 /// consumidores son `hmac_sha256`, `verify_hmac` y `constant_time_eq` — HMAC y comparación en
 /// tiempo constante, simétricos y de una vía: nada de lo que producen se verifica contra la
 /// clave pública que publica `/.well-known/attestation`, así que no hay suplantación del
 /// enclave. Ver el inventario completo en `synsema_core::secret::SecretInner::expose_bytes`.
-fn crypto_bytes(v: &SynValue) -> Vec<u8> {
+fn crypto_bytes(v: &SynValue, fname: &str, what: &str) -> Result<Vec<u8>, Control> {
     match v {
-        SynValue::Secret(s) => s.expose_bytes().to_vec(),
-        SynValue::Text(s) => s.as_bytes().to_vec(),
-        other => other.to_string().into_bytes(),
+        SynValue::Secret(s) => Ok(s.expose_bytes().to_vec()),
+        SynValue::Text(s) => Ok(s.as_bytes().to_vec()),
+        SynValue::Bytes(b) => Ok(b.to_vec()),
+        other => Err(Control::Error(RuntimeError::new(format!(
+            "{}: {} must be text, bytes or a secret, got {}",
+            fname,
+            what,
+            other.type_name()
+        )))),
     }
+}
+
+/// El texto de un secret que sale por un borde de TEXTO (header, query, `bearer`, auth de RPC, un
+/// parámetro de DB de texto). HB4 (v0.6.44): un secret SELLADO es error (antes salía la cadena
+/// `secret(NAME)` como si fuera el valor) y uno de bytes que no son UTF-8 también (antes llegaba
+/// con `from_utf8_lossy`, otros bytes).
+pub(crate) fn secret_text(s: &synsema_core::secret::SecretInner, who: &str, what: &str) -> Result<String, Control> {
+    let raw = s.expose_bytes_checked(who).map_err(|e| Control::Error(RuntimeError::new(e)))?;
+    String::from_utf8(raw.to_vec()).map_err(|_| {
+        Control::Error(RuntimeError::new(format!(
+            "{}: {} is secret({}), which holds bytes that are not UTF-8 text; it cannot go out as text",
+            who,
+            what,
+            s.name()
+        )))
+    })
+}
+
+/// Un valor que sale por un borde de texto (header, `bearer`, auth de RPC): texto tal cual,
+/// número o bool en su forma de siempre, `secret` por [`secret_text`]. `nothing`, bytes, listas y
+/// mapas son ERROR (HB4): antes salían como su forma impresa (`None`, `bytes(…)`, `[…]`) sin aviso
+/// — `bearer(nothing)` mandaba `Authorization: Bearer None`.
+pub(crate) fn edge_text(v: &SynValue, who: &str, what: &str) -> Result<String, Control> {
+    match v {
+        SynValue::Text(s) => Ok(s.to_string()),
+        SynValue::Number(_) | SynValue::Bool(_) => Ok(v.to_string()),
+        SynValue::Secret(s) => secret_text(s, who, what),
+        SynValue::Nothing => Err(Control::Error(RuntimeError::new(format!(
+            "{}: {} is nothing; pass a value (a missing env var or map key?), or leave it out",
+            who, what
+        )))),
+        other => Err(Control::Error(RuntimeError::new(format!(
+            "{}: {} must be text, a number or a secret, got {}",
+            who,
+            what,
+            other.type_name()
+        )))),
+    }
+}
+
+/// `application/x-www-form-urlencoded` de un texto (RFC 6749 apéndice B / HTML): alfanuméricos y
+/// `*-._` tal cual, espacio → `+`, el resto `%XX` en mayúsculas sobre sus bytes UTF-8.
+fn form_urlencode(t: &str) -> String {
+    let mut out = String::with_capacity(t.len());
+    for b in t.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => out.push(b as char),
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// `basic(user, password)` / `oauth_basic(client_id, client_secret)`: el valor del header
+/// `Authorization: Basic base64(user:password)` (RFC 7617) como secret, el par de `bearer`. Se
+/// materializa sólo en el socket. `user` sin ':' (separa usuario y contraseña); `nothing`, bytes o
+/// un secret sellado son error. Con `oauth`, cada parte va codificada como formulario antes.
+fn basic_header(args: &[SynValue], who: &str, oauth: bool) -> Result<SynValue, Control> {
+    let part = |v: &SynValue, what: &str| -> Result<(String, Option<String>), Control> {
+        match v {
+            SynValue::Text(t) => Ok((t.to_string(), None)),
+            SynValue::Secret(s) => Ok((secret_text(s, who, what)?, Some(s.name().to_string()))),
+            SynValue::Nothing => Err(Control::Error(RuntimeError::new(format!(
+                "{}: {} is nothing (a missing env var or map key?); pass text or a secret",
+                who, what
+            )))),
+            other => Err(Control::Error(RuntimeError::new(format!(
+                "{}: {} must be text or a secret, got {}",
+                who,
+                what,
+                other.type_name()
+            )))),
+        }
+    };
+    let (user_what, pass_what) = if oauth { ("the client_id", "the client_secret") } else { ("the user", "the password") };
+    let (mut user, _) = part(arg(args, 0)?, user_what)?;
+    let (mut password, name) = part(arg(args, 1)?, pass_what)?;
+    if oauth {
+        user = form_urlencode(&user);
+        password = form_urlencode(&password);
+    } else if user.contains(':') {
+        return Err(Control::Error(RuntimeError::new(format!(
+            "{}: the user cannot contain ':' (RFC 7617: it separates the user from the password)",
+            who
+        ))));
+    }
+    let token = synsema_core::bytesutil::b64_encode(format!("{}:{}", user, password).as_bytes());
+    Ok(syn_secret(name.unwrap_or_else(|| who.to_string()), format!("Basic {}", token)))
 }
 
 /// Resuelve una variable: environ del proceso > `.env` > default (§2). `None` si
@@ -341,17 +438,30 @@ impl Algo {
     }
 }
 
-/// Algoritmo soportado. SHA-1 se rechaza a propósito (débil, §4).
-fn parse_algo(s: &str) -> Result<Algo, Control> {
+/// Algoritmo soportado. SHA-1 se rechaza a propósito (débil, §4). `algo` es texto; otro tipo
+/// es error (no se adivina un algoritmo desde su forma impresa).
+fn parse_algo(v: Option<&SynValue>, fname: &str) -> Result<Algo, Control> {
+    let s = match v {
+        None => return Ok(Algo::Sha256),
+        Some(SynValue::Text(t)) => t.to_string(),
+        Some(other) => {
+            return Err(Control::Error(RuntimeError::new(format!(
+                "{}: algo must be text (\"sha256\" or \"sha512\"), got {}",
+                fname,
+                other.type_name()
+            ))))
+        }
+    };
     match s.trim().to_lowercase().as_str() {
         "" | "sha256" => Ok(Algo::Sha256),
         "sha512" => Ok(Algo::Sha512),
-        "sha1" => Err(Control::Error(RuntimeError::new(
-            "verify_hmac: SHA-1 is not supported (weak); use sha256 or sha512",
-        ))),
+        "sha1" => Err(Control::Error(RuntimeError::new(format!(
+            "{}: SHA-1 is not supported (weak); use sha256 or sha512",
+            fname
+        )))),
         other => Err(Control::Error(RuntimeError::new(format!(
-            "verify_hmac: unknown algorithm '{}' (use sha256 or sha512)",
-            other
+            "{}: unknown algorithm '{}' (use sha256 or sha512)",
+            fname, other
         )))),
     }
 }
@@ -805,21 +915,47 @@ pub fn register_secret_builtins(
         "bearer",
         1,
         Rc::new(move |_i, args, _loc| {
+            // HB4 (v0.6.44): texto o secret. `nothing` (un env que falta), bytes, números… son
+            // error: antes salía `Bearer None` / `Bearer bytes(…)` sin aviso. Un secret sellado o
+            // de bytes que no son UTF-8 también es error, no `Bearer secret(NAME)`.
             let (name, plaintext) = match arg(args, 0)? {
-                SynValue::Secret(s) => (s.name().to_string(), format!("Bearer {}", s.expose())),
-                other => ("bearer".to_string(), format!("Bearer {}", raw_str(other))),
+                SynValue::Secret(s) => (s.name().to_string(), format!("Bearer {}", secret_text(s, "bearer", "the token")?)),
+                SynValue::Text(t) => ("bearer".to_string(), format!("Bearer {}", t)),
+                SynValue::Nothing => {
+                    return Err(Control::Error(RuntimeError::new(
+                        "bearer: the token is nothing (a missing env var or map key?); pass text or a secret",
+                    )))
+                }
+                other => {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "bearer: the token must be text or a secret, got {}",
+                        other.type_name()
+                    ))))
+                }
             };
             Ok(syn_secret(name, plaintext))
         }),
     );
+
+    // basic(user, password) → secret "Basic base64(user:password)" (RFC 7617). El par de `bearer`
+    // (v0.6.44, auditoría ronda 2): las credenciales de cliente de OAuth (RFC 6749 §2.3.1, que todo
+    // servidor tiene que aceptar) y las APIs con Basic (Twilio, Mailgun, Jira, Stripe…). Sin esto, con
+    // la contraseña como secret, el header no se podía armar sin `reveal()`. Se materializa sólo en
+    // el socket, como todo header; `user` sin ':' (RFC 7617 §2); un secret sellado o de bytes no
+    // UTF-8 es error.
+    interp.register_builtin("basic", 2, Rc::new(move |_i, args, _loc| basic_header(args, "basic", false)));
+    // oauth_basic(client_id, client_secret) → lo mismo, pero con cada parte codificada como
+    // formulario ANTES de armar el Basic, como pide el RFC 6749 §2.3.1 (apéndice B): un secret con
+    // `+`, `/` o `=` (los de Azure, por ejemplo) un servidor OAuth estricto lo rechaza sin esto.
+    interp.register_builtin("oauth_basic", 2, Rc::new(move |_i, args, _loc| basic_header(args, "oauth_basic", true)));
 
     // hmac_sha256(data, s) → hex (la MAC, no es secreta).
     interp.register_builtin(
         "hmac_sha256",
         2,
         Rc::new(move |_i, args, _loc| {
-            let data = crypto_bytes(arg(args, 0)?);
-            let key = crypto_bytes(arg(args, 1)?);
+            let data = crypto_bytes(arg(args, 0)?, "hmac_sha256", "data")?;
+            let key = crypto_bytes(arg(args, 1)?, "hmac_sha256", "key")?;
             Ok(syn_text(to_hex(&hmac_compute(Algo::Sha256, &key, &data))))
         }),
     );
@@ -836,12 +972,9 @@ pub fn register_secret_builtins(
                     "hmac(data, key, algo?) takes 2 or 3 arguments",
                 )));
             }
-            let data = crypto_bytes(arg(args, 0)?);
-            let key = crypto_bytes(arg(args, 1)?);
-            let algo = match args.get(2) {
-                Some(v) => parse_algo(&raw_str(v))?,
-                None => Algo::Sha256,
-            };
+            let data = crypto_bytes(arg(args, 0)?, "hmac", "data")?;
+            let key = crypto_bytes(arg(args, 1)?, "hmac", "key")?;
+            let algo = parse_algo(args.get(2), "hmac")?;
             Ok(syn_bytes(hmac_compute(algo, &key, &data)))
         }),
     );
@@ -851,17 +984,27 @@ pub fn register_secret_builtins(
         "verify_hmac",
         -1,
         Rc::new(move |_i, args, _loc| {
-            let data = crypto_bytes(arg(args, 0)?);
-            let signature = raw_str(arg(args, 1)?);
-            let key = crypto_bytes(arg(args, 2)?);
-            let algo = match args.get(3) {
-                Some(v) => parse_algo(&raw_str(v))?,
-                None => Algo::Sha256,
-            };
+            let data = crypto_bytes(arg(args, 0)?, "verify_hmac", "data")?;
+            let key = crypto_bytes(arg(args, 2)?, "verify_hmac", "key")?;
+            let algo = parse_algo(args.get(3), "verify_hmac")?;
             let mac = hmac_compute(algo, &key, &data);
-            let provided = match decode_signature(&signature, algo.mac_len()) {
-                Some(b) => b,
-                None => return Ok(syn_bool(false)),
+            // La firma: texto en hex o base64 (lo que manda un webhook, con o sin `sha256=`), o
+            // los bytes crudos del MAC (lo que devuelve `hmac`). Viene de afuera: una firma de texto
+            // que no decodifica, o AUSENTE (`nothing`: el header no vino), es `false`, no un error
+            // (que haría 500 en vez de 400/401). Otro tipo es un error del programa.
+            let provided = match arg(args, 1)? {
+                SynValue::Nothing => return Ok(syn_bool(false)),
+                SynValue::Bytes(b) => b.to_vec(),
+                SynValue::Text(t) => match decode_signature(t, algo.mac_len()) {
+                    Some(b) => b,
+                    None => return Ok(syn_bool(false)),
+                },
+                other => {
+                    return Err(Control::Error(RuntimeError::new(format!(
+                        "verify_hmac: signature must be text (hex or base64) or bytes, got {}",
+                        other.type_name()
+                    ))))
+                }
             };
             Ok(syn_bool(constant_time_eq(&mac, &provided)))
         }),
@@ -872,8 +1015,8 @@ pub fn register_secret_builtins(
         "constant_time_eq",
         2,
         Rc::new(move |_i, args, _loc| {
-            let a = crypto_bytes(arg(args, 0)?);
-            let b = crypto_bytes(arg(args, 1)?);
+            let a = crypto_bytes(arg(args, 0)?, "constant_time_eq", "a")?;
+            let b = crypto_bytes(arg(args, 1)?, "constant_time_eq", "b")?;
             Ok(syn_bool(constant_time_eq(&a, &b)))
         }),
     );
@@ -974,11 +1117,32 @@ mod tests {
         // sha512 produce 64 bytes.
         let mac = hmac_compute(Algo::Sha512, b"key", b"data");
         assert_eq!(mac.len(), 64);
-        assert!(parse_algo("sha512").is_ok());
-        assert!(parse_algo("sha256").is_ok());
-        assert!(parse_algo("").is_ok());
-        assert!(parse_algo("sha1").is_err()); // débil, rechazado a propósito (§4)
-        assert!(parse_algo("md5").is_err());
+        let t = |s: &str| syn_text(s);
+        assert!(parse_algo(Some(&t("sha512")), "hmac").is_ok());
+        assert!(parse_algo(Some(&t("sha256")), "hmac").is_ok());
+        assert!(parse_algo(Some(&t("")), "hmac").is_ok());
+        assert!(parse_algo(None, "hmac").is_ok());
+        assert!(parse_algo(Some(&t("sha1")), "hmac").is_err()); // débil, rechazado a propósito (§4)
+        assert!(parse_algo(Some(&t("md5")), "hmac").is_err());
+        assert!(parse_algo(Some(&syn_bytes(b"sha256".to_vec())), "hmac").is_err(), "otro tipo: error, no su forma impresa");
+    }
+
+    /// HB4: lo que sale por un borde de texto nunca es una forma impresa ni un sellado disfrazado.
+    #[test]
+    fn edge_text_refuses_what_would_go_out_as_a_printed_form() {
+        let msg = |r: Result<String, Control>| match r {
+            Err(Control::Error(e)) => e.into_message(),
+            _ => panic!("expected an error"),
+        };
+        assert_eq!(edge_text(&syn_text("abc"), "t", "x").ok().unwrap(), "abc");
+        assert_eq!(edge_text(&synsema_core::types::syn_int(42), "t", "x").ok().unwrap(), "42");
+        assert_eq!(edge_text(&syn_secret("K", "s3cret".to_string()), "t", "x").ok().unwrap(), "s3cret");
+        assert!(msg(edge_text(&SynValue::Nothing, "fetch", "header \"X\"")).contains("fetch: header \"X\" is nothing"));
+        assert!(msg(edge_text(&syn_bytes(vec![1u8]), "t", "x")).contains("must be text, a number or a secret, got bytes"));
+        assert!(msg(edge_text(&syn_secret_bytes("B", vec![0xff, 0xfe]), "t", "x")).contains("secret(B), which holds bytes that are not UTF-8"));
+        assert_eq!(edge_text(&syn_secret_bytes("U", b"utf8 ok".to_vec()), "t", "x").ok().unwrap(), "utf8 ok");
+        let sealed = SynValue::Secret(synsema_core::types::Obj::new(synsema_core::secret::SecretInner::new_bytes_sealed("attestation_key", vec![7u8; 32])));
+        assert!(msg(edge_text(&sealed, "bearer", "the token")).contains("bearer: secret(attestation_key) is sealed"));
     }
 
     #[test]

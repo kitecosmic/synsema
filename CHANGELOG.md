@@ -6,6 +6,61 @@ Each says what changed, why, and what to write instead.
 
 Versions follow the release tags (`v0.6.24`, `v0.6.25`, …). Dates are the release date.
 
+## v0.6.44 — 2026-10-08
+
+`hmac` with bytes, bit operations, values that leave as text are never their printed form, and the full list of drivers in the `serve --attested` notice.
+
+**Behavior changes (read these first).**
+- **`hmac`, `verify_hmac`, `hmac_sha256` and `constant_time_eq` use the raw bytes of a `bytes`
+  argument.** Before, a `bytes` value was turned into its printed form (`bytes(6b6579)`) and that
+  text was hashed: `hmac(bytes("data"), bytes("key"))` gave another MAC than `hmac("data", "key")`,
+  with no warning. Now both give `0x5031fe3d…1bd0`, and binary keys can be chained (AWS SigV4,
+  HKDF by hand). **Text gives exactly the same MAC as before**, so existing webhook signatures do
+  not change. Any argument that is not text, bytes or a secret (a number, a list, `nothing`) is
+  now an error naming the argument and its type, instead of being hashed as its printed form; the
+  `algo` argument must be text. A `nothing` key used to be hashed as the text `"nothing"`, a key
+  anyone can guess: it is an error now. `verify_hmac` also accepts the signature as the raw MAC in
+  bytes; a text signature that does not decode is still `false`, and so is a missing one (`nothing`,
+  the header did not come), so a webhook handler answers 401 and not 500.
+- **Values that leave as text are never their printed form.** A header, a query parameter or
+  `bearer(...)` takes text, a number, a bool or a secret. `nothing` (a missing env var or map key),
+  `bytes`, lists and maps are an error naming the header or parameter: before, they went out as
+  their printed form (`bearer(nothing)` sent `Authorization: Bearer None`). A secret in a query
+  parameter or in a body (directly or inside a map or list) is an error: it used to go out as the
+  text `secret(NAME)`, which the server took as the value. A sealed secret
+  (`attestation_key()`) or a secret holding bytes that are not UTF-8 is an error wherever it would
+  leave as text (headers, `bearer`, `btc_rpc` auth, a mnemonic or passphrase for the HD wallet
+  builtins), never the placeholder `secret(NAME)`.
+- **`+` with a secret follows the text rules.** Numbers and bools join as before; `nothing`,
+  bytes, lists and maps are an error, as they are with text (before, with a secret they joined as
+  their printed form: `secret + nothing` gave "…nothing"). A sealed secret is an error (it gave an
+  unsealed secret holding the text `secret(NAME)`), and so is a secret holding bytes that are not
+  UTF-8 (it changed silently, so a chained HMAC key came out different). A backtick template
+  is unchanged: every hole shows its text (`token={tok} scopes={xs}` with `tok` a secret gives a
+  secret holding the list as text, as without a secret); only a sealed secret or a non-UTF-8 bytes
+  secret in a template is an error.
+- **A bytes secret as a database parameter keeps its bytes** (SQLite BLOB, Postgres `bytea`, MySQL
+  bytes, Mongo binary, Redis): it used to be converted to text, and bytes that are not UTF-8
+  changed. A sealed secret as a database parameter is an error, also nested in a list or a
+  document.
+
+**New builtins.**
+- `basic(user, secret)`: the `Authorization: Basic base64(user:password)` header value (RFC 7617)
+  as a secret, materialized only at the socket — the pair of `bearer`. OAuth client credentials
+  (RFC 6749 §2.3.1) and Basic-auth APIs could not be called with the password as a secret before
+  without `reveal()`. The user cannot contain `:`.
+- `oauth_basic(client_id, secret)`: the same for OAuth client credentials, with both parts
+  form-encoded first as RFC 6749 §2.3.1 asks (a secret with `+`, `/` or `=` is rejected by strict
+  servers otherwise).
+- Bits on 64-bit signed integers: `bit_and(a, b)`, `bit_or(a, b)`, `bit_xor(a, b)`, `bit_not(a)`,
+  `shl(x, n)`, `shr(x, n)` (arithmetic, keeps the sign). `n` is 0..63; a value outside 64 bits, a
+  float, or a `shl` that overflows is an error — nothing wraps around silently.
+- `xor_bytes(a, b)`: XOR of two `bytes` of the same length (different lengths or text → error).
+
+**`serve --attested`.** The startup line names every driver and format, in order:
+`Attested: drivers=tsm,nitro-tpm formats=sev-snp,nitro-tpm program_sha=… — GET
+/.well-known/attestation` (it said `driver=`/`format=` with only the first one).
+
 ## v0.6.43 — 2026-10-08
 
 Confidential VMs: AMD SEV-SNP reports verify, NitroTPM documents are produced and verified, one

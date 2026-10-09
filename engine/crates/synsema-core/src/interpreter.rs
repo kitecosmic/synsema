@@ -6412,9 +6412,14 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
         // Hueco de un template con backticks: el texto de cualquier valor, como el f-string de
         // Python (`xs={xs}` → "xs=[1, 2]"). Un secret sigue por `+` (queda secret y redactado).
         let op = if op == BinOp::InterpConcat {
-            if let SynValue::Text(l) = &left {
-                if !matches!(right, SynValue::Text(_) | SynValue::Secret(_)) {
-                    return Ok(syn_text(format!("{}{}", l, right)));
+            if !matches!(right, SynValue::Text(_) | SynValue::Secret(_)) {
+                match &left {
+                    SynValue::Text(l) => return Ok(syn_text(format!("{}{}", l, right))),
+                    // v0.6.44 (auditoría A2): después de un hueco con un secret lo acumulado es un
+                    // secret, y el hueco siguiente es igual de template: su texto, como sin secret.
+                    // Lo demás (sellado, bytes no UTF-8) lo decide `secret_concat`.
+                    SynValue::Secret(_) => return secret_concat(&left, &syn_text(right.to_string()), loc),
+                    _ => {}
                 }
             }
             BinOp::Add
@@ -6445,7 +6450,7 @@ Intent is frozen to prevent prompt injection from expanding the mandate.",
             // que en código sin secretos es siempre falsa → rama no-tomada, coste
             // efectivo cero (§8: no es un taint pervasivo, es un check local en `+`).
             if left.is_secret() || right.is_secret() {
-                return Ok(secret_concat(&left, &right));
+                return secret_concat(&left, &right, loc);
             }
             // F4.6b: el texto de la izquierda se agrega en el lugar si este valor es su único dueño
             // (el intermedio de `a + b + c`, como `s += x` con refcount 1 en CPython); si no, una
@@ -10039,18 +10044,48 @@ pub(crate) fn text_addable(x: &SynValue) -> bool {
 /// plaintext es la concatenación de los plaintexts (un operando no-secret aporta su
 /// display, igual que la concatenación normal). El nombre se hereda del primer
 /// operando secret (sólo cosmético para la redacción `secret(NAME)`).
-fn secret_concat(left: &SynValue, right: &SynValue) -> SynValue {
+/// `a + b` con algún operando `secret`: el resultado es un secret (sigue redactado). Las mismas
+/// reglas que la suma de texto: números y bools se pegan; `nothing`, bytes, listas y mapas son
+/// error (v0.6.44, auditoría M4: con un secret se pegaba su forma impresa, `secret + nothing` daba
+/// "…nothing" — el `Bearer None` por otra puerta). Un secret SELLADO es error (daba un secret no
+/// sellado con el texto `secret(NAME)`), y uno de bytes que no son UTF-8 también (cambiaba en
+/// silencio: la clave de un HMAC encadenado salía otra).
+fn secret_concat(left: &SynValue, right: &SynValue, loc: &SourceLocation) -> Result<SynValue, Control> {
     // (texto a concatenar, nombre si el operando es secret).
-    fn part(v: &SynValue) -> (String, Option<String>) {
+    let part = |v: &SynValue, other: &SynValue| -> Result<(String, Option<String>), Control> {
+        let named = |o: &SynValue| match o {
+            SynValue::Secret(s) => format!("secret({})", s.name()),
+            _ => "a secret".to_string(),
+        };
         match v {
-            SynValue::Secret(s) => (s.expose().to_string(), Some(s.name().to_string())),
-            other => (other.to_string(), None),
+            SynValue::Secret(s) if s.is_sealed() => Err(err_at(
+                format!("Cannot add secret({}): it is sealed (the attested identity key never becomes text)", s.name()),
+                loc,
+            )),
+            SynValue::Secret(s) => match std::str::from_utf8(s.expose_bytes()) {
+                Ok(t) => Ok((t.to_string(), Some(s.name().to_string()))),
+                Err(_) => Err(err_at(
+                    format!("Cannot add secret({}): it holds bytes that are not UTF-8 text, and `+` joins text", s.name()),
+                    loc,
+                )),
+            },
+            SynValue::Text(t) => Ok((t.to_string(), None)),
+            o if text_addable(o) => Ok((o.to_string(), None)),
+            o => Err(err_at(
+                format!(
+                    "Cannot add {} and {} — convert it on purpose: text(x){}",
+                    named(other),
+                    o.type_name(),
+                    if matches!(o, SynValue::Nothing) { " (a missing env var or map key?)" } else { "" }
+                ),
+                loc,
+            )),
         }
-    }
-    let (lp, ln) = part(left);
-    let (rp, rn) = part(right);
+    };
+    let (lp, ln) = part(left, right)?;
+    let (rp, rn) = part(right, left)?;
     let name = ln.or(rn).unwrap_or_else(|| "derived".to_string());
-    syn_secret(name, format!("{}{}", lp, rp))
+    Ok(syn_secret(name, format!("{}{}", lp, rp)))
 }
 
 /// `str(value.raw)` estilo Python (texto crudo, no el Display de SynValue).
@@ -12126,4 +12161,41 @@ fn dual_fn_pick<'a>(args: &'a [SynValue], op: &str) -> Result<(SynValue, &'a Syn
 #[inline(never)]
 fn note_loaded_module(resolved: &str, source: &str, program: &crate::ast::Program) {
     crate::loaded_modules::record(resolved, source, program);
+}
+
+#[cfg(test)]
+mod secret_concat_tests {
+    //! v0.6.44 (auditoría M4): `+` con un secret sigue las reglas de la suma de texto, y nunca pega
+    //! la forma impresa de nada ni el marcador de un sellado.
+    use super::*;
+    use crate::secret::SecretInner;
+    use crate::types::{syn_bytes, syn_int, syn_secret_bytes, syn_text};
+
+    fn loc() -> SourceLocation {
+        SourceLocation { file: "t.syn".into(), line: 1, column: 1, offset: 0 }
+    }
+    fn msg(r: Result<SynValue, Control>) -> String {
+        match r {
+            Err(Control::Error(e)) => e.into_message(),
+            _ => panic!("expected an error"),
+        }
+    }
+
+    #[test]
+    fn plus_with_a_secret_follows_the_text_rules() {
+        let k = syn_secret("K", "abc".to_string());
+        let ok = |r: Result<SynValue, Control>| match r {
+            Ok(SynValue::Secret(s)) => (s.name().to_string(), s.expose().to_string()),
+            _ => panic!("expected a secret"),
+        };
+        assert_eq!(ok(secret_concat(&syn_text("AWS4"), &k, &loc())), ("K".to_string(), "AWS4abc".to_string()));
+        assert_eq!(ok(secret_concat(&k, &syn_int(5), &loc())), ("K".to_string(), "abc5".to_string()), "un número se pega, como en el texto");
+        assert_eq!(ok(secret_concat(&syn_secret_bytes("B", b"utf8".to_vec()), &syn_text("!"), &loc())).1, "utf8!");
+        assert!(msg(secret_concat(&k, &SynValue::Nothing, &loc())).contains("Cannot add secret(K) and nothing"));
+        assert!(msg(secret_concat(&SynValue::Nothing, &k, &loc())).contains("Cannot add secret(K) and nothing"));
+        assert!(msg(secret_concat(&k, &syn_bytes(vec![1u8]), &loc())).contains("Cannot add secret(K) and bytes"));
+        assert!(msg(secret_concat(&syn_secret_bytes("B", vec![0xff]), &syn_text("x"), &loc())).contains("secret(B): it holds bytes that are not UTF-8"));
+        let sealed = SynValue::Secret(crate::types::Obj::new(SecretInner::new_bytes_sealed("attestation_key", vec![7u8; 32])));
+        assert!(msg(secret_concat(&syn_text("x"), &sealed, &loc())).contains("secret(attestation_key): it is sealed"));
+    }
 }
