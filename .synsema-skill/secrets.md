@@ -159,6 +159,9 @@ let b be http_get("https://api.provider.com/v1/items",
   error, never `secret(NAME)`. **No outlet yet** for an API that only takes the key in
   the URL or only in the body (it never worked: it used to send `secret(NAME)`); prefer a
   header / `basic()` / `bearer()` when the API offers one.
+- **Known limit:** a secret nested in a list/map inside a template hole (`` `Bearer {creds}` ``
+  with `creds = {"k": secret("K")}`) renders as the redacted text `secret(K)`, like `print` —
+  never the value, but not the credential either. Pass the secret itself / `bearer` / `basic`.
 - `as_secret(v)` without a label is NAMED `sealed` (`secret(sealed)`, scope of
   `reveal("sealed")`) — a name, not a sealed secret like `attestation_key()`. Pass a label.
 - **As a DB parameter** (`sql`, `mongo_*`, `redis_*`) a secret materializes at the DB edge:
